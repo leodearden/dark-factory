@@ -264,7 +264,7 @@ tasks:
     verdict: PASS
     delivered_check:
       kind: grep
-      pattern: clock skew
+      pattern: clock skew \(NTP\)
       paths:
       - orchestrator/src/orchestrator/harness.py
       expect: absent

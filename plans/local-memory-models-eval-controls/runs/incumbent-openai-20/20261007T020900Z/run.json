@@ -1,0 +1,84 @@
+{
+  "abort": null,
+  "check_results": [
+    {
+      "check_id": "code-sha-matches-checkout",
+      "detail": "HEAD 055e9c15a0d756704017b0d77ffbe4185155402f is clean and matches the spec",
+      "offenders": [],
+      "passed": true
+    },
+    {
+      "check_id": "preregistration-sha",
+      "detail": "control arm 'incumbent-openai-20' carries no preregistration",
+      "offenders": [],
+      "passed": true
+    },
+    {
+      "check_id": "token-cost-accounting",
+      "detail": "arm 'incumbent-openai-20': tokens and cost are accounted",
+      "offenders": [],
+      "passed": true
+    }
+  ],
+  "effective_embedder": {
+    "dimensions": 1536,
+    "model": "text-embedding-3-small"
+  },
+  "episode_ids": [
+    "8ed66f45-dde5-4c43-9812-9136d45beb6e",
+    "62f8f47b-42b5-47a3-95f6-64a8f1c8cead",
+    "026c9418-e82c-4793-a6a3-ab1421e5eff3",
+    "3137f2d8-0e96-4269-a91f-a199f50a96ad",
+    "32589460-bc9c-43e0-ac07-440933459352",
+    "b802d45a-c2a6-4280-b57e-6a8d4028c8de",
+    "64b321da-682d-4f77-8e08-03519297dda1",
+    "d70d0823-a301-4338-aa6e-892e0e606d19",
+    "165d9abb-81d4-413c-9a62-64eb766e7c5e",
+    "8ae5fcb9-c3b9-4800-953b-de7d69e6e076",
+    "61902ad3-f65e-4006-9cde-fc24d2bd471d",
+    "75953add-52fa-4d1b-9d7a-46f0f46f6c11",
+    "a31c41da-1d5f-47f8-8e24-0fbbde88730e",
+    "9d64ef76-c7b9-4f89-97cb-3c38197b7333",
+    "5bc03dd2-8b8b-497a-af0c-b21cd588dbfa",
+    "54d29441-2736-4c8b-8c6f-b29f4d9ab3e9",
+    "36a29883-4d90-4e8d-8b2b-ce3216957fb3",
+    "202366f4-73fb-4d0e-b1e8-5ed67c78736f",
+    "aaf1c209-307a-46d6-9a26-faa296c2e090",
+    "1b3fb06c-ace7-4ee9-8812-5e2675fdf0e4"
+  ],
+  "finished_at": "2026-10-07T02:12:13.889203Z",
+  "graphiti_max_coroutines": 5,
+  "graphiti_semaphore_limit": 20,
+  "incomplete": false,
+  "schema_version": 1,
+  "settings_summary": {
+    "concurrency": 3,
+    "episode_timeout_s": 120.0,
+    "index_configuration": "with-indices"
+  },
+  "spec": {
+    "arm_id": "incumbent-openai-20",
+    "arm_role": "control",
+    "axis": "llm",
+    "client_class": "openai",
+    "code_sha": "055e9c15a0d756704017b0d77ffbe4185155402f",
+    "corpus_sha": "850cf7c937c745b0d224a0ba975efc1c69080ad61d84c5369d06287cdd16f2e8",
+    "model_id": "gpt-4o-mini",
+    "params": {
+      "max_tokens": 4096,
+      "temperature": 0.0
+    },
+    "preregistration_sha": null,
+    "pricing": {
+      "usd_per_mtok_input": 0.15,
+      "usd_per_mtok_output": 0.6
+    },
+    "scratch_group_id": "evalmem_lme_ctl_openai_20",
+    "serving": {
+      "base_url": "https://api.openai.com/v1",
+      "stack": "openai"
+    },
+    "structured_output_mode": "json_schema"
+  },
+  "started_at": "2026-10-07T02:10:02.261231Z"
+}

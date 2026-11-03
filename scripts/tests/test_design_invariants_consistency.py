@@ -25,8 +25,10 @@ THE FIVE PINNED SITES (see ``PINNED_SITES`` for the machine-readable registry):
     family-inventory row (ordered) and the G7 trigger-shape fallback list (set).
   * ``CONTRIBUTING.md`` — pinned as an ABSENCE: it may name at most one
     invariant, never a restatement of the family.
-  * ``docs/code-quality.md`` — a PARTIAL `INV-N`-to-heuristic mapping, pinned
-    pair-wise against the normative doc, never for completeness.
+  * ``orchestrator/src/orchestrator/agents/code_quality.md``
+    (``docs/code-quality.md`` is a symlink to it) — a PARTIAL
+    `INV-N`-to-heuristic mapping, pinned pair-wise against the normative doc,
+    never for completeness.
 
 STRUCTURE, NEVER WORDING. This guard pins WHICH SLUGS APPEAR WHERE across
 artifacts — the cross-artifact correspondence that fails to auto-extend when an
@@ -54,7 +56,8 @@ PLACEMENT IS LOAD-BEARING. ``scripts/tests/`` modules must import NO first-party
 package — that is what lets ``uv run --project shared pytest scripts/tests/``
 (``scripts/orchestrator.yaml``'s ``test_command``) satisfy them on a freshly
 synced verify worktree. This module is stdlib-only (``os``, ``re``,
-``subprocess``, ``pathlib``) plus ``pytest``. Both scans shell out to the
+``subprocess``, ``pathlib``) plus ``pytest`` and the heading parser it imports,
+``scripts/legibility/invariants.py``, which is itself stdlib-only. Both scans shell out to the
 ``git`` binary (task 4971) for their tracked-file oracle — see
 ``_walk_repo_files``. This module always runs inside a git worktree, so the
 REPOSITORY half of that oracle is guaranteed; the ``git`` EXECUTABLE's
@@ -79,6 +82,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 import pytest
+from legibility import invariants
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -86,18 +90,15 @@ NORMATIVE_DOC = REPO_ROOT / "docs" / "legibility" / "design-invariants.md"
 FIXTURES_DOC = REPO_ROOT / "docs" / "legibility" / "design-invariants-fixtures.md"
 GATES_DOC = REPO_ROOT / "skills" / "prd" / "references" / "gates.md"
 CONTRIBUTING_DOC = REPO_ROOT / "CONTRIBUTING.md"
-CODE_QUALITY_DOC = REPO_ROOT / "docs" / "code-quality.md"
+CODE_QUALITY_DOC = (
+    REPO_ROOT / "orchestrator" / "src" / "orchestrator" / "agents" / "code_quality.md"
+)
 
 # A family this small would mean the normative doc stopped parsing, not that
 # dark-factory shrank its invariant list: eight are landed and none has ever been
 # retired. The floor is a NON-VACUITY guard on every comparison downstream, kept
 # well below the live count so a deliberate retirement does not go red spuriously.
 _MINIMUM_FAMILY_SIZE = 5
-
-# The one structural shape that defines family membership. `##` exactly (a `###`
-# sub-heading is a fixture shape in the fixtures doc, not an invariant), a bare
-# integer, and a backticked lowercase-kebab slug to end of line.
-_HEADING_RE = re.compile(r"^## INV-(\d+) `([a-z0-9][a-z0-9-]*)`$", re.MULTILINE)
 
 
 def parse_invariant_headings(md_text: str, *, source: str) -> list[tuple[int, str]]:
@@ -114,8 +115,8 @@ def parse_invariant_headings(md_text: str, *, source: str) -> list[tuple[int, st
     Duplicates are checked BEFORE contiguity: a doubled number (1, 2, 2) is a
     duplicate, not a numbering gap, and the message a reader gets should say so.
     """
-    pairs = [(int(number), slug) for number, slug in _HEADING_RE.findall(md_text)]
-    assert pairs, (
+    headings = invariants.parse_headings(md_text)
+    assert headings, (
         f"{source}: no `## INV-N `slug`` headings found at all (task 3802). This "
         f"guard derives the whole invariant family from those headings, so an "
         f"empty parse would silently turn every other site's drift check into a "
@@ -123,6 +124,15 @@ def parse_invariant_headings(md_text: str, *, source: str) -> list[tuple[int, st
         f"`<lower-kebab-slug>`` on its own line) or the wrong file was read."
     )
 
+    prefixed = [f"INV-{h.family}-{h.number}" for h in headings if h.family is not None]
+    assert not prefixed, (
+        f"{source}: family-prefixed invariant heading(s) {prefixed} (task 6400). "
+        f"dark-factory's family is the unprefixed `## INV-<n> `<slug>``; the "
+        f"`INV-<FAMILY>-<n>` form belongs to other projects' docs. Renumber the "
+        f"heading into the unprefixed family."
+    )
+
+    pairs = [(h.number, h.slug) for h in headings]
     numbers = [number for number, _ in pairs]
     slugs = [slug for _, slug in pairs]
 
@@ -427,7 +437,7 @@ PINNED_SITES = {
     "CONTRIBUTING.md": (
         "pinned as an ABSENCE: at most one by-name citation, never a restatement"
     ),
-    "docs/code-quality.md": (
+    "orchestrator/src/orchestrator/agents/code_quality.md": (
         "a partial `INV-N`-to-heuristic mapping, pinned pair-wise against the "
         "normative doc — never for completeness"
     ),
@@ -453,6 +463,10 @@ _EXCLUDED_TREES = (
     # slugs each). Pinning them would force rewriting history.
     "plans",
     "docs/prds",
+    # Review instrument reports (home set by docs/quality-findings-contract.md
+    # §5 "Report homes") cite invariant slugs per finding as of a pinned sha
+    # (task 6567); every future run adds another such record.
+    "review/reports",
 )
 
 _EXCLUDED_TREE_PARTS = tuple(tuple(tree.split("/")) for tree in _EXCLUDED_TREES)
@@ -591,6 +605,10 @@ def _walk_repo_files(root: Path, suffixes: tuple[str, ...]) -> list[Path]:
         # 4971). The aggregate anti-vacuity guards still cover the case where
         # the skew is large enough to matter.
         if not path.is_file():
+            continue
+        # A tracked symlink is an alias, not a site: its target is scanned in
+        # its own right.
+        if path.is_symlink():
             continue
         found.append(path)
     # `git ls-files` lists an UNMERGED path once per merge stage — a
@@ -1156,6 +1174,14 @@ _HEADINGS_DUP_NUMBER = """\
 ## INV-2 `c-slug`
 """
 
+# (h) A family-prefixed id. Valid in another project's doc (reify's INV-SF-n),
+# never in dark-factory's, whose family is the unprefixed INV-<n>.
+_HEADINGS_FAMILY_PREFIXED = """\
+## INV-1 `a-slug`
+
+## INV-SF-1 `b-slug`
+"""
+
 _FIXTURE_SOURCE = "a hand-written fixture"
 
 
@@ -1194,6 +1220,9 @@ def test_parse_invariant_headings_ignores_every_decoy_shape() -> None:
         ),
         pytest.param(
             _HEADINGS_DUP_NUMBER, "duplicate number", [repr([2])], id="duplicate-number"
+        ),
+        pytest.param(
+            _HEADINGS_FAMILY_PREFIXED, "family-prefixed", ["INV-SF-1"], id="family-prefixed"
         ),
     ],
 )
@@ -1712,8 +1741,8 @@ def test_contributing_does_not_restate_the_invariant_family() -> None:
 
 
 # ---------------------------------------------------------------------------
-# docs/code-quality.md — pinned as a PARTIAL mapping, pair-wise against the
-# normative doc
+# orchestrator/src/orchestrator/agents/code_quality.md — pinned as a PARTIAL
+# mapping, pair-wise against the normative doc
 #
 # The "Relationship to the design invariants" section maps a subset of the
 # family to Leo's fourteen numbered quality heuristics — four of eleven
@@ -1997,10 +2026,8 @@ def test_fixtures_verdict_table_covers_every_invariant_in_both_shapes() -> None:
 # "this file enumerates": CONTRIBUTING.md is registered and carries ZERO slugs
 # today, because what is pinned there is the ABSENCE of a restatement.
 #
-# plans/ and docs/prds/ are excluded BY DESIGN, not by oversight. Their PRDs and
-# capability manifests transcribe slugs as point-in-time G7 walk records (a scan
-# measured fourteen such files at 5-7 slugs each); those records must NOT be
-# updated when the family changes, so pinning them would force rewriting history.
+# The point-in-time record trees in `_EXCLUDED_TREES` are excluded BY DESIGN, not
+# by oversight; the reason for each tree sits beside that tuple.
 # ---------------------------------------------------------------------------
 
 
@@ -2011,6 +2038,11 @@ def test_fixtures_verdict_table_covers_every_invariant_in_both_shapes() -> None:
         pytest.param("plans", True, "the excluded tree itself", id="excluded-dir"),
         pytest.param("docs/prds/a-prd.md", True, "a nested excluded tree", id="excluded-nested"),
         pytest.param("docs/prds", True, "the nested tree itself", id="excluded-nested-dir"),
+        pytest.param(
+            "review/reports/review-x.md", True, "a review report record", id="excluded-review"
+        ),
+        pytest.param("review/reports", True, "the review reports tree itself", id="excluded-review-dir"),
+        pytest.param("review/other.md", False, "a sibling of review/reports", id="review-sibling"),
         pytest.param("plans-archive/x.md", False, "same prefix, different dir", id="same-prefix"),
         pytest.param("docs/prdsomething.md", False, "same prefix, a file", id="same-prefix-file"),
         pytest.param("docs/legibility/x.md", False, "a sibling of an excluded tree", id="sibling"),
@@ -2157,7 +2189,7 @@ def test_every_enumeration_site_is_pinned() -> None:
     assert not leaked, (
         f"the enumeration scan returned {len(leaked)} file(s) from the excluded "
         f"record trees {sorted(_EXCLUDED_TREES)} (task 3802): {leaked[:5]}. Those "
-        f"trees hold point-in-time G7 walk records that must not be retro-edited, "
+        f"trees hold point-in-time records that must not be retro-edited, "
         f"so pruning them is the policy, not an optimisation."
     )
 
@@ -2171,9 +2203,10 @@ def test_every_enumeration_site_is_pinned() -> None:
         f"one this repo has had drifted. Either pin the site here (add it to "
         f"PINNED_SITES with an assertion covering what it enumerates) or stop "
         f"enumerating there and point at {_repo_relative(NORMATIVE_DOC)} instead. "
-        f"Note that plans/ and docs/prds/ are excluded on purpose — they record "
-        f"point-in-time G7 walks that must not be retro-edited — so a new PRD "
-        f"transcribing slugs will never appear here."
+        f"Note that {', '.join(f'{tree}/' for tree in _EXCLUDED_TREES)} are "
+        f"excluded on purpose — they hold point-in-time records that must not be "
+        f"retro-edited (see _EXCLUDED_TREES) — so a new file there transcribing "
+        f"slugs will never appear here."
     )
 
 
@@ -2716,11 +2749,17 @@ def test_noncanonical_citations_fails_loudly_on_an_empty_family() -> None:
 # ---------------------------------------------------------------------------
 
 def _write_scan_tree(
-    root: Path, relative_paths: list[str], *, untracked: tuple[str, ...] = ()
+    root: Path,
+    relative_paths: list[str],
+    *,
+    untracked: tuple[str, ...] = (),
+    symlinks: tuple[tuple[str, str], ...] = (),
 ) -> None:
     """Build a real git repo at *root*: *relative_paths* end up TRACKED via
     ``git init`` + ``git add -A -f``; any *untracked* paths are written only
-    AFTER the add, so they stay out of the index.
+    AFTER the add, so they stay out of the index. Each *symlinks* pair is
+    ``(link_relative_path, target_as_written_in_the_link)``, created BEFORE the
+    add so the link itself is tracked.
 
     A real repo, not a bare directory: task 4971 re-sources the scan from
     ``git ls-files``, so trackedness must be exercised by the fixture rather
@@ -2735,6 +2774,11 @@ def _write_scan_tree(
         path = root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("", encoding="utf-8")
+
+    for link, target in symlinks:
+        path = root / link
+        path.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(target, path)
 
     for args in (("init", "-q"), ("add", "-A", "-f")):
         _run_git(list(args), cwd=root)
@@ -2969,6 +3013,24 @@ def test_walk_repo_files_ignores_untracked_markdown(tmp_path: Path) -> None:
     assert _walk_repo_files(tmp_path, (".md",)) == [tmp_path / "docs" / "site.md"]
 
 
+def test_walk_repo_files_skips_a_tracked_symlink(tmp_path: Path) -> None:
+    """A tracked symlink's indexed content is its target PATH, and the target is
+    scanned in its own right, so scanning the link double-counts one file. For an
+    untracked target it would read untracked content, against task 4971's
+    tracked-only oracle.
+    """
+    _write_scan_tree(
+        tmp_path, ["docs/real.md"], symlinks=(("notes/alias.md", "../docs/real.md"),)
+    )
+    index = _run_git(["ls-files", "-s"], cwd=tmp_path).stdout
+    assert any(
+        line.startswith("120000") and line.endswith("notes/alias.md")
+        for line in index.splitlines()
+    ), index
+
+    assert _walk_repo_files(tmp_path, (".md",)) == [tmp_path / "docs" / "real.md"]
+
+
 # ---------------------------------------------------------------------------
 # LIVE: the two repo-wide drift assertions
 #
@@ -3022,14 +3084,14 @@ def _assert_scan_is_trustworthy(scanned: list[Path]) -> None:
 
     Non-emptiness is already loud inside ``_citation_scan_files``; what this adds
     is the other direction — a walk that stopped pruning would report drift in
-    ``plans/`` and ``docs/prds/``, whose G7 walk records transcribe the family AS
+    the ``_EXCLUDED_TREES`` record trees, whose records transcribe the family AS
     IT WAS and must never be retro-edited.
     """
     leaked = sorted(_scan_label(path) for path in scanned if _in_excluded_tree(path))
     assert not leaked, (
         f"the citation scan returned {len(leaked)} file(s) from the excluded "
         f"record trees {sorted(_EXCLUDED_TREES)} (task 3803): {leaked[:5]}. Those "
-        f"trees hold point-in-time G7 walk records that must not be retro-edited, "
+        f"trees hold point-in-time records that must not be retro-edited, "
         f"so pruning them is the policy, not an optimisation."
     )
 

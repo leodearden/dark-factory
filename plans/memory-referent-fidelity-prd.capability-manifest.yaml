@@ -107,7 +107,7 @@ tasks:
     verdict: PASS
     delivered_check:
       kind: grep
-      pattern: _entities_gate
+      pattern: entities_gate\(
       paths:
       - fused-memory/src/fused_memory/server/tools.py
       expect: present

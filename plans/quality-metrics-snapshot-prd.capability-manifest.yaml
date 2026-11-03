@@ -1,0 +1,157 @@
+prd: plans/quality-metrics-snapshot-prd.md
+schema_version: 1
+tasks:
+- label: S1
+  task_id: 6394
+  title: Extract scripts/source_measures.py; generalise patch_targets; add workspace_domain
+  note: 'Move list and importer list widened at decompose (2026-10-05): task 5414
+    (done, cdc15a6b56) added PatchCall, patch_calls_in_tree and tracked_files seams
+    and six importers after the PRD''s 92af0716e8 anchor.'
+  capabilities:
+  - name: measures-to-move-exist
+    binding: capability→producer (wired) — scripts/merge_lane_metrics.py::file_size_measures_in_tree,
+      ::function_local_imports_in_tree, ::reexport_names_in_tree, ::file_cognitive_measures,
+      ::require_complexipy, ::maintainability_index, ::patch_targets_in_tree, ::private_reads_in_tree,
+      ::src_module_name, ::tracked_python_files, ::MetricsError, plus 5414's ::PatchCall,
+      ::patch_calls_in_tree, ::tracked_files, ::_git_output — all defined at 2bdfa20ce2
+      and called by ::build_report / ::sweep_repo
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def (file_size_measures|patch_targets|tracked_files|patch_calls_in_tree)
+      paths:
+      - scripts/merge_lane_metrics.py
+      expect: absent
+  - name: workspace-domain-in-source-measures
+    binding: producer = S1 (new) — member list read from root pyproject.toml [tool.uv.workspace].members
+      (7 entries at 2bdfa20ce2) with tomllib plus the scripts/tests pseudo-member
+      constant; per-entry import name with scripts/ as the import root
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def workspace_domain\(
+      paths:
+      - scripts/source_measures.py
+      expect: present
+  - name: patch-targets-take-module-set
+    binding: producer = S1 — scripts/merge_lane_metrics.py::patch_targets_in_tree
+      reads module-scope ::LANE_PATCH_MODULES today; S1 re-homes it in source_measures
+      taking the module set as an argument (decision 2)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def patch_targets_in_tree\(
+      paths:
+      - scripts/source_measures.py
+      expect: present
+  - name: census-importers-repointed
+    binding: capability→producer (wired) — scripts/suite_census.py, ::suite_census_evidence,
+      ::suite_census_pinning, ::suite_census_rust, scripts/tests/test_merge_lane_metrics_patch_calls.py
+      and scripts/tests/test_suite_census_pinning.py import moved names from merge_lane_metrics
+      at 2bdfa20ce2
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^from merge_lane_metrics import
+      paths:
+      - scripts/suite_census.py
+      - scripts/suite_census_evidence.py
+      - scripts/suite_census_pinning.py
+      - scripts/suite_census_rust.py
+      - scripts/tests/test_merge_lane_metrics_patch_calls.py
+      - scripts/tests/test_suite_census_pinning.py
+      expect: absent
+  - name: ratchet-json-byte-identical
+    binding: 'G6 branch 2 (exactness) — identity: moved pure functions keep their
+      bodies, so the report over the same tree is unchanged; configuration: no file
+      S1 edits is or becomes lane-importing (::imports_lane_module_in_tree), none
+      appears in orchestrator/tests/merge_lane_ratchet_baseline.json at 2bdfa20ce2,
+      and source_measures names no ALIAS_MODULES path; guard orchestrator/tests/test_merge_lane_ratchet.py::test_baseline_matches_a_fresh_measurement'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: pre/post comparison of --json output needs both script versions; the
+        ratchet test suite is the standing guard
+  - name: source-measures-imports-no-consumer
+    binding: layering rule (decision 1, heuristic 13) — producer = S1
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: an expect:absent grep is vacuous while scripts/source_measures.py does
+        not exist; reviewed in S1
+- label: S1b
+  task_id: 6395
+  title: Re-point the landed 5414 census enumeration onto workspace_domain
+  note: 'Added at decompose (2026-10-05, lead ruling): task 5414 was done (cdc15a6b56),
+    so its landed Part 2 code is re-pointed instead of the task.'
+  capabilities:
+  - name: census-enumeration-to-replace
+    binding: capability→producer (wired) — scripts/suite_census_pinning.py::measure_python_tree
+      walks tracked_files + ::_in_test_tree; ::_FirstParty reads src paths plus ::_SCRIPT_DIRS;
+      reached from scripts/suite_census.py::_python_pinning via ::ECOSYSTEMS['pytest']
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: _SCRIPT_DIRS|tracked_files
+      paths:
+      - scripts/suite_census_pinning.py
+      expect: absent
+  - name: census-reads-workspace-domain
+    binding: DAG-direction — workspace_domain produced by S1, upstream of S1b (S1b
+      depends on S1)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: workspace_domain
+      paths:
+      - scripts/suite_census_pinning.py
+      expect: present
+  - name: census-test-set-equals-domain-tests
+    binding: 'G6 branch 2 (exactness) — measured at 2bdfa20ce2: the census''s tests-segment
+      set (1,656) equals the domain tests kind (1,443 member + 117 scripts/tests +
+      96 tests/), 0 files outside, so first-party-independent columns cannot move;
+      first-party columns may move only for bare-name scripts/legibility importers'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: pre/post Part 2 table comparison at a fixed tree; boundary row 13 is
+        the fixture guard
+- label: S2
+  task_id: 6396
+  title: scripts/quality_metrics_snapshot.py (measure, --diff, --summary) and /review-all
+    phase-1 wiring
+  capabilities:
+  - name: snapshot-imports-source-measures
+    binding: DAG-direction — source_measures (S1) upstream of S2; complexipy 6.2.0
+      and radon 6.0.1 import from the workspace venv; pin source_measures COMPLEXIPY_MIN/MAX_EXCLUSIVE
+      moved by S1
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^(from source_measures import|import source_measures)
+      paths:
+      - scripts/quality_metrics_snapshot.py
+      expect: present
+  - name: consumer-graph-shape
+    binding: capability→producer (wired) — skills/review-all/references/orchestration.md
+      declares import_graph_path as {edges, reach_back, deferred, cycles}; skills/review-all/SKILL.md
+      Phase 1 already names scripts/quality_metrics_snapshot.py and plans/quality-metrics/<run_id>.json
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: 'skill-text wiring is judged in review (INV-10: no prose grep)'
+  - name: domain-count-equals-measured-files
+    binding: 'G6 branch 2 — recount from git ls-tree: 2,255 at 92af0716e8 (531+1,426+94+110+94),
+      2,295 at 2bdfa20ce2; the signal compares against the count at the measured commit,
+      never a constant'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: runtime assertion of the leaf's own CLI on main
+  - name: report-no-ranking-no-exit-1
+    binding: 'rejection-mechanism — producer = S2 (decision 6: path order, no averages,
+      exit 0/2 only); boundary rows 6 and 11'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a property of the output order, judged by the boundary rows

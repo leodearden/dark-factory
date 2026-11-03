@@ -1,20 +1,25 @@
 """The one task snapshot unit — ``dashboard.data.task_snapshot``.
 
 Every test here drives the unit through its PUBLIC seam: the canned
-fused-memory substrate below is patched at ``dashboard.data.tasks.mcp_tool_call``
-(a public name), so the real ``fetch_tasks`` / ``fetch_statuses`` / cache /
-fan-out path runs underneath and no private name is reached into.
+fused-memory substrate (``tests/_canned_mcp.py``) is patched at
+``dashboard.data.tasks.mcp_tool_call`` (a public name), so the real
+``fetch_tasks`` / ``fetch_statuses`` / cache / fan-out path runs underneath
+and no private name is reached into.
 """
 
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+import os
+import threading
 from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
 import httpx
 import pytest
+from _canned_mcp import CannedMCP, _raw_row
+from shared.process_identity import Liveness, ProcessIdentity, capture
+from shared.task_deferral import HeldBySessionDeferral, PlanningDeferral, record_to_json
 
 NOW = datetime(2026, 9, 20, 12, 0, 0, tzinfo=UTC)
 """The one injected instant every test stamps against.
@@ -24,136 +29,10 @@ whole point of the envelope is that ``as_of`` names the instant a payload was
 measured, and a test that cannot say what that instant is cannot check it.
 """
 
+
 # ---------------------------------------------------------------------------
-# CannedMCP — the fused-memory substrate, emulated faithfully enough that a
-# test above it is not vacuous (task 5587 pre-1)
+# TestCannedMCP — the shared substrate's fidelity (task 5587 pre-1)
 # ---------------------------------------------------------------------------
-
-
-class CannedMCP:
-    """A stand-in for :func:`dashboard.data.memory.mcp_tool_call`.
-
-    Faithful to the two substrate contracts the unit above it depends on,
-    because a paging loop tested against a non-paging fake tests nothing:
-
-    * ``get_tasks`` applies ``statuses`` as a row filter SERVER-side, then
-      slices ``page_size``/``offset`` over a list ordered by ascending ``id``
-      — so reaching the high-id end requires a computed offset. No
-      ``pagination`` envelope, matching ``test_active_tasks.py::_canned_mcp``:
-      the unit's row read is unpaginated and the terminal window discards the
-      envelope, so emitting one would fake a contract nothing here reads.
-    * ``get_statuses`` slices a deterministic total order and answers with the
-      five-key ``pagination`` envelope
-      (``total``/``offset``/``page_size``/``returned``/``has_more``) exactly
-      as ``fused_memory/server/tools.py::_pagination_meta`` builds it:
-      ``page_size`` echoes the REQUESTED size verbatim, ``returned`` is the
-      count actually SERVED, and ``has_more`` is ``offset + returned <
-      total``. That includes serving a page SMALLER than requested, which is
-      the case that tells a loop advancing by ``returned`` apart from one
-      advancing by the size it asked for.
-
-    Args:
-        rows: Raw MCP ``get_tasks`` rows (string ids), as
-            :func:`_raw_row` builds them.
-        status_map: ``{int id: status}`` — the population ``get_statuses``
-            serves.
-        status_page_size: The server's own page cap. ``None`` (default) is the
-            backward-compatible mode: the whole map in one response with NO
-            ``pagination`` key, which the contract defines as COMPLETE.
-        short_page_by: Serve this many FEWER statuses per page than the
-            smaller of the requested and the server cap. The served count is
-            reported in ``pagination['returned']``, like any other page. Zero
-            disables it.
-
-    Mutable after construction so one instance can change behaviour between a
-    test's two acquisitions. :attr:`fail_when` is a predicate over the
-    recorded call — ``{'tool', 'args', 'kwargs'}`` — and every call it accepts
-    raises ``httpx.ReadTimeout``. A predicate rather than a set of tool names
-    because the two failures worth injecting are not the same shape: "this
-    half is unreachable now" keys on the tool, while "the walk breaks at its
-    SECOND page" keys on the offset, and only the latter distinguishes an
-    offline marker from a silently short map.
-    """
-
-    def __init__(
-        self,
-        rows=(),
-        status_map=None,
-        *,
-        status_page_size: int | None = None,
-        short_page_by: int = 0,
-    ) -> None:
-        self.rows = [dict(row) for row in rows]
-        self.status_map = dict(status_map or {})
-        self.status_page_size = status_page_size
-        self.short_page_by = short_page_by
-        self.fail_when: Callable[[dict], bool] = lambda call: False
-        self.calls: list[dict] = []
-
-    def calls_to(self, tool: str) -> list[dict]:
-        """Every recorded call to *tool*, in order."""
-        return [call for call in self.calls if call['tool'] == tool]
-
-    async def __call__(self, client, url, tool, args, **kwargs):
-        # ``kwargs`` is recorded too: the per-request budget rides as the
-        # ``timeout=`` keyword and never inside ``args``, so it is only
-        # assertable at the wire if it is kept.
-        call = {'tool': tool, 'args': dict(args), 'kwargs': dict(kwargs)}
-        self.calls.append(call)
-        if self.fail_when(call):
-            raise httpx.ReadTimeout(f'canned {tool} read timeout')
-        if tool == 'get_statuses':
-            return self._statuses(args)
-        if tool == 'get_tasks':
-            return self._tasks(args)
-        raise AssertionError(f'unexpected tool {tool!r}')
-
-    def _statuses(self, args: dict) -> dict:
-        ordered = sorted(self.status_map.items(), key=lambda item: int(item[0]))
-        if self.status_page_size is None:
-            return {'statuses': {str(tid): status for tid, status in ordered}}
-
-        requested = args.get('page_size') or self.status_page_size
-        served = max(1, min(requested, self.status_page_size) - self.short_page_by)
-        offset = args.get('offset') or 0
-        window = ordered[offset:offset + served]
-        return {
-            'statuses': {str(tid): status for tid, status in window},
-            'pagination': {
-                'total': len(ordered),
-                'offset': offset,
-                'page_size': requested,
-                'returned': len(window),
-                'has_more': offset + len(window) < len(ordered),
-            },
-        }
-
-    def _tasks(self, args: dict) -> dict:
-        statuses = args.get('statuses')
-        selected = [
-            row for row in self.rows
-            if statuses is None or row.get('status') in statuses
-        ]
-        selected.sort(key=lambda row: int(row['id']))  # ORDER BY id ASC
-        page_size = args.get('page_size')
-        if page_size is not None:
-            start = args.get('offset') or 0
-            selected = selected[start:start + page_size]
-        return {'tasks': selected}
-
-
-def _raw_row(task_id, status, **overrides) -> dict:
-    """One raw MCP ``get_tasks`` row, distinguishable by id."""
-    row = {
-        'id': str(task_id),
-        'title': f'task {task_id}',
-        'status': status,
-        'dependencies': [],
-        'metadata': {},
-        'updatedAt': '2026-01-01T00:00:00+00:00',
-    }
-    row.update(overrides)
-    return row
 
 
 class TestCannedMCP:
@@ -247,15 +126,12 @@ def project_root(tmp_path):
 
 @pytest.fixture(autouse=True)
 def _isolate_caches():
-    """Neither the unit cache nor the fetch_tasks cache may cross a test."""
+    """The unit cache may not cross a test."""
     import dashboard.data.task_snapshot as snapshot_mod
-    import dashboard.data.tasks as tasks_mod
 
-    snapshot_mod._snapshot_cache_clear()
-    tasks_mod._fetch_tasks_cache_clear()
+    snapshot_mod.clear_snapshot_cache()
     yield
-    snapshot_mod._snapshot_cache_clear()
-    tasks_mod._fetch_tasks_cache_clear()
+    snapshot_mod.clear_snapshot_cache()
 
 
 class TestAcquireSnapshotHappyPath:
@@ -377,7 +253,7 @@ class TestAcquireSnapshotHappyPath:
 
         canned.fail_when = lambda call: call['tool'] == 'get_statuses'
         import dashboard.data.task_snapshot as snapshot_mod
-        snapshot_mod._snapshot_cache_clear()
+        snapshot_mod.clear_snapshot_cache()
         degraded = await self._acquire(canned, dummy_client, dashboard_config, project_root,
                                        now=NOW)
 
@@ -511,9 +387,9 @@ class TestAcquireSnapshotHappyPath:
     ):
         """(g) The unit owns the only TTL on this path.
 
-        Inside it, nothing is read at all. Past it, BOTH halves are — including
-        the rows, whose own 20 s cache would otherwise serve a value older than
-        the ``as_of`` this unit is about to stamp on it.
+        Inside it, nothing is read at all. Past it, BOTH halves are re-read
+        live, so neither can be older than the ``as_of`` this unit is about to
+        stamp on it.
         """
         import dashboard.data.task_snapshot as snapshot_mod
 
@@ -529,9 +405,7 @@ class TestAcquireSnapshotHappyPath:
             f'a warm unit issues no MCP call, got {canned.calls[calls_after_first:]}'
         )
 
-        # Past the unit TTL. The fetch_tasks cache is NOT cleared and its 20 s
-        # window is still open in real time, so a cached row read would serve
-        # the first acquisition's rows here.
+        # Past the unit TTL.
         monkeypatch.setattr(snapshot_mod, 'SNAPSHOT_TTL_SECONDS', 0.0)
         later = NOW + timedelta(seconds=16)
         third = await self._acquire(canned, dummy_client, dashboard_config, project_root, now=later)
@@ -786,7 +660,7 @@ class TestSnapshotDegradation:
         assert unreachable.failure is SnapshotFailure.UNREACHABLE
         assert unreachable.rows.state is not DatumState.FRESH
 
-        snapshot_mod._snapshot_cache_clear()
+        snapshot_mod.clear_snapshot_cache()
         monkeypatch.setattr(snapshot_mod, 'PER_CALL_TIMEOUT', 0.01)
         slow = CannedMCP(rows=rows, status_map=status_map, status_page_size=2000)
 
@@ -899,3 +773,127 @@ class TestSnapshotDegradation:
         assert unit.census.as_of == sibling_at
         assert unit.census.reason == reason
         assert classify(unit) is SnapshotHealth.DEGRADED
+
+
+# ---------------------------------------------------------------------------
+# TestHoldReads — what a deferred hold's referents read as, once per unit (task 6527)
+# ---------------------------------------------------------------------------
+
+HELD_ROW = 71
+STRAY_HELD_ROW = 72
+PLANNING_ROW = 73
+
+
+def _held_by_session(holder: ProcessIdentity) -> dict:
+    return {'deferral': record_to_json(HeldBySessionDeferral(
+        holder=holder, deferred_at=NOW, stamped_at=NOW,
+    ))}
+
+
+class TestHoldReads:
+    """Holder liveness is read from /proc once per unit and off the event loop.
+
+    The status map is offered as carrier statuses only when it was measured.
+    """
+
+    @staticmethod
+    async def _acquire(canned, client, config, root, *, now):
+        from dashboard.data.task_snapshot import acquire_snapshot
+
+        with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
+            return await acquire_snapshot(client, config, root, now=now)
+
+    @pytest.fixture()
+    def live_holder(self) -> ProcessIdentity:
+        holder = capture(os.getpid())
+        assert holder is not None, 'the test process must be able to identify itself'
+        return holder
+
+    @pytest.fixture()
+    def liveness_reads(self, monkeypatch) -> list[threading.Thread]:
+        """Wrap the unit's ``read_liveness``, recording the thread each call ran on."""
+        import dashboard.data.task_snapshot as snapshot_mod
+
+        real = snapshot_mod.read_liveness
+        threads: list[threading.Thread] = []
+
+        def recording(holders, **kwargs):
+            threads.append(threading.current_thread())
+            return real(holders, **kwargs)
+
+        monkeypatch.setattr(snapshot_mod, 'read_liveness', recording)
+        return threads
+
+    async def test_a_deferred_session_holder_is_read_into_the_unit(
+        self, project_root, dashboard_config, dummy_client, live_holder, liveness_reads
+    ):
+        canned = CannedMCP(
+            rows=[
+                _raw_row(HELD_ROW, 'deferred', metadata=_held_by_session(live_holder)),
+                _raw_row(STRAY_HELD_ROW, 'pending', metadata=_held_by_session(live_holder)),
+            ],
+            status_map={HELD_ROW: 'deferred', STRAY_HELD_ROW: 'pending'},
+        )
+        snapshot = await self._acquire(canned, dummy_client, dashboard_config, project_root,
+                                       now=NOW)
+
+        assert snapshot.holder_liveness == {HELD_ROW: Liveness.ALIVE}, (
+            'only the DEFERRED row names a holder; a stray record names none'
+        )
+
+    async def test_proc_is_read_once_per_unit_and_off_the_event_loop(
+        self, project_root, dashboard_config, dummy_client, live_holder, liveness_reads
+    ):
+        canned = CannedMCP(
+            rows=[_raw_row(HELD_ROW, 'deferred', metadata=_held_by_session(live_holder))],
+            status_map={HELD_ROW: 'deferred'},
+        )
+        for now in (NOW, NOW + timedelta(seconds=1)):
+            await self._acquire(canned, dummy_client, dashboard_config, project_root, now=now)
+
+        assert len(liveness_reads) == 1, 'a unit served from the cache must not re-read /proc'
+        assert liveness_reads[0] is not threading.main_thread(), (
+            '/proc must be read on a worker thread, never on the event loop'
+        )
+
+    async def test_a_unit_with_no_session_hold_reads_no_proc(
+        self, project_root, dashboard_config, dummy_client, live_holder, liveness_reads
+    ):
+        planning = record_to_json(PlanningDeferral(deferred_at=NOW, stamped_at=NOW))
+        canned = CannedMCP(
+            rows=[
+                _raw_row(STRAY_HELD_ROW, 'pending', metadata=_held_by_session(live_holder)),
+                _raw_row(PLANNING_ROW, 'deferred', metadata={'deferral': planning}),
+            ],
+            status_map={STRAY_HELD_ROW: 'pending', PLANNING_ROW: 'deferred'},
+        )
+        snapshot = await self._acquire(canned, dummy_client, dashboard_config, project_root,
+                                       now=NOW)
+
+        assert liveness_reads == []
+        assert snapshot.holder_liveness == {}
+
+    async def test_the_status_map_is_offered_only_when_it_was_measured(
+        self, project_root, dashboard_config, dummy_client, monkeypatch
+    ):
+        import dashboard.data.task_snapshot as snapshot_mod
+        from dashboard.data.datum import DatumState
+        from dashboard.data.task_snapshot import measured_status_map
+
+        rows, status_map = _tree()
+        canned = CannedMCP(rows=rows, status_map=status_map, status_page_size=2000)
+        good = await self._acquire(canned, dummy_client, dashboard_config, project_root,
+                                   now=NOW)
+        measured = measured_status_map(good)
+        assert measured is not None and dict(measured) == status_map
+
+        monkeypatch.setattr(snapshot_mod, 'SNAPSHOT_TTL_SECONDS', 0.0)
+        canned.fail_when = lambda call: call['tool'] == 'get_statuses'
+        degraded = await self._acquire(canned, dummy_client, dashboard_config, project_root,
+                                       now=NOW + timedelta(seconds=20))
+
+        assert degraded.rows.state is DatumState.FRESH
+        assert degraded.census.state is DatumState.STALE
+        assert measured_status_map(degraded) is None, (
+            'an unread map must not offer an empty one, or every carrier reads as missing'
+        )

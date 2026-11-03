@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _merge_lane_fakes import FakeVerifier, VerifyScript
+from _merge_lane_fakes import FakeVerifier, VerifyScript, lane_scene_config
 from _orch_helpers import (
     MERGE_GATE_BARRIER_TIMEOUT,
     make_placeholder_future,
@@ -24,20 +24,27 @@ from escalation.models import BORN_AT_L2_SEVERITIES
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.merge_queue import (  # noqa: E402
+from orchestrator.merge_lane.shadow import (
     _WARM_COLD_SHADOW_SENTINEL,
     _WARM_COLD_SHADOW_UNPARSEABLE_SENTINEL,
     ShadowCompareDiff,
     ShadowCompareState,
-    _alarm_warm_shadow_unparseable,
     _load_shadow_compare_state,
-    _maybe_schedule_shadow_compare,
     _nextest_reported_test_count,
     _run_shadow_compare,
     _save_shadow_compare_state,
     _shadow_compare_due,
     _submit_shadow_divergence_escalation,
     diff_per_test_results,
+)
+from orchestrator.merge_lane.worker import (
+    PRODUCTION_VERIFIER,
+    MergeOutcome,
+    MergeRequest,
+    QueuedBranch,
+    SpeculativeMergeWorker,
+    _alarm_warm_shadow_unparseable,
+    _maybe_schedule_shadow_compare,
     parse_per_test_results,
 )
 from orchestrator.verify import VerifyResult
@@ -829,10 +836,10 @@ class TestSubmitShadowDivergenceEscalation:
 
 
 # ---------------------------------------------------------------------------
-# Step-11: create_throwaway_verify_worktree (real-git) + _run_shadow_compare
+# Step-11: create_ephemeral_verify_worktree (real-git) + _run_shadow_compare
 # ---------------------------------------------------------------------------
 
-# --- Real-git fixtures for create_throwaway_verify_worktree ---
+# --- Real-git fixtures for create_ephemeral_verify_worktree ---
 
 
 async def _setup_repo(repo: Path) -> None:
@@ -868,71 +875,70 @@ def git_ops_wcs(git_repo_wcs: Path) -> GitOps:
     return GitOps(git, git_repo_wcs)
 
 
-class TestCreateThrowawayVerifyWorktree:
-    """Tests for git_ops.create_throwaway_verify_worktree (step-11 real-git).
+class TestCreateEphemeralVerifyWorktree:
+    """Behavioural pin of the public GitOps.create_ephemeral_verify_worktree.
 
-    (1) Verifies create_throwaway_verify_worktree creates an EPHEMERAL
-    _merge-<uuid> worktree (not the warm _merge-verify path) checked out at
-    merge_commit, and that cleanup_merge_worktree removes it.
+    It creates a ``_merge-<uuid>`` worktree directly under worktree_base,
+    detached at the given sha, never the fixed warm ``_merge-verify`` path;
+    cleanup_merge_worktree removes it.
     """
 
     @pytest.mark.asyncio
-    async def test_creates_ephemeral_worktree_at_merge_commit(
+    async def test_create_ephemeral_verify_worktree_is_detached_merge_uuid_at_sha(
         self, git_ops_wcs: GitOps, git_repo_wcs: Path
     ) -> None:
-        # Resolve the current HEAD SHA (a real commit in the repo)
         _, sha_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo_wcs)
-        merge_commit = sha_out.strip()
+        sha = sha_out.strip()
 
-        wt = await git_ops_wcs.create_throwaway_verify_worktree(merge_commit)
+        wt = await git_ops_wcs.create_ephemeral_verify_worktree(sha)
 
         try:
-            assert wt.exists(), f'Throwaway worktree dir must exist: {wt}'
-            # Name must start with _merge- (ephemeral UUID)
+            assert wt.exists(), f'Ephemeral worktree dir must exist: {wt}'
             assert wt.name.startswith('_merge-'), (
                 f'Expected _merge-<uuid>, got {wt.name!r}'
             )
-            # Must be checked out at the requested commit
+            assert wt.resolve().parent == git_ops_wcs.worktree_base.resolve()
             _, head_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
-            assert head_out.strip() == merge_commit, (
-                f'Worktree HEAD {head_out.strip()!r} != merge_commit {merge_commit!r}'
+            assert head_out.strip() == sha, (
+                f'Worktree HEAD {head_out.strip()!r} != sha {sha!r}'
             )
+            symref_rc, _, _ = await _run(['git', 'symbolic-ref', '-q', 'HEAD'], cwd=wt)
+            assert symref_rc != 0, 'Ephemeral worktree HEAD must be detached'
         finally:
             await git_ops_wcs.cleanup_merge_worktree(wt)
 
     @pytest.mark.asyncio
-    async def test_path_is_not_persistent_merge_verify(
+    async def test_create_ephemeral_verify_worktree_is_never_persistent_merge_verify(
         self, git_ops_wcs: GitOps, git_repo_wcs: Path
     ) -> None:
         _, sha_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo_wcs)
-        merge_commit = sha_out.strip()
+        sha = sha_out.strip()
 
-        wt = await git_ops_wcs.create_throwaway_verify_worktree(merge_commit)
+        wt = await git_ops_wcs.create_ephemeral_verify_worktree(sha)
 
         try:
-            # Path must NOT be the persistent warm worktree
             persistent = git_ops_wcs.persistent_merge_worktree_path
             assert wt.resolve() != persistent.resolve(), (
-                f'Throwaway path must not be {persistent}'
+                f'Ephemeral path must not be {persistent}'
             )
             assert wt.name != '_merge-verify', (
-                f'Throwaway name must not be _merge-verify; got {wt.name!r}'
+                f'Ephemeral name must not be _merge-verify; got {wt.name!r}'
             )
         finally:
             await git_ops_wcs.cleanup_merge_worktree(wt)
 
     @pytest.mark.asyncio
-    async def test_cleanup_removes_throwaway_worktree(
+    async def test_create_ephemeral_verify_worktree_is_removed_by_cleanup(
         self, git_ops_wcs: GitOps, git_repo_wcs: Path
     ) -> None:
         _, sha_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo_wcs)
-        merge_commit = sha_out.strip()
+        sha = sha_out.strip()
 
-        wt = await git_ops_wcs.create_throwaway_verify_worktree(merge_commit)
+        wt = await git_ops_wcs.create_ephemeral_verify_worktree(sha)
         assert wt.exists()
 
         await git_ops_wcs.cleanup_merge_worktree(wt)
-        assert not wt.exists(), 'cleanup_merge_worktree must remove the throwaway worktree'
+        assert not wt.exists(), 'cleanup_merge_worktree must remove the ephemeral worktree'
 
 
 # --- _run_shadow_compare async tests (cold leg stubbed) ---
@@ -942,10 +948,7 @@ def _make_mock_req(tmp_path: Path) -> MagicMock:
     """Build a minimal MergeRequest stub."""
     req = MagicMock()
     req.task_id = 'task-1710'
-    req.config = OrchestratorConfig(
-        project_root=tmp_path,
-        git=GitConfig(warm_verify_shadow_compare=True),
-    )
+    req.config = lane_scene_config(tmp_path, GitConfig(warm_verify_shadow_compare=True))
     return req
 
 
@@ -968,11 +971,12 @@ class TestRunShadowCompare:
         git_ops_stub = MagicMock()
 
         with patch(
-            'orchestrator.merge_queue._run_cold_shadow_verify',
+            'orchestrator.merge_lane.shadow._run_cold_shadow_verify',
             new=AsyncMock(return_value=cold),
         ):
             await _run_shadow_compare(
-                git_ops_stub, req, 'sha123abc', warm, q, event_store
+                git_ops_stub, req, 'sha123abc', warm, q, event_store,
+                verifier=PRODUCTION_VERIFIER,
             )
 
         # Case (c): no divergence → no escalation
@@ -988,11 +992,12 @@ class TestRunShadowCompare:
         req = _make_mock_req(tmp_path)
 
         with patch(
-            'orchestrator.merge_queue._run_cold_shadow_verify',
+            'orchestrator.merge_lane.shadow._run_cold_shadow_verify',
             new=AsyncMock(return_value=cold),
         ):
             await _run_shadow_compare(
-                MagicMock(), req, 'sha', warm, _make_escalation_queue(), event_store
+                MagicMock(), req, 'sha', warm, _make_escalation_queue(), event_store,
+                verifier=PRODUCTION_VERIFIER,
             )
 
         # Parity-ok event should be emitted
@@ -1012,11 +1017,12 @@ class TestRunShadowCompare:
         req = _make_mock_req(tmp_path)
 
         with patch(
-            'orchestrator.merge_queue._run_cold_shadow_verify',
+            'orchestrator.merge_lane.shadow._run_cold_shadow_verify',
             new=AsyncMock(return_value=cold),
         ):
             await _run_shadow_compare(
-                MagicMock(), req, 'deadbeef1234', warm, q, event_store
+                MagicMock(), req, 'deadbeef1234', warm, q, event_store,
+                verifier=PRODUCTION_VERIFIER,
             )
 
         q.submit.assert_called_once()
@@ -1031,11 +1037,12 @@ class TestRunShadowCompare:
         req = _make_mock_req(tmp_path)
 
         with patch(
-            'orchestrator.merge_queue._run_cold_shadow_verify',
+            'orchestrator.merge_lane.shadow._run_cold_shadow_verify',
             new=AsyncMock(return_value=cold),
         ):
             await _run_shadow_compare(
-                MagicMock(), req, 'deadbeef1234', warm, q, MagicMock()
+                MagicMock(), req, 'deadbeef1234', warm, q, MagicMock(),
+                verifier=PRODUCTION_VERIFIER,
             )
 
         esc = q.submit.call_args[0][0]
@@ -1050,11 +1057,12 @@ class TestRunShadowCompare:
         req = _make_mock_req(tmp_path)
 
         with patch(
-            'orchestrator.merge_queue._run_cold_shadow_verify',
+            'orchestrator.merge_lane.shadow._run_cold_shadow_verify',
             new=AsyncMock(return_value=cold),
         ):
             await _run_shadow_compare(
-                MagicMock(), req, 'sha', warm, _make_escalation_queue(), event_store
+                MagicMock(), req, 'sha', warm, _make_escalation_queue(), event_store,
+                verifier=PRODUCTION_VERIFIER,
             )
 
         event_store.emit.assert_not_called()
@@ -1068,10 +1076,11 @@ class TestRunShadowCompare:
         req = _make_mock_req(tmp_path)
         mock_cold = AsyncMock(return_value=cold)
 
-        with patch('orchestrator.merge_queue._run_cold_shadow_verify', new=mock_cold):
+        with patch('orchestrator.merge_lane.shadow._run_cold_shadow_verify', new=mock_cold):
             await _run_shadow_compare(
                 MagicMock(), req, 'sha_target_123', warm,
-                _make_escalation_queue(), MagicMock()
+                _make_escalation_queue(), MagicMock(),
+                verifier=PRODUCTION_VERIFIER,
             )
 
         # _run_cold_shadow_verify must have been called with the exact merge_commit
@@ -1104,11 +1113,12 @@ class TestRunShadowCompare:
         req = _make_mock_req(tmp_path)
 
         with patch(
-            'orchestrator.merge_queue._run_cold_shadow_verify',
+            'orchestrator.merge_lane.shadow._run_cold_shadow_verify',
             new=AsyncMock(return_value=cold),
         ):
             await _run_shadow_compare(
-                MagicMock(), req, 'sha123', warm, q, event_store
+                MagicMock(), req, 'sha123', warm, q, event_store,
+                verifier=PRODUCTION_VERIFIER,
             )
 
         # No alarm — this is inconclusive, not a real warm/cold divergence
@@ -1127,11 +1137,12 @@ class TestRunShadowCompare:
         req = _make_mock_req(tmp_path)
 
         with patch(
-            'orchestrator.merge_queue._run_cold_shadow_verify',
+            'orchestrator.merge_lane.shadow._run_cold_shadow_verify',
             new=AsyncMock(return_value=cold),
         ):
             await _run_shadow_compare(
-                MagicMock(), req, 'sha', warm, q, event_store
+                MagicMock(), req, 'sha', warm, q, event_store,
+                verifier=PRODUCTION_VERIFIER,
             )
 
         # Both empty: diff has no divergence → parity-ok event (both agree on nothing)
@@ -1157,8 +1168,8 @@ class TestRunShadowCompare:
         req = _make_mock_req(tmp_path)
         mock_cold = AsyncMock(side_effect=[cold1, cold2])
 
-        with patch('orchestrator.merge_queue._run_cold_shadow_verify', new=mock_cold):
-            await _run_shadow_compare(MagicMock(), req, 'sha', warm, q, MagicMock())
+        with patch('orchestrator.merge_lane.shadow._run_cold_shadow_verify', new=mock_cold):
+            await _run_shadow_compare(MagicMock(), req, 'sha', warm, q, MagicMock(), verifier=PRODUCTION_VERIFIER)
 
         # Cold leg must be invoked exactly twice (initial run + re-confirmation)
         assert mock_cold.call_count == 2, (
@@ -1187,8 +1198,8 @@ class TestRunShadowCompare:
         req = _make_mock_req(tmp_path)
         mock_cold = AsyncMock(side_effect=[cold1, cold2])
 
-        with patch('orchestrator.merge_queue._run_cold_shadow_verify', new=mock_cold):
-            await _run_shadow_compare(MagicMock(), req, 'sha', warm, q, event_store)
+        with patch('orchestrator.merge_lane.shadow._run_cold_shadow_verify', new=mock_cold):
+            await _run_shadow_compare(MagicMock(), req, 'sha', warm, q, event_store, verifier=PRODUCTION_VERIFIER)
 
         # Transient flip → no alarm (flaky, not a real divergence)
         q.submit.assert_not_called()
@@ -1212,8 +1223,8 @@ class TestRunShadowCompare:
         req = _make_mock_req(tmp_path)
         mock_cold = AsyncMock(return_value=cold)
 
-        with patch('orchestrator.merge_queue._run_cold_shadow_verify', new=mock_cold):
-            await _run_shadow_compare(MagicMock(), req, 'sha', warm, q, event_store)
+        with patch('orchestrator.merge_lane.shadow._run_cold_shadow_verify', new=mock_cold):
+            await _run_shadow_compare(MagicMock(), req, 'sha', warm, q, event_store, verifier=PRODUCTION_VERIFIER)
 
         # No re-confirmation: cold called exactly once (no alarm-worthy divergence)
         assert mock_cold.call_count == 1, (
@@ -1247,8 +1258,8 @@ class TestRunShadowCompare:
         req = _make_mock_req(tmp_path)
         mock_cold = AsyncMock(side_effect=[cold1, cold2])
 
-        with patch('orchestrator.merge_queue._run_cold_shadow_verify', new=mock_cold):
-            await _run_shadow_compare(MagicMock(), req, 'sha', warm, q, event_store)
+        with patch('orchestrator.merge_lane.shadow._run_cold_shadow_verify', new=mock_cold):
+            await _run_shadow_compare(MagicMock(), req, 'sha', warm, q, event_store, verifier=PRODUCTION_VERIFIER)
 
         # Cold must be called twice (first run + re-confirm attempt)
         assert mock_cold.call_count == 2, (
@@ -1344,6 +1355,8 @@ class _ColdLegDouble:
         warm_results: dict[str, str],
         escalation_queue: object,
         event_store: object,
+        *,
+        verifier: object,
     ) -> None:
         self.calls.append(_ColdLegCall(
             git_ops, req, merge_commit, warm_results, escalation_queue, event_store,
@@ -1408,9 +1421,10 @@ async def _schedule_with_cold_leg_doubled(
     merge_commit: str = 'sha',
 ) -> None:
     """Run the scheduler once against a doubled cold leg, then settle."""
-    with patch('orchestrator.merge_queue._run_shadow_compare', new=cold_leg):
+    with patch('orchestrator.merge_lane.shadow._run_shadow_compare', new=cold_leg):
         await _maybe_schedule_shadow_compare(
-            worker, MagicMock(), req, merge_commit, warm, None, None
+            worker, MagicMock(), req, merge_commit, warm, None, None,
+            verifier=PRODUCTION_VERIFIER,
         )
         await _settle()
 
@@ -1428,7 +1442,7 @@ def _make_shadow_config(
         warm_verify_shadow_compare_every_n_merges=every_n,
         warm_verify_shadow_compare_nightly_interval_secs=nightly_interval,
     )
-    return OrchestratorConfig(project_root=tmp_path, git=git)
+    return lane_scene_config(tmp_path, git)
 
 
 class TestMaybeScheduleShadowCompare:
@@ -1514,10 +1528,11 @@ class TestMaybeScheduleShadowCompare:
 
         # try/finally, not straight-line — see _ColdLegDouble.drain.
         try:
-            with patch('orchestrator.merge_queue._run_shadow_compare', new=cold_leg):
+            with patch('orchestrator.merge_lane.shadow._run_shadow_compare', new=cold_leg):
                 # This call must RETURN before the gated leg can complete
                 await _maybe_schedule_shadow_compare(
-                    worker, MagicMock(), req, 'sha123', warm, None, None
+                    worker, MagicMock(), req, 'sha123', warm, None, None,
+                    verifier=PRODUCTION_VERIFIER,
                 )
                 await cold_leg.await_start()
                 assert cold_leg.in_flight, (
@@ -1561,10 +1576,11 @@ class TestMaybeScheduleShadowCompare:
 
         # try/finally, not straight-line — see _ColdLegDouble.drain.
         try:
-            with patch('orchestrator.merge_queue._run_shadow_compare', new=cold_leg):
+            with patch('orchestrator.merge_lane.shadow._run_shadow_compare', new=cold_leg):
                 # First call: spawns the leg, which stays in flight on its gate
                 await _maybe_schedule_shadow_compare(
-                    worker, MagicMock(), req, 'sha', warm, None, None
+                    worker, MagicMock(), req, 'sha', warm, None, None,
+                    verifier=PRODUCTION_VERIFIER,
                 )
                 await cold_leg.await_start()
                 assert len(cold_leg.calls) == 1
@@ -1577,7 +1593,8 @@ class TestMaybeScheduleShadowCompare:
                 _save_shadow_compare_state(_shadow_state_path(tmp_path), state2)
 
                 await _maybe_schedule_shadow_compare(
-                    worker, MagicMock(), req, 'sha2', warm, None, None
+                    worker, MagicMock(), req, 'sha2', warm, None, None,
+                    verifier=PRODUCTION_VERIFIER,
                 )
                 await _settle()
                 # Still only the one leg
@@ -1610,10 +1627,11 @@ class TestMaybeScheduleShadowCompare:
 
         # try/finally, not straight-line — see _ColdLegDouble.drain.
         try:
-            with patch('orchestrator.merge_queue._run_shadow_compare', new=cold_leg):
+            with patch('orchestrator.merge_lane.shadow._run_shadow_compare', new=cold_leg):
                 # First call: due → spawns the leg, resets counter to 0
                 await _maybe_schedule_shadow_compare(
-                    worker, MagicMock(), req, 'sha', warm, None, None
+                    worker, MagicMock(), req, 'sha', warm, None, None,
+                    verifier=PRODUCTION_VERIFIER,
                 )
                 await cold_leg.await_start()
                 assert len(cold_leg.calls) == 1
@@ -1627,7 +1645,8 @@ class TestMaybeScheduleShadowCompare:
                 # Second call while first is in-flight: skips scheduling but MUST
                 # increment and persist the counter (10 → 11)
                 await _maybe_schedule_shadow_compare(
-                    worker, MagicMock(), req, 'sha2', warm, None, None
+                    worker, MagicMock(), req, 'sha2', warm, None, None,
+                    verifier=PRODUCTION_VERIFIER,
                 )
                 await _settle()
 
@@ -1648,13 +1667,6 @@ class TestMaybeScheduleShadowCompare:
 # Step-15: Integration — warm capture + worker/harness wiring
 # ---------------------------------------------------------------------------
 
-from orchestrator.merge_queue import (  # noqa: E402
-    MergeOutcome,
-    MergeRequest,
-    QueuedBranch,
-    SpeculativeMergeWorker,
-)
-
 
 def _make_warm_cold_config(
     project_root: Path,
@@ -1673,7 +1685,7 @@ def _make_warm_cold_config(
         warm_verify_shadow_compare=shadow_compare,
         warm_verify_shadow_compare_every_n_merges=1,  # always due in tests
     )
-    return OrchestratorConfig(project_root=project_root, git=git)
+    return lane_scene_config(project_root, git)
 
 
 #: A warm verify output that PARSES into a per-test map.  The map is what
@@ -1725,13 +1737,13 @@ class TestRunPostMergeVerifyOnResultCallback:
         self, tmp_path: Path
     ) -> None:
         """Passing on_result= must not raise TypeError (kwarg must exist)."""
-        from orchestrator.merge_queue import _run_post_merge_verify  # noqa: PLC0415
+        from orchestrator.merge_lane.worker import _run_post_merge_verify
 
         received: list[VerifyResult] = []
         merge_wt = tmp_path / 'wt'
         merge_wt.mkdir()
         req = MagicMock()
-        req.config = OrchestratorConfig(project_root=tmp_path, git=GitConfig())
+        req.config = lane_scene_config(tmp_path, GitConfig())
         req.task_files = None
         req.module_configs = []
         req.task_id = 'task-15'
@@ -1870,7 +1882,7 @@ class TestVerifyAndAdvanceShadowCompareScheduling:
         # _pytest.outcomes.Failed, a BaseException, so an unguarded stop call
         # would be skipped and leak a live worker into teardown (esc-3980-4).
         try:
-            with patch('orchestrator.merge_queue._run_shadow_compare', new=cold_leg):
+            with patch('orchestrator.merge_lane.shadow._run_shadow_compare', new=cold_leg):
                 await queue.put(req)
                 outcome = await wait_responsive(
                     req.result, label='task-sched merge outcome'
@@ -1919,7 +1931,7 @@ class TestVerifyAndAdvanceShadowCompareScheduling:
         # wait_responsive give-up is a BaseException. The gated leg is released
         # in the finally too, so a mid-block assert cannot leave it parked.
         try:
-            with patch('orchestrator.merge_queue._run_shadow_compare', new=cold_leg):
+            with patch('orchestrator.merge_lane.shadow._run_shadow_compare', new=cold_leg):
                 await queue.put(req)
                 # The outcome must arrive without the cold leg being released
                 outcome = await wait_responsive(
@@ -1981,12 +1993,11 @@ class TestHarnessStartMergeWorkerPassesEscalationQueue:
         fake_eq = MagicMock()
         h._escalation_queue = fake_eq
 
-        with patch('orchestrator.merge_queue.SpeculativeMergeWorker') as mock_smw_cls, \
+        with patch('orchestrator.merge_lane.worker.SpeculativeMergeWorker') as mock_smw_cls, \
              patch.object(h, '_build_service_restart_coordinator',
                           return_value=MagicMock()), \
              patch('asyncio.create_task', return_value=MagicMock()):
             mock_smw = MagicMock()
-            mock_smw.run = AsyncMock(return_value=None)
             mock_smw_cls.return_value = mock_smw
 
             await h._start_merge_worker()
@@ -2040,12 +2051,11 @@ class TestHarnessStartMergeWorkerPassesEscalationQueue:
         # _escalation_queue is None by default (set in Harness.__init__)
         assert h._escalation_queue is None
 
-        with patch('orchestrator.merge_queue.SpeculativeMergeWorker') as mock_smw_cls, \
+        with patch('orchestrator.merge_lane.worker.SpeculativeMergeWorker') as mock_smw_cls, \
              patch.object(h, '_build_service_restart_coordinator',
                           return_value=MagicMock()), \
              patch('asyncio.create_task', return_value=MagicMock()):
             mock_smw = MagicMock()
-            mock_smw.run = AsyncMock(return_value=None)
             mock_smw_cls.return_value = mock_smw
 
             await h._start_merge_worker()

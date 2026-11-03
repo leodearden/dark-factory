@@ -36,9 +36,11 @@ sweep is run against LIVE, FOREIGN checkouts whose own orchestrators are up, so
 each authority names how it is read:
 
 * **Graph** — ``GRAPH.RO_QUERY``, where read-only is SERVER-enforced rather
-  than client-promised. Never ``MemoryService`` / ``GraphitiBackend``, whose
-  handles can write.
-* **tasks.db** — an explicitly read-only ``file:...?mode=ro`` sqlite URI
+  than client-promised, through
+  ``fused_memory/backends/falkor_read_only.py::ReadOnlyGraphReader``. Never
+  ``MemoryService`` / ``GraphitiBackend``, whose handles can write.
+* **tasks.db** — ``shared/src/shared/tasks_db_readonly.py::connect_ro``, an
+  explicitly read-only ``file:...?mode=ro`` sqlite URI
   (:func:`_read_task_statuses_readonly`). NOT ``SqliteTaskBackend``: its read
   path opens a READ/WRITE connection and applies WAL pragmas plus a schema
   migration to whatever tasks.db it is pointed at, which for a cross-project
@@ -75,6 +77,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import sys
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -82,6 +85,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from shared.project_layout import tasks_db
+from shared.tasks_db_readonly import connect_ro
+
+from fused_memory.backends.falkor_read_only import ReadOnlyGraphReader
 from fused_memory.models.enums import MemoryCategory
 from fused_memory.services.completion_claim_gate import (
     UNRESOLVABLE,
@@ -566,9 +573,9 @@ CAVEATS: tuple[str, ...] = (
     'of all of these: every targeted graph WAS asked and returned nothing.',
     'DETECTION BOUND: claims are detected by the deterministic lexical '
     'vocabulary in fused_memory.services.completion_claim_gate, which requires '
-    'completion PHRASING and a concrete NAMED REF (task id / commit sha / tkt_ '
-    'id) to co-occur in one clause. A fabricated completion phrased without a '
-    'named ref is invisible to this sweep by construction.',
+    'a completion marker bound to its nearest concrete NAMED REF (task id / '
+    'commit sha / tkt_ id) in the same clause. A fabricated completion phrased '
+    'without a named ref is invisible to this sweep by construction.',
 )
 """The report's caveats, as DATA rather than docstring prose.
 
@@ -704,30 +711,16 @@ def build_report(
 # --------------------------------------------------------------------------- #
 # The read seam — GRAPH.RO_QUERY, no graphiti driver
 # --------------------------------------------------------------------------- #
+# The read-only guarantee is fused_memory/backends/falkor_read_only.py's.
+# This sweep reads over Cypher rather than through MemoryService for reasons
+# of its own: MemoryService.initialize() brings up Qdrant and an embedder it
+# does not need, and MemoryService.get_episodes is unusable regardless. That
+# read drops source_description, the ONLY carrier of the category this sweep
+# scopes to, and the MCP layer clamps last_n to 1000 against a population
+# measured at 2976 (dark_factory) and 4547 (reify) rows.
 
 DEFAULT_PROJECT = 'dark_factory'
 """The graph swept when --project is not given."""
-
-RO_COMMAND = 'GRAPH.RO_QUERY'
-"""The only FalkorDB command this script is permitted to issue.
-
-Read-only here is **server-enforced**, not client-promised: build_corpus.py
-(:667-675) records that a ``CREATE`` issued through this command path was
-refused by a live FalkorDB and materialized no graph. For an audit whose entire
-premise is "do not mutate on a regex verdict", that is the difference between a
-promise and a guarantee — which is why this script reads over Cypher rather
-than through ``MemoryService`` / ``GraphitiBackend``, both of which reach the
-store through a handle that CAN write.
-
-Two secondary reasons. ``MemoryService.initialize()`` brings up Qdrant and an
-embedder this sweep does not need, and graphiti_core's ``FalkorDriver.__init__``
-fire-and-forgets ``build_indices_and_constraints()`` — a WRITE. And
-``MemoryService.get_episodes`` is unusable regardless: it drops
-``source_description`` from its projection (memory_service.py:3838-3843), which
-is the ONLY carrier of the category this task scopes to, and the MCP layer
-clamps ``last_n`` to 1000 against a population measured at 2976 (dark_factory)
-and 4547 (reify) rows.
-"""
 
 PROJECTED_FIELDS: tuple[str, ...] = (
     'uuid',
@@ -778,17 +771,13 @@ each edge so one scan can be fanned out to every episode that asked.
 
 
 class EpisodeReader:
-    """Reads the ``Episodic`` population of one graph over ``GRAPH.RO_QUERY``.
+    """Reads the ``Episodic`` population of one graph, and the edges derived from it.
 
     Constructed either with an explicit *graph* handle (the tests pass a
-    double) or with a uri + graph name, in which case a ``falkordb.asyncio``
-    client is opened lazily on first use.
-
-    ``falkordb.FalkorDB`` — the DB client — is categorically distinct from
-    ``graphiti_core.driver.falkordb_driver.FalkorDriver``, the graphiti driver
-    whose ``__init__`` fire-and-forgets ``build_indices_and_constraints()``.
-    This class must never construct the latter: that would make a script whose
-    entire premise is "read-only" issue a write before it read anything.
+    double) or with a uri + graph name. Every read goes through
+    ``fused_memory/backends/falkor_read_only.py::ReadOnlyGraphReader``, which
+    opens the client lazily, issues only ``GRAPH.RO_QUERY`` and never
+    constructs graphiti's ``FalkorDriver``.
     """
 
     def __init__(
@@ -798,40 +787,8 @@ class EpisodeReader:
         graph_name: str = DEFAULT_PROJECT,
         uri: str | None = None,
     ) -> None:
-        self._graph = graph
         self.graph_name = graph_name
-        self.uri = uri
-
-    @staticmethod
-    def assert_read_only_command(command: str) -> None:
-        """Raise unless *command* is :data:`RO_COMMAND`.
-
-        A client-side guard layered on the server-side one. The server would
-        refuse a write anyway; this makes the violation a typed error at the
-        seam that owns the guarantee, rather than a redis error surfacing three
-        layers down where a reader would not connect it to this claim.
-        """
-        if command != RO_COMMAND:
-            raise RuntimeError(
-                f'this sweep may only issue {RO_COMMAND}, refused {command!r} '
-                f'— it is strictly read-only'
-            )
-
-    def _resolve_graph(self) -> Any:
-        """Return the graph handle, opening a client on first use.
-
-        The import is local so that merely importing this module — which the
-        tests do, with a double in hand — never requires falkordb to be
-        installed or a store to be running.
-        """
-        if self._graph is None:
-            from falkordb.asyncio import FalkorDB  # noqa: PLC0415
-
-            client = (
-                FalkorDB.from_url(self.uri) if self.uri else FalkorDB()
-            )
-            self._graph = client.select_graph(self.graph_name)
-        return self._graph
+        self._reader = ReadOnlyGraphReader(graph_name=graph_name, graph=graph, uri=uri)
 
     @staticmethod
     def _cell(row: list[Any], index: int) -> str:
@@ -854,13 +811,10 @@ class EpisodeReader:
         because the category is not a stored property, so it runs in Python
         over the label recovered from ``source_description``.
         """
-        self.assert_read_only_command(RO_COMMAND)
         query = EPISODE_CYPHER
         if limit is not None:
             query = f'{query} LIMIT {int(limit)}'
-        graph = self._resolve_graph()
-        response = await graph.ro_query(query)
-        rows = getattr(response, 'result_set', response) or []
+        rows = await self._reader.read_unpaged(query)
         population: list[CorpusRecord] = []
         for row in rows:
             source_description = self._cell(row, 3)
@@ -912,13 +866,10 @@ class EpisodeReader:
         Edge uuids are sorted, so two runs over an unchanged graph produce
         byte-identical output no matter what order the scan returned rows in.
         """
-        self.assert_read_only_command(RO_COMMAND)
         wanted = list(dict.fromkeys(episode_uuids))
         if not wanted:
             return {}
-        graph = self._resolve_graph()
-        response = await graph.ro_query(DERIVED_EDGE_CYPHER, {'uuids': wanted})
-        rows = getattr(response, 'result_set', response) or []
+        rows = await self._reader.read_unpaged(DERIVED_EDGE_CYPHER, {'uuids': wanted})
         wanted_set = set(wanted)
         found: dict[str, set[str]] = {}
         for row in rows:
@@ -1076,10 +1027,6 @@ def _resolve_uri(args: argparse.Namespace) -> str | None:
         return None
 
 
-#: Where a project keeps its task database, relative to its root — the path
-#: ``SqliteTaskBackend._db_path`` builds (backends/sqlite_task_backend.py:1137).
-TASKS_DB_RELPATH: tuple[str, ...] = ('.taskmaster', 'tasks', 'tasks.db')
-
 #: The tag context every in-tree caller reads under
 #: (``sqlite_task_backend.DEFAULT_TAG``, :127).
 TASKS_DEFAULT_TAG = 'master'
@@ -1091,7 +1038,7 @@ _SQL_CHUNK = 500
 
 
 def _readonly_connect(db_path: Path) -> Any:
-    """Open *db_path* over an explicitly READ-ONLY sqlite URI.
+    """Open tickets.db at *db_path* over an explicitly READ-ONLY sqlite URI.
 
     ``mode=ro`` is enforced by sqlite itself: the connection cannot create the
     file, cannot migrate it, and cannot write a byte. That matters because this
@@ -1102,9 +1049,11 @@ def _readonly_connect(db_path: Path) -> Any:
 
     Raises on a missing/unopenable file; every caller maps that to
     UNVERIFIABLE rather than to an accusation.
-    """
-    import sqlite3  # noqa: PLC0415
 
+    The task store opens through
+    ``shared/src/shared/tasks_db_readonly.py::connect_ro`` instead, whose
+    remedies are worded for a task store, so tickets.db keeps this opener.
+    """
     if not db_path.exists():
         raise FileNotFoundError(str(db_path))
     conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True, timeout=5.0)
@@ -1126,12 +1075,14 @@ def _read_task_statuses_readonly(
     Mirrors ``SqliteTaskBackend._statuses_from_conn``'s SQL and coercions
     (backends/sqlite_task_backend.py:1576-1594) — same table, same ``tag``
     filter, same int cast of the ids, same ``NULL`` -> ``'unknown'`` rule — but
-    over a connection that CANNOT write. Non-numeric ids are dropped exactly as
+    over a ``connect_ro`` connection, which CANNOT write and refuses a wrong
+    file with a named reason. Non-numeric ids are dropped exactly as
     that helper drops them, and an id with no row is simply absent from the
     result, which the probe reports as unresolvable.
 
-    Raises on any sqlite failure; the caller maps that to UNVERIFIABLE for the
-    whole project rather than to a false accusation against its writers.
+    Raises on any sqlite failure or ``connect_ro`` refusal; the caller maps
+    that to UNVERIFIABLE for the whole project rather than to a false
+    accusation against its writers.
     """
     int_ids: list[str] = []
     for raw in ids:
@@ -1142,7 +1093,8 @@ def _read_task_statuses_readonly(
     if not int_ids:
         return {}
 
-    conn = _readonly_connect(Path(project_root).joinpath(*TASKS_DB_RELPATH))
+    conn = connect_ro(tasks_db(project_root))
+    conn.row_factory = sqlite3.Row
     statuses: dict[str, str] = {}
     try:
         for chunk in _chunked(int_ids):
@@ -1200,22 +1152,18 @@ async def _build_ticket_probe(
 ) -> Callable[[str], dict[str, Any] | None | Any]:
     """Build the ticket probe, probing store AVAILABILITY exactly once.
 
-    THE DELIBERATE DIVERGENCE from the live write-path gate.
-    ``TaskInterceptor.get_ticket_row`` returns ``None`` BOTH for "no such
-    ticket" and for "no ticket store configured" (task_interceptor.py:
-    3006-3012), and ``completion_claim_gate._verify_ticket`` maps a ``None``
-    row to ``'mismatch'`` (:575). On the write path that conflation is
-    contained upstream by the ``_taskmaster_configured`` guard and costs at
-    most one spurious tag on one episode. In a BATCH sweep the same conflation
-    is a different animal: if tickets.db is merely absent or unopenable, every
-    ticket claim in the entire corpus prints as a fabrication accusation
-    against a named agent.
+    ``completion_claim_gate._verify_ticket`` maps a ``None`` row to
+    ``'mismatch'``, so ``None`` must mean only "no such ticket". The live
+    write path gets that from ``TaskInterceptor.get_ticket_row``, which raises
+    ``TicketStoreNotConfiguredError`` rather than returning ``None`` when no
+    store is configured. This sweep reads tickets.db directly, so it
+    establishes availability itself, to the same effect: if tickets.db is
+    absent or unopenable, every ticket claim in the corpus would otherwise
+    print as a fabrication accusation against a named agent.
 
     So availability is established ONCE, up front, and unavailability yields
-    :data:`UNRESOLVABLE` for every ref — never ``None``. The gate's own module
-    makes this distinction load-bearing at the sentinel level (:123-127,
-    INV-2), so honouring it here follows its stated intent rather than
-    departing from it.
+    :data:`UNRESOLVABLE` for every ref — never ``None``, the distinction the
+    gate's ``UNRESOLVABLE`` sentinel exists to keep (INV-2).
 
     The read runs over :func:`_read_ticket_rows_readonly` rather than
     ``TicketStore``, whose ``initialize()`` mkdirs the parent and applies
@@ -1263,7 +1211,7 @@ async def _build_task_status_probe(
 
     The read runs over :func:`_read_task_statuses_readonly` rather than
     ``SqliteTaskBackend.get_statuses``. The backend's read path opens a
-    READ/WRITE connection first (``_get_connection``: WAL pragmas + schema
+    READ/WRITE connection first (``_get_write_access``: WAL pragmas + schema
     migration) and is never closed, leaking its aiosqlite worker threads — and
     a sweep answering cross-project claims points it at OTHER projects' live
     databases while their orchestrators are running. ``mode=ro`` makes the
@@ -1302,38 +1250,18 @@ async def _build_task_status_probe(
 def _build_commit_probe(
     project_roots: dict[str, str],
 ) -> Callable[[str, str | None], bool | None]:
-    """Build the commit probe over the IMPORTED :func:`make_commit_probe`.
+    """Build the commit probe: the live gate's IMPORTED registry probe.
 
-    Rooted at the CLAIMED project's repository. An unregistered project is
-    unresolvable, never a miss — reporting "no such commit" because the wrong
-    repo was searched would be a false accusation.
+    :func:`make_registry_commit_probe` looks in the claimed project's
+    repository first and then in every other registered one, and reports a
+    miss only when all of them answered. Delegating keeps the sweep and the
+    write path on one definition of "this commit does not exist".
     """
     from fused_memory.services.completion_claim_gate import (  # noqa: PLC0415
-        make_commit_probe,
+        make_registry_commit_probe,
     )
 
-    cache: dict[str, Callable[[str], bool | None]] = {}
-
-    def probe(ref: str, project_id: str | None) -> bool | None:
-        root = project_roots.get(project_id) if project_id else None
-        if not root:
-            return None
-        if project_id not in cache:
-            try:
-                cache[str(project_id)] = make_commit_probe(root)
-            except Exception:
-                logger.warning(
-                    'could not build a commit probe for %r; UNVERIFIABLE',
-                    project_id, exc_info=True,
-                )
-                return None
-        try:
-            return cache[str(project_id)](ref)
-        except Exception:
-            logger.warning('commit probe failed for %r; UNVERIFIABLE', ref)
-            return None
-
-    return probe
+    return make_registry_commit_probe(project_roots)
 
 
 def _default_project_roots() -> dict[str, str]:

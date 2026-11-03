@@ -266,3 +266,5 @@ tasks:
     delivered_check:
       kind: manual
       reason: behavioural property proven by δ's own fixtures, not greppable
+signal_leaves:
+- δ

@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+from fused_memory.reconciliation.dangling_citation import (
+    DANGLING_CITATION_LINE_LABEL,
+    DanglingCitation,
+    build_dangling_citation_finding,
+    render_dangling_citation_line,
+)
 from fused_memory.reconciliation.stages.memory_consolidator import _format_findings
 
 
@@ -157,3 +163,28 @@ class TestFormatFindingsWithCitations:
         assert 'Entity0' in output
         assert 'Entity4' in output
         assert 'Entity5' not in output
+
+
+class TestFormatFindingsDanglingCitationLine:
+    """The Stage-1 payload names a dangling-citation finding's ids (task 5749)."""
+
+    def test_record_renders_its_line_verbatim(self):
+        record = DanglingCitation(
+            target_run_id='06a4466d-cdc0-49ac-8e99-e6723be39392',
+            finding_id='a1a1a1a1-0000-4000-8000-000000000001',
+            memory_id='beacf7fc-b76a-4c0b-876d-f4cf6d906d42',
+            store='mem0',
+        )
+        finding = build_dangling_citation_finding(record)
+        line = render_dangling_citation_line(finding)
+        assert line is not None
+        assert line in _format_findings([finding])
+
+    def test_finding_without_record_renders_no_line(self):
+        finding = {
+            'description': 'x',
+            'severity': 'minor',
+            'category': 'other',
+            'suggested_action': 'y',
+        }
+        assert DANGLING_CITATION_LINE_LABEL not in _format_findings([finding])

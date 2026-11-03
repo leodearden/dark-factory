@@ -10,13 +10,17 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import Mapping
+from datetime import datetime
 from typing import Any
 
 import anyio
 import httpx
 from shared.mcp_idempotency import maybe_inject_client_op_id
+from shared.mcp_post import MCP_POST_HEADERS, decode_mcp_response_body, mcp_endpoint_url
 
 from dashboard.config import DashboardConfig
+from dashboard.data.datum import Datum, DatumState, unknown_datum
 from dashboard.data.mcp_fanout import (
     FANOUT_FAILURE_EXCEPTIONS,
     call_with_deadline,
@@ -29,11 +33,6 @@ from dashboard.data.mcp_fanout import (
 )
 
 logger = logging.getLogger(__name__)
-
-MCP_HEADERS = {
-    'Content-Type': 'application/json',
-    'Accept': 'application/json, text/event-stream',
-}
 
 # Twin of orchestrator.mcp_lifecycle's use of shared.mcp_idempotency (task
 # 2712; hoisted into the shared module by task 2766 so the two McpSession
@@ -114,30 +113,6 @@ async def cancel_inflight_exchanges() -> None:
     await cancel_and_await(running_here, 'MCP exchange(s)')
 
 
-def _parse_mcp_response(resp: httpx.Response) -> dict:
-    """Parse an MCP JSON-RPC response (JSON or SSE)."""
-    content_type = resp.headers.get('content-type', '')
-    if 'text/event-stream' in content_type:
-        return _parse_sse_response(resp.text)
-    try:
-        return resp.json()
-    except (json.JSONDecodeError, ValueError):
-        return _parse_sse_response(resp.text)
-
-
-def _parse_sse_response(text: str) -> dict:
-    """Extract the last ``data:`` line from an SSE response and parse as JSON."""
-    last_data = None
-    for line in text.split('\n'):
-        if line.startswith('data: '):
-            last_data = line[6:]
-        elif line.startswith('data:'):
-            last_data = line[5:]
-    if last_data:
-        return json.loads(last_data)
-    raise ValueError(f'No data line in SSE response: {text[:200]}')
-
-
 def _extract_tool_result(rpc_response: dict) -> dict:
     """Pull the inner dict out of a JSON-RPC tools/call result."""
     content = rpc_response.get('result', {}).get('content', [])
@@ -159,7 +134,7 @@ class McpSession:
 
     def __init__(self, base_url: str):
         self.base_url = base_url.rstrip('/')
-        self.mcp_endpoint = f'{self.base_url}/mcp'
+        self.mcp_endpoint = mcp_endpoint_url(self.base_url)
         self._session_id: str | None = None
         self._initialized = False
         self._request_id = 0
@@ -220,7 +195,7 @@ class McpSession:
 
         maybe_inject_client_op_id(method, params)
 
-        headers = dict(MCP_HEADERS)
+        headers = dict(MCP_POST_HEADERS)
         if self._session_id:
             headers['Mcp-Session-Id'] = self._session_id
 
@@ -230,7 +205,7 @@ class McpSession:
         if sid := resp.headers.get('mcp-session-id'):
             self._session_id = sid
 
-        return _parse_mcp_response(resp)
+        return decode_mcp_response_body(resp)
 
     async def _raw_notify(
         self,
@@ -239,7 +214,7 @@ class McpSession:
         timeout: float = 10,
     ) -> None:
         payload: dict = {'jsonrpc': '2.0', 'method': method}
-        headers = dict(MCP_HEADERS)
+        headers = dict(MCP_POST_HEADERS)
         if self._session_id:
             headers['Mcp-Session-Id'] = self._session_id
         resp = await _post(client, self.mcp_endpoint, payload, headers, timeout)
@@ -304,9 +279,9 @@ async def mcp_tool_call(
     *cold* session performs three posts (``initialize``,
     ``notifications/initialized``, then ``tools/call``), so the worst case is
     roughly ``3 * timeout`` plus the server's own think time. Callers needing
-    a hard whole-operation bound must still wrap this in
-    ``asyncio.wait_for`` — every existing probe caller does, deliberately, and
-    the two layers are complementary rather than redundant.
+    a hard whole-operation bound must still wrap this in ``asyncio.wait_for``
+    at ``enclosing_deadline(timeout)``, never at *timeout* itself — the two
+    layers are complementary rather than redundant.
 
     **A session that hangs is self-evicting** (task 4958). When that enclosing
     ``wait_for`` fires — or the caller is cancelled for any other reason — the
@@ -318,8 +293,13 @@ async def mcp_tool_call(
     covered too, notably ``task_runtime.py::_probe_one``, whose own ``wait_for``
     cancels this call and which previously did not invalidate at all.
 
-    The guard catches ONLY the two hang-shaped exits (``asyncio.CancelledError``
-    and the builtin ``TimeoutError``) and always re-raises. It deliberately does
+    The guard catches ONLY the three hang-shaped exits and always re-raises:
+    ``asyncio.CancelledError``, the builtin ``TimeoutError``, and
+    ``httpx.TimeoutException`` — a per-request budget expiring. An equal outer
+    ``wait_for`` used to convert that expiry into a cancellation; one sized by
+    ``enclosing_deadline`` lets it arrive as itself, and evicting on it keeps
+    the task-4958 guarantee for ``task_runtime.py::_probe_one`` and the other
+    escalation-URL probes. It deliberately does
     not catch ``httpx.HTTPStatusError`` / ``ValueError``: teardown policy for
     those already belongs to the callers (``first_success``,
     ``get_queue_stats``, ``get_wal_status`` each invalidate themselves), and a
@@ -329,9 +309,27 @@ async def mcp_tool_call(
     session = _get_session(base_url)
     try:
         return await session.call_tool(client, tool_name, arguments, timeout=timeout)
-    except (asyncio.CancelledError, TimeoutError):
+    except (asyncio.CancelledError, TimeoutError, httpx.TimeoutException):
         invalidate_session(base_url)
         raise
+
+
+_ENCLOSING_DEADLINE_HEADROOM_SECONDS = 1.0
+
+
+def enclosing_deadline(per_request_timeout: float) -> float:
+    """The ``asyncio.wait_for`` bound to pair with :func:`mcp_tool_call`'s *timeout*.
+
+    Strictly greater, because an equal bound is armed first and fires at the
+    same deadline, pre-empting the transport's own exception —
+    ``httpx.PoolTimeout`` above all. With the exchange shielded by ``_post``,
+    that exception is then absorbed unseen by ``_settle`` and the caller sees
+    only a bare ``TimeoutError``. A saturated pool fails the FIRST post's
+    acquisition, so one budget plus headroom is enough for that failure to
+    reach the caller's OWN except clause (``mcp_fanout.py::first_success``, or
+    a probe's) so ``mcp_fanout.py::describe_exc`` can name it.
+    """
+    return per_request_timeout + _ENCLOSING_DEADLINE_HEADROOM_SECONDS
 
 
 async def _first_success(
@@ -372,7 +370,8 @@ async def get_memory_status(
     *timeout* is a per-HTTP-request budget (see :func:`mcp_tool_call`), NOT a
     bound on this call: the failover walks up to N URLs, each of which may
     perform a three-post cold-session handshake. Callers needing a hard bound
-    must still wrap this in ``asyncio.wait_for`` — ``metrics.py`` does.
+    must still wrap this in ``asyncio.wait_for`` at ``enclosing_deadline(timeout)``
+    — ``metrics.py`` does.
     """
     return await _first_success(
         client, config, 'get_status', {}, 'get_status', timeout=timeout,
@@ -391,8 +390,8 @@ async def get_queue_stats(
     *timeout* is a per-HTTP-request budget (see :func:`mcp_tool_call`), NOT a
     bound on this call: unlike a first-success failover this visits ALL N
     configured URLs, so the aggregate cost scales with N. Callers needing a
-    hard bound must still wrap this in ``asyncio.wait_for`` — ``metrics.py``
-    does.
+    hard bound must still wrap this in ``asyncio.wait_for`` at
+    ``enclosing_deadline(timeout)`` — ``metrics.py`` does.
 
     Each URL's attempt additionally carries ``mcp_fanout.call_with_deadline``'s
     default whole-operation deadline (resolved inside that helper at call time,
@@ -408,6 +407,7 @@ async def get_queue_stats(
     merged_counts: dict[str, int] = {}
     oldest_age: float | None = None
     any_success = False
+    errors: list[str] = []
 
     for url in config.fused_memory_urls:
         try:
@@ -422,6 +422,7 @@ async def get_queue_stats(
             # under-report queue counts at DEBUG with no journal trace at all.
             log_fanout_failure('get_queue_stats', url, e)
             invalidate_session(url)
+            errors.append(f'{url}: {describe_exc(e)}')
             continue
 
         note_fanout_success('get_queue_stats', url)
@@ -434,8 +435,47 @@ async def get_queue_stats(
             oldest_age = age
 
     if not any_success:
-        return {'offline': True, 'error': 'All servers unreachable'}
+        return {'offline': True, 'error': '; '.join(errors)}
     return {'counts': merged_counts, 'oldest_pending_age_seconds': oldest_age}
+
+
+WRITE_QUEUE_FRESHNESS_BOUND_SECONDS = 30
+"""How long a write-queue reading stays fresh.
+
+It must outlast the /memory route's own fan-out (each leg is bounded at 5 s),
+so the routine slow path does not serve its own probe stale — the same
+reasoning as ``merge_queue.py::LIVE_QUEUE_FRESHNESS_BOUND_SECONDS``.
+"""
+
+
+def write_queue_datum(
+    stats: Mapping[str, Any], *, measured_at: datetime,
+) -> Datum[dict[str, Any]]:
+    """The write queue as one Datum: the one normaliser of a get_queue_stats answer.
+
+    A reachable answer is a fresh ``{pending, retry, dead,
+    oldest_pending_age_seconds}``, a missing count reading 0. An offline one
+    is ``unknown`` carrying the probe's own error verbatim: an unmeasured
+    queue is a hole, never a row of zeros.
+    """
+    if stats.get('offline'):
+        return unknown_datum(
+            stats.get('error') or 'get_queue_stats reported offline without an error',
+            WRITE_QUEUE_FRESHNESS_BOUND_SECONDS,
+        )
+    counts = stats.get('counts') or {}
+    return Datum(
+        {
+            'pending': counts.get('pending', 0),
+            'retry': counts.get('retry', 0),
+            'dead': counts.get('dead', 0),
+            'oldest_pending_age_seconds': stats.get('oldest_pending_age_seconds'),
+        },
+        measured_at,
+        DatumState.FRESH,
+        None,
+        WRITE_QUEUE_FRESHNESS_BOUND_SECONDS,
+    )
 
 
 # Intentionally NOT converted to first_success: collects a per-URL entry from
@@ -457,7 +497,7 @@ async def get_wal_status(
     *timeout* is a per-HTTP-request budget (see :func:`mcp_tool_call`), NOT a
     bound on this call: like ``get_queue_stats`` this visits ALL N configured
     URLs, so the aggregate cost scales with N. Callers needing a hard bound
-    must still wrap this in ``asyncio.wait_for``.
+    must still wrap this in ``asyncio.wait_for`` at ``enclosing_deadline(timeout)``.
 
     Each URL's attempt additionally carries ``mcp_fanout.call_with_deadline``'s
     default whole-operation deadline (resolved inside that helper at call time,
@@ -509,7 +549,7 @@ async def get_curator_state(
     *timeout* is a per-HTTP-request budget (see :func:`mcp_tool_call`), NOT a
     bound on this call: the failover walks up to N URLs, each of which may
     perform a three-post cold-session handshake. ``api_curator`` wraps it in
-    ``asyncio.wait_for`` for the whole-operation bound.
+    ``asyncio.wait_for`` at ``enclosing_deadline(timeout)``.
     """
     return await _first_success(
         client, config, 'get_curator_state', {}, 'get_curator_state',

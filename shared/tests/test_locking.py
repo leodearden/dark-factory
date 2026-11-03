@@ -43,7 +43,7 @@ _CANONICAL_EXTENSIONS = [
     'manifest', 'md', 'mjs', 'mts',
     'npmrc', 'png', 'py', 'python-version',
     'ri', 'rs', 'scss', 'service', 'sh', 'step', 'stl', 'svg',
-    'template', 'timer', 'tombstones', 'toml', 'ts', 'tsx', 'txt', 'typed',
+    'template', 'timer', 'tombstones', 'toml', 'ts', 'tsv', 'tsx', 'txt', 'typed',
     'yaml', 'yml',
 ]
 
@@ -62,8 +62,8 @@ _CANONICAL_EXTENSIONS = [
 # would defeat the point of independent pinning.  Duplication + the two drift
 # guards below is the cheaper and more faithful trade.
 #
-# One real tracked path per canonical extension (59 extensions / 62 paths) —
-# dark-factory unless the comment says reify.  Enforced by
+# One real tracked path per canonical extension — dark-factory unless the
+# comment says reify.  Enforced by
 # TestIsFilePath::test_accept_corpus_covers_every_canonical_extension.
 # ---------------------------------------------------------------------------
 
@@ -143,6 +143,8 @@ _ACCEPT_PATHS = [
     # reify file with a `tombstones` extension; filename is PRD-normative
     # (reify docs/prds/v0_6/spec-conformance-suite.md D3).
     'docs/reify-language-spec.tombstones',  # reify
+    # reify #9058 (α-first): the first tracked reify `.tsv`, landed by reify #8662.
+    'tests/infra/affected-crates-direct-sets.tsv',  # reify
 ]
 
 # REJECT corpus (α/γ shared vector — all must return False).  Verbatim duplicate
@@ -1153,8 +1155,8 @@ class TestIsFilePath:
     def test_accept_corpus_paths_are_files(self, path: str):
         """Every canonical extension is run through the α copy of the predicate.
 
-        One representative path per canonical extension (all 59, not just the 22
-        added by the 2026-07-28 sweep).  Before this amendment only the 22 new
+        One representative path per canonical extension (every one, not just the
+        22 added by the 2026-07-28 sweep).  Before this amendment only the 22 new
         extensions had behavioural coverage here while the original 36 had nothing
         but four spot-checks in ``test_file_extensions_is_frozenset`` — leaving
         the copy the orchestrator scheduler actually imports pinned strictly
@@ -1170,7 +1172,7 @@ class TestIsFilePath:
         """
         assert is_file_path(path) is True, (
             f'{path!r} must classify as a file — its extension is on the '
-            f'canonical allowlist (59 entries as of dark_factory #3715 hotfix)'
+            'canonical allowlist'
         )
 
     @pytest.mark.parametrize('path', _REJECT_PATHS)

@@ -68,11 +68,12 @@ Usage
   # Deterministic age reference clock (tests / reproducible runs).
   python3 scripts/reclaim_orphaned_worktrees.py --now 1000000000
 
-This module is STDLIB-ONLY by design: it does NOT import/construct
-``OrchestratorConfig`` / ``GitOps`` (both config-required and side-effectful) —
-it re-implements the few git operations it needs via ``subprocess``, so it runs
-standalone in any environment (and the wrapper needs no ``uv``/service-env,
-unlike the flag-marker sweep). It reuses only the PRODUCER's naming FACTS.
+This module imports only the stdlib and shared's stdlib-only layout leaf, by
+design: it does NOT import/construct ``OrchestratorConfig`` / ``GitOps`` (both
+config-required and side-effectful) — it re-implements the few git operations
+it needs via ``subprocess``, so it runs from any checkout of this repo with
+plain ``python3`` (and the wrapper needs no ``uv``/service-env, unlike the
+flag-marker sweep). It reuses only the PRODUCER's naming FACTS.
 """
 
 from __future__ import annotations
@@ -90,14 +91,13 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
+import _checkout as _checkout
+from shared.project_layout import default_project_root
+
 logger = logging.getLogger('reclaim_orphaned_worktrees')
 
 # Stable greppable prefix on every operator-facing log line.
 _LOG_PREFIX = 'reclaim_orphaned_worktrees:'
-
-# The hardcoded absolute project-root default (drain_check.py / gc_agent_
-# transcripts.py set the precedent). Overridable via --repo.
-DEFAULT_PROJECT_ROOT = '/home/leo/src/dark-factory'
 
 # The quarantine base is a direct sibling of the worktree dir (mirrors
 # GitOps.quarantine_base: ``<worktree_dir>-orphaned``). Derived per-repo in
@@ -248,9 +248,10 @@ def select_reclaimable(
 # where it lands.
 #
 # DUPLICATED, NOT IMPORTED, from ``df_pytest_isolation._GIT_REDIRECT_ENV``:
-# this module is STDLIB-ONLY by design (see the module docstring — the systemd
-# wrapper runs plain ``python3`` with no ``uv``/service env) and that module
-# imports pytest, so importing it would break the nightly unit outright.
+# this module imports nothing beyond the stdlib and shared's stdlib-only layout
+# leaf (see the module docstring — the systemd wrapper runs plain ``python3``
+# with no ``uv``/service env) and that module imports pytest, so importing it
+# would break the nightly unit outright.
 # ``scripts/memory-metadata-coverage-census.sh`` carries a third copy for the
 # same reason. The duplication is pinned against drift by
 # ``test_scrubbed_git_env_matches_shared_redirect_classifier``.
@@ -265,15 +266,18 @@ _GIT_REDIRECT_ENV = (
     'GIT_CONFIG_GLOBAL',
     'GIT_CONFIG_SYSTEM',
     'GIT_CONFIG_COUNT',
+    'GIT_CONFIG_PARAMETERS',
 )
 
-# ``git -c`` pairs are passed as an INDEXED family (GIT_CONFIG_KEY_0/VALUE_0,
-# ...), so they cannot be enumerated by name.
+# ``GIT_CONFIG_COUNT``'s pairs are an INDEXED family (GIT_CONFIG_KEY_0/VALUE_0,
+# ...), so they cannot be enumerated by name. (``git -c`` itself propagates
+# through ``GIT_CONFIG_PARAMETERS`` above, not through this family.)
 _GIT_REDIRECT_ENV_PREFIXES = ('GIT_CONFIG_KEY_', 'GIT_CONFIG_VALUE_')
 
 
 def scrubbed_git_env(environ: Mapping[str, str]) -> dict[str, str]:
-    """A copy of *environ* with the git-REDIRECTING names removed, ``LC_ALL=C``.
+    """A copy of *environ* with git-redirecting and config-injecting names
+    removed, ``LC_ALL=C``.
 
     Pure: *environ* (in production ``os.environ``) is never mutated. Drops every
     name in :data:`_GIT_REDIRECT_ENV` and every name carrying a
@@ -283,23 +287,6 @@ def scrubbed_git_env(environ: Mapping[str, str]) -> dict[str, str]:
 
     A targeted removal, NOT a hermetic env rebuild — see the block comment above
     for which names retarget git and why the two preserved families do not.
-
-    KNOWN GAP, deliberately not closed here: ``GIT_CONFIG_PARAMETERS`` survives
-    this scrub. It is the same injection mechanism as the indexed
-    ``GIT_CONFIG_KEY_n``/``VALUE_n`` family — it is what git itself uses to
-    propagate ``-c`` to subprocesses — and it is read at startup with
-    command-line config precedence. MEASURED on git 2.43.0:
-    ``GIT_CONFIG_PARAMETERS="'core.hooksPath=/decoy/hooks'" git config
-    core.hooksPath`` prints ``/decoy/hooks``, and the name is confirmed present
-    in this function's output. So an ambient value reaches every git call in
-    this module, including the ``commit --no-verify`` in :func:`park_commit`.
-    It is NOT closed in this change because the name list is pinned to
-    ``df_pytest_isolation._GIT_REDIRECT_ENV`` by
-    ``test_scrubbed_git_env_matches_shared_redirect_classifier`` in BOTH
-    directions, so adding it here alone fails that pin — it is a SHARED gap
-    needing one coordinated change across both copies, filed as a follow-up.
-    Note this is config injection, not repository redirection: the
-    ``GIT_DIR``-class leak this guard exists for IS closed.
     """
     scrubbed = {
         key: value
@@ -739,7 +726,7 @@ def reclaim_worktrees(
 def build_parser() -> argparse.ArgumentParser:
     """Build the CLI arg parser (unit-testable in isolation).
 
-    ``--repo`` defaults to :data:`DEFAULT_PROJECT_ROOT`; ``--parking-root``
+    ``--repo`` defaults to the main checkout; ``--parking-root``
     defaults to ``None`` (derived as ``<repo>/.worktrees-orphaned`` in
     :func:`main`); ``--min-age-hours`` is the age floor (non-positive => reclaim
     nothing); ``--check`` is a dry-run flag; ``--now`` overrides the age
@@ -754,8 +741,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         '--repo',
-        default=DEFAULT_PROJECT_ROOT,
-        help='Repository whose quarantine base is swept (default: %(default)s).',
+        default=None,
+        help='Repository whose quarantine base is swept (default: the main checkout).',
     )
     parser.add_argument(
         '--parking-root',
@@ -866,7 +853,7 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO)
     args = build_parser().parse_args(argv)
 
-    repo = Path(args.repo)
+    repo = Path(args.repo) if args.repo is not None else default_project_root()
     parking_root = (
         Path(args.parking_root)
         if args.parking_root is not None

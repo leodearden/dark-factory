@@ -1,0 +1,54 @@
+{
+  "task_id": "6160",
+  "reason": "remote_runners constructor seam for verify-host tests (step-4)",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 2195,
+      "current": 2198
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::__init__",
+      "baseline": 10,
+      "current": 11
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_ensure_host_allocator",
+      "baseline": 2,
+      "current": 4
+    },
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 22126,
+      "current": 22134
+    },
+    {
+      "measure": "prose_lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 12536,
+      "current": 12540
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 4842,
+      "current": 4845
+    },
+    {
+      "measure": "total:lines",
+      "key": "<cluster>",
+      "baseline": 57580,
+      "current": 57588
+    },
+    {
+      "measure": "total:prose_lines",
+      "key": "<cluster>",
+      "baseline": 32032,
+      "current": 32036
+    }
+  ]
+}

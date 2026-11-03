@@ -125,7 +125,7 @@ _WIRING_UNCHECKED = 'which judge add_memory injects'
 
 _BAND_CANONICAL = 'parent-1'
 #: The slate's evidence child: the top-scoring candidate, and the one
-#: `_canonical_id_of` hoists to `_BAND_CANONICAL`. It is on the slate (that is
+#: `canonical_id_of` hoists to `_BAND_CANONICAL`. It is on the slate (that is
 #: what makes the band's canonical an id nobody carries) but it may never be
 #: DESIGNATED, because a correct remedy is obliged to hoist it.
 _EVIDENCE_CHILD = 'child-1'
@@ -282,7 +282,7 @@ class TestConsumptionProbe:
     ):
         """A correct option-(a) fix HOISTS, and must not be told to stop.
 
-        ``_canonical_id_of``'s own contract makes the hoist mandatory:
+        ``canonical_id_of``'s own contract makes the hoist mandatory:
         attaching to a child creates a grandchild that can never fold under the
         true canonical, which reads as content loss. So a remedy that threads
         the designation still has to hoist a designated CHILD to its parent —
@@ -326,6 +326,28 @@ class TestConsumptionProbe:
         assert named, proc.stdout
         for line in named:
             assert _EVIDENCE_CHILD not in line, proc.stdout
+
+    def test_a_ref_from_before_the_hoist_went_public_still_decides_it(
+        self, tmp_path,
+    ):
+        """A ref spelling the hoist ``_canonical_id_of`` keeps its own rule.
+
+        That ref's hoist folds ``m0`` as well, which the probe's metadata
+        fallback would not, so ``m0`` staying out of the designated pair shows
+        the ref's own function was asked under its older name.
+        """
+        src_root = write_fake_triage(
+            tmp_path / 'src', variant='pre_rename_wider_hoist',
+        )
+        proc = _run_probe(src_root)
+        assert proc.returncode != 0, f'{proc.stdout}\n{proc.stderr}'
+        assert _NOT_CONSUMED in proc.stdout, proc.stdout
+        named = [
+            line for line in proc.stdout.splitlines() if _DESIGNATED_PAIR in line
+        ]
+        assert named, proc.stdout
+        for line in named:
+            assert "'m0'" not in line, proc.stdout
 
 
 class TestFailsClosed:

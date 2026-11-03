@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-from orchestrator.agents.roles import AgentRole
+from orchestrator.agents.review_briefing import ReviewBriefing
+from orchestrator.agents.roles import AgentRole, build_reviewer_role
 from orchestrator.config import default_price_table
 from orchestrator.evals.reviewer_trial.variants import (
     _SPEC_COMPREHENSIVE,
     ALL_VARIANTS,
     REVIEWER_REFRESH_VARIANTS,
     VARIANT_A,
+    VARIANT_A_XHIGH,
     VARIANT_B,
     VARIANT_BASELINE,
     VARIANT_C,
@@ -17,6 +19,8 @@ from orchestrator.evals.reviewer_trial.variants import (
     VARIANT_SONNET5_SOLO,
     ReviewerSpec,
     build_trial_reviewer_role,
+    campaign_arms,
+    with_briefing,
 )
 
 
@@ -256,3 +260,55 @@ class TestFableEvidenceVariants:
         for candidate in (VARIANT_SONNET5_SOLO, VARIANT_FABLE51_SOLO, VARIANT_CROSS_FAMILY, VARIANT_A_XHIGH):
             assert candidate.name in names
         assert len({v.name for v in FABLE_EVIDENCE_VARIANTS}) == len(FABLE_EVIDENCE_VARIANTS)
+
+
+class TestBriefingArms:
+    """A briefing generation is one more arm dimension over an unchanged panel."""
+
+    def test_the_diff_only_arm_is_the_variant_itself(self) -> None:
+        assert VARIANT_A.briefing is ReviewBriefing.DIFF_ONLY
+        assert with_briefing(VARIANT_A, ReviewBriefing.DIFF_ONLY) is VARIANT_A
+
+    def test_the_d2_arm_is_named_for_its_briefing_and_keeps_the_panel(self) -> None:
+        arm = with_briefing(VARIANT_A, ReviewBriefing.CONTEXT_COMPLETE)
+
+        assert arm.name == 'variant_a_d2'
+        assert arm.briefing is ReviewBriefing.CONTEXT_COMPLETE
+        assert arm.reviewers == VARIANT_A.reviewers
+        assert VARIANT_A.name == 'variant_a'
+        assert VARIANT_A.briefing is ReviewBriefing.DIFF_ONLY
+
+    def test_campaign_arms_cross_each_variant_with_each_briefing_incumbent_first(self) -> None:
+        arms = campaign_arms(
+            [VARIANT_A, VARIANT_A_XHIGH],
+            [ReviewBriefing.DIFF_ONLY, ReviewBriefing.CONTEXT_COMPLETE],
+        )
+
+        assert [arm.name for arm in arms] == [
+            'variant_a', 'variant_a_d2', 'variant_a_xhigh', 'variant_a_xhigh_d2',
+        ]
+        assert arms[0] is VARIANT_A
+        assert [arm.briefing for arm in arms] == [
+            ReviewBriefing.DIFF_ONLY, ReviewBriefing.CONTEXT_COMPLETE,
+        ] * 2
+
+    def test_a_d2_trial_role_is_the_production_d2_role_plus_jcodemunch(self) -> None:
+        spec = VARIANT_A.reviewers[0]
+        role = build_trial_reviewer_role(spec, ReviewBriefing.CONTEXT_COMPLETE)
+        production = build_reviewer_role(
+            spec.name, spec.specialization, ReviewBriefing.CONTEXT_COMPLETE,
+        )
+
+        assert role.prompt_harness_version == 'reviewer-d2-v1'
+        assert role.system_prompt == production.system_prompt
+        assert role.allowed_tools == [*production.allowed_tools, 'mcp__jcodemunch__*']
+        assert (role.default_model, role.default_budget) == (spec.model, spec.budget)
+
+    def test_a_diff_only_trial_role_is_the_production_incumbent_plus_jcodemunch(self) -> None:
+        spec = VARIANT_A.reviewers[0]
+        role = build_trial_reviewer_role(spec)
+        production = build_reviewer_role(spec.name, spec.specialization)
+
+        assert role.prompt_harness_version == production.prompt_harness_version
+        assert role.system_prompt == production.system_prompt
+        assert role.allowed_tools == [*production.allowed_tools, 'mcp__jcodemunch__*']

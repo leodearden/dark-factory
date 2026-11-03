@@ -43,7 +43,7 @@ EVIDENTIARY_ANCHOR_DELETION_FAMILY = FlagTypeFamily(
         'mem0_evidentiary_anchor_full_mirror_loss',
         'cycle_summary_evidentiary_anchor_mirror_deletion_confirmed',
     }),
-    drift_token='anchor',
+    drift_tokens=frozenset({'anchor'}),
 )
 
 _BENIGN_SWEEP_DELETERS: frozenset[str] = frozenset(MEM0_TOMBSTONE_DELETERS)

@@ -20,9 +20,9 @@ Four classes, in the order a value travels:
 ## Sentinel-literal hazard — every specimen is BUILT, never written verbatim
 
 A raw envelope literal here would corrupt the tool call that edits this file,
-so every specimen is assembled from ``_markup_helpers``' builders and that
-module's ``assert_no_raw_sentinels`` enforces it on this file's own bytes at
-import. The plan document, the artifacts fixture and the refusal-memo isolation
+so every specimen is assembled from ``_markup_helpers``' builders and
+``tests/scripts/test_no_raw_envelope_literal.py::test_no_markup_handling_file_spells_a_raw_envelope_literal``
+enforces it on this file's source, repo-wide. The plan document, the artifacts fixture and the refusal-memo isolation
 come from ``_plan_markup_fixtures``, shared with the suite this split from —
 the memo especially, since both suites report refusals on the same locator.
 """
@@ -35,7 +35,6 @@ import json
 from _markup_helpers import (
     INVOKE_CLOSER,
     LT,
-    assert_no_raw_sentinels,
     closer,
     param_opener,
 )
@@ -48,9 +47,6 @@ from _plan_markup_fixtures import (
 from shared.toolcall_markup import detect
 
 from orchestrator.mcp import plan_tools
-
-assert_no_raw_sentinels(__file__)
-
 
 # ---------------------------------------------------------------------------
 # Task 4696 — the SELF-NAME closer, invisible to the read-repair prefilter.
@@ -137,7 +133,7 @@ class TestSelfNameCloserIsSeenByTheReadRepair:
 
         plan_tools._read_plan_repaired(plan_artifacts)
 
-        on_disk = json.loads((plan_artifacts.root / 'plan.json').read_text(encoding='utf-8'))
+        on_disk = json.loads(plan_artifacts.artifact_path('plan.json').read_text(encoding='utf-8'))
         assert on_disk['design_decisions'][0]['rationale'] == _SELF_NAME_RATIONALE_PROSE
         assert on_disk['reuse'][0]['how'] == _SELF_NAME_HOW_PROSE
 
@@ -177,7 +173,7 @@ class TestSelfNameCloserIsSeenByTheReadRepair:
         plan = corrupt_plan()
         plan['design_decisions'][0]['rationale'] = _UNREPAIRABLE_RATIONALE
         plan_artifacts.write_plan(copy.deepcopy(plan))
-        before = (plan_artifacts.root / 'plan.json').read_bytes()
+        before = plan_artifacts.artifact_path('plan.json').read_bytes()
 
         repaired, facts = plan_tools._read_plan_repaired(plan_artifacts)
 
@@ -185,7 +181,7 @@ class TestSelfNameCloserIsSeenByTheReadRepair:
         assert [f['outcome'] for f in flagged] == ['unrepairable']
         assert repaired['design_decisions'][0]['rationale'] == _UNREPAIRABLE_RATIONALE
         assert sorted(repaired['design_decisions'][0]) == ['decision', 'rationale']
-        assert (plan_artifacts.root / 'plan.json').read_bytes() == before, (
+        assert plan_artifacts.artifact_path('plan.json').read_bytes() == before, (
             'an unrepairable field must leave the file BYTE-IDENTICAL — a '
             'rewrite here would mean something was guessed'
         )
@@ -376,11 +372,11 @@ class TestQuotedSiblingTagIsNeverTruncated:
         plan = corrupt_plan()
         plan['design_decisions'][0]['rationale'] = _QUOTED_SIBLING_PROSE
         plan_artifacts.write_plan(copy.deepcopy(plan))
-        before = (plan_artifacts.root / 'plan.json').read_bytes()
+        before = plan_artifacts.artifact_path('plan.json').read_bytes()
 
         plan_tools._read_plan_repaired(plan_artifacts)
 
-        assert (plan_artifacts.root / 'plan.json').read_bytes() == before
+        assert plan_artifacts.artifact_path('plan.json').read_bytes() == before
 
     def test_a_self_name_closer_in_the_same_plan_is_still_repaired(
         self, plan_artifacts
@@ -444,7 +440,7 @@ class TestTheSelfNameTruncationIsAcceptedAndReconstructible:
         plan = corrupt_plan()
         plan['design_decisions'][0]['rationale'] = value
         artifacts.write_plan(copy.deepcopy(plan))
-        before = (artifacts.root / 'plan.json').read_bytes()
+        before = artifacts.artifact_path('plan.json').read_bytes()
 
         _plan, facts = plan_tools._read_plan_repaired(artifacts)
 
@@ -520,7 +516,7 @@ class TestTheSelfNameTruncationIsAcceptedAndReconstructible:
         )
 
         assert on_disk == _REFUSED_TRUNCATION
-        assert (plan_artifacts.root / 'plan.json').read_bytes() == before
+        assert plan_artifacts.artifact_path('plan.json').read_bytes() == before
 
     def test_the_refusal_is_reported_rather_than_swallowed(self, plan_artifacts):
         """Byte-identical must not mean invisible, or the asymmetry hides."""

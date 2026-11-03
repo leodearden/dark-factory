@@ -1,0 +1,48 @@
+{
+  "task_id": "6160",
+  "reason": "H1: train verify on a leased host (step-6)",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 2198,
+      "current": 2209
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_note_verify_started",
+      "baseline": 0,
+      "current": 2
+    },
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 22134,
+      "current": 22240
+    },
+    {
+      "measure": "prose_lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 12540,
+      "current": 12566
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 4845,
+      "current": 4856
+    },
+    {
+      "measure": "total:lines",
+      "key": "<cluster>",
+      "baseline": 57588,
+      "current": 57694
+    },
+    {
+      "measure": "total:prose_lines",
+      "key": "<cluster>",
+      "baseline": 32036,
+      "current": 32062
+    }
+  ]
+}

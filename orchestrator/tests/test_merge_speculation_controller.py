@@ -1,4 +1,4 @@
-"""Unit tests for orchestrator.merge_speculation_controller (task MQ-refactor
+"""Unit tests for orchestrator.merge_lane.speculation_controller (task MQ-refactor
 theta / 1993).
 
 Steps covered:
@@ -13,11 +13,11 @@ Steps covered:
   step-7  RED   — release paths + double-release tolerance
   step-8  GREEN — implement on_abort/on_shutdown
 
-This module intentionally imports orchestrator.merge_speculation_controller
+This module intentionally imports orchestrator.merge_lane.speculation_controller
 LOCALLY inside each test (mirrors test_merge_request_ledger.py's convention)
 so a not-yet-implemented symbol never breaks collection of the rest of the
-file during the RED steps. It imports only orchestrator.merge_types (NOT
-orchestrator.merge_queue) at module scope — SpeculationController has no
+file during the RED steps. It imports only orchestrator.merge_lane.types (NOT
+orchestrator.merge_lane.worker) at module scope — SpeculationController has no
 git/GitOps dependency at all (pure data-structure unit tests), same rationale
 as test_merge_request_ledger.py.
 """
@@ -30,7 +30,7 @@ from pathlib import Path
 import pytest
 
 from orchestrator.config import OrchestratorConfig
-from orchestrator.merge_types import MergeOutcome, MergeRequest, QueuedBranch
+from orchestrator.merge_lane.types import MergeOutcome, MergeRequest, QueuedBranch
 
 # ---------------------------------------------------------------------------
 # Helpers (per-file duplication convention — see test_merge_request_ledger.py)
@@ -67,12 +67,12 @@ def _make_pending_request(task_id: str = 'pred') -> MergeRequest:
 class TestSpeculationControllerInitialState:
     """SpeculationController initial state (task 1993 step-1).
 
-    RED until step-2 GREEN adds orchestrator.merge_speculation_controller.
+    RED until step-2 GREEN adds orchestrator.merge_lane.speculation_controller.
     """
 
     @pytest.mark.parametrize('depth', [1, 2])
     async def test_initial_state_is_idle_and_empty(self, depth: int) -> None:
-        from orchestrator.merge_speculation_controller import (
+        from orchestrator.merge_lane.speculation_controller import (
             PermitLedger,
             SpeculationController,
         )
@@ -92,7 +92,7 @@ class TestSpeculationControllerInitialState:
     async def test_take_prefetched_returns_none_when_empty_and_stays_idle(
         self, depth: int,
     ) -> None:
-        from orchestrator.merge_speculation_controller import (
+        from orchestrator.merge_lane.speculation_controller import (
             PermitLedger,
             SpeculationController,
         )
@@ -108,7 +108,7 @@ class TestSpeculationControllerInitialState:
     async def test_base_for_returns_actual_main_when_spec_base_is_none(
         self, depth: int,
     ) -> None:
-        from orchestrator.merge_speculation_controller import (
+        from orchestrator.merge_lane.speculation_controller import (
             PermitLedger,
             SpeculationController,
         )
@@ -123,7 +123,7 @@ class TestSpeculationControllerInitialState:
     async def test_snapshot_has_exactly_the_expected_keys_and_initial_values(
         self, depth: int,
     ) -> None:
-        from orchestrator.merge_speculation_controller import (
+        from orchestrator.merge_lane.speculation_controller import (
             PermitLedger,
             SpeculationController,
         )
@@ -173,7 +173,7 @@ class TestOnDequeueAttachFallback:
         on_lookahead_pending does). Seeding this way keeps this test's only
         RED dependency on the not-yet-implemented `on_dequeue` itself.
         """
-        from orchestrator.merge_speculation_controller import (
+        from orchestrator.merge_lane.speculation_controller import (
             PermitLedger,
             SpeculationController,
         )
@@ -273,7 +273,7 @@ class TestLookaheadAndTransferLifecycle:
     """
 
     async def test_acquire_for_lookahead_decrements_slot_and_sets_held(self) -> None:
-        from orchestrator.merge_speculation_controller import (
+        from orchestrator.merge_lane.speculation_controller import (
             PermitLedger,
             SpeculationController,
         )
@@ -290,7 +290,7 @@ class TestLookaheadAndTransferLifecycle:
     async def test_on_lookahead_found_sets_prefetched_and_spec_base_without_releasing(
         self,
     ) -> None:
-        from orchestrator.merge_speculation_controller import (
+        from orchestrator.merge_lane.speculation_controller import (
             PermitLedger,
             SpeculationController,
         )
@@ -310,7 +310,7 @@ class TestLookaheadAndTransferLifecycle:
         assert controller.is_idle() is False
 
     async def test_on_lookahead_pending_retains_permit_for_late_arrival(self) -> None:
-        from orchestrator.merge_speculation_controller import (
+        from orchestrator.merge_lane.speculation_controller import (
             PermitLedger,
             SpeculationController,
         )
@@ -330,7 +330,7 @@ class TestLookaheadAndTransferLifecycle:
         assert controller.is_idle() is False
 
     async def test_on_transfer_clears_held_without_releasing_slot(self) -> None:
-        from orchestrator.merge_speculation_controller import (
+        from orchestrator.merge_lane.speculation_controller import (
             PermitLedger,
             SpeculationController,
         )
@@ -360,7 +360,7 @@ class TestLookaheadAndTransferLifecycle:
         revparse-fail/drop/branch-presence-guard) where the loop `continue`s
         with no subsequent look-ahead call.
         """
-        from orchestrator.merge_speculation_controller import (
+        from orchestrator.merge_lane.speculation_controller import (
             PermitLedger,
             SpeculationController,
         )
@@ -391,7 +391,7 @@ class TestLookaheadAndTransferLifecycle:
         look-ahead ever runs to clean up); after the main-success transfer,
         spec_base is deliberately left for the look-ahead to handle.
         """
-        from orchestrator.merge_speculation_controller import (
+        from orchestrator.merge_lane.speculation_controller import (
             PermitLedger,
             SpeculationController,
         )
@@ -424,7 +424,7 @@ class TestLookaheadAndTransferLifecycle:
         it is never released by the merger side; only the (unexercised here)
         verifier drain would restore it to depth.
         """
-        from orchestrator.merge_speculation_controller import (
+        from orchestrator.merge_lane.speculation_controller import (
             PermitLedger,
             SpeculationController,
         )
@@ -460,7 +460,7 @@ class TestReleasePathsAndDoubleReleaseTolerance:
     """
 
     async def test_on_abort_releases_when_held(self) -> None:
-        from orchestrator.merge_speculation_controller import (
+        from orchestrator.merge_lane.speculation_controller import (
             PermitLedger,
             SpeculationController,
         )
@@ -484,7 +484,7 @@ class TestReleasePathsAndDoubleReleaseTolerance:
         clears spec_base as a pure state-cleanup, just without touching the
         semaphore.
         """
-        from orchestrator.merge_speculation_controller import (
+        from orchestrator.merge_lane.speculation_controller import (
             PermitLedger,
             SpeculationController,
         )
@@ -502,7 +502,7 @@ class TestReleasePathsAndDoubleReleaseTolerance:
         assert controller.held_by_merger == 0
 
     async def test_on_shutdown_releases_and_clears_all_fields_when_held(self) -> None:
-        from orchestrator.merge_speculation_controller import (
+        from orchestrator.merge_lane.speculation_controller import (
             PermitLedger,
             SpeculationController,
         )
@@ -530,7 +530,7 @@ class TestReleasePathsAndDoubleReleaseTolerance:
         assert controller.is_idle() is True
 
     async def test_on_shutdown_is_idempotent_when_already_idle(self) -> None:
-        from orchestrator.merge_speculation_controller import (
+        from orchestrator.merge_lane.speculation_controller import (
             PermitLedger,
             SpeculationController,
         )
@@ -566,7 +566,7 @@ class TestReleasePathsAndDoubleReleaseTolerance:
         is documented-tolerated, not a bug in this controller (see module
         docstring's "Plain-Semaphore double-release tolerance").
         """
-        from orchestrator.merge_speculation_controller import (
+        from orchestrator.merge_lane.speculation_controller import (
             PermitLedger,
             SpeculationController,
         )
@@ -617,7 +617,7 @@ class TestSpeculationControllerLedgerRouting:
     """
 
     def _make_ledger_and_controller(self, depth: int):
-        from orchestrator.merge_speculation_controller import (
+        from orchestrator.merge_lane.speculation_controller import (
             PermitLedger,
             SpeculationController,
         )
@@ -783,7 +783,7 @@ class TestCanCoalesceGate:
     """
 
     def _make_ledger_and_controller(self, depth: int):
-        from orchestrator.merge_speculation_controller import (
+        from orchestrator.merge_lane.speculation_controller import (
             PermitLedger,
             SpeculationController,
         )

@@ -23,14 +23,15 @@ of its own: it reads them back out of that document, asserts only that the
 document still carries some, and FAILS rather than dropping one it cannot parse.
 The hand-written tokens left are ``_POLICY_CLASS``, serving as the marker slug,
 and the two headings the spans must sit under — structural ANCHORS of exactly
-the kind ``tests/scripts/test_line_pin_policy.py::_MARKER_BEGIN`` is, not copies
+the kind ``tests/scripts/test_line_pin_policy.py::_MARKER_SLUG`` is, not copies
 of a vocabulary. What is held is ABLATION: the ruling has two homes — the policy
 document a human is pointed at, and the skill the watcher actually loads — and
 silent deletion from either, or quiet detachment from the section that home
 sends a reader to, leaves a ruling half the readership never sees.
 ``tests/scripts/test_line_pin_policy.py`` holds a two-home documentation policy
-exactly this way, with the same begin/end marker pair and the same refusal to
-assert on wording.
+exactly this way, with the same begin/end marker pair, the same extractor
+(``tests/scripts/verify_command_invariants.py::marked_body``) and the same
+refusal to assert on wording.
 
 COUNTER-EXAMPLES. The skill shows a REJECTED payload next to a good one, so a
 reader can recognise the shape that will be thrown away. Put
@@ -51,6 +52,7 @@ import pathlib
 import re
 
 import pytest
+import verify_command_invariants as vci
 from escalation.shadow_ruling import (
     FIRST_TRANCHE_CLASSES,
     HUMAN_FOREVER_GATES,
@@ -116,14 +118,6 @@ _POLICY_SECTION = "## The `scope-not-delivered` closure policy, also in force"
 #: both the class name and the marker slug, so the two cannot drift apart.
 _POLICY_CLASS = "scope-not-delivered"
 
-#: The marked span carrying the ruling, in each of its two homes. The opener is
-#: matched as a PREFIX, not as a whole comment, exactly as
-#: `tests/scripts/test_line_pin_policy.py::_MARKER_BEGIN` is: both homes carry
-#: their extraction contract inside the opening comment, and pinning the `-->`
-#: would forbid that.
-_POLICY_BEGIN = f"<!-- {_POLICY_CLASS}:begin"
-_POLICY_END = f"<!-- {_POLICY_CLASS}:end -->"
-
 #: A closure-form bullet. HYPHENATED, matching the spelling the policy
 #: vocabulary uses. That spelling is NOT what keeps this extractor and
 #: `_SLUG_BULLET` apart — a separator-free slug matches both, and `- `resume``
@@ -155,44 +149,19 @@ def _section(text: str, heading: str, level: str = "## ") -> str:
 
 
 def _marked_span(text: str, source: str) -> str:
-    """The body of the `scope-not-delivered` marked span in *text*.
+    """The body of the `scope-not-delivered` marked span in *text*, verbatim.
 
-    Fails LOUDLY — never skips, never returns empty — on every shape that would
-    leave the guard pinning nothing: the opener absent, duplicated, unterminated
-    or inverted. Error shapes mirror
-    `scripts/tests/test_merge_state_vocabulary_consistency.py`, whose extractor
-    contract records why: an extractor that silently yields nothing turns every
-    downstream assertion green while holding nothing at all.
+    This guard's slug, label and task on
+    `tests/scripts/verify_command_invariants.py::marked_body`, where every
+    malformed shape, a span wrapping nothing included, raises.
     """
-    opens = text.count(_POLICY_BEGIN)
-    assert opens == 1, (
-        f"{source}: expected exactly one `{_POLICY_BEGIN}` marker, found {opens} "
-        f"(task 5723). This document is one of the two homes of the "
-        f"`{_POLICY_CLASS}` ruling; a missing opener means the ruling was "
-        f"deleted from it, and a second one means the span this guard reads is "
-        f"ambiguous."
+    return vci.marked_body(
+        text,
+        slug=_POLICY_CLASS,
+        source=source,
+        label=f"the `{_POLICY_CLASS}` ruling, one of its two homes",
+        task="5723",
     )
-    closes = text.count(_POLICY_END)
-    assert closes == 1, (
-        f"{source}: expected exactly one `{_POLICY_END}` marker, found {closes} "
-        f"(task 5723) — the `{_POLICY_CLASS}` span is unterminated, so the rest "
-        f"of the file would be read as its body."
-    )
-
-    start = text.index(_POLICY_BEGIN)
-    end = text.index(_POLICY_END)
-    assert start < end, (
-        f"{source}: the `{_POLICY_END}` marker precedes `{_POLICY_BEGIN}` "
-        f"(task 5723) — the `{_POLICY_CLASS}` span is inverted and encloses "
-        f"nothing."
-    )
-    comment_close = text.find("-->", start)
-    assert comment_close != -1 and comment_close < end, (
-        f"{source}: the `{_POLICY_BEGIN}` comment is never closed with `-->` "
-        f"before the end marker (task 5723) — its own extraction-contract prose "
-        f"would be read as span content."
-    )
-    return text[comment_close + len("-->"):end]
 
 
 def _note_line(ruling_class: str, proposed_action: str) -> str:
@@ -454,6 +423,22 @@ def test_the_shadow_section_quotes_a_runnable_weekly_count_command():
 # ---------------------------------------------------------------------------
 # The `scope-not-delivered` standing policy, in both of its homes
 # ---------------------------------------------------------------------------
+
+
+def test_marked_span_refuses_a_span_that_wraps_nothing():
+    """A marker pair left wrapping nothing is the ablation both homes guard against.
+
+    The malformed-marker shapes are the shared helper's contract, pinned once in
+    `test_verify_command_invariants.py`; this pins that the wrapper threads this
+    guard's slug and *source* into it.
+    """
+    text = "<!-- scope-not-delivered:begin extraction contract -->\n\n<!-- scope-not-delivered:end -->\n"
+    with pytest.raises(AssertionError) as excinfo:
+        _marked_span(text, "probe.md")
+
+    message = str(excinfo.value)
+    assert "scope-not-delivered" in message
+    assert "probe.md" in message
 
 
 @pytest.fixture

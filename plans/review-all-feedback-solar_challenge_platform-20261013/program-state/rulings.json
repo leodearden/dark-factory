@@ -1,0 +1,262 @@
+[
+ {
+  "item": 1,
+  "stream": "Billing engine: evidence module and typed facts",
+  "ruling": "An absent settlement coverage becomes an explicit Absent observation at the meter_read boundary: assess_coverage counts it unobserved, _band_weights imputes it, one 'observed' predicate shared by both; all-None fixtures rewritten. Split statement.py along the seat's measured partition; one supply predicate; one governed-finance builder.",
+  "options_considered": [
+   "explicit Absent observation",
+   "require coverage on every HHRead and refuse without",
+   "accept as standing"
+  ],
+  "consequence": "UNDER_METERED has one definition and tasks 221/407 edit one predicate; the alternative made coarse-cadence runs depend on stream 6 landing first.",
+  "ruled_by": "human",
+  "date": "2026-10-14"
+ },
+ {
+  "item": 2,
+  "stream": "Billing push lifecycle and unit of work",
+  "ruling": "billing_run_status stays as the push ledger, written in the statement's transaction under one decision; the approve->issue gate is a state on it; the push operation moves into billing with a typed SkipReason; one unit of work owns commit/rollback.",
+  "options_considered": [
+   "separate push ledger in the same transaction",
+   "fold state/refs onto the statement row",
+   "accept as standing"
+  ],
+  "consequence": "push history (retries, provider refs) stays separable from the statement of record, and a provider change never migrates the money table.",
+  "ruled_by": "human",
+  "date": "2026-10-14"
+ },
+ {
+  "item": 3,
+  "stream": "Composition root per role",
+  "ruling": "Per-role builders over shared engine/session/store parameters; create_app(graph); every role checks the schema head and configures logging the same way; scp-dispatch and scp-ingest compose through their builders.",
+  "options_considered": [
+   "one Wired graph for every role",
+   "per-role builders",
+   "accept as standing"
+  ],
+  "consequence": "roles diverge only where they should; a shared collaborator is a parameter, not a graph member constructed in six processes.",
+  "ruled_by": "human",
+  "date": "2026-10-14"
+ },
+ {
+  "item": 4,
+  "stream": "Control feedback as typed values and provenance by type",
+  "ruling": "Emulator keeps the real multi-request Modbus sequence with pending state keyed by connection and a stated, tested one-connection-per-lane invariant; audit rows are stamped by the plane's injectable clock with device time as a separate column. AppliedSetpoint/RegisterWrite typed values; provenance required by type; contract.py's register codec split off (its partition passes heuristic 13).",
+  "options_considered": [
+   "FC23 atomic request",
+   "per-connection pending state",
+   "plane clock + device-time column",
+   "decode_feedback takes the clock"
+  ],
+  "consequence": "field fidelity of the double is kept (the standing concern that it already diverges from a real GX), sharded dispatch must never share a connection across lanes; every time-based query over the audit log has one clock and device skew becomes observable data (task 78 rule).",
+  "ruled_by": "human",
+  "date": "2026-10-14"
+ },
+ {
+  "item": 5,
+  "stream": "Ingest ack-persist ordering",
+  "ruling": "Manual ack after the batch commits (aiomqtt manual_ack, bounded max_queued_incoming_messages); one ingestion pipeline module owns admit->persist->ack as a stated invariant with one flush path under one lock; consent/decode drops carried in the persisted tick by one generic conversion; pinned by a kill-the-store-mid-flush test.",
+  "options_considered": [
+   "manual ack after commit",
+   "ack-on-receipt with bounded queue and counted loss",
+   "accept as standing"
+  ],
+  "consequence": "the broker's persistent session stays the system of record and the pipeline is one linear state machine an agent can read in one file; the store's unnest write is already idempotent on (device, ts, metric) so redelivery is safe; throughput is bounded by commit latency.",
+  "ruled_by": "human",
+  "date": "2026-10-14"
+ },
+ {
+  "item": 6,
+  "stream": "Settlement store seam",
+  "ruling": "A SettlementStore protocol beside TelemetryStore implemented by both backends and chosen at the composition root; one MetricKind policy object; SettlementCoverage carries the metric and the ops strip keys rows by it; late settlement rows append a new revision keyed by method_version with current = latest revision (append-only kept) and statement_of_record pins the revision it billed from; one parametrised contract test over both stores.",
+  "options_considered": [
+   "metric-keyed strip",
+   "register-metrics-only strip",
+   "min-across-metrics strip",
+   "newer derivation wins on conflict",
+   "first-write-wins plus a re-settle pass"
+  ],
+  "consequence": "any new Metric member appears in the strip automatically; late data heals itself through one write path while billing stays replayable because the statement names its revision; the briefing's append-only decision and the hotspot's revision-ledger remedy become one mechanism.",
+  "ruled_by": "human",
+  "date": "2026-10-14"
+ },
+ {
+  "item": 7,
+  "stream": "Tenant reach has one predicate",
+  "ruling": "One occupancy predicate over the supply window evaluated at a time — occupant(session, home_id, at) / holds_home(customer, property, at) — used by ScopedRepository, GateConsentChecker, the optimiser identity resolver and generated RLS policy SQL; the GUC is set in the one request-session dependency with unset meaning deny and an explicit fleet marker for ADMIN/OPERATOR; pinned by a Postgres test that a connection with no GUC sees zero tenant rows.",
+  "options_considered": [
+   "ACTIVE only",
+   "ACTIVE or PENDING",
+   "supply window at a time",
+   "accept as standing"
+  ],
+  "consequence": "reach matches what is billed; move-in/move-out attribution (task 323) becomes a date rule with one home; every account must state opened_on/closed_on.",
+  "ruled_by": "human",
+  "date": "2026-10-14"
+ },
+ {
+  "item": 8,
+  "stream": "Board requirements without a mechanism",
+  "ruling": "Not quality work: each of the 11 keys is routed to the owning capability PRD (the approve-issue, alerting and ops PRDs already filed as tasks 440-491) or to a new capability manifest where none exists; no quality stream is opened; the program doc records the routing per key.",
+  "options_considered": [
+   "route to capability PRDs",
+   "one quality stream",
+   "accept as standing"
+  ],
+  "consequence": "each requirement lands with its consumer named (G1) and seams owned (G4) rather than as mechanism built from a refactor brief.",
+  "ruled_by": "human",
+  "date": "2026-10-14"
+ },
+ {
+  "item": 9,
+  "stream": "Persisted vocabularies and schema equivalence",
+  "ruling": "Approved as one agent-mode stream whose first leaf widens tests/test_migrations.py::test_schema_matches_orm_metadata to all 28 mapped tables with compare_type=True on both lanes; then the enum_column helper, the NOT NULL / legacy-default migration under the pre-release ruling, RecipientKind as one definition, models/__init__ registration-only, CHAIN_HEAD read from ScriptDirectory.",
+  "options_considered": [
+   "approve with the schema test first",
+   "approve as proposed",
+   "accept as standing"
+  ],
+  "consequence": "schema equivalence is enforced before vocabularies move, so every later migration in the stream is caught by the widened test.",
+  "ruled_by": "human",
+  "date": "2026-10-14"
+ },
+ {
+  "item": 10,
+  "stream": "Planner boundary contracts",
+  "ruling": "Fix the boundary contracts now (Forecast shape, finance as-of through billing's governed-finance builder, one outcome/skip-reason enum, per-home savepoint with one try over resolve, consent and SoC) and leave the candidate/reserve machinery for the MPC PRD.",
+  "options_considered": [
+   "boundary contracts only",
+   "full rework incl. reserve and candidate factoring",
+   "accept as standing"
+  ],
+  "consequence": "MPC inherits typed inputs; candidate-specific code is deleted in one later move instead of being reworked twice.",
+  "ruled_by": "human",
+  "date": "2026-10-14"
+ },
+ {
+  "item": 11,
+  "stream": "Shared frontend layer and generated wire types",
+  "ruling": "TS wire types generated from app.openapi() in both SPA builds with a pytest gate asserting every TS enum union equals its Python Enum; a frontend-shared workspace package owns auth/storedSignIn/useJoinAnotherTabsSignIn, one http client with a typed failure handling 401, the one read hook (useRetryableLoad) and the formatters; RunsPanel gets a fallback tone.",
+  "options_considered": [
+   "generated types vs pytest union gate",
+   "workspace package vs copied directory with byte-equality test"
+  ],
+  "consequence": "drift between backend enums and the console becomes impossible rather than policed; the OpenAPI document becomes a kept contract; shared concerns have one home.",
+  "ruled_by": "human",
+  "date": "2026-10-14"
+ },
+ {
+  "item": 12,
+  "stream": "Validation topology as a value",
+  "ruling": "Delete the dormant GitHub workflows (validation.yml, slow-lane.yml) and their 36 pinning tests; ci.cadence.LANES and the systemd timers are the one cadence home. Drills take a frozen Topology value (containers, supervisor, settings, engine). Split validation/run.py along the seat's measured partition; Verdict gains NO_SIGNAL so a lane that produced no artefact never reports PASS; container image pins in one leaf below instance/ and validation/.",
+  "options_considered": [
+   "generate workflows from LANES",
+   "delete workflows",
+   "frozen Topology value",
+   "mutable drill context"
+  ],
+  "consequence": "nothing dormant to drift (esc-239-3 ruling: cadence = local timers); new drills compose from values and the harness lifecycle module is the one owner of the handles.",
+  "ruled_by": "human",
+  "date": "2026-10-14"
+ },
+ {
+  "item": 13,
+  "stream": "Consent purpose catalogue and gate decide()",
+  "ruling": "consent/purposes.py holds REQUIRED_SCOPE as the one purpose->categories catalogue; POST /consent takes purpose only and the server fills the scope from it; EXPIRED is dropped from the stored projection (0006-style migration) and the wire carries a separate effective-status type computed by one gate-side function on the injectable clock; one decide() produces CHECK_FAILED uniformly for every consumer.",
+  "options_considered": [
+   "drop EXPIRED vs timer-written EXPIRED",
+   "purpose-only POST vs client scope validated as superset"
+  ],
+  "consequence": "the catalogue is the only place scope is decided (the portal's wrong scope cannot recur); no reader can mistake the projection for liveness; renewal keys on the effective type; the briefing's 'EXPIRED is never stored' decision becomes typed.",
+  "ruled_by": "human",
+  "date": "2026-10-14"
+ },
+ {
+  "item": 14,
+  "stream": "Instance render owns runtime identity and schedules",
+  "ruling": "The role uid has one home: the Dockerfile creates the user with --uid 10001 --gid 10001 and creates/chowns the dispatch state directory; the render stops overriding user:; the container smoke runs as the deployed uid. One UTC-calendar/unit-text module below instance/ and ci/ that both renderers import; the render either mounts real broker/proxy configuration or stops claiming MQTTS/HTTPS.",
+  "options_considered": [
+   "Dockerfile uid",
+   "render constant with an image-building test",
+   "accept as standing"
+  ],
+  "consequence": "smoke and deploy run as the same identity by construction; host directory ownership instructions cite the image.",
+  "ruled_by": "human",
+  "date": "2026-10-14"
+ },
+ {
+  "item": 15,
+  "stream": "Provider mode as a typed axis",
+  "ruling": "A ProviderMode enum (fake, sandbox, live) resolved once from a Settings field, refused in the production deployment (ENVIRONMENT=production/prod) unless live, refused on staging when live — staging is a hardened pre-production rung that admits explicitly-set non-production modes (Leo 2026-10-16, S15 Q3, PRD §4 D6 ruling note d6ea845), turned into the port pair by the role's composition root and stamped on the run row; billing/providers/ owns the binding constructors; provider references become a typed value; one EventKind->ArrearsState map the fakes import; fakes mint their own prefixes and never echo the view's total.",
+  "options_considered": [
+   "Settings field",
+   "scp-bill --provider-mode flag",
+   "accept as standing"
+  ],
+  "consequence": "one axis in the one place deployment reads; the instance render and the hermetic-switch table see it; a new mode is one enum member.",
+  "ruled_by": "human",
+  "date": "2026-10-14"
+ },
+ {
+  "item": 16,
+  "stream": "Tariff as a typed domain value",
+  "ruling": "One tariff constructor parses the ORM Tariff once into FlatTariff | TouTariff with minute-valued bands, a wrap flag (start > end allowed, as the domain library does) and one validity rule; the create/update routes and billing's load path both call it; the current-tariff pointer is dropped and the current tariff is derived from the open assignment as an as-of query; Tariff rates are append-only versions.",
+  "options_considered": [
+   "allow wrap vs refuse wrap",
+   "assignment row on change with pointer cache vs drop the pointer"
+  ],
+  "consequence": "one band convention shared with the optimiser (Economy 7 expressible); tariff facts match the governed-ledger shape and run_billing reads only history (item 1 ruling).",
+  "ruled_by": "human",
+  "date": "2026-10-14"
+ },
+ {
+  "item": 17,
+  "stream": "Wire schemas derived from one field list",
+  "ruling": "Declare the value once (BatterySpec, BillBreakdown via dataclasses.fields, AccountChange) and derive ORM kwargs and pydantic request/response schemas from it; the five CRUD resources share one write mechanism; PATCH /accounts passes a typed AccountChange; every CRU write records the actor.",
+  "options_considered": [
+   "declare the value once",
+   "derive schemas from mapped columns",
+   "accept as standing"
+  ],
+  "consequence": "the domain value is the contract; storage and wire follow it and a divergence is an explicit mapping.",
+  "ruled_by": "human",
+  "date": "2026-10-14"
+ },
+ {
+  "item": 18,
+  "stream": "uncontested block (9 streams)",
+  "ruling": "Approved as proposed, each as an agent-mode /prd stream: Device last-seen has one reader; Time grid and UTC home; Simulated fleet identity; Dispatch composition out of control/; Settings domains and deployment profile; Governed ledgers on one mixin and reader; Money quantum and wire decimal grammar; Ops reads through public seams; Declared package strata.",
+  "options_considered": [
+   "approve all nine",
+   "approve with exclusions"
+  ],
+  "consequence": "one option each, confirmed findings, size S/M, low/medium risk; the remedies name what becomes deletable.",
+  "ruled_by": "human",
+  "date": "2026-10-14"
+ },
+ {
+  "item": 19,
+  "stream": "invariant candidates",
+  "ruling": "Each of the ten candidates lands as a checkable test inside its owning stream AND a repo-level leaf creates docs/legibility/design-invariants.md listing them in checkable form (the project had no invariants document); the program doc carries one pointer per invariant and owning stream, never a second list.",
+  "options_considered": [
+   "tests in owning streams only",
+   "also create the invariants document",
+   "defer"
+  ],
+  "consequence": "the project gains the gate-question home /prd G7 and /review phase 2 read; each invariant is enforced by a test the stream that owns the mechanism writes.",
+  "ruled_by": "human",
+  "date": "2026-10-14"
+ },
+ {
+  "item": 20,
+  "stream": "weakened findings in a cell's top three",
+  "ruling": "All sixteen stay in their streams at weakened weight; none is dropped and none changes a severity on its own.",
+  "options_considered": [
+   "keep all sixteen",
+   "drop the twelve low ones"
+  ],
+  "consequence": "the skeptic reproduced the structure in every case and marked only the weight overstated.",
+  "ruled_by": "human",
+  "date": "2026-10-14"
+ }
+]

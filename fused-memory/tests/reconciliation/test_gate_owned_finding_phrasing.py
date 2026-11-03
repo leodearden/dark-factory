@@ -61,6 +61,10 @@ class TestExtractHumanGatedTaskIds:
     not import — see the module docstring).  Strictness errs fail-safe: a
     strict predicate can only UNDER-select, so a non-gate finding is never
     rewritten.
+
+    The traversal contract (malformed shapes, id coercion, sort/dedup, empty
+    input) is pinned once in ``test_task_metadata_selection.py``; this class
+    pins only the predicate.
     """
 
     def test_selects_operational_mode_gate_task(self):
@@ -164,47 +168,6 @@ class TestExtractHumanGatedTaskIds:
             f'truthy values do not satisfy the gate; got {result!r}'
         )
 
-    def test_skips_non_dict_tasks_metadata_and_none_ids_without_raising(self):
-        """Non-dict elements, non-dict metadata, and None ids are all skipped."""
-        tree = FilteredTaskTree(active_tasks=[
-            'not-a-dict',  # type: ignore[list-item]
-            None,  # type: ignore[list-item]
-            {'id': 1, 'metadata': 'operational_mode=gate'},
-            {'id': 2, 'metadata': ['gate']},
-            {'id': 3, 'metadata': None},
-            {'id': 4},
-            {'id': None, 'metadata': {'operational_mode': 'gate'}},
-            {'metadata': {'always_escalates': True}},
-            {'id': 12, 'metadata': {'operational_mode': 'gate'}},
-        ])
-
-        result = extract_human_gated_task_ids(tree.active_tasks)
-
-        assert result == ['12'], (
-            'malformed elements must be skipped without raising — a spurious id '
-            f'would rewrite an unrelated finding; got {result!r}'
-        )
-
-    def test_coerces_int_ids_and_returns_sorted_deduped(self):
-        """int ids coerce to str; the result is sorted and deduped."""
-        tree = FilteredTaskTree(active_tasks=[
-            {'id': 652, 'metadata': {'always_escalates': True}},
-            {'id': '645', 'metadata': {'operational_mode': 'gate'}},
-            {'id': 645, 'metadata': {'operational_mode': 'gate'}},
-        ])
-
-        result = extract_human_gated_task_ids(tree.active_tasks)
-
-        assert result == ['645', '652'], (
-            'int and str spellings of one id must collapse, and the result must '
-            f'be sorted; got {result!r}'
-        )
-
-    def test_empty_input_returns_empty_list(self):
-        """No active tasks -> []."""
-        assert extract_human_gated_task_ids(FilteredTaskTree().active_tasks) == []
-        assert extract_human_gated_task_ids([]) == []
-
 
 class TestCanonicalHumanGateAction:
     """The one sentence both halves quote, its heading, and its prompt section.
@@ -266,7 +229,7 @@ class TestCanonicalHumanGateAction:
     def test_heading_constant_is_exported_and_well_formed(self):
         """The section heading is a constant so tests locate it without pinning prose.
 
-        Follows the ``EXECUTING_A_CLUSTER_FOLD_HEADING`` precedent in
+        Follows the ``PROPOSING_A_CONSOLIDATION_HEADING`` precedent in
         ``prompts/stage1.py``: a pure rename with a byte-identical body must
         not turn the wiring pins red for no behavioural reason.
         """

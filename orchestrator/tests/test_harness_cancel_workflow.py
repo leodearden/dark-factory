@@ -149,7 +149,8 @@ def harness_for_run_slot() -> Harness:
     h._merge_worker = None
     h._merge_inflight_registry = None  # type: ignore[assignment]
     h.cost_store = None
-    # _collect_done_reports uses these
+    # _collect_slot_report uses these
+    h._live_tasks = set()
     h._run_store = None
     h._run_id = None
     h.review_checkpoint = None
@@ -172,15 +173,15 @@ async def test_run_slot_returns_cancelled_report_when_hard_cancelled(
     harness_for_run_slot: Harness,
 ) -> None:
     """RED: CancelledError escapes _run_slot → wrapper_task.cancelled() is True;
-    _collect_done_reports' t.result() re-raises CancelledError past its own
-    `except Exception` guard, unwinding the harness main loop.
+    the done-callback's t.result() re-raises CancelledError past its own
+    `except Exception` guard.
 
     GREEN (step-10): _run_slot catches asyncio.CancelledError before
     `except Exception`, returns a synthetic TaskReport(outcome=CANCELLED) so:
     (a) wrapper_task completes normally (cancelled() is False);
     (b) wrapper_task.result() is a TaskReport(outcome=CANCELLED);
     (c) finally cleanup runs (registries cleared, semaphore released);
-    (d) _collect_done_reports appends the report without raising.
+    (d) _collect_slot_report appends the report without raising.
     """
     h = harness_for_run_slot
     tid = '42'
@@ -246,11 +247,11 @@ async def test_run_slot_returns_cancelled_report_when_hard_cancelled(
         'grace stamp must persist past the finally (popped only at re-dispatch)'
     )
 
-    # (d) Regression: _collect_done_reports must handle the wrapper_task cleanly.
+    # (d) Regression: _collect_slot_report must handle the wrapper_task cleanly.
     task_reports: list = []
-    h._collect_done_reports({wrapper_task}, task_reports)
+    h._collect_slot_report(task_reports, wrapper_task)
     assert len(task_reports) == 1, (
-        f'Expected _collect_done_reports to append 1 report, got {len(task_reports)}'
+        f'Expected _collect_slot_report to append 1 report, got {len(task_reports)}'
     )
     assert task_reports[0].outcome == WorkflowOutcome.CANCELLED
 
@@ -332,7 +333,7 @@ async def _drive_cancelled_slot(
     then hard_cancel_workflow.
 
     ``capture_task`` receives the wrapper asyncio.Task itself, for callers that
-    need to feed it back through ``_collect_done_reports`` (the runs.db half).
+    need to feed it back through ``_collect_slot_report`` (the runs.db half).
     """
     assignment = TaskAssignment(task_id=tid, task={'title': 'wedged task'}, modules=[])
     sem = asyncio.Semaphore(0)
@@ -520,7 +521,7 @@ class TestCancelledReportReachesRunStore:
     """The runs.db half of the acceptance query (task 3172, step-21).
 
     events.db gets the new task_completed emit; runs.db gets the same two
-    fields via ``_collect_done_reports`` → ``save_task_result``.  Pinning both
+    fields via ``_collect_slot_report`` → ``save_task_result``.  Pinning both
     keeps the two stores answerable by the SAME question.
     """
 
@@ -538,14 +539,14 @@ class TestCancelledReportReachesRunStore:
             capture_task=captured,
         )
 
-        # _collect_done_reports persists whatever the slot returned.  Wire the
+        # _collect_slot_report persists whatever the slot returned.  Wire the
         # run store only now: _run_slot itself must not need it.
         h._run_store = MagicMock()
         h._run_id = 'run-1'
         h.config = MagicMock()
         h.config.fused_memory.project_id = 'dark_factory'
 
-        h._collect_done_reports(set(captured), [])
+        h._collect_slot_report([], captured[0])
 
         h._run_store.save_task_result.assert_called_once()
         saved_report = h._run_store.save_task_result.call_args.args[1]

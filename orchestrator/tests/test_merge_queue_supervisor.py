@@ -23,18 +23,19 @@ import contextlib
 from pathlib import Path
 
 import pytest
-from _merge_lane_fakes import FakeClock, FakeVerifier, RecordingEscalations
+from _merge_lane_fakes import FakeClock, FakeVerifier, RecordingEscalations, lane_scene_config
+from _orch_helpers import wait_responsive
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.worker import (
     DecidedItem,
     InflightEntry,
     MergeOutcome,
     MergeRequest,
     SpeculativeMergeWorker,
 )
-from orchestrator.merge_types import QueuedBranch
 
 # ---------------------------------------------------------------------------
 # Fixtures — mirror test_merge_queue_restart_hook.py
@@ -76,7 +77,7 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
 
 @pytest.fixture
 def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
-    return OrchestratorConfig(project_root=git_repo, git=git_config)
+    return lane_scene_config(git_repo, git_config)
 
 
 async def _make_branch_with_file(
@@ -393,50 +394,55 @@ async def test_verifier_restart_preserves_inflight_and_redispatch(
     git_ops: GitOps,
     config: OrchestratorConfig,
 ) -> None:
-    """Within-cap verifier restart must NOT clear _inflight or _redispatch.
+    """Within-cap verifier restart must NOT clear _inflight or the redispatch park.
 
     The supervisor path (_spawn_loop + _on_loop_task_done restart branch) must
-    never touch self._inflight, self._redispatch, or the seeded entries' result
+    never touch self._inflight, self._intake.pending_redispatch(), or the seeded entries' result
     Futures.  The restarted _verifier_loop naturally resumes draining them
     (_finalize_inflight's `if not req.result.done()` guard makes re-finalization
     idempotent).
 
     Procedure:
-      1. Seed worker._redispatch with a SpeculativeItem marker.
-      2. Seed worker._inflight with an InflightEntry marker (verify_task=None).
+      1. Seed worker._intake.pending_redispatch() with one DecidedItem (request 'sv7-park').
+      2. Seed worker._inflight with an InflightEntry (verify_task=None) wrapping
+         a second, distinct DecidedItem (request 'sv7-task').
       3. Replace _verifier_loop with an idle stub.
       4. Build a dead task (RuntimeError) and invoke _on_loop_task_done directly.
-      5. Assert: escalation submitted, new task spawned, _redispatch and _inflight
+      5. Assert: escalation submitted, new task spawned, redispatch park and _inflight
          unchanged, Future not resolved.
     """
     queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
     eq = RecordingEscalations()
     worker = SpeculativeMergeWorker(git_ops, queue, escalation_queue=eq)
+    loop = asyncio.get_running_loop()
 
-    # Build a minimal MergeRequest with a pending Future
-    future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
-    req = MergeRequest(
-        task_id='sv7-task',
-        branch=QueuedBranch.parse('task/sv7', config.git.branch_prefix),
-        worktree=git_ops.project_root,  # doesn't need to be a real worktree
-        pre_rebased=False,
-        task_files=None,
-        module_configs=[],
-        config=config,
-        result=future,
-    )
+    def decided_item(task_id: str, result: asyncio.Future[MergeOutcome]) -> DecidedItem:
+        request = MergeRequest(
+            task_id=task_id,
+            branch=QueuedBranch.parse(f'task/{task_id}', config.git.branch_prefix),
+            worktree=git_ops.project_root,  # doesn't need to be a real worktree
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=result,
+        )
+        return DecidedItem(
+            request=request,
+            base_sha='abc123dead',
+            speculative=False,
+            immediate_outcome=MergeOutcome('blocked', reason='test-filler'),
+        )
 
-    # Build a minimal DecidedItem
-    item = DecidedItem(
-        request=req,
-        base_sha='abc123dead',
-        speculative=False,
-        immediate_outcome=MergeOutcome('blocked', reason='test-filler'),
-    )
+    # Two distinct requests: snapshot() renders one row per request_id, so a
+    # single item seeded into both containers would collapse to one row.
+    future: asyncio.Future[MergeOutcome] = loop.create_future()
+    inflight_item = decided_item('sv7-task', future)
+    parked_item = decided_item('sv7-park', loop.create_future())
 
     # Build a minimal InflightEntry (passthrough: verify_task=None)
     inflight_entry = InflightEntry(
-        item=item,
+        item=inflight_item,
         lease=None,
         verify_task=None,
         merge_wt=None,
@@ -444,7 +450,7 @@ async def test_verifier_restart_preserves_inflight_and_redispatch(
     )
 
     # Seed the instance deques
-    worker._redispatch.append(item)
+    worker._intake.request_redispatch(parked_item)
     worker._inflight.append(inflight_entry)
 
     # Replace _verifier_loop with an idle stub so the spawned restart task
@@ -685,69 +691,76 @@ async def test_real_merger_crash_preserves_verifier_and_pipeline(
 
     run_task = asyncio.create_task(worker.run())
 
-    # Poll up to ~2s until run() spawns both loop tasks.
-    deadline = asyncio.get_running_loop().time() + 2.0
-    while (
-        (worker._merger_task is None or worker._verifier_task is None)
-        and asyncio.get_running_loop().time() < deadline
-    ):
-        await asyncio.sleep(0.02)
+    # try/finally, not straight-line: wait_responsive gives up by raising
+    # _pytest.outcomes.Failed, a BaseException, so an unguarded stop call
+    # would be skipped and leak a live worker into teardown (esc-3980-4).
+    try:
+        # Poll up to ~2s until run() spawns both loop tasks.
+        deadline = asyncio.get_running_loop().time() + 2.0
+        while (
+            (worker._merger_task is None or worker._verifier_task is None)
+            and asyncio.get_running_loop().time() < deadline
+        ):
+            await asyncio.sleep(0.02)
 
-    assert worker._merger_task is not None, 'merger_task should be set after run() starts'
-    assert worker._verifier_task is not None, 'verifier_task should be set after run() starts'
-    verifier_task_before = worker._verifier_task
+        assert worker._merger_task is not None, 'merger_task should be set after run() starts'
+        assert worker._verifier_task is not None, 'verifier_task should be set after run() starts'
+        verifier_task_before = worker._verifier_task
 
-    # Poll up to ~3s for the merger death escalation.
-    deadline = asyncio.get_running_loop().time() + 3.0
-    while len(eq.filed) == 0 and asyncio.get_running_loop().time() < deadline:
-        await asyncio.sleep(0.02)
+        # Poll up to ~3s for the merger death escalation.
+        deadline = asyncio.get_running_loop().time() + 3.0
+        while len(eq.filed) == 0 and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.02)
 
-    # ── Assert 3: escalation emitted for merger death ─────────────────────
-    assert len(eq.filed) >= 1, (
-        f'Expected at least 1 escalation, got {len(eq.filed)}'
-    )
-    merger_esc = eq.filed[0]
-    assert merger_esc.level == 1, f'Expected level 1, got {merger_esc.level}'
-    assert merger_esc.severity == 'blocking', (
-        f'Expected severity blocking, got {merger_esc.severity!r}'
-    )
-    assert 'merge_worker_loop_died' in merger_esc.summary, (
-        f'summary missing merge_worker_loop_died: {merger_esc.summary!r}'
-    )
-    assert 'merger' in merger_esc.summary, (
-        f'summary missing "merger": {merger_esc.summary!r}'
-    )
+        # ── Assert 3: escalation emitted for merger death ─────────────────────
+        assert len(eq.filed) >= 1, (
+            f'Expected at least 1 escalation, got {len(eq.filed)}'
+        )
+        merger_esc = eq.filed[0]
+        assert merger_esc.level == 1, f'Expected level 1, got {merger_esc.level}'
+        assert merger_esc.severity == 'blocking', (
+            f'Expected severity blocking, got {merger_esc.severity!r}'
+        )
+        assert 'merge_worker_loop_died' in merger_esc.summary, (
+            f'summary missing merge_worker_loop_died: {merger_esc.summary!r}'
+        )
+        assert 'merger' in merger_esc.summary, (
+            f'summary missing "merger": {merger_esc.summary!r}'
+        )
 
-    # Give the event loop time for the supervisor to restart the merger.
-    await asyncio.sleep(0.1)
+        # Give the event loop time for the supervisor to restart the merger.
+        await asyncio.sleep(0.1)
 
-    # Submit the post-crash request.
-    req = _make_request('crash-test', 'crash-test', wt, config)
-    await queue.put(req)
+        # Submit the post-crash request.
+        req = _make_request('crash-test', 'crash-test', wt, config)
+        await queue.put(req)
 
-    # ── Assert 1: end-to-end liveness — restarted merger + surviving verifier ──
-    outcome = await asyncio.wait_for(req.result, timeout=15.0)
+        # ── Assert 1: end-to-end liveness — restarted merger + surviving verifier ──
+        outcome = await wait_responsive(
+            req.result,
+            label='post-crash request through the restarted merger and surviving verifier',
+        )
 
-    assert outcome.status == 'done', (
-        f'Expected outcome.status="done" but got {outcome.status!r}'
-    )
+        assert outcome.status == 'done', (
+            f'Expected outcome.status="done" but got {outcome.status!r}'
+        )
 
-    # ── Assert 2: verifier is the SAME task (never retired/replaced) ─────────
-    assert worker._verifier_task is verifier_task_before, (
-        'Verifier task must be the SAME object — it must not have been retired/replaced'
-    )
-    assert not worker._verifier_task.done(), (
-        'Verifier task should still be running (not retired)'
-    )
+        # ── Assert 2: verifier is the SAME task (never retired/replaced) ─────────
+        assert worker._verifier_task is verifier_task_before, (
+            'Verifier task must be the SAME object — it must not have been retired/replaced'
+        )
+        assert not worker._verifier_task.done(), (
+            'Verifier task should still be running (not retired)'
+        )
 
-    # ── Assert 4: merger was restarted (fresh, not-done task) ────────────────
-    assert worker._merger_task is not None
-    assert not worker._merger_task.done(), 'Restarted merger task should still be running'
-
-    # ── Cleanup ──────────────────────────────────────────────────────────────
-    await worker.stop()
-    with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
-        await asyncio.wait_for(run_task, timeout=2.0)
+        # ── Assert 4: merger was restarted (fresh, not-done task) ────────────────
+        assert worker._merger_task is not None
+        assert not worker._merger_task.done(), 'Restarted merger task should still be running'
+    finally:
+        # ── Cleanup ──────────────────────────────────────────────────────────
+        await worker.stop()
+        with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+            await asyncio.wait_for(run_task, timeout=2.0)
 
 
 # ---------------------------------------------------------------------------

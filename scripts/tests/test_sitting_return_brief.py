@@ -49,13 +49,16 @@ class Env:
     df: Path
     fleet: Path
     sessions: Path
-    handover: Path
     preparation: Path
     out: Path
 
     @property
     def queue(self) -> Path:
         return self.df / 'data' / 'escalations'
+
+    @property
+    def handover(self) -> Path:
+        return self.queue / 'l2-handover.md'
 
     @property
     def output(self) -> Path:
@@ -70,7 +73,6 @@ class Env:
             *[arg for root in (roots or (self.df,)) for arg in ('--project-root', str(root))],
             '--decisions-root', str(self.fleet),
             '--sessions-root', str(self.sessions),
-            '--handover', str(self.handover),
             '--preparation', str(self.preparation),
             '--output', str(self.output),
             '--ledger-out', str(self.ledger_out),
@@ -82,7 +84,7 @@ class Env:
             project_roots=[str(root) for root in (roots or (self.df,))],
             decisions_root=self.fleet,
             sessions_root=self.sessions,
-            handover_path=self.handover,
+            handover_override=None,
             preparation_path=self.preparation,
             previous_ledger=self.ledger_out,
             window=fleet_state.Window.trailing(NOW, days=1),
@@ -148,7 +150,7 @@ def _runs_db(path: Path) -> None:
 @pytest.fixture
 def env(tmp_path, make_tasks_db, project_root_with_tasks_db) -> Env:
     df = tmp_path / 'src' / 'dark-factory'
-    e = Env(tmp_path, df, tmp_path / 'fleet', tmp_path / 'fleet' / 'sessions', tmp_path / 'handover.md',
+    e = Env(tmp_path, df, tmp_path / 'fleet', tmp_path / 'fleet' / 'sessions',
             tmp_path / 'state' / 'preparation.json', tmp_path / 'out')
     make_tasks_db([
         *({'id': n, 'status': 'blocked'} for n in range(101, 108)),
@@ -336,6 +338,39 @@ class TestHeader:
         assert 'reify' in sections[TITLES[2]] and 'source_missing' in sections[TITLES[2]]
         assert 'runs_db' in sections[TITLES[2]]
         assert 'tasks_db' in sections[TITLES[3]]
+
+
+class TestHandoverPerProject:
+    @pytest.fixture
+    def reify(self, env) -> Path:
+        reify = env.tmp / 'src' / 'reify'
+        _esc(reify / 'data' / 'escalations', id='esc-101-1')
+        (reify / 'data' / 'escalations' / 'l2-handover.md').write_text(
+            '# handover\n\nesc-101-1 task 101: the reify watcher holds this\n'
+        )
+        return reify
+
+    def test_build_reads_each_projects_own_handover(self, env, reify):
+        document = mod.build(
+            project_roots=[str(env.df), str(reify)], decisions_root=env.fleet, sessions_root=env.sessions,
+            handover_override=None, preparation_path=env.preparation, previous_ledger=env.ledger_out,
+            window=fleet_state.Window.trailing(NOW, days=1), now=NOW,
+        )
+
+        key = escalation_key(normalize_escalations_dir(reify / 'data' / 'escalations'), 'esc-101-1')
+        (classified,) = [c for c in document.sitting.classified if c.item.key == key]
+        (probe,) = [p for p in classified.ownership.probes if p.probe == 'handover']
+        assert probe.status == 'mentions'
+        assert 'the reify watcher' in probe.evidence
+
+    def test_the_flag_takes_project_equals_path(self, env, capsys, reify):
+        override = env.tmp / 'override.md'
+        override.write_text('esc-101-1 task 101: read from the override\n')
+
+        rc, _ = _run(capsys, [*env.argv(env.df, reify), '--handover', f'reify={override}'])
+
+        assert rc == 0
+        assert 'read from the override' in env.output.read_text()
 
 
 class TestSupersession:

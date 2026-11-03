@@ -429,7 +429,7 @@ tasks:
       kind: grep
       pattern: shadow_coordinator
       paths:
-      - orchestrator/src/orchestrator/merge_queue.py
+      - orchestrator/src/orchestrator/merge_lane/worker.py
       expect: present
   - name: landing-payload-carries-the-settle-inputs
     binding: 'capability→producer (wired) — read at the EMIT site: data={request_id,

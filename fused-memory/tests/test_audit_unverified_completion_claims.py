@@ -15,7 +15,13 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _distinct_git_repo import init_distinct_git_repo
 from _fm_helpers import load_script_module
+from shared.project_layout import tasks_db
+from shared.task_store_schema import TASK_STORE_DDL
+from shared.tasks_db_readonly import TaskDbProblem, TaskDbUnreadable
+
+from fused_memory.backends.falkor_read_only import RO_COMMAND
 
 SCRIPT_PATH = (
     Path(__file__).parent.parent / 'scripts' / 'audit_unverified_completion_claims.py'
@@ -35,7 +41,6 @@ vars_of = _mod.vars_of
 UNRESOLVABLE = _mod.UNRESOLVABLE
 build_report = _mod.build_report
 _build_parser = _mod._build_parser
-RO_COMMAND = _mod.RO_COMMAND
 EpisodeReader = _mod.EpisodeReader
 EPISODE_CYPHER = _mod.EPISODE_CYPHER
 PROJECTED_FIELDS = _mod.PROJECTED_FIELDS
@@ -292,17 +297,15 @@ class TestAdjudicate:
         assert findings[0].ref == 'tkt_0RRRC5AASJ9Z630VP4PCN9H376'
 
     def test_unresolvable_ticket_registry_is_unverifiable_not_mismatch(self) -> None:
-        """THE CRITICAL ASSERTION — the deliberate divergence from the live gate.
+        """THE CRITICAL ASSERTION: an unreadable registry is never a mismatch.
 
-        ``TaskInterceptor.get_ticket_row`` returns None BOTH for "no such
-        ticket" and for "no ticket store configured" (task_interceptor.py:
-        3006-3012), and ``_verify_ticket`` maps a None row to 'mismatch'
-        (completion_claim_gate.py:575). On the write path that conflation is
-        contained upstream by the _taskmaster_configured guard and costs one
-        spurious tag. In a BATCH sweep it would print a fabrication accusation
-        against every ticket claim in the corpus whenever tickets.db is merely
-        absent. The gate's own module makes this distinction load-bearing at the
-        sentinel level (:123-127, INV-2); honouring it here follows that intent.
+        ``_verify_ticket`` maps a None row to 'mismatch', so None must mean
+        only "no such ticket". The live path gets that from
+        ``TaskInterceptor.get_ticket_row``, which raises
+        ``TicketStoreNotConfiguredError`` when no store is configured; the
+        sweep reads tickets.db itself and passes UNRESOLVABLE when it cannot.
+        Without that, a merely absent tickets.db would print a fabrication
+        accusation against every ticket claim in the corpus (INV-2).
         """
         findings = self._adjudicate(ESC_3085_1_INSTANCE_2, ticket=UNRESOLVABLE)
         assert len(findings) == 1
@@ -319,6 +322,12 @@ class TestAdjudicate:
     def test_terminal_task_status_verifies_and_is_dropped(self) -> None:
         """Verified claims never appear — the report is a report of problems."""
         assert self._adjudicate(ESC_3085_1_INSTANCE_1, task_status='done') == []
+
+    def test_filing_claim_about_an_open_task_is_not_a_finding(self) -> None:
+        """Filing asserts existence, so a pending task verifies it (sweep Class A)."""
+        assert self._adjudicate(
+            'the regression was refiled as task 4263', task_status='pending',
+        ) == []
 
     def test_open_task_status_is_a_mismatch(self) -> None:
         findings = self._adjudicate(ESC_3085_1_INSTANCE_1, task_status='in-progress')
@@ -719,7 +728,8 @@ class TestReadOnlyByConstruction:
         test_reader_constructs_no_graphiti_driver went AST-based. Pinning
         source text also punished a second legitimate mention of a constant.
         The behavioural guarantee lives in _FakeGraph (which raises if the
-        writable ``query`` is ever issued) and in assert_read_only_command;
+        writable ``query`` is ever issued) and in
+        ``fused_memory/backends/falkor_read_only.py::ReadOnlyGraphProxy``;
         this test is the structural backstop for a mutator that never runs
         under test.
         """
@@ -897,6 +907,11 @@ class TestEpisodeReader:
         batch = await EpisodeReader(graph=graph).fetch_derived_edges_batch(['ep-1'])
         assert batch == {'ep-1': ('edge-scalar',)}
 
+    async def test_the_derived_edge_batch_reaches_the_store_with_its_uuids(self) -> None:
+        graph = _FakeGraph(edge_rows=[])
+        await EpisodeReader(graph=graph).fetch_derived_edges_batch(['ep-1', 'ep-2'])
+        assert [params for _query, params in graph.queries] == [{'uuids': ['ep-1', 'ep-2']}]
+
     async def test_empty_batch_issues_no_query(self) -> None:
         graph = _FakeGraph()
         assert await EpisodeReader(graph=graph).fetch_derived_edges_batch([]) == {}
@@ -960,7 +975,8 @@ class TestEpisodeReader:
         graph = _FakeGraph(rows=[_episode_row()])
         reader = EpisodeReader(graph=graph)
         await reader.fetch_population()
-        assert reader._graph is graph
+        # The injected double served the read, so no lazily opened client replaced it.
+        assert graph.queries
 
 
 class _FakeReader:
@@ -1734,21 +1750,18 @@ class TestProbeBuilders:
     async def test_task_status_probe_reads_the_real_schema(self, tmp_path) -> None:
         """Statuses come back per (project, id), scoped to the master tag.
 
-        The fixture database is created from the BACKEND's own ``_SCHEMA_SQL``,
-        so this test fails if the read's SQL ever drifts from the schema the
-        backend writes — the silent-all-unverifiable regression.
+        The fixture database is created from
+        ``shared.task_store_schema.TASK_STORE_DDL``, the DDL the backend creates
+        every store with, so this test fails if the read's SQL ever drifts from
+        the schema the backend writes — the silent-all-unverifiable regression.
         """
         import sqlite3  # noqa: PLC0415
 
-        from fused_memory.backends.sqlite_task_backend import (  # noqa: PLC0415
-            _SCHEMA_SQL,
-        )
-
         root = tmp_path / 'proj'
-        db_path = root / '.taskmaster' / 'tasks' / 'tasks.db'
+        db_path = tasks_db(root)
         db_path.parent.mkdir(parents=True)
         conn = sqlite3.connect(db_path)
-        conn.executescript(_SCHEMA_SQL)
+        conn.executescript(TASK_STORE_DDL)
         conn.executemany(
             'INSERT INTO tasks (tag, id, title, status, updated_at) '
             'VALUES (?, ?, ?, ?, ?)',
@@ -1769,6 +1782,27 @@ class TestProbeBuilders:
         assert probe('5999', 'reify') is None  # another tag is not this tree
         assert probe('4040', 'reify') is None  # no such task -> unresolvable
         assert probe('5422', 'dark_factory') is None  # wrong project's tree
+
+    async def test_task_status_probe_stub_store_logs_the_refusal(
+        self, tmp_path, caplog
+    ) -> None:
+        """The 0-byte decoy is logged as connect_ro's EMPTY_STUB refusal, not as
+        `no such table: tasks`, and the claim stays UNVERIFIABLE."""
+        root = tmp_path / 'proj'
+        db_path = tasks_db(root)
+        db_path.parent.mkdir(parents=True)
+        db_path.write_bytes(b'')
+
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            probe = await _mod._build_task_status_probe(
+                {'reify': str(root)}, {'reify': {'5422'}}
+            )
+
+        assert probe('5422', 'reify') is None
+        logged = [r.exc_info[1] for r in caplog.records if r.exc_info]
+        assert len(logged) == 1
+        assert isinstance(logged[0], TaskDbUnreadable)
+        assert logged[0].reason is TaskDbProblem.EMPTY_STUB
 
     async def test_task_status_probe_missing_db_creates_nothing(
         self, tmp_path
@@ -1803,3 +1837,18 @@ class TestProbeBuilders:
         repo_root = SCRIPT_PATH.parents[2]
         probe = _mod._build_commit_probe({'dark_factory': str(repo_root)})
         assert probe('0' * 40, 'dark_factory') is False
+
+    async def test_commit_probe_finds_a_sha_in_another_registered_repo(
+        self, tmp_path
+    ) -> None:
+        """Sweep Class C: a reify writer naming a dark_factory commit."""
+        reify_root = tmp_path / 'reify'
+        df_root = tmp_path / 'dark_factory'
+        reify_sha = init_distinct_git_repo(reify_root)
+        df_sha = init_distinct_git_repo(df_root)
+        assert df_sha != reify_sha
+
+        probe = _mod._build_commit_probe(
+            {'reify': str(reify_root), 'dark_factory': str(df_root)}
+        )
+        assert probe(df_sha, 'reify') is True

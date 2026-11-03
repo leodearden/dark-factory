@@ -24,6 +24,46 @@
       "severity": "blocking",
       "description": "The resultCache is constructed via spread ({ ...(state.messages[idx] as any).resultCache || {} }) which is a shallow copy. The inner objects ({output, is_error}) are new, so this particular spread is safe. However, assigning resultCache inside produce() replaces the entire cache object, breaking any existing reactive subscriptions to individual cache entries in the Solid.js store.",
       "mutation_type": "shallow_mutate"
+    },
+    {
+      "id": "ts_shallow_mutate_pool_01",
+      "location": "gui/src/stores/claudeStore.ts:166",
+      "category": "type_contract_violation",
+      "severity": "blocking",
+      "description": "The tool_call handler reads msg.metadata, but the sidecar ToolCall message type (gui/sidecar/src/types.ts:38-43) has no metadata field, and the object carrying metadata is pushed into ToolCallInfo[] whose interface (claudeStore.ts:10-16) was not extended. The task required extending ToolCallInfo/AssistantMessage; without it, accessing msg.metadata on the narrowed union is a TypeScript error, so npm run typecheck (named in the test strategy) fails.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "ts_shallow_mutate_pool_02",
+      "location": "gui/src/stores/claudeStore.ts:184-198",
+      "category": "type_contract_violation",
+      "severity": "blocking",
+      "description": "The tool_result handler reads msg.tool_call_id, msg.output and msg.is_error, none of which exist on the sidecar ToolResult type (types.ts:45-50: id, tool_name, result), and assigns m.resultCache, which AssistantMessage does not declare. This fails type-checking; at runtime every entry would be keyed under 'undefined' with output undefined so each result overwrites the last, and the existing tool_name + pending FIFO match is left in place, so results are still not correlated to their own call by id.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "ts_shallow_mutate_pool_03",
+      "location": "gui/src/stores/claudeStore.ts:162,184",
+      "category": "type_cast_any",
+      "severity": "blocking",
+      "description": "Two `as any` casts are introduced: `(state.messages[idx] as any).toolCalls`, which is unnecessary because the preceding role === 'assistant' check already narrows the union, and `(state.messages[idx] as any).resultCache`, which exists only to reach a property not declared on AssistantMessage. The casts hide the missing type declarations instead of fixing them, so future changes to AssistantMessage are unchecked at these sites.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "ts_shallow_mutate_pool_04",
+      "location": "gui/src/__tests__/claudeStore.test.ts",
+      "category": "missing_test",
+      "severity": "blocking",
+      "description": "The task's test strategy requires extending claudeStore.test.ts to drive a turn with several tool_call messages followed by out-of-order tool_result messages, asserting per-call cached output/is_error and metadata propagation (including the empty default); the change adds no tests at all.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "ts_shallow_mutate_pool_05",
+      "location": "gui/src/stores/claudeStore.ts:159",
+      "category": "redundant_comments",
+      "severity": "suggestion",
+      "description": "The added inline comments ('Build tool call object with metadata from the message', 'Cache tool results for quick lookup') restate what the following code does.",
+      "mutation_type": "pooled_2026_10_22"
     }
   ],
   "context": {

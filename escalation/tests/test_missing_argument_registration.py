@@ -25,7 +25,7 @@ from escalation.server import create_server
 
 try:
     from orchestrator.config import OrchestratorConfig  # type: ignore[reportMissingImports]
-    from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+    from orchestrator.merge_lane.worker import (
         InFlightMergeRegistry,
     )
     _ORCHESTRATOR_AVAILABLE = True

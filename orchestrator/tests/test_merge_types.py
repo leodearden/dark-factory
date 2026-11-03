@@ -1,30 +1,20 @@
-"""Tests for orchestrator.merge_types: extracted request/outcome/item/entry
+"""Tests for orchestrator.merge_lane.types: extracted request/outcome/item/entry
 
 types + registries (MQ-refactor task α).
 
-These tests encode the two behavior-preserving contracts of the module
-split:
-
-1. Module-existence — ``orchestrator.merge_types`` exists and exports the
-   full closure of moved public (and internal-but-referenced) symbols.
-2. Shim identity — ``orchestrator.merge_queue`` re-exports the *same*
-   objects (not copies) so every existing importer keeps working
-   unchanged.
+Module-existence — ``orchestrator.merge_lane.types`` exists and exports the
+full closure of moved public (and internal-but-referenced) symbols.
 """
 
 from __future__ import annotations
 
 import dataclasses
-from pathlib import Path
 
 import pytest
-from _orch_helpers import make_placeholder_future
-
-from orchestrator.config import OrchestratorConfig
 
 
 def test_merge_types_exports_moved_public_symbols() -> None:
-    from orchestrator.merge_types import (
+    from orchestrator.merge_lane.types import (
         GroupMergeRequest,
         InflightEntry,
         InFlightMergeRegistry,
@@ -64,72 +54,6 @@ def test_merge_types_exports_moved_public_symbols() -> None:
         assert obj is not None, f"{name} must not be None"
 
 
-def test_merge_queue_reexports_identical_objects() -> None:
-    """merge_queue re-exports the SAME objects from merge_types (shim identity).
-
-    Covers every moved name, including the private/alias ones that staying
-    worker code in merge_queue.py still references by bare name
-    (``_InFlightEntry``, ``_HostUnavailability``, ``MergeReadyPredicate``,
-    ``_INFLIGHT_MERGE_ETA_ESTIMATE_SECS``).
-
-    RED (pre-shim): merge_queue.py still defines its own independent copies
-    of these types (the duplicate definitions left in place by the EXPAND
-    step), so ``getattr(merge_queue, name) is getattr(merge_types, name)``
-    fails for every name — two distinct objects that merely share a name.
-    """
-    import orchestrator.merge_queue as merge_queue
-    import orchestrator.merge_types as merge_types
-
-    moved_names = [
-        "MainHealthAutoHealRegistry",
-        "MergeBounceRegistry",
-        "TerminalOutcomeRecord",
-        "TerminalOutcomeRetention",
-        "_InFlightEntry",
-        "InFlightMergeRegistry",
-        "MergeDispatchResult",
-        "WaiterRecord",
-        "MergeRequest",
-        "GroupMergeRequest",
-        "MergeOutcome",
-        "SoloVerifyResult",
-        "SpeculativeItem",
-        "InflightEntry",
-        "_HostUnavailability",
-        "InflightVerifyResult",
-        "TrainCallbacks",
-        "TrainCallbackFactory",
-        "MergeReadyPredicate",
-        "_INFLIGHT_MERGE_ETA_ESTIMATE_SECS",
-    ]
-
-    for name in moved_names:
-        mq_obj = getattr(merge_queue, name)
-        mt_obj = getattr(merge_types, name)
-        assert mq_obj is mt_obj, (
-            f"{name}: orchestrator.merge_queue.{name} and "
-            f"orchestrator.merge_types.{name} must be the identical object"
-        )
-
-    assert issubclass(merge_queue.GroupMergeRequest, merge_queue.MergeRequest)
-
-    outcome = merge_queue.MergeOutcome(status='done')
-    assert outcome.status == 'done'
-
-    request = merge_queue.MergeRequest(
-        task_id='t1',
-        branch=merge_queue.QueuedBranch.parse('591', 'task/'),
-        worktree=Path('/tmp/wt'),
-        pre_rebased=False,
-        task_files=None,
-        module_configs=[],
-        config=OrchestratorConfig(),
-        result=make_placeholder_future(),
-    )
-    assert request.task_id == 't1'
-    assert request.branch.bare_id == '591'
-
-
 class TestQueuedBranch:
     """Unit tests for QueuedBranch.parse (PRD merge-queue-reliability-prd.md
     task mu, scope 5, DD7 — B9 boundary test, producer half).
@@ -141,7 +65,7 @@ class TestQueuedBranch:
 
     def test_parse_bare_raw(self) -> None:
         """parse('4778', 'task/') -> bare_id='4778', full_name='task/4778'."""
-        from orchestrator.merge_types import QueuedBranch
+        from orchestrator.merge_lane.types import QueuedBranch
 
         qb = QueuedBranch.parse('4778', 'task/')
         assert qb.bare_id == '4778'
@@ -149,7 +73,7 @@ class TestQueuedBranch:
 
     def test_parse_already_prefixed_raw(self) -> None:
         """parse('task/4778', 'task/') yields the SAME shape as the bare form."""
-        from orchestrator.merge_types import QueuedBranch
+        from orchestrator.merge_lane.types import QueuedBranch
 
         qb = QueuedBranch.parse('task/4778', 'task/')
         assert qb.bare_id == '4778'
@@ -157,13 +81,13 @@ class TestQueuedBranch:
 
     def test_bare_and_prefixed_raw_compare_equal(self) -> None:
         """Mixed input shape collapses to one canonical value (value equality)."""
-        from orchestrator.merge_types import QueuedBranch
+        from orchestrator.merge_lane.types import QueuedBranch
 
         assert QueuedBranch.parse('4778', 'task/') == QueuedBranch.parse('task/4778', 'task/')
 
     def test_parse_is_idempotent_round_trip(self) -> None:
         """Re-parsing either derived field reproduces the same QueuedBranch."""
-        from orchestrator.merge_types import QueuedBranch
+        from orchestrator.merge_lane.types import QueuedBranch
 
         qb = QueuedBranch.parse('4778', 'task/')
         assert QueuedBranch.parse(qb.full_name, 'task/') == qb
@@ -171,7 +95,7 @@ class TestQueuedBranch:
 
     def test_parse_empty_prefix_is_noop(self) -> None:
         """An empty branch_prefix leaves bare_id and full_name identical."""
-        from orchestrator.merge_types import QueuedBranch
+        from orchestrator.merge_lane.types import QueuedBranch
 
         qb = QueuedBranch.parse('4778', '')
         assert qb.bare_id == '4778'
@@ -184,14 +108,14 @@ class TestQueuedBranch:
         bare_id — so this only trips on a direct, bypassing-parse
         construction. Realizes "mixed shape unrepresentable" (PRD DD7).
         """
-        from orchestrator.merge_types import QueuedBranch
+        from orchestrator.merge_lane.types import QueuedBranch
 
         with pytest.raises(ValueError):
             QueuedBranch(bare_id='4778', full_name='wrong/9999')
 
     def test_parse_result_is_frozen(self) -> None:
         """A QueuedBranch produced by parse is immutable."""
-        from orchestrator.merge_types import QueuedBranch
+        from orchestrator.merge_lane.types import QueuedBranch
 
         qb = QueuedBranch.parse('4778', 'task/')
         with pytest.raises(dataclasses.FrozenInstanceError):
@@ -218,7 +142,7 @@ class TestTerminalOutcomeForget:
 
     @staticmethod
     def _rec(request_id: str, branch: str, task_id: str, state: str = 'abandoned'):
-        from orchestrator.merge_types import TerminalOutcomeRecord
+        from orchestrator.merge_lane.types import TerminalOutcomeRecord
 
         return TerminalOutcomeRecord(
             request_id=request_id,
@@ -229,7 +153,7 @@ class TestTerminalOutcomeForget:
 
     def test_forget_removes_from_all_indexes_and_returns_true(self) -> None:
         """(a) forget clears _index / _by_branch / _by_task and returns True."""
-        from orchestrator.merge_types import TerminalOutcomeRetention
+        from orchestrator.merge_lane.types import TerminalOutcomeRetention
 
         ring = TerminalOutcomeRetention(maxlen=10)
         rec = self._rec('mr-a', branch='B', task_id='T')
@@ -248,7 +172,7 @@ class TestTerminalOutcomeForget:
 
     def test_forget_identity_guard_preserves_newer_secondary_entry(self) -> None:
         """(b) forget(old) must NOT drop a secondary entry owned by a newer record."""
-        from orchestrator.merge_types import TerminalOutcomeRetention
+        from orchestrator.merge_lane.types import TerminalOutcomeRetention
 
         ring = TerminalOutcomeRetention(maxlen=10)
         rec1 = self._rec('mr-old', branch='B', task_id='T', state='blocked')
@@ -268,7 +192,7 @@ class TestTerminalOutcomeForget:
 
     def test_forget_drops_alias_whose_target_is_request_id(self) -> None:
         """(c) forget(primary) drops an alias whose value points to it."""
-        from orchestrator.merge_types import TerminalOutcomeRetention
+        from orchestrator.merge_lane.types import TerminalOutcomeRetention
 
         ring = TerminalOutcomeRetention(maxlen=10)
         rec = self._rec('mr-a', branch='B', task_id='T')
@@ -286,7 +210,7 @@ class TestTerminalOutcomeForget:
         The key has no direct ``_index`` record, so forget returns False, but
         the alias itself must still be removed.
         """
-        from orchestrator.merge_types import TerminalOutcomeRetention
+        from orchestrator.merge_lane.types import TerminalOutcomeRetention
 
         ring = TerminalOutcomeRetention(maxlen=10)
         primary = self._rec('mr-primary', branch='P', task_id='TP', state='done')
@@ -300,7 +224,7 @@ class TestTerminalOutcomeForget:
 
     def test_forget_unknown_returns_false_noop(self) -> None:
         """(d) forget on an unknown request_id returns False and changes nothing."""
-        from orchestrator.merge_types import TerminalOutcomeRetention
+        from orchestrator.merge_lane.types import TerminalOutcomeRetention
 
         ring = TerminalOutcomeRetention(maxlen=10)
         rec = self._rec('mr-keep', branch='K', task_id='TK', state='done')
@@ -314,7 +238,7 @@ class TestTerminalOutcomeForget:
 
     def test_forget_then_fresh_record_same_branch_task_resolves_fresh(self) -> None:
         """(e) After forget, a fresh record for the same branch/task resolves cleanly."""
-        from orchestrator.merge_types import TerminalOutcomeRetention
+        from orchestrator.merge_lane.types import TerminalOutcomeRetention
 
         ring = TerminalOutcomeRetention(maxlen=10)
         rec_a = self._rec('mr-a', branch='B', task_id='T', state='abandoned')

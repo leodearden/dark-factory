@@ -4,6 +4,7 @@ import copy
 import errno
 import json
 import os
+import re
 import stat
 import sys
 import threading
@@ -12,14 +13,20 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from _review_fixtures import review_aggregation, review_issue
 from shared import safe_io
 
 from orchestrator.artifacts import (
     PLAN_SCHEMA_VERSION,
+    PLAN_TASK_TEXT_FP_KEY,
     ArtifactWriteError,
+    PlanMutexNotHeld,
+    ReviewAggregation,
     TaskArtifacts,
     _normalize_plan,
+    iteration_entry_written_by_orchestrator,
 )
+from orchestrator.review_payload import ReviewPayloadError
 
 
 @pytest.fixture
@@ -37,23 +44,23 @@ def artifacts(worktree: Path) -> TaskArtifacts:
 
 class TestInit:
     def test_creates_directory_structure(self, artifacts: TaskArtifacts):
-        assert artifacts.root.exists()
-        assert (artifacts.root / 'metadata.json').exists()
-        assert (artifacts.root / 'reviews').is_dir()
+        assert artifacts.lane_root.exists()
+        assert artifacts.artifact_path('metadata.json').exists()
+        assert artifacts.artifact_path('reviews').is_dir()
 
     def test_creates_verdicts_directory(self, artifacts: TaskArtifacts):
-        assert (artifacts.root / 'verdicts').is_dir()
+        assert artifacts.artifact_path('verdicts').is_dir()
 
     def test_init_writes_no_gitignore(self, artifacts: TaskArtifacts):
         """W11-ι: init() no longer writes a .gitignore — .task-meta/ lives
         outside the worktree, so there's nothing for git to ignore.
         """
-        assert not (artifacts.root / '.gitignore').exists()
-        assert (artifacts.root / 'metadata.json').exists()
-        assert (artifacts.root / 'reviews').is_dir()
+        assert not (artifacts.lane_root / '.gitignore').exists()
+        assert artifacts.artifact_path('metadata.json').exists()
+        assert artifacts.artifact_path('reviews').is_dir()
 
     def test_metadata_contents(self, artifacts: TaskArtifacts):
-        metadata = json.loads((artifacts.root / 'metadata.json').read_text())
+        metadata = json.loads(artifacts.artifact_path('metadata.json').read_text())
         assert metadata['task_id'] == 'task-1'
         assert metadata['title'] == 'Test Task'
         assert metadata['description'] == 'A test task description'
@@ -84,44 +91,8 @@ class TestReadCreatedAt:
     def test_returns_none_when_created_at_key_missing(self, worktree: Path):
         worktree.mkdir()
         ta = TaskArtifacts(worktree)
-        ta.root.mkdir(parents=True, exist_ok=True)
-        (ta.root / 'metadata.json').write_text(json.dumps({'task_id': 'x'}))
-        assert ta.read_created_at() is None
-
-    def test_undecodable_metadata_json_returns_none(self, worktree: Path):
-        """A metadata.json that isn't valid UTF-8 raises UnicodeDecodeError
-        (a ValueError, not a json.JSONDecodeError) out of
-        ``Path.read_text()`` before ``json.loads`` ever runs. The "never
-        raises" contract must catch that too, not just malformed JSON.
-
-        ``read_created_at`` reads with ``encoding='utf-8'`` explicitly (matching
-        ``atomic_write_text``'s writer default), so these bytes — an invalid
-        UTF-8 lead byte — are guaranteed to fail decoding rather than json
-        parsing on every platform, regardless of the process locale.
-        """
-        worktree.mkdir()
-        ta = TaskArtifacts(worktree)
-        ta.root.mkdir(parents=True, exist_ok=True)
-        (ta.root / 'metadata.json').write_bytes(b'\xff\xfe{"created_at": "x"}')
-        assert ta.read_created_at() is None
-
-    def test_malformed_json_metadata_returns_none(self, worktree: Path):
-        """The pre-existing ``json.JSONDecodeError`` branch (syntactically
-        invalid but validly-encoded JSON) stays covered alongside the
-        undecodable-bytes branch above."""
-        worktree.mkdir()
-        ta = TaskArtifacts(worktree)
-        ta.root.mkdir(parents=True, exist_ok=True)
-        (ta.root / 'metadata.json').write_text('{not json')
-        assert ta.read_created_at() is None
-
-    def test_non_object_metadata_json_returns_none(self, worktree: Path):
-        """Valid JSON that isn't an object (e.g. a bare list) must not reach
-        ``metadata.get(...)`` and raise AttributeError."""
-        worktree.mkdir()
-        ta = TaskArtifacts(worktree)
-        ta.root.mkdir(parents=True, exist_ok=True)
-        (ta.root / 'metadata.json').write_text('[]')
+        ta.lane_root.mkdir(parents=True, exist_ok=True)
+        ta.artifact_path('metadata.json').write_text(json.dumps({'task_id': 'x'}))
         assert ta.read_created_at() is None
 
 
@@ -259,11 +230,11 @@ class TestMarkStepCommitted:
         artifacts.write_plan(self._plan())
         # Stabilize any one-time normalization rewrite before capturing bytes.
         artifacts.read_plan()
-        before = (artifacts.root / 'plan.json').read_text()
+        before = artifacts.artifact_path('plan.json').read_text()
 
         assert artifacts.mark_step_committed('nope', self.SHA) is False
 
-        after = (artifacts.root / 'plan.json').read_text()
+        after = artifacts.artifact_path('plan.json').read_text()
         assert after == before
 
     def test_idempotent_per_step_and_sha(self, artifacts: TaskArtifacts):
@@ -337,7 +308,7 @@ class TestIterationLog:
 
     def test_read_skips_corrupted_lines(self, artifacts: TaskArtifacts):
         """Good/bad/good lines → 2 entries, 1 corrupted."""
-        log_path = artifacts.root / 'iterations.jsonl'
+        log_path = artifacts.artifact_path('iterations.jsonl')
         lines = [
             json.dumps({'iteration': 1, 'agent': 'implementer', 'summary': 'ok'}),
             r'{"iteration": 2, "summary": "has bad escape \!"}',
@@ -354,7 +325,7 @@ class TestIterationLog:
 
     def test_read_all_corrupted(self, artifacts: TaskArtifacts):
         """All bad lines → empty entries, all lines in corrupted."""
-        log_path = artifacts.root / 'iterations.jsonl'
+        log_path = artifacts.artifact_path('iterations.jsonl')
         bad_lines = [
             r'not json at all',
             r'{"truncated": true',
@@ -376,7 +347,7 @@ class TestIterationLog:
         artifacts.append_iteration_log({
             'iteration': 1, 'agent': 'implementer', 'summary': 'stale',
         })
-        log_path = artifacts.root / 'iterations.jsonl'
+        log_path = artifacts.artifact_path('iterations.jsonl')
         assert log_path.exists()
 
         artifacts.clear_iteration_log()
@@ -386,12 +357,106 @@ class TestIterationLog:
 
     def test_clear_iteration_log_missing_ok(self, artifacts: TaskArtifacts):
         """clear_iteration_log() on a never-written log must not raise."""
-        log_path = artifacts.root / 'iterations.jsonl'
+        log_path = artifacts.artifact_path('iterations.jsonl')
         assert not log_path.exists()
 
         artifacts.clear_iteration_log()  # must not raise
 
         assert artifacts.read_iteration_log() == ([], [])
+
+
+_AGENT_AUTHORED_SHAPES = [
+    pytest.param(
+        {
+            'iteration': 2,
+            'agent': 'implementer',
+            'steps_completed': ['step-2'],
+            'blocker': 'escalated',
+            'deviations': [],
+            'next': 'resume after escalation',
+        },
+        id='no-source-no-timestamp-no-committed-5588',
+    ),
+    pytest.param(
+        {
+            'agent': 'implementer',
+            'steps_completed': ['step-2'],
+            'committed': True,
+            'source': 'agent',
+            'timestamp': '2026-08-06T04:25:00',
+        },
+        id='source-agent-committed-true-3713',
+    ),
+    pytest.param(
+        {
+            'agent': 'implementer',
+            'steps_completed': ['step-2'],
+            'committed': True,
+            'source': 'post-escalation-resume',
+        },
+        id='post-escalation-resume-3668',
+    ),
+    pytest.param(
+        {'agent': 'implementer', 'steps_completed': ['step-2'], 'source': 'implementer'},
+        id='source-implementer-3023',
+    ),
+    pytest.param(
+        {'agent': 'claude-task-3088-implementer', 'steps_completed': ['step-2']},
+        id='role-named-agent-no-source-3088',
+    ),
+    pytest.param(
+        {'agent': 'implementer', 'steps_completed': ['step-2'], 'source': ['orchestrator']},
+        id='list-valued-source',
+    ),
+]
+
+
+class TestIterationLogProvenance:
+    """Only entries written through append_iteration_log count as orchestrator-written.
+
+    Agents also append to iterations.jsonl by hand from their own shell
+    (task 5726); those lines must never pass the provenance predicate.
+    """
+
+    def test_entry_without_source_is_stamped_orchestrator(self, artifacts: TaskArtifacts):
+        artifacts.append_iteration_log({'agent': 'implementer', 'steps_completed': ['step-1']})
+
+        (entry,), _ = artifacts.read_iteration_log()
+        assert entry['source'] == 'orchestrator'
+        assert iteration_entry_written_by_orchestrator(entry) is True
+
+    def test_amendment_source_is_preserved(self, artifacts: TaskArtifacts):
+        artifacts.append_iteration_log({
+            'agent': 'implementer', 'steps_completed': ['step-1'], 'source': 'amendment',
+        })
+
+        (entry,), _ = artifacts.read_iteration_log()
+        assert entry['source'] == 'amendment'
+        assert iteration_entry_written_by_orchestrator(entry) is True
+
+    def test_unknown_source_is_refused_before_writing(self, artifacts: TaskArtifacts):
+        with pytest.raises(ValueError, match='iteration-log source') as exc_info:
+            artifacts.append_iteration_log({'agent': 'implementer', 'source': 'agent'})
+
+        message = str(exc_info.value)
+        assert "'agent'" in message
+        assert 'orchestrator' in message
+        assert 'amendment' in message
+        assert artifacts.read_iteration_log() == ([], [])
+
+    @pytest.mark.parametrize('agent_entry', _AGENT_AUTHORED_SHAPES)
+    def test_hand_appended_agent_entries_are_not_orchestrator_written(
+        self, artifacts: TaskArtifacts, agent_entry: dict,
+    ):
+        with open(artifacts.artifact_path('iterations.jsonl'), 'a') as log:
+            log.write(json.dumps(agent_entry) + '\n')
+
+        (entry,), _ = artifacts.read_iteration_log()
+        assert iteration_entry_written_by_orchestrator(entry) is False
+
+    @pytest.mark.parametrize('value', ['orchestrator', ['orchestrator'], None])
+    def test_predicate_is_total_over_non_dict_values(self, value: object):
+        assert iteration_entry_written_by_orchestrator(value) is False
 
 
 VALID_PLAN_WITH_STEPS = {
@@ -441,6 +506,40 @@ class TestPlanProvenance:
         assert updated['analysis'] == 'Some analysis'
         assert len(updated['steps']) == 1
 
+    def test_stamp_plan_provenance_writes_the_task_text_fingerprint(
+        self, artifacts: TaskArtifacts,
+    ):
+        artifacts.write_plan(dict(VALID_PLAN_WITH_STEPS))
+        artifacts.stamp_plan_provenance('session-abc123', task_text_fp='tfp:new')
+        updated = artifacts.read_plan()
+        assert updated[PLAN_TASK_TEXT_FP_KEY] == 'tfp:new'
+        assert updated['_session_id'] == 'session-abc123'
+        assert '_created_at' in updated
+
+    def test_stamp_plan_provenance_fingerprint_overwrites_a_stale_one(
+        self, artifacts: TaskArtifacts,
+    ):
+        artifacts.write_plan({**VALID_PLAN_WITH_STEPS, PLAN_TASK_TEXT_FP_KEY: 'tfp:old'})
+        artifacts.stamp_plan_provenance('session-abc123', task_text_fp='tfp:new')
+        assert artifacts.read_plan()[PLAN_TASK_TEXT_FP_KEY] == 'tfp:new'
+
+    def test_stamp_plan_provenance_without_fingerprint_keeps_the_existing_one(
+        self, artifacts: TaskArtifacts,
+    ):
+        artifacts.write_plan(dict(VALID_PLAN_WITH_STEPS))
+        artifacts.stamp_plan_provenance('planner', task_text_fp='tfp:authored')
+        artifacts.stamp_plan_provenance('implementer-iteration')
+        updated = artifacts.read_plan()
+        assert updated[PLAN_TASK_TEXT_FP_KEY] == 'tfp:authored'
+        assert updated['_session_id'] == 'implementer-iteration'
+
+    def test_stamp_plan_provenance_without_fingerprint_adds_none(
+        self, artifacts: TaskArtifacts,
+    ):
+        artifacts.write_plan(dict(VALID_PLAN_WITH_STEPS))
+        artifacts.stamp_plan_provenance('session-abc123')
+        assert PLAN_TASK_TEXT_FP_KEY not in artifacts.read_plan()
+
     def test_validate_plan_owner_true_for_matching_session(self, artifacts: TaskArtifacts):
         artifacts.write_plan(dict(VALID_PLAN_WITH_STEPS))
         artifacts.stamp_plan_provenance('session-abc123')
@@ -481,7 +580,7 @@ class TestPlanProvenance:
     def test_stamp_plan_provenance_raises_on_missing_plan(self, artifacts: TaskArtifacts):
         """stamp_plan_provenance() must raise ValueError if plan.json does not exist."""
         # Ensure plan.json does not exist
-        plan_path = artifacts.root / 'plan.json'
+        plan_path = artifacts.artifact_path('plan.json')
         assert not plan_path.exists()
 
         with pytest.raises(ValueError, match='valid plan'):
@@ -490,7 +589,7 @@ class TestPlanProvenance:
     def test_stamp_plan_provenance_raises_on_empty_plan(self, artifacts: TaskArtifacts):
         """stamp_plan_provenance() must raise ValueError if plan.json has no steps key."""
         # Write a plan with no 'steps' key at all
-        (artifacts.root / 'plan.json').write_text('{}')
+        artifacts.artifact_path('plan.json').write_text('{}')
 
         with pytest.raises(ValueError, match='valid plan'):
             artifacts.stamp_plan_provenance('session-abc123')
@@ -502,7 +601,7 @@ class TestPlanProvenance:
         has no actual plan content — stamping it silently would hide data loss.
         """
         stub = {'_session_id': 'old-session', '_created_at': '2026-01-01T00:00:00+00:00'}
-        (artifacts.root / 'plan.json').write_text(
+        artifacts.artifact_path('plan.json').write_text(
             __import__('json').dumps(stub)
         )
 
@@ -513,7 +612,7 @@ class TestPlanProvenance:
         self, artifacts: TaskArtifacts
     ):
         """Corrupt (non-JSON) plan.json must return False, not raise JSONDecodeError."""
-        plan_path = artifacts.root / 'plan.json'
+        plan_path = artifacts.artifact_path('plan.json')
         plan_path.write_text('this is not valid json }{}{')
 
         # Must return False without raising any exception
@@ -524,7 +623,7 @@ class TestPlanProvenance:
         self, artifacts: TaskArtifacts
     ):
         """Unreadable plan.json (chmod 000) must return False, not raise OSError."""
-        plan_path = artifacts.root / 'plan.json'
+        plan_path = artifacts.artifact_path('plan.json')
         plan_path.write_text('{"_session_id": "session-abc123"}')
         plan_path.chmod(0o000)
         try:
@@ -563,7 +662,7 @@ class TestBumpRevalidationStamp:
             artifacts.bump_revalidation_stamp('sess-1')
 
     def test_raises_on_empty_steps(self, artifacts: TaskArtifacts):
-        (artifacts.root / 'plan.json').write_text('{"steps": []}')
+        artifacts.artifact_path('plan.json').write_text('{"steps": []}')
         with pytest.raises(ValueError, match='valid plan'):
             artifacts.bump_revalidation_stamp('sess-1')
 
@@ -618,7 +717,7 @@ class TestStalePlanLock:
     """Tests for stale plan.lock detection and cleanup."""
 
     def _create_lock(self, artifacts: TaskArtifacts, session_id: str, locked_at: str):
-        lock_path = artifacts.root / 'plan.lock'
+        lock_path = artifacts.artifact_path('plan.lock')
         lock_path.write_text(json.dumps({
             'session_id': session_id,
             'locked_at': locked_at,
@@ -629,7 +728,7 @@ class TestStalePlanLock:
         self._create_lock(artifacts, 'task-1-abcd1234', '2026-04-03T12:00:00+00:00')
         result = artifacts.clear_stale_plan_lock('task-1')
         assert result is True
-        assert not (artifacts.root / 'plan.lock').exists()
+        assert not artifacts.artifact_path('plan.lock').exists()
 
     def test_recent_foreign_lock_preserved(self, artifacts: TaskArtifacts):
         """Lock from a different task with recent timestamp is NOT cleared."""
@@ -638,14 +737,14 @@ class TestStalePlanLock:
         self._create_lock(artifacts, 'task-99-ffff0000', recent)
         result = artifacts.clear_stale_plan_lock('task-1')
         assert result is False
-        assert (artifacts.root / 'plan.lock').exists()
+        assert artifacts.artifact_path('plan.lock').exists()
 
     def test_old_foreign_lock_cleared(self, artifacts: TaskArtifacts):
         """Lock from a different task with old timestamp IS cleared."""
         self._create_lock(artifacts, 'task-99-ffff0000', '2025-01-01T00:00:00+00:00')
         result = artifacts.clear_stale_plan_lock('task-1', stale_threshold_secs=600.0)
         assert result is True
-        assert not (artifacts.root / 'plan.lock').exists()
+        assert not artifacts.artifact_path('plan.lock').exists()
 
     def test_no_lock_returns_false(self, artifacts: TaskArtifacts):
         """No lock file → returns False."""
@@ -657,7 +756,7 @@ class TestStalePlanLock:
         self._create_lock(artifacts, 'task-99-ffff0000', 'not-a-timestamp')
         result = artifacts.clear_stale_plan_lock('task-1')
         assert result is True
-        assert not (artifacts.root / 'plan.lock').exists()
+        assert not artifacts.artifact_path('plan.lock').exists()
 
 
 class TestPlanLock:
@@ -667,7 +766,7 @@ class TestPlanLock:
     def test_lock_plan_creates_file_returns_true(self, artifacts: TaskArtifacts):
         result = artifacts.lock_plan('session-abc123')
         assert result is True
-        assert (artifacts.root / 'plan.lock').exists()
+        assert artifacts.artifact_path('plan.lock').exists()
 
     def test_is_plan_locked_true_after_lock(self, artifacts: TaskArtifacts):
         artifacts.lock_plan('session-abc123')
@@ -702,7 +801,7 @@ class TestPlanLock:
     ):
         """lock_plan must raise ValueError and leave no plan.lock if os.getpid() returns non-int."""
         monkeypatch.setattr('orchestrator.artifacts.os.getpid', lambda: None)
-        lock_path = artifacts.root / 'plan.lock'
+        lock_path = artifacts.artifact_path('plan.lock')
 
         with pytest.raises(ValueError, match=r'owner_pid.*non-null int'):
             artifacts.lock_plan('session-abc')
@@ -816,18 +915,14 @@ class TestAgentSession:
         artifacts.write_agent_session(
             'sess-x', 'implementer', 'now', task_id='t-1',
         )
-        assert (artifacts.root / 'agent_session.json').exists()
+        assert artifacts.artifact_path('agent_session.json').exists()
         artifacts.clear_agent_session()
-        assert not (artifacts.root / 'agent_session.json').exists()
+        assert not artifacts.artifact_path('agent_session.json').exists()
 
     def test_clear_is_idempotent(self, artifacts: TaskArtifacts):
         # No file present
         artifacts.clear_agent_session()  # must not raise
         artifacts.clear_agent_session()  # still idempotent
-
-    def test_read_returns_none_on_corrupt_json(self, artifacts: TaskArtifacts):
-        (artifacts.root / 'agent_session.json').write_text('{not valid json')
-        assert artifacts.read_agent_session() is None
 
     def test_write_persists_resume_count(self, artifacts: TaskArtifacts):
         artifacts.write_agent_session(
@@ -844,7 +939,7 @@ class TestAgentSession:
         artifacts.write_agent_session(
             'sess-d', 'architect', 'now', task_id='t-9', resume_count=1,
         )
-        raw = json.loads((artifacts.root / 'agent_session.json').read_text())
+        raw = json.loads(artifacts.artifact_path('agent_session.json').read_text())
         assert raw['schema_version'] == 2
         assert 'task_id' in raw
         assert 'resume_count' in raw
@@ -859,7 +954,7 @@ class TestAgentSession:
             'started_at': '2026-05-01T00:00:00+00:00',
             'owner_pid': 12345,
         }
-        (artifacts.root / 'agent_session.json').write_text(json.dumps(v1))
+        artifacts.artifact_path('agent_session.json').write_text(json.dumps(v1))
         data = artifacts.read_agent_session()
         assert data is not None
         # Legacy defaults for the absent v2 keys.
@@ -888,7 +983,7 @@ class TestAgentSession:
             'resume_count': 'abc',
             'schema_version': 2,
         }
-        (artifacts.root / 'agent_session.json').write_text(json.dumps(bad_str))
+        artifacts.artifact_path('agent_session.json').write_text(json.dumps(bad_str))
         assert artifacts.read_agent_session() is None
         # Null schema_version → int(None) raises TypeError.
         bad_null = {
@@ -899,7 +994,7 @@ class TestAgentSession:
             'resume_count': 0,
             'schema_version': None,
         }
-        (artifacts.root / 'agent_session.json').write_text(json.dumps(bad_null))
+        artifacts.artifact_path('agent_session.json').write_text(json.dumps(bad_null))
         assert artifacts.read_agent_session() is None
 
 
@@ -912,8 +1007,7 @@ class TestEmittedStepEscalations:
     process-local, so an orchestrator restart re-files every prior pair.  These
     emitted ``(step_id, stale_commit)`` keys are persisted to
     ``reconcile_state.json`` in the meta-root and hydrated on the next run so a
-    restarted workflow files at most genuinely-new pairs.  This mirrors the
-    ``TestAgentSession`` read/write/corrupt-fail-safe structure.
+    restarted workflow files at most genuinely-new pairs.
     """
 
     def test_read_returns_empty_set_when_missing(self, artifacts: TaskArtifacts):
@@ -951,12 +1045,6 @@ class TestEmittedStepEscalations:
             ('step-2', 'def456'),
         }
 
-    def test_read_returns_empty_set_on_corrupt_json(self, artifacts: TaskArtifacts):
-        # Fail-safe: unreadable JSON reads as an empty set (mirrors
-        # ``test_read_returns_none_on_corrupt_json`` for the agent-session sidecar).
-        (artifacts.root / 'reconcile_state.json').write_text('{not valid json')
-        assert artifacts.read_emitted_step_escalations() == set()
-
     def test_survives_restart_new_instance_same_root(
         self, artifacts: TaskArtifacts, worktree: Path
     ):
@@ -968,6 +1056,91 @@ class TestEmittedStepEscalations:
         # meta-root, so the durable store survives the "restart".
         restarted = TaskArtifacts(worktree)
         assert restarted.read_emitted_step_escalations() == {('step-1', 'abc123')}
+
+    @pytest.mark.parametrize(
+        'field_value',
+        [
+            pytest.param(None, id='null'),
+            pytest.param(3, id='int'),
+            pytest.param(True, id='bool'),
+            pytest.param({'x': 1}, id='dict'),
+            pytest.param('ab', id='string'),
+        ],
+    )
+    def test_non_list_field_reads_as_empty_set_and_warns(
+        self, artifacts: TaskArtifacts, caplog, field_value
+    ):
+        (artifacts.artifact_path('reconcile_state.json')).write_text(
+            json.dumps({'emitted_done_step_escalations': field_value})
+        )
+
+        with caplog.at_level('WARNING'):
+            assert artifacts.read_emitted_step_escalations() == set()
+
+        assert any(
+            record.name == 'orchestrator.artifacts'
+            and record.levelname == 'WARNING'
+            and 'reconcile_state.json' in record.getMessage()
+            for record in caplog.records
+        )
+
+    def test_malformed_entries_are_skipped_with_a_warning(
+        self, artifacts: TaskArtifacts, caplog
+    ):
+        (artifacts.artifact_path('reconcile_state.json')).write_text(
+            json.dumps({
+                'emitted_done_step_escalations': [
+                    [1, 2],
+                    ['only-one'],
+                    ['step-1', 'abc123'],
+                ]
+            })
+        )
+
+        with caplog.at_level('WARNING'):
+            assert artifacts.read_emitted_step_escalations() == {
+                ('step-1', 'abc123')
+            }
+
+        warnings = [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == 'orchestrator.artifacts'
+            and record.levelname == 'WARNING'
+            and 'reconcile_state.json' in record.getMessage()
+        ]
+        assert len(warnings) == 1
+        assert '2 malformed' in warnings[0]
+
+    def test_well_formed_store_reads_without_warning(
+        self, artifacts: TaskArtifacts, caplog
+    ):
+        artifacts.append_emitted_step_escalation('step-1', 'abc123')
+        artifacts.append_emitted_step_escalation('step-1', 'abc123')
+
+        with caplog.at_level('WARNING'):
+            assert artifacts.read_emitted_step_escalations() == {
+                ('step-1', 'abc123')
+            }
+
+        assert not [
+            record
+            for record in caplog.records
+            if record.name == 'orchestrator.artifacts'
+        ]
+
+    def test_append_over_malformed_field_rewrites_valid_store(
+        self, artifacts: TaskArtifacts
+    ):
+        store = artifacts.artifact_path('reconcile_state.json')
+        store.write_text(json.dumps({'emitted_done_step_escalations': None}))
+
+        artifacts.append_emitted_step_escalation('step-1', 'abc123')
+
+        assert artifacts.read_emitted_step_escalations() == {('step-1', 'abc123')}
+        assert json.loads(store.read_text()) == {
+            'emitted_done_step_escalations': [['step-1', 'abc123']]
+        }
 
 
 class TestVerdicts:
@@ -982,15 +1155,11 @@ class TestVerdicts:
             'verdict': {'complete': True},
         }
         artifacts.write_verdict('judge', envelope)
-        assert (artifacts.root / 'verdicts' / 'judge.json').exists()
+        assert (artifacts.artifact_path('verdicts') / 'judge.json').exists()
         assert artifacts.read_verdict('judge') == envelope
 
     def test_read_returns_none_when_missing(self, artifacts: TaskArtifacts):
         assert artifacts.read_verdict('missing') is None
-
-    def test_read_returns_none_on_corrupt_json(self, artifacts: TaskArtifacts):
-        (artifacts.root / 'verdicts' / 'judge.json').write_text('{not valid json')
-        assert artifacts.read_verdict('judge') is None
 
     def test_clear_removes_file(self, artifacts: TaskArtifacts):
         envelope = {
@@ -1002,7 +1171,7 @@ class TestVerdicts:
         }
         artifacts.write_verdict('judge', envelope)
         artifacts.clear_verdict('judge')
-        assert not (artifacts.root / 'verdicts' / 'judge.json').exists()
+        assert not (artifacts.artifact_path('verdicts') / 'judge.json').exists()
         assert artifacts.read_verdict('judge') is None
 
     def test_clear_is_idempotent(self, artifacts: TaskArtifacts):
@@ -1014,8 +1183,8 @@ class TestVerdicts:
         with pytest.raises(ValueError, match='invalid verdict role'):
             artifacts.write_verdict(bad_role, {'role': bad_role})
         # Nothing escaped verdicts/ or landed anywhere under root.
-        assert not any(artifacts.root.rglob('escape*'))
-        assert not any(artifacts.root.rglob('passwd*'))
+        assert not any(artifacts.task_root.rglob('escape*'))
+        assert not any(artifacts.task_root.rglob('passwd*'))
 
     @pytest.mark.parametrize('bad_role', ['../escape', 'a/b', '..', '.', '/etc/passwd', 'judge\n'])
     def test_read_verdict_rejects_unsafe_role(self, artifacts: TaskArtifacts, bad_role):
@@ -1026,6 +1195,70 @@ class TestVerdicts:
     def test_clear_verdict_rejects_unsafe_role(self, artifacts: TaskArtifacts, bad_role):
         with pytest.raises(ValueError, match='invalid verdict role'):
             artifacts.clear_verdict(bad_role)
+
+
+class TestJsonSidecarReadersFailSafe:
+    """Every JSON-sidecar reader shares one fail-safe posture: a corrupt
+    sidecar reads as that reader's fallback value and logs a warning."""
+
+    @pytest.mark.parametrize(
+        ('name', 'read', 'expected'),
+        [
+            pytest.param(
+                'metadata.json',
+                lambda ta: ta.read_created_at(),
+                None,
+                id='created_at',
+            ),
+            pytest.param(
+                'review_state.json',
+                lambda ta: ta.read_review_state(),
+                {'amendment_rounds_total': 0, 'review_cycles_total': 0, 'verdicts': {}},
+                id='review_state',
+            ),
+            pytest.param(
+                'agent_session.json',
+                lambda ta: ta.read_agent_session(),
+                None,
+                id='agent_session',
+            ),
+            pytest.param(
+                'reconcile_state.json',
+                lambda ta: ta.read_emitted_step_escalations(),
+                set(),
+                id='reconcile_state',
+            ),
+            pytest.param(
+                'verdicts/judge.json',
+                lambda ta: ta.read_verdict('judge'),
+                None,
+                id='verdict',
+            ),
+        ],
+    )
+    @pytest.mark.parametrize(
+        'payload',
+        [
+            pytest.param(b'\xff\xfe{"x": 1}', id='undecodable'),
+            pytest.param(b'{not valid json', id='malformed'),
+            pytest.param(b'[1]', id='non_object'),
+        ],
+    )
+    def test_corrupt_sidecar_reads_as_fail_safe_value(
+        self, artifacts: TaskArtifacts, caplog, name, read, expected, payload
+    ):
+        artifacts.artifact_path(name).write_bytes(payload)
+
+        with caplog.at_level('WARNING'):
+            assert read(artifacts) == expected
+
+        basename = Path(name).name
+        assert any(
+            record.name == 'orchestrator.artifacts'
+            and record.levelname == 'WARNING'
+            and basename in record.getMessage()
+            for record in caplog.records
+        )
 
 
 class TestReviews:
@@ -1106,6 +1339,36 @@ class TestReviews:
         assert 'No test for empty input' in text
         assert 'c.py:10' in text
 
+    @staticmethod
+    def _aggregation(suggestion_tags: list[str]) -> ReviewAggregation:
+        return review_aggregation(
+            [review_issue('blocker', 'blocking')],
+            [review_issue(tag) for tag in suggestion_tags],
+        )
+
+    def test_format_for_escalation_inlines_every_suggestion(self):
+        agg = self._aggregation(['alpha', 'beta'])
+        text = agg.format_for_escalation()
+        for suggestion in agg.suggestions:
+            for key in ('location', 'category', 'description', 'suggested_fix'):
+                assert suggestion[key] in text
+        blocking_at = text.index('# Review Feedback — Blocking Issues')
+        assert text.index('# Review Feedback — Suggestions') > blocking_at
+
+    def test_format_for_escalation_begins_with_the_replan_rendering(self):
+        agg = self._aggregation(['alpha', 'beta'])
+        assert agg.format_for_escalation().startswith(agg.format_for_replan())
+
+    def test_format_for_escalation_without_suggestions_equals_replan(self):
+        agg = self._aggregation([])
+        assert agg.format_for_escalation() == agg.format_for_replan()
+
+    def test_format_for_replan_stays_blocking_only(self):
+        agg = self._aggregation(['alpha', 'beta'])
+        text = agg.format_for_replan()
+        for suggestion in agg.suggestions:
+            assert suggestion['description'] not in text
+
     def test_aggregate_reviews_error_filtered(self, artifacts: TaskArtifacts):
         artifacts.write_review('reviewer1', {
             'reviewer': 'reviewer1',
@@ -1126,6 +1389,41 @@ class TestReviews:
         assert 'reviewer1' in agg.reviews
         assert 'reviewer2' not in agg.reviews
         assert not agg.all_reviewers_errored
+
+    def test_aggregate_reviews_rejects_an_off_contract_verdict(self, artifacts: TaskArtifacts):
+        artifacts.write_review('reviewer1', {
+            'reviewer': 'reviewer1',
+            'verdict': 'NEEDS_CHANGES',
+            'issues': [],
+            'summary': 'not a contract verdict',
+        })
+
+        with pytest.raises(ReviewPayloadError, match='NEEDS_CHANGES'):
+            artifacts.aggregate_reviews()
+
+    def test_aggregate_reviews_keeps_errored_review_records(self, artifacts: TaskArtifacts):
+        clean = {'reviewer': 'reviewer1', 'verdict': 'PASS', 'issues': [], 'summary': 'OK'}
+        errored = {
+            'reviewer': 'reviewer2',
+            'verdict': 'ERROR',
+            'issues': [],
+            'summary': 'Reviewer emitted no/invalid verdict: ',
+            'failure': {'kind': 'turn_cap', 'detail': 'agent hit max_turns', 'api_error_status': None},
+        }
+        artifacts.write_review('reviewer1', clean)
+        artifacts.write_review('reviewer2', errored)
+
+        agg = artifacts.aggregate_reviews()
+
+        assert agg.errored_reviews == {'reviewer2': errored}
+        assert agg.reviewer_errors == ['reviewer2']
+        assert agg.reviews == {'reviewer1': clean}
+
+    def test_errored_reviews_defaults_empty(self):
+        agg = ReviewAggregation(
+            has_blocking_issues=False, blocking_issues=[], suggestions=[], reviews={},
+        )
+        assert agg.errored_reviews == {}
 
 
 class TestBlockingDependency:
@@ -1166,7 +1464,7 @@ class TestBlockingDependency:
 
     def test_artifact_path_is_under_task_dir(self, artifacts: TaskArtifacts):
         artifacts.write_blocking_dependency('5', 'r', 'sha')
-        path = artifacts.root / 'blocking_dependency.json'
+        path = artifacts.artifact_path('blocking_dependency.json')
         assert path.exists()
         # And contents must be JSON parseable.
         json.loads(path.read_text())
@@ -1233,7 +1531,7 @@ class TestReadyToMerge:
 
     def test_artifact_path_is_under_task_dir(self, artifacts: TaskArtifacts):
         artifacts.write_ready_to_merge('sha', 'e')
-        path = artifacts.root / 'ready_to_merge.json'
+        path = artifacts.artifact_path('ready_to_merge.json')
         assert path.exists()
         json.loads(path.read_text())
 
@@ -1609,14 +1907,14 @@ class TestPlanNormalizationIntegration:
     def test_read_plan_writes_back_when_normalized(self, artifacts: TaskArtifacts):
         # Write a malformed plan directly (bypass write_plan to skip schema version)
         raw = {'task_id': 'task-1', 'tdd_steps': [{'id': 'step-1', 'status': 'pending'}]}
-        (artifacts.root / 'plan.json').write_text(json.dumps(raw))
+        artifacts.artifact_path('plan.json').write_text(json.dumps(raw))
 
         plan = artifacts.read_plan()
         assert 'steps' in plan
         assert 'tdd_steps' not in plan
 
         # Re-read from disk — should now be normalized
-        raw_on_disk = json.loads((artifacts.root / 'plan.json').read_text())
+        raw_on_disk = json.loads(artifacts.artifact_path('plan.json').read_text())
         assert 'steps' in raw_on_disk
         assert 'tdd_steps' not in raw_on_disk
 
@@ -1625,13 +1923,13 @@ class TestPlanNormalizationIntegration:
             'task_id': 'task-1',
             'steps': [{'id': 'step-1', 'status': 'pending'}],
         }
-        (artifacts.root / 'plan.json').write_text(json.dumps(valid))
+        artifacts.artifact_path('plan.json').write_text(json.dumps(valid))
         import os
-        mtime_before = os.path.getmtime(artifacts.root / 'plan.json')
+        mtime_before = os.path.getmtime(artifacts.artifact_path('plan.json'))
 
         artifacts.read_plan()
 
-        mtime_after = os.path.getmtime(artifacts.root / 'plan.json')
+        mtime_after = os.path.getmtime(artifacts.artifact_path('plan.json'))
         assert mtime_before == mtime_after
 
 
@@ -1645,7 +1943,7 @@ class TestStringItemResilience:
             'steps': [{'id': 'step-1', 'status': 'pending', 'commit': None}],
         }
         # Write raw to bypass normalization in write_plan
-        (artifacts.root / 'plan.json').write_text(json.dumps(plan))
+        artifacts.artifact_path('plan.json').write_text(json.dumps(plan))
 
         # Should not crash — string items are skipped
         artifacts.update_step_status('step-1', 'done', commit='abc')
@@ -1659,7 +1957,7 @@ class TestStringItemResilience:
                 {'id': 'step-1', 'status': 'pending', 'commit': None},
             ],
         }
-        (artifacts.root / 'plan.json').write_text(json.dumps(plan))
+        artifacts.artifact_path('plan.json').write_text(json.dumps(plan))
 
         # read_plan normalizes steps (Rule 5) but not prerequisites (Rule 4 removed);
         # string prerequisites are skipped by the isinstance guard in get_pending_steps
@@ -1674,7 +1972,7 @@ class TestStringItemResilience:
                 {'id': 'step-1', 'status': 'done', 'commit': 'abc'},
             ],
         }
-        (artifacts.root / 'plan.json').write_text(json.dumps(plan))
+        artifacts.artifact_path('plan.json').write_text(json.dumps(plan))
 
         completed = artifacts.get_completed_steps()
         assert len(completed) == 1
@@ -1692,12 +1990,12 @@ class TestWorktreeMissingTolerance:
         # Remove the worktree out-of-band
         import shutil
         shutil.rmtree(worktree)
-        assert not ta.root.is_dir()
+        assert not ta.task_root.is_dir()
 
         # Must not raise
         ta.write_review('reviewer-x', {'verdict': 'PASS', 'issues': []})
         # And nothing was created
-        assert not ta.root.exists()
+        assert not ta.task_root.exists()
 
     def test_write_verdict_skips_when_root_gone(self, tmp_path: Path):
         worktree = tmp_path / 'gone-verdict'
@@ -1706,7 +2004,7 @@ class TestWorktreeMissingTolerance:
         ta.init('task-v', 'gone', 'desc')
         import shutil
         shutil.rmtree(worktree)
-        assert not ta.root.is_dir()
+        assert not ta.task_root.is_dir()
 
         # Must not raise
         ta.write_verdict('judge', {
@@ -1714,7 +2012,7 @@ class TestWorktreeMissingTolerance:
             'emitted_at': 't', 'verdict': {'complete': True},
         })
         # And nothing was created
-        assert not ta.root.exists()
+        assert not ta.task_root.exists()
         assert ta.read_verdict('judge') is None
 
     def test_write_json_skips_when_root_gone(self, tmp_path: Path):
@@ -1725,9 +2023,8 @@ class TestWorktreeMissingTolerance:
         import shutil
         shutil.rmtree(worktree)
 
-        # _write_json into a path under .root with the dir gone — should swallow
-        target = ta.root / 'reviews' / 'foo.json'
-        ta._write_json(target, {'a': 1})  # no exception
+        # _write_json into an artifact whose root is gone — should swallow
+        ta._write_json('reviews/foo.json', {'a': 1})  # no exception
 
     def test_write_review_still_raises_for_genuine_io_errors(
         self, tmp_path: Path, monkeypatch
@@ -1774,6 +2071,86 @@ class TestMetaRootDerivation:
         )
 
 
+class TestTaskRootFor:
+    """`task_root_for` owns the task-lifetime `.task-meta/task-<id>` shape
+    (PRD plans/task-meta-task-keying-prd.md §Path-derivation contract), and
+    refuses an id that could leave `.task-meta/` or name a non-dir.
+    """
+
+    BASE = Path('/pool/.worktrees')
+
+    @pytest.mark.parametrize('task_id', ['3155', 'df_task_12', 'a.b-c_9'])
+    def test_accepted_id_derives_task_prefixed_dir(self, task_id: str):
+        assert TaskArtifacts.task_root_for(self.BASE, task_id) == (
+            self.BASE / '.task-meta' / f'task-{task_id}'
+        )
+
+    @pytest.mark.parametrize('task_id', ['', '../x', 'a/b', 'a b', '3155\n', 3155])
+    def test_rejected_id_raises_naming_value_and_pattern(self, task_id):
+        with pytest.raises(ValueError) as excinfo:
+            TaskArtifacts.task_root_for(self.BASE, task_id)
+        message = str(excinfo.value)
+        assert repr(task_id) in message
+        assert '^[A-Za-z0-9._-]+$' in message
+
+    def test_meta_root_for_lane_shape_is_unchanged(self):
+        assert TaskArtifacts.meta_root_for(self.BASE, '_lane-3') == (
+            self.BASE / '.task-meta' / '_lane-3'
+        )
+
+
+class TestReadLaneTaskId:
+    """`read_lane_task_id` resolves lane -> task off `metadata.json` ONLY, and
+    a missing, undecodable, corrupt or malformed file is a miss, never a raise.
+    """
+
+    @pytest.fixture
+    def meta_root(self, tmp_path: Path) -> Path:
+        root = tmp_path / '.task-meta' / '_lane-0'
+        root.mkdir(parents=True)
+        return root
+
+    def test_returns_task_id_from_metadata_json(self, meta_root: Path):
+        (meta_root / 'metadata.json').write_text(json.dumps({
+            'task_id': '5069',
+            'title': 'T',
+            'created_at': '2026-09-02T00:00:00+00:00',
+        }))
+        assert TaskArtifacts.read_lane_task_id(meta_root) == '5069'
+
+    def test_missing_meta_root_returns_none(self, tmp_path: Path):
+        meta_root = tmp_path / '.task-meta' / '_lane-0'
+        assert not meta_root.exists()
+        assert TaskArtifacts.read_lane_task_id(meta_root) is None
+
+    def test_missing_metadata_json_returns_none(self, meta_root: Path):
+        assert TaskArtifacts.read_lane_task_id(meta_root) is None
+
+    @pytest.mark.parametrize('payload', [
+        b'{not json',
+        b'\xff\xfe{"task_id": "5069"}',
+        b'["a", "b"]',
+        b'{"title": "T"}',
+        b'{"task_id": ""}',
+        b'{"task_id": {"nested": 1}}',
+        b'{"task_id": true}',
+    ], ids=[
+        'corrupt-json', 'non-utf8', 'non-dict', 'no-task-id', 'empty-task-id',
+        'dict-task-id', 'bool-task-id',
+    ])
+    def test_unusable_metadata_returns_none(self, meta_root: Path, payload: bytes):
+        (meta_root / 'metadata.json').write_bytes(payload)
+        assert TaskArtifacts.read_lane_task_id(meta_root) is None
+
+    def test_integer_task_id_is_coerced_to_str(self, meta_root: Path):
+        (meta_root / 'metadata.json').write_text(json.dumps({'task_id': 5069}))
+        assert TaskArtifacts.read_lane_task_id(meta_root) == '5069'
+
+    def test_plan_json_is_not_consulted(self, meta_root: Path):
+        (meta_root / 'plan.json').write_text(json.dumps({'task_id': '5069'}))
+        assert TaskArtifacts.read_lane_task_id(meta_root) is None
+
+
 class TestMetaRootConstructor:
     """`meta_root` is an OPTIONAL 2nd constructor arg. Supplying it activates
     the `.task-meta` relocation; writes must land there and NEVER under the
@@ -1787,7 +2164,7 @@ class TestMetaRootConstructor:
     def test_root_is_meta_root_when_supplied(self, worktree: Path, meta_root: Path):
         worktree.mkdir()
         ta = TaskArtifacts(worktree, meta_root)
-        assert ta.root == meta_root
+        assert ta.lane_root == ta.task_root == meta_root
 
     def test_init_and_write_plan_land_under_meta_root_only(
         self, worktree: Path, meta_root: Path
@@ -1966,13 +2343,10 @@ class TestReviewVerdictCache:
         assert rec['verdict'] == 'PASS'
         assert rec['suggestions_routed'] is False
 
-    def test_corrupt_review_state_is_fail_safe(self, artifacts: TaskArtifacts):
-        (artifacts.root / 'review_state.json').write_text('{not valid json')
-        assert artifacts.read_review_state() == {
-            'amendment_rounds_total': 0,
-            'review_cycles_total': 0,
-            'verdicts': {},
-        }
+    def test_get_cached_verdict_on_corrupt_review_state_returns_none(
+        self, artifacts: TaskArtifacts
+    ):
+        artifacts.artifact_path('review_state.json').write_text('{not valid json')
         assert artifacts.get_cached_verdict('tree_abc') is None
 
     def test_reviewer_fingerprint_round_trips(self, artifacts: TaskArtifacts):
@@ -2052,7 +2426,7 @@ class TestReviewCounters:
 class TestEnsureLanePlanSymlink:
     """`ensure_lane_plan_symlink()` single-sources plan.json: the lane copy
     `<worktree>/.task/plan.json` becomes an ABSOLUTE symlink INTO the durable
-    meta-root plan.json (`self.root / 'plan.json'`). Any residual reader of the
+    meta-root plan.json (`artifact_path('plan.json')`). Any residual reader of the
     lane path then transparently resolves to the meta-root file — the esc-5205-9
     stale-trap (a regular-file lane copy that diverges from the meta-root) is
     impossible because the lane path IS the meta-root file. No-op in legacy
@@ -2184,10 +2558,10 @@ class TestEnsureLanePlanSymlink:
         self, artifacts: TaskArtifacts, worktree: Path
     ):
         # (e) legacy meta_root=None mode (the `artifacts` fixture builds
-        # TaskArtifacts(worktree) with self.root == worktree/.task): a
+        # TaskArtifacts(worktree), rooted at worktree/.task): a
         # pre-existing real plan.json is left a regular FILE — no
         # self-referential symlink is created.
-        assert artifacts.root == worktree / '.task'
+        assert artifacts.lane_root == artifacts.task_root == worktree / '.task'
         artifacts.write_plan(
             {'steps': [{'id': 'step-1', 'status': 'pending', 'commit': None}]}
         )
@@ -2201,201 +2575,239 @@ class TestEnsureLanePlanSymlink:
         assert not lane_plan.is_symlink()
 
 
-class TestWriteMarkupResidue:
-    """`write_markup_residue` — the residue channel verdict-tools CAN reach.
+_LANE_ARTIFACT_NAMES = (
+    'metadata.json', 'agent_session.json', 'interactive.json',
+    'blocking_dependency.json', 'already_done.json', 'ready_to_merge.json',
+    'false_premise.json', 'unactionable_task.json',
+)
+_TASK_ARTIFACT_NAMES = (
+    'plan.json', 'plan.lock', 'iterations.jsonl', 'reviews', 'verdicts',
+    'review_state.json', 'reconcile_state.json',
+)
+_PLAN = {'steps': [{'id': 'step-1', 'status': 'pending', 'commit': None}]}
+_VERDICT = {
+    'role': 'judge', 'schema_version': 1, 'session_id': 's',
+    'emitted_at': 't', 'verdict': {'complete': True},
+}
 
-    ``create_server`` already holds a ``TaskArtifacts``, which is a file-backed
-    store rooted at ``self.root`` (``<worktree>/.task``, or the
-    ``.task-meta/<lane>`` root when one is supplied). ``.task/`` is gitignored,
-    so writing there cannot contaminate a task's diff or its verify.
 
-    This is the only surviving copy of a payload an agent could not re-emit, so
-    every row below is about NOT losing it (PRD C2 L187 / INV-7).
+class _DualRootLayout:
+    """One lane root and one task root for worktree ``wt-x`` / task ``42``."""
+
+    @pytest.fixture
+    def wt(self, tmp_path: Path) -> Path:
+        wt = tmp_path / 'wt-x'
+        wt.mkdir()
+        return wt
+
+    @pytest.fixture
+    def lane(self, wt: Path) -> Path:
+        return TaskArtifacts.meta_root_for(wt.parent, wt.name)
+
+    @pytest.fixture
+    def task(self, wt: Path) -> Path:
+        return TaskArtifacts.task_root_for(wt.parent, '42')
+
+    @pytest.fixture
+    def arts(self, wt: Path, lane: Path, task: Path) -> TaskArtifacts:
+        arts = TaskArtifacts(wt, lane, task)
+        arts.init('42', 'Dual', 'desc')
+        return arts
+
+
+def _names(root: Path) -> set[str]:
+    return {p.name for p in root.iterdir()}
+
+
+def _write_every_task_artifact(arts: TaskArtifacts) -> None:
+    arts.write_plan(copy.deepcopy(_PLAN))
+    arts.lock_plan('42-abc')
+    arts.append_iteration_log({'iteration': 1})
+    arts.write_review('r', {'verdict': 'PASS', 'issues': []})
+    arts.write_verdict('judge', _VERDICT)
+    arts.set_review_counters(amendment_rounds_total=1)
+    arts.record_review_verdict('tree', 'PASS', False)
+    arts.append_emitted_step_escalation('step-1', 'deadbeef')
+
+
+def _write_every_lane_artifact(arts: TaskArtifacts) -> None:
+    arts.write_agent_session('42-abc', 'implementer', 't', task_id='42')
+    arts.write_blocking_dependency('7', 'needs 7', 'sha')
+    arts.write_already_done('sha', 'ev')
+    arts.write_ready_to_merge('sha', 'ev')
+    arts.write_false_premise('c', 'p', 'e', 'r')
+    arts.write_unactionable_task('r', 'e')
+
+
+class TestDualRootRouting(_DualRootLayout):
+    """``TaskArtifacts(wt, lane, task)`` routes each artifact to the root the
+    frozen table names — task-lifetime state under ``task-<id>``, per-dispatch
+    exits under the lane — with no fallback between them (PRD
+    plans/task-meta-task-keying-prd.md decision 7).
     """
 
-    #: The keys the middleware's residue record actually supplies —
-    #: ``_refuse_unrepairable`` builds exactly this shape.
-    RESIDUE_KEYS = (
-        'error_type', 'category', 'owner', 'level', 'tool', 'field',
-        'matched_pattern', 'agent_id', 'project', 'summary', 'suggested_action',
-    )
+    def test_init_creates_both_roots_and_splits_them(self, arts, lane, task):
+        assert lane.is_dir() and task.is_dir()
+        assert (lane / 'metadata.json').is_file()
+        assert (task / 'reviews').is_dir() and (task / 'verdicts').is_dir()
+        assert not (lane / 'reviews').exists()
+        assert not (lane / 'verdicts').exists()
 
-    @staticmethod
-    def _record(raw_value: str) -> dict:
-        return {
-            'error_type': 'mcp_markup_unrepairable',
-            'category': 'mcp_markup_residue',
-            'owner': 'l2-escalation-watcher',
-            'level': 2,
-            'tool': 'submit_review_verdict',
-            'field': 'summary',
-            'matched_pattern': '</invoke>',
-            'agent_id': 'claude-task-3690-reviewer',
-            'project': 'dark_factory',
-            'raw_value': raw_value,
-            'summary': 'Unrepairable MCP envelope markup in submit_review_verdict.summary',
-            'suggested_action': 'Recover the raw_value for the caller if still needed.',
-        }
+    @pytest.mark.parametrize(('write', 'relpath'), [
+        (lambda a: a.write_plan(copy.deepcopy(_PLAN)), 'plan.json'),
+        (lambda a: a.lock_plan('42-abc'), 'plan.lock'),
+        (lambda a: a.append_iteration_log({'iteration': 1}), 'iterations.jsonl'),
+        (lambda a: a.write_review('r', {'verdict': 'PASS'}), 'reviews/r.json'),
+        (lambda a: a.write_verdict('judge', _VERDICT), 'verdicts/judge.json'),
+        (lambda a: a.set_review_counters(review_cycles_total=2), 'review_state.json'),
+        (lambda a: a.record_review_verdict('tree', 'PASS', False), 'review_state.json'),
+        (lambda a: a.append_emitted_step_escalation('s', 'c'), 'reconcile_state.json'),
+    ])
+    def test_task_keyed_writer_lands_under_task_only(self, arts, lane, task, write, relpath):
+        write(arts)
+        assert (task / relpath).is_file()
+        assert not (lane / relpath).exists()
 
-    def test_returns_a_lookup_able_id(self, artifacts: TaskArtifacts):
-        """(a) The return is the FILENAME, and a file of that name exists.
+    @pytest.mark.parametrize(('write', 'name'), [
+        (lambda a: None, 'metadata.json'),
+        (lambda a: a.write_agent_session('s', 'implementer', 't'), 'agent_session.json'),
+        (lambda a: a.write_blocking_dependency('7', 'r', 'sha'), 'blocking_dependency.json'),
+        (lambda a: a.write_already_done('sha', 'ev'), 'already_done.json'),
+        (lambda a: a.write_ready_to_merge('sha', 'ev'), 'ready_to_merge.json'),
+        (lambda a: a.write_false_premise('c', 'p', 'e', 'r'), 'false_premise.json'),
+        (lambda a: a.write_unactionable_task('r', 'e'), 'unactionable_task.json'),
+    ])
+    def test_lane_keyed_writer_lands_under_lane_only(self, arts, lane, task, write, name):
+        write(arts)
+        assert (lane / name).is_file()
+        assert not (task / name).exists()
 
-        The id has to be something an operator can act on — that is the whole
-        reason the refusal payload carries one.
-        """
-        residue_id = artifacts.write_markup_residue(self._record('leaked'))
+    def test_lane_holds_only_lane_keyed_names_after_every_writer(self, arts, lane):
+        _write_every_task_artifact(arts)
+        _write_every_lane_artifact(arts)
+        assert _names(lane) <= set(_LANE_ARTIFACT_NAMES)
+        assert 'plan.json.mutex' not in _names(lane)
 
-        assert isinstance(residue_id, str)
-        assert residue_id.startswith('markup_residue-')
-        assert residue_id.endswith('.json')
-        assert (artifacts.root / residue_id).is_file()
+    def test_plan_planted_in_lane_is_invisible(self, arts, lane):
+        (lane / 'plan.json').write_text(json.dumps(_PLAN))
+        assert arts.read_plan() == {}
 
-    def test_the_payload_survives_in_full_and_verbatim(self, artifacts: TaskArtifacts):
-        """(b) Not truncated, not excerpted.
+    def test_lane_exit_planted_in_task_is_invisible(self, arts, task):
+        (task / 'blocking_dependency.json').write_text(json.dumps({'depends_on_task_id': '7'}))
+        assert arts.read_blocking_dependency() is None
 
-        Deliberately unlike ``build_markup_block``'s 200-char excerpt: that is
-        a diagnostic sitting beside a payload the caller still holds, this is
-        the only surviving copy.
-        """
-        raw = ('x' * 5000) + '\n</invoke>\n<parameter name="issues">[{"a": 1}]'
-        record = self._record(raw)
+    def test_artifact_path_resolves_through_the_table(self, arts, lane, task):
+        assert arts.artifact_path('plan.json') == task / 'plan.json'
+        assert arts.artifact_path('metadata.json') == lane / 'metadata.json'
+        assert arts.artifact_path('reviews/merge.json') == task / 'reviews' / 'merge.json'
 
-        residue_id = artifacts.write_markup_residue(record)
+    def test_artifact_path_refuses_unknown_name(self, arts):
+        with pytest.raises(ValueError, match='nope.json'):
+            arts.artifact_path('nope.json')
 
-        assert residue_id is not None
-        stored = json.loads((artifacts.root / residue_id).read_text())
-        assert stored['raw_value'] == raw
-        assert len(stored['raw_value']) == len(raw)
-        for key in self.RESIDUE_KEYS:
-            assert stored[key] == record[key], f'{key} did not survive the write'
+    def test_family_accessors_route_to_task(self, arts, task):
+        assert arts.review_archive_dir('amend-1') == task / 'reviews-amend-1'
+        assert arts.review_archive_dir('cycle-2') == task / 'reviews-cycle-2'
+        assert arts.review_archives_root == task
+        assert arts.zero_output_evidence_path(3) == task / 'zero_output_evidence-iter3.json'
 
-    def test_a_second_refusal_does_not_overwrite_the_first(
-        self, artifacts: TaskArtifacts
-    ):
-        """(c) A fixed filename would make the second leak destroy the first
-        leak's evidence — the exact destruction this method exists to prevent.
-        """
-        first = artifacts.write_markup_residue(self._record('FIRST payload'))
-        second = artifacts.write_markup_residue(self._record('SECOND payload'))
+    def test_root_properties(self, arts, lane, task):
+        assert arts.lane_root == lane
+        assert arts.task_root == task
 
-        assert first is not None and second is not None
-        assert first != second
-        assert json.loads((artifacts.root / first).read_text())['raw_value'] == (
-            'FIRST payload'
-        )
-        assert json.loads((artifacts.root / second).read_text())['raw_value'] == (
-            'SECOND payload'
-        )
-        assert len(sorted(artifacts.root.glob('markup_residue-*.json'))) == 2
+    def test_for_task_derives_both_roots(self, wt):
+        arts = TaskArtifacts.for_task(wt, '42')
+        assert arts.lane_root == TaskArtifacts.meta_root_for(wt.parent, wt.name)
+        assert arts.task_root == TaskArtifacts.task_root_for(wt.parent, '42')
 
-    def test_numbering_is_collision_tolerant(self, artifacts: TaskArtifacts):
-        """(d) A fresh subprocess starts its counter from zero.
+    @pytest.mark.parametrize('single_root', ['legacy', 'meta'])
+    def test_single_root_modes_resolve_everything_under_one_root(self, wt, lane, single_root):
+        if single_root == 'legacy':
+            arts, root = TaskArtifacts(wt), wt / '.task'
+        else:
+            arts, root = TaskArtifacts(wt, lane), lane
+        assert arts.lane_root == arts.task_root == root
+        for name in (*_LANE_ARTIFACT_NAMES, *_TASK_ARTIFACT_NAMES):
+            assert arts.artifact_path(name) == root / name
+        assert arts.review_archive_dir('amend-1') == root / 'reviews-amend-1'
+        assert arts.review_archives_root == root
+        assert arts.zero_output_evidence_path(1) == root / 'zero_output_evidence-iter1.json'
 
-        verdict-tools runs as a fresh stdio subprocess per invocation, so
-        deriving the next index by SCANNING the directory rather than from
-        in-process state is what makes this hold.
-        """
-        one = artifacts.root / 'markup_residue-1.json'
-        two = artifacts.root / 'markup_residue-2.json'
-        one.write_text('{"raw_value": "from a previous process"}\n')
-        two.write_text('{"raw_value": "from another previous process"}\n')
-        before = (one.read_text(), two.read_text())
+    def test_lane_plan_symlink_targets_the_task_plan(self, arts, wt, task):
+        arts.ensure_lane_plan_symlink()
+        lane_plan = wt / '.task' / 'plan.json'
+        assert lane_plan.is_symlink()
+        assert lane_plan.resolve() == (task / 'plan.json').resolve()
 
-        residue_id = artifacts.write_markup_residue(self._record('THIRD payload'))
+        arts.write_plan(copy.deepcopy(_PLAN))
+        assert json.loads(lane_plan.read_text()) == arts.read_plan()
 
-        assert residue_id is not None
-        assert (artifacts.root / residue_id) not in (one, two)
-        assert (artifacts.root / residue_id).is_file()
-        assert (one.read_text(), two.read_text()) == before, (
-            'a pre-existing residue file was clobbered'
-        )
+        TaskArtifacts(wt).update_step_status('step-1', 'done', 'abc123')
+        assert lane_plan.is_symlink()
+        stored = json.loads((task / 'plan.json').read_text())
+        assert stored['steps'][0]['status'] == 'done'
 
-    def test_a_vanished_root_is_tolerated_not_raised(self, tmp_path: Path):
-        """(e) It runs on a path whose outcome is ALREADY decided.
-
-        Per ``_call_sink``'s never-raises contract a storage failure must cost
-        the operator a heads-up, not turn a clean refusal into an opaque crash.
-        And the return must not name a file that does not exist — ``None`` is
-        correct, because the conditional hint then tells the caller the truth
-        automatically.
-        """
+    def test_task_root_gone_is_tolerated(self, arts, lane, task):
         import shutil
+        shutil.rmtree(task)
 
-        worktree = tmp_path / 'gone-residue'
+        arts.write_review('r', {'verdict': 'PASS'})
+        arts.write_verdict('judge', _VERDICT)
+        with arts.plan_mutex():
+            pass
+        assert not task.exists()
+
+        arts.write_blocking_dependency('7', 'r', 'sha')
+        assert arts.read_blocking_dependency()['depends_on_task_id'] == '7'
+        assert (lane / 'blocking_dependency.json').is_file()
+
+    def test_plan_mutex_sits_beside_the_task_plan(self, arts, lane, task):
+        arts.write_plan(copy.deepcopy(_PLAN))
+        assert (task / 'plan.json.mutex').exists()
+        assert not (lane / 'plan.json.mutex').exists()
+
+    def test_lane_symlink_view_shares_the_task_plan_mutex(self, arts, wt):
+        arts.write_plan(copy.deepcopy(_PLAN))
+        arts.ensure_lane_plan_symlink()
+        with arts.plan_mutex():
+            TaskArtifacts(wt).write_plan(copy.deepcopy(_PLAN), mutex_held=True)
+
+    def test_unheld_mutex_claim_names_the_task_plan(self, arts, task):
+        with pytest.raises(PlanMutexNotHeld, match=re.escape(str(task / 'plan.json'))):
+            arts.write_plan(copy.deepcopy(_PLAN), mutex_held=True)
+
+
+class TestReadTitle:
+    """``read_title()`` — metadata.json's title, else plan.json's, else None."""
+
+    @pytest.fixture
+    def arts(self, worktree: Path) -> TaskArtifacts:
         worktree.mkdir()
-        ta = TaskArtifacts(worktree)
-        ta.init('task-r', 'gone', 'desc')
-        shutil.rmtree(worktree)
-        assert not ta.root.is_dir()
+        arts = TaskArtifacts(worktree)
+        arts.artifact_path('metadata.json').parent.mkdir(parents=True)
+        return arts
 
-        residue_id = ta.write_markup_residue(self._record('lost payload'))
+    def _seed(self, arts: TaskArtifacts, name: str, payload) -> None:
+        text = payload if isinstance(payload, str) else json.dumps(payload)
+        arts.artifact_path(name).write_text(text)
 
-        assert residue_id is None
-        assert not ta.root.exists()
+    def test_metadata_title_wins(self, arts):
+        self._seed(arts, 'metadata.json', {'title': 'From metadata'})
+        self._seed(arts, 'plan.json', {'title': 'From plan'})
+        assert arts.read_title() == 'From metadata'
 
-    def test_two_concurrent_writers_do_not_clobber_each_other(
-        self, tmp_path: Path
-    ):
-        """(f) A reviewer PANEL races on one root, and both payloads survive.
+    def test_falls_back_to_plan_title(self, arts):
+        self._seed(arts, 'metadata.json', {'task_id': '1'})
+        self._seed(arts, 'plan.json', {'title': 'From plan'})
+        assert arts.read_title() == 'From plan'
 
-        REVIEW SUGGESTION 4. Only ``verdicts/<role>.json`` is per-role — the
-        residue files sit directly on the SHARED ``self.root``, and several
-        verdict-tools subprocesses run against it at once. A serialization leak
-        is by nature bursty and correlated across panel members, so "two
-        refusals at the same moment" is the expected case, not the exotic one.
+    def test_absent_is_none(self, arts):
+        assert arts.read_title() is None
 
-        Scan-then-write leaves a TOCTOU window that the ``while ... exists()``
-        advance re-checks but does not close: two writers that both scan before
-        either writes both compute the same index, and the second write
-        silently overwrites the first — destroying exactly the only-surviving
-        copy this method exists to preserve.
-
-        The interleaving is forced rather than threaded, so the test measures
-        the window instead of racing for it: the first writer is suspended at
-        the moment it hands off to ``_write_json`` (i.e. after it has chosen its
-        name) and the second writer runs to completion inside that gap.
-        """
-        first = TaskArtifacts(tmp_path / 'panel')
-        first.init('task-r', 'panel', 'desc')
-        second = TaskArtifacts(tmp_path / 'panel')
-
-        original = TaskArtifacts._write_json
-        interleaved = []
-
-        def suspend_and_let_the_other_finish(self, path, data):
-            # Fire ONCE, and only for the first writer: the nested call must
-            # reach the real writer or nothing is ever written.
-            if not interleaved:
-                interleaved.append(path.name)
-                second.write_markup_residue(
-                    TestWriteMarkupResidue._record('SECOND payload')
-                )
-            return original(self, path, data)
-
-        monkeypatch = pytest.MonkeyPatch()
-        try:
-            monkeypatch.setattr(
-                TaskArtifacts, '_write_json', suspend_and_let_the_other_finish
-            )
-            first_id = first.write_markup_residue(self._record('FIRST payload'))
-        finally:
-            monkeypatch.undo()
-
-        assert interleaved, 'the interleaving hook never fired'
-
-        files = sorted(first.root.glob('markup_residue-*.json'))
-        assert len(files) == 2, (
-            f'two concurrent writers must produce two files, found '
-            f'{[p.name for p in files]}'
-        )
-        payloads = {json.loads(p.read_text())['raw_value'] for p in files}
-        assert payloads == {'FIRST payload', 'SECOND payload'}
-        # And the id handed back names the caller's OWN record, not the one
-        # that happened to land last.
-        assert first_id is not None
-        assert json.loads(
-            (first.root / first_id).read_text()
-        )['raw_value'] == 'FIRST payload'
+    @pytest.mark.parametrize('payload', ['{not json', {'title': '   '}, {'title': 7}, ['title']])
+    def test_unusable_title_is_none(self, arts, payload):
+        self._seed(arts, 'metadata.json', payload)
+        assert arts.read_title() is None
 
 
 # ---------------------------------------------------------------------------
@@ -2469,7 +2881,7 @@ class TestWriteJsonIsAtomic:
     def test_readers_only_ever_observe_a_complete_document(
         self, artifacts: TaskArtifacts
     ):
-        plan_path = artifacts.root / 'plan.json'
+        plan_path = artifacts.artifact_path('plan.json')
 
         # Two documents of DELIBERATELY different sizes: a torn read of the
         # larger one cannot be mistaken for a clean read of the smaller.
@@ -2531,7 +2943,7 @@ class TestWriteJsonIsAtomic:
         guard on the tmp+rename implementation, where ``os.replace`` is what
         keeps the promise and a naive ``unlink`` + create would break it.
         """
-        plan_path = artifacts.root / 'plan.json'
+        plan_path = artifacts.artifact_path('plan.json')
         artifacts.write_plan({'task_id': 'task-1', 'steps': []})
 
         misses: list = []
@@ -2572,7 +2984,7 @@ class TestWriteJsonIsAtomic:
         Driven through ``write_verdict`` so nothing about it is
         plan-specific: if only ``write_plan`` were made atomic, this fails.
         """
-        verdict_path = artifacts.root / 'verdicts' / 'judge.json'
+        verdict_path = artifacts.artifact_path('verdicts') / 'judge.json'
 
         def envelope(payload: str) -> dict:
             return {
@@ -2630,7 +3042,7 @@ class TestWriteJsonPreservesMode:
     def test_an_existing_targets_mode_survives_the_write(
         self, artifacts: TaskArtifacts, mode: int
     ):
-        target = artifacts.root / 'plan.json'
+        target = artifacts.artifact_path('plan.json')
         target.write_text('{}')
         os.chmod(target, mode)
 
@@ -2656,7 +3068,7 @@ class TestWriteJsonPreservesMode:
         reference = tmp_path / 'reference.json'
         reference.write_text('{}')
 
-        target = artifacts.root / 'plan.json'
+        target = artifacts.artifact_path('plan.json')
         assert not target.exists()
 
         artifacts.write_plan({'task_id': 'task-1', 'title': 'fresh', 'steps': []})
@@ -2680,7 +3092,7 @@ class TestWriteJsonPreservesMode:
         umask".  Ports ``test_target_file_mode_propagates_a_non_missing_file_os_error``
         from the plan-tools suite, whose whole point this is.
         """
-        target = artifacts.root / 'plan.json'
+        target = artifacts.artifact_path('plan.json')
         real_stat = Path.stat
 
         # Scoped to *target*, falling back to the real stat() for every other
@@ -2704,9 +3116,9 @@ class TestWriteJsonFollowsSymlinks:
 
     `ensure_lane_plan_symlink` makes `<worktree>/.task/plan.json` an absolute
     symlink onto the meta-root plan, and `_artifacts_from_args` still supports
-    the legacy `meta_root=None` shape where `self.root` IS `<worktree>/.task`
+    the legacy `meta_root=None` shape rooted at `<worktree>/.task`
     (mcp_lifecycle's `meta_root` parameter defaults to None) — so
-    `self.root / 'plan.json'` can BE that symlink.
+    `artifact_path('plan.json')` can BE that symlink.
 
     `Path.write_text` followed the link.  A bare `os.replace` onto the link
     path would swap the LINK for a regular file, silently re-forking the lane
@@ -2731,10 +3143,10 @@ class TestWriteJsonFollowsSymlinks:
         lane_plan = worktree / '.task' / 'plan.json'
         assert lane_plan.is_symlink()
 
-        # The legacy view: self.root == <worktree>/.task, so write_plan's
+        # The legacy view is rooted at <worktree>/.task, so write_plan's
         # target is the symlink itself.
         legacy = TaskArtifacts(worktree)
-        assert legacy.root == worktree / '.task'
+        assert legacy.lane_root == legacy.task_root == worktree / '.task'
         return legacy, lane_plan, meta_root / 'plan.json'
 
     def test_symlink_survives_and_the_real_file_receives_the_write(
@@ -2852,7 +3264,7 @@ class TestWriteJsonFollowsSymlinks:
         An unconditional parent check would break artifact creation outright.
         """
         import shutil
-        shutil.rmtree(artifacts.root / 'verdicts')
+        shutil.rmtree(artifacts.artifact_path('verdicts'))
 
         artifacts.write_verdict('judge', {
             'role': 'judge', 'schema_version': 1, 'session_id': 's',
@@ -2917,7 +3329,7 @@ class TestWriteJsonDelegatesToSharedSafeIo:
             '_write_json must not re-implement or double-write'
         )
         call = calls[0]
-        assert call['path'] == artifacts.root / 'plan.json'
+        assert call['path'] == artifacts.artifact_path('plan.json')
         assert call['kwargs'].get('fsync') is True, (
             "fsync=True is _write_json's stated durability contract, and "
             'safe_io defaults it to False — so dropping or flipping the '
@@ -2927,7 +3339,7 @@ class TestWriteJsonDelegatesToSharedSafeIo:
             f'mkdir=True creates the artifact\'s parent.  Saw: {call["kwargs"]}'
         )
         # The write really happened — the spy is not standing in for it.
-        assert json.loads((artifacts.root / 'plan.json').read_text())['title'] == 'p'
+        assert json.loads(artifacts.artifact_path('plan.json').read_text())['title'] == 'p'
 
     def test_a_nested_artifact_delegates_on_the_same_terms(
         self, artifacts: TaskArtifacts, monkeypatch
@@ -2938,7 +3350,7 @@ class TestWriteJsonDelegatesToSharedSafeIo:
         parent directory is what ``mkdir`` has to conjure.
         """
         import shutil
-        shutil.rmtree(artifacts.root / 'verdicts')
+        shutil.rmtree(artifacts.artifact_path('verdicts'))
         calls = self._spy(monkeypatch)
 
         artifacts.write_verdict('judge', {
@@ -2948,5 +3360,5 @@ class TestWriteJsonDelegatesToSharedSafeIo:
 
         assert [c['kwargs'].get('fsync') for c in calls] == [True]
         assert [c['kwargs'].get('mkdir') for c in calls] == [True]
-        assert calls[0]['path'] == artifacts.root / 'verdicts' / 'judge.json'
+        assert calls[0]['path'] == artifacts.artifact_path('verdicts') / 'judge.json'
         assert artifacts.read_verdict('judge') is not None

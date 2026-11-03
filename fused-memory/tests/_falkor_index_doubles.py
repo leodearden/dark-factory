@@ -1,0 +1,130 @@
+"""Fixtures and mock-graph doubles shared by the FalkorDB index suites.
+
+This module holds the measured ``CALL db.indexes()`` header, the trap state
+esc-3375-1 protected as evidence, and the doubles that build ``db.indexes()``
+rows and read back the statements a mock graph was sent.  The FalkorDB index
+suites all need the same ones, so each lives here once.
+
+Rows are DERIVED from α's normal form (``IndexSpec`` sets, folded back through
+``parse_index_statement``), never hard-coded: a graphiti change to the index set
+then moves every fixture with it instead of leaving a test passing against a
+stale expectation (INV-5: single home, never restate).
+"""
+
+from __future__ import annotations
+
+import asyncio
+from collections import defaultdict
+from collections.abc import Set as AbstractSet
+from unittest.mock import MagicMock
+
+import redis.exceptions
+
+from fused_memory.backends.falkor_indices import IndexSpec, parse_index_statement
+
+#: MEASURED 2026-08-09: what ``CALL db.indexes()`` raises against a graph KEY that
+#: does not exist yet.  Reproduced verbatim so the test exercises the real shape —
+#: but note the IMPLEMENTATION must not key on this wording (D2); it decides
+#: structurally, via ``list_graphs()`` membership.
+EMPTY_KEY_ERROR = redis.exceptions.ResponseError('Invalid graph operation on empty key')
+
+#: MEASURED read-only 2026-08-06: the header ``CALL db.indexes()`` returns, via
+#: ``redis-cli GRAPH.RO_QUERY dark_factory "CALL db.indexes()"`` and via a raw
+#: ``falkordb.asyncio`` client on the ro path; no index was created or dropped.
+#: Nine ``(type, name)`` pairs: ``entitytype`` is position 6, ``options`` position 3.
+LIVE_HEADER = [
+    [1, 'label'], [1, 'properties'], [1, 'types'], [1, 'options'], [1, 'language'],
+    [1, 'stopwords'], [1, 'entitytype'], [1, 'status'], [1, 'info'],
+]
+
+#: The trap state esc-3375-1 protected as evidence: an ``Entity(uuid)`` and a
+#: ``RELATES_TO(uuid)`` range index, and nothing else.  Every composite range
+#: statement upstream emits for those two labels is rejected wholesale against it.
+TRAP_PRESENT: frozenset[IndexSpec] = frozenset({
+    ('Entity', 'NODE', 'uuid', 'RANGE'),
+    ('RELATES_TO', 'RELATIONSHIP', 'uuid', 'RANGE'),
+})
+
+
+def rows_for(specs: AbstractSet[IndexSpec]) -> list[list]:
+    """Invert the normal form back into ``CALL db.indexes()``-shaped rows.
+
+    FalkorDB merges every index on a label into ONE record, so specs are grouped
+    by ``(label, entity_type)`` and each property's index types are collected into
+    the ``types`` column — the same merged shape measured live 2026-08-06, where
+    ``Entity`` comes back once carrying
+    ``{'group_id': ['RANGE', 'FULLTEXT'], 'summary': ['FULLTEXT'], ...}``.
+
+    Columns are emitted in ``LIVE_HEADER`` order::
+
+        [label, properties, types, options, language, stopwords,
+         entitytype, status, info]
+    """
+    grouped: dict[tuple[str, str], dict[str, list[str]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    for label, entity_type, field, index_type in sorted(specs):
+        grouped[(label, entity_type)][field].append(index_type)
+
+    return [
+        [
+            label,                              # label
+            list(types_by_field),               # properties
+            {f: list(ts) for f, ts in types_by_field.items()},  # types
+            {},                                 # options
+            'english',                          # language
+            [],                                 # stopwords
+            entity_type,                        # entitytype
+            'OPERATIONAL',                      # status
+            {},                                 # info
+        ]
+        for (label, entity_type), types_by_field in grouped.items()
+    ]
+
+
+def statements_written(graph) -> list[str]:
+    """The statements actually sent on the WRITE path, in order."""
+    return [call.args[0] for call in graph.query.call_args_list]
+
+
+def statements_read(graph) -> list[str]:
+    """The statements actually sent on the READ-ONLY path, in order."""
+    return [call.args[0] for call in graph.ro_query.call_args_list]
+
+
+class StatefulGraph:
+    """A graph double whose ``db.indexes()`` reflects the CREATEs it has accepted.
+
+    The plain ``make_graph_mock`` returns a FIXED row set, so a second concurrent
+    call sees the same pre-write state no matter what the first one did — which
+    makes the race under test invisible.  This double closes that: each accepted
+    statement is folded back into the reported index set through α's own parser,
+    so the read side is a real function of the write side.
+
+    Both methods ``await asyncio.sleep(0)``, and that is LOAD-BEARING, not
+    decoration: an ``AsyncMock`` resolves without ever suspending, so two gathered
+    calls would run strictly one-after-the-other and the test would pass against
+    an unserialized implementation.  The explicit yield is what lets the two
+    interleave at all.
+    """
+
+    def __init__(self, present: AbstractSet[IndexSpec]):
+        self.present = set(present)
+        self.issued: list[str] = []
+
+    @staticmethod
+    def _result(rows):
+        result = MagicMock()
+        result.result_set = rows
+        result.header = LIVE_HEADER
+        return result
+
+    async def ro_query(self, statement, *args, **kwargs):
+        await asyncio.sleep(0)
+        return self._result(rows_for(self.present))
+
+    async def query(self, statement, *args, **kwargs):
+        await asyncio.sleep(0)
+        self.issued.append(statement)
+        self.present |= set(parse_index_statement(statement))
+        return self._result([])

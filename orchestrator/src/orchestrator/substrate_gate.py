@@ -16,11 +16,12 @@ mapping).  No CLI — this module runs in-process inside the harness's
 
 from __future__ import annotations
 
-import json
 import logging
 import subprocess
 from dataclasses import dataclass
 from typing import Any
+
+from shared.task_metadata_wire import coerce_task_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -74,74 +75,46 @@ class SubstrateVerdict:
 
 
 # ---------------------------------------------------------------------------
-# extract_probe_set
+# Probe detection
 # ---------------------------------------------------------------------------
 
 
 def carries_substrate_probe(task: dict[str, Any]) -> bool:
     """Return True iff the task dict declares a ``substrate_probe`` key in metadata.
 
-    Uses the same JSON-string→dict coercion as ``extract_probe_set`` so the
-    predicate is robust to the fused-memory wire format (metadata may arrive as
-    a dict, a JSON string, or absent/None).
+    Metadata is read through ``shared.task_metadata_wire.coerce_task_metadata``.
+    Unreadable metadata is treated as carrying no probe — silently here, because
+    the scheduler has already warned about it at the wire boundary.
 
-    Returns True when:
-    - ``task['metadata']`` is a dict (or JSON string that decodes to a dict)
-    - the dict contains ``'substrate_probe'`` as a key (regardless of its value)
-
-    Returns False in all other cases (no metadata, non-dict, parse error).
+    Returns True when the readable metadata contains ``'substrate_probe'`` as a
+    key (regardless of its value); False otherwise.
 
     Used by ``run_substrate_recheck`` to distinguish "probe declared but malformed"
     (should fail CLOSED) from "probe genuinely absent" (should SKIP).
     """
-    raw = task.get('metadata')
-
-    # Coerce JSON string to dict (mirrors extract_probe_set / Scheduler._normalize)
-    if isinstance(raw, str):
-        try:
-            parsed = json.loads(raw)
-        except (json.JSONDecodeError, TypeError, ValueError):
-            return False
-        if not isinstance(parsed, dict):
-            return False
-        raw = parsed
-
-    if not isinstance(raw, dict):
-        return False
-
-    return 'substrate_probe' in raw
+    meta = coerce_task_metadata(task.get('metadata'))
+    return meta is not None and 'substrate_probe' in meta
 
 
 def extract_probe_set(task: dict[str, Any]) -> dict[str, Any] | None:
     """Extract the ``substrate_probe`` descriptor from a task dict, or None.
 
-    Mirrors ``Scheduler._normalize_task_metadata``'s JSON-string→dict
-    coercion so the read is robust to the fused-memory wire format (metadata
-    may arrive as a dict, a JSON string, or absent/None).
+    Metadata is read through ``shared.task_metadata_wire.coerce_task_metadata``.
+    Unreadable metadata is treated as carrying no probe — silently here, because
+    the scheduler has already warned about it at the wire boundary.
 
     Returns the descriptor dict when:
-    - ``task['metadata']`` is a dict (or JSON string that decodes to a dict)
-    - the dict contains ``'substrate_probe'`` as a nested dict
+    - the readable metadata contains ``'substrate_probe'`` as a nested dict
     - that nested dict contains a non-empty ``'probe_set'`` key
 
-    Returns None in all other cases (no metadata, malformed, no probe_set).
+    Returns None in all other cases (no metadata, unreadable, malformed, no
+    probe_set).
     """
-    raw = task.get('metadata')
-
-    # Coerce JSON string to dict (mirrors Scheduler._normalize_task_metadata)
-    if isinstance(raw, str):
-        try:
-            parsed = json.loads(raw)
-        except (json.JSONDecodeError, TypeError, ValueError):
-            return None
-        if not isinstance(parsed, dict):
-            return None
-        raw = parsed
-
-    if not isinstance(raw, dict):
+    meta = coerce_task_metadata(task.get('metadata'))
+    if meta is None:
         return None
 
-    descriptor = raw.get('substrate_probe')
+    descriptor = meta.get('substrate_probe')
     if not isinstance(descriptor, dict):
         return None
 

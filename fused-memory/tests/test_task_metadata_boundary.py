@@ -617,7 +617,7 @@ class TestCuratorGateContradictionAtWriteBoundary:
                 metadata=json.dumps(self._CONTRADICTION),
             )
 
-        # The rejected INSERT never landed — the _txn rolled back.
+        # The rejected INSERT never landed — the write unit rolled back.
         tasks = (await backend.get_tasks(project_root=project_root))['tasks']
         assert tasks == []
 
@@ -905,8 +905,8 @@ class TestSliceCardinalityAtWriteBoundary:
 
         The realistic shape of the defect: a well-formed row already exists
         and a subsequent writer supplies the list. ``milestone`` is in
-        ``incoming_keys``, so the generic re-raise gate fires and ``_txn``
-        rolls back — a follow-up ``get_task`` shows the dict value intact.
+        ``incoming_keys``, so the generic re-raise gate fires and the write
+        unit rolls back — a follow-up ``get_task`` shows the dict value intact.
         """
         backend = await make_backend(enforce=True)
         project_root = str(tmp_path / 'enforce')

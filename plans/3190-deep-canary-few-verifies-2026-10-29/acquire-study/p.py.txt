@@ -1,0 +1,46 @@
+import json,re,sys,statistics as st,datetime as dt,collections
+def pct(xs,q):
+    xs=sorted(xs);k=q*(len(xs)-1);f=int(k);c=min(f+1,len(xs)-1);return xs[f]+(xs[c]-xs[f])*(k-f)
+def summ(xs):
+    return f"n={len(xs)} min={min(xs):.0f} p50={pct(xs,.5):.0f} p90={pct(xs,.9):.0f} p95={pct(xs,.95):.0f} p99={pct(xs,.99):.0f} max={max(xs):.0f}"
+# A. verify ledger
+recs=[]
+for l in open('/home/leo/src/reify/data/verify-logs/verify-runs.jsonl',errors='replace'):
+    try: recs.append(json.loads(l))
+    except Exception: pass
+print('ledger records',len(recs))
+ls=[r.get('lane_seed') for r in recs if isinstance(r.get('lane_seed'),dict)]
+print('with lane_seed',len(ls)); print(json.dumps(ls[-1])[:500] if ls else None)
+# B. lines
+ts_re=re.compile(r'^(\S+)\s+\S+\s+(\S+?)\[(\d+)\]:')
+def parse(l):
+    m=ts_re.match(l)
+    if not m: return None
+    t=dt.datetime.fromisoformat(m.group(1)).astimezone(dt.timezone.utc)
+    return t,m.group(2),m.group(3)
+lines=[]
+for f in ('spec_old.log','spec_now.log'):
+    for l in open(f,errors='replace'):
+        p=parse(l)
+        if p: lines.append((p[0],p[1],p[2],l.rstrip()))
+lines.sort(key=lambda x:x[0])
+print('lines',len(lines), lines[0][0], lines[-1][0])
+# ordinary path: reset _spec-N -> next 'verify start (... worktree=_spec-N' same pid
+open_={}
+samples=[];detail=[]
+for t,prog,pid,l in lines:
+    m=re.search(r'acquire_spec_lane: (reset|created) \S*?(_spec-\d+)',l)
+    if m:
+        open_[(pid,m.group(2))]=t; continue
+    m=re.search(r'Task (\S+): verify start \(merge=\S+, worktree=(_spec-\d+)',l)
+    if m and (pid,m.group(2)) in open_:
+        d=(t-open_.pop((pid,m.group(2)))).total_seconds()
+        samples.append(d);detail.append((d,pid,m.group(1),m.group(2),t))
+    m=re.search(r'build_chain: depth=(\d+) built=(\d+).*lane=(_spec-\d+) elapsed_ms=(\d+)',l)
+    if m and (pid,m.group(3)) in open_:
+        open_.pop((pid,m.group(3)))
+if samples:
+    print('reset->verify start (ordinary+chain tip, _spec lanes):',summ(samples))
+    for d in sorted(detail,reverse=True)[:10]: print(round(d[0]),d[1],d[2],d[3],d[4].strftime('%m-%d %H:%M'))
+print('seed lock timeouts',sum('timed out after 30s' in l for *_,l in lines))
+print(collections.Counter(pid for t,prog,pid,l in lines if 'acquire_spec_lane' in l).most_common(12))

@@ -1,0 +1,10 @@
+prd: plans/recon-reliability-prd.md
+schema_version: 1
+tasks:
+- label: ο
+  task_id: 2232
+  title: 'W5-ο: B+H integration-gate — two-way boundary tests over the ledger + write-policy seams'
+  note: 'Minimal sidecar written by task 6590 (plans/dashboard-prd-lanes-prd.md §9 ε): this PRD predates YAML sidecars, so only its signal leaf is declared, hand-bound to the task whose prd_task_label is ο.'
+  capabilities: []
+signal_leaves:
+- ο

@@ -27,6 +27,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT
 
 import orchestrator.mcp_lifecycle as _lcmod
 from orchestrator.mcp_lifecycle import plan_tools_mcp_server, verify_plan_tools_startup
@@ -71,7 +72,7 @@ def worktree(tmp_path: Path) -> Path:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(120)  # overrides global timeout=60; per-probe anyio deadline is primary
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)  # per-probe anyio deadline is primary
 @pytest.mark.slow  # heavyweight: 6 real subprocesses; deselect with -m "not slow and not warm_lane_bash"
 async def test_concurrent_startup_no_hang(orch_project_dir: Path, worktree: Path) -> None:
     """6 concurrent plan-tools servers each complete MCP initialize < 30s each.

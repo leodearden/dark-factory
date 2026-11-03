@@ -65,9 +65,9 @@ def _clear_the_snapshot_unit():
     """The unit caches per root for 15 s — no test may inherit another's."""
     import dashboard.data.task_snapshot as snapshot_mod
 
-    snapshot_mod._snapshot_cache_clear()
+    snapshot_mod.clear_snapshot_cache()
     yield
-    snapshot_mod._snapshot_cache_clear()
+    snapshot_mod.clear_snapshot_cache()
 
 
 def _register_fetch_tasks(monkeypatch, tasks: list[dict]) -> None:
@@ -80,14 +80,13 @@ def _register_fetch_tasks(monkeypatch, tasks: list[dict]) -> None:
     id order, ``fetch_statuses`` answers over the WHOLE tree — because a fake
     laxer than the real signature is how a call-site regression passes.
 
-    ``timeout``/``cached`` are accepted-and-ignored: the unit threads its own
-    per-call budget into both reads and asks the row read for an uncached
-    answer, so a stub missing either keyword raises TypeError.
+    ``timeout`` is accepted-and-ignored: the unit threads its own per-call
+    budget into both reads, so a stub missing the keyword raises TypeError.
     """
 
     async def _fake_fetch_tasks(
         client, config, project_root, *,
-        statuses=None, chunk_size=None, timeout=None, cached=True,
+        statuses=None, timeout=None,
     ):
         rows = list(tasks)
         if statuses is not None:

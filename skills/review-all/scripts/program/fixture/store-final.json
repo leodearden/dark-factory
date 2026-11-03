@@ -1,0 +1,571 @@
+{
+  "tasks": [
+    {
+      "id": 101,
+      "title": "S1 α: introduce the alpha seam contract",
+      "status": "pending",
+      "priority": "high",
+      "updatedAt": "2026-10-19T09:00:00.000Z",
+      "dependencies": [],
+      "metadata": {
+        "source": "review-all",
+        "x_finding_key": [
+          "fk-0000000000a1"
+        ],
+        "x_finding_run": "review-all-fixture-20261019",
+        "prd_path": "plans/review-all-fixture-s1-prd.md",
+        "prd_task_label": "α",
+        "files": [
+          "src/fixture/alpha.py"
+        ],
+        "delivered_checks": [
+          {
+            "pattern": null,
+            "expect": "present",
+            "paths": [
+              "src/fixture/alpha.py"
+            ],
+            "script": null,
+            "args": [],
+            "timeout_secs": null,
+            "name": "alpha-module-present",
+            "kind": "path"
+          }
+        ]
+      }
+    },
+    {
+      "id": 102,
+      "title": "S1 β: route alpha callers through the contract",
+      "status": "pending",
+      "priority": "medium",
+      "updatedAt": "2026-10-19T09:00:00.000Z",
+      "dependencies": [
+        101
+      ],
+      "metadata": {
+        "source": "review-all",
+        "x_finding_key": [
+          "fk-0000000000a2"
+        ],
+        "x_finding_run": "review-all-fixture-20261019",
+        "prd_path": "plans/review-all-fixture-s1-prd.md",
+        "prd_task_label": "β"
+      }
+    },
+    {
+      "id": 103,
+      "title": "S1 γ [HELD on S2 C1]: retire the alpha shim",
+      "status": "deferred",
+      "priority": "medium",
+      "updatedAt": "2026-10-19T09:00:00.000Z",
+      "dependencies": [
+        101
+      ],
+      "metadata": {
+        "source": "review-all",
+        "x_finding_key": [
+          "fk-0000000000a1"
+        ],
+        "x_finding_run": "review-all-fixture-20261019",
+        "prd_path": "plans/review-all-fixture-s1-prd.md",
+        "prd_task_label": "γ",
+        "x_seam_wait": {
+          "stream": "S2",
+          "contract": "C1",
+          "release_owner": "S2"
+        }
+      }
+    },
+    {
+      "id": 104,
+      "title": "S1 δ: document the alpha seam",
+      "status": "pending",
+      "priority": "high",
+      "updatedAt": "2026-10-19T09:00:00.000Z",
+      "dependencies": [],
+      "metadata": {
+        "source": "review-all",
+        "x_finding_key": [
+          "fk-0000000000a2"
+        ],
+        "prd_path": "plans/review-all-fixture-s1-prd.md",
+        "prd_task_label": "δ"
+      }
+    },
+    {
+      "id": 105,
+      "title": "S2 β: move beta consumers onto the contract",
+      "status": "pending",
+      "priority": "medium",
+      "updatedAt": "2026-10-19T09:00:00.000Z",
+      "dependencies": [
+        106
+      ],
+      "metadata": {
+        "source": "review-all",
+        "x_finding_key": [
+          "fk-0000000000b1"
+        ],
+        "x_finding_run": "review-all-fixture-20261019",
+        "prd_path": "plans/review-all-fixture-s2-prd.md",
+        "prd_task_label": "β",
+        "x_dry_run_proposals": [
+          {
+            "proposal": "P1",
+            "text": "Move beta consumer 1 onto the seam contract and drop its private import of alpha internals; the dry run measured the call sites and their tests.",
+            "measured": {
+              "call_sites": 3,
+              "tests": 1
+            }
+          },
+          {
+            "proposal": "P2",
+            "text": "Move beta consumer 2 onto the seam contract and drop its private import of alpha internals; the dry run measured the call sites and their tests.",
+            "measured": {
+              "call_sites": 4,
+              "tests": 2
+            }
+          },
+          {
+            "proposal": "P3",
+            "text": "Move beta consumer 3 onto the seam contract and drop its private import of alpha internals; the dry run measured the call sites and their tests.",
+            "measured": {
+              "call_sites": 5,
+              "tests": 3
+            }
+          },
+          {
+            "proposal": "P4",
+            "text": "Move beta consumer 4 onto the seam contract and drop its private import of alpha internals; the dry run measured the call sites and their tests.",
+            "measured": {
+              "call_sites": 6,
+              "tests": 4
+            }
+          },
+          {
+            "proposal": "P5",
+            "text": "Move beta consumer 5 onto the seam contract and drop its private import of alpha internals; the dry run measured the call sites and their tests.",
+            "measured": {
+              "call_sites": 7,
+              "tests": 5
+            }
+          },
+          {
+            "proposal": "P6",
+            "text": "Move beta consumer 6 onto the seam contract and drop its private import of alpha internals; the dry run measured the call sites and their tests.",
+            "measured": {
+              "call_sites": 8,
+              "tests": 6
+            }
+          },
+          {
+            "proposal": "P7",
+            "text": "Move beta consumer 7 onto the seam contract and drop its private import of alpha internals; the dry run measured the call sites and their tests.",
+            "measured": {
+              "call_sites": 9,
+              "tests": 7
+            }
+          },
+          {
+            "proposal": "P8",
+            "text": "Move beta consumer 8 onto the seam contract and drop its private import of alpha internals; the dry run measured the call sites and their tests.",
+            "measured": {
+              "call_sites": 10,
+              "tests": 8
+            }
+          },
+          {
+            "proposal": "P9",
+            "text": "Move beta consumer 9 onto the seam contract and drop its private import of alpha internals; the dry run measured the call sites and their tests.",
+            "measured": {
+              "call_sites": 11,
+              "tests": 9
+            }
+          },
+          {
+            "proposal": "P10",
+            "text": "Move beta consumer 10 onto the seam contract and drop its private import of alpha internals; the dry run measured the call sites and their tests.",
+            "measured": {
+              "call_sites": 12,
+              "tests": 10
+            }
+          },
+          {
+            "proposal": "P11",
+            "text": "Move beta consumer 11 onto the seam contract and drop its private import of alpha internals; the dry run measured the call sites and their tests.",
+            "measured": {
+              "call_sites": 13,
+              "tests": 11
+            }
+          },
+          {
+            "proposal": "P12",
+            "text": "Move beta consumer 12 onto the seam contract and drop its private import of alpha internals; the dry run measured the call sites and their tests.",
+            "measured": {
+              "call_sites": 14,
+              "tests": 12
+            }
+          },
+          {
+            "proposal": "P13",
+            "text": "Move beta consumer 13 onto the seam contract and drop its private import of alpha internals; the dry run measured the call sites and their tests.",
+            "measured": {
+              "call_sites": 15,
+              "tests": 13
+            }
+          },
+          {
+            "proposal": "P14",
+            "text": "Move beta consumer 14 onto the seam contract and drop its private import of alpha internals; the dry run measured the call sites and their tests.",
+            "measured": {
+              "call_sites": 16,
+              "tests": 14
+            }
+          },
+          {
+            "proposal": "P15",
+            "text": "Move beta consumer 15 onto the seam contract and drop its private import of alpha internals; the dry run measured the call sites and their tests.",
+            "measured": {
+              "call_sites": 17,
+              "tests": 15
+            }
+          },
+          {
+            "proposal": "P16",
+            "text": "Move beta consumer 16 onto the seam contract and drop its private import of alpha internals; the dry run measured the call sites and their tests.",
+            "measured": {
+              "call_sites": 18,
+              "tests": 16
+            }
+          },
+          {
+            "proposal": "P17",
+            "text": "Move beta consumer 17 onto the seam contract and drop its private import of alpha internals; the dry run measured the call sites and their tests.",
+            "measured": {
+              "call_sites": 19,
+              "tests": 17
+            }
+          },
+          {
+            "proposal": "P18",
+            "text": "Move beta consumer 18 onto the seam contract and drop its private import of alpha internals; the dry run measured the call sites and their tests.",
+            "measured": {
+              "call_sites": 20,
+              "tests": 18
+            }
+          },
+          {
+            "proposal": "P19",
+            "text": "Move beta consumer 19 onto the seam contract and drop its private import of alpha internals; the dry run measured the call sites and their tests.",
+            "measured": {
+              "call_sites": 21,
+              "tests": 19
+            }
+          },
+          {
+            "proposal": "P20",
+            "text": "Move beta consumer 20 onto the seam contract and drop its private import of alpha internals; the dry run measured the call sites and their tests.",
+            "measured": {
+              "call_sites": 22,
+              "tests": 20
+            }
+          },
+          {
+            "proposal": "P21",
+            "text": "Move beta consumer 21 onto the seam contract and drop its private import of alpha internals; the dry run measured the call sites and their tests.",
+            "measured": {
+              "call_sites": 23,
+              "tests": 21
+            }
+          },
+          {
+            "proposal": "P22",
+            "text": "Move beta consumer 22 onto the seam contract and drop its private import of alpha internals; the dry run measured the call sites and their tests.",
+            "measured": {
+              "call_sites": 24,
+              "tests": 22
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": 106,
+      "title": "S2 α: deliver contract C2 for beta",
+      "status": "pending",
+      "priority": "high",
+      "updatedAt": "2026-10-19T09:00:00.000Z",
+      "dependencies": [
+        101
+      ],
+      "metadata": {
+        "source": "review-all",
+        "x_finding_key": [
+          "fk-0000000000b1"
+        ],
+        "x_finding_run": "review-all-fixture-20261019",
+        "prd_path": "plans/review-all-fixture-s2-prd.md",
+        "prd_task_label": "α"
+      }
+    },
+    {
+      "id": 107,
+      "title": "Phase 5: rename the fixture logger",
+      "status": "pending",
+      "priority": "low",
+      "updatedAt": "2026-10-19T09:00:00.000Z",
+      "dependencies": [],
+      "metadata": {
+        "source": "review-all",
+        "x_finding_run": "review-all-fixture-20261019"
+      }
+    },
+    {
+      "id": 108,
+      "title": "Gamma cleanup: drop the gamma shim import",
+      "status": "in-progress",
+      "priority": "medium",
+      "updatedAt": "2026-10-19T09:00:00.000Z",
+      "dependencies": [],
+      "metadata": {
+        "source": "review-all",
+        "x_finding_key": [
+          "fk-0000000000c1"
+        ],
+        "x_finding_run": "review-all-fixture-20261019"
+      }
+    },
+    {
+      "id": 109,
+      "title": "S1 ε: duplicate alpha seam note",
+      "status": "cancelled",
+      "priority": "low",
+      "updatedAt": "2026-10-19T09:00:00.000Z",
+      "dependencies": [],
+      "metadata": {
+        "source": "review-all",
+        "x_finding_key": [
+          "fk-0000000000a2"
+        ],
+        "x_finding_run": "review-all-fixture-20261019",
+        "prd_path": "plans/review-all-fixture-s1-prd.md",
+        "prd_task_label": "ε",
+        "x_acceptance_reason": "Subsumed by 102: the contract routing already covers it."
+      }
+    },
+    {
+      "id": 110,
+      "title": "review-all fixture: human gate",
+      "status": "deferred",
+      "priority": "high",
+      "updatedAt": "2026-10-19T09:00:00.000Z",
+      "dependencies": [
+        111
+      ],
+      "metadata": {
+        "source": "review-all",
+        "trigger_chain": {
+          "role": "human_gate",
+          "skill": "review-all",
+          "run_id": "review-all-fixture-20261019"
+        }
+      }
+    },
+    {
+      "id": 111,
+      "title": "review-all fixture: completion gate",
+      "status": "pending",
+      "priority": "high",
+      "updatedAt": "2026-10-19T09:00:00.000Z",
+      "dependencies": [],
+      "metadata": {
+        "source": "review-all",
+        "trigger_chain": {
+          "role": "completion_gate",
+          "skill": "review-all",
+          "run_id": "review-all-fixture-20261019"
+        }
+      }
+    },
+    {
+      "id": 113,
+      "title": "S1 ζ [RELEASED by S2 C2]: alpha adopts contract C2",
+      "status": "pending",
+      "priority": "medium",
+      "updatedAt": "2026-10-19T09:00:00.000Z",
+      "dependencies": [
+        101,
+        106
+      ],
+      "metadata": {
+        "source": "review-all",
+        "x_finding_key": [
+          "fk-0000000000a1"
+        ],
+        "x_finding_run": "review-all-fixture-20261019",
+        "prd_path": "plans/review-all-fixture-s1-prd.md",
+        "prd_task_label": "ζ",
+        "x_seam_wait": {
+          "stream": "S2",
+          "contract": "C2",
+          "release_owner": "S2"
+        },
+        "x_seam_released": {
+          "by": "S2",
+          "at": "2026-10-19T08:30:00Z",
+          "onto": [
+            106
+          ],
+          "contract_as_delivered": "C2: beta.contract() returns a frozen view"
+        }
+      }
+    },
+    {
+      "id": 120,
+      "title": "review-all fixture 20260901: human gate",
+      "status": "done",
+      "priority": "high",
+      "updatedAt": "2026-10-19T09:00:00.000Z",
+      "dependencies": [],
+      "metadata": {
+        "source": "review-all",
+        "trigger_chain": {
+          "role": "human_gate",
+          "skill": "review-all",
+          "run_id": "review-all-fixture-20260901"
+        }
+      }
+    },
+    {
+      "id": 121,
+      "title": "review-all other 20261001: human gate",
+      "status": "pending",
+      "priority": "high",
+      "updatedAt": "2026-10-19T09:00:00.000Z",
+      "dependencies": [],
+      "metadata": {
+        "source": "review-all",
+        "trigger_chain": {
+          "role": "human_gate",
+          "skill": "review-all",
+          "run_id": "review-all-other-20261001"
+        }
+      }
+    },
+    {
+      "id": 201,
+      "title": "Other PRD: harden the seam module",
+      "status": "pending",
+      "priority": "medium",
+      "updatedAt": "2026-10-19T09:00:00.000Z",
+      "dependencies": [],
+      "metadata": {
+        "prd_path": "plans/other-prd.md",
+        "prd_task_label": "α",
+        "files": [
+          "src/fixture/seam.py"
+        ]
+      }
+    },
+    {
+      "id": 202,
+      "title": "Seam contract entry point",
+      "status": "pending",
+      "priority": "medium",
+      "updatedAt": "2026-10-19T09:00:00.000Z",
+      "dependencies": [],
+      "metadata": {
+        "delivered_checks": [
+          {
+            "pattern": "^def seam_contract\\(",
+            "expect": "present",
+            "paths": [
+              "src/fixture/seam.py"
+            ],
+            "script": null,
+            "args": [],
+            "timeout_secs": null,
+            "name": "seam-contract-defined",
+            "kind": "grep"
+          }
+        ]
+      }
+    },
+    {
+      "id": 203,
+      "title": "OldThing keeps its public name",
+      "status": "pending",
+      "priority": "low",
+      "updatedAt": "2026-10-19T09:00:00.000Z",
+      "dependencies": [],
+      "metadata": {
+        "delivered_checks": [
+          {
+            "pattern": "^class OldThing\\b",
+            "expect": "present",
+            "paths": [
+              "src/fixture/old_name.py"
+            ],
+            "script": null,
+            "args": [],
+            "timeout_secs": null,
+            "name": "old-thing-defined",
+            "kind": "grep"
+          }
+        ]
+      }
+    },
+    {
+      "id": 204,
+      "title": "Removed module stays importable until callers move",
+      "status": "in-progress",
+      "priority": "medium",
+      "updatedAt": "2026-10-19T09:00:00.000Z",
+      "dependencies": [],
+      "metadata": {
+        "delivered_checks": [
+          {
+            "pattern": null,
+            "expect": "present",
+            "paths": [
+              "src/fixture/removed.py"
+            ],
+            "script": null,
+            "args": [],
+            "timeout_secs": null,
+            "name": "removed-module-present",
+            "kind": "path"
+          }
+        ]
+      }
+    },
+    {
+      "id": 205,
+      "title": "Done: seam and old_name groundwork",
+      "status": "done",
+      "priority": "medium",
+      "updatedAt": "2026-10-19T09:00:00.000Z",
+      "dependencies": [],
+      "metadata": {
+        "files": [
+          "src/fixture/seam.py"
+        ],
+        "delivered_checks": [
+          {
+            "pattern": null,
+            "expect": "present",
+            "paths": [
+              "src/fixture/old_name.py"
+            ],
+            "script": null,
+            "args": [],
+            "timeout_secs": null,
+            "name": "old-name-module-present",
+            "kind": "path"
+          }
+        ]
+      }
+    }
+  ]
+}

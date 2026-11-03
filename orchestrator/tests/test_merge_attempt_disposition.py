@@ -17,9 +17,9 @@ import sqlite3
 from pathlib import Path
 
 from orchestrator.event_store import EventStore
-from orchestrator.merge_disposition import MergeFailureDisposition
-from orchestrator.merge_queue import _emit_merge_attempt
-from orchestrator.merge_types import OutcomeKind
+from orchestrator.merge_lane.disposition import MergeFailureDisposition
+from orchestrator.merge_lane.types import OutcomeKind
+from orchestrator.merge_lane.worker import _emit_merge_attempt
 
 
 class TestEmitMergeAttemptDisposition:

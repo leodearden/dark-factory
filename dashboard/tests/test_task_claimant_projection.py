@@ -9,8 +9,9 @@ projection at its two seams:
 * :func:`dashboard.data.tasks._shape_task` — carries the two raw columns
   through to the dashboard wire shape.
 * :func:`dashboard.data.tasks.task_is_stranded` — the single dashboard-side
-  strand predicate, a thin wrapper that binds ``STRANDED_HEARTBEAT_TTL`` and
-  ``resolve_now`` onto :func:`shared.task_claimant.is_stranded`.
+  strand predicate, a thin wrapper that binds
+  ``shared.task_claimant.DEFAULT_CLAIMANT_HEARTBEAT_TTL`` and ``resolve_now``
+  onto :func:`shared.task_claimant.is_stranded`.
 * :func:`dashboard.data.active_tasks._build_task_row` — stamps the two raw
   columns plus the computed ``stranded`` boolean onto every task row.
 
@@ -24,11 +25,12 @@ from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
 import pytest
+from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL
 
 from dashboard.data import active_tasks as active_tasks_mod
 from dashboard.data import tasks as tasks_mod
 from dashboard.data.active_tasks import _build_task_row
-from dashboard.data.tasks import STRANDED_HEARTBEAT_TTL, _shape_task, task_is_stranded
+from dashboard.data.tasks import _shape_task, task_is_stranded
 
 _NOW = datetime(2026, 8, 8, 12, 0, 0, tzinfo=UTC)
 
@@ -130,33 +132,6 @@ class TestShapeTaskCarriesClaimantFields:
 
 
 class TestTaskIsStrandedTruthTable:
-    def test_ttl_is_ten_minutes(self):
-        """Pin the TTL's exact value, not merely that it is a positive duration.
-
-        Deliberately an exact-value pin.  ``isinstance(..., timedelta)`` plus
-        ``> timedelta(0)`` is satisfied equally by 1 microsecond and by 100
-        years, so it cannot catch a units slip (``seconds=10`` for
-        ``minutes=10``) — the one error this constant is actually prone to.
-
-        The value is a contract, not a local tuning knob: ``task_is_stranded``
-        binds it for every dashboard surface that renders a strand — the
-        task-row badge and the burndown live/stranded split — so the surfaces
-        cannot disagree (INV-5, see ``dashboard.data.tasks.task_is_stranded``),
-        and it is the documented mirror of the orchestrator's
-        ``harness._RECONCILE_HEARTBEAT_TTL``.  Moving it should therefore
-        require a deliberate edit to this test rather than passing silently.
-
-        The ``isinstance`` assertion is retained rather than folded into the
-        equality: ``task_is_stranded`` passes the constant straight into
-        :func:`shared.task_claimant.is_stranded`, which does ``timedelta``
-        arithmetic on it, so a differently-typed duration object that happened
-        to compare equal would still be wrong at the call site.
-        """
-        assert isinstance(STRANDED_HEARTBEAT_TTL, timedelta)
-        # Operand order is ruff SIM300's, not a style choice: it reads the
-        # SCREAMING_CASE name as the constant, so it must sit on the right.
-        assert timedelta(minutes=10) == STRANDED_HEARTBEAT_TTL
-
     def test_in_progress_with_null_claimant_is_stranded(self):
         task = {'status': 'in-progress', 'claimant_run_id': None, 'heartbeat_at': None}
         assert task_is_stranded(task, now=_NOW) is True
@@ -173,7 +148,7 @@ class TestTaskIsStrandedTruthTable:
         task = {
             'status': 'in-progress',
             'claimant_run_id': 'run/sess/pid=1',
-            'heartbeat_at': _iso(_NOW - STRANDED_HEARTBEAT_TTL / 2),
+            'heartbeat_at': _iso(_NOW - DEFAULT_CLAIMANT_HEARTBEAT_TTL / 2),
         }
         assert task_is_stranded(task, now=_NOW) is False
 
@@ -181,7 +156,7 @@ class TestTaskIsStrandedTruthTable:
         task = {
             'status': 'in-progress',
             'claimant_run_id': 'run/sess/pid=1',
-            'heartbeat_at': _iso(_NOW - STRANDED_HEARTBEAT_TTL - timedelta(seconds=1)),
+            'heartbeat_at': _iso(_NOW - DEFAULT_CLAIMANT_HEARTBEAT_TTL - timedelta(seconds=1)),
         }
         assert task_is_stranded(task, now=_NOW) is True
 
@@ -227,7 +202,8 @@ class TestTaskIsStrandedDelegates:
         with patch.object(tasks_mod, 'is_stranded', return_value=True) as shared:
             assert task_is_stranded(task, now=_NOW) is True
 
-        shared.assert_called_once_with(task, _NOW, STRANDED_HEARTBEAT_TTL)
+        shared.assert_called_once_with(task, _NOW, DEFAULT_CLAIMANT_HEARTBEAT_TTL)
+        assert shared.call_args.args[2] is DEFAULT_CLAIMANT_HEARTBEAT_TTL
 
     # The "must not substitute ``not has_live_claimant(...)``" contract is
     # pinned behaviorally, without patching, by the two truth-table cases that
@@ -355,7 +331,7 @@ class TestBuildTaskRowStrandProjection:
             'p',
             _task(
                 claimant_run_id='run/sess/pid=1',
-                heartbeat_at=_iso(_NOW - STRANDED_HEARTBEAT_TTL - timedelta(minutes=1)),
+                heartbeat_at=_iso(_NOW - DEFAULT_CLAIMANT_HEARTBEAT_TTL - timedelta(minutes=1)),
             ),
             42,
             _rt(agent='claude-task-42'),

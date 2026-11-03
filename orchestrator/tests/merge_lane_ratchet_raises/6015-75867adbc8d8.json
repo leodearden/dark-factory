@@ -1,0 +1,42 @@
+{
+  "task_id": "6015",
+  "reason": "Net-additive: conftest gains the autouse _no_mock_repr_stray_entries guard that fails any test leaving a <MagicMock ...> repr-named entry in the CWD (the str() leak shape the MagicMock/ directory guard cannot see)",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/tests/conftest.py",
+      "baseline": 50,
+      "current": 55
+    },
+    {
+      "measure": "lines",
+      "key": "orchestrator/tests/conftest.py",
+      "baseline": 1242,
+      "current": 1278
+    },
+    {
+      "measure": "prose_lines",
+      "key": "orchestrator/tests/conftest.py",
+      "baseline": 770,
+      "current": 772
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 4730,
+      "current": 4735
+    },
+    {
+      "measure": "total:lines",
+      "key": "<cluster>",
+      "baseline": 56271,
+      "current": 56307
+    },
+    {
+      "measure": "total:prose_lines",
+      "key": "<cluster>",
+      "baseline": 31571,
+      "current": 31573
+    }
+  ]
+}

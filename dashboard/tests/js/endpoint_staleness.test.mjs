@@ -10,7 +10,7 @@
 // statically detect named exports assigned from a variable, so
 // `import { staleNoticesForTab } from '...'` would come back undefined. We
 // therefore default-import the module and destructure instead (mirrors
-// tasks_offline_banner.test.mjs / task_status_counts.test.mjs). A plain
+// tasks_offline_banner.test.mjs / graph_layout.test.mjs). A plain
 // static ESM import is SAFE here — unlike data.js, this module touches no
 // browser global at load; its `window.DF_ENDPOINT_STALENESS` assignment is
 // guarded by `typeof window !== 'undefined'`.
@@ -27,28 +27,44 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 
 import staleness from '../../src/dashboard/static/redux/endpoint_staleness.js';
+import pollScope from '../../src/dashboard/static/redux/poll_scope.js';
+
+import { loadDataJs } from './_data_loader.mjs';
 
 const {
   STALE_FAILURE_THRESHOLD,
-  TAB_ENDPOINTS,
   staleEntryFor,
   formatAge,
   staleNoticesForTab,
+  loadingNoticeForTab,
 } = staleness;
+const { TAB_ENDPOINTS } = pollScope;
 
 const REDUX_DIR = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   '../../src/dashboard/static/redux',
 );
 
-// A representative endpoint that only ONE tab consumes, so a notice for it
-// can never be confused with a different tab's fan-in.
-const MERGE_PATH = '/api/v2/dashboard/merge-queue';
-const TASKS_PATH = '/api/v2/dashboard/tasks';
+const DASH = '/api/v2/dashboard';
+
+// Fixture endpoints: real dashboard paths, handed to the notice functions
+// directly, so each decision test names exactly the paths it decides over.
+const MERGE_PATH = `${DASH}/merge-queue`;
+const TASKS_PATH = `${DASH}/tasks`;
+const ESC_PATH = `${DASH}/escalations`;
+
+// A multi-endpoint path list, spelled out here rather than read off a surface
+// map: the notice functions decide over whatever paths they are handed, so
+// their decision tests do not depend on which tab polls what.
+const TASKS_TAB_PATHS = Object.freeze([
+  TASKS_PATH,
+  `${DASH}/orchestrators`,
+  `${DASH}/scheduler`,
+  `${DASH}/invariants`,
+]);
 
 const NOW = 1_700_000_000_000;
 
@@ -67,14 +83,19 @@ test('module exposes its documented surface', () => {
   assert.equal(typeof STALE_FAILURE_THRESHOLD, 'number');
   assert.ok(Number.isInteger(STALE_FAILURE_THRESHOLD) && STALE_FAILURE_THRESHOLD >= 2,
     `threshold must be an integer >= 2 so a single blip cannot trip it, got ${STALE_FAILURE_THRESHOLD}`);
-  assert.equal(typeof TAB_ENDPOINTS, 'object');
+  assert.equal(staleness.TAB_ENDPOINTS, undefined,
+    'TAB_ENDPOINTS lives in poll_scope.js, its one home; a second export here ' +
+    'would be a second copy of what the dashboard polls');
+  assert.equal(staleness.CHROME_ENDPOINTS, undefined,
+    'CHROME_ENDPOINTS lives in poll_scope.js, its one home; a second export here ' +
+    'would be a second copy of what the dashboard polls');
 });
 
 // ── (a) healthy tab ────────────────────────────────────────────────────────
 
 test('a healthy tab (failures: 0) produces no notice', () => {
   const notices = staleNoticesForTab({
-    tab: 'merge',
+    paths: [MERGE_PATH],
     stale: staleMap({ [MERGE_PATH]: { failures: 0, lastSuccessAt: NOW - 3000 } }),
     now: NOW,
   });
@@ -84,8 +105,8 @@ test('a healthy tab (failures: 0) produces no notice', () => {
 test('an absent entry (never polled yet) produces no notice', () => {
   // The very first render happens before any fetch resolves, so __stale is
   // `{}`. Claiming staleness there would fire on every page load.
-  assert.deepEqual(staleNoticesForTab({ tab: 'merge', stale: {}, now: NOW }), []);
-  assert.deepEqual(staleNoticesForTab({ tab: 'merge' }), []);
+  assert.deepEqual(staleNoticesForTab({ paths: [MERGE_PATH], stale: {}, now: NOW }), []);
+  assert.deepEqual(staleNoticesForTab({ paths: [MERGE_PATH] }), []);
   assert.deepEqual(staleNoticesForTab({}), []);
   assert.deepEqual(staleNoticesForTab(), []);
 });
@@ -98,7 +119,7 @@ test('a single blip does not trip the indicator (#4791 acceptance 2)', () => {
   // indicator that fires on those is an indicator operators learn to ignore.
   for (const failures of [1, STALE_FAILURE_THRESHOLD - 1]) {
     const notices = staleNoticesForTab({
-      tab: 'merge',
+      paths: [MERGE_PATH],
       stale: staleMap({ [MERGE_PATH]: { failures, lastSuccessAt: NOW - 9000 } }),
       now: NOW,
     });
@@ -108,7 +129,7 @@ test('a single blip does not trip the indicator (#4791 acceptance 2)', () => {
 
 test('reaching the threshold produces exactly one notice', () => {
   const notices = staleNoticesForTab({
-    tab: 'merge',
+    paths: [MERGE_PATH],
     stale: staleMap({
       [MERGE_PATH]: { failures: STALE_FAILURE_THRESHOLD, lastSuccessAt: NOW - 60_000 },
     }),
@@ -123,7 +144,7 @@ test('reaching the threshold produces exactly one notice', () => {
 
 test('past the threshold it stays exactly one notice, not one per failure', () => {
   const notices = staleNoticesForTab({
-    tab: 'merge',
+    paths: [MERGE_PATH],
     stale: staleMap({
       [MERGE_PATH]: { failures: STALE_FAILURE_THRESHOLD + 400, lastSuccessAt: NOW - 71_280_000 },
     }),
@@ -136,7 +157,7 @@ test('past the threshold it stays exactly one notice, not one per failure', () =
 
 test('the notice names the endpoint path and a human age', () => {
   const [notice] = staleNoticesForTab({
-    tab: 'merge',
+    paths: [MERGE_PATH],
     stale: staleMap({
       [MERGE_PATH]: { failures: STALE_FAILURE_THRESHOLD, lastSuccessAt: NOW - 125_000 },
     }),
@@ -160,6 +181,19 @@ test('formatAge renders seconds, minutes and hours distinguishably', () => {
   assert.ok(/h/.test(formatAge(19.8 * 3600 * 1000)), formatAge(19.8 * 3600 * 1000));
 });
 
+test('formatAge renders an age of a day or more in days, then whole hours', () => {
+  // An idle project's cards are weeks old; '480h' is a number an operator has
+  // to divide in their head.
+  assert.equal(formatAge(20 * 86_400_000), '20d');
+  assert.equal(formatAge(27 * 3_600_000), '1d 3h');
+  assert.equal(formatAge(48 * 3_600_000), '2d');
+});
+
+test('formatAge keeps hours and minutes for an age under a day', () => {
+  assert.equal(formatAge(19.8 * 3_600_000), '19h 48m');
+  assert.equal(formatAge(23 * 3_600_000 + 59 * 60_000), '23h 59m');
+});
+
 // ── (d) never-succeeded must not fabricate a zero age ──────────────────────
 
 test('an endpoint that never succeeded says NEVER, not "0s ago"', () => {
@@ -168,7 +202,7 @@ test('an endpoint that never succeeded says NEVER, not "0s ago"', () => {
   // documents: a missing timestamp is UNKNOWN, never "just now".
   for (const lastSuccessAt of [0, null, undefined]) {
     const [notice] = staleNoticesForTab({
-      tab: 'merge',
+      paths: [MERGE_PATH],
       stale: staleMap({
         [MERGE_PATH]: { failures: STALE_FAILURE_THRESHOLD, lastSuccessAt },
       }),
@@ -182,100 +216,28 @@ test('an endpoint that never succeeded says NEVER, not "0s ago"', () => {
   }
 });
 
-// ── (e) the tab->endpoint map is machine-checked against the real sources ──
+// ── (e) missing or malformed paths ─────────────────────────────────────────
 
-// Loads data.js against a shimmed browser-ish global. data.js assigns
-// `window.DF_DATA = {...}` at module scope, and an ESM `import` statement's
-// target module body runs BEFORE the importing file's own body — so
-// `globalThis.window` would still be unset when data.js's top level runs,
-// throwing `ReferenceError: window is not defined`. We therefore shim
-// window/fetch FIRST and only then load via createRequire, exactly as
-// data_poll.test.mjs::loadDataJs documents. `document` is deliberately NOT
-// shimmed, so data.js's auto-start guard stays inert under node.
-//
-// data.js also destructures window.DF_DATUM at module scope (task 5588), and
-// datum.js in turn destructures THIS module's formatAge, so the shim carries
-// DF_ENDPOINT_STALENESS and datum.js is loaded first — index.html's order,
-// endpoint_staleness.js -> datum.js -> data.js, reproduced under node.
-function loadDataJs() {
-  globalThis.window = { dispatchEvent: () => {}, DF_ENDPOINT_STALENESS: staleness };
-  globalThis.fetch = () => Promise.resolve({ ok: true, json: async () => ({}) });
-  const require = createRequire(import.meta.url);
-  const datumSpecifier = '../../src/dashboard/static/redux/datum.js';
-  delete require.cache[require.resolve(datumSpecifier)];
-  require(datumSpecifier);
-  const specifier = '../../src/dashboard/static/redux/data.js';
-  delete require.cache[require.resolve(specifier)];
-  return require(specifier);
-}
-
-// app.jsx is `type="text/babel"` and cannot be imported here, so the tab ids
-// are read out of its source — the same source-text contract idiom the Python
-// suite uses for .jsx (see test_tab_escalation_analytics.py).
-function appTabIds() {
-  const src = fs.readFileSync(path.join(REDUX_DIR, 'app.jsx'), 'utf8');
-  const block = src.match(/const tabs = \[([\s\S]*?)\];/);
-  assert.ok(block, 'could not locate the `const tabs = [...]` block in app.jsx');
-  return [...block[1].matchAll(/id:\s*'([^']+)'/g)].map(m => m[1]);
-}
-
-test('every mapped endpoint is a real endpointsFor() path', () => {
-  // A map that silently stops matching a renamed endpoint is a check that
-  // quietly stops checking: it would report "healthy" forever.
-  const { endpointsFor, pollKey } = loadDataJs();
-  const real = new Set(Object.keys(endpointsFor('24h')).map(pollKey));
-
-  for (const [tab, paths] of Object.entries(TAB_ENDPOINTS)) {
-    assert.ok(Array.isArray(paths) && paths.length > 0,
-      `tab ${tab} must map to a non-empty array of endpoint paths`);
-    for (const p of paths) {
-      assert.ok(real.has(p),
-        `TAB_ENDPOINTS[${tab}] names ${p}, which is not a pollKey of any ` +
-        `endpointsFor('24h') key: ${[...real].join(', ')}`);
-    }
-  }
-});
-
-test('every mapped tab id is one of app.jsx\'s tab ids', () => {
-  const ids = appTabIds();
-  assert.equal(ids.length, 13, `expected app.jsx's 13 tabs, got ${ids.length}: ${ids.join(', ')}`);
-  for (const tab of Object.keys(TAB_ENDPOINTS)) {
-    assert.ok(ids.includes(tab),
-      `TAB_ENDPOINTS has tab id ${tab}, which app.jsx does not render: ${ids.join(', ')}`);
-  }
-});
-
-test('every app.jsx tab is mapped — a tab with no entry is silently unmonitored', () => {
-  const ids = appTabIds();
-  for (const tab of ids) {
-    assert.ok(Object.prototype.hasOwnProperty.call(TAB_ENDPOINTS, tab),
-      `app.jsx renders tab ${tab} but TAB_ENDPOINTS has no entry for it, so ` +
-      'a wedge behind that tab would show no indicator at all');
-  }
-});
-
-test('an unknown tab id yields no notice rather than throwing', () => {
-  assert.deepEqual(
-    staleNoticesForTab({
-      tab: 'not-a-tab',
-      stale: staleMap({ [MERGE_PATH]: { failures: 99, lastSuccessAt: 0 } }),
-      now: NOW,
-    }),
-    [],
-  );
+test('missing or non-array paths yield no notice rather than throwing', () => {
+  const wedged = staleMap({ [MERGE_PATH]: { failures: 99, lastSuccessAt: 0 } });
+  assert.deepEqual(staleNoticesForTab({ stale: wedged, now: NOW }), []);
+  assert.deepEqual(staleNoticesForTab({ paths: 'x', stale: wedged, now: NOW }), []);
+  // A tab id is no longer consulted at all: the module holds no tab map, so
+  // the caller hands it the open tab's paths.
+  assert.deepEqual(staleNoticesForTab({ tab: 'merge', stale: wedged, now: NOW }), []);
 });
 
 // ── (f) fan-in and cross-tab isolation ─────────────────────────────────────
 
 test('a multi-endpoint tab yields one notice per FAILING endpoint', () => {
-  const paths = TAB_ENDPOINTS.tasks;
+  const paths = TASKS_TAB_PATHS;
   assert.ok(paths.length > 1,
     `the tasks tab fans in from several endpoints; got ${JSON.stringify(paths)}`);
 
   const all = staleMap(Object.fromEntries(
     paths.map(p => [p, { failures: STALE_FAILURE_THRESHOLD, lastSuccessAt: NOW - 30_000 }]),
   ));
-  const notices = staleNoticesForTab({ tab: 'tasks', stale: all, now: NOW });
+  const notices = staleNoticesForTab({ paths: TASKS_TAB_PATHS, stale: all, now: NOW });
   assert.equal(notices.length, paths.length);
   assert.deepEqual(notices.map(n => n.path).sort(), [...paths].sort());
 
@@ -283,20 +245,20 @@ test('a multi-endpoint tab yields one notice per FAILING endpoint', () => {
   const one = staleMap({
     [TASKS_PATH]: { failures: STALE_FAILURE_THRESHOLD, lastSuccessAt: NOW - 30_000 },
   });
-  const single = staleNoticesForTab({ tab: 'tasks', stale: one, now: NOW });
+  const single = staleNoticesForTab({ paths: TASKS_TAB_PATHS, stale: one, now: NOW });
   assert.equal(single.length, 1);
   assert.equal(single[0].path, TASKS_PATH);
 });
 
-test('a healthy tab shows nothing while a DIFFERENT tab\'s endpoint is wedged', () => {
+test('only the given paths are reported', () => {
   // The whole point of per-endpoint staleness: the 19.8h wedge hit the tasks
   // fan-out while the escalations endpoint stayed current. A global banner
   // would have lied about both.
   const stale = staleMap({
     [TASKS_PATH]: { failures: 400, lastSuccessAt: NOW - 71_280_000 },
   });
-  assert.deepEqual(staleNoticesForTab({ tab: 'esc', stale, now: NOW }), []);
-  assert.equal(staleNoticesForTab({ tab: 'tasks', stale, now: NOW }).length, 1);
+  assert.deepEqual(staleNoticesForTab({ paths: [ESC_PATH], stale, now: NOW }), []);
+  assert.equal(staleNoticesForTab({ paths: [TASKS_PATH], stale, now: NOW }).length, 1);
 });
 
 // ── staleEntryFor ──────────────────────────────────────────────────────────
@@ -311,7 +273,7 @@ test('staleEntryFor reads a path out of the published map and defaults safely', 
 
 test('every notice is a {kind, path, text} triple with kind "stale"', () => {
   const notices = staleNoticesForTab({
-    tab: 'tasks',
+    paths: TASKS_TAB_PATHS,
     stale: staleMap({
       [TASKS_PATH]: { failures: STALE_FAILURE_THRESHOLD, lastSuccessAt: NOW - 45_000 },
     }),
@@ -329,7 +291,7 @@ test('a missing `now` falls back rather than rendering NaN', () => {
   // App passes Date.now(), but this module also runs in the node harness and
   // must never emit "NaNs ago" into the operator's only staleness signal.
   const notices = staleNoticesForTab({
-    tab: 'merge',
+    paths: [MERGE_PATH],
     stale: staleMap({
       [MERGE_PATH]: { failures: STALE_FAILURE_THRESHOLD, lastSuccessAt: NOW - 5000 },
     }),
@@ -371,7 +333,7 @@ test('data.js prefers THIS module\'s threshold over its own fallback', async () 
   // source, and data.js names that global in a COMMENT explaining the lazy
   // read — so deleting the real read left the assertion green while its
   // message claimed the opposite.
-  const api = loadDataJs();
+  const { api } = loadDataJs();
   // Set AFTER the load, deliberately: loadDataJs installs a fresh
   // globalThis.window, and LAZINESS is exactly the property under test. data.js
   // is the FIRST classic script in index.html, so a module-scope read would be
@@ -405,4 +367,112 @@ test('data.js prefers THIS module\'s threshold over its own fallback', async () 
       'data.js took its own fallback instead of the loaded module\'s value, ' +
       'so the two can drift apart silently in the browser',
   );
+});
+
+// ── loadingNoticeForTab: the tab paths that have never delivered since page load ─
+
+test('loadingNoticeForTab is ONE notice naming every tab path with no receipt yet', () => {
+  const notice = loadingNoticeForTab({ paths: TASKS_TAB_PATHS, receipt: {}, stale: {} });
+  assert.deepEqual(Object.keys(notice).sort(), ['kind', 'paths', 'text']);
+  assert.equal(notice.kind, 'loading');
+  assert.deepEqual(notice.paths, TASKS_TAB_PATHS);
+  for (const path of TASKS_TAB_PATHS) {
+    assert.ok(notice.text.includes(path),
+      `the loading notice must name ${path}, got: ${notice.text}`);
+  }
+});
+
+test('loadingNoticeForTab names only the paths that have not delivered', () => {
+  const receipt = { [TASKS_PATH]: { servedAt: null, receivedAt: NOW, window: null } };
+  const notice = loadingNoticeForTab({ paths: TASKS_TAB_PATHS, receipt, stale: {} });
+  const pending = TASKS_TAB_PATHS.filter(p => p !== TASKS_PATH);
+  assert.deepEqual(notice.paths, pending);
+  assert.ok(!notice.text.includes(TASKS_PATH), `a delivered path is not loading: ${notice.text}`);
+});
+
+test('loadingNoticeForTab is null once every tab path has delivered', () => {
+  const receipt = Object.fromEntries(TASKS_TAB_PATHS.map(p => [p, { receivedAt: NOW }]));
+  assert.equal(loadingNoticeForTab({ paths: TASKS_TAB_PATHS, receipt, stale: {} }), null);
+});
+
+test('loadingNoticeForTab defers to the stale notice once an endpoint is stale', () => {
+  // A path that has failed STALE_FAILURE_THRESHOLD times is already named by
+  // staleNoticesForTab ("has never delivered data"); a second banner for the
+  // same fact would only be noise.
+  const stale = staleMap({ [MERGE_PATH]: { failures: STALE_FAILURE_THRESHOLD, lastSuccessAt: 0 } });
+  assert.equal(loadingNoticeForTab({ paths: [MERGE_PATH], receipt: {}, stale }), null);
+  const below = staleMap({ [MERGE_PATH]: { failures: STALE_FAILURE_THRESHOLD - 1, lastSuccessAt: 0 } });
+  assert.deepEqual(loadingNoticeForTab({ paths: [MERGE_PATH], receipt: {}, stale: below }).paths, [MERGE_PATH]);
+});
+
+test('loadingNoticeForTab reads one pending path in the singular', () => {
+  const notice = loadingNoticeForTab({ paths: [MERGE_PATH], receipt: {}, stale: {} });
+  assert.equal(notice.text, `${MERGE_PATH} has not delivered data yet — loading`);
+});
+
+test('loadingNoticeForTab tolerates every missing input', () => {
+  assert.equal(loadingNoticeForTab({ paths: 'x', receipt: {}, stale: {} }), null);
+  assert.equal(loadingNoticeForTab({ tab: 'merge', receipt: {}, stale: {} }), null);
+  assert.equal(loadingNoticeForTab(), null);
+  assert.equal(loadingNoticeForTab({}), null);
+  assert.equal(loadingNoticeForTab({ paths: [MERGE_PATH] }), null);
+  assert.equal(loadingNoticeForTab({ receipt: {}, stale: {} }), null);
+});
+
+// ── loadingNoticeForTab over the real data.js ──────────────────────────────
+//
+// These hand each tab the paths app.jsx would: its poll_scope.js entry.
+
+function liveLoadingNotices(win) {
+  return Object.fromEntries(Object.keys(TAB_ENDPOINTS).map(tab => [
+    tab,
+    loadingNoticeForTab({
+      paths: TAB_ENDPOINTS[tab], receipt: win.DF_DATA.__receipt, stale: win.DF_DATA.__stale,
+    }),
+  ]));
+}
+
+function quietDeps(fetchImpl) {
+  return {
+    fetchImpl,
+    now: () => NOW,
+    random: () => 0,
+    sleep: () => Promise.resolve(),
+    setTimeoutImpl: () => 0,
+    clearTimeoutImpl: () => {},
+  };
+}
+
+test('over the real data.js: every tab is loading before the first refresh, none after it', async () => {
+  const { api } = loadDataJs();
+  for (const [tab, notice] of Object.entries(liveLoadingNotices(globalThis.window))) {
+    assert.deepEqual(notice?.paths, TAB_ENDPOINTS[tab], `${tab}: ${JSON.stringify(notice)}`);
+  }
+
+  const ok = () => Promise.resolve({ ok: true, json: async () => ({}) });
+  await api.refreshDFData(undefined, {
+    state: api.createPollState(), jitterMaxMs: 0, deps: quietDeps(ok),
+  });
+
+  for (const [tab, notice] of Object.entries(liveLoadingNotices(globalThis.window))) {
+    assert.equal(notice, null, `${tab} still claims to be loading after a full refresh`);
+  }
+});
+
+test('over the real data.js: an endpoint that failed its first poll leaves only its own tab loading', async () => {
+  const { api } = loadDataJs();
+  const curator = `${DASH}/curator`;
+  const fetchImpl = url => (
+    url.split('?')[0] === curator
+      ? Promise.resolve({ ok: false, json: async () => ({}) })
+      : Promise.resolve({ ok: true, json: async () => ({}) })
+  );
+  await api.refreshDFData(undefined, {
+    state: api.createPollState(), jitterMaxMs: 0, deps: quietDeps(fetchImpl),
+  });
+
+  const loading = Object.entries(liveLoadingNotices(globalThis.window))
+    .filter(([, notice]) => notice !== null);
+  assert.deepEqual(loading.map(([tab]) => tab), ['curator']);
+  assert.deepEqual(loading[0][1].paths, [curator]);
 });

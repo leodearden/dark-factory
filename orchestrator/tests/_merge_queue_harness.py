@@ -15,14 +15,14 @@ call this helper, and merge_queue.py no longer carries a test-only method.
 
 This module lives in orchestrator/tests/ and is imported by bare module name
 (``from _merge_queue_harness import drive_verify_and_advance``), matching the
-flat-test-helper convention (see ``_serial_merge_worker.py``, ``_orch_helpers.py``
+flat-test-helper convention (see ``_orch_helpers.py``, ``_merge_lane_fakes.py``
 — orchestrator/tests/ has no ``__init__.py``).
 
 CRITICAL — dynamic module lookup, not from-import: every merge_queue
 module-level symbol is referenced as ``_mq.<name>`` (attribute lookup on the
-module object, resolved at call time), NEVER ``from orchestrator.merge_queue
+module object, resolved at call time), NEVER ``from orchestrator.merge_lane.worker
 import <name>``.  ~15 of the migrated tests do
-``patch('orchestrator.merge_queue.run_scoped_verification', …)`` (and similar
+``patch('orchestrator.merge_lane.worker.run_scoped_verification', …)`` (and similar
 on the other symbols); a from-import would bind the name in THIS module's
 namespace at import time, so the patch on the merge_queue attribute would
 silently fail to reach the helper's reference and the pass-mock would be
@@ -38,10 +38,13 @@ import asyncio
 import time
 from typing import TYPE_CHECKING
 
-import orchestrator.merge_queue as _mq
+import orchestrator.merge_lane.worker as _mq
 
 if TYPE_CHECKING:
-    from orchestrator.merge_queue import (
+    from collections.abc import Callable
+
+    from orchestrator.merge_lane.worker import (
+        InflightEntry,
         LocalRunner,
         RealMergeItem,
         SpeculativeMergeWorker,
@@ -103,4 +106,22 @@ async def drive_verify_and_advance(
         started_at=time.time(),
     )
 
-    return await worker._finalize_inflight(entry)
+    return await finalize_through_gate(worker, entry)
+
+
+async def finalize_through_gate(
+    worker: SpeculativeMergeWorker,
+    entry: InflightEntry,
+    *,
+    on_park: Callable[[], object] = lambda: None,
+) -> bool:
+    """``_finalize_inflight`` *entry*, resuming it while it parks on a gate
+    re-verify (task 6155).  Returns True iff main was advanced.
+
+    *on_park* runs each time the entry parks, before its gate has started.
+    """
+    while True:
+        advanced = await worker._finalize_inflight(entry)
+        if entry.gate is None:
+            return advanced
+        on_park()

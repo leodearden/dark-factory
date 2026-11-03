@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _curator_fake import FakeCurator
 from _orch_helpers import pydantic_spec
+from escalation.classify import DONE_STEP_COMMIT_ORPHAN_CLASS
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
 from orchestrator.config import OrchestratorConfig
+from orchestrator.escalation_router import AGGREGATE_ROLE, status_info_sentinel
 from orchestrator.harness import (
     Harness,
     _has_fresh_dispatch,
@@ -33,6 +37,9 @@ def harness(tmp_path: Path, mock_orch_config) -> Harness:
     # Task 2931: crisp test grace for the divergence-class routing.latest
     # freshness gate, decoupled from the 300.0 source default.
     mock_orch_config.orphan_l0_dispatch_freshness_secs = 120.0
+    mock_orch_config.info_l0_router_enabled = True
+    mock_orch_config.info_l0_router_ticket_timeout_secs = 900.0
+    mock_orch_config.info_l0_router_max_conversions_per_sweep = 20
 
     with (
         patch('orchestrator.harness.McpLifecycle'),
@@ -58,6 +65,10 @@ def harness(tmp_path: Path, mock_orch_config) -> Harness:
         return_value={'status': 'in-progress', 'metadata': {}},
     )
 
+    # Task 5223: an aged info L0 is routed through the curator, never by
+    # Scheduler.dispatch_tool's live HTTP path.
+    h.scheduler.dispatch_tool = FakeCurator()
+
     h._escalation_queue = EscalationQueue(tmp_path / 'escalations')
     return h
 
@@ -70,14 +81,19 @@ def _submit_aged(
     level: int = 0,
     category: str = 'design_concern',
     worktree: str | None = None,
+    severity: str = 'blocking',
 ) -> Escalation:
-    """Submit an escalation whose timestamp is ``seconds_ago`` in the past."""
+    """Submit an escalation whose timestamp is ``seconds_ago`` in the past.
+
+    Blocking by default: the info-L0 router (task 5223) owns aged info L0s,
+    and these tests describe the reaper's blocking path.
+    """
     ts = (datetime.now(UTC) - timedelta(seconds=seconds_ago)).isoformat()
     esc = Escalation(
         id=queue.make_id(task_id),
         task_id=task_id,
         agent_role='integration-reviewer',
-        severity='info',
+        severity=severity,
         category=category,
         summary=f'aged {seconds_ago}s',
         detail='detail',
@@ -264,7 +280,7 @@ class TestOrphanL0Reaper:
             ),
             detail='detail',
             # MUST NOT be 'verify_wip_reconciliation' — that would route
-            # through _is_done_step_commit_orphan's get_task branch, which
+            # through is_done_step_commit_orphan's get_task branch, which
             # this test does not stub.
             suggested_action='investigate_and_retry',
             timestamp=ts,
@@ -843,6 +859,103 @@ class TestOrphanL0Reaper:
         assert len(l0s) == 1  # the young one remains
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'task_row',
+        [
+            pytest.param({'status': 'done', 'metadata': {'done_provenance': {'kind': 'merged'}}}, id='merged'),
+            pytest.param(
+                {'status': 'done', 'metadata': {'done_provenance': {'kind': 'found_on_main'}}},
+                id='found_on_main',
+            ),
+            pytest.param(
+                {'status': 'done', 'metadata': {'done_provenance': {'kind': 'dispatch-gate-marker-found'}}},
+                id='dispatch-gate-marker-found',
+            ),
+            pytest.param({'status': 'done', 'metadata': {}}, id='provenance-absent'),
+            pytest.param({'status': 'in-progress', 'metadata': {}}, id='still-live'),
+            pytest.param(None, id='no-task-row'),
+        ],
+    )
+    async def test_done_step_commit_orphan_closes_status_info_under_its_aggregate(
+        self, harness: Harness, task_row: dict | None,
+    ):
+        """Task 5223 replaced task 2725's dismiss-or-promote split for this
+        always-info class: the info-L0 router closes it ``status-info`` whatever
+        the subject's state, and one aggregate L1 per sweep lists it
+        (plans/info-l0-disposition-router-prd.md D8)."""
+        assert harness._escalation_queue is not None
+        orphan = _submit_aged_done_step_commit_orphan(
+            harness._escalation_queue, 'task-2679', seconds_ago=300.0,
+        )
+        harness.scheduler.get_task = AsyncMock(return_value=task_row)
+
+        assert await harness._reap_orphan_l0_escalations() == 0
+
+        refreshed = harness._escalation_queue.get(orphan.id)
+        assert refreshed is not None
+        assert (refreshed.status, refreshed.resolution_class) == ('dismissed', 'status-info')
+        assert _reaper_l1s(harness._escalation_queue) == []
+        (aggregate,) = [
+            e for e in harness._escalation_queue.get_by_task(
+                status_info_sentinel(DONE_STEP_COMMIT_ORPHAN_CLASS), status='pending', level=1,
+            )
+            if e.agent_role == AGGREGATE_ROLE
+        ]
+        assert orphan.id in aggregate.detail
+
+    @pytest.mark.asyncio
+    async def test_non_step_commit_class_orphan_unaffected_by_status_lookup(
+        self, harness: Harness,
+    ):
+        """Task 2725: the terminal+merged skip is scoped to the
+        done-step-commit class only. A differently-classed aged orphan
+        (agent_role='integration-reviewer', category='design_concern' —
+        see ``_submit_aged``) on a done+merged task is promoted exactly as
+        before, and the class-gate short-circuits before ever awaiting
+        ``scheduler.get_task``.
+        """
+        assert harness._escalation_queue is not None
+        orphan = _submit_aged(
+            harness._escalation_queue, 'task-other-class', seconds_ago=300.0,
+        )
+        harness.scheduler.get_task = AsyncMock(
+            return_value={
+                'status': 'done',
+                'metadata': {'done_provenance': {'kind': 'merged'}},
+            },
+        )
+
+        count = await harness._reap_orphan_l0_escalations()
+        assert count == 1
+        harness.scheduler.get_task.assert_not_awaited()
+
+        all_escs = [
+            harness._escalation_queue.get(p.stem)
+            for p in (harness._escalation_queue.queue_dir).glob('esc-*.json')
+        ]
+        l1s = [e for e in all_escs if e and e.level == 1]
+        assert len(l1s) == 1
+        assert l1s[0].task_id == 'task-other-class'
+
+        refreshed = harness._escalation_queue.get(orphan.id)
+        assert refreshed is not None
+        assert refreshed.status == 'dismissed'
+
+
+class TestDoneStepCommitArmUnderTheKillSwitch:
+    """Task 2725's done-step-commit arm as it ran before the info-L0 router.
+
+    With ``info_l0_router_enabled`` hot-reloaded off, this always-info class
+    falls past the router branch to the arm again, so the kill switch's
+    fallback keeps the coverage it had (task 5223).
+    """
+
+    @pytest.fixture
+    def harness(self, harness: Harness) -> Harness:
+        harness.config.info_l0_router_enabled = False
+        return harness
+
+    @pytest.mark.asyncio
     async def test_done_step_commit_orphan_dismissed_when_subject_terminal_merged(
         self, harness: Harness,
     ):
@@ -1042,44 +1155,6 @@ class TestOrphanL0Reaper:
         assert refreshed.status == 'dismissed'
         assert refreshed.resolution is not None
         assert 'Auto-promoted to level 1' in refreshed.resolution
-
-    @pytest.mark.asyncio
-    async def test_non_step_commit_class_orphan_unaffected_by_status_lookup(
-        self, harness: Harness,
-    ):
-        """Task 2725: the terminal+merged skip is scoped to the
-        done-step-commit class only. A differently-classed aged orphan
-        (agent_role='integration-reviewer', category='design_concern' —
-        see ``_submit_aged``) on a done+merged task is promoted exactly as
-        before, and the class-gate short-circuits before ever awaiting
-        ``scheduler.get_task``.
-        """
-        assert harness._escalation_queue is not None
-        orphan = _submit_aged(
-            harness._escalation_queue, 'task-other-class', seconds_ago=300.0,
-        )
-        harness.scheduler.get_task = AsyncMock(
-            return_value={
-                'status': 'done',
-                'metadata': {'done_provenance': {'kind': 'merged'}},
-            },
-        )
-
-        count = await harness._reap_orphan_l0_escalations()
-        assert count == 1
-        harness.scheduler.get_task.assert_not_awaited()
-
-        all_escs = [
-            harness._escalation_queue.get(p.stem)
-            for p in (harness._escalation_queue.queue_dir).glob('esc-*.json')
-        ]
-        l1s = [e for e in all_escs if e and e.level == 1]
-        assert len(l1s) == 1
-        assert l1s[0].task_id == 'task-other-class'
-
-        refreshed = harness._escalation_queue.get(orphan.id)
-        assert refreshed is not None
-        assert refreshed.status == 'dismissed'
 
     @pytest.mark.asyncio
     async def test_done_step_commit_orphan_promoted_when_get_task_returns_none(
@@ -1378,9 +1453,9 @@ def _submit_aged_blocking(
 ) -> Escalation:
     """An aged L0 that is L0-LEGAL and non-info, so link 4 can decide it.
 
-    `_submit_aged`'s default `severity='info'` buckets NON_PINNING at link 1,
-    which is neither `dead_l0` nor `queue_handoff` — correct for the tests that
-    use it, and deliberately outside the new promotion arm.
+    `severity='info'` buckets NON_PINNING at link 1, which is neither
+    `dead_l0` nor `queue_handoff`, and is deliberately outside the new
+    promotion arm.
 
     Takes the HARNESS rather than the queue so the `harness` fixture's binding
     is resolved in one place instead of at every call site.
@@ -1529,8 +1604,8 @@ class TestInfoSeverityL0IsUntouchedByThisArm:
 
     An info L0 buckets NON_PINNING at link 1, so it is neither `dead_l0` nor
     `queue_handoff` and the `dead_l0`-only guard leaves it exactly where it is.
-    Task 5223 owns replacing the info-L0 path wholesale and must not find it
-    already moved.
+    Task 5223 replaced the info-L0 path behind that guard: once nothing is
+    live, the info-L0 router routes the record instead of promoting it.
     """
 
     async def test_an_info_l0_is_still_deferred_while_any_workflow_is_live(
@@ -1546,15 +1621,21 @@ class TestInfoSeverityL0IsUntouchedByThisArm:
             'an info L0 must NOT ride the new dead-filer promotion arm'
         )
 
-    async def test_an_info_l0_is_still_promoted_when_nothing_is_live(
+    async def test_an_info_l0_is_routed_when_nothing_is_live(
         self, harness: Harness,
     ) -> None:
-        _submit_aged_blocking(
+        esc = _submit_aged_blocking(
             harness, 'T1', 120.0,
             filing_claimant_run_id=_FILER_ID, severity='info',
         )
 
-        assert await harness._reap_orphan_l0_escalations() == 1
+        assert await harness._reap_orphan_l0_escalations() == 0
+
+        curator = harness.scheduler.dispatch_tool
+        assert isinstance(curator, FakeCurator)
+        (submitted,) = curator.calls_named('submit_task')
+        assert submitted['metadata']['escalation_id'] == esc.id
+        assert _reaper_l1s(_bound_queue(harness)) == []
 
 
 @pytest.mark.asyncio
@@ -1765,3 +1846,103 @@ class TestThePromotedRecordSaysWhichArmPromotedIt:
         assert refreshed is not None
         assert refreshed.resolution is not None
         assert 'no active workflow' in refreshed.resolution
+
+
+_EVAL_WORKTREE = '/home/leo/src/dark-factory-eval-worktrees/df_task_2339/run-ac3ab562'
+
+
+def _reaper_l1s(queue: EscalationQueue) -> list[Escalation]:
+    return [
+        e for e in (queue.get(p.stem) for p in queue.queue_dir.glob('esc-*.json'))
+        if e is not None and e.level == 1 and e.agent_role == 'harness-orphan-reaper'
+    ]
+
+
+@pytest.mark.asyncio
+class TestEvalLaneOrphansAreDismissed:
+    """An eval-lane L0 (``shared/src/shared/eval_lane.py``) is dismissed, never
+    promoted, and costs no taskmaster or liveness read."""
+
+    def _assert_dismissed(self, harness: Harness, esc: Escalation, reason: str) -> None:
+        queue = _bound_queue(harness)
+        refreshed = queue.get(esc.id)
+        assert refreshed is not None
+        assert refreshed.status == 'dismissed'
+        assert refreshed.resolved_by == 'harness-orphan-reaper'
+        assert refreshed.resolution_class == 'benign'
+        assert reason in (refreshed.resolution or '')
+        assert _reaper_l1s(queue) == []
+        get_task = harness.scheduler.get_task
+        assert isinstance(get_task, AsyncMock)
+        get_task.assert_not_awaited()
+
+    @pytest.mark.parametrize('task_id', ['df_task_2430_adv_plan', 'shadow_5383_01JCELL'])
+    async def test_aged_fixture_id_l0_is_dismissed(self, harness: Harness, task_id: str) -> None:
+        esc = _submit_aged(_bound_queue(harness), task_id, seconds_ago=120.0)
+
+        assert await harness._reap_orphan_l0_escalations() == 0
+
+        self._assert_dismissed(harness, esc, f'fixture-task-id:{task_id}')
+
+    async def test_numeric_id_from_eval_worktree_is_dismissed(self, harness: Harness) -> None:
+        esc = _submit_aged(
+            _bound_queue(harness), '2339', seconds_ago=120.0, worktree=_EVAL_WORKTREE,
+        )
+
+        assert await harness._reap_orphan_l0_escalations() == 0
+
+        self._assert_dismissed(harness, esc, f'eval-worktree:{_EVAL_WORKTREE}')
+
+    async def test_dismissed_ahead_of_the_liveness_arm(self, harness: Harness) -> None:
+        """Production 2339 looks live; the eval-worktree record is still
+        dismissed, not deferred on its unstamped filing identity."""
+        esc = _submit_aged(
+            _bound_queue(harness), '2339', seconds_ago=120.0, worktree=_EVAL_WORKTREE,
+        )
+        harness.scheduler.is_actively_held = MagicMock(return_value=True)
+
+        assert await harness._reap_orphan_l0_escalations() == 0
+
+        self._assert_dismissed(harness, esc, f'eval-worktree:{_EVAL_WORKTREE}')
+
+    async def test_dismissal_wakes_no_production_workflow(self, harness: Harness) -> None:
+        queue = _bound_queue(harness)
+        queue.set_resolve_callback(harness._on_escalation_resolved)
+        event = asyncio.Event()
+        harness._escalation_events['2339'] = event
+        esc = _submit_aged(queue, '2339', seconds_ago=120.0, worktree=_EVAL_WORKTREE)
+
+        assert await harness._reap_orphan_l0_escalations() == 0
+
+        self._assert_dismissed(harness, esc, f'eval-worktree:{_EVAL_WORKTREE}')
+        assert not event.is_set()
+
+    async def test_young_eval_lane_l0_is_left_pending(self, harness: Harness) -> None:
+        esc = _submit_aged(_bound_queue(harness), 'df_task_2430_adv_plan', seconds_ago=10.0)
+
+        assert await harness._reap_orphan_l0_escalations() == 0
+
+        refreshed = _bound_queue(harness).get(esc.id)
+        assert refreshed is not None
+        assert refreshed.status == 'pending'
+
+    @pytest.mark.parametrize(
+        ('task_id', 'worktree'),
+        [
+            ('3096', '/home/leo/src/dark-factory/.worktrees/3096'),
+            ('task-path-guard', None),
+        ],
+    )
+    async def test_production_orphan_is_still_promoted(
+        self, harness: Harness, task_id: str, worktree: str | None,
+    ) -> None:
+        queue = _bound_queue(harness)
+        esc = _submit_aged(queue, task_id, seconds_ago=120.0, worktree=worktree)
+
+        assert await harness._reap_orphan_l0_escalations() == 1
+
+        assert [l1.task_id for l1 in _reaper_l1s(queue)] == [task_id]
+        refreshed = queue.get(esc.id)
+        assert refreshed is not None
+        assert refreshed.status == 'dismissed'
+        assert 'Auto-promoted to level 1' in (refreshed.resolution or '')

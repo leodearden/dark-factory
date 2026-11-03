@@ -803,10 +803,12 @@ class TestADeclarationIsScopedToTheGraphitiLeg:
     is "every Graphiti write", NOT "every add_memory call".  Mem0-primary
     traffic is outside the counter entirely rather than counted as undeclared.
 
-    The tool-boundary `entities_gate` is category-INDEPENDENT and still rejects
-    a CONFLICTING declaration on this path — pinned separately in
-    tests/server/test_entities_gate_ingestion.py.  Absence is never rejected,
-    so an agent that omits `entities` cannot lose a write here either way.
+    The tool-boundary `entities_gate` reads the same routing rule
+    (`routes_to_graphiti`): on an explicit Mem0-primary category without
+    `dual_write` it shape-checks the declaration and never conflict-rejects it
+    — pinned separately in tests/server/test_entities_gate_ingestion.py.
+    Absence is never rejected, so an agent that omits `entities` cannot lose a
+    write here either way.
     """
 
     @pytest.mark.asyncio

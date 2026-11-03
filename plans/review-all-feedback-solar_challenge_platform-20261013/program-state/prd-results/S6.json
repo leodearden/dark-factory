@@ -1,0 +1,29 @@
+{
+ "stream": "S6",
+ "prd_path": "docs/prds/review-all-settlement-store-seam.md",
+ "manifest_path": "docs/prds/review-all-settlement-store-seam.capability-manifest.yaml",
+ "leaves_estimate": 13,
+ "lead_rulings_on_open_questions": [
+  "Q1 fk-8b142ca219bf: S6 lands only the stop-gap (D7, settlement refuses a half-hour with >1 publisher of a metric); the capability half (billing selects the property's designated certified meter; seed stops publishing registers from an INVERTER device) is routed R8-style to the P-Fleet/metering capability PRD and the key stays open after S6-epsilon with the routing recorded in the S8 table.",
+  "Q2 acknowledged: 'delete for drills' lands as harness-only timeseries/fault_injection.py behind a DB trigger with a named GUC exception, not a production-port method (D11); the remedy text is narrowed accordingly.",
+  "Q3: 'revised after billing' is exposed as scp-settle output only (S6-eta); the consumer is the cycle report (P-Ops/P-Audit task 634), noted on 634; P-Alert does not consume it this program.",
+  "Task 584 held deferred now; S6 decompose adopts it as eta or cancels it naming eta.",
+  "Tactical items decided in-leaf per PRD \u00a711."
+ ],
+ "lead_actions_at_decompose": [
+  "S6-delta depends on S26-alpha (1078) and beta (1082); three S6 migrations through chain_head()",
+  "584 -> adopt as eta or cancel naming eta",
+  "high leaves -> gate 1065 per the PRD"
+ ],
+ "cross_reference_lines": [
+  "S1: carry BillingService(settlement_basis=...) and the Statement.settlement_basis INSERT column through the statement.py split; S1 leaves touching statement.py, meter_read.py or register_read.py depend on S6-theta.",
+  "S2: bill_fleet/bill_account capture ONE SettlementBasis per run and build the three sources over one SettlementSnapshot (S6-theta).",
+  "S3: per-role builders hold TimeseriesStores from build_timeseries_stores; the api dependency module provides the SettlementStore beside the TelemetryStore; ingestion/service.py::_recording_stores' backend switch is S3's.",
+  "S12 depends on S6-gamma (rollups.MAX_SAMPLE_GAP / settlement_grade), S6-lambda (fault_injection for drills) and S6-mu (SettlementStore.census); S12's run.py split starts after S6-mu.",
+  "S23 depends on S6-kappa (SettlementStore.latest_rows, SettlementCoverage.metric); total order hh_start DESC, home_id, metric; S23 sizes the read limit for 11 rows per home per half-hour.",
+  "S19: after S6 the remaining store-relation SQL outside timeseries/ is ops liveness + 2 private-attribute bypasses, all S19's (C1 holds).",
+  "S11: SettlementCoverage.metric enters the ops wire; the TS Metric union is a new Enum mirror under INV-4.",
+  "S27: INV-7 enforcing test = tests/timeseries/contract/test_store_contract.py (S6-beta, extended by delta, kappa, mu).",
+  "S10: optimiser/forecast/persistence.py's import moves to timeseries.relations (S6-alpha)."
+ ]
+}

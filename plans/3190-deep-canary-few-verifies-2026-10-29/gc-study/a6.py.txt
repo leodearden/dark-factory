@@ -1,0 +1,73 @@
+import re,json,datetime as dt,collections,statistics as st,bisect
+U=dt.timezone.utc
+def T(s): return dt.datetime.fromisoformat(s).astimezone(U)
+def pct(xs,q):
+    xs=sorted(xs);k=q*(len(xs)-1);f=int(k);c=min(f+1,len(xs)-1);return xs[f]+(xs[c]-xs[f])*(k-f)
+A=json.load(open('a1.json'))
+resets=sorted((T(s),T(e),l) for s,e,l,_ in A['resets'])
+ends=sorted(T(x[0]) for x in A['sums'])
+R=re.compile(r'^(\S+) \S+ warm-lane-gc-sweep\.sh\[(\d+)\]: (.*)$')
+ren={};reaps=[]
+for l in open('sweep.log',errors='replace'):
+    m=R.match(l.rstrip())
+    if not m: continue
+    t=T(m.group(1));msg=m.group(3)
+    a=re.search(r'Renaming non-empty \S+/(_\w+-\d+)/target → \S+/\.reseed-trash/\S+\.(\d+) before',msg)
+    if a: ren[a.group(2)]=(t,a.group(1))
+    a=re.search(r'reaped stale reseed-trash entry: \S+/(\S+)\.(\d+) \(',msg)
+    if a: reaps.append((t,a.group(1),a.group(2)))
+cnt=collections.Counter();lag=[]
+for t,lane,tp in reaps:
+    if tp not in ren: cnt['no timer rename (orch-arm/older)']+=1;continue
+    tr,_=ren[tp]
+    i=bisect.bisect_left(ends,tr)
+    if i>=len(ends): cnt['after last end']+=1;continue
+    e=ends[i]
+    pre=[r for r in resets if r[0]<=e and r[1]<=e]
+    last=pre[-1][2] if pre else None
+    cnt['final lane of that timer sweep' if last==lane else 'not final lane']+=1
+    lag.append((e-tr).total_seconds())
+print(cnt,'rename->sweep end secs p50',round(st.median(lag)) if lag else None)
+# Δfree per reset noop vs active
+free=[(T(t),f) for t,f in A['free']];ts=[x[0] for x in free]
+def at(t):
+    i=bisect.bisect_left(ts,t)
+    return free[min(i,len(free)-1)][1]
+EV=collections.defaultdict(list)
+BUILD=('Invoking claude agent','cli_invoke] Command','verify start','Verification failed','acquire_spec_lane: reset','route=recycle','route=reset_in_place_reattach','acquire_warm_lane: route=reuse','_reuse_warm_lane: reused','stole lane','acquire_warm_lane: acquired','release_lane_for_terminal_task')
+for l in open('lane_any.log',errors='replace'):
+    m=re.match(r'^(\S+) ',l);la=re.search(r'_(lane|spec)-\d+',l)
+    if not m or not la or 'Recovery:' in l or 'reconciler' in l: continue
+    if any(b in l for b in BUILD): EV[la.group(0)].append(T(m.group(1)))
+per=collections.defaultdict(list)
+for s,e,l in resets: per[l].append((s,e))
+noop=[];act=[];pairs=0;nn=0;gens={}
+for l,v in per.items():
+    ev=sorted(EV[l]);v.sort()
+    for i in range(1,len(v)):
+        a=v[i-1][1];s,e=v[i]
+        h=bisect.bisect_right(ev,s)-bisect.bisect_left(ev,a)
+        d=at(e+dt.timedelta(minutes=6))-at(s-dt.timedelta(minutes=1))
+        pairs+=1
+        (act if h else noop).append(d)
+        if not h: nn+=1
+print('strict rule (release lines excluded): pairs',pairs,'noop',nn,round(nn/pairs,3),'active',pairs-nn)
+print('Δfree noop p10/p50/p90',[round(pct(noop,q)) for q in (.1,.5,.9)],'mean',round(st.mean(noop),1),'n',len(noop))
+print('Δfree active p10/p50/p90',[round(pct(act,q)) for q in (.1,.5,.9)],'mean',round(st.mean(act),1),'n',len(act))
+d=(resets[-1][1]-resets[0][0]).total_seconds()/86400
+print('active resets/day',round(len(act)/d,1),'noop/day',round(len(noop)/d,1))
+# distinct active lanes per day (agents/verify only)
+dist=collections.defaultdict(set)
+for l,v in EV.items():
+    for t in v: dist[t.date()].add(l)
+print({str(k):len(v) for k,v in sorted(dist.items())},'ever',len([l for l,v in EV.items() if v]))
+# lanes never active
+print('lanes w/ no event in window',sorted(set(per)-{l for l,v in EV.items() if v},key=lambda x:(x[:5],int(x.split('-')[1]))))
+# timing of reset relative to a lane's most recent activity (hours)
+g=[]
+for l,v in per.items():
+    ev=sorted(EV[l])
+    for s,e in v:
+        j=bisect.bisect_left(ev,s)
+        if j: g.append((s-ev[j-1]).total_seconds()/3600)
+print('hours since last activity at reset p50',round(pct(g,.5),1),'p90',round(pct(g,.9),1),'n',len(g))

@@ -14,7 +14,8 @@ Fixtures are DERIVED, not pinned
 --------------------------------
 Every mocked ``CALL db.indexes()`` row here is built by inverting
 ``expected_index_set()`` back into the measured live record shape (see
-``_rows_for``), using ``LIVE_HEADER`` from ``test_falkor_indices``.  A hard-coded
+``_falkor_index_doubles.py::rows_for``, shared with γ's wiring suite), using
+``_falkor_index_doubles.py::LIVE_HEADER``.  A hard-coded
 38 would go stale the first time graphiti changes its index set, and would do so
 by making these tests pass against the wrong expectation — the exact silent-drift
 class the PRD exists to remove (INV-5: single home, never restate).
@@ -37,78 +38,32 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections import defaultdict
 from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 import redis.exceptions
-
-# ``_TRAP_PRESENT`` — the trap state esc-3375-1 protected as evidence — is
-# IMPORTED, not restated: it had one definition per suite, and a future change to
-# what the trap contains would have had to be made twice or the two suites would
-# silently disagree about what they were testing (INV-5: single home).
-from test_falkor_indices import _TRAP_PRESENT, LIVE_HEADER
+from _falkor_index_doubles import (
+    EMPTY_KEY_ERROR,
+    LIVE_HEADER,
+    TRAP_PRESENT,
+    StatefulGraph,
+    rows_for,
+    statements_read,
+    statements_written,
+)
 
 from fused_memory.backends.falkor_indices import (
     IndexHeaderShapeError,
     IndexRecordShapeError,
-    IndexSpec,
     expected_index_set,
-    parse_index_statement,
     plan_index_statements,
 )
 from fused_memory.backends.graphiti_client import _MultiTenantFalkorDriver
 
 
-def _rows_for(specs: set[IndexSpec]) -> list[list]:
-    """Invert the normal form back into ``CALL db.indexes()``-shaped rows.
-
-    FalkorDB merges every index on a label into ONE record, so specs are grouped
-    by ``(label, entity_type)`` and each property's index types are collected into
-    the ``types`` column — the same merged shape measured live 2026-08-06, where
-    ``Entity`` comes back once carrying
-    ``{'group_id': ['RANGE', 'FULLTEXT'], 'summary': ['FULLTEXT'], ...}``.
-
-    Columns are emitted in ``LIVE_HEADER`` order::
-
-        [label, properties, types, options, language, stopwords,
-         entitytype, status, info]
-    """
-    grouped: dict[tuple[str, str], dict[str, list[str]]] = defaultdict(
-        lambda: defaultdict(list)
-    )
-    for label, entity_type, field, index_type in sorted(specs):
-        grouped[(label, entity_type)][field].append(index_type)
-
-    return [
-        [
-            label,                              # label
-            list(types_by_field),               # properties
-            {f: list(ts) for f, ts in types_by_field.items()},  # types
-            {},                                 # options
-            'english',                          # language
-            [],                                 # stopwords
-            entity_type,                        # entitytype
-            'OPERATIONAL',                      # status
-            {},                                 # info
-        ]
-        for (label, entity_type), types_by_field in grouped.items()
-    ]
-
-
 def _wire(backend, graph) -> None:
     """Point the backend's driver at *graph* — the seam ``_graph_for`` resolves through."""
     backend._driver._get_graph = MagicMock(return_value=graph)
-
-
-def _issued(graph) -> list[str]:
-    """The statements actually sent on the WRITE path, in order."""
-    return [call.args[0] for call in graph.query.call_args_list]
-
-
-def _ro_issued(graph) -> list[str]:
-    """The statements actually sent on the READ-ONLY path, in order."""
-    return [call.args[0] for call in graph.ro_query.call_args_list]
 
 
 class TestEnsureIndicesDiff:
@@ -125,7 +80,7 @@ class TestEnsureIndicesDiff:
         an empty plan, so a provisioned graph receives ZERO write statements.
         """
         expected = expected_index_set()
-        graph = make_graph_mock(_rows_for(expected), header=LIVE_HEADER)
+        graph = make_graph_mock(rows_for(expected), header=LIVE_HEADER)
         backend = make_backend(mock_config)
         _wire(backend, graph)
 
@@ -136,7 +91,7 @@ class TestEnsureIndicesDiff:
         assert result.statements == ()
         assert result.already_present == result.expected_total == len(expected)
         assert result.changed is False
-        assert _issued(graph) == []
+        assert statements_written(graph) == []
 
     @pytest.mark.asyncio
     async def test_trap_state_provisions_exactly_the_planned_statements(
@@ -144,19 +99,19 @@ class TestEnsureIndicesDiff:
     ):
         """The issued statements ARE the plan — β adds nothing and drops nothing."""
         expected = expected_index_set()
-        missing = expected - _TRAP_PRESENT
-        graph = make_graph_mock(_rows_for(_TRAP_PRESENT), header=LIVE_HEADER)
+        missing = expected - TRAP_PRESENT
+        graph = make_graph_mock(rows_for(TRAP_PRESENT), header=LIVE_HEADER)
         backend = make_backend(mock_config)
         _wire(backend, graph)
 
         result = await backend.ensure_indices(group_id='test')
 
         planned = [statement for statement, _specs in plan_index_statements(missing)]
-        assert _issued(graph) == planned
+        assert statements_written(graph) == planned
         assert result.statements == tuple(planned)
-        assert result.already_present == len(_TRAP_PRESENT)
+        assert result.already_present == len(TRAP_PRESENT)
         assert result.failed == ()
-        assert len(result.created) == result.expected_total - len(_TRAP_PRESENT)
+        assert len(result.created) == result.expected_total - len(TRAP_PRESENT)
         assert set(result.created) == missing
         assert result.changed is True
 
@@ -207,11 +162,11 @@ class TestPerStatementFailureIsolation:
     async def test_a_mid_list_failure_neither_raises_nor_stops_the_rest(
         self, mock_config, make_backend, make_graph_mock,
     ):
-        missing = expected_index_set() - _TRAP_PRESENT
+        missing = expected_index_set() - TRAP_PRESENT
         planned = plan_index_statements(missing)
         doomed_statement, doomed_specs = planned[len(planned) // 2]
 
-        graph = self._failing_graph(make_graph_mock, _rows_for(_TRAP_PRESENT), doomed_statement)
+        graph = self._failing_graph(make_graph_mock, rows_for(TRAP_PRESENT), doomed_statement)
         backend = make_backend(mock_config)
         _wire(backend, graph)
 
@@ -219,7 +174,7 @@ class TestPerStatementFailureIsolation:
 
         # Every planned statement was still attempted, including all the ones
         # AFTER the failure. A loop that aborted would issue a strict prefix.
-        assert _issued(graph) == [statement for statement, _ in planned]
+        assert statements_written(graph) == [statement for statement, _ in planned]
 
         failed_specs = [spec for spec, _error in result.failed]
         assert set(failed_specs) == set(doomed_specs)
@@ -233,11 +188,11 @@ class TestPerStatementFailureIsolation:
         self, mock_config, make_backend, make_graph_mock,
     ):
         """``len(created) + len(failed) == len(missing)`` — every spec lands in exactly one."""
-        missing = expected_index_set() - _TRAP_PRESENT
+        missing = expected_index_set() - TRAP_PRESENT
         planned = plan_index_statements(missing)
         doomed_statement, _specs = planned[0]
 
-        graph = self._failing_graph(make_graph_mock, _rows_for(_TRAP_PRESENT), doomed_statement)
+        graph = self._failing_graph(make_graph_mock, rows_for(TRAP_PRESENT), doomed_statement)
         backend = make_backend(mock_config)
         _wire(backend, graph)
 
@@ -281,58 +236,20 @@ class TestNoOperationalBarrier:
     async def test_exactly_one_db_indexes_call_and_no_status_poll(
         self, mock_config, make_backend, make_graph_mock,
     ):
-        graph = make_graph_mock(_rows_for(_TRAP_PRESENT), header=LIVE_HEADER)
+        graph = make_graph_mock(rows_for(TRAP_PRESENT), header=LIVE_HEADER)
         backend = make_backend(mock_config)
         _wire(backend, graph)
 
         await backend.ensure_indices(group_id='test')
 
-        reads = _ro_issued(graph)
+        reads = statements_read(graph)
         assert reads == ['CALL db.indexes()'], (
             'ensure_indices must read db.indexes() exactly ONCE (the diff read); '
             f'a second read is a status poll in disguise. Reads: {reads!r}'
         )
-        assert not any('db.indexes' in statement for statement in _issued(graph)), (
+        assert not any('db.indexes' in statement for statement in statements_written(graph)), (
             'no db.indexes() poll may appear on the write path either'
         )
-
-
-class _StatefulGraph:
-    """A graph double whose ``db.indexes()`` reflects the CREATEs it has accepted.
-
-    The plain ``make_graph_mock`` returns a FIXED row set, so a second concurrent
-    call sees the same pre-write state no matter what the first one did — which
-    makes the race under test invisible.  This double closes that: each accepted
-    statement is folded back into the reported index set through α's own parser,
-    so the read side is a real function of the write side.
-
-    Both methods ``await asyncio.sleep(0)``, and that is LOAD-BEARING, not
-    decoration: an ``AsyncMock`` resolves without ever suspending, so two gathered
-    calls would run strictly one-after-the-other and the test would pass against
-    an unserialized implementation.  The explicit yield is what lets the two
-    interleave at all.
-    """
-
-    def __init__(self, present: set[IndexSpec]):
-        self.present = set(present)
-        self.issued: list[str] = []
-
-    @staticmethod
-    def _result(rows):
-        result = MagicMock()
-        result.result_set = rows
-        result.header = LIVE_HEADER
-        return result
-
-    async def ro_query(self, statement, *args, **kwargs):
-        await asyncio.sleep(0)
-        return self._result(_rows_for(self.present))
-
-    async def query(self, statement, *args, **kwargs):
-        await asyncio.sleep(0)
-        self.issued.append(statement)
-        self.present |= set(parse_index_statement(statement))
-        return self._result([])
 
 
 class TestConcurrentProvisioningIsSerialized:
@@ -352,8 +269,8 @@ class TestConcurrentProvisioningIsSerialized:
         self, mock_config, make_backend,
     ):
         expected = expected_index_set()
-        planned = plan_index_statements(expected - _TRAP_PRESENT)
-        graph = _StatefulGraph(_TRAP_PRESENT)
+        planned = plan_index_statements(expected - TRAP_PRESENT)
+        graph = StatefulGraph(TRAP_PRESENT)
         backend = make_backend(mock_config)
         _wire(backend, graph)
 
@@ -386,7 +303,7 @@ class TestConcurrentProvisioningIsSerialized:
         write path that may already hold ``_identity_lock_for(group_id)``; sharing
         one lock between the two would hang that call rather than serialize it.
         """
-        graph = make_graph_mock(_rows_for(expected_index_set()), header=LIVE_HEADER)
+        graph = make_graph_mock(rows_for(expected_index_set()), header=LIVE_HEADER)
         backend = make_backend(mock_config)
         _wire(backend, graph)
 
@@ -432,7 +349,7 @@ class TestGroupArgCanonicalization:
         graphs — and every other test in this module would stay green, since they
         all pass an already-canonical id.
         """
-        graph = make_graph_mock(_rows_for(_TRAP_PRESENT), header=LIVE_HEADER)
+        graph = make_graph_mock(rows_for(TRAP_PRESENT), header=LIVE_HEADER)
         backend = make_backend(mock_config)
         _wire(backend, graph)
 
@@ -445,13 +362,6 @@ class TestGroupArgCanonicalization:
             'ensure_indices resolved a non-canonical graph key: '
             f'{backend._driver._get_graph.call_args_list!r}'
         )
-
-
-#: MEASURED 2026-08-09: what ``CALL db.indexes()`` raises against a graph KEY that
-#: does not exist yet.  Reproduced verbatim so the test exercises the real shape —
-#: but note the IMPLEMENTATION must not key on this wording (D2); it decides
-#: structurally, via ``list_graphs()`` membership.
-_EMPTY_KEY_ERROR = redis.exceptions.ResponseError('Invalid graph operation on empty key')
 
 
 def _with_graph_listing(backend, names: list[str]) -> None:
@@ -477,7 +387,7 @@ class TestAbsentGraph:
         self, mock_config, make_backend, make_graph_mock,
     ):
         graph = make_graph_mock([], header=LIVE_HEADER)
-        graph.ro_query = AsyncMock(side_effect=_EMPTY_KEY_ERROR)
+        graph.ro_query = AsyncMock(side_effect=EMPTY_KEY_ERROR)
         backend = make_backend(mock_config)
         _wire(backend, graph)
         _with_graph_listing(backend, ['some_other_graph'])
@@ -513,7 +423,7 @@ class TestUnreachableDriverPropagates:
         with pytest.raises(redis.exceptions.ConnectionError):
             await backend.ensure_indices(group_id='test')
 
-        assert _issued(graph) == [], 'nothing may be written after a failed diff read'
+        assert statements_written(graph) == [], 'nothing may be written after a failed diff read'
 
     @pytest.mark.asyncio
     async def test_a_list_graphs_failure_propagates_rather_than_reading_as_absent(
@@ -521,7 +431,7 @@ class TestUnreachableDriverPropagates:
     ):
         """The existence probe itself failing must not be mistaken for "absent"."""
         graph = make_graph_mock([], header=LIVE_HEADER)
-        graph.ro_query = AsyncMock(side_effect=_EMPTY_KEY_ERROR)
+        graph.ro_query = AsyncMock(side_effect=EMPTY_KEY_ERROR)
         backend = make_backend(mock_config)
         _wire(backend, graph)
         backend._driver.client.list_graphs = AsyncMock(
@@ -531,7 +441,7 @@ class TestUnreachableDriverPropagates:
         with pytest.raises(redis.exceptions.ConnectionError):
             await backend.ensure_indices(group_id='test')
 
-        assert _issued(graph) == []
+        assert statements_written(graph) == []
 
 
 class TestAlphaShapeErrorsFailClosed:
@@ -559,7 +469,7 @@ class TestAlphaShapeErrorsFailClosed:
         with pytest.raises(IndexHeaderShapeError):
             await backend.ensure_indices(group_id='test')
 
-        assert _issued(graph) == [], 'nothing may be written on an undetermined state'
+        assert statements_written(graph) == [], 'nothing may be written on an undetermined state'
 
     @pytest.mark.asyncio
     async def test_a_malformed_record_propagates_rather_than_reading_as_absent(
@@ -575,7 +485,7 @@ class TestAlphaShapeErrorsFailClosed:
         with pytest.raises(IndexRecordShapeError):
             await backend.ensure_indices(group_id='test')
 
-        assert _issued(graph) == []
+        assert statements_written(graph) == []
 
 
 class TestStructuredLogging:
@@ -593,10 +503,10 @@ class TestStructuredLogging:
     async def test_warning_names_the_failing_statement_and_its_error(
         self, mock_config, make_backend, make_graph_mock, caplog,
     ):
-        missing = expected_index_set() - _TRAP_PRESENT
+        missing = expected_index_set() - TRAP_PRESENT
         doomed_statement, _specs = plan_index_statements(missing)[0]
 
-        graph = make_graph_mock(_rows_for(_TRAP_PRESENT), header=LIVE_HEADER)
+        graph = make_graph_mock(rows_for(TRAP_PRESENT), header=LIVE_HEADER)
 
         async def _query(statement, *args, **kwargs):
             if statement == doomed_statement:
@@ -620,7 +530,7 @@ class TestStructuredLogging:
     async def test_info_reports_the_structured_counts_when_something_changed(
         self, mock_config, make_backend, make_graph_mock, caplog,
     ):
-        graph = make_graph_mock(_rows_for(_TRAP_PRESENT), header=LIVE_HEADER)
+        graph = make_graph_mock(rows_for(TRAP_PRESENT), header=LIVE_HEADER)
         backend = make_backend(mock_config)
         _wire(backend, graph)
 
@@ -652,7 +562,7 @@ class TestStructuredLogging:
         self, mock_config, make_backend, make_graph_mock, caplog,
     ):
         """INV-2: a no-op must not emit a line an operator would read as "provisioned"."""
-        graph = make_graph_mock(_rows_for(expected_index_set()), header=LIVE_HEADER)
+        graph = make_graph_mock(rows_for(expected_index_set()), header=LIVE_HEADER)
         backend = make_backend(mock_config)
         _wire(backend, graph)
 
@@ -667,44 +577,6 @@ class TestStructuredLogging:
             r for r in caplog.records
             if r.name == self._LOGGER and r.levelno >= logging.INFO
         ] == []
-
-    @pytest.mark.asyncio
-    async def test_the_deliberate_no_op_claims_nothing_at_any_level(
-        self, mock_config, make_backend, caplog,
-    ):
-        """INV-2: ``_ensure_indices`` does nothing, so it must claim nothing — at ANY level.
-
-        ``build_indices_and_constraints`` is a ``pass`` override (D4), so this
-        method provisions no index.  A log line emitted after it would be a
-        false positive whatever it said, and DEBUG is the worst place to say it:
-        below the service's INFO level it is neither a positive nor a negative
-        signal.  So the property asserted here is the ABSENCE of any record from
-        this module's logger, with NO claim about wording — a differently-phrased
-        re-addition is exactly as wrong, and a substring check would wave it
-        through.
-
-        Non-vacuity matters as much as the absence: the ``_indexed_graphs`` early
-        return would let this pass with the body never executing, so the awaited
-        build and the memoised group_id are asserted too.
-
-        HAZARD: the driver is a bare mock.  Constructing a real ``FalkorDriver``
-        (or ``_MultiTenantFalkorDriver``) here would fire-and-forget a genuine
-        index build under the running loop.
-        """
-        driver = MagicMock()
-        driver.build_indices_and_constraints = AsyncMock(return_value=None)
-        backend = make_backend(mock_config)
-        backend._driver_for = MagicMock(return_value=driver)
-        assert 'test' not in backend._indexed_graphs, (
-            'the memoisation set must start empty or the body never runs'
-        )
-
-        with caplog.at_level(logging.DEBUG, logger=self._LOGGER):
-            await backend._ensure_indices('test')
-
-        assert [r for r in caplog.records if r.name == self._LOGGER] == []
-        assert driver.build_indices_and_constraints.await_count == 1
-        assert 'test' in backend._indexed_graphs
 
 
 class TestProvisioningHazardGuards:

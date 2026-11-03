@@ -1,0 +1,80 @@
+{"attempts": 4, "day": "2026-09-01", "error_class": "Query timed out", "operation": "add_memory", "success": 0, "writes": 4}
+{"attempts": 37, "day": "2026-09-01", "error_class": null, "operation": "add_memory", "success": 1, "writes": 37}
+{"attempts": 1, "day": "2026-09-02", "error_class": "Query timed out", "operation": "add_memory", "success": 0, "writes": 1}
+{"attempts": 5, "day": "2026-09-02", "error_class": null, "operation": "add_memory", "success": 1, "writes": 5}
+{"attempts": 5, "day": "2026-09-03", "error_class": "Query timed out", "operation": "add_memory", "success": 0, "writes": 4}
+{"attempts": 41, "day": "2026-09-03", "error_class": null, "operation": "add_memory", "success": 1, "writes": 41}
+{"attempts": 15, "day": "2026-09-04", "error_class": null, "operation": "add_memory", "success": 1, "writes": 15}
+{"attempts": 1, "day": "2026-09-05", "error_class": null, "operation": "add_memory", "success": 1, "writes": 1}
+{"attempts": 4, "day": "2026-09-06", "error_class": null, "operation": "add_memory", "success": 1, "writes": 4}
+{"attempts": 1, "day": "2026-09-07", "error_class": "node 17f33152-654c-428e-88b9-7c18d10c6a28 not found", "operation": "add_episode", "success": 0, "writes": 1}
+{"attempts": 7, "day": "2026-09-07", "error_class": null, "operation": "add_memory", "success": 1, "writes": 7}
+{"attempts": 18, "day": "2026-09-08", "error_class": null, "operation": "add_memory", "success": 1, "writes": 18}
+{"attempts": 3, "day": "2026-09-09", "error_class": "Query timed out", "operation": "add_memory", "success": 0, "writes": 2}
+{"attempts": 32, "day": "2026-09-09", "error_class": null, "operation": "add_memory", "success": 1, "writes": 31}
+{"attempts": 1, "day": "2026-09-10", "error_class": "Query timed out", "operation": "add_memory", "success": 0, "writes": 1}
+{"attempts": 13, "day": "2026-09-10", "error_class": null, "operation": "add_memory", "success": 1, "writes": 13}
+{"attempts": 11, "day": "2026-09-11", "error_class": "Query timed out", "operation": "add_memory", "success": 0, "writes": 6}
+{"attempts": 36, "day": "2026-09-11", "error_class": null, "operation": "add_memory", "success": 1, "writes": 36}
+{"attempts": 14, "day": "2026-09-12", "error_class": null, "operation": "add_memory", "success": 1, "writes": 14}
+{"attempts": 1, "day": "2026-09-13", "error_class": null, "operation": "add_memory", "success": 1, "writes": 1}
+{"attempts": 1, "day": "2026-09-14", "error_class": "Query timed out", "operation": "add_memory", "success": 0, "writes": 1}
+{"attempts": 10, "day": "2026-09-14", "error_class": null, "operation": "add_memory", "success": 1, "writes": 10}
+{"attempts": 1, "day": "2026-09-15", "error_class": "Query timed out", "operation": "add_memory", "success": 0, "writes": 1}
+{"attempts": 10, "day": "2026-09-15", "error_class": null, "operation": "add_memory", "success": 1, "writes": 10}
+{"attempts": 4, "day": "2026-09-16", "error_class": "Query timed out", "operation": "add_memory", "success": 0, "writes": 3}
+{"attempts": 32, "day": "2026-09-16", "error_class": null, "operation": "add_memory", "success": 1, "writes": 32}
+{"attempts": 2, "day": "2026-09-17", "error_class": "Query timed out", "operation": "add_memory", "success": 0, "writes": 2}
+{"attempts": 28, "day": "2026-09-17", "error_class": null, "operation": "add_memory", "success": 1, "writes": 28}
+{"attempts": 4, "day": "2026-09-18", "error_class": "Query timed out", "operation": "add_memory", "success": 0, "writes": 4}
+{"attempts": 18, "day": "2026-09-18", "error_class": null, "operation": "add_memory", "success": 1, "writes": 18}
+{"attempts": 20, "day": "2026-09-19", "error_class": null, "operation": "add_memory", "success": 1, "writes": 20}
+{"attempts": 2, "day": "2026-09-20", "error_class": "Query timed out", "operation": "add_memory", "success": 0, "writes": 2}
+{"attempts": 14, "day": "2026-09-20", "error_class": null, "operation": "add_memory", "success": 1, "writes": 14}
+{"attempts": 3, "day": "2026-09-21", "error_class": "Query timed out", "operation": "add_memory", "success": 0, "writes": 3}
+{"attempts": 41, "day": "2026-09-21", "error_class": null, "operation": "add_memory", "success": 1, "writes": 41}
+{"attempts": 1, "day": "2026-09-22", "error_class": "Query timed out", "operation": "add_memory", "success": 0, "writes": 1}
+{"attempts": 27, "day": "2026-09-22", "error_class": null, "operation": "add_memory", "success": 1, "writes": 27}
+{"attempts": 47, "day": "2026-09-23", "error_class": null, "operation": "add_memory", "success": 1, "writes": 47}
+{"attempts": 2, "day": "2026-09-24", "error_class": "ResponseError", "operation": "add_memory", "success": 0, "writes": 1}
+{"attempts": 7, "day": "2026-09-24", "error_class": null, "operation": "add_memory", "success": 1, "writes": 7}
+{"attempts": 5, "day": "2026-09-25", "error_class": "ResponseError", "operation": "add_memory", "success": 0, "writes": 4}
+{"attempts": 32, "day": "2026-09-25", "error_class": null, "operation": "add_memory", "success": 1, "writes": 32}
+{"attempts": 3, "day": "2026-09-26", "error_class": "ResponseError", "operation": "add_memory", "success": 0, "writes": 3}
+{"attempts": 11, "day": "2026-09-26", "error_class": null, "operation": "add_memory", "success": 1, "writes": 11}
+{"attempts": 17, "day": "2026-09-27", "error_class": null, "operation": "add_memory", "success": 1, "writes": 17}
+{"attempts": 24, "day": "2026-09-28", "error_class": null, "operation": "add_memory", "success": 1, "writes": 24}
+{"attempts": 1, "day": "2026-09-29", "error_class": "CancelledError", "operation": "add_memory", "success": 0, "writes": 1}
+{"attempts": 2, "day": "2026-09-29", "error_class": "ResponseError", "operation": "add_memory", "success": 0, "writes": 2}
+{"attempts": 38, "day": "2026-09-29", "error_class": null, "operation": "add_memory", "success": 1, "writes": 38}
+{"attempts": 2, "day": "2026-09-30", "error_class": "ResponseError", "operation": "add_memory", "success": 0, "writes": 2}
+{"attempts": 36, "day": "2026-09-30", "error_class": null, "operation": "add_memory", "success": 1, "writes": 36}
+{"attempts": 1, "day": "2026-10-01", "error_class": "APITimeoutError", "operation": "add_memory", "success": 0, "writes": 1}
+{"attempts": 3, "day": "2026-10-01", "error_class": "CancelledError", "operation": "add_memory", "success": 0, "writes": 3}
+{"attempts": 7, "day": "2026-10-01", "error_class": "ResponseError", "operation": "add_memory", "success": 0, "writes": 6}
+{"attempts": 1858, "day": "2026-10-01", "error_class": null, "operation": "add_memory", "success": 1, "writes": 1858}
+{"attempts": 11, "day": "2026-10-02", "error_class": "CancelledError", "operation": "add_memory", "success": 0, "writes": 11}
+{"attempts": 2270, "day": "2026-10-02", "error_class": "ResponseError", "operation": "add_memory", "success": 0, "writes": 443}
+{"attempts": 1740, "day": "2026-10-02", "error_class": null, "operation": "add_memory", "success": 1, "writes": 1738}
+{"attempts": 12, "day": "2026-10-03", "error_class": "CancelledError", "operation": "add_memory", "success": 0, "writes": 12}
+{"attempts": 134, "day": "2026-10-03", "error_class": "RateLimitError", "operation": "add_memory", "success": 0, "writes": 29}
+{"attempts": 6206, "day": "2026-10-03", "error_class": "ResponseError", "operation": "add_memory", "success": 0, "writes": 1243}
+{"attempts": 2, "day": "2026-10-04", "error_class": "APITimeoutError", "operation": "add_memory", "success": 0, "writes": 2}
+{"attempts": 252, "day": "2026-10-04", "error_class": "BusyLoadingError", "operation": "add_memory", "success": 0, "writes": 160}
+{"attempts": 11, "day": "2026-10-04", "error_class": "CancelledError", "operation": "add_memory", "success": 0, "writes": 10}
+{"attempts": 50, "day": "2026-10-04", "error_class": "ConnectionError", "operation": "add_memory", "success": 0, "writes": 50}
+{"attempts": 2045, "day": "2026-10-04", "error_class": "RateLimitError", "operation": "add_memory", "success": 0, "writes": 472}
+{"attempts": 7, "day": "2026-10-04", "error_class": "ResponseError", "operation": "add_memory", "success": 0, "writes": 7}
+{"attempts": 2495, "day": "2026-10-04", "error_class": null, "operation": "add_memory", "success": 1, "writes": 2495}
+{"attempts": 1, "day": "2026-10-05", "error_class": "CancelledError", "operation": "add_memory", "success": 0, "writes": 1}
+{"attempts": 3, "day": "2026-10-05", "error_class": "ResponseError", "operation": "add_memory", "success": 0, "writes": 3}
+{"attempts": 717, "day": "2026-10-05", "error_class": null, "operation": "add_memory", "success": 1, "writes": 717}
+{"attempts": 1, "day": "2026-10-06", "error_class": "CancelledError", "operation": "add_memory", "success": 0, "writes": 1}
+{"attempts": 12, "day": "2026-10-06", "error_class": "ResponseError", "operation": "add_memory", "success": 0, "writes": 8}
+{"attempts": 389, "day": "2026-10-06", "error_class": null, "operation": "add_memory", "success": 1, "writes": 389}
+{"attempts": 3, "day": "2026-10-07", "error_class": "CancelledError", "operation": "add_memory", "success": 0, "writes": 3}
+{"attempts": 16, "day": "2026-10-07", "error_class": "ResponseError", "operation": "add_memory", "success": 0, "writes": 14}
+{"attempts": 823, "day": "2026-10-07", "error_class": null, "operation": "add_memory", "success": 1, "writes": 823}
+{"attempts": 9, "day": "2026-10-08", "error_class": "APITimeoutError", "operation": "add_memory", "success": 0, "writes": 4}
+{"attempts": 9, "day": "2026-10-08", "error_class": "ResponseError", "operation": "add_memory", "success": 0, "writes": 9}
+{"attempts": 176, "day": "2026-10-08", "error_class": null, "operation": "add_memory", "success": 1, "writes": 176}

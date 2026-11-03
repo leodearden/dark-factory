@@ -9,7 +9,8 @@ widening past "command parsing": the four marker assertions were about to exist
 in a second hand-written copy for exactly the reason the five command-parsing
 copies below did, and the same rule applies to both. Everything in the WHY IT
 EXISTS and IMPORT ME sections is written about the command helpers, but is meant
-about this module.
+about this module. Since task 5769 it also holds :func:`marked_body`, the
+slug-keyed form of that extraction.
 
 WHY IT EXISTS. A trio of command-parsing helpers — pick the ``&&`` segment that
 invokes the checker, extract that checker's positional targets, decide whether a
@@ -50,19 +51,22 @@ degrades to a guard that passes vacuously. If a caller needs behaviour this
 module does not have, add a PARAMETER here rather than a variant there —
 ``path_anchor`` (task 3883) is what that looks like in practice.
 
-THIS MODULE PARSES; IT DOES NOT DECIDE. The five call sites deliberately do not
-agree on semantics, and unifying them would be a behaviour change at four of
-them. So everything that is POLICY stays with its caller and arrives as an
-argument: which flags consume the following token (``_RUFF_FLAGS_TAKING_A_VALUE``
-in the CONTRIBUTING guard, ``_PYTEST_VALUE_FLAGS`` in the skills guard, none in
-the other three), which flag prefixes narrow a target set
-(``_NARROWING_FLAGS``), whether flag scanning covers the whole segment or only
-the checker's own post-anchor arguments, and the skills guard's
-``--directory`` base resolution / ``posixpath.normpath`` / target-EXISTS layer.
-What is shared is only the mechanics of reading a shell command. ``path_anchor``
-is NOT an exception to this: it records how the checker was SPELLED on the
-command line, which is a fact about the text being parsed, not a policy about
-the checker.
+THIS MODULE PARSES; IT DOES NOT DECIDE. This module's callers deliberately do
+not agree on semantics, and unifying them would change behaviour at every
+caller whose choice lost. So everything that is POLICY stays with its caller and
+arrives as an argument: whether to pass a value-flag set, and which one
+(:func:`positional_targets`' census lists every call site's choice), which flag
+prefixes narrow a target set (``_NARROWING_FLAGS``), whether flag scanning
+covers the whole segment or only the checker's own post-anchor arguments, and
+the skills guard's ``--directory`` base resolution / ``posixpath.normpath`` /
+target-EXISTS layer.
+What is shared is only the mechanics of reading a shell command and the facts
+those mechanics need. ``PYTEST_VALUE_FLAGS`` is such a fact — which pytest
+options take a SEPARATE value token is a property of pytest's CLI, so it lives
+here beside the ``PYTEST`` keyword (task 6172) — while PASSING it stays the
+caller's choice. ``path_anchor`` is NOT an exception to this either: it records
+how the checker was SPELLED on the command line, which is a fact about the text
+being parsed, not a policy about the checker.
 
 Importable from ``tests/scripts/test_*.py`` only because
 ``tests/scripts/conftest.py`` puts this directory on ``sys.path`` — pytest's
@@ -100,6 +104,18 @@ from orchestrator import verify_cmd
 RUFF = "ruff check"
 PYRIGHT = "pyright"
 PYTEST = "pytest"
+
+# The pytest options whose value is a SEPARATE token, so a parser handed this set
+# does not read that value as a target. A fact about pytest's CLI, not a policy;
+# callers still choose whether to pass it. The ``--flag=value`` spelling needs no
+# entry. Keep it CLOSED to value-taking flags: a boolean listed here would
+# swallow the real target that follows it.
+PYTEST_VALUE_FLAGS = frozenset({
+    "-c", "-k", "-m", "-n", "-o", "-p", "-r", "-W",
+    "--basetemp", "--color", "--deselect", "--dist", "--durations", "--ignore",
+    "--ignore-glob", "--import-mode", "--junitxml", "--log-level", "--maxfail",
+    "--rootdir", "--tb", "--timeout",
+})
 
 
 def _where(label: str | None, fallback: str) -> str:
@@ -194,9 +210,10 @@ def anchor_split(
 
     The ANCHOR is the last whitespace-separated token of *keyword*: ``check`` for
     ``ruff check``, ``pyright`` for ``pyright``, ``pytest`` for ``pytest``. One
-    rule reproduces every anchor the five callers use, two of which spelled it as
-    a hand-rolled ``tokens.index("check")`` and a third as a ``shlex``-tokenised
-    marker window with a raw ``str.endswith`` fallback (task 3883).
+    rule reproduces every anchor its callers use; of the five hand-maintained
+    copies it replaced, two spelled it as a hand-rolled ``tokens.index("check")``
+    and a third as a ``shlex``-tokenised marker window with a raw
+    ``str.endswith`` fallback (task 3883).
 
     THE ANCHOR BELONGS TO NEITHER HALF, and the split is the whole point.
     Everything BEFORE it is the WRAPPER's: in
@@ -297,48 +314,72 @@ def positional_targets(
     ``'scripts/' in cmd`` for both.
 
     *value_flags* is the caller's POLICY, and its default is the reason one
-    implementation serves five call sites unchanged. With it EMPTY, ``consume``
+    implementation serves every call site unchanged. With it EMPTY, ``consume``
     can never become True and the loop below reduces byte-for-byte to
-    ``[t for t in post if not t.startswith('-')]`` — exactly what
-    ``test_root_lint_covers_nonmember_py.py``, ``test_scripts_module_config.py``
-    and ``test_fallback_verify_config.py`` do today, phantom flag values
-    included. Supplying a set (the CONTRIBUTING guard's
-    ``_RUFF_FLAGS_TAKING_A_VALUE``, the skills guard's ``_PYTEST_VALUE_FLAGS``)
-    drops the following token instead. The
+    ``[t for t in post if not t.startswith('-')]``, phantom flag values
+    included. Supplying a set drops the following token instead. The
     ``--flag=value`` spelling needs no entry either way: ``shlex`` keeps it as
-    one token and the ``-`` prefix drops it whole.
+    one token and the ``-`` prefix drops it whole. Which call site passes which
+    set is the census below, counted per call site rather than per file: one
+    file can pass a set at one site and none at another.
 
     WHAT THIS GUARANTEES, stated no more strongly than it holds: every returned
     token was a positional argument after the anchor. It is NOT a proof that no
     unlisted value-taking flag exists — an unknown one still donates its value as
     a PHANTOM target, and nothing here can tell that phantom from a real path.
 
+    THE CALLER CENSUS. Each row is one call site: the set it passes, then what
+    it asserts of the returned targets.
+
+      * ``test_root_lint_covers_nonmember_py.py::_ruff_targets`` — none; each
+        EXISTS.
+      * ``test_fallback_verify_config.py::_lint_leg_targets`` — none; each
+        EXISTS.
+      * ``test_hook_ruff_targets_drift.py::_gate_ruff_targets`` — none; the
+        list EQUALS the hook's ``RUFF_TARGETS``.
+      * ``test_hook_magicmock_test_dirs_drift.py::_gate_magicmock_test_dirs``
+        — none, which is that checker's exact set; the list EQUALS the hook's
+        ``MAGICMOCK_TEST_DIRS``.
+      * ``test_scripts_module_config.py::_targets`` — none for the ruff and
+        pyright legs, which check MEMBERSHIP; its own ``_PYTEST_VALUE_FLAGS``
+        for the pytest leg via ``_pytest_targets``, which checks MEMBERSHIP
+        and EQUALITY.
+      * ``test_contributing_lint_command_drift.py::_ruff_targets`` —
+        ``_RUFF_FLAGS_TAKING_A_VALUE``; each EXISTS.
+      * ``test_skills_module_config_decision.py::_pytest_collected_dirs`` —
+        ``PYTEST_VALUE_FLAGS``; each EXISTS.
+      * ``test_fallback_verify_config.py::_fleet_pytest_suite_names`` —
+        ``PYTEST_VALUE_FLAGS``; the suite keys EQUAL its measured tables.
+      * ``test_member_scripts_type_gate.py``'s one inline call —
+        ``_PYRIGHT_VALUE_FLAGS``; COVERAGE via :func:`covers`.
+
     A PHANTOM IS NOT UNIFORMLY HARMLESS, and which callers can tolerate one does
-    NOT partition by which ones supply a set. Against a COVERAGE check a phantom
-    is inert: :func:`covers` over an extra target can only ever pass spuriously,
-    never fail. But a caller that ALSO asserts each target exists on disk reads
-    the list for exactly what a phantom adds, and goes red naming a flag value as
-    a missing path — a misleading diagnosis on a change that broke nothing.
-    Measured across the five callers: FOUR assert existence
-    (``test_root_lint_covers_nonmember_py.py``,
-    ``test_contributing_lint_command_drift.py``,
-    ``test_skills_module_config_decision.py``,
-    ``test_fallback_verify_config.py``) while only two of those four supply a
-    set; ``test_scripts_module_config.py`` supplies none and asserts no
-    existence. The remaining exposure is therefore root_lint's AND fallback's,
-    and each is recorded on that guard's own extractor —
-    ``test_root_lint_covers_nonmember_py.py::_ruff_targets`` and
-    ``test_fallback_verify_config.py::_lint_leg_targets`` — rather than papered
-    over here.
+    NOT partition by which ones supply a set. Against a COVERAGE or MEMBERSHIP
+    check a phantom is inert: :func:`covers` over an extra target can only ever
+    pass spuriously, never fail. But a check that each target EXISTS on disk, or
+    that the list EQUALS a second copy, reads the list for exactly what a
+    phantom adds, and goes red naming a flag value as a path — a misleading
+    diagnosis on a change that broke nothing. A set narrows that exposure to
+    UNLISTED flags only. Four call sites assert existence, and only two of
+    those four supply a set at that call site:
+    ``test_fallback_verify_config.py`` passes one at
+    ``_fleet_pytest_suite_names``, which asserts no existence, and none at
+    ``_lint_leg_targets``, which does. The remaining exposure is therefore
+    every set-less EXISTS or EQUALS row whose checker takes a value flag at
+    all. The two set-less EXISTS rows and the hook's ruff EQUALS row each
+    record it on their own extractor rather than papering over it here; the
+    hook's magicmock EQUALS row records on its extractor why that checker has
+    none.
 
     Discarding unrecognised tokens instead is not an option: that would silently
     shrink the target list and re-open the false-pass hazard the parsing exists
     to close. Widening the set is the caller's call, not this module's.
 
-    *path_anchor* is passed straight through to :func:`anchor_split`, for the
-    fifth caller ``test_fallback_verify_config.py::_lint_leg_targets`` (task
-    3883), whose ``check_bare_magicmock_config.py`` leg names the checker by
-    PATH. It is ORTHOGONAL to *value_flags*, and reading it as another policy
+    *path_anchor* is passed straight through to :func:`anchor_split`, for
+    callers reading the ``check_bare_magicmock_config.py`` leg, which names its
+    checker by PATH (first needed by
+    ``test_fallback_verify_config.py::_lint_leg_targets``, task 3883). It is
+    ORTHOGONAL to *value_flags*, and reading it as another policy
     knob would be a category error: *value_flags* is per-checker POLICY (which
     flags eat the following token — a fact about the checker's CLI), while
     *path_anchor* is a fact about how the checker was SPELLED on this particular
@@ -543,16 +584,6 @@ def marked_span(
     is only the four-assertion marker mechanic. *task* is the filing this guard
     belongs to, carried into every message so a human meets the rationale rather
     than a bare mismatch.
-
-    NOT YET THE SOLE HOME. ``test_contributing_lint_command_drift.py``'s
-    ``_documented_lint_command`` is still a private copy of these four
-    assertions: that file was outside task 4108's lock set, so migrating it would
-    have widened that task's concurrency footprint. The swap is mechanical —
-    pass its ``_MARKED_LINT_COMMAND`` pattern, its two marker literals and task
-    3558 — and until it happens, a change to the assertion mechanics here must be
-    mirrored there by hand. Filed as follow-up; recorded here rather than left
-    implicit because an un-migrated copy that nobody has written down is exactly
-    how the five copies this module replaced came to drift.
     """
     begin_count = text.count(begin)
     assert begin_count == 1, (
@@ -583,3 +614,28 @@ def marked_span(
         f"(task {task})"
     )
     return spans[0]
+
+
+_AFTER_THE_OPENING_COMMENT = re.compile(r"\A.*?-->(.*)\Z", re.DOTALL)
+
+
+def marked_body(text: str, *, slug: str, source: str, label: str, task: str) -> str:
+    """The body of the ``<!-- {slug}:begin ... -->`` / ``<!-- {slug}:end -->`` span.
+
+    The opener is matched as a PREFIX, not as a whole comment, so it may carry
+    its own prose; the body starts where that comment closes. Every malformed
+    shape raises through :func:`marked_span`: an unterminated opener and
+    inverted markers both leave no pattern match, and a blank body fails its
+    non-blank assertion. The body is returned verbatim: comment and whitespace
+    policy belong to the caller.
+    """
+    return marked_span(
+        text,
+        begin=f"<!-- {slug}:begin",
+        end=f"<!-- {slug}:end -->",
+        pattern=_AFTER_THE_OPENING_COMMENT,
+        what="body after the closed opening-marker comment",
+        source=source,
+        label=label,
+        task=task,
+    )

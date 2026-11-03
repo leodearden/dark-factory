@@ -16,8 +16,6 @@ four-character escape text is what the source holds.
 """
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 
 from shared.toolcall_markup import (
@@ -109,13 +107,3 @@ def test_canonical_opener_escapes_only_its_leading_bracket():
 
     assert result == _ESCAPE + CANONICAL_OPENER_PREFIX[1:] + '"description">'
     assert detect(result) is None
-
-
-def test_this_module_spells_no_raw_envelope_literal():
-    """This file's own SOURCE must never contain a raw ``chr(60)`` + ``/``."""
-    needle = chr(60) + '/'
-    source = Path(__file__).read_text(encoding='utf-8')
-    assert needle not in source, (
-        'A raw envelope literal was written into this test file. Spell it with '
-        'the \\x3c escape instead — see this module\'s docstring for why.'
-    )

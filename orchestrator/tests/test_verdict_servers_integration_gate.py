@@ -55,7 +55,6 @@ Scenario → test class map:
 
 from __future__ import annotations
 
-import asyncio
 import json
 from collections.abc import Callable
 from pathlib import Path
@@ -65,14 +64,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from _workflow_helpers import (
     AgentStub,
-    FakeBriefing,
-    FakeMcp,
     _build_workflow,
     _init_repo,
+    agent_side_artifacts,
 )
 from escalation.models import Escalation
 from shared.cli_invoke import (
-    _REAL_BUILTIN_TOOLS_DENYLIST,
     _SCHEMA_OUTPUT_TOOL,
     AgentResult,
     _SubprocessResult,
@@ -89,12 +86,11 @@ from orchestrator.steward import TaskSteward
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
 # ---------------------------------------------------------------------------
-# Fixtures — file-local, mirroring test_workflow_e2e.py:147-191. A REAL
-# OrchestratorConfig is required (not _workflow_helpers._make's MagicMock)
-# because the real _invoke calls resolve_route(route_inputs, self.config),
-# and the real _pre_triage_suggestions calls resolve_and_record_route(...,
-# config=self.config, ...) — both do real attribute/membership reads against
-# config.routing.* that a MagicMock can't satisfy.
+# Fixtures — file-local, mirroring test_workflow_e2e.py::git_repo, ::config,
+# ::git_ops and ::task_assignment. The WORKFLOW half needs a REAL
+# OrchestratorConfig (not _workflow_helpers._make's MagicMock): the real
+# _invoke calls resolve_route(route_inputs, self.config). The steward half
+# uses conftest.py::make_steward.
 # ---------------------------------------------------------------------------
 
 
@@ -103,7 +99,7 @@ def git_repo(tmp_path: Path) -> Path:
     """A bare-minimum git repo with an initial commit."""
     repo = tmp_path / 'repo'
     repo.mkdir()
-    asyncio.run(_init_repo(repo))
+    _init_repo(repo)
     return repo
 
 
@@ -150,19 +146,6 @@ def task_assignment() -> TaskAssignment:
 # ---------------------------------------------------------------------------
 
 
-def _artifacts_for(worktree: Path) -> TaskArtifacts:
-    """Real on-disk TaskArtifacts at the derived .task-meta sibling root for
-    *worktree* — the SAME root ``_invoke``'s ``_inject_verdict_tools_mcp``
-    derives (via ``_meta_root_for_worktree``) and ``TaskWorkflow.artifacts`` /
-    ``TaskSteward``'s own internal ``TaskArtifacts`` read from. Mirrors
-    ``AgentStub``'s explicit-meta_root construction in ``_workflow_helpers.py``
-    (rather than relying on the autouse ``_derive_meta_root_like_production``
-    shim, which exists for legacy bare-``TaskArtifacts(cwd)`` call sites) so
-    this module is self-contained.
-    """
-    return TaskArtifacts(worktree, TaskArtifacts.meta_root_for(worktree.parent, worktree.name))
-
-
 def _seed_workflow_artifacts(
     workflow: TaskWorkflow, *, tmp_path: Path, task_id: str = '42',
 ) -> TaskArtifacts:
@@ -178,7 +161,7 @@ def _seed_workflow_artifacts(
     """
     worktree = tmp_path / 'wt'
     worktree.mkdir(parents=True, exist_ok=True)
-    artifacts = _artifacts_for(worktree)
+    artifacts = TaskArtifacts.for_task(worktree, task_id)
     artifacts.init(task_id, 'Verdict boundary task', 'desc', base_commit='oldbase')
     workflow.artifacts = artifacts
     workflow.worktree = worktree
@@ -226,9 +209,7 @@ def _setup_judge_workflow(
 
     ``get_diff_from_base`` is mocked to return a non-empty diff (mirrors
     ``test_judge_completion_verdict.py``'s ``_setup``) so the judge is
-    actually invoked rather than empty-diff-skipped — ``base_commit='oldbase'``
-    is stamped at ``artifacts.init()`` time (via ``_seed_workflow_artifacts``),
-    so ``_run_completion_judge`` takes the ``get_diff_from_base`` branch.
+    actually invoked rather than empty-diff-skipped.
     """
     workflow, _scheduler = _build_workflow(config, git_ops, task_assignment, AgentStub())
     _seed_workflow_artifacts(workflow, tmp_path=tmp_path)
@@ -264,7 +245,7 @@ def _fake_invoke_writes_merger_verdict(
 
     async def _fake(*, cwd: Path, **kwargs: Any) -> AgentResult:
         if blocked is not None:
-            _artifacts_for(cwd).write_verdict(
+            agent_side_artifacts(cwd).write_verdict(
                 'merger', _envelope('merger', session_id, {'blocked': blocked, 'reason': reason}),
             )
         return AgentResult(success=success, output=output)
@@ -289,7 +270,7 @@ def _fake_invoke_writes_reviewer_verdict(
     async def _fake(*, cwd: Path, **kwargs: Any) -> AgentResult:
         if verdict is not None:
             _submit_review_verdict(
-                _artifacts_for(cwd), role_name, session_id, role_name, verdict,
+                agent_side_artifacts(cwd), role_name, session_id, role_name, verdict,
                 issues or [], summary,
             )
         return AgentResult(success=success, output=output, timed_out=timed_out)
@@ -310,7 +291,7 @@ def _fake_invoke_writes_judge_verdict(
 
     async def _fake(*, cwd: Path, **kwargs: Any) -> AgentResult:
         if artifact is not None:
-            _artifacts_for(cwd).write_verdict('judge', _envelope('judge', session_id, artifact))
+            agent_side_artifacts(cwd).write_verdict('judge', _envelope('judge', session_id, artifact))
         return AgentResult(success=success, output=output, structured_output=structured_output)
 
     return _fake
@@ -321,19 +302,15 @@ def _fake_invoke_writes_triage_verdict(
     skipped: list | None = None, proposed_task_groups: list | None = None,
     success: bool = True, output: str = '', session_id: str = 'sid',
 ) -> Callable[..., Any]:
-    """Closes over *worktree* explicitly rather than reading ``cwd`` from
-    kwargs: ``_pre_triage_suggestions`` invokes with
-    ``cwd=self.config.project_root`` (so the agent can browse the whole repo)
-    but derives its verdict meta_root from ``self.worktree`` — the two
-    deliberately differ (steward.py:727/760/796), so the fake must target the
-    worktree-derived root the steward actually reads back from, not the
-    invocation cwd.
+    """Closes over *worktree* explicitly: the fake must write to the roots
+    ``_pre_triage_suggestions`` derives from ``self.worktree`` and reads back
+    from (``TaskArtifacts.for_task``), whatever cwd the invocation carries.
     """
 
     async def _fake(**kwargs: Any) -> AgentResult:
         if write:
             _submit_triage(
-                _artifacts_for(worktree), 'triage', session_id,
+                agent_side_artifacts(worktree), 'triage', session_id,
                 accepted or [], skipped or [], proposed_task_groups or [],
             )
         return AgentResult(success=success, output=output)
@@ -355,26 +332,17 @@ def _make_triage_escalation(
     )
 
 
-def _build_steward_for_triage(
-    config: OrchestratorConfig, worktree: Path, *, task_id: str = '42',
-) -> TaskSteward:
-    """A real TaskSteward against a real on-disk meta-root (pre-initialized
-    so _pre_triage_suggestions's "meta-root missing" diagnostic branch never
-    fires — mirrors production, where TaskWorkflow._setup always creates it
-    first). usage_gate=None (default) takes invoke_with_cap_retry's no-gate
-    fast path — a single invocation, no cap-retry machinery.
+@pytest.fixture
+def triage_steward(make_steward) -> TaskSteward:
+    """conftest's ``make_steward`` steward, its .task-meta roots pre-initialised
+    as ``TaskWorkflow._setup`` does in production, so
+    ``_pre_triage_suggestions``'s "artifact root missing" branch never fires.
     """
-    worktree.mkdir(parents=True, exist_ok=True)
-    _artifacts_for(worktree).init(task_id, 'Verdict boundary task', 'exercise triage boundary')
-    return TaskSteward(
-        task_id=task_id,
-        task={'id': task_id, 'title': 'Verdict boundary task', 'description': 'd'},
-        worktree=worktree,
-        config=config,
-        mcp=FakeMcp(),  # type: ignore[arg-type]
-        escalation_queue=MagicMock(),
-        briefing=FakeBriefing(),  # type: ignore[arg-type]
+    steward = make_steward()
+    TaskArtifacts.for_task(steward.worktree, steward.task_id).init(
+        steward.task_id, steward.task['title'], steward.task['description'],
     )
+    return steward
 
 
 # ---------------------------------------------------------------------------
@@ -776,20 +744,18 @@ class TestTriageBoundary:
     ]
 
     async def test_written_verdict_produces_modified_pretriaged_escalation(
-        self, config, tmp_path, monkeypatch,
+        self, triage_steward, monkeypatch,
     ):
         """(10) fake writes verdicts/triage.json via submit_triage =>
         _pre_triage_suggestions returns a MODIFIED escalation whose detail
         carries the pre-triaged markdown (accepted/skipped counts, proposed
         task groups) — extract_triage_verdict consumed the real artifact.
         """
-        worktree = tmp_path / 'wt'
-        steward = _build_steward_for_triage(config, worktree)
         escalation = _make_triage_escalation(self._SUGGESTIONS)
         monkeypatch.setattr(
             'orchestrator.steward.invoke_agent',
             _fake_invoke_writes_triage_verdict(
-                worktree=worktree,
+                worktree=triage_steward.worktree,
                 accepted=[{
                     'index': 0, 'suggestion': 'Add test for X', 'reason': 'missing coverage',
                     'files': ['orchestrator/foo.py'], 'proposed_task_title': 'Add coverage for X',
@@ -804,7 +770,7 @@ class TestTriageBoundary:
             ),
         )
 
-        result = await steward._pre_triage_suggestions(escalation)
+        result = await triage_steward._pre_triage_suggestions(escalation)
 
         assert result is not escalation
         assert '## Pre-Triaged Results' in result.detail
@@ -812,7 +778,7 @@ class TestTriageBoundary:
         assert '1 accepted, 1 skipped' in result.summary
 
     async def test_absent_verdict_falls_back_to_original_escalation(
-        self, config, tmp_path, monkeypatch,
+        self, triage_steward, monkeypatch,
     ):
         """(11) fake writes NO verdict (cleared slot) => read_verdict absent
         => returns the ORIGINAL escalation unchanged (inline-triage
@@ -821,10 +787,8 @@ class TestTriageBoundary:
         cleared before this spawn (I-FRESH) — proven here because it does
         NOT leak through as a modified escalation.
         """
-        worktree = tmp_path / 'wt'
-        steward = _build_steward_for_triage(config, worktree)
         escalation = _make_triage_escalation(self._SUGGESTIONS)
-        _artifacts_for(worktree).write_verdict(
+        agent_side_artifacts(triage_steward.worktree).write_verdict(
             'triage',
             _envelope('triage', 'stale-sid', {
                 'accepted': [{
@@ -836,10 +800,10 @@ class TestTriageBoundary:
         )
         monkeypatch.setattr(
             'orchestrator.steward.invoke_agent',
-            _fake_invoke_writes_triage_verdict(worktree=worktree, write=False),
+            _fake_invoke_writes_triage_verdict(worktree=triage_steward.worktree, write=False),
         )
 
-        result = await steward._pre_triage_suggestions(escalation)
+        result = await triage_steward._pre_triage_suggestions(escalation)
 
         assert result is escalation
 
@@ -868,7 +832,7 @@ class TestFreshnessGuards:
         """
         workflow = _setup_judge_workflow(config, git_ops, task_assignment, tmp_path)
         assert workflow.worktree is not None  # set by _seed_workflow_artifacts above
-        _artifacts_for(workflow.worktree).write_verdict(
+        agent_side_artifacts(workflow.worktree).write_verdict(
             'judge',
             _envelope('judge', 'stale-sid', {
                 'complete': True, 'reasoning': 'stale', 'uncovered_plan_steps': [],
@@ -894,7 +858,7 @@ class TestFreshnessGuards:
         """
         workflow = _setup_merger_workflow(config, git_ops, task_assignment, tmp_path)
         assert workflow.worktree is not None  # set by _seed_workflow_artifacts above
-        _artifacts_for(workflow.worktree).write_verdict(
+        agent_side_artifacts(workflow.worktree).write_verdict(
             'merger', _envelope('merger', 'stale-sid', {'blocked': False, 'reason': ''}),
         )
         monkeypatch.setattr(
@@ -933,8 +897,8 @@ class TestSharedMachineryIntact:
     async def test_recon_like_output_schema_path_still_functions(self, tmp_path: Path) -> None:
         """A recon/curator-like invocation (non-trivial output_schema +
         disallowed_tools=['*']) still: (a) renders --json-schema with the
-        schema JSON; (b) expands '*' to _REAL_BUILTIN_TOOLS_DENYLIST, sparing
-        the synthetic StructuredOutput tool; (c) parses a StructuredOutput
+        schema JSON; (b) replaces '*' with the ``--tools ''`` registry filter,
+        sparing the synthetic StructuredOutput tool; (c) parses a StructuredOutput
         subprocess payload back into AgentResult.structured_output.
         """
         captured: list[list[str]] = []
@@ -975,10 +939,11 @@ class TestSharedMachineryIntact:
         assert '--json-schema' in argv
         assert argv[argv.index('--json-schema') + 1] == json.dumps(schema)
 
-        d_idx = argv.index('--disallowed-tools')
-        js_idx = argv.index('--json-schema', d_idx)
-        deny_values = argv[d_idx + 1:js_idx]
-        assert deny_values == _REAL_BUILTIN_TOOLS_DENYLIST, f'got {deny_values!r}'
+        # allowed_tools=['Read'] is a permission list, not a registry entry, so
+        # it is inert under the empty registry that --tools '' leaves.
+        assert argv[argv.index('--tools') + 1] == ''
+        assert '--disallowed-tools' not in argv
+        assert '*' not in argv
         assert _SCHEMA_OUTPUT_TOOL not in argv
 
         assert isinstance(result, AgentResult)

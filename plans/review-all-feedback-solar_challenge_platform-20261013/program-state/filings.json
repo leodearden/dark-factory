@@ -1,0 +1,653 @@
+[
+ {
+  "key": "fk-2ac9ca1ae8db",
+  "sources": [
+   "review"
+  ],
+  "step": "2",
+  "ticket_or_task": "567",
+  "disposition": "filed:567",
+  "note": "pending task adds the dispatch-state mount and requires the image to pre-create /var/lib/scp/dispatch owned by appuser (same unwritable-volume defect)"
+ },
+ {
+  "key": "fk-6de37ba38543",
+  "sources": [
+   "review"
+  ],
+  "step": "2",
+  "ticket_or_task": "516",
+  "disposition": "filed:516",
+  "note": "pending task moves identity/consent/SoC reads inside the per-home try with a savepoint (same runner.py defect)"
+ },
+ {
+  "key": "fk-f70ae6b30e2f",
+  "sources": [
+   "review"
+  ],
+  "step": "filed (curator combined)",
+  "ticket_or_task": "518",
+  "disposition": "filed:518"
+ },
+ {
+  "key": "fk-057a2dcb1a54",
+  "sources": [
+   "review"
+  ],
+  "step": "filed",
+  "ticket_or_task": "1013",
+  "disposition": "filed:1013"
+ },
+ {
+  "key": "fk-0959d091d763",
+  "sources": [
+   "hotspot"
+  ],
+  "step": "filed",
+  "ticket_or_task": "1014",
+  "disposition": "filed:1014"
+ },
+ {
+  "key": "fk-0c0e3ef4e738",
+  "sources": [
+   "hotspot"
+  ],
+  "step": "2",
+  "ticket_or_task": "866",
+  "disposition": "filed:866",
+  "note": "pending task: aiomqtt disconnect wait runs before/outside the shutdown flush timeout (same stop-bound defect; lock part is in-progress 1008)"
+ },
+ {
+  "key": "fk-391d4ee3e6ca",
+  "sources": [
+   "review"
+  ],
+  "step": "2",
+  "ticket_or_task": "521",
+  "disposition": "filed:521",
+  "note": "pending task persists own-use/VAT rates on the statement and serves them to the portal explainer (req 4)"
+ },
+ {
+  "key": "fk-41f983ffd091",
+  "sources": [
+   "review"
+  ],
+  "step": "filed",
+  "ticket_or_task": "1015",
+  "disposition": "filed:1015"
+ },
+ {
+  "key": "fk-598e0f0aadce",
+  "sources": [
+   "review"
+  ],
+  "step": "filed",
+  "ticket_or_task": "1016",
+  "disposition": "filed:1016"
+ },
+ {
+  "key": "fk-612e34f14aed",
+  "sources": [
+   "review"
+  ],
+  "step": "2",
+  "ticket_or_task": "496",
+  "disposition": "filed:496",
+  "note": "pending task wires dispatch_staleness_bound(settings interval) into both ops read_dispatch_liveness call sites"
+ },
+ {
+  "key": "fk-64412055963f",
+  "sources": [
+   "review"
+  ],
+  "step": "filed (curator combined)",
+  "ticket_or_task": "194",
+  "disposition": "filed:194"
+ },
+ {
+  "key": "fk-761322b9de8d",
+  "sources": [
+   "review"
+  ],
+  "step": "2",
+  "ticket_or_task": "554",
+  "disposition": "filed:554",
+  "note": "pending task adds the operator console 401 session-expiry path mirroring the portal"
+ },
+ {
+  "key": "fk-796ca07a0b4d",
+  "sources": [
+   "review"
+  ],
+  "step": "2",
+  "ticket_or_task": "493",
+  "disposition": "filed:493",
+  "note": "pending task: billing _check_consent maps a failed check to NO_CONSENT/consent_denied; wants CHECK_FAILED distinct reason"
+ },
+ {
+  "key": "fk-c4d0bd72b2a1",
+  "sources": [
+   "review"
+  ],
+  "step": "filed (curator combined)",
+  "ticket_or_task": "301",
+  "disposition": "filed:301"
+ },
+ {
+  "key": "fk-ca8aef7ca61a",
+  "sources": [
+   "review"
+  ],
+  "step": "filed (curator combined)",
+  "ticket_or_task": "295",
+  "disposition": "filed:295"
+ },
+ {
+  "key": "fk-e5f819d4d63a",
+  "sources": [
+   "this run"
+  ],
+  "step": "filed",
+  "ticket_or_task": "1017",
+  "disposition": "filed:1017"
+ },
+ {
+  "key": "fk-fa517ce324d7",
+  "sources": [
+   "hotspot"
+  ],
+  "step": "filed (curator combined)",
+  "ticket_or_task": "213",
+  "disposition": "filed:213"
+ },
+ {
+  "key": "fk-03da4d7533d3",
+  "sources": [
+   "review"
+  ],
+  "step": "filed",
+  "ticket_or_task": "1018",
+  "disposition": "filed:1018"
+ },
+ {
+  "key": "fk-0586d2a2822c",
+  "sources": [
+   "review"
+  ],
+  "step": "filed",
+  "ticket_or_task": "1019",
+  "disposition": "filed:1019"
+ },
+ {
+  "key": "fk-060d7b2890a1",
+  "sources": [
+   "this run"
+  ],
+  "step": "not-filed",
+  "ticket_or_task": "\u2014",
+  "disposition": "open",
+  "note": "weakened: the lead reads the skeptic note before filing (contract: weakened only after reading)"
+ },
+ {
+  "key": "fk-1001a64a576c",
+  "sources": [
+   "review"
+  ],
+  "step": "2",
+  "ticket_or_task": "395",
+  "disposition": "filed:395",
+  "note": "pending task consolidates the three get_telemetry_store dependencies (SPOT)"
+ },
+ {
+  "key": "fk-160bca1a028e",
+  "sources": [
+   "review"
+  ],
+  "step": "filed",
+  "ticket_or_task": "1020",
+  "disposition": "filed:1020"
+ },
+ {
+  "key": "fk-18353f82c64a",
+  "sources": [
+   "review"
+  ],
+  "step": "filed",
+  "ticket_or_task": "1021",
+  "disposition": "filed:1021"
+ },
+ {
+  "key": "fk-18414152e578",
+  "sources": [
+   "review"
+  ],
+  "step": "filed",
+  "ticket_or_task": "1022",
+  "disposition": "filed:1022"
+ },
+ {
+  "key": "fk-18632715302f",
+  "sources": [
+   "this run"
+  ],
+  "step": "filed",
+  "ticket_or_task": "1023",
+  "disposition": "filed:1023"
+ },
+ {
+  "key": "fk-1fd8711fd212",
+  "sources": [
+   "review"
+  ],
+  "step": "filed",
+  "ticket_or_task": "1024",
+  "disposition": "filed:1024"
+ },
+ {
+  "key": "fk-239c8b72dfed",
+  "sources": [
+   "this run"
+  ],
+  "step": "not-filed",
+  "ticket_or_task": "\u2014",
+  "disposition": "open",
+  "note": "weakened: the lead reads the skeptic note before filing (contract: weakened only after reading)"
+ },
+ {
+  "key": "fk-2628179f5885",
+  "sources": [
+   "this run"
+  ],
+  "step": "filed (curator combined)",
+  "ticket_or_task": "451",
+  "disposition": "filed:451"
+ },
+ {
+  "key": "fk-293356f57e99",
+  "sources": [
+   "this run"
+  ],
+  "step": "filed",
+  "ticket_or_task": "1025",
+  "disposition": "filed:1025"
+ },
+ {
+  "key": "fk-29f40e45f529",
+  "sources": [
+   "review"
+  ],
+  "step": "filed (curator combined)",
+  "ticket_or_task": "210",
+  "disposition": "filed:210"
+ },
+ {
+  "key": "fk-2b47ea2764a9",
+  "sources": [
+   "review"
+  ],
+  "step": "2",
+  "ticket_or_task": "809",
+  "disposition": "filed:809",
+  "note": "pending task rehomes container_images.py out of the validation package (instance/render/compose.py inverted dependency)"
+ },
+ {
+  "key": "fk-32bc3d2b3828",
+  "sources": [
+   "review"
+  ],
+  "step": "filed",
+  "ticket_or_task": "1026",
+  "disposition": "filed:1026"
+ },
+ {
+  "key": "fk-3c2eb5f0816d",
+  "sources": [
+   "review"
+  ],
+  "step": "not-filed",
+  "ticket_or_task": "\u2014",
+  "disposition": "open",
+  "note": "weakened: the lead reads the skeptic note before filing (contract: weakened only after reading)"
+ },
+ {
+  "key": "fk-3dc49f39f9f8",
+  "sources": [
+   "review"
+  ],
+  "step": "filed",
+  "ticket_or_task": "1027",
+  "disposition": "filed:1027"
+ },
+ {
+  "key": "fk-41e7dcec9005",
+  "sources": [
+   "review"
+  ],
+  "step": "filed (curator combined)",
+  "ticket_or_task": "267",
+  "disposition": "filed:267"
+ },
+ {
+  "key": "fk-4278a2af6d9b",
+  "sources": [
+   "review"
+  ],
+  "step": "filed",
+  "ticket_or_task": "1028",
+  "disposition": "filed:1028"
+ },
+ {
+  "key": "fk-464544ea5853",
+  "sources": [
+   "this run"
+  ],
+  "step": "2",
+  "ticket_or_task": "326",
+  "disposition": "filed:326",
+  "note": "pending task collapses ManualClock into SteppableClock"
+ },
+ {
+  "key": "fk-51c958596abb",
+  "sources": [
+   "this run"
+  ],
+  "step": "2",
+  "ticket_or_task": "859",
+  "disposition": "filed:859",
+  "note": "pending 859 (config/*, api/app.py) plus 420 (portal.py, seed.py) cover every .task/plan.json pointer in this slice"
+ },
+ {
+  "key": "fk-52501f753d07",
+  "sources": [
+   "this run"
+  ],
+  "step": "2",
+  "ticket_or_task": "420",
+  "disposition": "filed:420",
+  "note": "pending task covers the timeseries/* and ingestion/__init__ .task/plan.json docstring pointers"
+ },
+ {
+  "key": "fk-54d13a36bb87",
+  "sources": [
+   "review"
+  ],
+  "step": "filed",
+  "ticket_or_task": "1052",
+  "disposition": "filed:1052"
+ },
+ {
+  "key": "fk-54d7fb287f82",
+  "sources": [
+   "review"
+  ],
+  "step": "filed",
+  "ticket_or_task": "1029",
+  "disposition": "filed:1029"
+ },
+ {
+  "key": "fk-569849e70bdf",
+  "sources": [
+   "review"
+  ],
+  "step": "filed",
+  "ticket_or_task": "1030",
+  "disposition": "filed:1030"
+ },
+ {
+  "key": "fk-5d943ec6029d",
+  "sources": [
+   "review"
+  ],
+  "step": "filed",
+  "ticket_or_task": "1031",
+  "disposition": "filed:1031"
+ },
+ {
+  "key": "fk-622d8c567ff0",
+  "sources": [
+   "review"
+  ],
+  "step": "filed",
+  "ticket_or_task": "1032",
+  "disposition": "filed:1032"
+ },
+ {
+  "key": "fk-6f343b667909",
+  "sources": [
+   "this run"
+  ],
+  "step": "filed",
+  "ticket_or_task": "1033",
+  "disposition": "filed:1033"
+ },
+ {
+  "key": "fk-7596807da153",
+  "sources": [
+   "this run"
+  ],
+  "step": "not-filed",
+  "ticket_or_task": "\u2014",
+  "disposition": "open",
+  "note": "weakened: the lead reads the skeptic note before filing (contract: weakened only after reading)"
+ },
+ {
+  "key": "fk-7896a9bf9939",
+  "sources": [
+   "review"
+  ],
+  "step": "filed",
+  "ticket_or_task": "1034",
+  "disposition": "filed:1034"
+ },
+ {
+  "key": "fk-7b127fe035fb",
+  "sources": [
+   "review"
+  ],
+  "step": "2",
+  "ticket_or_task": "859",
+  "disposition": "filed:859",
+  "note": "pending 859 (config/*, api/app.py, frontend) plus 420 (portal.py, seed.py, drills, portal/reads.py) cover these .task/plan.json pointers"
+ },
+ {
+  "key": "fk-7f00a9b61ae4",
+  "sources": [
+   "review"
+  ],
+  "step": "filed",
+  "ticket_or_task": "1035",
+  "disposition": "filed:1035"
+ },
+ {
+  "key": "fk-9016d2157a70",
+  "sources": [
+   "review"
+  ],
+  "step": "filed",
+  "ticket_or_task": "1036",
+  "disposition": "filed:1036"
+ },
+ {
+  "key": "fk-94122b54cca3",
+  "sources": [
+   "review"
+  ],
+  "step": "not-filed",
+  "ticket_or_task": "\u2014",
+  "disposition": "open",
+  "note": "weakened: the lead reads the skeptic note before filing (contract: weakened only after reading)"
+ },
+ {
+  "key": "fk-a07dbb9f21cb",
+  "sources": [
+   "this run"
+  ],
+  "step": "filed",
+  "ticket_or_task": "1037",
+  "disposition": "filed:1037"
+ },
+ {
+  "key": "fk-ad109ef82bff",
+  "sources": [
+   "review"
+  ],
+  "step": "filed",
+  "ticket_or_task": "1038",
+  "disposition": "filed:1038"
+ },
+ {
+  "key": "fk-b8b3768ee249",
+  "sources": [
+   "this run"
+  ],
+  "step": "filed",
+  "ticket_or_task": "1039",
+  "disposition": "filed:1039"
+ },
+ {
+  "key": "fk-b9cb535cc8d2",
+  "sources": [
+   "this run"
+  ],
+  "step": "filed",
+  "ticket_or_task": "1040",
+  "disposition": "filed:1040"
+ },
+ {
+  "key": "fk-bcef2019e2fe",
+  "sources": [
+   "review"
+  ],
+  "step": "filed",
+  "ticket_or_task": "1041",
+  "disposition": "filed:1041"
+ },
+ {
+  "key": "fk-be6b977957ce",
+  "sources": [
+   "review"
+  ],
+  "step": "not-filed",
+  "ticket_or_task": "\u2014",
+  "disposition": "open",
+  "note": "weakened: the lead reads the skeptic note before filing (contract: weakened only after reading)"
+ },
+ {
+  "key": "fk-c5308ea1abe3",
+  "sources": [
+   "review"
+  ],
+  "step": "filed",
+  "ticket_or_task": "1042",
+  "disposition": "filed:1042"
+ },
+ {
+  "key": "fk-cc3f283090a7",
+  "sources": [
+   "review"
+  ],
+  "step": "filed",
+  "ticket_or_task": "1043",
+  "disposition": "filed:1043"
+ },
+ {
+  "key": "fk-cd4706d102d8",
+  "sources": [
+   "this run"
+  ],
+  "step": "filed",
+  "ticket_or_task": "1044",
+  "disposition": "filed:1044"
+ },
+ {
+  "key": "fk-d2e35c2963e8",
+  "sources": [
+   "this run"
+  ],
+  "step": "filed",
+  "ticket_or_task": "1045",
+  "disposition": "filed:1045"
+ },
+ {
+  "key": "fk-d5d6b9349097",
+  "sources": [
+   "review"
+  ],
+  "step": "filed",
+  "ticket_or_task": "1046",
+  "disposition": "filed:1046"
+ },
+ {
+  "key": "fk-d71b46072b60",
+  "sources": [
+   "review"
+  ],
+  "step": "filed",
+  "ticket_or_task": "1047",
+  "disposition": "filed:1047"
+ },
+ {
+  "key": "fk-dbbef61b9510",
+  "sources": [
+   "review"
+  ],
+  "step": "filed",
+  "ticket_or_task": "1048",
+  "disposition": "filed:1048"
+ },
+ {
+  "key": "fk-dd6838e7d69b",
+  "sources": [
+   "review"
+  ],
+  "step": "filed",
+  "ticket_or_task": "1049",
+  "disposition": "filed:1049"
+ },
+ {
+  "key": "fk-df1e3d3911b9",
+  "sources": [
+   "this run"
+  ],
+  "step": "not-filed",
+  "ticket_or_task": "\u2014",
+  "disposition": "open",
+  "note": "weakened: the lead reads the skeptic note before filing (contract: weakened only after reading)"
+ },
+ {
+  "key": "fk-e6d507d32735",
+  "sources": [
+   "this run"
+  ],
+  "step": "not-filed",
+  "ticket_or_task": "\u2014",
+  "disposition": "open",
+  "note": "weakened: the lead reads the skeptic note before filing (contract: weakened only after reading)"
+ },
+ {
+  "key": "fk-f85f21a4988e",
+  "sources": [
+   "review"
+  ],
+  "step": "filed",
+  "ticket_or_task": "1050",
+  "disposition": "filed:1050"
+ },
+ {
+  "key": "fk-f87240eea84a",
+  "sources": [
+   "review"
+  ],
+  "step": "filed (curator combined)",
+  "ticket_or_task": "734",
+  "disposition": "filed:734"
+ },
+ {
+  "key": "fk-fa9f275a8a19",
+  "sources": [
+   "review"
+  ],
+  "step": "filed",
+  "ticket_or_task": "1051",
+  "disposition": "filed:1051"
+ }
+]

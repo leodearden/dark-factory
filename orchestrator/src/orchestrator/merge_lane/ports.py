@@ -7,7 +7,7 @@ running orchestrator; a test injects its own implementation
 
 The verify and clock adapters are built from zero-argument RESOLVERS rather
 than from the collaborator functions themselves. A resolver is evaluated on
-every call, so the function used is whatever ``orchestrator.merge_queue``
+every call, so the function used is whatever ``orchestrator.merge_lane.worker``
 binds at that moment: the test suite still patches those module names (PRD
 phase γ migrates it onto injected fakes), and a function captured at
 construction would go inert under such a patch. γ retires the resolvers.
@@ -26,9 +26,8 @@ from escalation.models import Escalation
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps
-from orchestrator.merge_gates import PostMergePyrightResult
-from orchestrator.merge_lane.types import DiskGuardOutcome, EscalationRecord
-from orchestrator.merge_types import MergeRequest
+from orchestrator.merge_lane.gates import PostMergePyrightResult
+from orchestrator.merge_lane.types import DiskGuardOutcome, EscalationRecord, MergeRequest
 from orchestrator.unblock_types import BlockClass
 from orchestrator.verify import VerifyResult
 
@@ -143,7 +142,9 @@ class ClockPort(Protocol):
 
     async def sleep(self, secs: float) -> None: ...
 
-    async def wait_for_any(self, aws: Collection[Any], timeout: float) -> set[Any]:
+    async def wait_for_any(
+        self, aws: Collection[asyncio.Future[Any]], timeout: float,
+    ) -> set[asyncio.Future[Any]]:
         """Wait up to *timeout* for any of *aws* to finish; the DONE set, never a raise.
 
         A lane wait belongs on this port iff it sits in a REPEATING loop
@@ -165,6 +166,17 @@ class EscalationPort(Protocol):
     def file(self, record: EscalationRecord) -> str | None:
         """File *record*; returns the escalation id, or ``None`` when nothing was filed."""
         ...
+
+
+class ContainmentPredicate(Protocol):
+    """Whether every commit of *head* is already in *upstream* by patch-id.
+
+    False whenever that cannot be established, so a guard that skips only on
+    True fails open into a merge. Production implementation:
+    ``orchestrator/src/orchestrator/merge_lane/landing_evidence.py::patch_content_contained``.
+    """
+
+    async def __call__(self, head: str, upstream: str, git_ops: GitOps, /) -> bool: ...
 
 
 @dataclasses.dataclass(frozen=True)
@@ -228,7 +240,9 @@ class ProductionClock:
     async def sleep(self, secs: float) -> None:
         await asyncio.sleep(secs)
 
-    async def wait_for_any(self, aws: Collection[Any], timeout: float) -> set[Any]:
+    async def wait_for_any(
+        self, aws: Collection[asyncio.Future[Any]], timeout: float,
+    ) -> set[asyncio.Future[Any]]:
         done, _ = await asyncio.wait(aws, timeout=timeout)
         return done
 

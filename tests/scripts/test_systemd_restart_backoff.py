@@ -21,51 +21,13 @@ import subprocess
 
 import pytest
 from systemd_unit_invariants import (
+    FACTORY_INIT_REFERENCE,
+    NON_UNIT_PATHSPECS,
     assert_restart_backoff_effective,
     restart_directive,
 )
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
-
-# What discovery refuses to treat as a unit, excluded by CATEGORY rather than
-# by naming individual paths.  Both categories are files that CONTAIN a unit as
-# quoted text rather than files systemd can load, and both break the invariant
-# the same way: restart_directive is last-occurrence-wins FILE-WIDE, so on a
-# file holding more than one embedded unit it splices a directive out of one and
-# a directive out of another and reports a verdict about neither.
-#
-#   **/tests/**  — parity suites embed whole units as column-0 triple-quoted
-#     fixtures.  Measured: tests/scripts/test_check_fused_memory_unit_parity.py
-#     was swept as a 13th "unit" and PASSED by accident, splicing a cap out of
-#     the NEGATIVE fixture (which deliberately models the defect) together with
-#     RestartSteps= out of an unrelated POSITIVE one.  The glob form is
-#     load-bearing: a plain `:!tests/` excludes only the top-level directory and
-#     leaves fused-memory/tests/, orchestrator/tests/, scripts/tests/ and
-#     dashboard/tests/ swept — and fused-memory/tests/test_systemd_unit_config.py
-#     already parses systemd units, so one fixture there gaining a column-0 cap
-#     would drag a .py file back in.
-#
-#   **/*.md — prose.  A doc may legitimately show the DEFECT: a PRD or
-#     postmortem for this very task would carry a "before" fence (cap, no steps)
-#     next to an "after" fence, and no mechanical rule distinguishes a
-#     cautionary example from a prescription.  plans/afk-C1-systemd.md is the
-#     live instance — an as-built record of what was deployed, already diverged
-#     from the fleet in three visible ways (`Requires=fused-memory.service`,
-#     which the real units reject and test_orchestrator_service_files.py asserts
-#     is ABSENT; an obsolete `--config orchestrator/config.yaml`; no `--frozen`).
-#     Editing a directive inside it would falsify the record without making any
-#     unit correct.  Excluding the category rather than the path means the next
-#     doc quoting a unit does not turn CI red and does not have to be
-#     hand-added to a constant in a test file.
-#
-# The cost is that a doc which IS a copy-source for real units must opt back in
-# explicitly.  Exactly one does — skills/factory-init/references/supervised-unit
-# .md — and its guard below is UNCONDITIONAL, i.e. strictly stronger than the
-# sweep, not a weaker substitute for it.
-_NON_UNIT_PATHSPECS = (
-    ":(exclude,glob)**/tests/**",
-    ":(exclude,glob)**/*.md",
-)
 
 # Every path the sweep is known to cover today.  Guards against a discovery
 # that silently returns fewer files than it should — see
@@ -86,8 +48,6 @@ _EXPECTED_SWEPT_PATHS = frozenset(
         "scripts/orchestrator-solar-challenge-platform.service",
     }
 )
-
-_FACTORY_INIT_REFERENCE = "skills/factory-init/references/supervised-unit.md"
 
 
 def discover_units_declaring_a_restart_cap() -> list[str]:
@@ -114,7 +74,8 @@ def discover_units_declaring_a_restart_cap() -> list[str]:
     than a glob can.
 
     Test directories at any depth and markdown files are excluded via
-    _NON_UNIT_PATHSPECS — see the rationale on that constant.  Both hold units
+    systemd_unit_invariants.NON_UNIT_PATHSPECS — see the rationale on that
+    constant.  Both hold units
     as quoted text rather than as files systemd loads, and the file-wide
     last-wins read splices their embedded units together.
 
@@ -133,7 +94,7 @@ def discover_units_declaring_a_restart_cap() -> list[str]:
             r"^[ \t]*RestartMaxDelaySec[ \t]*=",
             "--",
             ".",
-            *_NON_UNIT_PATHSPECS,
+            *NON_UNIT_PATHSPECS,
         ],
         cwd=REPO_ROOT,
         capture_output=True,
@@ -154,7 +115,7 @@ def discover_units_declaring_a_restart_cap() -> list[str]:
 # Filename shapes a systemd unit definition is allowed to take in this repo.
 # Used to police what discovery drags IN, not what it must contain — see
 # test_discovery_sweeps_only_systemd_units.  `.md` is deliberately NOT here:
-# markdown is prose that quotes units, never a unit, and _NON_UNIT_PATHSPECS
+# markdown is prose that quotes units, never a unit, and NON_UNIT_PATHSPECS
 # keeps it out of discovery in the first place.
 _UNIT_FILE_SUFFIXES = (
     ".service",
@@ -206,7 +167,7 @@ def test_discovery_sweeps_only_systemd_units() -> None:
     The test-directory check is by path SEGMENT, not by prefix, so a unit-shaped
     fixture parked at fused-memory/tests/fixtures/whatever.service is caught too
     — the same depth blindness that a prefix-matching `:!tests/` pathspec has,
-    which is why _NON_UNIT_PATHSPECS uses the glob form.
+    which is why NON_UNIT_PATHSPECS uses the glob form.
     """
     discovered = discover_units_declaring_a_restart_cap()
     strays = [
@@ -245,7 +206,7 @@ def test_every_unit_declaring_a_restart_cap_pairs_it_with_steps(rel_path: str) -
 def test_factory_init_reference_unit_ships_effective_backoff() -> None:
     """The factory-init reference unit must declare the full backoff triple.
 
-    This file is markdown, so _NON_UNIT_PATHSPECS keeps it OUT of the sweep and
+    This file is markdown, so NON_UNIT_PATHSPECS keeps it OUT of the sweep and
     this guard is its only coverage.  That is not a downgrade: the guard is
     UNCONDITIONAL where the sweep is conditional, i.e. strictly stronger for
     this one file, so nothing was traded away by excluding the category.
@@ -270,16 +231,16 @@ def test_factory_init_reference_unit_ships_effective_backoff() -> None:
     than keep trusting a file-wide read; the same hazard is why markdown is
     excluded from discovery wholesale.
     """
-    path = REPO_ROOT / _FACTORY_INIT_REFERENCE
+    path = REPO_ROOT / FACTORY_INIT_REFERENCE
     assert path.exists(), (
-        f"{_FACTORY_INIT_REFERENCE} does not exist. New supervised units are "
+        f"{FACTORY_INIT_REFERENCE} does not exist. New supervised units are "
         "modelled on it, so if it moved this guard must follow it rather than "
         "silently stop checking anything."
     )
 
     for directive in ("RestartSec", "RestartSteps", "RestartMaxDelaySec"):
         assert restart_directive(path, directive) is not None, (
-            f"{_FACTORY_INIT_REFERENCE} does not declare {directive}=. This is "
+            f"{FACTORY_INIT_REFERENCE} does not declare {directive}=. This is "
             "the block new supervised units are copied from, so every unit "
             "minted from it inherits the omission — the whole backoff triple "
             "(floor, steps, cap) has to be present to be taught."

@@ -109,7 +109,7 @@ tasks:
       kind: grep
       pattern: effective_merge_module_configs\(
       paths:
-      - orchestrator/src/orchestrator/merge_queue.py
+      - orchestrator/src/orchestrator/merge_lane/worker.py
       expect: present
   - name: helper-home-and-inline-rebinding-site
     binding: capability→producer (wired) — grep:orchestrator/src/orchestrator/verify.py:5916-5917
@@ -139,16 +139,30 @@ tasks:
   title: 'Gate the task-μ fork: discriminate before verify_failure_is_preexisting_on_main
     returns wholly-preexisting'
   capabilities:
-  - name: mu-fork-early-return-site
-    binding: capability→producer (wired) — grep:orchestrator/src/orchestrator/verify.py:6472
-      `if failing_result.failing_test_ids is not None:` → :6479 `return wholly, (main_sha
-      if wholly else '')`. Both line anchors RE-RESOLVED exact on 2026-08-06
+  - name: mu-fork-flake-gate-helper
+    binding: capability→producer (wired) — orchestrator/src/orchestrator/verify.py::verify_failure_is_preexisting_on_main's
+      task-μ fork (`failing_result.failing_test_ids is not None`) returns its wholly-preexisting
+      verdict through orchestrator/src/orchestrator/verify.py::_wholly_preexisting_after_flake_gate,
+      which re-runs the named failures in isolation on main before that verdict stands
     verdict: PASS
     delivered_check:
       kind: grep
-      pattern: '[''"]main_probe[''"]'
+      pattern: _wholly_preexisting_after_flake_gate
       paths:
       - orchestrator/src/orchestrator/
+      expect: present
+  - name: mu-fork-flake-gate-tests
+    binding: 'amended 2026-10-20 (task 3788 carry): the original mu-fork-early-return-site
+      check grepped the ''main_probe'' call_site literal, which already had 1 hit on main
+      (a docstring at orchestrator/src/orchestrator/verify.py::_main_probe_failure_is_isolated_flake),
+      so it was vacuous. The two checks now bound to delta are the gate helper symbol above
+      (0 hits before 3788) and this test file (absent before 3788), which pins B4/B5 and
+      the main-pinned tree'
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - orchestrator/tests/test_verify_mu_fork_flake_gate.py
       expect: present
   - name: gate-is-live-but-structurally-unreachable
     binding: 'capability→producer (wired) + measured floor — _main_probe_failure_is_isolated_flake
@@ -196,9 +210,9 @@ tasks:
     verdict: PASS
     delivered_check:
       kind: grep
-      pattern: flake_suppression['"]?\s*[:=]
+      pattern: record_merge_flake_suppression
       paths:
-      - orchestrator/src/orchestrator/merge_queue.py
+      - orchestrator/src/orchestrator/merge_lane/worker.py
       expect: present
   - name: storm-streak-sentinel-to-bump
     binding: capability→producer (wired) — grep:orchestrator/src/orchestrator/verify.py:7791
@@ -419,3 +433,5 @@ tasks:
       reason: the task IS the check suite; its signal is all 14 rows of PRD §9 green
         end-to-end, which is what a delivered_check would otherwise be asserting about
         itself
+signal_leaves:
+- λ

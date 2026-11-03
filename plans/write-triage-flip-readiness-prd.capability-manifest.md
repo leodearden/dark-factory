@@ -21,3 +21,21 @@ Binds each leaf signal's asserted capabilities to evidence (G3 + G6), as of main
 | Γ4 | 4949's consumption probe | task 4949 in-progress (mid-merge 2026-09-23); Γ4 depends on it | PASS (producer upstream) |
 
 No binding resolves to declared-only, producer-downstream or rejection-absent. The OPEN rows are numeric thresholds whose gate escalation carries the observed values for the operator to re-base, and one deferred leaf.
+
+## Amendment 2026-10-01 (PRD §11), as of main `1e6a7074c0`
+
+Γ2 and ρ2 are retired (D12) and ν is retired (D13); their rows above stand as the record. μ's bindings are replaced; Γ3's basis is re-based (D15). New leaves:
+
+| leaf | capability | binding | verdict |
+|---|---|---|---|
+| ι | one definition of the flip metrics; refuses on unrated pairs | `score_write_triage_pairs.py::score_pairs` (YAML grep); the judged-candidate column is produced upstream by task 6007 | PASS (on landing) |
+| ω | openai arm posts the Responses API; `judge_reasoning_effort` hot-reloadable | measured 2026-09-30: luna/terra/sol reject `max_tokens` and answer on `responses.create`; leaf registered in `reload.py` (YAML greps) | PASS (on landing) |
+| ψ | the `contests` clause is the ruling's wording, one home | `JUDGE_SYSTEM_PROMPT` (YAML grep); wording × model measured on 359 hand links | PASS (on landing) |
+| χ | briefing renders a contesting child; recon marker writes exempt | `briefing.py::render_memory_results` has no contested branch today; `write_triage.py::declares_attach_keys` exists | PASS (on landing) |
+| π | population ≥ 300 judge-band writes; slates at production parameters | 591 qualifying writes on 2026-10-01; `prefetch_retrievals` takes any record list | PASS (on landing) |
+| λ | every judge-named pair rated | operational; Γ3's `unrated_pairs ≤ 0` makes incompleteness a fail, not a pass | OPEN (operational) |
+| μ | best_config carries ι's quality block | YAML grep on `false_contested_rate` | PASS (on landing) |
+| Γ3 | D15 thresholds achievable | every bound sits on the far side of a measured arm (Sol/Opus) and on the near side of today's judge | OPEN (provisional) |
+| Γ4 | population bound replaces the fixture bound | args edit only; never cancelled (D4) | PASS |
+
+No new binding resolves to declared-only, producer-downstream or rejection-absent.

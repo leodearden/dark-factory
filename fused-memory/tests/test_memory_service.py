@@ -5,21 +5,30 @@ import json
 import logging
 import types
 from datetime import UTC, datetime, timedelta, timezone
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from _fm_helpers import _make_rate_limit_error
 from _mem0_record_shapes import mem0_record
+from _qdrant_responses import missing_collection_404
+from qdrant_client.http.exceptions import UnexpectedResponse
+from shared.project_layout import KNOWN_PROJECT_ROOTS_ENV, escalation_queue_dir
 
+from fused_memory.backends.falkor_server_settings import FalkorServerSettings
+from fused_memory.config.schema import TaskmasterConfig
+from fused_memory.middleware import mem0_update_storm_escalator as storm_mod
 from fused_memory.models.enums import MemoryCategory, SourceStore
-from fused_memory.models.scope import Scope
+from fused_memory.models.scope import Scope, resolve_project_id_for_root
 from fused_memory.services import memory_service
 from fused_memory.services.memory_service import (
     MemoryService,
     ReferentRepairStats,
     _is_rate_limit_or_quota_error,
     _serialize_temporal,
+    metadata_row_text,
 )
+from fused_memory.services.write_journal import Mem0IntentStatus
 from fused_memory.utils.referent_verification import ReferentStats
 
 # A realistic stored Qdrant point payload: the mem0-owned keys mem0's own
@@ -44,12 +53,26 @@ DEFAULT_POINT_PAYLOAD = {
 }
 
 
+_MATCHING_SERVER_SETTINGS = FalkorServerSettings(
+    expected_graph_timeout_ms=30000, graph_timeout_ms=30000, appendonly='yes',
+)
+
+
 @pytest.fixture
 def service(mock_config):
     """MemoryService with mocked backends (no real DB needed)."""
+    return _mocked_service(mock_config)
+
+
+def _mocked_service(config) -> MemoryService:
+    """Build a MemoryService over *config* with mocked backends.
+
+    The ``service`` fixture's body, callable from a test body so a test can
+    set the environment BEFORE the service is constructed.
+    """
     from _fm_helpers import install_identity_mocks
 
-    svc = MemoryService(mock_config)
+    svc = MemoryService(config)
     # Mock backends
     svc.graphiti = MagicMock()
     svc.graphiti.search = AsyncMock(return_value=[])
@@ -66,6 +89,7 @@ def service(mock_config):
     svc.graphiti._require_client = MagicMock()
     svc.graphiti.get_nodes_by_exact_name = AsyncMock(return_value=[])
     svc.graphiti.get_valid_edges_for_node = AsyncMock(return_value=[])
+    svc.graphiti.read_server_settings = AsyncMock(return_value=_MATCHING_SERVER_SETTINGS)
     install_identity_mocks(svc.graphiti)
 
     svc.mem0 = MagicMock()
@@ -114,6 +138,16 @@ def service(mock_config):
     svc.durable_queue.replay_dead = AsyncMock(return_value=0)
     svc.durable_queue.close = AsyncMock()
     return svc
+
+
+def _mem0_add_journal() -> MagicMock:
+    """A write-journal double covering every call add_memory's Mem0 leg makes."""
+    journal = MagicMock()
+    journal.log_write_op = AsyncMock()
+    journal.log_backend_op = AsyncMock()
+    journal.log_mem0_intent = AsyncMock()
+    journal.resolve_mem0_intent = AsyncMock()
+    return journal
 
 
 class TestScope:
@@ -385,8 +419,9 @@ class TestAddMemory:
         """task 1974: a mem0.add call that returns {'results': []} WITHOUT
         raising is a silent dedup/no-op drop — the exact failure mode that
         made Stage 2's cycle_summary write go fully absent with no trace.
-        It must be logged as a WARNING even though add_memory() itself does
-        not raise and behavior (response/stores_written/journal) is unchanged.
+        add_memory() still does not raise, but the drop is no longer silent:
+        it is logged as a WARNING, and the response does not claim mem0 as
+        written.
         """
         service.mem0.add = AsyncMock(return_value={'results': []})
 
@@ -403,13 +438,12 @@ class TestAddMemory:
                 causation_id='run-x',
             )
 
-        # Behavior must be UNCHANGED — this is observability-only.
         assert result.memory_ids == [], (
             f'Expected memory_ids=[] for an empty mem0 result, got {result.memory_ids!r}'
         )
-        assert SourceStore.mem0 in result.stores_written, (
-            'stores_written must still include mem0 — the write was attempted '
-            'and did not raise; only the returned ids are empty.'
+        assert SourceStore.mem0 not in result.stores_written, (
+            'stores_written must not claim mem0 when Mem0 returned no id — '
+            'nothing was written.'
         )
 
         warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
@@ -464,6 +498,8 @@ class TestAddMemory:
         non-actionable log line for a legitimate infer-driven no-op."""
         monkeypatch.setattr(memory_service, '_MEM0_ADD_INFER_PINNED_FALSE', False)
         service.mem0.add = AsyncMock(return_value={'results': []})
+        mock_journal = _mem0_add_journal()
+        service.set_write_journal(mock_journal)
 
         with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
             result = await service.add_memory(
@@ -478,14 +514,112 @@ class TestAddMemory:
                 causation_id='run-x',
             )
 
-        # Behavior (response/stores_written) is unaffected by the gate.
+        # Nothing was written whatever the pin, so mem0 is never claimed. With
+        # the pin lifted a zero-id return is a legitimate no-op: no anomaly is
+        # reported and the intent completes.
         assert result.memory_ids == []
-        assert SourceStore.mem0 in result.stores_written
+        assert SourceStore.mem0 not in result.stores_written
+        assert 'empty_result' not in result.message
+        mock_journal.resolve_mem0_intent.assert_awaited_once_with(
+            ANY, Mem0IntentStatus.COMPLETED
+        )
 
         warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert warning_records == [], (
             f'Expected no WARNING once the infer=False pin no longer holds, got: '
             f'{[r.message for r in warning_records]}'
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        (
+            'backend_mock_kwargs',
+            'expected_stores',
+            'expected_message_suffix',
+            'expected_journal_error',
+        ),
+        [
+            pytest.param(
+                {'return_value': {'results': [{'id': 'mem0-1'}]}},
+                [SourceStore.mem0],
+                '',
+                None,
+                id='landed',
+            ),
+            pytest.param(
+                {'side_effect': RuntimeError('qdrant down')},
+                [],
+                ' [mem0_error: qdrant down]',
+                'qdrant down',
+                id='raised',
+            ),
+            pytest.param(
+                {'return_value': {'results': []}},
+                [],
+                ' [empty_result: mem0 add returned zero memory_ids]',
+                'empty_result: mem0 add returned zero memory_ids',
+                id='zero_ids',
+            ),
+        ],
+    )
+    async def test_stores_written_and_journal_stores_reflect_mem0_outcome(
+        self,
+        service,
+        backend_mock_kwargs,
+        expected_stores,
+        expected_message_suffix,
+        expected_journal_error,
+    ):
+        """add_memory says mem0 was written — in the response, the journal and
+        the message — only when Mem0 actually returned an id, and names every
+        failure, a silent zero-id drop included."""
+        service.mem0.add = AsyncMock(**backend_mock_kwargs)
+        mock_journal = _mem0_add_journal()
+        service.set_write_journal(mock_journal)
+
+        result = await service.add_memory(
+            content='cycle summary',
+            category='observations_and_summaries',
+            project_id='dark_factory',
+            causation_id='c1',
+        )
+
+        expected_store_values = [s.value for s in expected_stores]
+        assert result.stores_written == expected_stores
+        journal_kwargs = mock_journal.log_write_op.call_args[1]
+        assert journal_kwargs['result_summary']['stores'] == expected_store_values
+        assert journal_kwargs['success'] is (expected_journal_error is None)
+        assert journal_kwargs['error'] == expected_journal_error
+        assert result.message == f'Memory queued for {expected_store_values}{expected_message_suffix}'
+
+    @pytest.mark.asyncio
+    async def test_dual_write_zero_ids_claims_graphiti_alone_and_names_the_drop(
+        self, service
+    ):
+        """A landed Graphiti leg does not mask a zero-id Mem0 leg: the write
+        claims graphiti alone, and the journal and the message both name the
+        Mem0 drop."""
+        service.mem0.add = AsyncMock(return_value={'results': []})
+        mock_journal = _mem0_add_journal()
+        service.set_write_journal(mock_journal)
+
+        result = await service.add_memory(
+            content='We decided to use PostgreSQL for its JSON support',
+            category='decisions_and_rationale',
+            project_id='dark_factory',
+            dual_write=True,
+            causation_id='c1',
+        )
+
+        service.durable_queue.enqueue.assert_awaited_once()
+        assert result.stores_written == [SourceStore.graphiti]
+        journal_kwargs = mock_journal.log_write_op.call_args[1]
+        assert journal_kwargs['result_summary']['stores'] == ['graphiti']
+        assert journal_kwargs['success'] is False
+        assert journal_kwargs['error'] == 'empty_result: mem0 add returned zero memory_ids'
+        assert result.message == (
+            "Memory queued for ['graphiti'] "
+            '[empty_result: mem0 add returned zero memory_ids]'
         )
 
 
@@ -695,6 +829,60 @@ class TestAddSystemRecord:
         call_kwargs = mock_journal.log_write_op.call_args[1]
         assert call_kwargs['success'] is True
         assert call_kwargs['error'] is None
+
+    # -- Task 4045: stores_written must reflect the Mem0 outcome --
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('backend_mock_kwargs', 'expected_stores', 'expected_message_suffix'),
+        [
+            pytest.param(
+                {'return_value': {'results': [{'id': 'sys-1'}]}},
+                [SourceStore.mem0],
+                '',
+                id='landed',
+            ),
+            pytest.param(
+                {'side_effect': RuntimeError('qdrant down')},
+                [],
+                ' [mem0_error: qdrant down]',
+                id='raised',
+            ),
+            pytest.param(
+                {'return_value': {'results': []}},
+                [],
+                ' [empty_result: mem0 add_system_record returned zero memory_ids]',
+                id='zero_ids',
+            ),
+        ],
+    )
+    async def test_stores_written_and_journal_stores_reflect_mem0_outcome(
+        self, service, backend_mock_kwargs, expected_stores, expected_message_suffix,
+    ):
+        """On the guaranteed-persistence system-write path, the response's
+        stores_written and the journal's stores say mem0 only when Mem0
+        actually returned an id, and every failure is named in the message
+        itself (task 4045)."""
+        service.mem0.add_system_record = AsyncMock(**backend_mock_kwargs)
+        mock_journal = MagicMock()
+        mock_journal.log_write_op = AsyncMock()
+        mock_journal.log_backend_op = AsyncMock()
+        service._write_journal = mock_journal
+
+        result = await service.add_system_record(
+            content='cycle summary',
+            project_id='dark_factory',
+            agent_id='recon-stage-task_knowledge_sync',
+            category='observations_and_summaries',
+            metadata={'kind': 'cycle_summary', 'stage': 'task_knowledge_sync', 'run_id': 'r1'},
+            causation_id='c1',
+        )
+
+        expected_store_values = [s.value for s in expected_stores]
+        assert result.stores_written == expected_stores
+        journal_kwargs = mock_journal.log_write_op.call_args[1]
+        assert journal_kwargs['result_summary']['stores'] == expected_store_values
+        assert result.message == f'Memory queued for {expected_store_values}{expected_message_suffix}'
 
     # -- Amendment (task 2620 review): same task_id normalization as add_memory --
 
@@ -1253,6 +1441,104 @@ class TestSearch:
         assert len(results) == 0, (
             'Edge with non-null invalid_at must be excluded from search results (task 312)'
         )
+
+    @pytest.mark.asyncio
+    async def test_search_graphiti_result_carries_created_at(self, service):
+        """A Graphiti hit with no temporal context still carries its edge's creation time."""
+        from _fm_helpers import MockEdge, MockNode
+
+        service.graphiti.search = AsyncMock(return_value=[
+            MockEdge(
+                fact='Service C owns the ledger',
+                uuid='edge-created-1',
+                source_node=MockNode(name='Service C'),
+                valid_at=None,
+                invalid_at=None,
+                created_at=datetime(2026, 8, 22, 9, 30, 0, tzinfo=UTC),
+            ),
+        ])
+        service.mem0.search = AsyncMock(return_value={'results': []})
+
+        results = await service.search(
+            query='Service C',
+            project_id='test',
+            categories=['entities_and_relations'],
+        )
+        assert len(results) == 1
+        assert results[0].temporal is None
+        assert results[0].created_at == '2026-08-22T09:30:00+00:00', (
+            'a Graphiti hit must carry a recency tiebreaker (esc-3578-5); created_at '
+            'is dropped at memory_service.py::MemoryService._search_graphiti'
+        )
+
+    @pytest.mark.asyncio
+    async def test_search_graphiti_created_at_is_canonical_utc(self, service):
+        """An offset-aware stamp is converted to its UTC instant; a naive one is read as UTC."""
+        from _fm_helpers import MockEdge, MockNode
+
+        service.graphiti.search = AsyncMock(return_value=[
+            MockEdge(
+                fact='Service D runs in Karachi time',
+                uuid='edge-offset',
+                source_node=MockNode(name='Service D'),
+                created_at=datetime(2026, 8, 22, 9, 30, 0, tzinfo=timezone(timedelta(hours=5))),
+            ),
+            MockEdge(
+                fact='Service E stamps naive times',
+                uuid='edge-naive',
+                source_node=MockNode(name='Service E'),
+                created_at=datetime(2026, 8, 22, 9, 30, 0),
+            ),
+        ])
+        service.mem0.search = AsyncMock(return_value={'results': []})
+
+        results = await service.search(
+            query='Service',
+            project_id='test',
+            categories=['entities_and_relations'],
+        )
+        created = {r.id: r.created_at for r in results}
+        assert created['edge-offset'] == '2026-08-22T04:30:00+00:00'
+        assert created['edge-naive'] == '2026-08-22T09:30:00+00:00'
+
+    @pytest.mark.asyncio
+    async def test_search_graphiti_mixed_offset_created_at_sorts_chronologically(self, service):
+        """Emitted created_at strings must sort lexically iff the instants do.
+
+        topic_anchor.py::select_topic_canonical compares recency on the raw
+        string, so a preserved offset would mis-order these two edges.
+        """
+        from _fm_helpers import MockEdge, MockNode
+
+        earlier_instant = datetime(2026, 8, 22, 8, 0, tzinfo=UTC)
+        later_instant = datetime(2026, 8, 22, 9, 0, tzinfo=UTC)
+        earlier_stored = earlier_instant.astimezone(timezone(timedelta(hours=5)))
+        later_stored = later_instant.astimezone(timezone(timedelta(hours=-3)))
+        assert earlier_stored.isoformat() > later_stored.isoformat()
+
+        service.graphiti.search = AsyncMock(return_value=[
+            MockEdge(
+                fact='Service F was renamed',
+                uuid='edge-earlier',
+                source_node=MockNode(name='Service F'),
+                created_at=earlier_stored,
+            ),
+            MockEdge(
+                fact='Service F was renamed again',
+                uuid='edge-later',
+                source_node=MockNode(name='Service F'),
+                created_at=later_stored,
+            ),
+        ])
+        service.mem0.search = AsyncMock(return_value={'results': []})
+
+        results = await service.search(
+            query='Service F',
+            project_id='test',
+            categories=['entities_and_relations'],
+        )
+        created = {r.id: r.created_at for r in results}
+        assert created['edge-earlier'] < created['edge-later']
 
     @pytest.mark.asyncio
     async def test_search_category_false_negative_regression_task_1083(self, service):
@@ -2144,7 +2430,9 @@ class TestMetadataFastPathEquivalence:
         ['topic'],
         ['topic', 'kind'],
         ['not_present_at_all'],
-    ], ids=['one', 'several', 'absent'])
+        ['category'],                               # a fused-memory-owned key
+        ['topic', 'category'],
+    ], ids=['one', 'several', 'absent', 'protected_key', 'mixed_with_protected'])
     def test_delete_payload_agrees_with_the_delta_helper(self, keys):
         """merge + delete-only: Qdrant's server-side delete == the helper's."""
         payload = dict(DEFAULT_POINT_PAYLOAD)
@@ -2621,16 +2909,32 @@ class TestUpdateMemoryStormCounter:
 
         for i in range(5):
             await self._amend(service, agent_id=f'recon-stage-1-run-{i}')
-        assert len(service._mem0_update_storm_counters) == 5
+        assert len(service.mem0_update_storm_tracked_agents) == 5
 
         # Every one of those agents has now gone quiet for a full window.
         clock.advance(window + 1)
         await self._amend(service, agent_id='recon-stage-2')
 
-        assert set(service._mem0_update_storm_counters) == {'recon-stage-2'}, (
+        assert service.mem0_update_storm_tracked_agents == {'recon-stage-2'}, (
             'a counter whose window has emptied carries no state that could '
             'change a later decision, so it must not survive'
         )
+
+    @pytest.mark.asyncio
+    async def test_a_malformed_storm_leaf_tracks_no_agent(self, stormy):
+        """A bad leaf disables the alarm; it must not also leak a key per agent.
+
+        The sweep never runs while the leaf is bad, so a counter minted per
+        agent BEFORE the config check would accumulate without bound for as
+        long as the leaf stays malformed.
+        """
+        service, _clock = stormy
+        service.config.mem0_update.storm_threshold = 'ten'
+
+        for i in range(3):
+            await self._amend(service, agent_id=f'recon-stage-1-run-{i}')
+
+        assert service.mem0_update_storm_tracked_agents == frozenset()
 
     @pytest.mark.asyncio
     async def test_eviction_does_not_disarm_a_live_burst(self, stormy):
@@ -2662,12 +2966,130 @@ class TestUpdateMemoryStormCounter:
 
         assert isinstance(service._mem0_update_storm_escalator, Mem0UpdateStormEscalator)
 
-    def test_set_known_projects_reaches_the_escalator(self, service):
-        """The registry snapshot must arrive where project_root resolution happens."""
-        service.set_known_projects({'dark_factory': '/home/leo/src/dark-factory'})
-        assert service._mem0_update_storm_escalator._known_projects == {
-            'dark_factory': '/home/leo/src/dark-factory',
-        }
+
+@pytest.mark.skipif(
+    not storm_mod.HAS_ESCALATION,
+    reason='escalation package not installed in this environment',
+)
+class TestUpdateMemoryStormFilesIntoTheProjectQueue:
+    """An update_memory burst lands as a record in the right project's queue.
+
+    Drives the REAL escalator into real queue files under tmp_path through the
+    public surface, so it fails whichever link breaks: the registry seed, its
+    forwarding to the escalator, or the project_id -> root resolution.
+    """
+
+    AGENT = 'recon-stage-memory_consolidator'
+
+    @staticmethod
+    def _filed(root):
+        queue_files = sorted(escalation_queue_dir(root).glob('esc-*.json'))
+        return [json.loads(path.read_text()) for path in queue_files]
+
+    async def _amend(self, service, project_id, times):
+        for _ in range(times):
+            await service.update_memory(
+                memory_id='point-1', project_id=project_id,
+                content='amended text', reason='consolidation',
+                agent_id=self.AGENT,
+            )
+
+    @pytest.mark.asyncio
+    async def test_a_never_wired_service_files_into_an_env_registered_root(
+        self, mock_config, monkeypatch, tmp_path,
+    ):
+        """The alarm defends itself: startup wiring is not its only registry source."""
+        root = tmp_path / 'storm_proj'
+        root.mkdir()
+        monkeypatch.setenv(KNOWN_PROJECT_ROOTS_ENV, str(root))
+        service = _mocked_service(mock_config)
+        service.config.mem0_update.storm_threshold = 3
+
+        await self._amend(service, resolve_project_id_for_root(root), times=3)
+
+        filed = self._filed(root)
+        assert len(filed) == 1, filed
+        assert filed[0]['category'] == 'mem0_in_place_update_storm'
+        assert self.AGENT in filed[0]['summary']
+
+    @pytest.mark.asyncio
+    async def test_startup_wiring_replaces_the_env_seed(
+        self, mock_config, monkeypatch, tmp_path,
+    ):
+        """The startup snapshot wins over the seed, and the setter reaches the escalator."""
+        root_env = tmp_path / 'seeded' / 'storm_proj'
+        root_env.mkdir(parents=True)
+        root_wired = tmp_path / 'wired'
+        root_wired.mkdir()
+        monkeypatch.setenv(KNOWN_PROJECT_ROOTS_ENV, str(root_env))
+        service = _mocked_service(mock_config)
+        service.config.mem0_update.storm_threshold = 3
+        project_id = resolve_project_id_for_root(root_env)
+
+        service.set_known_projects({project_id: str(root_wired)})
+        await self._amend(service, project_id, times=3)
+
+        assert len(self._filed(root_wired)) == 1
+        assert self._filed(root_env) == []
+
+    @pytest.mark.asyncio
+    async def test_the_seed_never_consults_taskmaster_project_root(
+        self, mock_config, tmp_path, caplog,
+    ):
+        """taskmaster.project_root defaults to '.', so seeding from it would misfile.
+
+        With no env registry the burst must be logged and filed nowhere, even
+        into a real directory the config names.
+        """
+        primary = tmp_path / 'primary_proj'
+        primary.mkdir()
+        mock_config.taskmaster = TaskmasterConfig(project_root=str(primary))
+        service = _mocked_service(mock_config)
+        service.config.mem0_update.storm_threshold = 3
+        project_id = resolve_project_id_for_root(primary)
+
+        with caplog.at_level(logging.WARNING, logger=storm_mod.__name__):
+            await self._amend(service, project_id, times=3)
+
+        assert self._filed(primary) == []
+        assert any(
+            record.name == storm_mod.__name__
+            and record.levelno == logging.WARNING
+            and project_id in record.getMessage()
+            for record in caplog.records
+        ), [record.getMessage() for record in caplog.records]
+
+    @pytest.mark.asyncio
+    async def test_one_agent_amending_in_two_projects_files_a_per_project_count(
+        self, mock_config, tmp_path,
+    ):
+        """A recon stage id carries no project, so one agent amends in many.
+
+        The count filed into a project's queue must be reproducible from that
+        project's own journal rows, never pooled across projects.
+        """
+        root_a = tmp_path / 'a'
+        root_b = tmp_path / 'b'
+        root_a.mkdir()
+        root_b.mkdir()
+        service = _mocked_service(mock_config)
+        service.config.mem0_update.storm_threshold = 3
+        service.set_known_projects({'proj_a': str(root_a), 'proj_b': str(root_b)})
+
+        await self._amend(service, 'proj_a', times=2)
+        await self._amend(service, 'proj_b', times=2)
+
+        assert self._filed(root_a) == []
+        assert self._filed(root_b) == []
+
+        await self._amend(service, 'proj_b', times=1)
+
+        filed = self._filed(root_b)
+        assert len(filed) == 1, filed
+        assert 'count=3' in filed[0]['detail'].splitlines()
+        assert 'proj_b' in filed[0]['summary']
+        assert self._filed(root_a) == []
+        assert service.mem0_update_storm_tracked_agents == frozenset({self.AGENT})
 
 
 class TestUpdateEdgeVerification:
@@ -2877,6 +3299,48 @@ class TestClose:
         mock_journal.close.assert_called_once()
         mock_buffer.close.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_close_closes_router_and_classifier(self, service):
+        service.graphiti.close = AsyncMock()
+        service.mem0.close = AsyncMock()
+        service.router.close = AsyncMock()
+        service.classifier.close = AsyncMock()
+
+        await service.close()
+
+        service.router.close.assert_awaited_once()
+        service.classifier.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_durable_flush_closes_run_before_sdk_pool_releases(self, service):
+        service._write_journal = MagicMock()
+        service._event_buffer = MagicMock()
+        service.planned_episode_registry = MagicMock()
+        order: list[str] = []
+        for label, resource in (
+            ('durable_queue', service.durable_queue),
+            ('graphiti', service.graphiti),
+            ('mem0', service.mem0),
+            ('write_journal', service._write_journal),
+            ('event_buffer', service._event_buffer),
+            ('planned_episode_registry', service.planned_episode_registry),
+            ('classifier', service.classifier),
+            ('router', service.router),
+        ):
+            resource.close = AsyncMock(side_effect=lambda label=label: order.append(label))
+
+        await service.close()
+
+        assert sorted(order) == sorted(
+            [
+                'durable_queue', 'graphiti', 'mem0', 'write_journal',
+                'event_buffer', 'planned_episode_registry', 'classifier', 'router',
+            ]
+        )
+        for durable in ('write_journal', 'event_buffer', 'planned_episode_registry'):
+            for pool in ('classifier', 'router'):
+                assert order.index(durable) < order.index(pool), order
+
 
 # The logger MemoryService.close() reports sub-close failures on. Single-sourced
 # so the caplog LEVEL scope (`at_level(logger=...)`) and the record FILTER below
@@ -3012,9 +3476,10 @@ class TestCloseBoundsSlowSubclose:
     shutdown budget or starve the durable-flush closes that follow it."""
 
     def _wire_resources(self, service):
-        """Wire all six sub-resources with AsyncMock close() methods and
-        return a name->mock mapping (mirrors
-        TestCloseLogsExceptions._make_resource_mocks)."""
+        """Wire the six storage sub-resources with AsyncMock close() methods
+        and return a name->mock mapping (mirrors
+        TestCloseLogsExceptions._make_resource_mocks). The classifier and
+        router SDK-pool releases are left real."""
         service.graphiti.close = AsyncMock()
         service.mem0.close = AsyncMock()
 
@@ -3159,6 +3624,35 @@ class TestCloseBoundsSlowSubclose:
         resources['durable_queue'].close.assert_awaited_once()
         for name in ('_write_journal', '_event_buffer', 'planned_episode_registry'):
             resources[name].close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_hung_sdk_pool_release_is_bounded_below_the_backend_budget(
+        self, service, caplog
+    ):
+        """An SDK connection-pool release only drops local idle sockets, so its
+        real budget is far tighter than a storage backend's: a hung classifier
+        release lets close() return inside 2.0s with no timeout monkeypatched,
+        and the router release after it still runs."""
+        resources = self._wire_resources(service)
+        service.router.close = AsyncMock()
+
+        async def _hang(*_args, **_kwargs):
+            await asyncio.sleep(3600)
+
+        service.classifier.close = AsyncMock(side_effect=_hang)
+
+        with caplog.at_level(logging.WARNING, logger=_CLOSE_LOGGER):
+            await asyncio.wait_for(service.close(), timeout=2.0)
+
+        service.router.close.assert_awaited_once()
+        for resource in resources.values():
+            resource.close.assert_awaited_once()
+        warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == _CLOSE_LOGGER
+        ]
+        assert len(warnings) == 1, [r.getMessage() for r in warnings]
+        assert 'classifier' in warnings[0].getMessage()
 
 
 class TestGraphitiBackendRemoveEdge:
@@ -3891,6 +4385,49 @@ class TestGetEntity:
         assert 'e-invalid' not in {e['uuid'] for e in result['edges']}, (
             'FUZZY branch must drop invalidated edges to match the EXACT/topological '
             'branch (task 2726)'
+        )
+
+    @pytest.mark.asyncio
+    async def test_fuzzy_branch_keeps_restored_edges(self, service):
+        """FUZZY branch keeps a restored edge — ``invalid_at`` None, ``expired_at``
+        set — while still dropping a superseded one (task 4714, esc-4714-9).
+
+        The restore hooks clear ``invalid_at`` and keep ``expired_at`` as the
+        restored-edge signature; graphiti_core never sets ``expired_at`` without
+        ``invalid_at``.  So ``expired_at`` alone marks a RESTORED fact, not a
+        retired one, and dropping it would hide exactly what the hooks restored.
+        """
+        from _fm_helpers import MockEdge, MockNode
+
+        # Empty exact-name result forces the FUZZY fallback.  search_nodes and
+        # search are awaited concurrently through gather_or_raise, so both must
+        # be stubbed or the gather raises.
+        service.graphiti.get_nodes_by_exact_name = AsyncMock(return_value=[])
+        service.graphiti.search_nodes = AsyncMock(
+            return_value=[MockNode(name='Svc', uuid='n1')]
+        )
+        retired = datetime(2024, 9, 1, 10, 0, 0, tzinfo=UTC)
+        service.graphiti.search = AsyncMock(return_value=[
+            MockEdge(fact='Svc valid fact', uuid='e-valid', invalid_at=None, expired_at=None),
+            MockEdge(
+                fact='Svc superseded fact',
+                uuid='e-superseded',
+                invalid_at=retired,
+                expired_at=retired,
+            ),
+            MockEdge(
+                fact='Svc restored fact',
+                uuid='e-restored',
+                invalid_at=None,
+                expired_at=retired,
+            ),
+        ])
+
+        result = await service.get_entity('Svc', project_id='test')
+
+        assert [e['uuid'] for e in result['edges']] == ['e-valid', 'e-restored'], (
+            'FUZZY branch must drop the superseded edge (invalid_at set) and keep '
+            'the restored one (invalid_at None, expired_at set) — esc-4714-9'
         )
 
     # ------------------------------------------------------------------
@@ -7456,6 +7993,63 @@ class TestSearchGraphitiInvalidatedFiltering:
             'RRF scores must be strictly decreasing in rank order'
         )
 
+    @pytest.mark.asyncio
+    async def test_restored_edge_with_expired_at_alone_is_returned(self, service):
+        """A restored edge — ``invalid_at`` None, ``expired_at`` set — surfaces
+        (task 4714, esc-4714-9).
+
+        The restore hooks clear ``invalid_at`` and keep ``expired_at`` as the
+        restored-edge signature, and graphiti_core never sets ``expired_at``
+        without ``invalid_at``, so ``expired_at`` alone marks a restored fact.
+        Three edges go in: one fully active, one superseded via ``invalid_at``
+        (task 312), and one restored.  The active and restored facts come back,
+        ranked contiguously over the survivors.
+        """
+        from _fm_helpers import MockEdge
+
+        from fused_memory.models.scope import Scope
+
+        dt_valid = datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
+        dt_retired = datetime(2024, 9, 1, 0, 0, 0, tzinfo=UTC)
+
+        service.graphiti.search = AsyncMock(return_value=[
+            MockEdge(
+                fact='Current fact',
+                uuid='edge-active',
+                valid_at=dt_valid,
+                invalid_at=None,
+                expired_at=None,
+            ),
+            MockEdge(
+                fact='Superseded fact',
+                uuid='edge-invalid-at',
+                valid_at=dt_valid,
+                invalid_at=dt_retired,
+                expired_at=None,
+            ),
+            MockEdge(
+                fact='Restored fact',
+                uuid='edge-restored',
+                valid_at=dt_valid,
+                invalid_at=None,
+                expired_at=dt_retired,
+            ),
+        ])
+
+        scope = Scope(project_id='test')
+        results = await service._search_graphiti('fact', scope, limit=10)
+
+        assert [r.id for r in results] == ['edge-active', 'edge-restored'], (
+            'the superseded edge must be dropped (task 312) and the restored '
+            'edge kept: expired_at alone does not retire an edge (esc-4714-9)'
+        )
+        assert [r.content for r in results] == ['Current fact', 'Restored fact']
+
+        assert [r.metadata['store_rank'] for r in results] == [1, 2], (
+            'store_rank must be contiguous over survivors — the dropped '
+            'superseded edge must not consume a rank'
+        )
+
 
 class TestSearchRrfMerge:
     """Task 3658: MemoryService.search merges the two stores by RRF, not by precedence.
@@ -7696,6 +8290,33 @@ class TestGetStatusScoping:
             f'queue section should equal get_stats output; got {result["queue"]}'
         )
 
+
+class TestGetStatusSurfacesFalkorServerSettings:
+    """`get_status()['graphiti']['server_settings']` carries the live FalkorDB settings (task 6848)."""
+
+    @pytest.mark.asyncio
+    async def test_a_reset_timeout_is_visible_in_get_status(self, service):
+        service.graphiti.list_graphs = AsyncMock(return_value=[])
+        service.mem0.list_projects = AsyncMock(return_value=[])
+        reset = FalkorServerSettings(
+            expected_graph_timeout_ms=30000, graph_timeout_ms=1000, appendonly='no',
+        )
+        service.graphiti.read_server_settings = AsyncMock(return_value=reset)
+
+        result = await service.get_status()
+
+        assert result['graphiti']['server_settings'] == reset.to_status()
+        assert result['graphiti']['server_settings']['ok'] is False
+
+    @pytest.mark.asyncio
+    async def test_server_settings_are_reported_even_when_graph_listing_fails(self, service):
+        service.graphiti.list_graphs = AsyncMock(side_effect=ConnectionError('down'))
+        service.mem0.list_projects = AsyncMock(return_value=[])
+
+        result = await service.get_status()
+
+        assert result['graphiti']['connected'] is False
+        assert result['graphiti']['server_settings'] == _MATCHING_SERVER_SETTINGS.to_status()
 
 class TestGetStatusSurfacesDeadByOperation:
     """`get_status()['queue']` must carry the per-operation dead breakdown.
@@ -9622,6 +10243,131 @@ class TestReconPoolAutoTagMissingStageWarning:
         )
 
 
+class TestNonCycleSummaryReconPoolStrip:
+    """A Mem0 record carries recon_pool only if kind == 'cycle_summary' (task
+    3239): both public write seams strip a caller-supplied recon_pool from any
+    other write, loudly, so a stray tag can never join a reconciliation trim
+    pool.
+    """
+
+    _LOGGER = 'fused_memory.services.memory_service'
+
+    def _scoped_warnings(self, caplog):
+        return [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == self._LOGGER
+        ]
+
+    async def _add_note_with_pool_tag(
+        self, service, recon_pool: object = 'stage1_cycle_summary',
+    ):
+        await service.add_memory(
+            content='An ordinary observation',
+            category='observations_and_summaries',
+            project_id='dark_factory',
+            agent_id='recon-stage-memory_consolidator',
+            metadata={'kind': 'note', 'recon_pool': recon_pool},
+        )
+        return service.mem0.add.call_args[1]['metadata']
+
+    @pytest.mark.asyncio
+    async def test_add_memory_strips_pool_recon_pool_from_non_cycle_summary_kind(self, service):
+        backend_meta = await self._add_note_with_pool_tag(service)
+        assert 'recon_pool' not in backend_meta
+        assert backend_meta['kind'] == 'note'
+
+    @pytest.mark.asyncio
+    async def test_add_memory_strips_recon_pool_when_kind_absent(self, service):
+        await service.add_memory(
+            content='Cycle summary whose kind the LLM dropped',
+            category='observations_and_summaries',
+            project_id='dark_factory',
+            agent_id='recon-stage-task_knowledge_sync',
+            metadata={
+                'stage': 'task_knowledge_sync',
+                'recon_pool': 'stage2_cycle_summary',
+                'run_id': 'r1',
+            },
+        )
+        backend_meta = service.mem0.add.call_args[1]['metadata']
+        assert 'recon_pool' not in backend_meta
+        assert backend_meta['stage'] == 'task_knowledge_sync'
+        assert backend_meta['run_id'] == 'r1'
+
+    @pytest.mark.asyncio
+    async def test_strip_logs_one_structured_warning(self, service, caplog):
+        with caplog.at_level(logging.WARNING, logger=self._LOGGER):
+            await self._add_note_with_pool_tag(service)
+
+        warning_records = self._scoped_warnings(caplog)
+        assert len(warning_records) == 1, (
+            f'Expected exactly 1 strip WARNING, got {len(warning_records)}: '
+            f'{[r.getMessage() for r in warning_records]}'
+        )
+        record = warning_records[0]
+        assert record.project_id == 'dark_factory'
+        assert record.agent_id == 'recon-stage-memory_consolidator'
+        assert record.kind == 'note'
+        assert record.caller_recon_pool == 'stage1_cycle_summary'
+        assert 'recon_pool' in record.getMessage()
+
+    @pytest.mark.asyncio
+    async def test_strip_handles_unhashable_recon_pool_value(self, service):
+        """Qdrant matches a scalar filter against ANY element of an array
+        payload, so a list-valued tag would still join the pool — and it must
+        not crash the strip either."""
+        backend_meta = await self._add_note_with_pool_tag(
+            service, recon_pool=['stage1_cycle_summary'],
+        )
+        assert 'recon_pool' not in backend_meta
+
+    @pytest.mark.asyncio
+    async def test_add_system_record_strips_recon_pool_from_non_cycle_summary(
+        self, service, caplog,
+    ):
+        service.mem0.add_system_record = AsyncMock(return_value={'results': [{'id': 'sys-1'}]})
+
+        with caplog.at_level(logging.WARNING, logger=self._LOGGER):
+            await service.add_system_record(
+                content='system note',
+                project_id='dark_factory',
+                agent_id='recon-stage-task_knowledge_sync',
+                category='observations_and_summaries',
+                metadata={'kind': 'note', 'recon_pool': 'stage2_cycle_summary'},
+                causation_id='c1',
+            )
+
+        assert service.mem0.add_system_record.await_args is not None
+        backend_meta = service.mem0.add_system_record.await_args.kwargs['metadata']
+        assert 'recon_pool' not in backend_meta
+        warning_records = self._scoped_warnings(caplog)
+        assert len(warning_records) == 1
+        assert warning_records[0].agent_id == 'recon-stage-task_knowledge_sync'
+
+    @pytest.mark.asyncio
+    async def test_cycle_summary_write_keeps_recon_pool_without_strip_warning(
+        self, service, caplog,
+    ):
+        """The stage-2 prompt's legitimate caller-supplied tag survives."""
+        with caplog.at_level(logging.WARNING, logger=self._LOGGER):
+            await service.add_memory(
+                content='Cycle 3 summary: completed steps 1-4',
+                category='observations_and_summaries',
+                project_id='dark_factory',
+                agent_id='recon-stage-memory_consolidator',
+                metadata={
+                    'kind': 'cycle_summary',
+                    'stage': 'memory_consolidator',
+                    'run_id': 'r1',
+                    'recon_pool': 'stage1_cycle_summary',
+                },
+            )
+
+        backend_meta = service.mem0.add.call_args[1]['metadata']
+        assert backend_meta['recon_pool'] == 'stage1_cycle_summary'
+        assert self._scoped_warnings(caplog) == []
+
+
 class TestCycleSummaryRunIdGuard:
     """add_memory's cycle_summary run_id guard (task 2094), updated for the
     task-2109 auto-backfill.
@@ -10148,160 +10894,6 @@ class TestGraphitiBackendGetEdgeInvalidAt:
             await backend.get_edge_invalid_at('missing-edge-uuid', group_id='test')
 
 
-# ---------------------------------------------------------------------------
-# Step 1: TRACK B.1 backend clear_invalid_at RED tests
-# ---------------------------------------------------------------------------
-
-class TestGraphitiBackendUpdateEdgeClearInvalidAt:
-    """Backend update_edge must accept clear_invalid_at=True and set edge.invalid_at = None."""
-
-    def _make_backend_and_edge(self, mock_config, make_graph_mock):
-        """Set up a GraphitiBackend with mock driver/client, an awaitable graph, and a mock edge.
-
-        Returns (backend, mock_edge, graph) — ``graph`` is the same object
-        ``backend._graph_for(...)`` resolves to, so tests can assert on the
-        explicit direct-Cypher clear write (task 1940) issued via
-        ``graph.query(...)``.
-        """
-        from fused_memory.backends.graphiti_client import GraphitiBackend
-
-        backend = GraphitiBackend(mock_config)
-        mock_driver = MagicMock()
-        mock_cloned_driver = MagicMock()
-        mock_driver.clone = MagicMock(return_value=mock_cloned_driver)
-        backend._driver = mock_driver
-        backend.client = MagicMock()
-
-        graph = make_graph_mock([])
-        mock_driver._get_graph = MagicMock(return_value=graph)
-
-        mock_edge = AsyncMock()
-        mock_edge.source_node_uuid = 'src-uuid'
-        mock_edge.target_node_uuid = 'tgt-uuid'
-        mock_edge.uuid = 'e-1'
-        mock_edge.fact = 'original fact'
-        mock_edge.invalid_at = datetime(2026, 1, 1, tzinfo=UTC)
-        mock_edge.save = AsyncMock()
-        mock_edge.generate_embedding = AsyncMock()
-        backend.refresh_entity_summary = AsyncMock(return_value={})
-        return backend, mock_edge, graph
-
-    @pytest.mark.asyncio
-    async def test_clear_invalid_at_alone_sets_none(self, mock_config, make_graph_mock):
-        """clear_invalid_at=True with no fact/invalid_at clears edge.invalid_at and calls save."""
-        backend, mock_edge, _graph = self._make_backend_and_edge(mock_config, make_graph_mock)
-        with patch(
-            'fused_memory.backends.graphiti_client.EntityEdge'
-        ) as MockEntityEdge:
-            MockEntityEdge.get_by_uuid = AsyncMock(return_value=mock_edge)
-            await backend.update_edge('e-1', group_id='proj', clear_invalid_at=True)
-            assert mock_edge.invalid_at is None, (
-                'clear_invalid_at=True must set edge.invalid_at to None'
-            )
-            mock_edge.save.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_clear_invalid_at_with_fact_updates_both(self, mock_config, make_graph_mock):
-        """clear_invalid_at=True combined with fact updates fact AND clears invalid_at."""
-        backend, mock_edge, _graph = self._make_backend_and_edge(mock_config, make_graph_mock)
-        with patch(
-            'fused_memory.backends.graphiti_client.EntityEdge'
-        ) as MockEntityEdge:
-            MockEntityEdge.get_by_uuid = AsyncMock(return_value=mock_edge)
-            await backend.update_edge('e-1', 'new fact', group_id='proj', clear_invalid_at=True)
-            assert mock_edge.fact == 'new fact', (
-                'fact must be updated when fact is provided'
-            )
-            assert mock_edge.invalid_at is None, (
-                'invalid_at must be cleared when clear_invalid_at=True'
-            )
-            mock_edge.save.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_clear_invalid_at_takes_precedence_over_invalid_at(self, mock_config, make_graph_mock):
-        """When both invalid_at and clear_invalid_at=True are given, clear wins."""
-        backend, mock_edge, _graph = self._make_backend_and_edge(mock_config, make_graph_mock)
-        ts = datetime(2026, 6, 1, tzinfo=UTC)
-        with patch(
-            'fused_memory.backends.graphiti_client.EntityEdge'
-        ) as MockEntityEdge:
-            MockEntityEdge.get_by_uuid = AsyncMock(return_value=mock_edge)
-            await backend.update_edge(
-                'e-1', group_id='proj', invalid_at=ts, clear_invalid_at=True
-            )
-            assert mock_edge.invalid_at is None, (
-                'clear_invalid_at=True must take precedence: invalid_at ends up None'
-            )
-            mock_edge.save.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_clear_invalid_at_issues_explicit_null_cypher(self, mock_config, make_graph_mock):
-        """clear_invalid_at=True must issue an explicit direct-Cypher NULL write.
-
-        graphiti-core's FalkorDB map-based ``edge.save()`` does not reliably
-        clear a null-valued property, so update_edge must force the clear via
-        an explicit ``SET e.invalid_at = NULL`` Cypher write (task 1940).
-        """
-        from _fm_helpers import extract_cypher, extract_params
-
-        backend, mock_edge, graph = self._make_backend_and_edge(mock_config, make_graph_mock)
-        with patch(
-            'fused_memory.backends.graphiti_client.EntityEdge'
-        ) as MockEntityEdge:
-            MockEntityEdge.get_by_uuid = AsyncMock(return_value=mock_edge)
-            await backend.update_edge('e-1', group_id='proj', clear_invalid_at=True)
-
-        graph.query.assert_awaited_once()
-        cypher = extract_cypher(graph.query.call_args)
-        params = extract_params(graph.query.call_args)
-        assert 'RELATES_TO' in cypher
-        assert 'SET' in cypher
-        assert 'invalid_at' in cypher
-        assert 'NULL' in cypher
-        assert params == {'uuid': 'e-1'}
-
-    @pytest.mark.asyncio
-    async def test_fact_plus_clear_still_issues_explicit_clear(self, mock_config, make_graph_mock):
-        """The explicit clear Cypher must fire even when fact is also supplied."""
-        backend, mock_edge, graph = self._make_backend_and_edge(mock_config, make_graph_mock)
-        with patch(
-            'fused_memory.backends.graphiti_client.EntityEdge'
-        ) as MockEntityEdge:
-            MockEntityEdge.get_by_uuid = AsyncMock(return_value=mock_edge)
-            await backend.update_edge('e-1', 'new fact', group_id='proj', clear_invalid_at=True)
-
-        graph.query.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_explicit_clear_precedes_summary_refresh(self, mock_config, make_graph_mock):
-        """The explicit clear Cypher must be awaited BEFORE the endpoint summary refresh runs.
-
-        Otherwise refresh_entity_summary's get_valid_edges_for_node query (which
-        filters ``WHERE e.invalid_at IS NULL``) would run before the clear lands
-        and exclude the just-restored edge from the rebuilt summary.
-        """
-        backend, mock_edge, graph = self._make_backend_and_edge(mock_config, make_graph_mock)
-        observed_await_counts = []
-
-        async def _fake_refresh(node_uuid, *, group_id):
-            observed_await_counts.append(graph.query.await_count)
-            return {}
-
-        backend.refresh_entity_summary = AsyncMock(side_effect=_fake_refresh)
-
-        with patch(
-            'fused_memory.backends.graphiti_client.EntityEdge'
-        ) as MockEntityEdge:
-            MockEntityEdge.get_by_uuid = AsyncMock(return_value=mock_edge)
-            await backend.update_edge('e-1', group_id='proj', clear_invalid_at=True)
-
-        assert observed_await_counts, 'refresh_entity_summary was never called'
-        assert all(count > 0 for count in observed_await_counts), (
-            'explicit clear Cypher must be awaited before summary refresh; '
-            f'observed graph.query.await_count at refresh time: {observed_await_counts}'
-        )
-
-
 class TestScanMemoryContent:
     """MemoryService.scan_memory_content delegates to mem0.scan_payload_text.
 
@@ -10691,6 +11283,55 @@ class TestCountMemoriesByMetadata:
 
         assert filters['task_id'] == 2614
         assert isinstance(filters['task_id'], int)
+
+
+class TestMetadataReadsOnAbsentCollection:
+    """Both service-level metadata reads inherit the backend's absent-collection
+    degradation through their passthrough, so every caller of either one reads
+    a never-provisioned project as empty while a real failure still raises
+    (task 4858).
+
+    ``svc.mem0`` stays the REAL ``Mem0Backend``; only its Qdrant client is faked.
+    """
+
+    _PROJECT = 'solar_challenge'
+    _FILTERS = {'kind': 'project_status_correction'}
+    _READS = ['get_memories_by_metadata', 'count_memories_by_metadata']
+    _EMPTY_READ_RESULTS = [
+        pytest.param('get_memories_by_metadata', [], id='get'),
+        pytest.param('count_memories_by_metadata', 0, id='count'),
+    ]
+
+    @classmethod
+    async def _read_with_qdrant_raising(cls, mock_config, read: str, exc: BaseException):
+        svc = MemoryService(mock_config)
+        client = AsyncMock()
+        client.scroll = AsyncMock(side_effect=exc)
+        client.count = AsyncMock(side_effect=exc)
+        with patch.object(svc.mem0, '_get_async_qdrant', AsyncMock(return_value=client)):
+            return await getattr(svc, read)(project_id=cls._PROJECT, filters=cls._FILTERS)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('read', 'empty'), _EMPTY_READ_RESULTS)
+    async def test_absent_collection_reads_as_empty(self, mock_config, read, empty):
+        collection = Scope(project_id=self._PROJECT).mem0_collection_name(
+            mock_config.mem0.collection_prefix,
+        )
+
+        result = await self._read_with_qdrant_raising(
+            mock_config, read, missing_collection_404(collection),
+        )
+
+        assert result == empty
+        assert type(result) is type(empty)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('read', _READS)
+    async def test_backend_failure_still_raises(self, mock_config, read):
+        failure = UnexpectedResponse(500, 'Internal Server Error', b'boom', httpx.Headers())
+
+        with pytest.raises(UnexpectedResponse):
+            await self._read_with_qdrant_raising(mock_config, read, failure)
 
 
 # ---------------------------------------------------------------------------
@@ -11369,6 +12010,37 @@ class TestGetMemoryById:
             await service.get_memory_by_id(project_id='dark_factory', memory_id='u')
 
 
+class TestMetadataRowText:
+    """metadata_row_text: the text of one get_memories_by_metadata row.
+
+    Rows take the real scroll shape ``{'id', 'created_at', 'metadata'}`` of
+    backends/mem0_client.py::Mem0Backend._normalise_point, where ``metadata``
+    is the full payload.
+    """
+
+    def test_reads_the_text_from_the_payload_under_metadata(self):
+        row = {
+            'id': 'u',
+            'created_at': '2026-01-01T00:00:00+00:00',
+            'metadata': {'data': 'the text', 'topic': 't', 'created_at': '2026-01-01T00:00:00+00:00'},
+        }
+
+        assert metadata_row_text(row) == 'the text'
+
+    def test_a_top_level_content_key_is_not_the_rows_text(self):
+        row = {'id': 'u', 'content': 'stray', 'created_at': None, 'metadata': {'topic': 't'}}
+
+        assert metadata_row_text(row) == ''
+
+    @pytest.mark.parametrize(
+        'row',
+        [{'id': 'u'}, {'id': 'u', 'metadata': None}, {'id': 'u', 'metadata': 'not-a-dict'}],
+        ids=['no-metadata-key', 'metadata-none', 'metadata-not-a-dict'],
+    )
+    def test_a_row_without_a_payload_dict_reads_as_empty(self, row):
+        assert metadata_row_text(row) == ''
+
+
 class _FakePointStore:
     """A minimal in-memory stand-in for the Qdrant point behind Mem0Backend.
 
@@ -11772,7 +12444,8 @@ _MM_UPDATE_POINT_ID = 'mm-point-1'
 
 
 async def _mm_write(svc, entry_point, *, metadata, category='observations_and_summaries',
-                    project_id='dark_factory', agent_id='claude-task-3195'):
+                    project_id='dark_factory', agent_id='claude-task-3195',
+                    dual_write=False):
     """Drive one write through any of the three seams.
 
     D8/§2 pin enforcement at the SERVICE seam precisely so
@@ -11787,6 +12460,12 @@ async def _mm_write(svc, entry_point, *, metadata, category='observations_and_su
     record already carries one), so the harness supplies it explicitly rather
     than leaving the shared "caller keys survive alongside category"
     assertion to pass vacuously on two seams and fail on the third.
+
+    *dual_write* (task 3508) is forwarded ONLY on the ``add_memory`` arm:
+    neither ``add_system_record`` nor ``update_memory`` has the parameter,
+    because both always land in Mem0 whatever their ``category`` tag, so
+    there is nothing for the flag to switch.  ``dual_write=True`` is the only
+    state in which a Graphiti-primary category still reaches Mem0.
     """
     if entry_point == 'add_memory':
         return await svc.add_memory(
@@ -11796,6 +12475,7 @@ async def _mm_write(svc, entry_point, *, metadata, category='observations_and_su
             agent_id=agent_id,
             metadata=metadata,
             causation_id='c1',
+            dual_write=dual_write,
         )
     if entry_point == 'update_memory':
         # The §5(c) existence check and leaf δ's parent-liveness lookup share
@@ -11882,6 +12562,13 @@ _MM_ENTRY_POINTS = ['add_memory', 'add_system_record', 'update_memory']
 #: shrinking ``_MM_ENTRY_POINTS``, so the default for a new shared case stays
 #: "runs against all three".
 _MM_ADD_ENTRY_POINTS = ['add_memory', 'add_system_record']
+
+#: The entry points whose writes land in Mem0 REGARDLESS of the ``category``
+#: tag, so they pass ``reaches_mem0=True`` unconditionally (task 3508).
+#: ``add_memory`` is the only entry point whose routing depends on
+#: category/``dual_write``.  A fourth write path must be classified here
+#: explicitly rather than inheriting one side by accident.
+_MM_MEM0_ONLY_ENTRY_POINTS = ['add_system_record', 'update_memory']
 
 
 class TestMemoryMetadataValidationAtSeam:
@@ -12742,24 +13429,38 @@ class TestCanonicalUniquenessAtSeam:
         _mm_backend_mock(service, entry_point).assert_not_called()
         assert 'canonical_uniqueness_check_unavailable' in _mm_census_codes(caplog)
 
-    # -- scope: the invariant is Mem0-scoped -------------------------------
+    # -- scope: closed by the routing refusal (task 3508) -------------------
 
     @pytest.mark.asyncio
-    async def test_graphiti_primary_canonical_is_only_checked_against_mem0(
+    async def test_graphiti_only_canonical_is_refused_and_never_probes(
         self, service, caplog
     ):
-        """PINS the known scope limit so the silence cannot read as coverage.
+        """The scope limit is CLOSED, and the probe is no longer spent on it.
 
-        Both probes are Qdrant payload filters, but the seam deliberately
-        runs BEFORE the write_graphiti/write_mem0 branching. So for a
-        Graphiti-primary category the probe still runs (dual_write can
-        route any category into Mem0, which is why it is not skipped on
-        category alone) but can only ever see Mem0 rows — a
-        previously-written Graphiti-only canonical is invisible to it and
-        the <=1-per-(project, topic) rule does NOT hold there.
+        REWRITTEN, not deleted (task 3508): this test used to pin that the
+        probe IS issued for a Graphiti-primary write and that the write is
+        then ADMITTED. Both are now false, but the scope still needs a pin
+        — it is just a different fact.
+
+        The decisive fact, measured rather than inferred: on a write that
+        reaches only Graphiti the metadata is DISCARDED, not merely
+        uncounted — so `canonical`/`topic` are never stored, unreadable by
+        pick_survivor and uncountable by this very probe, both of which
+        read Mem0. (The graphiti_core measurement behind that is
+        single-homed in `check_canonical_routing`'s docstring.) Admitting
+        such a write would silently destroy the caller's assertion, so the
+        seam refuses it instead (canonical_on_non_mem0_write).
+
+        The probe is therefore SKIPPED: it could only ever return 0 on a
+        write that is already doomed, and the seam promises the ordinary
+        path issues zero wasted round-trips.
+
+        Note the flag: this test runs in WARN mode, the shipped default,
+        where "refused" means censused-and-still-written. The refusal only
+        stops the write once `enforce` is on (task 3626).
         """
         caplog.set_level(logging.WARNING, logger=_MM_CENSUS_LOGGER)
-        service.config.memory_metadata.enforce = True
+        service.config.memory_metadata.enforce = False
         # No Mem0 twin: exactly the state a Graphiti-only canonical leaves.
         service.mem0.count_by_metadata = AsyncMock(return_value=0)
 
@@ -12769,22 +13470,32 @@ class TestCanonicalUniquenessAtSeam:
             category='decisions_and_rationale',
         )
 
-        # The probe IS issued even though this write never reaches Mem0...
-        service.mem0.count_by_metadata.assert_awaited_once()
-        # ...and, seeing no Mem0 row, admits the write. Documented residual,
-        # not an oversight: closing it needs a Graphiti-side count the PRD
-        # does not specify. See _check_canonical_uniqueness's SCOPE note.
-        assert 'canonical_uniqueness_violation' not in _mm_census_codes(caplog)
+        codes = _mm_census_codes(caplog)
+        # Refused at the seam for being unstorable...
+        assert 'canonical_on_non_mem0_write' in codes
+        # ...so the uniqueness probe is never issued. No second census line
+        # either: reporting the one defect twice would render it as two.
+        service.mem0.count_by_metadata.assert_not_awaited()
+        assert 'canonical_uniqueness_violation' not in codes
 
     @pytest.mark.asyncio
-    async def test_graphiti_primary_canonical_is_rejected_when_a_mem0_twin_exists(
+    async def test_dual_write_canonical_is_rejected_when_a_mem0_twin_exists(
         self, service
     ):
-        """POSITIVE CONTROL for the scope test above.
+        """POSITIVE CONTROL for the test above, RE-POINTED at dual_write.
 
-        Without it, "no rejection for decisions_and_rationale" could not
-        distinguish the documented Mem0 scope from the check simply being
-        dead for Graphiti-primary categories.
+        Without a control, "no probe for decisions_and_rationale" could not
+        distinguish the routing refusal from the check simply being dead
+        for Graphiti-primary categories.
+
+        Re-pointed from dual_write=False to True (task 3508) because that
+        is the state which genuinely makes such a write Mem0-reaching — and
+        that makes this a strictly BETTER control than the one it replaces.
+        It now pins the load-bearing property: the predicate is the routing
+        OUTCOME, not category membership. A later reader who "simplifies"
+        `reaches_mem0` to `resolved_category in MEM0_PRIMARY` would break
+        dual_write silently, refusing canonical writes that do land in Mem0
+        and are perfectly enforceable — this test is what stops that.
         """
         from fused_memory.memory_metadata import CanonicalUniquenessViolation
 
@@ -12796,7 +13507,214 @@ class TestCanonicalUniquenessAtSeam:
                 service, 'add_memory',
                 metadata={'topic': self._TOPIC, 'canonical': True},
                 category='decisions_and_rationale',
+                dual_write=True,
             )
+        # The probe RAN — this write really does reach Mem0.
+        service.mem0.count_by_metadata.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_no_probe_and_no_new_code_on_a_graphiti_only_ordinary_write(
+        self, service, caplog
+    ):
+        """GUARD: the ordinary Graphiti-primary path is unregressed.
+
+        `test_no_round_trip_on_the_ordinary_path` covers the Mem0-primary
+        category only, so without this a change that made EVERY
+        Graphiti-primary write pay a round-trip — or censused every one of
+        them as a routing violation — would go unnoticed. Non-canonical
+        writes are the overwhelming majority; they must be untouched.
+        """
+        caplog.set_level(logging.WARNING, logger=_MM_CENSUS_LOGGER)
+        _mm_set_canonical_incumbent(service, self._INCUMBENT, topic=self._TOPIC)
+
+        await _mm_write(
+            service, 'add_memory',
+            metadata={'topic': self._TOPIC},
+            category='decisions_and_rationale',
+        )
+
+        service.mem0.count_by_metadata.assert_not_awaited()
+        assert 'canonical_on_non_mem0_write' not in _mm_census_codes(caplog)
+
+
+class TestCanonicalRoutingAtSeam:
+    """`canonical: True` on a write that cannot reach Mem0 (task 3508).
+
+    The seam half of `check_canonical_routing`. Every case drives a REAL
+    write through `_mm_write` rather than calling the rule directly, so
+    what is pinned is the wiring — that the seam computes `reaches_mem0`
+    and consults the rule — not the rule, which
+    `TestCanonicalRoutingRule` (tests/test_memory_metadata.py) already
+    owns.
+
+    The predicate is "will this land in Mem0", NOT "is the category
+    Mem0-primary": `dual_write=True` routes a Graphiti-primary category
+    into Mem0 too, where `canonical` genuinely IS stored and IS
+    enforceable. The CONTROL cases below exist so a later reader
+    cannot collapse the entry points onto one expression.
+    """
+
+    _TOPIC = 'some-topic'
+    _CODE = 'canonical_on_non_mem0_write'
+    _GRAPHITI_PRIMARY = 'decisions_and_rationale'
+
+    @pytest.mark.asyncio
+    async def test_warn_mode_censuses_and_lets_the_write_through(self, service, caplog):
+        """Warn mode's contract is census-and-proceed, not reject.
+
+        This is the SHIPPED default (`enforce = False`), so it is the
+        behaviour the live fleet actually gets: the new rule is inert on
+        the write path until task 3626's measured flip. A version that
+        raised here would be an outage on the day it landed.
+
+        BOTH halves are asserted, not just the census. "Proceeds" verified
+        only by the absence of a raise would still pass if a regression
+        censused correctly and then silently dropped the write (say, an
+        early `return` added after `emit_schema_warnings`) — and on this,
+        the shipped path, the proceed half is the more valuable one. The
+        category is Graphiti-primary, so the durable-queue enqueue IS the
+        write.
+        """
+        caplog.set_level(logging.WARNING, logger=_MM_CENSUS_LOGGER)
+        assert service.config.memory_metadata.enforce is False
+
+        await _mm_write(
+            service, 'add_memory',
+            metadata={'topic': self._TOPIC, 'canonical': True},
+            category=self._GRAPHITI_PRIMARY,
+        )
+
+        assert self._CODE in _mm_census_codes(caplog)
+        service.durable_queue.enqueue.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_enforce_mode_rejects_with_the_shape_error_not_the_uniqueness_one(
+        self, service
+    ):
+        """The two rejection contracts must stay distinguishable by `except`.
+
+        `CanonicalUniquenessViolation`'s contracted message asserts a NAMED
+        incumbent exists — a fact this check never observes. "You asserted
+        canonical where it cannot be stored" and "a duplicate already
+        exists" are different facts, and the PRD contract-fixes the two as
+        siblings, not subclasses, for exactly that reason.
+        """
+        from fused_memory.memory_metadata import (
+            CanonicalUniquenessViolation,
+            MemoryMetadataValidationError,
+        )
+
+        service.config.memory_metadata.enforce = True
+
+        with pytest.raises(MemoryMetadataValidationError) as excinfo:
+            await _mm_write(
+                service, 'add_memory',
+                metadata={'topic': self._TOPIC, 'canonical': True},
+                category=self._GRAPHITI_PRIMARY,
+            )
+        assert self._CODE in {v.code for v in excinfo.value.violations}
+        assert not isinstance(excinfo.value, CanonicalUniquenessViolation)
+
+    @pytest.mark.asyncio
+    async def test_rejection_happens_before_any_persistence(self, service):
+        """Nothing may reach either store once the write is doomed.
+
+        Mirrors `TestCanonicalUniquenessAtSeam`'s test of the same name.
+        Both halves matter: a Mem0 call would persist the record the
+        rejection just refused, and a Graphiti enqueue would durably
+        commit the twin whose missing metadata is the entire defect.
+        """
+        from fused_memory.memory_metadata import MemoryMetadataValidationError
+
+        service.config.memory_metadata.enforce = True
+        journal = _mm_install_journal(service)
+
+        with pytest.raises(MemoryMetadataValidationError):
+            await _mm_write(
+                service, 'add_memory',
+                metadata={'topic': self._TOPIC, 'canonical': True},
+                category=self._GRAPHITI_PRIMARY,
+            )
+        # `assert_not_awaited` on all three, not `assert_not_called`: all are
+        # AsyncMocks awaited in production, and the task-525 house convention
+        # (enforced by test_check_asyncmock_assertion_style) forbids mixing
+        # the two styles within one function.
+        service.mem0.add.assert_not_awaited()
+        service.durable_queue.enqueue.assert_not_awaited()
+        journal.log_mem0_intent.assert_not_awaited()
+
+    # -- controls: the code must not fire everywhere ------------------------
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('enforce', [False, True])
+    async def test_a_mem0_primary_write_is_untouched(self, service, caplog, enforce):
+        """CONTROL. Without it, "the code fires" cannot be told apart from
+        "the code always fires".
+
+        `observations_and_summaries` is Mem0-primary, so the marker IS
+        stored and IS enforceable — the live uniqueness probe owns that
+        case and this rule must stay silent, under EITHER flag.
+        """
+        caplog.set_level(logging.WARNING, logger=_MM_CENSUS_LOGGER)
+        service.config.memory_metadata.enforce = enforce
+
+        await _mm_write(
+            service, 'add_memory',
+            metadata={'topic': self._TOPIC, 'canonical': True},
+        )
+
+        assert self._CODE not in _mm_census_codes(caplog)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('enforce', [False, True])
+    @pytest.mark.parametrize('entry_point', _MM_MEM0_ONLY_ENTRY_POINTS)
+    async def test_mem0_only_entry_points_are_untouched_even_for_a_graphiti_category(
+        self, service, caplog, entry_point, enforce
+    ):
+        """CONTROL, and a deliberate pin of the ENTRY-POINT ASYMMETRY.
+
+        `add_system_record` never routes to Graphiti, and `update_memory`
+        amends a record that already lives in Mem0; on both, `category` is
+        a metadata TAG, never a routing input. So their canonical markers
+        are always stored, and they pass `reaches_mem0=True` rather than
+        recomputing add_memory's expression — which would refuse a valid
+        record on nothing but its tag.
+        """
+        caplog.set_level(logging.WARNING, logger=_MM_CENSUS_LOGGER)
+        service.config.memory_metadata.enforce = enforce
+
+        await _mm_write(
+            service, entry_point,
+            metadata={'topic': self._TOPIC, 'canonical': True},
+            category=self._GRAPHITI_PRIMARY,
+        )
+
+        assert self._CODE not in _mm_census_codes(caplog)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_MEM0_ONLY_ENTRY_POINTS)
+    async def test_mem0_only_entry_points_still_probe_a_graphiti_tagged_canonical(
+        self, service, entry_point
+    ):
+        """POSITIVE CONTROL for the case above.
+
+        Without it, "no routing code" could not be told apart from "the
+        uniqueness probe was skipped too" — guard 4's early return would
+        make both invisible. On `update_memory` the probe is reachable
+        because `_MM_UPDATE_PRE_IMAGE` holds no claim, so guard 3 is inert.
+        """
+        from fused_memory.memory_metadata import CanonicalUniquenessViolation
+
+        service.config.memory_metadata.enforce = True
+        _mm_set_canonical_incumbent(service, 'incumbent-uuid-1', topic=self._TOPIC)
+
+        with pytest.raises(CanonicalUniquenessViolation):
+            await _mm_write(
+                service, entry_point,
+                metadata={'topic': self._TOPIC, 'canonical': True},
+                category=self._GRAPHITI_PRIMARY,
+            )
+        service.mem0.count_by_metadata.assert_awaited_once()
 
 
 class TestCanonicalClaimChangeOnTheUpdatePath:
@@ -12924,6 +13842,34 @@ class TestCanonicalClaimChangeOnTheUpdatePath:
         call = service.mem0.count_by_metadata.await_args
         filters = call.kwargs.get('filters', call.args[1] if len(call.args) > 1 else None)
         assert filters == {'topic': 'other-topic', 'canonical': True}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('held', [1, 1.0, 'true'])
+    async def test_a_non_bool_canonical_pre_image_is_not_a_held_claim(
+        self, service, held
+    ):
+        """A pre-image whose canonical is not the bool True does not hold the
+        claim under the strict meaning, so patching it to True ACQUIRES the
+        claim and must be probed.
+
+        Guard 3's tuple equality `(1, t) == (True, t)` let int and float
+        pre-images skip the probe; 'true' is the companion row.
+        """
+        from fused_memory.memory_metadata import CanonicalUniquenessViolation
+
+        service.config.memory_metadata.enforce = True
+        self._stage(service, {'topic': self._TOPIC, 'canonical': held})
+        _mm_set_canonical_incumbent(service, self._INCUMBENT, topic=self._TOPIC)
+
+        with pytest.raises(CanonicalUniquenessViolation) as excinfo:
+            await service.update_memory(
+                memory_id=self._POINT, project_id='dark_factory',
+                metadata_patch={'canonical': True},
+            )
+
+        assert excinfo.value.incumbent_id == self._INCUMBENT
+        service.mem0.count_by_metadata.assert_awaited_once()
+        service.mem0.set_payload.assert_not_called()
 
 
 class TestParentIdLivenessAtSeam:
@@ -14113,6 +15059,22 @@ class TestReferentScanNarrowsWithTheProjectRegistry:
         assert self._enqueued_refs(service) == [self.EVIL_REF]
 
     @pytest.mark.asyncio
+    async def test_a_never_wired_service_narrows_with_an_env_registered_root(
+        self, mock_config, monkeypatch, tmp_path,
+    ):
+        """The constructor's env seed reaches this consumer, not only the storm alarm."""
+        root = tmp_path / 'reify'
+        root.mkdir()
+        monkeypatch.setenv(KNOWN_PROJECT_ROOTS_ENV, str(root))
+        service = _mocked_service(mock_config)
+
+        await service.add_memory(
+            content=self.JUNK_BODY, category='entities_and_relations', project_id='test'
+        )
+
+        assert self._enqueued_refs(service) == []
+
+    @pytest.mark.asyncio
     async def test_add_memory_preserves_a_genuine_in_registry_foreign_ref(self, service):
         service.set_known_projects(self.REGISTRY)
         await service.add_memory(
@@ -14170,13 +15132,14 @@ class TestSetKnownProjectsLogsTheWireUp:
     """One INFO line per wire-up, naming whether referent narrowing is ACTIVE.
 
     `set_known_projects` is the single injection point every caller goes
-    through (`server/main.py` plus tests), so a future second caller cannot
-    bypass the report by wiring the registry somewhere else.
+    through (the constructor's env seed, `server/main.py` and tests), so a
+    future second caller cannot bypass the report by wiring the registry
+    somewhere else.
 
     The PERMISSIVE arm is logged too, and is the one an operator most needs:
-    `MemoryService` is constructed before `build_known_projects_map` runs, so
-    an empty registry is a real and easily-missed window — and while it lasts,
-    every producer scan silently stays permissive.
+    with DASHBOARD_KNOWN_PROJECT_ROOTS unset the constructor's seed is empty
+    until startup wiring, so an empty registry is a real and easily-missed
+    window — and while it lasts, every producer scan silently stays permissive.
     """
 
     @staticmethod

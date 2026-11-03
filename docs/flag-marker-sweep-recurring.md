@@ -32,6 +32,10 @@ re-measured on **2026-08-17** (task 3923; the 2026-08-09 figures from task
 | `reify` | 0 | 0 | 27 (was 80 on 08-09) |
 | `know_live` | 0 | 1 | not probed |
 
+Re-measured **2026-10-30** (task 6241): `source` = 0 in all 11 registered
+projects and `kind` = 0 everywhere probed, `know_live` included; see
+[The in-cycle collector applies the same arm](#the-in-cycle-collector-applies-the-same-arm-task-6241).
+
 The `source` filter — the one `--check`'s verdict actually reads — matches
 **0 records in all three projects probed**, now including `know_live`, which
 neither task 3897 nor the task-2902 watch had probed. So the nightly run is
@@ -66,8 +70,8 @@ enumerates it, never runs a predicate over it, and never adds it to the
 delete set — a boundary enforced by `TestFlagForStage2IsNeverDeleted` in
 `fused-memory/tests/test_sweep_orphan_flag_markers.py`. Three reasons were
 originally given, two of them measured on 2026-08-09. Item 2 has since been
-closed by task 4435 (on the two gaps it named — see the divergence note under
-it) and no longer carries any weight; the ruling stands on items 1 and 3, each
+closed by task 4435 (on the two gaps it named — see the note under it) and no
+longer carries any weight; the ruling stands on items 1 and 3, each
 independently sufficient:
 
 1. **23 of the 61 live records carry no usable `task_id`**, so the script's
@@ -96,28 +100,15 @@ independently sufficient:
    so a reader can see the gap existed and was closed rather than wondering
    whether it was ever considered.
 
-   **Do not read this as full parity with the in-cycle collector.**
-   `_sweep_stale_mem0_pool` applies a THIRD protected-record predicate the
-   script still lacks: `is_protected_audit_record` /
-   `PROTECTED_AUDIT_KINDS` (task 4375), which withholds
-   deliberately-permanent audit records such as `kind='cadence_check'` —
-   the guard added after an age-only rule destroyed 40 of them in
-   `autopilot_video`. The script's own `find_stale_markers` /
-   `find_terminal_task_markers` can still reach such a record if it carries
-   `source='stage1_flag_marker'`. That divergence is deliberate (task
-   4435's scope was the two counts above, and the audit arm does not port
-   mechanically — in the in-cycle collector it sits BEHIND a primary
-   terminal-task-closure gate, whereas this script's `--terminal-drain`
-   deliberately deletes markers *because* their task went terminal) and is
-   tracked as **task 5129**. It does not reopen this item, whose subject was
-   the mirror guard and the tombstone write — both closed. If anything it
-   argues the other way: the 40 destroyed `cadence_check` records were in
-   *this* `flag_for_stage2` pool, so a script that deleted from it while
-   still missing the audit guard would repeat exactly that loss. Within the
-   script's own `source` enumeration the gap is live but latent for the same
-   structural reason item 2 was before it was closed: that filter is
-   documented above as matching zero records in every project probed, so it
-   reaches no `cadence_check` record either — today.
+   `_sweep_stale_mem0_pool` applies a THIRD protected-record predicate,
+   `is_protected_audit_record` / `PROTECTED_AUDIT_KINDS` (task 4375), which
+   withholds deliberately-permanent audit records such as
+   `kind='cadence_check'` — the guard added after an age-only rule destroyed
+   40 of them in `autopilot_video`. Task 5286 ported it to the script,
+   together with a primary arm of the script's own; the decision is recorded
+   in [Protected-record guards](#protected-record-guards-denylist-plus-a-primary-arm-task-5286).
+   That does not reopen this item, whose subject was the mirror guard and the
+   tombstone write.
 3. **The pool is already drained correctly** by task 2966's in-cycle
    collector, on a rolling 14-day window. A second collector here would race
    a correct one, producing duplicate deletes and duplicate tombstones for
@@ -126,6 +117,126 @@ independently sufficient:
 Whether those records should *ultimately* be deleted is a separate question,
 now adjudicable because the sweep can finally see them. Making them visible
 is this script's job; deleting them is not.
+
+### Protected-record guards: denylist plus a primary arm (task 5286)
+
+Every record the sweep withholds is classified by
+`fused-memory/scripts/sweep_orphan_flag_markers.py::protection_reason`, in
+this order. Each skip's WARNING names its reason, and the JSON report's
+`protected_skipped_reasons` maps each skipped id to it:
+
+1. `cycle_summary_mirror` — `mem0_tombstone.is_protected_mirror_record`
+   (tasks 3041/4435).
+2. `protected_audit_kind` — `mem0_tombstone.is_protected_audit_record`, the
+   `PROTECTED_AUDIT_KINDS` denylist (task 4375).
+3. `foreign_kind` — the script's PRIMARY arm: a `kind` that is present and
+   is not `stage1_flag_marker`.
+
+**Decision:** the denylist PLUS a named primary arm, the foreign-kind arm.
+
+**Why a primary arm is needed.** The denylist protects only the kinds
+someone registered, and in this script that is not enough:
+
+- `find_orphan_markers` (`kind != MARKER_KIND`) nominates any foreign-kind
+  record IMMEDIATELY, at any age and in every mode, so an unregistered audit
+  kind would be reached on the first run.
+- `--terminal-drain` walks into the denylist's residual intersection by
+  design: it deletes markers *because* their task went terminal.
+
+**Why not the terminal-closure gate.** `mem0_tombstone` names the
+terminal-task-closure gate as the primary defence, but `--terminal-drain` is
+its inverse. That gate also guards only the `flag_for_stage2` collector; this
+pool's in-cycle collector, `_sweep_stale_mem0_flag_markers`, is age-based with
+no closure gate, and since task 6241 applies this same foreign-kind arm (see
+[below](#the-in-cycle-collector-applies-the-same-arm-task-6241)).
+
+**Why the foreign-kind arm.** The legacy pool's shape is exactly "kind absent
+or `stage1_flag_marker`", so a declared different kind is positive evidence
+that the record belongs to another pool, and an unregistered audit kind is
+protected without anyone editing a list. The arm ignores task status, so it
+behaves identically with and without `--terminal-drain`. Since task 6241 the
+in-cycle collector withholds the same records, so a foreign-kind record in
+this pool is drained by neither collector; that cost is accepted
+[below](#the-in-cycle-collector-applies-the-same-arm-task-6241).
+
+**Why the denylist is kept.** Correct attribution — an audit record is
+reported as `protected_audit_kind`, never as merely `foreign_kind` — and
+parity with the in-cycle collector, so a future narrowing of the primary arm
+cannot silently drop audit protection.
+
+**The accepted residual.** An audit record that carries NO `kind` is
+protected by neither arm, the same as in-cycle.
+
+**The arm is absolute.** Like the mirror guard, it is enforced at the delete
+choke point and overrides `--delete-ids` (`targeted_correction_ids` still
+shows the refused request). The remedy for a record that genuinely must go is
+the individually authorised fused-memory MCP `delete_memory` tool. Every
+protected record also floors the residual backlog; see
+[`structural_floor`](#structural_floor-which-part-of-the-backlog-can-never-be-drained).
+
+### The in-cycle collector applies the same arm (task 6241)
+
+**Decision:** `_sweep_stale_mem0_flag_markers` withholds foreign-kind records
+too. The rule has one home,
+`fused-memory/src/fused_memory/reconciliation/mem0_tombstone.py::is_foreign_kind_record`,
+called by this script's `protection_reason`, by the in-cycle skeleton
+`_sweep_stale_mem0_pool` through its opt-in `pool_kind` argument, and by the
+`flag_for_stage2` collector's task-less arm (`_TasklessRetirement.permits`,
+task 4995). In-cycle it is checked after the mirror and audit guards and
+before the age test, the same order as `protection_reason`, so an audit record
+is still reported as an audit record. The `flag_for_stage2` collector does not
+pass `pool_kind`: its filter is wide by design, its kinds are a free-form long
+tail, and its primary arm is the terminal-closure gate.
+
+**Census, 2026-10-30**, through the fused-memory MCP
+`count_memories_by_metadata` / `get_memories_by_metadata` against the live
+service, while planning task 6241:
+
+- `{'source': 'stage1_flag_marker'}`: 0 records in all 11 registered
+  projects — `dark_factory`, `reify`, `autopilot_video`, `know_live`,
+  `solar_challenge`, `solar_challenge_platform`, `pump_web_ui`,
+  `scoping_intake`, `stream_touch`, `autotrade` and `mission_control`.
+- `{'kind': 'stage1_flag_marker'}`: 0 in `dark_factory`, `reify`,
+  `autopilot_video` and `know_live` (marker `a5732b3b` has been drained).
+- Positive controls were non-zero — `dark_factory` `{flag_for_stage2: True}`
+  = 1, `autopilot_video` `{kind: cadence_check}` = 2 — so the zeros are not a
+  blind probe.
+
+No live record in this pool declares a foreign kind, so the decision changes
+the outcome for none.
+
+**The create path is closed.** `MemoryService.add_memory` and
+`MemoryService.add_system_record` both call
+`fused-memory/src/fused_memory/reconciliation/flag_record_contract.py::enforce_flag_record_write_contract`,
+which refuses `source='stage1_flag_marker'` with any other non-`None` `kind`
+for every agent, not only `recon-stage-*`. The only residual writer is
+`update_memory`'s metadata patch, which that module's docstring places outside
+the contract.
+
+**Why keep rather than delete.**
+
+- Reconciliation's posture: uncertain means keep, and bounded recoverable
+  growth outranks permanent loss.
+- A structurally opt-in primary arm. `PROTECTED_AUDIT_KINDS` is
+  denylist-by-omission, the failure mode behind the 40 lost `cadence_check`
+  records, and this was the only marker collector without an opt-in arm: an
+  unregistered audit kind carrying `source='stage1_flag_marker'` would have
+  been age-deleted after 14 days, silently and irreversibly.
+- One pool definition. The manual and in-cycle collectors now agree that the
+  pool is "kind absent or `stage1_flag_marker`".
+
+**The accepted consequence.** A foreign-kind record in this pool is drained by
+neither collector. It:
+
+- permanently floors `structural_floor`, which already classifies it as
+  undrainable;
+- defeats the in-cycle count short-circuit for its project, costing one scroll
+  per cycle;
+- emits one WARNING per sweep naming its kind, so it cannot accumulate
+  silently.
+
+The remedy is the fused-memory MCP `delete_memory` tool for a dead record, or
+registering a genuinely permanent audit kind in `PROTECTED_AUDIT_KINDS`.
 
 ## Reading the output: `0 swept` is not automatically a clean bill
 
@@ -186,9 +297,10 @@ their remedies:
   `--check` without `--terminal-drain` counts terminal-referenced undated
   markers as floor, which is the honest answer to "can THIS command's gate
   ever pass". The logged remedy names the missing flag.
-- **Protected.** `cycle_summary` mirrors and `ledger_stamp` records are
-  refused unconditionally at the delete choke point, overriding even
-  `--delete-ids` (tasks 3041/4435). This arm is **absolute**: no flag of this
+- **Protected.** `cycle_summary` mirrors and `ledger_stamp` records (tasks
+  3041/4435), `PROTECTED_AUDIT_KINDS` audit records (task 4375) and
+  foreign-kind records (task 5286) are refused unconditionally at the delete
+  choke point, overriding even `--delete-ids`. This arm is **absolute**: no flag of this
   script drains it, so the remedy is the fused-memory MCP `delete_memory`
   tool or a corrected `source` enumeration.
 
@@ -241,9 +353,8 @@ figures are in the emitted JSON (`structural_floor.undrainable_count` and
   `cross_check.blind_spot`.
 
 The floor is defined over the sweep's KEEP-sets rather than over an
-enumerated list of sources, so task 5129's pending second protected
-predicate (`is_protected_audit_record` / `PROTECTED_AUDIT_KINDS`) will widen
-this floor automatically once it joins the delete-set subtraction.
+enumerated list of sources, so when task 5286 added the audit and
+foreign-kind arms to the protected set, this floor widened automatically.
 
 **An observed blind spot fails `--check` BY DEFAULT (task 3923).** A verdict
 rendered from an enumeration that matched nothing must not read as a pass,
@@ -460,10 +571,12 @@ an `if not known_projects` check is unreachable in exactly the degradation it
 looks like it guards. Three cases are distinguished:
 
 - **a named root that is not a directory on this host** — a typo, or a
-  moved/unmounted checkout. `Path.resolve()` is non-strict, so the builder
-  *admits* such a root under a basename-derived project_id rather than
-  skipping it: the nightly then sweeps a phantom project that enumerates 0,
-  deletes 0 and exits 0 — a silent green. Named individually.
+  moved/unmounted checkout. The builder *admits* such a root under a
+  basename-derived project_id deliberately, and WARNs at build time (task
+  5286; `fused-memory/src/fused_memory/models/scope.py::build_known_projects_map`'s
+  docstring records why). The nightly still sweeps that phantom project,
+  which enumerates 0, deletes 0 and exits 0 — a silent green — so the report
+  names it individually.
 - **a named root whose resolved path is absent from the map** — its
   project_id was claimed first by a root listed earlier (`first-wins`, with
   the primary root seeded first), so that checkout is never swept. Named

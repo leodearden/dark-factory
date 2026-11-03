@@ -1,7 +1,7 @@
 """Tests for scripts/watcher-rearm.sh -- the canonical bounded-wait +
 re-arm wrapper both escalation-watcher SKILL.md files shell out to.
 
-Two kinds of coverage:
+Three kinds of coverage:
   - Guard/usage tests run the script with a deliberately minimal env -- no
     ambient DARK_FACTORY_ROOT/PROJECT_ROOT leaks in, so the "missing env"
     case is exercised regardless of the host running these tests.
@@ -10,14 +10,21 @@ Two kinds of coverage:
     WATCHER_REARM_PYTHON=sys.executable + PYTHONPATH -- the watcher reads
     the queue directly via inotify, never through the MCP server, so this
     is the faithful hermetic "live" end-to-end path.
+  - Default-path tests (see fake_root) leave WATCHER_REARM_PYTHON unset,
+    so the wrapper runs its default interpreter -- the root venv's
+    $DARK_FACTORY_ROOT/.venv/bin/python -- against a fake root, with a
+    recording fake `uv` first on PATH (see _uv_shim).
 """
 from __future__ import annotations
 
+import hashlib
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
 from typing import NamedTuple
+from venv import EnvBuilder
 
 import pytest
 
@@ -67,13 +74,77 @@ def test_missing_env_fails_loudly():
 def _live_env(root):
     """Env for driving the REAL escalation.watcher subprocess: injects
     WATCHER_REARM_PYTHON=sys.executable + PYTHONPATH so the wrapper's
-    default `uv run` interpreter is bypassed and the subprocess imports
-    escalation.watcher (and shared.timestamps) directly from source."""
+    default interpreter (the root venv's python) is bypassed and the
+    subprocess imports escalation.watcher (and shared.timestamps) directly
+    from source."""
     env = dict(os.environ)
     env['DARK_FACTORY_ROOT'] = str(root)
     env['WATCHER_REARM_PYTHON'] = sys.executable
     env['PYTHONPATH'] = f'{root}/escalation/src:{root}/shared/src'
     return env
+
+
+def _uv_shim(tmp_path):
+    """Put a fake `uv` first on PATH that records every invocation and
+    fails. Returns (that PATH, marker path): the marker exists iff something
+    ran `uv`, so "uv is never invoked" is asserted by behaviour, not by
+    grepping the script."""
+    shim_bin = tmp_path / 'shim-bin'
+    shim_bin.mkdir()
+    marker = tmp_path / 'uv-invocations'
+    shim = shim_bin / 'uv'
+    shim.write_text(f'#!/bin/sh\necho "$@" >> {shlex.quote(str(marker))}\nexit 97\n')
+    shim.chmod(0o755)
+    return f'{shim_bin}{os.pathsep}{os.environ.get("PATH", "")}', marker
+
+
+def _default_env(root, path):
+    """Env for driving the wrapper's DEFAULT interpreter against the fake
+    DARK_FACTORY_ROOT `root`: no WATCHER_REARM_PYTHON, no inherited
+    VIRTUAL_ENV. PYTHONPATH points at the checkout under test, not at the
+    fake root, which holds nothing but the .venv a test builds there."""
+    env = {
+        key: value for key, value in os.environ.items()
+        if key not in ('WATCHER_REARM_PYTHON', 'VIRTUAL_ENV')
+    }
+    env['DARK_FACTORY_ROOT'] = str(root)
+    env['PATH'] = path
+    env['PYTHONPATH'] = f'{REPO_ROOT}/escalation/src:{REPO_ROOT}/shared/src'
+    return env
+
+
+def _stub_venv_python(venv):
+    """Make venv/bin/python a working interpreter: a shell stub that execs
+    sys.executable by its own path, so that interpreter's pyvenv.cfg (and
+    with it inotify_simple) still applies. A bare symlink would not work:
+    Python looks for pyvenv.cfg beside the path it was started by, and the
+    fake venv has none."""
+    bin_dir = venv / 'bin'
+    bin_dir.mkdir(parents=True)
+    stub = bin_dir / 'python'
+    stub.write_text(f'#!/bin/sh\nexec {shlex.quote(sys.executable)} "$@"\n')
+    stub.chmod(0o755)
+
+
+class _FakeRoot(NamedTuple):
+    """A fake DARK_FACTORY_ROOT holding no .venv yet, an empty queue dir, the
+    env that drives the wrapper's default interpreter against them, and the
+    uv shim's invocation marker (see _uv_shim)."""
+
+    root: Path
+    queue_dir: Path
+    env: dict[str, str]
+    uv_marker: Path
+
+
+@pytest.fixture
+def fake_root(tmp_path):
+    root = tmp_path / 'root'
+    root.mkdir()
+    queue_dir = tmp_path / 'queue'
+    queue_dir.mkdir()
+    shim_path, uv_marker = _uv_shim(tmp_path)
+    return _FakeRoot(root, queue_dir, _default_env(root, shim_path), uv_marker)
 
 
 def _write_pending(queue_dir, esc_id, task_id='1', level=2):
@@ -291,4 +362,201 @@ def test_exclude_file_ownership_suppresses(tmp_path, mode):
     )
     assert 'esc-' not in result.stdout, (
         f'Expected no escalation JSON on stdout; got {result.stdout!r}'
+    )
+
+
+def test_default_path_never_invokes_uv(fake_root):
+    """With WATCHER_REARM_PYTHON unset, the wrapper runs the shared root
+    venv's interpreter ($DARK_FACTORY_ROOT/.venv/bin/python) directly: the
+    real watcher fires through it, and `uv` is never invoked.
+
+    Why no uv at all, not even `uv run --no-sync` like the systemd units.
+    Measured 2026-10-23, uv 0.11.6, in throwaway workspaces: plain `uv run`
+    removed and recreated a 3.14.4 venv both against a `.python-version` of
+    3.13 and against requires-python <3.14. `--no-sync` stopped both, with
+    the warning "Using incompatible environment". But `--no-sync` still
+    CREATED a missing venv, and REMOVED and RECREATED a venv whose
+    interpreter link dangled. This wrapper must never sync, recreate or prune
+    the main checkout's venv, so it does not call uv."""
+    _stub_venv_python(fake_root.root / '.venv')
+    esc = _write_pending(fake_root.queue_dir, 'esc-60-1', task_id='60', level=2)
+    uv_marker = fake_root.uv_marker
+
+    result = _run(
+        '--queue-dir', str(fake_root.queue_dir), '--level', '2', '--timeout', '5',
+        env=fake_root.env,
+    )
+
+    assert result.returncode == 0, (
+        f'Expected exit 0; got {result.returncode}\n'
+        f'stdout={result.stdout!r} stderr={result.stderr!r}'
+    )
+    assert esc.id in result.stdout, (
+        f'Expected the escalation JSON on stdout; got stdout={result.stdout!r} '
+        f'stderr={result.stderr!r}'
+    )
+    assert 'WATCHER_REARM_OUTCOME: FIRED exit=0' in result.stderr, (
+        f'Expected the FIRED outcome line on stderr; got {result.stderr!r}'
+    )
+    assert not uv_marker.exists(), (
+        f'Expected the default path never to invoke uv; the uv shim recorded '
+        f'{uv_marker.read_text()!r}'
+    )
+
+
+def _venv_snapshot(venv_dir):
+    """Content snapshot of a venv tree, or None when nothing is there.
+
+    Every entry under venv_dir maps to its link target, 'dir', or the
+    sha256 of its bytes, so a remove-and-recreate or an install shows up as a
+    difference."""
+    if not os.path.lexists(venv_dir):
+        return None
+    entries = []
+    for dirpath, dirnames, filenames in os.walk(venv_dir, followlinks=False):
+        for name in dirnames + filenames:
+            path = os.path.join(dirpath, name)
+            relpath = os.path.relpath(path, venv_dir)
+            if os.path.islink(path):
+                entries.append((relpath, 'link:' + os.readlink(path)))
+            elif os.path.isdir(path):
+                entries.append((relpath, 'dir'))
+            else:
+                digest = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+                entries.append((relpath, 'file:' + digest))
+    return sorted(entries)
+
+
+_NOT_EXECUTABLE = 'not an executable interpreter'
+
+
+def _missing_venv(venv_dir):
+    return _NOT_EXECUTABLE
+
+
+def _dangling_interpreter(venv_dir):
+    interpreter = venv_dir / 'bin' / 'python'
+    interpreter.parent.mkdir(parents=True)
+    interpreter.symlink_to(venv_dir / 'gone' / 'python3.13')
+    return _NOT_EXECUTABLE
+
+
+def _empty_venv(venv_dir):
+    """The shape `uv run --no-sync` leaves after creating a missing venv: a
+    real interpreter with nothing installed, so `import escalation.watcher`
+    fails (on inotify_simple) even with the source tree on PYTHONPATH."""
+    EnvBuilder(with_pip=False, symlinks=True).create(str(venv_dir))
+    return 'cannot import escalation.watcher (ModuleNotFoundError'
+
+
+def _silently_failing_interpreter(venv_dir):
+    """An interpreter that dies without a word, as one killed by a signal
+    would: the diagnostic falls back to its exit status."""
+    interpreter = venv_dir / 'bin' / 'python'
+    interpreter.parent.mkdir(parents=True)
+    interpreter.write_text('#!/bin/sh\nexit 3\n')
+    interpreter.chmod(0o755)
+    return 'cannot import escalation.watcher (exit 3, no output)'
+
+
+# Each builder makes one broken shape of the root .venv and returns a token
+# naming its problem, which the refusal diagnostic must contain.
+_BROKEN_VENVS = [
+    pytest.param(_missing_venv, id='missing'),
+    pytest.param(_dangling_interpreter, id='dangling-interpreter'),
+    pytest.param(_empty_venv, id='empty-venv'),
+    pytest.param(_silently_failing_interpreter, id='silent-interpreter'),
+]
+
+
+@pytest.mark.parametrize('build', _BROKEN_VENVS)
+def test_default_path_refuses_broken_venv(fake_root, build):
+    """A root venv that cannot run the watcher makes the default path refuse
+    with exit 2 and a diagnostic naming the venv and the problem, BEFORE any
+    side effect: no exclude-file is created, uv is never invoked, and the
+    venv is left exactly as it was found."""
+    root_venv = fake_root.root / '.venv'
+    token = build(root_venv)
+    before = _venv_snapshot(root_venv)
+    queue_dir = fake_root.queue_dir
+    uv_marker = fake_root.uv_marker
+
+    result = _run(
+        '--queue-dir', str(queue_dir), '--level', '2', '--timeout', '5',
+        env=fake_root.env,
+    )
+
+    assert result.returncode == 2, (
+        f'Expected exit 2 (guard refusal); got {result.returncode}\n'
+        f'stdout={result.stdout!r} stderr={result.stderr!r}'
+    )
+    assert str(root_venv) in result.stderr, (
+        f'Expected the diagnostic to name the venv {str(root_venv)!r}; '
+        f'got {result.stderr!r}'
+    )
+    assert token in result.stderr, (
+        f'Expected the diagnostic to name the problem ({token!r}); '
+        f'got {result.stderr!r}'
+    )
+    assert 'WATCHER_REARM_OUTCOME' not in result.stderr, (
+        f'Expected a plain guard diagnostic with no outcome marker (the '
+        f'watcher was never invoked); got {result.stderr!r}'
+    )
+    assert not uv_marker.exists(), (
+        f'Expected a refusal never to invoke uv; the uv shim recorded '
+        f'{uv_marker.read_text()!r}'
+    )
+    assert _venv_snapshot(root_venv) == before, (
+        'Expected the refusal to leave the root venv exactly as it found it'
+    )
+    assert not (queue_dir / '.watcher-rearm-exclude-l2').exists(), (
+        'Expected the guard to refuse before the wrapper creates its '
+        'exclude-file'
+    )
+
+
+def test_check_refuses_missing_venv(fake_root):
+    """The --check dry-run reports a run that would refuse as a refusal,
+    not as a would-watch line."""
+    result = _run(
+        '--check', '--queue-dir', str(fake_root.queue_dir), '--level', '2',
+        env=fake_root.env,
+    )
+
+    assert result.returncode == 2, (
+        f'Expected exit 2 from --check with no root venv; got '
+        f'{result.returncode}\nstdout={result.stdout!r} stderr={result.stderr!r}'
+    )
+    assert str(fake_root.root / '.venv') in result.stderr, (
+        f'Expected the diagnostic to name the venv; got {result.stderr!r}'
+    )
+    assert 'would watch' not in result.stdout, (
+        f'Expected no would-watch line for a run that would refuse; got '
+        f'{result.stdout!r}'
+    )
+
+
+def test_override_needs_no_root_venv(fake_root):
+    """WATCHER_REARM_PYTHON keeps working unchanged: with the override set,
+    the wrapper neither needs nor checks the root venv."""
+    esc = _write_pending(fake_root.queue_dir, 'esc-61-1', task_id='61', level=2)
+    env = {**fake_root.env, 'WATCHER_REARM_PYTHON': sys.executable}
+    uv_marker = fake_root.uv_marker
+
+    result = _run(
+        '--queue-dir', str(fake_root.queue_dir), '--level', '2', '--timeout', '5',
+        env=env,
+    )
+
+    assert result.returncode == 0, (
+        f'Expected exit 0; got {result.returncode}\n'
+        f'stdout={result.stdout!r} stderr={result.stderr!r}'
+    )
+    assert esc.id in result.stdout, (
+        f'Expected the escalation JSON on stdout; got stdout={result.stdout!r} '
+        f'stderr={result.stderr!r}'
+    )
+    assert not uv_marker.exists(), (
+        f'Expected the override path never to invoke uv; the uv shim recorded '
+        f'{uv_marker.read_text()!r}'
     )

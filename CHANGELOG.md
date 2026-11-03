@@ -364,6 +364,17 @@ but never fail a submission. The rule itself lives in a new pure module,
 `escalation/src/escalation/merge_lane_resolution.py`, so it is testable without building a
 server, a queue, a registry and a fake worker.
 
+**`lane_source` has a fourth value, `'unavailable'` (task 5564).** `lane_source` is one of
+`'argument'`, `'task_metadata'`, `'default'` (the task was read and asked for nothing) or
+`'unavailable'` (the task-store read failed or timed out, so what the task carries is
+unknown). Previously a failed read's `{}` was reported as `'default'`, so a main-health
+hotfix relying on `metadata.merge_lane='high'` that was silently downgraded on a degraded
+store looked identical to a healthy no-op submission. The lane itself is unchanged —
+still `'normal'`, fail-open — only the reported provenance is more honest. The spelling
+mirrors `TaskMetadataResult.unavailable`, and the value alone carries the "lane is
+`'normal'` BECAUSE the read failed" fact, so no extra response key was added.
+`resolve_merge_lane` takes the flag as `metadata_unavailable` and stays pure.
+
 **`merge_lane` is now a Tier-A blessed metadata key**, so `parse_metadata` no longer emits
 `code=unknown_key` on every carrier, and `docs/task-authoring.md` §8 states what the key
 means and why `'high'` stays reserved. Blessed rather than promoted to a typed
@@ -389,10 +400,10 @@ own prior canonicals. The cure is ordering plus a closure that is CORROBORATED b
 live re-read, never inferred from "the delete call returned ok".
 
 Ordering is the contract, and each step sits where it does because of what its
-failure would cost: (1) argument validation, pure and free to refuse; (2) fail-closed
-`metadata_patch` authorization, inherited from task 3088's resolver and run
-unconditionally — reparenting is only discovered after the canonical exists, so a late
-denial would abort mid-transaction; (3) the same tool-layer citation gate `delete_memory`
+failure would cost: (1) fail-closed `metadata_patch` authorization, inherited from task
+3088's resolver and run unconditionally — reparenting is only discovered after the
+canonical exists, so a late denial would abort mid-transaction; (2) argument validation,
+pure and free to refuse; (3) the same tool-layer citation gate `delete_memory`
 runs, in its non-mutating `scan_only` pre-flight, so a set that cannot be cleared leaves
 the corpus byte-identical; (4) the canonical write, before anything destructive; (5)
 retained peers tagged, then per supersede read → re-home children → corroborate → delete;
@@ -514,6 +525,262 @@ entry, bounding but not closing it), and `x_memory_citation_tombstones` on citin
 landed, have since landed under task 3134 (below).
 
 ### Changed
+
+#### The starvation watchdog fires only on a stuck signal, and now acts on what it finds (task 3821, esc-4851-3)
+
+Read `STARVATION_WATCHDOG` series from before and after this change under different
+meanings. Before it, most firings measured backlog depth. The 488/741/915/1171-record
+storms were all `skip_count=0`.
+
+**Old behaviour.**
+- The clock was an in-memory `first_seen`, stamped from the monotonic clock. A restart or
+  a one-tick candidacy gap wiped it, so after every restart the whole backlog was
+  stamped as one cohort.
+- An `idle_only` gate fired on age alone (`idle_only_secs`, 72h), so that cohort, and
+  every low task that later crossed 72h, fired together.
+- A firing filed only a level-0 info escalation. It emitted no event and took no action.
+- Every alarm advanced the EWA breaker's numerator.
+
+**New behaviour.**
+- **Durable eligibility clock.** One wall-clock `eligible_since` anchor per task, stamped
+  at first dispatch candidacy, lives in `data/orchestrator/scheduler_eligibility.db`
+  (`shared.project_layout.scheduler_eligibility_db`). Restarts and transient gaps keep
+  it. Dispatch, leaving `pending`, or going terminal drops it.
+- **Every gate needs the age floor AND an in-candidacy stuck signal.** Age alone never
+  fires. The gate vocabulary is now `dual`, `lock_refused` and `park_blocked`, and
+  `idle_only` is retired:
+  - `dual`: top-candidate skips `>= skip_threshold` and age `>= idle_secs`. Unchanged,
+    except that it now runs on the durable clock.
+  - `lock_refused`: lock refusals `>= skip_threshold` and age `>= idle_only_secs`. A
+    refusal is a scan in which the task was refused its locks while a lower-ranked
+    candidate dispatched. PSI-deferred and no-winner scans count nothing.
+  - `park_blocked`: the task's live park has a module held by another task, and the park
+    is at least `park_blocked_age_secs` old (new, default 4h). It takes precedence over
+    the other gates and names `blocking_holder` and `blocking_module`.
+
+  The thresholds themselves are unchanged. `idle_secs` and `idle_only_secs` stay
+  259200.
+- **Corroboration and dedup.** A finding is delivered only if a live `get_statuses`
+  read still shows `pending`. Open watchdog escalations are reloaded at startup, so a
+  restart neither re-files an alarm nor leaves it unresolved.
+- **`starvation_detected` event.** Every delivered firing emits it. The payload carries
+  `gate`, `eligible_age_secs`, `skip_count`, `lock_refusals`, `blockers`,
+  `auto_pinned`, `pin_order`, `source` and `disposition`. A `park_blocked` firing also
+  carries `blocking_holder`, `blocking_module` and `park_age_secs`.
+- **Bounded, owned auto-pin.** A `dual` or `lock_refused` firing pins the task at the
+  tail of the queue. The pin's override row has `source='starvation_watchdog'` and
+  `ttl_until` = fire time + `auto_pin_ttl_secs` (new, default 24h), and it also files a
+  level-0 info trail. Watchdog pins are bounded:
+  - At most `auto_pin_max_concurrent` (new, default 3) exist at once.
+  - A firing past the cap is recorded as `cap_reached` and files no escalation of its
+    own. Instead, one level-1 escalation under `__starvation_auto_pin_cap__` names the
+    newly capped cohort. A capped task is not marked escalated: it is announced once,
+    then pinned (with its level-0 trail) on the first pass that finds a slot free. The
+    cap escalation is resolved once no capped task still waits on a slot.
+  - An existing operator row is never touched, and that firing is recorded as
+    `operator_override`.
+  - A watchdog pin is released, whichever process created it, when its task dispatches
+    or is seen in any status other than `pending`.
+
+  `park_blocked` takes no pin. It files a level-1 info escalation.
+- **`overrides.source`.** The overrides table gains `source TEXT NOT NULL DEFAULT
+  'operator'`. Both `OverrideStore` and fused-memory's override tools add the column to
+  legacy databases idempotently. Operator writes always take ownership, and
+  `get_pin_queue` reports `source`.
+- **EWA numerator.** `digest.counts_toward_ewa_numerator` excludes the watchdog's role
+  (`orchestrator-starvation-watchdog`). Its alarms still advance the digest gate.
+
+#### Only a pending owner whose dependencies are not known unsatisfied may hold parks (task 6518, esc-6040-7)
+
+**Old behaviour.** Park GC expired a park only when its owner was terminal, missing from
+the task read, or blocked by a LOCAL dependency. A blocked, deferred, in-review,
+merge-deferred or running owner kept its parks indefinitely, and a cross-project or
+delivered-check dependency was never consulted, because park GC ran before the phases
+that fill those caches.
+
+**New behaviour.** One owner-state predicate,
+`orchestrator/src/orchestrator/scheduler.py::Scheduler._park_hold_refusal`, decides whether
+an owner may hold parks, pin reservations included: it must be `pending`, and no
+dependency may be known to be unsatisfied. An UNKNOWN dependency (resolver failed,
+dependency absent from the resolver's answer, delivered check not evaluated this tick)
+keeps the park.
+
+- **New `reservation_expired` reasons**: `not_pending:<status>` (any status other than
+  `pending`, terminal excepted), `deps_unsatisfied:external` (the resolver reports a
+  cross-project dependency other than `done`, sentinels included) and
+  `deps_unsatisfied:delivered_check` (a dependency's delivered check ran and failed).
+  `deps_unsatisfied` for a local dependency, `terminal:<status>` and `missing` are
+  unchanged. `LIKE 'deps_unsatisfied%'` catches every dependency expiry.
+- **Park GC moved** after `external_dep_policy` and `delivered_check_gate` in
+  `_TICK_PHASE_ORDER`, with the park-eviction drain still immediately ahead of it, so
+  the dependency arm reads this tick's caches. It still runs before `reserve_now` and the
+  dispatch loops, and on an idle tick.
+- **`request_park_eviction`** is no longer refused (`live_owner`) for an owner park GC
+  would expire: the drain evicts it first and emits `reservation_force_evicted`. It is
+  refused exactly for the owners park GC keeps.
+- **`reserve_now`** on an owner that fails the predicate installs nothing: its flag is
+  consumed and the new `reserve_now_refused` event carries `{reason}` in the vocabulary
+  above.
+- **A released pin head** completes the fairness parks its skips earned only while it
+  is still a dispatch candidate that tick, so a blocked or deferred head drops its whole
+  footprint instead of re-parking it.
+- Dispatch is unchanged: it still treats an unknown dependency as not satisfied. Dispatch
+  and park GC read one tri-state dependency predicate,
+  `orchestrator/src/orchestrator/dependency_verdict.py::deps_verdict`.
+
+**Operator-visible signal.** `reservation_expired` rows with the new reasons in
+`runs.db`, and no fairness `reservation_installed` for a non-pending owner. The design
+note is the task 6518 amendment in `plans/scheduler-dispatch-scoring-and-lock-layer-prd.md`
+§7.
+
+#### Referent repair defers a degraded target lookup instead of minting off it (task 5191)
+
+When zeta's lookup of a repair target fails, the finding carries
+`uuid_lookup_degraded=True` (task 4506). The write-time repair pass (eta) now treats
+"could not look" as neither "absent" nor "present". See
+`fused-memory/src/fused_memory/services/memory_service.py::MemoryService._repair_edge_findings`
+and `::MemoryService._record_referent_repair_pass`.
+
+- **A degraded finding is recorded as `outcome='failed'` and nothing is written.**
+  Previously it went through `ensure_entity_node` -> `reassign_edge` and was booked
+  `minted=True`. So `nodes_minted` no longer counts backend errors as mints, and the
+  whole-set-fallback plausibility guard no longer refuses with a "no node of that name
+  exists" reason it could not check.
+- **A repair pass with zero repairs and at least one `'failed'` record now leaves the
+  per-group storm streak unchanged instead of resetting it.** This changes a rule task
+  3672 pinned: a backend blip can no longer disarm an in-progress storm alarm. A
+  `'failed'` record still never increments the streak, and a pass that both repaired
+  and failed still increments.
+
+#### Task-family census reads each graph once (task 5662)
+
+`maintenance/task_family_census.py` now makes one backend read per graph instead
+of one per fragmented family, and the structure that existed only to reconcile
+its two reads is gone.
+
+- The per-family `find_entity_nodes_by_name_substring` probe (one un-indexed
+  `CONTAINS` scan per fragmented family, 296 of them on the 2026-09-19 sweep) is
+  replaced by one group-scoped paged read per graph, the new
+  `GraphitiBackend.enumerate_ranked_entity_nodes`. `enumerate_entity_nodes` is
+  unchanged (task 5264, decision 7).
+- Membership and edge counts now come from the same rows, so `UnconfirmedFamily`
+  is unreachable and was deleted, and `FragmentedFamily` now raises `ValueError`
+  below two variants. **Output shape change:** the JSON loses top-level
+  `total_unconfirmed` and per-graph `unconfirmed`, and the summary line loses its
+  `unconfirmed=` token. This supersedes the "two reads disagreeing" paragraph of
+  the task-5264 entry above.
+- `nodes_scanned` now counts same-group nodes only. A node whose `group_id`
+  property names another project (task 2115's leak) is out of the census's
+  scope and is counted nowhere in its output. The deleted `unconfirmed` count
+  was the census's only trace of such a node. A separate read-only leak
+  detector is proposed as follow-up ticket `tkt_0RVQ5JNVSFM3WGVERS1Q2BEHZ0`.
+- The survivor ordering is now one structured spec in `graphiti_client.py`,
+  `_PROVENANCE_RANK_KEYS`, rendered both as the shared Cypher `ORDER BY`
+  (unchanged text) and as the Python sort. A unit test checks the Python sort
+  against openCypher's `ORDER BY` semantics. A live-FalkorDB test, run only
+  with `-m integration`, checks that the two agree on a real server. A rank
+  column whose non-NULL values mix types that Python cannot compare fails that
+  graph with `SurvivorRankTypeError`, which names the column and the types.
+
+#### Store preflight refuses an existing-but-empty target, not just a missing one (task 5468)
+
+The seven fused-memory store scripts that preflight their target now refuse an
+EMPTY one as well as a missing one: an escalation queue directory with no entries, or
+a `tasks.db` holding no tasks. That empty store is exactly the residue a mis-targeted
+run leaves behind, because both substrates auto-create themselves. An unreadable
+target still fails open. The wrappers are renamed `assert_queue_dir_populated` and
+`assert_task_store_populated`, and the general `assert_target_store_exists` is gone.
+See `fused-memory/src/fused_memory/utils/target_store_preflight.py`.
+
+#### Pinned tasks earn a pin reservation; reservation events carry `source`; new `pin_blocked` (task 6040)
+
+**Old behaviour.** A pinned task that failed `try_acquire` was skipped silently. It
+earned no reservation, accrued no skip count and emitted no event. Every module that
+freed up could be taken by whichever task scored next, so a pin on a hot file could
+starve indefinitely. Task 3659 is the replay: pinned, behind a holder on one module and
+a critical fairness park on it, while a medium task took its other module.
+
+**New behaviour.**
+
+- **Pin reservation.** The lowest-`pin_order` pins that are pinned, present, eligible,
+  not landed-outbox gated, not deterministic and lock-blocked are HEADS. At most
+  `pin_reservation_max_active` of them exist. A head reserves its current module set
+  on the ordinary park stacks, at a pin rank band that sits above every priority tier
+  and is ordered by `pin_order`. It installs inline in the pin loop, so a later pin or
+  scored candidate in the same tick cannot take a module the head is waiting for. It
+  shadows any fairness park, critical included, and restores it when used or released.
+  The pin owner's own fairness park on a module stays beneath its pin reservation, so a
+  release by the pin phase leaves that park exactly where it was; an owner whose skip
+  count has reached its tier's threshold also completes, at release, the fairness parks
+  the pin reservation had made redundant. It never preempts a HELD lock. A dispatch
+  consumes it, and EASY-backfill borrows through it as through a fairness park. It is
+  derived state, so the first tick after a restart rebuilds it. A pin still accrues no
+  skip count from the pin loop.
+- **`data.source` on every `reservation_*` event**: `'pin'` or `'fairness'`, derived
+  from the park's rank. `reserve_now` parks read `'fairness'`. This is the only new key
+  on `reservation_used`, `reservation_restored`, `reservation_expired`,
+  `reservation_force_evicted` and `reservation_force_evict_refused`. Pin-sourced
+  `reservation_installed`, `reservation_shadowed` and `reservation_install_blocked`
+  carry `pin_order` IN PLACE OF the tier fields `priority` / `preempted_by_priority`:
+  a pin rank lies above every tier, so the owner's tier would misdescribe it. On
+  `reservation_restored`, `source` is that of the restored entries themselves.
+- **New `reservation_expired` reasons** for releases decided in the pin phase:
+  `unpinned`, `gated`, `ineligible`, `deterministic`, `pin_displaced` (outranked by a
+  lower `pin_order` or past the cap) and `pin_reservations_disabled`. These remove only
+  the owner's pin entries. Terminal, missing and deps-unsatisfied pins are released by
+  park GC with its existing reasons, which remove every park the owner holds.
+- **New `pin_blocked` event**, payload `{task_id, pin_order, head, blockers: [{module,
+  owner, kind: held|parked}]}`. The blockers are read before the head's own
+  reservation installs. It fires when a pin becomes blocked, then at most once per
+  `pin_blocked_emit_interval_secs` while it stays blocked. Dispatching or leaving the
+  pin queue resets it, and a PSI-held tick neither emits nor resets it.
+- **New snapshot key `pin_reservations`**, `{task_id: {modules, installed_at}}`, in
+  `get_state_snapshot()` and `scheduler_state.json` (so `get_scheduler_state` too).
+  `parks` still reports every active top, pin owners included.
+- **Three green-tier knobs**, hot-reloadable and read at tick time:
+  `pin_reservations_enabled` (default `true`), `pin_reservation_max_active` (default
+  `1`, `ge=1`) and `pin_blocked_emit_interval_secs` (default `3600`). The kill switch
+  restores the pre-change pin loop: no reservation, no `pin_blocked`, and leftover pin
+  reservations are released once with reason `pin_reservations_disabled`.
+
+The design rationale is the annotation to
+`plans/scheduler-dispatch-scoring-and-lock-layer-prd.md` §7 and the module docstring of
+`orchestrator/src/orchestrator/pin_reservation.py`.
+
+**Migration for historical series.** Consumers filtering `reservation_installed` (or any
+`reservation_*` event) should add `json_extract(data, '$.source') = 'fairness'` to keep
+post-change series comparable with pre-change ones. Pre-change rows carry no `source`,
+and all of them are fairness. The change boundary is this task's merge commit.
+
+#### The plan-target drop-guard judges the tip the merge commit merged, not the submitted worktree's HEAD (task 4956)
+
+- **Plan-target drop-guard** — before: the guard took the task's HEAD from the submitted
+  worktree. A worktree left on a foreign commit (a recycled lane, or a resubmit passing a
+  checkout on main) made it cite files the branch never owned, against a speculative base
+  that predated them. After: it reads the merge commit's second parent, the tip
+  `GitOps.merge_to_main` actually merged, and fails open with a WARNING when there is
+  none. Measured: reify task 6249 / `mr-f09b27f5`. Replaying the guard with task_head
+  `995f13fd` (main just after a sibling landed) against the speculative base `433ebac3`
+  reproduces exactly the two cited files; the true branch tip `238c380e` yields none.
+
+**Operator consequence.** A `Merge commit is missing plan target files` block that cites
+paths outside the task's `metadata.files` is no longer expected. Before this fix, the
+correct response to one was to resubmit unchanged.
+
+#### `consolidate_memories` lists its closure as `{id, canonical}` rows, and its step contract now numbers authorization first (task 5275)
+
+- **Projection (wire-visible).** `topic_members` rows lose `content`, `created_at` and
+  `metadata`; the ids and the `topic_members_total` / `topic_members_truncated` /
+  `topic_members_available` qualifiers are unchanged. The envelope is the only record of
+  an irreversible multi-delete, and 200 raw rows could exceed the ~62 KB documented-safe
+  MCP response, which would lose every per-id disposition for records already gone. The
+  projection lives in `server/consolidation.py::build_consolidation_result`, so the
+  `execute_retain_consolidation` envelope gets it too; the topic-guard seed still reads
+  the full closure rows.
+- **Order.** The docs now match the code: (1) authorize, then (2) validate. Reordering
+  the code instead was rejected because auth-first is the repo-wide posture
+  (`update_memory`, `apply_retain_arm`). A test pins that an unauthorized caller with
+  malformed arguments gets `Mem0UpdateNotAuthorized`, not `ValidationError`.
 
 #### Fairness parks: `reservation_installed` never empty; new `reservation_install_blocked`; parks settled on every dispatch (task 5308)
 
@@ -1426,3 +1693,33 @@ emit `reservation_installed` with `reason='reserve_now'`; removed in
 `deb8f426ab` — historical event-store rows predating task 1230 may still
 contain it.)  The renamed event's pre-1230 form (`reservation_installed` +
 `data.reason='reserve_now'`) had zero in-repo consumers.
+
+### Fixed
+
+#### Fairness parks can no longer deadlock pending owners (task 7799)
+
+Two pending owners could each hold a partial park and need a key the other had parked.
+Each one's acquire was refused by the other's park, and only the score-top ever retried
+its install, so neither moved until someone deferred one of them or the orchestrator
+restarted. solar_challenge hit this four times between 10-27 and 11-01, once for about
+31 h. Park entries now have one order, `scheduler.py::_ParkKey`: rank, then older
+numeric id, then id. A foreign park blocks a requester that owns parks only when its key
+precedes the requester's best key, and install shadows or blocks by the same key. A
+requester that owns no park is still blocked by every park. Every park wait therefore
+points at a strictly smaller key, and no cycle can form. What an operator will see:
+`reservation_shadowed` events now also occur between same-tier owners (the older id
+shadows), and a park owner can pass a lower-key park on a key it has not parked.
+`request_park_eviction` behaves as before. Rationale:
+`plans/scheduler-dispatch-scoring-and-lock-layer-prd.md` §7, Amendment (task 7799).
+
+#### plan.json writers serialise on a cross-writer mutex (task 5745)
+
+Every plan.json read-modify-write now holds `TaskArtifacts.plan_mutex`: the 13 plan-tools
+mutators, the TaskArtifacts plan methods, `read_plan`'s normalization write-back, and the
+markup stamp. It is a reentrant `fcntl.flock` on a `plan.json.mutex` sidecar, keyed on the
+resolved plan path and honoured across threads and processes; the wait is bounded at 60s
+and then raises `FileMutexTimeout`, a `RuntimeError` rather than an `OSError`. The write that
+ends a read-modify-write, `write_plan(plan, mutex_held=True)`, verifies the calling thread
+holds the mutex and otherwise raises `PlanMutexNotHeld` before writing, so a forgotten lock
+fails loudly instead of losing an update. This closes the lost update task 4597 left pinned by
+`TestTheCrossWriterWindowIsKnown`, now `TestTheStampSerialisesWithEveryPlanWriter`.

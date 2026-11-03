@@ -519,6 +519,15 @@ table { border-collapse: collapse; width: 100%; }
 .taskgraph .node .id { font-family: var(--mono); font-size: 10px; color: var(--fg-3); }
 .taskgraph .node .ttl { font-size: 11px; color: var(--fg-1); line-height: 1.25; white-space: normal; }
 .taskgraph .node .meta { display: flex; gap: 6px; align-items: center; margin-top: 2px; }
+.deferral { display: flex; gap: 6px; align-items: baseline; min-width: 0; font-family: var(--mono); font-size: 11px; white-space: nowrap; }
+.taskgraph .node .deferral { font-size: 10px; margin-top: 2px; }
+.deferral .deferral-text { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.deferral .deferral-age { flex: none; color: var(--fg-3); }
+.deferral .deferral-human { flex: none; font-size: 9px; padding: 0 3px; border: 1px solid currentColor; border-radius: 3px; }
+.deferral[data-state="held"] { color: var(--fg-2); }
+.deferral[data-state="needs_human"], .deferral[data-state="unrecorded"] { color: var(--warn); }
+.deferral[data-state="unknown"] { color: var(--fg-3); font-style: italic; }
+.proj-head .deferral-chip { color: var(--warn); font-size: 10px; }
 .taskgraph .node.dim { opacity: 0.5; }
 .taskgraph .node .status-pip { width: 6px; height: 6px; border-radius: 50%; }
 .taskgraph .node.s-in-progress .status-pip { background: var(--accent); box-shadow: 0 0 4px oklch(0.72 0.14 230 / 0.6); }
@@ -742,11 +751,11 @@ table { border-collapse: collapse; width: 100%; }
   transition: opacity .1s, transform .1s;
 }
 .sched-cell:hover { transform: scale(1.15); }
-/* Cell color states — reuse --ok/--warn/--bad/--accent tokens */
-.sched-cell.free           { background: oklch(0.74 0.14 155 / 0.25); border: 1px solid var(--ok); }
-.sched-cell.held-by-other  { background: oklch(0.68 0.18 25 / 0.35); border: 1px solid var(--bad); }
-.sched-cell.parked-by-me   { background: oklch(0.80 0.14 80 / 0.35); border: 1px solid var(--warn); }
-.sched-cell.parked-by-other { background: oklch(0.80 0.14 80 / 0.18); border: 1px dashed var(--warn); }
+/* Cell states — lockChipState's vocabulary, the same classes the lock chips carry */
+.sched-cell.lock-free      { background: oklch(0.74 0.14 155 / 0.25); border: 1px solid var(--ok); }
+.sched-cell.lock-mine      { background: var(--ok); border: 1px solid var(--ok); }
+.sched-cell.lock-taken     { background: oklch(0.68 0.18 25 / 0.35); border: 1px solid var(--bad); }
+.sched-cell.lock-parked    { background: oklch(0.80 0.14 80 / 0.35); border: 1px solid var(--warn); }
 .sched-cell.not-in-set     { background: var(--bg-2); border: 1px solid transparent; opacity: 0.4; }
 
 .sched-empty {

@@ -11,6 +11,8 @@ regenerating it.
 cite-by-symbol; re-locate at implementation time. Measurements below are dated
 provenance of the studies they cite, not live counts.
 
+> **Amended 2026-10-12** by plans/offline-lane-red-path-prd.md: the lane now exposes the red-handler hook `on_pass_outcome` (§5.7); 'blocker after three confirmed-red advances' and 'lane engine untouched' no longer describe the lane.
+
 ## Goal
 
 A verify replays a recorded green verdict for every **unit** whose inputs are

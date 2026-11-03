@@ -1,0 +1,19 @@
+{
+  "arm_id": "gte-modernbert-base",
+  "arm_role": "candidate",
+  "axis": "embedding",
+  "code_sha": "8bb8c8893b0f58957753954ab0338d47f4b609b9",
+  "corpus_sha": "1eb3ed883afb5396fcba47a240e41f4b501d5b678789c48541325eb7c811b287",
+  "incomplete": false,
+  "measured_at": "2026-10-09T10:30:16.491616Z",
+  "metric": {
+    "denominator": 42,
+    "direction": "lower_is_worse",
+    "kind": "proportion",
+    "metric_id": "mem0-known-item-recall@5",
+    "n": 42,
+    "value": 0.35714285714285715
+  },
+  "preregistration_sha": "be4a44d6243b58a3293d66eb73f0ba56fa206efd",
+  "schema_version": 1
+}

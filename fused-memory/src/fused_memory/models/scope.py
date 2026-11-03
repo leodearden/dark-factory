@@ -26,25 +26,18 @@ from typing import NewType
 
 import yaml
 from pydantic import BaseModel, field_validator
+from shared.project_id import normalize_project_id
+from shared.project_layout import KNOWN_PROJECT_ROOTS_ENV, known_project_roots
 
 from fused_memory.utils.validation import (
     InputValidationError,
     PathShapedProjectIdError,
-    _to_underscore_canonical,
     canonicalize_project_id,
     require_project_root,
 )
 
 logger = logging.getLogger(__name__)
 
-
-# Env var holding the comma-separated list of project_roots the system
-# should treat as "known".  Reuses the dashboard's existing variable name
-# so a single export propagates to both consumers — see
-# ``dashboard/src/dashboard/config.py:88`` for the dashboard side.  A
-# tracked followup is to promote this to a neutrally-named env var with a
-# deprecation period.
-KNOWN_PROJECT_ROOTS_ENV: str = 'DASHBOARD_KNOWN_PROJECT_ROOTS'
 
 # Canonical project-manifest filename every DF-targeted project exposes at
 # its root (see CLAUDE.md "Repo Map").  ``read_declared_project_id`` reads
@@ -155,15 +148,15 @@ def resolve_project_id(
 
     Priority:
       1. Explicit mapping dict (if provided and contains project_root).
-      2. Derive from basename: lowercase, hyphens -> underscores.
+      2. Derive from the basename.
 
-    The underscore-canonical mapping (lowercase + hyphen->underscore) is the
-    same rule applied by :func:`fused_memory.utils.validation.canonicalize_project_id`
-    -- both delegate to the shared ``_to_underscore_canonical`` helper so the
-    rule has one source of truth. Unlike ``canonicalize_project_id``, this
-    function never raises on path-shaped input: it operates on an
-    already-extracted path basename (see below), not a raw caller-supplied
-    project_id, so the LOUD-reject guard does not apply here.
+    The basename goes through ``shared.project_id.normalize_project_id``, the
+    one project-id rule, which
+    :func:`fused_memory.utils.validation.canonicalize_project_id` applies too.
+    Unlike ``canonicalize_project_id``, this function never raises on
+    path-shaped input: it operates on an already-extracted path basename (see
+    below), not a raw caller-supplied project_id, so the LOUD-reject guard
+    does not apply here.
 
     Examples:
         >>> resolve_project_id('/home/leo/src/dark-factory')
@@ -173,8 +166,7 @@ def resolve_project_id(
     """
     if mapping and project_root in mapping:
         return mapping[project_root]
-    name = PurePosixPath(project_root.rstrip('/')).name
-    return _to_underscore_canonical(name)
+    return normalize_project_id(PurePosixPath(project_root.rstrip('/')).name)
 
 
 def read_declared_project_id(project_root: str | Path) -> str | None:
@@ -183,10 +175,10 @@ def read_declared_project_id(project_root: str | Path) -> str | None:
     Reads only the top-level ``project_id`` key from
     ``<project_root>/dark-factory-orchestrator.yaml`` (the canonical
     project-manifest filename — no legacy fallbacks, no orchestrator-package
-    import), normalizing a non-empty string value via the same
-    ``_to_underscore_canonical`` rule :func:`resolve_project_id` uses so a
-    declared id and a basename-derived id share one canonicalization source
-    of truth.
+    import), normalizing a non-empty string value via
+    ``shared.project_id.normalize_project_id``, the rule
+    :func:`resolve_project_id` uses, so a declared id and a basename-derived
+    id share one canonicalization source of truth.
 
     Strictly **fail-open**: this NEVER raises.  A missing manifest,
     unparseable YAML (including invalid non-UTF-8 bytes, whose
@@ -224,12 +216,12 @@ def read_declared_project_id(project_root: str | Path) -> str | None:
         return None
     # The declared value is raw operator-supplied input, so canonicalize it
     # through canonicalize_project_id's path-shape guard (NOT the bare
-    # _to_underscore_canonical resolve_project_id applies to an already-
+    # normalize_project_id resolve_project_id applies to an already-
     # extracted basename): a value with a path separator or leading '-'/'/'
     # is something resolve_project_id could never produce, so reject it and
     # fail open to basename derivation instead of registering a nonsensical
-    # id.  canonicalize_project_id delegates to the same _to_underscore_canonical
-    # rule for every non-path-shaped value, so declared and derived ids still
+    # id.  canonicalize_project_id applies the same normalize_project_id
+    # rule to every non-path-shaped value, so declared and derived ids still
     # share one canonicalization source of truth.
     try:
         return canonicalize_project_id(declared)
@@ -263,20 +255,31 @@ def resolve_project_id_for_root(project_root: str | Path) -> str:
     )
 
 
-def known_project_roots_from_env(
-    env_var: str = KNOWN_PROJECT_ROOTS_ENV,
-) -> list[str]:
-    """Parse the configured comma-separated env var into a list of project_roots.
+def known_project_roots_from_env() -> list[str]:
+    """The project_roots named by ``KNOWN_PROJECT_ROOTS_ENV``, as strings.
 
-    Returns ``[]`` when the env var is unset or empty.  Whitespace around
-    each entry is stripped; empty entries (e.g. trailing comma) are
-    skipped.  Does *not* resolve symlinks or check existence — call sites
-    decide whether stat-ing each root is appropriate.
+    The parser is ``shared.project_layout.known_project_roots``, so every
+    consumer reads the variable the same way: ``[]`` when unset or empty,
+    whitespace stripped, empty entries skipped, each entry path-normalised.
+    Does *not* resolve symlinks or check existence:
+    :func:`build_known_projects_map` admits a root that is not a directory
+    with a WARNING, and :func:`is_phantom_project_root` is the detector.
     """
-    raw = os.environ.get(env_var, '')
-    if not raw:
-        return []
-    return [p.strip() for p in raw.split(',') if p.strip()]
+    return [str(root) for root in known_project_roots()]
+
+
+def is_phantom_project_root(root: str | os.PathLike[str]) -> bool:
+    """True when *root* is not a directory on this host — a typo'd, moved or
+    unmounted checkout, or a file.
+
+    This is the ONE definition of a phantom project root, shared by
+    :func:`build_known_projects_map`,
+    :class:`~fused_memory.middleware.project_prefix_registry.ProjectPrefixRegistry`
+    and ``fused-memory/scripts/sweep_orphan_flag_markers.py``.  It uses
+    :func:`os.path.isdir`, which answers False rather than raising on an
+    unreadable or malformed path, so it is safe during process startup.
+    """
+    return not os.path.isdir(root)
 
 
 def build_known_projects_map(
@@ -290,9 +293,21 @@ def build_known_projects_map(
     :func:`known_project_roots_from_env` output so callers can rely on the
     env var by default but override in tests.
 
-    Empty/missing primary roots are silently skipped.  Roots that can't be
-    resolved (file not found, permission denied) are logged and skipped —
+    An empty primary root is silently skipped.  A root whose ``resolve()``
+    raises ``OSError`` is logged and skipped; that is the ONLY skip, because
     this helper must not raise during process startup.
+
+    A root that resolves but is NOT A DIRECTORY (per
+    :func:`is_phantom_project_root`) is ADMITTED deliberately, with one
+    WARNING per admitted phantom root per call (task 5286, arm (b)).
+    Skipping it would leave its project_id unregistered, and
+    ``reconciliation/harness.py::ReconciliationHarness._project_loop`` answers
+    an unregistered id by dead-lettering every buffered event for it through
+    ``reconciliation/event_buffer.py::EventBuffer.mark_project_dead_letter``,
+    which is terminal with no replay path.  Every consumer also snapshots
+    this map once at process start, so a checkout that is briefly absent at
+    startup would lose its events and stay de-registered until restart.
+    Admitting costs only an inert id, and the WARNING makes it loud.
     """
     if extra_roots is None:
         extra_roots = known_project_roots_from_env()
@@ -323,6 +338,14 @@ def build_known_projects_map(
                 pid, resolved, out[pid],
             )
             continue
+        if is_phantom_project_root(resolved):
+            logger.warning(
+                'build_known_projects_map: admitting project root %r '
+                '(resolved %s) as project_id %r, but it is not a directory on '
+                'this host; check %s or taskmaster.project_root for a typo or '
+                'a moved/unmounted checkout',
+                raw, resolved, pid, KNOWN_PROJECT_ROOTS_ENV,
+            )
         out[pid] = resolved
     return out
 

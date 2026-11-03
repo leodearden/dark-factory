@@ -8,6 +8,8 @@ of task 2175/ρ1b (which already threaded set_task_status → _apply_status_tran
   ticket blob)
 - MCP handlers set_task_status / update_task / submit_task (agent_id resolved from
   ctx via _resolve_identity and forwarded to the interceptor)
+- the set_task_status handler over a real stateless SDK session, where only an
+  explicit agent_id identifies the caller (task 5241)
 
 The interceptor-internal set_task_status → _apply_status_transition threading (and its
 actor-class transition gate) is owned and tested by task 2175/ρ1b; this module only
@@ -17,15 +19,23 @@ write paths.
 
 from __future__ import annotations
 
+import contextlib
 import json
+from collections.abc import AsyncIterator
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
+import anyio
 import pytest
 import pytest_asyncio
 from mcp.server.fastmcp import Context
+from mcp.server.models import InitializationOptions
+from mcp.server.session import ServerSession
+from mcp.shared.message import SessionMessage
+from mcp.types import ServerCapabilities
 
+from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.middleware.ticket_store import TicketStore
 from fused_memory.reconciliation.event_buffer import EventBuffer
@@ -212,6 +222,94 @@ async def test_set_task_status_handler_explicit_agent_id_takes_precedence_over_c
 
     task_interceptor.set_task_status.assert_awaited_once()
     assert task_interceptor.set_task_status.await_args.kwargs.get('agent_id') == 'explicit'
+
+
+# ---------------------------------------------------------------------------
+# set_task_status over a STATELESS session (task 5241, review round 1)
+#
+# These pin a PREMISE and pass on the code they were written against. They are
+# not regression-only tests: the fix they justify is the orchestrator's
+# explicit agent_id, whose RED signal is
+# orchestrator/tests/test_deterministic_provenance_wire_e2e.py. Production
+# serves stateless HTTP, where no tools/call session ever received an
+# InitializeRequest, so _resolve_identity has no clientInfo to fall back to.
+# ---------------------------------------------------------------------------
+
+
+_GATE_PROVENANCE = {
+    'kind': 'deterministic-gate',
+    'note': 'pure gate resolved',
+    'escalation_id': 'esc-5241-wire',
+}
+
+
+@contextlib.asynccontextmanager
+async def _stateless_ctx() -> AsyncIterator[Context[Any, Any, Any]]:
+    """A ctx whose session is a REAL SDK ``ServerSession(stateless=True)``,
+    the session a stateless-HTTP tools/call is served on, run through its
+    own lifecycle so its internal streams are closed too."""
+    to_server_send, to_server_recv = anyio.create_memory_object_stream[
+        SessionMessage | Exception
+    ](0)
+    from_server_send, from_server_recv = anyio.create_memory_object_stream[SessionMessage](0)
+    init_options = InitializationOptions(
+        server_name='fused-memory-test',
+        server_version='0',
+        capabilities=ServerCapabilities(),
+    )
+    try:
+        async with ServerSession(
+            to_server_recv, from_server_send, init_options, stateless=True,
+        ) as session:
+            yield cast(
+                Context[Any, Any, Any], SimpleNamespace(session=session, request_context=None),
+            )
+    finally:
+        for stream in (to_server_send, to_server_recv, from_server_send, from_server_recv):
+            stream.close()
+
+
+class TestSetTaskStatusOverAStatelessSession:
+    @pytest.fixture
+    def handler(self, memory_service, taskmaster, reconciler, event_buffer):
+        taskmaster.set_status_and_stamp_audit = AsyncMock(return_value={'success': True})
+        interceptor = TaskInterceptor(
+            taskmaster, reconciler, event_buffer, config=FusedMemoryConfig(),
+        )
+        return _raw(
+            create_mcp_server(memory_service, task_interceptor=interceptor), 'set_task_status',
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_sdk_session_carries_no_client_identity(self):
+        async with _stateless_ctx() as ctx:
+            assert ctx.session.client_params is None
+
+    @pytest.mark.asyncio
+    async def test_an_unnamed_deterministic_close_is_refused(
+        self, handler, taskmaster, tmp_path,
+    ):
+        async with _stateless_ctx() as ctx:
+            result = await handler(
+                id='1', status='done', project_root=str(tmp_path),
+                done_provenance=dict(_GATE_PROVENANCE), ctx=ctx,
+            )
+
+        assert result.get('error_type') == 'DeterministicProvenanceCallerNotPermitted', result
+        taskmaster.set_status_and_stamp_audit.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_explicitly_named_orchestrator_close_is_accepted(
+        self, handler, taskmaster, tmp_path,
+    ):
+        async with _stateless_ctx() as ctx:
+            result = await handler(
+                id='1', status='done', project_root=str(tmp_path),
+                done_provenance=dict(_GATE_PROVENANCE), agent_id='orchestrator', ctx=ctx,
+            )
+
+        assert 'error' not in result, result
+        taskmaster.set_status_and_stamp_audit.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------

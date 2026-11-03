@@ -1,4 +1,5 @@
-"""Tests for dashboard.config — canonical-vs-legacy escalation URL discovery.
+"""Tests for dashboard.config — canonical-vs-legacy escalation URL discovery,
+plus the curator ledger path (``TestCuratorEventsDbPath``).
 
 ``_discover_escalation_urls`` must prefer ``dark-factory-orchestrator.yaml``
 (the canonical top-level orchestrator config name) over the legacy spellings
@@ -9,6 +10,7 @@ WARNING naming the project whenever that fallback is used.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 
 import pytest
@@ -430,3 +432,76 @@ class TestMultiRootDiscovery:
         assert records[0].levelno == logging.WARNING
         assert str(bad_root) in records[0].getMessage()
         assert str(good_root) not in records[0].getMessage()
+
+
+class TestSameBasenameRoots:
+    """Two configured roots sharing a basename keep distinct labels and URLs."""
+
+    def _roots(self, tmp_path):
+        a = tmp_path / 'a' / 'proj'
+        b = tmp_path / 'b' / 'proj'
+        _write_yaml(a / 'dark-factory-orchestrator.yaml', {'escalation': {'port': 9101}})
+        _write_yaml(b / 'dark-factory-orchestrator.yaml', {'escalation': {'port': 9102}})
+        return a, b
+
+    def test_each_root_is_labelled_by_its_shortest_unique_suffix(self, tmp_path):
+        a, b = self._roots(tmp_path)
+        config = DashboardConfig(project_root=a, known_project_roots=[b])
+
+        assert config.project_labels.of(a.resolve()) == 'a/proj'
+        assert config.project_labels.of(b.resolve()) == 'b/proj'
+        assert config.project_labels.roots == config.all_project_roots
+
+    def test_the_label_table_is_built_once_per_config(self, tmp_path):
+        a, b = self._roots(tmp_path)
+        config = DashboardConfig(project_root=a, known_project_roots=[b])
+
+        assert config.project_labels is config.project_labels
+
+    def test_a_replaced_roster_is_labelled_afresh(self, tmp_path):
+        a, b = self._roots(tmp_path)
+        config = DashboardConfig(project_root=a, known_project_roots=[b])
+        assert config.project_labels.of(a.resolve()) == 'a/proj'
+
+        narrowed = dataclasses.replace(config, known_project_roots=[])
+
+        assert narrowed.project_labels.roots == (a.resolve(),)
+        assert narrowed.project_labels.of(a.resolve()) == 'proj'
+
+    def test_each_root_keeps_its_own_escalation_url(self, tmp_path):
+        a, b = self._roots(tmp_path)
+        expected = {
+            'a/proj': 'http://127.0.0.1:9101/mcp',
+            'b/proj': 'http://127.0.0.1:9102/mcp',
+        }
+
+        assert _discover_escalation_urls([a, b]) == expected
+        assert DashboardConfig(project_root=a, known_project_roots=[b]).escalation_urls == expected
+
+
+class TestCuratorEventsDbPath:
+    """``curator_events_db`` resolves where fused-memory writes the curator's
+    invocation ledger: ``<reconciliation.data_dir>/curator_events.db``.
+    """
+
+    def test_env_override_relocates_curator_ledger(self, tmp_path, monkeypatch):
+        monkeypatch.setenv('RECONCILIATION_DATA_DIR', str(tmp_path / 'recon'))
+
+        cfg = DashboardConfig(project_root=tmp_path / 'proj')
+
+        assert cfg.curator_events_db == tmp_path / 'recon' / 'curator_events.db'
+
+    @pytest.mark.parametrize('env_value', [None, ''], ids=['unset', 'empty'])
+    def test_env_unset_or_empty_falls_back_to_project_root(
+        self, tmp_path, monkeypatch, env_value,
+    ):
+        if env_value is None:
+            monkeypatch.delenv('RECONCILIATION_DATA_DIR', raising=False)
+        else:
+            monkeypatch.setenv('RECONCILIATION_DATA_DIR', env_value)
+
+        cfg = DashboardConfig(project_root=tmp_path / 'proj')
+
+        assert cfg.curator_events_db == (
+            cfg.project_root / 'data' / 'reconciliation' / 'curator_events.db'
+        )

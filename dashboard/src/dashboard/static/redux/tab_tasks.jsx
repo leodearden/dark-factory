@@ -7,20 +7,32 @@ const DF_T = window.DF_DATA;
 // see the SCOPE note in dashboard/tests/js/classic_script_scope.test.mjs.
 const DF_LOADER_T = window.DF_DATA_LOADER;
 const { useState: uS_T, useEffect: uE_T, useRef: uR_T, useLayoutEffect: uLE_T, useMemo: uM_T } = React;
-const { computeTiers, partitionComponents, orderRows, computeNeighborhood, focusGroupView } = window.DF_GRAPH_LAYOUT;
+const { computeTiers, computeNeighborhood, focusGroupView, layoutSignature, taskGraphLayout } = window.DF_GRAPH_LAYOUT;
 const {
   prdTitle, aggregatePrdStatus, summarizePrdMembers, prdIsFinished, prdBarSegments, prdProgress, prdProgressReading,
   groupTasksByPrd, orderPrdGroups,
 } = window.DF_PRD_GROUPING;
 const { strandBadgeState, agentCellState } = window.DF_TASK_ROW_CELLS;
 const { rtCell, rtAge, rtProbe, rtProbeSummary } = window.DF_RUNTIME_FMT;
-const { tasksBannerNotices } = window.DF_TASKS_OFFLINE_BANNER;
+const { tasksBannerNoticesFor } = window.DF_TASKS_OFFLINE_BANNER;
+const { invariantChipFor, chainChipFor } = window.DF_INVARIANT_CHIP;
+const { deferralCellState, deferralNeedsHumanChip } = window.DF_DEFERRAL_CELL;
 // Const exports renamed, function exports not: test_tab_tasks_prose.py::_LOAD_SAFETY_MECHANISM.
 const {
   projectCensus, projectRows, viewRows, snapshotRowsOver, unrequestedTerminalRows, terminalWindowProjects,
   terminalWindowEntrants, sameDatum,
   CENSUS_VIEWS: CENSUS_VIEWS_T, EVERY_VIEW: EVERY_VIEW_T,
 } = window.DF_TASK_SNAPSHOT;
+const { createPersistedHooks } = window.DF_PERSISTED_STATE;
+const { usePersistedState } = createPersistedHooks(React);
+
+// A per-project preference map holds only the projects that deviate from the
+// default (an undefined deviation), so a map with every project back at its
+// default is {} and usePersistedState removes its key.
+function withProjectDeviation(map, id, deviation) {
+  const { [id]: _previous, ...rest } = map;
+  return deviation === undefined ? rest : { ...rest, [id]: deviation };
+}
 
 // CSS accent per probe-status tone (runtime_format.js owns which tone each
 // status gets; this only translates a tone into a colour for the banner's
@@ -31,28 +43,36 @@ const PROBE_TONE_ACCENT_T = {
   bad: 'var(--bad)',
 };
 
-// Persisted-state hook (same shape as elsewhere)
-function tasksPersistedState(key, def) {
-  const [v, setV] = uS_T(() => {
-    try { const r = localStorage.getItem(key); return r != null ? JSON.parse(r) : def; }
-    catch { return def; }
-  });
-  uE_T(() => { try { localStorage.setItem(key, JSON.stringify(v)); } catch {} }, [key, v]);
-  return [v, setV];
+// Text colour per invariant chip tone, claimant or chain (invariant_chip.js owns the tone).
+const INVARIANT_CHIP_TONE_T = {
+  muted: 'var(--fg-3)',
+  warn: 'var(--warn)',
+  bad: 'var(--bad)',
+};
+
+// A deferred row's hold, drawn the same on its graph node and in the detail pane.
+function DeferralHold({ task }) {
+  const cell = deferralCellState(task);
+  if (!cell) return null;
+  return (
+    <div className="deferral" data-state={cell.state} title={cell.title}>
+      <span className="deferral-text">{cell.text}</span>
+      {cell.age && <span className="deferral-age">{cell.age}</span>}
+      {cell.needsHuman && <span className="deferral-human">needs human</span>}
+    </div>
+  );
 }
 
 // ── Edge router: draw curves from each parent (dep) to each child node ──
 function TaskGraphEdges({ containerRef, nodeRefs, tasks, selectedId, neighborhood }) {
   const [paths, setPaths] = uS_T([]);
 
-  // Stable signature: edges flicker because the parent's `tasks` is a new array
-  // every render (overview clock ticks force re-renders). Only re-run when the
-  // *content* changes — task ids, statuses, dep edges, selection.
-  // neighborhood is derived from selectedId+tasks so it is already covered.
-  const signature = uM_T(() => {
-    const parts = tasks.map(t => `${t.id}:${t.status}:${(t.deps||[]).map(d=>d.id+(d.done?'1':'0')).join(',')}`);
-    return parts.join('|') + '|sel=' + (selectedId || '');
-  }, [tasks, selectedId]);
+  // Edges flicker if redrawn on the `tasks` reference, a new array every render
+  // (each data poll and each interaction), so the effect below is keyed on
+  // content: the layout's key, each dep's done bit (it picks the stroke), and
+  // the selection. neighborhood derives from selectedId+tasks, so it is covered.
+  const layoutKey = layoutSignature(tasks);
+  const doneKey = JSON.stringify(tasks.map(t => (t.deps || []).map(d => !!d.done)));
 
   // Capture latest tasks/selection in a ref so recompute() always reads fresh
   // values without us having to put them in the effect deps array.
@@ -133,7 +153,7 @@ function TaskGraphEdges({ containerRef, nodeRefs, tasks, selectedId, neighborhoo
       ro.disconnect();
       window.removeEventListener('resize', recompute);
     };
-  }, [signature]);
+  }, [layoutKey, doneKey, selectedId]);
 
   return (
     <svg className="edges">
@@ -166,19 +186,13 @@ function TaskGraph({ tasks, selectedId, onSelect, onEnterFocus, nodeRefs: extern
   const ownNodeRefs = uR_T({});
   const nodeRefs = externalNodeRefs || ownNodeRefs;
 
-  // Partition into weakly-connected components + singletons, then order each
-  // component's tiers via barycenter/transpose (STATUS_ORDER baked in as the
-  // initial permutation/tiebreak — see graph_layout.js). Tiers are computed
-  // once over the full filtered set: a weakly-connected component has no
-  // edges to other components, so per-component tiers equal global tiers.
-  const { blocks, singletons } = uM_T(() => {
-    const tiers = computeTiers(tasks);
-    const { components, singletons: singles } = partitionComponents(tasks);
-    return { blocks: components.map(c => orderRows(c, tiers)), singletons: singles };
-  }, [tasks]);
-
-  // Highlight neighborhood when something is selected
-  const neighborhood = uM_T(() => computeNeighborhood(tasks, selectedId), [selectedId, tasks]);
+  // Keyed on content, not on `tasks`: callers pass a fresh array every render
+  // (each poll, each click). The layout holds ids only (see
+  // graph_layout.js::taskGraphLayout), so nodes render the current task objects.
+  const layoutKey = layoutSignature(tasks);
+  const { blocks, singletons } = uM_T(() => taskGraphLayout(tasks), [layoutKey]);
+  const neighborhood = uM_T(() => computeNeighborhood(tasks, selectedId), [layoutKey, selectedId]);
+  const taskById = new Map(tasks.map(t => [t.id, t]));
 
   // Node card JSX, shared verbatim between component-block tier rows and the
   // singleton strip so TaskGraphEdges (which resolves positions via
@@ -203,6 +217,7 @@ function TaskGraph({ tasks, selectedId, onSelect, onEnterFocus, nodeRefs: extern
           </span>
         </div>
         <div className="ttl">{t.title}</div>
+        <DeferralHold task={t} />
       </div>
     );
   }
@@ -225,7 +240,7 @@ function TaskGraph({ tasks, selectedId, onSelect, onEnterFocus, nodeRefs: extern
                   tiers 0..maxTier with no gaps (tier = 1 + max(in-component deps' tier)),
                   so a row shouldn't be empty here in practice. Kept in case that
                   invariant is ever violated by a future graph_layout.js change. */}
-              {row.length === 0 ? <div className="empty-tier">—</div> : row.map(renderNode)}
+              {row.length === 0 ? <div className="empty-tier">—</div> : row.map(id => renderNode(taskById.get(id)))}
             </div>
           ))}
         </div>
@@ -234,7 +249,7 @@ function TaskGraph({ tasks, selectedId, onSelect, onEnterFocus, nodeRefs: extern
         <div className="singleton-strip">
           <div className="strip-label">unconnected</div>
           <div className="row">
-            {singletons.map(renderNode)}
+            {singletons.map(id => renderNode(taskById.get(id)))}
           </div>
         </div>
       )}
@@ -289,26 +304,22 @@ function ProjectPrdGroups({ graphTasks, allProjectTasks, rows, terminal, selecte
   // Content signatures so the pricier work below (bucketing + PRD-level
   // mini-DAG tiering, and the full-member summaries) only reruns when
   // something it actually reads changes. `graphTasks`/`allProjectTasks` are
-  // fresh array instances on every TasksTab render — including the app-wide
-  // 1s clock tick (app.jsx's `setInterval(() => setNow(...), 1000)`, unrelated
-  // to data polling) — which would defeat a plain reference-keyed useMemo
-  // every tick (same reasoning as TaskGraphEdges' own `signature` memo
-  // above). Unlike that one, this signature must cover every field
-  // TaskGraph/renderNode displays for a grouped task (not just id/status/
-  // deps), since a stale cache here would freeze those fields' displayed
-  // values across ticks — keep it in sync with renderNode if it starts
-  // reading more of a task.
-  const filteredSig = uM_T(() => graphTasks.map(t =>
-    `${t.id}:${t.status}:${t.prd || ''}:${t.title}:${t.started}:${t.completed || ''}:` +
-    `${t.train ? `${t.train.id}/${t.train.order}` : ''}:` +
-    `${(t.deps || []).map(d => d.id + (d.done ? '1' : '0')).join(',')}`
-  ).join('|'), [graphTasks]);
+  // fresh array instances on every TasksTab render — each data poll and each
+  // interaction — which would defeat a plain reference-keyed useMemo on every
+  // one (same reasoning as the `layoutKey` of TaskGraphEdges and TaskGraph
+  // above). Bucketing, tiering and the neighborhood read only id, status, prd
+  // and dep ids, so `groupingKey` holds exactly those; a poll that changes only
+  // what a node draws (title, age, hold) reruns none of them. So `groups` is
+  // structure only: each box renders the CURRENT task objects, looked up by id
+  // in `taskById`, never the copies cached in `groups`.
+  const groupingKey = JSON.stringify(graphTasks.map(t => [t.id, t.status, t.prd || null, (t.deps || []).map(d => d.id)]));
   // fullMembersByPrd (below) only feeds summarizePrdMembers, which looks at
   // nothing but id/status/prd — a narrower, cheaper signature.
   const allSig = uM_T(() => allProjectTasks.map(t => `${t.id}:${t.status}:${t.prd || ''}`).join('|'), [allProjectTasks]);
 
-  const groups = uM_T(() => orderPrdGroups(groupTasksByPrd(graphTasks), computeTiers), [filteredSig]);
-  const neighborhood = uM_T(() => computeNeighborhood(graphTasks, selectedId), [filteredSig, selectedId]);
+  const groups = uM_T(() => orderPrdGroups(groupTasksByPrd(graphTasks), computeTiers), [groupingKey]);
+  const neighborhood = uM_T(() => computeNeighborhood(graphTasks, selectedId), [groupingKey, selectedId]);
+  const taskById = new Map(graphTasks.map(t => [t.id, t]));
 
   // The outline/pip aggregate status and the member bar both read from each
   // PRD's FULL member set (every task with that prd,
@@ -334,7 +345,8 @@ function ProjectPrdGroups({ graphTasks, allProjectTasks, rows, terminal, selecte
         const key = g.noPrd ? null : g.prd;
         const fullMembers = fullMembersByPrd.get(key) || g.tasks;
         return (
-          <PrdBox key={g.noPrd ? '__no_prd__' : g.prd} group={g} fullMembers={fullMembers} progress={progress}
+          <PrdBox key={g.noPrd ? '__no_prd__' : g.prd} group={g} currentTasks={g.tasks.map(t => taskById.get(t.id))}
+                  fullMembers={fullMembers} progress={progress}
                   selectedId={selectedId} onSelect={onSelect} onEnterFocus={onEnterFocus} nodeRefs={nodeRefs} />
         );
       })}
@@ -355,7 +367,7 @@ function ProjectPrdGroups({ graphTasks, allProjectTasks, rows, terminal, selecte
 // so each box's `collapsed` state is an independent useState — Rules of
 // Hooks requires one consistent hook set per mounted component instance,
 // not a variable-count hook call inside a loop over `groups`.
-function PrdBox({ group: g, fullMembers, progress, selectedId, onSelect, onEnterFocus, nodeRefs }) {
+function PrdBox({ group: g, currentTasks, fullMembers, progress, selectedId, onSelect, onEnterFocus, nodeRefs }) {
   const summary = uM_T(() => summarizePrdMembers(fullMembers), [fullMembers]);
   const agg = aggregatePrdStatus(summary);
 
@@ -424,7 +436,7 @@ function PrdBox({ group: g, fullMembers, progress, selectedId, onSelect, onEnter
       </div>
       {!collapsed && (
         <div className="prd-box-body">
-          <TaskGraph tasks={g.tasks} selectedId={selectedId} onSelect={onSelect} onEnterFocus={onEnterFocus}
+          <TaskGraph tasks={currentTasks} selectedId={selectedId} onSelect={onSelect} onEnterFocus={onEnterFocus}
                      nodeRefs={nodeRefs} renderEdges={false} />
         </div>
       )}
@@ -552,6 +564,12 @@ function TaskDetail({ task, allTasks }) {
               columns; deliberately INDEPENDENT of `agent` below, which is only
               worktree presence and stays truthy after the agent dies. */}
           {(() => { const sb = strandBadgeState(task); return sb && <span className={sb.cls} style={{ marginLeft: sb.marginLeft }} title={sb.title}>{sb.label}</span>; })()}</span>
+        {deferralCellState(task) && (
+          <React.Fragment>
+            <span className="k">hold</span>
+            <DeferralHold task={task} />
+          </React.Fragment>
+        )}
         <span className="k">agent</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{(() => { const ac = agentCellState(task); return ac.color ? <span style={{ color: ac.color }}>{ac.text}</span> : ac.text; })()}</span>
         <span className="k">loops</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{rtCell(task.loops)}</span>
         <span className="k">attempts</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{rtCell(task.attempts)}</span>
@@ -639,14 +657,14 @@ function TaskDetail({ task, allTasks }) {
 
 function TasksTab({ projectFilter, search }) {
   // Open/closed per project, persisted
-  const [openMap, setOpenMap] = tasksPersistedState('df.tasksOpen', {});
-  const toggle = (id) => setOpenMap(m => ({ ...m, [id]: !m[id] }));
+  const [openMap, setOpenMap] = usePersistedState('df.tasksOpen', {});
+  const toggle = (id) => setOpenMap(m => withProjectDeviation(m, id, m[id] === false ? undefined : false));
 
   // Per-project "group by PRD" view toggle, persisted (same per-project-id
   // map shape as openMap). Key absent/'flat' -> today's ungrouped view;
   // 'prd' -> the grouped-by-PRD view.
-  const [groupByPrdMap, setGroupByPrdMap] = tasksPersistedState('df.tasksGroupByPrd', {});
-  const setGroupByPrd = (id, v) => setGroupByPrdMap(m => ({ ...m, [id]: v }));
+  const [groupByPrdMap, setGroupByPrdMap] = usePersistedState('df.tasksGroupByPrd', {});
+  const setGroupByPrd = (id, v) => setGroupByPrdMap(m => withProjectDeviation(m, id, v === 'prd' ? 'prd' : undefined));
 
   // Selected task (single, across all projects)
   const [selectedId, setSelectedId] = uS_T(null);
@@ -678,7 +696,7 @@ function TasksTab({ projectFilter, search }) {
   // The census views, in-flight and backlog on by default. A new key, not
   // 'df.tasksFilters': an old {active, pending, ...} object would read as
   // "nothing selected" under the view keys.
-  const [filterMap, setFilterMap] = tasksPersistedState('df.tasks.views', { in_flight: true, backlog: true });
+  const [filterMap, setFilterMap] = usePersistedState('df.tasks.views', { in_flight: true, backlog: true, terminal: false });
   const filter = Object.fromEntries(CENSUS_VIEWS_T.map(v => [v.key, !!(filterMap || {})[v.key]]));
   const flipFilter = (key) => setFilterMap({ ...filter, [key]: !filter[key] });
 
@@ -727,13 +745,7 @@ function TasksTab({ projectFilter, search }) {
   // one too — PROJECTS is the orchestrator-derived list, a different
   // population that diverges whenever a root has no orchestrator (or the
   // reverse), which made the notice understate how many projects failed.
-  const bannerNotices = tasksBannerNotices({
-    offline: !!DF_T.TASKS_OFFLINE,
-    offlineProjects: DF_T.TASKS_OFFLINE_PROJECTS || [],
-    degradedProjects: DF_T.TASKS_DEGRADED_PROJECTS || [],
-    countUnknownProjects: DF_T.TASKS_COUNT_UNKNOWN_PROJECTS || [],
-    totalProjects: DF_T.TASKS_PROJECT_COUNT || 0,
-  });
+  const bannerNotices = tasksBannerNoticesFor(DF_T);
   const bannerTestIds = {
     global: 'tasks-offline-banner',
     partial: 'tasks-partial-banner',
@@ -867,7 +879,7 @@ function TasksTab({ projectFilter, search }) {
             // ProjectPrdGroups). For an OPEN group dropping them costs no
             // measured work: both were reference-keyed on `filtered`, which
             // listed.rows.filter(...) above rebuilds as a fresh array on every
-            // TasksTab render — including the app-wide 1s clock tick — so both
+            // TasksTab render — each data poll and each interaction — so both
             // already recomputed every render. That is the same hazard
             // ProjectPrdGroups documents for its own signature-keyed memos.
             //
@@ -885,9 +897,29 @@ function TasksTab({ projectFilter, search }) {
             const groupView = focusGroupView(filtered, { focusMode, selectedId, focusAnchorId });
             const isOpen = openMap[p.id] !== false; // default-open
             const groupByPrd = groupByPrdMap[p.id] === 'prd';
+            const invariantChip = invariantChipFor(DF_T.INVARIANTS, p.id);
+            const chainChip = chainChipFor(DF_T.INVARIANTS, p.id);
+            const deferralChip = deferralNeedsHumanChip(rows.value || []);
             const summary = (
               <>
                 {CENSUS_VIEWS_T.map(v => <Pip key={v.key} datum={census} color={CP_T[v.tone]} format={v.reading} />)}
+                {deferralChip && (
+                  <span className="mono deferral-chip" data-testid="tasks-deferral-needs-human" title={deferralChip.title}>
+                    {deferralChip.text}
+                  </span>
+                )}
+                {invariantChip && (
+                  <span className="mono" data-testid="tasks-invariant-chip" title={invariantChip.title}
+                        style={{ color: INVARIANT_CHIP_TONE_T[invariantChip.tone], fontSize: 10 }}>
+                    {invariantChip.text}
+                  </span>
+                )}
+                {chainChip && (
+                  <span className="mono" data-testid="tasks-chain-chip" title={chainChip.title}
+                        style={{ color: INVARIANT_CHIP_TONE_T[chainChip.tone], fontSize: 10 }}>
+                    {chainChip.text}
+                  </span>
+                )}
                 <span className="mono" style={{ color: 'var(--fg-3)', fontSize: 10 }}>
                   {groupView.shownCount}/{held.length} shown{groupView.emptiedByFocus ? ' — none in focus' : ''}
                 </span>

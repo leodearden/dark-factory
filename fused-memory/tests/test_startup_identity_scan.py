@@ -347,9 +347,9 @@ class TestInitializeSkipMaintenance:
 
     The ζ dry-run/census (migrate_cross_graph_leak.py) only needs a
     driver/client-wired backend for reads; the two startup maintenance
-    blocks (the index-build loop and the W6-ε startup identity scan, which
-    REPAIRS dup-uuid edges — a write) are needless mutation on a read-only
-    path and contend with a running service. skip_maintenance=True guards
+    blocks (the registered-graph index provisioning sweep and the W6-ε
+    startup identity scan, which REPAIRS dup-uuid edges — a write) are
+    needless mutation on a read-only path and contend with a running service. skip_maintenance=True guards
     BOTH blocks; the default (False) must keep running both.
     """
 
@@ -357,9 +357,9 @@ class TestInitializeSkipMaintenance:
     async def test_skip_maintenance_true_skips_both_blocks(
         self, mock_config, monkeypatch,
     ):
-        """skip_maintenance=True must skip BOTH the index-build loop and
-        _run_startup_identity_scan, while driver/client wiring still
-        completes."""
+        """skip_maintenance=True must skip BOTH the registered-graph index
+        provisioning sweep and _run_startup_identity_scan, while driver/client
+        wiring still completes."""
         import fused_memory.backends.graphiti_client as graphiti_client_module
 
         mock_config.llm.providers.openai.api_key = ''  # skip the OpenAI preflight/client
@@ -371,12 +371,12 @@ class TestInitializeSkipMaintenance:
         )
 
         backend = GraphitiBackend(mock_config)
-        backend._ensure_indices = AsyncMock()
+        backend.provision_registered_graphs = AsyncMock()
         backend._run_startup_identity_scan = AsyncMock(return_value={})
 
         await backend.initialize(skip_maintenance=True)
 
-        backend._ensure_indices.assert_not_awaited()
+        backend.provision_registered_graphs.assert_not_awaited()
         backend._run_startup_identity_scan.assert_not_awaited()
         assert backend.client is not None
         assert backend._driver is not None
@@ -400,16 +400,39 @@ class TestInitializeSkipMaintenance:
         )
 
         backend = GraphitiBackend(mock_config)
-        falkor_client_stub = MagicMock()
-        falkor_client_stub.list_graphs = AsyncMock(return_value=['g1'])
-        backend._require_falkor_client = MagicMock(return_value=falkor_client_stub)
-        backend._ensure_indices = AsyncMock()
+        backend.provision_registered_graphs = AsyncMock()
         backend._run_startup_identity_scan = AsyncMock(return_value={})
 
         await backend.initialize()
 
-        backend._ensure_indices.assert_awaited_once_with('g1')
+        backend.provision_registered_graphs.assert_awaited_once_with()
         backend._run_startup_identity_scan.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_initialize_survives_a_provisioning_sweep_failure(
+        self, mock_config, monkeypatch,
+    ):
+        """A sweep that raises (e.g. the graph listing is unreachable) must not
+        break backend startup, and must not skip the identity scan after it."""
+        import fused_memory.backends.graphiti_client as graphiti_client_module
+
+        mock_config.llm.providers.openai.api_key = ''
+        monkeypatch.setattr(
+            graphiti_client_module, '_MultiTenantFalkorDriver', MagicMock(),
+        )
+        monkeypatch.setattr(
+            graphiti_client_module, 'Graphiti', MagicMock(return_value=AsyncMock()),
+        )
+
+        backend = GraphitiBackend(mock_config)
+        backend.provision_registered_graphs = AsyncMock(side_effect=RuntimeError('boom'))
+        backend._run_startup_identity_scan = AsyncMock(return_value={})
+
+        await backend.initialize()  # must not raise
+
+        backend.provision_registered_graphs.assert_awaited_once_with()
+        backend._run_startup_identity_scan.assert_awaited_once()
+        assert backend.client is not None
 
 
 # ---------------------------------------------------------------------------

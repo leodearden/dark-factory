@@ -1,0 +1,54 @@
+{
+  "task_id": "5246",
+  "reason": "Net-additive operator feature: merge_relane (worker.py re-lane/re-bucket/wake of a queued request or its coalesced train, types.py RelaneOutcome and LaneMetadataWrite, plus the durable metadata.merge_lane write per moved task). Not a refactor that failed.",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 2220,
+      "current": 2249
+    },
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+      "baseline": 1974,
+      "current": 2021
+    },
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 22530,
+      "current": 22663
+    },
+    {
+      "measure": "prose_lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+      "baseline": 1012,
+      "current": 1038
+    },
+    {
+      "measure": "prose_lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 12582,
+      "current": 12617
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 4912,
+      "current": 4941
+    },
+    {
+      "measure": "total:lines",
+      "key": "<cluster>",
+      "baseline": 58037,
+      "current": 58217
+    },
+    {
+      "measure": "total:prose_lines",
+      "key": "<cluster>",
+      "baseline": 31782,
+      "current": 31843
+    }
+  ]
+}

@@ -21,7 +21,15 @@ import enum
 
 import pytest
 
-from shared.task_statuses import ACTIVE, STATUS_TRIGGERS, TERMINAL, WORKFLOW_PRESERVE, TaskStatus
+from shared.task_statuses import (
+    ACTIVE,
+    STATUS_TRIGGERS,
+    TERMINAL,
+    WORKFLOW_PRESERVE,
+    OwnerLiveness,
+    TaskStatus,
+    owner_liveness,
+)
 
 # ---------------------------------------------------------------------------
 # Legacy literal sets — verified verbatim against the working tree 2026-07-06.
@@ -119,6 +127,42 @@ class TestDerivedFrozensets:
 # Tracking placeholder — cross-package drift guard (reviewer finding, task
 # 2163 amendment pass). NOT runnable yet: see skip reason.
 # ---------------------------------------------------------------------------
+
+
+_EXPECTED_LIVENESS = {
+    TaskStatus.PENDING: 'open',
+    TaskStatus.IN_PROGRESS: 'open',
+    TaskStatus.BLOCKED: 'open',
+    TaskStatus.DEFERRED: 'deferred',
+    TaskStatus.REVIEW: 'open',
+    TaskStatus.MERGE_DEFERRED: 'open',
+    TaskStatus.INFRA_HOLD: 'open',
+    TaskStatus.DONE: 'done',
+    TaskStatus.CANCELLED: 'closed',
+}
+
+
+class TestOwnerLiveness:
+    def test_the_table_covers_every_status(self):
+        assert set(_EXPECTED_LIVENESS) == set(TaskStatus)
+
+    @pytest.mark.parametrize('status', list(TaskStatus))
+    def test_each_status_has_its_verdict(self, status):
+        assert owner_liveness(status) == _EXPECTED_LIVENESS[status]
+        assert owner_liveness(status.value) == _EXPECTED_LIVENESS[status]
+
+    @pytest.mark.parametrize('status', [None, ''])
+    def test_an_absent_status_is_closed(self, status):
+        assert owner_liveness(status) is OwnerLiveness.CLOSED
+
+    def test_verdicts_compare_equal_to_their_strings(self):
+        assert {m: m.value for m in OwnerLiveness} == {
+            OwnerLiveness.OPEN: 'open',
+            OwnerLiveness.DEFERRED: 'deferred',
+            OwnerLiveness.DONE: 'done',
+            OwnerLiveness.CLOSED: 'closed',
+        }
+        assert OwnerLiveness.DEFERRED == 'deferred'
 
 
 @pytest.mark.skip(

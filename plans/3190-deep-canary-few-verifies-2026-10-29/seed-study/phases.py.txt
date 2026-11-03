@@ -1,0 +1,44 @@
+import re,sys,json,datetime as D,collections
+ansi=re.compile(r'(\x1b|#033)\[[0-9;]*m')
+line=re.compile(r'^(\S+) \S+ (warm-lane-gc(?:-sweep)?\.sh)\[(\d+)\]: (.*)$')
+seeds=[];cur={};sweep=[]
+def ts(s): return D.datetime.fromisoformat(s).timestamp()
+marks=[('pinned base gen','pin'),('seed-warm-lane.sh: base=','start'),('Renaming non-empty','mv'),('Cloning ','clone0'),('Clone complete','clone1'),('Stamping sources','stamp0'),
+('delta-touch base','stamp1'),('Touched ','touched'),('Post-condition OK: no stale','stale'),('Invalidated ','inval'),('Relocated ','reloc'),('Relinked ','relink'),('Post-condition OK: oldest','oldest'),('Removing reseed trash','trash'),('git rerere disarmed','rerere'),('stash-guard hooks armed','hooks'),('Warm lane seeded','seeded')]
+for fn in sys.argv[1:]:
+  for l in open(fn,errors='replace'):
+    l=ansi.sub('',l)
+    m=line.match(l)
+    if not m: continue
+    t,_,pid,msg=m.groups()
+    if 'resetting lane:' in msg:
+        sweep.append((ts(t),'reset0',msg.split()[-1],pid));continue
+    if 'reset lane:' in msg:
+        sweep.append((ts(t),'reset1',msg.split()[-1],pid));continue
+    if '[seed]' not in msg: continue
+    for k,name in marks:
+        if k in msg:
+            s=cur.get(pid)
+            if name=='pin' or s is None:
+                s=cur[pid]={'pid':pid}
+            s.setdefault(name,ts(t))
+            if name=='pin':
+                g=re.search(r'target\.gen\.(\d+) for (\S+)',msg)
+                if g: s['gen']=int(g[1]);s['lane']=g[2]
+            if name=='clone0':
+                g=re.search(r'target\.gen\.(\d+)',msg); s['gen']=int(g[1]) if g else s.get('gen')
+                g=re.search(r'worktrees/([^/]+)/target',msg); s['lane']=g[1] if g else s.get('lane')
+            if name=='touched':
+                g=re.search(r'Touched (\d+) git',msg)
+                if g:s['ndelta']=int(g[1])
+            if name=='inval':
+                s['ninv']=int(re.search(r'Invalidated (\d+)',msg)[1])
+            if name=='reloc':
+                g=re.search(r'Relocated (\d+) of (\d+)',msg); s['nrel'],s['ncand']=int(g[1]),int(g[2])
+            if name=='relink':
+                s['nrelink']=int(re.search(r'Relinked (\d+)',msg)[1])
+            if name=='seeded':
+                seeds.append(s);cur.pop(pid,None)
+            break
+json.dump({'seeds':seeds,'sweep':sweep},open('/tmp/3190s/phases.json','w'))
+print(len(seeds),'complete seeds',len(sweep),'sweep marks',len(cur),'open')

@@ -1,0 +1,28 @@
+{"type": "queue-operation", "timestamp": "2026-09-28T14:22:48.887Z", "operation": "enqueue"}
+{"type": "queue-operation", "timestamp": "2026-09-28T14:22:48.891Z", "operation": "dequeue"}
+{"type": "attachment", "timestamp": "2026-09-28T14:22:34.850Z", "attachment": {"type": "hook_success"}}
+{"type": "user", "timestamp": "2026-09-28T14:22:49.056Z", "message": {"role": "user", "content": "redacted"}}
+{"type": "attachment", "timestamp": "2026-09-28T14:22:49.053Z", "attachment": {"type": "environment"}}
+{"type": "attachment", "timestamp": "2026-09-28T14:22:49.053Z", "attachment": {"type": "model"}}
+{"type": "attachment", "timestamp": "2026-09-28T14:22:49.053Z", "attachment": {"type": "deferred_tools_delta"}}
+{"type": "attachment", "timestamp": "2026-09-28T14:22:49.053Z", "attachment": {"type": "skill_listing"}}
+{"type": "attachment", "timestamp": "2026-09-28T14:22:49.053Z", "attachment": {"type": "total_tokens_reminder"}}
+{"type": "attachment", "timestamp": "2026-09-28T14:22:49.053Z", "attachment": {"type": "budget_usd"}}
+{"type": "atis-latch"}
+{"type": "attachment", "timestamp": "2026-09-28T14:23:09.162Z", "attachment": {"type": "instructions"}}
+{"type": "attachment", "timestamp": "2026-09-28T14:23:09.162Z", "attachment": {"type": "session_context"}}
+{"type": "attachment", "timestamp": "2026-09-28T14:23:09.163Z", "attachment": {"type": "date"}}
+{"type": "attachment", "timestamp": "2026-09-28T14:23:09.177Z", "attachment": {"type": "prompt_snapshot"}}
+{"type": "last-prompt", "lastPrompt": "redacted"}
+{"type": "atis-latch"}
+{"type": "assistant", "timestamp": "2026-09-28T14:24:20.813Z", "message": {"role": "assistant", "model": "claude-sonnet-5", "stop_reason": "tool_use", "content": [{"type": "thinking", "thinking": "redacted", "signature": "redacted"}]}}
+{"type": "assistant", "timestamp": "2026-09-28T14:24:45.047Z", "message": {"role": "assistant", "model": "claude-sonnet-5", "stop_reason": "tool_use", "content": [{"type": "tool_use", "id": "toolu_fixture_01", "name": "StructuredOutput", "input": {"action": "combine", "justification": "redacted", "target_id": "9001", "target_fingerprint": "redacted", "rewritten_task": "redacted", "description": "redacted", "details": "redacted", "files_to_modify": "redacted", "priority": "low"}}]}}
+{"type": "last-prompt", "lastPrompt": "redacted"}
+{"type": "atis-latch"}
+{"type": "user", "timestamp": "2026-09-28T14:25:12.670Z", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_fixture_01", "is_error": true, "content": "Output does not match required schema: /rewritten_task: must be object,null"}]}}
+{"type": "attachment", "timestamp": "2026-09-28T14:25:12.675Z", "attachment": {"type": "prompt_snapshot"}}
+{"type": "attachment", "timestamp": "2026-09-28T14:25:12.691Z", "attachment": {"type": "total_tokens_reminder"}}
+{"type": "attachment", "timestamp": "2026-09-28T14:25:12.692Z", "attachment": {"type": "budget_usd"}}
+{"type": "last-prompt", "lastPrompt": "redacted"}
+{"type": "atis-latch"}
+{"type": "cost-state"}

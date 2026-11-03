@@ -5,8 +5,8 @@ Task η removed the ``--json-schema`` / ``result.structured_output`` scaffold
 from the four *orchestrator verdict roles* (merger/reviewer/triage/judge),
 which now read their verdicts from on-disk artifacts. It deliberately made
 NO change to the SHARED ``shared.cli_invoke`` machinery — the
-``--json-schema`` render, the CLI-2.1.168 ``'*'`` deny-list expansion (which
-omits the synthetic ``StructuredOutput`` tool), and the
+``--json-schema`` render, the substitution of ``--tools ''`` for a ``'*'``
+deny (which keeps the synthetic ``StructuredOutput`` tool), and the
 ``structured_output`` parse — because fused-memory recon / curator /
 adjudicator still ride it (``reconciliation/stages/base.py`` →
 ``run_stage_via_cli(output_schema=get_report_schema())``;
@@ -16,8 +16,8 @@ This standing guard drives ``shared.cli_invoke.invoke_claude_agent`` with a
 recon/curator-like config (a non-trivial object ``output_schema`` +
 ``disallowed_tools=['*']``) and asserts the shared path still:
   (a) renders ``--json-schema`` with the schema JSON;
-  (b) expands the ``'*'`` wildcard to ``_REAL_BUILTIN_TOOLS_DENYLIST`` (real
-      builtins denied, ``StructuredOutput`` NOT denied); and
+  (b) replaces the ``'*'`` wildcard with the ``--tools ''`` registry filter
+      (no built-in or deferred tool, ``StructuredOutput`` NOT denied); and
   (c) parses a ``StructuredOutput``-bearing subprocess result back into
       ``AgentResult.structured_output``.
 
@@ -40,7 +40,6 @@ from unittest.mock import patch
 
 import pytest
 from shared.cli_invoke import (
-    _REAL_BUILTIN_TOOLS_DENYLIST,
     _SCHEMA_OUTPUT_TOOL,
     AgentResult,
     _SubprocessResult,
@@ -129,21 +128,19 @@ async def test_json_schema_rendered_with_schema_json(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_wildcard_deny_expands_and_spares_structured_output_tool(tmp_path: Path) -> None:
-    """(b) ``'*'`` + output_schema expands to _REAL_BUILTIN_TOOLS_DENYLIST
-    (real builtins e.g. Bash/Read denied) while the synthetic
-    ``StructuredOutput`` tool is NOT denied anywhere in argv.
+async def test_wildcard_deny_becomes_tool_registry_filter(tmp_path: Path) -> None:
+    """(b) ``'*'`` + output_schema renders as ``--tools ''`` (the registry
+    filter that leaves only the synthetic ``StructuredOutput`` tool), with no
+    ``'*'`` and no ``--disallowed-tools`` left, and the schema tool named
+    nowhere in argv.
     """
     argv, _ = await _drive_recon_like(tmp_path)
 
-    d_idx = argv.index('--disallowed-tools')
-    js_idx = argv.index('--json-schema', d_idx)
-    deny_values = argv[d_idx + 1:js_idx]
-
-    assert deny_values == _REAL_BUILTIN_TOOLS_DENYLIST, f'got {deny_values!r}'
-    assert '*' not in deny_values
-    # The schema tool must survive the expansion — denying it would
-    # permission-block every structured-output call (the CLI-2.1.168 bug).
+    assert argv[argv.index('--tools') + 1] == ''
+    assert '--disallowed-tools' not in argv
+    assert '*' not in argv
+    # Denying the schema tool would permission-block every structured-output
+    # call (the CLI-2.1.168 bug).
     assert _SCHEMA_OUTPUT_TOOL not in argv
 
 

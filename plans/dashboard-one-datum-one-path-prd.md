@@ -66,6 +66,34 @@ reviewer):
 | terminal window (400 done/cancelled rows) | — | — | 2.25 s / 9.4 MB |
 | whole tree (`orchestrator.py`, `burndown.py`, `app.py::_load_task_cards`, `merge_queue.py::load_task_titles`) | 3.4 s / 29 MB | 3.65 s / 30 MB | — |
 | `GET /api/v2/dashboard/tasks` today | | | 6.8 s / 16.4 MB |
+| `GET /api/v2/dashboard/tasks` after ι (task 5598, 2026-10-04) | | | 3.65–4.17 s / 3.08 MB |
+
+**After ι (task 5598, 2026-10-04, 22:43–22:45 UTC).** Method: the real
+`api/tasks.py::api_tasks` handler was called with a duck-typed `Request` over
+`DashboardConfig.from_env()` (the service's nine roots, live fused-memory at
+`localhost:8002`) and a new `httpx.AsyncClient`. Each run was a fresh process, so
+MCP sessions and every cache started cold, and timing was `perf_counter` from an
+uncommitted ad-hoc probe.
+
+- **Cold render, 3 runs:** 4.17 s, 3.65 s and 4.11 s, each serving 3.08 MB.
+- **Per-root health:** in every run all nine roots classified OK, census and rows
+  both `fresh`. `TASKS_OFFLINE` was false, so no root trailed in any run.
+- **Warm:** a second call in the same process took 1.54 s, 3.77 s and 0.99 s. The
+  15 s snapshot unit answers both reads, so what remains is the per-request tail:
+  the runtime probe, row shaping and the external-dep read.
+- **Terminal window:** in a further fresh process, `?terminal=dark-factory` took
+  4.25 s and 3.38 MB in all. The window alone took 0.77 s for 400 rows (0.32 MB),
+  served `lower_bound` as the newest 400 of 4682 terminal rows. After task 5950
+  (2026-10-18): the same request serves only the window and served_at — 0.32 MB
+  against 5.25 MB from the pre-5950 handler in the same process, over the
+  service's ten roots, cold, three runs each (2.33–3.02 s against 5.77–6.60 s),
+  the window `lower_bound` as the newest 400 of 5209 in every run.
+- **Against the 2026-09-18 baseline (6.8 s / 16.4 MB):** the cold render is
+  39–46 % faster and its payload 81 % smaller. The baseline acquisition was
+  0.38 s + 2.49 s + 2.25 s and included terminal rows. The default render no
+  longer reads terminal rows; one root's window, read on request, now costs
+  0.77 s, where the nine-root window cost 2.25 s / 9.4 MB.
+- **Next lever for task 4795:** field projection on `get_tasks` (task 4390).
 
 The whole-tree fetches are the heavy calls and this PRD removes all four from the
 request path. The compact map is cheap **but not immune**: the dashboard journal for
@@ -243,6 +271,10 @@ pointing at ι (a dependency edge on a `deferred` task would be inert). Task
 8. **PRD box `n/m done` is a `lower_bound` datum** over the fetched rows, rendered as
    `≥ n/m`, until a per-PRD server census exists (out of scope: the status map carries
    no PRD field).
+   *Superseded 2026-10-09 by `plans/dashboard-prd-lanes-prd.md` (§4.2, §4.4). A lineage
+   index over every task attributes each task to a PRD at read time, and
+   `GET /api/v2/dashboard/prds` serves exact per-PRD `done/total` (task 6583, γ1). The PRD
+   boxes are deleted (task 6585, δ).*
 9. **Burndown**: the sampler consumes the snapshot unit from decision 5; a failed cycle
    writes a row with `state='gap'` and `reason`; all nine members are stored — the
    three columns that do not exist today (`review`, `merge_deferred`, `infra_hold`)
@@ -377,7 +409,7 @@ pointing at ι (a dependency edge on a `deferred` task would be inert). Task
 | fused-memory `get_statuses` paging (`page_size`, `offset`, `has_more`, ≤ 2000) | called live: dark-factory 5539 statuses in three pages |
 | `tasks.py::fetch_statuses` cost / `fetch_tasks(statuses=…)` real server-side filter | measured table above; memory `fa730a43` |
 | `get_tasks` has **no** id filter; `get_task` per id exists | grep of `fused_memory/server/tools.py` 2026-09-18 (`::get_task`) — hence decision 12's miss path |
-| `app.py::_fanout_probe_completion` is a raw `fetch_tasks` caller by design (healthz) | present; exempted in decision 17 |
+| `app.py::_fanout_probe_completion` is a raw, uncached task-read caller (one row of the unit's row query since task 6321) by design (healthz) | present; exempted in decision 17 |
 | `shared.task_claimant.is_stranded` | present; consumed by `tasks.py::task_is_stranded` |
 | `burndown.py::ensure_snapshot_columns` probe-then-add migration | present; nullable columns expressible (`concurrency_cap INTEGER` precedent) |
 | `static/redux/endpoint_staleness.js` (`STALE_FAILURE_THRESHOLD = 3`), `data.js::DF_DATA.__stale`, `app.jsx::staleNoticesForTab` | present (task 4884) — the endpoint-freshness home this PRD defers to |
@@ -532,6 +564,59 @@ fact, not the registry's. Datum-kinded keys default to an `unknown` Datum with r
 | 14 | Old paths gone | repository state | AST access-path check passes; `collect_done_counts`, `task_status_counts.js` and its four pins, `dailyDeltas`, `_STATUS_MAP`, `orchestrator.py` summary, request-path whole-tree fetches absent |
 | 15 | Cold render over nine roots — **recorded, not gated** | caches cleared, all nine roots reachable | handler time, payload size and per-root state recorded in ι's completion note against the 2026-09-18 baseline (6.8 s / 16.4 MB; cold acquisition 0.38 s + 2.49 s + terminal 2.25 s); 4795 depends on ι and decides the next lever from this |
 
+**Sketch #14 as gated by ι (task 5598, 2026-10-05).** The old-path census in
+`dashboard/tests/test_datum_access_paths.py` checks three kinds of path: served
+assets (each answers 404 and is not loaded by the parsed `index.html`),
+window-level exports of served scripts, and route wire keys. It does not check
+Python identifiers or function-local client names. The AST access-path check in
+the same file enforces the absence of request-path whole-tree fetches.
+`collect_done_counts`, `_STATUS_MAP` and `dailyDeltas` were deleted by their
+producing leaves and have no name guard.
+
+**The `/healthz` probe reads one row of the unit's row query (task 6321,
+2026-10-31).** Until task 6321, decision 17's exemption was an unnarrowed
+`fetch_tasks`, the 3.4 s / 29 MB read that decision 20 costs. It is paid at
+most once per 30 s grace lapse, and only while something calls `/healthz`.
+Nothing calls it on a schedule: the watchdog probes the shallow `/api/health`,
+and `scripts/restart-dashboard.sh` calls `/healthz` only to wait for readiness
+after a restart. Task 5598 (2026-10-05) weighed two cheaper reads separately,
+and both findings still hold:
+
+- `fetch_tasks(statuses=[])` never reaches SQL, because fused-memory's
+  `sqlite_task_backend.py::_get_tasks_internal` returns before opening a
+  connection. It would not traverse the path the probe exists to test.
+- A one-row page alone cuts the transfer but not the server read, because
+  `server/tools.py::get_tasks` builds the whole list and slices it in memory.
+
+Combined, they do what neither does alone. With the snapshot unit's own row
+statuses (`task_snapshot.py::ROW_READ_STATUSES`, which `_read_unit` also reads)
+and `page_size=1`, the server runs exactly the unit's row query as
+`WHERE status IN (...)` and ships one row. That is what
+`app.py::_fanout_probe_completion` now reads, through `fetch_task_page`. It
+crosses the same shared client, `mcp_fanout.first_success`, MCP `get_tasks`
+and backend read connection as the request path. Decision 17's contract is
+unchanged: the read is raw and uncached, and is never answered from a stored
+value. The verdict is unchanged too: a completed fan-out is `ok` whatever it
+returned, so only completion ever mattered, not the rows.
+
+`/healthz` deliberately does NOT cross the snapshot unit's latch:
+
+- Inside its TTL, `acquire_snapshot` is answered by the stored unit, which
+  decision 17 forbids.
+- The latch and the unit's refresh are both bounded. Lock acquisition is
+  bounded by `mcp_fanout.py::_LOCK_ACQUIRE_TIMEOUT_SECONDS` and then bypassed
+  (task 4789). Each half of the unit's read runs under `task_snapshot.py::_bounded`.
+  So the wedge class the probe was built for, an unbounded held lock, is
+  closed on both legs. What remains is a substrate hang whose cancellation
+  does not land, and the raw probe already sees that, because it crosses the
+  same client and fan-out.
+- A wedged unit is not silent. It shows up as stale or unknown `Datum`s,
+  DEGRADED banners and `mcp_fanout.py::TTLCache._note_lock_bypass`'s WARNING.
+- A latch-age check would need new instrumentation and a wider `TTLCache`
+  interface, and no observed failure calls for it.
+
+Re-open this only on evidence of a unit wedge that those signals miss.
+
 ## Decomposition plan
 
 Sizing per the overlay bands (300–1500 LOC, ≤10–12 files); every pair of leaves that
@@ -598,8 +683,11 @@ and a miss cap); δ2's signal reworded as fixture-driven. META answered yes.
 ## Out of scope
 
 - A per-PRD server census (needs a PRD field on the status map — a fused-memory
-  change); PRD boxes stay `lower_bound`.
-- Field projection on `get_tasks` (task 4390; 4795's remaining lever).
+  change); PRD boxes stay `lower_bound`. *Superseded 2026-10-09: delivered by
+  `plans/dashboard-prd-lanes-prd.md` task 6583 (γ1), with no status-map change.*
+- Field projection on `get_tasks` (task 4390; 4795's remaining lever). *2026-10-09: the
+  projection part is delivered by task 6581 (`plans/dashboard-prd-lanes-prd.md` α), and
+  4390 depends on it.*
 - Regenerating `recon_status.js` from `journal.py` (5320's runtime unknown bucket
   already catches drift).
 - Dashboard supervision/watchdog and endpoint-freshness thresholds

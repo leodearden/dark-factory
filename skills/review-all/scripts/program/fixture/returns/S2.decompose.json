@@ -1,0 +1,61 @@
+{
+  "schema": "review-all-prd-return/1",
+  "run_id": "review-all-fixture-20261019",
+  "stream": "S2",
+  "pass": "decompose",
+  "session": {
+    "kind": "agent",
+    "title": "S2 decompose seat"
+  },
+  "prd_path": "plans/review-all-fixture-s2-prd.md",
+  "manifest_path": "plans/review-all-fixture-s2-prd.capability-manifest.md",
+  "sidecar_path": "plans/review-all-fixture-s2-prd.capability-manifest.yaml",
+  "commits": [],
+  "open_questions": [],
+  "xrefs": [],
+  "lead_actions": [],
+  "notes": "Filed α and β; released S1 ζ onto 106 for C2.",
+  "filed": [
+    {
+      "label": "α",
+      "task_id": 106,
+      "priority": "high",
+      "keys": [
+        "fk-0000000000b1"
+      ],
+      "gate_dep": false,
+      "adopted": false
+    },
+    {
+      "label": "β",
+      "task_id": 105,
+      "priority": "medium",
+      "keys": [
+        "fk-0000000000b1"
+      ],
+      "gate_dep": false,
+      "adopted": false
+    }
+  ],
+  "held": [],
+  "released": [
+    {
+      "task_id": 113,
+      "onto": [
+        106
+      ],
+      "contract_as_delivered": "C2: beta.contract() returns a frozen view"
+    }
+  ],
+  "commit_planning": {
+    "committed": [
+      106,
+      105,
+      113
+    ],
+    "excluded": [],
+    "stamping_errors": []
+  },
+  "other_filed": [],
+  "moves": []
+}

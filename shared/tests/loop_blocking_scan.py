@@ -32,9 +32,13 @@ is the number 3778's methodology could not produce.
 
 Design
 ------
-* Pure stdlib (``ast`` only), no filesystem I/O -- ``find_loop_blocking_sites``
-  takes a ``{relpath: source}`` mapping so the unit tests can feed synthetic
-  modules directly, exactly as ``silent_fallthrough_scan.find_violations`` does.
+* Pure stdlib (``ast`` only), no filesystem I/O.  Two entry points, split
+  exactly as ``silent_fallthrough_scan.find_violations`` /
+  ``find_violations_in_tree`` are: ``find_loop_blocking_sites`` takes a
+  ``{relpath: source}`` mapping so the unit tests can feed synthetic modules
+  directly, and ``find_loop_blocking_sites_in_trees`` takes already-parsed
+  ``{relpath: ast.Module}`` trees, which the whole-tree gate hands it from the
+  session's shared first-party tree.
 * ``SyntaxError`` in one module contributes nothing and never raises, so a
   mid-edit file cannot turn the whole-tree gate red.
 * Callee names resolve through the calling module's ``from X import Y``
@@ -78,6 +82,7 @@ directory.
 from __future__ import annotations
 
 import ast
+from collections.abc import Mapping
 from typing import NamedTuple
 
 from silent_fallthrough_scan import (
@@ -151,6 +156,13 @@ _DIRECTORY_ENTRY_WRITE_WHY = (
     'filesystem directory-entry write: creates, removes or renames an entry, '
     'so it waits on the filesystem journal, not merely the page cache'
 )
+_PATH_RESOLUTION_WHY = (
+    'filesystem metadata: path normalisation issues one lstat per path '
+    'component plus a readlink per symlink -- cheap against a warm dentry '
+    'cache (measured: plans/inv8-caller-side-census-2026-09-03.md section '
+    '4d), unbounded against a cold, network or wedged filesystem, and the '
+    'coroutine cannot tell which it got'
+)
 
 # Dotted paths, matched after `import X as Y` alias substitution
 # (`subprocess.run(...)`) and after `from X import Y` binding resolution
@@ -217,6 +229,7 @@ DOTTED_PRIMITIVES: dict[str, str] = {
     'os.path.exists': _METADATA_WHY,
     'os.path.isfile': _METADATA_WHY,
     'os.path.isdir': _METADATA_WHY,
+    'os.path.realpath': _PATH_RESOLUTION_WHY,
     'os.makedirs': _DIRECTORY_ENTRY_WRITE_WHY,
     'os.mkdir': _DIRECTORY_ENTRY_WRITE_WHY,
     'os.rmdir': _DIRECTORY_ENTRY_WRITE_WHY,
@@ -282,8 +295,8 @@ BUILTIN_PRIMITIVES: dict[str, str] = {
 # section 4c).  `replace`, `remove` and `walk` stay out of this table for good:
 # by attribute name alone they are str.replace, list.remove and ast.walk, so
 # every string edit would become a merge-blocking row -- their os.* spellings
-# are matched above as receiver-pinned dotted paths.  `resolve` (Path.resolve)
-# and os.path.realpath are the next widening, owned by task 6089 (+12 rows).
+# are matched above as receiver-pinned dotted paths.  `resolve` IS matched by
+# name although other classes define it too: why, census section 4d.
 METHOD_PRIMITIVES: dict[str, str] = {
     'read_text': (
         'filesystem: the primitive behind task 4091\'s and task 4201\'s missed '
@@ -311,6 +324,7 @@ METHOD_PRIMITIVES: dict[str, str] = {
     'is_file': _METADATA_WHY,
     'is_dir': _METADATA_WHY,
     'stat': _METADATA_WHY,
+    'resolve': _PATH_RESOLUTION_WHY,
     'iterdir': _DIRECTORY_READ_WHY,
     'glob': _DIRECTORY_READ_WHY,
     'rglob': _DIRECTORY_READ_WHY,
@@ -872,8 +886,10 @@ def _reaches_blocking(
 # --------------------------------------------------------------------------- #
 
 
-def find_loop_blocking_sites(sources: dict[str, str]) -> list[LoopBlockingSite]:
+def find_loop_blocking_sites(sources: Mapping[str, str]) -> list[LoopBlockingSite]:
     """Return every coroutine call site that reaches a blocking primitive.
+
+    A parse-then-delegate wrapper over :func:`find_loop_blocking_sites_in_trees`.
 
     Args:
         sources: ``{repo-relative path: source text}``.  Cross-module callee
@@ -886,13 +902,34 @@ def find_loop_blocking_sites(sources: dict[str, str]) -> list[LoopBlockingSite]:
         ``(filename, lineno)``.  A module that fails to parse contributes
         nothing and does not suppress its siblings.
     """
-    modules: dict[str, _ModuleCtx] = {}
-    ordered: list[_ModuleCtx] = []
+    trees: dict[str, ast.Module] = {}
     for relpath, source in sources.items():
         try:
-            tree = ast.parse(source, filename=relpath)
+            trees[relpath] = ast.parse(source, filename=relpath)
         except SyntaxError:
             continue
+    return find_loop_blocking_sites_in_trees(trees)
+
+
+def find_loop_blocking_sites_in_trees(
+    trees: Mapping[str, ast.Module],
+) -> list[LoopBlockingSite]:
+    """Return every coroutine call site that reaches a blocking primitive.
+
+    Args:
+        trees: ``{repo-relative path: parsed module}``.  Walked READ-ONLY: the
+            resolver builds only ``id()``-keyed side maps and never writes to a
+            node, because under the gate these trees are shared with every
+            other gate in the session.  Cross-module resolution sees only the
+            modules in this mapping, as for :func:`find_loop_blocking_sites`.
+
+    Returns:
+        One :class:`LoopBlockingSite` per CALL SITE, ordered by
+        ``(filename, lineno)``.
+    """
+    modules: dict[str, _ModuleCtx] = {}
+    ordered: list[_ModuleCtx] = []
+    for relpath, tree in trees.items():
         ctx = _ModuleCtx(relpath, tree)
         modules[ctx.name] = ctx
         ordered.append(ctx)

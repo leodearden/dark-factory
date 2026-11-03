@@ -1,0 +1,48 @@
+{
+  "task_id": "6155",
+  "reason": "Net-additive (task 6155): the gate re-verify no longer parks the verifier loop. A head whose CAS rebases is re-parked at the front of _inflight with its gate as a task (InflightEntry.gate / pending_task); _verifier_loop gains the two re-park branches (FINALIZE-HEAD and the shutdown drain), _run_verifier_loop and stop() pre-empt a parked gate, and the test harness gains the single resume loop finalize_through_gate. The CAS loop moved verbatim out of _finalize_inflight into _advance_candidate and its arms, each new function at or under cognitive 15.",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+      "baseline": 80,
+      "current": 81
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 2271,
+      "current": 2276
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_run_verifier_loop",
+      "baseline": 4,
+      "current": 6
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_verifier_loop",
+      "baseline": 252,
+      "current": 260
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::stop",
+      "baseline": 111,
+      "current": 112
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/tests/_merge_queue_harness.py",
+      "baseline": 5,
+      "current": 8
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5020,
+      "current": 5029
+    }
+  ]
+}

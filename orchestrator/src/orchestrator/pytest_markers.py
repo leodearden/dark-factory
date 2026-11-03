@@ -1,4 +1,11 @@
-"""Static detection of "every file-scoped pytest target is marker-deselected" (task 3494).
+"""The pure reader of pytest CONFIGURATION and marker facts from file content.
+
+Shared by two consumers: the marker-deselection probe — static detection of
+"every file-scoped pytest target is marker-deselected" (task 3494) — and the
+serial-recovery addopts derivation (``verify_plan.py::governing_addopts``,
+task 5079), which both need "which config does pytest read, and what are its
+addopts" answered one way.  A third reads only :func:`is_whole_tree_guard_module`:
+verify_plan's task-role guard-family enumeration and its census guard (task 7253).
 
 WHY STATIC, not a ``--collect-only`` probe.  This module's sole consumer is
 ``verify_plan._derive_module_runs``, and ``derive_verify_plan``'s docstring makes
@@ -24,16 +31,20 @@ per-item nor the class-level tier can exhaustively enumerate (see
 :func:`per_item_marker_names` and :func:`guaranteed_marker_names`), or a
 module with zero collected items resolves to "no widening" — i.e. precisely
 today's behaviour.  Widening is only ever chosen on positive proof.  Nothing
-here raises: ``verify._safe_derive_verify_plan_dict`` swallows exceptions and
-returns None, so a raise on a mid-edit ``pyproject.toml`` would silently
-destroy the ENTIRE plan record.
+here raises: ``verify.py::_safe_derive_executed_fallback_plan`` swallows
+exceptions and returns None, so a raise on a mid-edit ``pyproject.toml``
+would silently destroy the ENTIRE plan record.
 """
 from __future__ import annotations
 
 import ast
+import posixpath
+import re
 import shlex
 import tomllib
 from collections.abc import Callable, Iterator, Sequence
+
+from shared.pytest_mark_grammar import marker_name, pytestmark_elements
 
 
 class _Unsupported(Exception):
@@ -55,26 +66,31 @@ def _marker_expr_from_tokens(tokens: Sequence[str]) -> str | None:
     return found
 
 
-def _addopts_tokens(pyproject_text: str | None) -> list[str] | None:
-    """``[tool.pytest.ini_options].addopts`` from *pyproject_text*, as a token list.
-
-    A ``str`` addopts is split with ``shlex``; a list keeps only its ``str``
-    elements.  Any other type, any malformed TOML, and any missing/non-dict
-    intermediate table yields None.
-    """
-    if not pyproject_text:
-        return None
+def _pyproject_pytest_table(pyproject_text: str) -> dict | None:
+    """The ``[tool.pytest]`` table of *pyproject_text*; ``{}`` when absent, None when malformed."""
     try:
         data = tomllib.loads(pyproject_text)
     except (tomllib.TOMLDecodeError, ValueError, TypeError):
         return None
-    node: object = data
-    for key in ('tool', 'pytest', 'ini_options', 'addopts'):
-        if not isinstance(node, dict):
-            return None
-        if key not in node:
-            return None
-        node = node[key]
+    tool = data.get('tool')
+    table = tool.get('pytest') if isinstance(tool, dict) else None
+    return table if isinstance(table, dict) else {}
+
+
+def addopts_tokens(pyproject_text: str | None) -> list[str] | None:
+    """``[tool.pytest.ini_options].addopts`` from *pyproject_text*, as a token list.
+
+    A ``str`` addopts is split with ``shlex``; a list keeps only its ``str``
+    elements.  Any other type, any malformed TOML, and any missing/non-dict
+    intermediate table yields None — including a native ``[tool.pytest]``
+    (toml mode) table, which has no ``ini_options``.
+    """
+    if not pyproject_text:
+        return None
+    ini_options = (_pyproject_pytest_table(pyproject_text) or {}).get('ini_options')
+    if not isinstance(ini_options, dict) or 'addopts' not in ini_options:
+        return None
+    node = ini_options['addopts']
     if isinstance(node, str):
         try:
             return shlex.split(node)
@@ -85,9 +101,69 @@ def _addopts_tokens(pyproject_text: str | None) -> list[str] | None:
     return None
 
 
+#: pytest's config file names, in its lookup order within one directory
+#: (``_pytest/config/findpaths.py::locate_config``, pytest 9.0.3).
+_PYTEST_CONFIG_NAMES = (
+    'pytest.toml', '.pytest.toml', 'pytest.ini', '.pytest.ini',
+    'pyproject.toml', 'tox.ini', 'setup.cfg',
+)
+_ALWAYS_DECLARING_NAMES = frozenset({'pytest.toml', '.pytest.toml', 'pytest.ini', '.pytest.ini'})
+_TOX_PYTEST_SECTION = re.compile(r'^\[pytest\][ \t]*$', re.MULTILINE)
+_SETUP_CFG_PYTEST_SECTION = re.compile(r'^\[tool:pytest\][ \t]*$', re.MULTILINE)
+
+
+def _declares_pytest_config(name: str, text: str) -> bool | None:
+    """Whether config file *name* with content *text* is one pytest would read.
+
+    ``_pytest/config/findpaths.py::load_config_dict_from_file``'s matching
+    rule. None for a malformed ``pyproject.toml``, where pytest raises a
+    UsageError rather than reading any config at all.
+    """
+    if name in _ALWAYS_DECLARING_NAMES:
+        return True
+    if name == 'pyproject.toml':
+        table = _pyproject_pytest_table(text)
+        return None if table is None else bool(table)
+    if name == 'tox.ini':
+        return _TOX_PYTEST_SECTION.search(text) is not None
+    return _SETUP_CFG_PYTEST_SECTION.search(text) is not None
+
+
+def locate_pytest_config(start_dir: str, read: Callable[[str], str | None]) -> str | None:
+    """The config file pytest reads for a run rooted at *start_dir*, else None.
+
+    pytest's own walk (``_pytest/config/findpaths.py::locate_config``):
+    *start_dir*, then each ancestor, checking ``_PYTEST_CONFIG_NAMES`` in
+    order; the first file that declares pytest config wins. *start_dir* and
+    the result are relative to *read*'s root ('' or '.' is the root itself),
+    and the walk never looks above that root, so the answer is the config
+    pytest finds first or None. A malformed ``pyproject.toml`` on the way
+    also yields None. A *start_dir* that is absolute or escapes the root is
+    refused rather than walked.
+    """
+    directory = posixpath.normpath(start_dir or '.')
+    if posixpath.isabs(directory) or directory == '..' or directory.startswith('../'):
+        return None
+    while True:
+        for name in _PYTEST_CONFIG_NAMES:
+            path = name if directory == '.' else posixpath.join(directory, name)
+            text = read(path)
+            if text is None:
+                continue
+            declares = _declares_pytest_config(name, text)
+            if declares is None:
+                return None
+            if declares:
+                return path
+        if directory == '.':
+            return None
+        directory = posixpath.dirname(directory) or '.'
+
+
 #: Shell chain operators that terminate one clause of a chained command.
 #: Mirrors ``verify_cmd._CHAIN_OPERATOR_TOKENS`` by value, duplicated rather
-#: than imported to keep this module dependency-free (see the module docstring).
+#: than imported to keep this module free of orchestrator imports; its one
+#: non-stdlib import is the stdlib-only ``shared.pytest_mark_grammar``.
 _CHAIN_OPERATOR_TOKENS = frozenset({'&&', '||', ';', '|'})
 
 
@@ -105,7 +181,7 @@ def _cli_marker_expr(test_command: str | None) -> str | None:
       expression and silently suppress a legitimate widening.
 
     FIRST-occurrence-then-truncate-at-the-chain-delimiter is deliberately the
-    same semantics ``verify_plan._scope_prefix_to_keyword`` applies when it
+    same semantics ``verify_plan.scope_prefix_to_keyword`` applies when it
     scopes the very same string (``split_chain_tail`` + ``head.find(keyword)``),
     so the marker probe and the scoper can never describe DIFFERENT pytest
     invocations of one chained command.  ``split_chain_tail`` itself is not
@@ -150,67 +226,25 @@ def resolve_marker_expression(
     inside *test_command*'s FIRST ``pytest`` clause replaces it (see
     :func:`_cli_marker_expr` for why that clause, and only that clause).
 
-    *pyproject_text* is the content of the ini file at pytest's ROOTDIR, which
-    the caller locates from the command's effective cwd — see
+    *pyproject_text* is the content of the config file pytest reads for the
+    command, which the caller locates with pytest's own walk
+    (:func:`locate_pytest_config`) — see
     ``verify_plan.deselecting_expression_for_command``.  This function does not
     and cannot check that the two describe the same invocation.
 
     Never raises — every failure path returns None.
 
-    Caveat, recorded for the reader rather than handled here: ``verify_cmd``'s
-    serial-retry recovery appends ``-o addopts=`` at EXECUTION time, which clears
-    the addopts ``-m`` after planning.  A retry can therefore select MORE than
-    the plan assumed, which is the safe direction (extra coverage, never less).
+    A serial-retry recovery that cannot resolve the governing addopts blanks
+    them (``verify_cmd.py::serial_pytest``), so it can select MORE than the
+    plan assumed — the safe direction.
     """
     cli_expr = _cli_marker_expr(test_command)
     if cli_expr is not None:
         return cli_expr
-    tokens = _addopts_tokens(pyproject_text)
+    tokens = addopts_tokens(pyproject_text)
     if tokens is None:
         return None
     return _marker_expr_from_tokens(tokens)
-
-
-def _is_pytestmark_target(node: ast.expr) -> bool:
-    """True iff *node* is the bare name ``pytestmark``."""
-    return isinstance(node, ast.Name) and node.id == 'pytestmark'
-
-
-def _pytestmark_value(statement: ast.stmt) -> ast.expr | None:
-    """The value *statement* binds to ``pytestmark``, else None.
-
-    Covers both the plain ``pytestmark = ...`` and the annotated
-    ``pytestmark: list = ...`` spellings; an annotation with no value binds
-    nothing.
-    """
-    if isinstance(statement, ast.Assign):
-        if any(_is_pytestmark_target(target) for target in statement.targets):
-            return statement.value
-        return None
-    if isinstance(statement, ast.AnnAssign) and _is_pytestmark_target(statement.target):
-        return statement.value
-    return None
-
-
-def _marker_name(element: ast.expr) -> str | None:
-    """The marker name in a ``pytest.mark.NAME`` / ``pytest.mark.NAME(...)`` element.
-
-    Anything else — a bare constant, a local name, an unrelated attribute chain —
-    yields None and is skipped silently, without suppressing its siblings.
-    """
-    if isinstance(element, ast.Call):
-        element = element.func
-    if not isinstance(element, ast.Attribute):
-        return None
-    owner = element.value
-    if (
-        isinstance(owner, ast.Attribute)
-        and owner.attr == 'mark'
-        and isinstance(owner.value, ast.Name)
-        and owner.value.id == 'pytest'
-    ):
-        return element.attr
-    return None
 
 
 def _pytestmark_marker_names(body: Sequence[ast.stmt]) -> frozenset[str]:
@@ -227,25 +261,14 @@ def _pytestmark_marker_names(body: Sequence[ast.stmt]) -> frozenset[str]:
     rejects, breaking the "same shapes at both scopes" promise
     :func:`_class_marker_names` makes.
 
-    Only DIRECT children of *body* are considered — never ``ast.walk`` — so a
-    ``pytestmark`` bound inside an ``if`` is not the enclosing scope's marker.
-    Accepted value shapes: a bare ``pytest.mark.NAME``, a
-    ``pytest.mark.NAME(...)`` call, or a list/tuple of either.  A non-marker
-    element yields None from :func:`_marker_name` and is skipped silently,
-    without suppressing its siblings.  If the scope rebinds ``pytestmark`` more
-    than once, the LAST binding wins, mirroring Python's own semantics.
+    Which binding wins, and which statements count, is
+    ``shared.pytest_mark_grammar.pytestmark_elements``.  A non-marker element
+    yields None from ``shared.pytest_mark_grammar.marker_name`` and is skipped
+    silently, without suppressing its siblings.
     """
-    value: ast.expr | None = None
-    for statement in body:
-        bound = _pytestmark_value(statement)
-        if bound is not None:
-            value = bound
-    if value is None:
-        return frozenset()
-
-    elements = list(value.elts) if isinstance(value, ast.List | ast.Tuple) else [value]
     return frozenset(
-        name for name in (_marker_name(element) for element in elements) if name is not None
+        name for name in (marker_name(element) for element in pytestmark_elements(body))
+        if name is not None
     )
 
 
@@ -297,6 +320,62 @@ def module_level_marker_names(source: str | None) -> frozenset[str]:
     return _pytestmark_marker_names(tree.body)
 
 
+#: The sanctioned spelling of the whole-tree-scan ceiling.  Its VALUE lives in
+#: ``orchestrator/tests/_orch_helpers.py``, which production must not import, so
+#: guard-family membership is decided by the NAME the mark is spelled with.
+WHOLE_TREE_SCAN_TIMEOUT_NAME = 'WHOLE_TREE_SCAN_TEST_TIMEOUT'
+
+
+def module_level_timeout_arguments(source: str | None) -> tuple[ast.expr, ...]:
+    """The seconds expression of every ``pytest.mark.timeout(...)`` in *source*'s module ``pytestmark``.
+
+    Read from the LAST module-level binding only (``tree.body``, never a class or
+    function body), in element order, unevaluated.  Both spellings pytest-timeout
+    accepts are read — positional ``timeout(N)`` and keyword ``timeout(timeout=N)``;
+    a call with neither pins nothing and is skipped.  ``None``, a ``SyntaxError``
+    or a ``ValueError`` yields ``()``.  Never raises.
+    """
+    if not source:
+        return ()
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return ()
+
+    arguments: list[ast.expr] = []
+    for element in pytestmark_elements(tree.body):
+        if not isinstance(element, ast.Call) or marker_name(element) != 'timeout':
+            continue
+        if element.args:
+            arguments.append(element.args[0])
+            continue
+        keyword_value = next(
+            (keyword.value for keyword in element.keywords if keyword.arg == 'timeout'), None,
+        )
+        if keyword_value is not None:
+            arguments.append(keyword_value)
+    return tuple(arguments)
+
+
+def is_whole_tree_guard_module(source: str | None) -> bool:
+    """True iff *source*'s module-level timeout mark is spelled via ``WHOLE_TREE_SCAN_TEST_TIMEOUT``.
+
+    THE ONE definition of the whole-tree guard family, consumed by
+    ``verify_plan``'s task-role enumeration and enforced complete by
+    ``orchestrator/tests/test_whole_tree_scan_timeout_guard.py``.  The bare name
+    and a dotted ``<module>.WHOLE_TREE_SCAN_TEST_TIMEOUT`` both count; a numeric
+    literal never does, whatever its value.  Never raises.
+    """
+    if not source or WHOLE_TREE_SCAN_TIMEOUT_NAME not in source:
+        return False
+    for argument in module_level_timeout_arguments(source):
+        if isinstance(argument, ast.Name) and argument.id == WHOLE_TREE_SCAN_TIMEOUT_NAME:
+            return True
+        if isinstance(argument, ast.Attribute) and argument.attr == WHOLE_TREE_SCAN_TIMEOUT_NAME:
+            return True
+    return False
+
+
 def _class_marker_names(node: ast.ClassDef) -> frozenset[str]:
     """Marker names *node* applies to every item collected from its own body.
 
@@ -313,12 +392,12 @@ def _class_marker_names(node: ast.ClassDef) -> frozenset[str]:
 
     A non-marker element (e.g. the ``qdrant_skipif()`` call heading the real
     shape at ``fused-memory/tests/test_mem0_client.py``) yields None from
-    :func:`_marker_name` and is skipped silently, without suppressing its
-    siblings.
+    ``shared.pytest_mark_grammar.marker_name`` and is skipped silently, without
+    suppressing its siblings.
     """
     markers = {
         name
-        for name in (_marker_name(decorator) for decorator in node.decorator_list)
+        for name in (marker_name(decorator) for decorator in node.decorator_list)
         if name is not None
     }
 
@@ -739,7 +818,7 @@ def per_item_marker_names(source: str | None) -> tuple[frozenset[str], ...] | No
             continue
         decorator_markers = frozenset(
             name
-            for name in (_marker_name(decorator) for decorator in node.decorator_list)
+            for name in (marker_name(decorator) for decorator in node.decorator_list)
             if name is not None
         )
         items.append(module_markers | decorator_markers)

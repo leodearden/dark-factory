@@ -25,6 +25,7 @@ from escalation.pins import classify_pins
 
 from orchestrator.recovery_pins import (
     MERGE_REMEDIABLE_ESC_CATEGORIES,
+    ON_MAIN_REMEDIABLE_ESC_CATEGORIES,
     only_merge_remediable,
     records_pin_blocked_done_flip,
     records_pin_blocked_recovery,
@@ -111,6 +112,47 @@ class TestMergeRemediableCategories:
         """`all(...)` semantics: ONE human-concern record still vetoes the relaxation."""
         refs = [_ref('stranded_blocked'), _ref('task_failure', esc_id='esc-3541-2')]
         assert only_merge_remediable(refs) is False
+
+    def test_the_on_main_set_differs_from_the_shared_set_by_exactly_preexisting_main_break(
+        self,
+    ) -> None:
+        """Task 4645: a derivation, pinned in BOTH directions.
+
+        `<=` stops a later edit from dropping a shared category out of the
+        on-main set; the difference stops a later widening of the shared set
+        from silently bypassing the on-main clause (or the on-main set from
+        growing a category nobody reviewed).
+        """
+        assert isinstance(ON_MAIN_REMEDIABLE_ESC_CATEGORIES, frozenset)
+        assert MERGE_REMEDIABLE_ESC_CATEGORIES <= ON_MAIN_REMEDIABLE_ESC_CATEGORIES
+        added = ON_MAIN_REMEDIABLE_ESC_CATEGORIES - MERGE_REMEDIABLE_ESC_CATEGORIES
+        assert added == {'preexisting_main_break'}
+
+    def test_the_default_set_still_rejects_preexisting_main_break(self) -> None:
+        """The shared set is NOT widened: the off-main ask is genuinely unmet."""
+        assert only_merge_remediable([_ref('preexisting_main_break')]) is False
+
+    def test_the_on_main_set_accepts_preexisting_main_break(self) -> None:
+        refs = [_ref('preexisting_main_break')]
+        assert only_merge_remediable(refs, ON_MAIN_REMEDIABLE_ESC_CATEGORIES) is True
+
+    def test_the_on_main_set_still_accepts_the_shared_category(self) -> None:
+        refs = [_ref('stranded_blocked'), _ref('preexisting_main_break', esc_id='esc-3541-2')]
+        assert only_merge_remediable(refs, ON_MAIN_REMEDIABLE_ESC_CATEGORIES) is True
+
+    @pytest.mark.parametrize(
+        'category',
+        ['design_concern', 'task_failure', 'stranded_merge_failed', 'infra_issue'],
+    )
+    def test_the_on_main_set_still_refuses_a_human_concern_class(
+        self, category: str,
+    ) -> None:
+        """B8: the same `all(...)` that refuses under the shared set refuses here."""
+        refs = [
+            _ref('preexisting_main_break'),
+            _ref(category, esc_id='esc-3541-2'),
+        ]
+        assert only_merge_remediable(refs, ON_MAIN_REMEDIABLE_ESC_CATEGORIES) is False
 
 
 class TestRecordsPinRecovery:
@@ -205,6 +247,16 @@ class TestRecordsPinBlockedRecovery:
         """`all(...)` semantics, which test_convert_to_blocked.py already calls load-bearing."""
         records = [_ref('stranded_blocked'), _ref('task_failure', esc_id='esc-3541-2')]
         assert records_pin_blocked_recovery(_TID, records, live_claimant=False) is True
+
+    def test_lone_preexisting_main_break_l1_still_pins(self) -> None:
+        """Task 4645 relaxes the ON-MAIN done-flip only; this predicate is untouched.
+
+        It feeds the EXISTS_OFF_MAIN clause, the CONVERT scoping clause and the
+        scheduler redispatch, where the `preexisting_main_break` ask is unmet.
+        """
+        assert records_pin_blocked_recovery(
+            _TID, [_ref('preexisting_main_break')], live_claimant=False,
+        ) is True
 
     def test_empty_does_not_pin(self) -> None:
         assert records_pin_blocked_recovery(_TID, [], live_claimant=False) is False
@@ -387,6 +439,28 @@ class TestRecordsPinBlockedDoneFlip:
         assert records_pin_blocked_done_flip(_TID, records, live_claimant=False) is True
         assert records_pin_blocked_recovery(_TID, records, live_claimant=False) is False
 
+    def test_lone_preexisting_main_break_l1_does_not_pin(self) -> None:
+        """B7: the escalation that asked for the landing must not veto its own self-heal."""
+        assert records_pin_blocked_done_flip(
+            _TID, [_ref('preexisting_main_break')], live_claimant=False,
+        ) is False
+
+    def test_preexisting_main_break_plus_design_concern_pins(self) -> None:
+        """B8: ONE human-concern record still vetoes, by the same `all(...)`."""
+        records = [
+            _ref('preexisting_main_break'),
+            _ref('design_concern', esc_id='esc-3541-2'),
+        ]
+        assert records_pin_blocked_done_flip(_TID, records, live_claimant=False) is True
+
+    def test_a_dead_filer_l0_preexisting_main_break_does_not_pin(self) -> None:
+        """The relaxation is category-only, exactly as it already is for `stranded_blocked`."""
+        for category in ('stranded_blocked', 'preexisting_main_break'):
+            records = [_ref(category, level=0)]
+            assert records_pin_blocked_done_flip(
+                _TID, records, live_claimant=False,
+            ) is False, category
+
     def test_info_only_in_a_remediable_category_does_not_pin(self) -> None:
         records = [_ref('stranded_blocked', severity='info')]
         assert records_pin_blocked_done_flip(_TID, records, live_claimant=False) is False
@@ -404,12 +478,14 @@ class TestRecordsPinBlockedDoneFlip:
         assert records_pin_blocked_done_flip(_TID, None, live_claimant=False) is True
 
 
-class TestTheTwoBlockedPredicatesDivergeOnExactlyOneRow:
-    """The asymmetry is an ENUMERATED set, not an emergent accident.
+class TestTheTwoBlockedPredicatesDivergeOnExactlyTheEnumeratedRows:
+    """The asymmetry is an ENUMERATED mapping, not an emergent accident.
 
-    Walking both predicates over the same fixtures and naming the one row they
-    may disagree on means a future edit to either cannot silently widen the
-    divergence — which is the failure mode that produced this finding.
+    Walking both predicates over the same fixtures and naming the rows they may
+    disagree on, with the direction of each, means a future edit to either
+    cannot silently widen the divergence — which is the failure mode that
+    produced the dead-L0 finding, and again the `preexisting_main_break` one
+    (task 4645).
     """
 
     _FIXTURES = (
@@ -422,29 +498,39 @@ class TestTheTwoBlockedPredicatesDivergeOnExactlyOneRow:
             _ref('stranded_blocked'),
             _ref('task_failure', esc_id='esc-3541-2'),
         ]),
+        ('lone-preexisting-main-break', [_ref('preexisting_main_break')]),
+        ('preexisting-main-break-plus-human-concern', [
+            _ref('preexisting_main_break'),
+            _ref('design_concern', esc_id='esc-3541-2'),
+        ]),
     )
 
-    #: The ONLY label at which the two answers may differ.
-    _EXPECTED_DIVERGENCE = frozenset({'dead-filer-l0'})
+    #: label -> (done_flip, recovery) for the ONLY rows where the two differ.
+    _EXPECTED_DIVERGENCE = {
+        # A done-flip is terminal; recovery may proceed past an ownerless record.
+        'dead-filer-l0': (True, False),
+        # On main the ask is met, so only the done-flip relaxes (task 4645).
+        'lone-preexisting-main-break': (False, True),
+    }
 
     @pytest.mark.parametrize(
         'label,records', _FIXTURES, ids=[f[0] for f in _FIXTURES],
     )
-    def test_they_agree_everywhere_except_the_named_row(
+    def test_they_agree_everywhere_except_the_named_rows(
         self, label: str, records: list,
     ) -> None:
         recovery = records_pin_blocked_recovery(_TID, records, live_claimant=False)
         done_flip = records_pin_blocked_done_flip(_TID, records, live_claimant=False)
 
         if label in self._EXPECTED_DIVERGENCE:
-            assert done_flip is True and recovery is False, (
-                f'{label} is the one row the two predicates exist to disagree '
-                f'about; it must diverge in the CONSERVATIVE direction'
+            assert (done_flip, recovery) == self._EXPECTED_DIVERGENCE[label], (
+                f'{label} is an enumerated divergence; it must diverge in its '
+                f'recorded direction (done_flip={done_flip}, recovery={recovery})'
             )
         else:
             assert done_flip is recovery, (
                 f'{label} is not an enumerated divergence — the done-flip '
-                f'predicate has widened beyond the dead-L0 row it was added '
+                f'predicate has widened beyond the rows it was added '
                 f'for (recovery={recovery}, done_flip={done_flip})'
             )
 

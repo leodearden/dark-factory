@@ -69,8 +69,9 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from pathlib import Path
 from typing import TYPE_CHECKING
+
+from shared.project_layout import escalation_queue_dir
 
 if TYPE_CHECKING:
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
@@ -89,8 +90,6 @@ except ImportError:
     HAS_ESCALATION = False
 
 logger = logging.getLogger(__name__)
-
-_QUEUE_DIRNAME = 'data/escalations'
 
 _ANCHOR_TASK_ID = 'durable-write-dead-letter'
 
@@ -262,7 +261,7 @@ def emit_dead_letter_escalation(
         return None
 
     try:
-        queue = EscalationQueue(Path(project_root) / _QUEUE_DIRNAME)
+        queue = EscalationQueue(escalation_queue_dir(project_root))
     except Exception:
         # Constructing the queue creates its directory; a read-only or missing
         # project_root must not turn a lost alarm into a crash in the worker.

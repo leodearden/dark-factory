@@ -617,6 +617,7 @@ def _make_plan_workflow(tmp_path: Path) -> tuple[TaskWorkflow, AsyncMock]:
     from unittest.mock import AsyncMock as _AsyncMock  # noqa: PLC0415
 
     from _orch_helpers import pydantic_spec  # noqa: PLC0415
+    from _workflow_helpers import invoke_stub_awaiting_builder  # noqa: PLC0415
     from shared.cli_invoke import AgentResult  # noqa: PLC0415
 
     assignment = MagicMock()
@@ -664,8 +665,8 @@ def _make_plan_workflow(tmp_path: Path) -> tuple[TaskWorkflow, AsyncMock]:
 
     # Architect succeeds but writes no plan.json → _plan falls to the stubbed
     # no-plan handler, which is enough to observe the briefing call.
-    wf._invoke = _AsyncMock(  # type: ignore[method-assign]
-        return_value=AgentResult(success=True, output='ok'),
+    wf._invoke = invoke_stub_awaiting_builder(  # type: ignore[method-assign]
+        AgentResult(success=True, output='ok'),
     )
     wf._mark_blocked = _AsyncMock(return_value=WorkflowOutcome.BLOCKED)  # type: ignore[method-assign]
     wf._handle_no_plan_failure = _AsyncMock(  # type: ignore[method-assign]
@@ -686,10 +687,12 @@ class TestPlanThreadsCommittedWorkIntoBriefing:
 
         await wf._plan()
 
-        assert detector.await_count == 1, (
-            f'Expected exactly one detector await, got {detector.await_count}'
-        )
         build.assert_awaited()
+        assert detector.await_count == build.await_count, (
+            'Expected one detector await per architect briefing (the builder '
+            f're-gathers before every dispatch), got {detector.await_count} '
+            f'detector awaits for {build.await_count} briefings'
+        )
         kwargs = build.call_args.kwargs
         assert kwargs.get('committed_work') == detected, (
             f'Expected the detector list forwarded as committed_work, got {kwargs}'
@@ -883,9 +886,10 @@ class TestA1PartiallyCommittedPlanStillRunsExecute:
 
         invoke, build_implementer_prompt = _stub_execute_collaborators(workflow)
 
-        def _mark_pending_done(*_args, **_kwargs):
+        async def _mark_pending_done(_role, build_prompt, *_args, **_kwargs):
             from shared.cli_invoke import AgentResult  # noqa: PLC0415
 
+            await build_prompt()
             artifacts.update_step_status('step-2', 'done', 'impl-commit-sha')
             return AgentResult(success=True, output='')
 

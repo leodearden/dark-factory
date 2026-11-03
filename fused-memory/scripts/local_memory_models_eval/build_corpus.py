@@ -150,12 +150,15 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from redis.exceptions import RedisError
 from shared.cli_boundary import (
     LoudArgumentParser,
     report_broken_pipe,
     reset_stdout_failure_state,
     run_cli,
 )
+
+from fused_memory.backends.falkor_read_only import NonReadOnlyCommandError, ReadOnlyGraphReader
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -192,12 +195,21 @@ and ``replay_from_mem0:<category>`` on the Mem0 replay path. Anything else is a
 caller-supplied ``add_episode`` description.
 """
 
-_TEMPORAL_PREFIX_RE = re.compile(r'^\[temporal:[^\]]*\]\s*')
-"""``graphiti_client`` prepends ``[temporal:<ctx>] `` when temporal_context is set.
+_WRITER_ANNOTATIONS_RE = re.compile(r'^(?:\[(?:temporal:[^\]]*|unverified_claim)\]\s*)+')
+"""The leading annotations the episode writer adds in front of the description.
 
-Verified absent from dark_factory today — all rows are bare ``add_memory:*`` —
-but stripping it here keeps a future episode from landing in its own bogus
-payload-kind stratum.
+``fused-memory/src/fused_memory/backends/graphiti_client.py::GraphitiBackend.add_episode``
+prepends ``[unverified_claim] `` outermost (task 3142) and then
+``[temporal:<ctx>] ``. Both are write-time annotations, not part of the
+writer's category, so stripping them keeps a tagged write in its category's
+stratum instead of landing in its own bogus payload-kind stratum.
+
+The set is deliberately closed: an unrecognised bracket tag stays part of a
+caller string and buckets as :data:`ADD_EPISODE_KIND`. The live smoke's
+payload-axis equality is what catches a new writer annotation; a respelling of
+either existing one is caught offline by
+``fused-memory/tests/test_local_memory_models_eval_corpus.py::TestPayloadKind::test_classifies_what_the_episode_writer_persists``,
+which classifies the description the real writer persists.
 """
 
 STRATIFICATION_DIMENSIONS: tuple[str, ...] = (
@@ -342,8 +354,9 @@ def payload_kind(source_description: object) -> str:
     measured read-only, ``e.source`` is uniformly ``'text'`` across all 2770
     dark_factory episodes and discriminates nothing.
 
-    Recognized shapes, in order: an optional ``[temporal:<ctx>] `` prefix is
-    stripped first, then ``add_memory:<category>`` and
+    Recognized shapes, in order: optional writer annotations
+    (``[unverified_claim]`` / ``[temporal:<ctx>]``) are stripped first, then
+    ``add_memory:<category>`` and
     ``replay_from_mem0:<category>`` yield ``<category>``, and any other
     non-empty description is a caller-supplied ``add_episode`` string and
     yields :data:`ADD_EPISODE_KIND`.
@@ -356,10 +369,10 @@ def payload_kind(source_description: object) -> str:
         raise CorpusBuildError(
             f'source_description must be a non-empty string, got {source_description!r}'
         )
-    text = _TEMPORAL_PREFIX_RE.sub('', source_description.strip()).strip()
+    text = _WRITER_ANNOTATIONS_RE.sub('', source_description.strip()).strip()
     if not text:
         raise CorpusBuildError(
-            f'source_description carries only a temporal prefix: {source_description!r}'
+            f'source_description carries only writer annotations: {source_description!r}'
         )
     for prefix in _CATEGORY_PREFIXES:
         if text.startswith(prefix):
@@ -704,16 +717,6 @@ def select(population: list[EpisodeRecord], n: int, *, seed: str) -> SelectionRe
 DEFAULT_GRAPH = 'dark_factory'
 """The graph this corpus is drawn from."""
 
-RO_COMMAND = 'GRAPH.RO_QUERY'
-"""The only FalkorDB command this builder is permitted to issue.
-
-Read-only here is **server-enforced**, not client-promised: a ``CREATE`` issued
-through this command path was refused in a live probe and materialized no
-graph. That is a strictly stronger guarantee than a client-side convention,
-and it is why this builder reads over Cypher rather than through the product
-read path.
-"""
-
 POPULATION_CYPHER = 'MATCH (e:Episodic) RETURN ' + ', '.join(
     f'e.{field}' for field in PROJECTED_FIELDS
 )
@@ -740,15 +743,10 @@ class EpisodeReader:
     """Reads the ``Episodic`` population over ``GRAPH.RO_QUERY``.
 
     Constructed either with an explicit *graph* handle (the tests pass a
-    double) or with host/port, in which case it opens a ``falkordb.asyncio``
-    client lazily.
-
-    ``falkordb.FalkorDB`` — the DB client — is categorically distinct from
-    ``graphiti_core.driver.falkordb_driver.FalkorDriver``, the graphiti driver
-    whose ``__init__`` fire-and-forgets ``build_indices_and_constraints()``.
-    This class must never construct the latter; see the module docstring's
-    warning and the in-tree precedent at
-    ``fused-memory/tests/test_list_indices_integration.py``.
+    double) or with host/port. Either way it reads through
+    ``fused_memory/backends/falkor_read_only.py::ReadOnlyGraphReader``, which
+    owns the read-only guard and opens the ``falkordb.asyncio`` client lazily,
+    on the first read, without ever constructing graphiti's ``FalkorDriver``.
     """
 
     def __init__(
@@ -759,40 +757,12 @@ class EpisodeReader:
         host: str | None = None,
         port: int | None = None,
     ) -> None:
-        self._graph = graph
         self.graph_name = graph_name
         self.host = host if host is not None else _falkor_host_from_env()
         self.port = port if port is not None else _falkor_port_from_env()
-
-    @staticmethod
-    def assert_read_only_command(command: str) -> None:
-        """Raise unless *command* is :data:`RO_COMMAND`.
-
-        A client-side guard layered on top of the server-side one. The server
-        would refuse a write anyway; this makes the violation a typed
-        :class:`CorpusBuildError` at the seam that owns the guarantee, rather
-        than a redis error surfacing from three layers down where a reader
-        would not connect it to this module's read-only claim.
-        """
-        if command != RO_COMMAND:
-            raise CorpusBuildError(
-                f'build_corpus may only issue {RO_COMMAND}, refused {command!r} — '
-                f'this script is strictly read-only'
-            )
-
-    def _resolve_graph(self) -> object:
-        """Return the graph handle, opening a client on first use.
-
-        The import is local so that merely importing this module — which the
-        tests do, with a double in hand — never drags in the falkordb client.
-        """
-        if self._graph is None:
-            from falkordb.asyncio import FalkorDB  # noqa: PLC0415
-
-            self._graph = FalkorDB(host=self.host, port=self.port).select_graph(
-                self.graph_name
-            )
-        return self._graph
+        self._reader = ReadOnlyGraphReader(
+            graph_name=graph_name, graph=graph, host=self.host, port=self.port
+        )
 
     async def fetch_population(self) -> list[EpisodeRecord]:
         """Return every ``Episodic`` node, projected to :class:`EpisodeRecord`.
@@ -810,11 +780,17 @@ class EpisodeReader:
         DRAWN, and an undrawn one would still be counted in its stratum's
         denominator. Content is the replay experiment's independent variable,
         so an unusable one is exactly the condition that must be loud.
+
+        Should the shared guard ever refuse a primitive on this read, the
+        refusal surfaces as a :class:`CorpusBuildError` too, so it reaches the
+        CLI as an ``error:`` line and exit 1 rather than a traceback. It cannot
+        fire today: the read resolves only ``ro_query``, which the guard
+        forwards.
         """
-        self.assert_read_only_command(RO_COMMAND)
-        graph = self._resolve_graph()
-        response = await graph.ro_query(POPULATION_CYPHER)  # type: ignore[attr-defined]
-        rows = getattr(response, 'result_set', response)
+        try:
+            rows = await self._reader.read_unpaged(POPULATION_CYPHER)
+        except NonReadOnlyCommandError as exc:
+            raise CorpusBuildError(f'build_corpus is strictly read-only: {exc}') from exc
         population: list[EpisodeRecord] = []
         for index, row in enumerate(rows):
             if len(row) != len(PROJECTED_FIELDS):
@@ -1655,9 +1631,10 @@ def _fetch_population(graph_name: str) -> list[EpisodeRecord]:
     restart FalkorDB when the fix is a path. Attribution has to be true by
     construction, not by the hope that nothing else in the run raises.
 
-    Both the constructor and the ``asyncio.run`` are inside the ``try``:
-    :meth:`EpisodeReader._resolve_graph` imports and connects the client, so a
-    failure from there is genuinely a store-connectivity condition too.
+    The ``asyncio.run`` is inside the ``try`` because constructing the reader
+    opens nothing: the shared reader opens and connects the client lazily, on
+    the first read, so a failure from there is genuinely a store-connectivity
+    condition too.
     """
     try:
         return asyncio.run(EpisodeReader(graph_name=graph_name).fetch_population())
@@ -1755,21 +1732,11 @@ def _emit_verdict(report: VerifyReport) -> int:
 def _store_error_types() -> tuple[type[BaseException], ...]:
     """The exception types that mean "the store could not be read".
 
-    Two measured facts shape this, both re-confirmed on redis 7.4.0 rather than
-    assumed:
-
-    1. ``redis.exceptions.RedisError`` does NOT subclass ``OSError`` — the MRO
-       of ``redis.exceptions.ConnectionError`` is ``ConnectionError ->
-       RedisError -> Exception``. So catching ``OSError`` alone, the obvious
-       reading, would still let an unreachable FalkorDB escape as a traceback:
-       exactly the case exit ``1`` is documented to cover.
-    2. The import is function-local, matching :meth:`EpisodeReader._resolve_graph`,
-       so merely importing this module — which the tests do, with a double in
-       hand — never drags in the client. It tolerates ``ImportError`` because
-       ``redis`` is only a transitive dependency
-       (``graphiti-core[falkordb]`` -> ``falkordb`` -> ``redis``); without the
-       client installed there is no FalkorDB to be unreachable, and ``OSError``
-       alone is then the whole story.
+    ``redis.exceptions.RedisError`` does NOT subclass ``OSError`` — measured on
+    redis 7.4.0, the MRO of ``redis.exceptions.ConnectionError`` is
+    ``ConnectionError -> RedisError -> Exception``. So catching ``OSError``
+    alone, the obvious reading, would still let an unreachable FalkorDB escape
+    as a traceback: exactly the case exit ``1`` is documented to cover.
 
     ``RedisError`` rather than ``ConnectionError`` so a server-side
     ``ResponseError`` also exits with a message instead of a traceback. The
@@ -1777,10 +1744,6 @@ def _store_error_types() -> tuple[type[BaseException], ...]:
     keeps "unreachable" and "query rejected" distinguishable in the text
     without needing two clauses.
     """
-    try:
-        from redis.exceptions import RedisError  # noqa: PLC0415
-    except ImportError:
-        return (OSError,)
     return (OSError, RedisError)
 
 

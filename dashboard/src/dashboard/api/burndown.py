@@ -61,5 +61,5 @@ async def api_burndown(request: Request) -> JSONResponse:
     except Exception:
         logger.warning('Error fetching burndown data', exc_info=True)
         series = {}
-    shaped = redux_api.shape_burndown(series, served_at=now)
+    shaped = redux_api.shape_burndown(series, labels=config.project_labels, served_at=now)
     return JSONResponse(with_window({**shaped, 'served_at': now.isoformat()}, window))

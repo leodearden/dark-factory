@@ -41,15 +41,7 @@ from orchestrator.routing import (
     resolve_route,
 )
 
-
-@pytest.fixture(autouse=True)
-def _isolated_config_env(monkeypatch, tmp_path):
-    """Every OrchestratorConfig() built in this module reads ONLY the
-    package's shipped defaults.yaml -- no stray project config.yaml, no
-    ambient ORCH_CONFIG_PATH. Mirrors test_routing.py's per-test convention.
-    """
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+pytestmark = pytest.mark.usefixtures("code_default_config")
 
 
 def _role_defaults(

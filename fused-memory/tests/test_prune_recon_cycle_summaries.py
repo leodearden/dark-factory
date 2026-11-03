@@ -21,6 +21,8 @@ from _store_mutation_preflight_contract import (
     neutralise_fixture,
 )
 
+from fused_memory.utils.store_mutation_preflight import StoreMutationUnavailable
+
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'prune_recon_cycle_summaries.py'
 
 
@@ -593,7 +595,7 @@ class TestRun:
     """Async end-to-end tests for run(args, *, memory, known_projects_map)."""
 
     def _fixture_records(self) -> list[dict]:
-        """4 stage1 + 3 stage2 + 2 unrelated records.
+        """4 stage1 + 3 stage2 + 3 unrelated records.
 
         With keep_recent=2:
           stage1 (memory_consolidator): keeps the 2 newest ('s1-newest',
@@ -601,7 +603,7 @@ class TestRun:
             deletes 1 older quiescent ('s1-old-quiescent').
           stage2 (task_knowledge_sync): keeps the 2 newest ('s2-newest',
             's2-mid'); deletes 1 older quiescent ('s2-old-quiescent').
-          The 2 unrelated records must never appear in either pool.
+          The 3 unrelated records must never appear in either pool.
         """
         return [
             _cycle_summary_record('s1-newest', 'memory_consolidator', '2026-06-01T00:00:00+00:00'),
@@ -624,6 +626,15 @@ class TestRun:
             _unrelated_record(
                 'u2-wrong-stage',
                 metadata={'kind': 'cycle_summary', 'stage': 'task_knowledge_analyzer'},
+            ),
+            _unrelated_record(
+                'u3-pool-tagged-wrong-kind',
+                metadata={
+                    'kind': 'note',
+                    'stage': 'memory_consolidator',
+                    'recon_pool': 'stage1_cycle_summary',
+                    'data': '0 mutations. Quiescent cycle.',
+                },
             ),
         ]
 
@@ -706,9 +717,15 @@ class TestRun:
     @pytest.mark.asyncio
     async def test_unrelated_records_excluded_from_report(self):
         """Records with kind != cycle_summary, or an unrecognised stage, never
-        appear in either pool's scanned count or in the deletions list."""
-        memory = self._make_memory(self._fixture_records())
-        args = self._args(apply=False, project_id='dark_factory')
+        appear in either pool's scanned count or in the deletions list — even
+        when the scroll hands them over. That includes a record carrying a
+        pool's recon_pool tag and a pool stage without kind='cycle_summary':
+        the script keys on kind + stage, never on recon_pool (task 3239)."""
+        records = self._fixture_records()
+        memory = self._make_memory(records)
+        memory.mem0.scroll_by_metadata.return_value = records
+        memory.mem0.count_by_metadata.return_value = len(records)
+        args = self._args(apply=True, project_id='dark_factory')
 
         report = await _mod.run(args, memory=memory, known_projects_map=self._known_map())
 
@@ -717,10 +734,11 @@ class TestRun:
             for pools in report['projects'].values()
             for pool_stats in pools.values()
         )
-        assert total_scanned == 7  # 4 stage1 + 3 stage2; the 2 unrelated records excluded
-        all_deletion_ids = {d['id'] for d in report['deletions']}
-        assert 'u1-wrong-kind' not in all_deletion_ids
-        assert 'u2-wrong-stage' not in all_deletion_ids
+        assert total_scanned == 7  # 4 stage1 + 3 stage2; the 3 unrelated records excluded
+        unrelated_ids = {'u1-wrong-kind', 'u2-wrong-stage', 'u3-pool-tagged-wrong-kind'}
+        assert unrelated_ids.isdisjoint(d['id'] for d in report['deletions'])
+        called_ids = {c.kwargs.get('memory_id') for c in memory.delete_memory.call_args_list}
+        assert unrelated_ids.isdisjoint(called_ids)
 
     @pytest.mark.asyncio
     async def test_scan_uses_metadata_filtered_scroll(self):
@@ -987,7 +1005,7 @@ class TestRunApplyStoreMutationPreflight:
         memory = self._make_memory(self._records())
 
         with pytest.raises(
-            _mod.StoreMutationUnavailable, match=SENTINEL
+            StoreMutationUnavailable, match=SENTINEL
         ):
             await _mod.run(
                 self._args(apply=True), memory=memory,
@@ -1005,7 +1023,7 @@ class TestRunApplyStoreMutationPreflight:
         deny(_mod, monkeypatch)
         memory = self._make_memory(self._records())
 
-        with pytest.raises(_mod.StoreMutationUnavailable):
+        with pytest.raises(StoreMutationUnavailable):
             await _mod.run(
                 self._args(apply=True, project_id=None), memory=memory,
                 known_projects_map={'dark_factory': '/a', 'reify': '/b', 'knowlive': '/c'},
@@ -1033,9 +1051,8 @@ class TestRunApplyStoreMutationPreflight:
         memory.delete_memory.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_apply_is_unchanged_when_the_preflight_passes(self, monkeypatch):
+    async def test_apply_is_unchanged_when_the_preflight_passes(self):
         """Happy path: a writable environment prunes exactly as before."""
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
         memory = self._make_memory(self._records())
 
         report = await _mod.run(
@@ -1082,7 +1099,7 @@ class TestRunApplyStoreMutationPreflight:
         memory = self._make_memory([])
         memory.mem0.count_by_metadata = AsyncMock(return_value=7)
 
-        with pytest.raises(_mod.StoreMutationUnavailable):
+        with pytest.raises(StoreMutationUnavailable):
             await _mod.run(
                 self._args(apply=True), memory=memory,
                 known_projects_map=self._known_map(),
@@ -1105,7 +1122,7 @@ class TestRunApplyStoreMutationPreflight:
         deny(_mod, monkeypatch)
         memory = self._make_memory(self._records())
 
-        with pytest.raises(_mod.StoreMutationUnavailable):
+        with pytest.raises(StoreMutationUnavailable):
             await _mod.run(
                 self._args(apply=True, limit_per_project=0), memory=memory,
                 known_projects_map=self._known_map(),
@@ -1146,11 +1163,12 @@ class TestRunApplyStoreMutationPreflight:
         monkeypatch.setattr(_mod.asyncio, 'run', _drive)
 
         with caplog.at_level('ERROR'), pytest.raises(
-            _mod.StoreMutationUnavailable, match=SENTINEL
+            StoreMutationUnavailable, match=SENTINEL
         ):
             _mod.main()
 
-        assert fail_closed_records(caplog, 'prune_recon_cycle_summaries'), (
+        (record,) = fail_closed_records(caplog, 'prune_recon_cycle_summaries')
+        assert SENTINEL in record.getMessage(), (
             'nothing else explains this traceback -- the guard site must log '
             'the fail-closed diagnosis before raising; got: '
             f'{[rec.getMessage() for rec in caplog.records]}'

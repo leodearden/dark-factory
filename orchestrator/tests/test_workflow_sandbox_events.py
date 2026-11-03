@@ -23,7 +23,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from _workflow_helpers import FakeBriefing, FakeScheduler, _init_git_repo
+from _workflow_helpers import FakeBriefing, FakeScheduler, _init_git_repo, fixed_prompt
 
 from orchestrator.agents import sandbox_dispatch
 from orchestrator.agents.invoke import AgentResult
@@ -52,6 +52,7 @@ def _make_write_set(**overrides: Path) -> WriteSet:
     fields: dict[str, Path] = dict(
         worktree=Path('/wt'),
         task_meta=Path('/base/.task-meta/wt'),
+        task_root=Path('/base/.task-meta/task-2909'),
         git_objects=Path('/main/.git/objects'),
         git_task_refs=Path('/main/.git/refs/heads/task'),
         git_task_reflogs=Path('/main/.git/logs/refs/heads/task'),
@@ -170,7 +171,7 @@ class TestInvokeWiresEnsureSandboxDirs:
         # config/git_ops/scheduler/briefing, and cwd must be a worktree.
         repo = tmp_path / 'repo'
         repo.mkdir()
-        await _init_git_repo(repo)
+        _init_git_repo(repo)
         config = OrchestratorConfig(
             project_root=repo,
             max_concurrent_tasks=1,
@@ -215,7 +216,7 @@ class TestInvokeWiresEnsureSandboxDirs:
         hermetic = _make_write_set(claude_fleet=claude_fleet)
         assert not claude_fleet.exists()
         monkeypatch.setattr(
-            'orchestrator.workflow.compute_write_set', lambda _cwd: hermetic,
+            'orchestrator.workflow.compute_write_set', lambda _cwd, *, task_id, task_root: hermetic,
         )
 
         # Spy: record whether claude_fleet already exists on disk at the moment
@@ -241,7 +242,7 @@ class TestInvokeWiresEnsureSandboxDirs:
                 new_callable=AsyncMock,
                 return_value=AgentResult(success=True, output=''),
             ) as mock_cap_retry:
-                await workflow._invoke(IMPLEMENTER, 'PROMPT', cwd)
+                await workflow._invoke(IMPLEMENTER, fixed_prompt('PROMPT'), cwd)
         finally:
             sandbox_dispatch.set_backend(saved_backend)
 

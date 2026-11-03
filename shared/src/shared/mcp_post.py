@@ -54,31 +54,32 @@ that.  ``post_mcp_tool_call`` warns if handed a client that is not following
 redirects, so splitting them does not reopen the partial-application hole.
 
 The ingredients stay public — :data:`MCP_POST_HEADERS`,
-:func:`mcp_endpoint_url`, :func:`check_mcp_post_response` — for a caller that
-genuinely needs a non-``tools/call`` request or a hand-built envelope.
+:func:`mcp_endpoint_url`, :func:`check_mcp_post_response`,
+:func:`decode_mcp_response_body` — for a caller that genuinely needs a
+non-``tools/call`` request or a hand-built envelope.
 
-KNOWINGLY PARALLEL TO ``orchestrator.mcp_lifecycle``.  Three primitives here
-have long-lived twins there: :data:`MCP_POST_HEADERS` /
-``mcp_lifecycle.MCP_HEADERS``, :func:`_decode_body` /
-``McpSession._parse_response``, and :func:`_parse_sse` /
-``mcp_lifecycle._parse_sse_response``.  The dependency direction supports
-consolidating (``orchestrator`` already imports ``shared``), and doing so is
-the right end state — but ``orchestrator/src/orchestrator/mcp_lifecycle.py``
-is outside task 4023's module locks, so the copies are left in place
-DELIBERATELY rather than by oversight, and the consolidation is filed as
-follow-up work.  If you are editing either side, change both or finish the
-consolidation; do not let them drift.
+``shared.mcp_session``'s ``McpSession`` and ``SyncMcpSession`` (the
+session-handshake transports) and ``dashboard.data.memory``'s ``McpSession``
+consume :data:`MCP_POST_HEADERS`, :func:`mcp_endpoint_url` and
+:func:`decode_mcp_response_body`, so none of them holds a copy.
 
 Public API::
 
     from shared.mcp_post import (
         MCP_POST_HEADERS,
+        call_mcp_tool,
         check_mcp_post_response,
+        decode_mcp_response_body,
         mcp_endpoint_url,
+        mcp_server_base,
         mcp_tool_call_payload,
         open_mcp_client,
         post_mcp_tool_call,
     )
+
+Use :func:`call_mcp_tool` instead of :func:`post_mcp_tool_call` when the
+caller needs the tool's reply (a read's payload, a refusal's ``error_type``)
+rather than only "it landed"; both share one send.
 
 The module is intentionally NOT re-exported from ``shared/__init__.py``.
 Consumers import via the fully-qualified path (see above), consistent with the
@@ -97,10 +98,15 @@ import json
 import logging
 from typing import Any
 
+from shared.mcp_envelope import parse_tool_result
+
 __all__ = [
     'MCP_POST_HEADERS',
+    'call_mcp_tool',
     'check_mcp_post_response',
+    'decode_mcp_response_body',
     'mcp_endpoint_url',
+    'mcp_server_base',
     'mcp_tool_call_payload',
     'open_mcp_client',
     'post_mcp_tool_call',
@@ -108,13 +114,10 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-#: Headers every raw MCP POST must send.  Byte-identical to
-#: ``orchestrator.mcp_lifecycle.MCP_HEADERS`` — the already-correct pattern the
-#: five defect sites never adopted, and a knowingly-parallel copy pending the
-#: consolidation described in the module docstring.  Without the ``Accept``
-#: member the server answers ``406 Not Acceptable`` and the payload is
-#: discarded (see the module docstring for the measurement).  Copy with ``dict(MCP_POST_HEADERS)`` before
-#: mutating: this is a module-level singleton.
+#: Headers every raw MCP POST must send.  Without the ``Accept`` member the
+#: server answers ``406 Not Acceptable`` and the payload is discarded (see the
+#: module docstring for the measurement).  Copy with ``dict(MCP_POST_HEADERS)``
+#: before mutating: this is a module-level singleton.
 MCP_POST_HEADERS = {
     'Content-Type': 'application/json',
     'Accept': 'application/json, text/event-stream',
@@ -129,9 +132,9 @@ def mcp_endpoint_url(base_url: str) -> str:
 
     The ``rstrip('/')`` is load-bearing, not cosmetic — a configured base that
     already ends in ``/`` would otherwise produce ``…//mcp``, which is a
-    different path than the server mounts.  Mirrors the canonicalization
-    ``McpSession.__init__`` (``orchestrator/mcp_lifecycle.py``) has been doing
-    correctly all along; the defect sites simply never used it.
+    different path than the server mounts.  ``McpSession`` and
+    ``SyncMcpSession`` (``shared/src/shared/mcp_session.py``) build their
+    endpoint with this function.
 
     >>> mcp_endpoint_url('http://127.0.0.1:8002')
     'http://127.0.0.1:8002/mcp'
@@ -141,13 +144,19 @@ def mcp_endpoint_url(base_url: str) -> str:
     return f"{base_url.rstrip('/')}/mcp"
 
 
-def _decode_body(resp: Any) -> Any:
-    """Decode a JSON or SSE response body.
+def mcp_server_base(endpoint_url: str) -> str:
+    """The inverse of :func:`mcp_endpoint_url`: the server base of an MCP endpoint URL."""
+    return endpoint_url.rstrip('/').removesuffix('/mcp')
 
-    Mirrors ``McpSession._parse_response`` — FastMCP may answer a Streamable
-    HTTP POST with ``text/event-stream`` instead of ``application/json``, and a
-    naive ``resp.json()`` would then warn on every SUCCESSFUL write.  Raises on
-    an undecodable body; the sole caller turns that into a warning.
+
+def decode_mcp_response_body(resp: Any) -> Any:
+    """Decode an MCP response body sent as JSON or as SSE (Streamable HTTP).
+
+    FastMCP may answer with ``text/event-stream`` instead of
+    ``application/json``; for SSE the last ``data:`` frame wins.  An
+    unlabelled or mislabelled body falls back to the SSE spelling.  RAISES
+    ``ValueError`` when the body is neither JSON nor carries a ``data:`` line —
+    :func:`check_mcp_post_response` is the never-raises wrapper.
     """
     content_type = str(resp.headers.get('content-type', ''))
     if 'text/event-stream' in content_type:
@@ -225,7 +234,7 @@ def check_mcp_post_response(resp: Any, *, context: str) -> bool:
             )
             return False
 
-        payload = _decode_body(resp)
+        payload = decode_mcp_response_body(resp)
 
         if isinstance(payload, dict):
             error = payload.get('error')
@@ -321,6 +330,65 @@ async def post_mcp_tool_call(
     :param context: identifies the call site in any warning.
     :returns: True only if the call actually landed.
     """
+    resp = await _send_tool_call(
+        client, base_url, tool, arguments,
+        context=context, request_id=request_id, timeout=timeout,
+    )
+    return check_mcp_post_response(resp, context=context)
+
+
+async def call_mcp_tool(
+    client: Any,
+    base_url: str,
+    tool: str,
+    arguments: dict,
+    *,
+    context: str,
+    request_id: Any = 1,
+    timeout: float = 10,
+) -> dict | None:
+    """POST one MCP ``tools/call`` and return the tool's reply dict.
+
+    The same four-part send as :func:`post_mcp_tool_call`, for a caller that
+    needs the reply itself — a read's payload, or the ``error_type`` a tool
+    returns when it refuses — rather than only "it landed".  A reply carrying
+    ``error_type`` is returned unchanged: a tool-level refusal is a delivered
+    call.
+
+    Returns ``None``, always with a warning, when no reply dict arrived: any
+    failure :func:`check_mcp_post_response` reports, or any shape
+    ``parse_tool_result`` refuses — a JSON-RPC error
+    (``EnvelopeShape.JSON_RPC_ERROR``), a ``result.isError`` answer
+    (``EnvelopeShape.IS_ERROR``) or a text block that is not a JSON object.
+    Propagates a transport exception from ``client.post``, as
+    :func:`post_mcp_tool_call` does.
+    """
+    resp = await _send_tool_call(
+        client, base_url, tool, arguments,
+        context=context, request_id=request_id, timeout=timeout,
+    )
+    if not check_mcp_post_response(resp, context=context):
+        return None
+    try:
+        body = decode_mcp_response_body(resp)
+    except ValueError as exc:
+        logger.warning('MCP tool reply could not be decoded [%s]: %s', context, exc)
+        return None
+    reply, err = parse_tool_result(body, None, dict)
+    return None if err is not None else reply
+
+
+async def _send_tool_call(
+    client: Any,
+    base_url: str,
+    tool: str,
+    arguments: dict,
+    *,
+    context: str,
+    request_id: Any,
+    timeout: float,
+) -> Any:
+    """Parts 1 and 2 of the fix, plus the warning that guards part 3."""
     # ``True`` by default so a duck-typed stub with no such attribute (several
     # existing test doubles) does not produce a spurious warning.
     if not getattr(client, 'follow_redirects', True):
@@ -331,10 +399,9 @@ async def post_mcp_tool_call(
             context,
         )
 
-    resp = await client.post(
+    return await client.post(
         mcp_endpoint_url(base_url),
         headers=MCP_POST_HEADERS,
         json=mcp_tool_call_payload(tool, arguments, request_id=request_id),
         timeout=timeout,
     )
-    return check_mcp_post_response(resp, context=context)

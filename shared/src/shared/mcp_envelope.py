@@ -10,6 +10,7 @@ Public API::
     from shared.mcp_envelope import (
         parse_tool_result,
         resolver_failed,
+        write_failure_reason,
         EnvelopeParseError,
         EnvelopeShape,
     )
@@ -29,6 +30,7 @@ from typing import Any
 __all__ = [
     'parse_tool_result',
     'resolver_failed',
+    'write_failure_reason',
     'EnvelopeParseError',
     'EnvelopeShape',
 ]
@@ -63,6 +65,12 @@ class EnvelopeShape(enum.StrEnum):
 
     RAISED = 'RAISED'
     """An unexpected exception was raised during parsing."""
+
+    IS_ERROR = 'IS_ERROR'
+    """``result.isError`` is set; an error reply is never a value."""
+
+    JSON_RPC_ERROR = 'JSON_RPC_ERROR'
+    """The JSON-RPC body carries an ``error`` member, so there is no tool result."""
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +122,39 @@ def _fail(
 # ---------------------------------------------------------------------------
 
 
+def _first_text_block(content: Any) -> dict | None:
+    if not isinstance(content, list):
+        return None
+    for block in content:
+        if isinstance(block, dict) and block.get('type') == 'text':
+            return block
+    return None
+
+
+def _payload_of(result: dict, key: str | None) -> tuple[Any, EnvelopeParseError | None]:
+    """The tool's decoded payload: a dict ``structuredContent``, else the first text block."""
+    if result.get('error') is not None:
+        return _fail(EnvelopeShape.JSON_RPC_ERROR, key, result)
+    inner_result = result.get('result')
+    if not isinstance(inner_result, dict):
+        return _fail(EnvelopeShape.NO_TEXT_BLOCK, key, result)
+    if inner_result.get('isError'):
+        return _fail(EnvelopeShape.IS_ERROR, key, inner_result)
+
+    structured = inner_result.get('structuredContent')
+    if isinstance(structured, dict):
+        return structured, None
+
+    text_block = _first_text_block(inner_result.get('content', []))
+    if text_block is None:
+        return _fail(EnvelopeShape.NO_TEXT_BLOCK, key, result)
+    raw_text = text_block.get('text', '')
+    try:
+        return json.loads(raw_text), None
+    except (ValueError, TypeError):
+        return _fail(EnvelopeShape.JSON_DECODE_ERROR, key, raw_text)
+
+
 def parse_tool_result(
     result: Any,
     key: str | None,
@@ -124,10 +165,12 @@ def parse_tool_result(
     **Standard mode** (``key`` is a non-``None`` string):
 
     Returns ``(value, None)`` **only** when:
-    - *result* is a dict with ``result.content`` containing at least one
-      ``type=='text'`` block,
-    - ``json.loads`` succeeds on its ``text`` field,
-    - the parsed payload (after optional ``{data:{…}}`` unwrap) is a dict,
+    - *result* is a dict with no JSON-RPC ``error`` member (``JSON_RPC_ERROR``)
+      and whose ``result.isError`` is not set (``IS_ERROR``) — both are
+      checked before anything else, so an error reply is never a value,
+    - the payload is ``result.structuredContent`` when that is a dict, or
+      otherwise ``json.loads`` of the first ``type=='text'`` block's ``text``,
+    - the payload (after optional ``{data:{…}}`` unwrap) is a dict,
     - *key* is present in that dict, and
     - ``isinstance(inner[key], expected_type)`` holds.
 
@@ -137,8 +180,9 @@ def parse_tool_result(
     the inner payload is a dict and ``isinstance(inner, expected_type)`` holds
     (callers should pass ``expected_type=dict``; a mismatched type fails with
     ``WRONG_TYPE``).  ``KEY_ABSENT`` does not apply — the entire inner dict is
-    returned as-is.  ``NO_TEXT_BLOCK``, ``JSON_DECODE_ERROR``,
-    ``INNER_NOT_DICT``, ``WRONG_TYPE``, and ``RAISED`` still fail loud.
+    returned as-is.  ``JSON_RPC_ERROR``, ``IS_ERROR``, ``NO_TEXT_BLOCK``,
+    ``JSON_DECODE_ERROR``, ``INNER_NOT_DICT``, ``WRONG_TYPE``, and ``RAISED``
+    still fail loud.
 
     For **every** other outcome (including non-raising malformed payloads)
     exactly **one** ``logger.warning`` is emitted naming the shape, and the
@@ -147,35 +191,16 @@ def parse_tool_result(
     The invariant ``err is not None`` whenever ``value is None`` (and vice
     versa) is guaranteed — callers may branch on ``err is not None`` safely.
 
-    Processes only the **first** ``type=='text'`` block ("first text block
-    wins"), mirroring the scheduler's ``_parse_tool_text_result``.
+    When ``structuredContent`` is not a dict, only the first ``type=='text'``
+    block is read.
     """
     try:
-        # --- locate first text block -------------------------------------------
         if not isinstance(result, dict):
             return _fail(EnvelopeShape.NO_TEXT_BLOCK, key, result)
 
-        inner_result = result.get('result')
-        content = inner_result.get('content', []) if isinstance(inner_result, dict) else None
-        if not isinstance(content, list):
-            return _fail(EnvelopeShape.NO_TEXT_BLOCK, key, result)
-
-        text_block = None
-        for block in content:
-            if isinstance(block, dict) and block.get('type') == 'text':
-                text_block = block
-                break
-
-        if text_block is None:
-            return _fail(EnvelopeShape.NO_TEXT_BLOCK, key, result)
-
-        raw_text = text_block.get('text', '')
-
-        # --- JSON decode -------------------------------------------------------
-        try:
-            data = json.loads(raw_text)
-        except (ValueError, TypeError):
-            return _fail(EnvelopeShape.JSON_DECODE_ERROR, key, raw_text)  # noqa: B904
+        data, err = _payload_of(result, key)
+        if err is not None:
+            return None, err
 
         # --- {data:{…}} unwrap -------------------------------------------------
         if isinstance(data, dict) and isinstance(data.get('data'), dict):
@@ -247,3 +272,35 @@ def resolver_failed(value: Any, err: Exception | None) -> bool:
         (anything, <err>) → True    # error present → wait/escalate
     """
     return err is not None or not value
+
+
+# ---------------------------------------------------------------------------
+# write_failure_reason
+# ---------------------------------------------------------------------------
+
+
+def _clip(value: Any) -> str:
+    return repr(value)[:200]
+
+
+def write_failure_reason(reply: object) -> str | None:
+    """Return why *reply* is not a successful write, or ``None`` iff it is one.
+
+    *reply* is the tool's own reply — ``parse_tool_result(body, None, dict)``'s
+    value — never the JSON-RPC envelope.  ``@mcp_tool_errors`` turns every
+    server-side exception into an ordinary reply, so a rejection arrives here
+    as a dict.  ``success`` defaults to True because ``update_task`` answers
+    with the updated record, which carries no ``success`` key.
+    """
+    if not isinstance(reply, dict):
+        return f'server reply was not a dict: {type(reply).__name__}: {_clip(reply)}'
+    if not reply:
+        return 'server reply was empty ({}) — it carries no positive write signal'
+    if reply.get('error'):
+        error_type = reply.get('error_type')
+        named = f'{error_type}: ' if error_type else ''
+        return f'server returned an error: {named}{reply["error"]}'
+    if not reply.get('success', True):
+        detail = reply.get('error_type') or reply.get('message') or _clip(reply)
+        return f'server reported failure: {detail}'
+    return None

@@ -1,7 +1,8 @@
 """Tests for Harness._write_merge_heartbeat (task 2395, α of the fleet-redeploy PRD).
 
 Every orchestrator unit writes a tiny JSON heartbeat to a fleet-common
-directory (see ``orchestrator.fleet_heartbeat``) on each run-loop tick.
+directory (see ``orchestrator.fleet_heartbeat``) from its merge-heartbeat
+background service, whatever the dispatch loop is doing (task 5344).
 This method gathers the live state — ORCH_UNIT, ``_merge_pipeline_idle()``
 (the authoritative drain-gate truth source, task 1973 U2), and the
 ``queue_empty``/``depth`` diagnostics — and delegates the on-disk contract
@@ -78,8 +79,31 @@ class TestWriteMergeHeartbeat:
             'depth': 0,
             'queue_empty': True,
             'ts_epoch': payload['ts_epoch'],
+            'drain': None,
+            'verifies_in_flight': [],
+            'deployed_sha': None,
         }
         assert isinstance(payload['ts_epoch'], float)
+
+    async def test_heartbeat_carries_the_deployed_sha(
+        self, harness: Harness, tmp_path: Path, monkeypatch
+    ):
+        """Task 6565 D1: the unit's deployed sha and its flags reach the heartbeat."""
+        from orchestrator.deployed_sha import DeployedSha
+
+        fleet_dir = tmp_path / 'fleet'
+        monkeypatch.setenv('ORCH_UNIT', 'orchestrator-reify.service')
+        monkeypatch.setenv('ORCH_FLEET_DIR', str(fleet_dir))
+        worker = MagicMock()
+        worker.snapshot.return_value = {'depth': 0}
+        harness._merge_worker = worker
+        deployed = DeployedSha(sha='9' * 40, indeterminate=False, dirty_wire_path=True)
+        harness._deployed_sha = deployed
+
+        await harness._write_merge_heartbeat()
+
+        payload = json.loads((fleet_dir / 'orchestrator-reify.service.json').read_text())
+        assert payload['deployed_sha'] == deployed.to_wire()
 
     async def test_busy_tick_writes_heartbeat_with_merge_idle_false(
         self, harness: Harness, tmp_path: Path, monkeypatch

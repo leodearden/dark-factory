@@ -19,7 +19,7 @@ this batch:
       every loser attaches as a peer waiter whose future mirrors the
       winner's terminal outcome.
   delta (2927) -- coalesce_or_enqueue_merge_request's duplicate_in_verify
-      reject (merge_queue.py, reject code _C3_DUPLICATE_IN_VERIFY_CODE): a
+      reject (merge_lane/intake.py, reject code _C3_DUPLICATE_IN_VERIFY_CODE): a
       newer SHA submitted while the earlier SHA is IN VERIFY is structurally
       REJECTed, not coalesced or replaced.
   epsilon (2928) -- retire_cancelled_merge_request (see
@@ -303,13 +303,15 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _live_merge_worker import REAL_GIT_MERGE_RESULT_TIMEOUT
 from _merge_lane_fakes import (
     FakeVerifier,
     RecordingEscalations,
     hangs_until,
+    lane_scene_config,
     make_lane,
 )
-from _orch_helpers import make_placeholder_future
+from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT, make_placeholder_future, wait_responsive
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
@@ -318,15 +320,17 @@ from orchestrator.merge_lane import (
     coalesce_or_enqueue_merge_request,
     retire_cancelled_merge_request,
 )
-from orchestrator.merge_queue import PRODUCTION_CLOCK
-from orchestrator.merge_queue_store import MergeQueueStore, recover_pending_merges
-from orchestrator.merge_types import (
+from orchestrator.merge_lane.intake import enqueue_merge_request
+from orchestrator.merge_lane.queue_store import MergeQueueStore, recover_pending_merges
+from orchestrator.merge_lane.tip_relation import select_recovery_winner
+from orchestrator.merge_lane.types import (
     InFlightMergeRegistry,
     MergeRequest,
     QueuedBranch,
     TerminalOutcomeRecord,
     TerminalOutcomeRetention,
 )
+from orchestrator.merge_lane.worker import PRODUCTION_CLOCK
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_cancel import (
     acquire_merge_verify_flock,
@@ -406,7 +410,7 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
 
 @pytest.fixture
 def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
-    return OrchestratorConfig(project_root=git_repo, git=git_config)
+    return lane_scene_config(git_repo, git_config)
 
 
 async def _make_ephemeral_worktree(git_ops: GitOps) -> Path:
@@ -417,7 +421,7 @@ async def _make_ephemeral_worktree(git_ops: GitOps) -> Path:
     REAL registered git worktree (a plain ``mkdir()``'d directory always
     yields 'failed' -- see that module's test_non_worktree_directory_returns_failed).
     """
-    return await git_ops.create_throwaway_verify_worktree(await _head_sha(git_ops.project_root))
+    return await git_ops.create_ephemeral_verify_worktree(await _head_sha(git_ops.project_root))
 
 
 # ---------------------------------------------------------------------------
@@ -845,6 +849,8 @@ class TestIdentityFaceRecoveryDedupe:
         report = await recover_pending_merges(
             store, queue, git_ops, config, event_store=None,
             main_branch='main', branch_prefix='task/', registry=registry,
+            enqueue_merge_request=enqueue_merge_request,
+            select_recovery_winner=select_recovery_winner,
         )
 
         assert queue.qsize() == 1
@@ -900,6 +906,8 @@ class TestIdentityFaceRecoveryDedupe:
         report = await recover_pending_merges(
             store, queue, git_ops, config, event_store=None,
             main_branch='main', branch_prefix='task/', registry=registry,
+            enqueue_merge_request=enqueue_merge_request,
+            select_recovery_winner=select_recovery_winner,
         )
 
         assert queue.qsize() == 1
@@ -927,6 +935,8 @@ class TestIdentityFaceRecoveryDedupe:
         report = await recover_pending_merges(
             store, queue, git_ops, config, event_store=None,
             main_branch='main', branch_prefix='task/', registry=registry,
+            enqueue_merge_request=enqueue_merge_request,
+            select_recovery_winner=select_recovery_winner,
         )
 
         assert queue.qsize() == 1
@@ -952,7 +962,7 @@ class _TreeLivenessVerifier(FakeVerifier):
     ``_merge-<hash>`` worktree across a concurrent sweep.
 
     Injected as ``make_lane(..., verifier=...)`` -- the seam that replaced
-    this file's ``patch('orchestrator.merge_queue.run_scoped_verification')``.
+    this file's ``patch('orchestrator.merge_lane.worker.run_scoped_verification')``.
     ``run_scoped`` keeps the base fake's scripted hang (``hangs_until``) and
     passing ``VerifyResult``, and wraps it in the observations the capstone
     is actually about:
@@ -992,7 +1002,7 @@ class _TreeLivenessVerifier(FakeVerifier):
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(180)  # heavy class: real git + real merge worker end-to-end
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)  # heavy class: real git + real merge worker end-to-end
 class TestFiveThreeTwoSixReplayGate:
     """The headline done-gate: replays the 2026-07-22 task/5326 restart
     incident end-to-end, driving the ACTUAL startup substrate (real
@@ -1056,7 +1066,7 @@ class TestFiveThreeTwoSixReplayGate:
         # point and this test never calls harness.run() (only targeted
         # internal methods), so those neutralizations are moot post-init --
         # safe to swap in a fully-real, self-consistent config here.
-        harness.config = OrchestratorConfig(project_root=git_repo, git=git_config)
+        harness.config = lane_scene_config(git_repo, git_config)
         base = harness.git_ops.worktree_base
 
         # --- Pre-state: a REAL branch task/5326 with a real worktree and a
@@ -1315,7 +1325,11 @@ class TestFiveThreeTwoSixReplayGate:
 
             # (4) Release the gated verify; await the recovered merge.
             release.set()
-            outcome = await asyncio.wait_for(winner.result, timeout=60)
+            outcome = await wait_responsive(
+                winner.result,
+                timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
+                label='5326 replay gate: recovered merge outcome after the gated verify is released',
+            )
 
             assert outcome.status == 'done', f'Expected done, got: {outcome}'
             full_branch = f'{harness.config.git.branch_prefix}5326'

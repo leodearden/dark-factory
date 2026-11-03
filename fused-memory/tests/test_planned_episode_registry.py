@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 import pytest_asyncio
+from shared.async_sqlite_base import CheckpointResult
 
 from fused_memory.services.planned_episode_registry import PlannedEpisodeRegistry
 
@@ -103,24 +106,21 @@ class TestIdempotentInitialize:
 
     @pytest.mark.asyncio
     async def test_double_initialize_preserves_connection_identity(self, tmp_path):
-        """Second call to initialize() must return early, keeping original connection.
-
-        Currently FAILS because initialize() unconditionally overwrites self._db.
-        """
+        """Second call to initialize() must return early, keeping original connection."""
         reg = PlannedEpisodeRegistry(data_dir=tmp_path / 'registry')
         await reg.initialize()
 
         # Register data so we can verify it's still accessible afterwards
         await reg.register('uuid-before', 'proj-1')
 
-        # Capture the original connection object
-        original_db = reg._db
+        # Capture the original access object
+        original_access = reg._access
 
         # Second call — must be a no-op (early return)
         await reg.initialize()
 
         # Connection identity must be preserved (no new connection opened)
-        assert reg._db is original_db, (
+        assert reg._access is original_access, (
             'Second initialize() must not open a new connection (would leak the old one)'
         )
 
@@ -181,3 +181,44 @@ class TestRapidCallStability:
             assert await registry.are_all_planned(['uuid-a', 'uuid-b']) is True
         for _ in range(50):
             assert await registry.are_all_planned(['uuid-a', 'uuid-missing']) is False
+
+
+class TestSharedConnectionAtomicity:
+    """One aiosqlite connection is shared by every coroutine using the registry.
+
+    The cancellation arm has the same shape as
+    ``tests/test_recon_db_atomicity.py::test_a_cancelled_write_does_not_discard_a_concurrent_one``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_register_leaves_nothing_and_discards_nothing(self, registry):
+        """A cancelled ``register`` must neither land nor take a concurrent one with it.
+
+        Measured before ``AtomicConnection``: the cancelled row LANDED 3/3.  The
+        store had no rollback anywhere, so the survivor's commit swept up the
+        cancelled INSERT that was still queued on the shared connection.
+        """
+        victim = asyncio.create_task(registry.register('victim', 'p'))
+        survivor = asyncio.create_task(registry.register('survivor', 'p'))
+        await asyncio.sleep(0)
+        victim.cancel()
+
+        _, survived = await asyncio.wait_for(
+            asyncio.gather(victim, survivor, return_exceptions=True), 10
+        )
+
+        assert not isinstance(survived, BaseException), survived
+        assert await registry.is_planned('survivor') is True, (
+            "the surviving register is gone: the cancelled unit's rollback discarded it"
+        )
+        assert await registry.is_planned('victim') is False, (
+            'the cancelled register landed: a concurrent commit swept it up'
+        )
+
+    @pytest.mark.asyncio
+    async def test_checkpoint_after_close_answers_unavailable(self, tmp_path):
+        reg = PlannedEpisodeRegistry(data_dir=tmp_path / 'registry')
+        await reg.initialize()
+        await reg.close()
+
+        assert await reg.checkpoint() == CheckpointResult.unavailable()

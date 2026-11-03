@@ -1,0 +1,24 @@
+{
+  "task_id": "5445",
+  "reason": "instrument correction, not new coupling: source_measures.patch_targets now resolves a dotted path parked in a name bound once to a static string (module constant, f-string, + concatenation). Two lane test files already patched through such constants and are now counted: test_merge_queue_landed_reconciler.py (_MQ_GATE_TARGET -> worker.gate_mark_done_on_delivered_checks) and test_merge_lane_restart_drain.py (_GATE_REVERIFY_TARGET -> worker.run_scoped_verification). No test or lane code changed; task 5446 owns driving them to 0.",
+  "measures": [
+    {
+      "measure": "patch_targets",
+      "key": "orchestrator/tests/test_merge_lane_restart_drain.py",
+      "baseline": 0,
+      "current": 1
+    },
+    {
+      "measure": "patch_targets",
+      "key": "orchestrator/tests/test_merge_queue_landed_reconciler.py",
+      "baseline": 0,
+      "current": 1
+    },
+    {
+      "measure": "total:patch_targets",
+      "key": "<cluster>",
+      "baseline": 56,
+      "current": 57
+    }
+  ]
+}

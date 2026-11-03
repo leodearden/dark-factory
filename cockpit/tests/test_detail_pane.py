@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
 from orchestrator import session_registry as sr
 
 
@@ -190,8 +191,8 @@ class TestRenderDecisionDetail:
         assert 'unblock-df-2085-4242' in rendered
 
     def test_unresolvable_session_id_is_shown_and_marked_unresolved(self):
-        """The live shape today: session_id is a watcher lease token, not a slug
-        (task 4237). An operator must be able to tell "no link" from "broken link"."""
+        """An unlinked filing (no record_slug) leaves only session_id, a watcher
+        lease token. An operator must be able to tell "no link" from "broken link"."""
         from cockpit.panes.detail_pane import render_decision_detail
 
         session = _make_record(session_slug='unblock-df-2085-4242')
@@ -203,6 +204,57 @@ class TestRenderDecisionDetail:
 
         assert 'watcher-lease-abc123' in rendered
         assert 'unresolved' in rendered
+
+    def test_a_record_slug_naming_a_scanned_session_renders_it_resolved(self):
+        """The link the Enter-to-focus path uses; session_id is only provenance."""
+        from cockpit.panes.detail_pane import render_decision_detail
+
+        session = _make_record(session_slug='session-dark-factory-sess-watcher')
+        decision = _make_decision(
+            session_id='watcher-df-1348600', record_slug='session-dark-factory-sess-watcher'
+        )
+
+        rendered = render_decision_detail(
+            decision, [session], datetime(2026, 7, 7, tzinfo=UTC)
+        )
+
+        session_line = next(
+            line for line in rendered.splitlines() if line.startswith('session:')
+        )
+        assert session_line == 'session: session-dark-factory-sess-watcher'
+        assert 'unresolved' not in rendered
+
+    def test_a_reaped_record_slug_still_shows_the_filers_session_id(self):
+        """Both identities survive: the dead link, and the token that names the filer."""
+        from cockpit.panes.detail_pane import render_decision_detail
+
+        decision = _make_decision(
+            session_id='watcher-df-1348600', record_slug='session-dark-factory-sess-watcher'
+        )
+
+        rendered = render_decision_detail(decision, [], datetime(2026, 7, 7, tzinfo=UTC))
+
+        lines = rendered.splitlines()
+        session_at = lines.index('session: session-dark-factory-sess-watcher (unresolved)')
+        assert lines[session_at + 1] == 'filer: watcher-df-1348600'
+
+    @pytest.mark.parametrize(
+        ('session_id', 'record_slug'),
+        [
+            ('watcher-df-1348600', ''),
+            ('unblock-df-2085-4242', 'unblock-df-2085-4242'),
+            (None, 'session-dark-factory-sess-watcher'),
+        ],
+        ids=['unlinked', 'same-identity', 'no-session-id'],
+    )
+    def test_no_filer_line_when_it_would_add_no_identity(self, session_id, record_slug):
+        from cockpit.panes.detail_pane import render_decision_detail
+
+        decision = _make_decision(session_id=session_id, record_slug=record_slug)
+
+        rendered = render_decision_detail(decision, [], datetime(2026, 7, 7, tzinfo=UTC))
+
+        assert not any(line.startswith('filer:') for line in rendered.splitlines())
 
     def test_no_session_id_renders_a_placeholder_not_the_word_none(self):
         from cockpit.panes.detail_pane import render_decision_detail

@@ -291,6 +291,28 @@ class TestAddMemoryPrematureCompletionGate:
         )
         mock_service.add_memory.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_allows_a_merged_pull_request_number(self):
+        """'PR #5252' names a pull request, so the in-progress task 5252 is not
+        the subject of the 'Merged' and the write must not be blocked."""
+        mock_service = _allowing_service()
+        server = _server_with_statuses(mock_service, {'5252': 'in-progress'})
+
+        result = await server._tool_manager.call_tool(
+            'add_memory',
+            {
+                'content': 'Merged PR #5252 into main',
+                'category': 'observations_and_summaries',
+                'agent_id': 'recon-stage-task_knowledge_sync',
+                'project_id': _PROJECT_ID,
+            },
+        )
+
+        assert result.get('error') != 'premature_completion_claim_write_blocked', (
+            f'Gate must not read PR #5252 as task 5252; got: {result!r}'
+        )
+        mock_service.add_memory.assert_called_once()
+
 
 class TestAddEpisodePrematureCompletionGate:
     """Write-gate: recon-stage- agents must not write a present-tense completion

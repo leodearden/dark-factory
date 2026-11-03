@@ -64,7 +64,7 @@
 # would exit 4 with "unrecognized arguments: -n". The single place that defines
 # this verify leg is this test_command, so this is the SPOT. Both halves are
 # gated by tests/scripts/test_merge_gate_parallelism_config.py::
-# test_scripts_leg_carries_the_parallel_flags_on_its_test_command and
+# test_non_member_legs_carry_the_parallel_flags_on_their_test_command and
 # ::test_root_addopts_never_leaks_the_parallel_flags.
 # `auto` rather than a literal, and `--dist loadgroup` rather than xdist's
 # default: both arguments are written once, in the guard that enforces them —
@@ -276,7 +276,7 @@ test_command: "uv run --project shared pytest tests/scripts/ scripts/tests/ --tb
 # pyproject.toml, and held there by tests/scripts/test_nonmember_ruff_config.py.
 # Read them there; do not restate them here, or the two will drift and only one
 # copy is guarded.
-lint_command: "uv run --project shared ruff check scripts/"
+lint_command: "uv run --project shared ruff check scripts/ && python3 tests/scripts/raw_envelope_literal_guard.py scripts"
 
 # TYPE IS NOW DECLARED — task 3456 closed the gap task 3445 recorded here.
 #

@@ -7,6 +7,7 @@ import logging
 from typing import Any
 
 import pytest
+from shared.project_layout import escalation_queue_dir
 
 from fused_memory.middleware import scope_violation_escalator as sve_mod
 from fused_memory.middleware.scope_violation_escalator import ScopeViolationEscalator
@@ -44,6 +45,22 @@ class TestEscalationEnabled:
         assert 'fused-memory/' in payload['detail']
         assert 'dark_factory' in payload['detail']
         assert payload['suggested_action'] == 'resubmit_to_dark_factory'
+
+    def test_files_into_the_layout_escalation_queue_when_relocated(
+        self, tmp_path, escalation_queue_relocation,
+    ):
+        esc_id = ScopeViolationEscalator().report_rejection(
+            project_root=str(tmp_path),
+            project_id='reify',
+            candidate_title='Edit fused-memory/X',
+            matched_paths=('fused-memory/',),
+            suggested_project='dark_factory',
+            suggested_root='/home/leo/src/dark-factory',
+        )
+
+        filed = sorted(escalation_queue_dir(tmp_path).glob('esc-*.json'))
+        assert [json.loads(p.read_text())['id'] for p in filed] == [esc_id]
+        assert not (tmp_path / escalation_queue_relocation.legacy_relpath).exists()
 
     def test_caches_queue_per_project_root(self, tmp_path):
         """Repeated rejections for the same project_root reuse one EscalationQueue."""

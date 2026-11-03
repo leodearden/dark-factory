@@ -5,13 +5,10 @@ directories — NEVER the host's real ~/.config/systemd/user/ — mirroring the
 rule tests/scripts/test_check_fused_memory_unit_parity.py states in its own
 docstring.
 
-That rule is load-bearing here for a specific reason, not just portability:
-as measured on 2026-08-01 the installed dark-factory-dashboard-watchdog.service
-is still the pre-incident inline-shell copy, so the checker exits 1 against the
-live host today. That is the CORRECT signal — installing the post-3308 units
-belongs to task 3289 — but a test asserting parity against the live host would
-be red on landing, and one asserting drift would flip red the moment 3289 fixes
-it. Either encodes host state rather than checker behaviour.
+That rule is load-bearing here for a specific reason, not just portability: a
+test asserting parity or drift against the live host encodes that host's state
+rather than the checker's behaviour, so it turns red or green for reasons no
+change to the checker can affect.
 
 The only real-tree reads are REPO-side (the committed dashboard/*.service and
 *.timer files), used by the registry staleness guard.
@@ -21,6 +18,7 @@ loaded via importlib.util.spec_from_file_location, mirroring
 tests/scripts/test_check_fused_memory_unit_parity.py::_load_checker.
 """
 
+import dataclasses
 import importlib.util
 import os
 import pathlib
@@ -30,6 +28,7 @@ import sys
 import types
 
 import pytest
+import systemd_unit_parity
 from setup_host_sections import (
     checker_repo,
     enabled_units,
@@ -86,8 +85,7 @@ WantedBy=default.target
 
 def test_parse_unit_directives_returns_section_key_values_mapping():
     """Returns section → key → list-of-values, keyed by section name."""
-    mod = _load_checker()
-    parsed = mod.parse_unit_directives(_SAMPLE_UNIT)
+    parsed = systemd_unit_parity.parse_unit_directives(_SAMPLE_UNIT)
 
     assert set(parsed) == {"Unit", "Service", "Install"}
     assert parsed["Service"]["Type"] == ["oneshot"]
@@ -97,8 +95,7 @@ def test_parse_unit_directives_returns_section_key_values_mapping():
 
 def test_parse_unit_directives_skips_comments_and_blanks():
     """'#' and ';' comment lines and blank lines contribute no directives."""
-    mod = _load_checker()
-    parsed = mod.parse_unit_directives(_SAMPLE_UNIT)
+    parsed = systemd_unit_parity.parse_unit_directives(_SAMPLE_UNIT)
 
     unit_keys = set(parsed["Unit"])
     assert unit_keys == {"Description"}, (
@@ -121,8 +118,7 @@ def test_parse_unit_directives_accumulates_repeated_keys():
     key K" — which is exactly what a per-directive comparison needs, and what
     makes the two Environment= lines of the real dashboard unit addressable.
     """
-    mod = _load_checker()
-    parsed = mod.parse_unit_directives(_SAMPLE_UNIT)
+    parsed = systemd_unit_parity.parse_unit_directives(_SAMPLE_UNIT)
 
     assert parsed["Service"]["Environment"] == ["A=1", "B=2"]
 
@@ -135,8 +131,7 @@ def test_parse_unit_directives_joins_backslash_continuations():
     living on a continuation line is invisible to the checker — which would
     silently defeat the whole point of comparing what 3306 added.
     """
-    mod = _load_checker()
-    parsed = mod.parse_unit_directives(_SAMPLE_UNIT)
+    parsed = systemd_unit_parity.parse_unit_directives(_SAMPLE_UNIT)
 
     exec_values = parsed["Service"]["ExecStart"]
     assert len(exec_values) == 1, (
@@ -152,8 +147,7 @@ def test_parse_unit_directives_joins_backslash_continuations():
 
 def test_parse_unit_directives_drops_lines_before_first_section_header():
     """A directive before any [Section] header is dropped, not misattributed."""
-    mod = _load_checker()
-    parsed = mod.parse_unit_directives(_SAMPLE_UNIT)
+    parsed = systemd_unit_parity.parse_unit_directives(_SAMPLE_UNIT)
 
     # The leading `Type=simple` precedes [Unit]; the only Type= that survives
     # is [Service]'s `oneshot`.
@@ -169,8 +163,7 @@ def test_parse_unit_directives_splits_on_first_equals_only():
     every '=' would destroy the variable assignment the Environment= branch
     later needs to read.
     """
-    mod = _load_checker()
-    parsed = mod.parse_unit_directives("[Service]\nEnvironment=DASH_ROOTS=/a,/b\n")
+    parsed = systemd_unit_parity.parse_unit_directives("[Service]\nEnvironment=DASH_ROOTS=/a,/b\n")
 
     assert parsed["Service"]["Environment"] == ["DASH_ROOTS=/a,/b"]
 
@@ -233,7 +226,7 @@ def test_compare_unit_directive_missing_from_installed_is_drift():
     assert len(drifts) == 1, drifts
     (drift,) = drifts
     assert drift.key == "Restart"
-    assert drift.installed_value == mod._ABSENT
+    assert drift.installed_value == systemd_unit_parity.ABSENT
     assert "on-failure" in drift.repo_value
 
 
@@ -257,7 +250,7 @@ def test_compare_unit_comparison_is_symmetric():
     assert len(drifts) == 1, drifts
     (drift,) = drifts
     assert drift.key == "Restart"
-    assert drift.repo_value == mod._ABSENT
+    assert drift.repo_value == systemd_unit_parity.ABSENT
     assert "always" in drift.installed_value
 
 
@@ -354,7 +347,7 @@ def test_presence_only_missing_from_installed_is_drift():
     assert len(drifts) == 1, drifts
     (drift,) = drifts
     assert drift.key == "ExecStart"
-    assert drift.installed_value == mod._ABSENT
+    assert drift.installed_value == systemd_unit_parity.ABSENT
     assert "absent" in drift.reason, (
         "The reason must distinguish 'required directive absent' from a value "
         f"mismatch; got {drift.reason!r}"
@@ -373,7 +366,7 @@ def test_presence_only_missing_from_repo_is_drift():
     )
 
     assert len(drifts) == 1, drifts
-    assert drifts[0].repo_value == mod._ABSENT
+    assert drifts[0].repo_value == systemd_unit_parity.ABSENT
 
 
 def test_presence_only_absent_from_both_is_not_drift():
@@ -546,7 +539,7 @@ def test_environment_allowlist_does_not_bless_the_variable_disappearing():
 
     assert len(drifts) == 1, drifts
     assert "DASHBOARD_KNOWN_PROJECT_ROOTS" in drifts[0].key
-    assert drifts[0].installed_value == mod._ABSENT
+    assert drifts[0].installed_value == systemd_unit_parity.ABSENT
 
 
 def test_environment_non_allowlisted_value_difference_is_drift():
@@ -582,7 +575,7 @@ def test_environment_extra_installed_variable_is_drift():
 
     assert len(drifts) == 1, drifts
     assert "DASHBOARD_DEBUG" in drifts[0].key
-    assert drifts[0].repo_value == mod._ABSENT
+    assert drifts[0].repo_value == systemd_unit_parity.ABSENT
 
 
 def test_environment_name_set_compared_across_several_variables():
@@ -848,8 +841,8 @@ def test_env_matches_directive_missing_directive_is_drift():
     )
     assert drifts[0].key == _RELATION_KEY
     assert "WorkingDirectory" in drifts[0].reason
-    assert mod._ABSENT in drifts[0].installed_value, (
-        "The absent half must be rendered as _ABSENT so the report shows which "
+    assert systemd_unit_parity.ABSENT in drifts[0].installed_value, (
+        "The absent half must be rendered as ABSENT so the report shows which "
         f"of the two is missing. Got: {drifts[0].installed_value!r}"
     )
 
@@ -1085,7 +1078,7 @@ def test_exec_start_flag_missing_from_installed_is_drift():
     assert len(drifts) == 1, drifts
     (drift,) = drifts
     assert "timeout-keep-alive" in drift.key
-    assert drift.installed_value == mod._ABSENT
+    assert drift.installed_value == systemd_unit_parity.ABSENT
     assert drift.repo_value == "5"
 
 
@@ -1135,7 +1128,7 @@ def test_exec_start_flag_lookup_ignores_the_comment_block():
         "The comment's mention of --timeout-keep-alive must not be mistaken "
         f"for the flag being present on the command. Got: {drifts}"
     )
-    assert drifts[0].installed_value == mod._ABSENT
+    assert drifts[0].installed_value == systemd_unit_parity.ABSENT
 
 
 def test_exec_start_flags_absent_from_both_is_not_drift():
@@ -1153,7 +1146,7 @@ def test_exec_start_flag_helper_reads_the_parsed_value():
     Raw token, not int: --host 127.0.0.1 must work as well as --port 8080.
     """
     mod = _load_checker()
-    parsed = mod.parse_unit_directives(
+    parsed = systemd_unit_parity.parse_unit_directives(
         _exec_unit("/usr/bin/uv", "/opt/df", _BOTH_FLAGS)
     )["Service"]
 
@@ -1169,9 +1162,8 @@ def test_exec_start_flag_helper_reads_the_parsed_value():
 # ---------------------------------------------------------------------------
 #
 # These read REPO-side files only — never ~/.config/systemd/user/ — so they
-# stay green on a host whose installed units are drifted (which this one is,
-# deliberately, until task 3289 lands) and on CI, which has no installed units
-# at all.
+# stay green on a host whose installed units are drifted and on CI, which has
+# no installed units at all.
 
 _DASHBOARD_SERVICE = "dark-factory-dashboard.service"
 _WATCHDOG_SERVICE = "dark-factory-dashboard-watchdog.service"
@@ -1210,7 +1202,7 @@ def test_registry_keys_are_all_declared_in_the_committed_units():
     mod = _load_checker()
 
     for name, spec in mod.UNITS.items():
-        parsed = mod.parse_unit_directives(
+        parsed = systemd_unit_parity.parse_unit_directives(
             (REPO_ROOT / spec.repo_relpath).read_text(encoding="utf-8")
         )
         for section, key in tuple(spec.compared) + tuple(spec.present_only):
@@ -1228,7 +1220,7 @@ def test_registry_exec_start_flags_are_really_on_the_committed_command():
     for name, spec in mod.UNITS.items():
         if not spec.exec_start_flags:
             continue
-        parsed = mod.parse_unit_directives(
+        parsed = systemd_unit_parity.parse_unit_directives(
             (REPO_ROOT / spec.repo_relpath).read_text(encoding="utf-8")
         )
         for flag in spec.exec_start_flags:
@@ -1263,7 +1255,7 @@ def test_registry_environment_sections_name_a_section_the_committed_unit_has():
     for name, spec in mod.UNITS.items():
         if spec.environment_section is None:
             continue
-        parsed = mod.parse_unit_directives(
+        parsed = systemd_unit_parity.parse_unit_directives(
             (REPO_ROOT / spec.repo_relpath).read_text(encoding="utf-8")
         )
         assert spec.environment_section in parsed, (
@@ -1301,7 +1293,7 @@ def test_committed_environment_declarations_are_all_registered():
     mod = _load_checker()
 
     for name, spec in mod.UNITS.items():
-        parsed = mod.parse_unit_directives(
+        parsed = systemd_unit_parity.parse_unit_directives(
             (REPO_ROOT / spec.repo_relpath).read_text(encoding="utf-8")
         )
         for section, directives in parsed.items():
@@ -1316,6 +1308,198 @@ def test_committed_environment_declarations_are_all_registered():
                 "registered) so this directive is actually compared instead "
                 "of silently skipped."
             )
+
+
+def _unregistered_directives(spec, parsed) -> list[tuple[str, str]]:
+    """Every ``(section, key)`` in *parsed* that *spec* neither covers nor waives.
+
+    Takes the spec and the parsed unit rather than a unit name so the same
+    code drives both the real registry and the throwaway fixture that proves
+    it fires — the guard and its own proof cannot diverge.
+    """
+    covered = spec.covered_directives()
+    waived = {(section, key) for section, key, _reason in spec.unchecked_directives}
+    return [
+        (section, key)
+        for section, directives in parsed.items()
+        for key in directives
+        if (section, key) not in covered and (section, key) not in waived
+    ]
+
+
+def test_every_committed_directive_is_registered_or_explicitly_unchecked():
+    """COMPLETENESS GUARD: every directive a committed unit declares was considered.
+
+    The staleness guards above all run one way — a registered key must be
+    declared — and test_committed_environment_declarations_are_all_registered
+    inverts that for Environment= alone. This is the same inversion for every
+    directive. Without it a committed unit can gain a directive nobody
+    registered, every registered key still compares equal, and the gate reports
+    parity on a host that never received it. SuccessExitStatus= did exactly
+    that for ~3 weeks.
+
+    Comparison stays BOUNDED — the module docstring's case against an
+    unbounded diff is sound — but bounded must mean every directive was
+    considered, not that someone remembered to.
+    """
+    mod = _load_checker()
+
+    for name, spec in mod.UNITS.items():
+        parsed = systemd_unit_parity.parse_unit_directives(
+            (REPO_ROOT / spec.repo_relpath).read_text(encoding="utf-8")
+        )
+        unregistered = _unregistered_directives(spec, parsed)
+        assert unregistered == [], (
+            f"{name}: the committed unit {spec.repo_relpath} declares "
+            + ", ".join(f"[{section}] {key}" for section, key in unregistered)
+            + " but the registry neither compares nor waives it, so drift in it "
+            "would be reported as parity. Either register it on the branch that "
+            "fits (compared / present_only / override_directives / "
+            "environment_section), or add it to unchecked_directives with a "
+            "specific reason — a reasoned waiver is a legitimate answer, not a "
+            "way around this guard."
+        )
+
+
+def test_completeness_guard_fires_on_an_unregistered_directive():
+    """The guard's own proof, in both directions.
+
+    OOMPolicy= is a real systemd directive, absent from all three committed
+    units, and plainly not cosmetic — the shape of directive a future edit
+    could add without anyone registering it.
+    """
+    mod = _load_checker()
+    parsed = systemd_unit_parity.parse_unit_directives(
+        "[Unit]\n"
+        "Description=Throwaway fixture\n"
+        "[Service]\n"
+        "Type=simple\n"
+        "ExecStart=/bin/true\n"
+        "OOMPolicy=stop\n"
+    )
+    spec = mod.UnitSpec(
+        name="throwaway.service",
+        repo_relpath="dashboard/throwaway.service",
+        compared=(("Unit", "Description"), ("Service", "Type")),
+        present_only=(("Service", "ExecStart"),),
+    )
+
+    assert _unregistered_directives(spec, parsed) == [("Service", "OOMPolicy")]
+
+    waived = mod.UnitSpec(
+        name="throwaway.service",
+        repo_relpath="dashboard/throwaway.service",
+        compared=(("Unit", "Description"), ("Service", "Type")),
+        present_only=(("Service", "ExecStart"),),
+        unchecked_directives=(("Service", "OOMPolicy", "throwaway fixture directive"),),
+    )
+
+    assert _unregistered_directives(waived, parsed) == []
+
+
+def test_unchecked_directives_all_carry_a_nonempty_reason():
+    """Every waiver states a reason, or it is an invisible hole.
+
+    Same stance as test_divergence_allowlist_names_are_declared_in_a_committed_unit:
+    the gate's deliberate holes stay believable only while each one says why,
+    specifically enough for a reviewer to check.
+    """
+    mod = _load_checker()
+
+    for name, spec in mod.UNITS.items():
+        for section, key, reason in spec.unchecked_directives:
+            assert reason.strip(), (
+                f"{name}: unchecked_directives waives [{section}] {key} with an "
+                "empty reason. State why it is safe not to compare it."
+            )
+
+
+def test_unchecked_directive_that_is_also_covered_is_rejected():
+    """A directive both compared and waived raises at construction.
+
+    Its reason string would tell a reviewer the directive is deliberately not
+    compared while a branch compares it, so the waiver stops meaning what it
+    says. Rejected at import time, on the same terms as an env_matches_directive
+    pair registered with no environment_section.
+    """
+    mod = _load_checker()
+
+    with pytest.raises(ValueError) as excinfo:
+        mod.UnitSpec(
+            name="fixture.service",
+            repo_relpath="dashboard/fixture.service",
+            compared=(("Service", "TimeoutStopSec"),),
+            unchecked_directives=(("Service", "TimeoutStopSec", "contradictory waiver"),),
+        )
+
+    message = str(excinfo.value)
+    assert "fixture.service" in message, message
+    assert "[Service] TimeoutStopSec" in message, message
+    assert "contradictory waiver" in message, message
+
+
+# Every UnitSpec field, sorted by what compare_unit does with it. A field added
+# to UnitSpec fails the cross-check below until it is placed in one of these.
+_PROBE_DIRECTIVE_FIELDS = {
+    "compared": (("Service", "Compared"),),
+    "present_only": (("Service", "PresentOnly"),),
+    "override_directives": (("Service", "Override"),),
+    "environment_section": "Service",
+}
+_CONTENT_FIELDS = {"exec_start_flags", "env_matches_directive"}
+_NON_COMPARISON_FIELDS = {"name", "repo_relpath", "unchecked_directives"}
+
+
+def test_covered_directives_is_exactly_what_compare_unit_checks():
+    """covered_directives() and compare_unit's branches cannot drift apart.
+
+    compare_unit reads the spec's fields itself, so covered_directives() is a
+    second enumeration of its directive-level branches. Were the two to
+    disagree, the completeness guard would accept a directive nothing compares,
+    or demand a waiver for one that is compared.
+
+    A probe spec registers one directive on every directive-level field. Each
+    directive is then declared in one copy only, in both directions. It must
+    drift exactly when covered_directives() names it, and an unregistered
+    control directive must never drift. The content fields reach tokens inside
+    a directive, or relate two, so they cover no directive of their own.
+    """
+    mod = _load_checker()
+    assert {field.name for field in dataclasses.fields(mod.UnitSpec)} == (
+        set(_PROBE_DIRECTIVE_FIELDS) | _CONTENT_FIELDS | _NON_COMPARISON_FIELDS
+    ), (
+        "UnitSpec gained or lost a field: give it a probe value in "
+        "_PROBE_DIRECTIVE_FIELDS if compare_unit compares it as a whole "
+        "directive, otherwise classify it in _CONTENT_FIELDS or "
+        "_NON_COMPARISON_FIELDS"
+    )
+    spec = mod.UnitSpec(
+        name="probe.service", repo_relpath="dashboard/probe.service", **_PROBE_DIRECTIVE_FIELDS
+    )
+    covered = spec.covered_directives()
+
+    def drifts_from_either_side(section: str, key: str) -> bool:
+        declared = f"[{section}]\n{key}=PROBE=1\n"
+        bare = f"[{section}]\n"
+        return bool(mod.compare_unit(spec, declared, bare)) and bool(
+            mod.compare_unit(spec, bare, declared)
+        )
+
+    # Listed outright rather than read back from covered, so a branch that
+    # covered_directives() forgets still gets probed.
+    candidates = covered | {
+        ("Service", "Compared"),
+        ("Service", "PresentOnly"),
+        ("Service", "Override"),
+        ("Service", "Environment"),
+        ("Service", "Unregistered"),
+    }
+    drifting = {directive for directive in candidates if drifts_from_either_side(*directive)}
+
+    assert drifting == covered, (
+        f"compare_unit drifts on {sorted(drifting)} but covered_directives() "
+        f"names {sorted(covered)}"
+    )
 
 
 def test_registry_env_matches_directive_entries_are_declared_in_the_committed_units():
@@ -1339,10 +1523,10 @@ def test_registry_env_matches_directive_entries_are_declared_in_the_committed_un
             f"{name}: registry declares env_matches_directive but no "
             "environment_section, so the variable can never be read."
         )
-        parsed = mod.parse_unit_directives(
+        parsed = systemd_unit_parity.parse_unit_directives(
             (REPO_ROOT / spec.repo_relpath).read_text(encoding="utf-8")
         )
-        env = mod._environment_map(parsed, spec.environment_section)
+        env = systemd_unit_parity.environment_map(parsed, spec.environment_section)
         for var, key in spec.env_matches_directive:
             assert var in env, (
                 f"{name}: registry relates Environment={var} to {key}, but the "
@@ -1356,11 +1540,22 @@ def test_registry_env_matches_directive_entries_are_declared_in_the_committed_un
             )
 
 
+def test_divergence_allowlist_is_the_policy_projection():
+    """The allowlist is ENV_POLICY's dashboard projection, and immutable across the boundary."""
+    allowlist = _load_checker().DIVERGENCE_ALLOWLIST
+
+    assert isinstance(allowlist, frozenset)
+    assert allowlist == systemd_unit_parity.ENV_POLICY.divergence_allowlist(
+        systemd_unit_parity.UnitFamily.DASHBOARD
+    )
+
+
 def test_divergence_allowlist_names_are_declared_in_a_committed_unit():
     """STALENESS GUARD, allowlist edition: no waiver for a variable nobody sets.
 
-    DIVERGENCE_ALLOWLIST is the one deliberate hole in this gate, and its own
-    comment says to keep it small and every reason checkable.  An entry naming a
+    DIVERGENCE_ALLOWLIST is the one deliberate hole in this gate, so keep it
+    small; each entry's reason lives in the PRD's "D5 policy rows"
+    (plans/review-all-s25-scripts-instruments-prd.md).  An entry naming a
     variable no committed unit declares any more is worse than useless: it is a
     standing, invisible waiver that nothing will ever remove, because nothing
     reports it.  If the variable comes back later — reused for something else —
@@ -1372,20 +1567,16 @@ def test_divergence_allowlist_names_are_declared_in_a_committed_unit():
     for spec in mod.UNITS.values():
         if spec.environment_section is None:
             continue
-        parsed = mod.parse_unit_directives(
+        parsed = systemd_unit_parity.parse_unit_directives(
             (REPO_ROOT / spec.repo_relpath).read_text(encoding="utf-8")
         )
-        declared |= set(mod._environment_map(parsed, spec.environment_section))
+        declared |= set(systemd_unit_parity.environment_map(parsed, spec.environment_section))
 
-    for var, reason in mod.DIVERGENCE_ALLOWLIST.items():
+    for var in sorted(mod.DIVERGENCE_ALLOWLIST):
         assert var in declared, (
             f"DIVERGENCE_ALLOWLIST waives value comparison for {var}, but no "
             f"committed unit in the registry declares it. Declared: "
             f"{sorted(declared)}. Remove the entry or restore the variable."
-        )
-        assert reason.strip(), (
-            f"DIVERGENCE_ALLOWLIST entry {var} has an empty reason. Every hole "
-            "in this gate must state one specific enough for a reviewer to check."
         )
 
 
@@ -1410,6 +1601,54 @@ def test_dashboard_service_spec_pins_the_tasks_minimum_coverage():
             "RestartSteps=, so an installed unit whose cap systemd is silently "
             f"ignoring would be reported as parity. compared: {compared_keys}"
         )
+
+
+def test_dashboard_service_spec_compares_the_success_exit_status():
+    """SuccessExitStatus= is value-compared on the dashboard service.
+
+    It is load-bearing: ``uv run`` propagates its child's SIGTERM death as
+    128+15, so without the directive systemd records every graceful stop as
+    "Failed with result exit-code" (status=143) and a real crash reads exactly
+    like a deploy.
+
+    The measured history is why this needs its own pin. The directive was
+    absent from the installed unit for ~3 weeks after commit d50235fa66 added
+    it to the committed one, and this gate reported parity throughout —
+    BECAUSE THIS KEY WAS NOT IN THE REGISTRY. That is the silent-green failure
+    the staleness guards above exist to prevent, arriving from the one
+    direction they do not cover: they prove every registered key is declared,
+    never that every declared key is registered.
+    """
+    mod = _load_checker()
+    spec = mod.UNITS[_DASHBOARD_SERVICE]
+
+    assert ("Service", "SuccessExitStatus") in spec.compared, (
+        "the dashboard spec does not value-compare SuccessExitStatus=, so an "
+        "installed unit that lost it reports parity while systemd records "
+        f"every graceful stop as a failure. compared: {spec.compared}"
+    )
+
+
+def test_installed_copy_missing_success_exit_status_is_drift():
+    """The registry entry has teeth: dropping the line from the installed copy is drift.
+
+    Membership in ``compared`` proves only that a string is in a tuple. This
+    drives the real registered spec through compare_unit with an installed
+    copy that is the repo copy minus that one line — the exact shape measured
+    on this host before task 3289 — and requires exactly one drift naming it.
+    """
+    mod = _load_checker()
+    spec = mod.UNITS[_DASHBOARD_SERVICE]
+    repo_text = "[Service]\nType=simple\nSuccessExitStatus=143\nTimeoutStopSec=15\n"
+    installed_text = "[Service]\nType=simple\nTimeoutStopSec=15\n"
+
+    drifts = mod.compare_unit(spec, repo_text, installed_text)
+
+    assert len(drifts) == 1, drifts
+    (drift,) = drifts
+    assert drift.key == "SuccessExitStatus"
+    assert drift.repo_value == "143"
+    assert "absent from the installed copy" in drift.reason, drift.reason
 
 
 def test_dashboard_service_spec_pins_the_project_root_env_contract():
@@ -1456,11 +1695,6 @@ def test_project_root_is_allowlisted_for_cross_host_value_divergence():
         "DASHBOARD_PROJECT_ROOT is not allowlisted, so its value is compared "
         "across copies — that fires on every correctly-configured host whose "
         "repo does not live at /home/leo/src/dark-factory."
-    )
-    assert mod.DIVERGENCE_ALLOWLIST["DASHBOARD_PROJECT_ROOT"].strip(), (
-        "every allowlist entry must state its reason; this one must also name "
-        "what closes the hole (env_matches_directive), so the preamble's "
-        "'THIS IS A HOLE IN THE GATE' stays honest."
     )
 
 
@@ -1573,7 +1807,7 @@ def test_environment_file_added_only_to_the_installed_copy_is_drift():
 
     assert [d.key for d in drifts] == ["EnvironmentFile"], drifts
     assert drifts[0].installed_value == "/tmp/evil.env"
-    assert drifts[0].repo_value == mod._ABSENT
+    assert drifts[0].repo_value == systemd_unit_parity.ABSENT
 
 
 def test_environment_file_on_both_copies_is_not_drift():
@@ -1677,7 +1911,7 @@ def test_watchdog_environment_injected_on_the_installed_copy_is_drift():
     # [Install] stanza), so appending at EOF currently lands in the same
     # section too — but relying on that would silently couple this fixture to
     # section order: a future [Install] or [Unit] added after [Service] would
-    # make the appended line land outside it, _environment_map would read an
+    # make the appended line land outside it, environment_map would read an
     # empty [Service] on both sides, and this test would fail with
     # `assert [] == [...]`, reading like the checker regressed rather than
     # like the fixture drifted. [Service] appears exactly once, so inserting
@@ -1692,18 +1926,17 @@ def test_watchdog_environment_injected_on_the_installed_copy_is_drift():
     assert [d.key for d in drifts] == ["Environment=DASHBOARD_WATCHDOG_FAIL_STREAK"], drifts
     assert drifts[0].section == "Service"
     assert drifts[0].installed_value == "99"
-    assert drifts[0].repo_value == mod._ABSENT
+    assert drifts[0].repo_value == systemd_unit_parity.ABSENT
     assert "installed copy" in drifts[0].reason
 
 
 def test_find_dropins_returns_nothing_when_no_dropin_dir_exists(tmp_path: pathlib.Path):
     """The overwhelmingly common case must be silent."""
-    mod = _load_checker()
     installed = tmp_path / "installed"
     installed.mkdir()
     (installed / _DASHBOARD_SERVICE).write_text("[Service]\n", encoding="utf-8")
 
-    assert mod.find_dropins(installed, _DASHBOARD_SERVICE) == []
+    assert systemd_unit_parity.find_dropins(installed, _DASHBOARD_SERVICE) == []
 
 
 def test_find_dropins_reports_conf_files_and_ignores_the_rest(tmp_path: pathlib.Path):
@@ -1713,7 +1946,6 @@ def test_find_dropins_reports_conf_files_and_ignores_the_rest(tmp_path: pathlib.
     would raise an alarm over a stray editor backup — a false positive on the
     one gate whose value is being believed when it fires.
     """
-    mod = _load_checker()
     installed = tmp_path / "installed"
     installed.mkdir()
     dropin_dir = installed / f"{_DASHBOARD_SERVICE}.d"
@@ -1722,7 +1954,7 @@ def test_find_dropins_reports_conf_files_and_ignores_the_rest(tmp_path: pathlib.
     (dropin_dir / "10-limits.conf").write_text("[Service]\nTimeoutStopSec=90\n")
     (dropin_dir / "override.conf.bak").write_text("ignored\n")
 
-    found = mod.find_dropins(installed, _DASHBOARD_SERVICE)
+    found = systemd_unit_parity.find_dropins(installed, _DASHBOARD_SERVICE)
 
     assert [p.name for p in found] == ["10-limits.conf", "override.conf"], found
 
@@ -1983,7 +2215,7 @@ def test_main_reports_the_watchdog_pre_incident_drift(tmp_path: pathlib.Path, ca
     """The real measured host drift: the pre-incident inline-shell watchdog.
 
     Reproduced as a FIXTURE rather than read from ~/.config/systemd/user/, so
-    the assertion survives task 3289 installing the post-3308 units.
+    the assertion pins checker behaviour whatever that host has installed since.
     """
     mod = _load_checker()
     repo = _fake_repo(tmp_path, mod)
@@ -2648,7 +2880,7 @@ def _installed_env(mod: types.ModuleType, unit_dir: pathlib.Path) -> dict[str, s
     exactly as the gate one section later would read it.
     """
     text = (unit_dir / _DASHBOARD_SERVICE).read_text(encoding="utf-8")
-    return mod._environment_map(mod.parse_unit_directives(text), "Service")
+    return systemd_unit_parity.environment_map(systemd_unit_parity.parse_unit_directives(text), "Service")
 
 
 def _installed_directive(
@@ -2656,7 +2888,7 @@ def _installed_directive(
 ) -> str:
     """The single value of *key* in the installed dashboard unit's [Service]."""
     text = (unit_dir / _DASHBOARD_SERVICE).read_text(encoding="utf-8")
-    values = mod.parse_unit_directives(text)["Service"][key]
+    values = systemd_unit_parity.parse_unit_directives(text)["Service"][key]
     assert len(values) == 1, f"expected one {key}= in the installed unit, got {values}"
     return values[0]
 
@@ -3576,26 +3808,3 @@ def test_no_parity_call_site_branches_on_a_bare_exit_status(
         "the status anywhere but inside `_parity_verdict` re-creates the "
         f"defect the helper centralises.\n{block}"
     )
-def test_dashboard_reuses_the_shared_drift_and_absent():
-    """``Drift`` and ``_ABSENT`` are the SHARED objects, not local look-alikes.
-
-    IDENTITY, not equality, and the distinction is the whole point: a pasted
-    copy of a six-field frozen dataclass compares equal field-for-field with
-    the original while being a DISTINCT TYPE, so an ``==`` check on the class
-    — or on instances of it — would pass over exactly the fork this guard
-    exists to forbid. ``_ABSENT`` is worse still: two ``"<absent>"`` literals
-    may or may not be interned, so equality says nothing at all about whether
-    there is one definition or three.
-
-    The same pin the three earlier lifts carry (see
-    tests/scripts/test_check_orchestrator_unit_parity.py, which asserts this
-    shape for the parser and for ``find_dropins``). Duplicating a record inside
-    the tooling built to report silent duplication is the failure this family
-    exists to catch, one level up.
-    """
-    import systemd_unit_parity
-
-    mod = _load_checker()
-
-    assert mod.Drift is systemd_unit_parity.Drift
-    assert mod._ABSENT is systemd_unit_parity._ABSENT

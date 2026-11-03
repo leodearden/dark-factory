@@ -426,6 +426,73 @@ class TestScanContentPrecision:
             ], content
 
 
+class TestScanContentSeesSlugAndBranchSpellings:
+    """The fleet's own hyphen-slug and branch-name spellings (task 6059).
+
+    One unpadded '-' or '/' separator joins the task word to its number, so a
+    slug or branch can never span whitespace or a line break.
+    """
+
+    @pytest.mark.parametrize(
+        'content',
+        [
+            'Merged task-173-fillet-fix today',
+            'branch task/173 merged',
+            'TASK-173 is done',
+            'Tasks/173 notes',
+            "task-173's liveness investigation",
+            'see task-173.',
+        ],
+    )
+    def test_the_spelling_is_a_local_mention(self, content):
+        assert [r.node_name for r in scan_content(content, group_id='reify').refs] == [
+            'Task 173'
+        ]
+
+    @pytest.mark.parametrize(
+        'content',
+        [
+            'sub-task-5',
+            'reify-task-12',
+            'subtask-5',
+            'multitask/3',
+            'task-force 9',
+            'task--5',
+            'task-/5',
+            f'task-{ARABIC_INDIC_THREE}',
+            f'task-12{ARABIC_INDIC_THREE}',
+            'task\n-5',
+        ],
+        ids=[
+            'hyphen-before-the-word',
+            'project-hyphen-before-the-word',
+            'word-char-before-the-word',
+            'word-char-before-a-slash-spelling',
+            'no-digit-after-the-separator',
+            'a-doubled-separator',
+            'mixed-separators',
+            'a-unicode-digit',
+            'a-mixed-digit-run',
+            'a-line-break-is-not-a-separator',
+        ],
+    )
+    def test_a_lookalike_is_not_a_mention(self, content):
+        scan = scan_content(content, group_id='reify')
+        assert scan.refs == ()
+        assert scan.ambiguous == ()
+
+    @pytest.mark.parametrize('name', ['task-173', 'task/173'])
+    def test_the_anchored_node_name_parser_is_not_widened(self, name):
+        """The anchored parser drives node RENAMING, and an entity named
+        'task-173' was never measured as a task node."""
+        assert parse_node_name(name) is None
+
+    def test_a_slug_mention_contests_a_foreign_ref_of_the_same_number(self):
+        scan = scan_content('reify:5 and task-5', group_id='dark_factory')
+        assert scan.refs == ()
+        assert {r.node_name for r in scan.ambiguous} == {'reify:5', 'Task 5'}
+
+
 class TestUnicodeDigitsAreNotTaskNumbers:
     """A task number is written in ASCII digits. Python's ``re`` matches Unicode
     decimal digits with ``\\d`` on str patterns, so 'task \\u0663' parsed as a task

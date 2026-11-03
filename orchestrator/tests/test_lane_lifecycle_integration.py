@@ -16,6 +16,8 @@ Boundary suite:
     B4 — hostile `git add -A` stages ZERO task-meta (STRUCTURAL, load-bearing
          for task theta's later guard deletion)
     B5 — durable record + .task-meta survive `git clean -xfd` + `checkout -f`
+    B7 — REUSE dispatch refreshes updated_at; crash-recovery restore does not
+         (task 7863)
 
 B6 (dashboard reader resolves a relocated lane) was RETIRED by task
 gamma/2636 (``plans/dashboard-task-runtime-endpoint-prd.md``): that task
@@ -37,7 +39,10 @@ verify.py's has_conftest full-suite fallback for merge-time verify.
 from __future__ import annotations
 
 import asyncio
+import logging
 import shutil
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -52,6 +57,7 @@ from orchestrator.lane_lifecycle import (
     ESCALATION_SENTINEL_ROLE,
     IllegalLaneTransition,
     LaneLifecycle,
+    LaneRecord,
 )
 from orchestrator.lane_lifecycle import LaneState as DurableLaneState
 from orchestrator.warm_lane_pool import LaneState, WarmLanePool
@@ -172,6 +178,15 @@ async def _acquire_lane(
     return wt.path
 
 
+def _backdate_record(lifecycle: LaneLifecycle, lane: Path, *, days: int) -> str:
+    """Rewrite *lane*'s on-disk updated_at to *days* ago; return that stamp."""
+    path = lifecycle.state_dir / f'{lane.name}.json'
+    record = LaneRecord.from_json(path.read_text(encoding='utf-8'))
+    stamp = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+    path.write_text(replace(record, updated_at=stamp).to_json(), encoding='utf-8')
+    return stamp
+
+
 def _wire_recovery_scheduler(harness: Harness) -> None:
     """Stub the scheduler + event_store surface _recover_crashed_tasks reads.
 
@@ -214,9 +229,9 @@ class TestB1WriterReaderRoundTrip:
         lane = await _acquire_lane(harness.git_ops, '42', head, expected_title='B1 task')
         assert lane.name.startswith('_lane-')
 
-        # Write crashed progress under the sibling .task-meta root.
-        meta = TaskArtifacts.meta_root_for(harness.git_ops.worktree_base, lane.name)
-        ta = TaskArtifacts(lane, meta)
+        # Write crashed progress under the sibling .task-meta roots, as a
+        # dispatch of '42' into this lane leaves them.
+        ta = TaskArtifacts.for_task(lane, '42')
         ta.init('42', 'B1 task', 'd')
         ta.write_plan(_make_plan(3, 5, '42'))
 
@@ -361,8 +376,7 @@ class TestB2CrashQuarantine:
 
         head = await _get_head(repo)
         lane = await _acquire_lane(harness.git_ops, '42', head, expected_title='B2 identity')
-        meta = TaskArtifacts.meta_root_for(harness.git_ops.worktree_base, lane.name)
-        ta = TaskArtifacts(lane, meta)
+        ta = TaskArtifacts.for_task(lane, '42')
         ta.init('42', 'B2 identity', 'd')
         ta.write_plan(_make_plan(1, 2, '42'))
 
@@ -481,18 +495,17 @@ class TestB4Contamination:
         _wire_recovery_scheduler(harness)
 
         lane = await _acquire_lane(harness.git_ops, '42', await _get_head(repo))
-        meta = TaskArtifacts.meta_root_for(harness.git_ops.worktree_base, lane.name)
-        ta = TaskArtifacts(lane, meta)
+        ta = TaskArtifacts.for_task(lane, '42')
         ta.init('42', 'B4', 'd')
         ta.write_plan(_make_plan(1, 2, '42'))
         ta.append_iteration_log({'k': 1})
 
         # Metadata lives OUTSIDE the worktree: TaskArtifacts was pointed at
-        # the sibling `meta` root, never at `<lane>/.task`.  Nothing writes
-        # `<lane>/.task` any more, either — acquire's _ensure_task_gitignore
-        # defense-in-depth guard, the last thing that unconditionally
-        # created it, is gone.
-        assert (meta / 'plan.json').exists()
+        # the sibling `.task-meta` roots, never at `<lane>/.task`.  Nothing
+        # writes `<lane>/.task` any more, either — acquire's
+        # _ensure_task_gitignore defense-in-depth guard, the last thing that
+        # unconditionally created it, is gone.
+        assert ta.artifact_path('plan.json').exists()
         assert not (lane / '.task' / 'plan.json').exists()
         assert not (lane / '.task-meta').exists()
 
@@ -509,7 +522,7 @@ class TestB4Contamination:
             assert forbidden not in out, f'{forbidden!r} leaked into the hostile commit tree'
 
         # The sidecar is untouched by the commit.
-        assert (meta / 'plan.json').exists()
+        assert ta.artifact_path('plan.json').exists()
 
 
 # ── B5 — survives cleaning ──────────────────────────────────────────────
@@ -532,8 +545,7 @@ class TestB5SurvivesCleaning:
 
         base = harness.git_ops.worktree_base
         lane = await _acquire_lane(harness.git_ops, '42', await _get_head(repo))
-        meta = TaskArtifacts.meta_root_for(base, lane.name)
-        ta = TaskArtifacts(lane, meta)
+        ta = TaskArtifacts.for_task(lane, '42')
         ta.init('42', 'B5', 'd')
         ta.write_plan(_make_plan(1, 2, '42'))
 
@@ -551,4 +563,65 @@ class TestB5SurvivesCleaning:
         assert rec.state == DurableLaneState.ASSIGNED
         assert rec.task_id == '42'
 
-        assert (meta / 'plan.json').exists()
+        assert ta.artifact_path('plan.json').exists()
+
+
+# ── B7 — REUSE dispatch refreshes the record's age (task 7863) ─────────
+
+
+@pytest.mark.asyncio
+class TestB7ReuseDispatchRefreshesRecordAge:
+    """B7: the durable record's updated_at is warm-lane-gc.sh's record-gate
+    age clock. A restart's crash-recovery restore must leave it alone (or
+    abandoned lanes stay young), while the next REUSE dispatch of the same
+    task must move it to now (or an actively re-dispatched task ages out of
+    GC protection).
+    """
+
+    async def test_restore_keeps_age_and_reuse_dispatch_refreshes_it(
+        self, ig_git_repo: Path, caplog,
+    ):
+        repo = ig_git_repo
+        await _add_warm_lane_scripts(repo)
+        harness = _build_harness(_make_orch_config(repo))
+        _wire_recovery_scheduler(harness)
+        harness.scheduler.get_task = AsyncMock(return_value={'title': 'B7 task'})
+
+        head = await _get_head(repo)
+        lane = await _acquire_lane(harness.git_ops, '42', head, expected_title='B7 task')
+        ta = TaskArtifacts.for_task(lane, '42')
+        ta.init('42', 'B7 task', 'd')
+        ta.write_plan(_make_plan(1, 3, '42'))
+
+        lifecycle = LaneLifecycle(harness.git_ops.worktree_base)
+        old = _backdate_record(lifecycle, lane, days=30)
+
+        old_pool = harness.git_ops.warm_lane_pool
+        assert old_pool is not None
+        harness.git_ops.warm_lane_pool = WarmLanePool(
+            worktree_base=harness.git_ops.worktree_base,
+            size=old_pool.size,
+        )
+
+        await harness._recover_crashed_tasks()
+
+        pool = harness.git_ops.warm_lane_pool
+        assert pool.assignment_for('42') == lane
+        restored = lifecycle.read(lane)
+        assert restored is not None
+        assert restored.updated_at == old
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.git_ops'):
+            wt = await harness.git_ops.acquire_warm_lane(
+                '42', head, expected_title='B7 task',
+            )
+
+        assert isinstance(wt, WorktreeInfo), f'acquire_warm_lane failed: {wt!r}'
+        assert wt.path == lane
+        assert 'route=reuse edge=' in caplog.text, caplog.text
+        rec = lifecycle.read(lane)
+        assert rec is not None
+        assert (rec.state, rec.task_id) == (DurableLaneState.ASSIGNED, '42')
+        refreshed_at = datetime.fromisoformat(rec.updated_at)
+        assert refreshed_at > datetime.fromisoformat(old)
+        assert abs(datetime.now(UTC) - refreshed_at) < timedelta(minutes=5)

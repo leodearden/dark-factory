@@ -87,6 +87,7 @@ from fastmcp.server.middleware import Middleware
 from fastmcp.tools.base import ToolResult
 
 from shared.boundary_storm_escape import BoundaryStormEscape, Sink, call_sink
+from shared.mcp_tool_schema import live_tool_parameters
 from shared.uuid_prefix import (
     PrefixToken,
     find_prefix_tokens,
@@ -800,6 +801,10 @@ class UuidPrefixGuardMiddleware(Middleware):
         that cannot raise ``Unexpected keyword argument``. A tool that does
         take metadata then loses the flag and its own write-time gate answers
         with an actionable hint, which beats a call the tool cannot accept.
+
+        This method remains a near-twin of
+        ``shared/src/shared/mcp_markup_middleware.py::MarkupGuardMiddleware._apply_override``,
+        differing only in the strip helper.
         """
         if 'metadata' in await cls._schema_params(context, name):
             return
@@ -815,43 +820,14 @@ class UuidPrefixGuardMiddleware(Middleware):
     async def _schema_params(context, name: str) -> tuple[str, ...]:
         """The invoked tool's LIVE parameter names.
 
-        Two measured substrate facts, both of which the PRD's section 6 table
-        gets wrong for fastmcp 3.2.2: ``get_tool`` is a COROUTINE and must be
-        awaited, and ``tool.parameters`` is a full JSON Schema dict — so the
-        names live under ``'properties'``, not on the object itself.
-
-        LIVE rather than declared at registration, because what travels to a
-        tool has to be checked against the tool as it actually is; a schema
-        captured at wiring time would drift.
-
-        Any failure to resolve one yields an EMPTY tuple, which routes
-        :meth:`_apply_override` to the drop branch. That is the fail-safe
-        direction: the flag is lost and the write-time gate answers, where the
-        other direction is a call fastmcp refuses outright.
-
-        THE RESIDUAL DUPLICATION, named in full so a reader is not told this
-        file is INV-5-clean when part of it is not. This method and
-        :meth:`_apply_override` are near-twins of
-        ``MarkupGuardMiddleware._schema_properties`` / ``_schema_params`` and
-        ``._apply_override``: same two substrate facts, same fail-safe
-        direction, same strip-or-forward decision keyed off ``metadata``. They
-        are NOT extracted, and the storm/sink members that used to sit in this
-        file WERE (see :mod:`shared.boundary_storm_escape`), for a reason that
-        is not arbitrary — an extraction that leaves both call sites intact can
-        be done from this leaf, while unifying these two would mean editing
-        that middleware, outside this leaf's declared file scope. Filed rather
-        than dropped, as this task's ``cleanup_needed`` note records.
+        ``()`` when :func:`~shared.mcp_tool_schema.live_tool_parameters` has no
+        schema, which routes :meth:`_apply_override` to the drop branch. That
+        is the fail-safe direction: the flag is lost and the write-time gate
+        answers, where the other direction is a call fastmcp refuses outright.
         """
-        try:
-            tool = await context.fastmcp_context.fastmcp.get_tool(name)
-        except Exception:
-            logger.exception('uuid-prefix guard could not resolve the schema for %r', name)
-            return ()
-        parameters = getattr(tool, 'parameters', None) or {}
-        properties = parameters.get('properties') if isinstance(parameters, dict) else None
-        if not isinstance(properties, dict):
-            return ()
-        return tuple(properties)
+        parameters = await live_tool_parameters(context, name)
+        properties = parameters.get('properties') if parameters is not None else None
+        return tuple(properties) if isinstance(properties, dict) else ()
 
     # -- resolution -------------------------------------------------------
 

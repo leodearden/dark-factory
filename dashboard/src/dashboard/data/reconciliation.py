@@ -17,7 +17,7 @@ explicitly and concluded aggregation is moot for this module.
 
 from __future__ import annotations
 
-import json
+import enum
 import logging
 from datetime import UTC, datetime
 
@@ -35,6 +35,13 @@ _DEFAULT_BURST_COOLDOWN = 150
 _ACTIVE_THRESHOLD_SECONDS = 3600  # 1 hour
 
 
+class AgentActivity(enum.StrEnum):
+    """Which arm of :func:`partition_burst_state`'s rule admitted an agent as active."""
+
+    NON_IDLE = 'non_idle'
+    RECENT_WRITE = 'recent_write'
+
+
 def partition_burst_state(
     burst_state: list[dict],
     *,
@@ -44,7 +51,11 @@ def partition_burst_state(
     """Split burst agents into active and idle lists.
 
     Active means ``state != 'idle'`` **or** ``last_write_at`` within
-    *active_threshold_seconds*.  Everything else is idle/stale.
+    *active_threshold_seconds*.  Everything else is idle/stale.  Each active
+    agent comes back as a copy stamped with ``activity``, the
+    :class:`AgentActivity` arm that admitted it, so a consumer reads the
+    rule's own decision instead of re-deriving it; idle agents are returned
+    as given.
 
     *now* defaults to the live clock via :func:`dashboard.data.utils.resolve_now`;
     pass an explicit value for deterministic results.
@@ -54,14 +65,14 @@ def partition_burst_state(
     idle: list[dict] = []
     for agent in burst_state:
         if (agent.get('state') or 'idle') != 'idle':
-            active.append(agent)
+            active.append({**agent, 'activity': AgentActivity.NON_IDLE})
             continue
         # Idle agents with recent writes are still "active" for display
         last_write_at = agent.get('last_write_at')
         try:
             last_write = parse_utc(last_write_at).astimezone(UTC)
             if (now - last_write).total_seconds() < active_threshold_seconds:
-                active.append(agent)
+                active.append({**agent, 'activity': AgentActivity.RECENT_WRITE})
                 continue
         except (ValueError, TypeError) as exc:
             logger.debug(
@@ -76,14 +87,12 @@ async def get_recent_runs(db: aiosqlite.Connection | None, *, limit: int = 50) -
     """Return recent reconciliation runs ordered by started_at DESC.
 
     Each dict contains: id, project_id, run_type, trigger_reason, started_at,
-    completed_at, events_processed, status, duration_seconds, journal_entry_count.
+    completed_at, events_processed, status, duration_seconds.
     """
     async def _query(db: aiosqlite.Connection) -> list[dict]:
         async with db.execute(
             'SELECT r.id, r.project_id, r.run_type, r.trigger_reason,'
-            ' r.started_at, r.completed_at, r.events_processed, r.status,'
-            ' (SELECT COUNT(*) FROM journal_entries je'
-            '  WHERE je.run_id = r.id) AS journal_entry_count'
+            ' r.started_at, r.completed_at, r.events_processed, r.status'
             ' FROM runs r ORDER BY r.started_at DESC LIMIT ?',
             (limit,),
         ) as cursor:
@@ -117,61 +126,8 @@ async def get_recent_runs(db: aiosqlite.Connection | None, *, limit: int = 50) -
                     'events_processed': row['events_processed'],
                     'status': row['status'],
                     'duration_seconds': duration,
-                    'journal_entry_count': row['journal_entry_count'],
                 }
             )
-        return results
-
-    return await with_db(db, _query, [])
-
-
-async def get_journal_entries(db: aiosqlite.Connection | None, run_id: str) -> list[dict]:
-    """Return journal entries for a specific run, ordered by timestamp.
-
-    Each dict contains: id, stage, timestamp, operation, target_system,
-    before_state, after_state, reasoning, evidence.
-    """
-    async def _query(db: aiosqlite.Connection) -> list[dict]:
-        async with db.execute(
-            'SELECT id, stage, timestamp, operation, target_system,'
-            ' before_state, after_state, reasoning, evidence'
-            ' FROM journal_entries WHERE run_id = ? ORDER BY timestamp',
-            (run_id,),
-        ) as cursor:
-            rows = await cursor.fetchall()
-
-        results = []
-        for row in rows:
-            before_state = None
-            after_state = None
-            evidence = []
-            try:
-                if row['before_state']:
-                    before_state = json.loads(row['before_state'])
-            except (json.JSONDecodeError, TypeError):
-                before_state = row['before_state']
-            try:
-                if row['after_state']:
-                    after_state = json.loads(row['after_state'])
-            except (json.JSONDecodeError, TypeError):
-                after_state = row['after_state']
-            try:
-                if row['evidence']:
-                    evidence = json.loads(row['evidence'])
-            except (json.JSONDecodeError, TypeError):
-                evidence = []
-
-            results.append({
-                'id': row['id'],
-                'stage': row['stage'],
-                'timestamp': row['timestamp'],
-                'operation': row['operation'],
-                'target_system': row['target_system'],
-                'before_state': before_state,
-                'after_state': after_state,
-                'reasoning': row['reasoning'] or '',
-                'evidence': evidence,
-            })
         return results
 
     return await with_db(db, _query, [])

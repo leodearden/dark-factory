@@ -224,7 +224,7 @@ if [ -z "$TASK_ID" ] && [ "$AUDIT_MODE" -ne 1 ]; then
 fi
 
 # ── numeric --task validation ─────────────────────────────────────────────────
-if [ -n "$TASK_ID" ] && ! printf '%s\n' "$TASK_ID" | grep -qE '^[0-9]+$'; then
+if [ -n "$TASK_ID" ] && ! [[ "$TASK_ID" =~ ^[0-9]+$ ]]; then
     err "--task must be a positive integer (got: '$TASK_ID')"
     exit 2
 fi

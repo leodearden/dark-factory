@@ -3,9 +3,9 @@
 Dashboard-side mirror of ``orchestrator.digest.model_role_rollup``. Seeds the
 SAME fixture shape as orchestrator/tests/test_digest.py's
 ``TestModelRoleRollupCore`` / ``TestModelRoleRollupTurnCapSaturation`` (with
-timestamps placed relative to a fixed ``NOW`` reference, since this module's
-window is a rolling ``days``-lookback cutoff rather than digest's explicit
-``[window_start, window_end]`` bounds) and asserts numerically-equal
+timestamps placed relative to a fixed ``NOW`` reference, since this module
+derives its closed ``[NOW - days, NOW]`` window from ``now`` where digest is
+handed ``[window_start, window_end]`` explicitly) and asserts numerically-equal
 results — a shared-contract cross-check that both sides compute the
 identical GROUP-BY-(model, role) semantics from the same runs.db shape.
 """
@@ -423,3 +423,94 @@ class TestAggregateModelRoleRollup:
     async def test_empty_list_returns_empty_rollup(self) -> None:
         result = await aggregate_model_role_rollup([], days=DAYS, now=NOW)
         assert result == {'rows': [], 'turn_cap_saturation': {}}
+
+
+# ---------------------------------------------------------------------------
+# Window bounds — the digest's closed [window_start, window_end] convention.
+# ---------------------------------------------------------------------------
+
+# Transcribed from orchestrator/src/orchestrator/digest.py::model_role_rollup,
+# which filters `BETWEEN window_start AND window_end` (inclusive at both ends)
+# with window_end = the harness's wall-clock now. Mirrored by reading, never
+# imported (dashboard-alignment decision 1).
+_WINDOW_BOUNDARY_TABLE = [
+    pytest.param('2026-05-09T19:59:59+00:00', False, id='before-start'),
+    pytest.param('2026-05-09T20:00:00+00:00', True, id='at-start'),
+    pytest.param('2026-05-10T08:00:00+00:00', True, id='inside'),
+    pytest.param('2026-05-10T20:00:00+00:00', True, id='at-end-now'),
+    pytest.param('2026-05-10T20:00:01+00:00', False, id='after-end'),
+]
+
+
+async def _rollup_via_get(conn: aiosqlite.Connection) -> dict:
+    return await get_model_role_rollup(conn, days=DAYS, now=NOW)
+
+
+async def _rollup_via_aggregate(conn: aiosqlite.Connection) -> dict:
+    return await aggregate_model_role_rollup([conn], days=DAYS, now=NOW)
+
+
+_ENTRY_POINTS = [
+    pytest.param(_rollup_via_get, id='get'),
+    pytest.param(_rollup_via_aggregate, id='aggregate'),
+]
+
+
+def _seed_invocation_at(conn: sqlite3.Connection, timestamp: str) -> None:
+    conn.execute(
+        'INSERT INTO invocations '
+        '(run_id, task_id, project_id, account_name, model, role, '
+        ' cost_usd, capped, started_at, completed_at) '
+        "VALUES ('run-w', 'tw', 'p', 'a', 'sonnet', 'implementer', 1.0, 0, ?, ?)",
+        (timestamp, timestamp),
+    )
+
+
+def _seed_saturation_hit_at(conn: sqlite3.Connection, timestamp: str) -> None:
+    conn.executemany(
+        'INSERT INTO events (timestamp, run_id, task_id, event_type, role, data) '
+        "VALUES (?, 'run-w', 'tw', ?, 'simple_task', ?)",
+        [
+            ('2026-05-10T12:00:00+00:00', 'routing_decision', json.dumps({'max_turns': 10})),
+            ('2026-05-10T12:01:00+00:00', 'invocation_end', json.dumps({'turns': 1})),
+            (timestamp, 'invocation_end', json.dumps({'turns': 10})),
+        ],
+    )
+
+
+async def _rollup_of_fresh_db(tmp_path, seed, timestamp: str, rollup) -> dict:
+    db_path = tmp_path / 'window.db'
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.executescript(MODEL_ROLE_SCHEMA)
+        seed(conn, timestamp)
+        conn.commit()
+    finally:
+        conn.close()
+    async with aiosqlite.connect(str(db_path)) as aconn:
+        aconn.row_factory = aiosqlite.Row
+        return await rollup(aconn)
+
+
+class TestWindowFollowsDigestBounds:
+    """The window is the digest's closed ``[NOW - DAYS, NOW]``: a row exactly at
+    either bound is counted, a row one second outside either bound is not."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('rollup', _ENTRY_POINTS)
+    @pytest.mark.parametrize(('timestamp', 'included'), _WINDOW_BOUNDARY_TABLE)
+    async def test_invocation_rows(self, tmp_path, rollup, timestamp, included) -> None:
+        result = await _rollup_of_fresh_db(tmp_path, _seed_invocation_at, timestamp, rollup)
+        by_key = {(row['model'], row['role']): row for row in result['rows']}
+        if included:
+            assert by_key[('sonnet', 'implementer')]['invocation_count'] == 1
+        else:
+            assert ('sonnet', 'implementer') not in by_key
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('rollup', _ENTRY_POINTS)
+    @pytest.mark.parametrize(('timestamp', 'included'), _WINDOW_BOUNDARY_TABLE)
+    async def test_event_rows(self, tmp_path, rollup, timestamp, included) -> None:
+        result = await _rollup_of_fresh_db(tmp_path, _seed_saturation_hit_at, timestamp, rollup)
+        expected = 0.5 if included else 0.0
+        assert result['turn_cap_saturation']['simple_task'] == pytest.approx(expected)

@@ -10,20 +10,26 @@ from __future__ import annotations
 import asyncio
 import html.parser
 import json
+import os
 import re
+import shutil
 import sqlite3
 import threading
-from collections.abc import Awaitable, Callable, Sequence
-from contextlib import asynccontextmanager
+from collections.abc import Awaitable, Callable, Coroutine, Sequence
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NamedTuple
+from unittest.mock import patch
 
 import aiosqlite
 import httpx
 import pytest
+from fastapi import FastAPI
 
 from dashboard.config import DashboardConfig
+from dashboard.data.db import DbPool
+from dashboard.loops import _metrics_loop, _MetricsStore
 
 
 def live_aiosqlite_worker_threads() -> list[threading.Thread]:
@@ -238,6 +244,93 @@ async def drain(*tasks: asyncio.Task[Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Background-loop driving harness (task 5095)
+#
+# ONE definition of "run a real dashboard loop until the caller has seen
+# enough, then cancel it": drive_loop_until for any loop, drive_metrics_loop
+# for _metrics_loop against a recorded collect_metrics_snapshot.  Their
+# contract is pinned by test_metrics_loop_harness.py.
+# ---------------------------------------------------------------------------
+
+
+async def yielding_noop_sleep(*_args: object, **_kwargs: object) -> None:
+    """Stand-in for ``dashboard.loops._sleep_to_aligned_tick`` that suspends.
+
+    It MUST actually suspend.  A plain ``AsyncMock`` never yields, so the loop
+    spins synchronously and starves the event loop: an ``Event.set()`` waiter
+    (scheduled via ``call_soon``) never runs and ``asyncio.wait_for`` cannot
+    even time out.
+    """
+    await asyncio.sleep(0)
+
+
+async def drive_loop_until(
+    loop: Coroutine[Any, Any, None], until: asyncio.Event, *, timeout: float = 2.0
+) -> None:
+    """Run the never-returning *loop* as a task until *until* is set, then cancel it.
+
+    *timeout* is a backstop that is SUPPRESSED, so a regression fails on the
+    caller's named assertions rather than a bare ``TimeoutError``; assert a
+    positive witness (``until.is_set()``) before any upper-bound or absence
+    assertion.  Only ``CancelledError`` is swallowed on the way out, so a loop
+    that died of a real exception still surfaces it.  The task never outlives
+    this call.
+    """
+    task = asyncio.create_task(loop)
+    try:
+        with suppress(TimeoutError):
+            await asyncio.wait_for(until.wait(), timeout=timeout)
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+
+async def drive_metrics_loop(
+    store: _MetricsStore,
+    app: FastAPI,
+    *,
+    pool: DbPool,
+    http_client: httpx.AsyncClient,
+    until: asyncio.Event | None = None,
+    on_collect: Callable[[dict[str, Any]], None] | None = None,
+    timeout: float = 2.0,
+) -> list[dict[str, Any]]:
+    """Run ``_metrics_loop`` until *until* is set; return each collect call's kwargs.
+
+    *pool* and *http_client* are passed to the loop explicitly, and
+    ``app.state`` is never read or written here -- the binding tests depend on
+    the caller's ``app.state`` staying exactly as it built it.
+
+    With no *until* the driver stops after the first collect.  Otherwise the
+    caller sets *until* from wherever its observable lives: an *on_collect*
+    hook, a checkpoint mock.  *timeout* is ``drive_loop_until``'s suppressed
+    backstop.  *on_collect* runs INSIDE the loop's ``_run_once``, whose
+    ``except Exception`` swallows whatever it raises, so a hook should record
+    and signal, never assert.
+    """
+    calls: list[dict[str, Any]] = []
+    first_collect = asyncio.Event()
+
+    async def _record(*_args: object, **kwargs: Any) -> None:
+        calls.append(kwargs)
+        first_collect.set()
+        if on_collect is not None:
+            on_collect(kwargs)
+
+    with (
+        patch('dashboard.loops.collect_metrics_snapshot', new=_record),
+        patch('dashboard.loops._sleep_to_aligned_tick', new=yielding_noop_sleep),
+    ):
+        await drive_loop_until(
+            _metrics_loop(store, app, pool=pool, http_client=http_client),
+            first_collect if until is None else until,
+            timeout=timeout,
+        )
+    return calls
+
+
+# ---------------------------------------------------------------------------
 # Mocked MCP wire envelopes (task 3952)
 #
 # ONE definition of each of the three envelopes a mocked MCP server returns.
@@ -284,23 +377,43 @@ def mcp_notify_response() -> httpx.Response:
     return httpx.Response(202, headers={'mcp-session-id': MCP_SESSION_ID})
 
 
-def mcp_tool_response(inner: dict, request_id: int = 1) -> httpx.Response:
-    """A ``tools/call`` result carrying *inner* as JSON text content.
+def _tool_result_envelope(inner: dict, request_id: int) -> dict:
+    """The JSON-RPC ``tools/call`` result carrying *inner* as JSON text content.
 
     MCP nests the tool's own payload as a JSON *string* inside
     ``result.content[0].text``, so *inner* is serialized, not embedded — which
     is exactly the double-encoding the dashboard readers have to undo.
     """
+    return {
+        'jsonrpc': '2.0',
+        'id': request_id,
+        'result': {
+            'content': [{'type': 'text', 'text': json.dumps(inner)}],
+        },
+    }
+
+
+def mcp_tool_response(inner: dict, request_id: int = 1) -> httpx.Response:
+    """A ``tools/call`` result carrying *inner*, framed as a JSON body."""
     return httpx.Response(
         200,
-        json={
-            'jsonrpc': '2.0',
-            'id': request_id,
-            'result': {
-                'content': [{'type': 'text', 'text': json.dumps(inner)}],
-            },
-        },
+        json=_tool_result_envelope(inner, request_id),
         headers={'mcp-session-id': MCP_SESSION_ID},
+    )
+
+
+def mcp_sse_tool_response(inner: dict, request_id: int = 1) -> httpx.Response:
+    """The same ``tools/call`` result, framed as a Streamable-HTTP SSE body.
+
+    FastMCP may answer ``text/event-stream`` instead of ``application/json``;
+    the envelope inside the ``data:`` frame is identical to
+    :func:`mcp_tool_response`'s.
+    """
+    envelope = json.dumps(_tool_result_envelope(inner, request_id))
+    return httpx.Response(
+        200,
+        text=f'event: message\ndata: {envelope}\n\n',
+        headers={'content-type': 'text/event-stream', 'mcp-session-id': MCP_SESSION_ID},
     )
 
 
@@ -664,20 +777,6 @@ CREATE TABLE IF NOT EXISTS runs (
 CREATE INDEX IF NOT EXISTS idx_runs_project ON runs(project_id);
 CREATE INDEX IF NOT EXISTS idx_runs_started ON runs(started_at);
 
-CREATE TABLE IF NOT EXISTS journal_entries (
-    id TEXT PRIMARY KEY,
-    run_id TEXT NOT NULL,
-    stage TEXT,
-    timestamp TEXT NOT NULL,
-    operation TEXT NOT NULL,
-    target_system TEXT NOT NULL,
-    before_state TEXT,
-    after_state TEXT,
-    reasoning TEXT DEFAULT '',
-    evidence TEXT DEFAULT '[]'
-);
-CREATE INDEX IF NOT EXISTS idx_journal_run ON journal_entries(run_id);
-
 CREATE TABLE IF NOT EXISTS judge_verdicts (
     run_id TEXT PRIMARY KEY,
     reviewed_at TEXT NOT NULL,
@@ -783,6 +882,30 @@ async def make_recon_db(
         yield conn
 
 
+def node_path() -> str:
+    """The node binary: a skip locally, a failure under CI (CI carries node)."""
+    path = shutil.which('node')
+    if not path:
+        if os.environ.get('CI'):
+            pytest.fail('node is required in CI but not found on PATH')
+        pytest.skip('node not available')
+    return path
+
+
+def bug_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """Every captured WARNING a dashboard handler logs for its own bug, never an outage.
+
+    Matches the sentence ``dashboard/src/dashboard/api/tasks.py::_unknown_after_contract_break``,
+    ``dashboard/src/dashboard/api/tasks.py::_unknown_after_unexpected_error``
+    and the fan-out's catch-all in ``dashboard/src/dashboard/data/active_tasks.py``
+    all put in their message.
+    """
+    return [
+        record.getMessage() for record in caplog.records
+        if 'this is a BUG, not an outage' in record.getMessage()
+    ]
+
+
 # ---------------------------------------------------------------------------
 # JSX source slicing.
 #
@@ -826,6 +949,25 @@ class _JsSpan(NamedTuple):
     closed: bool
 
 
+def _string_literal_end(source: str, quote_at: int) -> tuple[int, bool]:
+    """Return ``(end, closed)`` for the literal whose opening quote is at *quote_at*.
+
+    ``end`` is exclusive and clamped to ``len(source)``; ``closed`` is False
+    when the source ran out first.  A backslash skips the next character, so
+    an escaped quote cannot close the literal.
+    """
+    quote = source[quote_at]
+    i, n = quote_at + 1, len(source)
+    while i < n:
+        if source[i] == '\\':
+            i += 2
+            continue
+        if source[i] == quote:
+            return i + 1, True
+        i += 1
+    return n, False
+
+
 def _scan_js(source: str) -> list[_JsSpan]:
     """Return the string-literal and comment spans of *source*, in order.
 
@@ -842,19 +984,9 @@ def _scan_js(source: str) -> list[_JsSpan]:
         ch = source[i]
 
         if ch in '\'"`':
-            start = i
-            i += 1
-            closed = False
-            while i < n:
-                if source[i] == '\\':  # an escaped char cannot close the literal
-                    i += 2
-                    continue
-                if source[i] == ch:
-                    i += 1
-                    closed = True
-                    break
-                i += 1
-            spans.append(_JsSpan(start, min(i, n), 'string', ch, closed))
+            end, closed = _string_literal_end(source, i)
+            spans.append(_JsSpan(i, end, 'string', ch, closed))
+            i = end
             continue
 
         if source[i : i + 2] == '//':
@@ -1131,13 +1263,13 @@ def strip_js_comments(source: str) -> str:
 # list they check against can never drift from what the files actually say.
 #
 # `destructure_bindings` returns (canonical, local) PAIRS, and each caller
-# projects the half it needs.  This is not fussiness — the three consumers it
-# replaces answer OPPOSITE questions over the identical line:
+# projects the half it needs.  This is not fussiness — its two DF_CHARTS
+# consumers answer OPPOSITE questions over the identical line:
 #   test_charts_consumer_bindings wants the LOCAL/alias name  — what the file
 #       must actually reference, since the alias is what it renders by;
-#   test_charts_axis_labels wants the CANONICAL/source name   — what must
-#       actually exist on the namespace object;
-#   test_tab_burndown wants BOTH, as an alias -> canonical map.
+#   test_tab_burndown wants BOTH, as an alias -> canonical map, plus the
+#       CANONICAL/source names of the export literal — what must actually
+#       exist on the namespace object.
 # On tabs.jsx's real `HistBar: HB` those are 'HB' and 'HistBar'.  A primitive
 # that picked one side would silently INVERT one of the two suites, which is
 # precisely the canonical-vs-alias slip test_charts_consumer_bindings.py
@@ -1157,10 +1289,11 @@ def strip_js_comments(source: str) -> str:
 #     object are not statically enumerable the way a destructure list is.  The
 #     defect these suites exist to catch can only exist in the destructure
 #     shape anyway.
-#   - A NESTED brace must fail loudly at the call site that names the coupling,
-#     rather than yield a half-read binding list that turns a downstream
-#     assertion red with an unrelated-looking message.  Three call sites turn
-#     the miss into a self-naming assertion for exactly that reason.
+#   - A NESTED brace must yield NO match rather than a half-read binding list:
+#     an empty result turns a downstream assertion red, where a half-read list
+#     would let a sweep go quietly wrong.  No call site names the coupling on
+#     that miss (test_tab_burndown.py's readers return an empty result), so the
+#     property is pinned in the contract below.
 #
 # Contract: test_jsx_source_helpers.py::TestDfChartsDestructure.
 # ---------------------------------------------------------------------------
@@ -1280,6 +1413,57 @@ def extract_df_data_block(src: str, key: str) -> str:
     if m is None:
         return ''
     return walk_balanced(src, m.end() - 1)  # m.end() - 1 is the opening `{`
+
+
+# ---------------------------------------------------------------------------
+# JSX opening-tag walk.
+#
+# Spans one opening tag, attributes included, so a probe can confine itself to
+# that element.  Contract: test_jsx_source_helpers.py::TestJsxOpenTagEnd.
+# ---------------------------------------------------------------------------
+
+
+def jsx_open_tag_end(src: str, start: int) -> int | None:
+    """Return the index JUST PAST the ``>`` closing the opening tag at *start*.
+
+    *start* must index the tag's ``<``, else ``ValueError``.  ``src[start:end]``
+    is the whole tag; ``src[end - 2:end] == '/>'`` tells a self-closing one.  A
+    ``<`` or ``>`` inside a ``{...}`` attribute expression or a string/template
+    literal does not end the tag.
+
+    ``None``, never a raise, when *start* begins no closed opening tag: it is
+    never closed, a literal is never terminated, a bare ``<`` opens at depth 0
+    first, or a ``}`` drives brace depth negative.
+
+    Not comment-aware (pass `strip_js_comments` output), and it shares
+    `_scan_js`'s lexer blind spots.
+    """
+    if src[start : start + 1] != '<':
+        raise ValueError(
+            f"jsx_open_tag_end: start={start} must index the tag's `<`, "
+            f'found {src[start : start + 1]!r}'
+        )
+    depth = 0
+    i = start + 1
+    while i < len(src):
+        c = src[i]
+        if c in '\'"`':
+            i, closed = _string_literal_end(src, i)
+            if not closed:
+                return None
+            continue
+        if c == '{':
+            depth += 1
+        elif c == '}':
+            depth -= 1
+            if depth < 0:
+                return None
+        elif depth == 0 and c == '>':
+            return i + 1
+        elif depth == 0 and c == '<':
+            return None
+        i += 1
+    return None
 
 
 # ---------------------------------------------------------------------------

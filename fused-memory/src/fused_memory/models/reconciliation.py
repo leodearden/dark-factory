@@ -18,6 +18,8 @@ class EventType(StrEnum):
     task_created = 'task_created'
     task_modified = 'task_modified'
     task_deleted = 'task_deleted'
+    deferral_restamped = 'deferral_restamped'
+    task_text_amended = 'task_text_amended'
 
 
 class EventSource(StrEnum):
@@ -34,6 +36,21 @@ class StageId(StrEnum):
     memory_consolidator = 'memory_consolidator'
     task_knowledge_sync = 'task_knowledge_sync'
     integrity_check = 'integrity_check'
+
+
+class StageAgentOutcome(StrEnum):
+    """What happened to a reconciliation stage's CLI agent."""
+
+    completed = 'completed'
+    """The CLI agent returned success."""
+    zero_output_timeout = 'zero_output_timeout'
+    """Killed before any assistant turn (``shared.cli_invoke.is_zero_output_timeout``)."""
+    timed_out = 'timed_out'
+    """Killed by a timeout after doing work, or with unknown progress."""
+    failed = 'failed'
+    """The agent exited unsuccessfully, or its invocation raised."""
+    not_launched = 'not_launched'
+    """The agent was never spawned."""
 
 
 class ReconciliationEvent(BaseModel):
@@ -79,23 +96,18 @@ class AssembledPayload:
     events: list  # list[ReconciliationEvent] — forward ref avoids circular
     context_items: dict[str, ContextItem] = field(default_factory=dict)
     total_tokens: int = 0
-    events_remaining: int = 0
-    effective_watermark: datetime | None = None
+    events_remaining: int = 0  # > 0 exactly when token_budget stopped the assembly
+    token_budget: int = 0
 
-
-class JournalEntry(BaseModel):
-    """One per reconciliation operation — full audit trail."""
-
-    id: str
-    run_id: str = ''
-    stage: StageId | None = None
-    timestamp: datetime
-    operation: str
-    target_system: str  # 'graphiti', 'mem0', 'taskmaster'
-    before_state: dict | None = None
-    after_state: dict | None = None
-    reasoning: str = ''
-    evidence: list[dict] = Field(default_factory=list)
+    def budget_report(self) -> dict[str, int]:
+        """How much of token_budget this chunk spent, and on how many events and context items."""
+        return {
+            'estimated_tokens': self.total_tokens,
+            'token_budget': self.token_budget,
+            'events': len(self.events),
+            'context_items': len(self.context_items),
+            'events_deferred': self.events_remaining,
+        }
 
 
 class StageReport(BaseModel):
@@ -108,6 +120,9 @@ class StageReport(BaseModel):
     stats: dict = Field(default_factory=dict)
     llm_calls: int = 0
     tokens_used: int = 0
+    # None = unrecorded (legacy journal rows, harness-synthesized reports); never
+    # read it as completed.
+    agent_outcome: StageAgentOutcome | None = None
 
 
 class RunType(StrEnum):
@@ -239,7 +254,12 @@ def _normalize_project_id(v: object, *, allow_empty: bool = False) -> object:
 
 
 class Watermark(BaseModel):
-    """Tracks what's been processed per project."""
+    """Tracks what's been processed per project.
+
+    The three ``*_timestamp`` fields are the lower bounds of the next cycle's data
+    windows, anchored at run start (why: tests/reconciliation/test_recon_window_anchor.py);
+    ``last_full_run_completed`` is the completion instant.
+    """
 
     project_id: str
     last_full_run_id: str | None = None
@@ -261,6 +281,35 @@ class VerdictSeverity(StrEnum):
     minor = 'minor'
     moderate = 'moderate'
     serious = 'serious'
+
+
+class FindingSeverity(StrEnum):
+    """Severity of a recon_report finding, in ascending order.
+
+    Distinct from ``VerdictSeverity`` (judge verdicts carry ``ok``) and from the
+    escalation-queue severities (info/blocking/critical/urgent).  "Present but
+    not automatically fixable" is ``actionable=False``, not a severity.
+    """
+
+    minor = 'minor'
+    moderate = 'moderate'
+    serious = 'serious'
+
+    @property
+    def gloss(self) -> str:
+        """What a finding of this severity is, as the stage prompts teach it."""
+        match self:
+            case FindingSeverity.minor:
+                return 'cosmetic mismatch'
+            case FindingSeverity.moderate:
+                return 'wrong information'
+            case FindingSeverity.serious:
+                return 'fundamentally contradictory state'
+
+
+# Derived from FindingSeverity; do not hand-declare elsewhere.
+FINDING_SEVERITY_VALUES: tuple[str, ...] = tuple(s.value for s in FindingSeverity)
+FINDING_SEVERITY_SET: frozenset[str] = frozenset(FINDING_SEVERITY_VALUES)
 
 
 class VerdictAction(StrEnum):

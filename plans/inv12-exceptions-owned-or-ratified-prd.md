@@ -661,3 +661,16 @@ mem0-update prefix configs;
    rewrites ≥144 marker-bearing lines.
 3. **Burn-down.** Confirm none is scheduled (D10), or name the owner.
 4. **Dead markers.** Run the `RUF100` autofix, or leave 1,499 grandfathered?
+
+## Appendix B — inline scanner design notes
+
+Rationale behind the inline scanner that no caller relies on and no test pins.
+A note lands here when it is moved out of the code; the scanner's docstrings
+still carry rationale that has not been moved, so a note's absence from this
+list says nothing about whether one exists. One bullet per note, each citing
+the symbol it explains.
+
+- `scripts/inline_suppression_refusal.py::InstrumentFailure` is one exception type for
+  every exit-2 cause, not one per cause. Splitting by cause would hand `main`
+  five `except` clauses that all do the same thing, and would let the stderr
+  prefix a log reader greps for differ between causes.

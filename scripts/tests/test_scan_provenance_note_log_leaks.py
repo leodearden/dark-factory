@@ -34,6 +34,7 @@ from scan_provenance_note_log_leaks import (
     format_report,
     scan_db,
 )
+from shared.tasks_db_readonly import TaskDbProblem, TaskDbUnreadable
 
 # The tasks-table schema and the fake-db builder live in scripts/tests/
 # conftest.py, behind the `make_tasks_db` fixture (task
@@ -384,6 +385,23 @@ class TestCli:
         assert '2902' in result.stdout
         assert 'corrupt.db' in result.stderr
         assert 'incomplete' in result.stderr
+
+    def test_a_skipped_stub_is_named_with_why_beside_a_polluted_store(
+        self, tmp_path, make_tasks_db
+    ):
+        """The EMPTY_STUB remedy itself quotes `no such table: tasks`, so this
+        rules out sqlite's raw error as the WARNING's reason, not the phrase."""
+        stub = tmp_path / 'stub.db'
+        stub.write_bytes(b'')
+        polluted = str(make_tasks_db(_MIXED_ROWS, name='polluted.db'))
+
+        result = _run_cli('--db', str(stub), '--db', polluted)
+
+        assert result.returncode == 1, result.stderr
+        assert '2902' in result.stdout
+        refusal = TaskDbUnreadable(stub.resolve(), TaskDbProblem.EMPTY_STUB)
+        assert str(refusal) in result.stderr
+        assert f'unreadable database {stub}: no such table' not in result.stderr
 
     def test_every_db_unreadable_exits_3_not_0(self, tmp_path):
         """EVERY resolved database failing to open is not a clean sweep.

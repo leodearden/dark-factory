@@ -1,6 +1,6 @@
-"""Phase-1 eval↔production integration gate — boundary suite B1–B9 (+ capstone).
+"""Phase-1 eval↔production integration gate — boundary suite B1–B10 (+ capstone).
 
-PRD eval-framework-revival §ι, Contract H, Boundary-test sketch B1–B9.
+PRD eval-framework-revival §ι, Contract H, Boundary-test sketch B1–B10.
 
 This is the "C-as-integration-gate" for the eval-framework-revival PRD: the
 two-way eval↔production seam test proving that the mechanisms delivered by the
@@ -16,6 +16,7 @@ REAL composed eval code paths against one refreshed fixture:
   - ``workflow._spawn_dry_run_unblock`` disabled early-return               (D4)
   - ``workflow.build_workflow`` single construction point               (α/P2)
   - ``metrics.compute_composite`` contract-agnostic scoring            (P4/B8)
+  - ``build_eval_orch_config`` ``strict_mcp_config`` vs the tracked ``.mcp.json`` (B10)
 
 Each B# faces BOTH sides of its seam: the production default AND the eval-side
 divergence, so the test proves the profile actually flips the behaviour rather
@@ -32,6 +33,7 @@ B# → mechanism map
   B7  no unblock spawn    ``_spawn_dry_run_unblock`` spawns 0 tasks with ``unblock_auto`` off
   B8  contract-agnostic   ``quality_from_review_artifact`` scores legacy == envelope shape
   B9  no claimant spam    a real eval ``Scheduler`` heartbeat logs zero warnings
+  B10 mcp isolation       eval config turns ``strict_mcp_config`` on against the live servers ``.mcp.json`` declares
 
 Why this suite is deterministic and CI-runnable (design decision)
 -----------------------------------------------------------------
@@ -76,15 +78,16 @@ via ``run_eval`` only when you want to capture the writes. See
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import subprocess
 from collections.abc import Callable, Coroutine
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
+from shared.cli_invoke import AgentResult
 from test_scheduler_dispatch_literal_tripwire import _dispatch_tool_literals
 from test_workflow_factory import (
     _CONSTRUCT_RE,
@@ -195,7 +198,7 @@ def committed_diff_fixture(tmp_path: Path) -> tuple[Path, str]:
 
 def _fake_invoke_agent(
     captured_prompts: list[str],
-) -> Callable[..., Coroutine[Any, Any, SimpleNamespace]]:
+) -> Callable[..., Coroutine[Any, Any, AgentResult]]:
     """Return an ``invoke_agent`` replacement that records prompts.
 
     Monkeypatch the returned coroutine over ``judge.invoke_agent`` (or
@@ -205,15 +208,17 @@ def _fake_invoke_agent(
     reads).  No real agent runs, so B4 grades the real committed diff for free.
     """
 
-    async def _fake(**kwargs: Any) -> SimpleNamespace:
+    async def _fake(**kwargs: Any) -> AgentResult:
         captured_prompts.append(str(kwargs.get('prompt', '')))
-        return SimpleNamespace(
+        return AgentResult(
+            success=True,
             structured_output={
                 'winner': 'A',
                 'confidence': 0.9,
                 'reasoning': 'canned boundary-suite verdict',
             },
             output='{"winner": "A", "confidence": 0.9, "reasoning": "r"}',
+            cost_usd=0.0,
         )
 
     return _fake
@@ -264,8 +269,8 @@ def test_b1_eval_profile_divergence_parity_and_tripwire(
 
     Exactness holds by construction: ``apply_eval_profile`` is a
     ``model_copy(update=)`` that changes exactly the profile leaves, and β
-    proves all 6 differ from their code defaults, so the divergence is
-    precisely the 6 documented keys — never more (a leak) or fewer (a no-op).
+    proves all 7 differ from their code defaults, so the divergence is
+    precisely the 7 documented keys — never more (a leak) or fewer (a no-op).
     """
     base = _load_default_config(tmp_path)
 
@@ -766,6 +771,36 @@ async def test_b9_set_task_claimant_heartbeat_no_warning(
         'set_task_claimant heartbeat emitted WARNING(s) (B9/D2 regression):\n'
         + '\n'.join(offenders)
     )
+
+
+# ── B10: eval agent MCP isolation (task 4757) ──────────────────────────────
+
+
+def test_b10_eval_agent_mcp_isolation_two_way(tmp_path: Path) -> None:
+    """B10 — eval agents are strictly MCP-scoped; production agents are not.
+
+    The premise: the tracked ``.mcp.json`` every eval worktree carries really
+    declares the live ``escalation`` and ``fused-memory`` servers, which the CLI
+    merges into any agent not run with ``--strict-mcp-config``. The two sides:
+    the deployed ``load_config()`` leaves ``strict_mcp_config`` off, and
+    ``build_eval_orch_config`` turns it on for the ``TaskWorkflow._invoke`` path.
+    What each eval spawn site then hands the argv builder is pinned in
+    ``test_eval_mcp_isolation.py``, which drives the real call sites.
+    """
+    ambient = json.loads(
+        (_orchestrator_src_root().parents[2] / '.mcp.json').read_text(),
+    )['mcpServers']
+    assert {'escalation', 'fused-memory'} <= set(ambient), (
+        f'tracked .mcp.json changed shape ({sorted(ambient)}); re-derive the '
+        'eval MCP isolation guard against the new ambient servers'
+    )
+
+    base = _load_default_config(tmp_path)
+    assert base.strict_mcp_config is False
+
+    cfg = EvalConfig(name='t', backend='claude', model='sonnet', effort='high')
+    task = {'id': 't', 'project_root': str(tmp_path)}
+    assert build_eval_orch_config(cfg, task, base).strict_mcp_config is True
 
 
 # ── Capstone: one refreshed fixture through the composed eval framework ─────

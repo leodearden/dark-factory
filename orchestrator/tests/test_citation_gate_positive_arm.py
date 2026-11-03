@@ -12,7 +12,7 @@ it trivially.  The gate can still fire POSITIVE there, because
 alternative, so a *sibling* task's landing commit whose subject mentions
 ``(#<TASK_ID>)`` satisfies it.  The fix stamps the CITING sha instead --
 byte-identical to what
-``escalation/src/escalation/server.py::_found_on_main_response`` returns
+``escalation/src/escalation/git_authority.py::found_on_main_response`` returns
 on the same evidence.
 
 This module pins that MECHANISM, not the runbooks' wording.  Both tests
@@ -57,6 +57,12 @@ as ``plans/found-on-main-provenance-integrity-prd.md`` label delta, a
 ``--max-count`` cap, a narrowed pattern -- the disagreement fails HERE,
 where the runbook edit that must follow is one file away, instead of both
 copies passing quietly while the behaviour this fix rests on has moved.
+
+Step 1's marker precondition is asserted through the real
+``GitOps.find_merge_marker`` only: the shell form an agent types is
+executed against production's rule by
+``tests/scripts/test_merge_marker_search_snippets.py``, so it is not
+transcribed here.
 
 ``GitOps`` is constructed directly from a default ``GitConfig``, the way
 ``orchestrator/tests/test_git_ops.py::TestFindTaskCitationCommit`` does
@@ -157,12 +163,10 @@ def _citation_walk(root: Path, tid: str) -> str | None:
     return None
 
 
-def _marker_search(root: Path, tid: str) -> str:
-    """Step 1's exact-subject merge-marker search (empty == no marker)."""
-    return _git(
-        root, 'log', 'main', '--fixed-strings',
-        f'--grep=Merge task/{tid} into main', '--max-count=1', '--format=%H',
-    )
+def _real_marker_search(root: Path, tid: str) -> str | None:
+    """Step 1's exact-subject marker search via the REAL `GitOps.find_merge_marker` (None == no marker)."""
+    git_ops = GitOps(GitConfig(main_branch='main', branch_prefix='task/'), root)
+    return asyncio.run(git_ops.find_merge_marker(f'task/{tid}', gate_on_existing_ref=False))
 
 
 def test_sibling_covered_phantom_branch_fires_the_gate_with_a_workless_tip(
@@ -197,8 +201,13 @@ def test_sibling_covered_phantom_branch_fires_the_gate_with_a_workless_tip(
         'if this stops holding, the rc=0 arm is no longer reachable in this state'
     )
 
-    # Step 1: no merge marker, so the ladder does not stop there.
-    assert _marker_search(root, TASK_ID) == '', (
+    # Step 1: no merge marker, so the ladder does not stop there.  The search
+    # finds 4700's marker in this same history, so its None is not a git failure.
+    assert _real_marker_search(root, '4700') == base, (
+        'positive control: find_merge_marker must find the `Merge task/4700 into main` '
+        'marker in this history, or its None for this task proves nothing'
+    )
+    assert _real_marker_search(root, TASK_ID) is None, (
         'expected no `Merge task/<ID> into main` marker on main for this task'
     )
 
@@ -244,7 +253,7 @@ def test_genuine_fast_forward_citing_commit_is_on_main_and_may_precede_the_tip(
     nothing.  It also shows the two shas diverge ordinarily -- a trailing
     non-citing commit on the branch is enough -- so a fix that preserved
     the tip form "just for real fast-forwards" would still disagree with
-    `escalation/src/escalation/server.py::_found_on_main_response`.
+    `escalation/src/escalation/git_authority.py::found_on_main_response`.
     """
     root = tmp_path / 'repo'
     _new_repo(root)

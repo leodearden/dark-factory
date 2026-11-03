@@ -3,11 +3,14 @@
 This is PRD §1 surface 3: the one surface in the flake subsystem an operator can run
 without wondering what it changed.  It aggregates the ledger written by task α
 (:mod:`orchestrator.flake_ledger`) into three outputs — open debt, per-test recurrence
-chains, and the three §5.6 health counters — and renders them as text.
+chains, and the three §5.6 health counters, gate-blind and systemic per call site — and
+renders them as text.
 
 BINDING CONTRACT — READ ONLY.  Nothing in this module opens debt, files a task,
 resolves anything, or escalates.  All ledger DATA comes from α's public READ API
-(``list_open_debt`` / ``read_occurrences`` / ``read_debt_many``); the only SQL of its
+(``list_open_debt`` / ``read_occurrences`` / ``read_debt_many`` / ``summarize_due`` /
+``read_call_sites_written``);
+the only SQL of its
 own is :func:`probe_ledger`'s single ``sqlite_master`` SELECT, which mutates strictly
 less than those readers do (no DDL, no journal-mode pragma).  One consequence is not
 obvious and is enforced by :func:`build_report`'s guards: α's readers PROVISION on read
@@ -42,20 +45,25 @@ echoes it — the same split as ``eval-list-fixtures`` →
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from orchestrator.flake_ledger import (
+    DUE_ITEM_STALE_AFTER,
+    DUE_ITEM_STALE_MINUTES,
     UNKNOWN_TEST_ID,
     DebtRow,
+    DueSummary,
     FlakeCallSite,
     FlakeOccurrenceRow,
     FlakeVerdict,
     list_open_debt,
+    read_call_sites_written,
     read_debt_many,
     read_occurrences,
+    summarize_due,
 )
 
 # --- PRD §10 defaults --------------------------------------------------------
@@ -87,46 +95,6 @@ DEFAULT_SYSTEMIC_WINDOW_MINUTES = 60
 # design — α's module docstring, §11 Q1).  A read that fills this limit is surfaced as
 # truncated rather than silently yielding a rate over an unknown window.
 DEFAULT_OCCURRENCE_READ_LIMIT = 20000
-
-# --- the merge-gate splice defect (task 5580) --------------------------------
-#
-# Until task 5580, `verify.confirm_isolated_rerun_verdict` built the merge gate's
-# isolated re-run as a STRING and a second rewrite re-parsed it, splicing `--junitxml`
-# between `--timeout` and its value.  pytest rejected the resulting argv
-# (rc=4, `argument --timeout: expected one argument`) before running a single test, and
-# the discriminator scored that rejection `fails_in_isolation`.  Such a row is a fact
-# about the command the gate rendered, not about the test it names.
-#
-# MEASURED on the live dark_factory ledger at 2026-09-20T01:24Z: the `merge_gate` call
-# site carried 357 `fails_in_isolation`, 4 `unconfirmable` and ZERO
-# `passes_in_isolation` over its entire history (2026-08-30T16:20Z -> 2026-09-19T20:43Z).
-# A gate that has never once cleared a test in three weeks was not discriminating.
-# (Task 5580's title says 350: that was the same population read 3 days earlier, still
-# growing because main runs the defective code until this lands.)
-#
-# The cutoff is the instant THIS FIX WAS AUTHORED.  What that buys is exact: no
-# observation stamped at or before it can have come from the fixed code, because the
-# fixed code did not exist yet.  The residual is real and is not papered over —
-# `merge_gate` rows observed between authoring and landing are still noise and are NOT
-# excluded.  That count is small and bounded by the merge lane's latency, whereas
-# pushing the cutoff past the fix would start discarding genuine reds, which is the one
-# direction the discriminator's doctrine forbids.
-#
-# SUNSET — 2026-09-27, one read window past the cutoff.  This whole cluster (the
-# constant, `_MERGE_GATE_SPLICE_DEFECT_END_AT`, `is_spliced_merge_gate_row`,
-# `FlakeLedgerReport.excluded_non_evidence`, `render_report`'s NOTE branch and
-# `TestSplicedMergeGateRowsAreNotEvidence`) is DELETABLE TOGETHER after that date, and
-# ticket tkt_0RTVQE7709R0J2GWDKAVWVWX53 asks for exactly that.  `build_report` windows
-# the occurrence read at `now - window_hours`, and its only production caller
-# (cli.py's `flake-ledger`) takes the DEFAULT_GATE_BLIND_WINDOW_HOURS=168h default — so
-# from 2026-09-27T01:24Z no report an operator can run reaches a row stamped at or
-# before the cutoff: the predicate can never return True again, the count is always 0
-# and the NOTE never renders.  Stated here rather than left to be inferred from the
-# window constant, because a filter whose horizon has silently passed is the same
-# not-quite-lying machinery this module exists to keep out of a report.  It is a DATE
-# and not an assert because a caller passing a wider `window_hours` can still reach
-# those rows, and for such a caller the exclusion is still correct.
-MERGE_GATE_SPLICE_DEFECT_END = '2026-09-20T01:24:27+00:00'
 
 
 # --- ledger reachability -----------------------------------------------------
@@ -214,42 +182,6 @@ def _parse_stamp(raw: str | None) -> datetime | None:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=UTC)
     return parsed.astimezone(UTC)
-
-
-#: :data:`MERGE_GATE_SPLICE_DEFECT_END` parsed ONCE, at import.  The predicate below
-#: runs on every occurrence of every report and the row count is the ledger's, not
-#: ours, so the parse does not belong inside it.  ``None`` only if the constant itself
-#: were malformed, which the predicate reads as "exclude nothing" — the safe direction,
-#: since it keeps every row as evidence.
-_MERGE_GATE_SPLICE_DEFECT_END_AT = _parse_stamp(MERGE_GATE_SPLICE_DEFECT_END)
-
-
-def is_spliced_merge_gate_row(row: FlakeOccurrenceRow) -> bool:
-    """True for an occurrence the merge-gate splice defect manufactured — see
-    :data:`MERGE_GATE_SPLICE_DEFECT_END`.
-
-    The ONE place the rule is written, so the count an operator is shown and the rows
-    the counters never see can never be two different sets (INV-5).
-
-    Narrow on every axis, because each one is what the defect could actually reach.
-    ``main_probe`` is excluded on evidence, not caution: its engine passes
-    ``role='task'``, so no junit path was ever computed and the second rewrite never
-    happened there.  Only ``fails_in_isolation`` is excluded, because that is the
-    verdict a rejected command produced — the rejection classified as an unknown test
-    failure, which is not infra-transient, so it became a confirmed red.  And a row
-    whose ``observed_at`` will not parse is KEPT: an unreadable clock does not place a
-    row before the fix, and degrading a parse failure into a deletion is the silent
-    data loss this module exists to refuse.
-    """
-    if row.call_site != FlakeCallSite.merge_gate:
-        return False
-    if row.verdict != FlakeVerdict.fails_in_isolation:
-        return False
-    observed = _parse_stamp(row.observed_at)
-    cutoff = _MERGE_GATE_SPLICE_DEFECT_END_AT
-    # INCLUSIVE at the bound: the cutoff is the authoring instant, so a row stamped
-    # exactly at it still predates the fixed code.
-    return observed is not None and cutoff is not None and observed <= cutoff
 
 
 def format_age(delta: timedelta | None) -> str:
@@ -664,10 +596,13 @@ def build_chains(
 
 @dataclass(frozen=True)
 class DebtReportRow:
-    """One open debt row plus its computed age (``None`` when ``opened_at`` won't parse)."""
+    """One open debt row plus its computed age (``None`` when ``opened_at`` won't parse),
+    and, when its test has items on the due list, the oldest item's ``enqueued_at``: the
+    owner filing is pending, not missing."""
 
     debt: DebtRow
     age: timedelta | None
+    pending_since: str | None = None
 
 
 @dataclass(frozen=True)
@@ -679,17 +614,15 @@ class FlakeLedgerReport:
     read, so reading an absent DB would hand back an empty result set from a database
     this report had just created.
 
+    The gate-blind and systemic counters are keyed by STORED ``call_site`` string, one
+    entry for every :class:`FlakeCallSite` member and for any other spelling in the
+    window, so a lane row can never move the merge gate's numbers.
+
     ``db_status`` carries the same distinction one layer down, for a file that IS present
     (see :func:`probe_ledger`).  :attr:`measured` is the single predicate every consumer
     should ask — including task θ, which must not act on counters that were never read.
     It defaults to :data:`LEDGER_OK` so a hand-built report (the render tests build them
     directly) means what it looks like it means.
-
-    ``excluded_non_evidence`` counts the rows :func:`is_spliced_merge_gate_row` kept out
-    of every counter below.  It is carried rather than discarded because an exclusion an
-    operator cannot see is a lie by omission — the same rule the ``truncated`` and
-    ``unparseable_opened_at`` caveats already follow.  It defaults to ``0`` for the same
-    reason ``db_status`` defaults: a hand-built report must mean what it looks like.
     """
 
     db_path: Path
@@ -698,16 +631,80 @@ class FlakeLedgerReport:
     window_since: str | None
     open_debt: list[DebtReportRow]
     chains: list[ChainRow]
-    gate_blind: GateBlindCounter
+    gate_blind_by_call_site: Mapping[str, GateBlindCounter]
     non_convergence: NonConvergenceCounter
-    systemic: SystemicCounter
+    systemic_by_call_site: Mapping[str, SystemicCounter]
     db_status: str = LEDGER_OK
-    excluded_non_evidence: int = 0
+    due: DueSummary | None = None
+    # Every call site that has EVER written a row; None = not read, so no
+    # never-written claim is made.
+    call_sites_written: frozenset[str] | None = None
+
+    def __post_init__(self) -> None:
+        gate_blind, systemic = set(self.gate_blind_by_call_site), set(self.systemic_by_call_site)
+        if gate_blind != systemic or FlakeCallSite.merge_gate.value not in gate_blind:
+            raise ValueError(
+                'the per-call-site counters must share one key set that includes '
+                f'merge_gate; gate-blind keys {sorted(gate_blind)}, systemic keys '
+                f'{sorted(systemic)}'
+            )
 
     @property
     def measured(self) -> bool:
         """True only when the counters are an actual reading of an actual ledger."""
         return self.db_present and self.db_status == LEDGER_OK
+
+
+def _group_by_call_site(
+    occurrences: Sequence[FlakeOccurrenceRow],
+) -> dict[str, list[FlakeOccurrenceRow]]:
+    """*occurrences* by their STORED ``call_site``, uncoerced, so an off-vocabulary
+    spelling stays visible under its own key instead of folding into a member."""
+    groups: dict[str, list[FlakeOccurrenceRow]] = {}
+    for row in occurrences:
+        groups.setdefault(row.call_site, []).append(row)
+    return groups
+
+
+def _call_site_keys(groups: Mapping[str, object]) -> list[str]:
+    """The one spelling of the counters' key universe: every member, plus any other
+    stored spelling, sorted."""
+    return sorted({m.value for m in FlakeCallSite} | groups.keys())
+
+
+def _counters_by_call_site(
+    occurrences: Sequence[FlakeOccurrenceRow],
+    *,
+    truncated: bool,
+    window_hours: int,
+    gate_blind_threshold: float,
+    gate_blind_min_observations: int,
+    systemic_distinct_tests: int,
+    systemic_window_minutes: int,
+) -> tuple[dict[str, GateBlindCounter], dict[str, SystemicCounter]]:
+    """The gate-blind and systemic counters, computed once per call site over its own
+    rows (an empty group for a call site with none in the window)."""
+    groups = _group_by_call_site(occurrences)
+    keys = _call_site_keys(groups)
+    gate_blind = {
+        key: compute_gate_blind(
+            groups.get(key, []),
+            threshold=gate_blind_threshold,
+            min_observations=gate_blind_min_observations,
+            window_hours=window_hours,
+            truncated=truncated,
+        )
+        for key in keys
+    }
+    systemic = {
+        key: compute_systemic(
+            groups.get(key, []),
+            distinct_tests=systemic_distinct_tests,
+            window_minutes=systemic_window_minutes,
+        )
+        for key in keys
+    }
+    return gate_blind, systemic
 
 
 def _unmeasured_report(
@@ -729,6 +726,15 @@ def _unmeasured_report(
     threshold the operator is being measured against stays visible, and
     :attr:`FlakeLedgerReport.measured` is what says the numbers are not a reading.
     """
+    gate_blind, systemic = _counters_by_call_site(
+        [],
+        truncated=False,
+        window_hours=window_hours,
+        gate_blind_threshold=gate_blind_threshold,
+        gate_blind_min_observations=gate_blind_min_observations,
+        systemic_distinct_tests=systemic_distinct_tests,
+        systemic_window_minutes=systemic_window_minutes,
+    )
     return FlakeLedgerReport(
         db_path=db_path,
         db_present=db_present,
@@ -737,18 +743,9 @@ def _unmeasured_report(
         window_since=None,
         open_debt=[],
         chains=[],
-        gate_blind=compute_gate_blind(
-            [],
-            threshold=gate_blind_threshold,
-            min_observations=gate_blind_min_observations,
-            window_hours=window_hours,
-        ),
+        gate_blind_by_call_site=gate_blind,
         non_convergence=compute_non_convergence([], now, age_days=age_days),
-        systemic=compute_systemic(
-            [],
-            distinct_tests=systemic_distinct_tests,
-            window_minutes=systemic_window_minutes,
-        ),
+        systemic_by_call_site=systemic,
     )
 
 
@@ -767,7 +764,8 @@ def build_report(
     """Read the ledger at *db_path* and aggregate it into a :class:`FlakeLedgerReport`.
 
     All ledger DATA comes from α's public read API — ``list_open_debt`` /
-    ``read_occurrences`` / ``read_debt_many``; the only SQL of this module's own is
+    ``read_occurrences`` / ``read_debt_many`` / ``summarize_due`` /
+    ``read_call_sites_written``; the only SQL of this module's own is
     :func:`probe_ledger`'s ``sqlite_master`` SELECT, which decides whether those readers
     are safe to call at all.  *now* defaults to the wall clock and is injectable so the
     whole report is deterministic under test.
@@ -832,19 +830,19 @@ def build_report(
 
     since = (now - timedelta(hours=window_hours)).isoformat()
     open_rows = list_open_debt(db_path)
-    read_rows = read_occurrences(db_path, since=since, limit=occurrence_limit)
-    # `truncated` is a property of the READ, so it is measured before the partition:
-    # a filled limit means the window is partial no matter what was later excluded.
-    truncated = len(read_rows) >= occurrence_limit
-
-    # Partitioned ONCE, here, so every counter downstream takes its input as given and
-    # not one of them learns about this defect (task 5580).  The rows stay in the
-    # ledger: `flake_occurrence` is append-only by contract and these rows are a TRUE
-    # record of what the gate emitted — including the only surviving evidence of the
-    # defect's reach.  What is false is reading them as verdicts about the code, and
-    # that is a reporting question, so it is answered in the reporting layer.
-    occurrences = [row for row in read_rows if not is_spliced_merge_gate_row(row)]
-    excluded_non_evidence = len(read_rows) - len(occurrences)
+    due = summarize_due(db_path, stale_before=now - DUE_ITEM_STALE_AFTER)
+    pending_since = {} if due is None else due.pending_since
+    occurrences = read_occurrences(db_path, since=since, limit=occurrence_limit)
+    truncated = len(occurrences) >= occurrence_limit
+    gate_blind, systemic = _counters_by_call_site(
+        occurrences,
+        truncated=truncated,
+        window_hours=window_hours,
+        gate_blind_threshold=gate_blind_threshold,
+        gate_blind_min_observations=gate_blind_min_observations,
+        systemic_distinct_tests=systemic_distinct_tests,
+        systemic_window_minutes=systemic_window_minutes,
+    )
 
     # The chain build reads debt for every test in the universe, and it must cost a
     # CONSTANT number of ledger connections rather than one per test: each `read_debt`
@@ -876,6 +874,7 @@ def build_report(
         DebtReportRow(
             debt=row,
             age=(now - opened) if (opened := _parse_stamp(row.opened_at)) is not None else None,
+            pending_since=pending_since.get(row.test_id),
         )
         for row in open_rows
     ]
@@ -887,24 +886,90 @@ def build_report(
         window_since=since,
         open_debt=open_debt,
         chains=build_chains(occurrences, open_rows, _debt_lookup),
-        gate_blind=compute_gate_blind(
-            occurrences,
-            threshold=gate_blind_threshold,
-            min_observations=gate_blind_min_observations,
-            window_hours=window_hours,
-            truncated=truncated,
-        ),
+        gate_blind_by_call_site=gate_blind,
         non_convergence=compute_non_convergence(open_rows, now, age_days=age_days),
-        systemic=compute_systemic(
-            occurrences,
-            distinct_tests=systemic_distinct_tests,
-            window_minutes=systemic_window_minutes,
-        ),
-        excluded_non_evidence=excluded_non_evidence,
+        systemic_by_call_site=systemic,
+        due=due,
+        call_sites_written=read_call_sites_written(db_path),
     )
 
 
 # --- rendering ---------------------------------------------------------------
+
+
+def _due_line(report: FlakeLedgerReport) -> str:
+    """The due list's size and its oldest item's age, flagged once that item is past the
+    stale bound (the drain's escalation reads the same bound)."""
+    due = report.due
+    if not report.measured:
+        return 'due list: not measured'
+    if due is None:
+        return 'due list: UNREADABLE'
+    if due.oldest is None:
+        return 'due list: empty'
+    enqueued = _parse_stamp(due.oldest.enqueued_at)
+    age = None if enqueued is None else report.generated_at - enqueued
+    past = f' — PAST THE {DUE_ITEM_STALE_MINUTES}-MINUTE BOUND' if due.stale else ''
+    return (
+        f'due list: {due.size} item(s), oldest enqueued {due.oldest.enqueued_at} '
+        f'(age {format_age(age)}){past}'
+    )
+
+
+_NEVER_WRITTEN = 'no rows ever written from this call site'
+
+
+def _gate_blind_lines(gb: GateBlindCounter, *, measured: bool) -> list[str]:
+    lines = [f'    gate blind (class 1, {gb.window_hours}h window):']
+    if not gb.total:
+        lines.append('        no occurrences in window')
+    # `n/a`, never `0.00`: α warns that a zero-row answer "reads as healthy rather than
+    # as a broken query", and "we cannot tell" must not print as "the gate is fine".
+    rate_txt = 'n/a' if gb.rate is None else f'{gb.rate:.2f}'
+    lines.append(
+        f'        unconfirmable rate: {rate_txt}  '
+        f'({gb.unconfirmable} unconfirmable / {gb.total} observations)  '
+        f'threshold={gb.threshold:.2f}'
+    )
+    if not measured:
+        # `ok` is a claim about the ledger, and there is no ledger reading to make it
+        # from.  Saying "not measured" is the whole point of the guards in build_report.
+        lines.append('        status: not measured (no ledger reading)')
+    elif not gb.sufficient:
+        # DISTINCT from "below threshold": those two states mean opposite things.
+        lines.append(
+            f'        status: insufficient observations '
+            f'(need {gb.min_observations}, have {gb.total})'
+        )
+    else:
+        lines.append(f'        status: {"OVER THRESHOLD" if gb.exceeds_threshold else "ok"}')
+    return lines
+
+
+def _systemic_lines(sy: SystemicCounter, *, measured: bool) -> list[str]:
+    psi_txt = 'n/a' if sy.peak_window_psi is None else f'{sy.peak_window_psi:.1f}'
+    status = (
+        'not measured (no ledger reading)' if not measured
+        else 'OVER THRESHOLD' if sy.exceeds_threshold else 'ok'
+    )
+    return [
+        f'    systemic (class 3, {sy.window_minutes}m window):',
+        f'        peak distinct tests: {sy.peak_distinct_tests}  threshold={sy.threshold}  '
+        f'peak_window_start={sy.peak_window_start or "-"}  peak_psi_cpu_some10={psi_txt}',
+        f'        status: {status}',
+    ]
+
+
+def _call_site_block(report: FlakeLedgerReport, call_site: str) -> list[str]:
+    """One call site's counters; a measured call site that has never written a row says
+    so, which is a different fact from having no rows in the window."""
+    lines = [f'  call site {call_site}:']
+    written = report.call_sites_written
+    if report.measured and written is not None and call_site not in written:
+        return [*lines, f'    {_NEVER_WRITTEN}']
+    lines += _gate_blind_lines(report.gate_blind_by_call_site[call_site], measured=report.measured)
+    lines += _systemic_lines(report.systemic_by_call_site[call_site], measured=report.measured)
+    return lines
 
 
 def render_report(report: FlakeLedgerReport) -> str:
@@ -916,7 +981,7 @@ def render_report(report: FlakeLedgerReport) -> str:
     ``format_stratification_table``'s determinism property.  No ``click`` import: this
     returns a string and the CLI only echoes it.
     """
-    gb, nc, sy = report.gate_blind, report.non_convergence, report.systemic
+    nc = report.non_convergence
     lines: list[str] = [
         f'flake ledger: {report.db_path}',
         f'generated_at: {report.generated_at.isoformat()}',
@@ -941,7 +1006,7 @@ def render_report(report: FlakeLedgerReport) -> str:
         )
     else:
         lines.append(f'window since: {report.window_since}')
-    if gb.truncated:
+    if any(c.truncated for c in report.gate_blind_by_call_site.values()):
         # α's read_occurrences docstring: a count over a limit-capped read is a count
         # over an unknown window, and dividing by it is meaningless.  The counters are
         # still printed — a bounded read is better than an unbounded one — but they are
@@ -950,17 +1015,7 @@ def render_report(report: FlakeLedgerReport) -> str:
             '  WARNING: the occurrence read was TRUNCATED at its limit — the counters '
             'below cover a PARTIAL window, not the full one.'
         )
-    if report.excluded_non_evidence:
-        # Fixed position (with the other read caveats, ahead of section 1) so the render
-        # stays byte-deterministic, and silent for a zero count so no report that has
-        # nothing to declare grows a line.  Count, cutoff and CAUSE on one line: a count
-        # whose reason an operator has to go and look up is not actionable.
-        lines.append(
-            f'  NOTE: {report.excluded_non_evidence} merge_gate observation(s) stamped at '
-            f'or before {MERGE_GATE_SPLICE_DEFECT_END} are EXCLUDED from every counter '
-            'below — the isolated re-run died on a pytest usage error without running a '
-            'test, so they are not evidence about any test (task 5580).'
-        )
+    lines.append(_due_line(report))
 
     # --- section 1: open debt ---
     lines += ['', 'OPEN DEBT', '-' * 60]
@@ -972,8 +1027,14 @@ def render_report(report: FlakeLedgerReport) -> str:
         # the single most consequential state this report can encounter: suppression
         # LANDS the merge (§5.7), so an unowned debt row means a flaky test is silently
         # no longer blocking anything and nobody owns fixing it.  Naming it loudly is a
-        # READ of the ledger — ι files nothing.
-        owner = f'owner={d.owner_task_id}' if d.owner_task_id else '*** NO OWNER (invariant breach) ***'
+        # READ of the ledger — ι files nothing.  An item on the due list for the test
+        # means the drain has not filed the owner YET, which is expected, not a breach.
+        if d.owner_task_id:
+            owner = f'owner={d.owner_task_id}'
+        elif row.pending_since is not None:
+            owner = f'filing pending since {row.pending_since}'
+        else:
+            owner = '*** NO OWNER (invariant breach) ***'
         # Same predicate the `over_age=N` summary below counts with — never a second
         # spelling of the comparison (INV-5).
         over = ' OVER-AGE' if _is_over_age(row.age, nc.age_threshold_days) else ''
@@ -1009,29 +1070,8 @@ def render_report(report: FlakeLedgerReport) -> str:
 
     # --- section 3: health counters ---
     lines += ['', 'HEALTH COUNTERS', '-' * 60]
-    lines.append(f'  gate blind (class 1, {gb.window_hours}h window):')
-    if not gb.total:
-        lines.append('      no occurrences in window')
-    # `n/a`, never `0.00`: α warns that a zero-row answer "reads as healthy rather than
-    # as a broken query", and "we cannot tell" must not print as "the gate is fine".
-    rate_txt = 'n/a' if gb.rate is None else f'{gb.rate:.2f}'
-    lines.append(
-        f'      unconfirmable rate: {rate_txt}  '
-        f'({gb.unconfirmable} unconfirmable / {gb.total} observations)  '
-        f'threshold={gb.threshold:.2f}'
-    )
-    if not report.measured:
-        # `ok` is a claim about the ledger, and there is no ledger reading to make it
-        # from.  Saying "not measured" is the whole point of the guards in build_report.
-        lines.append('      status: not measured (no ledger reading)')
-    elif not gb.sufficient:
-        # DISTINCT from "below threshold": those two states mean opposite things.
-        lines.append(
-            f'      status: insufficient observations '
-            f'(need {gb.min_observations}, have {gb.total})'
-        )
-    else:
-        lines.append(f'      status: {"OVER THRESHOLD" if gb.exceeds_threshold else "ok"}')
+    for call_site in sorted(report.gate_blind_by_call_site):
+        lines += _call_site_block(report, call_site)
 
     lines.append(f'  non-convergence (class 2, age backstop {nc.age_threshold_days}d):')
     lines.append(
@@ -1051,16 +1091,5 @@ def render_report(report: FlakeLedgerReport) -> str:
             f'      WARNING: {nc.future_dated} row(s) are FUTURE-DATED (opened_at is '
             'ahead of now — clock skew) and can never reach the age backstop'
         )
-
-    lines.append(f'  systemic (class 3, {sy.window_minutes}m window):')
-    psi_txt = 'n/a' if sy.peak_window_psi is None else f'{sy.peak_window_psi:.1f}'
-    lines.append(
-        f'      peak distinct tests: {sy.peak_distinct_tests}  threshold={sy.threshold}  '
-        f'peak_window_start={sy.peak_window_start or "-"}  peak_psi_cpu_some10={psi_txt}'
-    )
-    if not report.measured:
-        lines.append('      status: not measured (no ledger reading)')
-    else:
-        lines.append(f'      status: {"OVER THRESHOLD" if sy.exceeds_threshold else "ok"}')
 
     return '\n'.join(lines)

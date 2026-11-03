@@ -211,3 +211,139 @@ class TestMem0HalfCarriesTheTag:
         metadata = service.mem0.add.call_args[1]['metadata']
         # Absent, not present-and-False: no existing record shape changes.
         assert 'unverified_claim' not in metadata
+
+
+class TestAddMemoryCarriesTheFlag:
+    """`MemoryService.add_memory`'s `unverified_claim` parameter (task 4715):
+    the tag lands on whichever store(s) the write reaches."""
+
+    @pytest.mark.asyncio
+    async def test_graph_bound_write_carries_the_flag_on_the_queue_payload(self, service):
+        await service.add_memory(
+            content='task 5422 has been applied',
+            category='decisions_and_rationale',
+            project_id='dark_factory',
+            unverified_claim=True,
+        )
+
+        call = service.durable_queue.enqueue.call_args[1]
+        assert call['operation'] == 'add_memory_graphiti'
+        assert call['payload']['unverified_claim'] is True
+
+    @pytest.mark.asyncio
+    async def test_graph_bound_default_is_false_on_the_payload(self, service):
+        await service.add_memory(
+            content='task 5422 has been applied',
+            category='decisions_and_rationale',
+            project_id='dark_factory',
+        )
+
+        payload = service.durable_queue.enqueue.call_args[1]['payload']
+        assert payload['unverified_claim'] is False
+
+    @pytest.mark.asyncio
+    async def test_the_flag_survives_the_queue_round_trip(self, service):
+        await service.add_memory(
+            content='task 5422 has been applied',
+            category='decisions_and_rationale',
+            project_id='dark_factory',
+            unverified_claim=True,
+        )
+        payload = service.durable_queue.enqueue.call_args[1]['payload']
+
+        await service._execute_graphiti_write('add_memory_graphiti', payload)
+
+        assert service.graphiti.add_episode.call_args.kwargs['unverified_claim'] is True
+
+    @pytest.mark.asyncio
+    async def test_mem0_bound_write_stamps_the_record(self, service):
+        await service.add_memory(
+            content='task 5422 has been applied',
+            category='procedural_knowledge',
+            project_id='dark_factory',
+            unverified_claim=True,
+        )
+
+        metadata = service.mem0.add.call_args.kwargs['metadata']
+        assert metadata['unverified_claim'] is True
+
+    @pytest.mark.asyncio
+    async def test_untagged_mem0_record_carries_no_key(self, service):
+        await service.add_memory(
+            content='task 5422 has been applied',
+            category='procedural_knowledge',
+            project_id='dark_factory',
+        )
+
+        metadata = service.mem0.add.call_args.kwargs['metadata']
+        # Absent, not present-and-False: no existing record shape changes.
+        assert 'unverified_claim' not in metadata
+
+    @pytest.mark.asyncio
+    async def test_dual_write_tags_both_legs(self, service):
+        await service.add_memory(
+            content='task 5422 has been applied',
+            category='decisions_and_rationale',
+            project_id='dark_factory',
+            dual_write=True,
+            unverified_claim=True,
+        )
+
+        payload = service.durable_queue.enqueue.call_args[1]['payload']
+        assert payload['unverified_claim'] is True
+        metadata = service.mem0.add.call_args.kwargs['metadata']
+        assert metadata['unverified_claim'] is True
+
+
+class TestOnlyTheGateWritesTheTag:
+    """`unverified_claim` is SERVER-stamped, like `category`: registering it in
+    `SERVER_STAMPED_KEYS` silences the unknown-key census for it, so the write
+    seam must be what stops a caller forging it, or persisting it as False on
+    an untagged record (task 4715)."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('supplied', [True, False])
+    async def test_a_caller_supplied_value_is_discarded(self, service, supplied):
+        await service.add_memory(
+            content='renamed the helper for clarity',
+            category='procedural_knowledge',
+            project_id='dark_factory',
+            metadata={'unverified_claim': supplied},
+        )
+
+        metadata = service.mem0.add.call_args.kwargs['metadata']
+        assert 'unverified_claim' not in metadata, (
+            f'caller-supplied {supplied!r} reached the record: {metadata!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_caller_supplied_false_cannot_untag_a_flagged_write(self, service):
+        await service.add_memory(
+            content='task 5422 has been applied',
+            category='procedural_knowledge',
+            project_id='dark_factory',
+            metadata={'unverified_claim': False},
+            unverified_claim=True,
+        )
+
+        metadata = service.mem0.add.call_args.kwargs['metadata']
+        assert metadata['unverified_claim'] is True
+
+    @pytest.mark.asyncio
+    async def test_the_system_record_seam_discards_it_too(self, service):
+        # add_system_record shares add_memory's metadata validator, so the
+        # server-stamped registration silenced the census on this seam as well.
+        service.mem0.add_system_record = AsyncMock(
+            return_value={'results': [{'id': 'mem0-sys-1'}]},
+        )
+
+        await service.add_system_record(
+            content='cycle summary',
+            project_id='dark_factory',
+            agent_id='recon-stage-task_knowledge_sync',
+            category='observations_and_summaries',
+            metadata={'unverified_claim': True},
+        )
+
+        metadata = service.mem0.add_system_record.call_args.kwargs['metadata']
+        assert 'unverified_claim' not in metadata, f'{metadata!r}'

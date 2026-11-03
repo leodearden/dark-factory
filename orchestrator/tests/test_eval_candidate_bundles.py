@@ -1,15 +1,16 @@
 """Tests for ν's Claude-format-endpoint candidate bundles (task 2479).
 
-Non-incumbent (MiniMax M2.5, GLM-5.2, DeepSeek V4, Kimi) + native-cloud
-incumbent (Opus/Sonnet) bundles, each a (harness, model) ``EvalConfig``
+Non-incumbent (MiniMax M3, GLM-5.3, GLM-5.3-Flash, DeepSeek V4, Kimi) +
+native-cloud incumbent (Opus/Sonnet) bundles, each a (harness, model) ``EvalConfig``
 dispatched via Claude Code against a provider's official Anthropic-format
 endpoint (PRD C5: per-role ``ANTHROPIC_BASE_URL``/``ANTHROPIC_AUTH_TOKEN``).
 
 Runtime-behaviour tests only: roster/shape, endpoint+auth env contract,
-price-table coverage + λ's ``resolve_cost_usd`` -> ``'price_table'``, and
+price-table coverage + λ's ``resolve_cost_usd`` -> ``'price_table'``,
 ``get_config_by_name`` resolution + ``build_eval_orch_config`` endpoint
-propagation. The env-forwarding wiring itself is already covered by task
-2460's ``test_workflow_e2e.py``, and the μ OFAT/matrix driver by task 2478's
+propagation, and a literal pin of the dated slate (task 5384). The
+env-forwarding wiring itself is already covered by task 2460's
+``test_workflow_e2e.py``, and the μ OFAT/matrix driver by task 2478's
 ``test_eval_driver*.py`` — this module does not re-test either.
 
 Per-test local imports (the ``test_eval_driver_configs.py`` convention) so an
@@ -17,6 +18,31 @@ absent symbol fails the one test that needs it, not collection of the file.
 """
 
 from __future__ import annotations
+
+import pytest
+
+# The endpoint slate as LITERALS, pinned by task 5384 and extended by task
+# 7991, deliberately not read from the ``*_MODEL`` constants: a pin that reads
+# what it protects guards nothing (INV-10).
+_SLATE_MODELS_BY_NAME = {
+    'minimax-m3-endpoint': 'MiniMax-M3',
+    'glm-5.3-endpoint': 'glm-5.3',
+    'glm-5.3-flash-endpoint': 'glm-5.3-flash',
+    'deepseek-v4-endpoint': 'deepseek-v4',
+    'kimi-endpoint': 'kimi-latest',
+    'mimo-v2.6-pro-endpoint': 'mimo-v2.6-pro',
+    'mimo-v2.6-flash-endpoint': 'mimo-v2.6-flash',
+}
+# (model, input_per_1m, output_per_1m) list prices, USD per 1M tokens.
+_SLATE_LIST_PRICES = [
+    ('MiniMax-M3', 0.30, 1.20),
+    ('glm-5.3', 1.40, 4.40),
+    ('glm-5.3-flash', 0.15, 0.50),
+    ('deepseek-v4', 0.28, 0.42),
+    ('kimi-latest', 0.60, 2.50),
+    ('mimo-v2.6-pro', 0.435, 0.87),
+    ('mimo-v2.6-flash', 0.14, 0.28),
+]
 
 
 class TestClaudeEndpointCandidatesRoster:
@@ -54,22 +80,26 @@ class TestClaudeEndpointCandidatesRoster:
         matrix, are explicitly out of scope for this task."""
         from orchestrator.evals.configs import (
             DEEPSEEK_MODEL,
+            GLM_FLASH_MODEL,
             GLM_MODEL,
             KIMI_MODEL,
             MINIMAX_MODEL,
             claude_endpoint_candidates,
         )
 
-        non_incumbent_models = {MINIMAX_MODEL, GLM_MODEL, DEEPSEEK_MODEL, KIMI_MODEL}
+        non_incumbent_models = {
+            MINIMAX_MODEL, GLM_MODEL, GLM_FLASH_MODEL, DEEPSEEK_MODEL, KIMI_MODEL,
+        }
         non_incumbents = [
             c for c in claude_endpoint_candidates() if c.model in non_incumbent_models
         ]
         assert non_incumbents
         assert all(c.role == 'implementer' for c in non_incumbents)
 
-    def test_includes_the_four_non_incumbent_models(self):
+    def test_includes_the_five_non_incumbent_models(self):
         from orchestrator.evals.configs import (
             DEEPSEEK_MODEL,
+            GLM_FLASH_MODEL,
             GLM_MODEL,
             KIMI_MODEL,
             MINIMAX_MODEL,
@@ -79,6 +109,7 @@ class TestClaudeEndpointCandidatesRoster:
         models = {c.model for c in claude_endpoint_candidates()}
         assert MINIMAX_MODEL in models
         assert GLM_MODEL in models
+        assert GLM_FLASH_MODEL in models
         assert DEEPSEEK_MODEL in models
         assert KIMI_MODEL in models
 
@@ -102,13 +133,16 @@ class TestEndpointAuthEnvContract:
     def _non_incumbents(self):
         from orchestrator.evals.configs import (
             DEEPSEEK_MODEL,
+            GLM_FLASH_MODEL,
             GLM_MODEL,
             KIMI_MODEL,
             MINIMAX_MODEL,
             claude_endpoint_candidates,
         )
 
-        non_incumbent_models = {MINIMAX_MODEL, GLM_MODEL, DEEPSEEK_MODEL, KIMI_MODEL}
+        non_incumbent_models = {
+            MINIMAX_MODEL, GLM_MODEL, GLM_FLASH_MODEL, DEEPSEEK_MODEL, KIMI_MODEL,
+        }
         return [c for c in claude_endpoint_candidates() if c.model in non_incumbent_models]
 
     def test_non_incumbents_carry_claude_backend_and_env_contract(self):
@@ -122,6 +156,7 @@ class TestEndpointAuthEnvContract:
     def test_non_incumbent_base_urls_carry_the_provider_domain(self):
         from orchestrator.evals.configs import (
             DEEPSEEK_MODEL,
+            GLM_FLASH_MODEL,
             GLM_MODEL,
             KIMI_MODEL,
             MINIMAX_MODEL,
@@ -130,6 +165,7 @@ class TestEndpointAuthEnvContract:
         expected_domain = {
             MINIMAX_MODEL: 'minimax',
             GLM_MODEL: 'z.ai',
+            GLM_FLASH_MODEL: 'z.ai',
             DEEPSEEK_MODEL: 'deepseek',
             KIMI_MODEL: 'moonshot',
         }
@@ -184,6 +220,84 @@ class TestEndpointAuthEnvContract:
         assert all(not c.env_overrides for c in incumbents)
 
 
+_MIMO_BUNDLE_NAMES = ('mimo-v2.6-pro-endpoint', 'mimo-v2.6-flash-endpoint')
+
+
+class TestMimoEndpointEnvContract:
+    """The MiMo base URL and key are both operator env vars (task 7992's contract).
+
+    A Token Plan key answers only on its region's cluster, so the base URL is
+    not a literal; with no base URL the key is withheld, which the shadow
+    credential gate reads as no_credentials rather than a run that 401s.
+    """
+
+    def _mimo_bundles(self):
+        from orchestrator.evals.configs import claude_endpoint_candidates
+
+        by_name = {c.name: c for c in claude_endpoint_candidates()}
+        return [by_name[name] for name in _MIMO_BUNDLE_NAMES]
+
+    def test_a_set_base_url_and_key_flow_through_verbatim(self, monkeypatch):
+        base_url = 'https://token-plan-sgp.xiaomimimo.com/anthropic'
+        monkeypatch.setenv('MIMO_ANTHROPIC_BASE_URL', base_url)
+        monkeypatch.setenv('MIMO_API_KEY', 'tp-test')
+
+        for bundle in self._mimo_bundles():
+            assert bundle.backend == 'claude'
+            assert bundle.env_overrides['ANTHROPIC_BASE_URL'] == base_url
+            assert bundle.env_overrides['ANTHROPIC_AUTH_TOKEN'] == 'tp-test'
+
+    @pytest.mark.parametrize('base_url', [None, '   '], ids=['unset', 'whitespace'])
+    def test_a_blank_base_url_withholds_the_key(self, monkeypatch, base_url):
+        if base_url is None:
+            monkeypatch.delenv('MIMO_ANTHROPIC_BASE_URL', raising=False)
+        else:
+            monkeypatch.setenv('MIMO_ANTHROPIC_BASE_URL', base_url)
+        monkeypatch.setenv('MIMO_API_KEY', 'tp-test')
+
+        for bundle in self._mimo_bundles():
+            assert bundle.env_overrides['ANTHROPIC_AUTH_TOKEN'] == ''
+
+    @pytest.mark.parametrize('api_key', ['tp-test', None], ids=['key-set', 'key-unset'])
+    def test_a_blank_base_url_warning_blames_the_base_url_not_the_key(
+        self, monkeypatch, caplog, api_key,
+    ):
+        import logging
+
+        monkeypatch.delenv('MIMO_ANTHROPIC_BASE_URL', raising=False)
+        if api_key is None:
+            monkeypatch.delenv('MIMO_API_KEY', raising=False)
+        else:
+            monkeypatch.setenv('MIMO_API_KEY', api_key)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.evals.configs'):
+            self._mimo_bundles()
+
+        warnings = [
+            record.getMessage() for record in caplog.records
+            if record.levelno == logging.WARNING
+        ]
+        for name in _MIMO_BUNDLE_NAMES:
+            naming_this_bundle = [message for message in warnings if repr(name) in message]
+            assert naming_this_bundle, warnings
+            for message in naming_this_bundle:
+                assert 'no base URL' in message, message
+                assert 'MIMO_API_KEY' not in message, message
+
+    def test_resolving_a_static_config_builds_no_endpoint_bundle(self, monkeypatch, caplog):
+        import logging
+
+        from orchestrator.evals.configs import get_config_by_name
+
+        monkeypatch.delenv('MIMO_ANTHROPIC_BASE_URL', raising=False)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.evals.configs'):
+            config = get_config_by_name('claude-opus-high')
+
+        assert config is not None and config.name == 'claude-opus-high'
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING], caplog.text
+
+
 class TestClaudeEndpointPriceTable:
     """claude_endpoint_price_table(): default seeds + candidate-model prices,
     proven to resolve via λ's resolve_cost_usd (cost_source='price_table')."""
@@ -199,6 +313,7 @@ class TestClaudeEndpointPriceTable:
     def test_has_a_valid_entry_for_every_non_incumbent_candidate_model(self):
         from orchestrator.evals.configs import (
             DEEPSEEK_MODEL,
+            GLM_FLASH_MODEL,
             GLM_MODEL,
             KIMI_MODEL,
             MINIMAX_MODEL,
@@ -206,7 +321,9 @@ class TestClaudeEndpointPriceTable:
             claude_endpoint_price_table,
         )
 
-        non_incumbent_models = {MINIMAX_MODEL, GLM_MODEL, DEEPSEEK_MODEL, KIMI_MODEL}
+        non_incumbent_models = {
+            MINIMAX_MODEL, GLM_MODEL, GLM_FLASH_MODEL, DEEPSEEK_MODEL, KIMI_MODEL,
+        }
         candidate_models = {
             c.model for c in claude_endpoint_candidates() if c.model in non_incumbent_models
         }
@@ -251,7 +368,7 @@ class TestGetConfigByNameAndPropagation:
     def test_get_config_by_name_resolves_a_non_incumbent_bundle(self):
         from orchestrator.evals.configs import GLM_MODEL, get_config_by_name
 
-        cfg = get_config_by_name('glm-5.2-endpoint')
+        cfg = get_config_by_name('glm-5.3-endpoint')
         assert cfg is not None
         assert cfg.model == GLM_MODEL
 
@@ -267,10 +384,129 @@ class TestGetConfigByNameAndPropagation:
         cfg_path.write_text(f'project_root: {tmp_path}\n')
         base = load_config(cfg_path)
 
-        bundle = get_config_by_name('glm-5.2-endpoint')
+        bundle = get_config_by_name('glm-5.3-endpoint')
         assert bundle is not None
 
         orch_config = build_eval_orch_config(bundle, {}, base)
 
         assert orch_config.env_overrides.get('ANTHROPIC_BASE_URL') == GLM_BASE_URL
         assert orch_config.models.implementer == bundle.model
+
+
+
+class TestCandidatePriceCostBasis:
+    """Every candidate endpoint price declares how its arm is billed.
+
+    Under a GLM Coding Plan, GLM is credit-metered, so its dollar figure is an
+    imputed list price rather than a measured cost. An untagged imputed price
+    is the ``hardware_time_seconds`` mistake repeated
+    (eval-framework-revival-prd.md decision 1; live-shadow-eval-prd.md
+    decision 16), so the tag lives in the table itself.
+    """
+
+    def test_cost_basis_is_the_prd_decision_16_vocabulary(self):
+        from enum import StrEnum
+
+        from orchestrator.shadow_types import CostBasis
+
+        assert issubclass(CostBasis, StrEnum)
+        assert {member.value for member in CostBasis} == {'metered', 'subscription'}
+
+    def test_every_entry_is_a_typed_record_with_a_cost_basis(self):
+        from orchestrator.evals.configs import (
+            CANDIDATE_ENDPOINT_PRICES,
+            CandidateEndpointPrice,
+        )
+        from orchestrator.shadow_types import CostBasis
+
+        assert CANDIDATE_ENDPOINT_PRICES
+        for price in CANDIDATE_ENDPOINT_PRICES.values():
+            assert isinstance(price, CandidateEndpointPrice)
+            assert isinstance(price.cost_basis, CostBasis)
+
+    @pytest.mark.parametrize(('model', 'basis', 'imputed'), [
+        ('glm-5.3', 'subscription', True),
+        ('glm-5.3-flash', 'subscription', True),
+        ('MiniMax-M3', 'metered', False),
+        ('deepseek-v4', 'metered', False),
+        ('kimi-latest', 'metered', False),
+        ('mimo-v2.6-pro', 'subscription', True),
+        ('mimo-v2.6-flash', 'subscription', True),
+    ])
+    def test_per_model_cost_basis_is_pinned(self, model, basis, imputed):
+        from orchestrator.evals.configs import CANDIDATE_ENDPOINT_PRICES
+        from orchestrator.shadow_types import CostBasis
+
+        price = CANDIDATE_ENDPOINT_PRICES[model]
+        assert price.cost_basis is CostBasis(basis)
+        assert price.imputed is imputed
+
+    def test_entries_are_immutable(self):
+        import dataclasses
+
+        from orchestrator.evals.configs import CANDIDATE_ENDPOINT_PRICES
+
+        price = CANDIDATE_ENDPOINT_PRICES['glm-5.3']
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            price.input_per_1m = 0.0  # type: ignore[misc]
+
+
+class TestEndpointSlatePin:
+    """The endpoint slate, pinned by LITERAL ids and list prices.
+
+    Every other test in this module reads the ``*_MODEL`` constants, so it
+    stays green whatever those constants hold — a guard that reads the thing
+    it protects (INV-10). This class restates the slate as literals so a
+    stale or placeholder id, an unnoticed addition or removal, or a drifted
+    price fails loudly (task 5384; extended by task 7991).
+    """
+
+    def test_roster_is_exactly_the_incumbents_plus_the_pinned_slate(self):
+        from orchestrator.evals.configs import claude_endpoint_candidates
+
+        by_name = {c.name: c for c in claude_endpoint_candidates()}
+        assert set(by_name) == {
+            'claude-opus-high',
+            'claude-opus-max',
+            'claude-sonnet-max',
+            *_SLATE_MODELS_BY_NAME,
+        }
+
+    def test_bundles_carry_the_literal_provider_model_ids(self):
+        from orchestrator.evals.configs import claude_endpoint_candidates
+
+        by_name = {c.name: c for c in claude_endpoint_candidates()}
+        for name, model in _SLATE_MODELS_BY_NAME.items():
+            assert by_name[name].model == model
+
+    @pytest.mark.parametrize(('model', 'input_per_1m', 'output_per_1m'), _SLATE_LIST_PRICES)
+    def test_list_prices_are_pinned_as_rates_only(self, model, input_per_1m, output_per_1m):
+        """Exact equality also pins that the cost-basis tag stays out of this
+        projection, which runner.py unpacks into ``PriceEntry(**rates)``."""
+        from orchestrator.evals.configs import claude_endpoint_price_table
+
+        assert claude_endpoint_price_table()[model] == {
+            'input_per_1m': input_per_1m,
+            'output_per_1m': output_per_1m,
+        }
+
+    def test_base_urls_are_pinned(self):
+        from orchestrator.evals.configs import claude_endpoint_candidates
+
+        by_name = {c.name: c for c in claude_endpoint_candidates()}
+        expected_base_url = {
+            'glm-5.3-endpoint': 'https://api.z.ai/api/anthropic',
+            'glm-5.3-flash-endpoint': 'https://api.z.ai/api/anthropic',
+            'minimax-m3-endpoint': 'https://api.minimax.io/anthropic',
+        }
+        for name, base_url in expected_base_url.items():
+            assert by_name[name].env_overrides['ANTHROPIC_BASE_URL'] == base_url
+
+    def test_get_config_by_name_resolves_the_refreshed_bundles(self):
+        from orchestrator.evals.configs import get_config_by_name
+
+        for name, model in _SLATE_MODELS_BY_NAME.items():
+            cfg = get_config_by_name(name)
+            assert cfg is not None
+            assert cfg.model == model
+            assert cfg.backend == 'claude'

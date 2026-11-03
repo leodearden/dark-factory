@@ -1,6 +1,6 @@
 """Reconciliation drain/inflow throughput analysis (task 3049).
 
-Answers three operator questions about a project's reconciliation pipeline:
+Answers four operator questions about a project's reconciliation pipeline:
 
 * **inflow** — how many events actually arrive, per hour and per day, broken
   down by event type;
@@ -8,7 +8,9 @@ Answers three operator questions about a project's reconciliation pipeline:
   (backlog chunk, steady state, remediation, targeted) and what that costs
   per event;
 * **capacity** — the sustainable events/day that falls out of those two, and
-  whether it clears the observed burst inflow.
+  whether it clears the observed burst inflow;
+* **concentration** — which task ids the live inflow comes from, each buffered
+  row weighed by the events push folded into it (task 4278).
 
 Everything here is read-only over the reconciliation SQLite DB plus pure
 arithmetic, so the report can be run out-of-process against a live production
@@ -32,9 +34,10 @@ hour.  This is not hypothetical — it is the trap the task's METHOD NOTE calls
 out.
 
 The rule this module enforces: **bucket by parsing, never by SQL string
-comparison against a ``datetime('now')`` literal.**  ``utc_hour_bucket`` is the
-single place that parsing happens; every reader in this module and the rollup
-in ``event_buffer.cleanup_drained`` route through it.
+comparison against a ``datetime('now')`` literal.**  Bucketing happens in one
+place, ``_hour_key`` over an instant from ``_parse_utc``, which
+``utc_hour_bucket`` composes; every reader in this module and the rollup in
+``event_buffer.cleanup_drained`` route through them.
 """
 
 from __future__ import annotations
@@ -44,9 +47,16 @@ import json
 import sqlite3
 import sys
 from collections import Counter
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
+
+from fused_memory.reconciliation.coalescing import (
+    COALESCED_LAST_TIMESTAMP_KEY,
+    coalesced_count,
+    task_id_key,
+)
 
 __all__ = [
     'FITTED_CYCLE_FIXED_SECONDS',
@@ -62,6 +72,7 @@ __all__ = [
     'DRAIN_MODES',
     'classify_run',
     'drain_stats',
+    'inflow_concentration',
     'inflow_daily',
     'remediation_duty_cycle',
     'inflow_hourly',
@@ -88,10 +99,20 @@ def utc_hour_bucket(ts: str) -> str:
             garbage into a plausible-looking wrong hour would silently corrupt
             the measurement, so this fails loudly instead.
     """
+    return _hour_key(_parse_utc(ts))
+
+
+def _hour_key(instant: datetime) -> str:
+    """An aware UTC instant's hour key, ``'YYYY-MM-DDTHH'``."""
+    return instant.strftime('%Y-%m-%dT%H')
+
+
+def _parse_utc(ts: str) -> datetime:
+    """Parse an ISO8601 timestamp to an aware UTC instant; naive means UTC."""
     parsed = datetime.fromisoformat(ts)
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
-    return parsed.astimezone(UTC).strftime('%Y-%m-%dT%H')
+    return parsed.astimezone(UTC)
 
 
 def _connect_ro(db_path: str | Path) -> sqlite3.Connection:
@@ -164,27 +185,36 @@ def _hour_floor_instant(since: str | None) -> str | None:
     return None if bucket is None else f'{bucket}:00:00+00:00'
 
 
+class _Arrivals(NamedTuple):
+    """Per-(hour_bucket, event_type) arrival counts for one project."""
+
+    emitted: Counter[tuple[str, str]]  # every event producers pushed
+    coalesced: Counter[tuple[str, str]]  # the subset push folded into an older row
+
+
 def _arrival_counts(
     db_path: str | Path,
     project_id: str,
     since: str | None = None,
-) -> Counter[tuple[str, str]]:
-    """Per-(hour_bucket, event_type) arrival counts for one project.
-
-    The UNION of two sources that partition the event set exactly:
+) -> _Arrivals:
+    """Arrival counts for one project, from three sources that partition the pushed events.
 
     * ``event_arrival_hourly`` — events already swept out of the buffer by
       ``cleanup_drained``, which rolled them up in the same transaction as the
       DELETE;
     * ``event_buffer`` — every row still live, of ANY status ('buffered' and
       'drained' alike), because a drained row that has not yet aged past
-      ``max_age_seconds`` is still an arrival that has not been rolled up.
+      ``max_age_seconds`` is still an arrival that has not been rolled up;
+    * ``event_coalesced_hourly`` — events ``push`` folded into an older row
+      (task 4278), counted in the same transaction as the fold.
 
-    Those two sets are disjoint and exhaustive by construction, so summing
-    them double-counts nothing and loses nothing.
+    Each pushed event lands in exactly one of the three, so summing them
+    double-counts nothing and loses nothing.  One bound: a redelivered event
+    that folded in as an older or middle constituent of its row folds and is
+    counted again (``coalescing.merge_coalesced_payload``).
     """
     floor = _normalise_since(since)
-    counts: Counter[tuple[str, str]] = Counter()
+    emitted: Counter[tuple[str, str]] = Counter()
 
     conn = _connect_ro(db_path)
     try:
@@ -196,22 +226,35 @@ def _arrival_counts(
             ):
                 if floor is not None and row['hour_bucket'] < floor:
                     continue
-                counts[(row['hour_bucket'], row['event_type'])] += row['event_count']
+                emitted[(row['hour_bucket'], row['event_type'])] += row['event_count']
 
-        if _table_exists(conn, 'event_buffer'):
-            for row in conn.execute(
-                'SELECT timestamp, event_type FROM event_buffer WHERE project_id = ?',
-                (project_id,),
-            ):
-                # Bucket in Python.  Never filter these by a SQL comparison
-                # against a datetime('now') literal — see the METHOD NOTE.
-                bucket = utc_hour_bucket(row['timestamp'])
-                if floor is not None and bucket < floor:
-                    continue
-                counts[(bucket, row['event_type'])] += 1
+        for live in _live_rows(conn, project_id, floor):
+            emitted[(live.hour_bucket, live.event_type)] += 1
+
+        coalesced = _coalesced_counts(conn, project_id, floor)
     finally:
         conn.close()
 
+    emitted.update(coalesced)
+    return _Arrivals(emitted=emitted, coalesced=coalesced)
+
+
+def _coalesced_counts(
+    conn: sqlite3.Connection,
+    project_id: str,
+    floor: str | None,
+) -> Counter[tuple[str, str]]:
+    """Per-(hour_bucket, event_type) events folded at push; none before task 4278."""
+    counts: Counter[tuple[str, str]] = Counter()
+    if not _table_exists(conn, 'event_coalesced_hourly'):
+        return counts
+    for row in conn.execute(
+        """SELECT hour_bucket, event_type, coalesced_count
+           FROM event_coalesced_hourly WHERE project_id = ?""",
+        (project_id,),
+    ):
+        if floor is None or row['hour_bucket'] >= floor:
+            counts[(row['hour_bucket'], row['event_type'])] += row['coalesced_count']
     return counts
 
 
@@ -233,7 +276,7 @@ def inflow_hourly(
         Hour-bucket keys sort lexicographically in true chronological order,
         so the ordering is exact rather than approximate.
     """
-    counts = _arrival_counts(db_path, project_id, since)
+    counts = _arrival_counts(db_path, project_id, since).emitted
     hourly: Counter[str] = Counter()
     for (bucket, _event_type), n in counts.items():
         hourly[bucket] += n
@@ -254,13 +297,22 @@ def inflow_daily(
 
     Returns:
         ``{'daily': {'YYYY-MM-DD': int}, 'composition': {event_type: int},
-        'total_events': int}``.  The composition map is the evidence needed to
-        size lever 3 (coalescing redundant task_status_changed / task_modified
-        events for one task id) — it says how much of the inflow is actually
-        those two types.
+        'total_events': int, 'coalesced': {...same three keys...}}``.  The
+        composition map sized lever 3 (task 3049).  Now that lever 3 has landed
+        (task 4278), ``total_events`` counts every event producers emitted,
+        ``coalesced`` is the share ``push`` folded into an older row, and
+        ``total_events - coalesced['total_events']`` is the drain demand: the
+        rows that actually reached the buffer.
     """
-    counts = _arrival_counts(db_path, project_id, since)
+    arrivals = _arrival_counts(db_path, project_id, since)
+    return {
+        **_daily_shape(arrivals.emitted),
+        'coalesced': _daily_shape(arrivals.coalesced),
+    }
 
+
+def _daily_shape(counts: Counter[tuple[str, str]]) -> dict[str, Any]:
+    """Per-day totals, per-event_type composition and the grand total of ``counts``."""
     daily: Counter[str] = Counter()
     composition: Counter[str] = Counter()
     for (bucket, event_type), n in counts.items():
@@ -269,11 +321,170 @@ def inflow_daily(
 
     return {
         'daily': {day: daily[day] for day in sorted(daily)},
-        'composition': {
-            etype: composition[etype]
-            for etype in sorted(composition, key=lambda e: (-composition[e], e))
-        },
+        'composition': _ranked_counts(composition),
         'total_events': sum(daily.values()),
+    }
+
+
+def _ranked_counts(counts: Counter[str]) -> dict[str, int]:
+    """``counts`` as a dict ordered largest first, ties broken by name."""
+    return {key: counts[key] for key in sorted(counts, key=lambda k: (-counts[k], k))}
+
+
+class _Attribution(NamedTuple):
+    """What a stored payload says about the events its row stands for."""
+
+    task_id: str | None  # None when it names no task
+    weight: int  # pushed events folded into the row, at least 1
+    last_instant: datetime | None  # the newest folded event's instant, if any
+
+
+def _payload_attribution(payload: str) -> _Attribution:
+    """Parse a stored payload once into its task id, fold weight and newest instant.
+
+    Attribution is advisory, so a payload that is not JSON, or carries a
+    malformed fold count or timestamp, degrades to an unattributed weight-1
+    row instead of taking the report down.
+    """
+    try:
+        decoded = json.loads(payload)
+    except json.JSONDecodeError:
+        decoded = None
+    if not isinstance(decoded, dict):
+        return _Attribution(task_id=None, weight=1, last_instant=None)
+    return _Attribution(
+        task_id=task_id_key(decoded.get('task_id')),
+        weight=coalesced_count(decoded),
+        last_instant=_optional_instant(decoded.get(COALESCED_LAST_TIMESTAMP_KEY)),
+    )
+
+
+def _optional_instant(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return _parse_utc(value)
+    except ValueError:
+        return None
+
+
+class _LiveRow(NamedTuple):
+    """One live ``event_buffer`` row, its timestamp parsed once."""
+
+    instant: datetime
+    hour_bucket: str
+    event_type: str
+    payload: str
+
+
+def _live_rows(
+    conn: sqlite3.Connection,
+    project_id: str,
+    floor: str | None,
+) -> Iterator[_LiveRow]:
+    """Every live ``event_buffer`` row for the project, of ANY status, at or after ``floor``.
+
+    The one reader of live rows.  It buckets in Python and never filters by a
+    SQL comparison against a ``datetime('now')`` literal (the METHOD NOTE).
+    """
+    if not _table_exists(conn, 'event_buffer'):
+        return
+    for timestamp, event_type, payload in conn.execute(
+        'SELECT timestamp, event_type, payload FROM event_buffer WHERE project_id = ?',
+        (project_id,),
+    ):
+        instant = _parse_utc(timestamp)
+        bucket = _hour_key(instant)
+        if floor is None or bucket >= floor:
+            yield _LiveRow(instant, bucket, event_type, payload)
+
+
+def _widen(
+    window: tuple[datetime, datetime] | None,
+    instant: datetime,
+) -> tuple[datetime, datetime]:
+    """``window`` stretched to cover ``instant``; no window yet starts at it."""
+    if window is None:
+        return (instant, instant)
+    return (min(window[0], instant), max(window[1], instant))
+
+
+def inflow_concentration(
+    db_path: str | Path,
+    project_id: str,
+    since: str | None = None,
+    top_n: int = 10,
+) -> dict[str, Any]:
+    """Which task ids a project's live inflow comes from, largest first.
+
+    Counts EVENTS, not rows: a row ``push`` folded repeat task events into
+    (task 4278) weighs its fold count, and widens the window to its newest
+    folded event, so a looping task reads as large as it is.
+
+    Covers LIVE ``event_buffer`` rows only, because only they carry a payload:
+    ``cleanup_drained`` rolls a swept row up to (project, hour, event_type) and
+    its task id is gone.  That loses nothing that matters — while a backlog
+    exists the buffered rows ARE the backlog — but a burst that was already
+    swept is unattributable, so the window bounds state what was covered.
+
+    Args:
+        db_path: Path to reconciliation.db (opened read-only).
+        project_id: Project to report on.
+        since: Optional inclusive floor (see :func:`inflow_hourly`).
+        top_n: How many tasks to report.
+
+    Returns:
+        ``{'window_start', 'window_end', 'live_events', 'live_rows',
+        'unattributed_events', 'top_tasks': [{'task_id', 'events', 'share',
+        'composition'}]}``.  The window bounds are the earliest and latest UTC
+        instants counted (None with no rows).  ``live_rows`` is the row count
+        the ``live_events`` events sit in.  ``share`` is against ALL live
+        events, task-less ones included, so it reads directly as a fraction of
+        inflow.  Ties order by
+        task id, so the truncation is deterministic.
+
+    Raises:
+        ValueError: On a malformed stored timestamp, like every reader here.
+    """
+    window: tuple[datetime, datetime] | None = None
+    live_events = 0
+    live_rows = 0
+    unattributed = 0
+    per_task: dict[str, Counter[str]] = {}
+
+    conn = _connect_ro(db_path)
+    try:
+        for live in _live_rows(conn, project_id, _normalise_since(since)):
+            attribution = _payload_attribution(live.payload)
+            window = _widen(window, live.instant)
+            if attribution.last_instant is not None:
+                window = _widen(window, attribution.last_instant)
+            live_rows += 1
+            live_events += attribution.weight
+            if attribution.task_id is None:
+                unattributed += attribution.weight
+                continue
+            per_task.setdefault(attribution.task_id, Counter())[
+                live.event_type] += attribution.weight
+    finally:
+        conn.close()
+
+    ranked = sorted(per_task.items(), key=lambda item: (-item[1].total(), item[0]))
+    return {
+        'window_start': window[0].isoformat() if window else None,
+        'window_end': window[1].isoformat() if window else None,
+        'live_events': live_events,
+        'live_rows': live_rows,
+        'unattributed_events': unattributed,
+        'top_tasks': [
+            {
+                'task_id': task_id,
+                'events': types.total(),
+                'share': types.total() / live_events,
+                'composition': _ranked_counts(types),
+            }
+            for task_id, types in ranked[:top_n]
+        ],
     }
 
 
@@ -692,8 +903,8 @@ def capacity_verdict(
 def _retention_note() -> str:
     """The report's own measurement caveat.
 
-    ``cleanup_drained`` is the only ``DELETE FROM event_buffer`` in the
-    codebase, so before task 3049 added the ``event_arrival_hourly`` rollup a
+    ``cleanup_drained`` is the only DELETE of a committed ``event_buffer`` row
+    in the codebase, so before task 3049 added the ``event_arrival_hourly`` rollup a
     project's arrival history survived only as long as that cleanup window —
     NOT the week the task's ask (a) assumed.  (``event_journal`` is no help
     either: it is a write-ahead log whose ``mark_processed`` deletes the row.)
@@ -711,12 +922,15 @@ def _retention_note() -> str:
     """
     return (
         'Inflow retention: EventBuffer.cleanup_drained deletes drained rows '
-        'past a configured age, and is the only DELETE FROM event_buffer in '
-        'the codebase. Task 3049 added the event_arrival_hourly rollup INSIDE '
+        'past a configured age, and is the only DELETE of a committed '
+        'event_buffer row in the codebase. Task 3049 added the event_arrival_hourly rollup INSIDE '
         'that delete transaction, so from then on arrival history is durable '
         'and exact. Inflow from before the rollup landed was destroyed by that '
         'delete and is unrecoverable — treat any window extending back past '
-        'the rollup as truncated, not as a period of low inflow.'
+        'the rollup as truncated, not as a period of low inflow. Per-task '
+        'concentration reads payloads, which only live event_buffer rows '
+        'carry, so it covers the window printed with it (the current backlog '
+        'plus drained rows not yet swept), never the rolled-up history.'
     )
 
 
@@ -741,11 +955,14 @@ def build_report(
     Returns:
         A JSON-serialisable dict with ``project_id``, ``db_path``, ``since``,
         ``since_effective``,
-        ``inflow`` (hourly / daily / composition / total_events), ``drain``
+        ``inflow`` (hourly / daily / composition / total_events, plus
+        ``coalesced``: the :func:`inflow_daily` share folded at push), ``drain``
         (the :func:`drain_stats` payload), ``remediation_duty_cycle``,
         ``sustainable_events_per_day``, ``capacity_verdict``,
         ``remediation_free_events_per_day``,
-        ``remediation_free_capacity_verdict`` and ``retention_note``.
+        ``remediation_free_capacity_verdict``, ``concentration`` (the
+        :func:`inflow_concentration` payload, live rows only) and
+        ``retention_note``.
 
         TWO capacity figures, each with its own verdict:
 
@@ -807,6 +1024,7 @@ def build_report(
             'daily': daily['daily'],
             'composition': daily['composition'],
             'total_events': daily['total_events'],
+            'coalesced': daily['coalesced'],
         },
         'drain': drain,
         'remediation_duty_cycle': duty,
@@ -814,6 +1032,7 @@ def build_report(
         'capacity_verdict': verdict,
         'remediation_free_events_per_day': remediation_free,
         'remediation_free_capacity_verdict': remediation_free_verdict,
+        'concentration': inflow_concentration(db_path, project_id, effective_since),
         'retention_note': _retention_note(),
     }
 
@@ -836,8 +1055,12 @@ def _format_report(report: dict[str, Any]) -> str:
     inflow = report['inflow']
     lines.append(f'inflow:  {inflow["total_events"]} events over '
                  f'{len(inflow["hourly"])} hour(s)')
+    coalesced = inflow['coalesced']['total_events']
+    lines.append(f'           of which coalesced at push: {coalesced} '
+                 f'(rows reaching the buffer: {inflow["total_events"] - coalesced})')
     for etype, n in inflow['composition'].items():
         lines.append(f'           {etype}: {n}')
+    lines.extend(_format_concentration(report['concentration']))
 
     lines.append('drain:')
     for mode in DRAIN_MODES:
@@ -884,6 +1107,24 @@ def _format_report(report: dict[str, Any]) -> str:
     lines.append('')
     lines.append(report['retention_note'])
     return '\n'.join(lines)
+
+
+def _format_concentration(section: dict[str, Any]) -> list[str]:
+    """The readable per-task lines, headed by the live-row window they cover."""
+    if section['live_rows'] == 0:
+        return ['by task: no live event_buffer rows to attribute']
+    lines = [
+        f'by task: {section["live_events"]} event(s) on '
+        f'{section["live_rows"]} live event_buffer row(s), '
+        f'{section["window_start"]} .. {section["window_end"]}',
+    ]
+    for entry in section['top_tasks']:
+        lines.append(
+            f'           task {entry["task_id"]}: {entry["events"]} '
+            f'({entry["share"]:.1%})')
+    if section['unattributed_events']:
+        lines.append(f'           unattributed: {section["unattributed_events"]}')
+    return lines
 
 
 def _build_parser() -> argparse.ArgumentParser:

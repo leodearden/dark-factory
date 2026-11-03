@@ -49,10 +49,10 @@ from _orch_helpers import (
     git_env_with_ceiling,
 )
 
-from orchestrator import landing_evidence
 from orchestrator.config import GitConfig, RecoveryEmissionConfig
 from orchestrator.git_ops import GitOps
-from orchestrator.landing_evidence import (
+from orchestrator.merge_lane import landing_evidence, patch_content_contained
+from orchestrator.merge_lane.landing_evidence import (
     LANDING_GIT_ERROR_STORM_CATEGORY,
     LANDING_GIT_ERROR_STORM_SENTINEL,
     LandingMethod,
@@ -63,7 +63,6 @@ from orchestrator.landing_evidence import (
     file_landing_git_error_storm_escalation,
     format_unattributed_landing_detail,
 )
-from orchestrator.merge_lane import patch_content_contained
 
 if TYPE_CHECKING:
     from escalation.queue import EscalationQueue
@@ -1032,7 +1031,7 @@ class TestDegenerateArmBackwardCompatibility:
 
         **The residual, named rather than implied.**  That "not SAFETY" is
         conditional on attribution ALSO failing, and it is not guaranteed to.
-        :func:`~orchestrator.landing_evidence._resolve_main_reachable_evidence`
+        :func:`~orchestrator.merge_lane.landing_evidence._resolve_main_reachable_evidence`
         tier 1 accepts ANY main-reachable commit whose subject cites the task,
         including one from an EARLIER partial landing that this branch played
         no part in.  For a parked branch with no recorded base, a task with
@@ -1641,7 +1640,7 @@ class TestBranchWorkLandedNeverRaises:
             raise RuntimeError('simulated merge_base failure')
 
         monkeypatch.setattr(git_ops, 'merge_base_with_main', _boom)
-        with caplog.at_level('WARNING', logger='orchestrator.landing_evidence'):
+        with caplog.at_level('WARNING', logger='orchestrator.merge_lane'):
             verdict = await branch_work_landed(
                 git_ops, TASK_ID, sc.branch,
                 branch_tip_sha=sc.branch_tip_sha, metadata=None,
@@ -1873,6 +1872,28 @@ class TestLandingTally:
                 subject.record(reason)
         assert subject.git_error_count_in_window() == 0
 
+    def test_the_git_error_window_is_half_open(self) -> None:
+        now = [0.0]
+        subject = LandingTally(clock=lambda: now[0])
+        subject.record(LandingReason.git_error)
+
+        now[0] = subject.window_secs - 1.0
+        assert subject.git_error_count_in_window() == 1
+        now[0] = subject.window_secs
+        assert subject.git_error_count_in_window() == 0, (
+            'a stamp aged exactly the window is out'
+        )
+
+    def test_the_windowed_count_is_exact_however_large_the_storm(self) -> None:
+        """The count is the number the storm alarm reports, so it must be exact.
+
+        The window, not a cap, bounds it.
+        """
+        subject = LandingTally(clock=lambda: 0.0)
+        for _ in range(5000):
+            subject.record(LandingReason.git_error)
+        assert subject.git_error_count_in_window() == 5000
+
 
 @pytest.mark.asyncio
 class TestTallyIsChargedByEveryVerdict:
@@ -1914,7 +1935,7 @@ class TestTallyIsChargedByEveryVerdict:
         silence layered on the first.
         """
         scenario = build_rebased_landing(repo)
-        with caplog.at_level('INFO', logger='orchestrator.landing_evidence'):
+        with caplog.at_level('INFO', logger='orchestrator.merge_lane'):
             await branch_work_landed(
                 git_ops, TASK_ID, scenario.branch,
                 branch_tip_sha=scenario.branch_tip_sha, metadata=scenario.metadata,
@@ -2128,6 +2149,44 @@ class TestGitErrorStormEscape:
         )
         assert all(v.reason is LandingReason.git_error for v in verdicts)
         assert queue.submitted == []
+
+    async def test_a_failed_submit_is_retried_on_the_next_git_error(
+        self, git_ops: GitOps, repo: _Repo, tally: LandingTally,
+    ) -> None:
+        """The alarm's only dedup is the open L1 (``has_open_l1``), never a time
+        rate-limit or latch — which is why ``LandingTally`` uses
+        ``StormCounter.observe()`` and NOT ``record()``: routing the fire through
+        ``record()`` would consume a fire on a failed submit and stop re-filing a
+        resolved alarm mid-storm.
+        """
+        build_unlanded_branch(repo)
+        broken = _FakeEscalationQueue(submit_raises=True)
+        await _drive_git_errors(
+            git_ops, 4, queue=broken, recovery_emission=_storm_config(rate=3),
+        )
+        assert broken.submitted == []
+
+        healthy = _FakeEscalationQueue()
+        await _drive_git_errors(
+            git_ops, 1, queue=healthy, recovery_emission=_storm_config(rate=3),
+        )
+        assert len(healthy.submitted) == 1
+
+    async def test_a_resolved_alarm_is_refiled_while_the_storm_persists(
+        self, git_ops: GitOps, repo: _Repo, tally: LandingTally,
+    ) -> None:
+        build_unlanded_branch(repo)
+        first = _FakeEscalationQueue()
+        await _drive_git_errors(
+            git_ops, 4, queue=first, recovery_emission=_storm_config(rate=3),
+        )
+        assert len(first.submitted) == 1
+
+        resolved = _FakeEscalationQueue()
+        await _drive_git_errors(
+            git_ops, 1, queue=resolved, recovery_emission=_storm_config(rate=3),
+        )
+        assert len(resolved.submitted) == 1
 
     async def test_the_filer_is_directly_callable_and_reports_what_it_did(
         self, tally: LandingTally,

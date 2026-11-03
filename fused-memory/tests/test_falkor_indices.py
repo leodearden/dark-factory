@@ -46,6 +46,7 @@ from collections import OrderedDict, defaultdict
 from unittest.mock import MagicMock
 
 import pytest
+from _falkor_index_doubles import LIVE_HEADER, TRAP_PRESENT
 from graphiti_core.driver.driver import GraphProvider
 from graphiti_core.graph_queries import get_fulltext_indices, get_range_indices
 
@@ -969,21 +970,13 @@ class TestUnsettledIndexStatuses:
         assert 'status' in message
 
 
-# --- The MEASURED live CALL db.indexes() shape -----------------------------
+# --- The MEASURED live CALL db.indexes() rows ------------------------------
 #
-# Measured read-only 2026-08-06 via
-#   docker exec docker-falkordb-1 redis-cli GRAPH.RO_QUERY dark_factory "CALL db.indexes()"
-# and via a raw falkordb.asyncio client on the ro path.  No graphiti driver was
-# constructed and no index was created, dropped or modified anywhere.
-#
-# The header is 9 two-tuples; note that `entitytype` is index 6 and `options` is
-# index 3.  That gap is the defect these tests pin: list_indices() bound
+# From the same read-only 2026-08-06 measurement as
+# _falkor_index_doubles.py::LIVE_HEADER, whose column order these rows follow.
+# In that header `entitytype` is index 6 and `options` is index 3; that gap is
+# the defect TestListIndicesColumnBinding pins: list_indices() bound
 # entity_type to row[3].
-
-LIVE_HEADER = [
-    [1, 'label'], [1, 'properties'], [1, 'types'], [1, 'options'], [1, 'language'],
-    [1, 'stopwords'], [1, 'entitytype'], [1, 'status'], [1, 'info'],
-]
 
 LIVE_ROW_RELATES_TO = [
     'RELATES_TO',
@@ -1485,17 +1478,8 @@ class TestVectorDropStatement:
         assert 'RELATIONSHIP' in str(excinfo.value)
 
 
-#: The trap state esc-3375-1 protected as evidence: an ``Entity(uuid)`` and a
-#: ``RELATES_TO(uuid)`` range index, and nothing else.  Every composite range
-#: statement upstream emits for those two labels is rejected wholesale against it.
-_TRAP_PRESENT = {
-    ('Entity', 'NODE', 'uuid', 'RANGE'),
-    ('RELATES_TO', 'RELATIONSHIP', 'uuid', 'RANGE'),
-}
-
-
 def _trap_missing() -> set:
-    return expected_index_set() - _TRAP_PRESENT
+    return expected_index_set() - TRAP_PRESENT
 
 
 class TestPlanIndexStatements:

@@ -1,0 +1,36 @@
+{
+  "task_id": "5352",
+  "reason": "Net-additive: the coalesce one-strike registry becomes restart-durable (guard_state.PersistentSet), adding a TTL constant, the persisted initialiser and corrected prose in merge_queue.py; the private_reads total rises because the new cross-guard suite test_restart_durable_guards.py asserts against the guard attributes, which have no public accessor.",
+  "measures": [
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/merge_queue.py",
+      "baseline": 21572,
+      "current": 21604
+    },
+    {
+      "measure": "prose_lines",
+      "key": "orchestrator/src/orchestrator/merge_queue.py",
+      "baseline": 12288,
+      "current": 12305
+    },
+    {
+      "measure": "total:lines",
+      "key": "<cluster>",
+      "baseline": 55842,
+      "current": 55874
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6724,
+      "current": 6759
+    },
+    {
+      "measure": "total:prose_lines",
+      "key": "<cluster>",
+      "baseline": 31298,
+      "current": 31315
+    }
+  ]
+}

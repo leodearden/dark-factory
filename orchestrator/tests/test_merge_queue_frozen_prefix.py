@@ -39,7 +39,7 @@ Mapping:
                 + self._finalizing_head when phase in {'verifying',
                   'gate_reverify', 'finalizing'}
   {landed}    = main (its SHA reflects landed items)
-  unfrozen    = self._lane_buffers (pick order high→normal, FIFO)
+  unfrozen    = the intake's lane buffers (pick order high→normal, FIFO)
 """
 
 from __future__ import annotations
@@ -51,11 +51,12 @@ from pathlib import Path
 from typing import Literal
 
 import pytest
-from _merge_lane_fakes import FakeClock, FakeVerifier, make_lane
+from _merge_lane_fakes import FakeClock, FakeVerifier, lane_scene_config, make_lane
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, MergeResult, _run
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.worker import (
     DecidedItem,
     InflightEntry,
     ItemLifecycleState,
@@ -65,7 +66,6 @@ from orchestrator.merge_queue import (
     SpeculativeItem,
     SpeculativeMergeWorker,
 )
-from orchestrator.merge_types import QueuedBranch
 
 # ── Module-level sentinel for verify_task in pure unit tests ─────────────────
 #
@@ -114,7 +114,7 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
 
 @pytest.fixture
 def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
-    return OrchestratorConfig(project_root=git_repo, git=git_config)
+    return lane_scene_config(git_repo, git_config)
 
 
 # ── Module-level helpers ──────────────────────────────────────────────────────
@@ -236,10 +236,9 @@ def _seed_suffix(
     replace: bool = False,
 ) -> None:
     """Admit *reqs* to *lane*'s buffer; *replace* reorders the lane wholesale."""
-    buffer = worker._lane_buffers[lane]
-    if replace:
-        buffer.clear()
-    buffer.extend(reqs)
+    intake = worker._intake
+    kept = () if replace else intake.buffered(lane)
+    intake.replace_lane(lane, (*kept, *reqs))
 
 
 def _seed_finalizing_head(
@@ -359,7 +358,7 @@ class TestFrozenAndUnfrozenAccessors:
     async def test_lane_buffers_appear_in_unfrozen_suffix(
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
     ) -> None:
-        """Requests in _lane_buffers appear in unfrozen_suffix(), high before normal."""
+        """Requests in the lane buffers appear in unfrozen_suffix(), high before normal."""
         worker = _make_worker(git_ops)
         req_hi = _make_req('t-hi', 'task/t-hi', config, git_repo, lane='high')
         req_n1 = _make_req('t-n1', 'task/t-n1', config, git_repo)
@@ -528,7 +527,7 @@ class TestFrozenPrefixPropertyTest:
 
     RED until step-10 GREEN adds the frozen-rid exclusion filter to
     recompute_suffix_conflict_graph().  The immutability assertion (a) already
-    holds (emergent from δ's _lane_buffers-only recompute); only the exclusion
+    holds (emergent from δ's lane-buffers-only recompute); only the exclusion
     assertion (b) fails RED.
     """
 
@@ -537,7 +536,7 @@ class TestFrozenPrefixPropertyTest:
     ) -> None:
         """(a) In-flight entries are unchanged after suffix reorder + recompute.
 
-        Setup: D/E in _inflight (verifying); F/G in _lane_buffers['normal'].
+        Setup: D/E in _inflight (verifying); F/G in the normal lane buffer.
         Capture state, reverse F/G, recompute, assert:
           - D/E base_sha UNCHANGED
           - D/E inflight identity/order UNCHANGED
@@ -600,7 +599,7 @@ class TestFrozenPrefixPropertyTest:
 
         # ── Assert no frozen rid appears in suffix graph nodes ────────────────
         # NOTE: this loop is trivially satisfied here because D/E are only ever
-        # in _inflight and are never pushed into _lane_buffers, so they could
+        # in _inflight and are never pushed into the lane buffers, so they could
         # not appear in the suffix graph regardless of the exclusion filter.
         # The genuine RED→GREEN coverage for the exclusion filter lives in
         # test_frozen_rid_excluded_from_suffix_graph below.
@@ -613,14 +612,14 @@ class TestFrozenPrefixPropertyTest:
     async def test_frozen_rid_excluded_from_suffix_graph(
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
     ) -> None:
-        """(b) Exclusion filter: a frozen rid pushed into _lane_buffers is excluded.
+        """(b) Exclusion filter: a frozen rid pushed into the lane buffers is excluded.
 
         This is the genuine RED→GREEN delta: before step-10 adds the exclusion
-        filter, a frozen request that is also in _lane_buffers appears in
+        filter, a frozen request that is also in the lane buffers appears in
         suffix_conflict_graph.nodes.  After step-10, it is excluded.
 
         Setup: item D in _inflight (verifying); also D's request pushed into
-        _lane_buffers.  Recompute → D's rid must NOT appear in nodes.
+        the lane buffers.  Recompute → D's rid must NOT appear in nodes.
         """
         main_sha = 'fake-main-sha'
         worker = _make_worker(git_ops)
@@ -630,7 +629,7 @@ class TestFrozenPrefixPropertyTest:
                                         config=config, git_repo=git_repo)
         _seed_frozen(worker, _make_inflight_entry(item_d, verifying=True))
 
-        # Intentionally push the SAME request into _lane_buffers (simulates the
+        # Intentionally push the SAME request into the lane buffers (simulates the
         # bug this filter guards against: a frozen rid leaking into the suffix).
         _seed_suffix(worker, req_d)
 
@@ -767,7 +766,7 @@ class TestWarnIfVerifyBaseNotFrozenTip:
             config=config, git_repo=git_repo,
         )
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = _guard_warn(worker, item_e, 'main0')
 
         # Returns None (log-only, no side effect)
@@ -814,7 +813,7 @@ class TestWarnIfVerifyBaseNotFrozenTip:
             config=config, git_repo=git_repo,
         )
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = _guard_warn(worker, item_e, 'main0')
 
         assert result is None
@@ -841,7 +840,7 @@ class TestWarnIfVerifyBaseNotFrozenTip:
             config=config, git_repo=git_repo,
         )
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = _guard_warn(worker, item_d, 'main0')
 
         assert result is None
@@ -955,7 +954,7 @@ class TestRemergeCarveOutAtDispatchGuard:
         )
         item_r = _mark_recovery(item_r)
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = _guard_warn(worker, item_r, 'main0')
 
         assert result is None
@@ -992,7 +991,7 @@ class TestRemergeCarveOutAtDispatchGuard:
             config=config, git_repo=git_repo,
         )
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = _guard_warn(worker, item_e, 'main0')
 
         assert result is None
@@ -1029,7 +1028,7 @@ class TestRemergeCarveOutAtDispatchGuard:
             if marked:
                 item_e = _mark_recovery(item_e)
 
-            with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
                 assert _guard_warn(worker, item_e, 'main0') is None
 
             warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
@@ -1112,7 +1111,7 @@ class TestGuardWarningCarriesCallTimeContext:
         assert len(worker.frozen_prefix()) == 1
         expected_tip = worker.frozen_prefix_tip('main0')
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             _guard_warn(worker, item_e, 'main0')
 
         warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
@@ -1370,7 +1369,7 @@ class TestDispatchItemGuardWiring:
         with (
             mock.patch.object(git_ops, 'get_main_sha', side_effect=_return_main),
             mock.patch.object(worker, '_run_inflight_verify', _noop_verify),
-            caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'),
+            caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'),
         ):
             result = await _dispatch(worker, item_e)
 
@@ -1488,7 +1487,7 @@ class TestRemergeReturnPathParity:
         import inspect
         import textwrap
 
-        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
         src = textwrap.dedent(inspect.getsource(SpeculativeMergeWorker._remerge))
         returns = [n for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Return)]
@@ -1508,8 +1507,8 @@ class TestRemergeReturnPathParity:
         — is unaffected by the carve-out. A default of True would exempt the
         entire pipeline from §5.3 in one character.
         """
-        from orchestrator.merge_types import DecidedItem as _DI
-        from orchestrator.merge_types import RealMergeItem as _RMI
+        from orchestrator.merge_lane.types import DecidedItem as _DI
+        from orchestrator.merge_lane.types import RealMergeItem as _RMI
 
         for cls in (_RMI, _DI):
             field = {f.name: f for f in dataclasses.fields(cls)}['remerge_recovery']

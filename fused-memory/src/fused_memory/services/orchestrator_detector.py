@@ -1,18 +1,25 @@
 """Detect whether an orchestrator instance is live for a given project root.
 
-The orchestrator writes its PID to ``<project_root>/data/orchestrator/orchestrator.lock``
-when it starts. The first line format is ``PID <N> started <timestamp>``. We treat
-the lock as live only when (a) the file exists, (b) we can parse a PID from it, and
-(c) sending signal 0 to that PID succeeds (process exists and we have permission to
-signal it). Anything else — missing file, unparseable content, dead PID — is a stale
-or absent lock, so the orchestrator is not live.
+At startup the orchestrator takes ``LOCK_EX | LOCK_NB`` on
+``<project_root>/data/orchestrator/orchestrator.lock`` and writes
+``PID <N> started <timestamp>`` as its first line. This module reads two
+liveness signals from that one file. Pick one by what a wrong answer costs:
 
-Used by :class:`BacklogPolicy` to decide whether to escalate (orchestrator can see
-the escalation file) or reject the MCP call (no one's watching).
+* :func:`is_orchestrator_lock_held` asks the kernel whether some process
+  holds a flock on the file, so it cannot go stale. Use it to decide whether
+  to file work that only a running orchestrator drains, where a false "live"
+  loses the work silently. Its momentary shared lock refuses an orchestrator
+  start that lands in the same instant, and
+  ``orchestrator/src/orchestrator/harness.py::_acquire_project_lock`` exits
+  rather than retrying.
+* :func:`is_orchestrator_live_for` sends signal 0 to the PID in the file. It
+  never touches the lock, but a PID that outlived its orchestrator (a crash,
+  then PID reuse) reads as live.
 """
 
 from __future__ import annotations
 
+import fcntl
 import logging
 import os
 from datetime import UTC, datetime
@@ -22,8 +29,8 @@ logger = logging.getLogger(__name__)
 
 
 def is_orchestrator_live_for(project_root: str | Path) -> bool:
-    """Return True iff a running orchestrator process holds the project's lock."""
-    lock_path = Path(project_root) / 'data' / 'orchestrator' / 'orchestrator.lock'
+    """Return True iff the PID recorded in the project's orchestrator.lock answers signal 0."""
+    lock_path = _lock_path(project_root)
     try:
         text = lock_path.read_text(encoding='utf-8')
     except FileNotFoundError:
@@ -36,6 +43,29 @@ def is_orchestrator_live_for(project_root: str | Path) -> bool:
     if pid is None:
         return False
     return _pid_alive(pid)
+
+
+def is_orchestrator_lock_held(project_root: str | Path) -> bool:
+    """Return True iff some process holds a flock on the project's orchestrator.lock.
+
+    Probes with ``LOCK_SH | LOCK_NB`` on its own handle, so it never waits;
+    closing that handle releases the probe's lock. A missing or unopenable
+    lock file reads as not held; any other flock error propagates.
+
+    This is synchronous file I/O, so a coroutine calls it through
+    ``asyncio.to_thread``.
+    """
+    try:
+        handle = _lock_path(project_root).open('rb')
+    except OSError:
+        return False
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    finally:
+        handle.close()
+    return False
 
 
 def orchestrator_started_at(project_root: str | Path) -> datetime | None:
@@ -61,7 +91,7 @@ def orchestrator_started_at(project_root: str | Path) -> datetime | None:
     token, or an unparseable timestamp (``ValueError``). All failure modes are
     logged at debug, mirroring the other helpers in this module.
     """
-    lock_path = Path(project_root) / 'data' / 'orchestrator' / 'orchestrator.lock'
+    lock_path = _lock_path(project_root)
     try:
         text = lock_path.read_text(encoding='utf-8')
     except FileNotFoundError:
@@ -71,6 +101,10 @@ def orchestrator_started_at(project_root: str | Path) -> datetime | None:
         return None
 
     return _parse_started(text)
+
+
+def _lock_path(project_root: str | Path) -> Path:
+    return Path(project_root) / 'data' / 'orchestrator' / 'orchestrator.lock'
 
 
 def _parse_started(content: str) -> datetime | None:

@@ -441,18 +441,17 @@ tasks:
       - dark-factory-orchestrator.yaml
       expect: absent
 - label: ρ1
-  task_id: 7334
+  external_task_id: reify:7334
   title: 'reify yaml: harmonised psi_admission block + the companion PRD amendment'
   note: 'Filed in the reify project (project_root /home/leo/src/reify) against this
-    dark_factory-hosted PRD. HAND-STAMPED: commit_planning''s stamper derives the
-    sidecar as Path(project_root)/re.sub(r''[.]md$'','''',prd_path)+''.capability-manifest.yaml''
+    dark_factory-hosted PRD, so the block binds external_task_id, not a local task_id.
+    reify''s commit_planning stamper derives the sidecar as
+    Path(project_root)/re.sub(r''[.]md$'','''',prd_path)+''.capability-manifest.yaml''
     and refuses a path resolving outside project_root, and this task carries an ABSOLUTE
-    dark_factory prd_path — so reify''s commit_planning returned no manifest_stamping
-    report at all and copied no metadata.delivered_checks. The checks below are authoring-time
-    evidence for a human reader and are reify-repo-relative; they are NOT a live dispatch
-    gate, unlike the seven dark_factory labels above. Filed in the reify project (project_root
-    /home/leo/src/reify) against this dark_factory-hosted PRD; delivered_check paths
-    are reify-repo-relative.'
+    dark_factory prd_path, so it copied no metadata.delivered_checks. Task 4935 stamped
+    the mechanical checks below onto the reify task by hand
+    (docs/sidecar-orphan-reconciliation-2026-09-29/); they gate reify''s dispatch, not
+    dark_factory''s. delivered_check paths are reify-repo-relative.'
   capabilities:
   - name: harmonised-block-lands-in-the-reify-yaml
     binding: 'producer:ρ1 — reify''s dark-factory-orchestrator.yaml carries psi_admission:
@@ -519,17 +518,18 @@ tasks:
         present-grep can never gate (polarity lint vacuous_present); verified at
         review
 - label: ρ2
-  task_id: 7335
+  external_task_id: reify:7335
   title: '@own-slice for reify''s verify gates and jobserver balancer, plus the extracted
     unit renderer'
   note: 'Filed in the reify project (project_root /home/leo/src/reify) against this
-    dark_factory-hosted PRD. HAND-STAMPED: commit_planning''s stamper derives the
-    sidecar as Path(project_root)/re.sub(r''[.]md$'','''',prd_path)+''.capability-manifest.yaml''
+    dark_factory-hosted PRD, so the block binds external_task_id, not a local task_id.
+    reify''s commit_planning stamper derives the sidecar as
+    Path(project_root)/re.sub(r''[.]md$'','''',prd_path)+''.capability-manifest.yaml''
     and refuses a path resolving outside project_root, and this task carries an ABSOLUTE
-    dark_factory prd_path — so reify''s commit_planning returned no manifest_stamping
-    report at all and copied no metadata.delivered_checks. The checks below are authoring-time
-    evidence for a human reader and are reify-repo-relative; they are NOT a live dispatch
-    gate, unlike the seven dark_factory labels above. Scope widened at decompose per
+    dark_factory prd_path, so it copied no metadata.delivered_checks. Task 4935 stamped
+    the mechanical checks below onto the reify task by hand
+    (docs/sidecar-orphan-reconciliation-2026-09-29/); they gate reify''s dispatch, not
+    dark_factory''s. Scope widened at decompose per
     §Corrections (1): scripts/verify.sh and tests/infra/test_verify_admission_knob_parity.sh
     are added, because setting REIFY_PSI_GATE_PROC_PATH in verify_env alone would
     red that guard''s completeness section. Also serialized behind ρ1 by a real edge
@@ -570,6 +570,7 @@ tasks:
       pattern: REIFY_PSI_GATE_PROC_PATH
       paths:
       - tests/infra/test_verify_admission_knob_parity.sh
+      - tests/infra/test_verify_plan_structure.py
       expect: present
   - name: the-unit-pinning-guard-is-co-changed-not-broken
     binding: 'rejection-mechanism — §Corrections (5): tests/infra/test_host_global_unit_pinning.sh
@@ -656,7 +657,7 @@ tasks:
       - scripts/redeploy-jobserver-unit.sh
       expect: present
 - label: ρ3
-  task_id: 7336
+  external_task_id: reify:7336
   title: Balancer unit re-deploy (deterministic, before_done = scripts/redeploy-jobserver-unit.sh)
   capabilities:
   - name: before-done-script-is-produced-upstream-before-dispatch
@@ -696,10 +697,9 @@ tasks:
         present-grep can never gate (polarity lint vacuous_present); verified at
         review
   note: 'Filed in the reify project (project_root /home/leo/src/reify) against this
-    dark_factory-hosted PRD. HAND-STAMPED: commit_planning''s stamper derives the
-    sidecar as Path(project_root)/re.sub(r''[.]md$'','''',prd_path)+''.capability-manifest.yaml''
+    dark_factory-hosted PRD, so the block binds external_task_id, not a local task_id.
+    reify''s commit_planning stamper derives the sidecar as
+    Path(project_root)/re.sub(r''[.]md$'','''',prd_path)+''.capability-manifest.yaml''
     and refuses a path resolving outside project_root, and this task carries an ABSOLUTE
-    dark_factory prd_path — so reify''s commit_planning returned no manifest_stamping
-    report at all and copied no metadata.delivered_checks. The checks below are authoring-time
-    evidence for a human reader and are reify-repo-relative; they are NOT a live dispatch
-    gate, unlike the seven dark_factory labels above. '
+    dark_factory prd_path, so it copied no metadata.delivered_checks. Every capability
+    below is checked manually, so there was nothing to stamp.'

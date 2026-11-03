@@ -1,11 +1,14 @@
 """The MEMORY_EVALS ↔ ESCALATIONS id-space contract (task 3471).
 
 `tab_memory_evals.jsx` navigates from a memory-eval row to the escalations tab
-by id — `onNavigate('esc', escalation.id)` — and `tab_escalations.jsx`'s
-`findEscalationRow` resolves that id with a strict `row.id === id`.  So every
-escalation id MEMORY_EVALS emits must appear, with the SAME TYPE, among the
-rows ESCALATIONS ships.  Nothing pins that today: the two payloads are built by
-two producers that never reference each other
+with a `(queue, id)` focus — `queue` is `MEMORY_EVALS.escalation_queue`, the
+ESCALATIONS subsection the route read its escalations from — and
+`escalation_focus.js::findEscalationRow` resolves it with a strict
+`row.id === id` inside that one subsection, electing a row only when exactly one
+matches.  So every escalation id MEMORY_EVALS emits must appear exactly once,
+with the SAME TYPE, among the rows of the subsection it names.  Nothing pinned
+that before task 3471: the two payloads are built by two producers that never
+reference each other
 
     MEMORY_EVALS  — `memory_evals._escalation_projection` → `record.get('id')`
     ESCALATIONS   — `redux_api.shape_escalations`         → `{**esc, ...}`
@@ -28,14 +31,20 @@ only as good as that one.
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from _dashboard_helpers import build_dual_escalation_tree, write_escalation_record
 
-from dashboard.data.escalations import build_escalation_queues
-from dashboard.data.redux_api import shape_escalations
+from dashboard.data.escalation_corpus import corpus_queues, measure_corpus, reconciliation_queue
+from dashboard.data.escalations import build_escalation_queues, card_datums
+from dashboard.data.redux_api import shape_escalations, shape_memory_evals
+
+NOW = datetime(2026, 10, 1, 12, 0, 0, tzinfo=UTC)
+"""The instant the ESCALATIONS side's corpus walk is measured at."""
 
 # ---------------------------------------------------------------------------
 # The checker
@@ -84,37 +93,51 @@ def _iter_memory_eval_escalations(
             yield (f'unmatched_escalations[{index}]', escalation)
 
 
+def _is_usable_focus_part(value: Any) -> bool:
+    """``escalation_focus.js::isUsableFocusPart``: a focus queue or id is a non-empty string."""
+    return isinstance(value, str) and value != ''
+
+
 def collect_escalation_id_violations(
     memory_evals_payload: dict[str, Any],
     escalations_payload: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    """Every MEMORY_EVALS escalation id that ESCALATIONS cannot resolve.
+    """Every MEMORY_EVALS escalation link that ESCALATIONS cannot resolve.
+
+    The browser's rule, mirrored: a link keys on ``(queue, id)`` with ``queue``
+    from ``MEMORY_EVALS.escalation_queue``, and resolves only when exactly one
+    row of that subsection carries the id (``escalation_focus.js::findEscalationRow``).
 
     Args:
-        memory_evals_payload: what ``build_memory_evals`` returns (the
-            MEMORY_EVALS block itself, unwrapped).
+        memory_evals_payload: the MEMORY_EVALS block itself, unwrapped, as the
+            route shapes it (``_build_memory_evals``), so it names its queue.
         escalations_payload: the ``ESCALATIONS`` block —
-            ``shape_escalations(build_escalation_queues(config), {})['ESCALATIONS']``.
+            ``_build_escalations(config)`` — ``shape_escalations(...)['ESCALATIONS']``.
             Rows live under ``subsections[k]['escalations']``; the key is
             ``escalations``, NOT ``rows`` (``rows`` is only ``shape_escalations``'
             local name for the list it is accumulating).
 
-    Returns a list of ``{path, id, kind, detail}`` records, empty when every id
-    resolves.  ``kind`` is:
+    Returns a list of ``{path, id, kind, detail}`` records, empty when every
+    link resolves.  ``kind`` is, in the order checked:
 
-    * ``unusable_id``   — the emitted id is ``None``.  Checked FIRST, and a
-      violation regardless of what it collides with: `_escalation_projection`
-      does a bare ``record.get('id')``, so a queue file with no ``id`` field
-      projects ``id: None`` and the JSX calls ``onNavigate('esc', undefined)``.
-      `findEscalationRow` then compares ``row.id === id`` and matches the FIRST
-      row whose id is also undefined — an arbitrary wrong escalation, or none.
-      Without this arm that case reports CLEAN, because ``str(None)`` collides
-      with itself and ``type(None) is type(None)``.
-    * ``absent``        — no row carries this id at all.  The link dead-ends.
-    * ``type_mismatch`` — a row carries the same id VALUE but at a different
-      Python type (``4242`` vs ``'4242'``).  Distinguished from ``absent``
-      because it is the failure a `==` check cannot see and the browser
-      cannot survive: `findEscalationRow` uses `row.id === id` with no
+    * ``unusable_id``   — the emitted id is not a non-empty string
+      (``_is_usable_focus_part``, the browser's own test).  Checked FIRST, and
+      a violation regardless of what it collides with: `findEscalationRow`
+      refuses such a focus, so the link resolves to no row and the tab shows
+      its miss notice rather than opening an arbitrary row.  No row can make
+      the link work, not even one carrying the same number at the same type.
+      `_escalation_projection` does a bare ``record.get('id')``, so a queue
+      file with no ``id`` field projects ``id: None``.
+    * ``unscoped``      — the payload names no usable ``escalation_queue``.
+      The link renders disabled, or its focus is refused, so nothing resolves.
+    * ``absent``        — no row of the named subsection carries this id.  The
+      link dead-ends, even when another subsection carries it.
+    * ``ambiguous``     — more than one row of the named subsection carries
+      this id.  `findEscalationRow` elects none and the tab opens nothing.
+    * ``type_mismatch`` — the one row carries the same id VALUE but at a
+      different Python type (``'4242'`` vs ``4242``).  Distinguished from
+      ``absent`` because it is the failure a `==` check cannot see and the
+      browser cannot survive: `findEscalationRow` uses `row.id === id` with no
       `String()` coercion, so a str/int drift renders "escalation not found"
       while both payloads look perfectly populated.  No coercion exists on
       either side TODAY — `shape_escalations` emits ``{**esc, ...}`` and the
@@ -141,59 +164,83 @@ def collect_escalation_id_violations(
             'subsections, and get an empty (vacuously clean) violation list.'
         )
 
-    # str-keyed so a same-value/different-type row is found and classified
-    # rather than reported as absent.  The list holds every type seen under
-    # that key, since two subsections may legitimately carry the same id.
+    queue = memory_evals_payload.get('escalation_queue')
+
+    # Keyed by (subsection id, str(row id)), so a same-value/different-type row
+    # is found and classified rather than reported as absent.  The list holds
+    # every row id under that key, since a tie is itself a violation.
     #
-    # A row whose own id is None is NOT indexed: `findEscalationRow` would
-    # "resolve" it only for a link that is itself undefined, which is the
-    # unusable_id violation below rather than a successful resolution.  Leaving
-    # it in would let one broken row launder another broken link into clean.
-    rows_by_str_id: dict[str, list[Any]] = {}
+    # A row whose own id is None is NOT indexed: no link can resolve to it, so
+    # leaving it in could only launder another broken link into clean.
+    rows_by_key: dict[tuple[Any, str], list[Any]] = {}
     for subsection in subsections or []:
         for row in subsection.get('escalations') or []:
             if isinstance(row, dict) and row.get('id') is not None:
-                rows_by_str_id.setdefault(str(row.get('id')), []).append(row.get('id'))
+                key = (subsection.get('id'), str(row.get('id')))
+                rows_by_key.setdefault(key, []).append(row.get('id'))
 
     violations: list[dict[str, Any]] = []
     for path, escalation in _iter_memory_eval_escalations(memory_evals_payload):
         emitted = escalation.get('id')
-        if emitted is None:
+        if not _is_usable_focus_part(emitted):
             violations.append({
                 'path': path,
-                'id': None,
+                'id': emitted,
                 'kind': 'unusable_id',
                 'detail': (
-                    f'MEMORY_EVALS {path} carries escalation id None — the queue '
-                    'record has no `id` and `_escalation_projection` passes that '
-                    "through verbatim. The JSX calls onNavigate('esc', undefined) "
-                    'and findEscalationRow matches the first row whose id is also '
-                    'undefined, so the link opens an arbitrary escalation or none. '
-                    'No row can make this id usable; the record itself is the bug.'
+                    f'MEMORY_EVALS {path} carries escalation id {emitted!r}, which is '
+                    'not a non-empty string. findEscalationRow refuses such a focus, '
+                    'so the link resolves to no row and shows the miss notice. No row '
+                    'can make this id usable; the record itself is the bug.'
                 ),
             })
             continue
-        candidates = rows_by_str_id.get(str(emitted))
+        if not _is_usable_focus_part(queue):
+            violations.append({
+                'path': path,
+                'id': emitted,
+                'kind': 'unscoped',
+                'detail': (
+                    f'MEMORY_EVALS {path} links escalation id {emitted!r}, but the '
+                    f'payload names no usable escalation_queue ({queue!r}), so the '
+                    'link resolves nothing.'
+                ),
+            })
+            continue
+        candidates = rows_by_key.get((queue, str(emitted)))
         if candidates is None:
             violations.append({
                 'path': path,
                 'id': emitted,
                 'kind': 'absent',
                 'detail': (
-                    f'MEMORY_EVALS {path} links escalation id {emitted!r}, which appears '
-                    'in NO ESCALATIONS row — tab_escalations.jsx findEscalationRow would '
-                    'resolve nothing and the tab would render "not found".'
+                    f'MEMORY_EVALS {path} links escalation id {emitted!r} in queue '
+                    f'{queue!r}, where NO ESCALATIONS row carries it — findEscalationRow '
+                    'keys on (queue, id), so it would resolve nothing and the tab would '
+                    'render "not found".'
                 ),
             })
-        elif not any(type(candidate) is type(emitted) for candidate in candidates):
+        elif len(candidates) > 1:
+            violations.append({
+                'path': path,
+                'id': emitted,
+                'kind': 'ambiguous',
+                'detail': (
+                    f'MEMORY_EVALS {path} links escalation id {emitted!r} in queue '
+                    f'{queue!r}, where {len(candidates)} ESCALATIONS rows carry it — '
+                    'findEscalationRow elects a row only when exactly one matches, so '
+                    'the tab opens none of them.'
+                ),
+            })
+        elif type(candidates[0]) is not type(emitted):
             violations.append({
                 'path': path,
                 'id': emitted,
                 'kind': 'type_mismatch',
                 'detail': (
                     f'MEMORY_EVALS {path} links escalation id {emitted!r} '
-                    f'({type(emitted).__name__}), but every ESCALATIONS row with that '
-                    f'value carries it as {sorted({type(c).__name__ for c in candidates})} — '
+                    f'({type(emitted).__name__}) in queue {queue!r}, but the ESCALATIONS '
+                    f'row with that value carries it as {type(candidates[0]).__name__} — '
                     'findEscalationRow compares with `===`, so the link dead-ends.'
                 ),
             })
@@ -206,16 +253,22 @@ def collect_escalation_id_violations(
 
 
 def _build_memory_evals(config) -> dict[str, Any]:
+    """The MEMORY_EVALS block, composed the way ``app.py::api_memory_evals`` composes it."""
     from dashboard.data.memory_evals import build_memory_evals
 
-    return build_memory_evals(
-        config.memory_evals_dir, config.reconciliation_escalations_dir
-    )
+    queue = reconciliation_queue(config)
+    return shape_memory_evals(
+        **build_memory_evals(config.memory_evals_dir, queue.directory),
+        escalation_queue=queue.id,
+    )['MEMORY_EVALS']
 
 
 def _build_escalations(config) -> dict[str, Any]:
     """The ESCALATIONS block, built from the SAME config the payload above used."""
-    return shape_escalations(build_escalation_queues(config), {})['ESCALATIONS']
+    queues = build_escalation_queues(
+        measure_corpus(corpus_queues(config), now=NOW), active_rows={},
+    )
+    return shape_escalations(queues, card_datums(queues, {}), served_at=NOW)['ESCALATIONS']
 
 
 def _reach_kind(path: str) -> str:
@@ -260,6 +313,9 @@ def test_the_id_space_check_catches_a_divergent_projection(tmp_path: Path, monke
         the same JSON, so a value comparison cannot see a coercion added to one
         side and would keep reporting a clean id space after the browser
         stopped resolving it.
+
+    (2') A NON-STRING id that both sides carry at the same type: no drift for
+        a type comparison to see, yet the browser refuses it.
 
     (3) An UNUSABLE id — a queue record with no `id` field at all, which
         `record.get('id')` projects as `None`.  Not a mutation of the producer:
@@ -326,13 +382,16 @@ def test_the_id_space_check_catches_a_divergent_projection(tmp_path: Path, monke
     #     hand-rolled `json.dumps`: a fourth spelling of the record would drift
     #     from `escalation.models.Escalation`, and dropping `sort_keys` /
     #     `ensure_ascii` would stop this file being byte-shaped like a real one.
+    #
+    #     The file is renamed to the queue's own `esc-*.json` spelling, because
+    #     ESCALATIONS reads the corpus walk, which globs only that.
     numeric_id = 4242
     esc_dir = config.reconciliation_escalations_dir
     write_escalation_record(
         esc_dir, numeric_id,
         summary='numeric-id escalation',
         dedupe_fingerprint='eval:no-such-eval|metric:no-such-metric',
-    )
+    ).rename(esc_dir / f'esc-{numeric_id}.json')
 
     escalations_with_numeric = _build_escalations(config)
     assert any(
@@ -362,9 +421,25 @@ def test_the_id_space_check_catches_a_divergent_projection(tmp_path: Path, monke
         f'the violation must carry the EMITTED id, not the on-disk one: {type_violations}'
     )
 
+    # (2') A NON-STRING id at the SAME type on both sides.  Under the REAL
+    #      projection the numeric record reaches MEMORY_EVALS as 4242 and its
+    #      row carries 4242 too, so a type comparison sees no drift.  But
+    #      findEscalationRow refuses any focus id that is not a non-empty
+    #      string, so the link opens nothing, and the mirror must refuse it too.
+    numeric_violations = collect_escalation_id_violations(
+        _build_memory_evals(config), escalations_with_numeric
+    )
+    assert [(v['kind'], v['id']) for v in numeric_violations] == [('unusable_id', numeric_id)], (
+        'a numeric id carried at the same type on both sides must be reported as '
+        'exactly one unusable_id violation: findEscalationRow refuses a non-string '
+        f'id however well the two payloads agree. Got: {numeric_violations}'
+    )
+    # Removed again, so arm (3) sees only its own degenerate record.
+    (esc_dir / f'esc-{numeric_id}.json').unlink()
+
     # (3) UNUSABLE id: a queue record with NO `id` key.  `_escalation_projection`
     #     reads `record.get('id')`, so the projection emits `id: None` and the
-    #     link becomes `onNavigate('esc', undefined)`.  Run against the REAL
+    #     link's focus carries an undefined id.  Run against the REAL
     #     projection — nothing is monkeypatched here, because the degenerate
     #     artifact IS the defect.
     #
@@ -394,13 +469,72 @@ def test_the_id_space_check_catches_a_divergent_projection(tmp_path: Path, monke
     assert [v['kind'] for v in idless_violations] == ['unusable_id'], (
         'an escalation projected with `id: None` must be reported as exactly one '
         'unusable_id violation. It is NOT clean merely because an ESCALATIONS row '
-        'also carries `id: None`: findEscalationRow compares `row.id === id`, so '
-        f'undefined matches the first id-less row and opens the wrong one. '
-        f'Got: {idless_violations}'
+        'also carries `id: None`: findEscalationRow refuses an undefined id, so the '
+        f'link opens nothing. Got: {idless_violations}'
     )
     assert idless_violations[0]['id'] is None, (
         f'the violation must carry the emitted id (None): {idless_violations}'
     )
+
+
+def test_the_id_space_check_scopes_by_queue(tmp_path: Path) -> None:
+    """The checker keys rows on ``(queue, id)``, as ``findEscalationRow`` does.
+
+    The browser resolves a link only inside the subsection MEMORY_EVALS names
+    (``escalation_queue``), and elects a row only when exactly one matches. An
+    id-only checker would report clean for a link scoped to the wrong queue,
+    for a tie the browser refuses to break, and for a payload that names no
+    queue at all, each of which the browser renders as a miss or a disabled
+    link.
+    """
+    tree = build_dual_escalation_tree(tmp_path)
+    escalations = _build_escalations(tree.config)
+    memory_evals = _build_memory_evals(tree.config)
+    reached = list(_iter_memory_eval_escalations(memory_evals))
+
+    # (a) CONTROL: clean on the real producers, and something was checked.
+    assert reached, 'the fixture reached no escalation, so every arm below is vacuous'
+    assert collect_escalation_id_violations(memory_evals, escalations) == []
+
+    # (b) WRONG QUEUE: a subsection ESCALATIONS serves, but not the one the
+    #     escalations live in. corpus_queues always lists the project root's
+    #     queue, even when its directory is absent.
+    other_queues = [
+        sub['id'] for sub in escalations['subsections'] if sub['kind'] != 'reconciliation'
+    ]
+    assert other_queues, 'ESCALATIONS served no non-reconciliation subsection'
+    wrong_queue = {**memory_evals, 'escalation_queue': other_queues[0]}
+    wrong = collect_escalation_id_violations(wrong_queue, escalations)
+    assert [v['kind'] for v in wrong] == ['absent'] * len(reached), (
+        f'every link scoped to {other_queues[0]!r} resolves to no row: {wrong}'
+    )
+    assert all(v['path'] for v in wrong), wrong
+
+    # (c) AMBIGUITY: two rows under one (queue, id). The browser opens neither.
+    reconciliation = next(
+        sub for sub in escalations['subsections'] if sub['id'] == 'reconciliation'
+    )
+    reached_ids = {escalation['id'] for _path, escalation in reached}
+    duplicated = next(row for row in reconciliation['escalations'] if row['id'] in reached_ids)
+    tied = copy.deepcopy(escalations)
+    next(
+        sub for sub in tied['subsections'] if sub['id'] == 'reconciliation'
+    )['escalations'].append(copy.deepcopy(duplicated))
+    ambiguous = collect_escalation_id_violations(memory_evals, tied)
+    assert ambiguous, f'a tie on {duplicated["id"]!r} must be reported'
+    assert {(v['id'], v['kind']) for v in ambiguous} == {(duplicated['id'], 'ambiguous')}, (
+        ambiguous
+    )
+    for violation in ambiguous:
+        assert violation['path'], violation
+        assert 'reconciliation' in violation['detail'], violation
+        assert '2' in violation['detail'], violation
+
+    # (d) NO QUEUE: the link renders disabled, so nothing resolves.
+    unscoped_payload = {**memory_evals, 'escalation_queue': None}
+    unscoped = collect_escalation_id_violations(unscoped_payload, escalations)
+    assert [v['kind'] for v in unscoped] == ['unscoped'] * len(reached), unscoped
+    assert all(v['path'] for v in unscoped), unscoped
 
 
 # ---------------------------------------------------------------------------
@@ -430,10 +564,11 @@ def test_every_memory_eval_escalation_id_resolves_in_the_escalations_payload(
 ) -> None:
     """Every escalation id MEMORY_EVALS emits resolves to an ESCALATIONS row.
 
-    The deliverable contract.  `tab_memory_evals.jsx` hands `escalation.id` to
-    `onNavigate('esc', ...)` and `tab_escalations.jsx` resolves it with
-    `row.id === id`; if the id spaces diverge the link dead-ends with both
-    payloads looking fully populated and the whole suite green.
+    The deliverable contract.  `tab_memory_evals.jsx` hands
+    `{queue: escalation_queue, id: escalation.id}` to the escalations tab and
+    `escalation_focus.js::findEscalationRow` resolves it with `row.id === id`
+    inside that queue's subsection; if the id spaces diverge the link dead-ends
+    with both payloads looking fully populated and the whole suite green.
 
     Membership is the live exposure, not type.  `_index_escalations` filters
     hard — non-`eval_regression` categories, closed statuses and duplicate

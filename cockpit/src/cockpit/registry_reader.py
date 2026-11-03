@@ -10,7 +10,7 @@ It is also the cockpit's PROJECT-TOKEN CANONICALIZATION BOUNDARY (task
 everything else that needs it points here. Read-only is unchanged --
 nothing here writes to disk -- but every record that enters the cockpit
 through this module leaves it with ``.project`` folded onto the one
-canonical spelling (``session_registry.normalize_project_token``, task
+canonical spelling (``shared.project_id.fold_project_token``, task
 3807). The reason the fold has to sit HERE, at the reader, rather than in
 the display or scoring adapters downstream: the cockpit unions its two
 record kinds -- sessions and decisions -- onto ONE ``project_weights`` key
@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 from orchestrator import session_registry
-from orchestrator.session_registry import normalize_project_token
+from shared.project_id import fold_project_token
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +72,7 @@ def _canonicalize_project(
     ``record.project = ...`` idiom.
 
     The inequality guard mirrors that same function's already-canonical
-    test (``normalize_project_token(p) == p``): a record already spelled
+    test (``fold_project_token(p) == p``): a record already spelled
     canonically is left untouched rather than rebound to an equal string.
     What the guard elides is that attribute rebind and nothing more -- the
     fold has already run and already built its stripped/casefolded/
@@ -82,7 +82,7 @@ def _canonicalize_project(
     against 1,493 ``dark_factory``), which is NOT canonical, so a cold scan
     really does rewrite most of what it reads.
     """
-    canonical = normalize_project_token(record.project)
+    canonical = fold_project_token(record.project)
     if canonical != record.project:
         record.project = canonical
 

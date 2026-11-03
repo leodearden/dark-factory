@@ -29,15 +29,12 @@ rationale.
 
 from __future__ import annotations
 
-import ast
 import json
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from shared import toolcall_markup
-from shared.mcp_markup_middleware import OUTCOMES
-from shared.toolcall_markup import ENVELOPE_LITERALS
+from shared.mcp_markup_middleware import MARKUP_RECURRENCE_ROUTING, OUTCOMES
 
 from fused_memory.server import markup_tripwire
 from fused_memory.server.markup_tripwire import (
@@ -283,8 +280,8 @@ class TestEmitMarkupStormEscalation:
         assert 'toolcall-markup-containment-prd.md' in routing_text, (
             f'must route the burst at the live successor PRD: {payload!r}'
         )
-        assert '3083' in routing_text, (
-            f'must still name DF 3083, as the closed predecessor: {payload!r}'
+        assert MARKUP_RECURRENCE_ROUTING in detail, (
+            f'must carry the ONE shared routing sentence, not a local copy: {detail!r}'
         )
         # The count's key is outcome-NEUTRAL and static (task 4505): this one
         # filer serves all three of the middleware's outcomes, and a key naming
@@ -809,7 +806,7 @@ class TestEmitMarkupStormEscalation:
         )
         # The routing survives — the grep is demoted, not the destination.
         assert 'plans/toolcall-markup-containment-prd.md' in action, action
-        assert '3083 is done and closed to appends' in action, action
+        assert MARKUP_RECURRENCE_ROUTING in action, action
 
     def test_the_remedy_is_still_static(self, tmp_path):
         """Never interpolated with the resolved values, and the reason is old.
@@ -925,102 +922,6 @@ class TestSingleSourceOfTruth:
         one assertion a duplicate cannot pass.
         """
         assert markup_tripwire.MCP_MARKUP_PATTERNS is toolcall_markup.MCP_MARKUP_PATTERNS
-
-
-# ---------------------------------------------------------------------------
-# Source-hygiene guard (task 4228): both files below predate the ``\x3c``
-# escape convention shared.toolcall_markup's "Sentinel-literal hazard"
-# section establishes. Modelled on
-# scripts/tests/test_sweep_toolcall_markup.py's
-# ``test_the_script_source_spells_no_raw_envelope_literal`` (cross-file) and
-# ``test_this_module_spells_no_raw_envelope_literal`` (self-file).
-#
-# Coverage is per-file opt-in, not repo-wide: this guard covers only
-# markup_tripwire.py and this test module. The sibling files carry guards of
-# their own (task 4948): test_markup_tripwire_gate.py guards itself, and
-# tests/test_markup_guard_fused_memory.py guards both itself and
-# markup_guard.py. Repo-wide enforcement (a ratchet, a hooks/project-checks
-# leg, or a CI leg) is deliberately not built here; task 5209 owns that
-# design call.
-# ---------------------------------------------------------------------------
-
-#: Needle set shared by both guards below: every ENVELOPE_LITERALS member plus
-#: the two structural prefixes a hand-spelled specimen could use instead of
-#: the enumerated literals — the bare closing-tag prefix (catches any closer,
-#: not just the enumerated ones) and the ``parameter`` opening-tag prefix with
-#: no trailing space (so it also catches an attribute-less opener spelling,
-#: not just the ``name=`` form already covered via ``ENVELOPE_LITERALS``).
-#: Hoisted to module level so the cross-file and self-file guards read the
-#: SAME construction rather than two that could silently drift apart.
-_RAW_SENTINEL_NEEDLES = (*ENVELOPE_LITERALS, chr(60) + '/', chr(60) + 'parameter')
-
-
-def _raw_sentinel_hits(source: str) -> dict[str, list[int]]:
-    """Map each offending needle found in ``source`` to its 1-based lines.
-
-    The scan body shared by both guards below — hoisting only the needle
-    tuple and leaving this comprehension duplicated would still let the two
-    guards drift apart (e.g. a per-line exemption added to one copy and not
-    the other), which is exactly what hoisting the tuple above is meant to
-    prevent.
-    """
-    source_lines = source.splitlines()
-    return {
-        needle: [i + 1 for i, line in enumerate(source_lines) if needle in line]
-        for needle in _RAW_SENTINEL_NEEDLES
-        if needle in source
-    }
-
-
-def test_the_tripwire_source_spells_no_raw_envelope_literal():
-    """CROSS-FILE: markup_tripwire.py's own source must carry no raw literal.
-
-    Paired with an anti-vacuity check that the module's docstring still names
-    every canonical pattern after decoding — a bare "no raw literal" scan
-    would be trivially satisfiable by deleting the explanatory lines instead
-    of escaping them.
-    """
-    source_path = (
-        Path(__file__).resolve().parents[2]
-        / 'src'
-        / 'fused_memory'
-        / 'server'
-        / 'markup_tripwire.py'
-    )
-    assert source_path.is_file(), f'expected markup_tripwire.py at {source_path}'
-    source = source_path.read_text(encoding='utf-8')
-
-    hits = _raw_sentinel_hits(source)
-    assert not hits, (
-        f'{source_path.name} contains raw envelope sentinel(s) {hits!r}. Spell '
-        "them with the \\x3c escape instead — see this module's docstring for "
-        'why.'
-    )
-
-    doc = ast.get_docstring(ast.parse(source))
-    assert doc is not None, f'{source_path.name} lost its module docstring'
-    for pattern in MCP_MARKUP_PATTERNS:
-        assert pattern in doc, (
-            f'{pattern!r} is missing from the decoded docstring of '
-            f'{source_path.name} — escaping must not delete the specimen it '
-            'explains.'
-        )
-
-
-def test_this_module_spells_no_raw_envelope_literal():
-    """SELF-FILE (the idiom task 4696 promoted): this test module's own
-    source must never contain a raw envelope literal either — see this
-    module's docstring for why.
-    """
-    source = Path(__file__).read_text(encoding='utf-8')
-
-    hits = _raw_sentinel_hits(source)
-    assert not hits, (
-        'A raw envelope literal was written into this test file. Spell it '
-        "with the \\x3c escape instead — see this module's docstring for "
-        f'why. Offending needle(s): {hits!r}.'
-    )
-
 
 
 # ---------------------------------------------------------------------------
@@ -1162,3 +1063,37 @@ class TestDelegatesToTheSharedHelper:
 
         assert seen['category'] == 'mcp_markup_residue'
         assert seen['level'] == 2
+
+
+# ---------------------------------------------------------------------------
+# Where the residue record sends a recurrence.
+#
+# Appended at end of file, per this module's own convention above.
+# ---------------------------------------------------------------------------
+
+
+class TestTheResidueRecordRouting:
+    """The residue filer routes through the shared sentence (task 5698)."""
+
+    def test_the_residue_record_routes_a_recurrence_through_the_shared_sentence(
+        self, tmp_path,
+    ):
+        """Driven through the REAL queue: the routing lives in the record an
+        operator reads, so read that record back off disk."""
+        pytest.importorskip('escalation')
+
+        esc_id = markup_tripwire.emit_markup_residue_escalation(
+            str(tmp_path),
+            {'tool': 'add_memory', 'field': 'content', 'raw_value': 'payload bytes'},
+        )
+
+        assert esc_id is not None
+        files = list((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
+        assert len(files) == 1, f'expected exactly one escalation file, found: {files}'
+        payload = json.loads(files[0].read_text())
+        assert payload['id'] == esc_id
+        assert 'toolcall-markup-containment-prd.md' in payload['detail']
+        assert MARKUP_RECURRENCE_ROUTING in payload['detail'], (
+            f'must carry the ONE shared routing sentence, not a local copy: '
+            f'{payload["detail"]!r}'
+        )

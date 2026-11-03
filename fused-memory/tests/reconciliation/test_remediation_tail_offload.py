@@ -19,22 +19,24 @@ What the ticker reports is the WORST GAP between its turns, not how many turns
 it got: a wedge puts a hard floor under that gap, while a tick count also
 tracks machine speed and would red on a busy CI box.
 
-Harness scaffolding is re-created locally rather than imported from
-tests/test_harness.py — the convention set by tests/reconciliation/test_active_runs.py,
-since ``fused-memory/tests`` is not an importable package.
+The harness and its stores come from ``reconciliation.harness_fixtures``.
 """
 from __future__ import annotations
 
 import asyncio
 import contextlib
 import logging
+import os
+import shlex
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
+from shared.scheduler_state import SchedulerStateSnapshot
 
 import fused_memory.reconciliation.harness as harness_module
 from fused_memory.models.reconciliation import (
@@ -43,16 +45,23 @@ from fused_memory.models.reconciliation import (
     RunType,
     StageReport,
 )
-from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
 from fused_memory.reconciliation import escalation_archive
-from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.harness import (
     _INTEGRITY_FINDING_RECURRENCE_THRESHOLD,
     TierConfig,
     _derive_affected_ids,
 )
-from fused_memory.reconciliation.journal import ReconciliationJournal
+from fused_memory.reconciliation.stages.task_knowledge_sync import IntegrityCheck
 from fused_memory.reconciliation.task_filter import FilteredTaskTree
+from reconciliation.consolidator_fixtures import make_scope
+from reconciliation.harness_fixtures import (
+    make_harness,
+    make_harness_config,
+    make_memory_service,
+    open_event_buffer,
+    open_journal,
+    stub_stage_runs,
+)
 
 pytest.importorskip('escalation.queue')
 from escalation.dedupe import compute_content_fingerprint  # noqa: E402
@@ -64,115 +73,52 @@ PROJECT_ROOT = '/tmp/test-project'
 
 TICK_SECONDS = 0.005
 
-#: How long each stubbed blocking primitive sleeps, in the thread it should be
-#: running in — a margin over scheduler jitter, not a timing the code relies on.
-SCAN_BLOCK_SECONDS = 1.0
-PROBE_BLOCK_SECONDS = 1.0
+#: How long each stubbed slow primitive takes, off the loop where it belongs —
+#: a margin over scheduler jitter, not a timing the code relies on.
+SCAN_BLOCK_SECONDS = 2.0
+PROBE_BLOCK_SECONDS = 2.0
+GIT_BLOCK_SECONDS = 2.0
 
 
 def _max_gap_ceiling(blocked_seconds: float) -> float:
     """The longest loop stall tolerated while *blocked_seconds* of work runs.
 
     A call held on the loop thread stalls it for at least *blocked_seconds*;
-    offloaded, the worst gap is only scheduler jitter.  Half the block splits
-    the two.
+    offloaded, the worst gap is only scheduler jitter.  Three quarters of the
+    block sits between the two.
     """
-    return blocked_seconds / 2
+    return blocked_seconds * 0.75
 
 
-# ── Local harness scaffolding (mirrors tests/test_harness.py) ────────────────
-
-
-def _scope(project_id: str, project_root: str) -> ProjectScope:
-    return ProjectScope(ProjectId(project_id), ProjectRoot(project_root))
-
-
-def _rescope(stages: list, scope: ProjectScope) -> list:
-    """Re-scope pinned stage instances in place so the ``_make_stages`` shim
-    honors the scope production passes while keeping the mocked ``.run``."""
-    for s in stages:
-        s.scope = scope
-    return stages
+# ── Harness wiring ───────────────────────────────────────────────────────────
 
 
 @pytest_asyncio.fixture
 async def journal(tmp_path):
-    j = ReconciliationJournal(tmp_path / 'tail_offload_journal')
-    await j.initialize()
-    yield j
-    await j.close()
+    async with open_journal(tmp_path / 'tail_offload_journal') as j:
+        yield j
 
 
 @pytest_asyncio.fixture
 async def event_buffer(tmp_path):
-    buf = EventBuffer(
-        db_path=tmp_path / 'tail_offload_eb.db',
-        buffer_size_threshold=2,
-        max_staleness_seconds=3600,
-    )
-    await buf.initialize()
-    yield buf
-    await buf.close()
+    async with open_event_buffer(tmp_path / 'tail_offload_eb.db') as b:
+        yield b
 
 
 @pytest.fixture
 def memory_service():
-    svc = AsyncMock()
-    svc.search = AsyncMock(return_value=[])
-    svc.get_episodes = AsyncMock(return_value=[])
-    svc.get_status = AsyncMock(
-        return_value={
-            'graphiti': {'connected': True},
-            'mem0': {'connected': True},
-            'projects': {},
-        }
-    )
-    svc.get_entity = AsyncMock(return_value={'nodes': [], 'edges': []})
-    svc.get_memories_by_metadata = AsyncMock(return_value=[])
-    svc.mem0 = AsyncMock()
-    svc.mem0.get_all = AsyncMock(return_value={'results': []})
-    return svc
+    return make_memory_service()
 
 
 def _make_harness(journal, event_buffer, memory_service):
-    from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
-    from fused_memory.reconciliation.harness import ReconciliationHarness
-
-    config = FusedMemoryConfig(
-        reconciliation=ReconciliationConfig(
-            enabled=True,
-            explore_codebase_root='/tmp/test',
-            agent_llm_provider='anthropic',
-            agent_llm_model='claude-sonnet-4-20250514',
-        )
-    )
-    harness = ReconciliationHarness(
-        memory_service=memory_service,
-        taskmaster=AsyncMock(),
+    return make_harness(
         journal=journal,
         event_buffer=event_buffer,
-        config=config,
+        memory_service=memory_service,
+        taskmaster=AsyncMock(),
+        config=make_harness_config(judge_enabled=False),
+        known_projects={PROJECT_ID: PROJECT_ROOT},
     )
-    harness.judge = None
-    harness._known_projects = {PROJECT_ID: PROJECT_ROOT}
-    harness.stages = harness._make_stages(_scope(PROJECT_ID, PROJECT_ROOT))
-    harness._make_stages = lambda scope, **k: _rescope(harness.stages, scope)
-    return harness
-
-
-def _mock_stage_run(stage, items_flagged=None):
-    async def mock_run(events, watermark, prior_reports, run_id, model=None, _s=stage):
-        return StageReport(
-            stage=_s.stage_id,
-            started_at=datetime.now(UTC),
-            completed_at=datetime.now(UTC),
-            items_flagged=items_flagged or [],
-            stats={},
-            llm_calls=0,
-            tokens_used=0,
-        )
-
-    stage.run = mock_run
 
 
 def _finding_citing(
@@ -309,20 +255,22 @@ async def _prepare_pass(
     # pytest-unmanaged /tmp/test-project root.
     monkeypatch.setattr(
         harness_module, 'read_scheduler_state',
-        lambda _root: {
-            'queue': [], 'parks': {}, 'park_stacks': {},
-            'effective_priorities': {}, 'pin_queue': [], 'overrides': {},
-            'current_holders': {}, 'is_paused': False, 'pause_reason': None,
-            'snapshot_at': None,
-        },
+        lambda _root: SchedulerStateSnapshot.empty(),
     )
     monkeypatch.setattr(harness_module, 'orchestrator_started_at', lambda _root: None)
 
     await _seed_persistence(journal, findings)
 
-    _mock_stage_run(harness.stages[0])
-    _mock_stage_run(harness.stages[1])
-    _mock_stage_run(harness.stages[2], items_flagged=findings)
+    async def fake_run(
+        self, events, watermark, prior_reports, run_id, model=None, resume_session_id=None,
+    ):
+        now = datetime.now(UTC)
+        items_flagged = findings if isinstance(self, IntegrityCheck) else []
+        return StageReport(
+            stage=self.stage_id, started_at=now, completed_at=now, items_flagged=items_flagged,
+        )
+
+    stub_stage_runs(monkeypatch, fake_run)
 
     tree = FilteredTaskTree(
         active_tasks=list(cited_tasks or []), total_count=len(cited_tasks or []),
@@ -332,7 +280,7 @@ async def _prepare_pass(
     def run_pass():
         return harness._run_remediation_pass(
             PROJECT_ID, 'parent-run-id', findings, tier,
-            scope=_scope(PROJECT_ID, PROJECT_ROOT),
+            scope=make_scope(PROJECT_ID, PROJECT_ROOT),
             filtered_task_tree=tree,
             filtered_task_tree_fetched_at=datetime.now(UTC),
         )
@@ -361,7 +309,7 @@ class TestArchiveScanLeavesTheLoop:
     async def test_loop_keeps_ticking_while_the_archive_is_scanned(
         self, journal, event_buffer, memory_service, tmp_path, monkeypatch,
     ):
-        """A second of scan must not cost the loop a second of silence.
+        """Seconds of scan must not cost the loop seconds of silence.
 
         Task 901 reads as live so nothing escalates: `_escalate` still fsyncs
         on the loop (task 5270), and under load that stall would be measured
@@ -459,8 +407,7 @@ class TestArchiveScanLeavesTheLoop:
 # ── SITE 2: the live-workflow git probes ─────────────────────────────────────
 
 
-def _stub_probe(monkeypatch, probed: list, *, live_ids: frozenset[str] = frozenset(),
-                block: float = PROBE_BLOCK_SECONDS):
+def _stub_detector(monkeypatch, probed: list, *, live_ids: frozenset[str], block: float):
     """Replace the live-workflow detector with a slow stub that records ids.
 
     Stands in for ``is_workflow_live_for_task``, a coroutine since task 3778
@@ -475,6 +422,42 @@ def _stub_probe(monkeypatch, probed: list, *, live_ids: frozenset[str] = frozens
         return str(tid) in live_ids
 
     monkeypatch.setattr(harness_module, 'is_workflow_live_for_task', _is_live)
+
+
+def _stub_probe(monkeypatch, probed: list, *, live_ids: frozenset[str] = frozenset(),
+                block: float = PROBE_BLOCK_SECONDS):
+    """``_stub_detector``, with the worktree index the pass hoists stubbed out too.
+
+    The real index spawns a ``git worktree list`` inside the measured window.
+    ``TestHoistedWorktreeIndexLeavesTheLoop`` is the one test that keeps it.
+    """
+
+    async def _no_worktree_index(_project_root):
+        return {}
+
+    _stub_detector(monkeypatch, probed, live_ids=live_ids, block=block)
+    monkeypatch.setattr(harness_module, 'worktree_index_kwargs', _no_worktree_index)
+
+
+def _slow_git_first_on_path(monkeypatch, tmp_path: Path, *, block: float) -> Path:
+    """Put a ``git`` that takes *block* seconds first on PATH; return its call log.
+
+    Every invocation appends its arguments to the log, sleeps, then answers
+    with an empty successful listing, which reads as a known-empty worktree
+    index.
+    """
+    bin_dir = tmp_path / 'slow-git-bin'
+    bin_dir.mkdir()
+    call_log = tmp_path / 'slow-git-calls'
+    git = bin_dir / 'git'
+    git.write_text(
+        '#!/bin/sh\n'
+        f'echo "$*" >> {shlex.quote(str(call_log))}\n'
+        f'sleep {block}\n'
+    )
+    git.chmod(0o755)
+    monkeypatch.setenv('PATH', f'{bin_dir}{os.pathsep}{os.environ["PATH"]}')
+    return call_log
 
 
 class TestLiveWorkflowProbesLeaveTheLoopAndAreMemoised:
@@ -652,6 +635,45 @@ class TestRoutedTargetGateUsesTheSameMemo:
         assert probed == ['901', '902'], (
             f'expected 902 to be probed once (as a cited id) and then served from '
             f'the memo to the routed-target gate, got {probed}'
+        )
+
+
+class TestHoistedWorktreeIndexLeavesTheLoop:
+    """The one ``git worktree list`` the pass hoists must not hold the loop.
+
+    This test keeps the real ``worktree_index_kwargs`` and makes ``git``
+    itself slow, so a hoist that spawned git blockingly, through any spawn
+    API, would stall the loop for the whole of git's run.
+    """
+
+    @pytest.mark.asyncio
+    async def test_loop_keeps_ticking_while_the_worktree_index_is_listed(
+        self, journal, event_buffer, memory_service, tmp_path, monkeypatch,
+    ):
+        """Task 901 reads as live so nothing escalates: `_escalate` still
+        fsyncs on the loop (task 5270), and under load that stall would be
+        measured instead of git's."""
+        git_calls = _slow_git_first_on_path(monkeypatch, tmp_path, block=GIT_BLOCK_SECONDS)
+        _stub_scan(monkeypatch, [], block=0.0)
+        _stub_detector(monkeypatch, [], live_ids=frozenset({'901'}), block=0.0)
+        _, _, run_pass = await _prepare_pass(
+            journal=journal, event_buffer=event_buffer, memory_service=memory_service,
+            tmp_path=tmp_path, monkeypatch=monkeypatch,
+            findings=[_finding_citing('901')],
+            cited_tasks=[_in_progress_task('901')],
+        )
+
+        ticks, worst = await _worst_loop_stall(run_pass())
+
+        assert git_calls.exists() and 'worktree list' in git_calls.read_text(), (
+            'the hoisted worktree list never reached git — the index is not exercised'
+        )
+        assert ticks, 'the ticker never ran — the measurement is vacuous'
+        assert worst < _max_gap_ceiling(GIT_BLOCK_SECONDS), (
+            f'the event loop stalled for {worst * 1000:.0f}ms during the pass; '
+            f'the hoisted worktree list is spawning git inline on the loop '
+            f'(git takes {GIT_BLOCK_SECONDS * 1000:.0f}ms, so a stall at or above '
+            f'that is git holding the loop thread)'
         )
 
 

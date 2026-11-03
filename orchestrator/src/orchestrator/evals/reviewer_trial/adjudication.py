@@ -64,6 +64,28 @@ def _proposal_to_dicts(frontier_proposal: Iterable[Any]) -> list[dict]:
     return result
 
 
+def select_spot_check_subset(
+    diff_ids: Iterable[str],
+    fraction: float = 0.1,
+    minimum: int = 5,
+    sticky: Iterable[str] = (),
+) -> set[str]:
+    """A deterministic, evenly spread sample of *diff_ids* (``fraction`` of them, at least ``minimum``), plus every *sticky* id among them.
+
+    The sample depends only on the set of *diff_ids*, not their order. A
+    *sticky* id not in *diff_ids* is dropped.
+    """
+    ordered = sorted(diff_ids)
+    n = len(ordered)
+    if n == 0:
+        return set()
+    sticky_ids = {diff_id for diff_id in sticky if diff_id in ordered}
+    k = min(n, max(minimum, round(n * fraction)))
+    step = n / k
+    sampled = {ordered[int(i * step)] for i in range(k)}
+    return sticky_ids | sampled
+
+
 @dataclass
 class AdjudicationLog:
     """Append-only log of adjudication entries, one per mined diff."""
@@ -98,6 +120,24 @@ class AdjudicationLog:
     def spot_check_subset(self) -> list[AdjudicationEntry]:
         """Return the documented human spot-check subset (flagged entries)."""
         return [e for e in self.entries if e.in_spot_check_subset]
+
+    def grow_spot_check_subset(self, diff_ids: Iterable[str]) -> None:
+        """Re-sample the spot-check subset over *diff_ids*; membership only grows.
+
+        An entry already flagged, or one a human has acted on (its
+        ``spot_check_status`` is no longer ``'pending'``), stays flagged, so
+        prior sign-off is never silently dropped as the corpus grows. Entries
+        outside *diff_ids* are untouched.
+        """
+        ids = set(diff_ids)
+        entries = [e for e in self.entries if e.diff_id in ids]
+        sticky = {
+            e.diff_id for e in entries
+            if e.in_spot_check_subset or e.spot_check_status != 'pending'
+        }
+        subset = select_spot_check_subset(ids, sticky=sticky) if ids else set()
+        for entry in entries:
+            entry.in_spot_check_subset = entry.diff_id in subset
 
     def save(self, path: Path) -> None:
         """Write the log as JSONL — one AdjudicationEntry object per line."""

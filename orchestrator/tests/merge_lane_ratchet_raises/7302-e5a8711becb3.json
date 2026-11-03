@@ -1,0 +1,48 @@
+{
+  "task_id": "7302",
+  "reason": "Recording-only additions for task 7302: MergeResult.conflicted_paths + GitOps.unmerged_paths, ConflictEvidence/MergeBlockCategory carried on MergeOutcome, conflicted_paths on conflict merge_attempt emits, typed POST_MERGE_VERIFY stamps; not a failed refactor.",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 1483,
+      "current": 1489
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py::GitOps::merge_to_main",
+      "baseline": 9,
+      "current": 12
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/gates.py",
+      "baseline": 356,
+      "current": 358
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/gates.py::_emit_merge_attempt",
+      "baseline": 20,
+      "current": 22
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 2256,
+      "current": 2258
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py::_do_train_merge",
+      "baseline": 37,
+      "current": 38
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5016,
+      "current": 5027
+    }
+  ]
+}

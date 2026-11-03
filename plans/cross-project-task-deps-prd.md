@@ -10,7 +10,7 @@ Let a task in one project declare a dependency on a task in **another** project,
 
 Each project is isolated across three boundaries, and a cross-project dep has to cross all three:
 
-- **Storage** — per-project SQLite DB at `<project_root>/.taskmaster/tasks/tasks.db`; the `dependencies` table is `(tag, task_id, parent_id, depends_on)` with an **integer** `depends_on` and no project column (`fused-memory/src/fused_memory/backends/sqlite_task_backend.py:83`). Task IDs are per-project autoincrement and collide across projects.
+- **Storage** — per-project SQLite DB at `<project_root>/.taskmaster/tasks/tasks.db`; the `dependencies` table's `depends_on` is an **integer** with no project column beside it (`fused-memory/src/fused_memory/backends/sqlite_task_backend.py::_SCHEMA_SQL`; `python scripts/tasks_db_schema.py` prints the live shape). Task IDs are per-project autoincrement and collide across projects.
 - **Write API** — `add_dependency(id, depends_on, project_root)` validates that **both** endpoints exist in the **same** `project_root` and rejects anything else with `No tasks found for ID(s)` (`sqlite_task_backend.py:1042`).
 - **Gate** — the scheduler's `_deps_satisfied()` builds `status_map` from a single `get_tasks(project_root=self._project_root)` and does `status_map.get(dep_id, 'unknown')` (`orchestrator/src/orchestrator/scheduler.py:1444`, `2089`). A foreign dep ID falls to `'unknown'`, which isn't terminal → the task blocks forever, silently.
 

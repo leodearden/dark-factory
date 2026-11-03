@@ -20,6 +20,7 @@ import json
 from pathlib import Path
 
 import pytest
+from _mint_driver_loader import load_mint_driver
 
 # Matches the parents[2] convention used by conftest.py and the sibling
 # evals tests (test_eval_bootstrap_smoke.py). Defined locally rather than
@@ -224,7 +225,7 @@ class TestMergeShaAvailability:
         # denominator) beside rows reading referenced=20, planrate_only=19
         # over 39 included candidates, and called the SPLIT set a MAJORITY
         # when it is now the smaller of the two.
-        driver = _load_driver()
+        driver = load_mint_driver()
         assert manifest['merge_sha_availability'] == \
             driver.merge_sha_availability_block(manifest['candidates'])
 
@@ -278,30 +279,13 @@ class TestCurationMdIsGenerated:
     def test_rerender_is_byte_identical(self, manifest: dict) -> None:
         # The load-bearing invariant: two hand-maintained artifacts drift
         # silently, so the table is a pure function of the manifest.
-        import sys
-        sys.path.insert(0, str(REPO_ROOT / 'scripts'))
-        import importlib.util
-        spec = importlib.util.spec_from_file_location(
-            '_mint_driver_for_render', REPO_ROOT / 'scripts' / 'mint_hard_v2_fixtures.py',
-        )
-        assert spec is not None and spec.loader is not None
-        driver = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = driver
-        spec.loader.exec_module(driver)
+        driver = load_mint_driver('_mint_driver_for_render')
 
         assert driver.render_curation_md(manifest) == CURATION_MD.read_text()
 
     def test_renderer_is_pure(self, manifest: dict) -> None:
         # No wall-clock / no env, or the byte-equality test above is flaky.
-        import importlib.util
-        import sys
-        spec = importlib.util.spec_from_file_location(
-            '_mint_driver_purity', REPO_ROOT / 'scripts' / 'mint_hard_v2_fixtures.py',
-        )
-        assert spec is not None and spec.loader is not None
-        driver = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = driver
-        spec.loader.exec_module(driver)
+        driver = load_mint_driver('_mint_driver_purity')
         assert driver.render_curation_md(manifest) == driver.render_curation_md(manifest)
 
     def test_table_names_every_candidate(self, manifest: dict) -> None:
@@ -532,7 +516,7 @@ class TestMintedPool:
         # The DEFECT-2 invariant. A fixture may only claim its reference is
         # unavailable when no single landing merge exists under EITHER
         # accepted subject spelling — the same check that produced the claim.
-        driver = _load_driver()
+        driver = load_mint_driver()
         checked = 0
         for f in pool:
             if 'reference_unavailable' not in f['provenance']:
@@ -573,24 +557,6 @@ class TestMintedPool:
         assert fixture['provenance']['merge_sha'].startswith('3613bea224')
         assert fixture['provenance']['baseline_source'] == 'merge_first_parent'
         assert fixture['provenance']['base_is_approximated'] is False
-
-
-def _load_driver():
-    """Import ``scripts/mint_hard_v2_fixtures.py`` by path (not a package).
-
-    Same loader shape as ``test_mint_hard_v2_driver.py``: the pool invariants
-    below must be checked with the SAME matcher that stamped the claims, not
-    with a second copy that could drift from it.
-    """
-    import importlib.util
-    import sys
-    path = REPO_ROOT / 'scripts' / 'mint_hard_v2_fixtures.py'
-    spec = importlib.util.spec_from_file_location('mint_hard_v2_fixtures', path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
 
 
 def _mint_modes(manifest: dict) -> dict[str, str]:
@@ -753,6 +719,7 @@ class TestContinuityFixtures:
             assert got['provenance']['baseline_source'] == CONTINUITY_RUNG, \
                 entry['id']
 
+    @pytest.mark.reads_git_history
     def test_source_fixtures_are_byte_unchanged_since_before_beta1(
         self, continuity: list[dict],
     ) -> None:

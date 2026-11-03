@@ -333,17 +333,19 @@ class TestReindexEmbedderPathReachesConfiguredEndpoint:
                 ),
                 patch('fused_memory.maintenance.reindex.ReindexManager') as mock_mgr_cls,
             ):
+                # The REAL embedder run_reindex built is used while the run
+                # still owns it: run_reindex closes it on the way out.
+                async def embed_during_the_run(*_args, **_kwargs):
+                    embedder = mock_mgr_cls.call_args.kwargs['embedder']
+                    assert server.requests == [], 'no traffic expected before create()'
+                    await embedder.create(['some stale content'])
+                    return mock_result
+
                 mock_mgr = MagicMock()
-                mock_mgr.reindex_and_replay = AsyncMock(return_value=mock_result)
+                mock_mgr.reindex_and_replay = AsyncMock(side_effect=embed_during_the_run)
                 mock_mgr_cls.return_value = mock_mgr
 
                 await run_reindex()
-
-            # Capture the REAL embedder run_reindex built and constructed.
-            embedder = mock_mgr_cls.call_args.kwargs['embedder']
-            assert server.requests == [], 'no traffic expected before create()'
-
-            await embedder.create(['some stale content'])
 
             embedding_requests = server.requests_to('/embeddings')
             assert len(embedding_requests) == 1, (
@@ -387,12 +389,14 @@ class TestIndependentLLMAndEmbedderEndpoints:
                 ),
                 patch('fused_memory.maintenance.reindex.ReindexManager') as mock_mgr_cls,
             ):
+                async def embed_during_the_run(*_args, **_kwargs):
+                    await mock_mgr_cls.call_args.kwargs['embedder'].create(['stale'])
+                    return mock_result
+
                 mock_mgr = MagicMock()
-                mock_mgr.reindex_and_replay = AsyncMock(return_value=mock_result)
+                mock_mgr.reindex_and_replay = AsyncMock(side_effect=embed_during_the_run)
                 mock_mgr_cls.return_value = mock_mgr
                 await run_reindex()
-
-            await mock_mgr_cls.call_args.kwargs['embedder'].create(['stale'])
 
             # Exact counts, not "contains" — a base_url that is plumbed but
             # ignored would show up as a server that saw nothing.

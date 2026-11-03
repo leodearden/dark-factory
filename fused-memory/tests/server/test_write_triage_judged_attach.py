@@ -21,6 +21,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _sdk_client_stubs import sdk_client_double
 
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.memory import MemoryResult
@@ -39,6 +40,7 @@ from fused_memory.server.write_triage import (
     OUTCOME_RESTATED,
     OUTCOME_STORED,
     ROUTED_KEY,
+    JudgeUsage,
     TriageFailOpenCounter,
     TriageJudgeVerdict,
     triage_write,
@@ -158,6 +160,24 @@ class TestTheJudgedCandidateIsTheAttachTarget:
         assert decision.canonical_id == 'm3'
         assert decision.judged_candidate_id == 'm3'
         assert counter.live_count() == 0
+
+    @pytest.mark.asyncio
+    async def test_a_verdict_carrying_usage_attaches_to_its_candidate(self) -> None:
+        counter = _counter()
+        verdict = TriageJudgeVerdict(
+            OUTCOME_AMENDED, 'm3',
+            JudgeUsage(input_tokens=900, output_tokens=60, reasoning_tokens=40),
+        )
+
+        decision = await _triage(_middle_band_slate(), _judge_answering(verdict), counter)
+
+        assert decision.outcome == OUTCOME_AMENDED
+        assert decision.judged_candidate_id == 'm3'
+        assert counter.live_count() == 0
+
+    def test_a_verdict_defaults_to_no_usage(self) -> None:
+        assert TriageJudgeVerdict(OUTCOME_STORED).usage is None
+        assert JudgeUsage(1, 2).reasoning_tokens is None
 
     @pytest.mark.asyncio
     async def test_a_bare_word_names_no_candidate_and_attaches_to_the_bands_winner(
@@ -337,13 +357,20 @@ def _tool_service(results: list[MemoryResult]) -> AsyncMock:
 
 
 def _provider_answering(answer: dict) -> MagicMock:
-    """A fake ``AsyncOpenAI``, its own async context manager as the SDK's is."""
-    message = types.SimpleNamespace(content=json.dumps(answer))
-    client = MagicMock()
-    client.__aenter__ = AsyncMock(return_value=client)
-    client.__aexit__ = AsyncMock(return_value=False)
-    client.chat.completions.create = AsyncMock(return_value=types.SimpleNamespace(
-        choices=[types.SimpleNamespace(message=message)],
+    """A fake ``AsyncOpenAI`` that answers *answer* on the Responses API.
+
+    Its usage is real-shaped, reasoning tokens included, so the tool-level
+    path carries a verdict with usage end to end.
+    """
+    client = sdk_client_double()
+    client.responses.create = AsyncMock(return_value=types.SimpleNamespace(
+        output_text=json.dumps(answer),
+        status='completed',
+        incomplete_details=None,
+        usage=types.SimpleNamespace(
+            input_tokens=900, output_tokens=60,
+            output_tokens_details=types.SimpleNamespace(reasoning_tokens=40),
+        ),
     ))
     return client
 

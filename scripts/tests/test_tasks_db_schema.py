@@ -7,15 +7,16 @@ property check against a temp db built by ``scripts/tests/conftest.py``'s
 ``make_tasks_db``: the tool's report must equal what ``PRAGMA table_info``
 says about that same connection, and the python type it claims for a column
 must be the type a real insert/select actually hands back. A test that pinned
-the live tasks columns would make this suite the fifth hand-maintained copy of
-the column list — the very population the tool exists to retire.
+the live tasks columns would make this suite a hand-maintained copy of the
+column list — the very population the tool exists to retire.
 
 NOTHING HERE IMPORTS ``fused_memory.backends.sqlite_task_backend``, and that is
 deliberate rather than an oversight. It hard-imports ``aiosqlite``, which the
 ``uv run --project shared`` environment this suite runs under does not carry —
 a ``ModuleNotFoundError`` shape the confusion codebook records at least five
-separate times. Asserting against ``_SCHEMA_SQL`` would also test the wrong
-property: the tool must be right about a store it has never seen.
+separate times. Asserting against ``shared.task_store_schema.TASK_STORE_DDL``
+would also test the wrong property: the tool must be right about a store it
+has never seen.
 
 COVERAGE — the two chains that run this directory (see
 ``scripts/tests/test_task_db_scan.py``'s docstring for the near-homograph trap
@@ -35,12 +36,14 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from _task_db_scan import connect_ro
+from shared.tasks_db_readonly import connect_ro
 from tasks_db_schema import (
     EXIT_OK,
     EXIT_UNREADABLE,
     MainCheckoutUnresolved,
+    columns_outside,
     introspect,
+    introspect_ddl,
     main,
     resolve_live_db_path,
 )
@@ -154,7 +157,7 @@ def test_resolve_live_db_path_refuses_a_start_outside_any_git_tree(tmp_path):
 # The tool must be right about a store it has never seen, so every expectation
 # below is derived from the SAME connection through PRAGMA table_info rather
 # than written down here. A test that spelled out the tasks columns would be
-# the fifth hand-maintained copy of them.
+# a hand-maintained copy of them.
 # ---------------------------------------------------------------------------
 
 def _arbitrary_db(tmp_path: Path) -> Path:
@@ -373,6 +376,114 @@ def test_a_column_with_no_declared_type_is_reported_as_unconstrained(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# introspect_ddl(ddl) -> tuple[Table, ...]
+# columns_outside(candidate, reference) -> ((table, Column), ...)
+#
+# Arbitrary inline DDLs only: the properties are "a DDL is reported exactly as
+# a store built from it is" and "every candidate column the reference does not
+# declare identically is reported", whatever the schema.
+# ---------------------------------------------------------------------------
+
+def _pair_ddl(note: str = "note TEXT", primary_key: str = "left_id, right_id") -> str:
+    return f"""
+    CREATE TABLE pair (
+        left_id  INTEGER NOT NULL,
+        right_id INTEGER NOT NULL,
+        {note},
+        PRIMARY KEY ({primary_key})
+    );
+    """
+
+
+def _column(tables, table_name: str, column_name: str):
+    (column,) = (
+        column
+        for table in tables
+        if table.name == table_name
+        for column in table.columns
+        if column.name == column_name
+    )
+    return column
+
+
+def test_introspect_ddl_reports_what_introspect_reports_for_a_store_built_from_that_ddl(
+    tmp_path,
+):
+    ddl = _pair_ddl() + "CREATE TABLE loose (anything);"
+    built = tmp_path / "built.db"
+    builder = sqlite3.connect(built)
+    try:
+        builder.executescript(ddl)
+    finally:
+        builder.close()
+    conn = connect_ro(built)
+    try:
+        expected = introspect(conn)
+    finally:
+        conn.close()
+
+    assert introspect_ddl(ddl) == expected
+
+
+def test_columns_outside_an_identical_schema_is_empty():
+    assert columns_outside(introspect_ddl(_pair_ddl()), introspect_ddl(_pair_ddl())) == ()
+
+
+def test_columns_outside_a_superset_schema_is_empty():
+    reference = introspect_ddl(
+        _pair_ddl(note="note TEXT, added INTEGER") + "CREATE TABLE reference_only (x TEXT);"
+    )
+
+    assert columns_outside(introspect_ddl(_pair_ddl()), reference) == ()
+
+
+@pytest.mark.parametrize(
+    ("candidate_note", "reference_note"),
+    [
+        ("note TEXT", "remark TEXT"),
+        ("note TEXT", "note INTEGER"),
+        ("note TEXT NOT NULL", "note TEXT"),
+        ("note TEXT", "note TEXT NOT NULL"),
+    ],
+    ids=["renamed", "retyped", "not-null-only-in-candidate", "not-null-only-in-reference"],
+)
+def test_columns_outside_reports_the_candidate_column_the_reference_declares_differently(
+    candidate_note, reference_note
+):
+    candidate = introspect_ddl(_pair_ddl(note=candidate_note))
+    reference = introspect_ddl(_pair_ddl(note=reference_note))
+
+    assert columns_outside(candidate, reference) == (("pair", _column(candidate, "pair", "note")),)
+
+
+def test_columns_outside_reports_columns_at_a_different_primary_key_position():
+    candidate = introspect_ddl(_pair_ddl())
+    reference = introspect_ddl(_pair_ddl(primary_key="right_id, left_id"))
+
+    assert columns_outside(candidate, reference) == (
+        ("pair", _column(candidate, "pair", "left_id")),
+        ("pair", _column(candidate, "pair", "right_id")),
+    )
+
+
+def test_columns_outside_reports_every_column_of_a_table_the_reference_lacks_in_declaration_order():
+    candidate = introspect_ddl(
+        _pair_ddl() + "CREATE TABLE orphan (zeta TEXT, alpha INTEGER, mid REAL);"
+    )
+
+    outside = columns_outside(candidate, introspect_ddl(_pair_ddl()))
+
+    assert [(table, column.name) for table, column in outside] == [
+        ("orphan", "zeta"),
+        ("orphan", "alpha"),
+        ("orphan", "mid"),
+    ]
+    assert [column for _table, column in outside] == [
+        _column(candidate, "orphan", name) for name in ("zeta", "alpha", "mid")
+    ]
+
+
+# ---------------------------------------------------------------------------
 # main(argv) — the one-command answer, and its two refusals.
 #
 # Asserted on exit codes and stream separation, never on layout: the contract
@@ -436,6 +547,57 @@ def test_main_with_no_path_arguments_resolves_from_the_cwd(
 
     assert exit_code == 0
     assert "tasks" in capsys.readouterr().out
+
+
+def _no_args_from_a_worktree(tmp_path, make_tasks_db):
+    main_checkout = _main_checkout(tmp_path)
+    worktree = _linked_worktree(main_checkout)
+    return _seed_store(main_checkout, make_tasks_db), worktree, []
+
+
+def _relative_project_root(tmp_path, make_tasks_db):
+    return _seed_store(tmp_path / "proj", make_tasks_db), tmp_path, ["--project-root", "proj"]
+
+
+def _relative_db(tmp_path, make_tasks_db):
+    seeded = _seed_store(tmp_path / "proj", make_tasks_db)
+    cwd = seeded.parent.parent
+    return seeded, cwd, ["--db", str(seeded.relative_to(cwd))]
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    [_no_args_from_a_worktree, _relative_project_root, _relative_db],
+    ids=lambda spelling: spelling.__name__.lstrip("_"),
+)
+def test_main_first_line_is_the_absolute_path_of_the_store_it_read(
+    spelling, tmp_path, make_tasks_db, monkeypatch, capsys
+):
+    """The hotspot overlay tells a miner to open the path printed on line 1, so
+    a relative echo would reproduce the cwd-relative connect string task 5334
+    deleted."""
+    seeded, cwd, argv = spelling(tmp_path, make_tasks_db)
+    monkeypatch.chdir(cwd)
+
+    exit_code = main(argv)
+
+    out = capsys.readouterr().out
+    assert exit_code == EXIT_OK
+    first = out.splitlines()[0]
+    assert Path(first).is_absolute()
+    assert Path(first) == seeded.resolve()
+
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    conn = sqlite3.connect(Path(first).as_uri() + "?mode=ro", uri=True)
+    try:
+        tables = {
+            row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+    finally:
+        conn.close()
+    assert "tasks" in tables
 
 
 def test_main_diagnoses_a_git_that_wedges_past_the_timeout(tmp_path, monkeypatch, capsys):

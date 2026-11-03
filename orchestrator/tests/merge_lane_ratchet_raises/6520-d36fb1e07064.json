@@ -1,0 +1,42 @@
+{
+  "task_id": "6520",
+  "reason": "suite-wide CLAUDE_BINARY scrub: one df_pytest_isolation._df_claude_binary_unset binding, required in every test-root conftest by tests/scripts/test_basetemp_git_isolation.py::_wiring_defects",
+  "measures": [
+    {
+      "measure": "lines",
+      "key": "orchestrator/tests/conftest.py",
+      "baseline": 1270,
+      "current": 1271
+    },
+    {
+      "measure": "prose_lines",
+      "key": "orchestrator/tests/conftest.py",
+      "baseline": 789,
+      "current": 790
+    },
+    {
+      "measure": "reexport_names",
+      "key": "orchestrator/tests/conftest.py",
+      "baseline": 5,
+      "current": 6
+    },
+    {
+      "measure": "total:lines",
+      "key": "<cluster>",
+      "baseline": 58693,
+      "current": 58694
+    },
+    {
+      "measure": "total:prose_lines",
+      "key": "<cluster>",
+      "baseline": 31953,
+      "current": 31954
+    },
+    {
+      "measure": "total:reexport_names",
+      "key": "<cluster>",
+      "baseline": 6,
+      "current": 7
+    }
+  ]
+}

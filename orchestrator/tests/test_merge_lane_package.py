@@ -1,7 +1,8 @@
-"""The merge lane's façade and ports (PRD ``plans/merge-lane-quality-prd.md`` tasks ζ1 and β).
+"""The merge lane's façade and ports (PRD ``plans/merge-lane-quality-prd.md`` tasks ζ1, β, ζ2 and η).
 
-The façade is pinned by what it exports and by importing cleanly from
-either side of its cycle with ``orchestrator.merge_queue``. The ports are
+The façade is pinned by what it exports, and by the fourteen pre-package
+module names being gone: task η migrated their importers and deleted the
+aliases, so each old name must now fail to import. The ports are
 pinned by driving a real ``MergeLane`` over a real git repository with the
 fakes from ``_merge_lane_fakes`` injected: the injected verifier decides
 whether a branch lands, and the injected clock is the one the worker ages
@@ -15,6 +16,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any, assert_type
 
 import pytest
 from _merge_lane_fakes import (
@@ -39,10 +41,10 @@ from orchestrator.merge_lane import (
     QueuedBranch,
 )
 from orchestrator.merge_lane.ports import escalation_port
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.worker import (
     PRODUCTION_CLOCK,
     SpeculativeMergeWorker,
-    _resolve_dispatch_time_merge_base,
+    resolve_dispatch_time_merge_base,
 )
 
 # ---------------------------------------------------------------------------
@@ -53,8 +55,14 @@ REASON_CONSTANTS = 17
 
 
 def test_merge_lane_is_the_worker() -> None:
-    assert MergeLane is SpeculativeMergeWorker
-    assert merge_lane.resolve_dispatch_time_merge_base is _resolve_dispatch_time_merge_base
+    assert merge_lane.MergeLane is MergeLane is SpeculativeMergeWorker
+    assert merge_lane.resolve_dispatch_time_merge_base is resolve_dispatch_time_merge_base
+
+
+@pytest.mark.parametrize('name', ['_resolve_dispatch_time_merge_base', 'SpeculativeMergeWorker'])
+def test_the_pre_eta_facade_aliases_are_gone(name: str) -> None:
+    assert not hasattr(merge_lane, name)
+    assert name not in merge_lane.__all__
 
 
 def test_every_export_resolves_and_the_reason_constants_are_strings() -> None:
@@ -74,26 +82,35 @@ def test_a_name_outside_the_facade_is_an_attribute_error() -> None:
         _ = merge_lane.not_an_export
 
 
-@pytest.mark.parametrize(
-    'first, second',
-    [
-        ('orchestrator.merge_queue', 'orchestrator.merge_lane'),
-        ('orchestrator.merge_lane', 'orchestrator.merge_queue'),
-    ],
+#: The pre-package module names task 5037 deleted. Nothing aliases them, so a
+#: stale import fails loudly instead of reaching the package by another name.
+PRE_PACKAGE_MODULE_NAMES = (
+    'orchestrator.merge_queue',
+    'orchestrator.merge_gates',
+    'orchestrator.merge_types',
+    'orchestrator.merge_shadow',
+    'orchestrator.merge_liveness',
+    'orchestrator.merge_disposition',
+    'orchestrator.merge_queue_store',
+    'orchestrator.merge_completion',
+    'orchestrator.merge_drift',
+    'orchestrator.merge_speculation_controller',
+    'orchestrator.merge_request_ledger',
+    'orchestrator.merge_skew_tripwire',
+    'orchestrator.landing_evidence',
+    'orchestrator.landed_outbox',
 )
-def test_facade_imports_cleanly_from_either_side_of_its_cycle(
-    first: str, second: str,
-) -> None:
-    program = (
-        f'import {first}; import {second}; '
-        'from orchestrator.merge_lane import MergeLane; '
-        'from orchestrator.merge_queue import SpeculativeMergeWorker; '
-        'assert MergeLane is SpeculativeMergeWorker'
-    )
+
+
+@pytest.mark.parametrize('name', PRE_PACKAGE_MODULE_NAMES)
+def test_no_pre_package_module_name_is_importable(name: str) -> None:
+    """A fresh interpreter, so no module this suite already imported can answer."""
     completed = subprocess.run(
-        [sys.executable, '-c', program], capture_output=True, text=True, timeout=120,
+        [sys.executable, '-c', f'import {name}'], capture_output=True, text=True, timeout=120,
     )
-    assert completed.returncode == 0, completed.stderr
+    assert completed.returncode != 0, f'{name} still imports'
+    assert 'ModuleNotFoundError' in completed.stderr, completed.stderr
+    assert name in completed.stderr, completed.stderr
 
 
 # ---------------------------------------------------------------------------
@@ -272,6 +289,7 @@ class TestProductionClockWaitsForAny:
         task = asyncio.create_task(asyncio.sleep(0.01))
         try:
             done = await PRODUCTION_CLOCK.wait_for_any({task}, timeout=5.0)
+            assert_type(done, set[asyncio.Future[Any]])
             assert isinstance(done, set)
             assert done == {task}
         finally:
@@ -319,6 +337,7 @@ class TestFakeClockWaitsForAny:
         task = asyncio.create_task(asyncio.sleep(0.05))
         try:
             done = await clock.wait_for_any({task}, timeout=600.0)
+            assert_type(done, set[asyncio.Future[Any]])
             polls = 1
             while not done and polls < self.POLL_BUDGET:
                 done = await clock.wait_for_any({task}, timeout=600.0)

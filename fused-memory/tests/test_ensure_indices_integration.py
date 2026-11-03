@@ -33,39 +33,19 @@ statements auto-create the key — so provisioning from absent is self-healing.
 Counts are asserted as DERIVED quantities, never as the literal 28/30/38, so a
 graphiti upgrade moves them instead of leaving a stale magic number passing.
 
-HAZARD compliance
------------------
-Every graph here is a fresh uuid-suffixed scratch graph, deleted in ``finally``;
-no test ever names a real project graph.  ``GraphitiBackend.initialize()`` is
-NEVER called — its startup enumeration would sweep every graph on the server,
-including the six real trap graphs whose index state is protected evidence.  A
-bare ``graphiti_core`` ``FalkorDriver`` is never constructed either: its
-``__init__`` fire-and-forgets ``build_indices_and_constraints()`` under a running
-loop.  ``_MultiTenantFalkorDriver``'s D4 ``pass`` override neuters that, and it is
-injected into ``backend._driver`` directly.  No DUMP/RESTORE anywhere.
+Graphs and backends come only from ``_falkor_index_live``, which enforces the
+live-FalkorDB HAZARD rules.  No test names a real project graph, and there is no
+DUMP/RESTORE anywhere.
 """
 
 from __future__ import annotations
 
-import contextlib
-
 import pytest
 import pytest_asyncio
-from _fm_helpers import (
-    FALKOR_HOST,
-    FALKOR_PORT,
-    await_index_operational,
-    falkor_skipif,
-    unique_graph_name,
-)
-from falkordb.asyncio import FalkorDB
+from _falkor_index_live import listed_index_specs, live_backends, scratch_graphs
+from _fm_helpers import await_index_operational, falkor_skipif
 
-from fused_memory.backends.falkor_indices import (
-    expected_index_set,
-    normalize_index_records,
-    parse_index_statement,
-)
-from fused_memory.backends.graphiti_client import GraphitiBackend, _MultiTenantFalkorDriver
+from fused_memory.backends.falkor_indices import expected_index_set, parse_index_statement
 
 pytestmark = [
     falkor_skipif(),
@@ -91,52 +71,16 @@ _TRAP_LOST_RANGE_FIELDS = [
 
 @pytest_asyncio.fixture
 async def scratch():
-    """Factory for uuid-suffixed throwaway graphs, each torn down in ``finally``.
-
-    A SEPARATE graph per test, because the suite runs under
-    ``-n auto --dist loadgroup`` and two tests sharing a graph name would
-    cross-contaminate each other's index state.
-
-    Deliberately does NOT write to the graph: ``select_graph`` alone does not
-    create the KEY, which is what lets the absent-graph test observe the real
-    ``Invalid graph operation on empty key`` path.
-    """
-    clients: list[FalkorDB] = []
-    graphs: list = []
-
-    def _make(slug: str):
-        name = unique_graph_name(f'3707_ensure_indices_{slug}')
-        client = FalkorDB(host=FALKOR_HOST, port=FALKOR_PORT)
-        clients.append(client)
-        graph = client.select_graph(name)
-        graphs.append(graph)
-        return name, graph
-
-    try:
-        yield _make
-    finally:
-        for graph in graphs:
-            with contextlib.suppress(Exception):
-                await graph.delete()
-        for client in clients:
-            with contextlib.suppress(Exception):
-                await client.aclose()
+    """One graph per test: under ``-n auto --dist loadgroup`` a shared one cross-contaminates."""
+    async with scratch_graphs('3707_ensure_indices') as make:
+        yield make
 
 
 @pytest_asyncio.fixture
 async def live_backend(mock_config):
-    """A backend wired to a REAL driver, without ``initialize()``.
-
-    ``_MultiTenantFalkorDriver`` rather than a bare ``FalkorDriver``: the D4
-    ``pass`` override is what stops ``__init__`` from fire-and-forgetting an index
-    build on whatever graph it touches first.
-    """
-    backend = GraphitiBackend(mock_config)
-    backend._driver = _MultiTenantFalkorDriver(host=FALKOR_HOST, port=FALKOR_PORT)
-    try:
-        yield backend
-    finally:
-        await backend.close()
+    """An EMPTY registry is safe: ``ensure_indices`` never consults ``registered_graph_ids``."""
+    async with live_backends(mock_config) as make:
+        yield make(set())
 
 
 def _range_statements(statements: list[str]) -> list[str]:
@@ -163,7 +107,7 @@ class TestBoundary1TrapState:
 
         assert result.failed == (), f'provisioning the trap state failed: {result.failed}'
 
-        actual = normalize_index_records(await live_backend.list_indices(group_id=name))
+        actual = await listed_index_specs(live_backend, name)
         missing_after = [
             (label, entity_type, field)
             for label, entity_type, field in _TRAP_LOST_RANGE_FIELDS
@@ -221,7 +165,7 @@ class TestBoundary2VirginGraph:
         assert result.already_present == 0
         assert len(result.created) == result.expected_total == len(expected)
 
-        actual = normalize_index_records(await live_backend.list_indices(group_id=name))
+        actual = await listed_index_specs(live_backend, name)
         assert expected - actual == set(), f'missing after provisioning: {expected - actual}'
         assert actual - expected == set(), f'unexpected after provisioning: {actual - expected}'
 
@@ -258,7 +202,8 @@ class TestAbsentGraphLive:
     @pytest.mark.asyncio
     async def test_provisions_from_absent_rather_than_raising(self, scratch, live_backend):
         expected = expected_index_set()
-        name, graph = scratch('absent')  # deliberately never written to
+        # Deliberately never written to: select_graph alone creates no KEY.
+        name, graph = scratch('absent')
 
         result = await live_backend.ensure_indices(group_id=name)
         await await_index_operational(graph)

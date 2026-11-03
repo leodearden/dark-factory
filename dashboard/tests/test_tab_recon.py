@@ -14,7 +14,7 @@ executably by dashboard/tests/js/recon_status.test.mjs. What THAT suite
 structurally cannot see is whether app.jsx and tabs.jsx actually CALL it, or
 whether they quietly go on restating status literals of their own. That is
 what this module asserts — the same division test_tab_tasks_status_counts.py
-documents for task_status_counts.js. The stylesheet half of the contract
+documents for task_snapshot.js. The stylesheet half of the contract
 (TestBadgeTonesAreStyled) lives here for the same reason: styles.css is
 reachable from the test client and not from a node process.
 
@@ -615,4 +615,25 @@ class TestReconStatusLiteralsAreGone:
         assert compared == [], (
             f'ReconTab compares a run status against a literal: {compared} — '
             'the run vocabulary belongs to recon_status.js.'
+        )
+
+
+class TestActiveAgentsReadsTheServedActivity:
+    """The Active agents hint is a disclosed sub-view of the headline's population.
+
+    Both the headline (``burst_state.length``) and the hint read the one rule
+    ``reconciliation.py::partition_burst_state`` applies on the server; the hint
+    reads its served ``agent_activity`` counts instead of re-deriving a second
+    client predicate over ``burst_state``.
+    """
+
+    def test_the_hint_reads_the_served_non_idle_count(self, recon_tab_code):
+        tile = _extract_stat_tile(recon_tab_code, 'Active agents')
+        assert re.search(r'hint=\{[^}]*agent_activity\.non_idle', tile), (
+            f'the Active agents hint does not read agent_activity.non_idle:\n{tile}'
+        )
+
+    def test_no_client_idle_predicate_remains(self, recon_tab_code):
+        assert not re.search(r"!==?\s*'idle'", recon_tab_code), (
+            "ReconTab still filters agents with a client-side `!== 'idle'` predicate."
         )

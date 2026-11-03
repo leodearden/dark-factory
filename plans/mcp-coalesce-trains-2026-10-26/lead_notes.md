@@ -1,0 +1,29 @@
+# Lead notes after wave 1 (2026-10-26)
+
+Wave-1 seat outputs, all in this directory: `w1_R1.md` (merge-lane train lifecycle), `w1_R2.md` (task-status side), `w1_R3.md` (MCP submitter side), `w1_E1.md` (premise: MCP volume, counterfactual trains, verify cost), `w1_E2.md` (train outcome/derail taxonomy). Code is pinned at main 70063c3638, clean worktree `/home/leo/src/dark-factory/.claude/worktrees/mcp-coalesce-trains`.
+
+## Lead corrections and checks
+
+1. **E2's "net -2.7 h after 4953" is a runner-mix artifact.** E2 compared train verifies (mostly the `local` runner) against a weekly median over all solo verifies (laptop-heavy, about 3x faster). Recomputed by the lead with a runner-matched solo baseline (`lead/econ.py`):
+   - Before 4953: 57 merged trains with a verify, 48.5 h train verify, saved 33.8 h (median basis) / 37.6 h (mean basis); 28 derailed trains wasted 25.6 h; net +8.2 to +12.0 h. Train/solo-median ratio median 1.45.
+   - After 4953 (formed >= 2026-10-13T21:48Z, data to 2026-10-26T16:28Z): 31 merged trains, 19.7 h train verify, saved 19.0 h (median) / 20.5 h (mean); 12 derailed trains wasted 10.8 h; **net +8.2 to +9.6 h**. Train/solo-median ratio median 1.13.
+   - Rule: saved = sum over merged trains of (member_count x runner-matched solo passing-verify median or mean in the same before/after window) minus the train's summed merge_verify minutes; the runner is 'local' if any train verify row ran local. Waste = summed train verify minutes of derailed trains. Member re-verifies after a derail are not counted (owed anyway).
+   - Total merge_verify host-hours since 4953: 219.5 h (E1). So trains as a whole net about +4% of verify host-hours; gross saving about 9%.
+2. **Expected benefit of admitting MCP singles (lead estimate, upper bound).** Since 4953: 82 MCP-origin singles; at most 13 had an eligible workflow partner waiting concurrently and a clean own-branch history (E1 Q3b; ignores stackability, max 3, debounce, lane). E2's journal count is the looser bound: 31 suppressed coalescing passes where eligible + no_awaiting_workflow >= 2 (passes, not distinct singles). Marginal saving per member landed in a merged train after 4953 = 19.0 h / 72 members = about 16 min; net of derail waste across all members of started trains, about 5 min. So admitting MCP singles as trains perform today buys about 13 x (5-16 min) = **1-3.5 verify host-hours per ~12 days, at most about 1.5% of verify compute**. MCP singles are 15% of landings and about 17% of verify host-hours, but most never wait beside a partner (48 of 82 waited < 1 s in the buffer; 27 of 82 are resubmits of a branch whose last outcome was blocked, which the default predicate excludes anyway).
+3. **Train latency cost.** Formation-to-start median 178 min after 4953 (E2; selection-biased). An interactive MCP submitter waiting on a landing pays this latency if absorbed; solo MCP queue-to-land median is 42.5 min since 4953 (E1).
+4. **R1's side finding is CONFIRMED and is worse than reported.** `orchestrator/src/orchestrator/git_ops.py::GitOps.get_changed_line_ranges(ref)` is called with a bare task id by both `merge_lane/worker.py::SpeculativeMergeWorker._stack_coalesce_train` and `workflow.py` (declared-train former). Lead ran `git diff main...5925` in the main checkout: `error: short object ID 5925 is ambiguous`; `git rev-parse --verify task/7484` and `7484` both fail as refs, the branch is `task/<id>`. A bare id that is an UNAMBIGUOUS sha prefix would resolve to an unrelated commit and yield wrong (non-empty) ranges. Either way the line-range stackability screen is broken for every train; conflicts surface only at the stacking rebase.
+5. Journal-recovered WORKFLOW requests also lose `awaited_by_workflow` (5 of the 13 post-4953 `no_awaiting_workflow` exclusions, E1). R1: the coalescer reads only the per-request flag, never `InFlightMergeRegistry.has_workflow_waiter`.
+
+## Prior history (fused-memory and the task store)
+
+- Task 4953's own scope evaluated (a) a flag (chosen), (b) waiter-registry inspection, (c) the MCP path setting merge-deferred itself — REJECTED then because "a lone entry parked in merge-deferred with no train is a new strand class, and merge-deferred is non-terminal". It also listed "make the coalescer's superseded resolution park the member itself when no workflow will" as an alternative worth costing, but preferred keeping the invariant "only a workflow parks a task". Since then task 4737 (AbandonedMemberSweep) and 7022 (live single request as owner) landed.
+- 1721 (done): merge_status surfaces superseded_by; the /merge-queue skill follows the train via the branch handle + ancestry.
+- 7309 (pending, medium): merge_cancel for trains — whole-train cancel plus member eject-and-redrive; until then every train entry is refused `train_cancel_unsupported` (Leo ruled 2026-10-21 on 5248).
+- 6450 (pending, high): a failed status read during coalesce dissolve/derail re-drive retires the train and strands merge-deferred members.
+- 6566 (pending, low): a train whose tip is already on main ('already_merged') credits no member.
+- 6755 (pending, low): train verify parity with single-branch verify.
+- Carrier history: ~20 hand-carry carrier tasks walked deferred -> pending -> in-progress -> merge-deferred so an MCP submission could survive a coalesce (memory file `feedback_mcp_merge_request_into_a_deep_queue_gets_coalesced_and_ejected.md`); traps: the 4737 sweep re-pending a carrier, startup recovery deleting `.worktrees/<id>`, solo carriers not flipped done, `git worktree move` breaking the venv. Since 4953 no carrier is needed.
+
+## Leo's stated position (brief, 2026-10-26)
+
+"Not happy with the current exclusion." Trains are "an important lever for widening the merge queue's verify-compute bottleneck. Every solo MCP landing spends a full verify slot that a train could have shared." The memo must present the measured premise honestly, even where it cuts against this.

@@ -16,6 +16,54 @@
       "severity": "suggestion",
       "description": "On search error/timeout the prompt directs the reader to treat suppression as not-in-effect and emit the flag (fail-open with respect to suppression). It justifies this as mirroring filter_suppressed's 'conservative pass-through', but pass-through in the post-processor keeps flags for the opposite reason; here it means an intentionally suppressed task can get a flag emitted on a transient search failure, which is the same false-negative direction and relies entirely on the downstream post-processor still catching it.",
       "mutation_type": "error_handling"
+    },
+    {
+      "id": "mined_1187_pool_01",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/stage1.py:261-283",
+      "category": "test_gap",
+      "severity": "suggestion",
+      "description": "No test pins the hardened suppression-check contract in STAGE1_SYSTEM_PROMPT (categories/stores/limit=50 search params, str-coerced task_id comparison, error/timeout pass-through clause), nor that the named kwargs exist on the MCP `search` tool, so a later prompt edit can silently reintroduce the default limit=10 or strict int comparison.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1187_pool_02",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/stage1.py:247-271",
+      "category": "spot_prompt_restates_code",
+      "severity": "suggestion",
+      "description": "The Flag Suppression Check prose restates implementation facts owned by flag_dedup.py (filter_suppressed's limit=501, its bare 'stage1_flag_suppression' bulk query, the write_suppression_record -> build_suppression_payload int() chain) and reviewer-facing justification (why 50 suffices) that the Stage 1 agent does not need. Nothing ties these literals to the code, so they drift silently, and the producer chain is also repeated in the paragraph below the schema bullet.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1187_pool_03",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/stage1.py:247-252",
+      "category": "inaccurate_rationale",
+      "severity": "suggestion",
+      "description": "The prompt justifies string comparison of metadata.task_id by claiming Mem0 metadata round-trips through JSON and that historical writers in this codebase stored task_id as both int and str. JSON preserves int vs str, and the only programmatic producer (build_suppression_payload) coerces to int; str values could only come from legacy hand-authored records. The string-comparison rule itself is correct and matches filter_suppressed.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1187_pool_04",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/stage1.py:249",
+      "category": "naming",
+      "severity": "suggestion",
+      "description": "The new comparison expression `str(result.metadata.get('task_id')) == str(target_task_id)` uses `target_task_id`, a name the prompt never defines, while the rest of the section names the target task `<N>`.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1187_pool_05",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/stage1.py:279-283",
+      "category": "error_semantics_wording",
+      "severity": "suggestion",
+      "description": "The new error clause says only 'returns an error or times out' without stating the failure shape, whereas the neighbouring Terminal-State Pre-Check section names the `{'error': ..., 'error_type': ...}` field the MCP tools return; the agent must guess what counts as an error.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1187_pool_06",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/stage1.py:281",
+      "category": "misleading_label",
+      "severity": "suggestion",
+      "description": "The error clause calls its fail-open behaviour (emit flags when the suppression search fails) a 'conservative pass-through', while the task brief uses 'conservative alternative' for the opposite, fail-closed policy; the label is ambiguous for later editors. The fail-open policy itself matches filter_suppressed.",
+      "mutation_type": "pooled_2026_10_22"
     }
   ],
   "provenance": {

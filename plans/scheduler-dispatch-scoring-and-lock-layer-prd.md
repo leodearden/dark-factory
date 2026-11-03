@@ -376,7 +376,7 @@ watchdog.
 
 | class | example | auto-pin? |
 |---|---|---|
-| never top-scored | 3534 — rank 32/294, zero skips, four days undispatched | **yes**, this is what the pin is for |
+| never top-scored | 3534 — rank 32/294, zero skips, four days undispatched | **yes**, this is what the pin is for. Since task 6040 a pin that is lock-blocked also earns a pin reservation |
 | parked behind a live holder | 3248 — 16h parked, 9 of 10 modules free, one held by 3455 | **no**, provably inert |
 
 The second row is measured, not argued: during the 2026-08-06/07 outage
@@ -519,6 +519,59 @@ Each row faces **both** sides of a seam. Rows 1–3 face the fused-memory ↔ or
 | **Lexicographic CPM buckets (S3)** | `floor(log2(1+D))` lets 3585 (D=1, age 211) displace 3090 (D=0, age **706**) on a bucket boundary. Within-tier starvation exposure rises to 706, the worst of any variant, and aging is structurally defeated — the same failure class as today's saturation with the polarity flipped. |
 | **Flat continuity credit ≥ cpm max** | Inverts the fix: 115/291 candidates carry prior-dispatch history, and 3534 drops to rank 35–40, worse than baseline. |
 | **Detecting continuity from dispatch-event history** | The events DB has both false positives (orphan releases, 3563-class stuck locks) and false negatives (173/294 candidates have no events at all, ever). |
+
+**Annotation (task 6040) on the "Below-rank-1 park INSTALLATION" row.** Task 6040
+adds a BOUNDED exception to that row. It is not a reversal: only the head eligible
+lock-blocked pin(s) reserve, capped by `pin_reservation_max_active` (default 1). That
+is the EASY-backfill head reservation, and it avoids each harm measured above. A single
+operator-chosen reservation cannot gridlock with itself, its idle cost is one task's
+footprint, and C7 backfill borrows through it exactly as through a fairness park. It
+never preempts a held lock, so the preemption row above stands unchanged. See
+`orchestrator/src/orchestrator/pin_reservation.py`.
+
+**Amendment (task 6518, esc-6040-7).** A park, pin reservation or fairness, lives only
+while its owner may hold parks: status `pending` AND no dependency (local, cross-project
+`metadata.external_deps`, delivered check) known to be unsatisfied. A dependency that is
+merely unknown this tick keeps the park (INV-3, corroborate before acting). This narrows
+6040 D5(b). The ineligibility release still goes through park GC, and the pin phase's
+earned-fairness completion now runs only for an owner that is still a dispatch
+candidate that tick, so a blocked or deferred pin head drops its whole footprint instead
+of re-parking it. Hand-carries (deferred owners) get no park protection (D8). The rule
+has one home, `orchestrator/src/orchestrator/scheduler.py::Scheduler._park_hold_refusal`,
+which park GC, the operator eviction guard and `reserve_now` all consult.
+
+**Amendment (task 7799, park-cycle-787-945).** Ruling (Leo, 2026-10-30): a deadlock
+between parked owners must be impossible by construction. solar_challenge sighted four:
+945<->919 (10-27, over 23 h), 787<->945 (10-29/30), 787<->{894,919} (10-30) and
+919<->955 (10-31 to 11-01, about 31 h, ended only by an orchestrator restart that wiped
+park state). Each owner held a partial park and needed a key the other had parked, and
+each one's acquire was refused by the other's park. A requeue (architect `max_turns`,
+`scope_grant_lock_conflict`) re-parks a task within a minute, so hand-breaks and
+restarts cleared a cycle only incidentally. The fix is one total order on park entries,
+`orchestrator/src/orchestrator/scheduler.py::_ParkKey`: rank first, then the dispatch
+tie-break (older numeric id, then id; non-numeric ids last, I-4). One comparator is
+enforced at two points. At INSTALL (INV-3), a new entry shadows a conflicting top with
+a larger key and is blocked by one with a smaller key, so same-tier installs resolve by
+id instead of colliding. At the GATE (INV-8,
+`orchestrator/src/orchestrator/scheduler.py::ModuleLockTable._precedence_blocking_parks`), a
+foreign top blocks a requester that owns parks only when its key precedes the
+requester's best key, the minimum over every entry it holds. A requester that owns no
+park is blocked by every park, as before. A park owner therefore passes a lower-key park
+even on a key it has not parked yet, which is exactly the edge that formed every
+sighted cycle. The gate carries the guarantee, not install: install runs only for the
+tick's top-skipped candidate, so a predecessor that is not the score-top never retries
+it (945 logged no `task_skipped` in 787<->945). Under the gate every park wait goes
+from an owner to one with a strictly smaller best key. So the wait-for graph between
+park owners is acyclic in every reachable state, including the state right after a
+requeue re-parks, and the smallest-key owner waits only on live holders. Installation
+stays rank-1-gated, so the "Below-rank-1 park INSTALLATION" row above is not widened.
+The operator eviction lever keeps its D4 live-owner refusal
+(`orchestrator/src/orchestrator/scheduler.py::Scheduler._park_hold_refusal`) unchanged:
+no pending owner can be part of a cycle, so nothing needs evicting to break one. Branch
+progress is deliberately not in the key. The key must be computable from lock-table
+state alone and stay stable from tick to tick. Branch progress is the asynchronously
+refreshed `work_product` view, and the score already credits it as continuity, which
+decides who is TRIED first. Precedence decides only whose park may block whom.
 
 ## 8. Pre-conditions and substrate verification (G3)
 

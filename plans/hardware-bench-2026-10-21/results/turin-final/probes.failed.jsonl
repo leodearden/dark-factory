@@ -1,0 +1,2 @@
+{"probe": "rustc_j1", "k": 1, "rep": 1, "makespan_s": 85.37, "runs": [{"wall_s": 85.37, "maxrss_kb": 403624, "rc": 101}], "mhz_mean": 3537, "mhz_mean_allowed": 3327, "mhz_max_allowed": 4368, "host_load1_mean": 93.8, "foreign_verify_seen": false}
+{"probe": "rustc_jn", "k": 1, "rep": 1, "makespan_s": 9.09, "runs": [{"wall_s": 9.09, "maxrss_kb": 722528, "rc": 101}], "mhz_mean": 3075, "mhz_mean_allowed": 3542, "mhz_max_allowed": 4335, "host_load1_mean": 117.6, "foreign_verify_seen": false}

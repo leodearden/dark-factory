@@ -193,10 +193,12 @@ import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from pathlib import Path
 
 from shared.git_async import run_git
-from shared.task_claimant import has_live_claimant
+from shared.scheduler_state import SchedulerStateSnapshot
+from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL, has_live_claimant
 from shared.task_metadata import RoutingState
 
 from fused_memory.services.orchestrator_detector import is_orchestrator_live_for
@@ -257,18 +259,6 @@ DETERMINISTIC_TASK_KIND: str = 'deterministic'
 # _orchestrator_signal_ineligible (task 2409) to scope the blocked-normal
 # bare-orchestrator suppression.
 NORMAL_TASK_KIND: str = 'normal'
-
-# Heartbeat staleness threshold for the fresh-claimant corroboration signal
-# (task 2963). A killed workflow keeps its durable ``claimant_run_id`` but stops
-# advancing ``heartbeat_at``, so FRESHNESS (not presence) is the discriminator:
-# `has_live_claimant(task, now, ttl)` reports live only while the heartbeat is
-# newer than ``now - ttl``. Mirrors the orchestrator's validated
-# ``_RECONCILE_HEARTBEAT_TTL`` (harness.py:189) / ``_DEFAULT_HEARTBEAT_TTL``
-# (task_ground_truth.py:146) constant — the coordination point with sibling
-# task 2931's orphan-reaper liveness predicate (reuse this shared TTL, do not
-# invent a parallel heartbeat check).
-DEFAULT_HEARTBEAT_TTL: timedelta = timedelta(minutes=10)
-
 
 @dataclass(frozen=True)
 class WorkflowLiveness:
@@ -428,7 +418,7 @@ async def detect_live_workflow(
             does not pass this kwarg. The verdict is computed by
             :func:`corroboration_for_task` and passed in by the three consumers
             that hold the task dict, which task 2964 made agree with each other:
-            :func:`~fused_memory.reconciliation.stages.task_knowledge_sync._render_live_workflow_section`
+            :func:`~fused_memory.reconciliation.live_workflow_section.render_live_workflow_section`
             (the render-time Live-Workflow Signals section),
             ``recon_write_policy.check``'s Gate 2 (via its
             ``_corroboration_verdict`` helper), and ``reconciliation/harness.py``'s
@@ -439,7 +429,8 @@ async def detect_live_workflow(
         _orchestrator_live: Pre-computed project-level orchestrator-lock result.
             When provided, skips the ``is_orchestrator_live_for(project_root)``
             call — use this to hoist the constant project-level check out of
-            per-task loops (e.g. in :func:`_render_live_workflow_section`).
+            per-task loops (e.g. in
+            ``reconciliation/live_workflow_section.py::render_live_workflow_section``).
             ``None`` (default) triggers a fresh ``is_orchestrator_live_for``
             call.  Tests monkeypatch the module attribute directly; this
             parameter is only for performance hoisting, not test isolation.
@@ -657,7 +648,7 @@ def has_live_workflow_corroboration(
     task_id: str | int,
     *,
     claimant_live: bool,
-    scheduler_state: Mapping | None,
+    scheduler_state: SchedulerStateSnapshot | None,
     routing_latest_decided_at: str | None,
     orchestrator_started_at: datetime | None,
 ) -> bool:
@@ -681,8 +672,8 @@ def corroboration_for_task(
     task_id: str | int,
     *,
     now: datetime,
-    heartbeat_ttl: timedelta = DEFAULT_HEARTBEAT_TTL,
-    scheduler_state: Mapping | None = None,
+    heartbeat_ttl: timedelta = DEFAULT_CLAIMANT_HEARTBEAT_TTL,
+    scheduler_state: SchedulerStateSnapshot | None = None,
     orchestrator_started_at: datetime | None = None,
 ) -> bool:
     """Assemble the three corroboration signals from a *task* dict.
@@ -697,7 +688,9 @@ def corroboration_for_task(
 
     then delegates to :func:`has_live_workflow_corroboration`. The *scheduler_state*
     and *orchestrator_started_at* inputs are hoisted once per render by the
-    caller (see :func:`_render_live_workflow_section`) and threaded through.
+    caller (see
+    ``reconciliation/live_workflow_section.py::render_live_workflow_section``)
+    and threaded through.
 
     Returns True when any signal corroborates a live workflow for *task_id*.
     """
@@ -711,6 +704,43 @@ def corroboration_for_task(
         routing_latest_decided_at=routing_latest_decided_at,
         orchestrator_started_at=orchestrator_started_at,
     )
+
+
+class ClaimantLabel(StrEnum):
+    LIVE = 'live'
+    STALE = 'stale'
+    NONE = 'none'
+    UNKNOWN = 'unknown'
+
+
+def claimant_label(
+    task: object,
+    *,
+    now: datetime,
+    heartbeat_ttl: timedelta = DEFAULT_CLAIMANT_HEARTBEAT_TTL,
+) -> ClaimantLabel:
+    """Label *task*'s claimant for display; total, and it changes no ``is_live`` verdict.
+
+    STALE (a claimant whose heartbeat is old, missing or unparseable) is the
+    killed-but-lingering shape the task-2963 corroboration gate exists for.
+    UNKNOWN (an unreadable task) is never collapsed into NONE, so absence of
+    evidence never renders as evidence of absence.
+    """
+    if not isinstance(task, Mapping):
+        return ClaimantLabel.UNKNOWN
+    claimant = task.get('claimant_run_id')
+    # The "no claimant" predicate of shared/task_claimant.py::_claimant_liveness_stranded.
+    if claimant is None or (isinstance(claimant, str) and not claimant.strip()):
+        return ClaimantLabel.NONE
+    try:
+        is_live = has_live_claimant(task, now, heartbeat_ttl)
+    except Exception:
+        logger.warning(
+            'live_workflow_detector.claimant_label: claimant liveness unreadable for %r',
+            claimant, exc_info=True,
+        )
+        return ClaimantLabel.UNKNOWN
+    return ClaimantLabel.LIVE if is_live else ClaimantLabel.STALE
 
 
 def is_pure_gate_metadata(metadata: object) -> bool:
@@ -771,26 +801,18 @@ def is_pure_gate_metadata(metadata: object) -> bool:
 
 
 def _task_in_scheduler_holders_or_parks(
-    task_id: str | int, scheduler_state: Mapping | None
+    task_id: str | int, scheduler_state: SchedulerStateSnapshot | None
 ) -> bool:
-    """Return True when *task_id* is a scheduler park key or a current-holder value.
+    """Return True when *task_id* is a scheduler park owner or a current holder.
 
-    ``scheduler_state`` is the ``read_scheduler_state`` snapshot: ``parks`` is
-    keyed by task_id, ``current_holders`` is ``{module: task_id}`` (so the task
-    appears as a VALUE there). Both are reset by an orchestrator restart, so a
-    stranded post-redeploy task is absent from both. Coerces to ``str`` for the
-    comparison since the on-disk JSON stores task_ids as strings. Tolerates a
-    ``None`` state or missing/ non-dict ``parks``/``current_holders`` keys
-    (returns False, never raises).
+    ``current_holders`` maps module to task_id, so the task appears as a VALUE
+    there. Both are reset by an orchestrator restart, so a stranded
+    post-redeploy task is absent from both. Snapshot task ids are strings.
     """
-    if not isinstance(scheduler_state, Mapping):
+    if scheduler_state is None:
         return False
     tid = str(task_id)
-    parks = scheduler_state.get('parks')
-    if isinstance(parks, Mapping) and tid in {str(k) for k in parks}:
-        return True
-    holders = scheduler_state.get('current_holders')
-    return isinstance(holders, Mapping) and tid in {str(v) for v in holders.values()}
+    return tid in scheduler_state.parks or tid in scheduler_state.current_holders.values()
 
 
 def _routing_decided_after_restart(
