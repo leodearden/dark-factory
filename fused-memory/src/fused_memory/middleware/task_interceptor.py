@@ -44,7 +44,7 @@ from fused_memory.backends.task_backend_errors import (
 from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
 from fused_memory.backends.task_backend_types import AmendmentAdvisory, MetadataLookupResult
 from fused_memory.config.schema import CuratorConfig
-from fused_memory.middleware import deferral_gate, recon_write_policy
+from fused_memory.middleware import deferral_gate, recon_write_policy, task_text_write_guard
 from fused_memory.middleware.amendment_advisory import (
     TASK_TEXT_FIELDS,
     AmendmentWriter,
@@ -5669,6 +5669,7 @@ class TaskInterceptor:
         *,
         agent_id: str | None = None,
         client_op_id: str | None = None,
+        expected_text_fp: str | None = None,
         **kwargs: Any,
     ) -> dict:
         """Write task metadata through all interceptor gates.
@@ -5709,6 +5710,15 @@ class TaskInterceptor:
            project threshold; returns ``BacklogVerdict.to_error_dict()`` which has the
            shape ``{'error': '<msg>', 'error_type': 'ReconciliationBacklogExceeded', …}``
            (no ``success`` key).
+        4. The task-text compare-and-swap (task 4650) —
+           :func:`~fused_memory.middleware.task_text_write_guard.check_text_base`,
+           judged against a ``before`` read under the write lock.
+           ``expected_text_fp`` is the ``task_text_fp`` of the read the write
+           was composed against. A supplied token that no longer matches is
+           rejected for every caller (``TaskTextBaseStale``); a recon-stage
+           write replacing ``description``/``details``/``prompt`` without one
+           is rejected (``ReconTaskTextBaseRequired``). Declared explicitly so
+           it never reaches the backend or the journal.
 
         Callers must use :func:`interceptor_write_succeeded` to distinguish a successful
         write from a gate rejection — do NOT re-implement the formula inline.
@@ -5737,6 +5747,7 @@ class TaskInterceptor:
         # WP-E: serialise the write; re-embed below reads only and stays
         # outside the lock.
         is_recon_stage_write = isinstance(agent_id, str) and agent_id.startswith('recon-stage-')
+        text_write = task_text_write_guard.plan_text_write(kwargs)
         before: dict[str, Any] | None = None
         async with self._write_lock(project_id):
             # W5-ζ ReconWritePolicy: only consulted for recon-stage callers.
@@ -5749,11 +5760,11 @@ class TaskInterceptor:
             # between the check and the write). snapshot_token is extracted
             # from the incoming metadata payload so gate 3 (stale-snapshot)
             # can fire on this path. This same `before` read is reused by
-            # TWO other consumers, so a recon-stage write never issues two
+            # THREE other consumers, so a recon-stage write never issues two
             # before-reads: the lifecycle-reset guard's before-snapshot
-            # (task 2624) below, and the stale-gate-citation guard's live
+            # (task 2624) below, the stale-gate-citation guard's live
             # `dependencies` array (task 4919) immediately after the verdict
-            # check.
+            # check, and the task-text compare-and-swap (task 4650) after it.
             if is_recon_stage_write:
                 # is_recon_stage_write already guarantees this (it's defined
                 # as `isinstance(agent_id, str) and ...`); re-asserted here
@@ -5828,6 +5839,18 @@ class TaskInterceptor:
                     ),
                 ):
                     return err
+
+            if before is None and expected_text_fp is not None:
+                before = await tm.get_task(task_id, project_root)
+            if rejection := task_text_write_guard.check_text_base(
+                before=before,
+                write=text_write,
+                expected_text_fp=expected_text_fp,
+                fp_required=is_recon_stage_write,
+                task_id=task_id,
+                agent_id=agent_id,
+            ):
+                return rejection.to_error_dict()
 
             async def _do_update_task_write() -> Any:
                 return await self._journal_around(
