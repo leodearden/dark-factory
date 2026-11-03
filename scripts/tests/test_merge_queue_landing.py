@@ -307,6 +307,7 @@ def test_a_poll_that_settles_without_landing_is_not_landed(repo, scratch, termin
 
     assert refusal.failure is LandingFailure.NOT_LANDED
     assert refusal.state == terminal["state"]
+    assert refusal.reason == terminal.get("reason")
     assert terminal["state"] in refusal.detail, refusal.detail
     assert terminal.get("reason", "") in refusal.detail, refusal.detail
     _assert_untouched(repo, before, scratch)
@@ -320,9 +321,27 @@ def test_a_submit_that_settles_without_landing_is_not_landed(repo, scratch, stat
     refusal = _refused_by(repo, queue)
 
     assert refusal.failure is LandingFailure.NOT_LANDED
+    assert refusal.reason == f"why-{status}"
     assert status in refusal.detail, refusal.detail
     assert f"why-{status}" in refusal.detail, refusal.detail
     assert queue.calls_to("merge_status") == []
+    _assert_untouched(repo, before, scratch)
+
+
+def test_a_three_path_landing_the_queue_refuses_names_its_outcome_and_reason(docs_repo,
+                                                                             scratch):
+    repo = docs_repo
+    before = _main(repo)
+    queue = FakeMergeQueue(
+        repo, states=["verifying", {"state": "blocked", "reason": "verify failed: 2 tests"}],
+    )
+
+    refusal = _docs_refused_by(repo, queue, DOCS)
+
+    assert len(queue.calls_to("merge_request")) == 1, queue.calls
+    assert refusal.failure is LandingFailure.NOT_LANDED
+    assert refusal.state == "blocked"
+    assert refusal.reason == "verify failed: 2 tests"
     _assert_untouched(repo, before, scratch)
 
 
@@ -334,6 +353,7 @@ def test_a_submit_the_server_refuses_is_submit_rejected(repo, scratch):
     refusal = _refused_by(repo, queue)
 
     assert refusal.failure is LandingFailure.SUBMIT_REJECTED
+    assert refusal.reason == error
     assert error in refusal.detail, refusal.detail
     _assert_untouched(repo, before, scratch)
 
