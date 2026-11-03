@@ -1044,8 +1044,8 @@ class TestUnreachableAlarmNamesTheProbeTarget:
         worker = SpeculativeMergeWorker(
             git_ops, asyncio.Queue(), escalation_queue=escalations, deployed_sha=TEST_DEPLOYED_SHA,
         )
-        worker._ensure_host_allocator(OrchestratorConfig(
-            project_root=git_repo, git=git_config,
+        worker._ensure_host_allocator(lane_scene_config(
+            git_repo, git_config,
             verify_runners=[VerifyRunnerConfig(
                 name='laptop', ssh_host='leo-laptop', git_remote='laptop',
                 df_checkout_path='/remote/dark-factory',
