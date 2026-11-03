@@ -4,7 +4,9 @@ FakeMergeQueue behind it that lands for real in a temp git repo."""
 from __future__ import annotations
 
 import contextlib
+import errno
 import os
+import pathlib
 import signal
 import subprocess
 import tempfile
@@ -543,23 +545,30 @@ def test_an_empty_path_set_is_refused_before_any_call(repo, scratch):
 
 
 @pytest.mark.parametrize("case", [
-    "parent_relative", "absolute_elsewhere", "through_a_symlink", "under_dot_git", "the_root",
+    "parent_relative", "absolute_elsewhere", "through_a_symlink", "under_dot_git",
+    "nested_dot_git", "dot_git_in_another_case", "the_root",
 ])
 def test_a_path_outside_the_checkout_is_refused_before_any_call(docs_repo, scratch, tmp_path,
                                                                 case):
-    """Refused per path: each bad path rides alongside a good one."""
+    """Refused per path: each bad path rides alongside a good one. The
+    refusal names the rule, because a later backstop would refuse some of
+    these shapes too, less clearly."""
     repo = docs_repo
     outside = tmp_path / "outside"
     outside.mkdir()
     (repo / "linked").symlink_to(outside, target_is_directory=True)
     git(repo, "add", "linked")
     git(repo, "commit", "-q", "-m", "link a directory outside the checkout")
-    bad, escape = {
-        "parent_relative": ("../outside.md", tmp_path / "outside.md"),
-        "absolute_elsewhere": (str(tmp_path / "elsewhere.md"), tmp_path / "elsewhere.md"),
-        "through_a_symlink": ("linked/escape.md", outside / "escape.md"),
-        "under_dot_git": (".git/config", None),
-        "the_root": (".", None),
+    bad, escape, rule = {
+        "parent_relative": ("../outside.md", tmp_path / "outside.md", "is outside the checkout"),
+        "absolute_elsewhere": (str(tmp_path / "elsewhere.md"), tmp_path / "elsewhere.md",
+                               "is outside the checkout"),
+        "through_a_symlink": ("linked/escape.md", outside / "escape.md",
+                              "crosses a symlink in the checkout"),
+        "under_dot_git": (".git/config", None, "has a .git component"),
+        "nested_dot_git": ("plans/.git/x", None, "has a .git component"),
+        "dot_git_in_another_case": ("plans/.Git/x", None, "has a .git component"),
+        "the_root": (".", None, "itself"),
     }[case]
     git_config = (repo / ".git" / "config").read_bytes()
     before = _main(repo)
@@ -569,6 +578,7 @@ def test_a_path_outside_the_checkout_is_refused_before_any_call(docs_repo, scrat
 
     assert refusal.failure is LandingFailure.INVALID_CHANGE, refusal.detail
     assert bad in refusal.detail, refusal.detail
+    assert rule in refusal.detail, refusal.detail
     assert queue.calls == []
     assert escape is None or not escape.exists(), f"{escape} was written"
     assert (repo / ".git" / "config").read_bytes() == git_config
@@ -599,6 +609,72 @@ def test_a_symlink_only_the_base_carries_is_refused_before_any_call(docs_repo, s
     assert "linked/escape.md" in refusal.detail, refusal.detail
     assert queue.calls == []
     assert not (outside / "escape.md").exists(), "the write followed the base's symlink"
+    _assert_untouched(repo, before, scratch)
+
+
+def test_a_symlink_the_checkout_gained_after_the_base_is_refused_before_any_call(docs_repo,
+                                                                                 scratch,
+                                                                                 tmp_path):
+    """The base has no symlink to follow, so only the checkout shows that the
+    path lands where main now carries one."""
+    repo = docs_repo
+    base = _main(repo)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (repo / "linked").symlink_to(outside, target_is_directory=True)
+    git(repo, "add", "linked")
+    git(repo, "commit", "-q", "-m", "link a directory outside the checkout")
+    before = _main(repo)
+    queue = FakeMergeQueue(repo)
+
+    refusal = _docs_refused_by(
+        repo, queue, {PRD: DOCS[PRD], "linked/escape.md": b"escaped\n"}, base=base,
+    )
+
+    assert refusal.failure is LandingFailure.INVALID_CHANGE, refusal.detail
+    assert "linked/escape.md" in refusal.detail, refusal.detail
+    assert queue.calls == []
+    assert not (outside / "escape.md").exists(), "the write followed the checkout's symlink"
+    _assert_untouched(repo, before, scratch)
+
+
+@pytest.mark.parametrize("bad", [f"{CONFIG}/under-a-file.md", f"{CONFIG}/deeper/under.md",
+                                 "plans"], ids=["under_a_file", "deeper_under_a_file",
+                                                "over_a_directory"])
+def test_a_path_git_cannot_hold_as_a_file_at_the_base_is_invalid(docs_repo, scratch, bad):
+    repo = docs_repo
+    before = _main(repo)
+    queue = FakeMergeQueue(repo)
+
+    refusal = _docs_refused_by(repo, queue, {PRD: DOCS[PRD], bad: b"misplaced\n"})
+
+    assert refusal.failure is LandingFailure.INVALID_CHANGE, refusal.detail
+    assert bad in refusal.detail, refusal.detail
+    assert queue.calls == []
+    _assert_untouched(repo, before, scratch)
+
+
+def test_a_scratch_write_the_host_refuses_is_not_blamed_on_the_change(docs_repo, scratch,
+                                                                      monkeypatch):
+    """A full or read-only scratch filesystem is the host's fault: the tag
+    must not send the operator looking at the paths."""
+    repo = docs_repo
+    write_bytes = pathlib.Path.write_bytes
+
+    def full_scratch(self, data):
+        if str(self).startswith(scratch):
+            raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC), str(self))
+        return write_bytes(self, data)
+
+    monkeypatch.setattr(pathlib.Path, "write_bytes", full_scratch)
+    before = _main(repo)
+    queue = FakeMergeQueue(repo)
+
+    refusal = _docs_refused_by(repo, queue, DOCS)
+
+    assert refusal.failure is LandingFailure.SCRATCH_WRITE_FAILED, refusal.detail
+    assert os.strerror(errno.ENOSPC) in refusal.detail, refusal.detail
+    assert queue.calls == []
     _assert_untouched(repo, before, scratch)
 
 
@@ -1040,5 +1116,6 @@ def test_failure_tags_are_the_wire_vocabulary():
         "checkout_not_synced",
         "checkout_dirty",
         "invalid_change",
+        "scratch_write_failed",
         "git_failed",
     }

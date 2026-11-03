@@ -24,10 +24,12 @@ because the lane's advance would refuse to move main over uncommitted state
 there, halting the whole queue, or overwrite it.
 
 Refused before any queue call: an empty set; a path outside the checkout,
-through a symlink in it, under its .git, or the checkout itself; two
+through a symlink in it, with a .git component, or the checkout itself; two
 spellings of one path; a path whose content equals its copy at *base_sha* (a
 path the base lacks is a new file); all INVALID_CHANGE. Uncommitted state at
-a landed path is CHECKOUT_DIRTY.
+a landed path is CHECKOUT_DIRTY. A path the target ignores is refused by git
+itself, as GIT_FAILED, and a write the host refuses in the scratch
+directory is SCRATCH_WRITE_FAILED.
 
 A confirmed landing returns `Landing`, whose `landed_as` is the commit the
 queue landed it as. Any other outcome raises `LandingNotConfirmed`: `.failure`
@@ -114,6 +116,7 @@ class LandingFailure(enum.StrEnum):
     CHECKOUT_NOT_SYNCED = "checkout_not_synced"
     CHECKOUT_DIRTY = "checkout_dirty"
     INVALID_CHANGE = "invalid_change"
+    SCRATCH_WRITE_FAILED = "scratch_write_failed"
     GIT_FAILED = "git_failed"
 
 
@@ -181,6 +184,7 @@ def land_files(
     queue = _MergeQueue.connect(port)
     target = _Target.of(Path(repo), files, main_branch)
     target.check_change(base_sha)
+    target.check_checkout_clean()
     deadline = time.monotonic() + float(timeout_secs or DEFAULT_LANDING_TIMEOUT_SECS)
     with (
         _stop_signals_held() as stop,
@@ -369,8 +373,7 @@ class _Target:
     def check_change(self, base_sha: str) -> None:
         """Raise INVALID_CHANGE unless *base_sha* is a commit and every path's
         content differs from the copy *base_sha* carries, if any: a path it
-        lacks is a new file. Then raise CHECKOUT_DIRTY when any landed path
-        carries uncommitted state in the checkout."""
+        lacks is a new file."""
         if _run_git(self.repo, "rev-parse", "--verify", "--quiet",
                     f"{base_sha}^{{commit}}").returncode != 0:
             raise LandingNotConfirmed(
@@ -384,6 +387,10 @@ class _Target:
                 f"nothing to land for {', '.join(unchanged)}: base {base_sha} already carries "
                 f"this content",
             )
+
+    def check_checkout_clean(self) -> None:
+        """Raise CHECKOUT_DIRTY when any landed path carries uncommitted state
+        in the checkout."""
         dirty = self.dirty_paths()
         if dirty:
             raise LandingNotConfirmed(
@@ -406,7 +413,8 @@ class _Target:
         """Write every path's new content into *worktree*, the base checked
         out. A path git's tree cannot hold there as a file (under a file, over
         a directory, through a symlink the base carries but the target
-        checkout no longer does) is INVALID_CHANGE."""
+        checkout no longer does) is INVALID_CHANGE; any other write the host
+        refuses is SCRATCH_WRITE_FAILED."""
         for path, content in self.changes:
             destination = worktree / path
             if _crosses_symlink(worktree, path):
@@ -418,9 +426,14 @@ class _Target:
             try:
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 destination.write_bytes(content)
-            except OSError as exc:
+            except (IsADirectoryError, NotADirectoryError, FileExistsError) as exc:
                 raise LandingNotConfirmed(
                     LandingFailure.INVALID_CHANGE, f"{path} cannot be written as a file: {exc}",
+                ) from exc
+            except OSError as exc:
+                raise LandingNotConfirmed(
+                    LandingFailure.SCRATCH_WRITE_FAILED,
+                    f"the host refused writing {path} into the deploy worktree {worktree}: {exc}",
                 ) from exc
 
     def blob(self, rev: str, path: str) -> bytes | None:
@@ -453,7 +466,8 @@ def _holds(on_disk: Path, content: bytes | None) -> bool:
 def _repo_relative(repo: Path, path: str) -> str:
     """*path*, relative to the checkout *repo* or absolute inside it, as a
     repo-relative POSIX path. INVALID_CHANGE when it names the checkout
-    itself, anything outside it or under its .git, or crosses a symlink in it."""
+    itself or anything outside it, has a .git component, or crosses a symlink
+    in it."""
     root = repo.absolute()
     try:
         relative = Path(os.path.normpath(root / path)).relative_to(root)
@@ -462,8 +476,8 @@ def _repo_relative(repo: Path, path: str) -> str:
     else:
         if not relative.parts:
             problem = f"names the checkout {repo} itself, not a file in it"
-        elif relative.parts[0] == ".git":
-            problem = f"is under {repo}/.git, which no commit carries"
+        elif any(part.lower() == ".git" for part in relative.parts):
+            problem = "has a .git component (in some letter case), which git refuses to commit"
         elif _crosses_symlink(repo, relative.as_posix()):
             problem = (f"crosses a symlink in the checkout {repo}, so it would be written "
                        f"somewhere other than the path it names")
