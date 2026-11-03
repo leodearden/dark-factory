@@ -388,6 +388,26 @@ def _pytest_ini_options(pyproject: pathlib.Path) -> dict | None:
     return pytest_table['ini_options']
 
 
+def workspace_members() -> list[str]:
+    """``[tool.uv.workspace].members`` from the root pyproject.toml, never empty.
+
+    The one read of the members table for every sweep that discovers workspace
+    members, so the read and its anti-vacuity guard have a single home.
+    """
+    root_pyproject = REPO_ROOT / 'pyproject.toml'
+    root_data = tomllib.loads(root_pyproject.read_text(encoding='utf-8'))
+    members = root_data.get('tool', {}).get('uv', {}).get('workspace', {}).get('members', [])
+
+    # A typo'd key here would make every discovery loop iterate nothing and turn
+    # every sweep built on it into a silent pass.
+    assert members, (
+        '[tool.uv.workspace].members is empty or missing in the root '
+        'pyproject.toml — this guard reads it to discover which subprojects to '
+        'check, so it would otherwise pass vacuously.'
+    )
+    return members
+
+
 def discovered_pytest_configs() -> dict[str, dict]:
     """Every pyproject.toml in this repo declaring ``[tool.pytest.ini_options]``.
 
@@ -396,23 +416,13 @@ def discovered_pytest_configs() -> dict[str, dict]:
     defect this file guards against is a config that nobody remembered to give a
     cap, and a hand-written list is the same class of forgetting.
 
-    Both anti-vacuity guards live HERE rather than in each caller, because they
-    are properties of DISCOVERY and every sweep in this file depends on them.
+    Both anti-vacuity guards — ``workspace_members``'s non-empty read and the
+    config-count floor below — live in discovery rather than in each caller,
+    because they are properties of DISCOVERY and every sweep in this file
+    depends on them.
     """
-    root_pyproject = REPO_ROOT / 'pyproject.toml'
-    root_data = tomllib.loads(root_pyproject.read_text(encoding='utf-8'))
-    members = root_data.get('tool', {}).get('uv', {}).get('workspace', {}).get('members', [])
-
-    # A typo'd key here would make the loop below iterate nothing and turn every
-    # sweep in this file into a silent pass.
-    assert members, (
-        '[tool.uv.workspace].members is empty or missing in the root '
-        'pyproject.toml — this guard reads it to discover which subprojects to '
-        'check, so it would otherwise pass vacuously.'
-    )
-
     configs: dict[str, dict] = {}
-    for name in [ROOT_CONFIG_NAME, *members]:
+    for name in [ROOT_CONFIG_NAME, *workspace_members()]:
         ini_options = _pytest_ini_options(REPO_ROOT / name / 'pyproject.toml')
         if ini_options is not None:
             configs[name] = ini_options
