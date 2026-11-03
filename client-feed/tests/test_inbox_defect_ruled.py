@@ -20,6 +20,7 @@ from client_feed.contract import (
     parse_inbox_line,
 )
 from client_feed.feed_io import CURSOR_FILENAME, Cursor, OutDir, read_feed_lines
+from client_feed.inbox import read_inbox
 from client_feed.policy import Policy
 from client_feed.publisher import run_pass
 
@@ -97,6 +98,41 @@ def in_dir(tmp_path: Path) -> Path:
     path = tmp_path / 'in'
     write_engagement(path, project_id=PROJECT)
     return path
+
+
+def test_a_ruled_line_is_read_beside_requests_and_reports_in_inbox_order(in_dir: Path) -> None:
+    inbox = write_inbox(
+        in_dir, requested(1, 'src/ledger.py'), REPORTED, RULED, requested(4, 'src/reports.py')
+    )
+
+    read = read_inbox(in_dir, offset=0)
+
+    assert [line.seq for line in read.lines] == [1, 2, 3, 4]
+    assert read.rejected == ()
+    assert [request.seq for request in read.requests] == [1, 4]
+    assert [report.seq for report in read.reports] == [2]
+    assert [(ruling.block, ruling.report, ruling.kind) for ruling in read.rulings] == [
+        (2, 1, RulingKind.NOT_A_DEFECT)
+    ]
+    assert read.offset == inbox.stat().st_size
+
+
+def test_a_ruled_line_carrying_a_note_is_rejected_by_offset_and_the_tail_moves_on(
+    in_dir: Path,
+) -> None:
+    first = requested(1, 'src/ledger.py')
+    inbox = write_inbox(
+        in_dir, first, {**RULED, 'seq': 2, 'note': 'out of scope'}, requested(3, 'src/ledger.py')
+    )
+
+    read = read_inbox(in_dir, offset=0)
+
+    assert [line.seq for line in read.lines] == [1, 3]
+    assert read.rulings == ()
+    assert [(rejected.offset, 'note' in rejected.detail) for rejected in read.rejected] == [
+        (len(f'{json.dumps(first)}\n'.encode()), True)
+    ]
+    assert read.offset == inbox.stat().st_size
 
 
 @pytest.fixture
