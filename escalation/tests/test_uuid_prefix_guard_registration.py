@@ -30,6 +30,7 @@ from shared.uuid_prefix_guard import (
     UuidPrefixGuardMiddleware,
 )
 
+from escalation.models import BORN_AT_L2_SEVERITIES, Escalation
 from escalation.prefix_resolver_client import PrefixResolverClient
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
@@ -322,3 +323,123 @@ class TestOverride:
         assert esc.detail == CITING_DETAIL
         assert resolver.calls == []
         assert 'uuid_prefix_repair' not in (result.meta or {})
+
+
+# ---------------------------------------------------------------------------
+# INV-4: the burst alarm, on the real server.
+# ---------------------------------------------------------------------------
+
+#: The alarm's synthetic anchor, category and filer. Spelled out rather than
+#: imported: these tests assert the registration site put this vocabulary on a
+#: real record, and importing both sides of a contract lets both drift together.
+STORM_ANCHOR = 'uuid-prefix-storm'
+STORM_CATEGORY = 'uuid_prefix_storm'
+STORM_ROLE = 'harness-uuid-prefix-guard'
+
+#: ``UuidPrefixGuardMiddleware``'s default ``storm_threshold``; the server does
+#: not override it.
+STORM_THRESHOLD = 3
+
+
+class TestStormBurstAlarm:
+    """A burst of fail-soft outcomes files ONE open alarm, never a refusal."""
+
+    @staticmethod
+    async def _burst(server, calls: int = STORM_THRESHOLD) -> list[Any]:
+        """Drive *calls* prefixed escalate_info calls; return each result."""
+        results = []
+        async with Client(server) as client:
+            for index in range(calls):
+                results.append(await client.call_tool('escalate_info', {
+                    **REQUIRED,
+                    'summary': f'{REQUIRED["summary"]} (call {index})',
+                    'detail': CITING_DETAIL,
+                }))
+        return results
+
+    @staticmethod
+    def _alarms(queue) -> list[Any]:
+        """Every pending burst alarm on the queue, in filing order."""
+        return sorted(
+            (esc for esc in queue.get_pending() if esc.category == STORM_CATEGORY),
+            key=lambda esc: esc.id,
+        )
+
+    @staticmethod
+    def _outage_server(tmp_path: Path):
+        return build(tmp_path, RecordingResolver(outage=ResolverUnavailable('mem0')))
+
+    @pytest.mark.asyncio
+    async def test_a_burst_files_every_call_and_exactly_one_alarm(self, tmp_path: Path):
+        queue, server = self._outage_server(tmp_path)
+
+        results = await self._burst(server)
+
+        assert [result.data['status'] for result in results] == ['queued'] * STORM_THRESHOLD
+        storms = [meta_of(result)['uuid_prefix_repair'].get('storm') for result in results]
+        assert [storm is not None for storm in storms] == [False, False, True]
+        assert storms[-1]['count'] == STORM_THRESHOLD
+        assert storms[-1]['outcome'] == 'resolver_unavailable'
+
+        alarms = self._alarms(queue)
+        assert len(alarms) == 1, f'expected one burst alarm, found {len(alarms)}'
+        alarm = alarms[0]
+        assert alarm.task_id == STORM_ANCHOR
+        assert alarm.agent_role == STORM_ROLE
+        assert alarm.level == 1
+        assert alarm.severity == 'blocking'
+        assert alarm.severity not in BORN_AT_L2_SEVERITIES
+        assert str(STORM_THRESHOLD) in alarm.summary
+        assert 'resolver_unavailable' in alarm.summary
+
+    @pytest.mark.asyncio
+    async def test_a_second_burst_folds_into_the_open_alarm(self, tmp_path: Path):
+        """Driven through a SECOND server on the same queue: a restart is how
+        a second fire reaches the sink, since each guard counts per instance."""
+        queue, server = self._outage_server(tmp_path)
+        await self._burst(server)
+        first = self._alarms(queue)
+        assert len(first) == 1
+
+        _, restarted = self._outage_server(tmp_path)
+        await self._burst(restarted)
+
+        alarms = self._alarms(queue)
+        assert len(alarms) == 1, f'a second burst must fold into the open alarm, found {len(alarms)}'
+        assert alarms[0].id == first[0].id
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('category', 'agent_role'), [
+        ('design_concern', 'escalation-watcher'),
+        (STORM_CATEGORY, 'harness-markup-guard'),
+    ], ids=['another-category', 'another-filer'])
+    async def test_a_record_that_is_not_this_alarm_does_not_suppress_it(
+        self, tmp_path: Path, category: str, agent_role: str,
+    ):
+        """Dedup means "MY alarm is open": category AND filer, never the anchor alone."""
+        queue, server = self._outage_server(tmp_path)
+        squatter = queue.submit(Escalation(
+            id=queue.make_id(STORM_ANCHOR),
+            task_id=STORM_ANCHOR,
+            agent_role=agent_role,
+            severity='blocking',
+            category=category,
+            summary='Another producer filed on the same synthetic anchor.',
+            level=1,
+        ))
+
+        await self._burst(server)
+
+        mine = [esc for esc in self._alarms(queue) if esc.id != squatter]
+        assert len(mine) == 1, f'the squatting record suppressed the alarm, found {len(mine)}'
+        assert mine[0].agent_role == STORM_ROLE
+
+    @pytest.mark.asyncio
+    async def test_an_ambiguous_burst_files_one_alarm_naming_its_outcome(self, tmp_path: Path):
+        queue, server = build(tmp_path, RecordingResolver(AMBIGUOUS))
+
+        await self._burst(server)
+
+        alarms = self._alarms(queue)
+        assert len(alarms) == 1, f'expected one burst alarm, found {len(alarms)}'
+        assert 'forwarded_ambiguous' in alarms[0].summary
