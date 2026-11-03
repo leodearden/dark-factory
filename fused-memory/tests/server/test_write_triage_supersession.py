@@ -199,7 +199,7 @@ class TestAddMemoryMarksTheSupersededRecord:
         assert kwargs['project_id'] == _PROJECT_ID
         assert kwargs['agent_id'] == _AGENT_ID
         assert ack[SUPERSESSION_ACK_KEY] == {
-            'superseded_by': NEW_ID, 'marked': [OLD], 'unmarked': [],
+            'superseded_by': NEW_ID, 'marked': [OLD], 'unmarked': [], 'pending_retry': [],
         }, f'{ack!r}'
         if triage_enabled:
             assert ack[ROUTED_KEY] == OUTCOME_STORED, f'{ack!r}'
