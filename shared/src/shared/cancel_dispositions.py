@@ -8,12 +8,12 @@ from __future__ import annotations
 import json
 import re
 from collections import Counter, deque
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from types import MappingProxyType
-from typing import Annotated, Any, Final, Literal, Self, TypedDict, TypeVar, get_args
+from typing import Annotated, Any, Final, Literal, Self, TypedDict, TypeVar, assert_never, get_args
 
 from pydantic import (
     AfterValidator,
@@ -29,6 +29,7 @@ from pydantic import (
 )
 from pydantic_core import ErrorDetails, PydanticCustomError
 
+from shared.project_id import normalize_project_id
 from shared.task_statuses import TaskStatus
 
 __all__ = [
@@ -121,7 +122,8 @@ def _distinct(ids: tuple[int, ...]) -> tuple[int, ...]:
 
 TaskId = Annotated[int, Field(strict=True, gt=0)]
 ReasonText = Annotated[str, StringConstraints(max_length=REASON_MAX_CHARS)]
-DistinctTaskIds = Annotated[tuple[TaskId, ...], Field(min_length=1), AfterValidator(_distinct)]
+DistinctTaskIds = Annotated[tuple[TaskId, ...], AfterValidator(_distinct)]
+NonEmptyDistinctTaskIds = Annotated[DistinctTaskIds, Field(min_length=1)]
 
 
 class _DispositionBase(BaseModel):
@@ -136,7 +138,7 @@ class KeepDisposition(_DispositionBase):
 
 class RepointDisposition(_DispositionBase):
     action: Literal[CancelAction.REPOINT] = CancelAction.REPOINT
-    onto: DistinctTaskIds
+    onto: NonEmptyDistinctTaskIds
 
 
 class FoldDisposition(_DispositionBase):
@@ -230,13 +232,33 @@ class CancelChildrenInvalid(Exception):
         }
 
 
-_QUALIFIED_TASK_REF: Final = r'([^:\s]+):([1-9][0-9]*)'
-QualifiedTaskRefText = Annotated[str, StringConstraints(pattern=f'^{_QUALIFIED_TASK_REF}$')]
+_QUALIFIED_TASK_REF: Final = re.compile(r'([^:\s]+):([1-9][0-9]*)', re.ASCII)
 
 
 def qualified_task_ref(project_id: str, task_id: int) -> str:
-    """The one spelling of a task named across projects: `<project_id>:<id>`."""
-    return f'{project_id}:{task_id}'
+    """The one spelling of a task named across projects: `<project_id>:<id>`, canonically."""
+    return f'{normalize_project_id(project_id)}:{task_id}'
+
+
+def _split_qualified_ref(text: str) -> tuple[str, int] | None:
+    """The parts of a qualified_task_ref spelling, or None (also for a non-canonical project)."""
+    match = _QUALIFIED_TASK_REF.fullmatch(text)
+    if match is None or match[1] != normalize_project_id(match[1]):
+        return None
+    return match[1], int(match[2])
+
+
+def _qualified_ref_text(text: str) -> str:
+    if _split_qualified_ref(text) is None:
+        raise PydanticCustomError(
+            'qualified_task_ref',
+            'expected `<project_id>:<id>` with a canonical project id, got {text!r}',
+            {'text': text},
+        )
+    return text
+
+
+QualifiedTaskRefText = Annotated[str, AfterValidator(_qualified_ref_text)]
 
 
 def sibling_lookup_values(parent_id: str) -> tuple[str | int, ...]:
@@ -261,9 +283,8 @@ class ExternalChild:
 ChildKey = int | ExternalChild
 
 _LOCAL_KEY: Final = re.compile(r'[1-9][0-9]*', re.ASCII)
-_EXTERNAL_KEY: Final = re.compile(_QUALIFIED_TASK_REF, re.ASCII)
 _DISPOSITION_ADAPTER: Final = TypeAdapter(ChildDispositionVariant)
-_TASK_IDS_ADAPTER: Final = TypeAdapter(DistinctTaskIds)
+_TASK_IDS_ADAPTER: Final = TypeAdapter(NonEmptyDistinctTaskIds)
 
 _ERROR_TYPE_REASONS: Final[Mapping[str, CancelChildrenInvalidReason]] = {
     'union_tag_invalid': CancelChildrenInvalidReason.UNKNOWN_ACTION,
@@ -291,12 +312,12 @@ def _child_key(key_text: object, *, parent_id: int, parent_project_id: str) -> C
                 CancelChildrenInvalidReason.CHILD_IS_PARENT, _child_field(key_text), key_text
             )
         return child_id
-    external = _EXTERNAL_KEY.fullmatch(key_text) if isinstance(key_text, str) else None
-    if external is None or external[1] == parent_project_id:
+    external = _split_qualified_ref(key_text) if isinstance(key_text, str) else None
+    if external is None or external[0] == normalize_project_id(parent_project_id):
         raise CancelChildrenInvalid(
             CancelChildrenInvalidReason.INVALID_CHILD_KEY, _child_field(str(key_text)), key_text
         )
-    return ExternalChild(project_id=external[1], task_id=int(external[2]))
+    return ExternalChild(project_id=external[0], task_id=external[1])
 
 
 def _disposition_refusal(
@@ -433,14 +454,16 @@ def _check_target(
 
 
 def _cancelled_by(
-    children: Mapping[ChildKey, ChildDispositionVariant], parent_id: int
+    children: Mapping[ChildKey, ChildDispositionVariant],
+    parent_id: int,
+    co_cancelled: Collection[int],
 ) -> frozenset[int]:
     cancelled_children = (
         child
         for child, disposition in children.items()
         if isinstance(child, int) and disposition.action in CHILD_CANCELLING_ACTIONS
     )
-    return frozenset({parent_id, *cancelled_children})
+    return frozenset({parent_id, *cancelled_children, *co_cancelled})
 
 
 def _post_cancel_edges(
@@ -492,18 +515,20 @@ def check_targets(
     superseded_by: Sequence[int],
     *,
     parent_id: int,
+    co_cancelled: Collection[int],
     target_status: Mapping[int, TaskStatus | None],
     depends_on: Mapping[int, Sequence[int]],
 ) -> None:
     """Refuse a target that is missing, cancelled (already or by this cancel), or would close
     a dependency cycle in the graph this cancel leaves behind.
 
-    target_status maps each named target to its status, None when no such task exists;
-    depends_on is the pre-cancel task -> dependency-ids map, and the post-cancel overlay is
-    derived from children and parent_id. Local children are checked in ascending id order,
+    co_cancelled names the tasks the same act cancels separately (PRD §4.1); target_status
+    maps each named target to its status, None when no such task exists; depends_on is the
+    pre-cancel task -> dependency-ids map, and the post-cancel overlay is derived from
+    children, parent_id and co_cancelled. Local children are checked in ascending id order,
     then external ones by key, then superseded_by.
     """
-    cancelled = _cancelled_by(children, parent_id)
+    cancelled = _cancelled_by(children, parent_id, co_cancelled)
     edges = _post_cancel_edges(children, depends_on, parent_id=parent_id, cancelled=cancelled)
     for child in sorted(children, key=_child_order):
         _check_child(child, children[child], target_status, cancelled, edges)
@@ -588,6 +613,8 @@ def stamp_entry(
             return FoldEntry(reason=disposition.reason, into=disposition.into, **stamp)
         case MootDisposition():
             return MootEntry(reason=disposition.reason, **stamp)
+        case _:
+            assert_never(disposition)
 
 
 def co_cancelled_entry(
@@ -607,10 +634,13 @@ def entry_for_parent(
 def with_entry(
     entries: Sequence[CancelDispositionEntryVariant], entry: CancelDispositionEntryVariant
 ) -> tuple[CancelDispositionEntryVariant, ...]:
-    """Entries with `entry` replacing the one for its parent in place, else appended."""
-    if entry_for_parent(entries, entry.parent) is None:
-        return (*entries, entry)
-    return tuple(entry if existing.parent == entry.parent else existing for existing in entries)
+    """Entries with `entry` as its parent's only one: in the first one's place, else appended."""
+    position = next(
+        (index for index, existing in enumerate(entries) if existing.parent == entry.parent),
+        len(entries),
+    )
+    others = [existing for existing in entries if existing.parent != entry.parent]
+    return (*others[:position], entry, *others[position:])
 
 
 def entries_to_json(entries: Sequence[CancelDispositionEntryVariant]) -> list[dict[str, Any]]:
@@ -626,16 +656,20 @@ class InvalidEntries:
 
 
 def parse_entries(raw: object) -> tuple[CancelDispositionEntryVariant, ...] | InvalidEntries:
-    """Any metadata.cancel_dispositions slice as its entries: () when absent."""
+    """Any metadata.cancel_dispositions slice as its entries, one per parent: () when absent."""
     if raw is None:
         return ()
     if not isinstance(raw, list | tuple):
         return InvalidEntries(f'expected a list of entries, got {type(raw).__name__}')
     items = [item.root if isinstance(item, CancelDispositionEntry) else item for item in raw]
     try:
-        return tuple(_ENTRIES_ADAPTER.validate_python(items))
+        entries = tuple(_ENTRIES_ADAPTER.validate_python(items))
     except ValidationError as exc:
         return InvalidEntries(str(exc))
+    repeated = _repeated([entry.parent for entry in entries])
+    if repeated:
+        return InvalidEntries(f'more than one entry for parent {", ".join(repeated)}')
+    return entries
 
 
 class ChildRelation(StrEnum):
@@ -702,7 +736,7 @@ class CancelChildrenView(BaseModel):
     project_id: str
     status: TaskStatus
     children: tuple[ChildRow, ...]
-    superseded_by: tuple[TaskId, ...] = ()
+    superseded_by: DistinctTaskIds = ()
     external_dependents_checked: bool
     enforce: bool
 
@@ -711,6 +745,27 @@ class CancelChildrenView(BaseModel):
         repeated = _repeated([row.key for row in self.children])
         if repeated:
             raise ValueError(f'children lists {repeated} more than once')
+        return self
+
+    @model_validator(mode='after')
+    def _only_external_dependents_are_in_another_project(self) -> Self:
+        misplaced = [
+            row.key
+            for row in self.children
+            if (row.project_id == self.project_id)
+            == (row.relation == ChildRelation.EXTERNAL_DEPENDENT)
+        ]
+        if misplaced:
+            raise ValueError(
+                f'children {misplaced} must be in project {self.project_id!r} exactly when '
+                f'their relation is not {ChildRelation.EXTERNAL_DEPENDENT.value!r}'
+            )
+        return self
+
+    @model_validator(mode='after')
+    def _the_task_does_not_supersede_itself(self) -> Self:
+        if self.task_id in self.superseded_by:
+            raise ValueError(f'superseded_by names the task itself, {self.task_id}')
         return self
 
 
@@ -732,7 +787,7 @@ class DecisionRow:
     evidence_check: str
     action: str
     dispositions: tuple[CancelAction, ...]
-    example_ids: tuple[str, ...]
+    report_examples: tuple[str, ...]
 
 
 DECISION_TABLE: Final = (
@@ -748,7 +803,7 @@ DECISION_TABLE: Final = (
             '(then it is terminal, unlisted)'
         ),
         dispositions=(),
-        example_ids=('3378',),
+        report_examples=('3378',),
     ),
     DecisionRow(
         order=1,
@@ -756,7 +811,7 @@ DECISION_TABLE: Final = (
         evidence_check='`named_superseder` (in `superseded_by`)',
         action='**keep** (default)',
         dispositions=(CancelAction.KEEP,),
-        example_ids=('8032–8058', '928/930'),
+        report_examples=('8032–8058', '928/930'),
     ),
     DecisionRow(
         order=2,
@@ -767,7 +822,7 @@ DECISION_TABLE: Final = (
         ),
         action='**keep** (U)',
         dispositions=(CancelAction.KEEP,),
-        example_ids=('6906', '7007', '8207', '733'),
+        report_examples=('6906', '7007', '8207', '733'),
     ),
     DecisionRow(
         order=3,
@@ -784,7 +839,7 @@ DECISION_TABLE: Final = (
             'harm: locally it releases early, cross-project it wedges'
         ),
         dispositions=(CancelAction.REPOINT,),
-        example_ids=('952→1112', '5770→6580', '7738→8891', '6905/7996→8032'),
+        report_examples=('952→1112', '5770→6580', '7738→8891', '6905/7996→8032'),
     ),
     DecisionRow(
         order=4,
@@ -801,7 +856,7 @@ DECISION_TABLE: Final = (
             '`details` while it is `pending` (F); not covered → **moot** (M)'
         ),
         dispositions=(CancelAction.FOLD, CancelAction.MOOT),
-        example_ids=(
+        report_examples=(
             'F: 937/960',
             'F: 7997/7998→8032',
             'F: 5160→5261',
@@ -816,7 +871,7 @@ DECISION_TABLE: Final = (
         evidence_check='some declared files present, some missing',
         action='**keep** + `update_task` trimming the child to what main lacks (R)',
         dispositions=(CancelAction.KEEP,),
-        example_ids=('261', '792'),
+        report_examples=('261', '792'),
     ),
     DecisionRow(
         order=6,
@@ -826,7 +881,7 @@ DECISION_TABLE: Final = (
             'do NOT cancel the parent yet: ask (watcher → Leo; Stage 2 → recon_report)'
         ),
         dispositions=(),
-        example_ids=(),
+        report_examples=(),
     ),
 )
 
@@ -835,7 +890,7 @@ _TABLE_RULE: Final = '|---|---|---|---|---|'
 
 
 def _table_line(row: DecisionRow) -> str:
-    examples = ', '.join(row.example_ids) or '—'
+    examples = ', '.join(row.report_examples) or '—'
     return f'| {row.order} | {row.question} | {row.evidence_check} | {row.action} | {examples} |'
 
 

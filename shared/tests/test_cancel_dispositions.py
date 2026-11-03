@@ -180,6 +180,10 @@ def test_an_external_child_key_is_the_qualified_task_ref():
     assert child.key == 'reify:44' == qualified_task_ref('reify', 44)
 
 
+def test_a_qualified_task_ref_spells_the_project_id_canonically():
+    assert qualified_task_ref('Dark-Factory', 12) == 'dark_factory:12'
+
+
 def test_children_round_trip_through_their_wire_form():
     parsed = _parse(
         {
@@ -256,6 +260,27 @@ def test_children_round_trip_through_their_wire_form():
             id='own-project-qualified',
         ),
         pytest.param(
+            {'Dark-Factory:12': {'action': 'repoint', 'onto': [8032]}},
+            Reason.INVALID_CHILD_KEY,
+            'children.Dark-Factory:12',
+            'Dark-Factory:12',
+            id='own-project-qualified-in-another-spelling',
+        ),
+        pytest.param(
+            {'Reify:44': {'action': 'repoint', 'onto': [8032]}},
+            Reason.INVALID_CHILD_KEY,
+            'children.Reify:44',
+            'Reify:44',
+            id='external-project-not-canonical',
+        ),
+        pytest.param(
+            {7007: {'action': 'keep'}},
+            Reason.INVALID_CHILD_KEY,
+            'children.7007',
+            7007,
+            id='key-not-a-string',
+        ),
+        pytest.param(
             {'reify:44': {'action': 'moot'}},
             Reason.EXTERNAL_NOT_REPOINT,
             'children.reify:44.action',
@@ -289,6 +314,20 @@ def test_children_round_trip_through_their_wire_form():
             'children.1.into',
             None,
             id='missing-into',
+        ),
+        pytest.param(
+            {'1': {'reason': 'no action'}},
+            Reason.MISSING_FIELD,
+            'children.1.action',
+            None,
+            id='missing-action',
+        ),
+        pytest.param(
+            {'7007': {'action': 'repoint', 'onto': [8032, 0]}},
+            Reason.INVALID_VALUE,
+            'children.7007.onto.1',
+            0,
+            id='one-onto-element-not-an-id',
         ),
         pytest.param(
             {'1': {'action': 'moot', 'reason': 'x' * 501}},
@@ -423,11 +462,13 @@ def _check(
     children: Mapping[ChildKey, ChildDispositionVariant],
     superseded_by: tuple[int, ...] = (),
     depends_on: Mapping[int, list[int]] | None = None,
+    co_cancelled: tuple[int, ...] = (),
 ) -> None:
     check_targets(
         children,
         superseded_by,
         parent_id=PARENT,
+        co_cancelled=co_cancelled,
         target_status=_STATUSES,
         depends_on=depends_on or {},
     )
@@ -472,6 +513,12 @@ def test_superseded_by_naming_a_cancelled_task_is_refused():
     refusal = _refusal_of({}, superseded_by=(SUPERSEDER, CANCELLED))
 
     assert refusal == (Reason.TARGET_CANCELLED, 'superseded_by', CANCELLED)
+
+
+def test_superseded_by_naming_a_missing_task_is_refused():
+    refusal = _refusal_of({}, superseded_by=(SUPERSEDER, MISSING))
+
+    assert refusal == (Reason.TARGET_NOT_FOUND, 'superseded_by', MISSING)
 
 
 def test_a_repoint_that_would_close_a_dependency_cycle_is_refused():
@@ -581,6 +628,34 @@ def test_superseded_by_naming_a_child_the_map_cancels_is_refused():
 
 
 @pytest.mark.parametrize(
+    ('children', 'superseded_by', 'field'),
+    [
+        pytest.param(
+            {7007: RepointDisposition(onto=(7008,))}, (), 'children.7007.onto', id='repoint-onto'
+        ),
+        pytest.param({7007: FoldDisposition(into=7008)}, (), 'children.7007.into', id='fold-into'),
+        pytest.param({}, (7008,), 'superseded_by', id='superseded-by'),
+    ],
+)
+def test_a_target_the_same_act_co_cancels_is_refused(
+    children: Mapping[ChildKey, ChildDispositionVariant],
+    superseded_by: tuple[int, ...],
+    field: str,
+):
+    refusal = _refusal_of(children, superseded_by=superseded_by, co_cancelled=(7008,))
+
+    assert refusal == (Reason.TARGET_CANCELLED, field, 7008)
+
+
+def test_a_path_through_a_co_cancelled_task_closes_no_cycle():
+    _check(
+        {7007: RepointDisposition(onto=(SUPERSEDER,))},
+        depends_on={SUPERSEDER: [7008], 7008: [7007]},
+        co_cancelled=(7008,),
+    )
+
+
+@pytest.mark.parametrize(
     'children',
     [
         pytest.param(
@@ -648,6 +723,18 @@ def test_stamp_entry_carries_the_disposition_and_the_stamp(disposition, entry_ty
     )
 
 
+@pytest.mark.parametrize(
+    'not_a_variant',
+    [
+        pytest.param(ChildDisposition(KeepDisposition()), id='the-root-model-wrapper'),
+        pytest.param({'action': 'keep'}, id='the-wire-form'),
+    ],
+)
+def test_stamp_entry_refuses_anything_but_a_disposition_variant(not_a_variant):
+    with pytest.raises(AssertionError):
+        stamp_entry(not_a_variant, parent=P, **_STAMP)
+
+
 def test_a_repoint_entry_keeps_its_targets():
     entry = stamp_entry(RepointDisposition(onto=(8032,)), parent=P, **_STAMP)
 
@@ -684,6 +771,7 @@ def test_a_well_formed_entry_validates():
     'overrides',
     [
         pytest.param({'parent': str(PARENT)}, id='bare-parent-id'),
+        pytest.param({'parent': f'Dark-Factory:{PARENT}'}, id='non-canonical-parent-project'),
         pytest.param({'stamped_at': '2026-11-03T12:00:00'}, id='naive-stamped-at'),
         pytest.param({'source': 'other'}, id='unknown-source'),
         pytest.param({'onto': [8032]}, id='onto-on-keep'),
@@ -718,6 +806,16 @@ def test_with_entry_appends_an_entry_for_a_new_parent():
     entries = (_keep_for(A), _keep_for(B))
 
     assert with_entry(entries, _keep_for(C)) == (_keep_for(A), _keep_for(B), _keep_for(C))
+
+
+def test_with_entry_leaves_its_parent_exactly_one_entry():
+    entries = (_keep_for(A, 'first'), _keep_for(B), _keep_for(A, 'second'), _keep_for(C))
+
+    assert with_entry(entries, _keep_for(A, 'new')) == (
+        _keep_for(A, 'new'),
+        _keep_for(B),
+        _keep_for(C),
+    )
 
 
 def test_entry_for_parent_finds_the_parent_s_entry_or_none():
@@ -758,6 +856,10 @@ def test_parse_entries_accepts_the_typed_entries_parse_metadata_hands_back():
         pytest.param([_entry_json(parent='5869')], 'parent', id='bare-parent'),
         pytest.param([_entry_json(action='repoint')], 'onto', id='repoint-without-onto'),
         pytest.param({'parent': P}, 'list', id='not-a-list'),
+        pytest.param(
+            [_entry_json(), _entry_json(action='moot')], f'more than one entry for parent {P}',
+            id='two-entries-for-one-parent',
+        ),
     ],
 )
 def test_parse_entries_reports_a_malformed_slice(raw, named):
@@ -905,6 +1007,32 @@ def test_a_view_listing_one_child_twice_is_rejected():
         _view(children=(_row(), _row(title='again')))
 
 
+@pytest.mark.parametrize(
+    'superseded_by',
+    [
+        pytest.param((SUPERSEDER, SUPERSEDER), id='a-superseder-twice'),
+        pytest.param((SUPERSEDER, PARENT), id='the-task-itself'),
+    ],
+)
+def test_a_view_rejects_a_superseded_by_the_parser_refuses(superseded_by: tuple[int, ...]):
+    with pytest.raises(ValidationError):
+        _view(superseded_by=superseded_by)
+
+
+@pytest.mark.parametrize(
+    'row',
+    [
+        pytest.param(_row(project_id='reify'), id='local-row-in-another-project'),
+        pytest.param(
+            _row(id=44, relation=ChildRelation.EXTERNAL_DEPENDENT), id='external-row-in-this-project'
+        ),
+    ],
+)
+def test_a_view_rejects_a_row_whose_project_contradicts_its_relation(row: ChildRow):
+    with pytest.raises(ValidationError):
+        _view(children=(row,))
+
+
 def test_capped_lists_at_most_the_payload_cap_and_the_total():
     assert PAYLOAD_ID_CAP == 50
     assert capped('undispositioned', list(range(75))) == {
@@ -945,6 +1073,11 @@ def test_the_decision_table_reaches_every_caller_action_and_no_entry_only_one():
     assert not reached & ENTRY_ONLY_ACTIONS
 
 
+@pytest.mark.parametrize('row', DECISION_TABLE, ids=lambda row: f'row-{row.order}')
+def test_a_row_s_action_prose_names_each_of_its_dispositions_in_bold(row: DecisionRow):
+    assert all(f'**{action.value}**' in row.action for action in row.dispositions)
+
+
 def test_the_first_and_last_rows_dispose_of_nothing():
     assert DECISION_TABLE[0].dispositions == ()
     assert DECISION_TABLE[-1].dispositions == ()
@@ -964,7 +1097,7 @@ def test_each_row_renders_its_question_and_examples_on_its_own_line(row):
     line = _table_lines()[row.order + 2]
 
     assert row.question in line
-    assert all(example in line for example in row.example_ids)
+    assert all(example in line for example in row.report_examples)
 
 
 def test_the_rules_render_is_one_subsection_of_a_stage2_region():
@@ -982,11 +1115,17 @@ def test_the_rules_name_the_read_tool_the_skill_and_every_caller_action():
     assert all(f'`{action.value}`' in rules for action in CALLER_ACTIONS)
 
 
-def test_the_rules_name_each_action_s_fields_from_its_schema():
-    rules = render_cancel_children_rules()
-
-    assert '`onto`' in rules
-    assert '`into`' in rules
+@pytest.mark.parametrize(
+    'action_with_fields',
+    [
+        pytest.param('- `keep` (`reason`?): ', id='keep'),
+        pytest.param('- `repoint` (`onto`, `reason`?): ', id='repoint'),
+        pytest.param('- `fold` (`into`, `reason`?): ', id='fold'),
+        pytest.param('- `moot` (`reason`?): ', id='moot'),
+    ],
+)
+def test_the_rules_list_each_action_with_the_fields_its_schema_declares(action_with_fields):
+    assert action_with_fields in render_cancel_children_rules()
 
 
 def test_the_rules_embed_the_table_render_verbatim():
