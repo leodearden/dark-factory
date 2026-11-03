@@ -80,6 +80,7 @@ __all__ = [
     'render_cancel_children_rules',
     'render_decision_table_markdown',
     'rows_to_json',
+    'sibling_lookup_values',
     'stamp_entry',
     'with_entry',
 ]
@@ -236,6 +237,13 @@ QualifiedTaskRefText = Annotated[str, StringConstraints(pattern=f'^{_QUALIFIED_T
 def qualified_task_ref(project_id: str, task_id: int) -> str:
     """The one spelling of a task named across projects: `<project_id>:<id>`."""
     return f'{project_id}:{task_id}'
+
+
+def sibling_lookup_values(parent_id: str) -> tuple[str | int, ...]:
+    """Every stored form of a task id, because the metadata lookup is type-strict."""
+    if parent_id.isdecimal():
+        return (parent_id, int(parent_id))
+    return (parent_id,)
 
 
 @dataclass(frozen=True)
