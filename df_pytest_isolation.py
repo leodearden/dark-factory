@@ -2354,26 +2354,37 @@ def arm_usage_gate_sweep_confinement(config: pytest.Config, usage_gate_module: M
     Registers :func:`usage_gate_sweep_root`, :func:`real_probe_dir_sweep` and an
     autouse fixture applying :func:`confine_usage_gate_sweep` to
     *usage_gate_module*. Idempotent, because a session that collects several
-    test roots runs each root's ``pytest_configure``: the first arm wins, and
-    every caller passes the same ``shared.usage_gate`` module object.
+    test roots runs each root's ``pytest_configure``. Only the first arm's
+    module is patched, so a re-arm with a different module object is refused
+    with ``pytest.UsageError`` rather than leaving that module's gates unconfined.
     """
-    if config.pluginmanager.has_plugin(_USAGE_GATE_SWEEP_PLUGIN):
+    armed = config.pluginmanager.get_plugin(_USAGE_GATE_SWEEP_PLUGIN)
+    if armed is not None:
+        if armed.usage_gate_module is not usage_gate_module:
+            raise pytest.UsageError(
+                f'the UsageGate probe-dir sweep confinement already patches '
+                f'{armed.usage_gate_module!r}, so it cannot also confine '
+                f'{usage_gate_module!r}; every test root must arm it with the '
+                f'one shared.usage_gate module object this session imports'
+            )
         return
 
     @pytest.fixture(autouse=True)
     def confine(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
         confine_usage_gate_sweep(request, monkeypatch, usage_gate_module)
 
-    # `confine` must not share its attribute's name: a name assigned in a class
-    # body is looked up in the class dict and globals, never the enclosing
-    # function, so `x = x` would raise NameError for a local `x`.
-    class _UsageGateSweepConfinementPlugin:
-        _df_usage_gate_sweep_parent = _df_usage_gate_sweep_parent
-        usage_gate_sweep_root = usage_gate_sweep_root
-        real_probe_dir_sweep = real_probe_dir_sweep
-        _df_confine_usage_gate_sweep = confine
-
-    config.pluginmanager.register(_UsageGateSweepConfinementPlugin, _USAGE_GATE_SWEEP_PLUGIN)
+    plugin = type(
+        '_UsageGateSweepConfinementPlugin',
+        (),
+        {
+            'usage_gate_module': usage_gate_module,
+            '_df_usage_gate_sweep_parent': _df_usage_gate_sweep_parent,
+            'usage_gate_sweep_root': usage_gate_sweep_root,
+            'real_probe_dir_sweep': real_probe_dir_sweep,
+            '_df_confine_usage_gate_sweep': confine,
+        },
+    )
+    config.pluginmanager.register(plugin, _USAGE_GATE_SWEEP_PLUGIN)
 
 
 # ---------------------------------------------------------------------------
