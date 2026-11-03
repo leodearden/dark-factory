@@ -12,7 +12,7 @@ import os
 import re
 import subprocess
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import pytest
@@ -29,6 +29,8 @@ BANNER = "You've hit your usage limit · resets 5am (Europe/London)"
 ENV_KEYS = ('CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN', 'SITTING_TEST_MARKER', 'SITTING_NIGHTLY_CONFINED')
 TIMEOUT_SECS = '3'
 """Outlasts the fake's interpreter start under ``-n auto`` load (0.5s did not, 2 runs in 10), far short of its sleep."""
+BUILDER_TEMP_FILE_FLAGS = ('--system-prompt-file', '--mcp-config')
+"""The argv flags whose values are the paths ``build_claude_argv`` returns as temp files."""
 
 APPLY_VERBS = (
     'mcp__escalation__resolve_issue',
@@ -200,8 +202,35 @@ def _flag_values(argv: list[str], flag: str) -> list[str]:
     return values[:next((i for i, value in enumerate(values) if value.startswith('--')), len(values))]
 
 
-def _sysprompt_path(call: dict) -> Path:
-    return Path(call['sysprompt_path'])
+@dataclass(frozen=True)
+class Spawn:
+    """A process the run started, as the parent saw it once ``Popen`` had started it."""
+
+    argv: tuple[str, ...]
+    present_once_started: frozenset[Path]
+    """The builder temp files that existed once the process had been started."""
+
+    def temp_files(self) -> tuple[Path, ...]:
+        """The path after each of ``BUILDER_TEMP_FILE_FLAGS``; a missing flag raises."""
+        return tuple(Path(self.argv[self.argv.index(flag) + 1]) for flag in BUILDER_TEMP_FILE_FLAGS)
+
+
+def _record_spawns(monkeypatch: pytest.MonkeyPatch) -> list[Spawn]:
+    """Record every process the run starts, from this side, before ``communicate`` starts its timeout clock.
+
+    Nothing here waits on the child, so the record holds however far the child got before a kill.
+    """
+    spawns: list[Spawn] = []
+
+    class RecordingPopen(subprocess.Popen):
+        def __init__(self, args, *rest, **kwargs):
+            super().__init__(args, *rest, **kwargs)
+            started = Spawn(tuple(args), frozenset())
+            spawns.append(replace(started, present_once_started=frozenset(
+                path for path in started.temp_files() if path.is_file())))
+
+    monkeypatch.setattr(subprocess, 'Popen', RecordingPopen)
+    return spawns
 
 
 def _strip_claude_from_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -323,24 +352,26 @@ def test_the_child_reads_no_settings_file_and_may_write_only_its_inbox(tmp_path)
 
 
 @pytest.mark.parametrize(
-    ('spec', 'extra'),
+    ('spec', 'extra', 'witness'),
     [
-        ({'exit_code': 0}, {}),
-        ({'exit_code': 3, 'stderr': 'boom'}, {}),
-        ({'stall': 30.0}, {'timeout_secs': float(TIMEOUT_SECS)}),
+        ({'exit_code': 0}, {}, 'nightly_prepare: done'),
+        ({'exit_code': 3, 'stderr': 'boom'}, {}, 'claude exited 3'),
+        ({'stall': 30.0}, {'timeout_secs': float(TIMEOUT_SECS)}, 'claude timed out'),
     ],
     ids=['success', 'failure', 'timeout'],
 )
-def test_builder_temp_files_are_unlinked_after_the_run(tmp_path, spec, extra):
+def test_builder_temp_files_are_unlinked_after_the_run(tmp_path, monkeypatch, capsys, spec, extra, witness):
+    spawns = _record_spawns(monkeypatch)
     fake = _fake_claude(tmp_path, **spec)
 
     _run(fake, **extra)
 
-    call = fake.only_call()
-    assert call['sysprompt'] is not None, 'the system prompt file must exist while the CLI runs'
-    assert call['mcp_config'] is not None, 'the MCP config file must exist while the CLI runs'
-    assert not _sysprompt_path(call).exists(), 'the builder temp file must be unlinked after the run'
-    assert not Path(call['mcp_config_path']).exists(), 'the MCP config temp file must be unlinked after the run'
+    assert len(spawns) == 1, f'expected exactly one spawn, got {[spawn.argv for spawn in spawns]}'
+    spawn = spawns[0]
+    assert spawn.present_once_started == frozenset(spawn.temp_files()), 'the builder temp files must exist while the CLI runs'
+    assert not any(path.exists() for path in spawn.temp_files()), 'the builder temp files must be unlinked after the run'
+    captured = capsys.readouterr()
+    assert witness in captured.out + captured.err, f'the run must take the path this case names: {witness!r}'
 
 
 # ---------------------------------------------------------------------------
@@ -661,22 +692,14 @@ def test_no_store_is_written_and_only_the_fake_is_spawned(tmp_path, monkeypatch)
     (queue / 'esc-9-1.json').write_text(json.dumps({'id': 'esc-9-1', 'status': 'pending', 'level': 2}))
     (decisions / 'dec-1.json').write_text(json.dumps({'decision_id': 'dec-1', 'state': 'open'}))
     before = _snapshot(queue, decisions)
-    spawned: list[list[str]] = []
-    real_popen = subprocess.Popen
-
-    class RecordingPopen(real_popen):  # type: ignore[misc, valid-type]
-        def __init__(self, args, *rest, **kwargs):
-            spawned.append(list(args))
-            super().__init__(args, *rest, **kwargs)
-
-    monkeypatch.setattr(subprocess, 'Popen', RecordingPopen)
+    spawns = _record_spawns(monkeypatch)
     fake = _fake_claude(tmp_path)
 
     assert _run(fake) == mod.EXIT_OK
 
     assert _snapshot(queue, decisions) == before
     assert not list(queue.parent.rglob('*.lock')) and not list(decisions.rglob('*.lock'))
-    assert [argv[0] for argv in spawned] == [str(fake.bin)]
+    assert [spawn.argv[0] for spawn in spawns] == [str(fake.bin)]
 
 
 # ---------------------------------------------------------------------------
