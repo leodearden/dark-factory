@@ -12,6 +12,7 @@ from unittest.mock import DEFAULT, AsyncMock, MagicMock, patch
 import httpx
 import pytest
 import pytest_asyncio
+from _fm_helpers import LoopFreedomProbe
 from _qdrant_responses import missing_collection_404
 from qdrant_client.http.exceptions import UnexpectedResponse
 from reconciliation.harness_fixtures import (
@@ -17229,36 +17230,30 @@ class TestIntegrityGateIsAsyncAndNonBlocking:
     async def test_gate_does_not_block_the_event_loop(
         self, journal, event_buffer, mock_memory_service, tmp_path, monkeypatch, caplog,
     ):
-        """A slow detector must not stall the loop the remediation pass runs on.
+        """A suspended detector must not stall the loop the remediation pass runs on.
 
-        The fake awaits a real 200 ms sleep; a ticker coroutine advancing every
-        10 ms must keep advancing across it. A blocking implementation pins the
-        ticker at ~0.
+        While the gate is suspended inside the detector, a marker queued on the
+        test loop must run: the fake suspends on
+        fused-memory/tests/_fm_helpers.py::LoopFreedomProbe, and a gate that
+        resumed the detector itself instead of awaiting it reads False. This
+        loop-turn oracle replaces a wall-clock tick floor that reds under
+        GIL/host contention (task 5920 introduced the probe; task 5925 for this
+        site).
         """
-        ticks = 0
-
-        async def _ticker():
-            nonlocal ticks
-            while True:
-                await asyncio.sleep(0.01)
-                ticks += 1
+        probe = LoopFreedomProbe()
 
         async def _fake_is_live(_tid, _pr, **kw):
-            await asyncio.sleep(0.2)
+            await probe.suspend()
             return True
 
-        ticker = asyncio.create_task(_ticker())
-        try:
-            await self._run_gate(
-                journal=journal, event_buffer=event_buffer,
-                mock_memory_service=mock_memory_service, tmp_path=tmp_path,
-                monkeypatch=monkeypatch, caplog=caplog,
-                cited_task=self._cited_task(), fake_is_live=_fake_is_live,
-            )
-        finally:
-            ticker.cancel()
+        await self._run_gate(
+            journal=journal, event_buffer=event_buffer,
+            mock_memory_service=mock_memory_service, tmp_path=tmp_path,
+            monkeypatch=monkeypatch, caplog=caplog,
+            cited_task=self._cited_task(), fake_is_live=_fake_is_live,
+        )
 
-        assert ticks >= 5
+        probe.assert_loop_stayed_free()
 
     @pytest.mark.asyncio
     async def test_gate_hoists_the_worktree_index_across_the_cited_task_fan_out(
@@ -18586,7 +18581,7 @@ class TestHarnessCheckGraphitiQueueHealth:
 def _index_records_for(specs):
     """Invert an IndexSpec set into GraphitiBackend.list_indices()-shaped records.
 
-    Reuses ``test_ensure_indices._rows_for`` (the single row inverter) and then
+    Reuses ``_falkor_index_doubles.py::rows_for`` (the single row inverter) and then
     applies the SAME by-name column projection ``list_indices`` itself performs,
     so the fixture cannot drift from the shape the real method returns: rows are
     what ``CALL db.indexes()`` yields, records are what ``list_indices`` returns
@@ -18596,8 +18591,7 @@ def _index_records_for(specs):
     so a graphiti upgrade that changes the index set cannot make these tests pass
     against a stale expectation.
     """
-    from test_ensure_indices import _rows_for
-    from test_falkor_indices import LIVE_HEADER
+    from _falkor_index_doubles import LIVE_HEADER, rows_for
 
     from fused_memory.backends.falkor_indices import resolve_header_positions
 
@@ -18611,7 +18605,7 @@ def _index_records_for(specs):
         },
     )
     return [
-        {key: row[idx] for key, idx in positions.items()} for row in _rows_for(specs)
+        {key: row[idx] for key, idx in positions.items()} for row in rows_for(specs)
     ]
 
 

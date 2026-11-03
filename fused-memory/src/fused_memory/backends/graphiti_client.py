@@ -19,6 +19,7 @@ from typing import Any, TypedDict, TypeVar, cast
 from urllib.parse import urlparse
 
 from graphiti_core import Graphiti
+from graphiti_core.cross_encoder.client import CrossEncoderClient
 from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
 from graphiti_core.driver.driver import GraphDriver
 from graphiti_core.driver.falkordb_driver import FalkorDriver
@@ -36,6 +37,7 @@ from graphiti_core.nodes import EpisodeType, EpisodicNode
 from fused_memory.backends.exact_episode_window import ExactEpisodeWindowGraphiti
 from fused_memory.backends.falkor_edge_search import FalkorEdgeSearch
 from fused_memory.backends.falkor_fulltext import build_query
+from fused_memory.backends.falkor_graph_operations import FalkorGraphOperations
 from fused_memory.backends.falkor_indices import (
     IndexCatalogUnsettledError,
     IndexHeaderShapeError,
@@ -49,6 +51,11 @@ from fused_memory.backends.falkor_indices import (
     unsettled_index_statuses,
     vector_drop_statement,
     vector_index_properties,
+)
+from fused_memory.backends.falkor_server_settings import (
+    FalkorServerSettings,
+    read_falkor_server_settings,
+    warn_on_shortfalls,
 )
 from fused_memory.backends.falkor_string_bounds import exact_string_upper_bound
 from fused_memory.backends.llm_clients import (
@@ -569,9 +576,10 @@ _RESULTSET_SIZE = 10000
 """FalkorDB's server-wide result-set ceiling: every query returns at most this
 many rows, silently truncated — no error, no marker.
 
-This is an ASSUMPTION about server configuration, not a fact this repo
-controls: nothing here sets ``RESULTSET_SIZE``, and a grep finds no override
-anywhere.  Measured 2026-08-17 against localhost:6379::
+This is an ASSUMPTION about server configuration, not a fact this module
+controls: fused-memory/docker/docker-compose.yml pins ``RESULTSET_SIZE`` in
+FALKORDB_ARGS (task 6848), but a server started any other way may differ.
+Measured 2026-08-17 against localhost:6379::
 
     GRAPH.CONFIG GET RESULTSET_SIZE  ->  10000
 
@@ -1349,9 +1357,15 @@ class _MultiTenantFalkorDriver(FalkorDriver):
     Cypher FalkorDB can plan over the provisioned indices; see
     :mod:`fused_memory.backends.falkor_edge_search`.  It is a class attribute, so
     every ``clone()`` carries it on both the read and the write path.
+
+    ``graph_operations_interface`` is set (task 7714) so graphiti's edge
+    get-by-uuid(s) runs Cypher FalkorDB can plan; see
+    :mod:`fused_memory.backends.falkor_graph_operations`.  It is a class
+    attribute, so every ``clone()`` carries it.
     """
 
     search_interface = FalkorEdgeSearch()
+    graph_operations_interface = FalkorGraphOperations()
 
     async def build_indices_and_constraints(self, delete_existing=False):
         pass
@@ -1591,6 +1605,43 @@ class GraphitiBackend:
         self._cross_encoder = None
         self._group_clients: dict[str, Graphiti] = {}
 
+    @classmethod
+    def with_driver(
+        cls,
+        config: FusedMemoryConfig,
+        driver: FalkorDriver,
+        *,
+        registered_graph_ids: Iterable[str],
+        llm_client: LLMClient | None = None,
+        embedder: EmbedderClient | None = None,
+        cross_encoder: CrossEncoderClient | None = None,
+    ) -> 'GraphitiBackend':
+        """A backend over *driver* and the given sub-clients, wired without ``initialize()``.
+
+        No provisioning sweep, identity scan or server-settings read runs, and no
+        base ``client`` is built: methods that need one raise until it is assigned.
+        The registry is required because the derived one names real project graphs.
+        The backend takes ownership: ``close()`` releases the driver and sub-clients.
+        """
+        backend = cls(config, registered_graph_ids=registered_graph_ids)
+        backend._attach(
+            driver, llm_client=llm_client, embedder=embedder, cross_encoder=cross_encoder,
+        )
+        return backend
+
+    def _attach(
+        self,
+        driver: FalkorDriver,
+        *,
+        llm_client: LLMClient | None,
+        embedder: EmbedderClient | None,
+        cross_encoder: CrossEncoderClient | None,
+    ) -> None:
+        self._driver = driver
+        self._llm_client = llm_client
+        self._embedder = embedder
+        self._cross_encoder = cross_encoder
+
     @property
     def registered_graph_ids(self) -> frozenset[str]:
         """The graphs this backend provisions — PRD D5, docs/prds/falkordb-index-provisioning.md."""
@@ -1642,9 +1693,9 @@ class GraphitiBackend:
         graphiti.py:889-890) — since that condition is never true for a
         per-group client, the shared-driver mutation race that misroutes
         concurrent cross-group writes is structurally unreachable here.
-        The llm_client/embedder/cross_encoder sub-clients are shared (hoisted
-        in ``initialize()``) across every per-group client and the base
-        ``self.client``.
+        The llm_client/embedder/cross_encoder sub-clients are shared (attached
+        by ``initialize()`` or ``with_driver()``) across every per-group client
+        and the base ``self.client``.
 
         ``_group_clients`` is unbounded and never evicted, mirroring
         ``_cloned_drivers``/``_identity_locks`` above — safe because
@@ -1742,6 +1793,14 @@ class GraphitiBackend:
         """Return the FalkorDB client from the underlying driver."""
         driver = self._require_driver()
         return cast(Any, driver).client
+
+    async def read_server_settings(self) -> FalkorServerSettings:
+        """Read the live TIMEOUT and appendonly settings; read-only, and a failed read is reported, not raised."""
+        client = getattr(self._driver, 'client', None)
+        return await read_falkor_server_settings(
+            client,
+            expected_graph_timeout_ms=self.config.graphiti.falkordb.expected_graph_timeout_ms,
+        )
 
     async def _ensure_indices(self, group_id: str) -> None:
         """Provision *group_id*'s indices if it is registered and not yet cached.
@@ -1861,14 +1920,11 @@ class GraphitiBackend:
         host = parsed.hostname or 'localhost'
         port = parsed.port or 6379
 
-        self._driver = _MultiTenantFalkorDriver(
+        driver = _MultiTenantFalkorDriver(
             host=host,
             port=port,
             password=falkor_cfg.password,
         )
-
-        self._llm_client = llm_client
-        self._embedder = embedder_client
 
         # --- Cross-encoder (reranker) ---
         # Shared across the base client and every per-group client (see
@@ -1895,15 +1951,20 @@ class GraphitiBackend:
                 api_key=reranker_provider.api_key,
                 base_url=reranker_provider.api_url,
             )
-        self._cross_encoder = OpenAIRerankerClient(config=reranker_config)
+        cross_encoder = OpenAIRerankerClient(config=reranker_config)
 
+        self._attach(
+            driver, llm_client=llm_client, embedder=embedder_client, cross_encoder=cross_encoder,
+        )
         self.client = Graphiti(
-            graph_driver=self._driver,
-            llm_client=self._llm_client,
-            embedder=self._embedder,
-            cross_encoder=self._cross_encoder,
+            graph_driver=driver,
+            llm_client=llm_client,
+            embedder=embedder_client,
+            cross_encoder=cross_encoder,
             max_coroutines=cfg.queue.graphiti_max_coroutines,
         )
+
+        warn_on_shortfalls(await self.read_server_settings())
 
         # Provision the registered project graphs that already exist (PRD D6).
         if not skip_maintenance:
@@ -2250,27 +2311,28 @@ class GraphitiBackend:
         invalid_at: datetime | None = None,
         clear_invalid_at: bool = False,
     ) -> dict[str, Any]:
-        """Update an existing edge's fact text and/or invalidate it.
+        """Update an existing edge's fact text and/or its ``invalid_at``.
 
         At least one of ``fact``, ``invalid_at``, or ``clear_invalid_at`` must
-        be provided. When ``fact`` is set, the edge's fact text is replaced and
-        its embedding is regenerated. When ``invalid_at`` is set, the edge is
-        marked superseded as of that timestamp (no re-embedding needed). Both
-        may be combined.
+        be provided; each dimension has its own write:
 
-        When ``clear_invalid_at=True``, the edge's ``invalid_at`` field is
-        reset to ``None``, restoring it to an active (non-superseded) state.
-        This takes precedence over ``invalid_at`` if both are supplied.
-        Compatible with ``fact`` (update text and un-supersede in one call).
-        Because graphiti's FalkorDB map-based ``edge.save()`` (``MERGE ... SET
-        e = $edge_data``) does not reliably clear a null-valued property, the
-        clear is force-persisted by an explicit direct-Cypher
-        ``SET e.invalid_at = NULL`` write, issued after ``edge.save()`` and
-        before the endpoint summary refresh below (so the restored edge is
-        counted valid by that refresh's ``WHERE e.invalid_at IS NULL`` filter).
+        - ``fact`` replaces the fact text through graphiti's full-map
+          ``edge.save`` with a regenerated embedding.
+        - ``invalid_at`` / ``clear_invalid_at`` is one targeted
+          ``SET e.invalid_at`` write that touches no other property;
+          ``clear_invalid_at`` wins when both are given.
 
-        After saving, both source and target entity node summaries are rebuilt
-        from their current valid edges so they stay consistent.
+        A call carrying both ``fact`` and an invalidity change is two
+        independent writes, not one transaction: if the invalidity write
+        fails, the new fact is already stored.
+
+        graphiti's ``get_by_uuid`` projection omits ``fact_embedding``, so a
+        full-map save without a regenerated embedding would write
+        ``vecf32(null)``.  ``tests/test_graphiti_update_edge.py`` pins this.
+
+        Both writes land before the endpoint summaries are rebuilt, so a
+        restored edge is counted by the refresh's ``WHERE e.invalid_at IS NULL``
+        filter.
         """
         if fact is None and invalid_at is None and not clear_invalid_at:
             raise ValueError('update_edge requires fact, invalid_at, or clear_invalid_at to be set')
@@ -2278,25 +2340,11 @@ class GraphitiBackend:
         edge = await EntityEdge.get_by_uuid(driver, edge_uuid)
         if fact is not None:
             edge.fact = fact
-            embedder = self._require_client().embedder
-            await edge.generate_embedding(embedder)
-        if invalid_at is not None:
-            edge.invalid_at = invalid_at
-        if clear_invalid_at:
-            edge.invalid_at = None
-        await self._timed_write(edge.save(driver), 'update_edge.save')
-
-        if clear_invalid_at:
-            # edge.save()'s map-based SET does not reliably clear a
-            # null-valued property on FalkorDB — force it deterministically.
-            graph = self._graph_for(group_id)
-            await self._timed_write(
-                graph.query(
-                    'MATCH ()-[e:RELATES_TO {uuid: $uuid}]->() '
-                    'SET e.invalid_at = NULL',
-                    {'uuid': edge_uuid},
-                ),
-                'update_edge.clear_invalid_at',
+            await edge.generate_embedding(self._require_client().embedder)
+            await self._timed_write(edge.save(driver), 'update_edge.save')
+        if clear_invalid_at or invalid_at is not None:
+            await self._write_edge_invalid_at(
+                edge_uuid, None if clear_invalid_at else invalid_at, group_id=group_id,
             )
 
         # Deterministically refresh both endpoint entity summaries so they
@@ -2317,6 +2365,21 @@ class GraphitiBackend:
             'fact': edge.fact,
             'refreshed_nodes': refreshed,
         }
+
+    async def _write_edge_invalid_at(
+        self, edge_uuid: str, invalid_at: datetime | None, *, group_id: str,
+    ) -> None:
+        """Set one RELATES_TO edge's ``invalid_at``, or remove it for ``None``; nothing else changes."""
+        await self._timed_write(
+            self._graph_for(group_id).query(
+                'MATCH ()-[e:RELATES_TO {uuid: $uuid}]->() SET e.invalid_at = $invalid_at',
+                {
+                    'uuid': edge_uuid,
+                    'invalid_at': None if invalid_at is None else invalid_at.isoformat(),
+                },
+            ),
+            'update_edge.invalid_at',
+        )
 
     @_canonicalize_group_args
     async def reassign_edge(

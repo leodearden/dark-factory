@@ -1,8 +1,7 @@
-"""Tests for the read router heuristics."""
-
-from unittest.mock import AsyncMock, MagicMock
+"""Tests for ReadRouter: heuristic routing and LLM routing over an injected client."""
 
 import pytest
+from _sdk_client_stubs import completion_client
 
 from fused_memory.models.enums import QueryType, SourceStore
 from fused_memory.routing.router import ReadRouter
@@ -80,24 +79,19 @@ class TestRouteAsync:
         assert result.query_type == QueryType.broad
 
 
-class TestLLMRouting:
-    """Test _llm_route with a mocked OpenAI client."""
+@pytest.fixture
+def llm_config(mock_config):
+    mock_config.routing.use_heuristics = False
+    mock_config.routing.llm_fallback = True
+    return mock_config
 
-    def _make_mock_client(self, content: str) -> MagicMock:
-        """Return a mock AsyncOpenAI client that yields *content* as LLM output."""
-        mock_msg = MagicMock()
-        mock_msg.content = content
-        mock_choice = MagicMock()
-        mock_choice.message = mock_msg
-        mock_response = MagicMock()
-        mock_response.choices = [mock_choice]
-        mock_client = MagicMock()
-        mock_client.chat.completions.create = AsyncMock(return_value=mock_response)
-        return mock_client
+
+class TestLLMRouting:
+    """route() with heuristics off, over an injected OpenAI client."""
 
     @pytest.mark.asyncio
-    async def test_nested_braces_in_reasoning_parsed(self, router):
-        """_llm_route correctly parses JSON whose value contains nested braces."""
+    async def test_nested_braces_in_reasoning_parsed(self, llm_config):
+        """route() correctly parses JSON whose value contains nested braces."""
         # The broken regex r'\{[^}]+\}' fails here — stops at first '}' inside
         # the nested {entity lookup} value, producing invalid JSON for json.loads.
         llm_output = (
@@ -106,17 +100,17 @@ class TestLLMRouting:
             '"primary_store": "graphiti", '
             '"reasoning": "matches {entity lookup} pattern"}'
         )
-        router._openai_client = self._make_mock_client(llm_output)
+        router = ReadRouter(llm_config, openai_client=completion_client(llm_output))
 
-        result = await router._llm_route('What is the billing service?')
+        result = await router.route('What is the billing service?')
 
         assert result.query_type == QueryType.entity_lookup
         assert result.primary_store == SourceStore.graphiti
         assert SourceStore.graphiti in result.stores
 
     @pytest.mark.asyncio
-    async def test_markdown_fence_response_parsed(self, router):
-        """_llm_route correctly parses JSON wrapped in ```json...``` code fences."""
+    async def test_markdown_fence_response_parsed(self, llm_config):
+        """route() correctly parses JSON wrapped in ```json...``` code fences."""
         llm_output = (
             '```json\n'
             '{"query_type": "procedural", '
@@ -125,18 +119,20 @@ class TestLLMRouting:
             '"reasoning": "how-to query → {procedural store}"}\n'
             '```'
         )
-        router._openai_client = self._make_mock_client(llm_output)
+        router = ReadRouter(llm_config, openai_client=completion_client(llm_output))
 
-        result = await router._llm_route('How do I deploy to production?')
+        result = await router.route('How do I deploy to production?')
 
         assert result.query_type == QueryType.procedural
         assert result.primary_store == SourceStore.mem0
 
     @pytest.mark.asyncio
-    async def test_no_json_falls_back_to_broad(self, router):
-        """_llm_route returns the broad default when the LLM returns no JSON."""
-        router._openai_client = self._make_mock_client('Sorry, I cannot classify this.')
+    async def test_no_json_falls_back_to_broad(self, llm_config):
+        """route() returns the broad default when the LLM returns no JSON."""
+        client = completion_client('Sorry, I cannot classify this.')
+        router = ReadRouter(llm_config, openai_client=client)
 
-        result = await router._llm_route('some query')
+        result = await router.route('some query')
 
+        client.chat.completions.create.assert_awaited_once()
         assert result.query_type == QueryType.broad

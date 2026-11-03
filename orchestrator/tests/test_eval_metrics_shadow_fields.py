@@ -72,3 +72,23 @@ def test_legacy_metrics_without_the_keys_rescore_unchanged() -> None:
     legacy = EvalMetrics(**_known_fields(_LEGACY_METRICS))
     assert legacy.shadow_cell_id is None
     assert legacy.reference_kind is None
+
+
+def test_from_dict_ignores_keys_the_dataclass_does_not_declare() -> None:
+    read = EvalMetrics.from_dict({'tests_pass': True, 'legacy_sonnet_review_blocking_issues': 3})
+    assert read == EvalMetrics(tests_pass=True)
+
+
+def test_from_dict_reads_a_persisted_reference_kind_as_the_enum() -> None:
+    assert EvalMetrics.from_dict({'reference_kind': 'landed'}).reference_kind is ReferenceKind.LANDED
+
+
+def test_from_dict_round_trips_to_dict() -> None:
+    metrics = EvalMetrics(
+        tests_pass=True,
+        review_blocking_issues=2,
+        terminal_kind='planned',
+        shadow_cell_id='c1',
+        reference_kind=ReferenceKind.LANDED,
+    )
+    assert EvalMetrics.from_dict(metrics.to_dict()) == metrics

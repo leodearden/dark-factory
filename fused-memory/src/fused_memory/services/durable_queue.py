@@ -13,8 +13,9 @@ import logging
 import random
 import re
 import time
-from collections.abc import Callable, Coroutine, Iterable, Mapping
+from collections.abc import Callable, Coroutine, Iterable, Iterator, Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -308,6 +309,8 @@ class DurableWriteQueue:
         self._group_events: dict[str, asyncio.Event] = {}
         self._group_locks: dict[str, asyncio.Lock] = {}
         self._worker_tasks: dict[str, list[asyncio.Task]] = {}
+        # item id -> (group_id, instant the item was handed to execute_write)
+        self._executing_started_at: dict[int, tuple[str, datetime]] = {}
         self._closed = False
 
     # -- lifecycle ------------------------------------------------------------
@@ -524,10 +527,11 @@ class DurableWriteQueue:
                 # skipped.
                 payload = item.parsed_payload()
                 write_op_id = payload.get('_write_op_id')
-                result = await asyncio.wait_for(
-                    self._execute_write(item.operation, payload),
-                    timeout=self._write_timeout_seconds,
-                )
+                with self._executing(item):
+                    result = await asyncio.wait_for(
+                        self._execute_write(item.operation, payload),
+                        timeout=self._write_timeout_seconds,
+                    )
                 # The backend write LANDED. Anything that fails below is a
                 # post-execute failure, which is a materially different fact
                 # for anyone deciding whether a dead item is safe to replay.
@@ -559,6 +563,30 @@ class DurableWriteQueue:
                 await self._notify_dead_letter(
                     item, write_op_id, error, post_execute=executed
                 )
+
+    @contextlib.contextmanager
+    def _executing(self, item: QueueItem) -> Iterator[None]:
+        self._executing_started_at[item.id] = (item.group_id, datetime.now(UTC))
+        try:
+            yield
+        finally:
+            self._executing_started_at.pop(item.id, None)
+
+    def earliest_executing_start(self, group_id: str) -> datetime | None:
+        """When the earliest backend write still executing for *group_id* was
+        handed to execute_write, or None when none is executing.
+
+        Process-local by design: after a restart ``_recover_in_flight`` sends
+        every interrupted row back to pending, so it re-executes from scratch.
+        Why the reconciliation episode cursor needs this:
+        ``fused_memory/reconciliation/episode_window.py``.
+        """
+        starts = [
+            started_at
+            for item_group, started_at in self._executing_started_at.values()
+            if item_group == group_id
+        ]
+        return min(starts, default=None)
 
     async def _notify_terminal(
         self,

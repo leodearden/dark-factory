@@ -34,11 +34,14 @@ from typing import Any
 
 import pytest
 from _fm_helpers import falkor_skipif, load_script_module
+from redis.exceptions import ConnectionError as RedisConnectionError
 from shared.testing_streams import (
     StdoutWithAFailingFlush,
     StdoutWithAFailingWrite,
     closed_pipe_stdout,
 )
+
+from fused_memory.backends.falkor_read_only import ReadOnlyGraphProxy, open_graph
 
 SCRIPT_PATH = (
     Path(__file__).parent.parent / 'scripts' / 'local_memory_models_eval' / 'build_corpus.py'
@@ -800,17 +803,18 @@ class _UnreachableDouble(_FalkorDouble):
         raise self.exc
 
 
-def _redis_connection_error(message: str) -> BaseException:
-    """The exception a down FalkorDB actually surfaces, imported at call time.
+class _GuardFiringDouble(_FalkorDouble):
+    """A handle whose read drifts onto the writable ``query``, resolved through the real shared guard.
 
-    Local rather than a top-level import so this module keeps build_corpus.py's
-    own property — importing it drags in no client — and so collection never
-    depends on what is only a transitive dependency
-    (graphiti-core[falkordb] -> falkordb -> redis).
+    The builder's read resolves only ``ro_query``, which the guard forwards, so
+    the guard cannot fire on it today; this double stands in for a read path
+    that regressed. Subclasses ``_FalkorDouble`` so every write-path tripwire
+    stays armed.
     """
-    from redis.exceptions import ConnectionError as RedisConnectionError  # noqa: PLC0415
 
-    return RedisConnectionError(message)
+    async def ro_query(self, cypher, *args, **kwargs):
+        self.ro_queries.append(cypher)
+        return await ReadOnlyGraphProxy(self).query(cypher, *args, **kwargs)
 
 
 def _row(uuid: str, month: str = '2026-05', kind: str = 'temporal_facts') -> list[object]:
@@ -936,17 +940,19 @@ class TestReaderIsReadOnly:
             asyncio.run(double.execute_command('GRAPH.QUERY', 'g', 'CREATE (n:Junk)'))
         assert double.violations == ['execute_command:GRAPH.QUERY']
 
-    def test_reader_rejects_a_non_ro_command_client_side(self):
+    def test_a_guard_refusal_on_the_read_path_is_a_corpus_build_error(self):
         """A client-side guard on top of the server-side one.
 
-        GRAPH.RO_QUERY is refused server-side, but the guard makes the
-        violation a typed CorpusBuildError at the seam rather than a redis
-        error surfacing from three layers down.
+        A write is refused server-side anyway, but should the shared guard ever
+        fire on the builder's read, the refusal reaches the caller as a typed
+        CorpusBuildError rather than a redis error surfacing from three layers
+        down, and the writable primitive is never called.
         """
+        double = _GuardFiringDouble([_row('u1')])
         with pytest.raises(_mod.CorpusBuildError) as exc:
-            _mod.EpisodeReader.assert_read_only_command('GRAPH.QUERY')
+            _fetch(double)
         assert 'GRAPH.RO_QUERY' in str(exc.value)
-        _mod.EpisodeReader.assert_read_only_command('GRAPH.RO_QUERY')
+        assert double.violations == []
 
 
 class TestNoGraphitiDriverIsConstructed:
@@ -2575,13 +2581,11 @@ class TestAnUnreachableStoreIsATypedErrorNotATraceback:
         FalkorDB case escape as a traceback. Pinned as a premise so the reason
         for the second exception type cannot be lost to a later tidy-up.
         """
-        from redis.exceptions import ConnectionError as RedisConnectionError  # noqa: PLC0415
-
         assert not issubclass(RedisConnectionError, OSError)
 
     @pytest.mark.parametrize(
         'make_exc',
-        [_redis_connection_error, OSError],
+        [RedisConnectionError, OSError],
         ids=['redis-connection-error', 'oserror'],
     )
     def test_an_unreachable_store_exits_run_failed_under_verify(
@@ -2600,7 +2604,7 @@ class TestAnUnreachableStoreIsATypedErrorNotATraceback:
 
     @pytest.mark.parametrize(
         'make_exc',
-        [_redis_connection_error, OSError],
+        [RedisConnectionError, OSError],
         ids=['redis-connection-error', 'oserror'],
     )
     def test_an_unreachable_store_exits_run_failed_under_build(
@@ -2635,7 +2639,7 @@ class TestAnUnreachableStoreIsATypedErrorNotATraceback:
             's',
             '--out',
             str(out),
-            double=_UnreachableDouble(_redis_connection_error('falkordb is down')),
+            double=_UnreachableDouble(RedisConnectionError('falkordb is down')),
         )
         err = capsys.readouterr().err
         assert err.startswith('error: ')
@@ -2667,6 +2671,19 @@ class TestAnUnreachableStoreIsATypedErrorNotATraceback:
     def test_the_run_failed_code_is_still_disjoint_from_every_verdict(self):
         """CONTROL, re-asserted at the CLI layer: no new status may claim 1."""
         assert _mod.EXIT_RUN_FAILED not in set(_mod.EXIT_CODES.values())
+
+
+class TestARefusedCommandIsATypedErrorNotATraceback:
+    def test_the_guard_firing_exits_run_failed_with_an_error_line(self, monkeypatch, capsys):
+        capsys.readouterr()
+        code, _ = _run_cli(
+            monkeypatch, '--n', '20', '--seed', 's', '--dry-run', double=_GuardFiringDouble()
+        )
+        assert code == _mod.EXIT_RUN_FAILED
+        err = capsys.readouterr().err
+        assert err.startswith('error: ')
+        assert 'GRAPH.RO_QUERY' in err
+        assert 'Traceback' not in err
 
 
 class TestAWriteFailureIsNotBlamedOnTheStore:
@@ -2766,7 +2783,7 @@ class TestAWriteFailureIsNotBlamedOnTheStore:
             's',
             '--out',
             str(out),
-            double=_UnreachableDouble(_redis_connection_error('falkordb is down')),
+            double=_UnreachableDouble(RedisConnectionError('falkordb is down')),
         )
         err = capsys.readouterr().err
         assert code == _mod.EXIT_RUN_FAILED
@@ -3560,14 +3577,14 @@ def test_live_dark_factory_population_smoke(monkeypatch):
     recorders: list[_RecordingLiveGraph] = []
 
     async def _run() -> list:
-        reader = _mod.EpisodeReader(graph_name=_mod.DEFAULT_GRAPH)
-        # Resolve through the reader's OWN lazy client construction, so the
-        # host/port env wiring is exercised live rather than bypassed by an
-        # injected handle; then wrap it to record the command path.
-        live: Any = reader._resolve_graph()
+        # The probe reader resolves FALKOR_HOST/FALKOR_PORT, so the env wiring
+        # is exercised live; the handle it addresses is wrapped to record the
+        # command path.
+        probe = _mod.EpisodeReader(graph_name=_mod.DEFAULT_GRAPH)
+        live: Any = open_graph(probe.graph_name, host=probe.host, port=probe.port)
         recorder = _RecordingLiveGraph(live)
         recorders.append(recorder)
-        reader._graph = recorder
+        reader = _mod.EpisodeReader(graph=recorder, graph_name=probe.graph_name)
         try:
             return await reader.fetch_population()
         finally:

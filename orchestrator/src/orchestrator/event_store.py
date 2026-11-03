@@ -664,6 +664,13 @@ class EventType(StrEnum):
     # when the pin becomes blocked, then at most once per
     # pin_blocked_emit_interval_secs while it stays blocked.
     pin_blocked = 'pin_blocked'
+    # The starvation watchdog fired on a task (task 3821).  Producer, and the
+    # one statement of the payload: scheduler.py::Scheduler._deliver_starvation_finding,
+    # whose pin fields come from starvation_watchdog.py::PinOutcome.as_payload;
+    # predicate in starvation_watchdog.py::classify.  Emitted once per firing
+    # (deduped by the watchdog's escalated set, which survives restarts), and
+    # once more when a firing the auto-pin cap turned away gets a slot.
+    starvation_detected = 'starvation_detected'
     # Emitted once per acquire_next tick when the fused-memory task read
     # FAILED (distinct from a genuinely empty project) and the park-eviction
     # drain was therefore SKIPPED (fail-safe, survey finding C3).
@@ -753,6 +760,11 @@ class EventType(StrEnum):
     #   task's current text; the Lever-B skip is declined and the architect told.
     #   data: {drift, plan_text_fp, task_text_fp, plan_session_id}
     plan_text_drift = 'plan_text_drift'
+    # Task 4032 — a revalidated plan dropped a done step without a descope record or newly
+    #   shared a done commit, and one remedy architect pass did not fix it; the prior plan is
+    #   restored and the task takes the no-plan hold.
+    #   data: DoneStepIntegrityVerdict.to_dict()
+    done_step_integrity_refused = 'done_step_integrity_refused'
 
     # Config hot-reload (plans/config-hot-reload-prd.md, task beta) — emitted
     # by Harness.reload_config() on every call, success or failure. Data
@@ -1088,6 +1100,13 @@ class EventType(StrEnum):
     #   (INV-4). Age surfacing only; nothing times out. Payload:
     #   {waiter: {task_id, module, role, plan_id, wait_secs}, aged_count, alarm_secs}
     verify_admission_wait_aged = 'verify_admission_wait_aged'
+    # predicate_rearmed / predicate_recheck_stalled — from DeterministicRunner
+    #   when a declared predicate exits 75 ("not yet") and re-arms, or reaches
+    #   deterministic.predicate_recheck_stall_cap and files milestone_check_stalled
+    #   (plans/completion-driven-triggers-prd.md C1). Payload:
+    #   {rc, consecutive, stall_cap, recheck_secs, next_check_at, verdict}
+    predicate_rearmed = 'predicate_rearmed'
+    predicate_recheck_stalled = 'predicate_recheck_stalled'
 
     # Shadow eval (plans/live-shadow-eval-prd.md C2). task_id is the PRODUCTION
     # task the cell shadows; shadow_cell_skipped's data.reason is a

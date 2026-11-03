@@ -11,8 +11,6 @@ import pytest
 import yaml
 from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
 
-import dashboard.data.active_tasks as active_tasks
-import dashboard.data.task_snapshot as task_snapshot
 from dashboard.config import DashboardConfig
 from dashboard.data import escalation_corpus, redux_api
 from dashboard.data.active_tasks import (
@@ -22,6 +20,7 @@ from dashboard.data.active_tasks import (
 )
 from dashboard.data.datum import Datum, DatumState
 from dashboard.data.escalation_corpus import QueueKind, corpus_queues
+from dashboard.data.merge_queue import MergeAttempts
 from dashboard.data.root_invariants import RootInvariants, ScanStatus
 from dashboard.data.scheduler import collect_scheduler_state
 from dashboard.data.task_snapshot import (
@@ -31,17 +30,10 @@ from dashboard.data.task_snapshot import (
 )
 from dashboard.project_labels import ProjectLabels
 
+pytestmark = pytest.mark.usefixtures('fresh_task_snapshot_state')
+
 A_LABEL = 'a/proj'
 B_LABEL = 'b/proj'
-
-
-@pytest.fixture(autouse=True)
-def _fresh_collector_state():
-    active_tasks._reset_root_rotation()
-    task_snapshot._snapshot_cache_clear()
-    yield
-    active_tasks._reset_root_rotation()
-    task_snapshot._snapshot_cache_clear()
 
 
 @pytest.fixture
@@ -375,9 +367,11 @@ _TEAM_LABELS = ProjectLabels.of_roots([_TEAM_A, _TEAM_B])
 def _measured_merge_queue(depth: int) -> dict:
     """One project's merge-queue aggregate, with the fields the route always resolves."""
     return {
-        'depth_timeseries': {'labels': [0], 'values': [depth]},
-        'outcomes': {'labels': [], 'values': []},
-        'latency': {},
+        'depth_timeseries': Datum(
+            {'labels': [0], 'values': [depth], 'bucket_minutes': 15}, _NOW, DatumState.FRESH, None, 30,
+        ),
+        'attempts': Datum(MergeAttempts(), _NOW, DatumState.FRESH, None, 30),
+        'train_throughput': Datum({}, _NOW, DatumState.FRESH, None, 30),
         'recent': [],
         'active': [],
         'in_queue': Datum(0, _NOW, DatumState.FRESH, None, 30),
@@ -427,7 +421,7 @@ class TestReduxShapers:
         )['MERGE_QUEUE']
 
         assert {
-            label: (block['depth']['values'], block['halt']['halted'])
+            label: (block['depth']['value']['values'], block['halt']['halted'])
             for label, block in mq.items()
         } == {'team-a/app': ([3], True), 'team-b/app': ([5], False)}
 

@@ -553,14 +553,13 @@ JSON with `description`/`affected_ids`/`actionable`), and `dedupe_count`.
        # dead. This is a SUCCESS, not a failure: do NOT retry (a retry just
        # re-hits the same guard) and do NOT record a task id.
        resolve_issue(..., action='close_only', resolution="Ticket <res['reason']>")   # res["reason"] already reads "refused (no task created): ..."
-   elif res["status"] == "awaiting_curation":
-       # Parked for curation: no task_id yet, NOT a failure. Do NOT re-submit.
+   elif res["status"] in ("pending", "awaiting_curation"):  # open — resolve the SAME ticket again, never re-submit (_shared/ticket-failure-handling.md)
+       # No task_id yet, NOT a failure. Still open after the re-resolve:
        resolve_issue(..., action='resume', resolution="Queued for curation (ticket <sub['ticket']>)")
    elif res["status"] == "failed":
-       # Retryable (`server_restart`, `timeout`): apply
-       # _shared/ticket-failure-handling.md's retry policy (retry
-       # `resolve_ticket` first under `timeout`; re-submit the pair once
-       # under `server_restart`) within its 2-submit/2-resolve cap, then
+       # Retryable (`server_restart`): apply
+       # _shared/ticket-failure-handling.md's retry policy (re-submit the
+       # pair once) within its 2-submit/2-resolve cap, then
        # re-enter this dispatch on the retry's outcome. Once the reason is
        # terminal — or that budget is exhausted — do NOT call resolve_issue:
        # leave the escalation pending. Record res["reason"], tell the human,
@@ -570,9 +569,9 @@ JSON with `description`/`affected_ids`/`actionable`), and `dedupe_count`.
        # See _shared/ticket-failure-handling.md for the full retryable/
        # terminal reason matrix and R4 idempotency guidance.
    else:
-       # Unrecognized status (e.g. `cancelled`, written by cancel_ticket —
-       # the ticket status column has no CHECK constraint, and tools.py's
-       # docstring documents only the four statuses above). Same
+       # `cancelled` (withdrawn by cancel_ticket: terminal, no task_id) or a
+       # status outside _shared/ticket-failure-handling.md's vocabulary (the
+       # ticket status column has no CHECK constraint). Same
        # follow-through as the `failed` arm above (tell the human, file a
        # DecisionRecord, append this esc-id to the exclude file; do NOT call
        # resolve_issue) — plus record the raw `res`, since the status itself
@@ -739,7 +738,7 @@ check ran in. Single normative statement of the rule:
   re-derive it live. **Run from the project root** — `--queue-dir` defaults to
   the relative `./data/reconciliation/escalations`, so the cwd is what decides
   which queue is read; from anywhere else the script refuses with
-  `TargetStoreMissing` rather than manufacturing an empty queue and reporting a
+  `TargetStoreUnpopulated` rather than manufacturing an empty queue and reporting a
   false clean run (see
   `fused-memory/src/fused_memory/utils/target_store_preflight.py`). Pass an
   absolute `--queue-dir` if you cannot control the cwd.

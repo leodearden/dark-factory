@@ -1294,6 +1294,42 @@ class TestCountAndMemberSetContradictions:
         assert verdict.retain_ids == ('m1',)
 
 
+_NON_BOOL_CANONICALS = [1, 1.0, 'true']
+
+
+class TestOnlyTheBoolTrueIsCanonical:
+    """A ``canonical`` value that is not the bool ``True`` claims nothing.
+
+    Contrast ``test_a_named_incumbent_contradicting_a_zero_count_fails``,
+    where ``canonical=True`` makes C this topic's incumbent.
+    """
+
+    @pytest.mark.parametrize('value', _NON_BOOL_CANONICALS)
+    def test_a_non_bool_canonical_of_this_topic_is_not_the_incumbent(self, value):
+        m1 = _member('m1', topic=TOPIC)
+        c = _member('C', topic=TOPIC)
+        c['metadata']['canonical'] = value
+
+        verdict = _judge(_members(m1, c), canonical_count=0)
+
+        assert AutoReasonCode.canonical_count_contradicted not in _codes(verdict)
+        assert AutoReasonCode.member_already_canonical not in _codes(verdict)
+        assert 'C' in verdict.retain_ids
+        assert 'C' not in verdict.stripped_ids
+
+    @pytest.mark.parametrize('value', _NON_BOOL_CANONICALS)
+    def test_a_non_bool_canonical_of_another_topic_is_not_member_already_canonical(
+        self, value
+    ):
+        x1 = _member('x1', topic='some-other-topic')
+        x1['metadata']['canonical'] = value
+
+        verdict = _judge(_members(_member('m1'), x1), canonical_count=0)
+
+        assert AutoReasonCode.member_different_topic in _codes(verdict)
+        assert AutoReasonCode.member_already_canonical not in _codes(verdict)
+
+
 class TestCallerContractViolationsReturnAVerdict:
     """Inputs the parameter annotations FORBID, answered rather than obeyed.
 

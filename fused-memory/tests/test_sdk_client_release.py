@@ -307,10 +307,11 @@ class TestRoutingClientsClose:
         assert async_httpx_clients_built == []
 
     @pytest.mark.asyncio
-    async def test_an_injected_classifier_client_is_owned_and_released(self, mock_config):
+    @pytest.mark.parametrize('owner_cls', [ReadRouter, WriteClassifier])
+    async def test_an_injected_client_is_owned_and_released(self, mock_config, owner_cls):
         client = completion_client('{}')
 
-        await WriteClassifier(mock_config, openai_client=client).close()
+        await owner_cls(mock_config, openai_client=client).close()
 
         client.close.assert_awaited_once()
 

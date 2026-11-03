@@ -30,9 +30,11 @@ if TYPE_CHECKING:
     from shared.psi import PsiSample
 
     from orchestrator.event_store import EventStore
+    from orchestrator.git_ops import GitOps, WorktreeKind
 
 from shared.proc_group import terminate_process_group
-from shared.psi import read_psi_sample
+from shared.psi import cpu_some10_or_none, read_psi_sample
+from shared.python_env import without_python_env_selection
 from shared.verify_admission import acquire_task_slot, is_gated_role, nice_prefix
 
 from orchestrator import verify_evidence, verify_plan
@@ -2386,6 +2388,10 @@ def _tool_for_cmd(cmd: str | None) -> ToolKind:
     return parse_config_command(cmd).tool
 
 
+# The wire format between `_summarize_checks`, which joins a summary's
+# fragments with it, and `_aggregate_results`, which splits them back out.
+_SUMMARY_FRAGMENT_SEPARATOR = ', '
+
 # task 3173: the substring that marks a summary fragment as a signal-kill
 # note.  Shared by `_killed_leg_note` (producer) and `_aggregate_results`
 # (consumer), so multi-module aggregation — which rebuilds the summary by
@@ -2393,12 +2399,12 @@ def _tool_for_cmd(cmd: str | None) -> ToolKind:
 # 'type errors' — cannot silently drop the one fact that says the run means
 # nothing.  Any new consumer should match on this constant, never a literal.
 #
-# CONSTRAINT ON PRODUCERS: a marker-bearing fragment must not contain ', '.
-# `_summarize_checks` JOINS fragments with ', ' and `_aggregate_results`
-# recovers them with `.split(', ')`, so a comma inside the note splits it in
+# CONSTRAINT ON PRODUCERS: a marker-bearing fragment must not contain
+# `_SUMMARY_FRAGMENT_SEPARATOR`, or `_aggregate_results`'s split cuts it in
 # two and only the marker-bearing half survives — silently truncating the
 # sentence, which is the exact degradation the carry-through exists to
-# prevent.  Separate clauses with '; '.  Pinned by
+# prevent.  Separate clauses with '; ', and pass every interpolated value
+# through `_without_fragment_separator`.  Pinned by
 # test_verify.py::TestKillNoteIsOneAggregationFragment, which fails at the
 # producer rather than letting the consumer degrade quietly.
 SIGNAL_KILL_SUMMARY_MARKER = 'killed by signal'
@@ -2413,8 +2419,7 @@ SIGNAL_KILL_SUMMARY_MARKER = 'killed by signal'
 # truncated run reported ``1 failed, 728 passed, 1 skipped`` where a clean
 # re-run of the identical command reported ``19622 passed, 17 skipped``.
 #
-# Same CONSTRAINT ON PRODUCERS as above: a fragment bearing this marker must
-# not contain ', '.  See `_worker_death_leg_note`.
+# Same CONSTRAINT ON PRODUCERS as above.  See `_worker_death_leg_note`.
 WORKER_DEATH_SUMMARY_MARKER = 'session aborted after worker death'
 
 # Every marker that makes a summary fragment a no-verdict note.
@@ -2428,32 +2433,49 @@ def is_no_verdict_summary(summary: str) -> bool:
     return any(marker in summary for marker in _NO_VERDICT_SUMMARY_MARKERS)
 
 
-def _killed_leg_note(label: str, rc: int, duration: float | None) -> str:
+def _without_fragment_separator(text: str) -> str:
+    """*text* with each separator collapsed, so an interpolated value cannot split its note across the wire join."""
+    return text.replace(_SUMMARY_FRAGMENT_SEPARATOR, _SUMMARY_FRAGMENT_SEPARATOR.strip())
+
+
+def _leg_name(label: str, module: str | None) -> str:
+    """How a no-verdict note names its leg: the module prefix, when there is one, then the slot."""
+    if module is None:
+        return f'{label} leg'
+    return f'{_without_fragment_separator(module)} {label} leg'
+
+
+def _killed_leg_note(
+    label: str, rc: int, duration: float | None, *, module: str | None = None,
+) -> str:
     """Describe a leg that was terminated by an external signal.
 
-    Every clause is a MEASURED fact: which leg, which signal delivered it,
-    how long the process survived, and — the point of the whole exercise —
-    that no verdict exists.  ``duration`` is ``None`` (not ``0.0``) when the
-    caller has no timing in scope, in which case the "after N.NNs" clause is
-    omitted rather than fabricating "after 0.00s".
+    Every clause is a MEASURED fact: which leg (its module, when given, and
+    its slot), which signal delivered it, how long the process survived, and
+    — the point of the whole exercise — that no verdict exists.  ``duration``
+    is ``None`` (not ``0.0``) when the caller has no timing in scope, in which
+    case the "after N.NNs" clause is omitted rather than fabricating "after
+    0.00s".
 
     ``rc`` is asyncio's returncode, i.e. the NEGATIVE signal number, so the
     signal is ``-rc``.
 
-    Clauses are separated by ``'; '`` and the sentence must stay free of
-    ``', '`` — see ``SIGNAL_KILL_SUMMARY_MARKER``'s producer constraint: the
-    ``', '``-joined summary is the wire format between this function and
-    ``_aggregate_results``, and a comma here would silently truncate the note
-    on the way through aggregation.
+    Clauses are separated by ``'; '``: the note must stay one fragment, per
+    ``SIGNAL_KILL_SUMMARY_MARKER``'s producer constraint.
     """
     after = f' after {duration:.2f}s' if duration is not None else ''
     return (
-        f'{label} leg {SIGNAL_KILL_SUMMARY_MARKER} {-rc}{after}; '
+        f'{_leg_name(label, module)} {SIGNAL_KILL_SUMMARY_MARKER} {-rc}{after}; '
         f'no diagnostics produced; verdict indeterminate'
     )
 
 
-def _worker_death_leg_note(label: str) -> str:
+_MAX_NAMED_CRASHED_NODEIDS = 3
+
+
+def _worker_death_leg_note(
+    label: str, *, module: str | None = None, crashed_nodeids: Iterable[str] = (),
+) -> str:
     """Describe a leg whose pytest session was TRUNCATED by a worker death.
 
     The sibling of ``_killed_leg_note`` above, for the second cause of a
@@ -2464,23 +2486,32 @@ def _worker_death_leg_note(label: str) -> str:
     every test still queued on every worker was abandoned and the counts cover
     only what had already finished.
 
-    Every clause is a MEASURED fact, as ``_killed_leg_note``'s are: which leg,
-    that the remaining tests never ran, and that the tally is partial.  It
-    deliberately does NOT quote the tally, and deliberately does not take a
-    duration — the wall-clock time of a truncated run measures nothing anyone
-    should act on.
+    Every clause is a MEASURED fact, as ``_killed_leg_note``'s are: which leg
+    (its module, when given, and its slot), which test each dead worker had
+    in flight (that it was running, not a verdict on it), that the remaining
+    tests never ran, and that the tally is partial.  It deliberately does NOT
+    quote the tally, and deliberately does not take a duration — the
+    wall-clock time of a truncated run measures nothing anyone should act on.
 
-    Clauses are separated by ``'; '`` and the sentence must stay free of
-    ``', '`` — see ``SIGNAL_KILL_SUMMARY_MARKER``'s producer constraint: the
-    ``', '``-joined summary is the wire format between this function and
-    ``_aggregate_results``, and a comma here would silently truncate the note
-    on the way through aggregation, leaving only the marker-bearing half.
-    Pinned by test_verify.py::TestWorkerDeathLegSummary.
+    The note travels into the bench reason and the escalation title, so it
+    names at most ``_MAX_NAMED_CRASHED_NODEIDS`` in-flight tests and counts
+    the rest.
+
+    Clauses are separated by ``'; '``: the note must stay one fragment, per
+    ``SIGNAL_KILL_SUMMARY_MARKER``'s producer constraint.  Pinned by
+    test_verify.py::TestWorkerDeathLegSummary.
     """
-    return (
-        f'{label} leg {WORKER_DEATH_SUMMARY_MARKER}; '
-        f'remaining tests never ran; tally is partial'
-    )
+    in_flight = sorted({
+        _without_fragment_separator(strip_xdist_group_suffix(nodeid)) for nodeid in crashed_nodeids
+    })
+    clauses = [f'{_leg_name(label, module)} {WORKER_DEATH_SUMMARY_MARKER}']
+    if in_flight:
+        named = in_flight[:_MAX_NAMED_CRASHED_NODEIDS]
+        unnamed = len(in_flight) - len(named)
+        more = f' (+{unnamed} more)' if unnamed else ''
+        clauses.append('worker died running ' + ' and '.join(f"'{nodeid}'" for nodeid in named) + more)
+    clauses += ['remaining tests never ran', 'tally is partial']
+    return '; '.join(clauses)
 
 
 class LegSlot(StrEnum):
@@ -2600,6 +2631,7 @@ def _summarize_checks(
     lint_duration: float | None = None,
     type_duration: float | None = None,
     leg_categories: Mapping[LegSlot, FailureCategory] | None = None,
+    module: str | None = None,
 ) -> tuple[bool, str, str, str, list[str]]:
     """Classify the three checks into (passed, category, cause_hint, summary,
     failing_leg_categories).
@@ -2676,6 +2708,9 @@ def _summarize_checks(
     same legs, for a caller that also reads one leg's category: classifying
     scans the leg's whole output, so ``run_verification`` classifies once and
     its env-recovery gate reads the test slot. Omitted, it is computed here.
+
+    ``module`` is the verify's module prefix, named in each no-verdict note;
+    ``None`` for a single-module caller.
     """
     passed = test_rc == 0 and lint_rc == 0 and type_rc == 0
     if passed:
@@ -2712,14 +2747,16 @@ def _summarize_checks(
         # killed leg's captured output can itself carry a bailout marker, and
         # task 3173's wording for that case must not regress.
         if is_external_kill_rc(rc):
-            parts.append(_killed_leg_note(label, rc, duration))
+            parts.append(_killed_leg_note(label, rc, duration, module=module))
         elif label is LegSlot.TEST and _is_worker_death_truncated_session(out):
             if _first_surviving_failure_line(out) is not None:
                 parts.append(tool_verdict)
-            parts.append(_worker_death_leg_note(label))
+            parts.append(_worker_death_leg_note(
+                label, module=module, crashed_nodeids=_crash_attributed_nodeids(out),
+            ))
         else:
             parts.append(tool_verdict)
-    summary = f'Failures: {", ".join(parts)}'
+    summary = f'Failures: {_SUMMARY_FRAGMENT_SEPARATOR.join(parts)}'
     return passed, category, cause_hint, summary, per_check_categories
 
 
@@ -5050,43 +5087,6 @@ async def reap_leftover_verify_scopes(project_root: Path) -> list[str]:
     return reaped
 
 
-# Environment variables that activate a *specific* Python virtualenv / uv
-# project.  The orchestrator runs under `uv run --project orchestrator`, which
-# activates dark-factory/.venv and exports these into our process env.  If they
-# leak into a TARGET project's verify/build/test subprocess, the target's `uv`
-# resolves THIS venv instead of its own and a target `uv sync` writes the
-# target's deps into the orchestrator's runtime interpreter — the 2026-05-29
-# ghost-venv incident (autopilot-video's torch/insightface stack got synced into
-# dark-factory/.venv, flipping it 3.13->3.12 and deleting the live interpreter's
-# stdlib out from under the running orchestrator, which then hit FileNotFoundError
-# every scheduler cycle and stopped dispatching).
-#
-# Denylist, NOT allowlist: reify's cargo verify depends on a broad, evolving set
-# of toolchain/sccache/jobserver vars (RUSTC_WRAPPER, CARGO_*, the jobserver
-# FIFO, ...); an allowlist would silently break Rust verify the first time a new
-# var is needed.  We remove ONLY the python-env-selection vars below plus the
-# orchestrator's own ORCH_* control-plane namespace (see _ORCH_ENV_PREFIX) —
-# the vars that cause a leak — and pass everything else through untouched.
-_VENV_ISOLATION_KEYS: frozenset[str] = frozenset({
-    'VIRTUAL_ENV',
-    'UV_PROJECT_ENVIRONMENT',
-    'UV_PROJECT',
-    'UV_ACTIVE',
-    # Fix 3 may run the orchestrator unit with --frozen; UV_FROZEN / UV_NO_SYNC
-    # must NOT leak to a target, which has to stay free to sync its own deps.
-    'UV_FROZEN',
-    'UV_NO_SYNC',
-    # `uv run` (our ExecStart) sets UV_RUN_RECURSION_DEPTH in our env to guard
-    # against runaway nested invocations.  A target's verify is a logically
-    # independent uv invocation tree, so it must start that counter fresh rather
-    # than inherit our depth — otherwise a uv-based target (dark-factory /
-    # autopilot-video) would `uv run` "pre-loaded" at our depth.
-    'UV_RUN_RECURSION_DEPTH',
-    'CONDA_PREFIX',
-    'CONDA_DEFAULT_ENV',
-    'PYTHONHOME',
-})
-
 # The orchestrator's own control-plane env namespace.  ``OrchestratorConfig`` is
 # a pydantic-settings ``BaseSettings`` whose ``env_settings`` source reads the
 # ENTIRE ``ORCH_`` prefix as config overrides, so ANY ambient ``ORCH_*`` var
@@ -5102,27 +5102,6 @@ _VENV_ISOLATION_KEYS: frozenset[str] = frozenset({
 _ORCH_ENV_PREFIX: str = 'ORCH_'
 
 
-def _strip_venv_bin_from_path(path: str | None, venv: str | None) -> str | None:
-    """Drop the active venv's ``bin`` directory from a PATH string.
-
-    ``uv run`` prepends ``$VIRTUAL_ENV/bin`` to PATH in the orchestrator
-    process, so removing ``VIRTUAL_ENV`` alone is insufficient: the venv's bin
-    dir is still first on PATH and a target's bare ``python`` / ``uv`` / ``pip``
-    would still resolve into the orchestrator venv.  Remove exactly that one
-    component (matched as ``<venv>/bin`` via normpath); every other PATH entry
-    (cargo, sccache, system bins) keeps its order.  Returns *path* unchanged
-    when *path* or *venv* is falsy.
-    """
-    if not path or not venv:
-        return path
-    venv_bin = os.path.normpath(os.path.join(venv, 'bin'))
-    kept = [
-        p for p in path.split(os.pathsep)
-        if p and os.path.normpath(p) != venv_bin
-    ]
-    return os.pathsep.join(kept)
-
-
 def _target_subprocess_env(
     extra: dict[str, str] | None,
     *,
@@ -5131,7 +5110,7 @@ def _target_subprocess_env(
     """Build the subprocess env for a TARGET project's verify/build/test spawn.
 
     Starts from ``os.environ`` minus the orchestrator's own venv/uv activation
-    vars (``_VENV_ISOLATION_KEYS``), minus the orchestrator's ``ORCH_*``
+    vars (``shared.python_env.without_python_env_selection``), minus the orchestrator's ``ORCH_*``
     control-plane namespace (``_ORCH_ENV_PREFIX`` — so an ambient, leaked
     ``ORCH_CONFIG_PATH`` can't make a snapshot-era test load the production
     config; task 2957), and minus the venv ``bin`` dir on PATH, so the target's
@@ -5158,15 +5137,11 @@ def _target_subprocess_env(
     ruff's built-in defaults — a false green.  See pyproject.toml's
     ``[tool.ruff]`` decision block.)
     """
-    venv = os.environ.get('VIRTUAL_ENV')
     env = {
         k: v
-        for k, v in os.environ.items()
-        if k not in _VENV_ISOLATION_KEYS and not k.startswith(_ORCH_ENV_PREFIX)
+        for k, v in without_python_env_selection(os.environ).items()
+        if not k.startswith(_ORCH_ENV_PREFIX)
     }
-    stripped_path = _strip_venv_bin_from_path(env.get('PATH'), venv)
-    if stripped_path is not None:
-        env['PATH'] = stripped_path
     env['PYTHONUNBUFFERED'] = '1'
     # This assignment's POSITION is load-bearing, not incidental: it must stay
     # strictly ABOVE the `extra` overlay so an operator's `verify_env`
@@ -7020,7 +6995,12 @@ async def _preprovision_shared_venv(
         if done_at is not None and time.monotonic() - done_at < _PREPROVISION_DONE_TTL:
             return
         logger.info('Cold-verify shared-venv pre-provision: running %r in %s', cmd, worktree)
+        started = time.monotonic()
         rc, out, _ = await _run_cmd(cmd, worktree, timeout, env=verify_env or None)
+        logger.info(
+            'Cold-verify shared-venv pre-provision finished in %.1fs (rc=%d) in %s',
+            time.monotonic() - started, rc, worktree,
+        )
         if rc != 0:
             # Fail-open + loud (honours the loud-over-silent-degradation norm;
             # mirrors the _govern_cpu_str fail-open convention).  A SUCCESSFUL
@@ -7045,6 +7025,51 @@ async def _preprovision_shared_venv(
         # prune stale entries so the guard stays bounded across many worktrees.
         _PREPROVISION_DONE[key] = time.monotonic()
         _prune_preprovision_guard()
+
+
+async def _provision_main_tip_worktree(
+    worktree: Path,
+    config: OrchestratorConfig,
+    *,
+    role: Literal['merge', 'task', 'background'],
+) -> None:
+    """Provision a throwaway main-tip worktree the way the merge gate provisions its own.
+
+    Goes through ``_preprovision_shared_venv`` (same coalescing and fail-open
+    policy), with *role*'s verify env and in the warm timeout tier its verify legs
+    use. Such a worktree has no ``.task/``, so ``run_verification``'s ``is_cold``
+    gate never provisions it; without this, an environment-only failure on a
+    green main reads as red (task 6917).
+    """
+    await _preprovision_shared_venv(
+        worktree, config,
+        verify_env=_resolve_verify_env(config, None, role=role),
+        timeout=_resolve_verify_timeout(config, None, is_cold=False),
+    )
+
+
+@contextlib.asynccontextmanager
+async def _provisioned_ephemeral_worktree(
+    config: OrchestratorConfig,
+    git_ops: 'GitOps',
+    kind: 'WorktreeKind',
+    sha: str,
+    *,
+    warm_seed: bool,
+    role: Literal['merge', 'task', 'background'],
+) -> AsyncIterator[Path]:
+    """``GitOps.ephemeral_worktree``, provisioned before the body runs.
+
+    Every ``WorktreeKind`` is a main-tip kind, so each takes
+    ``_provision_main_tip_worktree``'s policy; a kind that is not would need
+    its own. Provisioning follows any warm seed: the seed fills ``target/``,
+    provisioning fills the venv and ``node_modules``.
+    """
+    async with git_ops.ephemeral_worktree(
+        kind, sha, warm_seed=warm_seed,
+    ) as worktree:
+        await _provision_main_tip_worktree(worktree, config, role=role)
+        yield worktree
 
 
 def _log_event_channel(label: str, channel: VerifyEventChannel) -> None:
@@ -7783,6 +7808,7 @@ async def run_verification(
         lint_duration=attempt.lint.duration_secs,
         type_duration=attempt.type.duration_secs,
         leg_categories=leg_categories,
+        module=module_prefix,
     )
     if timed_out:
         summary = f'Verification timed out after {max_retries} retries' if max_retries > 0 else 'Verification timed out'
@@ -7829,6 +7855,7 @@ async def run_verification(
             lint_duration=attempt.lint.duration_secs,
             type_duration=attempt.type.duration_secs,
             leg_categories=leg_categories,
+            module=module_prefix,
         )
         if timed_out:
             # Distinct wording from the first-pass timeout summary: this
@@ -8139,13 +8166,13 @@ def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
         # verify silently degraded to a bare 'Failures: ' with no parts at
         # all — erasing the one fact that says the run produced no verdict.
         # Carry every distinct no-verdict note through verbatim, in child
-        # order, de-duplicated (two subprojects killed identically must not
-        # stutter the same sentence twice).
+        # order, de-duplicated: only identical notes collapse (such as two
+        # unlabelled children), since each module's note names its module.
         for r in results:
-            for fragment in r.summary.removeprefix('Failures: ').split(', '):
+            for fragment in r.summary.removeprefix('Failures: ').split(_SUMMARY_FRAGMENT_SEPARATOR):
                 if is_no_verdict_summary(fragment) and fragment not in parts:
                     parts.append(fragment)
-        summary = 'All checks passed' if passed else f'Failures: {", ".join(parts)}'
+        summary = 'All checks passed' if passed else f'Failures: {_SUMMARY_FRAGMENT_SEPARATOR.join(parts)}'
 
     # Collect cause_hint from failing child results; join with ' | '.
     cause_hint = ' | '.join(r.cause_hint for r in results if r.cause_hint)
@@ -9959,7 +9986,7 @@ async def verify_failure_is_preexisting_on_main(
 
 async def run_main_tip_sweep(
     config: 'OrchestratorConfig',
-    git_ops: object,
+    git_ops: 'GitOps',
     *,
     main_sha: str | None = None,
     seed_mode: SweepSeedMode = SweepSeedMode.COLD,
@@ -9986,6 +10013,9 @@ async def run_main_tip_sweep(
             ``WARM`` CoW-seeds ``target/`` from the warm-lane base as a
             read-only consumer, failing soft to cold.  The
             ``_mainsweepconfirm-`` confirm worktree always stays cold.
+            Either mode provisions the worktree first
+            (``_provision_main_tip_worktree``), as a merge verify does; the
+            seed mode governs only ``target/``.
 
     Returns:
         ``(main_sha, VerifyResult)`` on success (result.passed may be False).
@@ -10072,7 +10102,7 @@ async def run_main_tip_sweep(
         # gate and the worktree pin (both now use the same resolved value).
         if main_sha is None:
             try:
-                main_sha = await git_ops.get_main_sha()  # type: ignore[union-attr]
+                main_sha = await git_ops.get_main_sha()
             except Exception:
                 logger.debug('run_main_tip_sweep: get_main_sha failed', exc_info=True)
                 return None
@@ -10083,10 +10113,11 @@ async def run_main_tip_sweep(
         # '_mainsweep-' band, retry-on-lock-contention add, GUARANTEED scoped
         # cleanup on exit — never a broad 'git worktree prune', DD5) is owned
         # by GitOps.ephemeral_worktree; see its docstring for the full
-        # contract.
-        async with git_ops.ephemeral_worktree(  # type: ignore[union-attr]
-            WorktreeKind.MAIN_SWEEP, main_sha,
-            warm_seed=seed_mode is SweepSeedMode.WARM,
+        # contract. _provisioned_ephemeral_worktree provisions it before the
+        # body runs.
+        async with _provisioned_ephemeral_worktree(
+            config, git_ops, WorktreeKind.MAIN_SWEEP, main_sha,
+            warm_seed=seed_mode is SweepSeedMode.WARM, role='background',
         ) as tmp_path:
             def _enoent_on_self(r: 'VerifyResult') -> bool:
                 """SECONDARY backstop (task 2507): True iff *r* is a
@@ -10866,7 +10897,10 @@ async def confirm_main_tip_failure_is_real(
     Cleanup (scoped ``git worktree remove --force`` + ``remove_tree``)
     always runs in a ``finally`` block; no broad ``git worktree prune`` (DD5
     guarantee — mirrors ``run_main_tip_sweep``/
-    ``verify_failure_is_preexisting_on_main``).
+    ``verify_failure_is_preexisting_on_main``). Before the re-runs it is
+    provisioned like the sweep's worktree (``_provision_main_tip_worktree``),
+    so a failure that only an unprovisioned environment produces is never
+    confirmed; it stays unseeded (cold).
 
     Node-id -> subproject mapping: module configs are freshly re-discovered
     on the probe worktree (never reused from *config* — that snapshot is for
@@ -10951,6 +10985,8 @@ async def confirm_main_tip_failure_is_real(
                 _sha_prefix,
             )
             return True
+
+        await _provision_main_tip_worktree(tmp_path, config, role='task')
 
         # Each subproject group gets its own scoped + forced-serial isolated
         # re-run. ALL groups must confirm green to suppress.
@@ -11334,19 +11370,9 @@ def _xdist_workers(cmd: str, verify_env: 'Mapping[str, str] | None') -> dict:
 def _psi_cpu_some10_or_none() -> float | None:
     """Host CPU pressure at observation, or ``None`` when it is not knowable.
 
-    ``read_ok=False`` is ``shared.psi``'s documented fail-open sentinel, and
-    maps to ``None`` (NOT ``0.0``, which would read as "the host was idle").
+    The sample-to-value mapping has one home, ``shared.psi.cpu_some10_or_none``.
     The ``except`` is belt to that braces: a TELEMETRY read must never change
     a gate's verdict, so it may not raise into the discriminator.
-
-    Deliberately NOT refactored to read its value off ``_load_sample`` above
-    (task 3353). The two are the same two invariants over the same reader, so
-    the duplicated try/except is tempting to collapse — but this one feeds the
-    flake discriminator's ``psi_cpu_some10`` column, which is an idempotency-
-    adjacent value in §8.3's ledger, and the refactor would buy nothing except
-    putting a second caller's WARNING text on that path. One reader, two thin
-    wrappers, each with a single caller, is the cheaper place to leave the
-    duplication.
     """
     try:
         sample = read_psi_sample()
@@ -11364,7 +11390,7 @@ def _psi_cpu_some10_or_none() -> float | None:
             exc_info=True,
         )
         return None
-    return sample.cpu_some10 if sample.read_ok else None
+    return cpu_some10_or_none(sample)
 
 
 #: The only failing-leg categories verify_classify.py::classify_failure

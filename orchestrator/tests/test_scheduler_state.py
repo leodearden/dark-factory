@@ -550,7 +550,8 @@ class TestEffectivePrioritiesCache:
 _SNAPSHOT_KEYS = frozenset({
     'skip_counts', 'parks', 'park_stacks', 'effective_priorities',
     'pin_queue', 'overrides', 'current_holders', 'lock_depth', 'snapshot_at',
-    'is_paused', 'pause_reason', 'requeue_cooldowns', 'pin_reservations',
+    'is_paused', 'pause_reason', 'pause_class', 'requeue_cooldowns',
+    'pin_reservations',
 })
 
 
@@ -563,9 +564,9 @@ def _arm_transient_cooldown(scheduler: Scheduler, task_id: str) -> None:
 
 
 class TestGetStateSnapshotShape:
-    """get_state_snapshot() returns a SchedulerStateSnapshot with the thirteen wire keys."""
+    """get_state_snapshot() returns a SchedulerStateSnapshot with every wire key."""
 
-    def test_snapshot_returns_thirteen_top_level_keys(self):
+    def test_snapshot_returns_every_top_level_key(self):
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
         scheduler.finish_startup()
         snap = scheduler.get_state_snapshot()

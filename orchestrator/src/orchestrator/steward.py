@@ -1021,26 +1021,27 @@ class TaskSteward:
         suggestions = json.loads(_strip_hash_prefix(escalation.detail))
         prompt = build_triage_prompt(suggestions, self.task)
 
-        meta_root = TaskArtifacts.meta_root_for(self.worktree.parent, self.worktree.name)
-        if not meta_root.is_dir():
-            # TaskWorkflow._setup normally creates this (via artifacts.init())
-            # for this exact worktree before any steward is ever constructed
-            # against it. If it's still missing here, the verdict-tools
-            # server spawned below (same --meta-root) would silently no-op
-            # its write_verdict call, and read_verdict() further down would
-            # return None indistinguishably from a genuine triage failure —
-            # log distinctly and create it so a misconfigured meta-root is
-            # diagnosable instead of masquerading as an ordinary fallback.
+        artifacts = TaskArtifacts.for_task(self.worktree, self.task_id)
+        for root in (artifacts.lane_root, artifacts.task_root):
+            if root.is_dir():
+                continue
+            # TaskWorkflow._setup normally creates both roots (via
+            # artifacts.init()) for this exact dispatch before any steward is
+            # ever constructed against it. If one is still missing here, the
+            # verdict-tools server spawned below (same roots) would silently
+            # no-op its write_verdict call, and read_verdict() further down
+            # would return None indistinguishably from a genuine triage
+            # failure — log distinctly and create it so a misconfigured root
+            # is diagnosable instead of masquerading as an ordinary fallback.
             logger.warning(
-                'Steward for task %s: pre-triage meta-root %s did not '
+                'Steward for task %s: pre-triage artifact root %s did not '
                 'exist — creating it now. This should already have been '
                 'created by workflow setup; a missing root here means '
                 'pre-triage would otherwise silently and permanently '
                 'degrade to inline triage.',
-                self.task_id, meta_root,
+                self.task_id, root,
             )
-            meta_root.mkdir(parents=True, exist_ok=True)
-        artifacts = TaskArtifacts(self.worktree, meta_root)
+            root.mkdir(parents=True, exist_ok=True)
         artifacts.clear_verdict('triage')  # I-FRESH: never consume a stale verdict
 
         # Base the injected config on the steward's own fused-memory wiring
@@ -1054,6 +1055,7 @@ class TaskSteward:
         # escalation_url: TRIAGE grants no escalation tools.
         mcp_config = _inject_verdict_tools_mcp(
             self.mcp.mcp_config_json(), self.worktree, TRIAGE,
+            task_root=artifacts.task_root,
         )
 
         try:

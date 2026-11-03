@@ -51,7 +51,6 @@ try:
     import exception_register
     from _task_db_scan import UNREADABLE_STORE_ERRORS, tasks_db_path
     from dashboard.config import DEFAULT_FUSED_MEMORY_URLS, DashboardConfig
-    from legibility import census_trigger
     from shared.governed_exceptions import (
         MalformedDisposition,
         TaskRef,
@@ -59,6 +58,8 @@ try:
         owner_from_record,
         owner_record,
     )
+    from shared.mcp_post import mcp_server_base
+    from shared.mcp_session import SyncMcpSession
     from shared.project_layout import default_project_root
     from shared.safe_io import atomic_write_text
     from shared.task_statuses import OwnerLiveness
@@ -1131,18 +1132,21 @@ def escalation_url(project_root: Path) -> str:
     return url
 
 
+def _call_tool(base_url: str, tool: str, arguments: dict[str, object], *, timeout: float) -> dict:
+    with SyncMcpSession(base_url, client_name='exception-owner-sweep', timeout=timeout) as session:
+        return session.call_tool(tool, arguments)
+
+
 def build_ports(project_root: Path, *, fused_memory_url: str | None, escalation_mcp_url: str | None) -> Ports:
     """Both MCP servers over the real transport; a URL left None takes its default."""
     fused_memory = fused_memory_url or os.environ.get(FUSED_MEMORY_URL_ENV, DEFAULT_FUSED_MEMORY_URLS[0])
     return Ports(
         project_root=project_root,
         db=tasks_db_path(project_root),
-        fused_memory=functools.partial(
-            census_trigger.post_mcp_tool_call, f'{fused_memory}/mcp', timeout=SUBMIT_RESOLVE_WAIT_SECS + 15
-        ),
+        fused_memory=functools.partial(_call_tool, fused_memory, timeout=SUBMIT_RESOLVE_WAIT_SECS + 15),
         escalation=functools.partial(
-            census_trigger.post_mcp_tool_call,
-            escalation_mcp_url or escalation_url(project_root),
+            _call_tool,
+            mcp_server_base(escalation_mcp_url or escalation_url(project_root)),
             timeout=ESCALATION_TIMEOUT_SECS,
         ),
     )

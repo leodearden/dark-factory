@@ -37,6 +37,8 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
+from _mock_openai_server import mock_openai_server
+from _sdk_client_stubs import sdk_client_double
 
 from fused_memory.config.reload import apply_reload
 from fused_memory.config.schema import (
@@ -1461,25 +1463,6 @@ class TestEveryResolverReadsLive:
 # ---------------------------------------------------------------------------
 
 
-def _client_double() -> MagicMock:
-    """A client double that is its own async context manager, like the SDKs.
-
-    `AsyncOpenAI.__aenter__` and `AsyncAnthropic.__aenter__` both `return
-    self` (read off openai 2.31.0 / anthropic 0.92.0), so `async with
-    client as c` binds the SAME object. A bare `MagicMock` instead returns a
-    FRESH child from `__aenter__`, which would make every `create` assertion
-    in this file inspect a different mock than the one `_call_llm` called —
-    passing or failing for reasons that have nothing to do with the code.
-
-    `__aexit__` returns False, because the real ones do: releasing a client
-    must not suppress an in-flight exception (see `TestTheClientIsReleased`).
-    """
-    client = MagicMock()
-    client.__aenter__ = AsyncMock(return_value=client)
-    client.__aexit__ = AsyncMock(return_value=False)
-    return client
-
-
 def _incomplete_openai_client(content: str, reason: str) -> MagicMock:
     """A Responses answer the provider marked ``incomplete`` for *reason*."""
     client = _openai_client(content, status='incomplete')
@@ -1499,7 +1482,7 @@ def _openai_client(
     unset *usage* reports none rather than an auto-generated Mock. The chat
     endpoint is a bare ``AsyncMock``, so a call on the wrong arm is visible.
     """
-    client = _client_double()
+    client = sdk_client_double()
     client.responses.create = AsyncMock(return_value=types.SimpleNamespace(
         output_text=content, usage=usage, status=status, incomplete_details=None,
     ))
@@ -1510,7 +1493,7 @@ def _openai_client(
 def _chat_client(content: str | None, usage: object = None) -> MagicMock:
     """A fake ``AsyncOpenAI`` for an ``openai_generic`` endpoint: chat.completions only.
 
-    Same construction shape as ``test_classifier.py::_make_mock_client`` — the
+    Same construction shape as ``_sdk_client_stubs.py::completion_client`` — the
     established openai double in this repo, plus the async-CM protocol the
     client is used through. Without *usage* the response's ``usage`` is the
     unspecced Mock's own auto-attribute, which reports no usable usage.
@@ -1523,7 +1506,7 @@ def _chat_client(content: str | None, usage: object = None) -> MagicMock:
     response.choices = [choice]
     if usage is not None:
         response.usage = usage
-    client = _client_double()
+    client = sdk_client_double()
     client.chat.completions.create = AsyncMock(return_value=response)
     client.responses.create = AsyncMock()
     return client
@@ -1546,7 +1529,7 @@ def _anthropic_client(blocks: list[FakeAnthropicTextBlock]) -> MagicMock:
     """A fake ``AsyncAnthropic`` whose ``messages.create`` yields *blocks*."""
     response = MagicMock()
     response.content = blocks
-    client = _client_double()
+    client = sdk_client_double()
     client.messages.create = AsyncMock(return_value=response)
     return client
 
@@ -1823,7 +1806,7 @@ class TestTheJudgeEndpointOnOneRealConfig:
 
     @pytest.mark.asyncio
     async def test_the_judge_client_gets_the_judge_url_and_the_classifier_never_does(
-        self,
+        self, monkeypatch,
     ) -> None:
         cfg = _real_config(judge_api_url=_JUDGE_URL)
 
@@ -1831,16 +1814,17 @@ class TestTheJudgeEndpointOnOneRealConfig:
         assert judge_ctor.call_args.kwargs['base_url'] == _JUDGE_URL
         assert judge_ctor.call_args.kwargs['api_key'] == 'sk-main'
 
-        main_client = _chat_client(
-            '{"primary": "procedural_knowledge", "confidence": 0.9}',
-        )
-        with patch(
-            'fused_memory.routing.classifier.AsyncOpenAI', return_value=main_client,
-        ) as main_ctor:
-            result = await WriteClassifier(cfg).classify('some content')
-        assert main_ctor.called
-        assert result.primary is MemoryCategory.procedural_knowledge
-        assert _JUDGE_URL not in main_ctor.call_args.kwargs.values()
+        with mock_openai_server() as server:
+            monkeypatch.setenv('OPENAI_BASE_URL', server.base_url)
+            server.chat_content = '{"primary": "procedural_knowledge", "confidence": 0.9}'
+            classifier = WriteClassifier(cfg)
+            try:
+                result = await classifier.classify('some content')
+            finally:
+                await classifier.close()
+
+            assert result.primary is MemoryCategory.procedural_knowledge
+            assert len(server.requests_to('/chat/completions')) == 1
 
         assert cfg.llm.providers.openai is not None
         assert cfg.llm.providers.openai.api_url == _MAIN_URL
@@ -1906,7 +1890,7 @@ class TestTheVerdictCarriesTheCallsUsage:
         self, response_usage: dict,
     ) -> None:
         """`int(MagicMock())` is 1: the reader checks `isinstance(int)`, never coerces."""
-        client = _client_double()
+        client = sdk_client_double()
         client.responses.create = AsyncMock(return_value=types.SimpleNamespace(
             output_text=_payload('amends', 'm1'), status='completed',
             incomplete_details=None, **response_usage,
@@ -2396,7 +2380,7 @@ class TestAReasoningEffortTheArmCannotSendRaises:
     async def test_the_call_is_refused_before_any_client_is_built(
         self, make_service, ctor: str,
     ) -> None:
-        client = _client_double()
+        client = sdk_client_double()
         client.messages.create = AsyncMock()
         client.chat.completions.create = AsyncMock()
         client.responses.create = AsyncMock()
@@ -2422,7 +2406,7 @@ class TestAReasoningEffortTheArmCannotSendRaises:
         service.config.write_triage.t_high = 0.95
         service.config.write_triage.t_low = 0.50
         service.search = AsyncMock(return_value=SearchResults([_result('m1', 0.80)]))
-        with patch(ctor, return_value=_client_double()):
+        with patch(ctor, return_value=sdk_client_double()):
             decision = await triage_write(
                 service, content='c', project_id='p',
                 counter=counter, judge=judge_write,
@@ -2519,10 +2503,14 @@ class TestTheClientIsReleased:
     """The SDK client is built per middle-band write and must not be leaked.
 
     `_call_llm` constructs `AsyncOpenAI`/`AsyncAnthropic` on every triaged
-    write. Neither defines `__del__` (verified against openai 2.31.0), so an
-    unclosed client abandons an `httpx` connection pool — sockets and TLS
-    state — to the garbage collector, on a path that runs once per write in a
-    single long-lived server process.
+    write. Neither client class defines `__del__`, but the `httpx` wrapper
+    each one holds does: `openai._base_client.AsyncHttpxClientWrapper` and its
+    anthropic twin (see `tests/_fm_helpers.py::reap_leaked_async_httpx_clients`).
+    That finaliser is no substitute for closing. It schedules `aclose()` only
+    if an event loop happens to be running when the garbage collector reaches
+    the client; otherwise the connection pool — sockets and TLS state — is
+    abandoned, on a path that runs once per write in a single long-lived
+    server process.
 
     The per-call CONSTRUCTION is deliberate and stays: a cached client keyed
     to a config that hot-reloads would pin a stale `model`/`api_url` past a
@@ -2576,7 +2564,7 @@ class TestTheClientIsReleased:
         async def _hang(*_args, **_kwargs):
             await asyncio.sleep(5)
 
-        client = _client_double()
+        client = sdk_client_double()
         if provider == 'openai':
             client.responses.create = AsyncMock(side_effect=_hang)
         else:
@@ -2592,7 +2580,7 @@ class TestTheClientIsReleased:
     @pytest.mark.asyncio
     async def test_the_client_is_released_when_the_transport_raises(self) -> None:
         """A release must not depend on the call having succeeded."""
-        client = _client_double()
+        client = sdk_client_double()
         client.responses.create = AsyncMock(side_effect=RuntimeError('boom'))
         with patch('openai.AsyncOpenAI', return_value=client), \
                 pytest.raises(RuntimeError):
@@ -2649,7 +2637,7 @@ class TestJudgeWriteFailuresRaise:
 
     @pytest.mark.asyncio
     async def test_a_transport_error_propagates(self) -> None:
-        client = _client_double()
+        client = sdk_client_double()
         client.responses.create = AsyncMock(side_effect=RuntimeError('boom'))
         with patch('openai.AsyncOpenAI', return_value=client), \
                 pytest.raises(RuntimeError):
@@ -2671,7 +2659,7 @@ class TestJudgeWriteFailuresRaise:
         async def _hang(*_args, **_kwargs):
             await asyncio.sleep(5)
 
-        client = _client_double()
+        client = sdk_client_double()
         client.responses.create = AsyncMock(side_effect=_hang)
         with patch('openai.AsyncOpenAI', return_value=client), \
                 pytest.raises(TimeoutError):
@@ -2695,7 +2683,7 @@ class TestJudgeWriteFailuresRaise:
         async def _hang(*_args, **_kwargs):
             await asyncio.sleep(5)
 
-        client = _client_double()
+        client = sdk_client_double()
         client.messages.create = AsyncMock(side_effect=_hang)
         with patch('anthropic.AsyncAnthropic', return_value=client), \
                 pytest.raises(TimeoutError):
@@ -2814,7 +2802,7 @@ class TestJudgeWriteInheritsBetasFailOpenApparatus:
 
         counter = TriageFailOpenCounter()
         service = self._mid_band_service(judge_timeout_seconds=0.01)
-        client = _client_double()
+        client = sdk_client_double()
         client.responses.create = AsyncMock(side_effect=_hang)
 
         with patch('openai.AsyncOpenAI', return_value=client):

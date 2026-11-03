@@ -83,12 +83,14 @@ PIN-CLASS AWARENESS
 The alarm's trigger was itself "a human-facing escalation is still open", so
 on a queue where L2s legitimately stay parked for days it re-fired forever,
 and an operator closing it only restarted the cycle.  So an
-``escalation_pinned`` hold whose every pin is already an L2 (the predicate is
-``escalation.pins.pinned_only_by_human_parked``) files no alarm; any other
-reason, and any hold with an unpromoted pin, still does.  Only the queue WRITE
-is suppressed — the streak still counts and the events and sweep summary still
-flow — and ``recovery_emission.streak_escalation_suppress_human_parked`` turns
-it off live.  Retuning ``veto_streak_threshold`` / ``veto_streak_min_span_secs``
+``escalation_pinned`` hold whose every pin is an L2, or an L1 that one of those
+L2s holds as a member, files no alarm (the canonical statement is
+``escalation.pins.pinned_only_by_human_parked``); any other reason, and any
+hold with an L1 that no L2 in the task's read holds, still does.  Only the
+queue WRITE is suppressed — the streak still counts and the events and sweep
+summary still flow — and
+``recovery_emission.streak_escalation_suppress_human_parked`` turns it off
+live.  Retuning ``veto_streak_threshold`` / ``veto_streak_min_span_secs``
 or ``streak_escalation_enabled`` instead was rejected: each also silences
 genuinely stuck tasks.  An alarm filed BEFORE its pin was promoted stays open
 until the release edge stands it down; no earlier stand-down is attempted,
@@ -962,7 +964,7 @@ def emit_recovery_veto_streak_escalation(
         if streak == threshold:
             logger.info(
                 'Recovery veto streak for task %s at %s not escalated: every '
-                'pin is already an L2 in front of a human (%s)',
+                'pin is already in front of a human (%s)',
                 task_id, site, ','.join(_flatten_ids(escalation_ids)) or '(none)',
             )
         return False

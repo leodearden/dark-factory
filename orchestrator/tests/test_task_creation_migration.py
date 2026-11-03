@@ -4,8 +4,7 @@ Covers two scopes:
   1. Tool allowlists in STEWARD and DEEP_REVIEWER roles — neither role keeps
      ``resolve_ticket`` in its allowlist; the server-side ticket janitor
      surfaces curator failures asynchronously.
-  2. Shared instruction-helper fragments: ``submit_resolve_instructions``
-     (for callers that wait on the curator) and ``submit_only_instructions``
+  2. The shared instruction-helper fragment ``submit_only_instructions``
      (for steward / deep_reviewer, which fire-and-forget).
 """
 
@@ -23,31 +22,10 @@ from orchestrator.agents.roles import (
     IMPLEMENTER,
     STEWARD,
     submit_only_instructions,
-    submit_resolve_instructions,
 )
 from orchestrator.config import OrchestratorConfig
 from orchestrator.review_checkpoint import ReviewCheckpoint
 from orchestrator.verify import VerifyResult
-
-# ---------------------------------------------------------------------------
-# Helper contract tests
-# ---------------------------------------------------------------------------
-
-
-class TestSharedSubmitResolveFragment:
-    """Contract tests for the submit_resolve_instructions helper."""
-
-    def test_helper_renders_shared_skeleton(self):
-        result = submit_resolve_instructions(
-            '{"source": "X"}',
-            outcome_target='SENTINEL_OUTCOME_XYZ',
-            step_prefix=('1', '2'),
-            project_root_expr='"/tmp"',
-        )
-        # The outcome_target sentinel must appear at least twice:
-        # once in the error-shape sentence and once in the failed-branch sentence.
-        assert result.count('SENTINEL_OUTCOME_XYZ') >= 2
-
 
 # ---------------------------------------------------------------------------
 # Site-wiring tests (minimal behavioral assertions)
@@ -287,10 +265,10 @@ class TestHelperIndentationAlignment:
     def test_multiline_metadata_continuation_aligns_after_caller_indent(self):
         # Pass caller_indent directly — the helper applies it internally, removing
         # the need for a separate textwrap.indent() wrap at the call site.
-        result = submit_resolve_instructions(
+        result = submit_only_instructions(
             '{"a": 1,\n"b": 2}',
             outcome_target='t',
-            step_prefix=('a', 'b'),
+            step_label='a',
             extra_submit_guidance='Line1\nLine2',
             caller_indent='   ',
         )

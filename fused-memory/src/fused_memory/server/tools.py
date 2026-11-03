@@ -215,7 +215,7 @@ from fused_memory.server.write_triage import (
 # dependency one-way, and leaves `_stub_judge` as `triage_write`'s default for
 # direct callers and for beta's judge-slot contract tests — which is what keeps
 # those tests meaningful rather than tautological.
-from fused_memory.server.write_triage_judge import judge_write
+from fused_memory.server.write_triage_judge import judge_write, resolve_judge_field_chars
 from fused_memory.services.completion_claim_gate import (
     UNRESOLVABLE,
     UNVERIFIED_CLAIM_TAG,
@@ -289,12 +289,38 @@ CREATE TABLE IF NOT EXISTS overrides (
     ttl_until     TEXT,
     created_at    TEXT NOT NULL,
     updated_at    TEXT NOT NULL,
+    source        TEXT NOT NULL DEFAULT 'operator',
     PRIMARY KEY (project_root, task_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_overrides_pinned
     ON overrides(project_root, pinned, pin_order);
-"""  # Source of truth: orchestrator/src/orchestrator/overrides.py:33-49
+"""  # Source of truth: orchestrator/src/orchestrator/overrides.py::_SCHEMA
+
+# Mirrors orchestrator/src/orchestrator/overrides.py::_migrate_add_source_column.
+# Every write through these tools is an operator write, so it stamps this value
+# and takes ownership of the row from the starvation watchdog.
+_OPERATOR_SOURCE = 'operator'
+
+
+async def _migrate_overrides_source_column(db: aiosqlite.Connection) -> None:
+    """Add ``source`` to a pre-ownership overrides table, idempotently.
+
+    The orchestrator migrates the same file, so losing the race to its ALTER
+    ('duplicate column name') is success, not failure.
+    """
+    cursor = await db.execute('PRAGMA table_info(overrides)')
+    columns = {row[1] for row in await cursor.fetchall()}
+    if 'source' in columns:
+        return
+    try:
+        await db.execute(
+            'ALTER TABLE overrides ADD COLUMN source TEXT NOT NULL '
+            f"DEFAULT '{_OPERATOR_SOURCE}'"
+        )
+    except aiosqlite.OperationalError as exc:
+        if 'duplicate column name' not in str(exc):
+            raise
 
 # Mirrors orchestrator/src/orchestrator/config.py PRIORITY_RANK keys.
 # Source of truth: orchestrator/src/orchestrator/config.py:27.
@@ -350,6 +376,7 @@ async def _open_overrides_db(
     busy_ms = 30000 if autocommit else 5000
     await apply_full_durability_pragmas(db, busy_timeout_ms=busy_ms)
     await db.executescript(_OVERRIDE_SCHEMA)
+    await _migrate_overrides_source_column(db)
     return db
 
 
@@ -3605,8 +3632,10 @@ def create_mcp_server(
         or different, explicitly or implicitly (ruling:
         plans/write-triage-flip-readiness-prd.md §11.3 C1''); it does not
         adjudicate which of the two is right. Your full text is stored and
-        readable in the canonical's grouped document (amendment text is
-        digested there; sighting text is only counted) and marked as
+        readable in the canonical's grouped document (a contesting
+        amendment's text is carried there in full up to
+        ``write_triage.judge_field_chars``; sighting text is still only
+        counted) and marked as
         contesting it, and the memory you contradict is left untouched. No
         adjudication is scheduled and nothing is escalated: the flag is a
         marker a human reads, not a work item anything picks up. Getting a ``contested`` ack is not a
@@ -4592,7 +4621,11 @@ def create_mcp_server(
             already listing the matched child is marked 'matched': True in
             place instead and gains a 'content' key carrying that same FULL
             body alongside its truncated 'digest', so a matched child's text is
-            never shortened by grouping wherever it ends up.
+            never shortened by grouping wherever it ends up.  A digest marked
+            'contested': True also carries 'content', whether or not the child
+            itself matched: the child's text capped at
+            write_triage.judge_field_chars, with the counted elision marker
+            when cut.
 
             Loud-fault keys, present only when something is genuinely unknown:
             'grouped'['children_unavailable'] (+ 'error_type') means the child
@@ -4677,7 +4710,10 @@ def create_mcp_server(
             # that metadata does not survive a list transform.
             try:
                 grouped_results = await group_search_results(
-                    memory_service, project_id, results
+                    memory_service,
+                    project_id,
+                    results,
+                    contested_text_chars=resolve_judge_field_chars(memory_service),
                 )
             except Exception:
                 # A grouping fault must never turn a working search into an
@@ -5097,8 +5133,10 @@ def create_mcp_server(
         distinction semantic search's silent low-similarity drop could not make.
 
         A miss now carries an optional ``tombstone`` key (task 3041) when the
-        record was DELIBERATELY reaped by a named reconciliation sweep. Its
-        presence proves the record is gone on purpose — naming the sweep
+        record was DELIBERATELY deleted by a tombstone-writing delete path —
+        one of the deleter tags listed at
+        ``reconciliation/recon_self_model.py::MEM0_TOMBSTONE_DELETERS``. Its
+        presence proves the record is gone on purpose — naming the deleter
         (``deleter``), the run that performed the deletion
         (``deleting_run_id``, distinct from the victim's own ``run_id``), when,
         and the victim's identifying metadata — rather than lost. This closes
@@ -5109,9 +5147,13 @@ def create_mcp_server(
 
         The key is OMITTED (not ``None``) when no tombstone exists, so its
         presence is itself the signal and the ordinary never-existed miss keeps
-        its original shape. Absence is NOT proof of the converse: tombstones
-        are TTL-bounded, so one older than
-        ``mem0_tombstone.MEM0_TOMBSTONE_TTL_DAYS`` has itself expired. The
+        its original shape. Absence is NOT proof of the converse: a miss with
+        no ``tombstone`` key is not evidence that the record was not
+        deliberately deleted, for two independent reasons. (1) Several Mem0
+        delete paths write no tombstone at all;
+        ``reconciliation/recon_self_model.py::render_cycle_summary_section``
+        is the maintained enumeration of them. (2) Even a written tombstone
+        expires after ``mem0_tombstone.MEM0_TOMBSTONE_TTL_DAYS``. The
         lookup is guarded and never runs on the hit branch, so it can only add
         information to an already-correct answer — a tombstone failure can
         never convert a correct ``found: False`` into an error, and a backend
@@ -5156,7 +5198,9 @@ def create_mcp_server(
             A hit additionally carries an optional ``grouped`` key (task 3129)
             when the record participates in a parent/child group: a CANONICAL
             gains ``{'amendments': [digests], 'amendment_count', 'sighting_count'}``
-            (plus ``'truncated': True`` when the digest listing is bounded, or
+            (a digest marked ``'contested': True`` also carries ``'content'``,
+            its text capped at ``write_triage.judge_field_chars``; plus
+            ``'truncated': True`` when the digest listing is bounded, or
             ``{'children_unavailable': True, 'error_type'}`` when the child
             reads failed); a CHILD gains ``{'parent': {'id', ...same block...}}``
             while keeping its OWN ``content``/``metadata``/``memory_id``.  On
@@ -5242,7 +5286,11 @@ def create_mcp_server(
         # found:True into an error dict.
         try:
             grouped = await group_memory_document(
-                memory_service, project_id, memory_id, record
+                memory_service,
+                project_id,
+                memory_id,
+                record,
+                contested_text_chars=resolve_judge_field_chars(memory_service),
             )
         except Exception:
             logger.warning(
@@ -9270,7 +9318,9 @@ def create_mcp_server(
         Callers should follow up with ``resolve_ticket`` to obtain the final
         task_id once the curator has decided (create / drop / combine).
         When the curator cannot judge it yet, the ticket parks as
-        ``awaiting_curation`` and is curated later.
+        ``awaiting_curation`` and is curated later. An open ``resolve_ticket``
+        answer means not decided yet: resolve the same ticket again and never
+        re-submit.
 
         ``planning_mode=True`` switches to a synchronous, curator-bypassing
         path for batched human decomposition (e.g., breaking a PRD into ~50
@@ -9659,32 +9709,31 @@ def create_mcp_server(
         project_root: str,
         timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
-        """Phase-2 of two-phase task creation: block until the curator worker decides.
+        """Phase-2 of two-phase task creation: answer a ticket, waiting while it is pending.
 
-        Returns ``{status, task_id?, reason?}`` once the ticket is terminal.
-        If the ticket is already terminal, returns immediately.
+        OPEN statuses — not decided yet. The answer carries ``ticket`` and
+        ``reason``, never ``task_id``, and the ticket is still being curated:
+        call ``resolve_ticket`` again with the SAME ticket and never re-submit.
+        - ``pending`` — queued or in curation. ``reason`` is ``wait_timeout``
+          (the wait expired), ``wait_interrupted`` (woken while still open,
+          e.g. a shutdown) or ``store_unavailable`` (the ticket store was
+          closing).
+        - ``awaiting_curation`` — the curator could not judge it yet, so it is
+          durably parked and retried automatically; ``reason`` says why.
 
-        Status values:
-        - ``created``  — a new task was created; ``task_id`` is the numeric id.
-        - ``combined`` — candidate was folded into an existing task; ``task_id``
-          is the target task's id.
-        - ``failed``   — an error occurred; ``reason`` describes it. Common
-          reasons: ``timeout``, ``server_restart``, ``expired``.
-        - ``awaiting_curation`` — NON-terminal: the curator could not judge the
-          submission yet (``reason`` says why), so it is durably parked and
-          retried automatically until it gets a verdict. NO ``task_id`` is
-          returned. It is neither a failure nor a creation: do NOT re-submit
-          and do NOT count it as created; call ``resolve_ticket`` again later.
-        - ``refused``  — a deterministic guard (cancelled-premise blocklist /
-          recon premise registry) rejected the candidate. **NO TASK WAS
-          CREATED and NO ``task_id`` is returned** — the key is absent, not
-          null, so a refusal can never be read as a creation. ``reason``
-          carries the refusal justification. This is terminal and a SUCCESS,
-          not an error: do NOT retry it (a retry re-hits the same
-          deterministic guard) and do NOT record any task id for it.
+        TERMINAL statuses — decided; an already-terminal ticket answers at once.
+        - ``created`` — a new task was created; ``task_id`` is its id.
+        - ``combined`` — folded into an existing task; ``task_id`` is that task's id.
+        - ``refused`` — a deterministic guard (cancelled-premise blocklist /
+          recon premise registry) rejected the candidate. NO task was created
+          and NO ``task_id`` key is present. A success, not an error: never
+          retry it and never record a task id for it.
+        - ``cancelled`` — withdrawn by ``cancel_ticket``; no ``task_id`` key.
+        - ``failed`` — no task was created; no ``task_id`` key; ``reason`` says
+          why (e.g. ``server_restart``, ``worker_dead``). With no ticket row to
+          read it is ``unknown_ticket`` or ``ticket_store not configured``.
 
-        Callers that receive ``status=failed, reason=timeout`` should either
-        retry or report an error.
+        The caller rule is ``skills/_shared/ticket-failure-handling.md``.
 
         Args:
             ticket: Ticket id returned by ``submit_task`` (must start with ``tkt_``)
@@ -9746,8 +9795,10 @@ def create_mcp_server(
         Args:
             project_root: Absolute path to project root.
             status: Optional status filter ('pending', 'awaiting_curation',
-                'created', 'failed', 'combined', 'refused', 'cancelled'). 'refused' means a deterministic guard
-                rejected the candidate and no task was created.
+                'created', 'failed', 'combined', 'refused', 'cancelled').
+                'pending' and 'awaiting_curation' are the open statuses: the
+                ticket is not decided yet. 'refused' means a deterministic
+                guard rejected the candidate and no task was created.
                 When None, all statuses are returned.
             since: Optional ISO-8601 timestamp; only tickets with
                 ``created_at >= since`` are returned. Default: now − 7 days.
@@ -10398,6 +10449,18 @@ def create_mcp_server(
         :mod:`fused_memory.server.markup_guard` for the authoritative pattern
         list and rationale.
 
+        A write that supplies ``title``/``description``/``details``/``prompt``
+        to an already-planned task (or a recon write whose audit-trail rotation
+        rewrote the description), where the task's ``metadata.plan_text_fp``
+        no longer matches the post-write description+details fingerprint,
+        returns ``amendment_advisory`` {task_id, plan_authored_at,
+        fields_changed, will_replan, plan_text_fp_before, task_text_fp_after}.
+        A running agent does not see the amendment; the task re-plans at its
+        next dispatch. ``will_replan`` is False for a done/cancelled task,
+        because the amendment reaches no work; True assumes the orchestrator's
+        default plan-fingerprint gate and a later dispatch. See
+        docs/task-authoring.md §9.
+
         Args:
             id: Task ID to update
             project_root: Absolute path to project root
@@ -10827,8 +10890,8 @@ def create_mcp_server(
                         """
                         INSERT INTO overrides
                             (project_root, task_id, boost_tier, pinned, pin_order,
-                             reserve_now, ttl_until, created_at, updated_at)
-                        VALUES (?, ?, ?, COALESCE(?, 0), ?, COALESCE(?, 0), ?, ?, ?)
+                             reserve_now, ttl_until, created_at, updated_at, source)
+                        VALUES (?, ?, ?, COALESCE(?, 0), ?, COALESCE(?, 0), ?, ?, ?, ?)
                         ON CONFLICT(project_root, task_id) DO UPDATE SET
                             boost_tier  = COALESCE(?, boost_tier),
                             pinned      = COALESCE(?, pinned),
@@ -10836,7 +10899,8 @@ def create_mcp_server(
                                                ELSE COALESCE(?, pin_order) END,
                             reserve_now = COALESCE(?, reserve_now),
                             ttl_until   = COALESCE(?, ttl_until),
-                            updated_at  = ?
+                            updated_at  = ?,
+                            source      = ?
                         """,
                         (
                             # INSERT values
@@ -10849,6 +10913,7 @@ def create_mcp_server(
                             ttl_until_iso,
                             now_iso,
                             now_iso,
+                            _OPERATOR_SOURCE,
                             # UPDATE SET values
                             boost_tier,
                             pinned_int,
@@ -10857,6 +10922,7 @@ def create_mcp_server(
                             reserve_now_int,
                             ttl_until_iso,
                             now_iso,
+                            _OPERATOR_SOURCE,
                         ),
                     )
                     await db.execute('COMMIT')
@@ -11053,7 +11119,10 @@ def create_mcp_server(
 
         Returns:
             ``{'pin_queue': [{'task_id': ..., 'boost_tier': ..., 'pinned': ...,
-            'pin_order': ..., 'reserve_now': ..., 'ttl_until': ...}, ...]}``
+            'pin_order': ..., 'reserve_now': ..., 'ttl_until': ...,
+            'source': ...}, ...]}`` where ``source`` is ``'operator'`` or
+            ``'starvation_watchdog'`` (a watchdog auto-pin, which carries a
+            ``ttl_until``).
         """
         _normalized = _normalize_project_root(project_root)
         if isinstance(_normalized, dict):
@@ -11062,7 +11131,8 @@ def create_mcp_server(
         db = await _open_overrides_db(project_root)
         try:
             cursor = await db.execute(
-                'SELECT task_id, boost_tier, pinned, pin_order, reserve_now, ttl_until '
+                'SELECT task_id, boost_tier, pinned, pin_order, reserve_now, '
+                'ttl_until, source '
                 'FROM overrides '
                 'WHERE project_root=? AND pinned=1 '
                 'ORDER BY pin_order ASC',
@@ -11077,6 +11147,7 @@ def create_mcp_server(
                     'pin_order': r[3],
                     'reserve_now': bool(r[4]),
                     'ttl_until': r[5],
+                    'source': r[6],
                 }
                 for r in rows
             ]
@@ -11101,7 +11172,7 @@ def create_mcp_server(
             project_root: Absolute path to project root.
 
         Returns:
-            Every SchedulerStateSnapshot field (13 keys). ``snapshot_at`` is
+            Every SchedulerStateSnapshot field. ``snapshot_at`` is
             null when no orchestrator has written a snapshot yet.
         """
         _normalized = _normalize_project_root(project_root)

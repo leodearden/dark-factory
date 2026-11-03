@@ -133,6 +133,16 @@ class TestCrossLayerIdentityLockstep:
                 f'({category!r}) must be denied auto-close'
             )
 
+    def test_runner_stall_category_is_in_the_deny_list(self) -> None:
+        """A re-arming predicate's stall escalation stays denied (PRD C1).
+
+        Separate from the milestone pin above so a rename of the stall
+        category identifies itself distinctly in the failure report.
+        """
+        from orchestrator.deterministic_runner import MILESTONE_CHECK_STALLED_CATEGORY
+
+        assert MILESTONE_CHECK_STALLED_CATEGORY in L2_AUTO_CLOSE_DENY_CATEGORIES
+
 
 class TestPromoteSentinelBoundRoles:
     """``PROMOTE_SENTINEL_BOUND_ROLES``: member roles whose clusters must be minted under a sentinel id.
@@ -552,6 +562,20 @@ class TestL2AutoCloseClass:
         )
         assert result is None, (
             f'Expected denylist to block milestone_check_failed, got: {result!r}'
+        )
+
+    def test_milestone_check_stalled_denied_even_for_non_deterministic_role(self) -> None:
+        """'milestone_check_stalled' is blocked by CATEGORY alone, exactly as
+        'milestone_check_failed' above: the stall of a re-arming predicate
+        waits for a human to choose resume or abandon."""
+        resolution = 'Subject task status=done per get_task; escalation moot.'
+        result = l2_auto_close_class(
+            identity=self.WATCHER, level=2, action='close_only',
+            category='milestone_check_stalled', agent_role='some-other-role',
+            resolution=resolution,
+        )
+        assert result is None, (
+            f'Expected denylist to block milestone_check_stalled, got: {result!r}'
         )
 
     def test_curator_adjudication_missing_denied_even_for_non_deterministic_role(self) -> None:

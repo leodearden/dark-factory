@@ -53,6 +53,7 @@ _EXPECTED_UV_RUN_UNITS = frozenset(
         "dashboard/dark-factory-dashboard.service",
         "dashboard/dark-factory-load-sampler.service",
         "fused-memory/fused-memory.service.example-systemd-config",
+        "scripts/client-feed.service.template",
         "scripts/dashboard.service.template",
         "scripts/fused-memory.service.template",
         "scripts/legibility-transcript-check@.service",
@@ -70,7 +71,7 @@ _EXPECTED_UV_RUN_UNITS = frozenset(
     }
 )
 
-# uv's render sentinel in the two `.service.template` files, substituted for an
+# uv's render sentinel in the `.service.template` files, substituted for an
 # absolute uv path by scripts/setup-host.sh.  Recognised so a template is swept
 # in its COMMITTED form rather than only after rendering.
 _UV_PATH_SENTINEL = "__UV_PATH__"

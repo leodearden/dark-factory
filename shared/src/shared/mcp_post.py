@@ -71,6 +71,7 @@ Public API::
         check_mcp_post_response,
         decode_mcp_response_body,
         mcp_endpoint_url,
+        mcp_server_base,
         mcp_tool_call_payload,
         open_mcp_client,
         post_mcp_tool_call,
@@ -105,6 +106,7 @@ __all__ = [
     'check_mcp_post_response',
     'decode_mcp_response_body',
     'mcp_endpoint_url',
+    'mcp_server_base',
     'mcp_tool_call_payload',
     'open_mcp_client',
     'post_mcp_tool_call',
@@ -140,6 +142,11 @@ def mcp_endpoint_url(base_url: str) -> str:
     'http://127.0.0.1:8002/mcp'
     """
     return f"{base_url.rstrip('/')}/mcp"
+
+
+def mcp_server_base(endpoint_url: str) -> str:
+    """The inverse of :func:`mcp_endpoint_url`: the server base of an MCP endpoint URL."""
+    return endpoint_url.rstrip('/').removesuffix('/mcp')
 
 
 def decode_mcp_response_body(resp: Any) -> Any:

@@ -156,7 +156,7 @@ Four rules make this fallback loop terminate correctly. **On the `coalesce-*` ar
 2. **rc=128-with-empty-marker does not mean "not landed" here — and on the `coalesce-*` arm, neither does rc=1** (see rule 3 for the mechanism: why a non-tip member's rc=1 is the common, permanent case there, not a reason to wait it out). A train merges only the tip branch, so a non-tip absorbed member's commits land under the **tip's** marker, not its own. Check two signals under **either** rc=128-with-empty-marker **or** rc=1 on the `coalesce-*` arm; this widened trigger does not extend to the `mr-*` arm, where rule 3's original rc=1 restriction still stands: (a) the **tip's** merge marker on main — run [step 1](../_shared/deriving-landed-sha.md#step-1)'s selecting search against the **tip's** subject:
    ```bash
    S="Merge task/<TIP_ID> into main"
-   git log main --fixed-strings --grep="$S" --format='%H%x09%s' \
+   git log main --fixed-strings --grep="task/<TIP_ID>" --format='%H%x09%s' \
      | awk -F'\t' -v s="$S" '$2==s && !seen {print $1; seen=1}'
    ```
    `<TIP_ID>` is parsed off the `coalesce-<TIP_ID>-<hex>` id by stripping the `coalesce-` prefix and
@@ -306,7 +306,7 @@ The outcome arrives from either the submit call (terminal at submit time) or the
       "note": "<explanation>"}`, not `kind: "merged"` — only re-derive and use the actual merge
       commit if `kind: "merged"` provenance is specifically wanted — and re-derive it with [step
       1](../_shared/deriving-landed-sha.md#step-1)'s selecting merge-marker search (`git log main
-      --fixed-strings --grep="$S" --format='%H%x09%s' | awk -F'\t' -v s="$S" '$2==s && !seen {print
+      --fixed-strings --grep="task/<TASK_ID>" --format='%H%x09%s' | awk -F'\t' -v s="$S" '$2==s && !seen {print
       $1; seen=1}'`, `S="Merge task/<TASK_ID> into main"`), which yields only a commit whose
       **subject** is exactly the marker.
 

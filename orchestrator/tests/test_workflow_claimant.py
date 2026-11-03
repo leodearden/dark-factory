@@ -97,9 +97,15 @@ def _make_workflow(
 
 
 async def _setup(wf: TaskWorkflow, base_sha: str = 'a' * 40) -> None:
-    """Drive the create_worktree path of _setup_worktree_and_artifacts."""
+    """Drive the create_worktree path of _setup_worktree_and_artifacts.
+
+    The worktree sits at ``<worktree_base>/<task id>``, as in production, so
+    its ``.task-meta/task-<id>`` root stays inside this test's tmp dir.
+    """
+    worktree = wf.git_ops.worktree_base / wf.task_id
+    worktree.mkdir(parents=True, exist_ok=True)
     wf.git_ops.create_worktree = AsyncMock(
-        return_value=WorktreeInfo(path=wf.config.project_root, base_commit=base_sha)
+        return_value=WorktreeInfo(path=worktree, base_commit=base_sha)
     )
     wf._sync_worktree_venvs = AsyncMock()
     with patch('orchestrator.workflow._run', new=AsyncMock(return_value=(0, '', ''))):
@@ -401,12 +407,11 @@ def _resolve_plan_lock_claimant(wf: TaskWorkflow):
     the plan.lock leg (a present db claimant wins outright).
 
     NO FIXTURE BRIDGE — this is the production path end to end.
-    ``TaskWorkflow`` builds its artifacts with
-    ``meta_root=_meta_root_for_worktree(self.worktree)`` (workflow.py), so
-    plan.lock lives in the ``.task-meta`` SIBLING, and
+    ``TaskWorkflow._artifact_roots`` gives the dispatch its task root
+    ``.task-meta/task-<id>``, where the task-scoped plan.lock lives, and
     ``_resolve_live_claimant`` derives that same root through
-    ``TaskArtifacts.meta_root_for`` on the read side (task 4028).  Writer and
-    reader meet at one path with nothing manufactured in between.
+    ``TaskArtifacts.for_task`` on the read side (tasks 4028, 3155).  Writer
+    and reader meet at one path with nothing manufactured in between.
 
     That is what gives these tests their reach.  Before 4028 the reader
     constructed a bare ``TaskArtifacts(worktree_path)`` and looked under

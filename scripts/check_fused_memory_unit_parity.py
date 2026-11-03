@@ -65,6 +65,7 @@ Design notes
 
 import argparse
 import pathlib
+import re
 import subprocess
 import sys
 from collections.abc import Sequence
@@ -140,6 +141,19 @@ REQUIRED_SERVICE_DIRECTIVES: tuple[str, ...] = (
 # connection to its still-listening port.
 REQUIRED_SERVICE_DIRECTIVE_PREFIXES: tuple[str, ...] = ("ExecStartPre=", "ExecStopPost=")
 
+# The backing stores must come up only through the FalkorDB AOF gate (task
+# 6330): a bare `docker compose ... up` ExecStartPre recreates falkordb onto
+# whatever AOF is on disk, and a stale one silently drops every later write.
+# Like the prefixes above, the gate's line carries host paths, so --fix can
+# only report these, never synthesize them.
+AOF_GATE_SCRIPT = "scripts/falkordb_aof_gate.py"
+AOF_GATE_DRIFT = f"ExecStartPre= running {AOF_GATE_SCRIPT} (task 6330)"
+BARE_COMPOSE_UP_DRIFT = (
+    "no ExecStartPre= running a bare `docker compose ... up` "
+    f"(it recreates falkordb without {AOF_GATE_SCRIPT})"
+)
+_BARE_COMPOSE_UP = re.compile(r"docker[ -]compose\b.*\sup(\s|$)")
+
 
 def _log(message: str, *, stream=None) -> None:
     """Tag every physical line of *message*; the contract lives in systemd_unit_parity.py::emit."""
@@ -190,6 +204,8 @@ def find_drift(
     unit_text: str,
     required: tuple[str, ...] = REQUIRED_SERVICE_DIRECTIVES,
     required_prefixes: tuple[str, ...] = REQUIRED_SERVICE_DIRECTIVE_PREFIXES,
+    *,
+    check_aof_gate: bool = True,
 ) -> list[str]:
     """Return required directives NOT present as non-comment lines in [Service].
 
@@ -201,6 +217,11 @@ def find_drift(
     [Service] line starts with it — used for directives whose full value is
     host-specific (e.g. ExecStartPre=) and therefore cannot be exact-matched.
     Prefix misses are appended, in order, after the exact-match misses.
+
+    With ``check_aof_gate``, a unit whose ExecStartPre= lines exist but none
+    runs AOF_GATE_SCRIPT reports AOF_GATE_DRIFT, and one with a bare compose-up
+    ExecStartPre= reports BARE_COMPOSE_UP_DRIFT, appended last. A unit with no
+    ExecStartPre= at all is already reported by its prefix miss.
 
     Args:
         unit_text: The full text of the systemd unit file.
@@ -221,7 +242,21 @@ def find_drift(
     missing.extend(
         p for p in required_prefixes if not any(line.startswith(p) for line in service_lines)
     )
+    if check_aof_gate:
+        missing.extend(_aof_gate_drift(service_lines))
     return missing
+
+
+def _aof_gate_drift(service_lines: list[str]) -> list[str]:
+    exec_start_pre = [line for line in service_lines if line.startswith("ExecStartPre=")]
+    if not exec_start_pre:
+        return []
+    drift = []
+    if not any(AOF_GATE_SCRIPT in line for line in exec_start_pre):
+        drift.append(AOF_GATE_DRIFT)
+    if any(_BARE_COMPOSE_UP.search(line) for line in exec_start_pre):
+        drift.append(BARE_COMPOSE_UP_DRIFT)
+    return drift
 
 
 # ---------------------------------------------------------------------------
@@ -252,7 +287,7 @@ def fix_unit_text(
     Returns:
         Updated text string (or the original if nothing was missing).
     """
-    missing = find_drift(unit_text, required, required_prefixes=())
+    missing = find_drift(unit_text, required, required_prefixes=(), check_aof_gate=False)
     if not missing:
         return unit_text
 
@@ -434,7 +469,7 @@ def main(argv: Sequence[str]) -> int:
         # / host paths) cannot be guessed. So the count of lines actually
         # appended is the number of missing EXACT directives, NOT len(drift)
         # (which also counts un-synthesizable prefix misses).
-        appended = find_drift(unit_text, required_prefixes=())
+        appended = find_drift(unit_text, required_prefixes=(), check_aof_gate=False)
         fixed_text = fix_unit_text(unit_text)
         installed_path.write_text(fixed_text, encoding="utf-8")
         _log(f"[fixed] Appended {len(appended)} directive(s) to {installed_path}")

@@ -264,6 +264,7 @@ recorded, not fixed here.
   way write the decision to fused-memory. The consumer that makes α's per-leg `rc`,
   `granted_at` and `plan_id` load-bearing (G1).
   *Signal:* a filed task id or a recorded declination, each carrying the measured share.
+  Decided 2026-10-31: not worth a task — see plans/verify-admission-fifo-prd.delta-decision.md.
 
 ## Out of scope
 

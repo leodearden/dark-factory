@@ -31,9 +31,11 @@ import pytest  # noqa: E402
 from _cross_account_evidence import PAIR_OVERRIDE_VAR  # noqa: E402
 from _oauth_accounts import ALL_TOKEN_LETTERS  # noqa: E402
 from df_pytest_isolation import (  # noqa: E402
+    _df_claude_binary_unset,  # noqa: F401  — the binding IS the wiring  # debt: task 6997
     _df_deploy_clocks_unwritten,  # noqa: F401  — the binding IS the wiring
     _df_git_ceiling_at_basetemp,  # noqa: F401  — the binding IS the wiring
     _df_git_env_hermetic,  # noqa: F401  — the binding IS the wiring
+    arm_leaked_drain_process_guard,
     reject_unsafe_basetemp,
 )
 from session_prebuild import SessionPrebuild  # noqa: E402
@@ -47,8 +49,9 @@ _FIRST_PARTY_TREE = SessionPrebuild(
 
 
 def pytest_configure(config):
-    """Refuse a --basetemp aimed inside a live task worktree (esc-3072-3)."""
+    """Refuse a --basetemp aimed inside a live task worktree (esc-3072-3); arm the drain-leak guard."""
     reject_unsafe_basetemp(config)
+    arm_leaked_drain_process_guard(config)
 
 
 def pytest_collection_finish(session):

@@ -100,11 +100,15 @@ def main_health_probe_spawned(outcome: MergeOutcome) -> bool:
 def lane_scene_config(
     project_root: Path, git: GitConfig, **overrides: Any,
 ) -> OrchestratorConfig:
-    """The ``OrchestratorConfig`` for a lane scene over a real tmp repo.
+    """The ``OrchestratorConfig`` for a merge-lane test scene.
 
     The main-health probe is off (``escalate_preexisting_main_break=False``);
     ``main_health_probe_spawned`` says why. *overrides* are any further
-    ``OrchestratorConfig`` fields the scene needs.
+    ``OrchestratorConfig`` fields the scene needs. A scene that exercises the
+    probe builds ``OrchestratorConfig`` itself with
+    ``escalate_preexisting_main_break`` named, and
+    ``test_lane_scene_config_guard.py`` holds every worker-constructing module
+    to that.
     """
     return OrchestratorConfig(
         project_root=project_root, git=git,

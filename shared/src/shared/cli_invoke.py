@@ -3886,6 +3886,32 @@ async def _invoke_claude(
             await bridge.stop()
 
 
+def _content_block_text(block: object) -> str | None:
+    if isinstance(block, str):
+        return block
+    if isinstance(block, dict) and block.get('type') == 'text':
+        text = block.get('text')
+        return text if isinstance(text, str) else None
+    return None
+
+
+def _assistant_message_text(messages: object) -> str:
+    """Join the text blocks of a CLI result's assistant *messages* with newlines.
+
+    Skips any message, content or block that is not of the expected shape.
+    """
+    if not isinstance(messages, list):
+        return ''
+    parts: list[str] = []
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get('type') != 'assistant':
+            continue
+        content = msg.get('content')
+        if isinstance(content, list):
+            parts.extend(text for text in map(_content_block_text, content) if text is not None)
+    return '\n'.join(parts)
+
+
 def _parse_claude_output(
     result: _SubprocessResult,
     *,
@@ -3943,6 +3969,8 @@ def _parse_claude_output(
     try:
         data = json.loads(result.stdout)
     except json.JSONDecodeError:
+        data = None
+    if not isinstance(data, dict):
         return AgentResult(
             success=result.returncode == 0,
             output=result.stdout,
@@ -3966,27 +3994,24 @@ def _parse_claude_output(
     session_id = data.get('session_id', '')
     subtype = data.get('subtype', '')
     structured = data.get('structured_output')
-    api_error_status = data.get('api_error_status')
+    raw_status = data.get('api_error_status')
+    api_error_status = (
+        raw_status if isinstance(raw_status, int) and not isinstance(raw_status, bool) else None
+    )
     raw_stop_reason = data.get('stop_reason')
     stop_reason = raw_stop_reason if isinstance(raw_stop_reason, str) else None
 
-    usage = data.get('usage') or {}
+    raw_usage = data.get('usage')
+    usage = raw_usage if isinstance(raw_usage, dict) else {}
     input_tokens = _to_token_count(usage.get('input_tokens'))
     output_tokens = _to_token_count(usage.get('output_tokens'))
     cache_read_tokens = _to_token_count(usage.get('cache_read_input_tokens'))
     cache_create_tokens = _to_token_count(usage.get('cache_creation_input_tokens'))
 
-    output_text = data.get('result', '')
-    if not output_text and isinstance(data.get('messages'), list):
-        parts = []
-        for msg in data['messages']:
-            if msg.get('type') == 'assistant':
-                for block in msg.get('content', []):
-                    if isinstance(block, dict) and block.get('type') == 'text':
-                        parts.append(block['text'])
-                    elif isinstance(block, str):
-                        parts.append(block)
-        output_text = '\n'.join(parts)
+    raw_result = data.get('result')
+    output_text = raw_result if isinstance(raw_result, str) else ''
+    if not output_text:
+        output_text = _assistant_message_text(data.get('messages'))
 
     # The CLI may report subtype='success' even when is_error is true (e.g.
     # usage cap hit).  Trust is_error as an authoritative override.
@@ -4054,6 +4079,18 @@ def _parse_claude_output(
         cost_basis=process_cost.basis,
         reported_total_cost_usd=process_cost.reported_total_usd,
         cost_delta_clamped=process_cost.delta_clamped,
+    )
+
+
+def parse_claude_cli_output(*, stdout: str, stderr: str, returncode: int) -> AgentResult:
+    """Parse one finished, non-resumed ``claude --print --output-format json`` run.
+
+    The one reader of the CLI result for callers outside this module that ran
+    the CLI themselves (``shared.usage_gate.UsageGate._run_probe``). Never
+    raises, whatever *stdout* holds.
+    """
+    return _parse_claude_output(
+        _SubprocessResult(stdout=stdout, stderr=stderr, returncode=returncode, duration_ms=0)
     )
 
 

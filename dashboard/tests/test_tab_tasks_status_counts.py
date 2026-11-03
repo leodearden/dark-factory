@@ -167,10 +167,10 @@ class TestRowsComeFromTheSnapshotByView:
         setter = re.search(r'\bconst\s+flipFilter\s*=\s*\(?\s*\w+\s*\)?\s*=>\s*(\w+)\(', tasks_tab_code)
         assert setter, 'TasksTab has no `const flipFilter = key => setX(...)`'
         state = re.search(
-            rf'\bconst\s*\[\s*\w+\s*,\s*{setter.group(1)}\s*\]\s*=\s*tasksPersistedState\(\s*[\'"]([^\'"]+)[\'"]',
+            rf'\bconst\s*\[\s*\w+\s*,\s*{setter.group(1)}\s*\]\s*=\s*usePersistedState\(\s*[\'"]([^\'"]+)[\'"]',
             tasks_tab_code,
         )
-        assert state, f'the filter setter {setter.group(1)} is not a tasksPersistedState'
+        assert state, f'the filter setter {setter.group(1)} is not a usePersistedState'
         assert state.group(1) != 'df.tasksFilters', (
             'a browser holding the old {active, pending, ...} object would read as "nothing '
             'selected" under the view keys; a fresh storage key makes it fall back to the default.'

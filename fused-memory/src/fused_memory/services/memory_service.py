@@ -44,6 +44,7 @@ from fused_memory.memory_metadata import (
     MetadataViolation,
     ParentHasChildrenError,
     check_canonical_routing,
+    is_canonical,
     is_valid_topic_slug,
     parent_liveness_violation,
     validate_memory_metadata,
@@ -115,6 +116,7 @@ from fused_memory.services.classification_fallback_alarm import (
 )
 from fused_memory.services.completion_claim_gate import UNVERIFIED_CLAIM_TAG
 from fused_memory.services.durable_queue import DeadLetterEvent, DurableWriteQueue
+from fused_memory.services.mem0_add_outcome import RAISED_MEM0_ADD, read_mem0_add_result
 from fused_memory.services.mem0_write_retry import (
     DEFAULT_MEM0_RETRY_POLICY,
     Mem0RetryPassSummary,
@@ -202,7 +204,8 @@ _SUBCLOSE_TIMEOUT = 3.0
 # They run after every durable-flush close and lose nothing if cut short.
 _POOL_RELEASE_TIMEOUT = 0.5
 
-# The overreach shadow's close cancels its judge jobs rather than draining them, so it needs no SQLite-flush budget.
+# The overreach shadow's close cancels its judge jobs rather than draining them, but its sidecar's close still runs a best-effort WAL checkpoint.
+# A cut at this budget abandons only that compaction; the connection still shuts (shared/src/shared/async_sqlite_base.py::AtomicConnection.close).
 _SHADOW_CLOSE_TIMEOUT = 0.5
 
 # The durable-queue group_id prefix that distinguishes a project's Mem0 writes
@@ -1118,6 +1121,8 @@ async def _check_canonical_uniqueness(
        Compared as a PAIR, not on ``canonical`` alone: a canonical record
        re-homed from topic T to topic U changes no ``canonical`` value but
        is acquiring a claim at U, where it genuinely is not the incumbent.
+       The held claim is read through ``is_canonical``, so a non-bool
+       pre-image (int ``1`` or ``1.0``) is not a held claim and is probed.
     4. the write will not reach Mem0 → return (task 3508).  The seam already
        censused — and under ``enforce`` refused — it as
        ``canonical_on_non_mem0_write``; the probe could only ever count 0.
@@ -1215,7 +1220,7 @@ async def _check_canonical_uniqueness(
     after-the-fact backstop that resolves a duplicate pair.  Do NOT add
     locking here — that would be an unreviewed scope expansion.
     """
-    if meta.get('canonical') is not True:
+    if not is_canonical(meta):
         return
 
     topic = meta.get('topic')
@@ -1225,8 +1230,10 @@ async def _check_canonical_uniqueness(
     # Guard 3 (task 3523) — no NEW claim, no probe.  See the numbered list in
     # the docstring: this is what makes the record's own presence in the
     # store irrelevant, so no `exclude_id` is needed anywhere below.
-    if baseline is not None and (
-        (baseline.get('canonical'), baseline.get('topic')) == (True, topic)
+    if (
+        baseline is not None
+        and is_canonical(baseline)
+        and baseline.get('topic') == topic
     ):
         return
 
@@ -6924,6 +6931,7 @@ class MemoryService:
         _graphiti_error = None
         _mem0_error = None
         _mem0_pending = None
+        _mem0_empty_result: str | None = None
 
         # Graphiti: enqueue via durable queue (async, but durably persisted)
         if write_graphiti:
@@ -7032,19 +7040,24 @@ class MemoryService:
                     payload={'content': content[:200]},
                     coro=self.mem0.add(content=content, scope=scope, metadata=meta),
                 )
-                mem0_ids = [
-                    r['id']
-                    for r in (mem0_result or {}).get('results', [])
-                    if isinstance(r, dict) and 'id' in r
-                ]
-                memory_ids.extend(mem0_ids)
-                stores_written.append(SourceStore.mem0)
-                # In-request call resolved without raising → stamp terminal.
+                mem0_outcome = read_mem0_add_result(
+                    mem0_result,
+                    operation='add',
+                    zero_ids_anomalous=_MEM0_ADD_INFER_PINNED_FALSE,
+                )
+                memory_ids.extend(mem0_outcome.memory_ids)
+                stores_written.extend(mem0_outcome.stores_written)
+                _mem0_empty_result = mem0_outcome.empty_result_error
                 if self._write_journal and intent_id:
-                    await self._write_journal.resolve_mem0_intent(
-                        intent_id, Mem0IntentStatus.COMPLETED
-                    )
-                if not mem0_ids and _MEM0_ADD_INFER_PINNED_FALSE:
+                    if _mem0_empty_result:
+                        await self._write_journal.resolve_mem0_intent(
+                            intent_id, Mem0IntentStatus.FAILED, reason=_mem0_empty_result
+                        )
+                    else:
+                        await self._write_journal.resolve_mem0_intent(
+                            intent_id, Mem0IntentStatus.COMPLETED
+                        )
+                if _mem0_empty_result:
                     # mem0.add() did not raise but returned no results — a silent
                     # dedup/infer no-op drop (task 1974). Under the pinned
                     # infer=False, a successful write always returns exactly one
@@ -7096,8 +7109,8 @@ class MemoryService:
                     'stores': [s.value for s in stores_written],
                     'stores_pending': [s.value for s in stores_pending_retry],
                 },
-                success=not (_graphiti_error or _mem0_error),
-                error=_graphiti_error or _mem0_error,
+                success=not (_graphiti_error or _mem0_error or _mem0_empty_result),
+                error=_graphiti_error or _mem0_error or _mem0_empty_result,
             )
 
         await self._emit_event(ReconciliationEvent(
@@ -7119,6 +7132,8 @@ class MemoryService:
             msg += f' [graphiti_error: {_graphiti_error}]'
         if _mem0_error:
             msg += f' [mem0_error: {_mem0_error}]'
+        if _mem0_empty_result:
+            msg += f' [{_mem0_empty_result}]'
         if _mem0_pending:
             msg += f' [mem0_pending_retry: {_mem0_pending}]'
         if classification_fallback is not None:
@@ -7416,8 +7431,7 @@ class MemoryService:
             find_canonical=self.get_memories_by_metadata,
         )
 
-        mem0_result = None
-        mem0_ids: list[str] = []
+        mem0_outcome = RAISED_MEM0_ADD
         _mem0_error: str | None = None
         try:
             mem0_result = await self._journaled_backend_call(
@@ -7428,11 +7442,9 @@ class MemoryService:
                 payload={'content': content[:200]},
                 coro=self.mem0.add_system_record(content=content, scope=scope, metadata=meta),
             )
-            mem0_ids = [
-                r['id']
-                for r in (mem0_result or {}).get('results', [])
-                if isinstance(r, dict) and 'id' in r
-            ]
+            mem0_outcome = read_mem0_add_result(
+                mem0_result, operation='add_system_record', zero_ids_anomalous=True
+            )
         except Exception as e:
             # Mirrors add_memory's try/except around its Mem0 branch (task
             # 2222 amendment): without this, a raised exception would skip
@@ -7451,11 +7463,9 @@ class MemoryService:
         # empty-result check, task 1974) — and silence is exactly what this
         # guaranteed-persistence system-write path exists to rule out, so it
         # must not be journaled as an unconditional success.
-        _empty_result = not mem0_ids
-        # mem0 is claimed only when it returned an id (task 4045).
-        stores_written: list[SourceStore] = [] if _empty_result else [SourceStore.mem0]
-        _empty_result_error = 'empty_result: mem0 add_system_record returned zero memory_ids'
-        if _empty_result and not _mem0_error:
+        mem0_ids = list(mem0_outcome.memory_ids)
+        stores_written = mem0_outcome.stores_written
+        if mem0_outcome.empty_result_error:
             logger.warning(
                 'MemoryService.add_system_record: mem0 add_system_record '
                 'returned zero memory_ids (silent empty-result drop on the '
@@ -7482,11 +7492,8 @@ class MemoryService:
                     'memory_ids': mem0_ids,
                     'stores': [s.value for s in stores_written],
                 },
-                success=not _empty_result,
-                error=(
-                    _mem0_error if _mem0_error else
-                    (_empty_result_error if _empty_result else None)
-                ),
+                success=mem0_outcome.landed,
+                error=_mem0_error or mem0_outcome.empty_result_error,
             )
 
         # An empty result (whether from a caught exception above or a
@@ -7499,7 +7506,7 @@ class MemoryService:
             'category': resolved_category.value,
             'content_preview': content[:200],
         }
-        if _empty_result:
+        if not mem0_outcome.landed:
             _event_payload['empty_result'] = True
             if _mem0_error:
                 _event_payload['error'] = _mem0_error
@@ -7517,8 +7524,8 @@ class MemoryService:
         msg = f'Memory queued for {[s.value for s in stores_written]}'
         if _mem0_error:
             msg += f' [mem0_error: {_mem0_error}]'
-        elif _empty_result:
-            msg += f' [{_empty_result_error}]'
+        elif mem0_outcome.empty_result_error:
+            msg += f' [{mem0_outcome.empty_result_error}]'
 
         return AddMemoryResponse(
             memory_ids=mem0_ids,
@@ -8574,6 +8581,20 @@ class MemoryService:
             }
             for ep in episodes
         ]
+
+    def earliest_unfinished_graphiti_write_start(self, project_id: str) -> datetime | None:
+        """When the earliest Graphiti write still executing for *project_id* began.
+
+        graphiti_core stamps an episode's created_at when add_episode BEGINS
+        and persists the node only after extraction, so an episode created at
+        or after this instant may not be readable yet. mem0 queue writes run on
+        their own queue group and are never counted.
+        """
+        if self.durable_queue is None:
+            return None
+        return self.durable_queue.earliest_executing_start(
+            Scope(project_id=project_id).graphiti_group_id
+        )
 
     # ------------------------------------------------------------------
     # Read: get_episode_content
@@ -10157,22 +10178,23 @@ class MemoryService:
         verdict, so a combined ``fact`` + ``clear_invalid_at`` call is
         ``verified`` only when *both* readbacks confirm. A pure
         ``invalid_at=<timestamp>`` supersede (no fact, no clear) is not
-        readback-verified — it persists reliably via the same write path
-        used for ``fact``. There is a small TOCTOU window between each save
-        and its readback — if a concurrent writer updates the same edge in
-        that window (another reconciliation cycle, an interactive agent, or
-        a retry) the readback may return a different value and ``verified``
-        will be ``False`` even though *our* save did persist.  This is a
-        known false-negative mode; reconciliation is mostly single-writer
-        per edge so it is rare in practice.  Undercounting ``edges_updated``
-        (the conservative outcome) is safer than overcounting, so the
-        behaviour is intentional.  Both readbacks (``get_edge_text`` and
-        ``get_edge_invalid_at``) resolve their Cypher through the same
-        per-``group_id`` graph object (``GraphitiBackend._graph_for``) that
-        the backend's explicit ``clear_invalid_at`` write uses, so
-        read-after-write consistency for *our own* write is expected within
-        that connection — the TOCTOU risk above is about a *different*
-        writer racing us, not about our own write lagging its readback.
+        readback-verified — it is the same targeted ``SET e.invalid_at``
+        write the clear uses, only without a readback. There is a small
+        TOCTOU window between each save and its readback — if a concurrent
+        writer updates the same edge in that window (another reconciliation
+        cycle, an interactive agent, or a retry) the readback may return a
+        different value and ``verified`` will be ``False`` even though *our*
+        save did persist.  This is a known false-negative mode; reconciliation
+        is mostly single-writer per edge so it is rare in practice.
+        Undercounting ``edges_updated`` (the conservative outcome) is safer
+        than overcounting, so the behaviour is intentional.  Both readbacks
+        (``get_edge_text`` and ``get_edge_invalid_at``) resolve their Cypher
+        through the same per-``group_id`` graph object
+        (``GraphitiBackend._graph_for``) that the backend's targeted
+        ``invalid_at`` write uses, so read-after-write consistency for
+        *our own* write is expected within that connection — the TOCTOU risk
+        above is about a *different* writer racing us, not about our own
+        write lagging its readback.
         """
         if fact is None and invalid_at is None and not clear_invalid_at:
             raise ValueError('update_edge requires fact, invalid_at, or clear_invalid_at to be set')
@@ -11563,6 +11585,7 @@ class MemoryService:
 
         # Graphiti connectivity + project discovery
         graphiti_counts: dict[str, int] = {}
+        graphiti_status: dict[str, Any]
         try:
             graphs = await self.graphiti.list_graphs()
             for graph_name in graphs:
@@ -11570,9 +11593,11 @@ class MemoryService:
                     graphiti_counts[graph_name] = await self.graphiti.node_count(graph_name)
                 except Exception:
                     graphiti_counts[graph_name] = -1
-            status['graphiti'] = {'connected': True}
+            graphiti_status = {'connected': True}
         except Exception as e:
-            status['graphiti'] = {'connected': False, 'error': str(e)}
+            graphiti_status = {'connected': False, 'error': str(e)}
+        graphiti_status['server_settings'] = (await self.graphiti.read_server_settings()).to_status()
+        status['graphiti'] = graphiti_status
 
         # Mem0 connectivity + project discovery
         mem0_counts: dict[str, int] = {}

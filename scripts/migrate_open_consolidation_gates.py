@@ -62,6 +62,7 @@ import check_consolidation_closure as closure_cli
 from _task_db_scan import TaskDbUnreadable, connect_ro, decode_metadata, tasks_db_path
 from escalation.categories import EscalationCategory
 from escalation.queue import EscalationQueue
+from fused_memory.canonical_marker import is_canonical
 from fused_memory.reconciliation.consolidation_auto import (
     AutoOutcome,
     AutoProposal,
@@ -462,7 +463,7 @@ def _gate_category(
 
 
 def _is_incumbent(metadata: Mapping[str, Any], topic: str) -> bool:
-    return metadata.get('canonical') is True and metadata.get('topic') == topic
+    return is_canonical(metadata) and metadata.get('topic') == topic
 
 
 def _verdict_reasons(verdict: AutoVerdict) -> tuple[Reason, ...]:
