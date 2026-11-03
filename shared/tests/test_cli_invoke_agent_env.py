@@ -1,4 +1,4 @@
-"""The non-sandbox Claude spawn path hands its child exactly one credential.
+"""The non-sandbox Claude spawn path hands its child one credential and no Python-env selection.
 
 ``shared.cli_invoke.invoke_claude_agent`` is the path fused-memory
 reconciliation and the legibility runner use. The spawning process holds the
@@ -104,3 +104,29 @@ async def test_child_inherits_only_its_session_credential(
     assert env['CLAUDE_CODE_OAUTH_TOKEN'] == expected_credential
     assert {k for k in env if _credential_shaped(k)} == {'CLAUDE_CODE_OAUTH_TOKEN'}
     assert os.environ['CLAUDE_OAUTH_TOKEN_A'] == POOL_A, 'the parent keeps its pool'
+
+
+async def test_child_inherits_no_python_env_selection(child_env, tmp_path, monkeypatch):
+    original_path = os.environ['PATH']
+    orch_venv = tmp_path / 'orch-venv'
+    monkeypatch.setenv('VIRTUAL_ENV', str(orch_venv))
+    monkeypatch.setenv('UV_PROJECT_ENVIRONMENT', str(orch_venv))
+    monkeypatch.setenv('UV_RUN_RECURSION_DEPTH', '1')
+    monkeypatch.setenv('PATH', str(orch_venv / 'bin') + os.pathsep + original_path)
+    workdir = tmp_path / 'work'
+    workdir.mkdir()
+
+    result = await invoke_claude_agent(
+        prompt='hi',
+        system_prompt='s',
+        cwd=workdir,
+        model='opus',
+        max_turns=1,
+        max_budget_usd=0.01,
+    )
+    assert result.success, f'fake claude dispatch did not succeed: {result!r}'
+    env = child_env()
+
+    for name in ('VIRTUAL_ENV', 'UV_PROJECT_ENVIRONMENT', 'UV_RUN_RECURSION_DEPTH'):
+        assert name not in env
+    assert env['PATH'].split(os.pathsep) == original_path.split(os.pathsep)

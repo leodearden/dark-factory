@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 import uuid
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -14,12 +14,18 @@ from typing import TYPE_CHECKING, Any, get_type_hints
 from shared.sqlite_column_migration import add_column_if_missing_sync
 from shared.sqlite_sync_base import CheckpointResult, apply_full_durability_pragmas_sync
 
+from orchestrator.pause_policy import (
+    STORED_EWA_PREDICATE_CLASSES,
+    PauseClass,
+    stored_pause_class,
+)
 from orchestrator.shadow_types import (
     CostBasis,
     PlanSource,
     ReferenceKind,
     ShadowCellState,
     ShadowShape,
+    ShadowStormCause,
 )
 from orchestrator.workflow_types import WorkflowOutcome
 
@@ -32,10 +38,20 @@ logger = logging.getLogger(__name__)
 _BLANK_CHARS = ' \t\n\r'
 _STRATUM_SEPARATOR = '×'
 _SHADOW_CELL_DEFAULT_OWNER = 'shadow_coordinator'
+_SHADOW_CELL_TIME_COLUMNS = (
+    'opened_at', 'settle_deadline', 'running_at', 'run_ended_at', 'settled_at',
+)
 
 
 def _is_blank(text: str | None) -> bool:
     return text is None or not text.strip(_BLANK_CHARS)
+
+
+def _utc_iso(moment: datetime) -> str:
+    """The one stored text form of an instant, so stored times compare as text."""
+    if moment.utcoffset() is None:
+        raise ValueError(f'a stored instant must be timezone-aware (got naive {moment!r})')
+    return moment.astimezone(UTC).isoformat()
 
 
 @dataclass(frozen=True)
@@ -65,6 +81,7 @@ class ShadowCell:
     cost_credits: float = 0.0
     run_id: str | None = None
     running_at: datetime | None = None
+    run_ended_at: datetime | None = None
     settled_at: datetime | None = None
     owner: str = _SHADOW_CELL_DEFAULT_OWNER
 
@@ -88,7 +105,7 @@ class ShadowCell:
             self._refuse(f'parent_cell_id must differ from cell_id (got {self.parent_cell_id!r})')
 
     def _check_timestamps(self) -> None:
-        for name in ('opened_at', 'settle_deadline', 'running_at', 'settled_at'):
+        for name in _SHADOW_CELL_TIME_COLUMNS:
             value = getattr(self, name)
             if value is not None and value.utcoffset() is None:
                 self._refuse(f'{name} must be timezone-aware (got naive {value!r})')
@@ -149,6 +166,7 @@ CREATE TABLE IF NOT EXISTS shadow_cells (
     run_id          TEXT,
     opened_at       TEXT NOT NULL,
     running_at      TEXT,
+    run_ended_at    TEXT,
     settled_at      TEXT,
     settle_deadline TEXT NOT NULL,
     owner           TEXT NOT NULL DEFAULT '{_SHADOW_CELL_DEFAULT_OWNER}',
@@ -158,6 +176,21 @@ CREATE TABLE IF NOT EXISTS shadow_cells (
     CHECK (cost_usd >= 0 AND cost_credits >= 0),
     CHECK (trim(owner, {_SQL_BLANK_CHARS}) <> ''),
     CHECK (parent_cell_id IS NULL OR parent_cell_id <> cell_id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_shadow_cells_one_per_triple
+    ON shadow_cells(project_id, task_id, shape, candidate);
+
+CREATE INDEX IF NOT EXISTS idx_shadow_cells_project_state
+    ON shadow_cells(project_id, state);
+
+CREATE TABLE IF NOT EXISTS shadow_storm (
+    project_id  TEXT PRIMARY KEY,
+    cause       TEXT,
+    detail      TEXT,
+    paused_at   TEXT,
+    resumed_at  TEXT,
+    CHECK ((cause IS NULL) = (paused_at IS NULL))
 );
 """
 
@@ -169,7 +202,6 @@ _SHADOW_CELL_ENUM_COLUMNS: dict[str, type[StrEnum]] = {
     'plan_source': PlanSource,
     'reference_kind': ReferenceKind,
 }
-_SHADOW_CELL_TIME_COLUMNS = ('opened_at', 'settle_deadline', 'running_at', 'settled_at')
 _SHADOW_CELL_PATH_COLUMNS = ('worktree_path', 'result_path')
 _PARENT_SHARED_COLUMNS = ('project_id', 'task_id', 'base_sha')
 
@@ -179,7 +211,7 @@ def _shadow_cell_to_row(cell: ShadowCell) -> dict[str, Any]:
     for name in _SHADOW_CELL_ENUM_COLUMNS:
         row[name] = None if row[name] is None else row[name].value
     for name in _SHADOW_CELL_TIME_COLUMNS:
-        row[name] = None if row[name] is None else row[name].astimezone(UTC).isoformat()
+        row[name] = None if row[name] is None else _utc_iso(row[name])
     for name in _SHADOW_CELL_PATH_COLUMNS:
         row[name] = None if row[name] is None else str(row[name])
     row['stratum'] = _STRATUM_SEPARATOR.join(cell.stratum)
@@ -235,6 +267,180 @@ def _require_valid_parent(conn: sqlite3.Connection, cell: ShadowCell) -> None:
                 f'{column}={getattr(cell, column)!r}; a child cell shares its '
                 f"parent's project, task and base"
             )
+
+
+@dataclass(frozen=True)
+class ShadowCellQuery:
+    """A ``find_shadow_cells`` filter: every unset field matches every cell of the project."""
+
+    project_id: str
+    states: frozenset[ShadowCellState] | None = None
+    task_id: str | None = None
+    shape: ShadowShape | None = None
+    candidate: str | None = None
+    run_id: str | None = None
+    opened_since: datetime | None = None
+    run_ended_since: datetime | None = None
+    deadline_before: datetime | None = None
+    newest_first: bool = False
+    limit: int | None = None
+
+    def __post_init__(self) -> None:
+        if _is_blank(self.project_id):
+            raise ValueError(f'ShadowCellQuery: project_id must be non-blank (got {self.project_id!r})')
+        if self.states is not None and not self.states:
+            raise ValueError('ShadowCellQuery: states must be None (any state) or non-empty')
+        if self.limit is not None and self.limit < 1:
+            raise ValueError(f'ShadowCellQuery: limit must be None or >= 1 (got {self.limit!r})')
+
+
+# (query field, SQL condition) — each *_since is inclusive, deadline_before strict.
+_SHADOW_CELL_QUERY_FILTERS = (
+    ('task_id', 'task_id = ?'),
+    ('shape', 'shape = ?'),
+    ('candidate', 'candidate = ?'),
+    ('run_id', 'run_id = ?'),
+    ('opened_since', 'opened_at >= ?'),
+    ('run_ended_since', 'run_ended_at >= ?'),
+    ('deadline_before', 'settle_deadline < ?'),
+)
+
+
+def _query_param(value: str | datetime) -> str:
+    return _utc_iso(value) if isinstance(value, datetime) else str(value)
+
+
+def _find_shadow_cells_sql(query: ShadowCellQuery) -> tuple[str, list[Any]]:
+    conditions = ['project_id = ?']
+    params: list[Any] = [query.project_id]
+    if query.states is not None:
+        values = sorted(state.value for state in query.states)
+        conditions.append(f'state IN ({", ".join("?" for _ in values)})')
+        params.extend(values)
+    for field_name, condition in _SHADOW_CELL_QUERY_FILTERS:
+        value = getattr(query, field_name)
+        if value is not None:
+            conditions.append(condition)
+            params.append(_query_param(value))
+    direction = 'DESC' if query.newest_first else 'ASC'
+    sql = (
+        f'SELECT * FROM shadow_cells WHERE {" AND ".join(conditions)} '
+        f'ORDER BY opened_at {direction}, cell_id {direction}'
+    )
+    if query.limit is not None:
+        sql += ' LIMIT ?'
+        params.append(query.limit)
+    return sql, params
+
+
+@dataclass(frozen=True)
+class CellChange:
+    """One requested transition of a stored cell; an unset field keeps the stored value.
+
+    Only a ``settled`` change carries a reference, and it must be coherent: a
+    ``landed`` reference names its sha, a ``none`` reference names none.
+    """
+
+    state: ShadowCellState
+    at: datetime
+    worktree_path: Path | None = None
+    result_path: Path | None = None
+    cost_usd: float | None = None
+    cost_credits: float | None = None
+    reason: str | None = None
+    reference_kind: ReferenceKind | None = None
+    reference_sha: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.state is ShadowCellState.SETTLED:
+            self._check_reference()
+        elif self.reference_kind is not None or self.reference_sha is not None:
+            self._refuse(
+                f'reference fields belong only to a {ShadowCellState.SETTLED.value!r} change '
+                f'(got reference_kind={self.reference_kind!r}, reference_sha={self.reference_sha!r})'
+            )
+
+    def _check_reference(self) -> None:
+        if self.reference_kind is None:
+            self._refuse('a settled change requires a reference_kind')
+        if self.reference_kind is ReferenceKind.LANDED and _is_blank(self.reference_sha):
+            self._refuse(f'a landed reference requires a non-blank reference_sha (got {self.reference_sha!r})')
+        if self.reference_kind is ReferenceKind.NONE and self.reference_sha is not None:
+            self._refuse(f'a none reference carries no reference_sha (got {self.reference_sha!r})')
+
+    def _refuse(self, invariant: str) -> None:
+        raise ValueError(f'CellChange to {self.state.value!r}: {invariant}')
+
+
+_CELL_CHANGE_CARRIED_FIELDS = tuple(
+    field.name for field in fields(CellChange) if field.name not in ('state', 'at')
+)
+
+
+def _successor_cell(cell: ShadowCell, change: CellChange) -> ShadowCell:
+    """The cell after *change*; ``replace`` re-runs every ``ShadowCell`` invariant."""
+    carried: dict[str, Any] = {
+        name: getattr(change, name)
+        for name in _CELL_CHANGE_CARRIED_FIELDS
+        if getattr(change, name) is not None
+    }
+    if change.state is ShadowCellState.RUNNING:
+        carried['running_at'] = change.at
+    if change.state.stamps_run_ended_at:
+        carried['run_ended_at'] = change.at
+    if change.state.stamps_settled_at:
+        carried['settled_at'] = change.at
+    return replace(cell, state=change.state, **carried)
+
+
+_ADVANCE_SHADOW_CELL_SQL = (
+    'UPDATE shadow_cells SET '
+    + ', '.join(f'{name} = :{name}' for name in _SHADOW_CELL_COLUMNS if name != 'cell_id')
+    + ' WHERE cell_id = :cell_id AND state = :expected_state'
+)
+
+
+@dataclass(frozen=True)
+class ShadowStormRecord:
+    """A project's ``shadow_storm`` row: shadow evaluation is paused while ``cause`` is set."""
+
+    project_id: str
+    cause: ShadowStormCause | None
+    detail: str | None
+    paused_at: datetime | None
+    resumed_at: datetime | None
+
+    def __post_init__(self) -> None:
+        if (self.cause is None) != (self.paused_at is None):
+            raise ValueError(
+                f'ShadowStormRecord {self.project_id!r}: cause and paused_at are set together '
+                f'(got cause={self.cause!r}, paused_at={self.paused_at!r})'
+            )
+
+    @property
+    def paused(self) -> bool:
+        return self.cause is not None
+
+
+def _optional_instant(raw: str | None) -> datetime | None:
+    return None if raw is None else datetime.fromisoformat(raw)
+
+
+def _read_shadow_storm(conn: sqlite3.Connection, project_id: str) -> ShadowStormRecord:
+    row = conn.execute(
+        'SELECT cause, detail, paused_at, resumed_at FROM shadow_storm WHERE project_id = ?',
+        (project_id,),
+    ).fetchone()
+    if row is None:
+        return ShadowStormRecord(project_id, None, None, None, None)
+    cause, detail, paused_at, resumed_at = row
+    return ShadowStormRecord(
+        project_id=project_id,
+        cause=None if cause is None else ShadowStormCause(cause),
+        detail=detail,
+        paused_at=_optional_instant(paused_at),
+        resumed_at=_optional_instant(resumed_at),
+    )
 
 
 @dataclass(frozen=True)
@@ -351,7 +557,14 @@ CREATE TABLE IF NOT EXISTS scheduler_state (
     -- class as operator evidence.  Nullable on purpose: NULL means "row
     -- predates task 4559", which the restart predicate treats as unknowable
     -- and therefore restores the halt blind.
-    ewa_value      REAL
+    ewa_value      REAL,
+    -- Task 4686: the hold's pause_policy.PauseClass value, its owner and its
+    -- ISO expiry.  Declared last because ALTER can only append (migrated by
+    -- _migrate_scheduler_state_hold_columns); a NULL pause_class reads as
+    -- operator.
+    pause_class    TEXT,
+    hold_owner     TEXT,
+    expires_at     TEXT
 );
 
 -- Task 5812: the last COLD main-tip sweep that reached a verdict.
@@ -401,7 +614,9 @@ class RunStore:
             # already-deployed runs.db needs the explicit ALTER.
             self._migrate_task_results_block_context(conn)
             self._migrate_scheduler_state_ewa_value(conn)
+            self._migrate_scheduler_state_hold_columns(conn)
             self._migrate_runs_code_sha(conn)
+            self._migrate_shadow_cells_run_ended_at(conn)
         finally:
             conn.close()
 
@@ -464,6 +679,34 @@ class RunStore:
             conn.commit()
             logger.info('RunStore: migrated scheduler_state — added ewa_value')
 
+    def _migrate_scheduler_state_hold_columns(self, conn: sqlite3.Connection) -> None:
+        """Add ``pause_class``/``hold_owner``/``expires_at`` to a pre-4686 ``scheduler_state``.
+
+        Same shape as :meth:`_migrate_scheduler_state_ewa_value`; a NULL
+        ``pause_class`` reads as operator via ``pause_policy.stored_pause_class``.
+        """
+        existing = {row[1] for row in conn.execute('PRAGMA table_info(scheduler_state)')}
+        added = []
+        for column in ('pause_class', 'hold_owner', 'expires_at'):
+            if column in existing:
+                continue
+            try:
+                # Column name is a hard-coded literal, never caller input.
+                conn.execute(f'ALTER TABLE scheduler_state ADD COLUMN {column} TEXT')
+            except sqlite3.OperationalError as exc:
+                if 'duplicate column name' not in str(exc).lower():
+                    raise
+                logger.debug(
+                    'RunStore: scheduler_state.%s already added concurrently', column,
+                )
+                continue
+            added.append(column)
+        if added:
+            conn.commit()
+            logger.info(
+                'RunStore: migrated scheduler_state — added %s', ', '.join(added)
+            )
+
     def _migrate_runs_code_sha(self, conn: sqlite3.Connection) -> None:
         """Add ``code_sha`` to a pre-6565 ``runs``.
 
@@ -474,6 +717,16 @@ class RunStore:
         if add_column_if_missing_sync(conn, 'runs', 'code_sha', 'TEXT'):
             conn.commit()
             logger.info('RunStore: migrated runs — added code_sha')
+
+    def _migrate_shadow_cells_run_ended_at(self, conn: sqlite3.Connection) -> None:
+        """Add ``run_ended_at`` to a pre-5387 ``shadow_cells``.
+
+        Same shape as :meth:`_migrate_runs_code_sha`. An existing row reads
+        NULL, meaning "the run had not ended, or ended before task 5387".
+        """
+        if add_column_if_missing_sync(conn, 'shadow_cells', 'run_ended_at', 'TEXT'):
+            conn.commit()
+            logger.info('RunStore: migrated shadow_cells — added run_ended_at')
 
     def start_run(
         self,
@@ -704,34 +957,53 @@ class RunStore:
         pause_at_iso: str,
         set_by_run_id: str,
         ewa_value: float | None = None,
+        *,
+        pause_class: PauseClass,
+        hold_owner: str | None = None,
+        expires_at: datetime | None = None,
     ) -> None:
         """Persist (or replace) the scheduler pause state for *project_id*.
 
         Uses INSERT OR REPLACE so repeated saves are idempotent — the most
         recent call wins, matching UPSERT semantics.
 
-        *ewa_value* (task 4559) is the live EWA at pause time, recorded for
-        EVERY pause class as operator evidence rather than as a trip flag — the
-        pause CLASS is carried by *reason*.  Keyword-defaulted to ``None`` so
-        every existing call site and ``MagicMock(spec=RunStore)`` spy stays
-        valid; ``None`` stores NULL, which reads back as "predates task 4559".
+        *pause_class* is required: every persisted hold carries its class
+        (PRD §6 invariant 4).  *ewa_value* (task 4559) is the live EWA at pause
+        time, recorded for every class as operator evidence; ``None`` stores
+        NULL, which reads back as "predates task 4559".  *expires_at* must be
+        timezone-aware.
+
+        Raises:
+            ValueError: *expires_at* is naive; nothing is written.
         """
+        if expires_at is not None and expires_at.tzinfo is None:
+            raise ValueError(
+                f'expires_at must be timezone-aware; got naive {expires_at.isoformat()!r}'
+            )
         conn = self._connect()
         try:
             conn.execute(
                 'INSERT OR REPLACE INTO scheduler_state '
-                '(project_id, pause_reason, pause_at, set_by_run_id, ewa_value) '
-                'VALUES (?, ?, ?, ?, ?)',
-                (project_id, reason, pause_at_iso, set_by_run_id, ewa_value),
+                '(project_id, pause_reason, pause_at, set_by_run_id, ewa_value, '
+                ' pause_class, hold_owner, expires_at) '
+                'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                (
+                    project_id, reason, pause_at_iso, set_by_run_id, ewa_value,
+                    pause_class.value,
+                    hold_owner,
+                    expires_at.isoformat() if expires_at is not None else None,
+                ),
             )
             conn.commit()
         finally:
             conn.close()
 
     def refresh_scheduler_pause_ewa(self, project_id: str, ewa_value: float) -> bool:
-        """Update ONLY ``ewa_value``, and only on a held ``ewa_trip_`` pause row.
+        """Update ONLY ``ewa_value``, and only on a held row whose stored EWA is its predicate.
 
-        Returns True if such a row existed and was updated.
+        Returns True if such a row existed and was updated.  Which classes
+        qualify is ``pause_policy.STORED_EWA_PREDICATE_CLASSES`` (today:
+        ewa_rate alone).
 
         Task 4559 amendment.  ``save_scheduler_pause`` writes a trip-TIME
         snapshot, and it is the only writer, so once a halt is asserted the
@@ -751,32 +1023,25 @@ class RunStore:
         ``set_by_run_id`` are left untouched so the row keeps recording WHEN
         and WHY the halt was asserted while ``ewa_value`` tracks the live
         statistic.  The bool return lets the caller distinguish "refreshed"
-        from "no ``ewa_trip_`` row to refresh" without a second read.
+        from "no qualifying row to refresh" without a second read.
 
-        The ``ewa_trip_`` scope is enforced HERE, in the WHERE clause, not only
-        at the call site.  ``_maybe_write_digest`` step (13b) does pre-filter on
-        ``scheduler.pause_reason``, but that is the IN-MEMORY reason and the two
-        can diverge: ``Scheduler.pause`` is first-wins in memory while
-        ``save_scheduler_pause`` is INSERT OR REPLACE, i.e. last-wins on disk.
-        A held ``ewa_trip_`` halt plus a later ``pause_scheduler('park-stop: …')``
-        — an in-memory no-op that still rewrites the row — would otherwise let
-        every subsequent digest step overwrite that park-stop row's trip-time
-        ``ewa_value`` with the decaying EWA, destroying the forensic evidence
-        ``pause_scheduler`` promises is never overwritten for non-EWA classes.
-        For ``ewa_trip_`` rows alone the stored scalar IS the live statistic;
-        for every other class it is evidence about that pause.
+        The class scope is enforced HERE, in the WHERE clause, not only at the
+        call site.  ``_maybe_write_digest`` step (13b) pre-filters on the
+        IN-MEMORY ``scheduler.pause_class``, which is first-wins, while this
+        row is last-wins (INSERT OR REPLACE): a held ewa_rate halt plus a later
+        park-stop ``pause_scheduler`` leaves memory saying ewa_rate over a
+        park_stop row.  For a qualifying class alone the stored scalar IS the
+        live statistic; for every other class (and a legacy NULL-class row, which
+        reads as operator) it is evidence about that pause and is kept.
         """
+        predicate_values = sorted(c.value for c in STORED_EWA_PREDICATE_CLASSES)
+        placeholders = ', '.join('?' * len(predicate_values))
         conn = self._connect()
         try:
-            # substr(...) rather than LIKE 'ewa_trip_%': in SQL LIKE, `_` is a
-            # single-character WILDCARD, so that pattern would also match
-            # reasons like 'ewaXtripY...'.  substr is an exact prefix test and
-            # mirrors the caller's Python `startswith('ewa_trip_')` byte for
-            # byte.  len('ewa_trip_') == 9.
             cursor = conn.execute(
                 'UPDATE scheduler_state SET ewa_value = ? '
-                "WHERE project_id = ? AND substr(pause_reason, 1, 9) = 'ewa_trip_'",
-                (ewa_value, project_id),
+                f'WHERE project_id = ? AND pause_class IN ({placeholders})',
+                (ewa_value, project_id, *predicate_values),
             )
             conn.commit()
             return cursor.rowcount > 0
@@ -786,15 +1051,18 @@ class RunStore:
     def load_scheduler_pause(self, project_id: str) -> dict | None:
         """Return the persisted pause record for *project_id*, or ``None``.
 
-        Returns a dict with keys ``reason``, ``pause_at``, ``set_by_run_id``
-        and ``ewa_value`` (task 4559; ``None`` for a row written before that
-        migration).
+        Returns a dict with keys ``reason``, ``pause_at``, ``set_by_run_id``,
+        ``ewa_value`` (task 4559; ``None`` for a row written before that
+        migration), ``pause_class`` (a :class:`PauseClass`; a NULL or
+        unrecognised stored value reads as operator), ``hold_owner`` and
+        ``expires_at`` (an aware ``datetime`` or ``None``).
         """
         conn = self._connect()
         try:
             conn.row_factory = sqlite3.Row
             row = conn.execute(
-                'SELECT pause_reason, pause_at, set_by_run_id, ewa_value '
+                'SELECT pause_reason, pause_at, set_by_run_id, ewa_value, '
+                '       pause_class, hold_owner, expires_at '
                 'FROM scheduler_state WHERE project_id = ?',
                 (project_id,),
             ).fetchone()
@@ -807,6 +1075,12 @@ class RunStore:
             'pause_at': row['pause_at'],
             'set_by_run_id': row['set_by_run_id'],
             'ewa_value': row['ewa_value'],
+            'pause_class': stored_pause_class(row['pause_class']),
+            'hold_owner': row['hold_owner'],
+            'expires_at': (
+                datetime.fromisoformat(row['expires_at'])
+                if row['expires_at'] is not None else None
+            ),
         }
 
     def clear_scheduler_pause(self, project_id: str) -> None:
@@ -892,3 +1166,108 @@ class RunStore:
         finally:
             conn.close()
         return None if row is None else _shadow_cell_from_row(row)
+
+    def find_shadow_cells(self, query: ShadowCellQuery) -> list[ShadowCell]:
+        """This project's cells matching *query*, by ``opened_at`` (oldest first unless asked)."""
+        sql, params = _find_shadow_cells_sql(query)
+        conn = self._connect()
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(sql, params).fetchall()
+        finally:
+            conn.close()
+        return [_shadow_cell_from_row(row) for row in rows]
+
+    def advance_shadow_cell(
+        self, cell_id: str, *, expected: ShadowCellState, change: CellChange,
+    ) -> ShadowCell | None:
+        """Move a cell from *expected* to ``change.state``: the one transition choke point.
+
+        Returns the stored successor, or ``None`` with nothing written when the
+        stored state is no longer *expected* (a lost compare-and-set). An
+        unknown cell raises ``KeyError``; a transition the successor table
+        forbids, or a successor breaking a row invariant, raises ``ValueError``.
+        Entering ``running`` stamps ``running_at``; entering a state that
+        ``stamps_run_ended_at`` stamps ``run_ended_at``; entering a state that
+        ``stamps_settled_at`` stamps ``settled_at``, and nothing else does.
+        """
+        conn = self._connect()
+        conn.row_factory = sqlite3.Row
+        try:
+            with conn:
+                conn.execute('BEGIN IMMEDIATE')
+                row = conn.execute(
+                    'SELECT * FROM shadow_cells WHERE cell_id = ?', (cell_id,)
+                ).fetchone()
+                if row is None:
+                    raise KeyError(f'shadow cell {cell_id!r} is not stored')
+                if not expected.may_become(change.state):
+                    raise ValueError(
+                        f'shadow cell {cell_id!r}: {expected.value!r} may not become '
+                        f'{change.state.value!r}'
+                    )
+                stored = _shadow_cell_from_row(row)
+                if stored.state is not expected:
+                    return None
+                successor = _successor_cell(stored, change)
+                conn.execute(
+                    _ADVANCE_SHADOW_CELL_SQL,
+                    {**_shadow_cell_to_row(successor), 'expected_state': expected.value},
+                )
+        finally:
+            conn.close()
+        return successor
+
+    # ------------------------------------------------------------------ #
+    # Shadow-eval storm pause (plans/live-shadow-eval-prd.md C2, task 5387) #
+    # ------------------------------------------------------------------ #
+
+    def get_shadow_storm(self, project_id: str) -> ShadowStormRecord:
+        """*project_id*'s storm record; a never-paused project reads an all-``None`` record."""
+        conn = self._connect()
+        try:
+            return _read_shadow_storm(conn, project_id)
+        finally:
+            conn.close()
+
+    def pause_shadow_storm(
+        self, project_id: str, cause: ShadowStormCause, detail: str, at: datetime,
+    ) -> bool:
+        """Pause *project_id*; True only for the call that created the pause.
+
+        While a pause stands a further call changes nothing, so the first
+        cause is kept and only its creator files the escalation.
+        """
+        conn = self._connect()
+        try:
+            with conn:
+                conn.execute('BEGIN IMMEDIATE')
+                if _read_shadow_storm(conn, project_id).paused:
+                    return False
+                conn.execute(
+                    'INSERT INTO shadow_storm (project_id, cause, detail, paused_at) '
+                    'VALUES (?, ?, ?, ?) ON CONFLICT(project_id) DO UPDATE SET '
+                    'cause = excluded.cause, detail = excluded.detail, '
+                    'paused_at = excluded.paused_at',
+                    (project_id, cause.value, detail, _utc_iso(at)),
+                )
+        finally:
+            conn.close()
+        return True
+
+    def resume_shadow_storm(self, project_id: str, at: datetime) -> bool:
+        """Lift *project_id*'s pause and record *at* as ``resumed_at``; True if one stood."""
+        conn = self._connect()
+        try:
+            with conn:
+                conn.execute('BEGIN IMMEDIATE')
+                if not _read_shadow_storm(conn, project_id).paused:
+                    return False
+                conn.execute(
+                    'UPDATE shadow_storm SET cause = NULL, detail = NULL, paused_at = NULL, '
+                    'resumed_at = ? WHERE project_id = ?',
+                    (_utc_iso(at), project_id),
+                )
+        finally:
+            conn.close()
+        return True

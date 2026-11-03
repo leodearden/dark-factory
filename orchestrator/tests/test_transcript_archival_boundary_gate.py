@@ -229,6 +229,7 @@ def _archive_files(git_repo: Path) -> set[str]:
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("code_default_config")
 class TestE1ArchivedAtCompletion:
     """E1 — running a role to completion archives its transcript to the durable
     root OUTSIDE the worktree, byte-verbatim, with no credential alongside.
@@ -241,9 +242,8 @@ class TestE1ArchivedAtCompletion:
     """
 
     async def test_completed_session_lands_in_the_durable_archive(
-        self, monkeypatch, git_repo, git_ops, task_assignment
+        self, git_repo, git_ops, task_assignment
     ):
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = _config(git_repo)  # transcript_archive enabled by default
         workflow, cwd = await _make_transcript_workflow(config, git_ops, task_assignment)
         transcript_bytes = b'{"type":"user","cwd":"/tmp/x"}\n{"type":"assistant"}\n'
@@ -281,7 +281,7 @@ class TestE1ArchivedAtCompletion:
         assert (config_dir.path / '.credentials.json').exists()
 
     async def test_kill_switch_leaves_the_archive_root_uncreated(
-        self, monkeypatch, git_repo, git_ops, task_assignment
+        self, git_repo, git_ops, task_assignment
     ):
         """KILL-SWITCH CONTROL for the row above — the PRODUCER caused that
         archive, not the tmp layout.
@@ -293,7 +293,6 @@ class TestE1ArchivedAtCompletion:
         documented green-tier kill switch would be untested at the integrated
         level.
         """
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = _config(git_repo, transcript_archive={'enabled': False})
         assert config.transcript_archive.enabled is False
         workflow, cwd = await _make_transcript_workflow(config, git_ops, task_assignment)
@@ -339,6 +338,7 @@ def _grow_and_advance(src: Path, dest: Path, extra: bytes) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("code_default_config")
 class TestE6ResumeReArchives:
     """E6 — a resumed session's GROWN transcript replaces its earlier archive.
 
@@ -350,9 +350,8 @@ class TestE6ResumeReArchives:
     """
 
     async def test_grown_transcript_replaces_its_earlier_archive(
-        self, monkeypatch, git_repo, git_ops, task_assignment
+        self, git_repo, git_ops, task_assignment
     ):
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = _config(git_repo)
         workflow, cwd = await _make_transcript_workflow(config, git_ops, task_assignment)
 
@@ -401,7 +400,7 @@ class TestE6ResumeReArchives:
         assert _archive_files(git_repo) == {f'{TASK_ID}/{ENC}/{sid}.jsonl'}
 
     async def test_same_second_grow_is_deliberately_skipped(
-        self, monkeypatch, git_repo, git_ops, task_assignment
+        self, git_repo, git_ops, task_assignment
     ):
         """STALE-MTIME CONTROL for the row above — the skip is INTENTIONAL.
 
@@ -419,7 +418,6 @@ class TestE6ResumeReArchives:
         the archived copy's exact value after the append) rather than raced
         against the clock, so the control is deterministic.
         """
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = _config(git_repo)
         workflow, cwd = await _make_transcript_workflow(config, git_ops, task_assignment)
 
@@ -453,6 +451,7 @@ class TestE6ResumeReArchives:
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("code_default_config")
 class TestE2SurvivesTeardown:
     """E2 — the user-observable claim of PRD §1.1: run a task to done, let the
     worktree be removed, and confirm the transcripts remain.
@@ -465,9 +464,8 @@ class TestE2SurvivesTeardown:
     """
 
     async def test_producer_archive_outlives_the_worktree(
-        self, monkeypatch, git_repo, git_ops, task_assignment
+        self, git_repo, git_ops, task_assignment
     ):
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = _config(git_repo)
         workflow, cwd = await _make_transcript_workflow(config, git_ops, task_assignment)
         transcript_bytes = b'{"type":"user"}\n{"type":"assistant"}\n'
@@ -525,6 +523,7 @@ class TestE2SurvivesTeardown:
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("code_default_config")
 class TestE3BackstopIdempotent:
     """E3 — at teardown the β backstop archives what the producer MISSED and
     leaves what the producer already archived byte-, mtime- and inode-identical.
@@ -538,9 +537,8 @@ class TestE3BackstopIdempotent:
     """
 
     async def test_backstop_archives_the_missing_and_skips_the_present(
-        self, monkeypatch, git_repo, task_assignment
+        self, git_repo, task_assignment
     ):
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = _config(git_repo)
         # ARMED GitOps — unlike every other row's fixture, this one carries the
         # live submodel, so the β backstop actually fires at teardown.
@@ -622,6 +620,7 @@ _PRODUCER_HOOK_WARNING = 'Transcript archival hook failed'
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("code_default_config")
 class TestE7FailureIsSoftAndLoud:
     """E7 — a broken archive destination never breaks the task, and never
     fails silently.
@@ -640,9 +639,8 @@ class TestE7FailureIsSoftAndLoud:
     """
 
     async def test_broken_archive_root_neither_breaks_nor_silences(
-        self, monkeypatch, caplog, git_repo, git_ops, task_assignment
+        self, caplog, git_repo, git_ops, task_assignment
     ):
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = _config(git_repo)
         workflow, cwd = await _make_transcript_workflow(config, git_ops, task_assignment)
 

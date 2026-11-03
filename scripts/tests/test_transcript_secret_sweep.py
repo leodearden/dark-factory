@@ -20,6 +20,7 @@ import transcript_secret_sweep as sweep
 from shared.project_layout import agent_transcripts_dir
 from shared.secret_env import is_secret_env_name
 from shared.secret_redaction import FileChangedDuringRedaction
+from shared.testing_mcp_stub import StubMcpServer
 from shared.transcript_archive import STAGING_SUFFIX
 
 POOL_A = 'sk-ant-oat01-' + 'Lv' * 17 + 'A'
@@ -289,6 +290,14 @@ def test_a_failed_escalation_is_reported_and_the_redaction_still_stands(tree):
     assert result.record()['escalation_error'] == result.escalation_error
 
 
+def _served_tool_calls(server: StubMcpServer) -> list[tuple[str, dict]]:
+    return [
+        (request.body['params']['name'], request.body['params']['arguments'])
+        for request in server.requests
+        if request.http_method == 'POST' and request.body.get('method') == 'tools/call'
+    ]
+
+
 class TestMain:
     @pytest.fixture
     def secretless_environ(self, monkeypatch):
@@ -296,13 +305,13 @@ class TestMain:
             if is_secret_env_name(name):
                 monkeypatch.delenv(name)
 
-    def _argv(self, tree: Tree, tmp_path: Path) -> list[str]:
+    def _argv(self, tree: Tree, tmp_path: Path, *, escalation_url: str = 'http://127.0.0.1:1/mcp') -> list[str]:
         return [
             '--project-root', str(tree.project_a),
             '--project-root', str(tree.project_b),
             '--units-dir', str(tmp_path / 'no-units'),
             '--claude-projects-dir', str(tree.claude_projects),
-            '--escalation-url', 'http://127.0.0.1:1/mcp',
+            '--escalation-url', escalation_url,
             '--min-age-secs', '0',
         ]
 
@@ -321,6 +330,24 @@ class TestMain:
         assert record['redacted'] == []
         assert record['escalation_error'] is None
 
+    @pytest.mark.parametrize('endpoint_suffix', ['/mcp', '/mcp/'])  # mcp-url-sweep: allow input the code under test must normalise; the stub asserts it reached /mcp
+    def test_a_sweep_that_redacts_files_one_escalation_on_the_configured_server(
+        self, secretless_environ, monkeypatch, tmp_path, capsys, endpoint_suffix
+    ):
+        """--escalation-url is the server's MCP URL, with or without a trailing slash."""
+        monkeypatch.setenv('CLAUDE_OAUTH_TOKEN_A', POOL_A)
+        tree = Tree(tmp_path)
+
+        with StubMcpServer(stateful=True, payload={'id': 'esc-1', 'status': 'pending'}) as server:
+            assert sweep.main(self._argv(tree, tmp_path, escalation_url=f'{server.url}{endpoint_suffix}')) == 0
+
+        assert self._record(capsys)['escalation_error'] is None
+        ((name, arguments),) = _served_tool_calls(server)
+        assert name == 'escalate_info'
+        assert arguments['task_id'] == arguments['agent_role'] == 'transcript-secret-sweep'
+        assert arguments['category'] == 'risk_identified'
+        assert POOL_A not in json.dumps(arguments)
+
     def test_an_environment_without_secrets_exits_2(self, secretless_environ, tmp_path, capsys):
         tree = Tree(tmp_path)
 
@@ -338,6 +365,6 @@ class TestMain:
         (line,) = out.splitlines()
         record = json.loads(line)
         assert record['ok'] is True
-        assert record['escalation_error']
+        assert record['escalation_error'].startswith('McpCallError')
         assert 'the escalation was not filed' in err
         assert POOL_A not in out + err

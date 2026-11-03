@@ -148,7 +148,7 @@ def resolve_candidates(names: list[str]) -> list[Any]:
     Two loud failures, both structural rather than advisory:
 
     * an unresolvable name exits naming itself;
-    * a RESOLVABLE config whose ``role != 'architect'`` exits too.
+    * a RESOLVABLE config whose role is not ARCHITECT exits too.
 
     The second is the load-bearing one. ``run_ofat_stage`` dispatches BY ROLE:
     an implementer candidate goes through ``run_eval``, a full agentic workflow
@@ -160,6 +160,7 @@ def resolve_candidates(names: list[str]) -> list[Any]:
     ``ofat_candidates()`` is never called anywhere in this driver.
     """
     from orchestrator.evals.configs import get_config_by_name
+    from orchestrator.evals.metrics import RoleUnderTest
 
     resolved = []
     for name in names:
@@ -170,9 +171,9 @@ def resolve_candidates(names: list[str]) -> list[Any]:
                 '  Architect candidates live in ARCHITECT_EVAL_CONFIGS '
                 '(orchestrator/src/orchestrator/evals/configs.py).'
             )
-        if cfg.role != 'architect':
+        if cfg.role is not RoleUnderTest.ARCHITECT:
             raise SystemExit(
-                f'Error: candidate {name!r} has role={cfg.role!r}, not \'architect\'.\n'
+                f'Error: candidate {name!r} has role={cfg.role.value!r}, not \'architect\'.\n'
                 '  run_ofat_stage dispatches BY ROLE, so this candidate would be routed '
                 'through run_eval — a full agentic workflow cell at roughly 10x the cost '
                 'of the plan-only architect cell this campaign measures. That is the spend '
@@ -351,10 +352,12 @@ def _architect_cells(results: list[Any]) -> list[tuple[str, str, dict[str, Any]]
     to what counts as an architect cell would otherwise have to be made twice,
     with only one of the sites carrying the argument for why it matters.
     """
+    from orchestrator.evals.metrics import RoleUnderTest
+
     cells = []
     for result in results:
         metrics = result.metrics or {}
-        if metrics.get('role_under_test') != 'architect':
+        if metrics.get('role_under_test') != RoleUnderTest.ARCHITECT:
             continue
         cells.append((result.task_id, result.config_name, metrics))
     return cells

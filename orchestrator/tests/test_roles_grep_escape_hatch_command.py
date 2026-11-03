@@ -1,6 +1,6 @@
 """The look-around escape hatch's prescribed commands do what the prompt says.
 
-The prompt text is orchestrator/src/orchestrator/agents/roles.py::_GREP_PCRE_BASH_RECOURSE.
+The prompt text is orchestrator/src/orchestrator/agents/harness_guidance.py::_GREP_PCRE_BASH_RECOURSE.
 Each command it prescribes is a named template constant spliced into that prose,
 so this module runs the templates in a real repo fixture and checks where they
 sit in the prompt. It asserts nothing about the surrounding wording.
@@ -14,7 +14,7 @@ from pathlib import Path
 
 from _git_fixtures import RepoSeed, _git_env, seed_repo
 
-from orchestrator.agents.roles import (
+from orchestrator.agents.harness_guidance import (
     GIT_GREP_PCRE_COMMAND_TEMPLATE,
     GREP_LOOKAROUND_GUIDANCE,
     GREP_LOOKAROUND_GUIDANCE_READ_ONLY,
@@ -37,7 +37,7 @@ def _render(template: str, pattern: str, path: str) -> list[str]:
     for placeholder in ('<pattern>', '<path>'):
         assert argv.count(placeholder) == 1, (
             f'expected exactly one {placeholder!r} argv token in the template, got {argv!r}; '
-            'rename the placeholder here too if the roles.py template constant renamed it'
+            'rename the placeholder here too if the harness_guidance.py template constant renamed it'
         )
     substitutions = {'<pattern>': pattern, '<path>': path}
     return [substitutions.get(token, token) for token in argv]

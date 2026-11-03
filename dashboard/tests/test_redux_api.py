@@ -16,6 +16,7 @@ from dashboard.data.datum import (
 )
 from dashboard.data.escalation_corpus import EscalationView
 from dashboard.data.memory import WRITE_QUEUE_FRESHNESS_BOUND_SECONDS, write_queue_datum
+from dashboard.data.merge_queue import MergeAttempts, TrainThroughput
 from dashboard.data.performance import PerformanceCards, PerformanceListing
 from dashboard.data.reconciliation import AgentActivity
 from dashboard.project_labels import ProjectLabels
@@ -672,14 +673,27 @@ def test_shape_recon_refuses_a_burst_row_the_partition_never_stamped():
 MQ_SERVED_AT = datetime(2026, 10, 1, 12, 0, 30, tzinfo=UTC)
 """The serving instant every shape_merge_queue case ages and validates against."""
 
+
+def _mq_read(value: object) -> Datum:
+    """A runs.db window read measured at the serving instant."""
+    return Datum(value, MQ_SERVED_AT, DatumState.FRESH, None, 30)
+
+
+_MQ_ZERO_THROUGHPUT: TrainThroughput = {
+    'trains_landed': 0, 'tasks_landed_via_trains': 0, 'train_verifies_per_landed_task': 0.0,
+    'baseline_solo_landed': 0, 'baseline_verifies_per_landed_task': 0.0,
+    'verifies_per_landed_task_delta': 0.0, 'train_cas_retry_rate': 0.0,
+    'baseline_cas_retry_rate': 0.0, 'cas_retry_rate_delta': 0.0, 'improved': False,
+}
+
 _MQ_MEASURED_QUEUE = {
     'in_queue': Datum(0, MQ_SERVED_AT, DatumState.FRESH, None, 30),
     'live_probe_configured': True,
-    'speculative': Datum(
-        {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': None},
-        MQ_SERVED_AT, DatumState.FRESH, None, 30,
-    ),
-    'recent_total': Datum(0, MQ_SERVED_AT, DatumState.FRESH, None, 30),
+    'speculative': _mq_read({'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': None}),
+    'recent_total': _mq_read(0),
+    'depth_timeseries': _mq_read({'labels': [], 'values': [], 'bucket_minutes': 15}),
+    'attempts': _mq_read(MergeAttempts()),
+    'train_throughput': _mq_read(_MQ_ZERO_THROUGHPUT),
 }
 """The queue fields the route resolves for every project: here, a measured empty queue."""
 
@@ -697,39 +711,42 @@ def _task_ids(rows):
 def test_shape_merge_queue_relabels_and_renames_depth():
     raw = {
         '/home/leo/src/dark-factory': {
-            'depth_timeseries': {'labels': [0, 1], 'values': [3, 4], 'bucket_minutes': 60},
-            'outcomes': {'labels': ['done'], 'values': [12]},
-            'latency': {'p50': 6000},
             'recent': [_mq_titled('17')],
             'active': [],
             **_MQ_MEASURED_QUEUE,
+            'depth_timeseries': _mq_read({'labels': [0, 1], 'values': [3, 4], 'bucket_minutes': 60}),
         },
     }
     body = redux_api.shape_merge_queue(raw, served_at=MQ_SERVED_AT, labels=_BASENAME_LABELS)
     assert 'dark-factory' in body['MERGE_QUEUE']
     section = body['MERGE_QUEUE']['dark-factory']
-    assert section['depth'] == {'labels': [0, 1], 'values': [3, 4], 'bucket_minutes': 60}
+    assert section['depth']['state'] == 'fresh'
+    assert section['depth']['value'] == {'labels': [0, 1], 'values': [3, 4], 'bucket_minutes': 60}
     assert _task_ids(section['recent']) == ['17']
     # Default: no halt_status passed → offline fallback per project.
     assert section['halt'] == {'offline': True}
 
 
+def test_shape_merge_queue_trims_the_depths_leading_zero_buckets():
+    """Leading empty buckets are dropped; an interior zero is an activity gap and stays."""
+    series = {'labels': ['a', 'b', 'c', 'd'], 'values': [0, 3, 0, 4], 'bucket_minutes': 15}
+
+    depth = _shaped(depth_timeseries=_mq_read(series))['depth']
+
+    assert depth['value'] == {'labels': ['b', 'c', 'd'], 'values': [3, 0, 4], 'bucket_minutes': 15}
+
+
 def test_shape_merge_queue_serves_no_width_for_a_depth_that_names_none():
     """A depth series without bucket_minutes serves None for it, never a guessed width."""
-    raw = {
-        '/home/leo/src/dark-factory': {
-            'depth_timeseries': {'labels': [], 'values': []},
-            'outcomes': {'labels': [], 'values': []},
-            'latency': {},
-            'recent': [],
-            'active': [],
-            **_MQ_MEASURED_QUEUE,
-        },
-    }
-    body = redux_api.shape_merge_queue(raw, served_at=MQ_SERVED_AT, labels=_BASENAME_LABELS)
-    assert body['MERGE_QUEUE']['dark-factory']['depth'] == {
-        'labels': [], 'values': [], 'bucket_minutes': None,
-    }
+    depth = _shaped(depth_timeseries=_mq_read({'labels': [], 'values': []}))['depth']
+
+    assert depth['value'] == {'labels': [], 'values': [], 'bucket_minutes': None}
+
+
+def test_shape_merge_queue_serves_an_unread_depth_as_unknown():
+    unread = unknown_datum('the merge_attempt depth series could not be read from runs.db', 30)
+
+    assert _shaped(depth_timeseries=unread)['depth'] == unread.to_wire()
 
 
 def test_shape_merge_queue_carries_the_recent_window_total():
@@ -738,9 +755,6 @@ def test_shape_merge_queue_carries_the_recent_window_total():
     recent_total = Datum(228, MQ_SERVED_AT, DatumState.FRESH, None, 30)
     raw = {
         '/home/leo/src/dark-factory': {
-            'depth_timeseries': {'labels': [], 'values': []},
-            'outcomes': {'labels': [], 'values': []},
-            'latency': {},
             'recent': recent,
             'active': [],
             **_MQ_MEASURED_QUEUE,
@@ -757,9 +771,6 @@ def test_shape_merge_queue_carries_the_recent_window_total():
 def test_shape_merge_queue_refuses_a_project_without_a_recent_total():
     """A project the route never gave a window total is a wiring bug, not a zero."""
     project = {
-        'depth_timeseries': {'labels': [], 'values': []},
-        'outcomes': {'labels': [], 'values': []},
-        'latency': {},
         'recent': [],
         'active': [],
         **_MQ_MEASURED_QUEUE,
@@ -777,25 +788,16 @@ def test_shape_merge_queue_refuses_a_project_without_a_recent_total():
 def test_shape_merge_queue_injects_halt_status_per_project():
     raw = {
         '/home/leo/src/reify': {
-            'depth_timeseries': {'labels': [], 'values': []},
-            'outcomes': {'labels': [], 'values': []},
-            'latency': {},
             'recent': [],
             'active': [],
             **_MQ_MEASURED_QUEUE,
         },
         '/home/leo/src/know-live': {
-            'depth_timeseries': {'labels': [], 'values': []},
-            'outcomes': {'labels': [], 'values': []},
-            'latency': {},
             'recent': [],
             'active': [],
             **_MQ_MEASURED_QUEUE,
         },
         '/home/leo/src/dark-factory': {
-            'depth_timeseries': {'labels': [], 'values': []},
-            'outcomes': {'labels': [], 'values': []},
-            'latency': {},
             'recent': [],
             'active': [],
             **_MQ_MEASURED_QUEUE,
@@ -821,9 +823,6 @@ def test_shape_merge_queue_includes_train_events():
     """shape_merge_queue exposes train_events list per project."""
     raw = {
         '/home/leo/src/dark-factory': {
-            'depth_timeseries': {'labels': [], 'values': []},
-            'outcomes': {'labels': [], 'values': []},
-            'latency': {},
             'recent': [],
             'active': [],
             **_MQ_MEASURED_QUEUE,
@@ -848,9 +847,6 @@ def test_shape_merge_queue_includes_train_events():
     # When 'train_events' key is absent, result should default to []
     raw_no_train = {
         '/home/leo/src/dark-factory': {
-            'depth_timeseries': {'labels': [], 'values': []},
-            'outcomes': {'labels': [], 'values': []},
-            'latency': {},
             'recent': [],
             'active': [],
             **_MQ_MEASURED_QUEUE,
@@ -881,18 +877,19 @@ def test_shape_merge_queue_attaches_outcome_colors():
     """shape_merge_queue adds outcomes['colors'] parallel to labels."""
     from dashboard.data.outcome_colors import assign_outcome_colors
 
+    # Equal counts, so the chart's alphabetical tie-break keeps _REIFY_LABELS' order.
+    attempts = MergeAttempts(outcomes=dict.fromkeys(_REIFY_LABELS, 2))
     raw = {
         '/home/leo/src/dark-factory': {
-            'depth_timeseries': {'labels': [], 'values': []},
-            'outcomes': {'labels': _REIFY_LABELS, 'values': [3, 2, 1, 4, 2]},
-            'latency': {},
             'recent': [],
             'active': [],
             **_MQ_MEASURED_QUEUE,
+            'attempts': _mq_read(attempts),
         },
     }
     body = redux_api.shape_merge_queue(raw, served_at=MQ_SERVED_AT, labels=_BASENAME_LABELS)
-    outcomes = body['MERGE_QUEUE']['dark-factory']['outcomes']
+    outcomes = body['MERGE_QUEUE']['dark-factory']['attempts']['value']['outcomes']
+    assert outcomes['labels'] == _REIFY_LABELS
 
     assert 'colors' in outcomes, f"Expected 'colors' key in outcomes; got keys: {list(outcomes)}"
     colors = outcomes['colors']
@@ -909,16 +906,13 @@ def test_shape_merge_queue_empty_outcomes_yields_empty_colors():
     """shape_merge_queue with empty outcomes attaches colors == []."""
     raw = {
         '/home/leo/src/dark-factory': {
-            'depth_timeseries': {'labels': [], 'values': []},
-            'outcomes': {'labels': [], 'values': []},
-            'latency': {},
             'recent': [],
             'active': [],
             **_MQ_MEASURED_QUEUE,
         },
     }
     body = redux_api.shape_merge_queue(raw, served_at=MQ_SERVED_AT, labels=_BASENAME_LABELS)
-    outcomes = body['MERGE_QUEUE']['dark-factory']['outcomes']
+    outcomes = body['MERGE_QUEUE']['dark-factory']['attempts']['value']['outcomes']
     assert outcomes.get('colors') == [], (
         f"Expected colors == [] for empty outcomes, got {outcomes.get('colors')!r}"
     )
@@ -2105,9 +2099,6 @@ class TestShapeEscalationAnalytics:
 def _mq_project(**overrides) -> dict:
     """A minimal per-project aggregate entry; *overrides* replace its keys."""
     data: dict = {
-        'depth_timeseries': {'labels': [], 'values': []},
-        'outcomes': {'labels': [], 'values': []},
-        'latency': {},
         'recent': [],
         'active': [],
         **_MQ_MEASURED_QUEUE,
@@ -2190,10 +2181,44 @@ class TestShapeMergeQueueServedDatums:
         assert table in str(excinfo.value)
 
     def test_latency_carries_the_timed_and_untimed_split(self):
-        latency = {'p50': 100, 'p95': 200, 'p99': 300, 'mean_ms': 150.0,
-                   'with_duration': 3, 'without_duration': 2}
+        record = MergeAttempts(outcomes={'done': 5}, durations=(100.0, 200.0, 300.0))
 
-        assert _shaped(latency=latency)['latency'] == latency
+        latency = _shaped(attempts=_mq_read(record))['attempts']['value']['latency']
+
+        assert latency == record.latency()
+        assert (latency['with_duration'], latency['without_duration']) == (3, 2)
+
+    def test_attempts_is_one_wire_datum_over_the_chart_and_the_latency(self):
+        """Sketch #9: one provenance behind the donut and the latency block."""
+        from dashboard.data.outcome_colors import assign_outcome_colors
+
+        record = MergeAttempts(
+            outcomes={'done': 3, 'conflict': 2, 'blocked': 1}, durations=(100.0, 250.0, 400.0),
+        )
+
+        section = _shaped(attempts=_mq_read(record))
+
+        chart = record.outcome_chart()
+        assert section['attempts']['state'] == 'fresh'
+        assert section['attempts']['value'] == {
+            'outcomes': {**chart, 'colors': assign_outcome_colors(chart['labels'])},
+            'latency': record.latency(),
+        }
+        assert not {'outcomes', 'latency'} & set(section)
+
+    def test_an_unknown_attempts_keeps_its_reason(self):
+        unread = unknown_datum('the merge_attempt events could not be read from runs.db', 30)
+
+        assert _shaped(attempts=unread)['attempts'] == unread.to_wire()
+
+    def test_a_fresh_attempts_past_its_bound_is_served_stale(self):
+        as_of = MQ_SERVED_AT - timedelta(seconds=45)
+
+        wire = _shaped(attempts=Datum(MergeAttempts(), as_of, DatumState.FRESH, None, 30))['attempts']
+
+        assert wire['state'] == 'stale'
+        assert wire['as_of'] == as_of.isoformat()
+        assert '30s freshness bound' in wire['reason']
 
     @pytest.mark.parametrize('configured', [True, False])
     def test_live_probe_configured_is_carried_verbatim(self, configured):
@@ -2234,17 +2259,21 @@ class TestShapeMergeQueueServedDatums:
         assert wire == unread.to_wire()
         assert wire['state'] == 'unknown'
 
-    @pytest.mark.parametrize('field, bare', [
-        ('speculative', {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': 0.0}),
-        ('recent_total', 0),
+    @pytest.mark.parametrize('raw_key, wire_name, bare', [
+        ('speculative', 'speculative',
+         {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': 0.0}),
+        ('recent_total', 'recent_total', 0),
+        ('depth_timeseries', 'depth', {'labels': [], 'values': [], 'bucket_minutes': 15}),
+        ('attempts', 'attempts', MergeAttempts()),
+        ('train_throughput', 'train_throughput', {}),
     ])
-    def test_a_bare_value_is_a_wiring_bug(self, field, bare):
+    def test_a_bare_value_is_a_wiring_bug(self, raw_key, wire_name, bare):
         with pytest.raises(DatumContractError) as excinfo:
-            _shaped(**{field: bare})
+            _shaped(**{raw_key: bare})
 
         assert excinfo.value.invariant is DatumInvariant.DATUM_REQUIRED
         assert 'myproj' in str(excinfo.value)
-        assert field in str(excinfo.value)
+        assert wire_name in str(excinfo.value)
 
 
 # ---------------------------------------------------------------------------
@@ -2253,11 +2282,10 @@ class TestShapeMergeQueueServedDatums:
 
 
 def test_shape_merge_queue_includes_train_throughput():
-    """shape_merge_queue exposes train_throughput dict per project.
+    """shape_merge_queue serves train_throughput as a wire Datum per project.
 
-    When per-project data contains 'train_throughput', it must appear in the
-    shaped output alongside 'train_events'.
-    When 'train_throughput' is absent, the shaped output defaults to {}.
+    A project the route never gave a train_throughput is a wiring bug
+    (DATUM_REQUIRED), not an empty dict.
     """
     throughput_payload = {
         'trains_landed': 2,
@@ -2273,44 +2301,30 @@ def test_shape_merge_queue_includes_train_throughput():
     }
     raw = {
         '/home/leo/src/dark-factory': {
-            'depth_timeseries': {'labels': [], 'values': []},
-            'outcomes': {'labels': [], 'values': []},
-            'latency': {},
             'recent': [],
             'active': [],
             **_MQ_MEASURED_QUEUE,
             'train_events': [],
-            'train_throughput': throughput_payload,
+            'train_throughput': _mq_read(throughput_payload),
         },
     }
     body = redux_api.shape_merge_queue(raw, served_at=MQ_SERVED_AT, labels=_BASENAME_LABELS)
     section = body['MERGE_QUEUE']['dark-factory']
 
-    assert 'train_throughput' in section, (
-        f"expected 'train_throughput' in shaped output; keys: {list(section.keys())}"
-    )
-    tt = section['train_throughput']
+    assert section['train_throughput']['state'] == 'fresh'
+    tt = section['train_throughput']['value']
     assert tt['trains_landed'] == 2
     assert tt['tasks_landed_via_trains'] == 4
     assert tt['improved'] is True
 
-    # When 'train_throughput' key is absent, defaults to {}.
-    raw_no_throughput = {
-        '/home/leo/src/dark-factory': {
-            'depth_timeseries': {'labels': [], 'values': []},
-            'outcomes': {'labels': [], 'values': []},
-            'latency': {},
-            'recent': [],
-            'active': [],
-            **_MQ_MEASURED_QUEUE,
-            'train_events': [],
-            # no 'train_throughput' key
-        },
-    }
-    body2 = redux_api.shape_merge_queue(
-        raw_no_throughput, served_at=MQ_SERVED_AT, labels=_BASENAME_LABELS,
-    )
-    assert body2['MERGE_QUEUE']['dark-factory']['train_throughput'] == {}
+    no_throughput = {'recent': [], 'active': [], **_MQ_MEASURED_QUEUE, 'train_events': []}
+    del no_throughput['train_throughput']
+    with pytest.raises(DatumContractError) as excinfo:
+        redux_api.shape_merge_queue(
+            {'/home/leo/src/dark-factory': no_throughput},
+            served_at=MQ_SERVED_AT, labels=_BASENAME_LABELS,
+        )
+    assert excinfo.value.invariant is DatumInvariant.DATUM_REQUIRED
 
 
 # ---------------------------------------------------------------------------
@@ -2321,9 +2335,6 @@ def test_shape_merge_queue_includes_train_throughput():
 def _mq_project_base() -> dict:
     """Minimal per-project data dict for shape_merge_queue tests."""
     return {
-        'depth_timeseries': {'labels': [], 'values': []},
-        'outcomes': {'labels': [], 'values': []},
-        'latency': {},
         'recent': [],
         'active': [],
         **_MQ_MEASURED_QUEUE,

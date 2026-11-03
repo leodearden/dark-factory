@@ -162,57 +162,6 @@ _ESCALATE_ARCHIVE_SCAN_WHY = (
     'with task 4781.'
 )
 
-#: The shared justification of every ``reconciliation/backlog_policy.py`` row.
-_BACKLOG_POLICY_RECORD_IO_WHY = (
-    'ROOT CAUSE (one defect): BacklogPolicy scans, reads and '
-    'writes its escalation records on the loop thread. on_judge_unhalt '
-    'is_dirs data/escalations, then globs every judge_halt*.json record '
-    'in the queue root -- an O(N) directory read that grows with the '
-    'pending queue -- read_texts each match and reaches '
-    '_restore_policy_keys; _maybe_write_escalation reaches '
-    '_merge_onto_persisted; both helpers read_text then write_text the '
-    'located record under escalation_id_lock. UNDERSTATED BY THESE '
-    'ROWS, and recorded here because no row can carry it: the dominant '
-    'blocking work on the write path is the '
-    'escalation.dedupe.submit_or_dedupe call one line ABOVE the '
-    '_merge_onto_persisted site -- find_dedupe_parent globs and '
-    'JSON-parses every pending record in the project queue '
-    '(queue.get_pending, O(N); N=41 measured on the live dark_factory '
-    'queue 2026-09-18), then queue.submit writes with a durable fsync. '
-    'The scanner reports only _merge_onto_persisted because those '
-    'primitives live in the escalation package, across a boundary its '
-    'fused-memory/src scope cannot follow -- so another row would be a '
-    'blessing test_no_stale_blessings rejects, and this paragraph is '
-    'the only honest place to state it. Filesystem, the limb task '
-    '3778\'s subprocess-only vocabulary omitted. The record '
-    'read/write rows are OWNED BY TASK 5270 -- do not file again: task '
-    '4484 step-9\'s ticket tkt_0RT7RHRS9ZTJSQK328919XXEJW became task '
-    '5075, coalesced into 5270. The is_dir and glob rows task 5099 '
-    'added when it widened the vocabulary are TASK 6086, filed to fold '
-    'into the same offload. The queue.resolve row task 6089 added is '
-    'escalation.queue.EscalationQueue.resolve, matched by the method name '
-    'resolve though it is not Path.resolve: an escalation_id_lock flock, an '
-    'atomic record rewrite and an archive move, once per pending halt '
-    'record. It is TASK 6086\'s, whose offload moves the whole closing loop '
-    'into one asyncio.to_thread hop.'
-)
-
-#: The shared justification of every ``CodebaseVerifier.verify`` LLM-tool row.
-_VERIFIER_LLM_TOOL_IO_WHY = (
-    'ROOT CAUSE (one defect): the async tools '
-    'CodebaseVerifier.verify hands the codebase-verification LLM do '
-    'their filesystem work inline on the loop thread, once per tool '
-    'call the model chooses to make -- an LLM-driven, unbounded call '
-    'count. read_file does full_path.read_text(); glob_search runs '
-    'codebase_root.glob(pattern) with an LLM-CHOSEN pattern and sorts '
-    'every match before keeping 50, so a "**/*" walks the whole '
-    'codebase root. The read_file row is OWNED BY TASK 5270 -- do not '
-    'file again: task 4484 step-9\'s ticket '
-    'tkt_0RT7RM7C7NS1ECYHFBDYP02KDJ became task 5078, coalesced into '
-    '5270. The glob_search row task 5099 added when it widened the '
-    'vocabulary is TASK 6088, filed to fold into the same offload.'
-)
-
 #: Task 5099: an idempotent mkdir of a store's own data dir as it opens.
 _MKDIR_ON_STORE_OPEN_WHY = (
     'ACCEPTED, measured cheap (one cause): one idempotent '
@@ -256,21 +205,9 @@ _COMBINE_AUDIT_APPEND_WHY = (
     'append of a single JSON line under 2 KB (descriptions truncated to '
     '500 chars), with no fsync. It runs once per curator COMBINE decision, '
     'each of which follows an LLM call of seconds, so the append is never '
-    'on a hot or storm-coupled path. The EventQueue dead-letter append is '
-    'the one defect of this shape, because it fires during a drop storm.'
-)
-
-#: Task 5099: EventQueue._write_dead_letter's inline append.
-_DEAD_LETTER_APPEND_WHY = (
-    'ROOT CAUSE (one defect): EventQueue._write_dead_letter runs '
-    'mkdir + exists + stat + the cascade rotation + open(\'a\') + write '
-    'inline on the loop thread, and its async callers reach it without a '
-    'hop. The enqueue overflow_drop branch fires EXACTLY when the loop is '
-    'saturated, so the blocking append is coupled to the storm it '
-    'records, and a rotation renames files on the same thread. '
-    'UNDERSTATED BY THESE ROWS: the scanner resolves only self.enqueue, '
-    'not other receivers\' event_queue.enqueue(...), so the real caller '
-    'population is larger. Filed by task 5099 as TASK 6085.'
+    'on a hot or storm-coupled path. The one storm-coupled defect of this '
+    'shape, the EventQueue dead-letter append that fires during a drop '
+    'storm, was moved onto a dedicated writer thread by task 6085.'
 )
 
 #: Task 6089: who owns the measured-cheap ``resolve`` rows its widening added.
@@ -291,19 +228,6 @@ _PATH_RESOLVE_GUARD_WHY = (
     '(census section 4d) scales with the path\'s component count, which is '
     'set by the path the code, configuration or caller supplies, not by '
     'what is on disk.'
-    + _CHEAP_RESOLVE_OWNER_WHY
-)
-
-#: Task 6089: the verifier LLM tools' path-containment guard.
-_VERIFIER_TOOL_PATH_GUARD_WHY = (
-    'ROOT CAUSE (one debt, measured cheap): CodebaseVerifier.verify\'s '
-    'read_file and grep_search tools each resolve() the model-chosen path '
-    'once, as an is_relative_to(codebase_root) containment guard -- one '
-    'Path.resolve per tool call (cost: census section 4d), and each tool '
-    'call follows an LLM turn of seconds. read_file\'s read_text after '
-    'the guard is TASK 5270\'s row in the same coroutine, and grep_search\'s '
-    'grep is already an awaited subprocess. If 5270 offloads read_file\'s '
-    'whole body, delete the read_file resolve row with it.'
     + _CHEAP_RESOLVE_OWNER_WHY
 )
 
@@ -456,50 +380,6 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         _MKDIR_ON_STORE_OPEN_WHY,
     ),
 
-    # ---- reconciliation/backlog_policy.py ----
-    (
-        'fused-memory/src/fused_memory/reconciliation/backlog_policy.py',
-        'BacklogPolicy.on_judge_unhalt',
-        '8f53c74a5d76',
-        'filed',
-        _BACKLOG_POLICY_RECORD_IO_WHY,
-    ),
-    (
-        'fused-memory/src/fused_memory/reconciliation/backlog_policy.py',
-        'BacklogPolicy.on_judge_unhalt',
-        '08a103635fd7',
-        'filed',
-        _BACKLOG_POLICY_RECORD_IO_WHY,
-    ),
-    (
-        'fused-memory/src/fused_memory/reconciliation/backlog_policy.py',
-        'BacklogPolicy._maybe_write_escalation',
-        '0d761c10e563',
-        'filed',
-        _BACKLOG_POLICY_RECORD_IO_WHY,
-    ),
-    (
-        'fused-memory/src/fused_memory/reconciliation/backlog_policy.py',
-        'BacklogPolicy.on_judge_unhalt',
-        'cb226477b1bf',
-        'filed',
-        _BACKLOG_POLICY_RECORD_IO_WHY,
-    ),
-    (
-        'fused-memory/src/fused_memory/reconciliation/backlog_policy.py',
-        'BacklogPolicy.on_judge_unhalt',
-        '48269c8edbbd',
-        'filed',
-        _BACKLOG_POLICY_RECORD_IO_WHY,
-    ),
-    (
-        'fused-memory/src/fused_memory/reconciliation/backlog_policy.py',
-        'BacklogPolicy.on_judge_unhalt',
-        'f8315799ebea',
-        'filed',
-        _BACKLOG_POLICY_RECORD_IO_WHY,
-    ),
-
     # ---- reconciliation/cli_stage_runner.py ----
     (
         'fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py',
@@ -516,34 +396,6 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'd325858ad5fe',
         'accepted',
         _MKDIR_ON_STORE_OPEN_WHY,
-    ),
-    (
-        'fused-memory/src/fused_memory/reconciliation/event_queue.py',
-        'EventQueue.recover',
-        '2f9ae36b2bc7',
-        'filed',
-        _DEAD_LETTER_APPEND_WHY,
-    ),
-    (
-        'fused-memory/src/fused_memory/reconciliation/event_queue.py',
-        'EventQueue.close',
-        'c8191bbaf10a',
-        'filed',
-        _DEAD_LETTER_APPEND_WHY,
-    ),
-    (
-        'fused-memory/src/fused_memory/reconciliation/event_queue.py',
-        'EventQueue._commit_with_retry',
-        '93d589ee10dd',
-        'filed',
-        _DEAD_LETTER_APPEND_WHY,
-    ),
-    (
-        'fused-memory/src/fused_memory/reconciliation/event_queue.py',
-        'EventQueue._enqueue_on_loop',
-        'f46e02910e17',
-        'filed',
-        _DEAD_LETTER_APPEND_WHY,
     ),
 
     # ---- reconciliation/harness.py ----
@@ -783,38 +635,10 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
     # ---- reconciliation/verify.py ----
     (
         'fused-memory/src/fused_memory/reconciliation/verify.py',
-        'CodebaseVerifier.verify.read_file',
-        'c04bd0d302eb',
-        'filed',
-        _VERIFIER_LLM_TOOL_IO_WHY,
-    ),
-    (
-        'fused-memory/src/fused_memory/reconciliation/verify.py',
-        'CodebaseVerifier.verify.glob_search',
-        '29916e02709d',
-        'filed',
-        _VERIFIER_LLM_TOOL_IO_WHY,
-    ),
-    (
-        'fused-memory/src/fused_memory/reconciliation/verify.py',
         'CodebaseVerifier.verify',
         'ab04e5fd6d64',
         'accepted',
         _FIXED_STAT_GUARD_WHY,
-    ),
-    (
-        'fused-memory/src/fused_memory/reconciliation/verify.py',
-        'CodebaseVerifier.verify.read_file',
-        '8ad4f6cd803f',
-        'filed',
-        _VERIFIER_TOOL_PATH_GUARD_WHY,
-    ),
-    (
-        'fused-memory/src/fused_memory/reconciliation/verify.py',
-        'CodebaseVerifier.verify.grep_search',
-        'd96696388685',
-        'filed',
-        _VERIFIER_TOOL_PATH_GUARD_WHY,
     ),
 
     # ---- services/durable_queue.py ----

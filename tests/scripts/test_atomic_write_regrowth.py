@@ -261,7 +261,7 @@ _ALLOWED_RENAMERS = {
         'disjoint-path discipline, so two writers can never share a temp path '
         'even if they bypass _persist_lock), and the asyncio.to_thread offload '
         'that keeps the blocking I/O off the event loop under burst load.',
-    ('fused-memory/src/fused_memory/reconciliation/event_queue.py', 'EventQueue._rotate_dead_letter'):
+    ('fused-memory/src/fused_memory/reconciliation/dead_letter_writer.py', 'DeadLetterWriter._rotate'):
         'MOVES existing files: cascade-rotates dead_letter.jsonl -> .1 -> .2 '
         '-> ... There is no content string, only os.replace(src, dst) per '
         'slot, so this is the same class as escalation sweep._atomic_move / '
@@ -270,7 +270,7 @@ _ALLOWED_RENAMERS = {
     ('fused-memory/src/fused_memory/reconciliation/event_queue.py', 'EventQueue.replay_dead_letters'):
         'MOVES an existing file: os.replace snapshots each dead-letter file '
         'onto a ``.replaying`` sibling as an atomic CLAIM — race-safe against '
-        'concurrent _write_dead_letter appends and self-guarding against '
+        'concurrent dead-letter writer appends and self-guarding against '
         're-replay, since a second call finds nothing left to snapshot. A '
         'claim, not a write; same class as escalation sweep._atomic_move / '
         'queue._archive_resolved.',

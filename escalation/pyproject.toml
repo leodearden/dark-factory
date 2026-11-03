@@ -99,7 +99,8 @@ addopts = "-n auto --dist loadgroup"
 include = ["src", "tests"]
 # ".." LAST (mirrors tests/conftest.py's sys.path.append): resolves the repo-root
 # df_pytest_isolation module without letting project dirs shadow their own src/.
-extraPaths = ["src", "tests", "../shared/src", ".."]
+# "../scripts" resolves the `legibility` package for tests/test_legibility_census_escalation_e2e.py.
+extraPaths = ["src", "tests", "../shared/src", "..", "../scripts"]
 pythonVersion = "3.11"
 typeCheckingMode = "basic"
 # Task 3367 / esc-3359-1: pins pyright's interpreter to THIS worktree's own

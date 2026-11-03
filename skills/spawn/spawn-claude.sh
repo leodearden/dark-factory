@@ -22,8 +22,7 @@
 #     inherit the spawner's default model. For other/extra claude flags use
 #     $CLAUDE_SPAWN_CLAUDE_ARGS (a raw passthrough, applied after --model).
 #
-# Self-exit: $CLAUDE_SPAWN_SELF_EXIT=1 (exactly 1) stamps record.self_exit
-#   and adds the exit-requested marker instruction to the trailer.
+# Self-exit: $CLAUDE_SPAWN_SELF_EXIT, default per lane; see skills/spawn/SKILL.md.
 #
 # These, and every other CLAUDE_SPAWN_* var read below, are per-launch
 # INPUTS: consumed by this invocation and then REMOVED from the spawned
@@ -131,8 +130,6 @@ title="$3"
 # positional-arg parse -- 'child' (the default) preserves every existing
 # caller's behavior byte-for-byte.
 spawn_mode="${CLAUDE_SPAWN_MODE:-child}"
-self_exit=""
-[ "${CLAUDE_SPAWN_SELF_EXIT:-}" = "1" ] && self_exit=1
 
 # Runs a spawn_t3_lane.py verb under the same import contract as the hooks
 # (skills/spawn/hooks/session-start.sh). Every verb prints one verdict line:
@@ -220,17 +217,29 @@ if [ "$spawn_backend" = "t3" ]; then
   require_python3_for_the_t3_lane
 fi
 
+# Decided once spawn_backend is known (the default differs per lane) and before
+# the `launching` write below, which stamps record.self_exit from it.
+self_exit=""
+if [ "$spawn_backend" = "t3" ]; then
+  [ "${CLAUDE_SPAWN_SELF_EXIT:-}" = "1" ] && self_exit=1
+else
+  [ "${CLAUDE_SPAWN_SELF_EXIT:-}" != "0" ] && self_exit=1
+fi
+
 # Started-verification watchdog (Attention Rail T4) state: a spawn-time
 # reference marker (mtime = spawn start, used by the step-4 transcript-
 # appearance probe to distinguish a fresh transcript from a stale one), a
 # failed-to-start marker path (NOT created here -- mktemp -u only reserves a
-# unique name; the watchdog creates the file itself when it flags), the
-# started-grace window, and the transcript-scan root. All independent of
+# unique name; the watchdog creates the file itself when it flags), a
+# payload-pid path (likewise only reserved; the payload writes its own pid
+# there for _payload_claude_alive), the started-grace window, and the
+# transcript-scan root. All independent of
 # SPAWN_LAUNCH_GRACE_SECS so genuine-launcher-failure (127) paths are
 # unaffected and existing tests (which only shrink the launch grace) never
 # trip the new code.
 spawn_ref="$(mktemp -t spawn-claude-ref-XXXXXX)"
 fts_marker="$(mktemp -u -t spawn-claude-XXXXXX.fts)"
+payload_pid_file="$(mktemp -u -t spawn-claude-XXXXXX.pid)"
 started_grace_default=90
 [ "$spawn_backend" = "t3" ] && started_grace_default=300
 SPAWN_STARTED_GRACE_SECS="${SPAWN_STARTED_GRACE_SECS:-$started_grace_default}"
@@ -252,7 +261,7 @@ CLAUDE_PROJECTS_DIR="${CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}"
 # spawn_ref to be removed prematurely.
 _cleanup() {
   [ -n "${watchdog_pid:-}" ] && kill "$watchdog_pid" 2>/dev/null
-  rm -f "$spawn_ref" "$fts_marker" ${t3_prompt_file:+"$t3_prompt_file"}
+  rm -f "$spawn_ref" "$fts_marker" "$payload_pid_file" ${t3_prompt_file:+"$t3_prompt_file"}
 }
 trap _cleanup EXIT
 
@@ -688,10 +697,16 @@ sanitize_env='for _v in ${!CLAUDE_SPAWN_@}; do unset "$_v"; done; unset _v; '
 # a Python layer that does not read it is unaffected.
 owner_ppid_export="export CLAUDE_SPAWN_OWNER_PPID=\$\$; "
 
+# Publishes that same pid (claude's direct parent on every lane) for the
+# started-watchdog's _payload_claude_alive. Fail-soft: a failed write only
+# leaves the transcript probe as the lane's evidence.
+q_payload_pid_file=$(printf %q "$payload_pid_file")
+payload_pid_publish="{ echo \$\$ > $q_payload_pid_file; } 2>/dev/null; "
+
 inner="trap 'echo \"\${ec:-\$?}\" > $q_sentinel_tmp; mv -f $q_sentinel_tmp $q_sentinel 2>/dev/null || cat $q_sentinel_tmp > $q_sentinel 2>/dev/null || : > $q_sentinel' EXIT; \
 trap 'exit 129' HUP; \
 trap 'exit 143' TERM; \
-${sanitize_env}${spawn_id_export}${parent_id_export}${result_export}${wm_title_export}${owner_ppid_export}export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1; cd $q_cwd && claude $flags $q_prompt; ec=\$?; exit \$ec"
+${sanitize_env}${spawn_id_export}${parent_id_export}${result_export}${wm_title_export}${owner_ppid_export}${payload_pid_publish}export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1; cd $q_cwd && claude $flags $q_prompt; ec=\$?; exit \$ec"
 
 # How long to wait for the sentinel to appear after the launcher returns
 # (covers a hair-late write or a very fast emulator).  Tests can shrink this.
@@ -853,64 +868,35 @@ _encode_cwd() {
   printf '%s' "${e//_/-}"
 }
 
-# Best-effort: is any process named `claude` a descendant of this script's
-# own PID? Guarded end-to-end -- ps unavailable, or any parsing hiccup,
-# yields "no descendant found" (fail-soft) rather than a fault. Scoped to
-# $$'s ancestor chain so it only matches a foreground-launched claude
-# (detached emulators reparent claude away from this script, so it is
-# correctly empty there) and never a coincidental, unrelated claude process
-# elsewhere on a busy host.
-_claude_descendant_alive() {
+# Best-effort: is a process named `claude` running as the direct child of
+# the payload shell, whose pid the payload published to $payload_pid_file?
+# That parent is the same on every lane, whoever owns the payload (tmux
+# server, gnome-terminal-server, an orphaning launcher), and it never matches
+# an unrelated claude elsewhere on the host. No pidfile yet, an empty or torn
+# read, no child yet, or no pgrep/ps all mean "no evidence this poll"; the
+# watchdog re-polls.
+_payload_claude_alive() {
+  local payload_pid children tok1 tok2 rest
+  payload_pid=$(cat "$payload_pid_file" 2>/dev/null) || return 1
+  case "$payload_pid" in ''|*[!0-9]*) return 1 ;; esac
+  command -v pgrep >/dev/null 2>&1 || return 1
   command -v ps >/dev/null 2>&1 || return 1
-  # Associative arrays (bash 4+) are required below. Stock macOS ships
-  # /bin/bash 3.2 (this script explicitly supports macOS via the
-  # mac-terminal branch), where `local -A` is a hard parse/option error, not
-  # a soft failure -- and this function is polled every ~0.25s for up to
-  # SPAWN_STARTED_GRACE_SECS (default 90s) whenever no transcript is yet
-  # present, so an unguarded error here would spam the caller-captured
-  # stderr with hundreds of lines. Fail-soft: skip this best-effort probe on
-  # bash <4 and rely on the transcript probe (_started_evidence's other
-  # branch) instead.
-  [ "${BASH_VERSINFO[0]:-0}" -ge 4 ] || return 1
-
-  local -A ppid_of=()
-  local -a claude_pids=()
-  local pid ppid rest tok1 tok2 discard
-
-  while read -r pid ppid rest; do
-    [ -n "$pid" ] || continue
-    ppid_of["$pid"]="$ppid"
-    # A real `claude` CLI is commonly a shebang wrapper (e.g. node/bash), in
-    # which case `comm` reports the INTERPRETER, not "claude" -- the kernel
-    # rewrites the exec to run the interpreter with the script's own path as
-    # an argument (empirically verified: a `#!/usr/bin/env bash` script named
-    # `claude` reports comm=bash, args="bash /path/to/claude"). Match on the
-    # first two whitespace-separated tokens of the full command line instead,
-    # covering both a raw `claude` binary (tok1) and an interpreter+script
-    # pair (tok2), by comparing each token's basename.
-    read -r tok1 tok2 discard <<<"$rest"
-    if [ "${tok1##*/}" = "claude" ] || [ "${tok2##*/}" = "claude" ]; then
-      claude_pids+=("$pid")
+  children=$(pgrep -d, -P "$payload_pid" 2>/dev/null) || return 1
+  # A `claude` CLI is commonly a shebang wrapper, whose argv is
+  # "<interpreter> /path/to/claude" (comm names the interpreter), so match
+  # the basename of either the first (native binary) or second token.
+  while read -r tok1 tok2 rest; do
+    if [ "${tok1##*/}" = claude ] || [ "${tok2##*/}" = claude ]; then
+      return 0
     fi
-  done < <(ps -eo pid=,ppid=,args= 2>/dev/null)
-
-  local cand anc hops
-  for cand in "${claude_pids[@]}"; do
-    anc="${ppid_of[$cand]:-}"
-    hops=0
-    while [ -n "$anc" ] && [ "$hops" -lt 100 ]; do
-      [ "$anc" = "$$" ] && return 0
-      anc="${ppid_of[$anc]:-}"
-      hops=$(( hops + 1 ))
-    done
-  done
+  done < <(ps -o args= -p "$children" 2>/dev/null)
   return 1
 }
 
 # Positive start-evidence: either a transcript file appeared under this
 # spawn's $CLAUDE_PROJECTS_DIR/<encoded-cwd>/ newer than the spawn-time
-# reference marker, or a claude process is running as this script's
-# descendant. The transcript probe is the primary, deterministically-tested
+# reference marker, or a claude process is running as the payload shell's
+# direct child. The transcript probe is the primary, deterministically-tested
 # signal (the motivating incident is "no transcript ever appeared"); the
 # process probe is a guarded best-effort secondary.
 #
@@ -930,7 +916,7 @@ _started_evidence() {
   if [ -d "$d" ] && [ -n "$(find "$d" -type f -newer "$spawn_ref" -print -quit 2>/dev/null)" ]; then
     return 0
   fi
-  _claude_descendant_alive && return 0
+  _payload_claude_alive && return 0
   return 1
 }
 
@@ -939,24 +925,12 @@ _started_evidence() {
 # the launcher turns out to be foreground (blocks until window-close) or
 # detached (returns immediately). Polls up to SPAWN_STARTED_GRACE_SECS for
 # start-evidence: the exit sentinel, a fresh transcript, or a live claude
-# descendant.
+# child of the payload shell.
 #
 # On grace-expiry with no evidence, flags failed-to-start: best-effort marks
 # the session-registry record, emits a loud caller-visible stderr line, and
 # writes the fts_marker so await_sentinel/resolve_* can break out of what
 # would otherwise be an unbounded wait.
-#
-# KNOWN LIMITATION (detached slow-start false-failure): for a DETACHED
-# launcher (konsole, or a custom $CLAUDE_TERMINAL_CMD), _claude_descendant_alive
-# is always empty by construction (setsid reparents claude away from this
-# script), so the transcript probe is the ONLY positive evidence available. A
-# real claude that is merely slow to write its first transcript (heavy load,
-# cold cache) past SPAWN_STARTED_GRACE_SECS is flagged failed-to-start even
-# though it is alive and will keep running detached -- a wrong terminal
-# status (144 + registry failed-to-start), not merely a late one. There is no
-# way to retract the flag once the caller has observed it. Callers on slow or
-# loaded hosts should raise SPAWN_STARTED_GRACE_SECS accordingly; see
-# SKILL.md's Verification section for the caller-facing note.
 mark_record_failed_to_start() {
   if [ -n "$SESSION_RECORD_DIR" ] && command -v python3 >/dev/null 2>&1; then
     python3 "$SESSION_REGISTRY_PY" refresh --record "$SESSION_RECORD_DIR" --status failed-to-start || true
@@ -1084,9 +1058,11 @@ resolve_detached() {
 # "*.done" file per sibling spawn accumulates in TMPDIR. Still exactly ONE
 # file per spawn after the task-5137 atomic publish: the trap writes
 # "$sentinel.tmp" and RENAMES it onto $sentinel, so the temp is consumed by
-# the rename rather than added to this leak. Not worth chasing for a few
-# stray bytes in TMPDIR -- reclaimed by normal OS tmp-dir cleanup, same as
-# the mac-terminal tmpscript leak.
+# the rename rather than added to this leak. Likewise one "*.pid" file per
+# sibling spawn: the payload publishes $payload_pid_file after _cleanup has
+# already run. Not worth chasing for a few stray bytes in TMPDIR --
+# reclaimed by normal OS tmp-dir cleanup, same as the mac-terminal tmpscript
+# leak.
 #
 # KNOWN LIMITATION (started-verification watchdog does not apply here): the
 # _started_watchdog background job (forked below, before the emulator case

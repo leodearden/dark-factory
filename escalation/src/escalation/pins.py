@@ -63,6 +63,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     'HUMAN_PARKED_MIN_LEVEL',
+    'ClusterPinRecord',
     'PinClass',
     'PinRecord',
     'PinReport',
@@ -124,6 +125,13 @@ class PinRecord(Protocol):
 
     @property
     def filing_claimant_run_id(self) -> str | None: ...
+
+
+class ClusterPinRecord(PinRecord, Protocol):
+    """A :class:`PinRecord` that also names the ids its cluster holds, read only by :func:`pinned_only_by_human_parked`."""
+
+    @property
+    def members(self) -> Sequence[str]: ...
 
 
 @dataclass(frozen=True)
@@ -429,26 +437,37 @@ def classify_pins(
 
 def pinned_only_by_human_parked(
     report: PinReport,
-    records: Sequence[PinRecord] | None,
+    records: Sequence[ClusterPinRecord] | None,
 ) -> bool:
     """Is everything that PINS this task already in front of a human?
 
     **This docstring is the canonical statement of the predicate; other sites
     point here.**  True iff the read succeeded, something pins the task, and
     every record in the ``queue_handoff`` bucket — the bucket
-    :attr:`PinReport.pins` reads — sits at ``level >= HUMAN_PARKED_MIN_LEVEL``.
+    :attr:`PinReport.pins` reads — is either itself at
+    ``level >= HUMAN_PARKED_MIN_LEVEL``, or a level-1 record that such a
+    human-level handoff in the SAME *records* names in its ``members``.  The
+    L1 an L2 was promoted from stays open, and still pins, until the L2's
+    cascade closes it, yet a human already holds it.  The holder must be among
+    *records* — the caller's read scope — so a cluster L2 filed under another
+    task id holds nothing here.
+
     *report* is what :func:`classify_pins` returned for these same *records*,
     taken rather than recomputed so a caller that already classified them does
     not classify twice; the info, unknown-severity, dead-L0 and
-    store-unavailable rules are therefore the chain's own.  Records that do not
-    pin (see :attr:`PinReport.pins`) cannot spoil the answer, and a store that
-    could not be read never counts as parked.
+    store-unavailable rules are therefore the chain's own, and an info L2 —
+    no handoff — holds nothing.  Records that do not pin (see
+    :attr:`PinReport.pins`) cannot spoil the answer, and a store that could not
+    be read never counts as parked.
 
     Every uncertain input answers False — no records, an unreadable store, an
-    L1 nobody has promoted, a level that is missing or not an int (never
-    coerced: ``'3'``, ``2.9`` and ``True`` are not levels), a handoff id the
-    records do not carry — because a false True silences an alarm for a
-    genuinely stranded task, while a false False costs one quick triage.
+    L1 no human-level handoff in *records* holds, a level that is missing or
+    not an int (never coerced: ``'3'``, ``2.9`` and ``True`` are not levels,
+    and a held member must be a genuine int ``1``), ``members`` that are not a
+    list or tuple of str (never coerced, and a bare string is never
+    substring-matched), a handoff id the records do not carry — because a
+    false True silences an alarm for a genuinely stranded task, while a false
+    False costs one quick triage.
 
     The bar is the LEVEL, not ``severity in BORN_AT_L2_SEVERITIES``: ``level``
     records the promotion to a human, whereas a critical/urgent record still at
@@ -459,8 +478,19 @@ def pinned_only_by_human_parked(
     """
     if report.store_unavailable or records is None or not report.queue_handoff:
         return False
-    levels = {record.id: record.level for record in records}
-    return all(_is_human_level(levels.get(esc_id)) for esc_id in report.queue_handoff)
+    return set(report.queue_handoff) <= _human_parked_ids(report.queue_handoff, records)
+
+
+def _human_parked_ids(
+    handoff_ids: Sequence[str],
+    records: Sequence[ClusterPinRecord],
+) -> frozenset[str]:
+    by_id = {record.id: record for record in records}
+    handoffs = [by_id[esc_id] for esc_id in handoff_ids if esc_id in by_id]
+    holders = [record for record in handoffs if _is_human_level(record.level)]
+    held = frozenset(member for holder in holders for member in _member_ids(holder))
+    held_l1s = [record for record in handoffs if record.id in held and _is_l1(record.level)]
+    return frozenset(record.id for record in holders + held_l1s)
 
 
 def is_queue_handoff(record: PinRecord) -> bool:
@@ -481,3 +511,14 @@ def _is_human_level(level: object) -> bool:
         and not isinstance(level, bool)
         and level >= HUMAN_PARKED_MIN_LEVEL
     )
+
+
+def _is_l1(level: object) -> bool:
+    return isinstance(level, int) and not isinstance(level, bool) and level == 1
+
+
+def _member_ids(record: ClusterPinRecord) -> frozenset[str]:
+    members: object = record.members
+    if not isinstance(members, (list, tuple)):
+        return frozenset()
+    return frozenset(member for member in members if isinstance(member, str))

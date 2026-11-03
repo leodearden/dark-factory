@@ -19,6 +19,7 @@ class EventType(StrEnum):
     task_modified = 'task_modified'
     task_deleted = 'task_deleted'
     deferral_restamped = 'deferral_restamped'
+    task_text_amended = 'task_text_amended'
 
 
 class EventSource(StrEnum):
@@ -98,20 +99,15 @@ class AssembledPayload:
     events_remaining: int = 0  # > 0 exactly when token_budget stopped the assembly
     token_budget: int = 0
 
-
-class JournalEntry(BaseModel):
-    """One per reconciliation operation — full audit trail."""
-
-    id: str
-    run_id: str = ''
-    stage: StageId | None = None
-    timestamp: datetime
-    operation: str
-    target_system: str  # 'graphiti', 'mem0', 'taskmaster'
-    before_state: dict | None = None
-    after_state: dict | None = None
-    reasoning: str = ''
-    evidence: list[dict] = Field(default_factory=list)
+    def budget_report(self) -> dict[str, int]:
+        """How much of token_budget this chunk spent, and on how many events and context items."""
+        return {
+            'estimated_tokens': self.total_tokens,
+            'token_budget': self.token_budget,
+            'events': len(self.events),
+            'context_items': len(self.context_items),
+            'events_deferred': self.events_remaining,
+        }
 
 
 class StageReport(BaseModel):

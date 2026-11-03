@@ -537,7 +537,7 @@ def _hermetic_environ() -> dict[str, str]:
     # worker's clean systemd unit never does, hiding the leak from CI.
     # Prefix-generic by design (3rd point-fix of this class; the set keeps
     # growing) -- sibling mechanism for the orchestrator suite:
-    # orchestrator/tests/test_session_hooks.py::_clear_claude_spawn_env
+    # orchestrator/tests/_session_hook_fixtures.py::isolate_hook_env
     # (task 2643).
     for key in [k for k in env if k.startswith("CLAUDE_SPAWN_")]:
         env.pop(key, None)
@@ -698,9 +698,9 @@ def test_base_env_scrubs_every_claude_spawn_var(
 
     Sets the four vars spawn-claude.sh itself splices into a spawned
     session (SESSION_ID, PARENT_ID, WM_TITLE, RESULT_FILE), the three the
-    orchestrator adds on top (ROLE, PROJECT, TASK_ID -- see task 2940's
-    extension to
-    orchestrator/tests/test_session_hooks.py::_clear_claude_spawn_env), and
+    orchestrator adds on top (ROLE, PROJECT, TASK_ID -- see task 2940; the
+    orchestrator side now scrubs by prefix too, in
+    orchestrator/tests/_session_hook_fixtures.py::isolate_hook_env), and
     a synthetic CLAUDE_SPAWN_FUTURE_KNOB that exists nowhere in the
     codebase. The synthetic one is the whole point: it is the only
     assertion that can distinguish a prefix-generic scrub from a fourth
@@ -2247,17 +2247,15 @@ def test_foreground_claude_descendant_suppresses_flag_without_transcript(
     tmp_path: pathlib.Path,
 ) -> None:
     """A live foreground `claude` descendant with NO transcript must suppress
-    the flag -- exercises _claude_descendant_alive as the LOAD-BEARING
+    the flag -- exercises _payload_claude_alive as the LOAD-BEARING
     evidence (the only positive signal available on this path).
 
     Uses a FOREGROUND launcher (xterm) whose fake claude writes no transcript
     at all under $CLAUDE_PROJECTS_DIR, but stays alive (sleeping) for a fixed
-    6s before exiting -- so the watchdog observes it as a live descendant
-    long before it exits, regardless of grace. Since xterm's fake terminal
-    `exec`s into the payload bash (see _FOREGROUND_TERM_SCRIPT), claude runs
-    as a direct descendant of spawn-claude.sh's own $$ -- unlike a detached
-    launcher (setsid + background job, reparented once the launcher process
-    exits), where this probe is correctly always empty.
+    6s before exiting -- so the watchdog observes it as a live child of the
+    payload shell long before it exits, regardless of grace. The
+    non-descendant lanes are covered by
+    test_live_claude_without_transcript_is_not_flagged_when_payload_is_not_the_launchers_descendant.
 
     Grace is load-adaptive via _set_started_grace (task 3451), the same
     policy as test_transcript_appearance_suppresses_flag. Originally task
@@ -2268,7 +2266,7 @@ def test_foreground_claude_descendant_suppresses_flag_without_transcript(
 
     The fake-claude sleep stays FIXED at 6s, decoupled from the now-larger
     grace: the only validity requirement is that the exit sentinel lands
-    AFTER _claude_descendant_alive observes the live descendant, and since
+    AFTER _payload_claude_alive observes the live claude, and since
     the 6s live window hugely exceeds the watchdog's 0.25s poll interval (and
     the watchdog polls continuously within the grace window), a fixed modest
     sleep keeps the sentinel strictly after evidence while keeping the happy
@@ -2280,7 +2278,7 @@ def test_foreground_claude_descendant_suppresses_flag_without_transcript(
     _write_foreground_terminal(bin_dir, "xterm")
 
     # Fake claude: writes NO transcript anywhere, just stays alive (sleeping)
-    # for a fixed 6s before exiting -- so only _claude_descendant_alive (not
+    # for a fixed 6s before exiting -- so only _payload_claude_alive (not
     # the transcript probe) can suppress the flag.
     claude = bin_dir / "claude"
     claude.write_text("#!/usr/bin/env bash\nsleep 6\nexit 0\n")
@@ -2314,6 +2312,138 @@ def test_foreground_claude_descendant_suppresses_flag_without_transcript(
     record = session_registry.SessionRecord.from_json(record_path.read_text())
     assert record.status == session_registry.Status.EXITED, (
         f"expected registry status exited, got {record.status}"
+    )
+
+
+def _write_server_owned_waiting_terminal(
+    bin_dir: pathlib.Path, name: str, pidfile: pathlib.Path
+) -> None:
+    """Write a fake ``gnome-terminal --wait`` whose payload a server owns.
+
+    The payload is double-forked and orphaned under setsid, so it is never a
+    descendant of spawn-claude.sh (gnome-terminal-server owns it in real
+    life), while this client blocks until the payload exits and then exits 0.
+    """
+    script = textwrap.dedent(f"""\
+        #!/usr/bin/env bash
+        while [[ $# -gt 0 ]]; do
+          if [[ "$1" == "bash" ]]; then
+            break
+          fi
+          shift
+        done
+        ( setsid env --default-signal=HUP,TERM "$@" >/dev/null 2>&1 & echo $! > {pidfile!s} )
+        while kill -0 "$(cat {pidfile!s})" 2>/dev/null; do sleep 0.1; done
+        exit 0
+    """)
+    p = bin_dir / name
+    p.write_text(script)
+    p.chmod(0o755)
+
+
+@pytest.mark.parametrize(
+    "lane", ["tmux", "konsole", "custom-term", "gnome-terminal", "mac-terminal"]
+)
+def test_live_claude_without_transcript_is_not_flagged_when_payload_is_not_the_launchers_descendant(
+    tmp_path: pathlib.Path, lane: str,
+) -> None:
+    """A live claude with no transcript yet (e.g. held at the workspace-trust
+    dialog) must not be flagged failed-to-start on a lane whose payload is
+    owned by a server or orphaned rather than descended from the launcher.
+
+    Task 7943 measured the defect: the process probe anchored on the
+    launcher's own $$, so tmux, konsole and a custom launcher exited a false
+    144, and gnome-terminal printed a false FAILED-TO-START line.
+    mac-terminal is the one lane that runs the payload from a tmpscript
+    rather than ``bash -c``.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    if lane == "tmux":
+        _write_fake_tmux(bin_dir, tmp_path / "tmux_used")
+        terminal_name = "xterm"
+    elif lane == "gnome-terminal":
+        _write_server_owned_waiting_terminal(bin_dir, lane, tmp_path / "payload.pid")
+        terminal_name = lane
+    elif lane == "mac-terminal":
+        _write_fake_open(bin_dir, tmp_path / "open_argv")
+        terminal_name = lane
+    else:
+        _write_detaching_terminal(bin_dir, lane, tmp_path / "leader.pid")
+        terminal_name = lane
+
+    env = _sentinel_test_env(bin_dir, terminal_name, tmp_path)
+    if lane == "tmux":
+        env["CLAUDE_SPAWN_BACKEND"] = "tmux"
+        env["CLAUDE_SPAWN_PROJECT"] = "proj"
+    grace = _set_started_grace(env)
+
+    # No transcript, and no `exec`, so the process keeps its claude argv and
+    # stays alive past the started-grace deadline.
+    claude = bin_dir / "claude"
+    claude.write_text(f"#!/usr/bin/env bash\nsleep {grace + 4}\nexit 0\n")
+    claude.chmod(0o755)
+
+    # scale_timeout=False: `grace` is already load-scaled (task 3599).
+    result = _run_spawn(
+        env, tmp_path, timeout=2 * grace + 4 + 10, scale_timeout=False
+    )
+
+    stderr = result.stderr.decode()
+    assert result.returncode == 0, (
+        f"expected claude's own exit 0 on the {lane} lane, got "
+        f"{result.returncode}\nstderr: {stderr}"
+    )
+    assert "failed-to-start" not in stderr.lower(), (
+        f"a live claude on the {lane} lane must not be flagged, got:\n{stderr}"
+    )
+
+    fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
+    record = session_registry.SessionRecord.from_json(
+        _find_one_record(fleet_root).read_text()
+    )
+    assert record.status == session_registry.Status.EXITED, (
+        f"expected registry status exited, got {record.status}"
+    )
+    assert record.exit_code == 0
+
+    leftover = list((tmp_path / "spawntmp").glob("spawn-claude-*.pid"))
+    assert not leftover, f"the launcher must remove its payload pidfile: {leftover}"
+
+
+def test_tmux_lane_payload_that_never_runs_is_still_flagged(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A tmux window whose payload never runs must still be flagged
+    failed-to-start: a genuinely absent claude leaves no evidence at all.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    _write_fake_claude(bin_dir, 0)
+    _write_fake_tmux(bin_dir, tmp_path / "tmux_used", run_payload=False)
+
+    env = _base_env(bin_dir, "xterm")
+    env["CLAUDE_SPAWN_BACKEND"] = "tmux"
+    env["CLAUDE_SPAWN_PROJECT"] = "proj"
+    # Load-insensitive, as in test_failed_to_start_detected_on_detached_exit0:
+    # no evidence can ever appear, so the pin only bounds the wait.
+    env["SPAWN_STARTED_GRACE_SECS"] = "2"
+
+    result = _run_spawn(env, tmp_path, timeout=20)
+
+    stderr = result.stderr.decode()
+    assert result.returncode == 144, (
+        f"expected exit 144 (EXIT_FAILED_TO_START), got {result.returncode}\n"
+        f"stderr: {stderr}"
+    )
+    assert "failed-to-start" in stderr.lower(), (
+        f"expected a loud failed-to-start line on stderr, got:\n{stderr}"
+    )
+
+    fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
+    record = session_registry.SessionRecord.from_json(
+        _find_one_record(fleet_root).read_text()
+    )
+    assert record.status == session_registry.Status.FAILED_TO_START, (
+        f"expected registry status failed-to-start, got {record.status}"
     )
 
 
@@ -2641,24 +2771,31 @@ def test_trailer_asks_for_a_checkpoint_outcome_and_reflect(tmp_path: pathlib.Pat
     assert "/reflect" in after_exit_clause
 
 
+@pytest.mark.parametrize("backend", ["wm", "tmux"])
 @pytest.mark.parametrize(("self_exit", "expected"), [
-    ("1", True), ("0", False), ("true", False), ("", False), (None, False),
+    (None, True), ("", True), ("true", True), ("1", True), ("0", False),
 ])
 def test_self_exit_input_stamps_the_record_and_gates_the_marker_instruction(
-    tmp_path: pathlib.Path, self_exit: str | None, expected: bool,
+    tmp_path: pathlib.Path, backend: str, self_exit: str | None, expected: bool,
 ) -> None:
     bin_dir = _make_bin_dir(tmp_path)
     prompt_file = tmp_path / "captured_prompt.txt"
     env_file = tmp_path / "captured_env.bin"
+    tmux_used = tmp_path / "tmux_used"
     _write_fake_claude_obeying_exit_marker(bin_dir, prompt_file, env_file)
     _write_foreground_terminal(bin_dir, "xterm")
     env = _base_env(bin_dir, "xterm")
+    env["CLAUDE_SPAWN_BACKEND"] = backend
+    if backend == "tmux":
+        _write_fake_tmux(bin_dir, tmux_used)
+        env["CLAUDE_SPAWN_PROJECT"] = "proj"
     if self_exit is not None:
         env["CLAUDE_SPAWN_SELF_EXIT"] = self_exit
 
     result = _run_spawn(env, tmp_path)
 
     assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+    assert tmux_used.exists() is (backend == "tmux")
     record_path = _find_one_record(pathlib.Path(env["CLAUDE_FLEET_ROOT"]))
     record = session_registry.SessionRecord.from_json(record_path.read_text())
     assert record.self_exit is expected
@@ -3048,6 +3185,7 @@ def _write_fake_tmux(
     marker: pathlib.Path,
     target: str = "fleet-proj:0",
     command_log: pathlib.Path | None = None,
+    run_payload: bool = True,
 ) -> None:
     """Write a fake ``tmux`` binary (Fleet Cockpit C6 tmux lane).
 
@@ -3065,10 +3203,17 @@ def _write_fake_tmux(
     running in the background, matching a real `tmux new-window` call.
     With *command_log*, each ``new-session``/``new-window`` first appends the
     byte length of its whole argv, the figure tmux's command-length limit
-    applies to.
+    applies to. With ``run_payload=False`` the window is "created" (marker,
+    target, exit 0) but the payload never runs -- a launcher that reports
+    success while claude never starts.
     """
     log_length = (
         f"printf '%s' \"$*\" | wc -c >> {command_log!s}" if command_log else ":"
+    )
+    launch_payload = (
+        'setsid env --default-signal=HUP,TERM "$@" >/dev/null 2>&1 &'
+        if run_payload
+        else ":"
     )
     script = textwrap.dedent(f"""\
         #!/usr/bin/env bash
@@ -3085,7 +3230,7 @@ def _write_fake_tmux(
               fi
               shift
             done
-            setsid env --default-signal=HUP,TERM "$@" >/dev/null 2>&1 &
+            {launch_payload}
             echo "{target}"
             exit 0
             ;;
@@ -4020,8 +4165,9 @@ def test_sanitization_preserves_launcher_stamped_record_identity(
 
     Stripping them is in fact corrective: a leaked inherited identity used
     to resolve as ``implementer:<project>#<id>`` on an unrelated session --
-    the same leak orchestrator/tests/test_session_hooks.py::_clear_claude_
-    spawn_env exists to defend against.
+    the same leak
+    orchestrator/tests/_session_hook_fixtures.py::isolate_hook_env exists
+    to defend against.
     """
     bin_dir = _make_bin_dir(tmp_path)
     capture_file = tmp_path / "captured_env.bin"
@@ -5254,3 +5400,21 @@ def test_t3_lane_self_exit_asks_the_thread_to_archive_itself(tmp_path: pathlib.P
     prompt = start.stdin
     assert "t3_thread_organize" in prompt and '"archive"' in prompt
     assert "exit-requested" not in prompt
+
+
+@pytest.mark.parametrize("self_exit", [None, "", "true", "0"])
+def test_t3_lane_leaves_self_exit_off_unless_the_input_is_exactly_1(
+    tmp_path: pathlib.Path, self_exit: str | None,
+) -> None:
+    lane = _T3Lane(tmp_path)
+    lane.env["CLAUDE_SPAWN_MODE"] = "sibling"
+    lane.env.pop("CLAUDE_SPAWN_SELF_EXIT", None)
+    if self_exit is not None:
+        lane.env["CLAUDE_SPAWN_SELF_EXIT"] = self_exit
+
+    result = lane.run()
+
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+    (start,) = lane.started_threads()
+    assert "t3_thread_organize" not in start.stdin and "exit-requested" not in start.stdin
+    assert lane.record().self_exit is False

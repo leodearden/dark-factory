@@ -22,6 +22,7 @@ __all__ = [
     'orchestrator_data_dir',
     'park_eviction_requests_db',
     'runs_db',
+    'scheduler_eligibility_db',
     'scheduler_overrides_db',
     'scheduler_state_json',
     'tasks_db',
@@ -59,6 +60,10 @@ def scheduler_overrides_db(root: StrPath) -> Path:
 
 def park_eviction_requests_db(root: StrPath) -> Path:
     return orchestrator_data_dir(root) / 'park_eviction_requests.db'
+
+
+def scheduler_eligibility_db(root: StrPath) -> Path:
+    return orchestrator_data_dir(root) / 'scheduler_eligibility.db'
 
 
 def tasks_db(root: StrPath) -> Path:

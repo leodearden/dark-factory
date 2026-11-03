@@ -71,7 +71,7 @@ async def test_setup_worktree_writes_branch_base_sha(tmp_path: Path):
     base_sha = 'a' * 40
 
     wf.git_ops.create_worktree = AsyncMock(
-        return_value=WorktreeInfo(path=tmp_path, base_commit=base_sha, stale_commits=0)
+        return_value=WorktreeInfo(path=tmp_path, base_commit=base_sha)
     )
     wf._sync_worktree_venvs = AsyncMock()
 
@@ -171,7 +171,7 @@ async def test_setup_worktree_update_task_soft_fail_logs_and_continues(
     base_sha = 'c' * 40
 
     wf.git_ops.create_worktree = AsyncMock(
-        return_value=WorktreeInfo(path=tmp_path, base_commit=base_sha, stale_commits=0)
+        return_value=WorktreeInfo(path=tmp_path, base_commit=base_sha)
     )
     wf._sync_worktree_venvs = AsyncMock()
     wf.scheduler.update_task = AsyncMock(side_effect=Exception('mcp down'))

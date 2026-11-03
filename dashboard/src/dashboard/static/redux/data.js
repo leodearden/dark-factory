@@ -20,12 +20,13 @@ const {
   unknownDatum: unknownDatumPlaceholder,
 } = window.DF_DATUM;
 
-// The surface -> endpoint maps that decide what is polled (pollSetFor). Module
-// scope, no fallback, RENAMED, for the same reason as the destructure above.
+// poll_scope.js's surface -> endpoint maps, which decide what is polled
+// (pollSetFor). Module scope, no fallback, RENAMED, for the same reason as the
+// destructure above: poll_scope.js owns the bare names.
 const {
   TAB_ENDPOINTS: POLL_TAB_ENDPOINTS,
   CHROME_ENDPOINTS: POLL_CHROME_ENDPOINTS,
-} = window.DF_ENDPOINT_STALENESS;
+} = window.DF_POLL_SCOPE;
 
 // How the wire delivers a key: 'plain' is a bare value, 'datum' is the
 // five-key envelope data/datum.py::Datum.to_wire() emits. Two shared frozen
@@ -199,14 +200,15 @@ window.DF_DATA = {
     verdict: null,
     runs: [],
   },
-  // MERGE_QUEUE: {project_label: {depth, outcomes, latency: {p50, p95, p99,
-  //   mean_ms, with_duration, without_duration}, recent, recent_total: Datum,
+  // MERGE_QUEUE: {project_label: {depth: Datum ({labels, values,
+  //   bucket_minutes}), attempts: Datum ({outcomes, latency: {p50, p95, p99,
+  //   mean_ms, with_duration, without_duration}}), recent, recent_total: Datum,
   //   speculative: Datum, active, in_queue: Datum, live_probe_configured,
   //   active_spark, halt, train_events:
   //   [{event_type, task_id, run_id, timestamp, data: {train_id,
-  //   member_task_ids, ...event-specific keys}}]}}; every recent and active
-  //   row's title is a Datum. The payload's top-level served_at is the receipt
-  //   merge_queue.js stamps those Datums with.
+  //   member_task_ids, ...event-specific keys}}], train_throughput: Datum}};
+  //   every recent and active row's title is a Datum. The payload's top-level
+  //   served_at is the receipt merge_queue.js stamps those Datums with.
   MERGE_QUEUE: {},
   COSTS: {
     summary: { total: 0, runs: 0, today: 0, tokens: null, p95_run_cost: null, delta_pct: null, delta_hint: null },
@@ -757,9 +759,10 @@ let currentWin = '24h';
 
 // Module-scope tab — announced by app.jsx through scopePollingToTab(tab).
 //
-// THE POLL SET IS CHROME_ENDPOINTS ∪ TAB_ENDPOINTS[tab] (pollSetFor): the open
-// tab's own endpoints in full, plus the always-on chrome, with /tasks narrowed
-// to ?projection=census whenever the tab itself does not list it.
+// THE POLL SET IS CHROME_ENDPOINTS ∪ TAB_ENDPOINTS[tab] (pollSetFor), both
+// declared in poll_scope.js: the open tab's own endpoints in full, plus the
+// always-on chrome, with /tasks narrowed to ?projection=census whenever the
+// tab itself does not list it.
 //
 // UNTIL A TAB IS NAMED, OR FOR A TAB ID WITH NO TAB_ENDPOINTS ENTRY, EVERY
 // ENDPOINT IS POLLED. The script-load first poll runs before the text/babel

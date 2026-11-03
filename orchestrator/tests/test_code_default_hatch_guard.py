@@ -19,13 +19,18 @@ mean what the test's own name already claims.
 
 This module holds three things:
 
-* unit tests for the AST detector in ``_config_default_scan``, driven over a
-  SYNTHETIC corpus written to ``tmp_path`` — never over real suite files, so
+* unit tests for the two AST detectors in ``_config_default_scan``, driven over
+  a SYNTHETIC corpus written to ``tmp_path`` — never over real suite files, so
   these unit tests do not churn when the suite changes;
-* the sweep ratchet itself, parametrized per ``test_*.py`` file, so a future
-  regression names the offending file directly;
-* two contract guards pinning the premise every repair rests on (the hatch
-  really does yield package defaults, and it is NOT autouse).
+* two sweep ratchets, each parametrized per ``test_*.py`` file so a future
+  regression names the offending file directly: one bans un-isolated
+  default assertions; the other bans blanking or deleting
+  ``ORCH_CONFIG_PATH``, which isolates only by accident of cwd, except for the
+  tests in ``_ABSENT_CONFIG_PATH_IS_THE_PRECONDITION``, whose every entry is
+  itself checked to still name a live site;
+* contract guards pinning the premises every repair rests on: the hatch
+  really does yield package defaults, it is NOT autouse, and
+  ``require_code_default_config``, which helpers call, admits only its state.
 """
 from __future__ import annotations
 
@@ -33,7 +38,13 @@ import os
 from pathlib import Path
 
 import pytest
-from _config_default_scan import DEFAULT_CONFIG, iter_default_asserting_tests
+from _code_default_hatch import require_code_default_config
+from _config_default_scan import (
+    DEFAULT_CONFIG,
+    ConfigPathWrite,
+    iter_config_path_blanking_sites,
+    iter_default_asserting_tests,
+)
 from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from orchestrator.config import OrchestratorConfig
@@ -192,8 +203,8 @@ from orchestrator.config import OrchestratorConfig
 
 
 @pytest.fixture
-def isolated_config_env(monkeypatch):
-    monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+def isolated_config_env(monkeypatch, tmp_path):
+    monkeypatch.setenv('ORCH_CONFIG_PATH', str(tmp_path / 'project.yaml'))
 
 
 def test_default():
@@ -215,8 +226,8 @@ from orchestrator.config import OrchestratorConfig
 
 class A:
     @pytest.fixture(autouse=True)
-    def _isolated(self, monkeypatch):
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    def _isolated(self, monkeypatch, tmp_path):
+        monkeypatch.setenv('ORCH_CONFIG_PATH', str(tmp_path / 'project.yaml'))
 
 
 class B:
@@ -228,6 +239,120 @@ class B:
         assert _names(found) == {('B', 'test_default')}, (
             'an autouse fixture in a sibling class must not shield this '
             f'class; got {found!r}'
+        )
+
+    @pytest.mark.parametrize('test_def', [
+        '''
+def test_adhoc(monkeypatch):
+    monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    cfg = OrchestratorConfig()
+    assert cfg.starvation_watchdog.skip_threshold == 50
+''',
+        '''
+def test_adhoc(monkeypatch):
+    monkeypatch.delenv("ORCH_CONFIG_PATH", raising=False)
+    cfg = OrchestratorConfig()
+    assert cfg.starvation_watchdog.skip_threshold == 50
+''',
+        '''
+def test_adhoc():
+    with patch.dict(os.environ, {'ORCH_CONFIG_PATH': ''}):
+        cfg = OrchestratorConfig()
+        assert cfg.starvation_watchdog.skip_threshold == 50
+''',
+    ], ids=['setenv-empty', 'delenv', 'patch-dict-empty'])
+    def test_flags_cwd_dependent_env_idioms(self, tmp_path, test_def):
+        """Blanking or deleting the variable is not isolation, because
+        orchestrator/src/orchestrator/config.py::OrchestratorConfig.settings_customise_sources
+        maps '' and unset alike to the CWD-relative config.yaml."""
+        src = _write(tmp_path, 'test_synth_env.py', f'''
+import os
+from unittest.mock import patch
+
+from orchestrator.config import OrchestratorConfig
+
+{test_def}''')
+        found = list(iter_default_asserting_tests(src))
+        assert _names(found) == {(None, 'test_adhoc')}, (
+            f'a blank or delete of ORCH_CONFIG_PATH must not count as '
+            f'isolation; got {found!r}'
+        )
+
+    @pytest.mark.parametrize('scoped_tests, expected', [
+        ('''
+class TestScoped:
+    @pytest.fixture(autouse=True)
+    def _isolated(self, monkeypatch):
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+
+    def test_default(self):
+        cfg = OrchestratorConfig()
+        assert cfg.starvation_watchdog.skip_threshold == 50
+''', ('TestScoped', 'test_default')),
+        ('''
+@pytest.fixture(autouse=True)
+def _isolated_config_env(monkeypatch):
+    monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
+
+
+def test_default():
+    cfg = OrchestratorConfig()
+    assert cfg.starvation_watchdog.skip_threshold == 50
+''', (None, 'test_default')),
+    ], ids=['class-autouse-setenv-empty', 'module-autouse-delenv'])
+    def test_flags_despite_an_autouse_fixture_that_only_blanks_the_variable(
+        self, tmp_path, scoped_tests, expected,
+    ):
+        """An autouse fixture isolates only by the same rule a test body does."""
+        src = _write(tmp_path, 'test_synth_blanking_autouse.py', f'''
+import pytest
+from orchestrator.config import OrchestratorConfig
+
+{scoped_tests}''')
+        found = list(iter_default_asserting_tests(src))
+        assert _names(found) == {expected}, (
+            'an autouse fixture that only blanks or deletes ORCH_CONFIG_PATH '
+            f'must not shield its scope; got {found!r}'
+        )
+
+    def test_flags_a_mere_mention_of_the_variable(self, tmp_path):
+        """Reading the variable writes nothing, so it isolates nothing."""
+        src = _write(tmp_path, 'test_synth_mention.py', '''
+import os
+
+from orchestrator.config import OrchestratorConfig
+
+
+def test_mentions():
+    assert 'ORCH_CONFIG_PATH' in os.environ
+    cfg = OrchestratorConfig()
+    assert cfg.starvation_watchdog.skip_threshold == 50
+''')
+        found = list(iter_default_asserting_tests(src))
+        assert _names(found) == {(None, 'test_mentions')}, (
+            f'a mere mention of ORCH_CONFIG_PATH must not count as isolation; '
+            f'got {found!r}'
+        )
+
+    def test_flags_despite_a_module_pytestmark_not_naming_the_hatch(
+        self, tmp_path,
+    ):
+        """Only a ``pytestmark`` that names the hatch isolates the module."""
+        src = _write(tmp_path, 'test_synth_other_pytestmark.py', '''
+import pytest
+from orchestrator.config import OrchestratorConfig
+
+pytestmark = pytest.mark.timeout(300)
+
+
+def test_default():
+    cfg = OrchestratorConfig()
+    assert cfg.starvation_watchdog.skip_threshold == 50
+''')
+        found = list(iter_default_asserting_tests(src))
+        assert _names(found) == {(None, 'test_default')}, (
+            'a module pytestmark that does not name code_default_config must '
+            f'not shield the module; got {found!r}'
         )
 
 
@@ -409,24 +534,71 @@ def test_hatched(code_default_config):
             'a direct `code_default_config` fixture argument must be honoured'
         )
 
-    @pytest.mark.parametrize('stmt', [
-        "monkeypatch.setenv('ORCH_CONFIG_PATH', '')",
-        'monkeypatch.delenv("ORCH_CONFIG_PATH", raising=False)',
-    ], ids=['setenv-empty', 'delenv'])
-    def test_adhoc_env_idioms(self, tmp_path, stmt):
-        """The two ad-hoc idioms already widespread in the suite count as
-        isolation; this sweep deliberately does not migrate them."""
-        src = _write(tmp_path, 'test_synth_env.py', f'''
+    @pytest.mark.parametrize('repoint', [
+        "monkeypatch.setenv('ORCH_CONFIG_PATH', str(p))",
+        "monkeypatch.setenv(name='ORCH_CONFIG_PATH', value=str(p))",
+        "os.environ['ORCH_CONFIG_PATH'] = str(p)",
+        "patch.dict(os.environ, {'ORCH_CONFIG_PATH': str(p)}).start()",
+        "patch.dict(os.environ, ORCH_CONFIG_PATH=str(p)).start()",
+        "patch.dict('os.environ', {'ORCH_CONFIG_PATH': str(p)}, clear=True).start()",
+    ], ids=['setenv', 'setenv-keywords', 'environ-subscript', 'patch-dict',
+            'patch-dict-keyword', 'patch-dict-string-target-clearing'])
+    def test_explicit_repoint_of_the_config(self, tmp_path, repoint):
+        """A test reading its own project file is not reading the operational one."""
+        src = _write(tmp_path, 'test_synth_repoint.py', f'''
+import os
+from unittest.mock import patch
+
 from orchestrator.config import OrchestratorConfig
 
 
-def test_adhoc(monkeypatch):
-    {stmt}
+def test_repointed(monkeypatch, tmp_path):
+    p = tmp_path / 'project.yaml'
+    {repoint}
     cfg = OrchestratorConfig()
     assert cfg.starvation_watchdog.skip_threshold == 50
 ''')
         assert list(iter_default_asserting_tests(src)) == [], (
-            f'the ad-hoc idiom {stmt!r} must be honoured as isolation'
+            'an explicit re-point of ORCH_CONFIG_PATH must be honoured as '
+            'isolation'
+        )
+
+    @pytest.mark.parametrize('scoped_tests', [
+        '''
+pytestmark = pytest.mark.usefixtures("code_default_config")
+
+
+def test_default():
+    cfg = OrchestratorConfig()
+    assert cfg.starvation_watchdog.skip_threshold == 50
+''',
+        '''
+pytestmark = [pytest.mark.asyncio, pytest.mark.usefixtures('code_default_config')]
+
+
+def test_default():
+    cfg = OrchestratorConfig()
+    assert cfg.starvation_watchdog.skip_threshold == 50
+''',
+        '''
+class TestHatched:
+    pytestmark = pytest.mark.usefixtures("code_default_config")
+
+    def test_default(self):
+        cfg = OrchestratorConfig()
+        assert cfg.starvation_watchdog.skip_threshold == 50
+''',
+    ], ids=['module', 'module-list', 'class-body'])
+    def test_pytestmark_naming_the_hatch(self, tmp_path, scoped_tests):
+        """``pytestmark`` applies its marks to every test in its scope."""
+        src = _write(tmp_path, 'test_synth_pytestmark.py', f'''
+import pytest
+from orchestrator.config import OrchestratorConfig
+
+{scoped_tests}''')
+        assert list(iter_default_asserting_tests(src)) == [], (
+            'a pytestmark naming code_default_config must hatch every test in '
+            'its scope'
         )
 
     def test_config_built_with_kwargs(self, tmp_path):
@@ -526,7 +698,7 @@ from orchestrator.config import OrchestratorConfig
 class TestIsolated:
     @pytest.fixture(autouse=True)
     def _isolated(self, monkeypatch, tmp_path):
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        monkeypatch.setenv('ORCH_CONFIG_PATH', str(tmp_path / 'project.yaml'))
 
     def test_default(self):
         cfg = OrchestratorConfig()
@@ -545,8 +717,8 @@ from orchestrator.config import OrchestratorConfig
 
 
 @pytest.fixture(autouse=True)
-def _isolated_config_env(monkeypatch):
-    monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
+def _isolated_config_env(monkeypatch, tmp_path):
+    monkeypatch.setenv('ORCH_CONFIG_PATH', str(tmp_path / 'project.yaml'))
 
 
 def test_default():
@@ -767,7 +939,142 @@ def test_shadowed_ctor(make_allowlist):
 
 
 # ---------------------------------------------------------------------------
-# THE RATCHET
+# BLANKING-SITE DETECTOR
+# ---------------------------------------------------------------------------
+
+#: One blank or delete in each kind of scope; each site's line is tagged
+#: ``# site: <qualname>`` so the expected line numbers are read, not counted.
+_BLANKING_SITES_MODULE = '''
+import os
+from unittest.mock import patch
+
+import pytest
+
+
+@pytest.fixture
+def module_fixture(monkeypatch):
+    monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)  # site: module_fixture
+
+
+def _helper(monkeypatch):
+    monkeypatch.setenv('ORCH_CONFIG_PATH', '')  # site: _helper
+
+
+def test_module_level():
+    with patch.dict(os.environ, {'ORCH_CONFIG_PATH': ''}):  # site: test_module_level
+        pass
+
+
+class TestX:
+    @pytest.fixture(autouse=True)
+    def _isolated(self, monkeypatch):
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')  # site: TestX._isolated
+
+    def test_y(self, monkeypatch):
+        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)  # site: TestX.test_y
+'''
+
+
+def _tagged_line(source: str, qualname: str) -> int:
+    """1-indexed line of *source* tagged ``# site: <qualname>``."""
+    tag = f'# site: {qualname}'
+    return next(
+        lineno for lineno, line in enumerate(source.splitlines(), start=1)
+        if line.endswith(tag)
+    )
+
+
+class TestBlankingSiteDetector:
+    """``iter_config_path_blanking_sites`` reports every blank or delete of
+    ``ORCH_CONFIG_PATH``, in whatever scope it sits, and nothing else."""
+
+    def test_yields_every_blank_and_delete_with_its_scope(self, tmp_path):
+        src = _write(tmp_path, 'test_synth_sites.py', _BLANKING_SITES_MODULE)
+        expected = [
+            (qualname, _tagged_line(_BLANKING_SITES_MODULE, qualname), kind)
+            for qualname, kind in [
+                ('module_fixture', ConfigPathWrite.DELETE),
+                ('_helper', ConfigPathWrite.BLANK),
+                ('test_module_level', ConfigPathWrite.BLANK),
+                ('TestX._isolated', ConfigPathWrite.BLANK),
+                ('TestX.test_y', ConfigPathWrite.DELETE),
+            ]
+        ]
+        found = sorted(iter_config_path_blanking_sites(src), key=lambda s: s[1])
+        assert found == expected, (
+            f'expected one (qualname, line, kind) per blanking site; got {found!r}'
+        )
+
+    @pytest.mark.parametrize('stmt, kind', [
+        ("monkeypatch.setenv(name='ORCH_CONFIG_PATH', value='')",
+         ConfigPathWrite.BLANK),
+        ("os.environ['ORCH_CONFIG_PATH'] = ''", ConfigPathWrite.BLANK),
+        ("with patch.dict(os.environ, ORCH_CONFIG_PATH=''):\n        pass",
+         ConfigPathWrite.BLANK),
+        ("monkeypatch.delenv(name='ORCH_CONFIG_PATH')", ConfigPathWrite.DELETE),
+        ("os.environ.pop('ORCH_CONFIG_PATH', None)", ConfigPathWrite.DELETE),
+        ("del os.environ['ORCH_CONFIG_PATH']", ConfigPathWrite.DELETE),
+        ("with patch.dict(os.environ, clear=True):\n        pass",
+         ConfigPathWrite.DELETE),
+        ("with patch.dict('os.environ', {'PATH': '/bin'}, clear=True):\n        pass",
+         ConfigPathWrite.DELETE),
+    ], ids=['setenv-keywords', 'environ-subscript', 'patch-dict-keyword',
+            'delenv-keyword', 'environ-pop', 'environ-del', 'patch-dict-clear',
+            'patch-dict-clear-other-keys'])
+    def test_classifies_each_spelling_of_a_blank_or_delete(
+        self, tmp_path, stmt, kind,
+    ):
+        src = _write(tmp_path, 'test_synth_spellings.py', f'''
+import os
+from unittest.mock import patch
+
+
+def test_z(monkeypatch):
+    {stmt}
+''')
+        found = [found_kind for _q, _l, found_kind in iter_config_path_blanking_sites(src)]
+        assert found == [kind], (
+            f'`{stmt}` writes ORCH_CONFIG_PATH as {kind.name}; got {found!r}'
+        )
+
+    @pytest.mark.parametrize('stmt', [
+        "monkeypatch.setenv('ORCH_CONFIG_PATH', str(p))",
+        "with patch.dict(os.environ, {'ORCH_CONFIG_PATH': str(p)}):\n        pass",
+        "os.environ['ORCH_CONFIG_PATH'] = str(p)",
+        "fake_environ = {'ORCH_CONFIG_PATH': ''}\n"
+        "    monkeypatch.setattr(verify.os, 'environ', fake_environ)",
+        "with patch.dict(fake_environ, {'ORCH_CONFIG_PATH': ''}, clear=True):\n"
+        "        pass",
+        "with patch.dict(os.environ, env, clear=True):\n        pass",
+        "with patch.dict(os.environ, {**env}, clear=True):\n        pass",
+        "os.environ.pop('TZ', None)",
+        "assert 'ORCH_CONFIG_PATH' not in os.environ",
+        "assert os.environ.get('ORCH_CONFIG_PATH', '') == ''",
+    ], ids=['setenv-path', 'patch-dict-path', 'environ-subscript-path',
+            'subprocess-env-dict', 'patch-dict-other-mapping',
+            'patch-dict-clear-unreadable-values',
+            'patch-dict-clear-unpacked-values', 'environ-pop-other-key',
+            'membership-read', 'get-read'])
+    def test_yields_nothing_for_a_non_blanking_mention(self, tmp_path, stmt):
+        src = _write(tmp_path, 'test_synth_non_sites.py', f'''
+import os
+from unittest.mock import patch
+
+from orchestrator import verify
+
+
+def test_z(monkeypatch, tmp_path, env, fake_environ):
+    p = tmp_path / 'project.yaml'
+    {stmt}
+''')
+        found = list(iter_config_path_blanking_sites(src))
+        assert found == [], (
+            f'`{stmt}` neither blanks nor deletes ORCH_CONFIG_PATH; got {found!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# THE RATCHETS
 # ---------------------------------------------------------------------------
 
 #: One param per FILE, not one per suite, so a regression names the offending
@@ -799,17 +1106,82 @@ def test_no_unhatched_code_default_assertions(source):
         f'Each of these passes only because the repo does not currently '
         f'declare that key. Declaring it — an ordinary ops edit — turns the '
         f'test red for a reason that has nothing to do with the change.\n'
+        f"Blanking ORCH_CONFIG_PATH with setenv('') or removing it with delenv "
+        f'does not count as isolation: both fall back to a cwd-relative '
+        f'config.yaml.\n'
         f'Remedy: add @pytest.mark.usefixtures("code_default_config") to the '
         f'test (or to its class, if every test in the class is defaults-only), '
         f'so the assertion means what the test name already claims.'
     )
 
 
+#: ``(file name, qualname)`` of the tests whose precondition IS an absent
+#: ``ORCH_CONFIG_PATH`` — each checks what happens when no config is named at
+#: all, which no re-point to any path could express.
+_ABSENT_CONFIG_PATH_IS_THE_PRECONDITION = frozenset({
+    ('test_config.py',
+     'TestLayeredConfig.test_load_config_raises_when_no_config_and_no_env'),
+    ('test_flake_report.py',
+     'TestFlakeLedgerCommand.test_no_config_and_no_env_exits_one_with_an_error'),
+    ('test_eval_task_sampler.py',
+     'TestEvalListFixturesCLI.test_needs_no_orchestrator_config'),
+    ('test_code_default_hatch_guard.py',
+     'TestRequireCodeDefaultConfig.test_fails_when_the_variable_is_unset'),
+})
+
+
+@pytest.mark.parametrize('source', _SUITE_FILES, ids=lambda p: p.name)
+def test_no_cwd_dependent_config_isolation(source):
+    """No test may blank or delete ``ORCH_CONFIG_PATH`` to isolate itself."""
+    sites = [
+        (qualname, lineno, kind)
+        for qualname, lineno, kind in iter_config_path_blanking_sites(source)
+        if (source.name, qualname) not in _ABSENT_CONFIG_PATH_IS_THE_PRECONDITION
+    ]
+    if not sites:
+        return
+    lines = '\n'.join(
+        f'  {qualname}  line {lineno}  {kind.name}'
+        for qualname, lineno, kind in sites
+    )
+    pytest.fail(
+        f'{source.name}: {len(sites)} site(s) blank or delete ORCH_CONFIG_PATH:\n'
+        f'{lines}\n\n'
+        f'orchestrator/src/orchestrator/config.py::OrchestratorConfig.'
+        f'settings_customise_sources maps an empty and an unset ORCH_CONFIG_PATH '
+        f'alike to a config.yaml relative to the process cwd, so these isolate '
+        f'only while no such file sits there.\n'
+        f'Remedy: add @pytest.mark.usefixtures("code_default_config") to the '
+        f'test and delete the line; or, if the test only loads an explicit path '
+        f'through load_config/census_config_keys, just delete the line; or, if '
+        f'the absent variable IS the precondition under test, add an entry to '
+        f'_ABSENT_CONFIG_PATH_IS_THE_PRECONDITION.'
+    )
+
+
+_EXEMPTIONS = sorted(_ABSENT_CONFIG_PATH_IS_THE_PRECONDITION)
+
+
+@pytest.mark.parametrize('file_name, qualname', _EXEMPTIONS,
+                         ids=[f'{f}::{q}' for f, q in _EXEMPTIONS])
+def test_every_exemption_still_names_a_blanking_site(file_name, qualname):
+    """A renamed or migrated exemption must not linger as a silent blind spot."""
+    source = Path(__file__).parent / file_name
+    assert source.is_file(), f'exempted file {file_name} no longer exists'
+    qualnames = {site[0] for site in iter_config_path_blanking_sites(source)}
+    assert qualname in qualnames, (
+        f'{file_name}::{qualname} is exempted from '
+        f'test_no_cwd_dependent_config_isolation but no longer blanks or '
+        f'deletes ORCH_CONFIG_PATH; drop its entry from '
+        f'_ABSENT_CONFIG_PATH_IS_THE_PRECONDITION'
+    )
+
+
 # ---------------------------------------------------------------------------
 # CONTRACT GUARDS
 #
-# The two premises every repair in this sweep rests on.  Both are ratchets:
-# green on arrival, red only if a future change breaks the contract.  Both are
+# The premises every repair in this sweep rests on.  All are ratchets: green
+# on arrival, red only if a future change breaks the contract.  All are
 # behavioural — nothing here asserts on docstring wording, comments or prose.
 # ---------------------------------------------------------------------------
 
@@ -916,3 +1288,27 @@ class TestHatchIsNotAutouse:
             f'an un-hatched test must read the operational config; '
             f'ORCH_CONFIG_PATH is {in_effect}'
         )
+
+
+class TestRequireCodeDefaultConfig:
+    """The helper-side guard admits the hatch's state and refuses every other.
+
+    Helpers that build a defaults-only config call it, so a caller that
+    forgets the hatch fails instead of silently reading the operational yaml.
+    """
+
+    def test_passes_under_the_hatch(self, code_default_config):
+        require_code_default_config()
+
+    def test_fails_on_the_operational_config(self):
+        with pytest.raises(pytest.fail.Exception):
+            require_code_default_config()
+
+    def test_fails_on_a_repoint_to_an_existing_file(self, declared_probe_config):
+        with pytest.raises(pytest.fail.Exception):
+            require_code_default_config()
+
+    def test_fails_when_the_variable_is_unset(self, monkeypatch):
+        monkeypatch.delenv('ORCH_CONFIG_PATH')
+        with pytest.raises(pytest.fail.Exception):
+            require_code_default_config()

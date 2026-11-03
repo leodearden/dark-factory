@@ -1,6 +1,6 @@
 # FalkorDB result-set cap: audit of every read in `graphiti_client.py`
 
-This is the one place where the measured row counts, the paging cost, the per-read classification, the open residual and the ticket cross-references are written down. Source code points here and does not restate them, so a re-measurement is a one-file edit. The rationale for each mechanism stays next to its definition in `fused-memory/src/fused_memory/backends/graphiti_client.py` (`_paged_ro_query`, `_apply_incompleteness_policy`, `IncompleteEnumerationError`, `_read_all_group_episodes`).
+This is the one place where the measured row counts, the paging cost, the per-read classification, the open residual and the ticket cross-references are written down. Source code points here and does not restate them, so a re-measurement is a one-file edit. The rationale for each mechanism stays next to its definition: in `fused-memory/src/fused_memory/backends/graphiti_client.py` (`_paged_ro_query`, `apply_incompleteness_policy`, `IncompleteEnumerationError`), and for the episode read in `fused-memory/src/fused_memory/backends/recent_episodes.py::read_recent_group_episodes`.
 
 Every figure below carries its date. The figures rot: Entity nodes on `dark_factory` read 16038, then 16083, then 16262 over roughly 24 hours of task 4340. Each claim is stated with its reason so that it can be falsified rather than trusted.
 
@@ -35,6 +35,21 @@ The same audit put the embedded populations at about 16083 Entity nodes on `dark
 Every Entity node on `dark_factory` carried `name_embedding`. The gap between the Episodic in-group count and the label count is rows whose `group_id` names another project. On `dark_factory` the gap is 78 rows, attributed to the task-2115 cross-graph leak. On `reify` it is 114 rows, which is the arithmetic difference and has not been separately attributed.
 
 On these figures both stale-embedding reads were truncated on both graphs. `retrieve_episodes` stood at 35% (`dark_factory`) and 47% (`reify`) of the cap, and growing.
+
+### 2026-10-26 (task 7502 architect), read-only `count(*)` probes against localhost:6379
+
+    graph                     Episodic in-group (on the label)
+    dark_factory              8509 (8575)
+    reify                     7818 (7932)
+    solar_challenge           8267
+    solar_challenge_platform  3107
+    scoping_intake            1694
+    stream_touch               645
+    know_live                  623 (662)
+    autopilot_video            330
+    pump_web_ui                 36
+
+The label count is shown only where it differs from the in-group count. The in-group total across the nine graphs is 31,029.
 
 ## MEASURED COST
 
@@ -87,19 +102,15 @@ The following text is moved verbatim from the task-4340 comment block:
 > and ~8.8 s against ~3.9 s (reify).  Seconds, bounded, and it is the price
 > of the answer being right; it is not a liveness risk at these sizes.
 
-### Keyset for `retrieve_episodes` does not reopen that decision
-
-Task 4869 pages `retrieve_episodes` with a keyset cursor. That does NOT reverse the "keyset declined" verdict above. The verdict was a latency argument against adding a second mode INSIDE `_paged_ro_query`. The episode read goes through graphiti-core rather than `ro_query`, and `EpisodicNode.get_by_group_ids(limit, uuid_cursor)` is the only paging that API exposes. It was also chosen for its termination proof, not for latency: the reader stops only on an EMPTY page, so a server cap below the page size cannot truncate it, and it needs neither a refusal guard nor a census.
-
 ### Task 4869's reads: paging cost UNMEASURED
 
-`query_stale_node_embeddings`, `query_stale_edge_embeddings`, `query_edges_by_time_range` and `retrieve_episodes` have no measured paging cost. All four are maintenance or cold paths (reindex, stale-edge cleanup, episode listing). The architect tried a single-page timing probe against production `dark_factory` on 2026-09-24 (SKIP/LIMIT over `name_embedding`). It produced no output within 300 s and was killed (exit 124), and FalkorDB answered a trivial count in 4 ms right afterwards. The cause is unknown. Hypothesis: contention around a fused-memory service restart at 09:22:44 that day. Treat the cost as unknown until someone measures it. Do not estimate it from the 4340 tables.
+`query_stale_node_embeddings`, `query_stale_edge_embeddings` and `query_edges_by_time_range` have no measured paging cost. All three are maintenance or cold paths (reindex, stale-edge cleanup). The architect tried a single-page timing probe against production `dark_factory` on 2026-09-24 (SKIP/LIMIT over `name_embedding`). It produced no output within 300 s and was killed (exit 124), and FalkorDB answered a trivial count in 4 ms right afterwards. The cause is unknown. Hypothesis: contention around a fused-memory service restart at 09:22:44 that day. Treat the cost as unknown until someone measures it. Do not estimate it from the 4340 tables.
 
 The two vector reads cut each page in `WITH ... ORDER BY ... SKIP ... LIMIT` BEFORE `RETURN` projects the embedding. The intent is that each page's sort carries node or edge refs and materialises only `page_size` vectors, not every matched vector. This is REASONED, NOT MEASURED. The throwaway-graph live test confirms only that FalkorDB accepts both templates and pages correctly through them.
 
 ## Per-read classification (post-4869, re-audited 2026-09-24)
 
-Method: `grep -n "ro_query(\|get_by_group_ids\|\.execute_query(" fused-memory/src/fused_memory/backends/graphiti_client.py`, then classify every call site. No read fits none of the categories below, so none is AT RISK.
+Method: `grep -n "ro_query(\|get_by_group_ids\|\.execute_query(" fused-memory/src/fused_memory/backends/graphiti_client.py fused-memory/src/fused_memory/backends/recent_episodes.py`, then classify every call site. No read fits none of the categories below, so none is AT RISK.
 
 ### PAGINATED via `_paged_ro_query` (SKIP/LIMIT pages plus a `count(*)` census)
 
@@ -112,16 +123,20 @@ Method: `grep -n "ro_query(\|get_by_group_ids\|\.execute_query(" fused-memory/sr
 
 All six are policed by the shared `apply_incompleteness_policy`: STRUCTURAL kinds raise `IncompleteEnumerationError`, EMPIRICAL kinds warn and return. For the three `enumerate_*` reads the policy is applied by the caller (a shim, a checked read, or a consumer's own call site), never inside the method. The three 4869 reads and `enumerate_entity_nodes` dedup re-emitted boundary rows with `_first_row_per_uuid`; the two valid-edge reads share `_group_valid_edge_rows`, which dedups on the `(n.uuid, e.uuid)` pair.
 
-### PAGINATED via keyset through graphiti-core
+### BOUNDED, below the cap by an enforced invariant
 
-- `retrieve_episodes` -> `_read_all_group_episodes` (task 4869). The truncation was the worst shape of this bug. graphiti-core orders by uuid DESC, so a capped read dropped the lowest uuids. The Python `created_at` sort then picked the most recent of the survivors: the WRONG episodes, not merely fewer. Page-budget exhaustion raises rather than returning a uuid-ordered prefix.
-  - What it costs (reasoned from the query text, not measured). Every keyset page runs graphiti-core's `MATCH (e:Episodic) WHERE e.group_id IN $group_ids AND e.uuid < $uuid RETURN DISTINCT ... ORDER BY uuid DESC LIMIT $limit`. That matches and sorts every episode below the cursor, `content` included. The read is therefore O(P · N log N) in the database and O(N) in transfer, and it grows with the group's episode count. The caller wants only `last_n` episodes, which `fused-memory/src/fused_memory/server/tools.py::get_episodes` caps at 1000.
-  - DECLINED ALTERNATIVE: a bounded read ordered by `created_at`. Before task 4869, a comment in `retrieve_episodes` named the cheaper fix: our own Cypher with `ORDER BY e.created_at DESC, e.uuid DESC LIMIT $last_n`. With `last_n` at most 1000, below the cap, it would need no paging at all. It would make `_read_all_group_episodes` unnecessary and turn the O(N) transfer into an O(`last_n`) one. The task-4869 plan declined it for three reasons:
-    1. It hard-codes graphiti-core's episode RETURN projection and record decoder (`get_episodic_node_from_record`) in this repo. The keyset path calls the public `EpisodicNode.get_by_group_ids` and inherits both.
-    2. The database would sort `created_at` values as stored. `_as_sortable_utc` reads a naive datetime as UTC and sorts a missing `created_at` last. The ordering tests for tasks 2055 and 2079 (`fused-memory/tests/test_get_episodes_ordering.py`, `fused-memory/tests/test_get_episodes_ordering_residual.py`) pin that behaviour, and a server-side sort would drop it.
-    3. Its correctness rests on the 1000 bound, which lives in `tools.py` and not in `retrieve_episodes`. Another caller that passed a `last_n` above the cap would be silently truncated again.
+- `retrieve_episodes` -> `fused-memory/src/fused_memory/backends/recent_episodes.py::read_recent_group_episodes` (task 7502). One `ro_query`, `MATCH (e:Episodic) WHERE e.group_id IN $group_ids RETURN DISTINCT <graphiti-core's EPISODIC_NODE_RETURN> ORDER BY created_at DESC, uuid DESC LIMIT $limit`, with no range predicate and no paging. Its transfer is proportional to `last_n`, not to the group. Measured by the task-7502 architect on 2026-10-26 at LIMIT 500 on all 9 graphs in the 2026-10-26 table: 0.007 to 0.141 s each, and identical to a Python sort of every `(uuid, created_at)`.
+  - WHY THE KEYSET READER WAS RETIRED. Task 4869's `_read_all_group_episodes` paged graphiti-core's `EpisodicNode.get_by_group_ids` with the cursor predicate `e.uuid < $uuid`. The Episodic(uuid) RANGE index serves that predicate, and it over-returns on a string `<`: see the section 'String < / <= on RANGE-indexed properties (task 7543)' below. On `dark_factory`, `uuid < '80000000-…'` gave 4860 rows where 4277 are true. On `know_live`, `uuid <` the group's minimum uuid returned 37 to 40 rows, the cursor among them, where 0 are true. So the cursor never advanced:
+    - `know_live` raised `IncompleteEnumerationError` at max_pages=1000 with episodes_seen=37586, for 623 episodes.
+    - The other graphs hit `TimeoutError` at the 30 s read budget.
+    - `pump_web_ui` happened to be served exactly.
 
-    Re-open it only with a measurement showing that this cold-path read's cost matters, and with an answer to reasons 2 and 3.
+    Stage 1 therefore received no episodes on 215 of 238 full reconciliation runs from 2026-10-22: on each, `stage_reports['memory_consolidator'].stats['stage1_fetch_degraded'] == ['episodes']`. `fused-memory/tests/test_retrieve_episodes_bounded_read.py::TestRetrieveEpisodesLiveFalkorDB` reproduces the defect on a throwaway graph carrying production's RANGE index set. Against 30 episodes the keyset reader raised `IncompleteEnumerationError` with episodes_seen=30000; the bounded read returns the exact newest-first window.
+  - It answers task 4869's three reasons for declining a bounded read ordered by `created_at`:
+    1. The read would hard-code graphiti-core's projection and decoder. `EPISODIC_NODE_RETURN` and `get_episodic_node_from_record` are imported from graphiti-core, not copied, so an upstream change still flows through.
+    2. The database would sort `created_at` as stored. All 31,029 in-group `created_at` values are fixed-width UTC `YYYY-MM-DDTHH:MM:SS.ffffff+00:00`, written by graphiti-core as `utc_now().isoformat()`, so lexical order is instant order. A microsecond-free `…SS+00:00` also sorts correctly, since `+` < `.`. The returned window is still re-sorted by `_as_sortable_utc` with the uuid tie-break, and graphiti-core's decoder rejects a missing `created_at`. The ordering cases of tasks 2055 and 2079 now live in `fused-memory/tests/test_retrieve_episodes_bounded_read.py`.
+    3. Its correctness would rest on a bound living in `tools.py`. `retrieve_episodes` itself now enforces 1 <= `last_n` < `_RESULTSET_SIZE`, raising `ValueError` before any query. A real server cap below the assumed one would shorten the result to a correct newest-first prefix rather than select the wrong episodes, because `ORDER BY` runs before truncation.
+  - History: task 4869 declined this read for the three reasons above, and task 7502 reopened it with the measurement and those answers.
 
 ### UNPAGINATED BY DESIGN, warns at the cap
 
@@ -135,7 +150,7 @@ All six are policed by the shared `apply_incompleteness_policy`: STRUCTURAL kind
 - Server-side grouped or filtered aggregates that SCAN the whole graph but return a small RESULT set. The cap applies to rows RETURNED, not rows scanned, so a `count`/`collect` that folds 20k rows into a handful is safe. Example: `_scan_duplicate_entity_names`, one row per duplicated name.
 - `CALL db.indexes()` (`list_indices`): one row per index, single digits.
 - Every per-node neighbourhood read. `get_valid_edges_for_node` is named because task 4340 asked about it specifically. Its row count is ONE node's valid degree, and a single node would have to hold more than 10000 of the graph's ~12506 valid edges (2026-08-17) to reach the cap. It is left unpaginated deliberately. Others: `get_connected_entity_uuids`, `dedup_valid_edges_for_node`, and the MENTIONS enumeration in `redirect_node_mentions` (added 2026-09-21).
-  - `redirect_node_mentions` is the one per-node read whose ceiling grows with the graph. Its row count is one entity's incoming MENTIONS, which cannot exceed the graph's Episodic population: 3576 on `dark_factory` and 4851 on `reify` (label counts, 2026-09-24). A truncated enumeration would leave links behind for the caller's DETACH DELETE to destroy. Re-check this read when an Episodic label count approaches the cap.
+  - `redirect_node_mentions` is the one per-node read whose ceiling grows with the graph. Its row count is one entity's incoming MENTIONS, which cannot exceed the graph's Episodic population: 8575 on `dark_factory` and 7932 on `reify` (label counts, 2026-10-26: 86% and 79% of the cap). A truncated enumeration would leave links behind for the caller's DETACH DELETE to destroy. The label counts now approach the cap; `tkt_0RWAVRAYZEDHH4DS10XFX07JE0` under TICKETS owns the re-check.
 
 ## String < / <= on RANGE-indexed properties (task 7543)
 
@@ -148,7 +163,7 @@ Per-site verdicts:
 1. `query_edges_by_time_range`: INEXACT, now FIXED. `_EDGES_IN_VALID_AT_WINDOW_MATCH` builds its upper bound with `exact_string_upper_bound`, and EXPLAIN still shows an Edge By Index Scan for the `>=` bound. The exact census takes 0.08 s against 0.03 s for the indexed form (3 runs). Its only consumer hands every returned uuid to `bulk_remove_edges`, so `fused-memory/src/fused_memory/maintenance/cleanup_stale_edges.py::CleanupManager.find_stale_edges` now also refuses the whole read, dry run included, when any returned edge's `valid_at` is missing or outside `[start, end]`. The CLI's default 2026-03-22 window returns 0 rows on `dark_factory`, `reify` and `solar_challenge`, so no past default-window run is implicated.
 2. The uuid-prefix reads (`_ENTITY_UUID_PREFIX_MATCH`, `_EDGE_UUID_PREFIX_MATCH`): EXACT, UNCHANGED. 164 production cases on `dark_factory` and `reify`, entity and edge reads with prefixes of length 1 to 36, all matched the client-side truth, and 2930 two-sided `[P, P')` ranges on a throwaway graph showed 0 mismatches even without STARTS WITH. Only a one-sided `uuid < '80000000'` over-returns (24512 rows against 21806 in production). EXPLAIN puts `STARTS WITH` in a Filter above the Node By Index Scan, so it is the load-bearing exact predicate should the two-sided range ever over-return. Wrapping `< $upper` would cost the index-served plan and buy nothing measurable.
 3. graphiti-core's previous-episode read: INEXACT, now FIXED. `Graphiti.add_episode` reads its extraction context through `self.retrieve_episodes`, which on FalkorDB runs `e.valid_at <= $reference_time ... ORDER BY e.valid_at DESC LIMIT 10`. On `dark_factory` the reference times 2026-04-10, 06-01, 08-15 and 10-20 each returned the graph's 10 newest episodes, all later than the reference time. Writes with past reference times do happen (Stage 1 retrospective episodes, arm_harness replay). `fused-memory/src/fused_memory/backends/exact_episode_window.py::ExactEpisodeWindowGraphiti` overrides `retrieve_episodes` with the same query bound through `exact_string_upper_bound`, and `GraphitiBackend._client_for`, add_episode's only client, constructs it. The exact read measured 0.02 to 0.19 s on `dark_factory`, `reify` and `solar_challenge`.
-4. The sweep. A tokenizer pass over every string literal looked for Cypher comparisons, the reversed `$x >` / `>=` forms included, in `fused-memory/src`, `fused-memory/scripts`, `scripts/`, `dashboard/` and the `orchestrator`, `shared` and `escalation` sources. Only the three sites above were found; the other matches are SQLite. graphiti-core's other `uuid < $uuid` keyset cursors are reachable only through `_read_all_group_episodes`, which is task 7502's reader.
+4. The sweep. A tokenizer pass over every string literal looked for Cypher comparisons, the reversed `$x >` / `>=` forms included, in `fused-memory/src`, `fused-memory/scripts`, `scripts/`, `dashboard/` and the `orchestrator`, `shared` and `escalation` sources. Only the three sites above were found; the other matches are SQLite. graphiti-core's other `uuid < $uuid` keyset cursors were reachable only through `_read_all_group_episodes`. Task 7502 removed that reader, so no graphiti-core keyset cursor is reachable from fused-memory.
 5. Newer FalkorDB releases. The changelogs were checked up to v4.22.2 and v6.0.3. v6.0.2 lists string range-index fixes, but none describes this superset. Whether a newer release fixes it is NOT verified live; task 7548 owns that check and the retirement of the workaround.
 
 ## History: the task-4340 compounding hazard
@@ -208,3 +223,5 @@ Every id below is a TICKET id, not a task id. The curator resolves tickets to ta
 - `tkt_0RSJP92VQNATQB0FSR20YMXGW8`: re-measure the task-2613 stale-status miss rate against the now-complete corpus. It was computed against a truncated denominator. Status: RESOLVED by task 4851 — see plans/stale-status-snapshot-sweep-report.md.
 - `tkt_0RSJP82N82SNKT2BHRT3HWK3DA`: paginate the four reads the 2026-08-17 audit left AT RISK. Status: RESOLVED by task 4869.
 - `tkt_0RSKFG5RX196H9CJ0RXGJCZF4F`: move this audit out of source into a reference doc. Status: RESOLVED by task 4869 (this file).
+- `tkt_0RW8MZKK11JSNTH38EHZQVVYMF`: audit the remaining `<` / `<=` predicates on RANGE-indexed string properties. Status: RESOLVED by task 7543.
+- `tkt_0RWAVRAYZEDHH4DS10XFX07JE0`: re-check `redirect_node_mentions`' unpaginated MENTIONS read now that Episodic label counts approach the cap. Status: OPEN.

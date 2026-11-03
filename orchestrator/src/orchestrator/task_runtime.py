@@ -151,7 +151,6 @@ def _read_task_entry(
     *,
     task_id: int,
     worktree: Path,
-    meta_root: Path,
     has_worktree: bool,
     lane: str | None,
     lane_state: str | None,
@@ -179,7 +178,7 @@ def _read_task_entry(
     fallback. A read failure already ``None``s ``started`` below, so the
     fallback only ever applies on the success path.
     """
-    artifacts = TaskArtifacts(worktree, meta_root)
+    artifacts = TaskArtifacts.for_task(worktree, str(task_id))
     try:
         entries, _corrupted = artifacts.read_iteration_log()
         loops = len(entries)
@@ -220,11 +219,9 @@ def _build_non_pooled_snapshot(*, git_ops, started_fallback: _StartedFallbackCac
         task_id = _extract_task_id(entry.name)
         if task_id is None:
             continue
-        meta_root = TaskArtifacts.meta_root_for(worktree_base, entry.name)
         results.append(_read_task_entry(
             task_id=task_id,
             worktree=entry,
-            meta_root=meta_root,
             has_worktree=True,
             lane=None,
             lane_state=None,
@@ -252,11 +249,9 @@ def _build_pooled_snapshot(*, git_ops, started_fallback: _StartedFallbackCache) 
         lane_state = _map_lane_state(record.state)
         if lane_state is None:
             continue
-        meta_root = TaskArtifacts.meta_root_for(worktree_base, lane)
         results.append(_read_task_entry(
             task_id=int(record.task_id),
             worktree=worktree_base / lane,
-            meta_root=meta_root,
             has_worktree=(worktree_base / lane).is_dir(),
             lane=lane,
             lane_state=lane_state,

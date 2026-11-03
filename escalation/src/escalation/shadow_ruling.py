@@ -150,6 +150,7 @@ GATED_ROLES: frozenset[str] = L2_AUTO_CLOSE_DENY_ROLES
 _MILESTONE_CATEGORIES: frozenset[str] = frozenset({
     'milestone_gate',
     'milestone_check_failed',
+    'milestone_check_stalled',
 })
 
 #: The reversible actions that are ALSO C1 ``resolution_action`` values, so an

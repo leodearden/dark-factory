@@ -3377,6 +3377,7 @@ class TestBuildCorpusWithheldCensus(_CorpusHarness):
         )
 
         assert withheld.caps == {
+            'sibling': config.curator.pool_sibling_cap,
             'module': config.curator.pool_module_cap,
             'embedding': config.curator.pool_embedding_cap,
             'dependency': config.curator.pool_dependency_cap,
@@ -3473,9 +3474,10 @@ class TestBuildCorpusWithheldCensus(_CorpusHarness):
             curator, CandidateTask(title='T', files_to_modify=[self.MODULE_FILE]),
         )
 
-        assert set(sizes) == {'anchor', 'module', 'embedding', 'dependency'}
+        assert set(sizes) == {'anchor', 'sibling', 'module', 'embedding', 'dependency'}
         assert sizes == {
             'anchor': 0,
+            'sibling': 0,
             'module': config.curator.pool_module_cap,
             'embedding': 0,
             'dependency': 0,
@@ -4767,7 +4769,7 @@ class TestPrepareCandidate:
             )
         assert prepared.pool == []
         assert prepared.pool_sizes == {
-            'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0,
+            'anchor': 0, 'sibling': 0, 'module': 0, 'embedding': 0, 'dependency': 0,
         }
 
 

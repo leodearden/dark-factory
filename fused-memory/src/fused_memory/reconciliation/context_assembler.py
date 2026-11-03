@@ -51,10 +51,10 @@ HINT_QUERIES_EXECUTED = 3
 #: read from an agent-originated one without re-deriving it from `operation`.
 _HINT_JOURNAL_SOURCE = 'reconciliation_hint'
 
-#: Per-item render caps. Budget-relevant: ContextItem derives token_estimate from
-#: the clipped text, so raising either spends token_budget that buys whole events.
-_TASK_DESC_CHARS = 300
-_MEMORY_BODY_CHARS = 500
+#: Per-item render caps from the 2026-10 corpus measurement; reconciliation.token_budget is sized to
+#: hold a measured backlog chunk at these values, so they change together (plans/recon-evidence-caps-measurement-2026-10.md).
+_TASK_DESC_CHARS = 4_000
+_MEMORY_BODY_CHARS = 2_000
 
 
 def estimate_tokens(text: str) -> int:

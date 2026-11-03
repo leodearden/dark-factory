@@ -46,6 +46,15 @@ dict) when any of these invariants is violated:
    rejected as deliberately UNRULED, not merely unimplemented (PRD "Out of
    scope"): a recurring chain of act-then-done deploys has no agreed
    semantics for what re-running the action means.
+8. ``before_done.recheck_secs``, when present, declares that the predicate may
+   answer "not yet" (exit 75) and re-arm (PRD
+   ``plans/completion-driven-triggers-prd.md`` C1). Both halves are delegated:
+   the shape (a strict int >= ``RECHECK_SECS_MIN``) and the kind half
+   (``kind='predicate'``) to the shared ``BeforeDone`` model, and the
+   milestone half (a ``mode='dated'`` milestone, whose ``at`` the re-arm
+   advances) to ``recheck_secs_milestone_conflict``. Unlike recurrence's
+   carrier clauses, the milestone half also holds at ``update_task``, because
+   ``TaskMetadata`` applies the same rule at the write boundary.
 
 ``inject_task_kind`` normalises the metadata dict and sets
 ``metadata.task_kind`` so it is persisted alongside ``before_done`` /
@@ -62,14 +71,29 @@ from typing import Any
 from pydantic import ValidationError
 from shared.before_done_paths import ScriptRootRefused, resolve_script_base
 from shared.repo_paths import DARK_FACTORY_ROOT_ENV, resolve_dark_factory_root
-from shared.task_metadata import Milestone, Recurrence
+from shared.task_metadata import (
+    RECHECK_SECS_MIN,
+    BeforeDone,
+    Milestone,
+    Recurrence,
+    recheck_secs_milestone_conflict,
+)
 
 from fused_memory.middleware.metadata_dict import raw_metadata_dict
 
 __all__ = [
+    'DETERMINISTIC_ROUTING_HINT',
     'deterministic_task_error',
     'inject_task_kind',
 ]
+
+DETERMINISTIC_ROUTING_HINT = (
+    "This is likely task_kind='deterministic' work, which has no commit "
+    'requirement: point metadata.before_done at a committed script for a '
+    'scripted action, or set metadata.always_escalates=True for a human gate. '
+    'If a code deliverable really is intended, declare at least one '
+    'committable path in metadata.files.'
+)
 
 _VALID_KINDS: frozenset[str] = frozenset({'normal', 'deterministic'})
 
@@ -123,6 +147,37 @@ def _validate_milestone(milestone: Any) -> dict[str, Any] | None:
             hint=(
                 "A milestone must be {'mode': 'dated', 'at': '<ISO-8601 datetime>'} "
                 "or {'mode': 'delayed', 'after_secs': <positive int>}."
+            ),
+        )
+    return None
+
+
+def _validate_recheck_secs(before_done: dict[str, Any], milestone: Any) -> dict[str, Any] | None:
+    """Validate a declared before_done.recheck_secs by delegating to its shared homes.
+
+    Returns a ValidationError dict on failure, or None when valid or absent.
+    ``BeforeDone`` is consulted only when ``recheck_secs`` is present, so a
+    recheck-free submission is judged exactly as before.
+    """
+    if before_done.get('recheck_secs') is None:
+        return None
+    try:
+        BeforeDone(**before_done)
+    except (ValidationError, TypeError) as exc:
+        return _validation_error(
+            f'metadata.before_done is invalid: {exc}',
+            hint=(
+                f'recheck_secs must be an int >= {RECHECK_SECS_MIN} on a '
+                "kind='predicate' action; drop it if the predicate never answers 'not yet'."
+            ),
+        )
+    conflict = recheck_secs_milestone_conflict(milestone)
+    if conflict is not None:
+        return _validation_error(
+            conflict,
+            hint=(
+                "Add 'milestone': {'mode': 'dated', 'at': '<ISO-8601 first check>'}, "
+                'or drop recheck_secs.'
             ),
         )
     return None
@@ -351,6 +406,9 @@ def deterministic_task_error(
             always_escalates=always_escalates,
             factory_root_resolver=factory_root_resolver,
         )
+        if err is not None:
+            return err
+        err = _validate_recheck_secs(before_done, milestone)
         if err is not None:
             return err
 
