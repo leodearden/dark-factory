@@ -31,8 +31,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from collections import Counter
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sized
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -2577,7 +2578,7 @@ sorted(iterdir()) (directory-name) order, not oldest-first, so if the
 on-disk backlog ever grows faster than spawns can drain it,
 alphabetically-later stale dirs can persist longer than
 alphabetically-earlier ones (TERMINAL_TTL eligibility itself is unaffected
-either way). The CLI `reap` verb (_run_reap) stays unbounded (limit=None)
+either way). The CLI `reap` verb (run_reap) stays unbounded (limit=None)
 so an operator wanting a full, immediate drain can still clear the entire
 backlog in a single invocation."""
 
@@ -3280,7 +3281,7 @@ def mark_windowless_wm_sessions_exited(
 
     Known trade-off for a multi-DISPLAY fleet (reviewer-flagged): ``wmctrl
     -l`` only reports windows on the single X ``DISPLAY`` the invoking
-    process is connected to -- whatever ``_run_launching``/``_run_reap`` (or
+    process is connected to -- whatever ``_run_launching``/``run_reap`` (or
     a directly-invoked CLI) happens to inherit as ``$DISPLAY`` -- never
     every display a fleet's sessions might be spread across. A session
     whose window genuinely lives on a DIFFERENT display than the one this
@@ -3376,6 +3377,127 @@ def mark_windowless_wm_sessions_exited(
             os.environ.get('DISPLAY'),
         )
     return marked
+
+
+# ---------------------------------------------------------------------------
+# Reap pipeline: one serialised, timed, fail-soft drain (task 7944)
+# ---------------------------------------------------------------------------
+
+REAP_LOCK_FILENAME = 'reap.lock'
+REAP_REPORT_FILENAME = 'last-reap.json'
+
+
+def reap_lock_path(root: Path | str | None = None) -> Path:
+    return fleet_root(root) / REAP_LOCK_FILENAME
+
+
+def reap_report_path(root: Path | str | None = None) -> Path:
+    return fleet_root(root) / REAP_REPORT_FILENAME
+
+
+@contextlib.contextmanager
+def reap_lock(root: Path | str | None = None) -> Iterator[None]:
+    """Blocking exclusive flock on ``<fleet_root>/reap.lock``, serialising reaps.
+
+    The sidecar is a stable lock target, created once and never renamed or
+    deleted, for the same reason as ``decision_id_lock``'s.
+    """
+    lock_path = reap_lock_path(root)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+@dataclass(frozen=True)
+class ReapPhase:
+    """One phase of ``run_reap``: its wall time, and either its count or its error."""
+
+    name: str
+    seconds: float
+    count: int | None
+    error: str | None
+
+
+@dataclass(frozen=True)
+class ReapReport:
+    """What one ``run_reap`` did, persisted at ``reap_report_path``."""
+
+    started_at: str
+    finished_at: str
+    phases: tuple[ReapPhase, ...]
+
+    def to_json(self) -> str:
+        return json.dumps(dataclasses.asdict(self), indent=2) + '\n'
+
+
+_REAP_PHASES: tuple[tuple[str, Callable[[Path | str | None], Sized]], ...] = (
+    ('mark_orphaned_sessions_exited', lambda root: mark_orphaned_sessions_exited(root)),
+    ('mark_windowless_wm_sessions_exited', lambda root: mark_windowless_wm_sessions_exited(root)),
+    ('reap_stale_records', lambda root: reap_stale_records(root)),
+    ('reap_stale_session_pointers', lambda root: reap_stale_session_pointers(root)),
+)
+"""``run_reap``'s phases in mark-then-delete order. Each lambda looks its
+phase up by module-global name when called, so a patched phase is the one
+that runs."""
+
+
+def _run_reap_phase(
+    name: str, phase: Callable[[Path | str | None], Sized], root: Path | str | None
+) -> ReapPhase:
+    started = time.monotonic()
+    try:
+        count = len(phase(root))
+    except Exception as exc:
+        logger.error('run_reap: phase %s failed', name, exc_info=True)
+        return ReapPhase(
+            name=name,
+            seconds=time.monotonic() - started,
+            count=None,
+            error=f'{type(exc).__name__}: {exc}',
+        )
+    return ReapPhase(name=name, seconds=time.monotonic() - started, count=count, error=None)
+
+
+def run_reap(root: Path | str | None = None) -> ReapReport:
+    """Drain the registry: mark orphans/windowless-wm exited, THEN delete stale dirs and pointers.
+
+    The ``reap`` verb, for the operator and for ``_run_launching``'s detached
+    child alike. Concurrent calls queue on ``reap_lock``.
+
+    Mark-then-delete keeps a pass complete: a record either liveness sweep
+    marks exited this pass must not simultaneously be eligible for stale_pid
+    deletion (marking bumps its mtime, so it lands back within
+    reap_stale_records' NON_TERMINAL_HEARTBEAT_TTL heartbeat grace) -- it
+    only becomes reapable later, once it ages past TERMINAL_TTL as any other
+    terminal record does. ``mark_windowless_wm_sessions_exited`` runs here
+    alongside ``mark_orphaned_sessions_exited`` because it marks exactly the
+    live-pid / age<1h wm-display zombies the pid/TTL sweep is forced to keep.
+    ``reap_stale_session_pointers`` runs last so pointers to records removed
+    in this same pass go too.
+
+    Each phase is timed and fail-soft on its own, so one phase's fault never
+    skips the rest. The report is written atomically to
+    ``reap_report_path``: it is the only window into a detached child whose
+    stdio is DEVNULL. A failed report write is logged, not raised.
+    """
+    with reap_lock(root):
+        started_at = datetime.now(UTC).isoformat()
+        phases = tuple(_run_reap_phase(name, phase, root) for name, phase in _REAP_PHASES)
+        report = ReapReport(
+            started_at=started_at, finished_at=datetime.now(UTC).isoformat(), phases=phases
+        )
+        try:
+            _atomic_write_text(reap_report_path(root), report.to_json())
+        except OSError:
+            logger.error('run_reap: failed to write %s', reap_report_path(root), exc_info=True)
+    return report
 
 
 # ---------------------------------------------------------------------------
@@ -4653,7 +4775,7 @@ def _run_launching(env: Mapping[str, str]) -> str:
     call -- out of this task's module scope (would touch harness/systemd).
     The bounded prune (``limit=REAP_BATCH_LIMIT``) caps its own scan/rmtree
     cost per call regardless of backlog size; the CLI ``reap`` verb
-    (``_run_reap``) remains the operator's unbounded full-drain path.
+    (``run_reap``) remains the operator's unbounded full-drain path.
 
     Last, ``reap_stale_session_pointers`` drops dead-pid and dangling pid
     pointers, under the same per-sweep guard; spawns are its only regular
@@ -4738,31 +4860,6 @@ def _run_set_display(
         tmux_target=tmux_target,
         t3_thread_id=t3_thread_id,
     )
-
-
-def _run_reap() -> list[ReapedSessionRecord]:
-    """Run the canonical ``reap`` verb: mark orphans/windowless-wm exited, THEN delete stale dirs.
-
-    Mark-then-delete keeps `reap` complete: a record either liveness sweep
-    would mark exited this same pass must not simultaneously be eligible
-    for stale_pid deletion (marking bumps its mtime, so it lands back
-    within reap_stale_records' NON_TERMINAL_HEARTBEAT_TTL heartbeat grace) --
-    it only becomes reapable later, once it ages past TERMINAL_TTL as any
-    other terminal record does. This is why ``mark_windowless_wm_sessions_exited``
-    (task 2934) runs here too, alongside ``mark_orphaned_sessions_exited`` --
-    it reaps exactly the live-pid / age<1h wm-display zombies (a closed
-    terminal window with a still-alive launcher_pid) the pid/TTL sweep is
-    forced to keep, so `reap` must drive both before deleting.
-
-    ``reap_stale_session_pointers`` runs after the deletion so pointers to
-    records removed in this same pass go too; the return value still lists
-    only the removed record dirs.
-    """
-    mark_orphaned_sessions_exited()
-    mark_windowless_wm_sessions_exited()
-    reaped = reap_stale_records()
-    reap_stale_session_pointers()
-    return reaped
 
 
 def _run_lease_claim(
@@ -6064,7 +6161,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.t3_thread_id,
             )
         elif args.verb == 'reap':
-            _run_reap()
+            run_reap()
         elif args.verb == 'lease-claim':
             _run_lease_claim(
                 args.name, args.slug, args.pid, args.policy, record_slug=args.record_slug
