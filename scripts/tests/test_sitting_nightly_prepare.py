@@ -48,6 +48,7 @@ import json, os, sys, time
 from pathlib import Path
 
 spec = json.loads(Path({spec!r}).read_text())
+time.sleep(spec['stall'])
 argv = sys.argv[1:]
 root = Path(spec['root'])
 inboxes = sorted((root / 'data' / 'sitting' / 'inbox').iterdir())
@@ -128,8 +129,13 @@ def _prep_payload(number: int) -> dict:
 
 
 def _fake_claude(tmp_path: Path, *, stdout: str = OK_RESULT, stderr: str = '', exit_code: int = 0,
-                 sleep: float = 0.0, batches: dict | None = None, recorded: tuple[str, ...] | None = None) -> FakeClaude:
-    """By default the fake is a productive agent: one batch of one preparation, written and recorded."""
+                 sleep: float = 0.0, stall: float = 0.0, batches: dict | None = None,
+                 recorded: tuple[str, ...] | None = None) -> FakeClaude:
+    """By default the fake is a productive agent: one batch of one preparation, written and recorded.
+
+    ``stall`` is how long the fake hangs before doing anything, i.e. a CLI that a loaded host has not
+    yet started when the timeout fires; ``sleep`` is how long it hangs after its work.
+    """
     if batches is None:
         batches, recorded = {'batch-01.json': [_prep_payload(1)]}, ('batch-01.json',)
     bin_dir = tmp_path / 'bin'
@@ -138,7 +144,7 @@ def _fake_claude(tmp_path: Path, *, stdout: str = OK_RESULT, stderr: str = '', e
     spec_file = tmp_path / 'claude-spec.json'
     spec_file.write_text(json.dumps({
         'record': str(calls_file), 'stdout': stdout, 'stderr': stderr,
-        'exit_code': exit_code, 'sleep': sleep, 'env_keys': list(ENV_KEYS),
+        'exit_code': exit_code, 'sleep': sleep, 'stall': stall, 'env_keys': list(ENV_KEYS),
         'root': str(tmp_path), 'batches': batches, 'recorded': list(recorded or ()),
     }))
     fake = bin_dir / 'claude'
@@ -321,7 +327,7 @@ def test_the_child_reads_no_settings_file_and_may_write_only_its_inbox(tmp_path)
     [
         ({'exit_code': 0}, {}),
         ({'exit_code': 3, 'stderr': 'boom'}, {}),
-        ({'sleep': 30.0}, {'timeout_secs': float(TIMEOUT_SECS)}),
+        ({'stall': 30.0}, {'timeout_secs': float(TIMEOUT_SECS)}),
     ],
     ids=['success', 'failure', 'timeout'],
 )
