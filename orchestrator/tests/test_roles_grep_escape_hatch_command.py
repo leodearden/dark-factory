@@ -12,6 +12,7 @@ import shlex
 import subprocess
 from pathlib import Path
 
+import pytest
 from _git_fixtures import RepoSeed, _git_env, seed_repo
 
 from orchestrator.agents.harness_guidance import (
@@ -25,10 +26,10 @@ _LOOKAHEAD_PATTERN = r'config\.(?!git)[a-z_]+'
 
 _SEARCH_SEED = RepoSeed(
     files=(
-        ('.gitignore', 'target/\n'),
+        ('.gitignore', 'target/\nnode_modules/\n'),
         ('src/mod.py', 'config.alpha = 1\nconfig.git = 2\n'),
     ),
-    message='tracked source plus an ignored build tree',
+    message='tracked source plus ignored build and vendored trees',
 )
 
 
@@ -53,6 +54,9 @@ def _seed_search_fixture(tmp_path: Path) -> Path:
     venv_lib.mkdir(parents=True)
     (repo / '.venv' / '.gitignore').write_text('*\n')
     (venv_lib / 'site.py').write_text('config.delta = 5\n')
+    vendored = repo / 'node_modules' / 'pkg' / 'index.py'
+    vendored.parent.mkdir(parents=True)
+    vendored.write_text('config.epsilon = 6\n')
     return repo
 
 
@@ -103,19 +107,28 @@ def test_git_grep_template_refuses_a_directory_outside_any_repo_with_exit_128(
     assert 'not a git repository' in result.stderr, _outcome(result)
 
 
+@pytest.mark.parametrize(
+    ('tree', 'seeded_file'),
+    [
+        ('target', 'target/debug/gen.py'),
+        ('.venv', '.venv/lib/site.py'),
+        ('node_modules', 'node_modules/pkg/index.py'),
+    ],
+    ids=['target', 'venv', 'node_modules'],
+)
 def test_fallback_template_reaches_an_ignored_tree_git_grep_reports_as_no_match(
-    tmp_path: Path,
+    tmp_path: Path, tree: str, seeded_file: str,
 ) -> None:
     repo = _seed_search_fixture(tmp_path)
 
-    git_grep = _run(_render(GIT_GREP_PCRE_COMMAND_TEMPLATE, _LOOKAHEAD_PATTERN, 'target'), repo)
+    git_grep = _run(_render(GIT_GREP_PCRE_COMMAND_TEMPLATE, _LOOKAHEAD_PATTERN, tree), repo)
     assert git_grep.returncode == 1, _outcome(git_grep)
     assert git_grep.stdout == '', _outcome(git_grep)
 
-    fallback_argv = _render(GREP_PCRE_FALLBACK_COMMAND_TEMPLATE, _LOOKAHEAD_PATTERN, 'target')
+    fallback_argv = _render(GREP_PCRE_FALLBACK_COMMAND_TEMPLATE, _LOOKAHEAD_PATTERN, tree)
     fallback = _run(['bash', '-c', shlex.join(fallback_argv)], repo)
     assert fallback.returncode == 0, _outcome(fallback)
-    assert 'target/debug/gen.py' in fallback.stdout, _outcome(fallback)
+    assert seeded_file in fallback.stdout, _outcome(fallback)
 
 
 def test_bash_recourse_leads_with_git_grep_before_the_grep_fallback() -> None:
