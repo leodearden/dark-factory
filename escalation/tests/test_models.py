@@ -702,6 +702,7 @@ class TestEscalationCancelChildrenFields:
         restored = Escalation.from_json(esc.to_json())
 
         assert restored.cancel_children == rows_to_json([row])
+        assert restored.cancel_children is not None
         assert ChildRow.model_validate(restored.cancel_children[0]) == row
 
     def test_children_map_round_trips_and_reparses(self):
@@ -724,6 +725,7 @@ class TestEscalationCancelChildrenFields:
         restored = Escalation.from_json(esc.to_json())
 
         assert restored.superseded_by == [8032, 8033]
+        assert restored.superseded_by is not None
         assert all(type(task_id) is int for task_id in restored.superseded_by)
 
     def test_legacy_json_without_the_three_keys_reads_none(self):
