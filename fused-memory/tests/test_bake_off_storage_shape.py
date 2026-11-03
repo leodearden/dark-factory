@@ -5056,7 +5056,6 @@ class TestRunBakeOffWiring:
         # same contended write, in a collection nobody was watching.
         seeded_projects = {project_id for project_id, _ in snapshots}
         assert len(seeded_projects) == len(mod.ARM_SHAPES) + len(mod.REGROWTH_MODES)
-        assert snapshots
         assert all(persist is False for _, persist in snapshots), snapshots
 
     async def test_the_distractor_slab_is_seeded_into_every_arm(self, monkeypatch):
