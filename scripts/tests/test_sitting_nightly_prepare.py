@@ -12,7 +12,7 @@ import os
 import re
 import subprocess
 import sys
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
@@ -202,6 +202,11 @@ def _flag_values(argv: list[str], flag: str) -> list[str]:
     return values[:next((i for i, value in enumerate(values) if value.startswith('--')), len(values))]
 
 
+def _builder_temp_files(argv: tuple[str, ...]) -> tuple[Path, ...]:
+    """The path after each ``BUILDER_TEMP_FILE_FLAGS`` flag, in argv order; an absent or valueless flag gives none."""
+    return tuple(Path(argv[i + 1]) for i, arg in enumerate(argv[:-1]) if arg in BUILDER_TEMP_FILE_FLAGS)
+
+
 @dataclass(frozen=True)
 class Spawn:
     """A process the run started, as the parent saw it once ``Popen`` had started it."""
@@ -211,8 +216,8 @@ class Spawn:
     """The builder temp files that existed once the process had been started."""
 
     def temp_files(self) -> tuple[Path, ...]:
-        """The path after each of ``BUILDER_TEMP_FILE_FLAGS``; a missing flag raises."""
-        return tuple(Path(self.argv[self.argv.index(flag) + 1]) for flag in BUILDER_TEMP_FILE_FLAGS)
+        """The builder temp files this process was handed, per ``_builder_temp_files``."""
+        return _builder_temp_files(self.argv)
 
 
 def _record_spawns(monkeypatch: pytest.MonkeyPatch) -> list[Spawn]:
@@ -224,10 +229,9 @@ def _record_spawns(monkeypatch: pytest.MonkeyPatch) -> list[Spawn]:
 
     class RecordingPopen(subprocess.Popen):
         def __init__(self, args, *rest, **kwargs):
+            argv = tuple(os.fsdecode(arg) for arg in ([args] if isinstance(args, (str, bytes, os.PathLike)) else args))
             super().__init__(args, *rest, **kwargs)
-            started = Spawn(tuple(args), frozenset())
-            spawns.append(replace(started, present_once_started=frozenset(
-                path for path in started.temp_files() if path.is_file())))
+            spawns.append(Spawn(argv, frozenset(path for path in _builder_temp_files(argv) if path.is_file())))
 
     monkeypatch.setattr(subprocess, 'Popen', RecordingPopen)
     return spawns
@@ -368,6 +372,7 @@ def test_builder_temp_files_are_unlinked_after_the_run(tmp_path, monkeypatch, ca
 
     assert len(spawns) == 1, f'expected exactly one spawn, got {[spawn.argv for spawn in spawns]}'
     spawn = spawns[0]
+    assert len(spawn.temp_files()) == len(BUILDER_TEMP_FILE_FLAGS), f'the CLI must be handed one path per builder temp-file flag: {spawn.argv}'
     assert spawn.present_once_started == frozenset(spawn.temp_files()), 'the builder temp files must exist while the CLI runs'
     assert not any(path.exists() for path in spawn.temp_files()), 'the builder temp files must be unlinked after the run'
     captured = capsys.readouterr()
