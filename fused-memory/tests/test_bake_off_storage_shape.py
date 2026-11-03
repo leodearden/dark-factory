@@ -4450,17 +4450,6 @@ def _driver_config() -> _FakeConfig:
     )
 
 
-class _FakeInstance:
-    """What ``Mem0Backend._get_instance`` returns; only ``db`` is touched."""
-
-    def __init__(self):
-        # A sentinel, not None: the driver must REPLACE it with its no-op, and
-        # `is not sentinel` is how the test proves the stub actually landed.
-        self.db = types.SimpleNamespace(add_history=_FakeInstance._SENTINEL)
-
-    _SENTINEL = object()
-
-
 class _FakeMem0:
     """The Mem0Backend surface the driver touches, and nothing else."""
 
@@ -4481,7 +4470,6 @@ class _FakeMem0:
         #: config is held by REFERENCE, so a post-run read cannot tell "turned
         #: off before seeding" from "turned off too late".
         self.persist_history_at_add: list[tuple[str, bool]] = []
-        self.instances: dict[str, _FakeInstance] = {}
         self.inflight = 0
         self.max_inflight = 0
         self.search_inflight = 0
@@ -4497,9 +4485,6 @@ class _FakeMem0:
         self._add_ticks = add_ticks
         self._add_calls = 0
         self._stored: dict[str, list[dict]] = {}
-
-    async def _get_instance(self, scope):
-        return self.instances.setdefault(scope.project_id, _FakeInstance())
 
     async def add(self, content, scope, metadata=None):
         self.persist_history_at_add.append(

@@ -1241,22 +1241,13 @@ def _driver_config() -> _FakeConfig:
     )
 
 
-class _FakeInstance:
-    def __init__(self):
-        self.db = _types.SimpleNamespace(add_history=None)
-
-
 class _FakeMem0:
     """Records every backend call, which is the whole point on the replay path."""
 
     def __init__(self):
         self.added: list[tuple[str, str]] = []
         self.searches: list[tuple[str, str, int]] = []
-        self.instances: dict[str, _FakeInstance] = {}
         self._stored: dict[str, list[dict]] = {}
-
-    async def _get_instance(self, scope):
-        return self.instances.setdefault(scope.project_id, _FakeInstance())
 
     async def add(self, content, scope, metadata=None):
         await asyncio.sleep(0)
