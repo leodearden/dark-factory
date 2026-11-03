@@ -118,7 +118,9 @@ async def test_plan_stamp_off_main_history_is_not_trusted(tmp_path: Path, answer
 
     f.get_changed_files.assert_awaited_once_with('oldmain123', 'newmain456')
     f.git_ops.is_ancestor_checked.assert_awaited()
-    assert f.git_ops.is_ancestor_checked.await_args.args[0] == 'rewritten999'
+    ancestry_check = f.git_ops.is_ancestor_checked.await_args
+    assert ancestry_check is not None
+    assert ancestry_check.args[0] == 'rewritten999'
 
 
 @pytest.mark.parametrize('architect', [
