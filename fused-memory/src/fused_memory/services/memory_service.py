@@ -6812,6 +6812,7 @@ class MemoryService:
         unverified_claim: bool = False,
         _source: str = 'mcp_tool',
         declared_referents: list[dict] | None = None,
+        defer_transient_mem0_failure: bool = True,
     ) -> AddMemoryResponse:
         """Lightweight classified write — skip extraction pipeline.
 
@@ -6877,6 +6878,12 @@ class MemoryService:
         write. A CONFLICTING declaration is likewise legal here: this layer is
         mechanism, and ``server/entities_gate.py`` is the policy that refuses
         it at the tool boundary.
+
+        ``defer_transient_mem0_failure=False`` is for callers that need the Mem0
+        id synchronously because they act on it in the same call: a transient
+        failure is then reported failed, not queued, and is safe to re-run
+        (an openai error proves nothing persisted, per
+        ``mem0_write_retry.classify_transient_provider_failure``).
         """
         scope = Scope(project_id=project_id, agent_id=agent_id, session_id=session_id)
         write_op_id = str(uuid_mod.uuid4())
@@ -7101,8 +7108,12 @@ class MemoryService:
                         },
                     )
             except Exception as e:
-                _mem0_pending = await self._defer_mem0_write_for_retry(
-                    e, intent_id=intent_id, write_op_id=write_op_id
+                _mem0_pending = (
+                    await self._defer_mem0_write_for_retry(
+                        e, intent_id=intent_id, write_op_id=write_op_id
+                    )
+                    if defer_transient_mem0_failure
+                    else None
                 )
                 if _mem0_pending is not None:
                     stores_pending_retry.append(SourceStore.mem0)
