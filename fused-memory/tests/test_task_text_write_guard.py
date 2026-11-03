@@ -22,6 +22,10 @@ from shared.task_text_fingerprint import task_text_fingerprint
 
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.middleware.task_text_write_guard import (
+    TASK_TEXT_FP_KEY,
+    TEXT_BASE_REQUIRED,
+    TEXT_BASE_STALE,
+    TEXT_VERIFIED_KEY,
     TextWriteUnconfirmedFinding,
     check_text_base,
     plan_text_write,
@@ -30,6 +34,10 @@ from fused_memory.middleware.task_text_write_guard import (
     verify_text_write_landed,
 )
 from fused_memory.reconciliation.event_buffer import EventBuffer
+from fused_memory.reconciliation.prompts.stage2 import (
+    STAGE2_SYSTEM_PROMPT,
+    build_stage2_system_prompt,
+)
 
 EMPTY_TEXT_FP = task_text_fingerprint(None, None)
 
@@ -664,3 +672,21 @@ class TestInterceptorTextVerificationBoundary:
 
         assert _error_type(result) == 'ReconTaskTextBaseRequired'
         assert taskmaster.get_task.await_count == 1
+
+
+class TestStage2PromptNamesTheTextWriteContract:
+    """Stage 2 writes task text through the MCP tool, so its prompt is the only
+    place it learns the contract: a replace-mode write without the token is
+    rejected, and only ``text_verified`` confirms an amendment landed."""
+
+    @pytest.mark.parametrize(
+        'name',
+        ['expected_text_fp', TASK_TEXT_FP_KEY, TEXT_VERIFIED_KEY, TEXT_BASE_STALE, TEXT_BASE_REQUIRED],
+    )
+    @pytest.mark.parametrize(
+        'prompt',
+        [STAGE2_SYSTEM_PROMPT, build_stage2_system_prompt('autopilot_video')],
+        ids=['default', 'autopilot_video'],
+    )
+    def test_the_prompt_names_it(self, prompt: str, name: str):
+        assert name in prompt
