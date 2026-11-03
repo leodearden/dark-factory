@@ -27,6 +27,7 @@ from _mem0_intent_fixtures import rate_limit_error
 from fused_memory.models.enums import SourceStore
 from fused_memory.models.memory import Mem0WriteState
 from fused_memory.models.scope import Scope
+from fused_memory.services.mem0_add_outcome import Mem0AddOutcome
 from fused_memory.services.memory_service import MemoryService
 from fused_memory.services.write_journal import WriteJournal
 
@@ -409,6 +410,54 @@ class TestAddMemoryTransientDeferral:
             if op['backend'] == 'mem0'
         ]
         assert [op['success'] for op in mem0_ops] == [0, 1]
+
+    @pytest.mark.asyncio
+    async def test_a_landed_retry_hands_its_supersedes_to_the_landing_hook(
+        self, recovery_service, recovery_journal
+    ):
+        svc = recovery_service
+        superseded = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+        svc.mem0.add = AsyncMock(side_effect=rate_limit_error())
+        await svc.add_memory(
+            content=_DEFERRED_CONTENT,
+            category='procedural_knowledge',
+            project_id='dark_factory',
+            metadata={'supersedes': [superseded]},
+        )
+        (intent,) = await recovery_journal.get_mem0_intents()
+        svc.mem0.add = AsyncMock(return_value={'results': [{'id': 'mem0-late'}]})
+        landed: list[tuple[Any, Mem0AddOutcome]] = []
+
+        async def on_landed(row, outcome):
+            landed.append((row, outcome))
+
+        summary = await svc.retry_due_mem0_intents(
+            now=datetime.datetime.fromisoformat(intent['next_attempt_at'])
+            + datetime.timedelta(seconds=1),
+            on_landed=on_landed,
+        )
+
+        assert summary.landed == 1
+        ((row, outcome),) = landed
+        assert row['id'] == intent['id']
+        assert json.loads(row['metadata'])['supersedes'] == [superseded]
+        assert outcome.memory_ids == ('mem0-late',)
+
+    @pytest.mark.asyncio
+    async def test_a_reissue_returns_a_typed_outcome(self, recovery_service, recovery_journal):
+        svc = recovery_service
+        svc.mem0.add = AsyncMock(side_effect=rate_limit_error())
+        await svc.add_memory(
+            content=_DEFERRED_CONTENT,
+            category='procedural_knowledge',
+            project_id='dark_factory',
+        )
+        (intent,) = await recovery_journal.get_mem0_intents()
+        svc.mem0.add = AsyncMock(return_value={'results': [{'id': 'mem0-late'}]})
+
+        outcome = await svc.reissue_mem0_intent(intent)
+
+        assert outcome == Mem0AddOutcome(memory_ids=('mem0-late',), empty_result_error=None)
 
     @pytest.mark.asyncio
     async def test_the_tool_payload_carries_the_pending_store(self, recovery_service):
