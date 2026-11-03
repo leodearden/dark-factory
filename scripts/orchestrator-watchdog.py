@@ -48,13 +48,11 @@ scripts/orchestrator-watchdog.timer).
 
 import contextlib
 import enum
-import json
 import math
 import os
 import shlex
 import subprocess
 import sys
-import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -62,8 +60,15 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from types import ModuleType
 
-# A flat sibling in scripts/, found because a directly executed script puts its
+# Flat siblings in scripts/, found because a directly executed script puts its
 # own directory at sys.path[0]; never run this file via `python -m` or `-I`.
+from _watchdog_state import (
+    atomic_write_json,
+    read_clock_epoch,
+    read_json_state,
+    stamp_clock,
+    within_min_interval,
+)
 from _watched_module_removals import removals_since
 
 # (port, systemd unit name) pairs to watch.  Port values match each
@@ -224,17 +229,6 @@ try:
     MODULE_REMOVAL_GRACE_SECS = int(os.environ["ORCH_MODULE_REMOVAL_GRACE_SECS"])
 except (KeyError, ValueError):
     MODULE_REMOVAL_GRACE_SECS = 600
-
-# Provenance recorded in every clock this script stamps (task 4823). These
-# MIRROR df_pytest_isolation.py::CLOCK_PROVENANCE_SOURCE_KEY /
-# ::CLOCK_PROVENANCE_SESSION_KEY / ::PYTEST_SESSION_TOKEN_ENV, which
-# df_pytest_isolation.py::deploy_clock_change_report reads and is the one place
-# that explains what they are for. They cannot be imported: this script is
-# stdlib-only and imports no first-party package (the same constraint that
-# forced the four-way FLEET_DEPLOY_CLOCK_RELPATH mirror below). Both mirrors are
-# pinned together by tests/scripts/test_orchestrator_watchdog.py.
-CLOCK_SOURCE = "orchestrator-watchdog.py"
-PYTEST_SESSION_TOKEN_ENV = "DF_PYTEST_SESSION_TOKEN"
 
 # Path to the shared fleet-deploy clock file: the SAME file
 # restart-all-orchestrators.sh stamps (atomically, only on its verified-fresh
@@ -1224,202 +1218,6 @@ def _newest_fm_watched_commit_epoch() -> int | None:
         return None
 
 
-def _atomic_write_json(path: str, payload: dict) -> bool:
-    """Atomically write *payload* as JSON to *path*; return True iff it landed.
-
-    The shared write primitive behind every piece of persisted watchdog state
-    (every clock, and the fm liveness streak) — extracted
-    in task 3764 so the mkdir/mktemp/write/rename dance is defined ONCE rather
-    than copy-pasted per state file. Python analogue of
-    restart-all-orchestrators.sh's stamp_fleet_deploy_clock: mkdir -p, mktemp a
-    sibling in the SAME directory (so os.replace is a same-filesystem atomic
-    rename), write, rename over the target.
-
-    Fail-soft: makedirs / temp-file / rename errors are logged and swallowed
-    (the temp file, if created, is unlinked) rather than raised. A persistence
-    hiccup must never crash the Type=oneshot watchdog or abort the rest of the
-    tick. Every caller's contract must therefore tolerate the write silently
-    not having happened — see _record_fm_liveness_failure, where a failed write
-    means the streak counter cannot accumulate and so fails SAFE (toward never
-    restarting).
-
-    RETURNS True only after the rename succeeded. Fail-soft is not the same as
-    fail-safe: for most callers a missed write is benign, but for one it is
-    not — _stamp_fm_liveness_restart_clock ARMS a cap, so a silently-missed
-    write leaves the liveness revive unbounded. Such callers must inspect this
-    value and say so loudly; the log line here alone is one line among healthy
-    ticks and is not sufficient signal on its own.
-    """
-    tmp_path: str | None = None
-    try:
-        target_dir = os.path.dirname(path)
-        os.makedirs(target_dir, exist_ok=True)
-        fd, tmp_path = tempfile.mkstemp(
-            prefix="." + os.path.basename(path) + ".", dir=target_dir
-        )
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(json.dumps(payload) + "\n")
-        os.replace(tmp_path, path)
-        tmp_path = None  # renamed away — nothing to clean up
-        return True
-    except Exception as exc:  # noqa: BLE001
-        if tmp_path is not None:
-            # Best-effort cleanup: if the temp file cannot be removed there is
-            # nothing further to do, and raising here would mask *exc* (the
-            # actual write failure) that the log line below reports.
-            with contextlib.suppress(OSError):
-                os.unlink(tmp_path)
-        log(f"_atomic_write_json: failed to write {path}: {exc!r}")
-        return False
-
-
-def _read_json_state(path: str) -> dict | None:
-    """Return the parsed JSON dict at *path*, or None if it cannot be read.
-
-    The shared fail-open read primitive paired with _atomic_write_json
-    (task 3764). Returns None — never raises — when the file is missing,
-    corrupt, truncated (a torn concurrent write), or unreadable.
-
-    A MISSING file is the normal "no state yet" case (fresh checkout, never
-    stamped, streak just cleared) and is deliberately SILENT: logging it would
-    spam the journal on every 60s tick. Corrupt/unreadable files ARE logged —
-    those are genuine degradations, and swallowing them silently is exactly the
-    silent-degradation failure mode the project's norms forbid.
-
-    A well-formed but NON-OBJECT body (``[1, 2]``, ``"hello"``, ``null`` — a
-    partially-overwritten or hand-edited file) is logged for the same reason:
-    it is indistinguishable in consequence from a corrupt one, since every
-    caller then loses its state. Before the task-3764 extraction this case
-    raised TypeError inside _read_last_fm_deploy_epoch and WAS logged; letting
-    it become a silent None would have made the deploy backstop and the
-    liveness cap both vanish with zero journal evidence.
-    """
-    try:
-        with open(path, encoding="utf-8") as f:
-            raw = json.load(f)
-        if not isinstance(raw, dict):
-            log(
-                f"ignoring non-object watchdog state at {path}: "
-                f"{type(raw).__name__}"
-            )
-            return None
-        return raw
-    except FileNotFoundError:
-        return None
-    except (OSError, ValueError, TypeError) as exc:
-        log(f"ignoring unreadable/corrupt watchdog state at {path}: {exc!r}")
-        return None
-
-
-def _read_clock_epoch(path: str, label: str) -> float | None:
-    """Return the ``ts`` epoch from the ``{ts, iso}`` clock file at *path*, or None.
-
-    The shared CLOCK-layer read primitive, one level above _read_json_state
-    (which owns the missing/corrupt/non-object branches) — extracted so the
-    watchdog's clocks cannot drift apart in their fail-open contracts.
-    Every one writes and reads the same ``{ts, iso, source, pytest_session}``
-    schema that restart-all-orchestrators.sh's ``stamp_fleet_deploy_clock`` and
-    ``StaleServiceRestartCoordinator._load_last_fire_wall`` agree on, so a
-    single ``float(ts)`` extraction serves every tier. The two provenance keys
-    (task 4823) are read ONLY by the pytest-side deploy-clock guard; nothing
-    here extracts them, and a reader added later should not start.
-
-    *label* names the clock in the log line only ("fleet-deploy clock",
-    "fm-deploy clock", ...) so a journal reader can tell WHICH clock
-    degraded; nothing branches on it.
-
-    FAIL-OPEN, uniformly: returns None — never raises — when the file is
-    missing (nothing has ever been stamped, or a fresh checkout with no
-    data/ yet), corrupt, unreadable, or carrying an unusable ``ts``. Every
-    caller must treat None as "the min-interval cap does not apply" (fail
-    toward letting the restart/backstop run, never toward silencing it
-    indefinitely on the strength of one unreadable file).
-    """
-    state = _read_json_state(path)
-    if state is None:
-        return None
-    try:
-        return float(state["ts"])
-    except (KeyError, TypeError, ValueError) as exc:
-        log(f"ignoring {label} at {path} with unusable 'ts': {exc!r}")
-        return None
-
-
-def _stamp_clock(path: str) -> bool:
-    """Atomically stamp *path* with the current time and provenance; True iff it landed.
-
-    The shared CLOCK-layer write primitive paired with _read_clock_epoch.
-    Python analogue of restart-all-orchestrators.sh's stamp_fleet_deploy_clock,
-    emitting the identical schema: an integer epoch plus a human-readable UTC
-    rendering that exists purely so an operator reading the file by hand does
-    not have to decode a bare number, plus the two provenance keys below.
-
-    SCHEMA {ts, iso, source, pytest_session} (task 4823; ts/iso predate it).
-    The two provenance keys are ADDITIVE and inert to every reader — each
-    extracts `ts` and nothing else — and what they are FOR is stated once, in
-    df_pytest_isolation.py::deploy_clock_change_report. The one contract this
-    writer must hold on its own: `pytest_session` is ALWAYS present, empty
-    included, because empty is the positive statement "no pytest session was an
-    ancestor of this write" whereas an omitted key is indistinguishable from a
-    pre-4823 writer and fails the run.
-
-    NO SANITISER HERE, unlike the bash sibling, and the asymmetry is deliberate
-    rather than an oversight: _atomic_write_json serialises through json.dumps,
-    which escapes any value correctly. stamp_fleet_deploy_clock builds its body
-    with printf, which cannot escape JSON at all, so it must strip the token
-    first (falling back to a non-empty sentinel, since stripping to "" would
-    forge the one value that forgives a change) or risk emitting a corrupt clock
-    — and _read_clock_epoch fails OPEN on a corrupt body, which would disarm the
-    very cap the stamp arms.
-
-    Fail-soft by inheritance from _atomic_write_json: a makedirs/temp/rename
-    error is logged and swallowed rather than raised, and reported back as
-    False. Callers whose SAFETY depends on the stamp landing (rather than
-    merely their convenience) must inspect that value and say so at their own
-    call site — see _stamp_fm_liveness_restart_clock.
-
-    Every clock this serves gets the fields uniformly, whether or not it is
-    one of the guarded paths: a schema that diverged between siblings is
-    exactly the drift these mirrors exist to prevent.
-    """
-    now = time.time()
-    return _atomic_write_json(
-        path,
-        {
-            "ts": int(now),
-            "iso": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(now)),
-            "source": CLOCK_SOURCE,
-            "pytest_session": os.environ.get(PYTEST_SESSION_TOKEN_ENV, ""),
-        },
-    )
-
-
-def _within_min_interval(secs: int, read_epoch: Callable[[], float | None]) -> bool:
-    """Return True iff *read_epoch*'s clock is newer than *secs* seconds ago.
-
-    The shared min-interval GATE, extracted so every cap shares one
-    definition of "too soon" rather than a copy each that could drift.
-
-    Takes the clock READER rather than a path on purpose: each cap's named
-    reader (_read_last_fleet_deploy_epoch and its siblings) stays the single
-    seam the tests substitute at, so a wrapper can never silently bypass its
-    own reader.
-
-    Two fail directions, both toward LETTING the caller act:
-      - *secs* <= 0 disables the cap outright, and the clock is not even read
-        (a disabled cap must not depend on a readable file);
-      - a None epoch (missing/corrupt/unreadable clock) counts as OUTSIDE the
-        window. Failing the other way would let one unreadable file suppress
-        every future restart indefinitely.
-    """
-    if secs <= 0:
-        return False
-    last = read_epoch()
-    if last is None:
-        return False
-    return (time.time() - last) < secs
-
-
 def _read_last_fleet_deploy_epoch() -> float | None:
     """Return the last verified fleet-deploy epoch from FLEET_DEPLOY_CLOCK_PATH, or None.
 
@@ -1428,7 +1226,7 @@ def _read_last_fleet_deploy_epoch() -> float | None:
     ``restart-all-orchestrators.sh``'s ``stamp_fleet_deploy_clock`` writes, so
     all three tiers agree on the shared clock's format.
 
-    Fail-open via _read_clock_epoch, mirroring ``_load_last_fire_wall``:
+    Fail-open via read_clock_epoch, mirroring ``_load_last_fire_wall``:
     returns None (never raises) when the file is missing (no fleet deploy has
     ever verified fresh, or a fresh checkout with no data/ yet), or when it is
     corrupt, unreadable, or missing its ``ts`` key. Callers must treat None as
@@ -1436,7 +1234,7 @@ def _read_last_fleet_deploy_epoch() -> float | None:
     silence). Reads FLEET_DEPLOY_CLOCK_PATH at CALL time, not at def time, so
     tests that monkeypatch the module global still work.
     """
-    return _read_clock_epoch(FLEET_DEPLOY_CLOCK_PATH, "fleet-deploy clock")
+    return read_clock_epoch(FLEET_DEPLOY_CLOCK_PATH, "fleet-deploy clock", log)
 
 
 def _within_fleet_deploy_min_interval() -> bool:
@@ -1449,9 +1247,9 @@ def _within_fleet_deploy_min_interval() -> bool:
     cap outright (the clock is not even read). A missing/unreadable clock
     (``_read_last_fleet_deploy_epoch`` returns None) is treated as "outside
     the window" — fail toward letting the backstop run, not toward silencing
-    it indefinitely. Both behaviours live in the shared _within_min_interval.
+    it indefinitely. Both behaviours live in the shared within_min_interval.
     """
-    return _within_min_interval(
+    return within_min_interval(
         ORCH_RESTART_MIN_INTERVAL_SECS, _read_last_fleet_deploy_epoch
     )
 
@@ -1495,7 +1293,7 @@ def _pid_alive(pid) -> bool:
 def _read_fleet_lease() -> dict | None:
     """Return the in-flight fleet-redeploy lease body at FLEET_LEASE_PATH, or None.
 
-    The LEASE-layer read primitive, one level above _read_json_state (which
+    The LEASE-layer read primitive, one level above read_json_state (which
     owns the missing/corrupt/non-object branches), so the lease inherits one
     fail-open contract shared with the clocks rather than introducing another.
     A MISSING file is the normal "no sweep running" case and is
@@ -1510,7 +1308,7 @@ def _read_fleet_lease() -> dict | None:
     monkeypatch the module global still work — the same requirement
     _read_last_fleet_deploy_epoch states.
     """
-    return _read_json_state(FLEET_LEASE_PATH)
+    return read_json_state(FLEET_LEASE_PATH, log)
 
 
 def _fleet_lease_age_secs(lease: dict) -> float | None:
@@ -1599,7 +1397,7 @@ def _within_fleet_staleness_head_start() -> bool:
     age of the newest watched commit. That comparison is algebraically
     identical to ``now - last_fleet_deploy < ORCH_RESTART_MIN_INTERVAL_SECS +
     STALENESS_GRACE_SECS``, so it is expressed as that single summed cap and
-    reuses the one shared gate (_within_min_interval) rather than recomputing
+    reuses the one shared gate (within_min_interval) rather than recomputing
     a window-open instant inline.
 
     WHY the anchor moved (task 4754): the old commit-age anchor measured the
@@ -1610,7 +1408,7 @@ def _within_fleet_staleness_head_start() -> bool:
     start inhibited nothing at a boundary — and the 60s-cadence backstop beat
     the event-driven coordinator 5 times out of 5 across 08-24/25/26.
 
-    Fail-open in BOTH directions, inherited from _within_min_interval rather
+    Fail-open in BOTH directions, inherited from within_min_interval rather
     than re-derived here: a missing/corrupt/unreadable clock makes
     _read_last_fleet_deploy_epoch return None and this returns False, so the
     backstop still acts (a missing clock must never disable a backstop
@@ -1625,7 +1423,7 @@ def _within_fleet_staleness_head_start() -> bool:
     that monkeypatch the module globals still work, mirroring
     scripts/orchestrator-watchdog.py::_read_last_fleet_deploy_epoch.
     """
-    return _within_min_interval(
+    return within_min_interval(
         ORCH_RESTART_MIN_INTERVAL_SECS + STALENESS_GRACE_SECS,
         _read_last_fleet_deploy_epoch,
     )
@@ -1700,7 +1498,7 @@ def _read_last_fm_deploy_epoch() -> float | None:
     stamp_fleet_deploy_clock), so ``float(ts)`` reads it identically — the
     provenance keys are inert here.
 
-    Fail-open via _read_clock_epoch: returns None (never raises) when the file
+    Fail-open via read_clock_epoch: returns None (never raises) when the file
     is missing (no fm deploy has ever verified fresh, or a fresh checkout with
     no data/ yet), or when it is corrupt, unreadable, or missing its ``ts``
     key. Callers must treat None as "the min-interval cap does not apply"
@@ -1708,7 +1506,7 @@ def _read_last_fm_deploy_epoch() -> float | None:
     FM_DEPLOY_CLOCK_PATH at CALL time, not at def time, so tests that
     monkeypatch the module global still work.
     """
-    return _read_clock_epoch(FM_DEPLOY_CLOCK_PATH, "fm-deploy clock")
+    return read_clock_epoch(FM_DEPLOY_CLOCK_PATH, "fm-deploy clock", log)
 
 
 def _within_fm_deploy_min_interval() -> bool:
@@ -1722,7 +1520,7 @@ def _within_fm_deploy_min_interval() -> bool:
     window" — fail toward letting the backstop run, not toward silencing it
     indefinitely.
     """
-    return _within_min_interval(FM_RESTART_MIN_INTERVAL_SECS, _read_last_fm_deploy_epoch)
+    return within_min_interval(FM_RESTART_MIN_INTERVAL_SECS, _read_last_fm_deploy_epoch)
 
 
 def _within_fm_staleness_head_start() -> bool:
@@ -1734,7 +1532,7 @@ def _within_fm_staleness_head_start() -> bool:
     the newest fm-watched commit. Algebraically identical to ``now -
     last_fm_deploy < FM_RESTART_MIN_INTERVAL_SECS + STALENESS_GRACE_SECS``, so
     it is expressed as that single summed cap and reuses the one shared gate
-    (_within_min_interval) rather than recomputing a window-open instant
+    (within_min_interval) rather than recomputing a window-open instant
     inline.
 
     WHY the anchor moved (task 4754): the old commit-age anchor measured the
@@ -1755,7 +1553,7 @@ def _within_fm_staleness_head_start() -> bool:
     tier's clock, so an orchestrator fleet redeploy never opens or resets fm's
     head-start window and vice-versa.
 
-    Fail-open in BOTH directions, inherited from _within_min_interval rather
+    Fail-open in BOTH directions, inherited from within_min_interval rather
     than re-derived here: a missing/corrupt/unreadable clock makes
     _read_last_fm_deploy_epoch return None and this returns False, so the fm
     backstop still acts (a missing clock must never disable a backstop
@@ -1769,7 +1567,7 @@ def _within_fm_staleness_head_start() -> bool:
     Both globals are read INSIDE the body (not defaulted at def time) so tests
     that monkeypatch the module globals still work.
     """
-    return _within_min_interval(
+    return within_min_interval(
         FM_RESTART_MIN_INTERVAL_SECS + STALENESS_GRACE_SECS,
         _read_last_fm_deploy_epoch,
     )
@@ -1788,17 +1586,17 @@ def _stamp_fm_deploy_clock() -> None:
     restart can never silence the backstop).
 
     Fail-soft: makedirs / temp-file / rename errors are logged and swallowed
-    by _atomic_write_json (the temp file, if created, is unlinked) rather than
+    by atomic_write_json (the temp file, if created, is unlinked) rather than
     raised — a stamp failure must not crash the detached unit. The backstop
     still self-heals via ActiveEnterTimestamp next tick, so the clock is only a
     secondary flap-guard.
 
-    Thin wrapper over the shared _stamp_clock helper (task 3764), which owns
+    Thin wrapper over the shared stamp_clock helper (task 3764), which owns
     the ``{ts, iso, source, pytest_session}`` payload schema and the
     atomic-write dance. Reads FM_DEPLOY_CLOCK_PATH at CALL time, not at def
     time, so tests that monkeypatch the module global still work.
     """
-    _stamp_clock(FM_DEPLOY_CLOCK_PATH)
+    stamp_clock(FM_DEPLOY_CLOCK_PATH, log)
 
 
 def _read_last_fm_liveness_restart_epoch() -> float | None:
@@ -1806,12 +1604,12 @@ def _read_last_fm_liveness_restart_epoch() -> float | None:
 
     Sibling of _read_last_fm_deploy_epoch reading a DIFFERENT file
     (FM_LIVENESS_RESTART_CLOCK_PATH, task 3764) with the identical ``{ts, iso}``
-    schema and fail-open contract. Fail-open via _read_clock_epoch: a missing
+    schema and fail-open contract. Fail-open via read_clock_epoch: a missing
     clock is the normal "the watchdog has never revived fm" case; a corrupt
     one is logged. Callers must treat None as "the cap does not apply".
     """
-    return _read_clock_epoch(
-        FM_LIVENESS_RESTART_CLOCK_PATH, "fm liveness restart clock"
+    return read_clock_epoch(
+        FM_LIVENESS_RESTART_CLOCK_PATH, "fm liveness restart clock", log
     )
 
 
@@ -1828,13 +1626,13 @@ def _within_fm_liveness_restart_min_interval() -> bool:
     by the fm staleness deploy cadence: reviving a wedge never delays a merged
     fm change's deploy, and a scheduled deploy never licenses an extra kill.
 
-    Fail direction (inherited from the shared _within_min_interval): an
+    Fail direction (inherited from the shared within_min_interval): an
     absent/unreadable clock counts as OUTSIDE the window. Failing the other
     way would let one unreadable file suppress every future revive
     indefinitely — worse than an extra restart the streak has already
     justified.
     """
-    return _within_min_interval(
+    return within_min_interval(
         FM_LIVENESS_RESTART_MIN_INTERVAL_SECS, _read_last_fm_liveness_restart_epoch
     )
 
@@ -1849,12 +1647,12 @@ def _stamp_fm_liveness_restart_clock() -> bool:
 
     Called from fused_memory_liveness_pass() in the ``finally`` around
     restart_unit(), so the cap is armed even if the restart raised or the
-    subsequent streak clear fails. Thin wrapper over the shared _stamp_clock
+    subsequent streak clear fails. Thin wrapper over the shared stamp_clock
     helper, which owns the payload schema and the atomic-write dance -- see
-    _stamp_clock for the field list, so this docstring cannot drift from it.
+    stamp_clock for the field list, so this docstring cannot drift from it.
 
     THE RETURN VALUE IS LOAD-BEARING and must not be dropped. This is the one
-    watchdog write whose failure points the WRONG way: _atomic_write_json is
+    watchdog write whose failure points the WRONG way: atomic_write_json is
     fail-soft, so a clock that cannot be written (a stale root-owned file,
     ENOSPC, exhausted inodes) leaves the cap unarmed while streak writes keep
     succeeding — and the pass then degrades to a revive roughly every
@@ -1864,7 +1662,7 @@ def _stamp_fm_liveness_restart_clock() -> bool:
     ActiveEnterTimestamp on the next tick — nothing else reconstructs this one,
     so the caller must surface the failure loudly.
     """
-    return _stamp_clock(FM_LIVENESS_RESTART_CLOCK_PATH)
+    return stamp_clock(FM_LIVENESS_RESTART_CLOCK_PATH, log)
 
 
 def _write_fm_liveness_streak(count: int, verdict: str, now: float) -> None:
@@ -1876,12 +1674,12 @@ def _write_fm_liveness_streak(count: int, verdict: str, now: float) -> None:
     ``--report`` row) can see WHAT kind of failure is accumulating and WHEN,
     rather than a bare integer.
 
-    Fail-soft by inheritance: _atomic_write_json logs and swallows any write
+    Fail-soft by inheritance: atomic_write_json logs and swallows any write
     error. A write that does not land simply means the streak cannot
     accumulate, which fails SAFE — the threshold is never reached and
     fused-memory is left alone.
     """
-    _atomic_write_json(
+    atomic_write_json(
         FM_LIVENESS_STREAK_PATH,
         {
             "count": int(count),
@@ -1889,6 +1687,7 @@ def _write_fm_liveness_streak(count: int, verdict: str, now: float) -> None:
             "ts": now,
             "iso": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(now)),
         },
+        log,
     )
 
 
@@ -1906,7 +1705,7 @@ def _read_fm_liveness_streak() -> tuple[int, float] | None:
     negatives are nonsense for a "consecutive failures so far" counter, and
     silently coercing them could only ever manufacture a restart.
     """
-    state = _read_json_state(FM_LIVENESS_STREAK_PATH)
+    state = read_json_state(FM_LIVENESS_STREAK_PATH, log)
     if state is None:
         return None
     try:
@@ -1997,7 +1796,7 @@ def _record_fm_liveness_failure(
     streaks: the safe direction.
 
     WRITE FAILURES ARE SAFE. _write_fm_liveness_streak inherits
-    _atomic_write_json's fail-soft contract, so a write that does not land is
+    atomic_write_json's fail-soft contract, so a write that does not land is
     logged and swallowed. The returned count is still correct for THIS tick,
     but nothing persisted — so the next tick starts from 1 again and the
     counter can never climb to FM_LIVENESS_STREAK_THRESHOLD. A watchdog that
@@ -2028,16 +1827,16 @@ def _record_fm_liveness_failure(
 def _read_last_unit_parity_epoch() -> float | None:
     """Return the last dashboard unit-parity check epoch, or None.
 
-    Thin named reader over _read_clock_epoch, like its fleet and fm siblings,
+    Thin named reader over read_clock_epoch, like its fleet and fm siblings,
     so this stays the seam tests substitute at. Fail-open: None means the
     check is due.
     """
-    return _read_clock_epoch(UNIT_PARITY_CLOCK_PATH, "unit-parity clock")
+    return read_clock_epoch(UNIT_PARITY_CLOCK_PATH, "unit-parity clock", log)
 
 
 def _within_unit_parity_min_interval() -> bool:
     """Return True iff the last parity check is newer than UNIT_PARITY_MIN_INTERVAL_SECS."""
-    return _within_min_interval(UNIT_PARITY_MIN_INTERVAL_SECS, _read_last_unit_parity_epoch)
+    return within_min_interval(UNIT_PARITY_MIN_INTERVAL_SECS, _read_last_unit_parity_epoch)
 
 
 def unit_parity_verdict() -> tuple[UnitParityVerdict, str]:
@@ -2101,7 +1900,7 @@ def unit_parity_pass() -> None:
     try:
         if _within_unit_parity_min_interval():
             return
-        _stamp_clock(UNIT_PARITY_CLOCK_PATH)
+        stamp_clock(UNIT_PARITY_CLOCK_PATH, log)
         verdict, report = unit_parity_verdict()
         if verdict == UnitParityVerdict.DRIFT:
             log(

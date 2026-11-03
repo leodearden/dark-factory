@@ -2226,7 +2226,7 @@ def test_within_fleet_staleness_head_start_false_when_clock_absent(
 ) -> None:
     """False when the fleet clock is missing/corrupt/unreadable.
 
-    The fail-OPEN direction inherited from _within_min_interval: with no
+    The fail-OPEN direction inherited from within_min_interval: with no
     readable clock there is no window-open instant to measure a head start
     from, so the head start must not apply. Failing the other way would let
     one unreadable file silence the fleet staleness backstop forever.
@@ -2245,7 +2245,7 @@ def test_within_fleet_staleness_head_start_false_when_both_caps_disabled(
     """False WITHOUT reading the clock when the summed cap is <=0.
 
     Both ORCH_RESTART_MIN_INTERVAL_SECS and STALENESS_GRACE_SECS at 0 sum to
-    0, which _within_min_interval short-circuits before touching the reader —
+    0, which within_min_interval short-circuits before touching the reader —
     a disabled head start must not depend on a readable file.
     """
     wdog = _load_watchdog()
@@ -2271,7 +2271,7 @@ def test_within_fleet_staleness_head_start_holds_grace_when_only_the_cap_is_disa
 
     The REALISTIC disabled-cap configuration an operator produces, as distinct
     from test_within_fleet_staleness_head_start_false_when_both_caps_disabled
-    above (which zeroes BOTH knobs and so only exercises _within_min_interval's
+    above (which zeroes BOTH knobs and so only exercises within_min_interval's
     <=0 short-circuit).
 
     With the cap at 0 the summed cap is STALENESS_GRACE_SECS (1800 > 0), so
@@ -3235,7 +3235,7 @@ def test_staleness_pass_head_start_fails_open_on_unreadable_fleet_clock(
     fleet staleness backstop PERMANENTLY and INVISIBLY: with no readable
     stamp there is no window-open instant, so a gate that answered "still
     inside the head start" would answer that on every tick forever. That is
-    the exact direction scripts/orchestrator-watchdog.py::_within_min_interval
+    the exact direction scripts/_watchdog_state.py::within_min_interval
     documents itself as failing away from, and routing the new gate through it
     is what makes this true by construction rather than by re-derivation.
 
@@ -7125,7 +7125,7 @@ _SESSION_TOKEN_SENTINEL = "3f9c1a8b2d7e4f60a5b3c1d9e7f50246"
 def test_the_fm_deploy_clock_stamp_carries_provenance(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:
-    """The fm clock covered EXPLICITLY, not by inheritance from _stamp_clock.
+    """The fm clock covered EXPLICITLY, not by inheritance from stamp_clock.
 
     It is the second PROTECTED_DEPLOY_CLOCK_RELPATHS entry and the one the
     measured 2026-08-28 incidents actually pointed at — the genuine event there
@@ -7266,7 +7266,7 @@ def test_within_fm_staleness_head_start_false_when_clock_absent(
 ) -> None:
     """False when fm's clock is missing/corrupt/unreadable.
 
-    The fail-OPEN direction inherited from _within_min_interval: with no
+    The fail-OPEN direction inherited from within_min_interval: with no
     readable fm clock there is no window-open instant to measure a head start
     from, so the head start must not apply. Failing the other way would let
     one unreadable file silence the fm staleness backstop forever.
@@ -7285,7 +7285,7 @@ def test_within_fm_staleness_head_start_false_when_both_caps_disabled(
     """False WITHOUT reading fm's clock when the summed cap is <=0.
 
     Both FM_RESTART_MIN_INTERVAL_SECS and STALENESS_GRACE_SECS at 0 sum to 0,
-    which _within_min_interval short-circuits before touching the reader — a
+    which within_min_interval short-circuits before touching the reader — a
     disabled head start must not depend on a readable file.
     """
     wdog = _load_watchdog()
@@ -8642,7 +8642,7 @@ def test_fm_staleness_pass_head_start_fails_open_on_unreadable_fm_clock(
     PERMANENTLY and INVISIBLY, because with no readable stamp there is no
     window-open instant and the gate would answer "still inside the head start"
     on every tick forever. That is the direction
-    scripts/orchestrator-watchdog.py::_within_min_interval documents itself as
+    scripts/_watchdog_state.py::within_min_interval documents itself as
     failing away from.
 
     Neither fm clock gate is monkeypatched, so both evaluate the real
@@ -9644,7 +9644,7 @@ def test_record_fm_liveness_failure_persists_across_module_instances(
 # is clamped "unlike the two knobs below": their "<=0 means 'disable the cap' —
 # a safe direction, since a disabled cap only removes a restriction on an
 # already-justified restart". That claim held for
-# FM_LIVENESS_RESTART_MIN_INTERVAL_SECS (_within_min_interval returns False on
+# FM_LIVENESS_RESTART_MIN_INTERVAL_SECS (within_min_interval returns False on
 # secs<=0 without even reading the clock) and was FALSE for the max-age knob:
 # _record_fm_liveness_failure tests `(now - prior_ts) > FM_LIVENESS_STREAK_MAX_AGE_SECS`,
 # so at 0 the comparison is true for essentially every prior entry, EVERY streak
@@ -9894,7 +9894,7 @@ def test_liveness_pass_unarmable_cap_is_logged_distinguishably(
     defaults) indefinitely — strictly worse flapping than the one-per-hour
     bound this layer promises. Nothing else reconstructs this clock (unlike
     the fm deploy clock, which self-heals from ActiveEnterTimestamp), so one
-    `_atomic_write_json:` line buried among healthy ticks is not enough
+    `atomic_write_json:` line buried among healthy ticks is not enough
     signal.
     """
     wdog = _load_watchdog()
@@ -12589,7 +12589,7 @@ def test_unit_parity_pass_stamps_on_attempt_even_when_the_checker_cannot_run(
 def test_unit_parity_pass_fails_open_on_a_corrupt_clock(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:
-    """A corrupt clock body lets the check RUN — the _read_clock_epoch contract.
+    """A corrupt clock body lets the check RUN — the read_clock_epoch contract.
 
     Failing the other way would let one unreadable file silence the gate for
     good.
@@ -12607,7 +12607,7 @@ def test_unit_parity_pass_fails_open_on_a_corrupt_clock(
 def test_unit_parity_min_interval_of_zero_disables_the_gate(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:
-    """<=0 disables the throttle, the shared _within_min_interval contract."""
+    """<=0 disables the throttle, the shared within_min_interval contract."""
     wdog = _load_watchdog()
     clock = _isolate_unit_parity(wdog, monkeypatch, tmp_path)
     clock.write_text(json.dumps({"ts": int(time.time())}))
