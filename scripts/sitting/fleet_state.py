@@ -31,9 +31,6 @@ from types import MappingProxyType
 from typing import Generic, Literal, TypeVar
 
 from _task_db_scan import (
-    TaskDbProblem,
-    TaskDbUnreadable,
-    connect_ro,
     runs_db_path,
     tasks_db_path,
 )
@@ -48,6 +45,7 @@ from orchestrator.session_registry import (
     normalize_escalations_dir,
 )
 from shared.project_id import fold_project_token
+from shared.tasks_db_readonly import TaskDbProblem, TaskDbUnreadable, connect_ro
 from sitting import inventory, payloads
 from sitting.inventory import QUEUE_SUBDIRS, PendingRecords, Shortfall
 from sitting.payloads import RejectedMarker

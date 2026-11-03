@@ -50,11 +50,9 @@ from pathlib import Path
 from typing import NamedTuple
 
 from _task_db_scan import (
-    TABLE_NAMES_SQL,
-    TaskDbUnreadable,
-    connect_ro,
     tasks_db_path,
 )
+from shared.tasks_db_readonly import TABLE_NAMES_SQL, TaskDbUnreadable, connect_ro
 
 _GIT_TIMEOUT_SECS = 30
 
@@ -213,7 +211,7 @@ def introspect_ddl(ddl: str) -> tuple[Table, ...]:
 
     The store lives in memory and is discarded. Callers hand the DDL in as text
     (``shared/src/shared/task_store_schema.py::TASK_STORE_DDL`` for the fixture
-    subset guards) because this script never imports ``shared``.
+    subset guards).
     """
     conn = sqlite3.connect(":memory:")
     try:

@@ -3,13 +3,13 @@
 
 READ-ONLY / REPORT-ONLY: this module and its CLI never mutate a task record or
 a manifest file. Every database connection it opens goes through
-``_task_db_scan.py::connect_ro``, a read-only SQLite URI (``mode=ro``), so the
-sweep is structurally incapable of writing to the live WAL database the running
-orchestrator holds open. Manifest YAML on disk and git history are only ever
-read. There is no ``--apply`` flag and no MCP client is ever constructed.
-REMEDIATION IS A SEPARATE, REVIEWED FOLLOW-UP — repairing a descriptor from
-this report is never done by this script (the audit/repair split of tasks
-3146 / 3329).
+``shared/src/shared/tasks_db_readonly.py::connect_ro``, a read-only SQLite URI
+(``mode=ro``), so the sweep is structurally incapable of writing to the live
+WAL database the running orchestrator holds open. Manifest YAML on disk and git
+history are only ever read. There is no ``--apply`` flag and no MCP client is
+ever constructed. REMEDIATION IS A SEPARATE, REVIEWED FOLLOW-UP — repairing a
+descriptor from this report is never done by this script (the audit/repair
+split of tasks 3146 / 3329).
 
 WHAT IT ANSWERS. ``shared.delivered_check_polarity`` gates NEW descriptors at
 authoring time, where the reference tree is free: ``commit_planning`` runs
@@ -94,12 +94,12 @@ from _task_db_scan import (
     AUDIT_EXIT_NO_ROOT,
     AUDIT_EXIT_NOTHING_AUDITED,
     AUDIT_EXIT_OK,
-    connect_ro,
     format_coverage_block,
     format_kv_line,
     run_audit_cli,
     tasks_db_path,
 )
+from shared.tasks_db_readonly import connect_ro
 
 # Bind `shared` to the SAME checkout as this script via a __file__-relative
 # path, never a hardcoded absolute. An editable install puts the MAIN
@@ -108,6 +108,9 @@ from _task_db_scan import (
 # the MAIN checkout's primitive. Same reasoning and same form as
 # scripts/audit_combine_gate_marker_loss.py::_SHARED_SRC. The shared.* imports below MUST
 # stay after this insert.
+# The shared.tasks_db_readonly import ABOVE is sound without it: importing
+# _task_db_scan already ran `import _checkout`, which bound this checkout's
+# shared/src.
 _SHARED_SRC = Path(__file__).resolve().parent.parent / "shared" / "src"
 if str(_SHARED_SRC) not in sys.path:
     sys.path.insert(0, str(_SHARED_SRC))
@@ -510,12 +513,12 @@ class TaskIndex(NamedTuple):
 def load_task_index(db_path: str) -> TaskIndex:
     """Statuses, ``updated_at`` stamps and stamped checks of *db_path*.
 
-    Opens through ``_task_db_scan.py::connect_ro`` (read-only; see there for
-    refusals). Malformed metadata is SKIPPED rather than raised: a single
-    undecodable row must not abort a whole-project sweep, and
-    ``extract_delivered_checks`` already implements exactly that benign-absent
-    contract (the same one ``lock_charter_guard.extract_files`` uses at the
-    wire boundary).
+    Opens through ``shared/src/shared/tasks_db_readonly.py::connect_ro``
+    (read-only; see there for refusals). Malformed metadata is SKIPPED rather
+    than raised: a single undecodable row must not abort a whole-project sweep,
+    and ``extract_delivered_checks`` already implements exactly that
+    benign-absent contract (the same one ``lock_charter_guard.extract_files``
+    uses at the wire boundary).
     """
     conn = connect_ro(db_path)
     try:
@@ -747,9 +750,9 @@ def load_open_dependents(db_path: str) -> dict[int, tuple[int, ...]]:
     the exact silent-fail-soft that exit code exists to prevent. Only the "no
     such table" shape is swallowed; every other ``sqlite3.Error`` propagates
     so a genuinely corrupt database still surfaces. The open goes through
-    ``_task_db_scan.py::connect_ro``, which refuses a store with NO tables at
-    all before the query runs — it guarantees some table, not this one, so
-    the swallow still has work to do.
+    ``shared/src/shared/tasks_db_readonly.py::connect_ro``, which refuses a
+    store with NO tables at all before the query runs — it guarantees some
+    table, not this one, so the swallow still has work to do.
     """
     conn = connect_ro(db_path)
     try:
