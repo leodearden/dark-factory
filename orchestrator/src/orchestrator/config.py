@@ -104,6 +104,10 @@ CONTINUITY_CREDIT: float = 120.0
 CONTINUITY_PROBE_TTL_SECS: float = 300.0
 CONTINUITY_CREDIT_MAX_AGE_SECS: float = 604800.0
 
+# Default of DeterministicConfig.predicate_recheck_stall_cap
+# (plans/completion-driven-triggers-prd.md C1).
+PREDICATE_RECHECK_STALL_CAP: int = 30
+
 # Per-process warn-once dedup for coerce_tier()'s unrecognized-value WARNING
 # below, keyed by a length-capped repr(value) (safe for unhashable/non-str
 # inputs) — mirrors the b3_gate._warned_description_read_failures /
@@ -536,6 +540,24 @@ class ReviewConfig(BaseModel):
     # incumbent diff-only briefing, or the context-complete 'd2' one. Read
     # fresh at each review, so a reload flips it — or kills it — live.
     reviewer_briefing: ReviewBriefing = Field(default=ReviewBriefing.DIFF_ONLY)
+    pre_test_commands: list[str] = Field(
+        default_factory=list,
+        description=(
+            'Shell commands run in order, in the main checkout (cwd = '
+            'project_root), before each review checkpoint\'s Phase 1 — e.g. '
+            'rebuilding frontend bundles that e2e tests serve.  Fail-soft: a '
+            'failing or timed-out command is logged and reported in the '
+            'reviewer prompt and in the saved review report when one is '
+            'written (a review skipped for capped accounts writes none); it '
+            'never aborts the review, and later commands still run (chain '
+            'dependent steps with && inside one entry).  Empty = no setup step.'
+        ),
+    )
+    pre_test_timeout_secs: float = Field(
+        default=1800.0,
+        gt=0,
+        description='Per-command timeout for review.pre_test_commands.',
+    )
 
 
 _DEFAULT_SKIP_THRESHOLD: dict[str, int] = {
@@ -607,6 +629,26 @@ class FairnessConfig(BaseModel):
                 )
             )
         return int(self.skip_threshold)
+
+
+class DeterministicConfig(BaseModel):
+    """Deterministic-task runner knobs (plans/completion-driven-triggers-prd.md C1).
+
+    ``predicate_recheck_stall_cap`` is how many consecutive exit-75 "not yet"
+    verdicts a re-arming predicate may return before ``DeterministicRunner``
+    files ``milestone_check_stalled``. ``Harness._run_deterministic_slot``
+    reads it whenever a slot builds its runner, so every leaf is green-tier.
+    Calibrate it from ``predicate_recheck_stalled`` events.
+    """
+
+    predicate_recheck_stall_cap: int = Field(
+        default=PREDICATE_RECHECK_STALL_CAP,
+        ge=1,
+        description=(
+            'Consecutive exit-75 "not yet" verdicts a re-arming predicate may return '
+            'before the runner files milestone_check_stalled (PRD C1).'
+        ),
+    )
 
 
 class ScoringConfig(BaseModel):
@@ -1379,8 +1421,10 @@ class MergeDeepConfig(BaseModel):
     cap-staging plan live in the PRD, which is the ONE canonical narrative for
     both — deliberately not restated here, because β (task 3184, the chain
     builder) and γ (task 3185, the dispatch gate) are the consumers that
-    implement that contract and may change it. Nothing in the orchestrator reads
-    the knob yet.
+    implement that contract and may change it.
+
+    ``chain_build_timeout_secs`` bounds one chain build (lane acquisition plus
+    the merges) inside ``SpeculativeMergeWorker._deep_chain_placement``.
 
     ``chain_cap=0`` (the shipped default) is the KILL SWITCH: the gate can never
     open, so no chain code runs on any dispatch path and behaviour is
@@ -1407,6 +1451,17 @@ class MergeDeepConfig(BaseModel):
             'at load rather than reaching dispatch. No upper bound is imposed. '
             'See plans/deep-merge-ahead-prd.md for the dispatch contract this '
             'gates and for the cap-staging plan.'
+        ),
+    )
+    chain_build_timeout_secs: float = Field(
+        default=1800.0,
+        gt=0,
+        description=(
+            'Deadline in seconds for one deep-chain build: lane acquisition '
+            '(git reset/clean, the CoW re-seed of target/) plus the sequential '
+            'merges. On overrun the dispatch degrades to the adjacent verify. '
+            'The build blocks the verifier loop, so this is also the worst-case '
+            'stall on finalising a green head. Read live per dispatch; must be > 0.'
         ),
     )
 
@@ -5331,6 +5386,9 @@ class OrchestratorConfig(BaseSettings):
     # knobs, which the anchor-coverage gate still falls back to.
     scoring: ScoringConfig = Field(default_factory=ScoringConfig)
 
+    # Deterministic-task runner knobs (PRD completion-driven-triggers C1).
+    deterministic: DeterministicConfig = Field(default_factory=DeterministicConfig)
+
     # Scheduler starvation watchdog (task 1880).
     starvation_watchdog: StarvationWatchdogConfig = Field(
         default_factory=StarvationWatchdogConfig,
@@ -6548,6 +6606,9 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     # I-1 / I-3 still bind a reload through apply_reload's whole-config
     # re-validation.
     _submodel_leaf_paths('scoring', ScoringConfig),
+    # Read when each deterministic slot builds its runner, so a reload applies
+    # from the next dispatch.
+    _submodel_leaf_paths('deterministic', DeterministicConfig),
     # Unknown-config-key census escape hatch (task 2989) — same whole-submodel
     # idiom.  Green-tier ON PURPOSE: the born-at-L2 this census files tells the
     # operator to add a path to config_key_census.ignore and hot-reload, and a
@@ -6667,6 +6728,8 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         'review.full_review_min_interval_secs',
         'review.full_review_min_tasks',
         'review.reviewer_briefing',
+        'review.pre_test_commands',
+        'review.pre_test_timeout_secs',
         # Verify env (fresh config's value already carries the sccache fold)
         'verify_env',
         # Cold-verify shared-venv pre-provision command (task 2997) — green-tier

@@ -33,16 +33,15 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from _merge_lane_fakes import lane_scene_config, main_health_probe_spawned
 from _merge_lane_verifier_doubles import ScriptedVerifier
+from _merge_worker_drive import HEAVY_BARRIER_TEST_TIMEOUT, stop_merge_worker
 from _orch_helpers import MERGE_GATE_BARRIER_TIMEOUT, wait_responsive
+from _verify_result_doubles import fake_verify_result
 
 # Reuse the γ harness two-host fakes (established cross-test-module import
 # pattern — see test_concurrent_verify_boundary.py / test_merge_speculation.py).
 from test_merge_queue_concurrent_verify import (
-    HEAVY_BARRIER_TEST_TIMEOUT,
-    _fake_verify_result,
     _gated_runner,
     _inject_two_host_allocator,
-    _stop_worker,
 )
 
 from orchestrator.config import GitConfig, OrchestratorConfig
@@ -906,9 +905,9 @@ class TestCascadeErrorChokepoint:
                 # N's verify: gate and fail.
                 gate_a_entered.set()
                 await gate_a_release.wait()
-                return _fake_verify_result(passed=False, summary='test_failure')
+                return fake_verify_result(passed=False, summary='test_failure')
             # Any subsequent call (req_c's local verify) passes immediately.
-            return _fake_verify_result(passed=True)
+            return fake_verify_result(passed=True)
 
         gate_b_release = asyncio.Event()
         gate_b_entered = asyncio.Event()
@@ -1023,7 +1022,7 @@ class TestCascadeErrorChokepoint:
                 label='rrcas-c: MergeOutcome (loop-survival signal)',
             )
         finally:
-            await _stop_worker(worker, worker_task)
+            await stop_merge_worker(worker, worker_task)
 
         # ── Loop survives + offending req blocked (pre-existing 1856 guard) ──
         assert outcome_c.status == 'done', (
@@ -1113,9 +1112,9 @@ class TestCascadeErrorChokepoint:
                 # N's verify: gate and fail.
                 gate_a_entered.set()
                 await gate_a_release.wait()
-                return _fake_verify_result(passed=False, summary='test_failure')
+                return fake_verify_result(passed=False, summary='test_failure')
             # Any subsequent call (req_c's local verify) passes immediately.
-            return _fake_verify_result(passed=True)
+            return fake_verify_result(passed=True)
 
         gate_b_release = asyncio.Event()
         gate_b_entered = asyncio.Event()
@@ -1244,7 +1243,7 @@ class TestCascadeErrorChokepoint:
                 label='rrcdc-c: MergeOutcome (loop-survival signal)',
             )
         finally:
-            await _stop_worker(worker, worker_task)
+            await stop_merge_worker(worker, worker_task)
 
         # ── Loop survives + offending req blocked (pre-existing 1856 guard) ──
         assert outcome_c.status == 'done', (
@@ -1300,8 +1299,8 @@ class TestCascadeErrorChokepoint:
             if call == 0:
                 gate_a_entered.set()
                 await gate_a_release.wait()
-                return _fake_verify_result(passed=False, summary='test_failure')
-            return _fake_verify_result(passed=True)
+                return fake_verify_result(passed=False, summary='test_failure')
+            return fake_verify_result(passed=True)
 
         gate_b_release = asyncio.Event()
         gate_b_entered = asyncio.Event()
@@ -1406,7 +1405,7 @@ class TestCascadeErrorChokepoint:
                 f'got {slot_now!r}.'
             )
         finally:
-            await _stop_worker(worker, worker_task)
+            await stop_merge_worker(worker, worker_task)
 
         assert outcome_c.status == 'done', (
             f'Expected req_c to resolve "done" (loop survived cascade error), '
@@ -1475,7 +1474,7 @@ class TestCascadeErrorChokepoint:
         async def _gated_local(*args: Any, **kwargs: Any) -> MagicMock:
             gate_a_entered.set()
             await gate_a_release.wait()
-            return _fake_verify_result(passed=True)
+            return fake_verify_result(passed=True)
 
         gated_remote = _gated_runner(
             gate_b_release, gate_b_entered, passed=True, name='laptop',
@@ -1543,7 +1542,7 @@ class TestCascadeErrorChokepoint:
             gate_a_release.set()
             gate_b_release.set()
         finally:
-            await _stop_worker(worker, worker_task)
+            await stop_merge_worker(worker, worker_task)
 
         assert req_a.result.done(), 'req_a.result should be resolved by stop()'
         assert req_b.result.done(), 'req_b.result should be resolved by stop()'

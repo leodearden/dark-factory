@@ -14,6 +14,7 @@ from typing import Any
 from shared.safe_io import atomic_write_text
 
 from .measurement import MeasurementStage, UnmeasuredCause, UnmeasuredRecord
+from .metrics import RoleUnderTest
 
 logger = logging.getLogger(__name__)
 
@@ -135,8 +136,16 @@ def _invocation_errors_from_marker(metrics: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
+def _role_under_test_from_legacy(metrics: dict[str, Any]) -> dict[str, Any]:
+    """A pre-6738 roleless cell as the run_eval implementer cell it was (PRD §7 D3)."""
+    stored = metrics.get('role_under_test')
+    role = RoleUnderTest.IMPLEMENTER if stored is None else RoleUnderTest(stored)
+    return {**metrics, 'role_under_test': role}
+
+
 LEGACY_METRIC_RULES: tuple[Callable[[dict[str, Any]], dict[str, Any]], ...] = (
     _invocation_errors_from_marker,
+    _role_under_test_from_legacy,
 )
 
 
@@ -154,6 +163,14 @@ def _load_cell(path: Path) -> EvalResult:
     data = json.loads(path.read_text())
     result = EvalResult(**{k: v for k, v in data.items() if k in _EVAL_RESULT_FIELDS})
     return dataclasses.replace(result, metrics=normalize_legacy_metrics(result.metrics))
+
+
+def load_result(path: Path) -> EvalResult:
+    """The cell persisted at *path*; one that cannot be read raises ResultLoadError naming it."""
+    try:
+        return _load_cell(path)
+    except (ValueError, OSError, TypeError, AttributeError) as e:
+        raise ResultLoadError(path, f'{type(e).__name__}: {e}') from e
 
 
 def _read_raw_cell(path: Path) -> dict[str, Any]:
@@ -235,10 +252,4 @@ class ResultStore:
             raise MissingResultsDirError(
                 self.directory, 'results dir not found (or is not a directory)'
             )
-        results = []
-        for path in self.cell_paths():
-            try:
-                results.append(_load_cell(path))
-            except (ValueError, OSError, TypeError, AttributeError) as e:
-                raise ResultLoadError(path, f'{type(e).__name__}: {e}') from e
-        return results
+        return [load_result(path) for path in self.cell_paths()]

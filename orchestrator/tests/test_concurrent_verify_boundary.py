@@ -34,19 +34,17 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from _merge_lane_fakes import FakeVerifier
 from _merge_lane_verifier_doubles import ScriptedVerifier
+from _merge_worker_drive import HEAVY_BARRIER_TEST_TIMEOUT, stop_merge_worker
 from _orch_helpers import MERGE_GATE_BARRIER_TIMEOUT, wait_responsive
+from _verify_result_doubles import fake_verify_result, real_verify_result
 
 # Reuse the γ harness fakes/fixtures (established cross-test-module import pattern).
 from test_merge_queue_concurrent_verify import (
-    HEAVY_BARRIER_TEST_TIMEOUT,
-    _fake_verify_result,
     _gated_runner,
     _inject_two_host_allocator,
     _make_branch_with_file,
     _make_config_no_runners,
     _make_fake_remote,
-    _mock_verify_result,
-    _stop_worker,
     config,  # noqa: F401 — pytest fixture re-exported from γ harness
     git_config,  # noqa: F401 — pytest fixture re-exported from γ harness
     git_ops,  # noqa: F401 — pytest fixture re-exported from γ harness
@@ -111,7 +109,7 @@ def _make_spanning_local_verify(
         gate_entered.set()
         await gate_release.wait()
         spans.append(_Span(name=name, start=t0, end=time.monotonic()))
-        return _fake_verify_result(passed=passed)
+        return fake_verify_result(passed=passed)
 
     return _impl
 
@@ -135,7 +133,7 @@ def _make_spanning_remote(
                 gate_entered.set()
             await gate_release.wait()
         spans.append(_Span(name=name, start=t0, end=time.monotonic()))
-        return _mock_verify_result(passed)
+        return real_verify_result(passed)
 
     runner = MagicMock()
     runner.name = name
@@ -189,7 +187,7 @@ class TestHarnessSmokeTest:
                 label='smoke-a: MergeOutcome (single item lands)',
             )
         finally:
-            await _stop_worker(worker, worker_task)
+            await stop_merge_worker(worker, worker_task)
 
         assert outcome.status == 'done', f'expected done, got {outcome}'
 
@@ -287,7 +285,7 @@ class TestB1OverlapOrderedAdvance:
                 label='b1-b: MergeOutcome (lands second, submission order)',
             )
         finally:
-            await _stop_worker(worker, worker_task)
+            await stop_merge_worker(worker, worker_task)
 
         # (1) Spans overlap: the two concurrent per-task verifies (N's gated
         #     local verify + N+1's gated remote laptop verify) ran
@@ -347,8 +345,8 @@ class TestB2ChainInvalidationUnderOverlap:
             if call == 0:
                 gate_a_entered.set()
                 await gate_a_release.wait()
-                return _fake_verify_result(passed=False, summary='test_failure')
-            return _fake_verify_result(passed=True)
+                return fake_verify_result(passed=False, summary='test_failure')
+            return fake_verify_result(passed=True)
 
         # N+1's remote verify: gated, PASSES when released
         gated_remote = _gated_runner(gate_b_release, gate_b_entered, passed=True, name='laptop')
@@ -407,7 +405,7 @@ class TestB2ChainInvalidationUnderOverlap:
                 label='b2-b: MergeOutcome (re-merged and re-verified)',
             )
         finally:
-            await _stop_worker(worker, worker_task)
+            await stop_merge_worker(worker, worker_task)
 
         # (1) N failed (not 'done' or 'already_merged')
         assert outcome_a.status not in ('done', 'already_merged'), (
@@ -471,7 +469,7 @@ class TestB3HostDownMidOverlap:
         async def _gated_local(*args: Any, **kwargs: Any) -> MagicMock:
             gate_a_entered.set()
             await gate_a_release.wait()
-            return _fake_verify_result(passed=True)
+            return fake_verify_result(passed=True)
 
         # N+1's remote runner: raises RunnerUnavailable after signalling entry
         async def _unavailable_side(*args: Any, **kwargs: Any) -> Any:
@@ -535,7 +533,7 @@ class TestB3HostDownMidOverlap:
                 label='b3-b: MergeOutcome (re-dispatched local after quarantine)',
             )
         finally:
-            await _stop_worker(worker, worker_task)
+            await stop_merge_worker(worker, worker_task)
 
         # (1) Remote host quarantined -- read off the public host census
         hosts = {h['name']: h for h in worker.snapshot()['hosts']}
@@ -590,8 +588,8 @@ class TestB4CancelBehavior:
             if call == 0:
                 gate_a_entered.set()
                 await gate_a_release.wait()
-                return _fake_verify_result(passed=False)
-            return _fake_verify_result(passed=True)
+                return fake_verify_result(passed=False)
+            return fake_verify_result(passed=True)
 
         # N+1's remote: gated + cancel rc=0 (clean cancel)
         gated_remote = _gated_runner(gate_b_release, gate_b_entered, passed=True, name='laptop')
@@ -647,7 +645,7 @@ class TestB4CancelBehavior:
                 label='b4a-b: MergeOutcome (re-dispatched after cancel confirm)',
             )
         finally:
-            await _stop_worker(worker, worker_task)
+            await stop_merge_worker(worker, worker_task)
 
         # (1) Exactly 2 cancel_verify calls on the clean-cancel (rc=0) path:
         # _abort_remote_verify (pre-cancel, id live) + cancel_and_release
@@ -695,8 +693,8 @@ class TestB4CancelBehavior:
             if call == 0:
                 gate_a_entered.set()
                 await gate_a_release.wait()
-                return _fake_verify_result(passed=False)
-            return _fake_verify_result(passed=True)
+                return fake_verify_result(passed=False)
+            return fake_verify_result(passed=True)
 
         # N+1's remote: gated + cancel rc=1 (fail), probe returns True (clears immediately)
         gated_remote = _gated_runner(gate_b_release, gate_b_entered, passed=True, name='laptop')
@@ -764,7 +762,7 @@ class TestB4CancelBehavior:
                 label='b4b-b: MergeOutcome (re-dispatched after probe clears)',
             )
         finally:
-            await _stop_worker(worker, worker_task)
+            await stop_merge_worker(worker, worker_task)
 
         # (1) cancel_verify called → cancel-fail path taken.
         # assert_called_once() was relaxed to assert_called() in task-1762 step-4:
@@ -822,7 +820,7 @@ class TestB5OperatorHalt:
         async def _gated_local(*args: Any, **kwargs: Any) -> MagicMock:
             gate_a_entered.set()
             await gate_a_release.wait()
-            return _fake_verify_result(passed=True)
+            return fake_verify_result(passed=True)
 
         # N+1's remote: gated, PASSES
         gated_remote = _gated_runner(gate_b_release, gate_b_entered, passed=True, name='laptop')
@@ -904,7 +902,7 @@ class TestB5OperatorHalt:
                 req_b.result, label='b5-b: MergeOutcome after unhalt',
             )
         finally:
-            await _stop_worker(worker, worker_task)
+            await stop_merge_worker(worker, worker_task)
 
         # Both must resolve done after unhalt + drain
         assert outcome_a.status == 'done', f'N expected done after unhalt, got {outcome_a}'
@@ -1070,7 +1068,7 @@ class TestB7SingleHostNewPath:
                 label='b7-c: MergeOutcome (single-host serial, third)',
             )
         finally:
-            await _stop_worker(worker, worker_task)
+            await stop_merge_worker(worker, worker_task)
 
         # (1) All three items routed through the new _dispatch_item /
         # _finalize_inflight path. Assert on the SET of distinct task_ids

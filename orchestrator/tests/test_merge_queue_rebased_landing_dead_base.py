@@ -32,9 +32,9 @@ from typing import Any
 import pytest
 from _git_fixtures import seed_repo
 from _merge_lane_fakes import FakeVerifier, VerifyScript, lane_scene_config, passes
+from _merge_worker_drive import HEAVY_BARRIER_TEST_TIMEOUT
 from _orch_helpers import wait_responsive
 from test_merge_queue_concurrent_verify import (
-    HEAVY_BARRIER_TEST_TIMEOUT,
     _gated_runner,
     _inject_two_host_allocator,
     _make_branch_with_file,

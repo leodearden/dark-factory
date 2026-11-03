@@ -25,13 +25,14 @@ from unittest.mock import MagicMock
 import pytest
 from _gate_fixtures import TEST_DEPLOYED_SHA, gated_remote_runner
 from _merge_lane_fakes import FakeClock
+from _xdist_crash_fixtures import XDIST_SESSION_ABORTED_OUTPUT
 from escalation.queue import EscalationQueue
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 from orchestrator.remote_gate import GateIdentity, GateIdentityPair, RunnerUnavailableKind
-from orchestrator.verify import VerifyResult
+from orchestrator.verify import WORKER_DEATH_SUMMARY_MARKER, VerifyResult
 from orchestrator.verify_runner import (
     MergeVerifySpec,
     RunnerUnavailable,
@@ -211,6 +212,43 @@ async def test_a_passing_ensure_readmits_and_the_second_failure_goes_sticky(scen
     await scene.tick()
     assert not scene.in_pool()
     assert scene.remote.probes == ['ensure'], 'a sticky bench is not probed at all'
+
+
+@pytest.mark.asyncio
+async def test_a_no_verdict_bench_record_names_the_archived_output(
+    scene: _Scene, tmp_path: Path,
+):
+    """A real no-verdict RunnerUnavailable leads the operator to its archived test log."""
+    wire = result_to_json(VerifyResult(
+        passed=False, test_output=XDIST_SESSION_ABORTED_OUTPUT, lint_output='', type_output='',
+        summary=f'Failures: test leg {WORKER_DEATH_SUMMARY_MARKER}', category='test_failure',
+    ))
+
+    async def run(argv: list[str], *, cwd: object = None) -> tuple[int, str, str]:
+        return (0, wire, 'LAPTOP LOG') if argv[0] == 'ssh' else (0, '', '')
+
+    runner = gated_remote_runner(_HOST, 'leo-laptop', 'leo-laptop', '/project', run=run)
+    archive_root = tmp_path / 'verify-logs'
+
+    async def dispatch_and_bench(task_id: str) -> Path:
+        with pytest.raises(RunnerUnavailable) as excinfo:
+            await runner.run_merge_verify(
+                'mergesha', _spec(), task_id=task_id, archive_root=archive_root,
+            )
+        assert excinfo.value.kind == 'no_verdict'
+        scene.worker.bench_unavailable_runner(_HOST, excinfo.value)
+        return next((archive_root / task_id).glob('attempt-1.remote-laptop.test-*.log'))
+
+    first_test_log = await dispatch_and_bench('3821')
+    assert str(first_test_log) in scene.host()['reason']
+    assert str(first_test_log) in scene.events.of(EventType.verify_host_skew)[0]['reason']
+
+    await scene.tick()
+    assert scene.in_pool()
+
+    second_test_log = await dispatch_and_bench('6215')
+    [l1] = scene.open_l1s()
+    assert str(second_test_log) in l1.detail
 
 
 # ---------------------------------------------------------------------------

@@ -10,6 +10,8 @@ call-site is wired up here (that's alpha3/alpha4).
 Contract (PRD Sec Contract) — derived per-invocation from the worktree path:
   1. whole worktree root (D1)
   2. ``<base>/.task-meta/<name>/`` (via ``TaskArtifacts.meta_root_for``)
+  2b. the dispatch's task root, by default ``<base>/.task-meta/task-<id>/``
+      (via ``TaskArtifacts.task_root_for``)
   3-6. main ``.git`` carve-outs (``objects/``, ``refs/heads/task/``,
        ``logs/refs/heads/task/``, ``worktrees/<name>/``) derived by parsing
        ``<worktree>/.git``'s ``gitdir:`` line
@@ -45,6 +47,7 @@ class WriteSet:
 
     worktree: Path
     task_meta: Path
+    task_root: Path
     git_objects: Path
     git_task_refs: Path
     git_task_reflogs: Path
@@ -60,6 +63,7 @@ class WriteSet:
         paths = [
             self.worktree,
             self.task_meta,
+            self.task_root,
             self.git_objects,
             self.git_task_refs,
             self.git_task_reflogs,
@@ -127,15 +131,23 @@ def _parse_gitdir(worktree: Path) -> Path:
     return admindir.resolve()
 
 
-def compute_write_set(worktree: Path, *, home: Path | None = None) -> WriteSet:
+def compute_write_set(
+    worktree: Path, *, task_id: str, task_root: Path | None = None, home: Path | None = None,
+) -> WriteSet:
     """Derive the full writable-path set for a sandboxed agent invocation
-    rooted at ``worktree``.
+    of task *task_id* rooted at ``worktree``.
+
+    ``task_root`` is the task root the dispatch actually uses (the workflow
+    passes its own, so a single-root eval dispatch is granted no
+    ``task-<id>`` dir its parallel trials would share); ``None`` derives
+    ``TaskArtifacts.task_root_for(worktree.parent, task_id)``.
 
     Pure: reads ``<worktree>/.git`` and resolves symlinks, but performs no
     filesystem writes (no makedirs) — existence/creation remains the
     backend's job (landlock_exec's ``_add_path`` already skips non-existent
     dirs). Fails loudly (``ValueError``) on a missing/malformed/directory
-    ``.git`` — fail-closed-friendly, honoring the loud-over-silent norm.
+    ``.git``, and on a *task_id* ``TaskArtifacts.task_root_for`` refuses —
+    fail-closed-friendly, honoring the loud-over-silent norm.
 
     ``home`` defaults to ``Path.home()``; tests should inject a hermetic
     tmp dir.
@@ -153,6 +165,10 @@ def compute_write_set(worktree: Path, *, home: Path | None = None) -> WriteSet:
         # to the real directory landlock enforces on — see
         # TestTaskMetaSymlinkResolution in test_write_set.py.
         task_meta=TaskArtifacts.meta_root_for(worktree.parent, worktree.name).resolve(),
+        task_root=(
+            task_root if task_root is not None
+            else TaskArtifacts.task_root_for(worktree.parent, task_id)
+        ).resolve(),
         git_objects=(main_git / 'objects').resolve(),
         git_task_refs=(main_git / 'refs' / 'heads' / 'task').resolve(),
         git_task_reflogs=(main_git / 'logs' / 'refs' / 'heads' / 'task').resolve(),

@@ -13,17 +13,16 @@ import logging
 import re
 import subprocess
 from datetime import datetime
-from importlib import resources as pkg_resources
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-import yaml
 from _orch_helpers import (
     pydantic_spec,
     skip_role_config_layer,
     stamp_stock_routing_config,
 )
+from _packaged_defaults import load_packaged_defaults
 from shared.cli_invoke import (
     AgentFailureKind,
     AgentResult,
@@ -63,8 +62,7 @@ class TestUnblockAutoConfigDefaults:
         assert ua.b3_proposal_keep_last == 5
 
     def test_defaults_yaml_has_unblock_auto_section(self):
-        defaults_file = pkg_resources.files('orchestrator') / 'defaults.yaml'
-        data = yaml.safe_load(defaults_file.read_text())
+        data = load_packaged_defaults()
         assert 'unblock_auto' in data, (
             "defaults.yaml must have an 'unblock_auto' section"
         )

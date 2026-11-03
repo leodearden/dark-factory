@@ -404,7 +404,9 @@ max_turns:
   # operation, which makes it a throttle rather than a runaway guard. 60 leaves
   # ~40% headroom over the observed max. NB the observed maxima are CENSORED by
   # the cap itself, so true demand may run higher.
-  reviewer: 60
+  # 60 -> 90 with effort xhigh (Leo 2026-10-31, task 7972): opus high's p99 is 28 turns in
+  # production and xhigh runs about 2.25x longer, so xhigh's p99 is about 63. Gate 7973 re-measures.
+  reviewer: 90
   merger: 50
   steward: 100
   triage: 25
@@ -424,7 +426,8 @@ effort:
   architect: "max"
   implementer: "max"
   debugger: "max"
-  reviewer: "high"
+  # Leo 2026-10-31 (task 7972); evidence and revert: gate task 7973.
+  reviewer: "xhigh"
   merger: "max"
   steward: "high"
   triage: "medium"
@@ -454,7 +457,8 @@ review:
   full_review_on_complete: true
   briefing_path: "review/briefing.yaml"
   reports_dir: "data/review-checkpoints"
-  reviewer_briefing: "diff-only"
+  # d2 fleet-wide: Leo 2026-10-31 (task 7972), first adopted for dark_factory by commit 6bd91df23d.
+  reviewer_briefing: "d2"
 
 # Scheduler fairness — anti-starvation for broad-footprint tasks.
 #
@@ -674,6 +678,8 @@ git:
 # cap-staging plan: plans/deep-merge-ahead-prd.md.
 merge_deep:
   chain_cap: 0
+  # Chain-build deadline (s); above reify's measured whole-process build p99 (~1230 s).
+  chain_build_timeout_secs: 1800
 
 # Chronic pool-infra flake auto-file detector (task 2358). Gated OFF until
 # reify task 5142's flaky-ledger.jsonl + CHRONIC-FLAKY marker substrate is

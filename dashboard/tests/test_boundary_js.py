@@ -255,8 +255,11 @@ def test_sketch_9_a_window_counts_its_own_merges_and_each_attempt_once(served_bo
     assert block['recent_total']['state'] == 'fresh', 'a readable runs.db window total is measured'
     assert block['speculative']['state'] == 'fresh', 'a readable runs.db speculative count is measured'
     assert block['recent_total']['value'] == len(block['recent']) == len(in_window)
-    latency = block['latency']
-    assert sum(block['outcomes']['values']) == latency['with_duration'] + latency['without_duration']
+    assert block['attempts']['state'] == 'fresh', 'a readable runs.db attempt window is measured'
+    assert block['depth']['state'] == 'fresh', 'a readable runs.db depth series is measured'
+    attempts = block['attempts']['value']
+    latency = attempts['latency']
+    assert sum(attempts['outcomes']['values']) == latency['with_duration'] + latency['without_duration']
     assert latency['with_duration'] == sum(1 for attempt in in_window if attempt.duration_ms)
     assert latency['without_duration'] == sum(1 for attempt in in_window if not attempt.duration_ms)
 
@@ -270,7 +273,7 @@ def test_sketch_9_the_two_windows_hold_different_merges(served_bodies):
 
 @pytest.mark.parametrize('window, bucket_minutes', [('24h', 15), ('7d', 60)])
 def test_the_served_depth_names_the_width_its_labels_are_spaced_at(served_bodies, window, bucket_minutes):
-    depth = served_bodies[f'merge_{window}']['MERGE_QUEUE']['dark-factory']['depth']
+    depth = served_bodies[f'merge_{window}']['MERGE_QUEUE']['dark-factory']['depth']['value']
     starts = [datetime.fromisoformat(label) for label in depth['labels']]
 
     assert depth['bucket_minutes'] == bucket_minutes

@@ -71,6 +71,13 @@ def test_cost_basis_values():
     assert [b.value for b in CostBasis] == ['metered', 'subscription']
 
 
+@pytest.mark.parametrize(
+    ('basis', 'imputes'), [(CostBasis.METERED, False), (CostBasis.SUBSCRIPTION, True)],
+)
+def test_only_a_subscription_arm_imputes_its_dollars(basis, imputes):
+    assert basis.imputes_dollars is imputes
+
+
 class TestShadowCellState:
     """C1's cell lifecycle and the two predicates its invariants hang on."""
 
@@ -204,8 +211,16 @@ def test_every_member_is_a_bare_str_that_round_trips(member: StrEnum):
 class TestSingleCopy:
     """The sibling modules consume these exact enums, never a second copy."""
 
-    def test_candidate_prices_use_the_shadow_types_cost_basis(self):
-        assert CANDIDATE_ENDPOINT_PRICES['glm-5.3'].cost_basis is CostBasis.SUBSCRIPTION
+    @pytest.mark.parametrize(
+        'model', ['glm-5.3', 'glm-5.3-flash', 'mimo-v2.6-pro', 'mimo-v2.6-flash'],
+    )
+    def test_candidate_prices_use_the_shadow_types_cost_basis(self, model):
+        assert CANDIDATE_ENDPOINT_PRICES[model].cost_basis is CostBasis.SUBSCRIPTION
+
+    @pytest.mark.parametrize('model', sorted(CANDIDATE_ENDPOINT_PRICES))
+    def test_a_price_entry_and_its_basis_agree_on_imputed_dollars(self, model):
+        price = CANDIDATE_ENDPOINT_PRICES[model]
+        assert price.imputed is price.cost_basis.imputes_dollars
 
     def test_build_live_fixture_accepts_a_shadow_types_shape(self, tmp_path):
         fixture = build_live_fixture(

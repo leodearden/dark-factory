@@ -96,6 +96,7 @@ def _stdio_mcp_server(
     worktree: Path,
     python_executable: str | None = None,
     meta_root: Path | None = None,
+    task_root: Path | None = None,
     extra_args: tuple[str, ...] = (),
 ) -> dict:
     """Shared launch-dict factory for stdio MCP servers (task 2482 amendment).
@@ -133,14 +134,19 @@ def _stdio_mcp_server(
             ``--meta-root``.  When ``None`` (default), no ``--meta-root``
             flag is emitted and args are byte-identical to before this
             parameter existed.
+        task_root: Optional task-lifetime root (see
+            ``TaskArtifacts.task_root_for``), passed as ``--task-root``
+            right after the ``--meta-root`` pair; ``None`` emits nothing.
         extra_args: Additional tokens appended after the ``--worktree``/
-            ``--meta-root`` args (e.g. verdict-tools' ``--verdict-role``
-            pair).  Empty by default — exactly plan-tools' shape.
+            ``--meta-root``/``--task-root`` args (e.g. verdict-tools'
+            ``--verdict-role`` pair).  Empty by default — exactly
+            plan-tools' shape.
 
     Returns:
         Claude Code MCP server config dict with ``command`` and ``args``.
     """
     meta_root_args = ['--meta-root', str(meta_root)] if meta_root is not None else []
+    task_root_args = ['--task-root', str(task_root)] if task_root is not None else []
     if python_executable:
         # Direct-interpreter no-uv hot path: eliminates the uv futex wedge.
         return {
@@ -148,6 +154,7 @@ def _stdio_mcp_server(
             'args': [
                 '-m', module_path, '--worktree', str(worktree),
                 *meta_root_args,
+                *task_root_args,
                 *extra_args,
             ],
             # Suppress FastMCP's banner + synchronous PyPI update-check so the
@@ -166,6 +173,7 @@ def _stdio_mcp_server(
             'python', '-m', module_path,
             '--worktree', str(worktree),
             *meta_root_args,
+            *task_root_args,
             *extra_args,
         ],
         # Same FastMCP banner/update-check suppression as the hot path above;
@@ -179,6 +187,7 @@ def plan_tools_mcp_server(
     worktree: Path,
     python_executable: str | None = None,
     meta_root: Path | None = None,
+    task_root: Path | None = None,
 ) -> dict:
     """Return a stdio MCP server config dict for the plan-tools server.
 
@@ -231,13 +240,14 @@ def plan_tools_mcp_server(
             orchestrator (worktree-lane-lifecycle PRD task ε1). When
             ``None`` (default), no ``--meta-root`` flag is emitted and args
             are byte-identical to before this parameter existed.
+        task_root: Optional task-lifetime root passed as ``--task-root``.
 
     Returns:
         Claude Code MCP server config dict with ``command`` and ``args``.
     """
     return _stdio_mcp_server(
         'orchestrator.mcp.plan_tools', orch_project_dir, worktree,
-        python_executable=python_executable, meta_root=meta_root,
+        python_executable=python_executable, meta_root=meta_root, task_root=task_root,
     )
 
 
@@ -247,12 +257,13 @@ def verdict_tools_mcp_server(
     role: str,
     python_executable: str | None = None,
     meta_root: Path | None = None,
+    task_root: Path | None = None,
 ) -> dict:
     """Return a stdio MCP server config dict for the verdict-tools server.
 
     Launch target is α's ``orchestrator.mcp.verdict_tools`` CLI (task 2481):
     ``<interpreter> -m orchestrator.mcp.verdict_tools --worktree <wt>
-    [--meta-root <mr>] --verdict-role <role>``. *role* is the
+    [--meta-root <mr>] [--task-root <tr>] --verdict-role <role>``. *role* is the
     ``--verdict-role`` value — the authoritative selector for both which
     single tool the server registers (judge/merger/reviewer-name, see
     ``verdict_tools.create_server``) and the ``verdicts/<role>.json``
@@ -301,13 +312,14 @@ def verdict_tools_mcp_server(
             ``--meta-root``, so the agent-side verdict-tools server targets
             the same relocated artifacts root as the orchestrator. When
             ``None`` (default), no ``--meta-root`` flag is emitted.
+        task_root: Optional task-lifetime root passed as ``--task-root``.
 
     Returns:
         Claude Code MCP server config dict with ``command`` and ``args``.
     """
     return _stdio_mcp_server(
         'orchestrator.mcp.verdict_tools', orch_project_dir, worktree,
-        python_executable=python_executable, meta_root=meta_root,
+        python_executable=python_executable, meta_root=meta_root, task_root=task_root,
         extra_args=('--verdict-role', role),
     )
 

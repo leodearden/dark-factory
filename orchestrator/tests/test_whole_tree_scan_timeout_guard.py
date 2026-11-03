@@ -15,19 +15,23 @@ marks this module demands guarantee the family never drops BELOW it, which is
 what a floor is for.  The value history of both lives in
 plans/pytest-per-test-timeout-measurement-2026-09-17.md.
 
-What makes the breach so expensive is the two settings around it:
+Until task 6354 what made the breach so expensive was the two settings around
+it:
 
-* ``[tool.pytest.ini_options].timeout_method = "thread"`` means a breach does
-  NOT fail the test -- pytest-timeout's thread method ``os._exit()``s the whole
+* ``[tool.pytest.ini_options].timeout_method = "thread"`` meant a breach did
+  NOT fail the test -- pytest-timeout's thread method ``os._exit()``ed the whole
   xdist worker ("node down: Not properly terminated");
 * ``--max-worker-restart=0`` (in ``[tool.pytest.ini_options].addopts``, task
-  1907) then declines to replace that worker, degrading the run to a TRUNCATED
-  whole-suite session whose surviving failure names some innocent guard that
+  1907) then declined to replace that worker, degrading the run to a TRUNCATED
+  whole-suite session whose surviving failure named some innocent guard that
   merely happened to share the dead worker.
 
-So a single slow tree-scan does not cost one red test -- it costs the whole
-verify run, and it misattributes the blame.  Escalations esc-3980-1 and
-esc-3787-1 are both instances.
+So a single slow tree-scan cost the whole verify run, and misattributed the
+blame.  Escalations esc-3980-1 and esc-3787-1 are both instances.  Since task
+6354 the method is ``signal``: a breach fails the one scanner, with its own
+traceback, and the worker lives on.  That is still a false red on a
+healthy-but-slow test, and the marks still prevent it, so the census below
+stays as it is.
 
 THE FIX the pyproject itself sanctions ("Slow tests opt out with
 ``@pytest.mark.timeout(N)``", the comment on
@@ -35,7 +39,7 @@ THE FIX the pyproject itself sanctions ("Slow tests opt out with
 ``pytestmark`` on each scanner.  This module pins the two constants that mark
 uses, and (from step-5 on) recomputes the census of scanners from source on
 every run so the Nth new scanner is caught at commit time rather than by another
-truncated verify.
+false red in verify.
 
 NOT widening the global ``timeout`` *as the remedy for THIS hazard*: doing it
 for that reason would blunt the hang-catching ceiling for the other ~16000
@@ -145,18 +149,27 @@ def _pytest_ini_options() -> dict[str, object]:
 class TestTimeoutConstants:
     """The two constants this guard's remediation advice depends on."""
 
-    def test_a_hung_test_dumps_its_stacks_before_any_kill_can_reach_it(self) -> None:
-        """``faulthandler_timeout`` must fire below the tightest kill a test meets.
+    def test_a_hung_test_dumps_its_stacks_below_the_verify_cap(self) -> None:
+        """``faulthandler_timeout`` must fire below the tightest cap a test meets.
 
-        Under ``timeout_method = "thread"`` the kill is an ``os._exit()`` that
-        leaves no traceback.  pytest-timeout's own banner goes through the
-        terminal writer to the worker's STDOUT, which execnet's
-        ``init_popen_io`` dup2s to /dev/null, so under xdist it never reaches
-        the controller; the faulthandler dump goes to STDERR, which the worker
+        The dump writes every thread's stack to STDERR, which an xdist worker
         inherits from the controller, and verify merges stderr into its log.
-        The dump is evidence only if it lands first, and the tightest kill an
-        UNMARKED test can meet is verify's CLI ``--timeout=300``, not this
-        file's ini default.  Marked tests below this value still die silently.
+        The bound serves two hangs.
+
+        A main thread blocked in a C call that never returns is one that
+        ``timeout_method = "signal"`` cannot interrupt: the cap never fires,
+        the worker hangs until verify's outer kill, and this dump is the only
+        witness.  Any positive value below the cap lands it well inside the
+        verify run.
+
+        A hang the cap DOES interrupt (a main thread waiting on a deadlocked
+        peer, say) fails with the main thread's traceback alone.
+        pytest-timeout writes the other threads' stacks to the terminal, and
+        on an xdist worker that is stdout, which execnet points at /dev/null.
+        pytest also cancels the pending dump when the test ends.  So the peer's
+        stack reaches the verify log only if this dump fires before the cap,
+        and the tightest cap an UNMARKED test can meet is verify's CLI
+        ``--timeout=300``, not this file's ini default.
         """
         ini_options = _pytest_ini_options()
 
@@ -167,7 +180,9 @@ class TestTimeoutConstants:
         assert 0 < dump_after < VERIFY_CLI_PER_TEST_TIMEOUT, (
             f'faulthandler_timeout ({dump_after}) must be positive and below '
             f'VERIFY_CLI_PER_TEST_TIMEOUT ({VERIFY_CLI_PER_TEST_TIMEOUT}), or a '
-            'hung test is killed before its stacks reach the verify log'
+            "hang the cap interrupts fails without its other threads' stacks: "
+            "pytest-timeout writes those to the xdist worker's discarded stdout, "
+            'and the pending dump is cancelled with the test'
         )
 
     def test_pyproject_default_timeout_mirrors_pyproject(self) -> None:
@@ -182,10 +197,13 @@ class TestTimeoutConstants:
         citing a line number in a comment, which is precisely how the earlier
         mirror was free to go stale.
 
-        ``timeout_method`` is asserted alongside it because the entire cost model
-        above rests on it: under thread mode a breach ``os._exit()``s the xdist
-        worker instead of failing the test.  If someone switches back to signal
-        mode, the rationale for every mark this guard demands changes, and that
+        ``timeout_method`` is asserted alongside it because the cost model above
+        rests on it.  Under signal mode a breach fails the one test, with its
+        traceback, and the worker lives on; a breach inside a long C or Rust
+        call (complexipy's analysis) is raised only once that call returns; and
+        a C call that never returns is not interrupted at all, which is what
+        ``faulthandler_timeout``'s dump is for.  If someone switches the method,
+        the cost of every breach this guard's marks prevent changes, and that
         should surface loudly here rather than be discovered later.
         """
         ini_options = _pytest_ini_options()
@@ -198,13 +216,16 @@ class TestTimeoutConstants:
             'WHOLE_TREE_SCAN_TEST_TIMEOUT, which is derived from it, still '
             'clears the measured worst case.'
         )
-        assert ini_options['timeout_method'] == 'thread', (
-            'timeout_method is no longer "thread" in '
-            f'{_ORCH_PYPROJECT} (got {ini_options["timeout_method"]!r}). The '
-            'whole rationale for this guard -- a breach os._exit()s the xdist '
-            'worker rather than failing the test, and --max-worker-restart=0 '
-            'turns that into a truncated whole-suite run -- is specific to '
-            'thread mode. Revisit this module before changing it.'
+        assert ini_options['timeout_method'] == 'signal', (
+            'timeout_method is no longer "signal" in '
+            f'{_ORCH_PYPROJECT} (got {ini_options["timeout_method"]!r}). This '
+            "guard's cost model is signal's: a breach fails the one test, with "
+            'its traceback, and the worker lives on; a breach inside a long C or '
+            'Rust call (complexipy) is raised only once that call returns; and a '
+            'C call that never returns is not interrupted, which is what '
+            "faulthandler_timeout's dump is for. The trade is decided in "
+            'tests/scripts/test_timeout_method_policy.py; revisit this module '
+            'before changing the method.'
         )
 
     def test_whole_tree_scan_timeout_clears_default_with_margin(self) -> None:

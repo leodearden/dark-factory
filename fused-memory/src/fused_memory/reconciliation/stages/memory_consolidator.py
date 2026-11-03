@@ -32,6 +32,10 @@ from fused_memory.reconciliation.degenerate_task_node_sweep import (
     extract_terminal_task_ids,
     sweep_degenerate_task_nodes,
 )
+from fused_memory.reconciliation.episode_window import (
+    UNFINISHED_WRITE_START_STAT,
+    unfinished_write_start_stat,
+)
 from fused_memory.reconciliation.flag_dedup import (
     EntityStandingSuppressionResult,
     acknowledge_resolved_flags,
@@ -270,6 +274,9 @@ class MemoryConsolidator(BaseStage):
     # design invariant INV-2 structured-facts-at-failure.
     _undatable_freshness_records: int
 
+    # Sampled just before the episode fetch; see reconciliation/episode_window.py.
+    _unfinished_graphiti_write_start: datetime | None
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # Per-instance initialisation: avoids shared-mutable-default hazard.
@@ -278,6 +285,7 @@ class MemoryConsolidator(BaseStage):
         # state across all instances (and across reused-instance runs).
         self._fetch_degraded_sources: list = []
         self._undatable_freshness_records: int = 0
+        self._unfinished_graphiti_write_start: datetime | None = None
         self._live_workflow_snapshot: LiveWorkflowSnapshot | None = None
 
     async def run(
@@ -322,6 +330,9 @@ class MemoryConsolidator(BaseStage):
         # on remediation passes (which never call assemble_payload's freshness filters
         # and so leave the per-instance counter at its __init__/reset value of 0).
         report.stats['stage1_undatable_freshness_records'] = self._undatable_freshness_records
+        report.stats[UNFINISHED_WRITE_START_STAT] = unfinished_write_start_stat(
+            self._unfinished_graphiti_write_start
+        )
 
         # Always present (task-2312): set BEFORE the remediation early-return below
         # so downstream consumers see this key on every run, including remediation
@@ -1593,11 +1604,15 @@ class MemoryConsolidator(BaseStage):
         # leak hazard as _fetch_degraded_sources above, so it gets the identical
         # precede-every-early-return placement.
         self._undatable_freshness_records = 0
+        self._unfinished_graphiti_write_start = None
 
         # Remediation mode: return focused payload with findings only
         if self.remediation_findings is not None:
             return await self._assemble_remediation_payload()
 
+        self._unfinished_graphiti_write_start = (
+            self.memory.earliest_unfinished_graphiti_write_start(self.project_id)
+        )
         # 1. Episodes since last reconciliation
         try:
             episodes = await self.memory.get_episodes(
@@ -1782,6 +1797,7 @@ Review the above data and perform memory consolidation:
         # value from a prior time-windowed assemble_payload call (task 4574, same
         # leak hazard as _fetch_degraded_sources above).
         self._undatable_freshness_records = 0
+        self._unfinished_graphiti_write_start = None
 
         event_summary = _format_events(ap.events)
         deferred_events_note = clip_note(

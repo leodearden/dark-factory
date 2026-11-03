@@ -60,6 +60,11 @@ class CostBasis(StrEnum):
     METERED = 'metered'
     SUBSCRIPTION = 'subscription'
 
+    @property
+    def imputes_dollars(self) -> bool:
+        """Whether cost_usd is a list price modelled onto credits, not measured (PRD decision 16)."""
+        return self is CostBasis.SUBSCRIPTION
+
 
 class ShadowCellState(StrEnum):
     """C1's cell lifecycle, in order (``shadow_cells.state``)."""

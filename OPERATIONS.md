@@ -607,6 +607,123 @@ your shell profile — it will silently redirect an unrelated invocation at
 the wrong project. Prefer a per-project `.envrc` (direnv) instead, and note
 that direnv isn't installed by default on a fresh host.
 
+### Client feed
+
+#### What the publisher is
+
+One long-running `client-feed publish --config <policy>` per client project,
+run as `client-feed@<name>.service`. Every pass writes that project's
+client-safe evidence to its `out/` (`feed.jsonl`, `state.json`,
+`cursor.json`) and reads its `in/` (`inbox.jsonl`, `engagement.json`), which
+the client portal writes. `scripts/setup-host.sh` renders the unit from
+`scripts/client-feed.service.template` and never enables it. The design is
+`plans/client-feed-prd.md`; what the publisher may open and write is its
+isolation invariant, §8.
+
+#### The policy file
+
+Each instance reads `~/.config/client-feed/<name>.yaml` (PRD §7.6). The schema
+and every default live in `client-feed/src/client_feed/policy.py::Policy`. The
+worked example for this repository is `client-feed/examples/dark-factory.yaml`.
+From the checkout root:
+
+```bash
+install -D -m 0600 client-feed/examples/dark-factory.yaml ~/.config/client-feed/dark-factory.yaml
+```
+
+For a client project, install it under the project's name, then edit
+`project_id`, `project_root`, `out_dir`, `in_dir` and `visible_globs`. The
+publisher refuses to start on a file it cannot read, parse or validate, on a
+`project_root` that is not the top of a git work tree, and on an `out_dir` that
+is missing, a symlink, or not the running user's
+(`client-feed/src/client_feed/policy.py::PolicyProblem`).
+
+#### The two directories
+
+| Directory | Owner:group | Mode | Written by |
+|---|---|---|---|
+| `<root>/<name>/out` | `leo:scoping-intake` | 2750, setgid | the publisher; its files are 0640 (`client-feed/src/client_feed/feed_io.py::FILE_MODE`) |
+| `<root>/<name>/in` | `scoping-intake:scoping-intake` | 2750, setgid | the portal; Leo reads it through the group |
+
+`<root>` is `/var/lib/scoping-intake-feeds` unless moved, and `scoping-intake`
+is the portal account's group. The portal repository creates both directories
+(`sudo ~leo/src/scoping-intake/deploy/install.sh feed <name>`), and the portal
+PRD owns them. The authoritative layout is that repository's
+`deploy/README.md` §"Feeds". If the root moves, point the policy's `out_dir`
+and `in_dir` at the new paths and restart the instance.
+
+`install.sh` adds Leo to the group (`usermod -aG scoping-intake leo`). The
+publisher's user units see the new membership only once Leo's user manager
+restarts. A reboot restarts it; with linger on, logging out does not.
+`sudo systemctl restart user@$(id -u).service` also restarts it, but that
+stops every user unit, the orchestrators and fused-memory included, so treat
+it as a fleet restart and drain first (§8). To check, and to keep the units
+running without a login:
+
+```bash
+systemd-run --user --pipe --wait id -nG   # must list scoping-intake
+loginctl enable-linger leo
+```
+
+#### Enabling an instance
+
+From the checkout root:
+
+```bash
+bash scripts/setup-host.sh       # renders client-feed@.service; enables nothing
+# install the policy (above), then publish one pass; a refusal prints on stderr and exits 1:
+uv run --no-sync --project client-feed client-feed snapshot --config ~/.config/client-feed/<name>.yaml
+systemctl --user enable --now client-feed@<name>.service
+systemctl --user cat client-feed@<name>.service                # the template, repo root and uv path substituted
+systemctl --user show -p ExecStart client-feed@<name>.service  # --config resolved to ~/.config/client-feed/<name>.yaml
+journalctl --user -u client-feed@<name>.service
+```
+
+The unit runs `uv run --no-sync`, so the shared `.venv` must already hold
+`client-feed`. setup-host's sync installs it, and so does
+`scripts/sync-orchestrator-env.sh`. After a template change, re-run setup-host
+and restart the instance. A clean stop exits 0. A refusal exits 1, and systemd
+retries it with a 5s→60s backoff until the cause is fixed.
+
+#### Reading the heartbeat's degraded list
+
+```bash
+uv run --no-sync --project client-feed client-feed dump-state --out-dir <out>
+```
+
+prints the fold of the feed. Its `degraded` is the last heartbeat's list of
+`{source, reason}`, and its `as_of` is that heartbeat's time. An empty list is
+healthy; an `as_of` older than a few intervals means the publisher is not
+running. The sources are `client-feed/src/client_feed/contract.py::Source`.
+What a degraded source holds back is stated in `plans/client-feed-prd.md`
+§12:
+
+- `engagement`: reveals are disabled for the pass (δ entry (d)).
+- `inbox`: the inbox offset is held (δ entry (e)).
+- `git`: a merge commit git cannot read holds the landing batch (γ entry (f)).
+  Unparseable git output and a timed-out `git cat-file --batch` read degrade
+  `git` too (task 7484 entry (c)).
+- `archive`: only that run's archived details are lost (γ entry (f)).
+- `tasks`, `events`: rows that cannot be projected are counted as
+  `skipped N rows: …` (γ entry (f)).
+
+The same failures are WARNING lines in the unit's journal.
+
+#### The isolation check
+
+The isolation gate is ζ's `client-feed/tests/test_isolation.py` (task 6973;
+PRD §10 row ζ, B1, B2, B15 and B22). The deployment canary is the portal
+repository's `deploy/README.md` §"Check": step 4 (the portal account cannot
+list `/home/leo`) and step 7 (the canary feed).
+
+#### What evidence exists
+
+- Test and criteria evidence exists for pytest projects only: junit
+  injection is pytest-only (PRD §2).
+- Per-test results for merge runs exist only when the client project's
+  `dark-factory-orchestrator.yaml` sets `merge_verify_breadth: full`.
+  Otherwise only task legs carry `test_results`.
+
 ---
 
 ## 4. Watching a run
@@ -947,6 +1064,29 @@ truncate-at-conflict semantics, and the stale-CAS abort — is
 `plans/deep-merge-ahead-prd.md`; this section is the operator's summary of
 it, not a second copy.
 
+**Deploying a knob flip.** `scripts/merge-deep-set-cap.sh`, like its sibling
+`scripts/merge-pytest-n-ab-switch.sh`, lands its yaml edit through the
+**target project's own merge queue** (`scripts/_merge_queue_landing.py`) and
+hot-reloads only once that landing is confirmed on main. It never commits to
+the target's main directly. Such a commit is drift that queue never verified,
+so every merge in flight there re-verifies in full
+(`orchestrator/src/orchestrator/merge_lane/gates.py::_disjoint_skip_blockers`).
+The landing pays one full merge verify of its own, so it can take hours.
+`MERGE_QUEUE_LANDING_TIMEOUT_SECS` (default 10800) bounds the wait. A
+request still in flight at that ceiling, or when the script is stopped, is
+cancelled. Every outcome short of a confirmed landing exits non-zero, naming
+the request's merge state.
+
+Set a calling deploy task's `before_done.timeout_secs` to at least the
+ceiling plus 300 s, not merely above it. The ceiling is checked only between
+polls, so a queue call in flight when it passes runs to its own reply
+timeout (130 s for the submit, 30 s for a poll), and the cancel after it can
+take 30 s more. The landing step can therefore end about 190 s past the
+ceiling (`scripts/_merge_queue_landing.py::land_file`), and the reload comes
+after a landing. A `before_done` timeout SIGKILLs the process group, so too
+tight a margin kills the script mid-cancel and leaves a live request that
+nothing reports.
+
 ### `resolve_issue` actions
 
 Resolving an L2 escalation takes an `action`, which maps to a specific
@@ -1252,6 +1392,13 @@ takes no arguments: it always re-reads that process's own
   `orchestrator/src/orchestrator/config.py::ScoringConfig` and
   `plans/scheduler-dispatch-scoring-and-lock-layer-prd.md` §C2. The legacy
   formula's `age_alpha` / `cpm_beta` stay restart-only.
+- `deterministic.predicate_recheck_stall_cap` (default 30, `>= 1`): how many
+  consecutive exit-75 "not yet" verdicts a re-arming predicate may return
+  before the runner files `milestone_check_stalled`. Read whenever a
+  deterministic slot builds its runner, so a reload applies from the next
+  dispatch. Calibrate it from `predicate_recheck_stalled` events. Normative
+  homes: `orchestrator/src/orchestrator/config.py::DeterministicConfig` and
+  `plans/completion-driven-triggers-prd.md` C1.
 - `verify_env`
 - `verify_cgroup_cpu_weight_merge` / `_task` / `_background` (the per-role
   cgroup `CPUWeight` a verify scope is spawned with when
@@ -2179,6 +2326,145 @@ writing streak state: `is_unit_enabled` (operator intent) and the 120s
 `STARTUP_GRACE_SECS` window after the unit starts (a not-yet-bound port is
 neither failure evidence nor recovery).
 
+### FalkorDB settings and the recreate gate
+
+FalkorDB's durable settings live in `fused-memory/docker/docker-compose.yml`
+and nowhere else: `REDIS_ARGS` turns the AOF on (`appendonly yes`,
+`appendfsync everysec`), `FALKORDB_ARGS` sets the query `TIMEOUT 30000`, and
+the image is pinned by digest (FalkorDB 4.18.0; `:latest` is now the 6.0
+engine). The image runs `redis-server` with no config file, so a runtime
+`CONFIG SET` or `GRAPH.CONFIG SET` lasts only until the next container
+restart, and a crash restart drops it silently (task 6330, 6848; the 10-26
+segfault reset both). Use `CONFIG SET` only as a stop-gap, never as the fix.
+
+fused-memory checks both at startup and logs a WARNING naming the shortfall
+when `TIMEOUT` is below `graphiti.falkordb.expected_graph_timeout_ms` or
+`appendonly` is not `yes`. `get_status` reports the live values on every call
+under `graphiti.server_settings` (`ok`, `shortfalls`, `read_errors`). It never
+sets them.
+
+The unit's `ExecStartPre` (and `scripts/setup-host.sh`) runs
+`scripts/falkordb_aof_gate.py` instead of a bare compose-up, and the
+fused-memory parity checker reports a unit that does not as drift. A recreate
+starts the new server with `appendonly yes`, which loads only the AOF and
+ignores `dump.rdb`, so a stale AOF would drop every write made since it went
+stale. The gate therefore decides as follows:
+
+| falkordb container | Gate action |
+|---|---|
+| any, but the compose file binds a different host data dir than the container mounts | not touched, qdrant comes up, ERROR |
+| running, AOF current | `compose up -d falkordb qdrant` (a recreate goes ahead) |
+| running, AOF not current or unreadable | left running, qdrant comes up, ERROR with each problem's remedy |
+| created / exited, its `REDIS_ARGS` enable `--appendonly yes` | `docker start` it unchanged and bring qdrant up; any pending recreate waits for the next restart |
+| created / exited, AOF not enabled at boot | not started (it would load a stale `dump.rdb`), qdrant comes up, ERROR; fused-memory then fails at its port wait |
+| restarting / paused / dead / removing | left alone, qdrant comes up, ERROR |
+| absent, data dir empty | `compose up -d falkordb qdrant` (fresh install) |
+| absent, `dump.rdb` or `appendonlydir` present | not created, qdrant comes up, ERROR; fused-memory then fails at its port wait |
+
+"AOF current" means the live server reports `appendonly yes`, `aof_enabled:1`,
+`loading:0`, `aof_last_write_status:ok` and `aof_rewrite_in_progress:0`. It
+also means the base and incr files in the host-side manifest total exactly
+the server's `aof_current_size`, bracketed by two `INFO` reads. Size is used
+rather than mtime because an idle server's incr file mtime does not move.
+
+**When it refuses**, the journal line names each problem and its remedy:
+
+| Problem | Remedy |
+|---|---|
+| `appendonly` no, `aof_enabled:0`, no manifest on the host | `docker exec docker-falkordb-1 redis-cli CONFIG SET appendonly yes`, wait for `aof_rewrite_in_progress:0`, restart fused-memory |
+| `loading:1` or `aof_rewrite_in_progress:1` | wait until both read 0, then restart fused-memory |
+| `aof_last_write_status:err` | the AOF write failed: check free space and IO errors on the disk holding `fused-memory/data/falkordb`, then restart |
+| compose file and container disagree on the data dir | run the gate with the main checkout's compose file, never a worktree's (a worktree's binds an empty data dir) |
+| container restarting / paused / dead | wait for it to settle (`docker ps -a`), then restart fused-memory |
+| stopped without AOF at boot, absent over data, or an `import-data.sh` refusal | "Deciding which FalkorDB copy is newest" below, BEFORE removing any container |
+| host AOF size disagrees with the server, or state unreadable | inspect by hand before restarting anything |
+
+To check the verdict without acting, run the gate with the main checkout's
+paths (exit 0 means a recreate is allowed):
+
+```bash
+python3 /home/leo/src/dark-factory/scripts/falkordb_aof_gate.py \
+  --compose-file /home/leo/src/dark-factory/fused-memory/docker/docker-compose.yml --check-only
+```
+
+#### Deciding which FalkorDB copy is newest
+
+A data dir can hold two copies of the graph: the AOF (`appendonlydir/`, base
+plus incr) and `dump.rdb`. A server started with `appendonly yes` loads only
+the AOF, and one started without it loads only `dump.rdb`. Whichever copy is
+older loses every write made after it. Do not assume `dump.rdb` is newer.
+Take a container whose runtime AOF was on and stop it: the AOF is fsynced
+first, and the final RDB save is SIGKILLed at compose's 10 s grace, so the AOF
+holds writes that `dump.rdb` lacks. Decide before any `docker rm`, because a
+stopped container's log is the best evidence. Everything below uses the main
+checkout.
+
+1. **Set aside a copy first**, so that a wrong choice can be undone. The files
+   are root-owned, so copy them inside a container. This needs free space
+   equal to their size.
+
+   ```bash
+   D=/home/leo/src/dark-factory/fused-memory/data/falkordb
+   IMG=falkordb/falkordb@sha256:58a95a33d591b25648bbb13268a23329aa39e70b4cbeff0752c65f8b4beba6db
+   docker run --rm --entrypoint sh -v "$D":/d "$IMG" -c \
+     'cp -a /d/appendonlydir /d/appendonlydir.pre-bootstrap; cp -a /d/dump.rdb /d/dump.rdb.pre-bootstrap'
+   ```
+
+2. **Read the stopped container's log**, if a container exists:
+   `docker logs --tail 50 docker-falkordb-1`. If "Saving the final RDB
+   snapshot" is followed by "DB saved on disk", the final save finished and
+   `dump.rdb` is current.
+3. **Otherwise, compare mtimes**: `stat -c '%y %n' "$D"/dump.rdb
+   "$D"/appendonlydir/*.incr.aof`. After an `import-data.sh` refusal, run this
+   on the export's files.
+4. **If the AOF is newer**, start onto it. No bootstrap is needed:
+
+   ```bash
+   docker rm docker-falkordb-1      # the stopped container, if one exists
+   docker compose -f /home/leo/src/dark-factory/fused-memory/docker/docker-compose.yml up -d falkordb
+   ```
+
+   Then record the graph counts below and check them against what you expect.
+5. **Only if `dump.rdb` is newer**, follow the bootstrap below.
+
+**Graph counts.** Record these from the first server that loads the data, and
+compare them after each later step:
+
+```bash
+C=docker-falkordb-1   # or falkordb-bootstrap during the bootstrap
+for g in $(docker exec $C redis-cli GRAPH.LIST); do
+  printf '%s %s\n' "$g" "$(docker exec $C redis-cli GRAPH.RO_QUERY "$g" 'MATCH (n) RETURN count(n)' | sed -n 2p)"
+done > /tmp/falkordb-graph-counts-$(date +%s).txt
+```
+
+#### Bootstrapping FalkorDB's AOF from dump.rdb
+
+Use this only when the decision above found `dump.rdb` to be the newest copy,
+for example an RDB-only export. It loads `dump.rdb` into one container that has
+no `REDIS_ARGS` (so the AOF is off and `dump.rdb` is what loads), then turns
+the AOF on, so that Redis rewrites the AOF from the loaded data. That rewrite
+replaces the old AOF; the set-aside copy from step 1 is the way back.
+
+```bash
+systemctl --user stop fused-memory
+docker rm docker-falkordb-1            # only if it exists and is stopped; never a running one
+docker run -d --name falkordb-bootstrap -p 6379:6379 -v "$D":/var/lib/falkordb/data \
+  -e FALKORDB_ARGS="MAX_QUEUED_QUERIES 25 TIMEOUT 30000 RESULTSET_SIZE 10000" "$IMG"
+docker exec falkordb-bootstrap redis-cli INFO persistence   # repeat until loading:0
+# record the graph counts (C=falkordb-bootstrap)
+docker exec falkordb-bootstrap redis-cli CONFIG SET appendonly yes
+docker exec falkordb-bootstrap redis-cli INFO persistence   # repeat until aof_rewrite_in_progress:0, aof_last_write_status:ok
+docker stop falkordb-bootstrap && docker rm falkordb-bootstrap
+docker compose -f /home/leo/src/dark-factory/fused-memory/docker/docker-compose.yml up -d falkordb
+# record the graph counts again (C=docker-falkordb-1): every graph's count must match
+systemctl --user start fused-memory
+```
+
+The compose-up by hand is deliberate: with no container and data on disk, the
+gate refuses to create one. Here the AOF was written moments ago from the
+loaded data, so it is current. Delete the `.pre-bootstrap` copies once the
+counts match.
+
 ### Dashboard unit-parity check
 
 Each orchestrator-watchdog tick also runs
@@ -2506,11 +2792,15 @@ check `applied`/`restart_required` on your reload call, per
 | `watcher_daily_cost_ceiling_usd` | `50.0` | All `escalation-watcher` (L1 auto-triage) invocations for the day |
 | `orch_daily_cost_ceiling_usd` | `200.0` | All orchestrator invocations (every role) for the day |
 
-**Multi-account failover (`usage_cap.*`)** is entirely optional — a
-single-user setup works fine on plain CLI OAuth login with no accounts
-file configured. If you do configure a pool
+**Multi-account failover (`usage_cap.*`)** is on in every shipped config. A
+pool whose roster resolves no token is EMPTY, and every invocation then raises
+in `UsageGate.before_invoke`: the gate never adopts the operator's `~/.claude`
+login unless told to (ruling 2026-11-01, task 8161). A single-user setup has two
+supported routes: `usage_cap.enabled: false`, or
+`usage_cap.fallback_to_default_credential: true` (interactive or single-user
+only: the whole fleet then rides that login). The pool
 (`usage_cap.accounts_file` → an external YAML of `oauth_token_env` entries
-resolved from `.env`), it gives the orchestrator per-account failover when
+resolved from `.env`) gives the orchestrator per-account failover when
 one account gets capped, plus the per-(account, model) scoped-cap
 dimension described in [§7](#7-model-routing). This whole block is
 restart-tier, not hot-reloadable.
@@ -3328,8 +3618,10 @@ failing recurring `oneshot` stays in `failed` state and silently ends the job.
 
 **API key.** The unit carries `UnsetEnvironment=ANTHROPIC_API_KEY` under the
 policy stated in "Legibility trickle accounts (03:00)" above.
-`nightly_prepare.py` also strips the key from the child's env, whether the
-account came from a lease or was inherited.
+`nightly_prepare.py` builds the child's env as
+`shared.secret_env.agent_subprocess_env` of its own (no API keys or other
+secrets, no endpoint selection, no Python-env selection), with the lease's
+`CLAUDE_CODE_OAUTH_TOKEN` on top.
 
 **First run: arm the timer.** The installer kicks no immediate run, because
 an off-cadence run would spend a Fable budget nobody scheduled.

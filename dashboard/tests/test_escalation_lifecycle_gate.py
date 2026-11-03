@@ -129,11 +129,11 @@ def _clear_escalation_caches() -> None:
     from dashboard.api.escalations import _analytics_memo_clear
     from dashboard.data.escalation_corpus import _corpus_cache_clear
     from dashboard.data.task_lookup import _lookup_cache_clear
-    from dashboard.data.task_snapshot import _snapshot_cache_clear
+    from dashboard.data.task_snapshot import clear_snapshot_cache
 
     _corpus_cache_clear()
     _analytics_memo_clear()
-    _snapshot_cache_clear()
+    clear_snapshot_cache()
     _lookup_cache_clear()
 
 

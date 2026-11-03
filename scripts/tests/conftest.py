@@ -42,7 +42,6 @@ drive the shared session runner end to end.
 """
 import json
 import os
-import shutil
 import sqlite3
 import sys
 from datetime import UTC, datetime, timedelta
@@ -84,6 +83,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
 from df_pytest_isolation import (  # noqa: E402
+    _df_claude_binary_unset,  # noqa: F401  — the binding IS the wiring  # debt: task 6997
     _df_deploy_clocks_unwritten,  # noqa: F401  — the binding IS the wiring
     _df_fleet_deploy_clock_redirect,  # noqa: F401  — the binding IS the wiring
     _df_fleet_dir_redirect,  # noqa: F401  — the binding IS the wiring
@@ -159,12 +159,13 @@ def _isolate_legibility_trickle_state(tmp_path_factory, monkeypatch):
 # Shared tasks.db fixtures (task 3336).
 #
 # _TASKS_SCHEMA is a deliberate SUBSET (of tables and columns) of
-# `fused-memory/src/fused_memory/backends/sqlite_task_backend.py::_SCHEMA_SQL`,
-# keeping only what the sweep scripts read, with the real shapes and NOT NULL
-# constraints of what it keeps rather than invented ones. For the full shape,
-# run `python scripts/tasks_db_schema.py`. It stays private to `make_tasks_db`,
-# which executes it on every use — that is the executable check, so no test
-# asserts on the literal.
+# `shared/src/shared/task_store_schema.py::TASK_STORE_DDL`, keeping only what
+# the sweep scripts read, with the real shapes and NOT NULL constraints of what
+# it keeps rather than invented ones. For the full shape, run
+# `python scripts/tasks_db_schema.py`. It stays private to `make_tasks_db`:
+# scripts/tests/test_make_tasks_db_schema.py builds a store through
+# `make_tasks_db` and checks it with `tasks_db_schema.columns_outside`, so no
+# test asserts on the literal.
 #
 # The schema is the SUPERSET of what the three sweep-script test files used
 # privately: audit_wiped_metadata_files' copy carries `priority TEXT`, the two
@@ -640,9 +641,10 @@ def runs_db(runs_db_path):
 #
 # The legibility trickle and census spawn `claude` through the shared runner
 # (shared.cli_invoke.invoke_with_cap_retry -> invoke_claude_agent), which
-# resolves the BARE name against PATH. These fixtures put a fake first on PATH
-# and give it a per-token script, so a suite can drive a real UsageGate through
-# failover, auth rejection and caps without any real CLI being reachable.
+# resolves CLAUDE_BINARY, else the bare name, against PATH. These fixtures put a
+# fake first on PATH and give it a per-token script, so a suite can drive a real
+# UsageGate through failover, auth rejection and caps without any real CLI
+# being reachable.
 # ---------------------------------------------------------------------------
 
 _FAKE_CLAUDE_PLAN_ENV = 'FAKE_CLAUDE_PLAN'
@@ -761,12 +763,15 @@ class FakeClaudeCli:
 def fake_claude_cli(tmp_path, monkeypatch):
     """Install a :class:`FakeClaudeCli` as the only `claude` on PATH.
 
-    Prepended to PATH and then PROVEN to win: ``shutil.which('claude')`` must
-    resolve to the fake, so no test using this fixture can ever reach the real
-    CLI (real LLM spend, and a test passing for the wrong reason). The shebang
-    is ``sys.executable``, so the fake needs nothing else on PATH to start.
-    Starts with the default plan; call ``.plan(...)`` to script it.
+    Prepended to PATH and then PROVEN to win: ``resolve_claude_binary()``, the
+    resolution the spawn itself performs, must return the fake, so no test
+    using this fixture can ever reach the real CLI (real LLM spend, and a test
+    passing for the wrong reason). The shebang is ``sys.executable``, so the
+    fake needs nothing else on PATH to start. Starts with the default plan;
+    call ``.plan(...)`` to script it.
     """
+    from shared.cli_invoke import resolve_claude_binary
+
     bin_dir = tmp_path / 'fake-claude-bin'
     bin_dir.mkdir()
     state_dir = tmp_path / 'fake-claude-state'
@@ -780,9 +785,9 @@ def fake_claude_cli(tmp_path, monkeypatch):
     monkeypatch.setenv(_FAKE_CLAUDE_PLAN_ENV, str(fake._plan_path))
     monkeypatch.setenv(_FAKE_CLAUDE_CALLS_ENV, str(fake._calls_path))
     monkeypatch.setenv('PATH', f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
-    assert shutil.which('claude') == str(fake.path), (
-        f"the fake claude at {fake.path} must be the one PATH resolves; "
-        f"got {shutil.which('claude')!r}"
+    assert resolve_claude_binary() == str(fake.path), (
+        f"the fake claude at {fake.path} must be the one the spawn resolves; "
+        f"got {resolve_claude_binary()!r}"
     )
     return fake
 

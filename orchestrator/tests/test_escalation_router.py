@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 from _curator_fake import FakeCurator
+from escalation.amendments import amendment_room
 from escalation.disposition import (
     Addressed,
     ConvertViaCurator,
@@ -23,7 +24,7 @@ from escalation.disposition import (
     StatusInfo,
 )
 from escalation.models import Escalation
-from escalation.queue import EscalationQueue, amendment_room
+from escalation.queue import EscalationQueue
 
 from orchestrator.escalation_router import (
     AGGREGATE_CATEGORY,

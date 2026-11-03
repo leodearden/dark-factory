@@ -190,6 +190,12 @@ for the whole fleet. Entry: `fused-memory/src/fused_memory/server/main.py`
   load-sampler unit. Discovers orchestrator instances by reading each
   registered project's `dark-factory-orchestrator.yaml` (`escalation.port`);
   reads fused-memory and its own SQLite DBs read-only.
+- **Client feed publisher** — `client-feed@<name>.service`, one instance per
+  client project; setup-host renders the template and enables none. It reads
+  that project's `tasks.db` and `runs.db` read-only, its verify archive, its
+  git objects and its `in/` directory, and writes only its `out/`. Invariant
+  and contract: `plans/client-feed-prd.md` §8 and §7. Operating it:
+  [OPERATIONS.md](OPERATIONS.md) §"Client feed".
 - **`scripts/orchestrator-watchdog.py`** — a systemd-timer oneshot
   (`OnBootSec=30`, `OnUnitActiveSec=60`). Its liveness pass TCP-probes each
   orchestrator's escalation port and revives a wedged unit immediately; its
@@ -452,7 +458,12 @@ For a normal task, `TaskWorkflow._drive()`
    `max_amendment_rounds`). Independently, every `review.interval` merges
    (default 40), a `ReviewCheckpoint` runs `deep_reviewer` across recently-
    merged modules for cross-task integration issues, filing its own
-   tasks/escalations if it finds any.
+   tasks/escalations if it finds any. Before its Phase 1 verification the
+   checkpoint runs any project-declared `review.pre_test_commands` (e.g.
+   rebuilding the frontend bundles e2e tests serve) in the main checkout,
+   fail-soft: a failed or timed-out command is reported to the reviewer and
+   in the saved report, never aborting the review
+   (`orchestrator/src/orchestrator/review_pre_test.py`).
 7. **MERGE.** `_submit_to_merge_queue()` hands the branch to the merge lane
    (§5).
 8. **DONE.** `_finalise_merged_done()` refreshes `metadata.files` from the
@@ -546,7 +557,7 @@ and are not restated here.
     `_file_stop_instruction_and_block`,
     `_file_curator_adjudication_missing_and_block`,
     `_file_milestone_gate_and_block`,
-    `_file_milestone_check_failed_and_block`). Each wraps the status write in
+    `_file_predicate_escalation_and_block`). Each wraps the status write in
     `try`/`except` and *log-and-swallows* a failure (the escalation is already
     durable), so it can file the record and still not write `blocked`. These
     are also the `pending → blocked` edge §3.8 depends on — no workflow, and

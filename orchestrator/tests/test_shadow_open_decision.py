@@ -314,6 +314,10 @@ class TestHostVerdict:
         assert decision.host is HostVerdict.UNREADABLE
 
 
+_MIMO_CANDIDATES = ['mimo-v2.6-pro-endpoint', 'mimo-v2.6-flash-endpoint']
+_MIMO_BASE_URL = 'https://token-plan-sgp.xiaomimimo.com/anthropic'
+
+
 class TestCandidateFacts:
     def test_a_blank_endpoint_token_is_no_credentials(self, monkeypatch):
         monkeypatch.setenv('ZAI_API_KEY', '')
@@ -339,6 +343,36 @@ class TestCandidateFacts:
 
     @pytest.mark.parametrize('name', ['glm-5.3-endpoint', 'glm-5.3-flash-endpoint'])
     def test_glm_endpoint_candidates_are_subscription(self, name):
+        config = get_config_by_name(name)
+        assert config is not None
+        assert cost_basis_of(config) is CostBasis.SUBSCRIPTION
+
+    @pytest.mark.parametrize('name', _MIMO_CANDIDATES)
+    def test_a_blank_mimo_key_is_no_credentials(self, monkeypatch, name):
+        monkeypatch.setenv('MIMO_ANTHROPIC_BASE_URL', _MIMO_BASE_URL)
+        monkeypatch.setenv('MIMO_API_KEY', '')
+        config = get_config_by_name(name)
+        assert config is not None
+        assert candidate_has_credentials(config) is False
+
+    @pytest.mark.parametrize('name', _MIMO_CANDIDATES)
+    def test_an_unset_mimo_base_url_is_no_credentials(self, monkeypatch, name):
+        monkeypatch.delenv('MIMO_ANTHROPIC_BASE_URL', raising=False)
+        monkeypatch.setenv('MIMO_API_KEY', 'tp-test')
+        config = get_config_by_name(name)
+        assert config is not None
+        assert candidate_has_credentials(config) is False
+
+    @pytest.mark.parametrize('name', _MIMO_CANDIDATES)
+    def test_a_mimo_base_url_and_key_are_credentials(self, monkeypatch, name):
+        monkeypatch.setenv('MIMO_ANTHROPIC_BASE_URL', _MIMO_BASE_URL)
+        monkeypatch.setenv('MIMO_API_KEY', 'tp-test')
+        config = get_config_by_name(name)
+        assert config is not None
+        assert candidate_has_credentials(config) is True
+
+    @pytest.mark.parametrize('name', _MIMO_CANDIDATES)
+    def test_mimo_endpoint_candidates_are_subscription(self, name):
         config = get_config_by_name(name)
         assert config is not None
         assert cost_basis_of(config) is CostBasis.SUBSCRIPTION

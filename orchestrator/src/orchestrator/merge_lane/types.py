@@ -28,6 +28,7 @@ from orchestrator.branch_stack import PreStackTip
 from orchestrator.critical_gate import critical_filing_gate
 from orchestrator.git_ops import MergeResult
 from orchestrator.merge_lane.disposition import MergeFailureDisposition, SkewEvidence
+from orchestrator.merge_lane.outcome_facts import ConflictEvidence, MergeBlockCategory
 from orchestrator.merge_lane.reverify_gate_decision import GateClearance
 from orchestrator.remote_gate import GateIdentityPair, RunnerUnavailableKind
 from orchestrator.verify import VerifyResult, merge_verify_command_budget_secs
@@ -943,7 +944,7 @@ class MergeRequest:
 
     Contrast with :attr:`enqueued_at`, which is re-stamped on every resubmission
     and held in-memory only (lost on restart).  ζ's aging comparator at
-    ``_pop_next_pickable`` reads this field; ``None`` for legacy in-flight requests
+    ``MergeIntake.pop_next_pickable`` reads this field; ``None`` for legacy in-flight requests
     created before α was deployed (ζ owns the ``enqueued_at`` fallback for those).
     """
     request_id: str = field(
@@ -1196,6 +1197,14 @@ class MergeOutcome:
     nothing emits no value at all rather than a ``0``.  See
     test_merge_queue_deep_landing.py, which asserts the encoding through a
     verbatim transcription of that predicate rather than restating it."""
+    block_category: MergeBlockCategory = MergeBlockCategory.MERGE_ERROR
+    """The category the workflow files a generic ``blocked`` outcome under,
+    stated by the producer rather than inferred from ``reason`` (task 7302)."""
+    conflict_evidence: ConflictEvidence | None = None
+    """The paths a ``conflict`` outcome, a train whose tip merge conflicted, or
+    a needs-rebase bounce conflicted on, recorded into runs.db; ``None`` when
+    no conflict was probed, the probe failed open, or git could not name the
+    paths (task 7302)."""
 
 
 @dataclass
@@ -1603,8 +1612,8 @@ class ItemLifecycleState(StrEnum):
     (merge-queue-reliability PRD scope-4 iota / task 2164, L-1).
 
     Normalizes today's FOUR redundant state encodings — container
-    membership across the five queues (``_queue``/``_lane_buffers``/
-    ``_verifier_queue``/``_redispatch``/``_dispatch_item``), the free-form
+    membership across the five queues (``_queue``/the lane buffers/
+    ``_verifier_queue``/the redispatch park/``_dispatch_item``), the free-form
     ``InflightEntry.phase: str`` field (deleted by task lambda / task 2173 —
     phase is now derived via ``SpeculativeMergeWorker._entry_phase()``), the
     :class:`InflightStatus` sentinel enum above, and the four worker transient side-fields

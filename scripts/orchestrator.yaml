@@ -276,7 +276,7 @@ test_command: "uv run --project shared pytest tests/scripts/ scripts/tests/ --tb
 # pyproject.toml, and held there by tests/scripts/test_nonmember_ruff_config.py.
 # Read them there; do not restate them here, or the two will drift and only one
 # copy is guarded.
-lint_command: "uv run --project shared ruff check scripts/"
+lint_command: "uv run --project shared ruff check scripts/ && python3 tests/scripts/raw_envelope_literal_guard.py scripts"
 
 # TYPE IS NOW DECLARED — task 3456 closed the gap task 3445 recorded here.
 #
