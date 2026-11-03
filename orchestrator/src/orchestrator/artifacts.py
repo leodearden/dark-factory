@@ -1040,6 +1040,17 @@ class TaskArtifacts:
                 self._write_held_plan(plan)
         return plan
 
+    def peek_plan(self) -> dict:
+        """Return the plan exactly as :meth:`read_plan` would, but never repair
+        it on disk: no ``plan_mutex`` is taken and nothing is written.
+
+        For observers that poll a live task's plan (such as
+        ``orchestrator/task_runtime.py::_read_task_entry``) and must not
+        rewrite it under the agent that owns it.
+        """
+        plan, _needs_repair = self._read_normalized_plan()
+        return plan
+
     def _read_normalized_plan(self) -> tuple[dict, bool]:
         plan_path = self.artifact_path('plan.json')
         if not plan_path.exists():
