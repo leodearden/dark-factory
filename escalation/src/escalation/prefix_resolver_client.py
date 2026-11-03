@@ -5,10 +5,12 @@
 pure function of ``(project_id, prefix)``: every call opens its own connection
 and nothing is held between calls.
 
-It fails OPEN, never quietly (INV-11). A transport error, a timeout, any
-non-200 status and a 200 whose body does not parse as a ``Resolution`` all
-raise ``ResolverUnavailable``, so the guard forwards the call unchanged and
-says so on ``meta``. None of them is ever read as a ``none``. A 503 names the
+It fails OPEN, never quietly (INV-11). ANY failure to obtain a ``Resolution``
+(a transport error, a timeout, an unusable *base_url*, a non-200 status, a
+malformed 200) raises ``ResolverUnavailable``, the one failure the C2 port
+declares, so the guard forwards the call unchanged and says so on ``meta``; it
+would re-raise anything else as a resolver bug. Only cancellation propagates,
+and no failure is ever read as a ``none``. A 503 names the
 store that failed, because "mem0 is down" is actionable where "the resolver is
 down" is not.
 
@@ -137,8 +139,8 @@ class PrefixResolverClient:
             return await self._request(project_id, prefix)
         except _Unanswered as exc:
             reason, store, cause = str(exc), exc.store, exc
-        except (httpx.HTTPError, TimeoutError) as exc:
-            reason, store, cause = type(exc).__name__, RESOLVER_SERVICE_STORE, exc
+        except Exception as exc:
+            reason, store, cause = f'{type(exc).__name__}: {exc}', RESOLVER_SERVICE_STORE, exc
         logger.warning(
             'prefix resolver: POST %s for project=%s prefix=%s got no resolution (%s); '
             'the %s store is treated as unavailable',
