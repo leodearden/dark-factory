@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import ssl
 import time
 from collections.abc import Callable, Coroutine
 from typing import Any
@@ -202,6 +203,47 @@ class TestDeadline:
         assert 0.9 <= elapsed < 3.0
 
 
+class TestCancellation:
+    @pytest.mark.asyncio
+    async def test_cancellation_propagates_and_is_never_unavailability(self, caplog):
+        caplog.set_level(logging.WARNING, logger=prefix_resolver_client.__name__)
+        in_flight = asyncio.Event()
+
+        async def hang(request: httpx.Request) -> httpx.Response:
+            in_flight.set()
+            await asyncio.sleep(30)
+            return httpx.Response(200, json={'outcome': 'none', 'candidates': []})
+
+        resolving = asyncio.create_task(_resolve(_client(hang, timeout_seconds=60)))
+        async with asyncio.timeout(5):
+            await in_flight.wait()
+        resolving.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await resolving
+        assert _client_warnings(caplog) == []
+
+
+class TestEventLoopCost:
+    @pytest.mark.asyncio
+    async def test_resolutions_build_the_tls_context_at_most_once(self, monkeypatch):
+        built: list[ssl.SSLContext] = []
+        create_default_context = ssl.create_default_context
+
+        def recording(*args: Any, **kwargs: Any) -> ssl.SSLContext:
+            built.append(create_default_context(*args, **kwargs))
+            return built[-1]
+
+        monkeypatch.setattr(ssl, 'create_default_context', recording)
+        client = PrefixResolverClient(base_url='http://127.0.0.1:1')
+
+        for _ in range(3):
+            with pytest.raises(ResolverUnavailable):
+                await _resolve(client)
+
+        assert len(built) <= 1
+
+
 class TestMalformedSuccess:
     @pytest.mark.asyncio
     @pytest.mark.parametrize('response', [
@@ -251,9 +293,12 @@ class TestFailureWarning:
             assert fragment in message
 
     @pytest.mark.asyncio
-    async def test_an_unusable_base_url_logs_one_warning_naming_the_error(self, caplog):
+    @pytest.mark.parametrize(('base_url', 'error'), [
+        ('http://localhost:abc', 'InvalidURL'),
+        ('http://127.0.0.1:80020', 'OverflowError'),
+    ], ids=['invalid-port', 'port-out-of-range'])
+    async def test_an_unusable_base_url_logs_one_warning_naming_the_error(self, caplog, base_url, error):
         caplog.set_level(logging.WARNING, logger=prefix_resolver_client.__name__)
-        base_url = 'http://localhost:abc'
 
         with pytest.raises(ResolverUnavailable):
             await _resolve(PrefixResolverClient(base_url=base_url))
@@ -261,7 +306,7 @@ class TestFailureWarning:
         warnings = _client_warnings(caplog)
         assert len(warnings) == 1
         message = warnings[0].getMessage()
-        for fragment in (f'{base_url}/resolve-prefix', _PROJECT, _PREFIX, 'InvalidURL'):
+        for fragment in (f'{base_url}/resolve-prefix', _PROJECT, _PREFIX, error):
             assert fragment in message
 
     @pytest.mark.asyncio

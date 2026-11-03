@@ -2,8 +2,9 @@
 
 :class:`PrefixResolverClient` implements ``shared.uuid_prefix_guard``'s
 ``PrefixResolver`` port over fused-memory's ``POST /resolve-prefix``. It is a
-pure function of ``(project_id, prefix)``: every call opens its own connection
-and nothing is held between calls.
+pure function of ``(project_id, prefix)``: every call opens its own connection,
+and the only thing shared between calls is the TLS configuration, which holds
+no per-request state.
 
 It fails OPEN, never quietly (INV-11). ANY failure to obtain a ``Resolution``
 (a transport error, a timeout, an unusable *base_url*, a non-200 status, a
@@ -17,7 +18,10 @@ down" is not.
 The bound (INV-8): one request's TOTAL deadline is
 :data:`REQUEST_DEADLINE_SECONDS`, so this guard occupies a call for at most
 ceil(MAX_DISTINCT_PREFIXES_PER_CALL / MAX_CONCURRENT_RESOLUTIONS) x 1 s = 2 s
-of awaited, non-blocking I/O.
+of awaited I/O. That deadline cannot interrupt synchronous work, which blocks
+the shared event loop. Each resolution's synchronous work is building a client
+and decoding a body, a fraction of a millisecond. The TLS context costs ~10 ms
+to build, so :func:`_tls_context` builds it once per process.
 
 The route path and field names are restated here because escalation may not
 import fused_memory. ``fused-memory/tests/test_prefix_resolver_client_contract.py``
@@ -28,7 +32,9 @@ lockstep. Contract: ``plans/uuid-prefix-resolution-prd.md`` §4-C5.
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
+import ssl
 from dataclasses import dataclass
 from typing import TypeGuard
 
@@ -63,6 +69,19 @@ class _Unanswered(Exception):
     def __init__(self, reason: str, store: str = RESOLVER_SERVICE_STORE) -> None:
         super().__init__(reason)
         self.store = store
+
+
+@functools.cache
+def _tls_context() -> ssl.SSLContext:
+    """httpx's default verifying context, whose CA-bundle load blocks the loop."""
+    return httpx.create_ssl_context()
+
+
+def _describe(exc: BaseException) -> str:
+    """Name the leaf errors: an anyio ExceptionGroup's own message hides its cause."""
+    if isinstance(exc, BaseExceptionGroup):
+        return '; '.join(_describe(leaf) for leaf in exc.exceptions)
+    return f'{type(exc).__name__}: {exc}'
 
 
 def _is_outcome(value: object) -> TypeGuard[ResolutionOutcome]:
@@ -140,7 +159,7 @@ class PrefixResolverClient:
         except _Unanswered as exc:
             reason, store, cause = str(exc), exc.store, exc
         except Exception as exc:
-            reason, store, cause = f'{type(exc).__name__}: {exc}', RESOLVER_SERVICE_STORE, exc
+            reason, store, cause = _describe(exc), RESOLVER_SERVICE_STORE, exc
         logger.warning(
             'prefix resolver: POST %s for project=%s prefix=%s got no resolution (%s); '
             'the %s store is treated as unavailable',
@@ -151,7 +170,9 @@ class PrefixResolverClient:
     async def _request(self, project_id: str, prefix: str) -> Resolution:
         async with (
             asyncio.timeout(self.timeout_seconds),
-            httpx.AsyncClient(timeout=self.timeout_seconds, transport=self.transport) as client,
+            httpx.AsyncClient(
+                timeout=self.timeout_seconds, transport=self.transport, verify=_tls_context(),
+            ) as client,
         ):
             response = await client.post(self.url, json={'project_id': project_id, 'prefix': prefix})
         if response.status_code != 200:
