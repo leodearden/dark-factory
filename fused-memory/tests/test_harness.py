@@ -1356,11 +1356,6 @@ class TestStage1CycleSummaryHarnessBackstop:
         mock_memory_service.recon_ledger = ledger_store
         mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-        # task σ: this test exercises the failed-cleanup CancelledError branch (it
-        # asserts the '_error' breadcrumb, which only that branch stamps). Since
-        # resume_after_restart now defaults True (a cancel → `interrupted`, no
-        # '_error'), opt out to keep exercising the failed path this test targets.
-        harness.config.resume_after_restart = False
         harness.stages[0].run = AsyncMock(side_effect=asyncio.CancelledError())
 
         with pytest.raises(asyncio.CancelledError):
@@ -2352,7 +2347,7 @@ class TestStage2CycleSummaryHarnessBackstop:
     ):
         """Drives run_full_cycle with the REAL write_stage2_cycle_summary (no
         patch), then fires the backstop AGAIN on the same run_id — a repeat
-        invocation, as an interrupt-then-resume produces, with the
+        invocation, with the
         confirmed-recovery marker cleared so the second call actually reaches
         the ledger. Exactly one row must exist, and it must carry the REAL
         llm_calls both times (never degraded to zeros)."""
@@ -2383,19 +2378,17 @@ class TestStage2CycleSummaryHarnessBackstop:
         # CONFIRMED a recovery, so task 4186's exclusion makes a second call a
         # no-op.
         #
-        # That skip also holds on a REAL resumed run, and is intentional there:
-        # _reattempt_cycle_summary_write stamps the marker on the LIVE report,
-        # update_run_stage_reports serializes it wholesale (model_dump, and the
-        # marker is not among the keys _apply_observed rewrites), and the
-        # journal rehydrates the row back into a StageReport — so a resumed run
-        # DOES see a marker left by a prior driver invocation, and skipping the
-        # re-fire on a True one is correct because True means a row demonstrably
-        # landed.
+        # That skip is intentional: _reattempt_cycle_summary_write stamps the
+        # marker on the LIVE report, update_run_stage_reports serializes it
+        # wholesale (model_dump, and the marker is not among the keys
+        # _apply_observed rewrites), and the journal rehydrates the row back
+        # into a StageReport — so any later read of this run sees the marker,
+        # and skipping the re-fire on a True one is correct because True means
+        # a row demonstrably landed.
         #
-        # The pop() below therefore does NOT emulate a resumed run: it
-        # manufactures the not-yet-recovered shape so this test keeps reaching
-        # the ledger's ON CONFLICT path, which is the idempotency it exists to
-        # pin.
+        # The pop() below therefore manufactures the not-yet-recovered shape so
+        # this test keeps reaching the ledger's ON CONFLICT path, which is the
+        # idempotency it exists to pin.
         stage2_report.stats.pop('stage2_cycle_summary_write_recovered_backstop', None)
         await harness._ensure_stage2_cycle_summary(
             run, run.id, 'test-project', run.started_at,
@@ -2539,8 +2532,9 @@ class TestStage2CycleSummaryHarnessBackstop:
     # no faithful re-attempt is possible: the entry survives only as a plain
     # dict. run.stage_reports is typed dict[str, StageReport | dict], and
     # journal.py reconstructs StageReport(**v) only when
-    # isinstance(v, dict) and 'stage' in v — so an adopted/resumed run can
-    # carry one. A row is honest (Stage 2 ran); its real numbers are not
+    # isinstance(v, dict) and 'stage' in v — so a run read back from the
+    # journal can carry one (task 2717's resume path, retired by task 5514,
+    # was the production route that did). A row is honest (Stage 2 ran); its real numbers are not
     # recoverable, so the row is zeroed and self-identifies.
 
     @staticmethod
@@ -2551,7 +2545,7 @@ class TestStage2CycleSummaryHarnessBackstop:
         its write on the run_id it is handed, so it is invoked directly here
         rather than through a driver — the plain-dict entry shape cannot be
         produced by a live in-process stage.run() at all (it arises from a
-        journal round-trip on an adopted/resumed run).
+        journal round-trip).
         """
         run = ReconciliationRun(
             id=str(uuid.uuid4()),
@@ -4147,7 +4141,7 @@ async def _drive_until(loop_coro, *events, timeout: float = 10.0):
 
 async def _drive_run_loop_until(harness, *events, timeout: float = 10.0):
     """_drive_until for harness.run_loop(), whose startup path
-    (release_stale_claims, predecessor/resume passes, judge init — several
+    (release_stale_claims, the recovery passes, judge init — several
     SQLite awaits) is what a fixed wall-clock budget used to starve.
     """
     await _drive_until(harness.run_loop(), *events, timeout=timeout)
@@ -5088,10 +5082,6 @@ async def test_cancellation_cleanup_shielded_from_second_cancel(
     import asyncio
 
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-    # task σ: the second-cancel injection below fires on complete_run(status='failed'),
-    # so this shield test must take the failed-cleanup branch — opt out of resume
-    # (which defaults on and would take the 'interrupted' branch instead).
-    harness.config.resume_after_restart = False
 
     # Event set by slow_stage_run when it starts — ensures the first cancel fires
     # inside the try block (not during pre-try setup like _get_prior_s3_findings).
@@ -5344,10 +5334,6 @@ async def test_run_full_cycle_finally_persists_stage_reports_despite_a_second_ca
     that.
     """
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-    # task σ's resume_after_restart defaults on and would take the
-    # 'interrupted' branch (no _error stamp) instead of 'failed' — opt out,
-    # matching test_cancellation_cleanup_shielded_from_second_cancel above.
-    harness.config.resume_after_restart = False
 
     # Event set by the slowed stage when it starts — ensures the first cancel
     # fires inside the try block, not during pre-try setup.
@@ -5490,7 +5476,6 @@ async def test_run_full_cycle_finally_gcs_config_dir_despite_a_second_cancellati
     finally awaits its shielded stage_reports write must not make the
     per-run config-dir GC unreachable — and must still propagate."""
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-    harness.config.resume_after_restart = False
 
     stage_entered = asyncio.Event()
     created_dirs: list = []
@@ -5767,10 +5752,8 @@ async def test_remediation_pass_cancellation_terminalises_row_as_failed(
     journal, event_buffer, mock_memory_service,
 ):
     """A cancelled remediation pass propagates the cancellation and leaves its
-    row 'failed' with a CancelledError record. Never 'interrupted', even with
-    resume on: an interrupted row would be re-driven as a full cycle."""
+    row 'failed' with a CancelledError record, never 'interrupted'."""
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-    harness.config.resume_after_restart = True
     stage_entered = asyncio.Event()
     _mock_stage_run(harness.stages[0])
     harness.stages[1].run = _stalling_stage_run(stage_entered)
@@ -6289,8 +6272,7 @@ async def _fail_run_with_all_accounts_capped(harness):
     assert result.status == RunStatus.failed
 
 
-async def _fail_run_with_cancellation_resume_off(harness):
-    harness.config.resume_after_restart = False
+async def _fail_run_with_cancellation(harness):
     entered = asyncio.Event()
     harness.stages[0].run = _stalling_stage_run(entered)
     outer = asyncio.create_task(harness.run_full_cycle('test-project', 'buffer_size:1'))
@@ -6305,9 +6287,9 @@ async def _fail_run_with_cancellation_resume_off(harness):
     [
         _fail_run_with_exception,
         _fail_run_with_all_accounts_capped,
-        _fail_run_with_cancellation_resume_off,
+        _fail_run_with_cancellation,
     ],
-    ids=['exception', 'all_accounts_capped', 'cancelled_resume_off'],
+    ids=['exception', 'all_accounts_capped', 'cancelled'],
 )
 async def test_run_full_cycle_failure_keeps_an_earlier_completed_runs_events_drained(
     journal, event_buffer, mock_memory_service, tmp_path, fail_run,
@@ -6497,12 +6479,10 @@ async def test_shielded_stage_report_persistence_still_propagates_cancellation(
     not to distinguish the fix in this task.
 
     Also pins that the shield does not change the run's terminal
-    disposition: status must still read 'failed' (the branch
-    resume_after_restart=False takes), unaffected by whichever write path
-    lands stage_reports.
+    disposition: status must still read 'failed', unaffected by whichever
+    write path lands stage_reports.
     """
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-    harness.config.resume_after_restart = False
 
     stage_entered = asyncio.Event()
 
@@ -6540,8 +6520,8 @@ async def test_shielded_stage_report_persistence_still_propagates_cancellation(
     persisted = await _poll_until(_run_persisted)
     assert persisted is not None, 'no run was persisted for test-project'
     assert persisted.status == 'failed', (
-        f"expected status='failed' (resume_after_restart=False takes the "
-        f'failed-cleanup branch), got {persisted.status!r} — the shield '
+        f"expected status='failed' (the cancellation path's only "
+        f'terminal disposition), got {persisted.status!r} — the shield '
         'must not change the terminal disposition the cancel path records'
     )
 
@@ -18464,9 +18444,9 @@ class TestHarnessIndexHealthStartupSweep:
         silently stopped running — the exact 'regression to invisible' the
         cadence-half wiring test (TestFullCycleWiringIndexHealth) exists to
         prevent.  Mirrors the sibling one-shot startup contract test
-        (test_run_loop_resumes_interrupted_runs_at_startup_before_reaper),
-        including its raise, which also pins that the startup guard around the
-        sweep cannot crash run_loop.
+        (test_run_loop_survives_a_failing_legacy_interrupted_sweep), including
+        its raise, which also pins that the startup guard around the sweep
+        cannot crash run_loop.
         """
         real_sleep = asyncio.sleep
 

@@ -2076,15 +2076,15 @@ class ReconciliationHarness:
         lock_holder: str | None,
         lock_age: float | None,
         *,
-        disposition: str = 'failed',
         error_type: str = 'StaleRunRecovery',
         error_message: str | None = None,
     ) -> dict | None:
-        """Recover a single orphaned run row to a terminal status.
+        """Recover a single orphaned run row to 'failed'.
 
-        Shared mechanical body for both recovery passes — the age-based
+        Shared mechanical body for the three recovery passes — the age-based
         ``_recover_stale_runs`` reaper and the startup ``_recover_predecessor_runs``
-        pass: error-stamp the run, complete it, restore the drained events it
+        and ``_recover_legacy_interrupted_runs`` passes: error-stamp the run,
+        complete it, GC its per-run config dir, restore the drained events it
         owned, release the lock when this run's own instance still owns it,
         and replay any deferred writes for the project. Returns the
         ``build_stale_run_diagnostics`` dict so the caller can drive its own
@@ -2100,11 +2100,6 @@ class ReconciliationHarness:
         ``restore_drained``'s ``include_unattributed``) are restored, so a
         concurrent live run's in-flight drained events on the same project
         are never clobbered back to 'buffered'.
-
-        ``disposition`` is the terminal journal status to complete the run
-        with; it defaults to (and, as of task 2711, is always) 'failed'. This
-        is the seam for task σ (session-resume): a future caller can pass a
-        resumable disposition instead before falling into this same body.
         """
         cutoff = self.config.stale_run_recovery_seconds
         diag = build_stale_run_diagnostics(run, lock_holder, lock_age, cutoff)
@@ -2118,7 +2113,7 @@ class ReconciliationHarness:
         recovered = await self.journal.complete_run_if_status(
             run.id,
             expected_status=run.status,
-            status=disposition,
+            status='failed',
             stage_reports=run.stage_reports,
         )
         if not recovered:
@@ -2135,16 +2130,6 @@ class ReconciliationHarness:
 
         # Task 2744: sweep the config dir a dead predecessor process may have left
         # behind for this run. Defensive — never mask the recovery outcome.
-        #
-        # TODO(task σ / session-resume): this GC is UNCONDITIONAL because
-        # ``disposition`` is always 'failed' today — a non-resumable terminal
-        # status — so the per-run config dir (which holds the CLI transcript a
-        # ``--resume`` would need) is always safe to delete here. When σ teaches
-        # this seam to complete a run with a *resumable* disposition (see the
-        # ``disposition`` docstring above), it MUST gate this GC on the
-        # disposition and skip it for resumable ones, or the transcript
-        # session-resume depends on is destroyed and resume has nothing to
-        # resume from.
         try:
             gc_run_config_dir(
                 self.journal.data_dir, run.id,
@@ -2212,7 +2197,7 @@ class ReconciliationHarness:
         instance_id — is left untouched for the existing age-based
         backstop to handle.
 
-        Recovery always completes the run with disposition='failed' and
+        Recovery always completes the run as 'failed' and
         never escalates: adopting your own dead predecessor's orphan at
         startup is expected operational-restart behaviour (mirrors the
         dead_owner_shielded suppression rationale in _recover_stale_runs),
@@ -2228,7 +2213,6 @@ class ReconciliationHarness:
 
             diag = await self._recover_one_run(
                 run, lock_holder, lock_age,
-                disposition='failed',
                 error_type='PredecessorRunRecovery',
                 error_message=(
                     'Run owned by dead predecessor instance, recovered at startup'
@@ -2259,7 +2243,6 @@ class ReconciliationHarness:
             lock_holder, lock_age = await self.buffer.get_lock_status(run.project_id)
             diag = await self._recover_one_run(
                 run, lock_holder, lock_age,
-                disposition='failed',
                 error_type='LegacyInterruptedRunRecovery',
                 error_message=(
                     'Legacy interrupted run (resume retired, task 5514) '
@@ -6120,8 +6103,6 @@ class ReconciliationHarness:
             )
 
         except asyncio.CancelledError as e:
-            # Always 'failed', never 'interrupted': _resume_interrupted_runs re-drives
-            # only run_full_cycle, and get_interrupted_runs does not filter by run_type.
             run.status = RunStatus.failed
             run.stage_reports['_error'] = _run_failure_record(
                 e, failed_stage=current_stage_name,
