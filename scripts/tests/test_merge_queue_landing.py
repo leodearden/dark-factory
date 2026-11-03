@@ -12,7 +12,13 @@ import threading
 import time
 
 import pytest
-from _merge_queue_landing import Landing, LandingFailure, LandingNotConfirmed, land_file
+from _merge_queue_landing import (
+    Landing,
+    LandingFailure,
+    LandingNotConfirmed,
+    land_file,
+    land_files,
+)
 from config_reload_script_fakes import (
     TOOL_RAISED,
     TRANSPORT_FAULTS,
@@ -35,6 +41,14 @@ EDITED = b"project_root: /nowhere\nknob: 1\n"
 LABEL = "test-knob-1"
 MESSAGE = "chore(test): set knob=1"
 
+PRD = "plans/demo-prd.md"
+PRD_SEED = b"# Demo PRD\n\nDraft.\n"
+DOCS = {
+    PRD: b"# Demo PRD\n\nDecomposed.\n",
+    "plans/demo-prd.capability-manifest.md": b"# Demo PRD capability manifest\n",
+    "plans/demo-prd.capability-manifest.yaml": b"capabilities: []\n",
+}
+
 
 @pytest.fixture
 def scratch(tmp_path, monkeypatch):
@@ -52,8 +66,32 @@ def repo(tmp_path):
     return checkout
 
 
+@pytest.fixture
+def docs_repo(repo):
+    """The target checkout, also tracking PRD as PRD_SEED; DOCS' other paths
+    are new to it."""
+    (repo / PRD).parent.mkdir()
+    (repo / PRD).write_bytes(PRD_SEED)
+    git(repo, "add", PRD)
+    git(repo, "commit", "-q", "-m", "seed the PRD")
+    return repo
+
+
 def _main(repo):
     return git(repo, "rev-parse", "main").strip()
+
+
+def _land_docs(repo, queue, files=DOCS, **kwargs):
+    """land_files of *files* onto *repo*'s main, through *queue*."""
+    with FakeEscalationMcp(tool_handlers=queue.handlers()) as server:
+        return land_files(
+            str(repo), files, _main(repo),
+            port=str(server.port), label=LABEL, message=MESSAGE, **kwargs,
+        )
+
+
+def _files_in(repo, commit):
+    return sorted(git(repo, "show", "--name-only", "--format=", commit).split())
 
 
 def _land(repo, queue, **kwargs):
@@ -187,6 +225,26 @@ def test_a_rebased_landing_is_confirmed_by_patch_identity(repo, scratch):
     _assert_left_nothing_behind(repo, scratch)
 
 
+def test_three_docs_paths_land_as_one_commit_through_one_request(docs_repo, scratch):
+    """Two of the three paths are new at base: a docs landing adds files."""
+    repo = docs_repo
+    base = _main(repo)
+    queue = FakeMergeQueue(repo, states=["verifying", "done"])
+
+    landing = _land_docs(repo, queue)
+
+    assert len(queue.calls_to("merge_request")) == 1, queue.calls
+    assert isinstance(landing, Landing)
+    assert landing.request_id == queue.request_id
+    assert landing.landed_as == _main(repo) == queue.merge_sha
+    assert _files_in(repo, landing.tip_sha) == sorted(DOCS)
+    assert git(repo, "log", "-1", "--format=%s", landing.tip_sha).strip() == MESSAGE
+    assert sorted(git(repo, "diff", "--name-only", base, "main").split()) == sorted(DOCS)
+    for path, content in DOCS.items():
+        assert (repo / path).read_bytes() == content, path
+    _assert_left_nothing_behind(repo, scratch)
+
+
 # ---------------------------------------------------------------------------
 # Every way a request can fail to land
 #
@@ -209,6 +267,13 @@ def _refused_by(repo, queue, **kwargs):
     """The LandingNotConfirmed land_file raises through *queue*."""
     with FakeEscalationMcp(tool_handlers=queue.handlers()) as server:
         return _refusal(repo, server.port, **kwargs)
+
+
+def _docs_refused_by(repo, queue, files, **kwargs):
+    """The LandingNotConfirmed land_files of *files* raises through *queue*."""
+    with pytest.raises(LandingNotConfirmed) as caught:
+        _land_docs(repo, queue, files, **kwargs)
+    return caught.value
 
 
 def _assert_untouched(repo, before, scratch):
@@ -402,15 +467,27 @@ def test_content_equal_to_the_base_is_refused_before_any_call(repo, scratch):
     _assert_untouched(repo, before, scratch)
 
 
-@pytest.mark.parametrize("bad", [
-    {"base": "0" * 40},
-    {"path": "absent.yaml"},
-], ids=["base_not_a_commit", "path_not_at_base"])
-def test_a_base_without_the_file_is_refused_before_any_call(repo, scratch, bad):
+def test_an_unchanged_path_among_changed_ones_is_refused_before_any_call(docs_repo, scratch):
+    """The landed commit carries exactly the named paths, so each must change."""
+    repo = docs_repo
     before = _main(repo)
     queue = FakeMergeQueue(repo)
 
-    refusal = _refused_by(repo, queue, **bad)
+    refusal = _docs_refused_by(repo, queue, {**DOCS, PRD: PRD_SEED})
+
+    assert refusal.failure is LandingFailure.INVALID_CHANGE
+    assert PRD in refusal.detail, refusal.detail
+    changed = [path for path in DOCS if path != PRD]
+    assert not any(path in refusal.detail for path in changed), refusal.detail
+    assert queue.calls == []
+    _assert_untouched(repo, before, scratch)
+
+
+def test_a_base_that_is_not_a_commit_is_refused_before_any_call(repo, scratch):
+    before = _main(repo)
+    queue = FakeMergeQueue(repo)
+
+    refusal = _refused_by(repo, queue, base="0" * 40)
 
     assert refusal.failure is LandingFailure.INVALID_CHANGE
     assert queue.calls == []
