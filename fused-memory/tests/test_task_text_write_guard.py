@@ -16,9 +16,11 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+import pytest_asyncio
 from shared.mcp_envelope import write_failure_reason
 from shared.task_text_fingerprint import task_text_fingerprint
 
+from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.middleware.task_text_write_guard import (
     TextWriteUnconfirmedFinding,
     check_text_base,
@@ -27,6 +29,7 @@ from fused_memory.middleware.task_text_write_guard import (
     verify_text_write,
     verify_text_write_landed,
 )
+from fused_memory.reconciliation.event_buffer import EventBuffer
 
 EMPTY_TEXT_FP = task_text_fingerprint(None, None)
 
@@ -392,3 +395,189 @@ class TestVerifyTextWriteLanded:
         assert landed['text_verified'] is False
         file_finding.assert_awaited_once()
         assert result == WRITE_RESULT
+
+
+# --------------------------------------------------------------------------- #
+# Interceptor boundary fixtures (copied from test_stale_gate_citation_guard.py;
+# this repo defines the quartet per test file rather than in a conftest)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def taskmaster():
+    tm = AsyncMock()
+    tm.get_task = AsyncMock(return_value={'id': '1', 'status': 'pending', 'title': 'Test Task'})
+    tm.set_task_status = AsyncMock(return_value={'success': True})
+    tm.get_tasks = AsyncMock(return_value={'tasks': []})
+    tm.add_task = AsyncMock(return_value={'id': '2', 'title': 'New Task'})
+    tm.update_task = AsyncMock(return_value={'success': True})
+    tm.remove_tasks = AsyncMock(return_value={'success': True})
+    tm.add_dependency = AsyncMock(return_value={'success': True})
+    tm.remove_dependency = AsyncMock(return_value={'success': True})
+    return tm
+
+
+@pytest.fixture
+def reconciler():
+    r = AsyncMock()
+    r.reconcile_task = AsyncMock(return_value={'actions': [{'type': 'knowledge_captured'}]})
+    return r
+
+
+@pytest_asyncio.fixture
+async def event_buffer(tmp_path):
+    buf = EventBuffer(db_path=tmp_path / 'interceptor_eb.db', buffer_size_threshold=100)
+    await buf.initialize()
+    yield buf
+    await buf.close()
+
+
+@pytest.fixture
+def interceptor(taskmaster, reconciler, event_buffer):
+    return TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+
+LIVE_ROW = {
+    'id': '4644',
+    'status': 'pending',
+    'title': 'Two-writer clobber',
+    'description': 'Current summary.',
+    'details': OLD_PARAGRAPH,
+    'dependencies': [],
+}
+
+
+@pytest.fixture
+def live_row(taskmaster):
+    row = dict(LIVE_ROW)
+    taskmaster.get_task = AsyncMock(return_value=row)
+    return row
+
+
+def _error_type(result: dict[str, Any]) -> object:
+    return result.get('error_type')
+
+
+class TestInterceptorTextBaseBoundary:
+    @pytest.mark.asyncio
+    async def test_a_recon_replace_without_a_token_is_rejected_before_the_write(
+        self, interceptor, taskmaster, live_row,
+    ):
+        result = await interceptor.update_task(
+            '4644', '/project', details=NEW_PARAGRAPH, agent_id=RECON_AGENT,
+        )
+
+        assert _error_type(result) == 'ReconTaskTextBaseRequired'
+        taskmaster.update_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_recon_replace_with_the_current_token_is_written(
+        self, interceptor, taskmaster, live_row,
+    ):
+        await interceptor.update_task(
+            '4644', '/project', details=NEW_PARAGRAPH, agent_id=RECON_AGENT,
+            expected_text_fp=text_fp_of(live_row),
+        )
+
+        taskmaster.update_task.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_recon_replace_with_a_stale_token_is_rejected(
+        self, interceptor, taskmaster, live_row,
+    ):
+        result = await interceptor.update_task(
+            '4644', '/project', details=NEW_PARAGRAPH, agent_id=RECON_AGENT,
+            expected_text_fp=text_fp_of({'details': 'an earlier read'}),
+        )
+
+        assert _error_type(result) == 'TaskTextBaseStale'
+        taskmaster.update_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_recon_details_append_needs_no_token(
+        self, interceptor, taskmaster, live_row,
+    ):
+        await interceptor.update_task(
+            '4644', '/project', details=NEW_PARAGRAPH, append=True, agent_id=RECON_AGENT,
+        )
+
+        taskmaster.update_task.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('text_kwarg', ['description', 'prompt'])
+    async def test_a_recon_description_or_prompt_write_without_a_token_is_rejected(
+        self, interceptor, taskmaster, live_row, text_kwarg,
+    ):
+        result = await interceptor.update_task(
+            '4644', '/project', agent_id=RECON_AGENT, **{text_kwarg: 'Rewritten.'},
+        )
+
+        assert _error_type(result) == 'ReconTaskTextBaseRequired'
+        taskmaster.update_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_recon_metadata_only_write_is_unaffected(
+        self, interceptor, taskmaster, live_row,
+    ):
+        await interceptor.update_task(
+            '4644', '/project', metadata='{"x_note": "seen"}', agent_id=RECON_AGENT,
+        )
+
+        taskmaster.update_task.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('agent_id', [None, 'claude-interactive'])
+    async def test_a_non_recon_replace_without_a_token_is_written_with_no_before_read(
+        self, interceptor, taskmaster, live_row, agent_id,
+    ):
+        reads_before_write: list[int] = []
+
+        async def _record_reads(**_kwargs: Any) -> dict[str, Any]:
+            reads_before_write.append(taskmaster.get_task.await_count)
+            return {'success': True}
+
+        taskmaster.update_task = AsyncMock(side_effect=_record_reads)
+
+        await interceptor.update_task(
+            '4644', '/project', details=NEW_PARAGRAPH, agent_id=agent_id,
+        )
+
+        assert reads_before_write == [0]
+
+    @pytest.mark.asyncio
+    async def test_a_non_recon_stale_token_is_rejected(self, interceptor, taskmaster, live_row):
+        result = await interceptor.update_task(
+            '4644', '/project', details=NEW_PARAGRAPH, agent_id='claude-interactive',
+            expected_text_fp=text_fp_of({'details': 'an earlier read'}),
+        )
+
+        assert _error_type(result) == 'TaskTextBaseStale'
+        taskmaster.update_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_non_recon_matching_token_is_written(self, interceptor, taskmaster, live_row):
+        await interceptor.update_task(
+            '4644', '/project', details=NEW_PARAGRAPH, agent_id='claude-interactive',
+            expected_text_fp=text_fp_of(live_row),
+        )
+
+        taskmaster.update_task.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_the_token_reaches_neither_the_backend_nor_the_journal(
+        self, interceptor, taskmaster, live_row,
+    ):
+        journal = AsyncMock()
+        interceptor.set_write_journal(journal)
+        token = text_fp_of(live_row)
+
+        await interceptor.update_task(
+            '4644', '/project', details=NEW_PARAGRAPH, agent_id=RECON_AGENT,
+            expected_text_fp=token,
+        )
+
+        assert 'expected_text_fp' not in taskmaster.update_task.await_args.kwargs
+        journalled = [call.kwargs['params'] for call in journal.log_write_op.await_args_list]
+        assert journalled
+        assert all('expected_text_fp' not in params for params in journalled)
+        assert all(token not in repr(params) for params in journalled)
