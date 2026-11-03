@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
+import signal
+import time
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _script_survivor import SURVIVOR_SCRIPT, is_alive, kill_survivor, read_survivor_pid
@@ -23,7 +26,7 @@ from orchestrator.before_done_script import (
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-class TestDefaultRunScriptEnv:
+class TestRunScriptEnv:
     """run_script merges a partial env dict over os.environ."""
 
     async def test_partial_env_inherits_path(self, tmp_path: Path):
@@ -35,12 +38,8 @@ class TestDefaultRunScriptEnv:
         resolve).  The fix merges over ``os.environ`` so the deploy script still runs
         in a sane environment while callers can still override individual variables.
         """
-        import os
-        from unittest.mock import AsyncMock as _AsyncMock
-        from unittest.mock import patch
-
-        mock_proc = _AsyncMock()
-        mock_proc.communicate = _AsyncMock(return_value=(b'', b''))
+        mock_proc = AsyncMock()
+        mock_proc.communicate = AsyncMock(return_value=(b'', b''))
         mock_proc.returncode = 0
 
         with patch('asyncio.create_subprocess_exec', return_value=mock_proc) as mock_exec:
@@ -137,10 +136,6 @@ class TestBeforeDoneSubprocessTimeoutHardening:
         and a real exit code IS in hand, is pinned by
         ``test_deterministic_runner.py::TestDefaultRunnerInnerTimeoutDeployHonesty``.)
         """
-        import asyncio
-        import os
-        import time
-
         script = tmp_path / 'hang.sh'
         pidfile = tmp_path / 'grandchild.pid'
         script.write_text(
@@ -237,8 +232,6 @@ class TestBeforeDoneSubprocessTimeoutHardening:
         from a timeout rather than reporting what was measured (task 4252
         reviewer finding).
         """
-        import asyncio
-
         script = tmp_path / 'exits-but-child-lives.sh'
         pidfile = tmp_path / 'survivor.pid'
         script.write_text(SURVIVOR_SCRIPT)
@@ -292,9 +285,6 @@ class TestBeforeDoneSubprocessTimeoutHardening:
         being asserted is the killpg's own ProcessLookupError, then the
         proc.kill() fallback's.
         """
-        import signal
-        from unittest.mock import patch
-
         pgid = _fake_pgid()
         mock_proc = MagicMock()
         # pid must equal the pgid: unsafe_pgid_reason refuses a mismatch as a
@@ -335,9 +325,6 @@ class TestBeforeDoneSubprocessTimeoutHardening:
         ``asyncio.wait_for(proc.wait(), timeout=reap_grace_secs)`` —
         this test exercises that bound directly.
         """
-        import asyncio
-        from unittest.mock import patch
-
         pgid = _fake_pgid()
         mock_proc = MagicMock()
         # pid must equal the pgid — see the sibling test.
@@ -377,8 +364,6 @@ class TestBeforeDoneSubprocessTimeoutHardening:
         dispatch no signal at all once ``proc.returncode is not None``, mirroring
         ``shared.proc_group.terminate_process_group``'s step 1.
         """
-        from unittest.mock import patch
-
         mock_proc = MagicMock()
         mock_proc.pid = 12345
         mock_proc.returncode = 0          # already reaped by asyncio's child watcher
@@ -422,8 +407,6 @@ class TestBeforeDoneSubprocessTimeoutHardening:
         ``df_pytest_isolation``'s handling of the same refusal: the timed-out
         child still dies, and only the (unreachable) grandchildren are forgone.
         """
-        from unittest.mock import patch
-
         mock_proc = MagicMock()
         mock_proc.returncode = None          # still running: not the reaped path
         mock_proc.kill = MagicMock()

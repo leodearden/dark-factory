@@ -115,7 +115,9 @@ class ScriptTimeout(Exception):
     whereas an exception type cannot collide with any exit code at all.
 
     Deliberately NOT a ``TimeoutError`` subclass: both ``run_fn`` seam
-    wrappers (``_invoke_run_fn_translating_timeout`` and ``_run_predicate``'s
+    wrappers
+    (``orchestrator/src/orchestrator/deterministic_runner.py::DeterministicRunner._invoke_run_fn_translating_timeout``
+    and ``orchestrator/src/orchestrator/deterministic_runner.py::DeterministicRunner._run_predicate``'s
     local ``_invoke_run_fn``) translate a seam-internal ``TimeoutError`` into
     ``RuntimeError``, precisely so that an ``except TimeoutError`` around the
     OUTER ``asyncio.wait_for`` can only ever mean "the outer wall-clock guard
@@ -195,7 +197,8 @@ class ScriptTimeout(Exception):
         overrun, and WHICH SIGNAL the teardown then dispatched.
 
         Shared by the deploy arms (via ``deploy_fact_lines``) and by
-        ``DeterministicRunner._run_predicate``'s arm, which differ only in
+        ``orchestrator/src/orchestrator/deterministic_runner.py::DeterministicRunner._run_predicate``'s
+        arm, which differ only in
         *subject* — so the formatted budget expression has ONE definition to
         change rather than two copies to keep in step (reviewer amendment).
 
@@ -216,14 +219,16 @@ class ScriptTimeout(Exception):
 
         Shared so the two deploy branches cannot come to say different things
         about the same event — the anti-drift property
-        ``DeterministicRunner._invoke_run_fn_translating_timeout`` supplied for
+        ``orchestrator/src/orchestrator/deterministic_runner.py::DeterministicRunner._invoke_run_fn_translating_timeout``
+        supplied for
         this case until it stopped catching the exception (task 4252).
 
         The class docstring says WHY a timed-out script is an infra fault
         rather than a ``(rc, tail)`` return; it stays the single canonical
         explanation and this method does not restate it.
 
-        ``DeterministicRunner._run_predicate``'s own ``ScriptTimeout`` arm
+        ``orchestrator/src/orchestrator/deterministic_runner.py::DeterministicRunner._run_predicate``'s
+        own ``ScriptTimeout`` arm
         shares only ``budget_line``: the CONSEQUENCE differs (a predicate
         timeout produces no milestone VERDICT, and that path's summary and
         category are separately pinned), and all three predicate infra arms
@@ -236,7 +241,8 @@ class ScriptTimeout(Exception):
 
         Args:
             script: the absolute path the runner executed
-                (``DeterministicRunner._before_done_paths``), the search key the
+                (``orchestrator/src/orchestrator/deterministic_runner.py::DeterministicRunner._before_done_paths``),
+                the search key the
                 survivor sentence hands the operator when that teardown left the
                 script's children running.  Not on the exception: it is the
                 deploy's own configuration, not something the timeout measured.

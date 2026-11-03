@@ -7,6 +7,12 @@ import json
 import pytest
 from _predicate_specimens import POLLUTED_PREDICATE_OUTPUT
 
+from orchestrator.predicate_output import (
+    PREDICATE_NOTE_MAX_PAYLOAD_CHARS,
+    predicate_verdict,
+    summarize_predicate_output,
+)
+
 # ---------------------------------------------------------------------------
 # Task 3286: `summarize_predicate_output` — the ALLOWLIST sanitizer standing
 # between a predicate script's raw stdout tail and `done_provenance.note`.
@@ -22,7 +28,6 @@ class TestSummarizePredicateOutput:
 
     def test_specimen_starts_with_deterministic_verdict_prefix(self):
         """The verdict prefix is unconditional — a note is never empty."""
-        from orchestrator.predicate_output import summarize_predicate_output
 
         result = summarize_predicate_output(POLLUTED_PREDICATE_OUTPUT, rc=0)
 
@@ -40,7 +45,6 @@ class TestSummarizePredicateOutput:
     )
     def test_specimen_server_log_markers_are_dropped(self, marker: str):
         """No server-log noise survives into the note (the task-2902 leak)."""
-        from orchestrator.predicate_output import summarize_predicate_output
 
         result = summarize_predicate_output(POLLUTED_PREDICATE_OUTPUT, rc=0)
 
@@ -50,7 +54,6 @@ class TestSummarizePredicateOutput:
 
     def test_specimen_trailing_json_verdict_survives_compacted(self):
         """The script's OWN structured verdict is the part worth keeping."""
-        from orchestrator.predicate_output import summarize_predicate_output
 
         result = summarize_predicate_output(POLLUTED_PREDICATE_OUTPUT, rc=0)
 
@@ -60,7 +63,6 @@ class TestSummarizePredicateOutput:
 
     def test_specimen_result_is_single_line(self):
         """A note flowing into a Mem0 summary must not carry newlines."""
-        from orchestrator.predicate_output import summarize_predicate_output
 
         result = summarize_predicate_output(POLLUTED_PREDICATE_OUTPUT, rc=0)
 
@@ -68,7 +70,6 @@ class TestSummarizePredicateOutput:
 
     def test_specimen_mid_token_first_line_is_dropped(self):
         """The 2000-char tail cut starts mid-word — that fragment is noise."""
-        from orchestrator.predicate_output import summarize_predicate_output
 
         result = summarize_predicate_output(POLLUTED_PREDICATE_OUTPUT, rc=0)
 
@@ -102,7 +103,6 @@ class TestSummarizePredicateOutput:
     )
     def test_clean_final_line_is_preserved(self, out: str, expected: str):
         """A single clean verdict line is the payload — kept verbatim."""
-        from orchestrator.predicate_output import summarize_predicate_output
 
         result = summarize_predicate_output(out, rc=0)
 
@@ -111,7 +111,6 @@ class TestSummarizePredicateOutput:
 
     def test_trailing_blank_lines_do_not_defeat_extraction(self):
         """A script ending with a newline still yields its verdict line."""
-        from orchestrator.predicate_output import summarize_predicate_output
 
         result = summarize_predicate_output('check ok: 0 flakes\n\n', rc=0)
 
@@ -121,7 +120,6 @@ class TestSummarizePredicateOutput:
 
     def test_pure_log_output_yields_bare_verdict(self):
         """Nothing but logger lines -> no payload at all, not a log line."""
-        from orchestrator.predicate_output import summarize_predicate_output
 
         out = (
             '2026-07-30 16:39:00,523 fused_memory.backends.graphiti_client '
@@ -148,7 +146,6 @@ class TestSummarizePredicateOutput:
         Losing a payload is the safe failure direction — the verdict prefix
         always survives and the raw text is logged (step-6).
         """
-        from orchestrator.predicate_output import summarize_predicate_output
 
         result = summarize_predicate_output(out, rc=0)
 
@@ -169,7 +166,6 @@ class TestSummarizePredicateOutput:
         a future change narrows tier 2, this expectation should flip
         deliberately, not silently.
         """
-        from orchestrator.predicate_output import summarize_predicate_output
 
         out = 'httpx HTTP Request: GET http://localhost:6333 secret=abc'
 
@@ -189,7 +185,6 @@ class TestSummarizePredicateOutput:
         ``predicate check passed (rc=2)`` into a provenance note that flows
         into a Mem0 completion summary.
         """
-        from orchestrator.predicate_output import summarize_predicate_output
 
         result = summarize_predicate_output('check failed: 3 flakes', rc=2)
 
@@ -206,18 +201,12 @@ class TestSummarizePredicateOutput:
         ``8679,868``.  A sliced JSON object is worse still — unparseable, yet
         still structured-looking to a reader.
         """
-        import json as _json
-
-        from orchestrator.predicate_output import (
-            PREDICATE_NOTE_MAX_PAYLOAD_CHARS,
-            summarize_predicate_output,
-        )
 
         obj = {'ids': list(range(2000))}
-        compact = _json.dumps(obj, separators=(',', ':'))
+        compact = json.dumps(obj, separators=(',', ':'))
         assert len(compact) > PREDICATE_NOTE_MAX_PAYLOAD_CHARS, 'fixture too small'
 
-        result = summarize_predicate_output(_json.dumps(obj, indent=2), rc=0)
+        result = summarize_predicate_output(json.dumps(obj, indent=2), rc=0)
 
         # Bounded: the cap plus the verdict prefix and the marker's own text.
         assert len(result) <= PREDICATE_NOTE_MAX_PAYLOAD_CHARS + 200, len(result)
@@ -229,10 +218,6 @@ class TestSummarizePredicateOutput:
 
     def test_payload_at_the_cap_is_kept(self):
         """The bound elides only what exceeds it — it is not a blanket drop."""
-        from orchestrator.predicate_output import (
-            PREDICATE_NOTE_MAX_PAYLOAD_CHARS,
-            summarize_predicate_output,
-        )
 
         out = 'ok ' + 'x' * (PREDICATE_NOTE_MAX_PAYLOAD_CHARS - 10)
         result = summarize_predicate_output(out, rc=0)
@@ -245,45 +230,30 @@ class TestSummarizePredicateOutput:
     @pytest.mark.parametrize('out', ['', None, 42, b'check ok', ['check ok']])
     def test_degenerate_output_yields_bare_verdict(self, out: object):
         """A falsy/non-str seam return never raises and never leaks a repr."""
-        from orchestrator.predicate_output import summarize_predicate_output
 
         result = summarize_predicate_output(out, rc=0)
 
         assert result == 'predicate check passed (rc=0)', result
 
 
-
 class TestPredicateVerdict:
     """``predicate_verdict`` keeps only a trailing JSON OBJECT, bounded by the note cap."""
 
     def test_trailing_json_object_is_the_verdict(self):
-        from orchestrator.predicate_output import predicate_verdict
-
         out = 'some log line\n{"verdict": "clean", "n": 0}'
 
         assert predicate_verdict(out) == {'verdict': 'clean', 'n': 0}
 
     def test_trailing_json_array_is_not_a_verdict(self):
-        from orchestrator.predicate_output import predicate_verdict
-
         assert predicate_verdict('x\n[1, 2]') is None
 
     def test_clean_final_line_is_not_a_verdict(self):
-        from orchestrator.predicate_output import predicate_verdict
-
         assert predicate_verdict('check ok: 0 flakes') is None
 
     def test_non_str_output_is_not_a_verdict(self):
-        from orchestrator.predicate_output import predicate_verdict
-
         assert predicate_verdict(None) is None
 
     def test_oversized_object_is_recorded_by_size_alone(self):
-        from orchestrator.predicate_output import (
-            PREDICATE_NOTE_MAX_PAYLOAD_CHARS,
-            predicate_verdict,
-        )
-
         obj = {'ids': list(range(2000))}
         compact = json.dumps(obj, separators=(',', ':'))
         assert len(compact) > PREDICATE_NOTE_MAX_PAYLOAD_CHARS, 'fixture too small'

@@ -13,7 +13,8 @@ summarized note).
 # ---------------------------------------------------------------------------
 # Task 3286 — the real task-2902 specimen shape.
 #
-# `_default_run_script` merges stderr into stdout and returns `[-2000:]`, so a
+# `orchestrator/src/orchestrator/before_done_script.py::run_script` merges
+# stderr into stdout and returns `[-2000:]`, so a
 # chatty predicate script's server-log noise reached `done_provenance.note`
 # verbatim — and from there fused-memory's `_format_outcome_echo` wrote it into
 # a Mem0 completion summary.  The live note on task 2902 is exactly 1999 chars:
