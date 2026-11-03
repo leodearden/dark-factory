@@ -687,8 +687,9 @@ def _dataclass_double_violation(
 # clock-deadline polls, and recorded 294 violations across 82 files (220 across 39
 # before it).  Those are the two sanctioned rises: each time every added violation
 # was already in the tree, newly SEEN, not new debt.  The non-orchestrator entries
-# can shrink only by a per-site ``# noqa: wall-clock-deadline`` until follow-up
-# ticket tkt_0RVCE77JGW0CZGWPSFFZ00REB5 makes ``wait_responsive`` importable outside
+# can shrink only by a per-site suppression pragma,
+# ``# noqa: wall-clock-deadline`` until follow-up ticket
+# tkt_0RVCE77JGW0CZGWPSFFZ00REB5 makes ``wait_responsive`` importable outside
 # orchestrator/tests.
 #
 # The number counts VIOLATIONS, not SITES.
