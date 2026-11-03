@@ -4136,12 +4136,17 @@ def test_cli_report_flag_routes_to_report_only(monkeypatch: pytest.MonkeyPatch) 
     # ss/urllib I/O. raising=False: tolerates the attribute not existing yet
     # (pre-B4-impl) so this test can be written before the impl lands.
     monkeypatch.setattr(wdog, "_print_fused_memory_liveness", lambda: None, raising=False)
-    monkeypatch.setattr(wdog, "print_unit_parity", lambda *_: None)
+    parity_args: list[tuple[object, ...]] = []
+    monkeypatch.setattr(wdog, "print_unit_parity", lambda *a: parity_args.append(a))
 
     exit_code = wdog._cli(["--report"])
 
     assert calls == ["report"], f"Expected only report() called, got {calls}"
     assert exit_code == 0
+    assert parity_args == [(wdog.REPO_DIR, wdog.log)], (
+        "the --report parity row must check the watchdog's own checkout and "
+        f"write to its journal sink, got {parity_args}"
+    )
 
 
 def test_cli_report_flag_returns_reports_exit_code(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -4178,9 +4183,13 @@ def test_cli_default_runs_main_then_staleness_pass(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(
         wdog, "fused_memory_staleness_pass", lambda: calls.append("fused_memory_staleness_pass")
     )
-    monkeypatch.setattr(
-        wdog, "unit_parity_pass", lambda *_: calls.append("unit_parity_pass")
-    )
+    parity_args: list[tuple[object, ...]] = []
+
+    def _record_unit_parity_pass(*args: object) -> None:
+        calls.append("unit_parity_pass")
+        parity_args.append(args)
+
+    monkeypatch.setattr(wdog, "unit_parity_pass", _record_unit_parity_pass)
 
     wdog._cli([])
 
@@ -4193,6 +4202,10 @@ def test_cli_default_runs_main_then_staleness_pass(monkeypatch: pytest.MonkeyPat
     ], (
         "Expected liveness passes, then both staleness passes, then the purely "
         f"observational dashboard unit-parity pass LAST, got {calls}"
+    )
+    assert parity_args == [(wdog.REPO_DIR, wdog.log)], (
+        "the timer-path parity pass must check the watchdog's own checkout and "
+        f"write to its journal sink, got {parity_args}"
     )
 
 

@@ -215,10 +215,11 @@ def within_min_interval(secs: int, read_epoch: Callable[[], float | None]) -> bo
     The shared min-interval GATE, extracted so every cap shares one
     definition of "too soon" rather than a copy each that could drift.
 
-    Takes the clock READER rather than a path on purpose: each cap's named
-    reader (scripts/orchestrator-watchdog.py::_read_last_fleet_deploy_epoch
-    and its siblings) stays the single seam the tests substitute at, so a
-    wrapper can never silently bypass its own reader.
+    Takes the clock READER rather than a path, so each caller keeps its own
+    test seam: the watchdog's caps each pass a named reader
+    (scripts/orchestrator-watchdog.py::_read_last_fleet_deploy_epoch and its
+    siblings) that their tests substitute, while a caller whose clock path is
+    injected can pass a lambda over read_clock_epoch instead.
 
     Two fail directions, both toward LETTING the caller act:
       - *secs* <= 0 disables the cap outright, and the clock is not even read

@@ -31,15 +31,15 @@ def _cross_device_replace(_src: str, _dst: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Part D: shared persistence helpers atomic_write_json / read_json_state
-# (task 3764)
+# Atomic JSON state files: atomic_write_json / read_json_state (task 3764)
 #
 # Task 3764 added THREE more persisted-state writers/readers to a watchdog that
 # already had two (_stamp_fm_deploy_clock / _read_last_fm_deploy_epoch).
 # Without extraction the ~20-line makedirs/mkstemp/os.replace/unlink-on-error
 # dance would have been copy-pasted a third and fourth time. The extraction is
-# behaviour-preserving; the watchdog's Part C deploy-clock suite is its
-# regression net, re-asserted explicitly by
+# behaviour-preserving; the deploy-clock suite in
+# tests/scripts/test_orchestrator_watchdog.py is its regression net,
+# re-asserted explicitly by
 # tests/scripts/test_orchestrator_watchdog.py::test_fm_deploy_clock_still_roundtrips_through_shared_helpers.
 # ---------------------------------------------------------------------------
 
@@ -214,7 +214,8 @@ def test_read_json_state_oserror_returns_none_and_logs(tmp_path: pathlib.Path) -
 
 
 # ---------------------------------------------------------------------------
-# Part D: shared CLOCK-layer primitives (task 3764 amendment)
+# Clock-layer primitives: read_clock_epoch / stamp_clock / within_min_interval
+# (task 3764 amendment)
 #
 # read_clock_epoch / stamp_clock / within_min_interval sit one level above
 # the JSON primitives and are the SINGLE definition behind every clock
