@@ -20,6 +20,8 @@ from typing import Any
 from shared.task_text_fingerprint import task_text_fingerprint
 
 TASK_TEXT_FP_KEY = 'task_text_fp'
+TEXT_BASE_STALE = 'TaskTextBaseStale'
+TEXT_BASE_REQUIRED = 'ReconTaskTextBaseRequired'
 
 
 def text_fp_of(task: object) -> str:
@@ -60,3 +62,71 @@ def plan_text_write(update_kwargs: Mapping[str, Any]) -> PlannedTextWrite:
         details=details if details is not None else update_kwargs.get('prompt'),
         details_appends=bool(update_kwargs.get('append')),
     )
+
+
+_REREAD_HINT = (
+    'Re-read the task with get_task, recompose the amendment against the '
+    'description/details that read returns, and resend it with expected_text_fp '
+    f'set to that response\'s {TASK_TEXT_FP_KEY}. Never resend the same text.'
+)
+
+
+@dataclass(frozen=True)
+class TextBaseRejection:
+    error_type: str
+    task_id: str
+    agent_id: str | None
+    fields: tuple[str, ...]
+    expected_text_fp: str | None
+    reason: str
+    hint: str = _REREAD_HINT
+
+    def to_error_dict(self) -> dict[str, Any]:
+        return {
+            'error': self.reason,
+            'error_type': self.error_type,
+            'task_id': self.task_id,
+            'agent_id': self.agent_id,
+            'op': 'update_task',
+            'fields': list(self.fields),
+            'expected_text_fp': self.expected_text_fp,
+            'hint': self.hint,
+        }
+
+
+def check_text_base(
+    *,
+    before: object,
+    write: PlannedTextWrite,
+    expected_text_fp: str | None,
+    fp_required: bool,
+    task_id: str,
+    agent_id: str | None,
+) -> TextBaseRejection | None:
+    if not write.writes_text:
+        return None
+    if expected_text_fp is not None and expected_text_fp != text_fp_of(before):
+        return TextBaseRejection(
+            error_type=TEXT_BASE_STALE,
+            task_id=task_id,
+            agent_id=agent_id,
+            fields=write.fields,
+            expected_text_fp=expected_text_fp,
+            reason=(
+                'the task text changed since the read this write was composed '
+                'against; writing it would overwrite that change'
+            ),
+        )
+    if expected_text_fp is None and fp_required and write.replaces_text:
+        return TextBaseRejection(
+            error_type=TEXT_BASE_REQUIRED,
+            task_id=task_id,
+            agent_id=agent_id,
+            fields=write.fields,
+            expected_text_fp=None,
+            reason=(
+                'a reconciliation-stage write that replaces description or details '
+                'must name the text it was composed against via expected_text_fp'
+            ),
+        )
+    return None
