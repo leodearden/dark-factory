@@ -1356,7 +1356,7 @@ class _ShortSleepClock:
     def newest_content_mtime(self, root: Path) -> float | None:  # noqa: ARG002
         return None
 
-    def verify_cpu_ticks(self, root: Path) -> int | None:  # noqa: ARG002
+    def verify_cpu_ticks(self, root: Path) -> int | None:
         return None
 
     async def sleep(self, secs: float) -> None:

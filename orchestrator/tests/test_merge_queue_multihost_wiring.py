@@ -2257,7 +2257,7 @@ class TestAlarmVerifyHostUnreachable:
         ]
         calls: list[list[str]] = []
 
-        async def _run(argv, *, cwd=None):  # noqa: ARG001
+        async def _run(argv, *, cwd=None):
             calls.append(list(argv))
             return (0, '', '')
 
