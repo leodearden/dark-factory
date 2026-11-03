@@ -54,7 +54,7 @@ def _downgraded_end_turn() -> AgentResult:
 
 
 async def _resumed_workflow(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> tuple[TaskWorkflow, _RecordingSink, _RecordingEventStore]:
     repo = tmp_path / 'repo'
     repo.mkdir()
@@ -73,17 +73,17 @@ async def _resumed_workflow(
     _seed_live_transcript(workflow._config_dir.path, SID)
     workflow.worktree = cwd
     store = _RecordingEventStore()
-    workflow.event_store = store  # type: ignore[assignment]
+    monkeypatch.setattr(workflow, 'event_store', store)
     workflow.usage_gate = make_gate_yielding([_make_slot(cap_hit=False), _make_slot(cap_hit=False)])
     workflow.artifacts.write_plan({
         'prerequisites': [],
         'steps': [{'id': s, 'description': s, 'status': 'pending'} for s in STEP_IDS],
     })
     workflow.artifacts.stamp_plan_provenance(workflow.session_id)
-    workflow._check_escalations = MagicMock(return_value=[])  # type: ignore[method-assign]
-    workflow._get_head_commit = AsyncMock(return_value='abc123')  # type: ignore[method-assign]
-    workflow._reconcile_done_step_commits = AsyncMock()  # type: ignore[method-assign]
-    workflow._iteration_commit_provenance = AsyncMock(return_value={})  # type: ignore[method-assign]
+    monkeypatch.setattr(workflow, '_check_escalations', MagicMock(return_value=[]))
+    monkeypatch.setattr(workflow, '_get_head_commit', AsyncMock(return_value='abc123'))
+    monkeypatch.setattr(workflow, '_reconcile_done_step_commits', AsyncMock())
+    monkeypatch.setattr(workflow, '_iteration_commit_provenance', AsyncMock(return_value={}))
     return workflow, sink, store
 
 
@@ -114,8 +114,10 @@ async def _run(workflow: TaskWorkflow, invoke_agent: AsyncMock) -> WorkflowOutco
 
 @pytest.mark.usefixtures('code_default_config')
 @pytest.mark.asyncio
-async def test_a_downgraded_resumed_run_that_completed_the_plan_is_kept(tmp_path: Path):
-    workflow, sink, store = await _resumed_workflow(tmp_path)
+async def test_a_downgraded_resumed_run_that_completed_the_plan_is_kept(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    workflow, sink, store = await _resumed_workflow(tmp_path, monkeypatch)
     invoke_agent = _completing_invoke_agent(workflow, _downgraded_end_turn())
 
     outcome = await _run(workflow, invoke_agent)
@@ -133,8 +135,10 @@ async def test_a_downgraded_resumed_run_that_completed_the_plan_is_kept(tmp_path
 
 @pytest.mark.usefixtures('code_default_config')
 @pytest.mark.asyncio
-async def test_a_rejected_resume_is_retried_fresh_and_reported(tmp_path: Path):
-    workflow, sink, store = await _resumed_workflow(tmp_path)
+async def test_a_rejected_resume_is_retried_fresh_and_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    workflow, sink, store = await _resumed_workflow(tmp_path, monkeypatch)
     invoke_agent = _completing_invoke_agent(workflow, measured_resume_rejection(SID))
 
     outcome = await _run(workflow, invoke_agent)
