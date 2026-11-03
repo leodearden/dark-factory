@@ -351,7 +351,7 @@ def observed_storm_window_inputs(db_path: Path | str) -> StormWindowSample | Non
                      exc_info=True)
         return None
 
-    from orchestrator.agents.roles import STEWARD  # noqa: PLC0415
+    from orchestrator.agents.roles import STEWARD
     from orchestrator.harness import _BY_DESIGN_RESTORE_OUTCOMES  # noqa: PLC0415
 
     carved = sorted(_BY_DESIGN_RESTORE_OUTCOMES)
