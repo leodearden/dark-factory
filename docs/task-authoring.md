@@ -1416,7 +1416,7 @@ stream, cross_repo, cross_repo_project, human_curator_gate,
 human_curator_adjudicated_at, last_blocked_at, recurrence,
 execution_class, merge_lane, pending_since, pending_since_backfilled,
 claimant_exception, audit_trail_rotation, plan_text_fp, plan_authored_at,
-main_health_signature
+main_health_signature, superseded_by, cancel_dispositions
 ```
 <!-- /tier-a-blessed-keys-mirror -->
 
@@ -1429,10 +1429,10 @@ copy was hand-maintained prose: task 4372 had to mirror two keys across in a
 separate follow-up commit, and the frozenset's own header comment sat stale
 across two blessings.
 
-`recurrence` (§6.1) is unusual for a Tier-A entry: it is *also* a registered
-submodel, so it is doubly exempt from the `unknown_key` scan (a registered
-key is already in `known_fields`). The blessing is deliberate
-belt-and-braces — it keeps the key suppressed if the registration is ever
+`recurrence` (§6.1) and `cancel_dispositions` are unusual for Tier-A entries:
+each is *also* a registered submodel, so each is doubly exempt from the
+`unknown_key` scan (a registered key is already in `known_fields`). The
+blessing is deliberate belt-and-braces — it keeps the key suppressed if the registration is ever
 moved or made lazy, and it is what makes
 `fused-memory/scripts/migrate_task_metadata_to_x_namespace.py` refuse to
 `x_`-namespace it, which for a submodel-backed key with live readers is the
