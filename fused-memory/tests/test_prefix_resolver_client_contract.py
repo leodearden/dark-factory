@@ -15,11 +15,10 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 from _id_resolver_fakes import FakeGraphiti, FakeMem0, make_resolver
+from escalation.prefix_resolver_client import PrefixResolverClient
 from shared.uuid_prefix_guard import Resolution, ResolverUnavailable
 
 from fused_memory.server.tools import create_mcp_server
-
-pytest.importorskip('escalation')
 
 _KNOWN_PROJECTS = {'reify': '/abs/reify'}
 _PREFIX = 'bff81530'
@@ -31,8 +30,6 @@ class _Wire:
     """β's real route over fake stores, and δ's client pointed at it."""
 
     def __init__(self, *, mem0: FakeMem0 | None = None, graphiti: FakeGraphiti | None = None) -> None:
-        from escalation.prefix_resolver_client import PrefixResolverClient
-
         self.resolver = make_resolver(mem0=mem0, graphiti=graphiti)
         server = create_mcp_server(AsyncMock(), id_resolver=self.resolver, known_projects=_KNOWN_PROJECTS)
         self.client = PrefixResolverClient(
