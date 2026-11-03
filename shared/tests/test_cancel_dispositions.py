@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 
 import pytest
 from pydantic import ValidationError
+from test_pure_stdlib_leaves import run_python_child
 
 from shared.cancel_dispositions import (
     CALLER_ACTIONS,
@@ -62,6 +63,7 @@ from shared.cancel_dispositions import (
     stamp_entry,
     with_entry,
 )
+from shared.task_metadata import parse_metadata
 from shared.task_statuses import TaskStatus
 
 PARENT = 5869
@@ -867,3 +869,70 @@ def test_the_rules_embed_the_table_render_verbatim():
 
 def test_the_rules_forbid_folding_or_mooting_an_in_progress_child():
     assert f'`{TaskStatus.IN_PROGRESS.value}`' in render_cancel_children_rules()
+
+
+# --- the metadata vocabulary (§4.8, §6 row 26) --------------------------------
+
+_TASK_METADATA_ONLY_CHILD = """
+import json, sys
+from shared.task_metadata import parse_metadata
+metadata, warnings = parse_metadata(json.loads(sys.argv[1]), direction='read')
+entries = metadata.model_extra['cancel_dispositions']
+print(json.dumps([
+    [warning.code for warning in warnings],
+    [type(entry).__name__ for entry in entries],
+    [type(entry.root).__name__ for entry in entries],
+]))
+"""
+
+_CANCEL_DISPOSITIONS_FIRST_CHILD = """
+import json, sys
+import shared.cancel_dispositions
+loaded_metadata = 'shared.task_metadata' in sys.modules
+from shared.task_metadata import is_known_metadata_key
+print(json.dumps([loaded_metadata, is_known_metadata_key('cancel_dispositions')]))
+"""
+
+
+def test_a_process_importing_only_task_metadata_types_the_cancel_dispositions_slice():
+    blob = json.dumps({'cancel_dispositions': entries_to_json(_ENTRIES[:2])})
+
+    seen = run_python_child(_TASK_METADATA_ONLY_CHILD, blob)
+
+    assert seen == [
+        [],
+        ['CancelDispositionEntry', 'CancelDispositionEntry'],
+        ['KeepEntry', 'RepointEntry'],
+    ]
+
+
+def test_cancel_dispositions_loads_without_task_metadata_and_the_key_is_known_after():
+    assert run_python_child(_CANCEL_DISPOSITIONS_FIRST_CHILD) == [False, True]
+
+
+def test_parsed_entries_from_metadata_read_back_through_parse_entries():
+    metadata, _ = parse_metadata(
+        {'cancel_dispositions': entries_to_json(_ENTRIES)}, direction='read'
+    )
+
+    assert metadata.model_extra is not None
+    assert parse_entries(metadata.model_extra['cancel_dispositions']) == _ENTRIES
+
+
+def test_a_single_entry_not_in_a_list_is_the_wrong_cardinality():
+    raw = {'cancel_dispositions': entries_to_json(_ENTRIES[:1])[0]}
+
+    _, warnings = parse_metadata(raw, direction='read')
+
+    assert [(w.field, w.code) for w in warnings] == [('cancel_dispositions', 'wrong_cardinality')]
+    with pytest.raises(TypeError):
+        parse_metadata(raw, direction='write', enforce=True)
+
+
+def test_an_entry_naming_a_bare_parent_id_is_an_invalid_submodel_kept_raw():
+    raw_entries = [_entry_json(parent=str(PARENT))]
+
+    metadata, warnings = parse_metadata({'cancel_dispositions': raw_entries}, direction='read')
+
+    assert [(w.field, w.code) for w in warnings] == [('cancel_dispositions', 'invalid_submodel')]
+    assert metadata.model_dump()['cancel_dispositions'] == raw_entries
