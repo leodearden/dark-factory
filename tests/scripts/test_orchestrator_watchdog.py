@@ -4243,6 +4243,28 @@ def test_cli_unknown_flag_does_not_crash(monkeypatch: pytest.MonkeyPatch) -> Non
     ]
 
 
+def test_watchdog_runs_as_a_directly_executed_script(tmp_path: pathlib.Path) -> None:
+    """systemd's ExecStart runs the file directly, so its flat-sibling imports resolve from the script's own directory, which pytest's conftest insertion otherwise masks."""
+    clock_file = tmp_path / "fm.json"
+    env = {
+        k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "PYTHONSAFEPATH")
+    }
+    env["FM_DEPLOY_CLOCK"] = str(clock_file)
+
+    result = subprocess.run(
+        [sys.executable, str(WATCHDOG_PATH), "--stamp-fm-deploy-clock"],
+        env=env,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, f"direct execution failed: {result.stderr}"
+    body = json.loads(clock_file.read_text())
+    assert body[CLOCK_PROVENANCE_SOURCE_KEY] == "orchestrator-watchdog.py"
+
+
 def test_cli_report_does_not_run_fm_staleness_pass(monkeypatch: pytest.MonkeyPatch) -> None:
     """--report must NOT invoke fused_memory_staleness_pass() (I7 at the CLI
     boundary): the fm staleness backstop runs on the timer path only, never in
@@ -7089,86 +7111,15 @@ def test_stamp_and_read_fm_deploy_clock_roundtrip(
 
 
 # ---------------------------------------------------------------------------
-# task 4823: the clock stamp carries its own provenance
+# task 4823: the fm deploy clock's stamp carries provenance in its own right.
 #
-# The watchdog is the SECOND of the two clock writers (restart-all-orchestrators.sh
-# is the first) and it owns three clocks through one _stamp_clock primitive.
-# These pin this writer's half of the contract;
-# df_pytest_isolation.py::deploy_clock_change_report states what the provenance
-# is for and what it buys.
-#
-# Every key is named through the df_pytest_isolation constants rather than a
-# literal of this file's own: that is what makes these drift pins rather than
-# tautologies, since the guard reads the keys IT defines and neither tier can
-# import the other (the watchdog is stdlib-only, and df_pytest_isolation is
-# stdlib+pytest-only because every subproject conftest imports it).
+# The stamp_clock primitive's half of the contract, and why every key is named
+# through the df_pytest_isolation constants, is pinned in
+# tests/scripts/test_watchdog_state.py.
 # ---------------------------------------------------------------------------
 
 # A stand-in for a real uuid4().hex; the shape a live session actually stamps.
 _SESSION_TOKEN_SENTINEL = "3f9c1a8b2d7e4f60a5b3c1d9e7f50246"
-
-
-def test_stamp_clock_records_its_writer_and_the_ambient_session_token(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
-    """A test-spawned stamp is TAGGED as test-spawned.
-
-    The token is read from the ambient environment at write time, which is what
-    lets a suite-wide guard attribute a write it did not make itself: every
-    spawner in this repo builds its child env from dict(os.environ), so
-    descendants inherit it for free.
-    """
-    wdog = _load_watchdog()
-    monkeypatch.setenv(PYTEST_SESSION_TOKEN_ENV, _SESSION_TOKEN_SENTINEL)
-    clock_file = tmp_path / "clock.json"
-
-    assert wdog._stamp_clock(str(clock_file)) is True
-
-    body = json.loads(clock_file.read_text())
-    assert body[CLOCK_PROVENANCE_SOURCE_KEY] == "orchestrator-watchdog.py"
-    assert body[CLOCK_PROVENANCE_SESSION_KEY] == _SESSION_TOKEN_SENTINEL
-
-
-def test_stamp_clock_records_an_empty_token_outside_a_pytest_session(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
-    """The shape every GENUINE deploy writes — and the guard's one forgiving input.
-
-    ALWAYS present, never omitted: an empty string is the positive statement "no
-    pytest session was an ancestor of this write", whereas a missing key is
-    indistinguishable from a pre-4823 writer and correctly keeps failing closed.
-    """
-    wdog = _load_watchdog()
-    monkeypatch.delenv(PYTEST_SESSION_TOKEN_ENV, raising=False)
-    clock_file = tmp_path / "clock.json"
-
-    wdog._stamp_clock(str(clock_file))
-
-    body = json.loads(clock_file.read_text())
-    assert CLOCK_PROVENANCE_SESSION_KEY in body, (
-        f"the key must be PRESENT and empty, not omitted; got {body!r}"
-    )
-    assert body[CLOCK_PROVENANCE_SESSION_KEY] == ""
-    assert body[CLOCK_PROVENANCE_SOURCE_KEY] == "orchestrator-watchdog.py"
-
-
-def test_stamp_clock_keeps_ts_and_iso_readable(tmp_path: pathlib.Path) -> None:
-    """The additive-schema guarantee the three readers depend on.
-
-    Every reader extracts `ts` and nothing else, so the two new keys must be
-    inert to all of them. Asserted through the real reader rather than by
-    eyeballing the body: a schema change that broke _read_clock_epoch would
-    disarm all three min-interval caps at once.
-    """
-    wdog = _load_watchdog()
-    clock_file = tmp_path / "clock.json"
-
-    wdog._stamp_clock(str(clock_file))
-
-    epoch = wdog._read_clock_epoch(str(clock_file), "test clock")
-    assert epoch is not None
-    assert epoch == pytest.approx(time.time(), abs=60)
-    assert isinstance(json.loads(clock_file.read_text())["iso"], str)
 
 
 def test_the_fm_deploy_clock_stamp_carries_provenance(
@@ -9207,208 +9158,10 @@ def test_fm_liveness_restart_min_interval_exceeds_worst_observed_lifetime(
 
 
 # ---------------------------------------------------------------------------
-# Part D: shared persistence helpers _atomic_write_json / _read_json_state
-# (task 3764)
-#
-# This task adds THREE more persisted-state writers/readers to a file that
-# already had two (_stamp_fm_deploy_clock / _read_last_fm_deploy_epoch).
-# Without extraction the ~20-line makedirs/mkstemp/os.replace/unlink-on-error
-# dance would be copy-pasted a third and fourth time. The extraction is
-# behaviour-preserving; the existing Part C deploy-clock suite is its
-# regression net, re-asserted explicitly at the bottom of this section.
+# Part D: the fm deploy clock still round-trips through the shared state
+# primitives (task 3764). The primitives' own contract tests live in
+# tests/scripts/test_watchdog_state.py.
 # ---------------------------------------------------------------------------
-
-
-def test_atomic_write_json_writes_body_and_creates_parent_dir(
-    tmp_path: pathlib.Path,
-) -> None:
-    """_atomic_write_json writes the JSON body, creating a missing parent dir.
-
-    Asserted against the REAL on-disk file (parsed back), never a mock.
-    """
-    wdog = _load_watchdog()
-    target = tmp_path / "deep" / "nested" / "state.json"
-    assert not target.parent.exists()
-
-    wdog._atomic_write_json(str(target), {"count": 2, "verdict": "wedged"})
-
-    assert target.exists(), "the write must create the target file and its parent dir"
-    assert json.loads(target.read_text()) == {"count": 2, "verdict": "wedged"}
-
-
-def test_atomic_write_json_leaves_no_stray_temp_file(tmp_path: pathlib.Path) -> None:
-    """A successful _atomic_write_json leaves ONLY the target file behind.
-
-    The write goes via tempfile.mkstemp + os.replace; the temp file must be
-    renamed away, not left accumulating in data/fused-memory/ on every tick.
-    """
-    wdog = _load_watchdog()
-    target = tmp_path / "state.json"
-
-    wdog._atomic_write_json(str(target), {"ts": 1})
-
-    survivors = sorted(p.name for p in tmp_path.iterdir())
-    assert survivors == ["state.json"], f"stray temp file(s) left behind: {survivors}"
-
-
-def test_atomic_write_json_fail_soft_on_replace_error(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
-    """A failed rename is logged and swallowed, and the temp file is unlinked.
-
-    Fail-soft: a persistence hiccup must never crash the oneshot watchdog.
-    """
-    wdog = _load_watchdog()
-    logged: list[str] = []
-    monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
-
-    def boom(_src, _dst):  # noqa: ANN001
-        raise OSError("cross-device link")
-
-    monkeypatch.setattr(wdog.os, "replace", boom)
-    target = tmp_path / "state.json"
-
-    # Must not raise.
-    wdog._atomic_write_json(str(target), {"ts": 1})
-
-    assert not target.exists(), "a failed write must not leave a partial target"
-    assert list(tmp_path.iterdir()) == [], (
-        f"the temp file must be unlinked on failure: "
-        f"{sorted(p.name for p in tmp_path.iterdir())}"
-    )
-    assert logged, "a swallowed write failure must be logged, not silent"
-
-
-def test_atomic_write_json_fail_soft_on_unwritable_dir(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
-    """An unwritable target directory is logged and swallowed, not raised."""
-    wdog = _load_watchdog()
-    logged: list[str] = []
-    monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
-
-    locked = tmp_path / "locked"
-    locked.mkdir()
-    locked.chmod(0o500)  # r-x: cannot create the temp file inside
-    try:
-        # Must not raise.
-        wdog._atomic_write_json(str(locked / "state.json"), {"ts": 1})
-    finally:
-        locked.chmod(0o700)
-
-    assert not (locked / "state.json").exists()
-    assert logged, "a swallowed write failure must be logged, not silent"
-
-
-def test_atomic_write_json_reports_whether_the_write_landed(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
-    """The writer returns True only after the rename succeeded, False otherwise.
-
-    Fail-soft is not the same as fail-safe: one caller
-    (_stamp_fm_liveness_restart_clock) ARMS a cap, so it must be able to tell
-    a landed write from a swallowed failure rather than assume the former.
-    """
-    wdog = _load_watchdog()
-    monkeypatch.setattr(wdog, "log", lambda _m: None)
-
-    assert wdog._atomic_write_json(str(tmp_path / "ok.json"), {"ts": 1}) is True
-
-    def boom(_src, _dst):  # noqa: ANN001
-        raise OSError("cross-device link")
-
-    monkeypatch.setattr(wdog.os, "replace", boom)
-    assert wdog._atomic_write_json(str(tmp_path / "bad.json"), {"ts": 1}) is False
-
-
-def test_read_json_state_returns_parsed_dict(tmp_path: pathlib.Path) -> None:
-    """_read_json_state parses a well-formed file into a dict."""
-    wdog = _load_watchdog()
-    target = tmp_path / "state.json"
-    target.write_text('{"ts": 1783000000, "iso": "2026-08-06T00:00:00+00:00"}')
-
-    assert wdog._read_json_state(str(target)) == {
-        "ts": 1783000000,
-        "iso": "2026-08-06T00:00:00+00:00",
-    }
-
-
-def test_read_json_state_missing_file_returns_none_silently(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
-    """A missing file yields None with NO log line.
-
-    "The state does not exist yet" is the normal case on a fresh checkout — it
-    is not a degradation and must not spam the journal every tick.
-    """
-    wdog = _load_watchdog()
-    logged: list[str] = []
-    monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
-
-    assert wdog._read_json_state(str(tmp_path / "absent.json")) is None
-    assert logged == [], f"a missing state file must not log: {logged}"
-
-
-def test_read_json_state_corrupt_json_returns_none_and_logs(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
-    """A truncated/corrupt body yields None (fail-open) AND a log line."""
-    wdog = _load_watchdog()
-    logged: list[str] = []
-    monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
-    target = tmp_path / "corrupt.json"
-    target.write_text('{"ts": 178300')  # truncated / partially written
-
-    assert wdog._read_json_state(str(target)) is None
-    assert logged, "a corrupt state file is a real degradation and must be logged"
-
-
-def test_read_json_state_non_object_body_returns_none_and_logs(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
-    """A well-formed but NON-OBJECT body yields None AND a log line.
-
-    ``[1, 2]`` / ``"hello"`` parse fine but carry no state, so every caller
-    loses its clock or streak — indistinguishable in consequence from a
-    corrupt file, and therefore a genuine degradation that must leave journal
-    evidence. Before the task-3764 extraction this case raised TypeError on
-    ``raw["ts"]`` inside _read_last_fm_deploy_epoch and WAS logged; a silent
-    None here would make the fm deploy backstop and the liveness restart cap
-    both vanish with nothing in the journal to explain it.
-    """
-    wdog = _load_watchdog()
-    for body in ("[1, 2]", '"hello"', "null", "3"):
-        logged: list[str] = []
-        monkeypatch.setattr(wdog, "log", lambda m, sink=logged: sink.append(m))
-        target = tmp_path / "nonobject.json"
-        target.write_text(body)
-
-        assert wdog._read_json_state(str(target)) is None, (
-            f"a non-object body must yield None: {body!r}"
-        )
-        assert logged, f"a non-object state body must be logged: {body!r}"
-        assert any(str(target) in m for m in logged), (
-            f"the log line must name the offending path: {logged!r}"
-        )
-
-
-def test_read_json_state_oserror_returns_none_and_logs(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
-    """A non-FileNotFoundError OSError yields None (fail-open) AND a log line."""
-    wdog = _load_watchdog()
-    logged: list[str] = []
-    monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
-    target = tmp_path / "state.json"
-    target.write_text('{"ts": 1}')
-    target.chmod(0o000)
-    try:
-        result = wdog._read_json_state(str(target))
-    finally:
-        target.chmod(0o600)
-
-    assert result is None
-    assert logged, "an unreadable state file must be logged, not silently ignored"
 
 
 def test_fm_deploy_clock_still_roundtrips_through_shared_helpers(
@@ -9434,107 +9187,6 @@ def test_fm_deploy_clock_still_roundtrips_through_shared_helpers(
     assert "ts" in body and "iso" in body, f"clock body must still carry ts+iso: {body}"
     assert wdog._read_last_fm_deploy_epoch() == pytest.approx(1783000000.0)
     assert isinstance(wdog._read_last_fm_deploy_epoch(), float)
-
-
-# ---------------------------------------------------------------------------
-# Part D: shared CLOCK-layer primitives (task 3764 amendment)
-#
-# _read_clock_epoch / _stamp_clock / _within_min_interval sit one level above
-# the JSON primitives and are now the SINGLE definition behind all eight clock
-# wrappers (fleet-deploy, fm-deploy, fm-liveness-restart). The wrappers' own
-# suites (Part A/C/D) are the behavioural regression net; these pin the
-# primitives' contracts directly so a drift between the three fail-open
-# contracts is caught at the source rather than in triplicate.
-# ---------------------------------------------------------------------------
-
-
-def test_read_clock_epoch_roundtrips_a_stamped_clock(tmp_path: pathlib.Path) -> None:
-    """_stamp_clock writes {ts, iso}; _read_clock_epoch reads it back as float."""
-    wdog = _load_watchdog()
-    clock = tmp_path / "nested" / "clock.json"
-    assert not clock.parent.exists(), "the stamp must create the parent dir"
-
-    wdog._stamp_clock(str(clock))
-
-    body = json.loads(clock.read_text())
-    assert "ts" in body and "iso" in body, f"clock body must carry ts+iso: {body}"
-    epoch = wdog._read_clock_epoch(str(clock), "test clock")
-    assert isinstance(epoch, float)
-    assert epoch == pytest.approx(float(body["ts"]))
-
-
-def test_read_clock_epoch_missing_file_returns_none_silently(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
-    """An absent clock is the normal 'never stamped' case: None, and no log spam."""
-    wdog = _load_watchdog()
-    logged: list[str] = []
-    monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
-
-    assert wdog._read_clock_epoch(str(tmp_path / "absent.json"), "test clock") is None
-    assert logged == [], f"a never-stamped clock must not log every tick: {logged!r}"
-
-
-def test_read_clock_epoch_unusable_ts_returns_none_and_names_the_clock(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
-    """A body with a missing/unusable `ts` fails open to None AND names the label.
-
-    The label is the whole reason it is a parameter: with three clocks now
-    sharing one reader, a journal line that did not say WHICH clock degraded
-    would be useless to an operator.
-    """
-    wdog = _load_watchdog()
-    for body in ('{"iso": "2026-08-06T00:00:00+00:00"}', '{"ts": "not-a-number"}'):
-        logged: list[str] = []
-        monkeypatch.setattr(wdog, "log", lambda m, sink=logged: sink.append(m))
-        clock = tmp_path / "clock.json"
-        clock.write_text(body)
-
-        assert wdog._read_clock_epoch(str(clock), "fm-deploy clock") is None
-        assert any("fm-deploy clock" in m for m in logged), (
-            f"the log line must name the degraded clock: {logged!r}"
-        )
-
-
-def test_within_min_interval_uses_the_reader_it_is_given(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The gate compares now - reader() against secs, honouring the passed reader.
-
-    Taking the READER rather than a path is what keeps each wrapper's named
-    epoch function the single seam tests substitute at — a wrapper can never
-    silently bypass its own reader.
-    """
-    wdog = _load_watchdog()
-    monkeypatch.setattr(wdog.time, "time", lambda: 1_000_000.0 + 100.0)
-
-    assert wdog._within_min_interval(3600, lambda: 1_000_000.0) is True
-    assert wdog._within_min_interval(60, lambda: 1_000_000.0) is False
-
-
-def test_within_min_interval_disabled_does_not_read_the_clock() -> None:
-    """secs<=0 disables the cap outright — the reader is not even called.
-
-    A disabled cap must not depend on a readable file.
-    """
-    wdog = _load_watchdog()
-
-    def boom() -> float:
-        pytest.fail("a disabled min-interval must not read its clock")
-
-    assert wdog._within_min_interval(0, boom) is False
-    assert wdog._within_min_interval(-1, boom) is False
-
-
-def test_within_min_interval_absent_clock_is_outside_the_window() -> None:
-    """A None epoch counts as OUTSIDE the window (fail toward acting).
-
-    Failing the other way would let one unreadable file suppress every future
-    restart indefinitely.
-    """
-    wdog = _load_watchdog()
-    assert wdog._within_min_interval(3600, lambda: None) is False
 
 
 # ---------------------------------------------------------------------------
@@ -10280,7 +9932,7 @@ def test_liveness_pass_unarmable_cap_is_logged_distinguishably(
     assert any("unbounded" in m for m in unarmed), (
         f"the line must state the consequence, not just the failure: {unarmed!r}"
     )
-    routine = [m for m in logged if m.startswith("_atomic_write_json:")]
+    routine = [m for m in logged if m.startswith("atomic_write_json:")]
     assert routine and unarmed != routine, (
         "the high-signal line must be distinguishable from the routine "
         f"persistence hiccup line: {logged!r}"
