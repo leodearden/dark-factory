@@ -352,10 +352,7 @@ cannot express them, and a second pass over the matches can.
 # Both spliced into _GREP_PCRE_BASH_RECOURSE by `+`; executed in a real repo
 # fixture by orchestrator/tests/test_roles_grep_escape_hatch_command.py.
 GIT_GREP_PCRE_COMMAND_TEMPLATE = "git grep --untracked -nP '<pattern>' -- <path>"
-GREP_PCRE_FALLBACK_COMMAND_TEMPLATE = (
-    "command grep -rP --include='*.py' --exclude-dir=.venv"
-    " --exclude-dir=node_modules --exclude-dir=.git '<pattern>' <path>"
-)
+GREP_PCRE_FALLBACK_COMMAND_TEMPLATE = "command grep -rP --include='*.py' '<pattern>' <path>"
 
 
 # Recourse for the roles holding unqualified `Bash`. Concatenated onto
@@ -390,11 +387,11 @@ The fallback, for exactly what git cannot see:
 
     """ + GREP_PCRE_FALLBACK_COMMAND_TEMPLATE + """
 
-`--include=` is its glob filter. It reads no ignore files at all, and its
-`--exclude-dir=` flags name only the commonest vendored trees, never a
-project's own build output. So point `<path>` at a source directory, or at
-the one ignored tree you need to search, never at the repo root; and if the
-rejected `Grep` call omitted `path`, do not simply substitute `.`.
+`--include=` is its glob filter. It reads no ignore files and skips no
+directory, so it searches exactly the tree you name, and all of it. So point
+`<path>` at a source directory, or at the one ignored tree you need to
+search, never at the repo root; and if the rejected `Grep` call omitted
+`path`, do not simply substitute `.`.
 
 The `command` prefix is load-bearing, not decoration. The harness shell
 snapshot shadows some search commands with shell functions, and WHICH ones is
@@ -403,8 +400,8 @@ not stable across sessions or hosts: one measured shadow wrapped `grep` in a
 a fast, confident, empty result. `command` reaches the real `/usr/bin/grep`
 either way.
 
-`rg --pcre2` also works, and needs none of those exclusions — `rg` IS the
-engine `Grep` wraps, so it honours the same ignore files. Its one limit is
+`rg --pcre2` also works, and honours the same ignore files `Grep` does,
+because `rg` IS the engine `Grep` wraps. Its one limit is
 where it survives. `rg` here is currently a shell FUNCTION that re-execs the
 Claude Code bundle, not a binary on `PATH`, so it is lost in a nested shell
 PROCESS: a `bash -c` or `sh -c`, or a standalone script file you write and
