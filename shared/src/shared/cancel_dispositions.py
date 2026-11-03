@@ -420,12 +420,15 @@ def _reaches(start: int, goal: int, edges: Callable[[int], Sequence[int]]) -> bo
 
 
 def _check_target(
-    field: str, target: int, target_status: Mapping[int, TaskStatus | None]
+    field: str,
+    target: int,
+    target_status: Mapping[int, TaskStatus | None],
+    cancelled: frozenset[int],
 ) -> None:
     status = target_status.get(target)
     if status is None:
         raise CancelChildrenInvalid(CancelChildrenInvalidReason.TARGET_NOT_FOUND, field, target)
-    if status == TaskStatus.CANCELLED:
+    if status == TaskStatus.CANCELLED or target in cancelled:
         raise CancelChildrenInvalid(CancelChildrenInvalidReason.TARGET_CANCELLED, field, target)
 
 
@@ -443,11 +446,11 @@ def _cancelled_by(
 def _post_cancel_edges(
     children: Mapping[ChildKey, ChildDispositionVariant],
     depends_on: Mapping[int, Sequence[int]],
+    *,
     parent_id: int,
+    cancelled: frozenset[int],
 ) -> Callable[[int], Sequence[int]]:
-    overrides: dict[int, Sequence[int]] = {
-        task: () for task in _cancelled_by(children, parent_id)
-    }
+    overrides: dict[int, Sequence[int]] = {task: () for task in cancelled}
     for child, disposition in children.items():
         if isinstance(child, int) and isinstance(disposition, RepointDisposition):
             kept = tuple(dep for dep in depends_on.get(child, ()) if dep != parent_id)
@@ -472,11 +475,12 @@ def _check_child(
     child: ChildKey,
     disposition: ChildDispositionVariant,
     target_status: Mapping[int, TaskStatus | None],
+    cancelled: frozenset[int],
     edges: Callable[[int], Sequence[int]],
 ) -> None:
     for field, target in _targets(disposition):
         child_field = _child_field(_key_text(child), field)
-        _check_target(child_field, target, target_status)
+        _check_target(child_field, target, target_status, cancelled)
         if _closes_cycle(child, disposition, target, edges):
             raise CancelChildrenInvalid(
                 CancelChildrenInvalidReason.REPOINT_CYCLE, child_field, target
@@ -491,19 +495,20 @@ def check_targets(
     target_status: Mapping[int, TaskStatus | None],
     depends_on: Mapping[int, Sequence[int]],
 ) -> None:
-    """Refuse a target that is missing, cancelled, or would close a dependency cycle in the
-    graph this cancel leaves behind.
+    """Refuse a target that is missing, cancelled (already or by this cancel), or would close
+    a dependency cycle in the graph this cancel leaves behind.
 
     target_status maps each named target to its status, None when no such task exists;
     depends_on is the pre-cancel task -> dependency-ids map, and the post-cancel overlay is
     derived from children and parent_id. Local children are checked in ascending id order,
     then external ones by key, then superseded_by.
     """
-    edges = _post_cancel_edges(children, depends_on, parent_id)
+    cancelled = _cancelled_by(children, parent_id)
+    edges = _post_cancel_edges(children, depends_on, parent_id=parent_id, cancelled=cancelled)
     for child in sorted(children, key=_child_order):
-        _check_child(child, children[child], target_status, edges)
+        _check_child(child, children[child], target_status, cancelled, edges)
     for target in superseded_by:
-        _check_target('superseded_by', target, target_status)
+        _check_target('superseded_by', target, target_status, cancelled)
 
 
 class DispositionSource(StrEnum):
