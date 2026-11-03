@@ -9402,3 +9402,53 @@ class TestRemoteRunnerMainPushMirror:
         result = await runner.run_merge_verify('abc123', _make_spec(), event_store=None)
         assert result == expected
         assert '+main:refs/heads/main' in _push_refspecs(calls)
+
+
+@pytest.mark.asyncio
+class TestRemoteRunnerMainMirrorPushTransport:
+    """Both main-mirror pushes are bounded by GIT_PUSH_SSH_CONFIG (task 8121)."""
+
+    async def test_fast_forward_and_force_pushes_carry_the_ssh_bounds(self):
+        from _gate_fixtures import (
+            TEST_CODE_CHECKOUT,
+            TEST_DEPLOYED_SHA,
+            TEST_DF_REMOTE,
+            TEST_GATE_ROOT,
+            gated_run,
+        )
+
+        from orchestrator.verify_runner import GIT_PUSH_SSH_CONFIG, RemoteRunner
+
+        raw_argvs: list[list[str]] = []
+        expected = VerifyResult(passed=True, test_output='', lint_output='', type_output='', summary='ok')
+
+        async def inner(argv, *, cwd=None):
+            if argv[:2] == ['git', 'rev-parse']:
+                return (0, 'MAINSHA', '')
+            if argv[:2] == ['git', 'push'] and argv[3] == 'main:refs/heads/main':
+                return (1, '', 'rejected: non-fast-forward')
+            if argv[0] == 'git':
+                return (0, '', '')
+            return (0, result_to_json(expected), '')
+
+        gated = gated_run(inner)
+
+        async def recording_run(argv, *, cwd=None):
+            raw_argvs.append(list(argv))
+            return await gated(argv, cwd=cwd)
+
+        runner = RemoteRunner(
+            'laptop', 'laptop.local', 'origin', '/repo',
+            main_branch='main',
+            run=recording_run,
+            id_factory=lambda: 'fixed-id',
+            df_remote_checkout=TEST_DF_REMOTE,
+            gate_checkouts_path=TEST_GATE_ROOT,
+            deployed_sha=TEST_DEPLOYED_SHA,
+            code_checkout=TEST_CODE_CHECKOUT,
+        )
+        await runner.run_merge_verify('abc123', _make_spec())
+
+        prefix = ['git', *GIT_PUSH_SSH_CONFIG, 'push', 'origin']
+        assert prefix + ['main:refs/heads/main'] in raw_argvs
+        assert prefix + ['+main:refs/heads/main'] in raw_argvs

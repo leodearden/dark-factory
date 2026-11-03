@@ -1747,6 +1747,9 @@ class RemoteRunner:
         β dedup: resolve the local main tip via `git rev-parse` (network-free).
         When the resolved sha matches _last_pushed_main_sha the push is skipped —
         the remote already has this main sha, so the push is redundant.
+
+        Both pushes carry GIT_PUSH_SSH_CONFIG so an unreachable verify host
+        fails within ConnectTimeout instead of blocking on TCP connect.
         """
         if self._main_branch:
             # Resolve local main tip (network-free)
@@ -1765,7 +1768,7 @@ class RemoteRunner:
             if resolved_main_sha is None or resolved_main_sha != self._last_pushed_main_sha:
                 try:
                     main_rc, _, main_stderr = await self._run(
-                        ['git', 'push', self._git_remote,
+                        ['git', *GIT_PUSH_SSH_CONFIG, 'push', self._git_remote,
                          f'{self._main_branch}:refs/heads/{self._main_branch}'],
                         cwd=self._cwd,
                     )
@@ -1782,7 +1785,7 @@ class RemoteRunner:
                         # on FF failure, so a healthy remote never sees one and
                         # the divergence signal is not silently dropped.
                         force_rc, _, force_stderr = await self._run(
-                            ['git', 'push', self._git_remote,
+                            ['git', *GIT_PUSH_SSH_CONFIG, 'push', self._git_remote,
                              f'+{self._main_branch}:refs/heads/{self._main_branch}'],
                             cwd=self._cwd,
                         )
