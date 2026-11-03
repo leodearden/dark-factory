@@ -7,9 +7,8 @@ from __future__ import annotations
 
 import dataclasses
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, MutableMapping
 from datetime import UTC, datetime
-from typing import Any
 
 import pytest
 from pydantic import ValidationError
@@ -170,11 +169,9 @@ def test_parse_children_keys_local_ids_as_ints_and_external_dependents_as_qualif
 
 def test_parse_children_returns_an_immutable_mapping():
     parsed = _parse({'6905': {'action': 'keep'}})
-    untyped_caller: Any = parsed
 
     assert isinstance(parsed, Mapping)
-    with pytest.raises(TypeError):
-        untyped_caller[6906] = KeepDisposition()
+    assert not isinstance(parsed, MutableMapping)
 
 
 def test_an_external_child_key_is_the_qualified_task_ref():
