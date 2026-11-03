@@ -108,6 +108,20 @@ class TestMem0RetryPolicy:
     def test_default_policy_exists(self):
         assert isinstance(DEFAULT_MEM0_RETRY_POLICY, Mem0RetryPolicy)
 
+    def test_the_default_backlog_alarm_age_is_an_hour(self):
+        assert DEFAULT_MEM0_RETRY_POLICY.backlog_alarm_age_seconds == 3600
+
+    @pytest.mark.parametrize('age', [0, -1])
+    def test_a_non_positive_backlog_alarm_age_is_rejected(self, age):
+        with pytest.raises(ValueError, match='backlog_alarm_age_seconds'):
+            Mem0RetryPolicy(
+                initial_delay_seconds=30,
+                max_delay_seconds=900,
+                poll_interval_seconds=30,
+                batch_size=50,
+                backlog_alarm_age_seconds=age,
+            )
+
     def test_initial_delay_above_the_cap_is_rejected(self):
         with pytest.raises(ValueError, match=r'901') as excinfo:
             Mem0RetryPolicy(

@@ -1011,6 +1011,9 @@ def _anchors_read_from_their_own_homes() -> dict[str, str]:
     from fused_memory.services.journal_growth_alarm import (
         _INSERT_RATE_ANCHOR_TASK_ID as JOURNAL_RATE_ANCHOR,
     )
+    from fused_memory.services.mem0_retry_backlog_alarm import (  # noqa: PLC0415
+        ANCHOR_TASK_ID as MEM0_RETRY_BACKLOG_ANCHOR,
+    )
     from fused_memory.services.memory_metadata_census import (  # noqa: PLC0415
         _ANCHOR_TASK_ID as CENSUS_ANCHOR_BASE,
     )
@@ -1033,6 +1036,7 @@ def _anchors_read_from_their_own_homes() -> dict[str, str]:
         'journal_growth_alarm file_size': JOURNAL_SIZE_ANCHOR,
         'journal_growth_alarm insert_rate': JOURNAL_RATE_ANCHOR,
         'classification_fallback_alarm': CLASSIFICATION_FALLBACK_ANCHOR,
+        'mem0_retry_backlog_alarm': MEM0_RETRY_BACKLOG_ANCHOR,
         # -- markup_guard, which CALLS the tripwire's filers with anchors of
         #    its own rather than carrying a copy of the skeleton -------------
         'markup_guard storm': GUARD_STORM_ANCHOR,
