@@ -1,0 +1,174 @@
+"""The §5.3 verify-base detector's policy and alarm (task 5302).
+
+A verify should start on the frozen-prefix tip.  ``detect_verify_base_divergence``
+decides, at dispatch, whether a real-verify item broke that rule and returns
+the record of it; ``alarm_verify_base_divergence`` files the record once as an
+L1.  Neither ever changes what the lane does (esc-3206-3, PRD §5.3).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import dataclasses
+import json
+from pathlib import Path
+
+import pytest
+from _merge_lane_fakes import RecordingEscalations, lane_scene_config
+from escalation.categories import EscalationCategory
+from orchestrator.merge_lane.verify_base_detector import (
+    VERIFY_BASE_DIVERGENCE_SENTINEL,
+    alarm_verify_base_divergence,
+    detect_verify_base_divergence,
+)
+
+from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.git_ops import MergeResult
+from orchestrator.merge_lane.types import (
+    DecidedItem,
+    MergeOutcome,
+    MergeRequest,
+    QueuedBranch,
+    RealMergeItem,
+    VerifyBaseDivergence,
+)
+
+_WIRE_KEYS = {'request_id', 'task_id', 'base_sha', 'expected_tip', 'verify_depth', 'observed_at'}
+
+
+@pytest.fixture
+def config(tmp_path: Path) -> OrchestratorConfig:
+    return lane_scene_config(tmp_path, GitConfig())
+
+
+def _request(config: OrchestratorConfig, task_id: str = 't-1') -> MergeRequest:
+    """A request for *task_id*; needs a running loop for its result future."""
+    return MergeRequest(
+        task_id=task_id,
+        branch=QueuedBranch.parse(f'task/{task_id}', config.git.branch_prefix),
+        worktree=config.project_root,
+        pre_rebased=False,
+        task_files=None,
+        module_configs=[],
+        config=config,
+        result=asyncio.get_running_loop().create_future(),
+    )
+
+
+def _real_item(
+    config: OrchestratorConfig, *, base_sha: str, remerge_recovery: bool = False,
+) -> RealMergeItem:
+    return RealMergeItem(
+        request=_request(config),
+        merge_result=MergeResult(success=True, merge_commit='sha-own'),
+        merge_wt=Path('/fake/merge-wt'),
+        base_sha=base_sha,
+        speculative=False,
+        remerge_recovery=remerge_recovery,
+    )
+
+
+def _detect(item: RealMergeItem | DecidedItem, expected_tip: str) -> VerifyBaseDivergence | None:
+    return detect_verify_base_divergence(item, expected_tip, verify_depth=2, observed_at=123.5)
+
+
+def _divergence(config: OrchestratorConfig) -> VerifyBaseDivergence:
+    divergence = _detect(_real_item(config, base_sha='sha-spec'), 'sha-tip')
+    assert divergence is not None
+    return divergence
+
+
+@pytest.mark.asyncio
+class TestDetectVerifyBaseDivergence:
+    """What counts as a dispatch-time divergence, and what it records."""
+
+    async def test_decided_item_is_not_a_candidate(self, config: OrchestratorConfig) -> None:
+        item = DecidedItem(
+            request=_request(config),
+            immediate_outcome=MergeOutcome('conflict'),
+            base_sha='sha-spec',
+            speculative=False,
+        )
+        assert _detect(item, 'sha-tip') is None
+
+    async def test_item_without_a_base_is_not_a_candidate(
+        self, config: OrchestratorConfig,
+    ) -> None:
+        assert _detect(_real_item(config, base_sha=''), 'sha-tip') is None
+
+    async def test_recovery_remerge_is_carved_out(self, config: OrchestratorConfig) -> None:
+        item = _real_item(config, base_sha='real-main', remerge_recovery=True)
+        assert _detect(item, 'sha-tip') is None
+
+    async def test_base_on_the_tip_is_no_divergence(self, config: OrchestratorConfig) -> None:
+        assert _detect(_real_item(config, base_sha=' sha-tip\n'), 'sha-tip') is None
+
+    async def test_divergence_records_the_dispatch_facts(
+        self, config: OrchestratorConfig,
+    ) -> None:
+        item = _real_item(config, base_sha='sha-spec')
+
+        divergence = _detect(item, 'sha-tip')
+
+        assert divergence == VerifyBaseDivergence(
+            request_id=item.request.request_id,
+            task_id=item.request.task_id,
+            base_sha='sha-spec',
+            expected_tip='sha-tip',
+            verify_depth=2,
+            observed_at=123.5,
+        )
+
+    async def test_divergence_is_immutable(self, config: OrchestratorConfig) -> None:
+        divergence = _divergence(config)
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            divergence.base_sha = 'other'  # type: ignore[misc]
+
+    async def test_wire_form_is_json_with_exactly_the_record_fields(
+        self, config: OrchestratorConfig,
+    ) -> None:
+        divergence = _divergence(config)
+
+        wire = divergence.to_wire()
+
+        assert set(wire) == _WIRE_KEYS
+        assert json.loads(json.dumps(wire)) == wire
+        assert wire['request_id'] == divergence.request_id
+        assert wire['verify_depth'] == 2
+
+
+@pytest.mark.asyncio
+class TestAlarmVerifyBaseDivergence:
+    """A divergence is filed once as a dedup'd L1; nothing else happens."""
+
+    async def test_no_queue_is_a_no_op(self, config: OrchestratorConfig) -> None:
+        alarm_verify_base_divergence(None, _divergence(config))
+
+    async def test_files_one_l1_naming_the_request_and_both_shas(
+        self, config: OrchestratorConfig,
+    ) -> None:
+        escalations = RecordingEscalations()
+        divergence = _divergence(config)
+
+        alarm_verify_base_divergence(escalations, divergence)
+
+        assert len(escalations.filed) == 1
+        filed = escalations.filed[0]
+        assert filed.task_id == VERIFY_BASE_DIVERGENCE_SENTINEL
+        assert filed.level == 1
+        assert filed.category == 'merge_verify_base_divergence'
+        for needle in (divergence.request_id, 'sha-spec', 'sha-tip'):
+            assert needle in filed.summary
+
+    async def test_open_l1_suppresses_a_second_filing(
+        self, config: OrchestratorConfig,
+    ) -> None:
+        escalations = RecordingEscalations(open_l1=True)
+
+        alarm_verify_base_divergence(escalations, _divergence(config))
+
+        assert escalations.filed == []
+
+
+def test_category_is_registered() -> None:
+    assert 'merge_verify_base_divergence' in {c.value for c in EscalationCategory}
