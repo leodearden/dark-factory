@@ -498,6 +498,32 @@ class TestFilenameShaped:
 
         assert findings == []
 
+    def test_the_filename_rule_lists_only_the_corpus_the_grep_searches(self, tmp_path):
+        """From ``git -C sub``, the grep reads only ``sub/`` and prints names
+        relative to it, so the filename rule must list exactly that."""
+        repo = init_git_repo(
+            tmp_path / 'repo',
+            {
+                'other/test_widget_strand.py': 'def run():\n    pass\n',
+                'sub/a.py': 'def f():\n    return 0\n',
+                'sub/test_gadget_strand.py': 'def run():\n    pass\n',
+            },
+        )
+
+        def lint(pattern: str):
+            return lint_delivered_checks(
+                [{'name': 'strand', 'kind': 'grep', 'pattern': pattern,
+                  'expect': 'present', 'paths': []}],
+                files=[],
+                repo_root=repo / 'sub',
+                ref='HEAD',
+            )
+
+        assert lint('test_widget_strand') == []
+        gadget = lint('test_gadget_strand')
+        assert [(f.severity, f.code) for f in gadget] == [('reject', 'filename_shaped')]
+        assert gadget[0].detail == ('test_gadget_strand.py',)
+
 
 # ---------------------------------------------------------------------------
 # TestAbsentOverbroad (task 3500 — step-7 RED / step-8 GREEN)
