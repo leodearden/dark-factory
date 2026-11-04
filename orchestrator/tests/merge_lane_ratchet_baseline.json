@@ -1585,6 +1585,7 @@
     "orchestrator/tests/test_merge_lane_coalesce_unwind.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_merge_lane_dead_base_ledger.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_merge_lane_halt.py": {"patch_targets": [], "private_reads": 0},
+    "orchestrator/tests/test_merge_lane_host_quarantine.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_merge_lane_instrumentation.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_merge_lane_intake.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_merge_lane_intake_buffers.py": {"patch_targets": [], "private_reads": 0},
