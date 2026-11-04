@@ -1,4 +1,5 @@
-"""A lease body whose fields do not carry LeaseHolder's declared types is UNREADABLE.
+"""A lease body that is not a JSON object, or whose fields do not carry LeaseHolder's
+declared types, is UNREADABLE.
 
 Every lease reader (lease_status, reap_stale_leases, claim_lease, the
 ``lease-claim`` CLI) treats such a body as an unknown holder -- never an
@@ -31,6 +32,10 @@ _NON_INT_PIDS = pytest.mark.parametrize(
     'bad',
     ['1234', None, 12.0, True, [1234]],
     ids=['str', 'null', 'float', 'bool', 'list'],
+)
+
+_NON_OBJECT_BODIES = pytest.mark.parametrize(
+    'bad', [[], None, 'x', 5, True], ids=['array', 'null', 'string', 'number', 'bool']
 )
 
 
@@ -242,7 +247,7 @@ _MUTATING_VERBS = pytest.mark.parametrize(
 
 
 def _assert_holder_mutation_refused(
-    tmp_path: Path, mutate: Callable[..., sr.LeaseMutation], body: dict[str, object]
+    tmp_path: Path, mutate: Callable[..., sr.LeaseMutation], body: object
 ) -> None:
     path = _seed_raw_lease(tmp_path, 'watcher-df', body, age=_WITHIN_TTL)
     before = (path.read_text(encoding='utf-8'), path.stat().st_mtime_ns)
@@ -288,3 +293,87 @@ def test_forced_release_on_a_non_int_pid_body_removes_the_lease(tmp_path: Path, 
 
     assert outcome is sr.LeaseMutation.FORCED
     assert not path.exists()
+
+
+@_NON_OBJECT_BODIES
+def test_from_json_rejects_a_non_object_body(bad: object) -> None:
+    with pytest.raises(TypeError) as excinfo:
+        sr.LeaseHolder.from_json(json.dumps(bad))
+    assert repr(bad) in str(excinfo.value)
+
+
+@_NON_OBJECT_BODIES
+def test_lease_status_reports_a_non_object_body_as_unreadable(tmp_path: Path, bad: object) -> None:
+    _seed_raw_lease(tmp_path, 'watcher-df', bad, age=timedelta(minutes=5))
+
+    status = sr.lease_status('watcher-df', root=tmp_path, now=_NOW)
+
+    assert status.state == 'unreadable'
+    assert status.holder_slug is None
+    assert status.holder_pid is None
+
+
+@_NON_OBJECT_BODIES
+def test_reap_stale_leases_reaps_a_non_object_body_and_finishes_the_sweep(
+    tmp_path: Path, bad: object
+) -> None:
+    _seed_raw_lease(tmp_path, 'a-non-object', bad, age=_PAST_TTL)
+    _seed_raw_lease(tmp_path, 'b-non-object-fresh', bad, age=_WITHIN_TTL)
+    _seed_raw_lease(tmp_path, 'z-dead-stale', _body(_DEAD_PID), age=_PAST_TTL)
+
+    reaped = sr.reap_stale_leases(root=tmp_path, now=_NOW)
+
+    assert {r.lease_name: r.reason for r in reaped} == {
+        'a-non-object': 'corrupt',
+        'z-dead-stale': 'stale_pid',
+    }
+    remaining = {p.stem for p in sr.leases_dir(root=tmp_path).glob('*.lease')}
+    assert remaining == {'b-non-object-fresh'}
+
+
+@_NON_OBJECT_BODIES
+def test_claim_lease_within_ttl_on_a_non_object_body_stands_down_on_an_unknown_holder(
+    tmp_path: Path, bad: object
+) -> None:
+    path = _seed_raw_lease(tmp_path, 'watcher-df', bad, age=_WITHIN_TTL)
+    seeded = path.read_text(encoding='utf-8')
+
+    claim = sr.claim_lease(
+        'watcher-df', holder=_claimant(), policy=sr.LeasePolicy.STAND_DOWN, root=tmp_path, now=_NOW
+    )
+
+    assert claim.acquired is False
+    assert claim.decision is sr.LeaseDecision.STAND_DOWN
+    assert claim.holder is None
+    assert '<unknown>' in claim.message
+    assert path.read_text(encoding='utf-8') == seeded
+
+
+@_MUTATING_VERBS
+@_NON_OBJECT_BODIES
+def test_holder_mutation_on_a_non_object_body_is_refused_and_touches_nothing(
+    tmp_path: Path, mutate: Callable[..., sr.LeaseMutation], bad: object
+) -> None:
+    _assert_holder_mutation_refused(tmp_path, mutate, bad)
+
+
+@pytest.mark.parametrize('bad', [[], None], ids=['array', 'null'])
+def test_main_lease_claim_on_a_non_object_body_stands_down_instead_of_failing_open(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    bad: object,
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    path = _seed_raw_lease(tmp_path, 'watcher-df', bad, age=timedelta(0))
+    os.utime(path, None)
+
+    rc = sr.main(
+        ['lease-claim', '--name', 'watcher-df', '--slug', 'watcher-df-200', '--pid', str(os.getpid())]
+    )
+
+    assert rc == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == 'decision=stand-down'
+    assert '<unknown>' in lines[1]
+    assert lines[2] == 'holder_liveness=held'
