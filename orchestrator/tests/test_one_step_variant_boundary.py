@@ -30,7 +30,7 @@ from _workflow_helpers import (
     AgentStub,
     FakeMcp,
     FakeScheduler,
-    _derive_meta_root_like_production,  # noqa: F401  autouse fixture, see its docstring
+    _derive_meta_root_like_production,
     _init_repo,
     agent_side_artifacts,
 )
@@ -46,7 +46,9 @@ from orchestrator.scheduler import TaskAssignment
 from orchestrator.verify import VerifyResult
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome, build_workflow
 
-pytestmark = pytest.mark.usefixtures('code_default_config')
+pytestmark = pytest.mark.usefixtures(
+    'code_default_config', _derive_meta_root_like_production.__name__,
+)
 
 TASK_ID = 'df_nu'
 TASK_MAX_EXECUTE_ITERATIONS = 4
@@ -169,9 +171,9 @@ def _workflow(orch: OrchestratorConfig, plan: dict) -> TaskWorkflow:
         ),
         config=orch,
         git_ops=git_ops,
-        scheduler=FakeScheduler(),  # type: ignore[arg-type]
+        scheduler=FakeScheduler(),
         briefing=BriefingAssembler(orch),
-        mcp=FakeMcp(),  # type: ignore[arg-type]
+        mcp=FakeMcp(),
         initial_plan=plan,
         merge_queue=merge_queue,
     )
