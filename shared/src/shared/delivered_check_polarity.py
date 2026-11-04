@@ -905,11 +905,19 @@ def _tracked_paths(
     ref: str,
     timeout_secs: float = GIT_TIMEOUT_SECS,
 ) -> list[str] | None:
-    """Paths in *ref*'s tree under *paths* (whole tree when empty) — the
-    committed tree the verdict was reached against, never the index.
-    ``None`` on any git failure — same never-guess contract as
-    :func:`_grep_matches`."""
-    argv = ['git', '-C', str(repo_root), 'ls-tree', '-r', '-z', '--full-tree', '--name-only', ref]
+    """Paths in *ref*'s tree under *paths* (all of it when empty): the
+    corpus ``git -C <repo_root> grep <ref>`` searches, so the filename rule
+    cannot name a file the grep cannot read. Without ``--full-tree``,
+    ls-tree is scoped to the ``-C`` directory with pathspecs and names
+    relative to it, exactly as the grep is; at the repository top level the
+    two forms list the same thing. It reads the committed tree the verdict
+    was reached against, never the index.
+
+    One known residual: ls-tree pathspecs are literal prefixes with no glob
+    magic, so a glob-scoped check lists nothing and gets no filename
+    diagnosis — the never-guess direction. ``None`` on any git failure, the
+    same contract as :func:`_grep_matches`."""
+    argv = ['git', '-C', str(repo_root), 'ls-tree', '-r', '-z', '--name-only', ref]
     if paths:
         argv.append('--')
         argv.extend(paths)
