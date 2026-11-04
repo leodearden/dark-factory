@@ -1181,6 +1181,49 @@ class TestASchema2SnapshotIsStillRead:
         assert 'params keys' in str(raised.value)
 
 
+def _below_run_id_and_cost(path: Path) -> list[str]:
+    """*path*'s lines without the two a re-run changes: run_id and the wall clock."""
+    return [
+        line
+        for line in path.read_text(encoding='utf-8').splitlines()
+        if not line.startswith(('  "run_id": ', '    "wall_clock_s": '))
+    ]
+
+
+class TestMeasurementIdentity:
+    @pytest.fixture
+    def taken(self, tmp_path: Path) -> dict[str, Any]:
+        return _measured(tmp_path, _GRAPH)
+
+    def test_it_is_the_recorded_sha_and_params(self, taken: dict[str, Any]) -> None:
+        identity = snapshot.measurement_identity(taken)
+        assert identity == (taken['as_of_sha'], taken['params'])
+        assert (identity.as_of_sha, identity.params) == (taken['as_of_sha'], taken['params'])
+
+    def test_two_runs_at_one_identity_are_byte_identical_below_run_id_and_cost(
+        self, tmp_path: Path
+    ) -> None:
+        # The PRD's decision-17 invariant: identity is (as_of_sha, params), not the checkout path.
+        root = _repo(tmp_path, _SUMMARY_FILES)
+        pinned = tmp_path / 'pinned'
+        git(root, 'worktree', 'add', '--detach', str(pinned), 'HEAD')
+        first, second = tmp_path / 'a.json', tmp_path / 'b.json'
+        assert snapshot.main(['--run-id', 'run-a', '--out', str(first), '--root', str(root)]) == 0
+        assert snapshot.main(['--run-id', 'run-b', '--out', str(second), '--root', str(pinned)]) == 0
+        a, b = snapshot.load_snapshot(first), snapshot.load_snapshot(second)
+        assert snapshot.measurement_identity(a) == snapshot.measurement_identity(b)
+        assert _below_run_id_and_cost(first) == _below_run_id_and_cost(second)
+        assert a['run_id'] != b['run_id']
+
+    def test_a_schema_2_rendering_never_shares_a_schema_3_identity(
+        self, taken: dict[str, Any]
+    ) -> None:
+        # Its instrument is unknown, so it never counts as already measured.
+        old = _as_schema_2(taken)
+        assert old['as_of_sha'] == taken['as_of_sha']
+        assert snapshot.measurement_identity(old) != snapshot.measurement_identity(taken)
+
+
 _COUPLING_BEFORE = 'from pkg import mod\n\ndef test_it():\n    assert mod._y\n'
 _COUPLING_AFTER = (
     'from unittest.mock import patch\nfrom pkg import mod\n\ndef test_it():\n'
