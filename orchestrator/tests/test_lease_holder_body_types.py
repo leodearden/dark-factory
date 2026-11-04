@@ -2,7 +2,8 @@
 
 Every lease reader (lease_status, reap_stale_leases, claim_lease, the
 ``lease-claim`` CLI) treats such a body as an unknown holder -- never an
-exception, and never a fake holder.
+exception, and never a fake holder. The mutating verbs (heartbeat_lease,
+release_lease) therefore refuse it even to the slug it names, unless forced.
 """
 
 from __future__ import annotations
@@ -10,6 +11,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -18,6 +20,7 @@ import pytest
 from orchestrator import session_registry as sr
 
 _NOW = datetime(2026, 7, 7, 12, 0, 0, tzinfo=UTC)
+_HOLDER_SLUG = 'watcher-df-100'
 _DEAD_PID = 2**31 - 1
 _PAST_TTL = sr.LEASE_HEARTBEAT_TTL + timedelta(minutes=1)
 _WITHIN_TTL = sr.LEASE_HEARTBEAT_TTL - timedelta(minutes=1)
@@ -41,7 +44,7 @@ def _seed_raw_lease(root: Path, name: str, body: object, *, age: timedelta) -> P
 
 
 def _body(pid: object) -> dict[str, object]:
-    return {'session_slug': 'watcher-df-100', 'pid': pid, 'start_ts': _NOW.isoformat()}
+    return {'session_slug': _HOLDER_SLUG, 'pid': pid, 'start_ts': _NOW.isoformat()}
 
 
 def _claimant() -> sr.LeaseHolder:
@@ -62,9 +65,15 @@ def test_constructor_rejects_a_non_int_pid(bad: object) -> None:
     assert repr(bad) in str(excinfo.value)
 
 
+@pytest.mark.parametrize('name', [f.name for f in dataclasses.fields(sr.LeaseHolder)])
+def test_every_lease_holder_field_is_type_checked_at_construction(name: str) -> None:
+    with pytest.raises(TypeError, match=name):
+        dataclasses.replace(_claimant(), **{name: object()})
+
+
 @pytest.mark.parametrize('pid', [0, -1, os.getpid(), 2**70], ids=['zero', 'negative', 'self', 'oversized'])
 def test_any_int_pid_is_accepted_and_round_trips(pid: int) -> None:
-    holder = sr.LeaseHolder(session_slug='watcher-df-100', pid=pid, start_ts=_NOW.isoformat())
+    holder = sr.LeaseHolder(session_slug=_HOLDER_SLUG, pid=pid, start_ts=_NOW.isoformat())
     assert sr.LeaseHolder.from_json(holder.to_json()) == holder
 
 
@@ -156,8 +165,8 @@ def test_main_lease_claim_on_a_non_int_pid_body_stands_down_instead_of_failing_o
 
 _NON_STR_FIELDS = pytest.mark.parametrize(
     ('field', 'bad'),
-    [('session_slug', 7), ('start_ts', 3), ('record_slug', 5)],
-    ids=['session_slug', 'start_ts', 'record_slug'],
+    [('session_slug', 7), ('start_ts', 3), ('record_slug', 5), ('record_slug', 0), ('record_slug', False)],
+    ids=['session_slug', 'start_ts', 'record_slug', 'record_slug-zero', 'record_slug-false'],
 )
 
 
@@ -214,9 +223,68 @@ def test_claim_lease_within_ttl_on_a_non_int_record_slug_body_stands_down(tmp_pa
 
 
 @pytest.mark.parametrize('present', [True, False], ids=['null', 'missing'])
-def test_falsy_record_slug_still_reads_as_unlinked(present: bool) -> None:
+def test_null_or_missing_record_slug_reads_as_an_unlinked_holder(tmp_path: Path, present: bool) -> None:
     body = _body(os.getpid())
     if present:
         body['record_slug'] = None
+    _seed_raw_lease(tmp_path, 'watcher-df', body, age=timedelta(minutes=5))
 
-    assert sr.LeaseHolder.from_dict(body).record_slug == ''
+    status = sr.lease_status('watcher-df', root=tmp_path, now=_NOW)
+
+    assert status.state == 'held'
+    assert status.holder_record_slug is None
+    assert status.holder_record_state is sr.HolderRecordState.UNLINKED
+
+
+_MUTATING_VERBS = pytest.mark.parametrize(
+    'mutate', [sr.heartbeat_lease, sr.release_lease], ids=['heartbeat', 'release']
+)
+
+
+def _assert_holder_mutation_refused(
+    tmp_path: Path, mutate: Callable[..., sr.LeaseMutation], body: dict[str, object]
+) -> None:
+    path = _seed_raw_lease(tmp_path, 'watcher-df', body, age=_WITHIN_TTL)
+    before = (path.read_text(encoding='utf-8'), path.stat().st_mtime_ns)
+
+    outcome = mutate('watcher-df', slug=_HOLDER_SLUG, root=tmp_path)
+
+    assert outcome is sr.LeaseMutation.REFUSED
+    assert (path.read_text(encoding='utf-8'), path.stat().st_mtime_ns) == before
+
+
+@_MUTATING_VERBS
+@_NON_INT_PIDS
+def test_holder_mutation_on_a_non_int_pid_body_is_refused_and_touches_nothing(
+    tmp_path: Path, mutate: Callable[..., sr.LeaseMutation], bad: object
+) -> None:
+    _assert_holder_mutation_refused(tmp_path, mutate, _body(bad))
+
+
+@_MUTATING_VERBS
+@_NON_STR_FIELDS
+def test_holder_mutation_on_a_non_str_field_body_is_refused_and_touches_nothing(
+    tmp_path: Path, mutate: Callable[..., sr.LeaseMutation], field: str, bad: object
+) -> None:
+    _assert_holder_mutation_refused(tmp_path, mutate, _body_with(field, bad))
+
+
+@_NON_INT_PIDS
+def test_forced_heartbeat_on_a_non_int_pid_body_bumps_the_heartbeat(tmp_path: Path, bad: object) -> None:
+    path = _seed_raw_lease(tmp_path, 'watcher-df', _body(bad), age=_PAST_TTL)
+    seeded_mtime_ns = path.stat().st_mtime_ns
+
+    outcome = sr.heartbeat_lease('watcher-df', slug=_HOLDER_SLUG, force=True, root=tmp_path)
+
+    assert outcome is sr.LeaseMutation.FORCED
+    assert path.stat().st_mtime_ns > seeded_mtime_ns
+
+
+@_NON_INT_PIDS
+def test_forced_release_on_a_non_int_pid_body_removes_the_lease(tmp_path: Path, bad: object) -> None:
+    path = _seed_raw_lease(tmp_path, 'watcher-df', _body(bad), age=_WITHIN_TTL)
+
+    outcome = sr.release_lease('watcher-df', slug=_HOLDER_SLUG, force=True, root=tmp_path)
+
+    assert outcome is sr.LeaseMutation.FORCED
+    assert not path.exists()

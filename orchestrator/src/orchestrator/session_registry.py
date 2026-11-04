@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeGuard
 
 # NOTE: this module is executed by absolute path from
 # skills/spawn/spawn-claude.sh and the SKILL.md verb lines with no venv,
@@ -281,7 +281,7 @@ class Question:
         return cls(text=data['text'], asked_at=data['asked_at'])
 
 
-def _is_strict_int(value: Any) -> bool:
+def _is_strict_int(value: object) -> TypeGuard[int]:
     """An int that is not a bool: Python's ``True`` would otherwise pass as int 1."""
     return isinstance(value, int) and not isinstance(value, bool)
 
@@ -4005,11 +4005,12 @@ class LeaseHolder:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> LeaseHolder:
+        record_slug = data.get('record_slug')
         return cls(
             session_slug=data['session_slug'],
             pid=data['pid'],
             start_ts=data['start_ts'],
-            record_slug=data.get('record_slug') or '',
+            record_slug='' if record_slug is None else record_slug,
         )
 
     def to_json(self) -> str:
