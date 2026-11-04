@@ -26,7 +26,12 @@ from pathlib import Path
 
 import pytest
 
-from escalation.authority import L2_AUTO_CLOSE_DENY_CATEGORIES, L2_AUTO_CLOSE_DENY_ROLES
+from escalation.authority import (
+    L2_AUTO_CLOSE_DENY_CATEGORIES,
+    L2_AUTO_CLOSE_DENY_ROLES,
+    POLICY_TABLE,
+    PolicyAction,
+)
 from escalation.classify import classify_resolver_tier
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue, iter_all_escalation_paths
@@ -1332,6 +1337,51 @@ def test_comparable_actions_stay_in_lockstep_with_the_c1_vocabulary():
     from escalation.server import RESOLVE_ACTIONS
 
     assert REVERSIBLE_ACTIONS & frozenset(RESOLVE_ACTIONS) == COMPARABLE_ACTIONS
+
+
+_LANDING_PROVENANCE = 'landing_provenance'
+
+
+def _done_flip_ruling() -> ShadowRuling:
+    return ShadowRuling(
+        ruling_class=_LANDING_PROVENANCE, proposed_action='done_flip',
+        evidence='git merge-base --is-ancestor <sha> main -> rc=0', confidence=0.9,
+    )
+
+
+class TestPolicyTableLockstep:
+    """The shadow vocabulary is the policy table's, not a second enumeration
+    (plans/decision-stream-prd.md §5.1): every class the table names can be
+    stamped, and every action a stamp proposes is an act the table knows."""
+
+    def test_first_tranche_classes_are_the_policy_table_slugs(self):
+        assert frozenset(row.policy_class for row in POLICY_TABLE) == FIRST_TRANCHE_CLASSES
+
+    def test_done_flip_is_a_reversible_action(self):
+        """PRD §3 decision 7: done_flip is waived reversible (Leo, 2026-11-04)."""
+        assert 'done_flip' in REVERSIBLE_ACTIONS
+
+    def test_every_stampable_proposal_is_a_policy_table_action(self):
+        assert frozenset({action.value for action in PolicyAction}) >= REVERSIBLE_ACTIONS
+
+    def test_a_landing_provenance_done_flip_stamp_round_trips(self):
+        """The codec half of boundary row 2."""
+        ruling = _done_flip_ruling()
+        assert parse_shadow_ruling(ruling.to_note_line()) == ruling
+
+    def test_a_done_flip_proposal_is_compared_as_its_trailing_close_only(self, tmp_path: Path):
+        """PRD §3 decision 7: a done_flip ends in a close_only resolution, so a
+        human close_only is agreement, a resume diverges, and a record with no
+        resolution_action stays not_comparable."""
+        fixture = _Fixture(tmp_path)
+        for observed_action in ('close_only', 'resume', None):
+            fixture.stamped_and_resolved(
+                _done_flip_ruling(), observed_action=observed_action, resolved_by='interactive',
+            )
+
+        klass = fixture.report().for_class(_LANDING_PROVENANCE)
+        assert klass is not None
+        assert (klass.agreed, klass.diverged, klass.not_comparable) == (1, 1, 1)
 
 
 # ---------------------------------------------------------------------------
