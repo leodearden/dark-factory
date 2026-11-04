@@ -7,7 +7,9 @@ a candidate resolved by name, ``build_eval_orch_config``, a REAL
 ``BriefingAssembler`` and ``build_workflow(..., initial_plan=...)``. Only the
 agent subprocess is faked, at ``orchestrator.workflow.invoke_agent`` (the
 ``test_routing_integration_gate.py`` seam), so the real ``_invoke`` resolves
-and sends every route.
+and sends every route. Memory recall's transport refuses every call, as the
+eval profile's ``127.0.0.1:1`` null sentinel does, so the brief renders
+without memory and no test reaches a live fused-memory server.
 
 Fixtures are module-local: a conftest.py or _workflow_helpers.py edit widens
 the merge-time scoped-test selection to the whole package.
@@ -21,6 +23,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
+from _briefing_helpers import MEMORY_TRANSPORT
 from _eval_config_lookup import named_eval_config
 from _implementer_action_oracle import ACTION_MARKER, TODAYS_ACTION
 from _workflow_helpers import (
@@ -29,11 +32,11 @@ from _workflow_helpers import (
     FakeScheduler,
     _derive_meta_root_like_production,  # noqa: F401  autouse fixture, see its docstring
     _init_repo,
+    agent_side_artifacts,
 )
 
 from orchestrator.agents.briefing import IMPLEMENTER_ACTIONS, BriefingAssembler
 from orchestrator.agents.invoke import AgentResult
-from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.evals.runner import build_eval_orch_config
 from orchestrator.git_ops import GitOps, _run
@@ -109,7 +112,7 @@ class _ObedientImplementer(AgentStub):
         return await self._complete(kwargs['cwd'], one_step=ONE_STEP_ACTION in kwargs['prompt'])
 
     async def _complete(self, cwd: Path, *, one_step: bool) -> AgentResult:
-        artifacts = TaskArtifacts(cwd, TaskArtifacts.meta_root_for(cwd.parent, cwd.name))
+        artifacts = agent_side_artifacts(cwd)
         pending = artifacts.get_pending_steps()
         for item in pending[:1] if one_step else pending:
             (cwd / f'{item["id"]}.txt').write_text(f'{item["id"]}\n')
@@ -184,6 +187,9 @@ async def _run_cell(
     orch = _cell_config(repo, candidate_name)
     workflow = _workflow(orch, plan)
     monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+    monkeypatch.setattr(
+        MEMORY_TRANSPORT, AsyncMock(side_effect=ConnectionRefusedError('null sentinel')),
+    )
     monkeypatch.setattr(
         'orchestrator.workflow.run_scoped_verification',
         AsyncMock(return_value=VerifyResult(

@@ -97,7 +97,7 @@ class TestRefusal:
         architect = ARCHITECT_EVAL_CONFIGS[0]
         with pytest.raises(ValueError) as excinfo:
             get_config_by_name(f'{architect.name}@one-step')
-        assert repr(architect.role) in str(excinfo.value)
+        assert repr(architect.role.value) in str(excinfo.value)
 
 
 @pytest.mark.usefixtures("code_default_config")
