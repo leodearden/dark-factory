@@ -1456,10 +1456,9 @@ class TestBareStrandedOrchestratorSuppression:
     by the bare project-wide orchestrator_live signal — that signal only
     reflects a running orchestrator process is dispatching SOME task in the
     project, not necessarily this one.  Status-agnostic (unlike rules 1-3):
-    recon_write_policy Gate 2 calls the detector without task_kind and with
-    whatever status the task currently holds, so the suppression must fire
-    regardless of status (excluding the statuses/combinations already handled
-    by rules 1-3).
+    a bare branch with a reaped worktree is per-task proof whatever the task's
+    status or kind, so the suppression fires regardless of status (excluding
+    the statuses/combinations already handled by rules 1-3).
     """
 
     def _side_effect(
