@@ -7334,6 +7334,13 @@ _RESTAMPED_STATES = _HELD_STATES | {ItemLifecycleState.GATE_REVERIFY, ItemLifecy
 # Registry states of a request back on the queue, waiting for the merger: not
 # in flight, so nothing should wait for it to settle (task 5371).
 _REQUEUED_STATES = frozenset({ItemLifecycleState.QUEUED, ItemLifecycleState.LANE_BUFFERED})
+# Phases (``_entry_phase`` values) of an entry whose verify or finalize is in
+# progress: what a finalize head needs to count as frozen or verifying.
+_VERIFY_PHASES = frozenset({
+    ItemLifecycleState.VERIFYING.value,
+    ItemLifecycleState.GATE_REVERIFY.value,
+    ItemLifecycleState.FINALIZING.value,
+})
 # Outcome of a coalesce train dissolved, unstarted, by an admission halt.
 _COALESCE_DISSOLVED_REASON = (
     'Coalesce train dissolved before its verify started (restart-drain '
@@ -9182,8 +9189,9 @@ class SpeculativeMergeWorker:
         stale lease into ``snapshot()``'s ``occupancy.by_host`` for an
         actually-free host, and (the latent wedge) keeping a DEAD merge commit
         at the :meth:`frozen_prefix_tip`, since
-        :meth:`_frozen_inflight_entries` appends this head whenever its phase
-        is in {verifying, gate_reverify, finalizing}.
+        :meth:`_frozen_inflight_entries` then counted this head as frozen on
+        its phase alone.  Task 5302 added the liveness half of that test
+        (:meth:`_finalize_head_is_frozen`), so a vacated head is not frozen.
 
         *inflight_ids*, if given, is used verbatim instead of re-deriving
         ``{e.item.request.request_id for e in self._inflight}``. Callers
@@ -10321,17 +10329,7 @@ class SpeculativeMergeWorker:
         return RelaneOutcome(relaned=False, lane=lane, refusal='not_found')
 
     # ── ε=1890 frozen-prefix / verify-frontier partition ─────────────────────
-    #
-    # §5.3 verify-base rule: ADVISORY BY DECISION, never enforced (task 3206).
-    # PRD §5.3 is the canonical record — verdict, re-merge carve-out, and the
-    # measured sweep behind them (4 classified hits, precision 0/4 as an
-    # enforcement predicate).  Deliberately a pointer, not a copy: that record
-    # is dated journald forensics and would rot here once retention rolls.
-    #
-    # What matters at THIS definition: two of the four hits were a phantom
-    # frozen tip, i.e. evidence that the definition below is the weak point —
-    # a finalize head whose verify is dead still counts as frozen.  Tightening
-    # it is deliberately a SEPARATE task, not folded in here.
+    # Definition and its measured history: plans/two-layer-merge-queue-prd.md §5.3.
 
     def _occupying_inflight_entries(self) -> list[InflightEntry]:
         """The ``_inflight`` entries not :attr:`~InflightEntry.vacated`, in
@@ -10349,9 +10347,15 @@ class SpeculativeMergeWorker:
         while verification is in flight.
 
         Definition (§5.3):
-          frozen = (self._finalizing_head_entry() if its phase is a verify/finalize phase)
+          frozen = [the finalize head, if _finalize_head_is_frozen(head)]
                    + [e for e in self._occupying_inflight_entries()
                       if e.in_verify_frontier]
+
+        Both halves apply one liveness rule: a :attr:`~InflightEntry.vacated`
+        entry is not frozen.  Its verify requeued or dropped the request and
+        released the lease (task 4582), so its merge commit is dead; counting
+        it made that commit the :meth:`frozen_prefix_tip` (PRD §5.3 class (a),
+        fixed by task 5302).
 
         Passthroughs (verify_task=None: conflict/already_merged/skip) are NOT
         frozen — they carry no merge_commit and are not part of the verify
@@ -10360,22 +10364,24 @@ class SpeculativeMergeWorker:
 
         Pure/synchronous — mirrors MergeIntake.pop_next_pickable.
 
-        MQ-reliability kappa-b (task 2435): the finalize head is now derived
-        via :meth:`_finalizing_head_entry` (the deleted ``_finalizing_head``
-        field's replacement) rather than read from a field — same phase
-        filter, same passthrough-exclusion behaviour.
+        MQ-reliability kappa-b (task 2435): the finalize head is derived via
+        :meth:`_finalizing_head_entry` (the deleted ``_finalizing_head``
+        field's replacement) rather than read from a field.
         """
         entries: list[InflightEntry] = []
-        _fh_entry = self._finalizing_head_entry()
-        if (
-            _fh_entry is not None
-            and self._entry_phase(_fh_entry) in {'verifying', 'gate_reverify', 'finalizing'}
-        ):
-            entries.append(_fh_entry)
-        for e in self._occupying_inflight_entries():
-            if e.in_verify_frontier:
-                entries.append(e)
+        head = self._finalizing_head_entry()
+        if head is not None and self._finalize_head_is_frozen(head):
+            entries.append(head)
+        entries.extend(e for e in self._occupying_inflight_entries() if e.in_verify_frontier)
         return entries
+
+    def _finalize_head_is_frozen(self, head: InflightEntry) -> bool:
+        """Whether the finalize *head* counts toward the frozen prefix (§5.3).
+
+        It must be in a verify or finalize phase and not vacated, the same
+        liveness rule :meth:`_occupying_inflight_entries` applies to the deque.
+        """
+        return not head.vacated and self._entry_phase(head) in _VERIFY_PHASES
 
     def _verify_frontier_depth(self) -> int:
         """Return the verify-frontier stack height (task 2340, reuses ε=1890).
@@ -12645,15 +12651,14 @@ class SpeculativeMergeWorker:
         # is the SECOND entry during the finalize window and would
         # misreport the verifying head.
         verify_in_progress = None
-        _verify_phases = {'verifying', 'gate_reverify', 'finalizing'}
         # Prefer the finalize-head entry only when its phase qualifies — a
         # passthrough finalize entry would otherwise mask a
         # genuinely-verifying _inflight[0].
         _vip_head = (
-            _fh_entry if _fh_entry is not None and self._entry_phase(_fh_entry) in _verify_phases
+            _fh_entry if _fh_entry is not None and self._entry_phase(_fh_entry) in _VERIFY_PHASES
             else (_occupying[0] if _occupying else None)
         )
-        if _vip_head is not None and self._entry_phase(_vip_head) in _verify_phases:
+        if _vip_head is not None and self._entry_phase(_vip_head) in _VERIFY_PHASES:
             verify_in_progress = {
                 'task_id': _vip_head.item.request.task_id,
                 'phase': self._entry_phase(_vip_head),
