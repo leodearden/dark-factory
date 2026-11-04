@@ -6753,7 +6753,7 @@ def _verify_admission_active(config: OrchestratorConfig) -> bool:
 
 
 def admission_active(config: OrchestratorConfig) -> bool:
-    """Whether verify admission is on now; the one public read, through the conftest seam."""
+    """Whether verify admission is on now."""
     return _verify_admission_active(config)
 
 
