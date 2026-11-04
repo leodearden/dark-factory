@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from collections.abc import Awaitable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
@@ -14,10 +15,12 @@ from shared.cli_invoke import read_transcript_records
 from shared.config_dir import TaskConfigDir
 from shared.jcodemunch_launch import jcodemunch_server_config
 from shared.safe_io import load_json_or_warn
+from shared.transcript_archive import archive_task_transcripts
 
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import (
     ReconciliationEvent,
+    StageAgentOutcome,
     StageId,
     StageReport,
     Watermark,
@@ -30,9 +33,12 @@ from fused_memory.reconciliation.citation_verifier import (
 )
 from fused_memory.reconciliation.cli_stage_runner import (
     STAGE_REPORT_SCHEMA,
+    recon_archive_root,
     recon_config_base_dir,
+    recon_transcript_archive_key,
     run_stage_via_cli,
 )
+from fused_memory.reconciliation.sqlite_failures import await_best_effort
 from fused_memory.utils.validation import require_project_id, require_run_id
 
 if TYPE_CHECKING:
@@ -86,10 +92,11 @@ class BaseStage:
         self.config = config
         self.scope = scope
         # Cross-project routing: dict[project_id, project_root] of every
-        # project the harness knows about (including this one).  Stage 2
-        # surfaces this to the LLM so it can re-route a finding to the
-        # correct project_root when the scope demands.  Empty until the
-        # harness sets it per cycle.
+        # project the harness knows about (including this one).  Stages 2 and
+        # 3 surface this to the LLM through
+        # reconciliation/known_projects_section.py::render_known_projects_section
+        # so it can re-route a finding to the correct project_root when the
+        # scope demands.  Empty until the harness sets it per cycle.
         self.known_projects: dict[str, str] = known_projects or {}
         self._usage_gate = usage_gate
         self._escalation_url: str | None = None
@@ -260,6 +267,7 @@ class BaseStage:
                 },
                 llm_calls=0,
                 tokens_used=0,
+                agent_outcome=StageAgentOutcome.not_launched,
             )
 
         # When recon_report_state is active, drop the output_schema requirement —
@@ -277,13 +285,18 @@ class BaseStage:
         # The config dir is derived deterministically from (data_dir, run_id) so
         # all three stages of a run share it and the harness GCs the same path;
         # attempt auto-increments per launch as durable history for task σ (resume).
+        # Both snapshot writes are best-effort (task 5561).
         session_id = str(uuid4())
         config_dir = TaskConfigDir(
             task_id=run_id,
             base_dir=recon_config_base_dir(self.journal.data_dir),
         )
-        await self.journal.record_run_session(
-            run_id, session_id=session_id, stage_cursor=self.stage_id.value
+        await self._write_session_snapshot_best_effort(
+            'record_run_session',
+            run_id,
+            self.journal.record_run_session(
+                run_id, session_id=session_id, stage_cursor=self.stage_id.value
+            ),
         )
 
         # Task σ resume seam: when the startup adopt-and-resume pass supplies the
@@ -339,20 +352,24 @@ class BaseStage:
             cancelled = True
             raise
         finally:
+            self._archive_stage_transcripts(config_dir, run_id)
             if not cancelled:
-                await self.journal.clear_run_session(run_id)
+                await self._write_session_snapshot_best_effort(
+                    'clear_run_session', run_id, self.journal.clear_run_session(run_id),
+                )
 
         completed = datetime.now(UTC)
 
         # PRD γ: read assembled report from in-process state (overrides stage_result.report).
         # Falls back to stage_result.report when recon_report_state is not configured
         # (back-compat path for non-recon stages) or when start_report degraded to None.
+        report_data = stage_result.report
         if _active_rrs is not None:
             assembled = _active_rrs.get_assembled_report(
                 run_id, self.stage_id.value
             )
             if assembled is not None:
-                stage_result.report = assembled
+                report_data = assembled
             else:
                 # Agent crashed / timed out before calling recon_report.complete.
                 # Substitute empty assembled dict — matches today's malformed-JSON outcome.
@@ -361,12 +378,12 @@ class BaseStage:
                     '(agent may have crashed before calling recon_report.complete)',
                     self.stage_id.value, run_id,
                 )
-                stage_result.report = {'summary': '', 'stats': {}, 'flagged_items': []}
+                report_data = {'summary': '', 'stats': {}, 'flagged_items': []}
 
         # Schema consistency (reviewer finding schema_consistency): warn when a
         # flagged item lacks both dedup keys — compute_flag_signature will return
         # None for these findings, silently bypassing cross-run recurrence tracking.
-        for _item in stage_result.report.get('flagged_items', []):
+        for _item in report_data.get('flagged_items', []):
             if not _item.get('task_id') and not _item.get('cited_tasks'):
                 logger.warning(
                     'Stage %s run_id=%s: finding lacks task_id and cited_tasks — '
@@ -375,7 +392,6 @@ class BaseStage:
                     _item.get('description', '<no description>'),
                 )
 
-        report_data = stage_result.report
         _flagged = report_data.get('flagged_items', [])
         _stats = report_data.get('stats', {})
 
@@ -507,6 +523,7 @@ class BaseStage:
             stats=_stats,
             llm_calls=stage_result.llm_calls,
             tokens_used=stage_result.tokens_used,
+            agent_outcome=stage_result.outcome,
         )
 
         duration = (completed - started).total_seconds()
@@ -520,16 +537,55 @@ class BaseStage:
                 'cost_usd': stage_result.cost_usd,
                 'llm_calls': stage_result.llm_calls,
                 'success': stage_result.success,
+                'agent_outcome': stage_result.outcome,
                 'error': stage_result.error or None,
             },
         )
 
         if not stage_result.success:
             logger.error(
-                f'Stage {self.stage_id.value} failed: {stage_result.error}'
+                f'Stage {self.stage_id.value} failed '
+                f'(agent outcome: {stage_result.outcome}): {stage_result.error}'
             )
 
         return stage_report
+
+    async def _write_session_snapshot_best_effort(
+        self, op: str, run_id: str, write: Awaitable[None],
+    ) -> None:
+        """Await one session-snapshot journal write, logging rather than raising on failure.
+
+        The snapshot is advisory: the task-σ resume gate
+        (``harness.py::ReconciliationHarness._resume_guard_reason`` and the
+        transcript check in ``run``) validates the transcript on disk instead
+        of trusting it. Cancellation propagates.
+        """
+        await await_best_effort(
+            write,
+            what=f'Stage {self.stage_id.value} session-snapshot write {op}',
+            run_id=run_id, logger=logger, level=logging.WARNING,
+        )
+
+    def _archive_stage_transcripts(self, config_dir: TaskConfigDir, run_id: str) -> None:
+        """Producer half of recon transcript archival (task 3972).
+
+        COPIES, so the σ ``--resume`` seam can still read the source. Runs on
+        every exit, cancellation included, because interrupted runs skip the
+        teardown half (``cli_stage_runner.py::gc_run_config_dir``) and
+        fused-memory has no boot-time orphan sweeper. ``session_id=None``
+        archives the whole per-run dir, so a resumed session's file and
+        subagent transcripts are covered; ``_archive_one``'s mtime-equality
+        skip makes repeats nearly free. Synchronous and total by contract.
+        """
+        archive_root = recon_archive_root(self.config)
+        if archive_root is None:
+            return
+        archive_task_transcripts(
+            config_dir.path,
+            recon_transcript_archive_key(run_id),
+            None,
+            archive_root=archive_root,
+        )
 
     def _build_recovery_prompt(self, run_id: str, stage_payload: str) -> str:
         """Build the continuation prompt delivered to a ``--resume``d stage (task σ).

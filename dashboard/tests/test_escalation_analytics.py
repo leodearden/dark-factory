@@ -207,12 +207,26 @@ class TestDoneByDay:
 
         assert result == {'2026-07-10': 2, '2026-07-11': 1}
 
-    def test_missing_db_returns_empty_dict(self, tmp_path):
+    def test_missing_db_is_unreadable(self, tmp_path):
+        """No runs.db is no reading — never {}, which would claim no task completed."""
         from dashboard.data.escalation_analytics import _done_by_day
 
         missing = tmp_path / 'does-not-exist' / 'runs.db'
 
-        assert _done_by_day(missing) == {}
+        assert _done_by_day(missing) is None
+
+    def test_a_failing_query_is_unreadable(self, tmp_path):
+        from dashboard.data.escalation_analytics import _done_by_day
+
+        tableless = tmp_path / 'runs.db'
+        sqlite3.connect(str(tableless)).close()
+
+        assert _done_by_day(tableless) is None
+
+    def test_a_readable_empty_db_is_a_measured_empty_dict(self, tmp_path):
+        from dashboard.data.escalation_analytics import _done_by_day
+
+        assert _done_by_day(_make_runs_db(tmp_path, [])) == {}
 
 
 # ---------------------------------------------------------------------------
@@ -610,7 +624,9 @@ class TestAggregateProjectLifespan:
         lifespan = entry['lifespan']
 
         promo = lifespan['l1_to_l2_promotion']
-        assert promo == {'count': 0, 'p50_secs': None, 'p90_secs': None}
+        assert promo == {
+            'count': 0, 'p50_secs': None, 'p90_secs': None, 'fold_time_unknown': 0,
+        }
 
         open_by_id = {item['id']: item for item in lifespan['open_items']}
         assert open_by_id['esc-201-1']['breach_6h'] is False
@@ -699,6 +715,7 @@ class TestAggregateProjectWorkflow:
         assert by_date[done_only_day]['filings'] == 0
         assert by_date[done_only_day]['done'] == 1
         assert by_date[done_only_day]['ratio'] == 0.0
+        assert workflow['done_counts_read'] is True
 
         # flow_daily: sparse cube over the 5 terminal-with-valid-times
         # records, keyed by (date(resolved_at), source, level, tier, class).
@@ -726,6 +743,24 @@ class TestAggregateProjectWorkflow:
         }
         assert all(row['n'] == 1 for row in workflow['flow_daily'])
         assert sum(row['n'] for row in workflow['flow_daily']) == len(entry['lifespan']['samples'])
+
+    def test_unreadable_runs_db_serves_unmeasured_done_counts(self, tmp_path):
+        """An unread runs.db is not 'no tasks completed': done and ratio are unmeasured."""
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        archive = build_golden_archive(esc_dir, now)
+        expected_filings_by_date: dict[str, int] = {}
+        for esc in archive.values():
+            d = datetime.fromisoformat(esc['timestamp']).date().isoformat()
+            expected_filings_by_date[d] = expected_filings_by_date.get(d, 0) + 1
+
+        entry, _ = _aggregate('dark_factory', esc_dir, tmp_path / 'absent' / 'runs.db', now=now)
+        workflow = entry['workflow']
+
+        assert workflow['done_counts_read'] is False
+        rows = workflow['esc_per_done_daily']
+        assert {row['date']: row['filings'] for row in rows} == expected_filings_by_date
+        assert all(row['done'] is None and row['ratio'] is None for row in rows)
 
 
 # ---------------------------------------------------------------------------
@@ -1699,6 +1734,37 @@ class TestCompleteResolutionClasses:
         assert source['classified'] == sum(source['classes'].values()) == len(RESOLUTION_CLASSES) + 1
 
 
+_ROUTER_CLASSES = frozenset({'addressed', 'observation-consumed', 'converted', 'status-info'})
+
+
+class TestDispositionedBucket:
+    """origin.sources[].dispositioned counts what the info-L0 router closed
+    (plans/info-l0-disposition-router-prd.md D14), beside the per-class keys."""
+
+    def test_it_counts_the_four_router_classes_and_no_other(self, tmp_path):
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        _one_terminal_per_class(esc_dir, now)
+        strand = _terminal('esc-7-1', now=now, status='dismissed', resolution_class='stale-strand')
+        _write_escalation(esc_dir, {**strand, 'agent_role': 'steward'}, archived=True)
+
+        entry, _ = _aggregate('dark_factory', esc_dir, tmp_path / 'runs.db', now=now)
+        sources = {s['source']: s for s in entry['origin']['sources']}
+
+        implementer = sources['implementer']
+        assert implementer['dispositioned'] == 4
+        assert implementer['dispositioned'] == sum(implementer['classes'][c] for c in _ROUTER_CLASSES)
+        assert sources['steward']['dispositioned'] == 0
+        assert set(implementer['classes']) == set(RESOLUTION_CLASSES)
+        assert {row['class'] for row in entry['workflow']['flow_daily']} <= RESOLUTION_CLASSES
+
+    def test_the_bucket_is_drawn_from_the_resolution_vocabulary(self):
+        from dashboard.data.escalation_analytics import DISPOSITIONED_CLASSES
+
+        assert DISPOSITIONED_CLASSES == _ROUTER_CLASSES
+        assert DISPOSITIONED_CLASSES <= RESOLUTION_CLASSES
+
+
 class TestOneTerminalPopulation:
     """classes, action_mix and terminal count the same terminal records."""
 
@@ -1775,11 +1841,14 @@ class TestCorpusViewsAndProvenance:
 
         payload = _analytics(projects, now=now)
 
+        read = {entry['project']: entry['workflow']['done_counts_read'] for entry in payload['per_project']}
+        assert read == {'alpha': True, 'beta': True, 'gamma': False}
         done = {
             entry['project']: sum(day['done'] for day in entry['workflow']['esc_per_done_daily'])
             for entry in payload['per_project']
+            if entry['workflow']['done_counts_read']
         }
-        assert done == {'alpha': 1, 'beta': 2, 'gamma': 0}
+        assert done == {'alpha': 1, 'beta': 2}
 
     def test_generated_at_is_the_corpus_instant(self, tmp_path):
         now = golden_now()

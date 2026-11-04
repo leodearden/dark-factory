@@ -33,6 +33,8 @@ __all__ = [
     'ACTIVE',
     'WORKFLOW_PRESERVE',
     'STATUS_TRIGGERS',
+    'OwnerLiveness',
+    'owner_liveness',
 ]
 
 
@@ -95,3 +97,29 @@ WORKFLOW_PRESERVE: frozenset[TaskStatus] = frozenset(
 STATUS_TRIGGERS: frozenset[TaskStatus] = frozenset(
     {TaskStatus.DONE, TaskStatus.BLOCKED, TaskStatus.CANCELLED, TaskStatus.DEFERRED}
 )
+
+
+class OwnerLiveness(enum.StrEnum):
+    """The four verdicts on a stored task owner's live status."""
+
+    OPEN = 'open'
+    DEFERRED = 'deferred'
+    DONE = 'done'
+    CLOSED = 'closed'
+
+
+def owner_liveness(status: str | None) -> OwnerLiveness:
+    """Classify a task's live *status* as an owner.
+
+    ``CLOSED`` for an empty or absent status or a terminal one other than ``done``
+    (``cancelled``); ``DEFERRED`` for ``deferred``; ``DONE`` for ``done``; ``OPEN`` for
+    every other status.  ``DEFERRED`` and ``DONE`` are kept distinct from ``CLOSED``
+    because each calls for a different action from the caller.
+    """
+    if not status:
+        return OwnerLiveness.CLOSED
+    if status == TaskStatus.DEFERRED:
+        return OwnerLiveness.DEFERRED
+    if status == TaskStatus.DONE:
+        return OwnerLiveness.DONE
+    return OwnerLiveness.CLOSED if status in TERMINAL else OwnerLiveness.OPEN

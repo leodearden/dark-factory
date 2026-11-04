@@ -11,9 +11,8 @@ them together.
 
 This module pins the paginated read primitive (``_paged_ro_query``), its four
 fail-closed completeness paths, the two task-4340 methods routed through it,
-the three task-4869 reads routed through it (the two stale-embedding reads and
-``query_edges_by_time_range``), and ``retrieve_episodes``' keyset reader
-(``_read_all_group_episodes``).
+and the three task-4869 reads routed through it (the two stale-embedding reads
+and ``query_edges_by_time_range``).
 
 ``FakeCappedGraph`` is a purpose-built double rather than a ``make_graph_mock``
 variant because it needs stateful multi-page behaviour and a query log.  It
@@ -26,9 +25,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import re
-import types
-from datetime import UTC, datetime, timedelta
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 import pytest_asyncio
@@ -42,6 +39,7 @@ from _fm_helpers import (
 )
 from falkordb.asyncio import FalkorDB
 
+from fused_memory.backends.falkor_string_bounds import exact_string_upper_bound
 from fused_memory.backends.graphiti_client import (
     INCOMPLETE_CENSUS_UNAVAILABLE,
     INCOMPLETE_SHORT_READ,
@@ -83,9 +81,7 @@ class FakeCappedGraph:
     """A graph double that reproduces FalkorDB's silent server-side row cap.
 
     This is the ONLY ro_query-level double in the suite that reproduces the
-    server cap; ``FakeCappedEpisodeStore`` is its graphiti-core-API
-    counterpart and shares ``_LIVE_RESULTSET_CAP``.
-    ``conftest.make_graph_mock`` deliberately does not, so the two cannot
+    server cap.  ``conftest.make_graph_mock`` deliberately does not, so the two cannot
     drift; it shares this module's census pattern exactly (``_CENSUS_RE``).
 
     Behaviour, keyed off the cypher text:
@@ -752,6 +748,98 @@ class TestIncompleteKindDiscriminator:
 
 
 # ---------------------------------------------------------------------------
+# task 4914: ReadCompleteness, the verdict a consumer reports for one read
+# ---------------------------------------------------------------------------
+
+_EVERY_INCOMPLETE_KIND = sorted(
+    INCOMPLETE_STRUCTURAL_KINDS | {INCOMPLETE_CENSUS_UNAVAILABLE, INCOMPLETE_SHORT_READ}
+)
+
+
+def test_incomplete_kinds_is_the_whole_vocabulary():
+    """The structural kinds plus the two empirical ones, and nothing else."""
+    from fused_memory.backends.graphiti_client import INCOMPLETE_KINDS
+
+    assert sorted(INCOMPLETE_KINDS) == _EVERY_INCOMPLETE_KIND
+
+
+class TestReadCompleteness:
+    """``ReadCompleteness.of`` is the one PagedRead -> (complete, kind) projection."""
+
+    def test_of_a_complete_read_is_complete_with_no_kind(self):
+        from fused_memory.backends.graphiti_client import ReadCompleteness
+
+        assert ReadCompleteness.of(complete_paged_read()) == ReadCompleteness(
+            complete=True, incomplete_kind=None
+        )
+
+    @pytest.mark.parametrize('kind', _EVERY_INCOMPLETE_KIND)
+    def test_of_an_incomplete_read_carries_its_kind(self, kind):
+        from fused_memory.backends.graphiti_client import ReadCompleteness
+
+        assert ReadCompleteness.of(incomplete_paged_read(kind)) == ReadCompleteness(
+            complete=False, incomplete_kind=kind
+        )
+
+    @pytest.mark.parametrize(
+        'complete, kind',
+        [
+            pytest.param(True, INCOMPLETE_SHORT_READ, id='complete-with-a-kind'),
+            pytest.param(False, None, id='incomplete-without-a-kind'),
+        ],
+    )
+    def test_kind_must_be_none_exactly_when_complete(self, complete, kind):
+        """Both directions of the invariant are refused at construction, naming both values."""
+        from fused_memory.backends.graphiti_client import ReadCompleteness
+
+        with pytest.raises(ValueError) as excinfo:
+            ReadCompleteness(complete=complete, incomplete_kind=kind)
+        message = str(excinfo.value)
+        assert f'complete={complete!r}' in message
+        assert f'incomplete_kind={kind!r}' in message
+
+    def test_an_unknown_kind_is_refused(self):
+        """A misspelt kind would fall out of every ``in INCOMPLETE_STRUCTURAL_KINDS`` gate."""
+        from fused_memory.backends.graphiti_client import ReadCompleteness
+
+        with pytest.raises(ValueError, match='shortread'):
+            ReadCompleteness(complete=False, incomplete_kind='shortread')
+
+    @pytest.mark.parametrize(
+        'complete, kind',
+        [
+            pytest.param(True, None, id='complete'),
+            pytest.param(False, INCOMPLETE_SHORT_READ, id='incomplete'),
+        ],
+    )
+    def test_result_keys_flatten_a_verdict_under_its_prefix(self, complete, kind):
+        from fused_memory.backends.graphiti_client import ReadCompleteness
+
+        verdict = ReadCompleteness(complete=complete, incomplete_kind=kind)
+        assert ReadCompleteness.result_keys('edges', verdict) == {
+            'edges_complete': complete,
+            'edges_incomplete_kind': kind,
+        }
+
+    def test_result_keys_of_no_verdict_are_both_none(self):
+        from fused_memory.backends.graphiti_client import ReadCompleteness
+
+        assert ReadCompleteness.result_keys('entities', None) == {
+            'entities_complete': None,
+            'entities_incomplete_kind': None,
+        }
+
+    def test_is_frozen(self):
+        import dataclasses
+
+        from fused_memory.backends.graphiti_client import ReadCompleteness
+
+        verdict = ReadCompleteness(complete=True, incomplete_kind=None)
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            verdict.complete = False  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
 # step-5: enumerate_all_valid_edges, and get_all_valid_edges as its shim
 # ---------------------------------------------------------------------------
 
@@ -841,7 +929,7 @@ class TestGetAllValidEdgesPagination:
         assert grouped
         messages = _warnings(caplog)
         assert messages
-        assert any('get_all_valid_edges' in m for m in messages)
+        assert any('enumerate_all_valid_edges' in m for m in messages)
         assert any(str(_LIVE_EDGE_ROWS) in m for m in messages)
 
     @pytest.mark.asyncio
@@ -996,6 +1084,118 @@ class TestGetAllValidEdgesBehaviourPreserved:
 
 
 # ---------------------------------------------------------------------------
+# task 4851: enumerate_valid_edges_mentioning, the narrowed per-task edge read
+# ---------------------------------------------------------------------------
+
+_MENTIONING_NEEDLE = '4851'
+
+# Double attribution (A/B on e1), a page-straddling repeat of (A, e1) and two
+# more edges, so page_size=2 spans three pages.
+_MENTIONING_CORPUS = [
+    ['A', 'e1', 'f1', 'n1'],
+    ['B', 'e1', 'f1', 'n1'],
+    ['A', 'e1', 'f1', 'n1'],
+    ['C', 'e2', 'f2', 'n2'],
+    ['C', 'e3', 'f3', 'n3'],
+]
+
+
+class TestEnumerateValidEdgesMentioning:
+    """The narrowed read pages, census-checks and binds its needle. (task 4851)
+
+    FakeCappedGraph does not evaluate CONTAINS: its corpus stands for the rows
+    the predicate already matched. These tests therefore pin the emitted
+    query, the binding, the paging and the grouping, not the server's filter.
+    """
+
+    @pytest.fixture
+    def run(self, mock_config, make_backend):
+        async def _run(graph, substring=_MENTIONING_NEEDLE, **kwargs):
+            backend = make_backend(mock_config)
+            _wire(backend, graph)
+            return await backend.enumerate_valid_edges_mentioning(
+                substring, group_id='test', **kwargs
+            )
+
+        return _run
+
+    @pytest.mark.asyncio
+    async def test_page_and_census_share_the_narrowed_population(self, run):
+        graph = FakeCappedGraph(list(_MENTIONING_CORPUS))
+        await run(graph, page_size=2)
+
+        assert graph.page_queries and graph.census_queries
+        for query in graph.page_queries + graph.census_queries:
+            assert 'MATCH (n:Entity)-[e:RELATES_TO]-()' in query
+            assert 'e.invalid_at IS NULL' in query
+            assert 'e.fact CONTAINS $substring' in query
+        for census in graph.census_queries:
+            assert census.strip().endswith('count(*)')
+            assert 'SKIP' not in census.upper()
+
+    @pytest.mark.asyncio
+    async def test_the_needle_is_bound_never_interpolated(self, run):
+        graph = FakeCappedGraph(list(_MENTIONING_CORPUS))
+        await run(graph, page_size=2)
+
+        assert graph.params
+        assert all(p == {'substring': _MENTIONING_NEEDLE} for p in graph.params)
+        assert not any(_MENTIONING_NEEDLE in query for query in graph.queries)
+
+    @pytest.mark.asyncio
+    async def test_a_multi_page_corpus_comes_back_whole_and_grouped_like_the_full_read(
+        self, run, mock_config, make_backend
+    ):
+        grouped, paged = await run(FakeCappedGraph(list(_MENTIONING_CORPUS)), page_size=2)
+
+        full_backend = make_backend(mock_config)
+        _wire(full_backend, FakeCappedGraph(list(_MENTIONING_CORPUS)))
+        full_grouped, _ = await full_backend.enumerate_all_valid_edges(
+            group_id='test', page_size=2
+        )
+
+        assert paged.complete is True
+        assert len(paged.rows) == len(_MENTIONING_CORPUS)
+        assert grouped == full_grouped
+        assert grouped['A'] == [{'uuid': 'e1', 'fact': 'f1', 'name': 'n1'}]
+        assert grouped['B'] == [{'uuid': 'e1', 'fact': 'f1', 'name': 'n1'}]
+        assert total_attributions(grouped) == 4
+
+    @pytest.mark.asyncio
+    async def test_a_disagreeing_census_reports_incomplete_and_still_returns(self, run):
+        grouped, paged = await run(
+            FakeCappedGraph(
+                list(_MENTIONING_CORPUS),
+                census_override=len(_MENTIONING_CORPUS) + 5,
+            ),
+            page_size=2,
+        )
+
+        assert paged.complete is False
+        assert isinstance(paged.reason, str) and paged.reason
+        assert distinct_edge_uuids(grouped) == {'e1', 'e2', 'e3'}
+
+    @pytest.mark.asyncio
+    async def test_an_empty_substring_is_refused_before_any_query(self, run):
+        """An empty CONTAINS matches every edge: a silent full read."""
+        graph = FakeCappedGraph(list(_MENTIONING_CORPUS))
+
+        with pytest.raises(ValueError, match='substring'):
+            await run(graph, substring='')
+
+        assert graph.queries == []
+
+    @pytest.mark.asyncio
+    async def test_page_query_orders_by_a_total_order(self, run):
+        graph = FakeCappedGraph(list(_MENTIONING_CORPUS))
+        await run(graph, page_size=2)
+
+        order_by = graph.page_queries[0].split('ORDER BY', 1)[1]
+        assert 'e.uuid' in order_by
+        assert 'n.uuid' in order_by
+
+
+# ---------------------------------------------------------------------------
 # step-9: enumerate_entity_nodes, and list_entity_nodes as its shim
 # ---------------------------------------------------------------------------
 #
@@ -1085,7 +1285,7 @@ class TestListEntityNodesPagination:
             nodes = await backend.list_entity_nodes(group_id='test')
         assert len(nodes) == _LIVE_ENTITY_NODES
         messages = _warnings(caplog)
-        assert any('list_entity_nodes' in m for m in messages)
+        assert any('enumerate_entity_nodes' in m for m in messages)
         assert any(str(_LIVE_ENTITY_NODES) in m for m in messages)
 
     @pytest.mark.asyncio
@@ -1428,7 +1628,7 @@ class TestShimsStillWarnOnEmpiricalIncompleteness:
         assert grouped
         assert len(distinct_edge_uuids(grouped)) == _LIVE_DISTINCT_EDGES
         messages = _warnings(caplog)
-        assert any('get_all_valid_edges' in m for m in messages)
+        assert any('enumerate_all_valid_edges' in m for m in messages)
 
         _, paged = await backend.enumerate_all_valid_edges(group_id='test')
         assert paged.incomplete_kind == getattr(graphiti_client, kind_name)
@@ -1462,7 +1662,7 @@ class TestShimsStillWarnOnEmpiricalIncompleteness:
 
         assert len(nodes) == _LIVE_ENTITY_NODES
         messages = _warnings(caplog)
-        assert any('list_entity_nodes' in m for m in messages)
+        assert any('enumerate_entity_nodes' in m for m in messages)
 
         _, paged = await backend.enumerate_entity_nodes(group_id='test')
         assert paged.incomplete_kind == getattr(graphiti_client, kind_name)
@@ -1705,13 +1905,14 @@ class TestApplyIncompletenessPolicy:
 
 
 class TestShimPolicyIsUnchangedByThePromotion:
-    """REGRESSION: promoting the helper changed nothing a shim caller sees.
+    """REGRESSION: promoting the helper kept the shims' raise/warn split.
 
-    The shims are the pre-4386 consumer contract and stay in place (the
-    rebuild write-path still depends on their fail-closed raise), so the
+    The shims are the pre-4386 consumer contract and stay in place, so the
     promotion has to be provably behaviour-preserving for them. Driven
     through the REAL backend against `FakeCappedGraph` rather than against a
-    stubbed policy, so it exercises the actual wiring.
+    stubbed policy, so it exercises the actual wiring.  Their warning names
+    the enumeration they read through, the same name every other consumer of
+    that read logs (task 4914).
     """
 
     @pytest.mark.asyncio
@@ -1749,7 +1950,7 @@ class TestShimPolicyIsUnchangedByThePromotion:
         with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
             grouped = await backend.get_all_valid_edges(group_id='test')
         assert len(distinct_edge_uuids(grouped)) == _LIVE_DISTINCT_EDGES
-        assert any('get_all_valid_edges' in m for m in _warnings(caplog))
+        assert any('enumerate_all_valid_edges' in m for m in _warnings(caplog))
 
         caplog.clear()
         _wire(
@@ -1761,7 +1962,7 @@ class TestShimPolicyIsUnchangedByThePromotion:
         with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
             nodes = await backend.list_entity_nodes(group_id='test')
         assert len(nodes) == _LIVE_ENTITY_NODES
-        assert any('list_entity_nodes' in m for m in _warnings(caplog))
+        assert any('enumerate_entity_nodes' in m for m in _warnings(caplog))
 
 
 # ---------------------------------------------------------------------------
@@ -1916,12 +2117,25 @@ class DualCorpusGraph:
 
     ``FakeCappedGraph`` holds one corpus and cannot represent "the node read
     succeeded and the edge read did not", which is the only shape in which
-    this defect is visible.
+    this defect is visible.  ``node_graph_kwargs`` / ``edge_graph_kwargs`` are
+    forwarded to the matching inner ``FakeCappedGraph``, so each corpus's
+    census can be bent independently.
     """
 
-    def __init__(self, node_rows: list[list], edge_rows: list[list]):
-        self._nodes = FakeCappedGraph(node_rows, resultset_cap=None)
-        self._edges = FakeCappedGraph(edge_rows, resultset_cap=None)
+    def __init__(
+        self,
+        node_rows: list[list],
+        edge_rows: list[list],
+        *,
+        node_graph_kwargs: dict | None = None,
+        edge_graph_kwargs: dict | None = None,
+    ):
+        self._nodes = FakeCappedGraph(
+            node_rows, resultset_cap=None, **(node_graph_kwargs or {})
+        )
+        self._edges = FakeCappedGraph(
+            edge_rows, resultset_cap=None, **(edge_graph_kwargs or {})
+        )
         self.queries: list[str] = []
 
     def _delegate(self, cypher: str):
@@ -1935,6 +2149,21 @@ class DualCorpusGraph:
         raise AssertionError('read paths must use ro_query, never query')
 
 
+def _force_paged_kwargs_for(monkeypatch, *, edge_read: bool, **forced):
+    """Force ``_paged_ro_query`` kwargs for ONE of the two reads, by page template."""
+    from fused_memory.backends import graphiti_client
+
+    real = graphiti_client._paged_ro_query
+
+    async def dispatching(*args, **kwargs):
+        page_template = args[1] if len(args) > 1 else kwargs.get('page_template', '')
+        if ('RELATES_TO' in page_template) == edge_read:
+            kwargs = {**kwargs, **forced}
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(graphiti_client, '_paged_ro_query', dispatching)
+
+
 def force_edge_read_only(monkeypatch, **forced):
     """Force ``_paged_ro_query`` kwargs for the EDGE read alone.
 
@@ -1942,17 +2171,12 @@ def force_edge_read_only(monkeypatch, **forced):
     Without this the two reads fail in lockstep on the shared default page
     size, which masks the defect — see the section comment above.
     """
-    from fused_memory.backends import graphiti_client
+    _force_paged_kwargs_for(monkeypatch, edge_read=True, **forced)
 
-    real = graphiti_client._paged_ro_query
 
-    async def dispatching(*args, **kwargs):
-        page_template = args[1] if len(args) > 1 else kwargs.get('page_template', '')
-        if 'RELATES_TO' in page_template:
-            kwargs = {**kwargs, **forced}
-        return await real(*args, **kwargs)
-
-    monkeypatch.setattr(graphiti_client, '_paged_ro_query', dispatching)
+def force_node_read_only(monkeypatch, **forced):
+    """Force ``_paged_ro_query`` kwargs for the NODE read alone; the mirror of the above."""
+    _force_paged_kwargs_for(monkeypatch, edge_read=False, **forced)
 
 
 def _healthy_entities(count: int = 5) -> list[list]:
@@ -2053,6 +2277,208 @@ class TestStructuralRefusalProducesNoStaleVerdicts:
             result = await backend.detect_stale_with_edges(group_id='test')
         # Nothing was returned, so nothing with a non-empty .stale was either.
         assert result is sentinel
+
+
+_STRUCTURAL_FORCINGS = [
+    pytest.param(
+        {'page_size': _LIVE_RESULTSET_CAP, 'resultset_size': _LIVE_RESULTSET_CAP},
+        id='refusal',
+    ),
+    pytest.param({'page_size': 2, 'max_pages': 1}, id='page-cap'),
+]
+
+
+class TestDetectStaleWithEdgesReportsBothReads:
+    """detect_stale_with_edges returns BOTH read verdicts, each from its own read.
+
+    The node read and the edge read truncate independently, so one verdict
+    cannot stand for the other.  Driven through the real ``_paged_ro_query``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_healthy_reads_report_both_complete(self, mock_config, make_backend):
+        from fused_memory.backends.graphiti_client import ReadCompleteness
+
+        backend = make_backend(mock_config)
+        _wire(backend, DualCorpusGraph(_healthy_entities(), _healthy_edges()))
+        result = await backend.detect_stale_with_edges(group_id='test')
+        complete = ReadCompleteness(complete=True, incomplete_kind=None)
+        assert result.entities_completeness == complete
+        assert result.edges_completeness == complete
+        assert result.stale == []
+
+    @pytest.mark.asyncio
+    async def test_short_edge_read_is_reported_on_the_edge_verdict_only(
+        self, mock_config, make_backend
+    ):
+        """Empirical, so it warns and still returns a result rather than raising."""
+        from fused_memory.backends.graphiti_client import ReadCompleteness
+
+        edges = _healthy_edges()
+        backend = make_backend(mock_config)
+        _wire(backend, DualCorpusGraph(
+            _healthy_entities(), edges,
+            edge_graph_kwargs={'census_override': len(edges) + 3},
+        ))
+        result = await backend.detect_stale_with_edges(group_id='test')
+        assert result.edges_completeness == ReadCompleteness(
+            complete=False, incomplete_kind=INCOMPLETE_SHORT_READ
+        )
+        assert result.entities_completeness.complete is True
+        assert result.total_count == 5
+
+    @pytest.mark.asyncio
+    async def test_unavailable_node_census_is_reported_on_the_node_verdict_only(
+        self, mock_config, make_backend
+    ):
+        from fused_memory.backends.graphiti_client import ReadCompleteness
+
+        backend = make_backend(mock_config)
+        _wire(backend, DualCorpusGraph(
+            _healthy_entities(), _healthy_edges(),
+            node_graph_kwargs={'census_result_set': [], 'census_result_set_set': True},
+        ))
+        result = await backend.detect_stale_with_edges(group_id='test')
+        assert result.entities_completeness == ReadCompleteness(
+            complete=False, incomplete_kind=INCOMPLETE_CENSUS_UNAVAILABLE
+        )
+        assert result.edges_completeness.complete is True
+
+    @pytest.mark.asyncio
+    async def test_each_verdict_carries_its_own_kind(self, mock_config, make_backend):
+        """Both incomplete, with DIFFERENT kinds: no cross-contamination between reads."""
+        from fused_memory.backends.graphiti_client import ReadCompleteness
+
+        edges = _healthy_edges()
+        backend = make_backend(mock_config)
+        _wire(backend, DualCorpusGraph(
+            _healthy_entities(), edges,
+            node_graph_kwargs={'census_result_set': [], 'census_result_set_set': True},
+            edge_graph_kwargs={'census_override': len(edges) + 3},
+        ))
+        result = await backend.detect_stale_with_edges(group_id='test')
+        assert result.entities_completeness == ReadCompleteness(
+            complete=False, incomplete_kind=INCOMPLETE_CENSUS_UNAVAILABLE
+        )
+        assert result.edges_completeness == ReadCompleteness(
+            complete=False, incomplete_kind=INCOMPLETE_SHORT_READ
+        )
+
+    @pytest.mark.asyncio
+    async def test_empirical_warnings_go_to_the_given_log(
+        self, mock_config, make_backend, caplog
+    ):
+        """Both reads' policy warnings; ``_paged_ro_query``'s own diagnostics stay on the backend's."""
+        edges = _healthy_edges()
+        backend = make_backend(mock_config)
+        _wire(backend, DualCorpusGraph(
+            _healthy_entities(), edges,
+            node_graph_kwargs={'census_result_set': [], 'census_result_set_set': True},
+            edge_graph_kwargs={'census_override': len(edges) + 3},
+        ))
+        caller_log = logging.getLogger('test.detect_stale.caller')
+        with caplog.at_level(logging.WARNING):
+            await backend.detect_stale_with_edges(group_id='test', log=caller_log)
+
+        policy_warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and 'enumeration INCOMPLETE' in r.getMessage()
+        ]
+        assert [r.name for r in policy_warnings] == [caller_log.name, caller_log.name]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('forced', _STRUCTURAL_FORCINGS)
+    async def test_structural_node_read_raises(
+        self, forced, mock_config, make_backend, monkeypatch
+    ):
+        """A refused node read is ``[]`` entities: zero verdicts and, without the policy, no raise."""
+        from fused_memory.backends import graphiti_client
+
+        backend = make_backend(mock_config)
+        _wire(backend, DualCorpusGraph(_healthy_entities(), _healthy_edges()))
+        force_node_read_only(monkeypatch, **forced)
+
+        _, node_paged = await backend.enumerate_entity_nodes(group_id='test')
+        assert node_paged.incomplete_kind in INCOMPLETE_STRUCTURAL_KINDS
+
+        with pytest.raises(graphiti_client.IncompleteEnumerationError):
+            await backend.detect_stale_with_edges(group_id='test')
+
+
+# ---------------------------------------------------------------------------
+# task 4914: the checked reads — each enumeration wired to the policy once
+# ---------------------------------------------------------------------------
+
+_CHECKED_NODES = [{'uuid': 'u1', 'name': 'Alice', 'summary': 'a real summary'}]
+_CHECKED_EDGES = {'u1': [{'uuid': 'e1', 'fact': 'a real summary', 'name': 'knows'}]}
+_CHECKED_READS = [
+    pytest.param('read_entity_nodes_checked', 'nodes_read', _CHECKED_NODES, id='nodes'),
+    pytest.param('read_all_valid_edges_checked', 'edges_read', _CHECKED_EDGES, id='edges'),
+]
+
+
+class TestCheckedReads:
+    """A checked read is its ``enumerate_*`` call plus the shared policy, returning the verdict.
+
+    Driven through a real backend whose ``enumerate_*`` seam is stubbed.
+    """
+
+    @pytest.fixture
+    def checked_read(self, mock_config, make_backend, make_edge_backend):
+        """callable(reader_name, read_kwarg, paged) -> awaitable of the checked read."""
+        from fused_memory.backends import graphiti_client
+
+        def _call(reader_name, read_kwarg, paged, **kwargs):
+            backend = make_edge_backend(
+                make_backend(mock_config),
+                nodes=_CHECKED_NODES, edges=_CHECKED_EDGES, **{read_kwarg: paged},
+            )
+            reader = getattr(graphiti_client, reader_name)
+            return reader(backend, group_id='test', **kwargs)
+
+        return _call
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('reader_name, read_kwarg, collection', _CHECKED_READS)
+    async def test_a_complete_read_returns_its_collection_and_a_complete_verdict(
+        self, reader_name, read_kwarg, collection, checked_read
+    ):
+        from fused_memory.backends.graphiti_client import ReadCompleteness
+
+        got, verdict = await checked_read(reader_name, read_kwarg, complete_paged_read())
+        assert got == collection
+        assert verdict == ReadCompleteness(complete=True, incomplete_kind=None)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('reader_name, read_kwarg, collection', _CHECKED_READS)
+    async def test_an_empirical_read_warns_on_the_given_log_and_returns_its_verdict(
+        self, reader_name, read_kwarg, collection, checked_read, caplog
+    ):
+        from fused_memory.backends.graphiti_client import ReadCompleteness
+
+        caller_log = logging.getLogger('test.checked_read.caller')
+        with caplog.at_level(logging.WARNING):
+            got, verdict = await checked_read(
+                reader_name, read_kwarg, incomplete_paged_read(INCOMPLETE_SHORT_READ),
+                log=caller_log,
+            )
+        assert got == collection
+        assert verdict == ReadCompleteness(
+            complete=False, incomplete_kind=INCOMPLETE_SHORT_READ
+        )
+        warned_under = {r.name for r in caplog.records if r.levelno == logging.WARNING}
+        assert warned_under == {caller_log.name}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('reader_name, read_kwarg, collection', _CHECKED_READS)
+    @pytest.mark.parametrize('kind', sorted(INCOMPLETE_STRUCTURAL_KINDS))
+    async def test_a_structural_read_raises(
+        self, reader_name, read_kwarg, collection, kind, checked_read
+    ):
+        from fused_memory.backends.graphiti_client import IncompleteEnumerationError
+
+        with pytest.raises(IncompleteEnumerationError):
+            await checked_read(reader_name, read_kwarg, incomplete_paged_read(kind))
 
 
 # ---------------------------------------------------------------------------
@@ -2316,12 +2742,15 @@ class TestQueryEdgesByTimeRangePagination:
             backend, FakeCappedGraph(make_windowed_edge_corpus(self.WINDOW_EDGES))
         )
         await _edges_in_window(backend)
-        where = 'e.valid_at >= $start AND e.valid_at <= $end'
+        where = 'e.valid_at >= $start AND ' + exact_string_upper_bound(
+            'e.valid_at', 'end', inclusive=True,
+        )
         assert len(graph.queries) == (
             len(graph.census_queries) + len(graph.page_queries)
         )
         census = graph.census_queries[0]
         assert where in census
+        assert 'e.valid_at <= $end' not in census
         assert census.rstrip().endswith('RETURN count(*)')
         assert 'SKIP' not in census.upper()
         population = census.rsplit('RETURN count(*)', 1)[0]
@@ -2404,166 +2833,3 @@ class TestQueryEdgesByTimeRangePagination:
             'valid_at': '2026-03-22T17:51:00',
             'invalid_at': '2026-03-22T18:00:00',
         }]
-
-
-# ---------------------------------------------------------------------------
-# task 4869: retrieve_episodes, keyset-paged through graphiti-core
-# ---------------------------------------------------------------------------
-#
-# This read reaches the server through EpisodicNode.get_by_group_ids, not
-# ro_query, so the cap bites one layer further from this module. It is the
-# worst-shaped truncation of all: graphiti-core orders by uuid DESC, so a capped
-# read drops the LOWEST uuids, and the created_at sort then picks the
-# most-recent of the SURVIVORS. The caller gets the wrong episodes, not fewer.
-
-
-class FakeCappedEpisodeStore:
-    """graphiti-core-API counterpart of FakeCappedGraph, for episode reads.
-
-    ``get_by_group_ids`` models graphiti-core's contract exactly: uuid DESC,
-    ``uuid < uuid_cursor`` when a cursor is given, ``limit`` when not None —
-    then SILENT truncation to ``resultset_cap``, as the server does. Each call's
-    ``(limit, uuid_cursor)`` is logged in ``calls`` and the uuids it returned
-    in ``pages``.
-    """
-
-    def __init__(self, episodes, *, resultset_cap: int | None = _LIVE_RESULTSET_CAP):
-        self.episodes = list(episodes)
-        self.resultset_cap = resultset_cap
-        self.calls: list[tuple[int | None, str | None]] = []
-        self.pages: list[list[str]] = []
-
-    async def get_by_group_ids(self, driver, group_ids, limit=None, uuid_cursor=None):
-        self.calls.append((limit, uuid_cursor))
-        page = sorted(self.episodes, key=lambda ep: ep.uuid, reverse=True)
-        if uuid_cursor:
-            page = [ep for ep in page if ep.uuid < uuid_cursor]
-        if limit is not None:
-            page = page[:limit]
-        if self.resultset_cap is not None:
-            page = page[: self.resultset_cap]
-        self.pages.append([ep.uuid for ep in page])
-        return page
-
-
-_EPISODE_BASE_TIME = datetime(2026, 9, 24, 12, 0, tzinfo=UTC)
-
-
-def make_episode_corpus(count: int) -> list[types.SimpleNamespace]:
-    """Episodes whose NEWEST members have the LOWEST uuids.
-
-    That is exactly the tail a uuid-DESC truncation drops, so a capped read
-    selects the wrong most-recent episodes rather than merely fewer.
-    """
-    return [
-        types.SimpleNamespace(
-            uuid=f'ep-{i:07d}',
-            created_at=_EPISODE_BASE_TIME - timedelta(minutes=i),
-            name=f'episode-{i}',
-            content=f'content-{i}',
-            source='message',
-            group_id='dark_factory',
-        )
-        for i in range(count)
-    ]
-
-
-def _patch_episode_store(store: FakeCappedEpisodeStore):
-    return patch(
-        'fused_memory.backends.graphiti_client.EpisodicNode.get_by_group_ids',
-        store.get_by_group_ids,
-    )
-
-
-class TestRetrieveEpisodesKeysetPagination:
-    """Every episode is read, so the created_at sort sees the whole group."""
-
-    CORPUS_SIZE = 12000  # comfortably above the 10000 cap
-
-    @pytest.mark.asyncio
-    async def test_control_an_unbounded_read_drops_the_newest_episodes(self):
-        """CONTROL: the double reproduces the defect it stands in for."""
-        store = FakeCappedEpisodeStore(make_episode_corpus(self.CORPUS_SIZE))
-        episodes = await store.get_by_group_ids(MagicMock(), ['g'], limit=None)
-        assert len(episodes) == _LIVE_RESULTSET_CAP
-        returned = {ep.uuid for ep in episodes}
-        assert not returned & {f'ep-{i:07d}' for i in range(2000)}
-
-    @pytest.mark.asyncio
-    async def test_the_most_recent_episodes_are_selected(self, mock_config, make_backend):
-        """HEADLINE: the newest five, not the newest five of the survivors."""
-        backend = make_backend(mock_config)
-        store = FakeCappedEpisodeStore(make_episode_corpus(self.CORPUS_SIZE))
-        with _patch_episode_store(store):
-            result = await backend.retrieve_episodes(group_ids=['dark_factory'], last_n=5)
-        assert [ep.uuid for ep in result] == [f'ep-{i:07d}' for i in range(5)]
-
-    @pytest.mark.asyncio
-    async def test_every_episode_is_reachable(self, mock_config, make_backend):
-        backend = make_backend(mock_config)
-        store = FakeCappedEpisodeStore(make_episode_corpus(self.CORPUS_SIZE))
-        with _patch_episode_store(store):
-            result = await backend.retrieve_episodes(
-                group_ids=['dark_factory'], last_n=self.CORPUS_SIZE
-            )
-        assert len({ep.uuid for ep in result}) == self.CORPUS_SIZE
-
-    @pytest.mark.asyncio
-    async def test_every_call_is_bounded_and_the_cursor_advances(
-        self, mock_config, make_backend
-    ):
-        backend = make_backend(mock_config)
-        store = FakeCappedEpisodeStore(make_episode_corpus(self.CORPUS_SIZE))
-        with _patch_episode_store(store):
-            await backend.retrieve_episodes(group_ids=['dark_factory'], last_n=5)
-        assert len(store.calls) > 1
-        assert all(limit is not None for limit, _ in store.calls)
-        assert store.calls[0][1] is None
-        for previous_page, (_, cursor) in zip(
-            store.pages[:-1], store.calls[1:], strict=True
-        ):
-            assert cursor == min(previous_page)
-
-    @pytest.mark.asyncio
-    async def test_a_server_cap_below_page_size_cannot_truncate_the_read(self):
-        """Only an EMPTY page ends the read, so a short page is never mistaken
-        for end-of-data. That is what makes a census unnecessary here."""
-        from fused_memory.backends.graphiti_client import _read_all_group_episodes
-
-        store = FakeCappedEpisodeStore(make_episode_corpus(10), resultset_cap=3)
-        with _patch_episode_store(store):
-            episodes = await _read_all_group_episodes(MagicMock(), ['g'], page_size=5)
-        assert {ep.uuid for ep in episodes} == {f'ep-{i:07d}' for i in range(10)}
-
-    @pytest.mark.asyncio
-    async def test_page_cap_exhaustion_raises_instead_of_returning_a_prefix(self):
-        from fused_memory.backends.graphiti_client import (
-            INCOMPLETE_PAGE_CAP,
-            IncompleteEnumerationError,
-            _read_all_group_episodes,
-        )
-
-        store = FakeCappedEpisodeStore(make_episode_corpus(10))
-        with (
-            _patch_episode_store(store),
-            pytest.raises(IncompleteEnumerationError) as exc,
-        ):
-            await _read_all_group_episodes(
-                MagicMock(), ['g'], page_size=2, max_pages=3
-            )
-        message = str(exc.value)
-        assert INCOMPLETE_PAGE_CAP in message
-        assert 'max_pages=3' in message
-        assert 'page_size=2' in message
-        assert 'episodes_seen=6' in message
-
-    @pytest.mark.asyncio
-    async def test_an_empty_group_returns_empty_after_one_call(
-        self, mock_config, make_backend
-    ):
-        backend = make_backend(mock_config)
-        store = FakeCappedEpisodeStore([])
-        with _patch_episode_store(store):
-            result = await backend.retrieve_episodes(group_ids=['dark_factory'], last_n=5)
-        assert result == []
-        assert len(store.calls) == 1

@@ -1,0 +1,18 @@
+{
+  "task_id": "5037",
+  "reason": "Task 5037 rewrote the line 'from orchestrator.landed_outbox import LandedOutbox, MergeProvenance  # noqa: E402' in orchestrator/tests/conftest.py, which changed its INV-12 inline-suppression key, so scripts/inline_suppressions.py --check rejected the suppression as new and unowned. Rather than mint a debt owner for it, the import moved into _isolated_merge_provenance, the only fixture that uses the two names, where it needs no E402 suppression. That trades one suppression for one function-local import (6 -> 7); lines hold at 1254.",
+  "measures": [
+    {
+      "measure": "function_local_imports",
+      "key": "orchestrator/tests/conftest.py",
+      "baseline": 6,
+      "current": 7
+    },
+    {
+      "measure": "total:function_local_imports",
+      "key": "<cluster>",
+      "baseline": 22,
+      "current": 23
+    }
+  ]
+}

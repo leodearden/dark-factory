@@ -1,0 +1,233 @@
+{
+  "arms": [
+    {
+      "arm_id": "qwen3.5-9b",
+      "gates": [
+        {
+          "bound": null,
+          "detail": "harness.py smoke --arm-spec exited 0",
+          "gate": "conformance-smoke",
+          "margin": null,
+          "unit": null,
+          "value": null,
+          "verdict": "PASS"
+        },
+        {
+          "bound": 17020.0,
+          "detail": "lms_vram.evaluate_budget PASS: the arm took 14.55 GiB (21972 - 7071 MiB), within the 16.62 GiB budget free before it started",
+          "gate": "vram-fit",
+          "margin": 2119.0,
+          "unit": "MiB",
+          "value": 14901.0,
+          "verdict": "PASS"
+        },
+        {
+          "bound": 28672.0,
+          "detail": "longest of 15 server-reported prompts against max_model_len 32768 - max_tokens 4096",
+          "gate": "context-fit",
+          "margin": 27381.0,
+          "unit": "tokens",
+          "value": 1291.0,
+          "verdict": "PASS"
+        },
+        {
+          "bound": 60000.0,
+          "detail": "no ok episode, so no warm p95 under load: 0/6 episodes ok; fastest attempted 120008 ms",
+          "gate": "throughput-floor",
+          "margin": null,
+          "unit": "ms",
+          "value": null,
+          "verdict": "FAIL"
+        }
+      ],
+      "reasoning": "on",
+      "reported": {
+        "abort_item_count": 5,
+        "call_duration_p50_ms": 59404.28466722369,
+        "call_duration_p95_ms": 128238.67042921484,
+        "calls_per_ok_episode_max": null,
+        "calls_per_ok_episode_p50": null,
+        "conformance_rate": 0.6666666666666666,
+        "episode_failure_rate": 1.0,
+        "error_classes": [
+          {
+            "count": 6,
+            "error_class": "TimeoutError"
+          }
+        ],
+        "graph_sameness_mean_entity_jaccard": null,
+        "graph_sameness_n": 0,
+        "health_verdict": "PASS",
+        "incomplete": true,
+        "latency_p50_ms": null,
+        "length_truncations": 9,
+        "other_model_calls": 0,
+        "own_model_calls": 15,
+        "rejected_calls": 0,
+        "tokens_per_episode": null,
+        "top_level_entities_named": 4
+      },
+      "served": true,
+      "stack": "vllm",
+      "survives": false
+    },
+    {
+      "arm_id": "phi-4-14b",
+      "gates": [
+        {
+          "bound": null,
+          "detail": "harness.py smoke --arm-spec exited 0",
+          "gate": "conformance-smoke",
+          "margin": null,
+          "unit": null,
+          "value": null,
+          "verdict": "PASS"
+        },
+        {
+          "bound": 17021.0,
+          "detail": "lms_vram.evaluate_budget PASS: the arm took 15.92 GiB (23372 - 7071 MiB), within the 16.62 GiB budget free before it started",
+          "gate": "vram-fit",
+          "margin": 720.0,
+          "unit": "MiB",
+          "value": 16301.0,
+          "verdict": "PASS"
+        },
+        {
+          "bound": 12288.0,
+          "detail": "1 of 156 'phi-4-14b' calls report no prompt length, so the longest prompt is unknown (longest of the 155 reported: 4065 tokens): 1x status 502: {\"error\": {\"message\": \"usage tap: upstream 127.0.0.1:8412 failed: RemoteDisconnected: Remote end closed connection without response\", \"type\": \"usage_tap\"}}",
+          "gate": "context-fit",
+          "margin": null,
+          "unit": "tokens",
+          "value": null,
+          "verdict": "UNMEASURED"
+        },
+        {
+          "bound": 60000.0,
+          "detail": "warm episode-latency p95 under load, strictly below 60000 ms to pass",
+          "gate": "throughput-floor",
+          "margin": -41879.16103005409,
+          "unit": "ms",
+          "value": 101879.16103005409,
+          "verdict": "FAIL"
+        }
+      ],
+      "reasoning": "off",
+      "reported": {
+        "abort_item_count": null,
+        "call_duration_p50_ms": 2489.1300601884723,
+        "call_duration_p95_ms": 11645.514604169875,
+        "calls_per_ok_episode_max": 11,
+        "calls_per_ok_episode_p50": 8,
+        "conformance_rate": 0.9870967741935484,
+        "episode_failure_rate": 0.05,
+        "error_classes": [
+          {
+            "count": 1,
+            "error_class": "TimeoutError"
+          }
+        ],
+        "graph_sameness_mean_entity_jaccard": 0.41096075407220917,
+        "graph_sameness_n": 19,
+        "health_verdict": "PASS",
+        "incomplete": false,
+        "latency_p50_ms": 29049.880309030414,
+        "length_truncations": 2,
+        "other_model_calls": 0,
+        "own_model_calls": 156,
+        "rejected_calls": 1,
+        "tokens_per_episode": 11062.78947368421,
+        "top_level_entities_named": 2
+      },
+      "served": true,
+      "stack": "vllm",
+      "survives": false
+    },
+    {
+      "arm_id": "moe-stretch",
+      "gates": [
+        {
+          "bound": null,
+          "detail": "harness.py smoke --arm-spec exited 0",
+          "gate": "conformance-smoke",
+          "margin": null,
+          "unit": null,
+          "value": null,
+          "verdict": "PASS"
+        },
+        {
+          "bound": 17021.0,
+          "detail": "lms_vram.evaluate_budget PASS: the arm took 14.29 GiB (21700 - 7071 MiB), within the 16.62 GiB budget free before it started",
+          "gate": "vram-fit",
+          "margin": 2392.0,
+          "unit": "MiB",
+          "value": 14629.0,
+          "verdict": "PASS"
+        },
+        {
+          "bound": 12288.0,
+          "detail": "longest of 12 server-reported prompts against max_model_len 16384 - max_tokens 4096",
+          "gate": "context-fit",
+          "margin": 10410.0,
+          "unit": "tokens",
+          "value": 1878.0,
+          "verdict": "PASS"
+        },
+        {
+          "bound": 60000.0,
+          "detail": "no ok episode, so no warm p95 under load: 0/6 episodes ok; fastest attempted 120007 ms",
+          "gate": "throughput-floor",
+          "margin": null,
+          "unit": "ms",
+          "value": null,
+          "verdict": "FAIL"
+        }
+      ],
+      "reasoning": "off",
+      "reported": {
+        "abort_item_count": 5,
+        "call_duration_p50_ms": 66362.66748886555,
+        "call_duration_p95_ms": 174460.52873693407,
+        "calls_per_ok_episode_max": null,
+        "calls_per_ok_episode_p50": null,
+        "conformance_rate": 1.0,
+        "episode_failure_rate": 1.0,
+        "error_classes": [
+          {
+            "count": 6,
+            "error_class": "TimeoutError"
+          }
+        ],
+        "graph_sameness_mean_entity_jaccard": null,
+        "graph_sameness_n": 0,
+        "health_verdict": "PASS",
+        "incomplete": true,
+        "latency_p50_ms": null,
+        "length_truncations": 4,
+        "other_model_calls": 0,
+        "own_model_calls": 12,
+        "rejected_calls": 0,
+        "tokens_per_episode": null,
+        "top_level_entities_named": 4
+      },
+      "served": true,
+      "stack": "llamacpp",
+      "survives": false
+    }
+  ],
+  "cap": {
+    "binds": false,
+    "candidates": 3,
+    "cap": 3
+  },
+  "code_sha": "055e9c15a0d756704017b0d77ffbe4185155402f",
+  "corpus_sha": "850cf7c937c745b0d224a0ba975efc1c69080ad61d84c5369d06287cdd16f2e8",
+  "envelope": {
+    "episode_timeout_s": 120.0,
+    "headroom": 2.0,
+    "p95_bound_ms": 60000.0
+  },
+  "outcome": "negative-verdict",
+  "preregistration_sha": "865a017d79c6a210da157474e639fd15fe51f9e0",
+  "schema_version": 1,
+  "survivors": []
+}

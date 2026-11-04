@@ -483,3 +483,5 @@ tasks:
     delivered_check:
       kind: manual
       reason: production evidence only
+signal_leaves:
+- G

@@ -23,18 +23,18 @@ import httpx
 from _canned_mcp import CannedMCP, _raw_row
 from _dt_helpers import make_fixed_datetime_cls
 from escalation.archive import archive_dir_for_date
-from escalation.models import Escalation
+from escalation.models import DeliveredCheckOwner, Escalation
 from escalation.queue import EscalationQueue
 from fastapi.testclient import TestClient
 from shared.locking import files_to_modules
 from shared.task_statuses import TaskStatus
 
-import dashboard.data.active_tasks as active_tasks_mod
 import dashboard.data.task_snapshot as snapshot_mod
 from dashboard.api.escalations import _analytics_memo_clear
 from dashboard.app import app
 from dashboard.config import DashboardConfig
 from dashboard.data import escalation_corpus
+from dashboard.data.active_tasks import reset_task_snapshot_state
 from dashboard.data.burndown import BURNDOWN_SCHEMA, collect_snapshot
 from dashboard.data.scheduler import _scheduler_cache_clear
 
@@ -128,6 +128,13 @@ CREATE TABLE events (
 ESCALATIONS_FILED = 5
 ESCALATIONS_ARCHIVED = 3
 """Pending L1 records filed through the real queue, and how many then sit in its archive."""
+
+CHECK_OWNER: DeliveredCheckOwner = {
+    'task_id': '4',
+    'check_name': 'boundary-capability',
+    'sidecar': {'path': 'plans/boundary.capabilities.yaml', 'on_main': 'declares'},
+}
+"""The delivered_check_owner of the one dependency_capability record the check-owner scenario files."""
 
 CORPUS_TTL_GENERATIONS: Mapping[str, float] = {'a': escalation_corpus.CORPUS_TTL_SECONDS, 'b': 3600.0}
 """Each corpus generation's TTL; the counts must not depend on it."""
@@ -254,8 +261,7 @@ def _canned_roots(
     for root in roots:
         root.mkdir(parents=True)
     app.state.config = DashboardConfig(project_root=roots[0], known_project_roots=roots[1:])
-    snapshot_mod._snapshot_cache_clear()
-    active_tasks_mod._reset_root_rotation()
+    reset_task_snapshot_state()
 
     def render(at: datetime) -> dict[str, Any]:
         with patch('dashboard.api.tasks.resolve_now', new=lambda _now: at):
@@ -269,7 +275,7 @@ def _canned_roots(
         ):
             yield render
     finally:
-        snapshot_mod._snapshot_cache_clear()
+        reset_task_snapshot_state()
 
 
 def _census_family(client: TestClient, workdir: Path) -> dict[str, Any]:
@@ -452,6 +458,17 @@ def _write_memory_ops(config: DashboardConfig) -> None:
         conn.commit()
 
 
+@contextmanager
+def _memory_graphs_at_t0() -> Iterator[None]:
+    """Both clocks a /memory-graphs request reads, pinned to T0: the journal
+    read's as_of and the route's served_at."""
+    with (
+        patch('dashboard.data.write_journal.resolve_now', new=lambda now: now or T0),
+        patch('dashboard.app.resolve_now', new=lambda now: now or T0),
+    ):
+        yield
+
+
 def _held_tree() -> CannedMCP:
     """H's two in-progress tasks, both footprinting :data:`LOCKED_FILE`."""
     footprint = {'metadata': {'files': [LOCKED_FILE]}}
@@ -497,8 +514,13 @@ def _corpus_family(client: TestClient, workdir: Path) -> dict[str, Any]:
 
     with _canned_roots(client, workdir / 'memory', {'dark-factory': _substrate(REIFY_COUNTS)}):
         _write_memory_ops(app.state.config)
-        with patch('dashboard.data.write_journal.resolve_now', new=lambda now: now or T0):
+        with _memory_graphs_at_t0():
             bodies['memory_ops'] = _get(client, MEMORY_GRAPHS)
+    with (
+        _canned_roots(client, workdir / 'memory_missing', {'dark-factory': _substrate(REIFY_COUNTS)}),
+        _memory_graphs_at_t0(),
+    ):
+        bodies['memory_ops_missing'] = _get(client, MEMORY_GRAPHS)
 
     offline_tree = _substrate({TaskStatus.IN_PROGRESS: 3, TaskStatus.PENDING: 2})
     with _canned_roots(client, workdir / 'locks', {HELD: _held_tree(), OFFLINE_SCHEDULER: offline_tree}) as render:
@@ -511,6 +533,39 @@ def _corpus_family(client: TestClient, workdir: Path) -> dict[str, Any]:
         bodies['tasks_with_p'] = render(T0)
 
     return bodies
+
+
+def _check_owner_family(client: TestClient, workdir: Path) -> dict[str, Any]:
+    """An /escalations body whose one row carries a delivered_check_owner (task 7725).
+
+    The record is filed as orchestrator/src/orchestrator/harness.py files a
+    failing delivered check, through the real queue, so the render tests'
+    owner-carrying row is checked against a shape the route really serves.
+    """
+    with _canned_roots(client, workdir / 'check_owner', {'dark-factory': _substrate(REIFY_COUNTS)}):
+        _clear_corpus()
+        config = app.state.config
+        queue = EscalationQueue(config.escalations_dir)
+        queue.submit(Escalation(
+            id=queue.make_id('3'),
+            task_id='3',
+            agent_role='orchestrator-scheduler',
+            severity='critical',
+            category='dependency_capability',
+            summary='delivered check boundary-capability fails on main',
+            detail='the owner block the harness renders',
+            suggested_action='manual_intervention',
+            timestamp=T0.isoformat(),
+            status='pending',
+            level=2,
+            delivered_check_owner=CHECK_OWNER,
+        ))
+        config.reconciliation_escalations_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            with patch('dashboard.api.escalations.resolve_now', new=lambda _now: T0):
+                return {'escalations_check_owner': _get(client, ESCALATIONS)}
+        finally:
+            _clear_corpus()
 
 
 def ragged_store_rows(workdir: Path) -> list[dict[str, Any]]:
@@ -536,4 +591,5 @@ def build_all(workdir: Path) -> dict[str, Any]:
             **_burndown_family(client, workdir),
             **_window_family(client, workdir),
             **_corpus_family(client, workdir),
+            **_check_owner_family(client, workdir),
         }

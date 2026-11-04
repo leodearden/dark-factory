@@ -9,7 +9,7 @@ from a lower_bound Datum over the snapshot rows and that window.
 This file pins only the WIRING, on comment-stripped served source. The rules
 themselves execute under node: which projects request the window in
 task_snapshot.test.mjs (terminalWindowProjects), what a requesting caller shows
-in data_poll.test.mjs (onDemandDatum), and the PRD count in
+in data_on_demand.test.mjs (onDemandDatum), and the PRD count in
 prd_grouping.test.mjs (prdProgress, prdProgressReading).
 """
 

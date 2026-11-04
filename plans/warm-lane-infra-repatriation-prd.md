@@ -1,6 +1,9 @@
 # Warm-lane infrastructure repatriation — redraw the reify↔dark-factory seam at the toolchain boundary
 
 **Status:** active · **Owner:** dark-factory · **Authored:** 2026-07-26
+
+> **Amended 2026-10-12** by plans/offline-lane-red-path-prd.md: 'a red routes within one advance' becomes 'within `persist_passes` spaced passes'.
+
 **Approach:** B+H (contract + two-way boundary tests) — cross-repo seam, two-repo blast radius, touches the ENOSPC accretion path.
 
 ## 1. Goal
@@ -100,6 +103,12 @@ The seam moves from *"reify ships the primitive, dark-factory wires the invocati
 `refresh-warm-base.sh` stays in reify under the same contract, with its RUSTFLAGS stamp generalised to `--build-fingerprint` (leaf θ).
 
 **Invariant C-1.** dark-factory never inspects the contents of the cache dir; the project never inspects lane state. A violation in either direction is the defect class this PRD exists to close.
+
+*Scoped exception (2026-11-01, task 7859; Leo's ruling 2026-10-30, evidence in `plans/3190-deep-canary-few-verifies-2026-10-29.md` Rounds 4 and 7).* Pass 1 of `warm-lane-gc.sh` now skips a lane whose cache is unchanged since its last seed. That test is the ONE place dark-factory inspects the project's cache dir. It reads:
+- the project-owned `<lane>.seed-stamp.json`: schema `reify.lane-seed/1`, plus `base_gen` from reify task 9611;
+- the mtimes of a fixed set of directories under `<lane>/target`. It hardcodes `target`, as gc's reset paths already do.
+
+It is confined to `orchestrator/scripts/warm-lane/lib_lane_seed.sh`. A failed or absent reading always means reset, today's behaviour. Rationale and measurements: `orchestrator/scripts/warm-lane/README.md` "Delta 14".
 
 ## 6. Boundary-test sketch (H) — facing both ways
 

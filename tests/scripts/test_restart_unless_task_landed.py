@@ -24,17 +24,11 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from git_listing import git
 
 SCRIPT_NAME = 'restart-orchestrators-unless-task-landed.sh'
 REPO_ROOT = Path(__file__).resolve().parents[2]
 REAL_SCRIPT = REPO_ROOT / 'scripts' / SCRIPT_NAME
-
-
-def _git(repo: Path, *args: str) -> str:
-    return subprocess.run(
-        ['git', *args], cwd=repo, check=True,
-        capture_output=True, text=True,
-    ).stdout.strip()
 
 
 @pytest.fixture
@@ -45,11 +39,11 @@ def repo(tmp_path: Path) -> Path:
     shutil.copy2(REAL_SCRIPT, r / 'scripts' / SCRIPT_NAME)
     (r / 'scripts' / SCRIPT_NAME).chmod(0o755)
 
-    _git(r.parent, 'init', '--initial-branch=main', str(r))
-    _git(r, 'config', 'user.email', 'test@example.invalid')
-    _git(r, 'config', 'user.name', 'Test')
-    _git(r, 'add', '-A')
-    _git(r, 'commit', '-m', 'base')
+    git(r.parent, 'init', '--initial-branch=main', str(r))
+    git(r, 'config', 'user.email', 'test@example.invalid')
+    git(r, 'config', 'user.name', 'Test')
+    git(r, 'add', '-A')
+    git(r, 'commit', '-m', 'base')
     return r
 
 
@@ -74,7 +68,7 @@ def _run(repo: Path, stub_path: Path, *args: str, cwd: Path | None = None):
 
 def test_landed_via_merge_marker_does_not_restart(repo, stub):
     stub_path, log = stub
-    _git(repo, 'commit', '--allow-empty', '-m', 'Merge task/777 into main')
+    git(repo, 'commit', '--allow-empty', '-m', 'Merge task/777 into main')
 
     r = _run(repo, stub_path, '777', '--drain')
 
@@ -85,7 +79,7 @@ def test_landed_via_merge_marker_does_not_restart(repo, stub):
 def test_landed_via_marker_when_branch_was_deleted(repo, stub):
     """The rc=128 trap: landed branches are deleted, ancestry then exits 128."""
     stub_path, log = stub
-    _git(repo, 'commit', '--allow-empty', '-m', 'Merge task/778 into main')
+    git(repo, 'commit', '--allow-empty', '-m', 'Merge task/778 into main')
     # No refs/heads/task/778 exists — exactly the post-cleanup state.
 
     r = _run(repo, stub_path, '778', '--drain')
@@ -97,7 +91,7 @@ def test_landed_via_marker_when_branch_was_deleted(repo, stub):
 def test_landed_via_ancestry_without_marker_does_not_restart(repo, stub):
     """Fast-forward / coalesced landings carry no marker of their own."""
     stub_path, log = stub
-    _git(repo, 'branch', 'task/779')  # points at main, so it IS an ancestor
+    git(repo, 'branch', 'task/779')  # points at main, so it IS an ancestor
 
     r = _run(repo, stub_path, '779', '--drain')
 
@@ -107,9 +101,9 @@ def test_landed_via_ancestry_without_marker_does_not_restart(repo, stub):
 
 def test_unlanded_branch_restarts_and_forwards_args(repo, stub):
     stub_path, log = stub
-    _git(repo, 'checkout', '-q', '-b', 'task/780')
-    _git(repo, 'commit', '--allow-empty', '-m', 'work not on main')
-    _git(repo, 'checkout', '-q', 'main')
+    git(repo, 'checkout', '-q', '-b', 'task/780')
+    git(repo, 'commit', '--allow-empty', '-m', 'work not on main')
+    git(repo, 'checkout', '-q', 'main')
 
     r = _run(repo, stub_path, '780', '--drain')
 
@@ -140,7 +134,7 @@ def test_missing_task_id_is_a_usage_error(repo, stub):
 def test_decision_is_independent_of_cwd(repo, stub, tmp_path):
     """The transient systemd unit's cwd defaults to $HOME, not the repo."""
     stub_path, log = stub
-    _git(repo, 'commit', '--allow-empty', '-m', 'Merge task/781 into main')
+    git(repo, 'commit', '--allow-empty', '-m', 'Merge task/781 into main')
     elsewhere = tmp_path / 'elsewhere'
     elsewhere.mkdir()
 

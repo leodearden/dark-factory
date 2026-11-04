@@ -4,9 +4,9 @@
 This script carries THREE INDEPENDENT RULES.  Rules A and B are mock-spec
 discipline and share the AST predicates ``_is_magicmock_call`` / ``_is_specced``;
 Rule C is a wait-deadline rule and shares none of them.  What ALL THREE share is
-only the exemption-comment contract (``_EXEMPT_TEMPLATE`` / ``_is_exempted``), the
+only the exemption-comment contract (``_lint_cli.py::is_exempted``), the
 single ``ast.walk`` and the output format.  The per-file debt-budget machinery
-(``_debt_budget`` / ``_apply_debt_budget``) is Rule C's alone: Rules A and B are
+(``_debt_entry`` / ``_apply_debt_budget``) is Rule C's alone: Rules A and B are
 hot for every scanned file.  They have separate detection pipelines,
 separate message vocabularies and separate ``# noqa`` codes.  Every statement in the
 "Rule A" section below is scoped to Rule A and says nothing about Rule B or Rule C.
@@ -20,7 +20,7 @@ separate message vocabularies and separate ``# noqa`` codes.  Every statement in
       ``return MagicMock(...)``, an argument, a comprehension body — whose literal
       kwargs match a registered stdlib-dataclass shape (``_DATACLASS_SHAPES``;
       ``VerifyResult`` today).  The binding name is never consulted.  Remedies are
-      dataclass-specific (``_fake_verify_result``, ``MagicMock(spec=VerifyResult)``).
+      dataclass-specific (``fake_verify_result``, ``MagicMock(spec=VerifyResult)``).
       Hot for every scanned file: the transitional per-file debt baseline was
       retired once its 95 grandfathered sites were migrated (task 4354).
 
@@ -54,9 +54,9 @@ runtime, 20.8s -> 30.7s over the seven scanned dirs).  Note what this ruling doe
 say: it is not "put every future check here".  It applies because Rule C is another
 AST pass over exactly the same file set with exactly the same stdlib-only budget.
 A guard needing runtime import, pytest marks or a non-stdlib dependency does not
-qualify and stays where it is — which is why
-``orchestrator/tests/test_merge_speculation.py::TestTimeoutMarkCoverage`` was
-deliberately left file-local by task 4246 rather than moved here.
+qualify and stays where it is — which is why the runtime-mark timeout-coverage
+guard, ``orchestrator/tests/test_wait_budget_coverage_guard.py``, is a pytest
+module rather than a rule here.
 
 ---------------------------------------------------------------------------
 Rule A — ``bare-magicmock``
@@ -136,8 +136,8 @@ matches only config/cfg/*_config/*_cfg targets; and its remedies read pydantic
 ``model_fields`` while ``VerifyResult`` is a stdlib dataclass.
 
 Preferred alternatives named in the rejection message:
-  • ``_fake_verify_result(...)``
-    (orchestrator/tests/test_merge_queue_concurrent_verify.py::_fake_verify_result)
+  • ``fake_verify_result(...)``
+    (orchestrator/tests/_verify_result_doubles.py::fake_verify_result)
   • ``MagicMock(spec=VerifyResult)`` seeded from ``dataclasses.fields(VerifyResult)``
 
 Origin: task 3477 (built the factory), task 3980 (migrated ten sites and added a
@@ -195,7 +195,7 @@ Scoping the rule to orchestrator/tests instead would reintroduce exactly the
 a-list-decides-coverage failure mode the paragraph above rejects.
 
 What is deliberately NOT load-bearing: a wait on a bare ``ast.Name`` target, i.e. the
-``asyncio.wait_for(worker_task, ...)`` teardown join in ``_stop_worker``.  It sits
+``asyncio.wait_for(worker_task, ...)`` teardown join in ``stop_merge_worker``.  It sits
 inside ``contextlib.suppress(Exception)``, asserts nothing and swallows its own
 TimeoutError, so it cannot manufacture the flake this rule exists to prevent.  That
 exclusion is STRUCTURAL — the Name-vs-Attribute/Call distinction — precisely so it is
@@ -215,8 +215,8 @@ sites and added a file-local guard), task 4246 (this shared, repo-wide guard).
 
 ---------------------------------------------------------------------------
 
-This script is intentionally stdlib-only (ast, argparse, collections.abc, pathlib, re,
-sys, typing) so
+This script is intentionally stdlib-only (ast, collections.abc, pathlib, sys, typing,
+plus its stdlib-only sibling _lint_cli.py) so
 hooks/project-checks can invoke it via plain python3 without uv env-resolution overhead.
 Adding a third-party dependency here would break that fast path.  This is why
 ``_DATACLASS_SHAPES`` hardcodes field names instead of importing the dataclasses it
@@ -227,22 +227,18 @@ fused-memory/tests/test_check_bare_magicmock_config.py::TestDataclassShapeRegist
 
 from __future__ import annotations
 
-import argparse
 import ast
-import re
 import sys
 from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 from typing import NamedTuple
 
-
-class Violation(NamedTuple):
-    """A lint violation found by the checker."""
-
-    filename: str
-    lineno: int
-    col_offset: int
-    message: str
+# Sibling import that survives `python3 -I`: see _lint_cli.py's module docstring.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    from _lint_cli import Violation, discover_files, is_exempted, run_cli
+finally:
+    del sys.path[0]
 
 
 # Names that the checker considers "config objects".
@@ -264,6 +260,9 @@ class _DataclassShape(NamedTuple):
     (orchestrator/src/orchestrator/merge_types.py::MergeOutcome.verify_skipped) that
     VerifyResult does not have, so a subset rule would have missed precisely the
     defect this rule exists to catch.
+
+    ``factory`` names the helper the message offers as the remedy, and
+    ``factory_home`` the repo-relative path of the module that defines it.
     """
 
     name: str
@@ -272,6 +271,7 @@ class _DataclassShape(NamedTuple):
     anchors: frozenset[str]
     min_field_matches: int
     factory: str
+    factory_home: str
 
 
 # Registered shapes.  The field lists are LITERALS, not imports: this script is
@@ -285,7 +285,7 @@ class _DataclassShape(NamedTuple):
 # slips through.  Its drift guards are in
 # fused-memory/tests/test_check_bare_magicmock_config.py::TestDataclassShapeRegistry,
 # which compare this literal against ``dataclasses.fields(VerifyResult)`` at runtime,
-# one test per drift direction.
+# one test per drift direction, and parse ``factory_home`` for ``factory``.
 _DATACLASS_SHAPES: tuple[_DataclassShape, ...] = (
     _DataclassShape(
         name='VerifyResult',
@@ -305,14 +305,21 @@ _DATACLASS_SHAPES: tuple[_DataclassShape, ...] = (
             'plan',
             'failing_test_ids',
             'failing_test_ids_by_module',
+            'skipped_test_ids',
             'failing_leg_categories',
+            'run_all_failed_members',
             'trivial',
             'duration_secs',
             'flake_suppression',
+            'admission_legs',
+            'units',
+            'cache_mode',
+            'test_leg_failed',
         }),
         anchors=frozenset({'passed'}),
         min_field_matches=2,
-        factory='_fake_verify_result',
+        factory='fake_verify_result',
+        factory_home='orchestrator/tests/_verify_result_doubles.py',
     ),
 )
 
@@ -370,31 +377,13 @@ def _is_specced(call: ast.Call) -> bool:
     return False
 
 
-# Exemption comment regexes, one per rule code.
-# Matches: ``# noqa: <code> — <non-empty-reason>``
-# Accepts em-dash (—) or ASCII hyphen (-) as separator.
-# Requires at least one non-space character after the separator.
-#
-# Each rule gets its OWN code so a suppression written for one can never silently
-# exempt another: the remedies are unrelated (mock_orch_config/pydantic_spec vs
-# _fake_verify_result/spec=VerifyResult vs wait_responsive/MERGE_RESULT_TIMEOUT), so a
-# pragma for one is not informed consent for another.  All three are built from the
-# same template, so the em-dash/ASCII-hyphen and mandatory-reason contract is
-# identical across rules and an author learns it once.
-_EXEMPT_TEMPLATE = r'#\s*noqa:\s*{code}\s*[—\-]+\s*\S.*'
-
+# Each rule gets its OWN ``# noqa`` code, under _lint_cli.py's one pragma grammar: the
+# remedies are unrelated (mock_orch_config/pydantic_spec vs
+# fake_verify_result/spec=VerifyResult vs wait_responsive/MERGE_RESULT_TIMEOUT), so a
+# pragma for one is not informed consent for another.
 _RULE_A_CODE = 'bare-magicmock'
 _RULE_B_CODE = 'bare-dataclass-double'
 _RULE_C_CODE = 'wall-clock-deadline'
-
-# Kept at its historical value so Rule A's behaviour is bit-identical.
-_EXEMPT_RE = re.compile(_EXEMPT_TEMPLATE.format(code=re.escape(_RULE_A_CODE)))
-
-_EXEMPT_RES: dict[str, re.Pattern[str]] = {
-    _RULE_A_CODE: _EXEMPT_RE,
-    _RULE_B_CODE: re.compile(_EXEMPT_TEMPLATE.format(code=re.escape(_RULE_B_CODE))),
-    _RULE_C_CODE: re.compile(_EXEMPT_TEMPLATE.format(code=re.escape(_RULE_C_CODE))),
-}
 
 _VIOLATION_MSG = (
     'bare MagicMock() assigned to a config variable with no spec/spec_set.'
@@ -429,7 +418,8 @@ def _dataclass_violation_msg(shape: _DataclassShape, kwargs: set[str]) -> str:
         f' (matched {shape.name} fields: {", ".join(sorted(kwargs & shape.fields))}).'
         ' Reading an absent attribute on it auto-vivifies a truthy child Mock instead'
         f' of raising AttributeError.{drift_clause}'
-        f' Use the {shape.factory}(...) helper, or MagicMock(spec={shape.name}) seeded'
+        f' Use the {shape.factory}(...) helper ({shape.factory_home}),'
+        f' or MagicMock(spec={shape.name}) seeded'
         f' from dataclasses.fields({shape.name}), so unknown-attribute reads raise'
         ' (tasks 3477/3980 built the factory; task 4016 added this guard).'
         ' To suppress: add # noqa: bare-dataclass-double — <reason> on the preceding'
@@ -437,8 +427,20 @@ def _dataclass_violation_msg(shape: _DataclassShape, kwargs: set[str]) -> str:
     )
 
 
-def _debt_budget(filename: str, debt: dict[str, int]) -> int | None:
-    """Return *filename*'s budget in the *debt* mapping, or None if it is not listed.
+class _DebtEntry(NamedTuple):
+    """One file's row in a debt baseline.
+
+    *key* is the baseline's OWN spelling of the path, which a remedy must quote: the
+    scanned filename may be absolute, and only the key is an edit the author can apply
+    verbatim.
+    """
+
+    key: str
+    budget: int
+
+
+def _debt_entry(filename: str, debt: dict[str, int]) -> _DebtEntry | None:
+    """Return *filename*'s row in the *debt* mapping, or None if it is not a debt file.
 
     Parameterised over *debt* so every baseline matches paths the same way (task 4246).
 
@@ -451,52 +453,66 @@ def _debt_budget(filename: str, debt: dict[str, int]) -> int | None:
     because the nine call sites pass repo-relative paths while pytest passes
     absolutes; both must reach the same verdict.
 
-    Returns None (not 0) for a non-debt file so callers can distinguish "no budget
-    recorded — report every site" from "budget of zero".
+    Returns None (not a zero budget) for a non-debt file so callers can distinguish
+    "no budget recorded — report every site" from "budget of zero".
     """
     parts = PurePosixPath(filename.replace('\\', '/')).parts
     for entry, allowed in debt.items():
         entry_parts = PurePosixPath(entry).parts
         if len(parts) >= len(entry_parts) and parts[-len(entry_parts) :] == entry_parts:
-            return allowed
+            return _DebtEntry(entry, allowed)
     return None
 
 
 def _apply_debt_budget(
     found: list[Violation],
-    budget: int | None,
+    entry: _DebtEntry | None,
     *,
-    build_overrun_msg: Callable[[int, int], str],
+    filename: str,
+    build_overrun_msg: Callable[[_DebtEntry, int], str],
+    build_slack_msg: Callable[[_DebtEntry, int], str],
 ) -> list[Violation]:
-    """Filter one rule's violations for a debt file down to just its budget overrun.
+    """Compare one rule's violation COUNT for a file against its debt budget.
 
-    *build_overrun_msg* is the caller's own ``(budget, found) -> str`` message
-    builder, REQUIRED and keyword-only (task 4246 amendment pass).  Each rule's
-    overrun carries its OWN remedy — telling a Rule C overrun to migrate a mock
-    double would send the reader down a dead end — so there is deliberately no
-    default: a future Rule D that forgets the argument fails at the call, rather
-    than silently inheriting another rule's remedy with no type error and no
-    test failure.  It is passed as a builder rather than a built string so the
-    over-budget-only computation stays lazy and no caller has to invent a value for
-    the *budget is None* branch, where it is never consulted.
+    This is the single place a file's count is compared with its budget.
 
-    - Not a debt file (*budget* is None) → every violation is reported unchanged.
-    - At or under budget → silence: this is the grandfathering the baseline exists for.
+    Both builders are the caller's own ``(entry, found) -> str`` message builders,
+    REQUIRED and keyword-only (task 4246 amendment pass).  Each rule's report carries
+    its OWN remedy — telling a Rule C overrun to migrate a mock double would send the
+    reader down a dead end — so there is deliberately no default: a future Rule D
+    that forgets one fails at the call, rather than silently inheriting another
+    rule's remedy with no type error and no test failure.  They are passed as
+    builders rather than built strings so each message is computed only on its own
+    branch and no caller has to invent a value for the *entry is None* branch.
+
+    - Not a debt file (*entry* is None) → every violation is reported unchanged.
+    - Exactly at budget → silence: this is the grandfathering the baseline exists for.
     - Over budget → report exactly ``found - budget`` violations, so the noise is
-      proportional to the overrun rather than dumping all 317 Rule C violations of
-      test_merge_queue.py on someone who added one.
-
-    The reported sites are the last in source order.  That choice is deterministic
-    rather than diagnostic — the checker cannot know which site is new — and the
-    message says so explicitly.
+      proportional to the overrun rather than dumping every violation of a large
+      debt file on someone who added one.  The reported sites are the last in source
+      order.  That choice is deterministic rather than diagnostic — the checker
+      cannot know which site is new — and the message says so explicitly.
+    - Under budget → ONE file-level violation at *filename* line 1, col 0, naming
+      the budget edit.  Slack has no site (the removed one is gone), and a budget
+      above the measurement would silently licence that many new violations (task
+      6202 moved this check here from another package's test suite).
     """
-    if budget is None:
+    if entry is None:
         return found
-    if len(found) <= budget:
+    if len(found) == entry.budget:
         return []
+    if len(found) < entry.budget:
+        return [
+            Violation(
+                filename=filename,
+                lineno=1,
+                col_offset=0,
+                message=build_slack_msg(entry, len(found)),
+            )
+        ]
     ordered = sorted(found, key=lambda v: (v.lineno, v.col_offset))
-    message = build_overrun_msg(budget, len(ordered))
-    return [v._replace(message=message) for v in ordered[budget:]]
+    message = build_overrun_msg(entry, len(ordered))
+    return [v._replace(message=message) for v in ordered[entry.budget :]]
 
 
 def _literal_kwarg_names(call: ast.Call) -> set[str]:
@@ -569,7 +585,7 @@ def _dataclass_double_violation(
     shape, kwargs = match
     # Computed lazily — only after a shape match — so the upward line walk keeps
     # the cost profile it has under Rule A rather than running on every call node.
-    if _is_exempted(lines, call.lineno, _RULE_B_CODE):
+    if is_exempted(lines, call.lineno, _RULE_B_CODE):
         return None
     return Violation(
         filename=filename,
@@ -608,12 +624,16 @@ def _dataclass_double_violation(
 # the identical situation Rule B faced at 95 sites/11 files, so these are
 # grandfathered.  Rule C ONLY: Rules A and B still apply in full to every file here.
 #
-# The count is a BUDGET, not a comment.  A debt file is silent while it carries at
-# most its recorded number and reports the overrun the moment it carries more, so
-# "shrink-only" is enforced on the same hot path the rule itself runs on rather than
-# trusted.  This matters most for orchestrator/tests/test_merge_queue.py, an
-# actively-developed hub, where a wholesale grandfather would have made a brand-new
-# wall-clock wait added tomorrow invisible to the gate.
+# The count is an EXACT BUDGET, not a comment.  A debt file is silent ONLY while it
+# carries exactly its recorded number.  Above it the checker reports the overrun;
+# below it, one file-level slack violation naming the edit that lowers the number.
+# So "shrink-only" is enforced on the same hot path the rule itself runs on rather
+# than trusted.  This matters most for an actively-developed debt file, where a
+# wholesale grandfather would have made a brand-new wall-clock wait added tomorrow
+# invisible to the gate — and slack left above the measurement would license that
+# many new waits just as silently.  Reporting the slack here puts the red in the
+# owning package's own lint_command and the pre-commit hook, rather than in
+# another package's suite (task 6202).
 #
 # DO NOT ADD ENTRIES, AND DO NOT RAISE A NUMBER.  Both may only shrink, as files are
 # migrated onto wait_responsive(...) with bounds derived from MERGE_RESULT_TIMEOUT.
@@ -629,17 +649,11 @@ def _dataclass_double_violation(
 # 3980 spent a task removing, and what makes it safe for task 4246 to delete that
 # module's file-local copy of this guard.
 #
-# Two entries share the trailing ``tests/test_harness.py``; ``_debt_budget`` matches
+# Two entries share the trailing ``tests/test_harness.py``; ``_debt_entry`` matches
 # on trailing path COMPONENTS, so the package directory keeps them distinct.
 _WALL_CLOCK_DEADLINE_DEBT: dict[str, int] = {
     # orchestrator/tests
-    'orchestrator/tests/test_merge_queue.py': 267,
-    'orchestrator/tests/test_merge_queue_concurrent_verify.py': 85,
-    'orchestrator/tests/test_concurrent_verify_boundary.py': 44,
-    'orchestrator/tests/test_merge_queue_lifecycle_registry.py': 30,
-    'orchestrator/tests/test_merge_queue_permit_conservation.py': 27,
-    'orchestrator/tests/test_merge_queue_resolve_release.py': 25,
-    'orchestrator/tests/test_coalesce_integration_gate.py': 12,
+    'orchestrator/tests/test_merge_queue_concurrent_verify.py': 64,
     'orchestrator/tests/test_merge_queue_request_liveness.py': 10,
     'orchestrator/tests/test_offline_lane.py': 10,
     'orchestrator/tests/test_live_merge_worker.py': 6,
@@ -649,7 +663,6 @@ _WALL_CLOCK_DEADLINE_DEBT: dict[str, int] = {
     'orchestrator/tests/test_merge_queue_verifier_raw_cancel.py': 3,
     'orchestrator/tests/test_harness.py': 2,
     'orchestrator/tests/test_invoke.py': 2,
-    'orchestrator/tests/test_merge_queue_coalesce.py': 2,
     'orchestrator/tests/test_merge_queue_deep_integration_gate.py': 2,
     'orchestrator/tests/test_merge_queue_invariant_integration_gate.py': 2,
     'orchestrator/tests/test_merge_skew_tripwire.py': 2,
@@ -678,7 +691,6 @@ _WALL_CLOCK_DEADLINE_DEBT: dict[str, int] = {
     'fused-memory/tests/test_e2e_durable_queue.py': 2,
     'fused-memory/tests/test_journaling_integration.py': 2,
     'fused-memory/tests/test_recon_claim_verification_wiring.py': 2,
-    'fused-memory/tests/test_ticket_worker.py': 2,
     # shared/tests
     'shared/tests/test_uuid_prefix_guard.py': 2,
     'shared/tests/test_async_sqlite_base.py': 1,
@@ -686,13 +698,14 @@ _WALL_CLOCK_DEADLINE_DEBT: dict[str, int] = {
 }
 
 
-def _wall_clock_overrun_msg(budget: int, found: int) -> str:
+def _wall_clock_overrun_msg(entry: _DebtEntry, found: int) -> str:
     """Build the message for a Rule C debt file that has grown past its budget.
 
     Carries Rule C's OWN remedy, never Rule B's: a wall-clock deadline is not fixed
-    by speccing a double, so offering ``_fake_verify_result`` here would send the
+    by speccing a double, so offering ``fake_verify_result`` here would send the
     reader down a dead end.
     """
+    budget = entry.budget
     return (
         'this file is on the SHRINK-ONLY wall-clock-deadline debt baseline with a'
         f' recorded budget of {budget} violation(s), but {found} were found —'
@@ -705,6 +718,34 @@ def _wall_clock_overrun_msg(budget: int, found: int) -> str:
         ' # noqa: wall-clock-deadline — <reason> above a deliberate one.'
         + _WALL_CLOCK_REMEDY_REACH
         + ' Do NOT raise the recorded budget in check_bare_magicmock_config.py.'
+    )
+
+
+def _wall_clock_slack_msg(entry: _DebtEntry, found: int) -> str:
+    """Build the message for a Rule C debt file carrying fewer violations than its budget.
+
+    Names the one edit that fixes it, quoting the baseline's own key.  No per-site
+    suppression can fix slack and no migration remedy applies, so neither is offered.
+    """
+    key = f"_WALL_CLOCK_DEADLINE_DEBT['{entry.key}']"
+    if found == 0:
+        edit = (
+            f'This file is fully migrated: delete {key} in'
+            ' fused-memory/scripts/check_bare_magicmock_config.py AND its line in'
+            ' _EXPECTED_WALL_CLOCK_DEBT_PATHS in'
+            ' fused-memory/tests/test_check_bare_magicmock_config.py.'
+        )
+    else:
+        edit = (
+            f'Fix: lower {key} from {entry.budget} to {found} in'
+            ' fused-memory/scripts/check_bare_magicmock_config.py.'
+        )
+    return (
+        'this file is on the SHRINK-ONLY wall-clock-deadline debt baseline with a'
+        f' recorded budget of {entry.budget} violation(s), but only {found} were'
+        ' found. A budget above the measurement lets that many NEW wall-clock waits'
+        ' land here silently, so the recorded number must be lowered in the same'
+        f' change that removes a wait. {edit}'
     )
 
 # ---------------------------------------------------------------------------
@@ -730,7 +771,7 @@ def _load_bearing_wait_target(node: ast.expr) -> str | None:
 
     Deliberately NOT load-bearing, and therefore excluded: the
     ``await asyncio.wait_for(worker_task, timeout=join_timeout)`` join in
-    ``_stop_worker``.  It targets a bare ``Name`` (the worker Task), sits inside
+    ``stop_merge_worker``.  It targets a bare ``Name`` (the worker Task), sits inside
     ``contextlib.suppress(Exception)``, asserts nothing, and swallows its own
     TimeoutError — so it cannot manufacture the flake task 3980 fixed, and
     stretching it would only slow teardown down.  The Name-vs-Attribute/Call
@@ -868,7 +909,7 @@ def _wall_clock_deadline_violations(
       2. the func is ``asyncio.wait_for`` or ``wait_responsive``;
       3. ``_load_bearing_wait_target`` recognises ``args[0]``.
     Only then is the exemption line-walk run (see ``_wall_clock_deadline_violations``'s
-    call to ``_is_exempted``), so the upward walk keeps Rule B's cost profile rather
+    call to ``is_exempted``), so the upward walk keeps Rule B's cost profile rather
     than running on every ``ast.Call`` in the tree.
 
     Position-blind by construction: the caller hands this every ``ast.Call``, so a
@@ -910,7 +951,7 @@ def _wall_clock_deadline_violations(
     # both matched — so the upward line walk keeps Rule B's cost profile rather than
     # running on every ast.Call in the tree.  ONE check per SITE suppresses BOTH
     # offence kinds: a pragma is consent for the site, not for one half of it.
-    if _is_exempted(lines, call.lineno, _RULE_C_CODE):
+    if is_exempted(lines, call.lineno, _RULE_C_CODE):
         return []
 
     messages: list[str] = []
@@ -938,36 +979,6 @@ def _wall_clock_deadline_violations(
         for message in messages
     ]
 
-def _is_exempted(lines: list[str], lineno: int, code: str) -> bool:
-    """Return True if the node at *lineno* (1-based) carries a valid ``code`` exemption.
-
-    Walks upward from ``lineno - 1`` over blank lines to the nearest non-blank line.
-    If that line matches ``code``'s exemption regex the node is exempt.
-    Any intervening non-blank, non-matching line breaks the exemption.
-
-    The *code* parameter keeps all three rules' suppressions strictly separate: a
-    ``# noqa: bare-magicmock`` pragma does not exempt a ``bare-dataclass-double`` or
-    ``wall-clock-deadline`` violation, in any direction.  Only the regex differs —
-    the walk, the blank-line tolerance and the mandatory-non-empty-reason contract
-    are shared verbatim.
-
-    Inline trailing exemption NOT honored: only the nearest *preceding* non-blank line
-    is inspected.  A ``# noqa: ...`` comment on the same line as the node (inline
-    trailing) is intentionally ignored.  This is by design — see module-level docstring.
-    """
-    exempt_re = _EXEMPT_RES[code]
-    # lineno is 1-based; convert to 0-based index of the line ABOVE the node.
-    idx = lineno - 2  # the line immediately above
-    while idx >= 0:
-        line = lines[idx]
-        stripped = line.strip()
-        if stripped == '':
-            idx -= 1
-            continue
-        # Nearest non-blank line found — must match the exemption regex.
-        return bool(exempt_re.match(stripped))
-    return False
-
 
 def find_violations(source: str, filename: str) -> list[Violation]:
     """Parse *source* and return every violation of ALL THREE rules.
@@ -989,8 +1000,10 @@ def find_violations(source: str, filename: str) -> list[Violation]:
     produce TWO violations — the kinds are independent.
 
     Rule C additionally honours its own SHRINK-ONLY per-file debt budget
-    (``_WALL_CLOCK_DEADLINE_DEBT``), applied to the collected COUNT after the walk.
-    Rules A and B have no baseline and apply in full to every file.
+    (``_WALL_CLOCK_DEADLINE_DEBT``), compared with the collected COUNT after the
+    walk: a debt file is silent only at exactly its budget, reports its overrun above
+    it and one file-level slack violation below it.  Rules A and B have no baseline
+    and apply in full to every file.
 
     SyntaxError in *source* → returns an empty list.
 
@@ -1006,10 +1019,10 @@ def find_violations(source: str, filename: str) -> list[Violation]:
     violations: list[Violation] = []
 
     # Rule C violations are collected separately so its debt file's budget can be
-    # applied to the COUNT after the walk (see _apply_debt_budget).  Looked up ONCE
+    # compared with the COUNT after the walk (see _apply_debt_budget).  Looked up ONCE
     # per file, not per node.
     wall_clock: list[Violation] = []
-    wall_clock_budget = _debt_budget(filename, _WALL_CLOCK_DEADLINE_DEBT)
+    wall_clock_debt = _debt_entry(filename, _WALL_CLOCK_DEADLINE_DEBT)
 
     # ONE walk, ALL THREE rules.  Rule B was originally a second full ast.walk over the
     # same tree, which cost ~43% of total checker runtime (20.8s → 30.7s over the seven
@@ -1061,7 +1074,7 @@ def find_violations(source: str, filename: str) -> list[Violation]:
         if _is_specced(value):  # type: ignore[arg-type]
             continue
 
-        # _is_exempted is computed lazily — only on finding the first config-named
+        # is_exempted is computed lazily — only on finding the first config-named
         # ast.Name target — because the exemption check (an upward line walk + regex)
         # is not free, and most assignments have no config-named targets.
         exempted: bool | None = None
@@ -1071,7 +1084,7 @@ def find_violations(source: str, filename: str) -> list[Violation]:
             if not _is_config_name(target.id):
                 continue
             if exempted is None:
-                exempted = _is_exempted(lines, assignment_lineno, _RULE_A_CODE)
+                exempted = is_exempted(lines, assignment_lineno, _RULE_A_CODE)
             if exempted:
                 # All targets of this node share the same lineno and therefore
                 # the same exemption status — no need to check further targets.
@@ -1085,12 +1098,16 @@ def find_violations(source: str, filename: str) -> list[Violation]:
                 )
             )
 
-    # Rule C's per-file debt budget is applied to its collected COUNT, not to
-    # individual sites: a grandfathered file stays silent while it does not grow, and
-    # reports exactly its overrun once it does.
+    # Rule C's per-file debt budget is compared with its collected COUNT, not with
+    # individual sites: a grandfathered file stays silent only at exactly its budget,
+    # reports exactly its overrun above it, and reports one slack violation below it.
     violations.extend(
         _apply_debt_budget(
-            wall_clock, wall_clock_budget, build_overrun_msg=_wall_clock_overrun_msg
+            wall_clock,
+            wall_clock_debt,
+            filename=filename,
+            build_overrun_msg=_wall_clock_overrun_msg,
+            build_slack_msg=_wall_clock_slack_msg,
         )
     )
 
@@ -1107,14 +1124,11 @@ _DISCOVERY_GLOBS: tuple[str, ...] = ('test_*.py', 'conftest.py', '_*.py')
 def discover_scan_targets(directory: Path) -> list[Path]:
     """Return every file under *directory* the checker scans, sorted.
 
-    The one home of directory discovery: ``main`` and the baseline-integrity census
-    in fused-memory/tests/test_check_bare_magicmock_config.py both call it, so the
-    gate and its census cannot scan different file sets.
+    The one directory expansion: ``main`` hands it to ``run_cli`` and the
+    baseline-integrity census in fused-memory/tests/test_check_bare_magicmock_config.py
+    calls it, so the gate and its census cannot scan different file sets.
     """
-    found: set[Path] = set()
-    for pattern in _DISCOVERY_GLOBS:
-        found.update(directory.rglob(pattern))
-    return sorted(found)
+    return discover_files(directory, _DISCOVERY_GLOBS)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1124,71 +1138,20 @@ def main(argv: list[str] | None = None) -> int:
     ``wall-clock-deadline`` — in a single AST pass per file.
 
     For directories, recursively scans test_*.py, conftest.py and _*.py helper
-    modules only (``discover_scan_targets``).
-    Prints violations to stdout in 'path:lineno:col: message' format (ruff-style).
-
-    Explicit file paths are validated up front; a missing explicit path fails
-    fast with exit code 2 before any scan work. Mid-scan OSErrors (e.g. a file
-    yanked between rglob discovery and read) are accumulated and reported on
-    stderr without discarding violations already collected.
-
-    Returns 0 if clean, 1 if only violations were found, 2 on any fatal error
-    (missing explicit path or transient read failure).
+    modules only (``discover_scan_targets``).  Output and the 0/1/2 exit ladder are
+    ``_lint_cli.run_cli``'s.
     """
-    parser = argparse.ArgumentParser(
+    return run_cli(
+        argv,
         description=(
             'Test-quality lint checks over test files: bare MagicMock() assigned to '
             'config-named variables (bare-magicmock), unspecced MagicMocks shaped like '
             'a registered dataclass (bare-dataclass-double), and load-bearing waits '
             'carrying a wall-clock deadline (wall-clock-deadline).'
-        )
+        ),
+        discover=discover_scan_targets,
+        find_violations=find_violations,
     )
-    parser.add_argument('paths', nargs='+', help='Files or directories to check')
-    args = parser.parse_args(argv)
-
-    # Phase 1: discovery + upfront validation of explicit paths.
-    # rglob results are guaranteed to exist at discovery time, so only
-    # non-directory (explicit) paths need the existence check.
-    files_to_scan: list[Path] = []
-    for path_str in args.paths:
-        p = Path(path_str)
-        if p.is_dir():
-            files_to_scan.extend(discover_scan_targets(p))
-        else:
-            if not p.exists():
-                print(f'error: {p}: No such file or directory', file=sys.stderr)
-                return 2
-            files_to_scan.append(p)
-
-    # Phase 2: scan. Accumulate per-file read errors without returning early,
-    # so a transient OSError on one file never discards violations already
-    # collected from earlier files.
-    all_violations: list[Violation] = []
-    read_errors: list[tuple[Path, Exception]] = []
-    for file_path in files_to_scan:
-        try:
-            source = file_path.read_text(encoding='utf-8')
-        except (OSError, UnicodeDecodeError) as exc:
-            # UnicodeDecodeError is a ValueError subclass, not an OSError,
-            # but a malformed file must be reported via the read_errors channel
-            # rather than crashing with an unhandled traceback.
-            read_errors.append((file_path, exc))
-            continue
-
-        violations = find_violations(source, str(file_path))
-        all_violations.extend(violations)
-
-    # Phase 3: reporting.
-    # Sort across files for deterministic ruff-style (filename, lineno, col_offset) output.
-    all_violations.sort(key=lambda v: (v.filename, v.lineno, v.col_offset))
-    for v in all_violations:
-        print(f'{v.filename}:{v.lineno}:{v.col_offset}: {v.message}')
-    for file_path, exc in read_errors:
-        print(f'error reading {file_path}: {exc}', file=sys.stderr)
-
-    if read_errors:
-        return 2
-    return 1 if all_violations else 0
 
 
 if __name__ == '__main__':

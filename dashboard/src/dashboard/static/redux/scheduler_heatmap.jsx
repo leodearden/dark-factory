@@ -10,6 +10,8 @@
    production-scale fixture (dashboard/tests/js/scheduler_heatmap_bounds.test.mjs);
    that this component actually CONSUMES it — what makes the cap structural
    rather than advisory — is pinned in dashboard/tests/test_tab_scheduler.py.
+   The truncation caption is describeHeatmapCap's, composed beside the
+   selection it describes.
 
    Exports: window.DF_SCHED_HEATMAP = { SchedulerHeatmap, HeatmapCell, cellStateFor }
 */
@@ -18,7 +20,7 @@
 // index.html loads scheduler_heatmap_bounds.js as a classic script, so it runs
 // before every Babel-transformed tag; the ordering is enforced by
 // test_index_html.py::test_scheduler_heatmap_bounds_js_loads_before_scheduler_heatmap.
-const { boundHeatmapAxes, rowTouchesModule } = window.DF_SCHED_HEATMAP_BOUNDS;
+const { boundHeatmapAxes, rowTouchesModule, describeHeatmapCap } = window.DF_SCHED_HEATMAP_BOUNDS;
 
 // ── Pure cell classifier (no React deps) ──
 //
@@ -89,21 +91,11 @@ const SchedulerHeatmap = React.memo(function SchedulerHeatmap({ rows, modules, o
     );
   }
 
+  const capCaption = describeHeatmapCap(bounded);
+
   return (
     <div className="sched-heatmap-wrap">
-      {(bounded.rowsTruncated || bounded.modulesTruncated) && (
-        // Only the COLUMN superlative is earned, and the asymmetry is the
-        // point: the server returns modules sorted `(-contention, path)` and
-        // the selection takes an order-preserving prefix of that, so those
-        // really are the most contended.  Nothing orders rows by contention —
-        // they arrive in composition order, parked ones pulled to the front —
-        // so the row axis gets a plain count rather than a claim the
-        // selection cannot keep.
-        <div className="sched-heatmap-cap">
-          Showing {bounded.rows.length} of {bounded.rowsTotal} tasks
-          {' '}and the {bounded.modules.length} most contended of {bounded.modulesTotal} modules.
-        </div>
-      )}
+      {capCaption && <div className="sched-heatmap-cap">{capCaption}</div>}
       <table className="sched-heatmap">
         <thead>
           <tr>

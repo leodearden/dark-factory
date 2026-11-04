@@ -41,10 +41,10 @@ import os
 import time
 import weakref
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from pathlib import Path
 from typing import Any, Generic, TypeVar
 
 import httpx
+from shared.streak import KeyedStreaks
 
 # PEP 696 TypeVar defaults, via typing_extensions rather than typing: pyright
 # rejects `typing.TypeVar(default=...)` under this package's
@@ -52,6 +52,8 @@ import httpx
 # 3.13 or newer"), while accepting and APPLYING the typing_extensions
 # spelling at the same pin. Declared directly in pyproject.toml (task 5018).
 from typing_extensions import TypeVar as TypeVarD
+
+from dashboard.project_labels import ProjectLabels
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +82,7 @@ K = TypeVarD('K', default=str)
 # each path/endpoint pair reports independently.
 _FANOUT_REWARN_EVERY = 500
 
-_failure_streaks: dict[tuple[str, str], int] = {}
+_failure_streaks: KeyedStreaks[tuple[str, str]] = KeyedStreaks(threshold=1)
 
 
 # ── bounded per-key lock acquisition (task 4789) ────────────────────
@@ -202,9 +204,11 @@ _REAP_UNWIND_TIMEOUT_SECONDS = 5.0
 #     dict, an empty/malformed result) that ``call`` raises to signal
 #     fall-through. :class:`PreformattedFanoutError` subclasses it.
 #
-# ``task_runtime`` and ``merge_halt`` carry their own near-copies with
-# ``OSError`` added. They are outside task 4958's file lock and deliberately
-# left alone; folding them in is a separate change.
+# ``merge_halt`` extends this tuple with ``OSError`` at its own site
+# (merge_halt.py::_PROBE_FAILURE_EXCEPTIONS) rather than widening it here.
+# task_runtime.py::_probe_one deliberately does not use it: its ordered
+# deadline/unreachable split (task 3517) is a fault-domain taxonomy that one
+# flat tuple cannot express.
 FANOUT_FAILURE_EXCEPTIONS: tuple[type[Exception], ...] = (
     httpx.ConnectError,
     httpx.TimeoutException,
@@ -264,11 +268,12 @@ _DEFAULT_PER_URL_DEADLINE_SECONDS = 75.0
 #    every individual ``self._network_stream.read(...)``. So the budget is
 #    re-armed per socket read, and a peer emitting one byte just inside each
 #    read window keeps the request alive indefinitely with the budget never
-#    firing. This is not exotic on this transport:
-#    ``memory.MCP_HEADERS`` sends ``Accept: application/json,
-#    text/event-stream`` and ``client.post`` reads the FULL body, so an SSE
-#    response the server never closes parks ``resp.text`` forever under a
-#    per-request budget that is behaving exactly as documented.
+#    firing. This is not exotic on this transport: ``memory.McpSession``
+#    sends ``shared.mcp_post.MCP_POST_HEADERS``, whose ``Accept`` is
+#    ``application/json, text/event-stream``, and ``client.post`` reads the
+#    FULL body, so an SSE response the server never closes parks
+#    ``resp.text`` forever under a per-request budget that is behaving
+#    exactly as documented.
 # 2. ``httpcore._async.connection::AsyncHTTPConnection.handle_async_request``
 #    acquires ``self._request_lock`` (an ``anyio.Lock``) with NO timeout; only
 #    the ``_connect`` inside it is budgeted.
@@ -294,9 +299,9 @@ _DEFAULT_PER_URL_DEADLINE_SECONDS = 75.0
 # ── why the deadline is default-on ──────────────────────────────────
 #
 # Most live :func:`first_success` call sites carry no enclosing deadline of
-# their own — measured under task 4958: ``app::api_curator_cancel`` (the
-# ``cancel_ticket`` proxy), ``app::_scheduler_proxy``, the three ``tasks``
-# sites, and ``scheduler``'s. Only ``metrics`` wraps its own inner call, and it
+# their own — measured under task 4958: ``app::_mcp_write_proxy`` (the
+# ``cancel_ticket`` and scheduler write proxy), the three ``tasks`` sites, and
+# ``scheduler``'s. Only ``metrics`` wraps its own inner call, and it
 # had to hand-convert ``TimeoutError`` into ``ValueError`` to do so. Those
 # unwrapped sites are precisely the ones that could park forever, and they are
 # outside this module — so an opt-in parameter would have left the hole open
@@ -348,27 +353,9 @@ def describe_exc(exc: BaseException) -> str:
     return f'{type(exc).__name__}: {text}' if text else type(exc).__name__
 
 
-def project_label(project_root: str | os.PathLike[str]) -> str:
-    """Render *project_root* as the short project name the UI labels it with.
-
-    The basename, falling back to the full string for a root with no basename
-    (``'/'``) so a label can never degrade to empty. This is the single
-    definition of that rule for the fan-out cluster — :func:`fanout_label`
-    composes it rather than re-deriving it.
-
-    ``redux_api``, ``metrics`` and ``api/merge_queue.py`` call this directly
-    (task 5595). ``active_tasks._project_label`` is still an independent
-    hand-rolled copy of the same rule. It is not imported here
-    (``active_tasks`` imports from ``tasks``, which imports this module), which
-    also means the delegation can only run the other way: it can eventually
-    call *this*, collapsing the last copy. Until it does, the two definitions
-    must be kept string-identical by hand.
-    """
-    root_str = str(project_root)
-    return Path(root_str).name or root_str
-
-
-def fanout_label(base: str, project_root: str | os.PathLike[str]) -> str:
+def fanout_label(
+    base: str, project_root: str | os.PathLike[str], labels: ProjectLabels,
+) -> str:
     """Compose a per-project-root fan-out log label, ``'base[project-name]'``.
 
     **Every fan-out caller parameterized by project_root MUST compose its
@@ -389,27 +376,13 @@ def fanout_label(base: str, project_root: str | os.PathLike[str]) -> str:
     A collapsed key also erases the diagnosis: the message names only the
     shared URL, so the operator cannot tell *which* project_root is down.
 
-    The discriminator is :func:`project_label` — the basename, the same rule
-    ``redux_api`` labels its payloads with and deliberately string-identical
-    to ``active_tasks._project_label``, so operator log labels match the
-    project chips the UI already renders. ``mcp_fanout``, the leaf of this cluster, is the
-    helper's home (see :func:`project_label`) and this docstring is the single
-    place the convention is written down.
-
-    **The guarantee above assumes project-root basenames are distinct.** Two
-    configured roots sharing one (``/srv/team-a/app`` and ``/srv/team-b/app``,
-    or two checkouts both named ``dark-factory``) collapse back onto a single
-    key and reintroduce both failure modes described above. That assumption is
-    pre-existing and system-wide rather than introduced here —
-    ``scheduler``'s ``label_to_root = {_project_label(r): r for r in ...}``
-    already silently drops one of two same-basename roots, and ``redux_api``
-    keys its whole per-project payload on the same basename — so this helper
-    inherits it deliberately instead of diverging from every other project
-    label the dashboard renders. For ``list_tickets`` the unambiguous full root
-    is in any case still in the message body (metrics appends
-    ``(project_root=...)``).
+    The discriminator is the root's project label in *labels*
+    (``dashboard/project_labels.py::ProjectLabels``), unique across the
+    configured roots, so same-basename roots keep independent streaks and an
+    operator log label is the same string as the project chip the UI renders.
+    This docstring is the single place the convention is written down.
     """
-    return f'{base}[{project_label(project_root)}]'
+    return f'{base}[{labels.of(project_root)}]'
 
 
 def log_fanout_failure(log_label: str, url: str, exc: BaseException) -> None:
@@ -421,20 +394,18 @@ def log_fanout_failure(log_label: str, url: str, exc: BaseException) -> None:
     ``dashboard.data.memory`` so the whole invisible-failure class is closed
     with one policy rather than three divergent ones.
     """
-    key = (log_label, url)
-    streak = _failure_streaks.get(key, 0) + 1
-    _failure_streaks[key] = streak
+    step = _failure_streaks.failure((log_label, url))
     detail = describe_exc(exc)
-    if streak == 1:
+    if step.fired:
         logger.warning('%s failed for %s: %s', log_label, url, detail)
-    elif streak % _FANOUT_REWARN_EVERY == 0:
+    elif step.count % _FANOUT_REWARN_EVERY == 0:
         logger.warning(
             '%s still failing for %s (%d consecutive): %s',
-            log_label, url, streak, detail,
+            log_label, url, step.count, detail,
         )
     else:
         logger.debug(
-            '%s failed for %s (%d consecutive): %s', log_label, url, streak, detail,
+            '%s failed for %s (%d consecutive): %s', log_label, url, step.count, detail,
         )
 
 
@@ -446,7 +417,9 @@ def note_fanout_success(log_label: str, url: str) -> None:
     Bounded by construction: it fires only when a streak was actually open,
     i.e. at most once per opening WARNING.
     """
-    streak = _failure_streaks.pop((log_label, url), 0)
+    key = (log_label, url)
+    streak = _failure_streaks.count(key)
+    _failure_streaks.success(key)
     if streak:
         logger.warning(
             '%s recovered for %s after %d consecutive failure(s)',
@@ -462,7 +435,7 @@ def reset_failure_streaks() -> None:
     clean throttling state — otherwise an earlier test's failure would silently
     demote a later test's first WARNING to DEBUG.
     """
-    _failure_streaks.clear()
+    _failure_streaks.forget(_failure_streaks.tracked_keys)
 
 
 async def call_with_deadline(
@@ -565,10 +538,10 @@ async def first_success(
     an ``httpx.PoolTimeout`` (this client's own pool is saturated) is
     distinguishable from a genuinely unreachable endpoint.
 
-    ``log_failures=False`` suppresses that reporting for the two ``app.py``
-    proxies that already emit their own fully-detailed WARNING at the call
-    site: the failure is then reported exactly once, by the caller, rather
-    than twice at the same level.
+    ``log_failures=False`` suppresses that reporting for ``app.py``'s
+    MCP-write proxy, which already emits its own fully-detailed WARNING at the
+    call site: the failure is then reported exactly once, by the caller,
+    rather than twice at the same level.
 
     **A builtin ``TimeoutError`` is exempt from that suppression** and is
     always reported. It cannot be a duplicate of a call-site line, by
@@ -576,7 +549,7 @@ async def first_success(
     the call site sees is a ``CancelledError`` — a ``BaseException``, outside
     its own ``except (ConnectError, TimeoutException, HTTPStatusError,
     ValueError)`` — and it logs nothing. Suppressing here too would make a hang
-    the ONE failure at those two sites that leaves no journal trace at all,
+    the ONE failure at that site that leaves no journal trace at all,
     which is the task-1814 shape this module's log policy exists to prevent.
 
     ``per_url_timeout`` is a **whole-operation deadline applied to each URL's
@@ -586,7 +559,7 @@ async def first_success(
     deliberately no way to disable it. A backstop with an off switch is a
     footgun — the only caller who would reach for it is one that has not
     thought about hangs, which is exactly the population it protects. Most live
-    call sites (``app.py``'s two proxies, the three ``tasks.py`` sites,
+    call sites (``app.py``'s MCP-write proxy, the three ``tasks.py`` sites,
     ``scheduler.py``'s) have no enclosing deadline of their own and are the
     ones that can park forever; a default-on bound closes that for them without
     editing any of them, and is non-binding for the callers that already wrap
@@ -879,9 +852,9 @@ class TTLCache(Generic[V, K]):
         # Per-INSTANCE (not module-level) consecutive-bypass streaks, keyed
         # by cache key. Per-instance because a key means something only
         # inside the cache that minted it: several live instances key on a
-        # bare string, so a module-level dict would let two caches' streaks
-        # collide.
-        self._bypass_streaks: dict[K, int] = {}
+        # bare string, so module-level streaks would let two caches collide.
+        # threshold=1, so a step's ``fired`` marks a streak's opening line.
+        self._bypass_streaks: KeyedStreaks[K] = KeyedStreaks(threshold=1)
         # The in-flight bypass task for a key, if any, stamped with the
         # monotonic time it started. Bounds concurrent bypass refreshes to
         # ONE per key (see _bypass_refresh) rather than one per timed-out
@@ -1003,12 +976,7 @@ class TTLCache(Generic[V, K]):
         # sweep above so a lock idled out in THIS same pass has its streak
         # reclaimed in the same pass too, rather than lingering one more
         # sweep cycle.
-        dead_streaks = [
-            k for k in self._bypass_streaks
-            if k not in self._store and k not in self._locks
-        ]
-        for key in dead_streaks:
-            del self._bypass_streaks[key]
+        self._bypass_streaks.retain(lambda k: k in self._store or k in self._locks)
         # A tracked bypass entry is safe to drop once no caller can still be
         # waiting on it: its task has already finished (belt-and-braces —
         # _start_bypass's done-callback normally removes these itself, but
@@ -1302,8 +1270,9 @@ class TTLCache(Generic[V, K]):
         not time out again here, the inherited bypass did — and is about to
         supersede it with a fresh attempt.
         """
-        streak = self._bypass_streaks.get(key, 0) + 1
-        self._bypass_streaks[key] = streak
+        step = self._bypass_streaks.failure(key)
+        streak = step.count
+        loud = step.fired or streak % _LOCK_BYPASS_REWARN_EVERY == 0
         name = getattr(refresh, '__qualname__', repr(refresh))
         if reason == 'bypass_cap':
             opening = (
@@ -1316,7 +1285,7 @@ class TTLCache(Generic[V, K]):
                 'key %r at the live-bypass cap (%d, bound %.2fs, refresh=%s); '
                 'joining the newest live refresh (%d consecutive)'
             )
-            if streak == 1 or streak % _LOCK_BYPASS_REWARN_EVERY == 0:
+            if loud:
                 logger.warning(
                     opening, key, _MAX_LIVE_BYPASSES_PER_KEY,
                     _LOCK_ACQUIRE_TIMEOUT_SECONDS, name, streak,
@@ -1351,7 +1320,7 @@ class TTLCache(Generic[V, K]):
                 'lock acquisition for key %r timed out after %.2fs '
                 '(refresh=%s), running without the lock (%d consecutive)'
             )
-        if streak == 1 or streak % _LOCK_BYPASS_REWARN_EVERY == 0:
+        if loud:
             logger.warning(opening, key, _LOCK_ACQUIRE_TIMEOUT_SECONDS, name, streak)
         else:
             logger.debug(repeat, key, _LOCK_ACQUIRE_TIMEOUT_SECONDS, name, streak)
@@ -1368,7 +1337,8 @@ class TTLCache(Generic[V, K]):
         call, so its recovery line appears on its next COLD miss rather than
         immediately; the bracket is still bounded and still closes.
         """
-        streak = self._bypass_streaks.pop(key, 0)
+        streak = self._bypass_streaks.count(key)
+        self._bypass_streaks.success(key)
         if streak:
             logger.warning(
                 'lock for key %r recovered after %d consecutive bypass(es)',
@@ -1573,6 +1543,6 @@ class TTLCache(Generic[V, K]):
         """
         self._store.clear()
         self._locks.clear()
-        self._bypass_streaks.clear()
+        self._bypass_streaks.forget(self._bypass_streaks.tracked_keys)
         self._bypass_tasks.clear()
         self._live_bypasses.clear()

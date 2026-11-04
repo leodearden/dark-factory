@@ -19,6 +19,7 @@ from fused_memory.arm_harness.metrics_record import (
     EMBEDDING_METRIC_IDS,
     LLM_METRIC_IDS,
     DeltaOf,
+    EmbeddingMetricId,
     IndexConfiguration,
     MetricsRecord,
     load_metrics_record,
@@ -81,7 +82,16 @@ def test_metric_id_vocabularies_are_closed_frozensets():
         'mrr',
         'query-embed-latency-p95',
         'reembed-throughput',
+        'mem0-known-item-recall@5',
+        'mem0-known-item-recall@10',
+        'mem0-mrr',
     } == EMBEDDING_METRIC_IDS
+
+
+def test_the_mem0_store_level_ids():
+    assert EmbeddingMetricId.MEM0_KNOWN_ITEM_RECALL_AT_5.value == 'mem0-known-item-recall@5'
+    assert EmbeddingMetricId.MEM0_KNOWN_ITEM_RECALL_AT_10.value == 'mem0-known-item-recall@10'
+    assert EmbeddingMetricId.MEM0_MRR.value == 'mem0-mrr'
 
 
 def test_index_configuration_values():
@@ -169,6 +179,22 @@ def test_other_metrics_forbid_an_index_configuration(axis, metric_id):
 
     with pytest.raises(ValidationError, match='index_configuration'):
         MetricsRecord.model_validate(data)
+
+
+@pytest.mark.parametrize(
+    'metric_id', ['mem0-known-item-recall@5', 'mem0-known-item-recall@10', 'mem0-mrr']
+)
+def test_mem0_metrics_are_store_level_embedding_metrics(metric_id):
+    data = _record_data(axis='embedding', metric=_scalar(metric_id, 0.5))
+
+    record = MetricsRecord.model_validate(data)
+    assert record.index_configuration is None
+    with pytest.raises(ValidationError, match='index_configuration'):
+        MetricsRecord.model_validate(
+            data | {'index_configuration': IndexConfiguration.WITH_INDICES}
+        )
+    with pytest.raises(ValidationError, match=metric_id):
+        MetricsRecord.model_validate(data | {'axis': 'llm'})
 
 
 def test_delta_of_an_arm_with_itself_is_rejected():

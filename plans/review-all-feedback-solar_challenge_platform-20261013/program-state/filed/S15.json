@@ -1,0 +1,129 @@
+{
+ "stream": "S15",
+ "prd_path": "docs/prds/review-all-provider-mode-as-a-typed-axis.md",
+ "sidecar_path": "docs/prds/review-all-provider-mode-as-a-typed-axis.capability-manifest.yaml",
+ "filed": [
+  {
+   "label": "alpha1",
+   "task_id": "1276",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-7d95cbeb4eac"
+   ],
+   "depends_on": [
+    "444",
+    "1014"
+   ],
+   "note": "ProviderMode in settings.py (Q1); billing/providers/binding.py"
+  },
+  {
+   "label": "alpha2",
+   "task_id": "1278",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-7d95cbeb4eac"
+   ],
+   "depends_on": [
+    "1276",
+    "1151"
+   ]
+  },
+  {
+   "label": "beta",
+   "task_id": "1279",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-7d95cbeb4eac"
+   ],
+   "depends_on": [
+    "1276",
+    "1077"
+   ]
+  },
+  {
+   "label": "gamma",
+   "task_id": "1280",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-7d95cbeb4eac"
+   ],
+   "depends_on": [
+    "1278",
+    "1098",
+    "1100",
+    "1235",
+    "301"
+   ],
+   "note": "mode through S2's lifecycle codec; may_push(run, mode)"
+  },
+  {
+   "label": "delta",
+   "task_id": "1025",
+   "priority": "low",
+   "x_finding_key": [
+    "fk-293356f57e99",
+    "fk-060d7b2890a1"
+   ],
+   "depends_on": [
+    "1276",
+    "1014",
+    "1097"
+   ],
+   "note": "amended in place"
+  },
+  {
+   "label": "epsilon",
+   "task_id": "1277",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-9aa17439e81b"
+   ],
+   "depends_on": [],
+   "note": "typed ReferenceKey; gate dep"
+  },
+  {
+   "label": "zeta",
+   "task_id": "1281",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-3ff082154988",
+    "fk-97dcf1114cc0"
+   ],
+   "depends_on": [
+    "1277",
+    "1041"
+   ],
+   "note": "fake fidelity; gate dep"
+  },
+  {
+   "label": "eta",
+   "task_id": "1282",
+   "priority": "low",
+   "x_finding_key": [
+    "fk-7d95cbeb4eac"
+   ],
+   "depends_on": [
+    "1278",
+    "1279",
+    "1280",
+    "1025",
+    "1277",
+    "1281"
+   ],
+   "note": "docs-only companion notes"
+  }
+ ],
+ "held_leaves": [],
+ "gate_dependencies_added": [
+  "1277",
+  "1281"
+ ],
+ "commit_planning_result": "all 8 pending; sidecar stamped",
+ "lead_rulings": [
+  "Nothing held: alpha2 -> 1151 (S3), beta -> 1077 (S24), gamma -> 1235 + 301 (S2) + 1098/1100 (S9), delta -> 1097 (S18).",
+  "Lead 2026-10-15 (Q2): 466 re-scoped onto 1276 + 1277 (edges, note, delivered_check providers-for-issue-built repathed to binding.py; provider-settings-fields-built dropped as delivered by 1276); fk-fc2f2705caa3 stamped on 466 and 641; fk-97dcf1114cc0 and fk-29ac1fb9951f stamped on 637; fk-29ac1fb9951f on 641.",
+  "Q4 edges 641, 644, 655 -> 1277 with notes; 655's view-reference-key checks repathed onto ReferenceKey.of; notes on 656, 465, 467, 653; slow_lane.py move (1025) notes on 1059, 1060, 1222, 1238, 531, 659, 903 with edges 1059/1222 -> 1025.",
+  "Q3 (Leo's eyes): R15 fail-safe recorded in 1279's description; flagged in the lead's report.",
+  "PRD drift (held -> wired; S2-shaped gamma mapping lives in 1280's description) noted by the lead before the sidecar commit."
+ ]
+}

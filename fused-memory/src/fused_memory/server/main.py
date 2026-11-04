@@ -11,7 +11,8 @@ import signal
 import socket
 import sys
 import threading
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -24,7 +25,13 @@ from functools import partial  # noqa: E402
 from shared.mcp_markup_middleware import RepairPolicy  # noqa: E402
 from shared.systemd_listeners import take_systemd_listeners  # noqa: E402
 
-from fused_memory.config.schema import FusedMemoryConfig  # noqa: E402
+from fused_memory.config.schema import (  # noqa: E402
+    DedupOutageDetectorConfig,
+    FusedMemoryConfig,
+)
+from fused_memory.reconciliation.audit_trail_rotation import (  # noqa: E402
+    memory_service_archive,
+)
 from fused_memory.reconciliation.consolidation_gate import (  # noqa: E402
     closure_exists_probe,
 )
@@ -42,7 +49,9 @@ if TYPE_CHECKING:
     from shared.cost_store import CostStore
     from shared.usage_gate import UsageGate
 
+    from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
     from fused_memory.middleware.task_interceptor import TaskInterceptor
+    from fused_memory.middleware.ticket_janitor import TicketJanitor
     from fused_memory.middleware.ticket_store import TicketStore
     from fused_memory.reconciliation.event_queue import EventQueue
     from fused_memory.reconciliation.harness import ReconciliationHarness
@@ -50,6 +59,7 @@ if TYPE_CHECKING:
     from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
     from fused_memory.reconciliation.sqlite_watchdog import SqliteWatchdog
     from fused_memory.server.topic_cluster_store import TopicClusterStore
+    from fused_memory.services.journal_growth_alarm import JournalGrowthAlarm
 
 # Logging
 LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -76,11 +86,12 @@ _HARNESS_CANCEL_TIMEOUT = 25.0
 _CLEANUP_STEP_TIMEOUT = 5.0
 
 # Per-step budget for the memory_service.close step specifically (task 2701).
-# MemoryService.close() runs six sub-closes sequentially, each individually
-# time-boxed at memory_service._SUBCLOSE_TIMEOUT (3.0s), so this outer step
-# budget must dominate 6 * _SUBCLOSE_TIMEOUT (=18s) with margin. 20s does and
-# fits inside _FORCE_EXIT_BUDGET's existing headroom (the worst-case step sum
-# below rises to 70s <= 75s) while leaving graceful+force<systemd untouched —
+# MemoryService.close() runs its sub-closes sequentially, each individually
+# time-boxed, so this outer step budget must dominate their sum,
+# services/memory_service.py::MemoryService.close_budget_secs, with margin.
+# 20s does and fits inside _FORCE_EXIT_BUDGET's existing headroom (the
+# worst-case step sum below rises to 70s <= 75s) while leaving
+# graceful+force<systemd untouched —
 # so the schema.py _MIRROR_* mirror and the systemd-template parity test stay
 # valid. Guarded by TestShutdownBudgetArithmetic in tests/test_server_shutdown.py.
 _MEMORY_CLOSE_STEP_TIMEOUT = 20.0
@@ -562,7 +573,13 @@ async def run_server():
     await memory_service.initialize()
 
     # Initialize write journal
+    from fused_memory.services.journal_retention import prune_every_table_at_startup
+    from fused_memory.services.mem0_write_retry import (
+        DEFAULT_MEM0_RETRY_POLICY,
+        run_periodic_mem0_retry,
+    )
     from fused_memory.services.write_journal import WriteJournal
+    from fused_memory.services.write_ops_retention import run_periodic_write_ops_prune
 
     wj_data_dir = Path(config.reconciliation.data_dir) if config.reconciliation else Path('./data')
     write_journal = WriteJournal(wj_data_dir)
@@ -577,47 +594,10 @@ async def run_server():
     _mem0_recovery = await memory_service.recover_mem0_intents()
     logger.info(f'mem0 intent recovery at startup: {_mem0_recovery}')
 
-    # Bounded retention: age out old terminal mem0_intents so the write-ahead
-    # journal does not grow without bound (one row accrues per successful mem0
-    # write). Runs after recovery so no still-pending intent is ever pruned;
-    # 'dead' dead-letters are preserved for manual replay. Fire-and-forget.
-    _mem0_pruned = await write_journal.prune_mem0_intents()
-    if _mem0_pruned:
-        logger.info(f'mem0 intent retention prune at startup: {_mem0_pruned} rows')
-
-    # Bounded retention: age out old idempotent_ops so the client-idempotency
-    # key table does not grow without bound (one row accrues per mutating task
-    # write). An idempotency key only needs to outlive the transport-retry
-    # window it guards, so the default TTL is aggressive. Fire-and-forget.
-    _idempotent_pruned = await write_journal.prune_idempotent_ops()
-    if _idempotent_pruned:
-        logger.info(
-            f'idempotent_ops retention prune at startup: {_idempotent_pruned} rows'
-        )
-
-    # Bounded retention: age out old write_ops so the journal does not grow
-    # without bound. UNLIKE its two siblings above this prune is BATCHED,
-    # ROW-BUDGETED and DEADLINE-BOUNDED: write_ops was measured at 35.4M rows /
-    # 16 GB, and an unbounded DELETE here would hold the write lock past the
-    # watchdog's 120 s startup grace (STARTUP_GRACE_SECS in
-    # scripts/orchestrator-watchdog.py) while silently dropping journal rows —
-    # log_write_op swallows its own errors and busy_timeout is only 5000 ms — so
-    # it would corrupt the very telemetry it is pruning. A first run against the
-    # current backlog will legitimately need many restarts to drain, which the
-    # prune discloses at WARNING rather than hiding. Fire-and-forget.
-    _wj = config.write_journal
-    _write_ops_pruned = await write_journal.prune_write_ops(
-        read_older_than_days=_wj.read_retention_days,
-        search_older_than_days=_wj.search_retention_days,
-        write_older_than_days=_wj.write_retention_days,
-        batch_size=_wj.prune_batch_size,
-        max_rows=_wj.prune_max_rows_per_run,
-        max_seconds=_wj.prune_max_seconds,
-    )
-    if _write_ops_pruned:
-        logger.info(
-            f'write_ops retention prune at startup: {_write_ops_pruned} rows'
-        )
+    # Must follow mem0 intent recovery, so no still-pending intent is pruned.
+    _pruned = await prune_every_table_at_startup(write_journal, config.write_journal)
+    if any(_pruned.values()):
+        logger.info(f'write journal retention prune at startup: {_pruned}')
 
     # Initialize task backend (SqliteTaskBackend).
     taskmaster = None
@@ -682,16 +662,14 @@ async def run_server():
     # be noticed any other way. Pure data, no lifetime coupling, same injection
     # pattern ReconciliationHarness and TicketJanitor already use.
     #
-    # KNOWINGLY UNCOVERED, and the asymmetry is the reason. Those two components
-    # need no wiring test because each DEFENDS ITSELF — omit the kwarg and it
-    # calls build_known_projects_map. This escalator has no such fallback (a
-    # safe fallback source is an open question: the module docstring forbids
-    # config.taskmaster.project_root, which defaults to '.'), so it depends on
-    # this one call. Deleting or reordering the line degrades the storm alarm to
-    # a WARN with no test failure. Do NOT "cover" it with a grep- or ast-based
-    # meta-test: that shape was deleted from this repo in fb3c47dccf on a
-    # CONFIRMED review finding. The real fix is tracked as a follow-up to task
-    # 3088 (escalation agent-followup-3088).
+    # MemoryService already seeds this registry from DASHBOARD_KNOWN_PROJECT_ROOTS,
+    # so this call adds the primary root rather than enabling the alarm. Tests pin
+    # the seed and set_known_projects' replace-on-set behaviour, but NO test
+    # exercises this call site: deleting or reordering it leaves every test
+    # green while a primary root the env var does not list loses its storm,
+    # dead-letter and entity-mint alarms. Do NOT "cover" it with a grep- or
+    # ast-based meta-test: that shape was deleted from this repo in fb3c47dccf
+    # on a CONFIRMED review finding.
     memory_service.set_known_projects(_known_projects_map)
     if len(_known_projects_map) > 1:
         prefix_registry: ProjectPrefixRegistry | None = (
@@ -808,6 +786,7 @@ async def run_server():
             burst_cooldown_seconds=config.reconciliation.burst_cooldown_seconds,
             stale_lock_seconds=config.reconciliation.stale_lock_seconds,
             queue_stats_fn=memory_service.durable_queue.get_stats if memory_service.durable_queue else None,
+            coalesce_task_events=config.reconciliation.coalesce_task_events,
         )
         await event_buffer.initialize()
 
@@ -912,6 +891,7 @@ async def run_server():
             event_queue=event_queue,
             backlog_policy=backlog_policy,
             usage_gate=curator_usage_gate,
+            cost_store=curator_cost_store,
             ticket_store=ticket_store,
             bulk_reset_guard=bulk_reset_guard,
             prefix_registry=prefix_registry,
@@ -926,6 +906,7 @@ async def run_server():
         # Wire the write journal so task writes leave durable audit rows.
         task_interceptor.set_write_journal(write_journal)
         _wire_closure_collaborators(task_interceptor, memory_service)
+        _wire_audit_trail_archive(task_interceptor, memory_service)
 
         # PRD γ (task 1546): Pre-build recon_report components here — before
         # ReconciliationHarness is constructed — so the SAME ReconReportState
@@ -999,6 +980,7 @@ async def run_server():
             taskmaster, None, event_buffer,
             config=config, escalator=curator_escalator,
             usage_gate=curator_usage_gate,
+            cost_store=curator_cost_store,
             ticket_store=ticket_store,
             prefix_registry=prefix_registry,
             scope_violation_escalator=scope_violation_escalator,
@@ -1007,6 +989,7 @@ async def run_server():
         await task_interceptor.start()
         task_interceptor.set_write_journal(write_journal)
         _wire_closure_collaborators(task_interceptor, memory_service)
+        _wire_audit_trail_archive(task_interceptor, memory_service)
 
     # Machine-derived topic clusters (task 3135). Built in both branches above
     # and never gated on reconciliation.enabled or the autoseed leaf: both of
@@ -1057,43 +1040,28 @@ async def run_server():
     loop_lag_task: asyncio.Task[None] = _start_loop_lag_monitor(config)
 
     # Ticket janitor — periodic sweep that surfaces failed tickets to the
-    # orchestrator as info-severity ticket_failure escalations. Replaces the
-    # per-call resolve_ticket wait the steward / deep_reviewer used to chain.
+    # orchestrator as info-severity ticket_failure escalations, and the curator
+    # dedup-outage signature as a blocking infra_issue. Replaces the per-call
+    # resolve_ticket wait the steward / deep_reviewer used to chain. It is also
+    # the only retrier of tickets parked awaiting_curation.
     janitor_task: asyncio.Task[None] | None = None
-    janitor_cfg = getattr(config.curator, 'janitor', None)
-    if janitor_cfg is not None and janitor_cfg.enabled and ticket_store is not None:
-        from fused_memory.middleware.ticket_janitor import TicketJanitor
-
-        _janitor_primary_root = (
-            config.taskmaster.project_root if config.taskmaster else ''
-        ) or ''
-        if _janitor_primary_root:
-            _janitor_primary_root = str(
-                Path(_janitor_primary_root).expanduser().resolve(),
-            )
-        ticket_janitor = TicketJanitor(
-            ticket_store,
-            cooldown_secs=janitor_cfg.cooldown_seconds,
-            batch_limit=janitor_cfg.batch_limit,
-            primary_project_root=_janitor_primary_root,
-            liveness_probe=(
-                task_interceptor.is_worker_alive
-                if task_interceptor is not None else None
-            ),
-            signal_ticket_resolved=(
-                task_interceptor._signal_ticket_event
-                if task_interceptor is not None else None
-            ),
-            known_projects=_known_projects_map,
-        )
+    ticket_janitor = (
+        _build_ticket_janitor(config, ticket_store, task_interceptor, _known_projects_map)
+        if ticket_store is not None else None
+    )
+    if ticket_janitor is not None:
+        janitor_cfg = config.curator.janitor
+        dedup_outage_cfg = _dedup_outage_detector_config(config)
         janitor_task = asyncio.create_task(
             ticket_janitor.run_loop(janitor_cfg.interval_seconds),
         )
         logger.info(
-            '  Ticket janitor: enabled (interval=%.0fs cooldown=%.0fs batch=%d)',
+            '  Ticket janitor: enabled (interval=%.0fs cooldown=%.0fs batch=%d '
+            'dedup_outage=%s)',
             janitor_cfg.interval_seconds,
             janitor_cfg.cooldown_seconds,
             janitor_cfg.batch_limit,
+            dedup_outage_cfg is not None and dedup_outage_cfg.enabled,
         )
     else:
         logger.info('  Ticket janitor: disabled')
@@ -1117,13 +1085,29 @@ async def run_server():
         recon_ledger=recon_ledger,
     )
     if _checkpoint_targets:
+        from fused_memory.services.journal_growth_alarm import JournalGrowthAlarm
+
+        growth_alarm = JournalGrowthAlarm(
+            write_journal,
+            config.write_journal_growth_alarm,
+            project_root=_primary_root or None,
+        )
         checkpoint_task = asyncio.create_task(
-            _periodic_checkpoint_loop(_checkpoint_targets),
+            _periodic_checkpoint_loop(_checkpoint_targets, growth_alarm=growth_alarm),
         )
         logger.info(
             '  Checkpoint loop: enabled (interval=%.0fs, targets=%s)',
             _CHECKPOINT_INTERVAL,
             [name for name, _ in _checkpoint_targets],
+        )
+        logger.info(
+            '  Write-journal growth alarm: max_file_bytes=%d '
+            'max_rows_inserted_per_day=%d interval=%.0fs, '
+            'rounded up to whole %.0fs checkpoint ticks',
+            config.write_journal_growth_alarm.max_file_bytes,
+            config.write_journal_growth_alarm.max_rows_inserted_per_day,
+            config.write_journal_growth_alarm.check_interval_seconds,
+            _CHECKPOINT_INTERVAL,
         )
     else:
         logger.info('  Checkpoint loop: no SQLite targets — skipped')
@@ -1145,6 +1129,34 @@ async def run_server():
         )
     else:
         logger.info('  Summary rebuild loop: disabled')
+
+    write_ops_prune_task = asyncio.create_task(
+        run_periodic_write_ops_prune(write_journal, config.write_journal),
+    )
+    logger.info(
+        '  Write-ops prune loop: every %.0fs, each pass bounded by %.0fs / %d rows',
+        config.write_journal.prune_interval_seconds,
+        config.write_journal.prune_max_seconds,
+        config.write_journal.prune_max_rows_per_run,
+    )
+
+    mem0_retry_task = asyncio.create_task(
+        run_periodic_mem0_retry(
+            memory_service.retry_due_mem0_intents,
+            interval_seconds=DEFAULT_MEM0_RETRY_POLICY.poll_interval_seconds,
+        ),
+    )
+    logger.info(
+        '  Mem0 write retry loop: every %.0fs, up to %d due intents per pass',
+        DEFAULT_MEM0_RETRY_POLICY.poll_interval_seconds,
+        DEFAULT_MEM0_RETRY_POLICY.batch_size,
+    )
+
+    remint_sweep_task: asyncio.Task[None] | None = _start_remint_sweep(
+        taskmaster,
+        task_interceptor.remint_broken_recurrence_chains,
+        _known_projects_map.values(),
+    )
 
     # Run transport
     transport = config.server.transport
@@ -1319,6 +1331,16 @@ async def run_server():
             rebuild_summaries_task.cancel()
             with contextlib.suppress(BaseException):
                 await rebuild_summaries_task
+        write_ops_prune_task.cancel()
+        with contextlib.suppress(BaseException):
+            await write_ops_prune_task
+        mem0_retry_task.cancel()
+        with contextlib.suppress(BaseException):
+            await mem0_retry_task
+        if remint_sweep_task is not None:
+            remint_sweep_task.cancel()
+            with contextlib.suppress(BaseException):
+                await remint_sweep_task
         loop_lag_task.cancel()
         with contextlib.suppress(BaseException):
             await loop_lag_task
@@ -1379,6 +1401,9 @@ def _collect_checkpoint_targets(
     pe = getattr(memory_service, 'planned_episode_registry', None)
     if pe is not None and hasattr(pe, 'checkpoint'):
         targets.append(('planned_episode_registry', pe.checkpoint))
+    shadow = getattr(memory_service, 'overreach_shadow', None)
+    if shadow is not None and hasattr(shadow, 'checkpoint'):
+        targets.append(('overreach_shadow', shadow.checkpoint))
     if known_projects:
         for project_id, root in known_projects.items():
             targets.append((
@@ -1592,6 +1617,36 @@ def _start_loop_lag_monitor(config) -> asyncio.Task[None]:
     )
 
 
+def _start_remint_sweep(
+    task_backend: TaskBackendProtocol | None,
+    remint: Callable[[str], Awaitable[object]],
+    project_roots: Iterable[str],
+) -> asyncio.Task[None] | None:
+    """Spawn the recurrence re-mint sweep (task 6572) and RETURN its handle for teardown.
+
+    The sweep repairs chains left done with no successor by a failed mint or a
+    crash between the done write and the mint. Without a task backend there
+    is no chain to repair, so nothing is spawned.
+    """
+    from fused_memory.middleware.recurrence_mint import (
+        REMINT_SWEEP_INTERVAL_SECS,
+        run_remint_sweep_loop,
+    )
+
+    if task_backend is None:
+        logger.info('  Recurrence re-mint sweep: disabled (no task backend)')
+        return None
+    roots = tuple(project_roots)
+    logger.info(
+        '  Recurrence re-mint sweep: enabled (at startup, then every %.0fs, %d project root(s))',
+        REMINT_SWEEP_INTERVAL_SECS,
+        len(roots),
+    )
+    return asyncio.create_task(
+        run_remint_sweep_loop(remint, roots), name='recurrence_remint_sweep',
+    )
+
+
 async def _run_checkpoint_cycle(targets: list[tuple[str, object]]) -> None:
     """One pass of WAL TRUNCATE checkpoints over every target.
 
@@ -1599,8 +1654,6 @@ async def _run_checkpoint_cycle(targets: list[tuple[str, object]]) -> None:
     from :func:`_periodic_checkpoint_loop` so unit tests can exercise the
     bookkeeping without waiting for ``_CHECKPOINT_INTERVAL``.
     """
-    from datetime import UTC, datetime
-
     now_iso = datetime.now(UTC).isoformat()
     for name, fn in targets:
         try:
@@ -1655,20 +1708,32 @@ async def _run_checkpoint_cycle(targets: list[tuple[str, object]]) -> None:
                 )
 
 
-async def _periodic_checkpoint_loop(targets: list[tuple[str, object]]) -> None:
-    """Run ``_run_checkpoint_cycle`` every :data:`_CHECKPOINT_INTERVAL` s.
+async def _periodic_checkpoint_loop(
+    targets: list[tuple[str, object]],
+    *,
+    growth_alarm: JournalGrowthAlarm | None = None,
+    interval: float = _CHECKPOINT_INTERVAL,
+) -> None:
+    """Run ``_run_checkpoint_cycle`` every *interval* s (:data:`_CHECKPOINT_INTERVAL`).
 
     Bounds the un-flushed WAL window so a stalled PASSIVE auto-checkpoint
     (the 2026-05-13 failure mode) can't accumulate indefinitely. The
     cycle is independent of the per-project write lock — SQLite serialises
-    the checkpoint against writers internally.
+    the checkpoint against writers internally. After each cycle the
+    write-journal *growth_alarm* gets its tick; its failure is logged and
+    never stops checkpointing.
     """
     while True:
         try:
-            await asyncio.sleep(_CHECKPOINT_INTERVAL)
+            await asyncio.sleep(interval)
         except asyncio.CancelledError:
             return
         await _run_checkpoint_cycle(targets)
+        if growth_alarm is not None:
+            try:
+                await growth_alarm.maybe_check()
+            except Exception:
+                logger.exception('write_journal growth alarm failed; checkpointing continues')
 
 
 async def _run_rebuild_summaries_cycle(memory_service, cfg) -> None:
@@ -1830,13 +1895,71 @@ def _resolve_curator_escalator_state_path(config: FusedMemoryConfig) -> Path:
     return Path('./data/curator_escalator_state.json')
 
 
+def _build_ticket_janitor(
+    config: FusedMemoryConfig,
+    ticket_store: TicketStore,
+    task_interceptor: TaskInterceptor | None,
+    known_projects: dict[str, str],
+) -> TicketJanitor | None:
+    """The ticket janitor, wired to drain parked tickets through *task_interceptor*; None when disabled."""
+    from fused_memory.middleware.ticket_janitor import TicketJanitor
+
+    janitor_cfg = getattr(config.curator, 'janitor', None)
+    if janitor_cfg is None or not janitor_cfg.enabled:
+        return None
+    primary_root = (config.taskmaster.project_root if config.taskmaster else '') or ''
+    if primary_root:
+        primary_root = str(Path(primary_root).expanduser().resolve())
+    return TicketJanitor(
+        ticket_store,
+        cooldown_secs=janitor_cfg.cooldown_seconds,
+        batch_limit=janitor_cfg.batch_limit,
+        primary_project_root=primary_root,
+        liveness_probe=task_interceptor.is_worker_alive if task_interceptor is not None else None,
+        signal_ticket_resolved=(
+            task_interceptor._signal_ticket_event if task_interceptor is not None else None
+        ),
+        requeue_ticket=(
+            task_interceptor.requeue_awaiting_curation_ticket
+            if task_interceptor is not None else None
+        ),
+        known_projects=known_projects,
+        dedup_outage=_dedup_outage_detector_config(config),
+        curation_backlog_min_attempts=janitor_cfg.curation_backlog_escalation_min_attempts,
+    )
+
+
+def _dedup_outage_detector_config(
+    config: FusedMemoryConfig,
+) -> DedupOutageDetectorConfig | None:
+    """The janitor's dedup-outage detector config, or None with the curator disabled.
+
+    A deliberately disabled curator resolves every ticket as a fast create
+    with no combine, which is the outage signature; there is no dedup to lose.
+    ``curator.enabled`` is restart-only, so deciding once at wiring is exact.
+    """
+    if not config.curator.enabled:
+        return None
+    return config.curator.janitor.dedup_outage
+
+
+def _mint_curator_run_id() -> str:
+    """A readable per-process curator run id: a fused-memory restart is a run boundary."""
+    return f'fused-memory-{datetime.now(UTC):%Y%m%dT%H%M%SZ}-{os.getpid()}'
+
+
 async def _setup_curator_usage_gate(
     config: FusedMemoryConfig,
+    *,
+    run_id: str | None = None,
 ) -> tuple[CostStore | None, UsageGate | None]:
     """Open a CostStore and construct a UsageGate for the curator, with leak protection.
 
     If ``config.usage_cap`` is None or disabled, returns ``(None, None)``
     without allocating any resources.
+
+    The gate is stamped with *run_id* (minted per process when omitted), the
+    run key the gate's account events and the curator's invocations share.
 
     Otherwise the CostStore is opened first (persistent aiosqlite connection).
     If ``UsageGate.__init__`` or the success-path log subsequently raises for
@@ -1846,8 +1969,7 @@ async def _setup_curator_usage_gate(
 
     **Cancellation hardening:** each cleanup await is wrapped in
     ``asyncio.shield(...)`` and guarded by ``except BaseException:`` +
-    log-and-swallow.  This mirrors the pattern at
-    ``SqliteTaskBackend._txn`` (``sqlite_task_backend.py:414-417``):
+    log-and-swallow:
     shielding prevents an external cancel from tearing the close mid-flush;
     catching ``BaseException`` ensures a synchronous ``CancelledError``
     originating inside the awaited coroutine cannot mask the original
@@ -1870,6 +1992,7 @@ async def _setup_curator_usage_gate(
     curator_usage_gate: UsageGate | None = None
     try:
         curator_usage_gate = UsageGate(config.usage_cap, cost_store=curator_cost_store)
+        curator_usage_gate.run_id = run_id or _mint_curator_run_id()
         logger.info(
             f'  Curator usage gate: {curator_usage_gate.account_count} account(s) '
             f'from {config.usage_cap.accounts_file or "inline"}',
@@ -2434,6 +2557,16 @@ def _wire_closure_collaborators(task_interceptor: Any, memory_service: Any) -> N
         count=_closure_count,
         exists=closure_exists_probe(memory_service),
     )
+
+
+def _wire_audit_trail_archive(task_interceptor: Any, memory_service: Any) -> None:
+    """Arm the audit-trail rotation (task 5771); it is dormant until this runs.
+
+    Called from both ``TaskInterceptor`` construction arms, beside
+    ``_wire_closure_collaborators``. The rule lives in
+    ``reconciliation/audit_trail_rotation.py``.
+    """
+    task_interceptor.set_audit_trail_archive(memory_service_archive(memory_service))
 
 
 def main():

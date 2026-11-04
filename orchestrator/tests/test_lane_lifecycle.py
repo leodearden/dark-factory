@@ -13,7 +13,8 @@ import codecs
 import json
 import locale
 import logging
-from datetime import datetime
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -583,6 +584,97 @@ class TestNoteAssigned:
         assert record.state == LaneState.IN_USE
         assert record.task_id == '42'
         assert record_path.read_bytes() == before_bytes
+
+
+# ---------------------------------------------------------------------------
+# refresh_assigned — the REUSE-dispatch activity stamp (task 7863): rewrites
+# only updated_at, the age clock warm-lane-gc.sh's record gate reads, on a
+# record the caller already holds; refuses anything else without writing.
+# ---------------------------------------------------------------------------
+
+
+def _backdate(lifecycle: LaneLifecycle, lane: Path, *, days: int) -> str:
+    """Rewrite *lane*'s on-disk updated_at to *days* ago; return that stamp."""
+    path = lifecycle.state_dir / f'{lane.name}.json'
+    record = LaneRecord.from_json(path.read_text(encoding='utf-8'))
+    stamp = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+    path.write_text(replace(record, updated_at=stamp).to_json(), encoding='utf-8')
+    return stamp
+
+
+def _assigned_lane(tmp_path: Path, lifecycle: LaneLifecycle, task_id: str) -> Path:
+    lane = tmp_path / '_lane-0'
+    lifecycle.transition(lane, LaneState.SEED, seeded_from_sha='abc123')
+    lifecycle.transition(lane, LaneState.REGISTERED, branch=f'task/{task_id}')
+    lifecycle.transition(lane, LaneState.ASSIGNED, task_id=task_id, title='demo')
+    return lane
+
+
+def _assert_recent(stamp: str, *, newer_than: str) -> None:
+    moment = datetime.fromisoformat(stamp)
+    assert moment > datetime.fromisoformat(newer_than)
+    assert abs(datetime.now(UTC) - moment) < timedelta(minutes=5)
+
+
+def _no_record(tmp_path: Path, lifecycle: LaneLifecycle) -> Path:
+    return tmp_path / '_lane-0'
+
+
+def _held_by_other_task(tmp_path: Path, lifecycle: LaneLifecycle) -> Path:
+    return _assigned_lane(tmp_path, lifecycle, '99')
+
+
+def _quarantined_holding_task(tmp_path: Path, lifecycle: LaneLifecycle) -> Path:
+    lane = _assigned_lane(tmp_path, lifecycle, '42')
+    lifecycle.transition(lane, LaneState.QUARANTINED)
+    return lane
+
+
+class TestRefreshAssigned:
+    def test_assigned_same_task_restamps_updated_at_and_keeps_every_other_field(
+        self, tmp_path: Path,
+    ):
+        lifecycle = _lifecycle(tmp_path)
+        lane = _assigned_lane(tmp_path, lifecycle, '42')
+        old = _backdate(lifecycle, lane, days=30)
+        before = lifecycle.read(lane)
+
+        returned = lifecycle.refresh_assigned(lane, task_id='42')
+
+        _assert_recent(returned.updated_at, newer_than=old)
+        assert replace(returned, updated_at=old) == before
+        assert lifecycle.read(lane) == returned
+
+    def test_in_use_same_task_restamps_and_stays_in_use(self, tmp_path: Path):
+        lifecycle = _lifecycle(tmp_path)
+        lane = _assigned_lane(tmp_path, lifecycle, '42')
+        lifecycle.transition(lane, LaneState.IN_USE)
+        old = _backdate(lifecycle, lane, days=30)
+        before = lifecycle.read(lane)
+
+        returned = lifecycle.refresh_assigned(lane, task_id='42')
+
+        assert returned.state == LaneState.IN_USE
+        _assert_recent(returned.updated_at, newer_than=old)
+        assert replace(returned, updated_at=old) == before
+        assert lifecycle.read(lane) == returned
+
+    @pytest.mark.parametrize(
+        'make_lane',
+        [_no_record, _released_lane, _held_by_other_task, _quarantined_holding_task],
+        ids=['absent', 'released', 'assigned-to-99', 'quarantined'],
+    )
+    def test_refuses_a_record_task_does_not_hold(self, tmp_path: Path, make_lane):
+        lifecycle = _lifecycle(tmp_path)
+        lane = make_lane(tmp_path, lifecycle)
+        record_path = lifecycle.state_dir / f'{lane.name}.json'
+        before_bytes = record_path.read_bytes() if record_path.exists() else None
+
+        with pytest.raises(IllegalLaneTransition, match="'42'"):
+            lifecycle.refresh_assigned(lane, task_id='42')
+
+        after_bytes = record_path.read_bytes() if record_path.exists() else None
+        assert after_bytes == before_bytes
 
 
 # ---------------------------------------------------------------------------

@@ -10,12 +10,26 @@ Routing policy (keyed off orchestrator liveness):
 
 * **Orchestrator is running** for the target project — submit a level-1
   escalation to the project's queue and return; the escalation watcher
-  runs ``/unblock`` against it. We degrade to ``action='create'`` so the
-  current ``add_task`` call still succeeds.
+  runs ``/unblock`` against it. The curator then defers, so the submission
+  is parked awaiting curation and retried until it gets a verdict; only a
+  zero-output hang degrades to ``action='create'``, marked ``degraded_by_zot``.
 
 * **No orchestrator** (typical interactive MCP usage) — re-raise the
   failure so the MCP caller sees a loud error instead of a silent
   curator outage.
+
+* **N consecutive degraded curations** (``report_consecutive_degraded``) —
+  reached by COUNT rather than by exception class, and queued unconditionally
+  while an orchestrator is running. Every other route above needs to know what
+  failed; this one only needs to know that curation has stopped working, which
+  is what makes it the backstop for the failure class nobody has handled yet.
+  It never raises, because its caller is already degrading.
+
+* **Backend binary unresolvable** (``report_backend_binary_unresolvable``) —
+  raised by the curator's startup self-check. A total outage: nothing is
+  deduped anywhere until an operator changes the environment, so the
+  escalation carries the remediation rather than just the symptom. Also
+  never raises.
 
 * **Post-ZOT duplicate finding** (``report_zot_duplicate``) — one level-1
   ``curator_zot_duplicate`` record per (new task, near-duplicate) pair,
@@ -44,11 +58,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from shared.project_layout import escalation_queue_dir
+
+from fused_memory.middleware.curator_types import CuratorFailureError
 from fused_memory.middleware.curator_zot_duplicate_sweep import (
     DUPLICATE_METADATA_KEY,
     DuplicateFinding,
 )
-from fused_memory.middleware.task_curator import CuratorFailureError
 from fused_memory.services.orchestrator_detector import is_orchestrator_lock_held
 
 if TYPE_CHECKING:
@@ -76,7 +92,6 @@ logger = logging.getLogger(__name__)
 
 
 _DEFAULT_COOLDOWN_SECS = 3600.0
-_QUEUE_DIRNAME = 'data/escalations'
 
 # Short in-process dedup window for zero-output-timeout reports. A batch of N
 # candidates that all hit ZOT bisects to N concurrent size-1 curate() calls,
@@ -92,6 +107,11 @@ _ZOT_DEDUP_WINDOW_SECS = 60.0
 _ZOT_CATEGORY = 'curator_zero_output_hang'
 _ZOT_ROOT_CAUSE = 'curator-empty-output-pre-turn-hang'
 _ZOT_DUPLICATE_CATEGORY = 'curator_zot_duplicate'
+
+# The curator-bucket SUBJECT pseudo-task id, shared deliberately with ticket_janitor
+# so every curator-subsystem escalation lands in one task history; pinned equal by
+# tests/test_folded_escalation.py::_DELIBERATE_ALIASES.
+_ANCHOR_TASK_ID: str = 'task-curator'
 
 
 def _transcript_evidence_lines(
@@ -113,7 +133,7 @@ def _curator_escalation(
     """Build a level-1 record in the fixed envelope every curator escalation shares."""
     return Escalation(
         id=queue.make_id('curator'),
-        task_id='task-curator',
+        task_id=_ANCHOR_TASK_ID,
         agent_role='fused-memory/task-curator',
         severity='blocking',
         category=category,
@@ -307,7 +327,7 @@ class CuratorEscalator:
     def _queue_for(self, project_root: str) -> EscalationQueue:
         q = self._queues.get(project_root)
         if q is None:
-            q = EscalationQueue(Path(project_root) / _QUEUE_DIRNAME)
+            q = EscalationQueue(escalation_queue_dir(project_root))
             self._queues[project_root] = q
         return q
 
@@ -461,9 +481,10 @@ class CuratorEscalator:
                 f'NOTE: this is the {self._ESCALATE_FIRST_N}rd curator failure '
                 f'for this project within the last hour. Further curator '
                 f'failures will be suppressed from escalation for 1h '
-                f'(until {resume_iso}). Investigate immediately — dedupe is '
-                f'intermittently disabled. See logs for `task_curator: '
-                f'decision=create cost_usd=0.0000` entries.',
+                f'(until {resume_iso}). Investigate immediately — submissions '
+                f'are parked awaiting curation and retried until the curator '
+                f'recovers. See the curation-backlog record and the logs for '
+                f'`deferring curation` entries.',
             )
         detail = '\n'.join(detail_lines)
 
@@ -472,8 +493,8 @@ class CuratorEscalator:
             queue,
             category='curator_failure',
             summary=(
-                'TaskCurator LLM failing; dedupe bypassed for this ticket '
-                '(and for further filings while the outage persists).'
+                'TaskCurator LLM failing; this submission is parked awaiting '
+                'curation and retried (as are further filings while the outage persists).'
             ),
             detail=detail,
         )
@@ -598,8 +619,8 @@ class CuratorEscalator:
             'structured-output curator/recon call is permission-denied. Fix that '
             'substitution so StructuredOutput is NOT blocked (the live check is '
             'shared/tests/test_wildcard_deny_live_inventory.py, -m integration), '
-            'then restart fused-memory.service. Task dedupe is DISABLED for this '
-            'project until it is fixed.',
+            'then restart fused-memory.service. Until it is fixed, every task '
+            'submission for this project is parked awaiting curation.',
         )
         detail = '\n'.join(detail_lines)
 
@@ -610,8 +631,8 @@ class CuratorEscalator:
             summary=(
                 'CRITICAL: schema StructuredOutput tool DENIED — CLI '
                 "tool-exclusion semantics changed; cli_invoke's --tools '' "
-                'substitution no longer permits the schema tool. Dedupe disabled '
-                'until it is fixed.'
+                'substitution no longer permits the schema tool. Submissions park '
+                'awaiting curation until it is fixed.'
             ),
             detail=detail,
         )
@@ -623,8 +644,207 @@ class CuratorEscalator:
         logger.error(
             'curator_escalator: queued schema-tool-denied L1 escalation %s for '
             "project %s — StructuredOutput tool blocked despite cli_invoke's --tools ''; "
-            'dedupe disabled until fixed',
+            'submissions park awaiting curation until fixed',
             escalation.id, project_id,
+        )
+
+    async def report_consecutive_degraded(
+        self,
+        *,
+        project_root: str,
+        project_id: str,
+        streak: int,
+        threshold: int,
+        last_justification: str,
+        candidate_title: str,
+    ) -> None:
+        """Alarm on a run of degraded curations, regardless of what caused them.
+
+        Every other path in this module is reached by exception CLASS. This one
+        is reached by COUNT, which is the whole point: per-class instrumentation
+        is always one unknown class behind the next outage, and the hole is
+        invisible precisely while it matters. A streak alarm cannot know what
+        went wrong, but it cannot be evaded by a novel failure mode either.
+
+        Never raises. The caller is already inside ``curate()``'s degraded path,
+        so raising would escalate a curator that is merely degrading into one
+        that fails ``add_task`` outright.
+
+        Never touches ``_failure_log``: burst suppression would hide a sustained
+        outage behind a single stale L1, which is the failure shape this alarm
+        exists to end.
+        """
+        if not HAS_ESCALATION:
+            logger.warning(
+                'curator_escalator: %d consecutive degraded curations for project '
+                '%s (threshold %d) but the escalation package is unavailable — '
+                'alarm not queued. last_justification=%r candidate_title=%r',
+                streak, project_id, threshold, last_justification, candidate_title,
+            )
+            return
+
+        if not await asyncio.to_thread(is_orchestrator_lock_held, project_root):
+            logger.error(
+                'curator_escalator: %d consecutive degraded curations for project '
+                '%s (threshold %d) and no orchestrator is running — alarm not '
+                'queued. last_justification=%r candidate_title=%r',
+                streak, project_id, threshold, last_justification, candidate_title,
+            )
+            return
+
+        detail = '\n'.join([
+            f'project_id={project_id!r}',
+            f'streak={streak}',
+            f'threshold={threshold}',
+            f'candidate_title={candidate_title!r}',
+            f'last_justification={last_justification}',
+            '',
+            'NOTE: this alarm is class-agnostic BY DESIGN. It does not know '
+            'what failed — it counts consecutive degraded decisions and trips '
+            'at the threshold. Every other escalation here keys off a specific '
+            'exception class, and that instrumentation will always have a hole: '
+            'the next outage arrives as a class nobody has handled yet. On '
+            '2026-08-13 to 08-18 such a hole (a FileNotFoundError for the '
+            'claude binary) kept the curator degrading to action=create for '
+            'five days, costing >=80h of fleet-wide dedupe. This path is the '
+            'backstop that bounds the next one at `threshold` curations.',
+            '',
+            f'Every curation counted in this streak for project {project_id!r} '
+            'returned action=create WITHOUT a usable dedupe judgement, so '
+            'duplicate tasks filed in that window were never deduped and may '
+            'need a sweep. The streak is counted per project; other projects '
+            'served by the same curator may be healthy.',
+        ])
+
+        queue = self._queue_for(project_root)
+        escalation = Escalation(
+            id=queue.make_id('curator'),
+            task_id=_ANCHOR_TASK_ID,
+            agent_role='fused-memory/task-curator',
+            severity='blocking',
+            category='curator_consecutive_degraded',
+            summary=(
+                f'curator degraded {streak} consecutive curations (threshold '
+                f'{threshold}) — every candidate in that run was filed without '
+                f'dedupe. Cause unknown to this alarm by design; see detail.'
+            ),
+            detail=detail,
+            level=1,
+        )
+        try:
+            queue.submit(escalation)
+        except Exception:
+            logger.exception(
+                'curator_escalator: failed to submit consecutive-degraded '
+                'escalation for project %s',
+                project_id,
+            )
+            # Do not re-raise — falling through to action='create' is safer than
+            # failing add_task just because queue I/O broke.
+            return
+
+        logger.error(
+            'curator_escalator: queued consecutive-degraded L1 escalation %s for '
+            'project %s — streak=%d threshold=%d last_justification=%r',
+            escalation.id, project_id, streak, threshold, last_justification,
+        )
+
+    async def report_backend_binary_unresolvable(
+        self,
+        *,
+        project_root: str,
+        project_id: str,
+        binary_spec: str,
+        search_path: str,
+    ) -> None:
+        """Alarm on a curator backend binary that does not resolve at all.
+
+        Total, not partial: while this holds, every curation on every project
+        fails before consulting the LLM, so every submission is parked awaiting
+        curation, and nothing in the environment will change on its own. It is a
+        config break rather than a flaky candidate, so it carries its own
+        category and its own remediation — an operator reading the escalation
+        should not have to derive the fix.
+
+        Like :meth:`report_consecutive_degraded`: never raises (the caller is
+        curator startup) and never touches ``_failure_log``.
+        """
+        if not HAS_ESCALATION:
+            logger.warning(
+                'curator_escalator: curator backend binary %r does not resolve '
+                '(PATH=%s) and the escalation package is unavailable — alarm '
+                'not queued for project %s',
+                binary_spec, search_path, project_id,
+            )
+            return
+
+        if not await asyncio.to_thread(is_orchestrator_lock_held, project_root):
+            logger.error(
+                'curator_escalator: curator backend binary %r does not resolve '
+                '(PATH=%s) and no orchestrator is running — alarm not queued '
+                'for project %s',
+                binary_spec, search_path, project_id,
+            )
+            return
+
+        detail = '\n'.join([
+            f'project_id={project_id!r}',
+            f'binary_spec={binary_spec!r}',
+            f'search_path={search_path}',
+            '',
+            'CONSEQUENCE: every curate() call fails before consulting the LLM, '
+            'so NOTHING is curated for as long as this holds: every task '
+            'submission is parked awaiting curation and retried until the '
+            'curator can judge it. The 2026-08-13 to 08-18 outage of this shape '
+            'created tasks without dedupe for five days, costing >=80h of '
+            'fleet-wide dedupe.',
+            '',
+            'FIX (either):',
+            '  1. Set CLAUDE_BINARY to the CLI\'s ABSOLUTE path in the '
+            'fused-memory service environment. This removes PATH from the '
+            'equation entirely and is the more robust of the two.',
+            '  2. Pin Environment=PATH= in '
+            '~/.config/systemd/user/fused-memory.service so the unit stops '
+            'inheriting whatever PATH systemd happens to hand it. '
+            'scripts/fused-memory.service.template carries the correct line; '
+            'scripts/check_fused_memory_unit_parity.py --fix appends it to a '
+            'deployed unit that is missing it.',
+            '',
+            'Then restart the fused-memory user unit and confirm the curator\'s '
+            'startup self-check logs a resolved absolute path.',
+        ])
+
+        queue = self._queue_for(project_root)
+        escalation = Escalation(
+            id=queue.make_id('curator'),
+            task_id=_ANCHOR_TASK_ID,
+            agent_role='fused-memory/task-curator',
+            severity='blocking',
+            category='curator_backend_binary_unresolvable',
+            summary=(
+                f'curator backend binary {binary_spec!r} does not resolve — '
+                f'every task submission parks awaiting curation until the '
+                f'environment is fixed. Config break, not a flaky candidate.'
+            ),
+            detail=detail,
+            level=1,
+        )
+        try:
+            queue.submit(escalation)
+        except Exception:
+            logger.exception(
+                'curator_escalator: failed to submit backend-binary-unresolvable '
+                'escalation for project %s',
+                project_id,
+            )
+            # Do not re-raise — falling through to action='create' is safer than
+            # failing add_task just because queue I/O broke.
+            return
+
+        logger.error(
+            'curator_escalator: queued backend-binary-unresolvable L1 escalation '
+            '%s for project %s — binary_spec=%r PATH=%s',
+            escalation.id, project_id, binary_spec, search_path,
         )
 
     async def _submit_zero_output_timeout(

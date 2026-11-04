@@ -17,15 +17,23 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
-from _scan_race_helpers import relocating_read_text, unreadable_read_text
+from _scan_race_helpers import (
+    deleting_read_text,
+    pruning_read_text,
+    relocating_read_text,
+    unreadable_read_text,
+)
 
+from escalation.amendments import (
+    MAX_AMENDMENT_DETAIL_CHARS,
+    MAX_AMENDMENT_LINE_CHARS,
+    MAX_AMENDMENT_OPTIONS,
+    MAX_AMENDMENTS,
+    amendment_room,
+)
 from escalation.classify import effective_benign
 from escalation.models import Escalation
 from escalation.queue import (
-    _MAX_AMENDMENT_DETAIL_CHARS,
-    _MAX_AMENDMENT_LINE_CHARS,
-    _MAX_AMENDMENT_OPTIONS,
-    _MAX_AMENDMENTS,
     _MAX_LATE_RESOLUTION_CHARS,
     _MAX_LATE_RESOLUTIONS,
     _MAX_ROOT_CAUSE_VARIANTS,
@@ -315,6 +323,102 @@ class TestDismissAllPendingAgeAware:
         assert strand is not None
         assert strand.resolution is not None
         assert 'severity=blocking' in strand.resolution
+
+
+class TestDismissAllPendingKeep:
+    """``keep`` spares the L0s its predicate selects from the startup sweep.
+
+    The info-L0 router routes info notes before the amnesty and leaves some of
+    them pending (a curator hold, or one it could not route); the sweep that
+    follows must not dismiss those unread (plans/info-l0-disposition-router-prd.md
+    boundary #16).
+    """
+
+    THRESHOLD_SECS = 600.0
+
+    def _seed(self, tmp_path: Path) -> EscalationQueue:
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_aged_escalation('esc-1-1', age_secs=90.0, task_id='1', severity='info'))
+        queue.submit(_aged_escalation('esc-2-1', age_secs=75480.0, task_id='2', severity='info'))
+        queue.submit(_aged_escalation('esc-3-1', age_secs=75480.0, task_id='3'))
+        queue.submit(_aged_escalation('esc-4-1', age_secs=90.0, task_id='4'))
+        queue.submit(_aged_escalation('esc-5-1', age_secs=75480.0, task_id='5', level=1))
+        return queue
+
+    @staticmethod
+    def _is_info(esc: Escalation) -> bool:
+        return esc.severity == 'info'
+
+    def test_kept_records_stay_pending_and_are_not_counted(self, tmp_path: Path):
+        queue = self._seed(tmp_path)
+
+        count = queue.dismiss_all_pending(
+            'Stale from prior run', strand_age_secs=self.THRESHOLD_SECS, keep=self._is_info,
+        )
+
+        assert count == 2
+        for kept_id in ('esc-1-1', 'esc-2-1'):
+            kept = queue.get(kept_id)
+            assert kept is not None
+            assert (kept.status, kept.resolution, kept.resolution_class) == ('pending', None, None)
+
+    def test_records_not_kept_are_swept_with_age_suffix_and_strand_stamp(self, tmp_path: Path):
+        queue = self._seed(tmp_path)
+
+        queue.dismiss_all_pending(
+            'Stale from prior run', strand_age_secs=self.THRESHOLD_SECS, keep=self._is_info,
+        )
+
+        strand, fresh = queue.get('esc-3-1'), queue.get('esc-4-1')
+        assert strand is not None and fresh is not None
+        assert (strand.status, strand.resolution_class) == ('dismissed', 'stale-strand')
+        assert (fresh.status, fresh.resolution_class) == ('dismissed', 'benign')
+        assert _pending_secs(fresh.resolution or '') is not None
+
+    def test_keep_none_sweeps_every_pending_l0_as_before(self, tmp_path: Path):
+        queue = self._seed(tmp_path)
+
+        count = queue.dismiss_all_pending('Stale from prior run', keep=None)
+
+        assert count == 4
+        for esc_id in ('esc-1-1', 'esc-2-1', 'esc-3-1', 'esc-4-1'):
+            swept = queue.get(esc_id)
+            assert swept is not None
+            assert swept.status == 'dismissed'
+
+    @pytest.mark.parametrize('keep', [None, lambda esc: True])
+    def test_level_1_is_preserved_either_way(self, tmp_path: Path, keep):
+        queue = self._seed(tmp_path)
+
+        queue.dismiss_all_pending('Stale from prior run', keep=keep)
+
+        level_1 = queue.get('esc-5-1')
+        assert level_1 is not None
+        assert level_1.status == 'pending'
+
+
+class TestAmendmentRoom:
+    """``amendment_room`` is zero exactly when the next amend would shed the oldest."""
+
+    @staticmethod
+    def _room(queue: EscalationQueue) -> int:
+        record = queue.get('esc-1-1')
+        assert record is not None
+        return amendment_room(record)
+
+    def test_room_counts_down_to_the_amend_that_sheds(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-1-1', task_id='1', level=1))
+
+        rooms = []
+        for i in range(MAX_AMENDMENTS):
+            rooms.append(self._room(queue))
+            assert queue.amend('esc-1-1', summary=f'pass {i}', agent_role='test')['dropped'] == 0
+
+        assert rooms == list(range(MAX_AMENDMENTS, 0, -1))
+        assert self._room(queue) == 0
+        assert queue.amend('esc-1-1', summary='one more', agent_role='test')['dropped'] == 1
+        assert self._room(queue) == 0
 
 
 class TestDismissAllPendingAgeAwareDegrades:
@@ -652,35 +756,25 @@ class TestGetWithDuplicateArchiveCandidates:
 class TestGetByTaskFindsRecordsWhoseStemDoesNotEncodeTaskId:
     """get_by_task must find a record whose FILENAME does not encode its task_id.
 
-    WHY THIS EXISTS — do not "optimise" it away.  ``make_id``'s argument is an
-    id-NAMESPACE key, not a task_id: it names the durable counter ``esc-{key}.seq``
-    and the id stem ``esc-{key}-{n}``, and nothing more.  Five production sites
-    diverge deliberately — ``curator_escalator.py`` x3 (``make_id('curator')``
-    with ``task_id='task-curator'``) and ``ticket_janitor.py`` x2
-    (``make_id('ticket-janitor')``, same task_id) — so ``'task-curator'`` alone
-    carries three stem families in the live corpus (``esc-curator-*`` 31,
-    ``esc-ticket-janitor-*`` 6, ``esc-task-curator-*`` 13).
-
-    The false identity "for every record file, ``stem.startswith(
-    f'esc-{record.task_id}-')``" is therefore FALSE (42 of 2,972 corpus records
-    violate it), and believing it cost TWO design cycles: task 3999's 2026-08-11
-    amendment and ``plans/resume-charter-loss-remediation-prd.md``, both
-    withdrawn 2026-08-20 under ruling esc-3999-2.  ``get_by_task`` is correct
-    precisely BECAUSE it globs the unscoped ``esc-*.json`` and filters on the
-    STORED ``task_id`` FIELD.
+    ``make_id``'s argument is an id-namespace key, not a task_id, so a record's
+    stem need not start with ``esc-{task_id}-``.  The production sites that
+    diverge, and the design history, live in
+    ``escalation/queue.py::EscalationQueue.make_id``.
 
     THE BOUNDARY THIS TEST DRAWS: it forbids scoping ``get_by_task``'s glob to
-    ``f'esc-{task_id}-*.json'``.  That change was already rejected on its own
-    merits in esc-3999-2 — a measured 15x on a path costing 20-90 CPU-seconds/day
-    over a corpus the 30-day pruner already bounds, weighed against a
-    silent-record-loss failure mode and the erosion of contract D11
-    (``index_drift_detector.py``, task 3709, which put an opaque dedup key in the
-    task_id slot precisely BECAUSE get_by_task filters on the stored field).
+    ``f'esc-{task_id}-*.json'``, in whole or for some class of task id (ruling
+    esc-3999-2).  ``get_by_task`` must glob the unscoped ``esc-*.json`` and
+    filter on the STORED ``task_id`` field.
 
-    This test is GREEN on arrival — it characterises existing correct behaviour —
-    so its honest RED is a MUTATION check: swap both globs to the scoped form and
-    it must go red.  That check was run and recorded in this commit.
+    GREEN on arrival — it characterises existing correct behaviour — so its
+    honest RED is a MUTATION check: swap both globs to the scoped form and every
+    case must go red.
     """
+
+    DIVERGENT_SPECIMENS = [
+        pytest.param('esc-curator-1', 'task-curator', id='synthetic-anchor-task-id'),
+        pytest.param('esc-ticket-janitor-1', '2859', id='real-numeric-task-id'),
+    ]
 
     def _esc(self, esc_id: str, task_id: str) -> Escalation:
         return Escalation(
@@ -692,34 +786,38 @@ class TestGetByTaskFindsRecordsWhoseStemDoesNotEncodeTaskId:
             summary='curator surfaced a ticket',
         )
 
-    def test_pending_divergent_stem_is_found_by_stored_task_id(self, tmp_path: Path):
-        """Both live stem families for one task_id come back from get_by_task."""
+    @pytest.mark.parametrize(('divergent_id', 'task_id'), DIVERGENT_SPECIMENS)
+    def test_pending_divergent_stem_is_found_by_stored_task_id(
+        self, tmp_path: Path, divergent_id: str, task_id: str,
+    ):
+        """Both stem families for one task_id come back from get_by_task."""
         queue = EscalationQueue(tmp_path / 'queue')
-        # The divergent specimen: stem says 'curator', the record says 'task-curator'.
-        queue.submit(self._esc('esc-curator-1', 'task-curator'))
-        # The SAME task_id under the other live stem family, for contrast.
-        queue.submit(self._esc('esc-task-curator-1', 'task-curator'))
+        matching_id = f'esc-{task_id}-1'
+        queue.submit(self._esc(divergent_id, task_id))
+        queue.submit(self._esc(matching_id, task_id))
 
-        results = queue.get_by_task('task-curator')
+        results = queue.get_by_task(task_id)
 
-        assert {e.id for e in results} == {'esc-curator-1', 'esc-task-curator-1'}, (
+        assert {e.id for e in results} == {divergent_id, matching_id}, (
             'get_by_task filters on the STORED task_id field, not on the '
             f'filename: got {sorted(e.id for e in results)}'
         )
 
-    def test_archived_divergent_stem_is_still_found(self, tmp_path: Path):
+    @pytest.mark.parametrize(('divergent_id', 'task_id'), DIVERGENT_SPECIMENS)
+    def test_archived_divergent_stem_is_still_found(
+        self, tmp_path: Path, divergent_id: str, task_id: str,
+    ):
         """The archive tier must not lose the divergent record either."""
         queue = EscalationQueue(tmp_path / 'queue')
-        queue.submit(self._esc('esc-curator-1', 'task-curator'))
-        queue.submit(self._esc('esc-task-curator-1', 'task-curator'))
-        queue.resolve('esc-curator-1', 'handled')
+        queue.submit(self._esc(divergent_id, task_id))
+        queue.submit(self._esc(f'esc-{task_id}-1', task_id))
+        queue.resolve(divergent_id, 'handled')
 
-        # It has moved out of the queue root and into archive/YYYY-MM-DD/.
-        assert not (queue.queue_dir / 'esc-curator-1.json').exists()
+        assert not (queue.queue_dir / f'{divergent_id}.json').exists()
 
-        results = queue.get_by_task('task-curator')
+        results = queue.get_by_task(task_id)
 
-        assert 'esc-curator-1' in {e.id for e in results}, (
+        assert divergent_id in {e.id for e in results}, (
             'an ARCHIVED divergent-stem record must still be found by its stored '
             f'task_id: got {sorted(e.id for e in results)}'
         )
@@ -2048,14 +2146,8 @@ class TestGetRetriesRelocationBetweenLocateAndRead:
         queue.submit(_make_escalation('esc-1-1', task_id='1'))
 
         doomed = queue.queue_dir / 'esc-1-1.json'
-        original_read_text = Path.read_text
 
-        def deleting_read_text(self: Path, *args: Any, **kwargs: Any) -> str:
-            if self == doomed and doomed.exists():
-                doomed.unlink()
-            return original_read_text(self, *args, **kwargs)
-
-        with patch.object(Path, 'read_text', deleting_read_text):
+        with patch.object(Path, 'read_text', deleting_read_text(doomed)):
             result = queue.get('esc-1-1')
 
         assert result is None
@@ -2194,14 +2286,8 @@ class TestGetByTaskRecoversRecordRelocatedMidScan:
         queue.submit(_make_escalation('esc-4176-2', task_id='4176', status='resolved'))
 
         doomed = queue.queue_dir / 'esc-4176-2.json'
-        original_read_text = Path.read_text
 
-        def deleting_read_text(self: Path, *args: Any, **kwargs: Any) -> str:
-            if self == doomed and doomed.exists():
-                doomed.unlink()
-            return original_read_text(self, *args, **kwargs)
-
-        with patch.object(Path, 'read_text', deleting_read_text):
+        with patch.object(Path, 'read_text', deleting_read_text(doomed)):
             results = queue.get_by_task('4176', status=None)
 
         assert [e.id for e in results] == ['esc-4176-1'], (
@@ -2255,6 +2341,51 @@ class TestGetByTaskRecoversRecordRelocatedMidScan:
         assert any('re-glob after vanish' in r.getMessage() for r in warnings), (
             f'Expected a WARNING naming the re-glob-after-vanish context; got: '
             f'{[r.getMessage() for r in warnings]}'
+        )
+
+
+class TestGetByTaskLeavesAnArchiveTierVanishUnrecovered:
+    """The other side of the mid-scan recovery gate in
+    ``queue.py::EscalationQueue.get_by_task``: only a ROOT-tier vanish is
+    re-located.
+    """
+
+    def test_an_archive_copy_pruned_mid_scan_costs_no_extra_archive_walk(
+        self, tmp_path: Path,
+    ):
+        """An archive copy rmtree'd mid-scan, as ``archive.prune_archive``
+        does, is dropped without raising, and the scan walks the archive no
+        more often than the same scan run undisturbed.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-4176-1', task_id='4176'))
+        queue.submit(_make_escalation('esc-4176-2', task_id='4176'))
+        queue.resolve('esc-4176-2', 'resolved before the scan')
+        (archive_copy,) = (queue.queue_dir / 'archive').rglob('esc-4176-2.json')
+
+        with patch.object(Path, 'rglob', autospec=True, side_effect=Path.rglob) as undisturbed:
+            queue.get_by_task('4176', status=None)
+        with (
+            patch.object(Path, 'read_text', pruning_read_text(archive_copy)),
+            patch.object(Path, 'rglob', autospec=True, side_effect=Path.rglob) as disturbed,
+        ):
+            results = queue.get_by_task('4176', status=None)
+
+        assert [e.id for e in results] == ['esc-4176-1'], (
+            f'Expected only the surviving record after the archive copy was '
+            f'pruned mid-scan (no raise), got {[e.id for e in results]}'
+        )
+        assert not archive_copy.parent.exists(), (
+            f'Expected the interposition to have pruned {archive_copy.parent}; '
+            f'without that the walk count below is vacuous'
+        )
+        assert undisturbed.call_count > 0, (
+            'Expected the spy to observe the undisturbed scan walking the archive; '
+            'without that the walk count below is vacuous'
+        )
+        assert disturbed.call_count == undisturbed.call_count, (
+            f'Expected no extra archive walk for an archive-tier vanish; undisturbed '
+            f'walks {undisturbed.call_args_list}, disturbed walks {disturbed.call_args_list}'
         )
 
 
@@ -4161,7 +4292,7 @@ class TestAddMembersToL2:
         A rotation re-promoting the same cluster with UNCHANGED text has
         contributed nothing.  Re-recording it would manufacture a spurious
         updated_at bump (re-triggering the watcher's re-assess on a no-op — the
-        contract task 3976 pinned) and burn cap budget, so _MAX_AMENDMENTS worth
+        contract task 3976 pinned) and burn cap budget, so MAX_AMENDMENTS worth
         of identical rows would push genuinely-distinct earlier framings out via
         the drop-oldest policy.
         """
@@ -4305,7 +4436,7 @@ class TestAddMembersToL2:
         The entry cap alone bounds nothing: an amendment's `detail` is the
         promote's unbounded free-text `evidence` argument — the same field the
         compact projection exists to keep off the wire — so a hot-folding L2
-        could sit "inside `_MAX_AMENDMENTS`" while growing by hundreds of KB,
+        could sit "inside `MAX_AMENDMENTS`" while growing by hundreds of KB,
         and every reader of a FULL record pays that (`get_escalation`,
         `get_pending_escalations(compact=False)`, every sweep's JSON parse).
 
@@ -4315,15 +4446,15 @@ class TestAddMembersToL2:
         l2 = self._framed_l2(queue)
         over = 50  # comfortably past every cap, whatever they are retuned to
 
-        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+        with caplog.at_level(logging.WARNING, logger='escalation.amendments'):
             result = queue.add_members_to_l2(
                 l2.id, [],
-                root_cause='R' * (_MAX_AMENDMENT_LINE_CHARS + over),
-                summary='S' * (_MAX_AMENDMENT_LINE_CHARS + over),
-                evidence='D' * (_MAX_AMENDMENT_DETAIL_CHARS + over),
+                root_cause='R' * (MAX_AMENDMENT_LINE_CHARS + over),
+                summary='S' * (MAX_AMENDMENT_LINE_CHARS + over),
+                evidence='D' * (MAX_AMENDMENT_DETAIL_CHARS + over),
                 options=(
-                    ['O' * (_MAX_AMENDMENT_LINE_CHARS + over)]
-                    * (_MAX_AMENDMENT_OPTIONS + 2)
+                    ['O' * (MAX_AMENDMENT_LINE_CHARS + over)]
+                    * (MAX_AMENDMENT_OPTIONS + 2)
                 ),
                 agent_role='escalation-watcher-auto',
             )
@@ -4334,16 +4465,16 @@ class TestAddMembersToL2:
 
         # (a) the KEPT text of each field is capped — the marker is allowed to
         # push the stored string past the cap, but the payload is not.
-        assert amendment['root_cause'].count('R') == _MAX_AMENDMENT_LINE_CHARS
-        assert amendment['summary'].count('S') == _MAX_AMENDMENT_LINE_CHARS
-        assert amendment['detail'].count('D') == _MAX_AMENDMENT_DETAIL_CHARS
+        assert amendment['root_cause'].count('R') == MAX_AMENDMENT_LINE_CHARS
+        assert amendment['summary'].count('S') == MAX_AMENDMENT_LINE_CHARS
+        assert amendment['detail'].count('D') == MAX_AMENDMENT_DETAIL_CHARS
         # (b) the options LIST is capped in length, and each option in width.
-        assert len(amendment['options']) == _MAX_AMENDMENT_OPTIONS, (
+        assert len(amendment['options']) == MAX_AMENDMENT_OPTIONS, (
             f'the options list must be length-capped, got '
             f'{len(amendment["options"])}'
         )
         assert all(
-            o.count('O') == _MAX_AMENDMENT_LINE_CHARS for o in amendment['options']
+            o.count('O') == MAX_AMENDMENT_LINE_CHARS for o in amendment['options']
         )
         # (c) the elision is MARKED IN-BAND, so a reader can tell the head of a
         # framing from the whole of one without cross-referencing anything.
@@ -4355,14 +4486,16 @@ class TestAddMembersToL2:
         )
         # (d) the loss is DURABLY COUNTED on the record (INV-8) — the byte-side
         # counterpart of amendments_truncated.
-        shed_options = 2 * (_MAX_AMENDMENT_LINE_CHARS + over)
-        expected = over * (3 + _MAX_AMENDMENT_OPTIONS) + shed_options
+        shed_options = 2 * (MAX_AMENDMENT_LINE_CHARS + over)
+        expected = over * (3 + MAX_AMENDMENT_OPTIONS) + shed_options
         assert result.amendments_chars_elided == expected, (
             f'expected {expected} elided chars, got {result.amendments_chars_elided}'
         )
         assert self._on_disk(queue, l2.id).amendments_chars_elided == expected
         assert any(
-            'elided' in r.getMessage() for r in caplog.records
+            'elided' in r.getMessage()
+            for r in caplog.records
+            if r.name == 'escalation.amendments'
         ), 'elision must also be loud in the log'
 
         # (e) elision does not defeat repeat detection: the SAME oversized
@@ -4371,12 +4504,12 @@ class TestAddMembersToL2:
         bumped_at = result.updated_at
         again = queue.add_members_to_l2(
             l2.id, [],
-            root_cause='R' * (_MAX_AMENDMENT_LINE_CHARS + over),
-            summary='S' * (_MAX_AMENDMENT_LINE_CHARS + over),
-            evidence='D' * (_MAX_AMENDMENT_DETAIL_CHARS + over),
+            root_cause='R' * (MAX_AMENDMENT_LINE_CHARS + over),
+            summary='S' * (MAX_AMENDMENT_LINE_CHARS + over),
+            evidence='D' * (MAX_AMENDMENT_DETAIL_CHARS + over),
             options=(
-                ['O' * (_MAX_AMENDMENT_LINE_CHARS + over)]
-                * (_MAX_AMENDMENT_OPTIONS + 2)
+                ['O' * (MAX_AMENDMENT_LINE_CHARS + over)]
+                * (MAX_AMENDMENT_OPTIONS + 2)
             ),
         )
         assert again is not None
@@ -4389,7 +4522,7 @@ class TestAddMembersToL2:
         """The whole list's SIZE — not just its length — is bounded by the caps.
 
         The property the caps exist for, asserted end-to-end: feed folds far
-        larger than any cap, fill past `_MAX_AMENDMENTS`, and the stored framing
+        larger than any cap, fill past `MAX_AMENDMENTS`, and the stored framing
         still fits an envelope computed FROM the constants.  Without per-field
         elision this is ~5 MB of durable record.
         """
@@ -4397,7 +4530,7 @@ class TestAddMembersToL2:
         l2 = self._framed_l2(queue)
         huge = 50_000
 
-        for i in range(_MAX_AMENDMENTS + 3):
+        for i in range(MAX_AMENDMENTS + 3):
             queue.add_members_to_l2(
                 l2.id, [],
                 root_cause=f'{i}' + 'R' * huge,
@@ -4408,7 +4541,7 @@ class TestAddMembersToL2:
             )
 
         record = self._on_disk(queue, l2.id)
-        assert len(record.amendments) == _MAX_AMENDMENTS
+        assert len(record.amendments) == MAX_AMENDMENTS
         stored = sum(
             len(a['root_cause']) + len(a['summary']) + len(a['detail'])
             + sum(len(o) for o in a['options'])
@@ -4417,11 +4550,11 @@ class TestAddMembersToL2:
         # Per-entry payload, derived from the constants; the marker allowance
         # covers the in-band elision notes (one per elided field).
         marker_allowance = 120
-        fields_per_entry = 3 + _MAX_AMENDMENT_OPTIONS
-        envelope = _MAX_AMENDMENTS * (
-            2 * _MAX_AMENDMENT_LINE_CHARS
-            + _MAX_AMENDMENT_DETAIL_CHARS
-            + _MAX_AMENDMENT_OPTIONS * _MAX_AMENDMENT_LINE_CHARS
+        fields_per_entry = 3 + MAX_AMENDMENT_OPTIONS
+        envelope = MAX_AMENDMENTS * (
+            2 * MAX_AMENDMENT_LINE_CHARS
+            + MAX_AMENDMENT_DETAIL_CHARS
+            + MAX_AMENDMENT_OPTIONS * MAX_AMENDMENT_LINE_CHARS
             + fields_per_entry * marker_allowance
         )
         assert stored <= envelope, (
@@ -4505,7 +4638,7 @@ class TestAddMembersToL2:
 
         # (f) at the cap, an append SHEDS — and the count is this call's own,
         # not a difference inferred from a racy pre-read.
-        for i in range(_MAX_AMENDMENTS):
+        for i in range(MAX_AMENDMENTS):
             queue.add_members_to_l2(
                 l2.id, [], root_cause=f'fill {i}', evidence=f'fill evidence {i}',
             )
@@ -4518,14 +4651,14 @@ class TestAddMembersToL2:
             f'a truncating append must report both facts, got {truncating}'
         )
         capped = queue.get(l2.id)
-        assert capped is not None and len(capped.amendments) == _MAX_AMENDMENTS
+        assert capped is not None and len(capped.amendments) == MAX_AMENDMENTS
 
     def test_amendment_list_is_capped_and_truncation_is_loud(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
     ):
         """Amendment growth is bounded, sheds the OLDEST, and counts what it shed.
 
-        INV-7: the cap has a NAME (`_MAX_AMENDMENTS`), a direction (drop oldest)
+        INV-7: the cap has a NAME (`MAX_AMENDMENTS`), a direction (drop oldest)
         and an owner (this method, at write time).  The loop bound is derived
         FROM the constant, never hardcoded — a literal here would encode the
         constant's VALUE instead of its NAME and go stale the moment it is
@@ -4541,8 +4674,8 @@ class TestAddMembersToL2:
         queue = EscalationQueue(tmp_path / 'esc')
         l2 = self._framed_l2(queue)
 
-        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
-            for i in range(_MAX_AMENDMENTS + overflow):
+        with caplog.at_level(logging.WARNING, logger='escalation.amendments'):
+            for i in range(MAX_AMENDMENTS + overflow):
                 result = queue.add_members_to_l2(
                     l2.id, [],
                     root_cause=f'root cause pass {i}',
@@ -4552,8 +4685,8 @@ class TestAddMembersToL2:
 
         assert result is not None
         # (a) growth is BOUNDED.
-        assert len(result.amendments) == _MAX_AMENDMENTS, (
-            f'Expected the list capped at {_MAX_AMENDMENTS}, '
+        assert len(result.amendments) == MAX_AMENDMENTS, (
+            f'Expected the list capped at {MAX_AMENDMENTS}, '
             f'got {len(result.amendments)}'
         )
         # (b) the RETAINED entries are the most RECENT ones — identified by
@@ -4561,10 +4694,10 @@ class TestAddMembersToL2:
         retained = {a['root_cause'] for a in result.amendments}
         assert retained == {
             f'root cause pass {i}'
-            for i in range(overflow, _MAX_AMENDMENTS + overflow)
-        }, f'Expected the newest {_MAX_AMENDMENTS} passes to survive, got {sorted(retained)}'
+            for i in range(overflow, MAX_AMENDMENTS + overflow)
+        }, f'Expected the newest {MAX_AMENDMENTS} passes to survive, got {sorted(retained)}'
         assert result.amendments[-1]['detail'] == (
-            f'evidence pass {_MAX_AMENDMENTS + overflow - 1}'
+            f'evidence pass {MAX_AMENDMENTS + overflow - 1}'
         ), 'the most recent framing must be the LAST entry'
         # (c) the loss is DURABLY COUNTED on the record — assertable without
         # scraping logs (INV-8).
@@ -4575,10 +4708,10 @@ class TestAddMembersToL2:
         # (d) and it is LOUD.
         warning_records = [
             r for r in caplog.records
-            if r.levelno >= logging.WARNING and r.name == 'escalation.queue'
+            if r.levelno >= logging.WARNING and r.name == 'escalation.amendments'
         ]
         assert warning_records, (
-            f"Expected a WARNING at logger 'escalation.queue'; got records: {caplog.records}"
+            f"Expected a WARNING at logger 'escalation.amendments'; got records: {caplog.records}"
         )
         assert any(l2.id in r.getMessage() for r in warning_records), (
             f'Expected a truncation WARNING naming {l2.id}; '
@@ -4588,7 +4721,7 @@ class TestAddMembersToL2:
         # The cap is enforced on DISK too, not just on the returned object —
         # the trim rides the same single _rewrite as the append.
         reloaded = self._on_disk(queue, l2.id)
-        assert len(reloaded.amendments) == _MAX_AMENDMENTS
+        assert len(reloaded.amendments) == MAX_AMENDMENTS
         assert reloaded.amendments_truncated == overflow
         assert {a['root_cause'] for a in reloaded.amendments} == retained
 
@@ -6787,6 +6920,65 @@ class TestHasOpenL1CategoryFilter:
         assert queue.has_open_l1('T', category='merge_error') is False
 
 
+class TestDismissIfCovered:
+    """``dismiss_if_covered`` dismisses an L0 under an open L1 of its own
+    category only, and tells that L1 what it absorbed (unblock-4917)."""
+
+    RESOLVER = 'harness-orphan-reaper'
+
+    @staticmethod
+    def _l0(queue: EscalationQueue, category: str) -> Escalation:
+        esc = _make_esc_with_category('esc-T-9', 'T', category, level=0)
+        esc.summary, esc.detail = 'disk quota hit', 'df shows 100%'
+        queue.submit(esc)
+        return esc
+
+    @staticmethod
+    def _get(queue: EscalationQueue, esc_id: str) -> Escalation:
+        esc = queue.get(esc_id)
+        assert esc is not None
+        return esc
+
+    def test_a_same_category_l1_covers_and_carries_the_dismissed_record(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_esc_with_category('esc-T-1', 'T', 'infra_issue'))
+        l0 = self._l0(queue, 'infra_issue')
+
+        assert queue.dismiss_if_covered(l0, resolver=self.RESOLVER) == ['esc-T-1']
+
+        dismissed = self._get(queue, l0.id)
+        assert (dismissed.status, dismissed.resolved_by) == ('dismissed', self.RESOLVER)
+        assert 'esc-T-1' in (dismissed.resolution or '')
+        (amendment,) = self._get(queue, 'esc-T-1').amendments
+        assert amendment['agent_role'] == self.RESOLVER
+        carried = amendment['summary'] + amendment['detail']
+        assert all(fact in carried for fact in (l0.id, 'disk quota hit', 'df shows 100%'))
+
+    @pytest.mark.parametrize(('category', 'status'), [
+        ('task_failure', 'pending'), ('infra_issue', 'resolved'),
+    ], ids=['another-category', 'closed-l1'])
+    def test_no_open_same_category_l1_writes_nothing(self, tmp_path: Path, category, status):
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_esc_with_category('esc-T-1', 'T', category, status=status))
+        l0 = self._l0(queue, 'infra_issue')
+
+        assert queue.dismiss_if_covered(l0, resolver=self.RESOLVER) == []
+
+        assert self._get(queue, l0.id).status == 'pending'
+        assert self._get(queue, 'esc-T-1').amendments == []
+
+    def test_a_legacy_category_is_matched_without_raising(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'queue')
+        for esc_id, level in (('esc-T-1', 1), ('esc-T-9', 0)):
+            legacy = _make_esc_with_category(esc_id, 'T', 'retired_category', level=level)
+            (queue.queue_dir / f'{esc_id}.json').write_text(legacy.to_json())
+
+        assert queue.dismiss_if_covered(self._get(queue, 'esc-T-9'), resolver=self.RESOLVER) == [
+            'esc-T-1',
+        ]
+        assert self._get(queue, 'esc-T-9').status == 'dismissed'
+
+
 class TestMultipleCoOpenL1Resolution:
     """Signature-aware dedup permits N co-open L1s per task; resolving one must
     leave the task blocked until the others are resolved (task 2757; reviewer
@@ -7302,10 +7494,10 @@ class TestAddMembersToL2RootCauseVariants:
         )
 
     def test_long_spelling_is_elided_with_the_in_band_marker(self, tmp_path: Path):
-        """(e cont.) Each stored spelling is capped by the existing `_elide` helper."""
+        """(e cont.) Each stored spelling is capped by the existing `elide` helper."""
         queue = EscalationQueue(tmp_path / 'esc')
         l2 = self._make_l2(queue)
-        long_cause = 'x' * (_MAX_AMENDMENT_LINE_CHARS + 250)
+        long_cause = 'x' * (MAX_AMENDMENT_LINE_CHARS + 250)
 
         queue.add_members_to_l2(l2.id, ['esc-l1-1'], root_cause=long_cause)
 
@@ -7313,7 +7505,7 @@ class TestAddMembersToL2RootCauseVariants:
         assert record is not None
         stored = record.root_cause_variants[-1]
         assert stored != long_cause, 'an over-long spelling must be elided'
-        assert stored.startswith('x' * _MAX_AMENDMENT_LINE_CHARS)
+        assert stored.startswith('x' * MAX_AMENDMENT_LINE_CHARS)
         assert 'elided' in stored, (
             f'elision must be MARKED IN-BAND, not silent: {stored[-120:]!r}'
         )
@@ -8777,7 +8969,7 @@ class TestLateResolutionCorrectsResolutionClass:
 class TestLateResolutionBounds:
     """`late_resolutions` is SIZE-bounded, and every loss is a durable fact.
 
-    The same no-silent-cap policy `_MAX_AMENDMENTS` already models: the oldest
+    The same no-silent-cap policy `MAX_AMENDMENTS` already models: the oldest
     entries are shed, each drop is counted ON THE RECORD (not merely logged), an
     over-long entry is elided with an in-band marker naming what was dropped, and
     the dropped character total is likewise durable — so `len(list) + truncated`
@@ -8894,3 +9086,80 @@ class TestLateResolutionBounds:
         assert record.late_resolutions_chars_elided == 3 * overshoot, (
             f'expected a running total: {record.late_resolutions_chars_elided!r}'
         )
+
+
+class TestTripFactsPersistence:
+    """A pause detector's structured trip facts survive the real queue writer."""
+
+    def test_ewa_rate_trip_round_trips_through_disk(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'queue')
+        esc = _make_escalation('esc-orchestrator-1', task_id='orchestrator')
+        esc.ewa_rate_trip = {
+            'ewa': 73.59,
+            'threshold': 24.6,
+            'ratio': 82.0,
+            'window_secs': 3600.0,
+            'dones_in_window': 1,
+            'submissions_in_step': 82,
+        }
+
+        esc_id = queue.submit(esc)
+
+        stored = queue.get(esc_id)
+        assert stored is not None
+        assert stored.ewa_rate_trip == esc.ewa_rate_trip
+
+
+class TestGetPendingByTask:
+    """``get_pending_by_task`` groups ONE root listing by task id (task 8073).
+
+    For every task id it must yield exactly what
+    ``get_by_task(task_id, status='pending')`` yields over the same files.
+    """
+
+    def _seed(self, queue: EscalationQueue) -> None:
+        queue.submit(_make_escalation('esc-1-1', task_id='1'))
+        queue.submit(_make_escalation('esc-1-2', task_id='1', level=2))
+        queue.submit(_make_escalation('esc-2-1', task_id='2'))
+        queue.submit(_make_escalation('esc-2-2', task_id='2'))
+        queue.resolve('esc-2-2', 'archived, no longer pending')
+        resolved_in_root = _make_escalation('esc-3-1', task_id='3', status='resolved')
+        (queue.queue_dir / 'esc-3-1.json').write_text(resolved_in_root.to_json())
+        (queue.queue_dir / 'esc-4-1.json').write_text('{not json')
+        (queue.queue_dir / 'esc-5-1.json.lock').write_text('')
+        (queue.queue_dir / 'esc-5.seq').write_text('7')
+
+    def test_each_group_matches_the_per_task_pending_read(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._seed(queue)
+
+        grouped = queue.get_pending_by_task()
+
+        for task_id in ('1', '2', '3', '4', '5', 'absent'):
+            expected = queue.get_by_task(task_id, status='pending')
+            assert [e.to_json() for e in grouped.get(task_id, [])] == [
+                e.to_json() for e in expected
+            ], task_id
+        assert set(grouped) == {'1', '2'}
+
+    def test_a_duplicated_id_dedups_within_a_task_but_not_across_tasks(
+        self, tmp_path: Path,
+    ):
+        """``get_by_task``'s ``seen`` set lives for one task's call, so a
+        second file carrying the same id counts once for its own task and
+        still counts for a different task."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-1-1', task_id='1'))
+        (queue.queue_dir / 'esc-1-1-copy.json').write_text(
+            _make_escalation('esc-1-1', task_id='1').to_json(),
+        )
+        (queue.queue_dir / 'esc-1-1-elsewhere.json').write_text(
+            _make_escalation('esc-1-1', task_id='2').to_json(),
+        )
+
+        grouped = queue.get_pending_by_task()
+
+        for task_id in ('1', '2'):
+            assert [e.id for e in grouped[task_id]] == [
+                e.id for e in queue.get_by_task(task_id, status='pending')
+            ] == ['esc-1-1']

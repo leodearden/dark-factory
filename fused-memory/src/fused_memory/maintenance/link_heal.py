@@ -1,14 +1,21 @@
 """The H1 heal plan: which action each live link earns, and what it writes.
 
-Contract: ``plans/write-triage-link-healing-prd.md`` H1. The action table has
-one home, here: :func:`_deterministic_row` holds rows 1-5, and
-:data:`_VERDICT_TABLE` plus the half-link children guard in
-:func:`_verdict_row` hold the rest. The kinds and the contested key are
-imported from ``server/grouped_read.py`` and never respelled.
+Contract: ``plans/write-triage-link-healing-prd.md`` H1, amended 2026-10-19
+(task 6961). The action table has one home, here: :func:`_deterministic_row`
+holds rows 0-5, and :data:`_VERDICT_TABLE` plus the half-link children guard in
+:func:`_verdict_row` hold the rest. Row 0 detaches an orchestrator completion
+record linked as a child. The orchestrator writes no link key, so triage
+stamped such a record's contest too, which is why row 0 outranks row 2. The
+kinds and the contested key are imported from ``server/grouped_read.py`` and
+never respelled.
+
+Row 2 protects a hand-declared contest only; a contest stamped by write triage
+(``TRIAGE_CONTESTED_METADATA_KEY``) is adjudicated and healed by detach only
+(PRD H1, amended 2026-10-12).
 
 A verdict reaches the table only as a :class:`LinkBasis`. The committed
-hand-link corpus is one source of them (:func:`load_corpus_bases`); other
-sources plug in by producing the same rows.
+hand-link corpus is one source of them (:func:`load_corpus_bases`); the link
+adjudicator is the other, and plugs in by producing the same rows.
 """
 
 from __future__ import annotations
@@ -16,7 +23,7 @@ from __future__ import annotations
 import json
 import re
 from collections import Counter
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, fields
 from enum import StrEnum
 from pathlib import Path
@@ -30,6 +37,10 @@ from fused_memory.maintenance.link_heal_store import (
     MetadataChange,
     StoreReadFailed,
 )
+from fused_memory.memory_metadata import (
+    TRIAGE_CONTESTED_METADATA_KEY,
+    is_orchestrator_completion_record,
+)
 from fused_memory.server.grouped_read import (
     AMENDMENT_KIND,
     CHILD_KINDS,
@@ -42,7 +53,7 @@ KIND_KEY = 'kind'
 PEER_KIND = 'peer'
 
 #: The record keys a heal reads and writes, in the order changes name them.
-LINK_KEYS = (PARENT_ID_KEY, KIND_KEY, CONTESTED_METADATA_KEY)
+LINK_KEYS = (PARENT_ID_KEY, KIND_KEY, CONTESTED_METADATA_KEY, TRIAGE_CONTESTED_METADATA_KEY)
 
 
 class Verdict(StrEnum):
@@ -61,6 +72,7 @@ MISFILE_VERDICTS = frozenset({Verdict.RELATED, Verdict.UNRELATED})
 BELONGS_VERDICTS = frozenset(
     {Verdict.SAME, Verdict.EXTENDS, Verdict.SUBSUMED, Verdict.CORRECTS},
 )
+AGREEING_VERDICTS = BELONGS_VERDICTS - {Verdict.CORRECTS}
 
 
 class KindClass(StrEnum):
@@ -111,8 +123,14 @@ class Report(StrEnum):
 
 class BasisSource(StrEnum):
     CORPUS = 'corpus'
+    ADJUDICATOR = 'adjudicator'
     DETERMINISTIC = 'deterministic'
+    COMPLETION_RECORD = 'completion_record'
     UNDO = 'undo'
+
+
+#: The heals that rest on the live link alone, never on a verdict over two texts.
+VERDICTLESS_SOURCES = frozenset({BasisSource.DETERMINISTIC, BasisSource.COMPLETION_RECORD})
 
 
 def link_parent_id(meta: Mapping[str, Any]) -> str | None:
@@ -128,6 +146,7 @@ class LinkImage:
     parent_id: str | None
     kind: Any = None
     contested: Any = None
+    contested_by_triage: Any = None
 
     @classmethod
     def from_metadata(cls, meta: Mapping[str, Any]) -> LinkImage:
@@ -135,12 +154,22 @@ class LinkImage:
             parent_id=link_parent_id(meta),
             kind=meta.get(KIND_KEY),
             contested=meta.get(CONTESTED_METADATA_KEY),
+            contested_by_triage=meta.get(TRIAGE_CONTESTED_METADATA_KEY),
         )
 
     def as_dict(self) -> dict[str, Any]:
         """The present keys only."""
-        values = (self.parent_id, self.kind, self.contested)
+        values = (self.parent_id, self.kind, self.contested, self.contested_by_triage)
         return {key: value for key, value in zip(LINK_KEYS, values, strict=True) if value is not None}
+
+    @property
+    def triage_stamped_contest(self) -> bool:
+        """Contested by write triage: only an exactly-True marker counts."""
+        return bool(self.contested) and self.contested_by_triage is True
+
+    @property
+    def hand_declared_contest(self) -> bool:
+        return bool(self.contested) and not self.triage_stamped_contest
 
 
 def apply_change(image: LinkImage, change: MetadataChange) -> LinkImage:
@@ -165,13 +194,12 @@ _WRITE_TARGETS: Mapping[HealAction, tuple[str | None, bool]] = MappingProxyType(
 def change_for(action: HealAction, pre_image: LinkImage) -> MetadataChange:
     """The one write *action* makes on a record showing *pre_image*.
 
-    A detach drops ``kind`` only when it is a child kind: an agent-invented
-    kind such as ``extension`` stays.
+    A detach deletes ``parent_id`` and every other link key the record carries,
+    except a ``kind`` outside the child kinds: an agent-invented kind such as
+    ``extension`` stays.
     """
     if action is HealAction.DETACH:
-        if kind_class(pre_image.kind) in _CHILD_KIND_CLASSES:
-            return MetadataChange.delete_only([PARENT_ID_KEY, KIND_KEY])
-        return MetadataChange.delete_only([PARENT_ID_KEY])
+        return MetadataChange.delete_only(_detached_keys(pre_image))
     kind, contest = _WRITE_TARGETS[action]
     patch: dict[str, Any] = {}
     if kind is not None:
@@ -179,6 +207,13 @@ def change_for(action: HealAction, pre_image: LinkImage) -> MetadataChange:
     if contest:
         patch[CONTESTED_METADATA_KEY] = True
     return MetadataChange.patch_only(patch)
+
+
+def _detached_keys(pre_image: LinkImage) -> list[str]:
+    deleted = {PARENT_ID_KEY, *pre_image.as_dict()}
+    if kind_class(pre_image.kind) not in _CHILD_KIND_CLASSES:
+        deleted.discard(KIND_KEY)
+    return [key for key in LINK_KEYS if key in deleted]
 
 
 def post_image_for(action: HealAction, pre_image: LinkImage) -> LinkImage:
@@ -240,20 +275,42 @@ class CorpusFormatError(ValueError):
 _SHA256_HEX = re.compile(r'[0-9a-f]{64}')
 
 
-def load_corpus_bases(path: Path) -> tuple[LinkBasis, ...]:
+@dataclass(frozen=True)
+class CorpusRow:
+    """One hand-link corpus row: the basis it supports, and the kind its link showed when rated."""
+
+    basis: LinkBasis
+    kind_at_rating: str | None
+
+
+def load_corpus_rows(path: Path) -> tuple[CorpusRow, ...]:
     """Every row of the committed hand-link corpus, parsed strictly."""
-    bases: list[LinkBasis] = []
+    rows: list[CorpusRow] = []
     seen: set[tuple[str, str, str]] = set()
     for line_no, line in enumerate(path.read_text(encoding='utf-8').splitlines(), 1):
         if not line.strip():
             continue
-        basis = _corpus_basis(_corpus_row(line, line_no), line_no)
+        row = _corpus_entry(_corpus_row(line, line_no), line_no)
+        basis = row.basis
         link = (basis.project_id, basis.child_id, basis.parent_id)
         if link in seen:
             raise CorpusFormatError(f'{basis.key}: duplicate link {link}')
         seen.add(link)
-        bases.append(basis)
-    return tuple(bases)
+        rows.append(row)
+    return tuple(rows)
+
+
+def load_corpus_bases(path: Path) -> tuple[LinkBasis, ...]:
+    """The basis of every row of the committed hand-link corpus."""
+    return tuple(row.basis for row in load_corpus_rows(path))
+
+
+def _corpus_entry(row: dict[str, Any], line_no: int) -> CorpusRow:
+    basis = _corpus_basis(row, line_no)
+    kind = row.get('kind_at_rating')
+    if kind is not None and not isinstance(kind, str):
+        raise CorpusFormatError(f'{basis.key}: kind_at_rating is neither a string nor null')
+    return CorpusRow(basis=basis, kind_at_rating=kind)
 
 
 def _corpus_row(line: str, line_no: int) -> dict[str, Any]:
@@ -351,6 +408,11 @@ def decide(state: LinkState, basis: LinkBasis | None) -> Decision:
     return Decision(outcome, basis.source if isinstance(outcome, HealAction) else None)
 
 
+def needs_verdict(state: LinkState) -> bool:
+    """The link reaches the verdict rows: no deterministic row decides it."""
+    return decide(state, None).outcome is Report.UNEXAMINED
+
+
 def is_stale(state: LinkState, basis: LinkBasis) -> bool:
     """The verdict no longer judges the texts the link shows now."""
     if not basis.rated_text_matches_live:
@@ -361,9 +423,11 @@ def is_stale(state: LinkState, basis: LinkBasis) -> bool:
 
 
 def _deterministic_row(state: LinkState, basis: LinkBasis | None) -> Decision | None:
+    if is_orchestrator_completion_record(state.child.metadata):
+        return Decision(HealAction.DETACH, BasisSource.COMPLETION_RECORD)
     if basis is not None and is_stale(state, basis):
         return Decision(Report.STALE_RATING)
-    if state.link.contested:
+    if state.link.hand_declared_contest:
         return Decision(Report.CONTESTED_REPORTED)
     if state.parent_presence is ParentPresence.ABSENT:
         return Decision(HealAction.DETACH, BasisSource.DETERMINISTIC)
@@ -374,11 +438,31 @@ def _deterministic_row(state: LinkState, basis: LinkBasis | None) -> Decision | 
     return None
 
 
+_NON_DETACH_HEALS = frozenset(HealAction) - {HealAction.DETACH}
+
+
 def _verdict_row(state: LinkState, verdict: Verdict) -> HealAction | Report:
     kind = kind_class(state.link.kind)
     if kind is KindClass.HALF_LINK and state.has_children and verdict in BELONGS_VERDICTS:
         return Report.HAS_CHILDREN
+    outcome = verdict_outcome(kind, verdict)
+    if state.link.triage_stamped_contest and outcome in _NON_DETACH_HEALS:
+        return Report.NO_ACTION
+    return outcome
+
+
+def verdict_outcome(kind: KindClass, verdict: Verdict) -> HealAction | Report:
+    """The verdict rows' outcome for a childless link of class *kind*."""
     return _VERDICT_TABLE[(kind, verdict)]
+
+
+def healed_kind(kind: str | None, verdict: Verdict) -> str | None:
+    """The ``kind`` a childless link shows once the heal *verdict* earns has been written;
+    ``None`` is a link with no ``kind``, before or after."""
+    outcome = verdict_outcome(kind_class(kind), verdict)
+    if not isinstance(outcome, HealAction):
+        return kind
+    return post_image_for(outcome, LinkImage(parent_id=None, kind=kind)).kind
 
 
 def _every_kind(verdicts: Iterable[Verdict], outcome: HealAction | Report):
@@ -409,8 +493,8 @@ class PlannedAction:
     """One heal, as planned: what the record must show before, and after.
 
     The write itself is never stored; :attr:`change` derives it from the action
-    and the pre-image. ``parent_sha256`` is ``None`` exactly for a
-    deterministic detach, whose parent is gone.
+    and the pre-image. ``parent_sha256`` is ``None`` exactly for a heal whose
+    basis is in :data:`VERDICTLESS_SOURCES`: no parent text decided it.
     """
 
     project_id: str
@@ -429,8 +513,9 @@ class PlannedAction:
                 f'post_image {self.post_image} is not what {self.action} '
                 f'writes over {self.pre_image}',
             )
-        if (self.parent_sha256 is None) != (self.basis_source is BasisSource.DETERMINISTIC):
-            raise ValueError('parent_sha256 is None exactly for a deterministic basis')
+        if (self.parent_sha256 is None) != (self.basis_source in VERDICTLESS_SOURCES):
+            verdictless = ', '.join(sorted(VERDICTLESS_SOURCES))
+            raise ValueError(f'parent_sha256 is None exactly for a verdictless basis ({verdictless})')
 
     @classmethod
     def planned(
@@ -476,10 +561,12 @@ class StaleField(StrEnum):
     PARENT_ID = PARENT_ID_KEY
     KIND = KIND_KEY
     CONTESTED = CONTESTED_METADATA_KEY
+    CONTESTED_BY_TRIAGE = TRIAGE_CONTESTED_METADATA_KEY
     CHILD_SHA256 = 'child_sha256'
     PARENT = 'parent'
     PARENT_SHA256 = 'parent_sha256'
     CHILDREN = 'children'
+    SOURCE = 'source'
 
 
 def verification_mismatch(image: LinkImage, record: LiveRecord | None) -> StaleField | None:
@@ -505,7 +592,8 @@ def corroboration_mismatch(
 ) -> StaleField | None:
     """The first way the live link differs from what *planned* was planned against.
 
-    *parent* is the read of the pre-image's parent in the child's project;
+    *parent* is the read of the pre-image's parent in the child's project, and
+    is ignored when :func:`corroboration_reads_parent` says the heal needs none;
     *child_count* is needed only for a completion.
     """
     if child is None:
@@ -513,13 +601,37 @@ def corroboration_mismatch(
     return (
         _image_mismatch(planned.pre_image, child)
         or _child_hash_mismatch(planned, child)
-        or _parent_mismatch(planned, parent)
+        or _row_premise_mismatch(planned, child, parent)
         or _children_mismatch(planned, child_count)
     )
 
 
+def _still_a_completion_record(child: LiveRecord) -> StaleField | None:
+    return None if is_orchestrator_completion_record(child.metadata) else StaleField.SOURCE
+
+
+#: The bases whose heal rests on the child alone, each with the check of that
+#: premise. Every other basis rests on its parent too (:func:`_parent_mismatch`).
+_CHILD_ONLY_PREMISES: Mapping[BasisSource, Callable[[LiveRecord], StaleField | None]] = (
+    MappingProxyType({BasisSource.COMPLETION_RECORD: _still_a_completion_record})
+)
+
+
+def corroboration_reads_parent(planned: PlannedAction) -> bool:
+    return planned.basis_source not in _CHILD_ONLY_PREMISES
+
+
 def _child_hash_mismatch(planned: PlannedAction, child: LiveRecord) -> StaleField | None:
     return None if child.text_sha256 == planned.child_sha256 else StaleField.CHILD_SHA256
+
+
+def _row_premise_mismatch(
+    planned: PlannedAction, child: LiveRecord, parent: LiveRecord | None,
+) -> StaleField | None:
+    child_only = _CHILD_ONLY_PREMISES.get(planned.basis_source)
+    if child_only is not None:
+        return child_only(child)
+    return _parent_mismatch(planned, parent)
 
 
 def _parent_mismatch(planned: PlannedAction, parent: LiveRecord | None) -> StaleField | None:
@@ -544,12 +656,17 @@ class RunCounts:
     ``examined`` counts the live links that were read and decided.
     ``adjudicated`` counts the examined links whose basis still judges the texts they show.
     ``unexamined`` counts the examined links that reached the verdict rows with no basis.
+    ``adjudications_reused`` counts the adjudicator verdicts already ledgered at the
+    texts a link shows; ``adjudication_failed`` the links the adjudicator was asked
+    about and gave no verdict.
     """
 
     links_total: int = 0
     examined: int = 0
     adjudicated: int = 0
     unexamined: int = 0
+    adjudications_reused: int = 0
+    adjudication_failed: int = 0
     planned: int = 0
     planned_by_action: Mapping[str, int] = field(default_factory=dict)
     already_pending: int = 0
@@ -587,7 +704,13 @@ class RunCounts:
 
     @property
     def complete(self) -> bool:
-        partial = (self.read_failed, self.failed, self.skipped_cap, self.not_attempted)
+        partial = (
+            self.read_failed,
+            self.failed,
+            self.skipped_cap,
+            self.not_attempted,
+            self.adjudication_failed,
+        )
         return not any(partial) and self.stopped_by is None
 
     def as_json(self) -> dict[str, Any]:
@@ -646,6 +769,42 @@ async def _presence_elsewhere(
     return ParentPresence.ABSENT
 
 
+@dataclass(frozen=True)
+class LinkReads:
+    """Every live link of some projects as read just now, and the ``(project, child)``
+    links whose read failed."""
+
+    states: tuple[LinkState, ...]
+    unread: tuple[tuple[str, str], ...]
+
+
+async def read_links(
+    store: LinkHealStore, census: LinkCensus, projects: Sequence[str],
+) -> LinkReads:
+    states: list[LinkState] = []
+    unread: list[tuple[str, str]] = []
+    for project_id in projects:
+        for child_id in await census.linked_ids(project_id):
+            try:
+                state = await read_link_state(store, project_id, child_id, projects)
+            except StoreReadFailed:
+                unread.append((project_id, child_id))
+                continue
+            if state is not None:
+                states.append(state)
+    return LinkReads(states=tuple(states), unread=tuple(unread))
+
+
+def plan_links(reads: LinkReads, bases: Iterable[LinkBasis]) -> Plan:
+    """Decide every link of *reads* against *bases*."""
+    tally = _PlanTally(bases)
+    for project_id, child_id in reads.unread:
+        tally.record_read_failure(project_id, child_id)
+    for state in reads.states:
+        tally.record(state)
+    return tally.plan()
+
+
 async def build_plan(
     bases: Iterable[LinkBasis],
     *,
@@ -654,17 +813,7 @@ async def build_plan(
     projects: Sequence[str],
 ) -> Plan:
     """Decide every live link of *projects* against *bases*. Writes nothing."""
-    tally = _PlanTally(bases)
-    for project_id in projects:
-        for child_id in await census.linked_ids(project_id):
-            try:
-                state = await read_link_state(store, project_id, child_id, projects)
-            except StoreReadFailed:
-                tally.record_read_failure(project_id, child_id)
-                continue
-            if state is not None:
-                tally.record(state)
-    return tally.plan()
+    return plan_links(await read_links(store, census, projects), bases)
 
 
 def _link_key(project_id: str, child_id: str, parent_id: str | None) -> tuple[str, str, str | None]:
@@ -672,7 +821,7 @@ def _link_key(project_id: str, child_id: str, parent_id: str | None) -> tuple[st
 
 
 class _PlanTally:
-    """What :func:`build_plan` has seen so far. Each :class:`Report` is
+    """What :func:`plan_links` has seen so far. Each :class:`Report` is
     disclosed by the :class:`RunCounts` counter its value names."""
 
     def __init__(self, bases: Iterable[LinkBasis]) -> None:
@@ -732,9 +881,9 @@ def _planned_action(
     basis_source: BasisSource | None,
     basis: LinkBasis | None,
 ) -> PlannedAction:
-    """A deterministic detach rests on the live child; every other heal on its basis."""
-    if basis_source is BasisSource.DETERMINISTIC:
-        source, key = BasisSource.DETERMINISTIC, None
+    """A verdictless heal rests on the live child; every other heal on its basis."""
+    if basis_source is not None and basis_source in VERDICTLESS_SOURCES:
+        source, key = basis_source, None
         child_sha256, parent_sha256 = state.child.text_sha256, None
     elif basis is not None:
         source, key = basis.source, basis.key

@@ -82,6 +82,9 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # to stop. _iter_leaves yields the list WHOLE, so it reloads atomically: a
     # half-applied prefix list would admit a caller no operator ever wrote.
     'reconciliation.deterministic_provenance_allowed_agent_prefixes',
+    # Recon transcript archival (task 3972); why green: the schema descriptions.
+    'reconciliation.transcript_archive_enabled',
+    'reconciliation.transcript_archive_root',
     # Write-triage band thresholds (task 3130). Written by
     # scripts/calibrate_write_triage.py --write-config, which derives them from
     # measured similarity distributions -- so hot-reload is what lets a
@@ -103,6 +106,11 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # Replaced wholesale rather than merged, so a category the latest run
     # stopped deriving a cutoff for does not keep a stale one.
     'write_triage.t_high_by_category',
+    # Per-project cutoffs (task 5547). No server-side consumer: the audit CLI
+    # builds a fresh FusedMemoryConfig per run, so an in-place reload is safe
+    # and restart_required would be a false alarm. Yielded whole by
+    # _iter_leaves, so it reloads all-or-nothing like the map above.
+    'write_triage_project_calibrations',
     # The two write-triage OPERATOR KNOBS (task 3127), green-tier for a
     # different reason than the calibrated thresholds above: they are hand-set,
     # not derived, and both are read LIVE off the shared
@@ -122,7 +130,11 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # Retrieval width, tuned against measured recall on a running server rather
     # than by redeploying. Read live per write, same path as the flag above.
     'write_triage.candidate_k',
-    # The eight write-triage JUDGE knobs (task 3128, PRD leaf gamma). Green-tier
+    # The attach-guard knobs (task 7158): hand-set, read live per write by
+    # server/write_triage.py's resolvers; None is each rule's hot off-switch.
+    'write_triage.min_parent_cosine',
+    'write_triage.hoist_max_cosine_gap',
+    # The write-triage JUDGE knobs (task 3128, PRD leaf gamma). Green-tier
     # for exactly the reason the two operator knobs above are: every one of
     # them is read LIVE off the shared memory_service.config.write_triage
     # object per middle-band write by server/write_triage_judge.py's resolvers,
@@ -130,7 +142,7 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # makes this registration real rather than restart-only in disguise.
     # tests/test_config_reload.py::TestWriteTriageJudgeLeavesAreGreenTier pins
     # both halves, and derives the expected leaf set from
-    # WriteTriageConfig.model_fields, so a NINTH judge_* leaf added later
+    # WriteTriageConfig.model_fields, so a further judge_* leaf added later
     # without a line here fails there rather than degrading silently.
     #
     # `judge_enabled` in particular MUST be green-tier, for the same reason
@@ -143,6 +155,7 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     'write_triage.judge_enabled',
     'write_triage.judge_provider',
     'write_triage.judge_model',
+    'write_triage.judge_api_url',
     'write_triage.judge_timeout_seconds',
     'write_triage.judge_candidate_count',
     'write_triage.judge_reasoning_effort',
@@ -168,6 +181,11 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # flow on a running server WITHOUT granting content-amend authority.
     'mem0_update.content_amend_allowed_agent_prefixes',
     'mem0_update.metadata_patch_allowed_agent_prefixes',
+    # Read live per shadow job by services/overreach_shadow.py::OverreachShadow,
+    # whose settings() re-reads memory_service.config.overreach_guard on every
+    # submit and judge call. shadow_enabled is the shadow's kill switch.
+    'overreach_guard.shadow_enabled',
+    'overreach_guard.judge_timeout_seconds',
     # Storm-alarm knobs, read live off the shared config by
     # MemoryService.update_memory and passed INTO StormCounter.record() on every
     # call. That per-call argument is the non-obvious part: the shared
@@ -207,16 +225,12 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     'entity_mint.storm_threshold',
     'entity_mint.storm_window_seconds',
     # ---- Deterministic auto-consolidation (task 5237, PRD Section 7/11) ----
-    # HONEST STATUS, because a comment that overclaims is worse than none: NO
-    # consumer of consolidation_auto.* exists on this branch. The executor is
-    # task delta, the proposal tool task gamma, the provenance bar task
-    # epsilon. These leaves are registered NOW so the section ships green-tier
-    # from its first commit; the live-read half of this module's reload-safety
-    # rule -- read off the shared config object per call, never captured at
-    # construction -- is discharged by those tasks' own resolvers and their own
-    # tests, which is where a captured-at-construction regression would be
-    # caught. Registration is load-bearing either way: anything absent from
-    # this frozenset silently degrades to restart-only.
+    # The live-read consumers are
+    # reconciliation/consolidation_auto_executor.py::run_auto_consolidation
+    # (MemoryConsolidator.run reads memory.config.consolidation_auto once per
+    # cycle, never at construction) and server/tools.py::propose_consolidation.
+    # Registration is load-bearing: anything absent from this frozenset
+    # silently degrades to restart-only.
     #
     # Two of these MUST be green tier for the PRD Section 11 rollout to work at
     # all. `enabled` is the kill switch -- what an operator flips to stop a
@@ -247,6 +261,7 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # cycle actually produces (PRD Section 12 Q2), so they must move on a
     # running server or the calibration loop is a redeploy loop.
     'consolidation_auto.backlog_multiplier',
+    'consolidation_auto.canonical_absent_bonus',
     'consolidation_auto.refusal_streak_threshold',
     'consolidation_auto.slug_collision_jaccard',
     'consolidation_auto.proposal_ttl_hours',
@@ -257,13 +272,21 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # write_triage.t_high_by_category. Each therefore reloads all-or-nothing,
     # which is why a partially-applied ranking map can never gate a cycle.
     'consolidation_auto.category_weights',
-    # ---- Link-heal executor caps (task 6181, plans/write-triage-link-healing-prd.md H1) ----
-    # The consumer is fused-memory/scripts/link_heal.py, which loads config at
-    # each run start. The server holds no copy, so an edit must never report
+    # ---- Link-heal executor caps and adjudicator knobs (tasks 6181, 6184;
+    # plans/write-triage-link-healing-prd.md H1, H2) ----
+    # The consumers are fused-memory/scripts/link_heal.py and
+    # fused-memory/scripts/eval_link_adjudicator.py, which load config at each
+    # run start. The server holds no copy, so an edit must never report
     # restart_required.
     'link_heal.max_actions_per_run',
     'link_heal.backlog_multiplier',
     'link_heal.write_failure_streak',
+    'link_heal.adjudicator_model',
+    'link_heal.shard_size',
+    'link_heal.field_chars',
+    'link_heal.misfile_share_ceiling',
+    'link_heal.corrects_share_ceiling',
+    'link_heal.shard_failure_streak',
 })
 
 

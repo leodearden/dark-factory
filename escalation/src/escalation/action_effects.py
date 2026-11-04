@@ -7,13 +7,19 @@ consulted by ``escalation.server.resolve_issue`` BEFORE any record mutation
 so an illegal action is rejected loudly (typed error, no write) instead of
 silently.
 
-Behaviour-preserving mapping (D2): the five ``TaskEffect`` values below are
-transcribed verbatim from the current source of truth,
-``orchestrator/src/orchestrator/harness.py::Harness._on_escalation_resolved``
-(originally its ``_ACTION_TARGETS`` map):
+Behaviour-preserving mapping (D2): the five ``TaskEffect`` values below are:
 ``restart`` -> ``pending``, ``park`` -> ``blocked`` (version-a: keeps the L2
 escalation OPEN; NOT ``deferred``), ``abandon`` -> ``cancelled``, ``resume``
 -> ``pending`` (orphan/cascade re-pend), ``close_only`` -> no status change.
+
+Table B has two consumers, and this module is the only copy of the mapping
+either reads. ``escalation.server.resolve_issue`` consults :func:`effect_for`
+for action LEGALITY and writes no task status. The orchestrator harness
+consults it for DISPATCH:
+``orchestrator/src/orchestrator/harness.py::Harness._on_escalation_resolved``
+branches on ``workflow_disposition`` and applies ``target_status``, and
+``orchestrator/src/orchestrator/harness.py::Harness._cascade_unblock_member``
+takes its ``resume`` re-pend target from the ``resume`` row.
 
 WHO the ``resume`` row applies to changed in task 3540 (PRD
 ``plans/task-escalation-state-graph-prd.md`` D8, spec E9), while the table
@@ -28,27 +34,29 @@ See ``orchestrator/src/orchestrator/harness.py::Harness._cascade_unblock_member`
 G6 archive verification: a scan of the live ``data/escalations`` archive (636
 records, 632 resolved/dismissed) found ``resolution_action`` values of
 *exactly* ``{close_only, resume, restart, abandon, park}`` and nothing else,
-occurring across escalation levels 0/1/2 and a wide, open category
-vocabulary (including categories like ``milestone_gate`` that are not even
-members of ``escalation.server.CATEGORIES``, which is inert/unvalidated).
+occurring across escalation levels 0/1/2 and a wide category vocabulary
+(including categories like ``milestone_gate`` far outside the original agent
+set). Legality is not narrowed by category: the registered vocabulary,
+``escalation.categories.EscalationCategory``, governs filing, not resolution.
 ``park`` at level 2 is semantically required (version-a) yet is absent from
 the archive, proving archive-absence does not imply illegality. Conclusion:
 the only combinations safe to reject are those whose *action* itself is
 outside the five valid actions — legality is therefore NOT narrowed by
 level or category today. ``ACTION_EFFECTS`` reflects this: every entry is
 keyed on the wildcard sentinel :data:`ANY` for both the level-class and
-category slots, leaving room for a future, more specific override (e.g. an
-infra-hold interaction, ω4) without changing today's behaviour or this
-module's public contract.
+category slots, leaving room for a future, more specific override without
+changing today's behaviour or this module's public contract.
 
 This module is intentionally pure: it defines the table and the
-:func:`effect_for` lookup only. It does NOT rewire
-``orchestrator.harness`` to consume it (ω3) and does NOT add an
-infra-hold override (ω4) — both are separate, out-of-scope tasks. It also
-does NOT import ``shared`` — the ``target_status`` values below are plain
-lowercase string literals kept in parity with ``shared.task_statuses.
-TaskStatus`` by test (see ``tests/test_action_effects.py``), not by import,
-so this module adds no new production dependency.
+:func:`effect_for` lookup only, and holds no infra-hold override. The
+infra-hold interaction (ω4, task 2200) is a harness pre-gate on
+``orchestrator.task_status.is_infra_held`` in
+``orchestrator/src/orchestrator/harness.py::Harness._cascade_unblock_member``,
+not a Table B entry. This module also does NOT import ``shared`` — the
+``target_status`` values below are plain lowercase string literals kept in
+parity with ``shared.task_statuses.TaskStatus`` by test (see
+``tests/test_action_effects.py``), not by import, so this module adds no new
+production dependency.
 """
 
 from __future__ import annotations
@@ -128,9 +136,9 @@ def level_class(level: int) -> int:
 
     Faithful and non-lossy today (the identity function): ``ACTION_EFFECTS``
     wildcards the level-class slot for every entry (see module docstring),
-    so no information is currently thrown away by classifying. A future
-    task (ω3/ω4) may bucket levels more coarsely or add a more specific
-    override without changing this function's contract.
+    so no information is currently thrown away by classifying. A future,
+    more specific override may bucket levels more coarsely without
+    changing this function's contract.
     """
     return level
 

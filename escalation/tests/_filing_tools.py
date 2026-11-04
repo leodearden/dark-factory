@@ -1,8 +1,9 @@
 """The two-line dance every test that files an escalation has to repeat.
 
-``escalate_blocker`` and ``escalate_info`` are async FastMCP tools, so calling
-one means ``await server.get_tool(name)`` and then ``await tool.fn(**kwargs)``.
-That pair was copied verbatim into a THIRD test module before this one existed
+``escalate_blocker``, ``escalate_info`` and ``promote_to_l2`` are async FastMCP
+tools, so calling one means ``await server.get_tool(name)`` and then
+``await tool.fn(**kwargs)``.  That pair was copied verbatim into a THIRD test
+module before this one existed
 (``test_server_chokepoint.py`` and ``test_observed_submit_response.py`` each
 carried its own identical copy) — the point at which a copy stops being cheaper
 than a name.
@@ -38,4 +39,10 @@ async def call_blocker(server, **kwargs: Any) -> dict[str, Any]:
 async def call_info(server, **kwargs: Any) -> dict[str, Any]:
     """Invoke ``escalate_info`` on *server* and return its response dict."""
     tool = await server.get_tool('escalate_info')
+    return await tool.fn(**kwargs)
+
+
+async def call_promote(server, **kwargs: Any) -> dict[str, Any]:
+    """Invoke ``promote_to_l2`` on *server* and return its response dict."""
+    tool = await server.get_tool('promote_to_l2')
     return await tool.fn(**kwargs)

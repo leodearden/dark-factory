@@ -29,6 +29,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _merge_lane_fakes import lane_scene_config
 
 # Bare sibling-import of the pure builders (no tests/__init__.py — tests dir is
 # on sys.path; mirrors test_concurrent_verify_boundary importing from
@@ -44,7 +45,7 @@ from test_merge_speculation import _LateArrivalFakeEventStore
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.worker import (
     DecidedItem,
     InflightEntry,
     InflightVerifyResult,
@@ -92,7 +93,7 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
 
 @pytest.fixture
 def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
-    return OrchestratorConfig(project_root=git_repo, git=git_config)
+    return lane_scene_config(git_repo, git_config)
 
 
 # ── Fake SHAs + entry/allocator builders (mirror TestFinalizeInflightNonPass) ─

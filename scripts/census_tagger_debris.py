@@ -4,7 +4,7 @@
 READ-ONLY / REPORT-ONLY: this module and its CLI never mutate a task record,
 an event record, or a plan artifact. Every corpus connection it opens is a
 read-only SQLite URI: the task store goes through
-``_task_db_scan.py::connect_ro``, the same open
+``shared/src/shared/tasks_db_readonly.py::connect_ro``, the same open
 ``audit_wiped_metadata_files.load_task_records`` uses, and the runs.db event log
 through :func:`_connect_readonly`
 (``sqlite3.connect(f"file:{path}?mode=ro", uri=True)``), so the sweep is
@@ -72,14 +72,16 @@ from collections.abc import Collection, Sequence
 from pathlib import Path
 from typing import NamedTuple
 
-# Tier 1 — the ONE tasks.db locator. Tier 3 — the warn-and-continue per-root
+import _checkout as _checkout
+
+# Tier 1 — the ONE tasks.db and runs.db locators. Tier 3 — the warn-and-continue per-root
 # loop and the shared no-root message. run_audit_cli is deliberately NOT
 # adopted; the exit-ladder block near main() records why.
 # discover_project_roots comes second-hand through the audit's documented
 # re-export, the same route repair_wiped_metadata_files.py takes.
 from _task_db_scan import (
     NO_PROJECT_ROOT_RESOLVED_MESSAGE,
-    connect_ro,
+    runs_db_path,
     sweep_project_roots,
     tasks_db_path,
 )
@@ -93,14 +95,13 @@ from _task_db_scan import (
 # ``from audit_wiped_metadata_files import`` block.
 from audit_wiped_metadata_files import (
     _EVENT_PLAN_SOURCES,
+    EVENT_LOG_UNREAD,
     FIDELITY_LOCK_LEVEL,
-    NO_MERGE_EVENT,
     _coerce_file_list,
     _decode_files,
     classify_wipe_signature,
     discover_project_roots,
     load_merge_signatures,
-    runs_db_path,
 )
 
 # The terminal allowlist is IMPORTED, never re-spelled. The census exists to
@@ -109,6 +110,11 @@ from audit_wiped_metadata_files import (
 # must be the same object or the census would be answering a question the
 # repair is not asking.
 from repair_wiped_metadata_files import TERMINAL_STATUSES
+
+# The artifact keys on the id spelling its consumers already use: the one
+# project-id rule, never the directory name.
+from shared.project_id import project_id_for_root
+from shared.tasks_db_readonly import connect_ro
 
 # ---------------------------------------------------------------------------
 # The classification vocabulary.
@@ -306,8 +312,10 @@ class CensusRecord(NamedTuple):
     over this task's ``merge_finalized`` history — a second, independently
     derived piece of evidence in a vocabulary DF 3113 P4a and DF 3427 already
     consume, so they can join this artifact to their existing candidate sets
-    without a translation layer. It is deliberately NOT the same field as
-    ``wipe_signature``, which is this census's own axis-3 label.
+    without a translation layer. When the event log could not be read it is
+    the audit's ``EVENT_LOG_UNREAD``, never a verdict over a log nobody read.
+    It is deliberately NOT the same field as ``wipe_signature``, which is this
+    census's own axis-3 label.
     """
 
     project_id: str
@@ -542,7 +550,8 @@ def classify_record(
 
 # ---------------------------------------------------------------------------
 # Corpus readers. Every connection below is mode=ro: tasks.db through
-# _task_db_scan.connect_ro, runs.db through _connect_readonly.
+# shared/src/shared/tasks_db_readonly.py::connect_ro, runs.db through
+# _connect_readonly.
 # ---------------------------------------------------------------------------
 
 
@@ -550,10 +559,10 @@ def _connect_readonly(path: str) -> sqlite3.Connection:
     """Open the runs.db event log at *path* through a read-only SQLite URI.
 
     The event-log opener only. The task store goes through
-    ``_task_db_scan.py::connect_ro`` instead, whose refusals speak of tasks.db
-    and would mislead about runs.db. Kept as a named helper so the "cannot
-    write" property is testable against the opener itself rather than
-    re-asserted per call site.
+    ``shared/src/shared/tasks_db_readonly.py::connect_ro`` instead, whose
+    refusals speak of tasks.db and would mislead about runs.db. Kept as a named
+    helper so the "cannot write" property is testable against the opener itself
+    rather than re-asserted per call site.
     """
     return sqlite3.connect(f"file:{path}?mode=ro", uri=True)
 
@@ -725,16 +734,6 @@ class ProjectCensus(NamedTuple):
     coverage: CensusCoverage
 
 
-def project_id_for(project_root: str) -> str:
-    """``/home/leo/src/solar-challenge-platform`` -> ``solar_challenge_platform``.
-
-    The six corpora spell their project ids with underscores where the
-    directory uses hyphens. The artifact must key on the id spelling its
-    consumers already use, not on the directory name.
-    """
-    return Path(project_root).name.replace("-", "_")
-
-
 def _sort_key(record: CensusRecord, lead: str) -> tuple[str, int, str]:
     """Sort by (*lead*, NUMERIC task id) so 100 follows 20 rather than preceding it.
 
@@ -763,7 +762,7 @@ def census_project(project_root: str) -> ProjectCensus:
 
     A missing or unreadable runs.db is TOLERATED but never hidden: every record
     still appears, degraded to NEVER_RECONCILED / NO_PRIOR_SCOPE /
-    NO_MERGE_EVENT, and ``coverage.event_log_read`` goes False so a consumer
+    EVENT_LOG_UNREAD, and ``coverage.event_log_read`` goes False so a consumer
     can see the axes were unknown rather than measured clean.
 
     A tasks.db error PROPAGATES — any of
@@ -774,7 +773,7 @@ def census_project(project_root: str) -> ProjectCensus:
     equality. Returning a partial census here would silently re-open the false
     green exit 3 closes.
     """
-    project_id = project_id_for(project_root)
+    project_id = project_id_for_root(Path(project_root).resolve())
     tasks_db = tasks_db_path(project_root)
 
     conn = connect_ro(tasks_db)
@@ -784,7 +783,7 @@ def census_project(project_root: str) -> ProjectCensus:
         conn.close()
     stamped = load_stamped_records(str(tasks_db))
 
-    # runs_db_path is IMPORTED from the audit, which already resolves
+    # runs_db_path is IMPORTED from _task_db_scan, which resolves
     # <root>/data/orchestrator/runs.db. That is how the 0-byte data/runs.db
     # decoy task 4525 warns about is avoided — by reuse, not by a new constant
     # this module would have to keep correct on its own.
@@ -835,9 +834,9 @@ def census_project(project_root: str) -> ProjectCensus:
                 metadata_files=record.metadata_files,
                 metadata_files_match_prior_plan=verdict.metadata_files_match_prior_plan,
                 merge_signature=(
-                    classify_wipe_signature(merge_signatures[str(record.task_id)])
-                    if str(record.task_id) in merge_signatures
-                    else NO_MERGE_EVENT
+                    classify_wipe_signature(merge_signatures.get(str(record.task_id), []))
+                    if event_log_read
+                    else EVENT_LOG_UNREAD
                 ),
             )
         )

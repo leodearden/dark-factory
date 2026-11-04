@@ -75,24 +75,15 @@ DEFAULT_PROBE_ARTIFACT_PATH: str = 'config/model-availability.yaml'
 # turn, without incurring meaningful cost.
 DEFAULT_PROBE_PROMPT: str = 'Reply with the single word: ok'
 
-# AgentResult.subtype the Claude CLI stamps when the local --max-budget-usd
-# ceiling fires: ``error_max_budget_usd``, WITH the ``_usd`` suffix -- not
-# ``error_max_budget`` (the same warning
-# ``orchestrator.dry_run_unblock::_BUDGET_SUBTYPES`` carries). This is a CLI
-# wire contract, so its canonical home is beside AgentResult in
-# ``shared.cli_invoke``, which every package that spells it already depends
-# on; consolidating the several per-package copies is filed follow-up work,
-# outside this module's scope.
-PROBE_BUDGET_EXHAUSTED_SUBTYPE: str = 'error_max_budget_usd'
-
 # Per-invocation USD ceiling probe_models forwards as max_budget_usd.
 # INVARIANT: it must clear one turn of the most expensive probed model. A
 # one-turn probe still pays for the CLI's own preamble, and one
 # FABLE_CANDIDATE_MODEL turn measures ~$0.15-0.25 that way, so a ceiling
-# below that aborts every such probe with PROBE_BUDGET_EXHAUSTED_SUBTYPE and
-# yields no availability evidence at all. $1.00 leaves ~4x headroom while
-# staying a trivially small per-(account, model) spend, and it is a CEILING,
-# not a spend: a probe that completes normally still costs one cheap turn.
+# below that aborts every such probe with
+# shared.cli_invoke.BUDGET_EXHAUSTED_SUBTYPE and yields no availability
+# evidence at all. $1.00 leaves ~4x headroom while staying a trivially small
+# per-(account, model) spend, and it is a CEILING, not a spend: a probe that
+# completes normally still costs one cheap turn.
 DEFAULT_PROBE_BUDGET_USD: float = 1.0
 
 # The status classify_probe_outcome returns for a turn that aborted on that
@@ -128,9 +119,9 @@ def classify_probe_outcome(result: AgentResult) -> str:
     """Map one probe invocation's ``AgentResult`` to a probe status string.
 
     A budget abort is checked FIRST, above every other tier including cap
-    detection: ``PROBE_BUDGET_EXHAUSTED_SUBTYPE`` means the API accepted the
-    request and consumed real tokens, so the model resolved for this account
-    and the account is NOT capped -- the distinction
+    detection: ``shared.cli_invoke.BUDGET_EXHAUSTED_SUBTYPE`` means the API
+    accepted the request and consumed real tokens, so the model resolved for
+    this account and the account is NOT capped -- the distinction
     ``shared.usage_gate::_probe_hit_local_budget_cap`` draws. Detection keys
     on that subtype ALONE, never on a ``cost_usd >= budget_usd`` heuristic:
     an agent can spend close to the ceiling and then fail for an unrelated
@@ -146,6 +137,7 @@ def classify_probe_outcome(result: AgentResult) -> str:
     Pure -- reads only *result*. ``'invoke_error'`` and ``'no_token'`` are
     assigned by ``probe_models`` around this function, never by it.
     """
+    from shared.cli_invoke import BUDGET_EXHAUSTED_SUBTYPE
     from shared.invocation_outcome import (
         OK,
         AuthFailed,
@@ -155,7 +147,7 @@ def classify_probe_outcome(result: AgentResult) -> str:
         classify_invocation,
     )
 
-    if (result.subtype or '') == PROBE_BUDGET_EXHAUSTED_SUBTYPE:
+    if result.subtype == BUDGET_EXHAUSTED_SUBTYPE:
         return PROBE_BUDGET_TOO_LOW_STATUS
 
     outcome = classify_invocation(result, strict_confirm=False, backend='claude')

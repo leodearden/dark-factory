@@ -312,6 +312,20 @@ question. `end-to-end` is the live confirm stage, opened only for a survivor can
     pin, because the existing bundle tests assert against the constants they protect and would
     stay green on any value. The `eval-ofat` candidate-selector gap is **not** fixed: the
     coordinator is the screen.
+
+    **Amended 2026-10-31 (Leo, task 7991).** MiMo V2.6 Pro (`mimo-v2.6-pro`, imputed
+    $0.435/$0.87 per 1M in/out) and MiMo V2.6 Flash (`mimo-v2.6-flash`, $0.14/$0.28) join the
+    slate on MiMo Code, at Leo's direction (source `https://mimo.mi.com/docs/en-US/pricing`,
+    retrieved 2026-10-31). `mimo-v2.5*` retired on 2026-10-21 and is not used;
+    `mimo-v2.6-pro-ultraspeed` is out of scope. The Claude-harness controls are
+    `mimo-v2.6-pro-endpoint` and `mimo-v2.6-flash-endpoint`
+    (`orchestrator/src/orchestrator/evals/configs.py::claude_endpoint_candidates`). Access is a
+    Xiaomi MiMo Token Plan: a `tp-` key answers only on its region's cluster,
+    `https://token-plan-{cn|sgp|ams}.xiaomimimo.com/anthropic`, so the base URL is read from
+    `MIMO_ANTHROPIC_BASE_URL` and the key from `MIMO_API_KEY`; a blank value in either skips the
+    cell as `no_credentials` rather than letting it 401. Pay-as-you-go `sk-` keys use
+    `https://api.xiaomimimo.com/anthropic` and are not interchangeable with `tp-` keys. The
+    literal slate pin covers both ids and prices.
 13. **No production config change** is applied by anything in this PRD (as every eval
     PRD in this lineage).
 14. **(Leo) The one-step implementer harness variant is an eval axis, with a control.**
@@ -338,6 +352,11 @@ question. `end-to-end` is the live confirm stage, opened only for a survivor can
     unbuildable arm is a real answer to land rather than a backend to half-build. **The
     Claude-harness control for the same model is mandatory** — the existing `pi-sonnet-control`
     candidate is exactly this pattern, and an arm without its control measures nothing.
+
+    **Amended 2026-10-31 (Leo, task 7991).** MiMo Code is MiMo V2.6's vendor harness, and the
+    same rule applies. The MiMo Code arm is probe-gated (task 7993, following the ZCode arm's
+    precedent in leaf ω, task 5399), and its mandatory same-model Claude-harness controls are
+    the two `-endpoint` bundles named in decision 12.
 16. **A subscription-metered arm gets two cost columns, and the modelled one is tagged (Leo).**
     A GLM Coding Plan bills **credits** against a weekly and rolling-5h allowance, not tokens, so
     a GLM cell meters no dollars. Writing `0` would make the cheapest-looking arm appear free and
@@ -352,6 +371,15 @@ question. `end-to-end` is the live confirm stage, opened only for a survivor can
     `cap_excluded` with reason `credits_exhausted`, and the `cost_ratio_ceiling` storm escape
     compares only within a matching `cost_basis`: across bases it would be permanently
     un-trippable for the subscription arm, a guard present and green and disarmed (INV-4).
+
+    **Amended 2026-10-31 (Leo, task 7991).** The MiMo Token Plan is credit-metered too, so both
+    MiMo price rows are `subscription` and their dollar figures imputed. Credits per token
+    (source `https://mimo.mi.com/docs/en-US/price/token-plan`, retrieved 2026-10-31): Pro 300
+    cache-miss input / 2.5 cache-hit input / 600 output; Flash 100 / 2 / 200. The quota is
+    monthly with no top-ups, and an exhausted plan stops until upgraded, so exhaustion settles a
+    cell `cap_excluded` with reason `credits_exhausted`. Computing `cost_credits` and detecting
+    exhaustion belong to task 7994. The eval-exclusivity ruling above covers the GLM Coding Plan
+    only; nothing is ruled for the Token Plan.
 
 ## Pre-conditions for activating
 
@@ -461,6 +489,58 @@ Ordering invariants: `on_phase` for a task is idempotent per `(task, shape, cand
 run fails writes `failed` before any settle can occur. Errors inside a cell never propagate
 to the production slot (the coordinator wraps the runner; a wrapped failure is a `failed`
 cell with the exception class in `reason`).
+
+> **As built (task 5387, 2026-10-27).** The contract above is the design; where the code
+> differs, the code below is authoritative.
+>
+> - **Constructor:** `ShadowCoordinator(config, deps: ShadowCoordinatorDeps, *, project_id,
+>   run_id, incumbents)`. `seed` has one home, `ShadowEvalConfig.seed`. The isolation probe
+>   in `deps` has no default.
+> - **`on_phase(task, phase: WorkflowState, entering)`** takes the task record, because the
+>   open decision needs the stratum and `branch_base_sha`.
+> - **`should_open` is async:** it gathers a store snapshot (`OpenInputs`). The pure part is
+>   `shadow_eval.py::decide_open`. Two skip reasons were added: `unknown_candidate` and
+>   `no_base_sha`. A resolver that raises is still `unknown_candidate`, logged at ERROR, and
+>   its skip carries `resolver_error`.
+> - **The open snapshot and the insert share one lock** per coordinator, so `max_concurrent`
+>   is a hard limit. The daily cap counts dollars already spent, so runs in flight can
+>   overshoot it by their own cost before the budget storm guard pauses.
+> - **A runner has three stages:** `ShadowRunner.prepare`, `run`, `release`. So `opened` and
+>   `running` are real states. `release` is called exactly once for every worktree that
+>   `prepare` returned, on every exit.
+> - **C1 gains `run_ended_at`,** stamped when a cell leaves a held state
+>   (`ShadowCellState.stamps_run_ended_at`). The `credits_exhausted` hold reads it over
+>   `CREDIT_WINDOW`, so the hold runs from when the allowance ran out.
+> - **`aclose()` leaves no held cell:** it cancels every drive, then fails whatever this run
+>   still holds with `cancelled_at_shutdown`.
+> - **Failed and cap-excluded cells** emit `shadow_cell_ended`, not `shadow_cell_settled`.
+> - **Settling has three entries:**
+>   - `on_merge_finalized`, keyed on the payload's `task_id`;
+>   - `on_production_terminal(task_id, outcome)`, the non-landing settle that row 5 needs
+>     (`WorkflowOutcome.BLOCKED`/`CANCELLED` only);
+>   - a late-reference catch-up when a run completes after production's outcome is
+>     already recorded.
+> - **Who writes `settled_at`:** only a transition into `settled`/`expired`
+>   (`ShadowCellState.stamps_settled_at`, enforced in `run_store.py::RunStore.advance_shadow_cell`),
+>   whose only callers are the settle path and `expire`. This structural rule replaces the
+>   list of writer names in the ordering invariants above.
+> - **Only `done`/`done_wip_recovery` with a `merge_sha` is a landing.** `superseded` and the
+>   retryable merge states settle nothing.
+> - **`expire(now)` returns `ExpireSweep(expired, deferred)`,** capped at `EXPIRE_BATCH_LIMIT`.
+> - **The storm pause is durable:** it is the `shadow_storm` row in runs.db, and the open
+>   gate reads that row. `storm_state()` returns an advisory `StormState(paused, cause,
+>   detail)`. Only the call that creates the pause escalates. `resume()` restarts every
+>   storm window at `resumed_at`.
+> - **Both cost guards count only `metered` cells:** the USD budget, and the ratio, which
+>   compares a cell only against production's metered `cost_basis`.
+> - **An unreadable production cost store** skips the ratio, but only for a bounded time:
+>   after `COST_UNREADABLE_PAUSE` consecutive failed reads, it pauses with cause
+>   `cost_unreadable`. The count is process-local.
+> - **Consequence leg 1 is an `architect`-shape cell.** Leg 2 opens from its completed run
+>   when `shadow_scoring.py::consequence_leg_warranted` holds, linked by `parent_cell_id`.
+> - **The C4 rules** live in `orchestrator/shadow_scoring.py`. `score_architect_cell` scores an
+>   `architect` cell and `score_implementer_cell` scores every other shape. The caller picks the
+>   rule by shape.
 
 ### C3 — live fixture builder (`evals/live_fixture.py`)
 
@@ -773,8 +853,9 @@ Resolved at decompose on 2026-09-11 are struck through with their resolution; th
 4. **Settle-deadline default.** 168 h assumes production lands within a week; long
    `merge-deferred` holds may exceed it. **Suggested resolution:** keep 168 h, count
    `expired` in the report, revisit after κ2.
-5. **Cross-project report aggregation.** Each orchestrator writes its own runs.db;
-   `eval-shadow report --project-root` per project vs a merged view. Decide in θ1.
+5. ~~**Cross-project report aggregation.**~~ **RESOLVED** in θ1, task 5389: per-project
+   `orchestrator eval-shadow report --config <project yaml>`, no merged view; the reasoning
+   is in the θ1 CLI commit message.
 6. **Consequence leg 2 reviewer.** Whether leg 2 runs the reviewer (adds cost, gives
    `review_blocking_issues`) or stops at verify. **Suggested resolution:** run it —
    review outcome is half the signal for "better plan". Decide in ζ.

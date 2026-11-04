@@ -1,13 +1,15 @@
 """Tests for the token-budget context assembler."""
 
 import asyncio
+import itertools
 import json
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
+from _clip_assertions import assert_elided
 
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.memory import MemoryCategory, MemoryResult, SourceStore
@@ -58,21 +60,12 @@ def _make_memory_result(
     )
 
 
-def _make_watermark(
-    last_run: datetime | None = None,
-) -> Watermark:
-    return Watermark(
-        project_id='test-project',
-        last_full_run_completed=last_run or datetime.now(UTC) - timedelta(hours=1),
-    )
+def _make_watermark() -> Watermark:
+    return Watermark(project_id='test-project')
 
 
 def _make_config(**overrides: int) -> ReconciliationConfig:
-    return ReconciliationConfig(
-        token_budget=overrides.get('token_budget', 65_000),
-        context_search_limit=overrides.get('context_search_limit', 5),
-        context_fetch_batch_size=overrides.get('context_fetch_batch_size', 10),
-    )
+    return ReconciliationConfig.model_validate(overrides)
 
 
 @pytest_asyncio.fixture
@@ -152,10 +145,23 @@ async def test_budget_stops_accumulation(mock_memory):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('token_budget', [1_450, ReconciliationConfig().token_budget])
+async def test_payload_states_the_budget_it_was_assembled_under(mock_memory, token_budget):
+    """Both the budget-stopped path and the all-fit path carry the budget value."""
+    config = _make_config(token_budget=token_budget)
+    assembler = _make_assembler(memory_service=mock_memory, config=config)
+    events = [_make_event(payload={'content_preview': f'content {i}'}) for i in range(10)]
+
+    result = await assembler.assemble(events, _make_watermark(), 'test-project')
+
+    assert result.token_budget == token_budget
+    assert (result.events_remaining > 0) == (token_budget == 1_450)
+
+
+@pytest.mark.asyncio
 async def test_all_events_fit_when_under_budget(mock_memory):
     """When total tokens < budget, all events are included."""
-    config = _make_config(token_budget=65_000)
-    assembler = _make_assembler(memory_service=mock_memory, config=config)
+    assembler = _make_assembler(memory_service=mock_memory, config=_make_config())
 
     events = [_make_event() for _ in range(5)]
     watermark = _make_watermark()
@@ -334,41 +340,6 @@ async def test_context_fetch_failure_includes_event(mock_memory):
 
     assert len(result.events) == 1
     assert len(result.context_items) == 0
-
-
-# ── Effective watermark ──────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_effective_watermark_uses_min_of_run_and_event():
-    """Watermark aligns with the earliest event if it predates last run."""
-    assembler = _make_assembler()
-
-    last_run = datetime(2026, 4, 2, 10, 0, tzinfo=UTC)
-    old_event_time = datetime(2026, 4, 1, 8, 0, tzinfo=UTC)
-
-    events = [_make_event(timestamp=old_event_time)]
-    watermark = _make_watermark(last_run=last_run)
-
-    result = await assembler.assemble(events, watermark, 'test-project')
-
-    assert result.effective_watermark == old_event_time
-
-
-@pytest.mark.asyncio
-async def test_effective_watermark_uses_last_run_when_events_are_recent():
-    """Watermark uses last_run when all events are more recent."""
-    assembler = _make_assembler()
-
-    last_run = datetime(2026, 4, 1, 8, 0, tzinfo=UTC)
-    recent_event = datetime(2026, 4, 2, 10, 0, tzinfo=UTC)
-
-    events = [_make_event(timestamp=recent_event)]
-    watermark = _make_watermark(last_run=last_run)
-
-    result = await assembler.assemble(events, watermark, 'test-project')
-
-    assert result.effective_watermark == last_run
 
 
 # ── Batch processing ────────────────────────────────────────────────
@@ -741,6 +712,170 @@ def test_format_task_no_display_id_uses_task_id_field():
     assert '[task:42]' in result
 
 
+def _desc_line(rendered: str) -> str:
+    return next(line for line in rendered.splitlines() if line.startswith('  desc: '))
+
+
+def _task_with_description(desc: str) -> dict:
+    return {'id': '7', 'title': 'T', 'status': 'done', 'dependencies': [], 'description': desc}
+
+
+def _memory_body(formatted: str) -> str:
+    return formatted.split('): ', 1)[1]
+
+
+def test_format_task_discloses_a_clipped_description():
+    desc = 'd' * 10_000
+
+    line = _desc_line(_format_task(_task_with_description(desc)))
+
+    assert_elided(line.removeprefix('  desc: '), desc)
+
+
+def test_format_task_leaves_a_short_description_unmarked():
+    desc = 'a short description'
+
+    assert _desc_line(_format_task(_task_with_description(desc))) == f'  desc: {desc}'
+
+
+async def _memory_context(mock_memory, body: str) -> str:
+    memory = _make_memory_result(content=body)
+    mock_memory.search = AsyncMock(return_value=[memory])
+    assembler = _make_assembler(memory_service=mock_memory)
+    events = [_make_event(payload={'content_preview': 'anything'})]
+
+    result = await assembler.assemble(events, _make_watermark(), 'test-project')
+
+    return _memory_body(result.context_items[memory.id].formatted)
+
+
+@pytest.mark.asyncio
+async def test_memory_context_discloses_a_clipped_body(mock_memory):
+    body = 'm' * 10_000
+
+    assert_elided(await _memory_context(mock_memory, body), body)
+
+
+@pytest.mark.asyncio
+async def test_memory_context_leaves_a_short_body_unmarked(mock_memory):
+    assert await _memory_context(mock_memory, 'a short memory') == 'a short memory'
+
+
+@pytest.mark.asyncio
+async def test_assembled_task_context_carries_the_elision_markers(mock_memory, mock_taskmaster):
+    """The formatted strings are what Stages 1/2/3 read verbatim, so the marker must reach them."""
+    desc = 'x' * 10_000
+    mock_taskmaster.get_task = AsyncMock(return_value={
+        **_task_with_description(desc),
+        'id': '42',
+        'metadata': {'memory_hints': {'queries': ['long hint']}},
+    })
+    hinted = _make_memory_result(content='y' * 10_000)
+    mock_memory.search = AsyncMock(return_value=[hinted])
+    assembler = _make_assembler(memory_service=mock_memory, taskmaster=mock_taskmaster)
+    events = [_make_event(
+        event_type=EventType.task_status_changed,
+        payload={'task_id': '42', 'old_status': 'in-progress', 'new_status': 'done'},
+    )]
+
+    result = await assembler.assemble(events, _make_watermark(), 'test-project')
+
+    task_line = _desc_line(result.context_items['task:42'].formatted)
+    assert_elided(task_line.removeprefix('  desc: '), desc)
+    assert_elided(_memory_body(result.context_items[hinted.id].formatted), hinted.content)
+
+
+@pytest.mark.asyncio
+async def test_assembled_context_renders_typical_long_records_whole(mock_memory, mock_taskmaster):
+    """A description just above the measured p90 and a memory body at the dark_factory p90
+    reach the payload whole (plans/recon-evidence-caps-measurement-2026-10.md, M1/M2)."""
+    desc = 'd' * 3_800
+    mock_taskmaster.get_task = AsyncMock(return_value={
+        **_task_with_description(desc),
+        'id': '42',
+        'metadata': {'memory_hints': {'queries': ['q']}},
+    })
+    hinted = _make_memory_result(content='m' * 1_950)
+    mock_memory.search = AsyncMock(return_value=[hinted])
+    assembler = _make_assembler(memory_service=mock_memory, taskmaster=mock_taskmaster)
+    events = [_make_event(
+        event_type=EventType.task_status_changed,
+        payload={'task_id': '42', 'old_status': 'in-progress', 'new_status': 'done'},
+    )]
+
+    result = await assembler.assemble(events, _make_watermark(), 'test-project')
+
+    assert _desc_line(result.context_items['task:42'].formatted) == f'  desc: {desc}'
+    assert _memory_body(result.context_items[hinted.id].formatted) == hinted.content
+
+
+# ── token_budget against a measured backlog chunk ───────────────────
+# Inputs measured in plans/recon-evidence-caps-measurement-2026-10.md (M1, M2, M3, M7).
+
+_MEASURED_CHUNK_EVENTS = 268
+_MEAN_RENDERED_DESCRIPTION_CHARS = 2_052
+_MEAN_RENDERED_MEMORY_CHARS = 763
+_CONTENT_PREVIEW_CHARS = 200
+_TASKS_PER_BLOCK = 3
+
+
+def _measured_block(block: int) -> list[ReconciliationEvent]:
+    task_ids = [str(_TASKS_PER_BLOCK * block + n) for n in range(_TASKS_PER_BLOCK)]
+    return [
+        *(_make_event(EventType.task_modified, payload={'task_id': task_ids[n % _TASKS_PER_BLOCK]})
+          for n in range(11)),
+        *(_make_event(EventType.memory_added, payload={'content_preview': 'p' * _CONTENT_PREVIEW_CHARS})
+          for _ in range(7)),
+        *(_make_event(EventType.memory_deleted, payload={'memory_id': str(uuid.uuid4())})
+          for _ in range(2)),
+    ]
+
+
+def _measured_backlog_chunk() -> list[ReconciliationEvent]:
+    blocks = itertools.chain.from_iterable(_measured_block(b) for b in itertools.count())
+    return list(itertools.islice(blocks, _MEASURED_CHUNK_EVENTS))
+
+
+async def _measured_search(*, query: str, **_) -> list[MemoryResult]:
+    hits = 1 if query.startswith('memory ') else 4
+    return [_make_memory_result(content='b' * _MEAN_RENDERED_MEMORY_CHARS) for _ in range(hits)]
+
+
+async def _measured_task(*, task_id: str, project_root: str) -> dict:
+    return {**_task_with_description('d' * _MEAN_RENDERED_DESCRIPTION_CHARS), 'id': task_id}
+
+
+_BUDGET_HOMES = {
+    'shipped_config_yaml': lambda shipped: shipped.reconciliation,
+    'schema_default': lambda _shipped: ReconciliationConfig(),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('budget_home', list(_BUDGET_HOMES.values()), ids=list(_BUDGET_HOMES))
+async def test_shipped_budget_holds_a_measured_backlog_chunk(
+    budget_home, mock_config, mock_memory, mock_taskmaster,
+):
+    """token_budget holds the median budget-bound chunk at the per-item caps.
+
+    Raising a per-item cap without the budget, or cutting the budget, narrows
+    every backlog chunk and fails here.
+    """
+    mock_memory.search = AsyncMock(side_effect=_measured_search)
+    mock_taskmaster.get_task = AsyncMock(side_effect=_measured_task)
+    assembler = _make_assembler(
+        memory_service=mock_memory, taskmaster=mock_taskmaster, config=budget_home(mock_config),
+    )
+
+    result = await assembler.assemble(_measured_backlog_chunk(), _make_watermark(), 'test-project')
+
+    assert len(result.events) == _MEASURED_CHUNK_EVENTS, (
+        f'only {len(result.events)} of {_MEASURED_CHUNK_EVENTS} measured events fit '
+        f'token_budget={result.token_budget}'
+    )
+    assert result.events_remaining == 0
+
+
 # ── _ctx_task_event subtask qualification ────────────────────────────
 
 
@@ -967,7 +1102,7 @@ def _hint_task(*queries: str, task_id: str = '42') -> dict:
 
 
 async def _search_rows(journal) -> list[dict]:
-    rows = await journal.get_ops_since('1970-01-01T00:00:00+00:00', limit=500, kind='read')
+    rows = await journal.get_stored_ops_since('1970-01-01T00:00:00+00:00', limit=500, kind='read')
     return [r for r in rows if r['operation'] == 'search']
 
 

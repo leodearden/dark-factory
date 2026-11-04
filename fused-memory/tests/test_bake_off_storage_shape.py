@@ -29,9 +29,12 @@ tests assert exact values with no tolerances.
 """
 from __future__ import annotations
 
+import dataclasses
 import functools
 import re
+import subprocess
 import types
+import uuid
 from collections.abc import Container
 from pathlib import Path
 
@@ -3286,6 +3289,106 @@ class TestAuditRecallOverTheCommittedFixture:
         assert first == second
 
 
+import copy  # noqa: E402
+
+
+def _count_detector_calls(monkeypatch, mod) -> list:
+    """Every call the real audit detector receives, appended as it happens.
+
+    ``functools.wraps`` is load-bearing: ``resolve_audit_threshold`` reads the
+    detector's default through ``inspect.signature``, which follows
+    ``__wrapped__``.  The counter is a new detector, so ``memoized_audit_recall``
+    holds nothing for it yet and its first audit always reaches it.
+    """
+    audit = mod.load_audit_script()
+    detector = audit.find_near_duplicate_memory_groups
+    calls: list = []
+
+    @functools.wraps(detector)
+    def _counted(*args, **kwargs):
+        calls.append(args)
+        return detector(*args, **kwargs)
+
+    monkeypatch.setattr(audit, 'find_near_duplicate_memory_groups', _counted)
+    return calls
+
+
+def _corpus_no_other_test_has_audited() -> list[dict]:
+    """The memo is process-wide and shared by every test on an xdist worker,
+    so each test audits content of its own."""
+    corpus = copy.deepcopy(_SYNTHETIC_CORPUS)
+    corpus[-1]['content'] += f' {uuid.uuid4().hex}'
+    return corpus
+
+
+class TestAuditRecallIsComputedOncePerContent:
+    """`memoized_audit_recall` pays the O(n^2) sweep once per distinct input."""
+
+    def test_equal_records_run_the_detector_once(self, monkeypatch):
+        mod = _mod()
+        records = _corpus_no_other_test_has_audited()
+        calls = _count_detector_calls(monkeypatch, mod)
+
+        first = mod.memoized_audit_recall(records, 0.85)
+        second = mod.memoized_audit_recall(copy.deepcopy(records), 0.85)
+
+        assert len(calls) == 1
+        assert first == second == mod.audit_recall_over_labeled_fixture(
+            records, 0.85,
+        )
+
+    def test_a_changed_record_is_audited_afresh(self, monkeypatch):
+        mod = _mod()
+        records = _corpus_no_other_test_has_audited()
+        calls = _count_detector_calls(monkeypatch, mod)
+        changed = copy.deepcopy(records)
+        changed[0]['content'] += ' (edited)'
+
+        mod.memoized_audit_recall(records, 0.85)
+        mod.memoized_audit_recall(changed, 0.85)
+
+        assert len(calls) == 2
+
+    def test_a_different_threshold_is_audited_afresh(self, monkeypatch):
+        mod = _mod()
+        records = _corpus_no_other_test_has_audited()
+        calls = _count_detector_calls(monkeypatch, mod)
+
+        mod.memoized_audit_recall(records, 0.85)
+        mod.memoized_audit_recall(records, 0.5)
+
+        assert len(calls) == 2
+
+    def test_mutating_a_result_does_not_reach_the_next_caller(self):
+        mod = _mod()
+        records = _corpus_no_other_test_has_audited()
+        first = mod.memoized_audit_recall(records, 0.85)
+        pristine = copy.deepcopy(first)
+
+        first['true_dup']['pairs'] = -1
+
+        assert mod.memoized_audit_recall(records, 0.85) == pristine
+
+    def test_a_swapped_detector_neither_reads_nor_leaves_a_remembered_result(
+        self, monkeypatch,
+    ):
+        mod = _mod()
+        records = _corpus_no_other_test_has_audited()
+        audit = mod.load_audit_script()
+        real = mod.memoized_audit_recall(records, 0.85)
+
+        with monkeypatch.context() as swapped:
+            swapped.setattr(
+                audit, 'find_near_duplicate_memory_groups',
+                lambda memories, threshold: [],
+            )
+            stubbed = mod.memoized_audit_recall(records, 0.85)
+
+        assert real['groups_found'] == 1
+        assert stubbed['groups_found'] == 0
+        assert mod.memoized_audit_recall(records, 0.85) == real
+
+
 # ===========================================================================
 # step-17 — the report: build_report + render_markdown
 # ===========================================================================
@@ -4153,6 +4256,49 @@ class TestTheTwoArtifactsAreWrittenAsAPair:
         )
 
 
+
+
+@dataclasses.dataclass(frozen=True)
+class _GitShim:
+    """A real ``git`` first on PATH that logs every argv before running it.
+
+    While ``failing_walks`` exists, every ``git log`` exits 1 instead.
+    """
+
+    log: Path
+    failing_walks: Path
+
+    @classmethod
+    def install(cls, tmp_path: Path, monkeypatch) -> _GitShim:
+        import os
+        import shutil
+
+        real = shutil.which('git')
+        if real is None:
+            pytest.skip('no git on PATH')
+        shim = cls(log=tmp_path / 'git.log', failing_walks=tmp_path / 'fail-walks')
+        executable = tmp_path / 'bin' / 'git'
+        executable.parent.mkdir()
+        executable.write_text(
+            '#!/bin/sh\n'
+            f'printf \'%s\\n\' "$*" >> "{shim.log}"\n'
+            f'if [ "$1" = log ] && [ -e "{shim.failing_walks}" ]; then exit 1; fi\n'
+            f'exec "{real}" "$@"\n'
+        )
+        executable.chmod(0o755)
+        monkeypatch.setenv(
+            'PATH', f'{executable.parent}{os.pathsep}{os.environ["PATH"]}',
+        )
+        return shim
+
+    def calls(self, subcommand: str) -> list[str]:
+        logged = self.log.read_text() if self.log.exists() else ''
+        return [
+            line for line in logged.splitlines()
+            if line.startswith(f'{subcommand} ')
+        ]
+
+
 class TestFixtureProvenance:
     """The blind-authoring audit trail is git history; the report cites it."""
 
@@ -4179,6 +4325,75 @@ class TestFixtureProvenance:
 
         assert not provenance[0]['path'].startswith('/')
 
+    def test_a_committed_fixtures_blob_is_the_one_heads_tree_holds(self):
+        entry = _mod().fixture_provenance([ARM_CLAIMS_PATH])[0]
+
+        held = subprocess.run(
+            ['git', 'rev-parse', '--verify', '--quiet', f'HEAD:{entry["path"]}'],
+            cwd=ARM_CLAIMS_PATH.parent, capture_output=True, text=True,
+            check=True,
+        )
+
+        assert entry['blob'] == held.stdout.strip()
+
+    def test_the_blob_identifies_content_not_path(self, tmp_path):
+        first, twin, other = (tmp_path / name for name in (
+            'first.jsonl', 'twin.jsonl', 'other.jsonl'))
+        first.write_text('{"same": true}\n')
+        twin.write_text('{"same": true}\n')
+        other.write_text('{"same": false}\n')
+
+        provenance = _mod().fixture_provenance([first, twin, other])
+
+        assert provenance[0]['blob']
+        assert provenance[0]['blob'] == provenance[1]['blob']
+        assert provenance[2]['blob'] != provenance[0]['blob']
+        assert [entry['commit'] for entry in provenance] == [None, None, None]
+
+    def test_a_path_git_cannot_read_reports_no_blob_rather_than_a_wrong_one(
+        self, tmp_path,
+    ):
+        provenance = _mod().fixture_provenance([tmp_path / 'missing.jsonl'])
+
+        assert provenance[0]['blob'] is None
+
+    def test_a_second_stamp_of_the_same_paths_does_not_walk_history_again(
+        self, tmp_path, monkeypatch,
+    ):
+        """Observed through a real git shim on PATH.  At most one walk per
+        path, because an earlier test on this worker may already have
+        stamped these paths."""
+        shim = _GitShim.install(tmp_path, monkeypatch)
+        paths = [ARM_CLAIMS_PATH, QUERY_SET_PATH]
+
+        first = _mod().fixture_provenance(paths)
+        second = _mod().fixture_provenance(paths)
+
+        assert first == second
+        assert all(len(entry['commit']) == 40 for entry in second)
+        # Every stamp hashes every path, so the shim saw all four blobs.
+        assert len(shim.calls('hash-object')) == 4
+        assert len(shim.calls('log')) <= 2, shim.calls('log')
+
+    def test_a_walk_that_failed_is_asked_again_rather_than_remembered(
+        self, tmp_path, monkeypatch,
+    ):
+        """A walk can fail transiently, e.g. the 30s timeout under load.  Its
+        None must not stand in for the commit for the rest of the process.
+        Stamps this test module, which no other test stamps, so no earlier
+        test can have filled the memo for it."""
+        shim = _GitShim.install(tmp_path, monkeypatch)
+        this_module = Path(__file__)
+
+        shim.failing_walks.touch()
+        failed = _mod().fixture_provenance([this_module])
+        shim.failing_walks.unlink()
+        answered = _mod().fixture_provenance([this_module])
+
+        assert failed[0]['commit'] is None
+        assert len(answered[0]['commit']) == 40
+        assert len(shim.calls('log')) == 2, shim.calls('log')
+
 
 # ===========================================================================
 # step-19 — the live driver's wiring, exercised WITHOUT a network
@@ -4199,7 +4414,6 @@ class TestFixtureProvenance:
 # markers PER-TEST.  Everything here runs in the merge lane.
 
 import asyncio  # noqa: E402
-import copy  # noqa: E402
 
 
 class _FakeConfig(types.SimpleNamespace):
@@ -4220,6 +4434,7 @@ def _driver_config() -> _FakeConfig:
         mem0=types.SimpleNamespace(
             collection_prefix='fused',  # the DEFAULT — nothing under it is reapable
             qdrant_url='http://localhost:6333',
+            persist_history=True,  # the DEFAULT — mem0 writes the shared history DB
         ),
         embedder=types.SimpleNamespace(
             model='text-embedding-3-small',
@@ -4235,30 +4450,26 @@ def _driver_config() -> _FakeConfig:
     )
 
 
-class _FakeInstance:
-    """What ``Mem0Backend._get_instance`` returns; only ``db`` is touched."""
-
-    def __init__(self):
-        # A sentinel, not None: the driver must REPLACE it with its no-op, and
-        # `is not sentinel` is how the test proves the stub actually landed.
-        self.db = types.SimpleNamespace(add_history=_FakeInstance._SENTINEL)
-
-    _SENTINEL = object()
-
-
 class _FakeMem0:
     """The Mem0Backend surface the driver touches, and nothing else."""
 
     def __init__(
         self,
         *,
+        config,
         search_raises_on: int | None = None,
         add_returns_no_id_on: int | None = None,
         add_ticks: int = 1,
     ):
+        self._config = config
         self.added: list[tuple[str, str]] = []            # (project_id, content)
         self.searches: list[tuple[str, str, int]] = []    # (project_id, query, limit)
-        self.instances: dict[str, _FakeInstance] = {}
+        #: (project_id, config.mem0.persist_history) at every `add`, the moment
+        #: a real Mem0Backend builds a project's instance from the config.
+        #: Snapshotted for the reason `queue_data_dir_at_initialize` is: the
+        #: config is held by REFERENCE, so a post-run read cannot tell "turned
+        #: off before seeding" from "turned off too late".
+        self.persist_history_at_add: list[tuple[str, bool]] = []
         self.inflight = 0
         self.max_inflight = 0
         self.search_inflight = 0
@@ -4275,10 +4486,10 @@ class _FakeMem0:
         self._add_calls = 0
         self._stored: dict[str, list[dict]] = {}
 
-    async def _get_instance(self, scope):
-        return self.instances.setdefault(scope.project_id, _FakeInstance())
-
     async def add(self, content, scope, metadata=None):
+        self.persist_history_at_add.append(
+            (scope.project_id, self._config.mem0.persist_history),
+        )
         self._add_calls += 1
         ordinal = self._add_calls
         self.inflight += 1
@@ -4338,6 +4549,7 @@ class _FakeMemoryService:
     def __init__(self, config):
         self.config = config
         self.mem0 = _FakeMem0(
+            config=config,
             search_raises_on=type(self).search_raises_on,
             add_returns_no_id_on=type(self).add_returns_no_id_on,
             add_ticks=type(self).add_ticks,
@@ -4825,9 +5037,12 @@ class TestRunBakeOffWiring:
 
         assert caller_config.mem0.collection_prefix == 'fused'
         assert caller_config.embedder.providers.openai.api_key == 'sk-fake-must-be-cleared'
+        assert caller_config.mem0.persist_history is True
 
-    async def test_it_stubs_the_xdist_contended_history_writer(self, monkeypatch):
-        """mem0's SQLite history writer is process-shared and contended (and
+    async def test_every_seeded_arm_keeps_mem0_history_off_the_shared_db(
+        self, monkeypatch,
+    ):
+        """mem0's shared SQLite history DB is process-shared and contended (and
         read-only in the sandbox).  It is not the question under test, and its
         failure would mask the one that is."""
         mod = _mod()
@@ -4835,14 +5050,13 @@ class TestRunBakeOffWiring:
 
         await mod.run_bake_off(**_SMALL_RUN)
 
-        instances = _FakeMemoryService.instances[-1].mem0.instances
+        snapshots = _FakeMemoryService.instances[-1].mem0.persist_history_at_add
         # Every seeded project, the two INJECTED passes included: they go
-        # through the same `seed_arm`, so an unstubbed instance there is the
+        # through the same `seed_arm`, so a persisting instance there is the
         # same contended write, in a collection nobody was watching.
-        assert len(instances) == len(mod.ARM_SHAPES) + len(mod.REGROWTH_MODES)
-        for instance in instances.values():
-            assert instance.db.add_history is not _FakeInstance._SENTINEL
-            assert instance.db.add_history('anything', keyword=1) is None
+        seeded_projects = {project_id for project_id, _ in snapshots}
+        assert len(seeded_projects) == len(mod.ARM_SHAPES) + len(mod.REGROWTH_MODES)
+        assert all(persist is False for _, persist in snapshots), snapshots
 
     async def test_the_distractor_slab_is_seeded_into_every_arm(self, monkeypatch):
         """The contamination floor is a controlled variable: an arm that got a
@@ -4887,19 +5101,21 @@ class TestRunBakeOffWiring:
         assert smallest_arm > mod.SEED_CONCURRENCY  # the bound has to actually bite
         assert mem0.max_inflight <= mod.SEED_CONCURRENCY
 
-    async def test_fetching_stays_serial_because_a_swallowed_read_timeout_is_silent(
+    async def test_fetching_stays_serial_because_concurrent_reads_aborted_the_live_run(
         self, monkeypatch,
     ):
-        """The read side is the one half that must NOT be made concurrent.
+        """The read side stays serial until someone re-measures it.
 
         Bounding it at SEED_CONCURRENCY is the obvious efficiency win — 753
         independent, order-insensitive round trips across the three arms — and
         it was implemented and measured. The live run aborted partway through
         the second arm with `MeasurementError: ... returned no results for a
-        10-limit query`. `Mem0Client.search` SWALLOWS its read timeout (logs,
-        returns `{}`), so on the read side concurrency converts a latency win
-        into a silently-empty ranking; `add` propagates its timeout instead,
-        which is why the write side keeps its bound.
+        10-limit query`. The hypothesis at the time: concurrent searches
+        exceeded the backend read timeout, which `search` then returned as
+        `{}`. Since task 5265 that timeout raises instead
+        (`backends/mem0_client.py::Mem0Backend._timed`), so the failure would
+        now be loud rather than an empty ranking, but nobody has re-run the
+        concurrent read path against a live store, so the serial bound stays.
 
         Asserted as the OBSERVABLE property — one search in flight at a time —
         rather than as "no semaphore exists", so a future re-attempt has to
@@ -5096,6 +5312,21 @@ class TestRunBakeOffWiring:
                 assert metric in report['arms'][arm]
         assert report['protocol']['distractor_slab_size'] == 12
         assert report['protocol']['embedder_model'] == 'text-embedding-3-small'
+
+    async def test_a_second_run_does_not_re_audit_the_same_alpha_fixture(
+        self, monkeypatch,
+    ):
+        """cluster_limit does not shrink the audit: it sweeps the whole alpha
+        fixture, so every run of the same fixture would otherwise repay it."""
+        mod = _mod()
+        _install_driver_doubles(monkeypatch)
+        calls = _count_detector_calls(monkeypatch, mod)
+
+        first = await mod.run_bake_off(**_SIX_ARM_RUN)
+        second = await mod.run_bake_off(**_SIX_ARM_RUN)
+
+        assert len(calls) == 1
+        assert first['audit_recall'] == second['audit_recall']
 
 
 # ===========================================================================
@@ -8266,13 +8497,16 @@ class TestTheSelfHitFilterIsProvenanceBasedNotIdBased:
 
 @pytest.mark.asyncio
 class TestAFailedQueryIsNotAMeasuredZero:
-    """`Mem0Client.search` swallows `TimeoutError` and returns `{}`.
+    """A backend read can come back empty without having measured anything.
 
-    So a network failure and a shape that ranked nothing arrive at `_search`
-    as the same empty list — which this module's own rule ("an empty hits list
-    with a real expectation IS a measured zero") then scores as 0.0 recall,
-    0.0 discoverability and 0.0 guard, indistinguishable in the artifact from
-    a real result.  Every arm seeds the SHARED distractor slab, so an empty
+    The backend's `search` propagates a read `TimeoutError`, but an empty
+    response (`{}`, `None`, no results) is still a possible reply, and a
+    failed query must never be counted as a measured zero.  If a network
+    failure and a shape that ranked nothing ever arrived at `_search` as the
+    same empty list, this module's own rule ("an empty hits list with a real
+    expectation IS a measured zero") would score it as 0.0 recall, 0.0
+    discoverability and 0.0 guard, indistinguishable in the artifact from a
+    real result.  Every arm seeds the SHARED distractor slab, so an empty
     ranking is not a possible outcome here: it is unambiguously detectable and
     must be loud, per the no-silent-fail-soft design invariant.
     """

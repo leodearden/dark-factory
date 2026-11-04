@@ -65,9 +65,9 @@ def _clear_the_snapshot_unit():
     """The unit caches per root for 15 s — no test may inherit another's."""
     import dashboard.data.task_snapshot as snapshot_mod
 
-    snapshot_mod._snapshot_cache_clear()
+    snapshot_mod.clear_snapshot_cache()
     yield
-    snapshot_mod._snapshot_cache_clear()
+    snapshot_mod.clear_snapshot_cache()
 
 
 def _register_fetch_tasks(monkeypatch, tasks: list[dict]) -> None:
@@ -86,7 +86,7 @@ def _register_fetch_tasks(monkeypatch, tasks: list[dict]) -> None:
 
     async def _fake_fetch_tasks(
         client, config, project_root, *,
-        statuses=None, chunk_size=None, timeout=None,
+        statuses=None, timeout=None,
     ):
         rows = list(tasks)
         if statuses is not None:

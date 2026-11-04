@@ -168,7 +168,7 @@ async def test_search_logged_when_causation_present(service, write_journal):
 
     # Without causation — no log
     await service.search(query='test', project_id='test')
-    ops = await write_journal.get_ops_since('2000-01-01T00:00:00')
+    ops = await write_journal.get_stored_ops_since('2000-01-01T00:00:00')
     assert len(ops) == 0
 
     # With causation — logged

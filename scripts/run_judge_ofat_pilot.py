@@ -11,8 +11,8 @@ process exit code). Two modes:
 * ``--run`` — invoke the eval-revival ο OFAT seam
   (``run_ofat_stage(task_paths, JUDGE_EVAL_CONFIGS, trials=N)``) over the fixtures
   to PRODUCE results (a live, hours-long, real-API-spend run of a Sonnet-max
-  implementer × fixtures × trials — NOT unit-tested by design), persist them, then
-  fall through to the same analysis.
+  implementer × fixtures × trials — NOT unit-tested by design; every executor
+  persists its own cell), then fall through to the same analysis.
 
 Exit codes gate the decide-and-act flip: ``0`` adopt · ``1`` marginal · ``2``
 reject · ``2`` on any other verdict. On a clear ``adopt`` an operator/CI applies
@@ -58,18 +58,16 @@ _EXIT_BY_VERDICT = {'adopt': 0, 'marginal': 1, 'reject': 2}
 
 
 def _load_results(results_dir: Path | None) -> list:
-    """Persisted results from *results_dir*, or the packaged ``RESULTS_DIR``.
+    """Persisted results from *results_dir*, or the packaged store's directory.
 
-    The ``--results-dir`` branch is :func:`_eval_results_io.load_results_from_dir`
-    (task 3743) — shared with ``scripts/run_fable_trial_v2_campaign.py`` so the
-    missing-dir / malformed-file hardening lands once for both drivers, both of
-    which read the same shared packaged results dir by default.
+    Both branches go through :func:`_eval_results_io.load_results_from_dir`, so
+    a missing dir or a malformed cell exits naming it either way.
     """
-    if results_dir is not None:
-        return load_results_from_dir(results_dir)
-    from orchestrator.evals.runner import load_results
+    from orchestrator.evals.results import ResultStore
 
-    return load_results()
+    return load_results_from_dir(
+        results_dir if results_dir is not None else ResultStore.packaged().directory
+    )
 
 
 def _run_pilot(
@@ -84,15 +82,15 @@ def _run_pilot(
 
     Loads the base orchestrator config, resolves the fixture corpus, and fans
     ``run_ofat_stage`` over ``JUDGE_EVAL_CONFIGS`` × fixtures × trials — the ο seam
-    consumed UNMODIFIED (decision 11). Each result is persisted via
-    ``save_result`` so a later ``--analyze-only`` can re-read it. Not unit-tested:
-    it spawns full agentic workflows with real API spend.
+    consumed UNMODIFIED (decision 11). Every executor persists its own cell
+    into the packaged store, so a later ``--analyze-only`` can re-read it. Not
+    unit-tested: it spawns full agentic workflows with real API spend.
     """
     import asyncio
 
     from orchestrator.config import ConfigRequiredError, load_config
     from orchestrator.evals.configs import JUDGE_EVAL_CONFIGS
-    from orchestrator.evals.runner import run_ofat_stage, save_result
+    from orchestrator.evals.runner import run_ofat_stage
 
     try:
         base_config = load_config(config_path)
@@ -109,19 +107,16 @@ def _run_pilot(
     if not task_paths:
         raise SystemExit(f'No eval fixtures found in {resolved_tasks_dir}')
 
-    results = asyncio.run(run_ofat_stage(
+    return asyncio.run(run_ofat_stage(
         task_paths, JUDGE_EVAL_CONFIGS, base_config,
         max_parallel=max_parallel, trials=trials, timeout_override=timeout,
     ))
-    for r in results:
-        save_result(r)
-    return results
 
 
 def _default_out() -> Path:
-    from orchestrator.evals.runner import RESULTS_DIR
+    from orchestrator.evals.results import ResultStore
 
-    return RESULTS_DIR / 'judge_ofat_pilot_report.md'
+    return ResultStore.packaged().directory / 'judge_ofat_pilot_report.md'
 
 
 def _build_parser() -> argparse.ArgumentParser:

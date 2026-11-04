@@ -38,13 +38,15 @@ import argparse
 import datetime as dt
 import json
 import os
-import re
 import resource
 import sqlite3
 import subprocess
 import sys
 import time
 from pathlib import Path
+
+import _checkout as _checkout
+from shared.merge_subject import parse_merge_subject
 
 CLONE_MARKER = '.replay-study-clone'
 STACK_CAP = 6          # max items in a phase-A stack (queue rarely offers more)
@@ -176,15 +178,19 @@ def merge_commit_index(repo: Path) -> dict[str, str]:
     """task label -> OLDEST 'Merge task/<label> into main' commit on main.
 
     Single history walk (vs one git-log --grep per task): oldest match is the
-    first genuine landing, sidestepping pipeline-duplicate re-merges.
+    first genuine landing, sidestepping pipeline-duplicate re-merges. Only a
+    WHOLE landing subject counts, read by the merge writer's own parser.
     """
     r = git(repo, 'log', 'main', '--format=%H %s')
     idx: dict[str, str] = {}
     for line in r.stdout.splitlines():
         sha, _, subj = line.partition(' ')
-        m = re.match(r'Merge task/(\S+) into main', subj)
-        if m:
-            idx[m.group(1)] = sha  # newest-first walk: last write wins = oldest
+        subject = parse_merge_subject(subj)
+        if subject is None or subject.main_branch != 'main':
+            continue
+        if subject.branch.startswith('task/'):
+            # newest-first walk: last write wins = oldest
+            idx[subject.branch.removeprefix('task/')] = sha
     return idx
 
 

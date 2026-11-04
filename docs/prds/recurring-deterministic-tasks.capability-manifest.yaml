@@ -147,3 +147,5 @@ tasks:
     delivered_check:
       kind: manual
       reason: the signal is the product-read-path chain evidence (B10)
+signal_leaves:
+- r6

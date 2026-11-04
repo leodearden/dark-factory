@@ -4,7 +4,12 @@ from enum import StrEnum
 
 from pydantic import BaseModel, Field
 
-from fused_memory.models.enums import MemoryCategory, QueryType, SourceStore
+from fused_memory.models.enums import (
+    ClassificationFallback,
+    MemoryCategory,
+    QueryType,
+    SourceStore,
+)
 
 
 class EpisodeStatus(StrEnum):
@@ -22,6 +27,8 @@ class ClassificationResult(BaseModel):
     secondary: MemoryCategory | None = None
     confidence: float = Field(ge=0.0, le=1.0)
     reasoning: str = ''
+    # None: primary is a real classification. A member names why primary is a default.
+    fallback: ClassificationFallback | None = None
 
 
 class MemoryResult(BaseModel):
@@ -97,8 +104,14 @@ class AddMemoryResponse(BaseModel):
 
     memory_ids: list[str] = Field(default_factory=list)
     stores_written: list[SourceStore] = Field(default_factory=list)
+    # Stores whose leg hit a transient provider error and is durably queued for
+    # server-side retry; disjoint from stores_written, ids assigned when it lands.
+    stores_pending_retry: list[SourceStore] = Field(default_factory=list)
     category: MemoryCategory | None = None
     message: str = ''
+    # Set when category was not supplied and the classifier returned a default
+    # rather than a classification.
+    classification_fallback: ClassificationFallback | None = None
 
 
 class ReadRouteResult(BaseModel):

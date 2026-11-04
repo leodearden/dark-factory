@@ -1,0 +1,113 @@
+{
+  "method": {
+    "run_id": "review-all-fixture-20261019",
+    "as_of_sha": "0000000000000000000000000000000000000000",
+    "since": "none",
+    "extra": {
+      "project_id": "fixture",
+      "launched_from": "/review-all-fixture/project",
+      "fable_seats": [
+        "synthesis",
+        "critic"
+      ],
+      "yes": true
+    }
+  },
+  "findings": [
+    {
+      "key": "fk-0000000000a1",
+      "area": "fixture",
+      "anchor": "src/fixture/alpha.py::AlphaShim",
+      "severity": "high",
+      "statement": "Alpha exposes its internals to every caller; nothing marks the seam.",
+      "measurements": [
+        {
+          "name": "call_sites",
+          "value": 3,
+          "rule": "grep -c over src/fixture"
+        }
+      ],
+      "verdict": "confirmed",
+      "disposition": "open"
+    },
+    {
+      "key": "fk-0000000000a2",
+      "area": "fixture",
+      "anchor": "src/fixture/alpha.py::route",
+      "severity": "medium",
+      "statement": "Callers route around the alpha contract through a private import.",
+      "measurements": [
+        {
+          "name": "call_sites",
+          "value": 3,
+          "rule": "grep -c over src/fixture"
+        }
+      ],
+      "verdict": "confirmed",
+      "disposition": "open",
+      "calibration_disputes_verdict": {
+        "to": "weakened",
+        "note": "two of the three private imports are test-only"
+      }
+    },
+    {
+      "key": "fk-0000000000b1",
+      "area": "fixture",
+      "anchor": "src/fixture/beta.py::consume",
+      "severity": "medium",
+      "statement": "Beta consumers re-derive the contract alpha should deliver.",
+      "measurements": [
+        {
+          "name": "call_sites",
+          "value": 3,
+          "rule": "grep -c over src/fixture"
+        }
+      ],
+      "verdict": "confirmed",
+      "disposition": "open"
+    },
+    {
+      "key": "fk-0000000000c1",
+      "area": "fixture",
+      "anchor": "src/fixture/gamma.py",
+      "severity": "low",
+      "statement": "The gamma shim has one importer left and can be deleted.",
+      "measurements": [
+        {
+          "name": "call_sites",
+          "value": 3,
+          "rule": "grep -c over src/fixture"
+        }
+      ],
+      "verdict": "confirmed",
+      "disposition": "open"
+    },
+    {
+      "key": "fk-0000000000d1",
+      "area": "fixture",
+      "anchor": "src/fixture/logging.py::LOGGER",
+      "severity": "low",
+      "statement": "The fixture logger name disagrees with its module.",
+      "measurements": [
+        {
+          "name": "call_sites",
+          "value": 3,
+          "rule": "grep -c over src/fixture"
+        }
+      ],
+      "verdict": "confirmed",
+      "disposition": "open"
+    }
+  ],
+  "filings": [
+    {
+      "key": "fk-0000000000d1",
+      "sources": [
+        "review-all"
+      ],
+      "step": "filed",
+      "ticket_or_task": "107",
+      "disposition": "filed:107"
+    }
+  ]
+}

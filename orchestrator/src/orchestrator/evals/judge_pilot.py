@@ -2,8 +2,8 @@
 
 An ADDITIVE, CONSUME-ONLY analysis surface over the eval-revival ο judge-OFAT
 seam (task 2825). This module IMPORTS ``report.build_composite_report`` /
-``format_composite_table`` and ``runner.load_results`` / ``run_ofat_stage`` and
-MODIFIES NONE of them (PRD decision 11 forbids this PRD from editing the eval
+``format_composite_table`` and consumes ``ResultStore.load_all`` / ``run_ofat_stage``
+output, and MODIFIES NONE of them (PRD decision 11 forbids this PRD from editing the eval
 instrument — runner.py / configs.py / the judge / the Elo machinery). It is the
 consumer of ο's composite that turns a judge-OFAT run into a decide-and-act
 verdict: trial ``judge-haiku`` against the ``judge-sonnet`` incumbent on the
@@ -23,10 +23,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from .metrics import RoleUnderTest
 from .report import build_composite_report, format_composite_table
 
 if TYPE_CHECKING:
-    from .runner import EvalResult
+    from .results import EvalResult
 
 # Default names for the ο judge-OFAT candidates (configs.JUDGE_EVAL_CONFIGS).
 INCUMBENT_JUDGE = 'judge-sonnet'
@@ -243,16 +244,16 @@ def decide_judge_adoption(
 
 
 def select_judge_results(results: list[EvalResult]) -> list[EvalResult]:
-    """Keep only the judge-OFAT rows (``metrics['role_under_test'] == 'judge'``).
+    """Keep only the judge-OFAT rows (``role_under_test`` is ``RoleUnderTest.JUDGE``).
 
-    The ο judge branch stamps ``role_under_test='judge'`` on each judge-candidate
-    ``EvalResult``; every other row (implementer / architect / end_to_end) is
+    The ο judge branch makes each judge-candidate ``EvalResult`` a JUDGE cell;
+    every other row (implementer / architect / end_to_end) is
     dropped. Filtering BEFORE :func:`report.build_composite_report` matters for
     correctness, not just tidiness: a stray non-judge row sharing a fixture would
     otherwise shift that fixture's cost/latency normalization floor and distort
     the judge composites. Pure over *results*, order-preserving.
     """
-    return [r for r in results if r.metrics.get('role_under_test') == 'judge']
+    return [r for r in results if r.metrics.get('role_under_test') == RoleUnderTest.JUDGE]
 
 
 def analyze_judge_ofat(

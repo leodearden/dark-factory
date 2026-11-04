@@ -197,7 +197,8 @@ from enum import StrEnum
 from pathlib import Path
 
 from shared.git_async import run_git
-from shared.task_claimant import has_live_claimant
+from shared.scheduler_state import SchedulerStateSnapshot
+from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL, has_live_claimant
 from shared.task_metadata import RoutingState
 
 from fused_memory.services.orchestrator_detector import is_orchestrator_live_for
@@ -258,18 +259,6 @@ DETERMINISTIC_TASK_KIND: str = 'deterministic'
 # _orchestrator_signal_ineligible (task 2409) to scope the blocked-normal
 # bare-orchestrator suppression.
 NORMAL_TASK_KIND: str = 'normal'
-
-# Heartbeat staleness threshold for the fresh-claimant corroboration signal
-# (task 2963). A killed workflow keeps its durable ``claimant_run_id`` but stops
-# advancing ``heartbeat_at``, so FRESHNESS (not presence) is the discriminator:
-# `has_live_claimant(task, now, ttl)` reports live only while the heartbeat is
-# newer than ``now - ttl``. Mirrors the orchestrator's validated
-# ``_RECONCILE_HEARTBEAT_TTL`` (harness.py:189) / ``_DEFAULT_HEARTBEAT_TTL``
-# (task_ground_truth.py:146) constant — the coordination point with sibling
-# task 2931's orphan-reaper liveness predicate (reuse this shared TTL, do not
-# invent a parallel heartbeat check).
-DEFAULT_HEARTBEAT_TTL: timedelta = timedelta(minutes=10)
-
 
 @dataclass(frozen=True)
 class WorkflowLiveness:
@@ -659,7 +648,7 @@ def has_live_workflow_corroboration(
     task_id: str | int,
     *,
     claimant_live: bool,
-    scheduler_state: Mapping | None,
+    scheduler_state: SchedulerStateSnapshot | None,
     routing_latest_decided_at: str | None,
     orchestrator_started_at: datetime | None,
 ) -> bool:
@@ -683,8 +672,8 @@ def corroboration_for_task(
     task_id: str | int,
     *,
     now: datetime,
-    heartbeat_ttl: timedelta = DEFAULT_HEARTBEAT_TTL,
-    scheduler_state: Mapping | None = None,
+    heartbeat_ttl: timedelta = DEFAULT_CLAIMANT_HEARTBEAT_TTL,
+    scheduler_state: SchedulerStateSnapshot | None = None,
     orchestrator_started_at: datetime | None = None,
 ) -> bool:
     """Assemble the three corroboration signals from a *task* dict.
@@ -728,7 +717,7 @@ def claimant_label(
     task: object,
     *,
     now: datetime,
-    heartbeat_ttl: timedelta = DEFAULT_HEARTBEAT_TTL,
+    heartbeat_ttl: timedelta = DEFAULT_CLAIMANT_HEARTBEAT_TTL,
 ) -> ClaimantLabel:
     """Label *task*'s claimant for display; total, and it changes no ``is_live`` verdict.
 
@@ -812,26 +801,18 @@ def is_pure_gate_metadata(metadata: object) -> bool:
 
 
 def _task_in_scheduler_holders_or_parks(
-    task_id: str | int, scheduler_state: Mapping | None
+    task_id: str | int, scheduler_state: SchedulerStateSnapshot | None
 ) -> bool:
-    """Return True when *task_id* is a scheduler park key or a current-holder value.
+    """Return True when *task_id* is a scheduler park owner or a current holder.
 
-    ``scheduler_state`` is the ``read_scheduler_state`` snapshot: ``parks`` is
-    keyed by task_id, ``current_holders`` is ``{module: task_id}`` (so the task
-    appears as a VALUE there). Both are reset by an orchestrator restart, so a
-    stranded post-redeploy task is absent from both. Coerces to ``str`` for the
-    comparison since the on-disk JSON stores task_ids as strings. Tolerates a
-    ``None`` state or missing/ non-dict ``parks``/``current_holders`` keys
-    (returns False, never raises).
+    ``current_holders`` maps module to task_id, so the task appears as a VALUE
+    there. Both are reset by an orchestrator restart, so a stranded
+    post-redeploy task is absent from both. Snapshot task ids are strings.
     """
-    if not isinstance(scheduler_state, Mapping):
+    if scheduler_state is None:
         return False
     tid = str(task_id)
-    parks = scheduler_state.get('parks')
-    if isinstance(parks, Mapping) and tid in {str(k) for k in parks}:
-        return True
-    holders = scheduler_state.get('current_holders')
-    return isinstance(holders, Mapping) and tid in {str(v) for v in holders.values()}
+    return tid in scheduler_state.parks or tid in scheduler_state.current_holders.values()
 
 
 def _routing_decided_after_restart(

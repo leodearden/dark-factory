@@ -22,6 +22,7 @@ from _dashboard_helpers import (
     extract_df_data_block,
     extract_function_body,
     find_script_position,
+    jsx_open_tag_end,
     strip_js_comments,
     walk_balanced,
 )
@@ -160,42 +161,6 @@ def _enclosing_function(src: str, idx: int) -> tuple[str, list[str]] | None:
 # ---------------------------------------------------------------------------
 
 
-def _jsx_open_tag_end(src: str, start: int) -> int:
-    """Return the index of the ``>`` closing the opening tag that begins at ``start``.
-
-    ``-1`` when ``start`` does not begin one.  Quote- and brace-aware, which is
-    the whole point: a ``>`` or ``<`` inside an attribute EXPRESSION
-    (``onClick={() => ...}``, ``aria-label={points > 1 ? ... : ...}``) or inside
-    a string/template literal is an operator, not the end of the tag.
-    """
-    depth = 0  # brace depth inside attribute expressions
-    quote = ''  # active string/template delimiter
-    i = start + 1
-    while i < len(src):
-        c = src[i]
-        if quote:
-            if c == '\\':
-                i += 2
-                continue
-            if c == quote:
-                quote = ''
-        elif c in '"\'`':
-            quote = c
-        elif c == '{':
-            depth += 1
-        elif c == '}':
-            depth -= 1
-            if depth < 0:
-                return -1  # started inside an expression, not at a tag
-        elif depth == 0:
-            if c == '>':
-                return i
-            if c == '<':
-                return -1  # a new tag opened first, so this was not one
-        i += 1
-    return -1
-
-
 def _jsx_open_tag_containing(src: str, needle: str) -> str | None:
     """Return the text of the single JSX opening tag containing ``needle``.
 
@@ -211,9 +176,11 @@ def _jsx_open_tag_containing(src: str, needle: str) -> str | None:
     ``aria-label={points > 1 ? ... : ...}`` makes the search return ``None``,
     so the test fails claiming the element is GONE — against behaviourally
     correct code.  The previous spelling pushed that onto future authors as a
-    style rule ("hoist comparisons into locals"); this walks the tag instead,
-    the way ``extract_function_body`` and ``_enclosing_function`` already walk
-    braces rather than spanning them.
+    style rule ("hoist comparisons into locals"); this walks the tag instead
+    with ``_dashboard_helpers.py::jsx_open_tag_end``, the way
+    ``extract_function_body`` and ``_enclosing_function`` already walk braces
+    rather than spanning them.  Its ``None`` means "not this candidate" here,
+    since a miss is the expected answer while probing starts backwards.
 
     Confinement to ONE opening tag is preserved, and is what gives callers
     their meaning: a mention in a neighbouring element cannot satisfy a check
@@ -226,9 +193,9 @@ def _jsx_open_tag_containing(src: str, needle: str) -> str | None:
     # Innermost first: the closest tag start before the needle whose span
     # actually reaches past it.
     for m in reversed(list(re.finditer(r'<[A-Za-z_$/]', src[:idx]))):
-        end = _jsx_open_tag_end(src, m.start())
-        if end >= idx + len(needle):
-            return src[m.start() : end + 1]
+        end = jsx_open_tag_end(src, m.start())
+        if end is not None and end > idx + len(needle):
+            return src[m.start() : end]
     return None
 
 

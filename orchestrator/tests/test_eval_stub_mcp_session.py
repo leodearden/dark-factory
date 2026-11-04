@@ -7,6 +7,7 @@ import logging
 
 import pytest
 from shared.mcp_envelope import parse_tool_result
+from shared.task_submit import SubmitFailed, parse_submit_task_result
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.evals.runner import _build_eval_scheduler, _StubMcpSession
@@ -450,7 +451,14 @@ class TestBuildEvalScheduler:
         """
         from orchestrator.config import OrchestratorConfig
 
-        config = OrchestratorConfig()
+        # task 4481: max_per_module pinned rather than inherited.  The
+        # contention this test stages exists only at limit 1 — the docstring
+        # and the comment below both already say so — but the value was being
+        # read from dark-factory-orchestrator.yaml, where an operator raising
+        # it (the fleet runs 8) makes the expansion SUCCEED and the assertion
+        # invert.  Matches the suite-wide OrchestratorConfig(max_per_module=1)
+        # idiom.
+        config = OrchestratorConfig(max_per_module=1)
         scheduler, stub = _build_eval_scheduler(
             config, 'task-99', ['some_module']
         )
@@ -466,3 +474,17 @@ class TestBuildEvalScheduler:
         # Expansion fails → result is not applied and the task resets to pending.
         assert result.applied is False
         assert stub._statuses.get('task-99') == 'pending'
+
+
+class TestStubMcpSessionSubmitTask:
+    """Tests for _StubMcpSession.call_tool('submit_task', ...)."""
+
+    @pytest.mark.asyncio
+    async def test_submit_task_answer_parses_to_a_failed_submission(self):
+        """An eval run files no tasks: the stub's answer, read by the same parser
+        Scheduler.submit_task uses, is a SubmitFailed carrying the refusal."""
+        stub = _StubMcpSession()
+        result = await stub.call_tool('submit_task', {'title': 'T', 'planning_mode': True})
+        outcome = parse_submit_task_result(result)
+        assert isinstance(outcome, SubmitFailed)
+        assert 'EvalStubRefusal' in outcome.reason

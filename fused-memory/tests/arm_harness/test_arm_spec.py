@@ -75,6 +75,13 @@ def embedding_data(**overrides) -> dict:
     return data | overrides
 
 
+QWEN_QUERY_PREFIX = 'Instruct: Given a search query, retrieve relevant memory records\nQuery: '
+
+
+def prefixed_embedding_data(**overrides) -> dict:
+    return embedding_data(query_prefix=QWEN_QUERY_PREFIX) | overrides
+
+
 def test_incumbent_control_arm_is_valid():
     spec = parse_arm_spec(control_llm_data())
 
@@ -228,10 +235,62 @@ def test_specs_are_frozen():
         spec.model_id = 'other'  # type: ignore[misc]
 
 
-@pytest.mark.parametrize('factory', [control_llm_data, moe_candidate_data, embedding_data])
+GPT_4O_MINI_PRICING = TokenPricing(usd_per_mtok_input=0.15, usd_per_mtok_output=0.60)
+
+
+def test_usd_for_one_million_tokens_each_way_is_the_sum_of_the_two_rates():
+    assert GPT_4O_MINI_PRICING.usd_for(1_000_000, 1_000_000) == 0.75
+
+
+def test_usd_for_prices_input_and_output_at_their_per_million_rates():
+    assert GPT_4O_MINI_PRICING.usd_for(1650, 95) == (1650 * 0.15 + 95 * 0.60) / 1_000_000
+
+
+@pytest.mark.parametrize(
+    ('input_tokens', 'output_tokens', 'offending'),
+    [(-1, 10, 'input_tokens'), (10, -7, 'output_tokens')],
+)
+def test_usd_for_refuses_a_negative_token_count(input_tokens, output_tokens, offending):
+    with pytest.raises(ValueError, match=offending) as caught:
+        GPT_4O_MINI_PRICING.usd_for(input_tokens, output_tokens)
+
+    assert str(min(input_tokens, output_tokens)) in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    'factory', [control_llm_data, moe_candidate_data, embedding_data, prefixed_embedding_data]
+)
 def test_load_arm_spec_round_trips_a_dumped_spec(tmp_path, factory):
     spec = parse_arm_spec(factory())
     path = tmp_path / 'arm.json'
     path.write_text(json.dumps(spec.model_dump(mode='json')))
 
     assert load_arm_spec(path) == spec
+
+
+def test_an_embedding_arm_without_a_query_prefix_carries_none():
+    spec = parse_arm_spec(embedding_data())
+
+    assert isinstance(spec, EmbeddingArmSpec)
+    assert spec.query_prefix is None
+
+
+def test_an_embedding_arm_carries_its_query_prefix_verbatim():
+    spec = parse_arm_spec(prefixed_embedding_data())
+
+    assert isinstance(spec, EmbeddingArmSpec)
+    assert spec.query_prefix == QWEN_QUERY_PREFIX
+
+
+def test_an_empty_query_prefix_is_rejected_naming_the_arm():
+    with pytest.raises(ValueError) as caught:
+        parse_arm_spec(embedding_data(query_prefix=''))
+
+    assert 'query_prefix' in str(caught.value)
+    assert 'bge-m3' in str(caught.value)
+
+
+def test_an_llm_arm_has_no_query_prefix():
+    message = _rejection(control_llm_data(query_prefix=QWEN_QUERY_PREFIX))
+
+    assert 'query_prefix' in message

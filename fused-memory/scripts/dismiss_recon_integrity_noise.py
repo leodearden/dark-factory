@@ -99,7 +99,7 @@ def run(
     When ``apply`` is False (the default) no writes occur; the report shows what
     would be dismissed and what would be kept.
 
-    Refuses with ``TargetStoreMissing`` when *queue_dir* is missing or empty — see
+    Refuses with ``TargetStoreUnpopulated`` when *queue_dir* is missing or empty — see
     the module docstring.  The check lives here rather than in ``main()`` so
     programmatic callers inherit it too.
     """

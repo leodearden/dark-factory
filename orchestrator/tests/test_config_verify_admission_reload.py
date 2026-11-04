@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import os
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 from pydantic import ValidationError
@@ -24,14 +25,13 @@ from orchestrator.config import (
 )
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestVerifyAdmissionConfigDefaults:
     """Default-on (spec-mandated) with a conservative single-slot floor and
     empty per-role nice overrides (defer to shared.verify_admission.nice_prefix).
     """
 
-    def test_defaults_on_bare_config(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    def test_defaults_on_bare_config(self, tmp_path):
         cfg = OrchestratorConfig()
         assert cfg.verify_admission_enabled is True
         assert cfg.verify_admission_task_slots == 1
@@ -79,6 +79,9 @@ class TestVerifyAdmissionReloadDisposition:
             'verify_admission_nice_merge',
             'verify_admission_nice_task',
             'verify_admission_nice_background',
+            'verify_admission_order',
+            'verify_admission_background_promote_secs',
+            'verify_admission_wait_alarm_secs',
         ],
     )
     def test_every_field_is_reloadable(self, field):
@@ -87,20 +90,16 @@ class TestVerifyAdmissionReloadDisposition:
             f'missing from RELOADABLE_FIELDS'
         )
 
-    def test_task_slots_edit_lands_in_applied_candidates_not_restart_required(
-        self, monkeypatch, tmp_path
-    ):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    @pytest.mark.usefixtures("code_default_config")
+    def test_task_slots_edit_lands_in_applied_candidates_not_restart_required(self):
         live = OrchestratorConfig(verify_admission_task_slots=1)
         fresh = OrchestratorConfig(verify_admission_task_slots=2)
         diff = diff_config(live, fresh)
         assert 'verify_admission_task_slots' in diff.applied_candidates
         assert 'verify_admission_task_slots' not in diff.restart_required
 
-    def test_apply_reload_applies_in_place(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    @pytest.mark.usefixtures("code_default_config")
+    def test_apply_reload_applies_in_place(self):
         live = OrchestratorConfig(verify_admission_task_slots=1)
         fresh = OrchestratorConfig(verify_admission_task_slots=2)
         report = apply_reload(live, fresh)
@@ -112,6 +111,7 @@ class TestVerifyAdmissionReloadDisposition:
         assert live.verify_admission_task_slots == 2
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestVerifyAdmissionSlotsDirReload:
     """task 2501: the per-project derived default must survive an
     apply_reload round-trip (model_validate(model_dump()) re-runs the
@@ -121,9 +121,7 @@ class TestVerifyAdmissionSlotsDirReload:
     allowlist (I3 under reload).
     """
 
-    def test_reload_of_sibling_field_preserves_derived_default(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    def test_reload_of_sibling_field_preserves_derived_default(self):
         live = OrchestratorConfig()
         fresh = OrchestratorConfig(verify_admission_task_slots=2)
         before = live.verify_admission_slots_dir
@@ -134,9 +132,7 @@ class TestVerifyAdmissionSlotsDirReload:
         assert live.verify_admission_slots_dir == before
         assert live.verify_admission_slots_dir != f'/tmp/df-verify-slots-{os.getuid()}'
 
-    def test_reload_applies_explicit_override(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    def test_reload_applies_explicit_override(self):
         live = OrchestratorConfig()
         fresh2 = OrchestratorConfig(verify_admission_slots_dir='/data/x/slots')
 
@@ -144,3 +140,59 @@ class TestVerifyAdmissionSlotsDirReload:
 
         assert 'verify_admission_slots_dir' in report['applied']
         assert live.verify_admission_slots_dir == '/data/x/slots'
+
+
+class TestVerifyAdmissionOrderingKnobs:
+    """Task 5628 (plans/verify-admission-fifo-prd.md): the admission gate's
+    order, background promotion age and wait alarm age."""
+
+    @pytest.mark.usefixtures('code_default_config')
+    def test_code_defaults_preserve_todays_unordered_admission(self):
+        cfg = OrchestratorConfig()
+        assert cfg.verify_admission_order == 'unordered'
+        assert cfg.verify_admission_background_promote_secs == 7200.0
+        assert cfg.verify_admission_wait_alarm_secs == 43200.0
+
+    def test_an_unknown_order_is_rejected(self):
+        with pytest.raises(ValidationError):
+            OrchestratorConfig(verify_admission_order=cast(Any, 'fifo'))
+
+    def test_arrival_order_is_accepted(self):
+        assert OrchestratorConfig(verify_admission_order='arrival').verify_admission_order == 'arrival'
+
+    @pytest.mark.parametrize(
+        'field', ['verify_admission_background_promote_secs', 'verify_admission_wait_alarm_secs'],
+    )
+    @pytest.mark.parametrize('bad_value', [0, -1])
+    def test_non_positive_ages_are_rejected(self, field, bad_value):
+        with pytest.raises(ValidationError):
+            OrchestratorConfig(**{field: bad_value})
+
+    @pytest.mark.parametrize(
+        'field', ['verify_admission_background_promote_secs', 'verify_admission_wait_alarm_secs'],
+    )
+    @pytest.mark.parametrize('good_value', [1.5])
+    def test_a_positive_fractional_age_is_accepted(self, field, good_value):
+        assert getattr(OrchestratorConfig(**{field: good_value}), field) == good_value
+
+    @pytest.mark.usefixtures("code_default_config")
+    def test_apply_reload_applies_all_three_in_place(self):
+        live = OrchestratorConfig()
+        fresh = OrchestratorConfig(
+            verify_admission_order='arrival',
+            verify_admission_background_promote_secs=60.0,
+            verify_admission_wait_alarm_secs=600.0,
+        )
+
+        report = apply_reload(live, fresh)
+
+        for field in (
+            'verify_admission_order',
+            'verify_admission_background_promote_secs',
+            'verify_admission_wait_alarm_secs',
+        ):
+            assert field in report['applied']
+            assert field not in report['restart_required']
+        assert live.verify_admission_order == 'arrival'
+        assert live.verify_admission_background_promote_secs == 60.0
+        assert live.verify_admission_wait_alarm_secs == 600.0

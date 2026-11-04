@@ -20,13 +20,18 @@ import functools
 import inspect
 import json
 import logging
+import subprocess
+import sys
+from enum import StrEnum
 from pathlib import Path
 
 import codebook as codebook_mod
 import coder as mod
 import digest as digest_mod
 import pytest
-from legibility import session_runner
+from cli_subprocess_timeout import cli_timeout_from_env
+from legibility import invariants, session_runner
+from quality_doc_texts import code_quality, definition_body, heuristic_headlines
 
 # Imported AFTER `coder`, deliberately: it is coder.py's own module-level
 # sys.path bootstrap that puts this checkout's shared/src on the path, so this
@@ -39,6 +44,10 @@ from shared.cap_markers import REAL_CLI_CAP_HIT_MESSAGES, REAL_CLI_CAP_MESSAGES
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _LIVE_CODEBOOK_PATH = _REPO_ROOT / "docs" / "legibility" / "confusion-codebook.yaml"
+
+# The vocabulary of a project declaring no invariant slugs, for every test
+# that is not about the slug list.
+_NO_SLUGS: tuple[str, ...] = ()
 
 # ---------------------------------------------------------------------------
 # Shared fixture helpers — synthetic transcript -> real digest text, mirrors
@@ -245,14 +254,14 @@ def test_build_prompt_embeds_digest_and_index_verbatim():
     digest_text = '---\nsession: "s1"\n---\n\n## User Corrections\n- unique marker UC123'
     index = "- entry-a: Title A — cause a\n- entry-b: Title B — cause b"
 
-    prompt = mod.build_prompt(digest_text, index)
+    prompt = mod.build_prompt(digest_text, index, invariant_slugs=_NO_SLUGS)
 
     assert digest_text in prompt
     assert index in prompt
 
 
 def test_build_prompt_embeds_phase_enum_including_unknown():
-    prompt = mod.build_prompt("digest text", "codebook index")
+    prompt = mod.build_prompt("digest text", "codebook index", invariant_slugs=_NO_SLUGS)
 
     for phase in codebook_mod.PHASES:
         assert phase in prompt
@@ -336,7 +345,7 @@ def test_code_digest_happy_path_success(tmp_path):
 
     result = mod.code_digest(
         digest_text, live_codebook, project="dark_factory", model="haiku",
-        invoke=fake_invoke,
+        invoke=fake_invoke, invariant_slugs=_NO_SLUGS,
     )
 
     assert result.ok is True
@@ -371,7 +380,7 @@ def test_code_digest_unparseable_output_is_failure_not_fabricated():
 
     result = mod.code_digest(
         digest_text, codebook, project="dark_factory", model="haiku",
-        invoke=fake_invoke,
+        invoke=fake_invoke, invariant_slugs=_NO_SLUGS,
     )
 
     assert result.ok is False
@@ -404,7 +413,7 @@ def test_code_digest_schema_invalid_record_is_failure_not_fabricated():
 
     result = mod.code_digest(
         digest_text, codebook, project="dark_factory", model="haiku",
-        invoke=fake_invoke,
+        invoke=fake_invoke, invariant_slugs=_NO_SLUGS,
     )
 
     assert result.ok is False
@@ -426,7 +435,7 @@ def test_code_digest_invocation_error_is_failure_not_fabricated():
 
     result = mod.code_digest(
         digest_text, codebook, project="dark_factory", model="haiku",
-        invoke=fake_invoke,
+        invoke=fake_invoke, invariant_slugs=_NO_SLUGS,
     )
 
     assert result.ok is False
@@ -448,7 +457,7 @@ def test_code_digest_malformed_frontmatter_is_failure_not_raised():
 
     result = mod.code_digest(
         digest_text, codebook, project="dark_factory", model="haiku",
-        invoke=fake_invoke,
+        invoke=fake_invoke, invariant_slugs=_NO_SLUGS,
     )
 
     assert result.ok is False
@@ -466,7 +475,7 @@ def test_code_digest_empty_judgment_is_success_not_failure():
 
     result = mod.code_digest(
         digest_text, codebook, project="dark_factory", model="haiku",
-        invoke=fake_invoke,
+        invoke=fake_invoke, invariant_slugs=_NO_SLUGS,
     )
 
     assert result.ok is True
@@ -518,7 +527,7 @@ def test_code_digest_cap_exhausted_is_a_labelled_failure_not_fabricated():
 
     result = mod.code_digest(
         digest_text, codebook, project="dark_factory", model="haiku",
-        invoke=fake_invoke,
+        invoke=fake_invoke, invariant_slugs=_NO_SLUGS,
     )
 
     assert result.capped is True, (
@@ -545,7 +554,7 @@ def _capped_flag_for(invoke):
     digest_text = _hand_digest(_SESSION_ID, "a confusing correction happened here")
     return mod.code_digest(
         digest_text, _tiny_codebook(), project="dark_factory", model="haiku",
-        invoke=invoke,
+        invoke=invoke, invariant_slugs=_NO_SLUGS,
     )
 
 
@@ -604,7 +613,7 @@ def test_code_digest_malformed_frontmatter_is_never_labelled_capped():
 
     result = mod.code_digest(
         "no frontmatter here, just prose", _tiny_codebook(),
-        project="dark_factory", model="haiku", invoke=fake_invoke,
+        project="dark_factory", model="haiku", invoke=fake_invoke, invariant_slugs=_NO_SLUGS,
     )
     assert result.ok is False
     assert result.capped is False
@@ -614,15 +623,16 @@ def test_code_digest_malformed_frontmatter_is_never_labelled_capped():
 # ---------------------------------------------------------------------------
 # task 4736: the EXIT-0 banner, and the guard that bounds where it is scanned
 #
-# The CLI does not always exit non-zero when it declines to answer -- it can
-# print the banner and exit 0, at which point the "reply" is prose that
-# parse_coder_output cannot turn into a verdict.  That is the second scan
-# site, and it is reached ONLY after the parse has already failed.
+# A banner that reaches code_digest as a reply is prose that parse_coder_output
+# cannot turn into a verdict.  A real usage cap never arrives that way (task
+# 6213: the runner's gate sees it as a failed result), so this scan only LABELS
+# a digest that is already failing.  It is reached ONLY after the parse has
+# already failed.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("message", REAL_CLI_CAP_MESSAGES)
 def test_code_digest_exit_zero_cap_banner_is_labelled_capped(message):
-    """A banner that arrives as a successful-looking reply is still a cap.
+    """A banner that arrives as a successful-looking reply is labelled a cap.
 
     Every corpus message is plain prose, so parse_coder_output cannot parse
     it -- the same premise the census side already pins in
@@ -636,7 +646,7 @@ def test_code_digest_exit_zero_cap_banner_is_labelled_capped(message):
     result = mod.code_digest(
         _hand_digest(_SESSION_ID, "a confusing correction happened here"),
         _tiny_codebook(), project="dark_factory", model="haiku",
-        invoke=fake_invoke,
+        invoke=fake_invoke, invariant_slugs=_NO_SLUGS,
     )
 
     assert result.capped is True, (
@@ -655,7 +665,7 @@ def test_code_digest_exit_zero_cap_reason_names_the_marker():
     result = mod.code_digest(
         _hand_digest(_SESSION_ID, "a confusing correction happened here"),
         _tiny_codebook(), project="dark_factory", model="haiku",
-        invoke=fake_invoke,
+        invoke=fake_invoke, invariant_slugs=_NO_SLUGS,
     )
     assert result.capped is True
     assert result.reason is not None, "a capped digest must still record WHY"
@@ -701,7 +711,7 @@ def test_code_digest_a_verdict_QUOTING_cap_text_is_never_read_as_a_banner():
     result = mod.code_digest(
         _hand_digest(_SESSION_ID, "a confusing correction happened here"),
         _tiny_codebook(), project="dark_factory", model="haiku",
-        invoke=fake_invoke,
+        invoke=fake_invoke, invariant_slugs=_NO_SLUGS,
     )
 
     assert result.capped is False, (
@@ -719,28 +729,6 @@ def test_code_digest_a_verdict_QUOTING_cap_text_is_never_read_as_a_banner():
     )
 
 
-@pytest.mark.parametrize("message", REAL_CLI_CAP_MESSAGES)
-def test_the_trickle_stage_offers_every_real_banner_to_the_pool(message):
-    """The runner puts a successful reply to the gate's strict cap detector
-    only when the stage cannot use it, so an exit-0 banner rotates the account
-    rather than leaving it AVAILABLE for the next digest (task 5637). That
-    route holds only while every real banner is unusable: a corpus entry that
-    parsed would turn this red rather than silently lose it."""
-    assert mod.TRICKLE_CODER_STAGE.is_usable_reply(message) is False
-
-
-def test_the_trickle_stage_never_offers_a_verdict_quoting_a_banner():
-    verdict = json.dumps({
-        "matches": [{
-            "cluster_id": "usage-limit-stall",
-            "evidence_quote": REAL_CLI_CAP_HIT_MESSAGES[0],
-        }],
-        "candidates": [],
-    })
-
-    assert mod.TRICKLE_CODER_STAGE.is_usable_reply(verdict) is True
-
-
 def test_code_digest_ordinary_garbage_stays_an_unlabelled_parse_failure():
     """NEGATIVE.  Unparseable output carrying no marker keeps its existing
     disposition: a plain parse failure, capped=False."""
@@ -750,7 +738,7 @@ def test_code_digest_ordinary_garbage_stays_an_unlabelled_parse_failure():
     result = mod.code_digest(
         _hand_digest(_SESSION_ID, "a confusing correction happened here"),
         _tiny_codebook(), project="dark_factory", model="haiku",
-        invoke=fake_invoke,
+        invoke=fake_invoke, invariant_slugs=_NO_SLUGS,
     )
     assert result.ok is False
     assert result.capped is False
@@ -764,13 +752,18 @@ def _batch_digests(n):
 # ---------------------------------------------------------------------------
 # task 4736: the batch tally and the deferral predicate
 #
-# `status` stays a two-value vocabulary, {"ok","failure"}, and the cap arrives
-# as a COUNT plus one predicate.  That is not squeamishness about enums:
-# census.py computes `saturated = dup_rate >= config.dup_rate and
-# run_result.status != "failure"` and selects storm batches with
-# `s.status == "failure"`, so a third status value would silently make a
-# capped mining batch count as saturated and stop the census early.
+# `status` is the two-member CodingStatus, and the cap arrives as a COUNT plus
+# one predicate: census treats anything but CodingStatus.FAILURE as a
+# non-storm batch, so a third member would make a capped mining batch count
+# as saturated.
 # ---------------------------------------------------------------------------
+
+def test_coding_status_is_a_two_member_str_enum():
+    assert issubclass(mod.CodingStatus, StrEnum)
+    assert {member.value for member in mod.CodingStatus} == {"ok", "failure"}
+    assert mod.CodingStatus.OK == "ok"
+    assert mod.CodingStatus.FAILURE == "failure"
+
 
 def _mixed_batch_invoke(*, capped, failed):
     """Return an *invoke* for a batch whose first *capped* digests hit a cap,
@@ -800,7 +793,7 @@ def _run_mixed(*, capped, failed, ok):
     digests = _batch_digests(capped + failed + ok)
     return mod.code_digests(
         digests, _tiny_codebook(), project="dark_factory", model="haiku",
-        invoke=_mixed_batch_invoke(capped=capped, failed=failed),
+        invoke=_mixed_batch_invoke(capped=capped, failed=failed), invariant_slugs=_NO_SLUGS,
     )
 
 
@@ -817,7 +810,7 @@ def test_code_digests_tallies_capped_alongside_the_existing_counts():
 def test_code_digests_with_no_caps_reports_zero_capped():
     result = _run_mixed(capped=0, failed=1, ok=3)
     assert result.capped == 0
-    assert result.status == "ok"
+    assert result.status == mod.CodingStatus.OK
 
 
 @pytest.mark.parametrize(
@@ -852,6 +845,23 @@ def test_is_cap_deferral_truth_table(capped, failed, ok, expected, why):
     )
 
 
+@pytest.mark.parametrize(
+    "capped, failed, ok, status, deferral",
+    [
+        (8, 3, 0, "FAILURE", True),
+        (3, 8, 0, "FAILURE", False),
+        (2, 1, 17, "OK", False),
+    ],
+)
+def test_is_cap_deferral_reads_the_typed_status(capped, failed, ok, status, deferral):
+    """Only a FAILURE run whose failures are a majority of caps defers; a
+    sub-storm OK run with caps among its failures does not."""
+    result = _run_mixed(capped=capped, failed=failed, ok=ok)
+    assert isinstance(result.status, mod.CodingStatus)
+    assert result.status == mod.CodingStatus[status]
+    assert mod.is_cap_deferral(result) is deferral
+
+
 def test_code_digests_sub_storm_cap_taints_and_excludes_but_still_merges():
     """TAINT-AND-EXCLUDE, the shape evals/runner.py already uses for a capped
     cell: label it and drop it from the reported result, never score it zero
@@ -863,7 +873,7 @@ def test_code_digests_sub_storm_cap_taints_and_excludes_but_still_merges():
     """
     result = _run_mixed(capped=2, failed=0, ok=18)
 
-    assert result.status == "ok", "2 of 20 is not a storm"
+    assert result.status == mod.CodingStatus.OK, "2 of 20 is not a storm"
     assert mod.is_cap_deferral(result) is False
     assert result.capped == 2
     assert len(result.records) == 18, (
@@ -920,10 +930,11 @@ def test_code_digests_all_succeed_batch_status_ok():
 
     result = mod.code_digests(
         digests, codebook, project="dark_factory", model="haiku",
-        invoke=_make_batch_invoke(fail_sessions=set()),
+        invoke=_make_batch_invoke(fail_sessions=set()), invariant_slugs=_NO_SLUGS,
     )
 
-    assert result.status == "ok"
+    assert isinstance(result.status, mod.CodingStatus)
+    assert result.status == mod.CodingStatus.OK
     assert result.total == 3
     assert result.succeeded == 3
     assert result.failed == 0
@@ -940,10 +951,11 @@ def test_code_digests_majority_failure_batch_status_failure():
 
     result = mod.code_digests(
         digests, codebook, project="dark_factory", model="haiku",
-        invoke=_make_batch_invoke(fail_sessions),
+        invoke=_make_batch_invoke(fail_sessions), invariant_slugs=_NO_SLUGS,
     )
 
-    assert result.status == "failure"
+    assert isinstance(result.status, mod.CodingStatus)
+    assert result.status == mod.CodingStatus.FAILURE
     assert result.total == 4
     assert result.succeeded == 1
     assert result.failed == 3
@@ -962,10 +974,10 @@ def test_code_digests_exactly_half_failure_is_not_a_storm():
 
     result = mod.code_digests(
         digests, codebook, project="dark_factory", model="haiku",
-        invoke=_make_batch_invoke(fail_sessions),
+        invoke=_make_batch_invoke(fail_sessions), invariant_slugs=_NO_SLUGS,
     )
 
-    assert result.status == "ok"
+    assert result.status == mod.CodingStatus.OK, "exactly half failed is not a storm"
     assert result.total == 4
     assert result.succeeded == 2
     assert result.failed == 2
@@ -1019,10 +1031,10 @@ def test_code_digests_logs_every_failure_in_a_sub_storm_batch(caplog):
     with caplog.at_level(logging.DEBUG, logger="legibility.coder"):
         result = mod.code_digests(
             digests, _tiny_codebook(), project="dark_factory", model="haiku",
-            invoke=_make_batch_invoke(fail_sessions),
+            invoke=_make_batch_invoke(fail_sessions), invariant_slugs=_NO_SLUGS,
         )
 
-    assert result.status == "ok", (
+    assert result.status == mod.CodingStatus.OK, (
         "if this ever became a storm the test would be pinning the wrong "
         "case -- the whole point is that nightly.py stays silent here"
     )
@@ -1059,10 +1071,10 @@ def test_code_digests_logs_one_record_per_failure_in_a_storm(caplog):
     with caplog.at_level(logging.DEBUG, logger="legibility.coder"):
         result = mod.code_digests(
             digests, _tiny_codebook(), project="dark_factory", model="haiku",
-            invoke=_make_batch_invoke(fail_sessions),
+            invoke=_make_batch_invoke(fail_sessions), invariant_slugs=_NO_SLUGS,
         )
 
-    assert result.status == "failure"
+    assert result.status == mod.CodingStatus.FAILURE
 
     warned = _coder_warnings(caplog)
     assert len(warned) == 3, (
@@ -1086,11 +1098,11 @@ def test_code_digests_logs_the_isolated_crash_path_too(caplog):
     with caplog.at_level(logging.DEBUG, logger="legibility.coder"):
         result = mod.code_digests(
             digests, _tiny_codebook(), project="dark_factory", model="haiku",
-            invoke=_make_crashing_invoke({"batch-sess-1"}),
+            invoke=_make_crashing_invoke({"batch-sess-1"}), invariant_slugs=_NO_SLUGS,
         )
 
     # The batch kept going: the other two digests still coded.
-    assert result.status == "ok"
+    assert result.status == mod.CodingStatus.OK
     assert result.total == 3
     assert result.succeeded == 2
     assert len(result.failures) == 1
@@ -1191,9 +1203,13 @@ def _main_digests(tmp_path, prefix, count):
 
 
 def _run_main(tmp_path, *args):
+    """Run main() with *tmp_path* as the observed project's root."""
     codebook_path = tmp_path / "codebook.yaml"
     codebook_mod.dump(_tiny_codebook(), codebook_path)
-    return mod.main([*map(str, args), "--codebook", str(codebook_path), "--project", "dark_factory"])
+    return mod.main([
+        *map(str, args), "--codebook", str(codebook_path), "--project", "dark_factory",
+        "--project-root", str(tmp_path),
+    ])
 
 
 def test_main_happy_path_writes_valid_jsonl_and_returns_0(
@@ -1214,6 +1230,7 @@ def test_main_happy_path_writes_valid_jsonl_and_returns_0(
     assert [codebook_mod.validate_coding_record(record) for record in records] == [[], []]
     assert {record["session"] for record in records} == {"main-sess-1", "main-sess-2"}
     captured = capsys.readouterr()
+    assert "status=ok " in captured.err, "a StrEnum status renders as its value"
     assert "total=2" in captured.err
     assert "failed=0" in captured.err
     calls = pooled_main.calls()
@@ -1252,7 +1269,7 @@ def test_main_every_account_capped_defers_with_exit_zero_and_an_honest_tally(
     assert "all 2 pool accounts capped" in err, (
         f"the exhaustion reason must reach the operator; got {err!r}"
     )
-    for field in ("status=failure", "total=3", "succeeded=0", "failed=3", "capped=3"):
+    for field in ("status=failure ", "total=3", "succeeded=0", "failed=3", "capped=3"):
         assert field in err, (field, err)
 
 
@@ -1323,3 +1340,255 @@ def test_main_digests_dir_skips_subdirectories(tmp_path, pooled_main, capsys):
     lines = [line for line in out_path.read_text(encoding="utf-8").splitlines() if line.strip()]
     assert len(lines) == 1
     assert json.loads(lines[0])["session"] == "dir-sess-1"
+
+
+# ---------------------------------------------------------------------------
+# task 6400: the quality Definition is the minting test, and the coder is told
+# the observed project's invariant slugs (plans/census-incremental-prd.md R9,
+# §4.8 rows 15 and 17). Expected texts are computed from the normative doc at
+# test time (quality_doc_texts), never restated.
+# ---------------------------------------------------------------------------
+
+
+def _block(prompt, name):
+    lines = prompt.splitlines()
+    start = lines.index(f"=== {name} ===")
+    body = []
+    for line in lines[start + 1:]:
+        if line.startswith("=== "):
+            break
+        body.append(line)
+    return body
+
+
+def _bullets(block):
+    return [line for line in block if line.startswith("- ")]
+
+
+def _slugged_prompt(invariant_slugs):
+    return mod.build_prompt("digest text", "codebook index", invariant_slugs=invariant_slugs)
+
+
+def _never_invoked(*args, **kwargs):
+    pytest.fail("invoke reached: invariant_slugs acquired a default")
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda: mod.build_prompt("digest text", "codebook index"),  # pyright: ignore[reportCallIssue]
+        lambda: mod.code_digest("digest text", {}, project="p", invoke=_never_invoked),  # pyright: ignore[reportCallIssue]
+        lambda: mod.code_digests([], {}, project="p", invoke=_never_invoked),  # pyright: ignore[reportCallIssue]
+    ],
+    ids=["build_prompt", "code_digest", "code_digests"],
+)
+def test_the_invariant_slugs_are_required_never_defaulted(call):
+    """A default would tell the miner a project declares no slugs, silently."""
+    with pytest.raises(TypeError):
+        call()
+
+
+def test_the_prompt_carries_the_quality_definition_and_no_heuristic():
+    prompt = _slugged_prompt(("a-slug", "b-slug"))
+
+    assert definition_body() in prompt
+    for headline in heuristic_headlines():
+        assert headline not in prompt
+
+
+def test_the_prompt_lists_the_invariant_slugs_in_order():
+    block = _block(_slugged_prompt(("a-slug", "b-slug")), "INVARIANT SLUGS")
+
+    assert _bullets(block) == ["- a-slug", "- b-slug"]
+
+
+def test_a_project_without_slugs_is_stated_not_omitted():
+    block = _block(_slugged_prompt(()), "INVARIANT SLUGS")
+
+    assert _bullets(block) == []
+    assert any(str(invariants.DOC_RELPATH) in line for line in block)
+
+
+@pytest.mark.parametrize("invariant_slugs", [("a-slug",), ()])
+def test_the_prompt_prescribes_exactly_one_json_reply_line(invariant_slugs):
+    lines = _slugged_prompt(invariant_slugs).splitlines()
+
+    assert len([line for line in lines if line.startswith("{")]) == 1
+
+
+def _recording_invoke(prompts):
+    def fake_invoke(prompt, model):
+        prompts.append(prompt)
+        return json.dumps({"matches": [], "candidates": []})
+
+    return fake_invoke
+
+
+def test_code_digest_passes_the_slugs_to_the_prompt():
+    prompts = []
+
+    result = mod.code_digest(
+        _hand_digest("slug-sess", "marker"), _tiny_codebook(), project="dark_factory",
+        invariant_slugs=("a-slug",), invoke=_recording_invoke(prompts),
+    )
+
+    assert result.ok
+    assert _bullets(_block(prompts[0], "INVARIANT SLUGS")) == ["- a-slug"]
+
+
+def test_code_digests_passes_the_slugs_to_every_prompt():
+    prompts = []
+
+    mod.code_digests(
+        [_hand_digest("slug-a", "one"), _hand_digest("slug-b", "two")], _tiny_codebook(),
+        project="dark_factory", invariant_slugs=("a-slug",), invoke=_recording_invoke(prompts),
+    )
+
+    assert len(prompts) == 2
+    assert all(_bullets(_block(p, "INVARIANT SLUGS")) == ["- a-slug"] for p in prompts)
+
+
+@pytest.mark.parametrize(
+    "definition_section",
+    ["## Definition\n\n", "## Renamed definition\n\nSome text.\n\n"],
+    ids=["emptied", "renamed"],
+)
+def test_a_broken_quality_definition_fails_every_digest(
+    tmp_path, monkeypatch, definition_section
+):
+    """Minting against no Definition would be silent; a failed batch is not."""
+    doc = tmp_path / "code_quality.md"
+    doc.write_text(
+        "# Code quality\n\n" + definition_section + "## The fourteen heuristics\n\n1. **One**\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(code_quality, "NORMATIVE_DOC", doc)
+    prompts = []
+
+    run = mod.code_digests(
+        _batch_digests(2), _tiny_codebook(), project="dark_factory",
+        invariant_slugs=("a-slug",), invoke=_recording_invoke(prompts),
+    )
+
+    assert prompts == []
+    assert run.records == []
+    assert run.status == mod.CodingStatus.FAILURE
+    assert len(run.failures) == 2
+    assert all("## Definition" in reason for _session, reason in run.failures)
+
+
+def test_main_reads_the_slugs_from_the_project_root(tmp_path, pooled_main):
+    pooled_main.plan(default={"result": _EMPTY_VERDICT})
+    doc = tmp_path / invariants.DOC_RELPATH
+    doc.parent.mkdir(parents=True)
+    doc.write_text("## INV-1 `cli-visible-slug`\n", encoding="utf-8")
+
+    rc = _run_main(tmp_path, *_main_digests(tmp_path, "main-slug", 1))
+
+    assert rc == 0
+    assert any(
+        "cli-visible-slug" in call["stdin"] or "cli-visible-slug" in " ".join(call["argv"])
+        for call in pooled_main.calls()
+    )
+
+
+def test_coder_runs_standalone_and_takes_a_project_root():
+    """Outside pytest nothing else puts orchestrator/src on sys.path, so this
+    proves coder.py's own bootstrap resolves the code-quality slicer."""
+    completed = subprocess.run(
+        [sys.executable, str(_REPO_ROOT / "scripts" / "legibility" / "coder.py"), "--help"],
+        cwd=_REPO_ROOT, capture_output=True, text=True,
+        timeout=cli_timeout_from_env("LEGIBILITY_CODER_CLI_TEST_TIMEOUT"),
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "--project-root" in completed.stdout
+
+
+# ---------------------------------------------------------------------------
+# task 5791: the reply build_prompt prescribes is the reply code_digest reads.
+# ---------------------------------------------------------------------------
+
+
+def _prescribed_reply():
+    prompt = mod.build_prompt("digest text", "codebook index", invariant_slugs=_NO_SLUGS)
+    [line] = [line for line in prompt.splitlines() if line.startswith("{")]
+    return json.loads(line)
+
+
+def _filled(field, value):
+    if value != "...":
+        return value
+    if field == "entry_id":
+        return "one-shot-subagent-contract"
+    if field.endswith("_phase"):
+        return "unknown"
+    return f"populated {field}"
+
+
+def test_a_reply_shaped_as_the_prompt_prescribes_reaches_the_merger():
+    reply = {
+        key: [{field: _filled(field, value) for field, value in item.items()} for item in items]
+        for key, items in _prescribed_reply().items()
+    }
+    populated = [
+        value
+        for items in reply.values()
+        for item in items
+        for value in item.values()
+        if isinstance(value, str) and value.startswith("populated ")
+    ]
+
+    result = mod.code_digest(
+        _hand_digest(_SESSION_ID, "marker"), _tiny_codebook(), project="dark_factory",
+        invariant_slugs=_NO_SLUGS, invoke=lambda prompt, model: json.dumps(reply),
+    )
+
+    assert result.ok, result.reason
+    assert result.record is not None
+    merge = codebook_mod.apply_coding_records(
+        _tiny_codebook(), [result.record], invariant_slugs=(),
+    )
+    assert merge.invalid_records == ()
+    assert merge.skipped_deletions == ()
+    assert merge.counts.matched == 1
+    assert merge.counts.candidates_applied == 1
+    merged_text = json.dumps(merge.codebook)
+    assert populated
+    assert [value for value in populated if value not in merged_text] == []
+
+
+@pytest.mark.parametrize(
+    ("reply", "named_keys"),
+    [
+        ({"verified": False, "reason": "cannot verify the cluster"}, ("matches", "candidates")),
+        ({}, ("matches", "candidates")),
+        ({"matches": []}, ("candidates",)),
+        ({"hits": [{"entry_id": "one-shot-subagent-contract"}], "candidates": []}, ("matches",)),
+        ({"matches": None, "candidates": []}, ("matches",)),
+        ({"verified": False, "reason": REAL_CLI_CAP_MESSAGES[0]}, ("matches", "candidates")),
+    ],
+    ids=[
+        "foreign_verdict_shape",
+        "empty_object",
+        "candidates_missing",
+        "renamed_key",
+        "null_where_a_list_is_prescribed",
+        "foreign_verdict_quoting_a_banner",
+    ],
+)
+def test_code_digest_a_reply_off_the_prescribed_schema_is_a_failure_not_an_empty_verdict(
+    reply, named_keys
+):
+    """A parsed reply missing a key build_prompt prescribes is not "coded fine,
+    found nothing" (never-fabricate)."""
+    result = mod.code_digest(
+        _hand_digest(_SESSION_ID, "marker"), _tiny_codebook(), project="dark_factory",
+        invariant_slugs=_NO_SLUGS, invoke=lambda prompt, model: json.dumps(reply),
+    )
+
+    assert result.ok is False
+    assert result.record is None
+    assert result.capped is False
+    assert result.session == _SESSION_ID
+    assert [key for key in named_keys if key not in result.reason] == []

@@ -9,6 +9,7 @@ document.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 
@@ -28,6 +29,7 @@ from _link_heal_harness import (
     LinkHealHarness,
     build_harness,
     corpus_basis,
+    run_corpus_apply,
     run_corpus_plan,
 )
 
@@ -46,6 +48,7 @@ from fused_memory.maintenance.link_heal_executor import (
     WRITE_FAILURE_ANCHOR,
     RunLimits,
     RunReport,
+    pending_plan_sha256,
     render_plan_document,
     run_plan,
 )
@@ -438,6 +441,22 @@ class TestRunPlanLedgersANonWritingRun:
         written = plan_path.read_bytes()
         assert hashlib.sha256(written).hexdigest() == report.plan_sha256
         assert ledger.resolve_run(report.run_id).plan_sha256 == report.plan_sha256
+        assert ledger.resolve_run(report.run_id).plan_path == plan_path
+
+    @pytest.mark.asyncio
+    async def test_the_pending_plan_sha_is_the_plan_runs_sha_until_the_pending_heals_change(
+        self, harness, ledger, tmp_path,
+    ):
+        report = await run_corpus_plan(
+            harness, ledger, tmp_path / 'plan.json', seed_three_heals(harness),
+        )
+        assert pending_plan_sha256(ledger.pending_actions(RunSource.CORPUS)) == report.plan_sha256
+
+        await run_corpus_apply(
+            harness, ledger, limits=dataclasses.replace(DEFAULT_LIMITS, max_actions_per_run=1),
+        )
+
+        assert pending_plan_sha256(ledger.pending_actions(RunSource.CORPUS)) != report.plan_sha256
 
     @pytest.mark.asyncio
     async def test_the_plan_document_is_the_rendering_of_the_pending_rows(
@@ -494,6 +513,7 @@ class TestRunPlanLeavesNothingHalfDone:
         (run,) = ledger.recent_runs(10)
         assert run.finished_at is not None
         assert run.plan_sha256 is None
+        assert run.plan_path is None
         assert run.counts == report.counts.as_json()
 
     @pytest.mark.asyncio
@@ -580,7 +600,10 @@ class TestReportModeEscapes:
     async def test_a_backlog_over_cap_times_multiplier_would_escape_and_files_nothing(
         self, harness, ledger, tmp_path,
     ):
-        limits = RunLimits(max_actions_per_run=2, backlog_multiplier=1, write_failure_streak=3)
+        limits = RunLimits(
+            max_actions_per_run=2, backlog_multiplier=1, write_failure_streak=3,
+            misfile_share_ceiling=0.25, corrects_share_ceiling=0.60,
+        )
 
         report = await run_corpus_plan(
             harness, ledger, tmp_path / 'plan.json', seed_three_heals(harness), limits,
@@ -593,7 +616,10 @@ class TestReportModeEscapes:
     async def test_a_backlog_at_cap_times_multiplier_would_not_escape(
         self, harness, ledger, tmp_path,
     ):
-        limits = RunLimits(max_actions_per_run=3, backlog_multiplier=1, write_failure_streak=3)
+        limits = RunLimits(
+            max_actions_per_run=3, backlog_multiplier=1, write_failure_streak=3,
+            misfile_share_ceiling=0.25, corrects_share_ceiling=0.60,
+        )
 
         report = await run_corpus_plan(
             harness, ledger, tmp_path / 'plan.json', seed_three_heals(harness), limits,
@@ -605,7 +631,10 @@ class TestReportModeEscapes:
     async def test_a_non_writing_run_never_would_escape_a_write_failure(
         self, harness, ledger, tmp_path,
     ):
-        limits = RunLimits(max_actions_per_run=0, backlog_multiplier=1, write_failure_streak=1)
+        limits = RunLimits(
+            max_actions_per_run=0, backlog_multiplier=1, write_failure_streak=1,
+            misfile_share_ceiling=0.25, corrects_share_ceiling=0.60,
+        )
 
         report = await run_corpus_plan(
             harness, ledger, tmp_path / 'plan.json', seed_three_heals(harness), limits,

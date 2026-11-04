@@ -21,12 +21,18 @@ import re
 import sys
 import warnings
 import weakref
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, NamedTuple
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
+from graphiti_core.cross_encoder.client import CrossEncoderClient
+from graphiti_core.embedder import EmbedderClient
+from graphiti_core.llm_client import LLMClient
 
 # Make this file's directory importable by test modules so
 # `from _fm_helpers import ...` resolves regardless of whether pytest
@@ -71,6 +77,7 @@ if str(REPO_ROOT) not in sys.path:
 from _fm_helpers import (  # noqa: E402
     _leaked_async_httpx_clients,
     _warn_if_drain_closed_a_foreign_client,
+    complete_paged_read,
     install_identity_mocks,
     pydantic_spec,
     reap_leaked_async_httpx_clients,
@@ -80,9 +87,12 @@ from _fm_helpers import (  # noqa: E402
 )
 from _graphiti_fake import FakeGraphitiClient  # noqa: E402
 from df_pytest_isolation import (  # noqa: E402
+    _df_claude_binary_unset,  # noqa: F401  — the binding IS the wiring  # debt: task 6997
     _df_deploy_clocks_unwritten,  # noqa: F401  — the binding IS the wiring
     _df_git_ceiling_at_basetemp,  # noqa: F401  — the binding IS the wiring
     _df_git_env_hermetic,  # noqa: F401  — the binding IS the wiring
+    arm_leaked_drain_process_guard,
+    arm_usage_gate_sweep_confinement,
     reject_unsafe_basetemp,
 )
 
@@ -101,14 +111,21 @@ from fused_memory.models.scope import KNOWN_PROJECT_ROOTS_ENV  # noqa: E402
 
 
 def pytest_configure(config):
-    """Session-start hooks: basetemp safety, and async-httpx leak tracking.
+    """Session-start hooks: basetemp safety, the drain-leak guard, UsageGate sweep confinement, async-httpx leak tracking.
 
     ``track_async_httpx_clients()`` runs HERE — at session start, before
     collection — rather than lazily from a fixture, so clients constructed at
     module import time are tracked too and can be reaped like any other
     (task 4412).
+
+    ``shared.usage_gate`` is imported here because a module-level import after
+    this file's ``sys.path`` setup would need a new ``E402`` suppression.
     """
     reject_unsafe_basetemp(config)
+    arm_leaked_drain_process_guard(config)
+    from shared import usage_gate
+
+    arm_usage_gate_sweep_confinement(config, usage_gate)
     track_async_httpx_clients()
 
 
@@ -328,6 +345,27 @@ def code_default_config(monkeypatch, tmp_path):
     monkeypatch.setenv('CONFIG_PATH', str(tmp_path / 'no-such-config.yaml'))
 
 
+@dataclass(frozen=True)
+class EscalationQueueRelocation:
+    legacy_relpath: str
+    relocated_relpath: str
+
+
+@pytest.fixture
+def escalation_queue_relocation(monkeypatch) -> EscalationQueueRelocation:
+    """Simulate an operator relocating the escalation queue in its one home."""
+    import shared.project_layout
+
+    relocation = EscalationQueueRelocation(
+        legacy_relpath=shared.project_layout.ESCALATION_QUEUE_RELPATH,
+        relocated_relpath='data/relocated-escalations',
+    )
+    monkeypatch.setattr(
+        shared.project_layout, 'ESCALATION_QUEUE_RELPATH', relocation.relocated_relpath
+    )
+    return relocation
+
+
 @pytest_asyncio.fixture(autouse=True)
 async def _reap_leaked_ticket_workers():
     """Drain any orphaned TaskInterceptor._curator_worker task at every
@@ -525,12 +563,81 @@ def make_backend():
 
     For a client that enforces graphiti_core's uuid= contract, use
     make_backend_over_fake_graphiti.
+
+    ``driver=`` replaces the default MagicMock driver; make_graph_driver builds one.
+    For a real driver and spec'd sub-clients, use make_wired_backend.
     """
-    def _factory(config, *, registered_graph_ids=()) -> GraphitiBackend:
-        backend = GraphitiBackend(config, registered_graph_ids=registered_graph_ids)
+    def _factory(config, *, registered_graph_ids=(), driver=None) -> GraphitiBackend:
+        backend = GraphitiBackend.with_driver(
+            config,
+            MagicMock() if driver is None else driver,
+            registered_graph_ids=registered_graph_ids,
+        )
         backend.client = MagicMock()
-        backend._driver = MagicMock()
         return backend
+
+    return _factory
+
+
+@pytest.fixture
+def make_graph_driver():
+    """Factory fixture: returns a callable(graphs) -> a real _MultiTenantFalkorDriver over *graphs*.
+
+    The driver runs over a FalkorDB double whose ``select_graph(name)`` answers
+    ``graphs[name]``; names are the canonical group ids the backend selects.  Pass
+    it as ``make_backend(config, driver=...)`` instead of assigning
+    ``backend._driver._get_graph``.
+    """
+    from fused_memory.backends.graphiti_client import _MultiTenantFalkorDriver
+
+    def _factory(graphs: Mapping[str, Any]) -> _MultiTenantFalkorDriver:
+        def _select(name: str) -> Any:
+            if name not in graphs:
+                raise KeyError(f'no graph wired for {name!r}; wired: {sorted(graphs)}')
+            return graphs[name]
+
+        falkor = MagicMock()
+        falkor.select_graph.side_effect = _select
+        return _MultiTenantFalkorDriver(falkor_db=falkor)
+
+    return _factory
+
+
+class SubClients(NamedTuple):
+    """Spec'd sub-client doubles, named as GraphitiBackend.with_driver's keywords."""
+
+    llm_client: LLMClient
+    embedder: EmbedderClient
+    cross_encoder: CrossEncoderClient
+
+
+class WiredBackend(NamedTuple):
+    backend: GraphitiBackend
+    sub_clients: SubClients
+
+
+@pytest.fixture
+def make_wired_backend(make_graph_driver):
+    """Factory fixture: returns a callable(config, driver=None) -> WiredBackend.
+
+    The backend is GraphitiBackend.with_driver over *driver* and fresh spec'd
+    sub-client doubles, returned beside it so a test can assert identity.  The
+    default driver is ``make_graph_driver({})``, which wires no graph.  Unlike
+    make_backend, it assigns no base ``client``.  The registry is empty.
+    """
+    def _factory(config, driver=None) -> WiredBackend:
+        sub_clients = SubClients(
+            llm_client=MagicMock(spec=LLMClient),
+            embedder=MagicMock(spec=EmbedderClient),
+            cross_encoder=MagicMock(spec=CrossEncoderClient),
+        )
+        backend = GraphitiBackend.with_driver(
+            config,
+            make_graph_driver({}) if driver is None else driver,
+            registered_graph_ids=(),
+            **sub_clients._asdict(),
+        )
+        return WiredBackend(backend, sub_clients)
 
     return _factory
 
@@ -608,9 +715,7 @@ def make_graph_mock():
     carries the stateful query log the truncation tests need — because two
     doubles that both claim to stand in for the same server drift, and the
     drift shows up as a test that passes against a fake nothing else agrees
-    with.  A test that needs the cap should use that one (or, for episode
-    reads through graphiti-core, its API-level counterpart
-    ``FakeCappedEpisodeStore`` in the same module).
+    with.  A test that needs the cap should use that one.
     """
     skip_limit_re = re.compile(r'SKIP\s+(\d+)\s+LIMIT\s+(\d+)', re.IGNORECASE)
     # Deliberately NARROW: only a query whose entire projection is a bare row
@@ -680,10 +785,27 @@ def make_fake_maintenance_service():
 
 @pytest.fixture
 def make_edge_backend():
-    """Factory fixture: returns a callable(backend, *, nodes, edges) -> backend."""
-    def _factory(backend, *, nodes, edges):
-        backend.list_entity_nodes = AsyncMock(return_value=nodes)
-        backend.get_all_valid_edges = AsyncMock(return_value=edges)
+    """Factory fixture: callable(backend, *, nodes, edges, nodes_read=None, edges_read=None) -> backend.
+
+    Stubs the two paginated whole-graph reads, ``enumerate_entity_nodes`` and
+    ``enumerate_all_valid_edges``, to return ``(nodes, nodes_read)`` and
+    ``(edges, edges_read)``.  A read left as None is a proven-complete
+    ``complete_paged_read`` sized to its collection.  Pass
+    ``incomplete_paged_read(kind)`` to drive the completeness policy.
+
+    The back-compat shims ``list_entity_nodes`` / ``get_all_valid_edges`` stay
+    REAL: they delegate to these stubs and apply the shared policy, so a
+    caller on either surface reads the same corpus.
+    """
+    def _factory(backend, *, nodes, edges, nodes_read=None, edges_read=None):
+        if nodes_read is None:
+            nodes_read = complete_paged_read(rows_seen=len(nodes))
+        if edges_read is None:
+            edges_read = complete_paged_read(
+                rows_seen=sum(len(v) for v in edges.values())
+            )
+        backend.enumerate_entity_nodes = AsyncMock(return_value=(nodes, nodes_read))
+        backend.enumerate_all_valid_edges = AsyncMock(return_value=(edges, edges_read))
         return backend
 
     return _factory
@@ -700,8 +822,21 @@ def mock_config(tmp_path) -> FusedMemoryConfig:
     environment (the model sets ``env_prefix=''``).  A test asserting on a
     field this factory does not name is asserting on the tracked
     ``fused-memory/config/config.yaml``, not on a code default.
+
+    ``write_triage.enabled`` is the one YAML-sourced field pinned here, to
+    off: the tracked YAML ships it on (task 3169), and with it on every
+    Mem0-primary ``add_memory`` in a unit test would reach the real judge
+    client.  A test of the triage path opts in on its own config.
+    ``overreach_guard.shadow_enabled`` is pinned off for the same reason: with
+    it on, every decision write in a unit test would reach the real overreach
+    judge; a test of the shadow opts in on its own config.
+    ``mem0.persist_history`` is pinned off too: with it on, any test that
+    builds a real mem0 instance from this config would write the
+    process-shared, xdist-contended, sandbox-read-only
+    ``$MEM0_DIR/history.db`` rather than a private in-memory DB; a test of the
+    persisted default opts in on its own config.
     """
-    return FusedMemoryConfig(
+    config = FusedMemoryConfig(
         llm=LLMConfig(
             provider='openai',
             model='gpt-4o-mini',
@@ -730,6 +865,10 @@ def mock_config(tmp_path) -> FusedMemoryConfig:
             data_dir=str(tmp_path / 'queue'),
         ),
     )
+    config.write_triage.enabled = False
+    config.overreach_guard.shadow_enabled = False
+    config.mem0.persist_history = False
+    return config
 
 
 # ---------------------------------------------------------------------------

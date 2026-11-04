@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _orch_helpers import wait_responsive
+from _workflow_helpers import fixed_prompt
 from escalation.queue import EscalationQueue
 from shared.config_dir import TaskConfigDir
 
@@ -586,7 +587,7 @@ class TestWorkflowSpawnSitesHoldTheSpan:
         monkeypatch.setattr(
             'orchestrator.workflow.invoke_with_cap_retry', AsyncMock(side_effect=_agent),
         )
-        await TaskWorkflow._invoke(workflow, SIMPLE_TASK, 'p', lane)
+        await TaskWorkflow._invoke(workflow, SIMPLE_TASK, fixed_prompt('p'), lane)
 
         assert seen == ['in_use'], 'AGENT site: _invoke must spawn inside lane_in_use'
         assert _lane_state(git_ops, lane) == 'assigned'
@@ -611,6 +612,7 @@ class TestWorkflowSpawnSitesHoldTheSpan:
 
     async def test_merge_phase_reverify(self, tmp_path: Path, monkeypatch):
         workflow, git_ops, lane = await _workflow_in_lane(tmp_path)
+        workflow.config.pre_merge_reverify = True
         workflow._maybe_defer_as_train_member = AsyncMock(return_value=None)  # type: ignore[method-assign]
         workflow._enter_phase = MagicMock()  # type: ignore[method-assign]
         workflow._check_scope_invariant = AsyncMock(return_value=None)  # type: ignore[method-assign]

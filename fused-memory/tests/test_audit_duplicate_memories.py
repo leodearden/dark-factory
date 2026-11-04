@@ -23,6 +23,9 @@ from _store_mutation_preflight_contract import (
 )
 from shared.testing_streams import StdoutWithAFailingFlush
 
+from fused_memory.config.schema import WriteTriageProjectCalibration
+from fused_memory.utils.store_mutation_preflight import StoreMutationUnavailable
+
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'audit_duplicate_memories.py'
 
 
@@ -446,6 +449,39 @@ class TestPickSurvivorCanonicalFlag:
         survivor, losers = pick_survivor(group)
         assert survivor['id'] == 'm2'
         assert [m['id'] for m in losers] == ['m1']
+
+
+class TestPickSurvivorStrictCanonicalMarker:
+    """Only the bool True claims canonical (canonical_marker.py::is_canonical)."""
+
+    @pytest.mark.parametrize('malformed', ['true', 1])
+    def test_bool_true_canonical_beats_older_malformed_marker(self, malformed):
+        group = [
+            _memory(
+                'm1', _VENV_GOTCHA_A, created_at='2026-07-01T00:00:00+00:00',
+                metadata={'canonical': malformed},
+            ),
+            _memory(
+                'm2', _VENV_GOTCHA_B, created_at='2026-07-13T00:00:00+00:00',
+                metadata={'canonical': True},
+            ),
+        ]
+        survivor, losers = pick_survivor(group)
+        assert survivor['id'] == 'm2'
+        assert [m['id'] for m in losers] == ['m1']
+
+    @pytest.mark.parametrize('malformed', ['true', 1])
+    def test_malformed_marker_alone_does_not_outrank_age(self, malformed):
+        group = [
+            _memory('m1', _VENV_GOTCHA_A, created_at='2026-07-01T00:00:00+00:00'),
+            _memory(
+                'm2', _VENV_GOTCHA_B, created_at='2026-07-13T00:00:00+00:00',
+                metadata={'canonical': malformed},
+            ),
+        ]
+        survivor, losers = pick_survivor(group)
+        assert survivor['id'] == 'm1'
+        assert [m['id'] for m in losers] == ['m2']
 
 
 class TestPickSurvivorOldestByCreatedAt:
@@ -3420,6 +3456,20 @@ class TestComputeClusterMetricsConsolidationNetDelta:
         _metrics, details = compute_cluster_metrics(records, {_PK: _plan_slice()}, {})
         assert details['categories'][_PK]['consolidation_events'][0]['absorbed'] == 0
 
+    @pytest.mark.parametrize('malformed', ['true', 1])
+    def test_malformed_canonical_marker_is_not_a_consolidation_event(self, malformed):
+        records = {
+            _PK: [
+                _dated('c', 'x', '2026-01-01T00:00:00+00:00',
+                       metadata={'topic': 'venv', 'canonical': malformed}),
+                _dated('after', 'y', '2026-01-02T00:00:00+00:00', metadata={'topic': 'venv'}),
+            ],
+        }
+        metrics, details = compute_cluster_metrics(records, {_PK: _plan_slice()}, {})
+
+        assert details['categories'][_PK]['consolidation_events'] == []
+        assert _by_id(metrics)[f'consolidation_net_delta.{_PK}'].n == 0
+
     def test_untopiced_event_uses_its_cluster_as_the_peer_set(self):
         records = {
             _PK: [
@@ -3927,13 +3977,24 @@ class TestRepeatedCategoryDoesNotDoubleIngest:
 # --- _run wiring doubles -----------------------------------------------------
 
 def _fake_config(t_high: float | None = 0.9,
-                 t_high_by_category: dict[str, float] | None = None):
-    return types.SimpleNamespace(
+                 t_high_by_category: dict[str, float] | None = None,
+                 project_calibrations: dict[str, dict[str, float]] | None = None):
+    """*project_calibrations* maps project -> cutoffs; None omits the section."""
+    config = types.SimpleNamespace(
         write_triage=types.SimpleNamespace(
             t_high=t_high, t_high_by_category=t_high_by_category,
         ),
         mem0=types.SimpleNamespace(collection_prefix='mem0'),
     )
+    if project_calibrations is not None:
+        config.write_triage_project_calibrations = {
+            project: WriteTriageProjectCalibration(
+                calibration_report_path=f'calibration/{project}.json',
+                t_high_by_category=cutoffs,
+            )
+            for project, cutoffs in project_calibrations.items()
+        }
+    return config
 
 
 class _FakeQdrant:
@@ -3992,7 +4053,8 @@ class _FakeMemoryService:
 
 def _install_run_doubles(monkeypatch, raw_by_category, *, t_high: float | None = 0.9,
                          t_high_by_category: dict[str, float] | None = None,
-                         ann_hits: dict[tuple, list[tuple]] | None = None):
+                         ann_hits: dict[tuple, list[tuple]] | None = None,
+                         project_calibrations: dict[str, dict[str, float]] | None = None):
     import fused_memory.config.schema as schema_mod  # noqa: PLC0415
     import fused_memory.services.memory_service as service_mod  # noqa: PLC0415
 
@@ -4001,7 +4063,7 @@ def _install_run_doubles(monkeypatch, raw_by_category, *, t_high: float | None =
     _FakeMemoryService.ann_hits = ann_hits or {}
     monkeypatch.setattr(
         schema_mod, 'FusedMemoryConfig',
-        lambda: _fake_config(t_high, t_high_by_category),
+        lambda: _fake_config(t_high, t_high_by_category, project_calibrations),
     )
     monkeypatch.setattr(service_mod, 'MemoryService', _FakeMemoryService)
     return _FakeMemoryService
@@ -4192,13 +4254,15 @@ class TestRunApplyAnnOnlyClusters:
     _NEW = '2026-01-03T00:00:00+00:00'
 
     async def _invoke(self, monkeypatch, raw, ann_hits, tmp_path, *argv,
-                      t_high_by_category=None):
+                      t_high_by_category=None, project_id='p',
+                      project_calibrations=None):
         _install_run_doubles(
             monkeypatch, raw, ann_hits=ann_hits,
             t_high_by_category=t_high_by_category,
+            project_calibrations=project_calibrations,
         )
         args = _build_parser().parse_args([
-            '--project-id', 'p', '--metrics-root', str(tmp_path), '--apply',
+            '--project-id', project_id, '--metrics-root', str(tmp_path), '--apply',
             '--threshold', '0.99', *argv,
         ])
         return await _run(args), _FakeMemoryService.instances[-1]
@@ -4239,6 +4303,34 @@ class TestRunApplyAnnOnlyClusters:
         assert plan['apply_withheld_groups'][0]['reason'] == (
             'ann_cutoff_not_evidenced_for_category'
         )
+
+    async def test_the_runs_own_project_cutoff_evidences_the_category(
+        self, monkeypatch, tmp_path, capsys,
+    ):
+        """Task 5547: the dark_factory corpus measured this category's cutoff."""
+        rc, service = await self._invoke(
+            monkeypatch, await self._clique_raw(_OS), self._CLIQUE_HITS, tmp_path,
+            project_id='dark_factory', project_calibrations={'dark_factory': {_OS: 0.9}},
+        )
+        capsys.readouterr()
+
+        assert rc == 0
+        assert service.deleted == ['m2']
+
+    async def test_another_projects_cutoff_does_not_evidence_this_run(
+        self, monkeypatch, tmp_path, capsys,
+    ):
+        rc, service = await self._invoke(
+            monkeypatch, await self._clique_raw(_OS), self._CLIQUE_HITS, tmp_path,
+            project_id='dark_factory', project_calibrations={'other_project': {_OS: 0.9}},
+        )
+        plan = json.loads(capsys.readouterr().out)
+
+        assert service.deleted == []
+        assert plan['apply_withheld_groups'][0]['reason'] == (
+            'ann_cutoff_not_evidenced_for_category'
+        )
+        assert rc == 1
 
     async def test_the_same_clique_in_a_calibrated_category_still_deletes(
         self, monkeypatch, tmp_path, capsys,
@@ -5256,11 +5348,12 @@ class TestLivenessSnapshotSubjectFacts:
     The task's own acceptance bar: the rescope is only worth shipping if the
     detector still fires on the corpus that motivated it. The clause technique
     returned the EMPTY SET on all four of these records before task 3403
-    narrowed `_CLAUSE_SPLIT_RE`'s dot and widened `TASK_REF_RE`'s separator, so
-    "it works now" is a measurement, not an inference -- and this class is
-    where that measurement lives. If a later edit to either shared regex
-    re-breaks the association, this fails before the group-level tests do,
-    naming the subject and the fact rather than an absent group.
+    narrowed the clause splitter's dot (now `task_filter.WIDE_CLAUSE_BOUNDARY_RE`)
+    and widened `TASK_REF_RE`'s separator, so "it works now" is a measurement,
+    not an inference -- and this class is where that measurement lives. If a
+    later edit to either shared regex re-breaks the association, this fails
+    before the group-level tests do, naming the subject and the fact rather
+    than an absent group.
 
     That last guarantee is only REAL because these tests seed
     `_SENTINEL_CORE_FACT` rather than `_CORE_FACT_STRANDED`. Asserting against
@@ -5276,7 +5369,7 @@ class TestLivenessSnapshotSubjectFacts:
 
     The guarantee is the CLASS's, not each test's, and the two mutants divide
     unevenly -- also measured. An inert `TASK_REF_RE` is killed by both tests.
-    An inert `_CLAUSE_SPLIT_RE` (one that never splits) is killed only by the
+    An inert `WIDE_CLAUSE_BOUNDARY_RE` (one that never splits) is killed only by the
     multi-task test: with a single-subject record the whole content IS that
     subject's clause, so not splitting is indistinguishable from splitting
     correctly and nothing is there to detect. That is why the multi-task
@@ -5411,7 +5504,7 @@ class TestLivenessSubjectFactsFallback:
     def test_a_clause_split_inside_a_quoted_value_falls_back(self):
         """`status="done. now"` -- the boundary lands mid-value.
 
-        `_CLAUSE_SPLIT_RE` is a regex over prose, not a parser, so a `.` inside
+        `WIDE_CLAUSE_BOUNDARY_RE` is a regex over prose, not a parser, so a `.` inside
         a quoted value splits the clause and leaves task 94's half holding an
         unterminated `status="done` that `_readable_field_pairs` declines to
         read. The RECORD-level classifier sees the value whole and keys fine,
@@ -5750,15 +5843,15 @@ class TestFindLivenessSnapshotRecurrences:
 
         The core fact is no longer built once per record and attributed to
         every subject it names. `find_liveness_snapshot_recurrences` splits the
-        content into clauses with `task_filter._CLAUSE_SPLIT_RE`, reads the
+        content into clauses with `task_filter.WIDE_CLAUSE_BOUNDARY_RE`, reads the
         task refs and the `<field>=<value>` assignments of each clause
         separately, and keys every subject on the union of the clauses that
         NAME it -- the same idiom `task_filter.find_conflicting_task_status_ids`
         uses. A multi-task re-verification reporting DIVERGENT values per task
         therefore joins each subject's own group instead of matching neither.
 
-        This was genuinely inert when the detector was written: `_CLAUSE_SPLIT_RE`
-        split on EVERY `.`, shattering filenames mid-sentence, and the real
+        This was genuinely inert when the detector was written: the clause
+        splitter split on EVERY `.`, shattering filenames mid-sentence, and the real
         content writes `task/94`, which `TASK_REF_RE` did not match -- together
         they yielded the EMPTY SET on all four real records. Task 3403 fixed
         both regexes at the source, and this task re-MEASURED the technique
@@ -6798,7 +6891,7 @@ class TestApplyStoreMutationPreflight:
         ])
 
         with pytest.raises(
-            _mod.StoreMutationUnavailable, match=SENTINEL
+            StoreMutationUnavailable, match=SENTINEL
         ):
             await _run(args)
 
@@ -6828,7 +6921,7 @@ class TestApplyStoreMutationPreflight:
             '--metrics-root', str(tmp_path),
         ])
 
-        with pytest.raises(_mod.StoreMutationUnavailable):
+        with pytest.raises(StoreMutationUnavailable):
             await _run(args)
 
         assert called == [], 'the scan must not run once the preflight has refused'
@@ -6854,7 +6947,6 @@ class TestApplyStoreMutationPreflight:
         self, monkeypatch, tmp_path,
     ):
         """Happy path: a writable environment deletes exactly as before."""
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
         _install_run_doubles(monkeypatch, self._raw())
         args = _build_parser().parse_args([
             '--project-id', 'p', '--apply', '--threshold', '0.75',
@@ -6914,7 +7006,7 @@ class TestApplyStoreMutationPreflight:
             '--metrics-root', str(tmp_path),
         ])
 
-        with pytest.raises(_mod.StoreMutationUnavailable):
+        with pytest.raises(StoreMutationUnavailable):
             await _run(args)
 
         assert _FakeMemoryService.instances == []
@@ -6960,11 +7052,12 @@ class TestApplyStoreMutationPreflightThroughMain:
         )
 
         with caplog.at_level('ERROR'), pytest.raises(
-            _mod.StoreMutationUnavailable, match=SENTINEL
+            StoreMutationUnavailable, match=SENTINEL
         ):
             _mod.main()
 
-        assert fail_closed_records(caplog, 'audit_duplicate_memories'), (
+        (record,) = fail_closed_records(caplog, 'audit_duplicate_memories')
+        assert SENTINEL in record.getMessage(), (
             'nothing else explains this traceback -- the guard site must log '
             'the fail-closed diagnosis before raising; got: '
             f'{[rec.getMessage() for rec in caplog.records]}'

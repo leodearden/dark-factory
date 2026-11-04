@@ -5,7 +5,8 @@ server's ``get_memory_by_id`` tool, and every heal is written through its
 ``update_memory`` tool, so the server's authorization gate and write journal
 apply unchanged. :class:`LinkHealStore` is that port, over an injected
 :data:`ToolCaller`: production passes :func:`mcp_tool_caller`, tests pass an
-in-process transport.
+in-process transport. :func:`server_tool_caller` opens the production one for
+a server URL, for every script that reads the live store.
 
 One read bypasses the server: no tool enumerates the records that carry a
 ``parent_id``, so :class:`QdrantLinkCensus` scrolls each project's collection
@@ -16,6 +17,7 @@ This is the bottom layer of the link-heal modules and imports none of them.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
@@ -24,7 +26,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Protocol
 
 from qdrant_client.models import Filter, IsEmptyCondition, PayloadField
-from shared.mcp_post import call_mcp_tool
+from shared.mcp_post import call_mcp_tool, open_mcp_client
 
 from fused_memory.models.scope import Scope
 from fused_memory.server.grouped_read import PARENT_ID_KEY
@@ -256,6 +258,13 @@ def mcp_tool_caller(client: Any, base_url: str) -> ToolCaller:
         )
 
     return call
+
+
+@contextlib.asynccontextmanager
+async def server_tool_caller(server_url: str) -> AsyncIterator[ToolCaller]:
+    """A :func:`mcp_tool_caller` over a client open for the context's lifetime."""
+    async with open_mcp_client() as client:
+        yield mcp_tool_caller(client, server_url)
 
 
 class CensusFailed(Exception):

@@ -228,29 +228,34 @@ Phase γ adds the **before_done blocking cross-unit deploy** path
      quiescence/resolve-to-done fork), and block.  A non-zero rc reaching this
      branch is always a verdict — the default runner's own timeout no longer
      arrives as one (next bullet).
+   - ``rc == 75`` on a gate declaring ``before_done.recheck_secs`` with a dated
+     milestone is "not yet": the gate re-arms instead of failing
+     (``DeterministicRunner._run_predicate`` carries the table, PRD
+     ``plans/completion-driven-triggers-prd.md`` C1).
    - ``ScriptTimeout`` — the DEFAULT runner's INNER per-script timeout (task
      4065) — is an infra fault, NOT a verdict: ``infra_issue`` + blocked with
      NO ``gate_escalated_at`` stamp.  See the ``ScriptTimeout`` class
      docstring for the full rationale.
-   - Outer-guard timeout or an unexpected ``run_fn`` error (likewise no
-     verdict — an infra fault, not a check failure): file born-at-L2
-     ``infra_issue`` and block — again NO ``gate_escalated_at`` stamp, so the
-     check is simply re-attempted on the next dispatch.  The outer
-     ``asyncio.wait_for`` guard is the backstop for a seam that never returns
-     AT ALL (a detached/unkillable child, or a hanging custom runner).  All
-     three no-verdict arms file the same category as each other, so their
+   - Outer-guard timeout, an unresolvable factory script root
+     (``FactoryRootUnresolved``, task 6386) or an unexpected ``run_fn`` error
+     (likewise no verdict — an infra fault, not a check failure): file
+     born-at-L2 ``infra_issue`` and block — again NO ``gate_escalated_at``
+     stamp, so the check is simply re-attempted on the next dispatch.  The
+     outer ``asyncio.wait_for`` guard is the backstop for a seam that never
+     returns AT ALL (a detached/unkillable child, or a hanging custom runner).
+     Every no-verdict arm files the same category as the others, so their
      escalation wording is deliberately distinct.
    - RECURRENCE CARRIER (task 4678 / r3, PRD
      ``docs/prds/recurring-deterministic-tasks.md`` R-D6 + contract C-5): when
      the task carries ``metadata.recurrence`` — one link of a recurring chain
-     — those THREE no-verdict arms file ``milestone_check_failed`` instead of
+     — those no-verdict arms file ``milestone_check_failed`` instead of
      ``infra_issue``, so every failure leg of a recurring job sits in one
      deny-listed, discriminable category
      (``escalation.authority.L2_AUTO_CLOSE_DENY_CATEGORIES``) rather than
      vanishing into the fleet's largest bucket.  Three things are deliberately
      NOT changed by that swap: the ``gate_escalated_at`` stamp is still never
      written on a no-verdict leg (task 4065 — the check is re-attempted, not
-     latched into resolve-to-done); the three SUMMARIES stay byte-identical, so
+     latched into resolve-to-done); the SUMMARIES stay byte-identical, so
      wording remains the discriminator telling a human which guard fired; and a
      NON-carrier predicate keeps ``infra_issue`` throughout.  Every DEPLOY path
      is untouched too — the ``category`` override is passed only from
@@ -356,18 +361,24 @@ Phase γ adds the **before_done blocking cross-unit deploy** path
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import logging
 import os
 import re
-import signal
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, assert_never
 
-from shared.proc_group import unsafe_pgid_reason
+from shared.before_done_paths import (
+    BeforeDonePaths,
+    resolve_before_done_paths,
+    resolve_script_base,
+)
+from shared.proc_group import SigkillDispatch, sigkill_process_group
+from shared.repo_paths import DARK_FACTORY_ROOT_ENV, resolve_dark_factory_root
 from shared.task_metadata import (
     HUMAN_CURATOR_ADJUDICATED_AT_KEY,
     HUMAN_CURATOR_GATE_KEY,
@@ -375,6 +386,7 @@ from shared.task_metadata import (
 )
 
 from orchestrator import systemd_inspect
+from orchestrator.config import PREDICATE_RECHECK_STALL_CAP
 from orchestrator.deploy_state import (
     DeployPhase,
     DeployState,
@@ -382,7 +394,18 @@ from orchestrator.deploy_state import (
     VerifyBaseline,
     enforce_transition,
 )
+from orchestrator.event_store import EventType
 from orchestrator.fm_retry import FM_RESTART_RETRY_WINDOW_SECS, fm_retry_backoffs
+from orchestrator.predicate_recheck import (
+    PredicateRecheck,
+    RearmedRecheck,
+    rearmed,
+    recheck_declaration,
+    render_verdict,
+    reset,
+    stall_detail,
+    verdict_stamps,
+)
 from orchestrator.proc_supervision import (
     EscalationSpec,
     FreshPidVerify,
@@ -406,8 +429,8 @@ logger = logging.getLogger(__name__)
 #
 # The cross-unit blocking deploy may restart the very service backing the
 # orchestrator's own fused-memory/MCP connection (e.g. task 2059), severing
-# it for the duration of a `--drain` restart.  `McpSession._raw_call`
-# (mcp_lifecycle.py) opens a fresh httpx.AsyncClient and re-inits the session
+# it for the duration of a `--drain` restart.  `shared.mcp_session.McpSession.call`
+# opens a fresh httpx.AsyncClient and re-inits the session
 # on any transient failure, so the NEXT call auto-reconnects — a successful
 # write IS the reconnection proof.  The post-deploy verify+writeback retry
 # budget (``DeterministicRunner._writeback_backoffs``) sizes off the shared
@@ -468,8 +491,8 @@ class ProcessTeardown(Enum):
     )
     #: ``proc`` was already reaped, so the pid-recycling guard dispatched
     #: NOTHING and the whole tree below it SURVIVES.  See
-    #: ``_terminate_process_tree``'s docstring for why refusing to signal
-    #: beats reaping an orphan.
+    #: ``shared/src/shared/proc_group.py::sigkill_process_group`` for why
+    #: refusing to signal beats reaping an orphan.
     NOT_SIGNALLED = (
         'nothing was signalled at all — the script had already been reaped, so '
         'signalling its possibly-recycled pid was refused, and nothing the '
@@ -487,6 +510,19 @@ class ProcessTeardown(Enum):
         same fact.
         """
         return self.value
+
+    @classmethod
+    def from_dispatch(cls, dispatch: SigkillDispatch) -> ProcessTeardown:
+        """The disposition for what ``sigkill_process_group`` reports dispatching."""
+        match dispatch:
+            case SigkillDispatch.GROUP_KILLED:
+                return cls.GROUP_KILLED
+            case SigkillDispatch.DIRECT_KILLED:
+                return cls.DIRECT_KILLED
+            case SigkillDispatch.NOT_SIGNALLED:
+                return cls.NOT_SIGNALLED
+            case _:
+                assert_never(dispatch)
 
 
 class ScriptTimeout(Exception):
@@ -611,7 +647,7 @@ def _script_timeout_budget_line(exc: ScriptTimeout, subject: str) -> str:
     )
 
 
-def _survivor_processes_line(script: str) -> str:
+def _survivor_processes_line(script: Path) -> str:
     """The actionable sentence for a teardown that left the script's children
     alive — printed by BOTH deploy arms whenever the whole-group kill was not
     the signal dispatched (task 4252 reviewer finding).
@@ -631,7 +667,7 @@ def _survivor_processes_line(script: str) -> str:
     )
 
 
-def _script_timeout_fact_lines(exc: ScriptTimeout, *, script: str) -> list[str]:
+def _script_timeout_fact_lines(exc: ScriptTimeout, *, script: Path) -> list[str]:
     """The FACT sentences both DEPLOY arms print for a ``ScriptTimeout``.
 
     Shared so the two deploy branches cannot come to say different things
@@ -654,9 +690,10 @@ def _script_timeout_fact_lines(exc: ScriptTimeout, *, script: str) -> list[str]:
         exc: the timeout, carrying the three measured facts these sentences
             are built from — budget, the script's own exit code if it had
             one, and which signal the teardown dispatched.
-        script: ``before_done['script']``, the search key the survivor
-            sentence hands the operator when that teardown left the script's
-            children running.  Not on ``exc``: it is the deploy's own
+        script: the absolute path the runner executed
+            (``DeterministicRunner._before_done_paths``), the search key the
+            survivor sentence hands the operator when that teardown left the
+            script's children running.  Not on ``exc``: it is the deploy's own
             configuration, not something the timeout measured.
     """
     group_killed = exc.teardown is ProcessTeardown.GROUP_KILLED
@@ -814,17 +851,20 @@ OPERATIONAL_LLM_GATE_MARKER_KEY: str = 'x_operational_llm_gate'
 # convention documented in authority.py's module docstring.  If any of these
 # strings changes, update both sides together.
 #
-# All three are named here rather than just the curator one (reviewer
+# All four are named here rather than just the curator one (reviewer
 # amendment): they are siblings with identical exposure, so pinning one and
 # leaving the others as bare literals would leave a reader of the denylist an
 # unexplained asymmetry — and would leave the same silent-rename hole open on
 # the unpinned members.  `curator_adjudication_missing` is the re-ask raised
 # when a `human_curator_gate` task resumes with no `human_curator_adjudicated_at`
 # stamp; `milestone_gate` is the gate itself; `milestone_check_failed` is a
-# failed predicate check.
+# failed predicate check; `milestone_check_stalled` is a re-arming predicate
+# still "not yet" at `deterministic.predicate_recheck_stall_cap` (PRD
+# plans/completion-driven-triggers-prd.md C1).
 CURATOR_ADJUDICATION_MISSING_CATEGORY: str = 'curator_adjudication_missing'
 MILESTONE_GATE_CATEGORY: str = 'milestone_gate'
 MILESTONE_CHECK_FAILED_CATEGORY: str = 'milestone_check_failed'
+MILESTONE_CHECK_STALLED_CATEGORY: str = 'milestone_check_stalled'
 
 # `metadata.recurrence` — one link of a recurring deterministic chain (task
 # 4676 / r1, modelled by `shared.task_metadata.Recurrence`).  Read here by
@@ -840,24 +880,23 @@ RECURRENCE_KEY: str = 'recurrence'
 _PROJECT_ROOT_PLACEHOLDER: str = '<project_root>'
 
 
-def _snippet_project_root(scheduler) -> str:
-    """Return the configured project_root for the operator runbook snippet.
+def _configured_project_root(scheduler) -> Path | None:
+    """Return the scheduler's configured project_root, or None if unusable.
 
-    Falls back to a VISIBLE placeholder rather than raising or interpolating a
-    repr.  ``scheduler`` is duck-typed here — ``Harness._run_deterministic_slot``
-    builds the runner "with only the minimal dependencies needed" — and
-    ``_file_curator_adjudication_missing_and_block``'s contract is that a
-    durable on-disk safety escalation is filed no matter what.  The attribute
-    chain is read while formatting the detail string, i.e. BEFORE
-    ``escalation_queue.submit()``, so an ``AttributeError`` there does not just
-    skip the BLOCK — it loses the escalation entirely and propagates, exactly
-    what that method's docstring forbids.
+    ``scheduler`` is duck-typed here — ``Harness._run_deterministic_slot``
+    builds the runner "with only the minimal dependencies needed" — so the
+    attribute chain must never raise.  That matters most to
+    ``_file_curator_adjudication_missing_and_block``, whose contract is that a
+    durable on-disk safety escalation is filed no matter what: the chain is
+    read while formatting the detail string, i.e. BEFORE
+    ``escalation_queue.submit()``, so an ``AttributeError`` there would not
+    just skip the BLOCK — it would lose the escalation entirely and propagate.
 
     Accepts the value ONLY when it is a non-empty ``str``/``Path`` that is not
-    the literal ``'None'``, so a test double's Mock attribute cannot reach an
-    operator as ``<MagicMock id=...>``.  The ``'None'`` rejection mirrors the
-    scheduler's own project_root guard, which defends against a value that
-    bypassed pydantic validation.
+    the literal ``'None'``, so a test double's Mock attribute reaches neither
+    an operator (as ``<MagicMock id=...>``) nor a filesystem path.  The
+    ``'None'`` rejection mirrors the scheduler's own project_root guard, which defends
+    against a value that bypassed pydantic validation.
 
     Deliberately no broad ``except Exception``: the two ``getattr`` defaults
     plus the isinstance/non-empty check are the entire failure surface.
@@ -866,8 +905,31 @@ def _snippet_project_root(scheduler) -> str:
     if isinstance(root, (str, Path)):
         text = str(root).strip()
         if text and text != 'None':
-            return text
-    return _PROJECT_ROOT_PLACEHOLDER
+            return Path(text)
+    return None
+
+
+class FactoryRootUnresolved(RuntimeError):
+    """before_done.script_root='factory' but ``resolve_dark_factory_root()``
+    found no dark-factory checkout.
+
+    ``_run_predicate`` files it through a dedicated no-verdict arm, never as a
+    verdict.
+    """
+
+    def __init__(self, script: str) -> None:
+        super().__init__(
+            f"before_done.script_root='factory' but the dark-factory tooling root is "
+            f'unresolvable, so script {script!r} cannot be located; set '
+            f'{DARK_FACTORY_ROOT_ENV} for the orchestrator process to the '
+            f'dark-factory checkout'
+        )
+
+
+def _snippet_project_root(scheduler) -> str:
+    """The configured project_root for the runbook snippet, else a visible placeholder."""
+    root = _configured_project_root(scheduler)
+    return str(root) if root is not None else _PROJECT_ROOT_PLACEHOLDER
 
 # Length bound applied to the externally-supplied `human_curator_adjudicated_at`
 # value when it is interpolated into the curator-gate `done_provenance.note`.
@@ -917,9 +979,9 @@ def _build_done_provenance(kind: str, **fields: object) -> dict:
     absent), whereas ``exclude_none`` now omits the key entirely in that
     case.  All known consumers (``task_interceptor.py`` and this module's
     tests) read it via ``.get('pid')``, so a missing key and an explicit
-    ``None`` are observationally identical there; extra fields such as
-    ``transient_unit`` / ``fire_delay_secs`` survive via ``DoneProvenance``'s
-    ``extra='allow'``.
+    ``None`` are observationally identical there. ``transient_unit`` and
+    ``fire_delay_secs`` are declared, typed fields of ``DoneProvenance``, so
+    a wrongly-typed value raises here too.
 
     ``kind``/``**fields`` are intentionally loosely typed (``str``/``object``):
     the six call sites forward heterogeneous field subsets, so pyright's
@@ -1044,9 +1106,10 @@ def _summarize_predicate_output(out: object, *, rc: int) -> str:
     ``predicate check passed (rc=2)``; the text cannot contradict the value.
     """
     verdict = f'predicate check {"passed" if rc == 0 else "failed"} (rc={rc})'
-    payload = _extract_predicate_payload(out)
-    if payload is None:
+    parsed = _parse_predicate_payload(out)
+    if parsed is None:
         return verdict
+    payload = parsed.text
     if len(payload) > _PREDICATE_NOTE_MAX_PAYLOAD_CHARS:
         payload = (
             f'<verdict payload elided: {len(payload)} chars exceeds '
@@ -1056,12 +1119,38 @@ def _summarize_predicate_output(out: object, *, rc: int) -> str:
     return f'{verdict}: {payload}'
 
 
-def _extract_predicate_payload(out: object) -> str | None:
+@dataclass(frozen=True)
+class _PredicatePayload:
+    """The recognized payload of a predicate's output: a trailing JSON block or a clean line.
+
+    Exactly one of ``json_value`` (tier 1) and ``line`` (tier 2) is set.
+    """
+
+    json_value: dict | list | None = None
+    line: str | None = None
+
+    def __post_init__(self) -> None:
+        if (self.json_value is None) == (self.line is None):
+            raise ValueError(
+                '_PredicatePayload needs exactly one of json_value and line '
+                f'(got json_value={self.json_value!r}, line={self.line!r})'
+            )
+
+    @property
+    def text(self) -> str:
+        """The single-line rendering the provenance note carries."""
+        if self.line is not None:
+            return self.line
+        return json.dumps(self.json_value, separators=(',', ':'))
+
+
+def _parse_predicate_payload(out: object) -> _PredicatePayload | None:
     """Return the recognized structured payload in *out*, or None.
 
     Tier 1 — a trailing JSON block: walk backwards to the last line whose
     strip opens a ``{``/``[``, and try to parse from there to end of output.
-    Re-dumped with compact separators so the note stays a single line.
+    Its rendering re-dumps it with compact separators so the note stays a
+    single line.
 
     Tier 2 — the last non-blank line, iff it carries no log shape
     (``_LOG_LINE_RE``).  This is what preserves the real in-repo predicate
@@ -1078,14 +1167,30 @@ def _extract_predicate_payload(out: object) -> str | None:
             parsed = json.loads('\n'.join(lines[index:]))
         except ValueError:
             continue
-        return json.dumps(parsed, separators=(',', ':'))
+        return _PredicatePayload(json_value=parsed)
 
     for line in reversed(lines):
         candidate = line.strip()
         if not candidate:
             continue
-        return None if _LOG_LINE_RE.search(candidate) else candidate
+        return None if _LOG_LINE_RE.search(candidate) else _PredicatePayload(line=candidate)
     return None
+
+
+def _predicate_verdict(out: object) -> dict | None:
+    """The structured verdict a predicate's output carries: its trailing JSON OBJECT.
+
+    Stamped as ``metadata.predicate_verdict`` (plans/completion-driven-triggers-prd.md
+    C1).  A clean line or a JSON array is never a verdict.  An object whose
+    compact rendering exceeds the note's cap is recorded by size alone.
+    """
+    payload = _parse_predicate_payload(out)
+    if payload is None or not isinstance(payload.json_value, dict):
+        return None
+    rendered = payload.text
+    if len(rendered) > _PREDICATE_NOTE_MAX_PAYLOAD_CHARS:
+        return {'elided': True, 'chars': len(rendered)}
+    return payload.json_value
 
 
 def _is_operational_llm_gate(metadata: dict) -> bool:
@@ -1339,6 +1444,21 @@ class DeterministicRunner:
             ``systemctl --user show`` ``communicate()`` call (task 2091).
             Defaults to ``_INSPECT_TIMEOUT_SECS``.  Injected in tests so a
             wedged-inspect test doesn't actually wait.
+        factory_root_resolver: Optional callable ``() -> Path | None`` locating
+            the dark-factory root a ``before_done.script_root='factory'``
+            script resolves under.  Defaults to
+            ``shared.repo_paths.resolve_dark_factory_root``; consulted only for
+            such scripts.  ``None`` raises ``FactoryRootUnresolved``.
+        predicate_recheck_stall_cap: How many consecutive exit-75 "not yet"
+            verdicts a re-arming predicate may return before the runner files
+            ``milestone_check_stalled`` (PRD completion-driven-triggers C1).
+            ``Harness._run_deterministic_slot`` passes the live
+            ``deterministic.predicate_recheck_stall_cap``; the default is
+            ``orchestrator.config.PREDICATE_RECHECK_STALL_CAP``.
+        clock: Optional callable ``() -> datetime`` (aware, UTC) timing a
+            predicate check: the re-arm, its streak record and the verdict
+            filer's ``gate_escalated_at``.  Defaults to ``datetime.now(UTC)``.
+            Injected in tests for exact ``milestone.at`` assertions.
     """
 
     def __init__(
@@ -1354,6 +1474,9 @@ class DeterministicRunner:
         reap_grace_secs=_REAP_GRACE_SECS,
         run_timeout_grace_secs=_RUN_TIMEOUT_GRACE_SECS,
         inspect_timeout_secs=_INSPECT_TIMEOUT_SECS,
+        factory_root_resolver: Callable[[], Path | None] | None = None,
+        predicate_recheck_stall_cap: int = PREDICATE_RECHECK_STALL_CAP,
+        clock: Callable[[], datetime] | None = None,
     ):
         self.scheduler = scheduler
         self.escalation_queue = escalation_queue
@@ -1369,6 +1492,9 @@ class DeterministicRunner:
         self._reap_grace_secs = reap_grace_secs
         self._run_timeout_grace_secs = run_timeout_grace_secs
         self._inspect_timeout_secs = inspect_timeout_secs
+        self._factory_root_resolver = factory_root_resolver or resolve_dark_factory_root
+        self._predicate_recheck_stall_cap = predicate_recheck_stall_cap
+        self._clock = clock or (lambda: datetime.now(UTC))
 
     # ------------------------------------------------------------------
     # Default injectable seam implementations
@@ -1382,6 +1508,28 @@ class DeterministicRunner:
         Operators set ORCH_UNIT in the [Service] Environment of the orchestrator unit.
         """
         return os.environ.get('ORCH_UNIT', '')
+
+    def _before_done_paths(self, before_done: dict) -> BeforeDonePaths:
+        root = _configured_project_root(self.scheduler)
+        if root is None:
+            root = Path.cwd()
+            logger.warning(
+                'DeterministicRunner: scheduler carries no configured project_root — '
+                'resolving before_done paths against the process cwd %s',
+                root,
+            )
+        project_root = root.resolve()
+        return resolve_before_done_paths(
+            before_done,
+            project_root,
+            script_base=self._script_base(before_done, project_root),
+        )
+
+    def _script_base(self, before_done: dict, project_root: Path) -> Path:
+        base = resolve_script_base(before_done, project_root, self._factory_root_resolver)
+        if base is None:
+            raise FactoryRootUnresolved(before_done['script'])
+        return base
 
     async def _default_schedule_detached_restart(
         self,
@@ -1441,20 +1589,10 @@ class DeterministicRunner:
             fails (tail carries the error detail).
         """
         target_unit = before_done.get('target_unit', 'unknown')
-        script = before_done['script']
         args = before_done.get('args') or []
-
-        # The transient unit runs under the systemd --user manager, which does
-        # NOT inherit the orchestrator's own working directory — it defaults to
-        # $HOME.  A relative deploy `script` would therefore fail to be found
-        # (exit 127) once the unit fires.  Resolve an explicit cwd from
-        # before_done['cwd'] when the caller supplied one; otherwise fall back
-        # to this process's own os.getcwd(), which is project_root because the
-        # orchestrator's own systemd unit pins WorkingDirectory=project_root.
-        # RestartPlan.__post_init__ absolutizes a relative `script` against
-        # this `cwd` (RP-3), byte-identical to this method's prior inline
-        # absolutization.
-        cwd = before_done.get('cwd') or os.getcwd()
+        # docs/task-authoring.md §5: paths resolve against the configured
+        # project_root (shared/src/shared/before_done_paths.py).
+        paths = self._before_done_paths(before_done)
 
         esc_summary = summary or (
             f'Self-restart fire-time failure: {target_unit}'
@@ -1533,9 +1671,9 @@ class DeterministicRunner:
         )
 
         plan = RestartPlan(
-            script=Path(script),
+            script=paths.script,
             args=list(args),
-            cwd=Path(cwd),
+            cwd=paths.cwd,
             target_unit=transient_unit,
             own_unit=transient_unit,
             on_failure_escalation=escalation_spec,
@@ -1673,18 +1811,17 @@ class DeterministicRunner:
                 script's OWN exit code when the teardown found the direct child
                 already exited.
         """
-        script = before_done['script']
+        paths = self._before_done_paths(before_done)
         args = before_done.get('args') or []
         # Merge over os.environ so the child sees a full environment (PATH, HOME,
         # XDG_RUNTIME_DIR …).  An empty / absent env dict means full inherit.
         env = {**os.environ, **before_done['env']} if before_done.get('env') else None
-        cwd = before_done.get('cwd') or None
         timeout_secs = before_done.get('timeout_secs', 60)
 
         proc = await asyncio.create_subprocess_exec(
-            script, *args,
+            str(paths.script), *args,
             env=env,
-            cwd=cwd,
+            cwd=paths.cwd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             start_new_session=True,
@@ -1692,7 +1829,8 @@ class DeterministicRunner:
         # Capture the pgid NOW, while proc is guaranteed alive and unreaped: with
         # start_new_session=True, pgid == proc.pid by POSIX guarantee.  Reading it
         # later via os.getpgid could hit a recycled pid and signal a stranger's
-        # group (task 845) — see `_terminate_process_tree`'s docstring.
+        # group (task 845) — see shared/src/shared/proc_group.py's module
+        # docstring, "Why the caller captures pgid".
         pgid = proc.pid
         try:
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_secs)
@@ -1747,29 +1885,16 @@ class DeterministicRunner:
     async def _terminate_process_tree(
         self, proc: asyncio.subprocess.Process, pgid: int,
     ) -> ProcessTeardown:
-        """Kill *proc*'s entire process group and bound the reap (task 2090).
+        """SIGKILL *proc*'s whole process group, then bound the reap (task 2090).
 
-        ``proc`` must have been spawned with ``start_new_session=True`` so its
-        process group is its own — NOT the orchestrator's — otherwise
-        ``os.killpg`` would SIGKILL the orchestrator itself.
-
-        Tries a whole-group SIGKILL first, which reaches any grandchildren
-        (e.g. a backgrounded ``systemctl``/``curl``/``sleep``) that would
-        otherwise survive the direct child's death as leaked orphans —
-        continuing to run (and keep the inherited stdout pipe's write end
-        open) indefinitely.  Note this is NOT needed to unblock ``proc.wait()``
-        below: asyncio's ``Process.wait()`` resolves on the child's own exit
-        notification (via the event loop's child watcher), not on pipe EOF —
-        only ``communicate()`` waits on that.  The process-group kill's value
-        is purely in not leaking the grandchildren themselves.  If the process
-        has already exited (or the group lookup otherwise fails), falls back
-        to a direct ``proc.kill()``.  Both kill attempts tolerate an
-        already-dead process — this helper must NEVER raise, so a timeout
-        branch can always return cleanly even if the process is already gone.
-
-        The reap itself is bounded by ``self._reap_grace_secs`` so a process
-        stuck in an uninterruptible state cannot hang this helper (and
-        therefore ``_default_run_script``) forever.
+        The signal choice is
+        ``shared/src/shared/proc_group.py::sigkill_process_group``'s: the whole
+        group, a direct ``proc.kill()`` when the group kill is refused or
+        fails, or nothing once the leader is reaped.  This helper renders that
+        choice as a ``ProcessTeardown`` and bounds the reap by
+        ``self._reap_grace_secs``, so a process stuck in an uninterruptible
+        state cannot hang it (and therefore ``_default_run_script``) forever.
+        It never raises, so a timeout branch can always return cleanly.
 
         Returns:
             Which signal was DISPATCHED (``ProcessTeardown``) — the caller
@@ -1781,78 +1906,16 @@ class DeterministicRunner:
             spawned were deliberately left alone.
 
         Args:
-            proc: the timed-out child, spawned with ``start_new_session=True``.
+            proc: the timed-out child, spawned with ``start_new_session=True``
+                so its process group is its own, not the orchestrator's.
             pgid: the process group id, which MUST be the value captured
                 immediately after that spawn (where ``pgid == proc.pid`` by
-                POSIX guarantee).  It is never refreshed here via
-                ``os.getpgid``: once ``proc`` has been reaped the kernel may
-                recycle its pid, and ``os.getpgid`` would then return an
-                unrelated group's id — in the task-845 incidents that resolved
-                to the user ``systemd --user`` manager's group and killed the
-                whole login session.  ``shared/src/shared/proc_group.py``'s
-                module docstring is the canonical statement of this contract.
-
-        A frozen capture alone is necessary but not sufficient, because the
-        captured NUMBER also goes stale the moment the leader is reaped.  The
-        ``proc.returncode is not None`` short-circuit below is what closes that
-        residual window: it dispatches no signal at all rather than risk
-        signalling a stranger.  Accepted trade-off, matching the shared
-        helper's: if the leader is already reaped we forgo killing surviving
-        grandchildren — refusing to kill a stranger beats reaping an orphan.
-
-        The third layer is ``shared.proc_group.unsafe_pgid_reason``, applied
-        below: even a frozen, unreaped pgid is refused if it resolves to init,
-        this process, our parent, our own group, or anything other than
-        ``proc.pid``.  This helper deliberately REUSES that predicate rather
-        than growing a third copy of it — the repo's other two group-killers
-        (``shared.proc_group.terminate_process_group`` and
-        ``df_pytest_isolation._kill_process_group``) both apply it, and a
-        divergent hand-rolled copy here would be the weakest of the three.  A
-        refusal degrades to the direct ``proc.kill()``, exactly as
-        ``df_pytest_isolation``'s does.
-
-        Why this does NOT simply delegate to ``terminate_process_group``, which
-        it otherwise resembles: that helper escalates SIGTERM → wait →
-        SIGKILL, while this path SIGKILLs immediately and bounds the reap once.
-        The immediate SIGKILL is deliberate for a deploy script that has
-        already blown its timeout budget, and delegation would also double the
-        worst-case wait (``2 * grace_secs``) and drop both the ``proc.kill()``
-        fallback and the reap-abandoned warning below.  Delegating is a
-        behaviour change, not a refactor; the shared *predicate* is the part
-        that is genuinely common, so that is what is shared.
+                POSIX guarantee), never refreshed via ``os.getpgid``.
+                ``shared/src/shared/proc_group.py``'s module docstring ("Why
+                the caller captures pgid") is the canonical statement of this
+                contract.
         """
-        if proc.returncode is not None:
-            logger.debug(
-                'DeterministicRunner: proc %s already reaped — skipping killpg '
-                '(its pid may already be recycled onto another group)',
-                proc.pid,
-            )
-            teardown = ProcessTeardown.NOT_SIGNALLED
-        elif (reason := unsafe_pgid_reason(pgid, proc.pid)) is not None:
-            # Residual defence, degrading to the direct child exactly as
-            # df_pytest_isolation._kill_process_group does on the same refusal.
-            logger.error(
-                'DeterministicRunner: refusing to killpg — %s. Falling back to '
-                'a direct kill() of pid %s; any grandchildren will be left to '
-                'the caller. This indicates a bug in the pgid capture.',
-                reason, proc.pid,
-            )
-            with contextlib.suppress(ProcessLookupError, OSError):
-                proc.kill()
-            teardown = ProcessTeardown.DIRECT_KILLED
-        else:
-            try:
-                os.killpg(pgid, signal.SIGKILL)
-                teardown = ProcessTeardown.GROUP_KILLED
-            except (ProcessLookupError, PermissionError, OSError) as exc:
-                logger.debug(
-                    'DeterministicRunner: killpg(%s) failed (%s: %s) — falling back '
-                    'to direct kill()',
-                    pgid, type(exc).__name__, exc,
-                )
-                with contextlib.suppress(ProcessLookupError, OSError):
-                    proc.kill()
-                teardown = ProcessTeardown.DIRECT_KILLED
+        teardown = ProcessTeardown.from_dispatch(sigkill_process_group(proc, pgid))
 
         try:
             await asyncio.wait_for(proc.wait(), timeout=self._reap_grace_secs)
@@ -1909,9 +1972,9 @@ class DeterministicRunner:
         the three log lines below interpolate the category so a carrier's logs
         read ``milestone_check_failed`` rather than a lie.
 
-        THIS method — not ``_file_milestone_check_failed_and_block`` — is the
+        THIS method — not ``_file_predicate_escalation_and_block`` — is the
         right home for that override precisely BECAUSE it does not stamp
-        ``gate_escalated_at``.  The milestone helper does, and task 4065
+        ``gate_escalated_at``.  The verdict helper does, and task 4065
         established that a no-verdict leg must NOT (the check is re-attempted
         on the next dispatch instead of being latched into section-1's
         resolve-to-done path).  r3 is a CATEGORY change only, so routing the
@@ -2449,7 +2512,7 @@ class DeterministicRunner:
         Task 2066: the cross-unit deploy script may restart the very service
         backing the orchestrator's own fused-memory/MCP connection (e.g. task
         2059), severing it for the duration of a ``--drain`` restart.  Because
-        ``McpSession._raw_call`` auto-reconnects on the next call after any
+        ``shared.mcp_session.McpSession.call`` auto-reconnects on the next call after any
         transient failure, a plain patient retry — not an explicit reconnect —
         is sufficient: a successful write IS the reconnection proof.
 
@@ -2810,22 +2873,34 @@ class DeterministicRunner:
 
         return WorkflowOutcome.BLOCKED
 
-    async def _file_milestone_check_failed_and_block(
+    async def _file_predicate_escalation_and_block(
         self,
         task_id: str,
+        *,
+        category: str,
         summary: str,
         detail: str,
+        stamps: dict,
+        now: datetime,
     ) -> WorkflowOutcome:
-        """File a born-at-L2 ``milestone_check_failed`` escalation and block (γ-predicate).
+        """File a born-at-L2 predicate VERDICT escalation and block (γ-predicate).
 
-        A non-zero predicate exit code is a milestone VERDICT ("the invariant
-        does not hold") — semantically distinct from an infra fault, so this
-        mirrors ``_file_infra_issue_and_block``'s dedup/file/block shape but
-        with a dedicated category AND additionally stamps ``gate_escalated_at``
-        (mirroring ``_file_milestone_gate_and_block``) so the next dispatch
-        routes through section-1's existing quiescence/resolve-to-done fork —
-        a human resolving the escalation drives the task to done with no
-        extra wiring.
+        Serves every verdict a human must weigh: ``milestone_check_failed``
+        ("the invariant does not hold") and ``milestone_check_stalled`` (a
+        re-arming predicate still "not yet" at its stall cap).  A verdict is
+        semantically distinct from an infra fault, so this mirrors
+        ``_file_infra_issue_and_block``'s dedup/file/block shape but
+        additionally stamps ``gate_escalated_at`` (mirroring
+        ``_file_milestone_gate_and_block``) so the next dispatch routes through
+        section-1's existing quiescence/resolve-to-done fork — a human
+        resolving the escalation re-runs the check with no extra wiring.
+
+        *stamps* (``predicate_verdict`` / ``predicate_recheck``, PRD
+        plans/completion-driven-triggers-prd.md C1) ride in the SAME single
+        ``update_task`` as ``gate_escalated_at``, so a verdict exit is still
+        exactly one metadata write.  ``gate_escalated_at`` is *now*, the
+        instant the check ran, so it agrees with the streak record's
+        ``last_checked_at``.
 
         Includes a dedup guard — if a pending escalation already exists (e.g.
         prior crash-safe re-dispatch), filing is skipped to avoid duplicate L2
@@ -2842,8 +2917,8 @@ class DeterministicRunner:
         if existing_pending:
             logger.info(
                 'DeterministicRunner: task %s already has %d pending escalation(s) — '
-                'skipping re-file (milestone_check_failed dedup guard)',
-                task_id, len(existing_pending),
+                'skipping re-file (%s dedup guard)',
+                task_id, len(existing_pending), category,
             )
         else:
             esc = Escalation(
@@ -2851,25 +2926,24 @@ class DeterministicRunner:
                 task_id=task_id,
                 agent_role=DETERMINISTIC_AGENT_ROLE,
                 severity='critical',
-                category=MILESTONE_CHECK_FAILED_CATEGORY,
+                category=category,
                 summary=summary[:200],
                 detail=detail,
                 level=2,
             )
             self.escalation_queue.submit(esc)
             logger.info(
-                'DeterministicRunner: filed L2 milestone_check_failed escalation %s for task %s',
-                esc.id, task_id,
+                'DeterministicRunner: filed L2 %s escalation %s for task %s',
+                category, esc.id, task_id,
             )
 
         # Stamp gate_escalated_at AFTER successful escalation submit (file-before-stamp
         # ordering, same as _file_milestone_gate_and_block) so a stamp failure re-files
         # on the next dispatch rather than silently skipping it.  A predicate NEVER
         # stamps before_done_ran_at — there is no I1 side effect to guard here.
-        now_iso = datetime.now(UTC).isoformat()
         await self.scheduler.update_task(
             task_id,
-            {'gate_escalated_at': now_iso},
+            {'gate_escalated_at': now.isoformat(), **stamps},
             metadata_mode='merge',
         )
 
@@ -2879,16 +2953,13 @@ class DeterministicRunner:
         # mask them behind a raw exception.
         try:
             await self.scheduler.set_task_status(task_id, 'blocked')
-            logger.info(
-                'DeterministicRunner: task %s blocked — milestone_check_failed', task_id,
-            )
+            logger.info('DeterministicRunner: task %s blocked — %s', task_id, category)
         except Exception as exc:
             logger.warning(
                 'DeterministicRunner: task %s blocked-status writeback failed '
-                '(connection may still be severed): %s: %s — the '
-                'milestone_check_failed escalation is already durable on local '
-                'disk, so returning BLOCKED regardless',
-                task_id, type(exc).__name__, exc,
+                '(connection may still be severed): %s: %s — the %s escalation '
+                'is already durable on local disk, so returning BLOCKED regardless',
+                task_id, type(exc).__name__, exc, category,
             )
 
         return WorkflowOutcome.BLOCKED
@@ -2922,12 +2993,26 @@ class DeterministicRunner:
           a Mem0 completion-summary write, so raw subprocess output landing
           there is ingested into memory.  The full raw output is logged at
           INFO immediately before summarizing, so nothing is silently lost.
+        - ``rc == 75`` (``os.EX_TEMPFAIL``) on a gate declaring
+          ``before_done.recheck_secs`` with a dated milestone -> "not yet"
+          (PRD ``plans/completion-driven-triggers-prd.md`` C1): ONE merge
+          write advances ``milestone.at`` by ``recheck_secs`` and stamps the
+          streak record and verdict, then a best-effort ``pending`` ->
+          ``WorkflowOutcome.REQUEUED``.  A refused write files the
+          no-verdict category and blocks instead.  The 75 that brings the
+          streak to ``deterministic.predicate_recheck_stall_cap`` does not
+          re-arm: it files born-at-L2 ``milestone_check_stalled`` (with the
+          ``gate_escalated_at`` stamp, like a failure) and blocks.
         - ``rc != 0`` -> a milestone VERDICT failure ("the invariant does not
           hold"): born-at-L2 ``milestone_check_failed`` escalation +
           ``gate_escalated_at`` stamp + blocked (routes through section-1's
           resume/quiescence machinery on the next dispatch).  Any non-zero rc
           returned by the seam is a verdict — including one from an injected
-          ``script_runner``, whatever its tail text says.
+          ``script_runner``, whatever its tail text says.  An UNDECLARED 75
+          lands here, its detail naming what the declaration lacks.
+        - Every verdict exit (0, 75, other) stamps ``predicate_verdict`` by
+          ``orchestrator.predicate_recheck.verdict_stamps``, and every exit
+          but a re-arm resets a ``predicate_recheck`` streak.
         - ``ScriptTimeout`` (task 4065) -> an INFRA fault, not a verdict: the
           DEFAULT runner's own inner per-script timeout fired, so no exit code
           exists.  born-at-L2 escalation + blocked, with NO
@@ -2938,36 +3023,37 @@ class DeterministicRunner:
           (next bullet but one): its non-carrier text asserts "deliberately not
           milestone_check_failed", which would contradict a carrier's own
           category.
-        - Outer-guard timeout / unexpected error -> likewise an INFRA fault
-          (no verdict was produced): born-at-L2 escalation + blocked
-          (re-attempted on the next dispatch, no ``gate_escalated_at`` stamp).
-          The outer ``asyncio.wait_for`` guard
-          (``timeout_secs + run_timeout_grace_secs``) stays the backstop for a
-          seam that never returns at all.  All three infra arms share one
-          category, so each carries deliberately distinct summary/detail
-          wording — that text is the only thing telling a human which guard
-          fired.
+        - Outer-guard timeout / ``FactoryRootUnresolved`` (task 6386) /
+          unexpected error -> likewise an INFRA fault (no verdict was
+          produced): born-at-L2 escalation + blocked (re-attempted on the next
+          dispatch, no ``gate_escalated_at`` stamp).  The outer
+          ``asyncio.wait_for`` guard (``timeout_secs + run_timeout_grace_secs``)
+          stays the backstop for a seam that never returns at all.  Every infra
+          arm shares one category, so each carries deliberately distinct
+          summary/detail wording — that text is the only thing telling a human
+          which guard fired.
         - CARRIER SPLIT (task 4678 / r3, PRD R-D6 + C-5): for a task carrying
-          ``metadata.recurrence`` — one link of a recurring chain — ALL THREE
-          no-verdict arms above file ``milestone_check_failed`` instead of
+          ``metadata.recurrence`` — one link of a recurring chain — EVERY
+          no-verdict arm above files ``milestone_check_failed`` instead of
           ``infra_issue`` (one ``no_verdict_category``, resolved once from
           ``_is_recurrence_carrier``), so a recurring job's failures never
           disappear into the crowded ``infra_issue`` bucket.  Every OTHER
           predicate — and every deploy path — is unchanged.  Two things do NOT
           move with the label: the STAMP (still no ``gate_escalated_at``,
-          because these are still no-verdict legs) and the three SUMMARIES
+          because these are still no-verdict legs) and the SUMMARIES
           (byte-identical, so the arm discriminator keeps working for carriers
           too).  The single wording change is the ``ScriptTimeout`` arm's
           detail sentence, which on the carrier path names R-D6 as the reason
           for the category instead of asserting the opposite of it.
 
         Returns:
-            WorkflowOutcome.DONE or WorkflowOutcome.BLOCKED.
+            WorkflowOutcome.DONE, WorkflowOutcome.BLOCKED, or
+            WorkflowOutcome.REQUEUED after a re-arm.
         """
         run_fn = self._script_runner or self._default_run_script
         outer_timeout = before_done.get('timeout_secs', 60) + self._run_timeout_grace_secs
 
-        # Task 4678 (r3): resolved ONCE, so all three no-verdict arms below
+        # Task 4678 (r3): resolved ONCE, so the no-verdict arms below
         # cannot drift into different categories for the same task.
         no_verdict_category = (
             MILESTONE_CHECK_FAILED_CATEGORY
@@ -3018,7 +3104,7 @@ class DeterministicRunner:
         except ScriptTimeout as exc:
             # Task 4065: the DEFAULT runner's own per-script timeout fired — no
             # exit code, so no verdict (see ScriptTimeout).  Wording is
-            # deliberately distinct from the two sibling arms: all three file
+            # deliberately distinct from the sibling arms: they all file
             # the SAME category as each other (`no_verdict_category`), so the
             # text is the only thing telling a human WHICH guard fired — which
             # is why task 4678's carrier split moves the category and leaves
@@ -3081,6 +3167,14 @@ class DeterministicRunner:
                 detail=inner_timeout_detail,
                 category=no_verdict_category,
             )
+        except FactoryRootUnresolved as exc:
+            # A configuration fault, not a verdict: the script was never located.
+            return await self._file_infra_issue_and_block(
+                task_id,
+                summary='Predicate script root unresolvable',
+                detail='\n'.join([description, str(exc)]),
+                category=no_verdict_category,
+            )
         except Exception as exc:
             # Likewise an infra fault, not a verdict — an unexpected error
             # means the check never ran to completion.
@@ -3094,6 +3188,29 @@ class DeterministicRunner:
                 detail=error_detail,
                 category=no_verdict_category,
             )
+
+        verdict = _predicate_verdict(out)
+        prev_recheck = PredicateRecheck.from_metadata(metadata)
+        now = self._clock()
+        declaration_gap: str | None = None
+        if rc == os.EX_TEMPFAIL:
+            declaration = recheck_declaration(before_done, metadata.get('milestone'))
+            if declaration.recheck_secs is not None:
+                return await self._rearm_or_stall(
+                    task_id,
+                    description=description,
+                    metadata=metadata,
+                    out=out,
+                    verdict=verdict,
+                    prev=prev_recheck,
+                    now=now,
+                    recheck_secs=declaration.recheck_secs,
+                    no_verdict_category=no_verdict_category,
+                )
+            declaration_gap = declaration.gap
+        settled_stamps = verdict_stamps(
+            metadata, verdict, reset(prev_recheck, now) if prev_recheck else None,
+        )
 
         if rc != 0:
             # A non-zero exit is a milestone VERDICT ("invariant does not
@@ -3114,12 +3231,16 @@ class DeterministicRunner:
             fail_detail = '\n'.join([
                 description,
                 f'Predicate check exit code: rc={rc}',
+                *([declaration_gap] if declaration_gap else []),
                 f'Output:\n{out}',
             ])
-            return await self._file_milestone_check_failed_and_block(
+            return await self._file_predicate_escalation_and_block(
                 task_id,
+                category=MILESTONE_CHECK_FAILED_CATEGORY,
                 summary=f'Milestone predicate check failed (rc={rc})',
                 detail=fail_detail,
+                stamps=settled_stamps,
+                now=now,
             )
 
         # Log the RAW output before summarizing it.  `_summarize_predicate_output`
@@ -3136,6 +3257,16 @@ class DeterministicRunner:
             'DeterministicRunner: task %s predicate check passed (rc=0) — setting done',
             task_id,
         )
+        # Written before done, so no metadata write lands on a terminal row.  An
+        # observability record, never a gate: a refused write still drives to done.
+        if settled_stamps and not await self.scheduler.update_task(
+            task_id, settled_stamps, metadata_mode='merge',
+        ):
+            logger.warning(
+                'DeterministicRunner: task %s predicate verdict stamp write refused '
+                '(keys %s) — driving to done regardless',
+                task_id, sorted(settled_stamps),
+            )
         await self.scheduler.set_task_status(
             task_id,
             'done',
@@ -3145,6 +3276,180 @@ class DeterministicRunner:
             ),
         )
         return WorkflowOutcome.DONE
+
+    async def _rearm_or_stall(
+        self,
+        task_id: str,
+        *,
+        description: str,
+        metadata: dict,
+        out: object,
+        verdict: dict | None,
+        prev: PredicateRecheck | None,
+        now: datetime,
+        recheck_secs: int,
+        no_verdict_category: str,
+    ) -> WorkflowOutcome:
+        """Answer a declared exit-75 "not yet": re-arm, or stall at the cap (PRD C1)."""
+        logger.info(
+            'DeterministicRunner: task %s predicate raw output (%d chars, '
+            'summarized into predicate_verdict): %s',
+            task_id, len(out) if isinstance(out, str) else 0, out,
+        )
+        record = rearmed(prev, now, recheck_secs)
+        if record.consecutive >= self._predicate_recheck_stall_cap:
+            return await self._stall_predicate(
+                task_id,
+                description=description,
+                metadata=metadata,
+                verdict=verdict,
+                prev=prev,
+                now=now,
+                streak=record.consecutive,
+                recheck_secs=recheck_secs,
+            )
+        return await self._rearm_predicate(
+            task_id,
+            metadata=metadata,
+            verdict=verdict,
+            record=record,
+            recheck_secs=recheck_secs,
+            no_verdict_category=no_verdict_category,
+        )
+
+    async def _rearm_predicate(
+        self,
+        task_id: str,
+        *,
+        metadata: dict,
+        verdict: dict | None,
+        record: RearmedRecheck,
+        recheck_secs: int,
+        no_verdict_category: str,
+    ) -> WorkflowOutcome:
+        """Advance the dated ``milestone.at`` to *record*'s next check and re-pend.
+
+        ONE merge write carries the advanced milestone, the streak record and
+        the verdict.  It comes first, so a lost trailing status write leaves a
+        task whose advanced ``at`` already withholds re-dispatch.  A REFUSED
+        write is escalated instead: with ``at`` not advanced, re-pending would
+        re-dispatch at once into the same 75, a loop with no escape.
+        """
+        next_check_at = record.next_check_at.isoformat()
+        stamps = {
+            'milestone': {**metadata['milestone'], 'at': next_check_at},
+            **verdict_stamps(metadata, verdict, record, always_stamp_verdict=True),
+        }
+        if not await self.scheduler.update_task(task_id, stamps, metadata_mode='merge'):
+            return await self._file_infra_issue_and_block(
+                task_id,
+                summary='Predicate re-arm write failed (rc=75)',
+                detail='\n'.join([
+                    f'The predicate answered "not yet" (exit 75) and should have re-armed '
+                    f'to next_check_at={next_check_at}, but the metadata write advancing '
+                    'milestone.at was refused, so the gate was not re-armed.',
+                    'Blocked rather than re-pended: with milestone.at unchanged, a '
+                    're-dispatch would re-run the check at once into the same verdict.',
+                    'Resume to re-run the check.',
+                ]),
+                category=no_verdict_category,
+            )
+        self._emit_predicate_event(
+            EventType.predicate_rearmed, task_id,
+            consecutive=record.consecutive, next_check_at=record.next_check_at,
+            recheck_secs=recheck_secs, verdict=verdict,
+        )
+        logger.info(
+            'DeterministicRunner: task %s predicate re-armed (rc=75, consecutive=%d/%d, '
+            'next_check_at=%s): %s',
+            task_id, record.consecutive, self._predicate_recheck_stall_cap, next_check_at,
+            render_verdict(verdict),
+        )
+        try:
+            await self.scheduler.set_task_status(task_id, 'pending')
+        except Exception as exc:
+            logger.warning(
+                'DeterministicRunner: task %s pending-status writeback failed after the '
+                're-arm (%s: %s) — milestone.at is already advanced, so the gate stays '
+                'withheld until next_check_at regardless',
+                task_id, type(exc).__name__, exc,
+            )
+        return WorkflowOutcome.REQUEUED
+
+    async def _stall_predicate(
+        self,
+        task_id: str,
+        *,
+        description: str,
+        metadata: dict,
+        verdict: dict | None,
+        prev: PredicateRecheck | None,
+        now: datetime,
+        streak: int,
+        recheck_secs: int,
+    ) -> WorkflowOutcome:
+        """File ``milestone_check_stalled`` instead of re-arming: the streak hit the cap.
+
+        ``milestone.at`` is left where it is and the streak resets, keeping
+        ``first_rearmed_at``.  The filer's ``gate_escalated_at`` stamp routes
+        the next dispatch through section 1: quiescent while the escalation is
+        pending, a re-run check (and a fresh streak) once it is resolved.
+        """
+        cap = self._predicate_recheck_stall_cap
+        stored = reset(prev, now)
+        outcome = await self._file_predicate_escalation_and_block(
+            task_id,
+            category=MILESTONE_CHECK_STALLED_CATEGORY,
+            summary=f'Milestone predicate still not satisfied after {cap} consecutive checks',
+            detail=stall_detail(
+                description,
+                streak=streak,
+                stall_cap=cap,
+                first_rearmed_at=stored.first_rearmed_at,
+                now=now,
+                recheck_secs=recheck_secs,
+                verdict=verdict,
+            ),
+            stamps=verdict_stamps(metadata, verdict, stored, always_stamp_verdict=True),
+            now=now,
+        )
+        self._emit_predicate_event(
+            EventType.predicate_recheck_stalled, task_id,
+            consecutive=streak, next_check_at=None,
+            recheck_secs=recheck_secs, verdict=verdict,
+        )
+        logger.warning(
+            'DeterministicRunner: task %s predicate stalled (rc=75, consecutive=%d/%d) — '
+            'filed %s instead of re-arming: %s',
+            task_id, streak, cap, MILESTONE_CHECK_STALLED_CATEGORY, render_verdict(verdict),
+        )
+        return outcome
+
+    def _emit_predicate_event(
+        self,
+        event_type: EventType,
+        task_id: str,
+        *,
+        consecutive: int,
+        next_check_at: datetime | None,
+        recheck_secs: int,
+        verdict: dict | None,
+    ) -> None:
+        event_store = getattr(self.scheduler, 'event_store', None)
+        if event_store is None:
+            return
+        event_store.emit(
+            event_type,
+            task_id=task_id,
+            data={
+                'rc': os.EX_TEMPFAIL,
+                'consecutive': consecutive,
+                'stall_cap': self._predicate_recheck_stall_cap,
+                'recheck_secs': recheck_secs,
+                'next_check_at': next_check_at.isoformat() if next_check_at else None,
+                'verdict': verdict,
+            },
+        )
 
     # ------------------------------------------------------------------
     # before_done deploy script execution — shared by run()'s named-target
@@ -3264,7 +3569,9 @@ class DeterministicRunner:
             inner_timeout_detail = '\n'.join([
                 description,
                 note,
-                *_script_timeout_fact_lines(exc, script=before_done['script']),
+                *_script_timeout_fact_lines(
+                    exc, script=self._before_done_paths(before_done).script,
+                ),
                 'before_done_ran_at is already stamped (I1) — the deploy is NOT re-run.',
             ])
             return await self._file_infra_issue_and_block(
@@ -4347,10 +4654,11 @@ class DeterministicRunner:
                     baseline_main_pid=baseline.get('MainPID', 0),
                     inspect_timeout_secs=self._inspect_timeout_secs,
                 )
+                paths = self._before_done_paths(before_done)
                 plan = RestartPlan(
-                    script=Path(before_done['script']),
+                    script=paths.script,
                     args=list(before_done.get('args') or []),
-                    cwd=Path(before_done.get('cwd') or os.getcwd()).resolve(),
+                    cwd=paths.cwd,
                     target_unit=target_unit,
                     # own_unit must be truthy and provably non-self here (this
                     # branch is only reached when the runner's OWN self_target
@@ -4404,7 +4712,7 @@ class DeterministicRunner:
                     inner_timeout_detail = '\n'.join([
                         description,
                         f'Target unit: {target_unit}',
-                        *_script_timeout_fact_lines(exc, script=before_done['script']),
+                        *_script_timeout_fact_lines(exc, script=paths.script),
                         'The post-deploy fresh-PID verify never ran, so the unit state '
                         'after the timeout is unobserved — check it out-of-band (e.g. '
                         'systemctl --user status) before resolving.',

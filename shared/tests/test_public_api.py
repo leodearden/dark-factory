@@ -93,16 +93,19 @@ class TestModuleLevelAll:
 
         assert hasattr(cli_invoke, '__all__'), 'cli_invoke must define __all__'
         assert set(cli_invoke.__all__) == {
+            'BUDGET_EXHAUSTED_SUBTYPE',
             'CAP_HIT_RESUME_PROMPT',
             'CRASH_RECOVERY_RESUME_PROMPT',
             'AgentFailureClass',
             'AgentFailureKind',
             'AgentResult',
+            'PromptBuilder',
             'AllAccountsCappedException',
             'TranscriptEvidence',
             'build_failure_message',
             'classify_agent_failure',
             'classify_cap_kill',
+            'claude_binary_spec',
             'count_transcript_turns',
             'detect_ended_awaiting_background',
             'detect_resumable_progress',
@@ -117,6 +120,7 @@ class TestModuleLevelAll:
             'note_unreadable_transcript',
             'read_transcript_records',
             'require_non_blank_prompt',
+            'resolve_claude_binary',
             'resumable_progress_for_session',
             'transcript_evidence',
             'transcript_evidence_for_session',

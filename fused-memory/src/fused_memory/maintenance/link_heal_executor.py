@@ -1,8 +1,15 @@
-"""Link-heal runs (plans/write-triage-link-healing-prd.md H1).
+"""Link-heal runs (plans/write-triage-link-healing-prd.md H1, H2).
 
 A plan run decides every live link, ledgers the heals it stands behind and
 writes the plan document: a deterministic rendering of every pending heal,
-whose sha256 an operator can approve. It writes nothing to the store.
+whose sha256 an operator can approve. It writes nothing to the store, and
+files nothing: every escape it would raise is recorded as ``would_escape``.
+Its verdicts come from the hand-link corpus (:func:`run_plan`) or from the
+link adjudicator (:func:`run_adjudicator_plan`), which is asked only about the
+links no deterministic row decides and that it has not judged at their
+current texts; its verdicts are ledgered as adjudications. A deterministic
+plan is :func:`run_plan` with no verdicts at all: only the deterministic rows
+plan a heal, and every other link is reported unexamined.
 
 An apply run drains the pending heals oldest first. Each heal re-reads its
 record live, and is skipped when the record no longer shows what it was
@@ -10,7 +17,9 @@ planned against; otherwise it sends exactly one write, then re-reads the
 record to verify it. An unattended run makes at most ``max_actions_per_run``
 write attempts and escalates a backlog beyond its multiple; an operator who
 approves the exact pending plan by sha lifts both. Any run stops, and
-escalates, after ``write_failure_streak`` consecutive failed heals.
+escalates, after ``write_failure_streak`` consecutive failed heals. An apply
+whose pending heals rest on adjudications that are too often misfile or
+CORRECTS writes nothing and escalates; only raising the ceiling lifts that.
 
 An undo run takes every heal one apply run applied back to its pre-image,
 newest first. Each step is corroborated against the image it expects and
@@ -37,18 +46,30 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 from shared.safe_io import atomic_write_text
+from shared.streak import KeyedStreaks
 
+from fused_memory.maintenance.link_adjudicator import LinkAdjudicator, LinkPair, LinkVerdict
 from fused_memory.maintenance.link_heal import (
     COMPLETION_ACTIONS,
+    MISFILE_VERDICTS,
+    BasisSource,
     LinkBasis,
     LinkImage,
+    LinkReads,
+    LinkState,
+    Plan,
     PlannedAction,
     RunCounts,
     StaleField,
+    Verdict,
     apply_change,
     build_plan,
     corroboration_mismatch,
+    corroboration_reads_parent,
     journal_reason,
+    needs_verdict,
+    plan_links,
+    read_links,
     undo_changes,
     verification_mismatch,
 )
@@ -56,13 +77,16 @@ from fused_memory.maintenance.link_heal_ledger import (
     UNDO_ACTION,
     ActionRow,
     ActionState,
+    AdjudicationRecord,
+    AdjudicationRow,
     LinkHealLedger,
-    RunRow,
     RunSource,
+    UndoTarget,
 )
 from fused_memory.maintenance.link_heal_store import (
     LinkCensus,
     LinkHealStore,
+    LiveRecord,
     MetadataChange,
     StoreReadFailed,
 )
@@ -75,11 +99,18 @@ logger = logging.getLogger(__name__)
 
 BACKLOG_ANCHOR = 'link-heal-backlog'
 WRITE_FAILURE_ANCHOR = 'link-heal-write-failure'
+MISFILE_SHARE_ANCHOR = 'link-heal-misfile-share'
+CORRECTS_SHARE_ANCHOR = 'link-heal-corrects-share'
+ADJUDICATOR_ANCHOR = 'link-heal-adjudicator'
+
+#: A share ceiling judges only a run with at least this many adjudicated pairs.
+SHARE_ESCAPE_MIN_PAIRS = 20
 
 PLAN_FORMAT = 'link-heal-plan/1'
 
 CAP_BIT = 'max_actions_per_run'
 STREAK_STOP = 'write_failure_streak'
+SHARE_STOP = 'adjudicated_share_ceiling'
 PLAN_DOCUMENT_STOP = 'plan_document_unwritten'
 
 
@@ -88,6 +119,8 @@ class RunLimits:
     max_actions_per_run: int
     backlog_multiplier: int
     write_failure_streak: int
+    misfile_share_ceiling: float
+    corrects_share_ceiling: float
 
     @classmethod
     def from_config(cls, config: LinkHealConfig) -> RunLimits:
@@ -95,6 +128,8 @@ class RunLimits:
             max_actions_per_run=config.max_actions_per_run,
             backlog_multiplier=config.backlog_multiplier,
             write_failure_streak=config.write_failure_streak,
+            misfile_share_ceiling=config.misfile_share_ceiling,
+            corrects_share_ceiling=config.corrects_share_ceiling,
         )
 
 
@@ -155,6 +190,81 @@ def write_failure_escape(
     )
 
 
+def share_escapes(
+    verdicts: Sequence[Verdict], limits: RunLimits, *, projects: Sequence[str],
+) -> tuple[Escape, ...]:
+    """The share escapes *verdicts* trip: a misfile or CORRECTS share over its ceiling."""
+    if len(verdicts) < SHARE_ESCAPE_MIN_PAIRS:
+        return ()
+    escapes = (
+        _share_escape(
+            verdicts, MISFILE_VERDICTS, limits.misfile_share_ceiling,
+            anchor=MISFILE_SHARE_ANCHOR, label='misfile', projects=projects,
+        ),
+        _share_escape(
+            verdicts, frozenset({Verdict.CORRECTS}), limits.corrects_share_ceiling,
+            anchor=CORRECTS_SHARE_ANCHOR, label='CORRECTS', projects=projects,
+        ),
+    )
+    return tuple(escape for escape in escapes if escape is not None)
+
+
+def adjudicated_share_escapes(
+    heals: Sequence[ActionRow],
+    ledger: LinkHealLedger,
+    limits: RunLimits,
+    *,
+    projects: Sequence[str],
+) -> tuple[Escape, ...]:
+    """The share escapes of the adjudications behind *heals*: every one, made or reused,
+    that the plan runs which staged them rest on. A plan run forecasts with it; apply gates on it."""
+    verdicts = ledger.adjudication_verdicts({row.run_id for row in heals})
+    return share_escapes(verdicts, limits, projects=projects)
+
+
+def _share_escape(
+    verdicts: Sequence[Verdict],
+    counted: frozenset[Verdict],
+    ceiling: float,
+    *,
+    anchor: str,
+    label: str,
+    projects: Sequence[str],
+) -> Escape | None:
+    count = sum(verdict in counted for verdict in verdicts)
+    share = count / len(verdicts)
+    if share <= ceiling:
+        return None
+    return Escape(
+        anchor=anchor,
+        summary=(
+            f'link-heal: {count} of {len(verdicts)} adjudicated pairs are {label} '
+            f'(share {share:.2f} > ceiling {ceiling})'
+        ),
+        detail={
+            'n': len(verdicts),
+            'count': count,
+            'share': share,
+            'ceiling': ceiling,
+            'projects': list(projects),
+        },
+    )
+
+
+def adjudicator_storm_escape(
+    summary: Mapping[str, Any], *, projects: Sequence[str],
+) -> Escape:
+    """The escape for a link adjudicator that stopped on consecutive failed shards."""
+    return Escape(
+        anchor=ADJUDICATOR_ANCHOR,
+        summary=(
+            f'link adjudicator ({summary.get("model")}) stopped after '
+            f'{summary.get("count")} consecutive failed shards'
+        ),
+        detail={**summary, 'projects': list(projects)},
+    )
+
+
 def render_escape_detail(detail: Mapping[str, Any]) -> str:
     """Sorted ``key: value`` lines; a non-string value renders as JSON."""
     return '\n'.join(
@@ -185,6 +295,32 @@ _ESCAPE_ROUTES: Mapping[str, _EscapeRoute] = MappingProxyType({
             'carries the failure and error_type). Check that the server is healthy and '
             'that mem0_update.metadata_patch_allowed_agent_prefixes admits link-heal-, '
             'then re-run apply.'
+        ),
+    ),
+    MISFILE_SHARE_ANCHOR: _EscapeRoute(
+        category='risk_identified',
+        suggested_action=(
+            'Review the plan document (`fused-memory/scripts/link_heal.py status`) and the '
+            'adjudicator plan runs\' verdicts in link_heal.db\'s adjudications table. If the '
+            'misfile share is real, raise link_heal.misfile_share_ceiling and re-run apply; '
+            'otherwise fix the adjudicator and re-plan.'
+        ),
+    ),
+    CORRECTS_SHARE_ANCHOR: _EscapeRoute(
+        category='risk_identified',
+        suggested_action=(
+            'Review the plan document (`fused-memory/scripts/link_heal.py status`) and the '
+            'adjudicator plan runs\' verdicts in link_heal.db\'s adjudications table. If the '
+            'CORRECTS share is real, raise link_heal.corrects_share_ceiling and re-run apply; '
+            'otherwise fix the adjudicator and re-plan.'
+        ),
+    ),
+    ADJUDICATOR_ANCHOR: _EscapeRoute(
+        category='infra_issue',
+        suggested_action=(
+            'The link adjudicator\'s Claude CLI shards kept failing (the detail\'s labels '
+            'name how). Check that the CLI is logged in and that link_heal.adjudicator_model '
+            'names a usable model, then re-run `link_heal.py plan --from-adjudicator`.'
         ),
     ),
 })
@@ -242,6 +378,11 @@ def render_plan_document(rows: Iterable[ActionRow]) -> bytes:
 
 def plan_sha256(document: bytes) -> str:
     return hashlib.sha256(document).hexdigest()
+
+
+def pending_plan_sha256(pending: Sequence[ActionRow]) -> str:
+    """The sha an --approved-plan-sha is checked against: that of the plan document *pending* renders."""
+    return plan_sha256(render_plan_document(pending))
 
 
 def _plan_entry(row: ActionRow) -> dict[str, Any]:
@@ -312,7 +453,29 @@ async def run_plan(
     """
     plan = await build_plan(bases, store=store, census=census, projects=projects)
     run_id = ledger.start_run(source, writes=False)
-    plan_path = plan_path_for(run_id)
+    return await _publish_plan(
+        plan, run_id,
+        ledger=ledger, limits=limits, projects=projects, source=source,
+        plan_path=plan_path_for(run_id),
+    )
+
+
+async def _publish_plan(
+    plan: Plan,
+    run_id: str,
+    *,
+    ledger: LinkHealLedger,
+    limits: RunLimits,
+    projects: Sequence[str],
+    source: RunSource,
+    plan_path: Path,
+    escapes: Sequence[Escape] = (),
+) -> RunReport:
+    """Stage *plan* against the ledger, write its document, and finish *run_id*.
+
+    *escapes*, and the backlog and share escapes an apply of *source*'s pending
+    heals would raise now, are recorded as ``would_escape``.
+    """
     staged = _stage(plan.actions, ledger)
     counts = replace(
         plan.counts,
@@ -331,10 +494,159 @@ async def run_plan(
         ledger.finish_run(run_id, counts=counts.as_json())
         return RunReport(run_id=run_id, counts=counts)
     sha = plan_sha256(document)
-    escape = backlog_escape(len(pending), limits, projects=projects)
-    counts = replace(counts, would_escape=() if escape is None else (escape.anchor,))
-    ledger.finish_run(run_id, counts=counts.as_json(), plan_sha256=sha)
+    backlog = backlog_escape(len(pending), limits, projects=projects)
+    shares = adjudicated_share_escapes(pending, ledger, limits, projects=projects)
+    would_escape = tuple(
+        escape.anchor for escape in (backlog, *shares, *escapes) if escape is not None
+    )
+    counts = replace(counts, would_escape=would_escape)
+    ledger.finish_run(run_id, counts=counts.as_json(), plan_sha256=sha, plan_path=plan_path)
     return RunReport(run_id=run_id, counts=counts, plan_sha256=sha, plan_path=plan_path)
+
+
+@dataclass(frozen=True)
+class _Candidate:
+    """A link the verdict rows decide, with the parent the verdict judges it against."""
+
+    state: LinkState
+    parent: LiveRecord
+
+    @property
+    def child_id(self) -> str:
+        return self.state.child.memory_id
+
+    @property
+    def key(self) -> str:
+        return f'{self.state.project_id}:{self.child_id}'
+
+    def pair(self) -> LinkPair:
+        return LinkPair(key=self.key, child_text=self.state.child.text, parent_text=self.parent.text)
+
+    def judged(self, ledger: LinkHealLedger) -> AdjudicationRow | None:
+        return ledger.adjudication_at(
+            self.state.project_id, self.child_id, self.parent.memory_id,
+            self.state.child.text_sha256, self.parent.text_sha256,
+        )
+
+    def record(self, verdict: LinkVerdict) -> AdjudicationRecord | None:
+        if verdict.verdict is None:
+            return None
+        return AdjudicationRecord(
+            project_id=self.state.project_id,
+            child_id=self.child_id,
+            parent_id=self.parent.memory_id,
+            child_sha256=self.state.child.text_sha256,
+            parent_sha256=self.parent.text_sha256,
+            verdict=verdict.verdict,
+            reason=verdict.reason,
+            model=verdict.model,
+        )
+
+
+def _candidates(reads: LinkReads) -> list[_Candidate]:
+    return [
+        _Candidate(state=state, parent=state.parent)
+        for state in reads.states
+        if state.parent is not None and needs_verdict(state)
+    ]
+
+
+def _adjudicator_basis(adjudication_id: int, record: AdjudicationRecord) -> LinkBasis:
+    return LinkBasis(
+        project_id=record.project_id,
+        child_id=record.child_id,
+        parent_id=record.parent_id,
+        verdict=record.verdict,
+        child_sha256=record.child_sha256,
+        parent_sha256=record.parent_sha256,
+        source=BasisSource.ADJUDICATOR,
+        key=str(adjudication_id),
+    )
+
+
+@dataclass(frozen=True)
+class _Adjudicated:
+    """What a plan run learned about its candidates, before anything is ledgered."""
+
+    reused: tuple[AdjudicationRow, ...]
+    records: tuple[AdjudicationRecord, ...]
+    failed: int
+    storms: tuple[Mapping[str, Any], ...]
+
+    def storm_escapes(self, projects: Sequence[str]) -> tuple[Escape, ...]:
+        return tuple(adjudicator_storm_escape(storm, projects=projects) for storm in self.storms)
+
+
+async def _adjudicate(
+    candidates: Sequence[_Candidate], ledger: LinkHealLedger, adjudicate: LinkAdjudicator,
+) -> _Adjudicated:
+    """Reuse each candidate's ledgered verdict at its current texts; ask about the rest."""
+    reused: list[AdjudicationRow] = []
+    asked: list[_Candidate] = []
+    for candidate in candidates:
+        row = candidate.judged(ledger)
+        if row is None:
+            asked.append(candidate)
+        else:
+            reused.append(row)
+    storms: list[Mapping[str, Any]] = []
+    verdicts = (
+        await adjudicate([candidate.pair() for candidate in asked], on_failure_storm=storms.append)
+        if asked
+        else []
+    )
+    answered = (candidate.record(verdict) for candidate, verdict in zip(asked, verdicts, strict=True))
+    records = tuple(record for record in answered if record is not None)
+    return _Adjudicated(
+        reused=tuple(reused),
+        records=records,
+        failed=len(verdicts) - len(records),
+        storms=tuple(storms),
+    )
+
+
+async def run_adjudicator_plan(
+    *,
+    adjudicate: LinkAdjudicator,
+    store: LinkHealStore,
+    census: LinkCensus,
+    ledger: LinkHealLedger,
+    limits: RunLimits,
+    projects: Sequence[str],
+    plan_path_for: Callable[[str], Path],
+) -> RunReport:
+    """A non-writing run planning heals from the link adjudicator's verdicts.
+
+    The adjudicator is asked only about the links the verdict rows decide and
+    that the ledger holds no adjudication of at their current texts. Every read
+    and every question is made before the run row exists. The run rests on the
+    adjudications it makes and on those it reuses. A failed verdict is counted,
+    never ledgered; a share over its ceiling and a failure storm are recorded as
+    ``would_escape``, never filed.
+    """
+    reads = await read_links(store, census, projects)
+    adjudicated = await _adjudicate(_candidates(reads), ledger, adjudicate)
+    run_id = ledger.start_run(RunSource.ADJUDICATOR, writes=False)
+    new_ids = ledger.add_adjudications(run_id, adjudicated.records)
+    ledger.reuse_adjudications(run_id, [row.adjudication_id for row in adjudicated.reused])
+    bases = [
+        *(_adjudicator_basis(row.adjudication_id, row.record) for row in adjudicated.reused),
+        *(
+            _adjudicator_basis(adjudication_id, record)
+            for adjudication_id, record in zip(new_ids, adjudicated.records, strict=True)
+        ),
+    ]
+    plan = plan_links(reads, bases)
+    counts = replace(
+        plan.counts,
+        adjudications_reused=len(adjudicated.reused),
+        adjudication_failed=adjudicated.failed,
+    )
+    return await _publish_plan(
+        replace(plan, counts=counts), run_id,
+        ledger=ledger, limits=limits, projects=projects, source=RunSource.ADJUDICATOR,
+        plan_path=plan_path_for(run_id), escapes=adjudicated.storm_escapes(projects),
+    )
 
 
 def link_heal_agent_id(run_id: str) -> str:
@@ -362,10 +674,15 @@ def _read_failure(phase: str, failure: StoreReadFailed) -> dict[str, Any]:
 
 
 async def _corroborate(store: LinkHealStore, heal: PlannedAction) -> StaleField | None:
-    """Re-read the child, its parent and (for a completion) its children, live."""
+    """Re-read the child, its parent when the heal rests on it, and (for a
+    completion) its children, live."""
     child = await store.read(heal.project_id, heal.child_id)
     parent_id = heal.pre_image.parent_id
-    parent = None if parent_id is None else await store.read(heal.project_id, parent_id)
+    parent = (
+        await store.read(heal.project_id, parent_id)
+        if parent_id is not None and corroboration_reads_parent(heal)
+        else None
+    )
     child_count = (
         await store.count_children(heal.project_id, heal.child_id)
         if heal.action in COMPLETION_ACTIONS
@@ -435,32 +752,44 @@ class ApprovalMismatch(ValueError):
 
 
 def _check_approval(approved: str, pending: Sequence[ActionRow]) -> None:
-    actual = plan_sha256(render_plan_document(pending))
+    actual = pending_plan_sha256(pending)
     if actual != approved:
         raise ApprovalMismatch(expected=approved, actual=actual)
 
 
 @dataclass
 class _Drain:
-    """What one apply run's drain has come to so far."""
+    """What one apply run's drain has come to so far; the drain is one failure run."""
 
+    failures: KeyedStreaks[None]
     outcomes: Counter[ActionState] = field(default_factory=Counter)
     writes: int = 0
-    streak: int = 0
     last_failure: Mapping[str, Any] | None = None
     not_attempted: int = 0
     stopped_by: str | None = None
 
-    def record(self, outcome: _Outcome) -> None:
-        """A failure extends the streak, an applied heal resets it, a skip leaves it."""
+    @classmethod
+    def for_limit(cls, limit: int) -> _Drain:
+        return cls(failures=KeyedStreaks(threshold=limit))
+
+    @property
+    def streak(self) -> int:
+        return self.failures.count(None)
+
+    def record(self, outcome: _Outcome) -> bool:
+        """Count *outcome*; True when this failure brings the streak to the limit.
+
+        A failure extends the streak, an applied heal resets it, a skip leaves it.
+        """
         self.outcomes[outcome.state] += 1
         if outcome.wrote:
             self.writes += 1
         if outcome.state is ActionState.FAILED:
-            self.streak += 1
             self.last_failure = outcome.detail
-        elif outcome.state is ActionState.APPLIED:
-            self.streak = 0
+            return self.failures.failure(None).fired
+        if outcome.state is ActionState.APPLIED:
+            self.failures.success(None)
+        return False
 
     def stop(self, *, not_attempted: int) -> None:
         self.stopped_by = STREAK_STOP
@@ -477,15 +806,14 @@ async def _drain(
     streak_limit: int,
 ) -> _Drain:
     """Heal *pending* in order until *cap* write attempts or *streak_limit* failures."""
-    drain = _Drain()
+    drain = _Drain.for_limit(streak_limit)
     for index, row in enumerate(pending):
         if cap is not None and drain.writes >= cap:
             outcome = _Outcome(ActionState.SKIPPED_CAP)
         else:
             outcome = await _heal_one(row.planned, store=store, run_id=run_id)
         ledger.set_outcome(row.action_id, outcome.state, run_id, outcome.detail)
-        drain.record(outcome)
-        if drain.streak >= streak_limit:
+        if drain.record(outcome):
             drain.stop(not_attempted=len(pending) - index - 1)
             break
     return drain
@@ -507,7 +835,9 @@ async def run_apply(
     """A writing run: heal the pending rows of *source*, oldest first.
 
     Raises :class:`ApprovalMismatch` before any run row when an approved sha
-    is not the pending plan's.
+    is not the pending plan's. When the adjudications behind the pending heals
+    trip a share ceiling, it files each share escape and writes nothing,
+    attended or not.
     """
     pending = ledger.pending_actions(source)
     attended = approved_plan_sha256 is not None
@@ -515,6 +845,13 @@ async def run_apply(
         _check_approval(approved_plan_sha256, pending)
     run_id = ledger.start_run(source, writes=True)
     projects = _projects(pending)
+    refusal = _share_refusal(
+        pending, ledger=ledger, limits=limits, filer=filer, projects=projects,
+        approved_plan_sha256=approved_plan_sha256,
+    )
+    if refusal is not None:
+        ledger.finish_run(run_id, counts=refusal.as_json())
+        return RunReport(run_id=run_id, counts=refusal)
     escaped = () if attended else _file(
         filer, backlog_escape(len(pending), limits, projects=projects),
     )
@@ -533,6 +870,29 @@ async def run_apply(
     )
     ledger.finish_run(run_id, counts=counts.as_json())
     return RunReport(run_id=run_id, counts=counts)
+
+
+def _share_refusal(
+    pending: Sequence[ActionRow],
+    *,
+    ledger: LinkHealLedger,
+    limits: RunLimits,
+    filer: EscapeFiler,
+    projects: Sequence[str],
+    approved_plan_sha256: str | None,
+) -> RunCounts | None:
+    """File the share escapes the adjudications behind *pending* trip; ``None`` when none does."""
+    escapes = adjudicated_share_escapes(pending, ledger, limits, projects=projects)
+    if not escapes:
+        return None
+    return RunCounts(
+        planned=len(pending),
+        planned_by_action=Counter(row.planned.action.value for row in pending),
+        not_attempted=len(pending),
+        escaped=tuple(entry for escape in escapes for entry in _file(filer, escape)),
+        stopped_by=SHARE_STOP,
+        approved_plan_sha256=approved_plan_sha256,
+    )
 
 
 def _drain_counts(
@@ -613,15 +973,14 @@ async def _undo_heal(
 
 
 async def run_undo(
-    target: RunRow, *, store: LinkHealStore, ledger: LinkHealLedger, limits: RunLimits,
+    target: UndoTarget, *, store: LinkHealStore, ledger: LinkHealLedger, limits: RunLimits,
 ) -> RunReport:
-    """A writing run taking back every heal *target* applied, newest first."""
-    heals = ledger.applied_actions(target.run_id)[::-1]
+    """A writing run taking back every heal *target* still has applied, newest first."""
+    heals = target.heals[::-1]
     run_id = ledger.start_run(RunSource.UNDO, writes=True)
-    drain = _Drain()
+    drain = _Drain.for_limit(limits.write_failure_streak)
     for index, row in enumerate(heals):
-        drain.record(await _undo_heal(row, store=store, ledger=ledger, run_id=run_id))
-        if drain.streak >= limits.write_failure_streak:
+        if drain.record(await _undo_heal(row, store=store, ledger=ledger, run_id=run_id)):
             drain.stop(not_attempted=len(heals) - index - 1)
             break
     counts = _drain_counts(heals, drain)

@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # scripts/warm-lane-gc-sweep.sh — Periodic GC backstop for the warm-lane CoW pool.
 #
-# Invokes warm-lane-gc.sh reclaim --mount <worktree_base> unconditionally on each
-# run (no disk-guard gate — the point is to reclaim FREE divergent lanes proactively
-# to PREVENT monotonic accretion BETWEEN acquires, before the disk floor is reached).
+# In mode `full` (the default) it invokes warm-lane-gc.sh reclaim --mount
+# <worktree_base> unconditionally on each run (no disk-guard gate — the point is to
+# reclaim FREE divergent lanes proactively to PREVENT monotonic accretion BETWEEN
+# acquires, before the disk floor is reached). In mode `trash-and-emergency` it
+# invokes gc.sh only when the emergency floor below engages --disk-pressure; see
+# REIFY_WARM_LANE_GC_SWEEP_MODE.
 #
 # Driven by deploy/systemd/reify-warm-lane-gc.timer (periodic oneshot).
 # The on-demand dark-factory ε path (disk-guard check → reclaim → requeue on low disk)
@@ -85,21 +88,30 @@
 #                      space-consuming reseed once free is critically low.
 #                      A df failure or unparseable measurement falls back to
 #                      plain reclaim (fail-to-α: --disk-pressure engages ONLY
-#                      on a positive low-water measurement).
+#                      on a positive low-water measurement) — or, in mode
+#                      trash-and-emergency, to no reclaim at all.
 #   -h, --help         Print this message and exit 0.
 #
 # Exit codes:
 #   0  — Sweep attempted or skipped (fail-open).
 #   1  — Runtime error propagated from gc.sh.
-#   2  — Usage/WIRING error: unknown flag, non-integer --critical-free-gib, or a
-#        missing sibling library (scripts/lib_live_refs.sh — an incomplete
-#        deployment, which no retry fixes). Matches warm-lane-gc.sh's taxonomy.
+#   2  — Usage/WIRING error: unknown flag, non-integer --critical-free-gib, an
+#        unknown REIFY_WARM_LANE_GC_SWEEP_MODE, or a missing sibling library
+#        (scripts/lib_live_refs.sh — an incomplete deployment, which no retry
+#        fixes). Matches warm-lane-gc.sh's taxonomy.
 #
 # Env knobs:
 #   REIFY_WARM_LANE_GC_SWEEP_MOUNT               — default --mount
 #   REIFY_WARM_LANE_GC_SWEEP_GC_SCRIPT           — default --gc-script
 #   REIFY_WARM_LANE_GC_SWEEP_DF                  — default --df
 #   REIFY_WARM_LANE_GC_SWEEP_CRITICAL_FREE_GIB   — default --critical-free-gib
+#   REIFY_WARM_LANE_GC_SWEEP_MODE                — `full` (default; also empty or
+#       unset) or `trash-and-emergency`: reap trash and measure the floor as in
+#       `full`, but invoke gc.sh only when the floor engages --disk-pressure;
+#       routine Pass-1 reclaim is then the orchestrator arm's. Anything else exits
+#       2. Environment= ONLY, with no flag: reify's install-warm-lane-units.sh
+#       rewrites ExecStart and strips flags, so the unit file's Environment= stays
+#       the single switch (README.md "Delta 14").
 
 set -euo pipefail
 
@@ -158,7 +170,12 @@ Usage: $(basename "$0") [--mount DIR] [--gc-script PATH] [--df CMD] [--critical-
     0  — Sweep attempted or skipped (fail-open on missing mount).
     1  — Runtime error from gc.sh.
     2  — Usage/wiring error: unknown flag, non-integer --critical-free-gib,
-         or a missing sibling scripts/lib_live_refs.sh.
+         an unknown REIFY_WARM_LANE_GC_SWEEP_MODE, or a missing sibling
+         scripts/lib_live_refs.sh.
+
+  Env: REIFY_WARM_LANE_GC_SWEEP_MODE=full (default) | trash-and-emergency.
+       trash-and-emergency invokes warm-lane-gc.sh only when the floor engages
+       --disk-pressure; a df failure then means no reclaim at all.
 EOF
 }
 
@@ -263,6 +280,7 @@ MOUNT="${REIFY_WARM_LANE_GC_SWEEP_MOUNT:-/home/leo/src/warm-lanes/worktrees}"
 GC_SCRIPT="${REIFY_WARM_LANE_GC_SWEEP_GC_SCRIPT:-$SCRIPT_DIR/warm-lane-gc.sh}"
 DF="${REIFY_WARM_LANE_GC_SWEEP_DF:-df}"
 CRITICAL_FREE_GIB="${REIFY_WARM_LANE_GC_SWEEP_CRITICAL_FREE_GIB:-2}"
+MODE="${REIFY_WARM_LANE_GC_SWEEP_MODE:-full}"
 
 # ── arg parsing ────────────────────────────────────────────────────────────────
 while [ $# -gt 0 ]; do
@@ -299,11 +317,20 @@ done
 # value feeds $(( CRITICAL_FREE_GIB * 1024^3 )) — a leading zero would be read
 # as OCTAL (08/09 error out leaving the variable unset, 010 silently means 8)
 # and a huge value would wrap negative on 64-bit and invert the comparison.
-if ! printf '%s\n' "$CRITICAL_FREE_GIB" | grep -qE '^(0|[1-9][0-9]{0,4})$'; then
+if ! [[ "$CRITICAL_FREE_GIB" =~ ^(0|[1-9][0-9]{0,4})$ ]]; then
     _warn "REIFY_WARM_LANE_GC_SWEEP_CRITICAL_FREE_GIB (or --critical-free-gib) is not a valid integer (0-99999, no leading zeros): '$CRITICAL_FREE_GIB'."
     _warn "Run '$(basename "$0") --help' for usage."
     exit 2
 fi
+
+# An enum validated loudly, before anything acts: a typo in a unit file fails the
+# unit visibly rather than silently meaning one mode or the other.
+case "$MODE" in
+    full|trash-and-emergency) ;;
+    *)
+        _warn "REIFY_WARM_LANE_GC_SWEEP_MODE must be 'full' or 'trash-and-emergency'; got: '$MODE'"
+        exit 2 ;;
+esac
 
 # ── fail-open: skip if mount dir does not exist ────────────────────────────────
 if [ ! -d "$MOUNT" ]; then
@@ -325,6 +352,7 @@ _reap_stale_trash "$MOUNT"
 # steady state never silently cold-ifies every reclaimable lane on every
 # periodic sweep.
 args=(reclaim --mount "$MOUNT")
+emergency=0
 
 df_out="$("$DF" -B1 --output=avail -- "$MOUNT")" || {
     _warn "df measurement failed (DF=$DF MOUNT=$MOUNT); proceeding without disk-pressure"
@@ -333,15 +361,21 @@ df_out="$("$DF" -B1 --output=avail -- "$MOUNT")" || {
 
 if [ -n "$df_out" ]; then
     avail_bytes="$(printf '%s\n' "$df_out" | awk 'NR==2{print $1}')"
-    if printf '%s\n' "$avail_bytes" | grep -qE '^[0-9]+$'; then
+    if [[ "$avail_bytes" =~ ^[0-9]+$ ]]; then
         critical_bytes=$(( CRITICAL_FREE_GIB * 1024 * 1024 * 1024 ))
         if [ "$avail_bytes" -le "$critical_bytes" ]; then
             _info "EMERGENCY low-water: avail=${avail_bytes} bytes <= floor=${critical_bytes} bytes (${CRITICAL_FREE_GIB} GiB) on $MOUNT — engaging --disk-pressure: reclaimable-lane resets now use rm -rf <lane>/target outright (free-before-reseed at true ENOSPC; acquire_lane re-seeds lazily per D10 §9.5; see esc-5058-5/esc-5114-1/esc-5115-2)"
             args+=(--disk-pressure)
+            emergency=1
         fi
     else
         _warn "df reported unparseable avail bytes (DF=$DF MOUNT=$MOUNT avail='${avail_bytes}'); proceeding without disk-pressure"
     fi
+fi
+
+if [ "$MODE" = trash-and-emergency ] && [ "$emergency" != 1 ]; then
+    _info "mode trash-and-emergency: free space on $MOUNT is above the ${CRITICAL_FREE_GIB} GiB floor or was unmeasured; routine Pass-1 reclaim is the orchestrator arm's, so $GC_SCRIPT is not invoked"
+    exit 0
 fi
 
 # ── invoke gc.sh reclaim --mount <MOUNT> [--disk-pressure] ────────────────────

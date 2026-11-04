@@ -18,13 +18,18 @@ import pytest
 from _fm_helpers import (
     extract_cypher,
     extract_params,
+    incomplete_paged_read,
     lease_dir_fixture,  # also activates the autouse lease-dir isolation here
     load_script_module,
     make_rebuild_detail,
 )
 from _graphiti_fake import FakeGraphitiClient
 
-from fused_memory.backends.graphiti_client import GraphitiBackend
+from fused_memory.backends.graphiti_client import (
+    INCOMPLETE_SHORT_READ,
+    GraphitiBackend,
+    PagedRead,
+)
 from fused_memory.models.scope import KNOWN_PROJECT_ROOTS_ENV
 
 CONFTEST_PATH = Path(__file__).parent / 'conftest.py'
@@ -215,7 +220,7 @@ class TestExtractParams:
 # ---------------------------------------------------------------------------
 
 class TestMakeEdgeBackend:
-    """make_edge_backend(backend, *, nodes, edges) wires the two-mock surface.
+    """make_edge_backend(backend, *, nodes, edges, nodes_read, edges_read) stubs the enumerate_* seam.
 
     Canonical usage::
 
@@ -228,31 +233,87 @@ class TestMakeEdgeBackend:
         result = make_edge_backend(backend, nodes=[], edges={})
         assert result is backend
 
-    def test_list_entity_nodes_is_async_mock(self, make_edge_backend):
-        """backend.list_entity_nodes is replaced with an AsyncMock."""
+    def test_enumerate_entity_nodes_is_async_mock(self, make_edge_backend):
+        """backend.enumerate_entity_nodes is replaced with an AsyncMock."""
         backend = MagicMock()
         make_edge_backend(backend, nodes=[], edges={})
-        assert isinstance(backend.list_entity_nodes, AsyncMock)
+        assert isinstance(backend.enumerate_entity_nodes, AsyncMock)
 
-    def test_get_all_valid_edges_is_async_mock(self, make_edge_backend):
-        """backend.get_all_valid_edges is replaced with an AsyncMock."""
+    def test_enumerate_all_valid_edges_is_async_mock(self, make_edge_backend):
+        """backend.enumerate_all_valid_edges is replaced with an AsyncMock."""
         backend = MagicMock()
         make_edge_backend(backend, nodes=[], edges={})
-        assert isinstance(backend.get_all_valid_edges, AsyncMock)
+        assert isinstance(backend.enumerate_all_valid_edges, AsyncMock)
 
-    def test_list_entity_nodes_return_value_equals_nodes_arg(self, make_edge_backend):
-        """list_entity_nodes.return_value equals the nodes kwarg passed to the factory."""
+    def test_shims_are_left_real_on_a_real_backend(
+        self, make_edge_backend, make_backend, mock_config,
+    ):
+        """The back-compat shims stay the backend's own bound methods.
+
+        They must keep delegating to the stubbed enumerate_* seam through the
+        shared completeness policy, so the factory never replaces them.
+        """
+        backend = make_edge_backend(make_backend(mock_config), nodes=[], edges={})
+        assert not isinstance(backend.list_entity_nodes, AsyncMock)
+        assert not isinstance(backend.get_all_valid_edges, AsyncMock)
+
+    @pytest.mark.asyncio
+    async def test_awaiting_enumerate_entity_nodes_yields_nodes_and_complete_read(
+        self, make_edge_backend,
+    ):
+        """Awaiting enumerate_entity_nodes() returns (nodes, PagedRead) complete by default."""
         nodes = [{'uuid': 'u1', 'name': 'Alice', 'summary': 'fact'}]
         backend = MagicMock()
         make_edge_backend(backend, nodes=nodes, edges={})
-        assert backend.list_entity_nodes.return_value == nodes
+        result_nodes, paged = await backend.enumerate_entity_nodes(group_id='test')
+        assert result_nodes == nodes
+        assert isinstance(paged, PagedRead)
+        assert paged.complete is True
+        assert paged.incomplete_kind is None
+        assert paged.rows_seen == len(nodes)
 
-    def test_get_all_valid_edges_return_value_equals_edges_arg(self, make_edge_backend):
-        """get_all_valid_edges.return_value equals the edges kwarg passed to the factory."""
-        edges = {'u1': [{'uuid': 'e1', 'fact': 'fact', 'name': 'rel'}]}
+    @pytest.mark.asyncio
+    async def test_awaiting_enumerate_all_valid_edges_yields_edges_and_complete_read(
+        self, make_edge_backend,
+    ):
+        """Awaiting enumerate_all_valid_edges() returns (edges, PagedRead) complete by default."""
+        edges = {
+            'u1': [{'uuid': 'e1', 'fact': 'fact', 'name': 'rel'}],
+            'u2': [
+                {'uuid': 'e1', 'fact': 'fact', 'name': 'rel'},
+                {'uuid': 'e2', 'fact': 'other', 'name': 'rel'},
+            ],
+        }
         backend = MagicMock()
         make_edge_backend(backend, nodes=[], edges=edges)
-        assert backend.get_all_valid_edges.return_value == edges
+        result_edges, paged = await backend.enumerate_all_valid_edges(group_id='test')
+        assert result_edges == edges
+        assert isinstance(paged, PagedRead)
+        assert paged.complete is True
+        assert paged.incomplete_kind is None
+        assert paged.rows_seen == 3
+
+    @pytest.mark.asyncio
+    async def test_nodes_read_is_returned_verbatim(self, make_edge_backend):
+        """An explicit nodes_read is the exact second element of the node stub."""
+        nodes_read = incomplete_paged_read(INCOMPLETE_SHORT_READ)
+        backend = MagicMock()
+        make_edge_backend(backend, nodes=[], edges={}, nodes_read=nodes_read)
+        _, paged = await backend.enumerate_entity_nodes(group_id='test')
+        assert paged is nodes_read
+        _, edges_paged = await backend.enumerate_all_valid_edges(group_id='test')
+        assert edges_paged.complete is True
+
+    @pytest.mark.asyncio
+    async def test_edges_read_is_returned_verbatim(self, make_edge_backend):
+        """An explicit edges_read is the exact second element of the edge stub."""
+        edges_read = incomplete_paged_read(INCOMPLETE_SHORT_READ)
+        backend = MagicMock()
+        make_edge_backend(backend, nodes=[], edges={}, edges_read=edges_read)
+        _, paged = await backend.enumerate_all_valid_edges(group_id='test')
+        assert paged is edges_read
+        _, nodes_paged = await backend.enumerate_entity_nodes(group_id='test')
+        assert nodes_paged.complete is True
 
     def test_nodes_is_keyword_only(self, make_edge_backend):
         """Calling with nodes as a positional argument raises TypeError."""
@@ -260,28 +321,13 @@ class TestMakeEdgeBackend:
         with pytest.raises(TypeError):
             make_edge_backend(backend, [], {})  # type: ignore[call-arg]
 
-    def test_edges_is_keyword_only(self, make_edge_backend):
-        """edges parameter has kind KEYWORD_ONLY in the factory signature."""
-        sig = inspect.signature(make_edge_backend)
-        assert sig.parameters['edges'].kind == inspect.Parameter.KEYWORD_ONLY
-
-    @pytest.mark.asyncio
-    async def test_awaiting_list_entity_nodes_yields_nodes(self, make_edge_backend):
-        """Awaiting backend.list_entity_nodes() returns the nodes list."""
-        nodes = [{'uuid': 'u1', 'name': 'Alice', 'summary': 'fact'}]
+    def test_a_read_cannot_be_passed_positionally(self, make_edge_backend):
+        """With nodes and edges by keyword, a second positional would bind to a read if one accepted it."""
         backend = MagicMock()
-        make_edge_backend(backend, nodes=nodes, edges={})
-        result = await backend.list_entity_nodes()
-        assert result == nodes
-
-    @pytest.mark.asyncio
-    async def test_awaiting_get_all_valid_edges_yields_edges(self, make_edge_backend):
-        """Awaiting backend.get_all_valid_edges() returns the edges dict."""
-        edges = {'u1': [{'uuid': 'e1', 'fact': 'fact', 'name': 'rel'}]}
-        backend = MagicMock()
-        make_edge_backend(backend, nodes=[], edges=edges)
-        result = await backend.get_all_valid_edges()
-        assert result == edges
+        with pytest.raises(TypeError, match='positional'):
+            make_edge_backend(  # type: ignore[misc]
+                backend, incomplete_paged_read(INCOMPLETE_SHORT_READ), nodes=[], edges={}
+            )
 
 
 # ---------------------------------------------------------------------------

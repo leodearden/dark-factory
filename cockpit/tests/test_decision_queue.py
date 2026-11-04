@@ -56,7 +56,6 @@ def _make_queue_item(**overrides) -> QueueItem:
         'filed_at': datetime(2026, 7, 1, tzinfo=UTC),
         'score': 1.0,
         'target': None,
-        'handling': False,
         'escalation_id': 'esc-1',
         'session_slug': None,
     }
@@ -743,16 +742,6 @@ class TestOrderQueue:
         )
 
         assert deferred[0].decision_id == 'dec-newer'
-
-    def test_handling_flag_reflected_on_item(self):
-        from cockpit.panes.decision_queue import order_queue
-        from cockpit.priority import Priorities
-
-        decision = _make_decision(id='dec-1', state=sr.DecisionState.OPEN)
-
-        items = order_queue([decision], [], Priorities.default(), _NOW, handling={'decision:dec-1'})
-
-        assert items[0].handling is True
 
     def test_escalation_id_populated_from_backing_record_for_both_kinds(self):
         """USER-OBSERVABLE SIGNAL (task 2517): the copy affordance needs the

@@ -1,0 +1,786 @@
+"""Reveals through the publisher: the engagement read, each request answered, each revealed file followed (PRD B11-B17)."""
+
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+import pytest
+from _git_repo import Repo, make_repo, path_with_git_killed_on
+from _in_dir import request_reveals, write_engagement
+from _stores import RunsDb, TasksDb
+
+from client_feed.contract import (
+    ENGAGEMENT_FILENAME,
+    FEED_FILENAME,
+    INBOX_FILENAME,
+    STATE_FILENAME,
+    Degradation,
+    FeedLine,
+    FeedState,
+    FileRevealed,
+    Heartbeat,
+    RefusalReason,
+    RevealBudget,
+    RevealRefused,
+    Source,
+    TreeSnapshot,
+    parse_state,
+)
+from client_feed.engagement import EngagementProjectMismatch
+from client_feed.feed_io import CURSOR_FILENAME, Cursor, OutDir, read_feed_lines
+from client_feed.policy import Policy
+from client_feed.publisher import PassReport, run_pass
+from client_feed.validate import validate_out_dir
+
+PROJECT = 'acme'
+BASE = datetime(2026, 10, 22, 10, 0, tzinfo=UTC)
+NOW = BASE + timedelta(hours=1)
+UNHELD_SHA = '9b1e4c7a2d5f8e0b3a6c9d2e5f8a1b4c7d0e3f6a'
+
+
+def at(minutes: float) -> datetime:
+    return BASE + timedelta(minutes=minutes)
+
+
+@dataclass(frozen=True)
+class Project:
+    """A root with empty stores and a committed main, its policy, and the portal's in_dir beside out_dir."""
+
+    repo: Repo
+    policy: Policy
+
+    @property
+    def in_dir(self) -> Path:
+        return self.policy.in_dir
+
+    @property
+    def out_dir(self) -> Path:
+        return self.policy.out_dir
+
+    def open(self) -> OutDir:
+        return OutDir.open(self.out_dir, project_id=PROJECT)
+
+    def run(self, *, minutes: float = 60) -> PassReport:
+        return run_pass(self.policy, self.open(), now=at(minutes))
+
+    def feed(self) -> tuple[FeedLine, ...]:
+        return read_feed_lines(self.out_dir)
+
+
+def make_project(
+    tmp_path: Path,
+    files: Mapping[str, str | bytes],
+    *,
+    links: Callable[[Repo], None] = lambda repo: None,
+    **policy_fields: Any,
+) -> Project:
+    """main's first commit c1 holds `files` and whatever `links` stages; the stores are made after it, untracked."""
+    repo = make_repo(tmp_path / 'repo')
+    repo.write('.gitignore', '.taskmaster/\ndata/\n')
+    for path, content in files.items():
+        repo.write(path, content)
+    links(repo)
+    repo.commit('c1', when=at(0))
+    TasksDb.create(repo.root)
+    RunsDb.create(repo.root)
+    out_dir = tmp_path / 'out'
+    out_dir.mkdir()
+    policy = Policy.model_validate(
+        {
+            'project_id': PROJECT,
+            'project_root': str(repo.root),
+            'out_dir': str(out_dir),
+            'in_dir': str(tmp_path / 'in'),
+            'visible_globs': ['src/**', 'tests/**'],
+            **policy_fields,
+        }
+    )
+    return Project(repo=repo, policy=policy)
+
+
+def heartbeats(project: Project) -> list[Heartbeat]:
+    return [line for line in project.feed() if isinstance(line, Heartbeat)]
+
+
+def engagement_degradation(report: PassReport) -> Degradation:
+    (degradation,) = report.degraded
+    assert degradation.source is Source.ENGAGEMENT
+    return degradation
+
+
+@pytest.fixture
+def small(tmp_path: Path) -> Project:
+    return make_project(tmp_path, {'src/a.py': 'a = 1\n', 'tests/test_a.py': 'def test_a():\n    pass\n'})
+
+
+def test_every_heartbeat_echoes_the_engagement_version_it_applied(small: Project) -> None:
+    write_engagement(small.in_dir, project_id=PROJECT, version=1)
+    small.run(minutes=60)
+    small.run(minutes=61)
+    write_engagement(small.in_dir, project_id=PROJECT, version=2)
+    small.run(minutes=62)
+
+    assert [beat.engagement_version for beat in heartbeats(small)] == [1, 1, 2]
+
+
+def _publishes_every_other_source(project: Project, report: PassReport) -> None:
+    (beat,) = heartbeats(project)
+    assert beat.engagement_version is None
+    assert beat.degraded == report.degraded
+    assert {'factory_state', 'branch_snapshot', 'tree_snapshot', 'heartbeat'} <= {
+        line.type for line in project.feed()
+    }
+    assert validate_out_dir(project.out_dir, expected_project_id=PROJECT).ok
+
+
+def test_a_missing_engagement_is_degraded_and_every_other_source_still_publishes(
+    small: Project,
+) -> None:
+    report = small.run()
+
+    assert 'missing' in engagement_degradation(report).reason
+    _publishes_every_other_source(small, report)
+
+
+def test_an_unparsable_engagement_is_degraded_as_invalid(small: Project) -> None:
+    small.in_dir.mkdir()
+    (small.in_dir / ENGAGEMENT_FILENAME).write_text('{"engagement_version": ')
+
+    report = small.run()
+
+    assert 'invalid' in engagement_degradation(report).reason
+    _publishes_every_other_source(small, report)
+
+
+def test_a_delivered_commit_the_repository_does_not_hold_is_degraded_naming_it(
+    small: Project,
+) -> None:
+    write_engagement(small.in_dir, project_id=PROJECT, delivered=UNHELD_SHA)
+
+    report = small.run()
+
+    assert UNHELD_SHA in engagement_degradation(report).reason
+    _publishes_every_other_source(small, report)
+
+
+def _out_bytes(project: Project) -> dict[str, bytes]:
+    names = (FEED_FILENAME, STATE_FILENAME, CURSOR_FILENAME)
+    return {name: (project.out_dir / name).read_bytes() for name in names}
+
+
+def test_an_engagement_of_another_project_stops_the_pass_before_anything_is_appended(
+    small: Project,
+) -> None:
+    write_engagement(small.in_dir, project_id=PROJECT)
+    small.run(minutes=60)
+    before = _out_bytes(small)
+    write_engagement(small.in_dir, project_id='other')
+
+    with pytest.raises(EngagementProjectMismatch):
+        small.run(minutes=61)
+
+    assert _out_bytes(small) == before
+
+
+def numbered(name: str, count: int) -> str:
+    return ''.join(f'{name}{index} = {index}\n' for index in range(count))
+
+
+B_FILES: Mapping[str, str | bytes] = {
+    'src/a.py': numbered('a', 200),
+    'src/b.py': numbered('b', 210),
+    'src/c.py': numbered('c', 100),
+    'src/d.py': numbered('d', 10),
+    'src/e.py': numbered('e', 480),
+    'tests/test_a.py': 'def test_a():\n    assert True\n',
+    '.mcp.json': '{"mcpServers": {"CANARY-MCP": {}}}\n',
+    'dark-factory-orchestrator.yaml': 'project_root: CANARY-ORCH\n',
+    'src/secret/k.py': 'KEY = "CANARY-SECRET"\n',
+    'src/blob.bin': b'\xff\xfe\x00\x01 CANARY-BLOB\n',
+}
+VISIBLE_REGULAR_FILES = [
+    'src/a.py', 'src/b.py', 'src/blob.bin', 'src/c.py', 'src/d.py', 'src/e.py', 'src/secret/k.py',
+    'tests/test_a.py',
+]
+
+
+@pytest.fixture
+def hostile(tmp_path: Path) -> Project:
+    """B11-B15's tree: 1,000 counted lines in src/a-e.py, beside invisible, never-reveal, binary, linked and untracked paths."""
+    outside = tmp_path / 'outside' / 'secret.txt'
+    outside.parent.mkdir()
+    outside.write_text('CANARY-LINK\n')
+    (tmp_path / 'x').write_text('CANARY-DOTDOT\n')
+
+    def links(repo: Repo) -> None:
+        repo.symlink('src/link.py', str(outside))
+        repo.gitlink('src/sub', 'b' * 40)
+
+    project = make_project(
+        tmp_path,
+        B_FILES,
+        links=links,
+        reveal_proportion=0.25,
+        reveal_floor_lines=50,
+        never_reveal_globs=['src/secret/**'],
+        generated_globs=['src/*.bin'],
+    )
+    project.repo.write('src/untracked.py', 'CANARY-UNTRACKED\n')
+    write_engagement(project.in_dir, project_id=PROJECT)
+    return project
+
+
+def answers(project: Project) -> list[FileRevealed | RevealRefused]:
+    return [line for line in project.feed() if isinstance(line, FileRevealed | RevealRefused)]
+
+
+def refusals(project: Project) -> list[tuple[str, RefusalReason]]:
+    return [(line.path, line.reason) for line in answers(project) if isinstance(line, RevealRefused)]
+
+
+def newest_tree(project: Project) -> TreeSnapshot:
+    return [line for line in project.feed() if isinstance(line, TreeSnapshot)][-1]
+
+
+def state_of(project: Project) -> FeedState:
+    return parse_state((project.out_dir / STATE_FILENAME).read_text())
+
+
+def cursor_of(project: Project) -> Cursor:
+    return Cursor.model_validate_json((project.out_dir / CURSOR_FILENAME).read_text())
+
+
+def request(project: Project, *paths: str, minutes: float = 30) -> None:
+    request_reveals(project.in_dir, *paths, at=at(minutes))
+
+
+def test_b11_the_tree_lists_only_visible_regular_files_and_an_invisible_path_is_not_visible(
+    hostile: Project,
+) -> None:
+    request(hostile, '.mcp.json')
+
+    hostile.run()
+
+    assert [file.path for file in newest_tree(hostile).files] == VISIBLE_REGULAR_FILES
+    assert refusals(hostile) == [('.mcp.json', RefusalReason.NOT_VISIBLE)]
+    assert len(answers(hostile)) == 1
+
+
+def test_b12_a_granted_request_reveals_the_file_at_head_and_spends_its_lines(
+    hostile: Project,
+) -> None:
+    request(hostile, 'src/a.py')
+
+    hostile.run()
+
+    (revealed,) = answers(hostile)
+    assert isinstance(revealed, FileRevealed)
+    assert (
+        revealed.path, revealed.content, revealed.lines, revealed.commit, revealed.deleted,
+        revealed.renamed_from,
+    ) == ('src/a.py', B_FILES['src/a.py'], 200, hostile.repo.rev('main'), False, None)
+    assert [file.path for file in state_of(hostile).revealed] == ['src/a.py']
+    assert newest_tree(hostile).budget == RevealBudget(
+        proportion=0.25, counted_lines=1000, budget_lines=250, spent_lines=200, floor_lines=50
+    )
+    assert validate_out_dir(hostile.out_dir, expected_project_id=PROJECT).ok
+
+
+def test_a_request_landing_exactly_on_the_budget_is_granted(hostile: Project) -> None:
+    request(hostile, 'src/a.py')
+    hostile.run(minutes=60)
+    request(hostile, 'src/d.py', minutes=61)
+
+    hostile.run(minutes=62)
+
+    assert [(line.type, line.path) for line in answers(hostile)] == [
+        ('file_revealed', 'src/a.py'),
+        ('file_revealed', 'src/d.py'),
+    ]
+    assert newest_tree(hostile).budget.spent_lines == 250
+    assert validate_out_dir(hostile.out_dir, expected_project_id=PROJECT).ok
+
+
+def test_b13_requests_are_answered_in_inbox_order_and_past_the_budget_refused(
+    hostile: Project,
+) -> None:
+    request(hostile, 'src/b.py', 'src/c.py', 'src/d.py')
+
+    hostile.run()
+
+    assert [(line.type, line.path) for line in answers(hostile)] == [
+        ('file_revealed', 'src/b.py'),
+        ('reveal_refused', 'src/c.py'),
+        ('reveal_refused', 'src/d.py'),
+    ]
+    assert refusals(hostile) == [
+        ('src/c.py', RefusalReason.OVER_BUDGET),
+        ('src/d.py', RefusalReason.OVER_BUDGET),
+    ]
+    assert newest_tree(hostile).budget.spent_lines == 210
+
+
+def test_b14_a_free_file_is_granted_without_spending(hostile: Project) -> None:
+    hostile.run(minutes=60)
+    request(hostile, 'tests/test_a.py', minutes=61)
+
+    hostile.run(minutes=62)
+
+    (revealed,) = answers(hostile)
+    assert (revealed.type, revealed.path) == ('file_revealed', 'tests/test_a.py')
+    assert newest_tree(hostile).budget.spent_lines == 0
+
+
+def test_b14_a_free_file_is_granted_after_follow_head_overspends_the_budget(tmp_path: Path) -> None:
+    project = make_project(
+        tmp_path,
+        {
+            'src/a.py': numbered('a', 200),
+            'src/b.py': numbered('b', 800),
+            'tests/test_a.py': 'def test_a():\n    assert True\n',
+        },
+        reveal_proportion=0.25,
+        reveal_floor_lines=50,
+    )
+    write_engagement(project.in_dir, project_id=PROJECT)
+    request(project, 'src/a.py')
+    project.run(minutes=60)
+    project.repo.write('src/a.py', numbered('a', 1000))
+    project.repo.commit('grow a', when=at(61))
+    request(project, 'tests/test_a.py', minutes=62)
+
+    got = pass_answers(project, minutes=63)
+
+    assert [(event.type, event.path) for event in got] == [
+        ('file_revealed', 'src/a.py'),
+        ('file_revealed', 'tests/test_a.py'),
+    ]
+    budget = newest_tree(project).budget
+    assert (budget.spent_lines, budget.budget_lines) == (1000, 450)
+    assert 'tests/test_a.py' in revealed_paths(project)
+
+
+HOSTILE_REQUESTS = [
+    ('../x', RefusalReason.NOT_IN_TREE),
+    ('/etc/passwd', RefusalReason.NOT_IN_TREE),
+    ('src/link.py', RefusalReason.SYMLINK),
+    ('src/untracked.py', RefusalReason.NOT_IN_TREE),
+    ('src/sub', RefusalReason.SYMLINK),
+    ('src/secret/k.py', RefusalReason.NOT_REVEALABLE),
+    ('src/blob.bin', RefusalReason.NOT_REVEALABLE),
+]
+
+
+def test_b15_a_hostile_path_is_refused_by_tree_lookup_and_nothing_outside_the_tree_is_read(
+    hostile: Project,
+) -> None:
+    request(hostile, *(path for path, _ in HOSTILE_REQUESTS))
+
+    hostile.run()
+
+    assert refusals(hostile) == HOSTILE_REQUESTS
+    assert len(answers(hostile)) == len(HOSTILE_REQUESTS)
+    for path in sorted(hostile.out_dir.iterdir()):
+        assert 'CANARY-' not in path.read_text(errors='replace'), path.name
+
+
+def test_the_inbox_offset_moves_past_answered_requests_so_none_is_answered_twice(
+    hostile: Project,
+) -> None:
+    request(hostile, 'src/a.py', '../x')
+    hostile.run(minutes=60)
+
+    hostile.run(minutes=61)
+
+    assert len(answers(hostile)) == 2
+    cursor = cursor_of(hostile)
+    assert cursor.inbox_offset == (hostile.in_dir / INBOX_FILENAME).stat().st_size
+
+
+def test_a_symlinked_inbox_is_degraded_as_inbox_and_its_offset_held(
+    hostile: Project, tmp_path: Path
+) -> None:
+    elsewhere = tmp_path / 'elsewhere'
+    request_reveals(elsewhere, 'src/a.py', at=at(30))
+    (hostile.in_dir / INBOX_FILENAME).symlink_to(elsewhere / INBOX_FILENAME)
+
+    report = hostile.run()
+
+    assert [degradation.source for degradation in report.degraded] == [Source.INBOX]
+    assert answers(hostile) == []
+    cursor = cursor_of(hostile)
+    assert cursor.inbox_offset == 0
+    _publishes_every_other_source_but(hostile, Source.INBOX)
+
+
+def test_an_inbox_shorter_than_the_cursors_offset_is_degraded_as_inbox_and_its_offset_held(
+    hostile: Project,
+) -> None:
+    request(hostile, 'src/a.py', 'src/d.py')
+    hostile.run(minutes=60)
+    held = cursor_of(hostile).inbox_offset
+    (hostile.in_dir / INBOX_FILENAME).write_text('')
+    request(hostile, 'src/b.py', minutes=61)
+
+    report = hostile.run(minutes=62)
+
+    (degradation,) = report.degraded
+    assert degradation.source is Source.INBOX
+    assert '(inbox_rewound)' in degradation.reason
+    assert cursor_of(hostile).inbox_offset == held
+    assert [line.path for line in answers(hostile)] == ['src/a.py', 'src/d.py']
+    _publishes_every_other_source_but(hostile, Source.INBOX)
+
+
+def test_an_inbox_that_cannot_be_read_is_degraded_as_inbox_and_its_offset_held(
+    hostile: Project,
+) -> None:
+    (hostile.in_dir / INBOX_FILENAME).mkdir()
+
+    report = hostile.run()
+
+    (degradation,) = report.degraded
+    assert degradation.source is Source.INBOX
+    assert '(unreadable)' in degradation.reason
+    assert cursor_of(hostile).inbox_offset == 0
+    _publishes_every_other_source_but(hostile, Source.INBOX)
+
+
+def _publishes_every_other_source_but(project: Project, source: Source) -> None:
+    beat = heartbeats(project)[-1]
+    assert {degradation.source for degradation in beat.degraded} == {source}
+    assert {'factory_state', 'branch_snapshot', 'tree_snapshot', 'heartbeat'} <= {
+        line.type for line in project.feed()
+    }
+    assert validate_out_dir(project.out_dir, expected_project_id=PROJECT).ok
+
+
+def test_a_malformed_inbox_line_is_named_and_the_valid_line_after_it_still_answered(
+    hostile: Project,
+) -> None:
+    with (hostile.in_dir / INBOX_FILENAME).open('a') as inbox:
+        inbox.write('{"not": "a request"}\n')
+    request(hostile, 'src/a.py')
+
+    report = hostile.run()
+
+    (degradation,) = report.degraded
+    assert degradation.source is Source.INBOX
+    assert degradation.reason.startswith('rejected 1 ')
+    assert [(line.type, line.path) for line in answers(hostile)] == [('file_revealed', 'src/a.py')]
+
+
+def _delivered_project(tmp_path: Path, *, proportion: float) -> Project:
+    """B17: c1 is delivered; c2 appends 60 lines to src/a.py and adds src/n.py of 30."""
+    project = make_project(
+        tmp_path,
+        {name: content for name, content in B_FILES.items() if name.startswith('src/') and name.endswith('.py')},
+        reveal_proportion=proportion,
+        reveal_floor_lines=50,
+        never_reveal_globs=['src/secret/**'],
+    )
+    repo = project.repo
+    c1 = repo.rev('main')
+    repo.write('src/a.py', numbered('a', 200) + numbered('grown', 60))
+    repo.write('src/n.py', numbered('n', 30))
+    repo.commit('c2', when=at(10))
+    write_engagement(project.in_dir, project_id=PROJECT, delivered=c1)
+    return project
+
+
+def test_b17_only_lines_added_or_changed_since_delivery_count_and_an_unchanged_file_is_free(
+    tmp_path: Path,
+) -> None:
+    project = _delivered_project(tmp_path, proportion=0.25)
+    request(project, 'src/b.py')
+
+    project.run()
+
+    assert newest_tree(project).budget.counted_lines == 90
+    assert [(line.type, line.path) for line in answers(project)] == [('file_revealed', 'src/b.py')]
+    assert newest_tree(project).budget.spent_lines == 0
+
+
+def test_b17_a_changed_file_is_charged_its_lines_since_delivery_not_its_lines_at_head(
+    tmp_path: Path,
+) -> None:
+    project = _delivered_project(tmp_path, proportion=1.0)
+    request(project, 'src/a.py')
+
+    project.run()
+
+    (revealed,) = answers(project)
+    assert isinstance(revealed, FileRevealed) and revealed.lines == 260
+    assert newest_tree(project).budget.spent_lines == 60
+
+
+def test_b17_the_cursor_carries_each_changed_blob_pairs_added_lines(tmp_path: Path) -> None:
+    project = _delivered_project(tmp_path, proportion=0.25)
+    repo = project.repo
+
+    project.run()
+
+    counts = cursor_of(project).added_line_counts
+    assert counts is not None
+    assert counts.by_blob_pair == {repo.rev('main~1:src/a.py'): {repo.rev('main:src/a.py'): 60}}
+
+
+def test_b17_a_later_pass_charges_a_carried_blob_pair_without_diffing_it_again(
+    tmp_path: Path,
+) -> None:
+    project = _delivered_project(tmp_path, proportion=0.25)
+    repo = project.repo
+    project.run(minutes=60)
+    cursor = cursor_of(project)
+    planted = {repo.rev('main~1:src/a.py'): {repo.rev('main:src/a.py'): 100}}
+    assert cursor.added_line_counts is not None
+    carried = cursor.added_line_counts.model_copy(update={'by_blob_pair': planted})
+    (project.out_dir / CURSOR_FILENAME).write_text(
+        cursor.model_copy(update={'added_line_counts': carried}).model_dump_json()
+    )
+    repo.write('src/b.py', numbered('b', 210) + numbered('more', 5))
+    repo.commit('c3', when=at(20))
+
+    project.run(minutes=61)
+
+    assert newest_tree(project).budget.counted_lines == 100 + 30 + 5
+
+
+def test_a_new_tree_keeps_the_states_budget_while_the_reveal_unit_is_degraded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _delivered_project(tmp_path, proportion=0.25)
+    project.run(minutes=60)
+    before = newest_tree(project).budget
+    project.repo.write('src/a.py', numbered('a', 200) + numbered('grown', 70))
+    c3 = project.repo.commit('c3', when=at(20))
+
+    with monkeypatch.context() as patched:
+        patched.setenv('PATH', path_with_git_killed_on(tmp_path / 'bin', 'diff'))
+        report = project.run(minutes=61)
+
+    assert [degradation.source for degradation in report.degraded] == [Source.GIT]
+    assert (newest_tree(project).commit, newest_tree(project).budget) == (c3, before)
+    project.run(minutes=62)
+    assert newest_tree(project).budget.counted_lines == 70 + 30
+
+
+FOLLOWED = ('src/a.py', 'src/b.py', 'src/c.py', 'src/f.py')
+FOLLOW_FILES: Mapping[str, str | bytes] = {
+    **{path: numbered(Path(path).stem, 20) for path in FOLLOWED},
+    'src/e.py': numbered('e', 400),
+}
+
+
+@pytest.fixture
+def followed(tmp_path: Path) -> Project:
+    """Pass 1 at c1 granted src/a.py, src/b.py, src/c.py and src/f.py, each charged its 20 lines."""
+    project = make_project(tmp_path, FOLLOW_FILES, reveal_proportion=1.0, reveal_floor_lines=5)
+    write_engagement(project.in_dir, project_id=PROJECT)
+    request(project, *FOLLOWED)
+    project.run(minutes=60)
+    assert [file.path for file in state_of(project).revealed] == list(FOLLOWED)
+    return project
+
+
+def pass_answers(project: Project, *, minutes: float) -> list[FileRevealed | RevealRefused]:
+    """The answers and re-emissions one more pass appends; every pass leaves a valid out_dir."""
+    before = len(project.feed())
+    project.run(minutes=minutes)
+    assert validate_out_dir(project.out_dir, expected_project_id=PROJECT).ok
+    return [line for line in project.feed()[before:] if isinstance(line, FileRevealed | RevealRefused)]
+
+
+def revealed_paths(project: Project) -> list[str]:
+    return [file.path for file in state_of(project).revealed]
+
+
+def summary(events: list[FileRevealed | RevealRefused]) -> list[tuple[Any, ...]]:
+    return [
+        (event.path, event.commit, event.renamed_from, event.deleted, event.lines)
+        for event in events
+        if isinstance(event, FileRevealed)
+    ]
+
+
+def test_b16_a_changed_file_is_re_emitted_and_a_renamed_one_follows_its_new_path(
+    followed: Project,
+) -> None:
+    repo = followed.repo
+    repo.write('src/a.py', numbered('a', 25))
+    repo.git('mv', 'src/b.py', 'src/b2.py')
+    c2 = repo.commit('c2', when=at(65))
+
+    got = pass_answers(followed, minutes=70)
+
+    assert summary(got) == [
+        ('src/a.py', c2, None, False, 25),
+        ('src/b2.py', c2, 'src/b.py', False, 20),
+    ]
+    assert [event.content for event in got if isinstance(event, FileRevealed)] == [
+        numbered('a', 25),
+        numbered('b', 20),
+    ]
+    assert revealed_paths(followed) == ['src/a.py', 'src/b2.py', 'src/c.py', 'src/f.py']
+
+
+def test_b16_a_deleted_file_ends_its_reveal_and_its_recreation_is_not_followed(
+    followed: Project,
+) -> None:
+    repo = followed.repo
+    spent = newest_tree(followed).budget.spent_lines
+    repo.git('rm', '-q', 'src/c.py')
+    c3 = repo.commit('c3', when=at(65))
+
+    assert summary(pass_answers(followed, minutes=70)) == [('src/c.py', c3, None, True, 0)]
+    assert 'src/c.py' not in revealed_paths(followed)
+    assert newest_tree(followed).budget.spent_lines == spent - 20
+
+    repo.write('src/c.py', numbered('c', 20))
+    repo.commit('c4', when=at(75))
+
+    assert pass_answers(followed, minutes=80) == []
+    assert 'src/c.py' not in revealed_paths(followed)
+
+    request(followed, 'src/c.py', minutes=85)
+
+    assert summary(pass_answers(followed, minutes=90)) == [
+        ('src/c.py', repo.rev('main'), None, False, 20)
+    ]
+    assert newest_tree(followed).budget.spent_lines == spent
+
+
+def test_b16_a_delete_and_recreate_inside_one_pass_ends_the_reveal(followed: Project) -> None:
+    repo = followed.repo
+    repo.git('rm', '-q', 'src/f.py')
+    repo.commit('c5', when=at(65))
+    repo.write('src/f.py', numbered('recreated', 20))
+    c6 = repo.commit('c6', when=at(66))
+
+    assert summary(pass_answers(followed, minutes=70)) == [('src/f.py', c6, None, True, 0)]
+    assert 'src/f.py' not in revealed_paths(followed)
+
+
+def test_b16_a_change_and_its_revert_inside_one_pass_re_emit_nothing(followed: Project) -> None:
+    repo = followed.repo
+    repo.write('src/a.py', numbered('changed', 20))
+    repo.commit('c7', when=at(65))
+    repo.write('src/a.py', numbered('a', 20))
+    repo.commit('c8', when=at(66))
+
+    assert pass_answers(followed, minutes=70) == []
+    assert revealed_paths(followed) == list(FOLLOWED)
+
+
+def test_b16_a_file_renamed_out_of_the_visible_tree_ends_its_reveal(followed: Project) -> None:
+    repo = followed.repo
+    (repo.root / 'private').mkdir()
+    repo.git('mv', 'src/a.py', 'private/x.py')
+    moved = repo.commit('move out of sight', when=at(65))
+
+    assert summary(pass_answers(followed, minutes=70)) == [('src/a.py', moved, None, True, 0)]
+    assert revealed_paths(followed) == ['src/b.py', 'src/c.py', 'src/f.py']
+
+
+def test_b16_a_merge_touching_a_revealed_file_re_emits_it_once_at_the_merge(
+    followed: Project,
+) -> None:
+    repo = followed.repo
+    repo.branch('task/7')
+    repo.checkout('task/7')
+    repo.write('src/a.py', numbered('a', 21))
+    repo.commit('seven one', when=at(61))
+    repo.write('src/a.py', numbered('a', 22))
+    repo.commit('seven two', when=at(62))
+    repo.checkout('main')
+    merge = repo.merge_no_ff('task/7', 'Merge task/7 into main', when=at(65))
+
+    assert summary(pass_answers(followed, minutes=70)) == [('src/a.py', merge, None, False, 22)]
+
+
+def test_b16_without_reveals_head_a_changed_revealed_file_is_still_re_emitted_once(
+    followed: Project,
+) -> None:
+    cursor_path = followed.out_dir / CURSOR_FILENAME
+    cursor = Cursor.model_validate_json(cursor_path.read_text())
+    cursor_path.write_text(cursor.model_copy(update={'reveals_head': None}).model_dump_json())
+    repo = followed.repo
+    repo.write('src/a.py', numbered('a', 30))
+    c2 = repo.commit('c2', when=at(65))
+
+    assert summary(pass_answers(followed, minutes=70)) == [('src/a.py', c2, None, False, 30)]
+    assert pass_answers(followed, minutes=71) == []
+
+
+def test_a_request_repeated_in_one_inbox_read_reveals_the_file_once(hostile: Project) -> None:
+    request(hostile, 'src/a.py', 'src/a.py')
+
+    hostile.run()
+
+    assert [(line.type, line.path) for line in answers(hostile)] == [('file_revealed', 'src/a.py')]
+    assert newest_tree(hostile).budget.spent_lines == 200
+
+
+def _main_stays(repo: Repo) -> None:
+    """main stays where pass 1 left it."""
+
+
+def _main_moves_past_the_file(repo: Repo) -> None:
+    repo.write('src/e.py', numbered('e', 401))
+    repo.commit('touch e only', when=at(61))
+
+
+@pytest.mark.parametrize('between', [_main_stays, _main_moves_past_the_file], ids=['same-head', 'later-head'])
+def test_a_retry_for_an_unchanged_revealed_file_appends_no_answer(
+    followed: Project, between: Callable[[Repo], None]
+) -> None:
+    granted_at = followed.repo.rev('main')
+    spent = newest_tree(followed).budget.spent_lines
+    between(followed.repo)
+    request(followed, 'src/a.py', minutes=62)
+
+    assert pass_answers(followed, minutes=63) == []
+    assert [file.commit for file in state_of(followed).revealed if file.path == 'src/a.py'] == [granted_at]
+    assert newest_tree(followed).budget.spent_lines == spent
+
+
+def test_a_retry_for_a_changed_revealed_file_adds_nothing_to_its_follow_head_re_emit(
+    followed: Project,
+) -> None:
+    repo = followed.repo
+    repo.write('src/a.py', numbered('a', 25))
+    c2 = repo.commit('c2', when=at(65))
+    request(followed, 'src/a.py', minutes=66)
+
+    got = pass_answers(followed, minutes=70)
+
+    assert summary(got) == [('src/a.py', c2, None, False, 25)]
+
+
+def test_a_crash_between_append_and_cursor_neither_re_answers_nor_drops_a_request(
+    hostile: Project,
+) -> None:
+    hostile.run(minutes=60)
+    request(hostile, 'src/a.py', '../x', minutes=61)
+    committed = {
+        name: (hostile.out_dir / name).read_bytes() for name in (CURSOR_FILENAME, STATE_FILENAME)
+    }
+    hostile.run(minutes=62)
+    for name, data in committed.items():
+        (hostile.out_dir / name).write_bytes(data)
+    request(hostile, 'src/d.py', minutes=63)
+
+    hostile.run(minutes=64)
+
+    assert [(line.type, line.path) for line in answers(hostile)] == [
+        ('file_revealed', 'src/a.py'),
+        ('reveal_refused', '../x'),
+        ('file_revealed', 'src/d.py'),
+    ]
+    seqs = [line.seq for line in hostile.feed()]
+    assert seqs == sorted(set(seqs))
+    cursor = cursor_of(hostile)
+    assert cursor.inbox_offset == (hostile.in_dir / INBOX_FILENAME).stat().st_size
+    assert validate_out_dir(hostile.out_dir, expected_project_id=PROJECT).ok

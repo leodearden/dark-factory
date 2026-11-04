@@ -1,5 +1,7 @@
 """Tests for config schema Literal type validation."""
 
+import itertools
+import json
 import os
 import re
 import sys
@@ -34,6 +36,7 @@ from fused_memory.config.schema import (
 from fused_memory.server.near_duplicate_guard import (
     _TOPIC_CLUSTER_DEFAULT_HINT,
     build_topic_cluster_block,
+    can_share_one_occurrence,
     find_matching_topic_cluster,
 )
 from fused_memory.services.durable_queue import DEFAULT_TRANSIENT_ERROR_NAMES
@@ -744,6 +747,44 @@ class TestReconciliationConfigJudgeInfraMaxConsecutiveFailures:
             ReconciliationConfig(judge_infra_max_consecutive_failures=-1)
 
 
+class TestReconTranscriptArchiveConfig:
+    """The recon transcript-archive leaves (task 3972)."""
+
+    FM_CONFIG_YAML = Path(__file__).resolve().parent.parent / 'config' / 'config.yaml'
+    LEGIBILITY_YAML = (
+        Path(__file__).resolve().parents[2] / 'docs' / 'legibility' / 'legibility.yaml'
+    )
+
+    def test_defaults(self):
+        cfg = ReconciliationConfig()
+        assert cfg.transcript_archive_enabled is True
+        assert cfg.transcript_archive_root == 'data/orchestrator/agent-transcripts'
+
+    def test_default_root_matches_the_shipped_legibility_archive_roots(self):
+        """Recon archives must land where the legibility miner walks; if the
+        two drift, they are written and never mined."""
+        assert self.LEGIBILITY_YAML.is_file(), f'expected {self.LEGIBILITY_YAML}'
+        legibility = yaml.safe_load(self.LEGIBILITY_YAML.read_text())
+
+        assert (
+            ReconciliationConfig().transcript_archive_root
+            in legibility['agent_transcript_roots']
+        )
+
+    def test_shipped_config_yaml_loads_the_leaves(self, monkeypatch):
+        assert self.FM_CONFIG_YAML.is_file(), f'expected {self.FM_CONFIG_YAML}'
+        shipped = yaml.safe_load(self.FM_CONFIG_YAML.read_text())['reconciliation']
+        assert 'transcript_archive_enabled' in shipped
+        assert 'transcript_archive_root' in shipped
+
+        monkeypatch.setenv('CONFIG_PATH', str(self.FM_CONFIG_YAML))
+        cfg = FusedMemoryConfig().reconciliation
+
+        assert isinstance(cfg.transcript_archive_enabled, bool)
+        assert isinstance(cfg.transcript_archive_root, str)
+        assert cfg.transcript_archive_root
+
+
 class TestReconciliationAutoUnhaltAfterCooldown:
     """Tests for auto_unhalt_after_cooldown (task 2920 deliverable c).
 
@@ -1192,6 +1233,11 @@ class TestConsolidationAutoConfig:
     def test_default_proposal_ttl_hours_is_one_week(self):
         assert ConsolidationAutoConfig().proposal_ttl_hours == 168
 
+    def test_default_canonical_absent_bonus_is_2(self):
+        """A cluster whose topic has no canonical yet ranks as if twice its
+        size (PRD C4 ranking formula; consolidation_flood_control.rank_and_cap)."""
+        assert ConsolidationAutoConfig().canonical_absent_bonus == 2.0
+
     def test_default_category_weights_are_the_three_mem0_primaries(self):
         """PRD §12 Q1 — the three Mem0-primary categories, with
         observations_and_summaries down-weighted because its corpus is
@@ -1298,6 +1344,16 @@ class TestConsolidationAutoConfig:
         with pytest.raises(ValidationError):
             ConsolidationAutoConfig(proposal_ttl_hours=-1)
 
+    def test_canonical_absent_bonus_below_one_rejected(self):
+        """A bonus below 1 would PENALISE a canonical-absent cluster, inverting
+        the policy it exists to express."""
+        with pytest.raises(ValidationError):
+            ConsolidationAutoConfig(canonical_absent_bonus=0.9)
+
+    def test_canonical_absent_bonus_float_override_accepted(self):
+        assert ConsolidationAutoConfig(canonical_absent_bonus=1.5).canonical_absent_bonus == 1.5
+        assert ConsolidationAutoConfig(canonical_absent_bonus=1.0).canonical_absent_bonus == 1.0
+
     def test_backlog_multiplier_zero_rejected(self):
         with pytest.raises(ValidationError):
             ConsolidationAutoConfig(backlog_multiplier=0)
@@ -1361,8 +1417,10 @@ class TestReconciliationDeterministicProvenancePrefixes:
 
     def test_default_is_orchestrator_only(self):
         """The orchestrator sends no agent_id, so tools.py::_resolve_identity
-        falls back to the clientInfo.name that mcp_lifecycle.py::
-        McpSession.initialize advertises — the literal 'orchestrator'."""
+        falls back to the clientInfo.name the orchestrator advertises
+        (orchestrator/src/orchestrator/mcp_lifecycle.py::ORCHESTRATOR_MCP_IDENTITY,
+        sent by shared/src/shared/mcp_session.py::McpSession.initialize) — the
+        literal 'orchestrator'."""
         assert ReconciliationConfig().deterministic_provenance_allowed_agent_prefixes == [
             'orchestrator',
         ]
@@ -1617,6 +1675,27 @@ class TestPathScopeAdjudicatorConfigBudget:
         )
 
 
+class TestCuratorDegradedStreakThreshold:
+    """The knob behind the class-agnostic degraded-streak alarm (task 4448).
+
+    Distinct from ``zero_output_breaker_threshold``, which counts only ZOT
+    failures and exists to stop burning 180s per hung call. This one counts
+    degraded DECISIONS of any cause and exists to make the outage visible.
+    """
+
+    def test_default_is_five(self):
+        assert CuratorConfig().degraded_streak_threshold == 5, (
+            'N=5 is chosen against the 2026-08-13 to 08-18 outage: 08-15 alone '
+            'saw 38 consecutive degradations, so N=5 would have escalated '
+            'within minutes of that day starting instead of on day five.'
+        )
+
+    def test_rejects_below_one(self):
+        """N=0 would fire on a healthy curator's first non-LLM decision."""
+        with pytest.raises(ValidationError):
+            CuratorConfig(degraded_streak_threshold=0)
+
+
 class TestCuratorEntryCharCaps:
     """The per-entry char caps, pinned with the measurement that set them.
 
@@ -1659,10 +1738,10 @@ class TestCuratorEntryCharCaps:
     def test_the_total_cap_is_unreachable_at_stock_stream_caps(self):
         """FINDING 1, as an executable invariant rather than a comment.
 
-        A maximal pool is anchor(<=1) + module + embedding + dependency. With
-        stock values that is 29 against a total cap of 30, so ``_trim_pool``
-        short-circuits on every call and the STREAM caps are the binding
-        constraints. This is pinned so a future cap edit that silently
+        A maximal pool without siblings is anchor(<=1) + module + embedding +
+        dependency. With stock values that is 29 against a total cap of 30, so
+        ``_trim_pool`` short-circuits on every call for such a pool and the
+        STREAM caps are the binding constraints. This is pinned so a future cap edit that silently
         re-strands or un-strands the final trim is caught here, at the config
         layer, rather than being discovered as a permanently-silent
         ``pool_truncated`` census.
@@ -1682,6 +1761,31 @@ class TestCuratorEntryCharCaps:
             f'arithmetic, and re-read whether the stream caps are still the '
             f'binding constraints.'
         )
+
+    @pytest.mark.parametrize('value', [0, -1])
+    @pytest.mark.parametrize('field', ['entry_description_chars', 'entry_details_chars'])
+    def test_a_non_positive_entry_cap_is_refused_at_load(self, field, value):
+        """A cap of 0 or less would make every curator prompt build raise in utils/clip_disclosure.py::TruncationFact, so it is refused when the config loads."""
+        with pytest.raises(ValidationError, match=field):
+            CuratorConfig(**{field: value})
+
+
+class TestCuratorSiblingCap:
+    """The cap on an agent-followup candidate's same-parent sibling stream (task 6227)."""
+
+    def test_a_sibling_is_never_trimmed_at_stock_caps(self):
+        cfg = CuratorConfig()
+        assert 1 + cfg.pool_sibling_cap <= cfg.pool_total_cap, (
+            f'anchor(1) + pool_sibling_cap ({cfg.pool_sibling_cap}) exceeds '
+            f'pool_total_cap ({cfg.pool_total_cap}). _trim_pool cuts siblings '
+            f'only after every other stream except the anchor, so this '
+            f'inequality is what keeps a sibling from ever being cut.'
+        )
+
+    def test_a_negative_sibling_cap_is_refused_at_load(self):
+        """A cap of 0 is legal and disables the stream; a negative one is refused."""
+        with pytest.raises(ValidationError, match='pool_sibling_cap'):
+            CuratorConfig(pool_sibling_cap=-1)
 
 
 class TestCuratorConfigBudgetRaise:
@@ -1771,6 +1875,58 @@ class TestCuratorZotDuplicateSweepConfig:
     def test_search_limit_must_be_positive(self):
         with pytest.raises(ValidationError):
             CuratorConfig(zot_duplicate_search_limit=0)
+
+
+class TestCurationDeferralConfig:
+    """Task 4503: the knobs behind parking a submission the curator could not judge."""
+
+    def test_defaults(self):
+        from fused_memory.config.schema import TicketJanitorConfig
+
+        cfg = CuratorConfig()
+        assert cfg.deferral_backoff_base_seconds == 60.0
+        assert cfg.deferral_backoff_max_seconds == 1800.0
+        assert TicketJanitorConfig().curation_backlog_escalation_min_attempts == 2
+
+    @pytest.mark.parametrize(
+        'field',
+        ['deferral_backoff_base_seconds', 'deferral_backoff_max_seconds'],
+    )
+    @pytest.mark.parametrize('value', [0.0, -1.0])
+    def test_seconds_must_be_positive(self, field, value):
+        with pytest.raises(ValidationError):
+            CuratorConfig(**{field: value})
+
+    def test_backlog_escalation_needs_at_least_one_attempt(self):
+        from fused_memory.config.schema import TicketJanitorConfig
+
+        with pytest.raises(ValidationError):
+            TicketJanitorConfig(curation_backlog_escalation_min_attempts=0)
+        assert TicketJanitorConfig(
+            curation_backlog_escalation_min_attempts=1,
+        ).curation_backlog_escalation_min_attempts == 1
+
+    def test_backoff_max_below_base_is_rejected_naming_both(self):
+        with pytest.raises(ValidationError) as excinfo:
+            CuratorConfig(deferral_backoff_base_seconds=120.0, deferral_backoff_max_seconds=90.0)
+        message = str(excinfo.value)
+        assert '120' in message
+        assert '90' in message
+
+    def test_backoff_max_equal_to_base_is_accepted(self):
+        cfg = CuratorConfig(deferral_backoff_base_seconds=90.0, deferral_backoff_max_seconds=90.0)
+        assert cfg.deferral_backoff_max_seconds == 90.0
+
+    def test_there_is_no_terminal_deferral_bound(self):
+        assert 'deferral_max_seconds' not in CuratorConfig.model_fields
+
+    def test_none_is_hot_reloadable(self):
+        from fused_memory.config.reload import RELOADABLE_FIELDS
+
+        assert not {
+            leaf for leaf in RELOADABLE_FIELDS
+            if 'deferral' in leaf or 'curation_backlog' in leaf
+        }
 
 
 class TestQueueConfigTransientErrorFields:
@@ -2383,45 +2539,27 @@ class TestProceduralTopicGuardClustersDefault:
             assert cluster.phrases, f'{cluster.topic_id} has empty phrases'
             assert cluster.min_phrase_hits >= 1
 
-    def test_no_seeded_phrase_nests_inside_another_in_the_same_cluster(self):
+    def test_no_two_seeded_phrases_can_share_one_occurrence(self):
         """The invariant that keeps every cluster's ``min_phrase_hits`` meaningful.
 
         ``find_matching_topic_cluster`` counts DISTINCT phrases present as
-        plain substrings, so if one phrase nests inside another in the SAME
-        cluster, a SINGLE occurrence of the longer form scores two distinct
-        hits and satisfies ``min_phrase_hits=2`` on its own -- defeating that
-        field's stated purpose ("Default 2 so a single incidental keyword
-        never triggers a false block").
+        substrings, so two phrases that one occurrence can hold (one nesting
+        in the other, or 'ruff format' / 'format-clean' overlapping on a whole
+        word) score two hits from a single construction and defeat
+        ``min_phrase_hits=2``.
 
-        The hazard is generic to the matcher, not specific to any one seed:
-        the concrete temptations are 'ruff format --check' beside bare 'ruff
-        format' (ruff-format cluster, task 3435) and bare 'plan.json' beside
-        '.task/plan.json' (plan-revalidation cluster). So the guard is
-        asserted over EVERY seeded cluster rather than one, and holds for all
-        four today.
-
-        NOT sufficient on its own: the two RETIRED eval-worktree clusters
-        each carried 'eval-worktree' beside 'eval worktree' -- one concept,
-        two spelling-variant phrases, neither nesting inside the other --
-        which scored two distinct hits off a single mention and passed this
-        test cleanly. Sibling spelling variants are task 4179's matcher-level
-        fix, not this invariant's.
-
-        Compared by INDEX, not identity: two phrases that are accidentally
-        equal must fail here too (an exact duplicate is the degenerate
-        nesting case, and ``is not`` would silently skip it only when the
-        interpreter happens to intern both copies to one object).
+        Checked with ``can_share_one_occurrence``, the same definition
+        ``derive_topic_cluster`` enforces on machine-derived clusters.
+        Sibling spelling variants (the retired 'eval-worktree' /
+        'eval worktree' pair) are outside it: task 4179.
         """
         for cluster in ReconciliationConfig().procedural_knowledge_topic_guard_clusters:
-            phrases = [p.lower() for p in cluster.phrases]
-            for i, outer in enumerate(phrases):
-                for j, inner in enumerate(phrases):
-                    if i != j:
-                        assert inner not in outer, (
-                            f'{cluster.topic_id}: {inner!r} nests inside {outer!r} -- one '
-                            f'occurrence would score two distinct hits and defeat '
-                            f'min_phrase_hits'
-                        )
+            for first, second in itertools.combinations(cluster.phrases, 2):
+                assert not can_share_one_occurrence(first, second), (
+                    f'{cluster.topic_id}: {first!r} and {second!r} can share one '
+                    f'occurrence -- it would score two distinct hits and defeat '
+                    f'min_phrase_hits'
+                )
 
 
 class TestTopicClusterAutoseedEnabledLeaf:
@@ -2873,7 +3011,7 @@ class TestRuffFormatNotAnEnforcedGateCluster:
             'ruff check',
             'enforced gate',
             'enforced lint gate',
-            'format-clean',
+            'not format-clean',
         ]
         assert cluster.min_phrase_hits == 2
         assert '3342' in cluster.hint
@@ -2967,7 +3105,7 @@ class TestRuffFormatNotAnEnforcedGateCluster:
 
         Reviewer (test-proportionality): one case per distinct HIT-PROFILE,
         not one per corpus entry. 4ab1c78f is the 4-hit maximum and the sole
-        exerciser of 'format-clean'; d72c66dc carries 'enforced lint gate';
+        exerciser of 'not format-clean'; d72c66dc carries 'enforced lint gate';
         87a4982d sits exactly AT the threshold on the 'ruff format' +
         'ruff check' anchor pair alone, which is what makes 'ruff check'
         load-bearing for the half of the corpus that says nothing about
@@ -2998,6 +3136,10 @@ class TestRuffFormatNotAnEnforcedGateCluster:
                 'I ran ruff format on the file I created so my added lines are '
                 'clean.',
                 id='format-only-note-1-hit',
+            ),
+            pytest.param(
+                'This file is ruff format-clean after my edit.',
+                id='ruff-format-clean-one-construction-1-hit',
             ),
         ],
     )
@@ -3767,27 +3909,37 @@ class TestWriteTriageConfig:
         assert factory().enabled is False  # type: ignore[call-arg]
         assert factory().candidate_k > 5  # type: ignore[call-arg]
 
-    def test_the_shipped_config_yaml_ships_the_flag_off_and_k_wide(self, monkeypatch):
+    def test_the_shipped_config_yaml_ships_the_flag_on_with_the_selected_judge(self, monkeypatch):
         """The pin must hold on the REAL deployment file, not just the model.
 
-        The schema default is what a deployment gets only if config.yaml stays
-        silent. config.yaml carries an explicit `write_triage:` block, so the
-        shipped values there are what the running server actually reads — and
-        they are what an operator (and the next calibration run) can edit.
-        Asserting the class default alone would pass while the deployed file
-        said `enabled: true`.
+        config.yaml carries an explicit `write_triage:` block, so the shipped
+        values there are what the running server reads. Task 3169 flipped the
+        flag on (Leo, 2026-10-11) with the judge that gate Γ3 selected; the
+        judge keys are compared against the committed selection because a null
+        judge_model inherits llm.model, which the comparative scores worse than
+        leaving triage off.
         """
-        yaml_path = Path(__file__).resolve().parent.parent / 'config' / 'config.yaml'
+        config_dir = Path(__file__).resolve().parent.parent
+        yaml_path = config_dir / 'config' / 'config.yaml'
         assert yaml_path.is_file(), f'expected config.yaml at {yaml_path}'
         monkeypatch.setenv('CONFIG_PATH', str(yaml_path))
-        cfg = FusedMemoryConfig()
+        triage = FusedMemoryConfig().write_triage
+        selection = json.loads(
+            (config_dir / 'calibration' / 'write_triage_best_config.json').read_text()
+        )['selection']
 
-        assert cfg.write_triage.enabled is False, (
-            'fused-memory/config/config.yaml must ship write_triage.enabled: '
-            'false — the D10 staged-rollout flag is flipped by task 3169, not '
-            'by the merge that lands the skeleton'
-        )
-        assert cfg.write_triage.candidate_k > 5, (
+        assert triage.enabled is True
+        assert {
+            'judge_provider': triage.judge_provider,
+            'judge_model': triage.judge_model,
+            'judge_reasoning_effort': triage.judge_reasoning_effort,
+            'judge_candidate_count': triage.judge_candidate_count,
+            'field_chars': triage.judge_field_chars,
+        } == {key: selection[key] for key in (
+            'judge_provider', 'judge_model', 'judge_reasoning_effort',
+            'judge_candidate_count', 'field_chars',
+        )}
+        assert triage.candidate_k > 5, (
             'fused-memory/config/config.yaml must ship a candidate_k wider than '
             "the retired guard's limit=5 (measured recall 26.1% @5 vs 69.4% @20)"
         )
@@ -4109,6 +4261,33 @@ def test_shipped_config_max_staleness_still_bounds_latency(monkeypatch):
     )
 
 
+# ── coalesce_task_events (task 4278, recon lever 3) ──────────────────
+#
+# Push-time folding of repeat task events is on by default, switchable, and
+# restart-only: EventBuffer captures the flag by value at construction.
+
+
+def test_coalesce_task_events_defaults_on_and_can_be_switched_off():
+    assert ReconciliationConfig().coalesce_task_events is True
+    assert ReconciliationConfig(coalesce_task_events=False).coalesce_task_events is False
+
+
+def test_shipped_config_coalesces_task_events(monkeypatch):
+    assert _shipped_reconciliation_config(monkeypatch).coalesce_task_events is True
+
+
+def test_coalesce_task_events_is_restart_only():
+    from fused_memory.config.reload import RELOADABLE_FIELDS
+
+    assert 'reconciliation.coalesce_task_events' not in RELOADABLE_FIELDS
+
+
+def test_event_buffer_default_matches_the_config_default():
+    from fused_memory.reconciliation.event_buffer import EventBuffer
+
+    assert EventBuffer().coalesce_task_events is ReconciliationConfig().coalesce_task_events
+
+
 class TestWriteJournalConfig:
     """Task 3212 item 4: `write_ops` retention is operator-tunable and its
     read/search asymmetry is enforced, not merely documented.
@@ -4132,9 +4311,11 @@ class TestWriteJournalConfig:
         assert section.read_retention_days == 30.0
         assert section.search_retention_days == 365.0
         assert section.write_retention_days == 730.0
-        assert section.prune_batch_size == 5000
+        assert section.prune_batch_size == 500
         assert section.prune_max_rows_per_run == 500_000
         assert section.prune_max_seconds == 30.0
+        assert section.prune_interval_seconds == 1800.0
+        assert section.referent_findings_retention_days == 365.0
 
     def test_search_rows_outlive_task_read_rows(self):
         section = FusedMemoryConfig().write_journal
@@ -4153,12 +4334,22 @@ class TestWriteJournalConfig:
             'RED: the rejection must name the field an operator has to fix'
         )
 
+    def test_a_zero_prune_interval_is_rejected(self):
+        from fused_memory.config.schema import WriteJournalConfig
+
+        with pytest.raises(ValidationError) as excinfo:
+            WriteJournalConfig(prune_interval_seconds=0)
+        assert 'prune_interval_seconds' in str(excinfo.value), (
+            'RED: a zero interval would spin the periodic prune loop'
+        )
+
     def test_values_load_from_yaml(self, tmp_path, monkeypatch):
         config_data = {
             'write_journal': {
                 'read_retention_days': 7.0,
                 'search_retention_days': 90.0,
                 'prune_max_seconds': 5.0,
+                'prune_interval_seconds': 600.0,
             },
         }
         config_file = tmp_path / 'config.yaml'
@@ -4170,6 +4361,113 @@ class TestWriteJournalConfig:
         assert section.read_retention_days == 7.0, 'RED: the section must be tunable'
         assert section.search_retention_days == 90.0
         assert section.prune_max_seconds == 5.0
+        assert section.prune_interval_seconds == 600.0
         # Unmentioned leaves keep their defaults rather than being clobbered.
         assert section.write_retention_days == 730.0
-        assert section.prune_batch_size == 5000
+        assert section.prune_batch_size == 500
+
+
+class TestWriteJournalGrowthAlarmConfig:
+    """Task 3311: the write_journal growth alarm's ceilings are operator-tunable.
+
+    The measured basis of the defaults lives in the
+    ``write_journal_growth_alarm`` block of ``fused-memory/config/config.yaml``.
+    """
+
+    def test_section_is_a_bare_submodel_with_defaults(self):
+        from fused_memory.config.schema import WriteJournalGrowthAlarmConfig
+
+        section = FusedMemoryConfig().write_journal_growth_alarm
+        assert isinstance(section, WriteJournalGrowthAlarmConfig), (
+            'RED: write_journal_growth_alarm must be a BARE (non-Optional) '
+            'submodel — reload.py descends only into required submodels'
+        )
+        assert section.max_file_bytes == 6_442_450_944
+        assert section.max_rows_inserted_per_day == 75_000
+        assert section.check_interval_seconds == 3600.0
+
+    def test_values_load_from_yaml(self, tmp_path, monkeypatch):
+        config_data = {
+            'write_journal_growth_alarm': {
+                'max_file_bytes': 1024,
+                'check_interval_seconds': 60.0,
+            },
+        }
+        config_file = tmp_path / 'config.yaml'
+        config_file.write_text(yaml.dump(config_data))
+        monkeypatch.setenv('CONFIG_PATH', str(config_file))
+
+        section = FusedMemoryConfig().write_journal_growth_alarm
+
+        assert section.max_file_bytes == 1024, 'RED: the section must be tunable'
+        assert section.check_interval_seconds == 60.0
+        assert section.max_rows_inserted_per_day == 75_000
+
+    def test_shipped_config_yaml_carries_exactly_the_schema_defaults(self, monkeypatch):
+        """The schema default and the config.yaml literal are two copies of one
+        number; the yaml's measured-basis comment is where it is justified."""
+        from fused_memory.config.schema import WriteJournalGrowthAlarmConfig
+
+        for name in (
+            'WRITE_JOURNAL_GROWTH_ALARM_MAX_FILE_BYTES',
+            'WRITE_JOURNAL_GROWTH_ALARM_MAX_ROWS_PER_DAY',
+            'WRITE_JOURNAL_GROWTH_ALARM_CHECK_INTERVAL_SECONDS',
+        ):
+            monkeypatch.delenv(name, raising=False)
+        yaml_path = Path(__file__).resolve().parent.parent / 'config' / 'config.yaml'
+        monkeypatch.setenv('CONFIG_PATH', str(yaml_path))
+
+        assert FusedMemoryConfig().write_journal_growth_alarm == WriteJournalGrowthAlarmConfig()
+
+    @pytest.mark.parametrize(
+        'field',
+        ['max_file_bytes', 'max_rows_inserted_per_day', 'check_interval_seconds'],
+    )
+    def test_non_positive_values_are_rejected(self, field):
+        from fused_memory.config.schema import WriteJournalGrowthAlarmConfig
+
+        with pytest.raises(ValidationError) as excinfo:
+            WriteJournalGrowthAlarmConfig.model_validate({field: 0})
+        assert field in str(excinfo.value), (
+            'RED: a ceiling of 0 fires permanently; the rejection must name the field'
+        )
+
+
+class TestDedupOutageDetectorConfig:
+    """Task 4718: the TicketJanitor's dedup-outage detector is configured under
+    ``curator.janitor.dedup_outage``. The defaults are back-tested in
+    ``plans/curator-dedup-outage-2026-08-15-rca.md``.
+    """
+
+    def test_nested_under_the_ticket_janitor_config(self):
+        from fused_memory.config.schema import DedupOutageDetectorConfig, TicketJanitorConfig
+
+        assert isinstance(TicketJanitorConfig().dedup_outage, DedupOutageDetectorConfig)
+
+    def test_defaults(self):
+        from fused_memory.config.schema import DedupOutageDetectorConfig
+
+        cfg = DedupOutageDetectorConfig()
+
+        assert cfg.enabled is True
+        assert cfg.window_seconds == 21600.0
+        assert cfg.min_samples == 10
+        assert cfg.max_median_resolve_seconds == 15.0
+
+    @pytest.mark.parametrize(
+        'field',
+        ['window_seconds', 'max_median_resolve_seconds', 'min_samples'],
+    )
+    def test_non_positive_bounds_are_rejected(self, field):
+        from fused_memory.config.schema import DedupOutageDetectorConfig
+
+        with pytest.raises(ValidationError) as excinfo:
+            DedupOutageDetectorConfig.model_validate({field: 0})
+        assert field in str(excinfo.value)
+
+    def test_reachable_from_the_top_level_config(self):
+        from fused_memory.config.schema import DedupOutageDetectorConfig
+
+        section = FusedMemoryConfig().curator.janitor.dedup_outage
+
+        assert isinstance(section, DedupOutageDetectorConfig)

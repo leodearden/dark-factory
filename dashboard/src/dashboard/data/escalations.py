@@ -37,7 +37,8 @@ from dashboard.data.escalation_corpus import (
     QueueRef,
     views_over,
 )
-from dashboard.data.memory import mcp_tool_call
+from dashboard.data.mcp_fanout import describe_exc
+from dashboard.data.memory import enclosing_deadline, mcp_tool_call
 from dashboard.data.task_lookup import FETCHED_ROW_FRESHNESS_BOUND_SECONDS, TaskRef
 
 logger = logging.getLogger(__name__)
@@ -56,7 +57,7 @@ def load_queue_escalations(
     which also walks the archive subtree.
 
     Only ``esc-*.json`` names an escalation.  The queue directory has other
-    residents: ``orchestrator/src/orchestrator/b3_gate.py::STATE_REL_PATH``
+    residents: ``orchestrator/src/orchestrator/b3_gate.py::STATE_FILENAME``
     keeps ``b3-state.json`` there, and a ``*.json`` glob read it as an id-less
     escalation.  :func:`escalation.queue.iter_all_escalation_paths`, and so the
     corpus walk the Escalations tab reads, globs ``esc-*.json`` for the same
@@ -455,10 +456,12 @@ async def _fetch_pins_one(
                 client, base_url, 'get_pending_escalations', {'compact': True},
                 timeout=timeout,
             ),
-            timeout=timeout,
+            timeout=enclosing_deadline(timeout),
         )
     except (TimeoutError, httpx.HTTPError, OSError, ValueError) as exc:
-        logger.debug('get_pending_escalations failed for %s: %s', base_url, exc)
+        logger.debug(
+            'get_pending_escalations failed for %s: %s', base_url, describe_exc(exc),
+        )
         return None
 
     if isinstance(result, list):
@@ -494,7 +497,8 @@ async def fetch_pins_recovery(
     """Fan ``get_pending_escalations`` out to every escalation URL concurrently.
 
     Returns ``{project_label: {escalation_id: [task_ids]} | None}``, with the
-    labels taken verbatim from *escalation_urls* (project basenames, matching
+    labels taken verbatim from *escalation_urls* (project label —
+    ``dashboard/project_labels.py::ProjectLabels`` — matching
     ``shape_merge_queue`` and ``get_merge_halt_status``).  Every configured
     label is always present in the result: one project's failure never sinks
     another's, because each probe is isolated.
@@ -521,8 +525,10 @@ async def fetch_pins_recovery(
     function never reads stay off the wire on every poll.
 
     The default ``mcp_tool_call`` timeout is 10s — too slow for a polling loop —
-    so each call is wrapped in ``asyncio.wait_for`` and worst-case latency stays
-    close to *per_call_timeout* even when every orchestrator is down.
+    so each call is wrapped in ``asyncio.wait_for`` at
+    ``memory.py::enclosing_deadline(per_call_timeout)``: worst-case latency
+    stays one second above *per_call_timeout* even when every orchestrator is
+    down, and a saturated pool is still named.
     """
     if not escalation_urls:
         return {}

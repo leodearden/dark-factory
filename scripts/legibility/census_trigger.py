@@ -1,10 +1,12 @@
 """scripts/legibility/census_trigger.py — periodic legibility census trigger
 evaluator + census-state reader.
 
-See plans/confusion-reduction-prd.md §6 (task ζ: fire logic + hard floor),
-§7.4 (per-project census config block), §7.5 (census state contract),
-§8.5 (boundary-test matrix — day-9-no-spike/day-7+130-landed/
-day-6+4-candidates-in-72h/day-4+spike -> no-fire/fire/fire/no-fire(floor)).
+See plans/confusion-reduction-prd.md §6 (task ζ: fire logic), §7.4
+(per-project census config block), §7.5 (census state contract) and §8.5
+(boundary-test matrix). The novelty-spike and floor contract lives in
+plans/census-incremental-prd.md §4.7, superseding §8.5's
+day-6+4-candidates-in-72h row: the spike is relative to a trailing baseline,
+and the floor is anchored on the session watermark.
 
 Evaluated at the end of each nightly trickle run (wired by PRD task ε) and
 via the standalone `evaluate` CLI subcommand below.
@@ -84,47 +86,20 @@ block directly with a light pyyaml read, falling back to defaults on a
 missing/malformed file. Those defaults ARE sourced from β's
 `legibility.config.Census` pydantic model (scripts/legibility/config.py),
 though -- now that β has landed, it is the single source of truth for the
-six §7.4 threshold values, so `CensusConfig`'s fields read their defaults
+census threshold values, so `CensusConfig`'s fields read their defaults
 from it rather than re-hardcoding them (see the `CensusConfig` docstring).
 
-The get_statuses done-count fetch is injected (`status_fetcher`), not a
-hardcoded MCP/HTTP client. The seam exists for DETERMINISM, and it is not a
-workaround for a missing package: httpx IS installed here -- a direct
-dependency of `shared` (shared/pyproject.toml, `httpx>=0.27`, task 2965) --
-so `default_status_fetcher`'s lazy `import httpx` below resolves to the real
-library and really does POST to $FUSED_MEMORY_MCP_URL (default
-localhost:8002). On any box running the fused-memory stack that POST
-SUCCEEDS, so a test leaning on ambient unreachability flaps with the host's
-listener state (task 3291). Injecting therefore matters MORE now, not less:
-it keeps the pure decision core fully unit-testable and makes "a failing
-get_statuses fails SAFE" testable with a raising fake regardless of what is
-listening. An MCP client is importable here too, symmetrically with httpx:
-`fastmcp>=3.2` is a direct dependency of `shared` (shared/pyproject.toml,
-task 3689), and fastmcp in turn depends on `mcp`, so `mcp` and
-`mcp.client.streamable_http` both resolve under `uv run --project
-shared` -- a hardcoded MCP client would run here too, and would really
-reach whatever is listening. So, as with httpx, this seam's rationale rests
-on DETERMINISM ALONE -- a pure, unit-testable decision core and a fail-safe
-path exercisable with a raising fake -- regardless of what is installed or
-listening, never on either package being absent. This paragraph has now had
-a package-absence claim rot TWICE: "no httpx" (fixed by task 3376) and "no
-MCP client" (fixed here by task 4110, which rotted on 2026-08-10 when task
-3689 added fastmcp to shared/pyproject.toml). Never re-ground this
-rationale on a package's absence again.
-`default_status_fetcher` provides the best-effort glue implementation, and
-since task 4148 it is the SHARED production factory for all three
-consumers -- the standalone `evaluate` CLI, `census.py`'s `main()`, and the
-nightly trickle's `run_nightly` (which defaults its `status_fetcher` seam
-to it). It unwraps the real MCP `tools/call` JSON-RPC envelope via
-`_extract_tool_result` (the tool's actual return value lives at
-`result.structuredContent` or `result.content[0].text`, never at the
-envelope's top level). It resolves its `project_root` to an ABSOLUTE path
-before sending it: the MCP
-argument is interpreted by the server's cwd, not the client's, and
-fused-memory's `_normalize_project_root` hard-rejects any relative path
-(task 3291). Whatever the fetcher returns is converted to a number by
-`extract_done_count`, never by an inline `.get("statuses")` -- see that
-function for why.
+The get_statuses done-count fetch is injected (`status_fetcher`) so the
+decision core stays pure and "a failing get_statuses fails SAFE" is testable
+with a raising fake, whatever is listening on the host.
+`default_status_fetcher` is the shared production fetcher for the `evaluate`
+CLI, `census.py`'s `main()` and the nightly trickle's `run_nightly`. It calls
+get_statuses through `shared.mcp_session.SyncMcpSession`, which hands back
+the tool's unwrapped reply, and it resolves `project_root` to an ABSOLUTE
+path first because fused-memory's `_normalize_project_root` rejects a
+relative one. Whatever the fetcher returns is validated by
+`extract_statuses` (and counted by `extract_done_count`), never read by an
+inline `.get("statuses")` -- see those functions for why.
 """
 from __future__ import annotations
 
@@ -132,16 +107,23 @@ import argparse
 import json
 import logging
 import os
+import statistics
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from enum import Enum
 from pathlib import Path
-from typing import overload
+from typing import Any, overload
 
 import yaml
 from legibility import codebook
 from legibility.config import Census as _LegibilityCensus
+
+if (_SHARED_SRC := str(Path(__file__).resolve().parents[2] / "shared" / "src")) not in sys.path:
+    sys.path.insert(0, _SHARED_SRC)
+
+from shared.mcp_session import McpCallError, SyncMcpSession
 
 logger = logging.getLogger("legibility.census_trigger")
 
@@ -175,11 +157,11 @@ def _as_utc(value: datetime | None) -> datetime | None:
 # CensusConfig — §7.4 census: block, with hardcoded defaults
 # ---------------------------------------------------------------------------
 
-# Single source of truth for the six §7.4 threshold *values*: task β's
+# Single source of truth for the census threshold *values*: task β's
 # `Census` pydantic model (scripts/legibility/config.py), instantiated once
 # at import time. `CensusConfig` below stays its own flat dataclass (not
-# `Census` itself) because its nested `novelty_spike.count`/`window_hours`
-# shape doesn't match the flat attributes `evaluate()` and `from_mapping`
+# `Census` itself) because its nested `novelty_spike` block's shape doesn't
+# match the flat attributes `evaluate()` and `from_mapping`
 # read/merge -- but its field *defaults* are pulled from here so the two
 # schemas cannot silently drift apart (review finding, task 2579 amendment
 # pass: config.py did not exist yet when this module was first written).
@@ -188,7 +170,7 @@ _CENSUS_DEFAULTS = _LegibilityCensus()
 
 @dataclass(frozen=True)
 class CensusConfig:
-    """The six §7.4 census-trigger thresholds. Field defaults are sourced
+    """The census-trigger thresholds. Field defaults are sourced
     from `legibility.config.Census` (see `_CENSUS_DEFAULTS` above), not
     re-hardcoded here. `from_mapping` merges a partial override mapping
     (e.g. the `census:` sub-dict of a project's legibility.yaml) over these
@@ -203,6 +185,8 @@ class CensusConfig:
     tasks_landed_min_days: int = _CENSUS_DEFAULTS.tasks_landed_min_days
     novelty_spike_count: int = _CENSUS_DEFAULTS.novelty_spike.count
     novelty_spike_window_hours: int = _CENSUS_DEFAULTS.novelty_spike.window_hours
+    novelty_spike_multiple: int = _CENSUS_DEFAULTS.novelty_spike.multiple
+    novelty_spike_baseline_days: int = _CENSUS_DEFAULTS.novelty_spike.baseline_days
     floor_days: int = _CENSUS_DEFAULTS.floor_days
 
     @classmethod
@@ -222,7 +206,7 @@ class CensusConfig:
         whole batch is reported in exactly one WARNING. This method NEVER
         raises.
 
-        Per-field fallback, not a whole-block reject, because the six
+        Per-field fallback, not a whole-block reject, because the
         thresholds are independent: one typo'd `novelty_spike.count` must not
         also disarm the (a) max-interval backstop.
 
@@ -283,6 +267,14 @@ class CensusConfig:
                 "novelty_spike.window_hours", novelty_spike, "window_hours",
                 defaults.novelty_spike_window_hours,
             ),
+            novelty_spike_multiple=_threshold(
+                "novelty_spike.multiple", novelty_spike, "multiple",
+                defaults.novelty_spike_multiple,
+            ),
+            novelty_spike_baseline_days=_threshold(
+                "novelty_spike.baseline_days", novelty_spike, "baseline_days",
+                defaults.novelty_spike_baseline_days,
+            ),
             floor_days=_threshold(
                 "floor_days", mapping, "floor_days", defaults.floor_days,
             ),
@@ -318,22 +310,87 @@ class Decision:
     reasons: list[str]
 
 
+class FloorAnchorKind(Enum):
+    SESSION_WATERMARK = "session watermark"
+    LAST_CENSUS_AT = "last_census_at (no watermark yet)"
+    EARLIEST_CODEBOOK_DATE = "earliest codebook date (never censused)"
+
+
+@dataclass(frozen=True)
+class FloorAnchor:
+    """The instant the census floor is measured from, and where it came from."""
+
+    kind: FloorAnchorKind
+    at: datetime
+
+
+def _floor_condition(
+    now_utc: datetime, anchor: FloorAnchor | None, config: CensusConfig
+) -> tuple[bool, str]:
+    if anchor is None:
+        return True, (
+            "floor: no anchor (no session watermark, last_census_at or codebook date)"
+            " -> BLOCKS all conditions"
+        )
+    days = (now_utc - _as_utc(anchor.at)).total_seconds() / 86400.0
+    blocks = days < config.floor_days
+    line = f"floor: {days:.1f}d since {anchor.kind.value} (floor {config.floor_days}d)"
+    return blocks, line + (" -> BLOCKS all conditions" if blocks else "")
+
+
+def _count_within(first_seens_utc: list[datetime], *, end: datetime, hours: int) -> int:
+    start = end - timedelta(hours=hours)
+    return sum(1 for fs in first_seens_utc if start <= fs <= end)
+
+
+def _novelty_condition(
+    now_utc: datetime, candidate_first_seens: list[datetime], config: CensusConfig
+) -> tuple[bool, str]:
+    seen = [_as_utc(fs) for fs in candidate_first_seens]
+    hours = config.novelty_spike_window_hours
+    baseline_days = config.novelty_spike_baseline_days
+    count = _count_within(seen, end=now_utc, hours=hours)
+    head = f"novelty-spike: {count} within {hours}h"
+
+    history_days = (now_utc - min(seen)).total_seconds() / 86400.0 if seen else 0.0
+    if history_days < baseline_days:
+        return False, (
+            f"{head} (baseline needs {baseline_days}d of candidate history, "
+            f"have {history_days:.1f}d) -> N/A"
+        )
+
+    baseline = (
+        statistics.median(
+            _count_within(seen, end=now_utc - timedelta(days=k), hours=hours)
+            for k in range(1, baseline_days + 1)
+        )
+        if baseline_days
+        else 0.0
+    )
+    spike = count >= config.novelty_spike_count and count >= config.novelty_spike_multiple * baseline
+    line = f"{head} (baseline median {baseline:g}, x{config.novelty_spike_multiple})"
+    return spike, line + (" -> FIRE" if spike else "")
+
+
 def evaluate(
     *,
     now: datetime,
     last_census_at: datetime | None,
-    never_censused: bool,
+    floor_anchor: FloorAnchor | None,
     tasks_landed: int | None,
     candidate_first_seens: list[datetime],
     config: CensusConfig,
 ) -> Decision:
-    """Pure decision core for the §6/§8.5 fire logic. Fires at the earliest
+    """Pure decision core for the census fire logic. Fires at the earliest
     of condition (a) max_interval_days, (b) tasks_landed_min_days +
-    tasks_landed_threshold, (c) novelty_spike — all three, and the
-    floor_days hard floor that overrides them, are implemented in the body
-    below (`cond_a`, `cond_b`, `cond_c`, `floor_blocks`). No I/O:
-    all inputs are plain values so the full §8.5 matrix is testable without
-    a filesystem or a live get_statuses call.
+    tasks_landed_threshold, (c) novelty_spike, subject to a floor measured
+    from `floor_anchor` (plans/census-incremental-prd.md §4.7 Floor): inside
+    floor_days of the anchor nothing fires. The floor never fires by itself,
+    and its reason line always names its anchor. The novelty condition is
+    relative to the median of the daily window counts over the trailing
+    baseline_days, and N/A until that much candidate history exists (PRD
+    §4.7 (b)). No I/O: all inputs are plain values so the full matrix is
+    testable without a filesystem or a live get_statuses call.
     """
     now_utc = _as_utc(now)
     last_utc = _as_utc(last_census_at)
@@ -372,33 +429,13 @@ def evaluate(
             )
         )
 
-    window_start = now_utc - timedelta(hours=config.novelty_spike_window_hours)
-    in_window = [
-        fs for fs in candidate_first_seens if window_start <= _as_utc(fs) <= now_utc
-    ]
-    cond_c = len(in_window) >= config.novelty_spike_count
-    reasons.append(
-        "novelty-spike: {} candidate(s) within {}h (threshold {}){}".format(
-            len(in_window),
-            config.novelty_spike_window_hours,
-            config.novelty_spike_count,
-            " -> FIRE" if cond_c else "",
-        )
-    )
+    cond_c, novelty_line = _novelty_condition(now_utc, candidate_first_seens, config)
+    reasons.append(novelty_line)
 
-    triggered = cond_a or cond_b or cond_c
+    floor_blocks, floor_line = _floor_condition(now_utc, floor_anchor, config)
+    reasons.append(floor_line)
 
-    floor_blocks = (
-        not never_censused and days_since is not None and days_since < config.floor_days
-    )
-    if floor_blocks:
-        reasons.append(
-            f"floor: only {days_since:.1f}d since last census (floor {config.floor_days}d) -> BLOCKS all conditions"
-        )
-    elif never_censused:
-        reasons.append("floor: never censused -> exempt")
-
-    fire = triggered and not floor_blocks
+    fire = (cond_a or cond_b or cond_c) and not floor_blocks
 
     return Decision(fire=fire, reasons=reasons)
 
@@ -406,6 +443,16 @@ def evaluate(
 # ---------------------------------------------------------------------------
 # load_census_state — §7.5 census-state.json reader (three-valued)
 # ---------------------------------------------------------------------------
+
+CENSUS_STATE_RELPATH = Path("docs") / "legibility" / "census-state.json"
+
+
+def census_state_path(project_root: str | Path) -> Path:
+    """The ONE spelling of a project's census-state.json path: the census
+    writes it, the trigger reads it, and the nightly records it for
+    ``check_census_progress.py`` to re-read."""
+    return Path(project_root) / CENSUS_STATE_RELPATH
+
 
 _STATE_TIMESTAMP_KEYS = ("last_census_at", "session_watermark")
 
@@ -495,7 +542,7 @@ def codebook_signal(codebook: dict) -> tuple[datetime | None, list[datetime]]:
     """Extract the census-trigger signal from a `codebook.load()`-shaped
     dict (task γ / 2575's schema): the earliest structured sighting or
     candidate `first_seen`/sighting date across the WHOLE codebook (used to
-    anchor condition (a) when `never_censused`), and every candidate's
+    anchor condition (a) and the floor when never censused), and every candidate's
     `first_seen` date on its own (used for condition (c)'s novelty-spike
     window count). Unparseable dates are skipped rather than raising.
 
@@ -544,7 +591,7 @@ def load_census_config(project_root: str | Path) -> CensusConfig:
     A file that parses but holds an unusable threshold VALUE (a quoted
     `'10'`, a float, a JSON `true`, a negative) is handled one level down by
     `CensusConfig.from_mapping`, which rejects that field alone -- default
-    plus one WARNING for the batch -- so the other five thresholds stay live.
+    plus one WARNING for the batch -- so the other thresholds stay live.
     Between the two, this function returns a fully-typed `CensusConfig` for
     any input whatsoever, which is what makes its never-raises contract, and
     `decide_for_project`'s, actually hold.
@@ -631,16 +678,16 @@ def extract_done_count(payload) -> int:
     `StatusFetchUnavailable` if *payload* is not a usable get_statuses
     envelope.
 
-    This is the SOLE place a get_statuses payload is turned into a number,
-    and it exists because the idiom it replaces silently fabricated
-    baselines. Both `compute_tasks_landed` below and `census.run_census`
+    The count is taken over `extract_statuses(payload)`, the SOLE place a
+    get_statuses payload is validated, and that validation exists because
+    the idiom it replaces silently fabricated baselines. Both `compute_tasks_landed` below and `census.run_census`
     used to inline `sum(1 for v in (payload.get("statuses") or {}).values()
     if v == "done")`. That `or {}` swallowed *every* unusable payload into a
     done-count of 0 -- no warning, no exception, no way to tell a real
     empty project from a failed call. fused-memory's `@mcp_tool_errors`
     returns its `{"error", "error_type"}` dict on an `isError: false`
-    JSON-RPC response, so `_extract_tool_result` unwraps it as though it
-    were a genuine result and the old idiom read it as 0. That fabricated 0
+    JSON-RPC response, so the client unwraps it as though it were a
+    genuine result and the old idiom read it as 0. That fabricated 0
     was persisted as a real census baseline on 2026-07-24 and on 2026-07-31
     (task 3291) — an unsound baseline that stayed latent only for as long as
     the fetch itself was broken (the same defect zeroed `current_done`, so
@@ -657,14 +704,12 @@ def extract_done_count(payload) -> int:
     non-mapping `statuses` key, a non-dict payload, or the tool-error
     envelope is treated as unavailable.
 
-    Note this strictness deliberately lives HERE and not in
-    `_extract_tool_result`: that unwrapper is shared with
-    `census._post_mcp_tool_call`, which serves `submit_task` and
-    `escalate_info`, and those callers legitimately receive and inspect the
-    `{"error": ...}` dict (submit_task's documented rejection shape).
-    Raising there would break unrelated paths; raising at the
-    get_statuses-specific boundary closes the hole at both call sites at
-    once without touching them.
+    Note this strictness deliberately lives HERE and not in the MCP client:
+    `SyncMcpSession.call_tool` hands every caller the tool's reply as-is,
+    and `submit_task`'s callers legitimately receive and inspect its
+    `{"error": ...}` rejection dict. Raising at the get_statuses-specific
+    boundary closes the hole for both done-count consumers without touching
+    unrelated paths.
 
     Raises:
         StatusFetchUnavailable: with a message naming the offending shape --
@@ -674,6 +719,23 @@ def extract_done_count(payload) -> int:
             in full; any embedded value repr is bounded, because this message
             is re-emitted into the nightly journal as a single log line (see
             `_bounded_repr`).
+    """
+    return count_done(extract_statuses(payload))
+
+
+def count_done(statuses: Mapping[str, Any]) -> int:
+    """How many tasks of an `extract_statuses` mapping are `"done"`."""
+    return sum(1 for status in statuses.values() if status == "done")
+
+
+def extract_statuses(payload) -> Mapping[str, Any]:
+    """The `{task id string: status}` mapping of a get_statuses payload, or
+    raise `StatusFetchUnavailable` if *payload* is not a usable get_statuses
+    envelope (see `extract_done_count` for why each shape is rejected).
+
+    `{"statuses": {}}` is a valid, empty answer. A census run reads one
+    snapshot through here and derives both its outcome feed and its
+    done-count from it, so the two cannot disagree.
     """
     if not isinstance(payload, dict):
         raise StatusFetchUnavailable(
@@ -705,7 +767,7 @@ def extract_done_count(payload) -> int:
             f"(got {type(statuses).__name__}{sized}): {_bounded_repr(statuses)}"
         )
 
-    return sum(1 for status in statuses.values() if status == "done")
+    return statuses
 
 
 def compute_tasks_landed(*, state: dict | None, status_fetcher) -> int | None:
@@ -720,8 +782,8 @@ def compute_tasks_landed(*, state: dict | None, status_fetcher) -> int | None:
     usable `{"statuses": {id: status}}` envelope (matching get_statuses' real
     shape -- fused-memory/src/fused_memory/server/tools.py:2665). In
     particular fused-memory's `{"error", "error_type"}` tool-error dict --
-    which rides an `isError: false` JSON-RPC response and so survives
-    `_extract_tool_result` intact -- fails SAFE here rather than counting
+    which rides an `isError: false` JSON-RPC response and so reaches the
+    fetcher as the tool's reply -- fails SAFE here rather than counting
     zero; see `extract_done_count` for why counting zero was the defect
     (task 3291). Otherwise returns `current_done - baseline`.
 
@@ -802,544 +864,34 @@ def compute_tasks_landed(*, state: dict | None, status_fetcher) -> int | None:
 _FUSED_MEMORY_URL_ENV_VAR = "FUSED_MEMORY_MCP_URL"
 _DEFAULT_FUSED_MEMORY_URL = "http://localhost:8002"  # dashboard.config.DEFAULT_FUSED_MEMORY_URLS[0]
 
-# Single source of truth for the headers every legibility poster must send on
-# a `tools/call` POST to a local MCP `/mcp` endpoint. The streamable-HTTP MCP
-# transport 406s ("Not Acceptable: Client must accept application/json")
-# *before* even dispatching the tools/call if `Accept` doesn't include BOTH
-# media types -- verified live against localhost:8002 (and :8003). The reply's
-# Content-Type then depends on the SERVER, not on this header: the stateless
-# fused-memory server answers `application/json`, while the stateful escalation
-# server answers an authenticated `tools/call` with `text/event-stream` (task
-# 3644, verified live against :8103 -- the claim previously recorded here, that
-# these calls are never SSE-framed, was wrong and cost every legibility
-# escalation). `_decode_mcp_body` below handles both.
-# Kept load-bearing-constant-single-sourced here (census_trigger is
-# already imported by census.py, nightly.py, and check_transcript_persistence.py)
-# so a future transport change is a one-line edit, not four lockstep edits
-# with a silent-406 risk on any one that's missed. All FOUR legibility MCP
-# consumers -- nightly._default_poster, census._post_mcp_tool_call,
-# check_transcript_persistence._default_poster and this module's own
-# default_status_fetcher -- now reach the wire only through
-# `post_mcp_envelope`/`post_mcp_tool_call` below, so this header pair (and the
-# session handshake, and SSE decoding) has exactly one definition.
-MCP_STREAMABLE_HTTP_HEADERS = {
-    "Accept": "application/json, text/event-stream",
-    "Content-Type": "application/json",
-}
-
-
-def _extract_tool_result(rpc_response: dict) -> dict:
-    """Unwrap a JSON-RPC `tools/call` response into the tool's actual
-    return value.
-
-    An MCP `tools/call` response does NOT put the tool's result at the top
-    level of the JSON-RPC envelope: FastMCP places it at
-    `result.structuredContent` (get_statuses declares a typed return,
-    `-> dict[str, Any]`) and/or as a JSON string at `result.content[0].text`
-    (the universal fallback every MCP client must support). Returning
-    `response.json()` verbatim -- the envelope, not the unwrapped value --
-    left `compute_tasks_landed` reading a `statuses` key that was never
-    there, so `current_done` was silently always `0` and the delta always
-    negative (never fires condition (b), but with zero visibility into why;
-    review finding, task 2579 amendment pass).
-
-    Prefers `structuredContent` (already a dict, no string to parse);
-    falls back to parsing `content[0].text` (mirrors
-    `dashboard.data.memory._extract_tool_result`, the same unwrap this
-    codebase already relies on elsewhere for a live get_statuses call).
-
-    Raises `StatusFetchUnavailable` -- rather than returning `{}` -- when
-    neither shape is present/parseable, so a malformed envelope fails safe
-    through the exact same path as a network failure (one WARNING logged by
-    `compute_tasks_landed`) instead of silently degrading to an
-    unwarned-about negative delta.
-    """
-    result = rpc_response.get("result") if isinstance(rpc_response, dict) else None
-    if not isinstance(result, dict):
-        raise StatusFetchUnavailable(
-            f"malformed MCP response (no result): {_bounded_repr(rpc_response)}"
-        )
-
-    structured = result.get("structuredContent")
-    if isinstance(structured, dict):
-        return structured
-
-    content = result.get("content")
-    if isinstance(content, list) and content:
-        first = content[0]
-        text = first.get("text") if isinstance(first, dict) else None
-        if isinstance(text, str):
-            try:
-                parsed = json.loads(text)
-            except json.JSONDecodeError as exc:
-                raise StatusFetchUnavailable(f"unparseable MCP content text: {exc}") from exc
-            if isinstance(parsed, dict):
-                return parsed
-
-    raise StatusFetchUnavailable(
-        f"MCP tools/call result has neither structuredContent nor parseable "
-        f"content: {_bounded_repr(result)}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# post_mcp_envelope / post_mcp_tool_call — the session-aware MCP transport
-# ---------------------------------------------------------------------------
-#
-# THE ROOT-CAUSE FIX (task 3644). Two MCP servers, two transport MODES, and
-# every legibility poster spoke only to the second one:
-#
-#   fused-memory (:8002) is STATELESS -- a bare `tools/call` POST returns 200
-#   with `content-type: application/json` and no session id. This is why
-#   `census.default_submit_fn` works today and must keep working.
-#
-#   the escalation server (:8103) is STATEFUL. A bare `tools/call` POST is
-#   rejected at the TRANSPORT layer, before the tool ever runs (captured
-#   verbatim from a live probe on 2026-08-05):
-#
-#       HTTP/1.1 400 Bad Request
-#       mcp-session-id: 93599e03ba3b4baeb5bd0d2b6b399ddd
-#       {"jsonrpc":"2.0","id":"server-error",
-#        "error":{"code":-32600,"message":"Bad Request: Missing session ID"}}
-#
-# All THREE legibility fail-loud escalation posters (census._post_mcp_tool_call,
-# nightly._default_poster, check_transcript_persistence._default_poster) target
-# the escalation server and all three swallow failures best-effort, so all three
-# were silently dropping every escalation they ever filed. Single-sourcing the
-# transport here -- alongside MCP_STREAMABLE_HTTP_HEADERS, which the task-2953
-# 406 fix centralised for exactly this reason -- keeps the fix one edit instead
-# of three lockstep ones.
-#
-# The handshake sequence is ported (to a synchronous, single-shot form) from
-# `fused-memory/scripts/cgl_eta_scheduler_gate.py::McpClient` (task 2491), the
-# same fix in async form; its two hard-won traps are carried over below.
-
-_MCP_PROTOCOL_VERSION = "2024-11-05"
-_MCP_CLIENT_INFO = {"name": "dark-factory-legibility", "version": "1.0"}
-_MCP_SESSION_HEADER = "mcp-session-id"
-
-# The stateful server's "you need a session" status. ONLY this status triggers
-# the handshake+retry: any other non-2xx is a genuine server failure and must
-# propagate unretried rather than be double-sent and buried in handshake noise.
-_MCP_SESSION_REQUIRED_STATUS = 400
-
-
-def _sse_data_payloads(text: str) -> list[str]:
-    """Split an SSE body into one `data` payload per FRAME, per the SSE
-    framing rules -- not one per `data:` LINE.
-
-    Two rules matter here and both were got wrong by the first cut of this
-    code (review finding, task 3644 amendment pass):
-
-    * A frame is terminated by a BLANK line, and a single frame's `data`
-      field is the newline-JOIN of every `data:` line it contains. Parsing
-      only the first line of a multi-line payload feeds `json.loads` a
-      fragment, which raises on a response that was perfectly well-formed.
-    * A stream may carry MORE THAN ONE frame. FastMCP sends progress/log
-      notifications over the same `tools/call` stream whenever a tool takes a
-      `Context`, so the first frame is not necessarily the response. (The
-      escalation tools take no `Context` today, which is why this is latent
-      rather than live -- but the symptom would be a bogus "malformed MCP
-      response (no result)" on a call that SUCCEEDED server-side, i.e. this
-      exact investigation re-opened.)
-
-    Line endings are normalised first: a real server frames with CRLF, and
-    `"data: {...}\r"` would otherwise carry a stray `\r` into `json.loads`.
-    """
-    normalised = text.replace("\r\n", "\n").replace("\r", "\n")
-    payloads = []
-    for frame in normalised.split("\n\n"):
-        data_lines = [
-            line[len("data:"):].lstrip()
-            for line in frame.split("\n")
-            if line.startswith("data:")
-        ]
-        if data_lines:
-            payloads.append("\n".join(data_lines))
-    return payloads
-
-
-def _decode_sse_body(text: str) -> dict:
-    """Return the first JSON-RPC RESPONSE object framed in an SSE body.
-
-    "Response" means an object carrying `result` or `error`: notification
-    frames (which have `method` and no `id`) are skipped rather than
-    returned, so a progress notification ahead of the real reply cannot be
-    mistaken for it.
-
-    Raises rather than returning `{}` when no frame qualifies -- a malformed
-    or notification-only stream is a real fault, and degrading it to an empty
-    result is precisely the silent-failure mode task 3644 exists to close.
-    Every reported body goes through `_bounded_repr` so one oversized stream
-    cannot turn a warning into a screenful.
-    """
-    payloads = _sse_data_payloads(text)
-    if not payloads:
-        raise StatusFetchUnavailable(
-            f"no SSE data line in MCP response body: {_bounded_repr(text)}"
-        )
-
-    undecodable = []
-    for payload in payloads:
-        try:
-            decoded = json.loads(payload)
-        except json.JSONDecodeError as exc:
-            # Do NOT fail here: a malformed NOTIFICATION frame must not
-            # destroy an otherwise-good response frame behind it. The error is
-            # kept and reported only if nothing usable is found at all.
-            undecodable.append(f"{_bounded_repr(payload)} ({exc})")
-            continue
-        if isinstance(decoded, dict) and ("result" in decoded or "error" in decoded):
-            return decoded
-
-    detail = f"; first undecodable frame: {undecodable[0]}" if undecodable else ""
-    raise StatusFetchUnavailable(
-        f"no MCP result/error frame in SSE response body ({len(payloads)} data "
-        f"frame(s), none carrying a JSON-RPC result or error{detail}): "
-        f"{_bounded_repr(text)}"
-    )
-
-
-def _decode_mcp_body(response) -> dict:
-    """Decode an MCP `/mcp` response body into a JSON-RPC dict.
-
-    Three shapes, all observed live and all load-bearing:
-
-    * `202` / empty content -- `notifications/initialized` answers with no
-      body at all. Yields `{}` rather than raising on the absent JSON.
-    * `text/event-stream` -- what the STATEFUL escalation server (:8103)
-      returns for an authenticated `tools/call`: an `event: message` line
-      followed by `data: {json}`. `response.json()` raises a JSONDecodeError
-      on it, which is the second half of the task-3644 defect: even a
-      correctly handshaken client still dropped every escalation here.
-      Framing is handled by `_decode_sse_body` above.
-    * `application/json` -- the STATELESS fused-memory server (:8002) shape;
-      decoded by `response.json()` exactly as before, unchanged.
-
-    The 202 check is on the STATUS, and `response.text` is read only inside
-    the SSE branch, so decoding a JSON reply never touches the body twice --
-    and an unexpectedly empty 200 surfaces as a loud `json()` failure through
-    the caller's warning rather than as a silent `{}`.
-    """
-    if response.status_code == 202:
-        return {}
-
-    content_type = (response.headers or {}).get("content-type", "")
-    if "text/event-stream" in content_type:
-        return _decode_sse_body(response.text)
-
-    return response.json()
-
-
-def _raise_on_mcp_error(body: dict) -> dict:
-    """Return *body* unchanged unless it reports a failure, in which case
-    raise `StatusFetchUnavailable`.
-
-    HTTP 200 IS NOT SUCCESS on MCP (review finding, task 3644 amendment
-    pass). Both failure shapes ride a 200:
-
-    * a JSON-RPC-level `error` object (the request never reached a tool);
-    * `result.isError: true` (the tool ran and failed) -- FastMCP's shape for
-      a raised `ToolError`.
-
-    `post_escalation` / `post_findings` discard the decoded body entirely and
-    report True on "no exception", so without this check a tool-level failure
-    reads as a landed escalation: the same green-on-paper/nothing-filed
-    failure this task exists to close, moved one layer up from the transport.
-    Raising here drops both siblings into their existing best-effort WARNING +
-    `return False` path, and reaches `census`'s poster too. (The census path
-    was only ACCIDENTALLY protected, by `_extract_tool_result` choking on an
-    error envelope's non-JSON `content[0].text` -- relying on a JSONDecodeError
-    as an error check is exactly the kind of fragility this replaces.)
-    """
-    if not isinstance(body, dict):
-        return body
-
-    error = body.get("error")
-    if error is not None:
-        raise StatusFetchUnavailable(
-            f"MCP server returned a JSON-RPC error: {_bounded_repr(error)}"
-        )
-
-    result = body.get("result")
-    if isinstance(result, dict) and result.get("isError"):
-        raise StatusFetchUnavailable(
-            f"MCP tool reported an error: {_bounded_repr(result)}"
-        )
-    return body
-
-
-def _terminate_mcp_session(url: str, session_headers: dict, *, timeout: float) -> None:
-    """Best-effort DELETE releasing the server-side session behind
-    *session_headers*. Never raises.
-
-    A LEAK FIX, not a nicety (review finding, task 3644 amendment pass). MCP's
-    `StreamableHTTPSessionManager` keeps every session in
-    `self._server_instances[session_id]` with a live per-session `run_server`
-    task, and drops it ONLY on an explicit DELETE (the spec's session
-    termination) or at manager shutdown. The escalation server is a long-lived
-    uvicorn process serving the whole fleet (`harness.py`'s
-    `mcp_server.http_app()` -- the STATEFUL default), so without this every
-    legibility escalation ever posted -- nightly trickle, transcript-persistence
-    check, each census defer/fail-loud -- would permanently add one dict entry
-    plus one live anyio task to it. Slow, unbounded, and introduced by the very
-    handshake that fixed the 400.
-
-    Swallowing is deliberate and asymmetric with the rest of this module: the
-    envelope has ALREADY been delivered by the time this runs, so a failure to
-    tidy up must never turn a landed escalation into a reported failure. It is
-    logged at DEBUG so a leak is still diagnosable if one is ever suspected.
-    """
-    import httpx
-
-    try:
-        httpx.delete(url, headers=session_headers, timeout=timeout)
-    except Exception as exc:  # noqa: BLE001 - tidy-up must never mask delivery
-        logger.debug(
-            "MCP session termination DELETE to %s failed (harmless for this "
-            "call; the server-side session is leaked until it restarts): %s",
-            url, exc,
-        )
-
-
-def post_mcp_envelope(url: str, envelope: dict, *, timeout: float = 30.0) -> dict:
-    """POST one JSON-RPC *envelope* to an MCP `/mcp` endpoint, handshaking
-    only if the server demands a session. Returns the decoded response body.
-
-    ADAPTIVE by design (task 3644): the envelope goes out session-less first,
-    and the MCP `initialize` -> `notifications/initialized` handshake runs
-    only on an HTTP 400. An unconditional handshake would add two round trips
-    to every `submit_task` the census files against the STATELESS fused-memory
-    server and change a path that works today; this way that path stays
-    byte-for-byte one POST. The wasted first POST against a stateful server is
-    harmless -- the 400 is raised at the transport layer before any tool
-    executes, so there is no double-execution risk -- and the retry is bounded
-    to exactly ONE attempt.
-
-    Raises whatever `response.raise_for_status()` raises on any other non-2xx
-    (and any transport exception verbatim); callers wrap this best-effort.
-
-    IMPLEMENTATION CONSTRAINT (task 3376): only `httpx.post` and `httpx.delete`
-    may be used, and the 400 must be detected by reading `response.status_code`
-    BEFORE calling `raise_for_status()` -- never via an httpx exception type and
-    never via `httpx.Client`. The shared `install_fake_httpx` test fixture
-    (scripts/tests/conftest.py) exposes only the verbs a test opts into and
-    `pytest.fail`s loudly on any other attribute, precisely so a future reach
-    for `httpx.Timeout` or `except httpx.HTTPError` cannot stay green off the
-    stub's own miss.
-    """
-    import httpx
-
-    response = httpx.post(
-        url, json=envelope, headers=MCP_STREAMABLE_HTTP_HEADERS, timeout=timeout,
-    )
-    if response.status_code != _MCP_SESSION_REQUIRED_STATUS:
-        response.raise_for_status()
-        return _raise_on_mcp_error(_decode_mcp_body(response))
-
-    # --- stateful server: handshake, then retry the original envelope once ---
-    #
-    # Keep the 400's own body BEFORE discarding it. Not every 400 is about a
-    # missing session: a stateless server (fused-memory :8002, which
-    # `census.default_submit_fn` targets) answers a genuinely bad request with
-    # 400 too, then answers `initialize` with 200 and NO session id -- and the
-    # operator would otherwise get a session-protocol complaint with the real,
-    # server-stated reason thrown away, in a subsystem whose entire premise is
-    # legible failure (review finding, task 3644 amendment pass).
-    first_400 = _bounded_repr(getattr(response, "text", "") or "")
-
-    # TRAP 1 (task 2491): `initialize` MUST be sent session-less. A stateful
-    # server 404s "Session not found" if the client invents its own id -- and
-    # the 400 above carries an `mcp-session-id` response header of its own
-    # which is NOT a usable session either. The only usable id is the one the
-    # server ASSIGNS on the initialize response, so nothing from before this
-    # point is carried forward.
-    init = httpx.post(
-        url,
-        json={
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": _MCP_PROTOCOL_VERSION,
-                "clientInfo": _MCP_CLIENT_INFO,
-                "capabilities": {},
-            },
-        },
-        headers=MCP_STREAMABLE_HTTP_HEADERS,
-        timeout=timeout,
-    )
-    try:
-        init.raise_for_status()
-    except Exception as exc:
-        raise RuntimeError(
-            f"MCP handshake with {url} failed at initialize ({exc}); the "
-            f"original session-less 400 said: {first_400}"
-        ) from exc
-
-    # TRAP 2 (task 2491): capture the session id from the RESPONSE HEADER, and
-    # do it before any 202/empty-body early return -- `initialize` carries a
-    # JSON body but `notifications/initialized` may not.
-    session_id = init.headers.get(_MCP_SESSION_HEADER)
-    if not session_id:
-        raise RuntimeError(
-            f"MCP server at {url} demanded a session (HTTP "
-            f"{_MCP_SESSION_REQUIRED_STATUS}) but assigned no "
-            f"{_MCP_SESSION_HEADER} on initialize; the original 400 said: "
-            f"{first_400}"
-        )
-
-    session_headers = {**MCP_STREAMABLE_HTTP_HEADERS, _MCP_SESSION_HEADER: session_id}
-
-    # From here the SERVER holds state on our behalf, so every exit path must
-    # release it -- hence the try/finally rather than a call after the return
-    # value is computed (review finding, task 3644 amendment pass).
-    try:
-        notified = httpx.post(
-            url,
-            json={"jsonrpc": "2.0", "method": "notifications/initialized",
-                  "params": {}},
-            headers=session_headers,
-            timeout=timeout,
-        )
-        try:
-            notified.raise_for_status()
-        except Exception as exc:
-            raise RuntimeError(
-                f"MCP handshake with {url} failed at notifications/initialized "
-                f"({exc}); the original session-less 400 said: {first_400}"
-            ) from exc
-
-        retried = httpx.post(
-            url, json=envelope, headers=session_headers, timeout=timeout,
-        )
-        try:
-            retried.raise_for_status()
-        except Exception as exc:
-            raise RuntimeError(
-                f"MCP {url} still rejected the envelope after a successful "
-                f"session handshake ({exc}); the original session-less 400 "
-                f"said: {first_400}"
-            ) from exc
-        return _raise_on_mcp_error(_decode_mcp_body(retried))
-    finally:
-        _terminate_mcp_session(url, session_headers, timeout=timeout)
-
-
-def post_mcp_tool_call(
-    url: str, tool_name: str, arguments: dict, *, timeout: float = 30.0,
-) -> dict:
-    """Call MCP tool *tool_name* at *url* and return its unwrapped result.
-
-    The one transport entrypoint every legibility MCP consumer goes through:
-    builds the `tools/call` envelope, posts it via :func:`post_mcp_envelope`
-    (session handshake included when the server is stateful), and unwraps the
-    JSON-RPC envelope via :func:`_extract_tool_result` -- so callers get the
-    tool's actual return value, not `{"jsonrpc": ..., "result": ...}`.
-    """
-    return _extract_tool_result(
-        post_mcp_envelope(
-            url,
-            {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "tools/call",
-                "params": {"name": tool_name, "arguments": arguments},
-            },
-            timeout=timeout,
-        )
-    )
-
 
 def default_status_fetcher(project_root: str | Path):
-    """Return a zero-arg best-effort get_statuses caller.
+    """Return a zero-arg get_statuses caller for *project_root*.
 
-    Since task 4148 this is the SHARED production factory for all three
-    consumers -- the standalone `evaluate` CLI below, `census.py`'s `main()`,
-    and the nightly trickle, whose `run_nightly` defaults its
-    `status_fetcher` seam to `default_status_fetcher(cfg.project_root)`.
-    (It previously served the `evaluate` CLI alone: nothing on the nightly
-    path ever built a fetcher, so condition (b) fell through to
-    `compute_tasks_landed`'s `status_fetcher is None` arm on every real run.)
+    The shared production factory for the `evaluate` CLI, `census.py`'s
+    `main()` and the nightly trickle. It calls fused-memory at
+    `$FUSED_MEMORY_MCP_URL` (default `http://localhost:8002`) and returns
+    the tool's reply, the `{"statuses": {...}}` mapping
+    `compute_tasks_landed` reads. Any failure raises `StatusFetchUnavailable`
+    naming the URL.
 
-    Reads the fused-memory MCP endpoint from the `FUSED_MEMORY_MCP_URL` env
-    var, defaulting to
-    `http://localhost:8002`. `httpx` is imported lazily so importing this
-    module for its pure core never needs it, and so tests can substitute a
-    stub for the real POST -- not for availability (see module docstring);
-    that ImportError, along with
-    any network/HTTP/parse failure, is wrapped as `StatusFetchUnavailable`
-    so callers can catch fetch failures deterministically rather than a bare
-    Exception. The call itself goes through :func:`post_mcp_tool_call`, so the
-    return value is the tool's own unwrapped result -- matching
-    `compute_tasks_landed`'s expected `{"statuses": {...}}` shape rather than
-    the outer JSON-RPC envelope -- and this consumer gets the session
-    handshake and SSE decoding for free along with the other three.
-
-    *project_root* is resolved to an ABSOLUTE path before it crosses the
-    wire: the MCP `get_statuses` argument is interpreted by the SERVER's
-    cwd, not the client's, so a relative path is meaningless there and is
-    hard-rejected by fused-memory's `_normalize_project_root` (task 3291 --
-    see the comment at the resolve call below).
+    *project_root* is resolved to an ABSOLUTE path here, at the wire, for
+    every consumer at once: the server resolves the argument against its own
+    cwd, and fused-memory's `_normalize_project_root` rejects a relative
+    path. An absolute root is sent unchanged.
     """
-    # THE ROOT-CAUSE FIX (task 3291). The MCP argument is resolved by the
-    # server process, not this one, so a relative path is not merely
-    # fragile -- fused-memory's `_normalize_project_root` rejects it
-    # outright with {"error": "project_root must be a non-empty absolute
-    # path, got: '.'", "error_type": "ValidationError"}. That envelope rides
-    # an `isError: false` JSON-RPC response, so it used to sail through
-    # `_extract_tool_result` and get counted as a done-count of 0.
-    #
-    # census.py resolves its own, now required, --project-root (task 3269);
-    # the `evaluate` CLI's "." default still depends on this resolve().
-    #
-    # Resolving HERE, at the wire boundary, rather than at each CLI
-    # entrypoint, fixes every consumer at once -- census.py's main(), the
-    # nightly trickle's decide_for_project, and the `evaluate` CLI all build
-    # their fetcher through this one function. Fixing it at the CLIs instead
-    # would need lockstep edits with the same silent-failure risk this
-    # module already single-sources MCP_STREAMABLE_HTTP_HEADERS to avoid.
-    #
-    # census.py's own Path(args.project_root) stays relative-friendly: it is
-    # used for local filesystem access (config, codebook, report, state),
-    # where a cwd-relative path resolves correctly in-process. Only the
-    # over-the-wire argument was ever broken.
     project_root_str = str(Path(project_root).resolve())
-    url = os.environ.get(_FUSED_MEMORY_URL_ENV_VAR, _DEFAULT_FUSED_MEMORY_URL)
+    base_url = os.environ.get(_FUSED_MEMORY_URL_ENV_VAR, _DEFAULT_FUSED_MEMORY_URL)
 
     def _fetch() -> dict:
         try:
-            # Availability probe only -- the POST itself goes out through
-            # `post_mcp_tool_call`, which does its own lazy import. Kept so an
-            # absent httpx still surfaces as the specific "httpx is not
-            # installed" StatusFetchUnavailable rather than as a generic
-            # "get_statuses unreachable" wrapped ImportError.
-            import httpx  # noqa: F401
-        except ImportError as exc:
-            raise StatusFetchUnavailable("httpx is not installed") from exc
-
-        try:
-            # Routed through the ONE shared transport (review finding, task
-            # 3644 amendment pass) rather than a hand-rolled POST: this is the
-            # fourth legibility MCP consumer, and the other three moved. The
-            # hand-rolled copy was byte-for-byte what `post_mcp_tool_call` does
-            # MINUS the session handshake and SSE decoding -- so it was the one
-            # remaining place where a fused-memory switch to a stateful
-            # `http_app()` (the same default the escalation server runs) would
-            # silently break the done-count baseline through
-            # `StatusFetchUnavailable`, i.e. reproduce this exact bug in the
-            # last unmigrated consumer.
-            return post_mcp_tool_call(
-                f"{url}/mcp",
-                "get_statuses",
-                {"project_root": project_root_str},
-                timeout=10.0,
-            )
-        except StatusFetchUnavailable:
-            raise
-        except Exception as exc:  # noqa: BLE001 - any failure must fail safe
+            with SyncMcpSession(
+                base_url, client_name="legibility-census-trigger", timeout=10.0,
+            ) as session:
+                return session.call_tool("get_statuses", {"project_root": project_root_str})
+        except McpCallError as exc:
             raise StatusFetchUnavailable(
-                f"get_statuses unreachable at {url}: {exc}"
+                f"get_statuses unreachable at {base_url}: {exc}"
             ) from exc
 
     return _fetch
@@ -1348,6 +900,26 @@ def default_status_fetcher(project_root: str | Path):
 # ---------------------------------------------------------------------------
 # decide_for_project — high-level assembly (config + state + codebook signal)
 # ---------------------------------------------------------------------------
+
+def _trigger_anchors(
+    state: dict | None, *, never_censused: bool, earliest_codebook_date: datetime | None
+) -> tuple[datetime | None, FloorAnchor | None]:
+    """The instant max-interval and tasks-landed measure from, and the floor's anchor."""
+    if never_censused:
+        if earliest_codebook_date is None:
+            return None, None
+        return earliest_codebook_date, FloorAnchor(
+            FloorAnchorKind.EARLIEST_CODEBOOK_DATE, earliest_codebook_date
+        )
+    state = state or {}
+    last_census_at = _parse_date(state.get("last_census_at"))
+    watermark = _parse_date(state.get("session_watermark"))
+    if watermark is not None:
+        return last_census_at, FloorAnchor(FloorAnchorKind.SESSION_WATERMARK, watermark)
+    if last_census_at is None:
+        return None, None
+    return last_census_at, FloorAnchor(FloorAnchorKind.LAST_CENSUS_AT, last_census_at)
+
 
 def decide_for_project(
     project_root: str | Path,
@@ -1388,9 +960,7 @@ def decide_for_project(
 
     config = load_census_config(project_root)
 
-    state_status, state = load_census_state(
-        project_root / "docs" / "legibility" / "census-state.json"
-    )
+    state_status, state = load_census_state(census_state_path(project_root))
     if state_status == "malformed":
         return Decision(
             fire=False,
@@ -1409,13 +979,9 @@ def decide_for_project(
         logger.warning("codebook at %s is unreadable: %s", codebook_path, exc)
         earliest_sighting, candidate_first_seens = None, []
 
-    if never_censused:
-        last_census_at = earliest_sighting
-    else:
-        raw_last_census_at = (state or {}).get("last_census_at")
-        last_census_at = (
-            datetime.fromisoformat(raw_last_census_at) if raw_last_census_at else None
-        )
+    last_census_at, floor_anchor = _trigger_anchors(
+        state, never_censused=never_censused, earliest_codebook_date=earliest_sighting
+    )
 
     try:
         tasks_landed = compute_tasks_landed(state=state, status_fetcher=status_fetcher)
@@ -1442,7 +1008,7 @@ def decide_for_project(
     return evaluate(
         now=now,
         last_census_at=last_census_at,
-        never_censused=never_censused,
+        floor_anchor=floor_anchor,
         tasks_landed=tasks_landed,
         candidate_first_seens=candidate_first_seens,
         config=config,

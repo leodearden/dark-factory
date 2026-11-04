@@ -46,6 +46,7 @@ from shared.merge_state import (
     SUBMIT_NON_TERMINAL,
     SUBMIT_TERMINAL,
     TERMINAL_STATES,
+    MergeReason,
     MergeState,
     MergeSubmitStatus,
 )
@@ -73,21 +74,17 @@ _MERGE_TYPES_SOURCE = (
 # member — see the plan's design decision on _map_live_state.
 _LEGACY_LIVE = frozenset({'queued', 'verifying', 'gate', 'finalizing'})
 
-# escalation/src/escalation/server.py::_map_terminal_state — every value it
-# returns.  NOTE 'already_merged' is deliberately NOT a MergeState member:
-# _map_terminal_state collapses it to 'done' (it is a SUBMIT-only value, i.e. a
+# escalation/src/escalation/merge_status_answer.py::map_terminal_state — every
+# value it returns.  NOTE 'already_merged' is deliberately NOT a MergeState
+# member: map_terminal_state collapses it to 'done' (it is a SUBMIT-only value, i.e. a
 # MergeSubmitStatus member).  Same for 'done_wip_recovery' -> 'done' and
 # 'wip_halted'/'wip_recovery_no_advance'/'unmerged_state'/'unknown_branch'/
 # 'error' -> 'blocked'.
 _LEGACY_TERMINAL = frozenset({'done', 'conflict', 'blocked', 'abandoned', 'superseded'})
 
-# escalation/src/escalation/server.py::_found_on_main_response — the Tier-3.5
+# escalation/src/escalation/git_authority.py::found_on_main_response — the
 # git-authority response state.
 _LEGACY_FOUND_ON_MAIN = 'done'
-
-# escalation/src/escalation/server.py — the Tier-4 "honest unknown" return, and
-# merge_cancel's no-live-waiter miss path.
-_LEGACY_TIER4 = 'unknown'
 
 def _merge_outcome_status_literal() -> frozenset[str] | None:
     """``MergeOutcome.status``'s ``Literal`` members, read from orchestrator SOURCE.
@@ -266,10 +263,37 @@ class TestPollPartitions:
         } == EPISTEMIC_STATES
 
     def test_poll_stop_states(self):
-        assert TERMINAL_STATES | {MergeState.unknown} == POLL_STOP_STATES
+        assert TERMINAL_STATES | EPISTEMIC_STATES == POLL_STOP_STATES
 
     def test_cancel_states(self):
-        assert TERMINAL_STATES | {MergeState.unknown} == CANCEL_STATES
+        assert OUTCOME_STATES | EPISTEMIC_STATES == CANCEL_STATES
+
+
+class TestMergeReason:
+    """The closed ``reason`` companion of an epistemic ``state`` (PRD OQ3)."""
+
+    def test_is_str_enum(self):
+        assert issubclass(MergeReason, enum.StrEnum)
+
+    def test_exact_vocabulary(self):
+        assert {r.value for r in MergeReason} == {
+            'never_submitted',
+            'prior_run_terminal',
+            'journaled_not_live',
+            'coalesce_train_id',
+            'landing_unattributable',
+            'probe_failed',
+        }
+
+    def test_member_names_are_the_wire_values(self):
+        for member in MergeReason:
+            assert member.name == member.value, (
+                f'MergeReason.{member.name} has wire value {member.value!r}; '
+                'member names must BE the wire values (the MergeState convention)'
+            )
+
+    def test_is_distinct_from_merge_state(self):
+        assert set() == {r.value for r in MergeReason} & {s.value for s in MergeState}
 
 
 class TestPartitionsAreExhaustiveAndDisjoint:
@@ -324,31 +348,23 @@ class TestParityWithTodaysServer:
         assert {s.value for s in LIVE_STATES} == _LEGACY_LIVE
 
     def test_terminal_states_match_map_terminal_state(self):
-        # escalation/src/escalation/server.py::_map_terminal_state
+        # escalation/src/escalation/merge_status_answer.py::map_terminal_state
         assert {s.value for s in TERMINAL_STATES} == _LEGACY_TERMINAL
 
     def test_found_on_main_is_done(self):
-        # escalation/src/escalation/server.py::_found_on_main_response
+        # escalation/src/escalation/git_authority.py::found_on_main_response
         assert MergeState.done == _LEGACY_FOUND_ON_MAIN
 
-    def test_tier4_is_unknown(self):
-        # escalation/src/escalation/server.py — Tier 4 "honest unknown"
-        assert MergeState.unknown == _LEGACY_TIER4
+    def test_clean_miss_is_no_record(self):
+        # escalation/src/escalation/server.py::merge_status — the walk's
+        # bottom: every tier missed cleanly and git established no landing.
+        assert MergeState.no_record == 'no_record'
 
     def test_already_merged_is_not_a_poll_state(self):
         # _map_terminal_state collapses 'already_merged' to 'done', so it is a
         # SUBMIT-only value.  Asserted explicitly because three runbooks
         # currently name it in a POLL terminal set (that is DEFECT 2).
         assert 'already_merged' not in {s.value for s in MergeState}
-
-    def test_epistemic_members_are_not_emitted_yet(self):
-        # PRD D1's three new epistemic members land in the enum HERE (alpha)
-        # but nothing emits them until beta.  Pinning that they are absent
-        # from today's server output keeps this file honest about which
-        # members are contract-only.
-        not_yet_emitted = {MergeState.no_record, MergeState.stale_record, MergeState.journaled}
-        assert not_yet_emitted <= EPISTEMIC_STATES
-        assert {s.value for s in not_yet_emitted} & (_LEGACY_LIVE | _LEGACY_TERMINAL) == set()
 
 
 class TestStandaloneLoadability:
@@ -381,6 +397,7 @@ class TestStandaloneLoadability:
             'EPISTEMIC_STATES',
             'POLL_STOP_STATES',
             'CANCEL_STATES',
+            'MergeReason',
         ):
             assert hasattr(module, name), (
                 f'{name} does not resolve on a file-path load of {_MERGE_STATE_SOURCE}'

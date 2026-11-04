@@ -16,6 +16,70 @@
       "severity": "suggestion",
       "description": "The new instruction directs the agent, on any get_task error envelope, to 'skip the terminal-state write without flagging'. Since a get_task error can be transient/inconclusive, this path can silently drop a genuine terminal-state contradiction (no temporal_fact written and no Stage 2 flag), producing a false negative in terminal-state reconciliation \u2014 matching the 'review passed but escalation_created' symptom noted for this task.",
       "mutation_type": "error_handling"
+    },
+    {
+      "id": "mined_1174_pool_01",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/stage1.py:88",
+      "category": "incomplete_task_requirement",
+      "severity": "blocking",
+      "description": "Task item 4 asks for the pinned flag_type to be defined as a constant in flag_dedup.py and used by the prompt. flag_dedup.py is in FILES_TO_MODIFY but is untouched; the literal 'terminal_state_pre_check' is hard-coded only in the STAGE1_SYSTEM_PROMPT prose, so the (task_id, flag_type) dedup value has no single code-level home and can drift silently.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1174_pool_02",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/stage1.py:66",
+      "category": "incomplete_task_requirement",
+      "severity": "blocking",
+      "description": "Task item 1 requires replacing all bare tool names in the UUID Resolution Discipline section with FQN form, but two bare `delete_memory` references remain (stage1.py:66 'Before calling `delete_memory`' and stage1.py:75 'NOT valid `delete_memory` IDs'), so the section mixes bare and `mcp__fused-memory__delete_memory` forms.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1174_pool_03",
+      "location": "fused-memory/tests/reconciliation/test_stage1.py:1",
+      "category": "missing_tests",
+      "severity": "blocking",
+      "description": "The new test_stage1.py covers only fix #2 (project_root threading). No test asserts the prompt changes of fixes #1, #3 and #4: FQN tool names in the UUID Resolution / Terminal-State sections, the get_task error-envelope 'inconclusive, skip without flagging' instruction (including its single-brace rendering), or the pinned flag_type, so any of them can regress silently.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1174_pool_04",
+      "location": "fused-memory/src/fused_memory/reconciliation/stages/memory_consolidator.py:272",
+      "category": "duplication_spot",
+      "severity": "suggestion",
+      "description": "The 'Use project_root=\"...\" for tasks scoped to this project.' directive now exists in three hand-written copies: the new private MemoryConsolidator._build_project_root_directive and inline in task_knowledge_sync.py:1267 (Stage 2) and :1407 (Stage 3), with differing empty-root behaviour (Stage 1 omits the line, Stages 2/3 emit project_root=\"\"). There is no shared template next to the _STAGEn_PROJECT_ID_GUIDELINE constants.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1174_pool_05",
+      "location": "fused-memory/src/fused_memory/reconciliation/stages/memory_consolidator.py:262",
+      "category": "comments_stance",
+      "severity": "suggestion",
+      "description": "The new 3-line _build_project_root_directive carries a 7-line docstring that explains newline mechanics and defends the design ('Both payload methods call this helper so the f-string fragment stays in a single place'); this reviewer-answering prose is already inaccurate because _assemble_remediation_payload, a third payload builder, does not call it.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1174_pool_06",
+      "location": "fused-memory/src/fused_memory/reconciliation/stages/memory_consolidator.py:197",
+      "category": "unrequested_output_change",
+      "severity": "suggestion",
+      "description": "Both Stage 1 payload builders previously ended with a newline after the project_id guideline; the change closes the f-string immediately after the directive call, so the payload now has no trailing newline even when project_root is unset. Harmless to the agent but an unannounced change to output on the unset path.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1174_pool_07",
+      "location": "fused-memory/tests/reconciliation/test_stage1.py:24",
+      "category": "test_fixture_duplication",
+      "severity": "suggestion",
+      "description": "test_stage1.py hand-copies the MemoryConsolidator mock wiring from tests/test_stages.py in _make_consolidator, with a drifting line-number pointer ('mirrors test_stages.py ~L1418') and task-number prose, instead of sharing a fixture via conftest or helpers. The new tests/reconciliation/ package location itself is mandated by the task's file list and is not a defect.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1174_pool_08",
+      "location": "fused-memory/tests/reconciliation/test_stage1.py:132",
+      "category": "redundant_assertion",
+      "severity": "suggestion",
+      "description": "In both omit-when-empty tests, `assert 'Use project_root=\"\"' not in result` follows `assert 'Use project_root=' not in result` and can never fail on its own; the tests also do not pin that the payload still ends with the project_id guideline.",
+      "mutation_type": "pooled_2026_10_22"
     }
   ],
   "provenance": {

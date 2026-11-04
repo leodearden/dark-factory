@@ -2,9 +2,10 @@
 
 The live counterpart of ``_falkor_index_doubles``.  Every suite that drives
 ``GraphitiBackend``'s index provisioning against a real FalkorDB needs the same
-three things: throwaway graphs, a backend over a real driver, and the production
-expected-set check.  The first two carry the HAZARD rules below, so they live
-here once; a hazard fix made to one private copy would never reach the others.
+three things: throwaway graphs, a backend over a real driver, and a normalized
+reading of the indices a graph lists, with the production expected-set check
+built on it.  The first two carry the HAZARD rules below, so they live here
+once; a hazard fix made to one private copy would never reach the others.
 
 HAZARD rules, enforced here so no caller can forget one:
 
@@ -18,8 +19,8 @@ HAZARD rules, enforced here so no caller can forget one:
   DASHBOARD_KNOWN_PROJECT_ROOTS.
 * The driver is a fully constructed ``_MultiTenantFalkorDriver``, never a bare
   ``FalkorDriver``, whose ``__init__`` fire-and-forgets an index build under a
-  running loop.  ``GraphitiBackend`` accepts no driver publicly, so it is
-  written into ``backend._driver``; ``injected_driver`` is the matching read.
+  running loop.  It is handed to ``GraphitiBackend.with_driver``, and
+  ``LiveBackends.driver_of`` returns the driver this module holds.
 """
 
 from __future__ import annotations
@@ -41,7 +42,6 @@ from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.reconciliation.index_health import summarize_index_health
 
 ScratchGraphFactory = Callable[[str], tuple[str, AsyncGraph]]
-LiveBackendFactory = Callable[[Iterable[str]], GraphitiBackend]
 
 
 @contextlib.asynccontextmanager
@@ -73,33 +73,45 @@ async def scratch_graphs(task_slug: str) -> AsyncIterator[ScratchGraphFactory]:
                 await client.aclose()
 
 
-@contextlib.asynccontextmanager
-async def live_backends(config: FusedMemoryConfig) -> AsyncIterator[LiveBackendFactory]:
-    """Yield ``make(registered) -> GraphitiBackend`` over a real driver; all closed on exit."""
-    backends: list[GraphitiBackend] = []
+class LiveBackends:
+    """``live_backends``' factory: each call builds a backend over its own live driver; ``driver_of`` returns that driver."""
 
-    def make(registered: Iterable[str]) -> GraphitiBackend:
-        backend = GraphitiBackend(config, registered_graph_ids=registered)
-        backend._driver = _MultiTenantFalkorDriver(host=FALKOR_HOST, port=FALKOR_PORT)
-        backends.append(backend)
+    def __init__(self, config: FusedMemoryConfig) -> None:
+        self._config = config
+        self._drivers: dict[GraphitiBackend, _MultiTenantFalkorDriver] = {}
+
+    def __call__(self, registered: Iterable[str]) -> GraphitiBackend:
+        driver = _MultiTenantFalkorDriver(host=FALKOR_HOST, port=FALKOR_PORT)
+        backend = GraphitiBackend.with_driver(
+            self._config, driver, registered_graph_ids=registered,
+        )
+        self._drivers[backend] = driver
         return backend
 
-    try:
-        yield make
-    finally:
-        for backend in backends:
+    def driver_of(self, backend: GraphitiBackend) -> _MultiTenantFalkorDriver:
+        return self._drivers[backend]
+
+    async def close_all(self) -> None:
+        for backend in self._drivers:
             await backend.close()
 
 
-def injected_driver(backend: GraphitiBackend) -> _MultiTenantFalkorDriver:
-    """The driver ``live_backends`` gave *backend*; any other backend raises."""
-    driver = backend._driver
-    if not isinstance(driver, _MultiTenantFalkorDriver):
-        raise TypeError(f'backend carries no live_backends driver: {driver!r}')
-    return driver
+@contextlib.asynccontextmanager
+async def live_backends(config: FusedMemoryConfig) -> AsyncIterator[LiveBackends]:
+    """Yield a ``LiveBackends`` factory, ``make(registered) -> GraphitiBackend``; all closed on exit."""
+    backends = LiveBackends(config)
+    try:
+        yield backends
+    finally:
+        await backends.close_all()
+
+
+async def listed_index_specs(backend: GraphitiBackend, group_id: str) -> set[IndexSpec]:
+    """The specs ``CALL db.indexes()`` LISTS, normalized: listed, not necessarily OPERATIONAL or serving."""
+    return normalize_index_records(await backend.list_indices(group_id=group_id))
 
 
 async def missing_production_indices(backend: GraphitiBackend, group_id: str) -> list[IndexSpec]:
     """Expected-but-absent specs, judged by the reader and summarizer δ's detector uses."""
-    actual = normalize_index_records(await backend.list_indices(group_id=group_id))
-    return summarize_index_health(actual, expected_index_set())['missing']
+    listed = await listed_index_specs(backend, group_id)
+    return summarize_index_health(listed, expected_index_set())['missing']

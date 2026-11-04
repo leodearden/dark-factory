@@ -27,7 +27,7 @@ from typing import Any
 from escalation.models import Escalation
 from shared.asyncio_tasks import abandon_task
 
-logger = logging.getLogger('orchestrator.merge_skew_tripwire')
+logger = logging.getLogger('orchestrator.merge_lane')
 
 # Mirrors GitConfig.load_bearing_oracle_timeout_secs' default (config.py) —
 # the default applied when a caller doesn't thread the configured value

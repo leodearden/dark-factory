@@ -26,6 +26,10 @@ LOGGING_CHILD_JOURNAL (a spawned child that wrote a line of its own). Both
 cover branches that a real capture in this retention window cannot reach, and
 both use real line texts with only the separation or the pid attribution
 changed.
+
+The two APPLICATION_SAYS_CONSUMED_* inputs are assembled too, and carry one
+INVENTED application line: an application log line containing the word that
+begins systemd's stop-time accounting, which none of the captures above holds.
 """
 from __future__ import annotations
 
@@ -164,6 +168,37 @@ SELF_RECOVERED_THEN_UNRELATED_RESTART_JOURNAL = """\
 2026-09-16T15:07:47+01:00 leo-MS-7C35 systemd[2626]: Started fused-memory.service - Fused Memory MCP Server (dark-factory).
 """
 
+# A real watchdog-caught stall, 2026-09-19 19:24:35 -> 19:26:54 = 139s (task
+# 5688), reduced from the 15450-line `journalctl --user -u fused-memory.service
+# --since "2026-09-19 19:20:00" --until "2026-09-19 19:32:00"` window. What
+# makes it a fixture of its own: systemd went straight from `Consumed` to
+# `Starting` and logged NO `Stopped` line and no SIGKILL, so its stop-time
+# accounting is the only line witnessing the end of the 62s teardown.
+#
+# Real gaps preserved: 139s (the stall), 47s (19:26:54 -> 19:27:41, SIGTERM
+# latency) and 31s (19:28:04 -> 19:28:35, the startup write_ops prune).
+NO_STOPPED_LINE_JOURNAL = """\
+2026-09-19T19:24:33+01:00 leo-MS-7C35 uv[1601425]: 2026-09-19 19:24:33 - httpx - INFO - HTTP Request: PUT http://localhost:6333/collections/fused_dark_factory/points?wait=true "HTTP/1.1 200 OK"
+2026-09-19T19:24:33+01:00 leo-MS-7C35 uv[1601425]: 2026-09-19 19:24:33 - fused_memory.reconciliation.event_buffer - INFO - reconciliation.event_buffered
+2026-09-19T19:24:34+01:00 leo-MS-7C35 uv[1601425]: 2026-09-19 19:24:34 - httpx - INFO - HTTP Request: POST http://localhost:6333/collections/fused_dark_factory/points/scroll "HTTP/1.1 200 OK"
+2026-09-19T19:24:34+01:00 leo-MS-7C35 uv[1601425]: 2026-09-19 19:24:34 - httpx - INFO - HTTP Request: POST http://localhost:6333/collections/fused_dark_factory/points/count "HTTP/1.1 200 OK"
+2026-09-19T19:24:34+01:00 leo-MS-7C35 uv[1601425]: 2026-09-19 19:24:34 - httpx - INFO - HTTP Request: POST http://localhost:6333/collections/fused_dark_factory/points/count "HTTP/1.1 200 OK"
+2026-09-19T19:24:34+01:00 leo-MS-7C35 uv[1601425]: 2026-09-19 19:24:34 - httpx - INFO - HTTP Request: POST http://localhost:6333/collections/fused_dark_factory/points "HTTP/1.1 200 OK"
+2026-09-19T19:24:34+01:00 leo-MS-7C35 uv[1601425]: 2026-09-19 19:24:34 - mem0.memory.main - INFO - Deleting memory with memory_id='9f93b1c9-3947-4566-bdb1-b8981b047e86'
+2026-09-19T19:24:34+01:00 leo-MS-7C35 uv[1601425]: 2026-09-19 19:24:34 - httpx - INFO - HTTP Request: POST http://localhost:6333/collections/fused_dark_factory/points/delete?wait=true "HTTP/1.1 200 OK"
+2026-09-19T19:24:34+01:00 leo-MS-7C35 uv[1601425]: 2026-09-19 19:24:34 - fused_memory.reconciliation.event_buffer - INFO - reconciliation.event_buffered
+2026-09-19T19:24:35+01:00 leo-MS-7C35 uv[1601425]: 2026-09-19 19:24:35 - fused_memory.reconciliation.stages.task_knowledge_sync - WARNING - reconciliation.done_provenance_section_truncated
+2026-09-19T19:26:54+01:00 leo-MS-7C35 systemd[2626]: Stopping fused-memory.service - Fused Memory MCP Server (dark-factory)...
+2026-09-19T19:27:41+01:00 leo-MS-7C35 uv[1601425]: 2026-09-19 19:27:41 - __main__ - INFO - Received SIGTERM — initiating operator shutdown
+2026-09-19T19:27:55+01:00 leo-MS-7C35 uv[1601425]: asyncio.exceptions.CancelledError
+2026-09-19T19:27:56+01:00 leo-MS-7C35 systemd[2626]: fused-memory.service: Consumed 8min 16.382s CPU time, 2.2G memory peak, 477.3M memory swap peak.
+2026-09-19T19:27:56+01:00 leo-MS-7C35 systemd[2626]: Starting fused-memory.service - Fused Memory MCP Server (dark-factory)...
+2026-09-19T19:27:56+01:00 leo-MS-7C35 docker[54757]:  Container docker-falkordb-1 Running
+2026-09-19T19:28:04+01:00 leo-MS-7C35 uv[54920]: 2026-09-19 19:28:04 - __main__ - INFO - idempotent_ops retention prune at startup: 31 rows
+2026-09-19T19:28:35+01:00 leo-MS-7C35 uv[54920]: 2026-09-19 19:28:35 - fused_memory.services.write_journal - INFO - Pruned 155000 write_ops rows (read>30.0d: 155000, search>365.0d: 0, write>730.0d: 0); frees pages for reuse, does not shrink the file
+2026-09-19T19:28:36+01:00 leo-MS-7C35 systemd[2626]: Started fused-memory.service - Fused Memory MCP Server (dark-factory).
+"""
+
 # ASSEMBLED, not captured: the real 15:07 stop sequence above with the restart
 # pushed out, so the silence begins with the unit already DOWN rather than
 # wedged. Only the separation is synthetic; every line text is real.
@@ -204,6 +239,31 @@ LOGGING_CHILD_JOURNAL = """\
 2026-09-16T12:08:22+01:00 leo-MS-7C35 systemd[2626]: fused-memory.service: Killing process 1289425 (git) with signal SIGKILL.
 2026-09-16T12:08:22+01:00 leo-MS-7C35 systemd[2626]: Starting fused-memory.service - Fused Memory MCP Server (dark-factory)...
 2026-09-16T12:09:03+01:00 leo-MS-7C35 systemd[2626]: Started fused-memory.service - Fused Memory MCP Server (dark-factory).
+"""
+
+# ASSEMBLED, not captured: NO_STOPPED_LINE_JOURNAL reduced to its restart, plus
+# ONE invented application line mid-teardown that carries the word systemd's
+# stop-time accounting begins with. Only systemd's own `Consumed <n>s CPU time`
+# line witnesses the end of a teardown; an application line that happens to say
+# "Consumed" must not cut the 62s short.
+APPLICATION_SAYS_CONSUMED_MID_TEARDOWN_JOURNAL = """\
+2026-09-19T19:24:35+01:00 leo-MS-7C35 uv[1601425]: 2026-09-19 19:24:35 - fused_memory.reconciliation.stages.task_knowledge_sync - WARNING - reconciliation.done_provenance_section_truncated
+2026-09-19T19:26:54+01:00 leo-MS-7C35 systemd[2626]: Stopping fused-memory.service - Fused Memory MCP Server (dark-factory)...
+2026-09-19T19:27:41+01:00 leo-MS-7C35 uv[1601425]: 2026-09-19 19:27:41 - __main__ - INFO - Received SIGTERM — initiating operator shutdown
+2026-09-19T19:27:45+01:00 leo-MS-7C35 uv[1601425]: 2026-09-19 19:27:45 - fused_memory.reconciliation.event_buffer - INFO - Consumed 3 buffered events before shutdown
+2026-09-19T19:27:55+01:00 leo-MS-7C35 uv[1601425]: asyncio.exceptions.CancelledError
+2026-09-19T19:27:56+01:00 leo-MS-7C35 systemd[2626]: fused-memory.service: Consumed 8min 16.382s CPU time, 2.2G memory peak, 477.3M memory swap peak.
+2026-09-19T19:27:56+01:00 leo-MS-7C35 systemd[2626]: Starting fused-memory.service - Fused Memory MCP Server (dark-factory)...
+2026-09-19T19:28:36+01:00 leo-MS-7C35 systemd[2626]: Started fused-memory.service - Fused Memory MCP Server (dark-factory).
+"""
+
+# ASSEMBLED, not captured: SELF_RECOVERED_STALL_JOURNAL with its last line
+# before the silence replaced by the same invented application line. The unit
+# was running throughout, so the silence must not read as a down window.
+APPLICATION_SAYS_CONSUMED_BEFORE_SILENCE_JOURNAL = """\
+2026-09-16T12:16:06+01:00 leo-MS-7C35 uv[1289738]: 2026-09-16 12:16:06 - fused_memory.reconciliation.event_buffer - INFO - reconciliation.event_buffered
+2026-09-16T12:16:07+01:00 leo-MS-7C35 uv[1289738]: 2026-09-16 12:16:07 - fused_memory.reconciliation.event_buffer - INFO - Consumed 3 buffered events before shutdown
+2026-09-16T12:18:47+01:00 leo-MS-7C35 uv[1289738]: 2026-09-16 12:18:47 - __main__ - INFO - thread_monitor: threads=33 delta=-1
 """
 
 # A healthy busy window: real consecutive lines from 2026-09-16 12:03, where fm
@@ -502,6 +562,36 @@ def test_episode_1_cost_decomposes_from_its_own_clean_stop():
 
     assert costs.teardown_seconds == 50.0
     assert costs.startup_seconds == 39.0
+
+
+def test_a_stop_with_no_stopped_line_is_still_one_episode_stopped_on_signal():
+    episodes = analyze(NO_STOPPED_LINE_JOURNAL)
+
+    assert len(episodes) == 1
+    assert episodes[0].stall_seconds == 139.0
+    assert episodes[0].outcome == "stopped-on-signal"
+
+
+def test_a_teardown_with_no_stopped_line_ends_at_systemd_s_stop_accounting():
+    """`Stopping` at 19:26:54 to `Consumed` at 19:27:56. An absent teardown
+    means the unit was never torn down, which this capture refutes."""
+    assert analyze(NO_STOPPED_LINE_JOURNAL)[0].costs.teardown_seconds == 62.0
+
+
+def test_a_teardown_with_no_stopped_line_is_still_weighed_against_startup():
+    """62s of teardown against a 40s start."""
+    assert analyze(NO_STOPPED_LINE_JOURNAL)[0].costs.dominant_recovery_term == "teardown"
+
+
+def test_an_application_line_saying_consumed_does_not_end_a_teardown():
+    costs = analyze(APPLICATION_SAYS_CONSUMED_MID_TEARDOWN_JOURNAL)[0].costs
+
+    assert costs.teardown_seconds == 62.0
+    assert costs.dominant_recovery_term == "teardown"
+
+
+def test_an_application_line_saying_consumed_does_not_mark_the_unit_down():
+    assert analyze(APPLICATION_SAYS_CONSUMED_BEFORE_SILENCE_JOURNAL)[0].outcome == "self-recovered"
 
 
 def test_detection_interval_is_reported_unavailable_not_fabricated():

@@ -57,8 +57,9 @@ about it failed.
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 from typing import TYPE_CHECKING
+
+from shared.project_layout import escalation_queue_dir
 
 if TYPE_CHECKING:
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
@@ -81,8 +82,6 @@ except ImportError: # pragma: no cover — exercised only in minimal envs
     HAS_ESCALATION = False
 
 logger = logging.getLogger(__name__)
-
-_QUEUE_DIRNAME: str = 'data/escalations'
 
 # Anchor task_id for ``EscalationQueue.make_id``, so the resulting ids
 # (e.g. ``esc-entity-mint-storm-3``) are greppable and distinct from the
@@ -146,7 +145,7 @@ def emit_entity_mint_storm_escalation(
         return None
 
     try:
-        queue = EscalationQueue(Path(project_root) / _QUEUE_DIRNAME)
+        queue = EscalationQueue(escalation_queue_dir(project_root))
     except Exception:
         # Constructing the queue creates its directory; a read-only or missing
         # project_root must not turn an alarm into a crash on the write path.

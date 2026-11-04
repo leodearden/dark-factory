@@ -53,10 +53,11 @@ def _logical_lines(script: str) -> list[str]:
     Joining it would swallow a real command into a comment and drop it from the
     scan silently — the one direction this helper must refuse.
 
-    Near-duplicate of tests/scripts/test_uv_run_venv_isolation.py::
-    logical_exec_start's continuation join, kept local only because the shared
-    home (tests/scripts/systemd_unit_invariants.py) is outside task 5553's
-    locks; hoisting both is filed as a follow-up.
+    Kept local rather than shared with its unit-file counterpart,
+    tests/scripts/systemd_unit_invariants.py::logical_exec_start: this is a
+    SHELL grammar over a whole script, bound by the shell's comment rule
+    above, and that module holds unit-file semantics only.  This is the one
+    shell consumer.
     """
     joined: list[str] = []
     pending = ""

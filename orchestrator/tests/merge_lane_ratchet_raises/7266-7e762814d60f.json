@@ -1,0 +1,24 @@
+{
+  "task_id": "7266",
+  "reason": "amend (review, SPOT / uniform enforcement): SpeculativeMergeWorker._bench_from_verify reads the lease from its entry and returns when the entry, its lease or the host allocator is absent, as _vacate_inflight_entry does, instead of trusting a separately passed lease; the one conditional expression that derives the entry from an optional slot is +1 cognitive",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 2260,
+      "current": 2261
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_bench_from_verify",
+      "baseline": 2,
+      "current": 3
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5061,
+      "current": 5062
+    }
+  ]
+}

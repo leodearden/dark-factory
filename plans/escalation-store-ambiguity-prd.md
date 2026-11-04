@@ -130,6 +130,13 @@ Stage 2 runs a denylist (`STAGE2_DISALLOWED = DISALLOW_BUILTIN`,
 `cli_stage_runner.py:78`) that never covered `mcp__escalation__*`. Deny the two
 read tools and state the boundary in the stage prompt.
 
+> **Amendment (2026-10-07, task 3250).** The sanctioned write need is **Stage 2's
+> alone**: FIX D lives in the Stage 2 prompt, and α's own boundary note already
+> told Stage 1 and Stage 3 that no escalation action is sanctioned there. Task
+> 3250 made the mechanism agree. Stage 1 and Stage 3 now deny `escalate_blocker`
+> and `escalate_info` via `cli_stage_runner.py::DISALLOW_ESCALATION_WRITES`, and
+> Stage 2 keeps both. The paragraph above is left as the α-time record.
+
 *Road not taken:* per-project escalation routing for recon, mirroring
 `known_projects` + the dashboard's `_discover_escalation_urls`
 (`dashboard/config.py:92`). Rejected — it would mean N escalation connections per

@@ -47,7 +47,7 @@ from typing import Any
 
 from orchestrator.event_store import EventType
 
-logger = logging.getLogger('orchestrator.merge_completion')
+logger = logging.getLogger('orchestrator.merge_lane')
 
 
 def merge_completion_eligible(event_store: Any, task_id: str | None) -> bool:

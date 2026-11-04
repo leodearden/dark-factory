@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections import Counter
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,11 @@ from _fm_helpers import install_identity_mocks
 
 from fused_memory.backends.mem0_client import split_managed_metadata
 from fused_memory.config.schema import Mem0UpdateConfig
+from fused_memory.maintenance.link_adjudicator import (
+    AdjudicationFailure,
+    LinkPair,
+    LinkVerdict,
+)
 from fused_memory.maintenance.link_heal import LINK_KEYS, BasisSource, LinkBasis, Verdict
 from fused_memory.maintenance.link_heal_executor import (
     Escape,
@@ -42,6 +48,10 @@ from fused_memory.maintenance.link_heal_store import (
     LinkHealStore,
     ToolCaller,
     text_sha256,
+)
+from fused_memory.memory_metadata import (
+    ORCHESTRATOR_COMPLETION_SOURCE,
+    TRIAGE_CONTESTED_METADATA_KEY,
 )
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.memory import MemoryResult
@@ -70,7 +80,13 @@ PARENT = '22222222-2222-4222-8222-222222222222'
 CHILD_TEXT = 'the child note about link healing'
 PARENT_TEXT = 'the parent note about link healing'
 
-DEFAULT_LIMITS = RunLimits(max_actions_per_run=25, backlog_multiplier=5, write_failure_streak=3)
+#: The provenance the orchestrator stamps on a task completion record (task 6961).
+COMPLETION_META = {'source': ORCHESTRATOR_COMPLETION_SOURCE, 'task_id': '4242'}
+
+DEFAULT_LIMITS = RunLimits(
+    max_actions_per_run=25, backlog_multiplier=5, write_failure_streak=3,
+    misfile_share_ceiling=0.25, corrects_share_ceiling=0.60,
+)
 
 
 def corpus_basis(
@@ -274,16 +290,20 @@ class LinkHealHarness:
         parent_text: str | None = PARENT_TEXT,
         project: str = DF,
         contested: bool = False,
+        contested_by_triage: bool = False,
+        meta: Mapping[str, Any] | None = None,
     ) -> None:
-        """A child linked to a parent; ``parent_text=None`` seeds no parent."""
+        """A child, carrying *meta* too, linked to a parent; ``parent_text=None`` seeds no parent."""
         if parent_text is not None:
             self.seed(project, parent, parent_text)
-        meta: dict[str, object] = {PARENT_ID_KEY: parent}
+        child_meta: dict[str, Any] = {**(meta or {}), PARENT_ID_KEY: parent}
         if kind is not None:
-            meta['kind'] = kind
+            child_meta['kind'] = kind
         if contested:
-            meta[CONTESTED_METADATA_KEY] = True
-        self.seed(project, child, child_text, **meta)
+            child_meta[CONTESTED_METADATA_KEY] = True
+        if contested_by_triage:
+            child_meta[TRIAGE_CONTESTED_METADATA_KEY] = True
+        self.seed(project, child, child_text, **child_meta)
 
     def journal_rows(self, kind: str = 'write') -> list[dict[str, Any]]:
         """The journal's ``write_ops`` rows of *kind*, oldest first, params decoded."""
@@ -355,6 +375,25 @@ async def run_corpus_plan(
     )
 
 
+async def run_deterministic_plan(
+    harness: LinkHealHarness,
+    ledger: LinkHealLedger,
+    plan_path: Path,
+    projects: Sequence[str] = PROJECTS,
+) -> RunReport:
+    """``run_plan`` with no bases: only the deterministic rows plan a heal."""
+    return await run_plan(
+        (),
+        store=harness.store(),
+        census=harness.mem0,
+        ledger=ledger,
+        limits=DEFAULT_LIMITS,
+        projects=projects,
+        source=RunSource.DETERMINISTIC,
+        plan_path_for=lambda _run_id: plan_path,
+    )
+
+
 class RecordingFiler:
     """An ``EscapeFiler`` that files nowhere and remembers every escape."""
 
@@ -383,6 +422,67 @@ async def run_corpus_apply(
         source=RunSource.CORPUS,
         approved_plan_sha256=approved_plan_sha256,
     )
+
+
+async def run_deterministic_apply(
+    harness: LinkHealHarness,
+    ledger: LinkHealLedger,
+    *,
+    filer: EscapeFiler | None = None,
+    approved_plan_sha256: str | None = None,
+) -> RunReport:
+    """``run_apply`` of the deterministically planned heals over the harness's store."""
+    return await run_apply(
+        store=harness.store(),
+        ledger=ledger,
+        limits=DEFAULT_LIMITS,
+        filer=filer or RecordingFiler(),
+        source=RunSource.DETERMINISTIC,
+        approved_plan_sha256=approved_plan_sha256,
+    )
+
+
+Answer = Verdict | AdjudicationFailure
+
+FAKE_ADJUDICATOR_MODEL = 'fake-model'
+
+
+class FakeAdjudicator:
+    """A ``LinkAdjudicator`` answering ``answer_for(child text)`` and remembering every pair.
+
+    A *storm* summary, when given, is handed to the run's storm hook on every call.
+    """
+
+    def __init__(
+        self,
+        answer_for: Callable[[str], Answer],
+        *,
+        storm: Mapping[str, Any] | None = None,
+    ) -> None:
+        self.calls: list[list[LinkPair]] = []
+        self._answer_for = answer_for
+        self._storm = storm
+
+    @property
+    def pairs(self) -> list[LinkPair]:
+        return [pair for call in self.calls for pair in call]
+
+    async def __call__(
+        self,
+        pairs: Sequence[LinkPair],
+        *,
+        on_failure_storm: Callable[[Mapping[str, Any]], None] | None = None,
+    ) -> list[LinkVerdict]:
+        self.calls.append(list(pairs))
+        if self._storm is not None and on_failure_storm is not None:
+            on_failure_storm(self._storm)
+        return [self._verdict(pair) for pair in pairs]
+
+    def _verdict(self, pair: LinkPair) -> LinkVerdict:
+        answer = self._answer_for(pair.child_text)
+        if isinstance(answer, AdjudicationFailure):
+            return LinkVerdict(pair.key, FAKE_ADJUDICATOR_MODEL, failure=answer, detail='scripted')
+        return LinkVerdict(pair.key, FAKE_ADJUDICATOR_MODEL, verdict=answer, reason=f'scripted {answer}')
 
 
 def assert_store_invariants(harness: LinkHealHarness) -> None:

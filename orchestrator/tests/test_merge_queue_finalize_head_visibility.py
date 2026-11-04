@@ -25,10 +25,12 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _merge_lane_fakes import lane_scene_config
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.worker import (
     DecidedItem,
     InflightEntry,
     InflightVerifyResult,
@@ -37,7 +39,6 @@ from orchestrator.merge_queue import (
     MergeRequest,
     SpeculativeMergeWorker,
 )
-from orchestrator.merge_types import QueuedBranch
 from orchestrator.verify_runner import HostLease
 
 # ── fixtures ─────────────────────────────────────────────────────────────────
@@ -78,7 +79,7 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
 
 @pytest.fixture
 def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
-    return OrchestratorConfig(project_root=git_repo, git=git_config)
+    return lane_scene_config(git_repo, git_config)
 
 
 # ── shared helpers ────────────────────────────────────────────────────────────
@@ -418,7 +419,7 @@ class TestFinalizingHeadLifecycle:
         content: str,
     ):
         """Build a real merged item so _finalize_inflight's merge_result path works."""
-        from orchestrator.merge_queue import RealMergeItem
+        from orchestrator.merge_lane.worker import RealMergeItem
 
         # Create branch with file
         worktree = (await git_ops.create_worktree(branch)).path

@@ -1,0 +1,15 @@
+{"stream": "S27", "prd_path": "docs/prds/review-all-design-invariants-document.md", "manifest_path": "docs/prds/review-all-design-invariants-document.capability-manifest.yaml", "leaves_estimate": 2,
+ "lead_rulings_on_open_questions": [
+  "Q1 allowlist routing: adopt the PRD's Appendix A (26 src files with .task/plan.json or bare plan.json pointers routed across eleven streams); no mass-delete leaf.",
+  "Q2 premise correction accepted: the consumers are /prd G7, /review phase 2, /review-all synthesis and CLAUDE.md readers; rendering the list into dispatched prompts is a dark-factory decision, out of scope.",
+  "Q3 D3 accepted: once alpha lands, /prd G7 is blocking for this project and adopts dark-factory's family by reference (one pointer, no restated list).",
+  "Q4 D2 accepted: dark-factory invariants are cited as df:<slug>, never by number; the program doc's invariants table changes the same way.",
+  "Q5 accepted: INV-10 covers src/**/*.py docstrings and comments only."],
+ "cross_reference_lines": [
+  "Design invariants promoted (R19): replace the 10-row gist table with one pointer row per invariant (id, slug, owning stream); statements live only in docs/legibility/design-invariants.md; cite dark-factory invariants as df:<slug>.",
+  "Design invariants promoted, row 10: 'repo grep gate (S27 lands it)' becomes tests/docs/test_rationale_pointers.py::test_src_rationale_pointers_name_tracked_paths (S27 beta).",
+  "Seam ownership, row docs/legibility/design-invariants.md: S27 owns grammar, header and the entries as first written; each owning stream's enforcing-test leaf depends on S27 alpha and, in the commit that adds its test, sets its INV Status: enforced and names the node id; tests/docs/test_design_invariants_doc.py rejects an enforced entry whose test does not exist.",
+  "Seam ownership, new row: tests/docs/test_rationale_pointers.py ALLOWLIST: S27 owns; the stream named on an entry (PRD Appendix A) removes the pointer and deletes the entry in the same commit.",
+  "Shared conventions: once S27 alpha lands, /prd G7 is BLOCKING for this project; it walks INV-1..INV-10 plus dark-factory's family by reference, so a stream decomposed after alpha records G7 waivers by slug.",
+  "Triage briefing: S27's rationale-pointer gate starts with an allowlist of 26 src files, each naming an owning stream; a stream that removes one deletes its entry; do not file 'stale allowlist entry' as a regression."],
+ "seam_dependencies": "every enforcing-test leaf (S18, S12, S13, S11, S21, S10, S7, S6, S9, S17) depends on S27 alpha and flips its INV to enforced; pointer-removal duties per Appendix A for S1, S3, S5, S25, S26 and the above."}

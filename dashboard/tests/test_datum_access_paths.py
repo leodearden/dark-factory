@@ -27,8 +27,7 @@ from typing import Any, TypeVar
 from unittest.mock import AsyncMock, patch
 from urllib.parse import urlsplit
 
-from _dashboard_helpers import ScriptTagCollector
-from _lock_chip_matrix import node_path
+from _dashboard_helpers import ScriptTagCollector, node_path
 
 # ---------------------------------------------------------------------------
 # The finder
@@ -291,10 +290,11 @@ _GRANTS: tuple[AccessGrant, ...] = (
         'decision 12)',
     ),
     AccessGrant(
-        'app.py', '_fanout_probe_completion', frozenset({'fetch_tasks'}),
+        'app.py', '_fanout_probe_completion', frozenset({'fetch_task_page'}),
         'the /healthz MCP fan-out liveness probe reads raw and uncached by '
         'design: a stored value would mask the wedge it detects (PRD '
-        'decision 17). The ONE named exemption.',
+        'decision 17). It reads one row of the snapshot unit\'s row query '
+        '(task 6321). The ONE named exemption.',
     ),
 )
 

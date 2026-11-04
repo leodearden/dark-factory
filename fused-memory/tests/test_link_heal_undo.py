@@ -32,9 +32,11 @@ from fused_memory.maintenance.link_heal_ledger import (
     ActionRow,
     ActionState,
     LinkHealLedger,
+    NothingToUndo,
     RunSource,
     UnknownRun,
 )
+from fused_memory.memory_metadata import TRIAGE_CONTESTED_METADATA_KEY
 from fused_memory.server.grouped_read import (
     AMENDMENT_KIND,
     CONTESTED_METADATA_KEY,
@@ -71,7 +73,8 @@ async def plan_and_apply(
 
 async def undo(harness: LinkHealHarness, ledger: LinkHealLedger, run_ref: str) -> RunReport:
     return await run_undo(
-        ledger.resolve_run(run_ref), store=harness.store(), ledger=ledger, limits=DEFAULT_LIMITS,
+        ledger.undo_target(ledger.resolve_run(run_ref)),
+        store=harness.store(), ledger=ledger, limits=DEFAULT_LIMITS,
     )
 
 
@@ -151,14 +154,18 @@ class TestUndoADetach:
         assert child['metadata'][PARENT_ID_KEY] == PARENT
 
     @pytest.mark.asyncio
-    async def test_undoing_the_same_run_again_writes_nothing(self, harness, ledger, tmp_path):
+    async def test_undoing_the_same_run_again_is_refused_and_writes_nothing(
+        self, harness, ledger, tmp_path,
+    ):
         _plan, applied, _first = await self._undone(harness, ledger, tmp_path)
         writes_before = harness.mem0.write_count
+        runs_before = len(ledger.recent_runs(100))
 
-        again = await undo(harness, ledger, applied.run_id)
+        with pytest.raises(NothingToUndo, match='no heal still applied'):
+            await undo(harness, ledger, applied.run_id)
 
         assert harness.mem0.write_count == writes_before
-        assert again.counts.applied == 0
+        assert len(ledger.recent_runs(100)) == runs_before
 
     @pytest.mark.asyncio
     async def test_a_re_plan_does_not_propose_the_undone_detach(self, harness, ledger, tmp_path):
@@ -182,6 +189,62 @@ class TestUndoADetach:
 
         assert report.counts.applied == 1
         assert link_keys(harness) == {PARENT_ID_KEY: PARENT, 'kind': AMENDMENT_KIND}
+
+
+class TestUndoATriageContestDetach:
+    @pytest.mark.asyncio
+    async def test_one_patch_only_write_restores_the_link_the_flag_and_its_marker(
+        self, harness, ledger, tmp_path,
+    ):
+        harness.seed_link(contested=True, contested_by_triage=True)
+        _plan, applied = await plan_and_apply(harness, ledger, tmp_path, corpus_basis('RELATED'))
+
+        await undo(harness, ledger, applied.run_id)
+
+        restored = {
+            PARENT_ID_KEY: PARENT,
+            'kind': AMENDMENT_KIND,
+            CONTESTED_METADATA_KEY: True,
+            TRIAGE_CONTESTED_METADATA_KEY: True,
+        }
+        assert link_keys(harness) == restored
+        undo_params = harness.journal_rows()[-1]['params']
+        assert undo_params['metadata_patch'] == restored
+        assert 'metadata_delete_keys' not in undo_params
+
+
+class TestUndoRefusesARunWithNothingApplied:
+    @pytest.mark.asyncio
+    async def test_the_plan_runs_id_is_refused_before_any_run_row(
+        self, harness, ledger, tmp_path,
+    ):
+        harness.seed_link()
+        planned, _applied = await plan_and_apply(
+            harness, ledger, tmp_path, corpus_basis('RELATED'),
+        )
+        writes_before = harness.mem0.write_count
+        runs_before = len(ledger.recent_runs(100))
+
+        with pytest.raises(NothingToUndo, match='plan run'):
+            await undo(harness, ledger, planned.run_id)
+
+        assert len(ledger.recent_runs(100)) == runs_before
+        assert harness.mem0.write_count == writes_before
+        assert the_heal(ledger, planned).state is ActionState.APPLIED
+
+    @pytest.mark.asyncio
+    async def test_an_undo_runs_id_is_refused(self, harness, ledger, tmp_path):
+        harness.seed_link()
+        _planned, applied = await plan_and_apply(
+            harness, ledger, tmp_path, corpus_basis('RELATED'),
+        )
+        report = await undo(harness, ledger, applied.run_id)
+        runs_before = len(ledger.recent_runs(100))
+
+        with pytest.raises(NothingToUndo, match='undo run'):
+            await undo(harness, ledger, report.run_id)
+
+        assert len(ledger.recent_runs(100)) == runs_before
 
 
 class TestUndoARelabelAndFlag:
@@ -271,3 +334,57 @@ class TestUndoCorroboration:
             await undo(harness, ledger, 'f' * 32)
 
         assert ledger.recent_runs(10) == []
+
+
+def _sighting_ids(index: int) -> tuple[str, str]:
+    return (f'{index:08x}-c0c0-4c0c-8c0c-{index:012x}', f'{index:08x}-a0a0-4a0a-8a0a-{index:012x}')
+
+
+def _seed_sightings(harness: LinkHealHarness, count: int) -> tuple[LinkBasis, ...]:
+    """*count* EXTENDS-rated sightings, each under its own parent: *count* relabels."""
+    bases = []
+    for index in range(count):
+        child, parent = _sighting_ids(index)
+        child_text, parent_text = f'sighting {index}', f'parent {index}'
+        harness.seed_link(
+            kind=SIGHTING_KIND, child=child, parent=parent,
+            child_text=child_text, parent_text=parent_text,
+        )
+        bases.append(corpus_basis(
+            'EXTENDS', child=child, parent=parent,
+            child_text=child_text, parent_text=parent_text, key=f'H{index:03d}',
+        ))
+    return tuple(bases)
+
+
+class TestTheUndoWriteFailureStreak:
+    """Undo takes heals back newest first, so sighting 4 is attempted first."""
+
+    async def _undo_failing(
+        self, harness, ledger, tmp_path, failing: set[int],
+    ) -> RunReport:
+        _plan, applied = await plan_and_apply(
+            harness, ledger, tmp_path, *_seed_sightings(harness, 5),
+        )
+        for index in failing:
+            harness.mem0.read_failures.add(_sighting_ids(index)[0])
+        return await undo(harness, ledger, applied.run_id)
+
+    @pytest.mark.asyncio
+    async def test_the_undo_stops_after_the_streak(self, harness, ledger, tmp_path):
+        counts = (await self._undo_failing(harness, ledger, tmp_path, {0, 1, 2, 3, 4})).counts
+
+        limit = DEFAULT_LIMITS.write_failure_streak
+        assert counts.stopped_by == 'write_failure_streak'
+        assert counts.failed == limit
+        assert counts.not_attempted == 5 - limit
+        assert counts.applied == 0
+
+    @pytest.mark.asyncio
+    async def test_an_applied_undo_between_failures_resets_the_streak(
+        self, harness, ledger, tmp_path,
+    ):
+        counts = (await self._undo_failing(harness, ledger, tmp_path, {4, 3, 1, 0})).counts
+
+        assert counts.stopped_by is None
+        assert (counts.failed, counts.applied, counts.not_attempted) == (4, 1, 0)

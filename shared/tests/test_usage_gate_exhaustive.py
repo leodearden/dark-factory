@@ -1730,15 +1730,19 @@ class TestInitAccountsFallbacks:
         assert len(gate._accounts) == 0 or gate._accounts[0].name == 'default'
 
     async def test_no_accounts_no_default_credential(self):
-        """No configured accounts + no default cred → empty (lines 138-143)."""
-        config = UsageCapConfig(accounts=[], wait_for_reset=False)
+        """Opted in, but no configured accounts and no default cred → empty (lines 138-143)."""
+        config = UsageCapConfig(
+            accounts=[], wait_for_reset=False, fallback_to_default_credential=True,
+        )
         with patch('shared.usage_gate._read_oauth_token', return_value=None):
             gate = UsageGate(config)
         assert gate._accounts == []
 
     async def test_no_accounts_falls_back_to_default_credential(self):
-        """No configured accounts → falls back to default credential (lines 138-141)."""
-        config = UsageCapConfig(accounts=[], wait_for_reset=False)
+        """Opted in, no configured accounts → falls back to default credential (lines 138-141)."""
+        config = UsageCapConfig(
+            accounts=[], wait_for_reset=False, fallback_to_default_credential=True,
+        )
         with patch('shared.usage_gate._read_oauth_token', return_value='default-tok'):
             gate = UsageGate(config)
         assert len(gate._accounts) == 1

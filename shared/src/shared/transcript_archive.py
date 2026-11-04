@@ -32,7 +32,9 @@ Design properties (see plans/agent-transcript-archival-prd.md, task α):
 
 The archive is a VERBATIM copy: one plain, greppable ``.jsonl`` corpus, so
 ``rg`` works across it and no reader needs a decompression branch (task 3618,
-leaf α of plans/transcript-preservation-seam-prd.md).
+leaf α of plans/transcript-preservation-seam-prd.md). The one exception: live
+secret values held by the archiving process are replaced by same-length
+placeholders on the way in (``shared.secret_redaction``, task 6820).
 
 The module also owns the **read** side of that archive:
 :func:`durable_archive_path` is the single session-id-keyed locator into it
@@ -61,6 +63,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from shared.secret_env import secret_env_values
+from shared.secret_redaction import Needle, RedactionError, redact_in_place, redaction_needles
+
 logger = logging.getLogger(__name__)
 
 # Module-level count of per-file archival failures this process.
@@ -81,7 +86,10 @@ _ARCHIVAL_FAILURES: int = 0
 # mirroring migrate_transcript_archive_gunzip.STAGING_SUFFIX: debris stranded by
 # a hard kill matches no reader's ``*.jsonl`` glob, so it is inert rather than a
 # transcript lookalike, and the next archival of the same session rewrites it.
-_STAGING_SUFFIX = '.archive-tmp'
+# The one reader that does match it is scripts/transcript_secret_sweep.py: a
+# staged copy is redacted only after it lands, so debris a hard kill strands
+# between the two may still hold a live secret value.
+STAGING_SUFFIX = '.archive-tmp'
 
 # The single notification seam onto the counter above. _record_failure is the
 # one funnel BOTH producers (archive_task_transcripts' copy, and
@@ -145,7 +153,7 @@ def _record_failure(
     task_id: str,
     exc: BaseException,
     *,
-    detail: str = 'failed to archive',
+    detail: str | None = None,
 ) -> None:
     """Count and loudly (but non-fatally) log a single per-file archive failure.
 
@@ -159,10 +167,14 @@ def _record_failure(
     :func:`_purge_config_dir` left ``.credentials.json`` behind — accrues to the
     SAME counter and the same ``path``/``task_id``/``errno`` shape rather than
     growing a second, separately-monitored signal. One counter, one greppable
-    shape, one thing a consumer has to watch.
+    shape, one thing a consumer has to watch. Left unset, it names the failed
+    step: redaction for a :class:`shared.secret_redaction.RedactionError`,
+    archival otherwise.
     """
     global _ARCHIVAL_FAILURES
     _ARCHIVAL_FAILURES += 1
+    if detail is None:
+        detail = 'failed to redact' if isinstance(exc, RedactionError) else 'failed to archive'
     payload = {
         'path': str(src),
         'task_id': task_id,
@@ -218,6 +230,7 @@ def _archive_one(
     projects_root: Path,
     archive_root: Path,
     task_id: str,
+    needles: tuple[Needle, ...],
 ) -> bool:
     """Copy a single transcript *src* to its mirror under *archive_root*.
 
@@ -253,19 +266,22 @@ def _archive_one(
     if dest.exists() and int(dest.stat().st_mtime) == int(st.st_mtime):
         return False
     dest.parent.mkdir(parents=True, exist_ok=True)
-    staging = dest.with_name(dest.name + _STAGING_SUFFIX)
+    staging = dest.with_name(dest.name + STAGING_SUFFIX)
     try:
         # shutil.copyfile uses the platform fast-copy path (copy_file_range /
         # sendfile) and is exactly as memory-bounded as an explicit chunked
         # loop: agent-session JSONL can be many MB and only grows on resume, so
         # peak RSS stays flat regardless of transcript size. This is a COPY,
         # not a rename — the session may still be live and reading its own
-        # source file. Any I/O error here is an OSError, caught + counted by
+        # source file. The private staging snapshot, never the live source, is
+        # then redacted, so nothing appended after the copy can slip past the
+        # redaction. An OSError or RedactionError here is caught + counted by
         # the caller (best-effort).
         shutil.copyfile(src, staging)
+        redact_in_place(staging, needles).raise_if_refused(src)
         os.utime(staging, (st.st_atime, st.st_mtime))
         os.replace(staging, dest)
-    except OSError:
+    except (OSError, RedactionError):
         # Only the staging file is ever touched before the replace, so a
         # pre-existing archived copy is still whole — drop the partial and let
         # the caller count + log the original failure.
@@ -295,6 +311,7 @@ def _move_to_archive(
     projects_root: Path,
     archive_root: Path,
     task_id: str,
+    needles: tuple[Needle, ...],
 ) -> bool:
     """MOVE a single transcript *src* to its mirror under *archive_root*.
 
@@ -305,7 +322,14 @@ def _move_to_archive(
 
     Returns ``True`` when the file was newly moved into the archive, ``False``
     when the archive was ALREADY current and the source was merely dropped.
-    Either way the source is gone on return; an OSError means it is NOT.
+    Either way the source is gone on return; an OSError or RedactionError
+    means it is NOT.
+
+    The source is redacted IN PLACE before the rename, so the canonical
+    archive path never holds an unredacted copy; ``redact_in_place`` keeps the
+    mtime, so the already-current skip below still holds. A line whose
+    redaction is refused stays as it was while every other line is redacted,
+    and the source is then held rather than archived.
 
     Why a rename rather than :func:`_archive_one`'s staged copy:
 
@@ -318,9 +342,9 @@ def _move_to_archive(
       twice over: a ``now``-stamped archive would read to
       ``gc_agent_transcripts`` as a reset retention age, and it would defeat
       the already-current skip above.
-    * **It is O(1) metadata, not O(size) I/O** — which is what makes doing it
-      synchronously, inside a teardown path, cheap enough to be
-      unconditional.
+    * **It is O(1) metadata plus one read of the source** for redaction, not a
+      copy — which is what makes doing it synchronously, inside a teardown
+      path, cheap enough to be unconditional.
 
     The rename fast path requires source and destination on ONE filesystem.
     Re-measured on this host 2026-08-18: ``<project_root>/.worktrees`` (where
@@ -341,6 +365,7 @@ def _move_to_archive(
     if dest.exists() and int(dest.stat().st_mtime) == int(st.st_mtime):
         src.unlink()
         return False
+    redact_in_place(src, needles).raise_if_refused(src)
     dest.parent.mkdir(parents=True, exist_ok=True)
     try:
         os.rename(src, dest)
@@ -363,7 +388,7 @@ def _move_to_archive(
         # handle, an operator can mount either path elsewhere tomorrow, and
         # "assume same-device forever" is exactly the assumption that turns a
         # remount into silent data loss. Its only exercise is the test suite.
-        _archive_one(src, projects_root, archive_root, task_id)
+        _archive_one(src, projects_root, archive_root, task_id, needles)
         src.unlink()
     return True
 
@@ -534,6 +559,7 @@ def archive_before_delete(
         # archive tree is conjured for a task that has no transcripts.
         return ArchiveBeforeDelete()
 
+    needles = redaction_needles(secret_env_values(os.environ))
     archived = 0
     already_current = 0
     held: list[Path] = []
@@ -541,11 +567,11 @@ def archive_before_delete(
     # reproducible across runs rather than filesystem-order-dependent.
     for src in sorted(projects_root.glob('**/*.jsonl')):
         try:
-            if _move_to_archive(src, projects_root, archive_root, task_id):
+            if _move_to_archive(src, projects_root, archive_root, task_id, needles):
                 archived += 1
             else:
                 already_current += 1
-        except OSError as exc:
+        except (OSError, RedactionError) as exc:
             # Counted + logged loudly, and the source is HELD. Deleting an
             # un-archived transcript is the one thing this function exists to
             # prevent, so a failure costs us the directory, never the data.
@@ -586,15 +612,16 @@ def archive_task_transcripts(
         sources = list(projects_root.glob(f'*/{session_id}.jsonl'))
         sources += list(projects_root.glob(f'*/{session_id}/subagents/*.jsonl'))
 
+    needles = redaction_needles(secret_env_values(os.environ))
     count = 0
     for src in sources:
         # Best-effort: a per-file OSError is logged + counted, never re-raised,
         # so one bad file cannot lose its siblings and the whole function stays
         # total — the property the producer relies on to call it in a finally.
         try:
-            if _archive_one(src, projects_root, archive_root, task_id):
+            if _archive_one(src, projects_root, archive_root, task_id, needles):
                 count += 1
-        except OSError as exc:
+        except (OSError, RedactionError) as exc:
             _record_failure(src, task_id, exc)
     return count
 
@@ -860,7 +887,7 @@ def restore_archived_transcript(
         # session ID` exactly as a zero-byte one does (measured, CLI 2.1.236).
         # The mtime mirror goes onto the STAGING file so the published copy is
         # correctly stamped from the instant it appears.
-        staging = dest.with_name(dest.name + _STAGING_SUFFIX)
+        staging = dest.with_name(dest.name + STAGING_SUFFIX)
         try:
             if gzipped:
                 # STREAMED, not read()-then-write: agent-session JSONL runs to

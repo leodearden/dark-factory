@@ -43,6 +43,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeGuard, get_args
 
 from fused_memory.config.schema import JudgeReasoningEffort, WriteTriageConfig
@@ -65,9 +66,10 @@ from fused_memory.server.write_triage import (
     JudgeUsage,
     TriageJudgeVerdict,
 )
+from fused_memory.utils.clip_disclosure import TruncationFact, elide_text
 
 if TYPE_CHECKING:
-    from collections.abc import Collection, Sequence
+    from collections.abc import Collection, Mapping, Sequence
 
     from fused_memory.models.memory import MemoryResult
 
@@ -305,11 +307,6 @@ _DEFAULT_JUDGE_CANDIDATE_COUNT = 5
 #: multiply the cost of every call.
 _DEFAULT_JUDGE_FIELD_CHARS: int = WriteTriageConfig.model_fields['judge_field_chars'].default
 
-#: Appended to any field this module cut. The marker is not decoration: a
-#: silent truncation hands the model a severed sentence to read as the whole
-#: record, and "this text continues" is information the verdict depends on.
-_ELIDED_MARKER = '…[elided]'
-
 #: The ceiling on the whole judge call at the shipped defaults, in the unit
 #: this module can actually count: characters. It is not a token cap — what a
 #: call costs in tokens per slate width is PRD C1's measured ESTIMATE
@@ -340,19 +337,52 @@ _ELIDED_MARKER = '…[elided]'
 #: fused-memory/tests/server/test_write_triage_judge.py::TestJudgeExemplars::test_the_budget_admits_no_further_worked_example
 #: holds it there, measuring both sides afresh on every run.
 #:
-#: Note "over" the cap, not "at": `_elide` returns a field of exactly the cap
-#: unchanged and cuts a longer one to the cap plus `_ELIDED_MARKER`, so the
-#: widest render is 9 chars per field — 54 across the six — wider than a slate
-#: built at the cap.
-JUDGE_PROMPT_CHAR_BUDGET = 27_000
+#: WHY A CUT FIELD IS WIDER THAN THE CAP. :func:`_elide` renders a field at the
+#: cap untouched, and a longer one as the cap plus a marker that counts the
+#: cut, so the widest render grows by one char per field for each digit of
+#: that count. The measured worst case cuts every field by a six-digit count;
+#: each further digit adds 6 chars across the call, and the slack absorbs
+#: those up to a count no process could hold. That worst case is measured
+#: afresh on every run by
+#: fused-memory/tests/server/test_write_triage_judge.py::_worst_case_call_chars.
+JUDGE_PROMPT_CHAR_BUDGET = 27_100
 
 
 def _elide(text: object, field_chars: int) -> str:
-    """*text* as a string, bounded by *field_chars* and marked if cut."""
-    body = text if isinstance(text, str) else str(text or '')
-    if len(body) <= field_chars:
-        return body
-    return body[:field_chars] + _ELIDED_MARKER
+    """*text* cut to *field_chars* by elide_text, which marks how many characters it dropped.
+
+    The marker is not decoration: a silent truncation hands the model a
+    severed sentence to read as the whole record. It carries the count
+    because the size of the loss decides whether it mattered. Input that is
+    not a string is coerced to its text first.
+    """
+    return elide_text(text, field_chars, field='judge_field').text
+
+
+class JudgePromptElisions(NamedTuple):
+    """Which fields build_judge_prompt cuts at one width: the entry, and each candidate by id."""
+
+    entry: bool
+    candidates: Mapping[str, bool]
+
+
+def judge_prompt_elisions(
+    content: str,
+    candidates: Sequence[MemoryResult],
+    *,
+    field_chars: int = _DEFAULT_JUDGE_FIELD_CHARS,
+) -> JudgePromptElisions:
+    """Which fields :func:`build_judge_prompt` would cut, for every candidate given.
+
+    Answered by the same :func:`_elide` the render calls, so it cannot disagree
+    with the prompt. It selects nothing: the whole slate it is handed is reported.
+    """
+    return JudgePromptElisions(
+        entry=_elide(content, field_chars) != content,
+        candidates=MappingProxyType(
+            {c.id: _elide(c.content, field_chars) != c.content for c in candidates},
+        ),
+    )
 
 
 def select_judge_candidates(
@@ -526,9 +556,9 @@ def build_judge_prompt(
     No candidate is marked or singled out. The verdict carries its own id, so
     neither slate position nor the band's winner steers the answer.
 
-    Every field is bounded by *field_chars* and marked with
-    :data:`_ELIDED_MARKER` when cut, so a pathological canonical cannot blow
-    up the call. :func:`judge_write` passes ``write_triage.judge_field_chars``,
+    Every field is bounded by *field_chars* and cut by :func:`_elide`, which
+    marks how many characters it dropped, so a pathological canonical cannot
+    blow up the call. :func:`judge_write` passes ``write_triage.judge_field_chars``,
     resolved per call; what that costs in tokens per slate width is PRD C1's
     measured estimate.
 
@@ -768,6 +798,20 @@ def resolve_judge_reasoning_effort(memory_service: Any) -> str | None:
     return None
 
 
+def resolve_judge_api_url(memory_service: Any) -> str | None:
+    """The judge's own endpoint, or None meaning INHERIT the provider's api_url.
+
+    A blank or non-string value inherits, for the same reason
+    :func:`_provider_credentials` refuses to forward a blank credential: an
+    empty ``base_url`` fails every call and reads as a judge outage rather
+    than as the cleared leaf it is.
+    """
+    value = _judge_attr(memory_service, 'judge_api_url')
+    if isinstance(value, str) and value.strip():
+        return value
+    return None
+
+
 # --- the LLM call ------------------------------------------------------------
 
 #: Output cap for the two answer-only arms (anthropic, and a chat-only compat
@@ -805,6 +849,12 @@ def _provider_credentials(memory_service: Any, provider: str) -> _ProviderCreden
     in config.yaml). Reading the config section is for a deployment that pins a
     key or points at an OpenAI-compatible local endpoint.
 
+    ``base_url`` is ``write_triage.judge_api_url`` when set, else
+    ``llm.providers.<provider>.api_url``. The override is judge-only, so the
+    main LLM arm is unaffected; the ``api_key`` still comes from the provider
+    section (a judge-scoped key is task ν's, not this leaf's), and so does
+    ``serves_responses_api`` below.
+
     ``serves_responses_api`` is the deployment's existing declaration of what
     the configured OpenAI endpoint speaks — ``llm.client_class``, the same
     declaration ``backends/graphiti_client.py`` builds its client from, where
@@ -822,7 +872,7 @@ def _provider_credentials(memory_service: Any, provider: str) -> _ProviderCreden
     api_key = getattr(section, 'api_key', None)
     if isinstance(api_key, str) and api_key:
         client_kwargs['api_key'] = api_key
-    api_url = getattr(section, 'api_url', None)
+    api_url = resolve_judge_api_url(memory_service) or getattr(section, 'api_url', None)
     if isinstance(api_url, str) and api_url:
         client_kwargs['base_url'] = api_url
     serves_responses_api = (
@@ -892,9 +942,10 @@ async def _call_llm(
     Each arm builds and closes its client PER CALL. A cached client would pin
     a stale ``api_key``/``api_url`` past a hot reload, turning a green-tier
     knob into a restart-only one. ``async with`` around ``asyncio.wait_for``
-    closes the connection pool even when a timeout cancels the request, which
-    matters because neither SDK client defines ``__del__``. The lost
-    connection reuse is a deliberate trade.
+    closes the connection pool even when a timeout cancels the request. The
+    SDK's own ``httpx`` wrapper finaliser (``AsyncHttpxClientWrapper.__del__``)
+    is no substitute: it closes the pool only if an event loop is running when
+    the client is collected. The lost connection reuse is a deliberate trade.
 
     NO ``try``/``except`` anywhere, and ``async with`` swallows nothing: every
     failure propagates to ``write_triage.py::triage_write``'s ``except`` arm,
@@ -1132,9 +1183,10 @@ async def judge_write(
         )
         return TriageJudgeVerdict(OUTCOME_STORED)
 
+    candidate_count = resolve_judge_candidate_count(memory_service)
     selected = select_judge_candidates(
         candidates,
-        resolve_judge_candidate_count(memory_service),
+        candidate_count,
         canonical_id=getattr(decision, 'canonical_id', None),
     )
     if not selected:
@@ -1151,4 +1203,18 @@ async def judge_write(
         reasoning_effort=resolve_judge_reasoning_effort(memory_service),
     )
     verdict = parse_judge_verdict(reply.text, [candidate.id for candidate in selected])
-    return verdict._replace(usage=reply.usage)
+    return verdict._replace(
+        usage=reply.usage,
+        truncation_facts=_slate_trim_facts(candidates, selected, candidate_count),
+    )
+
+
+def _slate_trim_facts(
+    candidates: Any, selected: Sequence[MemoryResult], candidate_count: int,
+) -> tuple[TruncationFact, ...]:
+    """How many COMPARABLE candidates the judge was not shown, counted with ``cosine_of``."""
+    comparable = sum(1 for result in candidates or () if cosine_of(result) is not None)
+    elided = comparable - len(selected)
+    if elided <= 0:
+        return ()
+    return (TruncationFact(field='judge_candidates', cap=candidate_count, elided=elided),)

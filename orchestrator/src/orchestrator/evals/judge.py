@@ -2,51 +2,91 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import math
 import random
 import re
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from itertools import combinations
 from pathlib import Path
-from typing import Any, TypeGuard
+from typing import TYPE_CHECKING, Any
+
+from shared.cli_invoke import no_mcp_servers_config
 
 from orchestrator.agents.invoke import invoke_agent
 
 from .elo import (
-    MAX_PER_PAIR,
+    MAX_UNMEASURED_PER_PAIR,
+    PAIRWISE_RESULT,
     TaskPool,
     _pair_key,
     ensure_config_in_pool,
     next_matchup,
     record_match,
 )
+from .measurement import (
+    MeasurementStage,
+    Scored,
+    Unmeasured,
+    json_answer,
+    measured_call,
+    require_answer_iff_measured,
+)
+from .plan_predicates import is_scorable_plan, plan_confirmed
 from .snapshots import get_diff
+
+if TYPE_CHECKING:
+    from shared.cli_invoke import AgentResult
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass
+@dataclass(frozen=True)
 class JudgeVerdict:
-    """Result of one pairwise comparison."""
+    """Result of one pairwise comparison: a winner, or why there is none."""
 
     task_id: str
     config_a: str
     config_b: str
-    winner: str       # 'A', 'B', or 'tie'
+    winner: str | None  # a PAIRWISE_RESULT key; None exactly when unmeasured
     confidence: float
     reasoning: str
+    unmeasured: Unmeasured | None = None
+
+    def __post_init__(self) -> None:
+        require_answer_iff_measured('JudgeVerdict', 'winner', self.winner, self.unmeasured)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
+_UNSWAPPED = {'A': 'B', 'B': 'A', 'tie': 'tie'}
+
+
+def parse_winner(payload: dict, key: str = 'winner') -> str:
+    """*payload*'s winner; ``KeyError`` when absent, ``ValueError`` when not A/B/tie."""
+    winner = payload[key]
+    if winner not in PAIRWISE_RESULT:
+        raise ValueError(f'{key} must be one of {list(PAIRWISE_RESULT)}, got {winner!r}')
+    return winner
+
+
+def parse_confidence(payload: dict) -> float:
+    """*payload*'s confidence; ``KeyError`` when absent, ``ValueError`` when not finite."""
+    confidence = float(payload['confidence'])
+    if not math.isfinite(confidence):
+        raise ValueError(f'non-finite confidence {confidence!r}')
+    return confidence
+
+
 JUDGE_SCHEMA = {
     'type': 'object',
     'properties': {
-        'winner': {'type': 'string', 'enum': ['A', 'B', 'tie']},
+        'winner': {'type': 'string', 'enum': list(PAIRWISE_RESULT)},
         'confidence': {'type': 'number', 'minimum': 0.0, 'maximum': 1.0},
         'reasoning': {'type': 'string'},
     },
@@ -72,6 +112,8 @@ async def run_judge(
     """Blind pairwise comparison using Claude opus with max thinking.
 
     result_a/b are EvalResult dicts with 'worktree_path' and 'config_name'.
+    A refused call or an answer without a valid winner and a finite
+    confidence is an unmeasured verdict (``winner`` None), never a tie.
     """
     # Get diffs (use pre-computed diff if available, e.g. for reference impl).
     # Thread the authoritative base commit so get_diff yields the full
@@ -121,36 +163,52 @@ Compare these implementations on:
 
 Output JSON: {{"winner": "A" or "B" or "tie", "confidence": 0.0-1.0, "reasoning": "..."}}"""
 
-    result = await invoke_agent(
+    task_id = task.get('id', 'unknown')
+    config_a = result_a['config_name']
+    config_b = result_b['config_name']
+    outcome = await measured_call(
+        invoke_agent,
+        functools.partial(
+            _parse_pairwise_verdict,
+            task_id=task_id, config_a=config_a, config_b=config_b, swapped=swapped,
+        ),
+        stage=MeasurementStage.PAIRWISE_JUDGE,
+        backend='claude',
+        label=f'Pairwise judge {task_id}: {config_a} vs {config_b}',
         prompt=prompt,
         system_prompt='You are an expert code reviewer performing blinded pairwise comparison. Be precise and fair.',
         cwd=Path('/tmp'),
         model='opus',
         effort='max',
-        backend='claude',
         max_budget_usd=5.0,
         output_schema=JUDGE_SCHEMA,
+        # The judge needs no MCP: it answers through output_schema. The truthy
+        # zero-server config is what makes the strict flag bite (task 4757);
+        # mcp_config=None would leave the cwd's ambient .mcp.json merged.
+        mcp_config=no_mcp_servers_config(),
+        strict_mcp_config=True,
     )
+    if isinstance(outcome, Unmeasured):
+        return JudgeVerdict(
+            task_id, config_a, config_b, winner=None, confidence=0.0, reasoning='',
+            unmeasured=outcome,
+        )
+    return outcome.value
 
-    # Parse verdict
-    try:
-        verdict = result.structured_output or json.loads(result.output)
-    except (json.JSONDecodeError, TypeError):
-        logger.warning(f'Judge produced unparseable output: {result.output[:200]}')
-        verdict = {'winner': 'tie', 'confidence': 0.0, 'reasoning': 'Judge output parse failure'}
 
-    # Account for swap
-    winner = verdict.get('winner', 'tie')
-    if swapped:
-        winner = {'A': 'B', 'B': 'A', 'tie': 'tie'}.get(winner, 'tie')
-
+def _parse_pairwise_verdict(
+    result: AgentResult, *, task_id: str, config_a: str, config_b: str, swapped: bool,
+) -> JudgeVerdict:
+    """The judge's verdict for the configs as given, undoing the prompt's swap."""
+    payload = json_answer(result)
+    winner = parse_winner(payload)
     return JudgeVerdict(
-        task_id=task.get('id', 'unknown'),
-        config_a=result_a['config_name'],
-        config_b=result_b['config_name'],
-        winner=winner,
-        confidence=verdict.get('confidence', 0.0),
-        reasoning=verdict.get('reasoning', ''),
+        task_id=task_id,
+        config_a=config_a,
+        config_b=config_b,
+        winner=_UNSWAPPED[winner] if swapped else winner,
+        confidence=parse_confidence(payload),
+        reasoning=str(payload.get('reasoning', '')),
     )
 
 
@@ -178,15 +236,28 @@ async def run_tournament(
     return verdicts
 
 
+@dataclass(frozen=True)
+class TournamentTally:
+    """Judge calls that scored and calls that did not measure; both spent the round budget."""
+
+    judged: int
+    unmeasured: int
+
+
 async def run_elo_tournament(
     result_dicts: list[dict],
     task: dict,
     pool: TaskPool,
     max_rounds: int = 50,
-) -> int:
+    *,
+    max_unmeasured_per_pair: int = MAX_UNMEASURED_PER_PAIR,
+) -> TournamentTally:
     """Run Elo-based matchup selection until budget exhausted or all pairs maxed.
 
-    Mutates *pool* in place.  Returns the number of judge calls made.
+    Mutates *pool* in place with measured verdicts only: an unmeasured one
+    moves no rating and no pair count. A pair is unschedulable for this run
+    once it has *max_unmeasured_per_pair* unmeasured verdicts, or when either
+    contender has no result; neither is persisted, so a later run re-measures.
     """
     # Seed any new configs into the pool
     for r in result_dicts:
@@ -195,19 +266,21 @@ async def run_elo_tournament(
     # Build lookup: config_name → result dict
     by_config: dict[str, dict] = {r['config_name']: r for r in result_dicts}
 
-    rounds_used = 0
-    while rounds_used < max_rounds:
-        matchup = next_matchup(pool)
+    unschedulable: set[str] = set()
+    unmeasured_by_pair: Counter[str] = Counter()
+    judged = unmeasured = 0
+    while judged + unmeasured < max_rounds:
+        matchup = next_matchup(pool, skip=unschedulable)
         if matchup is None:
             logger.info('All pairs maxed out, stopping')
             break
 
         config_a, config_b = matchup
+        key = _pair_key(config_a, config_b)
 
         # Skip if either config has no result available (e.g. worktree deleted)
         if config_a not in by_config or config_b not in by_config:
-            key = _pair_key(config_a, config_b)
-            pool.pair_counts[key] = MAX_PER_PAIR  # avoid infinite loop
+            unschedulable.add(key)
             continue
 
         logger.info(
@@ -216,13 +289,24 @@ async def run_elo_tournament(
         )
 
         verdict = await run_judge(by_config[config_a], by_config[config_b], task)
+        if verdict.winner is None:
+            unmeasured += 1
+            unmeasured_by_pair[key] += 1
+            if unmeasured_by_pair[key] >= max_unmeasured_per_pair:
+                unschedulable.add(key)
+                logger.warning(
+                    f'Elo pair {key} retired for this run after '
+                    f'{unmeasured_by_pair[key]} unmeasured verdicts'
+                )
+            continue
+
         record_match(
             pool, config_a, config_b,
             verdict.winner, verdict.confidence, verdict.reasoning,
         )
-        rounds_used += 1
+        judged += 1
 
-    return rounds_used
+    return TournamentTally(judged=judged, unmeasured=unmeasured)
 
 
 # ---------------------------------------------------------------------------
@@ -268,16 +352,6 @@ def _plan_reuse_items_present(plan: dict) -> bool:
     return bool(plan.get('reuse'))
 
 
-def _plan_confirmed(plan: dict) -> bool:
-    """True when the plan carries the ``_finalized_at`` completeness marker.
-
-    ``confirm_plan`` (and ``artifacts.stamp_plan_provenance``) stamp
-    ``_finalized_at`` once the architect finalizes a complete plan, so its
-    presence is the code-observable "confirmed" signal.
-    """
-    return bool(plan.get('_finalized_at'))
-
-
 # Code-owned structural rubric. Each criterion is
 # ``{name, weight, description}`` and ``name`` dispatches through this closed
 # detector registry (a pure predicate over the produced plan dict). The
@@ -291,7 +365,7 @@ _PLAN_QUALITY_DETECTORS: dict[str, Callable[[dict], bool]] = {
     'files_declared': _plan_files_declared,
     'design_decisions_present': _plan_design_decisions_present,
     'reuse_items_present': _plan_reuse_items_present,
-    'plan_confirmed': _plan_confirmed,
+    'plan_confirmed': plan_confirmed,
 }
 
 PLAN_QUALITY_RUBRIC: dict[str, Any] = {
@@ -318,42 +392,13 @@ PLAN_QUALITY_RUBRIC: dict[str, Any] = {
 }
 
 
-def is_scorable_plan(plan: object) -> TypeGuard[dict]:
-    """THE single test for "does this artifact carry content worth scoring?".
-
-    A plan with no steps is not a plan — whether it is absent (``None``), empty
-    (``{}``), not a dict at all, or the header-only stub ``create_plan`` writes
-    on the architect's FIRST plan-tools call (``plan_tools._create_plan``: a
-    TRUTHY dict with ``task_id`` / ``title`` / ``analysis`` / ``files`` and
-    ``steps: []``).
-
-    Deliberately shared by :func:`score_plan_structure`'s ``0.0``
-    short-circuit and by ``run_architect_eval``'s cap-taint predicate. Those
-    were once two independent tests — raw dict truthiness in the runner versus
-    ``not plan.get('steps')`` here — and they disagreed exactly on the
-    header-only stub, so a session cap landing right after ``create_plan`` left
-    the cell UNtainted and then floored it to a fabricated ``0.0``. Making both
-    call sites literally this function makes that drift structurally impossible.
-
-    Note this is a different question from the ``has_steps`` RUBRIC criterion
-    (:func:`_plan_has_steps`), which is scored per-plan against a real plan; do
-    not conflate the two roles.
-
-    Typed as a ``TypeGuard`` (a plain ``bool`` at runtime) so it also carries
-    the ``isinstance`` narrowing the inline guard it replaced used to give
-    :func:`score_plan_structure`.
-    """
-    return isinstance(plan, dict) and bool(plan.get('steps'))
-
-
 def clamp_unit_score(score: float) -> float:
     """THE output-range contract shared by the two plan-quality instruments.
 
     :func:`score_plan_structure` and :func:`judge_plan_quality` are a
     two-instrument pair reduced onto ONE axis (``EvalMetrics.plan_quality``) —
-    exactly the shape :func:`is_scorable_plan` (above) already solved for
-    scorability. That function's docstring records the rule: "making both call
-    sites literally this function makes that drift structurally impossible."
+    exactly the shape ``plan_predicates.is_scorable_plan`` already solved for
+    scorability by making every call site literally that one function.
     The range invariant gets the same treatment within THIS pair — the ONE
     named contract both plan-quality instruments call, rather than a copied
     expression the two can silently drift apart on the next time either is
@@ -372,9 +417,8 @@ def clamp_unit_score(score: float) -> float:
 
     Covers a real schema gap: ``PLAN_QUALITY_SCHEMA`` declares
     ``{'minimum': 0.0, 'maximum': 1.0}``, but that only constrains the
-    ``structured_output`` delivery path — the documented
-    ``result.structured_output or json.loads(result.output)`` fallback in
-    :func:`judge_plan_quality` bypasses schema enforcement entirely, so an
+    ``structured_output`` delivery path — the ``json.loads(result.output)``
+    fallback in ``measurement.json_answer`` bypasses schema enforcement entirely, so an
     out-of-range judge answer reaches this runtime clamp regardless of which
     path delivered it.
 
@@ -388,12 +432,12 @@ def clamp_unit_score(score: float) -> float:
     one. Rather than leave that a convention callers must remember, this
     function REJECTS all non-finite input outright with ``ValueError`` — a
     loud floor, not just a documented one (structured-facts-at-failure). The
-    one caller with untrusted input (:func:`judge_plan_quality`) already
-    pre-checks with its own ``math.isfinite`` guard and degrades gracefully to
-    the ``None`` sentinel (with a WARNING) before ever reaching here, so in
-    practice this raise is a defense-in-depth backstop for a future second
-    caller that forgets to — the same class of gap :func:`is_scorable_plan`'s
-    docstring warns a second caller could otherwise silently re-open. This
+    one caller with untrusted input (``_parse_plan_verdict``) already
+    pre-checks with its own ``math.isfinite`` guard, which ``measured_call``
+    records as an unparseable answer (with a WARNING) before ever reaching
+    here, so in practice this raise is a defense-in-depth backstop for a future second
+    caller that forgets to — the same class of gap a second caller re-opens
+    by skipping ``plan_predicates.is_scorable_plan``. This
     function's contract is finite-in, ``[0, 1]``/4dp-out, ``ValueError`` on
     anything else.
     """
@@ -456,44 +500,13 @@ def score_plan_structure(
     return clamp_unit_score(score)
 
 
-@dataclass
+@dataclass(frozen=True)
 class PlanQualityVerdict:
-    """Result of the LLM plan judge (eval-revival θ).
+    """The LLM plan judge's answer: a ``[0, 1]`` score and its explanation."""
 
-    ``plan_quality`` is a ``float`` in ``[0, 1]`` when the judge scored the
-    plan, or ``None`` — the parse-failure sentinel — when the judge output could
-    not be parsed. ``run_architect_eval`` treats ``None`` as its signal to
-    degrade to the deterministic :func:`score_plan_structure` floor, so the
-    persisted ``plan_quality`` is a non-sentinel float even when the judge
-    fails (a judge failure never nulls a cell that has a real plan behind it).
-    """
-
-    plan_quality: float | None
+    plan_quality: float
     per_criterion: dict[str, Any]
     reasoning: str
-    # Set when the JUDGE'S OWN invocation was refused at the transport layer (a
-    # 429 cap hit / auth failure), so this ``None`` plan_quality is an INFRA
-    # failure — we never got a judgement — rather than an unparseable answer.
-    # Trailing and defaulted, so every existing 3-arg construction (including
-    # the parse-failure fallback below) is unaffected and keeps reading None.
-    invocation_error: str | None = None
-    # USD spend of THIS verdict's own judge invocation (eval-revival υ).
-    # ``0.0`` when no invocation happened (the pre-invoke unjudgeable-artifact
-    # refusal below) or when the caller constructed the verdict itself — the
-    # same trailing-defaulted shape as ``invocation_error`` immediately above,
-    # for the same reason: every existing construction site keeps working.
-    # ``run_architect_eval`` reads this to fold the judge's spend into the
-    # cell's own ``cost_usd`` (metrics.py's documented judge_cost_usd-is-a-
-    # SUBSET-of-cost_usd contract). Every POST-invoke construction site below
-    # coerces via ``metrics.coerce_cost_usd`` before assigning here, so
-    # DECLARED type and ACTUAL runtime type agree even under a test double —
-    # a direct dataclass construction (like this default, or the legacy
-    # 3-arg call sites) is the only way this field can hold anything the
-    # helper did not already validate.
-    cost_usd: float = 0.0
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
 
 
 PLAN_QUALITY_SCHEMA = {
@@ -512,106 +525,22 @@ async def judge_plan_quality(
     reference_diff: str,
     task: dict,
     rubric: dict[str, Any] = PLAN_QUALITY_RUBRIC,
-) -> PlanQualityVerdict:
+) -> Scored[PlanQualityVerdict] | Unmeasured:
     """LLM plan judge: score a produced *plan* against the real landed diff.
 
-    Mirrors :func:`run_judge`'s structure — an opus judge with an
-    ``output_schema``, ``structured_output``-or-``json.loads`` parse, and a
-    defined fallback verdict on parse failure. The prompt embeds the produced
-    plan, the landed *reference_diff* (``pre_task_commit..post_task_commit``,
-    the always-available ground truth since ζ fixtures frequently carry
-    ``plan: null``), and the code-owned *rubric*'s criterion names — so the
-    semantic judge scores the SAME named structural signals
-    :func:`score_plan_structure` weights deterministically.
-
-    THE ANTI-FABRICATION FLOOR APPLIES UNIFORMLY, WHICHEVER SCORING PATH RUNS
-    (task 3303). An artifact that is not :func:`is_scorable_plan` carries
-    nothing to judge, so this function refuses it up front — before a prompt is
-    built, before ``invoke_agent`` — and returns the deterministic floor
-    instead. The guard is the SAME predicate :func:`score_plan_structure`
-    short-circuits on and ``run_architect_eval`` gates on, so the three cannot
-    drift; and the refusal's score is DERIVED by calling
-    :func:`score_plan_structure` — with THIS call's own *rubric*, not the module
-    default — rather than hardcoding ``0.0``, so a future change to the floor's
-    semantics (including a rubric-sensitive one) carries this path with it
-    structurally rather than by convention. Without it, this instrument's
-    coherence rested entirely on its ONE caller remembering to gate, and any
-    second caller (a backfill/re-scoring script, a new eval path, ``prompt_opt``,
-    a resume wave) silently re-opened the reported defect: the 2026-07-29 cell
-    ``reify_task_12__architect-opus-high__52c66767.json`` records
-    ``plan_steps=0`` alongside ``plan_quality=0.31`` — a value the floor cannot
-    even express (its outputs are multiples of ``0.125``), so it can only have
-    come from an ungated judge scoring an empty artifact.
-
-    That refusal is ``plan_quality=0.0``-not-``None`` DELIBERATELY: ``None``
-    means "no judgement available, degrade to the floor" (parse failure /
-    transport refusal), whereas here the judgement is definite and no infra
-    failure occurred. ``invocation_error`` stays ``None`` for the same reason —
-    nothing was refused at the transport layer. Keeping the two apart preserves
-    the content-failure / infra-failure distinction tasks 3118 and 3302 turn on:
-    a stepless plan from a healthy architect is a real reliability signal worth
-    ``0.0``, never a cap-tainted exclusion.
-
-    A successfully parsed ``plan_quality`` is put through
-    :func:`clamp_unit_score` rather than returned as a raw float — see that
-    function's docstring for why a runtime clamp is still needed despite
-    ``PLAN_QUALITY_SCHEMA``'s declared bounds, and for the non-finite-input
-    mechanics behind the exception below. The parse contract is one rule with
-    two LOUD exceptions (never silent — each leaves one WARNING naming the
-    cell): an out-of-range but FINITE answer (e.g. ``1.5``) is clamped and
-    the WARNING names the raw and clamped values; ANY non-finite answer
-    (``NaN``, ``+/-Infinity``) degrades to the ``None`` sentinel instead,
-    exactly like a parse failure, because it is not a judgement at all.
-
-    On any parse failure the verdict's ``plan_quality`` is ``None`` (the
-    sentinel :func:`run_architect_eval` degrades on), never a crash. When the
-    judge's OWN invocation was refused at the transport layer (a 429 cap hit /
-    auth failure) the verdict additionally carries ``invocation_error``, so that
-    infra cause stays distinguishable from an unparseable answer; the caller
-    still degrades to the deterministic structural floor, which remains a
-    legitimate content-derived score whenever a real plan exists.
-
-    COST ACCOUNTING (eval-revival υ): the returned verdict's ``cost_usd``
-    reports THIS invocation's own USD spend — every path that reached
-    ``invoke_agent`` (success, transport refusal, NaN, parse failure) carries
-    that call's real cost, whatever the verdict turned out to be; only the
-    PRE-invoke unjudgeable-artifact refusal above, which returns before
-    ``invoke_agent`` is ever called, reports ``0.0``. Each of those four
-    POST-invoke sites coerces ``result.cost_usd`` through
-    :func:`~orchestrator.evals.metrics.coerce_cost_usd` (amendment,
-    reviewer design-coherence) before it rides the verdict, so the
-    dataclass's declared ``float`` type is actually true at every
-    construction site — not just enforced by whichever caller happens to
-    read it defensively.
+    ``Scored`` when the judge answered parseably, or when the artifact is not
+    :func:`is_scorable_plan` — then the judge is never invoked and the score is
+    :func:`score_plan_structure`'s floor at ``cost_usd=0.0``. ``Unmeasured``
+    (stage ``judge``) when the judge's call was refused or its answer was
+    unparseable, null or non-finite; a finite out-of-range answer is clamped
+    with a WARNING. ``cost_usd`` is the judge invocation's own spend on every
+    path that reached it. Rationale: docs/plan-scoring-and-judge.md.
     """
-    # Name WHICH cell to go look at, whichever key the caller populated:
-    # ``run_architect_eval`` passes ``id``, but a second caller — precisely the
-    # scenario BOTH warnings below defend against — may carry only ``name``
-    # (``run_judge`` and the prompt builder further down both key off ``name``
-    # first). Falling through absent AND empty values means a malformed task
-    # dict degrades a log line rather than crashing an anti-fabrication guard
-    # or an out-of-range check. Hoisted here so the unjudgeable-artifact guard
-    # and the out-of-range parse-block check below name the same cell the
-    # same way.
+    # Name WHICH cell to go look at, whichever key the caller populated.
     cell = task.get('id') or task.get('name') or 'unknown'
 
     if not is_scorable_plan(plan):
-        # THIS call's rubric, not the module default. Today the floor
-        # short-circuits on ``is_scorable_plan`` before it ever reads a rubric,
-        # so every rubric yields 0.0 here and the argument is inert — but
-        # dropping it would make "the score is DERIVED from the floor" true of
-        # only ONE of the floor's two arguments, and would silently re-open the
-        # two-instrument disagreement 3303 closes the day that short-circuit
-        # becomes rubric-sensitive (a rubric-defined minimum, or criteria that
-        # change what "unscorable" means).
         floor = score_plan_structure(plan, rubric=rubric)
-        # LOUD, not a silent 0.0: reaching here means a caller did NOT gate,
-        # which is exactly how the reported cell was written. WARNING matches
-        # ``run_architect_eval``'s own no-scorable-plan log and the
-        # transport-refusal log below — an expected-but-notable degradation,
-        # not an error. It cannot double-log through the normal path because
-        # the runner's own ``is_scorable_plan`` gate short-circuits before the
-        # judge is ever awaited.
         logger.warning(
             f'Plan judge asked to score an UNJUDGEABLE artifact for {cell}: '
             f'the plan carries no steps '
@@ -619,19 +548,42 @@ async def judge_plan_quality(
             f'deterministic structural floor ({floor}). The caller did not '
             f'gate; run_architect_eval does (task 3302/3303).'
         )
-        return PlanQualityVerdict(
-            plan_quality=floor,
-            per_criterion={},
-            reasoning=(
-                'plan carries no steps — not a judgeable artifact; scored on '
-                f'the deterministic structural floor ({floor})'
+        return Scored(
+            PlanQualityVerdict(
+                plan_quality=floor,
+                per_criterion={},
+                reasoning=(
+                    'plan carries no steps — not a judgeable artifact; scored on '
+                    f'the deterministic structural floor ({floor})'
+                ),
             ),
-            # cost_usd stays the dataclass default (0.0): no invoke_agent call
-            # happened on this path, so recording any spend would fabricate
-            # it — the same anti-fabrication discipline that governs
-            # plan_quality and invocation_error on this exact return.
+            cost_usd=0.0,
         )
 
+    return await measured_call(
+        invoke_agent,
+        functools.partial(_parse_plan_verdict, cell=cell),
+        stage=MeasurementStage.JUDGE,
+        backend='claude',
+        label=f'Plan judge for {cell}',
+        prompt=_plan_judge_prompt(plan, reference_diff, task, rubric),
+        system_prompt=(
+            'You are an expert software architect grading an implementation '
+            'plan against the change that actually landed. Be precise and fair.'
+        ),
+        cwd=Path('/tmp'),
+        model='opus',
+        effort='max',
+        max_budget_usd=5.0,
+        output_schema=PLAN_QUALITY_SCHEMA,
+        mcp_config=no_mcp_servers_config(),
+        strict_mcp_config=True,
+    )
+
+
+def _plan_judge_prompt(
+    plan: dict, reference_diff: str, task: dict, rubric: dict[str, Any],
+) -> str:
     task_name = task.get('name', task.get('id', 'unknown'))
     task_desc = task.get('task_definition', {}).get('description', '')
 
@@ -644,7 +596,7 @@ async def judge_plan_quality(
     # as run_judge does for the contender diffs.
     clean_diff = _strip_metadata(reference_diff)
 
-    prompt = f"""You are evaluating the QUALITY of an implementation PLAN a \
+    return f"""You are evaluating the QUALITY of an implementation PLAN a \
 software architect produced for a task, BEFORE any code was written.
 
 Task: {task_name}
@@ -670,123 +622,29 @@ PRODUCE the landed diff if executed. Judge the PLAN, not the diff.
 
 Output JSON: {{"plan_quality": 0.0-1.0, "per_criterion": {{"<criterion>": 0.0-1.0, ...}}, "reasoning": "..."}}"""
 
-    result = await invoke_agent(
-        prompt=prompt,
-        system_prompt=(
-            'You are an expert software architect grading an implementation '
-            'plan against the change that actually landed. Be precise and fair.'
-        ),
-        cwd=Path('/tmp'),
-        model='opus',
-        effort='max',
-        backend='claude',
-        max_budget_usd=5.0,
-        output_schema=PLAN_QUALITY_SCHEMA,
-    )
 
-    # Was the JUDGE ITSELF refused at the transport layer? Checked BEFORE the
-    # parse block, because a 429 body is not JSON and would otherwise land in
-    # the parse-failure fallback — making an infra refusal indistinguishable
-    # from a judge that answered badly. Local import: keeps judge.py's
-    # module-level import surface unchanged (and there is no cycle either way —
-    # metrics.py does not import judge). coerce_cost_usd is the SAME producer-
-    # side coercion used at every POST-invoke return below (amendment,
-    # reviewer design-coherence) — see its docstring in metrics.py.
-    from .metrics import coerce_cost_usd, detect_invocation_error
+def _parse_plan_verdict(result: AgentResult, *, cell: str) -> PlanQualityVerdict:
+    """The judge's verdict, clamped; ``ValueError``/``KeyError`` if it has none.
 
-    invocation_error = detect_invocation_error(result)
-    if invocation_error:
+    A null or non-finite ``plan_quality`` is not a judgement (see
+    :func:`clamp_unit_score`). A finite out-of-range one is clamped, loudly.
+    """
+    payload = json_answer(result)
+    raw = payload['plan_quality']
+    if raw is None:
+        raise ValueError('plan_quality is null')
+    raw_quality = float(raw)
+    if not math.isfinite(raw_quality):
+        raise ValueError(f'non-finite plan_quality {raw_quality!r}')
+    plan_quality = clamp_unit_score(raw_quality)
+    if raw_quality < 0.0 or raw_quality > 1.0:
         logger.warning(
-            f'Plan judge invocation REFUSED at the transport layer: '
-            f'{invocation_error}'
+            f'Plan judge for {cell} answered OUTSIDE its declared '
+            f'[0, 1] contract (raw plan_quality={raw_quality!r}) — '
+            f'clamped to {plan_quality!r}.'
         )
-        return PlanQualityVerdict(
-            plan_quality=None,
-            per_criterion={},
-            reasoning=f'plan judge invocation refused: {invocation_error}',
-            invocation_error=invocation_error,
-            # A refused invocation still burned tokens — real spend, not $0.
-            cost_usd=coerce_cost_usd(result.cost_usd),
-        )
-
-    # Parse verdict — structured_output first, else json.loads(output); a
-    # missing/None/non-numeric plan_quality degrades to the None sentinel.
-    try:
-        verdict = result.structured_output or json.loads(result.output)
-        raw_quality = verdict['plan_quality']
-        if raw_quality is None:
-            plan_quality = None
-        else:
-            raw_quality = float(raw_quality)
-            # A non-finite answer is not a judgement at all, so it degrades
-            # to the None sentinel BEFORE the clamp (see clamp_unit_score's
-            # docstring for the mechanics): NaN because it is unordered and
-            # the clamp cannot constrain it at all; +/-Infinity because the
-            # clamp CAN constrain it, but only by fabricating the best/worst
-            # possible score (1.0/0.0) on a live ranking surface
-            # (report._mean_plan_quality -> select_survivors) — a worse
-            # failure than admitting no measurement. The finite
-            # out-of-range clamp + WARNING path immediately below is
-            # DELIBERATELY unchanged (operator SCOPE RULING 2026-08-12):
-            # this narrows the task-3410 amendment, it does not reverse it
-            # — finite overshoots stay orderable and intent-preserving.
-            if not math.isfinite(raw_quality):
-                logger.warning(
-                    f'Plan judge for {cell} answered a non-finite '
-                    f'plan_quality ({raw_quality!r}) — not a real judgement, '
-                    f'degraded to the None sentinel (run_architect_eval '
-                    f'falls back to the deterministic structural floor).'
-                )
-                return PlanQualityVerdict(
-                    plan_quality=None,
-                    per_criterion={},
-                    reasoning=(
-                        f'Plan judge answered a non-finite plan_quality '
-                        f'({raw_quality!r}) for {cell}'
-                    ),
-                    # The judge DID run and produced an answer (a nonsense
-                    # one) — real spend, not $0.
-                    cost_usd=coerce_cost_usd(result.cost_usd),
-                )
-            plan_quality = clamp_unit_score(raw_quality)
-            # See clamp_unit_score's docstring for why the schema bound alone
-            # (structured_output-only) does not stop an out-of-range answer
-            # reaching here. LOUD, not silent: the value is still corrected,
-            # but an operator must be able to see that the judge answered
-            # OUTSIDE its declared contract, not just read the
-            # silently-corrected output.
-            if raw_quality < 0.0 or raw_quality > 1.0:
-                logger.warning(
-                    f'Plan judge for {cell} answered OUTSIDE its declared '
-                    f'[0, 1] contract (raw plan_quality={raw_quality!r}) — '
-                    f'clamped to {plan_quality!r}.'
-                )
-    except (json.JSONDecodeError, TypeError, KeyError, ValueError):
-        logger.warning(
-            f'Plan judge produced unparseable output: {str(result.output)[:200]}'
-        )
-        return PlanQualityVerdict(
-            plan_quality=None,
-            per_criterion={},
-            reasoning='Plan judge output parse failure',
-            # The judge DID run and produced output (just unparseable) —
-            # real spend, not $0.
-            cost_usd=coerce_cost_usd(result.cost_usd),
-        )
-
     return PlanQualityVerdict(
         plan_quality=plan_quality,
-        per_criterion=verdict.get('per_criterion', {}) or {},
-        reasoning=verdict.get('reasoning', ''),
-        # Coerced at the producer via the shared metrics.coerce_cost_usd
-        # helper (amendment, reviewer design-coherence): isinstance-gated,
-        # so a bare MagicMock — as the pre-existing judge tests construct,
-        # without setting cost_usd — degrades to 0.0 instead of leaking a
-        # non-float into a field declared ``float`` (verified: MagicMock
-        # configures __float__ to return 1.0, so a naive float() coercion
-        # would have silently FABRICATED spend instead; isinstance avoids
-        # that trap). This makes the declared type actually true at every
-        # construction site, not enforced only by the runner's defensive
-        # read (_verdict_cost_usd, now itself built on this same helper).
-        cost_usd=coerce_cost_usd(result.cost_usd),
+        per_criterion=payload.get('per_criterion') or {},
+        reasoning=payload.get('reasoning', ''),
     )

@@ -1,0 +1,3 @@
+```json
+{"cancelled": ["1001", "395", "390", "544"], "skipped": [], "released": [{"task": "1118", "edges": ["1118->1150", "1118->1151"], "commit_planning_result": "1118 flipped deferred -> pending; manifest_stamping: path docs/prds/review-all-dispatch-composition-out-of-control.capability-manifest.yaml, stamped [\"δ\"], missing_labels [], errors []"}], "errors": []}
+```

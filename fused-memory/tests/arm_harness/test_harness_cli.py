@@ -12,11 +12,11 @@ from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
+import yaml
 from _fm_helpers import load_script_module
 from _mock_openai_server import mock_openai_server
 from shared.cli_boundary import EXIT_STDOUT_FAILED
 from shared.memory_eval_metrics import Metric
-from shared.safe_io import atomic_write_text
 
 from arm_harness._fakes import (
     FINISHED_AT,
@@ -28,7 +28,12 @@ from arm_harness._fakes import (
     incumbent_control_spec,
     llm_spec,
     make_prereg_repo,
+    preregistration_inputs,
     run_manifest_for,
+    screening_outcomes,
+    slate_arm,
+    write_arm_evidence,
+    write_run,
 )
 from fused_memory.arm_harness.arm_spec import LlmArmSpec
 from fused_memory.arm_harness.checks import CLEANUP_CYPHER, PROBE_CYPHER
@@ -42,7 +47,6 @@ from fused_memory.arm_harness.metrics_record import (
     load_metrics_record,
     load_metrics_records,
     record_for,
-    write_metrics_record,
 )
 from fused_memory.arm_harness.preregistration import (
     PREREGISTRATION_INPUTS_FILENAME,
@@ -59,10 +63,16 @@ from fused_memory.arm_harness.run import (
     write_outcomes,
 )
 from fused_memory.arm_harness.run_manifest import (
-    RunManifest,
     load_run_manifest,
-    serialize_run_manifest,
 )
+from fused_memory.arm_harness.screening import (
+    GateId,
+    derive_screening_verdict,
+    load_screening_verdict,
+    serialize_screening_verdict,
+)
+from fused_memory.arm_harness.screening_evidence import ArmEvidencePaths, load_arm_evidence
+from fused_memory.arm_harness.slate import load_llm_slate
 from fused_memory.arm_harness.topology import EDGE_CYPHER, NODE_CYPHER, read_topology, topology_hash
 from fused_memory.backends.llm_token_usage import LlmTokenUsage
 from fused_memory.config.schema import FusedMemoryConfig
@@ -197,9 +207,15 @@ class FakeLive:
                 open_journal=_opener(self.journal, log.journal_paths.append),
                 open_falkordb=_opener(self.falkor, lambda: _count(log, 'falkordb_opens')),
                 open_qdrant=_opener(self.qdrant, lambda: _count(log, 'qdrant_opens')),
+                open_embedding_arm_backend=_embedding_only,
+                build_arm_embedder=_embedding_only,
             )
 
         return build
+
+
+def _embedding_only(*args: Any, **kwargs: Any) -> Any:
+    raise AssertionError('only the embedding subcommands (test_embedding_cli.py) build these')
 
 
 def _count(log: DepsLog, name: str) -> None:
@@ -702,15 +718,6 @@ def _scalar_record(spec: LlmArmSpec, metric_id: LlmMetricId, value: float) -> Me
     return record_for(spec, metric, measured_at=MEASURED_AT, incomplete=False)
 
 
-def _write_run(run_dir: Path, manifest: RunManifest, records: list[MetricsRecord]) -> Path:
-    atomic_write_text(
-        run_dir / RUN_MANIFEST_FILENAME, serialize_run_manifest(manifest), mkdir=True
-    )
-    for record in records:
-        write_metrics_record(record, run_dir)
-    return run_dir
-
-
 def _accounted(spec: LlmArmSpec, tokens: float = 900.0) -> list[MetricsRecord]:
     return [
         _scalar_record(spec, LlmMetricId.TOKENS_PER_EPISODE, tokens),
@@ -730,8 +737,8 @@ def _parity_specs() -> tuple[LlmArmSpec, LlmArmSpec]:
 
 def test_parity_check_writes_delta_records_under_run_a_parity(harness, live, tmp_path):
     spec_a, spec_b = _parity_specs()
-    run_a = _write_run(tmp_path / 'a', run_manifest_for(spec_a), _accounted(spec_a, 900.0))
-    run_b = _write_run(tmp_path / 'b', run_manifest_for(spec_b), _accounted(spec_b, 850.0))
+    run_a = write_run(tmp_path / 'a', run_manifest_for(spec_a), _accounted(spec_a, 900.0))
+    run_b = write_run(tmp_path / 'b', run_manifest_for(spec_b), _accounted(spec_b, 850.0))
 
     code = harness.main(
         ['parity-check', '--run-a', str(run_a), '--run-b', str(run_b)],
@@ -759,8 +766,8 @@ def test_parity_check_refuses_an_incomplete_run(harness, live, tmp_path, capsys)
         incomplete=True,
         abort=ArmAbort(arm_id=spec_b.arm_id, item_ids=('e1',), error_classes=('RuntimeError',)),
     )
-    run_a = _write_run(tmp_path / 'a', run_manifest_for(spec_a), _accounted(spec_a))
-    run_b = _write_run(tmp_path / 'b', aborted, _accounted(spec_b))
+    run_a = write_run(tmp_path / 'a', run_manifest_for(spec_a), _accounted(spec_a))
+    run_b = write_run(tmp_path / 'b', aborted, _accounted(spec_b))
 
     code = harness.main(
         ['parity-check', '--run-a', str(run_a), '--run-b', str(run_b)],
@@ -776,7 +783,7 @@ def test_parity_check_refuses_an_interrupted_run_without_run_json(
     harness, live, tmp_path, capsys
 ):
     spec_a, _ = _parity_specs()
-    run_a = _write_run(tmp_path / 'a', run_manifest_for(spec_a), _accounted(spec_a))
+    run_a = write_run(tmp_path / 'a', run_manifest_for(spec_a), _accounted(spec_a))
     interrupted = tmp_path / 'b'
     interrupted.mkdir()
 
@@ -800,8 +807,8 @@ def test_control_check_passes_two_symmetric_accounted_control_runs(
     harness, live, tmp_path, capsys
 ):
     spec_a, spec_b = _control('ctrl-a', 'evalmem_ctrl_a'), _control('ctrl-b', 'evalmem_ctrl_b')
-    run_a = _write_run(tmp_path / 'a', run_manifest_for(spec_a), _accounted(spec_a))
-    run_b = _write_run(tmp_path / 'b', run_manifest_for(spec_b), _accounted(spec_b))
+    run_a = write_run(tmp_path / 'a', run_manifest_for(spec_a), _accounted(spec_a))
+    run_b = write_run(tmp_path / 'b', run_manifest_for(spec_b), _accounted(spec_b))
     reference_path = write_outcomes(tmp_path / 'reference', _reference(('e1', 'e2')))
 
     code = harness.main(
@@ -825,8 +832,8 @@ def test_control_check_passes_two_symmetric_accounted_control_runs(
 def test_control_check_fails_on_an_asymmetric_temperature(harness, live, tmp_path, capsys):
     spec_a = _control('ctrl-a', 'evalmem_ctrl_a')
     spec_b = _control('ctrl-b', 'evalmem_ctrl_b', params={'temperature': 0.7, 'max_tokens': 4096})
-    run_a = _write_run(tmp_path / 'a', run_manifest_for(spec_a), _accounted(spec_a))
-    run_b = _write_run(tmp_path / 'b', run_manifest_for(spec_b), _accounted(spec_b))
+    run_a = write_run(tmp_path / 'a', run_manifest_for(spec_a), _accounted(spec_a))
+    run_b = write_run(tmp_path / 'b', run_manifest_for(spec_b), _accounted(spec_b))
 
     code = harness.main(
         ['control-check', '--run', str(run_a), '--run', str(run_b)], deps=live.factory(harness)
@@ -838,8 +845,8 @@ def test_control_check_fails_on_an_asymmetric_temperature(harness, live, tmp_pat
 
 def test_control_check_refuses_two_runs_of_one_arm(harness, live, tmp_path):
     spec = _control('ctrl-a', 'evalmem_ctrl_a')
-    run_a = _write_run(tmp_path / 'a', run_manifest_for(spec), _accounted(spec))
-    run_b = _write_run(tmp_path / 'b', run_manifest_for(spec), _accounted(spec))
+    run_a = write_run(tmp_path / 'a', run_manifest_for(spec), _accounted(spec))
+    run_b = write_run(tmp_path / 'b', run_manifest_for(spec), _accounted(spec))
 
     code = harness.main(
         ['control-check', '--run', str(run_a), '--run', str(run_b)], deps=live.factory(harness)
@@ -851,8 +858,8 @@ def test_control_check_refuses_two_runs_of_one_arm(harness, live, tmp_path):
 def test_control_check_refuses_a_limited_run_against_a_full_one(harness, live, tmp_path, capsys):
     spec_a, spec_b = _control('ctrl-a', 'evalmem_ctrl_a'), _control('ctrl-b', 'evalmem_ctrl_b')
     limited = run_manifest_for(spec_b, episode_ids=('e1',))
-    run_a = _write_run(tmp_path / 'a', run_manifest_for(spec_a), _accounted(spec_a))
-    run_b = _write_run(tmp_path / 'b', limited, _accounted(spec_b))
+    run_a = write_run(tmp_path / 'a', run_manifest_for(spec_a), _accounted(spec_a))
+    run_b = write_run(tmp_path / 'b', limited, _accounted(spec_b))
 
     code = harness.main(
         ['control-check', '--run', str(run_a), '--run', str(run_b)], deps=live.factory(harness)
@@ -866,8 +873,8 @@ def test_control_check_refuses_a_limited_run_against_a_full_one(harness, live, t
 
 def test_control_check_refuses_an_embedding_arm_run(harness, live, tmp_path, capsys):
     spec_a = _control('ctrl-a', 'evalmem_ctrl_a')
-    run_a = _write_run(tmp_path / 'a', run_manifest_for(spec_a), _accounted(spec_a))
-    run_b = _write_run(tmp_path / 'b', run_manifest_for(embedding_spec()), [])
+    run_a = write_run(tmp_path / 'a', run_manifest_for(spec_a), _accounted(spec_a))
+    run_b = write_run(tmp_path / 'b', run_manifest_for(embedding_spec()), [])
 
     code = harness.main(
         ['control-check', '--run', str(run_a), '--run', str(run_b)], deps=live.factory(harness)
@@ -898,8 +905,8 @@ def test_an_unreadable_run_is_refused_naming_it(
     harness, live, tmp_path, capsys, command, corruption
 ):
     spec_a, spec_b = _control('ctrl-a', 'evalmem_ctrl_a'), _control('ctrl-b', 'evalmem_ctrl_b')
-    run_a = _write_run(tmp_path / 'a', run_manifest_for(spec_a), _accounted(spec_a))
-    run_b = _write_run(tmp_path / 'b', run_manifest_for(spec_b), _accounted(spec_b))
+    run_a = write_run(tmp_path / 'a', run_manifest_for(spec_a), _accounted(spec_a))
+    run_b = write_run(tmp_path / 'b', run_manifest_for(spec_b), _accounted(spec_b))
     relative, text = _RUN_CORRUPTIONS[corruption]
     (run_b / relative).write_text(text)
 
@@ -913,8 +920,8 @@ def test_an_unreadable_run_is_refused_naming_it(
 @pytest.mark.parametrize('content', [None, '{not json\n'], ids=['missing', 'not-json'])
 def test_control_check_refuses_an_unreadable_reference(harness, live, tmp_path, capsys, content):
     spec_a, spec_b = _control('ctrl-a', 'evalmem_ctrl_a'), _control('ctrl-b', 'evalmem_ctrl_b')
-    run_a = _write_run(tmp_path / 'a', run_manifest_for(spec_a), _accounted(spec_a))
-    run_b = _write_run(tmp_path / 'b', run_manifest_for(spec_b), _accounted(spec_b))
+    run_a = write_run(tmp_path / 'a', run_manifest_for(spec_a), _accounted(spec_a))
+    run_b = write_run(tmp_path / 'b', run_manifest_for(spec_b), _accounted(spec_b))
     reference = tmp_path / 'reference.jsonl'
     if content is not None:
         reference.write_text(content)
@@ -949,7 +956,7 @@ def test_run_refuses_an_unreadable_reference_before_any_backend(
 
 def test_control_check_needs_at_least_two_runs(harness, live, tmp_path):
     spec = _control('ctrl-a', 'evalmem_ctrl_a')
-    run_a = _write_run(tmp_path / 'a', run_manifest_for(spec), _accounted(spec))
+    run_a = write_run(tmp_path / 'a', run_manifest_for(spec), _accounted(spec))
 
     with pytest.raises(SystemExit) as raised:
         harness.main(['control-check', '--run', str(run_a)], deps=live.factory(harness))
@@ -1039,7 +1046,7 @@ def _control_run_dir(
     sameness: bool = False,
 ) -> Path:
     manifest = run_manifest_for(spec, episode_ids=PREREG_EPISODES)
-    run_dir = _write_run(root / spec.arm_id, manifest, _prereg_records(
+    run_dir = write_run(root / spec.arm_id, manifest, _prereg_records(
         spec, p95_ms=p95_ms, sameness=sameness
     ))
     write_outcomes(run_dir, _prereg_outcomes(calls))
@@ -1150,11 +1157,179 @@ def test_preregister_refuses_missing_outcomes(harness, live, tmp_path, capsys):
 
 def test_preregister_refuses_an_embedding_arm_run(harness, live, tmp_path, capsys):
     run_a, _ = _control_pair(tmp_path)
-    run_b = _write_run(tmp_path / 'emb', run_manifest_for(embedding_spec()), [])
+    run_b = write_run(tmp_path / 'emb', run_manifest_for(embedding_spec()), [])
 
     err = _refused_preregister(harness, live, run_a, run_b, tmp_path / 'f.json', capsys)
 
     assert 'embedding arm' in err
+
+
+# --- screen ---------------------------------------------------------------------------
+
+SCREEN_SLATE = (
+    slate_arm(),
+    slate_arm(
+        arm_id='phi-4-14b', port=8412, served_model_name='phi-4-14b', reasoning='off',
+        max_model_len=16384,
+    ),
+    slate_arm(
+        arm_id='moe-stretch', stack='llamacpp', port=8413, served_model_name='moe-stretch',
+        structured_output_mode='json_object', quant='q4_k_xl', reasoning='off',
+        max_model_len=16384,
+    ),
+)
+SURVIVOR_FAIL_UNSERVED = {
+    'qwen3.5-9b': {},
+    'phi-4-14b': {'smoke_exit': 3},
+    'moe-stretch': {'wait_ready_exit': 1},
+}
+
+
+def _offline() -> Any:
+    raise AssertionError('screen is offline post-processing: it must never build live deps')
+
+
+@dataclass(frozen=True)
+class ScreenInputs:
+    evidence_root: Path
+    arms_manifest: Path
+    preregistration_inputs: Path
+    reference_outcomes: Path
+    out: Path
+
+    def argv(self) -> list[str]:
+        return [
+            'screen',
+            '--evidence-root', str(self.evidence_root),
+            '--arms-manifest', str(self.arms_manifest),
+            '--preregistration-inputs', str(self.preregistration_inputs),
+            '--reference-outcomes', str(self.reference_outcomes),
+            '--out', str(self.out),
+        ]
+
+
+def _arms_manifest(path: Path) -> Path:
+    embedding = {
+        'arm_id': 'bge-embed', 'axis': 'embedding', 'stack': 'vllm', 'port': 8414,
+        'served_model_name': 'bge-embed', 'structured_output_mode': 'none', 'dims': 1024,
+    }
+    arms = [{'axis': 'llm', **arm.model_dump()} for arm in SCREEN_SLATE] + [embedding]
+    path.write_text(yaml.safe_dump({'port_block': [8410, 8417], 'arms': arms}, sort_keys=False))
+    return path
+
+
+def _screen_inputs(
+    tmp_path: Path, evidence: Mapping[str, Mapping[str, Any]] = SURVIVOR_FAIL_UNSERVED
+) -> ScreenInputs:
+    root = tmp_path / 'evidence'
+    for arm in SCREEN_SLATE:
+        if arm.arm_id in evidence:
+            write_arm_evidence(root, arm, **evidence[arm.arm_id])
+    inputs_path = tmp_path / PREREGISTRATION_INPUTS_FILENAME
+    inputs_path.write_text(serialize_preregistration_inputs(preregistration_inputs()))
+    reference_dir = tmp_path / 'control-a'
+    write_outcomes(reference_dir, screening_outcomes())
+    return ScreenInputs(
+        evidence_root=root,
+        arms_manifest=_arms_manifest(tmp_path / 'arms.yaml'),
+        preregistration_inputs=inputs_path,
+        reference_outcomes=reference_dir / OUTCOMES_FILENAME,
+        out=tmp_path / 'out' / 'screening-verdict.json',
+    )
+
+
+def _expected_verdict(inputs: ScreenInputs):
+    slate = load_llm_slate(inputs.arms_manifest)
+    evidence = {
+        arm.arm_id: load_arm_evidence(ArmEvidencePaths(inputs.evidence_root, arm.arm_id), arm)
+        for arm in slate
+    }
+    return derive_screening_verdict(
+        slate,
+        evidence,
+        load_preregistration_inputs(inputs.preregistration_inputs),
+        load_outcomes(inputs.reference_outcomes),
+    )
+
+
+def test_screen_writes_the_verdict_derived_from_the_evidence(harness, tmp_path, capsys):
+    inputs = _screen_inputs(tmp_path)
+
+    code = harness.main(inputs.argv(), deps=_offline)
+
+    assert code == harness.EXIT_OK
+    expected = _expected_verdict(inputs)
+    assert inputs.out.read_text() == serialize_screening_verdict(expected)
+    assert expected.survivors == ('qwen3.5-9b',)
+    lines = capsys.readouterr().out.splitlines()
+    gate_lines = [line for line in lines if line.startswith('gate ')]
+    pairs = [(arm.arm_id, gate.value) for arm in SCREEN_SLATE for gate in GateId]
+    assert len(gate_lines) == len(pairs)
+    for (arm_id, gate), line in zip(pairs, gate_lines, strict=True):
+        assert f'gate {arm_id} {gate}: ' in line
+    qwen_vram = gate_lines[1]
+    assert 'PASS' in qwen_vram
+    assert 'value 16637.0' in qwen_vram
+    assert 'bound 18019.0' in qwen_vram
+    assert 'margin 1382.0' in qwen_vram
+    assert 'FAIL' in gate_lines[4]
+    assert all('UNMEASURED' in line for line in gate_lines[8:])
+    assert 'survivors: qwen3.5-9b' in lines
+    assert 'outcome: proceed-to-theta' in lines
+
+
+def test_screen_with_zero_survivors_is_a_result_not_an_error(harness, tmp_path, capsys):
+    all_fail = {arm.arm_id: {'smoke_exit': 3} for arm in SCREEN_SLATE}
+    inputs = _screen_inputs(tmp_path, all_fail)
+
+    code = harness.main(inputs.argv(), deps=_offline)
+
+    assert code == harness.EXIT_OK
+    assert load_screening_verdict(inputs.out).survivors == ()
+    lines = capsys.readouterr().out.splitlines()
+    assert 'survivors: none' in lines
+    assert 'outcome: negative-verdict' in lines
+
+
+def test_screen_never_overwrites_an_existing_verdict(harness, tmp_path, capsys):
+    inputs = _screen_inputs(tmp_path)
+    inputs.out.parent.mkdir(parents=True)
+    inputs.out.write_text('screened\n')
+
+    code = harness.main(inputs.argv(), deps=_offline)
+
+    assert code == harness.EXIT_REFUSED
+    assert inputs.out.read_text() == 'screened\n'
+    err = capsys.readouterr().err
+    assert err.startswith('error: ')
+    assert str(inputs.out) in err
+
+
+def test_screen_refuses_a_misshapen_arms_manifest_naming_it(harness, tmp_path, capsys):
+    inputs = _screen_inputs(tmp_path)
+    inputs.arms_manifest.write_text('arms:\n  - not-a-mapping\n')
+
+    code = harness.main(inputs.argv(), deps=_offline)
+
+    assert code == harness.EXIT_REFUSED
+    assert not inputs.out.exists()
+    err = capsys.readouterr().err
+    assert err.startswith('error: ')
+    assert str(inputs.arms_manifest) in err
+    assert 'not mappings' in err
+
+
+def test_screen_refuses_invalid_evidence_naming_the_error(harness, tmp_path, capsys):
+    missing_moe = {k: v for k, v in SURVIVOR_FAIL_UNSERVED.items() if k != 'moe-stretch'}
+    inputs = _screen_inputs(tmp_path, missing_moe)
+
+    code = harness.main(inputs.argv(), deps=_offline)
+
+    assert code == harness.EXIT_REFUSED
+    assert not inputs.out.exists()
+    err = capsys.readouterr().err
+    assert err.startswith('error: ScreeningEvidenceError: ')
+    assert 'moe-stretch' in err
 
 
 # --- topology -------------------------------------------------------------------------

@@ -17,11 +17,11 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeGuard
 
 from shared import safe_io
 
@@ -110,7 +110,7 @@ class AcquireRoute(Enum):
     #: main; ``git worktree add`` (no ``-b``) + seed, then the reuse tail.
     CREATE_ONCE_REATTACH = 'create_once_reattach'
     #: git_ops.py ~3132-3161 — already-registered lane whose
-    #: ``.task-meta/plan.json`` matches this task (post-restart backstop).
+    #: ``.task-meta/<lane>/metadata.json`` names this task (post-restart backstop).
     DISK_BACKSTOP_REUSE = 'disk_backstop_reuse'
     #: git_ops.py ~3163-3213 — already-registered lane whose orphan branch
     #: has commits beyond main; ``git checkout -f`` + the reuse tail.
@@ -167,7 +167,8 @@ _validate_acquire_route_transitions()
 
 
 class IllegalLaneTransition(Exception):
-    """Raised when a caller attempts a (from, to) edge not in LEGAL_TRANSITIONS.
+    """Raised when a caller attempts a (from, to) edge not in LEGAL_TRANSITIONS,
+    or ``refresh_assigned`` on a record the caller does not hold.
 
     Never silent-heal (PRD I2): the durable record is left unchanged when this
     is raised.
@@ -220,6 +221,20 @@ class LaneRecord:
     @classmethod
     def from_json(cls, text: str) -> LaneRecord:
         return cls.from_dict(json.loads(text))
+
+
+def _now_stamp() -> str:
+    """The ``updated_at`` stamp format, which warm-lane-gc.sh's record gate parses."""
+    return datetime.now(UTC).isoformat()
+
+
+def _held_by(record: LaneRecord | None, task_id: str) -> TypeGuard[LaneRecord]:
+    """True iff *record* is ``ASSIGNED``/``IN_USE`` for *task_id*."""
+    return (
+        record is not None
+        and record.state in (LaneState.ASSIGNED, LaneState.IN_USE)
+        and record.task_id == task_id
+    )
 
 
 class LaneLifecycle:
@@ -402,7 +417,7 @@ class LaneLifecycle:
             title=current.title if current is not None else None,
             branch=current.branch if current is not None else None,
             seeded_from_sha=current.seeded_from_sha if current is not None else None,
-            updated_at=datetime.now(UTC).isoformat(),
+            updated_at=_now_stamp(),
         )
         for key, value in fields.items():
             setattr(record, key, value)
@@ -524,7 +539,8 @@ class LaneLifecycle:
 
         * Already ``ASSIGNED``/``IN_USE`` for the SAME ``task_id``: no-op —
           returns the existing record UNCHANGED, with no write at all
-          (idempotent).
+          (idempotent). It never restamps ``updated_at``; that is
+          ``refresh_assigned``'s job.
         * Already ``ASSIGNED``/``IN_USE`` for a DIFFERENT ``task_id`` (or any
           other state with no legal edge to ``ASSIGNED``): never steals,
           never mutates — raises ``IllegalLaneTransition`` (propagated to the
@@ -575,11 +591,7 @@ class LaneLifecycle:
         rec = self.read(lane)
         state = rec.state if rec is not None else None
 
-        if (
-            rec is not None
-            and state in (LaneState.ASSIGNED, LaneState.IN_USE)
-            and rec.task_id == task_id
-        ):
+        if _held_by(rec, task_id):
             return rec  # idempotent no-op; no I/O
         self._refuse_in_use_steal(lane, rec, task_id)
 
@@ -706,6 +718,27 @@ class LaneLifecycle:
             )
             return False
         return True
+
+    def refresh_assigned(self, lane: Path | str, *, task_id: str) -> LaneRecord:
+        """Restamp ``updated_at`` on a record *task_id* already holds.
+
+        ``updated_at`` is the activity clock warm-lane-gc.sh's record gate
+        reads (``--max-record-age-days``). This is the REUSE-dispatch stamp,
+        called only via ``WarmLanePool.refresh_assignment``. It is not a
+        transition: every other field is carried unchanged. A record that is
+        absent, unreadable, held by another task or in any other state raises
+        ``IllegalLaneTransition`` and is left untouched.
+        """
+        task_id = str(task_id)
+        rec = self.read(lane)
+        if not _held_by(rec, task_id):
+            raise IllegalLaneTransition(
+                f'refusing updated_at refresh for lane {Path(lane).name!r}: '
+                f'task_id={task_id!r} does not hold it (record={rec!r})'
+            )
+        refreshed = replace(rec, updated_at=_now_stamp())
+        self._write(lane, refreshed)
+        return refreshed
 
     def pool_storage_present(self) -> bool:
         """True iff worktree_base is backed by live pool storage (task 2099).

@@ -19,7 +19,9 @@ const { pinningBadgeState } = window.DF_PINS_RECOVERY;
 const { plainDatum } = window.DF_DATUM;
 // The corpus' class split and views — read only through their one client
 // reader, escalation_views.js.
-const { resolutionSegments, corpusAgeCaption, openInHistoryOver } = window.DF_ESCALATION_VIEWS;
+const {
+  resolutionSegments, corpusAgeCaption, openInHistoryOver, windowedEscPerDone,
+} = window.DF_ESCALATION_VIEWS;
 // The persisted UI-preference hooks — persisted_state.js.
 const { createPersistedHooks } = window.DF_PERSISTED_STATE;
 const { usePersistedState, useOpenSet } = createPersistedHooks(React);
@@ -221,7 +223,7 @@ function OriginPanel({ origin, win, generatedAt, regimeMarkers }) {
       </div>
       {stacks.length > 0 && (
         <TimeChart labels={dates} markers={regimeMarkers}>
-          <C.StackedAreaChart stacks={stacks} labels={dates} snapMax={C.niceCountMax} formatX={fmtDateTime} />
+          <C.StackedAreaChart stacks={stacks} labels={dates} countAxis formatX={fmtDateTime} />
         </TimeChart>
       )}
       <table className="tbl" style={{ marginTop: 10 }}>
@@ -435,7 +437,7 @@ function LifespanPanel({ lifespan, win, generatedAt }) {
 // an action-mix donut, churn/throughput time charts, and a reserved mount
 // seam for ζ's lifecycle-flow diagram (depends on δ).
 
-function WorkflowPanel({ workflow, terminal, win, generatedAt, regimeMarkers }) {
+function WorkflowPanel({ project, workflow, terminal, win, generatedAt, regimeMarkers }) {
   const tierWeekly = sliceWeeklyByWindow(workflow.tier_weekly, generatedAt, win);
   const weeks = Object.keys(tierWeekly).sort();
   const weekTotals = weeks.map(w => Object.values(tierWeekly[w] || {}).reduce((s, n) => s + n, 0));
@@ -476,13 +478,18 @@ function WorkflowPanel({ workflow, terminal, win, generatedAt, regimeMarkers }) 
   const churnDates = Object.keys(churnDaily).sort();
 
   const escPerDoneDaily = sliceRowsByWindow(workflow.esc_per_done_daily || [], generatedAt, win, row => row.date);
-  // A null ratio means done == 0 that day: no task completed, so escalations
-  // per done is undefined rather than zero. It is passed straight through as a
-  // hole, and LineChart breaks the line across it (task 3489). These rows used
+  // A null ratio means done == 0 that day (no task completed), or that the
+  // project's runs.db could not be read (workflow.done_counts_read false), so
+  // escalations per done is undefined rather than zero. It is passed straight
+  // through as a hole, and LineChart breaks the line across it (task 3489). These rows used
   // to be FILTERED OUT, which dropped the day from this label row too — that
   // compacted the x-axis and silently redated every surviving sample, the exact
   // hazard spark_path.js's header calls out.
   const epdDates = escPerDoneDaily.map(row => row.date);
+  // A window with no ratio draws no line, so the chart's caption says why.
+  const escPerDone = windowedEscPerDone([
+    { project, doneCountsRead: workflow.done_counts_read, rows: escPerDoneDaily },
+  ]);
 
   const flowDaily = sliceRowsByWindow(workflow.flow_daily || [], generatedAt, win, row => row.date);
 
@@ -512,8 +519,7 @@ function WorkflowPanel({ workflow, terminal, win, generatedAt, regimeMarkers }) 
             <C.LineChart
               series={[{ key: 'churn', color: C.PALETTE.bad, values: churnDates.map(d => churnDaily[d] || 0) }]}
               labels={churnDates}
-              formatY={C.formatCountTick}
-              snapMax={C.niceCountMax}
+              countAxis
               formatX={fmtDateTime}
             />
           </TimeChart>
@@ -521,7 +527,9 @@ function WorkflowPanel({ workflow, terminal, win, generatedAt, regimeMarkers }) 
       )}
       {epdDates.length > 0 && (
         <>
-          <div style={{ fontSize: 10, color: 'var(--fg-3)', margin: '10px 0 4px' }}>Escalations filed per task done</div>
+          <div style={{ fontSize: 10, color: 'var(--fg-3)', margin: '10px 0 4px' }}>
+            Escalations filed per task done{escPerDone.ratio === null && ` — ${escPerDone.absentReason}`}
+          </div>
           <TimeChart labels={epdDates} markers={regimeMarkers}>
             <C.LineChart
               series={[{ key: 'ratio', color: C.PALETTE.accent, values: escPerDoneDaily.map(row => row.ratio) }]}
@@ -596,6 +604,7 @@ function EscalationAnalyticsTab({ projectFilter }) {
               generatedAt={analytics.generated_at}
             />
             <WorkflowPanel
+              project={p.project}
               workflow={p.workflow}
               terminal={p.terminal}
               win={win}

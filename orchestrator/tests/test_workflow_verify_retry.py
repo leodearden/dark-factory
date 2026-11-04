@@ -1,4 +1,6 @@
-"""Tests for the opaque-infra-timeout fast-fail path in ``_verify_debugfix_loop``.
+"""Tests for the retry behaviour of ``_verify_debugfix_loop``: the
+opaque-infra-timeout fast-fail, plus what each debugger dispatch is told about
+its attempt.
 
 When the verifier's own injected ``Command timed out after Ns: …`` wrapper
 string is the only cause hint, retrying gives the debugger nothing to act
@@ -20,6 +22,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from orchestrator.agents.briefing import PriorAttemptCause, VerifyAttemptContext
+from orchestrator.agents.invoke import AgentResult
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
@@ -116,6 +120,11 @@ def _make_workflow(
     return workflow, artifacts
 
 
+async def _run_verify_loop(workflow: TaskWorkflow) -> WorkflowOutcome:
+    """The single call site through which these tests drive the verify/debug loop."""
+    return await workflow._verify_debugfix_loop()
+
+
 def _opaque_timeout_result() -> VerifyResult:
     return VerifyResult(
         passed=False,
@@ -167,7 +176,7 @@ class TestOpaqueTimeoutFastFail:
             'orchestrator.workflow.run_scoped_verification', verify_mock,
         )
 
-        outcome = await workflow._verify_debugfix_loop()
+        outcome = await _run_verify_loop(workflow)
         assert outcome == WorkflowOutcome.BLOCKED
         # Verify was called exactly max_opaque_timeout_attempts (2) times;
         # third call MUST NOT happen.
@@ -196,7 +205,7 @@ class TestOpaqueTimeoutFastFail:
             'orchestrator.workflow.run_scoped_verification', verify_mock,
         )
 
-        outcome = await workflow._verify_debugfix_loop()
+        outcome = await _run_verify_loop(workflow)
         assert outcome == WorkflowOutcome.BLOCKED
         # Real test failures retry up to max_verify_attempts.
         assert verify_mock.await_count == config.max_verify_attempts, (
@@ -234,7 +243,7 @@ class TestOpaqueTimeoutFastFail:
             'orchestrator.workflow.run_scoped_verification', verify_mock,
         )
 
-        outcome = await workflow._verify_debugfix_loop()
+        outcome = await _run_verify_loop(workflow)
         # We expect a full max_verify_attempts (5) loop because the
         # plan's simple guard checks attempt-count + opaque category +
         # opaque regex.  After the first opaque attempt verify_attempt=1
@@ -281,7 +290,7 @@ class TestPerTaskVerifyRole:
             'orchestrator.workflow.run_scoped_verification', verify_mock,
         )
 
-        outcome = await workflow._verify_debugfix_loop()
+        outcome = await _run_verify_loop(workflow)
 
         assert outcome == WorkflowOutcome.DONE, f'expected DONE, got {outcome}'
         assert verify_mock.await_count == 1, (
@@ -289,4 +298,91 @@ class TestPerTaskVerifyRole:
         )
         assert verify_mock.call_args.kwargs.get('role') == 'task', (
             f"expected role='task' kwarg; got call_args={verify_mock.call_args}"
+        )
+
+
+def _test_failure_a() -> VerifyResult:
+    return VerifyResult(
+        passed=False,
+        test_output='FAILED tests/test_x.py::test_a\n',
+        lint_output='',
+        type_output='',
+        summary='Failures: tests failed',
+        cause_hint='FAILED tests/test_x.py::test_a',
+        category='test_failure',
+    )
+
+
+def _lint_failure_without_cause_hint() -> VerifyResult:
+    return VerifyResult(
+        passed=False,
+        test_output='',
+        lint_output='x.py:1:1: F401',
+        type_output='',
+        summary='Failures: lint issues',
+        cause_hint='',
+        category='lint_failure',
+    )
+
+
+@pytest.mark.asyncio
+class TestDebuggerReceivesAttemptContext:
+    async def _drive(self, config, git_ops, task_assignment, monkeypatch, results):
+        wt = (await git_ops.create_worktree(task_assignment.task_id)).path
+        workflow, _artifacts = _make_workflow(config, git_ops, task_assignment, wt)
+        debugger_prompt = AsyncMock(return_value='debug')
+        monkeypatch.setattr(workflow.briefing, 'build_debugger_prompt', debugger_prompt)
+        monkeypatch.setattr(workflow, '_inter_iteration_rebase', AsyncMock(return_value=None))
+        prompt_builders: list = []
+
+        async def record_dispatch(role, build_prompt, cwd, output_schema=None):
+            prompt_builders.append(build_prompt)
+            return AgentResult(success=True, output='')
+
+        monkeypatch.setattr(workflow, '_invoke', record_dispatch)
+        monkeypatch.setattr(workflow.config, 'escalate_preexisting_main_break', False)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification', AsyncMock(side_effect=results),
+        )
+
+        outcome = await _run_verify_loop(workflow)
+        # Build each prompt only now, after the loop has moved past every attempt:
+        # a builder that read the loop's live attempt state would see the last one.
+        for build_prompt in prompt_builders:
+            await build_prompt()
+        contexts = [call.kwargs['attempt_context'] for call in debugger_prompt.await_args_list]
+        return outcome, contexts
+
+    async def test_each_dispatch_is_numbered_and_never_lists_itself_as_prior(
+        self, config, git_ops, task_assignment, monkeypatch,
+    ):
+        outcome, contexts = await self._drive(
+            config, git_ops, task_assignment, monkeypatch,
+            [_test_failure_a(), _lint_failure_without_cause_hint(), _passing_result()],
+        )
+
+        ctx1 = VerifyAttemptContext(attempt=1, max_attempts=5, prior_causes=())
+        ctx2 = VerifyAttemptContext(
+            attempt=2, max_attempts=5,
+            prior_causes=(
+                PriorAttemptCause('test_failure', 'FAILED tests/test_x.py::test_a'),
+            ),
+        )
+        assert outcome == WorkflowOutcome.DONE
+        assert contexts == [ctx1, ctx2]
+
+    async def test_prior_without_cause_hint_falls_back_to_summary(
+        self, config, git_ops, task_assignment, monkeypatch,
+    ):
+        _outcome, contexts = await self._drive(
+            config, git_ops, task_assignment, monkeypatch,
+            [
+                _test_failure_a(), _lint_failure_without_cause_hint(),
+                _test_failure_a(), _passing_result(),
+            ],
+        )
+
+        third_dispatch = contexts[2]
+        assert third_dispatch.prior_causes[1] == PriorAttemptCause(
+            'lint_failure', 'Failures: lint issues',
         )

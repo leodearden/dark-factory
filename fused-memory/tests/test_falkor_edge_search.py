@@ -90,9 +90,6 @@ FALLBACK_LEGS: dict[str, SearchLeg] = {
     'community_similarity_search': lambda driver: search_utils.community_similarity_search(
         driver, [0.1, 0.2, 0.3], ['g']
     ),
-    'edge_bfs_search': lambda driver: search_utils.edge_bfs_search(
-        driver, ['origin'], 2, SearchFilters(), ['g']
-    ),
     'episode_mentions_reranker': lambda driver: search_utils.episode_mentions_reranker(
         driver, [['a', 'b']]
     ),
@@ -271,6 +268,75 @@ class TestEdgeSimilaritySearch:
     @pytest.mark.asyncio
     async def test_parses_records_into_entity_edges(self) -> None:
         edges, _ = await self._search(['g'])
+
+        (edge,) = edges
+        assert (edge.uuid, edge.source_node_uuid, edge.target_node_uuid) == (
+            'edge-uuid',
+            'source-uuid',
+            'target-uuid',
+        )
+
+
+class TestEdgeBfsSearch:
+    @staticmethod
+    async def _search(
+        origins: Sequence[str] | None = ('origin-entity', 'origin-episode'),
+        depth: int = 3,
+        search_filter: SearchFilters | None = None,
+        group_ids: Sequence[str] | None = ('g',),
+    ) -> tuple[list[Any], list[IssuedQuery]]:
+        driver, issued = hardened_driver([CANNED_EDGE_RECORD])
+        edges = await search_utils.edge_bfs_search(
+            driver,
+            None if origins is None else list(origins),
+            depth,
+            search_filter or SearchFilters(),
+            None if group_ids is None else list(group_ids),
+            20,
+        )
+        return edges, issued
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('origins', 'depth'),
+        [(None, 3), ([], 3), (['origin-entity'], 0)],
+        ids=['no-origins', 'empty-origins', 'zero-depth'],
+    )
+    async def test_no_reachable_edges_issues_nothing(
+        self, origins: list[str] | None, depth: int
+    ) -> None:
+        """graphiti's contract: node_bfs_search treats depth < 1 as no results, and a path of 1..0 edges holds none."""
+        edges, issued = await self._search(origins, depth)
+
+        assert edges == []
+        assert issued == []
+
+    @pytest.mark.asyncio
+    async def test_forwards_graphiti_params(self) -> None:
+        _, issued = await self._search()
+
+        (query,) = issued
+        assert query.params['bfs_origin_node_uuids'] == ['origin-entity', 'origin-episode']
+        assert query.params['limit'] == 20
+        assert query.params['group_ids'] == ['g']
+        assert '*1..3' in query.cypher
+
+    @pytest.mark.asyncio
+    async def test_group_filter_is_omitted_without_group_ids(self) -> None:
+        _, issued = await self._search(group_ids=None)
+
+        assert 'group_ids' not in issued[0].params
+
+    @pytest.mark.asyncio
+    async def test_applies_graphiti_search_filter_predicates(self) -> None:
+        _, issued = await self._search(search_filter=SearchFilters(edge_uuids=['x']))
+
+        assert issued[0].params['edge_uuids'] == ['x']
+        assert '$edge_uuids' in issued[0].cypher
+
+    @pytest.mark.asyncio
+    async def test_parses_records_into_entity_edges(self) -> None:
+        edges, _ = await self._search()
 
         (edge,) = edges
         assert (edge.uuid, edge.source_node_uuid, edge.target_node_uuid) == (

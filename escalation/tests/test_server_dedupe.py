@@ -1,8 +1,7 @@
 """Tests for escalation deduplication via the MCP server tools.
 
-Uses the FastMCP async unit-test pattern from test_release_workflow.py:
-    tool = await server.get_tool('escalate_blocker')
-    result = await tool.fn(...)
+Escalations are filed through the shared ``_filing_tools.py::call_blocker`` /
+``call_info`` helpers.
 
 All tests use tmp_path-backed EscalationQueue so they are fully isolated.
 """
@@ -10,9 +9,9 @@ All tests use tmp_path-backed EscalationQueue so they are fully isolated.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
 import pytest
+from _filing_tools import call_blocker, call_info
 
 from escalation.dedupe import DedupeConfig
 from escalation.queue import EscalationQueue
@@ -25,16 +24,6 @@ from escalation.server import create_server
 
 def _make_server(queue: EscalationQueue, dedupe_config: DedupeConfig | None = None):
     return create_server(queue, dedupe_config=dedupe_config)
-
-
-async def _blocker(server, **kwargs: Any) -> dict[str, Any]:
-    tool = await server.get_tool('escalate_blocker')
-    return await tool.fn(**kwargs)
-
-
-async def _info(server, **kwargs: Any) -> dict[str, Any]:
-    tool = await server.get_tool('escalate_info')
-    return await tool.fn(**kwargs)
 
 
 def _queue_root_files(queue: EscalationQueue) -> list[Path]:
@@ -56,7 +45,7 @@ class TestEscalateBlockerDedupe:
         queue = EscalationQueue(tmp_path / 'esc')
         server = _make_server(queue)
 
-        result = await _blocker(
+        result = await call_blocker(
             server,
             task_id='42',
             agent_role='implementer',
@@ -77,7 +66,7 @@ class TestEscalateBlockerDedupe:
         queue = EscalationQueue(tmp_path / 'esc')
         server = _make_server(queue)
 
-        first = await _blocker(
+        first = await call_blocker(
             server,
             task_id='42',
             agent_role='implementer',
@@ -87,7 +76,7 @@ class TestEscalateBlockerDedupe:
         parent_id = first['id']
 
         # Different tail / casing — same first 3 tokens after normalisation
-        second = await _blocker(
+        second = await call_blocker(
             server,
             task_id='42',
             agent_role='implementer',
@@ -121,7 +110,7 @@ class TestEscalateBlockerDedupe:
         fired_ids: list[str] = []
         queue.set_notify_callback(lambda esc: fired_ids.append(esc.id))
 
-        first = await _blocker(
+        first = await call_blocker(
             server,
             task_id='42',
             agent_role='implementer',
@@ -130,7 +119,7 @@ class TestEscalateBlockerDedupe:
         )
         parent_id = first['id']
 
-        await _blocker(
+        await call_blocker(
             server,
             task_id='42',
             agent_role='implementer',
@@ -163,7 +152,7 @@ class TestEscalateInfoDedupe:
         queue = EscalationQueue(tmp_path / 'esc')
         server = _make_server(queue)
 
-        first = await _info(
+        first = await call_info(
             server,
             task_id='42',
             agent_role='implementer',
@@ -174,7 +163,7 @@ class TestEscalateInfoDedupe:
         assert first['status'] == 'queued'
         assert 'action' not in first, 'escalate_info must NOT return action key'
 
-        second = await _info(
+        second = await call_info(
             server,
             task_id='42',
             agent_role='implementer',
@@ -207,7 +196,7 @@ class TestEscalateInfoDedupe:
         queue = EscalationQueue(tmp_path / 'esc')
         server = _make_server(queue)
 
-        first = await _info(
+        first = await call_info(
             server,
             task_id='42',
             agent_role='implementer',
@@ -217,7 +206,7 @@ class TestEscalateInfoDedupe:
         parent_id = first['id']
         assert first['status'] == 'queued'
 
-        second = await _blocker(
+        second = await call_blocker(
             server,
             task_id='42',
             agent_role='implementer',
@@ -250,7 +239,7 @@ class TestEscalateInfoDedupe:
         queue = EscalationQueue(tmp_path / 'esc')
         server = _make_server(queue)
 
-        first = await _blocker(
+        first = await call_blocker(
             server,
             task_id='42',
             agent_role='implementer',
@@ -259,7 +248,7 @@ class TestEscalateInfoDedupe:
         )
         parent_id = first['id']
 
-        second = await _info(
+        second = await call_info(
             server,
             task_id='42',
             agent_role='implementer',
@@ -295,7 +284,7 @@ class TestCrossTaskDedupe:
         queue = EscalationQueue(tmp_path / 'esc')
         server = _make_server(queue)
 
-        first = await _blocker(
+        first = await call_blocker(
             server,
             task_id='42',
             agent_role='implementer',
@@ -304,7 +293,7 @@ class TestCrossTaskDedupe:
         )
         parent_id = first['id']
 
-        second = await _blocker(
+        second = await call_blocker(
             server,
             task_id='99',
             agent_role='implementer',
@@ -340,14 +329,14 @@ class TestDedupeGates:
         queue = EscalationQueue(tmp_path / 'esc')
         server = _make_server(queue, dedupe_config=DedupeConfig(infra_dedupe_enabled=False))
 
-        first = await _blocker(
+        first = await call_blocker(
             server,
             task_id='42',
             agent_role='implementer',
             category='infra_issue',
             summary='fused-memory connection timeout on port 8002',
         )
-        second = await _blocker(
+        second = await call_blocker(
             server,
             task_id='42',
             agent_role='implementer',
@@ -372,14 +361,14 @@ class TestDedupeGates:
         queue = EscalationQueue(tmp_path / 'esc')
         server = _make_server(queue)  # default config: only infra_issue is in scope
 
-        first = await _blocker(
+        first = await call_blocker(
             server,
             task_id='42',
             agent_role='implementer',
             category='risk_identified',
             summary='fused-memory connection timeout on port 8002',
         )
-        second = await _blocker(
+        second = await call_blocker(
             server,
             task_id='42',
             agent_role='implementer',
@@ -442,7 +431,7 @@ class TestDedupeTOCTOURace:
         server = _make_server(queue)
 
         # (1) Submit first infra_issue blocker — establishes the parent.
-        first = await _blocker(
+        first = await call_blocker(
             server,
             task_id='42',
             agent_role='implementer',
@@ -468,7 +457,7 @@ class TestDedupeTOCTOURace:
         monkeypatch.setattr(dedupe_module, 'find_dedupe_parent', _racing_find)
 
         # (3) Second blocker with a similar summary — hits the race window.
-        second = await _blocker(
+        second = await call_blocker(
             server,
             task_id='42',
             agent_role='implementer',
@@ -510,7 +499,7 @@ class TestDedupeChildIdContract:
         queue = EscalationQueue(tmp_path / 'esc')
         server = _make_server(queue)
 
-        first = await _blocker(
+        first = await call_blocker(
             server,
             task_id='42',
             agent_role='implementer',
@@ -519,7 +508,7 @@ class TestDedupeChildIdContract:
         )
         parent_id = first['id']
 
-        second = await _blocker(
+        second = await call_blocker(
             server,
             task_id='42',
             agent_role='implementer',
@@ -546,7 +535,7 @@ class TestDedupeChildIdContract:
         queue = EscalationQueue(tmp_path / 'esc')
         server = _make_server(queue)
 
-        await _blocker(
+        await call_blocker(
             server,
             task_id='42',
             agent_role='implementer',
@@ -554,14 +543,14 @@ class TestDedupeChildIdContract:
             summary='fused-memory connection timeout on port 8002',
         )
 
-        second = await _blocker(
+        second = await call_blocker(
             server,
             task_id='42',
             agent_role='implementer',
             category='infra_issue',
             summary='Fused-memory  CONNECTION timeout!',
         )
-        third = await _blocker(
+        third = await call_blocker(
             server,
             task_id='42',
             agent_role='implementer',
@@ -621,7 +610,7 @@ class TestCrossTaskChildResumeContract:
         server = _make_server(queue)
 
         # (1) Submit parent blocker from task 42.
-        first = await _blocker(
+        first = await call_blocker(
             server,
             task_id='42',
             agent_role='implementer',
@@ -632,7 +621,7 @@ class TestCrossTaskChildResumeContract:
         parent_id = first['id']
 
         # (2) Submit cross-task blocker from task 99 — dedupes into parent under task 42.
-        second = await _blocker(
+        second = await call_blocker(
             server,
             task_id='99',
             agent_role='implementer',
@@ -686,7 +675,7 @@ class TestCrossTaskChildResumeContract:
         #      defense-in-depth: even if the similarity heuristic is later tuned, two
         #      clearly disjoint keys will never fold.  status='queued' proves there is no
         #      lingering block from the archived parent (no-ghost contract).
-        fresh_infra = await _blocker(
+        fresh_infra = await call_blocker(
             server,
             task_id='99',
             agent_role='implementer',
@@ -706,7 +695,7 @@ class TestCrossTaskChildResumeContract:
         #      of any archived parents — the two status='queued' outcomes (gate-2
         #      short-circuit vs. dedupe-path-with-no-match) have meaningfully different
         #      causes and are asserted separately to document both contracts.
-        fresh_sv = await _blocker(
+        fresh_sv = await call_blocker(
             server,
             task_id='99',
             agent_role='implementer',

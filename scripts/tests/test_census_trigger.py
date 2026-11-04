@@ -13,15 +13,21 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import UTC, datetime, timedelta
+import re
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pytest
 import yaml
 from legibility import census_trigger as ct
 from legibility.config import Census as LegibilityCensus
+from shared.testing_mcp_stub import StubAnswer, StubMcpServer
 
 NOW = datetime(2026, 7, 14, 12, 0, 0, tzinfo=UTC)
+
+
+def _anchor(kind, days_ago):
+    return ct.FloorAnchor(kind=kind, at=NOW - timedelta(days=days_ago))
 
 
 # ---------------------------------------------------------------------------
@@ -35,15 +41,19 @@ def test_census_config_defaults_match_prd_section_7_4():
     assert config.tasks_landed_min_days == 7
     assert config.novelty_spike_count == 4
     assert config.novelty_spike_window_hours == 72
+    assert config.novelty_spike_multiple == 2
+    assert config.novelty_spike_baseline_days == 30
     assert config.floor_days == 5
 
 
 def test_census_config_from_mapping_merges_partial_overrides_over_defaults():
     config = ct.CensusConfig.from_mapping(
-        {"max_interval_days": 3, "novelty_spike": {"count": 9}}
+        {"max_interval_days": 3, "novelty_spike": {"count": 9, "baseline_days": 14}}
     )
     assert config.max_interval_days == 3
     assert config.novelty_spike_count == 9
+    assert config.novelty_spike_baseline_days == 14
+    assert config.novelty_spike_multiple == 2
     # untouched fields keep their §7.4 defaults
     assert config.tasks_landed_threshold == 120
     assert config.tasks_landed_min_days == 7
@@ -83,6 +93,8 @@ def test_census_config_from_mapping_empty_dict_returns_defaults():
         ("floor_days", "floor_days", None),
         ("novelty_spike_count", "count", "novelty_spike"),
         ("novelty_spike_window_hours", "window_hours", "novelty_spike"),
+        ("novelty_spike_multiple", "multiple", "novelty_spike"),
+        ("novelty_spike_baseline_days", "baseline_days", "novelty_spike"),
     ],
 )
 @pytest.mark.parametrize("bad", ["10", "", 10.0, 1.5, True, False, -1, None, [10], {"n": 10}])
@@ -137,7 +149,7 @@ def test_census_config_from_mapping_reports_every_bad_value_in_one_warning(caplo
                 "max_interval_days": "10",
                 "floor_days": -1,
                 "tasks_landed_threshold": 200,  # the one good override
-                "novelty_spike": {"window_hours": None},
+                "novelty_spike": {"window_hours": None, "multiple": "2"},
             }
         )
 
@@ -145,11 +157,12 @@ def test_census_config_from_mapping_reports_every_bad_value_in_one_warning(caplo
     assert config.max_interval_days == ct.CensusConfig().max_interval_days
     assert config.floor_days == ct.CensusConfig().floor_days
     assert config.novelty_spike_window_hours == ct.CensusConfig().novelty_spike_window_hours
+    assert config.novelty_spike_multiple == ct.CensusConfig().novelty_spike_multiple
 
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warnings) == 1
     message = warnings[0].getMessage()
-    for named in ("max_interval_days", "floor_days", "window_hours"):
+    for named in ("max_interval_days", "floor_days", "window_hours", "multiple"):
         assert named in message
     assert "tasks_landed_threshold" not in message
 
@@ -163,7 +176,9 @@ def test_census_config_from_mapping_accepts_every_valid_int_silently(caplog):
                 "max_interval_days": 0,
                 "floor_days": 0,
                 "tasks_landed_threshold": 10_000,
-                "novelty_spike": {"count": 0, "window_hours": 1},
+                "novelty_spike": {
+                    "count": 0, "window_hours": 1, "multiple": 0, "baseline_days": 0,
+                },
             }
         )
 
@@ -174,6 +189,8 @@ def test_census_config_from_mapping_accepts_every_valid_int_silently(caplog):
     assert config.tasks_landed_threshold == 10_000
     assert config.novelty_spike_count == 0
     assert config.novelty_spike_window_hours == 1
+    assert config.novelty_spike_multiple == 0
+    assert config.novelty_spike_baseline_days == 0
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +210,8 @@ def test_census_config_defaults_match_legibility_config_census_model():
     assert config.tasks_landed_min_days == beta_defaults.tasks_landed_min_days
     assert config.novelty_spike_count == beta_defaults.novelty_spike.count
     assert config.novelty_spike_window_hours == beta_defaults.novelty_spike.window_hours
+    assert config.novelty_spike_multiple == beta_defaults.novelty_spike.multiple
+    assert config.novelty_spike_baseline_days == beta_defaults.novelty_spike.baseline_days
     assert config.floor_days == beta_defaults.floor_days
 
 
@@ -206,7 +225,7 @@ def _evaluate_a(*, last_census_at, tasks_landed=None, candidate_first_seens=None
     return ct.evaluate(
         now=NOW,
         last_census_at=last_census_at,
-        never_censused=False,
+        floor_anchor=ct.FloorAnchor(ct.FloorAnchorKind.SESSION_WATERMARK, last_census_at),
         tasks_landed=tasks_landed,
         candidate_first_seens=candidate_first_seens or [],
         config=config or ct.CensusConfig(),
@@ -256,91 +275,255 @@ def test_evaluate_condition_b_delta_unavailable_no_fire():
 
 
 # ---------------------------------------------------------------------------
-# step-7: RED — evaluate() condition (c): novelty spike
+# relative novelty spike against a trailing baseline
+# (plans/census-incremental-prd.md §4.7 (b), §4.8 row 13)
 # ---------------------------------------------------------------------------
 
-def _evaluate_c(*, candidate_first_seens):
-    """last_census_at=now-6d: > floor(5), < max_interval(10), < min_days(7)
-    -- so only condition (c) can possibly fire. first_seen values are
-    passed as YYYY-MM-DD date strings, exactly as the codebook writes them
-    (§7.1 candidates[].first_seen), parsed to datetimes here (evaluate()
-    itself takes already-parsed datetimes)."""
+_TODAY = datetime.combine(NOW.date(), datetime.min.time(), tzinfo=UTC)
+
+
+def _first_seens_over_a_baseline_of_40(current_72h):
+    """35 days of history whose every 72h window holds exactly 40 candidates
+    (period-3 daily counts 13, 13, 14), then today topped up so the window
+    ending at NOW holds `current_72h`."""
+    daily = {days_ago: (13, 13, 14)[days_ago % 3] for days_ago in range(1, 36)}
+    daily[0] = daily[3] + (current_72h - 40)
+    return [_TODAY - timedelta(days=days_ago) for days_ago, n in daily.items() for _ in range(n)]
+
+
+def _quiet_history():
+    return [NOW - timedelta(days=40)]
+
+
+def _evaluate_novelty(first_seens, config=None, now=NOW):
+    return ct.evaluate(
+        now=now,
+        last_census_at=now - timedelta(days=6),
+        floor_anchor=ct.FloorAnchor(ct.FloorAnchorKind.SESSION_WATERMARK, now - timedelta(days=6)),
+        tasks_landed=None,
+        candidate_first_seens=first_seens,
+        config=config or ct.CensusConfig(),
+    )
+
+
+def _novelty_line(decision):
+    (line,) = [r for r in decision.reasons if r.startswith("novelty-spike:")]
+    return line
+
+
+def test_novelty_spike_43_against_baseline_median_40_does_not_fire():
+    decision = _evaluate_novelty(_first_seens_over_a_baseline_of_40(43))
+    assert decision.fire is False
+    assert _novelty_line(decision) == "novelty-spike: 43 within 72h (baseline median 40, x2)"
+
+
+def test_novelty_spike_90_against_baseline_median_40_fires():
+    decision = _evaluate_novelty(_first_seens_over_a_baseline_of_40(90))
+    assert decision.fire is True
+    assert (
+        _novelty_line(decision) == "novelty-spike: 90 within 72h (baseline median 40, x2) -> FIRE"
+    )
+
+
+def test_novelty_spike_needs_the_absolute_minimum_too():
+    three = _evaluate_novelty(_quiet_history() + [_TODAY] * 3)
+    assert three.fire is False
+    assert _novelty_line(three) == "novelty-spike: 3 within 72h (baseline median 0, x2)"
+
+    four = _evaluate_novelty(_quiet_history() + [_TODAY] * 4)
+    assert four.fire is True
+    assert _novelty_line(four).endswith("-> FIRE")
+
+
+def test_novelty_spike_is_na_with_less_than_baseline_days_of_history():
+    ten_days = [_TODAY - timedelta(days=i % 11) for i in range(90)]
+    decision = _evaluate_novelty(ten_days)
+    assert decision.fire is False
+    line = _novelty_line(decision)
+    assert "N/A" in line
+    assert "30d" in line
+    assert "10.5d" in line
+
+
+def test_novelty_spike_window_counts_72h_inclusive():
+    # 2026-07-11 is 84h before NOW (excluded); NOW - 72h exactly is included.
+    dated = [
+        datetime.fromisoformat(d) for d in ("2026-07-14", "2026-07-13", "2026-07-12", "2026-07-11")
+    ]
+    decision = _evaluate_novelty(_quiet_history() + dated + [NOW - timedelta(hours=72)])
+    assert _novelty_line(decision).startswith("novelty-spike: 4 within 72h")
+
+
+def test_novelty_spike_baseline_days_zero_degenerates_to_the_absolute_rule():
+    decision = _evaluate_novelty(
+        [_TODAY] * 4, config=ct.CensusConfig(novelty_spike_baseline_days=0)
+    )
+    assert decision.fire is True
+    assert "baseline median 0" in _novelty_line(decision)
+
+
+def test_novelty_spike_multiple_is_honoured():
+    decision = _evaluate_novelty(
+        _first_seens_over_a_baseline_of_40(90), config=ct.CensusConfig(novelty_spike_multiple=3)
+    )
+    assert decision.fire is False
+    assert _novelty_line(decision).endswith("(baseline median 40, x3)")
+
+
+# Histogram of candidates[].first_seen in docs/legibility/confusion-codebook.yaml
+# at 92af0716e8 (1,132 candidates).
+_RECORDED_DAILY_NEW_CANDIDATES = {
+    "2026-07-13": 4, "2026-07-14": 4, "2026-07-15": 5, "2026-07-16": 2, "2026-07-17": 2,
+    "2026-07-18": 1, "2026-07-19": 6, "2026-07-20": 11, "2026-07-21": 6, "2026-07-22": 35,
+    "2026-07-23": 5, "2026-07-24": 2, "2026-07-25": 3, "2026-07-26": 1, "2026-07-28": 3,
+    "2026-07-29": 7, "2026-07-30": 32, "2026-07-31": 24, "2026-08-01": 8, "2026-08-02": 23,
+    "2026-08-03": 20, "2026-08-04": 9, "2026-08-05": 17, "2026-08-06": 15, "2026-08-07": 16,
+    "2026-08-08": 15, "2026-08-09": 16, "2026-08-10": 17, "2026-08-11": 7, "2026-08-12": 20,
+    "2026-08-13": 2, "2026-08-15": 18, "2026-08-16": 18, "2026-08-17": 1, "2026-08-18": 24,
+    "2026-08-19": 22, "2026-08-21": 11, "2026-08-22": 23, "2026-08-23": 20, "2026-08-24": 28,
+    "2026-08-25": 28, "2026-08-26": 14, "2026-08-27": 23, "2026-08-28": 24, "2026-08-29": 16,
+    "2026-08-31": 16, "2026-09-01": 8, "2026-09-02": 7, "2026-09-03": 20, "2026-09-04": 15,
+    "2026-09-05": 12, "2026-09-06": 13, "2026-09-07": 21, "2026-09-08": 31, "2026-09-09": 21,
+    "2026-09-10": 20, "2026-09-11": 63, "2026-09-12": 25, "2026-09-13": 18, "2026-09-14": 1,
+    "2026-09-15": 21, "2026-09-16": 18, "2026-09-17": 22, "2026-09-18": 20, "2026-09-19": 3,
+    "2026-09-20": 16, "2026-09-21": 25, "2026-09-22": 12, "2026-09-23": 15, "2026-09-24": 6,
+    "2026-09-25": 21, "2026-09-26": 11, "2026-09-27": 18, "2026-09-28": 1, "2026-10-02": 15,
+    "2026-10-03": 9,
+}
+
+
+def _recorded_72h_count(day):
+    return sum(
+        _RECORDED_DAILY_NEW_CANDIDATES.get((day - timedelta(days=back)).isoformat(), 0)
+        for back in range(3)
+    )
+
+
+def test_novelty_spike_replay_fires_on_the_relative_rule_not_the_absolute_one():
+    recorded = {
+        "version": 2,
+        "entries": [],
+        "candidates": _candidates_from_dates(
+            [day for day, n in _RECORDED_DAILY_NEW_CANDIDATES.items() for _ in range(n)]
+        ),
+    }
+    _, first_seens = ct.codebook_signal(recorded)
+
+    lines, fired, absolute_days = {}, {}, set()
+    day = date(2026, 8, 15)
+    while day <= date(2026, 10, 3):
+        now = datetime.combine(day, datetime.min.time(), tzinfo=UTC) + timedelta(hours=12)
+        decision = _evaluate_novelty(first_seens, now=now)
+        lines[day] = _novelty_line(decision)
+        if decision.fire:
+            fired[day] = lines[day]
+        if _recorded_72h_count(day) >= 4:
+            absolute_days.add(day)
+        day += timedelta(days=1)
+
+    assert fired == {
+        date(2026, 9, 11): "novelty-spike: 104 within 72h (baseline median 43.5, x2) -> FIRE",
+        date(2026, 9, 12): "novelty-spike: 108 within 72h (baseline median 44.5, x2) -> FIRE",
+        date(2026, 9, 13): "novelty-spike: 106 within 72h (baseline median 46, x2) -> FIRE",
+    }
+    assert lines[date(2026, 8, 25)] == "novelty-spike: 76 within 72h (baseline median 43.5, x2)"
+    assert len(absolute_days) == 48
+    assert set(fired) < absolute_days
+
+
+# ---------------------------------------------------------------------------
+# hard floor: measured from its anchor, blocks a/b/c, always reported
+# (plans/census-incremental-prd.md §4.7 Floor)
+# ---------------------------------------------------------------------------
+
+def _evaluate_floor(*, last_census_days_ago, floor_anchor, tasks_landed=None, config=None):
     return ct.evaluate(
         now=NOW,
-        last_census_at=NOW - timedelta(days=6),
-        never_censused=False,
-        tasks_landed=None,
-        candidate_first_seens=[datetime.fromisoformat(s) for s in candidate_first_seens],
-        config=ct.CensusConfig(),
+        last_census_at=NOW - timedelta(days=last_census_days_ago),
+        floor_anchor=floor_anchor,
+        tasks_landed=tasks_landed,
+        candidate_first_seens=[],
+        config=config or ct.CensusConfig(),
     )
 
 
-def test_evaluate_condition_c_four_within_72h_fires():
-    # 2026-07-14/13/12 (twice) are 0h/0h/36h/60h before NOW -- all <= 72h.
-    decision = _evaluate_c(
-        candidate_first_seens=["2026-07-14", "2026-07-14", "2026-07-13", "2026-07-12"]
-    )
-    assert decision.fire is True
-    assert any("novelty-spike" in r and "4" in r for r in decision.reasons)
+def _floor_lines(decision):
+    return [r for r in decision.reasons if r.startswith("floor:")]
 
 
-def test_evaluate_condition_c_only_three_within_72h_no_fire():
-    decision = _evaluate_c(candidate_first_seens=["2026-07-14", "2026-07-13", "2026-07-12"])
-    assert decision.fire is False
-
-
-def test_evaluate_condition_c_four_but_one_outside_window_counts_as_three_no_fire():
-    # 2026-07-11 is 84h before NOW -- outside the 72h window, so only 3
-    # of these 4 candidates count.
-    decision = _evaluate_c(
-        candidate_first_seens=["2026-07-14", "2026-07-13", "2026-07-12", "2026-07-11"]
+def test_evaluate_floor_blocks_inside_floor_days_of_its_anchor():
+    decision = _evaluate_floor(
+        last_census_days_ago=12,
+        floor_anchor=_anchor(ct.FloorAnchorKind.SESSION_WATERMARK, 3),
     )
     assert decision.fire is False
+    assert _floor_lines(decision) == [
+        "floor: 3.0d since session watermark (floor 5d) -> BLOCKS all conditions"
+    ]
 
 
-# ---------------------------------------------------------------------------
-# step-9: RED — hard floor (blocks a/b/c) + never-censused exemption
-# ---------------------------------------------------------------------------
-
-_SPIKE_4_IN_72H = ["2026-07-14", "2026-07-14", "2026-07-13", "2026-07-12"]
-
-
-def test_evaluate_floor_blocks_spike_when_censused():
-    decision = ct.evaluate(
-        now=NOW,
-        last_census_at=NOW - timedelta(days=4),
-        never_censused=False,
-        tasks_landed=None,
-        candidate_first_seens=[datetime.fromisoformat(s) for s in _SPIKE_4_IN_72H],
-        config=ct.CensusConfig(),
-    )
-    assert decision.fire is False
-    assert any("floor" in r for r in decision.reasons)
-
-
-def test_evaluate_floor_blocks_tasks_landed_and_spike_when_censused():
-    decision = ct.evaluate(
-        now=NOW,
-        last_census_at=NOW - timedelta(days=4),
-        never_censused=False,
+def test_evaluate_floor_blocks_tasks_landed_too():
+    decision = _evaluate_floor(
+        last_census_days_ago=8,
+        floor_anchor=_anchor(ct.FloorAnchorKind.SESSION_WATERMARK, 4),
         tasks_landed=999,
-        candidate_first_seens=[datetime.fromisoformat(s) for s in _SPIKE_4_IN_72H],
-        config=ct.CensusConfig(),
     )
     assert decision.fire is False
-    assert any("floor" in r for r in decision.reasons)
+    assert any("BLOCKS" in line for line in _floor_lines(decision))
 
 
-def test_evaluate_floor_exempt_when_never_censused():
-    decision = ct.evaluate(
-        now=NOW,
-        last_census_at=NOW - timedelta(days=2),
-        never_censused=True,
-        tasks_landed=None,
-        candidate_first_seens=[datetime.fromisoformat(s) for s in _SPIKE_4_IN_72H],
-        config=ct.CensusConfig(),
+def test_evaluate_floor_clear_still_names_its_anchor():
+    decision = _evaluate_floor(
+        last_census_days_ago=12,
+        floor_anchor=_anchor(ct.FloorAnchorKind.SESSION_WATERMARK, 6),
     )
     assert decision.fire is True
+    assert _floor_lines(decision) == ["floor: 6.0d since session watermark (floor 5d)"]
+
+
+@pytest.mark.parametrize(
+    "kind,label",
+    [
+        (ct.FloorAnchorKind.LAST_CENSUS_AT, "since last_census_at (no watermark yet)"),
+        (ct.FloorAnchorKind.EARLIEST_CODEBOOK_DATE, "since earliest codebook date (never censused)"),
+        (ct.FloorAnchorKind.SESSION_WATERMARK, "since session watermark"),
+    ],
+)
+def test_evaluate_floor_line_names_each_anchor_kind(kind, label):
+    decision = _evaluate_floor(last_census_days_ago=12, floor_anchor=_anchor(kind, 3))
+    floor_lines = _floor_lines(decision)
+    assert len(floor_lines) == 1
+    assert label in floor_lines[0]
+    assert "BLOCKS" in floor_lines[0]
+
+
+def test_evaluate_floor_applies_to_a_never_censused_project():
+    decision = _evaluate_floor(
+        last_census_days_ago=3,
+        floor_anchor=_anchor(ct.FloorAnchorKind.EARLIEST_CODEBOOK_DATE, 3),
+        config=ct.CensusConfig(max_interval_days=1),
+    )
+    assert decision.fire is False
+    (floor_line,) = _floor_lines(decision)
+    assert "earliest codebook date (never censused)" in floor_line
+
+
+def test_evaluate_floor_without_an_anchor_blocks_and_says_so():
+    decision = _evaluate_floor(last_census_days_ago=12, floor_anchor=None)
+    assert decision.fire is False
+    (floor_line,) = _floor_lines(decision)
+    assert floor_line.startswith("floor: no anchor")
+    assert "BLOCKS" in floor_line
+
+
+def test_evaluate_floor_never_fires_by_itself():
+    decision = _evaluate_floor(
+        last_census_days_ago=9,
+        floor_anchor=_anchor(ct.FloorAnchorKind.SESSION_WATERMARK, 100),
+    )
+    assert decision.fire is False
+    (floor_line,) = _floor_lines(decision)
+    assert "BLOCKS" not in floor_line
 
 
 # ---------------------------------------------------------------------------
@@ -635,8 +818,8 @@ def test_compute_tasks_landed_missing_baseline_returns_none_with_one_warning(cap
 # fused-memory's `_normalize_project_root` hard-rejects a relative path with
 # exactly this payload. Verified live against localhost:8002 with
 # `{"project_root": "."}` -- and critically, the JSON-RPC envelope carries
-# `isError: false`, so `_extract_tool_result` unwraps this dict as though it
-# were a genuine tool result and hands it straight to the caller.
+# `isError: false`, so the MCP client unwraps this dict as though it were a
+# genuine tool result and hands it straight to the caller.
 _TOOL_ERROR_ENVELOPE = {
     "error": "project_root must be a non-empty absolute path, got: '.'",
     "error_type": "ValidationError",
@@ -658,8 +841,8 @@ def test_extract_done_count_empty_statuses_is_a_valid_zero():
 
 def test_extract_done_count_raises_on_fused_memory_tool_error_envelope():
     """The regression that poisoned the live baseline. `@mcp_tool_errors`
-    returns this dict with `isError: false` at the JSON-RPC layer, so
-    `_extract_tool_result` unwraps it happily; the old
+    returns this dict with `isError: false` at the JSON-RPC layer, so the
+    MCP client unwraps it happily; the old
     `(payload.get("statuses") or {})` idiom then read it as a done-count of
     0 -- silently, with no warning and no exception."""
     with pytest.raises(ct.StatusFetchUnavailable) as excinfo:
@@ -702,6 +885,71 @@ def test_extract_done_count_raises_on_non_dict_payload(payload):
         ct.extract_done_count(payload)
 
     assert type(payload).__name__ in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# task 6404: extract_statuses() — the validated {task id: status} mapping a
+# census run reads ONCE and derives both its outcome feed and its done-count
+# from. extract_done_count builds on it, so the two cannot drift.
+# ---------------------------------------------------------------------------
+
+
+def test_extract_statuses_returns_the_validated_mapping():
+    assert dict(ct.extract_statuses({"statuses": {"12": "done", "13": "pending"}})) == {
+        "12": "done",
+        "13": "pending",
+    }
+
+
+def test_extract_statuses_empty_statuses_is_a_valid_empty_mapping():
+    assert dict(ct.extract_statuses({"statuses": {}})) == {}
+
+
+def test_extract_statuses_raises_on_fused_memory_tool_error_envelope():
+    with pytest.raises(ct.StatusFetchUnavailable) as excinfo:
+        ct.extract_statuses(_TOOL_ERROR_ENVELOPE)
+
+    assert "project_root must be a non-empty absolute path" in str(excinfo.value)
+
+
+def test_extract_statuses_raises_when_statuses_key_absent():
+    with pytest.raises(ct.StatusFetchUnavailable) as excinfo:
+        ct.extract_statuses({})
+
+    assert "statuses" in str(excinfo.value)
+
+
+def test_extract_statuses_raises_when_statuses_is_not_a_mapping():
+    with pytest.raises(ct.StatusFetchUnavailable) as excinfo:
+        ct.extract_statuses({"statuses": ["1", "2"]})
+
+    assert "statuses" in str(excinfo.value)
+    assert "list" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("payload", [None, [], "oops", 0])
+def test_extract_statuses_raises_on_non_dict_payload(payload):
+    with pytest.raises(ct.StatusFetchUnavailable) as excinfo:
+        ct.extract_statuses(payload)
+
+    assert type(payload).__name__ in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"statuses": {}},
+        {"statuses": {"1": "done", "2": "done", "3": "pending"}},
+        {"statuses": {"1": "done"}, "error": "x"},
+        {"statuses": {"7": "cancelled", "8": "done", "9": "in-progress"}},
+    ],
+)
+def test_extract_done_count_is_the_done_count_of_extract_statuses(payload):
+    statuses = ct.extract_statuses(payload)
+
+    assert ct.extract_done_count(payload) == sum(
+        1 for status in statuses.values() if status == "done"
+    )
 
 
 def test_compute_tasks_landed_tool_error_envelope_returns_none_with_one_warning(caplog):
@@ -964,270 +1212,118 @@ def test_bounded_keys_survives_mixed_type_keys():
     assert "None" in result
 
 
+# ---------------------------------------------------------------------------
+# default_status_fetcher against a real-socket stand-in for fused-memory,
+# reached through FUSED_MEMORY_MCP_URL.
+# ---------------------------------------------------------------------------
+
+def _fetch_from(server, monkeypatch, project_root):
+    monkeypatch.setenv("FUSED_MEMORY_MCP_URL", server.url)
+    return ct.default_status_fetcher(project_root)()
+
+
+def _get_statuses_arguments(server):
+    """The arguments of the one tools/call *server* received, which must be
+    get_statuses."""
+    [call] = [
+        r.body for r in server.requests
+        if isinstance(r.body, dict) and r.body.get("method") == "tools/call"
+    ]
+    assert call["params"]["name"] == "get_statuses"
+    return call["params"]["arguments"]
+
+
+def test_default_status_fetcher_returns_the_unwrapped_get_statuses_reply(tmp_path, monkeypatch):
+    with StubMcpServer(stateful=False, payload={"statuses": {"1": "done"}}) as server:
+        reply = _fetch_from(server, monkeypatch, tmp_path)
+
+    assert reply == {"statuses": {"1": "done"}}
+
+
 def test_default_status_fetcher_raises_status_fetch_unavailable_when_unreachable(
-    tmp_path, install_fake_httpx
+    tmp_path, monkeypatch,
 ):
-    """An unreachable endpoint must surface as StatusFetchUnavailable, never
-    as a raw transport exception.
-
-    The transport failure is INJECTED rather than relied upon. This test
-    originally passed on two ambient premises, both of which are now false:
-    that httpx was not importable here (so the lazy-import ImportError branch
-    fired), and that nothing listened on the default FUSED_MEMORY_MCP_URL
-    (http://localhost:8002). httpx is installed today, and a real fused-memory
-    MCP server listens on :8002 on any machine running the stack -- so the
-    test flapped pass/fail with that live server's connection state instead of
-    testing this module. Injecting a failing `httpx` module (via the shared
-    `install_fake_httpx` fixture, as
-    test_default_status_fetcher_sends_streamable_http_accept_headers below
-    also does) makes the "unreachable" premise true by construction.
-    """
-    def _fake_post(url, **kwargs):
-        raise OSError("[Errno 111] Connection refused")
-
-    install_fake_httpx(_fake_post)
-
-    fetcher = ct.default_status_fetcher(tmp_path)
-
-    # match + __cause__ pin the network-failure branch specifically --
-    # StatusFetchUnavailable also wraps an absent httpx (ImportError), a
-    # non-2xx response, and an _extract_tool_result parse failure, so
-    # asserting only the exception type would still pass if the fake ever
-    # stopped exercising the network path. The fake above raises OSError
-    # (not the narrower ConnectionError -- OSError is what a real errno-111
-    # connection refusal actually is), so pin __cause__ to that.
-    with pytest.raises(ct.StatusFetchUnavailable, match="unreachable at") as excinfo:
-        fetcher()
-    assert isinstance(excinfo.value.__cause__, OSError)
-
-
-class _FakeHttpxResponse:
-    """A 200/`application/json` `httpx.Response` stand-in for the
-    `default_status_fetcher` tests.
-
-    `status_code` and `headers` were added in the task-3644 amendment pass:
-    `default_status_fetcher._fetch` no longer hand-rolls its own POST, it
-    routes through `post_mcp_tool_call` like the other three legibility MCP
-    consumers -- which reads `status_code` (to detect a stateful server's 400
-    "Missing session ID") and `headers` (to pick the JSON vs SSE decoder).
-    The values pin the STATELESS fused-memory shape this fetcher actually
-    talks to, so these tests keep exercising the single-POST fast path.
-    """
-
-    def __init__(self, payload):
-        self.status_code = 200
-        self.headers = {"content-type": "application/json"}
-        self.text = ""
-        self._payload = payload
-
-    def raise_for_status(self):
+    """A refused connection surfaces as StatusFetchUnavailable naming the
+    URL, never as a raw transport exception."""
+    with StubMcpServer(stateful=False) as server:
         pass
-
-    def json(self):
-        return self._payload
-
-
-def test_default_status_fetcher_sends_streamable_http_accept_headers(
-    tmp_path, install_fake_httpx
-):
-    """Task 2953: the streamable-HTTP MCP transport 406s
-    ("Not Acceptable: Client must accept application/json") any tools/call
-    POST whose Accept header doesn't include both application/json and
-    text/event-stream -- verified live against a local MCP /mcp endpoint.
-    default_status_fetcher's httpx import is lazy, but httpx is genuinely
-    available here: a DIRECT dependency of `shared` (shared/pyproject.toml,
-    `httpx>=0.27`, task 2965), not a transitive one. So the real POST would
-    actually go out; the shared `install_fake_httpx` fixture substitutes a
-    stub to capture the outbound call without a network, and without
-    depending on whatever is listening on localhost:8002."""
-    captured_kwargs = {}
-    rpc_response = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "result": {"structuredContent": {"statuses": {"1": "done"}}},
-    }
-
-    def _fake_post(url, **kwargs):
-        captured_kwargs.update(kwargs)
-        return _FakeHttpxResponse(rpc_response)
-
-    install_fake_httpx(_fake_post)
-
+    monkeypatch.setenv("FUSED_MEMORY_MCP_URL", server.url)
     fetcher = ct.default_status_fetcher(tmp_path)
-    result = fetcher()
 
-    assert result == {"statuses": {"1": "done"}}
-    headers = captured_kwargs.get("headers") or {}
-    assert "application/json" in headers.get("Accept", "")
-    assert "text/event-stream" in headers.get("Accept", "")
-    # Content-Type is part of the same transport contract -- pin it too so a
-    # future edit dropping it can't pass on the Accept assertions alone.
-    assert headers.get("Content-Type") == "application/json"
-    # The JSON-RPC tools/call body must still ride along on the same call.
-    envelope = captured_kwargs.get("json") or {}
-    assert envelope.get("method") == "tools/call"
-    assert envelope.get("params", {}).get("name") == "get_statuses"
+    with pytest.raises(ct.StatusFetchUnavailable, match=re.escape(f"unreachable at {server.url}")):
+        fetcher()
 
 
-def _capture_get_statuses_project_root(install_fake_httpx, project_root):
-    """Drive `default_status_fetcher(project_root)` against a fake httpx and
-    return the `project_root` argument it actually put on the wire. Reuses
-    the `_FakeHttpxResponse` + shared `install_fake_httpx` harness above (the
-    `import httpx` inside `_fetch` is lazy precisely so this works).
-
-    Takes the fixture as a parameter rather than requesting it: this is a
-    plain helper, not a test, so pytest will not inject fixtures into it."""
-    captured_kwargs = {}
-
-    def _fake_post(url, **kwargs):
-        captured_kwargs.update(kwargs)
-        return _FakeHttpxResponse(
-            {"jsonrpc": "2.0", "id": 1, "result": {"structuredContent": {"statuses": {}}}}
-        )
-
-    install_fake_httpx(_fake_post)
-
-    ct.default_status_fetcher(project_root)()
-    return captured_kwargs["json"]["params"]["arguments"]["project_root"]
-
-
-def test_default_status_fetcher_sends_absolute_project_root_for_dot(
-    tmp_path, monkeypatch, install_fake_httpx
+def test_default_status_fetcher_raises_status_fetch_unavailable_on_a_tool_error(
+    tmp_path, monkeypatch,
 ):
-    """Task 3291 root cause. fused-memory's `_normalize_project_root` hard-
-    rejects ANY relative path -- verified live against localhost:8002, which
-    answered `{"project_root": "."}` with
-    `{"error": "project_root must be a non-empty absolute path, got: '.'",
-      "error_type": "ValidationError"}`.
+    """An isError reply is a failed fetch, not a done-count of 0."""
+    with (
+        StubMcpServer(stateful=False, answer=StubAnswer.IS_ERROR) as server,
+        pytest.raises(ct.StatusFetchUnavailable) as excinfo,
+    ):
+        _fetch_from(server, monkeypatch, tmp_path)
 
-    census.py resolves its own, now required, `--project-root` (task 3269);
-    the `evaluate` CLI's `"."` default still reaches this resolve. The MCP
-    argument is resolved by the SERVER's cwd, not the client's, so a relative
-    path is meaningless over the wire."""
+    assert server.url in str(excinfo.value)
+
+
+def test_default_status_fetcher_sends_absolute_project_root_for_dot(tmp_path, monkeypatch):
+    """fused-memory's `_normalize_project_root` rejects any relative path: the
+    MCP argument is resolved by the SERVER's cwd, not the client's. The
+    `evaluate` CLI's "." default reaches this resolve."""
     monkeypatch.chdir(tmp_path)
 
-    sent = _capture_get_statuses_project_root(install_fake_httpx, ".")
+    with StubMcpServer(stateful=False, payload={"statuses": {}}) as server:
+        _fetch_from(server, monkeypatch, ".")
+        sent = _get_statuses_arguments(server)["project_root"]
 
     assert sent == str(tmp_path.resolve())
     assert Path(sent).is_absolute()
 
 
 def test_default_status_fetcher_sends_absolute_project_root_for_relative_subdir(
-    tmp_path, monkeypatch, install_fake_httpx
+    tmp_path, monkeypatch,
 ):
-    """Second case so the fix cannot pass by special-casing `"."` alone."""
+    """Second case so the fix cannot pass by special-casing "." alone."""
     (tmp_path / "sub" / "dir").mkdir(parents=True)
     monkeypatch.chdir(tmp_path)
 
-    sent = _capture_get_statuses_project_root(install_fake_httpx, "sub/dir")
+    with StubMcpServer(stateful=False, payload={"statuses": {}}) as server:
+        _fetch_from(server, monkeypatch, "sub/dir")
+        sent = _get_statuses_arguments(server)["project_root"]
 
     assert sent == str((tmp_path / "sub" / "dir").resolve())
     assert Path(sent).is_absolute()
 
 
-def test_default_status_fetcher_leaves_absolute_project_root_unchanged(
-    tmp_path, monkeypatch, install_fake_httpx
-):
-    """The other half of the contract: an ALREADY-absolute root must cross the
-    wire byte-for-byte unchanged. Both tests above start from a relative path,
-    so on their own they would not notice a "fix" that mangles absolute inputs.
-
-    This matters concretely because fused-memory keys its `_MAIN_CHECKOUT_CACHE`
-    on the path it is handed: if `resolve()` were ever to rewrite an operator's
-    configured root (a symlinked home, say `/home/leo` -> elsewhere), the cache
-    key would silently stop matching the configured one. Pinning pass-through
-    for the already-absolute case is what keeps this fix a normalisation of
-    relative paths rather than a rewrite of every path."""
+def test_default_status_fetcher_leaves_absolute_project_root_unchanged(tmp_path, monkeypatch):
+    """An already-absolute root crosses the wire unchanged. fused-memory keys
+    its `_MAIN_CHECKOUT_CACHE` on the path it is handed, so the resolve must
+    normalise relative paths and rewrite nothing else."""
     monkeypatch.chdir(tmp_path)
     absolute_root = str(tmp_path)
 
-    sent = _capture_get_statuses_project_root(install_fake_httpx, absolute_root)
+    with StubMcpServer(stateful=False, payload={"statuses": {}}) as server:
+        _fetch_from(server, monkeypatch, absolute_root)
+        sent = _get_statuses_arguments(server)["project_root"]
 
     assert sent == absolute_root
 
 
-# ---------------------------------------------------------------------------
-# amendment pass (review findings #1/#2): _extract_tool_result() unwraps the
-# real MCP tools/call JSON-RPC envelope. default_status_fetcher's HTTP
-# round-trip is never driven against a real endpoint here -- the tests above
-# inject a fake `httpx` module instead, since anything else makes them depend
-# on whether a live fused-memory MCP server happens to be listening on the
-# default URL; these tests instead exercise the envelope parser
-# directly against realistic tools/call response shapes, and then bridge its
-# output into compute_tasks_landed to pin the exact contract between them.
-# ---------------------------------------------------------------------------
-
-def _done_statuses_envelope(count):
-    return {str(i): "done" for i in range(count)}
-
-
-def test_extract_tool_result_prefers_structured_content():
-    # structuredContent and content disagree on purpose, so a returned value
-    # equal to structuredContent's (not content's) proves precedence.
-    rpc_response = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "result": {
-            "content": [{"type": "text", "text": json.dumps({"statuses": {"decoy": "done"}})}],
-            "structuredContent": {"statuses": {"1": "done"}},
-            "isError": False,
-        },
-    }
-    assert ct._extract_tool_result(rpc_response) == {"statuses": {"1": "done"}}
-
-
-def test_extract_tool_result_falls_back_to_content_text_when_no_structured_content():
-    rpc_response = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "result": {
-            "content": [{"type": "text", "text": json.dumps({"statuses": {"1": "done"}})}],
-            "isError": False,
-        },
-    }
-    assert ct._extract_tool_result(rpc_response) == {"statuses": {"1": "done"}}
-
-
-def test_extract_tool_result_raises_when_no_result_key():
-    # e.g. a JSON-RPC error response, which carries "error" instead of "result".
-    rpc_response = {"jsonrpc": "2.0", "id": 1, "error": {"code": -32000, "message": "boom"}}
-    with pytest.raises(ct.StatusFetchUnavailable):
-        ct._extract_tool_result(rpc_response)
-
-
-def test_extract_tool_result_raises_when_content_text_unparseable():
-    rpc_response = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "result": {"content": [{"type": "text", "text": "not json"}]},
-    }
-    with pytest.raises(ct.StatusFetchUnavailable):
-        ct._extract_tool_result(rpc_response)
-
-
-def test_extract_tool_result_feeds_compute_tasks_landed_correct_delta():
-    """Pins the exact shape contract between a realistic MCP tools/call
-    envelope (as get_statuses actually returns it) and
-    compute_tasks_landed -- closing the gap where only the hand-rolled
-    _wrapped_fetcher test double (which bypasses envelope parsing entirely)
-    was ever exercised. Before the fix, this delta silently came out
-    negative (0 - 500) instead of 130."""
-    statuses = _done_statuses_envelope(630)
+def test_default_status_fetcher_feeds_compute_tasks_landed_the_correct_delta(
+    tmp_path, monkeypatch,
+):
+    """The fetcher's reply is exactly the shape compute_tasks_landed reads:
+    630 done of 645 against a 500 baseline is a delta of 130."""
+    statuses = _done_statuses(630)
     statuses.update({str(i): "pending" for i in range(630, 645)})
-    rpc_response = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "result": {
-            "content": [{"type": "text", "text": json.dumps({"statuses": statuses})}],
-            "structuredContent": {"statuses": statuses},
-            "isError": False,
-        },
-    }
-    state = {"last_census_done_count": 500}
 
-    result = ct.compute_tasks_landed(
-        state=state, status_fetcher=lambda: ct._extract_tool_result(rpc_response)
-    )
+    with StubMcpServer(stateful=False, payload={"statuses": statuses}) as server:
+        monkeypatch.setenv("FUSED_MEMORY_MCP_URL", server.url)
+        result = ct.compute_tasks_landed(
+            state={"last_census_done_count": 500},
+            status_fetcher=ct.default_status_fetcher(tmp_path),
+        )
 
     assert result == 130
 
@@ -1283,6 +1379,143 @@ def test_decide_for_project_row1_missing_state_fires_from_earliest_sighting(tmp_
 
     assert decision.fire is True
     assert any("max-interval" in r for r in decision.reasons)
+    assert (
+        "floor: 12.5d since earliest codebook date (never censused) (floor 5d)"
+        in decision.reasons
+    )
+
+
+def _write_legibility_yaml(project_root, text):
+    legibility_dir = project_root / "docs" / "legibility"
+    legibility_dir.mkdir(parents=True, exist_ok=True)
+    (legibility_dir / "legibility.yaml").write_text(text, encoding="utf-8")
+
+
+def test_decide_for_project_legacy_state_floor_falls_back_to_last_census_at(tmp_path):
+    _write_codebook(tmp_path)
+    _write_census_state(
+        tmp_path,
+        last_census_at=(NOW - timedelta(days=3)).isoformat(),
+        last_census_report="plans/confusion-census-prior.md",
+    )
+    _write_legibility_yaml(tmp_path, "census:\n  max_interval_days: 1\n")
+
+    decision = ct.decide_for_project(tmp_path, now=NOW, status_fetcher=None)
+
+    assert decision.fire is False
+    assert (
+        "floor: 3.0d since last_census_at (no watermark yet) (floor 5d) -> BLOCKS all conditions"
+        in decision.reasons
+    )
+
+
+def test_decide_for_project_never_censused_floor_blocks_from_the_earliest_codebook_date(
+    tmp_path,
+):
+    _write_codebook(
+        tmp_path,
+        entries=[
+            {
+                "id": "entry-a",
+                "title": "t",
+                "severity": "low",
+                "status": "open",
+                "origin_phase": "unknown",
+                "manifested_phase": "unknown",
+                "sightings": [_sighting((NOW - timedelta(days=3)).date().isoformat())],
+            }
+        ],
+    )
+    _write_legibility_yaml(tmp_path, "census:\n  max_interval_days: 1\n")
+
+    decision = ct.decide_for_project(tmp_path, now=NOW, status_fetcher=None)
+
+    assert decision.fire is False
+    floor_lines = [r for r in decision.reasons if r.startswith("floor:")]
+    assert len(floor_lines) == 1
+    assert "since earliest codebook date (never censused)" in floor_lines[0]
+    assert "BLOCKS" in floor_lines[0]
+
+
+def _watermarked_state(*, last_census_days_ago, watermark_days_ago) -> dict[str, str | None]:
+    return {
+        "last_census_at": (NOW - timedelta(days=last_census_days_ago)).isoformat(),
+        "last_census_report": "plans/confusion-census-prior.md",
+        "last_census_run_id": "census-dark_factory-20260702",
+        "session_watermark": (NOW - timedelta(days=watermark_days_ago)).isoformat(),
+    }
+
+
+def test_decide_for_project_floor_reads_the_session_watermark_not_last_census_at(tmp_path):
+    _write_codebook(tmp_path)
+    _write_census_state(
+        tmp_path, **_watermarked_state(last_census_days_ago=12, watermark_days_ago=3)
+    )
+
+    decision = ct.decide_for_project(tmp_path, now=NOW, status_fetcher=None)
+
+    assert "max-interval: 12.0d since last census (threshold 10d) -> FIRE" in decision.reasons
+    assert decision.fire is False
+    assert (
+        "floor: 3.0d since session watermark (floor 5d) -> BLOCKS all conditions"
+        in decision.reasons
+    )
+
+
+def test_decide_for_project_floor_clears_on_an_old_watermark(tmp_path):
+    _write_codebook(tmp_path)
+    _write_census_state(
+        tmp_path, **_watermarked_state(last_census_days_ago=12, watermark_days_ago=12)
+    )
+
+    decision = ct.decide_for_project(tmp_path, now=NOW, status_fetcher=None)
+
+    assert decision.fire is True
+    assert any(r.startswith("max-interval:") and "-> FIRE" in r for r in decision.reasons)
+    assert "floor: 12.0d since session watermark (floor 5d)" in decision.reasons
+
+
+@pytest.mark.parametrize("watermark_present", [True, False], ids=["null", "absent"])
+def test_decide_for_project_null_or_absent_watermark_falls_back_to_last_census_at(
+    tmp_path, watermark_present
+):
+    state = _watermarked_state(last_census_days_ago=12, watermark_days_ago=12)
+    if watermark_present:
+        state["session_watermark"] = None
+    else:
+        del state["session_watermark"]
+    _write_codebook(tmp_path)
+    _write_census_state(tmp_path, **state)
+
+    decision = ct.decide_for_project(tmp_path, now=NOW, status_fetcher=None)
+
+    assert decision.fire is True
+    assert "floor: 12.0d since last_census_at (no watermark yet) (floor 5d)" in decision.reasons
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        {},
+        {"last_census_report": "plans/confusion-census-prior.md"},
+        {"last_census_at": None, "session_watermark": None},
+    ],
+    ids=["empty", "report-only", "null-timestamps"],
+)
+def test_decide_for_project_ok_state_without_timestamps_blocks_on_no_anchor(tmp_path, state):
+    _write_spike_codebook(tmp_path)
+    _write_census_state(tmp_path, **state)
+
+    decision = ct.decide_for_project(tmp_path, now=NOW, status_fetcher=None)
+
+    assert any(
+        r.startswith("novelty-spike:") and r.endswith("-> FIRE") for r in decision.reasons
+    )
+    assert decision.fire is False
+    assert (
+        "floor: no anchor (no session watermark, last_census_at or codebook date)"
+        " -> BLOCKS all conditions" in decision.reasons
+    )
 
 
 def test_decide_for_project_row2_day9_no_spike_low_delta_no_fire(tmp_path):
@@ -1318,32 +1551,42 @@ def test_decide_for_project_row3_day7_130_landed_fires(tmp_path):
     assert any("tasks-landed" in r for r in decision.reasons)
 
 
-def test_decide_for_project_row4_day6_novelty_spike_fires(tmp_path):
-    _write_codebook(tmp_path, candidates=_candidates_from_dates(_SPIKE_4_IN_72H))
+def _write_spike_codebook(project_root):
+    _write_codebook(
+        project_root,
+        candidates=_candidates_from_dates(
+            [fs.date().isoformat() for fs in _first_seens_over_a_baseline_of_40(90)]
+        ),
+    )
+
+
+def test_decide_for_project_row4_novelty_spike_fires(tmp_path):
+    _write_spike_codebook(tmp_path)
     _write_census_state(
-        tmp_path,
-        last_census_at=(NOW - timedelta(days=6)).isoformat(),
-        last_census_report="plans/confusion-census-prior.md",
+        tmp_path, **_watermarked_state(last_census_days_ago=6, watermark_days_ago=6)
     )
 
     decision = ct.decide_for_project(tmp_path, now=NOW, status_fetcher=None)
 
     assert decision.fire is True
-    assert any("novelty-spike" in r for r in decision.reasons)
+    assert any(
+        r.startswith("novelty-spike:") and r.endswith("-> FIRE") for r in decision.reasons
+    )
 
 
-def test_decide_for_project_row5_day4_floor_blocks_spike_no_fire(tmp_path):
-    _write_codebook(tmp_path, candidates=_candidates_from_dates(_SPIKE_4_IN_72H))
+def test_decide_for_project_row5_floor_blocks_novelty_spike_no_fire(tmp_path):
+    _write_spike_codebook(tmp_path)
     _write_census_state(
-        tmp_path,
-        last_census_at=(NOW - timedelta(days=4)).isoformat(),
-        last_census_report="plans/confusion-census-prior.md",
+        tmp_path, **_watermarked_state(last_census_days_ago=6, watermark_days_ago=3)
     )
 
     decision = ct.decide_for_project(tmp_path, now=NOW, status_fetcher=None)
 
     assert decision.fire is False
-    assert any("floor" in r for r in decision.reasons)
+    assert (
+        "floor: 3.0d since session watermark (floor 5d) -> BLOCKS all conditions"
+        in decision.reasons
+    )
 
 
 def test_decide_for_project_row6_malformed_state_no_fire_one_warning(tmp_path, caplog):
@@ -1544,718 +1787,33 @@ def test_cli_evaluate_malformed_state_never_crashes_and_exits_0(tmp_path, capsys
     assert "DECISION:" in captured.out
 
 
-# ---------------------------------------------------------------------------
-# task 3644: post_mcp_tool_call — the MCP streamable-HTTP session handshake
-# ---------------------------------------------------------------------------
-#
-# The escalation MCP server (:8103) is a STATEFUL FastMCP streamable-HTTP
-# server; the fused-memory one (:8002) is STATELESS. All four legibility MCP
-# consumers used to bare-POST `tools/call` at both, which the stateful one
-# rejects at the TRANSPORT layer -- before the tool ever runs -- with
-# (captured verbatim from a live probe against :8103 on 2026-08-05):
-#
-#     HTTP/1.1 400 Bad Request
-#     mcp-session-id: 93599e03ba3b4baeb5bd0d2b6b399ddd
-#     {"jsonrpc":"2.0","id":"server-error",
-#      "error":{"code":-32600,"message":"Bad Request: Missing session ID"}}
-#
-# so every legibility fail-loud escalation was silently swallowed. These tests
-# pin the adaptive fix: POST session-less first, and ONLY on a 400 perform the
-# handshake and retry once, so the stateless path stays exactly one POST.
-
-_SESSION_REQUIRED_400_BODY = {
-    "jsonrpc": "2.0",
-    "id": "server-error",
-    "error": {"code": -32600, "message": "Bad Request: Missing session ID"},
-}
-
-# The live 400 carries an `mcp-session-id` RESPONSE header of its own (see the
-# probe above). It is NOT a usable session -- a client that scrapes it and
-# replays it gets 404 "Session not found". The fakes below hand back this
-# sentinel so a test fails loudly if the implementation ever reuses it instead
-# of running the real `initialize` handshake.
-_UNUSABLE_SESSION_FROM_400 = "sid-scraped-off-the-400-do-not-reuse"
-
-
-class _FakeMcpResponse:
-    """An `httpx.Response` stand-in exposing exactly what the MCP transport
-    helper is allowed to touch: `status_code`, `headers`, `text`, `json()` and
-    `raise_for_status()`.
-
-    Deliberately a separate class from `_FakeHttpxResponse` above rather than
-    an extension of it: that one models only a 200/JSON reply, and widening it
-    with transport states would silently change the premise of every existing
-    test that uses it.
-    """
-
-    def __init__(self, *, status_code=200, headers=None, payload=None, text=""):
-        self.status_code = status_code
-        self.headers = headers or {}
-        self.text = text
-        self._payload = payload
-
-    def raise_for_status(self):
-        if self.status_code >= 400:
-            # A plain RuntimeError, NOT httpx.HTTPStatusError: the shared
-            # `install_fake_httpx` stub exposes only `post` and `pytest.fail`s
-            # on any other attribute, so neither the code under test nor this
-            # test may name an httpx exception type (task 3376's constraint).
-            raise RuntimeError(f"HTTP {self.status_code}")
-
-    def json(self):
-        if self._payload is None:
-            raise ValueError("response has no JSON body")
-        return self._payload
-
-
-def _stateful_mcp_post(recorded, *, session_id="sid-abc", tool_result=None):
-    """Build a fake `httpx.post` behaving like the STATEFUL escalation server.
-
-    `tools/call` without a valid `mcp-session-id` request header -> 400
-    "Missing session ID"; `initialize` -> 200 carrying the server-ASSIGNED id
-    as a response header; `notifications/initialized` -> 202 with no body;
-    `tools/call` WITH the assigned header -> 200 + a normal JSON-RPC envelope.
-    Every request is appended to *recorded* as `(url, kwargs)`.
-    """
-    tool_result = {"id": "esc-42"} if tool_result is None else tool_result
-
-    def _post(url, **kwargs):
-        recorded.append((url, kwargs))
-        envelope = kwargs.get("json") or {}
-        method = envelope.get("method")
-        if method == "initialize":
-            return _FakeMcpResponse(
-                status_code=200,
-                headers={"mcp-session-id": session_id,
-                         "content-type": "application/json"},
-                payload={"jsonrpc": "2.0", "id": envelope.get("id"), "result": {}},
-            )
-        if method == "notifications/initialized":
-            return _FakeMcpResponse(status_code=202, headers={}, text="")
-        if (kwargs.get("headers") or {}).get("mcp-session-id") != session_id:
-            return _FakeMcpResponse(
-                status_code=400,
-                headers={"content-type": "application/json",
-                         "mcp-session-id": _UNUSABLE_SESSION_FROM_400},
-                payload=_SESSION_REQUIRED_400_BODY,
-                # The real 400 carries this body as TEXT too; the transport
-                # keeps it so a 400 that was NOT about a missing session can
-                # still be diagnosed from the resulting error message.
-                text=json.dumps(_SESSION_REQUIRED_400_BODY),
-            )
-        return _FakeMcpResponse(
-            status_code=200,
-            headers={"content-type": "application/json"},
-            payload={"jsonrpc": "2.0", "id": envelope.get("id"),
-                     "result": {"structuredContent": tool_result}},
-        )
-
-    return _post
-
-
-def _recording_delete(deleted):
-    """Build a fake `httpx.delete` recording each MCP session-termination call.
-
-    `post_mcp_envelope` DELETEs the endpoint after a handshake so the server
-    does not leak one session (a `_server_instances` entry + a live per-session
-    anyio task) per legibility escalation. The stub is OPT-IN, so every test
-    that reaches a handshake must supply one -- which is the point: a test that
-    forgets lands in `install_fake_httpx`'s loud-miss `pytest.fail` rather than
-    silently exercising a different path.
-    """
-    def _delete(url, **kwargs):
-        deleted.append((url, kwargs))
-        return _FakeMcpResponse(status_code=200, headers={}, text="")
-
-    return _delete
-
-
-def _methods(recorded):
-    """The ordered list of JSON-RPC `method`s actually put on the wire."""
-    return [(kwargs.get("json") or {}).get("method") for _url, kwargs in recorded]
-
-
-def test_post_mcp_tool_call_handshakes_when_the_server_demands_a_session(
-    install_fake_httpx
-):
-    """A stateful server's 400 must trigger initialize -> notifications/
-    initialized -> retry, with the SERVER-assigned session id."""
-    recorded = []
-    deleted = []
-    install_fake_httpx(_stateful_mcp_post(recorded), delete=_recording_delete(deleted))
-
-    result = ct.post_mcp_tool_call(
-        "http://localhost:8103/mcp",
-        "escalate_info",
-        {"task_id": "legibility-census-dark_factory", "summary": "s"},
-    )
-
-    # The unwrapped TOOL result, not the JSON-RPC envelope.
-    assert result == {"id": "esc-42"}
-
-    assert _methods(recorded) == [
-        "tools/call",            # session-less first attempt -> 400
-        "initialize",            # handshake
-        "notifications/initialized",
-        "tools/call",            # retried with the session header
+def _cli_floor_line(tmp_path, capsys):
+    exit_code = ct.main(["evaluate", "--project-root", str(tmp_path)])
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    (floor_line,) = [
+        line for line in captured.out.splitlines() if line.startswith("floor:")
     ]
-
-    headers = [kwargs.get("headers") or {} for _url, kwargs in recorded]
-
-    # `initialize` MUST be session-less. A client that invents (or scrapes)
-    # its own id here gets 404 "Session not found" from a stateful server --
-    # the trap documented in fused-memory/scripts/cgl_eta_scheduler_gate.py's
-    # McpClient (task 2491).
-    assert "mcp-session-id" not in headers[1]
-
-    # ...and the id used afterwards is the one `initialize` assigned, never
-    # the unusable one the 400 response carried.
-    assert headers[2].get("mcp-session-id") == "sid-abc"
-    assert headers[3].get("mcp-session-id") == "sid-abc"
-
-    # The task-2953 Accept/Content-Type contract still rides on EVERY request,
-    # handshake requests included -- a 406 there would be just as fatal.
-    for sent in headers:
-        assert sent.get("Accept") == ct.MCP_STREAMABLE_HTTP_HEADERS["Accept"]
-        assert sent.get("Content-Type") == ct.MCP_STREAMABLE_HTTP_HEADERS["Content-Type"]
-
-    # The retry re-sends the ORIGINAL call, not a rebuilt/mangled one.
-    retried = (recorded[3][1].get("json") or {})["params"]
-    assert retried["name"] == "escalate_info"
-    assert retried["arguments"]["task_id"] == "legibility-census-dark_factory"
-
-    # ...and the session we opened is RELEASED. Without the DELETE the
-    # long-lived escalation server accumulates one `_server_instances` entry
-    # plus one live per-session anyio task per escalation, for ever.
-    assert len(deleted) == 1, f"expected exactly one session DELETE, got {deleted}"
-    delete_url, delete_kwargs = deleted[0]
-    assert delete_url == "http://localhost:8103/mcp"
-    assert (delete_kwargs.get("headers") or {}).get("mcp-session-id") == "sid-abc"
+    return floor_line
 
 
-def test_post_mcp_tool_call_makes_exactly_one_post_against_a_stateless_server(
-    install_fake_httpx
-):
-    """Regression guard for the fused-memory submit_task path.
-
-    :8002 is STATELESS -- a bare `tools/call` POST returns 200 with
-    `content-type: application/json` and no session id -- and
-    `census.default_submit_fn` files every curator task through it today. The
-    handshake must therefore be ADAPTIVE: no 400, no extra round trips, so
-    this fix cannot regress task filing.
-    """
-    recorded = []
-
-    def _post(url, **kwargs):
-        recorded.append((url, kwargs))
-        return _FakeMcpResponse(
-            status_code=200,
-            headers={"content-type": "application/json"},
-            payload={"jsonrpc": "2.0", "id": 1,
-                     "result": {"structuredContent": {"task_id": "3644"}}},
-        )
-
-    install_fake_httpx(_post)
-
-    result = ct.post_mcp_tool_call(
-        "http://localhost:8002/mcp", "submit_task", {"title": "t"},
+def test_cli_evaluate_prints_a_floor_line_naming_its_anchor(tmp_path, capsys):
+    six_days_ago = datetime.now(UTC) - timedelta(days=6)
+    _write_codebook(tmp_path)
+    _write_census_state(
+        tmp_path,
+        last_census_at=six_days_ago.date().isoformat(),
+        last_census_report="plans/confusion-census-prior.md",
     )
 
-    assert result == {"task_id": "3644"}
-    assert _methods(recorded) == ["tools/call"]
-    assert "mcp-session-id" not in (recorded[0][1].get("headers") or {})
+    assert "since last_census_at (no watermark yet)" in _cli_floor_line(tmp_path, capsys)
 
-
-def test_post_mcp_tool_call_does_not_retry_a_non_400_failure(install_fake_httpx):
-    """A real server failure must propagate, never be masked by a handshake.
-
-    Only 400 means "missing session ID". Retrying a 500 would double-send a
-    side-effecting tools/call and bury the actual fault under handshake noise.
-    """
-    recorded = []
-
-    def _post(url, **kwargs):
-        recorded.append((url, kwargs))
-        return _FakeMcpResponse(
-            status_code=500,
-            headers={"content-type": "application/json"},
-            payload={"error": "boom"},
-        )
-
-    install_fake_httpx(_post)
-
-    with pytest.raises(RuntimeError, match="HTTP 500"):
-        ct.post_mcp_tool_call("http://localhost:8103/mcp", "escalate_info", {})
-
-    assert _methods(recorded) == ["tools/call"]
-
-
-# ---------------------------------------------------------------------------
-# task 3644: post_mcp_tool_call — SSE body decoding
-# ---------------------------------------------------------------------------
-#
-# The second half of the same defect. Once a session EXISTS, the stateful
-# escalation server answers `tools/call` with an SSE-framed body, not JSON
-# (captured verbatim from the live probe against :8103 on 2026-08-05):
-#
-#     HTTP/1.1 200 OK
-#     content-type: text/event-stream
-#
-#     event: message
-#     data: {"jsonrpc":"2.0","id":1,"result":{...}}
-#
-# `response.json()` raises a JSONDecodeError on that body, so even a perfectly
-# handshaken client still drops the escalation. The fakes below make `json()`
-# raise exactly as httpx would, so a test cannot pass by accidentally taking
-# the JSON path on an SSE response.
-
-
-class _FakeSseResponse(_FakeMcpResponse):
-    """A 200 `text/event-stream` response whose `json()` raises, exactly as
-    `httpx.Response.json()` does on an SSE body."""
-
-    def __init__(self, text, *, status_code=200):
-        super().__init__(
-            status_code=status_code,
-            headers={"content-type": "text/event-stream"},
-            text=text,
-        )
-
-    def json(self):
-        raise json.JSONDecodeError("Expecting value", self.text or "", 0)
-
-
-def _sse_body(payload) -> str:
-    """Frame *payload* the way the escalation server frames a tools/call
-    reply: an `event:` line, a `data:` line, and a blank terminator."""
-    return f"event: message\ndata: {json.dumps(payload)}\n\n"
-
-
-def test_post_mcp_tool_call_decodes_an_sse_tools_call_response(install_fake_httpx):
-    """The post-handshake retry's SSE body must be parsed off its `data:`
-    line -- the JSON path is never taken for an SSE response."""
-    recorded = []
-    deleted = []
-    stateful = _stateful_mcp_post(recorded)
-
-    def _post(url, **kwargs):
-        response = stateful(url, **kwargs)
-        envelope = kwargs.get("json") or {}
-        if envelope.get("method") == "tools/call" and response.status_code == 200:
-            return _FakeSseResponse(_sse_body(
-                {"jsonrpc": "2.0", "id": 1,
-                 "result": {"structuredContent": {"id": "esc-77", "level": 0}}},
-            ))
-        return response
-
-    install_fake_httpx(_post, delete=_recording_delete(deleted))
-
-    result = ct.post_mcp_tool_call(
-        "http://localhost:8103/mcp", "escalate_info", {"summary": "s"},
+    _write_census_state(
+        tmp_path,
+        last_census_at=six_days_ago.date().isoformat(),
+        last_census_report="plans/confusion-census-prior.md",
+        session_watermark=six_days_ago.isoformat(),
     )
 
-    assert result == {"id": "esc-77", "level": 0}
-    assert _methods(recorded)[-1] == "tools/call"
-    assert len(deleted) == 1
+    assert "since session watermark" in _cli_floor_line(tmp_path, capsys)
 
-
-def test_post_mcp_tool_call_decodes_an_sse_response_without_a_handshake(
-    install_fake_httpx
-):
-    """SSE framing is a property of the RESPONSE, not of the handshake: a
-    server that answers the first (session-less) POST with an SSE body must
-    decode identically, with no extra round trips."""
-    recorded = []
-
-    def _post(url, **kwargs):
-        recorded.append((url, kwargs))
-        return _FakeSseResponse(_sse_body(
-            {"jsonrpc": "2.0", "id": 1, "result": {"structuredContent": {"ok": True}}},
-        ))
-
-    install_fake_httpx(_post)
-
-    assert ct.post_mcp_tool_call("http://localhost:8103/mcp", "escalate_info", {}) == {
-        "ok": True
-    }
-    assert _methods(recorded) == ["tools/call"]
-
-
-def test_post_mcp_tool_call_still_decodes_a_plain_json_response(install_fake_httpx):
-    """Regression guard: the stateless fused-memory shape
-    (`content-type: application/json`) must keep decoding via `json()`
-    unchanged -- SSE support is additive, not a replacement."""
-    recorded = []
-
-    def _post(url, **kwargs):
-        recorded.append((url, kwargs))
-        return _FakeMcpResponse(
-            status_code=200,
-            headers={"content-type": "application/json"},
-            payload={"jsonrpc": "2.0", "id": 1,
-                     "result": {"structuredContent": {"task_id": "3644"}}},
-        )
-
-    install_fake_httpx(_post)
-
-    assert ct.post_mcp_tool_call("http://localhost:8002/mcp", "submit_task", {}) == {
-        "task_id": "3644"
-    }
-    assert _methods(recorded) == ["tools/call"]
-
-
-def test_post_mcp_tool_call_fails_loud_on_an_sse_body_with_no_data_line(
-    install_fake_httpx
-):
-    """A malformed stream must raise a bounded, diagnosable error rather than
-    degrade to `{}` -- a silently-empty result is exactly the green-on-paper
-    failure this task exists to close."""
-    def _post(url, **kwargs):
-        return _FakeSseResponse("event: message\n: keep-alive comment\n\n")
-
-    install_fake_httpx(_post)
-
-    with pytest.raises(Exception, match="no SSE data line") as excinfo:
-        ct.post_mcp_tool_call("http://localhost:8103/mcp", "escalate_info", {})
-
-    # The offending body is reported at all...
-    assert "keep-alive" in str(excinfo.value)
-
-
-def test_post_mcp_tool_call_bounds_the_reported_sse_body(install_fake_httpx):
-    """...and reported BOUNDED. Separated from the test above deliberately:
-    "the marker text appears" passes identically for an unbounded
-    `repr(response.text)`, so on its own it asserts nothing about boundedness
-    and a refactor swapping `_bounded_repr` for a raw f-string would stay
-    green while re-introducing the multi-kilobyte-log-line problem this module
-    documents at `_MAX_REPR_CHARS`.
-
-    Every one of these messages is re-emitted verbatim into the nightly
-    systemd journal by `compute_tasks_landed` / `run_census`, one line each.
-    """
-    oversized = "event: message\n: " + ("x" * 5000) + "\n\n"
-
-    def _post(url, **kwargs):
-        return _FakeSseResponse(oversized)
-
-    install_fake_httpx(_post)
-
-    with pytest.raises(Exception, match="no SSE data line") as excinfo:
-        ct.post_mcp_tool_call("http://localhost:8103/mcp", "escalate_info", {})
-
-    message = str(excinfo.value)
-    assert "repr truncated" in message
-    # Bounded to roughly `_MAX_REPR_CHARS` plus the surrounding prose -- the
-    # 5000-char body must NOT be in there. A generous ceiling: the assertion
-    # under test is "orders of magnitude smaller than the body", not an exact
-    # length.
-    assert len(message) < ct._MAX_REPR_CHARS + 300, (
-        f"error message is {len(message)} chars for a {len(oversized)}-char "
-        f"body -- the bounded repr is not being applied"
-    )
-
-
-def test_post_mcp_envelope_tolerates_an_empty_202_body(install_fake_httpx):
-    """`notifications/initialized` answers 202 with no body at all; decoding
-    must yield `{}` rather than raising on the absent JSON."""
-    def _post(url, **kwargs):
-        return _FakeMcpResponse(status_code=202, headers={}, text="")
-
-    install_fake_httpx(_post)
-
-    assert ct.post_mcp_envelope(
-        "http://localhost:8103/mcp",
-        {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
-    ) == {}
-
-
-def test_post_mcp_tool_call_skips_sse_notification_frames(install_fake_httpx):
-    """A notification frame ahead of the response must be SKIPPED, not
-    mistaken for it.
-
-    FastMCP streams progress/log notifications over the same `tools/call` SSE
-    stream whenever a tool takes a `Context`. Returning the first `data:` line
-    would hand `_extract_tool_result` a notification and raise "malformed MCP
-    response (no result)" on a call that SUCCEEDED server-side -- a transport
-    bug in appearance, re-opening exactly this investigation.
-    """
-    body = (
-        'event: message\n'
-        'data: {"jsonrpc":"2.0","method":"notifications/progress",'
-        '"params":{"progress":1}}\n'
-        '\n'
-        'event: message\n'
-        'data: {"jsonrpc":"2.0","id":1,'
-        '"result":{"structuredContent":{"id":"esc-99"}}}\n'
-        '\n'
-    )
-
-    def _post(url, **kwargs):
-        return _FakeSseResponse(body)
-
-    install_fake_httpx(_post)
-
-    assert ct.post_mcp_tool_call("http://localhost:8103/mcp", "escalate_info", {}) == {
-        "id": "esc-99"
-    }
-
-
-def test_post_mcp_tool_call_joins_multiline_sse_data_fields(install_fake_httpx):
-    """Per the SSE spec a single event's `data` field may span several `data:`
-    lines, which must be newline-JOINED before parsing. Parsing only the first
-    would feed `json.loads` a fragment and raise on a well-formed response."""
-    body = (
-        'event: message\n'
-        'data: {"jsonrpc":"2.0","id":1,\n'
-        'data:  "result":{"structuredContent":{"id":"esc-split"}}}\n'
-        '\n'
-    )
-
-    def _post(url, **kwargs):
-        return _FakeSseResponse(body)
-
-    install_fake_httpx(_post)
-
-    assert ct.post_mcp_tool_call("http://localhost:8103/mcp", "escalate_info", {}) == {
-        "id": "esc-split"
-    }
-
-
-def test_post_mcp_tool_call_fails_loud_on_a_notification_only_sse_stream(
-    install_fake_httpx
-):
-    """Data frames that carry no JSON-RPC result/error at all are a real
-    fault, not an empty success."""
-    body = (
-        'event: message\n'
-        'data: {"jsonrpc":"2.0","method":"notifications/progress"}\n'
-        '\n'
-    )
-
-    def _post(url, **kwargs):
-        return _FakeSseResponse(body)
-
-    install_fake_httpx(_post)
-
-    with pytest.raises(Exception, match="no MCP result/error frame"):
-        ct.post_mcp_tool_call("http://localhost:8103/mcp", "escalate_info", {})
-
-
-# ---------------------------------------------------------------------------
-# task 3644 (amendment pass): a 200 carrying a TOOL-LEVEL failure is not a
-# success
-# ---------------------------------------------------------------------------
-#
-# `nightly.post_escalation` and `check_transcript_persistence.post_findings`
-# discard the decoded body and report True on "no exception raised", so an
-# `isError: true` (or a JSON-RPC `error`) envelope read as a landed escalation
-# -- the same green-on-paper/nothing-filed failure this task exists to close,
-# one layer up from the transport.
-
-
-# A realistic `tools/call` envelope for the transport-level tests below, so
-# `_methods()` sees the method actually being retried rather than a bare stub.
-_ESCALATE_ENVELOPE = {
-    "jsonrpc": "2.0",
-    "id": 1,
-    "method": "tools/call",
-    "params": {"name": "escalate_info", "arguments": {"summary": "s"}},
-}
-
-def test_post_mcp_envelope_raises_on_a_tool_error_envelope(install_fake_httpx):
-    """`result.isError: true` -- FastMCP's shape for a raised ToolError."""
-    def _post(url, **kwargs):
-        return _FakeMcpResponse(
-            status_code=200,
-            headers={"content-type": "application/json"},
-            payload={"jsonrpc": "2.0", "id": 1, "result": {
-                "isError": True,
-                "content": [{"type": "text", "text": "unknown category 'nope'"}],
-            }},
-        )
-
-    install_fake_httpx(_post)
-
-    with pytest.raises(ct.StatusFetchUnavailable, match="MCP tool reported an error"):
-        ct.post_mcp_envelope("http://localhost:8103/mcp", _ESCALATE_ENVELOPE)
-
-
-def test_post_mcp_envelope_raises_on_a_jsonrpc_error_envelope(install_fake_httpx):
-    """A JSON-RPC-level `error` (the request never reached a tool) on a 200."""
-    def _post(url, **kwargs):
-        return _FakeMcpResponse(
-            status_code=200,
-            headers={"content-type": "application/json"},
-            payload={"jsonrpc": "2.0", "id": 1,
-                     "error": {"code": -32602, "message": "Unknown tool"}},
-        )
-
-    install_fake_httpx(_post)
-
-    with pytest.raises(ct.StatusFetchUnavailable, match="JSON-RPC error"):
-        ct.post_mcp_envelope("http://localhost:8103/mcp", _ESCALATE_ENVELOPE)
-
-
-# ---------------------------------------------------------------------------
-# task 3644 (amendment pass): the handshake's own failure paths
-# ---------------------------------------------------------------------------
-#
-# These are the paths an operator actually hits when the server is
-# misconfigured or rejects the protocol version -- and an unexercised error
-# path in this transport is precisely how the original defect survived. Each
-# also pins that the ORIGINAL 400's body is carried into the message, so a 400
-# that was NOT about a missing session is still diagnosable instead of being
-# replaced by a misleading session-protocol complaint.
-
-
-def test_post_mcp_envelope_raises_when_initialize_assigns_no_session_id(
-    install_fake_httpx
-):
-    """A stateless server answering a genuinely-bad request with 400 answers
-    `initialize` with 200 and NO session id. That must name the ORIGINAL 400's
-    reason, not just complain about the session protocol -- and must not go on
-    to send a doomed retry."""
-    recorded = []
-
-    def _post(url, **kwargs):
-        recorded.append((url, kwargs))
-        envelope = kwargs.get("json") or {}
-        if envelope.get("method") == "initialize":
-            return _FakeMcpResponse(
-                status_code=200,
-                headers={"content-type": "application/json"},  # no session id
-                payload={"jsonrpc": "2.0", "id": 1, "result": {}},
-            )
-        return _FakeMcpResponse(
-            status_code=400,
-            headers={"content-type": "application/json"},
-            text='{"error":{"message":"category must be one of ..."}}',
-        )
-
-    install_fake_httpx(_post)
-
-    with pytest.raises(RuntimeError, match="assigned no mcp-session-id") as excinfo:
-        ct.post_mcp_envelope("http://localhost:8002/mcp", _ESCALATE_ENVELOPE)
-
-    # The server's OWN stated reason survives into the message.
-    assert "category must be one of" in str(excinfo.value)
-    # No `notifications/initialized`, no retry: the handshake stopped dead.
-    assert _methods(recorded) == ["tools/call", "initialize"]
-
-
-def test_post_mcp_envelope_raises_when_initialize_itself_fails(install_fake_httpx):
-    """A non-2xx `initialize` (protocol version rejected, server wedged) must
-    surface with its status AND the original 400, and must not retry."""
-    recorded = []
-
-    def _post(url, **kwargs):
-        recorded.append((url, kwargs))
-        envelope = kwargs.get("json") or {}
-        if envelope.get("method") == "initialize":
-            return _FakeMcpResponse(status_code=500, headers={}, text="boom")
-        return _FakeMcpResponse(
-            status_code=400, headers={},
-            text='{"error":{"message":"Missing session ID"}}',
-        )
-
-    install_fake_httpx(_post)
-
-    with pytest.raises(RuntimeError, match="HTTP 500") as excinfo:
-        ct.post_mcp_envelope("http://localhost:8103/mcp", _ESCALATE_ENVELOPE)
-
-    assert "failed at initialize" in str(excinfo.value)
-    assert "Missing session ID" in str(excinfo.value)
-    assert _methods(recorded) == ["tools/call", "initialize"]
-
-
-def test_post_mcp_envelope_raises_when_notifications_initialized_fails(
-    install_fake_httpx
-):
-    """A failing `notifications/initialized` must abort before the retry --
-    and still release the session it already opened."""
-    recorded = []
-    deleted = []
-
-    def _post(url, **kwargs):
-        recorded.append((url, kwargs))
-        envelope = kwargs.get("json") or {}
-        method = envelope.get("method")
-        if method == "initialize":
-            return _FakeMcpResponse(
-                status_code=200,
-                headers={"mcp-session-id": "sid-abc",
-                         "content-type": "application/json"},
-                payload={"jsonrpc": "2.0", "id": 1, "result": {}},
-            )
-        if method == "notifications/initialized":
-            return _FakeMcpResponse(status_code=500, headers={}, text="boom")
-        return _FakeMcpResponse(
-            status_code=400, headers={},
-            text='{"error":{"message":"Missing session ID"}}',
-        )
-
-    install_fake_httpx(_post, delete=_recording_delete(deleted))
-
-    with pytest.raises(RuntimeError, match="HTTP 500") as excinfo:
-        ct.post_mcp_envelope("http://localhost:8103/mcp", _ESCALATE_ENVELOPE)
-
-    assert "failed at notifications/initialized" in str(excinfo.value)
-    assert _methods(recorded) == [
-        "tools/call", "initialize", "notifications/initialized",
-    ]
-    # The session existed by then, so it is released on the failure path too.
-    assert [(kw.get("headers") or {}).get("mcp-session-id") for _u, kw in deleted] == [
-        "sid-abc"
-    ]
-
-
-def test_post_mcp_envelope_raises_when_the_retry_still_fails(install_fake_httpx):
-    """A 400 that was never about the session: the retry fails the same way,
-    and the message must say so rather than blame the handshake."""
-    recorded = []
-    deleted = []
-
-    def _post(url, **kwargs):
-        recorded.append((url, kwargs))
-        envelope = kwargs.get("json") or {}
-        if envelope.get("method") == "initialize":
-            return _FakeMcpResponse(
-                status_code=200,
-                headers={"mcp-session-id": "sid-abc",
-                         "content-type": "application/json"},
-                payload={"jsonrpc": "2.0", "id": 1, "result": {}},
-            )
-        if envelope.get("method") == "notifications/initialized":
-            return _FakeMcpResponse(status_code=202, headers={}, text="")
-        return _FakeMcpResponse(
-            status_code=400, headers={},
-            text='{"error":{"message":"task_id must be a non-empty string"}}',
-        )
-
-    install_fake_httpx(_post, delete=_recording_delete(deleted))
-
-    with pytest.raises(RuntimeError, match="still rejected the envelope") as excinfo:
-        ct.post_mcp_envelope("http://localhost:8103/mcp", _ESCALATE_ENVELOPE)
-
-    assert "task_id must be a non-empty string" in str(excinfo.value)
-    # Exactly ONE retry -- never a loop.
-    assert _methods(recorded).count("tools/call") == 2
-    assert len(deleted) == 1
-
-
-def test_post_mcp_envelope_never_lets_a_failing_session_delete_propagate(
-    install_fake_httpx
-):
-    """Session tidy-up is best-effort by design: the envelope has ALREADY been
-    delivered by the time the DELETE runs, so a failure to release the session
-    must never turn a landed escalation into a reported failure."""
-    recorded = []
-
-    def _exploding_delete(url, **kwargs):
-        raise OSError("[Errno 111] Connection refused")
-
-    install_fake_httpx(_stateful_mcp_post(recorded), delete=_exploding_delete)
-
-    assert ct.post_mcp_tool_call(
-        "http://localhost:8103/mcp", "escalate_info", {"summary": "s"},
-    ) == {"id": "esc-42"}

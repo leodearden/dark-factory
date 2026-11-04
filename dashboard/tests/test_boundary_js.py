@@ -39,12 +39,12 @@ from _boundary_payloads import (
     ragged_b,
     ragged_day,
 )
+from _dashboard_helpers import node_path
 from _lock_chip_matrix import (
     CELL_MATRIX,
     heatmap_cell_and_chip,
     heatmap_module,
     heatmap_row,
-    node_path,
 )
 from shared.task_statuses import TaskStatus
 
@@ -129,6 +129,7 @@ def test_sketch_2_an_unmeasured_census_is_unknown_and_says_why(served_bodies):
     assert census['value'] is None and census['as_of'] is None
     assert (census['reason'] or '').strip(), 'an unknown census must say why'
     assert body['TASKS_COUNT_UNKNOWN_PROJECTS'] == ['dark-factory']
+    assert body['TASKS_COUNT_STALE_PROJECTS'] == [], 'no value, so not a stale one'
     assert _census(body, 'reify')['state'] == 'fresh', 'the healthy project stays measured'
 
 
@@ -141,6 +142,10 @@ def test_sketch_3_a_failed_refresh_serves_the_last_good_census_as_stale(served_b
     assert _served_at(body) - datetime.fromisoformat(census['as_of']) == timedelta(hours=3)
     assert 'ReadTimeout' in census['reason'], census['reason']
     assert census['value']['total'] == 5459, 'the stale value is the last good one'
+    assert body['TASKS_COUNT_STALE_PROJECTS'] == ['dark-factory']
+    assert body['TASKS_COUNT_UNKNOWN_PROJECTS'] == [], (
+        'a census serving its last good value is not an unknown count'
+    )
 
 
 def test_sketch_4_every_root_census_partitions_its_total(served_bodies):
@@ -176,6 +181,10 @@ def test_sketch_13_a_transient_failure_ages_the_census_then_recovers(served_bodi
     assert aged['as_of'] == measured['as_of'], 'the stale census is the measured one, at its instant'
     assert recovered['state'] == 'fresh', recovered
     assert datetime.fromisoformat(recovered['as_of']) == _served_at(after)
+    assert [
+        (body['TASKS_COUNT_UNKNOWN_PROJECTS'], body['TASKS_COUNT_STALE_PROJECTS'])
+        for body in (before, during, after)
+    ] == [([], []), ([], ['dark-factory']), ([], [])]
 
 
 def test_sketch_6_the_sampler_persists_the_census_the_route_serves(served_bodies):
@@ -252,9 +261,14 @@ def test_sketch_9_a_window_counts_its_own_merges_and_each_attempt_once(served_bo
     in_window = [attempt for attempt in MERGE_ATTEMPTS if attempt.age <= span]
 
     assert body['WINDOW']['served'] == window
-    assert block['recent_total'] == len(block['recent']) == len(in_window)
-    latency = block['latency']
-    assert sum(block['outcomes']['values']) == latency['with_duration'] + latency['without_duration']
+    assert block['recent_total']['state'] == 'fresh', 'a readable runs.db window total is measured'
+    assert block['speculative']['state'] == 'fresh', 'a readable runs.db speculative count is measured'
+    assert block['recent_total']['value'] == len(block['recent']) == len(in_window)
+    assert block['attempts']['state'] == 'fresh', 'a readable runs.db attempt window is measured'
+    assert block['depth']['state'] == 'fresh', 'a readable runs.db depth series is measured'
+    attempts = block['attempts']['value']
+    latency = attempts['latency']
+    assert sum(attempts['outcomes']['values']) == latency['with_duration'] + latency['without_duration']
     assert latency['with_duration'] == sum(1 for attempt in in_window if attempt.duration_ms)
     assert latency['without_duration'] == sum(1 for attempt in in_window if not attempt.duration_ms)
 
@@ -262,8 +276,21 @@ def test_sketch_9_a_window_counts_its_own_merges_and_each_attempt_once(served_bo
 def test_sketch_9_the_two_windows_hold_different_merges(served_bodies):
     week, day = (served_bodies[f'merge_{window}']['MERGE_QUEUE']['dark-factory'] for window in ('7d', '24h'))
 
-    assert week['recent_total'] != day['recent_total']
+    assert week['recent_total']['value'] != day['recent_total']['value']
     assert len(week['recent']) != len(day['recent'])
+
+
+@pytest.mark.parametrize('window, bucket_minutes', [('24h', 15), ('7d', 60)])
+def test_the_served_depth_names_the_width_its_labels_are_spaced_at(served_bodies, window, bucket_minutes):
+    depth = served_bodies[f'merge_{window}']['MERGE_QUEUE']['dark-factory']['depth']['value']
+    starts = [datetime.fromisoformat(label) for label in depth['labels']]
+
+    assert depth['bucket_minutes'] == bucket_minutes
+    assert len(starts) >= 2, (
+        "the fixture's merges at 20h and 70h before T0 leave at least two buckets after the leading-zero trim"
+    )
+    gaps = {later - earlier for earlier, later in zip(starts, starts[1:], strict=False)}
+    assert gaps == {timedelta(minutes=bucket_minutes)}
 
 
 @pytest.mark.parametrize('generation', sorted(CORPUS_TTL_GENERATIONS))
@@ -288,12 +315,24 @@ def test_sketch_10_each_ttl_generation_is_its_own_walk(served_bodies):
 
 
 def test_sketch_11_every_journal_row_is_counted_once_in_the_totals(served_bodies):
-    totals = served_bodies['memory_ops']['MEMORY_OPS']['totals']
+    served = served_bodies['memory_ops']['MEMORY_OPS']['totals']
+    assert served['state'] == 'fresh', served
+    totals = served['value']
     kinds = [kind for _operation, kind in MEMORY_OPS]
 
     assert totals['reads'] + totals['writes'] + totals['other'] == totals['total'] == len(MEMORY_OPS)
     assert (totals['reads'], totals['writes']) == (kinds.count('read'), kinds.count('write'))
     assert totals['other'] == 1, 'the kind outside read and write is counted, as other'
+
+
+def test_sketch_11_a_missing_journal_is_unknown_not_a_quiet_day(served_bodies):
+    ops = served_bodies['memory_ops_missing']['MEMORY_OPS']
+
+    for reading in ('totals', 'newest_hour_total'):
+        assert ops[reading]['state'] == 'unknown', ops[reading]
+        assert (ops[reading]['reason'] or '').strip(), f'an unknown {reading} must say why'
+    for series in ('labels', 'reads', 'writes', 'other', 'total', 'by_operation'):
+        assert ops[series] == [], f'a hole serves no {series} to draw as a flat zero line'
 
 
 def test_sketch_12_an_offline_scheduler_is_named_while_its_tasks_are_still_served(served_bodies):

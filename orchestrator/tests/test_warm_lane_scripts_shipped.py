@@ -23,6 +23,8 @@ ship four scripts that cannot execute:
   it now needs BOTH libs to run at all.  Pass-1 reclaimability is decided from
   the durable ``.lane-state`` record, and a silently-absent reader would
   degrade reclaim back to the ``FREE ≈ flock-free`` approximation γ removed.
+  Task 7859 added a THIRD, ``$SCRIPT_DIR/lib_lane_seed.sh`` (the Pass-1
+  skip-unchanged predicate, dark-factory-native), behind the same guard.
 * ``warm-lane-audit.sh`` sources TWO: ``$SCRIPT_DIR/lib_portable.sh``, and —
   since dark-factory task 3074 (leaf β) — ``$SCRIPT_DIR/lib_lane_state.sh``.
   Both now sit behind the same ``exit 2`` guard shape copied from
@@ -92,6 +94,9 @@ SOURCED_LIBS = (
     # than re-inlined into its one consumer.  Here for the same reason as the
     # entry above: exists / owner-execute-bit / `bash -n` coverage for free.
     'lib_task_citation.sh',
+    # dark-factory-native, like lib_lane_state.sh: warm-lane-gc.sh's Pass-1
+    # skip-unchanged predicate (task 7859, README "Delta 14").
+    'lib_lane_seed.sh',
 )
 
 ALL_SHIPPED = RELOCATED_SCRIPTS + SOURCED_LIBS
@@ -171,6 +176,8 @@ class TestSiblingLibsTravelledWithTheScripts:
         # ``source``; dark-factory diverges (README "Delta 11") for the reason
         # task 3370 gave for ``lib_portable.sh``.
         'lib_task_citation.sh not found next to',
+        # warm-lane-gc.sh's third sibling (task 7859), the same template again.
+        'lib_lane_seed.sh not found next to',
     )
 
     @pytest.mark.parametrize(
