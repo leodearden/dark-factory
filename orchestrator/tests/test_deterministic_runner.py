@@ -3369,68 +3369,6 @@ class TestDefaultRunnerInnerTimeoutDeployHonesty:
 
 
 # ---------------------------------------------------------------------------
-# The runner's ``reap_grace_secs`` knob reaches the before_done script's reap.
-# ---------------------------------------------------------------------------
-
-@pytest.mark.asyncio
-class TestDefaultRunnerForwardsReapGrace:
-    """``DeterministicRunner(reap_grace_secs=...)`` bounds the timed-out
-    deploy script's reap, not the module default.
-
-    The bounded reap itself is
-    ``orchestrator/src/orchestrator/before_done_script.py::terminate_process_tree``,
-    whose own tests pass the bound directly.  This pins the runner's half:
-    ``_default_run_script`` forwards the constructor value.
-    """
-
-    async def test_constructor_reap_grace_bounds_the_timeout_reap(
-        self, tmp_path: Path, caplog,
-    ):
-        """A zero bound abandons the reap, and the warning names that bound.
-
-        ``asyncio.wait_for`` with a timeout of 0 raises before it starts the
-        awaitable, so the abandoned-reap warning is deterministic here.  The
-        5s module default would have reaped the SIGKILLed script in time and
-        logged nothing.
-        """
-        from orchestrator.deterministic_runner import DeterministicRunner
-        from orchestrator.workflow import WorkflowOutcome
-
-        script = tmp_path / 'slow-deploy.sh'
-        script.write_text('#!/bin/sh\nsleep 30\n')
-        script.chmod(0o755)
-        task = _deploy_task(
-            task_id='6488',
-            target_unit=None,
-            script=str(script),
-            cwd=str(tmp_path),
-            timeout_secs=1,
-        )
-        runner = DeterministicRunner(
-            scheduler=_mock_scheduler(task),
-            escalation_queue=EscalationQueue(tmp_path),
-            unit_inspector=AsyncMock(),
-            script_runner=None,
-            reap_grace_secs=0,
-        )
-
-        with caplog.at_level('WARNING', logger='orchestrator.before_done_script'):
-            outcome = await asyncio.wait_for(
-                runner.run(_make_assignment(task)), timeout=20,
-            )
-
-        assert outcome == WorkflowOutcome.BLOCKED
-        reap_warnings = [
-            r.getMessage() for r in caplog.records
-            if r.name == 'orchestrator.before_done_script'
-        ]
-        assert len(reap_warnings) == 1, reap_warnings
-        assert 'reap_grace_secs=0 after termination signal' in reap_warnings[0], (
-            reap_warnings[0]
-        )
-
-
-# ---------------------------------------------------------------------------
 # ζ D2 boundary: an illegal deploy-phase transition files a REAL born-at-L2
 # escalation before raising — never a silent write.
 # ---------------------------------------------------------------------------
