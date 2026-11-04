@@ -330,9 +330,33 @@ serialization by real dependencies. All leaves `task_kind=normal` unless stated.
 | δ2 | Sitting skill | `skills/sitting/SKILL.md` (extracted from `skills/escalation-watcher/SKILL.md`: seed, docket, always-ask, H1–H6, apply order via `apply`/`audit`, spawn discuss/carry threads sequentially), `skills/spawn/SKILL.md` handoff section | a sitting on a fixture docket applies two answers and one audit through the verbs with zero direct `resolve_issue` calls (transcript check in the skill's own test harness, as `skills/_shared` fragments are tested today); the `escalation-watcher` skill's apply section becomes a pointer | δ1 |
 | ε | Criteria-triggered sitting: evaluator, presence probe, lanes, lease, cooldown, timer | `scripts/sitting/sitting_trigger.py`, `scripts/sitting-trigger.{service,timer}`, `skills/spawn/spawn-claude.sh` (wm fallback order when `CLAUDE_SPAWN_BACKEND=auto` and no tty), tests, OPERATIONS.md §12 | rows 15–18 as tests with a fake T3 store and a fake spawn; live: `systemctl --user list-timers` shows `sitting-trigger.timer`; the docket's trigger-state line names the last evaluator run | δ2 |
 | ζ | Q6 detector rules in the L1 skill, tier-10 move, recon-queue precheck note | `skills/escalation-watcher-auto/SKILL.md`, `tests/skills/*` | rows 19, 20 as skill tests on fixture L1s (no promote for a pending-L2-pinned veto L1; strand with no waiting workflow handled at L1) | 7716 |
-| η | Flip gate: shadow agreement ≥ 95% at n ≥ 10 per class → Leo flips `live`; new classes also need 3346 | human gate (`task_kind=deterministic`, `always_escalates=True`, predicate: `shadow_ruling.agreement_report` over `data/escalations` for every queue reports each moved class at n ≥ 10) | the gate's L2 lists per class n, agreement, and the proposed state; Leo answers per class; the state files change | α, β, γ, δ1, 3346 (new classes) |
-| θ | Retire residents: `escalation-watcher` skill becomes a pointer to `sitting` + executor; delete `recon-watch/run.sh`; ARCHITECTURE.md §6, OPERATIONS.md, CLAUDE.md watcher mentions; `lease-reap` of dead `watcher-*` leases | skills, docs, `orchestrator/src/orchestrator/session_registry.py` (none: leases reaped by CLI) | `git grep -l "escalation-watcher" skills docs OPERATIONS.md ARCHITECTURE.md` lists only the pointer and history; `ls ~/.claude/fleet/leases` has no `watcher-*` file after reap; the 14-day Q6 check (dated gate) flips `streak_escalation_enabled` in df and reify yamls | η |
-| ι | Observation, 7 days after η: producers wrote in production | deterministic gate: `runs.db` has executor `rotation_exited` rows with ≥ 1 close in every active project; ≥ 1 DecisionRecord with `policy_class`; the return brief rendered ≥ 1 `audit N`; no `watcher-*` lease claimed; the trigger evaluator ran within the last hour | the gate's own predicate | η, θ |
+| η1 | Flip gate for the moved classes (decision 7's adopted list): shadow agreement ≥ 95% at n ≥ 10 per class → Leo flips `live` | human gate (`task_kind=deterministic`, `always_escalates=True`, `execution_class=decision`, delayed milestone 7 d after its deps so shadow stamps accrue); the evidence is `shadow_ruling.agreement_report` over every queue, rendered by `return_brief.py::_agreement_lines` | the gate's L2 lists per class n, agreement, and the proposed state; Leo answers per class; δ1's `policy-state` verb writes the state files | α, β, γ, δ1 |
+| η2 | Flip gate for the new delegations (decision 7's shadow-start list) | as η1 | as η1, for the new classes | η1, 3346 |
+| θ1 | Retire residents: `escalation-watcher` skill becomes a pointer to `sitting` + executor; delete `recon-watch/run.sh` and `scripts/recon-watch.sh`; ARCHITECTURE.md §6, OPERATIONS.md, CLAUDE.md watcher mentions; `lease-reap` of dead `watcher-*` leases | skills, docs (leases reaped by the `session_registry.py lease-reap` CLI; `~/.claude/fleet/` is in the agent write-set) | `git grep -l "escalation-watcher" skills docs OPERATIONS.md ARCHITECTURE.md` lists only the pointer and history; `ls ~/.claude/fleet/leases` has no `watcher-*` file after reap | η1, δ2, ε |
+| θ2 | The 14-day Q6 check: no veto-streak or strand-sweep L2 that ζ's rules should have prevented, in df and reify; if clean, `streak_escalation_enabled: true` in df's yaml | `dark-factory-orchestrator.yaml`, PRD §10 record | a dated record in §10 with the count per project and the rule; df's flag flipped only on a clean verdict | ζ, β (same yaml) |
+| λ | reify half of θ2: flip reify's `streak_escalation_enabled` when θ2's record says reify is clean | reify `dark-factory-orchestrator.yaml` (a reify task, external dep on θ2) | reify's yaml reads `true` on reify main, or the task closes citing θ2's not-clean verdict | θ2 (cross-project) |
+| κ | Deploy gate: install and enable `sitting-trigger.timer` on the host | host only (`~/.config/systemd/user/` is outside the agent write-set; `task_kind=deterministic`, `always_escalates=True`, `execution_class=operational`) | `systemctl --user list-timers` lists `sitting-trigger.timer`; the docket's trigger-state line names a run within 5 min | ε |
+| ι | Observation, 7 days after η1 and θ1: producers wrote in production | `task_kind=normal`, delayed milestone 7 d, read-only measurement appended to §10 (the startup-hardening η shape; no predicate script exists to bind a deterministic gate to) | §10 records: `runs.db` executor `rotation_exited` rows with ≥ 1 close in every active project; ≥ 1 DecisionRecord with `policy_class` and zero executor closes lacking one; the return brief rendered ≥ 1 `audit N`; no `watcher-*` lease claimed; the trigger evaluator ran within the last hour; a filed follow-up for every failure | η1, θ1, κ |
+
+**Decompose amendments (2026-11-04, `/prd` decompose session prd-df-3475198).** No design
+decision is re-opened; these make the plan executable as filed.
+
+- η split into η1/η2 so that 3346 gates only the new-class flips (decision 7). Classes below
+  n = 10 when η1 or η2 fires stay `shadow` and are flipped later at any sitting with the same
+  verb once the brief's agreement block shows the bar.
+- The `shadow → live` write had no producer in §5 (the listed writers are the audit flip, the
+  storm escape and `reload_config`); δ1 owns it as a `policy-state` verb that refuses any
+  transition outside `off → shadow → live → shadow`.
+- θ split into θ1 (retirement, after η1) and θ2 (the dated Q6 check, after ζ), because they
+  hang off different chains; λ carries the reify yaml, which no df worktree can write.
+- κ added: ε's live timer signal needs a host install no agent can perform.
+- γ, δ2 and ζ: no harness runs an LLM over a skill in tests, so their "dry rotation" and
+  "transcript" signals are rewritten as deterministic contract tests over the skill text and
+  the fixture fake server's accepted call shapes; the behavioural proof is η's shadow agreement,
+  θ2's count and ι. New skill tests live in `tests/scripts/` (`tests/skills/` is not under any
+  `test_command`).
+- Same-file serialization: δ2 after γ (`skills/escalation-watcher/SKILL.md`), ε after β
+  (OPERATIONS.md), θ1 after ε, θ2 after β (`dark-factory-orchestrator.yaml`).
 
 Companion edits inside the leaves above (no separate tasks): `docs/escalation-standing-policy.md`
 gains the table's classes and the waiver (α); the preparer tasks 6214/8253 are referenced, not
@@ -385,3 +409,7 @@ executor close in window" and ι is the production proof (δ1, ι). No waiver ne
    `apply.py` sharing `payloads.py`; decide in δ1.
 5. **Whether `claim_policy_class` is a new tool or a `stamp_triage` extension.** Suggested: new
    tool, since `stamp_triage` replaces the note and must stay ungated; decide in α.
+
+## 10. Observation record
+
+θ2 (the 14-day Q6 check) and ι (the production observation) append dated records here.
