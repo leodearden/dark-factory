@@ -10573,9 +10573,9 @@ class SpeculativeMergeWorker:
 
         The single shared chain-intact predicate behind all three enforcement
         points (dispatch re-check, FAIL adoption, PASS adoption) — factored here
-        so the checks can never silently drift apart, mirroring how
-        :meth:`_frozen_base_chain` is the one shared walk behind the two §5.3
-        report surfaces.
+        so the checks can never silently drift apart.  It is also what
+        :meth:`check_frozen_prefix_invariant` reports, so the INV-3 report and
+        its enforcement are one mechanism (task 5302).
 
         A verdict is adoptable iff, at adoption time, the item's verified tree
         still equals ``current-main ∘ S`` for an ordered sequence S of
@@ -10606,112 +10606,87 @@ class SpeculativeMergeWorker:
             return base
         return None
 
-    def _frozen_base_chain(self, main_sha: str) -> Iterator[tuple[str, str, str, bool]]:
-        """Walk the frozen prefix's expected-base chain, yielding (rid, expected, actual, recovery).
+    def _frozen_base_chain(self) -> Iterator[tuple[RealMergeItem, str | None]]:
+        """Walk the frozen prefix's real merges as (item, predecessor_commit), oldest first.
 
-        Shared chain-walk consumed by BOTH :meth:`check_frozen_prefix_invariant`
-        and :meth:`_verify_base_frozen_tip_violations` — the two checks compare
-        the exact same per-entry chained expected base (head expected =
-        main_sha; each subsequent entry's expected = predecessor's
-        merge_commit) and differ only in how they word a mismatch as a
-        violation string. Factored here so that chain-walk is defined exactly
-        once: if base-chain semantics ever change (e.g. how passthrough /
-        conflict entries advance the chain), both surfaces pick up the fix
-        together instead of silently drifting out of sync.
+        *predecessor_commit* is the previous frozen real merge's merge commit,
+        or None for the head: the head's base is judged by INV-3 alone
+        (:meth:`_chain_dead_link`), never against current main, which may
+        legitimately move under an in-flight verify (PRD §5.3, task 5302).
 
-        Entries with no merge_result/merge_commit (passthrough / conflict)
-        are skipped and do NOT advance the chain — mirrors the dispatch
-        guard's own ``item.merge_result is None or not item.base_sha``
-        exclusion.
+        Entries with no merge commit (passthrough / conflict) are skipped and
+        do NOT advance the chain.  A ``remerge_recovery`` entry still advances
+        it: each entry's merge commit sets its successor's expected base, so
+        dropping one from the WALK would turn a single carved-out break into a
+        cascade of false ones behind it.  The carve-out is applied to violation
+        emission only, by the consumer.
 
-        The fourth tuple element is the entry item's ``remerge_recovery``
-        marker (PRD §5.3 re-merge carve-out).  It is REPORTED here, never
-        acted on: a recovery entry is still walked and still advances the
-        chain, because each entry's ``merge_commit`` sets the expected base
-        for its successors — filtering recovery entries out of the WALK would
-        corrupt the expected base of every entry behind them, turning one
-        carved-out entry into a cascade of false violations.  Each consumer
-        decides what the marker means for its own output.
-
-        Pure/synchronous (no await); never raises on well-formed
-        InflightEntry data.
+        Pure/synchronous (no await).
         """
-        expected_base = main_sha.strip()
+        predecessor: str | None = None
         for entry in self._frozen_inflight_entries():
-            rid = entry.item.request.request_id
-            if not isinstance(entry.item, RealMergeItem):
-                # Not a real merge — nothing to chain; do not advance.
+            item = entry.item
+            if not isinstance(item, RealMergeItem) or not item.merge_result.merge_commit:
                 continue
-            mr = entry.item.merge_result
-            if not mr.merge_commit:
-                # No merge_commit — nothing to chain; do not advance.
-                continue
-            actual_base = entry.item.base_sha.strip() if entry.item.base_sha else ''
-            yield rid, expected_base, actual_base, entry.item.remerge_recovery
-            # Advance expected_base for the next entry regardless of whether
-            # this one matched (or was carved out), so subsequent chain errors
-            # are also surfaced (not shadowed).
-            expected_base = mr.merge_commit.strip()
+            yield item, predecessor
+            predecessor = item.merge_result.merge_commit.strip()
+
+    def _chain_breaks(
+        self, item: RealMergeItem, predecessor: str | None, main_sha: str,
+    ) -> list[str]:
+        """The INV-3 dead link and the successor chain-link break at *item*, if any."""
+        rid = item.request.request_id
+        breaks: list[str] = []
+        dead = self._chain_dead_link(item, main_sha)
+        if dead is not None:
+            breaks.append(
+                f'INV-3 chain broken at {rid}: base {dead!r} is a recorded dead '
+                f'commit, so its verdict will be voided at adoption'
+            )
+        base = item.base_sha.strip() if item.base_sha else ''
+        if predecessor is not None and base != predecessor:
+            annotation = (
+                ' [recovery re-merge (expected): this item came from _remerge '
+                'and targets real main by design — PRD §5.3 carve-out, task '
+                '3206; not structural damage]'
+            ) if item.remerge_recovery else ''
+            breaks.append(
+                f'frozen-prefix base-chain broken at {rid}: '
+                f'expected base {predecessor!r} but item has {base!r}{annotation}'
+            )
+        return breaks
 
     def check_frozen_prefix_invariant(self, main_sha: str) -> list[str]:
-        """Return §5.3 violations as human-readable strings (empty = healthy) (ε=1890).
+        """Return frozen-prefix violations as human-readable strings (empty = healthy) (ε=1890).
 
         λ's integration-gate seam: callers assert violations == [] to gate a
         lane advance, a reorder, or a deploy.
 
         Checks performed:
-          1. Base-chain integrity: for each frozen entry in submission order,
-             expected_base = predecessor's merge_commit (or main_sha for the
-             first entry).  If the entry has a merge_result AND its base_sha
-             does not match expected_base, record a violation naming the rid,
-             expected, and actual base.  Entries with no merge_result
-             (passthrough / conflict) are skipped — they carry no commit.
-             A ``remerge_recovery`` entry is still reported (it really does
-             break the chain) but its violation string is ANNOTATED
-             'recovery re-merge (expected)' so λ/operators can tell it from
-             genuine structural damage — see the in-body note.
-          2. Frozen/suffix disjointness: any rid that appears in BOTH
+          1. INV-3 chain-intact (plans/merge-verdict-integrity-prd.md §1): no
+             frozen real merge is built on a recorded dead commit.  The test is
+             :meth:`_chain_dead_link`, the predicate behind INV-3's three
+             enforcement points, so this report and that enforcement are one
+             mechanism.  Such an entry's chain was re-based out from under its
+             verify, and its verdict will be voided at adoption, so the report
+             is transient.  The head is NOT compared with *main_sha*: a head
+             on an older LANDED main is intact, since the CAS rebase and the
+             gate re-verify own it.
+          2. Successor chain links: each frozen real merge after the head must
+             be based on its predecessor's merge commit.  A
+             ``remerge_recovery`` entry really does break its link, so it is
+             reported, but ANNOTATED 'recovery re-merge (expected)' (PRD §5.3
+             carve-out, task 3206) so it reads apart from structural damage.
+          3. Frozen/suffix disjointness: any rid that appears in BOTH
              frozen_prefix() and unfrozen_suffix() is a structural bug; record
              one violation per duplicate.
-
-        The chain walk itself lives in :meth:`_frozen_base_chain` (shared with
-        :meth:`_verify_base_frozen_tip_violations`); this method only compares
-        expected vs. actual and formats its own violation wording.
 
         Pure/synchronous — reads stored in-memory state, no await.
         """
         violations: list[str] = []
+        for item, predecessor in self._frozen_base_chain():
+            violations.extend(self._chain_breaks(item, predecessor, main_sha))
 
-        # ── 1. Base-chain integrity ───────────────────────────────────────────
-        # NOTE (task 3206): the §5.3 re-merge carve-out is deliberately NOT
-        # applied here.  This check asks "is the frozen prefix's base chain
-        # structurally intact?", which is a different question from §5.3's
-        # "was this verify permitted to start against this base?" — a recovery
-        # re-merge genuinely does break the chain, and hiding that would blind
-        # λ's integration gate to real structural damage.
-        #
-        # It is still ANNOTATED, though: a recovery re-merge anywhere but the
-        # head of the frozen prefix trips this check by construction (its base
-        # is real main while its chained expected base is its predecessor's
-        # merge_commit), so without the annotation an operator reading
-        # snapshot()['two_layer_invariants'] cannot tell that entry apart from
-        # genuine structural damage — and the §5.3 carve-out's whole point was
-        # to stop crying wolf about exactly those entries.  Suppressing them
-        # is not an option (see above); labelling them is.
-        for rid, expected_base, actual_base, recovery in self._frozen_base_chain(main_sha):
-            if actual_base != expected_base:
-                annotation = (
-                    ' [recovery re-merge (expected): this item came from _remerge '
-                    'and targets real main by design — PRD §5.3 carve-out, task '
-                    '3206; not structural damage]'
-                ) if recovery else ''
-                violations.append(
-                    f'frozen-prefix base-chain broken at {rid}: '
-                    f'expected base {expected_base!r} but item has {actual_base!r}'
-                    f'{annotation}'
-                )
-
-        # ── 2. Frozen/suffix disjointness ────────────────────────────────────
         frozen_set = set(self.frozen_prefix())
         suffix_set = set(self.unfrozen_suffix())
         for rid in sorted(frozen_set & suffix_set):
@@ -10723,13 +10698,14 @@ class SpeculativeMergeWorker:
         return violations
 
     def two_layer_invariants(self, main_sha: str) -> list[str]:
-        """Return ALL §5.3 two-layer violations as human-readable strings (λ=1895).
+        """Return the two-layer pipeline's invariant violations as strings (λ=1895).
 
-        Empty list → all §5.3 invariants hold.  Non-empty → each string names
+        Empty list → every invariant holds.  Non-empty → each string names
         the offending ``request_id`` (or pair) and the violated invariant.
 
-        Composes :meth:`check_frozen_prefix_invariant` (base-chain integrity +
-        frozen∩suffix disjointness) with three additional checks:
+        Composes :meth:`check_frozen_prefix_invariant` (INV-3 chain-intact
+        over the frozen prefix, successor chain links, frozen∩suffix
+        disjointness) with two graph-consistency checks:
 
         (i)  **textual⊆footprint contract**: every edge in
              ``suffix_conflict_graph.textual_edges`` must also be in
@@ -10744,46 +10720,33 @@ class SpeculativeMergeWorker:
              ``conflicts_with_main`` but absent from nodes is a δ=1889
              graph-consistency violation naming the stale rid.
 
-        (iii) **verify-base ⊆ frozen-tip** (task 1999 / MQ-invariants ξ, I5):
-             snapshot-granularity promotion of the dispatch-time
-             :meth:`_verify_base_divergence_at_dispatch` log-only guard — see
-             :meth:`_verify_base_frozen_tip_violations` for the per-entry
-             chained-base check.  Distinctly worded from
-             :meth:`check_frozen_prefix_invariant`'s base-chain violation so
-             it stands as its own named verify-frontier assertion target,
-             even though it mirrors the same chain math.
+        The dispatch-time verify-base rule is NOT reported here.  It is a
+        detector, judged once at dispatch, whose records are
+        ``snapshot()['verify_base_divergences']`` (PRD §5.3, task 5302):
+        re-judging it here against a later main made every move of main under
+        an in-flight verify read as a violation.
 
         Pure / synchronous (no await).  Fail-safe: never raises; any
         unexpected exception inside a sub-check is caught and surfaced as a
         violation string so the caller always receives a ``list[str]``.
 
         Mirrors :meth:`check_frozen_prefix_invariant`'s ``-> list[str]``
-        idiom and gives the operator dashboard a single §5.3 health surface
-        (PRD §1).  Used by λ's integration test and the 'two_layer_invariants'
-        snapshot key.
+        idiom and gives the operator dashboard a single two-layer health
+        surface (PRD §1).  Used by λ's integration test and the
+        'two_layer_invariants' snapshot key.
         """
         try:
-            # ── inherited checks (base-chain + frozen∩suffix disjointness) ────
+            # ── inherited checks (INV-3 chain + frozen∩suffix disjointness) ───
             # Skip when main_sha is unavailable ('unknown' sentinel from
-            # snapshot()) to avoid spurious base-chain violations at startup
-            # or after a get_main_sha() failure.  Graph-consistency checks
-            # (i)+(ii) below still run — they don't need main_sha.
+            # snapshot()): _chain_dead_link's base == main short-circuit needs
+            # a real main.  Graph-consistency checks (i)+(ii) below still run
+            # — they don't need main_sha.
             if main_sha and main_sha != 'unknown':
                 violations: list[str] = self.check_frozen_prefix_invariant(main_sha)
             else:
                 violations = []
         except Exception as exc:  # pragma: no cover — defensive
             violations = [f'two_layer_invariants: check_frozen_prefix_invariant raised: {exc}']
-
-        # ── (iii) verify-base ⊆ frozen-tip ───────────────────────────────────
-        # Same main_sha-availability gate as the inherited base-chain check
-        # above; own try/except so a failure here never shadows (or is
-        # shadowed by) check_frozen_prefix_invariant's result.
-        if main_sha and main_sha != 'unknown':
-            try:
-                violations.extend(self._verify_base_frozen_tip_violations(main_sha))
-            except Exception as exc:  # pragma: no cover — defensive
-                violations.append(f'two_layer_invariants: verify-base check raised: {exc}')
 
         graph = self._intake.suffix_conflict_graph
 
@@ -10813,53 +10776,6 @@ class SpeculativeMergeWorker:
                 f'two_layer_invariants: conflicts_with_main⊆nodes check raised: {exc}'
             )
 
-        return violations
-
-    def _verify_base_frozen_tip_violations(self, main_sha: str) -> list[str]:
-        """Return verify-base/frozen-tip violations as human-readable strings (task 1999 I5).
-
-        Snapshot-granularity promotion of :meth:`_verify_base_divergence_at_dispatch`
-        (the ε=1890 log-only dispatch guard): every currently-frozen entry's
-        recorded ``base_sha`` must equal the frozen-tip base it was dispatched
-        against — the head entry's expected base is *main_sha*, and each
-        subsequent entry's expected base is its predecessor's ``merge_commit``.
-
-        Walks the exact same chain as :meth:`check_frozen_prefix_invariant`,
-        via the shared :meth:`_frozen_base_chain` generator (per-entry
-        chained expected base, NOT a naive "every entry == newest tip"
-        comparison, which would falsely flag a healthy multi-entry frozen
-        prefix whose head is based on main rather than the stack's tip) —
-        the two checks overlap mathematically but are kept as
-        distinctly-worded, separately-named surfaces: this one parallels the
-        retained ε=1890 dispatch-time WARN and gives it a dedicated
-        verify-frontier assertion target in the snapshot health surface.
-        Because both surfaces now build from the same generator, a future
-        change to the chain-walk itself (e.g. how passthrough entries
-        advance the chain) cannot make the two surfaces silently disagree.
-
-        §5.3 RE-MERGE CARVE-OUT (PRD §5.3): entries whose item carries
-        ``remerge_recovery=True`` are exempt — they legitimately target real
-        main, so a mismatch is correct by construction.  Applied to violation
-        EMISSION only, never by filtering :meth:`_frozen_base_chain` (see that
-        method), and applied identically by
-        :meth:`_verify_base_divergence_at_dispatch` at dispatch time: both
-        §5.3 surfaces carve out together or they silently disagree, precisely
-        the failure the shared-generator paragraph above exists to prevent.
-
-        Pure/synchronous (no await). Fail-safe: never raises — callers
-        (:meth:`two_layer_invariants`) wrap this in their own try/except, but
-        the loop body itself cannot raise on well-formed InflightEntry data.
-        """
-        violations: list[str] = []
-        for rid, expected_base, actual_base, recovery in self._frozen_base_chain(main_sha):
-            if recovery:
-                continue  # §5.3 re-merge carve-out (task 3206) — emission only
-            if actual_base != expected_base:
-                violations.append(
-                    f'verify-base⊄frozen-tip at {rid!r}: dispatched for real-verify '
-                    f'with base {actual_base!r} but expected frozen-tip base '
-                    f'{expected_base!r} (ε=1890 §5.3 verify-base/frozen-tip rule)'
-                )
         return violations
 
     # task 2359: variable-depth speculative verify placement -- stateful
@@ -16302,9 +16218,9 @@ class SpeculativeMergeWorker:
         rather than by N keyword arguments an N+1'th path could forget.
 
         §5.3 RE-MERGE CARVE-OUT: items returned here are exempt from the
-        verify-base⊄frozen-tip guard at BOTH surfaces
-        (:meth:`_verify_base_divergence_at_dispatch`,
-        :meth:`_verify_base_frozen_tip_violations`).  ``base_sha=actual_main``
+        dispatch-time verify-base detector
+        (:meth:`_verify_base_divergence_at_dispatch`), and their chain-link
+        break is annotated in :meth:`check_frozen_prefix_invariant`.  ``base_sha=actual_main``
         and ``speculative=False`` in the body are ADJUDICATED and must NOT be
         changed to stack on ``frozen_prefix_tip()``.  PRD §5.3 is the canonical
         write-up — grounds, five consumer sites, and measured evidence.
