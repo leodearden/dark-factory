@@ -340,6 +340,12 @@ Flipping an existing row live for the **executor** is a switch-file write, not
 an `authority.py` edit. Adding a row, or extending a class to the
 **auto-watcher** arm, is the case that needs one.
 
+Renaming or removing a row leaves its old slug in every switch file that names
+it. On such a queue the executor is refused `policy_state_unreadable` until the
+next `set_class_state` there drops the stale slug. The renamed class then comes
+back at its row's initial `shadow` switch, so a live class must be flipped live
+again under its new name.
+
 Which arm you are extending decides whether `authority.py` is in your diff.
 
 ## The integrity rule

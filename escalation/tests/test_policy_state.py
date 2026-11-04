@@ -105,6 +105,37 @@ class TestSetClassState:
         with pytest.raises(ValueError, match='no_such_class'):
             set_class_state(tmp_path, 'no_such_class', ClassSwitch.LIVE)
 
+    def test_a_move_drops_a_slug_no_row_has_and_keeps_the_rest(self, tmp_path: Path) -> None:
+        """A renamed or removed row's slug must not leave the repair verb unusable."""
+        _write_state(
+            tmp_path, json.dumps({'classes': {'retired_class': 'live', 'found_on_main': 'live'}}),
+        )
+
+        previous = set_class_state(tmp_path, 'landing_provenance', ClassSwitch.LIVE)
+
+        assert previous is ClassSwitch.SHADOW
+        expected = _initial_states() | {
+            'found_on_main': ClassSwitch.LIVE, 'landing_provenance': ClassSwitch.LIVE,
+        }
+        assert dict(load_class_states(tmp_path)) == expected
+
+    def test_setting_the_current_state_on_a_stale_file_repairs_it(self, tmp_path: Path) -> None:
+        _write_state(tmp_path, json.dumps({'classes': {'retired_class': 'not-a-switch'}}))
+
+        previous = set_class_state(tmp_path, 'landing_provenance', ClassSwitch.SHADOW)
+
+        assert previous is ClassSwitch.SHADOW
+        assert dict(load_class_states(tmp_path)) == _initial_states()
+
+    def test_an_illegal_move_on_a_stale_file_leaves_it_unchanged(self, tmp_path: Path) -> None:
+        path = _write_state(tmp_path, json.dumps({'classes': {'retired_class': 'live'}}))
+        before = path.read_bytes()
+
+        with pytest.raises(IllegalClassTransition):
+            set_class_state(tmp_path, 'landing_provenance', ClassSwitch.OFF)
+
+        assert path.read_bytes() == before
+
 
 def test_the_queue_never_reads_the_state_file_as_an_escalation(tmp_path: Path) -> None:
     queue = EscalationQueue(tmp_path / 'esc')
