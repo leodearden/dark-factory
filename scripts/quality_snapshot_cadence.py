@@ -101,9 +101,8 @@ def _predicted_params(python: Path) -> dict[str, Any]:
     return params
 
 
-@contextlib.contextmanager
-def _pinned(root: Path, sha: str, home: Path) -> Iterator[Path]:
-    """A detached worktree of *sha* in a fresh directory under *home*, removed on exit."""
+def _added_worktree(root: Path, sha: str, home: Path) -> Path:
+    """A detached worktree of *sha* in a fresh directory under *home*; the directory goes if git refuses."""
     home.mkdir(parents=True, exist_ok=True)
     tree = Path(tempfile.mkdtemp(prefix=f'{sha[:12]}-', dir=home))
     try:
@@ -111,10 +110,27 @@ def _pinned(root: Path, sha: str, home: Path) -> Iterator[Path]:
     except source_measures.MetricsError:
         tree.rmdir()
         raise
+    return tree
+
+
+def _remove_worktree(root: Path, tree: Path, *, after: BaseException | None) -> None:
+    """Remove *tree*; a failure names the tree left behind, chained to the failure *after* which it ran."""
+    try:
+        _git(root, 'worktree', 'remove', '--force', str(tree))
+    except source_measures.MetricsError as removal:
+        raise removal from after
+
+
+@contextlib.contextmanager
+def _pinned(root: Path, sha: str, home: Path) -> Iterator[Path]:
+    """A detached worktree of *sha* under *home*, removed on exit however the body ends."""
+    tree = _added_worktree(root, sha, home)
     try:
         yield tree
-    finally:
-        _git(root, 'worktree', 'remove', '--force', str(tree))
+    except BaseException as failure:
+        _remove_worktree(root, tree, after=failure)
+        raise
+    _remove_worktree(root, tree, after=None)
 
 
 def _measure(python: Path, sha: str, tree: Path, out: Path, run_id: str) -> None:

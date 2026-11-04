@@ -224,6 +224,14 @@ _MISPREDICTS = '''if '--params' in sys.argv:
     sys.exit(0)'''
 
 
+#: The instrument failing after locking its pinned tree, so that removing the tree fails too.
+_LOCKS_AND_FAILS = '''if '--run-id' in sys.argv:
+    tree = sys.argv[sys.argv.index('--root') + 1]
+    subprocess.run(['git', '-C', tree, 'worktree', 'lock', tree], check=True)
+    print('shim: the measurement failed', file=sys.stderr)
+    sys.exit(1)'''
+
+
 class TestRefusals:
     def test_an_instrument_failure_names_its_cause_and_the_sha(
         self, tmp_path: Path, capfd: pytest.CaptureFixture[str], state_home: Path
@@ -273,6 +281,16 @@ class TestRefusals:
         recorded = snapshot.load_snapshot(data / 'fixture' / f'{_main_sha(root)}.json')['params']
         assert '"complexipy_version": "0.0.0"' in err
         assert json.dumps(recorded, sort_keys=True) in err
+
+    def test_a_tree_left_behind_is_named_below_the_instruments_cause(
+        self, tmp_path: Path, capfd: pytest.CaptureFixture[str], state_home: Path
+    ) -> None:
+        root = _repo(tmp_path)
+        data = tmp_path / 'data'
+        assert _cadence(root, data, python=str(_shim(tmp_path, _LOCKS_AND_FAILS))) == 2
+        err = capfd.readouterr().err
+        [left_behind] = _pinned_trees_home(state_home).iterdir()
+        assert err.index('shim: the measurement failed') < err.index(str(left_behind))
 
     def test_a_project_id_that_is_not_a_path_segment_is_an_argparse_exit_2(
         self, tmp_path: Path
