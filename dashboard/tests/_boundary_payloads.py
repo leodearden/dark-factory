@@ -37,6 +37,7 @@ from dashboard.data import escalation_corpus
 from dashboard.data.active_tasks import reset_task_snapshot_state
 from dashboard.data.burndown import BURNDOWN_SCHEMA, collect_snapshot
 from dashboard.data.scheduler import _scheduler_cache_clear
+from dashboard.data.task_lineage import clear_lineage_state
 
 T0 = datetime(2026, 10, 4, 9, 0, 0, tzinfo=UTC)
 """The instant every scenario's first render is served at."""
@@ -49,6 +50,7 @@ ESCALATIONS = '/api/v2/dashboard/escalations'
 ESCALATION_ANALYTICS = '/api/v2/dashboard/escalation-analytics'
 MEMORY_GRAPHS = '/api/v2/dashboard/memory-graphs'
 SCHEDULER = '/api/v2/dashboard/scheduler'
+PRDS = '/api/v2/dashboard/prds'
 
 # in_flight 43 (running 25), backlog 1310, terminal 4106: total 5459.
 DARK_FACTORY_COUNTS: Mapping[TaskStatus, int] = {
@@ -262,6 +264,7 @@ def _canned_roots(
         root.mkdir(parents=True)
     app.state.config = DashboardConfig(project_root=roots[0], known_project_roots=roots[1:])
     reset_task_snapshot_state()
+    clear_lineage_state()
 
     def render(at: datetime) -> dict[str, Any]:
         with patch('dashboard.api.tasks.resolve_now', new=lambda _now: at):
@@ -276,6 +279,7 @@ def _canned_roots(
             yield render
     finally:
         reset_task_snapshot_state()
+        clear_lineage_state()
 
 
 def _census_family(client: TestClient, workdir: Path) -> dict[str, Any]:
@@ -568,6 +572,89 @@ def _check_owner_family(client: TestClient, workdir: Path) -> dict[str, Any]:
             _clear_corpus()
 
 
+PRD_A = 'plans/a-prd.md'
+PRD_B = 'plans/b-prd.md'
+PRD_C = 'plans/c-prd.md'
+FOREIGN_PRD = '/elsewhere/plans/x-prd.md'
+OVERLAY_ROW = 11
+ORPHAN = 12
+
+
+def prd_tree() -> CannedMCP:
+    """One project's tree for the PRD view, as ``test_prd_view.py``'s census join fixture.
+
+    PRD A: 1 done, 2 ready and pending 40 days, 3 a follow-up of 1, 4 a done
+    follow-up of 3 carrying two links, 5 cancelled. PRD B: 6 done only. Then
+    7 with no link, 8 done with no PRD, 9 a high-priority cross-project
+    follow-up from source 'review', and 10 blocked under a foreign PRD.
+    """
+    pending_since = (T0 - timedelta(days=40)).isoformat()
+    rows = [
+        _raw_row(1, 'done', priority='medium', metadata={'prd_path': PRD_A}),
+        _raw_row(2, 'pending', priority='medium', metadata={'prd_path': PRD_A, 'pending_since': pending_since}),
+        _raw_row(3, 'in-progress', priority='medium', metadata={'spawned_from': 1}),
+        _raw_row(4, 'done', priority='medium', metadata={'spawned_from': 3, 'cross_repo_refile_of': 'reify:1'}),
+        _raw_row(5, 'cancelled', priority='medium', metadata={'prd_path': PRD_A}),
+        _raw_row(6, 'done', priority='medium', metadata={'prd_path': PRD_B}),
+        _raw_row(7, 'pending', priority='medium'),
+        _raw_row(8, 'done', priority='medium'),
+        _raw_row(9, 'pending', priority='high', metadata={'spawned_from': 'reify:5569', 'source': 'review'}),
+        _raw_row(10, 'blocked', metadata={'prd_path': FOREIGN_PRD}),
+    ]
+    return CannedMCP(rows, {int(row['id']): row['status'] for row in rows}, status_page_size=2000)
+
+
+def _grow_past_lineage(substrate: CannedMCP) -> None:
+    """A new active row naming its own PRD, and an id only the status map knows."""
+    substrate.rows.append(_raw_row(OVERLAY_ROW, 'pending', priority='medium', metadata={'prd_path': PRD_C}))
+    substrate.status_map[OVERLAY_ROW] = 'pending'
+    substrate.status_map[ORPHAN] = 'pending'
+
+
+def _render_prds(client: TestClient, at: datetime) -> dict[str, Any]:
+    with patch('dashboard.api.prds.resolve_now', new=lambda _now: at):
+        return _get(client, PRDS)
+
+
+@contextmanager
+def canned_prd_roots(
+    client: TestClient, workdir: Path, substrates: Mapping[str, CannedMCP],
+) -> Iterator[Callable[[datetime], dict[str, Any]]]:
+    """:func:`_canned_roots`, yielding GET /prds at a named instant."""
+    with _canned_roots(client, workdir, substrates):
+        yield lambda at: _render_prds(client, at)
+
+
+def prd_view_family(client: TestClient, workdir: Path) -> dict[str, Any]:
+    """Boundary rows 8, 9 and 12: the PRD view over the census join.
+
+    ``prd_view_map_failed_tasks`` is the /tasks body served at the same
+    instant as ``prd_view_map_failed``, so its census reason is the one the
+    failed map half carried.
+    """
+    bodies: dict[str, Any] = {}
+
+    two_projects = {'dark-factory': prd_tree(), 'reify': _substrate(REIFY_COUNTS)}
+    with _canned_roots(client, workdir / 'prd_view_fresh', two_projects):
+        bodies['prd_view_fresh'] = _render_prds(client, T0)
+
+    growing = prd_tree()
+    with _canned_roots(client, workdir / 'prd_view_overlay', {'dark-factory': growing}):
+        _render_prds(client, T0)
+        _grow_past_lineage(growing)
+        bodies['prd_view_overlay'] = _render_prds(client, T0 + timedelta(seconds=20))
+
+    failing = prd_tree()
+    with _canned_roots(client, workdir / 'prd_view_map_failed', {'dark-factory': failing}) as render_tasks:
+        _render_prds(client, T0)
+        _fail_status_map(failing)
+        failed_at = T0 + timedelta(seconds=20)
+        bodies['prd_view_map_failed'] = _render_prds(client, failed_at)
+        bodies['prd_view_map_failed_tasks'] = render_tasks(failed_at)
+
+    return bodies
+
+
 def ragged_store_rows(workdir: Path) -> list[dict[str, Any]]:
     """Every row the real sampler wrote in the ragged scenario, oldest first.
 
@@ -592,4 +679,5 @@ def build_all(workdir: Path) -> dict[str, Any]:
             **_window_family(client, workdir),
             **_corpus_family(client, workdir),
             **_check_owner_family(client, workdir),
+            **prd_view_family(client, workdir),
         }
