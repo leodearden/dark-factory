@@ -45,13 +45,15 @@ would carry all 39 as false positives. Main today is also the tree an operator
 can actually act on: a descriptor that is broken TODAY is broken for every
 dependent dispatched from now on, whatever it did at merge time.
 
-EVALUATION GOES THROUGH THE RUNTIME PRIMITIVE.
+EVALUATION GOES THROUGH THE RUNTIME PRIMITIVES.
 ``shared.delivered_check_polarity.evaluate_grep_at_tree`` — which
-``orchestrator.delivered_checks._run_grep_check`` also delegates to — so the
-sweep cannot disagree with the scheduler about ERE-vs-Python regex, the ``-e``
-separator, pathspec placement, or the ``rc >= 2 -> ERRORED`` boundary. A sweep
-that used its own grep would invent findings the gate does not see, and miss
-the ones it does.
+``orchestrator.delivered_checks._run_grep_check`` also delegates to — and its
+path twin ``shared.delivered_check_polarity.evaluate_path_at_tree`` (twin of
+``orchestrator.delivered_checks._run_path_check``), so the sweep cannot
+disagree with the scheduler about ERE-vs-Python regex, the ``-e`` separator,
+pathspec placement, path existence, or the ``rc >= 2 -> ERRORED`` boundary. A
+sweep that used its own grep would invent findings the gate does not see, and
+miss the ones it does.
 
 STALE PATHS. A second question, orthogonal to polarity: does an
 ``expect: present`` grep or path check name a ``sys.modules`` alias shim, or a
@@ -79,7 +81,7 @@ import re
 import sqlite3
 import subprocess
 import sys
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from types import MappingProxyType
 from typing import NamedTuple
@@ -121,6 +123,7 @@ from shared.delivered_check_polarity import (  # noqa: E402
     GATE_REF,
     CheckOutcome,
     evaluate_grep_at_tree,
+    evaluate_path_at_tree,
     extract_delivered_checks,
     lint_delivered_checks,
 )
@@ -170,10 +173,12 @@ DEFECT_DISPOSITIONS = (
     DISPOSITION_UNWIRED_LIVE_GATE,
 )
 
-#: The kinds given a polarity disposition. Not ``path``: the supersession
-#: pickaxe (:func:`find_superseding_task`) has no path counterpart, so a done
-#: path check that fails could not be told apart from a superseded one.
-POLARITY_SWEPT_KINDS = ("grep",)
+#: The kinds given a polarity disposition: both kinds that carry an
+#: ``expect``, each evaluated through :data:`_ROW_EVALUATORS`.
+POLARITY_SWEPT_KINDS = ("grep", "path")
+
+#: The kinds the STRUCTURAL section lints: its codes exist only for grep.
+STRUCTURAL_SWEPT_KINDS = ("grep",)
 
 
 class DescriptorRow(NamedTuple):
@@ -292,10 +297,11 @@ def structural_findings(
 
     Through ``lint_delivered_checks`` itself, with the row's sidecar as
     ``manifest_path`` so the self-reference rule can see the descriptor's own
-    family — the same classification the authoring gate reaches.
+    family — the same classification the authoring gate reaches. Only rows of
+    :data:`STRUCTURAL_SWEPT_KINDS` are linted, whatever the caller passes.
     """
     found = []
-    for row in rows:
+    for row in (r for r in rows if r.kind in STRUCTURAL_SWEPT_KINDS):
         check = {
             "name": row.name, "kind": row.kind, "pattern": row.pattern,
             "expect": row.expect, "paths": list(row.paths), "manifest_path": row.manifest,
@@ -383,7 +389,8 @@ def classify_descriptor(
        nothing (so a failing check is not a defect) and it gates nothing (so a
        passing one is not a vacuous live gate).
     4. Done: ``PASS`` is the success state; ``FAIL`` is the defect, unless a
-       later task is known to have reintroduced the pattern.
+       later task is known to have undone it, by changing the pattern's
+       occurrences or creating or deleting the path.
     5. Live: ``PASS`` is the vacuous gate this sweep exists to surface, and
        ``FAIL`` is the ordinary forward-looking majority — unless the
        descriptor was never *stamped* onto its producer, in which case the
@@ -412,14 +419,7 @@ def classify_descriptor(
     return DISPOSITION_HEALTHY if stamped else DISPOSITION_UNWIRED_LIVE_GATE
 
 
-def evaluate_row(row: DescriptorRow, *, repo_root: str, ref: str = GATE_REF) -> CheckOutcome:
-    """Evaluate one descriptor against *ref*, through the RUNTIME primitive.
-
-    Deliberately a one-line delegation rather than its own grep:
-    :func:`shared.delivered_check_polarity.evaluate_grep_at_tree` is the same
-    function ``orchestrator.delivered_checks._run_grep_check`` delegates to, so
-    this sweep and the scheduler cannot disagree about what a check means.
-    """
+def _evaluate_grep_row(row: DescriptorRow, repo_root: str, ref: str) -> CheckOutcome:
     return evaluate_grep_at_tree(
         row.pattern or "",
         list(row.paths),
@@ -427,6 +427,32 @@ def evaluate_row(row: DescriptorRow, *, repo_root: str, ref: str = GATE_REF) -> 
         repo_root=repo_root,
         ref=ref,
     )
+
+
+def _evaluate_path_row(row: DescriptorRow, repo_root: str, ref: str) -> CheckOutcome:
+    return evaluate_path_at_tree(
+        list(row.paths), expect=row.expect, repo_root=repo_root, ref=ref
+    )
+
+
+_ROW_EVALUATORS: dict[str, Callable[[DescriptorRow, str, str], CheckOutcome]] = {
+    "grep": _evaluate_grep_row,
+    "path": _evaluate_path_row,
+}
+
+
+def evaluate_row(row: DescriptorRow, *, repo_root: str, ref: str = GATE_REF) -> CheckOutcome:
+    """Evaluate one descriptor against *ref*, through the RUNTIME primitive.
+
+    Deliberately a delegation rather than its own grep or listing: a grep row
+    goes to :func:`shared.delivered_check_polarity.evaluate_grep_at_tree` and
+    a path row to :func:`shared.delivered_check_polarity.evaluate_path_at_tree`,
+    the functions ``orchestrator.delivered_checks._run_grep_check`` and
+    ``_run_path_check`` delegate to or twin, so this sweep and the scheduler
+    cannot disagree about what a check means. A kind with no evaluator is
+    never reached: the loaders emit only grep and path rows.
+    """
+    return _ROW_EVALUATORS[row.kind](row, repo_root, ref)
 
 
 # ---------------------------------------------------------------------------
@@ -446,10 +472,9 @@ def _mechanical_rows_from_checks(
 ) -> list[DescriptorRow]:
     """Filter *checks* down to the grep and path descriptors and shape them.
 
-    ``grep`` rows feed the polarity dispositions and the stale-path sweep;
-    ``path`` rows feed only the stale-path sweep (see
-    :data:`POLARITY_SWEPT_KINDS`). A script check has no tree predicate (its
-    own guard is TestCheckedInScriptCheckTargets). A grep entry with no
+    Both kinds feed the polarity dispositions (see
+    :data:`POLARITY_SWEPT_KINDS`) and the stale-path sweep. A script check has
+    no tree predicate (its own guard is TestCheckedInScriptCheckTargets). A grep entry with no
     pattern, or a path entry with no usable paths, is a SCHEMA defect the
     corpus validator owns, not a delivery one.
     """
@@ -790,8 +815,9 @@ def audit_project(project_root: str, ref: str = GATE_REF) -> ProjectAudit:
     Deduplication is by ``(task_id, name)`` with the METADATA copy winning,
     regardless of kind: that is the artifact the runtime gate actually
     evaluates, so when the sidecar and the stamped metadata disagree — even
-    when the stamped copy is a path check the sweep does not evaluate — the
-    stamped one is the live behaviour and the sidecar row would be a phantom.
+    when the stamped copy is a path check and the sidecar spells it as a
+    grep — the stamped one is the live behaviour and the sidecar row would be
+    a phantom.
     """
     db = str(tasks_db_path(project_root))
     index = load_task_index(db)
@@ -1170,8 +1196,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "READ-ONLY, STATUS-AWARE audit of checked-in delivered_checks: "
-            "reports every kind=grep descriptor whose polarity against main "
-            "today disagrees with its producer's status — a closed producer "
+            "reports every kind=grep and kind=path descriptor whose polarity "
+            "against main today disagrees with its producer's status — a closed producer "
             "whose capability is nowhere on main (broken), an open one "
             "whose check already passes and therefore gates nothing (vacuous "
             "live gate), or an open one whose sound sidecar check was never "
