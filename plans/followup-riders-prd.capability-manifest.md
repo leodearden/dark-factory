@@ -30,8 +30,8 @@ _execute_combine}`, `middleware/done_provenance_authz.py`, `middleware/lock_char
 Absent, produced upstream by PRD 1 (all pending, wired as out-of-batch edges): `followup_hold` and the
 hold rule (ε 8417 → α), `followup_items` / `merge_items` / `_format_followup_items` (β 8414 → β),
 `promote(by='rider')` and, through its companion correction, `register_promotion_guard` (ζ 8418 → γ).
-Absent, produced by PRD 2 (not yet decomposed): `followup_packing.RIDER_RESERVE_DAYS`, `exclusion()`
-(the γ binding left OPEN below). Absent as the PRD says (this batch creates them): `riders.py`,
+Produced by PRD 2 P1 (task 8452, filed 2026-11-04): `followup_packing.RIDER_RESERVE_DAYS`, `exclusion()`
+(the γ binding below is PASS by producer, edge 8440 → 8452 wired). Absent as the PRD says (this batch creates them): `riders.py`,
 `plan_riders.py`, `shared/rider_ledger.py`, `middleware/rider_carry.py`, every `rider_*` symbol.
 
 Name corrections (no contract change; carried into the leaf descriptions):
@@ -75,7 +75,7 @@ Name corrections (no contract change; carried into the leaf descriptions):
 | γ | sweep interval | grep `carry_sweep_interval_secs` in `fused-memory/src/fused_memory/config/schema.py` | PASS |
 | γ | workflow carry reconcile | grep `_reconcile_rider_carry` in `workflow.py` | PASS |
 | γ | total close event, human release verb | grep `rider_close_failed` in `fused-memory/src/` + `orchestrator/src/`; `release_rider` in `server/tools.py` | PASS |
-| γ | carry clock = PRD 2's `RIDER_RESERVE_DAYS` | grep `RIDER_RESERVE_DAYS` in `rider_carry.py`. Producer is PRD 2 P0/P1, which is not decomposed yet, so the edge is **pending**. The lead adds `γ → P1` once PRD 2 is filed. γ imports the constant and never redefines it; if it is absent at γ's plan time, γ escalates | **OPEN** |
+| γ | carry clock = PRD 2's `RIDER_RESERVE_DAYS` | grep `RIDER_RESERVE_DAYS` in `rider_carry.py`. Producer: task-8452 (PRD 2 P1), upstream via the edge 8440 → 8452 wired 2026-11-04. γ imports the constant and never redefines it | PASS |
 | γ | boundary suite | grep `def test_` in new `fused-memory/tests/integration/test_followup_riders.py` | PASS |
 | γ | every §4.6 row green; `OPERATIONS.md` riders section | manual (row 19 is shared with PRD 2's gate; the section is prose, INV-10) | PASS |
 | δ | report script with no-producer states and the `KILL` line | grep `producer has not written` and `KILL` in new `scripts/followup_riders_report.py` | PASS |
@@ -88,6 +88,6 @@ Name corrections (no contract change; carried into the leaf descriptions):
    series reads "producer has not written".
 2. The three name corrections above.
 
-The only non-PASS binding is the γ carry-clock row, which is OPEN with the pending PRD 2 P1 edge.
+Every binding is PASS; the γ carry-clock row became PASS when PRD 2 P1 was filed as 8452 and the edge 8440 → 8452 wired.
 No binding resolves to declared-only, test-only, producer-downstream or producer-absent.
-DAG: α→8417; β→α, 8414; γ→β, 8418, [PRD 2 P1 pending]; δ→γ. `signal_leaves: [γ]`.
+DAG: α→8417; β→α, 8414; γ→β, 8418, 8452; δ→γ. `signal_leaves: [γ]`.

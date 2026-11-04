@@ -229,7 +229,7 @@ tasks:
   - label: "γ"
     task_id: 8440
     title: "Deliverability stamp, close and release in the status transition, carry sweep, integration gate"
-    note: "Integration gate and signal leaf. One binding OPEN: RIDER_RESERVE_DAYS is produced by PRD 2 P0/P1 (plans/followup-packing-sweep-prd.md), not yet decomposed; the edge to PRD 2 P1 is pending and is added by the lead once PRD 2 is filed."
+    note: "Integration gate and signal leaf. RIDER_RESERVE_DAYS is produced by PRD 2 P1 (task 8452, plans/followup-packing-sweep-prd.md); edge 8440 -> 8452 wired 2026-11-04."
     capabilities:
       - name: "stamp-deliverability"
         binding: "capability→producer — rider_carry.stamp_rider_deliverability"
@@ -328,8 +328,8 @@ tasks:
           paths: ["fused-memory/src/fused_memory/server/tools.py"]
           expect: present
       - name: "carry-clock-constant"
-        binding: "producer:PRD 2 P0/P1 followup_packing.RIDER_RESERVE_DAYS — PRD 2 not yet decomposed; edge to P1 PENDING (lead adds it). γ imports, never redefines; absent at plan time ⇒ γ escalates"
-        verdict: OPEN
+        binding: "producer:task-8452 followup_packing.RIDER_RESERVE_DAYS — PRD 2 P1, upstream via edge 8440 -> 8452. γ imports, never redefines"
+        verdict: PASS
         delivered_check:
           kind: grep
           pattern: "RIDER_RESERVE_DAYS"
