@@ -81,7 +81,7 @@ negative, so an EWMA chart can never show improvement at these rates.
    marker overlay, the before/after panel, the module table and the snapshot step series; the band prop
    and marker overlay are added to `charts.jsx` once and the escalation-analytics tab consumes the lifted
    overlay.
-6. **Two orchestrator fields** make two series honest at the source: a typed `block_class` written where
+6. **Two orchestrator fields** make two series honest at the source: a typed `charter_class` written where
    the architect blocks a task, and a `prompt_digest` on every `routing_decision`.
 7. **A deterministic quality-metrics cadence**: schema 3 records measurement identity; a wrapper pins
    the tree, skips an already-measured identity, writes uncommitted snapshots under
@@ -132,11 +132,11 @@ negative, so an EWMA chart can never show improvement at these rates.
    landings before 2026-10-21 the producer reads `.worktrees/.task-meta/<task_id>/review_state.json`
    `review_cycles_total + 1` once at backfill and stamps `source='disk_counter'` on the row (Leo, 11-04:
    do the backfill). No `task_results` stamp; task 5353 is a sibling per-dispatch defect, untouched.
-9. **Charter blocks** read a typed `block_class` written at the architect block sites in
+9. **Charter blocks** read a typed `charter_class` (named so because `orchestrator/src/orchestrator/unblock_types.py::BlockClass` is already the unblock path's closed four-value domain, branched on by the b3 gate, and the architect-stage cause is an orthogonal dimension: heuristic 3) written at the architect block sites in
    `orchestrator/src/orchestrator/workflow.py` (the four `Architect reported …` / `Plan files not touched`
    strings): `under_specified` (unactionable, false premise), `stale_charter` (already done; Leo, 11-04:
    its own class beside `under_specified`), `plan_files_untouched`. The class is written to
-   `task_results.block_class`, to the `task_blocked` event payload and to the escalation record; the
+   `task_results.charter_class`, to the `task_blocked` event payload and to the escalation record; the
    regex over `block_reason` is used only for backfill rows, stamped `source='regex_backfill'`. Until the
    producer has written in production the series renders "no producer has written here" (INV-13).
 10. **Prompt changes become derivable**: `routing_decision.data.prompt_digest` = sha256 of the role's
@@ -244,7 +244,7 @@ negative, so an EWMA chart can never show improvement at these rates.
   `train_merged` (74), `merge_blocked` (168 post_merge_verify), `review_completed` (since 10-21),
   `merge_verify` (1,335), `flake_occurrence` (1,653 rows in window), `routing_decision` (24,841 all
   time), `config_reload` (26), `runs.code_sha` (since 10-21), `invocation_end.$.turns` (since 04-09).
-  The two producers this PRD adds (`block_class`, `prompt_digest`) have not written; their readers render
+  The two producers this PRD adds (`charter_class`, `prompt_digest`) have not written; their readers render
   "no producer has written here" until they do (leaf γ's signal includes that state).
 
 ## Cross-PRD relationship (G4)
@@ -285,7 +285,7 @@ LandingRow = Landing + {
   cost:     {all_role_usd: float|None, by_role: {role: usd}, implementer_invocations: int,
              execute_iterations: int|None, turns: int|None, turns_capped: bool, code_lines: int,
              src_lines: int, test_lines: int, review_rounds: int|None, review_rounds_source:
-             'review_completed'|'disk_counter'|None, block_class: str|None, block_class_source: ...},
+             'review_completed'|'disk_counter'|None, charter_class: str|None, charter_class_source: ...},
   modules:  [{module, src_lines}],
   rule_vintage: {metric_id: measured_since_iso}}
 rows_for(landings, runs_db, repo, git_budget_s) -> list[LandingRow]
@@ -337,7 +337,7 @@ first landing at or after `at`.
 
 ### Orchestrator fields
 
-- `task_results.block_class TEXT NULL` (additive column with `CREATE TABLE IF NOT EXISTS` + `ALTER`
+- `task_results.charter_class TEXT NULL` (additive column with `CREATE TABLE IF NOT EXISTS` + `ALTER`
   guard on the `_ADDED_*` pattern), value ∈ {`under_specified`, `stale_charter`, `plan_files_untouched`};
   the same key on the `task_blocked` event payload and the escalation record's `detail`.
 - `routing_decision.data.prompt_digest: str` (64 hex), computed by one function
@@ -369,7 +369,7 @@ when identities' `params` differ. `scripts/quality_snapshot_cadence.py --root <p
 | 11 | Gap row on failure | a project root whose runs.db is locked or git absent | `sample_state` gap row with the verbatim reason; datum `state='stale'` with age; no zero row |
 | 12 | Main ahead of cursor | 3 landings land between ticks | read side reports `state='stale'`, reason "3 landings not yet sampled"; next tick clears it |
 | 13 | Retention never touches quality.db | `downsample_metrics` runs | `landings` row count unchanged; a test pins `quality.db` absent from `_DOWNSAMPLE_TABLES` |
-| 14 | Block class written | an architect blocks a task as unactionable in a dispatched run | `task_results.block_class='under_specified'`, the `task_blocked` event and the escalation carry it; the charter series' next row reads it with `source='block_class'` |
+| 14 | Block class written | an architect blocks a task as unactionable in a dispatched run | `task_results.charter_class='under_specified'`, the `task_blocked` event and the escalation carry it; the charter series' next row reads it with `source='charter_class'` |
 | 15 | Prompt digest written and stepped | a dispatch after a `roles.py` prompt-constant edit | `routing_decision.data.prompt_digest` differs from the previous dispatch of that role; after 3 dispatches a `kind='prompt'` marker appears |
 | 16 | Snapshot identity | two cadence runs at one sha with equal params | second exits 0 `already measured`; the first's file is byte-identical below `run_id`/`cost` to a forced re-run |
 | 17 | Params differ labelled | diff of a schema-2 snapshot against a schema-3 one | `--diff` opens with `params differ: instrument unknown → …`; measure deltas carry the not-attributable label; exit 0 |
@@ -421,11 +421,11 @@ purpose*, *structured data instead of meaningful strings*, *files make internal 
   the static-asset pins. Signal: the Quality tab renders for df the five outcome tiles with bands and the
   change-cost charts with markers from the live endpoint; the escalation-analytics charts still show
   their three 07-15 markers (sketch rows 9, 21). Prereqs: δ.
-- **ζ — Orchestrator: typed `block_class` and `prompt_digest`.** Modules:
+- **ζ — Orchestrator: typed `charter_class` and `prompt_digest`.** Modules:
   `orchestrator/src/orchestrator/workflow.py` (the four architect block sites), `event_store.py`
-  (`task_results.block_class`, event payload), `escalation` record detail, `routing_dispatch.py`,
+  (`task_results.charter_class`, event payload), `escalation` record detail, `routing_dispatch.py`,
   new `agents/prompt_digest.py`, tests. Signal: in a dispatched run on main, an architect block writes
-  `block_class` to `task_results`, the `task_blocked` event and the escalation; every new
+  `charter_class` to `task_results`, the `task_blocked` event and the escalation; every new
   `routing_decision` row carries a 64-hex `prompt_digest` that changes when a role's prompt constant
   changes (sketch rows 14, 15). Prereqs: none (parallel to α–ε); κ depends on it.
 - **η — Snapshot identity: schema 3, identity test, labelled diff, cadence wrapper.** Modules:
@@ -458,7 +458,7 @@ DAG: α → β → γ → δ → ε; η → θ → ι (ι also after γ, ε); ζ
 G7 walk (advisory; `docs/legibility/design-invariants.md`): INV-1 contracts are the wire shape validated
 by `validate_datum` and the manifest's `delivered_check`s, not prose; INV-9 the landing datum has one home
 (`quality.db`, derived from runs.db) and markers one reader; INV-11 a failed tick writes a gap row with the
-verbatim reason; INV-13 readers render "no producer has written here" for `block_class` and `prompt_digest`
+verbatim reason; INV-13 readers render "no producer has written here" for `charter_class` and `prompt_digest`
 until ζ fires in production, and every other producer is verified writing (Pre-conditions); INV-14 does not
 apply (no load-sampler metric). No waivers.
 
