@@ -10,6 +10,7 @@ from types import MappingProxyType
 from typing import Any
 
 import pytest
+from _prd_tree import PRD_A, PRD_B, prd_tree_tasks
 from shared.task_statuses import TaskStatus
 
 from dashboard.data import prd_view
@@ -177,14 +178,10 @@ def test_segment_tones_are_the_palette_keys():
 # ---------------------------------------------------------------------------
 
 ROOT = '/home/leo/src/dark-factory'
-PRD_A = 'plans/a-prd.md'
-PRD_B = 'plans/b-prd.md'
-FOREIGN_PRD = '/elsewhere/plans/x-prd.md'
 SNAPSHOT_BOUND = 30
 LINEAGE_BOUND = 900
 SNAPSHOT_AS_OF = NOW - timedelta(seconds=5)
 LINEAGE_AS_OF = NOW - timedelta(seconds=120)
-_NO_PRIORITY = None
 
 
 def _pending_since(days: float) -> str:
@@ -193,21 +190,7 @@ def _pending_since(days: float) -> str:
 
 _Tasks = Mapping[int, tuple[str, str | None, Mapping[str, Any]]]
 
-# id: (status, priority, metadata). PRD A: 1 done, 2 ready, 3 a follow-up of 1,
-# 4 a done follow-up of 3 carrying two links, 5 cancelled; PRD B: 6 done only;
-# 7 no link; 8 done with no PRD; 9 a cross-project link; 10 a foreign PRD.
-_TASKS: _Tasks = {
-    1: ('done', 'medium', {'prd_path': PRD_A}),
-    2: ('pending', 'medium', {'prd_path': PRD_A, 'pending_since': _pending_since(40)}),
-    3: ('in-progress', 'medium', {'spawned_from': 1}),
-    4: ('done', 'medium', {'spawned_from': 3, 'cross_repo_refile_of': 'reify:1'}),
-    5: ('cancelled', 'medium', {'prd_path': PRD_A}),
-    6: ('done', 'medium', {'prd_path': PRD_B}),
-    7: ('pending', 'medium', {}),
-    8: ('done', 'medium', {}),
-    9: ('pending', 'high', {'spawned_from': 'reify:5569', 'source': 'review'}),
-    10: ('blocked', _NO_PRIORITY, {'prd_path': FOREIGN_PRD}),
-}
+_TASKS: _Tasks = prd_tree_tasks(NOW)
 STATUS_MAP: dict[int, str] = {task_id: status for task_id, (status, _, _) in _TASKS.items()}
 
 

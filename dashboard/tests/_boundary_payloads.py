@@ -22,6 +22,7 @@ import aiosqlite
 import httpx
 from _canned_mcp import CannedMCP, _raw_row
 from _dt_helpers import make_fixed_datetime_cls
+from _prd_tree import prd_tree_tasks
 from escalation.archive import archive_dir_for_date
 from escalation.models import DeliveredCheckOwner, Escalation
 from escalation.queue import EscalationQueue
@@ -572,34 +573,19 @@ def _check_owner_family(client: TestClient, workdir: Path) -> dict[str, Any]:
             _clear_corpus()
 
 
-PRD_A = 'plans/a-prd.md'
-PRD_B = 'plans/b-prd.md'
 PRD_C = 'plans/c-prd.md'
-FOREIGN_PRD = '/elsewhere/plans/x-prd.md'
 OVERLAY_ROW = 11
 ORPHAN = 12
 
 
 def prd_tree() -> CannedMCP:
-    """One project's tree for the PRD view, as ``test_prd_view.py``'s census join fixture.
-
-    PRD A: 1 done, 2 ready and pending 40 days, 3 a follow-up of 1, 4 a done
-    follow-up of 3 carrying two links, 5 cancelled. PRD B: 6 done only. Then
-    7 with no link, 8 done with no PRD, 9 a high-priority cross-project
-    follow-up from source 'review', and 10 blocked under a foreign PRD.
-    """
-    pending_since = (T0 - timedelta(days=40)).isoformat()
+    """``_prd_tree.py``'s fixture tree at T0, served raw as one project's substrate."""
     rows = [
-        _raw_row(1, 'done', priority='medium', metadata={'prd_path': PRD_A}),
-        _raw_row(2, 'pending', priority='medium', metadata={'prd_path': PRD_A, 'pending_since': pending_since}),
-        _raw_row(3, 'in-progress', priority='medium', metadata={'spawned_from': 1}),
-        _raw_row(4, 'done', priority='medium', metadata={'spawned_from': 3, 'cross_repo_refile_of': 'reify:1'}),
-        _raw_row(5, 'cancelled', priority='medium', metadata={'prd_path': PRD_A}),
-        _raw_row(6, 'done', priority='medium', metadata={'prd_path': PRD_B}),
-        _raw_row(7, 'pending', priority='medium'),
-        _raw_row(8, 'done', priority='medium'),
-        _raw_row(9, 'pending', priority='high', metadata={'spawned_from': 'reify:5569', 'source': 'review'}),
-        _raw_row(10, 'blocked', metadata={'prd_path': FOREIGN_PRD}),
+        _raw_row(
+            task_id, task.status, metadata=dict(task.metadata),
+            **({} if task.priority is None else {'priority': task.priority}),
+        )
+        for task_id, task in prd_tree_tasks(T0).items()
     ]
     return CannedMCP(rows, {int(row['id']): row['status'] for row in rows}, status_page_size=2000)
 

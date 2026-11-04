@@ -20,7 +20,6 @@ import pytest
 from _boundary_payloads import (
     ORPHAN,
     OVERLAY_ROW,
-    PRD_A,
     PRD_C,
     T0,
     canned_prd_roots,
@@ -28,6 +27,7 @@ from _boundary_payloads import (
     prd_view_family,
 )
 from _canned_mcp import CannedMCP
+from _prd_tree import PRD_A
 from fastapi.testclient import TestClient
 from shared.task_statuses import TaskStatus
 
