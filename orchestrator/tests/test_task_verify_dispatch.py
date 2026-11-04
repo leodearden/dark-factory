@@ -345,18 +345,22 @@ class _Hooks:
 
 
 class _LocalRun:
-    """A recording stand-in for run_scoped_verification."""
+    """A recording stand-in for run_scoped_verification; *body*, when set, is
+    awaited with the call's admission plan before the verdict."""
 
     def __init__(self, observe: Callable[[], object]) -> None:
         self.result = _result(True, summary='local verdict')
         self.raises: Exception | None = None
         self.observe = observe
+        self.body: Callable[[AdmissionPlan], Awaitable[None]] | None = None
         self.calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
         self.observed: list[object] = []
 
     async def __call__(self, *args: Any, **kwargs: Any) -> VerifyResult:
         self.calls.append((args, kwargs))
         self.observed.append(self.observe())
+        if self.body is not None:
+            await self.body(kwargs['admission_plan'])
         if self.raises is not None:
             raise self.raises
         return self.result
@@ -930,6 +934,75 @@ class TestHostSymmetry:
         assert h.only_sidecar()['reason'] == 'remote'
         assert 'laptop' in h.quarantine
         assert h.hooks.unavailable_kinds() == [('laptop', 'transport')]
+        _assert_turn_left(h)
+
+
+# ---------------------------------------------------------------------------
+# The claim's withdrawal of the local run (decision 14)
+# ---------------------------------------------------------------------------
+
+
+def _readmitted_laptop(tmp_path: Path) -> _Harness:
+    """A harness whose laptop is benched, so the call's attempt queues there."""
+    h = _harness(
+        tmp_path, _ORCH_ONLY,
+        transport=_Transport(verify=_answers(_result(True, summary='remote verdict'))),
+    )
+    h.quarantine.add('laptop')
+    return h
+
+
+def _readmit(h: _Harness) -> None:
+    """Grant the queued attempt its laptop turn; it resumes before anything scheduled after."""
+    h.quarantine.discard('laptop')
+    h.pool.note_readmitted('laptop', h.config)
+
+
+@pytest.mark.asyncio
+class TestWithdrawal:
+    async def test_a_leg_scheduled_in_the_step_of_the_laptop_grant_never_starts(
+        self, tmp_path: Path,
+    ) -> None:
+        h = _readmitted_laptop(tmp_path)
+        started: list[str] = []
+
+        async def ungated_test_leg(plan: AdmissionPlan) -> None:
+            plan.latch.mark_granted()
+            started.append('test')
+
+        async def readmit_then_start_a_leg(plan: AdmissionPlan) -> None:
+            _readmit(h)
+            await asyncio.ensure_future(ungated_test_leg(plan))
+
+        h.local.body = readmit_then_start_a_leg
+
+        result = await h.call()
+
+        assert started == []
+        assert result.summary == 'remote verdict'
+        assert h.only_sidecar()['reason'] == 'remote'
+        _assert_turn_left(h)
+
+    async def test_a_withdrawn_local_run_whose_unwind_fails_is_a_warning(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        h = _readmitted_laptop(tmp_path)
+
+        async def readmit_then_fail_to_unwind(_plan: AdmissionPlan) -> None:
+            _readmit(h)
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                raise RuntimeError('leg cleanup failed') from None
+
+        h.local.body = readmit_then_fail_to_unwind
+        caplog.set_level(logging.DEBUG, logger=_DISPATCH_LOGGER)
+
+        result = await h.call()
+
+        assert result.summary == 'remote verdict'
+        [record] = [r for r in caplog.records if r.exc_info and 'leg cleanup failed' in str(r.exc_info[1])]
+        assert (record.name, record.levelno) == (_DISPATCH_LOGGER, logging.WARNING)
         _assert_turn_left(h)
 
 

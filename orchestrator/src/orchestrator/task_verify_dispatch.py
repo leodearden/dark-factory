@@ -314,11 +314,19 @@ def _infra_transient_unavailability(host: str, result: VerifyResult) -> RunnerUn
     )
 
 
-async def _reap(task: asyncio.Future[Any]) -> None:
-    task.cancel()
-    await asyncio.wait({task})
-    if not task.cancelled() and (exc := task.exception()) is not None:
-        logger.debug('A cancelled task verify leg ended with %r instead', exc)
+async def _reap_remote(remote: asyncio.Future[VerifyResult]) -> None:
+    """Cancel a remote verify, which normally ends in RunnerUnavailable, and await its end."""
+    remote.cancel()
+    await asyncio.wait({remote})
+    if not remote.cancelled() and (exc := remote.exception()) is not None:
+        logger.debug('A cancelled remote task verify ended with %r instead', exc)
+
+
+async def _withdrawn(local: asyncio.Task[VerifyResult]) -> None:
+    """Await a local run already cancelled; any end but the cancel is a failed unwind."""
+    await asyncio.wait({local})
+    if not local.cancelled() and (exc := local.exception()) is not None:
+        logger.warning('A withdrawn local task verify failed to unwind', exc_info=exc)
 
 
 class _Left(enum.Enum):
@@ -327,7 +335,15 @@ class _Left(enum.Enum):
     LEFT = 'left'
 
 
-_AttemptOutcome = VerifyResult | FallbackReason | Literal[_Left.LEFT]
+@dataclass(frozen=True)
+class _RemoteVerdict:
+    """The claiming attempt's verdict, with the policy read at its grant, which settles it."""
+
+    result: VerifyResult
+    policy: TaskVerifyPolicy
+
+
+_AttemptOutcome = _RemoteVerdict | FallbackReason | Literal[_Left.LEFT]
 
 
 def _warn_if_failed(host: str, attempt: asyncio.Task[_AttemptOutcome]) -> None:
@@ -348,7 +364,7 @@ class _LocalWon:
     local: asyncio.Task[VerifyResult]
 
 
-_RaceOutcome = _LocalWon | VerifyResult | FallbackReason
+_RaceOutcome = _LocalWon | _RemoteVerdict | FallbackReason
 
 
 @dataclass(eq=False)
@@ -356,8 +372,6 @@ class _Race:
     """One eligible call's race between the local queue and every remote host's gate."""
 
     plan: AdmissionPlan
-    policy: TaskVerifyPolicy
-    """Read at arrival, then re-read at the claiming grant, whose turn it checks and settles."""
     local: asyncio.Task[VerifyResult] | None = None
     attempts: dict[asyncio.Task[_AttemptOutcome], str] = field(default_factory=dict)
     claimed_by: str | None = None
@@ -371,13 +385,15 @@ class _Race:
             return False
         if policy.host_policy == 'local':
             return False
-        self.claimed_by, self.policy = host, policy
+        self.claimed_by = host
         return True
 
     def withdraw_local(self) -> asyncio.Future[None] | None:
-        """Cancel the local call once; every caller awaits the same reap."""
+        """Cancel the local call once, in the caller's step, so no leg already
+        scheduled starts after a claim; every caller awaits the same reap."""
         if self.reaping is None and self.local is not None and not self.local.done():
-            self.reaping = asyncio.ensure_future(_reap(self.local))
+            self.local.cancel()
+            self.reaping = asyncio.ensure_future(_withdrawn(self.local))
         return self.reaping
 
 
@@ -460,7 +476,7 @@ class TaskVerifyDispatcher:
             return await self._run_local_because(call, draft, 'not_eligible')
         if not self._pool.hosts:
             return await self._run_local_because(call, draft, 'no_host')
-        race = _Race(plan=AdmissionPlan.begin(role='task', task_id=call.task_id), policy=policy)
+        race = _Race(plan=AdmissionPlan.begin(role='task', task_id=call.task_id))
         outcome = await self._race(race, call, draft)
         return await self._after_race(call, race, outcome, draft)
 
@@ -471,10 +487,10 @@ class TaskVerifyDispatcher:
         if isinstance(outcome, _LocalWon):
             draft.reason = 'local_granted_first'
             return outcome.local.result()
-        if isinstance(outcome, VerifyResult):
+        if isinstance(outcome, _RemoteVerdict):
             draft.reason = 'remote'
             draft.remote_wait_secs = race.remote_wait_secs
-            return await self._settle_remote(call, race.policy, outcome, draft)
+            return await self._settle_remote(call, outcome.policy, outcome.result, draft)
         draft.reason = outcome
         return await call.run(self._run_local, admission_plan=race.plan)
 
@@ -499,7 +515,7 @@ class TaskVerifyDispatcher:
             done, _ = await asyncio.wait(
                 {*race.attempts, *local}, return_when=asyncio.FIRST_COMPLETED,
             )
-            for task in done & race.attempts.keys():
+            for task in race.attempts.keys() & done:
                 outcome = self._attempt_outcome(race, race.attempts.pop(task), task)
                 if outcome is not _Left.LEFT:
                     return outcome
@@ -526,16 +542,19 @@ class TaskVerifyDispatcher:
         request = race.plan.request(module=None, scope_kind=None)
         gate_policy = functools.partial(self._pool.policy, host, call.config)
         async with self._pool.gate(host).admit(request, gate_policy) as grant:
-            if not race.try_claim(host, self._policy_of(call.config)):
+            policy = self._policy_of(call.config)
+            if not race.try_claim(host, policy):
                 return _Left.LEFT
             race.remote_wait_secs = grant.granted - race.plan.arrival
             with self._pool.holding(host, call.task_id):
-                return await self._claimed_turn(race, host, call, draft)
+                return await self._claimed_turn(race, host, policy, call, draft)
 
     async def _claimed_turn(
-        self, race: _Race, host: str, call: _VerifyCall, draft: _DecisionDraft,
-    ) -> VerifyResult | FallbackReason:
-        """Withdraw the local call, re-derive the scope at the turn, then run on *host*."""
+        self, race: _Race, host: str, policy: TaskVerifyPolicy, call: _VerifyCall,
+        draft: _DecisionDraft,
+    ) -> _RemoteVerdict | FallbackReason:
+        """Withdraw the local call, re-derive the scope at the turn, then run on *host*
+        under *policy*, the one read at the claiming grant."""
         reaping = race.withdraw_local()
         if reaping is not None:
             await asyncio.shield(reaping)
@@ -543,9 +562,12 @@ class TaskVerifyDispatcher:
         if scope is None:
             return 'dispatcher_error'
         draft.tip_sha, draft.base_sha = scope.tip_sha, scope.base_sha
-        if not self._eligible(call, race.policy, scope):
+        if not self._eligible(call, policy, scope):
             return 'not_eligible'
-        return await self._run_remote(call, scope, host, draft)
+        outcome = await self._run_remote(call, scope, host, draft)
+        if isinstance(outcome, VerifyResult):
+            return _RemoteVerdict(outcome, policy)
+        return outcome
 
     async def _settle_remote(
         self, call: _VerifyCall, policy: TaskVerifyPolicy, remote: VerifyResult,
@@ -597,7 +619,7 @@ class TaskVerifyDispatcher:
         finally:
             if remote is not None and not remote.done():
                 await asyncio.shield(self._pool.cancel_in_flight(
-                    host, runner, unwind=functools.partial(_reap, remote),
+                    host, runner, unwind=functools.partial(_reap_remote, remote),
                 ))
             draft.lease_held_secs = time.monotonic() - started
 
