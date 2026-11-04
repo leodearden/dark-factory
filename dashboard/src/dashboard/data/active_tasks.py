@@ -260,11 +260,12 @@ _TASKS_ROOT_CONCURRENCY = 4
 
 @dataclass(frozen=True, slots=True)
 class TasksBudget:
-    """The three bounds the per-root fan-out runs under.
+    """The three bounds a per-root fan-out runs under.
 
-    Both collectors take one as ``budget=``. Every bound must be able to serve
-    a root: a non-positive time bound serves nothing, and a zero-width
-    semaphore admits no root and hangs the walk.
+    Both collectors here take one as ``budget=``, and ``/prds`` ships its own
+    (``dashboard/src/dashboard/api/prds.py::PRDS_BUDGET``). Every bound must
+    be able to serve a root: a non-positive time bound serves nothing, and a
+    zero-width semaphore admits no root and hangs the walk.
     """
 
     per_project: float

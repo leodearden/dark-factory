@@ -8,9 +8,11 @@ substrates. The pure view's own cases live in ``test_prd_view.py``.
 from __future__ import annotations
 
 import dataclasses
+import logging
 import time
 from collections.abc import Callable, Iterator
 from datetime import datetime, timedelta
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
@@ -35,6 +37,8 @@ from dashboard.data.census import build_census
 from dashboard.data.prd_view import Segment
 
 ROOT = 'dark-factory'
+SLOW = 'slow'
+BROKEN = 'broken'
 
 
 @pytest.fixture(scope='module', autouse=True)
@@ -136,6 +140,60 @@ def test_a_view_whose_build_raises_is_served_unknown(client, tmp_path, monkeypat
         view = render(T0)['PRD_VIEW'][ROOT]
     assert view['state'] == 'unknown'
     assert 'unexpected error' in view['reason']
+
+
+# --- the budgeted fan-out degrades one root, never the others --------------
+
+
+def _tighten(monkeypatch: pytest.MonkeyPatch, **bounds: float) -> None:
+    monkeypatch.setattr(prds, 'PRDS_BUDGET', dataclasses.replace(prds.PRDS_BUDGET, **bounds))
+
+
+def test_a_root_past_its_share_is_unknown_while_the_other_renders(client, tmp_path, monkeypatch):
+    _tighten(monkeypatch, per_project=2.0)
+    slow = prd_tree()
+    slow.projection_delay = 4.0
+    with canned_prd_roots(client, tmp_path, {ROOT: prd_tree(), SLOW: slow}) as render:
+        views = render(T0)['PRD_VIEW']
+    assert views[SLOW]['state'] == 'unknown'
+    assert views[SLOW]['reason'].startswith('exceeded its 2.0s share of the 20.0s /prds budget (')
+    assert views[ROOT]['state'] == 'fresh'
+
+
+def test_a_root_admitted_after_the_deadline_is_skipped_unread(client, tmp_path, monkeypatch):
+    _tighten(monkeypatch, total=1e-9)
+    substrate = prd_tree()
+    with canned_prd_roots(client, tmp_path, {ROOT: substrate}) as render:
+        view = render(T0)['PRD_VIEW'][ROOT]
+    assert view['state'] == 'unknown'
+    assert view['reason'].startswith('skipped — the 0.0s /prds budget was already spent')
+    assert substrate.calls == []
+
+
+def test_a_root_whose_acquisition_raises_is_unknown_while_the_other_renders(
+    client, tmp_path, monkeypatch, caplog,
+):
+    acquire = prds.acquire_lineage
+
+    async def _raises_for_broken(http_client, config, root, *, now):
+        if Path(root).name == BROKEN:
+            raise RuntimeError('acquisition bug')
+        return await acquire(http_client, config, root, now=now)
+
+    monkeypatch.setattr(prds, 'acquire_lineage', _raises_for_broken)
+    with (
+        canned_prd_roots(client, tmp_path, {ROOT: prd_tree(), BROKEN: prd_tree()}) as render,
+        caplog.at_level(logging.WARNING, logger=prds.__name__),
+    ):
+        views = render(T0)['PRD_VIEW']
+    assert views[BROKEN]['state'] == 'unknown'
+    assert views[BROKEN]['reason'] == (
+        "unexpected error while acquiring this project's inputs (see the WARNING and its traceback)"
+    )
+    assert views[ROOT]['state'] == 'fresh'
+    [bug] = [record for record in caplog.records if record.name == prds.__name__]
+    assert bug.exc_info is not None
+    assert BROKEN in bug.getMessage()
 
 
 # --- row 11: a slow lineage read never holds the response ------------------

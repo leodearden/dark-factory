@@ -26,9 +26,10 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from dashboard.config import DashboardConfig
+from dashboard.data.active_tasks import TasksBudget
 from dashboard.data.datum import Datum, DatumContractError, unknown_datum, validate_datum
 from dashboard.data.prd_view import PrdView, PrdViewInputs, build_prd_view, validate_prd_view
-from dashboard.data.task_lineage import LINEAGE_FRESHNESS_BOUND_SECONDS, acquire_lineage
+from dashboard.data.task_lineage import acquire_lineage
 from dashboard.data.task_snapshot import acquire_snapshot
 from dashboard.data.utils import resolve_now
 
@@ -37,34 +38,27 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-@dataclass(frozen=True, slots=True)
-class PrdsBudget:
-    """The three bounds the /prds per-root fan-out runs under.
+PRDS_BUDGET = TasksBudget(per_project=14.0, total=20.0, root_concurrency=4)
+"""The three bounds the /prds per-root fan-out runs under, read at each request.
 
-    The figures are /tasks', by the same arithmetic. ``per_project`` (14.0 s)
-    holds the snapshot unit's roster, ``task_snapshot.PER_CALL_TIMEOUT`` (4.4)
-    x its three bounded operations = 13.2 s; the lineage index waits only
-    ``task_lineage.LINEAGE_REQUEST_WAIT_SECONDS`` (5.0) inside it. ``total``
-    (20.0 s) is 10 s under ``data.js``'s 30 s fetch abort, so a degraded payload
-    still renders. ``root_concurrency`` (4) keeps the walk parallel but
-    bounded. ``dashboard/tests/test_prds_budget.py`` checks the constraints.
-    """
+The figures are /tasks', by the same arithmetic. ``per_project`` (14.0 s)
+holds the snapshot unit's roster, ``task_snapshot.PER_CALL_TIMEOUT`` (4.4) x
+its three bounded operations = 13.2 s; the lineage index waits only
+``task_lineage.LINEAGE_REQUEST_WAIT_SECONDS`` (5.0) inside it. ``total``
+(20.0 s) is 10 s under ``data.js``'s 30 s fetch abort, so a degraded payload
+still renders. ``root_concurrency`` (4) keeps the walk parallel but bounded.
+``dashboard/tests/test_prds_budget.py`` checks the constraints.
+"""
 
-    per_project: float
-    total: float
-    root_concurrency: int
+STAND_IN_VIEW_BOUND_SECONDS = 900
+"""The freshness bound of the unknown served in place of a view this render
+could not acquire, build or validate.
 
-    def __post_init__(self) -> None:
-        for name, seconds in (('per_project', self.per_project), ('total', self.total)):
-            if not seconds > 0:
-                raise ValueError(f'PrdsBudget.{name} must be positive, got {seconds!r}')
-        if self.root_concurrency < 1:
-            raise ValueError(
-                f'PrdsBudget.root_concurrency must be at least 1, got {self.root_concurrency!r}'
-            )
-
-
-PRDS_BUDGET = PrdsBudget(per_project=14.0, total=20.0, root_concurrency=4)
+An unknown has no ``as_of``, so its bound only states the contract a served
+view keeps. A built view takes its oldest input's bound, so a stand-in states
+the loosest any input carries, the lineage index's;
+``dashboard/tests/test_prds_budget.py`` pins that equality.
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,7 +89,7 @@ async def _acquire_within_budget(
     config: DashboardConfig,
     *,
     now: datetime,
-    budget: PrdsBudget,
+    budget: TasksBudget,
 ) -> dict[Path, PrdViewInputs | RootUnserved]:
     """Every configured root's inputs, or why a root has none, in canonical root order.
 
@@ -157,7 +151,7 @@ def _served_view(
 ) -> Datum[PrdView]:
     """*label*'s view at *served_at*, validated here as well as where it was built."""
     if isinstance(inputs, RootUnserved):
-        return unknown_datum(inputs.reason, LINEAGE_FRESHNESS_BOUND_SECONDS)
+        return unknown_datum(inputs.reason, STAND_IN_VIEW_BOUND_SECONDS)
     what = f"project {label}'s PRD view"
     try:
         datum = build_prd_view(inputs, now=served_at)
@@ -172,7 +166,7 @@ def _served_view(
         )
         return unknown_datum(
             f'{what} broke the {broken.invariant.value} invariant: {broken}',
-            LINEAGE_FRESHNESS_BOUND_SECONDS,
+            STAND_IN_VIEW_BOUND_SECONDS,
         )
     except Exception:
         logger.warning(
@@ -182,7 +176,7 @@ def _served_view(
         )
         return unknown_datum(
             f'unexpected error while building {what} (see the WARNING and its traceback)',
-            LINEAGE_FRESHNESS_BOUND_SECONDS,
+            STAND_IN_VIEW_BOUND_SECONDS,
         )
     return datum
 

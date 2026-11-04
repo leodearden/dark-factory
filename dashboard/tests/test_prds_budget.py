@@ -57,6 +57,11 @@ def test_the_lineage_read_releases_its_slot_before_the_next_refresh() -> None:
     assert task_lineage.LINEAGE_PER_CALL_TIMEOUT < 10
 
 
+def test_a_stand_in_view_states_the_loosest_input_bound() -> None:
+    loosest = max(task_snapshot.FRESHNESS_BOUND_SECONDS, task_lineage.LINEAGE_FRESHNESS_BOUND_SECONDS)
+    assert loosest == prds.STAND_IN_VIEW_BOUND_SECONDS
+
+
 def test_the_open_question_1_figures_are_pinned() -> None:
     assert task_lineage.LINEAGE_TTL_SECONDS == 300
     assert task_lineage.LINEAGE_FRESHNESS_BOUND_SECONDS == 900
