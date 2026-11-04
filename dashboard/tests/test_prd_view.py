@@ -606,9 +606,16 @@ def _open_id_missing(view: PrdView) -> PrdView:
     return _replace_row(view, followup_open=())
 
 
-def _figure_rule_missing(view: PrdView) -> PrdView:
-    rules = {figure: text for figure, text in view.rules.items() if figure is not FigureId.MULTI_LINK}
-    return dataclasses.replace(view, rules=MappingProxyType(rules))
+@dataclasses.dataclass(frozen=True, slots=True)
+class _ViewServingAnUnruledFigure(PrdView):
+    def to_wire(self) -> dict[str, object]:
+        return {**PrdView.to_wire(self), 'unruled_figure': 0}
+
+
+def _unruled_figure(view: PrdView) -> PrdView:
+    return _ViewServingAnUnruledFigure(
+        **{field.name: getattr(view, field.name) for field in dataclasses.fields(view)},
+    )
 
 
 _BREACHES: dict[str, tuple[Callable[[PrdView], PrdView], PrdViewInvariant, tuple[str, ...]]] = {
@@ -618,7 +625,7 @@ _BREACHES: dict[str, tuple[Callable[[PrdView], PrdView], PrdViewInvariant, tuple
     'dark_matter_total': (_dark_matter_off_by_one, PrdViewInvariant.DARK_MATTER_TOTAL, ('total=4',)),
     'open_id_twice': (_open_id_twice, PrdViewInvariant.OPEN_ID_ONCE, ('[7]',)),
     'open_id_missing': (_open_id_missing, PrdViewInvariant.OPEN_ID_ONCE, ('[3]',)),
-    'figure_rule_missing': (_figure_rule_missing, PrdViewInvariant.FIGURE_RULE, ('multi_link',)),
+    'unruled_figure': (_unruled_figure, PrdViewInvariant.FIGURE_RULE, ('unruled_figure',)),
 }
 
 

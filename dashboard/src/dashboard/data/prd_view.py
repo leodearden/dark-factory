@@ -366,7 +366,6 @@ class PrdView:
     dark_matter: DarkMatter
     multi_link: int
     inputs: tuple[InputState, ...]
-    rules: Mapping[FigureId, str]
 
     def to_wire(self) -> dict[str, object]:
         return {
@@ -376,7 +375,7 @@ class PrdView:
             FigureId.DARK_MATTER.value: self.dark_matter.to_wire(),
             FigureId.MULTI_LINK.value: self.multi_link,
             'inputs': [state.to_wire() for state in self.inputs],
-            'rules': {figure.value: text for figure, text in self.rules.items()},
+            'rules': {figure.value: text for figure, text in FIGURE_RULES.items()},
             'segment_legend': [
                 {'segment': segment.value, 'label': SEGMENT_LABELS[segment],
                  'tone': SEGMENT_TONES[segment]}
@@ -510,7 +509,6 @@ def _shape_view(
         dark_matter=_dark_matter(dark, inputs.status_map),
         multi_link=multi_link,
         inputs=states,
-        rules=FIGURE_RULES,
     )
 
 
@@ -731,14 +729,13 @@ def _listed_open_ids(view: PrdView) -> Iterable[int]:
 
 
 def _check_figure_rules(view: PrdView) -> None:
-    unruled = [figure.value for figure in FigureId if not (view.rules.get(figure) or '').strip()]
     view_figures = set(view.to_wire()) - _STRUCTURAL_VIEW_KEYS
     row_figures = {key for row in view.prds for key in row.to_wire()} - _STRUCTURAL_ROW_KEYS
     unnamed = sorted((view_figures | row_figures) - {figure.value for figure in FigureId})
-    if unruled or unnamed:
+    if unnamed:
         raise PrdViewContractError(
             PrdViewInvariant.FIGURE_RULE,
-            f'figures without rule text: {unruled}; wire figures naming no FigureId: {unnamed}',
+            f'wire figures naming no FigureId, so carrying no rule text: {unnamed}',
         )
 
 
