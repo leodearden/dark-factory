@@ -8,7 +8,7 @@ import json
 import logging
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import asdict, dataclass, replace
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, assert_never, cast
 
@@ -90,6 +90,7 @@ from escalation.models import (
 )
 from escalation.note_to_file import file_note_to_file, note_to_file_refusal
 from escalation.pins import classify_pins
+from escalation.policy_gate import claim_payload, identity_resolve_refusal, queue_kind_of
 from escalation.project_root_guard import ProjectRootGuard
 from escalation.queue import AmendmentOutcome, EscalationQueue, blank_resolve_outcome
 from escalation.queue import observed_submit_response as _observed_submit_response
@@ -796,6 +797,8 @@ _COMPACT_ESCALATION_FIELDS = (
     # and giving absence a second, different meaning on a neighbouring key would
     # be exactly the legibility trap that contract exists to prevent.
     'pin_declared_by',
+    # The executor's precheck and the coordinator's apply read the claim from a compact drain.
+    'policy_class', 'claimed_at', 'claimed_by',
     # project_id (task 4951) is DELIBERATELY NOT PROJECTED — decided in task 5776
     # (won't-fix), so do not re-file it as an oversight.
     #
@@ -965,6 +968,7 @@ _MARKUP_RESIDUE_SEVERITY = 'critical'
 # to the live list_tools().
 _ESCALATION_SERVER_TOOL_NAMES: frozenset[str] = frozenset({
     'amend_escalation',
+    'claim_policy_class',
     'claim_warm_worktree',
     'clear_verify_host_quarantine',
     'declare_pin',
@@ -1525,6 +1529,7 @@ def create_server(
     mcp.add_middleware(MissingArgumentMiddleware())
 
     cfg = dedupe_config if dedupe_config is not None else DedupeConfig()
+    queue_kind = queue_kind_of(store_identity)
 
     # --- Optional project_root assertion (PRD §6.3) ---
     # Sync tools call check() directly: FastMCP already runs them on a worker
@@ -2404,6 +2409,16 @@ def create_server(
         A ``park`` on an info-severity target is refused with code
         ``park_on_info`` and the record is not touched (see Gate precedence).
 
+        **Policy-table identities** (task 8422).  The executor
+        (``authority.EXECUTOR_IDENTITY``) must pass ``resolution_class`` and
+        act under a fresh claim on a live class whose evidence the resolution
+        quotes (``escalation/src/escalation/authority.py::executor_refusal``,
+        the reason behind ``executor_policy_class``); otherwise it gets
+        ``level_forbidden`` with a ``policy_refusal`` code.  The coordinator
+        (``authority.COORDINATOR_IDENTITY``) gets ``claimed_by_executor`` on a
+        record carrying a fresh executor claim.  Both answers are shaped by
+        ``escalation/src/escalation/policy_gate.py::identity_resolve_refusal``.
+
         **Resolution text** reaches the agent only on the L0 live-resume path
         (``action='resume'``).  For all other actions the text is stored on the
         record for audit purposes but is not injected into any agent briefing.
@@ -2515,7 +2530,10 @@ def create_server(
         verification behind this).
 
         **Gate precedence**, in order: the connection-capability gate
-        (``bad_capability_header`` / ``level_forbidden``) → this Table B
+        (``bad_capability_header`` / ``level_forbidden``) → the policy-table
+        identity gate (``resolution_class_required`` /
+        ``policy_state_unreadable`` / ``level_forbidden`` /
+        ``claimed_by_executor``) → this Table B
         legality gate (``illegal_transition``) → the park-on-info gate
         (``park_on_info``, via ``_park_on_info_refusal``; ``park`` only, on an
         info-severity target, because an info record never pins its task,
@@ -2717,6 +2735,12 @@ def create_server(
                 ),
                 'code': 'level_forbidden',
             }
+        if (refusal := identity_resolve_refusal(
+            identity, rec, action=action, resolution=resolution,
+            resolution_class=resolution_class, queue_dir=queue.queue_dir,
+            queue_kind=queue_kind, now=datetime.now(UTC),
+        )) is not None:
+            return refusal
         if identity is not None:
             # Server-attributed identity overrides the tool arg for both the
             # park stamp (below) and the resolve call further down — a caller
@@ -3236,6 +3260,42 @@ def create_server(
         if esc is None:
             return {'error': f'Escalation {escalation_id} not found or not pending'}
         return esc.to_dict()
+
+    @mcp.tool()
+    def claim_policy_class(
+        escalation_id: str,
+        policy_class: str,
+        clean: bool = False,
+    ) -> dict[str, Any]:
+        """Claim a pending escalation for one policy-table class before acting on it.
+
+        EXECUTOR-ONLY (task 8422, ``plans/decision-stream-prd.md`` §5.2): any
+        connection whose X-Escalation-Identity is not
+        ``authority.EXECUTOR_IDENTITY``, header-less ones included, gets
+        ``level_forbidden``.  A successful claim writes ``policy_class``,
+        ``claimed_at`` and ``claimed_by`` and returns the full record.  The
+        executor's later ``resolve_issue`` acts only under such a claim, and
+        the coordinator is refused ``claimed_by_executor`` while it is fresh.
+
+        Refused with ``claim_refused`` and a ``policy_refusal`` code when the
+        record already carries a fresh claim (``already_claimed``, naming that
+        claim's ``policy_class`` and ``claimed_at``), the class is ``off`` on
+        this queue, the class is unknown or does not cover the record or this
+        queue's kind, or the class writes files and *clean* is not True.
+        *clean* is the executor's report that ``project_root`` has no
+        uncommitted changes.  A record on the executor's deny list gets
+        ``level_forbidden``.  A claim expires ``authority.CLAIM_TTL`` after
+        ``claimed_at``.  ``stamp_triage`` stays ungated.
+        """
+        return claim_payload(
+            queue,
+            identity=get_http_headers().get(_IDENTITY_HEADER),
+            escalation_id=escalation_id,
+            policy_class=policy_class,
+            clean=clean,
+            queue_kind=queue_kind,
+            now=datetime.now(UTC),
+        )
 
     @mcp.tool()
     def declare_pin(

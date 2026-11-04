@@ -229,6 +229,10 @@ _REVIEWED_STAGE_SAFE = {
     # an id for and reads no per-task state, so against the reconciliation
     # queue it can only ever answer "not found" — never a categorical [].
     'mcp__escalation__amend_escalation',
+    # claim_policy_class (task 8422) refuses every identity except the
+    # escalation executor, so a recon stage can only ever be refused; it reads
+    # no per-task state.
+    'mcp__escalation__claim_policy_class',
     'mcp__escalation__claim_warm_worktree',
     # clear_verify_host_quarantine (task 6565) is merge-lane control plane: it
     # re-admits a benched verify host and reads no per-task escalation state.

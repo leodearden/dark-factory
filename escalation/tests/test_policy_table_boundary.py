@@ -17,6 +17,8 @@ from typing import Any
 import pytest
 from _escalation_http import escalation_http_call
 from _escalation_seed import seed_escalation
+from fastmcp import Client
+from fastmcp.client.transports import StreamableHttpTransport
 
 from escalation.authority import COORDINATOR_IDENTITY, EXECUTOR_IDENTITY, ClassSwitch
 from escalation.classify import classify_resolver_tier
@@ -88,12 +90,16 @@ def _status(queue: EscalationQueue, escalation_id: str) -> str:
     return record.status
 
 
-def _rows(result: Any) -> list[dict[str, Any]]:
-    """A list-returning tool's rows, whichever way fastmcp hands them back."""
-    if isinstance(result, dict) and 'result' in result:
-        result = result['result']
-    assert isinstance(result, list), f'expected a list of rows, got {result!r}'
-    return result
+async def _drain(base_url: str, tool_name: str, **tool_kwargs: Any) -> list[dict[str, Any]]:
+    """A header-less list read's rows, from ``structured_content``.
+
+    ``result.data`` is no use here: fastmcp turns each ``dict[str, Any]`` row
+    of a list-returning tool into an opaque object with no fields.
+    """
+    async with Client(StreamableHttpTransport(f'{base_url}/mcp/')) as client:
+        result = await client.call_tool(tool_name, tool_kwargs)
+    assert result.structured_content is not None
+    return result.structured_content['result']
 
 
 class TestRow1ExecutorClosesALiveClassRecord:
@@ -106,12 +112,8 @@ class TestRow1ExecutorClosesALiveClassRecord:
         assert claimed.get('policy_class') == _LANDING, claimed
         assert claimed.get('claimed_by') == EXECUTOR_IDENTITY
 
-        pending = _rows(await escalation_http_call(
-            base_url, 'get_pending_escalations', compact=True,
-        ))
-        by_task = _rows(await escalation_http_call(
-            base_url, 'get_task_escalations', task_id=_TASK, compact=True,
-        ))
+        pending = await _drain(base_url, 'get_pending_escalations', compact=True)
+        by_task = await _drain(base_url, 'get_task_escalations', task_id=_TASK, compact=True)
         for drain in (pending, by_task):
             (row,) = [r for r in drain if r['id'] == record.id]
             assert {field: row[field] for field in _CLAIM_FIELDS} == {
