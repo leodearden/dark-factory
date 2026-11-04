@@ -755,3 +755,72 @@ class TestDeclaredFilenameShaped:
         )
 
         assert [f.code for f in findings] == ['vacuous_absent']
+
+
+# ---------------------------------------------------------------------------
+# Match sites survive unusual paths (task 6037)
+# ---------------------------------------------------------------------------
+
+
+class TestMatchSitesSurviveUnusualPaths:
+    """A match site is read from ``git grep -n -z`` records, so a ':' in a
+    path cannot split the record and a non-ASCII path arrives unquoted,
+    comparable with the descriptor family and the declared files."""
+
+    def test_a_colon_in_the_path_keeps_the_comment_only_refinement(self, tmp_path):
+        repo = init_git_repo(
+            tmp_path / 'repo', {'src/a:b.py': '# colon_token is described here\n'}
+        )
+
+        findings = lint_delivered_checks(
+            [{'name': 'c', 'kind': 'grep', 'pattern': 'colon_token', 'expect': 'present',
+              'paths': []}],
+            files=[],
+            repo_root=repo,
+            ref='HEAD',
+        )
+
+        assert [f.code for f in findings] == ['vacuous_present_comment_only']
+        assert any(site.startswith('src/a:b.py:1:') for site in findings[0].detail)
+
+    def test_a_colon_in_the_path_is_named_by_absent_overbroad(self, tmp_path):
+        repo = init_git_repo(
+            tmp_path / 'repo',
+            {'src/owned.py': 'legacy_token = 1\n', 'src/we:ird.py': 'legacy_token = 2\n'},
+        )
+
+        findings = lint_delivered_checks(
+            [{'name': 'legacy-gone', 'kind': 'grep', 'pattern': 'legacy_token',
+              'expect': 'absent', 'paths': []}],
+            files=['src/owned.py'],
+            repo_root=repo,
+            ref='HEAD',
+        )
+
+        assert [(f.severity, f.code) for f in findings] == [('warn', 'absent_overbroad')]
+        assert 'src/we:ird.py' in '\n'.join(findings[0].detail)
+
+    def test_a_non_ascii_sidecar_path_is_still_self_referential(self, tmp_path):
+        manifest = 'plans/café-prd.capability-manifest.yaml'
+        repo = init_git_repo(
+            tmp_path / 'repo',
+            {
+                manifest: (
+                    'capabilities:\n'
+                    '  - name: c\n'
+                    '    delivered_check:\n'
+                    '      pattern: cafe_token\n'
+                ),
+                'src/x.py': 'def f():\n    return 0\n',
+            },
+        )
+
+        findings = lint_delivered_checks(
+            [{'name': 'c', 'kind': 'grep', 'pattern': 'cafe_token', 'expect': 'present',
+              'paths': [], 'manifest_path': manifest}],
+            files=[],
+            repo_root=repo,
+            ref='HEAD',
+        )
+
+        assert [f.code for f in findings] == ['vacuous_present_self_referential']
