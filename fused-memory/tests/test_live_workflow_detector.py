@@ -1180,6 +1180,99 @@ class TestIsUnclaimedAwaitingDependency:
 
 
 # ---------------------------------------------------------------------------
+# Pending-normal awaiting-dependency orchestrator_live suppression (task 8330)
+# ---------------------------------------------------------------------------
+
+
+class TestPendingAwaitingDependencyOrchestratorSuppression:
+    """detect_live_workflow(status='pending', task_kind in (None, 'normal'),
+    unclaimed_awaiting_dependency=True) drops the bare project-wide lock — rule 6.
+
+    The scheduler never dispatches a task with an unmet local dependency, so for an
+    unclaimed pending task the lock cannot be evidence of a dispatch a recon write
+    could race. Any per-task git evidence keeps the signal.
+    """
+
+    _NOW = datetime(2026, 1, 1, tzinfo=UTC)
+
+    async def _detect(self, tmp_path, *, worktree_stdout=None, log_rc=1, log_stdout='', **kwargs):
+        side_effect, _ = _git_side_effect(
+            worktree_stdout=worktree_stdout or _worktree_porcelain_no_branch(),
+            log_rc=log_rc,
+            log_stdout=log_stdout,
+        )
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            return await detect_live_workflow(
+                _TASK_ID, str(tmp_path), now=self._NOW, _orchestrator_live=True, **kwargs,
+            )
+
+    @pytest.mark.parametrize('task_kind', ['normal', None], ids=['normal', 'absent'])
+    @pytest.mark.asyncio
+    async def test_bare_lock_dropped_for_unclaimed_task_awaiting_dependency(self, tmp_path, task_kind):
+        result = await self._detect(
+            tmp_path, status='pending', task_kind=task_kind, unclaimed_awaiting_dependency=True,
+        )
+
+        assert result.orchestrator_live is False
+        assert result.is_live is False
+        assert result.indeterminate is False
+
+    @pytest.mark.asyncio
+    async def test_registered_worktree_keeps_the_signal(self, tmp_path):
+        result = await self._detect(
+            tmp_path,
+            worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
+            status='pending', task_kind='normal', unclaimed_awaiting_dependency=True,
+        )
+
+        assert result.orchestrator_live is True
+        assert result.worktree_registered is True
+        assert result.is_live is True
+
+    @pytest.mark.asyncio
+    async def test_recent_commit_keeps_the_signal(self, tmp_path):
+        result = await self._detect(
+            tmp_path,
+            log_rc=0, log_stdout=(self._NOW - timedelta(hours=1)).isoformat(),
+            status='pending', task_kind='normal', unclaimed_awaiting_dependency=True,
+        )
+
+        assert result.orchestrator_live is True
+        assert result.recent_commit is True
+        assert result.is_live is True
+
+    @pytest.mark.parametrize(
+        'awaiting_kwargs',
+        [{'unclaimed_awaiting_dependency': False}, {}],
+        ids=['false', 'omitted'],
+    )
+    @pytest.mark.asyncio
+    async def test_dispatch_eligible_pending_task_keeps_the_signal(self, tmp_path, awaiting_kwargs):
+        result = await self._detect(tmp_path, status='pending', task_kind='normal', **awaiting_kwargs)
+
+        assert result.orchestrator_live is True
+        assert result.is_live is True
+
+    @pytest.mark.parametrize('task_kind', ['deterministic', 'other'])
+    @pytest.mark.asyncio
+    async def test_other_task_kinds_keep_the_signal(self, tmp_path, task_kind):
+        result = await self._detect(
+            tmp_path, status='pending', task_kind=task_kind, unclaimed_awaiting_dependency=True,
+        )
+
+        assert result.orchestrator_live is True
+
+    @pytest.mark.parametrize('status', ['in-progress', 'review', 'merge-deferred'])
+    @pytest.mark.asyncio
+    async def test_non_pending_statuses_keep_the_signal(self, tmp_path, status):
+        result = await self._detect(
+            tmp_path, status=status, task_kind='normal', unclaimed_awaiting_dependency=True,
+        )
+
+        assert result.orchestrator_live is True
+
+
+# ---------------------------------------------------------------------------
 # reify#5245 hardening: reaped-worktree / bare-branch / stranded-orchestrator
 # false-positive (task 2767)
 # ---------------------------------------------------------------------------
