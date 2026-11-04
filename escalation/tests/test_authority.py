@@ -19,7 +19,10 @@ stays in sync with the duplicated string.
 from __future__ import annotations
 
 import dataclasses
+import importlib.util
+import pathlib
 import re
+import types
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -912,6 +915,17 @@ def _unclaimed(**overrides: str) -> Escalation:
     return _record(policy_class=None, claimed_at=None, claimed_by=None, **overrides)
 
 
+_DASHBOARD_WATCHDOG_PATH = pathlib.Path(__file__).parents[2] / 'scripts' / 'dashboard-watchdog.py'
+
+
+def _load_dashboard_watchdog() -> types.ModuleType:
+    spec = importlib.util.spec_from_file_location('dashboard_watchdog', _DASHBOARD_WATCHDOG_PATH)
+    assert spec is not None and spec.loader is not None, _DASHBOARD_WATCHDOG_PATH
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 class TestExecutorIdentity:
     def test_executor_identity_resolves_levels_0_to_2(self) -> None:
         assert EXECUTOR_IDENTITY == 'orchestrator-escalation-executor'
@@ -926,8 +940,42 @@ class TestExecutorIdentity:
         assert COORDINATOR_IDENTITY in PROMOTE_ALLOWED
 
     def test_executor_deny_roles_extend_the_auto_close_deny_roles(self) -> None:
-        watchdogs = {'orchestrator-watchdog', 'dashboard-watchdog'}
+        watchdogs = {'orchestrator-watchdog', 'harness-dashboard-watchdog'}
         assert L2_AUTO_CLOSE_DENY_ROLES | watchdogs == EXECUTOR_DENY_ROLES
+
+    def test_dashboard_watchdog_role_is_denied_in_lockstep(self) -> None:
+        """The deny entry names the role the dashboard watchdog REALLY files under.
+
+        The alarm is filed by a hyphenated script, so its role string is
+        duplicated here rather than imported; loading the script is the only
+        thing that keeps the two pinned.
+        """
+        watchdog = _load_dashboard_watchdog()
+        assert watchdog.ESCALATION_AGENT_ROLE in EXECUTOR_DENY_ROLES
+
+    def test_real_dashboard_watchdog_alarm_is_neither_claimable_nor_closable(self) -> None:
+        watchdog = _load_dashboard_watchdog()
+        alarm = Escalation(
+            id='esc-dashboard-watchdog-restart-ceiling-1',
+            task_id=watchdog.ESCALATION_TASK_SENTINEL,
+            agent_role=watchdog.ESCALATION_AGENT_ROLE,
+            severity=watchdog.ESCALATION_SEVERITY,
+            category='infra_issue', summary='restart ceiling hit', level=2,
+        )
+        claim = _claim(alarm, 'self_cleared_infra')
+        assert claim is not None
+        assert claim.code is RefusalCode.DENIED_RECORD
+
+        claimed = dataclasses.replace(
+            alarm, policy_class='self_cleared_infra',
+            claimed_at=_FRESH, claimed_by=EXECUTOR_IDENTITY,
+        )
+        close = _executor(
+            claimed, resolution='ActiveState=active',
+            state={'self_cleared_infra': ClassSwitch.LIVE},
+        )
+        assert close is not None
+        assert close.code is RefusalCode.DENIED_RECORD
 
     def test_claim_ttl_is_the_six_hour_triage_ack_window(self) -> None:
         assert timedelta(hours=6) == CLAIM_TTL

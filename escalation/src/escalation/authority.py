@@ -188,8 +188,13 @@ L2_AUTO_CLOSE_DENY_ROLES: frozenset[str] = frozenset({'orchestrator-deterministi
 
 # The executor's deny roles: the sentinel role above plus the two watchdog
 # alarms. Its deny categories ARE L2_AUTO_CLOSE_DENY_CATEGORIES.
+# 'harness-dashboard-watchdog' is the role scripts/dashboard-watchdog.py
+# ::ESCALATION_AGENT_ROLE files under (the PRD's bare 'dashboard-watchdog' is
+# not a role any filer writes); tests/test_authority.py pins it in lockstep.
+# 'orchestrator-watchdog' (PRD boundary row 3) has no filer yet: it reserves
+# the role for the task-8270 host alarm.
 EXECUTOR_DENY_ROLES: frozenset[str] = L2_AUTO_CLOSE_DENY_ROLES | {
-    'orchestrator-watchdog', 'dashboard-watchdog',
+    'orchestrator-watchdog', 'harness-dashboard-watchdog',
 }
 
 # How long an executor claim stays fresh. The code home of the triage-ack
