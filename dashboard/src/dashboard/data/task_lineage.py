@@ -4,8 +4,9 @@ ACCESS (PRD ``plans/dashboard-prd-lanes-prd.md`` §4.2, §5.3), and the one
 caller of :func:`dashboard.data.tasks.fetch_metadata_projection`. Each root's
 index is refreshed in the background, one read at a time. A request waits for
 a refresh at most :data:`LINEAGE_REQUEST_WAIT_SECONDS`, then is served what
-the store holds: the newest good read, stale once a later read failed, or
-unknown before any read succeeded. No request is held past that wait.
+the store holds: the newest good read, stale once a later read failed or once
+it is older than its bound at the request's *now*, or unknown before any read
+succeeded. No request is held past that wait.
 
 No clock read: every instant is the caller's injected *now*, and a read's
 ``as_of`` is the *now* of the request that started it, so the index never
@@ -16,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
@@ -25,9 +27,11 @@ from types import MappingProxyType
 import httpx
 
 from dashboard.config import DashboardConfig
-from dashboard.data.datum import Datum, DatumState, unknown_datum
+from dashboard.data.datum import Datum, DatumState, aged_at, unknown_datum
 from dashboard.data.prd_attribution import LINEAGE_METADATA_KEYS, LineageEntry, lineage_entry
 from dashboard.data.tasks import TaskReadOffline, fetch_metadata_projection
+
+logger = logging.getLogger(__name__)
 
 LINEAGE_TTL_SECONDS = 300.0
 """Age below which a root's last good read is served without a refresh.
@@ -39,8 +43,15 @@ costs a PRD view little, while one unpaged projected read moves ~1.2 MB
 """
 
 LINEAGE_FRESHNESS_BOUND_SECONDS = 900
-"""The lineage Datum's freshness bound: three TTLs, so a value stays fresh
-across two failed or slow refreshes before ``aged_at`` reads it as stale."""
+"""The lineage Datum's freshness bound, three TTLs.
+
+It must exceed :data:`LINEAGE_TTL_SECONDS`, because a value inside its TTL
+is served without a refresh. A failed read does not wait for it: the failure
+is served ``stale`` at once, whatever the last good read's age, and is
+retried after :data:`LINEAGE_RETRY_SECONDS`. So this bound only ages a last
+good read that nothing has refreshed: after an idle spell with no request,
+or while a refresh started past an old ``as_of`` is still in flight.
+"""
 
 LINEAGE_PER_CALL_TIMEOUT = 6.0
 """Per-HTTP-request budget of the projected read.
@@ -98,18 +109,18 @@ async def acquire_lineage(
     *,
     now: datetime,
 ) -> Datum[TaskLineage]:
-    """*project_root*'s lineage index as it stands at *now*, refreshed when due."""
+    """*project_root*'s lineage index as it reads at *now*, refreshed when due."""
     root = str(project_root)
     state = _store.get(root, _RootState())
     if state.last_good is not None and _age(state.last_good.as_of, now) < LINEAGE_TTL_SECONDS:
-        return _served(state)
+        return aged_at(_served(state), now)
     refresh = _live_refresh(state)
     if refresh is None and not _retry_deferred(state, now):
         refresh = _start_refresh(client, config, root, now=now)
     if refresh is not None:
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(asyncio.shield(refresh), LINEAGE_REQUEST_WAIT_SECONDS)
-    return _served(_store.get(root, _RootState()))
+    return aged_at(_served(_store.get(root, _RootState())), now)
 
 
 def clear_lineage_state() -> None:
@@ -174,7 +185,12 @@ async def _refresh(
 async def _read(
     client: httpx.AsyncClient, config: DashboardConfig, root: str, *, started: datetime,
 ) -> _Measured | str:
-    """One bounded projected read: the measured index, or why there is none."""
+    """One bounded projected read: the measured index, or why there is none.
+
+    A timeout or an offline substrate is an outage and is answered quietly.
+    Any other exception, from the read or from parsing its rows, is our own
+    bug, and is logged with its traceback as well.
+    """
     try:
         rows = await asyncio.wait_for(
             fetch_metadata_projection(
@@ -183,13 +199,18 @@ async def _read(
             ),
             LINEAGE_READ_TIMEOUT,
         )
+        if isinstance(rows, TaskReadOffline):
+            return rows.detail
+        index = {row.id: lineage_entry(row.metadata, root) for row in rows}
     except TimeoutError:
         return f'lineage read exceeded its {LINEAGE_READ_TIMEOUT}s budget'
     except Exception as exc:
+        logger.warning(
+            'project %s: unexpected error while reading its lineage index, which keeps '
+            'its last good read (or none); this is a BUG, not an outage',
+            root, exc_info=True,
+        )
         return f'lineage read raised {type(exc).__name__}: {exc}'
-    if isinstance(rows, TaskReadOffline):
-        return rows.detail
-    index = {row.id: lineage_entry(row.metadata, root) for row in rows}
     return _Measured(MappingProxyType(index), as_of=started)
 
 

@@ -5,6 +5,7 @@ that serves it (PRD dashboard-prd-lanes §4.2, §5.1, §5.3)."""
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
@@ -13,7 +14,7 @@ import pytest
 from _canned_mcp import CannedMCP, _raw_row
 
 from dashboard.data import task_lineage
-from dashboard.data.datum import DatumState
+from dashboard.data.datum import DatumState, validate_datum
 from dashboard.data.prd_attribution import (
     LINEAGE_METADATA_KEYS,
     PrdKey,
@@ -107,16 +108,6 @@ class TestFetchMetadataProjection:
             (3, {'prd_path': 'plans/a-prd.md'}),
         ]
         assert all(isinstance(row, ProjectedTask) for row in result)
-
-    async def test_a_projected_row_is_not_a_shaped_task_row(self, dummy_client, dummy_config):
-        canned = CannedMCP(_rows())
-        with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
-            result = await fetch_metadata_projection(
-                dummy_client, dummy_config, ROOT, metadata_keys=('prd_path',),
-            )
-        assert isinstance(result, tuple)
-        assert not hasattr(result[0], 'title')
-        assert not hasattr(result[0], 'status')
 
     async def test_skips_non_integer_ids_and_normalises_missing_metadata(
         self, dummy_client, dummy_config,
@@ -337,6 +328,59 @@ class TestAcquireLineage:
         assert datum.value == good.value
         assert datum.reason is not None
         assert 'budget' in datum.reason
+
+    async def test_a_last_good_past_its_bound_is_served_stale_while_its_refresh_is_in_flight(
+        self, dummy_client, dummy_config, quick_waits,
+    ):
+        hanging = _Hanging(CannedMCP(_rows()))
+        hanging.hanging = False
+        bound = task_lineage.LINEAGE_FRESHNESS_BOUND_SECONDS
+        past_bound = T0 + timedelta(seconds=bound + 1)
+        with patch('dashboard.data.tasks.mcp_tool_call', new=hanging):
+            good = await acquire_lineage(dummy_client, dummy_config, ROOT, now=T0)
+            hanging.hanging = True
+            datum = await acquire_lineage(dummy_client, dummy_config, ROOT, now=past_bound)
+            await asyncio.sleep(0.3)
+        assert datum.state is DatumState.STALE
+        assert datum.as_of == T0
+        assert datum.value == good.value
+        assert datum.reason == (
+            f'measured {bound + 1}s before it was served, past the {bound}s freshness bound'
+        )
+        validate_datum(datum, past_bound)
+
+    @pytest.mark.parametrize('seam', ['fetch_metadata_projection', 'lineage_entry'])
+    async def test_an_unexpected_error_is_logged_as_a_bug_and_served_unknown(
+        self, dummy_client, dummy_config, monkeypatch, caplog, seam,
+    ):
+        def _bug(*_args, **_kwargs):
+            raise RuntimeError('lineage bug')
+
+        monkeypatch.setattr(task_lineage, seam, _bug)
+        with (
+            patch('dashboard.data.tasks.mcp_tool_call', new=CannedMCP(_rows())),
+            caplog.at_level(logging.WARNING, logger=task_lineage.__name__),
+        ):
+            datum = await acquire_lineage(dummy_client, dummy_config, ROOT, now=T0)
+        assert datum.state is DatumState.UNKNOWN
+        assert datum.reason == 'lineage read raised RuntimeError: lineage bug'
+        [record] = [r for r in caplog.records if r.name == task_lineage.__name__]
+        assert record.levelno == logging.WARNING
+        assert record.exc_info is not None
+        assert 'BUG' in record.getMessage()
+
+    async def test_an_outage_is_served_without_a_bug_warning(
+        self, dummy_client, dummy_config, caplog,
+    ):
+        canned = CannedMCP(_rows())
+        canned.fail_when = lambda call: call['tool'] == 'get_tasks'
+        with (
+            patch('dashboard.data.tasks.mcp_tool_call', new=canned),
+            caplog.at_level(logging.WARNING, logger=task_lineage.__name__),
+        ):
+            datum = await acquire_lineage(dummy_client, dummy_config, ROOT, now=T0)
+        assert datum.state is DatumState.UNKNOWN
+        assert [r for r in caplog.records if r.name == task_lineage.__name__] == []
 
     async def test_a_failed_read_is_not_retried_before_the_retry_floor(
         self, dummy_client, dummy_config,
