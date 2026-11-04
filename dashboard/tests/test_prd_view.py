@@ -4,7 +4,7 @@ census, active rows and lineage (PRD dashboard-prd-lanes §4.4–§4.5, §5.5)."
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from types import MappingProxyType
 from typing import Any
@@ -190,10 +190,12 @@ def _pending_since(days: float) -> str:
     return (NOW - timedelta(days=days)).isoformat()
 
 
+_Tasks = Mapping[int, tuple[str, str | None, Mapping[str, Any]]]
+
 # id: (status, priority, metadata). PRD A: 1 done, 2 ready, 3 a follow-up of 1,
 # 4 a done follow-up of 3 carrying two links, 5 cancelled; PRD B: 6 done only;
 # 7 no link; 8 done with no PRD; 9 a cross-project link; 10 a foreign PRD.
-_TASKS: dict[int, tuple[str, str | None, dict[str, Any]]] = {
+_TASKS: _Tasks = {
     1: ('done', 'medium', {'prd_path': PRD_A}),
     2: ('pending', 'medium', {'prd_path': PRD_A, 'pending_since': _pending_since(40)}),
     3: ('in-progress', 'medium', {'spawned_from': 1}),
@@ -208,7 +210,7 @@ _TASKS: dict[int, tuple[str, str | None, dict[str, Any]]] = {
 STATUS_MAP: dict[int, str] = {task_id: status for task_id, (status, _, _) in _TASKS.items()}
 
 
-def _active_row(task_id: int, status: str, priority: str | None, metadata: dict) -> dict:
+def _active_row(task_id: int, status: str, priority: str | None, metadata: Mapping) -> dict:
     row: dict[str, Any] = {
         'id': task_id, 'status': status, 'dependencies': [], 'metadata': metadata,
     }
@@ -217,7 +219,7 @@ def _active_row(task_id: int, status: str, priority: str | None, metadata: dict)
     return row
 
 
-def _rows(tasks: dict[int, tuple[str, str | None, dict[str, Any]]]) -> list[dict]:
+def _rows(tasks: _Tasks) -> list[dict]:
     """The open tasks' raw rows, as the snapshot unit holds its active rows."""
     return [
         _active_row(task_id, status, priority, metadata)
@@ -226,7 +228,7 @@ def _rows(tasks: dict[int, tuple[str, str | None, dict[str, Any]]]) -> list[dict
     ]
 
 
-def _lineage(tasks: dict[int, tuple[str, str | None, dict[str, Any]]]) -> dict[int, LineageEntry]:
+def _lineage(tasks: _Tasks) -> dict[int, LineageEntry]:
     return {task_id: lineage_entry(metadata, ROOT) for task_id, (_, _, metadata) in tasks.items()}
 
 
@@ -235,7 +237,7 @@ def _fresh(value: Any, as_of: datetime, bound: int) -> Datum[Any]:
 
 
 def _inputs(
-    tasks: dict[int, tuple[str, str | None, dict[str, Any]]] = _TASKS,
+    tasks: _Tasks = _TASKS,
     *,
     status_map: dict[int, str] | None = None,
     census: Datum[TaskCensus] | None = None,
@@ -335,7 +337,7 @@ def test_the_census_identity_holds_against_the_status_map():
     )
 
 
-def _with_metadata(task_id: int, **metadata: Any) -> dict[int, tuple[str, str | None, dict]]:
+def _with_metadata(task_id: int, **metadata: Any) -> _Tasks:
     status, priority, base = _TASKS[task_id]
     return {**_TASKS, task_id: (status, priority, {**base, **metadata})}
 
@@ -446,8 +448,9 @@ def test_an_input_past_its_own_bound_at_now_is_judged_stale():
     assert datum.state is DatumState.STALE
     assert datum.reason == 'active_rows: measured 31s before it was served, past the 30s freshness bound'
     assert datum.value is not None
-    [_, active_rows, _] = datum.value.to_wire()['inputs']
-    assert active_rows['state'] == 'stale'
+    assert [state.state for state in datum.value.inputs] == [
+        DatumState.FRESH, DatumState.STALE, DatumState.FRESH,
+    ]
 
 
 def test_every_non_fresh_input_is_named_in_the_reason():
