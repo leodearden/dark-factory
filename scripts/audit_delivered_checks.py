@@ -214,7 +214,8 @@ class Finding(NamedTuple):
     """One classified descriptor.
 
     ``superseded_by`` is set only when the supersession probe attributed a
-    later task to the pattern's return.
+    later task to the change that undid the check (see
+    :func:`find_superseding_task`).
 
     ``open_dependents`` names the still-open tasks that depend on this
     descriptor's producer — the tasks a defective check actually holds up. It
@@ -696,21 +697,61 @@ _TASK_IN_SUBJECT_RE = re.compile(r"task[\s/-]#?(\d+)")
 _SUPERSESSION_EXCLUDE_PATHSPEC = f":(exclude)*{MANIFEST_SUFFIX}"
 
 
+def _grep_history_argv(row: DescriptorRow, repo_root: str, since: str) -> list[str] | None:
+    """The commits since *since* that changed the pattern's occurrence count."""
+    if not row.pattern:
+        return None
+    argv = [
+        "git", "-C", repo_root, "log", "--format=%s",
+        f"--since={since}", "-S", row.pattern, "--pickaxe-regex",
+    ]
+    # A pathspec of nothing-but-exclusions applies the exclusion to the
+    # implicit "everything" — verified against this repo's git rather than
+    # assumed, since older git treats it as matching nothing.
+    return [*argv, "--", *row.paths, _SUPERSESSION_EXCLUDE_PATHSPEC]
+
+
+def _path_history_argv(row: DescriptorRow, repo_root: str, since: str) -> list[str] | None:
+    """The commits since *since* that created or deleted a listed path."""
+    return [
+        "git", "-C", repo_root, "log", "--format=%s",
+        f"--since={since}", "--diff-filter=AD", "--", *row.paths,
+    ]
+
+
+_HISTORY_ARGVS: dict[str, Callable[[DescriptorRow, str, str], list[str] | None]] = {
+    "grep": _grep_history_argv,
+    "path": _path_history_argv,
+}
+
+
+def _history_argv(row: DescriptorRow, *, repo_root: str, since: str) -> list[str] | None:
+    """The kind's history probe: the commits that could have undone *row*."""
+    return _HISTORY_ARGVS[row.kind](row, repo_root, since)
+
+
 def find_superseding_task(
     row: DescriptorRow, *, repo_root: str, since: str | None
 ) -> str | None:
-    r"""A LATER task that reintroduced *row*'s pattern, or ``None``.
+    r"""A LATER task that undid *row*'s capability, or ``None``.
 
     Only ever consulted for a would-be ``broken`` row, and only ever able to
     DOWNGRADE it — so a false negative costs a footnote and a false positive
-    costs a missed defect. That asymmetry is why the attribution is strict:
-    the task id must come from the merge-commit subject convention, never
-    inferred from the diff or the author.
+    costs a missed defect. That asymmetry is why the attribution is strict,
+    for both probes in :data:`_HISTORY_ARGVS`: the task id must come from the
+    merge-commit subject convention, never inferred from the diff or the
+    author.
 
     *since* is the producer's ``updated_at``; commits at or before it are the
     producer's own work, not a later undoing. Absent, no claim is made at all
     rather than scanning all of history and attributing the producer's own
     merge to it.
+
+    A grep row's probe is the pickaxe: the commits that changed the pattern's
+    occurrence count. A path row's is its analogue, ``--diff-filter=AD``: the
+    commits that created or deleted a listed path. The path probe needs no
+    manifest exclusion, because it names explicit paths rather than searching
+    contents.
 
     ``--pickaxe-regex`` IS LOAD-BEARING, not a refinement. A bare ``-S`` is a
     LITERAL-string pickaxe, but every pattern here is the POSIX ERE that
@@ -724,16 +765,11 @@ def find_superseding_task(
     repo: literal ``-S`` returns nothing for both patterns, ``--pickaxe-regex``
     returns 3578's commits for both.
     """
-    if not since or not row.pattern:
+    if not since:
         return None
-    argv = [
-        "git", "-C", repo_root, "log", "--format=%s",
-        f"--since={since}", "-S", row.pattern, "--pickaxe-regex",
-    ]
-    # A pathspec of nothing-but-exclusions applies the exclusion to the
-    # implicit "everything" — verified against this repo's git rather than
-    # assumed, since older git treats it as matching nothing.
-    argv += ["--", *row.paths, _SUPERSESSION_EXCLUDE_PATHSPEC]
+    argv = _history_argv(row, repo_root=repo_root, since=since)
+    if argv is None:
+        return None
     try:
         result = subprocess.run(argv, capture_output=True, text=True, timeout=60)
     except (OSError, subprocess.TimeoutExpired):
@@ -981,6 +1017,13 @@ _COVERAGE_CAVEAT = (
 )
 
 
+def _subject_pair(row: DescriptorRow) -> tuple[str, str]:
+    """What the check asserts about: a path row's paths, a grep row's pattern."""
+    if row.kind == "path":
+        return ("paths", ",".join(row.paths))
+    return ("pattern", repr(row.pattern))
+
+
 def _format_finding(finding: Finding) -> list[str]:
     """One finding as a key=value line plus its indented ``reason:``.
 
@@ -995,7 +1038,7 @@ def _format_finding(finding: Finding) -> list[str]:
         ("status", row.status),
         ("name", row.name),
         ("expect", row.expect),
-        ("pattern", repr(row.pattern)),
+        _subject_pair(row),
         ("source", row.source),
     ]
     if row.manifest:

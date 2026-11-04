@@ -693,8 +693,10 @@ only on `broken` (a done producer whose capability is nowhere on main),
 check) and an actionable stale path (a live producer, or a done one with open
 dependents; the rest are listed report-only); `superseded` — a correct
 descriptor that later work legitimately undid — is reported and never
-actionable. A separate report-only section lists sidecar
-descriptors carrying a structural code (`vacuous_present_self_referential`,
+actionable. Grep and path descriptors both get a disposition; a grep's
+supersession is read from the commits that changed its pattern's occurrences,
+a path's from the commits that created or deleted it. A separate report-only
+section lists sidecar descriptors carrying a structural code (`vacuous_present_self_referential`,
 `vacuous_present_comment_only`, `filename_shaped`). Those codes are measured
 against today's tree, and a reworded comment or a later file flips them, so
 they never affect the exit code and no gating test sweeps them.
