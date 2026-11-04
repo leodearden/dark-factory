@@ -443,7 +443,10 @@ class TestTaskProseRoute:
         body = response.json()
         assert body['error'] == 'budget_exceeded'
         assert body['detail']
-        assert fused_memory.tool_calls(), 'the read must have reached get_task before hanging'
+        assert [post.method for post in fused_memory.posts] == ['tools/call'], (
+            'the budgeted read must be the single get_task post, sent on an already-open '
+            'session, before it hangs'
+        )
         [record] = [r for r in caplog.records if r.name == 'dashboard.api.task_prose']
         assert 'proj' in record.getMessage()
         assert '19' in record.getMessage()
