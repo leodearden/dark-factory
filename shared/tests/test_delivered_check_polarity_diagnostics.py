@@ -7,6 +7,7 @@ against a real throwaway git repo.
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -498,6 +499,21 @@ class TestFilenameShaped:
 
         assert findings == []
 
+    def test_an_escape_git_reads_otherwise_names_no_filename(self, tmp_path):
+        r"""git reads ``\d`` as a literal ``d`` and Python as a digit, so a
+        digit in a tracked filename is evidence of nothing."""
+        repo = init_git_repo(tmp_path / 'repo', {'src/test_7.py': 'def run():\n    pass\n'})
+
+        findings = lint_delivered_checks(
+            [{'name': 'digit-escape', 'kind': 'grep', 'pattern': r'test_\d',
+              'expect': 'present', 'paths': ['src']}],
+            files=['src'],
+            repo_root=repo,
+            ref='HEAD',
+        )
+
+        assert findings == []
+
     def test_the_filename_rule_lists_only_the_corpus_the_grep_searches(self, tmp_path):
         """From ``git -C sub``, the grep reads only ``sub/`` and prints names
         relative to it, so the filename rule must list exactly that."""
@@ -932,6 +948,28 @@ class TestMatchSitesSurviveUnusualPaths:
 
         assert [(f.severity, f.code) for f in findings] == [('warn', 'absent_overbroad')]
         assert 'src/we:ird.py' in '\n'.join(findings[0].detail)
+
+    def test_an_undecodable_name_degrades_only_its_own_record(self, tmp_path):
+        undecodable = 'src/' + os.fsdecode(b'\xff') + '.py'
+        repo = init_git_repo(
+            tmp_path / 'repo',
+            {
+                'src/owned.py': 'legacy_token = 1\n',
+                'src/elsewhere.py': 'legacy_token = 2\n',
+                undecodable: 'legacy_token = 3\n',
+            },
+        )
+
+        findings = lint_delivered_checks(
+            [{'name': 'legacy-gone', 'kind': 'grep', 'pattern': 'legacy_token',
+              'expect': 'absent', 'paths': []}],
+            files=['src/owned.py'],
+            repo_root=repo,
+            ref='HEAD',
+        )
+
+        assert [(f.severity, f.code) for f in findings] == [('warn', 'absent_overbroad')]
+        assert 'src/elsewhere.py' in '\n'.join(findings[0].detail)
 
     def test_a_non_ascii_sidecar_path_is_still_self_referential(self, tmp_path):
         manifest = 'plans/café-prd.capability-manifest.yaml'

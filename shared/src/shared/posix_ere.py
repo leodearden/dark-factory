@@ -25,36 +25,85 @@ _POSIX_CLASSES: dict[str, str] = {
 }
 
 
-def to_python_regex(pattern: str) -> str | None:
-    """*pattern*, a POSIX ERE, as a Python regex that matches the same text.
+#: The escaped letters both engines read alike outside a bracket: GNU ERE's
+#: word and space classes and word boundaries, which Python shares. Every
+#: other escaped letter or digit diverges: ``\d`` is a literal ``d`` to
+#: glibc and a digit class to Python.
+_SHARED_LETTER_ESCAPES = frozenset('wWsSbB')
 
-    Only bracket expressions are rewritten: inside one a backslash is a
-    literal, ``[:name:]`` is a character class, and Python's set operators
-    (``&&``, ``||``, ``~~``, ``--``, a nested ``[``) mean nothing. ``None``
-    when the bracket expression is unterminated or uses a feature with no
-    ASCII translation (an unknown class, ``[.x.]``, ``[=x=]``).
+#: Escaped punctuation GNU ERE reads as an anchor and Python as itself.
+_GNU_ANCHOR_ESCAPES = frozenset('<>`\'')
+
+#: The characters that end a quantifier, after which Python 3.11+ reads a
+#: ``+`` as possessive and GNU ERE as one more repetition.
+_QUANTIFIER_ENDS = frozenset('*+?}')
+
+
+def to_python_regex(pattern: str) -> str | None:
+    """*pattern*, a POSIX ERE, as Python regex source; ``None`` where the two
+    engines are known to read it differently.
+
+    Bracket expressions are translated: inside one a backslash is a literal,
+    ``[:name:]`` is a character class, and Python's set operators (``&&``,
+    ``||``, ``~~``, ``--``, a nested ``[``) mean nothing. Outside a bracket
+    nothing is rewritten; a construct there whose meaning differs yields
+    ``None``: an escaped letter or digit outside
+    :data:`_SHARED_LETTER_ESCAPES`, a GNU anchor escape, a trailing
+    backslash, Python's ``(?`` extension syntax, and a ``+`` after a
+    quantifier. So do an unterminated bracket expression and one using a
+    feature with no ASCII translation (an unknown class, ``[.x.]``,
+    ``[=x=]``). Everything else passes through as written, so the result
+    serves a diagnostic, never a verdict.
     """
     out: list[str] = []
+    after_quantifier = False
     i = 0
     while i < len(pattern):
         char = pattern[i]
         if char == '\\':
-            out.append(pattern[i : i + 2])
+            escaped = pattern[i + 1 : i + 2]
+            if not _escape_reads_alike(escaped):
+                return None
+            out.append(char + escaped)
             i += 2
-            continue
-        if char != '[':
+        elif char == '[':
+            end = _bracket_end(pattern, i)
+            translated = _translate_bracket(pattern[i + 1 : end - 1]) if end > 0 else None
+            if translated is None:
+                return None
+            out.append(translated)
+            i = end
+        elif (char == '(' and pattern.startswith('?', i + 1)) or (
+            char == '+' and after_quantifier
+        ):
+            return None
+        else:
             out.append(char)
             i += 1
-            continue
-        end = _bracket_end(pattern, i)
-        if end < 0:
-            return None
-        translated = _translate_bracket(pattern[i + 1 : end - 1])
-        if translated is None:
-            return None
-        out.append(translated)
-        i = end
+        after_quantifier = char in _QUANTIFIER_ENDS
     return ''.join(out)
+
+
+def compile_ere(pattern: str) -> re.Pattern[str] | None:
+    """*pattern*, a ``git grep -E`` ERE, compiled from
+    :func:`to_python_regex`; ``None`` when it cannot be translated or Python
+    rejects the translation."""
+    translated = to_python_regex(pattern)
+    if translated is None:
+        return None
+    try:
+        return re.compile(translated)
+    except re.error:
+        return None
+
+
+def _escape_reads_alike(escaped: str) -> bool:
+    """A backslash before *escaped* means the same to GNU ERE and Python."""
+    if not escaped:
+        return False
+    if escaped.isascii() and escaped.isalnum():
+        return escaped in _SHARED_LETTER_ESCAPES
+    return escaped not in _GNU_ANCHOR_ESCAPES
 
 
 def _translate_bracket(body: str) -> str | None:

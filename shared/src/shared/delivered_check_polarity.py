@@ -133,7 +133,6 @@ import functools
 import json
 import logging
 import posixpath
-import re
 import subprocess
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
@@ -152,7 +151,7 @@ from shared.delivered_check_scope import (
     resolve_commit,
     stale_scope_paths,
 )
-from shared.posix_ere import to_python_regex, top_level_arms
+from shared.posix_ere import compile_ere, top_level_arms
 
 __all__ = [
     'GATE_REF',
@@ -855,7 +854,11 @@ def _grep_matches(
     itself the literal ``'-E'``, since the flag precedes the pattern.
     ``-z`` NUL-terminates the name and line number, so a ``:`` in a path
     cannot split a record and names arrive unquoted (see
-    :func:`_parse_grep_records`).
+    :func:`_parse_grep_records`). Unquoted names can be raw non-UTF-8
+    bytes, so each undecodable byte is replaced by U+FFFD: one such name or
+    line degrades only its own record, never the whole site list. A
+    replaced name equals no declared or descriptor-family path, which is
+    also true of the name it replaced.
 
     ``None`` (not ``[]``) for an unanswerable question is the load-bearing
     distinction: ``[]`` would read as "matches, but none of them are
@@ -867,7 +870,11 @@ def _grep_matches(
     argv[flag:flag] = ['-n', '-z']
     try:
         completed = subprocess.run(
-            argv, capture_output=True, text=True, timeout=timeout_secs
+            argv,
+            capture_output=True,
+            encoding='utf-8',
+            errors='replace',
+            timeout=timeout_secs,
         )
     except GIT_PROBE_FAILURES:
         return None
@@ -1066,15 +1073,15 @@ def _filename_shaped_finding(
 
     Python's engine is used HERE and nowhere else in this module, because
     the subject is a path LIST that git offers no grep mode over. The ERE
-    is first translated by ``shared/src/shared/posix_ere.py::to_python_regex``,
-    so the diagnostic reads a bracket expression as git does. A pattern
-    that cannot be translated or compiled yields ``None`` (no finding),
-    never a guess, and a verdict is never decided this way.
+    is compiled by ``shared/src/shared/posix_ere.py::compile_ere``, so the
+    diagnostic reads a bracket expression as git does. A pattern it cannot
+    read as git does yields ``None`` (no finding), never a guess, and a
+    verdict is never decided this way.
     """
     tracked = _tracked_paths(paths, repo_root=repo_root, ref=ref)
     if not tracked:
         return None
-    matcher = _compile_ere(pattern)
+    matcher = compile_ere(pattern)
     if matcher is None:
         return None
     hits = [path for path in tracked if matcher.search(path)]
@@ -1098,18 +1105,6 @@ def _filename_shaped_finding(
     )
 
 
-def _compile_ere(pattern: str) -> re.Pattern[str] | None:
-    """*pattern*, a ``git grep -E`` ERE, compiled so Python reads it as git
-    does; ``None`` when it cannot be translated or compiled."""
-    translated = to_python_regex(pattern)
-    if translated is None:
-        return None
-    try:
-        return re.compile(translated)
-    except re.error:
-        return None
-
-
 def _declared_filename_finding(
     name: str,
     pattern: str,
@@ -1126,8 +1121,8 @@ def _declared_filename_finding(
     The task's ``metadata.files`` can.
 
     THE RULE, exactly: EVERY top-level alternative of the pattern (see
-    ``shared/src/shared/posix_ere.py::top_level_arms``), translated by
-    ``shared/src/shared/posix_ere.py::to_python_regex`` so a bracket
+    ``shared/src/shared/posix_ere.py::top_level_arms``), compiled by
+    ``shared/src/shared/posix_ere.py::compile_ere`` so a bracket
     expression reads as git reads it, FULLY matches the basename or the
     stem (basename minus its last suffix) of one declared file that EVERY
     entry of the check's ``paths`` contains (the whole tree
@@ -1138,15 +1133,15 @@ def _declared_filename_finding(
     can be a wiring check — a declared module named in ANOTHER file's
     import.
     A pattern the splitter cannot parse is judged whole, and only when it
-    carries no ``|`` at all. An arm that cannot be translated or compiled
-    yields no finding, never a guess.
+    carries no ``|`` at all. An arm ``compile_ere`` cannot read yields no
+    finding, never a guess.
     """
     arms = top_level_arms(pattern)
     if arms is None:
         if '|' in pattern:
             return None
         arms = [pattern]
-    matchers = [matcher for matcher in map(_compile_ere, arms) if matcher is not None]
+    matchers = [matcher for matcher in map(compile_ere, arms) if matcher is not None]
     if len(matchers) != len(arms):
         return None
     for declared in files:

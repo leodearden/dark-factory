@@ -8,7 +8,7 @@ import warnings
 
 import pytest
 
-from shared.posix_ere import to_python_regex, top_level_arms
+from shared.posix_ere import compile_ere, to_python_regex, top_level_arms
 
 
 def _compiled(pattern: str) -> re.Pattern[str]:
@@ -101,6 +101,48 @@ class TestToPythonRegex:
     )
     def test_untranslatable_input_is_none(self, pattern):
         assert to_python_regex(pattern) is None
+
+    @pytest.mark.parametrize('pattern', [r'a\.b', r'\w+', r'\bword\b', r'\s\S\W\B', r'a\|b'])
+    def test_an_escape_both_engines_read_alike_is_unchanged(self, pattern):
+        assert to_python_regex(pattern) == pattern
+
+    @pytest.mark.parametrize(
+        'pattern',
+        [
+            pytest.param(r'\d+', id='digit-escape-is-a-literal-d-to-glibc'),
+            pytest.param(r'\D', id='non-digit-escape'),
+            pytest.param(r'\<word\>', id='gnu-word-anchors'),
+            pytest.param(r"\`start\'", id='gnu-buffer-anchors'),
+            pytest.param(r'a\nb', id='newline-escape'),
+            pytest.param(r'(a)\1', id='back-reference'),
+            pytest.param('trailing\\', id='trailing-backslash'),
+            pytest.param('(?i)word', id='python-extension-group'),
+            pytest.param('a*+', id='possessive-star'),
+            pytest.param('a++', id='possessive-plus'),
+            pytest.param('a{2}+', id='possessive-interval'),
+        ],
+    )
+    def test_a_construct_the_engines_read_differently_is_none(self, pattern):
+        assert to_python_regex(pattern) is None
+
+
+class TestCompileEre:
+    def test_a_translatable_pattern_compiles_as_git_reads_it(self):
+        matcher = compile_ere('a[[:space:]]b')
+
+        assert matcher is not None
+        assert matcher.search('a b')
+        assert not matcher.search('a:]b')
+
+    @pytest.mark.parametrize(
+        'pattern',
+        [
+            pytest.param('[[:nope:]]', id='untranslatable'),
+            pytest.param('a**', id='python-rejects-the-translation'),
+        ],
+    )
+    def test_a_pattern_it_cannot_read_is_none(self, pattern):
+        assert compile_ere(pattern) is None
 
 
 class TestTopLevelArms:
