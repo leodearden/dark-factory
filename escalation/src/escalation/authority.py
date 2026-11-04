@@ -110,7 +110,9 @@ ROLE_LEVEL_ALLOWLIST: dict[str, frozenset[int]] = {
 
 # Identities permitted to mint a new L2 via promote_to_l2. Header-less
 # (absent identity) callers are unaffected — this only gates identified
-# callers not in this set.
+# callers not in this set. The coordinator is a member because PRD §3
+# decision 3 gives it full levels, denied only on a fresh executor claim;
+# refusing it promote_to_l2 would be a second, unstated denial.
 PROMOTE_ALLOWED: frozenset[str] = frozenset({
     _WATCHER_AUTO_IDENTITY, EXECUTOR_IDENTITY, COORDINATOR_IDENTITY,
 })
