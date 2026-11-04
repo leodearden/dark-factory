@@ -100,6 +100,7 @@ from orchestrator.lane_lifecycle import (
     POOL_ROOT_SENTINEL,  # noqa: F401  re-export shim (test_pool_storage_guard.py)
     AcquireRoute,
     LaneLifecycle,
+    LaneLiveness,
     LaneState,
 )
 from orchestrator.lane_task_dir import archive_root_for, evict_previous_occupant
@@ -2999,9 +3000,7 @@ class GitOps:
         # K>1 warm-up burst.  Reset-in-place (already-registered) acquires are
         # per-lane and don't contend, so this only guards the one-time create path.
         self._spec_wt_create_lock: asyncio.Lock = asyncio.Lock()
-        # Live lane_in_use spans per lane in THIS process (leaf δ), keyed by
-        # resolved lane path; only the exit to zero marks the lane idle.
-        self._lane_in_use_depth: dict[Path, int] = {}
+        self._lane_liveness = LaneLiveness()
         # Serialize create_interactive_worktree's cap-count + create-once span
         # on THIS instance (task 2010 amendment) — mirrors _spec_wt_create_lock
         # above.  Without it, two concurrent calls can both observe the
@@ -4290,12 +4289,11 @@ class GitOps:
         """Hold a warm lane's durable record at IN_USE while a dark-factory
         child runs in it (leaf δ, task 3076).
 
-        This is only the span: the ASSIGNED <-> IN_USE edges, and their
-        never-raise contract, live in ``LaneLifecycle.note_in_use`` /
-        ``note_idle``. Observable as ``<worktree_base>/.lane-state/<lane>.json``
-        reading ``"state": "in_use"`` inside the block and ``"assigned"``
-        after it, however the block exits. A no-op for ``None``, a pool-less
-        GitOps, or a worktree that is not a pool lane. Unrelated to
+        Observable as ``<worktree_base>/.lane-state/<lane>.json`` reading
+        ``"state": "in_use"`` inside the block and ``"assigned"`` after it,
+        however the block exits; with nested spans on one lane, only the last
+        exit steps it back (``LaneLiveness.span``). A no-op for ``None``, a
+        pool-less GitOps, or a worktree that is not a pool lane. Unrelated to
         :meth:`pool_in_use`, which asks whether a warm-lane pool is enabled.
         Which spawn sites hold it: plans/warm-lane-infra-repatriation-prd.md
         §11 q2.
@@ -4304,20 +4302,8 @@ class GitOps:
         if lane_dir is None or pool is None or not pool.is_lane(lane_dir):
             yield
             return
-        key = lane_dir.resolve()
-        # No lock: no await falls between a depth update and its synchronous
-        # record write, and every span runs on the one asyncio loop (the same
-        # in-process reasoning as WarmLanePool.assignments_snapshot). Every
-        # enter re-marks, so a span opened after a re-assignment is truthful.
-        self._lane_in_use_depth[key] = self._lane_in_use_depth.get(key, 0) + 1
-        try:
-            self._lane_lifecycle.note_in_use(lane_dir)
+        with self._lane_liveness.span(lane_dir, self._lane_lifecycle):
             yield
-        finally:
-            self._lane_in_use_depth[key] -= 1
-            if self._lane_in_use_depth[key] == 0:
-                del self._lane_in_use_depth[key]
-                self._lane_lifecycle.note_idle(lane_dir)
 
     def reset_stale_lane_in_use_records(self) -> list[str]:
         """Step every IN_USE lane record with no live span here back to ASSIGNED.
@@ -4327,7 +4313,7 @@ class GitOps:
         the names of the lanes it reset.
         """
         return self._lane_lifecycle.reset_stale_in_use(
-            skip=[lane.name for lane in self._lane_in_use_depth],
+            skip=self._lane_liveness.live_lane_names(),
         )
 
     async def _is_registered_worktree(self, path: Path) -> bool:

@@ -15,6 +15,7 @@ mixing those in would break the pool's purity and its existing 2-value
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 from dataclasses import asdict, dataclass, replace
@@ -26,7 +27,7 @@ from typing import TYPE_CHECKING, TypeGuard
 from shared import safe_io
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Iterable, Iterator
 
     from escalation.queue import EscalationQueue
 
@@ -829,3 +830,36 @@ class LaneLifecycle:
                 self._worktree_base,
                 exc_info=True,
             )
+
+
+class LaneLiveness:
+    """In-process count of the live dark-factory children in each warm lane (leaf δ).
+
+    ``span`` holds a lane's durable record at IN_USE: every enter marks it,
+    so a span opened after a re-assignment is truthful, and only the exit of
+    the last live span marks it idle again. The edges themselves, and their
+    never-raise contract, are ``LaneLifecycle.note_in_use`` / ``note_idle``.
+    Counted per lane name, the identity a durable record is keyed by. Not
+    thread-safe: every span runs on the one asyncio loop, and nothing yields
+    between a count update and its record write.
+    """
+
+    def __init__(self) -> None:
+        self._depth: dict[str, int] = {}
+
+    @contextlib.contextmanager
+    def span(self, lane: Path, lifecycle: LaneLifecycle) -> Iterator[None]:
+        name = lane.name
+        self._depth[name] = self._depth.get(name, 0) + 1
+        try:
+            lifecycle.note_in_use(lane)
+            yield
+        finally:
+            self._depth[name] -= 1
+            if self._depth[name] == 0:
+                del self._depth[name]
+                lifecycle.note_idle(lane)
+
+    def live_lane_names(self) -> list[str]:
+        """Names of the lanes holding at least one live span."""
+        return list(self._depth)
