@@ -13,10 +13,10 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from _escalation_seed import seed_escalation
+
 from escalation.models import Escalation
 from escalation.queue import ClaimResult, EscalationQueue
-
-from _escalation_seed import seed_escalation
 
 _EXECUTOR = 'orchestrator-escalation-executor'
 
