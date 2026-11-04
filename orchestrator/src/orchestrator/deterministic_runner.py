@@ -41,7 +41,12 @@ from shared.task_metadata import (
 )
 
 from orchestrator import systemd_inspect
-from orchestrator.before_done_script import REAP_GRACE_SECS, ScriptTimeout, run_script
+from orchestrator.before_done_script import (
+    REAP_GRACE_SECS,
+    ProcessTeardown,
+    ScriptTimeout,
+    run_script,
+)
 from orchestrator.config import PREDICATE_RECHECK_STALL_CAP
 from orchestrator.deploy_state import (
     DeployPhase,
@@ -109,6 +114,67 @@ logger = logging.getLogger(__name__)
 # returns at all (a detached/unkillable child, or a custom script_runner that
 # simply hangs).
 _RUN_TIMEOUT_GRACE_SECS: float = 30.0
+
+
+def _deploy_timeout_fact_lines(exc: ScriptTimeout, *, script: Path) -> list[str]:
+    """The FACT sentences both DEPLOY arms print for a ``ScriptTimeout``.
+
+    Shared so the two deploy branches cannot come to say different things
+    about the same event (task 4252).  The predicate arm shares only
+    ``ScriptTimeout.budget_line``: its CONSEQUENCE differs (no milestone
+    VERDICT), and the predicate infra arms all file one category, so their
+    wording is the only thing telling a human which guard fired.
+
+    Args:
+        script: the absolute path that ran (``_before_done_paths``), the
+            survivor sentence's search key.
+    """
+    lines = [exc.budget_line('Deploy script')]
+    if exc.exit_code is None:
+        if exc.teardown is ProcessTeardown.NOT_SIGNALLED:
+            # This cell is reachable only as a signal death, and the plain
+            # "had not exited" spelling below would be false in it:
+            # NOT_SIGNALLED means the script was ALREADY reaped when the
+            # teardown ran, and a reaped script with no exit code is one that
+            # died of a signal (a negative returncode is not an exit code).
+            why_no_code = (
+                'the script had already died of a SIGNAL rather than exiting, and '
+                'a signal death produces no exit code'
+            )
+        else:
+            why_no_code = 'the script had not exited when the timeout fired'
+        lines.append(
+            f'No exit code was produced — {why_no_code}. No output was captured '
+            f'either: the merged stdout/stderr read was still in flight. The '
+            f'script DID run, so it may have applied PART of its effect: inspect '
+            f'out-of-band before resolving.'
+        )
+    elif exc.teardown is ProcessTeardown.GROUP_KILLED:
+        lines.append(
+            f'The script ITSELF had already exited with code {exc.exit_code}: '
+            f'the timeout fired because a process it spawned outlived it, '
+            f'still holding the merged stdout/stderr pipe open, and that '
+            f'survivor was killed with the group. So the script ran to '
+            f'completion — but its exit code never reached the deploy '
+            f'classifier, so this deploy is NOT recorded as successful even '
+            f'when that code is 0, and no output was captured because the '
+            f'read was still in flight. Check out-of-band what the surviving '
+            f'child was and whether killing it left the effect half-applied.'
+        )
+    else:
+        lines.append(
+            f'The script ITSELF had already exited with code {exc.exit_code}: '
+            f'the timeout fired because a process it spawned outlived it, '
+            f'still holding the merged stdout/stderr pipe open. So the script '
+            f'ran to completion — but its exit code never reached the deploy '
+            f'classifier, so this deploy is NOT recorded as successful even '
+            f'when that code is 0, and no output was captured because the read '
+            f'was still in flight.'
+        )
+    survivor = exc.survivor_line(script)
+    if survivor is not None:
+        lines.append(survivor)
+    return lines
 
 
 # Task 2091 / 2119: bound `_default_inspect_unit`'s `systemctl --user show`
@@ -2510,7 +2576,7 @@ class DeterministicRunner:
         ``description`` / ``metadata`` are in scope to file the escalation,
         which is not here.  The anti-drift property this helper exists for is
         preserved for the timeout case by the shared
-        ``ScriptTimeout.deploy_fact_lines``; both branches are pinned by
+        ``_deploy_timeout_fact_lines``; both branches are pinned by
         ``TestDefaultRunnerInnerTimeoutDeployHonesty``.
         """
         try:
@@ -2580,8 +2646,8 @@ class DeterministicRunner:
             inner_timeout_detail = '\n'.join([
                 description,
                 note,
-                *exc.deploy_fact_lines(
-                    script=self._before_done_paths(before_done).script,
+                *_deploy_timeout_fact_lines(
+                    exc, script=self._before_done_paths(before_done).script,
                 ),
                 'before_done_ran_at is already stamped (I1) — the deploy is NOT re-run.',
             ])
@@ -3723,7 +3789,7 @@ class DeterministicRunner:
                     inner_timeout_detail = '\n'.join([
                         description,
                         f'Target unit: {target_unit}',
-                        *exc.deploy_fact_lines(script=paths.script),
+                        *_deploy_timeout_fact_lines(exc, script=paths.script),
                         'The post-deploy fresh-PID verify never ran, so the unit state '
                         'after the timeout is unobserved — check it out-of-band (e.g. '
                         'systemctl --user status) before resolving.',

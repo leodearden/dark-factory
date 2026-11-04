@@ -74,10 +74,9 @@ def summarize_predicate_output(out: object, *, rc: int) -> str:
     The denylist rejection is otherwise deliberately CONSERVATIVE and will
     drop an otherwise clean final line that merely contains a standalone
     ``INFO``/``ERROR`` token.  Losing a payload is the safe failure
-    direction: the verdict prefix always survives, and
-    ``orchestrator/src/orchestrator/deterministic_runner.py::DeterministicRunner._run_predicate``
-    logs the raw output before calling this, so nothing is silently
-    discarded.
+    direction: the verdict prefix always survives, and a caller that must
+    keep the raw output logs it before calling this — this function returns
+    a note, it does not decide what else is kept.
 
     An oversized payload is replaced WHOLESALE with a marker naming the
     dropped size — never sliced.  Task 2054 found a raw ``note[:N]`` slice
@@ -86,9 +85,8 @@ def summarize_predicate_output(out: object, *, rc: int) -> str:
     structured-looking to a reader.
 
     *rc* is rendered as both a word and a number, and the word is DERIVED
-    from the number (``passed`` iff ``rc == 0``).  Today the only caller is
-    ``DeterministicRunner._run_predicate``'s ``rc == 0`` branch, but a hardcoded ``passed`` would
-    let a future non-zero caller stamp the self-contradictory note
+    from the number (``passed`` iff ``rc == 0``).  A hardcoded ``passed``
+    would let a caller with a non-zero rc stamp the self-contradictory note
     ``predicate check passed (rc=2)``; the text cannot contradict the value.
     """
     verdict = f'predicate check {"passed" if rc == 0 else "failed"} (rc={rc})'

@@ -3282,13 +3282,12 @@ class TestDefaultRunnerInnerTimeoutDeployHonesty:
         queue = EscalationQueue(tmp_path)
         scheduler = _mock_scheduler(task)
 
+        timeout = ScriptTimeout(1, exit_code=exit_code, teardown=teardown)
         runner = DeterministicRunner(
             scheduler=scheduler,
             escalation_queue=queue,
             unit_inspector=AsyncMock(),
-            script_runner=AsyncMock(
-                side_effect=ScriptTimeout(1, exit_code=exit_code, teardown=teardown),
-            ),
+            script_runner=AsyncMock(side_effect=timeout),
         )
 
         outcome = await runner.run(assignment)
@@ -3316,6 +3315,12 @@ class TestDefaultRunnerInnerTimeoutDeployHonesty:
             f'{teardown.name} left processes the script spawned alive, so the '
             f'detail must send the operator to find and kill them — and must '
             f'NOT say so when the group really was killed: {esc.detail!r}'
+        )
+        assert timeout.budget_line('Deploy script') in esc.detail, esc.detail
+        signal_death = exit_code is None and teardown is ProcessTeardown.NOT_SIGNALLED
+        assert ('died of a SIGNAL' in esc.detail) == signal_death, (
+            f'an already-reaped script with no exit code died of a signal, and '
+            f'only that cell may say so: {esc.detail!r}'
         )
 
     async def test_targetless_deploy_injected_runner_nonzero_rc_still_reports_rc(

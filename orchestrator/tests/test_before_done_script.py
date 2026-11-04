@@ -500,26 +500,12 @@ class TestScriptTimeoutRendering:
         )
 
     @_MEASURED_SHAPES
-    def test_deploy_fact_lines_open_with_the_budget_line(
+    def test_survivor_line_appears_iff_the_group_was_not_killed(
         self, exit_code: int | None, teardown: ProcessTeardown,
     ):
         exc = ScriptTimeout(5, exit_code=exit_code, teardown=teardown)
 
-        assert exc.deploy_fact_lines(script=_SCRIPT)[0] == exc.budget_line('Deploy script')
+        line = exc.survivor_line(_SCRIPT)
 
-    @_MEASURED_SHAPES
-    def test_survivor_sentence_appears_iff_the_group_was_not_killed(
-        self, exit_code: int | None, teardown: ProcessTeardown,
-    ):
-        exc = ScriptTimeout(5, exit_code=exit_code, teardown=teardown)
-
-        names_script = any(str(_SCRIPT) in line for line in exc.deploy_fact_lines(script=_SCRIPT))
-
-        assert names_script is (teardown is not ProcessTeardown.GROUP_KILLED)
-
-    def test_reaped_script_without_exit_code_is_a_signal_death(self):
-        exc = ScriptTimeout(5, exit_code=None, teardown=ProcessTeardown.NOT_SIGNALLED)
-
-        assert any(
-            'died of a SIGNAL' in line for line in exc.deploy_fact_lines(script=_SCRIPT)
-        )
+        assert (line is None) is (teardown is ProcessTeardown.GROUP_KILLED)
+        assert line is None or str(_SCRIPT) in line, line

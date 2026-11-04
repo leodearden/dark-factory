@@ -288,6 +288,28 @@ Phase γ **predicate** sub-path (`before_done['kind'] == 'predicate'`):
   short-circuits BEFORE the `before_done_ran_at` proof-check (a
   predicate never stamps it).
 
+### How the arms handle `ScriptTimeout`
+
+`orchestrator/src/orchestrator/before_done_script.py::ScriptTimeout` states
+the caller contract and why a timeout is an infra fault rather than a
+verdict.  The runner meets it like this (tasks 4065 / 4252):
+
+- Only the default runner raises it.  An injected `script_runner` keeps the
+  plain `(rc, tail)` contract, so its non-zero rc is still an honest
+  verdict on the predicate path.
+- Three arms catch it, each BEFORE its `except Exception` catch-all: the
+  target_unit-less deploy in `_run_deploy_script_guarded`, the cross-unit
+  deploy in `run()` section 2, and `_run_predicate`.
+- Both `run_fn` seam wrappers, `_invoke_run_fn_translating_timeout` and
+  `_run_predicate`'s local `_invoke_run_fn`, translate a seam-internal
+  `TimeoutError` into `RuntimeError`, so the outer guard's
+  `except TimeoutError` means only that the outer guard fired.
+  `ScriptTimeout` passes through them untouched because it is not a
+  `TimeoutError`.
+- The two deploy arms print the same fact lines
+  (`_deploy_timeout_fact_lines`), so they cannot describe one event two
+  ways.  The predicate arm shares only `ScriptTimeout.budget_line`.
+
 ## 3. Pure gate (`before_done=None`, `always_escalates=True`)
 
 - File one born-at-L2 escalation (I3: in-process submit, sentinel role

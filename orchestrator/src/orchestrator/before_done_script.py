@@ -90,46 +90,39 @@ class ProcessTeardown(Enum):
 
 
 class ScriptTimeout(Exception):
-    """Raised by ``run_script`` when its INNER per-subprocess
-    ``asyncio.wait_for`` fires — i.e. the script itself overran
-    ``before_done['timeout_secs']`` and the Layer-A teardown ran (task 4065).
+    """Raised by ``run_script`` when its per-script ``asyncio.wait_for``
+    fires — i.e. the script itself overran *timeout_secs* and the Layer-A
+    teardown ran (task 4065).
 
-    THIS DOCSTRING IS THE CANONICAL EXPLANATION of the classification.  The
-    other 4065 sites (docs/deterministic-runner.md, and in
-    ``orchestrator/src/orchestrator/deterministic_runner.py``:
-    ``DeterministicRunner._default_run_script``,
-    ``DeterministicRunner._run_predicate``, both seam wrappers, the
-    ``script_runner`` ctor arg) deliberately carry one-line pointers here rather than restating it, so
-    the next change to this rule has ONE place to update, not ten that can
-    independently rot.
+    THIS DOCSTRING IS THE CANONICAL EXPLANATION of the classification; other
+    sites carry one-line pointers here rather than restating it.  How the
+    deterministic runner's deploy and predicate arms report it is
+    docs/deterministic-runner.md's concern, not this module's.
 
-    Why an exception rather than a ``(rc, tail)`` return: the previous
-    ``return 1, '<script timed out after Ns>'`` was indistinguishable, at the
-    ``run_fn`` seam, from a predicate check script genuinely EXITING non-zero
-    — which on the γ-predicate path is a milestone VERDICT ("the invariant
-    does not hold"), complete with a ``gate_escalated_at`` stamp latching the
-    task into the resolve-to-done path.  A timed-out script produced no exit
-    code and therefore no verdict; it is an INFRA fault.  A sentinel rc (e.g.
-    GNU ``timeout``'s 124) would merely move the collision — a script that
-    genuinely exits with the sentinel would be misclassified the other way —
-    whereas an exception type cannot collide with any exit code at all.
+    Why an exception rather than a ``(rc, tail)`` return: a
+    ``return 1, '<script timed out after Ns>'`` is indistinguishable from a
+    script genuinely EXITING non-zero, and a caller that reads a non-zero exit
+    as a VERDICT (a check script's "the invariant does not hold") would then
+    record a verdict nobody produced.  A timed-out script handed its caller no
+    exit code and therefore no verdict; it is an INFRA fault.  A sentinel rc
+    (e.g. GNU ``timeout``'s 124) would merely move the collision — a script
+    that genuinely exits with the sentinel would be misclassified the other
+    way — whereas an exception type cannot collide with any exit code at all.
 
-    Deliberately NOT a ``TimeoutError`` subclass: both ``run_fn`` seam
-    wrappers
-    (``orchestrator/src/orchestrator/deterministic_runner.py::DeterministicRunner._invoke_run_fn_translating_timeout``
-    and ``orchestrator/src/orchestrator/deterministic_runner.py::DeterministicRunner._run_predicate``'s
-    local ``_invoke_run_fn``) translate a seam-internal ``TimeoutError`` into
-    ``RuntimeError``, precisely so that an ``except TimeoutError`` around the
-    OUTER ``asyncio.wait_for`` can only ever mean "the outer wall-clock guard
-    itself fired".  A ``TimeoutError`` subclass would be swallowed by that
-    translation and re-reported as a generic "unexpected error" — trading one
-    misattribution for another, one layer down.
+    The contract for a caller of ``run_script``:
 
-    ONLY the default runner raises this.  An injected ``script_runner`` keeps
-    the plain ``(rc, tail)`` contract, so a custom runner's non-zero rc is
-    still an honest verdict on the predicate path.  Classification keys on
-    this exception TYPE — never on substring-matching the tail, which would
-    misclassify any check script that merely PRINTS "timed out".
+    * ``run_script`` is the only raiser.
+    * Catch it in a dedicated ``except ScriptTimeout`` arm placed BEFORE any
+      generic ``except Exception``, which would otherwise report the timeout
+      as an unexpected error.
+    * Classify on this exception TYPE — never by substring-matching the
+      output, which would misclassify any script that merely PRINTS "timed
+      out".
+    * It is deliberately NOT a ``TimeoutError`` subclass.  A caller that
+      bounds ``run_script`` with its own outer ``asyncio.wait_for`` can
+      therefore read ``except TimeoutError`` as "that outer guard fired", and
+      a caller that translates a stray inner ``TimeoutError`` into another
+      type cannot swallow this one and re-report it as a generic error.
 
     Carries exactly three things, ALL MEASURED (task 4252 + reviewer
     amendments) — nothing here is fabricated, and no ``(rc, tail)`` pair is
@@ -160,10 +153,7 @@ class ScriptTimeout(Exception):
     by a caller.
 
     Captured output is never carried in any case — that read was still in
-    flight when the timeout fired.  Every caller — both deploy paths and the
-    predicate path — owns a dedicated ``except ScriptTimeout`` arm, each
-    placed BEFORE its ``except Exception`` catch-all, and reports the timeout
-    as what it was.
+    flight when the timeout fired.
     """
 
     def __init__(
@@ -193,20 +183,18 @@ class ScriptTimeout(Exception):
             )
 
     def budget_line(self, subject: str) -> str:
-        """The sentence EVERY ``ScriptTimeout`` arm opens with: which budget was
-        overrun, and WHICH SIGNAL the teardown then dispatched.
+        """The opening sentence of any report of this timeout: which budget
+        *subject* overran, and WHICH SIGNAL the teardown then dispatched.
 
-        Shared by the deploy arms (via ``deploy_fact_lines``) and by
-        ``orchestrator/src/orchestrator/deterministic_runner.py::DeterministicRunner._run_predicate``'s
-        arm, which differ only in
-        *subject* — so the formatted budget expression has ONE definition to
-        change rather than two copies to keep in step (reviewer amendment).
+        *subject* is the caller's noun for what ran (e.g. ``'Deploy script'``),
+        so the formatted budget expression has ONE definition however many
+        reports open with it (reviewer amendment).
 
-        The trailing clause is ``self.teardown.clause`` (task 4252), so all
-        three arms state what was actually signalled.  Every one of them
-        previously asserted a whole-group SIGKILL unconditionally, including
-        on the branch that dispatches nothing at all — centralising this
-        sentence is precisely what let one edit correct all three.
+        The trailing clause is ``self.teardown.clause`` (task 4252), so a
+        report states what was actually signalled.  Reports used to assert a
+        whole-group SIGKILL unconditionally, including on the branch that
+        dispatches nothing at all — centralising this sentence is what let
+        one edit correct every one of them.
         """
         return (
             f'{subject} exceeded its own per-script timeout '
@@ -214,120 +202,45 @@ class ScriptTimeout(Exception):
             f'{self.teardown.clause}.'
         )
 
-    def deploy_fact_lines(self, *, script: Path) -> list[str]:
-        """The FACT sentences both DEPLOY arms print for this timeout.
+    def survivor_line(self, script: Path) -> str | None:
+        """The actionable sentence for a teardown that left the script's
+        children alive, or ``None`` when the whole group was killed (task 4252
+        reviewer finding).
 
-        Shared so the two deploy branches cannot come to say different things
-        about the same event — the anti-drift property
-        ``orchestrator/src/orchestrator/deterministic_runner.py::DeterministicRunner._invoke_run_fn_translating_timeout``
-        supplied for
-        this case until it stopped catching the exception (task 4252).
-
-        The class docstring says WHY a timed-out script is an infra fault
-        rather than a ``(rc, tail)`` return; it stays the single canonical
-        explanation and this method does not restate it.
-
-        ``orchestrator/src/orchestrator/deterministic_runner.py::DeterministicRunner._run_predicate``'s
-        own ``ScriptTimeout`` arm
-        shares only ``budget_line``: the CONSEQUENCE differs (a predicate
-        timeout produces no milestone VERDICT, and that path's summary and
-        category are separately pinned), and all three predicate infra arms
-        file the same category, so their remaining wording is the only thing
-        telling a human which guard fired.
-
-        The sentences are built from the three measured facts this exception
-        carries — budget, the script's own exit code if it had one, and which
-        signal the teardown dispatched.
+        Deliberately does NOT offer the pid or pgid as something to kill: the
+        teardown declined to signal that id precisely because it may by now
+        belong to an unrelated group, so handing it to a human would be the
+        task-845 footgun the guard exists to prevent.  The script path is the
+        safe search key, and is the one thing the operator needs that this
+        text can supply.
 
         Args:
-            script: the absolute path the runner executed
-                (``orchestrator/src/orchestrator/deterministic_runner.py::DeterministicRunner._before_done_paths``),
-                the search key the
-                survivor sentence hands the operator when that teardown left the
-                script's children running.  Not on the exception: it is the
-                deploy's own configuration, not something the timeout measured.
+            script: the absolute path that ran.  Not on the exception: it is
+                the caller's configuration, not something the timeout
+                measured.
         """
-        group_killed = self.teardown is ProcessTeardown.GROUP_KILLED
-        lines = [
-            self.budget_line('Deploy script'),
-        ]
-        if self.exit_code is None:
-            if self.teardown is ProcessTeardown.NOT_SIGNALLED:
-                # This cell is reachable only as a signal death, and the plain
-                # "had not exited" spelling below would be false in it:
-                # NOT_SIGNALLED means the script was ALREADY reaped when the
-                # teardown ran, and a reaped script with no exit code is one that
-                # died of a signal (a negative returncode is not an exit code).
-                why_no_code = (
-                    'the script had already died of a SIGNAL rather than exiting, and '
-                    'a signal death produces no exit code'
-                )
-            else:
-                why_no_code = 'the script had not exited when the timeout fired'
-            lines.append(
-                f'No exit code was produced — {why_no_code}. No output was captured '
-                f'either: the merged stdout/stderr read was still in flight. The '
-                f'script DID run, so it may have applied PART of its effect: inspect '
-                f'out-of-band before resolving.'
-            )
-        elif group_killed:
-            lines.append(
-                f'The script ITSELF had already exited with code {self.exit_code}: '
-                f'the timeout fired because a process it spawned outlived it, '
-                f'still holding the merged stdout/stderr pipe open, and that '
-                f'survivor was killed with the group. So the script ran to '
-                f'completion — but its exit code never reached the deploy '
-                f'classifier, so this deploy is NOT recorded as successful even '
-                f'when that code is 0, and no output was captured because the '
-                f'read was still in flight. Check out-of-band what the surviving '
-                f'child was and whether killing it left the effect half-applied.'
-            )
-        else:
-            lines.append(
-                f'The script ITSELF had already exited with code {self.exit_code}: '
-                f'the timeout fired because a process it spawned outlived it, '
-                f'still holding the merged stdout/stderr pipe open. So the script '
-                f'ran to completion — but its exit code never reached the deploy '
-                f'classifier, so this deploy is NOT recorded as successful even '
-                f'when that code is 0, and no output was captured because the read '
-                f'was still in flight.'
-            )
-        if not group_killed:
-            lines.append(_survivor_processes_line(script))
-        return lines
+        if self.teardown is ProcessTeardown.GROUP_KILLED:
+            return None
+        return (
+            f'Whatever the script spawned was therefore NOT killed and may still be '
+            f'running — including anything still holding the output pipe open. It '
+            f'must be located and killed out-of-band before resolving: search by the '
+            f'script path ({script}), NOT by pid, since the pid the runner refused '
+            f'to signal may by now belong to an unrelated process group (task 845).'
+        )
 
     @property
     def summary_phrase(self) -> str:
-        """The parenthetical both deploy SUMMARIES carry for this timeout.
+        """A short parenthetical for a one-line summary of this timeout.
 
-        The summary is the headline a human reads first, so it must not assert
+        A summary is the headline a human reads first, so it must not assert
         "no exit code" for the case where the script did produce one (see the
-        class docstring).  Defined once so the two branch-distinct summaries
-        cannot come to characterise the same event differently.
+        class docstring).  Defined once so no two summaries can characterise
+        the same event differently.
         """
         if self.exit_code is None:
             return 'no exit code'
         return f'script exited rc={self.exit_code}, output pipe held open'
-
-
-def _survivor_processes_line(script: Path) -> str:
-    """The actionable sentence for a teardown that left the script's children
-    alive — printed by BOTH deploy arms whenever the whole-group kill was not
-    the signal dispatched (task 4252 reviewer finding).
-
-    Deliberately does NOT offer the pid or pgid as something to kill: the
-    runner declined to signal that id precisely because it may by now belong
-    to an unrelated group, so handing it to a human would be the task-845
-    footgun the guard exists to prevent.  The script path is the safe search
-    key, and is the one thing the operator needs that this text can supply.
-    """
-    return (
-        f'Whatever the script spawned was therefore NOT killed and may still be '
-        f'running — including anything still holding the output pipe open. It '
-        f'must be located and killed out-of-band before resolving: search by the '
-        f'script path ({script}), NOT by pid, since the pid the runner refused '
-        f'to signal may by now belong to an unrelated process group (task 845).'
-    )
 
 
 async def run_script(
