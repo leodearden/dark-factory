@@ -116,8 +116,10 @@ async def _read(fused_memory: _FusedMemory, config: DashboardConfig, root: Path,
 
 
 async def _open_session(config: DashboardConfig, root: Path) -> None:
-    """Open the MCP session that later reads of the same URL reuse."""
-    answered = _FusedMemory({9101: {'id': '19', 'description': 'd', 'details': 't'}})
+    """Open the MCP session for config's FIRST fused-memory URL, reused by later reads of it."""
+    port = httpx.URL(config.fused_memory_urls[0]).port
+    assert port is not None, 'the mock keys its answers by explicit port'
+    answered = _FusedMemory({port: {'id': '19', 'description': 'd', 'details': 't'}})
     assert await _read(answered, config, root, 19) == TaskProse(description='d', details='t')
 
 
@@ -455,7 +457,9 @@ class TestTaskProseRoute:
         body = response.json()
         assert body['error'] == 'budget_exceeded'
         assert body['detail']
-        assert [post.method for post in fused_memory.posts] == ['tools/call'], (
+        assert [
+            (post.method, (post.params or {}).get('name')) for post in fused_memory.posts
+        ] == [('tools/call', 'get_task')], (
             'the budgeted read must be the single get_task post, sent on an already-open '
             'session, before it hangs'
         )
