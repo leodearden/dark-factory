@@ -7,7 +7,9 @@ shim that acts and then execs the real interpreter, so no module is patched.
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -15,6 +17,8 @@ import pytest
 import quality_metrics_snapshot as snapshot
 import quality_snapshot_cadence as cadence
 from git_listing import git
+
+REPO_ROOT = Path(__file__).parents[2]
 
 _FILES: dict[str, str] = {
     'pyproject.toml': '[project]\nname = "pkg"\n',
@@ -195,3 +199,108 @@ class TestThePinnedTree:
         assert _main_sha(root) != before
         assert _worktrees(root) == [root.resolve()]
         assert list(_pinned_trees_home(state_home).iterdir()) == []
+
+
+# ---------------------------------------------------------------------------
+# Refusals: exit 2, the cause named on stderr, the pinned tree removed.
+
+
+def _refused(
+    root: Path, data: Path, capfd: pytest.CaptureFixture[str], *extra: str, python: str = sys.executable
+) -> str:
+    """Run, assert the refusal and that no worktree is left behind, and return stderr."""
+    assert _cadence(root, data, *extra, python=python) == 2
+    assert _worktrees(root) == [root.resolve()]
+    return capfd.readouterr().err
+
+
+#: Ask the real instrument for its params, then report a complexipy version it does not record.
+_MISPREDICTS = '''if '--params' in sys.argv:
+    import json
+    asked = subprocess.run([sys.executable, *sys.argv[1:]], capture_output=True, text=True, check=True)
+    params = json.loads(asked.stdout)
+    params['complexipy_version'] = '0.0.0'
+    print(json.dumps(params))
+    sys.exit(0)'''
+
+
+class TestRefusals:
+    def test_an_instrument_failure_names_its_cause_and_the_sha(
+        self, tmp_path: Path, capfd: pytest.CaptureFixture[str], state_home: Path
+    ) -> None:
+        root = _repo(tmp_path, {**_FILES, 'pyproject.toml': '[tool.ruff]\nline-length = 100\n'})
+        data = tmp_path / 'data'
+        err = _refused(root, data, capfd)
+        assert '[project].name' in err
+        assert _main_sha(root) in err
+        assert not list(data.rglob('*.json'))
+        assert list(_pinned_trees_home(state_home).iterdir()) == []
+
+    def test_an_unknown_sha_is_named_and_nothing_is_measured(
+        self, tmp_path: Path, capfd: pytest.CaptureFixture[str]
+    ) -> None:
+        root = _repo(tmp_path)
+        data = tmp_path / 'data'
+        assert '0123456789abcdef0123' in _refused(root, data, capfd, '--sha', '0123456789abcdef0123')
+        assert not data.exists()
+
+    def test_a_missing_interpreter_is_named(
+        self, tmp_path: Path, capfd: pytest.CaptureFixture[str]
+    ) -> None:
+        root = _repo(tmp_path)
+        data = tmp_path / 'data'
+        missing = tmp_path / 'missing-python'
+        assert str(missing) in _refused(root, data, capfd, python=str(missing))
+        assert not data.exists()
+
+    def test_an_unreadable_existing_snapshot_is_named_and_left_as_it_was(
+        self, tmp_path: Path, capfd: pytest.CaptureFixture[str]
+    ) -> None:
+        root = _repo(tmp_path)
+        data = tmp_path / 'data'
+        existing = data / 'fixture' / f'{_main_sha(root)}.json'
+        existing.parent.mkdir(parents=True)
+        existing.write_text('not json\n', encoding='utf-8')
+        assert str(existing) in _refused(root, data, capfd)
+        assert existing.read_text(encoding='utf-8') == 'not json\n'
+
+    def test_a_recorded_identity_unlike_the_prediction_names_both(
+        self, tmp_path: Path, capfd: pytest.CaptureFixture[str]
+    ) -> None:
+        root = _repo(tmp_path)
+        data = tmp_path / 'data'
+        err = _refused(root, data, capfd, python=str(_shim(tmp_path, _MISPREDICTS)))
+        recorded = snapshot.load_snapshot(data / 'fixture' / f'{_main_sha(root)}.json')['params']
+        assert '"complexipy_version": "0.0.0"' in err
+        assert json.dumps(recorded, sort_keys=True) in err
+
+    def test_a_project_id_that_is_not_a_path_segment_is_an_argparse_exit_2(
+        self, tmp_path: Path
+    ) -> None:
+        with pytest.raises(SystemExit) as raised:
+            cadence.main(['--root', str(tmp_path), '--project-id', '../x'])
+        assert raised.value.code == 2
+
+
+def test_the_real_entry_point_measures_and_writes(tmp_path: Path, state_home: Path) -> None:
+    root = _repo(tmp_path)
+    data = tmp_path / 'data'
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith('GIT_') or key == 'GIT_CEILING_DIRECTORIES'
+    }
+    env['XDG_STATE_HOME'] = str(state_home)
+    proc = subprocess.run(
+        [
+            sys.executable, str(REPO_ROOT / 'scripts' / 'quality_snapshot_cadence.py'),
+            '--root', str(root), '--project-id', 'fixture', '--python', sys.executable,
+            '--data-dir', str(data),
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert (data / 'fixture' / f'{_main_sha(root)}.json').is_file()
