@@ -379,7 +379,8 @@ class LaneLifecycle:
         escalation queue is wired) and raises ``IllegalLaneTransition``
         WITHOUT touching the on-disk record (PRD I2, never silent-heal). A
         corrupt record is never silently treated as a fresh, ``None``-origin
-        lane.
+        lane. The legal ``IN_USE -> ASSIGNED`` edge is refused the same way
+        when ``fields`` would change the record's ``task_id``.
 
         On a legal edge: merges **fields onto the current record (or an
         all-``None`` base if this is the first transition, or if the prior
