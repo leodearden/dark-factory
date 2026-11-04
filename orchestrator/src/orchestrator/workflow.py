@@ -9149,13 +9149,14 @@ class TaskWorkflow:
                     # breaker in the γ branch first. Kept as a diagnostic in
                     # case that invariant is ever broken by a future change.
                     logger.warning(
-                        'Task %s: exhausted max_execute_iterations with '
+                        'Task %s: exhausted the EXECUTE iteration cap with '
                         'consecutive_progress_timeouts=%s (progress_resume_total=%s) '
                         '— session may be slow or looping. '
-                        'Bound: max_execute_iterations=%s, '
+                        'Bound: iteration_cap=%s (implementer_brief_variant=%s), '
                         'max_progress_resume_iterations=%s.',
                         self.task_id, consecutive_progress_timeouts,
                         self.metrics.progress_resume_total, iteration_cap,
+                        self.config.implementer_brief_variant,
                         self.config.max_progress_resume_iterations,
                     )
                 return WorkflowOutcome.BLOCKED

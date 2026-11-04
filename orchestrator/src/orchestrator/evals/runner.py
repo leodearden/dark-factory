@@ -28,6 +28,7 @@ from orchestrator.config import (
     SandboxConfig,
 )
 from orchestrator.git_ops import GitOps
+from orchestrator.implementer_brief_variant import execute_iteration_cap
 from orchestrator.scheduler import Scheduler, TaskAssignment
 from orchestrator.workflow import (
     TaskWorkflow,
@@ -715,7 +716,12 @@ async def collect_metrics(
     )
     # False-green guard — catches the 404-bug signature so the same class of
     # silent failure doesn't need manual quarantine in future runs.
-    if is_false_green(m, workflow.config.max_execute_iterations):
+    enforced_cap = execute_iteration_cap(
+        workflow.config.implementer_brief_variant,
+        workflow.config.max_execute_iterations,
+        lambda: plan,
+    )
+    if is_false_green(m, enforced_cap):
         logger.warning(
             'False-green signature for task %s: %d iters @ cap, '
             '$0 cost, 0 lines / 0 files changed, T/T/T — '
