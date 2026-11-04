@@ -6,7 +6,7 @@ schema_version: 1
 signal_leaves: ["γ"]
 tasks:
   - label: "α"
-    task_id: null
+    task_id: 8438
     title: "Rider offers in observe mode: pure selector, config, events, rider ledger"
     note: "Resolved at decompose: α also commits riders {enabled: true, mode: observe} to dark-factory-orchestrator.yaml, because no leaf owned the observe-mode enablement δ's series depend on (defaults.yaml keeps enabled false)."
     capabilities:
@@ -113,7 +113,7 @@ tasks:
           kind: manual
           reason: "observed on a live df dispatch after deploy; counted by δ"
   - label: "β"
-    task_id: null
+    task_id: 8439
     title: "Architect rider pass in shadow and offer modes: prompt builder, plan tools, typed verdicts, carry writes, write-authority refusal"
     capabilities:
       - name: "rider-verdict-record"
@@ -227,7 +227,7 @@ tasks:
           kind: manual
           reason: "agent behaviour at dispatch; shadow rows counted by δ"
   - label: "γ"
-    task_id: null
+    task_id: 8440
     title: "Deliverability stamp, close and release in the status transition, carry sweep, integration gate"
     note: "Integration gate and signal leaf. One binding OPEN: RIDER_RESERVE_DAYS is produced by PRD 2 P0/P1 (plans/followup-packing-sweep-prd.md), not yet decomposed; the edge to PRD 2 P1 is pending and is added by the lead once PRD 2 is filed."
     capabilities:
@@ -356,7 +356,7 @@ tasks:
           kind: manual
           reason: "prose; gating δ on its wording would be a prose guard (INV-10)"
   - label: "δ"
-    task_id: null
+    task_id: 8441
     title: "Follow-up riders observation report, 14 days after the integration gate"
     capabilities:
       - name: "report-script"
