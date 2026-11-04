@@ -815,10 +815,14 @@ def _stale_scope_findings(
 #: ``shared`` must not depend on ``fused_memory``.
 _MANIFEST_SUFFIX = '.capability-manifest.yaml'
 
-#: A match line starting (after leading whitespace) with any of these is
-#: PROSE, not a capability. ``*`` covers both a C block-comment
-#: continuation and a markdown bullet — both are prose for this purpose.
+#: A match line in a non-markdown file starting (after leading whitespace)
+#: with any of these is PROSE, not a capability. ``*`` is a C block-comment
+#: continuation. In markdown a heading or a bullet can BE the capability
+#: (task 6036), so a markdown file uses :data:`_MARKDOWN_COMMENT_MARKERS`.
 _COMMENT_MARKERS = ('#', '//', '*', '"""', "'''")
+
+_MARKDOWN_SUFFIXES = ('.md', '.markdown')
+_MARKDOWN_COMMENT_MARKERS = ('<!--',)
 
 
 @dataclass(frozen=True)
@@ -934,8 +938,13 @@ def _descriptor_family(manifest_path: str) -> frozenset[str]:
     return frozenset({manifest_path})
 
 
-def _is_comment_line(text: str) -> bool:
-    return text.lstrip().startswith(_COMMENT_MARKERS)
+def _is_comment_line(match: _GrepMatch) -> bool:
+    markers = (
+        _MARKDOWN_COMMENT_MARKERS
+        if match.path.endswith(_MARKDOWN_SUFFIXES)
+        else _COMMENT_MARKERS
+    )
+    return match.text.lstrip().startswith(markers)
 
 
 def _covered_by_declared_files(path: str, declared: Sequence[str]) -> bool:
@@ -969,7 +978,7 @@ def _refine_vacuous_present(
     """Sharpen ``vacuous_present`` into a code that says WHY.
 
     Order is pinned: self-reference is the more specific diagnosis and wins
-    when both hold (a markdown bullet in the sibling PRD is inside the
+    when both hold (an HTML comment in the sibling PRD is inside the
     descriptor family AND comment-shaped). Emitting both would double-count
     one defect in the reject payload.
 
@@ -987,7 +996,7 @@ def _refine_vacuous_present(
         if all(m.path in family for m in matches):
             return 'vacuous_present_self_referential', sites
 
-    if all(_is_comment_line(m.text) for m in matches):
+    if all(_is_comment_line(m) for m in matches):
         return 'vacuous_present_comment_only', sites
 
     return 'vacuous_present', sites
