@@ -54,6 +54,7 @@ from audit_delivered_checks import (
     load_task_index,
     stale_path_findings,
     stale_path_is_actionable,
+    structural_findings,
 )
 from shared.delivered_check_polarity import CheckOutcome
 from shared.tasks_db_readonly import TaskDbProblem, TaskDbUnreadable
@@ -413,6 +414,20 @@ class TestEvaluateRow:
         plain.mkdir()
         assert evaluate_row(_row(), repo_root=str(plain)) is CheckOutcome.ERRORED
 
+    def test_a_path_row_is_evaluated_as_existence(self, tmp_path):
+        # An EMPTY file exists but holds no line for a grep to match: only an
+        # existence check reads it as present.
+        root = _init_repo(tmp_path / 'repo', {'src/a.py': 'pass\n', 'src/empty.py': ''})
+
+        def outcome(path, expect='present'):
+            row = _row(kind='path', pattern=None, paths=(path,), expect=expect)
+            return evaluate_row(row, repo_root=str(root))
+
+        assert outcome('src/a.py') is CheckOutcome.PASS
+        assert outcome('src/empty.py') is CheckOutcome.PASS
+        assert outcome('src/b.py') is CheckOutcome.FAIL
+        assert outcome('src/b.py', expect='absent') is CheckOutcome.PASS
+
 
 # ---------------------------------------------------------------------------
 # audit_project — the three-source join, and the report's sections.
@@ -552,25 +567,39 @@ class TestAuditProject:
         assert audit.coverage.sidecars_unloadable == 0
         assert from_sidecar == {'cap-y': DISPOSITION_UNWIRED_LIVE_GATE}
 
-    def test_path_descriptors_get_no_polarity_disposition(
+    def test_path_descriptors_get_a_polarity_disposition(
         self, tmp_path, make_tasks_db, project_root_with_tasks_db
     ):
-        """Path rows are loaded for the stale-path sweep only: the supersession
-        pickaxe has no path counterpart, so they are never given a disposition.
-        The grep row is the positive control that the project was swept."""
-        path_only = {'delivered_checks': [
-            {'name': 'p', 'kind': 'path', 'expect': 'present', 'paths': ['src/b.py']}]}
+        """A path check carries an ``expect`` like a grep check, so the same
+        status-by-outcome table classifies it."""
+        def path_check(path):
+            return {'delivered_checks': [
+                {'name': 'p', 'kind': 'path', 'expect': 'present', 'paths': [path]}]}
+
         root = _init_repo(tmp_path / 'proj', {'src/a.py': 'pass\n'})
         project_root_with_tasks_db(root)
         make_tasks_db(
-            [{'id': 30, 'status': 'done', 'metadata': path_only}],
+            [
+                {'id': 30, 'status': 'done', 'metadata': path_check('src/a.py')},
+                {'id': 31, 'status': 'done', 'metadata': path_check('src/never.py')},
+                {'id': 32, 'status': 'pending', 'metadata': path_check('src/a.py')},
+                {'id': 33, 'status': 'pending', 'metadata': path_check('src/never.py')},
+                {'id': 34, 'status': 'cancelled', 'metadata': path_check('src/never.py')},
+            ],
             directory=root / '.taskmaster' / 'tasks',
         )
 
         audit = audit_project(str(root))
+        by_task = {f.row.task_id: f.disposition for f in audit.findings}
 
-        assert audit.findings == []
-        assert audit.coverage.descriptors_total == 0
+        assert by_task == {
+            30: DISPOSITION_DELIVERED,
+            31: DISPOSITION_BROKEN,
+            32: DISPOSITION_VACUOUS_LIVE_GATE,
+            33: DISPOSITION_HEALTHY,
+            34: DISPOSITION_INERT,
+        }
+        assert audit.coverage.descriptors_total == len(audit.findings) == 5
 
     def test_a_grep_row_beside_path_rows_is_still_classified(
         self, tmp_path, make_tasks_db, project_root_with_tasks_db
@@ -588,10 +617,11 @@ class TestAuditProject:
 
         audit = audit_project(str(root))
 
-        assert [(f.row.name, f.disposition) for f in audit.findings] == [
+        assert sorted((f.row.name, f.disposition) for f in audit.findings) == [
             ('g', DISPOSITION_BROKEN),
+            ('p', DISPOSITION_BROKEN),
         ]
-        assert audit.coverage.descriptors_total == 1
+        assert audit.coverage.descriptors_total == 2
 
     def test_report_renders_supersession_in_its_own_section(self):
         # A superseded row must not sit in the DEFECTS section: it is a
@@ -1404,6 +1434,15 @@ class TestStructuralSection:
         assert [(s['name'], s['code']) for s in payload['projects'][0]['structural']] == [
             ('hook-wired', 'vacuous_present_comment_only')
         ]
+
+    def test_path_rows_never_reach_the_structural_section(self, tmp_path):
+        # The structural codes exist only for grep, so a path row must never
+        # be linted into this section, whatever its caller passes.
+        root = _init_repo(tmp_path / 'repo', {'src/a.py': 'pass\n'})
+        row = _row(kind='path', pattern=None, paths=('src/a.py',), source='manifest',
+                   manifest='plans/x.capability-manifest.yaml')
+
+        assert structural_findings([row], repo_root=str(root)) == ()
 
 
 class TestReadOnly:
