@@ -831,17 +831,19 @@ async def _live_episodic_count(graph_name: str, episode_uuid: str) -> tuple[int,
         await client.aclose()
 
 
-def _live_config(base: FusedMemoryConfig) -> FusedMemoryConfig:
-    """Point *base* at the live FalkorDB with the real OpenAI key, as production config does."""
+def _live_config(base: FusedMemoryConfig, api_key: str) -> FusedMemoryConfig:
+    """Point *base* at the live FalkorDB with *api_key* on both OpenAI providers.
+
+    Production config.yaml sets ``api_key: ${OPENAI_API_KEY}`` on both.
+    """
     config = base.model_copy(deep=True)
     # Keyless, Graphiti substitutes graphiti_core's default clients (deprecated small
     # model gpt-4.1-nano); see test_the_live_config_runs_graphiti_on_the_configured_clients.
-    api_key = os.environ['OPENAI_API_KEY']
     llm_provider = config.llm.providers.openai
     embedder_provider = config.embedder.providers.openai
     assert llm_provider is not None and embedder_provider is not None, (
         'base config must carry openai provider blocks for both llm and embedder; '
-        '_live_config copies OPENAI_API_KEY into them'
+        '_live_config sets api_key on both'
     )
     llm_provider.api_key = api_key
     embedder_provider.api_key = api_key
@@ -849,9 +851,9 @@ def _live_config(base: FusedMemoryConfig) -> FusedMemoryConfig:
     return config
 
 
-def test_the_live_config_runs_graphiti_on_the_configured_clients(mock_config, monkeypatch):
-    monkeypatch.setenv('OPENAI_API_KEY', 'sk-hermetic-not-a-real-key')
-    config = _live_config(mock_config)
+def test_the_live_config_runs_graphiti_on_the_configured_clients(mock_config):
+    api_key = 'sk-hermetic-not-a-real-key'
+    config = _live_config(mock_config, api_key)
 
     llm = build_llm_client(config)
     assert llm is not None, (
@@ -859,14 +861,19 @@ def test_the_live_config_runs_graphiti_on_the_configured_clients(mock_config, mo
         'its default OpenAIClient(), whose small model is the hard-coded '
         'gpt-4.1-nano (now 404 model_not_found, task 8072), not llm.model.'
     )
-    assert (llm.model, llm.small_model) == (config.llm.model, config.llm.model)
+    assert (llm.model, llm.small_model, llm.config.api_key) == (
+        config.llm.model,
+        config.llm.model,
+        api_key,
+    )
 
     embedder = build_embedder(config)
     assert embedder is not None
-    assert (embedder.config.embedding_model, embedder.config.embedding_dim) == (
-        config.embedder.model,
-        config.embedder.dimensions,
-    )
+    assert (
+        embedder.config.embedding_model,
+        embedder.config.embedding_dim,
+        embedder.config.api_key,
+    ) == (config.embedder.model, config.embedder.dimensions, api_key)
 
 
 @falkor_skipif()
@@ -898,7 +905,7 @@ async def test_the_write_creates_a_real_episodic_node_in_falkordb(mock_config):
 
     graph_name = unique_graph_name('3561_episode_uuid')
 
-    config = _live_config(mock_config)
+    config = _live_config(mock_config, os.environ['OPENAI_API_KEY'])
 
     backend = GraphitiBackend(config)
     # skip_maintenance=True is load-bearing, not an optimisation: the default
