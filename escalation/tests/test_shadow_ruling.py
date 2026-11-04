@@ -1358,14 +1358,16 @@ class TestPolicyTableLockstep:
 
     # Rows whose every act the codec refuses to stamp. Exact, so the set can
     # neither grow silently nor outlive the ruling that empties it.
-    _UNSTAMPABLE_ROWS = frozenset({'completion_claim_true'})  # debt: ticket tkt_0RWKR1BTXVXB9Q06EQ0K3WQE0G
+    _UNSTAMPABLE_ROWS = frozenset({'completion_claim_true'})
 
     def test_every_row_has_an_act_a_stamp_may_propose(self):
         unstampable = frozenset(
             row.policy_class for row in POLICY_TABLE
             if not {str(action) for action in row.actions} & REVERSIBLE_ACTIONS
         )
-        assert unstampable == self._UNSTAMPABLE_ROWS
+        assert unstampable == self._UNSTAMPABLE_ROWS, (
+            'task 8475 rules on completion_claim_true; empty _UNSTAMPABLE_ROWS when it lands'
+        )
 
     def test_done_flip_is_a_reversible_action(self):
         """PRD §3 decision 7: done_flip is waived reversible (Leo, 2026-11-04)."""
