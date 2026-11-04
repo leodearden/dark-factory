@@ -29,6 +29,7 @@ from fused_memory.services.live_workflow_detector import (
     detect_live_workflow,
     has_live_workflow_corroboration,
     is_pure_gate_metadata,
+    is_unclaimed_awaiting_dependency,
     is_workflow_live_for_task,
 )
 
@@ -1079,6 +1080,103 @@ class TestPendingDeterministicPureGateOrchestratorSuppression:
             )
 
         assert live is False
+
+
+# ---------------------------------------------------------------------------
+# Unclaimed-awaiting-dependency classifier (task 8330)
+# ---------------------------------------------------------------------------
+
+
+def _awaiting_task(**overrides: object) -> dict:
+    """reify task 8162's shape: pending, unclaimed, no heartbeat, one local dependency."""
+    task: dict = {
+        'id': '8162',
+        'status': 'pending',
+        'claimant_run_id': None,
+        'heartbeat_at': None,
+        'dependencies': [9739],
+    }
+    task.update(overrides)
+    return task
+
+
+class TestIsUnclaimedAwaitingDependency:
+    """is_unclaimed_awaiting_dependency: positive evidence that a task has no claimant,
+    no heartbeat and at least one local dependency the scheduler cannot count satisfied.
+
+    Fail-safe toward live: absent, unreadable or ambiguous input returns False.
+    """
+
+    def test_reify_8162_shape_is_awaiting(self):
+        assert is_unclaimed_awaiting_dependency(_awaiting_task(), {'9739': 'pending'}) is True
+
+    @pytest.mark.parametrize(
+        'dep_status', ['pending', 'in-progress', 'blocked', 'deferred', 'review', 'infra-hold'],
+    )
+    def test_every_non_terminal_non_merge_deferred_dep_status_is_unmet(self, dep_status):
+        assert is_unclaimed_awaiting_dependency(_awaiting_task(), {'9739': dep_status}) is True
+
+    @pytest.mark.parametrize('dep_status', ['done', 'cancelled'])
+    def test_terminal_dep_is_satisfied(self, dep_status):
+        assert is_unclaimed_awaiting_dependency(_awaiting_task(), {'9739': dep_status}) is False
+
+    def test_all_deps_terminal_is_not_awaiting(self):
+        task = _awaiting_task(dependencies=[9739, 9740])
+        statuses = {'9739': 'done', '9740': 'cancelled'}
+        assert is_unclaimed_awaiting_dependency(task, statuses) is False
+
+    def test_one_unmet_dep_among_satisfied_ones_is_awaiting(self):
+        task = _awaiting_task(dependencies=[9739, 9740])
+        statuses = {'9739': 'done', '9740': 'pending'}
+        assert is_unclaimed_awaiting_dependency(task, statuses) is True
+
+    def test_merge_deferred_dep_is_not_evidence(self):
+        """The scheduler's same-train allowance (dependency_verdict._local_verdict)
+        may count a merge-deferred dep satisfied, so it proves nothing here."""
+        assert is_unclaimed_awaiting_dependency(_awaiting_task(), {'9739': 'merge-deferred'}) is False
+
+    def test_dep_absent_from_status_map_is_not_evidence(self):
+        assert is_unclaimed_awaiting_dependency(_awaiting_task(), {}) is False
+
+    def test_unknown_sentinel_is_not_evidence(self):
+        assert is_unclaimed_awaiting_dependency(_awaiting_task(), {'9739': 'unknown'}) is False
+
+    def test_claimant_disqualifies(self):
+        task = _awaiting_task(claimant_run_id='run-x/y/pid=1')
+        assert is_unclaimed_awaiting_dependency(task, {'9739': 'pending'}) is False
+
+    def test_blank_claimant_counts_as_no_claimant(self):
+        task = _awaiting_task(claimant_run_id='  ')
+        assert is_unclaimed_awaiting_dependency(task, {'9739': 'pending'}) is True
+
+    def test_heartbeat_disqualifies_even_without_claimant(self):
+        task = _awaiting_task(heartbeat_at='2026-11-04T10:00:00+00:00')
+        assert is_unclaimed_awaiting_dependency(task, {'9739': 'pending'}) is False
+
+    @pytest.mark.parametrize(
+        'task',
+        [_awaiting_task(dependencies=[]), {k: v for k, v in _awaiting_task().items() if k != 'dependencies'}],
+        ids=['empty', 'key_absent'],
+    )
+    def test_no_dependencies_is_not_awaiting(self, task):
+        assert is_unclaimed_awaiting_dependency(task, {'9739': 'pending'}) is False
+
+    @pytest.mark.parametrize('task', [None, 'x'], ids=['none', 'str'])
+    def test_non_mapping_task_is_not_awaiting(self, task):
+        assert is_unclaimed_awaiting_dependency(task, {'9739': 'pending'}) is False
+
+    @pytest.mark.parametrize('statuses', [None, [('9739', 'pending')]], ids=['none', 'list'])
+    def test_non_mapping_status_map_is_not_awaiting(self, statuses):
+        assert is_unclaimed_awaiting_dependency(_awaiting_task(), statuses) is False
+
+    def test_csv_string_dependencies_resolve(self):
+        task = _awaiting_task(dependencies='9739, 9740')
+        assert is_unclaimed_awaiting_dependency(task, {'9739': 'done', '9740': 'pending'}) is True
+
+    @pytest.mark.parametrize('dep_id', [9739, '9739'], ids=['int', 'str'])
+    def test_int_and_str_dep_ids_match_the_string_key(self, dep_id):
+        task = _awaiting_task(dependencies=[dep_id])
+        assert is_unclaimed_awaiting_dependency(task, {'9739': 'pending'}) is True
 
 
 # ---------------------------------------------------------------------------
