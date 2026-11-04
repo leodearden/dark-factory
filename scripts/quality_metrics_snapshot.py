@@ -25,7 +25,7 @@ import time
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
-from typing import Any, Protocol, TypeGuard
+from typing import Any, NamedTuple, Protocol, TypeGuard
 
 import _checkout as _checkout
 import source_measures
@@ -573,6 +573,16 @@ def take_snapshot(root: Path, *, run_id: str, since: str) -> dict[str, Any]:
         'import_graph': dict(measured.import_graph),
     }
     return validate_snapshot(snapshot, origin='this measurement')
+
+
+class MeasurementIdentity(NamedTuple):
+    as_of_sha: str
+    params: Mapping[str, Any]
+
+
+def measurement_identity(snapshot: Mapping[str, Any]) -> MeasurementIdentity:
+    """A validated snapshot's identity: plans/quality-dashboard-prd.md decision 17."""
+    return MeasurementIdentity(snapshot['as_of_sha'], snapshot['params'])
 
 
 # ---------------------------------------------------------------------------
