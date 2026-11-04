@@ -1224,6 +1224,85 @@ class TestMeasurementIdentity:
         assert snapshot.measurement_identity(old) != snapshot.measurement_identity(taken)
 
 
+_NOT_ATTRIBUTABLE = (
+    '  not attributable to code: a delta below may come from the params change, not from the code'
+)
+
+
+class TestParamsDiffer:
+    """A params key unknown on either side, or differing, opens the diff; unknown never equals unknown."""
+
+    @pytest.fixture
+    def taken(self, tmp_path: Path) -> dict[str, Any]:
+        return _measured(tmp_path, _GRAPH)
+
+    @staticmethod
+    def _new_params(taken: dict[str, Any]) -> tuple[str, str]:
+        params = taken['params']
+        return json.dumps(params['instrument'], sort_keys=True), json.dumps(params['python_version'])
+
+    def test_a_schema_2_previous_reads_instrument_unknown(self, taken: dict[str, Any]) -> None:
+        instrument, python = self._new_params(taken)
+        diff = snapshot.diff_lines(taken, _as_schema_2(taken))
+        assert diff[0] == (
+            f'params differ: instrument unknown -> {instrument}; python_version unknown -> {python}'
+        )
+        assert diff[1] == _NOT_ATTRIBUTABLE
+        assert diff[2].startswith('current: ')
+
+    def test_a_schema_1_previous_reads_the_same(self, taken: dict[str, Any]) -> None:
+        assert (
+            snapshot.diff_lines(taken, _as_schema_1(taken))[:2]
+            == snapshot.diff_lines(taken, _as_schema_2(taken))[:2]
+        )
+
+    def test_the_reverse_direction(self, taken: dict[str, Any]) -> None:
+        instrument, python = self._new_params(taken)
+        assert snapshot.diff_lines(_as_schema_2(taken), taken)[0] == (
+            f'params differ: instrument {instrument} -> unknown; python_version {python} -> unknown'
+        )
+
+    def test_unknown_never_equals_unknown(self, taken: dict[str, Any]) -> None:
+        old = _as_schema_2(taken)
+        assert snapshot.diff_lines(old, old)[0] == (
+            'params differ: instrument unknown -> unknown; python_version unknown -> unknown'
+        )
+
+    def test_only_differing_keys_are_listed(self, taken: dict[str, Any]) -> None:
+        older = copy.deepcopy(taken)
+        older['params']['complexipy_version'] = '0.0.0'
+        real = json.dumps(taken['params']['complexipy_version'])
+        assert snapshot.diff_lines(taken, older)[0] == (
+            f'params differ: complexipy_version "0.0.0" -> {real}'
+        )
+
+    def test_equal_params_open_with_the_headers(self, taken: dict[str, Any]) -> None:
+        assert snapshot.diff_lines(taken, taken)[0].startswith('current: ')
+
+    def test_the_command_line_diff_opens_with_it_and_exits_0(
+        self, taken: dict[str, Any], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        current, previous = tmp_path / 'current.json', tmp_path / 'previous.json'
+        current.write_text(snapshot.render_snapshot(taken), encoding='utf-8')
+        previous.write_text(snapshot.render_snapshot(_as_schema_2(taken)), encoding='utf-8')
+        capsys.readouterr()
+        assert snapshot.main(['--current', str(current), '--diff', str(previous)]) == 0
+        printed = capsys.readouterr().out.splitlines()
+        assert printed[:2] == snapshot.diff_lines(taken, _as_schema_2(taken))[:2]
+        assert printed[0].startswith('params differ: instrument unknown -> ')
+
+    def test_the_committed_10_08_snapshot_reads_instrument_unknown(
+        self, taken: dict[str, Any]
+    ) -> None:
+        # The PRD's sketch row 17, on the actual file its signal diffs.
+        previous = snapshot.load_snapshot(
+            REPO_ROOT / 'plans' / 'quality-metrics' / 'review-all-dark_factory-20261008.json'
+        )
+        diff = snapshot.diff_lines(taken, previous)
+        assert diff[0].startswith('params differ: instrument unknown -> ')
+        assert diff[1] == _NOT_ATTRIBUTABLE
+
+
 _COUPLING_BEFORE = 'from pkg import mod\n\ndef test_it():\n    assert mod._y\n'
 _COUPLING_AFTER = (
     'from unittest.mock import patch\nfrom pkg import mod\n\ndef test_it():\n'
