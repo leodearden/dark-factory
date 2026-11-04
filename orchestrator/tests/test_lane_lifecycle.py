@@ -270,6 +270,52 @@ class TestIllegalEscalate:
             lifecycle.transition(lane, LaneState.IN_USE)
 
 
+def _in_use_lane(tmp_path: Path, lifecycle: LaneLifecycle) -> Path:
+    """Drive a lane to IN_USE for task 42 and return its path."""
+    lane = tmp_path / '_lane-0'
+    lifecycle.transition(lane, LaneState.SEED, seeded_from_sha='abc123')
+    lifecycle.transition(lane, LaneState.REGISTERED, branch='task/42')
+    lifecycle.transition(lane, LaneState.ASSIGNED, task_id='42', title='demo')
+    lifecycle.transition(lane, LaneState.IN_USE)
+    return lane
+
+
+class TestInUseReturnEdgeKeepsTheAssignment:
+    """Leaf δ (task 3076) legalised IN_USE -> ASSIGNED for the last live child
+    exiting. transition() is the one mutator, so it is where that edge is
+    refused when it would hand the lane to another task."""
+
+    @pytest.mark.parametrize('other_task_id', ['99', None])
+    def test_a_task_id_change_raises_escalates_and_writes_nothing(
+        self, tmp_path: Path, other_task_id: str | None,
+    ):
+        queue = EscalationQueue(tmp_path / 'escalations')
+        lifecycle = _lifecycle(tmp_path, escalation_queue=queue)
+        lane = _in_use_lane(tmp_path, lifecycle)
+        record_path = tmp_path / '.lane-state' / f'{lane.name}.json'
+        before_bytes = record_path.read_bytes()
+
+        with pytest.raises(IllegalLaneTransition, match='IN_USE for task'):
+            lifecycle.transition(lane, LaneState.ASSIGNED, task_id=other_task_id)
+
+        assert record_path.read_bytes() == before_bytes
+        escalations = queue.get_by_task(f'lane-lifecycle-{lane.name}')
+        assert len(escalations) == 1
+        assert (escalations[0].agent_role, escalations[0].level) == (
+            ESCALATION_SENTINEL_ROLE, 2,
+        )
+
+    def test_naming_the_task_it_already_holds_is_legal(self, tmp_path: Path):
+        lifecycle = _lifecycle(tmp_path)
+        lane = _in_use_lane(tmp_path, lifecycle)
+
+        record = lifecycle.transition(lane, LaneState.ASSIGNED, task_id='42')
+
+        assert (record.state, record.task_id, record.title) == (
+            LaneState.ASSIGNED, '42', 'demo',
+        )
+
+
 # ---------------------------------------------------------------------------
 # Unknown **fields validation
 # ---------------------------------------------------------------------------
@@ -543,22 +589,15 @@ class TestNoteAssigned:
         # Never silent-steal: the record is untouched on conflict.
         assert record_path.read_bytes() == before_bytes
 
-    def _in_use_lane(self, tmp_path: Path, lifecycle: LaneLifecycle) -> Path:
-        lane = tmp_path / '_lane-0'
-        lifecycle.transition(lane, LaneState.SEED, seeded_from_sha='abc123')
-        lifecycle.transition(lane, LaneState.REGISTERED, branch='task/42')
-        lifecycle.transition(lane, LaneState.ASSIGNED, task_id='42', title='demo')
-        lifecycle.transition(lane, LaneState.IN_USE)
-        return lane
-
     def test_in_use_different_task_raises_escalates_and_leaves_record_unchanged(
         self, tmp_path: Path,
     ):
-        # Leaf δ made IN_USE -> ASSIGNED legal, so the table alone would let
-        # task 99 silently re-key a lane task 42 has a live child in.
+        # Leaf δ made IN_USE -> ASSIGNED legal, so without transition()'s
+        # re-key guard task 99 could silently take a lane task 42 has a live
+        # child in.
         queue = EscalationQueue(tmp_path / 'escalations')
         lifecycle = _lifecycle(tmp_path, escalation_queue=queue)
-        lane = self._in_use_lane(tmp_path, lifecycle)
+        lane = _in_use_lane(tmp_path, lifecycle)
         record_path = tmp_path / '.lane-state' / f'{lane.name}.json'
         before_bytes = record_path.read_bytes()
 
@@ -575,7 +614,7 @@ class TestNoteAssigned:
         self, tmp_path: Path,
     ):
         lifecycle = _lifecycle(tmp_path)
-        lane = self._in_use_lane(tmp_path, lifecycle)
+        lane = _in_use_lane(tmp_path, lifecycle)
         record_path = tmp_path / '.lane-state' / f'{lane.name}.json'
         before_bytes = record_path.read_bytes()
 

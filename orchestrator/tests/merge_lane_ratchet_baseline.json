@@ -68,7 +68,7 @@
   },
   "files": {
     "orchestrator/src/orchestrator/git_ops.py": {"cognitive": 1506, "function_local_imports": 4, "lines": 16534, "prose_lines": 9454, "reexport_names": 1},
-    "orchestrator/src/orchestrator/lane_lifecycle.py": {"cognitive": 56, "function_local_imports": 1, "lines": 807, "prose_lines": 343, "reexport_names": 0},
+    "orchestrator/src/orchestrator/lane_lifecycle.py": {"cognitive": 57, "function_local_imports": 1, "lines": 831, "prose_lines": 348, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/__init__.py": {"cognitive": 0, "function_local_imports": 0, "lines": 98, "prose_lines": 21, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/coalesce_unwind.py": {"cognitive": 9, "function_local_imports": 0, "lines": 100, "prose_lines": 22, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/completion.py": {"cognitive": 8, "function_local_imports": 0, "lines": 90, "prose_lines": 54, "reexport_names": 0},
@@ -352,7 +352,7 @@
     "orchestrator/src/orchestrator/lane_lifecycle.py::LaneLifecycle::_read_or_raise": 2,
     "orchestrator/src/orchestrator/lane_lifecycle.py::LaneLifecycle::_record_lane_names": 2,
     "orchestrator/src/orchestrator/lane_lifecycle.py::LaneLifecycle::_record_path": 0,
-    "orchestrator/src/orchestrator/lane_lifecycle.py::LaneLifecycle::_refuse_in_use_steal": 2,
+    "orchestrator/src/orchestrator/lane_lifecycle.py::LaneLifecycle::_refuse_in_use_rekey": 3,
     "orchestrator/src/orchestrator/lane_lifecycle.py::LaneLifecycle::_write": 0,
     "orchestrator/src/orchestrator/lane_lifecycle.py::LaneLifecycle::all_records": 3,
     "orchestrator/src/orchestrator/lane_lifecycle.py::LaneLifecycle::mark_pool_storage_present": 1,

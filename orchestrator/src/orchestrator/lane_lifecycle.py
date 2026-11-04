@@ -77,7 +77,8 @@ LEGAL_TRANSITIONS: frozenset[tuple[LaneState | None, LaneState]] = frozenset(
         (LaneState.RELEASED, LaneState.ASSIGNED),
         (LaneState.ASSIGNED, LaneState.IN_USE),
         # leaf δ's return edge: the last live dark-factory child in the lane
-        # exited. IN_USE is a liveness marker; it never re-keys the assignment.
+        # exited. IN_USE is a liveness marker, so transition() refuses this
+        # edge when it would change the task_id.
         (LaneState.IN_USE, LaneState.ASSIGNED),
         (LaneState.IN_USE, LaneState.RELEASED),
         (LaneState.ASSIGNED, LaneState.RELEASED),
@@ -414,6 +415,7 @@ class LaneLifecycle:
                 f'illegal lane transition for lane {Path(lane).name!r}: '
                 f'{current_state} -> {to}'
             )
+        self._refuse_in_use_rekey(lane, current, to, fields)
 
         record = LaneRecord(
             state=to,
@@ -431,6 +433,44 @@ class LaneLifecycle:
 
         self._write(lane, record)
         return record
+
+    def _refuse_in_use_rekey(
+        self,
+        lane: Path | str,
+        current: LaneRecord | None,
+        to: LaneState,
+        fields: dict[str, object],
+    ) -> None:
+        """Escalate and raise when ``IN_USE -> ASSIGNED`` would change ``task_id``.
+
+        IN_USE marks a live child of the assignment it sits on, so its return
+        edge keeps that assignment; handing the lane to another task needs a
+        release first.
+        """
+        if current is None or (current.state, to) != (LaneState.IN_USE, LaneState.ASSIGNED):
+            return
+        new_task_id = fields.get('task_id', current.task_id)
+        if new_task_id == current.task_id:
+            return
+        lane_name = Path(lane).name
+        self._file_escalation(
+            lane,
+            summary=(
+                f'Refused re-key of IN_USE lane {lane_name!r}: task '
+                f'{current.task_id} -> {new_task_id}'
+            ),
+            detail=(
+                f'LaneLifecycle.transition refused IN_USE -> ASSIGNED for lane '
+                f'{lane_name!r} because it would change task_id from '
+                f'{current.task_id!r} to {new_task_id!r} while that task has a '
+                'live child in the lane. The durable record was left unchanged '
+                '(never silent-heal, PRD W11 I2).'
+            ),
+        )
+        raise IllegalLaneTransition(
+            f'lane {lane_name!r} is IN_USE for task {current.task_id!r}; '
+            f'refusing to re-key it to task {new_task_id!r}'
+        )
 
     def _file_escalation(self, lane: Path | str, *, summary: str, detail: str) -> None:
         """Best-effort born-at-L2 filer shared by the illegal-transition and
@@ -550,10 +590,9 @@ class LaneLifecycle:
           never mutates — raises ``IllegalLaneTransition`` (propagated to the
           caller, NOT swallowed — unlike the best-effort ``GitOps`` writer
           methods this mirrors) and the durable record is left untouched.
-          The ``ASSIGNED`` half relies on the table (``ASSIGNED -> ASSIGNED``
-          is illegal); the ``IN_USE`` half is enforced by
-          ``_refuse_in_use_steal``, because leaf δ made ``IN_USE ->
-          ASSIGNED`` legal.
+          ``transition()`` refuses both halves: the ``ASSIGNED`` one on the
+          table (``ASSIGNED -> ASSIGNED`` is illegal), the ``IN_USE`` one on
+          its re-key guard, because leaf δ made ``IN_USE -> ASSIGNED`` legal.
         * Current state ``QUARANTINED``: RECYCLED, not refused. Emits a LOUD
           ``WARNING`` (never silent-heal, PRD W11 I2), routes the ONE
           sanctioned ``QUARANTINED -> RELEASED`` recycle edge (which clears the
@@ -597,7 +636,6 @@ class LaneLifecycle:
 
         if _held_by(rec, task_id):
             return rec  # idempotent no-op; no I/O
-        self._refuse_in_use_steal(lane, rec, task_id)
 
         registered_fields = {'branch': branch} if branch is not None else {}
         if state is None:
@@ -625,8 +663,8 @@ class LaneLifecycle:
             state = LaneState.RELEASED
         # REGISTERED/RELEASED (and a different-task ASSIGNED/IN_USE conflict)
         # fall straight through to the terminal edge below — transition()
-        # itself is the single legality gate, so a conflicting/illegal origin
-        # raises there.
+        # itself is the single gate: a different-task ASSIGNED origin raises
+        # on the table, a different-task IN_USE origin on its re-key guard.
 
         assigned_fields: dict[str, object] = {'task_id': task_id}
         if title is not None:
@@ -634,20 +672,6 @@ class LaneLifecycle:
         if branch is not None:
             assigned_fields['branch'] = branch
         return self.transition(lane, LaneState.ASSIGNED, **assigned_fields)
-
-    def _refuse_in_use_steal(
-        self, lane: Path | str, rec: LaneRecord | None, task_id: str,
-    ) -> None:
-        """Raise, escalate and write nothing when *rec* is IN_USE for another task."""
-        if rec is None or rec.state is not LaneState.IN_USE or rec.task_id == task_id:
-            return
-        self._file_illegal_transition_escalation(
-            lane, LaneState.IN_USE, LaneState.ASSIGNED,
-        )
-        raise IllegalLaneTransition(
-            f'lane {Path(lane).name!r} is IN_USE for task {rec.task_id!r}; '
-            f'refusing to re-key it to task {task_id!r}'
-        )
 
     def note_in_use(self, lane: Path | str) -> bool:
         """Best-effort ``ASSIGNED -> IN_USE``: a dark-factory child is live in *lane*.
