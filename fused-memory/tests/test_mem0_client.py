@@ -10,7 +10,7 @@ import httpx
 import pytest
 from _fm_helpers import QDRANT_URL, collection_vector_size, qdrant_skipif
 from _qdrant_responses import missing_collection_404
-from _stub_qdrant_server import stub_qdrant_server
+from _stub_qdrant_server import StubQdrantServer, stub_qdrant_server
 from mem0 import AsyncMemory
 from mem0.configs.base import MemoryConfig
 from qdrant_client import QdrantClient
@@ -3271,14 +3271,24 @@ class TestBuildConfigDictEndpointPlumbing:
 
 
 @pytest.fixture
-def mem0_built_from(monkeypatch, mock_config) -> Iterator[list[dict]]:
+def stub_qdrant(mock_config) -> Iterator[StubQdrantServer]:
+    """Point ``mock_config`` at a local stub Qdrant (tests/_stub_qdrant_server.py).
+
+    Mem0Backend provisions its collection itself before mem0 is built, so a
+    test that builds an instance needs a Qdrant to answer, and this keeps it
+    off the live one.
+    """
+    with stub_qdrant_server() as stub:
+        mock_config.mem0.qdrant_url = stub.url
+        yield stub
+
+
+@pytest.fixture
+def mem0_built_from(monkeypatch) -> list[dict]:
     """Every config dict mem0 is built from, captured at mem0's own boundary.
 
     The recorder hands back a double whose ``add`` answers the way mem0's does,
     so the public ``Mem0Backend.add`` runs end to end with no OpenAI.
-    Mem0Backend provisions its collection itself before mem0 is built, so a
-    local stub Qdrant (tests/_stub_qdrant_server.py) answers that and no test
-    reaches a live Qdrant.
     """
     captured: list[dict] = []
 
@@ -3291,9 +3301,7 @@ def mem0_built_from(monkeypatch, mock_config) -> Iterator[list[dict]]:
         return _BuiltInstance()
 
     monkeypatch.setattr(AsyncMemory, 'from_config', classmethod(_record))
-    with stub_qdrant_server() as stub:
-        mock_config.mem0.qdrant_url = stub.url
-        yield captured
+    return captured
 
 
 class TestMem0HistoryPersistence:
@@ -3307,7 +3315,7 @@ class TestMem0HistoryPersistence:
 
     @pytest.mark.asyncio
     async def test_history_goes_to_a_private_in_memory_db_when_persistence_is_off(
-        self, mock_config, mem0_built_from,
+        self, mock_config, stub_qdrant, mem0_built_from,
     ):
         mock_config.mem0.persist_history = False
 
@@ -3317,7 +3325,7 @@ class TestMem0HistoryPersistence:
 
     @pytest.mark.asyncio
     async def test_the_shipped_default_leaves_mem0_on_its_own_shared_history_db(
-        self, mock_config, mem0_built_from,
+        self, mock_config, stub_qdrant, mem0_built_from,
     ):
         assert Mem0BackendConfig().persist_history is True
         config = mock_config.model_copy(deep=True)
@@ -3333,7 +3341,7 @@ class TestMem0HistoryPersistence:
 
     @pytest.mark.asyncio
     async def test_the_shared_test_config_keeps_history_off_the_shared_db(
-        self, mock_config, mem0_built_from,
+        self, mock_config, stub_qdrant, mem0_built_from,
     ):
         """Every test that builds a real mem0 instance derives its config from
         ``mock_config``, and relies on this to stay off the shared file."""
@@ -3351,6 +3359,10 @@ class TestNonDefaultDimsAgainstAnExistingCollection:
     Both now follow the config — but only for a collection that does not exist
     yet. Changing the knob on a live deployment therefore requires recreating
     and re-embedding the collection; it is not live-migratable.
+
+    This class pins only mem0's skip of an existing collection. The product
+    creates a new one itself, and that create is pinned at
+    tests/test_mem0_collection_provisioning.py::test_a_new_collection_is_created_at_the_configured_width_under_cosine_distance.
     """
 
     @staticmethod
@@ -3387,19 +3399,6 @@ class TestNonDefaultDimsAgainstAnExistingCollection:
         )
 
         client.create_collection.assert_not_called()
-
-    def test_a_fresh_collection_is_created_at_the_configured_dimensionality(self):
-        """Control: the plumbing does work — on a collection that does not yet
-        exist, which is the only case where changing dimensions is safe."""
-        from mem0.vector_stores.qdrant import Qdrant
-
-        client = self._fake_qdrant_client([])
-
-        Qdrant(collection_name='brand_new', embedding_model_dims=768, client=client)
-
-        client.create_collection.assert_called_once()
-        vectors_config = client.create_collection.call_args.kwargs['vectors_config']
-        assert vectors_config.size == 768
 
 
 class TestAmbientBaseUrlPrecedenceIsReported:

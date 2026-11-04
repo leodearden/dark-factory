@@ -17,7 +17,6 @@ from contextlib import asynccontextmanager
 import httpx
 import pytest
 from _stub_qdrant_server import stub_qdrant_server
-from mem0.memory.storage import SQLiteManager
 from qdrant_client.http.exceptions import UnexpectedResponse
 
 from fused_memory.backends.mem0_client import Mem0Backend
@@ -30,10 +29,9 @@ MEMORY_ID = '00000000-0000-4000-8000-000000000001'
 
 @pytest.fixture
 def config(mock_config, monkeypatch) -> FusedMemoryConfig:
-    """mem0's history store defaults to the LIVE ~/.mem0/history.db; keep these tests off it."""
+    """mem0 telemetry off: no posthog call and no mem0migrations collection on the stub."""
     monkeypatch.setattr('mem0.memory.main.capture_event', lambda *a, **kw: None)
     monkeypatch.setattr('mem0.memory.main.MEM0_TELEMETRY', False)
-    monkeypatch.setattr('mem0.memory.main.SQLiteManager', lambda *_a, **_kw: SQLiteManager(':memory:'))
     return mock_config.model_copy(deep=True)
 
 
@@ -61,6 +59,16 @@ async def test_a_collection_create_slower_than_the_http_client_default_still_pro
         async with backend_against(stub.url, config) as backend:
             assert await backend.get(MEMORY_ID, SCOPE) is None
         assert stub.creates(target) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_new_collection_is_created_at_the_configured_width_under_cosine_distance(config, target):
+    config.embedder.dimensions = 768
+    with stub_qdrant_server() as stub:
+        async with backend_against(stub.url, config) as backend:
+            assert await backend.get(MEMORY_ID, SCOPE) is None
+        [create_body] = stub.create_bodies(target)
+    assert create_body['vectors'] == {'size': 768, 'distance': 'Cosine'}
 
 
 @pytest.mark.asyncio

@@ -65,6 +65,7 @@ class StubQdrantServer:
         self._meta_op_lock = threading.Lock()
         self._create_requests: Counter[str] = Counter()
         self._exists_requests: Counter[str] = Counter()
+        self._create_bodies: dict[str, list[dict[str, Any]]] = {}
         self._created: dict[str, threading.Event] = {}
         for name in preexisting:
             self._created_event(name).set()
@@ -73,6 +74,11 @@ class StubQdrantServer:
         """How many ``PUT /collections/{name}`` requests the server has received."""
         with self._state_lock:
             return self._create_requests[name]
+
+    def create_bodies(self, name: str) -> list[dict[str, Any]]:
+        """The parsed JSON body of every ``PUT /collections/{name}``, in arrival order."""
+        with self._state_lock:
+            return list(self._create_bodies.get(name, []))
 
     def exists_checks(self, name: str) -> int:
         """How many ``GET /collections/{name}/exists`` requests the server has received."""
@@ -101,9 +107,10 @@ class StubQdrantServer:
         with self._state_lock:
             return [name for name, event in self._created.items() if event.is_set()]
 
-    def _create(self, name: str) -> tuple[int, dict[str, Any]]:
+    def _create(self, name: str, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         with self._state_lock:
             self._create_requests[name] += 1
+            self._create_bodies.setdefault(name, []).append(body)
         with self._meta_op_lock:
             if self._exists(name):
                 return 409, _already_exists(name)
@@ -116,7 +123,7 @@ class StubQdrantServer:
             self._created_event(name).set()
             return 200, _ok(True)
 
-    def respond(self, method: str, path: str) -> tuple[int, dict[str, Any]]:
+    def respond(self, method: str, path: str, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         """Route one request to its canned Qdrant answer."""
         segments = [unquote(part) for part in urlsplit(path).path.split('/') if part]
         match method, segments:
@@ -127,7 +134,7 @@ class StubQdrantServer:
             case 'GET', ['collections', name, 'exists']:
                 return self._check_exists(name)
             case 'PUT', ['collections', name]:
-                return self._create(name)
+                return self._create(name, body)
             case 'PUT', ['collections', _, 'index']:
                 return 200, _ok({'operation_id': 0, 'status': 'completed'})
             case 'POST', ['collections', _, 'points']:
@@ -144,9 +151,8 @@ def _make_handler(state: StubQdrantServer) -> type[BaseHTTPRequestHandler]:
 
         def _serve(self) -> None:
             length = int(self.headers.get('Content-Length') or 0)
-            if length:
-                self.rfile.read(length)
-            status, body = state.respond(self.command, self.path)
+            request_body = json.loads(self.rfile.read(length)) if length else {}
+            status, body = state.respond(self.command, self.path, request_body)
             payload = json.dumps(body).encode()
             self.send_response(status)
             self.send_header('Content-Type', 'application/json')
@@ -195,7 +201,7 @@ def stub_qdrant_server(
     httpd = _QuietServer(('127.0.0.1', 0), _make_handler(state))
     host, port = httpd.server_address[:2]
     state.url = f'http://{host!s}:{port}'
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread = threading.Thread(target=httpd.serve_forever, kwargs={'poll_interval': 0.05}, daemon=True)
     thread.start()
     try:
         yield state
