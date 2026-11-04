@@ -18,6 +18,8 @@ stays in sync with the duplicated string.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from escalation.authority import (
@@ -25,11 +27,18 @@ from escalation.authority import (
     L2_AUTO_CLOSE_ALLOWLIST,
     L2_AUTO_CLOSE_DENY_CATEGORIES,
     L2_AUTO_CLOSE_DENY_ROLES,
+    POLICY_TABLE,
     PROMOTE_ALLOWED,
     PROMOTE_SENTINEL_BOUND_ROLES,
     ROLE_LEVEL_ALLOWLIST,
+    ClassSwitch,
+    PolicyAction,
+    PolicyMatch,
+    PolicyRow,
     l2_auto_close_class,
+    policy_row,
 )
+from escalation.categories import EscalationCategory
 
 
 class TestRoleLevelAllowlistShape:
@@ -631,7 +640,187 @@ class TestL2AutoCloseClass:
         assert 'orchestrator-deterministic' in L2_AUTO_CLOSE_DENY_ROLES
 
     def test_allowlist_contains_three_classes_in_specificity_order(self) -> None:
-        names = [klass.name for klass in L2_AUTO_CLOSE_ALLOWLIST]
+        names = [klass.policy_class for klass in L2_AUTO_CLOSE_ALLOWLIST]
         assert names == ['superseded_main_sweep', 'self_cleared_infra', 'stale_task_scoped'], (
             f'Expected most-specific-first ordering, got: {names!r}'
         )
+
+
+def _row(**overrides: object) -> PolicyRow:
+    """A valid PolicyRow with *overrides* applied, for the construction invariants."""
+    fields: dict[str, object] = {
+        'policy_class': 'probe_class',
+        'match': PolicyMatch(),
+        'actions': frozenset({PolicyAction.CLOSE_ONLY}),
+        'evidence': (re.compile(r'probe', re.IGNORECASE),),
+    }
+    fields.update(overrides)
+    return PolicyRow(**fields)  # type: ignore[arg-type]
+
+
+class TestPolicyRowInvariants:
+    """A PolicyRow refuses to exist in a shape the executor gate could misread."""
+
+    def test_a_valid_row_constructs(self) -> None:
+        assert _row().policy_class == 'probe_class'
+
+    @pytest.mark.parametrize('slug', ('Has-Caps', 'has space', 'dash-ed', ''))
+    def test_slug_must_be_lower_snake(self, slug: str) -> None:
+        with pytest.raises(ValueError, match=re.escape(repr(slug))):
+            _row(policy_class=slug)
+
+    def test_empty_actions_refused_naming_slug_and_value(self) -> None:
+        with pytest.raises(ValueError) as excinfo:
+            _row(policy_class='empty_actions', actions=frozenset())
+        assert 'empty_actions' in str(excinfo.value)
+        assert 'frozenset()' in str(excinfo.value)
+
+    def test_actions_without_a_resolve_action_refused(self) -> None:
+        actions = frozenset({PolicyAction.FILE_TASK, PolicyAction.ADD_DEPENDENCY})
+        with pytest.raises(ValueError) as excinfo:
+            _row(policy_class='no_resolve', actions=actions)
+        message = str(excinfo.value)
+        assert 'no_resolve' in message
+        assert 'file_task' in message and 'add_dependency' in message
+
+    def test_empty_evidence_refused(self) -> None:
+        with pytest.raises(ValueError) as excinfo:
+            _row(policy_class='no_evidence', evidence=())
+        assert 'no_evidence' in str(excinfo.value)
+        assert '()' in str(excinfo.value)
+
+    def test_string_evidence_entry_refused(self) -> None:
+        with pytest.raises(ValueError) as excinfo:
+            _row(policy_class='str_evidence', evidence=(r'raw-string',))
+        assert 'str_evidence' in str(excinfo.value)
+        assert 'raw-string' in str(excinfo.value)
+
+    def test_reversible_is_false_iff_done_flip_is_allowed(self) -> None:
+        assert _row().reversible is True
+        flipping = _row(actions=frozenset({PolicyAction.DONE_FLIP, PolicyAction.CLOSE_ONLY}))
+        assert flipping.reversible is False
+
+    def test_audit_full_until_is_20_for_file_writing_or_recover_main(self) -> None:
+        assert _row().audit_full_until == 0
+        assert _row(file_writing=True).audit_full_until == 20
+        recovering = _row(actions=frozenset({PolicyAction.RECOVER_MAIN, PolicyAction.CLOSE_ONLY}))
+        assert recovering.audit_full_until == 20
+
+    def test_evidence_present_needs_every_pattern(self) -> None:
+        row = _row(evidence=(
+            re.compile(r'alpha', re.IGNORECASE),
+            re.compile(r'beta', re.IGNORECASE),
+        ))
+        assert row.evidence_present('ALPHA then Beta')
+        assert not row.evidence_present('alpha only')
+        assert not row.evidence_present('')
+
+    def test_table_evidence_is_case_insensitive(self) -> None:
+        row = policy_row('landing_provenance')
+        assert row is not None
+        assert row.evidence_present(
+            'FOUND_ON_MAIN AT 1A2B3C4D; GIT MERGE-BASE --IS-ANCESTOR 1A2B3C4D MAIN RC=0'
+        )
+
+
+class TestPolicyMatch:
+    """PolicyMatch reads only the record's category and agent_role."""
+
+    def test_unconstrained_match_accepts_anything(self) -> None:
+        match = PolicyMatch()
+        assert match.matches('infra_issue', 'some-agent')
+        assert match.matches('task_failure', '')
+
+    def test_categories_must_contain_the_record_category(self) -> None:
+        match = PolicyMatch(categories=frozenset({EscalationCategory.INFRA_ISSUE}))
+        assert match.matches('infra_issue', 'any-role')
+        assert not match.matches('task_failure', 'any-role')
+
+    def test_agent_role_is_a_full_match(self) -> None:
+        match = PolicyMatch(agent_role=re.compile(r'orchestrator-main-sweep'))
+        assert match.matches('task_failure', 'orchestrator-main-sweep')
+        assert not match.matches('task_failure', 'orchestrator-main-sweep-2')
+        assert not match.matches('task_failure', 'x-orchestrator-main-sweep')
+
+    def test_category_and_role_are_anded(self) -> None:
+        match = PolicyMatch(
+            categories=frozenset({EscalationCategory.RISK_IDENTIFIED}),
+            agent_role=re.compile(r'orchestrator-recovery-veto-streak'),
+        )
+        assert match.matches('risk_identified', 'orchestrator-recovery-veto-streak')
+        assert not match.matches('risk_identified', 'some-agent')
+        assert not match.matches('infra_issue', 'orchestrator-recovery-veto-streak')
+
+
+class TestPolicyTableRows:
+    """POLICY_TABLE: the one enumeration of executor classes (PRD §5.1)."""
+
+    _FOUND_ON_MAIN = 'found_on_main at 1a2b3c4d; git merge-base --is-ancestor 1a2b3c4d main rc=0'
+
+    def test_table_is_a_tuple_of_rows_with_unique_slugs(self) -> None:
+        assert isinstance(POLICY_TABLE, tuple)
+        assert all(isinstance(row, PolicyRow) for row in POLICY_TABLE)
+        slugs = [row.policy_class for row in POLICY_TABLE]
+        assert len(slugs) == len(set(slugs)), f'duplicate slugs in {slugs!r}'
+
+    def test_every_class_starts_shadow(self) -> None:
+        not_shadow = {
+            row.policy_class: row.initial_state
+            for row in POLICY_TABLE if row.initial_state is not ClassSwitch.SHADOW
+        }
+        assert not not_shadow, f'every class must start shadow (decision 7): {not_shadow!r}'
+
+    def test_no_row_allows_park_or_restart(self) -> None:
+        for row in POLICY_TABLE:
+            assert not ({'park', 'restart'} & row.actions), row.policy_class
+
+    def test_unknown_slug_has_no_row(self) -> None:
+        assert policy_row('nope') is None
+
+    def test_every_row_is_reachable_by_its_slug(self) -> None:
+        for row in POLICY_TABLE:
+            assert policy_row(row.policy_class) is row
+
+    def test_landing_provenance_row(self) -> None:
+        row = policy_row('landing_provenance')
+        assert row is not None
+        assert row.match.matches('provenance_unattributed', 'some-agent')
+        assert not row.match.matches('provenance_conflict', 'some-agent')
+        assert {PolicyAction.DONE_FLIP, PolicyAction.CLOSE_ONLY} <= row.actions
+        assert row.reversible is False
+        assert row.evidence_present(self._FOUND_ON_MAIN)
+        assert not row.evidence_present(
+            'found_on_main; git merge-base --is-ancestor main rc=0'
+        )
+
+    def test_found_on_main_matches_any_category(self) -> None:
+        row = policy_row('found_on_main')
+        assert row is not None
+        for category in ('task_failure', 'infra_issue', 'provenance_unattributed'):
+            assert row.match.matches(category, 'some-agent')
+        assert row.evidence_present(self._FOUND_ON_MAIN)
+
+    @pytest.mark.parametrize('slug', ('red_main_recovery', 'b3_low_risk_unblock'))
+    def test_file_writing_rows_are_fully_audited(self, slug: str) -> None:
+        row = policy_row(slug)
+        assert row is not None
+        assert row.file_writing is True
+        assert row.audit_full_until == 20
+
+    def test_only_the_recon_row_serves_the_reconciliation_queue(self) -> None:
+        recon = policy_row('recon_run_self_cleared')
+        assert recon is not None
+        assert recon.queue_kind == 'reconciliation'
+        others = {
+            row.policy_class: row.queue_kind
+            for row in POLICY_TABLE
+            if row is not recon and row.queue_kind != 'project'
+        }
+        assert not others, f'only recon_run_self_cleared may serve the recon queue: {others!r}'
+
+    def test_carve_out_rows_are_table_rows_in_specificity_order(self) -> None:
+        assert [row.policy_class for row in L2_AUTO_CLOSE_ALLOWLIST] == [
+            'superseded_main_sweep', 'self_cleared_infra', 'stale_task_scoped',
+        ]
+        for row in L2_AUTO_CLOSE_ALLOWLIST:
+            assert any(row is table_row for table_row in POLICY_TABLE), row.policy_class
