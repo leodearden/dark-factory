@@ -4310,8 +4310,8 @@ class GitOps:
         # in-process reasoning as WarmLanePool.assignments_snapshot). Every
         # enter re-marks, so a span opened after a re-assignment is truthful.
         self._lane_in_use_depth[key] = self._lane_in_use_depth.get(key, 0) + 1
-        self._lane_lifecycle.note_in_use(lane_dir)
         try:
+            self._lane_lifecycle.note_in_use(lane_dir)
             yield
         finally:
             self._lane_in_use_depth[key] -= 1

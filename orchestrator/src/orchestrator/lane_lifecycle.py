@@ -307,14 +307,18 @@ class LaneLifecycle:
         rather than raising. Returns ``{}`` when ``state_dir`` doesn't exist
         (never created, or an empty/pre-record host).
         """
-        if not self.state_dir.is_dir():
-            return {}
         records: dict[str, LaneRecord] = {}
-        for path in sorted(self.state_dir.glob('*.json')):
-            record = self.read(path.stem)
+        for lane_name in self._record_lane_names():
+            record = self.read(lane_name)
             if record is not None:
-                records[path.stem] = record
+                records[lane_name] = record
         return records
+
+    def _record_lane_names(self) -> list[str]:
+        """Lane names with a record file, in record-file order; [] without ``state_dir``."""
+        if not self.state_dir.is_dir():
+            return []
+        return [path.stem for path in sorted(self.state_dir.glob('*.json'))]
 
     def _write(self, lane: Path | str, record: LaneRecord) -> None:
         """Atomically write *record* for *lane* (tmp file + os.replace).
@@ -651,11 +655,11 @@ class LaneLifecycle:
         Returns True when the record reads IN_USE afterwards; one already
         IN_USE is a success with no write. Any other state (a benign race,
         e.g. the lane was released while a child was finishing), a corrupt
-        record, or a failed write returns False. Never raises: unlike
-        ``note_assigned``, which propagates, a liveness marker must never
-        abort the caller that is spawning the child.
+        or unreadable record, or a failed write returns False. Never raises:
+        unlike ``note_assigned``, which propagates, a liveness marker must
+        never abort the caller that is spawning the child.
         """
-        rec = self.read(lane)
+        rec = self._read_best_effort(lane)
         if rec is not None and rec.state is LaneState.IN_USE:
             return True
         return self._best_effort_step(lane, rec, LaneState.ASSIGNED, LaneState.IN_USE)
@@ -664,9 +668,10 @@ class LaneLifecycle:
         """Best-effort ``IN_USE -> ASSIGNED``: the last live child left *lane*.
 
         Same never-raise contract as ``note_in_use``; a record in any state
-        other than IN_USE is left alone and False returned.
+        other than IN_USE, or a corrupt or unreadable one, is left alone and
+        False returned.
         """
-        rec = self.read(lane)
+        rec = self._read_best_effort(lane)
         return self._best_effort_step(lane, rec, LaneState.IN_USE, LaneState.ASSIGNED)
 
     def reset_stale_in_use(self, skip: Iterable[str] = ()) -> list[str]:
@@ -679,7 +684,7 @@ class LaneLifecycle:
         raises; returns the names of the lanes it reset, in lane-name order.
         """
         try:
-            records = self.all_records()
+            lane_names = self._record_lane_names()
         except OSError:
             logger.warning(
                 'lane_lifecycle: could not scan %s for stale IN_USE records',
@@ -688,8 +693,9 @@ class LaneLifecycle:
             return []
         skipped = set(skip)
         reset: list[str] = []
-        for lane_name, rec in records.items():
-            if rec.state is not LaneState.IN_USE or lane_name in skipped:
+        for lane_name in lane_names:
+            rec = self._read_best_effort(lane_name)
+            if rec is None or rec.state is not LaneState.IN_USE or lane_name in skipped:
                 continue
             if self.note_idle(lane_name):
                 logger.info(
@@ -698,6 +704,17 @@ class LaneLifecycle:
                 )
                 reset.append(lane_name)
         return reset
+
+    def _read_best_effort(self, lane: Path | str) -> LaneRecord | None:
+        """``read()``, with an unreadable record file also mapped to ``None``."""
+        try:
+            return self.read(lane)
+        except OSError:
+            logger.warning(
+                'lane_lifecycle: could not read record for lane %s',
+                Path(lane).name, exc_info=True,
+            )
+            return None
 
     def _best_effort_step(
         self, lane: Path | str, rec: LaneRecord | None, origin: LaneState, to: LaneState,
