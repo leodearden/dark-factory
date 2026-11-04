@@ -3,17 +3,40 @@ census, active rows and lineage (PRD dashboard-prd-lanes §4.4–§4.5, §5.5)."
 
 from __future__ import annotations
 
+import dataclasses
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from types import MappingProxyType
 from typing import Any
 
 import pytest
+from shared.task_statuses import TaskStatus
 
+from dashboard.data.census import CensusVocabularyError, TaskCensus, build_census
+from dashboard.data.datum import (
+    Datum,
+    DatumContractError,
+    DatumInvariant,
+    DatumState,
+    unknown_datum,
+    validate_datum,
+)
+from dashboard.data.prd_attribution import LineageEntry, UnresolvedReason, lineage_entry
 from dashboard.data.prd_view import (
+    FIGURE_RULES,
+    SEGMENT_LABELS,
     SEGMENT_TONES,
+    FigureId,
+    PrdView,
+    PrdViewContractError,
+    PrdViewInputs,
+    PrdViewInvariant,
     Segment,
+    build_prd_view,
     is_human_gate,
     is_ready,
     segment_of,
+    validate_prd_view,
 )
 
 NOW = datetime(2026, 11, 4, 12, 0, tzinfo=UTC)
@@ -146,3 +169,479 @@ def test_segment_tones_are_the_palette_keys():
         Segment.READY: 'warn',
         Segment.WAITING: 'info',
     }
+
+
+# ---------------------------------------------------------------------------
+# build_prd_view: the census join over one root (boundary rows 8, 9 and 12)
+# ---------------------------------------------------------------------------
+
+ROOT = '/home/leo/src/dark-factory'
+PRD_A = 'plans/a-prd.md'
+PRD_B = 'plans/b-prd.md'
+FOREIGN_PRD = '/elsewhere/plans/x-prd.md'
+SNAPSHOT_BOUND = 30
+LINEAGE_BOUND = 900
+SNAPSHOT_AS_OF = NOW - timedelta(seconds=5)
+LINEAGE_AS_OF = NOW - timedelta(seconds=120)
+_NO_PRIORITY = None
+
+
+def _pending_since(days: float) -> str:
+    return (NOW - timedelta(days=days)).isoformat()
+
+
+# id: (status, priority, metadata). PRD A: 1 done, 2 ready, 3 a follow-up of 1,
+# 4 a done follow-up of 3 carrying two links, 5 cancelled; PRD B: 6 done only;
+# 7 no link; 8 done with no PRD; 9 a cross-project link; 10 a foreign PRD.
+_TASKS: dict[int, tuple[str, str | None, dict[str, Any]]] = {
+    1: ('done', 'medium', {'prd_path': PRD_A}),
+    2: ('pending', 'medium', {'prd_path': PRD_A, 'pending_since': _pending_since(40)}),
+    3: ('in-progress', 'medium', {'spawned_from': 1}),
+    4: ('done', 'medium', {'spawned_from': 3, 'cross_repo_refile_of': 'reify:1'}),
+    5: ('cancelled', 'medium', {'prd_path': PRD_A}),
+    6: ('done', 'medium', {'prd_path': PRD_B}),
+    7: ('pending', 'medium', {}),
+    8: ('done', 'medium', {}),
+    9: ('pending', 'high', {'spawned_from': 'reify:5569', 'source': 'review'}),
+    10: ('blocked', _NO_PRIORITY, {'prd_path': FOREIGN_PRD}),
+}
+STATUS_MAP: dict[int, str] = {task_id: status for task_id, (status, _, _) in _TASKS.items()}
+
+
+def _active_row(task_id: int, status: str, priority: str | None, metadata: dict) -> dict:
+    row: dict[str, Any] = {
+        'id': task_id, 'status': status, 'dependencies': [], 'metadata': metadata,
+    }
+    if priority is not None:
+        row['priority'] = priority
+    return row
+
+
+def _rows(tasks: dict[int, tuple[str, str | None, dict[str, Any]]]) -> list[dict]:
+    """The open tasks' raw rows, as the snapshot unit holds its active rows."""
+    return [
+        _active_row(task_id, status, priority, metadata)
+        for task_id, (status, priority, metadata) in tasks.items()
+        if TaskStatus(status) not in {TaskStatus.DONE, TaskStatus.CANCELLED}
+    ]
+
+
+def _lineage(tasks: dict[int, tuple[str, str | None, dict[str, Any]]]) -> dict[int, LineageEntry]:
+    return {task_id: lineage_entry(metadata, ROOT) for task_id, (_, _, metadata) in tasks.items()}
+
+
+def _fresh(value: Any, as_of: datetime, bound: int) -> Datum[Any]:
+    return Datum(value, as_of, DatumState.FRESH, None, bound)
+
+
+def _inputs(
+    tasks: dict[int, tuple[str, str | None, dict[str, Any]]] = _TASKS,
+    *,
+    status_map: dict[int, str] | None = None,
+    census: Datum[TaskCensus] | None = None,
+    rows: Datum[list[dict]] | None = None,
+    lineage: Datum[Any] | None = None,
+) -> PrdViewInputs:
+    status_map = (
+        {task_id: status for task_id, (status, _, _) in tasks.items()}
+        if status_map is None else status_map
+    )
+    return PrdViewInputs(
+        project_root=ROOT,
+        status_map=status_map,
+        census=census or _fresh(build_census(status_map), SNAPSHOT_AS_OF, SNAPSHOT_BOUND),
+        rows=rows or _fresh(_rows(tasks), SNAPSHOT_AS_OF, SNAPSHOT_BOUND),
+        lineage=lineage or _fresh(MappingProxyType(_lineage(tasks)), LINEAGE_AS_OF, LINEAGE_BOUND),
+    )
+
+
+def _view(inputs: PrdViewInputs | None = None) -> PrdView:
+    view = build_prd_view(inputs or _inputs(), now=NOW).value
+    assert view is not None
+    return view
+
+
+def _wire(inputs: PrdViewInputs | None = None) -> dict[str, Any]:
+    return _view(inputs).to_wire()
+
+
+def test_a_prd_row_counts_its_members_by_segment():
+    [row] = _wire()['prds']
+    assert row == {
+        'key': PRD_A,
+        'segments': {
+            'done': 2, 'in_progress': 1, 'blocked': 0, 'deferred': 0, 'ready': 1, 'waiting': 0,
+        },
+        'total': 4,
+        'direct_open_ids': [2],
+        'followup_open': [{'task_id': 3, 'hops': 1}],
+        'ready': {
+            'count': 1, 'oldest_task_id': 2, 'oldest_pending_days': 40,
+            'oldest_is_lower_bound': False,
+        },
+    }
+
+
+def test_a_prd_with_no_open_member_is_closed_not_a_row():
+    wire = _wire()
+    assert PRD_B not in [row['key'] for row in wire['prds']]
+    assert wire['closed'] == {'prds': 1, 'tasks': 1}
+
+
+def test_done_tasks_no_prd_owns_close_the_sum_undrawn():
+    assert _wire()['unattributed_done'] == 1
+
+
+def test_multi_link_counts_tasks_carrying_two_link_keys():
+    assert _wire()['multi_link'] == 1
+
+
+def test_dark_matter_groups_open_unattributed_tasks():
+    dark_matter = _wire()['dark_matter']
+    assert dark_matter['total'] == 3
+    assert dark_matter['members'] == {
+        'no_link': [7], 'cross_project_link': [9], 'foreign_prd': [10],
+    }
+    assert dark_matter['by_reason'] == {
+        reason.value: (1 if reason.value in {'no_link', 'cross_project_link', 'foreign_prd'} else 0)
+        for reason in UnresolvedReason
+    }
+    assert dark_matter['by_status'] == {
+        status.value: {'pending': 2, 'blocked': 1}.get(status.value, 0) for status in TaskStatus
+    }
+    assert dark_matter['by_priority'] == {'medium': 1, 'high': 1, 'unrecorded': 1}
+    assert dark_matter['by_source'] == {'review': 1, 'unrecorded': 2}
+    assert dark_matter['ready_high_ids'] == [9]
+
+
+def test_dark_matter_sources_are_the_top_five_plus_other():
+    sources = ['a', 'a', 'a', 'b', 'b', 'c', 'd', 'e', 'f', 'g']
+    tasks = {
+        task_id: ('pending', 'medium', {'source': source})
+        for task_id, source in enumerate(sources, start=1)
+    }
+    assert _wire(_inputs(tasks))['dark_matter']['by_source'] == {
+        'a': 3, 'b': 2, 'c': 1, 'd': 1, 'e': 1, 'other': 2,
+    }
+
+
+def test_the_census_identity_holds_against_the_status_map():
+    wire = _wire()
+    census = build_census(STATUS_MAP)
+    drawn = sum(row['total'] for row in wire['prds'])
+    assert (
+        drawn + wire['closed']['tasks'] + wire['unattributed_done'] + wire['dark_matter']['total']
+        == census.total - census.counts[TaskStatus.CANCELLED]
+    )
+
+
+def _with_metadata(task_id: int, **metadata: Any) -> dict[int, tuple[str, str | None, dict]]:
+    status, priority, base = _TASKS[task_id]
+    return {**_TASKS, task_id: (status, priority, {**base, **metadata})}
+
+
+def test_a_backfilled_anchor_makes_the_ready_age_a_lower_bound():
+    tasks = _with_metadata(2, pending_since_backfilled=True)
+    [row] = _wire(_inputs(tasks))['prds']
+    assert row['ready'] == {
+        'count': 1, 'oldest_task_id': 2, 'oldest_pending_days': 40,
+        'oldest_is_lower_bound': True,
+    }
+
+
+def test_a_younger_backfilled_anchor_still_makes_the_ready_age_a_lower_bound():
+    tasks = {
+        **_TASKS,
+        11: ('pending', 'medium', {
+            'prd_path': PRD_A, 'pending_since': _pending_since(3), 'pending_since_backfilled': True,
+        }),
+    }
+    [row] = _wire(_inputs(tasks))['prds']
+    assert row['ready'] == {
+        'count': 2, 'oldest_task_id': 2, 'oldest_pending_days': 40,
+        'oldest_is_lower_bound': True,
+    }
+
+
+@pytest.mark.parametrize(
+    'anchor', [{}, {'pending_since': 'not a timestamp'}, {'pending_since': 12345}],
+    ids=['absent', 'unparseable', 'not_a_string'],
+)
+def test_a_ready_member_without_a_parseable_anchor_makes_the_age_a_lower_bound(anchor):
+    tasks = {**_TASKS, 11: ('pending', 'medium', {'prd_path': PRD_A, **anchor})}
+    [row] = _wire(_inputs(tasks))['prds']
+    assert row['ready'] == {
+        'count': 2, 'oldest_task_id': 2, 'oldest_pending_days': 40,
+        'oldest_is_lower_bound': True,
+    }
+
+
+def test_no_ready_member_has_no_ready_age():
+    tasks = _with_metadata(2, external_deps=['reify:1'])
+    [row] = _wire(_inputs(tasks))['prds']
+    assert row['ready'] == {
+        'count': 0, 'oldest_task_id': None, 'oldest_pending_days': None,
+        'oldest_is_lower_bound': False,
+    }
+
+
+# --- row 8: the active rows overlay a lagging lineage index ---------------
+
+
+def test_an_active_rows_own_prd_overrides_its_lineage_entry():
+    lineage = {**_lineage(_TASKS), 2: lineage_entry({}, ROOT)}
+    inputs = _inputs(lineage=_fresh(MappingProxyType(lineage), LINEAGE_AS_OF, LINEAGE_BOUND))
+    wire = _wire(inputs)
+    assert wire['prds'][0]['direct_open_ids'] == [2]
+    assert 2 not in [task_id for ids in wire['dark_matter']['members'].values() for task_id in ids]
+
+
+def test_a_status_map_id_unknown_to_lineage_and_rows_is_lineage_pending():
+    status_map = {**STATUS_MAP, 11: 'pending', 12: 'done'}
+    wire = _wire(_inputs(status_map=status_map))
+    assert wire['dark_matter']['members']['lineage_pending'] == [11]
+    assert wire['unattributed_done'] == 2
+    census = build_census(status_map)
+    drawn = sum(row['total'] for row in wire['prds'])
+    assert (
+        drawn + wire['closed']['tasks'] + wire['unattributed_done'] + wire['dark_matter']['total']
+        == census.total - census.counts[TaskStatus.CANCELLED]
+    )
+
+
+# --- composite provenance -------------------------------------------------
+
+
+def test_a_view_over_fresh_inputs_is_fresh_as_of_its_oldest_input():
+    datum = build_prd_view(_inputs(), now=NOW)
+    assert datum.state is DatumState.FRESH
+    assert datum.reason is None
+    assert datum.as_of == LINEAGE_AS_OF
+    assert datum.freshness_bound_seconds == LINEAGE_BOUND
+    validate_datum(datum, NOW)
+
+
+def test_the_view_lists_each_input_with_its_own_provenance():
+    snapshot_as_of = SNAPSHOT_AS_OF.astimezone(UTC).isoformat()
+    lineage_as_of = LINEAGE_AS_OF.astimezone(UTC).isoformat()
+    assert _wire()['inputs'] == [
+        {'name': 'status_map', 'as_of': snapshot_as_of, 'state': 'fresh', 'reason': None},
+        {'name': 'active_rows', 'as_of': snapshot_as_of, 'state': 'fresh', 'reason': None},
+        {'name': 'lineage', 'as_of': lineage_as_of, 'state': 'fresh', 'reason': None},
+    ]
+
+
+def test_stale_rows_make_a_stale_view_naming_the_rows_reason():
+    rows = Datum(_rows(_TASKS), NOW - timedelta(seconds=60), DatumState.STALE, 'rows read failed: boom', 30)
+    datum = build_prd_view(_inputs(rows=rows), now=NOW)
+    assert datum.state is DatumState.STALE
+    assert datum.reason == 'active_rows: rows read failed: boom'
+    assert datum.value is not None
+    validate_datum(datum, NOW)
+
+
+def test_an_input_past_its_own_bound_at_now_is_judged_stale():
+    rows = _fresh(_rows(_TASKS), NOW - timedelta(seconds=31), SNAPSHOT_BOUND)
+    datum = build_prd_view(_inputs(rows=rows), now=NOW)
+    assert datum.state is DatumState.STALE
+    assert datum.reason == 'active_rows: measured 31s before it was served, past the 30s freshness bound'
+    assert datum.value is not None
+    [_, active_rows, _] = datum.value.to_wire()['inputs']
+    assert active_rows['state'] == 'stale'
+
+
+def test_every_non_fresh_input_is_named_in_the_reason():
+    rows = Datum(_rows(_TASKS), SNAPSHOT_AS_OF, DatumState.STALE, 'rows lag', SNAPSHOT_BOUND)
+    lineage = Datum(
+        MappingProxyType(_lineage(_TASKS)), LINEAGE_AS_OF, DatumState.STALE, 'lineage lag', LINEAGE_BOUND,
+    )
+    datum = build_prd_view(_inputs(rows=rows, lineage=lineage), now=NOW)
+    assert datum.state is DatumState.STALE
+    assert datum.reason == 'active_rows: rows lag; lineage: lineage lag'
+
+
+def test_unknown_lineage_makes_an_unknown_view_naming_the_lineage_reason():
+    lineage = unknown_datum('first lineage read still in flight after 5.0s', LINEAGE_BOUND)
+    datum = build_prd_view(_inputs(lineage=lineage), now=NOW)
+    assert datum.state is DatumState.UNKNOWN
+    assert datum.value is None
+    assert datum.reason == 'lineage: first lineage read still in flight after 5.0s'
+    assert datum.freshness_bound_seconds == LINEAGE_BOUND
+    validate_datum(datum, NOW)
+
+
+def test_an_unknown_census_makes_an_unknown_view_with_the_census_reason():
+    census = unknown_datum('status map read failed: connection refused', SNAPSHOT_BOUND)
+    datum = build_prd_view(_inputs(census=census), now=NOW)
+    assert datum.state is DatumState.UNKNOWN
+    assert datum.reason == 'status map read failed: connection refused'
+
+
+def test_a_failed_map_half_beside_a_last_good_census_is_unknown_with_the_maps_reason():
+    census = Datum(
+        build_census(STATUS_MAP), NOW - timedelta(seconds=40), DatumState.STALE,
+        'status map read failed: timeout', SNAPSHOT_BOUND,
+    )
+    datum = build_prd_view(_inputs(status_map={}, census=census), now=NOW)
+    assert datum.state is DatumState.UNKNOWN
+    assert datum.reason == 'status map read failed: timeout'
+
+
+def test_an_empty_map_beside_a_fresh_census_is_unknown():
+    census = _fresh(build_census({}), SNAPSHOT_AS_OF, SNAPSHOT_BOUND)
+    datum = build_prd_view(_inputs(status_map={}, census=census), now=NOW)
+    assert datum.state is DatumState.UNKNOWN
+    assert datum.reason == 'the status map measured no tasks'
+
+
+def test_an_off_vocabulary_status_makes_an_unknown_view_with_the_census_error():
+    status_map = {**STATUS_MAP, 99: 'bogus'}
+    with pytest.raises(CensusVocabularyError) as drift:
+        build_census(status_map)
+    census = _fresh(build_census(STATUS_MAP), SNAPSHOT_AS_OF, SNAPSHOT_BOUND)
+    datum = build_prd_view(_inputs(status_map=status_map, census=census), now=NOW)
+    assert datum.state is DatumState.UNKNOWN
+    assert datum.reason == str(drift.value)
+
+
+# --- row 12: every figure carries its rule --------------------------------
+
+_STRUCTURAL_VIEW_KEYS = {'prds', 'inputs', 'rules', 'segment_legend'}
+_STRUCTURAL_ROW_KEYS = {'key'}
+_GAMMA_2_KEYS = {
+    'title', 'lane', 'state_line', 'signal', 'next_action', 'activity', 'detail',
+    'lanes', 'signal_coverage', 'hidden_high',
+}
+
+
+def test_every_figure_id_has_rule_text_shipped_in_the_view():
+    assert set(FIGURE_RULES) == set(FigureId)
+    assert all(isinstance(text, str) and text.strip() for text in FIGURE_RULES.values())
+    assert _wire()['rules'] == {figure.value: text for figure, text in FIGURE_RULES.items()}
+
+
+def test_every_figure_on_the_wire_names_a_figure_id():
+    wire = _wire()
+    figure_ids = {figure.value for figure in FigureId}
+    view_figures = set(wire) - _STRUCTURAL_VIEW_KEYS
+    row_figures = {key for row in wire['prds'] for key in row} - _STRUCTURAL_ROW_KEYS
+    assert view_figures <= figure_ids
+    assert row_figures <= figure_ids
+    assert view_figures | row_figures == figure_ids
+
+
+def test_the_segment_legend_is_served_in_display_order():
+    assert _wire()['segment_legend'] == [
+        {'segment': segment.value, 'label': SEGMENT_LABELS[segment], 'tone': SEGMENT_TONES[segment]}
+        for segment in Segment
+    ]
+
+
+def _all_keys(value: Any) -> set[str]:
+    if isinstance(value, dict):
+        return set(value) | {key for child in value.values() for key in _all_keys(child)}
+    if isinstance(value, list):
+        return {key for child in value for key in _all_keys(child)}
+    return set()
+
+
+def test_the_wire_carries_no_gamma_2_figure():
+    assert not _all_keys(_wire()) & _GAMMA_2_KEYS
+
+
+def test_every_open_id_appears_exactly_once():
+    wire = _wire(_inputs(status_map={**STATUS_MAP, 11: 'pending'}))
+    listed = [
+        *(task_id for row in wire['prds'] for task_id in row['direct_open_ids']),
+        *(followup['task_id'] for row in wire['prds'] for followup in row['followup_open']),
+        *(task_id for ids in wire['dark_matter']['members'].values() for task_id in ids),
+    ]
+    open_ids = {
+        task_id for task_id, status in {**STATUS_MAP, 11: 'pending'}.items()
+        if status not in {'done', 'cancelled'}
+    }
+    assert sorted(listed) == sorted(open_ids)
+
+
+# --- validate_prd_view: each declared rule, breached by hand --------------
+
+
+def _replace_row(view: PrdView, **changes: Any) -> PrdView:
+    row, *rest = view.prds
+    return dataclasses.replace(view, prds=(dataclasses.replace(row, **changes), *rest))
+
+
+def _segments_off_by_one(view: PrdView) -> PrdView:
+    segments = view.prds[0].segments
+    return _replace_row(
+        view, segments=MappingProxyType({**segments, Segment.DONE: segments[Segment.DONE] + 1}),
+    )
+
+
+def _no_open_member(view: PrdView) -> PrdView:
+    total = view.prds[0].total
+    segments = {segment: (total if segment is Segment.DONE else 0) for segment in Segment}
+    return _replace_row(view, segments=MappingProxyType(segments))
+
+
+def _broken_identity(view: PrdView) -> PrdView:
+    return dataclasses.replace(view, unattributed_done=view.unattributed_done + 1)
+
+
+def _dark_matter_off_by_one(view: PrdView) -> PrdView:
+    dark_matter = view.dark_matter
+    return dataclasses.replace(
+        view, dark_matter=dataclasses.replace(dark_matter, total=dark_matter.total + 1),
+    )
+
+
+def _open_id_twice(view: PrdView) -> PrdView:
+    return _replace_row(view, direct_open_ids=(*view.prds[0].direct_open_ids, 7))
+
+
+def _open_id_missing(view: PrdView) -> PrdView:
+    return _replace_row(view, followup_open=())
+
+
+def _figure_rule_missing(view: PrdView) -> PrdView:
+    rules = {figure: text for figure, text in view.rules.items() if figure is not FigureId.MULTI_LINK}
+    return dataclasses.replace(view, rules=MappingProxyType(rules))
+
+
+_BREACHES: dict[str, tuple[Callable[[PrdView], PrdView], PrdViewInvariant, tuple[str, ...]]] = {
+    'segments_sum': (_segments_off_by_one, PrdViewInvariant.SEGMENTS_SUM, (PRD_A, 'total=4')),
+    'open_member': (_no_open_member, PrdViewInvariant.OPEN_MEMBER, (PRD_A,)),
+    'census_identity': (_broken_identity, PrdViewInvariant.CENSUS_IDENTITY, ('= 10', '= 9')),
+    'dark_matter_total': (_dark_matter_off_by_one, PrdViewInvariant.DARK_MATTER_TOTAL, ('total=4',)),
+    'open_id_twice': (_open_id_twice, PrdViewInvariant.OPEN_ID_ONCE, ('[7]',)),
+    'open_id_missing': (_open_id_missing, PrdViewInvariant.OPEN_ID_ONCE, ('[3]',)),
+    'figure_rule_missing': (_figure_rule_missing, PrdViewInvariant.FIGURE_RULE, ('multi_link',)),
+}
+
+
+def test_a_built_view_passes_its_own_validator():
+    validate_prd_view(_view(), STATUS_MAP)
+
+
+@pytest.mark.parametrize('breach', list(_BREACHES.values()), ids=list(_BREACHES))
+def test_validate_prd_view_refuses_each_breach(breach):
+    tamper, rule, offending = breach
+    with pytest.raises(PrdViewContractError) as refused:
+        validate_prd_view(tamper(_view()), STATUS_MAP)
+    assert isinstance(refused.value, DatumContractError)
+    assert refused.value.invariant is DatumInvariant.VALUE_CONTRACT
+    assert refused.value.rule is rule
+    message = str(refused.value)
+    assert rule.value in message
+    for value in offending:
+        assert value in message
+
+
+def test_a_breach_lists_at_most_five_offending_ids():
+    tasks = {**_TASKS, **{task_id: ('pending', 'medium', {}) for task_id in range(11, 19)}}
+    status_map = {task_id: status for task_id, (status, _, _) in tasks.items()}
+    view = _view(_inputs(tasks))
+    duplicated = _replace_row(view, direct_open_ids=(2, *range(11, 19)))
+    with pytest.raises(PrdViewContractError) as refused:
+        validate_prd_view(duplicated, status_map)
+    assert '[11, 12, 13, 14, 15] (+3 more)' in str(refused.value)
