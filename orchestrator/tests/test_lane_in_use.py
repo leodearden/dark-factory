@@ -22,19 +22,21 @@ from _workflow_helpers import fixed_prompt
 from escalation.queue import EscalationQueue
 from shared.config_dir import TaskConfigDir
 
-# Reused read-only: the real-git warm-lane writer -> crash-recovery reader
-# harness wiring, and (as test_task_verify_lease.py::_build_task_workflow does)
-# the factory that builds a TaskWorkflow with every collaborator mocked.
-from test_lane_lifecycle_integration import (  # noqa: F401 -- ig_git_repo is a fixture used by name
+# Reused read-only: the real-git repo and warm-lane writer -> crash-recovery
+# reader harness wiring, the merge-phase preamble stubs, and (as
+# test_task_verify_lease.py::_build_task_workflow does) the factory that builds
+# a TaskWorkflow with every collaborator mocked.
+from test_lane_lifecycle_integration import (
     _acquire_lane,
     _add_warm_lane_scripts,
     _build_harness,
     _get_head,
+    _make_ig_repo,
     _make_orch_config,
     _make_plan,
     _wire_recovery_scheduler,
-    ig_git_repo,
 )
+from test_task_verify_lease import _StopMergePhase, _stub_merge_phase_preamble
 from test_workflow_verify_retry import _make_workflow
 
 from orchestrator.agents.invoke import AgentResult
@@ -568,10 +570,6 @@ def _passing_result() -> VerifyResult:
     )
 
 
-class _StopMergePhase(Exception):
-    """Raised by the merge-phase spy to unwind before the merge-queue submit."""
-
-
 @pytest.mark.asyncio
 class TestWorkflowSpawnSitesHoldTheSpan:
     @pytest.mark.usefixtures('code_default_config')
@@ -613,12 +611,7 @@ class TestWorkflowSpawnSitesHoldTheSpan:
     async def test_merge_phase_reverify(self, tmp_path: Path, monkeypatch):
         workflow, git_ops, lane = await _workflow_in_lane(tmp_path)
         workflow.config.pre_merge_reverify = True
-        workflow._maybe_defer_as_train_member = AsyncMock(return_value=None)  # type: ignore[method-assign]
-        workflow._enter_phase = MagicMock()  # type: ignore[method-assign]
-        workflow._check_scope_invariant = AsyncMock(return_value=None)  # type: ignore[method-assign]
-        workflow._recover_before_merge = AsyncMock(return_value=None)  # type: ignore[method-assign]
-        git_ops.get_main_sha = AsyncMock(return_value='mainsha')  # type: ignore[method-assign]
-        git_ops.rebase_onto_main = AsyncMock(return_value=True)  # type: ignore[method-assign]
+        _stub_merge_phase_preamble(monkeypatch, workflow)
         seen: list[str] = []
 
         def _reverify_then_bail(*_args, **_kwargs) -> VerifyResult:
@@ -628,9 +621,6 @@ class TestWorkflowSpawnSitesHoldTheSpan:
         monkeypatch.setattr(
             'orchestrator.workflow.run_scoped_verification',
             AsyncMock(side_effect=_reverify_then_bail),
-        )
-        monkeypatch.setattr(
-            'orchestrator.workflow._run', AsyncMock(return_value=(0, 'headsha\n', '')),
         )
         with pytest.raises(_StopMergePhase):
             await workflow._run_merge_phase('task/42')
@@ -690,6 +680,11 @@ class TestWorkflowSpawnSitesHoldTheSpan:
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture
+def recovery_repo(tmp_path: Path) -> Path:
+    return _make_ig_repo(tmp_path)
+
+
 async def _crashed_in_flight_lane(repo: Path) -> tuple[Path, Path]:
     """Acquire a lane for live task 42 with progress on disk, as a run that
     then dies would leave it. Returns (worktree_base, lane)."""
@@ -721,26 +716,26 @@ def _reset_lines(caplog, lane: Path) -> list[logging.LogRecord]:
 @pytest.mark.asyncio
 class TestCrashRecoveryResetsInUseFossils:
     async def test_a_record_left_in_use_by_a_crash_is_reset_to_assigned(
-        self, ig_git_repo: Path, caplog,
+        self, recovery_repo: Path, caplog,
     ):
-        worktree_base, lane = await _crashed_in_flight_lane(ig_git_repo)
+        worktree_base, lane = await _crashed_in_flight_lane(recovery_repo)
         # The shape a SIGKILL mid-span leaves behind.
         assert LaneLifecycle(worktree_base).note_in_use(lane) is True
 
         with caplog.at_level(logging.INFO, logger='orchestrator.lane_lifecycle'):
-            await _restart_and_recover(ig_git_repo)
+            await _restart_and_recover(recovery_repo)
 
         record = _on_disk(worktree_base, lane.name)
         assert (record['state'], record['task_id']) == ('assigned', '42')
         assert _reset_lines(caplog, lane), 'the startup reset must be logged'
 
     async def test_an_assigned_record_stays_assigned_and_is_not_reset(
-        self, ig_git_repo: Path, caplog,
+        self, recovery_repo: Path, caplog,
     ):
-        worktree_base, lane = await _crashed_in_flight_lane(ig_git_repo)
+        worktree_base, lane = await _crashed_in_flight_lane(recovery_repo)
 
         with caplog.at_level(logging.INFO, logger='orchestrator.lane_lifecycle'):
-            await _restart_and_recover(ig_git_repo)
+            await _restart_and_recover(recovery_repo)
 
         record = _on_disk(worktree_base, lane.name)
         assert (record['state'], record['task_id']) == ('assigned', '42')

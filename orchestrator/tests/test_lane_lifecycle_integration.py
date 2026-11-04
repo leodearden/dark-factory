@@ -76,13 +76,18 @@ async def _init_repo(repo: Path) -> None:
 
 @pytest.fixture
 def ig_git_repo(tmp_path: Path) -> Path:
+    return _make_ig_repo(tmp_path)
+
+
+def _make_ig_repo(tmp_path: Path) -> Path:
     """Temporary git repo with an initial commit + a resolvable warm base.
 
     Pre-creates the default derived warm-lane base (task 2061 gate) so the
     acquire_warm_lane pre-acquire base-health gate sees WarmBaseHealth.OK,
     and marks `.worktrees/.pool-root` present (task 2099 create-once guard) —
     mirrors test_lane_lifecycle_gitops.py's git_repo / test_warm_lane_
-    integration_gate.py's ig_git_repo fixtures.
+    integration_gate.py's ig_git_repo fixtures. Calls asyncio.run, so call it
+    from a sync fixture, never from inside a running event loop.
     """
     repo = tmp_path / 'repo'
     repo.mkdir()
