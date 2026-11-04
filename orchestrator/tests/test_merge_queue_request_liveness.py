@@ -3970,9 +3970,10 @@ def _assert_quiescent_registry(
           Resolution is detected PASSIVELY (RequestLedger has no on-resolve
           hook), so sweeping first is required, not optional.
       (e) ``two_layer_invariants(main_sha) == []`` — *main_sha* MUST be a
-          REAL sha, never the ``'unknown'`` sentinel: the base-chain and
-          verify-base sub-checks are silently SKIPPED for 'unknown', which
-          would make this pass vacuously.
+          REAL sha, never the ``'unknown'`` sentinel: the base-chain
+          (INV-3) sub-check is silently SKIPPED for 'unknown', which would
+          make this pass vacuously.  Beside it, the dispatch-time
+          ``snapshot()['verify_base_divergences']`` detector key reads ``[]``.
       (f) ``snapshot()['entries'] == []`` — no live work survives
           quiescence.  This is the surface a phantom finalize head
           corrupts, and the census is a SUPERSET of the registry's
@@ -3999,6 +4000,7 @@ def _assert_quiescent_registry(
     assert tli == [], (
         f'two_layer_invariants({main_sha!r}) non-empty at quiescence: {tli!r}'
     )
+    assert worker.snapshot()['verify_base_divergences'] == []
 
     census = worker.snapshot()['entries']
     assert census == [], (
@@ -4240,14 +4242,11 @@ class TestDeadVerifyAbortSelfHealsEndToEnd:
         _assert_quiescent_registry(worker, main_sha, [req])
 
         # ── (7) the aborted/requeued entry is ABSENT from the frozen prefix
-        #        and never becomes its tip.  _frozen_inflight_entries appends
-        #        the finalize head whenever its phase is in
-        #        {verifying, gate_reverify, finalizing}, so a phantom head puts
-        #        a DEAD merge commit at the frozen-prefix tip and every later
-        #        real-verify dispatch mismatches it.  Survivable today only
-        #        because _warn_if_verify_base_not_frozen_tip is log-only —
-        #        pinning it here is what lets the separate eps=1890
-        #        enforcement-flip task proceed without this class re-poisoning it.
+        #        and never becomes its tip.  A phantom (vacated) finalize head
+        #        counted as frozen would put a DEAD merge commit at the
+        #        frozen-prefix tip, and every later real-verify dispatch would
+        #        trip _verify_base_divergence_at_dispatch's detector against it
+        #        (PRD §5.3 class (a); the liveness rule is task 5302's).
         fp = worker.frozen_prefix()
         assert rid not in fp, (
             f'the aborted/requeued request must not sit in the frozen prefix: {fp!r}'

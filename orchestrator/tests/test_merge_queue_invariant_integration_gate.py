@@ -46,9 +46,10 @@ NAME (grep/search), never trust a PRD line offset.
       the surviving InflightEntry passthrough_outcome ValueError [ε=1890].
   8.  CAS-retry rebased landing completes without a phantom
       POST_MERGE_EQUIVALENCE_FAILED (1928 regression pin) [ε=1890 I3].
-  10. A main tip that advances under an in-flight verify surfaces a
-      verify-base violation that is a member of two_layer_invariants()
-      [ξ=1999 I5], and clears once the item drains.
+  10. A main tip that advances under an in-flight verify is NOT a violation:
+      two_layer_invariants() and snapshot()['verify_base_divergences'] both
+      stay [] (task 5302 retired the ξ=1999 I5 false positive), and the item
+      drains.
   11. snapshot() keys are additive-only across the whole module-split batch
       (13 keys total, resource_audit being the newest).
   12. InFlightMergeRegistry.acquire/attach fan-out mirror + the
@@ -316,9 +317,9 @@ def _assert_quiescent(
           request out of LANE_BUFFERED without ever reaching _retire_item's
           TERMINAL hop shows up here as a leaked entry.
       (e) lane.two_layer_invariants(main_sha) == [] — *main_sha* MUST be a
-          REAL sha, never 'unknown': the base-chain and verify-base
-          sub-checks are silently skipped for the 'unknown' sentinel, which
-          would make this assertion pass vacuously rather than meaningfully.
+          REAL sha, never 'unknown': the base-chain (INV-3) sub-check is
+          silently skipped for the 'unknown' sentinel, which would make this
+          assertion pass vacuously rather than meaningfully.
 
     Task 5030 dropped a sixth surface: the request-liveness ledger's own
     emptiness, which was asserted as ``_request_ledger.sweep_resolved()``
