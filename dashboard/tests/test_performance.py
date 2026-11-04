@@ -2816,7 +2816,9 @@ class TestCancelOutcomesAreNotCounted:
 _SLICE_OF_A_CLEAN_ATTEMPT: dict[str, str | None] = {
     'done': 'one-pass',
     # Passed; its merge waits on a train or a coalesced merge, and the merge
-    # worker flips it done with no new row.
+    # worker usually flips it done with no new row. Some are instead re-run in
+    # a later orchestrator run and record a done row too: the card counts
+    # attempts, not tasks, so such a task reads as two passes. Accepted.
     'merge-deferred': 'one-pass',
     # The exit re-pends the row and the scheduler re-dispatches it.
     'requeued': 'requeued',
