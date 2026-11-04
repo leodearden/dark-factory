@@ -13,14 +13,14 @@ from types import MappingProxyType
 
 import pytest
 from _escalation_seed import seed_escalation
+
+from escalation.authority import POLICY_TABLE, ClassSwitch, IllegalClassTransition
 from escalation.policy_state import (
     POLICY_STATE_FILENAME,
     PolicyStateUnreadable,
     load_class_states,
     set_class_state,
 )
-
-from escalation.authority import POLICY_TABLE, ClassSwitch, IllegalClassTransition
 from escalation.queue import EscalationQueue
 
 
