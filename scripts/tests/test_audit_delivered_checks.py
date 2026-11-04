@@ -428,6 +428,12 @@ class TestEvaluateRow:
         assert outcome('src/b.py') is CheckOutcome.FAIL
         assert outcome('src/b.py', expect='absent') is CheckOutcome.PASS
 
+    def test_a_kind_with_no_probe_is_refused_by_name(self, tmp_path):
+        root = _init_repo(tmp_path / 'repo', {'src/a.py': 'pass\n'})
+
+        with pytest.raises(ValueError, match="kind 'script'"):
+            evaluate_row(_row(kind='script', pattern=None), repo_root=str(root))
+
 
 # ---------------------------------------------------------------------------
 # audit_project — the three-source join, and the report's sections.
@@ -1451,9 +1457,7 @@ class TestStructuralSection:
             ('hook-wired', 'vacuous_present_comment_only')
         ]
 
-    def test_path_rows_never_reach_the_structural_section(self, tmp_path):
-        # The structural codes exist only for grep, so a path row must never
-        # be linted into this section, whatever its caller passes.
+    def test_a_path_row_yields_no_structural_code(self, tmp_path):
         root = _init_repo(tmp_path / 'repo', {'src/a.py': 'pass\n'})
         row = _row(kind='path', pattern=None, paths=('src/a.py',), source='manifest',
                    manifest='plans/x.capability-manifest.yaml')
@@ -1649,6 +1653,56 @@ class TestSupersessionAttribution:
             task_id=3705, expect='absent', path='src/own.py',
         )
         _commit(root, 'Merge task/3705 into main', {'src/own.py': 'pass\n'})
+
+        finding = audit_project(str(root)).findings[0]
+
+        assert finding.disposition == DISPOSITION_BROKEN
+        assert finding.superseded_by is None
+
+    def test_a_commit_that_only_modified_the_path_never_supersedes_it(
+        self, tmp_path, make_tasks_db, project_root_with_tasks_db
+    ):
+        # The path was never deleted, so editing it undid nothing.
+        root = self._path_project(
+            tmp_path, make_tasks_db, project_root_with_tasks_db,
+            task_id=3706, expect='absent', path='src/kept.py',
+            files={'src/a.py': 'pass\n', 'src/kept.py': 'pass\n'},
+        )
+        _commit(root, 'fix: tweak (task 3707)', {'src/kept.py': 'changed\n'})
+
+        finding = audit_project(str(root)).findings[0]
+
+        assert finding.disposition == DISPOSITION_BROKEN
+        assert finding.superseded_by is None
+
+    def test_a_file_added_beneath_a_directory_entry_never_supersedes_it(
+        self, tmp_path, make_tasks_db, project_root_with_tasks_db
+    ):
+        # The directory was never removed, so an unrelated file landing in it
+        # undid nothing.
+        root = self._path_project(
+            tmp_path, make_tasks_db, project_root_with_tasks_db,
+            task_id=3708, expect='absent', path='src/pkg',
+            files={'src/a.py': 'pass\n', 'src/pkg/a.py': 'pass\n'},
+        )
+        _commit(root, 'feat: a neighbour (task 3709)', {'src/pkg/b.py': 'pass\n'})
+
+        finding = audit_project(str(root)).findings[0]
+
+        assert finding.disposition == DISPOSITION_BROKEN
+        assert finding.superseded_by is None
+
+    def test_a_glob_character_in_a_path_is_read_literally(
+        self, tmp_path, make_tasks_db, project_root_with_tasks_db
+    ):
+        # ls-tree reads 'src/x*.py' as that one file; a commit adding
+        # src/xy.py touches a different path.
+        root = self._path_project(
+            tmp_path, make_tasks_db, project_root_with_tasks_db,
+            task_id=3710, expect='absent', path='src/x*.py',
+            files={'src/a.py': 'pass\n', 'src/x*.py': 'pass\n'},
+        )
+        _commit(root, 'feat: another module (task 3711)', {'src/xy.py': 'pass\n'})
 
         finding = audit_project(str(root)).findings[0]
 

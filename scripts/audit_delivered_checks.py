@@ -173,10 +173,6 @@ DEFECT_DISPOSITIONS = (
     DISPOSITION_UNWIRED_LIVE_GATE,
 )
 
-#: The kinds given a polarity disposition: both kinds that carry an
-#: ``expect``, each evaluated through :data:`_ROW_EVALUATORS`.
-POLARITY_SWEPT_KINDS = ("grep", "path")
-
 #: The kinds the STRUCTURAL section lints: its codes exist only for grep.
 STRUCTURAL_SWEPT_KINDS = ("grep",)
 
@@ -436,12 +432,6 @@ def _evaluate_path_row(row: DescriptorRow, repo_root: str, ref: str) -> CheckOut
     )
 
 
-_ROW_EVALUATORS: dict[str, Callable[[DescriptorRow, str, str], CheckOutcome]] = {
-    "grep": _evaluate_grep_row,
-    "path": _evaluate_path_row,
-}
-
-
 def evaluate_row(row: DescriptorRow, *, repo_root: str, ref: str = GATE_REF) -> CheckOutcome:
     """Evaluate one descriptor against *ref*, through the RUNTIME primitive.
 
@@ -450,10 +440,10 @@ def evaluate_row(row: DescriptorRow, *, repo_root: str, ref: str = GATE_REF) -> 
     a path row to :func:`shared.delivered_check_polarity.evaluate_path_at_tree`,
     the functions ``orchestrator.delivered_checks._run_grep_check`` and
     ``_run_path_check`` delegate to or twin, so this sweep and the scheduler
-    cannot disagree about what a check means. A kind with no evaluator is
-    never reached: the loaders emit only grep and path rows.
+    cannot disagree about what a check means. A kind outside
+    :data:`POLARITY_SWEPT_KINDS` raises ``ValueError`` naming it.
     """
-    return _ROW_EVALUATORS[row.kind](row, repo_root, ref)
+    return _kind_probe(row).evaluate(row, repo_root, ref)
 
 
 # ---------------------------------------------------------------------------
@@ -698,60 +688,7 @@ _SUPERSESSION_EXCLUDE_PATHSPEC = f":(exclude)*{MANIFEST_SUFFIX}"
 
 
 def _grep_history_argv(row: DescriptorRow, repo_root: str, since: str) -> list[str] | None:
-    """The commits since *since* that changed the pattern's occurrence count."""
-    if not row.pattern:
-        return None
-    argv = [
-        "git", "-C", repo_root, "log", "--format=%s",
-        f"--since={since}", "-S", row.pattern, "--pickaxe-regex",
-    ]
-    # A pathspec of nothing-but-exclusions applies the exclusion to the
-    # implicit "everything" — verified against this repo's git rather than
-    # assumed, since older git treats it as matching nothing.
-    return [*argv, "--", *row.paths, _SUPERSESSION_EXCLUDE_PATHSPEC]
-
-
-def _path_history_argv(row: DescriptorRow, repo_root: str, since: str) -> list[str] | None:
-    """The commits since *since* that created or deleted a listed path."""
-    return [
-        "git", "-C", repo_root, "log", "--format=%s",
-        f"--since={since}", "--diff-filter=AD", "--", *row.paths,
-    ]
-
-
-_HISTORY_ARGVS: dict[str, Callable[[DescriptorRow, str, str], list[str] | None]] = {
-    "grep": _grep_history_argv,
-    "path": _path_history_argv,
-}
-
-
-def _history_argv(row: DescriptorRow, *, repo_root: str, since: str) -> list[str] | None:
-    """The kind's history probe: the commits that could have undone *row*."""
-    return _HISTORY_ARGVS[row.kind](row, repo_root, since)
-
-
-def find_superseding_task(
-    row: DescriptorRow, *, repo_root: str, since: str | None
-) -> str | None:
-    r"""A LATER task that undid *row*'s capability, or ``None``.
-
-    Only ever consulted for a would-be ``broken`` row, and only ever able to
-    DOWNGRADE it — so a false negative costs a footnote and a false positive
-    costs a missed defect. That asymmetry is why the attribution is strict,
-    for both probes in :data:`_HISTORY_ARGVS`: the task id must come from the
-    merge-commit subject convention, never inferred from the diff or the
-    author.
-
-    *since* is the producer's ``updated_at``; commits at or before it are the
-    producer's own work, not a later undoing. Absent, no claim is made at all
-    rather than scanning all of history and attributing the producer's own
-    merge to it.
-
-    A grep row's probe is the pickaxe: the commits that changed the pattern's
-    occurrence count. A path row's is its analogue, ``--diff-filter=AD``: the
-    commits that created or deleted a listed path. The path probe needs no
-    manifest exclusion, because it names explicit paths rather than searching
-    contents.
+    r"""The commits since *since* that changed the pattern's occurrence count.
 
     ``--pickaxe-regex`` IS LOAD-BEARING, not a refinement. A bare ``-S`` is a
     LITERAL-string pickaxe, but every pattern here is the POSIX ERE that
@@ -765,9 +702,104 @@ def find_superseding_task(
     repo: literal ``-S`` returns nothing for both patterns, ``--pickaxe-regex``
     returns 3578's commits for both.
     """
+    if not row.pattern:
+        return None
+    argv = [
+        "git", "-C", repo_root, "log", "--format=%s",
+        f"--since={since}", "-S", row.pattern, "--pickaxe-regex",
+    ]
+    # A pathspec of nothing-but-exclusions applies the exclusion to the
+    # implicit "everything" — verified against this repo's git rather than
+    # assumed, since older git treats it as matching nothing.
+    return [*argv, "--", *row.paths, _SUPERSESSION_EXCLUDE_PATHSPEC]
+
+
+def _path_history_argv(row: DescriptorRow, repo_root: str, since: str) -> list[str] | None:
+    """The commits since *since* that created or deleted exactly a listed path.
+
+    ``--diff-filter=AD`` is the path analogue of the pickaxe: a commit that
+    only modified the path changed nothing the check reads. Each path is
+    ``:(literal)``, the way ``ls-tree`` reads it, and everything beneath it
+    is excluded. Git records no commit creating a directory itself, so a
+    directory entry yields no commits and the probe makes no claim for it.
+    """
+    pathspecs = [
+        spec
+        for path in row.paths
+        for spec in (f":(literal){path}", f":(exclude,literal){path.rstrip('/')}/")
+    ]
+    return [
+        "git", "-C", repo_root, "log", "--format=%s",
+        f"--since={since}", "--diff-filter=AD", "--", *pathspecs,
+    ]
+
+
+def _grep_subject(row: DescriptorRow) -> tuple[str, str]:
+    return ("pattern", repr(row.pattern))
+
+
+def _path_subject(row: DescriptorRow) -> tuple[str, str]:
+    return ("paths", ",".join(row.paths))
+
+
+class _KindProbe(NamedTuple):
+    """Everything the polarity sweep does differently for one kind.
+
+    ``evaluate`` reads the check's outcome at a ref; ``history_argv`` lists
+    the commits that could have undone it, or ``None`` for no claim;
+    ``subject`` is the report's key=value pair for what the check asserts
+    about.
+    """
+
+    evaluate: Callable[[DescriptorRow, str, str], CheckOutcome]
+    history_argv: Callable[[DescriptorRow, str, str], list[str] | None]
+    subject: Callable[[DescriptorRow], tuple[str, str]]
+
+
+_KIND_PROBES: Mapping[str, _KindProbe] = MappingProxyType({
+    "grep": _KindProbe(_evaluate_grep_row, _grep_history_argv, _grep_subject),
+    "path": _KindProbe(_evaluate_path_row, _path_history_argv, _path_subject),
+})
+
+#: The kinds given a polarity disposition: exactly those with a probe.
+POLARITY_SWEPT_KINDS = tuple(_KIND_PROBES)
+
+
+def _kind_probe(row: DescriptorRow) -> _KindProbe:
+    probe = _KIND_PROBES.get(row.kind)
+    if probe is None:
+        raise ValueError(
+            f"no polarity probe for kind {row.kind!r} (task {row.task_id}, "
+            f"check {row.name!r}): only {POLARITY_SWEPT_KINDS} rows are swept"
+        )
+    return probe
+
+
+def find_superseding_task(
+    row: DescriptorRow, *, repo_root: str, since: str | None
+) -> str | None:
+    """A LATER task that undid *row*'s capability, or ``None``.
+
+    Only ever consulted for a would-be ``broken`` row, and only ever able to
+    DOWNGRADE it — so a false negative costs a footnote and a false positive
+    costs a missed defect. That asymmetry is why the attribution is strict,
+    for every kind's ``history_argv`` in :data:`_KIND_PROBES`: the task id
+    must come from the merge-commit subject convention, never inferred from
+    the diff or the author.
+
+    *since* is the producer's ``updated_at``; commits at or before it are the
+    producer's own work, not a later undoing. Absent, no claim is made at all
+    rather than scanning all of history and attributing the producer's own
+    merge to it.
+
+    A grep row's probe is the regex pickaxe (:func:`_grep_history_argv`). A
+    path row's is the commits that created or deleted exactly a listed path
+    (:func:`_path_history_argv`); it needs no manifest exclusion, because it
+    names explicit paths rather than searching contents.
+    """
     if not since:
         return None
-    argv = _history_argv(row, repo_root=repo_root, since=since)
+    argv = _kind_probe(row).history_argv(row, repo_root, since)
     if argv is None:
         return None
     try:
@@ -1017,13 +1049,6 @@ _COVERAGE_CAVEAT = (
 )
 
 
-def _subject_pair(row: DescriptorRow) -> tuple[str, str]:
-    """What the check asserts about: a path row's paths, a grep row's pattern."""
-    if row.kind == "path":
-        return ("paths", ",".join(row.paths))
-    return ("pattern", repr(row.pattern))
-
-
 def _format_finding(finding: Finding) -> list[str]:
     """One finding as a key=value line plus its indented ``reason:``.
 
@@ -1038,7 +1063,7 @@ def _format_finding(finding: Finding) -> list[str]:
         ("status", row.status),
         ("name", row.name),
         ("expect", row.expect),
-        _subject_pair(row),
+        _kind_probe(row).subject(row),
         ("source", row.source),
     ]
     if row.manifest:
