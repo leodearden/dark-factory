@@ -19,32 +19,32 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _lane_test_helpers import (
+    acquire_lane,
+    add_warm_lane_scripts,
+    build_harness,
+    get_head,
+    make_orch_config,
+    make_plan,
+    make_warm_lane_repo,
+    pure_fs_git_ops,
+    wire_recovery_scheduler,
+)
 from _orch_helpers import wait_responsive
 from _workflow_helpers import fixed_prompt
 from escalation.queue import EscalationQueue
 from shared.config_dir import TaskConfigDir
 
-# Reused read-only: the real-git repo and warm-lane writer -> crash-recovery
-# reader harness wiring, the merge-phase preamble stubs, and (as
+# Reused read-only: the merge-phase preamble stubs, and (as
 # test_task_verify_lease.py::_build_task_workflow does) the factory that builds
 # a TaskWorkflow with every collaborator mocked.
-from test_lane_lifecycle_integration import (
-    _acquire_lane,
-    _add_warm_lane_scripts,
-    _build_harness,
-    _get_head,
-    _make_ig_repo,
-    _make_orch_config,
-    _make_plan,
-    _wire_recovery_scheduler,
-)
 from test_task_verify_lease import _StopMergePhase, _stub_merge_phase_preamble
 from test_workflow_verify_retry import _make_workflow
 
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.agents.roles import SIMPLE_TASK
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.config import OrchestratorConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.lane_lifecycle import LaneLifecycle, LaneState
 from orchestrator.scheduler import TaskAssignment
@@ -363,22 +363,6 @@ class TestResetStaleInUse:
         assert self._snapshot(tmp_path, [*self.STALE, *self.UNTOUCHED]) == settled
 
 
-def _git_ops(tmp_path: Path, pool_size: int = 0) -> GitOps:
-    """A pure-FS GitOps (these tests never shell out to git), pooled when
-    *pool_size* > 0. Mirrors test_task_verify_lease.py::_git_ops."""
-    project_root = tmp_path / 'project'
-    project_root.mkdir(exist_ok=True)
-    config = GitConfig(
-        main_branch='main',
-        branch_prefix='task/',
-        remote='origin',
-        worktree_dir='.worktrees',
-        push_after_advance=False,
-        warm_lane_pool=pool_size > 0,
-    )
-    return GitOps(config, project_root, warm_lane_pool_size=pool_size)
-
-
 async def _assigned_lane(git_ops: GitOps, task_id: str = '42') -> Path:
     """Assign the first free pool lane to *task_id* through the pool, the sole
     ASSIGNED writer, which mirrors it onto the durable record."""
@@ -407,7 +391,7 @@ class TestLaneInUseSpan:
     async def test_lane_reads_in_use_inside_the_span_and_assigned_after(
         self, tmp_path: Path,
     ):
-        git_ops = _git_ops(tmp_path, pool_size=1)
+        git_ops = pure_fs_git_ops(tmp_path, pool_size=1)
         lane = await _assigned_lane(git_ops)
         assert _lane_state(git_ops, lane) == 'assigned'
 
@@ -422,7 +406,7 @@ class TestLaneInUseSpan:
         )
 
     async def test_a_cold_worktree_is_not_tracked(self, tmp_path: Path):
-        git_ops = _git_ops(tmp_path, pool_size=1)
+        git_ops = pure_fs_git_ops(tmp_path, pool_size=1)
         cold = git_ops.worktree_base / '3076'
         cold.mkdir(parents=True)
         ran = False
@@ -434,7 +418,7 @@ class TestLaneInUseSpan:
         assert not (git_ops.worktree_base / '.lane-state').exists()
 
     async def test_a_gitops_without_a_pool_tracks_nothing(self, tmp_path: Path):
-        git_ops = _git_ops(tmp_path)
+        git_ops = pure_fs_git_ops(tmp_path)
         assert git_ops.warm_lane_pool is None
         lane = git_ops.worktree_base / LANE_NAME
         lane.mkdir(parents=True)
@@ -447,7 +431,7 @@ class TestLaneInUseSpan:
         assert not (git_ops.worktree_base / '.lane-state').exists()
 
     async def test_no_lane_tracks_nothing(self, tmp_path: Path):
-        git_ops = _git_ops(tmp_path, pool_size=1)
+        git_ops = pure_fs_git_ops(tmp_path, pool_size=1)
         ran = False
 
         async with git_ops.lane_in_use(None):
@@ -459,7 +443,7 @@ class TestLaneInUseSpan:
     async def test_a_raising_body_propagates_and_the_lane_returns_to_assigned(
         self, tmp_path: Path,
     ):
-        git_ops = _git_ops(tmp_path, pool_size=1)
+        git_ops = pure_fs_git_ops(tmp_path, pool_size=1)
         lane = await _assigned_lane(git_ops)
 
         with pytest.raises(RuntimeError, match='child failed'):
@@ -469,7 +453,7 @@ class TestLaneInUseSpan:
         assert _lane_state(git_ops, lane) == 'assigned'
 
     async def test_a_cancelled_body_returns_the_lane_to_assigned(self, tmp_path: Path):
-        git_ops = _git_ops(tmp_path, pool_size=1)
+        git_ops = pure_fs_git_ops(tmp_path, pool_size=1)
         lane = await _assigned_lane(git_ops)
         entered = asyncio.Event()
 
@@ -488,7 +472,7 @@ class TestLaneInUseSpan:
         assert _lane_state(git_ops, lane) == 'assigned'
 
     async def test_a_released_lane_is_never_written(self, tmp_path: Path):
-        git_ops = _git_ops(tmp_path, pool_size=1)
+        git_ops = pure_fs_git_ops(tmp_path, pool_size=1)
         lane = await _assigned_lane(git_ops)
         pool = git_ops.warm_lane_pool
         assert pool is not None
@@ -507,7 +491,7 @@ class TestLaneInUseSpan:
     async def test_an_unreadable_record_neither_aborts_the_span_nor_leaks_it(
         self, tmp_path: Path,
     ):
-        git_ops = _git_ops(tmp_path, pool_size=1)
+        git_ops = pure_fs_git_ops(tmp_path, pool_size=1)
         lane = await _assigned_lane(git_ops)
         ran = False
 
@@ -537,7 +521,7 @@ class TestLaneInUseNesting:
     async def test_nested_spans_hold_in_use_until_the_outer_one_exits(
         self, tmp_path: Path,
     ):
-        git_ops = _git_ops(tmp_path, pool_size=1)
+        git_ops = pure_fs_git_ops(tmp_path, pool_size=1)
         lane = await _assigned_lane(git_ops)
 
         async with git_ops.lane_in_use(lane):
@@ -555,7 +539,7 @@ class TestLaneInUseNesting:
     async def test_a_raise_in_the_inner_span_unwinds_both_to_assigned(
         self, tmp_path: Path,
     ):
-        git_ops = _git_ops(tmp_path, pool_size=1)
+        git_ops = pure_fs_git_ops(tmp_path, pool_size=1)
         lane = await _assigned_lane(git_ops)
 
         with pytest.raises(RuntimeError, match='inner child failed'):
@@ -565,7 +549,7 @@ class TestLaneInUseNesting:
         assert _lane_state(git_ops, lane) == 'assigned'
 
     async def test_spans_on_different_lanes_are_independent(self, tmp_path: Path):
-        git_ops = _git_ops(tmp_path, pool_size=2)
+        git_ops = pure_fs_git_ops(tmp_path, pool_size=2)
         lane_a = await _assigned_lane(git_ops, '42')
         lane_b = await _assigned_lane(git_ops, '43')
 
@@ -585,7 +569,7 @@ class TestLaneInUseNesting:
     async def test_a_fresh_span_after_a_full_unwind_writes_in_use_again(
         self, tmp_path: Path,
     ):
-        git_ops = _git_ops(tmp_path, pool_size=1)
+        git_ops = pure_fs_git_ops(tmp_path, pool_size=1)
         lane = await _assigned_lane(git_ops)
         async with git_ops.lane_in_use(lane), git_ops.lane_in_use(lane):
             pass
@@ -600,7 +584,7 @@ class TestLaneInUseNesting:
     async def test_every_enter_re_marks_a_lane_reassigned_under_a_long_span(
         self, tmp_path: Path,
     ):
-        git_ops = _git_ops(tmp_path, pool_size=1)
+        git_ops = pure_fs_git_ops(tmp_path, pool_size=1)
         pool = git_ops.warm_lane_pool
         assert pool is not None
         lane = await _assigned_lane(git_ops, '42')
@@ -622,7 +606,7 @@ class TestLaneInUseNesting:
         assert _assignment(git_ops, lane)[0] == '43'
 
     async def test_the_sweep_spares_a_lane_held_by_a_live_span(self, tmp_path: Path):
-        git_ops = _git_ops(tmp_path, pool_size=2)
+        git_ops = pure_fs_git_ops(tmp_path, pool_size=2)
         live = await _assigned_lane(git_ops, '42')
         fossil = await _assigned_lane(git_ops, '43')
         assert LaneLifecycle(git_ops.worktree_base).note_in_use(fossil) is True
@@ -644,7 +628,7 @@ class TestLaneInUseNesting:
 
 async def _workflow_in_lane(tmp_path: Path) -> tuple[TaskWorkflow, GitOps, Path]:
     """A TaskWorkflow whose worktree IS a warm lane assigned to its task."""
-    git_ops = _git_ops(tmp_path, pool_size=1)
+    git_ops = pure_fs_git_ops(tmp_path, pool_size=1)
     config = OrchestratorConfig(project_root=git_ops.project_root, git=git_ops.config)
     lane = await _assigned_lane(git_ops, '42')
     assignment = TaskAssignment(
@@ -779,26 +763,26 @@ class TestWorkflowSpawnSitesHoldTheSpan:
 
 @pytest.fixture
 def recovery_repo(tmp_path: Path) -> Path:
-    return _make_ig_repo(tmp_path)
+    return make_warm_lane_repo(tmp_path)
 
 
 async def _crashed_in_flight_lane(repo: Path) -> tuple[Path, Path]:
     """Acquire a lane for live task 42 with progress on disk, as a run that
     then dies would leave it. Returns (worktree_base, lane)."""
-    await _add_warm_lane_scripts(repo)
-    git_ops = _build_harness(_make_orch_config(repo)).git_ops
-    lane = await _acquire_lane(git_ops, '42', await _get_head(repo))
+    await add_warm_lane_scripts(repo)
+    git_ops = build_harness(make_orch_config(repo)).git_ops
+    lane = await acquire_lane(git_ops, '42', await get_head(repo))
     artifacts = TaskArtifacts(
         lane, TaskArtifacts.meta_root_for(git_ops.worktree_base, lane.name),
     )
     artifacts.init('42', 'crashed task', 'd')
-    artifacts.write_plan(_make_plan(3, 5, '42'))
+    artifacts.write_plan(make_plan(3, 5, '42'))
     return git_ops.worktree_base, lane
 
 
 async def _restart_and_recover(repo: Path) -> None:
-    restarted = _build_harness(_make_orch_config(repo))
-    _wire_recovery_scheduler(restarted)
+    restarted = build_harness(make_orch_config(repo))
+    wire_recovery_scheduler(restarted)
     await restarted._recover_crashed_tasks()
 
 
