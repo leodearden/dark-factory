@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import datetime, timedelta
 from types import MappingProxyType
 from typing import Any
@@ -30,7 +30,6 @@ from fastapi.testclient import TestClient
 from shared.task_statuses import TaskStatus
 
 from dashboard.api import prds
-from dashboard.app import app
 from dashboard.data import task_lineage
 from dashboard.data.census import build_census
 from dashboard.data.prd_view import Segment
@@ -38,12 +37,16 @@ from dashboard.data.prd_view import Segment
 ROOT = 'dark-factory'
 
 
-@pytest.fixture(scope='module')
-def bodies(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
+@pytest.fixture(scope='module', autouse=True)
+def _module_samplers_off() -> Iterator[None]:
     with pytest.MonkeyPatch.context() as patched:
         patched.setenv('DASHBOARD_SAMPLERS', 'off')
-        with TestClient(app) as client:
-            return prd_view_family(client, tmp_path_factory.mktemp('prd_view'))
+        yield
+
+
+@pytest.fixture(scope='module')
+def bodies(_client: TestClient, tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
+    return prd_view_family(_client, tmp_path_factory.mktemp('prd_view'))
 
 
 def _row(view: dict[str, Any], key: str) -> dict[str, Any]:
