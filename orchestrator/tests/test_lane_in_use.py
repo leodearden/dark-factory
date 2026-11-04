@@ -574,8 +574,8 @@ class _StopMergePhase(Exception):
 
 @pytest.mark.asyncio
 class TestWorkflowSpawnSitesHoldTheSpan:
+    @pytest.mark.usefixtures('code_default_config')
     async def test_agent_invocation(self, tmp_path: Path, monkeypatch):
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         workflow, git_ops, lane = await _workflow_in_lane(tmp_path)
         workflow._config_dir = TaskConfigDir('42', base_dir=lane / '.task')
         seen: list[str] = []
