@@ -6,7 +6,7 @@ schema_version: 1
 signal_leaves: ["ι"]
 tasks:
   - label: "α"
-    task_id: null
+    task_id: 8413
     title: "Declared-scope class stamped at the submit boundary, immutable, with a reader allowlist"
     capabilities:
       - name: "declared-scope-model"
@@ -63,7 +63,7 @@ tasks:
           kind: manual
           reason: "observed through submit_task then get_task on a fileless task"
   - label: "β"
-    task_id: null
+    task_id: 8414
     title: "Follow-up items contract, server-derived keys, bundling filing prompt, briefing render"
     capabilities:
       - name: "followup-item-model"
@@ -113,7 +113,7 @@ tasks:
           kind: manual
           reason: "agent behaviour at dispatch; counted by the θ report"
   - label: "γ"
-    task_id: null
+    task_id: 8415
     title: "Item-preserving combine, item-aware R4, combine re-stamp of declared scope, audit fields, holder excluded from curator pools and combine targets"
     capabilities:
       - name: "combine-audit-items"
@@ -171,7 +171,7 @@ tasks:
           kind: manual
           reason: "behaviour through submit_task and resolve_ticket; asserted again by ι"
   - label: "δ"
-    task_id: null
+    task_id: 8416
     title: "Lift batch rule 2: within-batch combine"
     capabilities:
       - name: "batch-rule-2-lifted"
@@ -197,7 +197,7 @@ tasks:
           kind: manual
           reason: "task 6707 may take the next version first, so no fixed literal is safe"
   - label: "ε"
-    task_id: null
+    task_id: 8417
     title: "Follow-up holder task, hold at filing, backfill at server startup, holder protection"
     capabilities:
       - name: "holder-mint"
@@ -255,7 +255,7 @@ tasks:
           kind: manual
           reason: "existing scheduler behaviour over the new edge; asserted by ι"
   - label: "ζ"
-    task_id: null
+    task_id: 8418
     title: "Promotion closure and its triggers; findings-contract and skill edits"
     capabilities:
       - name: "promote"
@@ -297,7 +297,7 @@ tasks:
           kind: manual
           reason: "prose edits; judged by review, never by a wording grep"
   - label: "η"
-    task_id: null
+    task_id: 8419
     title: "Done-time declared_scope_outcome event and the burndown held series"
     capabilities:
       - name: "outcome-event-at-done"
@@ -323,7 +323,7 @@ tasks:
           kind: manual
           reason: "rendering judgment over a project with and without a holder"
   - label: "ι"
-    task_id: null
+    task_id: 8420
     title: "Integration gate: the follow-up filing shape boundary-test sketch end to end"
     capabilities:
       - name: "boundary-suite"
@@ -340,7 +340,7 @@ tasks:
           kind: manual
           reason: "the gate's own verify run is the evidence"
   - label: "θ"
-    task_id: null
+    task_id: 8421
     title: "Follow-up filing shape observation report, 14 days after the integration gate"
     capabilities:
       - name: "report-script"
