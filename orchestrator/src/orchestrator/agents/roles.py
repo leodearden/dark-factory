@@ -821,6 +821,10 @@ partition it tried and the heuristic-13 symptom each candidate hit, or none.
 """
 
 
+# Exercised against real git by orchestrator/tests/test_roles_already_done_commit_search.py.
+ALREADY_DONE_COMMIT_SEARCH = "git log main --reverse --format='%H %s' -S '<symbol>' -- <path>"
+
+
 ARCHITECT = AgentRole(
     name='architect',
     system_prompt="""\
@@ -855,7 +859,7 @@ Build the plan using the plan-tools MCP tools. Do NOT write plan.json directly.
 
    Based on what you find, choose ONE of the following exits. Do NOT call `create_plan` if any of the rejection paths apply.
 
-   - **Work is already on main** (the file/symbol the task asks you to add is already present, typically because a sibling task direct-merged or a prior orchestrator run landed it): call `report_task_already_done(commit=<sha>, evidence="...")` and stop. Find the commit with `git log --all --oneline -- <path>` or by grepping recent merge commits. The orchestrator will verify the commit is on main and set this task to `done` with provenance.
+   - **Work is already on main** (the file/symbol the task asks you to add is already present, typically because a sibling task direct-merged or a prior orchestrator run landed it): call `report_task_already_done(commit=<sha>, evidence="...")` and stop. Find the commit with a search scoped to main and to the path: `""" + ALREADY_DONE_COMMIT_SEARCH + """` lists, oldest first, the commits on main that changed how often `<symbol>` (a string the asked-for work introduced) occurs in `<path>`, so its first row is normally the commit that introduced it. Never use `git log --all` (not scoped to main), main's HEAD, or a sha picked by eye from an unscoped listing: the on-main check passes for every commit on main, so only a task-scoped search names the right one. The orchestrator checks the commit is on main and attributes it to this task against its declared files or delivered checks before setting the task to `done` with provenance.
    - **Work is complete on THIS BRANCH but never landed on main (fast-forward + verify-passed + review-PASS)**: call `report_ready_to_merge(commit=<branch tip sha>, evidence="...")` and stop. This applies when main is an ancestor of the branch tip and the tip is NOT already contained in main (a clean fast-forward), verify already PASSED on this exact tip, and review already returned PASS or suggestions-only on this exact tree. Do NOT use `report_unactionable_task` for this case — that L1 costs a human ~100k tokens and vetoes the verified-green auto-merge reaper. Do NOT use `report_ready_to_merge` when work is genuinely missing, when verify/review never passed on this tip, or when the branch has diverged from main (needs a rebase/merge to resolve) — write a plan instead. If the work is already on MAIN, that is `report_task_already_done`, not this.
    - **A referenced file/symbol is missing AND a sibling task is expected to introduce it** (the task tree, briefing, or task description points to an un-merged sibling task as the source): call `report_blocking_dependency(depends_on_task_id=<sibling_task_id>, reason="...")` and stop. The orchestrator will register the Taskmaster dependency and re-queue this task once the named task lands.
    - **A referenced file/symbol is missing AND you can't identify a sibling task** (the artifact is just missing, no obvious owner): escalate via `escalate_blocker` with `category='missing_premise'`, naming the missing artifact and why the task assumed it existed.
