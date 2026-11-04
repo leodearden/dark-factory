@@ -272,7 +272,11 @@ was dispatched by the new run at 08:06:12.7Z, requeued 11:03:48Z and re-stamped 
 first-tick re-stamps are not a restart re-stamp: those tasks were not pending at shutdown, because
 `orchestrator/src/orchestrator/scheduler.py::_settle_starvation_on_dispatch` forgets an anchor at dispatch,
 so their return to pending started a fresh age. No task that stayed pending across the restart was
-re-stamped. The row count (1,802 in the snapshot, 1,849 live) is not a criterion; the store churns every tick.
+re-stamped. Nor did any lose its anchor: each of the 18 snapshot tasks absent from the live store has a
+dispatch event after the snapshot, and the only one of them still pending, 6163, was dispatched by the new
+run at 11:24:14Z (`lock_acquired`; checked at 12:07Z, when the store had not been written since 11:24:14Z
+and so still held the anchors compared at 11:37:52Z). The row count (1,802 in the snapshot, 1,849 live) is
+not a criterion; the store churns every tick.
 
 ## 5. Owners, summarised (every status read from the df store on 11-02; S4 has the full table)
 
