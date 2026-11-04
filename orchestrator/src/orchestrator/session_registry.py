@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeGuard
 
 # NOTE: this module is executed by absolute path from
 # skills/spawn/spawn-claude.sh and the SKILL.md verb lines with no venv,
@@ -281,17 +281,20 @@ class Question:
         return cls(text=data['text'], asked_at=data['asked_at'])
 
 
+def _is_strict_int(value: object) -> TypeGuard[int]:
+    """An int that is not a bool: Python's ``True`` would otherwise pass as int 1."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 def _coerce_owner_pid(value: Any) -> int | None:
     """Read ``claude_owner_pid`` from a record body, tolerating junk.
 
-    A bool is rejected before the int check (``bool`` IS an ``int`` in
-    Python, and ``True`` would silently become pid 1). Anything else that is
-    not a positive int -- absent, null, a string, a float, 0, a negative --
-    reads as None, i.e. "no owner pid bound". Never raises: this is on
-    ``from_dict``'s path, and a hand-edited or older record body must not be
-    what breaks a session hook.
+    Anything that is not a positive ``_is_strict_int`` -- absent, null, a
+    bool, a string, a float, 0, a negative -- reads as None, i.e. "no owner
+    pid bound". Never raises: this is on ``from_dict``'s path, and a
+    hand-edited or older record body must not be what breaks a session hook.
     """
-    if isinstance(value, bool) or not isinstance(value, int):
+    if not _is_strict_int(value):
         return None
     return value if value > 0 else None
 
@@ -3940,6 +3943,10 @@ class HolderRecordState(StrEnum):
 class LeaseHolder:
     """Serialized identity of a lease's current holder -- the exact ``.lease`` file body.
 
+    Every field is type-checked at construction, and from_dict also rejects
+    a body that is not a JSON object, so a mistyped body is unreadable
+    rather than a holder.
+
     session_slug: a CLAIMANT-CHOSEN ownership token, NOT a session-registry
         record key. The skills prescribe ``<lease-role>-<project>-<pid>``
         (escalation-watcher's and recon-escalation-watcher's "Claiming the
@@ -3967,7 +3974,8 @@ class LeaseHolder:
         Its ONLY two roles are (i) the ownership comparison in
         ``_check_lease_ownership`` and (ii) naming the holder in a
         human-readable contention/refusal message.
-    pid: the holder process's pid; liveness is checked via _pid_alive.
+    pid: the holder process's pid; liveness is checked via _pid_alive. Any int, bool
+        excluded (0 is resolve_session_pid's degraded provably-dead value).
     start_ts: ISO-8601 timestamp of when this holder claimed the lease.
     record_slug: the holder's session-registry record key, resolved at claim
         time from *pid*'s pointer (``resolve_session_slug_for_pid``). '' when
@@ -3980,6 +3988,14 @@ class LeaseHolder:
     start_ts: str
     record_slug: str = ''
 
+    def __post_init__(self) -> None:
+        if not _is_strict_int(self.pid):
+            raise TypeError(f'LeaseHolder.pid must be an int (not a bool), got {self.pid!r}')
+        for name in ('session_slug', 'start_ts', 'record_slug'):
+            value = getattr(self, name)
+            if not isinstance(value, str):
+                raise TypeError(f'LeaseHolder.{name} must be a str, got {value!r}')
+
     def to_dict(self) -> dict[str, Any]:
         return {
             'session_slug': self.session_slug,
@@ -3990,11 +4006,14 @@ class LeaseHolder:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> LeaseHolder:
+        if not isinstance(data, dict):
+            raise TypeError(f'LeaseHolder body must be a JSON object, got {data!r}')
+        record_slug = data.get('record_slug')
         return cls(
             session_slug=data['session_slug'],
             pid=data['pid'],
             start_ts=data['start_ts'],
-            record_slug=data.get('record_slug') or '',
+            record_slug='' if record_slug is None else record_slug,
         )
 
     def to_json(self) -> str:
