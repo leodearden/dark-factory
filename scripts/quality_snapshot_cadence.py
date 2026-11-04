@@ -43,8 +43,8 @@ def _run(command: Sequence[str], *, capture: bool) -> subprocess.CompletedProces
         ) from exc
 
 
-def _git(root: Path, *args: str) -> str:
-    command = ['git', '-C', str(root), *args]
+def _stdout(command: Sequence[str]) -> str:
+    """*command*'s stdout; a non-zero exit is refused naming the command, its code and its stderr."""
     completed = _run(command, capture=True)
     if completed.returncode != 0:
         raise source_measures.MetricsError(
@@ -52,6 +52,10 @@ def _git(root: Path, *args: str) -> str:
             f'{completed.stderr.strip() or "no stderr"}'
         )
     return completed.stdout
+
+
+def _git(root: Path, *args: str) -> str:
+    return _stdout(['git', '-C', str(root), *args])
 
 
 def _full_sha(root: Path, rev: str) -> str:
@@ -82,29 +86,30 @@ def _identity_text(identity: snapshot.MeasurementIdentity) -> str:
 def _predicted_params(python: Path) -> dict[str, Any]:
     """The params a measurement by *python* would record, asked of the instrument itself."""
     command = [str(python), str(INSTRUMENT), '--params']
-    completed = _run(command, capture=True)
-    if completed.returncode != 0:
-        raise source_measures.MetricsError(
-            f'`{shlex.join(command)}` exited {completed.returncode}: '
-            f'{completed.stderr.strip() or "no stderr"}'
-        )
+    printed = _stdout(command)
     try:
-        params = json.loads(completed.stdout)
+        params = json.loads(printed)
     except json.JSONDecodeError as exc:
         raise source_measures.MetricsError(
             f'`{shlex.join(command)}` printed no JSON params: {exc}'
         ) from exc
     if not isinstance(params, dict):
         raise source_measures.MetricsError(
-            f'`{shlex.join(command)}` printed {completed.stdout.strip()}, not a JSON object'
+            f'`{shlex.join(command)}` printed {printed.strip()}, not a JSON object'
         )
     return params
 
 
 def _added_worktree(root: Path, sha: str, home: Path) -> Path:
     """A detached worktree of *sha* in a fresh directory under *home*; the directory goes if git refuses."""
-    home.mkdir(parents=True, exist_ok=True)
-    tree = Path(tempfile.mkdtemp(prefix=f'{sha[:12]}-', dir=home))
+    try:
+        home.mkdir(parents=True, exist_ok=True)
+        tree = Path(tempfile.mkdtemp(prefix=f'{sha[:12]}-', dir=home))
+    except OSError as exc:
+        raise source_measures.MetricsError(
+            f'{home}: no directory could be made there for the pinned tree -- '
+            f'{exc.__class__.__name__}: {exc}'
+        ) from exc
     try:
         _git(root, 'worktree', 'add', '--detach', str(tree), sha)
     except source_measures.MetricsError:

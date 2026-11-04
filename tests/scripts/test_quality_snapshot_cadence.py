@@ -282,6 +282,17 @@ class TestRefusals:
         assert '"complexipy_version": "0.0.0"' in err
         assert json.dumps(recorded, sort_keys=True) in err
 
+    def test_a_state_home_that_cannot_hold_the_pinned_tree_is_named(
+        self, tmp_path: Path, capfd: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        root = _repo(tmp_path)
+        data = tmp_path / 'data'
+        blocker = tmp_path / 'state-is-a-file'
+        blocker.write_text('', encoding='utf-8')
+        monkeypatch.setenv('XDG_STATE_HOME', str(blocker))
+        assert str(blocker) in _refused(root, data, capfd)
+        assert not data.exists()
+
     def test_a_tree_left_behind_is_named_below_the_instruments_cause(
         self, tmp_path: Path, capfd: pytest.CaptureFixture[str], state_home: Path
     ) -> None:
