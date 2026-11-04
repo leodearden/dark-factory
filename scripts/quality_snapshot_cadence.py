@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+"""Measure a project's main, or given shas, from a pinned tree into ``<data-dir>/<project_id>/<sha>.json``.
+
+A sha whose file already records the same measurement identity is skipped; nothing
+is ever committed. Exit 0 when done; exit 2 on any failure, its cause named on
+stderr. Rationale: plans/quality-dashboard-prd.md decisions 18-19.
+"""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import dataclasses
+import datetime
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+from collections.abc import Iterator, Mapping, Sequence
+from pathlib import Path
+from typing import Any
+
+import quality_metrics_snapshot as snapshot
+import source_measures
+
+FACTORY_ROOT = Path(__file__).resolve().parents[1]
+INSTRUMENT = FACTORY_ROOT / 'scripts' / 'quality_metrics_snapshot.py'
+DEFAULT_PYTHON = FACTORY_ROOT / '.venv' / 'bin' / 'python'
+DEFAULT_DATA_DIR = FACTORY_ROOT / 'data' / 'quality-metrics'
+
+_PROJECT_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]*')
+
+
+def _run(command: Sequence[str], *, capture: bool) -> subprocess.CompletedProcess[str]:
+    """*command*'s completed process, whatever its exit code; one that cannot start is refused naming it."""
+    try:
+        return subprocess.run(command, capture_output=capture, text=True, check=False)
+    except OSError as exc:
+        raise source_measures.MetricsError(
+            f'could not run `{shlex.join(command)}`: {exc.__class__.__name__}: {exc}'
+        ) from exc
+
+
+def _git(root: Path, *args: str) -> str:
+    command = ['git', '-C', str(root), *args]
+    completed = _run(command, capture=True)
+    if completed.returncode != 0:
+        raise source_measures.MetricsError(
+            f'`{shlex.join(command)}` exited {completed.returncode}: '
+            f'{completed.stderr.strip() or "no stderr"}'
+        )
+    return completed.stdout
+
+
+def _full_sha(root: Path, rev: str) -> str:
+    return _git(root, 'rev-parse', '--verify', '--end-of-options', f'{rev}^{{commit}}').strip()
+
+
+def _shas(root: Path, requested: Sequence[str] | None) -> list[str]:
+    return [_full_sha(root, rev) for rev in requested or ['main']]
+
+
+def _state_home(project_id: str) -> Path:
+    """Where pinned trees live: the factory's XDG state-home convention, read at call time."""
+    base = os.environ.get('XDG_STATE_HOME')
+    if not base:
+        try:
+            base = str(Path.home() / '.local' / 'state')
+        except RuntimeError as exc:
+            raise source_measures.MetricsError(
+                f'no home directory to hold the pinned tree ({exc}); set XDG_STATE_HOME'
+            ) from exc
+    return Path(base) / 'dark-factory' / 'quality-snapshot' / project_id
+
+
+def _identity_text(identity: snapshot.MeasurementIdentity) -> str:
+    return f'{identity.as_of_sha} {json.dumps(dict(identity.params), sort_keys=True)}'
+
+
+def _predicted_params(python: Path) -> dict[str, Any]:
+    """The params a measurement by *python* would record, asked of the instrument itself."""
+    command = [str(python), str(INSTRUMENT), '--params']
+    completed = _run(command, capture=True)
+    if completed.returncode != 0:
+        raise source_measures.MetricsError(
+            f'`{shlex.join(command)}` exited {completed.returncode}: '
+            f'{completed.stderr.strip() or "no stderr"}'
+        )
+    try:
+        params = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise source_measures.MetricsError(
+            f'`{shlex.join(command)}` printed no JSON params: {exc}'
+        ) from exc
+    if not isinstance(params, dict):
+        raise source_measures.MetricsError(
+            f'`{shlex.join(command)}` printed {completed.stdout.strip()}, not a JSON object'
+        )
+    return params
+
+
+@contextlib.contextmanager
+def _pinned(root: Path, sha: str, home: Path) -> Iterator[Path]:
+    """A detached worktree of *sha* in a fresh directory under *home*, removed on exit."""
+    home.mkdir(parents=True, exist_ok=True)
+    tree = Path(tempfile.mkdtemp(prefix=f'{sha[:12]}-', dir=home))
+    try:
+        _git(root, 'worktree', 'add', '--detach', str(tree), sha)
+    except source_measures.MetricsError:
+        tree.rmdir()
+        raise
+    try:
+        yield tree
+    finally:
+        _git(root, 'worktree', 'remove', '--force', str(tree))
+
+
+def _measure(python: Path, sha: str, tree: Path, out: Path, run_id: str) -> None:
+    """Run the instrument on *tree*, its stdout and stderr this process's own."""
+    command = [str(python), str(INSTRUMENT), '--run-id', run_id, '--out', str(out), '--root', str(tree)]
+    returncode = _run(command, capture=False).returncode
+    if returncode != 0:
+        raise source_measures.MetricsError(
+            f'the instrument exited {returncode} measuring {sha} in the pinned tree {tree}; '
+            'its stderr above names the cause'
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class _Settings:
+    """The command line, resolved: whose shas, measured by which interpreter, into where."""
+
+    root: Path
+    project_id: str
+    python: Path
+    data_dir: Path
+    force: bool
+
+
+def _utc_stamp() -> str:
+    """Now to the microsecond, so two runs of one sha never share a run_id."""
+    return datetime.datetime.now(datetime.UTC).strftime('%Y%m%dT%H%M%S.%fZ')
+
+
+def _cadence_one(settings: _Settings, sha: str, params: Mapping[str, Any]) -> str:
+    """Measure *sha* unless its file already records this identity; the line to print."""
+    out = settings.data_dir / settings.project_id / f'{sha}.json'
+    wanted = snapshot.MeasurementIdentity(sha, params)
+    if (
+        not settings.force
+        and out.exists()
+        and snapshot.measurement_identity(snapshot.load_snapshot(out)) == wanted
+    ):
+        return f'already measured: {_identity_text(wanted)}'
+    run_id = f'quality-snapshot-{settings.project_id}-{sha[:12]}-{_utc_stamp()}'
+    with _pinned(settings.root, sha, _state_home(settings.project_id)) as tree:
+        _measure(settings.python, sha, tree, out, run_id)
+    recorded = snapshot.measurement_identity(snapshot.load_snapshot(out))
+    if recorded != wanted:
+        raise source_measures.MetricsError(
+            f'{out}: the measurement recorded the identity {_identity_text(recorded)}, not the '
+            f'predicted {_identity_text(wanted)}; the instrument or its interpreter changed mid-run'
+        )
+    return f'measured: {sha} -> {out}'
+
+
+def _project_id(value: str) -> str:
+    if not _PROJECT_ID.fullmatch(value):
+        raise argparse.ArgumentTypeError(
+            f'{value!r} is not a project id: it names a directory, so letters, digits and _ . - '
+            'only, starting with a letter or digit'
+        )
+    return value
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Measure a project's main, or the given shas, with the factory's snapshot "
+            'instrument in a pinned worktree, skipping a sha already measured at the same '
+            'identity (as_of_sha, params). Never commits.'
+        ),
+        epilog='Exit codes: 0 done; 2 any failure, its cause named on stderr.',
+    )
+    parser.add_argument('--root', required=True, type=Path, help='The project checkout to measure.')
+    parser.add_argument(
+        '--project-id', required=True, type=_project_id, help='The data directory to write under.'
+    )
+    parser.add_argument('--sha', nargs='+', help='Measure these commits, in order, instead of main.')
+    parser.add_argument(
+        '--force', action='store_true', help='Re-measure even a sha already measured at this identity.'
+    )
+    parser.add_argument(
+        '--data-dir', type=Path, default=DEFAULT_DATA_DIR, help=f'Default: {DEFAULT_DATA_DIR}.'
+    )
+    parser.add_argument(
+        '--python',
+        type=Path,
+        default=DEFAULT_PYTHON,
+        help=f'The interpreter that measures (default: {DEFAULT_PYTHON}).',
+    )
+    return parser
+
+
+def _require_executable(python: Path) -> None:
+    if not (python.is_file() and os.access(python, os.X_OK)):
+        raise source_measures.MetricsError(
+            f'{python}: no executable interpreter to measure with; run `uv sync --all-packages` '
+            f'in {FACTORY_ROOT}, or pass --python'
+        )
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entry point; see the module docstring for the exit codes."""
+    args = _build_parser().parse_args(argv)
+    settings = _Settings(args.root, args.project_id, args.python, args.data_dir, args.force)
+    try:
+        _require_executable(settings.python)
+        shas = _shas(settings.root, args.sha)
+        params = _predicted_params(settings.python)
+        for sha in shas:
+            print(_cadence_one(settings, sha, params), flush=True)
+    except source_measures.MetricsError as exc:
+        print(f'quality_snapshot_cadence: {exc}', file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
