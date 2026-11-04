@@ -111,8 +111,15 @@ def _drive_to(
 
 
 @pytest.fixture
-def lifecycle(tmp_path: Path) -> LaneLifecycle:
-    return LaneLifecycle(worktree_base=tmp_path)
+def queue(tmp_path: Path) -> EscalationQueue:
+    return EscalationQueue(tmp_path / 'escalations')
+
+
+@pytest.fixture
+def lifecycle(tmp_path: Path, queue: EscalationQueue) -> LaneLifecycle:
+    """Wired to a real queue: a benign race that reached transition()'s
+    illegal-edge path would page a human, and must show up here."""
+    return LaneLifecycle(worktree_base=tmp_path, escalation_queue=queue)
 
 
 @pytest.fixture
@@ -144,7 +151,8 @@ class TestNoteInUseAndIdle:
         [LaneState.RELEASED, LaneState.REGISTERED, LaneState.SEED, LaneState.QUARANTINED],
     )
     def test_note_in_use_writes_nothing_on_a_lane_with_no_live_assignment(
-        self, tmp_path: Path, lifecycle: LaneLifecycle, lane: Path, state: LaneState,
+        self, tmp_path: Path, lifecycle: LaneLifecycle, queue: EscalationQueue,
+        lane: Path, state: LaneState,
     ):
         _drive_to(lifecycle, lane, state)
         before = _record_path(tmp_path).read_bytes()
@@ -152,19 +160,21 @@ class TestNoteInUseAndIdle:
         assert lifecycle.note_in_use(lane) is False
 
         assert _record_path(tmp_path).read_bytes() == before
+        assert queue.get_pending() == []
 
     def test_note_in_use_on_an_absent_record_creates_nothing(
-        self, tmp_path: Path, lifecycle: LaneLifecycle, lane: Path,
+        self, tmp_path: Path, lifecycle: LaneLifecycle, queue: EscalationQueue,
+        lane: Path,
     ):
         assert lifecycle.note_in_use(lane) is False
 
         assert not _record_path(tmp_path).exists()
+        assert queue.get_pending() == []
 
     def test_note_in_use_on_a_corrupt_record_writes_and_escalates_nothing(
-        self, tmp_path: Path, lane: Path,
+        self, tmp_path: Path, lifecycle: LaneLifecycle, queue: EscalationQueue,
+        lane: Path,
     ):
-        queue = EscalationQueue(tmp_path / 'escalations')
-        lifecycle = LaneLifecycle(worktree_base=tmp_path, escalation_queue=queue)
         record_path = _record_path(tmp_path)
         record_path.parent.mkdir(parents=True)
         record_path.write_text('{not valid json')
@@ -183,7 +193,8 @@ class TestNoteInUseAndIdle:
         ],
     )
     def test_note_idle_writes_nothing_unless_the_lane_reads_in_use(
-        self, tmp_path: Path, lifecycle: LaneLifecycle, lane: Path, state: LaneState,
+        self, tmp_path: Path, lifecycle: LaneLifecycle, queue: EscalationQueue,
+        lane: Path, state: LaneState,
     ):
         _drive_to(lifecycle, lane, state)
         before = _record_path(tmp_path).read_bytes()
@@ -191,13 +202,16 @@ class TestNoteInUseAndIdle:
         assert lifecycle.note_idle(lane) is False
 
         assert _record_path(tmp_path).read_bytes() == before
+        assert queue.get_pending() == []
 
     def test_note_idle_on_an_absent_record_creates_nothing(
-        self, tmp_path: Path, lifecycle: LaneLifecycle, lane: Path,
+        self, tmp_path: Path, lifecycle: LaneLifecycle, queue: EscalationQueue,
+        lane: Path,
     ):
         assert lifecycle.note_idle(lane) is False
 
         assert not _record_path(tmp_path).exists()
+        assert queue.get_pending() == []
 
     def test_note_in_use_on_an_in_use_lane_is_true_without_a_write(
         self, tmp_path: Path, lifecycle: LaneLifecycle, lane: Path,
@@ -280,12 +294,7 @@ class TestResetStaleInUse:
     UNTOUCHED = ('_lane-2', '_lane-3', '_lane-4', '_lane-5')
 
     @pytest.fixture
-    def queue(self, tmp_path: Path) -> EscalationQueue:
-        return EscalationQueue(tmp_path / 'escalations')
-
-    @pytest.fixture
-    def swept(self, tmp_path: Path, queue: EscalationQueue) -> LaneLifecycle:
-        lifecycle = LaneLifecycle(worktree_base=tmp_path, escalation_queue=queue)
+    def swept(self, tmp_path: Path, lifecycle: LaneLifecycle) -> LaneLifecycle:
         for lane_name, task_id in self.STALE.items():
             _drive_to(lifecycle, tmp_path / lane_name, LaneState.IN_USE, task_id)
         _drive_to(lifecycle, tmp_path / '_lane-2', LaneState.ASSIGNED, '44')
