@@ -1027,6 +1027,7 @@ class TestLayeredConfig:
         # Preserved from package defaults
         assert config.models.architect == 'opus'
         assert config.effort.architect == 'xhigh'
+        assert config.max_turns.architect == 180
 
     def test_deep_merge_preserves_sibling_keys(self, tmp_path):
         """Overriding one key in a nested dict should not clobber siblings."""

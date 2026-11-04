@@ -742,7 +742,7 @@ matter most for reasoning about safety:
 
 | Role | Stage | Purpose | Model / effort / budget / turns |
 |---|---|---|---|
-| `architect` | PLAN | Explores the codebase, verifies premises, builds the TDD plan | opus / xhigh / $15 / 100 |
+| `architect` | PLAN | Explores the codebase, verifies premises, builds the TDD plan | opus / xhigh / $15 / 180 |
 | `implementer` | EXECUTE | RED test → GREEN implementation → commit, per plan step; sandboxed | sonnet / max / $10 / 80 (routed to opus above ~12 steps or ~3 modules) |
 | `debugger` | VERIFY failure loop | Fixes test/lint/typecheck failures with minimal changes; sandboxed | sonnet / max / $5 / 50 |
 | `reviewer_comprehensive` | REVIEW | Sole reviewer: test quality, reuse, architecture, performance, robustness; read-only | opus / high / $5 / 30 (config resolves `reviewer_comprehensive` → the `reviewer` config key) |

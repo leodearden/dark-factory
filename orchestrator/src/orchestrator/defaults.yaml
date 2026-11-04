@@ -392,7 +392,8 @@ budgets:
 
 # Turn limits per invocation
 max_turns:
-  architect: 100
+  # Leo 2026-11-04: matches the df/reify value; seat U's 17 mechanical no-plan failures were the 100-turn cap.
+  architect: 180
   implementer: 80
   debugger: 50
   # 30 -> 60 (2026-08-17, task-3543 /unblock investigation; see task 3321).
