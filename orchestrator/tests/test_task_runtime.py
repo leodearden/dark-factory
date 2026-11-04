@@ -380,7 +380,8 @@ class TestReadFailureMarked:
         [entry] = build_task_runtime_snapshot(git_ops=git_ops)
 
         assert entry.error and 'steps' in entry.error
-        assert (entry.phase, entry.loops) == (None, None)
+        assert (entry.loops, entry.attempts, entry.phase, entry.started) == (None, None, None, None)
+        assert entry.has_worktree is True
 
 
 # ---------------------------------------------------------------------------
