@@ -6,7 +6,7 @@ schema_version: 1
 signal_leaves: ["P3"]
 tasks:
   - label: "P0"
-    task_id: null
+    task_id: 8451
     title: "Pack candidate generators, hub rule, exclusions, rider reservation, survivor rule, and the pack judge"
     note: "Resolved at decompose: the v1 recipe regexes, the absent-pending_since rule and the whole-pool hub denominator are pinned by the committed pool dump (recipe_v1 labels, header hub_keys); an independent re-implementation of PRD §4.1 reproduced all four CSV runs set-equal on 2026-11-04."
     capabilities:
@@ -175,7 +175,7 @@ tasks:
           kind: manual
           reason: "an expect-absent grep on a file that does not exist yet is vacuous at authoring; the reviewer checks the import block"
   - label: "P1"
-    task_id: null
+    task_id: 8452
     title: "Pack ledger, sweep loop and config; observe mode deployed"
     capabilities:
       - name: "pack-ledger"
@@ -273,7 +273,7 @@ tasks:
           kind: manual
           reason: "observed on the live fused-memory after the next redeploy; P3's report reads it"
   - label: "P2"
-    task_id: null
+    task_id: 8453
     title: "Pack executor, status-chokepoint precondition, locked survivor rewrite, combine write-half extraction, undo"
     capabilities:
       - name: "apply-pack"
@@ -403,7 +403,7 @@ tasks:
           kind: manual
           reason: "a concurrency property; asserted by the leaf's tests, judged by the reviewer"
   - label: "P3"
-    task_id: null
+    task_id: 8454
     title: "Observe report and the integration gate"
     capabilities:
       - name: "report-no-producer-state"
@@ -443,7 +443,7 @@ tasks:
           kind: manual
           reason: "needs the live pack_sweep.db written by P1 in production"
   - label: "Φ"
-    task_id: null
+    task_id: 8455
     title: "Flip gate: read the pack sweep observe report, set curator.pack_sweep.mode enforce"
     capabilities:
       - name: "leo-ruling"
