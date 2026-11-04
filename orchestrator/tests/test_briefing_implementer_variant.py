@@ -10,12 +10,18 @@ from __future__ import annotations
 import itertools
 
 import pytest
-from _implementer_action_oracle import ACTION_MARKER, TODAYS_ACTION
+from _implementer_action_oracle import ACTION_MARKER, WHOLE_PLAN_ACTION_PIN
 
 from orchestrator.agents import briefing
 from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.config import GitConfig, OrchestratorConfig
-from orchestrator.implementer_brief_variant import ImplementerBriefVariant
+from orchestrator.implementer_brief_variant import (
+    ImplementerBriefVariant,
+    execute_iteration_cap,
+    invocation_bounds,
+)
+
+pytestmark = pytest.mark.usefixtures('code_default_config')
 
 REBASE_NOTICE = {
     'old_base': '07abf574a61c',
@@ -70,9 +76,9 @@ def _split_at_action(prompt: str) -> tuple[str, str]:
 
 
 @pytest.mark.asyncio
-async def test_whole_plan_action_is_todays_sentence(tmp_path):
+async def test_whole_plan_action_is_the_pinned_sentence(tmp_path):
     _, action = _split_at_action(await _render(_config(tmp_path)))
-    assert action == TODAYS_ACTION
+    assert action == WHOLE_PLAN_ACTION_PIN
 
 
 @pytest.mark.asyncio
@@ -99,6 +105,18 @@ async def test_one_step_action_is_the_registered_one_step_paragraph(tmp_path):
     )
     assert action == briefing.IMPLEMENTER_ACTIONS[ImplementerBriefVariant.ONE_STEP] + '\n'
     assert set(briefing.IMPLEMENTER_ACTIONS) == set(ImplementerBriefVariant)
+
+
+@pytest.mark.asyncio
+async def test_an_unvalidated_str_variant_is_whole_plan_for_brief_cap_and_bounds(tmp_path):
+    config = _config(tmp_path).model_copy(update={'implementer_brief_variant': 'one-step'})
+    variant = config.implementer_brief_variant
+
+    _, action = _split_at_action(await _render(config))
+
+    assert action == WHOLE_PLAN_ACTION_PIN
+    assert execute_iteration_cap(variant, 10, _plan) == 10
+    assert invocation_bounds(variant, 'implementer', 20.0, 160) == (20.0, 160)
 
 
 @pytest.mark.asyncio

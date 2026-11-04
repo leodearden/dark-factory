@@ -24,7 +24,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from _eval_config_lookup import named_eval_config
-from _implementer_action_oracle import ACTION_MARKER, TODAYS_ACTION
+from _implementer_action_oracle import ACTION_MARKER, WHOLE_PLAN_ACTION_PIN
 from _merge_lane_fakes import lane_scene_config
 from _workflow_helpers import (
     AgentStub,
@@ -268,7 +268,7 @@ class TestOneStepRow15:
 
 @pytest.mark.asyncio
 class TestWholePlanParityTripwire:
-    async def test_a_clean_run_is_todays_single_whole_plan_iteration(self, repo, monkeypatch):
+    async def test_a_clean_run_is_one_whole_plan_iteration_with_the_pinned_action(self, repo, monkeypatch):
         stub = _ObedientImplementer()
         orch, workflow, outcome = await _run_cell(
             repo, monkeypatch, 'claude-sonnet-max', stub, _plan(steps=3),
@@ -278,7 +278,7 @@ class TestWholePlanParityTripwire:
         assert outcome == WorkflowOutcome.DONE
         assert len(stub.implementer_calls) == 1
         [call] = stub.implementer_calls
-        assert _action_of(call['prompt']) == TODAYS_ACTION
+        assert _action_of(call['prompt']) == WHOLE_PLAN_ACTION_PIN
         assert call['max_turns'] == orch.max_turns.implementer
         assert call['max_budget_usd'] == orch.budgets.implementer
         log = _implementer_log(workflow)

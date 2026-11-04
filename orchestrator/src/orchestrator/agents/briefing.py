@@ -23,7 +23,7 @@ from orchestrator.agents.review_briefing import (
     review_action_section,
 )
 from orchestrator.config import OrchestratorConfig
-from orchestrator.implementer_brief_variant import ImplementerBriefVariant
+from orchestrator.implementer_brief_variant import ImplementerBriefVariant, is_one_step
 from orchestrator.plan_descope import DESCOPE_DISPOSITIONS, DoneStepIntegrityVerdict
 
 logger = logging.getLogger(__name__)
@@ -43,6 +43,14 @@ IMPLEMENTER_ACTIONS: Mapping[ImplementerBriefVariant, str] = MappingProxyType({
     ),
 })
 """The implementer brief's Action paragraph per ``config.implementer_brief_variant``."""
+
+
+def _implementer_action(variant: ImplementerBriefVariant) -> str:
+    """The Action paragraph *variant* selects, by the :func:`is_one_step` rule the cap and the bounds also use."""
+    return IMPLEMENTER_ACTIONS[
+        ImplementerBriefVariant.ONE_STEP if is_one_step(variant) else ImplementerBriefVariant.WHOLE_PLAN
+    ]
+
 
 DIFF_ONLY_DIFF_CAP_CHARS = 50_000
 """Where the incumbent reviewer briefing cuts its diff; ``diff_cap_chars=0`` lifts the cut."""
@@ -1078,7 +1086,7 @@ Before writing any new code, walk the pending steps in plan order:
 
 # Action
 
-{IMPLEMENTER_ACTIONS[self.config.implementer_brief_variant]}
+{_implementer_action(self.config.implementer_brief_variant)}
 """
 
     async def build_amender_prompt(
