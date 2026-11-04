@@ -67,6 +67,9 @@ presence-only evidence the resolution must quote, exactly as the 2630
 carve-out above does; the carve-out's three classes are rows of that table
 rather than a second copy of their regexes. Whether a class may act on a
 given queue is a per-queue :class:`ClassSwitch` held outside this module.
+Two more identified callers read it: ``EXECUTOR_IDENTITY`` (levels {0,1,2},
+every act gated by :func:`executor_refusal`) and ``COORDINATOR_IDENTITY``
+(full levels, denied only by :func:`coordinator_denied`).
 """
 
 from __future__ import annotations
@@ -74,11 +77,13 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from enum import StrEnum
 from types import MappingProxyType
 
 from escalation.action_effects import ACTION_EFFECTS
 from escalation.categories import EscalationCategory, require_registered_category
+from escalation.models import Escalation
 from escalation.store_identity import QueueKind
 
 # Must equal orchestrator.harness._WATCHER_ESCALATION_HEADERS['X-Escalation-Identity'].
@@ -86,18 +91,29 @@ from escalation.store_identity import QueueKind
 # direction; pinned in lockstep by tests/test_authority.py.
 _WATCHER_AUTO_IDENTITY = 'orchestrator-escalation-watcher-auto'
 
+# The escalation executor rotation (PRD plans/decision-stream-prd.md §3
+# decision 3): levels {0,1,2}, every act class-gated by executor_refusal below.
+EXECUTOR_IDENTITY = 'orchestrator-escalation-executor'
+
+# The human sitting: full levels, denied only on a record carrying a fresh
+# executor claim (coordinator_denied below).
+COORDINATOR_IDENTITY = 'interactive:coordinator'
+
 # Identity -> the set of escalation levels that identity may resolve/park.
 # A present X-Escalation-Levels header may only NARROW within this ceiling,
 # never widen it (see escalation.server resolve_issue). Identities absent
 # from this mapping fall back to the 2041 header-opt-in behaviour.
 ROLE_LEVEL_ALLOWLIST: dict[str, frozenset[int]] = {
     _WATCHER_AUTO_IDENTITY: frozenset({0, 1}),
+    EXECUTOR_IDENTITY: frozenset({0, 1, 2}),
 }
 
 # Identities permitted to mint a new L2 via promote_to_l2. Header-less
 # (absent identity) callers are unaffected — this only gates identified
 # callers not in this set.
-PROMOTE_ALLOWED: frozenset[str] = frozenset({_WATCHER_AUTO_IDENTITY})
+PROMOTE_ALLOWED: frozenset[str] = frozenset({
+    _WATCHER_AUTO_IDENTITY, EXECUTOR_IDENTITY, COORDINATOR_IDENTITY,
+})
 
 # MEMBER agent_roles (not caller identities — disjoint from PROMOTE_ALLOWED)
 # whose records live under a SYNTHETIC sentinel task id. An L2 clustering only
@@ -167,6 +183,17 @@ L2_AUTO_CLOSE_DENY_CATEGORIES: frozenset[str] = frozenset({
 # per CLAUDE.md's "Deterministic task kind" section). Checked BEFORE the
 # allowlist (denylist-first).
 L2_AUTO_CLOSE_DENY_ROLES: frozenset[str] = frozenset({'orchestrator-deterministic'})
+
+# The executor's deny roles: the sentinel role above plus the two watchdog
+# alarms. Its deny categories ARE L2_AUTO_CLOSE_DENY_CATEGORIES.
+EXECUTOR_DENY_ROLES: frozenset[str] = L2_AUTO_CLOSE_DENY_ROLES | {
+    'orchestrator-watchdog', 'dashboard-watchdog',
+}
+
+# How long an executor claim stays fresh. The code home of the triage-ack
+# freshness window that skills/escalation-watcher-auto/SKILL.md "Triage-ack
+# freshness contract" states in prose.
+CLAIM_TTL = timedelta(hours=6)
 
 
 # ---------------------------------------------------------------------------
@@ -652,4 +679,210 @@ def l2_auto_close_class(
     for row in L2_AUTO_CLOSE_ALLOWLIST:
         if row.match.matches(category, agent_role) and row.evidence_present(text):
             return row.policy_class
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Executor and coordinator gates over POLICY_TABLE (task 8422; PRD §5.1).
+# ---------------------------------------------------------------------------
+
+
+class RefusalCode(StrEnum):
+    """Why an executor act or claim was refused."""
+
+    DENIED_RECORD = 'denied_record'
+    NO_FRESH_CLAIM = 'no_fresh_claim'
+    UNKNOWN_CLASS = 'unknown_class'
+    ROW_MISMATCH = 'row_mismatch'
+    ACTION_NOT_ALLOWED = 'action_not_allowed'
+    CLASS_NOT_LIVE = 'class_not_live'
+    EVIDENCE_MISSING = 'evidence_missing'
+    CLASS_OFF = 'class_off'
+    ALREADY_CLAIMED = 'already_claimed'
+    PROJECT_ROOT_DIRTY = 'project_root_dirty'
+
+
+@dataclass(frozen=True)
+class PolicyRefusal:
+    code: RefusalCode
+    detail: str
+
+
+def _claim_is_fresh(record: Escalation, now: datetime) -> bool:
+    """True iff the executor claimed *record* less than CLAIM_TTL before *now*.
+
+    An unparsable ``claimed_at`` is never fresh: the executor is refused and
+    the human is not blocked, which is the safe reading on both sides.
+    """
+    if record.claimed_by != EXECUTOR_IDENTITY or record.claimed_at is None:
+        return False
+    try:
+        age = now - datetime.fromisoformat(record.claimed_at)
+    except (TypeError, ValueError):
+        return False
+    return timedelta(0) <= age < CLAIM_TTL
+
+
+def _denied(record: Escalation) -> PolicyRefusal | None:
+    if record.category in L2_AUTO_CLOSE_DENY_CATEGORIES:
+        return PolicyRefusal(
+            RefusalCode.DENIED_RECORD,
+            f'category {record.category!r} is on the executor deny list',
+        )
+    if record.agent_role in EXECUTOR_DENY_ROLES:
+        return PolicyRefusal(
+            RefusalCode.DENIED_RECORD,
+            f'agent_role {record.agent_role!r} is on the executor deny list',
+        )
+    return None
+
+
+def _row_or_refusal(
+    record: Escalation, policy_class: str | None, queue_kind: QueueKind,
+) -> PolicyRow | PolicyRefusal:
+    row = None if policy_class is None else policy_row(policy_class)
+    if row is None:
+        return PolicyRefusal(RefusalCode.UNKNOWN_CLASS, f'no policy row named {policy_class!r}')
+    if row.queue_kind != queue_kind:
+        return PolicyRefusal(
+            RefusalCode.ROW_MISMATCH,
+            f'{row.policy_class!r} serves {row.queue_kind!r} queues, not {queue_kind!r}',
+        )
+    if not row.match.matches(record.category, record.agent_role):
+        return PolicyRefusal(
+            RefusalCode.ROW_MISMATCH,
+            f'{row.policy_class!r} does not cover category {record.category!r} '
+            f'with agent_role {record.agent_role!r}',
+        )
+    return row
+
+
+def executor_refusal(
+    record: Escalation,
+    action: str,
+    resolution: str | None,
+    state: Mapping[str, ClassSwitch],
+    *,
+    now: datetime,
+    queue_kind: QueueKind,
+) -> PolicyRefusal | None:
+    """Why the executor may not resolve *record* with *action*, or ``None``.
+
+    Checked in PRD §5.1 order: deny lists, a fresh executor claim, the claimed
+    row's match and queue kind, the row's actions, the class being live on
+    this queue (*state*; a class absent from it is at its row's initial
+    state), and every evidence pattern present in *resolution*.
+    """
+    if (denied := _denied(record)) is not None:
+        return denied
+    if not _claim_is_fresh(record, now):
+        return PolicyRefusal(
+            RefusalCode.NO_FRESH_CLAIM,
+            f'no executor claim younger than {CLAIM_TTL}: '
+            f'claimed_by={record.claimed_by!r}, claimed_at={record.claimed_at!r}',
+        )
+    row = _row_or_refusal(record, record.policy_class, queue_kind)
+    if isinstance(row, PolicyRefusal):
+        return row
+    if action not in row.actions:
+        return PolicyRefusal(
+            RefusalCode.ACTION_NOT_ALLOWED,
+            f'{row.policy_class!r} does not allow {action!r}; '
+            f'it allows {sorted(map(str, row.actions))}',
+        )
+    switch = state.get(row.policy_class, row.initial_state)
+    if switch != ClassSwitch.LIVE:
+        return PolicyRefusal(
+            RefusalCode.CLASS_NOT_LIVE, f'{row.policy_class!r} is {switch}, not live',
+        )
+    text = resolution or ''
+    missing = [pattern.pattern for pattern in row.evidence if not pattern.search(text)]
+    if missing:
+        return PolicyRefusal(
+            RefusalCode.EVIDENCE_MISSING,
+            f'{row.policy_class!r} resolution matches none of: ' + '  AND  '.join(missing),
+        )
+    return None
+
+
+def executor_policy_class(
+    record: Escalation,
+    action: str,
+    resolution: str | None,
+    state: Mapping[str, ClassSwitch],
+    *,
+    now: datetime,
+    queue_kind: QueueKind,
+) -> str | None:
+    """The class the executor acts under, or ``None`` meaning level_forbidden (PRD §5.1)."""
+    refusal = executor_refusal(
+        record, action, resolution, state, now=now, queue_kind=queue_kind,
+    )
+    return record.policy_class if refusal is None else None
+
+
+def claim_refusal(
+    record: Escalation,
+    policy_class: str,
+    state: Mapping[str, ClassSwitch],
+    *,
+    now: datetime,
+    clean: bool,
+    queue_kind: QueueKind,
+) -> PolicyRefusal | None:
+    """Why the executor may not claim *record* as *policy_class*, or ``None``.
+
+    A shadow class is claimable, so the executor can act out its shadow
+    measurement. *clean* is the executor's report that ``project_root`` has
+    no uncommitted changes; a file-writing class needs it (PRD §3 decision 5).
+    """
+    if (denied := _denied(record)) is not None:
+        return denied
+    row = _row_or_refusal(record, policy_class, queue_kind)
+    if isinstance(row, PolicyRefusal):
+        return row
+    if state.get(row.policy_class, row.initial_state) == ClassSwitch.OFF:
+        return PolicyRefusal(RefusalCode.CLASS_OFF, f'{row.policy_class!r} is off on this queue')
+    if _claim_is_fresh(record, now):
+        return PolicyRefusal(
+            RefusalCode.ALREADY_CLAIMED,
+            f'already claimed as {record.policy_class!r} at {record.claimed_at}',
+        )
+    if row.file_writing and not clean:
+        return PolicyRefusal(
+            RefusalCode.PROJECT_ROOT_DIRTY,
+            f'{row.policy_class!r} writes files and needs clean=True',
+        )
+    return None
+
+
+def coordinator_denied(record: Escalation, now: datetime) -> bool:
+    """True iff *record* carries a fresh executor claim the coordinator must not race."""
+    return _claim_is_fresh(record, now)
+
+
+# The only moves a class switch may make (PRD §5.1): off -> shadow -> live ->
+# shadow. No writer moves a class to off.
+CLASS_SWITCH_TRANSITIONS: frozenset[tuple[ClassSwitch, ClassSwitch]] = frozenset({
+    (ClassSwitch.OFF, ClassSwitch.SHADOW),
+    (ClassSwitch.SHADOW, ClassSwitch.LIVE),
+    (ClassSwitch.LIVE, ClassSwitch.SHADOW),
+})
+
+
+class IllegalClassTransition(ValueError):
+    """A class switch move outside :data:`CLASS_SWITCH_TRANSITIONS`."""
+
+
+def check_class_transition(policy_class: str, current: ClassSwitch, target: ClassSwitch) -> None:
+    if (current, target) not in CLASS_SWITCH_TRANSITIONS:
+        raise IllegalClassTransition(
+            f'policy class {policy_class!r} cannot move {current} -> {target}'
+        )
+
+
+def storm_escape_target(current: ClassSwitch, closes: int, cap: int) -> ClassSwitch | None:
+    """SHADOW when a live class closed more than *cap* records in one rotation, else ``None``."""
+    if current == ClassSwitch.LIVE and closes > cap:
+        return ClassSwitch.SHADOW
     return None

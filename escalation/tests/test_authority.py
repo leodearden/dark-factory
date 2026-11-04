@@ -18,8 +18,10 @@ stays in sync with the duplicated string.
 
 from __future__ import annotations
 
+import dataclasses
 import re
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import pytest
 
@@ -54,6 +56,7 @@ from escalation.authority import (
 )
 from escalation.categories import EscalationCategory
 from escalation.models import Escalation
+from escalation.store_identity import QueueKind
 
 
 class TestRoleLevelAllowlistShape:
@@ -661,16 +664,17 @@ class TestL2AutoCloseClass:
         )
 
 
-def _row(**overrides: object) -> PolicyRow:
-    """A valid PolicyRow with *overrides* applied, for the construction invariants."""
-    fields: dict[str, object] = {
-        'policy_class': 'probe_class',
-        'match': PolicyMatch(),
-        'actions': frozenset({PolicyAction.CLOSE_ONLY}),
-        'evidence': (re.compile(r'probe', re.IGNORECASE),),
-    }
-    fields.update(overrides)
-    return PolicyRow(**fields)  # type: ignore[arg-type]
+_VALID_ROW = PolicyRow(
+    policy_class='probe_class',
+    match=PolicyMatch(),
+    actions=frozenset({PolicyAction.CLOSE_ONLY}),
+    evidence=(re.compile(r'probe', re.IGNORECASE),),
+)
+
+
+def _row(**overrides: Any) -> PolicyRow:
+    """A valid PolicyRow with *overrides* applied, re-running the construction invariants."""
+    return dataclasses.replace(_VALID_ROW, **overrides)
 
 
 class TestPolicyRowInvariants:
@@ -873,11 +877,11 @@ def _executor(
     action: str = 'close_only',
     resolution: str = _FOUND_ON_MAIN_TEXT,
     state: dict[str, ClassSwitch] | None = None,
-    queue_kind: str = 'project',
+    queue_kind: QueueKind = 'project',
 ) -> PolicyRefusal | None:
     return executor_refusal(
         record, action, resolution, _LIVE if state is None else state,
-        now=_NOW, queue_kind=queue_kind,  # type: ignore[arg-type]
+        now=_NOW, queue_kind=queue_kind,
     )
 
 
@@ -887,11 +891,11 @@ def _claim(
     *,
     state: dict[str, ClassSwitch] | None = None,
     clean: bool = False,
-    queue_kind: str = 'project',
+    queue_kind: QueueKind = 'project',
 ) -> PolicyRefusal | None:
     return claim_refusal(
         record, policy_class, {} if state is None else state,
-        now=_NOW, clean=clean, queue_kind=queue_kind,  # type: ignore[arg-type]
+        now=_NOW, clean=clean, queue_kind=queue_kind,
     )
 
 
