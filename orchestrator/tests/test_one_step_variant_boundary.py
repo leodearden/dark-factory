@@ -23,9 +23,9 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
-from _briefing_helpers import MEMORY_TRANSPORT
 from _eval_config_lookup import named_eval_config
 from _implementer_action_oracle import ACTION_MARKER, TODAYS_ACTION
+from _merge_lane_fakes import lane_scene_config
 from _workflow_helpers import (
     AgentStub,
     FakeMcp,
@@ -35,6 +35,7 @@ from _workflow_helpers import (
     agent_side_artifacts,
 )
 
+from orchestrator.agents import memory_recall
 from orchestrator.agents.briefing import IMPLEMENTER_ACTIONS, BriefingAssembler
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.config import GitConfig, OrchestratorConfig
@@ -134,15 +135,15 @@ def repo(tmp_path: Path) -> Path:
 
 
 def _cell_config(repo: Path, candidate_name: str) -> OrchestratorConfig:
-    base = OrchestratorConfig(
-        project_root=repo,
-        max_concurrent_tasks=1,
-        git=GitConfig(
+    base = lane_scene_config(
+        repo,
+        GitConfig(
             main_branch='main',
             branch_prefix='task/',
             remote='origin',
             worktree_dir='.worktrees',
         ),
+        max_concurrent_tasks=1,
     )
     task = {
         'id': TASK_ID,
@@ -190,7 +191,8 @@ async def _run_cell(
     workflow = _workflow(orch, plan)
     monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
     monkeypatch.setattr(
-        MEMORY_TRANSPORT, AsyncMock(side_effect=ConnectionRefusedError('null sentinel')),
+        memory_recall, 'mcp_call',
+        AsyncMock(side_effect=ConnectionRefusedError('null sentinel')),
     )
     monkeypatch.setattr(
         'orchestrator.workflow.run_scoped_verification',
