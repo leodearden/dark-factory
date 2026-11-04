@@ -338,7 +338,7 @@ def test_every_task_in_the_fixture_is_attributed():
 @pytest.mark.parametrize('descending', [False, True], ids=['ascending', 'descending'])
 def test_ten_node_chain_is_attributed_independently_of_iteration_order(descending):
     ids = sorted(range(1, 11), reverse=descending)
-    metadata = {task_id: {'spawned_from': task_id + 1} for task_id in ids}
+    metadata: dict[int, dict] = {task_id: {'spawned_from': task_id + 1} for task_id in ids}
     metadata[10] = {'prd_path': 'plans/ten-prd.md'}
     ordered = {task_id: metadata[task_id] for task_id in ids}
     attributions = attribute(_entries(ordered))[0]

@@ -6,7 +6,8 @@ A task names its PRD directly (``metadata.prd_path``, or the legacy ``prd`` /
 (PRD ``plans/dashboard-prd-lanes-prd.md`` §4.1–§4.3, §5.3–§5.4).
 :func:`lineage_entry` is the ONE parse of a task's metadata into a
 :class:`LineageEntry`, for projected lineage rows and raw active rows alike, so
-no two readers can disagree about what a task says.
+no two readers can disagree about what a task says. :func:`attribute` walks a
+whole project's entries into one :class:`Attribution` per task.
 
 Pure: no I/O and no clock read.
 """
@@ -17,8 +18,9 @@ import enum
 import posixpath
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
+from types import MappingProxyType
 from typing import Any
 
 from shared.timestamps import parse_timestamp_or_warn
@@ -56,6 +58,8 @@ _UNRESOLVABLE_LINK_REASONS = frozenset(
 _LOCAL_TASK_ID = re.compile(r'[0-9]+')
 _CROSS_PROJECT_LINK = re.compile(r'[A-Za-z0-9_.-]+:\d+')
 _RAW_LINK_CAP = 200
+
+MAX_HOPS = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,3 +199,110 @@ def _done_stamped_at(done_provenance: object) -> datetime | None:
         return None
     moment, ok = parse_timestamp_or_warn(stamped_at, context='prd_attribution.done_stamped_at')
     return moment if ok else None
+
+
+@dataclass(frozen=True, slots=True)
+class Attribution:
+    """One task's PRD key, or the reason it has none, and the links followed.
+
+    ``hops`` counts the links followed before the walk stopped; a
+    ``DEPTH_EXCEEDED`` result carries ``MAX_HOPS``.
+    """
+
+    prd: str | None
+    hops: int
+    unresolved: UnresolvedReason | None
+
+    def __post_init__(self) -> None:
+        if (self.prd is None) == (self.unresolved is None):
+            raise ValueError(
+                'Attribution: exactly one of prd and unresolved must be set; '
+                f'got prd={self.prd!r}, unresolved={self.unresolved!s}'
+            )
+        if not 0 <= self.hops <= MAX_HOPS:
+            raise ValueError(
+                f'Attribution: hops must lie in 0..MAX_HOPS ({MAX_HOPS}); got hops={self.hops}'
+            )
+
+    @property
+    def direct(self) -> bool:
+        return self.hops == 0
+
+
+def attribute(entries: Mapping[int, LineageEntry]) -> tuple[Mapping[int, Attribution], int]:
+    """Attribute every task in *entries*; also count the tasks carrying two or more links.
+
+    The walk from a task stops at the first task with its own PRD verdict, a
+    link it cannot follow, a missing target or a cycle, and a local link
+    examined ``MAX_HOPS`` links out ends it as ``DEPTH_EXCEEDED``. Each task's
+    unbounded outcome is memoised and bounded on its own, so the result is
+    the same in any iteration order. Cycle-safe; O(len(entries)).
+    """
+    outcomes: dict[int, _Outcome] = {}
+    for task_id in entries:
+        if task_id not in outcomes:
+            _walk_from(task_id, entries, outcomes)
+    attributions = {task_id: outcomes[task_id].bounded() for task_id in entries}
+    multi_link = sum(entry.multi_link for entry in entries.values())
+    return MappingProxyType(attributions), multi_link
+
+
+@dataclass(frozen=True, slots=True)
+class _Outcome:
+    """Where an unbounded walk from one task stops, ``distance`` links on."""
+
+    prd: str | None
+    reason: UnresolvedReason | None
+    distance: int
+    stopped_at_local_link: bool
+
+    def one_link_earlier(self) -> _Outcome:
+        return replace(self, distance=self.distance + 1)
+
+    def bounded(self) -> Attribution:
+        if self.distance > MAX_HOPS or (self.distance == MAX_HOPS and self.stopped_at_local_link):
+            return Attribution(prd=None, hops=MAX_HOPS, unresolved=UnresolvedReason.DEPTH_EXCEEDED)
+        reached_a_linkless_root = self.reason is UnresolvedReason.NO_LINK and self.distance > 0
+        reason = UnresolvedReason.ROOT_WITHOUT_PRD if reached_a_linkless_root else self.reason
+        return Attribution(prd=self.prd, hops=self.distance, unresolved=reason)
+
+
+def _walk_from(
+    start: int, entries: Mapping[int, LineageEntry], outcomes: dict[int, _Outcome],
+) -> None:
+    path: list[int] = []
+    on_path: dict[int, int] = {}
+    current = start
+    while current not in outcomes:
+        on_path[current] = len(path)
+        path.append(current)
+        step = _step(entries[current], entries)
+        if isinstance(step, _Outcome):
+            outcomes[current] = step
+            break
+        if step in on_path:
+            cycle = path[on_path[step]:]
+            for member in cycle:
+                outcomes[member] = _Outcome(None, UnresolvedReason.CYCLE, len(cycle) - 1, True)
+            break
+        current = step
+    successor = current
+    for task_id in reversed(path):
+        if task_id not in outcomes:
+            outcomes[task_id] = outcomes[successor].one_link_earlier()
+        successor = task_id
+
+
+def _step(entry: LineageEntry, entries: Mapping[int, LineageEntry]) -> _Outcome | int:
+    """The walk's verdict at *entry*, or the id of the task it moves on to."""
+    if isinstance(entry.own_prd, PrdKey):
+        return _Outcome(entry.own_prd.key, None, 0, False)
+    if isinstance(entry.own_prd, Unresolved):
+        return _Outcome(None, entry.own_prd.reason, 0, False)
+    if entry.link is None:
+        return _Outcome(None, UnresolvedReason.NO_LINK, 0, False)
+    if isinstance(entry.link, UnresolvableLink):
+        return _Outcome(None, entry.link.reason, 0, False)
+    if entry.link.target not in entries:
+        return _Outcome(None, UnresolvedReason.MISSING_TARGET, 0, True)
+    return entry.link.target
