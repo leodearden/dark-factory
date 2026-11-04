@@ -3,7 +3,10 @@
 PURE (PRD ``plans/dashboard-prd-lanes-prd.md`` §4.3–§4.5, §4.9–§4.10, §5.5):
 no I/O and no clock read but the injected *now*. It reads one root's status
 map, its raw active rows and its lineage index, handed in by the caller, and
-never imports the modules that acquire them.
+never imports the modules that acquire them. Its one piece of state is a
+per-root memo of the attribution, which does not depend on *now*; it is keyed
+on the very rows and lineage values it was computed from, so it can only
+ever answer for those.
 
 :func:`build_prd_view` serves the γ1 subset of §5.5's ``PrdView``: per-PRD
 segments, totals, open members and ready age; closed PRDs; unattributed done;
@@ -470,6 +473,52 @@ class _Member:
     attribution: Attribution
 
 
+@dataclass(frozen=True, slots=True)
+class _Attributed:
+    """One root's attribution, and the rows and lineage values it was computed from."""
+
+    rows: Sequence[Mapping[str, Any]]
+    lineage: Mapping[int, LineageEntry]
+    rows_by_id: Mapping[int, Mapping[str, Any]]
+    attributions: Mapping[int, Attribution]
+    multi_link: int
+
+
+_attributed: dict[str, _Attributed] = {}
+"""The last attribution per root; ``_attributed_for`` owns it."""
+
+
+def _attributed_for(
+    project_root: str, rows: Sequence[Mapping[str, Any]], lineage: Mapping[int, LineageEntry],
+) -> _Attributed:
+    """*project_root*'s attribution, overlaying its active rows on its lineage index.
+
+    The overlay and the walk are most of a build's cost and do not depend on
+    *now*: on a synthetic 9,700-task root with 3,276 active rows (measured
+    2026-11-04, loaded host) a build that re-attributes took at best 98 ms, one
+    reusing the attribution 44 ms. Their inputs are cached
+    values that are replaced, never mutated, when re-read: the snapshot unit's
+    rows for 15 s, the lineage index for 300 s. So the result is reused for
+    as long as both are the very same objects. The memo holds them, so
+    neither identity can be reused by another value while it is held.
+    """
+    memo = _attributed.get(project_root)
+    if memo is not None and memo.rows is rows and memo.lineage is lineage:
+        return memo
+    rows_by_id = {row['id']: row for row in rows}
+    entries = {
+        **lineage,
+        **{
+            task_id: lineage_entry(_metadata_of(row), project_root)
+            for task_id, row in rows_by_id.items()
+        },
+    }
+    attributions, multi_link = attribute(entries)
+    memo = _Attributed(rows, lineage, MappingProxyType(rows_by_id), attributions, multi_link)
+    _attributed[project_root] = memo
+    return memo
+
+
 def _shape_view(
     inputs: PrdViewInputs,
     rows: Sequence[Mapping[str, Any]],
@@ -477,24 +526,17 @@ def _shape_view(
     states: tuple[InputState, ...],
     now: datetime,
 ) -> PrdView:
-    rows_by_id = {row['id']: row for row in rows}
-    entries = {
-        **lineage,
-        **{
-            task_id: lineage_entry(_metadata_of(row), inputs.project_root)
-            for task_id, row in rows_by_id.items()
-        },
-    }
-    attributions, multi_link = attribute(entries)
+    attributed = _attributed_for(inputs.project_root, rows, lineage)
     by_prd: dict[str, list[_Member]] = {}
     dark: dict[UnresolvedReason, list[_Member]] = {}
     unattributed_done = 0
     for task_id, status in inputs.status_map.items():
-        row = rows_by_id.get(task_id)
+        row = attributed.rows_by_id.get(task_id)
         segment = segment_of(task_id, status, row, inputs.status_map, now=now)
         if segment is None:
             continue
-        member = _Member(task_id, row, segment, attributions.get(task_id, _LINEAGE_PENDING))
+        attribution = attributed.attributions.get(task_id, _LINEAGE_PENDING)
+        member = _Member(task_id, row, segment, attribution)
         if member.attribution.prd is not None:
             by_prd.setdefault(member.attribution.prd, []).append(member)
         elif segment is Segment.DONE:
@@ -507,7 +549,7 @@ def _shape_view(
         closed=closed,
         unattributed_done=unattributed_done,
         dark_matter=_dark_matter(dark, inputs.status_map),
-        multi_link=multi_link,
+        multi_link=attributed.multi_link,
         inputs=states,
     )
 

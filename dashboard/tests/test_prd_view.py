@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 from shared.task_statuses import TaskStatus
 
+from dashboard.data import prd_view
 from dashboard.data.census import CensusVocabularyError, TaskCensus, build_census
 from dashboard.data.datum import (
     Datum,
@@ -409,6 +410,36 @@ def test_a_status_map_id_unknown_to_lineage_and_rows_is_lineage_pending():
         drawn + wire['closed']['tasks'] + wire['unattributed_done'] + wire['dark_matter']['total']
         == census.total - census.counts[TaskStatus.CANCELLED]
     )
+
+
+# --- the attribution is reused for the same rows and lineage values ------
+
+
+def test_one_rows_and_lineage_value_is_attributed_once_while_now_moves(monkeypatch):
+    walks: list[int] = []
+    walk = prd_view.attribute
+
+    def _counted(entries):
+        walks.append(len(entries))
+        return walk(entries)
+
+    monkeypatch.setattr(prd_view, 'attribute', _counted)
+    inputs = _inputs()
+    first = _view(inputs)
+    later = build_prd_view(inputs, now=NOW + timedelta(days=2)).value
+    assert later is not None
+    assert len(walks) == 1
+    assert first.prds[0].ready.oldest_pending_days == 40
+    assert later.prds[0].ready.oldest_pending_days == 42
+
+
+def test_a_new_rows_value_beside_the_same_lineage_is_attributed_afresh():
+    lineage = _fresh(MappingProxyType(_lineage(_TASKS)), LINEAGE_AS_OF, LINEAGE_BOUND)
+    before = _wire(_inputs(lineage=lineage))
+    after = _wire(_inputs(_with_metadata(7, prd_path=PRD_B), lineage=lineage))
+    assert before['dark_matter']['members']['no_link'] == [7]
+    assert 'no_link' not in after['dark_matter']['members']
+    assert [row['direct_open_ids'] for row in after['prds'] if row['key'] == PRD_B] == [[7]]
 
 
 # --- composite provenance -------------------------------------------------
