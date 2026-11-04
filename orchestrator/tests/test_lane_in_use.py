@@ -17,6 +17,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _orch_helpers import wait_responsive
 from escalation.queue import EscalationQueue
 from shared.config_dir import TaskConfigDir
 
@@ -404,7 +405,7 @@ class TestLaneInUseSpan:
                 await asyncio.Event().wait()
 
         holder = asyncio.create_task(_hold_forever())
-        await asyncio.wait_for(entered.wait(), timeout=10)
+        await wait_responsive(entered.wait(), label='holder entered lane_in_use')
         assert _lane_state(git_ops, lane) == 'in_use'
         holder.cancel()
         with pytest.raises(asyncio.CancelledError):
