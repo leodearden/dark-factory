@@ -10,9 +10,11 @@ dark-factory's own spawn points rather than a /proc scan, is decided in
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
+from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -58,6 +60,30 @@ def _record_path(worktree_base: Path, lane_name: str = LANE_NAME) -> Path:
 
 def _on_disk(worktree_base: Path, lane_name: str = LANE_NAME) -> dict:
     return json.loads(_record_path(worktree_base, lane_name).read_text())
+
+
+skip_as_root = pytest.mark.skipif(
+    os.geteuid() == 0, reason='root ignores permission bits',
+)
+
+
+@contextlib.contextmanager
+def _faulted(path: Path, mode: int) -> Iterator[None]:
+    """A real filesystem fault: *path* carries *mode* for the block, then its
+    original mode again however the block exits."""
+    original = path.stat().st_mode & 0o777
+    path.chmod(mode)
+    try:
+        yield
+    finally:
+        path.chmod(original)
+
+
+def _warned_about(caplog, lane_name: str) -> bool:
+    return any(
+        r.levelno == logging.WARNING and lane_name in r.getMessage()
+        for r in caplog.records
+    )
 
 
 def _legal_ladder(task_id: str) -> list[tuple[LaneState, dict[str, str]]]:
@@ -184,29 +210,27 @@ class TestNoteInUseAndIdle:
         assert _record_path(tmp_path).read_bytes() == before
 
 
-@pytest.mark.skipif(os.geteuid() == 0, reason='root ignores directory write bits')
+@skip_as_root
 class TestNeverRaises:
     """A liveness marker must never abort the child-spawning caller.
 
-    The fault is a real one: the ``.lane-state`` dir is made read-only, so
-    the atomic write itself raises ``PermissionError``.
+    Each fault is a real one: a read-only ``.lane-state`` dir makes the
+    atomic write raise ``PermissionError``, and a mode-0 record file makes
+    the read raise it.
     """
 
     def _assert_swallowed(
-        self, tmp_path: Path, caplog, call, expected_state: str,
+        self, tmp_path: Path, caplog, call, fault: tuple[Path, int],
+        expected_state: str,
     ) -> None:
-        state_dir = tmp_path / '.lane-state'
-        state_dir.chmod(0o500)
-        try:
-            with caplog.at_level(logging.WARNING, logger='orchestrator.lane_lifecycle'):
-                assert call() is False
-        finally:
-            state_dir.chmod(0o700)
+        with _faulted(*fault), caplog.at_level(
+            logging.WARNING, logger='orchestrator.lane_lifecycle',
+        ):
+            assert call() is False, 'a liveness marker never aborts its caller'
         assert _on_disk(tmp_path)['state'] == expected_state
-        assert any(
-            r.levelno == logging.WARNING and LANE_NAME in r.getMessage()
-            for r in caplog.records
-        ), 'the swallowed write failure must be logged naming the lane'
+        assert _warned_about(caplog, LANE_NAME), (
+            'the swallowed failure must be logged naming the lane'
+        )
 
     def test_note_in_use_write_failure_returns_false_and_warns(
         self, tmp_path: Path, lifecycle: LaneLifecycle, lane: Path, caplog,
@@ -214,7 +238,8 @@ class TestNeverRaises:
         _drive_to(lifecycle, lane, LaneState.ASSIGNED)
 
         self._assert_swallowed(
-            tmp_path, caplog, lambda: lifecycle.note_in_use(lane), 'assigned',
+            tmp_path, caplog, lambda: lifecycle.note_in_use(lane),
+            (lifecycle.state_dir, 0o500), 'assigned',
         )
 
     def test_note_idle_write_failure_returns_false_and_warns(
@@ -223,7 +248,28 @@ class TestNeverRaises:
         _drive_to(lifecycle, lane, LaneState.IN_USE)
 
         self._assert_swallowed(
-            tmp_path, caplog, lambda: lifecycle.note_idle(lane), 'in_use',
+            tmp_path, caplog, lambda: lifecycle.note_idle(lane),
+            (lifecycle.state_dir, 0o500), 'in_use',
+        )
+
+    def test_note_in_use_on_an_unreadable_record_returns_false_and_warns(
+        self, tmp_path: Path, lifecycle: LaneLifecycle, lane: Path, caplog,
+    ):
+        _drive_to(lifecycle, lane, LaneState.ASSIGNED)
+
+        self._assert_swallowed(
+            tmp_path, caplog, lambda: lifecycle.note_in_use(lane),
+            (_record_path(tmp_path), 0o000), 'assigned',
+        )
+
+    def test_note_idle_on_an_unreadable_record_returns_false_and_warns(
+        self, tmp_path: Path, lifecycle: LaneLifecycle, lane: Path, caplog,
+    ):
+        _drive_to(lifecycle, lane, LaneState.IN_USE)
+
+        self._assert_swallowed(
+            tmp_path, caplog, lambda: lifecycle.note_idle(lane),
+            (_record_path(tmp_path), 0o000), 'in_use',
         )
 
 
@@ -281,6 +327,22 @@ class TestResetStaleInUse:
         reset = swept.reset_stale_in_use(skip=['_lane-1'])
 
         assert reset == ['_lane-0']
+        assert _on_disk(tmp_path, '_lane-1')['state'] == 'in_use'
+
+    @skip_as_root
+    def test_one_unreadable_record_costs_only_that_lane(
+        self, tmp_path: Path, swept: LaneLifecycle, caplog,
+    ):
+        with _faulted(_record_path(tmp_path, '_lane-1'), 0o000), caplog.at_level(
+            logging.WARNING, logger='orchestrator.lane_lifecycle',
+        ):
+            reset = swept.reset_stale_in_use()
+
+        assert reset == ['_lane-0'], (
+            'one unreadable record must not abandon the sweep of every other lane'
+        )
+        assert _warned_about(caplog, '_lane-1')
+        assert _on_disk(tmp_path, '_lane-0')['state'] == 'assigned'
         assert _on_disk(tmp_path, '_lane-1')['state'] == 'in_use'
 
     def test_a_second_sweep_is_a_no_op(self, tmp_path: Path, swept: LaneLifecycle):
@@ -431,6 +493,32 @@ class TestLaneInUseSpan:
 
         assert inside == released
         assert record_path.read_bytes() == released
+
+    @skip_as_root
+    async def test_an_unreadable_record_neither_aborts_the_span_nor_leaks_it(
+        self, tmp_path: Path,
+    ):
+        git_ops = _git_ops(tmp_path, pool_size=1)
+        lane = await _assigned_lane(git_ops)
+        ran = False
+
+        with _faulted(_record_path(git_ops.worktree_base, lane.name), 0o000):
+            async with git_ops.lane_in_use(lane):
+                ran = True
+
+        assert ran, 'a liveness marker never aborts the child-spawning caller'
+        assert _lane_state(git_ops, lane) == 'assigned'
+        async with git_ops.lane_in_use(lane):
+            inside = _lane_state(git_ops, lane)
+        assert (inside, _lane_state(git_ops, lane)) == ('in_use', 'assigned'), (
+            'a faulted span must not leak depth, or no later span on the lane '
+            'ever steps it back to assigned'
+        )
+        assert LaneLifecycle(git_ops.worktree_base).note_in_use(lane) is True
+        assert git_ops.reset_stale_lane_in_use_records() == [lane.name], (
+            'a faulted span must leave no live-span claim, or the sweep spares '
+            'an unhealable IN_USE fossil forever'
+        )
 
 
 @pytest.mark.asyncio
