@@ -470,6 +470,34 @@ class TestFilenameShaped:
 
         assert [f.code for f in findings] == ['vacuous_absent']
 
+    def _lint_strand_scope(self, repo: Path, pattern: str):
+        return lint_delivered_checks(
+            [{'name': 'gating-strand', 'kind': 'grep', 'pattern': pattern,
+              'expect': 'present', 'paths': ['orchestrator/tests']}],
+            files=['orchestrator/tests'],
+            repo_root=repo,
+            ref='HEAD',
+        )
+
+    @pytest.mark.filterwarnings('error::FutureWarning')
+    def test_a_posix_class_pattern_matching_a_tracked_filename_is_rejected(
+        self, strand_repo
+    ):
+        findings = self._lint_strand_scope(
+            strand_repo, 'test_workflow_merge_gating_[[:alpha:]]+'
+        )
+
+        assert [(f.severity, f.code) for f in findings] == [('reject', 'filename_shaped')]
+
+    @pytest.mark.filterwarnings('error::FutureWarning')
+    def test_a_posix_class_the_filename_does_not_satisfy_is_healthy(self, strand_repo):
+        """The CONTROL: the translation is semantic, not permissive."""
+        findings = self._lint_strand_scope(
+            strand_repo, 'test_workflow_merge_gating_[[:digit:]]+'
+        )
+
+        assert findings == []
+
 
 # ---------------------------------------------------------------------------
 # TestAbsentOverbroad (task 3500 — step-7 RED / step-8 GREEN)
@@ -808,6 +836,32 @@ class TestDeclaredFilenameShaped:
         )
 
         assert [f.code for f in findings] == ['vacuous_absent']
+
+    @pytest.mark.filterwarnings('error::FutureWarning')
+    def test_a_posix_class_pattern_naming_the_declared_file_is_rejected(
+        self, pre_3536_repo
+    ):
+        findings = lint_delivered_checks(
+            [{**_T3536_CHECK, 'pattern': 'test_workflow_merge_gating_[[:alpha:]]+'}],
+            files=_T3536_FILES,
+            repo_root=pre_3536_repo,
+        )
+
+        assert [f.code for f in findings] == ['filename_shaped']
+        assert findings[0].detail == ('orchestrator/tests/test_workflow_merge_gating_strand.py',)
+
+    @pytest.mark.filterwarnings('error::FutureWarning')
+    def test_a_posix_class_the_declared_name_does_not_satisfy_is_healthy(
+        self, pre_3536_repo
+    ):
+        """The CONTROL: the translation is semantic, not permissive."""
+        findings = lint_delivered_checks(
+            [{**_T3536_CHECK, 'pattern': 'test_workflow_merge_gating_[[:digit:]]+'}],
+            files=_T3536_FILES,
+            repo_root=pre_3536_repo,
+        )
+
+        assert findings == []
 
 
 # ---------------------------------------------------------------------------
