@@ -493,3 +493,58 @@ allowlist test greps real imports.
   `FollowupHolderProtectedError` (ε), pool exclusion (γ), `deps_verdict` unsatisfied (existing,
   wired at `Scheduler._eligible_for_dispatch`). Reader-shaped leaves (η, θ) render the no-producer
   state.
+
+## 10. Decompose record (2026-11-04)
+
+Decomposed by the PRD1 decompose seat (`/prd` decompose mode under `/team`) against main `55b50a6212`.
+Nine leaves were filed in planning mode, eleven intra-batch edges were wired exactly as §6, and the batch
+was flipped in one `commit_planning`. There are no out-of-batch edges and none to 6707.
+
+| label | task | prereqs | priority |
+|---|---|---|---|
+| α | 8413 | — | high |
+| β | 8414 | α | high |
+| γ | 8415 | β | high |
+| δ | 8416 | γ | medium |
+| ε | 8417 | γ | high (`metadata.g7_waivers`: holds-owned-and-bounded) |
+| ζ | 8418 | ε | high |
+| η | 8419 | α, ε | medium |
+| ι | 8420 | δ, ζ, η | medium (signal leaf) |
+| θ | 8421 | ι | low (`milestone` delayed 1,209,600 s; anchors on ι going done) |
+
+Capability manifest: `plans/follow-up-filing-shape-prd.capability-manifest.md` and its sidecar `.yaml`.
+The sidecar was stamped by `commit_planning` with all nine labels, no missing labels and no errors.
+Thirty-three mechanical checks were copied into `metadata.delivered_checks`; nine are manual.
+Three bindings were resolved at decompose. None changes a contract.
+
+- γ creates `followup_hold.py` with the marker key and `is_holder`, and ε extends it. γ's `is_holder`
+  conjunct otherwise named a producer downstream of γ.
+- Boundary row 15's `followup_promoted{by: human}` events move to ζ. ε keeps the readiness half.
+- Boundary row 20's curator render is γ's. α keeps the stamp half.
+
+Two path corrections went into the filed tasks:
+
+- ε's config schema is `fused-memory/src/fused_memory/config/schema.py`.
+- ε also edits `server/tools.py` for `release_holder`.
+
+G7 notes stamped into task descriptions, without waivers:
+
+- γ records the item keys a partial R4 hit dropped (`no-silent-fail-soft`).
+- α's reader allowlist test walks imports and seeds a forbidden fixture (`guards-exercise-behaviour`), and
+  each allowlist entry cites decision 8 (`exceptions-owned-or-ratified`).
+- ε's backfill runs before the server serves (`loop-thread-occupancy-bounded`).
+- The holder edge is the authority for "held now", and η counts edges, not records (`one-fact-one-home`).
+
+The overlay's trigger-chain gate does not apply: this PRD remediates no quality-instrument finding.
+
+Known residual: δ, ε and ζ all edit `task_interceptor.py`, but §6's edges leave δ unordered against ε and
+ζ. The overlay asks same-file leaves to be serialized by edges. The edges were filed exactly as §6, so
+the module lock serialises them at dispatch and a rebase is the cost.
+
+Companion corrections:
+
+- 4719 was annotated (details plus `metadata.x_subsumed_by` → β/8414) and cancelled. Its only spawned
+  child, 6227, is done, and nothing depends on it.
+- 6072 was annotated with the composition rule: the parent edge and the holder edge are ANDed, and a
+  parent edge never promotes on insert.
+- 3260 was annotated: γ never writes `metadata.files` from a combine.
