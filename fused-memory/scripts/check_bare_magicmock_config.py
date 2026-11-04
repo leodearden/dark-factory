@@ -684,10 +684,10 @@ def _dataclass_double_violation(
 # wait_for's positional timeout, and directory discovery gained ``_*.py`` helper
 # modules — and recorded 650 violations across 47 files in four packages.  Task 7800
 # re-measured once more after Rule C learned asyncio.timeout/timeout_at blocks and
-# clock-deadline polls, and recorded 294 violations across 82 files (220 across 39
-# before it).  Those are the two sanctioned rises: each time every added violation
-# was already in the tree, newly SEEN, not new debt.  The non-orchestrator entries
-# can shrink only by a per-site suppression pragma,
+# clock-deadline polls, and recorded 296 violations across 83 files in five packages
+# (220 across 39 before it).  Those are the two sanctioned rises: each time every
+# added violation was already in the tree, newly SEEN, not new debt.  The
+# non-orchestrator entries can shrink only by a per-site suppression pragma,
 # ``# noqa: wall-clock-deadline`` until follow-up ticket
 # tkt_0RVCE77JGW0CZGWPSFFZ00REB5 makes ``wait_responsive`` importable outside
 # orchestrator/tests.
@@ -818,6 +818,8 @@ _WALL_CLOCK_DEADLINE_DEBT: dict[str, int] = {
     'shared/tests/test_failover_integration.py': 1,
     'shared/tests/test_git_async.py': 1,
     'shared/tests/test_usage_gate_park_visibility.py': 1,
+    # escalation/tests
+    'escalation/tests/test_prefix_resolver_client.py': 2,
 }
 
 

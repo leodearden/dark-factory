@@ -1987,9 +1987,9 @@ class TestExemptionSeparatorVariants:
 # sanctioned rise where every added violation was newly SEEN, not new debt:
 #   * task 5269: 650 violations across 47 files in four packages (task 4246 shipped
 #     618 across 20, every one under orchestrator/tests/);
-#   * task 7800: 294 across 82 files after Rule C learned asyncio.timeout blocks and
-#     clock-deadline polls — every added violation newly SEEN, not new debt (220
-#     across 39 before it).
+#   * task 7800: 296 across 83 files in five packages after Rule C learned
+#     asyncio.timeout blocks and clock-deadline polls — every added violation newly
+#     SEEN, not new debt (220 across 39 before it).
 # Counted as VIOLATIONS, not sites — one call can produce two.
 # test_merge_speculation.py measures ZERO (tasks 3980 and 7800 migrated it) and is
 # deliberately ABSENT.
@@ -2076,6 +2076,7 @@ _EXPECTED_WALL_CLOCK_DEBT_PATHS = frozenset({
     'shared/tests/test_failover_integration.py',
     'shared/tests/test_git_async.py',
     'shared/tests/test_usage_gate_park_visibility.py',
+    'escalation/tests/test_prefix_resolver_client.py',
 })
 
 # Exactly ONE Rule C violation (bare wait_for; the bound is derived, not written),
@@ -2111,9 +2112,9 @@ class TestWallClockDeadlineDebtBaseline:
 
     Pre-existing violations — 618 across 20 files when task 4246 shipped the rule,
     650 across 47 files in four packages once task 5269 widened its detection, and
-    294 across 82 files once task 7800 taught it asyncio.timeout blocks and
-    clock-deadline polls (220 across 39 before; every added one newly SEEN, not new
-    debt) — mean a hot default-on rule would turn those packages' lint_commands red
+    296 across 83 files in five packages once task 7800 taught it asyncio.timeout
+    blocks and clock-deadline polls (220 across 39 before; every added one newly
+    SEEN, not new debt) — mean a hot default-on rule would turn those packages' lint_commands red
     immediately and stall the merge lane repo-wide — the identical situation Rule B
     faced at 95 sites/11 files, solved the identical way and since retired, its debt
     fully migrated (task 4354).

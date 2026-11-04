@@ -313,7 +313,7 @@ Reversing this decision means updating this section, `CLAUDE.md` and
     `orchestrator/tests/_orch_helpers.py`, and like `poll_responsive` are
     importable only under `orchestrator/tests`, so in any other package the
     per-site `# noqa: wall-clock-deadline — <reason>` is the remedy. See the
-    script's Rule C docstring. Pre-existing debt, across four packages, is
+    script's Rule C docstring. Pre-existing debt, across five packages, is
     grandfathered in the script's `_WALL_CLOCK_DEADLINE_DEBT` baseline — the
     last surviving baseline, and **shrink-only** and opt-out, so a new
     offending file fails the gate by default. It is an **exact budget** rather than a bare list: a listed file is
