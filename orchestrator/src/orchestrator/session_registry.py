@@ -3943,8 +3943,9 @@ class HolderRecordState(StrEnum):
 class LeaseHolder:
     """Serialized identity of a lease's current holder -- the exact ``.lease`` file body.
 
-    Every field is type-checked at construction, so a mistyped body is
-    unreadable rather than a holder.
+    Every field is type-checked at construction, and from_dict also rejects
+    a body that is not a JSON object, so a mistyped body is unreadable
+    rather than a holder.
 
     session_slug: a CLAIMANT-CHOSEN ownership token, NOT a session-registry
         record key. The skills prescribe ``<lease-role>-<project>-<pid>``
@@ -4005,6 +4006,8 @@ class LeaseHolder:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> LeaseHolder:
+        if not isinstance(data, dict):
+            raise TypeError(f'LeaseHolder body must be a JSON object, got {data!r}')
         record_slug = data.get('record_slug')
         return cls(
             session_slug=data['session_slug'],
