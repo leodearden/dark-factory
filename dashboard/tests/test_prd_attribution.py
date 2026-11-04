@@ -9,6 +9,8 @@ import pytest
 
 from dashboard.data.prd_attribution import (
     LINEAGE_METADATA_KEYS,
+    MAX_HOPS,
+    Attribution,
     LineageEntry,
     LinkField,
     LocalLink,
@@ -16,6 +18,7 @@ from dashboard.data.prd_attribution import (
     UnresolvableLink,
     Unresolved,
     UnresolvedReason,
+    attribute,
     coalesce_prd,
     lineage_entry,
     normalise_prd_key,
@@ -213,3 +216,169 @@ def test_lineage_metadata_keys_pin_the_read():
         'spawned_from', 'x_recovered_from_task', 'cross_repo_refile_of',
         'done_provenance',
     )
+
+
+# ---------------------------------------------------------------------------
+# attribute: every task's PRD, by its own provenance or its lineage chain
+# ---------------------------------------------------------------------------
+
+
+def _entries(metadata_by_id: dict[int, dict]) -> dict[int, LineageEntry]:
+    return {task_id: lineage_entry(metadata, ROOT) for task_id, metadata in metadata_by_id.items()}
+
+
+def _chain(head: int, length: int, prd: str) -> dict[int, dict]:
+    """``length`` links from *head* down to a root carrying *prd*: ids head..head-length."""
+    root = head - length
+    chain: dict[int, dict] = {root: {'prd_path': prd}}
+    for task_id in range(root + 1, head + 1):
+        chain[task_id] = {'spawned_from': task_id - 1}
+    return chain
+
+
+_FIXTURE: dict[int, dict] = {
+    1: {'prd_path': 'plans/a-prd.md'},
+    **{
+        task_id: metadata
+        for length in range(1, 7)
+        for task_id, metadata in _chain(100 * length + length, length, f'plans/chain-{length}-prd.md').items()
+    },
+    20: {'spawned_from': 21},
+    21: {'spawned_from': 20},
+    22: {'spawned_from': 20},
+    **_chain(909, 9, 'plans/deep-prd.md'),
+    30: {'spawned_from': 'reify:5569'},
+    31: {'spawned_from': {'id': 3}},
+    32: {'x_recovered_from_task': 'cand-12'},
+    33: {'spawned_from': 99999},
+    34: {},
+    35: {'spawned_from': 36},
+    36: {},
+    37: {'prd': '/elsewhere/plans/x-prd.md', 'spawned_from': 1},
+    38: {'spawned_from': 37},
+    39: {'spawned_from': 1, 'cross_repo_refile_of': 'reify:4'},
+}
+
+
+def _attributed() -> tuple[dict[int, Attribution], int]:
+    attributions, multi_link = attribute(_entries(_FIXTURE))
+    return dict(attributions), multi_link
+
+
+def test_max_hops_is_eight():
+    assert MAX_HOPS == 8
+
+
+def test_direct_task_is_attributed_at_hop_zero():
+    result = _attributed()[0][1]
+    assert result == Attribution(prd='plans/a-prd.md', hops=0, unresolved=None)
+    assert result.direct is True
+
+
+@pytest.mark.parametrize('length', range(1, 7))
+def test_chain_resolves_to_its_root_prd(length):
+    head = 100 * length + length
+    result = _attributed()[0][head]
+    assert result == Attribution(prd=f'plans/chain-{length}-prd.md', hops=length, unresolved=None)
+    assert result.direct is False
+
+
+def test_two_cycle_and_a_task_leading_into_it():
+    attributions = _attributed()[0]
+    assert attributions[20] == Attribution(prd=None, hops=1, unresolved=UnresolvedReason.CYCLE)
+    assert attributions[21] == Attribution(prd=None, hops=1, unresolved=UnresolvedReason.CYCLE)
+    assert attributions[22] == Attribution(prd=None, hops=2, unresolved=UnresolvedReason.CYCLE)
+
+
+def test_nine_hop_chain_exceeds_depth_while_eight_hops_resolve():
+    attributions = _attributed()[0]
+    assert attributions[909] == Attribution(
+        prd=None, hops=MAX_HOPS, unresolved=UnresolvedReason.DEPTH_EXCEEDED,
+    )
+    assert attributions[908] == Attribution(prd='plans/deep-prd.md', hops=8, unresolved=None)
+
+
+@pytest.mark.parametrize(
+    ('task_id', 'expected'),
+    [
+        (30, Attribution(prd=None, hops=0, unresolved=UnresolvedReason.CROSS_PROJECT_LINK)),
+        (31, Attribution(prd=None, hops=0, unresolved=UnresolvedReason.UNPARSEABLE_LINK)),
+        (32, Attribution(prd=None, hops=0, unresolved=UnresolvedReason.UNPARSEABLE_LINK)),
+        (33, Attribution(prd=None, hops=0, unresolved=UnresolvedReason.MISSING_TARGET)),
+        (34, Attribution(prd=None, hops=0, unresolved=UnresolvedReason.NO_LINK)),
+        (35, Attribution(prd=None, hops=1, unresolved=UnresolvedReason.ROOT_WITHOUT_PRD)),
+        (36, Attribution(prd=None, hops=0, unresolved=UnresolvedReason.NO_LINK)),
+        (37, Attribution(prd=None, hops=0, unresolved=UnresolvedReason.FOREIGN_PRD)),
+        (38, Attribution(prd=None, hops=1, unresolved=UnresolvedReason.FOREIGN_PRD)),
+        (39, Attribution(prd='plans/a-prd.md', hops=1, unresolved=None)),
+    ],
+    ids=[
+        'cross_project', 'dict_link', 'candidate_link', 'missing_target', 'no_link',
+        'root_without_prd', 'bare_root', 'own_foreign_prd', 'foreign_ancestor',
+        'multi_link_follows_precedence',
+    ],
+)
+def test_unresolved_and_edge_cases(task_id, expected):
+    assert _attributed()[0][task_id] == expected
+
+
+def test_a_task_carrying_two_link_keys_counts_once():
+    assert _attributed()[1] == 1
+
+
+def test_every_attribution_is_direct_exactly_at_hop_zero():
+    for result in _attributed()[0].values():
+        assert result.direct is (result.hops == 0)
+
+
+def test_every_task_in_the_fixture_is_attributed():
+    assert set(_attributed()[0]) == set(_FIXTURE)
+
+
+@pytest.mark.parametrize('descending', [False, True], ids=['ascending', 'descending'])
+def test_ten_node_chain_is_attributed_independently_of_iteration_order(descending):
+    ids = sorted(range(1, 11), reverse=descending)
+    metadata = {task_id: {'spawned_from': task_id + 1} for task_id in ids}
+    metadata[10] = {'prd_path': 'plans/ten-prd.md'}
+    ordered = {task_id: metadata[task_id] for task_id in ids}
+    attributions = attribute(_entries(ordered))[0]
+    assert attributions[2] == Attribution(prd='plans/ten-prd.md', hops=8, unresolved=None)
+    assert attributions[1] == Attribution(
+        prd=None, hops=MAX_HOPS, unresolved=UnresolvedReason.DEPTH_EXCEEDED,
+    )
+    assert [attributions[task_id].hops for task_id in range(3, 11)] == list(range(7, -1, -1))
+
+
+def test_whole_fixture_is_attributed_independently_of_iteration_order():
+    ascending = dict(attribute(_entries(dict(sorted(_FIXTURE.items()))))[0])
+    descending = dict(attribute(_entries(dict(sorted(_FIXTURE.items(), reverse=True))))[0])
+    assert ascending == descending
+
+
+def test_a_missing_target_at_the_depth_limit_exceeds_depth():
+    """The walk checks depth before it looks the target up, from every start."""
+    for descending in (False, True):
+        ids = sorted(range(1, 10), reverse=descending)
+        metadata = {task_id: {'spawned_from': task_id + 1} for task_id in ids}
+        metadata[9] = {'spawned_from': 99999}
+        attributions = attribute(_entries({task_id: metadata[task_id] for task_id in ids}))[0]
+        assert attributions[1] == Attribution(
+            prd=None, hops=MAX_HOPS, unresolved=UnresolvedReason.DEPTH_EXCEEDED,
+        )
+        assert attributions[2] == Attribution(
+            prd=None, hops=7, unresolved=UnresolvedReason.MISSING_TARGET,
+        )
+
+
+@pytest.mark.parametrize(
+    ('kwargs', 'named'),
+    [
+        ({'prd': 'k', 'hops': 0, 'unresolved': UnresolvedReason.CYCLE}, 'cycle'),
+        ({'prd': None, 'hops': 0, 'unresolved': None}, 'prd'),
+        ({'prd': 'k', 'hops': 9, 'unresolved': None}, '9'),
+    ],
+    ids=['prd_and_reason', 'neither', 'hops_over_max'],
+)
+def test_attribution_refuses_an_impossible_value(kwargs, named):
+    with pytest.raises(ValueError, match=named):
+        Attribution(**kwargs)
