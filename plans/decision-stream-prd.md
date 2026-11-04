@@ -351,9 +351,11 @@ decision is re-opened; these make the plan executable as filed.
   hang off different chains; λ carries the reify yaml, which no df worktree can write.
 - κ added: ε's live timer signal needs a host install no agent can perform.
 - γ, δ2 and ζ: no harness runs an LLM over a skill in tests, so their "dry rotation" and
-  "transcript" signals are rewritten as deterministic contract tests over the skill text and
-  the fixture fake server's accepted call shapes; the behavioural proof is η's shadow agreement,
-  θ2's count and ι. New skill tests live in `tests/scripts/` (`tests/skills/` is not under any
+  "transcript" signals are rewritten as INV-10 guards (`guards-exercise-behaviour`): marker-
+  delimited spans in each skill mirrored against their live artifact (γ: `POLICY_TABLE`; δ2:
+  δ1's CLI; ζ: the sentinel constants), and γ's example call blocks run against the fixture fake
+  server — never a regex over prose. The behavioural proof is η's shadow agreement, θ2's count
+  and ι. New skill tests live in `tests/scripts/` (`tests/skills/` is not under any
   `test_command`).
 - Same-file serialization: δ2 after γ (`skills/escalation-watcher/SKILL.md`), ε after β
   (OPERATIONS.md), θ1 after ε, θ2 after β (`dark-factory-orchestrator.yaml`).
