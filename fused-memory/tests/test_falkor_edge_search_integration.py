@@ -39,8 +39,8 @@ pytestmark = [
     pytest.mark.integration,
 ]
 
-# Large enough that stock BM25 (one index scan per hit x Entity node) overruns
-# the server TIMEOUT: measured past 1000 ms at 800 x 800.
+# Large enough that SIMILARITY_MIN_SCORE cuts the cosine ranking between the two
+# limits of test_returns_the_top_scoring_entity_edges: roughly 440 to 2000 edges.
 EDGE_COUNT = 800
 
 # Not a graphiti stopword, alphanumeric, and a single RediSearch token.
@@ -188,10 +188,18 @@ async def seed_ring(scratch, live_backend_factory) -> Callable[[int], Awaitable[
 SearchLeg = Callable[[GraphDriver], Awaitable[list[EntityEdge]]]
 
 
-async def issued_by_hardened_driver(seeded: SeededGraph, leg: SearchLeg) -> IssuedQuery:
+async def run_on_hardened_driver(
+    seeded: SeededGraph, leg: SearchLeg
+) -> tuple[list[EntityEdge], IssuedQuery]:
+    """*leg*'s rows through the hardened driver, and the one query it issued for them."""
     issued = spy_on_queries(seeded.driver)
-    await leg(seeded.driver)
+    edges = await leg(seeded.driver)
     (query,) = issued
+    return edges, query
+
+
+async def issued_by_hardened_driver(seeded: SeededGraph, leg: SearchLeg) -> IssuedQuery:
+    _, query = await run_on_hardened_driver(seeded, leg)
     return query
 
 
@@ -241,12 +249,11 @@ class TestEdgeFulltextLeg:
 
     @pytest.mark.asyncio
     async def test_returns_topology_endpoints_within_budget(self, seed_ring):
-        """The budget is work, not wall-clock: no operator yields more records than the fulltext hits."""
+        """No operator of the issued Cypher's profile yields more records than the fulltext hits."""
         seeded = await seed_ring(EDGE_COUNT)
-        leg = bm25_leg(seeded.name, 20)
 
-        edges = await leg(seeded.driver)
-        plan = await profile(seeded.graph, await issued_by_hardened_driver(seeded, leg))
+        edges, query = await run_on_hardened_driver(seeded, bm25_leg(seeded.name, 20))
+        plan = await profile(seeded.graph, query)
 
         assert len(edges) == 20
         assert returned_endpoints(edges) == seeded.seeded_endpoints(edges)

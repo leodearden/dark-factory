@@ -69,5 +69,5 @@ def scan_operators(plan: ExecutionPlan) -> list[str]:
 
 
 def peak_records_produced(plan: ExecutionPlan) -> int:
-    """The most records any one operator of a profiled *plan* produced: its work, whatever the host load."""
+    """The most records any one operator of a profiled *plan* produced."""
     return max(operation.records_produced for operation in _operations(plan))
