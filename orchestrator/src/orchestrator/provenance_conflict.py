@@ -146,6 +146,12 @@ def _record_binds(record: Any, reopen_at: object) -> bool:
     "any" agrees with "newest" without ordering the amendments.  Every
     ambiguity binds too — an unparseable ``detail``, or a recorded value that
     is absent or not a string.
+
+    Residual: refreshes share the amendment list with every other writer, and
+    ``escalation/src/escalation/amendments.py::MAX_AMENDMENTS`` sheds the
+    oldest entry, so that many foreign amendments after the newest refresh
+    shed it and a cold sink releases at the live ``reopen_at``.  Closing that
+    needs an atomic fold-plus-refresh primitive in the escalation package.
     """
     details = [getattr(record, 'detail', None)]
     details.extend(
@@ -173,7 +179,10 @@ def _refresh_folded_parent(
     the durable record would still carry only the first ``reopen_at`` and a
     cold sink would release a live hold.  The refresh is written only when
     the parent does not already bind *reopen_at*, so same-reopen repeats from
-    any writer site add nothing (INV-4).  ``amend``'s status is ignored:
+    any writer site add nothing (INV-4).  The ``get``/``amend`` pair is not
+    atomic, so two writers folding at once can each append a refresh; both
+    bind the same value, and the amendment cap bounds them.  ``amend``'s
+    status is ignored:
     ``not_pending`` / ``not_found`` mean the parent was resolved in between,
     which already released the hold.
     """
