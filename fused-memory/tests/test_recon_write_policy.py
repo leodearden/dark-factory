@@ -2500,27 +2500,29 @@ class TestGate2PendingAwaitingDependency:
         taskmaster.set_task_status.assert_not_awaited()
 
     @pytest.mark.parametrize(
-        ('statuses_kwargs', 'expected'),
-        [({'dependency_statuses': {'9739': 'pending'}}, True), ({}, False)],
+        ('statuses_kwargs', 'rejected'),
+        [({'dependency_statuses': {'9739': 'pending'}}, False), ({}, True)],
         ids=['statuses_given', 'statuses_omitted'],
     )
     @pytest.mark.asyncio
-    async def test_check_forwards_the_classified_verdict(self, monkeypatch, statuses_kwargs, expected):
-        captured: dict = {}
-        monkeypatch.setattr(
-            recon_write_policy, 'is_workflow_live_for_task', _capturing_async_detector(captured),
-        )
+    async def test_check_drops_the_lock_only_with_dependency_statuses(
+        self, monkeypatch, statuses_kwargs, rejected,
+    ):
+        self._force_orchestrator_live(monkeypatch)
 
-        await _check(
+        verdict = await _check(
             'set_task_status',
             task_id='8162',
+            project_root='/project',
+            target_status='cancelled',
             live_status='pending',
             task_metadata={'task_kind': 'normal'},
             task_snapshot=_task_8162(),
             **statuses_kwargs,
         )
 
-        assert captured['kwargs']['unclaimed_awaiting_dependency'] is expected
+        assert verdict.is_rejection is rejected
+        assert (verdict.error_type == 'ReconLiveWorkflowWriteRejected') is rejected
 
 
 class _FakeStatusReader:

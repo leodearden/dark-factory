@@ -34,13 +34,13 @@ Three independent early-return gates in :func:`check`:
    evidence for (task 3751) and an in-progress task whose only "live"
    signals are a lingering worktree registration and that same lock is
    downgraded when no fresh per-task signal corroborates it (task 2964 —
-   see :func:`check`'s Gate 2 paragraph). Those four inputs are exactly the
-   tuple ``reconciliation/live_workflow_section.py``'s
+   see :func:`check`'s Gate 2 paragraph). Those four renderer-shared inputs
+   are exactly the tuple ``reconciliation/live_workflow_section.py``'s
    ``render_live_workflow_section`` passes, which is the invariant task
    2964 exists to establish: the render-time Live-Workflow Signals section
    must never call a task not-live while this gate rejects writes to it.
-   One input is Gate-2-only (task 8330): ``dependency_statuses``, read by
-   :func:`read_dependency_statuses`, feeds the detector's rule 6. The
+   Gate 2 adds one Gate-2-only input (task 8330): ``dependency_statuses``,
+   read by :func:`read_dependency_statuses`, feeds the detector's rule 6. The
    remaining disagreement therefore runs one way only: the renderer can
    over-report such a task as live, never under-report it. Parity is task
    8385.
@@ -479,11 +479,9 @@ async def check(
     ``dependency_statuses`` (task 8330) is the ``{dep_id: status}`` map of the
     task's dependencies, normally from :func:`read_dependency_statuses`. With
     ``task_snapshot`` it feeds :func:`is_unclaimed_awaiting_dependency`, whose
-    verdict is forwarded as ``unclaimed_awaiting_dependency`` (detector rule
-    6): an unclaimed pending normal task with a positively unmet local
-    dependency is not dispatch-eligible, so the bare lock no longer rejects
-    writes to it. An absent or unreadable map, or a dependency that is
-    missing, ``'unknown'`` or merge-deferred, leaves the rule inert.
+    verdict is forwarded as ``unclaimed_awaiting_dependency`` and keys
+    detector rule 6, which drops the bare lock for a task the scheduler will
+    not dispatch. An absent or unreadable map leaves the rule inert.
 
     Gate 3 (stale snapshot, op-agnostic, checked last): ``snapshot_token is
     not None`` AND it disagrees with ``live_status`` ->

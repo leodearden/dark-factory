@@ -111,13 +111,9 @@ by direct ``get_task`` read) stalled 3+ consecutive reconciliation cycles (runs
 dispatches a task with an unmet local dependency (``Scheduler._eligible_for_dispatch``
 via ``dependency_verdict.py::deps_verdict``), so for an unclaimed pending task
 awaiting one the bare project lock cannot be evidence of a dispatch a recon
-write could race.  ``detect_live_workflow`` therefore forces ``orchestrator_live``
-to ``False`` when ``status == 'pending' AND task_kind in (None, 'normal') AND NOT
-worktree_registered AND NOT recent_commit AND unclaimed_awaiting_dependency``
-(rule 6 of :func:`_orchestrator_signal_ineligible`).  The input is classified by
-the caller with :func:`is_unclaimed_awaiting_dependency` (no claimant, no
-heartbeat, a positively unmet dependency); ``None``/``False`` leaves the detector
-unchanged.  Confirmed incident: reify tasks 8155-8165, held live by the bare lock
+write could race; rule 6 of :func:`_orchestrator_signal_ineligible` drops it,
+keyed on the caller's :func:`is_unclaimed_awaiting_dependency` verdict.
+Confirmed incident: reify tasks 8155-8165, held live by the bare lock
 alone through recon runs 1171aa98 and 276cb3b7.
 
 **Reaped worktrees and bare branches (task 2767, reify#5245).** A worktree
@@ -425,14 +421,11 @@ async def detect_live_workflow(
             per-task ``worktree_registered``/``recent_commit`` signals are
             unaffected, so a pure gate that somehow did acquire a worktree is
             still ``is_live``.
-        unclaimed_awaiting_dependency: Whether the task has no claimant, no
-            heartbeat and a positively unmet local dependency, as classified by
-            :func:`is_unclaimed_awaiting_dependency`. When ``status ==
-            'pending'`` AND ``task_kind`` is ``None`` or ``NORMAL_TASK_KIND``
-            AND there is neither a registered worktree nor a recent commit AND
-            this is truthy, ``orchestrator_live`` is forced ``False`` (rule 6,
-            task 8330): the scheduler will not dispatch the task. ``None`` (the
-            default) and ``False`` leave the rule inert.
+        unclaimed_awaiting_dependency: The caller's
+            :func:`is_unclaimed_awaiting_dependency` verdict, which keys rule 6
+            of :func:`_orchestrator_signal_ineligible` (task 8330): the
+            scheduler will not dispatch such a task. ``None`` (the default) and
+            ``False`` leave the rule inert.
         corroborated: Per-task corroboration verdict for the in-progress
             liveness gate (task 2963). Only an explicit ``False`` downgrades:
             when ``status == 'in-progress'`` AND there is no ``recent_commit``
@@ -863,7 +856,7 @@ def is_unclaimed_awaiting_dependency(task: object, dependency_statuses: object) 
 
 
 def _has_no_claimant(task: Mapping) -> bool:
-    """The "no claimant" predicate of shared/task_claimant.py::_claimant_liveness_stranded."""
+    """The negation of shared/task_claimant.py::_carries_claimant."""
     claimant = task.get('claimant_run_id')
     return claimant is None or (isinstance(claimant, str) and not claimant.strip())
 
