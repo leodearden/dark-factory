@@ -715,14 +715,22 @@ def _grep_history_argv(row: DescriptorRow, repo_root: str, since: str) -> list[s
 
 
 def _path_history_argv(row: DescriptorRow, repo_root: str, since: str) -> list[str] | None:
-    """The commits since *since* that created or deleted exactly a listed path.
+    """The commits since *since* that moved the check toward FAILING.
 
-    ``--diff-filter=AD`` is the path analogue of the pickaxe: a commit that
-    only modified the path changed nothing the check reads. Each path is
-    ``:(literal)``, the way ``ls-tree`` reads it, and everything beneath it
-    is excluded. Git records no commit creating a directory itself, so a
-    directory entry yields no commits and the probe makes no claim for it.
+    Those are deletions of a listed path for ``expect: present`` and
+    creations for any other *expect*, the reading
+    ``shared.delivered_check_polarity.interpret_path_listing`` applies. The
+    check is conjunctive, so a commit moving it toward passing (creating one
+    of several required paths, deleting one of several forbidden ones) can
+    sit beside a real defect and must not be attributed.
+
+    A commit that only modified the path changed nothing the check reads.
+    Each path is ``:(literal)``, the way ``ls-tree`` reads it, and everything
+    beneath it is excluded. Git records no commit creating a directory
+    itself, so a directory entry yields no commits and the probe makes no
+    claim for it.
     """
+    undoing_filter = "D" if row.expect == "present" else "A"
     pathspecs = [
         spec
         for path in row.paths
@@ -730,7 +738,7 @@ def _path_history_argv(row: DescriptorRow, repo_root: str, since: str) -> list[s
     ]
     return [
         "git", "-C", repo_root, "log", "--format=%s",
-        f"--since={since}", "--diff-filter=AD", "--", *pathspecs,
+        f"--since={since}", f"--diff-filter={undoing_filter}", "--", *pathspecs,
     ]
 
 
@@ -793,7 +801,8 @@ def find_superseding_task(
     merge to it.
 
     A grep row's probe is the regex pickaxe (:func:`_grep_history_argv`). A
-    path row's is the commits that created or deleted exactly a listed path
+    path row's is the commits that deleted (expect=present) or created (any
+    other expect) exactly a listed path
     (:func:`_path_history_argv`); it needs no manifest exclusion, because it
     names explicit paths rather than searching contents.
     """
