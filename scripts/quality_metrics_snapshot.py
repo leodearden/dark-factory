@@ -996,6 +996,11 @@ _PAIR_MOVED = (
 )
 _PAIR_ADDED = '; total up: complexity added'
 _CROSSING_LABEL = 'measure per heuristic 14, not a target'
+_PARAMS_DIFFER = 'params differ: '
+_NOT_ATTRIBUTABLE = (
+    'not attributable to code: a delta below may come from the params change, not from the code'
+)
+_UNKNOWN = 'unknown'
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1069,6 +1074,36 @@ def _record_pairs(
     pairs += [(path, None, now[path]) for path in pairing.added if path in now]
     pairs += [(path, before[path], None) for path in pairing.removed if path in before]
     return sorted(pairs, key=lambda pair: pair[0])
+
+
+def _param_rendered(snapshot: Mapping[str, Any], key: str) -> str:
+    """*key*'s value as JSON, or bare unknown when *snapshot*'s schema does not record it."""
+    if key not in _SCHEMAS[snapshot['schema_version']].params.fields:
+        return _UNKNOWN
+    return json.dumps(snapshot['params'][key], sort_keys=True)
+
+
+#: Every params key a read schema records, so a key neither side records still reads unknown.
+_PARAMS_KEYS = tuple(sorted({key for schema in _SCHEMAS.values() for key in schema.params.fields}))
+
+
+def _params_entries(current: Mapping[str, Any], previous: Mapping[str, Any]) -> list[str]:
+    """Every params key unknown on either side or differing, sorted: unknown never equals unknown."""
+    renderings = (
+        (key, _param_rendered(previous, key), _param_rendered(current, key)) for key in _PARAMS_KEYS
+    )
+    return [
+        f'{key} {before} -> {after}'
+        for key, before, after in renderings
+        if _UNKNOWN in (before, after) or before != after
+    ]
+
+
+def _params_lines(current: Mapping[str, Any], previous: Mapping[str, Any]) -> list[str]:
+    entries = _params_entries(current, previous)
+    if not entries:
+        return []
+    return [_PARAMS_DIFFER + '; '.join(entries), f'  {_NOT_ATTRIBUTABLE}']
 
 
 def _header(label: str, snapshot: Mapping[str, Any]) -> str:
@@ -1191,10 +1226,15 @@ def _diff_section(header: str, entries: Sequence[str]) -> list[str]:
 
 
 def diff_lines(current: Mapping[str, Any], previous: Mapping[str, Any]) -> list[str]:
-    """What moved from *previous* to *current*: measures and their changes, never a verdict."""
+    """What moved from *previous* to *current*: measures and their changes, never a verdict.
+
+    When a params key differs or is unknown on either side, a params-differ line
+    and its not-attributable label come first.
+    """
     pairing = _pairing(current, previous)
     pairs = _record_pairs(pairing, current, previous)
     return [
+        *_params_lines(current, previous),
         _header('current', current),
         _header('previous', previous),
         *_diff_section('unreadable (measures unknown, never zero):', _unreadable_entries(current, previous)),
