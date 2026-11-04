@@ -121,8 +121,7 @@ class TestDetectVerifyBaseDivergence:
 
     async def test_divergence_is_immutable(self, config: OrchestratorConfig) -> None:
         divergence = _divergence(config)
-        with pytest.raises(dataclasses.FrozenInstanceError):
-            divergence.base_sha = 'other'  # type: ignore[misc]
+        pytest.raises(dataclasses.FrozenInstanceError, setattr, divergence, 'base_sha', 'other')
 
     async def test_wire_form_is_json_with_exactly_the_record_fields(
         self, config: OrchestratorConfig,
