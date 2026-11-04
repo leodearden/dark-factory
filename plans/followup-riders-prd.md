@@ -911,3 +911,55 @@ corroboration to `rider_of == host_id` alone, moving the `status == pending` tes
 `host_stalled` arm, so a rider a human deferred still has `rider_of` and the host edge cleared
 when its host lands or fails (rows 8f, 13h, 13r), and the promotion guard is registered explicitly
 in `server/main.py` rather than at `rider_carry.py` import time.
+
+## Decompose record (2026-11-04)
+
+Decomposed against main `c393a67c54` by the PRD 3 decompose seat. The manifest and sidecar were committed
+at `8bba1402ab` and the stamped sidecar at `59ac0ac4ba`, both as
+`plans/followup-riders-prd.capability-manifest.{md,yaml}`, with `signal_leaves: [γ]`. There are 41 grep
+checks (no `script`, no `path`) and 5 manual ones. The local polarity lint returned 0 findings.
+
+| label | id | prereqs (edges) | prio |
+|---|---|---|---|
+| α | 8438 | 8417 (PRD 1 ε) | high |
+| β | 8439 | 8438, 8414 (PRD 1 β) | high |
+| γ | 8440 | 8439, 8418 (PRD 1 ζ); **PRD 2 P1 pending** | high |
+| δ | 8441 | 8440; `milestone {delayed, 1209600}` (clock starts at γ's landing) | low |
+
+Edges: 3 intra-batch, 3 out-of-batch. Every task is `task_kind="normal"` and pending. No task depends on
+a blocked task. `commit_planning` stamped α, β, γ and δ with no missing labels or errors.
+
+**Pending edge.** PRD 2 (`plans/followup-packing-sweep-prd.md`) is not committed or decomposed, so the
+§7 edge γ → PRD 2 P1 is not wired. Add `add_dependency(8440, <P1 id>)` once PRD 2 is filed. Until then,
+the manifest's γ carry-clock row stays OPEN, and 8440's description tells γ to escalate if
+`RIDER_RESERVE_DAYS` is absent.
+
+**Resolved at decompose** (no contract change):
+
+1. No leaf owned turning observe mode on (`defaults.yaml` keeps `enabled: false`), so δ's observe series
+   could never be written. α (8438) now commits `riders: {enabled: true, mode: observe}` to
+   `dark-factory-orchestrator.yaml`. The `shadow` and `offer` flips stay Leo's. Reify needs the same stanza
+   in its own config, by an operator; until then δ's reify series reads "producer has not written".
+2. Name corrections:
+   - the narrowing pass is `TaskWorkflow._try_narrow_plan` (§2, §3 decision 9, §9 question 2 say
+     `_run_plan_tightening`);
+   - `RiderWriteAuthorityError` subclasses `TaskmasterError` in `backends/task_backend_errors.py`, because
+     there is no `TaskBackendError`;
+   - in `_plan`, `lock_plan` runs before `_reconcile_plan_scope`, so decision 1's offer call sits after the
+     lock, which is harmless (§2).
+3. Design notes carried into the descriptions:
+   - β samples shadow mode with a stable digest of `(run_id, host)`, not the per-process salted `hash()`;
+   - α runs the PRD-host check only on subset-passing riders (INV-8);
+   - γ runs its git calls through the non-blocking provenance path (INV-8).
+
+G7: no waivers. §6 records none, and the re-walk found no unresolved hit.
+
+**Companion corrections:**
+
+- 8418's description now carries the generic `register_promotion_guard` hook. It uses no rider
+  vocabulary and has zero registrants; 8440 is the only registrant.
+- 3260, 6072 and 6322 carry riders notes in their `details`.
+- Left as doc edits for the lead:
+  - the one-sentence rider seam in `plans/cancel-with-children-prd.md` §4.2. γ's description says it may
+    already be present;
+  - PRD 2's two decision-8 sentences.
