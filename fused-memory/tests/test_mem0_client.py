@@ -3,12 +3,14 @@
 import asyncio
 import contextlib
 import logging
+from collections.abc import Iterator
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
 from _fm_helpers import QDRANT_URL, collection_vector_size, qdrant_skipif
 from _qdrant_responses import missing_collection_404
+from _stub_qdrant_server import stub_qdrant_server
 from mem0 import AsyncMemory
 from mem0.configs.base import MemoryConfig
 from qdrant_client import QdrantClient
@@ -3269,12 +3271,14 @@ class TestBuildConfigDictEndpointPlumbing:
 
 
 @pytest.fixture
-def mem0_built_from(monkeypatch) -> list[dict]:
+def mem0_built_from(monkeypatch, mock_config) -> Iterator[list[dict]]:
     """Every config dict mem0 is built from, captured at mem0's own boundary.
 
     The recorder hands back a double whose ``add`` answers the way mem0's does,
-    so the public ``Mem0Backend.add`` runs end to end with no Qdrant and no
-    OpenAI.
+    so the public ``Mem0Backend.add`` runs end to end with no OpenAI.
+    Mem0Backend provisions its collection itself before mem0 is built, so a
+    local stub Qdrant (tests/_stub_qdrant_server.py) answers that and no test
+    reaches a live Qdrant.
     """
     captured: list[dict] = []
 
@@ -3287,7 +3291,9 @@ def mem0_built_from(monkeypatch) -> list[dict]:
         return _BuiltInstance()
 
     monkeypatch.setattr(AsyncMemory, 'from_config', classmethod(_record))
-    return captured
+    with stub_qdrant_server() as stub:
+        mock_config.mem0.qdrant_url = stub.url
+        yield captured
 
 
 class TestMem0HistoryPersistence:
