@@ -2257,6 +2257,22 @@ class EscalationQueue:
                 )
             return esc
 
+    def _load_root_pending(self, escalation_id: str) -> Escalation | None:
+        """The pending record at the queue root, or ``None`` when absent, unparsable or not pending.
+
+        Never falls back to the archive, so a caller that rewrites the result
+        cannot resurrect an archived record. Call it under ``escalation_id_lock``.
+        """
+        path = self.queue_dir / f'{escalation_id}.json'
+        if not path.exists():
+            return None
+        try:
+            esc = Escalation.from_json(path.read_text())
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            logger.warning(f'Failed to parse escalation {escalation_id}: {e}')
+            return None
+        return esc if esc.status == 'pending' else None
+
     def stamp_triage(
         self, escalation_id: str, *, triaged_by: str | None = None, triage_note: str = '',
     ) -> Escalation | None:
@@ -2301,16 +2317,8 @@ class EscalationQueue:
         (archived/resolved/dismissed).
         """
         with escalation_id_lock(self.queue_dir, escalation_id):
-            path = self.queue_dir / f'{escalation_id}.json'
-            if not path.exists():
-                return None
-            try:
-                esc = Escalation.from_json(path.read_text())
-            except (json.JSONDecodeError, KeyError, TypeError) as e:
-                logger.warning(f'Failed to parse escalation {escalation_id}: {e}')
-                return None
-
-            if esc.status != 'pending':
+            esc = self._load_root_pending(escalation_id)
+            if esc is None:
                 return None
 
             esc.triaged_at = datetime.now(UTC).isoformat()
@@ -2342,16 +2350,8 @@ class EscalationQueue:
         ``triaged_at``'s.
         """
         with escalation_id_lock(self.queue_dir, escalation_id):
-            path = self.queue_dir / f'{escalation_id}.json'
-            if not path.exists():
-                return ClaimResult(record=None, refusal=None)
-            try:
-                esc = Escalation.from_json(path.read_text())
-            except (json.JSONDecodeError, KeyError, TypeError) as e:
-                logger.warning(f'Failed to parse escalation {escalation_id}: {e}')
-                return ClaimResult(record=None, refusal=None)
-
-            if esc.status != 'pending':
+            esc = self._load_root_pending(escalation_id)
+            if esc is None:
                 return ClaimResult(record=None, refusal=None)
             refusal = refuse(esc)
             if refusal is not None:
@@ -2492,16 +2492,8 @@ class EscalationQueue:
         *declared_by* normalises to nothing new.
         """
         with escalation_id_lock(self.queue_dir, escalation_id):
-            path = self.queue_dir / f'{escalation_id}.json'
-            if not path.exists():
-                return None
-            try:
-                esc = Escalation.from_json(path.read_text())
-            except (json.JSONDecodeError, KeyError, TypeError) as e:
-                logger.warning(f'Failed to parse escalation {escalation_id}: {e}')
-                return None
-
-            if esc.status != 'pending':
+            esc = self._load_root_pending(escalation_id)
+            if esc is None:
                 return None
 
             existing = list(esc.pin_declared_by)
