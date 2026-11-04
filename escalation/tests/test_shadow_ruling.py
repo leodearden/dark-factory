@@ -1352,10 +1352,20 @@ def _done_flip_ruling() -> ShadowRuling:
 class TestPolicyTableLockstep:
     """The shadow vocabulary is the policy table's, not a second enumeration
     (plans/decision-stream-prd.md §5.1): every class the table names can be
-    stamped, and every action a stamp proposes is an act the table knows."""
+    stamped, and every action a stamp proposes is an act the table knows.
+    FIRST_TRANCHE_CLASSES equal to the table's slugs is held by
+    tests/scripts/test_shadow_ruling_doc_contract.py."""
 
-    def test_first_tranche_classes_are_the_policy_table_slugs(self):
-        assert frozenset(row.policy_class for row in POLICY_TABLE) == FIRST_TRANCHE_CLASSES
+    # Rows whose every act the codec refuses to stamp. Exact, so the set can
+    # neither grow silently nor outlive the ruling that empties it.
+    _UNSTAMPABLE_ROWS = frozenset({'completion_claim_true'})  # debt: ticket tkt_0RWKR1BTXVXB9Q06EQ0K3WQE0G
+
+    def test_every_row_has_an_act_a_stamp_may_propose(self):
+        unstampable = frozenset(
+            row.policy_class for row in POLICY_TABLE
+            if not {str(action) for action in row.actions} & REVERSIBLE_ACTIONS
+        )
+        assert unstampable == self._UNSTAMPABLE_ROWS
 
     def test_done_flip_is_a_reversible_action(self):
         """PRD §3 decision 7: done_flip is waived reversible (Leo, 2026-11-04)."""

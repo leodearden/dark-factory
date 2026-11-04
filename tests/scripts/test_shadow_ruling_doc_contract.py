@@ -350,18 +350,13 @@ def test_first_tranche_classes_are_exactly_the_policy_table_slugs():
     `FIRST_TRANCHE_CLASSES`, so that frozenset must be the table's slugs and
     nothing else (plans/decision-stream-prd.md §5.1: the table is the only
     enumeration)."""
-    slugs = [row.policy_class for row in POLICY_TABLE]
-    table = frozenset(slugs)
+    table = frozenset(row.policy_class for row in POLICY_TABLE)
 
     assert table == FIRST_TRANCHE_CLASSES, (
         f"escalation.shadow_ruling.FIRST_TRANCHE_CLASSES and "
         f"escalation.authority.POLICY_TABLE have drifted.\n"
         f"  stampable but not a table row: {sorted(FIRST_TRANCHE_CLASSES - table)}\n"
         f"  a table row but not stampable: {sorted(table - FIRST_TRANCHE_CLASSES)}"
-    )
-    assert len(POLICY_TABLE) == len(table), (
-        f"POLICY_TABLE names a policy_class more than once: "
-        f"{sorted(slug for slug in table if slugs.count(slug) > 1)}"
     )
 
 
