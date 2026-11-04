@@ -5,8 +5,9 @@ decides whether the executor may act on or claim a record, and whether the
 coordinator must wait for an executor claim. This module reads the queue's
 class switches (``escalation.policy_state``), asks those questions, and shapes
 each answer as the dict ``resolve_issue`` or ``claim_policy_class`` returns.
-Apart from that state-file read and the claim write through
-``EscalationQueue.claim_policy_class``, every function here is pure.
+:func:`perform_claim` is the one function here that writes: it stamps the
+claim through ``EscalationQueue.claim_policy_class``. The rest read the state
+file at most.
 """
 
 from __future__ import annotations
@@ -108,7 +109,7 @@ def _claim_refused(refusal: PolicyRefusal, existing: Escalation) -> dict[str, An
     return payload
 
 
-def claim_payload(
+def perform_claim(
     queue: EscalationQueue,
     *,
     identity: str | None,
@@ -118,7 +119,11 @@ def claim_payload(
     queue_kind: QueueKind,
     now: datetime,
 ) -> dict[str, Any]:
-    """``claim_policy_class``'s answer: the claimed record, or why it was refused."""
+    """Stamp the executor's claim on the record, then answer ``claim_policy_class``.
+
+    The answer is the claimed record, or why the claim was refused and nothing
+    was written.
+    """
     if identity != EXECUTOR_IDENTITY:
         return _level_forbidden(f'only {EXECUTOR_IDENTITY} may claim a policy class')
     try:

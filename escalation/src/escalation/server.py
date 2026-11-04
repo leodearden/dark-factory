@@ -90,7 +90,7 @@ from escalation.models import (
 )
 from escalation.note_to_file import file_note_to_file, note_to_file_refusal
 from escalation.pins import classify_pins
-from escalation.policy_gate import claim_payload, identity_resolve_refusal, queue_kind_of
+from escalation.policy_gate import identity_resolve_refusal, perform_claim, queue_kind_of
 from escalation.project_root_guard import ProjectRootGuard
 from escalation.queue import AmendmentOutcome, EscalationQueue, blank_resolve_outcome
 from escalation.queue import observed_submit_response as _observed_submit_response
@@ -2418,6 +2418,13 @@ def create_server(
         (``authority.COORDINATOR_IDENTITY``) gets ``claimed_by_executor`` on a
         record carrying a fresh executor claim.  Both answers are shaped by
         ``escalation/src/escalation/policy_gate.py::identity_resolve_refusal``.
+        Both gates judge a SNAPSHOT: the record as read before the per-id
+        lock, and the class switches as read before ``queue.resolve`` takes
+        it.  A claim landing, or a class leaving live, inside that window is
+        not seen, so the executor/coordinator disjointness is advisory, not
+        strict.  Making it strict means re-checking under
+        ``escalation_id_lock`` inside ``queue.resolve``, as
+        ``EscalationQueue.claim_policy_class``'s *refuse* callback does.
 
         **Resolution text** reaches the agent only on the L0 live-resume path
         (``action='resume'``).  For all other actions the text is stored on the
@@ -3287,7 +3294,7 @@ def create_server(
         ``level_forbidden``.  A claim expires ``authority.CLAIM_TTL`` after
         ``claimed_at``.  ``stamp_triage`` stays ungated.
         """
-        return claim_payload(
+        return perform_claim(
             queue,
             identity=get_http_headers().get(_IDENTITY_HEADER),
             escalation_id=escalation_id,
