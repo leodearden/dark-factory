@@ -55,7 +55,7 @@ from _merge_lane_fakes import FakeClock, FakeVerifier, lane_scene_config, make_l
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, MergeResult, _run
-from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.types import InflightStatus, QueuedBranch
 from orchestrator.merge_lane.worker import (
     DecidedItem,
     InflightEntry,
@@ -1251,6 +1251,97 @@ class TestFinalizingHeadInFrozenPrefix:
         assert item_g.request.request_id in fp, (
             f"gate_reverify-phase _finalizing_head missing from frozen_prefix(): {fp!r}"
         )
+
+    @pytest.mark.parametrize('status', [InflightStatus.REQUEUED, InflightStatus.DROPPED])
+    @pytest.mark.parametrize(
+        'then', [None, ItemLifecycleState.FINALIZING], ids=['verifying', 'finalizing'],
+    )
+    async def test_vacated_finalizing_head_is_not_frozen(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+        status: InflightStatus,
+        then: ItemLifecycleState | None,
+    ) -> None:
+        """A vacated finalize head is not frozen, whatever its phase (task 5302).
+
+        Its verify requeued or dropped the request and released the lease
+        (task 4582); only the head-of-line finalize remains.  Counting it is
+        the PRD §5.3 class-(a) phantom frozen tip.
+        """
+        worker = _make_worker(git_ops)
+        _, item_h = _make_fake_item('t-h', base_sha='main0', merge_commit='phantom-c',
+                                    config=config, git_repo=git_repo)
+        entry_h = dataclasses.replace(_make_inflight_entry(item_h), status=status)
+        _seed_finalizing_head(worker, entry_h, then=then)
+
+        assert worker.frozen_prefix() == ()
+        assert worker.snapshot()['frozen_prefix']['request_ids'] == []
+        assert worker.frozen_prefix_tip('main0') == 'main0'
+
+    async def test_vacated_finalizing_head_yields_to_live_deque_entry(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """Behind a vacated finalize head, the live deque entry is the whole prefix."""
+        worker = _make_worker(git_ops)
+        _, item_h = _make_fake_item('t-h', base_sha='main0', merge_commit='phantom-c',
+                                    config=config, git_repo=git_repo)
+        _, item_e = _make_fake_item('t-e', base_sha='main0', merge_commit='sha-Ec',
+                                    config=config, git_repo=git_repo)
+        entry_h = dataclasses.replace(
+            _make_inflight_entry(item_h), status=InflightStatus.REQUEUED,
+        )
+        _seed_finalizing_head(worker, entry_h)
+        _seed_frozen(worker, _make_inflight_entry(item_e))
+
+        assert worker.frozen_prefix() == (item_e.request.request_id,)
+        assert worker.frozen_prefix_tip('main0') == 'sha-Ec'
+
+    async def test_phantom_finalize_head_does_not_poison_the_dispatch_guard(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Replay of PRD §5.3 class (a): 2026-08-08, tasks 5687/5830.
+
+        A requeued head's dead merge commit stayed the frozen tip, so a later
+        dispatch on correct main warned.  With the head vacated the tip is
+        main, and the same dispatch is silent.
+        """
+        import logging
+
+        worker = _make_worker(git_ops)
+        _, item_h = _make_fake_item('t-5687', base_sha='main0', merge_commit='phantom-c',
+                                    config=config, git_repo=git_repo)
+        entry_h = dataclasses.replace(
+            _make_inflight_entry(item_h), status=InflightStatus.REQUEUED,
+        )
+        _seed_finalizing_head(worker, entry_h, then=ItemLifecycleState.FINALIZING)
+        _, item_c = _make_fake_item('t-5830', base_sha='main0', merge_commit='sha-Cc',
+                                    config=config, git_repo=git_repo)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
+            _guard_warn(worker, item_c, 'main0')
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warnings == []
+
+    async def test_live_finalizing_head_is_still_frozen(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """CONTROL: a finalize head that was not vacated stays frozen."""
+        worker = _make_worker(git_ops)
+        _, item_h = _make_fake_item('t-h', base_sha='main0', merge_commit='sha-Hc',
+                                    config=config, git_repo=git_repo)
+        _seed_finalizing_head(
+            worker, _make_inflight_entry(item_h), then=ItemLifecycleState.FINALIZING,
+        )
+
+        assert worker.frozen_prefix() == (item_h.request.request_id,)
+        assert worker.frozen_prefix_tip('main0') == 'sha-Hc'
 
 
 # ── Amendment: _dispatch_item guard wiring tests (review suggestion) ──────────
