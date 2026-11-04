@@ -11,6 +11,7 @@ import copy
 import dataclasses
 import json
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -151,7 +152,7 @@ class TestTheHeader:
         out = tmp_path / 'out' / 'snapshot.json'
         assert _run(root, out) == 0
         measured = json.loads(out.read_text(encoding='utf-8'))
-        assert measured['schema_version'] == 2
+        assert measured['schema_version'] == 3
         assert measured['instrument'] == 'quality-metrics-snapshot'
         assert measured['run_id'] == 'run-1'
         assert measured['as_of_sha'] == git(root, 'rev-parse', 'HEAD').strip()
@@ -162,11 +163,25 @@ class TestTheHeader:
         assert evidence['complete'] is True
         wall_clock = measured['cost']['wall_clock_s']
         assert isinstance(wall_clock, float) and wall_clock >= 0
+        assert list(measured['params']) == [
+            'complexipy_version', 'python_version', 'instrument',
+            'h14_soft_ceiling_lines', 'h14_alarm_lines',
+        ]
         assert measured['params'] == {
             'complexipy_version': source_measures.complexipy_version(),
+            'python_version': platform.python_version(),
+            'instrument': {
+                'quality_metrics_snapshot': _blob_on_disk('scripts/quality_metrics_snapshot.py'),
+                'source_measures': _blob_on_disk('scripts/source_measures.py'),
+            },
             'h14_soft_ceiling_lines': 1500,
             'h14_alarm_lines': 2000,
         }
+
+
+def _blob_on_disk(relpath: str) -> str:
+    """The running instrument file's blob id: hash-object, so an uncommitted edit still agrees."""
+    return git(REPO_ROOT, 'hash-object', '--', relpath).strip()
 
 
 class TestFileRecords:
@@ -301,6 +316,7 @@ class TestTheCommandLine:
             pytest.param(['--out', 'x.json'], id='out-without-run-id'),
             pytest.param(['--current', 'a.json'], id='current-without-diff'),
             pytest.param(['--summary', 'a.json', '--run-id', 'r'], id='summary-with-run-id'),
+            pytest.param(['--params', '--run-id', 'r'], id='params-with-run-id'),
             pytest.param([], id='no-mode'),
         ],
     )
@@ -308,6 +324,18 @@ class TestTheCommandLine:
         with pytest.raises(SystemExit) as raised:
             snapshot.main(argv)
         assert raised.value.code == 2
+
+
+class TestTheParamsMode:
+    def test_it_prints_the_params_a_measurement_records_as_one_json_line(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        recorded = _measured(tmp_path, _BASE)['params']
+        capsys.readouterr()
+        assert snapshot.main(['--params']) == 0
+        printed = capsys.readouterr().out.splitlines()
+        assert len(printed) == 1
+        assert json.loads(printed[0]) == recorded
 
 
 # ---------------------------------------------------------------------------
@@ -1026,9 +1054,17 @@ class TestImportGraphChanges:
         ]
 
 
+def _as_schema_2(taken: dict[str, Any]) -> dict[str, Any]:
+    """What a pre-8463 measurement of the same tree recorded: no python_version or instrument params."""
+    old = copy.deepcopy(taken)
+    old['schema_version'] = 2
+    del old['params']['python_version'], old['params']['instrument']
+    return old
+
+
 def _as_schema_1(taken: dict[str, Any]) -> dict[str, Any]:
     """What a pre-6612 measurement of the same tree recorded, e.g. plans/quality-metrics/review-all-dark_factory-20261008.json."""
-    old = copy.deepcopy(taken)
+    old = _as_schema_2(taken)
     old['schema_version'] = 1
     graph = old['import_graph']
     del graph['hidden_cycles'], graph['typing_cycles']
@@ -1107,14 +1143,42 @@ class TestASchema1SnapshotIsStillRead:
 
     def test_an_unread_version_is_refused_naming_the_read_ones(self, taken: dict[str, Any]) -> None:
         with pytest.raises(source_measures.MetricsError) as raised:
-            snapshot.validate_snapshot({**taken, 'schema_version': 3}, origin='v3')
-        assert 'schema_version is 3' in str(raised.value)
-        assert 'one of [1, 2]' in str(raised.value)
+            snapshot.validate_snapshot({**taken, 'schema_version': 4}, origin='v4')
+        assert 'schema_version is 4' in str(raised.value)
+        assert 'one of [1, 2, 3]' in str(raised.value)
 
     def test_the_instrument_is_checked_before_the_version(self) -> None:
         with pytest.raises(source_measures.MetricsError) as raised:
             snapshot.validate_snapshot({'schema_version': 7, 'instrument': 'other'}, origin='foreign')
         assert 'instrument' in str(raised.value)
+
+
+class TestASchema2SnapshotIsStillRead:
+    @pytest.fixture
+    def taken(self, tmp_path: Path) -> dict[str, Any]:
+        return _measured(tmp_path, _GRAPH)
+
+    def test_it_is_valid(self, taken: dict[str, Any]) -> None:
+        old = _as_schema_2(taken)
+        assert snapshot.validate_snapshot(old, origin='v2') == old
+
+    @pytest.mark.parametrize(
+        ('version', 'dropped'),
+        [
+            pytest.param(2, 'instrument', id='schema-2-carrying-python_version'),
+            pytest.param(2, 'python_version', id='schema-2-carrying-instrument'),
+            pytest.param(3, 'instrument', id='schema-3-lacking-instrument'),
+        ],
+    )
+    def test_params_of_another_schema_are_refused(
+        self, taken: dict[str, Any], version: int, dropped: str
+    ) -> None:
+        edited = copy.deepcopy(taken)
+        edited['schema_version'] = version
+        del edited['params'][dropped]
+        with pytest.raises(source_measures.MetricsError) as raised:
+            snapshot.validate_snapshot(edited, origin='edited')
+        assert 'params keys' in str(raised.value)
 
 
 _COUPLING_BEFORE = 'from pkg import mod\n\ndef test_it():\n    assert mod._y\n'
@@ -1561,7 +1625,7 @@ class TestABadPreviousSnapshotIsRefusedBeforeMeasuring:
         assert _run(root, measured) == 0
         previous = tmp_path / 'previous.json'
         previous.write_text(
-            json.dumps({**json.loads(measured.read_text(encoding='utf-8')), 'schema_version': 3}),
+            json.dumps({**json.loads(measured.read_text(encoding='utf-8')), 'schema_version': 4}),
             encoding='utf-8',
         )
         capsys.readouterr()
