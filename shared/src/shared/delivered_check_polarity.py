@@ -841,13 +841,16 @@ def _grep_matches(
 ) -> list[_GrepMatch] | None:
     """The match SITES for a check. ``None`` means git could not answer.
 
-    ``-n`` is INSERTED into the argv :func:`build_grep_argv` returns rather
-    than a second argv being assembled here: the pattern's ``-e``
+    ``-n -z`` is INSERTED into the argv :func:`build_grep_argv` returns
+    rather than a second argv being assembled here: the pattern's ``-e``
     separator, the ``--`` pathspec placement and the ref position all stay
     owned by the one builder, so a refinement can never search a different
     corpus than the verdict it is refining (module docstring, PARITY
     CONTRACT). ``argv.index('-E')`` finds the FLAG even when the pattern is
     itself the literal ``'-E'``, since the flag precedes the pattern.
+    ``-z`` NUL-terminates the name and line number, so a ``:`` in a path
+    cannot split a record and names arrive unquoted (see
+    :func:`_parse_grep_records`).
 
     ``None`` (not ``[]``) for an unanswerable question is the load-bearing
     distinction: ``[]`` would read as "matches, but none of them are
@@ -855,7 +858,8 @@ def _grep_matches(
     rejection.
     """
     argv = build_grep_argv(pattern, paths, project_root=repo_root, ref=ref)
-    argv.insert(argv.index('-E'), '-n')
+    flag = argv.index('-E')
+    argv[flag:flag] = ['-n', '-z']
     try:
         completed = subprocess.run(
             argv, capture_output=True, text=True, timeout=timeout_secs
@@ -864,16 +868,26 @@ def _grep_matches(
         return None
     if completed.returncode >= 2:
         return None
+    return _parse_grep_records(completed.stdout, prefix=f'{ref}:')
 
-    prefix = f'{ref}:'
+
+def _parse_grep_records(stdout: str, *, prefix: str) -> list[_GrepMatch]:
+    """``<ref>:<path> NUL <n> NUL <text>`` records, one per line, path
+    unquoted.
+
+    A record this parser cannot read — including git's localized
+    ``Binary file ... matches`` notice, which carries no NUL — degrades to
+    "no refinement", never to a wrong one. Splitting at the first two NULs
+    only leaves a NUL inside the matched text intact.
+    """
     matches: list[_GrepMatch] = []
-    for record in completed.stdout.splitlines():
-        rest = record[len(prefix):] if record.startswith(prefix) else record
-        path, _, remainder = rest.partition(':')
-        line_no, _, text = remainder.partition(':')
-        if not path or not line_no.isdigit():
-            # A record this parser cannot read degrades to "no refinement",
-            # never to a wrong one.
+    for record in stdout.split('\n'):
+        fields = record.split('\0', 2)
+        if len(fields) != 3:
+            continue
+        located, line_no, text = fields
+        path = located[len(prefix):]
+        if not located.startswith(prefix) or not path or not line_no.isdigit():
             continue
         matches.append(_GrepMatch(path=path, line_no=int(line_no), text=text))
     return matches
