@@ -122,3 +122,35 @@ async def test_concurrent_first_calls_for_one_project_provision_once(config, tar
             results = await asyncio.gather(backend.get(MEMORY_ID, SCOPE), backend.get(MEMORY_ID, SCOPE))
             assert results == [None, None]
         assert stub.creates(target) == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_first_calls_share_one_failed_create_and_the_next_call_retries(config, target):
+    with stub_qdrant_server(create_status={target: 500}) as stub:
+        async with backend_against(stub.url, config) as backend:
+            results = await asyncio.gather(
+                backend.get(MEMORY_ID, SCOPE), backend.get(MEMORY_ID, SCOPE), return_exceptions=True,
+            )
+            assert [type(result) for result in results] == [UnexpectedResponse, UnexpectedResponse]
+            assert stub.creates(target) == 1
+            with pytest.raises(UnexpectedResponse):
+                await backend.get(MEMORY_ID, SCOPE)
+            assert stub.creates(target) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_first_caller_leaves_the_shared_creation_running_for_the_others(config, target):
+    with stub_qdrant_server(create_delay_s={target: 10.0}) as stub:
+        async with backend_against(stub.url, config) as backend:
+            first = asyncio.create_task(backend.get(MEMORY_ID, SCOPE))
+            second = asyncio.create_task(backend.get(MEMORY_ID, SCOPE))
+            async with asyncio.timeout(10):
+                while stub.creates(target) == 0:
+                    await asyncio.sleep(0.01)
+            first.cancel()
+            stub.release_event.set()
+            assert await second is None
+            with pytest.raises(asyncio.CancelledError):
+                await first
+        assert stub.creates(target) == 1
+        assert stub.exists_checks(target) == 1
