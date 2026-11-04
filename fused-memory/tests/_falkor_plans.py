@@ -1,9 +1,11 @@
 """Pin the FalkorDB plan shape of the Cypher graphiti issues.
 
 ``spy_on_queries`` captures the Cypher a live driver issues, ``explain`` asks
-FalkorDB how it would plan one captured query, ``non_leaf_scans`` reads the
-structured plan for scans that re-execute once per input row, and
-``scan_operators`` lists every scan the plan runs.
+FalkorDB how it would plan one captured query, ``profile`` runs a captured
+query under GRAPH.PROFILE, ``non_leaf_scans`` reads the structured plan for
+scans that re-execute once per input row, ``scan_operators`` lists every scan
+the plan runs, and ``peak_records_produced`` reads the most records any
+operator of a profiled plan produced.
 """
 
 from __future__ import annotations
@@ -30,9 +32,18 @@ def spy_on_queries(driver: GraphDriver) -> list[IssuedQuery]:
     return issued
 
 
+def _server_params(query: IssuedQuery) -> dict[str, Any]:
+    """*query*'s params as FalkorDB takes them: graphiti's driver-side routing_ hint dropped."""
+    return {key: value for key, value in query.params.items() if key != 'routing_'}
+
+
 async def explain(graph: AsyncGraph, query: IssuedQuery) -> ExecutionPlan:
-    params = {key: value for key, value in query.params.items() if key != 'routing_'}
-    return await graph.explain(query.cypher, params)
+    return await graph.explain(query.cypher, _server_params(query))
+
+
+async def profile(graph: AsyncGraph, query: IssuedQuery) -> ExecutionPlan:
+    """Run *query* under GRAPH.PROFILE: its plan, with the records each operator produced."""
+    return await graph.profile(query.cypher, _server_params(query))
 
 
 def _operations(plan: ExecutionPlan) -> Iterator[Operation]:
@@ -55,3 +66,8 @@ def non_leaf_scans(plan: ExecutionPlan) -> list[str]:
 def scan_operators(plan: ExecutionPlan) -> list[str]:
     """Every scan operator in *plan*, leaf or not."""
     return [operation.name for operation in _operations(plan) if operation.name.endswith('Scan')]
+
+
+def peak_records_produced(plan: ExecutionPlan) -> int:
+    """The most records any one operator of a profiled *plan* produced: its work, whatever the host load."""
+    return max(operation.records_produced for operation in _operations(plan))
