@@ -273,18 +273,19 @@ class TestAcquireLineage:
         assert 'canned get_tasks read timeout' in datum.reason
 
     async def test_a_slow_first_read_answers_within_the_wait_then_lands_single_flight(
-        self, dummy_client, dummy_config, quick_waits,
+        self, dummy_client, dummy_config, quick_waits, monkeypatch,
     ):
-        canned = CannedMCP(_rows(), projection_delay=0.15)
+        monkeypatch.setattr(task_lineage, 'LINEAGE_READ_TIMEOUT', 5.0)
+        canned = CannedMCP(_rows(), projection_delay=0.5)
         with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
             loop = asyncio.get_running_loop()
             started = loop.time()
             pending = await acquire_lineage(dummy_client, dummy_config, ROOT, now=T0)
-            assert loop.time() - started < 0.15
+            assert loop.time() - started < 0.4
             assert pending.state is DatumState.UNKNOWN
             assert pending.reason is not None
             assert 'in flight' in pending.reason
-            await asyncio.sleep(0.25)
+            await asyncio.sleep(0.6)
             landed = await acquire_lineage(
                 dummy_client, dummy_config, ROOT, now=T0 + timedelta(seconds=1),
             )
