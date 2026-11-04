@@ -59,14 +59,27 @@ the records being PROMOTED rather than on the caller's identity, so unlike
 the tables above it binds header-less callers too. Tasks 6861 and 5880 bind
 the offline lane's records and the zero-progress requeue alarm by the same
 rule.
+
+Task 8422 adds ``POLICY_TABLE`` (PRD ``plans/decision-stream-prd.md`` §5.1):
+the ONE enumeration of escalation policy classes. Each :class:`PolicyRow`
+names the records it applies to, the acts it authorises, and the
+presence-only evidence the resolution must quote, exactly as the 2630
+carve-out above does; the carve-out's three classes are rows of that table
+rather than a second copy of their regexes. Whether a class may act on a
+given queue is a per-queue :class:`ClassSwitch` held outside this module.
 """
 
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from enum import StrEnum
+from types import MappingProxyType
 
-from escalation.categories import EscalationCategory
+from escalation.action_effects import ACTION_EFFECTS
+from escalation.categories import EscalationCategory, require_registered_category
+from escalation.store_identity import QueueKind
 
 # Must equal orchestrator.harness._WATCHER_ESCALATION_HEADERS['X-Escalation-Identity'].
 # Duplicated (not imported) to preserve the escalation -> orchestrator layer
@@ -156,138 +169,449 @@ L2_AUTO_CLOSE_DENY_CATEGORIES: frozenset[str] = frozenset({
 L2_AUTO_CLOSE_DENY_ROLES: frozenset[str] = frozenset({'orchestrator-deterministic'})
 
 
-@dataclass(frozen=True)
-class _L2CloseClass:
-    """One allowlisted auto-close class: a record-shape predicate plus a
-    structural-evidence requirement.
+# ---------------------------------------------------------------------------
+# The policy table (task 8422; PRD plans/decision-stream-prd.md §5.1).
+# ---------------------------------------------------------------------------
 
-    ``categories`` / ``agent_roles`` are ``None`` when the class does not
-    constrain that dimension (category-agnostic / role-agnostic); otherwise
-    a frozenset the record's ``category`` / ``agent_role`` must belong to.
 
-    ``evidence`` is a tuple of requirement GROUPS: every group must have at
-    least one matching alternative present in the resolution text (AND
-    across groups), and each group is itself a tuple of case-insensitive
-    regex alternatives (OR within a group).
+class ClassSwitch(StrEnum):
+    """A policy class's per-queue switch (PRD §3 decision 2).
+
+    ``shadow`` only measures; ``live`` lets the class act; ``off`` withdraws it.
     """
 
-    name: str
-    categories: frozenset[str] | None
-    agent_roles: frozenset[str] | None
-    evidence: tuple[tuple[str, ...], ...]
+    OFF = 'off'
+    SHADOW = 'shadow'
+    LIVE = 'live'
 
-    def matches_record(self, category: str, agent_role: str) -> bool:
-        """Return True if *category* / *agent_role* satisfy this class's shape predicate."""
+
+class PolicyAction(StrEnum):
+    """Every act a policy row may authorise.
+
+    ``close_only``, ``resume`` and ``abandon`` are ``resolve_issue`` actions;
+    the rest are task-side or infra acts the executor performs before it
+    resolves. ``park`` and ``restart`` are absent on purpose: no class is ever
+    granted them. ``update_task_amendment`` is the shadow codec's existing
+    spelling of "amend the task record", reused rather than re-coined.
+    """
+
+    CLOSE_ONLY = 'close_only'
+    RESUME = 'resume'
+    ABANDON = 'abandon'
+    DONE_FLIP = 'done_flip'
+    UPDATE_TASK_AMENDMENT = 'update_task_amendment'
+    ADD_DEPENDENCY = 'add_dependency'
+    FILE_TASK = 'file_task'
+    RECOVER_MAIN = 'recover_main'
+    B3_APPLY = 'b3_apply'
+    REPLAY_DEAD_LETTERS = 'replay_dead_letters'
+    REPROBE_QUARANTINE = 'reprobe_quarantine'
+
+
+_RESOLVE_ACTIONS: frozenset[str] = frozenset(action for action, _, _ in ACTION_EFFECTS)
+
+# A file-writing or main-moving class is audited at 100% until it has this
+# many closes (PRD §3 decisions 5 and 6).
+FULL_AUDIT_MIN_N = 20
+
+_POLICY_CLASS_SLUG = re.compile(r'[a-z0-9_]+')
+
+
+@dataclass(frozen=True)
+class PolicyMatch:
+    """Which records a row applies to.
+
+    ``categories`` must contain the record's category, and ``agent_role``
+    must FULL-match its agent_role; the two are ANDed. ``None`` leaves that
+    dimension unconstrained, so an all-``None`` match is any record outside
+    the deny lists.
+    """
+
+    categories: frozenset[EscalationCategory] | None = None
+    agent_role: re.Pattern[str] | None = None
+
+    def __post_init__(self) -> None:
+        for category in self.categories or ():
+            require_registered_category(category)
+
+    def matches(self, category: str, agent_role: str) -> bool:
         if self.categories is not None and category not in self.categories:
             return False
-        return self.agent_roles is None or agent_role in self.agent_roles
+        return self.agent_role is None or self.agent_role.fullmatch(agent_role) is not None
+
+
+@dataclass(frozen=True)
+class PolicyRow:
+    """One policy class: the records it covers, its acts, and its evidence.
+
+    Every evidence pattern must search-match the resolution text; that is
+    presence of quoted proof, not verification of it (see the 2630 paragraph
+    in this module's docstring).
+    """
+
+    policy_class: str
+    match: PolicyMatch
+    actions: frozenset[PolicyAction]
+    evidence: tuple[re.Pattern[str], ...]
+    file_writing: bool = False
+    queue_kind: QueueKind = 'project'
+    initial_state: ClassSwitch = ClassSwitch.SHADOW
+
+    def __post_init__(self) -> None:
+        slug = self.policy_class
+        if not _POLICY_CLASS_SLUG.fullmatch(slug):
+            raise ValueError(f'policy_class {slug!r} must match ^[a-z0-9_]+$')
+        if not self.actions:
+            raise ValueError(f'policy row {slug!r} allows no action: {self.actions!r}')
+        if _RESOLVE_ACTIONS.isdisjoint(self.actions):
+            raise ValueError(
+                f'policy row {slug!r} allows no resolve_issue action; '
+                f'got {sorted(map(str, self.actions))}'
+            )
+        if not self.evidence:
+            raise ValueError(f'policy row {slug!r} requires evidence; got {self.evidence!r}')
+        for pattern in self.evidence:
+            if not isinstance(pattern, re.Pattern):
+                raise ValueError(
+                    f'policy row {slug!r} evidence entry {pattern!r} is '
+                    f'{type(pattern).__name__}, not a compiled re.Pattern'
+                )
+
+    @property
+    def reversible(self) -> bool:
+        """False only for a done flip (waived, Leo 2026-11-04; PRD §3 decision 7)."""
+        return PolicyAction.DONE_FLIP not in self.actions
+
+    @property
+    def audit_full_until(self) -> int:
+        """How many closes this class is audited at 100% for before random draw."""
+        touches_files = self.file_writing or PolicyAction.RECOVER_MAIN in self.actions
+        return FULL_AUDIT_MIN_N if touches_files else 0
 
     def evidence_present(self, resolution: str) -> bool:
-        """Return True if every evidence group has >=1 alternative matching *resolution*."""
-        return all(
-            any(re.search(pattern, resolution, re.IGNORECASE) for pattern in group)
-            for group in self.evidence
-        )
+        return all(pattern.search(resolution) for pattern in self.evidence)
 
 
-# Ordered MOST-SPECIFIC-FIRST: a record can satisfy more than one class's
-# shape predicate (e.g. an infra_issue filed by orchestrator-main-sweep
-# satisfies both (a)'s and (b)'s predicates) — first-match-wins picks the
-# sharpest attribution when its stricter evidence is present, falling back
-# to the more general class otherwise.
-#
-#   (a) superseded_main_sweep — mirrors harness._close_superseded_main_sweep_escalations:
-#       requires BOTH a newer sweep-escalation id (``esc-...``) AND proof the
-#       failing tip is an ancestor of a now-green main.
-#   (b) self_cleared_infra — mirrors harness._revalidate_open_deterministic_escalation:
-#       requires a quoted liveness-probe token from a known key allowlist
-#       (paused / ActiveState / MainPID / ActiveEnterTimestamp) — NOT an
-#       arbitrary "word=word" token, so incidental '='s in prose (e.g.
-#       'note=ok') can't satisfy the evidence requirement.
-#   (c) stale_task_scoped — category-agnostic, requires a live get_task
-#       citation showing the subject task went terminal / was re-scoped / was
-#       re-dispatched. All THREE alternatives are citation-anchored (task 4192):
-#       the terminal-status one on a 'status=' / 'status:' shape rather than a
-#       free-standing "is done" English phrase, and the two moved-on ones on an
-#       explicit preposition ('to'/'into'/'as' for re-scoped, 'as' only for
-#       re-dispatched) plus a task/run identifier. So neither "the work is
-#       done" nor "was rescoped last week" nor "re-dispatched it this morning"
-#       can satisfy it — the identity that writes this text is the LLM-driven
-#       watcher rotation, whose free-form close prose is exactly where such
-#       phrasing appears incidentally.
-#
-#       Precisely what the identifier requires, so the anchor is not read as
-#       stronger than it is: a token containing a DIGIT, optionally wrapped in
-#       '#' / quotes / backticks. It is not validated as a real task or run id,
-#       and a bare number counts — so count-shaped prose that happens to use
-#       the same preposition ("re-scoped into 2 subtasks") still matches. The
-#       load-bearing part is the preposition+token STRUCTURE, which the casual
-#       phrasing this anchor exists to reject never produces.
-#
-#       This class shares its INTENT with harness._revalidate_open_l2 — a
-#       subject that has gone terminal or moved on moots the escalation — but
-#       is NOT a mirror of it, in three ways (verified against harness.py
-#       _revalidate_open_l2 at main 6ee3eaec25):
-#         - Independent mechanism, no shared code: the harness sweep closes
-#           IN-PROCESS via self._escalation_queue.resolve(...) under the
-#           'harness-escalation-revalidation-sweep' role. It never issues an
-#           HTTP resolve_issue, so it never reaches l2_auto_close_class at all.
-#         - Strictly wider on CATEGORY: since task 2724 landed, the harness
-#           sweep is ALLOWLIST-gated on config.escalation_revalidation_allowlist
-#           (default {task_failure, stranded_blocked}); class (c) is
-#           category-AGNOSTIC modulo L2_AUTO_CLOSE_DENY_CATEGORIES.
-#         - Strictly wider on EVIDENCE: the harness closes only on a live batch
-#           get_statuses read showing the subject 'done'/'cancelled'; class (c)
-#           also accepts a cited re-scoped / re-dispatched citation, which the
-#           harness never checks.
-#       Class (c) is therefore the WIDEST auto-close door in this allowlist —
-#       weigh any further loosening of it against that.
-L2_AUTO_CLOSE_ALLOWLIST: tuple[_L2CloseClass, ...] = (
-    _L2CloseClass(
-        name='superseded_main_sweep',
-        categories=None,
-        agent_roles=frozenset({'orchestrator-main-sweep'}),
-        evidence=(
-            (r'esc-\S+',),
-            (r'is[- ]ancestor', r'merge-base', r'ancestor of', r'verifies clean', r'gate re-run'),
+def _any_of(*alternatives: str) -> re.Pattern[str]:
+    """One case-insensitive evidence pattern satisfied by any of *alternatives*."""
+    return re.compile('|'.join(f'(?:{a})' for a in alternatives), re.IGNORECASE)
+
+
+def _role(*agent_roles: str) -> re.Pattern[str]:
+    """An agent_role pattern that full-matches exactly one of *agent_roles*."""
+    return re.compile('|'.join(map(re.escape, agent_roles)))
+
+
+def _categories(*members: EscalationCategory) -> PolicyMatch:
+    return PolicyMatch(categories=frozenset(members))
+
+
+def _actions(*members: PolicyAction) -> frozenset[PolicyAction]:
+    return frozenset(members)
+
+
+_C = EscalationCategory
+_A = PolicyAction
+_ANY_RECORD = PolicyMatch()
+
+_SHA = r'\b[0-9a-f]{7,40}\b'
+_ANCESTOR = (r'is[- ]ancestor', r'merge-base')
+_TASK_CITE = r'task\s+#?\d+'
+_ESC_ID = r'\besc-[\w-]*\d'
+# A quoted liveness-probe token from a known key allowlist, NOT an arbitrary
+# "word=word" token, so incidental '='s in prose ('note=ok') cannot satisfy it.
+# Admits the '>' comparison harness.py itself emits (MainPID>0).
+_PROBE_TOKEN = r'\b(?:paused|ActiveState|MainPID|ActiveEnterTimestamp)\b\s*[=:>]\s*\S+'
+
+_FOUND_ON_MAIN_EVIDENCE = (_any_of(r'found_on_main'), _any_of(_SHA), _any_of(*_ANCESTOR))
+_FOUND_ON_MAIN_ACTIONS = _actions(_A.DONE_FLIP, _A.CLOSE_ONLY)
+
+# Moved classes (PRD §3 decision 7): acts already granted to the interactive
+# session, moving to the executor after a shadow period that only measures.
+_MOVED_ROWS: tuple[PolicyRow, ...] = (
+    # Class 1b.
+    PolicyRow(
+        'landing_provenance', _categories(_C.PROVENANCE_UNATTRIBUTED),
+        _FOUND_ON_MAIN_ACTIONS, _FOUND_ON_MAIN_EVIDENCE,
+    ),
+    # Class 3, self-execute item 12: a disposition, not a category.
+    PolicyRow('found_on_main', _ANY_RECORD, _FOUND_ON_MAIN_ACTIONS, _FOUND_ON_MAIN_EVIDENCE),
+    # Class 2's update_task half.
+    PolicyRow(
+        'delivered_check_repath', _categories(_C.DEPENDENCY_CAPABILITY),
+        _actions(_A.UPDATE_TASK_AMENDMENT, _A.RESUME),
+        (_any_of(r'delivered_checks?'), _any_of(rf'pass(?:es|ed)?\s+at\s+(?:main|{_SHA})')),
+    ),
+    # Item 1.
+    PolicyRow(
+        'read_only_probe_answered', _ANY_RECORD, _actions(_A.CLOSE_ONLY),
+        (
+            _any_of(r'\bprobe\b'),
+            _any_of(r'->', r'=>', r'\brc\s*=', r'exit(?:ed)?\s*(?:code\s*)?\d'),
         ),
     ),
-    _L2CloseClass(
-        name='self_cleared_infra',
-        categories=frozenset({'infra_issue'}),
-        agent_roles=None,
-        evidence=(
-            (r'\b(?:paused|ActiveState|MainPID|ActiveEnterTimestamp)\b\s*[=:>]\s*\S+',),
+    # Item 3.
+    PolicyRow(
+        'premature_gate_followup', _ANY_RECORD,
+        _actions(_A.FILE_TASK, _A.ADD_DEPENDENCY, _A.CLOSE_ONLY),
+        (_any_of(_TASK_CITE), _any_of(r'\bdelayed\b'), _any_of(r'\bdepend')),
+    ),
+    # Item 4.
+    PolicyRow(
+        'preserved_payload_recovered', _ANY_RECORD,
+        _actions(_A.UPDATE_TASK_AMENDMENT, _A.CLOSE_ONLY),
+        (_any_of(r'\brecovered\b'), _any_of(_TASK_CITE)),
+    ),
+    # Item 5.
+    PolicyRow(
+        'owner_finding_appended', _ANY_RECORD,
+        _actions(_A.UPDATE_TASK_AMENDMENT, _A.CLOSE_ONLY),
+        (_any_of(_TASK_CITE), _any_of(r'status\s*[=:]\s*pending'), _any_of(r'\bappend')),
+    ),
+    # Item 11, class 1a's TRUE arm.
+    PolicyRow(
+        'completion_claim_true', _categories(_C.UNVERIFIED_COMPLETION_CLAIM),
+        _actions(_A.ABANDON),
+        (
+            _any_of(r'status\s*[=:]\s*done'), _any_of(*_ANCESTOR),
+            _any_of(r'no dependents'), _any_of(r'rev-list\s+--count'),
         ),
     ),
+    # The three task-2630 carve-out classes; L2_AUTO_CLOSE_ALLOWLIST below
+    # orders them for the auto-watcher.
+    #
+    # superseded_main_sweep mirrors harness._close_superseded_main_sweep_escalations:
+    # it requires BOTH a newer sweep-escalation id (``esc-...``) AND proof the
+    # failing tip is an ancestor of a now-green main.
+    PolicyRow(
+        'superseded_main_sweep', PolicyMatch(agent_role=_role('orchestrator-main-sweep')),
+        _actions(_A.CLOSE_ONLY),
+        (
+            _any_of(r'esc-\S+'),
+            _any_of(
+                r'is[- ]ancestor', r'merge-base', r'ancestor of', r'verifies clean', r'gate re-run',
+            ),
+        ),
+    ),
+    # self_cleared_infra mirrors harness._revalidate_open_deterministic_escalation:
+    # it requires a quoted liveness-probe token (see _PROBE_TOKEN).
+    PolicyRow(
+        'self_cleared_infra', _categories(_C.INFRA_ISSUE), _actions(_A.CLOSE_ONLY),
+        (_any_of(_PROBE_TOKEN),),
+    ),
+    # stale_task_scoped — category-agnostic, requires a live get_task citation
+    # showing the subject task went terminal / was re-scoped / was
+    # re-dispatched. All THREE alternatives are citation-anchored (task 4192):
+    # the terminal-status one on a 'status=' / 'status:' shape rather than a
+    # free-standing "is done" English phrase, and the two moved-on ones on an
+    # explicit preposition ('to'/'into'/'as' for re-scoped, 'as' only for
+    # re-dispatched) plus a task/run identifier. So neither "the work is done"
+    # nor "was rescoped last week" nor "re-dispatched it this morning" can
+    # satisfy it — the identity that writes this text is the LLM-driven watcher
+    # rotation, whose free-form close prose is exactly where such phrasing
+    # appears incidentally.
+    #
+    # Precisely what the identifier requires, so the anchor is not read as
+    # stronger than it is: a token containing a DIGIT, optionally wrapped in
+    # '#' / quotes / backticks. It is not validated as a real task or run id,
+    # and a bare number counts — so count-shaped prose that happens to use the
+    # same preposition ("re-scoped into 2 subtasks") still matches. The
+    # load-bearing part is the preposition+token STRUCTURE, which the casual
+    # phrasing this anchor exists to reject never produces.
+    #
+    # This class shares its INTENT with harness._revalidate_open_l2 — a subject
+    # that has gone terminal or moved on moots the escalation — but is NOT a
+    # mirror of it, in three ways (verified against harness.py
+    # _revalidate_open_l2 at main 6ee3eaec25):
+    #   - Independent mechanism, no shared code: the harness sweep closes
+    #     IN-PROCESS via self._escalation_queue.resolve(...) under the
+    #     'harness-escalation-revalidation-sweep' role. It never issues an HTTP
+    #     resolve_issue, so it never reaches l2_auto_close_class at all.
+    #   - Strictly wider on CATEGORY: since task 2724 landed, the harness sweep
+    #     is ALLOWLIST-gated on config.escalation_revalidation_allowlist
+    #     (default {task_failure, stranded_blocked}); this class is
+    #     category-AGNOSTIC modulo L2_AUTO_CLOSE_DENY_CATEGORIES.
+    #   - Strictly wider on EVIDENCE: the harness closes only on a live batch
+    #     get_statuses read showing the subject 'done'/'cancelled'; this class
+    #     also accepts a cited re-scoped / re-dispatched citation, which the
+    #     harness never checks.
+    # It is therefore the WIDEST auto-close door in the carve-out — weigh any
+    # further loosening of it against that.
+    #
     # FOLLOW-UP (open, deliberate — not an oversight): this class gates
     # categories with a DENYLIST (L2_AUTO_CLOSE_DENY_CATEGORIES) while the
-    # harness revalidation sweep now gates with an ALLOWLIST
-    # (config.escalation_revalidation_allowlist, default
-    # {task_failure, stranded_blocked}). Task 2724 has landed on main, so that
-    # divergence is a fact today, not a future one. Aligning the two models is
-    # a behaviour change with its own blast radius — it would narrow which L2s
-    # the watcher can auto-close at all — and was scoped OUT of task 4192 by
-    # the 2026-08-12 operator ruling; it wants its own task and review.
-    _L2CloseClass(
-        name='stale_task_scoped',
-        categories=None,
-        agent_roles=None,
-        evidence=(
-            (
+    # harness revalidation sweep gates with an ALLOWLIST. Task 2724 has landed
+    # on main, so that divergence is a fact today, not a future one. Aligning
+    # the two models is a behaviour change with its own blast radius — it would
+    # narrow which L2s the watcher can auto-close at all — and was scoped OUT of
+    # task 4192 by the 2026-08-12 operator ruling; it wants its own task and
+    # review.
+    PolicyRow(
+        'stale_task_scoped', _ANY_RECORD, _actions(_A.CLOSE_ONLY),
+        (
+            _any_of(
                 r'status\s*[=:]\s*(done|cancelled)',
                 # The optional [#`"'] wrappers admit the spellings this repo
                 # actually writes task references in — 'task #3821', a
-                # markdown-quoted `3821`, a quoted "task 3821" — which the
-                # as-ruled shapes rejected. They relax only the citation's
-                # PUNCTUATION, never its structure: an explicit preposition
-                # plus an identifier containing a digit is still required, so
-                # every casual-prose negative stays rejected.
+                # markdown-quoted `3821`, a quoted "task 3821". They relax only
+                # the citation's PUNCTUATION, never its structure: an explicit
+                # preposition plus an identifier containing a digit is still
+                # required, so every casual-prose negative stays rejected.
                 r'''re-?scoped\s+(?:to|into|as)\s+[#`"']?(?:task\s+)?[#`"']?[a-z0-9_.:-]*\d''',
                 r'''re-?dispatched\s+as\s+[#`"']?(?:run|task)?[- ]?[#`"']?[a-z0-9_.:-]*\d''',
             ),
         ),
     ),
+    # Item 6's carve-out half and item 7: the PRD's "applies a named ruling"
+    # key. A ruling citation lives in the resolution text, so it is evidence
+    # on a match-anything row rather than a record match.
+    PolicyRow(
+        'applies_named_ruling', _ANY_RECORD, _actions(_A.CLOSE_ONLY, _A.RESUME),
+        (
+            _any_of(r'\b(?:Leo|ruled|ruling)\b[^\n]*\b20\d{2}-\d{2}-\d{2}\b'),
+            _any_of(_ESC_ID, r'x_ruling'),
+        ),
+    ),
+)
+
+# New delegations (PRD §3 decision 7): start shadow, flip live per class at the
+# η gate.
+_NEW_DELEGATION_ROWS: tuple[PolicyRow, ...] = (
+    # Class 5.
+    PolicyRow(
+        'curator_cause_cleared',
+        _categories(
+            _C.CURATOR_FAILURE, _C.CURATOR_CONSECUTIVE_DEGRADED, _C.CURATOR_ZERO_OUTPUT_HANG,
+            _C.TICKET_FAILURE, _C.MCP_MARKUP_RESIDUE,
+        ),
+        _actions(_A.CLOSE_ONLY),
+        (
+            _any_of(r'get_curator_state', r'\bprobe\b'),
+            _any_of(r'\bcleared\b', r'\brecovered\b', r'false positive'),
+        ),
+    ),
+    # Class 1a's false-positive arm.
+    PolicyRow(
+        'completion_claim_false_positive', _categories(_C.UNVERIFIED_COMPLETION_CLAIM),
+        _actions(_A.CLOSE_ONLY),
+        (
+            _any_of(r'status\s*[=:]\s*\w+'), _any_of(r'false positive'),
+            _any_of(r'not an assertion', r'imperative'),
+        ),
+    ),
+    # Detector-close confirmation.
+    PolicyRow(
+        'detector_stood_down',
+        PolicyMatch(agent_role=_role(
+            'orchestrator-recovery-veto-streak',
+            'orchestrator-verify-host-monitor',
+            'orchestrator-zero-progress-requeue',
+        )),
+        _actions(_A.CLOSE_ONLY),
+        (_any_of(r'stood down', r'alarm (?:has )?cleared'), _any_of(_ESC_ID)),
+    ),
+    PolicyRow(
+        'dead_letter_replayed', _categories(_C.DURABLE_WRITE_DEAD_LETTER),
+        _actions(_A.REPLAY_DEAD_LETTERS, _A.CLOSE_ONLY),
+        (_any_of(r'replay_dead_letters'), _any_of(r'replayed\s*[=:]\s*\d+')),
+    ),
+    # Quarantine re-probe.
+    PolicyRow(
+        'verify_host_reprobed', _categories(_C.VERIFY_HOST_UNREACHABLE),
+        _actions(_A.REPROBE_QUARANTINE, _A.CLOSE_ONLY),
+        (_any_of(r'\bprobe\b'), _any_of(r'\breachable\b', r'\brc\s*=\s*0\b')),
+    ),
+    # B3.
+    PolicyRow(
+        'b3_low_risk_unblock', _categories(_C.TASK_FAILURE, _C.REVIEW_ISSUES),
+        _actions(_A.B3_APPLY, _A.RESUME, _A.CLOSE_ONLY),
+        (_any_of(r'b3_gate'), _any_of(r'request_id\s*[=:]\s*\S+')),
+        file_writing=True,
+    ),
+    # Red main (PRD §3 decision 6). File-writing because recover_main moves the
+    # main checkout, which must be clean.
+    PolicyRow(
+        'red_main_recovery', _categories(_C.PREEXISTING_MAIN_BREAK),
+        _actions(_A.RECOVER_MAIN, _A.CLOSE_ONLY),
+        (
+            _any_of(r'\bgate\b'), _any_of(r'\bsweep\b', r're-run'),
+            _any_of(r'recover_main'), _any_of(_SHA),
+        ),
+        file_writing=True,
+    ),
+)
+
+# Recon self-clears (PRD §3 decision 10): the only row the shared
+# reconciliation queue serves.
+_RECON_ROWS: tuple[PolicyRow, ...] = (
+    PolicyRow(
+        'recon_run_self_cleared', _categories(_C.RECON_STALE_RUN), _actions(_A.CLOSE_ONLY),
+        (_any_of(r'(?:later|subsequent) run'), _any_of(r'run[_ -]?id\s*[=:]\s*\S+')),
+        queue_kind='reconciliation',
+    ),
+)
+
+# The four first-tranche classes the ratified skeleton shadowed before this
+# table existed; their slugs are frozen by the shadow-stamp archive.
+# design_concern_semantic_collision is executor-unreachable, because
+# design_concern is a deny category; only the interactive arm measures it.
+_LEGACY_FIRST_TRANCHE_ROWS: tuple[PolicyRow, ...] = (
+    PolicyRow(
+        'risk_identified_branch_behind_main', _categories(_C.RISK_IDENTIFIED),
+        _actions(_A.FILE_TASK, _A.CLOSE_ONLY),
+        (_any_of(*_ANCESTOR, r'behind main'),),
+    ),
+    PolicyRow(
+        'risk_identified_recovery_veto_streak',
+        PolicyMatch(
+            categories=frozenset({_C.RISK_IDENTIFIED}),
+            agent_role=_role('orchestrator-recovery-veto-streak'),
+        ),
+        _actions(_A.CLOSE_ONLY),
+        (_any_of(r'4541', r'veto[- ]streak'),),
+    ),
+    PolicyRow(
+        'design_concern_semantic_collision', _categories(_C.DESIGN_CONCERN),
+        _actions(_A.UPDATE_TASK_AMENDMENT, _A.CLOSE_ONLY),
+        (_any_of(r'collision', r'reconcil'),),
+    ),
+    PolicyRow(
+        'infra_issue_transient_self_cleared', _categories(_C.INFRA_ISSUE),
+        _actions(_A.CLOSE_ONLY), (_any_of(_PROBE_TOKEN),),
+    ),
+)
+
+POLICY_TABLE: tuple[PolicyRow, ...] = (
+    _MOVED_ROWS + _NEW_DELEGATION_ROWS + _RECON_ROWS + _LEGACY_FIRST_TRANCHE_ROWS
+)
+
+
+def _index_by_class(rows: Iterable[PolicyRow]) -> Mapping[str, PolicyRow]:
+    by_class: dict[str, PolicyRow] = {}
+    for row in rows:
+        if row.policy_class in by_class:
+            raise ValueError(f'duplicate policy_class {row.policy_class!r} in POLICY_TABLE')
+        by_class[row.policy_class] = row
+    return MappingProxyType(by_class)
+
+
+_ROWS_BY_CLASS: Mapping[str, PolicyRow] = _index_by_class(POLICY_TABLE)
+
+
+def policy_row(policy_class: str) -> PolicyRow | None:
+    """The table row named *policy_class*, or ``None`` when there is none."""
+    return _ROWS_BY_CLASS.get(policy_class)
+
+
+# The task-2630 carve-out classes, ordered MOST-SPECIFIC-FIRST: a record can
+# satisfy more than one row's match (an infra_issue filed by
+# orchestrator-main-sweep satisfies both superseded_main_sweep's and
+# self_cleared_infra's) — first-match-wins picks the sharpest attribution when
+# its stricter evidence is present, falling back to the more general class
+# otherwise.
+L2_AUTO_CLOSE_ALLOWLIST: tuple[PolicyRow, ...] = tuple(
+    _ROWS_BY_CLASS[slug]
+    for slug in ('superseded_main_sweep', 'self_cleared_infra', 'stale_task_scoped')
 )
 
 
@@ -313,9 +637,10 @@ def l2_auto_close_class(
     is applied BEFORE the allowlist, so a born-at-L2 human gate is never
     auto-closable even when a class predicate would otherwise match (e.g. an
     ``orchestrator-deterministic``-filed ``infra_issue`` is blocked by the
-    role denylist despite matching class (b)'s category).
+    role denylist despite matching ``self_cleared_infra``'s category). The
+    rows' ``queue_kind`` is ignored here, exactly as before the table existed.
 
-    Returns the matched class's ``name`` (for the caller's audit trail /
+    Returns the matched row's ``policy_class`` (for the caller's audit trail /
     rotation-digest line) or ``None`` when no class matches — the caller
     (``resolve_issue``) treats ``None`` as "stay forbidden".
     """
@@ -324,7 +649,7 @@ def l2_auto_close_class(
     if category in L2_AUTO_CLOSE_DENY_CATEGORIES or agent_role in L2_AUTO_CLOSE_DENY_ROLES:
         return None
     text = resolution or ''
-    for klass in L2_AUTO_CLOSE_ALLOWLIST:
-        if klass.matches_record(category, agent_role) and klass.evidence_present(text):
-            return klass.name
+    for row in L2_AUTO_CLOSE_ALLOWLIST:
+        if row.match.matches(category, agent_role) and row.evidence_present(text):
+            return row.policy_class
     return None
