@@ -1615,7 +1615,7 @@ class TestVerifyBaseDetectorKey:
         assert len(filed) == 1 and filed[0].level == 1
         await _settle(entry)
 
-    async def test_divergence_leaves_the_invariants_field(
+    async def test_divergent_successor_reads_as_a_chain_link_break_not_a_verify_base_string(
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
     ) -> None:
         worker, _ = self._lane(git_ops, config, git_repo)
@@ -1623,8 +1623,10 @@ class TestVerifyBaseDetectorKey:
 
         entry = await _dispatch_on_main(worker, git_ops, item_e, 'fake-main')
 
-        invariants = worker.snapshot()['two_layer_invariants']
-        assert not [v for v in invariants if 'verify-base⊄frozen-tip' in v], invariants
+        assert worker.snapshot()['two_layer_invariants'] == [
+            f'frozen-prefix base-chain broken at {item_e.request.request_id}: '
+            f"expected base 'sha-Dc' but item has 'wrong-base'"
+        ]
         await _settle(entry)
 
     async def test_open_l1_dedups_a_second_divergence(
