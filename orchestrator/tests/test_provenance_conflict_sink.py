@@ -438,6 +438,7 @@ class TestArbitrationHoldSurvivesADedupeFold:
     _R1 = '2026-07-15T00:00:00+00:00'
     _R2 = '2026-07-20T00:00:00+00:00'
     _R3 = '2026-07-25T00:00:00+00:00'
+    _R4 = '2026-07-30T00:00:00+00:00'
 
     def _sink(self, tmp_path):
         from orchestrator.provenance_conflict import ProvenanceConflictSink
@@ -487,6 +488,23 @@ class TestArbitrationHoldSurvivesADedupeFold:
 
         rows = queue.get_by_task('42', status='pending')
         assert len(rows[0].amendments) == 1, rows[0].amendments
+
+    def test_every_recorded_reopen_at_binds_across_several_refreshes(
+        self, tmp_path,
+    ):
+        from orchestrator.provenance_conflict import ProvenanceConflictSink
+
+        sink, queue = self._sink(tmp_path)
+        for reopen_at in (self._R1, self._R2, self._R3, self._R3):
+            _record(sink, reopen_at=reopen_at)
+        rows = queue.get_by_task('42', status='pending')
+
+        assert len(rows) == 1, rows
+        assert len(rows[0].amendments) == 2, rows[0].amendments
+        cold = ProvenanceConflictSink(escalation_queue=queue)
+        for recorded in (self._R1, self._R2, self._R3):
+            assert cold.arbitration_pending(rows, reopen_at=recorded) is True, recorded
+        assert cold.arbitration_pending(rows, reopen_at=self._R4) is False
 
     def test_unparseable_refresh_holds(self, tmp_path):
         from orchestrator.provenance_conflict import ProvenanceConflictSink
