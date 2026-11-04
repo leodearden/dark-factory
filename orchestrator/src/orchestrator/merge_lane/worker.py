@@ -740,9 +740,7 @@ PRODUCTION_VERIFIER: VerifyPort = ProductionVerifier(
     post_merge_pyright=lambda: _check_post_merge_pyright,
     post_merge_equivalence=lambda: _check_post_merge_equivalence,
     disk_guard=lambda: _ensure_verify_disk_space,
-    cold_shadow_verify=lambda: functools.partial(
-        _run_cold_shadow_verify, verifier=PRODUCTION_VERIFIER,
-    ),
+    cold_shadow_verify=lambda: _run_cold_shadow_verify,
     dry_run=lambda: run_dry_run_unblock,
 )
 PRODUCTION_CLOCK: ClockPort = ProductionClock(
