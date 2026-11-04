@@ -221,6 +221,57 @@ class TestCommentOnlyRefinement:
 
 
 # ---------------------------------------------------------------------------
+# TestMarkdownCommentRule (task 6037)
+# ---------------------------------------------------------------------------
+
+
+class TestMarkdownCommentRule:
+    """In markdown only an HTML comment is a comment. A heading or a bullet
+    can BE the capability: task 6036 adjudicated task 3199's
+    ``'^## Decision table'`` check as correct."""
+
+    def _lint_one_file(self, tmp_path: Path, rel_path: str, body: str, pattern: str):
+        repo = init_git_repo(tmp_path / 'repo', {rel_path: body})
+        return lint_delivered_checks(
+            [{'name': 'doc-cap', 'kind': 'grep', 'pattern': pattern, 'expect': 'present',
+              'paths': [rel_path]}],
+            files=[rel_path],
+            repo_root=repo,
+            ref='HEAD',
+        )
+
+    def test_a_markdown_heading_is_content_not_a_comment(self, tmp_path):
+        findings = self._lint_one_file(
+            tmp_path,
+            'docs/report.md',
+            '# Report\n\n## Decision table\n\n| a | b |\n',
+            '^## Decision table',
+        )
+
+        assert [f.code for f in findings] == ['vacuous_present']
+
+    def test_a_markdown_bullet_is_content_not_a_comment(self, tmp_path):
+        findings = self._lint_one_file(
+            tmp_path,
+            'docs/notes.md',
+            '* archive_task_transcripts lands here\n',
+            'archive_task_transcripts',
+        )
+
+        assert [f.code for f in findings] == ['vacuous_present']
+
+    def test_an_html_comment_in_markdown_is_a_comment(self, tmp_path):
+        findings = self._lint_one_file(
+            tmp_path,
+            'docs/notes.md',
+            '<!-- archive_task_transcripts is handled elsewhere -->\n',
+            'archive_task_transcripts',
+        )
+
+        assert [f.code for f in findings] == ['vacuous_present_comment_only']
+
+
+# ---------------------------------------------------------------------------
 # TestRefinementPrecedence (task 3500 — step-7 RED / step-8 GREEN)
 # ---------------------------------------------------------------------------
 
@@ -229,7 +280,7 @@ class TestRefinementPrecedence:
     """AT MOST ONE finding per check, with a deterministic winner.
 
     Both refinements can hold at once (a manifest ``pattern:`` line reached
-    through a markdown bullet in the sibling PRD is self-referential AND
+    through an HTML comment in the sibling PRD is self-referential AND
     comment-shaped). Emitting two findings would double-count one defect in
     the reject payload, so the order is pinned: self-referential is the more
     specific diagnosis and wins.
@@ -240,8 +291,10 @@ class TestRefinementPrecedence:
             tmp_path / 'repo',
             {
                 # Every match line here is BOTH inside the descriptor family
-                # and comment-shaped (a markdown bullet starts with '*').
-                'plans/foo-prd.md': '# Foo PRD\n\n* foo_capability_token lands here\n',
+                # and comment-shaped (an HTML comment, markdown's only one).
+                'plans/foo-prd.md': (
+                    '# Foo PRD\n\n<!-- foo_capability_token lands here -->\n'
+                ),
                 'plans/foo-prd.capability-manifest.yaml': (
                     'capabilities:\n'
                     '  - name: foo-cap\n'
