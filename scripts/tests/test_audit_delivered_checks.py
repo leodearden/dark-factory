@@ -1593,14 +1593,14 @@ class TestSupersessionAttribution:
         assert finding.disposition == DISPOSITION_BROKEN
 
     def _path_project(self, tmp_path, make_tasks_db, project_root_with_tasks_db, *,
-                      task_id, expect, path, files=None):
+                      task_id, expect, paths, files=None):
         return _make_project(
             tmp_path, make_tasks_db, project_root_with_tasks_db,
             files=files,
             tasks=[{'id': task_id, 'status': 'done',
                     'updated_at': '2020-01-01T00:00:00+00:00',
                     'metadata': _checks({'name': f'{task_id}-lands', 'kind': 'path',
-                                         'expect': expect, 'paths': [path]})}],
+                                         'expect': expect, 'paths': list(paths)})}],
         )
 
     def test_a_deleted_path_is_attributed_to_the_task_that_deleted_it(
@@ -1608,7 +1608,7 @@ class TestSupersessionAttribution:
     ):
         root = self._path_project(
             tmp_path, make_tasks_db, project_root_with_tasks_db,
-            task_id=3700, expect='present', path='src/gone.py',
+            task_id=3700, expect='present', paths=('src/gone.py',),
             files={'src/a.py': 'pass\n', 'src/gone.py': 'def f():\n    pass\n'},
         )
         _delete(root, 'Merge task/3701 into main', 'src/gone.py')
@@ -1623,7 +1623,7 @@ class TestSupersessionAttribution:
     ):
         root = self._path_project(
             tmp_path, make_tasks_db, project_root_with_tasks_db,
-            task_id=3702, expect='absent', path='src/back.py',
+            task_id=3702, expect='absent', paths=('src/back.py',),
         )
         _commit(root, 'feat: restore the module (task 3703)', {'src/back.py': 'pass\n'})
 
@@ -1637,7 +1637,7 @@ class TestSupersessionAttribution:
     ):
         root = self._path_project(
             tmp_path, make_tasks_db, project_root_with_tasks_db,
-            task_id=3704, expect='present', path='src/never.py',
+            task_id=3704, expect='present', paths=('src/never.py',),
         )
 
         finding = audit_project(str(root)).findings[0]
@@ -1650,7 +1650,7 @@ class TestSupersessionAttribution:
     ):
         root = self._path_project(
             tmp_path, make_tasks_db, project_root_with_tasks_db,
-            task_id=3705, expect='absent', path='src/own.py',
+            task_id=3705, expect='absent', paths=('src/own.py',),
         )
         _commit(root, 'Merge task/3705 into main', {'src/own.py': 'pass\n'})
 
@@ -1665,7 +1665,7 @@ class TestSupersessionAttribution:
         # The path was never deleted, so editing it undid nothing.
         root = self._path_project(
             tmp_path, make_tasks_db, project_root_with_tasks_db,
-            task_id=3706, expect='absent', path='src/kept.py',
+            task_id=3706, expect='absent', paths=('src/kept.py',),
             files={'src/a.py': 'pass\n', 'src/kept.py': 'pass\n'},
         )
         _commit(root, 'fix: tweak (task 3707)', {'src/kept.py': 'changed\n'})
@@ -1682,7 +1682,7 @@ class TestSupersessionAttribution:
         # undid nothing.
         root = self._path_project(
             tmp_path, make_tasks_db, project_root_with_tasks_db,
-            task_id=3708, expect='absent', path='src/pkg',
+            task_id=3708, expect='absent', paths=('src/pkg',),
             files={'src/a.py': 'pass\n', 'src/pkg/a.py': 'pass\n'},
         )
         _commit(root, 'feat: a neighbour (task 3709)', {'src/pkg/b.py': 'pass\n'})
@@ -1699,10 +1699,43 @@ class TestSupersessionAttribution:
         # src/xy.py touches a different path.
         root = self._path_project(
             tmp_path, make_tasks_db, project_root_with_tasks_db,
-            task_id=3710, expect='absent', path='src/x*.py',
+            task_id=3710, expect='absent', paths=('src/x*.py',),
             files={'src/a.py': 'pass\n', 'src/x*.py': 'pass\n'},
         )
         _commit(root, 'feat: another module (task 3711)', {'src/xy.py': 'pass\n'})
+
+        finding = audit_project(str(root)).findings[0]
+
+        assert finding.disposition == DISPOSITION_BROKEN
+        assert finding.superseded_by is None
+
+    def test_a_commit_creating_one_listed_path_never_supersedes_a_present_check(
+        self, tmp_path, make_tasks_db, project_root_with_tasks_db
+    ):
+        # Creating x moved the conjunctive check toward passing; y is still
+        # missing, so nothing was undone.
+        root = self._path_project(
+            tmp_path, make_tasks_db, project_root_with_tasks_db,
+            task_id=3712, expect='present', paths=('src/x.py', 'src/y.py'),
+        )
+        _commit(root, 'feat: add x (task 3713)', {'src/x.py': 'pass\n'})
+
+        finding = audit_project(str(root)).findings[0]
+
+        assert finding.disposition == DISPOSITION_BROKEN
+        assert finding.superseded_by is None
+
+    def test_a_commit_deleting_one_listed_path_never_supersedes_an_absent_check(
+        self, tmp_path, make_tasks_db, project_root_with_tasks_db
+    ):
+        # Deleting p moved the conjunctive check toward passing; q still
+        # exists, so nothing was undone.
+        root = self._path_project(
+            tmp_path, make_tasks_db, project_root_with_tasks_db,
+            task_id=3714, expect='absent', paths=('src/p.py', 'src/q.py'),
+            files={'src/a.py': 'pass\n', 'src/p.py': 'pass\n', 'src/q.py': 'pass\n'},
+        )
+        _delete(root, 'refactor: drop p (task 3715)', 'src/p.py')
 
         finding = audit_project(str(root)).findings[0]
 
