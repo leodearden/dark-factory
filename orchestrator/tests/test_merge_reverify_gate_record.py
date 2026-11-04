@@ -30,6 +30,7 @@ from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane import MergeOutcome, MergeRequest, QueuedBranch
 from orchestrator.merge_lane.disposition import MergeFailureDisposition
 from orchestrator.merge_lane.gates import _reverify_rebased_tree, note_queue_verified_main_tip
+from orchestrator.merge_lane.main_health_probe import MAIN_HEALTH_RED_REASON_PREFIX
 from orchestrator.merge_lane.reverify_gate_decision import (
     MAX_RECORDED_OVERLAP_PATHS,
     GateClearance,
@@ -39,7 +40,6 @@ from orchestrator.merge_lane.reverify_gate_decision import (
     emit_reverify_gate_decision,
 )
 from orchestrator.merge_lane.worker import (
-    MAIN_HEALTH_RED_REASON_PREFIX,
     TRANSIENT_INFRA_REASON_PREFIX,
     _run_post_merge_verify,
 )

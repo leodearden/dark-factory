@@ -22,9 +22,9 @@ from _orch_helpers import make_placeholder_future, pydantic_spec
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import AdvanceOutcome, MergeResult
 from orchestrator.merge_lane.landed_outbox import LandedOutbox
+from orchestrator.merge_lane.main_health_probe import MAIN_HEALTH_RED_REASON_PREFIX
 from orchestrator.merge_lane.types import QueuedBranch
 from orchestrator.merge_lane.worker import (
-    MAIN_HEALTH_RED_REASON_PREFIX,
     TRAIN_REBASE_CONFLICT_REASON_PREFIX,
     GroupMergeRequest,
     MergeOutcome,

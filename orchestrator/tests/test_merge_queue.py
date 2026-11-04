@@ -13821,7 +13821,7 @@ class TestRunPostMergeVerify:
         timed_out_result.type_output = ''
 
         verifier = _ScriptedVerifier(answers=[VerifyScript(result=timed_out_result)])
-        with patch('orchestrator.merge_lane.worker._classify_main_health_red', AsyncMock(return_value=None)):
+        with patch('orchestrator.merge_lane.worker.classify_main_health_red', AsyncMock(return_value=None)):
             result = await _run_post_merge_verify(
                 git_ops, req, merge_wt,
                 timeouts={}, enospc_retries={},
@@ -13856,7 +13856,7 @@ class TestRunPostMergeVerify:
         test_fail_result.type_output = ''
 
         verifier = _ScriptedVerifier(answers=[VerifyScript(result=test_fail_result)])
-        with patch('orchestrator.merge_lane.worker._classify_main_health_red', AsyncMock(return_value=None)):
+        with patch('orchestrator.merge_lane.worker.classify_main_health_red', AsyncMock(return_value=None)):
             result = await _run_post_merge_verify(
                 git_ops, req, merge_wt,
                 timeouts={}, enospc_retries={},
@@ -20975,7 +20975,7 @@ class TestRunPostMergeVerifyRouting:
         )
 
         verifier = _ScriptedVerifier(answers=[VerifyScript(result=failed_result)])
-        with patch('orchestrator.merge_lane.worker._classify_main_health_red', AsyncMock(return_value=None)) as mock_mh:
+        with patch('orchestrator.merge_lane.worker.classify_main_health_red', AsyncMock(return_value=None)) as mock_mh:
             result = await _run_post_merge_verify(
                 git_ops, req, merge_wt,
                 timeouts={}, enospc_retries={},
@@ -21013,7 +21013,7 @@ class TestRunPostMergeVerifyRouting:
             answers=[VerifyScript(result=passed_scoped)],
             gates=[broken_gate],
         )
-        with patch('orchestrator.merge_lane.worker._classify_main_health_red', AsyncMock()) as mock_mh:
+        with patch('orchestrator.merge_lane.worker.classify_main_health_red', AsyncMock()) as mock_mh:
             result = await _run_post_merge_verify(
                 git_ops, req, merge_wt,
                 timeouts={}, enospc_retries={},

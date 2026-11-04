@@ -3,7 +3,7 @@ alpha's classify_merge_failure_disposition into the production merge-gate
 failure path + every I4 surface.
 
 Boundary rows as tests:
-  row1 (steps 1-2):   MAIN_RED — _classify_main_health_red stamps disposition.
+  row1 (steps 1-2):   MAIN_RED — classify_main_health_red stamps disposition.
   I4 surfacing (steps 3-4): _render_skew_surfaces pure helper.
   rows 2/3/4 (steps 5-6):   _classify_disposition_for_outcome async wrapper.
   I4 on the real outcome (steps 7-8): _run_post_merge_verify wiring.
@@ -38,12 +38,14 @@ from orchestrator.merge_lane.disposition import (
     MergeFailureDisposition,
     SkewEvidence,
 )
+from orchestrator.merge_lane.main_health_probe import (
+    MAIN_HEALTH_RED_REASON_PREFIX,
+    classify_main_health_red,
+)
 from orchestrator.merge_lane.types import OutcomeKind, QueuedBranch
 from orchestrator.merge_lane.worker import (
-    MAIN_HEALTH_RED_REASON_PREFIX,
     MergeOutcome,
     MergeRequest,
-    _classify_main_health_red,
     _run_post_merge_verify,
     resolve_dispatch_time_merge_base,
 )
@@ -169,7 +171,7 @@ def _make_req(
 
 
 class TestClassifyMainHealthRedSetsDisposition:
-    """_classify_main_health_red must stamp disposition=MAIN_RED on the
+    """classify_main_health_red must stamp disposition=MAIN_RED on the
     outcome it returns when the preexisting probe confirms True (I1: probe
     order preserved; the classifier is never invoked for this bucket), while
     the fix-main reason prefix and dedupe_fingerprint stay unchanged."""
@@ -182,7 +184,7 @@ class TestClassifyMainHealthRedSetsDisposition:
 
         _seed_main_health_probe(COMPILE_ERROR_RESULT, MAIN_SHA, preexisting=True)
         outcome = asyncio.run(
-            _classify_main_health_red(git_ops, req, COMPILE_ERROR_RESULT)
+            classify_main_health_red(git_ops, req, COMPILE_ERROR_RESULT)
         )
 
         git_ops.ephemeral_worktree.assert_not_called()
@@ -203,7 +205,7 @@ class TestClassifyMainHealthRedSetsDisposition:
         )
 
     def test_negative_classification_stays_indeterminate(self, tmp_path: Path) -> None:
-        """When probe returns (False, ''), _classify_main_health_red returns
+        """When probe returns (False, ''), classify_main_health_red returns
         None (falls through) — disposition is not this function's concern."""
         config = _make_config(tmp_path)
         git_ops = _make_git_ops(tmp_path)
@@ -212,7 +214,7 @@ class TestClassifyMainHealthRedSetsDisposition:
 
         _seed_main_health_probe(COMPILE_ERROR_RESULT, MAIN_SHA, preexisting=False)
         outcome = asyncio.run(
-            _classify_main_health_red(git_ops, req, COMPILE_ERROR_RESULT)
+            classify_main_health_red(git_ops, req, COMPILE_ERROR_RESULT)
         )
 
         git_ops.ephemeral_worktree.assert_not_called()
