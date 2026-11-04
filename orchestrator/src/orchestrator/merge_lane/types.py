@@ -1732,6 +1732,35 @@ class VerifyBaseFacts:
 
 
 @dataclass(frozen=True)
+class VerifyBaseDivergence:
+    """A real-verify dispatched on a base that was not the frozen-prefix tip
+    (PRD §5.3, task 5302).
+
+    Recorded once, at dispatch, against that moment's freshly read main, so a
+    later move of main can never create or change one.  ``verify_depth`` is
+    the frozen-prefix height the verify joined; ``observed_at`` is the lane
+    clock's reading at dispatch.
+    """
+
+    request_id: str
+    task_id: str
+    base_sha: str
+    expected_tip: str
+    verify_depth: int
+    observed_at: float
+
+    def to_wire(self) -> dict[str, str | int | float]:
+        return {
+            'request_id': self.request_id,
+            'task_id': self.task_id,
+            'base_sha': self.base_sha,
+            'expected_tip': self.expected_tip,
+            'verify_depth': self.verify_depth,
+            'observed_at': self.observed_at,
+        }
+
+
+@dataclass(frozen=True)
 class LandingCandidate:
     """A verified tree the finalize CAS loop is landing on main (task 6155).
 
@@ -1932,6 +1961,9 @@ class InflightEntry:
                      rebased tree re-verifies, or ``None`` (task 6155).  While
                      it is set the entry keeps its lease and permit, and the
                      next ``_finalize_inflight`` call resumes the CAS from it.
+    verify_base_divergence: the :class:`VerifyBaseDivergence` recorded when
+                     this entry's verify was dispatched off the frozen tip, or
+                     ``None`` (task 5302).
     """
 
     item: SpeculativeItem
@@ -1950,6 +1982,7 @@ class InflightEntry:
     spec_warm: bool = False                 # δ (task 3186): warmth of an ADOPTED head's published merge_wt
     verify_base: VerifyBaseFacts | None = None
     gate: PendingGate | None = None
+    verify_base_divergence: VerifyBaseDivergence | None = None
 
     @property
     def pending_task(self) -> asyncio.Task[object] | None:

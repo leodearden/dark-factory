@@ -16,11 +16,6 @@ from pathlib import Path
 import pytest
 from _merge_lane_fakes import RecordingEscalations, lane_scene_config
 from escalation.categories import EscalationCategory
-from orchestrator.merge_lane.verify_base_detector import (
-    VERIFY_BASE_DIVERGENCE_SENTINEL,
-    alarm_verify_base_divergence,
-    detect_verify_base_divergence,
-)
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import MergeResult
@@ -31,6 +26,11 @@ from orchestrator.merge_lane.types import (
     QueuedBranch,
     RealMergeItem,
     VerifyBaseDivergence,
+)
+from orchestrator.merge_lane.verify_base_detector import (
+    VERIFY_BASE_DIVERGENCE_SENTINEL,
+    alarm_verify_base_divergence,
+    detect_verify_base_divergence,
 )
 
 _WIRE_KEYS = {'request_id', 'task_id', 'base_sha', 'expected_tip', 'verify_depth', 'observed_at'}
