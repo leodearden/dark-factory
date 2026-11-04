@@ -4,10 +4,23 @@ that serves it (PRD dashboard-prd-lanes §4.2, §5.1, §5.3)."""
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Iterator
+from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
+import pytest
 from _canned_mcp import CannedMCP, _raw_row
 
+from dashboard.data import task_lineage
+from dashboard.data.datum import DatumState
+from dashboard.data.prd_attribution import (
+    LINEAGE_METADATA_KEYS,
+    PrdKey,
+    attribute,
+    lineage_entry,
+)
+from dashboard.data.task_lineage import acquire_lineage, clear_lineage_state
 from dashboard.data.tasks import ProjectedTask, TaskReadOffline, fetch_metadata_projection
 
 ROOT = '/proj/lineage'
@@ -148,3 +161,229 @@ class TestFetchMetadataProjection:
         assert isinstance(result, TaskReadOffline)
         assert 'cannot project spam' in result.detail
 
+
+# ---------------------------------------------------------------------------
+# acquire_lineage: the per-root, background-refreshed lineage index
+# ---------------------------------------------------------------------------
+
+T0 = datetime(2026, 11, 4, 12, 0, tzinfo=UTC)
+OTHER_ROOT = '/proj/other'
+
+
+@pytest.fixture(autouse=True)
+def _fresh_lineage_state() -> Iterator[None]:
+    clear_lineage_state()
+    yield
+    clear_lineage_state()
+
+
+@pytest.fixture()
+def quick_waits(monkeypatch):
+    monkeypatch.setattr(task_lineage, 'LINEAGE_REQUEST_WAIT_SECONDS', 0.05)
+    monkeypatch.setattr(task_lineage, 'LINEAGE_READ_TIMEOUT', 0.2)
+
+
+def _projected_calls(canned: CannedMCP, root: str = ROOT) -> list[dict]:
+    return [call for call in canned.calls_to('get_tasks') if call['args']['project_root'] == root]
+
+
+class _Hanging:
+    """A substrate whose projected reads hang until healed, then answer as *inner*."""
+
+    def __init__(self, inner: CannedMCP) -> None:
+        self.inner = inner
+        self.hanging = True
+        self.calls = 0
+
+    async def __call__(self, client, url, tool, args, **kwargs):
+        self.calls += 1
+        if self.hanging:
+            await asyncio.Event().wait()
+        return await self.inner(client, url, tool, args, **kwargs)
+
+
+class TestAcquireLineage:
+    async def test_cold_first_read_is_fresh_at_the_request_instant(
+        self, dummy_client, dummy_config,
+    ):
+        canned = CannedMCP(_rows())
+        with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
+            datum = await acquire_lineage(dummy_client, dummy_config, ROOT, now=T0)
+
+        assert datum.state is DatumState.FRESH
+        assert datum.as_of == T0
+        assert datum.freshness_bound_seconds == task_lineage.LINEAGE_FRESHNESS_BOUND_SECONDS
+        assert datum.value is not None
+        assert dict(datum.value) == {
+            1: lineage_entry({'spawned_from': 3, 'prd': 'plans/b-prd.md'}, ROOT),
+            2: lineage_entry({}, ROOT),
+            3: lineage_entry({'prd_path': 'plans/a-prd.md'}, ROOT),
+        }
+        assert attribute(datum.value)[0][3].prd == 'plans/a-prd.md'
+        assert datum.value[1].own_prd == PrdKey('plans/b-prd.md')
+        [call] = _projected_calls(canned)
+        assert call['args']['fields'] == [
+            'id', *(f'metadata.{key}' for key in LINEAGE_METADATA_KEYS),
+        ]
+
+    async def test_a_value_within_its_ttl_is_served_without_a_read(
+        self, dummy_client, dummy_config,
+    ):
+        canned = CannedMCP(_rows())
+        ttl = task_lineage.LINEAGE_TTL_SECONDS
+        with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
+            await acquire_lineage(dummy_client, dummy_config, ROOT, now=T0)
+            within = await acquire_lineage(
+                dummy_client, dummy_config, ROOT, now=T0 + timedelta(seconds=ttl - 1),
+            )
+            assert len(_projected_calls(canned)) == 1
+            assert within.as_of == T0
+            past = await acquire_lineage(
+                dummy_client, dummy_config, ROOT, now=T0 + timedelta(seconds=ttl + 1),
+            )
+        assert len(_projected_calls(canned)) == 2
+        assert past.state is DatumState.FRESH
+        assert past.as_of == T0 + timedelta(seconds=ttl + 1)
+
+    async def test_a_failed_first_read_is_unknown_with_the_failure(
+        self, dummy_client, dummy_config,
+    ):
+        canned = CannedMCP(_rows())
+        canned.fail_when = lambda call: call['tool'] == 'get_tasks'
+        with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
+            datum = await acquire_lineage(dummy_client, dummy_config, ROOT, now=T0)
+        assert datum.state is DatumState.UNKNOWN
+        assert datum.value is None
+        assert datum.reason is not None
+        assert 'canned get_tasks read timeout' in datum.reason
+
+    async def test_a_failure_after_a_success_is_stale_at_the_original_as_of(
+        self, dummy_client, dummy_config,
+    ):
+        canned = CannedMCP(_rows())
+        later = T0 + timedelta(seconds=task_lineage.LINEAGE_TTL_SECONDS + 1)
+        with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
+            good = await acquire_lineage(dummy_client, dummy_config, ROOT, now=T0)
+            canned.fail_when = lambda call: call['tool'] == 'get_tasks'
+            datum = await acquire_lineage(dummy_client, dummy_config, ROOT, now=later)
+        assert datum.state is DatumState.STALE
+        assert datum.as_of == T0
+        assert datum.value == good.value
+        assert datum.reason is not None
+        assert 'canned get_tasks read timeout' in datum.reason
+
+    async def test_a_slow_first_read_answers_within_the_wait_then_lands_single_flight(
+        self, dummy_client, dummy_config, quick_waits,
+    ):
+        canned = CannedMCP(_rows(), projection_delay=0.15)
+        with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
+            loop = asyncio.get_running_loop()
+            started = loop.time()
+            pending = await acquire_lineage(dummy_client, dummy_config, ROOT, now=T0)
+            assert loop.time() - started < 0.15
+            assert pending.state is DatumState.UNKNOWN
+            assert pending.reason is not None
+            assert 'in flight' in pending.reason
+            await asyncio.sleep(0.25)
+            landed = await acquire_lineage(
+                dummy_client, dummy_config, ROOT, now=T0 + timedelta(seconds=1),
+            )
+        assert landed.state is DatumState.FRESH
+        assert landed.as_of == T0
+        assert len(_projected_calls(canned)) == 1
+
+    async def test_a_hung_read_ends_on_its_budget_and_frees_the_slot(
+        self, dummy_client, dummy_config, quick_waits,
+    ):
+        hanging = _Hanging(CannedMCP(_rows()))
+        retry = task_lineage.LINEAGE_RETRY_SECONDS
+        with patch('dashboard.data.tasks.mcp_tool_call', new=hanging):
+            await acquire_lineage(dummy_client, dummy_config, ROOT, now=T0)
+            await asyncio.sleep(0.3)
+            failed = await acquire_lineage(
+                dummy_client, dummy_config, ROOT, now=T0 + timedelta(seconds=1),
+            )
+            assert failed.state is DatumState.UNKNOWN
+            assert failed.reason is not None
+            assert 'budget' in failed.reason
+            assert hanging.calls == 1
+            hanging.hanging = False
+            healed = await acquire_lineage(
+                dummy_client, dummy_config, ROOT, now=T0 + timedelta(seconds=retry + 1),
+            )
+        assert hanging.calls == 2
+        assert healed.state is DatumState.FRESH
+        assert healed.as_of == T0 + timedelta(seconds=retry + 1)
+
+    async def test_a_hung_refresh_over_a_last_good_serves_it_stale(
+        self, dummy_client, dummy_config, quick_waits,
+    ):
+        hanging = _Hanging(CannedMCP(_rows()))
+        hanging.hanging = False
+        later = T0 + timedelta(seconds=task_lineage.LINEAGE_TTL_SECONDS + 1)
+        with patch('dashboard.data.tasks.mcp_tool_call', new=hanging):
+            good = await acquire_lineage(dummy_client, dummy_config, ROOT, now=T0)
+            hanging.hanging = True
+            in_flight = await acquire_lineage(dummy_client, dummy_config, ROOT, now=later)
+            assert in_flight.as_of == T0
+            assert in_flight.value == good.value
+            await asyncio.sleep(0.3)
+            datum = await acquire_lineage(
+                dummy_client, dummy_config, ROOT, now=later + timedelta(seconds=1),
+            )
+        assert datum.state is DatumState.STALE
+        assert datum.as_of == T0
+        assert datum.value == good.value
+        assert datum.reason is not None
+        assert 'budget' in datum.reason
+
+    async def test_a_failed_read_is_not_retried_before_the_retry_floor(
+        self, dummy_client, dummy_config,
+    ):
+        canned = CannedMCP(_rows())
+        canned.fail_when = lambda call: call['tool'] == 'get_tasks'
+        retry = task_lineage.LINEAGE_RETRY_SECONDS
+        with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
+            await acquire_lineage(dummy_client, dummy_config, ROOT, now=T0)
+            early = await acquire_lineage(
+                dummy_client, dummy_config, ROOT, now=T0 + timedelta(seconds=retry - 1),
+            )
+            assert len(_projected_calls(canned)) == 1
+            assert early.state is DatumState.UNKNOWN
+            canned.fail_when = lambda call: False
+            due = await acquire_lineage(
+                dummy_client, dummy_config, ROOT, now=T0 + timedelta(seconds=retry),
+            )
+        assert len(_projected_calls(canned)) == 2
+        assert due.state is DatumState.FRESH
+
+    async def test_roots_keep_separate_values_and_failures(self, dummy_client, dummy_config):
+        canned = CannedMCP(_rows())
+        canned.fail_when = lambda call: call['args'].get('project_root') == OTHER_ROOT
+        with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
+            good = await acquire_lineage(dummy_client, dummy_config, ROOT, now=T0)
+            bad = await acquire_lineage(dummy_client, dummy_config, OTHER_ROOT, now=T0)
+            again = await acquire_lineage(
+                dummy_client, dummy_config, ROOT, now=T0 + timedelta(seconds=1),
+            )
+        assert good.state is DatumState.FRESH
+        assert bad.state is DatumState.UNKNOWN
+        assert again.state is DatumState.FRESH
+        assert again.value == good.value
+        assert len(_projected_calls(canned, ROOT)) == 1
+
+    async def test_a_read_abandoned_by_clear_does_not_repopulate_the_store(
+        self, dummy_client, dummy_config, quick_waits,
+    ):
+        canned = CannedMCP(_rows(), projection_delay=0.15)
+        with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
+            await acquire_lineage(dummy_client, dummy_config, ROOT, now=T0)
+            clear_lineage_state()
+            await asyncio.sleep(0.25)
+            canned.projection_delay = 0.0
+            datum = await acquire_lineage(
+                dummy_client, dummy_config, ROOT, now=T0 + timedelta(seconds=1),
+            )
+        assert len(_projected_calls(canned)) == 2
+        assert datum.state is DatumState.FRESH
+        assert datum.as_of == T0 + timedelta(seconds=1)
