@@ -19,10 +19,15 @@ stays in sync with the duplicated string.
 from __future__ import annotations
 
 import re
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from escalation.authority import (
+    CLAIM_TTL,
+    COORDINATOR_IDENTITY,
+    EXECUTOR_DENY_ROLES,
+    EXECUTOR_IDENTITY,
     L2_AUTO_CLOSE_ACTION,
     L2_AUTO_CLOSE_ALLOWLIST,
     L2_AUTO_CLOSE_DENY_CATEGORIES,
@@ -32,13 +37,23 @@ from escalation.authority import (
     PROMOTE_SENTINEL_BOUND_ROLES,
     ROLE_LEVEL_ALLOWLIST,
     ClassSwitch,
+    IllegalClassTransition,
     PolicyAction,
     PolicyMatch,
+    PolicyRefusal,
     PolicyRow,
+    RefusalCode,
+    check_class_transition,
+    claim_refusal,
+    coordinator_denied,
+    executor_policy_class,
+    executor_refusal,
     l2_auto_close_class,
     policy_row,
+    storm_escape_target,
 )
 from escalation.categories import EscalationCategory
+from escalation.models import Escalation
 
 
 class TestRoleLevelAllowlistShape:
@@ -824,3 +839,298 @@ class TestPolicyTableRows:
         ]
         for row in L2_AUTO_CLOSE_ALLOWLIST:
             assert any(row is table_row for table_row in POLICY_TABLE), row.policy_class
+
+
+_NOW = datetime(2026, 11, 4, 12, 0, tzinfo=UTC)
+_FRESH = (_NOW - timedelta(minutes=10)).isoformat()
+_STALE = (_NOW - timedelta(hours=7)).isoformat()
+_FOUND_ON_MAIN_TEXT = (
+    'found_on_main at 1a2b3c4d; git merge-base --is-ancestor 1a2b3c4d main rc=0'
+)
+
+
+def _record(
+    *,
+    category: str = 'provenance_unattributed',
+    agent_role: str = 'implementer',
+    policy_class: str | None = 'landing_provenance',
+    claimed_at: str | None = _FRESH,
+    claimed_by: str | None = EXECUTOR_IDENTITY,
+) -> Escalation:
+    return Escalation(
+        id='esc-8422-1', task_id='8422', agent_role=agent_role, severity='blocking',
+        category=category, summary='s', level=2, policy_class=policy_class,
+        claimed_at=claimed_at, claimed_by=claimed_by,
+    )
+
+
+_LIVE = {'landing_provenance': ClassSwitch.LIVE}
+
+
+def _executor(
+    record: Escalation,
+    *,
+    action: str = 'close_only',
+    resolution: str = _FOUND_ON_MAIN_TEXT,
+    state: dict[str, ClassSwitch] | None = None,
+    queue_kind: str = 'project',
+) -> PolicyRefusal | None:
+    return executor_refusal(
+        record, action, resolution, _LIVE if state is None else state,
+        now=_NOW, queue_kind=queue_kind,  # type: ignore[arg-type]
+    )
+
+
+def _claim(
+    record: Escalation,
+    policy_class: str = 'landing_provenance',
+    *,
+    state: dict[str, ClassSwitch] | None = None,
+    clean: bool = False,
+    queue_kind: str = 'project',
+) -> PolicyRefusal | None:
+    return claim_refusal(
+        record, policy_class, {} if state is None else state,
+        now=_NOW, clean=clean, queue_kind=queue_kind,  # type: ignore[arg-type]
+    )
+
+
+def _unclaimed(**overrides: str) -> Escalation:
+    return _record(policy_class=None, claimed_at=None, claimed_by=None, **overrides)
+
+
+class TestExecutorIdentity:
+    def test_executor_identity_resolves_levels_0_to_2(self) -> None:
+        assert EXECUTOR_IDENTITY == 'orchestrator-escalation-executor'
+        assert ROLE_LEVEL_ALLOWLIST[EXECUTOR_IDENTITY] == frozenset({0, 1, 2})
+
+    def test_coordinator_keeps_full_levels(self) -> None:
+        assert COORDINATOR_IDENTITY == 'interactive:coordinator'
+        assert COORDINATOR_IDENTITY not in ROLE_LEVEL_ALLOWLIST
+
+    def test_both_identities_may_promote(self) -> None:
+        assert EXECUTOR_IDENTITY in PROMOTE_ALLOWED
+        assert COORDINATOR_IDENTITY in PROMOTE_ALLOWED
+
+    def test_executor_deny_roles_extend_the_auto_close_deny_roles(self) -> None:
+        watchdogs = {'orchestrator-watchdog', 'dashboard-watchdog'}
+        assert L2_AUTO_CLOSE_DENY_ROLES | watchdogs == EXECUTOR_DENY_ROLES
+
+    def test_claim_ttl_is_the_six_hour_triage_ack_window(self) -> None:
+        assert timedelta(hours=6) == CLAIM_TTL
+
+    def test_carve_out_stays_watcher_only(self) -> None:
+        assert l2_auto_close_class(
+            identity=EXECUTOR_IDENTITY, level=2, action='close_only',
+            category='task_failure', agent_role='some-agent',
+            resolution='Subject task status=done per get_task; escalation moot.',
+        ) is None
+
+
+class TestExecutorRefusal:
+    """executor_refusal checks in PRD §5.1 order and names what failed."""
+
+    def test_everything_valid_is_not_refused(self) -> None:
+        record = _record()
+        assert _executor(record) is None
+        assert executor_policy_class(
+            record, 'close_only', _FOUND_ON_MAIN_TEXT, _LIVE, now=_NOW, queue_kind='project',
+        ) == 'landing_provenance'
+
+    def test_deny_category_is_denied(self) -> None:
+        refusal = _executor(_record(category='milestone_gate'))
+        assert refusal is not None
+        assert refusal.code is RefusalCode.DENIED_RECORD
+        assert 'milestone_gate' in refusal.detail
+
+    @pytest.mark.parametrize('agent_role', sorted(EXECUTOR_DENY_ROLES))
+    def test_deny_role_is_denied(self, agent_role: str) -> None:
+        refusal = _executor(_record(agent_role=agent_role))
+        assert refusal is not None
+        assert refusal.code is RefusalCode.DENIED_RECORD
+        assert agent_role in refusal.detail
+
+    def test_deny_role_outranks_a_missing_claim(self) -> None:
+        refusal = _executor(_unclaimed(agent_role='orchestrator-watchdog'))
+        assert refusal is not None
+        assert refusal.code is RefusalCode.DENIED_RECORD
+
+    @pytest.mark.parametrize(
+        ('claimed_at', 'claimed_by'),
+        (
+            pytest.param(None, None, id='no-claim'),
+            pytest.param(_STALE, EXECUTOR_IDENTITY, id='seven-hours-old'),
+            pytest.param((_NOW - CLAIM_TTL).isoformat(), EXECUTOR_IDENTITY, id='exactly-ttl'),
+            pytest.param(_FRESH, 'interactive', id='other-claimant'),
+            pytest.param('not-a-timestamp', EXECUTOR_IDENTITY, id='unparsable'),
+        ),
+    )
+    def test_claim_must_be_fresh_and_the_executors(
+        self, claimed_at: str | None, claimed_by: str | None,
+    ) -> None:
+        refusal = _executor(_record(claimed_at=claimed_at, claimed_by=claimed_by))
+        assert refusal is not None
+        assert refusal.code is RefusalCode.NO_FRESH_CLAIM
+
+    def test_unknown_class(self) -> None:
+        refusal = _executor(_record(policy_class='nope'))
+        assert refusal is not None
+        assert refusal.code is RefusalCode.UNKNOWN_CLASS
+        assert 'nope' in refusal.detail
+
+    def test_row_mismatch_on_category(self) -> None:
+        refusal = _executor(_record(category='task_failure'))
+        assert refusal is not None
+        assert refusal.code is RefusalCode.ROW_MISMATCH
+        assert 'task_failure' in refusal.detail
+
+    def test_recon_row_does_not_serve_a_project_queue(self) -> None:
+        record = _record(category='recon_stale_run', policy_class='recon_run_self_cleared')
+        refusal = _executor(record, state={'recon_run_self_cleared': ClassSwitch.LIVE})
+        assert refusal is not None
+        assert refusal.code is RefusalCode.ROW_MISMATCH
+        assert 'project' in refusal.detail
+
+    def test_project_row_does_not_serve_the_recon_queue(self) -> None:
+        refusal = _executor(_record(), queue_kind='reconciliation')
+        assert refusal is not None
+        assert refusal.code is RefusalCode.ROW_MISMATCH
+        assert 'reconciliation' in refusal.detail
+
+    def test_action_must_be_allowed_by_the_row(self) -> None:
+        refusal = _executor(_record(), action='resume')
+        assert refusal is not None
+        assert refusal.code is RefusalCode.ACTION_NOT_ALLOWED
+        assert 'resume' in refusal.detail
+
+    @pytest.mark.parametrize(
+        'state',
+        (
+            pytest.param({'landing_provenance': ClassSwitch.SHADOW}, id='shadow'),
+            pytest.param({'landing_provenance': ClassSwitch.OFF}, id='off'),
+            pytest.param({}, id='absent-means-initial-shadow'),
+        ),
+    )
+    def test_class_must_be_live(self, state: dict[str, ClassSwitch]) -> None:
+        refusal = _executor(_record(), state=state)
+        assert refusal is not None
+        assert refusal.code is RefusalCode.CLASS_NOT_LIVE
+
+    def test_evidence_missing_names_the_unmatched_pattern(self) -> None:
+        text = 'found_on_main; git merge-base --is-ancestor main rc=0'
+        refusal = _executor(_record(), resolution=text)
+        assert refusal is not None
+        assert refusal.code is RefusalCode.EVIDENCE_MISSING
+        row = policy_row('landing_provenance')
+        assert row is not None
+        missing = [pattern.pattern for pattern in row.evidence if not pattern.search(text)]
+        assert missing
+        for pattern in missing:
+            assert pattern in refusal.detail
+
+    def test_any_refusal_projects_to_no_class(self) -> None:
+        assert executor_policy_class(
+            _record(), 'resume', _FOUND_ON_MAIN_TEXT, _LIVE, now=_NOW, queue_kind='project',
+        ) is None
+
+
+class TestClaimRefusal:
+    def test_shadow_class_is_claimable(self) -> None:
+        assert _claim(_unclaimed()) is None
+
+    def test_deny_record(self) -> None:
+        refusal = _claim(_unclaimed(agent_role='orchestrator-watchdog'))
+        assert refusal is not None
+        assert refusal.code is RefusalCode.DENIED_RECORD
+
+    def test_unknown_class(self) -> None:
+        refusal = _claim(_unclaimed(), 'nope')
+        assert refusal is not None
+        assert refusal.code is RefusalCode.UNKNOWN_CLASS
+
+    def test_row_mismatch(self) -> None:
+        refusal = _claim(_unclaimed(category='task_failure'))
+        assert refusal is not None
+        assert refusal.code is RefusalCode.ROW_MISMATCH
+
+    def test_off_class_is_not_claimable(self) -> None:
+        refusal = _claim(_unclaimed(), state={'landing_provenance': ClassSwitch.OFF})
+        assert refusal is not None
+        assert refusal.code is RefusalCode.CLASS_OFF
+
+    def test_fresh_claim_blocks_a_second(self) -> None:
+        refusal = _claim(_record())
+        assert refusal is not None
+        assert refusal.code is RefusalCode.ALREADY_CLAIMED
+
+    def test_stale_claim_is_reclaimable(self) -> None:
+        assert _claim(_record(claimed_at=_STALE)) is None
+
+    def test_file_writing_row_needs_a_clean_project_root(self) -> None:
+        record = _unclaimed(category='preexisting_main_break')
+        refusal = _claim(record, 'red_main_recovery', clean=False)
+        assert refusal is not None
+        assert refusal.code is RefusalCode.PROJECT_ROOT_DIRTY
+        assert _claim(record, 'red_main_recovery', clean=True) is None
+
+
+class TestCoordinatorDenied:
+    def test_fresh_executor_claim_denies_the_coordinator(self) -> None:
+        assert coordinator_denied(_record(), _NOW) is True
+
+    @pytest.mark.parametrize(
+        ('claimed_at', 'claimed_by'),
+        (
+            pytest.param(_STALE, EXECUTOR_IDENTITY, id='seven-hours-old'),
+            pytest.param((_NOW - CLAIM_TTL).isoformat(), EXECUTOR_IDENTITY, id='exactly-ttl'),
+            pytest.param(None, None, id='no-claim'),
+            pytest.param('not-a-timestamp', EXECUTOR_IDENTITY, id='unparsable'),
+            pytest.param(_FRESH, 'interactive', id='non-executor-claimant'),
+        ),
+    )
+    def test_anything_else_leaves_the_coordinator_free(
+        self, claimed_at: str | None, claimed_by: str | None,
+    ) -> None:
+        record = _record(claimed_at=claimed_at, claimed_by=claimed_by)
+        assert coordinator_denied(record, _NOW) is False
+
+
+class TestClassTransitions:
+    @pytest.mark.parametrize(
+        ('current', 'target'),
+        (
+            (ClassSwitch.OFF, ClassSwitch.SHADOW),
+            (ClassSwitch.SHADOW, ClassSwitch.LIVE),
+            (ClassSwitch.LIVE, ClassSwitch.SHADOW),
+        ),
+    )
+    def test_allowed_transitions(self, current: ClassSwitch, target: ClassSwitch) -> None:
+        check_class_transition('landing_provenance', current, target)
+
+    @pytest.mark.parametrize(
+        ('current', 'target'),
+        (
+            (ClassSwitch.SHADOW, ClassSwitch.OFF),
+            (ClassSwitch.LIVE, ClassSwitch.OFF),
+            (ClassSwitch.OFF, ClassSwitch.LIVE),
+        ),
+    )
+    def test_illegal_transitions_name_slug_current_and_target(
+        self, current: ClassSwitch, target: ClassSwitch,
+    ) -> None:
+        with pytest.raises(IllegalClassTransition) as excinfo:
+            check_class_transition('landing_provenance', current, target)
+        assert isinstance(excinfo.value, ValueError)
+        message = str(excinfo.value)
+        assert 'landing_provenance' in message
+        assert str(current) in message and str(target) in message
+
+    def test_storm_escape_drops_a_live_class_over_its_cap_to_shadow(self) -> None:
+        assert storm_escape_target(ClassSwitch.LIVE, 31, 30) is ClassSwitch.SHADOW
+
+    @pytest.mark.parametrize(
+        ('current', 'closes'),
+        ((ClassSwitch.LIVE, 30), (ClassSwitch.SHADOW, 99), (ClassSwitch.OFF, 99)),
+    )
+    def test_storm_escape_leaves_everything_else(self, current: ClassSwitch, closes: int) -> None:
+        assert storm_escape_target(current, closes, 30) is None
