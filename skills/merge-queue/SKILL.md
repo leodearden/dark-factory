@@ -452,11 +452,13 @@ Reordering within the suffix is always disk-free (only recomputes the merge-tree
 ### Layer 2: Frozen verify frontier (prefix)
 
 The **frozen prefix** = {verifying} ∪ {landed}. Items in the frozen prefix are **immutable**:
-- A verify is always dispatched against the tip of the frozen prefix (`frozen_prefix_tip`).
+- A verify should be dispatched against the tip of the frozen prefix (`frozen_prefix_tip`). That rule is a dispatch-time detector, not a refusal: see `verify_base_divergences` below.
 - No reorder or re-base ever touches an in-flight verify item.
 - The suffix recompute only touches `_lane_buffers`; in-flight `_inflight` order and `base_sha` are unchanged.
 
-Health check: `two_layer_invariants(main_sha)` → `[]` when all §5.3 invariants hold.
+Health check: `two_layer_invariants(main_sha)` → `[]` when INV-3 chain-intact (no frozen entry built on a recorded dead commit), the successor chain links, frozen∩suffix disjointness and the conflict-graph consistency checks all hold. It does not compare the frozen head with current main: main moving under an in-flight verify is not a violation (task 5302).
+
+Dispatch-time detector: `verify_base_divergences()` → `()` unless a real verify was dispatched on a base that was not the frozen-prefix tip at that moment. Each record is computed once at dispatch and stamped on its in-flight entry, and each also files an L1 `merge_verify_base_divergence` unless one is already open. The verify is never refused: INV-3 voids a dead-base verdict at adoption. A hit means either the frozen-prefix tip pointed at a requeued or dropped head (a regression of task 5302's liveness rule, PRD §5.3 class (a)) or an item was stacked on a speculative-only base (class (d)). Triage it from the record and the PRD §5.3 recurrence bullet.
 
 ### Conflict-clique aging order and disjoint throughput bypass
 
@@ -480,7 +482,8 @@ The `snapshot()` call exposes these additive, backward-compatible keys:
 | `suffix_conflict_graph` | Current conflict-graph edges for suffix items |
 | `frozen_prefix` | `{request_ids, tip_merge_commit, verify_depth}` |
 | `metrics` | `{retries_per_landing, drift_at_detection, landings_total}` |
-| `two_layer_invariants` | `[]` when healthy; list of violation strings otherwise |
+| `two_layer_invariants` | `[]` when healthy; otherwise INV-3 dead-link, successor chain-link, disjointness or graph-consistency violation strings |
+| `verify_base_divergences` | `[]` normally; one `{request_id, task_id, base_sha, expected_tip, verify_depth, observed_at}` dict per in-flight verify that was dispatched off the frozen-prefix tip (task 5302). Non-empty pairs with an L1 `merge_verify_base_divergence` |
 | `hosts` | Per-verify-host `{name, is_local, slot_state, quarantined, quarantine_class, unavailable_since, unavailable_secs, streak, reason}` — tells RU-quarantine (`ru`) from divergence-quarantine (`divergence`) from a leaked slot (busy/parked, no occupant) from free-and-never-asked-for. An RU-tracked host with no allocator slot is appended with `slot_state: null` |
 
 When any host is quarantined the heartbeat line also carries an inline

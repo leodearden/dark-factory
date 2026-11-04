@@ -23,15 +23,15 @@ The **frozen prefix** = {verifying} ∪ {landed}.  The **unfrozen suffix** = eve
 
 ## 2. Key design invariants (§5.3)
 
-All four invariants must hold simultaneously.  `two_layer_invariants(main_sha)` → `[]` when healthy; a non-empty list describes specific violations.
+Three invariants and one detector.  I1, I3 and I4 are invariants and must hold simultaneously.  `two_layer_invariants(main_sha)` → `[]` when healthy; it reports the frozen-prefix half as INV-3 chain-intact (no frozen entry built on a recorded dead commit, `plans/merge-verdict-integrity-prd.md` §1), successor chain links and frozen∩suffix disjointness, plus the conflict-graph consistency checks.  I2 is a detector, judged once at dispatch, with its own surface (task 5302).
 
 ### I1. Frozen prefix immutable
 
 An item in the frozen prefix (verifying or landed) is **never reordered or re-based** out from under an in-flight verify.  Its `_inflight` position and `base_sha` are set at dispatch time and do not change.
 
-### I2. Verify base equals frozen-prefix tip
+### I2 (detector). Verify base equals frozen-prefix tip at dispatch
 
-Every real-verify dispatch uses **exactly the tip of the frozen prefix** as its base SHA (`frozen_prefix_tip(main_sha)`).  Dispatching against any other base is a violation (logged at WARNING by `_warn_if_base_not_frozen_tip`).
+Every real-verify dispatch should use **exactly the tip of the frozen prefix** as its base SHA (`frozen_prefix_tip(main_sha)`).  The rule is judged once, at dispatch, by `SpeculativeMergeWorker._verify_base_divergence_at_dispatch` against that dispatch's freshly fetched main; the policy, with the recovery re-merge carve-out, is `merge_lane/verify_base_detector.py::detect_verify_base_divergence`.  A hit is logged at WARNING, stamped on the in-flight entry as a `VerifyBaseDivergence`, surfaced in `snapshot()['verify_base_divergences']`, and filed as an L1 `merge_verify_base_divergence` unless one is already open.  It never refuses the dispatch (esc-3206-3): INV-3 voids a dead-base verdict at adoption.  It is not re-judged later, because main legitimately moves under an in-flight verify; re-judging it at snapshot time was the false positive behind the 2026-08-12 and 2026-08-28 recurrences (PRD §5.3).
 
 ### I3. Reorder touches only the unfrozen suffix
 
@@ -101,7 +101,8 @@ The breaker itself is a pure read/decide component; the Harness pass owns all si
 | `suffix_conflict_graph` | dict | In-memory conflict-graph edges for unfrozen suffix items (δ=1889) |
 | `frozen_prefix` | dict | `{request_ids, tip_merge_commit, verify_depth}` — current frozen-prefix state (ε=1890) |
 | `metrics` | dict | `{retries_per_landing, drift_at_detection: {count, last, mean, max}, landings_total}` (ι=1894) |
-| `two_layer_invariants` | list\[str\] | `[]` when all §5.3 invariants hold; violation strings otherwise (λ=1895) |
+| `two_layer_invariants` | list\[str\] | `[]` when the §5.3 invariants hold; otherwise INV-3 dead-link, successor chain-link, disjointness or graph-consistency violation strings (λ=1895; INV-3 head arm since task 5302) |
+| `verify_base_divergences` | list\[dict\] | `[]` normally; one `{request_id, task_id, base_sha, expected_tip, verify_depth, observed_at}` record per in-flight verify dispatched off the frozen-prefix tip, judged once at dispatch (I2 detector, task 5302) |
 | `hosts` | list\[dict\] | Per-verify-host state: `{name, is_local, slot_state: free\|busy\|parked\|null, quarantined, quarantine_class: ru\|divergence\|null, unavailable_since, unavailable_secs, streak, reason}` (task 3275) |
 
 `hosts` is what makes an under-full `verifying N/M hosts` line diagnosable — it
@@ -173,8 +174,10 @@ can hang on an ssh connect) or after it returned (a cross-check or gate re-verif
 | `MergeIntake.pop_next_pickable()` | merge_lane/intake_buffers.py | Select next item using clique-scoped aging (ζ=1891) |
 | `frozen_prefix()` | merge_lane/worker.py | Return ordered `request_id`s in the frozen prefix |
 | `frozen_prefix_tip()` | merge_lane/worker.py | Return the base SHA for next verify dispatch |
-| `check_frozen_prefix_invariant()` | merge_lane/worker.py | §5.3 I1+I2 violations (base-chain integrity) |
-| `two_layer_invariants()` | merge_lane/worker.py | All §5.3 violations (I1–I4 + graph consistency) |
+| `check_frozen_prefix_invariant()` | merge_lane/worker.py | Frozen-prefix violations: INV-3 dead links (via `_chain_dead_link`), successor chain links, frozen∩suffix disjointness |
+| `two_layer_invariants()` | merge_lane/worker.py | The §5.3 invariant violations: `check_frozen_prefix_invariant()` + graph consistency.  Not the I2 detector |
+| `verify_base_divergences()` | merge_lane/worker.py | The I2 detector's records stamped on the frozen prefix, in frozen order (task 5302) |
+| `detect_verify_base_divergence()` | merge_lane/verify_base_detector.py | Pure I2 policy: the `VerifyBaseDivergence` a dispatch commits, or None (task 5302) |
 | `recompute_suffix_conflict_graph()` | merge_lane/worker.py | Worker delegator → `MergeIntake.recompute_suffix_conflict_graph()` → `SuffixConflictTracker.recompute()` (suffix_graph.py); recomputes the conflict graph |
 | `MergeIntake.bounce_conflicting_suffix_items()` | merge_lane/intake_buffers.py | Delegator → `SuffixConflictTracker.bounce_conflicting_suffix_items()` (suffix_graph.py); graph-time disk-free bounce of the younger conflicting item |
 | `_run_no_landings_breaker_pass()` | harness.py | Harness pass that acts on `BreakerTrip`: calls `force_halt_scheduler` + files L2-INFO escalation |
@@ -485,6 +488,7 @@ API as one-statement delegators.
 | λ | 1895 | Integration gate + `two_layer_invariants()` — §5.3 invariant health surface |
 | μ | 1896 | This documentation task (SKILL.md + design-doc companion) |
 | ν | 1897 | Follow-on task (post-integration cleanup / companion) |
+| — | 5302 | Frozen-prefix liveness (a vacated finalize head is not frozen); the I2 verify-base rule split out of `two_layer_invariants()` into the dispatch-time detector (`verify_base_divergences()`, L1 `merge_verify_base_divergence`) |
 
 ---
 
