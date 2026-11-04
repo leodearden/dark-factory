@@ -734,6 +734,15 @@ class TestPolicyRowInvariants:
         assert not row.evidence_present('alpha only')
         assert not row.evidence_present('')
 
+    def test_missing_evidence_names_each_unmatched_pattern_in_row_order(self) -> None:
+        row = _row(evidence=(
+            re.compile(r'alpha', re.IGNORECASE),
+            re.compile(r'beta', re.IGNORECASE),
+        ))
+        assert row.missing_evidence('ALPHA then Beta') == ()
+        assert row.missing_evidence('beta only') == ('alpha',)
+        assert row.missing_evidence('') == ('alpha', 'beta')
+
     def test_table_evidence_is_case_insensitive(self) -> None:
         row = policy_row('landing_provenance')
         assert row is not None
@@ -1027,7 +1036,7 @@ class TestExecutorRefusal:
         assert refusal.code is RefusalCode.EVIDENCE_MISSING
         row = policy_row('landing_provenance')
         assert row is not None
-        missing = [pattern.pattern for pattern in row.evidence if not pattern.search(text)]
+        missing = row.missing_evidence(text)
         assert missing
         for pattern in missing:
             assert pattern in refusal.detail

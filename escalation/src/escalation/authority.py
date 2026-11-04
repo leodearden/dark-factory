@@ -317,8 +317,12 @@ class PolicyRow:
         touches_files = self.file_writing or PolicyAction.RECOVER_MAIN in self.actions
         return FULL_AUDIT_MIN_N if touches_files else 0
 
+    def missing_evidence(self, resolution: str) -> tuple[str, ...]:
+        """The source of each evidence pattern *resolution* fails to match, in row order."""
+        return tuple(pattern.pattern for pattern in self.evidence if not pattern.search(resolution))
+
     def evidence_present(self, resolution: str) -> bool:
-        return all(pattern.search(resolution) for pattern in self.evidence)
+        return not self.missing_evidence(resolution)
 
 
 def _any_of(*alternatives: str) -> re.Pattern[str]:
@@ -797,12 +801,10 @@ def executor_refusal(
         return PolicyRefusal(
             RefusalCode.CLASS_NOT_LIVE, f'{row.policy_class!r} is {switch}, not live',
         )
-    text = resolution or ''
-    missing = [pattern.pattern for pattern in row.evidence if not pattern.search(text)]
-    if missing:
+    if missing := row.missing_evidence(resolution or ''):
         return PolicyRefusal(
             RefusalCode.EVIDENCE_MISSING,
-            f'{row.policy_class!r} resolution matches none of: ' + '  AND  '.join(missing),
+            f'{row.policy_class!r} resolution lacks required evidence: ' + '; '.join(missing),
         )
     return None
 
