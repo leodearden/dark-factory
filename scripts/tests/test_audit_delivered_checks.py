@@ -1317,6 +1317,22 @@ class TestStalePaths:
 
 
 class TestReportShape:
+    def test_a_path_row_is_rendered_by_its_paths(self):
+        row = _row(kind='path', pattern=None, paths=('src/gone.py',), status='done')
+        audit = ProjectAudit(
+            project_root='/synthetic',
+            findings=[Finding(row=row, disposition=DISPOSITION_BROKEN)],
+            coverage=AuditCoverage(
+                descriptors_total=1, descriptors_without_task=0, unevaluable=0,
+                sidecars_unloadable=0,
+            ),
+        )
+
+        report = format_report([audit])
+
+        assert 'paths=src/gone.py' in report
+        assert 'pattern=None' not in report
+
     def test_json_is_an_object_carrying_coverage(
         self, tmp_path, make_tasks_db, project_root_with_tasks_db
     ):
@@ -1571,6 +1587,73 @@ class TestSupersessionAttribution:
 
         assert finding.superseded_by is None
         assert finding.disposition == DISPOSITION_BROKEN
+
+    def _path_project(self, tmp_path, make_tasks_db, project_root_with_tasks_db, *,
+                      task_id, expect, path, files=None):
+        return _make_project(
+            tmp_path, make_tasks_db, project_root_with_tasks_db,
+            files=files,
+            tasks=[{'id': task_id, 'status': 'done',
+                    'updated_at': '2020-01-01T00:00:00+00:00',
+                    'metadata': _checks({'name': f'{task_id}-lands', 'kind': 'path',
+                                         'expect': expect, 'paths': [path]})}],
+        )
+
+    def test_a_deleted_path_is_attributed_to_the_task_that_deleted_it(
+        self, tmp_path, make_tasks_db, project_root_with_tasks_db
+    ):
+        root = self._path_project(
+            tmp_path, make_tasks_db, project_root_with_tasks_db,
+            task_id=3700, expect='present', path='src/gone.py',
+            files={'src/a.py': 'pass\n', 'src/gone.py': 'def f():\n    pass\n'},
+        )
+        _delete(root, 'Merge task/3701 into main', 'src/gone.py')
+
+        finding = audit_project(str(root)).findings[0]
+
+        assert finding.disposition == DISPOSITION_SUPERSEDED
+        assert finding.superseded_by == '3701'
+
+    def test_a_recreated_path_is_attributed_to_the_task_that_recreated_it(
+        self, tmp_path, make_tasks_db, project_root_with_tasks_db
+    ):
+        root = self._path_project(
+            tmp_path, make_tasks_db, project_root_with_tasks_db,
+            task_id=3702, expect='absent', path='src/back.py',
+        )
+        _commit(root, 'feat: restore the module (task 3703)', {'src/back.py': 'pass\n'})
+
+        finding = audit_project(str(root)).findings[0]
+
+        assert finding.disposition == DISPOSITION_SUPERSEDED
+        assert finding.superseded_by == '3703'
+
+    def test_a_path_never_created_is_broken_not_superseded(
+        self, tmp_path, make_tasks_db, project_root_with_tasks_db
+    ):
+        root = self._path_project(
+            tmp_path, make_tasks_db, project_root_with_tasks_db,
+            task_id=3704, expect='present', path='src/never.py',
+        )
+
+        finding = audit_project(str(root)).findings[0]
+
+        assert finding.disposition == DISPOSITION_BROKEN
+        assert finding.superseded_by is None
+
+    def test_the_producers_own_commit_never_supersedes_it(
+        self, tmp_path, make_tasks_db, project_root_with_tasks_db
+    ):
+        root = self._path_project(
+            tmp_path, make_tasks_db, project_root_with_tasks_db,
+            task_id=3705, expect='absent', path='src/own.py',
+        )
+        _commit(root, 'Merge task/3705 into main', {'src/own.py': 'pass\n'})
+
+        finding = audit_project(str(root)).findings[0]
+
+        assert finding.disposition == DISPOSITION_BROKEN
+        assert finding.superseded_by is None
 
     @pytest.mark.parametrize('subject, expected', [
         ('Merge task/3578 into main', '3578'),
