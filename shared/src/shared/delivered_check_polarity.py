@@ -152,7 +152,7 @@ from shared.delivered_check_scope import (
     resolve_commit,
     stale_scope_paths,
 )
-from shared.posix_ere import top_level_arms
+from shared.posix_ere import to_python_regex, top_level_arms
 
 __all__ = [
     'GATE_REF',
@@ -1056,19 +1056,18 @@ def _filename_shaped_finding(
     tree those already exist, so a path check on them would itself be
     rejected as ``vacuous_present``.
 
-    ``re.search`` — Python's engine, not the POSIX ERE ``git grep -E`` uses
-    — is deliberate and safe HERE and nowhere else in this module: the
-    subject is a path LIST that git offers no grep mode over, the result is
-    a diagnostic rather than the verdict the runtime must reproduce, and any
-    pattern Python cannot compile yields ``None`` (no finding) rather than a
-    guess. A verdict is never decided this way.
+    Python's engine is used HERE and nowhere else in this module, because
+    the subject is a path LIST that git offers no grep mode over. The ERE
+    is first translated by ``shared/src/shared/posix_ere.py::to_python_regex``,
+    so the diagnostic reads a bracket expression as git does. A pattern
+    that cannot be translated or compiled yields ``None`` (no finding),
+    never a guess, and a verdict is never decided this way.
     """
     tracked = _tracked_paths(paths, repo_root=repo_root, ref=ref)
     if not tracked:
         return None
-    try:
-        matcher = re.compile(pattern)
-    except re.error:
+    matcher = _compile_ere(pattern)
+    if matcher is None:
         return None
     hits = [path for path in tracked if matcher.search(path)]
     if not hits:
@@ -1091,6 +1090,18 @@ def _filename_shaped_finding(
     )
 
 
+def _compile_ere(pattern: str) -> re.Pattern[str] | None:
+    """*pattern*, a ``git grep -E`` ERE, compiled so Python reads it as git
+    does; ``None`` when it cannot be translated or compiled."""
+    translated = to_python_regex(pattern)
+    if translated is None:
+        return None
+    try:
+        return re.compile(translated)
+    except re.error:
+        return None
+
+
 def _declared_filename_finding(
     name: str,
     pattern: str,
@@ -1107,9 +1118,11 @@ def _declared_filename_finding(
     The task's ``metadata.files`` can.
 
     THE RULE, exactly: EVERY top-level alternative of the pattern (see
-    ``shared/src/shared/posix_ere.py::top_level_arms``), compiled by Python ``re``, FULLY matches the
-    basename or the stem (basename minus its last suffix) of one declared
-    file that EVERY entry of the check's ``paths`` contains (the whole tree
+    ``shared/src/shared/posix_ere.py::top_level_arms``), translated by
+    ``shared/src/shared/posix_ere.py::to_python_regex`` so a bracket
+    expression reads as git reads it, FULLY matches the basename or the
+    stem (basename minus its last suffix) of one declared file that EVERY
+    entry of the check's ``paths`` contains (the whole tree
     when ``paths`` is empty). Full match, not search, so a symbol that
     merely shares text with a module name is not flagged; every arm, so an
     alternative naming a real symbol keeps the check a sound gate; every
@@ -1117,16 +1130,16 @@ def _declared_filename_finding(
     can be a wiring check — a declared module named in ANOTHER file's
     import.
     A pattern the splitter cannot parse is judged whole, and only when it
-    carries no ``|`` at all.
+    carries no ``|`` at all. An arm that cannot be translated or compiled
+    yields no finding, never a guess.
     """
     arms = top_level_arms(pattern)
     if arms is None:
         if '|' in pattern:
             return None
         arms = [pattern]
-    try:
-        matchers = [re.compile(arm) for arm in arms]
-    except re.error:
+    matchers = [matcher for matcher in map(_compile_ere, arms) if matcher is not None]
+    if len(matchers) != len(arms):
         return None
     for declared in files:
         if declared.endswith('/') or not all(_is_under(declared, scope) for scope in paths):
