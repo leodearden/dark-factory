@@ -79,6 +79,7 @@ from test_merge_queue_rebased_landing_dead_base import _git_until_it_takes, _lan
 from orchestrator.config import OrchestratorConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane import MERGE_WORKER_SHUTDOWN_REASON, MergeLane, MergeRequest
+from orchestrator.merge_lane.types import RecoveryEvidence
 from orchestrator.remote_gate import RunnerUnavailableKind
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import HostAllocator, HostLease, RunnerUnavailable
@@ -771,7 +772,9 @@ class TestHostFreedWhileHeadVerifies:
             assert not lane.requests[WAITER].result.done(), lane.observed()
             assert lane.states()[LONG_HEAD] == 'verifying', lane.observed()
 
-            assert lane.worker.readmit_host(lane.remote.name, now=time.time()) is True, (
+            assert lane.worker.readmit_host(
+                lane.remote.name, now=time.time(), evidence=RecoveryEvidence.SSH_HEALTH_PROBE,
+            ) is True, (
                 f'a passing reprobe could not readmit the benched laptop; {_remote_row(lane)!r}'
             )
 
