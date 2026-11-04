@@ -200,8 +200,10 @@ from shared.git_async import run_git
 from shared.scheduler_state import SchedulerStateSnapshot
 from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL, has_live_claimant
 from shared.task_metadata import RoutingState
+from shared.task_statuses import ACTIVE, TaskStatus
 
 from fused_memory.services.orchestrator_detector import is_orchestrator_live_for
+from fused_memory.utils.task_dependency_ids import task_dependency_ids
 
 logger = logging.getLogger(__name__)
 
@@ -259,6 +261,13 @@ DETERMINISTIC_TASK_KIND: str = 'deterministic'
 # _orchestrator_signal_ineligible (task 2409) to scope the blocked-normal
 # bare-orchestrator suppression.
 NORMAL_TASK_KIND: str = 'normal'
+
+# Dependency statuses that are positive evidence the scheduler will not dispatch
+# the dependent: a strict subset of what
+# orchestrator/src/orchestrator/dependency_verdict.py::_local_verdict counts
+# unsatisfied. Terminal satisfies there; a same-train merge-deferred dep may too.
+UNMET_DEPENDENCY_STATUSES: frozenset[str] = ACTIVE - {TaskStatus.MERGE_DEFERRED}
+
 
 @dataclass(frozen=True)
 class WorkflowLiveness:
@@ -728,10 +737,9 @@ def claimant_label(
     """
     if not isinstance(task, Mapping):
         return ClaimantLabel.UNKNOWN
-    claimant = task.get('claimant_run_id')
-    # The "no claimant" predicate of shared/task_claimant.py::_claimant_liveness_stranded.
-    if claimant is None or (isinstance(claimant, str) and not claimant.strip()):
+    if _has_no_claimant(task):
         return ClaimantLabel.NONE
+    claimant = task.get('claimant_run_id')
     try:
         is_live = has_live_claimant(task, now, heartbeat_ttl)
     except Exception:
@@ -795,9 +803,37 @@ def is_pure_gate_metadata(metadata: object) -> bool:
     return bool(metadata.get('always_escalates')) and not metadata.get('before_done')
 
 
+def is_unclaimed_awaiting_dependency(task: object, dependency_statuses: object) -> bool:
+    """Return True when *task* is unclaimed and awaits at least one unmet local dependency.
+
+    Unclaimed means no claimant (null or blank ``claimant_run_id``) and no
+    ``heartbeat_at``. Unmet means a dependency id whose status in
+    *dependency_statuses* is in :data:`UNMET_DEPENDENCY_STATUSES`. Feeds rule 6
+    of :func:`_orchestrator_signal_ineligible` (task 8330).
+
+    Fail-safe toward live: only positive evidence returns True. A non-Mapping
+    input, a task with no dependencies, or a dependency that is missing from the
+    map, reads ``'unknown'`` or is merge-deferred all return False.
+    """
+    if not isinstance(task, Mapping) or not isinstance(dependency_statuses, Mapping):
+        return False
+    if not _has_no_claimant(task) or task.get('heartbeat_at') is not None:
+        return False
+    return any(
+        dependency_statuses.get(dep_id) in UNMET_DEPENDENCY_STATUSES
+        for dep_id in task_dependency_ids(dict(task))
+    )
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+
+def _has_no_claimant(task: Mapping) -> bool:
+    """The "no claimant" predicate of shared/task_claimant.py::_claimant_liveness_stranded."""
+    claimant = task.get('claimant_run_id')
+    return claimant is None or (isinstance(claimant, str) and not claimant.strip())
 
 
 def _task_in_scheduler_holders_or_parks(
