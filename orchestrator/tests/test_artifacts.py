@@ -17,6 +17,7 @@ from _review_fixtures import review_aggregation, review_issue
 from shared import safe_io
 
 from orchestrator.artifacts import (
+    PLAN_BASE_COMMIT_KEY,
     PLAN_SCHEMA_VERSION,
     PLAN_TASK_TEXT_FP_KEY,
     ArtifactWriteError,
@@ -25,6 +26,7 @@ from orchestrator.artifacts import (
     TaskArtifacts,
     _normalize_plan,
     iteration_entry_written_by_orchestrator,
+    plan_task_text_fp,
 )
 from orchestrator.review_payload import ReviewPayloadError
 
@@ -540,6 +542,15 @@ class TestPlanProvenance:
         artifacts.stamp_plan_provenance('session-abc123')
         assert PLAN_TASK_TEXT_FP_KEY not in artifacts.read_plan()
 
+    def test_plan_task_text_fp_reads_a_stamped_fingerprint(self):
+        assert plan_task_text_fp({PLAN_TASK_TEXT_FP_KEY: 'tfp:x'}) == 'tfp:x'
+
+    @pytest.mark.parametrize('plan', [
+        {}, {PLAN_TASK_TEXT_FP_KEY: ''}, {PLAN_TASK_TEXT_FP_KEY: None}, {PLAN_TASK_TEXT_FP_KEY: 7},
+    ], ids=['absent', 'empty', 'none', 'int'])
+    def test_plan_task_text_fp_is_none_for_an_absent_or_malformed_stamp(self, plan: dict):
+        assert plan_task_text_fp(plan) is None
+
     def test_validate_plan_owner_true_for_matching_session(self, artifacts: TaskArtifacts):
         artifacts.write_plan(dict(VALID_PLAN_WITH_STEPS))
         artifacts.stamp_plan_provenance('session-abc123')
@@ -644,18 +655,24 @@ class TestBumpRevalidationStamp:
         assert '_revalidated_at' in updated
         assert updated['_revalidated_by_session'] == 'sess-1'
 
-    def test_updates_base_commit_when_provided(self, artifacts: TaskArtifacts):
-        artifacts.write_plan(dict(VALID_PLAN_WITH_STEPS))
-        artifacts.bump_revalidation_stamp('sess-1', base_commit='newsha456')
-        assert artifacts.read_base_commit() == 'newsha456'
+    def test_advances_the_plan_base_not_the_dispatch_base(self, worktree: Path):
+        worktree.mkdir(parents=True, exist_ok=True)
+        ta = TaskArtifacts(worktree)
+        ta.init('task-1', 'T', 'd', base_commit='originalsha')
+        ta.write_plan(dict(VALID_PLAN_WITH_STEPS))
+        ta.bump_revalidation_stamp('sess-1', base_commit='newsha456')
+        assert ta.read_plan()[PLAN_BASE_COMMIT_KEY] == 'newsha456'
+        assert ta.read_base_commit() == 'originalsha'
 
     def test_leaves_base_commit_when_none(self, worktree: Path):
         worktree.mkdir(parents=True, exist_ok=True)
         ta = TaskArtifacts(worktree)
         ta.init('task-1', 'T', 'd', base_commit='originalsha')
         ta.write_plan(dict(VALID_PLAN_WITH_STEPS))
+        ta.stamp_plan_provenance('s0', base_commit='planbase')
         ta.bump_revalidation_stamp('sess-1')  # base_commit=None default
         assert ta.read_base_commit() == 'originalsha'
+        assert ta.read_plan()[PLAN_BASE_COMMIT_KEY] == 'planbase'
 
     def test_raises_on_missing_plan(self, artifacts: TaskArtifacts):
         with pytest.raises(ValueError, match='valid plan'):
@@ -1917,6 +1934,42 @@ class TestPlanNormalizationIntegration:
         raw_on_disk = json.loads(artifacts.artifact_path('plan.json').read_text())
         assert 'steps' in raw_on_disk
         assert 'tdd_steps' not in raw_on_disk
+
+    def test_peek_plan_normalizes_without_writing_back(self, artifacts: TaskArtifacts):
+        plan_path = artifacts.artifact_path('plan.json')
+        raw = {'task_id': 'task-1', 'tdd_steps': [{'id': 'step-1', 'status': 'pending'}]}
+        plan_path.write_text(json.dumps(raw))
+        bytes_before = plan_path.read_bytes()
+        listing_before = sorted(p.name for p in plan_path.parent.iterdir())
+
+        plan = artifacts.peek_plan()
+
+        assert 'tdd_steps' not in plan
+        assert [step['id'] for step in plan['steps']] == ['step-1']
+        assert plan_path.read_bytes() == bytes_before
+        assert sorted(p.name for p in plan_path.parent.iterdir()) == listing_before
+
+    def test_only_the_on_disk_repair_warns(self, artifacts: TaskArtifacts, caplog):
+        plan_path = artifacts.artifact_path('plan.json')
+        plan_path.write_text(json.dumps({'tdd_steps': ['write the test']}))
+
+        def artifact_warnings() -> list[str]:
+            return [
+                record.getMessage()
+                for record in caplog.records
+                if record.name == 'orchestrator.artifacts'
+                and record.levelname == 'WARNING'
+            ]
+
+        with caplog.at_level('WARNING'):
+            artifacts.peek_plan()
+            artifacts.peek_plan()
+            assert artifact_warnings() == []
+
+            artifacts.read_plan()
+            [repair_warning] = artifact_warnings()
+
+        assert str(plan_path) in repair_warning
 
     def test_read_plan_no_write_when_valid(self, artifacts: TaskArtifacts):
         valid = {

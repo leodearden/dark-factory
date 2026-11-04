@@ -9,10 +9,13 @@ import httpx
 import pytest
 from _fm_helpers import QDRANT_URL, collection_vector_size, qdrant_skipif
 from _qdrant_responses import missing_collection_404
+from mem0 import AsyncMemory
+from mem0.configs.base import MemoryConfig
 from qdrant_client import QdrantClient
 from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
 
 from fused_memory.backends.mem0_client import Mem0Backend, is_missing_collection_error
+from fused_memory.config.schema import Mem0BackendConfig
 from fused_memory.models.scope import Scope
 
 # Sentinel distinguishing "caller passed vector=None" (model a Qdrant point
@@ -2133,7 +2136,6 @@ async def _build_asr_backend(mock_config, scope, monkeypatch) -> Mem0Backend:
     config = mock_config.model_copy(deep=True)
     backend = Mem0Backend(config)
     inst = await backend._get_instance(scope)
-    inst.db.add_history = lambda *a, **kw: None
 
     collection = scope.mem0_collection_name(config.mem0.collection_prefix)
     # Race-safe vector-dim read: under `-n auto` load the just-created
@@ -3264,6 +3266,74 @@ class TestBuildConfigDictEndpointPlumbing:
         assert 'embedding_dims' in embedder_params
         assert 'embedding_model_dims' not in embedder_params
         assert 'embedding_model_dims' in vector_store_params
+
+
+@pytest.fixture
+def mem0_built_from(monkeypatch) -> list[dict]:
+    """Every config dict mem0 is built from, captured at mem0's own boundary.
+
+    The recorder hands back a double whose ``add`` answers the way mem0's does,
+    so the public ``Mem0Backend.add`` runs end to end with no Qdrant and no
+    OpenAI.
+    """
+    captured: list[dict] = []
+
+    class _BuiltInstance:
+        async def add(self, **kwargs):
+            return {'results': [{'id': 'm1'}]}
+
+    def _record(cls, config_dict):
+        captured.append(config_dict)
+        return _BuiltInstance()
+
+    monkeypatch.setattr(AsyncMemory, 'from_config', classmethod(_record))
+    return captured
+
+
+class TestMem0HistoryPersistence:
+    """``mem0.persist_history`` decides which SQLite DB mem0 keeps its change
+    history in.
+
+    Every assertion reads mem0's PARSED ``MemoryConfig``: it ignores unknown
+    keys, so a misspelt key would silently fall back to the shared file, and
+    only the parsed value can catch that.
+    """
+
+    @pytest.mark.asyncio
+    async def test_history_goes_to_a_private_in_memory_db_when_persistence_is_off(
+        self, mock_config, mem0_built_from,
+    ):
+        mock_config.mem0.persist_history = False
+
+        await Mem0Backend(mock_config).add('x', Scope(project_id='p'))
+
+        assert MemoryConfig(**mem0_built_from[0]).history_db_path == ':memory:'
+
+    @pytest.mark.asyncio
+    async def test_the_shipped_default_leaves_mem0_on_its_own_shared_history_db(
+        self, mock_config, mem0_built_from,
+    ):
+        assert Mem0BackendConfig().persist_history is True
+        config = mock_config.model_copy(deep=True)
+        config.mem0.persist_history = True
+
+        await Mem0Backend(config).add('x', Scope(project_id='p'))
+
+        assert 'history_db_path' not in mem0_built_from[0]
+        assert (
+            MemoryConfig(**mem0_built_from[0]).history_db_path
+            == MemoryConfig().history_db_path
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_shared_test_config_keeps_history_off_the_shared_db(
+        self, mock_config, mem0_built_from,
+    ):
+        """Every test that builds a real mem0 instance derives its config from
+        ``mock_config``, and relies on this to stay off the shared file."""
+        await Mem0Backend(mock_config).add('x', Scope(project_id='p'))
+
+        assert MemoryConfig(**mem0_built_from[0]).history_db_path == ':memory:'
 
 
 class TestNonDefaultDimsAgainstAnExistingCollection:

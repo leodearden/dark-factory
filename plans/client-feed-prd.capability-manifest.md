@@ -109,6 +109,8 @@ Gate task 7062 (esc-7062-1). Six new blocks in the sidecar, σ1a, σ1b, σ2, σ3
 their own `commit_planning`. `signal_leaves` is now `["ζ", "σ3"]`. As of main `384a6dc454`
 (2026-10-23).
 
+Added 2026-11-03 (decision 14, Leo's ruling in scoping-intake `docs/prds/declined-defect-reports.md`): one more block, σ1c (`DefectRuled` in the inbox contract, task 8351). Evidence: σ1a (7402) done, so `client_feed/contract.py`'s union and `parse_inbox_line` exist to extend; `defect_ruled` grepped absent at `06aea7ac01`; the consumer is σ2 (7404, amended, now depending on σ1c) and the writer is the portal's δ (scoping_intake 602), whose `in-v3` fixture σ3 (7407) vendors; the duty's writes exist (`shared.defects.Withdrawal`, `WithdrawalCode.NOT_A_DEFECT`, `Rule`, `Ruling{ruled_by: operator}`; `record_defect_outcome`, `declare_defect`, defect-tests α2 7044 done). Delivered check: `class DefectRuled` present in `contract.py`.
+
 **Verdict summary: 16 bindings, all PASS.**
 
 - 10 are mechanical checks: 8 grep `present` and 2 path `present`.

@@ -291,9 +291,18 @@ one coverage function, one depth). The residue backstop covers anything that sli
 `shared/src/shared/task_metadata.py::_BLESSED_METADATA_KEYS`; value validated at the cancel
 write by the gate; `docs/task-authoring.md` Tier-A entry + Tier-B row
 `superseded_by ← x_superseded_by, x_subsumed_by, subsumed_by, x_coalesced_into, x_replacement`
-so the legacy spellings warn as `unknown_key` drift per the Tier-B contract
 (`tests/scripts/test_task_authoring_tier_b_canonical_keys.py` pins that the canonical is
-blessed). Not the same spelling as the MEMORY key (`x_superseded_by`, string id, Mem0 record) on
+blessed). Of the row's aliases only the un-prefixed `subsumed_by` warns `unknown_key` (Tier-B
+drift; α pins it in
+`shared/tests/test_task_metadata.py::TestParseMetadataFailurePolicy::test_superseded_by_tier_b_alias_still_warns`).
+The `x_` spellings (`x_superseded_by`, `x_subsumed_by`, `x_coalesced_into`, `x_replacement`)
+sit in the Tier-C `x_` namespace that `shared/src/shared/task_metadata.py::parse_metadata`
+never warns on (`docs/task-authoring.md` §8 Tier-C;
+`shared/tests/test_task_metadata.py::TestParseMetadataFailurePolicy::test_x_prefixed_unknown_key_silent_zero_warnings`),
+so the row lists them only as spellings to avoid in new writes — no `x_` carve-out
+(esc-8142-1: with no corpus migration per D3, a carve-out would make every legacy pointer a
+permanent census line). `superseded_by` and `cancel_dispositions` are Tier-A blessed and do not
+warn `unknown_key`. Not the same spelling as the MEMORY key (`x_superseded_by`, string id, Mem0 record) on
 purpose: same name, different store, different shape is heuristic-1 lying. The deferral
 `carried_by` record stays what it is — a HOLD with a carrier, not a supersession — and
 `x_coalesced_into` keeps its two legacy readers; neither is folded here. Written ONLY by the
@@ -576,7 +585,7 @@ Model: `fused-memory/tests/test_status_authority_gate.py::_fresh_stack` (real `S
 | 23 | same | late refusal re-files | pre-flight passes; dependent D added before the harness write | `CancelChildrenRejection`; new L2 on P with `evidence` payload; P status unchanged (blocked) |
 | 24 | same | no harness | `harness=None` | response `task_status_effect='none_no_orchestrator'` |
 | 25 | Stage 2 ↔ refusal | prompt carries the rules | render | `render_cancel_children_rules()` names `get_cancel_children` and every action in `ChildDisposition`; SKILL.md marker block == `render_decision_table_markdown()` |
-| 26 | vocabulary | blessing | parse a task carrying `superseded_by` / `cancel_dispositions` | no `unknown_key`; `x_superseded_by` on a task WARNS (Tier-B); machine-authored keys ⊆ blessed (`test_pending_since_anchor.py` family) |
+| 26 | vocabulary | blessing | parse a task carrying `superseded_by` / `cancel_dispositions` | no `unknown_key` for `superseded_by` / `cancel_dispositions`; `subsumed_by` on a task warns `unknown_key` (Tier-B alias); `x_superseded_by` and the row's other `x_` aliases stay silent (Tier-C, esc-8142-1); machine-authored keys ⊆ blessed (`test_pending_since_anchor.py` family) |
 | 27 | MCP ↔ interceptor | bare cancel is gated | enforce on; P live with C2 depending on it; `set_task_status(P,'cancelled')` with NO children/superseded_by | `cancel_children_undispositioned`; P live |
 | 28 | same | late mode does not deadlock | P cancelled; C2 live; late call with `children={C2: repoint [S]}` under the real `_write_lock` | returns within a bounded time (test timeout), C2 repointed; a concurrent unrelated write to the same project completes |
 | 29 | same | concurrent retry of one call | two identical calls for P issued concurrently (same `client_op_id`), first slowed at child 1 | second waits on the per-parent lock, then returns the replayed result or the late-mode shape (`late_disposition: True`), never an untagged `no_op`; each child written once |
@@ -591,7 +600,7 @@ Model: `fused-memory/tests/test_status_authority_gate.py::_fresh_stack` (real `S
 
 | leaf | title | packages / files | observable signal | prereqs | LOC |
 |---|---|---|---|---|---|
-| α | Cancel-disposition contract module + vocabulary | `shared/src/shared/cancel_dispositions.py` (new: models, `DECISION_TABLE`, both renderers, `sibling_lookup_values`; imports NOTHING from `task_metadata` — registration happens from `task_metadata.py`, the `DeferralRecord` precedent), `shared/src/shared/task_metadata.py` (bless `superseded_by`, `cancel_dispositions`; register submodel), `fused-memory/src/fused_memory/middleware/task_curator.py` (`_sibling_lookup_values` moved out, imported back — not duplicated), `escalation/src/escalation/models.py::Escalation` (optional `cancel_children`, `children`, `superseded_by` fields, `granted_files` zero-migration pattern), `docs/task-authoring.md` (Tier-A entries, Tier-B row, "retire a task" pointer), `shared/tests/test_cancel_dispositions.py`, Tier-B test row | `python -c 'from shared.cancel_dispositions import ChildDisposition'` parses the §4.2 examples and rejects the §6 row-6 cases with the named `reason_code`; a task carrying `x_superseded_by` warns `unknown_key` | — | 500–700 |
+| α | Cancel-disposition contract module + vocabulary | `shared/src/shared/cancel_dispositions.py` (new: models, `DECISION_TABLE`, both renderers, `sibling_lookup_values`; imports NOTHING from `task_metadata` — registration happens from `task_metadata.py`, the `DeferralRecord` precedent), `shared/src/shared/task_metadata.py` (bless `superseded_by`, `cancel_dispositions`; register submodel), `fused-memory/src/fused_memory/middleware/task_curator.py` (`_sibling_lookup_values` moved out, imported back — not duplicated), `escalation/src/escalation/models.py::Escalation` (optional `cancel_children`, `children`, `superseded_by` fields, `granted_files` zero-migration pattern), `docs/task-authoring.md` (Tier-A entries, Tier-B row, "retire a task" pointer), `shared/tests/test_cancel_dispositions.py`, Tier-B test row | `python -c 'from shared.cancel_dispositions import ChildDisposition'` parses the §4.2 examples and rejects the §6 row-6 cases with the named `reason_code`; a task carrying `subsumed_by` warns `unknown_key` while one carrying `x_superseded_by` stays silent (Tier-C) | — | 500–700 |
 | β | Interceptor gate (observe mode), executor, `get_cancel_children` tool, late path, transition-window sweep edits | `fused-memory/src/fused_memory/middleware/task_interceptor.py` (set_task_status params, per-parent lock then mode decision, `_apply_status_transition(cancel_cause, batch_ids)`, verifier, `_journal_params`), `fused-memory/src/fused_memory/reconciliation/backlog_policy.py` (`known_project_roots()`), `fused-memory/src/fused_memory/reconciliation/targeted.py` (the two §4.11 transition-window edits only), `fused-memory/config/config.yaml`, `fused-memory/src/fused_memory/config/schema.py` and `fused-memory/src/fused_memory/config/reload.py` (`cancel_children.enforce: false`, allowlisted, per-call read), new `fused-memory/src/fused_memory/middleware/cancel_children_gate.py` (enumeration + coverage + executor; keeps `task_interceptor.py` from growing — heuristic 14; imports downward only — heuristic 13), `fused-memory/src/fused_memory/server/tools.py` (params, new tool), `fused-memory/tests/test_cancel_children_gate.py` (§6 rows 1–14, 26–31) | §6 row 1 (with enforce on in the test stack) and row 2 through the MCP tool against a real store; row 31 (observe mode allows and journals) | α | 1,100–1,500 |
 | γ | Backstop sweep rewrite | extract `_sweep_*` from `targeted.py` into `fused-memory/src/fused_memory/reconciliation/cancel_backstop.py`; `reconcile_task(cancel_cause=)`; `fused-memory/tests/test_targeted.py::TestSweepCancelledDescendants` rewritten against a real stack (drop the interceptor-kwarg mock assertions — Tests stance); wiring pin for `task_interceptor` | §6 rows 15–19, 32, 35; `descendant_escalated` journal rows carry `task_ids`; residue records carry `cancel_children` | α (Escalation field), β (producer of the stamps the sweep reads — INV-13; same file `targeted.py`) | 600–900 |
 | δ | Abandon path: pre-flight, persistence, pass-through, loud re-file | `escalation/src/escalation/server.py::resolve_issue`, `escalation/src/escalation/queue.py::resolve` (stamps the α fields), `orchestrator/src/orchestrator/harness.py` (`cancel_children_blocker`, cascade `co_cancelled`, terminal-head refusal, teardown arm, re-file), `orchestrator/src/orchestrator/scheduler.py` (`children`/`superseded_by`/`co_cancelled` kwargs, size-scaled timeout, `CancelChildrenRejection`), tests in `escalation/tests/` and `orchestrator/tests/test_harness_action_dispatch.py` | §6 rows 20–24, 33–34 | α, β | 700–1,000 |
@@ -714,4 +723,12 @@ ordering; cascade callback ordering; `register_metadata_submodel(cardinality='li
 `render_live_workflow_authority_rules` precedent; Tier-B pin test. Interceptor access to the
 known-project-roots registry: verified (Appendix A item 7).
 G6 premises: every signal in §7 is a public call or a grep against a file this PRD writes.
+
+## Corrections (2026-11-03 — esc-8142-1, task 8348)
+
+As authored, §4.8, §6 row 26 and the §7 α signal said an `x_`-prefixed alias (`x_superseded_by`)
+on a task warns `unknown_key`. `shared/src/shared/task_metadata.py::parse_metadata` never warns
+on `x_` keys, so those three sites were corrected in place to: `subsumed_by` warns `unknown_key`; the `x_`
+aliases are Tier-C-silent spellings to avoid; `superseded_by` / `cancel_dispositions` do not
+warn `unknown_key`. D3 is unchanged. Corrected before ζ (task 8147) executes §6 rows 1–35.
 

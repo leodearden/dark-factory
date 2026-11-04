@@ -65,7 +65,7 @@ dev = [
     # tests/test_cli_invoke.py need @pytest.mark.xdist_group pins first (task
     # 5408; pinned by tests/scripts/test_merge_gate_parallelism_config.py::
     # RULED_SERIAL_MEMBERS).
-    "pytest-xdist>=3.5.0",
+    "pytest-xdist>=3.6.0",
     "ruff>=0.4",
     "aiohttp>=3.9",
 ]

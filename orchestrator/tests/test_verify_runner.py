@@ -12,7 +12,15 @@ from typing import Any, ClassVar
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _gate_fixtures import gate_argv, gated_remote_runner
+from _gate_fixtures import (
+    TEST_CODE_CHECKOUT,
+    TEST_DEPLOYED_SHA,
+    TEST_DF_REMOTE,
+    TEST_GATE_ROOT,
+    gate_argv,
+    gated_remote_runner,
+    gated_run,
+)
 from _orch_helpers import pydantic_spec, wait_responsive
 
 from orchestrator.config import ModuleConfig, OrchestratorConfig
@@ -20,9 +28,11 @@ from orchestrator.event_store import EventStore, EventType
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import (
     CANCEL_PROBE_INTERVAL_SECS,
+    GIT_PUSH_SSH_CONFIG,
     HEARTBEAT_STOP_JOIN_SECS,
     LocalRunner,
     MergeVerifySpec,
+    RemoteRunner,
     UnscopedTypecheckSpec,
     VerifyCommand,
     VerifyRunner,
@@ -9431,3 +9441,88 @@ class TestPollUntilClean:
 
         assert await poll_until_clean(probe, attempts=3, sleep=sleep) is True
         assert (len(probes), len(slept)) == (2, 1)
+
+
+def _raw_recording_runner(inner):
+    """A main_branch='main' RemoteRunner on the gate layout, plus every argv it runs, verbatim.
+
+    Unlike :func:`gated_remote_runner`, which strips ``GIT_PUSH_SSH_CONFIG``
+    before *inner* sees a push, the recorder sits outside the gate wrapping, so
+    it keeps each push's transport options.  *inner* still sees plain argvs.
+    """
+    raw_argvs: list[list[str]] = []
+    gated = gated_run(inner)
+
+    async def recording_run(argv, *, cwd=None):
+        raw_argvs.append(list(argv))
+        return await gated(argv, cwd=cwd)
+
+    runner = RemoteRunner(
+        'laptop', 'laptop.local', 'origin', '/repo',
+        main_branch='main',
+        run=recording_run,
+        id_factory=lambda: 'fixed-id',
+        df_remote_checkout=TEST_DF_REMOTE,
+        gate_checkouts_path=TEST_GATE_ROOT,
+        deployed_sha=TEST_DEPLOYED_SHA,
+        code_checkout=TEST_CODE_CHECKOUT,
+    )
+    return runner, raw_argvs
+
+
+@pytest.mark.asyncio
+class TestRemoteRunnerPushTransport:
+    """Every RemoteRunner push rides GIT_PUSH_SSH_CONFIG under a deadline (task 8121)."""
+
+    _PASS = VerifyResult(passed=True, test_output='', lint_output='', type_output='', summary='ok')
+    _PUSH_PREFIX: ClassVar[list[str]] = ['git', *GIT_PUSH_SSH_CONFIG, 'push', 'origin']
+
+    async def test_fast_forward_and_force_pushes_carry_the_ssh_bounds(self):
+        async def inner(argv, *, cwd=None):
+            if argv[:2] == ['git', 'rev-parse']:
+                return (0, 'MAINSHA', '')
+            if argv[:2] == ['git', 'push'] and argv[3] == 'main:refs/heads/main':
+                return (1, '', 'rejected: non-fast-forward')
+            if argv[0] == 'git':
+                return (0, '', '')
+            return (0, result_to_json(self._PASS), '')
+
+        runner, raw_argvs = _raw_recording_runner(inner)
+        await runner.run_merge_verify('abc123', _make_spec())
+
+        assert self._PUSH_PREFIX + ['main:refs/heads/main'] in raw_argvs
+        assert self._PUSH_PREFIX + ['+main:refs/heads/main'] in raw_argvs
+
+    async def test_ref_cleanup_push_carries_the_ssh_bounds(self):
+        async def inner(argv, *, cwd=None):
+            if argv[:2] == ['git', 'rev-parse']:
+                return (0, 'MAINSHA', '')
+            if argv[0] == 'git':
+                return (0, '', '')
+            return (0, result_to_json(self._PASS), '')
+
+        runner, raw_argvs = _raw_recording_runner(inner)
+        await runner.run_merge_verify('abc123', _make_spec())
+
+        assert self._PUSH_PREFIX + ['--delete', 'refs/merge-verify/fixed-id'] in raw_argvs
+
+    @pytest.mark.parametrize('hung_arg', ['refs/heads/main', '--delete'])
+    async def test_a_best_effort_push_that_never_returns_cannot_stall_the_verify(
+        self, monkeypatch, hung_arg,
+    ):
+        """A hung main-mirror push (FF and force alike) or ref cleanup is cut off and swallowed."""
+        monkeypatch.setattr('orchestrator.verify_runner.ENSURE_CLIENT_TIMEOUT_SECS', 0.05)
+
+        async def inner(argv, *, cwd=None):
+            if argv[:2] == ['git', 'rev-parse']:
+                return (0, 'MAINSHA', '')
+            if argv[:2] == ['git', 'push'] and any(hung_arg in arg for arg in argv[2:]):
+                await asyncio.Event().wait()
+            if argv[0] == 'git':
+                return (0, '', '')
+            return (0, result_to_json(self._PASS), '')
+
+        runner, _ = _raw_recording_runner(inner)
+        result = await asyncio.wait_for(runner.run_merge_verify('abc123', _make_spec()), timeout=5)
+
+        assert result == self._PASS

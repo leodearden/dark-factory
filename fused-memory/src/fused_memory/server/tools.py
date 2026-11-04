@@ -43,6 +43,10 @@ from fused_memory.backends.metadata_lookup import (
     InvalidMetadataLookupError,
     validate_metadata_query,
 )
+from fused_memory.backends.task_projection import (
+    InvalidTaskProjectionField,
+    parse_task_projection,
+)
 from fused_memory.config.reload import apply_reload
 from fused_memory.config.schema import DEFAULT_CONFIG_PATH, FusedMemoryConfig
 from fused_memory.mcp_tools.scheduler_state import (
@@ -1299,6 +1303,20 @@ def _validate_statuses(statuses: Any) -> dict[str, Any] | None:
         'error': f'statuses must be a list of status strings; got {statuses!r}',
         'error_type': 'ValidationError',
     }
+
+
+def _validate_fields(fields: Any) -> dict[str, Any] | None:
+    """Return the INV-2 ValidationError payload unless ``fields`` is a valid ``get_tasks`` projection."""
+    try:
+        parse_task_projection(fields)
+    except InvalidTaskProjectionField as e:
+        return {
+            'error': str(e),
+            'error_type': 'ValidationError',
+            'field': e.field,
+            'allowed': list(e.allowed),
+        }
+    return None
 
 
 # find_tasks_by_metadata's page-size cap, and its include_value page budget in
@@ -8640,6 +8658,7 @@ def create_mcp_server(
         page_size: int | None = None,
         offset: int = 0,
         statuses: Any = None,
+        fields: Any = None,
     ) -> dict[str, Any]:
         """List all tasks in the project.
 
@@ -8658,6 +8677,12 @@ def create_mcp_server(
                 results to matching tasks via a SQL ``status IN (...)`` predicate.  An
                 empty list (``[]``) is valid and returns no tasks.  A bare string is
                 rejected with a ValidationError.
+            fields: Optional row projection.  None returns full rows, unchanged.  Each
+                entry is a top-level row key or ``metadata.<key>`` (key matching
+                ``[A-Za-z_][A-Za-z0-9_]*``); ``id`` is always returned, and a requested
+                metadata key absent on a task is omitted.  An invalid entry is a
+                ValidationError carrying ``field`` and ``allowed``.  Composes with
+                ``statuses`` and ``page_size``.
         """
         # Input validation — early-exit before touching the interceptor.
         # Shared with get_statuses so both tools reject identical inputs
@@ -8668,12 +8693,17 @@ def create_mcp_server(
         _statuses_error = _validate_statuses(statuses)
         if _statuses_error is not None:
             return _statuses_error
+        _fields_error = _validate_fields(fields)
+        if _fields_error is not None:
+            return _fields_error
 
         _normalized = _normalize_project_root(project_root)
         if isinstance(_normalized, dict):
             return _normalized
         project_root = _normalized
-        result = await task_interceptor.get_tasks(project_root=project_root, tag=tag, statuses=statuses)
+        result = await task_interceptor.get_tasks(
+            project_root=project_root, tag=tag, statuses=statuses, fields=fields,
+        )
         if isinstance(result, dict) and 'error' not in result:
             pid = resolve_project_id(project_root)
             # Shallow copy to avoid mutating a potentially shared/cached interceptor dict.

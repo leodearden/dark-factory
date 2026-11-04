@@ -42,7 +42,8 @@
 #   t3 — a T3 Code thread in the project whose root is <cwd>; no terminal.
 #     The lane refuses (exit 145) skip_permissions=false and any
 #     $CLAUDE_SPAWN_CLAUDE_ARGS; $CLAUDE_SPAWN_MODEL becomes the thread's
-#     model. Child mode joins on the thread's result.md or archive and exits
+#     model, on the instance resolve_t3_provider picks ($CLAUDE_SPAWN_T3_PROVIDER
+#     names one explicitly; a disabled one is refused, exit 145). Child mode joins on the thread's result.md or archive and exits
 #     with spawn_t3_lane.py `wait`'s code. The started-grace defaults to 300s.
 #   tmux — bypass terminal-emulator discovery entirely
 #     and launch in a crash-survivable, reattachable tmux window instead
@@ -193,6 +194,61 @@ t3_lane_refuse() {
   exit "$EXIT_LANE_REFUSED"
 }
 
+# Any fault or unknown verdict from spawn_t3_lane.py is a launcher failure.
+t3_lane_call() {
+  local rc
+  t3_verdict=$(t3_lane_module "$@")
+  rc=$?
+  if [ "$rc" -ne 0 ] || [ -z "$(verdict_status "$t3_verdict")" ]; then
+    echo "spawn-claude.sh: t3 lane: spawn_t3_lane.py $1 faulted (rc $rc); treating it as a launcher failure" >&2
+    exit 127
+  fi
+}
+
+t3_lane_unexpected() {
+  echo "spawn-claude.sh: t3 lane: spawn_t3_lane.py $1 answered '$t3_verdict'; treating it as a launcher failure" >&2
+  exit 127
+}
+
+# $t3_verdict is a `refused reason=provider-disabled` line naming the instance
+# and how it was chosen (spawn_t3_provider.ProviderSource).
+refuse_disabled_t3_provider() {
+  local instance source why
+  instance=$(verdict_field "$t3_verdict" instance_id)
+  source=$(verdict_field "$t3_verdict" source)
+  case "$source" in
+    explicit) why="CLAUDE_SPAWN_T3_PROVIDER names it, and it is disabled for this T3 project" ;;
+    fallback) why="this T3 project has no default and no single enabled Claude instance, and the fallback is disabled" ;;
+    *) why="it is disabled for this T3 project ($source)" ;;
+  esac
+  t3_lane_refuse "provider instance '$instance'" \
+    "$why; name an enabled instance in CLAUDE_SPAWN_T3_PROVIDER, or set CLAUDE_SPAWN_BACKEND=tmux or wm"
+}
+
+# Sets t3_provider, the instance a model-pinned thread runs on, resolved by
+# spawn_t3_lane.py `provider` (order: $CLAUDE_SPAWN_T3_PROVIDER, the project's
+# live Claude instance, claudeAgent). Runs before the `launching` write, so a
+# disabled instance is refused without leaving a record behind.
+t3_provider=""
+resolve_t3_provider() {
+  if [ -z "${CLAUDE_SPAWN_MODEL:-}" ]; then
+    [ -z "${CLAUDE_SPAWN_T3_PROVIDER:-}" ] && return 0
+    t3_lane_refuse "CLAUDE_SPAWN_T3_PROVIDER='$CLAUDE_SPAWN_T3_PROVIDER' without CLAUDE_SPAWN_MODEL" \
+      "t3 takes a provider instance only together with a model; set CLAUDE_SPAWN_MODEL too"
+  fi
+  local -a args=(provider --cwd "$cwd")
+  [ -n "${CLAUDE_SPAWN_T3_PROVIDER:-}" ] && args+=(--provider "$CLAUDE_SPAWN_T3_PROVIDER")
+  t3_lane_call "${args[@]}"
+  case "$(verdict_status "$t3_verdict")" in
+    instance)
+      t3_provider=$(verdict_field "$t3_verdict" instance_id)
+      [ -n "$t3_provider" ] || t3_lane_unexpected provider
+      ;;
+    refused) refuse_disabled_t3_provider ;;
+    *) t3_lane_unexpected provider ;;
+  esac
+}
+
 refuse_inputs_the_t3_lane_cannot_honour() {
   if [ "$skip_perms" != "true" ]; then
     t3_lane_refuse "skip_permissions=$skip_perms" \
@@ -215,6 +271,7 @@ resolve_spawn_backend
 if [ "$spawn_backend" = "t3" ]; then
   refuse_inputs_the_t3_lane_cannot_honour
   require_python3_for_the_t3_lane
+  resolve_t3_provider
 fi
 
 # Decided once spawn_backend is known (the default differs per lane) and before
@@ -273,17 +330,11 @@ trap _cleanup EXIT
 # PROJECT/TASK_ID/ESCALATION_ID pass through from this process's own
 # environment when a caller already set them.
 #
-# Task 2511: the `launching` subcommand also opportunistically drives
-# session_registry's liveness sweep (mark_orphaned_sessions_exited) after it
-# writes this record -- fail-soft, and it never touches this call's stdout,
-# so the record dir captured into SESSION_RECORD_DIR below is unaffected.
-# Neither that sweep nor reap_stale_records has a periodic production driver
-# of its own (CLI-only), so every spawn is what drains prior orphaned
-# (unclean-death) records to `exited`. Task 2689: every spawn now ALSO
-# opportunistically bound-prunes terminal/stale record dirs from disk
-# (reap_stale_records(limit=REAP_BATCH_LIMIT), also fail-soft) right after
-# the mark sweep, draining the on-disk backlog over successive spawns; the
-# CLI `reap` verb remains the operator's unbounded one-shot full-drain. See
+# Task 7944: after writing this record, `launching` starts a detached full
+# `reap` of the registry and returns at once. That child's stdio is
+# /dev/null, so it never touches this call's stdout and the record dir
+# captured into SESSION_RECORD_DIR below is unaffected. The CLI `reap` verb
+# is the same pipeline run in the foreground. See
 # session_registry._run_launching's docstring.
 SESSION_RECORD_DIR=""
 if command -v python3 >/dev/null 2>&1; then
@@ -1128,21 +1179,6 @@ _detach() {
 # awaits its start (binding its transcript to the record) and, in child mode,
 # joins on its result.md. Any fault or unknown verdict is a launcher failure.
 
-t3_lane_call() {
-  local rc
-  t3_verdict=$(t3_lane_module "$@")
-  rc=$?
-  if [ "$rc" -ne 0 ] || [ -z "$(verdict_status "$t3_verdict")" ]; then
-    echo "spawn-claude.sh: t3 lane: spawn_t3_lane.py $1 faulted (rc $rc); treating it as a launcher failure" >&2
-    exit 127
-  fi
-}
-
-t3_lane_unexpected() {
-  echo "spawn-claude.sh: t3 lane: spawn_t3_lane.py $1 answered '$t3_verdict'; treating it as a launcher failure" >&2
-  exit 127
-}
-
 launch_t3_thread() {
   local thread_title="${title:-${SESSION_RECORD_DIR##*/}}"
   [ -n "$thread_title" ] || thread_title="spawned claude session"
@@ -1150,6 +1186,7 @@ launch_t3_thread() {
   printf '%s' "$prompt" > "$t3_prompt_file"
   local -a args=(launch --cwd "$cwd" --title "$thread_title" --prompt-file "$t3_prompt_file" --record "$SESSION_RECORD_DIR")
   [ -n "${CLAUDE_SPAWN_MODEL:-}" ] && args+=(--model "$CLAUDE_SPAWN_MODEL")
+  [ -n "$t3_provider" ] && args+=(--provider "$t3_provider")
   [ -n "${parent_of_child:-}" ] && args+=(--parent "$parent_of_child")
   t3_launch_epoch=$(date +%s)
   t3_lane_call "${args[@]}"
@@ -1163,6 +1200,7 @@ launch_t3_thread() {
       exit 126
       ;;
     refused)
+      [ "$(verdict_field "$t3_verdict" reason)" = "provider-disabled" ] && refuse_disabled_t3_provider
       t3_lane_refuse "cwd=$cwd ($(verdict_field "$t3_verdict" reason); project root $(verdict_field "$t3_verdict" detail))" \
         "a T3 thread always runs in its project's root; pass that root as cwd, or set CLAUDE_SPAWN_BACKEND=tmux or wm"
       ;;

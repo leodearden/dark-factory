@@ -27,12 +27,28 @@ logger = logging.getLogger(__name__)
 
 PLAN_SCHEMA_VERSION = 1
 PLAN_TASK_TEXT_FP_KEY = '_task_text_fp'
+PLAN_BASE_COMMIT_KEY = '_base_commit'
 
 # Must exceed the longest legitimate critical section: plan_tools._mark_step_done's two timeout=10 git probes.
 PLAN_MUTEX_TIMEOUT_SECS = 60.0
 
 ORCHESTRATOR_ITERATION_SOURCES: frozenset[str] = frozenset({'orchestrator', 'amendment'})
 """The only ``source`` values :meth:`TaskArtifacts.append_iteration_log` writes."""
+
+
+def _plan_stamp(plan: Mapping[str, object], key: str) -> str | None:
+    stamped = plan.get(key)
+    return stamped if isinstance(stamped, str) and stamped else None
+
+
+def plan_base_commit(plan: Mapping[str, object]) -> str | None:
+    """The main SHA *plan* was last validated against (plans/task-meta-task-keying-prd.md §M2); None when unstamped or malformed."""
+    return _plan_stamp(plan, PLAN_BASE_COMMIT_KEY)
+
+
+def plan_task_text_fp(plan: Mapping[str, object]) -> str | None:
+    """The task-text fingerprint *plan* was authored against; None when unstamped or malformed."""
+    return _plan_stamp(plan, PLAN_TASK_TEXT_FP_KEY)
 
 
 def iteration_entry_written_by_orchestrator(entry: object) -> bool:
@@ -234,7 +250,7 @@ def _normalize_plan(plan: dict) -> tuple[dict, bool]:
     if 'steps' not in plan:
         for alias in _STEPS_ALIASES:
             if alias in plan and isinstance(plan[alias], list):
-                logger.warning('Normalizing plan: renaming %r → "steps"', alias)
+                logger.debug('Normalizing plan: renaming %r → "steps"', alias)
                 plan['steps'] = plan.pop(alias)
                 modified = True
                 break
@@ -243,7 +259,7 @@ def _normalize_plan(plan: dict) -> tuple[dict, bool]:
     if 'steps' not in plan and _NESTED_PLAN_KEY in plan:
         nested = plan[_NESTED_PLAN_KEY]
         if isinstance(nested, dict):
-            logger.warning(
+            logger.debug(
                 'Normalizing plan: flattening %s phases from %r',
                 len(nested), _NESTED_PLAN_KEY,
             )
@@ -259,8 +275,8 @@ def _normalize_plan(plan: dict) -> tuple[dict, bool]:
     if isinstance(steps, list):
         new_steps, changed = _wrap_string_items(steps, 'step')
         if changed:
-            logger.warning('Normalizing plan: wrapping %d string steps as dicts',
-                           sum(1 for s in steps if isinstance(s, str)))
+            logger.debug('Normalizing plan: wrapping %d string steps as dicts',
+                         sum(1 for s in steps if isinstance(s, str)))
             plan['steps'] = new_steps
             modified = True
 
@@ -1024,6 +1040,17 @@ class TaskArtifacts:
                 self._write_held_plan(plan)
         return plan
 
+    def peek_plan(self) -> dict:
+        """Return the plan exactly as :meth:`read_plan` would, but never repair
+        it on disk: no ``plan_mutex`` is taken and nothing is written.
+
+        For observers that poll a live task's plan (such as
+        ``orchestrator/task_runtime.py::_read_task_entry``) and must not
+        rewrite it under the agent that owns it.
+        """
+        plan, _needs_repair = self._read_normalized_plan()
+        return plan
+
     def _read_normalized_plan(self) -> tuple[dict, bool]:
         plan_path = self.artifact_path('plan.json')
         if not plan_path.exists():
@@ -1304,20 +1331,21 @@ class TaskArtifacts:
     def bump_revalidation_stamp(
         self, session_id: str, base_commit: str | None = None,
     ) -> None:
-        """Stamp ``_revalidated_at`` on plan.json and update metadata.json's
-        ``base_commit`` to *base_commit*. Mirrors the write semantics of the
+        """Stamp ``_revalidated_at`` on plan.json and advance the plan's own
+        ``_base_commit`` to *base_commit*. Mirrors the write semantics of the
         ``confirm_plan`` plan-tools MCP call but is invoked by orchestrator
         code (Lever B — overlap=0 revalidation skip) rather than by an
-        architect tool call.
+        architect tool call. metadata.json is never written here: its
+        ``base_commit`` is this dispatch's worktree fork point, owned by
+        ``init``/``update_base_commit`` alone (PRD task-meta-task-keying §M2).
 
         Args:
             session_id: Current orchestrator session id, written into
                 ``_revalidated_by_session`` for telemetry / audit. The
                 plan.json's existing ``_session_id`` (the original planner)
                 is preserved.
-            base_commit: New main SHA the plan is now tracked against. When
-                ``None``, metadata.json is left untouched (typical for tests
-                that exercise only the plan.json side-effect).
+            base_commit: The main SHA the plan has now been validated
+                against. A falsy value leaves an existing stamp untouched.
 
         Raises:
             ValueError: if plan.json is missing or has no ``steps`` —
@@ -1332,18 +1360,20 @@ class TaskArtifacts:
                 )
             plan['_revalidated_at'] = datetime.now(UTC).isoformat()
             plan['_revalidated_by_session'] = session_id
+            if base_commit:
+                plan[PLAN_BASE_COMMIT_KEY] = base_commit
             self._write_held_plan(plan)
-        if base_commit is not None:
-            self.update_base_commit(base_commit)
 
     def stamp_plan_provenance(
         self, session_id: str, *, task_text_fp: str | None = None,
+        base_commit: str | None = None,
     ) -> None:
         """Stamp _session_id and _created_at into plan.json.
 
         Reads current plan.json, adds provenance fields, writes back.
         ``task_text_fp=None`` leaves an existing fingerprint untouched (the
-        per-iteration and recovered-plan stamps rely on this).
+        per-iteration and recovered-plan stamps rely on this); a falsy
+        ``base_commit`` likewise leaves an existing ``_base_commit`` untouched.
 
         Raises:
             ValueError: if plan.json is missing or does not contain a 'steps' list.
@@ -1368,6 +1398,8 @@ class TaskArtifacts:
             plan.setdefault('_finalized_at', plan['_created_at'])
             if task_text_fp is not None:
                 plan[PLAN_TASK_TEXT_FP_KEY] = task_text_fp
+            if base_commit:
+                plan[PLAN_BASE_COMMIT_KEY] = base_commit
             self._write_held_plan(plan)
 
     def validate_plan_owner(self, session_id: str) -> bool:

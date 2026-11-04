@@ -413,10 +413,11 @@ def test_the_stamp_is_still_well_formed_json_for_a_hostile_token(
 
     printf cannot escape JSON, so an env value carrying a quote, a backslash, a
     newline or a brace could otherwise produce a syntactically broken file --
-    and _read_clock_epoch fails OPEN on a corrupt body, which would disarm the
-    very min-interval cap this stamp exists to arm. The token's exact value is
-    not asserted (it is unrepresentable here by construction), but its
-    EMPTINESS is: sanitising away a token that was genuinely present would
+    and scripts/_watchdog_state.py::read_clock_epoch fails OPEN on a corrupt
+    body, which would disarm the very min-interval cap this stamp exists to
+    arm. The token's exact value is not asserted (it is unrepresentable here
+    by construction), but its EMPTINESS is: sanitising away a token that was
+    genuinely present would
     forgive the very write it proves, since empty is what
     df_pytest_isolation.py::deploy_clock_change_report reads as "no pytest
     session was an ancestor of this write". So the sanitiser drops to a

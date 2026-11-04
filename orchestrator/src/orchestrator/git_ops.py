@@ -65,7 +65,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Literal, NamedTuple, TypedDict
+from typing import Any, Literal, NamedTuple, TypedDict, TypeGuard
 
 from shared.git_async import run_git
 from shared.proc_group import (
@@ -347,6 +347,12 @@ class TrainMembership(TypedDict, total=False):
     id: str
     order: int
     members: list[str] | None
+
+
+def _is_train_successor(train: TrainMembership | None) -> TypeGuard[TrainMembership]:
+    """Whether *train* places its task after the train's anchor (order > 0),
+    so the task's branch stacks on its predecessor's tip rather than main."""
+    return train is not None and train.get('order', 0) > 0
 
 
 @dataclass(frozen=True)
@@ -4617,7 +4623,7 @@ class GitOps:
         # PRD § 9.4: when a train member has order > 0, branch from the prior
         # member's branch tip so the chain is contiguous.  order=0 (degenerate
         # train) and train=None both fall through to _freshen_main().
-        if train is not None and train.get('order', 0) > 0:
+        if _is_train_successor(train):
             # ── Train path: branch from predecessor's tip ─────────────────
             # PRD § 9.4: resolve the predecessor's branch and use its tip SHA
             # as start_ref so the new worktree stacks directly on top.
@@ -4639,7 +4645,7 @@ class GitOps:
             cwd=self.project_root,
         )
         if rc != 0:
-            if train is not None and train.get('order', 0) > 0:
+            if _is_train_successor(train):
                 # start_ref was a SHA just verified by resolve_branch_sha; if
                 # rev-parse fails here it indicates git state corruption, not a
                 # missing remote ref.  Falling back to main would silently violate
@@ -4862,7 +4868,7 @@ class GitOps:
                 # across requeues.  Rebasing onto main (the old unconditional
                 # behaviour) corrupts the train by re-parenting the delta off
                 # main instead of the predecessor's commits.
-                if train is not None and train.get('order', 0) > 0:
+                if _is_train_successor(train):
                     # Guard (raise RuntimeError on None) is in _resolve_predecessor_tip.
                     rebase_target, base_ref = await self._resolve_predecessor_tip(
                         train, branch_name
@@ -4898,7 +4904,7 @@ class GitOps:
                         cwd=worktree_path,
                     )
                     actual_base = mb_out.strip() or base_sha.strip()
-                    if train is not None and train.get('order', 0) > 0:
+                    if _is_train_successor(train):
                         # For stacked train members a rebase conflict means the
                         # stacking invariant is broken — log at ERROR so the
                         # degradation is visible rather than silently shipped on
@@ -5024,6 +5030,7 @@ class GitOps:
                 reattached = await self._reattach_cold_worktree(
                     worktree_path, full_branch,
                     branch_name=branch_name, expected_title=expected_title,
+                    keep_stack=_is_train_successor(train),
                 )
                 if reattached is not None:
                     return reattached
@@ -5087,6 +5094,7 @@ class GitOps:
         *,
         branch_name: str,
         expected_title: str | None = None,
+        keep_stack: bool = False,
     ) -> 'WorktreeInfo | None':
         """Re-attach ``worktree_path`` to a surviving orphan ``full_branch``.
 
@@ -5141,6 +5149,8 @@ class GitOps:
                 the full branch itself).
             expected_title: The live task's title, or ``None`` to skip the
                 identity guard.
+            keep_stack: Passed to :meth:`_reuse_warm_lane`; True for a train
+                successor, which keeps its predecessor's commits.
 
         Raises:
             RuntimeError: ``git worktree add`` failed (e.g. *full_branch* is
@@ -5222,7 +5232,9 @@ class GitOps:
                 await self._relocate_foreign_meta_root(worktree_path, dest)
                 return None
 
-        return await self._reuse_warm_lane(worktree_path, full_branch)
+        return await self._reuse_warm_lane(
+            worktree_path, full_branch, keep_stack=keep_stack,
+        )
 
     async def create_interactive_worktree(
         self, slug: str, *, start_ref: str | None = None,
@@ -8360,15 +8372,24 @@ class GitOps:
             )
 
     async def _reuse_warm_lane(
-        self, lane_dir: Path, full_branch: str,
+        self, lane_dir: Path, full_branch: str, *, keep_stack: bool = False,
     ) -> 'WorktreeInfo':
-        """Handle a live-requeue: same task on the same lane (in-memory map hit).
+        """Resume a requeued task's existing branch in the worktree *lane_dir*.
 
-        Mirrors the cold-requeue reuse block (git_ops.py ~806-858):
+        Serves every resume of a surviving branch, warm lane or cold:
+        :meth:`acquire_warm_lane`'s reuse and reattach routes and
+        :meth:`_reattach_cold_worktree`.  Mirrors :meth:`create_worktree`'s
+        cold-requeue reuse block:
         1. Commit any uncommitted WIP so it is preserved across the rebase.
-        2. Rebase onto main (best-effort; log failure and continue on old base).
+        2. Re-attach the lane onto *full_branch*.
+        3. Un-stack, then rebase onto main (best-effort; log failure and
+           continue on old base) — :meth:`_rebase_requeued_onto_main`.
         4. Recompute ``base_commit`` as ``merge-base main HEAD``.
         5. Re-provision the debug port (inv.7).
+
+        *keep_stack* skips step 3's un-stack, for a train successor.  Only
+        the cold reattach can pass it: :meth:`acquire_warm_lane` never serves
+        a train successor.
 
         ``.task/plan.json`` is NOT committed by ``commit()`` (task metadata
         lives outside the worktree for the orchestrator hot path; any
@@ -8383,39 +8404,29 @@ class GitOps:
         # 1. Commit WIP (returns None if nothing to commit — that's fine)
         await self.commit(lane_dir, 'chore: save WIP before requeue rebase')
 
-        # 2. Rebase onto main (best-effort; failure leaves the branch on old
-        #    base).  rebase_preserving_task_commits (not the bare primitive):
-        #    guards against a silent branch-reset wipe (task 2403) — a
-        #    BranchResetError raised here propagates to the caller's
-        #    try/except-release wrapper (see docstring above) and on to
+        # 2. Re-attach the lane, which release_warm_lane may have detached,
+        #    BEFORE the un-stack and the rebase (task-1923 residual), so both
+        #    move refs/heads/<full_branch> itself and the un-stack finds the
+        #    lane as the worktree holding the branch.  On an attached lane
+        #    this is a reset-to-self.  Best-effort: a failed rebind leaves the
+        #    lane detached, holding no branch, so step 3 leaves the branch on
+        #    its old base.
+        #    NOTE: checkout -B bypasses git's single-checkout guard; a
+        #    concurrent worktree on full_branch is a duplicate-dispatch hazard.
+        await self.rebind_branch_to_head(lane_dir, full_branch)
+
+        # 3. Un-stack, then rebase onto main (best-effort; failure leaves the
+        #    branch on its old base).  A BranchResetError (task 2403)
+        #    propagates to the caller's try/except-release wrapper and on to
         #    _drive()'s exception handler.
-        rebased = await self.rebase_preserving_task_commits(lane_dir)
+        rebased = await self._rebase_requeued_onto_main(
+            lane_dir, full_branch, keep_stack=keep_stack,
+        )
         if not rebased:
             logger.info(
-                '_reuse_warm_lane: rebase failed for %s; continuing on old base', lane_dir,
+                '_reuse_warm_lane: %s not rebased onto main; continuing on old base',
+                lane_dir,
             )
-
-        # 2b. Rebind refs/heads/<full_branch> to the lane's current HEAD and
-        #     re-attach the lane onto the branch.
-        #
-        #     Task-1923 residual: release_warm_lane detaches the lane via
-        #     `git checkout --detach`.  If the same task is re-dispatched via
-        #     the disk-backstop reuse route (route 2) or the in-memory reuse
-        #     route (route 1), _reuse_warm_lane runs commit()+rebase_onto_main
-        #     on a DETACHED HEAD and never moves refs/heads/<full_branch> to
-        #     match.  The stale ref then causes α's retention guard to evaluate
-        #     0-commits-beyond-main (incorrect) and delete it, and the merge
-        #     worker (resolve_queued_branch_ref) to hit unknown_branch.
-        #
-        #     best-effort: if the rebind fails (e.g. invalid branch name or
-        #     some other git error), log and continue — WIP is still on the
-        #     lane's HEAD, which is no worse than today's detached-HEAD state.
-        #     NOTE: checkout -B bypasses git's single-checkout guard; a
-        #     concurrent worktree on full_branch is NOT a fail-safe — it is a
-        #     duplicate-dispatch hazard (both worktrees end up on the branch).
-        #     Route 3 (γ reattach) already re-attaches before this call, so
-        #     the rebind is a harmless reset-to-self there.
-        await self.rebind_branch_to_head(lane_dir, full_branch)
 
         # 4. Recompute base: merge-base between main_branch and HEAD
         _, mb_out, _ = await _run(
@@ -8433,6 +8444,41 @@ class GitOps:
             lane_dir, full_branch, base_commit[:8] if base_commit else '?', port,
         )
         return WorktreeInfo(path=lane_dir, base_commit=base_commit, reify_debug_port=port)
+
+    async def _rebase_requeued_onto_main(
+        self, worktree: Path, full_branch: str, *, keep_stack: bool,
+    ) -> bool:
+        """Rebase a requeued branch onto main from its own delta.
+
+        A branch stacked on a base that never landed
+        (``orchestrator/src/orchestrator/branch_stack.py::StackBaseLedger``)
+        is un-stacked first.  When the un-stack stops, the branch stays on its
+        old base and keeps its record: a plain rebase would replay the base's
+        commits under its own and hand them to the agent and the reviewer
+        (task 6219).  The un-stack rewrites the branch in whichever worktree
+        holds it, so the branch is left alone unless *worktree* is that
+        worktree.  *keep_stack* skips the un-stack, for a train successor
+        stacked on its predecessor on purpose.  Returns whether the branch
+        now sits on main.
+        """
+        if keep_stack:
+            return await self.rebase_preserving_task_commits(worktree)
+        holder = await self._worktree_holding_branch(full_branch)
+        if holder is None or holder.resolve() != worktree.resolve():
+            logger.warning(
+                '_rebase_requeued_onto_main: %s stays on its old base: it is '
+                'held by %s, not %s',
+                full_branch, holder, worktree,
+            )
+            return False
+        unstack = await self.unstack_from_unlanded_base(full_branch)
+        if unstack.stops_merge:
+            logger.warning(
+                '_rebase_requeued_onto_main: %s stays on its old base: %s',
+                full_branch, unstack.merge_block_reason(),
+            )
+            return False
+        return await self.rebase_preserving_task_commits(worktree)
 
     async def rebind_branch_to_head(self, worktree: Path, full_branch: str) -> bool:
         """Rebind *full_branch* to the current HEAD of *worktree* and attach the lane.

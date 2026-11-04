@@ -478,11 +478,12 @@ reconciliation:
   # DENY-ON-MISSING: a caller whose resolved identity matches no prefix here is
   # refused, and an EMPTY list denies EVERY caller — that empty value is the
   # incident knob, and it is green-tier so it lands on the next call rather than
-  # after a restart. Only 'orchestrator' by default: the orchestrator sends no
-  # agent_id, so the identity resolver falls back to the clientInfo.name its MCP
-  # session advertises, which is that literal. NOTE the identity this bar reads
-  # is SELF-REPORTED, so it deters a cooperating caller rather than enforcing a
-  # boundary. Shown at its shipped default; uncomment to change.
+  # after a restart. Only 'orchestrator' by default: Scheduler.set_task_status
+  # sends agent_id='orchestrator' explicitly, because stateless HTTP drops
+  # clientInfo so the identity resolver has nothing to fall back to. NOTE the
+  # identity this bar reads is SELF-REPORTED, so it deters a cooperating caller
+  # rather than enforcing a boundary. Shown at its shipped default; uncomment
+  # to change.
   # deterministic_provenance_allowed_agent_prefixes: ['orchestrator']
   usage_cap:
     enabled: true

@@ -31,6 +31,7 @@ from collections.abc import (
     Callable,
     Collection,
     Coroutine,
+    Iterable,
     Iterator,
     Mapping,
     MutableSet,
@@ -45,7 +46,6 @@ from escalation.models import Escalation
 from shared.mcp_post import open_mcp_client, post_mcp_tool_call
 
 from orchestrator.branch_stack import UnstackOutcome
-from orchestrator.critical_gate import critical_filing_gate
 from orchestrator.delivered_checks import gate_mark_done_on_delivered_checks
 from orchestrator.deployed_sha import DeployedSha
 from orchestrator.dry_run_unblock import (
@@ -120,6 +120,7 @@ from orchestrator.merge_lane.liveness import (
     _MERGE_AHEAD_BOUND,
     _MERGE_WORKER_LOOP_DIED_SENTINEL,
     INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS,
+    VerifyProgressWatch,
     _acquire_warm_verify_worktree,
     _alarm_verify_host_skew,
     _alarm_verify_host_unreachable,
@@ -132,6 +133,7 @@ from orchestrator.merge_lane.liveness import (
     check_serial_lane_tripwire,
     newest_content_mtime,
     release_chain_build_lane,
+    verify_tree_cpu_ticks,
 )
 from orchestrator.merge_lane.member_redrive import MemberRedriveOutcome, MemberRedriver
 from orchestrator.merge_lane.no_progress_abort import NoProgressAbort, emit_no_progress_abort
@@ -189,6 +191,7 @@ from orchestrator.merge_lane.types import (
     InflightVerifyResult,
     ItemLifecycleState,
     LandingCandidate,
+    LeaseRow,
     MainHealthAutoHealRegistry,
     MergeCancelRefusal,
     MergeCancelVerdict,
@@ -201,6 +204,7 @@ from orchestrator.merge_lane.types import (
     PendingGate,
     QueuedBranch,
     RealMergeItem,
+    RecoveryEvidence,
     RelaneOutcome,
     SoloVerifyResult,
     SpeculativeItem,
@@ -211,9 +215,10 @@ from orchestrator.merge_lane.types import (
     VerifyInFlightKind,
     VerifyWorktreeHandle,
     _HostUnavailability,
-    escalation_policy,
     item_merge_wt,
+    lease_activity,
     quarantine_class,
+    remote_dispatch_live,
 )
 from orchestrator.remote_gate import GateIdentityPair, RunnerUnavailableKind
 from orchestrator.scheduler import StaleEvidenceRejection
@@ -669,7 +674,9 @@ PRODUCTION_VERIFIER: VerifyPort = ProductionVerifier(
     ),
     dry_run=lambda: run_dry_run_unblock,
 )
-PRODUCTION_CLOCK: ClockPort = ProductionClock(content_mtime=lambda: newest_content_mtime)
+PRODUCTION_CLOCK: ClockPort = ProductionClock(
+    content_mtime=lambda: newest_content_mtime, cpu_ticks=lambda: verify_tree_cpu_ticks,
+)
 
 
 def _main_health_fingerprint(category: str, cause_hint: str, probe_sha: str) -> str:
@@ -4276,6 +4283,46 @@ def _first_copy_per_request(entries: list[dict]) -> tuple[list[dict], list[str]]
     return kept, dropped
 
 
+def _task_ids_by_host(rows: Iterable[LeaseRow]) -> dict[str, list[str]]:
+    """``{host: [task_id, ...]}`` over *rows*, in row order."""
+    by_host: dict[str, list[str]] = {}
+    for row in rows:
+        by_host.setdefault(row.host, []).append(row.task_id)
+    return by_host
+
+
+def _verifying_by_host(rows: Iterable[LeaseRow]) -> dict[str, list[str]]:
+    """``occupancy.verifying_by_host``: :func:`_task_ids_by_host` of the rows that count verifying."""
+    return _task_ids_by_host(row for row in rows if row.counts_verifying)
+
+
+def _ssh_targets_by_runner(config: OrchestratorConfig) -> Mapping[str, str]:
+    """``{runner name: ssh_host}`` of *config*'s enabled verify runners."""
+    return {r.name: r.ssh_host for r in config.enabled_verify_runners}
+
+
+def _lease_part(row: LeaseRow) -> str:
+    """``host=task_id``, annotated ``(activity[,quarantined])`` unless it counts verifying."""
+    occupant = f'{row.host}={row.task_id}'
+    if row.counts_verifying:
+        return occupant
+    flags = (row.activity.value, 'quarantined') if row.host_quarantined else (row.activity.value,)
+    return f'{occupant}({",".join(flags)})'
+
+
+def _occupancy_suffix(rows: Sequence[LeaseRow], *, hosts_total: int) -> str:
+    """The heartbeat's `` | verifying N/M hosts: ...`` segment; '' with no lease held.
+
+    N counts the hosts of :func:`_verifying_by_host`, and every lease is named,
+    so a held lease with nothing running on its host reads
+    ``laptop=5300(finished)``.
+    """
+    if not rows:
+        return ''
+    parts = ' '.join(_lease_part(row) for row in rows)
+    return f' | verifying {len(_verifying_by_host(rows))}/{hosts_total} hosts: {parts}'
+
+
 class _DuplicateRenderLog:
     """WARNs about a request_id ``snapshot()`` rendered more than once, once
     per episode: snapshot() runs on every heartbeat and MCP poll, so a
@@ -7618,91 +7665,40 @@ class SpeculativeMergeWorker:
     # monkeypatch convention above.
     VERIFY_ABANDON_POLL_SECS: float = 10.0
     # task 2420 (DEFECT 1, split from 2357; extends #1728): no-progress
-    # budget for the in-flight verify abort-poll loop.  The #1728 alpha
-    # owner-heartbeat keeps a LIVE worker's merge worktree ROOT mtime fresh
-    # every _HEARTBEAT_POLL_S seconds even while its verify subprocess is
-    # dead/hung, so the 3h root-mtime reaper
+    # budget for the in-flight verify abort-poll loop (Abort trigger 3).  The
+    # #1728 owner-heartbeat keeps a LIVE worker's merge worktree ROOT mtime
+    # fresh even while its verify is dead/hung, so the 3h root-mtime reaper
     # (INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS) never fires for that failure
-    # mode.  Kept small relative to the reaper window so a genuinely dead
-    # verify is caught promptly; kept as a class attribute so tests can
-    # monkeypatch it tiny (e.g. worker.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS
-    # = 0.2) for fast, deterministic abort-path coverage.  Mirrors the
-    # VERIFY_ABANDON_POLL_SECS monkeypatch convention above.
-    # INVARIANT (reviewer finding, task 2420 amend): this heuristic's
-    # liveness signal is filesystem content mtime under merge_wt, so it
-    # assumes a HEALTHY verify writes some file incrementally within every
-    # budget window (test/lint/type-check output, build artifacts, etc.). A
-    # purely CPU-bound stretch that writes nothing to disk for longer than
-    # this budget (e.g. fully-buffered test output, a compiler that emits
-    # artifacts only at the very end) would be misclassified as dead and
-    # re-dispatched — and after MAX_INFLIGHT_DEAD_VERIFY_ABORTS repeats,
-    # escalated to a terminal 'blocked' even though the verify was healthy.
-    # Tune this budget to the longest expected no-write stretch of your
-    # verify workloads, not just the dead-verify symptom's timescale.
-    # BLIND SPOT (reviewer finding, task 2420 amend #2): the same risk
-    # applies to any verify toolchain that writes primarily OUTSIDE
-    # merge_wt — e.g. pytest/mypy/ruff caches under ~/.cache, $TMPDIR
-    # scratch, or an out-of-tree build directory are all invisible to
-    # newest_content_mtime(merge_wt). This assumption ("a healthy verify
-    # writes some file incrementally under merge_wt within every budget
-    # window") is NOT enforced or validated anywhere — it is a per-repo
-    # tuning concern. Operators whose verify command writes its working
-    # output outside the worktree should raise this budget accordingly (or,
-    # if feasible, route that tool's cache/scratch dir back under merge_wt).
-    # REMOTE LEASES (task 4579 addition): this budget now governs BOTH lease
-    # kinds. For a REMOTE lease it additionally bounds the POST-DISPATCH
-    # window — the stretch after dispatch_in_flight goes False
-    # (verify_runner.py:1483) in which task 2822's cross-check runs a FULL
-    # LOCAL verify, authorised for up to merge_verify_cold_command_timeout_secs
-    # per command (far above this 1800s default). The tuning rule above is
-    # therefore stricter than it looks once a remote runner is enabled: this
-    # budget must exceed the longest expected no-write stretch of the
-    # CROSS-CHECK's local verify, not just of the remote dispatch itself.
-    # Measured reify mismatch: 345 of 463 local verifies in a 30-day window
-    # exceeded 1800s (mean 2561s, max 10263s) — a 1800s default is not
-    # automatically safe the moment a remote runner is turned on. The BLIND
-    # SPOT above (toolchains writing outside merge_wt) applies verbatim to
-    # the cross-check leg of the REMOTE arm too.
-    #
-    # INVARIANT (task 4659 incident, 2026-08-29): this budget MUST EXCEED the
-    # longest PER-COMMAND verify timeout the target can authorise, because a
-    # command that is still within its own sanctioned runtime is by definition
-    # healthy and must never be killed here. pytest writes its junit XML only
-    # at command COMPLETION, so a single verify command legitimately produces
-    # ZERO writes under merge_wt for its entire duration — the no-progress
-    # signal cannot distinguish that from a hang, and must not try to.
-    # dark-factory authorises up to `verify_command_timeout_secs: 3600` on the
-    # global fallback path (the path a zero-.py / cross-cutting diff routes
-    # to), above every per-module budget (max: scripts/ at 2400s). The old
-    # 1800.0 sat BELOW that 3600s ceiling, so this watchdog could fire on a
-    # verify with 30 minutes of authorised runtime still to go.
-    # It did: under host oversubscription (load 76-137 on 32 cores) three
-    # consecutive head-of-line verifies — tasks 4659, 4810, 4055 — were each
-    # killed at 1800s and re-queued, main took ZERO landings for 3+ hours, and
-    # the queue grew 1 -> 19 while the scheduler kept dispatching the task
-    # pytest runs that caused the contention. A livelock, not a hang.
-    # 5400s clears the 3600s ceiling with 1800s of headroom. Raise this again
-    # if any per-command budget is ever raised past 5400s; the ordering is the
-    # contract, not the number.
-    # Cost of the raise, accepted deliberately: a genuinely hung verify now
-    # holds the (single) verifier host 90min x MAX_INFLIGHT_DEAD_VERIFY_ABORTS
-    # = 4.5h before resolving `blocked`, up from 1.5h. That is strictly better
-    # than the livelock above, which had no terminating condition at all.
+    # mode.  A class attribute so tests can monkeypatch it tiny, like
+    # VERIFY_ABANDON_POLL_SECS above.
+    # LIVENESS (task 5290) is the union of a live remote ssh dispatch, a
+    # change in the verify process tree's CPU time, and a newer content mtime
+    # under merge_wt, on BOTH lease kinds (task 2566); a remote lease's
+    # post-dispatch window, where task 2822's cross-check runs a full local
+    # verify, is judged the same way.  The rationale lives once, at
+    # orchestrator/src/orchestrator/merge_lane/liveness.py::VerifyProgressWatch.
+    # The CPU signal covers a verify that writes nothing until it completes
+    # (pytest's junit) or writes only outside merge_wt (~/.cache, $TMPDIR),
+    # which used to need a per-repo raise of this budget.
+    # INVARIANT: this budget MUST EXCEED the longest PER-COMMAND verify
+    # timeout the target can authorise (3600s on dark-factory's global
+    # fallback), because a command inside its own sanctioned runtime is
+    # healthy by definition.  The CPU signal does not retire this ordering:
+    # it can be absent (no /proc, or work running in a container outside the
+    # process tree).  Raise this if any per-command budget passes 5400s; the
+    # ordering is the contract, not the number.  Incident: task 4659
+    # (2026-08-29), whose 1800s kills livelocked main for 3h+ (2e58a8fc28).
+    # Cost, accepted: a genuinely hung verify holds its host 90min x
+    # MAX_INFLIGHT_DEAD_VERIFY_ABORTS = 4.5h before resolving `blocked`.
     INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS: float = 5400.0
-    # Throttle for the newest_content_mtime() worktree-subtree walk that
-    # drives the budget above — distinct from VERIFY_ABANDON_POLL_SECS so
-    # the walk cost is bounded independently of the 10s abort-poll cadence.
-    # Kept as a class attribute so tests can monkeypatch it tiny for fast,
-    # deterministic coverage.  Mirrors the VERIFY_ABANDON_POLL_SECS
-    # monkeypatch convention above.
-    # COST (reviewer finding, task 2420 amend): each probe is a full
-    # recursive os.walk + per-entry stat() over merge_wt — O(number of
-    # filesystem entries below root); see newest_content_mtime's docstring.
-    # The 60s default assumes the worktree's content tree (build/test
-    # output, excluding .git) stays in the thousands-of-entries range, not
-    # millions.  A repo whose verify writes a much larger tree should raise
-    # this interval so the per-probe I/O stays negligible relative to the
-    # verify itself — this is NOT currently self-tuning/adaptive.
+    # Throttle for trigger 3's progress probes, distinct from
+    # VERIFY_ABANDON_POLL_SECS so their cost is bounded independently of the
+    # 10s abort-poll cadence; a class attribute so tests can monkeypatch it.
+    # Each probe reads the verify tree's CPU fingerprint (a stat and a cwd
+    # readlink per pid) and runs the newest_content_mtime() walk of merge_wt
+    # only when that is silent.  The walk is O(entries below merge_wt), so
+    # the 60s default assumes thousands, not millions, of entries outside
+    # .git; it is not self-tuning.
     INFLIGHT_VERIFY_PROGRESS_PROBE_SECS: float = 60.0
     # task 2420 (DEFECT 1): busy-loop guard for the no-progress abort trigger.
     # After this many CONSECUTIVE no-progress aborts for the same task_id,
@@ -8355,6 +8351,9 @@ class SpeculativeMergeWorker:
         self._unreachable_escalate_after_n: int = 3
         self._unreachable_escalate_after_secs: float = 600.0
         self._reprobe_interval_s: float = 120.0
+        # {runner name: configured ssh_host}, the target the unreachability
+        # alarm names (task 5290); set alongside the knobs above.
+        self._runner_ssh_targets: Mapping[str, str] = {}
         # Rate-limit state for the reprobe sweep's "still unreachable" record
         # (task 3043 amend).  {host: (last_info_at, last_streak, sweeps_seen)}.
         # A host that
@@ -9189,7 +9188,7 @@ class SpeculativeMergeWorker:
         *inflight_ids*, if given, is used verbatim instead of re-deriving
         ``{e.item.request.request_id for e in self._inflight}``. Callers
         that already materialized that set for their own purposes (e.g.
-        :meth:`snapshot`, which also needs it for ``_container_ids``) can
+        :meth:`_rendered_inflight`, over the occupying entries it renders) can
         pass it to avoid a second O(inflight) pass over the same deque
         within a single call; callers without one (e.g.
         :meth:`_frozen_inflight_entries`) simply omit it.
@@ -9334,6 +9333,7 @@ class SpeculativeMergeWorker:
                 config.verify_host_unreachable_escalate_after_secs
             )
             self._reprobe_interval_s = config.verify_host_reprobe_interval_s
+            self._runner_ssh_targets = _ssh_targets_by_runner(config)
             return self._host_allocator
         # project_root unavailable: return a transient empty-remote allocator
         # without caching so a subsequent call with project_root set builds the
@@ -9378,11 +9378,11 @@ class SpeculativeMergeWorker:
         never downgrades a skew entry: it refreshes the reason of a transport
         entry only.
 
-        Returns whether the caller should alarm: always for an
-        :func:`escalation_policy` of 'immediate', else once ``streak`` reaches
-        ``self._unreachable_escalate_after_n`` (via the shared
-        ``critical_gate.critical_filing_gate``, task 2558).  The alarm helpers'
-        ``has_open_l1`` dedup prevents re-submitting.
+        Returns whether the caller should alarm: the entry's
+        :meth:`_HostUnavailability.alarm_due` against this worker's streak and
+        time thresholds, the same predicate the reprobe sweep re-asserts
+        (task 5290).  The alarm helpers' ``has_open_l1`` dedup prevents
+        re-submitting.
         """
         entry = self._runner_unavailable.setdefault(
             host, _HostUnavailability(streak=0, first_unavailable_at=now, reason=reason),
@@ -9394,11 +9394,10 @@ class SpeculativeMergeWorker:
             entry.kind, entry.reason, entry.identity = kind, reason, identity
         elif quarantine_class(entry.kind) == 'ru':
             entry.reason = reason
-        if escalation_policy(entry.kind, sticky=entry.sticky) == 'immediate':
-            return True
-        return critical_filing_gate(
-            streak=entry.streak,
-            threshold=self._unreachable_escalate_after_n,
+        return entry.alarm_due(
+            now,
+            after_n=self._unreachable_escalate_after_n,
+            after_secs=self._unreachable_escalate_after_secs,
         )
 
     def _open_skew_bench(self, host: str, entry: _HostUnavailability) -> None:
@@ -9473,8 +9472,7 @@ class SpeculativeMergeWorker:
         semantics are DELEGATED to :meth:`_record_runner_unavailable` so they
         are identical across this path and the existing RUNNER_UNAVAILABLE
         finalize path, and the L1 alarm keeps the existing
-        ``has_open_l1`` dedup (exactly one open alarm per host per downtime
-        episode).
+        ``has_open_l1`` dedup (at most one open alarm per host at a time).
 
         Local is a no-op *for state*: it is the trust anchor, is never
         quarantined, and has no remote to probe for recovery.  It is NOT a
@@ -9543,6 +9541,7 @@ class SpeculativeMergeWorker:
             entry.reason,
             streak=entry.streak,
             duration_s=duration_s,
+            ssh_target=self._runner_ssh_targets.get(host),
             event_store=self._event_store,
         )
 
@@ -9707,14 +9706,13 @@ class SpeculativeMergeWorker:
            ``allocator.readmit`` — which un-quarantines *and* un-PARKs; plain
            ``clear_quarantine`` cannot recover a PARKED slot, since
            ``acquire_remote`` additionally requires ``_SLOT_FREE`` — then
-           :meth:`readmit_host` resets the tracker and resolves the open L1s.
-        3. **On failure** (host still unreachable): if
-           ``self._unreachable_escalate_after_secs > 0`` **and**
-           ``now - entry.first_unavailable_at >= self._unreachable_escalate_after_secs``
-           fires the time-based variant of the unreachability alarm (dedup'd via
-           ``has_open_l1``).  When *escalate_after_secs* is **0** the time-based
-           trip is disabled (streak-only mode); see
-           ``OrchestratorConfig.verify_host_unreachable_escalate_after_secs``.
+           :meth:`readmit_host` resets the tracker and resolves the alarms on
+           the evidence the probe named.
+        3. **On failure** (host still unreachable): re-asserts the alarm while
+           :meth:`_HostUnavailability.alarm_due` holds (dedup'd via
+           ``has_open_l1``), so a resolve issued while the host still fails its
+           probe — on an occupancy read, say — is re-opened on the next sweep:
+           recovery is a measurement (the probe), never a proxy (task 5290).
            Probing before alarming avoids a spurious open→immediate-resolve L1
            churn for a host that recovers in the same cycle it would have tripped
            the time-based threshold.
@@ -9812,8 +9810,9 @@ class SpeculativeMergeWorker:
                 # Probe first so a host that recovers in the same cycle it would
                 # have tripped the time-based threshold goes directly to the
                 # recovery path, avoiding a spurious open→immediate-resolve L1.
-                if await self.probe_host(name, runner):
-                    await self._readmit_probed_host(name, runner, now)
+                evidence = await self.probe_host(name, runner)
+                if evidence is not None:
+                    await self._readmit_benched_host(name, runner, now, evidence=evidence)
                 else:
                     self._note_host_still_out(name, entry, now)
             except Exception:
@@ -9822,30 +9821,37 @@ class SpeculativeMergeWorker:
                     name,
                 )
 
-    async def probe_host(self, name: str, runner: Any) -> bool:
-        """Whether tracked host *name* has recovered, probed as its bench class needs (design D6).
+    async def probe_host(self, name: str, runner: Any) -> RecoveryEvidence | None:
+        """The evidence that tracked host *name* has recovered, or None (design D6, task 5290).
 
-        An 'ru' bench answers ``runner.health()`` (``ssh true``).  A 'skew'
-        bench answers ``runner.ensure_gate()`` — publish, build or reuse the
-        gate, handshake — so a host only comes back once it can run this
-        dispatcher's gate.  A sticky bench is never probed: it waits for an
-        operator clear or a restart.
+        An 'ru' bench answers ``runner.health()`` (``ssh true``), giving
+        ``SSH_HEALTH_PROBE``.  A 'skew' bench answers ``runner.ensure_gate()``
+        — publish, build or reuse the gate, handshake — giving ``ENSURE_GATE``,
+        so a host only comes back once it can run this dispatcher's gate.  A
+        sticky bench is never probed: it waits for an operator clear or a
+        restart.
         """
         entry = self._runner_unavailable[name]
         if entry.sticky:
-            return False
+            return None
         if quarantine_class(entry.kind) == 'ru':
-            return await runner.health()
+            return await self._ssh_health_evidence(runner)
         try:
             await runner.ensure_gate(event_store=self._event_store)
         except RunnerUnavailable as exc:
             logger.info('reprobe: ensure-gate for skew-benched host %r failed (%s): %s',
                         name, exc.kind, exc)
-            return False
-        return True
+            return None
+        return RecoveryEvidence.ENSURE_GATE
 
-    async def _readmit_probed_host(self, name: str, runner: Any, now: float) -> bool:
-        """Re-admit *name*, whose probe passed, unless its PARKED slot is not yet clean.
+    @staticmethod
+    async def _ssh_health_evidence(runner: Any) -> RecoveryEvidence | None:
+        return RecoveryEvidence.SSH_HEALTH_PROBE if await runner.health() else None
+
+    async def _readmit_benched_host(
+        self, name: str, runner: Any, now: float, *, evidence: RecoveryEvidence,
+    ) -> bool:
+        """Re-admit *name* on *evidence* unless its PARKED slot is not yet clean.
 
         PARK means "the cancel RPC failed, so a stale verify may still be
         running there", so a PARKED slot is freed only on a clean
@@ -9860,7 +9866,7 @@ class SpeculativeMergeWorker:
         downtime_s = now - entry.first_unavailable_at if entry is not None else 0.0
         if _was_parked and not await self._parked_slot_is_clean(name, runner, downtime_s):
             return False
-        if not self.readmit_host(name, now=now, expect_epoch=_probed_epoch):
+        if not self.readmit_host(name, now=now, evidence=evidence, expect_epoch=_probed_epoch):
             return False
         logger.info(
             'reprobe: host %r recovered after %.0fs down — re-admitted to '
@@ -9900,7 +9906,7 @@ class SpeculativeMergeWorker:
         return False
 
     def _note_host_still_out(self, name: str, entry: _HostUnavailability, now: float) -> None:
-        """Log a failed reprobe (rate-limited) and fire the time-based alarm when due."""
+        """Log a failed reprobe (rate-limited) and re-assert the alarm while it is due."""
         downtime_s = now - entry.first_unavailable_at
         # Rate-limited (task 3043 amend): this is the one record that repeats
         # forever for a permanently-gone host.  INFO for the first
@@ -9931,16 +9937,23 @@ class SpeculativeMergeWorker:
             entry.streak,
             _sweeps + 1,
         )
-        # `> 0` guard: secs=0 disables the time-based trip (streak-only).
-        if 0 < self._unreachable_escalate_after_secs <= downtime_s:
+        if entry.alarm_due(
+            now,
+            after_n=self._unreachable_escalate_after_n,
+            after_secs=self._unreachable_escalate_after_secs,
+        ):
             self._alarm_host(name, entry, downtime_s)
 
-    def readmit_host(self, name: str, *, now: float, expect_epoch: int | None = None) -> bool:
+    def readmit_host(
+        self, name: str, *, now: float, evidence: RecoveryEvidence,
+        expect_epoch: int | None = None,
+    ) -> bool:
         """Return remote *name* to the verify pool and close its bench: THE readmit.
 
         Un-quarantines and un-PARKs it (``allocator.readmit``, refused when the
         park episode moved past *expect_epoch*), drops its tracker entry, and
-        resolves its open unreachability and skew L1s.  The reprobe sweep calls
+        resolves its pending unreachability and skew alarms on the named
+        *evidence* (task 5290).  The reprobe sweep calls
         it after a passing :meth:`probe_host`, and keeps the per-(host, sha)
         skew count that makes the next skew bench sticky;
         :meth:`clear_host_quarantine` (the operator clear) calls it without a
@@ -9958,10 +9971,12 @@ class SpeculativeMergeWorker:
         downtime_s = now - entry.first_unavailable_at if entry is not None else 0.0
         self._record_runner_recovered(name)
         _clear_verify_host_unreachable(
-            self._escalation_queue, self._event_store, name, downtime_s=downtime_s,
+            self._escalation_queue, self._event_store, name,
+            downtime_s=downtime_s, evidence=evidence,
         )
         _clear_verify_host_skew(
-            self._escalation_queue, self._event_store, name, downtime_s=downtime_s,
+            self._escalation_queue, self._event_store, name,
+            downtime_s=downtime_s, evidence=evidence,
         )
         return True
 
@@ -9996,7 +10011,9 @@ class SpeculativeMergeWorker:
             return {**result, 'reason': f'{name!r} is not a remote verify host of this worker'}
         if entry is None and not quarantined:
             return {**result, 'reason': f'{name!r} is not benched'}
-        if not await self._readmit_probed_host(name, runner, self._clock.now()):
+        if not await self._readmit_benched_host(
+            name, runner, self._clock.now(), evidence=RecoveryEvidence.OPERATOR_CLEAR,
+        ):
             return {
                 **result,
                 'reason': 'its slot is PARKED and a stale verify may still be running there',
@@ -12271,6 +12288,52 @@ class SpeculativeMergeWorker:
             req.request_id for req in (*buffered, *arrivals) if req.result.done()
         })
 
+    def _rendered_inflight(self) -> tuple[InflightEntry | None, list[InflightEntry]]:
+        """The finalize head and the occupying ``_inflight`` entries, as :meth:`snapshot` renders them."""
+        occupying = self._occupying_inflight_entries()
+        return self._finalizing_head_entry({e.item.request.request_id for e in occupying}), occupying
+
+    def _lease_rows(
+        self, fh_entry: InflightEntry | None, occupying: Sequence[InflightEntry],
+    ) -> list[LeaseRow]:
+        """One :class:`LeaseRow` per held lease: the finalize head, then *occupying*."""
+        return [
+            self._lease_row(entry, entry.lease) for entry in (fh_entry, *occupying)
+            if entry is not None and entry.lease is not None
+        ]
+
+    def _lease_row(self, entry: InflightEntry, lease: HostLease) -> LeaseRow:
+        return LeaseRow(
+            host=lease.name,
+            task_id=entry.item.request.task_id,
+            request_id=entry.item.request.request_id,
+            activity=lease_activity(lease, entry.pending_task),
+            host_quarantined=lease.name in self._runner_quarantine,
+        )
+
+    def _hosts_total(self) -> int:
+        """Hosts the allocator manages; 1 before one is built."""
+        return len(self._host_allocator.host_names) if self._host_allocator is not None else 1
+
+    def _occupancy_block(self, rows: Sequence[LeaseRow]) -> dict:
+        """:meth:`snapshot`'s ``occupancy``, from :meth:`_lease_rows`.
+
+        by_host / inflight_by_host / hosts_busy / inflight_total are LEASE
+        occupancy; ``leases`` and ``verifying_by_host`` say what each lease is
+        doing (task 5290).
+        """
+        inflight_by_host = _task_ids_by_host(rows)
+        return {
+            'hosts_total': self._hosts_total(),
+            'hosts_busy': len(inflight_by_host),
+            # LOSSY on purpose (historical shape): the last occupant per host.
+            'by_host': {row.host: row.task_id for row in rows},
+            'inflight_by_host': inflight_by_host,
+            'inflight_total': len(rows),
+            'leases': [row.to_wire() for row in rows],
+            'verifying_by_host': _verifying_by_host(rows),
+        }
+
     def snapshot(self) -> dict:
         """Return a synchronous read-only snapshot of the merge worker pipeline state.
 
@@ -12296,14 +12359,18 @@ class SpeculativeMergeWorker:
               in-flight count must read inflight_total (task 3275).
             by_host: {host: task_id}, retained at its historical shape for
               backward compatibility.  LOSSY: when two entries share a host it
-              keeps only the last (and the finalize-head prepend drops the
-              head's task_id in that case).  Preserved verbatim for existing
-              consumers and task 3044's in-flight rework; inflight_by_host is
-              the authoritative view.
+              keeps only the last.  inflight_by_host is the authoritative view.
             inflight_by_host: {host: [task_id, ...]} — lossless, every leased
               occupant present.  Ordered finalize head first, then _inflight
               order, mirroring `entries`.
             inflight_total: total leased in-flight entries across all hosts.
+            These four are LEASE occupancy: a lease is not evidence that its
+            host is reachable or verifying (task 5290).  The activity view:
+            leases: one {host, task_id, request_id, activity,
+              host_quarantined} row per lease, in inflight_by_host order;
+              activity is a :class:`LeaseActivity` value.
+            verifying_by_host: {host: [task_id, ...]} for the leases whose
+              activity is live and whose host is not quarantined.
           hosts: list of per-host state dicts (task 3275), one per host the
             allocator manages, in allocator order (local first), each
             {name, is_local, slot_state, quarantined, quarantine_class,
@@ -12413,11 +12480,10 @@ class SpeculativeMergeWorker:
         # down (double-count avoidance), while still running in its original
         # position right after the _inflight loop. Independent of emission
         # order because it reads the containers directly rather than the
-        # `entries` list built so far. _inflight_ids is materialized once
-        # and reused below for _finalizing_head_entry() too, rather than
-        # letting it re-derive the same set internally (both would
-        # otherwise take an O(inflight) pass over the identical deque).
-        _occupying = self._occupying_inflight_entries()
+        # `entries` list built so far. The finalize head and the occupying
+        # entries come from _rendered_inflight(), which the heartbeat's
+        # occupancy segment shares.
+        _fh_entry, _occupying = self._rendered_inflight()
         _inflight_ids: set[str] = {e.item.request.request_id for e in _occupying}
         _container_ids: set[str] = set(_inflight_ids)
         _container_ids |= {_rd.request.request_id for _rd in self._intake.pending_redispatch()}
@@ -12442,7 +12508,6 @@ class SpeculativeMergeWorker:
         # submission-order head. Replaces the deleted _finalizing_head field
         # (merge-queue-reliability PRD scope-4 kappa-b / task 2435).
         _excluded_ids: set[str] = _container_ids | _decided
-        _fh_entry = self._finalizing_head_entry(_inflight_ids)
         if _fh_entry is not None:
             entries.append(_infl_entry(_fh_entry, 0))
             _excluded_ids.add(_fh_entry.item.request.request_id)
@@ -12602,49 +12667,7 @@ class SpeculativeMergeWorker:
                 ),
             }
 
-        # occupancy: per-host in-flight breakdown for heartbeat and dashboard consumers.
-        _by_host = {
-            _infl.lease.name: _infl.item.request.task_id
-            for _infl in _occupying
-            if _infl.lease is not None
-        }
-        # Include the finalizing head (if any) — it is the submission-order head
-        # and its host slot is still occupied while _finalize_inflight awaits.
-        # Inserted head-first so 'local' leads the dict, matching position 0 in entries.
-        if _fh_entry is not None and _fh_entry.lease is not None:
-            _fh_name = _fh_entry.lease.name
-            _fh_tid = _fh_entry.item.request.task_id
-            _by_host = {_fh_name: _fh_tid, **_by_host}
-        # 3275 additive: lossless per-host occupant lists, built in the SAME
-        # order (finalize head first, then _inflight order) as _by_host above.
-        # _by_host is left byte-for-byte unchanged — it is lossy by two paths
-        # (the dict comprehension collapses two entries sharing a host
-        # last-writer-wins, and the prepend splat above drops the head's
-        # task_id when the head shares a host with an in-flight entry) and it
-        # is the field task 3044 is reworking, so it is preserved verbatim
-        # rather than widened.
-        _inflight_by_host: dict[str, list[str]] = {}
-        if _fh_entry is not None and _fh_entry.lease is not None:
-            _inflight_by_host[_fh_entry.lease.name] = [_fh_entry.item.request.task_id]
-        for _infl in _occupying:
-            if _infl.lease is not None:
-                _inflight_by_host.setdefault(_infl.lease.name, []).append(
-                    _infl.item.request.task_id
-                )
-        _hosts_total = (
-            len(self._host_allocator.host_names)
-            if self._host_allocator is not None else 1
-        )
-        occupancy = {
-            'hosts_total': _hosts_total,
-            # Identical value to len(_by_host) (same key set by construction),
-            # but sourced from the lossless map so a future edit to _by_host
-            # cannot silently perturb this count.
-            'hosts_busy': len(_inflight_by_host),
-            'by_host': _by_host,
-            'inflight_by_host': _inflight_by_host,
-            'inflight_total': sum(len(v) for v in _inflight_by_host.values()),
-        }
+        occupancy = self._occupancy_block(self._lease_rows(_fh_entry, _occupying))
 
         return {
             'entries': entries,
@@ -13075,7 +13098,7 @@ class SpeculativeMergeWorker:
         carrying the same facts structurally (repo structured-facts-at-failure
         invariant — the log line must not be the only carrier).  It is built
         from ``snapshot()['hosts']`` rather than from ``occupancy`` **on
-        purpose**: the occupancy suffix is gated on a non-empty ``by_host``, so
+        purpose**: the occupancy suffix is gated on a held lease, so
         a pool that is quarantined but idle would report no degradation at all
         — one of the three 2026-07 incidents where a stuck merge queue was
         diagnosed only by hand-correlating a ``verifying N/M hosts`` line
@@ -13123,19 +13146,13 @@ class SpeculativeMergeWorker:
         }
 
         occ = snap['occupancy']
-        _occ_suffix = ''
-        if occ['by_host']:
-            _host_parts = ' '.join(
-                f'{h}={tid}' for h, tid in occ['by_host'].items()
-            )
-            _occ_suffix = (
-                f' | verifying {occ["hosts_busy"]}/{occ["hosts_total"]} hosts: '
-                f'{_host_parts}'
-            )
+        _occ_suffix = _occupancy_suffix(
+            self._lease_rows(*self._rendered_inflight()), hosts_total=occ['hosts_total'],
+        )
 
         # 3275: degradation segment, built from snap['hosts'] and deliberately
-        # INDEPENDENT of the `if occ['by_host']:` gate above — a quarantined
-        # pool with nothing in flight has an empty by_host and would otherwise
+        # INDEPENDENT of the occupancy suffix's lease gate — a quarantined
+        # pool with nothing in flight holds no lease and would otherwise
         # report no degradation at all.
         _deg = [h for h in snap['hosts'] if h['quarantined']]
         _deg_suffix = ''
@@ -17528,44 +17545,23 @@ class SpeculativeMergeWorker:
                 merge_base_sha=verify_base.merge_base_sha,
                 main_sha=verify_base.main_sha,
             ))
-            # task 2420 (DEFECT 1, split from 2357; extends #1728), revised by
-            # task 4579: no-progress budget seed.  Content-mtime is sampled
-            # for BOTH lease kinds — a REMOTE lease's ssh dispatch itself
-            # writes nothing to this local merge_wt, but task 2822's
-            # post-dispatch cross-check runs a FULL LOCAL verify
-            # (LocalRunner(merge_wt, ...), merge_queue.py:2977-3015) on THIS
-            # host inside the SAME awaited verify_task, and that cross-check
-            # genuinely does advance merge_wt's content mtime.  See the union
-            # of evidence sources in the poll loop below (Abort trigger 3).
-            # newest_content_mtime never stats merge_wt's own root inode, so
-            # the #1728 alpha owner-heartbeat's os.utime(merge_wt) can never
-            # mask a dead verify on EITHER arm.  The seed is unconditional
-            # (not `if lease.is_local else None`): leaving it None for a
-            # remote lease would make the first probe hit the
-            # `_last_content_mtime is None` arm and hand a genuinely
-            # coasting remote lease one free budget window.
-            _last_content_mtime = self._clock.newest_content_mtime(merge_wt)
-            # task 2420 amend (reviewer finding, robustness): time.monotonic(),
-            # not time.time(), for _last_progress_at/_last_probe_at/_now below
-            # — all three are pure duration references (never persisted or
-            # compared against a stored wall-clock value), so they must be
-            # immune to NTP/manual clock steps. A backward step would delay a
-            # real dead-verify abort; a forward step could prematurely trip
-            # the budget and, after MAX_INFLIGHT_DEAD_VERIFY_ABORTS repeats,
-            # false-'block' a healthy task. Matches the time.monotonic()
-            # convention used elsewhere in this file (e.g. _elapsed_ms,
-            # per-attempt t0 at the top of the dequeue loop).
-            _last_progress_at = self._clock.monotonic()
-            _last_probe_at = _last_progress_at
-            _dispatch_seen_in_flight = False
+            # Abort trigger 3's progress watch, seeded unconditionally (both
+            # lease kinds) before the first await, so a coasting remote lease
+            # gets no free budget window from an unseeded first probe.  Its
+            # times are monotonic: durations, immune to wall-clock steps.
+            _watch = VerifyProgressWatch.start(
+                self._clock.monotonic(),
+                cpu_ticks=self._clock.verify_cpu_ticks(merge_wt),
+                content_mtime=self._clock.newest_content_mtime(merge_wt),
+            )
             # task 2420 amend (reviewer finding, correctness); revised by task
             # 4579: guard against INFLIGHT_VERIFY_PROGRESS_PROBE_SECS not
             # being comfortably smaller than INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS.
             # If the probe interval were >= the budget, the very first
-            # eligible content probe would land at/after the budget deadline,
+            # eligible progress probe would land at/after the budget deadline,
             # so the abort would trip before a single progress probe ever
             # ran — false-aborting every verify regardless of health. The
-            # probe interval now drives the content-mtime arm for BOTH lease
+            # probe interval gates the progress probes for BOTH lease
             # kinds (task 4579: it used to be LOCAL-only), so a misconfigured
             # or hot-reloaded PROBE >= BUDGET pair would false-abort every
             # REMOTE verify for the identical reason it would false-abort
@@ -17668,93 +17664,23 @@ class SpeculativeMergeWorker:
                         merge_wt=None,
                         status=InflightStatus.REQUEUED,
                     )
-                # Abort trigger 3 — no in-flight verify progress budget
-                # (task 2420 DEFECT 1, split from 2357; extends #1728;
-                # un-gated to cover REMOTE leases by task 2566, closing the
-                # latent 7200s-coast gap; task 4579 unions the two evidence
-                # sources instead of branching on lease type — see below):
-                # terminate a verify with no progress observed for a full
-                # budget and RE-QUEUE, mirroring the operator-halt branch above.
-                # Checked last so abandon/halt precedence (triggers 1/2) is
-                # preserved when they land on the same poll.
-                # Each firing is recorded, and counted as a strike, per
-                # orchestrator/src/orchestrator/merge_lane/no_progress_abort.py::NoProgressAbort.
-                #
-                # PROGRESS is the UNION of two independent evidence sources
-                # (task 4579 — previously an if/elif branched by lease type,
-                # which made a REMOTE lease structurally unable to see its
-                # own post-dispatch local writes; see the reify mr-945466ca
-                # incident this closed):
-                #   A. content progress under merge_wt (throttled by
-                #      _progress_probe_secs), sampled for BOTH lease kinds —
-                #      resets the clock, so a genuinely long-running healthy
-                #      verify is never false-killed. For a LOCAL lease this
-                #      is the verify itself; for a REMOTE lease this is
-                #      task 2822's post-dispatch cross-check, a FULL LOCAL
-                #      verify (LocalRunner(merge_wt, ...),
-                #      merge_queue.py:2977-3015) that runs on THIS host
-                #      inside the SAME awaited verify_task once the ssh
-                #      dispatch returns.
-                #   B. a live remote ssh dispatch (REMOTE leases only) —
-                #      RemoteRunner.dispatch_in_flight (task 2566): a live
-                #      dispatch is progress (its death is owned by task
-                #      2362's ssh keepalive, never touched here) and resets
-                #      the clock every poll. dispatch_in_flight goes False
-                #      the instant run_merge_verify returns
-                #      (verify_runner.py:1483) — which is precisely when
-                #      evidence A takes over for the cross-check's window.
-                #      getattr(..., True) fails safe: a runner not exposing
-                #      the property is treated as live and never
-                #      progress-aborted.
-                #
-                # SAFETY: adding evidence A for remote leases can only make this trigger LESS
-                # trigger-happy, never introduce a false abort. The one way it could instead MASK a
-                # genuine remote coast — some writer other than the verify touching merge_wt — is
-                # narrower than it first looks: task 2873's merge_verify_lease
-                # (merge_queue.py:3006-3014) wraps ONLY the cross-check's own local verify call,
-                # gated on persistent_merge_worktree and entered just before
-                # cross_check_runner.run_merge_verify(...) — it does NOT cover the window before
-                # that lease is acquired, and it does not exist at all on paths where no cross-check
-                # runs at all (remote verify FAILs, a trivial pass, verify_cross_check_remote_green
-                # disabled, or an infra-transient retry between dispatches). A concurrent foreign
-                # write into merge_wt during one of those windows would reset the clock same as a
-                # real cross-check write. This narrows the guarantee, it does not remove it: masking
-                # is unreachable while evidence B is live (it dominates below), RemoteRunner's own
-                # writes during a coast touch only `.git` (pruned by newest_content_mtime) and
-                # archive outside merge_wt, and the busy-loop cap counts only actual aborts — so the
-                # residual exposure can DELAY a coast abort by a foreign write's timing, never
-                # suppress it the way a permanent mask would.
+                # Abort trigger 3 — no in-flight verify progress for a full
+                # budget (task 2420; both lease kinds since task 2566): RE-QUEUE,
+                # mirroring the operator-halt branch above, and checked last so
+                # triggers 1/2 keep precedence on the same poll.  Each firing is
+                # recorded and counted as a strike per
+                # orchestrator/src/orchestrator/merge_lane/no_progress_abort.py::NoProgressAbort;
+                # what counts as progress lives once, at
+                # orchestrator/src/orchestrator/merge_lane/liveness.py::VerifyProgressWatch.
                 _now = self._clock.monotonic()
-                # Evidence B is checked FIRST and short-circuits evidence A: while a remote dispatch
-                # is live it is already progress on its own, so probing content-mtime too would only
-                # re-confirm what B already established, at the cost of a synchronous os.walk of
-                # merge_wt (newest_content_mtime, merge_liveness.py) on the merge worker's event
-                # loop every _progress_probe_secs for the whole dispatch — 17-40+ minutes on reify —
-                # for zero marginal signal (reviewer finding, performance). Trade-off:
-                # _last_content_mtime stays at its seed for that whole window, so the first
-                # post-dispatch probe treats whatever mtime the tree is ACTUALLY at as fresh
-                # progress once — one extra budget window of slack if that mtime came from a foreign
-                # writer rather than the cross-check, not a masked coast (same busy-loop-cap
-                # argument as the SAFETY paragraph above).
-                _dispatch_live = (
-                    not lease.is_local
-                    and getattr(lease.runner, 'dispatch_in_flight', True)
+                _watch = _watch.observe(
+                    _now,
+                    dispatch_live=remote_dispatch_live(lease),
+                    probe_every_secs=_progress_probe_secs,
+                    cpu_ticks=lambda: self._clock.verify_cpu_ticks(merge_wt),
+                    content_mtime=lambda: self._clock.newest_content_mtime(merge_wt),
                 )
-                if _dispatch_live:
-                    _last_progress_at = _now
-                    _dispatch_seen_in_flight = True
-                # Evidence A — content progress under merge_wt (BOTH lease kinds), probed only when
-                # evidence B is not already live.
-                elif _now - _last_probe_at >= _progress_probe_secs:
-                    _last_probe_at = _now
-                    _cur_content_mtime = self._clock.newest_content_mtime(merge_wt)
-                    if _cur_content_mtime is not None and (
-                        _last_content_mtime is None
-                        or _cur_content_mtime > _last_content_mtime
-                    ):
-                        _last_content_mtime = _cur_content_mtime
-                        _last_progress_at = _now
-                _no_progress_secs = _now - _last_progress_at
+                _no_progress_secs = _watch.no_progress_secs(_now)
                 if _no_progress_secs >= self.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS:
                     # Busy-loop guard (task 2420): count CONSECUTIVE
                     # no-progress aborts per task_id.  Once the count
@@ -17776,7 +17702,7 @@ class SpeculativeMergeWorker:
                         budget_secs=self.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS,
                         strike=_dead_abort_n,
                         max_strikes=self.MAX_INFLIGHT_DEAD_VERIFY_ABORTS,
-                        dispatch_seen_in_flight=_dispatch_seen_in_flight,
+                        dispatch_seen_in_flight=_watch.dispatch_seen_in_flight,
                     )
                     logger.warning(
                         'Task %s: no in-flight verify progress for %.0fs '

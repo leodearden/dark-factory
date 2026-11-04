@@ -4434,6 +4434,7 @@ def _driver_config() -> _FakeConfig:
         mem0=types.SimpleNamespace(
             collection_prefix='fused',  # the DEFAULT — nothing under it is reapable
             qdrant_url='http://localhost:6333',
+            persist_history=True,  # the DEFAULT — mem0 writes the shared history DB
         ),
         embedder=types.SimpleNamespace(
             model='text-embedding-3-small',
@@ -4449,30 +4450,26 @@ def _driver_config() -> _FakeConfig:
     )
 
 
-class _FakeInstance:
-    """What ``Mem0Backend._get_instance`` returns; only ``db`` is touched."""
-
-    def __init__(self):
-        # A sentinel, not None: the driver must REPLACE it with its no-op, and
-        # `is not sentinel` is how the test proves the stub actually landed.
-        self.db = types.SimpleNamespace(add_history=_FakeInstance._SENTINEL)
-
-    _SENTINEL = object()
-
-
 class _FakeMem0:
     """The Mem0Backend surface the driver touches, and nothing else."""
 
     def __init__(
         self,
         *,
+        config,
         search_raises_on: int | None = None,
         add_returns_no_id_on: int | None = None,
         add_ticks: int = 1,
     ):
+        self._config = config
         self.added: list[tuple[str, str]] = []            # (project_id, content)
         self.searches: list[tuple[str, str, int]] = []    # (project_id, query, limit)
-        self.instances: dict[str, _FakeInstance] = {}
+        #: (project_id, config.mem0.persist_history) at every `add`, the moment
+        #: a real Mem0Backend builds a project's instance from the config.
+        #: Snapshotted for the reason `queue_data_dir_at_initialize` is: the
+        #: config is held by REFERENCE, so a post-run read cannot tell "turned
+        #: off before seeding" from "turned off too late".
+        self.persist_history_at_add: list[tuple[str, bool]] = []
         self.inflight = 0
         self.max_inflight = 0
         self.search_inflight = 0
@@ -4489,10 +4486,10 @@ class _FakeMem0:
         self._add_calls = 0
         self._stored: dict[str, list[dict]] = {}
 
-    async def _get_instance(self, scope):
-        return self.instances.setdefault(scope.project_id, _FakeInstance())
-
     async def add(self, content, scope, metadata=None):
+        self.persist_history_at_add.append(
+            (scope.project_id, self._config.mem0.persist_history),
+        )
         self._add_calls += 1
         ordinal = self._add_calls
         self.inflight += 1
@@ -4552,6 +4549,7 @@ class _FakeMemoryService:
     def __init__(self, config):
         self.config = config
         self.mem0 = _FakeMem0(
+            config=config,
             search_raises_on=type(self).search_raises_on,
             add_returns_no_id_on=type(self).add_returns_no_id_on,
             add_ticks=type(self).add_ticks,
@@ -5039,9 +5037,12 @@ class TestRunBakeOffWiring:
 
         assert caller_config.mem0.collection_prefix == 'fused'
         assert caller_config.embedder.providers.openai.api_key == 'sk-fake-must-be-cleared'
+        assert caller_config.mem0.persist_history is True
 
-    async def test_it_stubs_the_xdist_contended_history_writer(self, monkeypatch):
-        """mem0's SQLite history writer is process-shared and contended (and
+    async def test_every_seeded_arm_keeps_mem0_history_off_the_shared_db(
+        self, monkeypatch,
+    ):
+        """mem0's shared SQLite history DB is process-shared and contended (and
         read-only in the sandbox).  It is not the question under test, and its
         failure would mask the one that is."""
         mod = _mod()
@@ -5049,14 +5050,13 @@ class TestRunBakeOffWiring:
 
         await mod.run_bake_off(**_SMALL_RUN)
 
-        instances = _FakeMemoryService.instances[-1].mem0.instances
+        snapshots = _FakeMemoryService.instances[-1].mem0.persist_history_at_add
         # Every seeded project, the two INJECTED passes included: they go
-        # through the same `seed_arm`, so an unstubbed instance there is the
+        # through the same `seed_arm`, so a persisting instance there is the
         # same contended write, in a collection nobody was watching.
-        assert len(instances) == len(mod.ARM_SHAPES) + len(mod.REGROWTH_MODES)
-        for instance in instances.values():
-            assert instance.db.add_history is not _FakeInstance._SENTINEL
-            assert instance.db.add_history('anything', keyword=1) is None
+        seeded_projects = {project_id for project_id, _ in snapshots}
+        assert len(seeded_projects) == len(mod.ARM_SHAPES) + len(mod.REGROWTH_MODES)
+        assert all(persist is False for _, persist in snapshots), snapshots
 
     async def test_the_distractor_slab_is_seeded_into_every_arm(self, monkeypatch):
         """The contamination floor is a controlled variable: an arm that got a

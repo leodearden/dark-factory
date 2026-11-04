@@ -92,6 +92,7 @@ from df_pytest_isolation import (  # noqa: E402
     _df_git_ceiling_at_basetemp,  # noqa: F401  — the binding IS the wiring
     _df_git_env_hermetic,  # noqa: F401  — the binding IS the wiring
     arm_leaked_drain_process_guard,
+    arm_usage_gate_sweep_confinement,
     reject_unsafe_basetemp,
 )
 
@@ -110,15 +111,21 @@ from fused_memory.models.scope import KNOWN_PROJECT_ROOTS_ENV  # noqa: E402
 
 
 def pytest_configure(config):
-    """Session-start hooks: basetemp safety, the drain-leak guard, async-httpx leak tracking.
+    """Session-start hooks: basetemp safety, the drain-leak guard, UsageGate sweep confinement, async-httpx leak tracking.
 
     ``track_async_httpx_clients()`` runs HERE — at session start, before
     collection — rather than lazily from a fixture, so clients constructed at
     module import time are tracked too and can be reaped like any other
     (task 4412).
+
+    ``shared.usage_gate`` is imported here because a module-level import after
+    this file's ``sys.path`` setup would need a new ``E402`` suppression.
     """
     reject_unsafe_basetemp(config)
     arm_leaked_drain_process_guard(config)
+    from shared import usage_gate
+
+    arm_usage_gate_sweep_confinement(config, usage_gate)
     track_async_httpx_clients()
 
 
@@ -823,6 +830,11 @@ def mock_config(tmp_path) -> FusedMemoryConfig:
     ``overreach_guard.shadow_enabled`` is pinned off for the same reason: with
     it on, every decision write in a unit test would reach the real overreach
     judge; a test of the shadow opts in on its own config.
+    ``mem0.persist_history`` is pinned off too: with it on, any test that
+    builds a real mem0 instance from this config would write the
+    process-shared, xdist-contended, sandbox-read-only
+    ``$MEM0_DIR/history.db`` rather than a private in-memory DB; a test of the
+    persisted default opts in on its own config.
     """
     config = FusedMemoryConfig(
         llm=LLMConfig(
@@ -855,6 +867,7 @@ def mock_config(tmp_path) -> FusedMemoryConfig:
     )
     config.write_triage.enabled = False
     config.overreach_guard.shadow_enabled = False
+    config.mem0.persist_history = False
     return config
 
 

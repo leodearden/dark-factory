@@ -7,7 +7,10 @@ verdict onto its own exit codes.
 
 Every verb prints one line on stdout, a status word and then ``key=value``
 tokens (``%``-escaped, ``none`` for an absent value), and exits 0. An internal
-fault prints nothing on stdout, a traceback on stderr, and exits 3.
+fault prints nothing on stdout, a traceback on stderr, and exits 3. ``pair``
+and ``status`` manage this host's credential for T3's ``/mcp``
+(``t3_mcp_client``): ``pair`` prints ``paired`` or ``pair-failed``, and
+``status`` prints ``paired``, ``expired``, ``unpaired`` or ``status-failed``.
 
 Two facts of ``t3`` v0.1.2 shape this module:
 
@@ -48,11 +51,10 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from orchestrator import session_registry
+from orchestrator import session_registry, spawn_t3_provider, t3_mcp_client
 from orchestrator.session_ownership_probes import ProcessTree
 
 MESSAGE_CHAR_LIMIT = 120_000
-CLAUDE_PROVIDER_INSTANCE = 'claudeAgent'
 PENDING_RUN_STATUSES = frozenset({'preparing', 'queued', 'starting'})
 ENDED_RUN_STATUSES = frozenset({'failed', 'cancelled', 'interrupted', 'rolled_back'})
 STARTUP_FAILURE_STATUSES = frozenset({'failed', 'cancelled', 'rolled_back'})
@@ -318,8 +320,8 @@ def _spill_pointer(spill: Path) -> str:
     return f'Read {spill} and follow it as your brief; that file holds your whole task.'
 
 
-def _start_argv(cwd: str, title: str, model: str | None) -> list[str]:
-    model_flags = ['--provider', CLAUDE_PROVIDER_INSTANCE, '--model', model] if model else []
+def _start_argv(cwd: str, title: str, model: str | None, provider: str) -> list[str]:
+    model_flags = ['--provider', provider, '--model', model] if model else []
     return ['thread', 'start', '--json', '--title', title, *model_flags, cwd, '-']
 
 
@@ -330,8 +332,10 @@ class LaunchedThread:
     run_id: str | None
 
 
-def _start_thread(cwd: str, title: str, model: str | None, message: str) -> LaunchedThread:
-    launched = run_t3(_start_argv(cwd, title, model), stdin=message)
+def _start_thread(
+    cwd: str, title: str, model: str | None, provider: str, message: str
+) -> LaunchedThread:
+    launched = run_t3(_start_argv(cwd, title, model, provider), stdin=message)
     if not isinstance(launched, dict) or not launched.get('threadId'):
         raise T3CommandFailed('t3 thread start printed no threadId')
     return LaunchedThread(
@@ -390,6 +394,32 @@ def _usable_parent(parent: str | None) -> str | None:
     return parent or None
 
 
+def provider_instance(
+    cwd: str, explicit: str | None, env: Mapping[str, str]
+) -> spawn_t3_provider.ProviderChoice:
+    """The instance a thread for *cwd* runs on; see ``spawn_t3_provider`` for the order."""
+    try:
+        project = containing_project(cwd, registered_projects(env))
+    except ProjectStoreUnreadable as exc:
+        logger.warning(f'provider enablement is checked environment-wide: {exc}')
+        project = None
+    return _provider_for(project, explicit, env)
+
+
+def _provider_for(
+    project: T3Project | None, explicit: str | None, env: Mapping[str, str]
+) -> spawn_t3_provider.ProviderChoice:
+    project_id = project.project_id if project else None
+    return spawn_t3_provider.resolve_instance(t3_userdata_dir(env), project_id, explicit)
+
+
+def _provider_verdict(choice: spawn_t3_provider.ProviderChoice) -> str:
+    named = {'instance_id': choice.instance_id, 'source': choice.source.value}
+    if choice.enabled is False:
+        return _verdict('refused', reason='provider-disabled', **named)
+    return _verdict('instance', **named)
+
+
 def launch(
     cwd: str,
     title: str,
@@ -398,6 +428,7 @@ def launch(
     model: str | None,
     env: Mapping[str, str],
     *,
+    provider: str | None = None,
     parent: str | None = None,
 ) -> str:
     if shutil.which('t3') is None:
@@ -413,11 +444,15 @@ def launch(
         detail = os.path.realpath(project.workspace_root) if project else None
         return _verdict('refused', reason='cwd-not-project-root', detail=detail)
 
+    choice = _provider_for(project, provider, env)
+    if model and choice.enabled is False:
+        return _provider_verdict(choice)
+
     _sweep_project_listing(cwd)
     message = _message_for(Path(prompt_file).read_text(encoding='utf-8'), record_dir)
     launched_at = datetime.now(UTC)
     try:
-        launched = _start_thread(cwd, title, model, message)
+        launched = _start_thread(cwd, title, model, choice.instance_id, message)
     except T3CommandFailed as exc:
         logger.warning(str(exc))
         recovered = _find_launched_after_failure(cwd, title, launched_at, project)
@@ -842,8 +877,92 @@ def self_record(tree: ProcessTree) -> str:
 
 
 # ---------------------------------------------------------------------------
+# MCP credential: pair and status
+# ---------------------------------------------------------------------------
+
+
+class RuntimeOriginFailure(StrEnum):
+    MISSING = 'server-runtime-missing'
+    UNUSABLE = 'server-runtime-origin-unusable'
+
+
+@dataclass(frozen=True)
+class RuntimeOriginFailed:
+    """server-runtime.json names no origin a credential may be sent to."""
+
+    reason: RuntimeOriginFailure
+    origin: str | None = None
+    """The ``origin`` string as found, for an UNUSABLE one."""
+    detail: str | None = None
+
+    def fields(self) -> dict[str, object]:
+        """The verdict tokens: the reason, then for an UNUSABLE origin what was found and why."""
+        if self.reason is RuntimeOriginFailure.MISSING:
+            return {'reason': self.reason.value}
+        return {'reason': self.reason.value, 'origin': self.origin, 'detail': self.detail}
+
+
+def _runtime_origin(env: Mapping[str, str]) -> str | RuntimeOriginFailed:
+    runtime = read_server_runtime(env)
+    if runtime is None:
+        return RuntimeOriginFailed(RuntimeOriginFailure.MISSING)
+    origin = runtime.get('origin')
+    if not isinstance(origin, str):
+        return RuntimeOriginFailed(RuntimeOriginFailure.UNUSABLE, detail='server-runtime.json has no origin string')
+    try:
+        return t3_mcp_client.checked_origin(origin)
+    except ValueError as error:
+        return RuntimeOriginFailed(RuntimeOriginFailure.UNUSABLE, origin, str(error))
+
+
+def _pair_failure_fields(failed: t3_mcp_client.PairFailed) -> dict[str, object]:
+    fields: dict[str, object] = {'reason': failed.reason.value}
+    if failed.reason is t3_mcp_client.PairFailure.CLI_VERSION_MISMATCH:
+        fields |= {'cli': failed.cli_version, 'server': failed.server_version}
+    if failed.detail is not None:
+        fields['detail'] = failed.detail
+    return fields
+
+
+def pair_verb(env: Mapping[str, str], code: str | None, origin: str | None) -> str:
+    resolved = origin or _runtime_origin(env)
+    if isinstance(resolved, RuntimeOriginFailed):
+        return _verdict('pair-failed', **resolved.fields())
+    source = t3_mcp_client.OperatorCode(code) if code else t3_mcp_client.CliCodeSource()
+    result = t3_mcp_client.pair(resolved, source)
+    if isinstance(result, t3_mcp_client.PairFailed):
+        return _verdict('pair-failed', **_pair_failure_fields(result))
+    credential = result.credential
+    return _verdict(
+        'paired',
+        environment_id=credential.environment_id,
+        expires_at=credential.expires_at.isoformat(),
+        access=credential.access,
+    )
+
+
+def status_verb(env: Mapping[str, str], origin: str | None) -> str:
+    resolved = origin or _runtime_origin(env)
+    if isinstance(resolved, RuntimeOriginFailed):
+        return _verdict('status-failed', **({'reason': resolved.reason.value, 'origin': None} | resolved.fields()))
+    status = t3_mcp_client.credential_status_at(resolved)
+    if isinstance(status, t3_mcp_client.DescriptorFailed):
+        return _verdict('status-failed', reason=status.reason.value, origin=resolved, detail=status.detail)
+    expires_at = status.credential.expires_at.isoformat() if status.credential else None
+    return _verdict(status.state.value, environment_id=status.environment_id, expires_at=expires_at, origin=resolved)
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
+
+def _origin_argument(url: str) -> str:
+    """``checked_origin`` for argparse, which prints an ArgumentTypeError's message and drops a ValueError's."""
+    try:
+        return t3_mcp_client.checked_origin(url)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -851,12 +970,17 @@ def _build_parser() -> argparse.ArgumentParser:
     verbs = parser.add_subparsers(dest='verb', required=True)
     verbs.add_parser('detect', help='print t3 when this process is hosted by a T3 thread')
 
+    provider_p = verbs.add_parser('provider', help='resolve the provider instance for a launch')
+    provider_p.add_argument('--cwd', required=True)
+    provider_p.add_argument('--provider', default=None, help='explicit provider instance id')
+
     launch_p = verbs.add_parser('launch', help='start a T3 thread for a spawn')
     launch_p.add_argument('--cwd', required=True)
     launch_p.add_argument('--title', required=True)
     launch_p.add_argument('--prompt-file', required=True)
     launch_p.add_argument('--record', required=True, help="record dir, '' when none")
     launch_p.add_argument('--model', default=None)
+    launch_p.add_argument('--provider', default=None, help='explicit provider instance id')
     launch_p.add_argument('--parent', default=None, help="the spawner's record slug")
 
     started_p = verbs.add_parser('await-started', help='wait for the thread to start, then bind')
@@ -872,6 +996,15 @@ def _build_parser() -> argparse.ArgumentParser:
     wait_p.add_argument('--record', required=True)
 
     verbs.add_parser('self-record', help="print this session's own record slug and parent")
+
+    pair_p = verbs.add_parser(
+        'pair', help="pair this host with the T3 server's /mcp (self-pair, or --code from an operator)"
+    )
+    pair_p.add_argument('--code', default=None)
+    pair_p.add_argument('--origin', type=_origin_argument, default=None)
+
+    status_p = verbs.add_parser('status', help="print the lane's MCP credential state")
+    status_p.add_argument('--origin', type=_origin_argument, default=None)
     return parser
 
 
@@ -888,12 +1021,19 @@ def _dispatch(args: argparse.Namespace) -> str:
             args.record,
             args.model,
             os.environ,
+            provider=args.provider,
             parent=args.parent,
         )
+    if args.verb == 'provider':
+        return _provider_verdict(provider_instance(args.cwd, args.provider, os.environ))
     if args.verb == 'await-started':
         return await_started(args.thread_id, args.cwd, args.record, args.timeout, args.since)
     if args.verb == 'wait':
         return wait(args.thread_id, args.cwd, args.record, os.environ)
+    if args.verb == 'pair':
+        return pair_verb(os.environ, args.code, args.origin)
+    if args.verb == 'status':
+        return status_verb(os.environ, args.origin)
     return self_record(ProcessTree())
 
 

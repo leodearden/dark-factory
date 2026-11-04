@@ -83,6 +83,7 @@ from fused_memory.backends.task_backend_types import (
     UpdateTaskResult,
     ValidateDependenciesResult,
 )
+from fused_memory.backends.task_projection import parse_task_projection
 from fused_memory.backends.task_text_markup_gate import refuse_leaked_task_text
 from fused_memory.config.schema import TaskmasterConfig
 from fused_memory.middleware.candidate_key import compute_candidate_key
@@ -2065,10 +2066,14 @@ class SqliteTaskBackend:
     async def get_tasks(
         self, project_root: str, tag: str | None = None,
         statuses: list[str] | None = None,
+        fields: Sequence[str] | None = None,
     ) -> GetTasksResult:
+        projection = parse_task_projection(fields)
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG
         tasks = await self._get_tasks_internal(project_root, tag, statuses=statuses)
+        if projection is not None:
+            tasks = [projection.apply(task) for task in tasks]
         return {'tasks': tasks}
 
     async def get_task(

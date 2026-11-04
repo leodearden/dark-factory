@@ -3965,13 +3965,21 @@ cap or outcome row ever recorded the loss. `data.stage` splits it:
 | `stage` | Meaning | `data` |
 |---|---|---|
 | `pre_flight` | We corroborated, found nothing (and could not rehydrate), and dispatched fresh. | `{stage, session_id, role, restore}` — `restore` is the rehydration **outcome**: `disabled` \| `miss` \| `fault` \| `published` (see below) |
-| `cli` | The resume WAS armed and the CLI rejected it; `invoke_with_cap_retry` retried fresh and returned a **success**, so nothing else records the loss. | `{stage, session_id, session_ids, role, fallbacks}` — `fallbacks` is the count of fresh retries this one invocation had to make, `session_ids` the ids they dropped (oldest first; `session_id` is the first, i.e. the resume the orchestrator adopted) |
+| `cli` | The resume WAS armed and the CLI rejected it before any model turn; `invoke_with_cap_retry` retried fresh (a retry that can itself fail), so nothing else records the loss. A resumed run that did work and *then* ended non-success (the `ended_awaiting_background` downgrade, a budget kill) is **not** reported here: it is a surviving resume, returned to the caller. | `{stage, session_id, session_ids, role, fallbacks}` — `fallbacks` is the count of fresh retries this one invocation had to make, `session_ids` the ids they dropped (oldest first; `session_id` is the first, i.e. the resume the orchestrator adopted) |
 
 ```sql
 SELECT json_extract(data, '$.stage') AS stage, COUNT(*)
   FROM events WHERE event_type = 'session_resume_failed'
  GROUP BY stage;
 ```
+
+The steward emits `cli` rows too, carrying `role = 'steward'`. Those are
+live-continuation resumes the `_run_slot` guard never adopted, so filter them
+out of any ratio reading with
+`AND json_extract(data, '$.role') != 'steward'`. Rows written before task 5579
+also include completed-but-downgraded runs: the old branch counted every
+resumed non-success, and 0 of 25 such rows measured on dark_factory and reify
+were rejections.
 
 `data.restore` on the `pre_flight` rows is what tells you *which* thing is
 broken, so split on it before concluding anything:
@@ -4000,7 +4008,8 @@ silently inflates the attempt count. Read it against `session_resume` alone:
 
 That reading holds because BOTH stages are subsets of the adopted-resume
 population by construction: `pre_flight` fires only where a recovered session
-was about to be armed, and `cli` fires only when `_invoke` actually armed one.
+was about to be armed, and a non-steward `cli` row fires only when `_invoke`
+actually armed one.
 The underlying `AgentResult.resume_fallbacks` counter is *wider* than that — it
 also counts a resume `invoke_with_cap_retry` re-armed internally after a cap
 hit, which a plain fresh dispatch can reach — so the emit is gated on the
