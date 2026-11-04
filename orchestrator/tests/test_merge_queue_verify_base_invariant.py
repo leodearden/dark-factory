@@ -546,7 +546,7 @@ class TestRemergeCarveOutAtSnapshotSurface:
             dispatch_worker = _make_worker(git_ops)
             caplog.clear()
             with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
-                dispatch_worker._warn_if_verify_base_not_frozen_tip(item, main_sha)
+                dispatch_worker._verify_base_divergence_at_dispatch(item, main_sha)
             dispatch_fired = any(
                 r.levelno >= logging.WARNING for r in caplog.records
             )

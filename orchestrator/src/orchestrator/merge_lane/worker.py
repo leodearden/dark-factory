@@ -210,6 +210,7 @@ from orchestrator.merge_lane.types import (
     SpeculativeItem,
     TerminalOutcomeRetention,
     TrainCallbackFactory,
+    VerifyBaseDivergence,
     VerifyBaseFacts,
     VerifyInFlight,
     VerifyInFlightKind,
@@ -219,6 +220,10 @@ from orchestrator.merge_lane.types import (
     lease_activity,
     quarantine_class,
     remote_dispatch_live,
+)
+from orchestrator.merge_lane.verify_base_detector import (
+    alarm_verify_base_divergence,
+    detect_verify_base_divergence,
 )
 from orchestrator.remote_gate import GateIdentityPair, RunnerUnavailableKind
 from orchestrator.scheduler import StaleEvidenceRejection
@@ -10518,6 +10523,19 @@ class SpeculativeMergeWorker:
         tip = self._newest_frozen_commit()
         return tip if tip is not None else main_sha
 
+    def verify_base_divergences(self) -> tuple[VerifyBaseDivergence, ...]:
+        """The §5.3 verify-base divergences stamped on the frozen prefix, in
+        frozen order (task 5302).
+
+        Each was computed once, by :meth:`_verify_base_divergence_at_dispatch`
+        against its dispatch's fresh main, so a later move of main never adds
+        one; a record lives as long as its entry.  Pure/synchronous.
+        """
+        return tuple(
+            d for e in self._frozen_inflight_entries()
+            if (d := e.verify_base_divergence) is not None
+        )
+
     def _record_dead_base(self, *shas: str) -> None:
         """Record merge commit(s) as dead bases in the INV-3 chain-liveness ledger.
 
@@ -10728,7 +10746,7 @@ class SpeculativeMergeWorker:
 
         (iii) **verify-base ⊆ frozen-tip** (task 1999 / MQ-invariants ξ, I5):
              snapshot-granularity promotion of the dispatch-time
-             :meth:`_warn_if_verify_base_not_frozen_tip` log-only guard — see
+             :meth:`_verify_base_divergence_at_dispatch` log-only guard — see
              :meth:`_verify_base_frozen_tip_violations` for the per-entry
              chained-base check.  Distinctly worded from
              :meth:`check_frozen_prefix_invariant`'s base-chain violation so
@@ -10800,7 +10818,7 @@ class SpeculativeMergeWorker:
     def _verify_base_frozen_tip_violations(self, main_sha: str) -> list[str]:
         """Return verify-base/frozen-tip violations as human-readable strings (task 1999 I5).
 
-        Snapshot-granularity promotion of :meth:`_warn_if_verify_base_not_frozen_tip`
+        Snapshot-granularity promotion of :meth:`_verify_base_divergence_at_dispatch`
         (the ε=1890 log-only dispatch guard): every currently-frozen entry's
         recorded ``base_sha`` must equal the frozen-tip base it was dispatched
         against — the head entry's expected base is *main_sha*, and each
@@ -10824,7 +10842,7 @@ class SpeculativeMergeWorker:
         main, so a mismatch is correct by construction.  Applied to violation
         EMISSION only, never by filtering :meth:`_frozen_base_chain` (see that
         method), and applied identically by
-        :meth:`_warn_if_verify_base_not_frozen_tip` at dispatch time: both
+        :meth:`_verify_base_divergence_at_dispatch` at dispatch time: both
         §5.3 surfaces carve out together or they silently disagree, precisely
         the failure the shared-generator paragraph above exists to prevent.
 
@@ -11883,69 +11901,57 @@ class SpeculativeMergeWorker:
             now=now, min_age_secs=self.PERIODIC_REAP_MIN_AGE_SECS,
         )
 
-    def _warn_if_verify_base_not_frozen_tip(
+    def _verify_base_divergence_at_dispatch(
         self,
         item: SpeculativeItem,
         main_sha: str,
-    ) -> None:
-        """Log a WARNING when a real-verify dispatch base is not the frozen tip (ε=1890).
+    ) -> VerifyBaseDivergence | None:
+        """Detect, log and escalate a real-verify dispatched off the frozen tip (PRD §5.3).
 
-        §5.3 invariant: a verify may only start against a base that is the tip
-        of the frozen prefix.  This guard surfaces a mismatch as a WARNING for
-        observability (λ integration gate / production debugging) WITHOUT
-        changing control flow, raising, or mutating any state.
-
-        ADVISORY BY DECISION — do NOT flip this to enforcement (task 3206;
-        PRD §5.3 carries the adjudication and the measured evidence).  The
-        soundness property §5.3 is reaching for is already enforced at
-        ADOPTION time by INV-3: :meth:`_void_and_remerge` (called from
-        :meth:`_finalize_inflight`) discards a PASS *or* FAIL verdict whose
-        ``base_sha`` is a known-dead commit, so a verify against a base that
-        turns out not to be the eventual main is never ADOPTED.  Dispatch time
-        cannot know whether the item frozen ahead will land or fail; adoption
-        time can.
-
-        §5.3 RE-MERGE CARVE-OUT: items carrying ``remerge_recovery=True`` are
-        exempt — they come from :meth:`_remerge` and legitimately target real
-        main.  :meth:`_verify_base_frozen_tip_violations` applies the identical
-        carve-out on the snapshot surface; the two must stay in lockstep.
+        A DETECTOR, never a refusal (esc-3206-3): it changes no control flow
+        and mutates no lane state.  The soundness property §5.3 reaches for is
+        enforced at ADOPTION time by INV-3: :meth:`_void_and_remerge` (called
+        from :meth:`_finalize_inflight`) discards a PASS *or* FAIL verdict
+        whose ``base_sha`` is a known-dead commit.  Dispatch time cannot know
+        whether the item frozen ahead will land or fail; adoption time can.
 
         Called from _dispatch_item immediately before launching the real-verify
-        task.  main_sha must be the caller's already-fetched get_main_sha()
-        result (fail-open: the guard is skipped entirely on get_main_sha error,
-        so this method is never reached with a stale/empty sha argument).
-
-        Entries with no merge_result (passthrough/conflict) are excluded:
-        they carry no merge_commit and are not part of the frozen prefix.
-
-        Pure/synchronous (no await).  Returns None in all cases.
+        task, with that call's freshly fetched main (fail-open: skipped on a
+        get_main_sha error).  _dispatch_item stamps the returned record on the
+        entry, so the WARNING, the L1 and :meth:`verify_base_divergences` are
+        one computation.  The policy, ``remerge_recovery`` carve-out included,
+        is :func:`detect_verify_base_divergence`.
         """
-        if not isinstance(item, RealMergeItem) or not item.base_sha:
-            return  # passthrough / conflict — not a real-verify candidate
-        if item.remerge_recovery:
-            # §5.3 re-merge carve-out (PRD §5.3): a recovery re-merge targets
-            # real main by construction, so a mismatch here is not a violation.
-            # Suppressed at BOTH surfaces (see
-            # _verify_base_frozen_tip_violations) so they cannot disagree.
-            return
-        expected_tip = self.frozen_prefix_tip(main_sha)
-        if item.base_sha.strip() == expected_tip.strip():
-            return  # invariant holds
-        logger.warning(
-            'ε=1890 §5.3 guard: task %s (rid=%s) dispatched for real-verify '
-            'against a base (%r) that is NOT the frozen-prefix tip (%r); '
-            'verify_depth=%d.  TRIAGE — either half can be the wrong one: the '
-            'EXPECTED TIP may be a stranded finalize head\'s dead merge commit '
-            '(task-3082 class; this verify may still pass and land), or the '
-            'base really is speculative-only.  ADVISORY BY DECISION — control '
-            'flow unchanged, not a latent bug awaiting enforcement; see PRD '
-            '§5.3 (task 3206).',
-            item.request.task_id,
-            item.request.request_id,
-            item.base_sha,
-            expected_tip,
-            len(self.frozen_prefix()),
+        divergence = detect_verify_base_divergence(
+            item,
+            self.frozen_prefix_tip(main_sha),
+            verify_depth=len(self.frozen_prefix()),
+            observed_at=self._clock.now(),
         )
+        if divergence is None:
+            return None
+        logger.warning(
+            'ε=1890 §5.3 guard (verify-base detector): task %s (rid=%s) dispatched for '
+            'real-verify against a base (%r) that is NOT the frozen-prefix tip '
+            "(%r); verify_depth=%d.  Recorded in snapshot()['verify_base_divergences'] "
+            'and filed as an L1 merge_verify_base_divergence; control flow '
+            'unchanged (esc-3206-3, PRD §5.3).',
+            divergence.task_id,
+            divergence.request_id,
+            divergence.base_sha,
+            divergence.expected_tip,
+            divergence.verify_depth,
+        )
+        try:
+            alarm_verify_base_divergence(
+                self._escalation_queue, divergence, event_store=self._event_store,
+            )
+        except Exception:
+            logger.warning(
+                'verify-base divergence L1 for rid=%s failed to file; the record '
+                'stands on the entry', divergence.request_id, exc_info=True,
+            )
+        return divergence
 
     async def _acquire_next_request(self) -> MergeRequest | None:
         """Return the next pickable request, blocking if nothing is available.
@@ -12730,6 +12736,11 @@ class SpeculativeMergeWorker:
             # No collision with existing keys.
             'two_layer_invariants': self.two_layer_invariants(
                 self._intake.last_known_main_sha or 'unknown'
+            ),
+            # task 5302 additive key: the §5.3 verify-base DETECTOR's records,
+            # stamped at dispatch and never re-derived against the cached main.
+            'verify_base_divergences': list(
+                map(VerifyBaseDivergence.to_wire, self.verify_base_divergences()),
             ),
             # θ=1993 additive key: merger-side speculation state (from
             # self._speculation_controller.snapshot()) plus
@@ -14933,8 +14944,8 @@ class SpeculativeMergeWorker:
                         # item.base_sha (:8381), _dispatch_item's Mechanism-2
                         # staleness check explicitly excludes
                         # item.immediate_outcome is not None (:8901), and
-                        # _warn_if_verify_base_not_frozen_tip returns
-                        # immediately when item.merge_result is None (:5228).
+                        # detect_verify_base_divergence returns None for
+                        # any DecidedItem.
                         # So this divergence has no observable effect.
                         _decided_item = DecidedItem(
                             request=req,
@@ -16292,7 +16303,7 @@ class SpeculativeMergeWorker:
 
         §5.3 RE-MERGE CARVE-OUT: items returned here are exempt from the
         verify-base⊄frozen-tip guard at BOTH surfaces
-        (:meth:`_warn_if_verify_base_not_frozen_tip`,
+        (:meth:`_verify_base_divergence_at_dispatch`,
         :meth:`_verify_base_frozen_tip_violations`).  ``base_sha=actual_main``
         and ``speculative=False`` in the body are ADJUDICATED and must NOT be
         changed to stack on ``frozen_prefix_tip()``.  PRD §5.3 is the canonical
@@ -20623,26 +20634,27 @@ class SpeculativeMergeWorker:
         # `finally` owns the chain lane.  Nothing between the last `await` in
         # this block and that call can raise.
         try:
-            # ── ε=1890 log-only §5.3 guard: verify base must be frozen-prefix tip ──
+            # ── ε=1890 §5.3 verify-base detector: record, log, escalate ──────────
             # Fail-open: fetch main_sha in a try/except so a transient git error
-            # never blocks verify dispatch.  The guard is purely observational —
-            # it never changes control flow.  NOT wired into _verify_and_advance
+            # never blocks verify dispatch.  The detector is purely observational
+            # — it never changes control flow.  NOT wired into _verify_and_advance
             # (the compat shim used by direct-call tests) to keep shim tests green.
             #
-            # ADVISORY BY DECISION (PRD §5.3, task 3206) — this is not a
+            # A DETECTOR, never a refusal (esc-3206-3, PRD §5.3) — this is not a
             # not-yet-enforced TODO; the soundness property is already enforced at
             # ADOPTION time by INV-3 (_void_and_remerge via _finalize_inflight).
             # Two traps make a naive flip here actively dangerous, so if one is
             # ever attempted anyway, it must solve BOTH:
             #   1. The `except Exception: pass` below would SWALLOW any exception
             #      raised by the guard, so enforcement can NOT be implemented by
-            #      making _warn_if_verify_base_not_frozen_tip raise — it would
+            #      making _verify_base_divergence_at_dispatch raise — it would
             #      silently do nothing.
             #   2. This guard sits AFTER `allocator.acquire()` above, so a bare
             #      `return None` inserted here LEAKS the host lease.  (The
             #      enclosing LEASE/PERMIT LEAK GUARD catches a RAISE out of this
             #      region, not a `return` -- a `return` is a normal exit and no
             #      `except` arm sees it.  Trap 2 stands unchanged.)
+            verify_base_divergence: VerifyBaseDivergence | None = None
             try:
                 _guard_main_sha = await self._git_ops.get_main_sha()
                 # DEFECT 2 (task 2357): refresh the §5.3 snapshot cache from the
@@ -20650,7 +20662,9 @@ class SpeculativeMergeWorker:
                 # lags behind this dispatch's view of main (piggybacks the fetch
                 # above; no extra git round-trip).
                 self._intake.note_main_sha(_guard_main_sha)
-                self._warn_if_verify_base_not_frozen_tip(item, _guard_main_sha)
+                verify_base_divergence = self._verify_base_divergence_at_dispatch(
+                    item, _guard_main_sha,
+                )
             except Exception:
                 pass  # fail-open: skip the check (and the refresh) on any git error
 
@@ -20791,6 +20805,7 @@ class SpeculativeMergeWorker:
             permit=item_permit,
             chain=chain,
             verify_wt=verify_wt,
+            verify_base_divergence=verify_base_divergence,
         )
         entry_slot.entry = entry
         return entry

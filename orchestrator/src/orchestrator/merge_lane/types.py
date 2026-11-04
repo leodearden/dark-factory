@@ -1330,7 +1330,8 @@ class DecidedItem:
     permit: SpecPermit | None = None  # ζ: speculation-slot token owned by PermitLedger; threaded/released by η
     # task 3206 / PRD §5.3: mirrors RealMergeItem so BOTH arms of the union
     # carry the marker.  Currently UNREAD on this arm — both §5.3 consumers
-    # (_warn_if_verify_base_not_frozen_tip, _frozen_base_chain) type-narrow to
+    # (merge_lane/verify_base_detector.py::detect_verify_base_divergence and
+    # worker.py::SpeculativeMergeWorker::_frozen_base_chain) type-narrow to
     # RealMergeItem before reading it, because only a real merge has a verify
     # base to check.  It is not decorative, though: _remerge's single-exit
     # chokepoint stamps the marker with dataclasses.replace on whichever
