@@ -250,7 +250,7 @@ def _normalize_plan(plan: dict) -> tuple[dict, bool]:
     if 'steps' not in plan:
         for alias in _STEPS_ALIASES:
             if alias in plan and isinstance(plan[alias], list):
-                logger.warning('Normalizing plan: renaming %r → "steps"', alias)
+                logger.debug('Normalizing plan: renaming %r → "steps"', alias)
                 plan['steps'] = plan.pop(alias)
                 modified = True
                 break
@@ -259,7 +259,7 @@ def _normalize_plan(plan: dict) -> tuple[dict, bool]:
     if 'steps' not in plan and _NESTED_PLAN_KEY in plan:
         nested = plan[_NESTED_PLAN_KEY]
         if isinstance(nested, dict):
-            logger.warning(
+            logger.debug(
                 'Normalizing plan: flattening %s phases from %r',
                 len(nested), _NESTED_PLAN_KEY,
             )
@@ -275,8 +275,8 @@ def _normalize_plan(plan: dict) -> tuple[dict, bool]:
     if isinstance(steps, list):
         new_steps, changed = _wrap_string_items(steps, 'step')
         if changed:
-            logger.warning('Normalizing plan: wrapping %d string steps as dicts',
-                           sum(1 for s in steps if isinstance(s, str)))
+            logger.debug('Normalizing plan: wrapping %d string steps as dicts',
+                         sum(1 for s in steps if isinstance(s, str)))
             plan['steps'] = new_steps
             modified = True
 

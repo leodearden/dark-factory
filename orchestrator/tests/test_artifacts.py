@@ -1949,6 +1949,28 @@ class TestPlanNormalizationIntegration:
         assert plan_path.read_bytes() == bytes_before
         assert sorted(p.name for p in plan_path.parent.iterdir()) == listing_before
 
+    def test_only_the_on_disk_repair_warns(self, artifacts: TaskArtifacts, caplog):
+        plan_path = artifacts.artifact_path('plan.json')
+        plan_path.write_text(json.dumps({'tdd_steps': ['write the test']}))
+
+        def artifact_warnings() -> list[str]:
+            return [
+                record.getMessage()
+                for record in caplog.records
+                if record.name == 'orchestrator.artifacts'
+                and record.levelname == 'WARNING'
+            ]
+
+        with caplog.at_level('WARNING'):
+            artifacts.peek_plan()
+            artifacts.peek_plan()
+            assert artifact_warnings() == []
+
+            artifacts.read_plan()
+            [repair_warning] = artifact_warnings()
+
+        assert str(plan_path) in repair_warning
+
     def test_read_plan_no_write_when_valid(self, artifacts: TaskArtifacts):
         valid = {
             'task_id': 'task-1',
