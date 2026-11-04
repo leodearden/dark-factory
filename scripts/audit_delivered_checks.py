@@ -94,6 +94,7 @@ from _task_db_scan import (
     AUDIT_EXIT_NO_ROOT,
     AUDIT_EXIT_NOTHING_AUDITED,
     AUDIT_EXIT_OK,
+    decode_metadata,
     format_coverage_block,
     format_kv_line,
     run_audit_cli,
@@ -514,11 +515,11 @@ def load_task_index(db_path: str) -> TaskIndex:
     """Statuses, ``updated_at`` stamps and stamped checks of *db_path*.
 
     Opens through ``shared/src/shared/tasks_db_readonly.py::connect_ro``
-    (read-only; see there for refusals). Malformed metadata is SKIPPED rather
-    than raised: a single undecodable row must not abort a whole-project sweep,
-    and ``extract_delivered_checks`` already implements exactly that
-    benign-absent contract (the same one ``lock_charter_guard.extract_files``
-    uses at the wire boundary).
+    (read-only; see there for refusals). Metadata is decoded by
+    ``scripts/_task_db_scan.py::decode_metadata``, the decoder every audit
+    script shares, which degrades a corrupt blob to ``{}``: a single
+    undecodable row is SKIPPED rather than raised, because it must not abort
+    a whole-project sweep.
     """
     conn = connect_ro(db_path)
     try:
@@ -533,7 +534,7 @@ def load_task_index(db_path: str) -> TaskIndex:
             task_id = int(record["id"])
             statuses[task_id] = (record["tag"], record["status"])
             stamps[task_id] = record["updated_at"]
-            checks = extract_delivered_checks(record["metadata"])
+            checks = extract_delivered_checks(decode_metadata(record["metadata"]))
             metadata_rows.extend(
                 _mechanical_rows_from_checks(
                     checks,
