@@ -1,4 +1,4 @@
-"""The tail of in/inbox.jsonl, the portal's reveal requests and defect reports to the publisher (PRD §7.4, §14.3)."""
+"""The tail of in/inbox.jsonl, the portal's reveal requests, defect reports and the rulings on them to the publisher (PRD §7.4, §14.3)."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from client_feed.contract import (
     INBOX_FILENAME,
     ContractViolation,
     DefectReported,
+    DefectRuled,
     InboxLine,
     RevealRequested,
     parse_inbox_line,
@@ -41,6 +42,11 @@ class InboxRead:
     def reports(self) -> tuple[DefectReported, ...]:
         """The defect reports among the lines."""
         return tuple(line for line in self.lines if isinstance(line, DefectReported))
+
+    @property
+    def rulings(self) -> tuple[DefectRuled, ...]:
+        """The rulings on defect reports among the lines."""
+        return tuple(line for line in self.lines if isinstance(line, DefectRuled))
 
 
 class InboxUnusable(FeedIoError):
