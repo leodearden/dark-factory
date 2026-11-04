@@ -519,6 +519,19 @@ class TestCheckFrozenPrefixInvariant:
         # The violation message should name the offending rid
         assert item_e.request.request_id in ' '.join(violations)
 
+    async def test_lone_head_off_main_is_intact(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """A lone head whose base is not main_sha, and not a recorded dead
+        commit, breaks nothing: INV-3 is chain-intact, not base == main (task 5302).
+        """
+        worker = _make_worker(git_ops)
+        _, item_d = _make_fake_item('t-d', base_sha='older-main', merge_commit='commitDc',
+                                    config=config, git_repo=git_repo)
+        _seed_frozen(worker, _make_inflight_entry(item_d, verifying=True))
+
+        assert worker.check_frozen_prefix_invariant('main000') == []
+
     async def test_disjointness_violation(
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
     ) -> None:
