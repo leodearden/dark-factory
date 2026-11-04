@@ -386,10 +386,97 @@ for (const bucketMinutes of [60, null]) {
     const titles = [...container.querySelectorAll('.panel-head > .title')]
       .map(title => title.textContent)
       .filter(text => text.startsWith('Merge attempts'));
-    const caption = harness.window.DF_MERGE_QUEUE.depthBucketCaption(block.depth);
+    const caption = harness.window.DF_MERGE_QUEUE.depthBucketCaption(block.depth.value);
     assert.deepEqual(titles, [`Merge attempts · ${caption}`]);
   });
 }
+
+// ── An unread runs.db (merge_queue.js::attemptsOver, worstP95Over, projectAttempts) ──
+// A project whose runs.db could not be read renders every runs.db reading as
+// unknown: no measured-looking 0, and no chart drawn over nothing.
+
+function mountMergeTab(t, block) {
+  const harness = openWindow(t);
+  seedDashboardData(harness.window, {
+    MERGE_QUEUE: { [PROJECT]: block },
+    __receipt: receiptsFor(harness.window.DF_DATA_LOADER, ['MERGE_QUEUE']),
+  });
+  const { container } = harness.mount(harness.window.DF_TABS.MergeTab, { projectFilter: [] });
+  return { harness, container };
+}
+
+function panelTitled(container, prefix) {
+  const titles = [...container.querySelectorAll('.panel-head > .title')].filter(title => title.textContent.startsWith(prefix));
+  assert.equal(titles.length, 1, `expected exactly one panel titled "${prefix}…"`);
+  return titles[0].closest('.panel');
+}
+
+test('tabs.jsx::MergeTab renders an unread runs.db as unknown, never as measured zeros', t => {
+  const { harness, container } = mountMergeTab(t, mergeQueueBlock({ bucketMinutes: 60, unread: true }));
+  const DF = harness.window.DF_DATA;
+  const { attemptsOver, worstP95Over, projectAttempts } = harness.window.DF_MERGE_QUEUE;
+  const { datumView, EM_DASH } = harness.window.DF_DATUM;
+
+  const merges = datumView(attemptsOver(DF, null)).text;
+  assert.equal(merges, EM_DASH);
+  assert.equal(statTile(container, 'Merges (window)').querySelector('.val').textContent, merges);
+  const worst = datumView(worstP95Over(DF, null)).text;
+  assert.equal(worst, EM_DASH);
+  assert.equal(statTile(container, 'p95 latency · worst project').querySelector('.val').textContent, worst);
+
+  const pips = [...container.querySelectorAll('.pip')].map(pip => pip.textContent);
+  assert.ok(pips.includes(`${datumView(projectAttempts(DF, PROJECT)).text} attempts`), JSON.stringify(pips));
+  assert.ok(!pips.some(text => text.startsWith('0 attempts')), `an unread project reads a measured 0: ${JSON.stringify(pips)}`);
+  for (const prefix of ['Outcomes', 'Merge attempts']) {
+    assert.equal(panelTitled(container, prefix).querySelector('svg'), null, `${prefix} draws a chart over an unread window`);
+  }
+});
+
+test('tabs.jsx::MergeTab counts a measured window\'s attempts with attemptCount', t => {
+  const block = mergeQueueBlock({ bucketMinutes: 60, outcomes: { done: 3, conflict: 2 } });
+  const { harness, container } = mountMergeTab(t, block);
+
+  const count = harness.window.DF_MERGE_QUEUE.attemptCount(block.attempts.value);
+  assert.equal(count, 5);
+  assert.equal(statTile(container, 'Merges (window)').querySelector('.val').textContent, String(count));
+  for (const prefix of ['Outcomes', 'Merge attempts']) {
+    assert.notEqual(panelTitled(container, prefix).querySelector('svg'), null, `${prefix} draws no chart over a measured window`);
+  }
+});
+
+function withDepthValues(block, values) {
+  return { ...block, depth: { ...block.depth, value: { ...block.depth.value, values } } };
+}
+
+function panelMeta(container, prefix) {
+  return panelTitled(container, prefix).querySelector('.panel-head > .meta').textContent;
+}
+
+// The depth series' first bucket is counted whole (test_merge_queue_data.py::test_first_bucket_includes_events_before_cutoff), so its sum is not the window's attempt count; attemptCount is the only one.
+for (const values of [[1], [2, 0, 3]]) {
+  test(`tabs.jsx::MergeTab reads the depth panel as the series' per-bucket peak over ${JSON.stringify(values)}`, t => {
+    const block = withDepthValues(mergeQueueBlock({ bucketMinutes: 60, buckets: values.length }), values);
+    const { container } = mountMergeTab(t, block);
+
+    const meta = panelMeta(container, 'Merge attempts');
+    assert.ok(meta.startsWith(`peak ${Math.max(0, ...values)}/bucket`), meta);
+  });
+}
+
+test('tabs.jsx::MergeTab gives a window one attempt count, whatever the depth series sums to', t => {
+  const block = withDepthValues(mergeQueueBlock({ bucketMinutes: 60, buckets: 3, outcomes: { done: 1 } }), [1, 0, 1]);
+  const { harness, container } = mountMergeTab(t, block);
+  const count = harness.window.DF_MERGE_QUEUE.attemptCount(block.attempts.value);
+
+  const pips = [...container.querySelectorAll('.pip')].map(pip => pip.textContent);
+  assert.ok(pips.includes(`${count} attempts`), JSON.stringify(pips));
+  const outcomes = panelMeta(container, 'Outcomes');
+  assert.ok(outcomes.startsWith(`${count} merges`), outcomes);
+  assert.equal(statTile(container, 'Merges (window)').querySelector('.val').textContent, String(count));
+  const depth = panelMeta(container, 'Merge attempts');
+  assert.doesNotMatch(depth, /\battempts\b/);
+  assert.doesNotMatch(depth, /\bmerges\b/);
+});
 
 // ── Decision 6: a render throw is contained, and its notice is render_failure.js's ──
 // React's development build reports every throw a boundary catches on
@@ -981,5 +1068,43 @@ for (const chart of COUNT_AXIS_CHARTS) {
     const axis = renderAxis(harness, chart, { countAxis: true, formatY: v => `${v} ops` });
     const max = harness.window.DF_SPARK_PATH.axisMax(DATA_MAX, axis.ticks, true);
     assert.deepEqual(axis.labels, tickValues(max, axis.ticks).map(v => `${v} ops`));
+  });
+}
+
+// ── Decision 10: the Tasks tab's banner notices (tasks_offline_banner.js::tasksBannerNoticesFor) ──
+// Every notice kind the helper returns renders under its own test id. Each
+// case seeds the one /tasks fact that yields that kind and nothing else, so a
+// kind with no bannerTestIds entry renders with no test id and fails here.
+
+const OTHER_PROJECT = 'q';
+const BANNER_CASES = [
+  { kind: 'global', testId: 'tasks-offline-banner',
+    data: { TASKS_OFFLINE: true, TASKS_OFFLINE_PROJECTS: [PROJECT], TASKS_PROJECT_COUNT: 1 } },
+  { kind: 'partial', testId: 'tasks-partial-banner',
+    data: { TASKS_OFFLINE_PROJECTS: [OTHER_PROJECT], TASKS_PROJECT_COUNT: 2 } },
+  { kind: 'degraded', testId: 'tasks-degraded-banner',
+    data: { TASKS_DEGRADED_PROJECTS: [OTHER_PROJECT], TASKS_PROJECT_COUNT: 2 } },
+  { kind: 'count-unknown', testId: 'tasks-count-unknown-banner',
+    data: { TASKS_COUNT_UNKNOWN_PROJECTS: [PROJECT], TASKS_PROJECT_COUNT: 1 } },
+  { kind: 'count-stale', testId: 'tasks-count-stale-banner',
+    data: { TASKS_COUNT_STALE_PROJECTS: [PROJECT], TASKS_PROJECT_COUNT: 1 } },
+];
+
+for (const { kind, testId, data } of BANNER_CASES) {
+  test(`tab_tasks.jsx::TasksTab renders the ${kind} notice tasksBannerNoticesFor describes under ${testId}`, t => {
+    const harness = openWindow(t);
+    const { window } = harness;
+    seedOneTask(window, inProgressTask(false));
+    seedDashboardData(window, { ...data, __receipt: receiptsFor(window.DF_DATA_LOADER, Object.keys(data)) });
+    const { container } = harness.mount(window.DF_TASKS.TasksTab, TAB_PROPS);
+
+    const notices = window.DF_TASKS_OFFLINE_BANNER.tasksBannerNoticesFor(window.DF_DATA);
+    assert.deepEqual(Array.from(notices, n => n.kind), [kind]);
+    const rendered = [...container.querySelectorAll(`[data-testid="${testId}"]`)];
+    assert.equal(rendered.length, 1, `the ${kind} notice must render exactly once under ${testId}`);
+    assert.equal(rendered[0].textContent, notices[0].text);
+    for (const other of BANNER_CASES.filter(c => c.kind !== kind)) {
+      assert.deepEqual([...container.querySelectorAll(`[data-testid="${other.testId}"]`)], [], other.testId);
+    }
   });
 }

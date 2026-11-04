@@ -557,7 +557,7 @@ and are not restated here.
     `_file_stop_instruction_and_block`,
     `_file_curator_adjudication_missing_and_block`,
     `_file_milestone_gate_and_block`,
-    `_file_milestone_check_failed_and_block`). Each wraps the status write in
+    `_file_predicate_escalation_and_block`). Each wraps the status write in
     `try`/`except` and *log-and-swallows* a failure (the escalation is already
     durable), so it can file the record and still not write `blocked`. These
     are also the `pending → blocked` edge §3.8 depends on — no workflow, and
@@ -739,7 +739,7 @@ matter most for reasoning about safety:
 
 | Role | Stage | Purpose | Model / effort / budget / turns |
 |---|---|---|---|
-| `architect` | PLAN | Explores the codebase, verifies premises, builds the TDD plan | opus / max / $15 / 100 |
+| `architect` | PLAN | Explores the codebase, verifies premises, builds the TDD plan | opus / xhigh / $15 / 100 |
 | `implementer` | EXECUTE | RED test → GREEN implementation → commit, per plan step; sandboxed | sonnet / max / $10 / 80 (routed to opus above ~12 steps or ~3 modules) |
 | `debugger` | VERIFY failure loop | Fixes test/lint/typecheck failures with minimal changes; sandboxed | sonnet / max / $5 / 50 |
 | `reviewer_comprehensive` | REVIEW | Sole reviewer: test quality, reuse, architecture, performance, robustness; read-only | opus / high / $5 / 30 (config resolves `reviewer_comprehensive` → the `reviewer` config key) |

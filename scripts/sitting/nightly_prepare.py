@@ -46,8 +46,10 @@ child can settle a slot. The known cost is that this run's spend is invisible
 to the gate. The leased token is written into the run's config dir and
 removed on every exit that reaches ``run``'s ``finally`` (a SIGKILL leaves
 it). With no lease the run is skipped (exit 1): it never uses the host login.
-``ANTHROPIC_API_KEY`` is stripped from the child's env (OPERATIONS.md §12,
-"Legibility trickle accounts (03:00)").
+The child's env is ``shared.secret_env.agent_subprocess_env`` of this
+process's, with the lease's ``CLAUDE_CODE_OAUTH_TOKEN`` on top, so it holds no
+API key or other secret, no endpoint selection and no Python-environment
+selection (OPERATIONS.md §12, "Legibility trickle accounts (03:00)").
 
 Exit codes: 0 the run completed and recorded something; 1 it failed, timed out,
 hit a usage limit or recorded nothing; 2 a configuration error. ``main`` never raises,
@@ -88,9 +90,10 @@ from orchestrator.agents.sandbox_dispatch import (  # noqa: E402  # debt: task 6
     wrap_command,
 )
 from shared.cap_markers import looks_like_blocking_banner  # noqa: E402
-from shared.cli_invoke import build_claude_argv  # noqa: E402
+from shared.cli_invoke import build_claude_argv, claude_binary_spec  # noqa: E402  # debt: task 6760
 from shared.config_dir import TaskConfigDir  # noqa: E402  # debt: task 6760
 from shared.git_read_rules import git_read_rules  # noqa: E402  # debt: task 6760
+from shared.secret_env import agent_subprocess_env  # noqa: E402  # debt: task 6760
 from sitting import inventory, preparation  # noqa: E402  # debt: task 6760
 
 EXIT_OK, EXIT_FAILED, EXIT_CONFIG = 0, 1, 2
@@ -326,8 +329,7 @@ def _mcp_config(path: Path) -> dict[str, Any]:
 
 def _child_env(gate: Any, inbox: Path, config_dir: TaskConfigDir) -> dict[str, str] | None:
     """The CLI's env with a leased account written into *config_dir*, or None when no pool account is free."""
-    env = dict(os.environ)
-    env.pop('ANTHROPIC_API_KEY', None)
+    env = agent_subprocess_env(os.environ)
     env[preparation.NIGHTLY_CONFINEMENT_ENV] = str(inbox)
     env['CLAUDE_CONFIG_DIR'] = str(config_dir.path)
     lease = gate.try_lease(reverse=True)
@@ -466,7 +468,7 @@ def _positive(cast: Callable[[str], float]) -> Callable[[str], Any]:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog='nightly_prepare.py', description='Run the prepare-sitting mode headless.')
-    parser.add_argument('--claude-bin', default='claude', help='the claude CLI (default: claude on PATH)')
+    parser.add_argument('--claude-bin', default=claude_binary_spec(), help='the claude CLI (default: $CLAUDE_BINARY, else claude on PATH)')
     parser.add_argument('--model', default=DEFAULT_MODEL)
     parser.add_argument('--budget-usd', type=_positive(float), default=DEFAULT_BUDGET_USD)
     parser.add_argument('--timeout-secs', type=_positive(float), default=DEFAULT_TIMEOUT_SECS)

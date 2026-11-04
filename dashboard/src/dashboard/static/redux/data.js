@@ -61,7 +61,8 @@ function endpointsFor(win) {
   return {
     '/api/v2/dashboard/orchestrators':                { 'ORCHESTRATORS': PLAIN, 'PROJECTS': PLAIN, 'ORCHESTRATORS_SPARK': PLAIN },
     '/api/v2/dashboard/tasks':                        { 'TASKS_OFFLINE': PLAIN, 'TASKS_OFFLINE_PROJECTS': PLAIN,
-                                                        'TASKS_DEGRADED_PROJECTS': PLAIN, 'TASKS_COUNT_UNKNOWN_PROJECTS': PLAIN, 'TASKS_PROJECT_COUNT': PLAIN,
+                                                        'TASKS_DEGRADED_PROJECTS': PLAIN, 'TASKS_COUNT_UNKNOWN_PROJECTS': PLAIN,
+                                                        'TASKS_COUNT_STALE_PROJECTS': PLAIN, 'TASKS_PROJECT_COUNT': PLAIN,
                                                         'TASKS_SNAPSHOT': PLAIN },
     '/api/v2/dashboard/invariants':                   { 'INVARIANTS': PLAIN },
     '/api/v2/dashboard/memory':                       { 'MEMORY_STATUS': PLAIN },
@@ -154,6 +155,8 @@ window.DF_DATA = {
   // the done count was never measured — neither offline nor degraded. Without
   // this list they would render as healthy with a confident "0 done".
   TASKS_COUNT_UNKNOWN_PROJECTS: [],
+  // Projects whose census is shown from its last measurement, with its age.
+  TASKS_COUNT_STALE_PROJECTS: [],
   // N for the banner's "k of N": how many task project roots the tasks handler
   // fanned out over. Comes from the server so it denominates the same
   // population TASKS_OFFLINE_PROJECTS is drawn from — PROJECTS (orchestrator-
@@ -200,14 +203,15 @@ window.DF_DATA = {
     verdict: null,
     runs: [],
   },
-  // MERGE_QUEUE: {project_label: {depth, outcomes, latency: {p50, p95, p99,
-  //   mean_ms, with_duration, without_duration}, recent, recent_total: Datum,
+  // MERGE_QUEUE: {project_label: {depth: Datum ({labels, values,
+  //   bucket_minutes}), attempts: Datum ({outcomes, latency: {p50, p95, p99,
+  //   mean_ms, with_duration, without_duration}}), recent, recent_total: Datum,
   //   speculative: Datum, active, in_queue: Datum, live_probe_configured,
   //   active_spark, halt, train_events:
   //   [{event_type, task_id, run_id, timestamp, data: {train_id,
-  //   member_task_ids, ...event-specific keys}}]}}; every recent and active
-  //   row's title is a Datum. The payload's top-level served_at is the receipt
-  //   merge_queue.js stamps those Datums with.
+  //   member_task_ids, ...event-specific keys}}], train_throughput: Datum}};
+  //   every recent and active row's title is a Datum. The payload's top-level
+  //   served_at is the receipt merge_queue.js stamps those Datums with.
   MERGE_QUEUE: {},
   COSTS: {
     summary: { total: 0, runs: 0, today: 0, tokens: null, p95_run_cost: null, delta_pct: null, delta_hint: null },

@@ -109,6 +109,7 @@ class EscalationCategory(StrEnum):
     TICKET_FAILURE = 'ticket_failure'
     UNMERGED_STATE = 'unmerged_state'
     UNVERIFIED_COMPLETION_CLAIM = 'unverified_completion_claim'
+    UUID_PREFIX_STORM = 'uuid_prefix_storm'
     VALIDATION_LANE_RED = 'validation_lane_red'
     VERIFY_CROSS_CHECK_MISMATCH = 'verify_cross_check_mismatch'
     VERIFY_DRIFT_DIVERGENCE = 'verify_drift_divergence'

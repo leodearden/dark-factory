@@ -37,7 +37,9 @@ hermeticity seam only** — production never sets it. See the autouse
 `test_warm_lane_script_resolution.py` pin the *shipped* and *resolution* halves
 of the contract above. `test_lane_state_lib.py` pins `lib_lane_state.sh` —
 including the INV-5 drift gate that fails the build if `PROTECTED_PREFIXES`
-gains a band the library's static fallback does not cover. The **behaviour** of
+gains a band the library's static fallback does not cover.
+`test_live_refs_lib.py` pins `lib_live_refs.sh`'s reference detection and its
+scan footprint, at the merge gate. The **behaviour** of
 every invocable script here is
 covered by the ported bash tests in `orchestrator/tests/warm-lane/` — see
 [that directory's README](../../tests/warm-lane/README.md) for provenance, the
@@ -1463,6 +1465,93 @@ every reify lane therefore also resets as today, visible as
 
 - `orchestrator/tests/warm-lane/test_warm_lane_gc.sh` Block V (V1-V9) and A12;
 - `test_warm_lane_gc_sweep.sh` Block Z (Z1-Z6).
+
+### Delta 15 — `lib_live_refs.sh`: the fd/cwd pass enumerates only `/proc/<pid>/cwd` and `/proc/<pid>/fd`
+
+Added by **task 8089**. Offline pass `20261101T113026-1bafdf` killed
+`test_warm_lane_gc.sh` at its 900 s budget with `Results: 449 passed, 0 failed`
+already printed: nothing failed, the suite was slow. An instrumented 307 s run
+spent 164 s in 86 fd/cwd scans and 65 s in 79 maps scans.
+
+- **Equivalence.** On a real `/proc` the old `find /proc -maxdepth 3 …`
+  expression can match only `/proc/<pid>/cwd` and `/proc/<pid>/fd/*`. The rest
+  of its depth-3 walk (`attr/`, `net/`, `ns/`, `map_files/`, `fdinfo/`,
+  `/proc/sys/…`) matched nothing and was pure cost. The new producer hands
+  `find` exactly those links as starting points. The awk matcher is unchanged.
+- **`xargs` + `sh -c 'exec find "$@" …'`**, not a bare glob as `find`'s argv,
+  which would `E2BIG` at very large process counts and fail OPEN.
+- **Not `find -files0-from`**: findutils ≥ 4.9 only, and an older `find`
+  prints nothing, which fails open the same way.
+- **`warm-lane-gc.sh`** carries a comment-only pointer at the end of its
+  header's COST REVERSAL bullet, to the figures in `lib_live_refs.sh`; no code
+  change.
+
+reify's original still carries the depth-3 walk. Current per-call figures live
+in `lib_live_refs.sh`'s MEASURED COST block.
+
+**Pinned by:** `orchestrator/tests/test_live_refs_lib.py` — `TestScanFootprint`
+for what a negative verdict may list, `TestReferenceDetection` for the verdicts.
+
+### Delta 16 — `warm-lane-audit.sh` refuses a missing mount and ages lanes by their record
+
+**`warm-lane-audit.sh` and `warm-lane-gc.sh` diverge further from reify.**
+Added by **task 6114**. The audit had two defects:
+
+- **A missing mount read as an empty pool.** With `--mount` /
+  `REIFY_WARM_LANE_MOUNT` unset, empty or not a directory, the resident walk and
+  the df read were skipped rather than refused, so the run printed
+  `HEADROOM resident=0 …` at exit 0. No consumer can tell that from a pool that
+  really is empty.
+- **`age_min` was the lane dir's mtime.** Transient files inside a lane keep
+  churning that mtime: reify's lane 52 read `age_min=9` for a dispatch about
+  three hours old. LEAKED requires `age_min >= --stale-age-min`, so a churning
+  RELEASED orphan could never be LEAKED.
+
+The fix:
+
+- **Mount refusal.** An unset/empty or non-directory mount is exit 2 with
+  nothing on stdout, checked once at the validation boundary. The walk and df
+  guards it made dead are gone. A real mount with no residents still exits 0
+  and prints HEADROOM, plus one `[warn]` naming the mount and `resident=0`: that
+  shape is almost always the mount point above the worktrees dir.
+  `orchestrator/src/orchestrator/git_ops.py::GitOps._run_warm_lane_audit`
+  always passes `--mount <worktree_base>` and maps a non-zero exit to "no
+  headroom", so the refusal is fail-soft there.
+- **Record clock.** `age_min` is read off the lane-state record's `updated_at`
+  whenever that is judgeable, in both directions (not the max of the two
+  clocks). The dir mtime is the fallback for a record-less resident and for an
+  empty or unparseable stamp. A new last column, `age_source=record|dir-mtime`,
+  names the clock a row used; it is also the last key of each JSON lane object.
+  The clock is read once per run, and a stamp ahead of it (a skewed writer)
+  reads `age_min=0`, never a negative age.
+- **One parse.** `lib_lane_state.sh::lane_state_epoch` is the single parse of
+  `updated_at`. It owns the empty-first guard that GNU `date -d ''` needs (it
+  exits 0 and answers today's midnight).
+  `warm-lane-gc.sh::_record_gate_downgrade_reason` now calls it, with its
+  behaviour unchanged.
+
+It also folds in reify task 7525's comment-only fix. Nothing runs the audit from
+a timer, so the header's "health timer" consumer is gone, and so are
+`lib_lane_state.sh`'s two claims that the audit is timer-driven.
+
+This is patched here, not upstream, for the reason Delta 7 gives under "Why
+patch here rather than upstream to reify". The reify counterpart, task 7255,
+had no commits when this landed. If it lands with different wording, reconcile
+it here.
+
+Out of scope: accounting for the `_mainsweep-`/`_mainprobe-` bands, which DF
+task 5455 and reify task 7476 own. Until then, record-less band residents
+report `age_source=dir-mtime`.
+
+**Pinned by:**
+
+- `orchestrator/tests/test_warm_lane_audit_mount_and_age.py`: the mount
+  refusal, the zero-resident warn, and the record clock against real
+  `LaneRecord.to_json()` records
+- `orchestrator/tests/test_lane_state_lib.py::TestLaneStateEpoch`
+- the gc suite's existing S-age-degrade block, for the refactored gate
+- audit Block N, whose orphan-stale records are now stamped 90 minutes back
+  to match their backdated dirs
 
 ## Sibling-seed defaults, and who resolves them
 

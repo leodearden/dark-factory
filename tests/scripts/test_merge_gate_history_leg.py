@@ -70,6 +70,7 @@ READS_ONLY_THROWAWAY_REPOS: Mapping[str, str] = {
         'run_git is patched; each git argv is a mocked CompletedProcess or side-effect input'
     ),
     'orchestrator/tests/test_atomic_train_merge.py': _SEEDS_ITS_OWN_REPO,
+    'orchestrator/tests/test_branch_base.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_branch_stack.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_branch_work_landed.py': '_Repo wraps the tmp_path git_repo fixture',
     'orchestrator/tests/test_citation_gate_positive_arm.py': _SEEDS_ITS_OWN_REPO,
@@ -106,6 +107,7 @@ READS_ONLY_THROWAWAY_REPOS: Mapping[str, str] = {
     'orchestrator/tests/test_rebased_solo_landing_ladder.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_reconcile_done_step_commits.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_recut_ruling_gitops.py': _SEEDS_ITS_OWN_REPO,
+    'orchestrator/tests/test_review_inputs.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_roles_ancestry_check.py': 'every call runs in a clone under tmp_path',
     'orchestrator/tests/test_timeout_marker_inversion_guard.py': (
         'create_subprocess_exec is faked; the git argv is a recorded-call literal'

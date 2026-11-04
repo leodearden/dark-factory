@@ -216,7 +216,7 @@ def test_mark_step_done_validates_against_the_plan_it_writes(lane: _Lane) -> Non
 
 def test_a_mutator_without_its_mutex_refuses_to_write(lane: _Lane) -> None:
     """A forgotten ``_plan_mutation`` fails loudly at the write, not as a lost update."""
-    plan_path = lane.artifacts.root / 'plan.json'
+    plan_path = lane.artifacts.artifact_path('plan.json')
     before = plan_path.read_bytes()
     undecorated = inspect.unwrap(_add_plan_step)
 

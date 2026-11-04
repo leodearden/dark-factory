@@ -435,7 +435,7 @@ def _stranded_park_rows(
     Args:
         park_stacks:   ``{module_key: [entry, ...]}`` from the scheduler
                        snapshot; entry fields are owned by
-                       ``orchestrator/src/orchestrator/scheduler.py::ModuleLockTable.snapshot_park_stacks``.
+                       ``orchestrator/src/orchestrator/lock_table.py::ModuleLockTable.snapshot_park_stacks``.
         live_task_ids: Set of task_ids present in the active-tasks snapshot
                        (``{r['task_id'] for r in rows}``).  Owners in this
                        set are live and are skipped.

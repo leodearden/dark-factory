@@ -6176,9 +6176,10 @@ class TaskInterceptor:
     async def get_tasks(
         self, project_root: str, tag: str | None = None,
         statuses: list[str] | None = None,
+        fields: Sequence[str] | None = None,
     ) -> dict:
         tm = await self._ensure_taskmaster()
-        return dict(await tm.get_tasks(project_root, tag, statuses=statuses))
+        return dict(await tm.get_tasks(project_root, tag, statuses=statuses, fields=fields))
 
     async def get_statuses(
         self,

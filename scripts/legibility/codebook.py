@@ -136,7 +136,7 @@ _SIGHTING_SCHEMA = {
 # are checked by finding_identity_errors, not by these schemas.
 _FINDING_KEY_SCHEMA = {"type": "string", "pattern": KEY_PATTERN}
 
-FILED_TICKET_RESOLUTIONS = ("created", "combined", "refused", "failed", "existing")
+FILED_TICKET_RESOLUTIONS = ("created", "combined", "refused", "failed", "cancelled", "existing")
 
 FILED_TICKET_STEPS = ("key", "semantic", "curator")
 

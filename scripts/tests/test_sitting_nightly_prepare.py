@@ -1,7 +1,8 @@
 """Tests for scripts/sitting/nightly_prepare.py — the 05:30 headless Fable prepare run (task 5376).
 
 The real ``claude`` is never reached: every test hands ``--claude-bin`` a
-recording fake and ``main`` a hand-rolled gate, so no account is leased from
+recording fake, or sets ``CLAUDE_BINARY`` to one on a PATH stripped of
+``claude``, and hands ``main`` a hand-rolled gate, so no account is leased from
 the live pool and no model is billed.
 """
 from __future__ import annotations
@@ -17,7 +18,7 @@ from pathlib import Path
 import pytest
 from legibility import account_pool
 from orchestrator.agents import landlock, sandbox, sandbox_dispatch
-from shared.cli_invoke import build_claude_argv
+from shared.cli_invoke import build_claude_argv, resolve_claude_binary
 from shared.usage_gate import AccountLease
 from sitting import nightly_prepare as mod
 from sitting import prepare_sitting
@@ -26,9 +27,18 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 OK_RESULT = json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False, 'result': 'recorded 3'})
 BANNER = "You've hit your usage limit · resets 5am (Europe/London)"
-ENV_KEYS = ('CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'SITTING_TEST_MARKER', 'SITTING_NIGHTLY_CONFINED', 'CLAUDE_CONFIG_DIR')
+ENV_KEYS = (
+    'CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN',
+    'SITTING_TEST_MARKER', 'SITTING_NIGHTLY_CONFINED', 'CLAUDE_CONFIG_DIR',
+)
 TIMEOUT_SECS = '3'
 """Outlasts the fake's interpreter start under ``-n auto`` load (0.5s did not, 2 runs in 10), far short of its sleep."""
+STALLED_CLI_TIMEOUT_SECS = 0.2
+"""Times out a fake that stalls before doing anything: what the parent observes does not depend on how far the child got."""
+SYSTEM_PROMPT_FILE_FLAG = '--system-prompt-file'
+MCP_CONFIG_FLAG = '--mcp-config'
+BUILDER_TEMP_FILE_FLAGS = (SYSTEM_PROMPT_FILE_FLAG, MCP_CONFIG_FLAG)
+"""The argv flags whose values are the paths ``build_claude_argv`` returns as temp files."""
 
 APPLY_VERBS = (
     'mcp__escalation__resolve_issue',
@@ -48,6 +58,7 @@ import json, os, sys, time
 from pathlib import Path
 
 spec = json.loads(Path({spec!r}).read_text())
+time.sleep(spec['stall'])
 argv = sys.argv[1:]
 root = Path(spec['root'])
 inboxes = sorted((root / 'data' / 'sitting' / 'inbox').iterdir())
@@ -74,12 +85,12 @@ credentials = Path(os.environ.get('CLAUDE_CONFIG_DIR', '/nonexistent'), '.creden
 if credentials.exists():
     record['credentials'] = credentials.read_text()
     record['credentials_mode'] = credentials.stat().st_mode & 0o777
-if '--system-prompt-file' in argv:
-    path = argv[argv.index('--system-prompt-file') + 1]
+if {system_prompt_file_flag!r} in argv:
+    path = argv[argv.index({system_prompt_file_flag!r}) + 1]
     record['sysprompt_path'] = path
     record['sysprompt'] = Path(path).read_text() if os.path.exists(path) else None
-if '--mcp-config' in argv:
-    path = argv[argv.index('--mcp-config') + 1]
+if {mcp_config_flag!r} in argv:
+    path = argv[argv.index({mcp_config_flag!r}) + 1]
     record['mcp_config_path'] = path
     record['mcp_config'] = json.loads(Path(path).read_text()) if os.path.exists(path) else None
 with open(spec['record'], 'a') as sink:
@@ -151,8 +162,13 @@ def _prep_payload(number: int) -> dict:
 
 
 def _fake_claude(tmp_path: Path, *, stdout: str = OK_RESULT, stderr: str = '', exit_code: int = 0,
-                 sleep: float = 0.0, batches: dict | None = None, recorded: tuple[str, ...] | None = None) -> FakeClaude:
-    """By default the fake is a productive agent: one batch of one preparation, written and recorded."""
+                 sleep: float = 0.0, stall: float = 0.0, batches: dict | None = None,
+                 recorded: tuple[str, ...] | None = None) -> FakeClaude:
+    """By default the fake is a productive agent: one batch of one preparation, written and recorded.
+
+    ``stall`` is how long the fake hangs before doing anything, i.e. a CLI that a loaded host has not
+    yet started when the timeout fires; ``sleep`` is how long it hangs after its work.
+    """
     if batches is None:
         batches, recorded = {'batch-01.json': [_prep_payload(1)]}, ('batch-01.json',)
     bin_dir = tmp_path / 'bin'
@@ -161,11 +177,14 @@ def _fake_claude(tmp_path: Path, *, stdout: str = OK_RESULT, stderr: str = '', e
     spec_file = tmp_path / 'claude-spec.json'
     spec_file.write_text(json.dumps({
         'record': str(calls_file), 'stdout': stdout, 'stderr': stderr,
-        'exit_code': exit_code, 'sleep': sleep, 'env_keys': list(ENV_KEYS),
+        'exit_code': exit_code, 'sleep': sleep, 'stall': stall, 'env_keys': list(ENV_KEYS),
         'root': str(tmp_path), 'batches': batches, 'recorded': list(recorded or ()),
     }))
     fake = bin_dir / 'claude'
-    fake.write_text(_FAKE_CLAUDE_SRC.format(python=sys.executable, spec=str(spec_file)))
+    fake.write_text(_FAKE_CLAUDE_SRC.format(
+        python=sys.executable, spec=str(spec_file),
+        system_prompt_file_flag=SYSTEM_PROMPT_FILE_FLAG, mcp_config_flag=MCP_CONFIG_FLAG,
+    ))
     fake.chmod(0o755)
     return FakeClaude(fake, calls_file, tmp_path)
 
@@ -217,8 +236,47 @@ def _flag_values(argv: list[str], flag: str) -> list[str]:
     return values[:next((i for i, value in enumerate(values) if value.startswith('--')), len(values))]
 
 
-def _sysprompt_path(call: dict) -> Path:
-    return Path(call['sysprompt_path'])
+def _builder_temp_files(argv: tuple[str, ...]) -> tuple[Path, ...]:
+    """The path after each ``BUILDER_TEMP_FILE_FLAGS`` flag, in argv order; an absent or valueless flag gives none."""
+    return tuple(Path(argv[i + 1]) for i, arg in enumerate(argv[:-1]) if arg in BUILDER_TEMP_FILE_FLAGS)
+
+
+@dataclass(frozen=True)
+class Spawn:
+    """A process the run started, as the parent saw it once ``Popen`` had started it."""
+
+    argv: tuple[str, ...]
+    present_once_started: frozenset[Path]
+    """The builder temp files that existed once the process had been started."""
+
+    def temp_files(self) -> tuple[Path, ...]:
+        """The builder temp files this process was handed, per ``_builder_temp_files``."""
+        return _builder_temp_files(self.argv)
+
+
+def _record_spawns(monkeypatch: pytest.MonkeyPatch) -> list[Spawn]:
+    """Record every process the run starts, from this side, before ``communicate`` starts its timeout clock.
+
+    Nothing here waits on the child, so the record holds however far the child got before a kill.
+    """
+    spawns: list[Spawn] = []
+
+    class RecordingPopen(subprocess.Popen):
+        def __init__(self, args, *rest, **kwargs):
+            argv = tuple(os.fsdecode(arg) for arg in ([args] if isinstance(args, (str, bytes, os.PathLike)) else args))
+            super().__init__(args, *rest, **kwargs)
+            spawns.append(Spawn(argv, frozenset(path for path in _builder_temp_files(argv) if path.is_file())))
+
+    monkeypatch.setattr(subprocess, 'Popen', RecordingPopen)
+    return spawns
+
+
+def _strip_claude_from_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Leave no `claude` on PATH, so a bare default can never reach the real CLI."""
+    empty_bin = tmp_path / 'empty-bin'
+    empty_bin.mkdir()
+    monkeypatch.setenv('PATH', f'{empty_bin}{os.pathsep}/usr/bin')
+    assert resolve_claude_binary() is None, 'the premise: no claude is reachable'
 
 
 # ---------------------------------------------------------------------------
@@ -251,8 +309,8 @@ def test_argv_is_exactly_the_shared_builders_with_the_defaults(tmp_path):
     for path in temp_files:
         Path(path).unlink(missing_ok=True)
     expected[0] = str(fake.bin)
-    expected[expected.index('--system-prompt-file') + 1] = call['sysprompt_path']
-    expected[expected.index('--mcp-config') + 1] = call['mcp_config_path']
+    expected[expected.index(SYSTEM_PROMPT_FILE_FLAG) + 1] = call['sysprompt_path']
+    expected[expected.index(MCP_CONFIG_FLAG) + 1] = call['mcp_config_path']
     assert call['argv'] == expected
     assert mod.DEFAULT_MODEL == 'fable', 'the task mandates the prepare-sitting mode run nightly on Fable'
     assert call['sysprompt'], 'the builder always writes a system prompt; it must not be empty'
@@ -333,24 +391,27 @@ def test_the_child_reads_no_settings_file_and_may_write_only_its_inbox(tmp_path)
 
 
 @pytest.mark.parametrize(
-    ('spec', 'extra'),
+    ('spec', 'extra', 'witness'),
     [
-        ({'exit_code': 0}, {}),
-        ({'exit_code': 3, 'stderr': 'boom'}, {}),
-        ({'sleep': 30.0}, {'timeout_secs': float(TIMEOUT_SECS)}),
+        ({'exit_code': 0}, {}, 'nightly_prepare: done'),
+        ({'exit_code': 3, 'stderr': 'boom'}, {}, 'claude exited 3'),
+        ({'stall': 30.0}, {'timeout_secs': STALLED_CLI_TIMEOUT_SECS}, 'claude timed out'),
     ],
     ids=['success', 'failure', 'timeout'],
 )
-def test_builder_temp_files_are_unlinked_after_the_run(tmp_path, spec, extra):
+def test_builder_temp_files_are_unlinked_after_the_run(tmp_path, monkeypatch, capsys, spec, extra, witness):
+    spawns = _record_spawns(monkeypatch)
     fake = _fake_claude(tmp_path, **spec)
 
     _run(fake, **extra)
 
-    call = fake.only_call()
-    assert call['sysprompt'] is not None, 'the system prompt file must exist while the CLI runs'
-    assert call['mcp_config'] is not None, 'the MCP config file must exist while the CLI runs'
-    assert not _sysprompt_path(call).exists(), 'the builder temp file must be unlinked after the run'
-    assert not Path(call['mcp_config_path']).exists(), 'the MCP config temp file must be unlinked after the run'
+    assert len(spawns) == 1, f'expected exactly one spawn, got {[spawn.argv for spawn in spawns]}'
+    spawn = spawns[0]
+    assert len(spawn.temp_files()) == len(BUILDER_TEMP_FILE_FLAGS), f'the CLI must be handed one path per builder temp-file flag: {spawn.argv}'
+    assert spawn.present_once_started == frozenset(spawn.temp_files()), 'the builder temp files must exist while the CLI runs'
+    assert not any(path.exists() for path in spawn.temp_files()), 'the builder temp files must be unlinked after the run'
+    captured = capsys.readouterr()
+    assert witness in captured.out + captured.err, f'the run must take the path this case names: {witness!r}'
 
 
 # ---------------------------------------------------------------------------
@@ -414,7 +475,7 @@ def test_the_mcp_servers_are_exactly_the_checkouts_escalation_and_fused_memory_b
     ambient = json.loads((REPO_ROOT / '.mcp.json').read_text())['mcpServers']
     assert call['mcp_config'] == {'mcpServers': {name: ambient[name] for name in ('escalation', 'fused-memory')}}
     argv = call['argv']
-    assert argv[argv.index('--mcp-config') + 2] == '--strict-mcp-config'
+    assert argv[argv.index(MCP_CONFIG_FLAG) + 2] == '--strict-mcp-config'
 
 
 def test_every_allowed_or_denied_mcp_tool_names_a_configured_server():
@@ -532,6 +593,18 @@ def test_a_leased_account_supplies_the_child_env(tmp_path, monkeypatch):
     assert call['env']['SITTING_NIGHTLY_CONFINED']
     assert not call['env_has']['ANTHROPIC_API_KEY']
     assert gate.released == ['tok-max-h'], 'the lease is handed straight back'
+
+
+def test_a_proxied_shells_endpoint_selection_does_not_reach_the_child(tmp_path, monkeypatch):
+    monkeypatch.setenv('ANTHROPIC_BASE_URL', 'http://127.0.0.1:8317')
+    monkeypatch.setenv('ANTHROPIC_AUTH_TOKEN', 'proxy-key')
+    fake = _fake_claude(tmp_path)
+
+    assert _run(fake, gate=_live_gate()) == mod.EXIT_OK
+
+    env_has = fake.only_call()['env_has']
+    assert not env_has['ANTHROPIC_BASE_URL']
+    assert not env_has['ANTHROPIC_AUTH_TOKEN']
 
 
 def test_a_real_pool_lease_is_handed_back_before_the_run(tmp_path, monkeypatch, pool_roster):
@@ -654,6 +727,39 @@ def test_a_missing_binary_is_a_configuration_error_and_leases_nothing(tmp_path, 
     assert 'no-such-claude' in capsys.readouterr().err
 
 
+def test_with_no_flag_the_run_spawns_claude_binary(tmp_path, monkeypatch):
+    _strip_claude_from_path(tmp_path, monkeypatch)
+    fake = _fake_claude(tmp_path)
+    monkeypatch.setenv('CLAUDE_BINARY', str(fake.bin))
+
+    rc = mod.main([], gate=_live_gate(), root=fake.root)
+
+    assert rc == mod.EXIT_OK
+    assert fake.only_call()['argv'][0] == str(fake.bin)
+
+
+def test_the_flag_outranks_claude_binary(tmp_path, monkeypatch):
+    fake = _fake_claude(tmp_path)
+    monkeypatch.setenv('CLAUDE_BINARY', str(tmp_path / 'no-such-claude'))
+
+    rc = mod.main(['--claude-bin', str(fake.bin)], gate=_live_gate(), root=fake.root)
+
+    assert rc == mod.EXIT_OK
+    assert fake.only_call()['argv'][0] == str(fake.bin)
+
+
+def test_an_unresolvable_claude_binary_without_the_flag_is_a_configuration_error(tmp_path, monkeypatch, capsys):
+    _strip_claude_from_path(tmp_path, monkeypatch)
+    monkeypatch.setenv('CLAUDE_BINARY', str(tmp_path / 'no-such-claude'))
+    gate = _live_gate()
+
+    rc = mod.main([], gate=gate, root=tmp_path)
+
+    assert rc == mod.EXIT_CONFIG
+    assert gate.leases == 0
+    assert str(tmp_path / 'no-such-claude') in capsys.readouterr().err
+
+
 def test_the_entry_point_runs_standalone_without_the_test_sys_path(tmp_path):
     """The wrapper runs the file directly, so its bootstrap alone must resolve ``legibility.account_pool``'s imports."""
     script = REPO_ROOT / 'scripts' / 'sitting' / 'nightly_prepare.py'
@@ -702,22 +808,28 @@ def test_no_store_is_written_and_only_the_fake_is_spawned(tmp_path, monkeypatch)
     (queue / 'esc-9-1.json').write_text(json.dumps({'id': 'esc-9-1', 'status': 'pending', 'level': 2}))
     (decisions / 'dec-1.json').write_text(json.dumps({'decision_id': 'dec-1', 'state': 'open'}))
     before = _snapshot(queue, decisions)
-    spawned: list[list[str]] = []
-    real_popen = subprocess.Popen
-
-    class RecordingPopen(real_popen):  # type: ignore[misc, valid-type]
-        def __init__(self, args, *rest, **kwargs):
-            spawned.append(list(args))
-            super().__init__(args, *rest, **kwargs)
-
-    monkeypatch.setattr(subprocess, 'Popen', RecordingPopen)
+    spawns = _record_spawns(monkeypatch)
     fake = _fake_claude(tmp_path)
 
     assert _run(fake) == mod.EXIT_OK
 
     assert _snapshot(queue, decisions) == before
     assert not list(queue.parent.rglob('*.lock')) and not list(decisions.rglob('*.lock'))
-    assert [argv[0] for argv in spawned] == [str(fake.bin)]
+    assert [spawn.argv[0] for spawn in spawns] == [str(fake.bin)]
+
+
+def test_the_spawn_recorder_records_every_process_and_never_raises(tmp_path, monkeypatch):
+    spawns = _record_spawns(monkeypatch)
+    helper = tmp_path / 'helper'
+    helper.write_text('#!/bin/sh\nexit 0\n')
+    helper.chmod(0o755)
+
+    subprocess.run([sys.executable, '-c', 'pass', MCP_CONFIG_FLAG], check=True)
+    subprocess.run(helper, check=True)
+
+    assert [spawn.argv for spawn in spawns] == [(sys.executable, '-c', 'pass', MCP_CONFIG_FLAG), (str(helper),)]
+    assert all(spawn.temp_files() == () for spawn in spawns)
+    assert all(spawn.present_once_started == frozenset() for spawn in spawns)
 
 
 # ---------------------------------------------------------------------------

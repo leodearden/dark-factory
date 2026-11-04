@@ -42,7 +42,8 @@
 #   t3 — a T3 Code thread in the project whose root is <cwd>; no terminal.
 #     The lane refuses (exit 145) skip_permissions=false and any
 #     $CLAUDE_SPAWN_CLAUDE_ARGS; $CLAUDE_SPAWN_MODEL becomes the thread's
-#     model. Child mode joins on the thread's result.md or archive and exits
+#     model, on the instance resolve_t3_provider picks ($CLAUDE_SPAWN_T3_PROVIDER
+#     names one explicitly; a disabled one is refused, exit 145). Child mode joins on the thread's result.md or archive and exits
 #     with spawn_t3_lane.py `wait`'s code. The started-grace defaults to 300s.
 #   tmux — bypass terminal-emulator discovery entirely
 #     and launch in a crash-survivable, reattachable tmux window instead
@@ -193,6 +194,61 @@ t3_lane_refuse() {
   exit "$EXIT_LANE_REFUSED"
 }
 
+# Any fault or unknown verdict from spawn_t3_lane.py is a launcher failure.
+t3_lane_call() {
+  local rc
+  t3_verdict=$(t3_lane_module "$@")
+  rc=$?
+  if [ "$rc" -ne 0 ] || [ -z "$(verdict_status "$t3_verdict")" ]; then
+    echo "spawn-claude.sh: t3 lane: spawn_t3_lane.py $1 faulted (rc $rc); treating it as a launcher failure" >&2
+    exit 127
+  fi
+}
+
+t3_lane_unexpected() {
+  echo "spawn-claude.sh: t3 lane: spawn_t3_lane.py $1 answered '$t3_verdict'; treating it as a launcher failure" >&2
+  exit 127
+}
+
+# $t3_verdict is a `refused reason=provider-disabled` line naming the instance
+# and how it was chosen (spawn_t3_provider.ProviderSource).
+refuse_disabled_t3_provider() {
+  local instance source why
+  instance=$(verdict_field "$t3_verdict" instance_id)
+  source=$(verdict_field "$t3_verdict" source)
+  case "$source" in
+    explicit) why="CLAUDE_SPAWN_T3_PROVIDER names it, and it is disabled for this T3 project" ;;
+    fallback) why="this T3 project has no default and no single enabled Claude instance, and the fallback is disabled" ;;
+    *) why="it is disabled for this T3 project ($source)" ;;
+  esac
+  t3_lane_refuse "provider instance '$instance'" \
+    "$why; name an enabled instance in CLAUDE_SPAWN_T3_PROVIDER, or set CLAUDE_SPAWN_BACKEND=tmux or wm"
+}
+
+# Sets t3_provider, the instance a model-pinned thread runs on, resolved by
+# spawn_t3_lane.py `provider` (order: $CLAUDE_SPAWN_T3_PROVIDER, the project's
+# live Claude instance, claudeAgent). Runs before the `launching` write, so a
+# disabled instance is refused without leaving a record behind.
+t3_provider=""
+resolve_t3_provider() {
+  if [ -z "${CLAUDE_SPAWN_MODEL:-}" ]; then
+    [ -z "${CLAUDE_SPAWN_T3_PROVIDER:-}" ] && return 0
+    t3_lane_refuse "CLAUDE_SPAWN_T3_PROVIDER='$CLAUDE_SPAWN_T3_PROVIDER' without CLAUDE_SPAWN_MODEL" \
+      "t3 takes a provider instance only together with a model; set CLAUDE_SPAWN_MODEL too"
+  fi
+  local -a args=(provider --cwd "$cwd")
+  [ -n "${CLAUDE_SPAWN_T3_PROVIDER:-}" ] && args+=(--provider "$CLAUDE_SPAWN_T3_PROVIDER")
+  t3_lane_call "${args[@]}"
+  case "$(verdict_status "$t3_verdict")" in
+    instance)
+      t3_provider=$(verdict_field "$t3_verdict" instance_id)
+      [ -n "$t3_provider" ] || t3_lane_unexpected provider
+      ;;
+    refused) refuse_disabled_t3_provider ;;
+    *) t3_lane_unexpected provider ;;
+  esac
+}
+
 refuse_inputs_the_t3_lane_cannot_honour() {
   if [ "$skip_perms" != "true" ]; then
     t3_lane_refuse "skip_permissions=$skip_perms" \
@@ -215,6 +271,7 @@ resolve_spawn_backend
 if [ "$spawn_backend" = "t3" ]; then
   refuse_inputs_the_t3_lane_cannot_honour
   require_python3_for_the_t3_lane
+  resolve_t3_provider
 fi
 
 # Decided once spawn_backend is known (the default differs per lane) and before
@@ -230,13 +287,16 @@ fi
 # reference marker (mtime = spawn start, used by the step-4 transcript-
 # appearance probe to distinguish a fresh transcript from a stale one), a
 # failed-to-start marker path (NOT created here -- mktemp -u only reserves a
-# unique name; the watchdog creates the file itself when it flags), the
-# started-grace window, and the transcript-scan root. All independent of
+# unique name; the watchdog creates the file itself when it flags), a
+# payload-pid path (likewise only reserved; the payload writes its own pid
+# there for _payload_claude_alive), the started-grace window, and the
+# transcript-scan root. All independent of
 # SPAWN_LAUNCH_GRACE_SECS so genuine-launcher-failure (127) paths are
 # unaffected and existing tests (which only shrink the launch grace) never
 # trip the new code.
 spawn_ref="$(mktemp -t spawn-claude-ref-XXXXXX)"
 fts_marker="$(mktemp -u -t spawn-claude-XXXXXX.fts)"
+payload_pid_file="$(mktemp -u -t spawn-claude-XXXXXX.pid)"
 started_grace_default=90
 [ "$spawn_backend" = "t3" ] && started_grace_default=300
 SPAWN_STARTED_GRACE_SECS="${SPAWN_STARTED_GRACE_SECS:-$started_grace_default}"
@@ -258,7 +318,7 @@ CLAUDE_PROJECTS_DIR="${CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}"
 # spawn_ref to be removed prematurely.
 _cleanup() {
   [ -n "${watchdog_pid:-}" ] && kill "$watchdog_pid" 2>/dev/null
-  rm -f "$spawn_ref" "$fts_marker" ${t3_prompt_file:+"$t3_prompt_file"}
+  rm -f "$spawn_ref" "$fts_marker" "$payload_pid_file" ${t3_prompt_file:+"$t3_prompt_file"}
 }
 trap _cleanup EXIT
 
@@ -270,17 +330,11 @@ trap _cleanup EXIT
 # PROJECT/TASK_ID/ESCALATION_ID pass through from this process's own
 # environment when a caller already set them.
 #
-# Task 2511: the `launching` subcommand also opportunistically drives
-# session_registry's liveness sweep (mark_orphaned_sessions_exited) after it
-# writes this record -- fail-soft, and it never touches this call's stdout,
-# so the record dir captured into SESSION_RECORD_DIR below is unaffected.
-# Neither that sweep nor reap_stale_records has a periodic production driver
-# of its own (CLI-only), so every spawn is what drains prior orphaned
-# (unclean-death) records to `exited`. Task 2689: every spawn now ALSO
-# opportunistically bound-prunes terminal/stale record dirs from disk
-# (reap_stale_records(limit=REAP_BATCH_LIMIT), also fail-soft) right after
-# the mark sweep, draining the on-disk backlog over successive spawns; the
-# CLI `reap` verb remains the operator's unbounded one-shot full-drain. See
+# Task 7944: after writing this record, `launching` starts a detached full
+# `reap` of the registry and returns at once. That child's stdio is
+# /dev/null, so it never touches this call's stdout and the record dir
+# captured into SESSION_RECORD_DIR below is unaffected. The CLI `reap` verb
+# is the same pipeline run in the foreground. See
 # session_registry._run_launching's docstring.
 SESSION_RECORD_DIR=""
 if command -v python3 >/dev/null 2>&1; then
@@ -694,10 +748,16 @@ sanitize_env='for _v in ${!CLAUDE_SPAWN_@}; do unset "$_v"; done; unset _v; '
 # a Python layer that does not read it is unaffected.
 owner_ppid_export="export CLAUDE_SPAWN_OWNER_PPID=\$\$; "
 
+# Publishes that same pid (claude's direct parent on every lane) for the
+# started-watchdog's _payload_claude_alive. Fail-soft: a failed write only
+# leaves the transcript probe as the lane's evidence.
+q_payload_pid_file=$(printf %q "$payload_pid_file")
+payload_pid_publish="{ echo \$\$ > $q_payload_pid_file; } 2>/dev/null; "
+
 inner="trap 'echo \"\${ec:-\$?}\" > $q_sentinel_tmp; mv -f $q_sentinel_tmp $q_sentinel 2>/dev/null || cat $q_sentinel_tmp > $q_sentinel 2>/dev/null || : > $q_sentinel' EXIT; \
 trap 'exit 129' HUP; \
 trap 'exit 143' TERM; \
-${sanitize_env}${spawn_id_export}${parent_id_export}${result_export}${wm_title_export}${owner_ppid_export}export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1; cd $q_cwd && claude $flags $q_prompt; ec=\$?; exit \$ec"
+${sanitize_env}${spawn_id_export}${parent_id_export}${result_export}${wm_title_export}${owner_ppid_export}${payload_pid_publish}export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1; cd $q_cwd && claude $flags $q_prompt; ec=\$?; exit \$ec"
 
 # How long to wait for the sentinel to appear after the launcher returns
 # (covers a hair-late write or a very fast emulator).  Tests can shrink this.
@@ -859,64 +919,35 @@ _encode_cwd() {
   printf '%s' "${e//_/-}"
 }
 
-# Best-effort: is any process named `claude` a descendant of this script's
-# own PID? Guarded end-to-end -- ps unavailable, or any parsing hiccup,
-# yields "no descendant found" (fail-soft) rather than a fault. Scoped to
-# $$'s ancestor chain so it only matches a foreground-launched claude
-# (detached emulators reparent claude away from this script, so it is
-# correctly empty there) and never a coincidental, unrelated claude process
-# elsewhere on a busy host.
-_claude_descendant_alive() {
+# Best-effort: is a process named `claude` running as the direct child of
+# the payload shell, whose pid the payload published to $payload_pid_file?
+# That parent is the same on every lane, whoever owns the payload (tmux
+# server, gnome-terminal-server, an orphaning launcher), and it never matches
+# an unrelated claude elsewhere on the host. No pidfile yet, an empty or torn
+# read, no child yet, or no pgrep/ps all mean "no evidence this poll"; the
+# watchdog re-polls.
+_payload_claude_alive() {
+  local payload_pid children tok1 tok2 rest
+  payload_pid=$(cat "$payload_pid_file" 2>/dev/null) || return 1
+  case "$payload_pid" in ''|*[!0-9]*) return 1 ;; esac
+  command -v pgrep >/dev/null 2>&1 || return 1
   command -v ps >/dev/null 2>&1 || return 1
-  # Associative arrays (bash 4+) are required below. Stock macOS ships
-  # /bin/bash 3.2 (this script explicitly supports macOS via the
-  # mac-terminal branch), where `local -A` is a hard parse/option error, not
-  # a soft failure -- and this function is polled every ~0.25s for up to
-  # SPAWN_STARTED_GRACE_SECS (default 90s) whenever no transcript is yet
-  # present, so an unguarded error here would spam the caller-captured
-  # stderr with hundreds of lines. Fail-soft: skip this best-effort probe on
-  # bash <4 and rely on the transcript probe (_started_evidence's other
-  # branch) instead.
-  [ "${BASH_VERSINFO[0]:-0}" -ge 4 ] || return 1
-
-  local -A ppid_of=()
-  local -a claude_pids=()
-  local pid ppid rest tok1 tok2 discard
-
-  while read -r pid ppid rest; do
-    [ -n "$pid" ] || continue
-    ppid_of["$pid"]="$ppid"
-    # A real `claude` CLI is commonly a shebang wrapper (e.g. node/bash), in
-    # which case `comm` reports the INTERPRETER, not "claude" -- the kernel
-    # rewrites the exec to run the interpreter with the script's own path as
-    # an argument (empirically verified: a `#!/usr/bin/env bash` script named
-    # `claude` reports comm=bash, args="bash /path/to/claude"). Match on the
-    # first two whitespace-separated tokens of the full command line instead,
-    # covering both a raw `claude` binary (tok1) and an interpreter+script
-    # pair (tok2), by comparing each token's basename.
-    read -r tok1 tok2 discard <<<"$rest"
-    if [ "${tok1##*/}" = "claude" ] || [ "${tok2##*/}" = "claude" ]; then
-      claude_pids+=("$pid")
+  children=$(pgrep -d, -P "$payload_pid" 2>/dev/null) || return 1
+  # A `claude` CLI is commonly a shebang wrapper, whose argv is
+  # "<interpreter> /path/to/claude" (comm names the interpreter), so match
+  # the basename of either the first (native binary) or second token.
+  while read -r tok1 tok2 rest; do
+    if [ "${tok1##*/}" = claude ] || [ "${tok2##*/}" = claude ]; then
+      return 0
     fi
-  done < <(ps -eo pid=,ppid=,args= 2>/dev/null)
-
-  local cand anc hops
-  for cand in "${claude_pids[@]}"; do
-    anc="${ppid_of[$cand]:-}"
-    hops=0
-    while [ -n "$anc" ] && [ "$hops" -lt 100 ]; do
-      [ "$anc" = "$$" ] && return 0
-      anc="${ppid_of[$anc]:-}"
-      hops=$(( hops + 1 ))
-    done
-  done
+  done < <(ps -o args= -p "$children" 2>/dev/null)
   return 1
 }
 
 # Positive start-evidence: either a transcript file appeared under this
 # spawn's $CLAUDE_PROJECTS_DIR/<encoded-cwd>/ newer than the spawn-time
-# reference marker, or a claude process is running as this script's
-# descendant. The transcript probe is the primary, deterministically-tested
+# reference marker, or a claude process is running as the payload shell's
+# direct child. The transcript probe is the primary, deterministically-tested
 # signal (the motivating incident is "no transcript ever appeared"); the
 # process probe is a guarded best-effort secondary.
 #
@@ -936,7 +967,7 @@ _started_evidence() {
   if [ -d "$d" ] && [ -n "$(find "$d" -type f -newer "$spawn_ref" -print -quit 2>/dev/null)" ]; then
     return 0
   fi
-  _claude_descendant_alive && return 0
+  _payload_claude_alive && return 0
   return 1
 }
 
@@ -945,24 +976,12 @@ _started_evidence() {
 # the launcher turns out to be foreground (blocks until window-close) or
 # detached (returns immediately). Polls up to SPAWN_STARTED_GRACE_SECS for
 # start-evidence: the exit sentinel, a fresh transcript, or a live claude
-# descendant.
+# child of the payload shell.
 #
 # On grace-expiry with no evidence, flags failed-to-start: best-effort marks
 # the session-registry record, emits a loud caller-visible stderr line, and
 # writes the fts_marker so await_sentinel/resolve_* can break out of what
 # would otherwise be an unbounded wait.
-#
-# KNOWN LIMITATION (detached slow-start false-failure): for a DETACHED
-# launcher (konsole, or a custom $CLAUDE_TERMINAL_CMD), _claude_descendant_alive
-# is always empty by construction (setsid reparents claude away from this
-# script), so the transcript probe is the ONLY positive evidence available. A
-# real claude that is merely slow to write its first transcript (heavy load,
-# cold cache) past SPAWN_STARTED_GRACE_SECS is flagged failed-to-start even
-# though it is alive and will keep running detached -- a wrong terminal
-# status (144 + registry failed-to-start), not merely a late one. There is no
-# way to retract the flag once the caller has observed it. Callers on slow or
-# loaded hosts should raise SPAWN_STARTED_GRACE_SECS accordingly; see
-# SKILL.md's Verification section for the caller-facing note.
 mark_record_failed_to_start() {
   if [ -n "$SESSION_RECORD_DIR" ] && command -v python3 >/dev/null 2>&1; then
     python3 "$SESSION_REGISTRY_PY" refresh --record "$SESSION_RECORD_DIR" --status failed-to-start || true
@@ -1090,9 +1109,11 @@ resolve_detached() {
 # "*.done" file per sibling spawn accumulates in TMPDIR. Still exactly ONE
 # file per spawn after the task-5137 atomic publish: the trap writes
 # "$sentinel.tmp" and RENAMES it onto $sentinel, so the temp is consumed by
-# the rename rather than added to this leak. Not worth chasing for a few
-# stray bytes in TMPDIR -- reclaimed by normal OS tmp-dir cleanup, same as
-# the mac-terminal tmpscript leak.
+# the rename rather than added to this leak. Likewise one "*.pid" file per
+# sibling spawn: the payload publishes $payload_pid_file after _cleanup has
+# already run. Not worth chasing for a few stray bytes in TMPDIR --
+# reclaimed by normal OS tmp-dir cleanup, same as the mac-terminal tmpscript
+# leak.
 #
 # KNOWN LIMITATION (started-verification watchdog does not apply here): the
 # _started_watchdog background job (forked below, before the emulator case
@@ -1158,21 +1179,6 @@ _detach() {
 # awaits its start (binding its transcript to the record) and, in child mode,
 # joins on its result.md. Any fault or unknown verdict is a launcher failure.
 
-t3_lane_call() {
-  local rc
-  t3_verdict=$(t3_lane_module "$@")
-  rc=$?
-  if [ "$rc" -ne 0 ] || [ -z "$(verdict_status "$t3_verdict")" ]; then
-    echo "spawn-claude.sh: t3 lane: spawn_t3_lane.py $1 faulted (rc $rc); treating it as a launcher failure" >&2
-    exit 127
-  fi
-}
-
-t3_lane_unexpected() {
-  echo "spawn-claude.sh: t3 lane: spawn_t3_lane.py $1 answered '$t3_verdict'; treating it as a launcher failure" >&2
-  exit 127
-}
-
 launch_t3_thread() {
   local thread_title="${title:-${SESSION_RECORD_DIR##*/}}"
   [ -n "$thread_title" ] || thread_title="spawned claude session"
@@ -1180,6 +1186,7 @@ launch_t3_thread() {
   printf '%s' "$prompt" > "$t3_prompt_file"
   local -a args=(launch --cwd "$cwd" --title "$thread_title" --prompt-file "$t3_prompt_file" --record "$SESSION_RECORD_DIR")
   [ -n "${CLAUDE_SPAWN_MODEL:-}" ] && args+=(--model "$CLAUDE_SPAWN_MODEL")
+  [ -n "$t3_provider" ] && args+=(--provider "$t3_provider")
   [ -n "${parent_of_child:-}" ] && args+=(--parent "$parent_of_child")
   t3_launch_epoch=$(date +%s)
   t3_lane_call "${args[@]}"
@@ -1193,6 +1200,7 @@ launch_t3_thread() {
       exit 126
       ;;
     refused)
+      [ "$(verdict_field "$t3_verdict" reason)" = "provider-disabled" ] && refuse_disabled_t3_provider
       t3_lane_refuse "cwd=$cwd ($(verdict_field "$t3_verdict" reason); project root $(verdict_field "$t3_verdict" detail))" \
         "a T3 thread always runs in its project's root; pass that root as cwd, or set CLAUDE_SPAWN_BACKEND=tmux or wm"
       ;;

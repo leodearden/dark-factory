@@ -219,8 +219,8 @@ class TestSpeculationAccountingViolations:
 # feeding both snapshot()['speculation']['inflight_speculative'] and
 # speculation_accounting_violations() by scanning FIVE separate worker-
 # internal locations (self._inflight, self._verifier_queue,
-# self._redispatch, self._finalizing_head, self._dispatching_item) — task
-# 2063 closed the _redispatch gap, task 2096 closed the _finalizing_head and
+# self._intake.pending_redispatch(), self._finalizing_head, self._dispatching_item) — task
+# 2063 closed the redispatch-park gap, task 2096 closed the _finalizing_head and
 # _dispatching_item gaps (each an under-count window that produced a
 # spurious 'speculation-slot conservation violated' finding).
 #
@@ -380,7 +380,7 @@ class TestMergeAheadCapHandoffCrossCheck:
 class TestRedispatchSpeculativeAccounting:
     """Ledger-based accounting for a speculative item's permit.
 
-    Task 2063 originally closed the _redispatch-parked gap in the location-
+    Task 2063 originally closed the redispatch-park gap in the location-
     scanning census this class exercised; task 2160/η deletes that scan
     entirely, so this now pins the replacement ledger-only invariant: a
     permit acquired through the ledger is counted no matter where its item
@@ -401,7 +401,7 @@ class TestRedispatchSpeculativeAccounting:
 
         # Acquire both permits THROUGH the ledger (no raw semaphore poking)
         # and attach each token to its item. Deliberately NOT placed on
-        # worker._verifier_queue/_redispatch/etc — post-η the count must not
+        # worker._verifier_queue/the redispatch park/etc — post-η the count must not
         # depend on structural location, only on ledger membership.
         item_a = _make_spec_item(tmp_path, speculative=True)
         item_a.permit = await worker._speculation_ledger.acquire()
@@ -424,12 +424,12 @@ class TestRedispatchSpeculativeAccounting:
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
 
-        # A cascade-remerged item parked on _redispatch is non-speculative
+        # A cascade-remerged item parked on the redispatch park is non-speculative
         # (_remerge returns speculative=False; its permit was already
         # released before remerge, so .permit is None too) and must never be
         # counted — else the ledger-only invariant would be broken and could
         # mask a genuine imbalance.
-        worker._redispatch.append(_make_spec_item(tmp_path, speculative=False))
+        worker._intake.request_redispatch(_make_spec_item(tmp_path, speculative=False))
 
         assert worker._inflight_speculative_count() == 0
         assert worker.speculation_accounting_violations() == []
@@ -545,7 +545,7 @@ class TestFinalizeHeadSpeculativeAccounting:
 # ---------------------------------------------------------------------------
 # task 2096: dispatch-gap (in-dispatch item) speculative permit accounting
 #
-# _verifier_loop's DISPATCH-FILL pops an item off _redispatch/_verifier_queue
+# _verifier_loop's DISPATCH-FILL pops an item off the redispatch park/_verifier_queue
 # then `entry = await self._dispatch_item(item)` — the item is off the queue
 # but not yet appended to _inflight during that await (host-acquisition git
 # calls, in-dispatch speculative-remerge). A speculative item's `.speculative`

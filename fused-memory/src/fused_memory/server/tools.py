@@ -43,6 +43,10 @@ from fused_memory.backends.metadata_lookup import (
     InvalidMetadataLookupError,
     validate_metadata_query,
 )
+from fused_memory.backends.task_projection import (
+    InvalidTaskProjectionField,
+    parse_task_projection,
+)
 from fused_memory.config.reload import apply_reload
 from fused_memory.config.schema import DEFAULT_CONFIG_PATH, FusedMemoryConfig
 from fused_memory.mcp_tools.scheduler_state import (
@@ -215,7 +219,7 @@ from fused_memory.server.write_triage import (
 # dependency one-way, and leaves `_stub_judge` as `triage_write`'s default for
 # direct callers and for beta's judge-slot contract tests — which is what keeps
 # those tests meaningful rather than tautological.
-from fused_memory.server.write_triage_judge import judge_write
+from fused_memory.server.write_triage_judge import judge_write, resolve_judge_field_chars
 from fused_memory.services.completion_claim_gate import (
     UNRESOLVABLE,
     UNVERIFIED_CLAIM_TAG,
@@ -1299,6 +1303,20 @@ def _validate_statuses(statuses: Any) -> dict[str, Any] | None:
         'error': f'statuses must be a list of status strings; got {statuses!r}',
         'error_type': 'ValidationError',
     }
+
+
+def _validate_fields(fields: Any) -> dict[str, Any] | None:
+    """Return the INV-2 ValidationError payload unless ``fields`` is a valid ``get_tasks`` projection."""
+    try:
+        parse_task_projection(fields)
+    except InvalidTaskProjectionField as e:
+        return {
+            'error': str(e),
+            'error_type': 'ValidationError',
+            'field': e.field,
+            'allowed': list(e.allowed),
+        }
+    return None
 
 
 # find_tasks_by_metadata's page-size cap, and its include_value page budget in
@@ -3632,8 +3650,10 @@ def create_mcp_server(
         or different, explicitly or implicitly (ruling:
         plans/write-triage-flip-readiness-prd.md §11.3 C1''); it does not
         adjudicate which of the two is right. Your full text is stored and
-        readable in the canonical's grouped document (amendment text is
-        digested there; sighting text is only counted) and marked as
+        readable in the canonical's grouped document (a contesting
+        amendment's text is carried there in full up to
+        ``write_triage.judge_field_chars``; sighting text is still only
+        counted) and marked as
         contesting it, and the memory you contradict is left untouched. No
         adjudication is scheduled and nothing is escalated: the flag is a
         marker a human reads, not a work item anything picks up. Getting a ``contested`` ack is not a
@@ -4619,7 +4639,11 @@ def create_mcp_server(
             already listing the matched child is marked 'matched': True in
             place instead and gains a 'content' key carrying that same FULL
             body alongside its truncated 'digest', so a matched child's text is
-            never shortened by grouping wherever it ends up.
+            never shortened by grouping wherever it ends up.  A digest marked
+            'contested': True also carries 'content', whether or not the child
+            itself matched: the child's text capped at
+            write_triage.judge_field_chars, with the counted elision marker
+            when cut.
 
             Loud-fault keys, present only when something is genuinely unknown:
             'grouped'['children_unavailable'] (+ 'error_type') means the child
@@ -4704,7 +4728,10 @@ def create_mcp_server(
             # that metadata does not survive a list transform.
             try:
                 grouped_results = await group_search_results(
-                    memory_service, project_id, results
+                    memory_service,
+                    project_id,
+                    results,
+                    contested_text_chars=resolve_judge_field_chars(memory_service),
                 )
             except Exception:
                 # A grouping fault must never turn a working search into an
@@ -5124,8 +5151,10 @@ def create_mcp_server(
         distinction semantic search's silent low-similarity drop could not make.
 
         A miss now carries an optional ``tombstone`` key (task 3041) when the
-        record was DELIBERATELY reaped by a named reconciliation sweep. Its
-        presence proves the record is gone on purpose — naming the sweep
+        record was DELIBERATELY deleted by a tombstone-writing delete path —
+        one of the deleter tags listed at
+        ``reconciliation/recon_self_model.py::MEM0_TOMBSTONE_DELETERS``. Its
+        presence proves the record is gone on purpose — naming the deleter
         (``deleter``), the run that performed the deletion
         (``deleting_run_id``, distinct from the victim's own ``run_id``), when,
         and the victim's identifying metadata — rather than lost. This closes
@@ -5136,9 +5165,13 @@ def create_mcp_server(
 
         The key is OMITTED (not ``None``) when no tombstone exists, so its
         presence is itself the signal and the ordinary never-existed miss keeps
-        its original shape. Absence is NOT proof of the converse: tombstones
-        are TTL-bounded, so one older than
-        ``mem0_tombstone.MEM0_TOMBSTONE_TTL_DAYS`` has itself expired. The
+        its original shape. Absence is NOT proof of the converse: a miss with
+        no ``tombstone`` key is not evidence that the record was not
+        deliberately deleted, for two independent reasons. (1) Several Mem0
+        delete paths write no tombstone at all;
+        ``reconciliation/recon_self_model.py::render_cycle_summary_section``
+        is the maintained enumeration of them. (2) Even a written tombstone
+        expires after ``mem0_tombstone.MEM0_TOMBSTONE_TTL_DAYS``. The
         lookup is guarded and never runs on the hit branch, so it can only add
         information to an already-correct answer — a tombstone failure can
         never convert a correct ``found: False`` into an error, and a backend
@@ -5183,7 +5216,9 @@ def create_mcp_server(
             A hit additionally carries an optional ``grouped`` key (task 3129)
             when the record participates in a parent/child group: a CANONICAL
             gains ``{'amendments': [digests], 'amendment_count', 'sighting_count'}``
-            (plus ``'truncated': True`` when the digest listing is bounded, or
+            (a digest marked ``'contested': True`` also carries ``'content'``,
+            its text capped at ``write_triage.judge_field_chars``; plus
+            ``'truncated': True`` when the digest listing is bounded, or
             ``{'children_unavailable': True, 'error_type'}`` when the child
             reads failed); a CHILD gains ``{'parent': {'id', ...same block...}}``
             while keeping its OWN ``content``/``metadata``/``memory_id``.  On
@@ -5269,7 +5304,11 @@ def create_mcp_server(
         # found:True into an error dict.
         try:
             grouped = await group_memory_document(
-                memory_service, project_id, memory_id, record
+                memory_service,
+                project_id,
+                memory_id,
+                record,
+                contested_text_chars=resolve_judge_field_chars(memory_service),
             )
         except Exception:
             logger.warning(
@@ -8619,6 +8658,7 @@ def create_mcp_server(
         page_size: int | None = None,
         offset: int = 0,
         statuses: Any = None,
+        fields: Any = None,
     ) -> dict[str, Any]:
         """List all tasks in the project.
 
@@ -8637,6 +8677,12 @@ def create_mcp_server(
                 results to matching tasks via a SQL ``status IN (...)`` predicate.  An
                 empty list (``[]``) is valid and returns no tasks.  A bare string is
                 rejected with a ValidationError.
+            fields: Optional row projection.  None returns full rows, unchanged.  Each
+                entry is a top-level row key or ``metadata.<key>`` (key matching
+                ``[A-Za-z_][A-Za-z0-9_]*``); ``id`` is always returned, and a requested
+                metadata key absent on a task is omitted.  An invalid entry is a
+                ValidationError carrying ``field`` and ``allowed``.  Composes with
+                ``statuses`` and ``page_size``.
         """
         # Input validation — early-exit before touching the interceptor.
         # Shared with get_statuses so both tools reject identical inputs
@@ -8647,12 +8693,17 @@ def create_mcp_server(
         _statuses_error = _validate_statuses(statuses)
         if _statuses_error is not None:
             return _statuses_error
+        _fields_error = _validate_fields(fields)
+        if _fields_error is not None:
+            return _fields_error
 
         _normalized = _normalize_project_root(project_root)
         if isinstance(_normalized, dict):
             return _normalized
         project_root = _normalized
-        result = await task_interceptor.get_tasks(project_root=project_root, tag=tag, statuses=statuses)
+        result = await task_interceptor.get_tasks(
+            project_root=project_root, tag=tag, statuses=statuses, fields=fields,
+        )
         if isinstance(result, dict) and 'error' not in result:
             pid = resolve_project_id(project_root)
             # Shallow copy to avoid mutating a potentially shared/cached interceptor dict.

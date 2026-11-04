@@ -35,6 +35,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from shared.task_complexity import is_simple_complexity
+from shared.tasks_db_readonly import TaskDbUnreadable, connect_ro
 
 from orchestrator.agents.triage import has_simple_task_blocker
 from orchestrator.evals.snapshots import _run as _git_run
@@ -707,26 +708,17 @@ def enrich_candidates_from_task_db(
     best-effort pass looks each *numeric* task id up in the ``tasks`` table at
     *db_path* (``<project_root>/.taskmaster/tasks/tasks.db``) and returns copies
     with those fields filled (``complexity`` read from the row's ``metadata``
-    JSON blob). Opened ``mode=ro`` (mirroring
-    ``curator_corpus.read_curator_decisions``) so it never locks the live db.
-    Not ``scripts/_task_db_scan.py::connect_ro``, deliberately: package code
-    cannot import a ``scripts/`` sibling, and this pass degrades to stubs
-    rather than refusing.
+    JSON blob). Opens through
+    ``shared/src/shared/tasks_db_readonly.py::connect_ro``, so it never locks
+    the live db, and a refusal degrades to stubs with the refusal's remedy in
+    the warning.
 
     Degrades to the UNCHANGED stub — never raises — for a non-numeric id
     (legacy fixtures), an id absent from the db, or a missing/unreadable db: a
     stub still classifies (to the default cell) rather than crashing the cut.
     """
-    db_path = Path(db_path)
-    if not db_path.exists():
-        logger.warning(
-            'enrich_candidates_from_task_db: no task db at %s; keeping %d '
-            'candidate(s) as stubs', db_path, len(candidates),
-        )
-        return list(candidates)
-
     try:
-        conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
+        conn = connect_ro(db_path)
         conn.row_factory = sqlite3.Row
         try:
             rows = conn.execute(
@@ -734,10 +726,10 @@ def enrich_candidates_from_task_db(
             ).fetchall()
         finally:
             conn.close()
-    except sqlite3.Error as exc:
+    except (TaskDbUnreadable, sqlite3.Error) as exc:
         logger.warning(
-            'enrich_candidates_from_task_db: read of %s failed (%s); keeping stubs',
-            db_path, exc,
+            'enrich_candidates_from_task_db: %s; keeping %d candidate(s) as stubs',
+            exc, len(candidates),
         )
         return list(candidates)
 

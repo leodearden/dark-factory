@@ -451,6 +451,39 @@ class TestPickSurvivorCanonicalFlag:
         assert [m['id'] for m in losers] == ['m1']
 
 
+class TestPickSurvivorStrictCanonicalMarker:
+    """Only the bool True claims canonical (canonical_marker.py::is_canonical)."""
+
+    @pytest.mark.parametrize('malformed', ['true', 1])
+    def test_bool_true_canonical_beats_older_malformed_marker(self, malformed):
+        group = [
+            _memory(
+                'm1', _VENV_GOTCHA_A, created_at='2026-07-01T00:00:00+00:00',
+                metadata={'canonical': malformed},
+            ),
+            _memory(
+                'm2', _VENV_GOTCHA_B, created_at='2026-07-13T00:00:00+00:00',
+                metadata={'canonical': True},
+            ),
+        ]
+        survivor, losers = pick_survivor(group)
+        assert survivor['id'] == 'm2'
+        assert [m['id'] for m in losers] == ['m1']
+
+    @pytest.mark.parametrize('malformed', ['true', 1])
+    def test_malformed_marker_alone_does_not_outrank_age(self, malformed):
+        group = [
+            _memory('m1', _VENV_GOTCHA_A, created_at='2026-07-01T00:00:00+00:00'),
+            _memory(
+                'm2', _VENV_GOTCHA_B, created_at='2026-07-13T00:00:00+00:00',
+                metadata={'canonical': malformed},
+            ),
+        ]
+        survivor, losers = pick_survivor(group)
+        assert survivor['id'] == 'm1'
+        assert [m['id'] for m in losers] == ['m2']
+
+
 class TestPickSurvivorOldestByCreatedAt:
     """With no canonical flag, the oldest by created_at wins."""
 
@@ -3422,6 +3455,20 @@ class TestComputeClusterMetricsConsolidationNetDelta:
         }
         _metrics, details = compute_cluster_metrics(records, {_PK: _plan_slice()}, {})
         assert details['categories'][_PK]['consolidation_events'][0]['absorbed'] == 0
+
+    @pytest.mark.parametrize('malformed', ['true', 1])
+    def test_malformed_canonical_marker_is_not_a_consolidation_event(self, malformed):
+        records = {
+            _PK: [
+                _dated('c', 'x', '2026-01-01T00:00:00+00:00',
+                       metadata={'topic': 'venv', 'canonical': malformed}),
+                _dated('after', 'y', '2026-01-02T00:00:00+00:00', metadata={'topic': 'venv'}),
+            ],
+        }
+        metrics, details = compute_cluster_metrics(records, {_PK: _plan_slice()}, {})
+
+        assert details['categories'][_PK]['consolidation_events'] == []
+        assert _by_id(metrics)[f'consolidation_net_delta.{_PK}'].n == 0
 
     def test_untopiced_event_uses_its_cluster_as_the_peer_set(self):
         records = {

@@ -93,11 +93,13 @@ from orchestrator.agents.write_set import (
 )
 from orchestrator.artifacts import (
     PLAN_SCHEMA_VERSION,
-    PLAN_TASK_TEXT_FP_KEY,
     ReviewAggregation,
     TaskArtifacts,
     iteration_entry_written_by_orchestrator,
+    plan_base_commit,
+    plan_task_text_fp,
 )
+from orchestrator.branch_base import own_work_base
 from orchestrator.branch_mergeability import Mergeability, read_branch_state
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.curator_submit import SubmitBatchResult, submit_task_batch
@@ -111,7 +113,7 @@ from orchestrator.dry_run_unblock import (
     run_dry_run_unblock,
 )
 from orchestrator.escalation_router import InfoL0Sweep, RouterPorts, exit_kind_for, router_owns
-from orchestrator.event_store import EventStore, EventType
+from orchestrator.event_store import EventStore, EventType, cli_resume_failed_data
 from orchestrator.exit_contract import (
     ExitStatusWriteFailure,
     judge_exit,
@@ -145,6 +147,7 @@ from orchestrator.merge_lane.landing_evidence import (
     validate_landing_evidence,
     validate_reported_landing,
 )
+from orchestrator.merge_lane.train_selection import select_train_members
 from orchestrator.merge_lane.types import QueuedBranch
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
 from orchestrator.plan_descope import (
@@ -155,7 +158,13 @@ from orchestrator.plan_descope import (
 )
 from orchestrator.recovery_pins import records_pin_blocked_recovery
 from orchestrator.recut_ruling import ruling_to_enforce
-from orchestrator.review_inputs import gather_review_subject, review_fork_point
+from orchestrator.resume_resolution import (
+    CarriedResolution,
+    render_carried_resolutions,
+    render_issue_context,
+    select_carried_resolutions,
+)
+from orchestrator.review_inputs import gather_review_subject
 from orchestrator.review_outcome import review_completed_payload
 from orchestrator.review_suggestions.curator_intake import (
     review_suggestion_submit_arguments,
@@ -254,11 +263,11 @@ _ORCH_PROJECT_DIR = Path(__file__).resolve().parents[2]
 
 
 def _meta_root_for_worktree(worktree: Path) -> Path:
-    """Derive the `.task-meta` root for *worktree* — the single DRY seam used
-    by both the orchestrator-side ``TaskArtifacts`` construction (``_setup``)
-    and the agent-side plan-tools MCP injection (``_inject_plan_tools_mcp``),
-    so both sides compute the IDENTICAL meta_root for a given worktree
-    (worktree-lane-lifecycle PRD task ε1).
+    """Derive the lane `.task-meta` root for *worktree* — the single DRY seam
+    used by both the orchestrator-side roots (``TaskWorkflow._artifact_roots``)
+    and the agent-side MCP injections (``_inject_plan_tools_mcp`` /
+    ``_inject_verdict_tools_mcp``), so both sides compute the IDENTICAL lane
+    root for a given worktree (worktree-lane-lifecycle PRD task ε1).
 
     Thin wrapper around ``TaskArtifacts.meta_root_for`` — the single owner of
     the `.task-meta` path shape — so callers here never hand-join ``.task``
@@ -267,7 +276,7 @@ def _meta_root_for_worktree(worktree: Path) -> Path:
     return TaskArtifacts.meta_root_for(worktree.parent, worktree.name)
 
 
-def _inject_plan_tools_mcp(mcp_config: dict | None, cwd: Path) -> dict:
+def _inject_plan_tools_mcp(mcp_config: dict | None, cwd: Path, *, task_root: Path) -> dict:
     """Inject the plan-tools stdio MCP server entry into *mcp_config*.
 
     Creates a minimal ``{'mcpServers': {}}`` skeleton when *mcp_config* is
@@ -289,21 +298,25 @@ def _inject_plan_tools_mcp(mcp_config: dict | None, cwd: Path) -> dict:
       ``plan_tools_mcp_server`` for callers that cannot supply an interpreter.
     - Task 1776 (this): ``python_executable=sys.executable`` eliminates ``uv``
       from the hot path entirely, collapsing the proc tree to ``claude → python3``.
-    - Task 2258 (W11-ε1): ``meta_root=_meta_root_for_worktree(cwd)`` passes the
-      sibling `.task-meta` root through as ``--meta-root``, so the agent-side
-      plan-tools server writes plan.json to the same relocated artifacts root
-      the orchestrator's own ``TaskArtifacts`` instance reads from.
+    - Task 2258 (W11-ε1) and task 3155: the lane root
+      (``_meta_root_for_worktree(cwd)``) and *task_root* pass through as
+      ``--meta-root`` / ``--task-root``, so the agent-side plan-tools server
+      writes each artifact to the root the orchestrator's own
+      ``TaskArtifacts`` reads it from. *task_root* is required so a call site
+      cannot silently fall back to a single root.
     """
     if not mcp_config:
         mcp_config = {'mcpServers': {}}
     mcp_config.setdefault('mcpServers', {})['plan-tools'] = plan_tools_mcp_server(
         _ORCH_PROJECT_DIR, cwd, python_executable=sys.executable,
-        meta_root=_meta_root_for_worktree(cwd),
+        meta_root=_meta_root_for_worktree(cwd), task_root=task_root,
     )
     return mcp_config
 
 
-def _inject_verdict_tools_mcp(mcp_config: dict | None, cwd: Path, role: AgentRole) -> dict:
+def _inject_verdict_tools_mcp(
+    mcp_config: dict | None, cwd: Path, role: AgentRole, *, task_root: Path,
+) -> dict:
     """Inject the verdict-tools stdio MCP server entry into *mcp_config*.
 
     Creates a minimal ``{'mcpServers': {}}`` skeleton when *mcp_config* is
@@ -325,10 +338,10 @@ def _inject_verdict_tools_mcp(mcp_config: dict | None, cwd: Path, role: AgentRol
     ``reviews/reviewer_comprehensive.json``.
 
     Modeled on ``_inject_plan_tools_mcp``: same direct-interpreter no-uv hot
-    path (``python_executable=sys.executable``) and the same
-    ``meta_root=_meta_root_for_worktree(cwd)`` passthrough so the agent-side
-    verdict-tools server targets the identical relocated `.task-meta` root
-    the orchestrator's own ``TaskArtifacts`` instance reads from.
+    path (``python_executable=sys.executable``) and the same lane-root and
+    required *task_root* passthrough, so the agent-side verdict-tools server
+    writes ``verdicts/`` to the task root the orchestrator's own
+    ``TaskArtifacts`` reads it from.
 
     Deliberately passes no ``--session-id`` to ``verdict_tools_mcp_server``,
     even though the active session id is available here at the ``_invoke``
@@ -340,7 +353,7 @@ def _inject_verdict_tools_mcp(mcp_config: dict | None, cwd: Path, role: AgentRol
         mcp_config = {'mcpServers': {}}
     mcp_config.setdefault('mcpServers', {})['verdict-tools'] = verdict_tools_mcp_server(
         _ORCH_PROJECT_DIR, cwd, role.name, python_executable=sys.executable,
-        meta_root=_meta_root_for_worktree(cwd),
+        meta_root=_meta_root_for_worktree(cwd), task_root=task_root,
     )
     return mcp_config
 
@@ -397,8 +410,8 @@ def _needs_human(e: Escalation) -> bool:
       never hand-roll ``severity != 'info'`` here.
 
     The single home of that rule for both consumers: disjuncts 2 and 3 of
-    :func:`_is_gating_escalation`, and the stop-the-line short-circuit in
-    ``TaskWorkflow._wait_for_resolution``.
+    :func:`_is_gating_escalation`, and the stop-the-line checks at the entry
+    and the tail of ``TaskWorkflow._wait_for_resolution``.
     """
     return e.severity in BORN_AT_L2_SEVERITIES or (
         e.level >= 2 and is_queue_handoff(e)
@@ -486,9 +499,10 @@ class _HumanHandoff(Exception):
 
 
 class _StewardReescalated(_HumanHandoff):
-    """The steward filed a hand-off L1 during this wait — through its own
+    """The steward filed a hand-off during this wait — an L1 through its own
     give-up path or its agent's ``escalate_blocker(level=1)`` (consumed by the
-    auto-watcher, which may promote to L2 for a human)."""
+    auto-watcher, which may promote to L2 for a human), or a record
+    :func:`_needs_human` selects."""
 
     def __init__(self, escalations: list[Escalation]):
         super().__init__(escalations, 'Steward re-escalated to human')
@@ -496,14 +510,18 @@ class _StewardReescalated(_HumanHandoff):
 
 class _NoStewardApplicable(_HumanHandoff):
     """Open records end the wait that no steward acted on: the stop-the-line
-    ``'L2'`` records :func:`_needs_human` selects, raised before the wait ever
-    awaits, or ``'L1'`` hand-offs left open by anyone but this wait's steward."""
+    records :func:`_needs_human` selects, raised before the wait ever awaits or
+    at its tail, or L1 hand-offs left open by anyone but this wait's steward.
+    The block reason names each record under its own tier: ``L2`` for a record
+    that needs a human, else ``L1``."""
 
-    def __init__(self, escalations: list[Escalation], tier: Literal['L1', 'L2']):
-        ids = ', '.join(e.id for e in escalations)
-        super().__init__(
-            escalations, f'Gated by open {tier} {ids}; no steward applicable',
+    def __init__(self, escalations: list[Escalation]):
+        tiers = (
+            ('L2', [e.id for e in escalations if _needs_human(e)]),
+            ('L1', [e.id for e in escalations if not _needs_human(e)]),
         )
+        gated_by = ' and '.join(f'{tier} {", ".join(ids)}' for tier, ids in tiers if ids)
+        super().__init__(escalations, f'Gated by open {gated_by}; no steward applicable')
 
 if TYPE_CHECKING:
     from escalation.disposition import ExitKind
@@ -784,65 +802,6 @@ def compute_preexisting_main_break_fingerprint(
         )
     except Exception:
         return ''
-
-
-def _line_ranges_stackable(
-    ranges_a: dict[str, list[tuple[int, int]]],
-    ranges_b: dict[str, list[tuple[int, int]]],
-) -> bool:
-    """Return True iff tasks A and B are line-level stackable.
-
-    Two tasks are stackable iff no file they both touch has overlapping changed
-    line ranges relative to BASE (main).  Crate/file-disjointness is NOT
-    required for stackability — same file, different lines is fine (PRD §A.2).
-
-    Uses closed-interval intersection: range (s1,e1) intersects (s2,e2)
-    iff s1 <= e2 and s2 <= e1.
-    """
-    shared_files = set(ranges_a) & set(ranges_b)
-    for fname in shared_files:
-        for s1, e1 in ranges_a[fname]:
-            for s2, e2 in ranges_b[fname]:
-                if s1 <= e2 and s2 <= e1:
-                    return False
-    return True
-
-
-def _select_train_members(
-    anchor_id: str,
-    candidate_ids: list[str],
-    ranges_by_id: dict[str, dict[str, list[tuple[int, int]]]],
-    max_members: int,
-) -> list[str]:
-    """Select a mutually-stackable subset of candidates capped at max_members.
-
-    Greedy selection: start with the anchor, then iterate candidates in
-    deterministic (id-sorted) order, adding each that is _line_ranges_stackable
-    against ALL already-selected members.  Stops when len(selected) == max_members.
-
-    Returns [] when the result has fewer than 2 members — the sentinel for
-    "no viable train" (a single-member train is meaningless).
-
-    The anchor is always first (order-0) in the returned list.
-    """
-    selected: list[str] = [anchor_id]
-
-    for candidate_id in sorted(candidate_ids):
-        if len(selected) >= max_members:
-            break
-        candidate_ranges = ranges_by_id.get(candidate_id, {})
-        # Must be stackable with every already-selected member (mutual stackability).
-        stackable_with_all = all(
-            _line_ranges_stackable(candidate_ranges, ranges_by_id.get(sel_id, {}))
-            for sel_id in selected
-        )
-        if stackable_with_all:
-            selected.append(candidate_id)
-
-    # A single-member "train" is a no-op — return the empty sentinel.
-    if len(selected) < 2:
-        return []
-    return selected
 
 
 def classify_rebase_cohort(
@@ -1410,7 +1369,9 @@ class TaskWorkflow:
         # that _mark_blocked used to perform.
         self._steward_outcome_channel: asyncio.Queue | None = None
         self._config_dir: TaskConfigDir | None = None
-        self._old_plan_base: str | None = None  # base commit from prior session (for revalidation diff)
+        # The prior dispatch's metadata.json fork point: Layer-B's discriminator,
+        # and _plan()'s revalidation fallback for a plan with no trusted _base_commit.
+        self._old_plan_base: str | None = None
         # Base commit for the current run's worktree (set in run() right after
         # create_worktree).  Captured here so _reconcile_metadata_files_for_done
         # can diff base..merge_sha and write the actually-changed paths instead
@@ -1823,13 +1784,13 @@ class TaskWorkflow:
         Returns the mapped ``WorkflowOutcome``, or ``None`` to signal the caller
         to park the workflow as ``MERGE_DEFERRED``.
         """
+        from orchestrator.merge_lane.intake import register_and_enqueue_merge_request
         from orchestrator.merge_lane.worker import (
             TRAIN_INCOMPLETE_REASON_PREFIX,
             TRAIN_VERIFY_FAILED_REASON_PREFIX,
             GroupMergeRequest,
             MergeOutcome,  # noqa: F401 — kept for type completeness
             QueuedBranch,
-            register_and_enqueue_merge_request,
         )
 
         train = self._train
@@ -2086,7 +2047,7 @@ class TaskWorkflow:
 
         Formation (when guards pass and candidates exist):
           1. Fetch line ranges for self + each candidate.
-          2. Select a mutually-stackable subset via _select_train_members (greedy, capped).
+          2. Select a mutually-stackable subset via select_train_members (greedy, capped).
           3. Assign metadata.train={id, order, members} to every selected member via
              scheduler.update_task(append=True) — backend recursive-merge touches only
              the train key, preserving all other metadata keys without a race.
@@ -2132,7 +2093,7 @@ class TaskWorkflow:
             cid: r for cid, r in zip(_all_range_ids, _range_results, strict=True)
         }
 
-        selected = _select_train_members(
+        selected = select_train_members(
             self.task_id, candidate_ids, ranges_by_id,
             self.config.merge_train_max_members,
         )
@@ -2612,6 +2573,21 @@ class TaskWorkflow:
                 )
         self._phase_cost_at_entry = self.metrics.total_cost_usd
 
+    def _artifact_roots(self, worktree: Path) -> tuple[Path, Path]:
+        """The ``(lane root, task root)`` every dispatch into *worktree* uses.
+
+        An external (eval-mode) worktree gets its lane root twice: eval trials
+        of one task id share a parent dir, so a task-keyed root would
+        interleave their plans (task 3155 plan, design decision 4). Any other
+        worktree gets ``TaskArtifacts.for_task``'s pair, the one the steward
+        also opens.
+        """
+        if self._worktree_external:
+            lane_root = _meta_root_for_worktree(worktree)
+            return lane_root, lane_root
+        dual = TaskArtifacts.for_task(worktree, self.task_id)
+        return dual.lane_root, dual.task_root
+
     def _emit_workflow_verify(
         self,
         *,
@@ -2773,11 +2749,10 @@ class TaskWorkflow:
         if not self._worktree_external:
             await self._sync_worktree_venvs()
 
-        self.artifacts = TaskArtifacts(
-            self.worktree, _meta_root_for_worktree(self.worktree),
-        )
-        # Capture old base_commit before init() overwrites metadata.json
-        # — _plan() uses it for revalidation diff.
+        self.artifacts = TaskArtifacts(self.worktree, *self._artifact_roots(self.worktree))
+        # Capture the prior dispatch's fork point before init() overwrites
+        # metadata.json — Layer-B's discriminator below, and _plan()'s
+        # revalidation fallback for a plan with no trusted _base_commit.
         self._old_plan_base = self.artifacts.read_base_commit()
         self.artifacts.init(
             self.task_id,
@@ -2993,9 +2968,8 @@ class TaskWorkflow:
                     # SIMPLE_TASK gave up — drop the plan so the architect
                     # path runs cleanly.
                     if self.artifacts is not None:
-                        plan_path = self.artifacts.root / 'plan.json'
-                        plan_path.unlink(missing_ok=True)
-                        (self.artifacts.root / 'plan.lock').unlink(
+                        self.artifacts.artifact_path('plan.json').unlink(missing_ok=True)
+                        self.artifacts.artifact_path('plan.lock').unlink(
                             missing_ok=True,
                         )
                 elif simple_outcome != WorkflowOutcome.PLANNED:
@@ -3066,7 +3040,7 @@ class TaskWorkflow:
                     await self._ensure_steward_started()
                     logger.info(f'Task {self.task_id}: waiting for escalation resolution')
                     try:
-                        resolution = await self._wait_for_resolution()
+                        carried = await self._wait_for_resolution()
                     except _HumanHandoff as handoff:
                         return await self._mark_blocked(
                             handoff.block_reason,
@@ -3141,7 +3115,7 @@ class TaskWorkflow:
                     # free-text resolution prose and the resumed
                     # implementer's briefing/_task_files never reflect the
                     # expanded scope. granted_files is read from resolved
-                    # escalation records, not the joined `resolution` string.
+                    # escalation records, not from the prose in `carried`.
                     granted = self._collect_granted_files()
                     if granted:
                         current_files = self.plan.get('files', [])
@@ -3187,13 +3161,16 @@ class TaskWorkflow:
                     # Resume with resolution context
                     logger.info(f'Task {self.task_id}: resuming after escalation resolution')
                     async def build_resume_prompt(
-                        resolution: str = resolution,
+                        carried: tuple[CarriedResolution, ...] = carried,
                     ) -> str:
                         assert self.worktree is not None
                         return await self.briefing.build_resume_prompt(
                             self.task, self._live_plan(),
-                            '\n'.join(e.summary for e in self._check_escalations()),
-                            resolution, self.worktree,
+                            render_issue_context(
+                                [e for e in self._check_escalations() if is_queue_handoff(e)],
+                                carried,
+                            ),
+                            render_carried_resolutions(carried), self.worktree,
                         )
 
                     await self._invoke(IMPLEMENTER, build_resume_prompt, self.worktree)
@@ -3927,10 +3904,10 @@ class TaskWorkflow:
             # be satisfied as stamped is cleared rather than preserved.
             logger.warning(
                 'Task %s: merge_retry_pending HEAD match (%s) but the plan has '
-                'no files (artifacts root=%s) — cannot verify the merge-entry '
+                'no files (plan=%s) — cannot verify the merge-entry '
                 'scope invariant, clearing stamp and running full pipeline',
                 self.task_id, current_head,
-                self.artifacts.root if self.artifacts is not None else None,
+                self.artifacts.artifact_path('plan.json') if self.artifacts is not None else None,
             )
             await self._clear_merge_retry_pending()
             return None
@@ -4426,7 +4403,10 @@ class TaskWorkflow:
         try:
             await self._wait_for_resolution()
         except _HumanHandoff as handoff:
-            # Byte-for-byte the shape at :2643-2647.  merge_phase stays at its
+            # run()'s hand-off arm, plus the stop every merge-entry park exit
+            # makes before parking: a hand-off can end the wait with the
+            # steward still live, and _mark_blocked spawns the dry-run
+            # investigator in its worktree.  merge_phase stays at its
             # default False so the row lands `blocked` at _mark_blocked's ENTRY
             # gate (spec S1).  Post-3537 a merge_phase=True call would also
             # write it — the suppression now covers only the ENTRY transition,
@@ -4435,6 +4415,7 @@ class TaskWorkflow:
             # here: this path exits the slot outright, it does not retry a
             # queue submission in-place, which is the ONLY thing merge_phase
             # is for.
+            await self._stop_and_clear_steward()
             return await self._mark_blocked(
                 handoff.block_reason,
                 detail=_format_reescalation_detail(handoff.escalations),
@@ -4504,14 +4485,16 @@ class TaskWorkflow:
                 ),
                 escalate_to_human=True,
             )
-        # SINGLE-SHOT re-check.  The wait can return having cleared what it was
-        # waiting on while a DIFFERENT gating record is open — most sharply a
-        # born-at-L2 filed mid-resolution, which the wait cannot see at all
-        # (its loop polls level-0, its stop-the-line check ran at entry before
-        # the record existed, and its tail reads level-1 queue handoffs).
-        # Without this, such a record is merged straight past.  Re-uses the
-        # SAME _is_gating_escalation predicate rather than an equivalent
-        # inline condition, so there is exactly one gate policy in this file.
+        # SINGLE-SHOT re-check, deliberately redundant with the wait's tail.
+        # That tail applies _needs_human to the full pending set, so a
+        # born-at-L2 filed mid-resolution already raises inside the wait.  It
+        # cannot see a gating record filed AFTER its read — including a plain
+        # blocking L0, which it deliberately does not gate — and at merge entry
+        # there is no later gate, so without this such a record is merged
+        # straight past.  Re-uses the SAME _is_gating_escalation predicate
+        # rather than an equivalent inline condition, so there is exactly one
+        # gate policy in this file.  Pinned by
+        # orchestrator/tests/test_workflow_merge_gating_strand.py::TestGateReFireIsBounded::test_gating_record_filed_after_the_wait_parks_with_l1
         #
         # Deliberately NOT a loop back into the machinery.  Boundedness (spec
         # S5): the whole merge-entry gate path must cost at most ONE steward
@@ -4530,31 +4513,19 @@ class TaskWorkflow:
             e for e in self._check_escalations() if _is_gating_escalation(e)
         ]
         if still_gating:
-            # STOP-THEN-CLEAR before parking, the same idiom the gate-cleared
-            # exit below and _wait_for_resolution's give-up branch (:12620-
-            # 12623) use.  Unlike the sibling exits, this one reaches
-            # _mark_blocked with the steward STILL LIVE — the expiry branch's
-            # steward was already stopped by the wait itself, and the
-            # _NoStewardApplicable branch's records are out of its reach —
-            # and _mark_blocked(escalate_to_human=True) fires
-            # _spawn_dry_run_unblock, which runs run_dry_run_unblock against
-            # self.worktree: the SAME worktree TaskSteward invokes its agent in
-            # (steward.py:542, 590).  Leaving the poll loop live is therefore
-            # the two-agents-one-worktree hazard here too, just with the
-            # dry-run investigator in place of the merge tail (review
-            # amendment).  Stopping first also closes the narrower race the
-            # single-shot re-check opens: a live steward can resolve the record
-            # microseconds after the re-check read it, making the freshly-filed
-            # L1 and the `blocked` park spurious.  Suppressed for the same
-            # reason as every other stop() on a degraded path — a failing stop
-            # must not convert a park into a workflow crash.  Safe with respect
-            # to _mark_blocked: its escalate_to_human branch returns before any
+            # Stop the steward before parking, as the hand-off arm above does:
+            # this arm too reaches _mark_blocked with the steward still live,
+            # and _mark_blocked(escalate_to_human=True) spawns the dry-run
+            # investigator in its worktree.  (The expiry branch needs no stop:
+            # the wait already stopped its steward.)  Stopping first also
+            # closes the narrower race the single-shot re-check opens: a live
+            # steward can resolve the record microseconds after the re-check
+            # read it, making the freshly-filed L1 and the `blocked` park
+            # spurious.  Safe with respect to _mark_blocked: its
+            # escalate_to_human branch returns before any
             # _ensure_steward_started, so clearing the reference here cannot
             # cause a fresh steward to be built behind our back.
-            if self._steward is not None:
-                with contextlib.suppress(Exception):
-                    await self._steward.stop()
-                self._steward = None
+            await self._stop_and_clear_steward()
             return await self._mark_blocked(
                 f'Merge-entry gate: {len(still_gating)} gating escalation(s) '
                 f'still open after the steward wait',
@@ -4592,26 +4563,11 @@ class TaskWorkflow:
         # steward, so nothing was ever live in the worktree during a merge; and
         # unlike run()'s ESCALATED branch — which resumes only the implementer
         # and re-gates afterwards — there is no later gate here to catch a bad
-        # merge, and no re-dispatch can un-merge a branch.  The sibling exits
-        # above do not need it: they never reach the merge tail, and run()'s
-        # `finally` stops the steward on the way out of the slot.
-        #
-        # stop() cancels the loop task (steward.py:209-217) and on the stock
-        # `steward: "claude"` backend the resulting CancelledError propagates
-        # into cli_invoke.py:_run_subprocess, whose handler (:2240-2252)
-        # terminates the agent's whole process group — so an in-flight agent
-        # genuinely stops writing rather than merely being detached from.
-        # Clearing the reference is the existing stop-then-clear idiom
-        # (cf. :6807-6809 / :6851-6853 / :12579-12582): a later _mark_blocked
-        # on the merge tail then builds a FRESH steward through
-        # _ensure_steward_started rather than awaiting a cancelled loop that
-        # can never publish.  Suppressed because a failing stop() must not
-        # convert a cleared gate into a workflow crash — the merge is still
-        # safe to attempt if the loop was already dead.
-        if self._steward is not None:
-            with contextlib.suppress(Exception):
-                await self._steward.stop()
-            self._steward = None
+        # merge, and no re-dispatch can un-merge a branch.  The park exits
+        # above stop the steward too, for the dry-run investigator their
+        # _mark_blocked spawns in this worktree.  A later _mark_blocked on the
+        # merge tail builds a FRESH steward, because the reference is cleared.
+        await self._stop_and_clear_steward()
         # BLOCKED → IN_PROGRESS is likewise legal for ActorClass.ORCHESTRATOR.
         self._enter_phase(WorkflowState.MERGE)
         return None
@@ -5203,7 +5159,7 @@ class TaskWorkflow:
                 and not existing.get('_finalized_at')
                 and not existing.get('steps')
             ):
-                plan_path = self.artifacts.root / 'plan.json'
+                plan_path = self.artifacts.artifact_path('plan.json')
                 if plan_path.exists():
                     plan_path.unlink()
 
@@ -5245,7 +5201,7 @@ class TaskWorkflow:
             existing_plan
             and existing_plan.get('steps')
             and existing_plan.get('_session_id')
-            and self._old_plan_base
+            and (revalidation_base := await self._revalidation_base(existing_plan))
         ):
             # Done-step commits a rebase orphaned are remapped before either
             # the skip or the architect trusts them (task 4032).
@@ -5253,22 +5209,23 @@ class TaskWorkflow:
             before_plan = existing_plan
             current_main = await self.git_ops.get_main_sha()
             revalidation_changed_files = await self.git_ops.get_changed_files(
-                self._old_plan_base, current_main,
+                revalidation_base, current_main,
             )
             plan_file_set = set(existing_plan.get('files', []))
             overlap = [f for f in revalidation_changed_files if f in plan_file_set]
             logger.info(
-                'Task %s: revalidating existing plan '
+                'Task %s: revalidating existing plan from %s '
                 '(%d changed files, %d overlap with plan)',
-                self.task_id, len(revalidation_changed_files), len(overlap),
+                self.task_id, revalidation_base[:12],
+                len(revalidation_changed_files), len(overlap),
             )
             text_drift = self._check_plan_text_drift(existing_plan)
 
             # ── Lever B: revalidation skip ────────────────────────────
             # When main has gained no changes that touch the plan's files,
             # the architect's revalidation pass is a near-certain no-op.
-            # Short-circuit by stamping _revalidated_at and bumping
-            # base_commit ourselves, then return PLANNED. Falls through to
+            # Short-circuit by stamping _revalidated_at and advancing the
+            # plan's _base_commit ourselves, then return PLANNED. Falls through to
             # the existing architect path on any pre-flight failure.
             if (
                 self.config.revalidation_skip_enabled
@@ -5734,7 +5691,7 @@ class TaskWorkflow:
         if not self.config.plan_text_fp_gate_enabled:
             return None
         current_fp = self._current_task_text_fp()
-        plan_fp = plan.get(PLAN_TASK_TEXT_FP_KEY)
+        plan_fp = plan_task_text_fp(plan)
         drift = task_text_drift(plan_fp, current_fp)
         if drift is TaskTextDrift.CURRENT:
             return None
@@ -5747,7 +5704,7 @@ class TaskWorkflow:
                 EventType.plan_text_drift, task_id=self.task_id, phase='plan',
                 data={
                     'drift': drift.value,
-                    'plan_text_fp': plan_fp if isinstance(plan_fp, str) else None,
+                    'plan_text_fp': plan_fp,
                     'task_text_fp': current_fp,
                     'plan_session_id': str(plan.get('_session_id') or ''),
                 },
@@ -5769,14 +5726,15 @@ class TaskWorkflow:
 
     def _stamped_task_text_fp(self) -> str | None:
         assert self.artifacts is not None
-        fp = self.artifacts.read_plan().get(PLAN_TASK_TEXT_FP_KEY)
-        return fp if isinstance(fp, str) else None
+        return plan_task_text_fp(self.artifacts.read_plan())
 
     async def _stamp_authored_plan(self) -> None:
-        """Provenance-stamp a plan just authored against ``self.task`` and mirror its text fingerprint."""
+        """Provenance-stamp a plan just authored against ``self.task`` and the dispatch base, and mirror its text fingerprint."""
         assert self.artifacts is not None
         fp = self._current_task_text_fp()
-        self.artifacts.stamp_plan_provenance(self.session_id, task_text_fp=fp)
+        self.artifacts.stamp_plan_provenance(
+            self.session_id, task_text_fp=fp, base_commit=self.artifacts.read_base_commit(),
+        )
         await self._mirror_plan_text_fp(fp, self.artifacts.read_plan().get('_created_at'))
 
     async def _mirror_plan_text_fp(self, fp: str, authored_at: object) -> None:
@@ -5789,6 +5747,28 @@ class TaskWorkflow:
         except Exception as exc:
             logger.warning('Task %s: plan_text_fp mirror write failed: %s', self.task_id, exc)
         self._mutable_task_metadata().update(mirror)
+
+    async def _revalidation_base(self, plan: dict) -> str | None:
+        """The main SHA *plan* was last validated against, corroborated on main's history, else the prior dispatch's fork point (PRD task-meta-task-keying §M2)."""
+        stamped = plan_base_commit(plan)
+        if stamped is None:
+            return self._old_plan_base
+        on_main = await self.git_ops.is_ancestor_checked(stamped, self.config.git.main_branch)
+        if on_main is True:
+            return stamped
+        if on_main is None:
+            logger.warning(
+                'Task %s: git could not check plan _base_commit %s against main; '
+                'revalidating from the prior dispatch base',
+                self.task_id, stamped[:12],
+            )
+        else:
+            logger.info(
+                'Task %s: plan _base_commit %s is not on main; '
+                'revalidating from the prior dispatch base',
+                self.task_id, stamped[:12],
+            )
+        return self._old_plan_base
 
     async def _can_skip_revalidation(self, plan: dict) -> bool:
         """Lever B pre-flight checks for the revalidation skip.
@@ -5880,7 +5860,7 @@ class TaskWorkflow:
         # self.modules/_module_configs already updated by
         # _reconcile_plan_scope on success (unchanged if the module set is).
 
-        # Bump revalidation stamp + base commit (mirrors confirm_plan).
+        # Stamp _revalidated_at and advance plan.json's _base_commit to current main.
         try:
             self.artifacts.bump_revalidation_stamp(
                 self.session_id, base_commit=current_main,
@@ -6877,7 +6857,7 @@ class TaskWorkflow:
            best-effort persist via ``scheduler.update_task`` (wrapped in a logged
            try/except).
 
-        ζ (task 1887) consumes this value at ``_pop_next_pickable`` for aging-
+        ζ (task 1887) consumes this value at ``MergeIntake.pop_next_pickable`` for aging-
         priority ordering and owns the ``enqueued_at`` fallback for legacy
         ``None`` values.
 
@@ -8439,7 +8419,7 @@ class TaskWorkflow:
         # Clear stale merge-failure review from prior runs — prevents
         # the review phase from re-surfacing resolved merge issues.
         if self.artifacts:
-            stale_merge = self.artifacts.root / 'reviews' / 'merge.json'
+            stale_merge = self.artifacts.artifact_path('reviews/merge.json')
             if stale_merge.exists():
                 logger.info('Task %s: removing stale merge.json review', self.task_id)
                 stale_merge.unlink()
@@ -8759,10 +8739,9 @@ class TaskWorkflow:
                     # Archive pre-amendment reviews so post-mortem can compare
                     if self.artifacts:
                         import shutil
-                        reviews_dir = self.artifacts.root / 'reviews'
-                        archive_dir = (
-                            self.artifacts.root
-                            / f'reviews-amend-{amendment_round}'
+                        reviews_dir = self.artifacts.artifact_path('reviews')
+                        archive_dir = self.artifacts.review_archive_dir(
+                            f'amend-{amendment_round}'
                         )
                         if reviews_dir.exists() and not archive_dir.exists():
                             shutil.copytree(reviews_dir, archive_dir)
@@ -8836,8 +8815,8 @@ class TaskWorkflow:
 
             # Archive reviews from this cycle before re-plan overwrites them
             if self.artifacts:
-                reviews_dir = self.artifacts.root / 'reviews'
-                archive_dir = self.artifacts.root / f'reviews-cycle-{review_cycle}'
+                reviews_dir = self.artifacts.artifact_path('reviews')
+                archive_dir = self.artifacts.review_archive_dir(f'cycle-{review_cycle}')
                 if reviews_dir.exists() and not archive_dir.exists():
                     import shutil
                     shutil.copytree(reviews_dir, archive_dir)
@@ -8854,9 +8833,12 @@ class TaskWorkflow:
                 f'{len(reviews.blocking_issues)} blocking issues'
             )
             stamped_fp = self._stamped_task_text_fp()
-            await self._replan(reviews)
-            # Re-stamp provenance — architect may have overwritten plan.json
             assert self.artifacts is not None
+            stamped_base = plan_base_commit(self.artifacts.read_plan())
+            await self._replan(reviews)
+            # Re-stamp provenance — architect may have overwritten plan.json.
+            # A review replan is not a validation against main: restore the
+            # prior _base_commit rather than stamping the dispatch base.
             self.plan = self.artifacts.read_plan()
             if not self.plan or not self.plan.get('steps'):
                 plan_dump = json.dumps(self.plan, indent=2) if self.plan else 'None'
@@ -8871,7 +8853,7 @@ class TaskWorkflow:
             if outcome := await self._validate_prerequisites_or_block('replan'):
                 return outcome
             self.artifacts.stamp_plan_provenance(
-                self.session_id, task_text_fp=stamped_fp,
+                self.session_id, task_text_fp=stamped_fp, base_commit=stamped_base,
             )
             # Task 2874: the architect may have WIDENED plan.files while
             # addressing review feedback ("you may add new steps"), so route
@@ -9588,7 +9570,7 @@ class TaskWorkflow:
 
         Called on EVERY zero-output timeout in ``_execute_iterations`` (before
         the threshold check) so both sub-threshold and tripping occurrences
-        are captured.  Writes to ``artifacts.root`` which outlives the per-task
+        are captured.  Writes to the task root, which outlives the per-task
         ``TaskConfigDir`` cleanup and the BLOCKED worktree (not GC'd since the
         task is not DONE).
 
@@ -9664,7 +9646,7 @@ class TaskWorkflow:
                         self.task_id, exc,
                     )
 
-            evidence_path = self.artifacts.root / f'zero_output_evidence-iter{iteration}.json'
+            evidence_path = self.artifacts.zero_output_evidence_path(iteration)
             evidence_path.write_text(json.dumps(evidence, indent=2))
             logger.info(
                 'Task %s: zero-output evidence written → %s',
@@ -9687,11 +9669,7 @@ class TaskWorkflow:
         """
         assert self.worktree is not None and self.artifacts is not None
 
-        base_commit = self.artifacts.read_base_commit()
-        if base_commit:
-            diff = await self.git_ops.get_diff_from_base(self.worktree, base_commit)
-        else:
-            diff = await self.git_ops.get_diff_from_main(self.worktree)
+        diff = await self.git_ops.get_diff_from_base(self.worktree, await self._own_work_base())
 
         if not diff or not diff.strip():
             logger.info(
@@ -11170,7 +11148,7 @@ class TaskWorkflow:
             return reviews
         if self.artifacts is None:
             return reviews
-        prior = load_prior_round_suggestions(self.artifacts.root)
+        prior = load_prior_round_suggestions(self.artifacts.review_archives_root)
         if not prior:
             return reviews
 
@@ -11222,11 +11200,7 @@ class TaskWorkflow:
                 return self._review_inputs_unavailable(roster, exc)
             diff = subject.change.diff
         else:
-            base_commit = self.artifacts.read_base_commit()
-            if base_commit:
-                diff = await self.git_ops.get_diff_from_base(self.worktree, base_commit)
-            else:
-                diff = await self.git_ops.get_diff_from_main(self.worktree)
+            diff = await self.git_ops.get_diff_from_base(self.worktree, await self._own_work_base())
 
         amendment_suggestions = (
             amendment_ctx.amended_suggestions if amendment_ctx is not None else None
@@ -11292,22 +11266,18 @@ class TaskWorkflow:
 
         return self.artifacts.aggregate_reviews()
 
-    async def _context_complete_review_subject(self) -> ReviewSubject:
-        """The context-complete reviewer's inputs, from the worktree at a fresh fork point.
-
-        The fork point is re-derived now, because the stored base goes stale
-        once main is merged into the branch (task 5695); the stored base and
-        then the main branch name are the fallbacks.
-        """
+    async def _own_work_base(self) -> str:
+        """The base whose ``...HEAD`` range in the worktree is this task's own work."""
         assert self.worktree is not None and self.artifacts is not None
-        main_branch = self.config.git.main_branch
-        base = (
-            await review_fork_point(self.worktree, main_branch)
-            or self.artifacts.read_base_commit()
-            or main_branch
+        return await own_work_base(
+            self.worktree, self.config.git.main_branch, self.artifacts.read_base_commit(),
         )
+
+    async def _context_complete_review_subject(self) -> ReviewSubject:
+        """The context-complete reviewer's inputs, from the worktree at its own-work base."""
+        assert self.worktree is not None and self.artifacts is not None
         return await gather_review_subject(
-            self.worktree, base,
+            self.worktree, await self._own_work_base(),
             task=self.task,
             plan=self.artifacts.read_plan() or None,
             plan_absent_reason='this task has no plan.json (a simple-task run writes none)',
@@ -11566,7 +11536,7 @@ class TaskWorkflow:
             # itself a reviewer_comprehensive amendment on task 2483).
             # This is purely diagnostic; the fail-safe ERROR outcome below
             # is unchanged either way.
-            verdicts_dir = self.artifacts.root / 'verdicts'
+            verdicts_dir = self.artifacts.artifact_path('verdicts')
             if not verdicts_dir.is_dir():
                 logger.warning(
                     'Task %s: reviewer %s verdict absent AND %s does not '
@@ -11950,14 +11920,15 @@ class TaskWorkflow:
         )
         from orchestrator.merge_lane.disposition import MergeFailureDisposition
         from orchestrator.merge_lane.gates import _check_plan_files_touched_in_branch
+        from orchestrator.merge_lane.intake import (
+            emit_merge_coalesced,
+            register_and_enqueue_merge_request,
+        )
+        from orchestrator.merge_lane.tip_relation import AttachAction, resolve_attach_action
         from orchestrator.merge_lane.worker import (
-            AttachAction,
             MergeRequest,
             OutcomeKind,
             _emit_merge_attempt,
-            _emit_merge_coalesced,
-            register_and_enqueue_merge_request,
-            resolve_attach_action,
         )
 
         assert self.worktree is not None
@@ -12322,7 +12293,7 @@ class TaskWorkflow:
                     # classify await (I10 await-gap).  Fall through to enqueue in that case.
                     attached = _registry.attach(branch_name, waiter)
                     if attached:
-                        _emit_merge_coalesced(
+                        emit_merge_coalesced(
                             self.event_store, merge_request, 'workflow',
                             _registry.eta_seconds(branch_name),
                         )
@@ -12882,7 +12853,7 @@ class TaskWorkflow:
             # pre-triage meta-root diagnostic (steward.py:701-719). This
             # is purely diagnostic; the fail-safe blocked outcome below is
             # unchanged either way.
-            verdicts_dir = self.artifacts.root / 'verdicts'
+            verdicts_dir = self.artifacts.artifact_path('verdicts')
             if not verdicts_dir.is_dir():
                 logger.warning(
                     'Task %s: merger verdict absent AND %s does not '
@@ -14500,7 +14471,9 @@ class TaskWorkflow:
         sandbox_modules = None
         sandbox_extras = None
         if self.config.sandbox.enabled and role.sandboxed:
-            write_set = compute_write_set(cwd)
+            write_set = compute_write_set(
+                cwd, task_id=self.task_id, task_root=self._artifact_roots(cwd)[1],
+            )
             # Pre-create the load-bearing claude_fleet carve-out OUTSIDE the
             # sandbox at this single INV-5/D11 write-set consumption point, so it
             # exists before sandbox_extras (below) is built (task 2996) — see
@@ -14547,7 +14520,9 @@ class TaskWorkflow:
         # (--no-sync, --frozen) reuse the already-synced orchestrator venv to
         # avoid cold-resolve stalls under load (reify esc-4415-240/esc-4437-123).
         if 'plan_tools' in role.mcp_families and cwd:
-            mcp_config = _inject_plan_tools_mcp(mcp_config, cwd)
+            mcp_config = _inject_plan_tools_mcp(
+                mcp_config, cwd, task_root=self._artifact_roots(cwd)[1],
+            )
 
         # Verdict-tools stdio MCP server — reviewer/judge/merger submit a
         # constrained verdict artifact (PRD task β, task 2482). Gated on
@@ -14556,7 +14531,9 @@ class TaskWorkflow:
         # config when None, so the reviewer (no 'orchestrator' family) still
         # acquires it.
         if 'verdict_tools' in role.mcp_families and cwd:
-            mcp_config = _inject_verdict_tools_mcp(mcp_config, cwd, role)
+            mcp_config = _inject_verdict_tools_mcp(
+                mcp_config, cwd, role, task_root=self._artifact_roots(cwd)[1],
+            )
 
         # --strict-mcp-config stops the CLI unioning in the ambient project/user
         # .mcp.json. EVAL_PROFILE scopes every role (task 4757). A role whose
@@ -15002,10 +14979,10 @@ class TaskWorkflow:
         completed_at = datetime.now(UTC).isoformat()
 
         # The CLI-stage half of session_resume_failed (task 3578): we DID arm
-        # --resume, the CLI rejected the session, and invoke_with_cap_retry
-        # retried fresh and handed back a SUCCESS. Nothing else records that —
-        # from runs.db the invocation looks perfect, so the lost transcript was
-        # invisible. `shared` has no event store, so the count rides out on
+        # --resume and the CLI rejected the session before any model turn, so
+        # invoke_with_cap_retry retried fresh. resume_fallbacks counts only
+        # those proven rejections (shared/cli_invoke.py::is_resume_rejected,
+        # task 5579). `shared` has no event store, so the count rides out on
         # AgentResult.resume_fallbacks and is turned into an event here.
         #
         # getattr with a default, not attribute access: several suites hand
@@ -15017,8 +14994,8 @@ class TaskWorkflow:
         # EventType's taxonomy note).
         #
         # GATED ON OUR OWN ARMED RESUME, not on the counter alone. cli_invoke
-        # increments resume_fallbacks for ANY resumed attempt that failed
-        # non-cap and was retried fresh — including a resume its retry loop
+        # increments resume_fallbacks for ANY rejected resume it retried
+        # fresh — including a resume its retry loop
         # re-armed ITSELF after a cap hit (invoke_kwargs['resume_session_id'] =
         # result.session_id). A plain FRESH dispatch that hits a cap can
         # therefore come back with a non-zero count while no resume was ever
@@ -15027,41 +15004,32 @@ class TaskWorkflow:
         # resumes we DECIDED to make, how many did not survive?") and could
         # push it above 1. resume_session_id is non-None iff the arm site above
         # corroborated and adopted, which is that predicate exactly.
+        #
+        # The payload names the session actually LOST, which session_id_val
+        # often is not: cli_invoke's _reset_for_fresh_retry regenerates the
+        # pre-allocated id, and a cap re-arm replaces the armed id with
+        # result.session_id. The steward builds the same row through the same
+        # builder (event_store.py::cli_resume_failed_data).
         resume_fallbacks = getattr(result, 'resume_fallbacks', 0)
-        if resume_fallbacks and resume_session_id:
-            # …and name the session actually LOST, which session_id_val often
-            # is not: cli_invoke's _reset_for_fresh_retry regenerates the
-            # pre-allocated id, and a cap re-arm replaces the armed id with
-            # result.session_id. The carrier keeps every dropped id in order;
-            # the first is the resume we adopted, so it is the scalar
-            # data.session_id, with the full list alongside for the
-            # multi-fallback invocations. Falls back to our own armed id if an
-            # older shared/ (or a suite stand-in) carries no list.
-            lost_session_ids = [
-                str(s) for s in
-                (getattr(result, 'resume_fallback_session_ids', ()) or ())
-            ]
-            lost_session_id = (
-                lost_session_ids[0] if lost_session_ids else resume_session_id
-            )
+        cli_failure = cli_resume_failed_data(
+            armed_session_id=resume_session_id,
+            role=role.name,
+            fallbacks=resume_fallbacks,
+            dropped_session_ids=getattr(result, 'resume_fallback_session_ids', ()) or (),
+        )
+        if cli_failure is not None:
             if self.event_store:
                 self.event_store.emit(
                     EventType.session_resume_failed,
                     task_id=self.task_id,
-                    data={
-                        'stage': 'cli',
-                        'session_id': lost_session_id,
-                        'session_ids': lost_session_ids,
-                        'role': role.name,
-                        'fallbacks': resume_fallbacks,
-                    },
+                    data=cli_failure,
                 )
             # Genuine by construction (task ε/3733): the restore ran a phase
             # earlier and is not what failed here, so the report carries no
             # restore outcome and the harness cannot carve it out.
             self._report_resume_failed(
                 stage='cli',
-                session_id=lost_session_id,
+                session_id=cli_failure['session_id'],
                 role_name=role.name,
                 restore=None,
                 archive_root=archive_root,
@@ -15074,6 +15042,9 @@ class TaskWorkflow:
             # Adopted AND survived — the reset half of the circuit breaker.
             # `resume_session_id` is non-None iff the arm site corroborated and
             # adopted, so this is exactly "a resume we DECIDED to make worked".
+            # A resumed run that ran turns and then ended non-success (the
+            # ended_awaiting_background downgrade, a budget kill) also survived:
+            # the role's normal non-success handling owns that outcome (task 5579).
             self._report_resume_succeeded()
 
         # Record the last successfully-completed role (updated only on success,
@@ -15302,7 +15273,7 @@ class TaskWorkflow:
             return []
         return self.escalation_queue.get_by_task(self.task_id, status='pending')
 
-    async def _wait_for_resolution(self) -> str:
+    async def _wait_for_resolution(self) -> tuple[CarriedResolution, ...]:
         """Wait until no pending level-0 record holds the wait: every L0 while a
         steward is live, else only the steward-owned ones.
 
@@ -15315,18 +15286,23 @@ class TaskWorkflow:
         that ``run()`` calls ``_mark_blocked`` and halts.
 
         Raises a ``_HumanHandoff``:
-        - ``_NoStewardApplicable('L2')`` if any pending escalation needs a
-          human — immediate terminal, stop the line, before any await; OR,
-          once the level-0 wait ends with level-1 queue handoffs open (never
-          an info record, PRD D3):
-        - ``_StewardReescalated`` if this wait's steward re-escalated, else
-        - ``_NoStewardApplicable('L1')`` — the L1s predate the wait or came
-          from elsewhere, so no steward acted on them (PRD D13).
+        - ``_NoStewardApplicable`` if any pending escalation needs a human —
+          immediate terminal, stop the line, before any await; OR,
+          once the level-0 wait ends with open records that the same
+          :func:`_needs_human` rule selects over the FULL pending set (so a
+          record filed during the wait is caught), or with level-1 queue
+          handoffs open (never an info record, PRD D3):
+        - ``_StewardReescalated`` if this wait's steward filed one of them, else
+        - ``_NoStewardApplicable`` — they predate the wait or came from
+          elsewhere, so no steward acted on them (PRD D13).
 
-        When no escalation queue is available (e.g. eval mode), returns
-        an empty string immediately — the caller treats this as "no
-        resolution" and the workflow proceeds to ESCALATED/BLOCKED
-        via its normal path.
+        Otherwise returns the task's resolved escalations as attributed
+        :class:`CarriedResolution` items in resolution order, each marked as
+        answering this round when it was not yet resolved as the wait began
+        (see ``orchestrator/src/orchestrator/resume_resolution.py``).  When no
+        escalation queue is available (e.g. eval mode), returns an empty
+        tuple immediately — the caller treats this as "no resolution" and
+        the workflow proceeds to ESCALATED/BLOCKED via its normal path.
 
         **Bounded (task 3170, fix C + review fixes D1/D2/D3).** The level-0
         wait is bounded by an IDLE window
@@ -15396,8 +15372,9 @@ class TaskWorkflow:
         resumed implementer edits and commits in, so dismissing or resuming
         beside a live steward agent means two agents committing in one git
         worktree.  The tail then yields exactly two dispositions: a
-        ``_HumanHandoff`` (blocking, with the open level-1 queue handoffs) when
-        one is open, or the collected resolutions (resuming) when none is.  It
+        ``_HumanHandoff`` (blocking, with the open hand-off records the Raises
+        list names) when one is open, or the collected resolutions (resuming)
+        when none is.  It
         deliberately does NOT call :meth:`_mark_blocked`, which would file a
         fresh L0 and could add a SECOND full grace window for what is a pure
         wait-timeout.
@@ -15413,7 +15390,7 @@ class TaskWorkflow:
                 '(eval mode?) — returning immediately',
                 self.task_id,
             )
-            return ''
+            return ()
 
         # Reset once per wait, AFTER the no-queue early return, so each wait
         # reports its OWN outcome and a stale True from an earlier wait can
@@ -15426,15 +15403,18 @@ class TaskWorkflow:
         # Records that need a human are stop-the-line: no auto-watcher or
         # steward can resolve them, so waiting for the
         # L0 loop to clear makes no sense and risks a busy resume-spin (gate
-        # fires → _wait_for_resolution returns '' → resume → gate fires again).
+        # fires → _wait_for_resolution returns nothing → resume → gate fires again).
         # Raised as a _HumanHandoff so run() calls _mark_blocked and halts for
         # human intervention rather than looping; the reason says no steward
         # was applicable (D13).
         open_at_entry = self.escalation_queue.get_by_task(self.task_id, status='pending')
         pending_l2 = [e for e in open_at_entry if _needs_human(e)]
         if pending_l2:
-            raise _NoStewardApplicable(pending_l2, 'L2')
+            raise _NoStewardApplicable(pending_l2)
         open_ids_at_entry = {e.id for e in open_at_entry}
+        resolved_before_round = frozenset(
+            e.id for e in self.escalation_queue.get_by_task(self.task_id, status='resolved')
+        )
 
         # Wait for level-0 pending escalations to clear, BOUNDED by a derived
         # window (task 3170, fix C + review fix D1).  See the method docstring
@@ -15521,24 +15501,13 @@ class TaskWorkflow:
                 # (steward.py:542, 590), the SAME worktree the resumed
                 # implementer edits and commits in, so stopping first closes
                 # the two-agents-one-worktree window entirely rather than
-                # narrowing it.  stop() cancels the loop task (steward.py:
-                # 209-217) and on the stock `steward: "claude"` backend the
-                # resulting CancelledError propagates into
-                # cli_invoke.py:_run_subprocess, whose handler (:2240-2252)
-                # terminates the agent's whole process group — so the in-flight
-                # agent genuinely stops writing rather than merely being
-                # detached from.  Clearing the reference (the existing
-                # stop-then-clear idiom, cf. :5319-5320 / :5363-5364) makes a
-                # later _mark_blocked build a FRESH steward through
-                # _ensure_steward_started instead of awaiting a cancelled loop
-                # that can never publish.  Suppressed because this is cleanup on
-                # an already-degraded path: a failing stop() must not convert a
-                # wait-timeout into a workflow crash.
+                # narrowing it (how, and why the reference is cleared:
+                # _stop_and_clear_steward).
                 #
                 # Task 3536: record the give-up for callers that must tell it
                 # apart from a genuine resolution.  They cannot do so from this
                 # method's return value — the tail below dismisses the orphans
-                # and, with no open L1, returns the collected resolutions
+                # and, with no open hand-off, returns the collected resolutions
                 # exactly as a successful wait does.  run()'s ESCALATED branch
                 # deliberately ignores the flag (resuming the implementer on
                 # expiry is safe there: it does more work and the pipeline
@@ -15548,10 +15517,7 @@ class TaskWorkflow:
                 # repend-PRD D4 stop-the-line.  The flag is set only when the
                 # give-up dismissed something: a router-owned info note left
                 # pending for the exit finalizer (D10) was not auto-dismissed.
-                if self._steward is not None:
-                    with contextlib.suppress(Exception):
-                        await self._steward.stop()
-                    self._steward = None
+                await self._stop_and_clear_steward()
                 orphans = self._pending_steward_l0s()
                 self._steward_wait_expired = bool(orphans)
                 orphan_ids = [e.id for e in orphans]
@@ -15606,28 +15572,26 @@ class TaskWorkflow:
         # outcome out of _await_steward_completion.
         self._drain_steward_outcomes()
 
-        handoff_l1 = [
-            e for e in self.escalation_queue.get_by_task(
-                self.task_id, status='pending', level=1,
-            )
-            if is_queue_handoff(e)
+        # The entry gate's stop-the-line rule again, over the FULL pending set:
+        # a record that needs a human may have been filed while this waited.
+        open_at_tail = self.escalation_queue.get_by_task(self.task_id, status='pending')
+        handoffs = [
+            e for e in open_at_tail
+            if _needs_human(e) or (e.level == 1 and is_queue_handoff(e))
         ]
-        if handoff_l1:
+        if handoffs:
             steward_filed_one = any(
                 e.agent_role == STEWARD.name and e.id not in open_ids_at_entry
-                for e in handoff_l1
+                for e in handoffs
             )
             if steward_filed_one:
-                raise _StewardReescalated(handoff_l1)
-            raise _NoStewardApplicable(handoff_l1, 'L1')
+                raise _StewardReescalated(handoffs)
+            raise _NoStewardApplicable(handoffs)
 
-        # Collect resolutions (filter ensures resolution is non-None str for join)
-        resolutions = [
-            e.resolution
-            for e in self.escalation_queue.get_by_task(self.task_id)
-            if e.status == 'resolved' and e.resolution is not None
-        ]
-        return '\n'.join(resolutions)
+        return select_carried_resolutions(
+            self.escalation_queue.get_by_task(self.task_id),
+            resolved_before_round=resolved_before_round,
+        )
 
     async def _get_head_commit(self) -> str:
         """Return the worktree's HEAD sha, or ``''`` when git exits non-zero.
@@ -16553,7 +16517,7 @@ class TaskWorkflow:
         foreign_session = ''
         if self.artifacts is not None:
             try:
-                plan_path = self.artifacts.root / 'plan.json'
+                plan_path = self.artifacts.artifact_path('plan.json')
                 data = json.loads(plan_path.read_text())
                 foreign_session = data.get('_session_id') or ''
             except Exception:
@@ -18586,6 +18550,25 @@ class TaskWorkflow:
         steward.set_outcome_channel(self._steward_outcome_channel)
         steward.set_wip_probe(self._worktree_has_wip_commits)
         await steward.start()
+
+    async def _stop_and_clear_steward(self) -> None:
+        """Stop the steward before anything else writes in its worktree.
+
+        ``TaskSteward._run_loop`` keeps invoking its agent with ``cwd =
+        self.worktree``, so a park (whose dry-run investigator runs there) or
+        the merge tail beside a live loop is two agents in one worktree.
+        ``stop()`` cancels the loop, and on the stock ``claude`` backend that
+        terminates the agent's process group.  Clearing the reference makes a
+        later :meth:`_ensure_steward_started` build a fresh steward rather than
+        await a cancelled loop that can never publish; it also drops this
+        steward's cost from the report ``harness.py::_run_slot`` reads off
+        ``workflow._steward``.  A failing ``stop()`` is suppressed: it must not
+        turn a park or a cleared gate into a workflow crash.
+        """
+        if self._steward is not None:
+            with contextlib.suppress(Exception):
+                await self._steward.stop()
+            self._steward = None
 
     async def _await_cancellable(self, awaitable, *, on_soft_cancel=None):
         """Race ``awaitable`` against ``self._cancel_event``.

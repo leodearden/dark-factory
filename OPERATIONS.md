@@ -1392,6 +1392,13 @@ takes no arguments: it always re-reads that process's own
   `orchestrator/src/orchestrator/config.py::ScoringConfig` and
   `plans/scheduler-dispatch-scoring-and-lock-layer-prd.md` §C2. The legacy
   formula's `age_alpha` / `cpm_beta` stay restart-only.
+- `deterministic.predicate_recheck_stall_cap` (default 30, `>= 1`): how many
+  consecutive exit-75 "not yet" verdicts a re-arming predicate may return
+  before the runner files `milestone_check_stalled`. Read whenever a
+  deterministic slot builds its runner, so a reload applies from the next
+  dispatch. Calibrate it from `predicate_recheck_stalled` events. Normative
+  homes: `orchestrator/src/orchestrator/config.py::DeterministicConfig` and
+  `plans/completion-driven-triggers-prd.md` C1.
 - `verify_env`
 - `verify_cgroup_cpu_weight_merge` / `_task` / `_background` (the per-role
   cgroup `CPUWeight` a verify scope is spawned with when
@@ -2785,11 +2792,15 @@ check `applied`/`restart_required` on your reload call, per
 | `watcher_daily_cost_ceiling_usd` | `50.0` | All `escalation-watcher` (L1 auto-triage) invocations for the day |
 | `orch_daily_cost_ceiling_usd` | `200.0` | All orchestrator invocations (every role) for the day |
 
-**Multi-account failover (`usage_cap.*`)** is entirely optional — a
-single-user setup works fine on plain CLI OAuth login with no accounts
-file configured. If you do configure a pool
+**Multi-account failover (`usage_cap.*`)** is on in every shipped config. A
+pool whose roster resolves no token is EMPTY, and every invocation then raises
+in `UsageGate.before_invoke`: the gate never adopts the operator's `~/.claude`
+login unless told to (ruling 2026-11-01, task 8161). A single-user setup has two
+supported routes: `usage_cap.enabled: false`, or
+`usage_cap.fallback_to_default_credential: true` (interactive or single-user
+only: the whole fleet then rides that login). The pool
 (`usage_cap.accounts_file` → an external YAML of `oauth_token_env` entries
-resolved from `.env`), it gives the orchestrator per-account failover when
+resolved from `.env`) gives the orchestrator per-account failover when
 one account gets capped, plus the per-(account, model) scoped-cap
 dimension described in [§7](#7-model-routing). This whole block is
 restart-tier, not hot-reloadable.
@@ -3617,7 +3628,10 @@ failing recurring `oneshot` stays in `failed` state and silently ends the job.
 
 **API key.** The unit carries `UnsetEnvironment=ANTHROPIC_API_KEY` under the
 policy stated in "Legibility trickle accounts (03:00)" above.
-`nightly_prepare.py` also strips the key from the child's env.
+`nightly_prepare.py` builds the child's env as
+`shared.secret_env.agent_subprocess_env` of its own (no API keys or other
+secrets, no endpoint selection, no Python-env selection), with the lease's
+`CLAUDE_CODE_OAUTH_TOKEN` on top.
 
 **First run: arm the timer.** The installer kicks no immediate run, because
 an off-cadence run would spend a Fable budget nobody scheduled.
@@ -3961,13 +3975,21 @@ cap or outcome row ever recorded the loss. `data.stage` splits it:
 | `stage` | Meaning | `data` |
 |---|---|---|
 | `pre_flight` | We corroborated, found nothing (and could not rehydrate), and dispatched fresh. | `{stage, session_id, role, restore}` — `restore` is the rehydration **outcome**: `disabled` \| `miss` \| `fault` \| `published` (see below) |
-| `cli` | The resume WAS armed and the CLI rejected it; `invoke_with_cap_retry` retried fresh and returned a **success**, so nothing else records the loss. | `{stage, session_id, session_ids, role, fallbacks}` — `fallbacks` is the count of fresh retries this one invocation had to make, `session_ids` the ids they dropped (oldest first; `session_id` is the first, i.e. the resume the orchestrator adopted) |
+| `cli` | The resume WAS armed and the CLI rejected it before any model turn; `invoke_with_cap_retry` retried fresh (a retry that can itself fail), so nothing else records the loss. A resumed run that did work and *then* ended non-success (the `ended_awaiting_background` downgrade, a budget kill) is **not** reported here: it is a surviving resume, returned to the caller. | `{stage, session_id, session_ids, role, fallbacks}` — `fallbacks` is the count of fresh retries this one invocation had to make, `session_ids` the ids they dropped (oldest first; `session_id` is the first, i.e. the resume the orchestrator adopted) |
 
 ```sql
 SELECT json_extract(data, '$.stage') AS stage, COUNT(*)
   FROM events WHERE event_type = 'session_resume_failed'
  GROUP BY stage;
 ```
+
+The steward emits `cli` rows too, carrying `role = 'steward'`. Those are
+live-continuation resumes the `_run_slot` guard never adopted, so filter them
+out of any ratio reading with
+`AND json_extract(data, '$.role') != 'steward'`. Rows written before task 5579
+also include completed-but-downgraded runs: the old branch counted every
+resumed non-success, and 0 of 25 such rows measured on dark_factory and reify
+were rejections.
 
 `data.restore` on the `pre_flight` rows is what tells you *which* thing is
 broken, so split on it before concluding anything:
@@ -3996,7 +4018,8 @@ silently inflates the attempt count. Read it against `session_resume` alone:
 
 That reading holds because BOTH stages are subsets of the adopted-resume
 population by construction: `pre_flight` fires only where a recovered session
-was about to be armed, and `cli` fires only when `_invoke` actually armed one.
+was about to be armed, and a non-steward `cli` row fires only when `_invoke`
+actually armed one.
 The underlying `AgentResult.resume_fallbacks` counter is *wider* than that — it
 also counts a resume `invoke_with_cap_retry` re-armed internally after a cap
 hit, which a plain fresh dispatch can reach — so the emit is gated on the

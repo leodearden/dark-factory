@@ -868,7 +868,7 @@ class TestK2ConcurrencyAndAdvanceOrder:
 def _make_persistent_config(tmp_path: Any) -> OrchestratorConfig:
     """OrchestratorConfig with git.persistent_merge_worktree=True."""
     git = GitConfig(persistent_merge_worktree=True)
-    return OrchestratorConfig(project_root=tmp_path, git=git)
+    return lane_scene_config(tmp_path, git)
 
 
 def _make_liveness_config(
@@ -1354,6 +1354,9 @@ class _ShortSleepClock:
         return time.monotonic()
 
     def newest_content_mtime(self, root: Path) -> float | None:  # noqa: ARG002
+        return None
+
+    def verify_cpu_ticks(self, root: Path) -> int | None:
         return None
 
     async def sleep(self, secs: float) -> None:
@@ -1990,20 +1993,11 @@ def _xcheck_config(*, project_root: Path, cross_check: bool = True) -> Orchestra
     """OrchestratorConfig with the fix-(b) knob explicit, rooted at the caller's
     sandboxed *project_root* — the cross-check LocalRunner's archive_root and
     the runs.db path both derive from it.
-
-    ``escalate_preexisting_main_break=False`` is the FIRST guard both
-    ``_classify_main_health_red`` and ``_spawn_main_health_probe`` apply
-    (merge_queue.py -- the two share a byte-identical guard block), so a
-    config that declines pre-existing-break classification is the operator
-    knob that keeps the probe out of these tests.  The cross-check verdict
-    itself is unaffected: main-health classification runs only AFTER a
-    failure has been adopted.
     """
-    return OrchestratorConfig(
-        git=GitConfig(main_branch='main'),
-        project_root=project_root,
+    return lane_scene_config(
+        project_root,
+        GitConfig(main_branch='main'),
         verify_cross_check_remote_green=cross_check,
-        escalate_preexisting_main_break=False,
     )
 
 
@@ -2476,9 +2470,9 @@ class TestTwoHostFalseGreenCapstone:
         )
 
         # Dispatching host runs the FULL merge-gate profile.
-        full_config = OrchestratorConfig(
-            git=GitConfig(main_branch='main'),
-            project_root=tmp_path,
+        full_config = lane_scene_config(
+            tmp_path,
+            GitConfig(main_branch='main'),
             merge_verify_workspace=True,
             merge_verify_breadth='full',
         )

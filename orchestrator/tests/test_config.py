@@ -3,12 +3,12 @@
 import logging
 import os
 import warnings
-from importlib import resources as pkg_resources
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
 import yaml
+from _packaged_defaults import load_packaged_defaults
 from pydantic import ValidationError
 from shared.project_id import project_id_for_root
 
@@ -40,13 +40,6 @@ from orchestrator.config import (
     load_config,
     project_review_config,
 )
-
-
-def _load_package_defaults() -> dict:
-    """Read the shipped defaults.yaml so tests stay in sync automatically."""
-    defaults_file = pkg_resources.files('orchestrator') / 'defaults.yaml'
-    return yaml.safe_load(defaults_file.read_text())
-
 
 # Shared diagnostic phrase used by both lock_depth boundary tests.
 # Hoisted to module scope so both the positive and negative tests reference one
@@ -102,7 +95,7 @@ class TestDefaults:
     def test_default_values(self):
         """Package defaults.yaml is loaded via settings_customise_sources."""
         config = OrchestratorConfig()
-        defaults = _load_package_defaults()
+        defaults = load_packaged_defaults()
         # Values from package defaults.yaml (not Pydantic field defaults)
         assert config.max_concurrent_tasks == defaults['max_concurrent_tasks']
         assert config.max_per_module == defaults['max_per_module']
@@ -418,7 +411,7 @@ class TestDefaults:
     def test_verify_cold_command_timeout_secs_from_defaults_yaml(self):
         """verify_cold_command_timeout_secs is loaded from defaults.yaml (expected 5400)."""
         config = OrchestratorConfig()
-        defaults = _load_package_defaults()
+        defaults = load_packaged_defaults()
         assert config.verify_cold_command_timeout_secs == defaults['verify_cold_command_timeout_secs']
         assert config.verify_cold_command_timeout_secs == 5400
 
@@ -445,7 +438,7 @@ class TestDefaults:
         gate makes a timeout a queue-stalling block.
         """
         config = OrchestratorConfig()
-        defaults = _load_package_defaults()
+        defaults = load_packaged_defaults()
         assert config.merge_verify_cold_command_timeout_secs == defaults['merge_verify_cold_command_timeout_secs']
         assert config.merge_verify_cold_command_timeout_secs == 7200
 
@@ -530,7 +523,7 @@ class TestDefaults:
         max_consecutive_merge_thrash follow the same pattern.
         """
         config = OrchestratorConfig()
-        defaults = _load_package_defaults()
+        defaults = load_packaged_defaults()
         assert config.max_failure_signature_repeat == defaults['max_failure_signature_repeat']
 
 
@@ -1033,7 +1026,7 @@ class TestLayeredConfig:
         assert config.max_concurrent_tasks == 8
         # Preserved from package defaults
         assert config.models.architect == 'opus'
-        assert config.effort.architect == 'max'
+        assert config.effort.architect == 'xhigh'
 
     def test_deep_merge_preserves_sibling_keys(self, tmp_path):
         """Overriding one key in a nested dict should not clobber siblings."""
@@ -1235,7 +1228,7 @@ class TestParkStopConfig:
         field defaults — any OrchestratorConfig() instantiation will pull the
         YAML values first (via settings_customise_sources).
         """
-        defaults = _load_package_defaults()
+        defaults = load_packaged_defaults()
         assert 'park_stop_enabled' in defaults, (
             "defaults.yaml is missing 'park_stop_enabled'"
         )
@@ -1320,7 +1313,7 @@ class TestMergeVerifyBreadthConfig:
         above), and that value flows through both a bare OrchestratorConfig()
         and load_config() over an otherwise-empty explicit config file.
         """
-        defaults = _load_package_defaults()
+        defaults = load_packaged_defaults()
         assert 'merge_verify_breadth' in defaults, (
             "defaults.yaml is missing 'merge_verify_breadth'"
         )
@@ -2387,7 +2380,7 @@ class TestStarvationWatchdogConfig:
 
     def test_packaged_defaults_keep_thresholds_and_add_knobs(self):
         """The retune is the predicate, not the numbers: both age floors stay 72h."""
-        block = _load_package_defaults()['starvation_watchdog']
+        block = load_packaged_defaults()['starvation_watchdog']
         assert block['idle_secs'] == 259200.0
         assert block['idle_only_secs'] == 259200.0
         assert block['skip_threshold'] == 50
@@ -2618,7 +2611,7 @@ class TestTransientRequeueBackoffConfig:
         Field default) is not re-implemented here.
         """
         config = OrchestratorConfig()
-        defaults = _load_package_defaults()
+        defaults = load_packaged_defaults()
         assert 'transient_requeue_backoff_base_secs' in defaults
         assert 'transient_requeue_backoff_cap_secs' in defaults
         assert (
@@ -3000,7 +2993,7 @@ class TestSimpleTaskRoleConfigAddressability:
         bare submodel Field defaults -- keeps config.py and defaults.yaml in
         lockstep."""
         config = OrchestratorConfig()
-        defaults = _load_package_defaults()
+        defaults = load_packaged_defaults()
         assert config.models.simple_task == defaults['models']['simple_task'] == 'sonnet'
         assert config.budgets.simple_task == defaults['budgets']['simple_task'] == 2.50
         assert config.max_turns.simple_task == defaults['max_turns']['simple_task'] == 50
@@ -3507,7 +3500,7 @@ class TestProgressExtensionConfig:
         bare OrchestratorConfig() (which loads package defaults.yaml via
         settings_customise_sources) picks them up byte-for-byte."""
         config = OrchestratorConfig()
-        defaults = _load_package_defaults()
+        defaults = load_packaged_defaults()
 
         assert defaults['timeouts']['working_idle_secs'] == 1800
         assert config.timeouts.working_idle_secs == defaults['timeouts']['working_idle_secs']
@@ -3598,7 +3591,7 @@ class TestOrchestratorConfigPrices:
         table (task 2459 amendment) — nothing else enforces they agree, so
         assert equality directly to catch future drift.
         """
-        assert default_price_table() == _load_package_defaults()['prices']
+        assert default_price_table() == load_packaged_defaults()['prices']
 
 
 class TestPricesReloadDisposition:
@@ -4452,7 +4445,7 @@ class TestRecoveryEmissionConfig:
         STANZA — not the ``Field(default=...)`` — is what actually applies.  A
         drifted stanza would silently win.
         """
-        defaults = _load_package_defaults()
+        defaults = load_packaged_defaults()
         assert 'recovery_emission' in defaults, (
             'the shipped defaults.yaml must declare the recovery_emission: '
             'block so the knobs are discoverable without reading pydantic source'
@@ -4648,10 +4641,10 @@ class TestProjectReviewConfig:
         review = project_review_config(tmp_path)
 
         assert review.briefing_path == 'docs/review-conventions.yaml'
-        assert review.reports_dir == _load_package_defaults()['review']['reports_dir']
+        assert review.reports_dir == load_packaged_defaults()['review']['reports_dir']
         assert os.environ['ORCH_CONFIG_PATH'] == str(tmp_path / 'some-other-project.yaml')
 
     def test_a_project_without_a_config_file_gets_the_shipped_defaults(self, tmp_path: Path):
         review = project_review_config(tmp_path)
 
-        assert review.briefing_path == _load_package_defaults()['review']['briefing_path']
+        assert review.briefing_path == load_packaged_defaults()['review']['briefing_path']

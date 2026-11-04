@@ -5,8 +5,8 @@ orchestrator config and then hot-reloads it through
 That environment has three parts, each faked here for real rather than by a
 stand-in binary on PATH: the escalation MCP the reload talks to (a loopback
 HTTP server speaking its measured STATEFUL protocol, plus the catalogue of
-ways its transport can fail), the git repo holding the config, and the
-`python3` a caller's shell offers the reload step.
+ways its transport can fail and the reply of a tool that raised), the git repo
+holding the config, and the `python3` a caller's shell offers the reload step.
 
 Stdlib only, and free of pytest, so every consumer imports it by bare name
 (scripts/tests/conftest.py appends scripts/tests to sys.path).
@@ -21,6 +21,7 @@ import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from typing import TypedDict
 
 
 def sse_frame(payload):
@@ -62,7 +63,7 @@ class FakeEscalationMcp:
 
     `initialize_reply` / `tool_call_reply` each override one step of that
     exchange with a literal (status, headers, body) triple, which is how the
-    transport-fault cases below are built without restating the handshake.
+    fault cases below are built without restating the handshake.
     `faults_armed` gates both overrides: they bite only while it answers True,
     so a fault can wait for a landing to happen first. `tool_call_delay`
     holds the authenticated `tools/call` reply back that many seconds
@@ -213,6 +214,15 @@ class FakeEscalationMcp:
         self._thread.join(timeout=5)
 
 
+class McpFault(TypedDict, total=False):
+    """The FakeEscalationMcp keyword arguments that inject one fault, each
+    overriding one step of the exchange with a literal (status, headers, body)
+    reply."""
+
+    initialize_reply: tuple[int, dict[str, str], str]
+    tool_call_reply: tuple[int, dict[str, str], str]
+
+
 def reload_report(**overrides):
     """A reload report in orchestrator/src/orchestrator/harness.py::
     reload_config's return shape, every field defaulted so each test states
@@ -252,17 +262,8 @@ ENVELOPE_LEVEL_ERROR = (
                "error": {"code": -32602, "message": "Unknown tool: reload_config"}}),
 )
 
-TOOL_IS_ERROR = (
-    200,
-    {"Content-Type": "text/event-stream"},
-    sse_frame({"jsonrpc": "2.0", "id": 1, "result": {
-        "isError": True,
-        "content": [{"type": "text", "text": "ToolError: reload_config failed"}],
-    }}),
-)
-
-# id -> FakeEscalationMcp keyword arguments.
-TRANSPORT_FAULTS = {
+# id -> fault.
+TRANSPORT_FAULTS: dict[str, McpFault] = {
     # The shape a raw single-shot POST hits against the live server today --
     # the direct regression test for the defect.
     "always_400": {"initialize_reply": FakeEscalationMcp.MISSING_SESSION_REPLY},
@@ -272,8 +273,6 @@ TRANSPORT_FAULTS = {
     "initialize_assigns_no_session": {"initialize_reply": INITIALIZE_WITHOUT_A_SESSION},
     # The request reached the server but never a tool.
     "envelope_level_error": {"tool_call_reply": ENVELOPE_LEVEL_ERROR},
-    # FastMCP's shape for a raised ToolError: the tool ran and failed.
-    "tool_is_error": {"tool_call_reply": TOOL_IS_ERROR},
 }
 
 
@@ -290,6 +289,24 @@ class ClosedPort:
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", 0))
             self.port = probe.getsockname()[1]
+
+
+# ---------------------------------------------------------------------------
+# A tool that ran and raised
+# ---------------------------------------------------------------------------
+
+TOOL_IS_ERROR = (
+    200,
+    {"Content-Type": "text/event-stream"},
+    sse_frame({"jsonrpc": "2.0", "id": 1, "result": {
+        "isError": True,
+        "content": [{"type": "text", "text": "ToolError: reload_config failed"}],
+    }}),
+)
+
+# FastMCP's shape for a raised ToolError: the request reached the tool, which
+# ran and failed, so unlike every TRANSPORT_FAULTS entry it may have acted.
+TOOL_RAISED: McpFault = {"tool_call_reply": TOOL_IS_ERROR}
 
 
 # ---------------------------------------------------------------------------

@@ -29,7 +29,6 @@ import sys
 from pathlib import Path
 
 import pytest
-from _task_db_scan import TaskDbProblem, TaskDbUnreadable
 from audit_delivered_checks import (
     _TASK_IN_SUBJECT_RE,
     DISPOSITION_BROKEN,
@@ -56,6 +55,7 @@ from audit_delivered_checks import (
     stale_path_is_actionable,
 )
 from shared.delivered_check_polarity import CheckOutcome
+from shared.tasks_db_readonly import TaskDbProblem, TaskDbUnreadable
 
 # ---------------------------------------------------------------------------
 # classify_descriptor — the pure core, and the whole point of the script.

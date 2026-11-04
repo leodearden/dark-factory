@@ -25,6 +25,7 @@ from pathlib import Path
 
 import pytest
 from config_reload_script_fakes import (
+    TOOL_RAISED,
     TRANSPORT_FAULTS,
     ClosedPort,
     FakeEscalationMcp,
@@ -342,6 +343,33 @@ def test_a_reload_that_never_reached_the_tool_fails_closed(tmp_path, deploy_env,
     assert "applied disposition missing" not in proc.stderr, (
         f"a request that never reached the tool was blamed on the disposition: {proc.stderr}"
     )
+    assert "Traceback" not in proc.stderr, f"stderr={proc.stderr}"
+    _assert_left_nothing_behind(repo, deploy_env)
+
+
+TOOL_RAISED_MARKER = "reload_config ran and failed"
+
+
+def test_a_reload_that_raised_fails_closed_naming_the_tool(tmp_path, deploy_env):
+    """reload_config was reached and raised once the cap had landed: the
+    failure names the TOOL, which may have applied the cap before failing,
+    never a transport that did not deliver it."""
+    config = _seeded(tmp_path)
+    repo = config.parent
+    queue = FakeMergeQueue(repo)
+
+    with _target(queue, reload_report(config_path=str(config), applied=APPLIED_6),
+                 faults_armed=queue.has_landed, **TOOL_RAISED) as server:
+        proc = _run(server, config, "6", env=deploy_env)
+
+    assert proc.returncode != 0, f"a raised reload was read as success: {proc.stdout}"
+    landed_as = head(repo)
+    assert queue.has_landed() and landed_as == queue.merge_sha
+    assert TOOL_RAISED_MARKER in proc.stderr, f"stderr={proc.stderr}"
+    assert landed_as in proc.stderr, f"stderr={proc.stderr}"
+    assert "lands at the next restart" in proc.stderr, f"stderr={proc.stderr}"
+    assert TRANSPORT_MARKER not in proc.stderr, f"stderr={proc.stderr}"
+    assert "applied disposition missing" not in proc.stderr, f"stderr={proc.stderr}"
     assert "Traceback" not in proc.stderr, f"stderr={proc.stderr}"
     _assert_left_nothing_behind(repo, deploy_env)
 

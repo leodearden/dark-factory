@@ -1412,7 +1412,8 @@ This task was paused because an agent escalated a blocking issue.
 
 {prior_proposal_section}
 ## Action
-Resume the task applying the handler's resolution. The prior agent's work
+Resume the task applying the resolution(s) that answer this round's
+escalation(s), each attributed to its escalation id. The prior agent's work
 is preserved in the worktree. Read `.task/plan.json` (a symlink into the
 durable `<worktree_base>/.task-meta/<worktree-name>/plan.json`, which survives
 worktree resets) and `<worktree_base>/.task-meta/<worktree-name>/iterations.jsonl`
