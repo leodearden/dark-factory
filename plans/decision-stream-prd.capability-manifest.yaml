@@ -6,7 +6,7 @@ schema_version: 1
 signal_leaves: ["ι"]
 tasks:
   - label: "α"
-    task_id: null
+    task_id: 8422
     title: "Policy table, executor and coordinator identities, class claim, shadow-vocabulary lockstep"
     capabilities:
       - name: "policy-table"
@@ -48,7 +48,7 @@ tasks:
           kind: manual
           reason: "behaviour judged by α's own server tests, not a grep"
   - label: "β"
-    task_id: null
+    task_id: 8423
     title: "Role-parameterised rotation supervisor, executor rotation, rotation events, inflight record, executor config"
     capabilities:
       - name: "rotation-spec"
@@ -84,7 +84,7 @@ tasks:
           paths: ["orchestrator/src/orchestrator/config.py"]
           expect: present
   - label: "γ"
-    task_id: null
+    task_id: 8424
     title: "Executor skill: per-class procedures, red-main class, B3 class, worktree-only rule, inflight protocol, recon rows"
     capabilities:
       - name: "executor-skill"
@@ -102,7 +102,7 @@ tasks:
           paths: ["tests/scripts/test_executor_skill_policy_contract.py"]
           expect: present
   - label: "δ1"
-    task_id: null
+    task_id: 8425
     title: "Sitting tooling: apply, audit, policy-state, ports module, random audit draw, docket blocks"
     capabilities:
       - name: "ports-module"
@@ -135,7 +135,7 @@ tasks:
           kind: manual
           reason: "verb name and module are δ1's tactical choice (PRD §9 q4); η1/η2 judge it at the gate"
   - label: "δ2"
-    task_id: null
+    task_id: 8426
     title: "Sitting skill"
     capabilities:
       - name: "sitting-skill"
@@ -146,7 +146,7 @@ tasks:
           paths: ["skills/sitting/SKILL.md"]
           expect: present
   - label: "ε"
-    task_id: null
+    task_id: 8427
     title: "Criteria-triggered sitting: evaluator, presence probe, lanes, lease, cooldown, timer"
     capabilities:
       - name: "trigger-evaluator"
@@ -164,7 +164,7 @@ tasks:
           paths: ["scripts/sitting-trigger.timer"]
           expect: present
   - label: "ζ"
-    task_id: null
+    task_id: 8428
     title: "Q6 detector rules in the L1 skill, tier-10 move, recon-queue precheck note"
     capabilities:
       - name: "l1-skill-q6-rules"
@@ -174,7 +174,7 @@ tasks:
           kind: manual
           reason: "rule wording is ζ's; no stable grep anchor exists before it is written"
   - label: "η1"
-    task_id: null
+    task_id: 8429
     title: "Flip gate: moved classes to live at n ≥ 10 and ≥ 95% agreement (human gate)"
     note: "Split from PRD η at decompose so 3346 gates only the new classes (decision 7)."
     capabilities:
@@ -185,7 +185,7 @@ tasks:
           kind: manual
           reason: "Leo's per-class ruling"
   - label: "η2"
-    task_id: null
+    task_id: 8430
     title: "Flip gate: new delegations to live at n ≥ 10 and ≥ 95% agreement, after 3346 (human gate)"
     note: "Split from PRD η at decompose; carries the 3346 dependency."
     capabilities:
@@ -196,7 +196,7 @@ tasks:
           kind: manual
           reason: "Leo's per-class ruling"
   - label: "θ1"
-    task_id: null
+    task_id: 8432
     title: "Retire resident watchers: escalation-watcher → pointer, delete recon-watch launchers, docs, lease reap"
     note: "Split from PRD θ at decompose; the dated Q6 check is θ2."
     capabilities:
@@ -208,7 +208,7 @@ tasks:
           paths: ["recon-watch/run.sh"]
           expect: absent
   - label: "θ2"
-    task_id: null
+    task_id: 8433
     title: "14-day Q6 clean check; flip df streak_escalation_enabled on a clean verdict"
     note: "Split from PRD θ at decompose; hangs off ζ, not η."
     capabilities:
@@ -230,7 +230,7 @@ tasks:
           kind: manual
           reason: "foreign registry; conditional"
   - label: "κ"
-    task_id: null
+    task_id: 8431
     title: "Deploy gate: install and enable sitting-trigger.timer (human gate)"
     capabilities:
       - name: "timer-installed"
@@ -240,7 +240,7 @@ tasks:
           kind: manual
           reason: "systemctl --user list-timers is a host check"
   - label: "ι"
-    task_id: null
+    task_id: 8434
     title: "Observation 7 days after η1 and θ1: the producers wrote in production (INV-13)"
     capabilities:
       - name: "production-observation-recorded"
