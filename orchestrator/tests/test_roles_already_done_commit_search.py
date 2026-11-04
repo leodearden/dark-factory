@@ -25,7 +25,7 @@ PATH = 'mod.py'
 
 @dataclass(frozen=True)
 class SearchHistory:
-    """A main whose ``mod.py`` gained SYMBOL twice, beside an unmerged sibling."""
+    """A main whose ``mod.py`` gained SYMBOL twice, checked out on an unmerged sibling."""
 
     root: Path
     sha_side: str
@@ -54,7 +54,7 @@ def history(tmp_path: Path) -> SearchHistory:
     git(root, 'commit', '-m', 'later: a second definition')
     sha_later = git(root, 'rev-parse', 'HEAD')
 
-    git(root, 'checkout', '-b', 'task/9')
+    git(root, 'checkout', 'task/8')
     return SearchHistory(root=root, sha_side=sha_side, sha_feat=sha_feat, sha_later=sha_later)
 
 
