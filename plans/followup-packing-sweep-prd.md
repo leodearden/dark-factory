@@ -891,3 +891,45 @@ committed (`c393a67c54`, tasks 8438–8441): decision 7 names `rider_of` exactly
 `rider_ledger.last_decline_reason` as a same-parent pack hint (`different_intent` → pack with
 siblings; absent → no hint); §5 cites PRD 3 as committed with its task ids and records that γ 8440
 will depend on P1 once filed.
+
+## Decompose record (2026-11-04)
+
+Decomposed against main `eb84ac9f41` by the PRD 2 decompose seat. The manifest and sidecar were committed
+at `28ff3cc7de` and the stamped sidecar at `646bd7235b`, both as
+`plans/followup-packing-sweep-prd.capability-manifest.{md,yaml}`, with `signal_leaves: [P3]`. There are 48
+grep checks (no `script`, no `path`) and 8 manual ones; the local polarity lint returned 0 findings and
+`shared/tests/test_capability_manifest.py` passed (551).
+
+| label | id | prereqs (edges) | prio |
+|---|---|---|---|
+| P0 | 8451 | 8413 (PRD 1 α), 8414 (PRD 1 β) | high |
+| P1 | 8452 | 8451, 8417 (PRD 1 ε) | high |
+| P2 | 8453 | 8452, 8415 (PRD 1 γ), 8418 (PRD 1 ζ), 8142 and 8143 (cancel-with-children α, β; both `pending` on 2026-11-04) | high |
+| P3 | 8454 | 8453 | medium |
+| Φ | 8455 | 8452, 8454; deterministic, `always_escalates`, `execution_class: decision`, `milestone {delayed, 604800}` (clock starts when both are done) | medium |
+
+Edges: 5 intra-batch, 7 out-of-batch. P0–P3 are `task_kind="normal"`; every task is pending. No task depends
+on a blocked task (6707 is not an edge, §5). `commit_planning` stamped P0, P1, P2, P3 and Φ with no missing
+labels or errors; `delivered_checks` copied: P0 19, P1 11, P2 15, P3 3, Φ 0. P0 and P2 carry
+`g7_waivers: []`, as §6 states; the G7 re-walk found no unresolved hit, so no waiver.
+
+**Companion corrections.** `8440 → 8452` wired (PRD 3 γ's pending edge, its §5 row and decompose record),
+with a details note on 8440. A details note on 6322: the packer excludes `dedupe_skipped` tasks until its
+sweep clears the marker, and it may reuse P1's loop host (no edge). 5197 is done (no write). 8417's waiver
+rationale and PRD 1 decision 15 / row ε already read "the packing sweep and riders are the drains, bounded by
+θ's report" (`dc1981e7a2` and the 8417 details note), so nothing was re-written. The cancel-with-children
+§4.14 "pack executor" row is P2's edit.
+
+**Resolved at decompose** (no contract change; carried into the descriptions):
+
+1. G6, P0's fixture premise: an independent re-implementation of §4.1 over the committed pool dump
+   reproduced all four CSV runs as sets of (generator, member set). It depends on three facts this PRD did
+   not spell out, now in P0's description and the manifest: the v1 recipe regexes (only in the untracked
+   seat notes and a `/tmp` script; quoted verbatim in 8451's details, and matching the dump's `recipe_v1`
+   on 2,517 of 2,517 titles); the hub share is over the whole held pool, fileless members included; an
+   absent `pending_since` (reify 7951) reads as oldest, never reserved.
+2. Name correction: `fused-memory/tests/test_task_interceptor_curator.py` (§4.5 row 22, §6 P2) does not
+   exist; the combine tests live in `fused-memory/tests/test_task_interceptor.py`, which is in P2's files.
+3. INV-8 note on P1: member assembly is one bulk read per project, never a `get_task` per member.
+4. P0 records `rider_ledger.last_decline_reason` on the proposal as a hint only; acting on it in generation
+   is a v2 candidate (critic's final nit).
