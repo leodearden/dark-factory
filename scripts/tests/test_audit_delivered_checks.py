@@ -29,6 +29,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from _task_db_scan import decode_metadata
 from audit_delivered_checks import (
     _TASK_IN_SUBJECT_RE,
     DISPOSITION_BROKEN,
@@ -328,6 +329,28 @@ class TestLoadTaskIndex:
         assert [r.task_id for r in index.metadata_rows] == [14]
         assert index.stamped_names == {(14, 'ok')}
         assert set(index.statuses) == {12, 13, 14}
+
+    def test_metadata_is_decoded_as_the_sibling_audits_decode_it(self, make_tasks_db):
+        # A BLOB-typed metadata column is still metadata: the decoder every
+        # audit script shares accepts bytes, so this one must too.
+        db = make_tasks_db([{'id': 18, 'status': 'done'}])
+        blob = json.dumps({
+            'delivered_checks': [
+                {'name': 'blob', 'kind': 'grep', 'pattern': 'X', 'expect': 'present'}
+            ]
+        }).encode()
+        conn = sqlite3.connect(db)
+        try:
+            conn.execute('UPDATE tasks SET metadata = ? WHERE id = 18', (blob,))
+            conn.commit()
+        finally:
+            conn.close()
+
+        index = load_task_index(str(db))
+
+        assert [(r.task_id, r.name) for r in index.metadata_rows] == [(18, 'blob')]
+        assert index.stamped_names == {(18, 'blob')}
+        assert 'delivered_checks' in decode_metadata(blob)
 
     def test_connection_is_read_only(self, make_tasks_db):
         # READ-ONLY/REPORT-ONLY is a structural guarantee, not a convention:
