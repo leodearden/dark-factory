@@ -710,11 +710,18 @@ for the reason vocabulary). Per-leaf capability→evidence bindings:
   > - **The profile** is `orchestrator/src/orchestrator/evals/shadow_invocation.py::build_shadow_orch_config`.
   >   Strict MCP and the null memory endpoint are inherited from `EVAL_PROFILE`, not re-set.
   >   `run_eval` and `run_end_to_end` take it as `orch_config_builder`.
+  > - **ε2 (task 5388) runs a shadow cell only through**
+  >   `orchestrator/src/orchestrator/evals/shadow_invocation.py::run_shadow_eval` or `::run_shadow_end_to_end`.
+  >   Both fix that builder, so the profile the probe checks is the profile the cell runs under.
   > - **The coordinator's isolation dep** is
-  >   `orchestrator/src/orchestrator/evals/shadow_invocation.py::shadow_isolation_available`. Its
-  >   findings come from `probe_isolation` over the legs `shadow_leg_invocations` builds. Beyond
-  >   strict MCP, memory and containment, it also refuses a sandboxed leg whose backend resolves
-  >   to `none` (`sandbox_unwrapped`).
+  >   `orchestrator/src/orchestrator/evals/shadow_isolation.py::shadow_isolation_available`. Its
+  >   findings come from `probe_isolation` over the legs `shadow_leg_invocations` builds, and a
+  >   probe that cannot build its legs fails closed. Beyond strict MCP, memory and containment, it
+  >   also refuses a sandboxed leg whose backend resolves to `none` (`sandbox_unwrapped`). It refuses
+  >   any leg carrying an MCP server that is not spawned per invocation (`live_mcp_server`). A
+  >   workflow leg's servers come from
+  >   `orchestrator/src/orchestrator/workflow.py::compose_invocation_mcp_config`, the composition
+  >   `TaskWorkflow._invoke` dispatches with.
 
 - **ω — ZCode harness arm** *(leaf, probe-gated, task **5399**)*. **Stage 1 is a gate:** probe
   whether ZCode can be driven by the eval runner at all — a headless/non-interactive invocation,
