@@ -211,6 +211,20 @@ def test_an_empty_tree_is_rejected(tmp_path: Path) -> None:
         RepoSeed.from_tree(src, 'm')
 
 
+@pytest.mark.parametrize('make_root', [
+    pytest.param(lambda root: None, id='missing'),
+    pytest.param(lambda root: root.write_text('not a tree\n', encoding='utf-8'), id='a-file'),
+])
+def test_a_missing_tree_is_rejected_by_path(
+    make_root: Callable[[Path], object], tmp_path: Path,
+) -> None:
+    root = tmp_path / 'atomic_train'
+    make_root(root)
+
+    with pytest.raises(ValueError, match=re.escape(str(root))):
+        RepoSeed.from_tree(root, 'm')
+
+
 def test_a_tree_symlink_is_rejected_by_path(tmp_path: Path) -> None:
     src = tmp_path / 'src'
     _write_workspace_tree(src)

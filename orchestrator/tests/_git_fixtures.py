@@ -53,6 +53,8 @@ class RepoSeed:
     @classmethod
     def from_tree(cls, root: Path, message: str) -> RepoSeed:
         """Seed every file under *root*; one a text seed cannot carry raises, naming it."""
+        if not root.is_dir():
+            raise ValueError(f'a tree seed needs a directory: {root}')
         return cls(
             files=tuple(
                 (path.relative_to(root).as_posix(), _plain_text_of(path))
