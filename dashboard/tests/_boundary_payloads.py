@@ -23,6 +23,7 @@ import httpx
 from _canned_mcp import CannedMCP, _raw_row
 from _dt_helpers import make_fixed_datetime_cls
 from _prd_tree import prd_tree_tasks
+from _runs_db_fixture import EVENTS_DDL, runs_db_path
 from escalation.archive import archive_dir_for_date
 from escalation.models import DeliveredCheckOwner, Escalation
 from escalation.queue import EscalationQueue
@@ -109,24 +110,6 @@ MERGE_ATTEMPTS: tuple[MergeAttempt, ...] = (
     MergeAttempt(timedelta(hours=70), 'done', 3000),
 )
 """One project's merges over three days: three inside 24h, all six inside 7d."""
-
-# The orchestrator's runs.db events table, as orchestrator/src/orchestrator/
-# event_store.py::_SCHEMA creates it; the dashboard does not depend on that package.
-_EVENTS_DDL = """\
-CREATE TABLE events (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp   TEXT    NOT NULL,
-    run_id      TEXT    NOT NULL,
-    task_id     TEXT,
-    event_type  TEXT    NOT NULL,
-    phase       TEXT,
-    role        TEXT,
-    data        TEXT    DEFAULT '{}',
-    cost_usd    REAL,
-    duration_ms INTEGER
-);
-"""
-
 
 ESCALATIONS_FILED = 5
 ESCALATIONS_ARCHIVED = 3
@@ -382,10 +365,10 @@ def _burndown_family(client: TestClient, workdir: Path) -> dict[str, Any]:
 
 def _write_merge_attempts(root: Path) -> None:
     """*root*'s runs.db, holding :data:`MERGE_ATTEMPTS` as task ids 1, 2, ..."""
-    store = root / 'data' / 'orchestrator' / 'runs.db'
+    store = runs_db_path(root)
     store.parent.mkdir(parents=True)
     with closing(sqlite3.connect(store)) as conn:
-        conn.executescript(_EVENTS_DDL)
+        conn.executescript(EVENTS_DDL)
         conn.executemany(
             'INSERT INTO events (timestamp, run_id, task_id, event_type, phase, data, duration_ms) '
             "VALUES (?, ?, ?, 'merge_attempt', 'merge', ?, ?)",
