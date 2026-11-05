@@ -8,6 +8,7 @@ gap stands. No host probe runs: every backend resolution is injected.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import pytest
@@ -49,6 +50,14 @@ def _landlock() -> Backend:
 
 def _no_backend() -> Backend:
     return 'none'
+
+
+class _BackendProbeFailed(RuntimeError):
+    pass
+
+
+def _failing_backend() -> Backend:
+    raise _BackendProbeFailed('backend probe exploded')
 
 
 def _shadow_fixture(project_root: Path) -> dict:
@@ -195,6 +204,37 @@ def test_an_empty_probe_refuses_to_claim_isolation() -> None:
         probe_isolation(())
 
 
+def test_shadow_isolation_available_refuses_and_logs_every_finding(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    base = OrchestratorConfig(project_root=tmp_path)
+    findings = probe_isolation(shadow_leg_invocations(base, resolve_backend=_no_backend)).findings
+
+    with caplog.at_level(logging.WARNING, logger='orchestrator.evals.shadow_isolation'):
+        available = shadow_isolation_available(base, resolve_backend=_no_backend)
+
+    assert available is False
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == len(findings) > 0
+    for finding, message in zip(findings, warnings, strict=True):
+        assert finding.role in message
+        assert str(finding.gap) in message
+
+
+def test_a_probe_that_cannot_build_its_legs_fails_closed(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    base = OrchestratorConfig(project_root=tmp_path)
+
+    with caplog.at_level(logging.ERROR, logger='orchestrator.evals.shadow_isolation'):
+        available = shadow_isolation_available(base, resolve_backend=_failing_backend)
+
+    assert available is False
+    [record] = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert record.exc_info is not None
+    assert isinstance(record.exc_info[1], _BackendProbeFailed)
+
+
 @pytest_asyncio.fixture
 async def costs(tmp_path):
     async with CostStore(tmp_path / 'runs.db') as store:
@@ -202,13 +242,16 @@ async def costs(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'resolve_backend', [_no_backend, _failing_backend], ids=['gap-found', 'probe-failed'],
+)
 async def test_the_coordinator_skips_a_cell_whose_profile_does_not_isolate(
-    tmp_path: Path, costs: CostStore,
+    tmp_path: Path, costs: CostStore, resolve_backend,
 ) -> None:
-    production_legs = (_production_implementer_leg(tmp_path),)
+    base = OrchestratorConfig(project_root=tmp_path)
     rig = build_coordinator(
         tmp_path, costs,
-        isolation_probe=lambda: not probe_isolation(production_legs).isolation_unavailable,
+        isolation_probe=lambda: shadow_isolation_available(base, resolve_backend=resolve_backend),
     )
 
     opened = await rig.coordinator.on_phase(make_task('5387'), WorkflowState.PLAN, entering=False)

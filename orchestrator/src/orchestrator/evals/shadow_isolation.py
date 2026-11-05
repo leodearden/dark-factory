@@ -225,8 +225,17 @@ def shadow_isolation_available(
     *,
     resolve_backend: Callable[[], Backend] = resolve_active_backend,
 ) -> bool:
-    """Whether a shadow cell on *base_config*'s project may open; the coordinator's isolation dep."""
-    verdict = probe_isolation(shadow_leg_invocations(base_config, resolve_backend=resolve_backend))
+    """Whether a shadow cell on *base_config*'s project may open; the coordinator's isolation dep.
+
+    A probe that cannot build its legs fails closed, so the coordinator still
+    names the skip ``isolation_unavailable``.
+    """
+    try:
+        legs = shadow_leg_invocations(base_config, resolve_backend=resolve_backend)
+    except Exception:
+        logger.exception('shadow isolation unavailable: the probe could not build its legs')
+        return False
+    verdict = probe_isolation(legs)
     for finding in verdict.findings:
         logger.warning(
             'shadow isolation unavailable: %s leg %s has %s (%s)',
