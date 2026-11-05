@@ -10,12 +10,16 @@ from __future__ import annotations
 import ast
 import asyncio
 import dataclasses
+import importlib.util
 import math
 from collections.abc import Mapping
+from pathlib import Path
+from types import ModuleType
 
 import pytest
 from _wait_budget_audit import (
     AMBIENT_TEST_TIMEOUT,
+    RESPONSIVE_WAIT_HELPERS,
     ItemWaitAudit,
     LimitSource,
     audit_module,
@@ -869,6 +873,44 @@ class TestPollResponsive:
 
         assert is_responsive_wait_call(node) is is_responsive, (
             f'is_responsive_wait_call({call!r}) should be {is_responsive}'
+        )
+
+
+# Rule C's checker: stdlib-only, so it holds a literal copy of the responsive
+# helper names that this package derives from the helpers themselves.
+_RULE_C_CHECKER_PATH = (
+    Path(__file__).resolve().parents[2]
+    / 'fused-memory'
+    / 'scripts'
+    / 'check_bare_magicmock_config.py'
+)
+
+
+def _load_rule_c_checker() -> ModuleType:
+    """A fresh copy of the Rule C checker, loaded by path: it is a script."""
+    spec = importlib.util.spec_from_file_location(
+        '_rule_c_checker_for_wait_budget_audit', _RULE_C_CHECKER_PATH
+    )
+    assert spec is not None and spec.loader is not None, (
+        f'no import spec for {_RULE_C_CHECKER_PATH}'
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class TestRuleCRecognisesTheBilledHelpers:
+    def test_rule_c_and_the_audit_name_the_same_responsive_helpers(self) -> None:
+        """A helper the audit bills and leak-scans must also be a Rule C
+        call shape, or a raw literal bound on it escapes the lint."""
+        checker = _load_rule_c_checker()
+
+        assert set(checker.RESPONSIVE_WAIT_HELPERS) == RESPONSIVE_WAIT_HELPERS, (
+            'RESPONSIVE_WAIT_HELPERS in fused-memory/scripts/'
+            'check_bare_magicmock_config.py must name exactly the helpers '
+            'orchestrator/tests/_wait_budget_audit.py::RESPONSIVE_WAIT_HELPERS '
+            f'names: {sorted(checker.RESPONSIVE_WAIT_HELPERS)} != '
+            f'{sorted(RESPONSIVE_WAIT_HELPERS)}'
         )
 
 

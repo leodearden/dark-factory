@@ -519,15 +519,15 @@ class TestResponsiveHelperRegistry:
     def test_each_helper_is_a_top_level_async_def_at_its_registered_home(self):
         """Parsed, never imported: the homes are orchestrator test helpers.
 
-        `_RESPONSIVE_WAIT_HELPERS` is a stdlib-only literal copy, so a rename or a
+        `RESPONSIVE_WAIT_HELPERS` is a stdlib-only literal copy, so a rename or a
         move would otherwise silently blind the call leg to that helper and leave
         every message citing a path that no longer resolves.
         """
-        for name, helper in _checker._RESPONSIVE_WAIT_HELPERS.items():
+        for name, helper in _checker.RESPONSIVE_WAIT_HELPERS.items():
             home = _REPO_ROOT / helper.home
             assert home.is_file(), (
                 f'{name}: home {helper.home!r} is not a file; update '
-                '`_RESPONSIVE_WAIT_HELPERS` in fused-memory/scripts/check_bare_magicmock_config.py'
+                '`RESPONSIVE_WAIT_HELPERS` in fused-memory/scripts/check_bare_magicmock_config.py'
             )
             module = ast.parse(home.read_text(encoding='utf-8'))
             async_defs = {
@@ -535,7 +535,7 @@ class TestResponsiveHelperRegistry:
             }
             assert name in async_defs, (
                 f'{name} is not a top-level async def of {helper.home!r}; update '
-                '`_RESPONSIVE_WAIT_HELPERS` in fused-memory/scripts/check_bare_magicmock_config.py'
+                '`RESPONSIVE_WAIT_HELPERS` in fused-memory/scripts/check_bare_magicmock_config.py'
             )
 
     @pytest.mark.parametrize(
@@ -552,7 +552,7 @@ class TestResponsiveHelperRegistry:
     )
     def test_each_routing_remedy_cites_its_helper_at_its_registered_home(self, source, helper):
         [violation] = _rule_c(source)
-        citation = f'{_checker._RESPONSIVE_WAIT_HELPERS[helper].home}::{helper}'
+        citation = f'{_checker.RESPONSIVE_WAIT_HELPERS[helper].home}::{helper}'
 
         assert citation in violation.message, violation.message
 

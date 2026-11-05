@@ -940,10 +940,12 @@ class _ResponsiveHelper(NamedTuple):
 
 # The responsive wait helpers by the name a call site spells.  A stdlib-only literal
 # copy of where they live, which this checker cannot import — the same precedent as
-# ``_DATACLASS_SHAPES``, guarded the same way: each ``home`` is parsed for its helper by
-# fused-memory/tests/test_wall_clock_poll_deadlines.py::TestResponsiveHelperRegistry.
+# ``_DATACLASS_SHAPES``, guarded from both sides.  Each ``home`` is parsed for its helper by
+# fused-memory/tests/test_wall_clock_poll_deadlines.py::TestResponsiveHelperRegistry,
+# and the name set must equal the one the wait-budget audit derives from the helpers
+# themselves (orchestrator/tests/test_wait_budget_audit.py::TestRuleCRecognisesTheBilledHelpers).
 # A responsive helper is itself the remedy, so only its raw-literal kind ever applies.
-_RESPONSIVE_WAIT_HELPERS: dict[str, _ResponsiveHelper] = {
+RESPONSIVE_WAIT_HELPERS: dict[str, _ResponsiveHelper] = {
     'wait_responsive': _ResponsiveHelper(
         home='orchestrator/tests/_orch_helpers.py', describe=_load_bearing_wait_target
     ),
@@ -955,7 +957,7 @@ _RESPONSIVE_WAIT_HELPERS: dict[str, _ResponsiveHelper] = {
 
 def _helper_ref(name: str) -> str:
     """Cite responsive helper *name* as ``<home>::<name>``."""
-    return f'{_RESPONSIVE_WAIT_HELPERS[name].home}::{name}'
+    return f'{RESPONSIVE_WAIT_HELPERS[name].home}::{name}'
 
 
 _WAIT_RESPONSIVE_REF = _helper_ref('wait_responsive')
@@ -1154,7 +1156,7 @@ def _wait_call_violations(call: ast.Call, lines: list[str], filename: str) -> li
     Gating order is cheapest-first, and deliberately so:
       1. the call has at least one positional argument (no ``args[0]`` to inspect
          otherwise — and a bare ``asyncio.wait_for()`` must be skipped, not crash);
-      2. the func is ``asyncio.wait_for`` or a ``_RESPONSIVE_WAIT_HELPERS`` helper;
+      2. the func is ``asyncio.wait_for`` or a ``RESPONSIVE_WAIT_HELPERS`` helper;
       3. that shape's describer recognises ``args[0]`` (``_load_bearing_wait_target``,
          except a ``poll_responsive`` predicate, which is always load-bearing).
     Only then is the exemption line-walk run, so the upward walk keeps Rule B's cost
@@ -1172,8 +1174,8 @@ def _wait_call_violations(call: ast.Call, lines: list[str], filename: str) -> li
     is_bare_wait_for = _asyncio_function_name(call) == 'wait_for'
     if is_bare_wait_for:
         describe = _load_bearing_wait_target
-    elif isinstance(func, ast.Name) and func.id in _RESPONSIVE_WAIT_HELPERS:
-        describe = _RESPONSIVE_WAIT_HELPERS[func.id].describe
+    elif isinstance(func, ast.Name) and func.id in RESPONSIVE_WAIT_HELPERS:
+        describe = RESPONSIVE_WAIT_HELPERS[func.id].describe
     else:
         return []
 
