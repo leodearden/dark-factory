@@ -205,6 +205,10 @@ class EventType(StrEnum):
     # PLUS three always-present, nullable keys (task 5651): plan_hash,
     # cache_mode and units, defined by
     # orchestrator/src/orchestrator/verify_evidence.py::verify_event_fields.
+    # PLUS two always-present, nullable keys (task 8523): runner_reason (why
+    # the verify ran on that host) and base_relation (what the merge was built
+    # on); vocabulary in orchestrator/src/orchestrator/merge_verify_facts.py,
+    # rationale in plans/merge-lane-policy-prd.md D10.
     merge_verify = 'merge_verify'
     # A merge-role scoped-verify red that the isolated-rerun-confirm gate
     # (verify.apply_merge_flake_suppression, PRD task α) demonstrated was a

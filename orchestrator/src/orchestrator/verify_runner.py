@@ -66,7 +66,7 @@ from orchestrator import flake_ledger, verify
 from orchestrator.config import EnvProbeConfig, ModuleConfig, VerifyHostPolicy
 from orchestrator.deployed_sha import DeployedSha, resolve_code_checkout
 from orchestrator.event_store import EventType
-from orchestrator.merge_verify_facts import RunnerReason
+from orchestrator.merge_verify_facts import MergeVerifyDispatchFacts, RunnerReason
 from orchestrator.remote_gate import (
     ENSURE_CLIENT_TIMEOUT_SECS,
     SHIM_REMEDY,
@@ -2531,6 +2531,7 @@ class VerifyRunnerPool:
         speculative: bool | None = None,
         chain_items: int = 1,
         chain_build_ms: int | None = None,
+        dispatch_facts: MergeVerifyDispatchFacts | None = None,
     ) -> VerifyResult:
         """Run the verify bundle and emit a merge_verify event.
 
@@ -2585,6 +2586,12 @@ class VerifyRunnerPool:
         ``merge_verify`` doc-comment in ``event_store.py`` for the full field
         note.
 
+        ``dispatch_facts`` (task 8523) supplies ``runner_reason`` and
+        ``base_relation``; both keys are always present, None when the caller
+        reported no allocation decision.  A RunnerUnavailable fallback to
+        local reports ``remote_quarantined``.  Vocabulary:
+        ``orchestrator/merge_verify_facts.py``.
+
         Fail-safe (PRD §A Invariant 2 / D5): if the selected runner raises
         RunnerUnavailable, dispatch reports it to the pool's *on_unavailable*
         sink and falls back to the local runner (if distinct), logging exactly
@@ -2631,6 +2638,10 @@ class VerifyRunnerPool:
                 # RunnerUnavailable→local fallback: always 2-arg (local never archives remote stderr)
                 result = await self._local.run_merge_verify(merge_sha, spec)
                 actual_runner = self._local
+                dispatch_facts = dataclasses.replace(
+                    dispatch_facts or MergeVerifyDispatchFacts(),
+                    runner_reason=RunnerReason.REMOTE_QUARANTINED,
+                )
             else:
                 raise
         duration_ms = round((time.monotonic() - t0) * 1000)
@@ -2689,6 +2700,7 @@ class VerifyRunnerPool:
                     # dispatch()'s docstring for why the default is 1.
                     'chain_items': chain_items,
                     'chain_build_ms': chain_build_ms,
+                    **(dispatch_facts or MergeVerifyDispatchFacts()).event_fields(),
                     # task 2837 (PRD verify-retry-failed-only D5): retry_scope +
                     # retry_subset_sizes — always-present (None for a full/legacy
                     # verify), derived from the D2 failed-only contract carried in
