@@ -42,6 +42,7 @@ from _store_mutation_preflight_contract import (
     fail_closed_records,
     neutralise_fixture,
 )
+from shared.testing_xdist_groups import single_xdist_group
 
 from fused_memory.utils.store_mutation_preflight import (
     StoreMutationUnavailable,
@@ -710,3 +711,117 @@ class TestNoInlinedFailClosedMarker:
             "'<the script's logger name>')` instead, so the fail-closed "
             'marker is spelled once:\n  ' + '\n  '.join(offenders)
         )
+
+
+# ---------------------------------------------------------------------------
+# The one pass the three guards share
+# ---------------------------------------------------------------------------
+
+
+def _write_module(root: pathlib.Path, rel: str, source: str) -> pathlib.Path:
+    path = root / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(source, encoding='utf-8')
+    return path
+
+
+_SHAPED_FIXTURE_BODY = (
+    "    monkeypatch.setattr(mod, 'assert_store_mutation_allowed', lambda **_kw: None)\n"
+)
+
+
+class TestSweepTestModules:
+    def test_the_historical_fixture_name_is_flagged_by_name(self, tmp_path: pathlib.Path) -> None:
+        path = _write_module(
+            tmp_path, 'test_a.py', f'def {_HAND_ROLLED_FIXTURE_NAME}():\n    pass\n'
+        )
+
+        sweep = _sweep_test_modules([path], root=tmp_path)
+
+        assert sweep.hand_rolled_fixtures == (f'test_a.py:1:{_HAND_ROLLED_FIXTURE_NAME} (name)',)
+
+    def test_an_autouse_fixture_rebinding_the_guard_is_flagged_by_shape(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        path = _write_module(
+            tmp_path,
+            'test_a.py',
+            'import pytest\n\n\n'
+            '@pytest.fixture(autouse=True)\n'
+            'def _no_preflight(monkeypatch):\n' + _SHAPED_FIXTURE_BODY,
+        )
+
+        sweep = _sweep_test_modules([path], root=tmp_path)
+
+        assert sweep.hand_rolled_fixtures == ('test_a.py:5:_no_preflight (shape)',)
+
+    def test_a_non_autouse_fixture_rebinding_the_guard_is_not_flagged(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        path = _write_module(
+            tmp_path,
+            'test_a.py',
+            'import pytest\n\n\n'
+            '@pytest.fixture\n'
+            'def _rigged(monkeypatch):\n' + _SHAPED_FIXTURE_BODY,
+        )
+
+        assert _sweep_test_modules([path], root=tmp_path).hand_rolled_fixtures == ()
+
+    def test_a_raise_of_the_sentinel_is_a_deny_raiser(self, tmp_path: pathlib.Path) -> None:
+        path = _write_module(
+            tmp_path, 'test_a.py', "def f():\n    raise mod.StoreMutationUnavailable('x')\n"
+        )
+
+        assert _sweep_test_modules([path], root=tmp_path).deny_raisers == ('test_a.py:2',)
+
+    def test_an_assertion_naming_the_sentinel_is_not_a_deny_raiser(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        path = _write_module(
+            tmp_path,
+            'test_a.py',
+            'def f():\n    with pytest.raises(StoreMutationUnavailable):\n        pass\n',
+        )
+
+        assert _sweep_test_modules([path], root=tmp_path).deny_raisers == ()
+
+    def test_a_string_carrying_the_marker_is_an_inlined_marker(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        path = _write_module(tmp_path, 'test_a.py', f'X = {FAIL_CLOSED_MARKERS[0]!r}\n')
+
+        assert _sweep_test_modules([path], root=tmp_path).inlined_markers == ('test_a.py:1',)
+
+    def test_a_clean_module_reports_nothing(self, tmp_path: pathlib.Path) -> None:
+        path = _write_module(tmp_path, 'test_a.py', 'def test_ok():\n    assert True\n')
+
+        assert _sweep_test_modules([path], root=tmp_path) == _PreflightSweep(
+            hand_rolled_fixtures=(), deny_raisers=(), inlined_markers=()
+        )
+
+    def test_labels_follow_the_path_order_and_are_relative_to_the_root(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        raiser = "def f():\n    raise StoreMutationUnavailable('x')\n"
+        later = _write_module(tmp_path, 'test_z.py', raiser)
+        nested = _write_module(tmp_path, 'sub/test_b.py', raiser)
+
+        sweep = _sweep_test_modules([later, nested], root=tmp_path)
+
+        assert sweep.deny_raisers == ('test_z.py:2', 'sub/test_b.py:2')
+
+
+def test_the_tree_sweeps_share_one_xdist_worker(request: pytest.FixtureRequest) -> None:
+    sweeps = {
+        TestNoHandRolledNeutraliseFixture.test_no_test_module_defines_its_own_neutralise_fixture,
+        TestNoHandRolledDenyRaiser.test_no_test_module_raises_store_mutation_unavailable,
+        TestNoInlinedFailClosedMarker.test_no_test_module_spells_the_fail_closed_marker,
+    }
+    selected = [
+        item for item in request.session.items if getattr(item, 'function', None) in sweeps
+    ]
+    if not selected:
+        pytest.skip('no tree sweep is selected in this session')
+
+    assert single_xdist_group(selected) == _SWEEP_GROUP_NAME
