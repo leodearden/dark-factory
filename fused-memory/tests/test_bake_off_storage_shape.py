@@ -9014,6 +9014,55 @@ class TestBuildParser:
         assert '--dump-fetches' in capsys.readouterr().err
 
 
+@dataclasses.dataclass(frozen=True)
+class _MainLeg:
+    """What one doubled `main(argv)` returned, handed `run_bake_off`, and wrote."""
+
+    code: int
+    regrowth_seen: tuple
+    report_json: str
+
+
+def _record_main_leg(extra_argv: tuple[str, ...], directory: Path) -> _MainLeg:
+    mod = _mod()
+    regrowth_seen: list = []
+    json_out = directory / 'report.json'
+    with pytest.MonkeyPatch.context() as mp:
+        isolated_lease_dir(mp, directory / 'leases')
+        _install_driver_doubles(mp)
+        real = mod.run_bake_off
+
+        async def _spy(**kwargs):
+            regrowth_seen.append(kwargs.get('regrowth'))
+            return await real(**kwargs)
+
+        mp.setattr(mod, 'run_bake_off', _spy)
+
+        code = mod.main([
+            *extra_argv, '--clusters', '2', '--distractors', '12',
+            '--project-suffix', 'utest',
+            '--json-out', str(json_out), '--md-out', str(directory / 'report.md'),
+        ])
+
+    return _MainLeg(
+        code=code,
+        regrowth_seen=tuple(regrowth_seen),
+        # Empty when no artifact was written, so the reading test's own
+        # assertion is what reports the failed leg.
+        report_json=json_out.read_text() if json_out.exists() else '',
+    )
+
+
+@pytest.fixture(scope='module')
+def main_legs(tmp_path_factory) -> types.MappingProxyType[tuple[str, ...], _MainLeg]:
+    """One recorded `main()` leg per extra argv; every field is immutable."""
+    return types.MappingProxyType({
+        argv: _record_main_leg(argv, tmp_path_factory.mktemp('main-leg'))
+        for argv in ((), ('--no-regrowth',))
+    })
+
+
+@_ON_THE_RECORDING_WORKER
 class TestMain:
     """`main(argv)` driven directly — no subprocess."""
 
