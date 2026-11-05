@@ -2934,6 +2934,24 @@ def _contests_exemplar() -> judge_module.JudgeExemplar:
     )
 
 
+async def _live_judge_verdict(**judge_kwargs: Any) -> TriageJudgeVerdict:
+    """`judge_write`'s verdict; a call past the judge budget skips, every other failure stays red.
+
+    A budget expiry yields no verdict, so it says nothing about the wording. TestTheFrontierArmLive
+    keeps a timeout red: it is the live edge for the fail-open/latency dimension.
+    """
+    try:
+        return await judge_write(**judge_kwargs)
+    except TimeoutError:
+        service = judge_kwargs['memory_service']
+        pytest.skip(
+            f'{resolve_judge_model(service)} (effort {resolve_judge_reasoning_effort(service)}) '
+            f'gave no verdict within write_triage.judge_timeout_seconds='
+            f'{resolve_judge_timeout(service)}; production stores this write and counts a '
+            f'fail-open (contract C1, write_triage.py::triage_write); no wording was observed',
+        )
+
+
 class TestTheLiveWordingBudgetGuard:
     """`_live_judge_verdict` skips only a call past the judge budget; the rest stays red."""
 
@@ -3004,7 +3022,8 @@ class TestTheShippedWordingLive:
     """Boundary row 3 (flip-readiness PRD §11.4): `contests` covers an outdated candidate.
 
     Pinned to Sol: gpt-4o-mini labels both outdated entries `contested` under
-    the old wording too, so only Sol tells the two wordings apart.
+    the old wording too, so only Sol tells the two wordings apart. A call past
+    the judge budget skips through `_live_judge_verdict`.
     """
 
     @pytest.mark.asyncio
@@ -3060,7 +3079,7 @@ class TestTheShippedWordingLive:
         write_triage.judge_reasoning_effort = 'low'
         service = types.SimpleNamespace(config=config)
 
-        verdict = await judge_write(
+        verdict = await _live_judge_verdict(
             memory_service=service, content=entry, project_id='p',
             decision=_decision(candidate_id), candidates=slate,
         )
