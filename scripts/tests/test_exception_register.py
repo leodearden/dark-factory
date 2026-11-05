@@ -40,6 +40,7 @@ from shared.governed_exceptions import (
     TaskRef,
     TicketRef,
 )
+from shared.testing_xdist_groups import single_xdist_group
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -1439,6 +1440,33 @@ def test_json_names_the_default_state_path_under_the_root(tmp_path: Path, capsys
     assert sweep['state_path'] == str(tmp_path / exception_register.SWEEP_STATE_PATH)
 
 
+@pytest.mark.parametrize(
+    ('files', 'stamp', 'expected'),
+    [
+        pytest.param({'m.py': 'x = 1\n'}, None, 0, id='clean-and-never-run'),
+        pytest.param(_UNRATIFIED_TREES['inline-marker'], None, 1, id='a-closed-world-violation'),
+        pytest.param(
+            _UNRATIFIED_TREES['inline-marker'],
+            _stamp('2020-01-01T00:00:00+00:00'),
+            2,
+            id='a-stale-sweep-outranks-the-violation',
+        ),
+    ],
+)
+def test_report_exit_code_is_the_report_verbs_exit_code(
+    tmp_path: Path, files: dict[str, str], stamp: dict | None, expected: int
+):
+    _register_tree(tmp_path, files)
+    state = tmp_path / 'state.json'
+    if stamp is not None:
+        _write_state(state, stamp)
+
+    register = exception_register.measure(tmp_path, sweep_state=state, now=_NOW)
+
+    assert exception_register.report_exit_code(register) == expected
+    assert _main_reading(tmp_path, state, '--report') == expected
+
+
 # ---------------------------------------------------------------------------
 # The live tree — the merge-time guard that the real register is clean.
 #
@@ -1532,3 +1560,18 @@ def test_no_live_declaration_cites_the_closed_rulings_task():
         'list the disposition docs/legibility/inv12-day-one-rulings.md rules for it:\n  '
         + '\n  '.join(citing)
     )
+
+
+def test_the_live_register_consumers_share_one_xdist_worker(request):
+    consumers = {
+        test_the_live_register_is_clean,
+        test_the_live_register_document_reads_the_real_tree,
+        test_no_live_declaration_cites_the_closed_rulings_task,
+    }
+    selected = [
+        item for item in request.session.items if getattr(item, 'function', None) in consumers
+    ]
+    if not selected:
+        pytest.skip('no live-register consumer is selected in this session')
+
+    assert single_xdist_group(selected) == _LIVE_TREE_GROUP_NAME
