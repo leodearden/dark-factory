@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from escalation.categories import EscalationCategory
 from escalation.models import Escalation
 
 from orchestrator.event_store import EventType
@@ -69,7 +70,7 @@ def alarm_verify_base_divergence(
         agent_role='orchestrator-merge-verify-base-detector',
         severity='blocking',
         level=1,
-        category='merge_verify_base_divergence',
+        category=EscalationCategory.MERGE_VERIFY_BASE_DIVERGENCE,
         summary=(
             f'Merge verify dispatched off the frozen-prefix tip: {divergence.request_id} '
             f'(task {divergence.task_id}) verifies on {divergence.base_sha!r}, '
@@ -85,15 +86,31 @@ def alarm_verify_base_divergence(
             'voids it at adoption.'
         ),
         suggested_action=(
-            'Triage which half is wrong.  If expected_tip is the merge commit '
-            'of a head that was already requeued or dropped, the frozen-prefix '
-            'definition has regressed (PRD §5.3 class (a), fixed by task '
-            '5302).  Otherwise the item was stacked on a speculative-only '
-            'base, a genuine class-(d) violation: find the path that built it.  '
-            'Recovery re-merges are carved out, and the cached main is never '
-            'read, so neither explains a hit.'
+            'Triage which of three sources produced the hit.  (1) expected_tip '
+            'is the merge commit of a head that was already requeued or '
+            'dropped: the frozen-prefix liveness rule has regressed (PRD §5.3 '
+            'class (a), task 5302).  (2) expected_tip is the merge commit of a '
+            'head that was never vacated and is stuck in finalizing or '
+            'gate_reverify, including a head whose own merge commit was '
+            'recorded dead on a rebased landing (merge_lane/worker.py::'
+            'SpeculativeMergeWorker::_land_rebased_or_park_gate, ticket '
+            'tkt_0RWKN8Q02REA5YEFNQX4WDJRJT): a phantom tip the liveness rule '
+            'cannot see, and the item itself is fine.  (3) Otherwise the item '
+            'was stacked on a speculative-only base, a genuine class-(d) '
+            'violation: find the path that built it.  Recovery re-merges are '
+            'carved out, and the cached main is never read, so neither '
+            'explains a hit.'
         ),
     )
     escalation_queue.submit(esc)
     if event_store is not None:
-        event_store.emit(EventType.escalation_created, data=wire)
+        event_store.emit(
+            EventType.escalation_created,
+            task_id=divergence.task_id,
+            data={
+                **wire,
+                'escalation_id': esc.id,
+                'category': str(esc.category),
+                'summary': esc.summary,
+            },
+        )

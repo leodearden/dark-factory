@@ -12,12 +12,14 @@ import asyncio
 import dataclasses
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 from _merge_lane_fakes import RecordingEscalations, lane_scene_config
 from escalation.categories import EscalationCategory
 
 from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.event_store import EventType
 from orchestrator.git_ops import MergeResult
 from orchestrator.merge_lane.types import (
     DecidedItem,
@@ -76,6 +78,16 @@ def _divergence(config: OrchestratorConfig) -> VerifyBaseDivergence:
     divergence = _detect(_real_item(config, base_sha='sha-spec'), 'sha-tip')
     assert divergence is not None
     return divergence
+
+
+class _RecordingEvents:
+    """An event store that records each ``emit`` call instead of writing it."""
+
+    def __init__(self) -> None:
+        self.emitted: list[tuple[EventType, dict[str, Any]]] = []
+
+    def emit(self, event_type: EventType, **fields: Any) -> None:
+        self.emitted.append((event_type, fields))
 
 
 @pytest.mark.asyncio
@@ -159,14 +171,40 @@ class TestAlarmVerifyBaseDivergence:
         for needle in (divergence.request_id, 'sha-spec', 'sha-tip'):
             assert needle in filed.summary
 
+    async def test_filing_emits_one_self_describing_event(
+        self, config: OrchestratorConfig,
+    ) -> None:
+        """The event carries the record plus what an escalation reader keys on."""
+        escalations = RecordingEscalations()
+        events = _RecordingEvents()
+        divergence = _divergence(config)
+
+        alarm_verify_base_divergence(escalations, divergence, event_store=events)
+
+        [filed] = escalations.filed
+        assert events.emitted == [(
+            EventType.escalation_created,
+            {
+                'task_id': divergence.task_id,
+                'data': {
+                    **divergence.to_wire(),
+                    'escalation_id': filed.id,
+                    'category': 'merge_verify_base_divergence',
+                    'summary': filed.summary,
+                },
+            },
+        )]
+
     async def test_open_l1_suppresses_a_second_filing(
         self, config: OrchestratorConfig,
     ) -> None:
         escalations = RecordingEscalations(open_l1=True)
+        events = _RecordingEvents()
 
-        alarm_verify_base_divergence(escalations, _divergence(config))
+        alarm_verify_base_divergence(escalations, _divergence(config), event_store=events)
 
         assert escalations.filed == []
+        assert events.emitted == []
 
 
 def test_category_is_registered() -> None:

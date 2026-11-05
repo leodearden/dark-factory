@@ -10359,8 +10359,9 @@ class SpeculativeMergeWorker:
         Both halves apply one liveness rule: a :attr:`~InflightEntry.vacated`
         entry is not frozen.  Its verify requeued or dropped the request and
         released the lease (task 4582), so its merge commit is dead; counting
-        it made that commit the :meth:`frozen_prefix_tip` (PRD §5.3 class (a),
-        fixed by task 5302).
+        it made that commit the :meth:`frozen_prefix_tip` (PRD §5.3 class (a)).
+        For the finalize head this guards behind task 3082's disposal, and a
+        head stranded without being vacated still passes it (PRD §5.3).
 
         Passthroughs (verify_task=None: conflict/already_merged/skip) are NOT
         frozen — they carry no merge_commit and are not part of the verify
