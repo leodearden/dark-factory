@@ -9195,15 +9195,16 @@ class Harness:
         """Invoke the warm-lane GC reclaim helper once (single cadence tick).
 
         Delegates unconditionally to ``git_ops._run_warm_lane_gc_reclaim()``,
-        which is already fail-soft: rc 127 when the script is absent (no-op),
-        non-zero on script error (logged at WARNING inside the helper), and
-        never raises.  This method therefore also never raises.
+        which is already fail-soft: rc 127 when no reclaim ran, non-zero on
+        script error (logged at WARNING inside the helper), and never raises.
+        This method therefore also never raises.
 
-        Logging is tiered to avoid noise on hosts where gc.sh is absent
-        (rc=127 is the expected no-op case on ~144 ticks/day with the 600s
-        default):
-          * rc==0   → INFO  (actual reclaim ran)
-          * rc==127 → DEBUG (script absent — expected no-op)
+        Logging is tiered against what git_ops already logs for the pass:
+          * rc==0   → DEBUG, because git_ops' per-pass ``reclaim pass`` record
+            is the INFO line
+          * rc==127 → INFO, cause-free; git_ops' preceding line names the
+            cause: a lease deferral at INFO; a pool refusal, script not found
+            (naming both candidates) or unexpected error at WARNING
           * other   → WARNING (unexpected non-zero)
 
         Also folds in the interactive-worktree (``_iact-*``) crash-safety
@@ -9216,9 +9217,15 @@ class Harness:
         """
         rc = await self.git_ops._run_warm_lane_gc_reclaim()
         if rc == 0:
-            logger.info('Warm-lane GC reclaim pass: reclaimed (rc=0)')
+            logger.debug(
+                'Warm-lane GC reclaim pass: script exited 0 (counts in the '
+                '_run_warm_lane_gc_reclaim reclaim pass record)',
+            )
         elif rc == 127:
-            logger.debug('Warm-lane GC reclaim pass: script absent, no-op (rc=127)')
+            logger.info(
+                'Warm-lane GC reclaim pass: no reclaim ran this tick (rc=127) — '
+                'the preceding _run_warm_lane_gc_reclaim line names the cause',
+            )
         else:
             logger.warning('Warm-lane GC reclaim pass: non-zero rc=%d', rc)
         await self._run_interactive_worktree_reaper_pass()
