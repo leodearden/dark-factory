@@ -113,6 +113,7 @@ class LineageEntry:
     link: Link | None
     multi_link: bool
     done_stamped_at: datetime | None
+    done_kind: str | None
 
 
 def coalesce_prd(metadata: Mapping[str, Any]) -> str | None:
@@ -183,18 +184,28 @@ def lineage_entry(metadata: Mapping[str, Any], project_root: str) -> LineageEntr
     """Parse one task's *metadata* into its :class:`LineageEntry`."""
     raw_prd = coalesce_prd(metadata)
     present_links = sum(metadata.get(field.value) is not None for field in LinkField)
+    done_stamped_at, done_kind = _done_provenance(metadata.get(DONE_PROVENANCE_KEY))
     return LineageEntry(
         own_prd=None if raw_prd is None else normalise_prd_key(raw_prd, project_root),
         link=parse_link(metadata),
         multi_link=present_links >= 2,
-        done_stamped_at=_done_stamped_at(metadata.get(DONE_PROVENANCE_KEY)),
+        done_stamped_at=done_stamped_at,
+        done_kind=done_kind,
     )
 
 
-def _done_stamped_at(done_provenance: object) -> datetime | None:
+def _done_provenance(done_provenance: object) -> tuple[datetime | None, str | None]:
+    """``(stamped_at, kind)`` of a ``done_provenance`` value, each None when absent or malformed."""
     if not isinstance(done_provenance, Mapping):
-        return None
-    stamped_at = done_provenance.get('stamped_at')
+        return None, None
+    kind = done_provenance.get('kind')
+    return (
+        _stamped_at(done_provenance.get('stamped_at')),
+        kind if isinstance(kind, str) and kind else None,
+    )
+
+
+def _stamped_at(stamped_at: object) -> datetime | None:
     if not isinstance(stamped_at, str):
         return None
     moment, ok = parse_timestamp_or_warn(stamped_at, context='prd_attribution.done_stamped_at')
