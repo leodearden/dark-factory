@@ -71,28 +71,27 @@ from shared.cli_boundary import LoudArgumentParser, run_cli
 # The probe IMPORTS what it measures rather than re-spelling it, so a code
 # change can never leave it measuring a stale spelling (the
 # measure_plural_enum_guard_recall.py precedent).
-_SRC = Path(__file__).resolve().parent.parent / 'src'
-if str(_SRC) not in sys.path:
+if str(_SRC := Path(__file__).resolve().parent.parent / 'src') not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from shared.task_statuses import TaskStatus  # noqa: E402
+from shared.task_statuses import TaskStatus
 
-from fused_memory.backends.graphiti_client import PagedRead  # noqa: E402
-from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (  # noqa: E402
+from fused_memory.backends.graphiti_client import PagedRead
+from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (
     flatten_dedup_edges,
     select_stale_status_snapshot_edges,
 )
-from fused_memory.reconciliation.status_snapshot_extraction import (  # noqa: E402
+from fused_memory.reconciliation.status_snapshot_extraction import (
     CLAUSE_BREAK_CHARS,
     SNAPSHOT_STATUS_RE,
     extract_marker_task_ids,
     is_token_internal_break,
 )
-from fused_memory.reconciliation.task_filter import (  # noqa: E402
+from fused_memory.reconciliation.task_filter import (
     INACTIVE_TASK_STATUSES,
     TASK_REF_RE,
 )
-from fused_memory.utils.target_store_preflight import (  # noqa: E402
+from fused_memory.utils.target_store_preflight import (
     TargetStoreUnpopulated,
     assert_task_store_populated,
 )

@@ -81,8 +81,7 @@ from typing import Any
 # measures a stale spelling of the thing it claims to measure, and would keep
 # reporting a reassuring zero after the code it audits had changed underneath
 # it. Any drift now surfaces as an ImportError, not as a wrong number.
-_SRC = Path(__file__).resolve().parent.parent / 'src'
-if str(_SRC) not in sys.path:
+if str(_SRC := Path(__file__).resolve().parent.parent / 'src') not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 # The SHIPPED pagination engine and the SHIPPED population definition. The
@@ -97,7 +96,7 @@ if str(_SRC) not in sys.path:
 # the probe defines no attribute by that name. That is how a future author
 # re-growing a private census helper gets caught. The alias also makes it
 # unambiguous at the call site that the SHIPPED helper is the one running.
-from fused_memory.backends.graphiti_client import (  # noqa: E402
+from fused_memory.backends.graphiti_client import (
     _ALL_VALID_EDGES_MATCH,
     _DEFAULT_READ_PAGE_SIZE,
     _MAX_READ_PAGES,
@@ -108,12 +107,12 @@ from fused_memory.backends.graphiti_client import (  # noqa: E402
     INCOMPLETE_STRUCTURAL_REFUSAL,
     _paged_ro_query,
 )
-from fused_memory.backends.graphiti_client import (  # noqa: E402
+from fused_memory.backends.graphiti_client import (
     _census_count as _shipped_census_count,
 )
 
 # The shipped regex and the guard whose recall this probe measures.
-from fused_memory.reconciliation.status_snapshot_extraction import (  # noqa: E402
+from fused_memory.reconciliation.status_snapshot_extraction import (
     _ENUM_PREP_WORD_RE,
     PLURAL_ENUM_SNAPSHOT_RE,
     _enumeration_is_prepositional_complement,
