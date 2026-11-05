@@ -700,6 +700,22 @@ for the reason vocabulary). Per-leaf capability→evidence bindings:
   Modules: `orchestrator/evals`, `orchestrator/agents`. Prereqs: α, ν. Depends
   (out-of-batch): **4757**, **3096**.
 
+  > **As built (task 5386).** Where this bullet and the code differ, the code is authoritative.
+  >
+  > - **The S6 gate** was `orchestrator/src/orchestrator/evals/runner.py::build_eval_orch_config`'s
+  >   `sandbox: SandboxConfig(enabled=False)`, not a missing kwarg. `TaskWorkflow._invoke`
+  >   already forwards `sandbox_modules`/`sandbox_extras` once the sandbox is enabled, through
+  >   `orchestrator/src/orchestrator/agents/invocation_scope.py::invocation_scope`, so
+  >   `agents/invoke.py` is unchanged.
+  > - **The profile** is `orchestrator/src/orchestrator/evals/shadow_invocation.py::build_shadow_orch_config`.
+  >   Strict MCP and the null memory endpoint are inherited from `EVAL_PROFILE`, not re-set.
+  >   `run_eval` and `run_end_to_end` take it as `orch_config_builder`.
+  > - **The coordinator's isolation dep** is
+  >   `orchestrator/src/orchestrator/evals/shadow_invocation.py::shadow_isolation_available`. Its
+  >   findings come from `probe_isolation` over the legs `shadow_leg_invocations` builds. Beyond
+  >   strict MCP, memory and containment, it also refuses a sandboxed leg whose backend resolves
+  >   to `none` (`sandbox_unwrapped`).
+
 - **ω — ZCode harness arm** *(leaf, probe-gated, task **5399**)*. **Stage 1 is a gate:** probe
   whether ZCode can be driven by the eval runner at all — a headless/non-interactive invocation,
   MCP server config (the implementer leg calls `mark_step_done`), an argument targeting the
