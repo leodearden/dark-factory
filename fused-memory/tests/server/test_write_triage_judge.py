@@ -30,7 +30,7 @@ import subprocess
 import sys
 import types
 import uuid
-from collections.abc import MutableMapping
+from collections.abc import Callable, MutableMapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -2932,6 +2932,66 @@ def _contests_exemplar() -> judge_module.JudgeExemplar:
         exemplar for exemplar in judge_module.JUDGE_EXEMPLARS
         if exemplar.verdict == 'contests'
     )
+
+
+class TestTheLiveWordingBudgetGuard:
+    """`_live_judge_verdict` skips only a call past the judge budget; the rest stays red."""
+
+    @staticmethod
+    def _judge_kwargs(**write_triage: Any) -> dict[str, Any]:
+        return {
+            'memory_service': _judge_svc(**write_triage),
+            'content': 'c', 'project_id': 'p',
+            'decision': _decision('m1'), 'candidates': [_result('m1', 0.80)],
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_call_past_the_judge_budget_skips_naming_the_budget(self) -> None:
+        async def _hang(*_args, **_kwargs):
+            await asyncio.sleep(5)
+
+        client = sdk_client_double()
+        client.responses.create = AsyncMock(side_effect=_hang)
+        with patch('openai.AsyncOpenAI', return_value=client), \
+                pytest.raises(pytest.skip.Exception) as excinfo:
+            await _live_judge_verdict(**self._judge_kwargs(judge_timeout_seconds=0.01))
+
+        reason = str(excinfo.value)
+        assert 'test-model' in reason
+        assert '0.01' in reason
+
+    @pytest.mark.asyncio
+    async def test_a_verdict_is_returned_as_is(self) -> None:
+        client = _openai_client(_payload('restates', 'm1'))
+        with patch('openai.AsyncOpenAI', return_value=client):
+            verdict = await _live_judge_verdict(**self._judge_kwargs())
+
+        assert verdict.outcome == OUTCOME_RESTATED
+        assert verdict.candidate_id == 'm1'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'make_client',
+        [
+            lambda: _openai_client('I cannot answer that.'),
+            lambda: _incomplete_openai_client(_payload('restates', 'm1'), 'max_output_tokens'),
+        ],
+        ids=['unparseable', 'incomplete'],
+    )
+    async def test_an_unusable_answer_stays_red(
+        self, make_client: Callable[[], MagicMock],
+    ) -> None:
+        with patch('openai.AsyncOpenAI', return_value=make_client()), \
+                pytest.raises(JudgeOutputError):
+            await _live_judge_verdict(**self._judge_kwargs())
+
+    @pytest.mark.asyncio
+    async def test_a_transport_error_stays_red(self) -> None:
+        client = sdk_client_double()
+        client.responses.create = AsyncMock(side_effect=RuntimeError('boom'))
+        with patch('openai.AsyncOpenAI', return_value=client), \
+                pytest.raises(RuntimeError):
+            await _live_judge_verdict(**self._judge_kwargs())
 
 
 @pytest.mark.integration
