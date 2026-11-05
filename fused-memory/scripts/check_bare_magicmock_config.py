@@ -49,8 +49,9 @@ call sites and break every in-flight branch, for a cosmetic gain.
 
 Task 4246 added Rule C under that same ruling, unchanged: the nine wiring edits, the
 extra ``python3`` process and the second fleet-lint-coverage entry a sibling script
-would have cost are all still there, and Rule C is per-``ast.Call`` exactly like
-Rule B, so it folds into the SAME ``ast.walk`` for very nearly free rather than
+would have cost are all still there, and Rule C is per-NODE like Rule B (it
+dispatches on ``ast.Call``, ``ast.While`` and ``ast.AsyncWith``; task 7800 added the
+latter two), so it folds into the SAME ``ast.walk`` for very nearly free rather than
 paying for a second pass (a second full walk was measured at ~43% of total checker
 runtime, 20.8s -> 30.7s over the seven scanned dirs).  Note what this ruling does NOT
 say: it is not "put every future check here".  It applies because Rule C is another
