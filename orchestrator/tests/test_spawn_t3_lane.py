@@ -1,14 +1,13 @@
 """Tests for orchestrator.spawn_t3_lane, driven through its verbs against a fake T3.
 
-``launch`` and ``provider`` talk to ``_fake_t3_server.FakeT3Server`` over
-``/mcp``; the ``t3`` fixture seeds this host's credential for it. Its tool
-replies are the module-level ``*_JSON`` constants below, in T3 Code v0.1.6's
-shapes (``~/src/t3code-v0.1.6``): ``packages/contracts/src/project.ts::Project``
-and ``apps/server/src/mcp/toolkits/project/tools.ts`` (``t3_project_list``,
-``t3_thread_launch``), ``packages/contracts/src/orchestratorMcp.ts`` (the
-thread list). ``await-started`` and ``wait`` still drive a fake ``t3`` CLI on
-PATH, ``FAKE_T3_SOURCE``, which reads its scripted responses from
-``$FAKE_T3_SCRIPT`` and logs every call to ``$FAKE_T3_LOG``.
+``launch``, ``provider``, ``await-started`` and ``wait`` talk to
+``_fake_t3_server.FakeT3Server`` over ``/mcp``; the ``t3`` fixture seeds this
+host's credential for it. Its tool replies are the module-level ``*_JSON``
+constants below, in T3 Code v0.1.6's shapes (``~/src/t3code-v0.1.6``):
+``packages/contracts/src/project.ts::Project``,
+``apps/server/src/mcp/toolkits/project/tools.ts`` (``t3_project_list``,
+``t3_thread_launch``) and ``packages/contracts/src/orchestratorMcp.ts`` (the
+thread list, read and wait results).
 """
 
 from __future__ import annotations
@@ -17,10 +16,9 @@ import json
 import os
 import subprocess
 import sys
-import textwrap
 import time
-from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from collections.abc import Callable, Iterator, Mapping
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -74,6 +72,14 @@ THREAD_LAUNCH_JSON: dict[str, Any] = {
 }
 """``t3_thread_launch``'s success; ``runId`` and ``status`` may be null."""
 
+THREAD_WAIT_JSON: dict[str, Any] = {
+    'threadId': THREAD_ID,
+    'runId': RUN_ID,
+    'status': 'running',
+    'timedOut': True,
+}
+"""``t3_thread_wait``'s ``OrchestratorMcpThreadWaitResult`` for a slice that ran out; :func:`waited` varies it."""
+
 THREAD_LIST_JSON: dict[str, Any] = {
     'projectId': PROJECT_ID,
     'currentThreadId': None,
@@ -110,53 +116,6 @@ THREAD_READ_JSON: dict[str, Any] = {
 """``t3_thread_read``'s ``OrchestratorMcpThreadReadResult``
 (``packages/contracts/src/orchestratorMcp.ts``, the detail abridged); :func:`thread_read` varies it."""
 
-THREAD_LIST_ITEM_JSON: dict[str, Any] = {
-    'threadId': THREAD_ID,
-    'projectId': PROJECT_ID,
-    'title': 'unblock:df#7489 t3-lane',
-    'createdBy': 'user',
-    'creationSource': 'mcp',
-    'status': 'running',
-    'latestRunId': RUN_ID,
-    'providerInstanceId': 'claudeAgent',
-    'model': 'claude-opus-5-5',
-    'runtimeMode': 'full-access',
-    'interactionMode': 'default',
-    'linkedPullRequest': None,
-    'pullRequests': [],
-    'settled': False,
-    'settledAt': None,
-    'snoozed': False,
-    'snoozedUntil': None,
-    'parentThreadId': None,
-    'relationshipToParent': None,
-    'itemCount': 3,
-    'createdAt': '2026-10-25T08:04:00.000Z',
-    'updatedAt': '2026-10-25T08:05:43.000Z',
-}
-"""One ``OrchestratorMcpThreadListItem``; the fake CLI's ``thread list --json`` prints a
-bare array of these, and archived threads are never listed. ``status`` is ``idle``
-or a run status: preparing|queued|starting|running|waiting|completed|interrupted|
-failed|cancelled|rolled_back."""
-
-THREAD_SHOW_JSON: dict[str, Any] = {
-    'thread': {
-        'threadId': THREAD_ID,
-        'projectId': PROJECT_ID,
-        'title': 'unblock:df#7489 t3-lane',
-        'status': 'completed',
-        'latestRunId': RUN_ID,
-        'activeRunId': None,
-        'runCount': 1,
-        'pendingRequestCount': 0,
-        'archived': True,
-        'settled': False,
-    },
-    'messages': [],
-}
-"""The fake CLI's ``thread show <id> --json``: ``{thread: OrchestratorMcpThreadDetail, messages}``
-(detail abridged to the fields the lane reads, ``archived`` among them)."""
-
 SERVER_RUNTIME_JSON: dict[str, Any] = {
     'version': 1,
     'pid': 881190,
@@ -170,52 +129,8 @@ SERVER_RUNTIME_JSON: dict[str, Any] = {
 naming an origin nothing answers: a test that forgets :func:`point_runtime_at`
 fails as descriptor-unreachable instead of reaching the workstation's real T3 on :3773."""
 
-FAKE_T3_SOURCE = textwrap.dedent(
-    '''\
-    #!/usr/bin/env python3
-    """Fake t3: answers `thread start|list|show` from $FAKE_T3_SCRIPT, logs to $FAKE_T3_LOG.
-
-    The script maps "start" / "list" / "show" to a list of responses
-    {"exit": int, "stdout": <json or null>, "stderr": str}; each call takes the
-    next one and the last repeats. A response with "add_thread" appends that
-    list item to every later "list" answer, as a real launch would.
-    """
-    import json, os, sys
-    script_path = os.environ["FAKE_T3_SCRIPT"]
-    script = json.load(open(script_path))
-    verb = sys.argv[2] if len(sys.argv) > 2 and sys.argv[1] == "thread" else ""
-    stdin = sys.stdin.read() if "-" in sys.argv[3:] else None
-    with open(os.environ["FAKE_T3_LOG"], "a") as log:
-        log.write(json.dumps({"argv": sys.argv[1:], "stdin": stdin}) + "\\n")
-    counts = script.setdefault("_counts", {})
-    responses = script.get(verb) or [{"exit": 2, "stdout": None, "stderr": "unscripted"}]
-    response = responses[min(counts.get(verb, 0), len(responses) - 1)]
-    counts[verb] = counts.get(verb, 0) + 1
-    stdout = response.get("stdout")
-    if verb == "list" and stdout is not None:
-        stdout = stdout + script.get("_added", [])
-    if "add_thread" in response:
-        script.setdefault("_added", []).append(response["add_thread"])
-    json.dump(script, open(script_path, "w"))
-    if stdout is not None:
-        print(json.dumps(stdout))
-    if response.get("stderr"):
-        print(response["stderr"], file=sys.stderr)
-    sys.exit(response.get("exit", 0))
-    '''
-)
-
-
-def ok(stdout: Any) -> dict[str, Any]:
-    return {'exit': 0, 'stdout': stdout}
-
-
-def unreachable() -> dict[str, Any]:
-    return {'exit': 1, 'stdout': None, 'stderr': 'Could not reach the T3 Code server.'}
-
-
-def listed(**overrides: Any) -> dict[str, Any]:
-    return {**THREAD_LIST_ITEM_JSON, **overrides}
+def waited(*, timed_out: bool, status: str = 'running') -> ToolSuccess:
+    return ToolSuccess({**THREAD_WAIT_JSON, 'status': status, 'timedOut': timed_out})
 
 
 def thread_read(**thread: Any) -> ToolSuccess:
@@ -229,21 +144,6 @@ def project(root: Path | str, **overrides: Any) -> dict[str, Any]:
 
 def projects_page(*projects: dict[str, Any], next_cursor: int | None = None) -> ToolSuccess:
     return ToolSuccess({'projects': list(projects), 'nextCursor': next_cursor})
-
-
-@dataclass
-class FakeT3:
-    script_path: Path
-    log_path: Path
-
-    def script(self, **responses: list[dict[str, Any]]) -> None:
-        self.script_path.write_text(json.dumps(responses))
-
-    def calls(self, verb: str) -> list[dict[str, Any]]:
-        if not self.log_path.exists():
-            return []
-        entries = [json.loads(line) for line in self.log_path.read_text().splitlines()]
-        return [entry for entry in entries if entry['argv'][1:2] == [verb]]
 
 
 @dataclass
@@ -273,24 +173,8 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Env:
     monkeypatch.setenv('T3CODE_HOME', str(t3_home))
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(fleet))
     monkeypatch.setenv('CLAUDE_PROJECTS_DIR', str(projects_dir))
-    monkeypatch.setenv('SPAWN_T3_POLL_SECS', '0')
     monkeypatch.setenv('PATH', path_without_t3())
     return Env(project_dir, t3_home, fleet, projects_dir)
-
-
-@pytest.fixture
-def fake_t3(env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeT3:
-    bin_dir = tmp_path / 'bin'
-    bin_dir.mkdir()
-    executable = bin_dir / 't3'
-    executable.write_text(FAKE_T3_SOURCE.replace('/usr/bin/env python3', sys.executable, 1))
-    executable.chmod(0o755)
-    fake = FakeT3(tmp_path / 'fake-t3.json', tmp_path / 'fake-t3.log')
-    fake.script()
-    monkeypatch.setenv('PATH', f'{bin_dir}{os.pathsep}{os.environ["PATH"]}')
-    monkeypatch.setenv('FAKE_T3_SCRIPT', str(fake.script_path))
-    monkeypatch.setenv('FAKE_T3_LOG', str(fake.log_path))
-    return fake
 
 
 @pytest.fixture
@@ -370,6 +254,14 @@ def spawn_record(env: Env, slug: str = 'unblock-df-7489-4242') -> str:
         root=env.fleet,
     )
     return str(sr.record_path_for_slug(slug, root=env.fleet).parent)
+
+
+def stale_t3_record(env: Env) -> str:
+    """A live t3 record of ``env.project`` whose thread no listing names."""
+    record_dir = spawn_record(env, 'sibling-df-1-1')
+    sr.update_display('sibling-df-1-1', root=env.fleet, kind='t3', t3_thread_id='th-vanished')
+    time.sleep(0.01)
+    return record_dir
 
 
 def prompt_file(tmp_path: Path, text: str) -> str:
@@ -685,9 +577,7 @@ class TestLaunch:
     def test_launch_first_sweeps_the_projects_records_whose_thread_is_gone(
         self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        stale_dir = spawn_record(env, 'sibling-df-1-1')
-        sr.update_display('sibling-df-1-1', root=env.fleet, kind='t3', t3_thread_id='th-vanished')
-        time.sleep(0.01)
+        stale_dir = stale_t3_record(env)
 
         launch_line(capsys, tmp_path, env.project)
 
@@ -698,9 +588,7 @@ class TestLaunch:
     def test_an_incomplete_thread_listing_sweeps_nothing(
         self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        stale_dir = spawn_record(env, 'sibling-df-1-1')
-        sr.update_display('sibling-df-1-1', root=env.fleet, kind='t3', t3_thread_id='th-vanished')
-        time.sleep(0.01)
+        stale_dir = stale_t3_record(env)
         t3.tool_replies['t3_thread_list'] = replies_in_turn(
             ToolSuccess({**THREAD_LIST_JSON, 'nextCursor': 1}), ToolFailure('orchestration_error', 'page lost')
         )
@@ -1228,16 +1116,16 @@ class TestRebinding:
 # ---------------------------------------------------------------------------
 
 
-Listed = lane.ThreadObservation(lane.ThreadState.LISTED, 'running', RUN_ID)
+Present = lane.ThreadObservation(lane.ThreadState.PRESENT, 'running', RUN_ID)
 
 
 def _ended(run_id: str = RUN_ID, status: str = 'failed') -> lane.ThreadObservation:
-    return lane.ThreadObservation(lane.ThreadState.LISTED, status, run_id)
+    return lane.ThreadObservation(lane.ThreadState.PRESENT, status, run_id)
 
 
 class TestJoinTracker:
     def test_a_final_result_finishes_zero_even_while_running(self) -> None:
-        assert lane.JoinTracker().verdict(Listed, result_final=True, now=0) == 0
+        assert lane.JoinTracker().verdict(Present, result_final=True, now=0) == 0
 
     def test_an_archived_thread_finishes_zero(self) -> None:
         archived = lane.ThreadObservation(lane.ThreadState.ARCHIVED)
@@ -1250,7 +1138,7 @@ class TestJoinTracker:
     @pytest.mark.parametrize('status', ['idle', 'waiting', 'running', 'completed', 'queued'])
     def test_live_or_idle_keeps_waiting(self, status: str) -> None:
         tracker = lane.JoinTracker()
-        observation = lane.ThreadObservation(lane.ThreadState.LISTED, status, RUN_ID)
+        observation = lane.ThreadObservation(lane.ThreadState.PRESENT, status, RUN_ID)
         assert tracker.verdict(observation, result_final=False, now=0) is None
         assert tracker.verdict(observation, result_final=False, now=10_000) is None
 
@@ -1264,7 +1152,7 @@ class TestJoinTracker:
     def test_a_newer_run_within_the_grace_resets_it(self) -> None:
         tracker = lane.JoinTracker()
         tracker.verdict(_ended('run-1'), result_final=False, now=0)
-        assert tracker.verdict(Listed, result_final=False, now=60) is None
+        assert tracker.verdict(Present, result_final=False, now=60) is None
         assert tracker.verdict(_ended('run-2'), result_final=False, now=130) is None
         assert tracker.verdict(_ended('run-2'), result_final=False, now=249) is None
         assert tracker.verdict(_ended('run-2'), result_final=False, now=250) == 1
@@ -1285,67 +1173,139 @@ class TestJoinTracker:
         tracker = lane.JoinTracker()
         down = lane.ThreadObservation(lane.ThreadState.UNREACHABLE)
         tracker.verdict(down, result_final=False, now=0)
-        tracker.verdict(Listed, result_final=False, now=500)
+        tracker.verdict(Present, result_final=False, now=500)
         assert tracker.verdict(down, result_final=False, now=700) is None
         assert tracker.verdict(down, result_final=False, now=1300) is None
         assert tracker.verdict(down, result_final=False, now=1301) == 126
 
 
+@dataclass
+class FakeClock:
+    now: float = 0.0
+    sleeps: list[float] = field(default_factory=list)
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, secs: float) -> None:
+        self.sleeps.append(secs)
+        self.now += secs
+
+
+def wait_for(env: Env, record_dir: str, clock: FakeClock, **options: Any) -> str:
+    return lane.wait(
+        THREAD_ID, str(env.project), record_dir, os.environ, clock=clock.monotonic, sleep=clock.sleep, **options
+    )
+
+
 class TestWait:
-    def _wait(self, capsys: pytest.CaptureFixture[str], env: Env, record_dir: str) -> str:
-        return run_verb(
-            capsys, 'wait', '--thread-id', THREAD_ID, '--cwd', str(env.project),
-            '--record', record_dir,
-        )
-
-    def test_a_final_result_md_finishes_zero(
-        self, env: Env, fake_t3: FakeT3, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        fake_t3.script(list=[ok([listed(status='running')])])
+    def test_a_slice_that_times_out_is_followed_at_once_by_the_next(self, env: Env, t3: FakeT3Server) -> None:
         record_dir = spawn_record(env)
-        (Path(record_dir) / 'result.md').write_text('---\noutcome: done\n---\nAll good.\n')
 
-        assert self._wait(capsys, env, record_dir) == 'finished code=0'
+        def the_child_finishes(arguments: Mapping[str, Any]) -> ToolSuccess:
+            (Path(record_dir) / 'result.md').write_text('---\noutcome: done\n---\n')
+            return waited(timed_out=False, status='completed')
 
-    def test_settled_and_in_progress_are_not_finished_until_archived(
-        self, env: Env, fake_t3: FakeT3, capsys: pytest.CaptureFixture[str]
+        t3.tool_replies |= {
+            't3_thread_read': thread_read(status='running'),
+            't3_thread_wait': replies_in_turn(waited(timed_out=True), waited(timed_out=True), the_child_finishes),
+        }
+        clock = FakeClock()
+
+        assert wait_for(env, record_dir, clock) == 'finished code=0'
+        assert t3.tool_calls('t3_thread_wait') == [{'threadId': THREAD_ID, 'timeoutMs': 600_000}] * 3
+        assert clock.sleeps == []
+        assert len(t3.tool_calls('t3_thread_list')) == 4
+
+    def test_an_ended_run_is_rechecked_after_a_pause_until_its_grace_passes(
+        self, env: Env, t3: FakeT3Server
     ) -> None:
-        settled = listed(status='idle', settled=True, settledAt='2026-10-25T09:00:00.000Z')
-        fake_t3.script(list=[ok([settled]), ok([settled]), ok([])], show=[ok(THREAD_SHOW_JSON)])
-        record_dir = spawn_record(env)
-        (Path(record_dir) / 'result.md').write_text('outcome: in-progress\n')
+        t3.tool_replies |= {
+            't3_thread_read': thread_read(status='failed', latestRunId=RUN_ID),
+            't3_thread_wait': waited(timed_out=False, status='failed'),
+        }
+        clock = FakeClock()
 
-        assert self._wait(capsys, env, record_dir) == 'finished code=0'
-        assert len(fake_t3.calls('list')) == 3
+        assert wait_for(env, spawn_record(env), clock) == 'finished code=1'
+        assert clock.sleeps and set(clock.sleeps) == {lane.SETTLED_RECHECK_SECS}
+        assert clock.now >= lane.ENDED_RUN_GRACE_SECS
 
-    def test_a_successful_show_without_the_thread_finishes_127(
-        self, env: Env, fake_t3: FakeT3, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        fake_t3.script(list=[ok([])], show=[ok({'messages': []})])
+    def test_a_server_down_past_its_grace_is_126(self, env: Env, t3: FakeT3Server) -> None:
+        t3.hangs_up = True
+        clock = FakeClock()
 
-        assert self._wait(capsys, env, '') == 'finished code=127'
+        assert wait_for(env, '', clock) == 'finished code=126'
+        assert clock.now > lane.UNREACHABLE_GRACE_SECS
+        assert set(clock.sleeps) == {lane.SETTLED_RECHECK_SECS}
 
-    def test_a_failed_show_is_unreachable_not_gone(self, env: Env, fake_t3: FakeT3) -> None:
-        fake_t3.script(list=[ok([])], show=[{'exit': 1, 'stdout': None, 'stderr': 'gone'}])
-
-        observation, known = lane.observe_thread(THREAD_ID, str(env.project))
-
-        assert observation.state is lane.ThreadState.UNREACHABLE
-        assert known == {}
-
-    def test_wait_stops_when_its_caller_is_gone(self, env: Env, fake_t3: FakeT3) -> None:
-        fake_t3.script(list=[ok([listed(status='running')])])
+    def test_wait_stops_at_a_slice_boundary_once_its_caller_is_gone(self, env: Env, t3: FakeT3Server) -> None:
+        t3.tool_replies |= {'t3_thread_read': thread_read(), 't3_thread_wait': waited(timed_out=True)}
         parents = iter([4242, 4242, 4242, 1])
 
         with pytest.raises(lane.CallerGone):
-            lane.wait(THREAD_ID, str(env.project), '', {'SPAWN_T3_POLL_SECS': '0'},
-                      parent_pid=lambda: next(parents))
+            wait_for(env, '', FakeClock(), parent_pid=lambda: next(parents))
 
-        assert len(fake_t3.calls('list')) == 2
+        assert len(t3.tool_calls('t3_thread_wait')) == 2
+
+    def test_a_thread_t3_does_not_know_finishes_127(self, env: Env, t3: FakeT3Server) -> None:
+        t3.tool_replies['t3_thread_read'] = ToolFailure('thread_not_found', f'Thread {THREAD_ID} was not found.')
+
+        assert wait_for(env, '', FakeClock()) == 'finished code=127'
+
+    def test_an_archived_thread_finishes_zero(
+        self, env: Env, t3: FakeT3Server, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        t3.tool_replies['t3_thread_read'] = thread_read(archived=True)
+
+        line = run_verb(capsys, 'wait', '--thread-id', THREAD_ID, '--cwd', str(env.project), '--record', '')
+
+        assert line == 'finished code=0'
+
+    def test_a_settled_thread_is_rechecked_after_a_pause_until_archived(self, env: Env, t3: FakeT3Server) -> None:
+        settled = thread_read(status='idle', settled=True, settledAt='2026-10-25T09:00:00.000Z')
+        t3.tool_replies |= {
+            't3_thread_read': replies_in_turn(settled, settled, thread_read(archived=True)),
+            't3_thread_wait': waited(timed_out=False, status='completed'),
+        }
+        record_dir = spawn_record(env)
+        (Path(record_dir) / 'result.md').write_text('outcome: in-progress\n')
+        clock = FakeClock()
+
+        assert wait_for(env, record_dir, clock) == 'finished code=0'
+        assert clock.sleeps == [lane.SETTLED_RECHECK_SECS] * 2
+
+    def test_each_pass_sweeps_the_read_threads_project(self, env: Env, t3: FakeT3Server) -> None:
+        stale_dir = stale_t3_record(env)
+        t3.tool_replies['t3_thread_read'] = thread_read(archived=True, projectId='project-of-the-read')
+
+        assert wait_for(env, '', FakeClock()) == 'finished code=0'
+        stale = sr.read_record(Path(stale_dir).name, root=env.fleet)
+        assert (stale.status, stale.exit_code) == (sr.Status.EXITED, sr.ORPHAN_EXIT_CODE)
+        assert t3.tool_calls('t3_thread_list') == [{'projectId': 'project-of-the-read', 'limit': 100}]
+
+    def test_an_incomplete_listing_sweeps_nothing_while_waiting(self, env: Env, t3: FakeT3Server) -> None:
+        stale_dir = stale_t3_record(env)
+        t3.tool_replies |= {
+            't3_thread_read': thread_read(archived=True),
+            't3_thread_list': replies_in_turn(
+                ToolSuccess({**THREAD_LIST_JSON, 'nextCursor': 1}), ToolFailure('orchestration_error', 'page lost')
+            ),
+        }
+
+        assert wait_for(env, '', FakeClock()) == 'finished code=0'
+        assert sr.read_record(Path(stale_dir).name, root=env.fleet).status == sr.Status.LAUNCHING
+
+    def test_an_unbound_record_is_bound_while_waiting(self, env: Env, t3: FakeT3Server) -> None:
+        record_dir = spawn_record(env)
+        (Path(record_dir) / 'result.md').write_text('outcome: done\n')
+        write_transcript(env, SESSION_ID, trailer(record_dir))
+        t3.tool_replies['t3_thread_read'] = thread_read()
+
+        assert wait_for(env, record_dir, FakeClock()) == 'finished code=0'
+        assert sr.read_record(Path(record_dir).name, root=env.fleet).claude_session_id == SESSION_ID
 
     def test_main_reports_a_gone_caller_on_stderr_only(
-        self, env: Env, fake_t3: FakeT3, capsys: pytest.CaptureFixture[str],
-        monkeypatch: pytest.MonkeyPatch,
+        self, env: Env, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         def gone(*_args: object, **_kwargs: object) -> str:
             raise lane.CallerGone('caller 4242 is gone')
@@ -1357,39 +1317,6 @@ class TestWait:
         captured = capsys.readouterr()
         assert (rc, captured.out) == (lane.INTERNAL_FAULT_EXIT, '')
         assert captured.err == 'spawn_t3_lane: caller 4242 is gone\n'
-
-    def test_a_failed_show_during_an_outage_is_not_mistaken_for_deletion(
-        self, env: Env, fake_t3: FakeT3, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        fake_t3.script(
-            list=[ok([]), unreachable(), ok([])],
-            show=[unreachable(), ok(THREAD_SHOW_JSON)],
-        )
-
-        assert self._wait(capsys, env, '') == 'finished code=0'
-
-    def test_each_poll_sweeps_the_projects_t3_records(
-        self, env: Env, fake_t3: FakeT3, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        fake_t3.script(list=[ok([])], show=[ok(THREAD_SHOW_JSON)])
-        record_dir = spawn_record(env, 'sibling-df-1-1')
-        sr.update_display('sibling-df-1-1', root=env.fleet, kind='t3', t3_thread_id='th-vanished')
-        time.sleep(0.01)
-
-        assert self._wait(capsys, env, '') == 'finished code=0'
-        record = sr.read_record(Path(record_dir).name, root=env.fleet)
-        assert (record.status, record.exit_code) == (sr.Status.EXITED, sr.ORPHAN_EXIT_CODE)
-
-    def test_an_unbound_record_is_bound_while_waiting(
-        self, env: Env, fake_t3: FakeT3, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        record_dir = spawn_record(env)
-        (Path(record_dir) / 'result.md').write_text('outcome: done\n')
-        write_transcript(env, SESSION_ID, trailer(record_dir))
-        fake_t3.script(list=[ok([listed()])])
-
-        assert self._wait(capsys, env, record_dir) == 'finished code=0'
-        assert sr.read_record(Path(record_dir).name, root=env.fleet).claude_session_id == SESSION_ID
 
 
 # ---------------------------------------------------------------------------
