@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Final
 
 from _git_repo import make_repo
-from _stores import RunsDb, TasksDb
+from _stores import EscalationQueueDir, RunsDb, TasksDb
 
 from client_feed.contract import FileRevealed, RevealRefused
 from client_feed.feed_io import CURSOR_FILENAME, Cursor, read_feed_lines
@@ -25,6 +25,7 @@ def reveal_policy(tmp_path: Path, in_dir: Path, *, project_id: str, committed_at
     repo.commit('c1', when=committed_at)
     TasksDb.create(repo.root)
     RunsDb.create(repo.root)
+    EscalationQueueDir.create(repo.root)
     out_dir = tmp_path / 'out'
     out_dir.mkdir()
     return Policy.model_validate(

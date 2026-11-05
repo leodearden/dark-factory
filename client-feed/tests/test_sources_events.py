@@ -25,7 +25,6 @@ from client_feed.sources.events import (
     VerifyVerdict,
     read_events,
     read_factory_status,
-    read_open_escalations,
     read_review_counts,
 )
 from client_feed.sources.store import StoreProblem, StoreReadError
@@ -438,102 +437,6 @@ class TestFactoryStatus:
             read_factory_status(root, now=at(0))
 
         assert caught.value.problem is StoreProblem.MISSING
-
-
-def escalation(escalation_id: str | None = None, **extra: object) -> dict:
-    data: dict = {'category': 'task_failure', 'summary': 'SECRET-SUMMARY /home/leo/x', **extra}
-    if escalation_id is not None:
-        data['escalation_id'] = escalation_id
-    return data
-
-
-class TestOpenEscalations:
-    def test_a_created_escalation_is_open_at_its_level(self, root: Path, runs: RunsDb) -> None:
-        runs.emit('escalation_created', at=at(0), task_id='9', data=escalation('esc-9-1', level=2))
-
-        assert read_open_escalations(root).levels(9) == (2,)
-
-    def test_a_resolution_by_id_closes_it(self, root: Path, runs: RunsDb) -> None:
-        runs.emit('escalation_created', at=at(0), task_id='9', data=escalation('esc-9-1', level=2))
-        runs.emit('escalation_resolved', at=at(1), task_id='9', data={'escalation_id': 'esc-9-1'})
-
-        assert read_open_escalations(root).levels(9) == ()
-
-    def test_a_resolution_by_ids_closes_only_the_listed(self, root: Path, runs: RunsDb) -> None:
-        for number in (1, 2, 3):
-            runs.emit(
-                'escalation_created', at=at(number), task_id='9',
-                data=escalation(f'esc-9-{number}', level=number),
-            )
-        runs.emit(
-            'escalation_resolved', at=at(5), task_id='9',
-            data={'outcome': 'steward_wait_timeout', 'escalation_ids': ['esc-9-1', 'esc-9-3']},
-        )
-
-        assert read_open_escalations(root).levels(9) == (2,)
-
-    def test_an_outcome_only_resolution_closes_its_task_only(
-        self, root: Path, runs: RunsDb
-    ) -> None:
-        runs.emit('escalation_created', at=at(0), task_id='9', data=escalation('esc-9-1', level=1))
-        runs.emit('escalation_created', at=at(1), task_id='9', data=escalation('esc-9-2', level=2))
-        runs.emit('escalation_created', at=at(2), task_id='10', data=escalation('esc-10-1', level=1))
-        runs.emit('escalation_resolved', at=at(3), task_id='9', data={'outcome': 'requeued'})
-
-        escalations = read_open_escalations(root)
-
-        assert (escalations.levels(9), escalations.levels(10)) == ((), (1,))
-
-    @pytest.mark.parametrize(
-        ('task_id', 'data'),
-        [
-            ('9', escalation(None, level=1)),
-            ('_mainprobe-1', escalation('esc-x-1', level=1)),
-            ('9', 'not json'),
-        ],
-    )
-    def test_a_created_row_without_an_id_or_task_opens_nothing(
-        self, root: Path, runs: RunsDb, task_id: str, data: dict | str
-    ) -> None:
-        runs.emit('escalation_created', at=at(0), task_id=task_id, data=data)
-
-        assert read_open_escalations(root).by_task == {}
-
-    @pytest.mark.parametrize('level', ['2', True, 1.0, None])
-    def test_a_level_that_is_not_an_integer_reads_as_unrecorded(
-        self, root: Path, runs: RunsDb, level: object
-    ) -> None:
-        runs.emit('escalation_created', at=at(0), task_id='9', data=escalation('esc-9-1', level=level))
-
-        assert read_open_escalations(root).levels(9) == (None,)
-
-    def test_an_absent_level_reads_as_unrecorded(self, root: Path, runs: RunsDb) -> None:
-        runs.emit('escalation_created', at=at(0), task_id='9', data=escalation('esc-9-1'))
-
-        assert read_open_escalations(root).levels(9) == (None,)
-
-    def test_resolving_an_unknown_id_changes_nothing(self, root: Path, runs: RunsDb) -> None:
-        runs.emit('escalation_created', at=at(0), task_id='9', data=escalation('esc-9-1', level=1))
-        runs.emit('escalation_resolved', at=at(1), task_id='9', data={'escalation_id': 'esc-9-7'})
-
-        assert read_open_escalations(root).levels(9) == (1,)
-
-    def test_a_task_with_no_escalation_has_no_levels(self, root: Path, runs: RunsDb) -> None:
-        assert read_open_escalations(root).levels(9) == ()
-
-    def test_no_escalation_text_reaches_the_result(self, root: Path, runs: RunsDb) -> None:
-        runs.emit('escalation_created', at=at(0), task_id='9', data=escalation('esc-9-1', level=2))
-
-        escalations = read_open_escalations(root)
-
-        assert 'SECRET-' not in repr(escalations)
-        assert '/home/' not in repr(escalations)
-
-    def test_a_missing_store_is_refused(self, root: Path) -> None:
-        with pytest.raises(StoreReadError) as caught:
-            read_open_escalations(root)
-
-        assert (caught.value.source, caught.value.problem) == (Source.EVENTS, StoreProblem.MISSING)
 
 
 def review(cycle: int, blocking: int, suggestions: int, by_category: dict[str, int]) -> dict:
