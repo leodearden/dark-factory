@@ -1386,8 +1386,14 @@ Anything else resets, as before. That includes a `NaN` `exited_at`, which
   - `preserved` means "a reclaim candidate held back". An unchanged lane has
     nothing to reclaim, so folding it in would hide a growing shield inside
     ordinary idleness.
-  - No Python consumer parses the line: `GitOps._run_warm_lane_gc_reclaim`
-    discards stdout on rc=0. S-discard1 pins the full line.
+  - The orchestrator arm parses the line, in
+    `orchestrator/src/orchestrator/warm_lane_gc_summary.py::parse_reclaim_summary`
+    (task 7857). It keys on field names, so either copy's set is accepted;
+    reify's has `reset_cold` and no record-gate fields. It REQUIRES `reset`,
+    `removed` and `preserved`, so renaming one of them makes every pass log
+    an "uncounted" WARNING. Each rc=0 pass logs one INFO "reclaim pass"
+    record carrying `origin`, `script` and `duration_s` plus every field.
+    S-discard1 pins the full line.
 - **`base_gen` is compared exactly, never normalised.** Taking the realpath of a
   stamp that recorded the `base/target` symlink would resolve it to whatever gen
   is current now. That reads as a silent "always the same gen", the unsafe
