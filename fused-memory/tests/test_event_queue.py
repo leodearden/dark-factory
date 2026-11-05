@@ -41,6 +41,10 @@ async def _wait_for(
 ):
     """Poll ``get_current()`` until ``predicate`` accepts its value, or the deadline lapses.
 
+    New waits for a real-EventBuffer drainer commit use ``_signal_after_commits``,
+    which has no deadline to race; this poll and its ``_wait_for_buffer_size`` /
+    ``_wait_for_drained`` wrappers remain only for their existing call sites.
+
     Load-tolerant alternative to gating a drainer handoff on
     ``asyncio.wait_for(queue._queue.join(), timeout=<small>)``: that pattern
     ties the pass/fail line to how fast a (possibly starved, under full-suite
@@ -971,15 +975,12 @@ def test_read_dead_letters_basic_keys(tmp_path):
 def test_read_dead_letters_limit(tmp_path):
     """read_dead_letters(limit=N) returns at most N records, newest-first."""
     dl = tmp_path / 'dl.jsonl'
-    seed_dead_letters(dl, [_make_event() for _ in range(5)])
+    events = [_make_event() for _ in range(5)]
+    seed_dead_letters(dl, events)
     q = EventQueue(AsyncMock(), dead_letter_path=dl)
 
     limited = q.read_dead_letters(limit=2)
-    assert len(limited) == 2
-    # Newest-first: the last 2 written records should be returned first.
-    all_records = q.read_dead_letters()
-    assert len(all_records) == 5
-    assert limited == all_records[:2]
+    assert [r['event']['id'] for r in limited] == [e.id for e in reversed(events)][:2]
 
 
 def test_read_dead_letters_project_id_filter(tmp_path):
@@ -1004,13 +1005,15 @@ def test_read_dead_letters_project_id_filter(tmp_path):
 def test_read_dead_letters_after_rotation(tmp_path):
     """After rotation, read_dead_letters merges current + rotated files newest-first."""
     dl = tmp_path / 'dl.jsonl'
-    seed_dead_letters(tmp_path / 'dl.jsonl.1', [_make_event() for _ in range(2)])
-    seed_dead_letters(dl, [_make_event()])
+    rotated = [_make_event() for _ in range(2)]
+    current = [_make_event()]
+    seed_dead_letters(tmp_path / 'dl.jsonl.1', rotated)
+    seed_dead_letters(dl, current)
     q = EventQueue(AsyncMock(), dead_letter_path=dl, keep_rotations=2)
 
     all_records = q.read_dead_letters()
-    assert len(all_records) == 3, (
-        f'Must return records from current + rotated file; got {len(all_records)}'
+    assert [r['event']['id'] for r in all_records] == (
+        [e.id for e in reversed(current)] + [e.id for e in reversed(rotated)]
     )
 
 
