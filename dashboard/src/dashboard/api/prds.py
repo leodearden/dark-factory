@@ -1,62 +1,106 @@
-"""`/api/v2/dashboard/prds` — one PRD view per project root, as a ``Datum``.
+"""`/api/v2/dashboard/prds` — one PRD view and one contention line per project root.
 
-Serves ``{"PRD_VIEW": {label: Datum[PrdView]}, "served_at": iso}`` (PRD
-``plans/dashboard-prd-lanes-prd.md`` §4.4, §5.6). This is the γ1 subset of
-§5.5's ``PrdView``: per-PRD segments, totals, open members and ready age;
-closed PRDs; unattributed done; dark matter; the multi-link count; each
-input's provenance; and every figure's rule text. γ2 adds lanes, signals,
-activity and a second per-project datum beside this one.
+Serves ``{"PRD_VIEW": {label: Datum[PrdView]}, "PRD_CONTENTION": {label:
+Datum[Contention]}, "served_at": iso}`` (PRD ``plans/dashboard-prd-lanes-prd.md``
+§4.4, §5.5, §5.6). The view carries each PRD's segments, lane, state line,
+signal mark, next action and detail; the contention line the lock keys the
+ready set wants and who holds them.
 
 Each root ACQUIRES its inputs inside a budgeted fan-out: its snapshot unit,
-the same cache ``/tasks`` reads, and its lineage index. Each view is then
-built at ``served_at`` and validated again here, and any failure degrades
-that one root to an explained ``unknown``, so the endpoint always answers 200.
+the same cache ``/tasks`` reads, its lineage index, its scheduler state and its
+run ledger's activity together, then the documents of the PRDs it draws. The
+escalation corpus and the run-ledger connections are acquired once per
+request, before the fan-out and under its deadline. Each datum is then built
+at ``served_at`` and validated again here. The two degrade apart: a scheduler
+failure degrades only ``PRD_CONTENTION``, a lineage failure only
+``PRD_VIEW``, and any failure degrades that one root's datum to an explained
+``unknown``, so the endpoint always answers 200.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import TypeVar
 
+import aiosqlite
 import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from dashboard.config import DashboardConfig
 from dashboard.data.active_tasks import TasksBudget
-from dashboard.data.datum import Datum, DatumContractError, unknown_datum, validate_datum
-from dashboard.data.prd_view import PrdView, PrdViewInputs, build_prd_view, validate_prd_view
+from dashboard.data.datum import (
+    Datum,
+    DatumContractError,
+    map_datum,
+    unknown_datum,
+    validate_datum,
+)
+from dashboard.data.db import DbPool
+from dashboard.data.escalation_corpus import (
+    EscalationCorpus,
+    acquire_corpus,
+    corpus_queues,
+    pending_level2_by_task,
+)
+from dashboard.data.prd_contention import (
+    Contention,
+    ContentionInputs,
+    build_contention,
+    validate_contention,
+)
+from dashboard.data.prd_signal import PRD_DOCUMENTS_REQUEST_WAIT_SECONDS, read_prd_documents
+from dashboard.data.prd_view import (
+    PrdView,
+    PrdViewInputs,
+    build_prd_view,
+    open_work_keys,
+    validate_prd_view,
+)
+from dashboard.data.scheduler import SCHEDULER_STATE_REQUEST_WAIT_SECONDS, acquire_scheduler_state
+from dashboard.data.task_activity import (
+    ACTIVITY_REQUEST_WAIT_SECONDS,
+    RUNS_DB,
+    acquire_activity,
+)
 from dashboard.data.task_lineage import acquire_lineage
 from dashboard.data.task_snapshot import acquire_snapshot
 from dashboard.data.utils import resolve_now
+from dashboard.project_dbs import _project_scoped_dbs_labeled
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+T = TypeVar('T')
 
-PRDS_BUDGET = TasksBudget(per_project=14.0, total=20.0, root_concurrency=4)
+
+PRDS_BUDGET = TasksBudget(per_project=18.0, total=20.0, root_concurrency=4)
 """The three bounds the /prds per-root fan-out runs under, read at each request.
 
-The figures are /tasks', by the same arithmetic. ``per_project`` (14.0 s)
-holds the snapshot unit's roster, ``task_snapshot.PER_CALL_TIMEOUT`` (4.4) x
-its three bounded operations = 13.2 s; the lineage index waits only
-``task_lineage.LINEAGE_REQUEST_WAIT_SECONDS`` (5.0) inside it. ``total``
-(20.0 s) is 10 s under ``data.js``'s 30 s fetch abort, so a degraded payload
-still renders. ``root_concurrency`` (4) keeps the walk parallel but bounded.
-``dashboard/tests/test_prds_budget.py`` checks the constraints.
+``per_project`` (18.0 s) holds a root's two sequential stages. The first is
+its snapshot unit's roster, ``task_snapshot.PER_CALL_TIMEOUT`` (4.4) x its
+three bounded operations = 13.2 s; the lineage index, scheduler state and
+activity run beside it and wait at most 5.0, 4.0 and 4.0 s. The second is its
+PRD documents, waiting at most ``prd_signal.PRD_DOCUMENTS_REQUEST_WAIT_SECONDS``
+(4.0): 13.2 + 4.0 = 17.2 s. ``total`` (20.0 s) is 10 s under ``data.js``'s
+30 s fetch abort, so a degraded payload still renders. ``root_concurrency`` (4)
+keeps the walk parallel but bounded. ``dashboard/tests/test_prds_budget.py``
+checks the constraints.
 """
 
 STAND_IN_VIEW_BOUND_SECONDS = 900
-"""The freshness bound of the unknown served in place of a view this render
-could not acquire, build or validate.
+"""The freshness bound of the unknown served in place of a view or contention
+line this render could not acquire, build or validate.
 
 An unknown has no ``as_of``, so its bound only states the contract a served
-view keeps. A built view takes its oldest input's bound, so a stand-in states
-the loosest any input carries, the lineage index's;
+datum keeps. A built datum takes its oldest input's bound, so a stand-in
+states the loosest any input carries, the lineage index's;
 ``dashboard/tests/test_prds_budget.py`` pins that equality.
 """
 
@@ -68,42 +112,95 @@ class RootUnserved:
     reason: str
 
 
+@dataclass(frozen=True, slots=True)
+class RootInputs:
+    """What one root's two datums are built from."""
+
+    view: PrdViewInputs
+    contention: ContentionInputs
+
+
+@dataclass(frozen=True, slots=True)
+class _RequestReads:
+    """The reads one request makes once for every root: the corpus and each root's runs.db."""
+
+    corpus: Datum[EscalationCorpus]
+    runs_dbs: Mapping[str, aiosqlite.Connection | None]
+
+
 async def _acquire_inputs(
-    client: httpx.AsyncClient, config: DashboardConfig, root: Path, *, now: datetime,
-) -> PrdViewInputs:
-    snapshot, lineage = await asyncio.gather(
+    client: httpx.AsyncClient,
+    config: DashboardConfig,
+    root: Path,
+    reads: _RequestReads,
+    *,
+    now: datetime,
+) -> RootInputs:
+    snapshot, lineage, scheduler_state, activity = await asyncio.gather(
         acquire_snapshot(client, config, root, now=now),
         acquire_lineage(client, config, root, now=now),
+        acquire_scheduler_state(
+            client, config, root, now=now, wait_seconds=SCHEDULER_STATE_REQUEST_WAIT_SECONDS,
+        ),
+        acquire_activity(
+            reads.runs_dbs.get(str(root)), root, now=now, wait_seconds=ACTIVITY_REQUEST_WAIT_SECONDS,
+        ),
     )
-    return PrdViewInputs(
+    keys = open_work_keys(
+        str(root), snapshot.status_map, snapshot.rows.value or [], lineage.value or {},
+    )
+    documents = await read_prd_documents(
+        root, keys, now=now, wait_seconds=PRD_DOCUMENTS_REQUEST_WAIT_SECONDS,
+    )
+    view = PrdViewInputs(
         project_root=str(root),
         status_map=snapshot.status_map,
         census=snapshot.census,
         rows=snapshot.rows,
         lineage=lineage,
+        escalations=pending_level2_by_task(reads.corpus, str(root)),
+        activity=activity,
+        documents=documents,
+        liveness=map_datum(snapshot.rows, lambda _rows: snapshot.holder_liveness),
     )
+    contention = ContentionInputs(
+        project_root=str(root),
+        status_map=snapshot.status_map,
+        census=snapshot.census,
+        rows=snapshot.rows,
+        activity=activity,
+        scheduler=scheduler_state,
+    )
+    return RootInputs(view=view, contention=contention)
 
 
 async def _acquire_within_budget(
     client: httpx.AsyncClient,
     config: DashboardConfig,
+    pool: DbPool,
     *,
     now: datetime,
     budget: TasksBudget,
-) -> dict[Path, PrdViewInputs | RootUnserved]:
+) -> dict[Path, RootInputs | RootUnserved]:
     """Every configured root's inputs, or why a root has none, in canonical root order.
 
     Mirrors ``dashboard/src/dashboard/data/active_tasks.py::_serve_roots_within_budget``
     without its admission rotation: one deadline, a bounded semaphore, and a
     per-root ``wait_for`` sized after admission, so one slow or broken root
-    never blanks the others.
+    never blanks the others. The request-wide reads come first, inside the
+    same deadline, so what they spend comes out of every root's remaining time.
     """
     loop = asyncio.get_running_loop()
     deadline = loop.time() + budget.total
     slots = asyncio.Semaphore(budget.root_concurrency)
     labels = config.project_labels
+    corpus, runs_dbs = await asyncio.gather(
+        acquire_corpus(corpus_queues(config), now=now),
+        _project_scoped_dbs_labeled(config, pool, RUNS_DB),
+    )
+    reads = _RequestReads(corpus=corpus, runs_dbs=dict(runs_dbs))
 
-    async def _one(root: Path) -> PrdViewInputs | RootUnserved:
+    async def _one(root: Path) -> RootInputs | RootUnserved:
         label = labels.of(root)
         async with slots:
             remaining = deadline - loop.time()
@@ -115,7 +212,7 @@ async def _acquire_within_budget(
                 )
             try:
                 return await asyncio.wait_for(
-                    _acquire_inputs(client, config, root, now=now),
+                    _acquire_inputs(client, config, root, reads, now=now),
                     timeout=min(remaining, budget.per_project),
                 )
             except TimeoutError:
@@ -146,17 +243,17 @@ def _unserved(label: str, reason: str) -> RootUnserved:
     return RootUnserved(reason)
 
 
-def _served_view(
-    label: str, inputs: PrdViewInputs | RootUnserved, served_at: datetime,
-) -> Datum[PrdView]:
-    """*label*'s view at *served_at*, validated here as well as where it was built."""
-    if isinstance(inputs, RootUnserved):
-        return unknown_datum(inputs.reason, STAND_IN_VIEW_BOUND_SECONDS)
-    what = f"project {label}'s PRD view"
+def _served(
+    what: str,
+    build: Callable[[], Datum[T]],
+    validate: Callable[[T], None],
+    served_at: datetime,
+) -> Datum[T]:
+    """*build*'s datum, validated here as well as where it was built; unknown if either breaks."""
     try:
-        datum = build_prd_view(inputs, now=served_at)
+        datum = build()
         if datum.value is not None:
-            validate_prd_view(datum.value, inputs.status_map)
+            validate(datum.value)
         validate_datum(datum, served_at)
     except DatumContractError as broken:
         logger.warning(
@@ -181,22 +278,61 @@ def _served_view(
     return datum
 
 
+def _served_view(
+    label: str, inputs: RootInputs | RootUnserved, served_at: datetime,
+) -> Datum[PrdView]:
+    """*label*'s view at *served_at*."""
+    if isinstance(inputs, RootUnserved):
+        return unknown_datum(inputs.reason, STAND_IN_VIEW_BOUND_SECONDS)
+    view = inputs.view
+    return _served(
+        f"project {label}'s PRD view",
+        lambda: build_prd_view(view, now=served_at),
+        lambda value: validate_prd_view(value, view.status_map),
+        served_at,
+    )
+
+
+def _served_contention(
+    label: str, inputs: RootInputs | RootUnserved, served_at: datetime,
+) -> Datum[Contention]:
+    """*label*'s contention line at *served_at*."""
+    if isinstance(inputs, RootUnserved):
+        return unknown_datum(inputs.reason, STAND_IN_VIEW_BOUND_SECONDS)
+    contention = inputs.contention
+    return _served(
+        f"project {label}'s contention line",
+        lambda: build_contention(contention, now=served_at),
+        validate_contention,
+        served_at,
+    )
+
+
 @router.get('/api/v2/dashboard/prds')
 async def api_prds(request: Request) -> JSONResponse:
-    """One PRD view per configured root, keyed by its label, plus ``served_at``.
+    """One PRD view and one contention line per configured root, keyed by its label.
 
     ``render_at`` stamps what this render measures; ``served_at`` is resolved
-    after the fan-out, and every view is built and validated at it, so the
+    after the fan-out, and every datum is built and validated at it, so the
     composite's aged inputs and the freshness check read the same instant.
     """
     config: DashboardConfig = request.app.state.config
     client: httpx.AsyncClient = request.app.state.http_client
+    pool: DbPool = request.app.state.db
     render_at = resolve_now(None)
-    acquired = await _acquire_within_budget(client, config, now=render_at, budget=PRDS_BUDGET)
+    acquired = await _acquire_within_budget(
+        client, config, pool, now=render_at, budget=PRDS_BUDGET,
+    )
     served_at = resolve_now(None)
     labels = config.project_labels
-    views = {
-        labels.of(root): _served_view(labels.of(root), inputs, served_at).to_wire()
-        for root, inputs in acquired.items()
-    }
-    return JSONResponse({'PRD_VIEW': views, 'served_at': served_at.isoformat()})
+    views: dict[str, object] = {}
+    contentions: dict[str, object] = {}
+    for root, inputs in acquired.items():
+        label = labels.of(root)
+        views[label] = _served_view(label, inputs, served_at).to_wire()
+        contentions[label] = _served_contention(label, inputs, served_at).to_wire()
+    return JSONResponse({
+        'PRD_VIEW': views,
+        'PRD_CONTENTION': contentions,
+        'served_at': served_at.isoformat(),
+    })

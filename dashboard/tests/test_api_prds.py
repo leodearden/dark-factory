@@ -41,6 +41,7 @@ from fastapi.testclient import TestClient
 from shared.task_statuses import TaskStatus
 
 from dashboard.api import prds
+from dashboard.app import app
 from dashboard.data import task_lineage
 from dashboard.data.census import build_census
 from dashboard.data.prd_view import Segment
@@ -63,8 +64,11 @@ def bodies(_client: TestClient, tmp_path_factory: pytest.TempPathFactory) -> dic
 
 
 @pytest.fixture(scope='module')
-def lanes(_client: TestClient, tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
-    return prd_lanes_family(_client, tmp_path_factory.mktemp('prd_lanes'))
+def lanes(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
+    """Served under a lifespan of its own, as ``build_all`` serves it: built lazily, it would
+    otherwise read a run-ledger pool an earlier ``client`` test's lifespan already closed."""
+    with TestClient(app) as client:
+        return prd_lanes_family(client, tmp_path_factory.mktemp('prd_lanes'))
 
 
 def _row(view: dict[str, Any], key: str) -> dict[str, Any]:
