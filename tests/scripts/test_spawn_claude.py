@@ -56,6 +56,7 @@ if str(_ORCH_TESTS) not in sys.path:
     sys.path.append(str(_ORCH_TESTS))
 
 from _fake_t3_server import (  # noqa: E402  # pyright: ignore[reportMissingImports]  # debt: ticket tkt_0RWM91VJZ090GZN83A13S8E9N7
+    DEAD_ORIGIN,
     ENVIRONMENT_ID,
     FakeT3Server,
     RecordedRequest,
@@ -5073,6 +5074,7 @@ class _T3Lane:
         self.script = SPAWN_SCRIPT
         self.scenario: dict[str, Any] = {
             "workspace_root": str(self.cwd),
+            "project_archived_at": None,
             "thread_status": "running",
             "latest_run_id": "run-1",
             "archived_after_reads": None,
@@ -5094,7 +5096,7 @@ class _T3Lane:
     def answer_project_list(self, arguments: Mapping[str, Any]) -> ToolSuccess:
         project = {
             "id": _T3_PROJECT_ID, "title": "df", "workspaceRoot": self.scenario["workspace_root"],
-            "archivedAt": None, "deletedAt": None,
+            "archivedAt": self.scenario["project_archived_at"], "deletedAt": None,
         }
         return ToolSuccess({"projects": [project], "nextCursor": None})
 
@@ -5286,6 +5288,17 @@ def test_t3_lane_without_a_credential_or_a_t3_to_self_pair_names_the_pair_verb(t
     assert not t3_lane.started_threads()
 
 
+def test_t3_lane_with_nothing_answering_the_runtime_origin_says_start_t3_not_pair(t3_lane: _T3Lane) -> None:
+    t3_lane.env["T3CODE_HOME"] = str(_write_t3_home(t3_lane.tmp_path / "dead", 1, "2026-10-23T09:09:43.139Z", DEAD_ORIGIN))
+
+    result = t3_lane.run()
+
+    stderr = result.stderr.decode()
+    assert result.returncode == 126, f"stderr: {stderr}"
+    assert "descriptor-unreachable" in stderr and "start T3 Code" in stderr
+    assert "spawn_t3_lane.py pair" not in stderr
+
+
 def test_t3_lane_refuses_a_cwd_outside_every_t3_project(t3_lane: _T3Lane) -> None:
     t3_lane.scenario["workspace_root"] = str(t3_lane.tmp_path / "elsewhere")
 
@@ -5295,6 +5308,17 @@ def test_t3_lane_refuses_a_cwd_outside_every_t3_project(t3_lane: _T3Lane) -> Non
     assert result.returncode == 145, f"stderr: {stderr}"
     assert "cwd-outside-projects" in stderr and f"cwd={t3_lane.cwd}" in stderr
     assert "explicitly (CLAUDE_SPAWN_BACKEND=t3)" in stderr
+    assert not t3_lane.started_threads()
+
+
+def test_t3_lane_refuses_a_cwd_only_an_archived_project_contains_naming_its_root(t3_lane: _T3Lane) -> None:
+    t3_lane.scenario["project_archived_at"] = "2026-10-30T00:00:00.000Z"
+
+    result = t3_lane.run()
+
+    stderr = result.stderr.decode()
+    assert result.returncode == 145, f"stderr: {stderr}"
+    assert f"project-archived: {os.path.realpath(t3_lane.cwd)}" in stderr
     assert not t3_lane.started_threads()
 
 
@@ -5323,14 +5347,15 @@ def test_t3_lane_refuses_a_worktree_t3_does_not_list_with_t3s_own_message(t3_lan
     assert t3_lane.record().display is None
 
 
-def test_t3_lane_launch_failure_prints_t3s_detail_and_is_127(t3_lane: _T3Lane) -> None:
-    t3_lane.server.tool_replies["t3_thread_launch"] = ToolFailure("orchestration_error", "x")
+def test_t3_lane_launch_failure_prints_t3s_detail_verbatim_and_is_127(t3_lane: _T3Lane) -> None:
+    detail = "50% of %41 \\n \u2014 x"
+    t3_lane.server.tool_replies["t3_thread_launch"] = ToolFailure("orchestration_error", detail)
 
     result = t3_lane.run()
 
     stderr = result.stderr.decode()
     assert result.returncode == 127, f"stderr: {stderr}"
-    assert "orchestration_error: x" in stderr
+    assert f"orchestration_error: {detail}" in stderr
 
 
 def test_t3_thread_that_fails_before_running_is_failed_to_start(t3_lane: _T3Lane) -> None:
