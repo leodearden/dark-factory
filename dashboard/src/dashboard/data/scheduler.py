@@ -85,6 +85,7 @@ from shared.scheduler_state import (
 
 from dashboard.config import DashboardConfig
 from dashboard.data.active_tasks import collect_tasks_with_counts
+from dashboard.data.lock_contention import holder_of, lock_wanters
 from dashboard.data.mcp_fanout import TTLCache, fanout_label, first_success
 from dashboard.data.memory import mcp_tool_call
 from dashboard.data.task_snapshot import SnapshotHealth, classify
@@ -233,7 +234,9 @@ def _module_contention_counts(
 
     For each module path that appears in any task's ``lock_set`` **or** in
     ``park_stacks`` keys, count how many live tasks include it and attach park
-    ownership data.
+    ownership data.  Counting and holder resolution are
+    ``dashboard/src/dashboard/data/lock_contention.py``'s, the rule the PRD
+    view's contention line shares.
 
     The holder for a module is resolved via the shared hierarchical prefix rule
     (``modules_conflict``), not dict-equality, so a holder key that is a
@@ -284,10 +287,7 @@ def _module_contention_counts(
           parked_owner_live bool       True iff parked_by is in live_task_ids
           park_stack       list[dict]  stack entries each enriched with ``live``
     """
-    counts: dict[str, int] = {}
-    for row in rows:
-        for path in row.get('lock_set') or []:
-            counts[path] = counts.get(path, 0) + 1
+    counts = lock_wanters(row.get('lock_set') or [] for row in rows)
 
     # All paths to produce entries for: contended paths ∪ park_stacks keys.
     # A fully-stranded module (dead park, no live waiters) has no entry in
@@ -314,16 +314,7 @@ def _module_contention_counts(
     result: list[dict] = []
     for path in all_paths:
         count = counts.get(path, 0)
-        # Resolve the holder via the shared hierarchical prefix rule rather than
-        # dict-equality.  Both *path* (a normalized module key) and the
-        # current_holders keys are normalized to lock_depth, so the common case
-        # is an exact match — but a holder key with fewer than lock_depth
-        # components (a sub-depth parent) still conflicts with this child
-        # module, and modules_conflict catches it where `.get(path)` would miss.
-        holder = next(
-            (tid for mod, tid in current_holders.items() if modules_conflict(mod, path)),
-            None,
-        )
+        holder = holder_of(path, current_holders)
         holder_live = (
             (holder in live_task_ids)
             if (holder is not None and live_task_ids is not None)
