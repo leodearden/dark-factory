@@ -117,6 +117,7 @@ from orchestrator.verify_cancel import (
     write_lock_holder_pgid,
 )
 from orchestrator.verify_classify import reports_disk_full
+from orchestrator.warm_lane_gc_summary import log_reclaim_outcome
 from orchestrator.warm_lane_pool import WarmLanePool, WarmLanePoolCensus, WarmLanePoolShrink
 from orchestrator.worktree_admin_entries import unlock_dangling_locked_entries
 from orchestrator.worktree_identity import identities_match, read_worktree_title
@@ -6237,8 +6238,11 @@ class GitOps:
         removal still work, so reclaim is degraded rather than dead.
 
         Fail-soft: absent script → 127 sentinel; any unexpected exception → 127;
-        never raises.  A non-zero exit is logged at WARNING and treated as
-        'nothing reclaimed' by the caller (``_warm_lane_disk_admission_blocked``).
+        never raises.  The run's outcome (the rc!=0 WARNING, or on rc=0 the
+        per-pass record) is logged by
+        ``orchestrator/src/orchestrator/warm_lane_gc_summary.py::log_reclaim_outcome``;
+        a non-zero exit is treated as 'nothing reclaimed' by the caller
+        (``_warm_lane_disk_admission_blocked``).
 
         **Merge-verify lease guard (task 2315, BUG 1)**: defers (127) while
         any PERSISTENT-LANE merge-verify lease is held — INCLUDING our own.
@@ -6321,11 +6325,12 @@ class GitOps:
                     'plus disk-pressure target rm',
                     seed, script,
                 )
-            rc, _, err = await _run(cmd, cwd=self.project_root)
-            if rc != 0:
-                logger.warning(
-                    '_run_warm_lane_gc_reclaim: script exited %d (stderr=%r)', rc, err,
-                )
+            started = time.monotonic()
+            rc, out, err = await _run(cmd, cwd=self.project_root)
+            log_reclaim_outcome(
+                rc=rc, stdout=out, stderr=err, script=script, origin=origin,
+                duration_secs=time.monotonic() - started,
+            )
             return rc
         except Exception:
             logger.warning(

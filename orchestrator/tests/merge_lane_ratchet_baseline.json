@@ -68,7 +68,7 @@
     "complete": true
   },
   "files": {
-    "orchestrator/src/orchestrator/git_ops.py": {"cognitive": 1505, "function_local_imports": 4, "lines": 16520, "prose_lines": 9447, "reexport_names": 1},
+    "orchestrator/src/orchestrator/git_ops.py": {"cognitive": 1504, "function_local_imports": 4, "lines": 16525, "prose_lines": 9450, "reexport_names": 1},
     "orchestrator/src/orchestrator/lane_lifecycle.py": {"cognitive": 58, "function_local_imports": 1, "lines": 866, "prose_lines": 360, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/__init__.py": {"cognitive": 0, "function_local_imports": 0, "lines": 98, "prose_lines": 21, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/coalesce_unwind.py": {"cognitive": 9, "function_local_imports": 0, "lines": 100, "prose_lines": 22, "reexport_names": 0},
@@ -182,7 +182,7 @@
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_run_thin_warm_lane": 7,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_run_warm_lane_audit": 6,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_run_warm_lane_disk_guard": 3,
-    "orchestrator/src/orchestrator/git_ops.py::GitOps::_run_warm_lane_gc_reclaim": 7,
+    "orchestrator/src/orchestrator/git_ops.py::GitOps::_run_warm_lane_gc_reclaim": 6,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_run_warm_lane_soft_guard": 3,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_safe_restore_park_with_recovery": 4,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_scan_merge_marker": 1,
