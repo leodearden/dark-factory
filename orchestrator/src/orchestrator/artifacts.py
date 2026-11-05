@@ -8,7 +8,7 @@ import os
 import re
 import shutil
 import stat
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
@@ -1257,10 +1257,10 @@ class TaskArtifacts:
         Raises:
             ReviewsRootMissing: the root holding reviews/ no longer exists.
         """
-        root = self._root_for('reviews')
-        if not root.is_dir():
-            raise ReviewsRootMissing(reviewer_name, root)
-        self._write_json(f'reviews/{reviewer_name}.json', review)
+        self._write_json(
+            f'reviews/{reviewer_name}.json', review,
+            on_root_gone=lambda root: ReviewsRootMissing(reviewer_name, root),
+        )
 
     def read_reviews(self) -> dict[str, dict]:
         """Read all reviews from the reviews/ directory."""
@@ -1804,7 +1804,10 @@ class TaskArtifacts:
 
         return False
 
-    def _write_json(self, name: str, data: dict) -> None:
+    def _write_json(
+        self, name: str, data: dict,
+        *, on_root_gone: Callable[[Path], FileNotFoundError] | None = None,
+    ) -> None:
         """Write *data* to artifact *name* (routed by ``artifact_path``) as
         JSON, ATOMICALLY and DURABLY.
 
@@ -1812,6 +1815,13 @@ class TaskArtifacts:
         (metadata, plan, review_state, reviews, verdicts, agent_session,
         reconcile_state, the architect's report artifacts), and therefore the
         single owner of their byte format and their durability guarantees.
+
+        It is also the single owner of what a vanished root (the worktree
+        deleted out-of-band) means for a write. By default the write is a
+        logged no-op. A caller whose artifact must not be lost passes
+        *on_root_gone*: the root is then never recreated, only the artifact's
+        own directory below it, and a root found gone raises
+        ``on_root_gone(root)``.
 
         What a concurrent reader may rely on: it observes either the complete
         OLD contents or the complete NEW contents — never a truncated file,
@@ -1890,15 +1900,13 @@ class TaskArtifacts:
         into an O(n) rewrite while destroying the partial-read tolerance that
         makes a truncated log still usable line-by-line.
         """
-        # Tolerate a vanished worktree.  Callers that care about durability
-        # (init, plan, base_commit, reviews, etc.) check their root
-        # themselves; the opportunistic writes (verdicts, for one) just want
-        # a no-op when the worktree has been deleted out-of-band.
         path = self.artifact_path(name)
+        root = self._root_for(Path(name).parts[0])
         try:
             # Resolve FIRST — write through a symlink, never onto it.  Order
             # inside this block is deliberate: the refusal must precede any
-            # filesystem mutation, so dangling check → mode lookup → write.
+            # filesystem mutation, so dangling check → directory creation →
+            # mode lookup → write.
             target = Path(os.path.realpath(path))
             if path.is_symlink() and not target.parent.is_dir():
                 raise ArtifactWriteError(
@@ -1907,6 +1915,8 @@ class TaskArtifacts:
                     'dangling symlink?) — refusing to materialise a stray '
                     'file at the link path'
                 )
+            if on_root_gone is not None and path.parent != root:
+                path.parent.mkdir(exist_ok=True)
             # ``_existing_mode`` is inside the try so a NON-FileNotFoundError
             # stat failure (EACCES/ELOOP/ENAMETOOLONG) surfaces through the
             # same path as any other write failure.  It swallows
@@ -1922,14 +1932,14 @@ class TaskArtifacts:
                 json.dumps(data, indent=2) + '\n',  # byte format UNCHANGED
                 mode=_existing_mode(target),
                 fsync=True,
-                mkdir=True,
+                mkdir=on_root_gone is None,
             )
-        except FileNotFoundError:
-            root = self._root_for(Path(name).parts[0])
-            if not root.is_dir():
-                logger.info(
-                    'TaskArtifacts: skipping _write_json to %s — root %s no longer exists',
-                    path, root,
-                )
-                return
-            raise
+        except FileNotFoundError as exc:
+            if root.is_dir():
+                raise
+            if on_root_gone is not None:
+                raise on_root_gone(root) from exc
+            logger.info(
+                'TaskArtifacts: skipping _write_json to %s — root %s no longer exists',
+                path, root,
+            )

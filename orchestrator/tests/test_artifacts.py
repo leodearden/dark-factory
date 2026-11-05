@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 import pytest
 from _review_fixtures import review_aggregation, review_issue
+from _review_payloads import blocking_review, pass_review
 from shared import safe_io
 
 from orchestrator.artifacts import (
@@ -2035,25 +2036,7 @@ class TestStringItemResilience:
 
 
 class TestWorktreeMissingTolerance:
-    """A deleted worktree: the best-effort writes (write_verdict, _write_json)
-    survive it without raising, while write_review, whose output is the review
-    gate's only input, refuses loudly."""
-
-    def test_write_review_raises_when_root_gone(self, tmp_path: Path):
-        worktree = tmp_path / 'gone'
-        worktree.mkdir()
-        ta = TaskArtifacts(worktree)
-        ta.init('task-x', 'gone', 'desc')
-        shutil.rmtree(worktree)
-        assert not ta.task_root.is_dir()
-
-        with pytest.raises(ReviewsRootMissing) as excinfo:
-            ta.write_review('reviewer-x', {'verdict': 'PASS', 'issues': []})
-
-        assert isinstance(excinfo.value, FileNotFoundError)
-        assert 'reviewer-x' in str(excinfo.value)
-        assert str(ta.task_root) in str(excinfo.value)
-        assert not ta.task_root.exists()
+    """Best-effort writes survive a deleted worktree without raising."""
 
     def test_write_verdict_skips_when_root_gone(self, tmp_path: Path):
         worktree = tmp_path / 'gone-verdict'
@@ -2835,30 +2818,14 @@ class TestDualRootRouting(_DualRootLayout):
             arts.write_plan(copy.deepcopy(_PLAN), mutex_held=True)
 
 
-def _blocking_review(reviewer: str) -> dict:
-    return {
-        'reviewer': reviewer,
-        'verdict': 'ISSUES_FOUND',
-        'issues': [{
-            'severity': 'blocking', 'location': 'a.py:1',
-            'category': 'bug', 'description': f'stale finding from {reviewer}',
-        }],
-        'summary': 'stale',
-    }
-
-
-def _pass_review(reviewer: str) -> dict:
-    return {'reviewer': reviewer, 'verdict': 'PASS', 'issues': [], 'summary': 'ok'}
-
-
 class TestClearReviews(_DualRootLayout):
     """``clear_reviews()`` empties reviews/ so the next aggregation holds only
     reviews written after it (task 3158; PRD plans/task-meta-task-keying-prd.md
     boundary B7)."""
 
     def test_removes_every_review_and_keeps_the_dir(self, artifacts: TaskArtifacts):
-        artifacts.write_review('reviewer_comprehensive', _pass_review('reviewer_comprehensive'))
-        artifacts.write_review('merge', _blocking_review('merge'))
+        artifacts.write_review('reviewer_comprehensive', pass_review('reviewer_comprehensive'))
+        artifacts.write_review('merge', blocking_review('merge'))
         reviews_dir = artifacts.artifact_path('reviews')
         (reviews_dir / 'notes.txt').write_text('stray\n')
 
@@ -2871,10 +2838,10 @@ class TestClearReviews(_DualRootLayout):
     def test_a_retired_reviewers_blocking_file_is_not_aggregated_after_clear(
         self, artifacts: TaskArtifacts,
     ):
-        artifacts.write_review('reviewer_retired', _blocking_review('reviewer_retired'))
+        artifacts.write_review('reviewer_retired', blocking_review('reviewer_retired'))
 
         artifacts.clear_reviews()
-        artifacts.write_review('reviewer_comprehensive', _pass_review('reviewer_comprehensive'))
+        artifacts.write_review('reviewer_comprehensive', pass_review('reviewer_comprehensive'))
 
         agg = artifacts.aggregate_reviews()
         assert agg.has_blocking_issues is False
@@ -2887,12 +2854,12 @@ class TestClearReviews(_DualRootLayout):
         archive = artifacts.review_archive_dir('amend-1')
         archive.mkdir()
         (archive / 'reviewer_comprehensive.json').write_text(
-            json.dumps(_blocking_review('reviewer_comprehensive'))
+            json.dumps(blocking_review('reviewer_comprehensive'))
         )
         artifacts.write_verdict('judge', _VERDICT)
         artifacts.set_review_counters(review_cycles_total=2)
         artifacts.write_plan(copy.deepcopy(_PLAN))
-        artifacts.write_review('reviewer_comprehensive', _pass_review('reviewer_comprehensive'))
+        artifacts.write_review('reviewer_comprehensive', pass_review('reviewer_comprehensive'))
 
         artifacts.clear_reviews()
 
@@ -2902,7 +2869,7 @@ class TestClearReviews(_DualRootLayout):
         assert artifacts.read_plan()['steps'] == _PLAN['steps']
 
     def test_is_idempotent(self, artifacts: TaskArtifacts):
-        artifacts.write_review('reviewer_comprehensive', _pass_review('reviewer_comprehensive'))
+        artifacts.write_review('reviewer_comprehensive', pass_review('reviewer_comprehensive'))
 
         artifacts.clear_reviews()
         artifacts.clear_reviews()
@@ -2917,13 +2884,58 @@ class TestClearReviews(_DualRootLayout):
         assert not artifacts.task_root.exists()
 
     def test_dual_root_empties_the_task_root_reviews(self, arts, task):
-        arts.write_review('reviewer_comprehensive', _pass_review('reviewer_comprehensive'))
+        arts.write_review('reviewer_comprehensive', pass_review('reviewer_comprehensive'))
         assert (task / 'reviews' / 'reviewer_comprehensive.json').is_file()
 
         arts.clear_reviews()
 
         assert (task / 'reviews').is_dir()
         assert list((task / 'reviews').iterdir()) == []
+
+
+class TestWriteReviewRefusesVanishedRoot:
+    """``write_review`` raises instead of skipping when its root is gone, and
+    never recreates that root: reviews/ is the review gate's only input, so a
+    skipped write would read as a PASS (task 3158)."""
+
+    def test_raises_when_root_gone(self, tmp_path: Path):
+        worktree = tmp_path / 'gone'
+        worktree.mkdir()
+        ta = TaskArtifacts(worktree)
+        ta.init('task-x', 'gone', 'desc')
+        shutil.rmtree(worktree)
+        assert not ta.task_root.is_dir()
+
+        with pytest.raises(ReviewsRootMissing) as excinfo:
+            ta.write_review('reviewer-x', pass_review('reviewer-x'))
+
+        assert isinstance(excinfo.value, FileNotFoundError)
+        assert 'reviewer-x' in str(excinfo.value)
+        assert str(ta.task_root) in str(excinfo.value)
+        assert not ta.task_root.exists()
+
+    def test_a_root_vanishing_mid_write_raises_and_stays_gone(
+        self, artifacts: TaskArtifacts, monkeypatch: pytest.MonkeyPatch,
+    ):
+        real_write = safe_io.atomic_write_text
+
+        def root_vanishes_then_write(path, text, **kwargs):
+            shutil.rmtree(artifacts.task_root)
+            return real_write(path, text, **kwargs)
+
+        monkeypatch.setattr(safe_io, 'atomic_write_text', root_vanishes_then_write)
+
+        with pytest.raises(ReviewsRootMissing):
+            artifacts.write_review('reviewer_comprehensive', pass_review('reviewer_comprehensive'))
+
+        assert not artifacts.task_root.exists()
+
+    def test_creates_a_missing_reviews_dir_under_a_live_root(self, artifacts: TaskArtifacts):
+        shutil.rmtree(artifacts.artifact_path('reviews'))
+
+        artifacts.write_review('reviewer_comprehensive', pass_review('reviewer_comprehensive'))
+
+        assert set(artifacts.read_reviews()) == {'reviewer_comprehensive'}
 
 
 class TestReadTitle:

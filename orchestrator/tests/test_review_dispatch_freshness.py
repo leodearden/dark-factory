@@ -12,26 +12,15 @@ from unittest.mock import AsyncMock
 
 import pytest
 from _review_loop_harness import review_loop_workflow
+from _review_payloads import blocking_review
 
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
 
-def _blocking_review(reviewer: str) -> dict:
-    return {
-        'reviewer': reviewer,
-        'verdict': 'ISSUES_FOUND',
-        'issues': [{
-            'severity': 'blocking', 'location': 'a.py:1',
-            'category': 'bug', 'description': f'prior dispatch finding from {reviewer}',
-        }],
-        'summary': 'prior dispatch',
-    }
-
-
 def _seed_prior_dispatch_reviews(wf: TaskWorkflow) -> None:
     assert wf.artifacts is not None
-    wf.artifacts.write_review('reviewer_comprehensive', _blocking_review('reviewer_comprehensive'))
-    wf.artifacts.write_review('merge', _blocking_review('merge'))
+    wf.artifacts.write_review('reviewer_comprehensive', blocking_review('reviewer_comprehensive'))
+    wf.artifacts.write_review('merge', blocking_review('merge'))
 
 
 @pytest.mark.asyncio

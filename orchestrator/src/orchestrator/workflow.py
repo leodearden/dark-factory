@@ -11280,7 +11280,10 @@ class TaskWorkflow:
             )
 
         for role, result in zip(roster, results, strict=True):
-            if isinstance(result, Exception):
+            # BaseException, not Exception: gather returns a child's own
+            # CancelledError as a result, and a reviewer with no review would
+            # vanish from the aggregation, which the gate reads as PASS.
+            if isinstance(result, BaseException):
                 logger.error(
                     f'Reviewer {role.name} failed after retries: {result}',
                     exc_info=result,
@@ -11290,8 +11293,7 @@ class TaskWorkflow:
                     classify_reviewer_exception(result),
                     summary=f'Reviewer exception: {result}',
                 )
-            if isinstance(result, dict):
-                self.artifacts.write_review(role.name, result)
+            self.artifacts.write_review(role.name, result)
 
         return self.artifacts.aggregate_reviews()
 

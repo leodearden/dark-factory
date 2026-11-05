@@ -20,6 +20,8 @@ from unittest.mock import patch
 
 import pytest
 from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
+from _review_loop_harness import review_loop_workflow
+from _review_payloads import blocking_review
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import TASK_META_DIRNAME, GitConfig
@@ -35,6 +37,7 @@ from orchestrator.lane_lifecycle import (
     LaneLifecycle,
     LaneState,
 )
+from orchestrator.workflow import WorkflowOutcome
 
 # HONEST EXCEPTION in this family, recorded rather than papered over:
 # TestSingleWriterSourceScan does sweep every *.py under orchestrator/src via
@@ -833,18 +836,6 @@ class TestAcquireClearsForeignTaskMeta:
 # ---------------------------------------------------------------------------
 
 
-def _blocking_review(reviewer: str) -> dict:
-    return {
-        'reviewer': reviewer,
-        'verdict': 'ISSUES_FOUND',
-        'issues': [{
-            'severity': 'blocking', 'location': 'a.py:1',
-            'category': 'bug', 'description': f'stale finding from {reviewer}',
-        }],
-        'summary': 'stale',
-    }
-
-
 def _dispatch_view(lane: Path, task_id: str) -> TaskArtifacts:
     arts = TaskArtifacts.for_task(lane, task_id)
     arts.init(task_id, f'Task {task_id}', 'desc')
@@ -867,7 +858,7 @@ class TestWarmLaneHandoffReviewFreshness:
         assert isinstance(first, WorktreeInfo), f'Expected WorktreeInfo; got {first!r}'
         lane = first.path
         _dispatch_view(lane, 'OLD').write_review(
-            'reviewer_comprehensive', _blocking_review('reviewer_comprehensive'),
+            'reviewer_comprehensive', blocking_review('reviewer_comprehensive'),
         )
         assert git_ops.warm_lane_pool is not None
         await git_ops.warm_lane_pool.release(lane)
@@ -899,7 +890,7 @@ class TestWarmLaneHandoffReviewFreshness:
         residue_dir = TaskArtifacts.meta_root_for(git_ops.worktree_base, lane.name) / 'reviews'
         residue_dir.mkdir(parents=True, exist_ok=True)
         (residue_dir / 'reviewer_comprehensive.json').write_text(
-            json.dumps(_blocking_review('reviewer_comprehensive'))
+            json.dumps(blocking_review('reviewer_comprehensive'))
         )
         assert git_ops.warm_lane_pool is not None
         await git_ops.warm_lane_pool.release(lane)
@@ -914,9 +905,12 @@ class TestWarmLaneHandoffReviewFreshness:
         assert agg.reviews == {} and agg.errored_reviews == {}
         assert agg.has_blocking_issues is False
 
-    async def test_same_task_reuse_carries_prior_reviews_until_cleared(
-        self, git_repo: Path, caplog: pytest.LogCaptureFixture,
+    async def test_same_task_redispatch_clears_the_prior_dispatchs_reviews(
+        self, git_repo: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture,
     ):
+        """The workflow's dispatch-boundary guard, run over the reacquired
+        lane, removes what the prior dispatch left in reviews/ and keeps the
+        plan that the same-task reuse exists to carry."""
         await _add_warm_lane_scripts(git_repo)
         git_ops = GitOps(_warm_config(), git_repo, warm_lane_pool_size=1)
         start_ref = await _get_head(git_repo)
@@ -926,8 +920,7 @@ class TestWarmLaneHandoffReviewFreshness:
         lane = first.path
         prior = _dispatch_view(lane, 'OLD')
         prior.write_plan({'steps': [{'id': 'step-1', 'status': 'done', 'commit': 'abc'}]})
-        prior.set_review_counters(review_cycles_total=1)
-        prior.write_review('reviewer_comprehensive', _blocking_review('reviewer_comprehensive'))
+        prior.write_review('reviewer_comprehensive', blocking_review('reviewer_comprehensive'))
         assert git_ops.warm_lane_pool is not None
         await git_ops.warm_lane_pool.release(lane)
 
@@ -937,14 +930,15 @@ class TestWarmLaneHandoffReviewFreshness:
         assert isinstance(result, WorktreeInfo), f'Expected WorktreeInfo; got {result!r}'
         assert result.path == lane
         _assert_route_logged(caplog, AcquireRoute.DISK_BACKSTOP_REUSE)
-        redispatch = _dispatch_view(result.path, 'OLD')
-        assert set(redispatch.read_reviews()) == {'reviewer_comprehensive'}
+        wf = review_loop_workflow(tmp_path / 'review-loop', task_id='OLD')
+        wf.worktree = result.path
+        wf.artifacts = redispatch = _dispatch_view(result.path, 'OLD')
 
-        redispatch.clear_reviews()
+        outcome = await wf._execute_verify_review_loop()
 
+        assert outcome is WorkflowOutcome.DONE
         assert redispatch.read_reviews() == {}
         assert [s['id'] for s in redispatch.read_plan()['steps']] == ['step-1']
-        assert redispatch.get_review_cycles_total() == 1
 
 
 # ---------------------------------------------------------------------------
