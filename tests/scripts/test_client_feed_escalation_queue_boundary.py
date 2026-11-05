@@ -3,9 +3,10 @@
 The client-feed suite cannot import the escalation package, so its fixture records are
 hand-copied and cannot catch producer drift. Here the escalation server's own tools file,
 promote, park and resolve on a tmp root, and client-feed reads the queue they leave. Checked:
-`level` in every test; `members` through an L1 promoted under another task's L2; `status`
-through a resolution whose archival fails and leaves the closed records at the root; and
-archival and the L2 cascade.
+`level` in every test; that every record the producer leaves parses, in every read, so a
+status or type the reader refuses turns this red instead of reading as a close; `members`
+through an L1 promoted under another task's L2; `status` through a resolution whose archival
+fails and leaves the closed records at the root; and archival and the L2 cascade.
 """
 from __future__ import annotations
 
@@ -14,7 +15,7 @@ from typing import Any
 
 import pytest
 from client_feed.contract import TaskStatus, WaitingOn
-from client_feed.sources.escalations import read_open_escalations
+from client_feed.sources.escalations import OpenEscalations, read_open_escalations
 from client_feed.sources.tasks import waiting_on
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
@@ -83,8 +84,14 @@ async def _closed(server: FastMCP, l2_id: str) -> None:
     assert resolved['status'] in {'resolved', 'dismissed'}
 
 
+def _open_escalations(root: Path) -> OpenEscalations:
+    escalations = read_open_escalations(root)
+    assert escalations.skipped == ()
+    return escalations
+
+
 def _blocked_waits_on(root: Path, task_id: int) -> WaitingOn | None:
-    return waiting_on(TaskStatus.BLOCKED, read_open_escalations(root).levels(task_id))
+    return waiting_on(TaskStatus.BLOCKED, _open_escalations(root).levels(task_id))
 
 
 async def test_a_promoted_then_resolved_l2_waits_on_leo_then_on_the_factory(
@@ -101,7 +108,7 @@ async def test_a_promoted_then_resolved_l2_waits_on_leo_then_on_the_factory(
     await _closed(server, l2_id)
 
     assert _blocked_waits_on(root, TASK_ID) is WaitingOn.FACTORY
-    assert read_open_escalations(root).levels(TASK_ID) == ()
+    assert _open_escalations(root).levels(TASK_ID) == ()
 
 
 async def test_a_promoted_l2_makes_its_member_task_wait_on_leo_until_the_cascade(
@@ -120,7 +127,7 @@ async def test_a_promoted_l2_makes_its_member_task_wait_on_leo_until_the_cascade
 
     assert _blocked_waits_on(root, MEMBER_TASK_ID) is WaitingOn.FACTORY
     assert _blocked_waits_on(root, TASK_ID) is WaitingOn.FACTORY
-    assert read_open_escalations(root).levels(MEMBER_TASK_ID) == ()
+    assert _open_escalations(root).levels(MEMBER_TASK_ID) == ()
 
 
 async def test_a_resolution_left_at_the_root_by_a_failed_archival_is_not_open(
@@ -135,8 +142,8 @@ async def test_a_resolution_left_at_the_root_by_a_failed_archival_is_not_open(
     assert {path.stem for path in queue.glob('esc-*.json')} == {l1_id, l2_id}
     assert _blocked_waits_on(root, TASK_ID) is WaitingOn.FACTORY
     assert _blocked_waits_on(root, MEMBER_TASK_ID) is WaitingOn.FACTORY
-    assert read_open_escalations(root).levels(TASK_ID) == ()
-    assert read_open_escalations(root).levels(MEMBER_TASK_ID) == ()
+    assert _open_escalations(root).levels(TASK_ID) == ()
+    assert _open_escalations(root).levels(MEMBER_TASK_ID) == ()
 
 
 async def test_a_parked_l1_waits_on_leo(root: Path, server: FastMCP) -> None:

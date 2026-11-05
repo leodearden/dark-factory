@@ -119,7 +119,9 @@ def test_a_closed_record_left_at_the_root_is_not_open(
 ) -> None:
     queue.write('esc-9-1', task_id='9', level=2, status=status)
 
-    assert read_open_escalations(root).levels(9) == ()
+    escalations = read_open_escalations(root)
+
+    assert (escalations.levels(9), escalations.skipped) == ((), ())
 
 
 @pytest.mark.parametrize('task_id', [None, 'write-journal-size-ceiling', '0', '-3'])

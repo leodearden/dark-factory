@@ -698,6 +698,9 @@ escalation text (never shown). A second feed transport. Per-person links. Failin
     real producer. It drives the escalation server's own tools (`escalate_blocker`, `promote_to_l2`,
     `resolve_issue`) on a tmp root and checks:
     - `level`, in every test;
+    - that every record the producer leaves parses, in every read: a `status` or a field type the
+      reader refuses would be skipped as malformed, which for a closed record reads exactly like a
+      close, so a skip fails the test;
     - own-task attribution, and member attribution across tasks: an L1 on one task promoted under
       another task's L2 makes the member task wait on `leo` until the cascade;
     - the `status` filter: a resolution whose archival fails, forced by a regular file at
