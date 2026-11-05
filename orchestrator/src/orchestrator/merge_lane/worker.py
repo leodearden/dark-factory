@@ -225,6 +225,10 @@ from orchestrator.merge_lane.verify_base_detector import (
     alarm_verify_base_divergence,
     detect_verify_base_divergence,
 )
+from orchestrator.merge_verify_facts import (
+    MergeVerifyDispatchFacts,
+    classify_base_relation,
+)
 from orchestrator.remote_gate import GateIdentityPair, RunnerUnavailableKind
 from orchestrator.scheduler import StaleEvidenceRejection
 from orchestrator.task_status import WORKFLOW_PRESERVE_STATUSES
@@ -2453,6 +2457,7 @@ async def _run_post_merge_verify(
     main_sha: str | None = None,
     verifier: VerifyPort = PRODUCTION_VERIFIER,
     history_leg_command: str | None = None,
+    dispatch_facts: MergeVerifyDispatchFacts | None = None,
 ) -> MergeOutcome | None:
     """Run post-merge verification for a single task.
 
@@ -2614,6 +2619,9 @@ async def _run_post_merge_verify(
             ``history_leg.py::HistoryLegRunner``, instead of the full gate;
             every step around the dispatch is unchanged.  ``None`` (default)
             runs the full gate.
+        dispatch_facts: The ``runner_reason``/``base_relation`` attempt 0's
+            ``merge_verify`` row carries; every retry reports it as
+            ``retry_held_host`` (``orchestrator/merge_verify_facts.py``).
     """
     # Normalize the narrowed-budget counter dict once up front (task 2835):
     # None (the default for every unmigrated caller) becomes a fresh,
@@ -2856,7 +2864,9 @@ async def _run_post_merge_verify(
         verify = await pool.dispatch(
             merge_sha, spec, depth=depth, speculative=speculative,
             chain_items=chain_items, chain_build_ms=chain_build_ms,
+            dispatch_facts=dispatch_facts,
         )
+        retry_facts = (dispatch_facts or MergeVerifyDispatchFacts()).as_retry()
 
         # Transient-infra (disk pressure) retry: an ENOSPC failure is
         # often a self-healing host condition.  Prune stale _merge-*
@@ -2879,6 +2889,7 @@ async def _run_post_merge_verify(
                 verify = await pool.dispatch(
                     merge_sha, spec, attempt=1, depth=depth, speculative=speculative,
                     chain_items=chain_items, chain_build_ms=chain_build_ms,
+                    dispatch_facts=retry_facts,
                 )
         # Classified infra-transient retry (task ν, verify-scope-inversion-prd.md):
         # a failing VerifyResult whose category is policy-table infra-transient
@@ -2989,7 +3000,7 @@ async def _run_post_merge_verify(
                 verify = await pool.dispatch(
                     merge_sha, spec, attempt=retries[req.task_id], depth=depth,
                     speculative=speculative, chain_items=chain_items,
-                    chain_build_ms=chain_build_ms,
+                    chain_build_ms=chain_build_ms, dispatch_facts=retry_facts,
                 )
 
     # Task ε: record EVERY attempt's flake observation, oldest first.
@@ -17087,6 +17098,7 @@ class SpeculativeMergeWorker:
         chain: ChainResult | None = None,
         verify_wt: VerifyWorktreeHandle | None = None,
         entry_slot: InflightEntrySlot | None = None,
+        dispatch_facts: MergeVerifyDispatchFacts | None = None,
     ) -> InflightVerifyResult:
         """Run the verify portion for one in-flight item.
 
@@ -17477,6 +17489,7 @@ class SpeculativeMergeWorker:
                 chain_build_ms=chain_build_ms,
                 merge_base_sha=verify_base.merge_base_sha,
                 main_sha=verify_base.main_sha,
+                dispatch_facts=dispatch_facts,
             ))
             # Abort trigger 3's progress watch, seeded unconditionally (both
             # lease kinds) before the first await, so a coasting remote lease
@@ -20123,6 +20136,15 @@ class SpeculativeMergeWorker:
         )
         return candidate.reanchored(item, gate.rebased_sha)
 
+    def _frontier_base_commits(self) -> tuple[set[str], set[str]]:
+        """The in-flight merge commits and gate-rebased heads a dispatch may be built on."""
+        stacked_on = {
+            e.item.merge_result.merge_commit for e in self._inflight
+            if isinstance(e.item, RealMergeItem) and e.item.merge_result.merge_commit
+        }
+        rebased_heads = {e.gate.rebased_sha for e in self._inflight if e.gate is not None}
+        return stacked_on, rebased_heads
+
     async def _dispatch_item(
         self,
         item: SpeculativeItem,
@@ -20572,6 +20594,7 @@ class SpeculativeMergeWorker:
             #      region, not a `return` -- a `return` is a normal exit and no
             #      `except` arm sees it.  Trap 2 stands unchanged.)
             verify_base_divergence: VerifyBaseDivergence | None = None
+            _guard_main_sha: str | None = None
             try:
                 _guard_main_sha = await self._git_ops.get_main_sha()
                 # DEFECT 2 (task 2357): refresh the §5.3 snapshot cache from the
@@ -20584,6 +20607,15 @@ class SpeculativeMergeWorker:
                 )
             except Exception:
                 pass  # fail-open: skip the check (and the refresh) on any git error
+            # Vocabulary: orchestrator/merge_verify_facts.py.
+            stacked_on, rebased_heads = self._frontier_base_commits()
+            dispatch_facts = MergeVerifyDispatchFacts(
+                runner_reason=lease.reason,
+                base_relation=classify_base_relation(
+                    item.base_sha, main_sha=_guard_main_sha,
+                    stacked_on=stacked_on, rebased_heads=rebased_heads,
+                ),
+            )
 
             # ── Launch background verify task ────────────────────────────────────
             # depth (task 2340) is computed synchronously HERE — before
@@ -20702,7 +20734,7 @@ class SpeculativeMergeWorker:
             self._run_inflight_verify(
                 item, lease, depth=depth, probe_base=probe_base,
                 chain_items=chain_items, chain=chain, verify_wt=verify_wt,
-                entry_slot=entry_slot,
+                entry_slot=entry_slot, dispatch_facts=dispatch_facts,
             )
         )
 
