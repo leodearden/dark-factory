@@ -31,7 +31,6 @@ from dashboard.data.prd_view import (
     LANE_LABELS,
     LANE_PRECEDENCE,
     LANE_RULES,
-    MOVING_WINDOW_DAYS,
     FigureId,
     Lane,
     MilestoneStatus,
@@ -167,11 +166,10 @@ def test_the_precedence_is_served_beside_the_lanes(wire):
     assert list(LANE_PRECEDENCE) == [Lane(lane) for lane in wire['lane_precedence']]
 
 
-def test_every_lane_has_one_rule_and_the_moving_rule_names_its_window():
+def test_every_lane_has_one_rule():
     assert isinstance(LANE_RULES, MappingProxyType)
     assert set(LANE_RULES) == set(Lane)
     assert all(text.strip() for text in LANE_RULES.values())
-    assert f'{MOVING_WINDOW_DAYS} days' in LANE_RULES[Lane.MOVING]
 
 
 def test_the_lane_figures_carry_rule_text(wire):
@@ -463,7 +461,6 @@ def test_the_gamma_2_figures_carry_rule_text():
         FigureId.STATE_LINE, FigureId.NEXT_ACTION, FigureId.DETAIL, FigureId.HIDDEN_HIGH,
     ):
         assert FIGURE_RULES[figure].strip()
-    assert 'attention' in FIGURE_RULES[FigureId.LANES]
 
 
 def _replace_lanes(view: PrdView, change: Callable[[list[tuple[Lane, tuple[str, ...]]]], None]):

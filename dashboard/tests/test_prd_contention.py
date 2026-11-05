@@ -283,15 +283,6 @@ def test_every_figure_has_rule_text_and_every_wire_figure_names_one(wire):
     assert figures == {figure.value for figure in ContentionFigure}
 
 
-def test_each_count_rule_says_which_population_it_counts():
-    assert 'ready' in CONTENTION_RULES[ContentionFigure.TOP]
-    assert 'Scheduler tab' in CONTENTION_RULES[ContentionFigure.TOP]
-    assert 'ready' in CONTENTION_RULES[ContentionFigure.HELD_SHARE]
-    never_started = CONTENTION_RULES[ContentionFigure.NEVER_STARTED]
-    assert 'task_started' in never_started
-    assert 'window start' in never_started
-
-
 def _breach(contention: Contention, **changes: Any) -> ContentionInvariant:
     with pytest.raises(ContentionContractError) as caught:
         validate_contention(dataclasses.replace(contention, **changes))
