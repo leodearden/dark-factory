@@ -74,18 +74,22 @@ async def acquire_activity(
     *,
     now: datetime,
     wait_seconds: float | None = None,
+    absent_reason: str | None = None,
 ) -> Datum[TaskActivity]:
     """*project_root*'s task activity as it reads at *now*; *conn* is its runs.db, if any.
 
     No runs.db is unknown: it reads the same as an unmounted volume. A
     runs.db without ``task_results`` is a lower bound, its completions read
-    from ``task_completed`` events alone.
+    from ``task_completed`` events alone. *absent_reason* says why *conn* is
+    None when the caller knows better than a missing file.
     """
     store = Path(project_root) / RUNS_DB
 
     async def read() -> Datum[TaskActivity]:
         if conn is None:
-            return unknown_datum(f'no runs.db at {store}', ACTIVITY_FRESHNESS_BOUND_SECONDS)
+            return unknown_datum(
+                absent_reason or f'no runs.db at {store}', ACTIVITY_FRESHNESS_BOUND_SECONDS,
+            )
         try:
             return await _measure(conn, store, now)
         except sqlite3.Error as exc:
