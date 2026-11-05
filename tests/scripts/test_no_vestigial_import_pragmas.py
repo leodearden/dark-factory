@@ -78,10 +78,13 @@ parses as an import statement" rather than on a substring scan.
 from __future__ import annotations
 
 import ast
-import importlib.util
+import importlib
+import json
 import re
+import subprocess
 import sys
 import tomllib
+from collections.abc import Iterable
 from pathlib import Path
 
 import pytest
@@ -194,8 +197,10 @@ def _parse_import_statement(code: str) -> ast.Import | ast.ImportFrom | None:
     return None
 
 
-def _pragma_carrying_imports() -> list[tuple[Path, int, str, ast.Import | ast.ImportFrom]]:
-    """Every ``(path, lineno, line, node)`` in the scanned suites where an import is suppressed.
+def _pragma_carrying_imports(
+    directories: Iterable[Path],
+) -> list[tuple[Path, int, str, ast.Import | ast.ImportFrom]]:
+    """Every ``(path, lineno, line, node)`` in *directories* where an import is suppressed.
 
     ONE scanner for both guards, so they cannot disagree about what counts as
     an import site — only about which sites are legitimate.
@@ -206,7 +211,7 @@ def _pragma_carrying_imports() -> list[tuple[Path, int, str, ast.Import | ast.Im
     necessarily the comment delimiter.
     """
     sites: list[tuple[Path, int, str, ast.Import | ast.ImportFrom]] = []
-    for directory in _SCANNED_DIRS:
+    for directory in directories:
         assert directory.is_dir(), (
             f'{directory} does not exist, so this guard silently stopped covering it. '
             f'If that suite moved or was renamed, update _SCANNED_DIRS — a guard that '
@@ -298,20 +303,61 @@ def _resolving_root(module: str, roots: list[Path]) -> Path | None:
     return None
 
 
-def _resolves_in_running_interpreter(module: str) -> bool:
-    """True when *module* is importable in the interpreter running this test.
+_FIND_SPEC_PROBE = '''
+import importlib.util
+import json
+import sys
 
-    Asks the interpreter rather than naming modules, so this covers ``pytest``,
-    ``yaml`` and every other declared dependency with one rule and needs no edit
-    when a new third-party import lands in either scanned suite.
 
-    ``find_spec`` does not execute *module* — it only locates it — and a
-    top-level name has no parent package to import as a side effect.
-    """
+def found(name):
     try:
-        return importlib.util.find_spec(module) is not None
+        return importlib.util.find_spec(name) is not None
     except (ImportError, ValueError):
         return False
+
+
+print(json.dumps([name for name in sys.argv[1:] if found(name)]))
+'''
+
+
+def _installed_modules(modules: Iterable[str]) -> frozenset[str]:
+    """Those of *modules* that a fresh ``-I`` interpreter of this environment can locate.
+
+    That interpreter sees the venv's site-packages and ``.pth`` entries, but not
+    the sys.path and sys.modules entries that collected test modules add.
+    """
+    probe = subprocess.run(
+        [sys.executable, '-I', '-c', _FIND_SPEC_PROBE, *sorted(modules)],
+        capture_output=True,
+        text=True,
+    )
+    assert probe.returncode == 0, (
+        f'the installed-module probe exited {probe.returncode} under '
+        f'{sys.executable}:\n{probe.stderr}'
+    )
+    return frozenset(json.loads(probe.stdout))
+
+
+def _installed_module_offenders(
+    sites: Iterable[tuple[Path, int, str, ast.Import | ast.ImportFrom]],
+) -> list[tuple[Path, int, str, str]]:
+    """The ``(path, lineno, line, module)`` among *sites* whose module is installed.
+
+    A module that resolves on class (a)'s search roots is excluded first, so it
+    is never reported here as well.
+    """
+    candidates = [
+        (path, lineno, code, module)
+        for path, lineno, code, node in sites
+        for module in _imported_top_level_modules(node)
+        if _resolving_root(module, _import_search_roots(path.parent)) is None
+    ]
+    installed = _installed_modules(module for *_, module in candidates)
+    return [
+        (path, lineno, code, module)
+        for path, lineno, code, module in candidates
+        if module in installed
+    ]
 
 
 def test_no_missing_imports_pragma_on_installed_module_import() -> None:
@@ -332,7 +378,7 @@ def test_no_missing_imports_pragma_on_installed_module_import() -> None:
     interpreter. A suppression on this line converts that env fault into
     silence.
 
-    ASKS THE INTERPRETER, rather than naming ``pytest``. The five pragmas task
+    ASKS A FRESH INTERPRETER OF THIS ENVIRONMENT, rather than naming ``pytest``. The five pragmas task
     4516 deleted in this class all sat on ``import pytest``, but the rationale
     above is a property of "resolved from the venv", not of that one name:
     ``import yaml`` under the same suppression would be equally vestigial and
@@ -342,9 +388,8 @@ def test_no_missing_imports_pragma_on_installed_module_import() -> None:
 
     THE SPLIT IS PRESERVED by checking class (a) FIRST: a module that resolves
     on the ``extraPaths`` search roots belongs to the other guard and its other
-    remedy, and is skipped here even though the running interpreter can also
-    import it (each suite's ``conftest.py`` puts those same directories on
-    sys.path, so it always can).
+    remedy, and is skipped here even when a fresh interpreter can also import
+    it.
 
     These pragmas were provably copy-paste cargo rather than considered
     suppressions, which is visible without appeal to intent because they were
@@ -355,13 +400,7 @@ def test_no_missing_imports_pragma_on_installed_module_import() -> None:
     below carried none; and in ``test_trial_module_tagger_haiku.py`` the
     polarity was simply reversed.
     """
-    offenders = [
-        (path, lineno, code, module)
-        for path, lineno, code, node in _pragma_carrying_imports()
-        for module in _imported_top_level_modules(node)
-        if _resolving_root(module, _import_search_roots(path.parent)) is None
-        and _resolves_in_running_interpreter(module)
-    ]
+    offenders = _installed_module_offenders(_pragma_carrying_imports(_SCANNED_DIRS))
 
     assert not offenders, (
         f'{len(offenders)} import(s) of an installed module carry a '
@@ -426,9 +465,9 @@ def test_no_missing_imports_pragma_on_resolvable_import() -> None:
     """
     offenders = [
         (path, lineno, code, module, root)
-        for path, lineno, code, node in _pragma_carrying_imports()
+        for path, lineno, code, node in _pragma_carrying_imports(_SCANNED_DIRS)
         for module in _imported_top_level_modules(node)
-        if (root := _resolving_root(module, _import_search_roots(path.parent))) is not None
+        if (root :=_resolving_root(module, _import_search_roots(path.parent))) is not None
     ]
 
     assert not offenders, (
