@@ -16,7 +16,7 @@ import asyncio
 import json
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
@@ -37,7 +37,8 @@ from _curator_helpers import (
 )
 from shared.cli_invoke import AgentResult, AllAccountsCappedException
 
-from fused_memory.config.schema import FusedMemoryConfig
+from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
+from fused_memory.config.schema import FusedMemoryConfig, TaskmasterConfig
 from fused_memory.middleware.curation_deferral import DeferReason
 from fused_memory.middleware.curator_types import (
     CandidateTask,
@@ -465,24 +466,6 @@ class TestTheBreakerGatesEveryDispatch:
 # --- B6: the consumer sees the exact match inside a worker batch -------------
 
 
-class _RecordingTaskmaster:
-    def __init__(self) -> None:
-        self.add_task_calls: list[dict[str, Any]] = []
-        self.tasks: dict[str, dict[str, Any]] = {}
-
-    async def ensure_connected(self) -> None:
-        return None
-
-    async def add_task(self, **kwargs: Any) -> dict[str, Any]:
-        self.add_task_calls.append(kwargs)
-        task_id = str(100 + len(self.add_task_calls))
-        self.tasks[task_id] = {'id': task_id, 'title': kwargs.get('title'), 'status': 'pending'}
-        return {'id': task_id, 'title': kwargs.get('title')}
-
-    async def get_task(self, task_id: str, project_root: str) -> dict[str, Any]:
-        return self.tasks[task_id]
-
-
 @pytest.fixture(autouse=True)
 def _combine_audit_in_tmp(monkeypatch, tmp_path):
     monkeypatch.setenv('DARK_FACTORY_DATA_DIR', str(tmp_path / 'data'))
@@ -504,6 +487,14 @@ async def event_buffer(tmp_path):
     await buffer.close()
 
 
+@pytest_asyncio.fixture
+async def backend(tmp_path):
+    task_backend = SqliteTaskBackend(TaskmasterConfig(project_root=str(tmp_path)))
+    await task_backend.start()
+    yield task_backend
+    await task_backend.close()
+
+
 def _task(title: str, description: str, files: list[str]) -> dict[str, Any]:
     return {
         'title': title, 'description': description,
@@ -514,15 +505,15 @@ def _task(title: str, description: str, files: list[str]) -> dict[str, Any]:
 @pytest.mark.asyncio
 class TestExactDuplicateInsideAWorkerBatch:
     async def test_a_reworded_duplicate_in_a_batch_drops_onto_the_task_it_repeats(
-        self, store, event_buffer,
+        self, store, event_buffer, backend, tmp_path,
     ):
-        taskmaster = cast(Any, _RecordingTaskmaster())
+        root = str(tmp_path)
         invoke = invoke_by_role(
             single=agent_result({'action': 'create', 'justification': 'new'}),
             batch=_create_each_in_batch,
         )
         curator = TaskCurator(
-            config=make_config(), taskmaster=taskmaster, escalator=escalator_double(),
+            config=make_config(), taskmaster=backend, escalator=escalator_double(),
             invoke=invoke,
         )
 
@@ -532,34 +523,35 @@ class TestExactDuplicateInsideAWorkerBatch:
         curator.prepare_candidate = AsyncMock(side_effect=bundle_for)
         curator.record_task = AsyncMock()
         interceptor = TaskInterceptor(
-            taskmaster, None, event_buffer, ticket_store=store, curator=curator,
+            backend, None, event_buffer, ticket_store=store, curator=curator,
         )
         try:
             first = await interceptor.submit_task(
-                PROJECT_ROOT, **_task('Task A', 'The first filing.', ['a.py']),
+                root, **_task('Task A', 'The first filing.', ['a.py']),
             )
-            assert (await interceptor.resolve_ticket(first['ticket'], PROJECT_ROOT, 30.0))[
-                'task_id'
-            ] == '101'
+            task_a = (await interceptor.resolve_ticket(first['ticket'], root, 30.0))['task_id']
 
             b, duplicate, c = await submit_as_one_batch(interceptor, curator, [
                 _task('Task B', 'Other work.', ['b.py']),
                 _task('Task A', 'The same ask, filed again in other words.', ['a.py']),
                 _task('Task C', 'More other work.', ['c.py']),
-            ], project_root=PROJECT_ROOT)
+            ], project_root=root)
             answers = [
-                await interceptor.resolve_ticket(ticket, PROJECT_ROOT, 30.0)
+                await interceptor.resolve_ticket(ticket, root, 30.0)
                 for ticket in (b, duplicate, c)
+            ]
+            created = [answers[0], answers[2]]
+            assert [a['status'] for a in created] == ['created', 'created']
+            created_titles = [
+                (await backend.get_task(a['task_id'], root))['title'] for a in created
             ]
         finally:
             await interceptor.close()
 
         assert answers[1] == {
-            'status': 'combined', 'task_id': '101', 'reason': 'drop: pre-llm-exact-match',
+            'status': 'combined', 'task_id': task_a, 'reason': 'drop: pre-llm-exact-match',
         }
-        assert [(a['status'], a['task_id']) for a in (answers[0], answers[2])] == [
-            ('created', '102'), ('created', '103'),
-        ]
+        assert created_titles == ['Task B', 'Task C']
         [batch_prompt] = _prompts(invoke, 'task_curator_batch')
         assert candidates_in(batch_prompt) == 2
         assert 'title: Task A' not in batch_prompt
