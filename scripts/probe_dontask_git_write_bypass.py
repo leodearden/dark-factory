@@ -57,7 +57,7 @@ def _scratch_repo(base: Path) -> Path:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(description=(__doc__ or '').partition('\n')[0])
     parser.add_argument('--claude-bin', default='claude')
     parser.add_argument('--model', default='haiku')
     args = parser.parse_args()
