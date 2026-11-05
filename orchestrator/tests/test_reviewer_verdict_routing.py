@@ -44,7 +44,8 @@ from _workflow_helpers import _make
 from shared.cli_invoke import AgentResult, AllAccountsCappedException
 from shared.usage_gate import SessionBudgetExhausted
 
-from orchestrator.agents.roles import REVIEWER_COMPREHENSIVE
+from orchestrator.agents.review_briefing import ReviewBriefing
+from orchestrator.agents.roles import REVIEWER_COMPREHENSIVE, reviewers_for
 from orchestrator.mcp.verdict_tools import _envelope
 from orchestrator.reviewer_failure import ReviewerFailure, ReviewerFailureKind
 
@@ -919,6 +920,79 @@ class TestReviewMirrorCarriesSalvagedVerdict:
         # No retry burned => clear_verdict() never destroyed the artifact.
         assert f.wf._invoke.call_count == 1
         assert aggregation.reviewer_errors == []
+
+
+def _stale_seed(kind: str) -> tuple[str, dict]:
+    """A reviews/ file a prior round or dispatch would leave behind."""
+    if kind == 'retired_blocking':
+        return 'reviewer_retired', {
+            'reviewer': 'reviewer_retired', 'verdict': 'ISSUES_FOUND',
+            'issues': _blocking_issues(1), 'summary': 'stale blocker',
+        }
+    if kind == 'merge_failure':
+        return 'merge', {
+            'verdict': 'ISSUES_FOUND',
+            'issues': [{
+                'severity': 'blocking', 'location': 'merge',
+                'category': 'merge_conflict', 'description': 'stale merge failure',
+            }],
+            'summary': 'Merge failed: merge_conflict',
+        }
+    return 'reviewer_retired', {
+        'reviewer': 'reviewer_retired', 'verdict': 'ERROR',
+        'issues': [], 'summary': 'stale error',
+    }
+
+
+@pytest.mark.asyncio
+class TestReviewRoundAggregatesOnlyItsOwnRoster:
+    """A review round's aggregation holds exactly the reviews its own roster
+    wrote (task 3158; PRD plans/task-meta-task-keying-prd.md boundary B7)."""
+
+    def _setup(self, tmp_path: Path):
+        f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+        f.wf.briefing.build_reviewer_prompt = AsyncMock(return_value='prompt')
+        f.wf.git_ops.get_diff_from_base = AsyncMock(return_value='diff')
+        f.wf.config.reviewer_stagger_secs = 0
+        f.wf.config.max_reviewer_retries = 0
+        return f
+
+    @pytest.mark.parametrize('seed', ['retired_blocking', 'merge_failure', 'retired_error'])
+    async def test_a_stale_review_file_is_not_aggregated(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, seed: str,
+    ):
+        f = self._setup(tmp_path)
+        f.artifacts.write_review(*_stale_seed(seed))
+        monkeypatch.setattr(f.wf, '_invoke', AsyncMock(
+            side_effect=_invoke_writes_review_verdict(f, verdict='PASS', summary='ok'),
+        ))
+
+        aggregation = await f.wf._review()
+
+        assert aggregation.has_blocking_issues is False
+        assert aggregation.reviewer_errors == []
+        assert set(aggregation.reviews) == {'reviewer_comprehensive'}
+        reviews_dir = f.artifacts.artifact_path('reviews')
+        assert {p.stem for p in reviews_dir.glob('*.json')} == {'reviewer_comprehensive'}
+
+    async def test_the_inputs_unavailable_path_aggregates_only_its_roster(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        f = self._setup(tmp_path)
+        f.wf.config.review.reviewer_briefing = ReviewBriefing.CONTEXT_COMPLETE
+        monkeypatch.setattr(
+            f.wf, '_context_complete_review_subject',
+            AsyncMock(side_effect=RuntimeError('boom')),
+        )
+        f.artifacts.write_review(*_stale_seed('retired_blocking'))
+
+        aggregation = await f.wf._review()
+
+        assert aggregation.reviewer_errors == [
+            r.name for r in reviewers_for(ReviewBriefing.CONTEXT_COMPLETE)
+        ]
+        assert all(i['reviewer'] != 'reviewer_retired' for i in aggregation.blocking_issues)
+        assert aggregation.has_blocking_issues is False
 
 
 @pytest.mark.asyncio
