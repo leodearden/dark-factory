@@ -11203,6 +11203,9 @@ class TaskWorkflow:
     async def _review(self, amendment_ctx: AmendmentReviewContext | None = None):
         """Run the reviewer roster with staggered launches and aggregate it.
 
+        reviews/ is cleared first, so the returned aggregation covers exactly
+        this round's roster.
+
         Errored reviewers are retried in-phase up to ``max_reviewer_retries``
         unless their failure kind's policy skips in-phase retry
         (``orchestrator/reviewer_failure.py::should_retry_reviewer``).
@@ -11214,6 +11217,7 @@ class TaskWorkflow:
         enforceable guarantee; this only reduces wasted reviewer effort.
         """
         assert self.worktree is not None and self.artifacts is not None
+        self.artifacts.clear_reviews()
         briefing = self.config.review.reviewer_briefing
         roster = reviewers_for(briefing)
         subject = None
