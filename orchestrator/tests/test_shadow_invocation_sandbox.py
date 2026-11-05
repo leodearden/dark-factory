@@ -26,22 +26,13 @@ from orchestrator.agents.roles import ARCHITECT, IMPLEMENTER, AgentRole
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.evals.configs import EvalConfig
 from orchestrator.evals.live_fixture import build_live_fixture
-from orchestrator.evals.runner import build_eval_orch_config
+from orchestrator.evals.runner import build_eval_orch_config, eval_mcp_lifecycle
 from orchestrator.evals.shadow_invocation import build_shadow_orch_config
 from orchestrator.evals.snapshots import create_eval_worktree
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.workflow import build_workflow
 
 _IMPL = EvalConfig('probe', 'claude', 'sonnet', 'high')
-
-
-class _EvalShapedMcp:
-    """The eval runner's MCP stub shape: no orchestrator-assembled servers."""
-
-    url = 'http://127.0.0.1:1'
-
-    def mcp_config_json(self, escalation_url: str | None = None) -> dict:
-        return {}
 
 
 class _EvalCell:
@@ -113,11 +104,10 @@ async def _dispatched_kwargs(
         git_ops=_make_git_ops(cell.repo),
         scheduler=FakeScheduler(),
         briefing=FakeBriefing(),
-        mcp=_EvalShapedMcp(),
+        mcp=eval_mcp_lifecycle(orch),
         initial_plan=fixture['plan'],
     )
     workflow.worktree = cell.worktree
-    workflow.artifacts = None
 
     await workflow._invoke(role, fixed_prompt('P'), cell.worktree)
 
