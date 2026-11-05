@@ -55,6 +55,7 @@ from orchestrator.session_ownership_probes import ProcessTree
 
 MESSAGE_CHAR_LIMIT = 120_000
 PAGE_LIMIT = 100
+LAUNCH_ATTEMPTS = 2
 PENDING_RUN_STATUSES = frozenset({'preparing', 'queued', 'starting'})
 ENDED_RUN_STATUSES = frozenset({'failed', 'cancelled', 'interrupted', 'rolled_back'})
 STARTUP_FAILURE_STATUSES = frozenset({'failed', 'cancelled', 'rolled_back'})
@@ -462,9 +463,26 @@ class LaunchedThread:
     run_id: str | None
 
 
-def _launch_outcome(reply: t3_mcp_client.CallResult) -> LaunchedThread | str:
-    """The launched thread, else the verdict line."""
-    if not isinstance(reply, t3_mcp_client.ToolOk):
+_LOST_REPLY = frozenset({t3_mcp_client.TransportFault.UNREACHABLE, t3_mcp_client.TransportFault.PROTOCOL})
+
+
+def _send_launch(client: t3_mcp_client.T3McpClient, arguments: Mapping[str, Any]) -> t3_mcp_client.CallResult:
+    """t3_thread_launch, resent with the same clientRequestId while its reply is lost: T3 replays that thread."""
+    reply = client.call('t3_thread_launch', arguments)
+    for _ in range(LAUNCH_ATTEMPTS - 1):
+        if not (isinstance(reply, t3_mcp_client.TransportFailed) and reply.fault in _LOST_REPLY):
+            break
+        reply = client.call('t3_thread_launch', arguments)
+    return reply
+
+
+def _launch_outcome(reply: t3_mcp_client.CallResult, strategy: WorkspaceStrategy) -> LaunchedThread | str:
+    """The launched thread, else the verdict line; T3, not the lane, judges whether a worktree is the project's."""
+    if isinstance(reply, t3_mcp_client.ToolFailed):
+        if reply.code == 'invalid_request' and strategy.binds_worktree:
+            return _verdict('refused', reason='cwd-not-project-worktree', detail=reply.message)
+        return _verdict('launch-failed', detail=f'{reply.code}: {reply.message}')
+    if isinstance(reply, t3_mcp_client.TransportFailed):
         return _failed_call_verdict(_incomplete('t3_thread_launch', reply))
     thread_id = reply.value.get('threadId')
     if not isinstance(thread_id, str) or not thread_id:
@@ -560,6 +578,7 @@ def launch(
 
     _sweep_listed_threads(client, project.project_id, cwd)
     message = _message_for(Path(prompt_file).read_text(encoding='utf-8'), record_dir)
+    strategy = WorkspaceStrategy.for_cwd(project, cwd)
     arguments = _launch_arguments(
         project,
         title,
@@ -567,10 +586,10 @@ def launch(
         model,
         choice.instance_id,
         skip_permissions=skip_permissions,
-        strategy=WorkspaceStrategy.for_cwd(project, cwd),
+        strategy=strategy,
         request_id=_client_request_id(record_dir),
     )
-    launched = _launch_outcome(client.call('t3_thread_launch', arguments))
+    launched = _launch_outcome(_send_launch(client, arguments), strategy)
     if isinstance(launched, str):
         return launched
     if record_dir:
