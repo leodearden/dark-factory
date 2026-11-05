@@ -258,7 +258,7 @@ def _import_search_roots(importing_dir: Path) -> list[Path]:
     DERIVED FROM CONFIG, never hardcoded — see this guard's docstring for why
     that is the whole point rather than a stylistic preference.
 
-    Two sources, and the second is not redundant:
+    Three sources, and neither the second nor the third is redundant:
 
     1. Every ROOT ``[tool.pyright] extraPaths`` entry, resolved relative to the
        repo root. This is what makes the flat ``scripts/`` imports here resolve
@@ -272,9 +272,11 @@ def _import_search_roots(importing_dir: Path) -> list[Path]:
        same-directory sibling and would otherwise be misjudged unresolvable.
        Taking it per-file rather than as a constant is what lets one scanner
        serve both scanned suites without either borrowing the other's siblings.
+    3. The execution root, which pyright resolves local imports against and
+       which holds ``conftest.py`` and ``df_pytest_isolation.py``.
     """
     extra_paths = _load_root_pyright_config().get('extraPaths', [])
-    return [REPO_ROOT / entry for entry in extra_paths] + [importing_dir]
+    return [REPO_ROOT / entry for entry in extra_paths] + [importing_dir, REPO_ROOT]
 
 
 def _imported_top_level_modules(node: ast.Import | ast.ImportFrom) -> list[str]:
