@@ -12,7 +12,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
-from _curator_helpers import agent_result, answer_each_with, submit_as_one_batch, zot_agent_result
+from _curator_helpers import (
+    agent_result,
+    answer_each_with,
+    prepared,
+    submit_as_one_batch,
+    zot_agent_result,
+)
 from _fm_helpers import _init_git_repo, make_8df8_scenario, poll_until
 from _fm_helpers import submit_and_resolve as _submit_and_resolve
 from shared.async_sqlite_base import CheckpointResult
@@ -16689,40 +16695,6 @@ class TestZotDuplicateSweepWiring:
         assert held == {'search': False, 'stamp': True, 'escalation': False}
 
 
-class _UnescalatedZotCurator(_ScoredCorpusCurator):
-    """Corpus fake answering as the pipeline decides a ZOT with no orchestrator.
-
-    With nothing to escalate to, the curator's failure mapper still creates,
-    marked ``degraded_by_zot``, and carries no escalation id.
-    """
-
-    def note_created(self, project_id: str, candidate: CandidateTask, task_id: str) -> None:
-        pass
-
-    async def prepare_candidate(
-        self, candidate: CandidateTask, project_id: str, project_root: str,
-    ) -> PreparedCandidate:
-        return PreparedCandidate(
-            candidate=candidate, pool=[],
-            pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
-            prompt_tokens=0,
-        )
-
-    async def curate_prepared(self, prepared, project_id: str, project_root: str):
-        return [
-            CuratorDecision(
-                action='create',
-                justification='curator-failed: CuratorFailureError: no orchestrator is running',
-                degraded=True,
-                degraded_by_zot=True,
-            )
-            for _ in prepared
-        ]
-
-    async def close(self) -> None:
-        return None
-
-
 class TestZotDuplicateSweepWithoutOrchestrator:
     """With no orchestrator the curator decides the ZOT as a marked create, still swept and stamped."""
 
@@ -16741,8 +16713,23 @@ class TestZotDuplicateSweepWithoutOrchestrator:
 
     @staticmethod
     async def _install_curator(interceptor, project_id: str):
-        curator = _UnescalatedZotCurator({_DUP_TASK_ID: 0.80})
-        await curator.record_task(_DUP_TASK_ID, CandidateTask(title='Existing gate fix'), project_id)
+        """A real curator whose LLM hangs and whose escalator finds no orchestrator.
+
+        The corpus is the scored fake, so the sweep finds the existing task.
+        """
+        corpus = _ScoredCorpusCurator({_DUP_TASK_ID: 0.80})
+        await corpus.record_task(_DUP_TASK_ID, CandidateTask(title='Existing gate fix'), project_id)
+        curator = TaskCurator(
+            config=_curator_cfg(), taskmaster=None, escalator=CuratorEscalator(),
+            invoke=AsyncMock(return_value=zot_agent_result()),
+        )
+
+        async def bundle_for(candidate: CandidateTask, *_args: Any) -> PreparedCandidate:
+            return prepared(candidate.title, candidate=candidate)
+
+        curator.prepare_candidate = AsyncMock(side_effect=bundle_for)
+        curator.record_task = corpus.record_task
+        curator.search_corpus = corpus.search_corpus
         interceptor._curator = curator
 
     @staticmethod

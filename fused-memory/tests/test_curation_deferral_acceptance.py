@@ -30,6 +30,7 @@ from _curator_helpers import (
     empty_corpus,
     escalator_double,
     pool_with_ids,
+    prepared,
     zot_agent_result,
 )
 from escalation.queue import EscalationQueue
@@ -500,18 +501,20 @@ async def test_a_fail_open_create_carries_the_dedupe_skipped_marker(server):
     curator = TaskCurator(
         config=config, taskmaster=None, escalator=escalator, invoke=AsyncMock(side_effect=invoke),
     )
-    with (
-        patch.object(TaskCurator, '_build_corpus', empty_corpus),
-        patch.object(TaskCurator, 'record_task', AsyncMock()),
-        patch.object(TaskCurator, 'search_corpus', AsyncMock(return_value=[])),
-    ):
-        interceptor, janitor, _ = await server.boot(config, curator)
-        ticket_id = await _park(interceptor, 'Work', metadata=_CALLER_METADATA)
-        capped = False
 
-        await _let_tiny_backoff_pass()
-        await _bounded(janitor.tick())
-        answer = await _resolve(interceptor, ticket_id)
+    async def bundle_for(candidate: CandidateTask, *_args: Any) -> PreparedCandidate:
+        return prepared(candidate.title, candidate=candidate)
+
+    curator.prepare_candidate = AsyncMock(side_effect=bundle_for)
+    curator.record_task = AsyncMock()
+    curator.search_corpus = AsyncMock(return_value=[])
+    interceptor, janitor, _ = await server.boot(config, curator)
+    ticket_id = await _park(interceptor, 'Work', metadata=_CALLER_METADATA)
+    capped = False
+
+    await _let_tiny_backoff_pass()
+    await _bounded(janitor.tick())
+    answer = await _resolve(interceptor, ticket_id)
 
     assert (answer['status'], answer['task_id']) == ('created', '101')
     reason = answer['reason'].removeprefix('create: ')
