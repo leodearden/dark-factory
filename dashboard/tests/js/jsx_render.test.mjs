@@ -478,6 +478,64 @@ test('tabs.jsx::MergeTab gives a window one attempt count, whatever the depth se
   assert.doesNotMatch(depth, /\bmerges\b/);
 });
 
+// ── The Completion-paths legend (charts.jsx::PALETTE.paths) ──
+// Every slice performance.py::get_completion_paths serves draws in a colour of
+// its own, so no slice reads as another or as nothing.
+
+const COMPLETION_PATHS = ['one-pass', 'multi-pass', 'via-steward', 'via-interactive', 'requeued', 'blocked'];
+
+// performance.py::PerformanceCards.to_wire, one attempt down each path.
+const PERF_CARDS = {
+  paths: COMPLETION_PATHS.map(path => ({ path, count: 1, pct: 16.7 })),
+  escalation: {
+    steward_rate: 0, interactive_rate: 0, interactive_count: 0,
+    human_attention: { zero: 0, minimal: 0, significant: 0 },
+  },
+  hist_outer: { labels: ['0', '1', '2', '3+'], values: [6, 0, 0, 0] },
+  hist_inner: { labels: ['0', '1', '2', '3+'], values: [6, 0, 0, 0] },
+  ttc: { p50: 1000, p75: 1000, p90: 1000, p95: 1000, count: 2 },
+};
+
+function seedPerformance(window) {
+  seedDashboardData(window, {
+    PROJECTS: [projectRow(PROJECT)],
+    PERFORMANCE: {
+      [PROJECT]: {
+        cards: wireDatum(PERF_CARDS),
+        time_centiles_history: { labels: [], p50: [], p95: [] },
+        one_pass_history: { labels: [], values: [] },
+        escalation_history: { labels: [], values: [] },
+      },
+    },
+    PERFORMANCE_LISTING: wireDatum(1),
+    __receipt: receiptsFor(window.DF_DATA_LOADER, ['PERFORMANCE', 'PERFORMANCE_LISTING', 'PROJECTS']),
+  });
+}
+
+// The 8px swatch beside the legend label that reads *path*.
+function legendSwatch(panel, path) {
+  const labels = [...panel.querySelectorAll('span')].filter(
+    span => span.textContent === path && span.previousElementSibling?.style.width === '8px',
+  );
+  assert.equal(labels.length, 1, `expected exactly one Completion-paths legend row for "${path}"`);
+  return labels[0].previousElementSibling;
+}
+
+test('tabs.jsx::PerfTab Completion paths gives every slice its own PALETTE.paths swatch', t => {
+  const harness = openWindow(t);
+  seedPerformance(harness.window);
+  const { container } = harness.mount(harness.window.DF_TABS.PerfTab, { projectFilter: [] });
+  const panel = panelTitled(container, 'Completion paths');
+
+  const swatches = COMPLETION_PATHS.map(path => {
+    const swatch = legendSwatch(panel, path).style.background;
+    assert.notEqual(swatch, '', `the "${path}" slice has no swatch colour`);
+    assert.equal(swatch, styledColor(harness.window, harness.window.DF_CHARTS.PALETTE.paths[path]), path);
+    return swatch;
+  });
+  assert.equal(new Set(swatches).size, COMPLETION_PATHS.length, `two slices share a colour: ${JSON.stringify(swatches)}`);
+});
+
 // ── Decision 6: a render throw is contained, and its notice is render_failure.js's ──
 // React's development build reports every throw a boundary catches on
 // console.error: jsdom's report of the replayed throw (its stack, or
@@ -1068,5 +1126,43 @@ for (const chart of COUNT_AXIS_CHARTS) {
     const axis = renderAxis(harness, chart, { countAxis: true, formatY: v => `${v} ops` });
     const max = harness.window.DF_SPARK_PATH.axisMax(DATA_MAX, axis.ticks, true);
     assert.deepEqual(axis.labels, tickValues(max, axis.ticks).map(v => `${v} ops`));
+  });
+}
+
+// ── Decision 10: the Tasks tab's banner notices (tasks_offline_banner.js::tasksBannerNoticesFor) ──
+// Every notice kind the helper returns renders under its own test id. Each
+// case seeds the one /tasks fact that yields that kind and nothing else, so a
+// kind with no bannerTestIds entry renders with no test id and fails here.
+
+const OTHER_PROJECT = 'q';
+const BANNER_CASES = [
+  { kind: 'global', testId: 'tasks-offline-banner',
+    data: { TASKS_OFFLINE: true, TASKS_OFFLINE_PROJECTS: [PROJECT], TASKS_PROJECT_COUNT: 1 } },
+  { kind: 'partial', testId: 'tasks-partial-banner',
+    data: { TASKS_OFFLINE_PROJECTS: [OTHER_PROJECT], TASKS_PROJECT_COUNT: 2 } },
+  { kind: 'degraded', testId: 'tasks-degraded-banner',
+    data: { TASKS_DEGRADED_PROJECTS: [OTHER_PROJECT], TASKS_PROJECT_COUNT: 2 } },
+  { kind: 'count-unknown', testId: 'tasks-count-unknown-banner',
+    data: { TASKS_COUNT_UNKNOWN_PROJECTS: [PROJECT], TASKS_PROJECT_COUNT: 1 } },
+  { kind: 'count-stale', testId: 'tasks-count-stale-banner',
+    data: { TASKS_COUNT_STALE_PROJECTS: [PROJECT], TASKS_PROJECT_COUNT: 1 } },
+];
+
+for (const { kind, testId, data } of BANNER_CASES) {
+  test(`tab_tasks.jsx::TasksTab renders the ${kind} notice tasksBannerNoticesFor describes under ${testId}`, t => {
+    const harness = openWindow(t);
+    const { window } = harness;
+    seedOneTask(window, inProgressTask(false));
+    seedDashboardData(window, { ...data, __receipt: receiptsFor(window.DF_DATA_LOADER, Object.keys(data)) });
+    const { container } = harness.mount(window.DF_TASKS.TasksTab, TAB_PROPS);
+
+    const notices = window.DF_TASKS_OFFLINE_BANNER.tasksBannerNoticesFor(window.DF_DATA);
+    assert.deepEqual(Array.from(notices, n => n.kind), [kind]);
+    const rendered = [...container.querySelectorAll(`[data-testid="${testId}"]`)];
+    assert.equal(rendered.length, 1, `the ${kind} notice must render exactly once under ${testId}`);
+    assert.equal(rendered[0].textContent, notices[0].text);
+    for (const other of BANNER_CASES.filter(c => c.kind !== kind)) {
+      assert.deepEqual([...container.querySelectorAll(`[data-testid="${other.testId}"]`)], [], other.testId);
+    }
   });
 }

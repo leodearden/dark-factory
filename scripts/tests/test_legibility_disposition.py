@@ -486,6 +486,46 @@ def test_resolve_tickets_holds_an_open_ticket_pending() -> None:
     assert _rows(result, "entry-a")[0]["resolution"] is None
 
 
+def test_resolve_tickets_writes_a_cancelled_ticket_as_resolved_not_an_error() -> None:
+    cb = _codebook(_entry("entry-a", filed_tickets=[_row("tkt_k")]))
+    store = FakeTaskStore(resolve_outcomes={
+        "tkt_k": _outcome(task_store.TicketStatus.CANCELLED, reason="user_cancelled"),
+    })
+
+    result, resolutions = disposition.resolve_tickets(cb, store=store, run_id=_RUN, clock=_Clock())
+
+    (row,) = _rows(result, "entry-a")
+    assert row["resolution"] == "cancelled"
+    assert row["task_id"] is None
+    assert resolutions.errors == ()
+    assert resolutions.pending == ()
+    assert [resolved.ticket for resolved in resolutions.resolved] == ["tkt_k"]
+    assert codebook.validate(result) == []
+
+    again = FakeTaskStore()
+    disposition.resolve_tickets(result, store=again, run_id=_RUN, clock=_Clock())
+    assert again.arguments_of("resolve_ticket") == []
+
+
+@pytest.mark.parametrize("status", list(task_store.TicketStatus), ids=str)
+def test_every_census_ticket_status_resolves_or_stays_pending(status: task_store.TicketStatus) -> None:
+    names_a_task = status in (task_store.TicketStatus.CREATED, task_store.TicketStatus.COMBINED)
+    outcome = _outcome(status, 7 if names_a_task else None, reason="r")
+    cb = _codebook(_entry("entry-a", filed_tickets=[_row("tkt_s")]))
+    store = FakeTaskStore(resolve_outcomes={"tkt_s": outcome})
+
+    result, resolutions = disposition.resolve_tickets(cb, store=store, run_id=_RUN, clock=_Clock())
+
+    (row,) = _rows(result, "entry-a")
+    assert resolutions.errors == ()
+    if outcome.undecided:
+        assert row["resolution"] is None
+        assert "tkt_s" in resolutions.pending
+    else:
+        assert row["resolution"] == status.value
+        assert codebook.validate(result) == []
+
+
 def test_resolve_tickets_stops_when_its_budget_is_spent() -> None:
     assert disposition.RESOLVE_BUDGET_SECS == 300
     assert disposition.RESOLVE_CALL_CAP_SECS == 115

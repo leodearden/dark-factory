@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import hashlib
 import json
 import logging
@@ -13,7 +14,7 @@ import string
 import sys
 import time
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from enum import Enum
@@ -94,6 +95,7 @@ from orchestrator.agents.write_set import (
 from orchestrator.artifacts import (
     PLAN_SCHEMA_VERSION,
     ReviewAggregation,
+    ReviewsRootMissing,
     TaskArtifacts,
     iteration_entry_written_by_orchestrator,
     plan_base_commit,
@@ -113,7 +115,7 @@ from orchestrator.dry_run_unblock import (
     run_dry_run_unblock,
 )
 from orchestrator.escalation_router import InfoL0Sweep, RouterPorts, exit_kind_for, router_owns
-from orchestrator.event_store import EventStore, EventType
+from orchestrator.event_store import EventStore, EventType, cli_resume_failed_data
 from orchestrator.exit_contract import (
     ExitStatusWriteFailure,
     judge_exit,
@@ -128,6 +130,7 @@ from orchestrator.git_ops import (
     _run,
     is_wip_safety_commit,
 )
+from orchestrator.implementer_brief_variant import execute_iteration_cap
 from orchestrator.l0_promotion import promote_l0_to_l1
 from orchestrator.main_health_actions import MainHealthNextAction
 from orchestrator.main_health_fix_owner import (
@@ -3957,7 +3960,12 @@ class TaskWorkflow:
         # task's warm lane, so it equally races reify's warm-lane-gc.sh
         # reclaim; the flock is the cross-process guard that script
         # honors. Fails open on contention.
-        async with self.git_ops.task_verify_lease(self.worktree):
+        # lane_in_use is leaf δ's IN_USE span, kept separate from the
+        # lease; its call-site spy lives in test_lane_in_use.py.
+        async with (
+            self.git_ops.task_verify_lease(self.worktree),
+            self.git_ops.lane_in_use(self.worktree),
+        ):
             verify = await run_scoped_verification(
                 self.worktree, self.config, self._module_configs,
                 task_files=self._task_files,
@@ -4669,7 +4677,8 @@ class TaskWorkflow:
             else:
                 logger.info('Task %s: synced venv for %s', self.task_id, prefix)
 
-        await asyncio.gather(*(_sync(p) for p in sorted(prefixes)))
+        async with self.git_ops.lane_in_use(worktree):
+            await asyncio.gather(*(_sync(p) for p in sorted(prefixes)))
 
     async def _reconcile_scope_locks(
         self, plan_files: list[str],
@@ -8416,13 +8425,13 @@ class TaskWorkflow:
 
     async def _execute_verify_review_loop(self) -> WorkflowOutcome:
         """Execute → Verify → Review loop with retry limits."""
-        # Clear stale merge-failure review from prior runs — prevents
-        # the review phase from re-surfacing resolved merge issues.
+        # Dispatch-boundary freshness guard: once per dispatch and per
+        # post-escalation re-entry, before EXECUTE, so no prior dispatch's
+        # verdicts (warm-lane reuse, cross-lane re-dispatch, cold reuse) remain
+        # in reviews/ even when this dispatch stops before REVIEW. The
+        # per-round guard lives in _review.
         if self.artifacts:
-            stale_merge = self.artifacts.artifact_path('reviews/merge.json')
-            if stale_merge.exists():
-                logger.info('Task %s: removing stale merge.json review', self.task_id)
-                stale_merge.unlink()
+            self.artifacts.clear_reviews()
 
         # Seed the loop counters from the persisted task-lifetime totals
         # (task 2749) so max_amendment_rounds / max_review_cycles bound the
@@ -8886,6 +8895,15 @@ class TaskWorkflow:
                 )
             self.metrics.review_cycles += 1
 
+    def _execute_iteration_cap(self) -> int:
+        """The EXECUTE loop's bound under ``config.implementer_brief_variant``."""
+        assert self.artifacts is not None
+        return execute_iteration_cap(
+            self.config.implementer_brief_variant,
+            self.config.max_execute_iterations,
+            self.artifacts.read_plan,
+        )
+
     async def _execute_iterations(self) -> WorkflowOutcome:
         """Run implementer iterations until plan is complete."""
         assert self.worktree is not None and self.artifacts is not None
@@ -9104,9 +9122,10 @@ class TaskWorkflow:
         reuse_entry_probe = True
         while reuse_entry_probe or self.artifacts.get_pending_steps():
             reuse_entry_probe = False
+            iteration_cap = self._execute_iteration_cap()
             if (
                 self.metrics.execute_iterations - self.metrics.progress_resume_total
-                >= self.config.max_execute_iterations
+                >= iteration_cap
             ):
                 # Iteration cap reached (progress-resumes excluded from the
                 # count — see progress_resume_total above).  If the most-recent
@@ -9138,13 +9157,14 @@ class TaskWorkflow:
                     # breaker in the γ branch first. Kept as a diagnostic in
                     # case that invariant is ever broken by a future change.
                     logger.warning(
-                        'Task %s: exhausted max_execute_iterations with '
+                        'Task %s: exhausted the EXECUTE iteration cap with '
                         'consecutive_progress_timeouts=%s (progress_resume_total=%s) '
                         '— session may be slow or looping. '
-                        'Bound: max_execute_iterations=%s, '
+                        'Bound: iteration_cap=%s (implementer_brief_variant=%s), '
                         'max_progress_resume_iterations=%s.',
                         self.task_id, consecutive_progress_timeouts,
-                        self.metrics.progress_resume_total, self.config.max_execute_iterations,
+                        self.metrics.progress_resume_total, iteration_cap,
+                        self.config.implementer_brief_variant,
                         self.config.max_progress_resume_iterations,
                     )
                 return WorkflowOutcome.BLOCKED
@@ -10602,7 +10622,12 @@ class TaskWorkflow:
                 # warm-lane-gc.sh honors; task_verify_lease fails OPEN on
                 # contention (per-attempt scope keeps the hold off the
                 # infra-retry backoff sleeps below).
-                async with self.git_ops.task_verify_lease(self.worktree):
+                # lane_in_use is leaf δ's IN_USE span, kept separate from the
+                # lease; its call-site spy lives in test_lane_in_use.py.
+                async with (
+                    self.git_ops.task_verify_lease(self.worktree),
+                    self.git_ops.lane_in_use(self.worktree),
+                ):
                     result = await run_scoped_verification(
                         self.worktree, self.config, self._module_configs,
                         task_files=self._task_files,
@@ -11179,6 +11204,9 @@ class TaskWorkflow:
     async def _review(self, amendment_ctx: AmendmentReviewContext | None = None):
         """Run the reviewer roster with staggered launches and aggregate it.
 
+        reviews/ is cleared first, so the returned aggregation covers exactly
+        this round's roster.
+
         Errored reviewers are retried in-phase up to ``max_reviewer_retries``
         unless their failure kind's policy skips in-phase retry
         (``orchestrator/reviewer_failure.py::should_retry_reviewer``).
@@ -11190,6 +11218,7 @@ class TaskWorkflow:
         enforceable guarantee; this only reduces wasted reviewer effort.
         """
         assert self.worktree is not None and self.artifacts is not None
+        self.artifacts.clear_reviews()
         briefing = self.config.review.reviewer_briefing
         roster = reviewers_for(briefing)
         subject = None
@@ -11251,7 +11280,10 @@ class TaskWorkflow:
             )
 
         for role, result in zip(roster, results, strict=True):
-            if isinstance(result, Exception):
+            # BaseException, not Exception: gather returns a child's own
+            # CancelledError as a result, and a reviewer with no review would
+            # vanish from the aggregation, which the gate reads as PASS.
+            if isinstance(result, BaseException):
                 logger.error(
                     f'Reviewer {role.name} failed after retries: {result}',
                     exc_info=result,
@@ -11261,8 +11293,7 @@ class TaskWorkflow:
                     classify_reviewer_exception(result),
                     summary=f'Reviewer exception: {result}',
                 )
-            if isinstance(result, dict):
-                self.artifacts.write_review(role.name, result)
+            self.artifacts.write_review(role.name, result)
 
         return self.artifacts.aggregate_reviews()
 
@@ -11339,9 +11370,7 @@ class TaskWorkflow:
         so only a corrupt, hand-edited or cross-role artifact can reach disk
         under someone else's name.  It still matters: ``_run_reviewer``'s
         return is mirrored verbatim into ``reviews/<role>.json`` (``_review``
-        -> ``artifacts.write_review``), and that mirror — despite
-        ``write_review``'s "debugging aid, not load-bearing" docstring
-        (``artifacts.py:851-852``) — is the SOLE input to
+        -> ``artifacts.write_review``), and that mirror is the SOLE input to
         ``aggregate_reviews()``, which makes the blocking-issue decision.  A
         cross-role payload returned verbatim would be filed, and its issues
         counted, under the wrong reviewer's name.
@@ -14101,10 +14130,14 @@ class TaskWorkflow:
         )
 
     def _write_merge_failure_review(self, category: str, detail: str) -> None:
-        """Write a review-format JSON describing a merge failure to .task/reviews/.
+        """Write a review-format JSON describing a merge failure to reviews/.
 
         Uses the same schema as reviewer agents so humans and retry agents
-        can consume it uniformly.
+        can consume it uniformly. The record is forensic: every caller routes
+        the same detail onward (as a block reason, or into main-health
+        auto-heal), and both ``clear_reviews()`` call sites run before any
+        aggregation, so it is never aggregated. Losing it to a vanished root
+        is logged, not raised.
         """
         if not self.artifacts:
             return
@@ -14121,7 +14154,13 @@ class TaskWorkflow:
             ],
             'summary': detail[:200],
         }
-        self.artifacts.write_review('merge', review)
+        try:
+            self.artifacts.write_review('merge', review)
+        except ReviewsRootMissing as exc:
+            logger.warning(
+                'Task %s: merge-failure review (%s) not written: %s',
+                self.task_id, category, exc,
+            )
 
     def _build_agent_env(self, role: AgentRole) -> dict[str, str] | None:
         """Build the env_overrides dict for this agent invocation.
@@ -14826,61 +14865,62 @@ class TaskWorkflow:
         # in-flight so the finally preserves (does not clear) its sidecar.
         session_preserved = False
         try:
-            result = await invoke_with_cap_retry(
-                usage_gate=self.usage_gate,
-                label=f'Task {self.task_id} [{role.name}]',
-                config_dir=self._config_dir,
-                invoke_fn=invoke_agent,
-                prompt=prompt,
-                rebuild_prompt=build_prompt,
-                system_prompt=self._resolve_role_system_prompt(role, model),
-                cwd=cwd,
-                model=model,
-                max_turns=max_turns_val,
-                max_budget_usd=budget,
-                allowed_tools=role.allowed_tools or None,
-                disallowed_tools=role.disallowed_tools or None,
-                mcp_config=mcp_config,
-                strict_mcp_config=strict_mcp,
-                output_schema=output_schema,
-                sandbox_modules=sandbox_modules,
-                sandbox_extras=sandbox_extras,
-                effort=effort_val,
-                backend=backend_val,
-                # Rides the same **invoke_kwargs forwarding path as backend=
-                # above (task 2457) straight to invoke_agent(prices=...) ->
-                # the codex/gemini/pi cost estimators (claude ignores it —
-                # reports native cost). See OrchestratorConfig.prices.
-                prices=self.config.prices,
-                timeout_seconds=timeout_val,
-                startup_grace_secs=timeouts_cfg.startup_grace_secs,
-                # Working-regime progress extension (task 2360 fix #1): once the
-                # transcript proves liveness (≥1 turn), the watchdog no longer
-                # kills at the flat per-role timeout_val ceiling — it extends to
-                # max(working_idle_secs, timeout_val), bounded above by the
-                # absolute cap.  _invoke is the SHARED chokepoint for every role,
-                # so this engages uniformly; safe by construction since the
-                # extended idle bound is always >= the old per-role ceiling.
-                working_idle_secs=timeouts_cfg.working_idle_secs,
-                absolute_cap_secs=self.config.invocation_timeout,
-                session_id=session_id_val,
-                resume_session_id=resume_session_id,
-                # Judge is safe by OMISSION from config.role_env_overrides (the
-                # per-role OPT-IN endpoint-env map, task 2460) — _build_agent_env
-                # no longer gates roles by a hardcoded allow-list, so the judge
-                # simply must not be named there.  Opting it in would propagate
-                # ANTHROPIC_BASE_URL and route it through vLLM, where
-                # max_model_len causes ServerDisconnectedError after 2 tool-use
-                # rounds (3cd380a079) — do not add 'judge' to role_env_overrides
-                # unless that endpoint is confirmed to handle its tool-use
-                # pattern.  Cap hits on Claude API are handled by UsageGate
-                # account failover (wired in runner.py for eval mode).
-                env_overrides=self._build_agent_env(role),
-                # Spawn-identity env for the SessionStart hook (task 2512) —
-                # independent of env_overrides (which is None for
-                # merger/judge/reviewer); spawn_env is built for every role.
-                spawn_env=self._build_spawn_env(role),
-            )
+            async with self.git_ops.lane_in_use(cwd):
+                result = await invoke_with_cap_retry(
+                    usage_gate=self.usage_gate,
+                    label=f'Task {self.task_id} [{role.name}]',
+                    config_dir=self._config_dir,
+                    invoke_fn=invoke_agent,
+                    prompt=prompt,
+                    rebuild_prompt=build_prompt,
+                    system_prompt=self._resolve_role_system_prompt(role, model),
+                    cwd=cwd,
+                    model=model,
+                    max_turns=max_turns_val,
+                    max_budget_usd=budget,
+                    allowed_tools=role.allowed_tools or None,
+                    disallowed_tools=role.disallowed_tools or None,
+                    mcp_config=mcp_config,
+                    strict_mcp_config=strict_mcp,
+                    output_schema=output_schema,
+                    sandbox_modules=sandbox_modules,
+                    sandbox_extras=sandbox_extras,
+                    effort=effort_val,
+                    backend=backend_val,
+                    # Rides the same **invoke_kwargs forwarding path as backend=
+                    # above (task 2457) straight to invoke_agent(prices=...) ->
+                    # the codex/gemini/pi cost estimators (claude ignores it —
+                    # reports native cost). See OrchestratorConfig.prices.
+                    prices=self.config.prices,
+                    timeout_seconds=timeout_val,
+                    startup_grace_secs=timeouts_cfg.startup_grace_secs,
+                    # Working-regime progress extension (task 2360 fix #1): once the
+                    # transcript proves liveness (≥1 turn), the watchdog no longer
+                    # kills at the flat per-role timeout_val ceiling — it extends to
+                    # max(working_idle_secs, timeout_val), bounded above by the
+                    # absolute cap.  _invoke is the SHARED chokepoint for every role,
+                    # so this engages uniformly; safe by construction since the
+                    # extended idle bound is always >= the old per-role ceiling.
+                    working_idle_secs=timeouts_cfg.working_idle_secs,
+                    absolute_cap_secs=self.config.invocation_timeout,
+                    session_id=session_id_val,
+                    resume_session_id=resume_session_id,
+                    # Judge is safe by OMISSION from config.role_env_overrides (the
+                    # per-role OPT-IN endpoint-env map, task 2460) — _build_agent_env
+                    # no longer gates roles by a hardcoded allow-list, so the judge
+                    # simply must not be named there.  Opting it in would propagate
+                    # ANTHROPIC_BASE_URL and route it through vLLM, where
+                    # max_model_len causes ServerDisconnectedError after 2 tool-use
+                    # rounds (3cd380a079) — do not add 'judge' to role_env_overrides
+                    # unless that endpoint is confirmed to handle its tool-use
+                    # pattern.  Cap hits on Claude API are handled by UsageGate
+                    # account failover (wired in runner.py for eval mode).
+                    env_overrides=self._build_agent_env(role),
+                    # Spawn-identity env for the SessionStart hook (task 2512) —
+                    # independent of env_overrides (which is None for
+                    # merger/judge/reviewer); spawn_env is built for every role.
+                    spawn_env=self._build_spawn_env(role),
+                )
         except asyncio.CancelledError:
             # Cooperative cancellation of the agent invocation itself (a clean
             # SIGTERM shutdown surfaces as CancelledError from THIS await) is an
@@ -14979,10 +15019,10 @@ class TaskWorkflow:
         completed_at = datetime.now(UTC).isoformat()
 
         # The CLI-stage half of session_resume_failed (task 3578): we DID arm
-        # --resume, the CLI rejected the session, and invoke_with_cap_retry
-        # retried fresh and handed back a SUCCESS. Nothing else records that —
-        # from runs.db the invocation looks perfect, so the lost transcript was
-        # invisible. `shared` has no event store, so the count rides out on
+        # --resume and the CLI rejected the session before any model turn, so
+        # invoke_with_cap_retry retried fresh. resume_fallbacks counts only
+        # those proven rejections (shared/cli_invoke.py::is_resume_rejected,
+        # task 5579). `shared` has no event store, so the count rides out on
         # AgentResult.resume_fallbacks and is turned into an event here.
         #
         # getattr with a default, not attribute access: several suites hand
@@ -14994,8 +15034,8 @@ class TaskWorkflow:
         # EventType's taxonomy note).
         #
         # GATED ON OUR OWN ARMED RESUME, not on the counter alone. cli_invoke
-        # increments resume_fallbacks for ANY resumed attempt that failed
-        # non-cap and was retried fresh — including a resume its retry loop
+        # increments resume_fallbacks for ANY rejected resume it retried
+        # fresh — including a resume its retry loop
         # re-armed ITSELF after a cap hit (invoke_kwargs['resume_session_id'] =
         # result.session_id). A plain FRESH dispatch that hits a cap can
         # therefore come back with a non-zero count while no resume was ever
@@ -15004,41 +15044,32 @@ class TaskWorkflow:
         # resumes we DECIDED to make, how many did not survive?") and could
         # push it above 1. resume_session_id is non-None iff the arm site above
         # corroborated and adopted, which is that predicate exactly.
+        #
+        # The payload names the session actually LOST, which session_id_val
+        # often is not: cli_invoke's _reset_for_fresh_retry regenerates the
+        # pre-allocated id, and a cap re-arm replaces the armed id with
+        # result.session_id. The steward builds the same row through the same
+        # builder (event_store.py::cli_resume_failed_data).
         resume_fallbacks = getattr(result, 'resume_fallbacks', 0)
-        if resume_fallbacks and resume_session_id:
-            # …and name the session actually LOST, which session_id_val often
-            # is not: cli_invoke's _reset_for_fresh_retry regenerates the
-            # pre-allocated id, and a cap re-arm replaces the armed id with
-            # result.session_id. The carrier keeps every dropped id in order;
-            # the first is the resume we adopted, so it is the scalar
-            # data.session_id, with the full list alongside for the
-            # multi-fallback invocations. Falls back to our own armed id if an
-            # older shared/ (or a suite stand-in) carries no list.
-            lost_session_ids = [
-                str(s) for s in
-                (getattr(result, 'resume_fallback_session_ids', ()) or ())
-            ]
-            lost_session_id = (
-                lost_session_ids[0] if lost_session_ids else resume_session_id
-            )
+        cli_failure = cli_resume_failed_data(
+            armed_session_id=resume_session_id,
+            role=role.name,
+            fallbacks=resume_fallbacks,
+            dropped_session_ids=getattr(result, 'resume_fallback_session_ids', ()) or (),
+        )
+        if cli_failure is not None:
             if self.event_store:
                 self.event_store.emit(
                     EventType.session_resume_failed,
                     task_id=self.task_id,
-                    data={
-                        'stage': 'cli',
-                        'session_id': lost_session_id,
-                        'session_ids': lost_session_ids,
-                        'role': role.name,
-                        'fallbacks': resume_fallbacks,
-                    },
+                    data=cli_failure,
                 )
             # Genuine by construction (task ε/3733): the restore ran a phase
             # earlier and is not what failed here, so the report carries no
             # restore outcome and the harness cannot carve it out.
             self._report_resume_failed(
                 stage='cli',
-                session_id=lost_session_id,
+                session_id=cli_failure['session_id'],
                 role_name=role.name,
                 restore=None,
                 archive_root=archive_root,
@@ -15051,6 +15082,9 @@ class TaskWorkflow:
             # Adopted AND survived — the reset half of the circuit breaker.
             # `resume_session_id` is non-None iff the arm site corroborated and
             # adopted, so this is exactly "a resume we DECIDED to make worked".
+            # A resumed run that ran turns and then ended non-success (the
+            # ended_awaiting_background downgrade, a budget kill) also survived:
+            # the role's normal non-success handling owns that outcome (task 5579).
             self._report_resume_succeeded()
 
         # Record the last successfully-completed role (updated only on success,
@@ -18067,20 +18101,22 @@ class TaskWorkflow:
         if block_class is None:
             block_class = classify_block_reason(reason)
         try:
+            investigate = functools.partial(
+                run_dry_run_unblock,
+                task_id=self.task_id,
+                worktree=str(self.worktree),
+                reason=reason,
+                detail=detail,
+                scheduler=self.scheduler,
+                mcp=self.mcp,
+                config=self.config,
+                event_store=getattr(self, 'event_store', None),
+                usage_gate=self.usage_gate,
+                cost_store=self.cost_store,
+                block_class=block_class,
+            )
             _task = asyncio.create_task(
-                run_dry_run_unblock(
-                    task_id=self.task_id,
-                    worktree=str(self.worktree),
-                    reason=reason,
-                    detail=detail,
-                    scheduler=self.scheduler,
-                    mcp=self.mcp,
-                    config=self.config,
-                    event_store=getattr(self, 'event_store', None),
-                    usage_gate=self.usage_gate,
-                    cost_store=self.cost_store,
-                    block_class=block_class,
-                ),
+                self._run_in_lane(self.worktree, investigate),
                 name=investigation_task_name(self.task_id),
             )
             self._background_tasks.add(_task)
@@ -18090,6 +18126,17 @@ class TaskWorkflow:
                 'Task %s: failed to spawn dry-run unblock hook: %s',
                 self.task_id, exc,
             )
+
+    async def _run_in_lane(
+        self, lane: Path, child: Callable[[], Awaitable[object]],
+    ) -> None:
+        """Run *child* inside *lane*'s IN_USE span (leaf δ).
+
+        *child* is bound at spawn time but only called here, so its coroutine
+        never exists outside the span.
+        """
+        async with self.git_ops.lane_in_use(lane):
+            await child()
 
     async def _write_completion_to_memory(self) -> None:
         """Write task completion summary so dependent tasks find it in briefings.

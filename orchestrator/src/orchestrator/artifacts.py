@@ -8,7 +8,7 @@ import os
 import re
 import shutil
 import stat
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
@@ -82,6 +82,23 @@ class ArtifactWriteError(OSError):
     working, and is a DISTINCT type so ``_write_json``'s vanished-root
     ``except FileNotFoundError`` tolerance cannot accidentally swallow it.
     """
+
+
+class ReviewsRootMissing(FileNotFoundError):
+    """A review could not be written because the root holding reviews/ is gone.
+
+    Built from a single message, so ``errno`` stays None and
+    ``workflow_types.py::classify_failure`` blocks the task, as it does
+    ``git_ops.py::WorktreeMissing``.
+    """
+
+    def __init__(self, reviewer_name: str, root: Path):
+        self.reviewer_name = reviewer_name
+        self.root = root
+        super().__init__(
+            f'review {reviewer_name!r} cannot reach the review gate: '
+            f'its root {root} no longer exists'
+        )
 
 
 class PlanMutexNotHeld(RuntimeError):
@@ -250,7 +267,7 @@ def _normalize_plan(plan: dict) -> tuple[dict, bool]:
     if 'steps' not in plan:
         for alias in _STEPS_ALIASES:
             if alias in plan and isinstance(plan[alias], list):
-                logger.warning('Normalizing plan: renaming %r → "steps"', alias)
+                logger.debug('Normalizing plan: renaming %r → "steps"', alias)
                 plan['steps'] = plan.pop(alias)
                 modified = True
                 break
@@ -259,7 +276,7 @@ def _normalize_plan(plan: dict) -> tuple[dict, bool]:
     if 'steps' not in plan and _NESTED_PLAN_KEY in plan:
         nested = plan[_NESTED_PLAN_KEY]
         if isinstance(nested, dict):
-            logger.warning(
+            logger.debug(
                 'Normalizing plan: flattening %s phases from %r',
                 len(nested), _NESTED_PLAN_KEY,
             )
@@ -275,8 +292,8 @@ def _normalize_plan(plan: dict) -> tuple[dict, bool]:
     if isinstance(steps, list):
         new_steps, changed = _wrap_string_items(steps, 'step')
         if changed:
-            logger.warning('Normalizing plan: wrapping %d string steps as dicts',
-                           sum(1 for s in steps if isinstance(s, str)))
+            logger.debug('Normalizing plan: wrapping %d string steps as dicts',
+                         sum(1 for s in steps if isinstance(s, str)))
             plan['steps'] = new_steps
             modified = True
 
@@ -1040,6 +1057,17 @@ class TaskArtifacts:
                 self._write_held_plan(plan)
         return plan
 
+    def peek_plan(self) -> dict:
+        """Return the plan exactly as :meth:`read_plan` would, but never repair
+        it on disk: no ``plan_mutex`` is taken and nothing is written.
+
+        For observers that poll a live task's plan (such as
+        ``orchestrator/task_runtime.py::_read_task_entry``) and must not
+        rewrite it under the agent that owns it.
+        """
+        plan, _needs_repair = self._read_normalized_plan()
+        return plan
+
     def _read_normalized_plan(self) -> tuple[dict, bool]:
         plan_path = self.artifact_path('plan.json')
         if not plan_path.exists():
@@ -1219,23 +1247,20 @@ class TaskArtifacts:
         self._clear_path('iterations.jsonl')
 
     def write_review(self, reviewer_name: str, review: dict) -> None:
-        """Write .task/reviews/{name}.json.
+        """Write ``reviews/{reviewer_name}.json``.
 
-        Best-effort: if the artifacts root has been removed (worktree gone
-        out-of-band), skip the write rather than raising — the review JSON
-        is a debugging aid, not load-bearing for workflow correctness. This
-        method assumes ``init()`` has already created the reviews' root:
-        reviews are a post-implementation workflow phase, so init() has
-        always run by the time a reviewer's output is written.
+        reviews/ is load-bearing: ``aggregate_reviews()`` is the review gate's
+        only input. A skipped write would leave an aggregation with no
+        blocking issues and no errors, which the gate reads as PASS, so a
+        vanished root raises instead. The root is never recreated.
+
+        Raises:
+            ReviewsRootMissing: the root holding reviews/ no longer exists.
         """
-        root = self._root_for('reviews')
-        if not root.is_dir():
-            logger.info(
-                'TaskArtifacts: skipping write_review %r — root %s no longer exists',
-                reviewer_name, root,
-            )
-            return
-        self._write_json(f'reviews/{reviewer_name}.json', review)
+        self._write_json(
+            f'reviews/{reviewer_name}.json', review,
+            on_root_gone=lambda root: ReviewsRootMissing(reviewer_name, root),
+        )
 
     def read_reviews(self) -> dict[str, dict]:
         """Read all reviews from the reviews/ directory."""
@@ -1245,6 +1270,19 @@ class TaskArtifacts:
             for path in reviews_dir.glob('*.json'):
                 reviews[path.stem] = json.loads(path.read_text())
         return reviews
+
+    def clear_reviews(self) -> None:
+        """Remove every review so the next aggregation holds only reviews written after this call."""
+        reviews_dir = self.artifact_path('reviews')
+        if not reviews_dir.is_dir():
+            return
+        removed = []
+        for entry in reviews_dir.iterdir():
+            if entry.is_symlink() or not entry.is_dir():
+                entry.unlink(missing_ok=True)
+                removed.append(entry.name)
+        if removed:
+            logger.info('TaskArtifacts: cleared reviews %s from %s', sorted(removed), reviews_dir)
 
     def aggregate_reviews(self) -> ReviewAggregation:
         """Aggregate every review as ``orchestrator/review_payload.py::normalize_review`` reads it.
@@ -1608,24 +1646,17 @@ class TaskArtifacts:
     # ──────────────────────────────────────────────────────────────────
 
     def write_verdict(self, role: str, envelope: dict) -> None:
-        """Write ``.task/verdicts/{role}.json``.
+        """Write ``verdicts/{role}.json``.
 
-        Best-effort: if the artifacts root has been removed (worktree gone
-        out-of-band), skip the write rather than raising — mirrors
-        ``write_review``'s root-gone guard. This method assumes ``init()``
-        has already created the verdicts' root.
+        Best-effort through ``_write_json``'s default root-gone no-op: a
+        vanished root (worktree gone out-of-band) skips the write and is never
+        recreated. Skipping fails closed, because ``_run_reviewer`` treats a
+        missing verdict as ERROR.
 
         Raises:
             ValueError: if *role* is invalid — see ``_validate_verdict_role``.
         """
         _validate_verdict_role(role)
-        root = self._root_for('verdicts')
-        if not root.is_dir():
-            logger.info(
-                'TaskArtifacts: skipping write_verdict %r — root %s no longer exists',
-                role, root,
-            )
-            return
         self._write_json(f'verdicts/{role}.json', envelope)
 
     def read_verdict(self, role: str) -> dict | None:
@@ -1766,7 +1797,10 @@ class TaskArtifacts:
 
         return False
 
-    def _write_json(self, name: str, data: dict) -> None:
+    def _write_json(
+        self, name: str, data: dict,
+        *, on_root_gone: Callable[[Path], FileNotFoundError] | None = None,
+    ) -> None:
         """Write *data* to artifact *name* (routed by ``artifact_path``) as
         JSON, ATOMICALLY and DURABLY.
 
@@ -1774,6 +1808,14 @@ class TaskArtifacts:
         (metadata, plan, review_state, reviews, verdicts, agent_session,
         reconcile_state, the architect's report artifacts), and therefore the
         single owner of their byte format and their durability guarantees.
+
+        It is also the single owner of what a vanished root (the worktree
+        deleted out-of-band) means for a write. A write never recreates its
+        root: only ``init()`` creates roots, so the write creates just the
+        artifact's own directory directly below the root. A root found gone,
+        before or during the write, makes the write a logged no-op. A caller
+        whose artifact must not be lost passes *on_root_gone*, and the write
+        raises ``on_root_gone(root)`` instead.
 
         What a concurrent reader may rely on: it observes either the complete
         OLD contents or the complete NEW contents — never a truncated file,
@@ -1819,7 +1861,7 @@ class TaskArtifacts:
         and no current site has a defensible reason to opt out.  Should a
         future caller genuinely write in a loop, give THAT caller the flag
         rather than flipping the default underneath the recovery artifacts.
-        The kwargs this contract turns on are pinned by
+        The ``fsync`` kwarg this contract turns on is pinned by
         ``TestWriteJsonDelegatesToSharedSafeIo``.
 
         An EXISTING target keeps its own permission bits across the swap (see
@@ -1852,15 +1894,13 @@ class TaskArtifacts:
         into an O(n) rewrite while destroying the partial-read tolerance that
         makes a truncated log still usable line-by-line.
         """
-        # Tolerate a vanished worktree.  Callers that care about durability
-        # (init, plan, base_commit, etc.) check their root themselves; the
-        # opportunistic writes (reviews, iteration log) just want a no-op
-        # when the worktree has been deleted out-of-band.
         path = self.artifact_path(name)
+        root = self._root_for(Path(name).parts[0])
         try:
             # Resolve FIRST — write through a symlink, never onto it.  Order
             # inside this block is deliberate: the refusal must precede any
-            # filesystem mutation, so dangling check → mode lookup → write.
+            # filesystem mutation, so dangling check → directory creation →
+            # mode lookup → write.
             target = Path(os.path.realpath(path))
             if path.is_symlink() and not target.parent.is_dir():
                 raise ArtifactWriteError(
@@ -1869,29 +1909,29 @@ class TaskArtifacts:
                     'dangling symlink?) — refusing to materialise a stray '
                     'file at the link path'
                 )
+            if path.parent != root:
+                path.parent.mkdir(exist_ok=True)
             # ``_existing_mode`` is inside the try so a NON-FileNotFoundError
             # stat failure (EACCES/ELOOP/ENAMETOOLONG) surfaces through the
             # same path as any other write failure.  It swallows
             # FileNotFoundError ITSELF and reports the target as new, so a
             # vanished target does NOT short-circuit here — it reaches
-            # ``atomic_write_text``, which re-creates the parent chain under
-            # ``mkdir=True``, exactly as the superseded
-            # ``path.parent.mkdir(parents=True)`` did.  The tolerated no-op
-            # branch below is therefore reached from the WRITE, never from
-            # the mode lookup.
+            # ``atomic_write_text``, whose temp-file create raises
+            # FileNotFoundError when the root is gone.  The root-gone branch
+            # below is therefore reached from the directory creation or the
+            # WRITE, never from the mode lookup.
             safe_io.atomic_write_text(
                 target,
                 json.dumps(data, indent=2) + '\n',  # byte format UNCHANGED
                 mode=_existing_mode(target),
                 fsync=True,
-                mkdir=True,
             )
-        except FileNotFoundError:
-            root = self._root_for(Path(name).parts[0])
-            if not root.is_dir():
-                logger.info(
-                    'TaskArtifacts: skipping _write_json to %s — root %s no longer exists',
-                    path, root,
-                )
-                return
-            raise
+        except FileNotFoundError as exc:
+            if root.is_dir():
+                raise
+            if on_root_gone is not None:
+                raise on_root_gone(root) from exc
+            logger.info(
+                'TaskArtifacts: skipping _write_json to %s — root %s no longer exists',
+                path, root,
+            )

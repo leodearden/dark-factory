@@ -245,6 +245,65 @@ def prompt_file(tmp_path: Path, text: str) -> str:
     return str(path)
 
 
+PROXY_SETTINGS: dict[str, Any] = {
+    'defaultModelSelection': {'instanceId': 'claude-proxy', 'model': 'claude-opus-5-5'},
+    'providerInstances': {
+        'claudeAgent': {'driver': 'claudeAgent', 'enabled': False},
+        'claude-proxy': {'driver': 'claudeAgent', 'enabled': True},
+    },
+}
+"""``$T3CODE_HOME/userdata/settings.json`` on a host whose only enabled Claude instance
+is ``claude-proxy`` (v0.1.6 shapes, abridged)."""
+
+
+def write_settings(env: Env, settings: dict[str, Any]) -> None:
+    (env.t3_home / 'userdata' / 'settings.json').write_text(json.dumps(settings))
+
+
+# ---------------------------------------------------------------------------
+# provider
+# ---------------------------------------------------------------------------
+
+
+class TestProvider:
+    def test_the_projects_live_instance_is_named_with_its_source(
+        self, env: Env, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        write_settings(env, PROXY_SETTINGS)
+
+        line = run_verb(capsys, 'provider', '--cwd', str(env.project))
+
+        assert line == 'instance instance_id=claude-proxy source=project'
+
+    def test_a_disabled_explicit_instance_is_refused(
+        self, env: Env, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        write_settings(env, PROXY_SETTINGS)
+
+        line = run_verb(
+            capsys, 'provider', '--cwd', str(env.project), '--provider', 'claudeAgent'
+        )
+
+        assert line == 'refused reason=provider-disabled instance_id=claudeAgent source=explicit'
+
+    def test_a_project_disable_is_read_through_the_project_store(
+        self, env: Env, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        overrides = {PROJECT_ID: {'providerInstances': {'claude-proxy': {'enabled': False}}}}
+        write_settings(env, {**PROXY_SETTINGS, 'projectSettingsOverrides': overrides})
+
+        line = run_verb(capsys, 'provider', '--cwd', str(env.project))
+
+        assert line == 'refused reason=provider-disabled instance_id=claudeAgent source=fallback'
+
+    def test_no_settings_falls_back_to_claude_agent_unverified(
+        self, env: Env, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        line = run_verb(capsys, 'provider', '--cwd', str(env.project))
+
+        assert line == 'instance instance_id=claudeAgent source=fallback'
+
+
 # ---------------------------------------------------------------------------
 # detect
 # ---------------------------------------------------------------------------
@@ -408,6 +467,37 @@ class TestLaunch:
 
         assert line == f'started thread_id={THREAD_ID} project_id={PROJECT_ID} run_id=none'
         assert '--model' not in fake_t3.calls('start')[0]['argv']
+
+    def test_a_model_runs_on_the_projects_live_claude_instance(
+        self, env: Env, fake_t3: FakeT3, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        write_settings(env, PROXY_SETTINGS)
+        fake_t3.script(start=[ok(THREAD_START_JSON)])
+
+        line = run_verb(
+            capsys, 'launch', '--cwd', str(env.project), '--title', 't',
+            '--prompt-file', prompt_file(tmp_path, 'p'), '--record', '', '--model', 'fable',
+        )
+
+        assert line.startswith('started ')
+        argv = fake_t3.calls('start')[0]['argv']
+        assert argv[argv.index('--provider') + 1 :][:3] == ['claude-proxy', '--model', 'fable']
+
+    def test_a_disabled_explicit_instance_is_refused_before_any_start(
+        self, env: Env, fake_t3: FakeT3, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        write_settings(env, PROXY_SETTINGS)
+        record_dir = spawn_record(env)
+
+        line = run_verb(
+            capsys, 'launch', '--cwd', str(env.project), '--title', 't',
+            '--prompt-file', prompt_file(tmp_path, 'p'), '--record', record_dir,
+            '--model', 'fable', '--provider', 'claudeAgent',
+        )
+
+        assert line == 'refused reason=provider-disabled instance_id=claudeAgent source=explicit'
+        assert fake_t3.calls('start') == [] and fake_t3.calls('list') == []
+        assert sr.read_record(Path(record_dir).name, root=env.fleet).display is None
 
     def test_no_t3_on_path_is_no_launcher(
         self, env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,

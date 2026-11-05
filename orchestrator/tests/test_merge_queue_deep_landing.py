@@ -287,9 +287,9 @@ def _assert_quiescent(
           ``sweep_resolved()`` runs; calling it here before ``is_empty()``
           is required, not optional.
       (e) worker.two_layer_invariants(main_sha) == [] — *main_sha* MUST be a
-          REAL sha, never 'unknown': the base-chain and verify-base
-          sub-checks are silently skipped for the 'unknown' sentinel, which
-          would make this assertion pass vacuously rather than meaningfully.
+          REAL sha, never 'unknown': the base-chain (INV-3) sub-check is
+          silently skipped for the 'unknown' sentinel, which would make this
+          assertion pass vacuously rather than meaningfully.
       (f) worker.snapshot()['entries'] == [] — the lane's public census is
           empty: every request_id has left both the containers and the
           ItemLifecycle registry (snapshot's own non-terminal section is

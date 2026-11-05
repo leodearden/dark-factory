@@ -6,11 +6,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
-from _stores import RunsDb, TasksDb
+from _stores import EscalationQueueDir, RunsDb, TasksDb
 from shared.project_layout import tasks_db
 
 from client_feed.contract import Source, TaskStatus, WaitingOn
-from client_feed.sources.events import OpenEscalations, read_open_escalations
+from client_feed.sources.escalations import OpenEscalations, read_open_escalations
 from client_feed.sources.store import StoreProblem, StoreReadError
 from client_feed.sources.tasks import (
     SkippedTask,
@@ -267,7 +267,6 @@ class TestSkippedTasks:
     ('status', 'levels', 'expected'),
     [
         (TaskStatus.BLOCKED, (2,), WaitingOn.LEO),
-        (TaskStatus.BLOCKED, (None,), WaitingOn.FACTORY),
         (TaskStatus.BLOCKED, (1,), WaitingOn.FACTORY),
         (TaskStatus.BLOCKED, (0,), WaitingOn.FACTORY),
         (TaskStatus.BLOCKED, (), WaitingOn.FACTORY),
@@ -279,7 +278,7 @@ class TestSkippedTasks:
         (TaskStatus.CANCELLED, (1,), None),
     ],
 )
-def test_waiting_on(status: TaskStatus, levels: Sequence[int | None], expected: WaitingOn | None) -> None:
+def test_waiting_on(status: TaskStatus, levels: Sequence[int], expected: WaitingOn | None) -> None:
     assert waiting_on(status, levels) is expected
 
 
@@ -288,36 +287,41 @@ class TestWaitingOnFromTheStores:
         read = read_tasks(root, since=None, escalations=read_open_escalations(root))
         return next(row.waiting_on for row in read.rows if row.task_id == task_id)
 
-    def test_a_blocked_task_with_an_open_level_two_waits_on_leo(
+    def test_a_blocked_task_under_a_pending_level_two_waits_on_leo_until_it_is_archived(
         self, root: Path, tasks: TasksDb
     ) -> None:
-        runs = RunsDb.create(root)
+        queue = EscalationQueueDir.create(root)
         tasks.add(9, status='blocked', updated_at=LATE)
-        runs.emit(
-            'escalation_created', at=datetime(2026, 10, 2, tzinfo=UTC), task_id='9',
-            data={'escalation_id': 'esc-9-1', 'level': 2, 'summary': 'SECRET-SUMMARY'},
-        )
+        queue.write('esc-9-1', task_id='9', level=1)
+        queue.write('esc-9-2', task_id='9', level=2, members=['esc-9-1'])
 
         assert self.waiting(root, 9) is WaitingOn.LEO
 
-        runs.emit(
-            'escalation_resolved', at=datetime(2026, 10, 3, tzinfo=UTC), task_id='9',
-            data={'escalation_id': 'esc-9-1'},
-        )
+        queue.archive('esc-9-2', status='dismissed')
+        queue.archive('esc-9-1', status='dismissed')
 
         assert self.waiting(root, 9) is WaitingOn.FACTORY
 
     def test_an_open_level_one_escalation_waits_on_the_factory(
         self, root: Path, tasks: TasksDb
     ) -> None:
-        runs = RunsDb.create(root)
+        queue = EscalationQueueDir.create(root)
         tasks.add(10, status='in-progress', updated_at=LATE)
-        runs.emit(
-            'escalation_created', at=datetime(2026, 10, 2, tzinfo=UTC), task_id='10',
-            data={'escalation_id': 'esc-10-1', 'level': 1},
-        )
+        queue.write('esc-10-1', task_id='10', level=1)
 
         assert self.waiting(root, 10) is WaitingOn.FACTORY
+
+    def test_a_level_two_recorded_only_in_runs_db_no_longer_decides(
+        self, root: Path, tasks: TasksDb
+    ) -> None:
+        EscalationQueueDir.create(root)
+        tasks.add(9, status='blocked', updated_at=LATE)
+        RunsDb.create(root).emit(
+            'escalation_created', at=datetime(2026, 10, 2, tzinfo=UTC), task_id='9',
+            data={'escalation_id': 'esc-9-1', 'level': 2},
+        )
+
+        assert self.waiting(root, 9) is WaitingOn.FACTORY
 
 
 class TestStore:

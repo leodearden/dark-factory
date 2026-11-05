@@ -20,6 +20,8 @@ T3 Code v0.1.6 (``~/src/t3code-v0.1.6``):
 ``mcpOAuth`` group and the ``descriptor`` endpoint),
 ``packages/contracts/src/environment.ts::ExecutionEnvironmentDescriptor``,
 ``apps/server/src/mcp/McpHttpServer.ts`` (the 401 body),
+``apps/server/src/auth/PairingGrantStore.ts`` (``PAIRING_TOKEN_ALPHABET``,
+``PAIRING_TOKEN_LENGTH``: the pairing codes),
 ``apps/server/src/cliAuthFormat.ts::formatIssuedPairingCredential`` (the CLI's
 ``--json`` output) and effect's ``McpServer`` ``CallToolResult``.
 
@@ -60,6 +62,10 @@ FULL_ACCESS_SCOPES = ('orchestration:read', 'orchestration:operate', 'settings:w
 DEAD_ORIGIN = 'http://127.0.0.1:1'
 """Nothing answers here: binding port 1 needs root, so unlike a freed ephemeral
 port no concurrently running fake can be handed it."""
+PAIRING_CODE_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ'
+PAIRING_CODE_LENGTH = 12
+"""T3's ``PAIRING_TOKEN_ALPHABET`` and ``PAIRING_TOKEN_LENGTH``: no minted code
+begins with '-', so each one passes on argv as ``--code <code>`` the way an operator's does."""
 
 DESCRIPTOR_PATH = '/.well-known/t3/environment'
 REGISTER_PATH = '/oauth/mcp/register'
@@ -240,7 +246,7 @@ class FakeT3Server(ThreadingHTTPServer):
         self.tool_replies['t3_environment_read'] = _environment_read(environment_id, self.server_version)
 
     def add_pairing_code(self) -> str:
-        code = secrets.token_urlsafe(12)
+        code = ''.join(secrets.choice(PAIRING_CODE_ALPHABET) for _ in range(PAIRING_CODE_LENGTH))
         with self._lock:
             self._pairing_codes.add(code)
             self._issued_pairing_codes.append(code)

@@ -897,6 +897,34 @@ class TestTrackedFiles:
         assert source_measures.tracked_files(root, '*.rs') == ('sub/b.rs', 'z.rs')
 
 
+class TestBlobSha:
+    """Git's blob id of the content on disk, which is the index entry only while they agree."""
+
+    def test_a_committed_file_is_its_index_blob(self, tmp_path: Path) -> None:
+        root = _indexed_repo(tmp_path / 'repo', {'a.py': 'a = 1\n'})
+        _commit(root, 'base')
+        indexed = git(root, 'ls-files', '-s', 'a.py').split()[1]
+        assert source_measures.blob_sha(root / 'a.py') == indexed
+
+    def test_an_unstaged_edit_is_read_from_the_content_not_the_index(
+        self, tmp_path: Path
+    ) -> None:
+        root = _indexed_repo(tmp_path / 'repo', {'a.py': 'a = 1\n'})
+        _commit(root, 'base')
+        indexed = git(root, 'ls-files', '-s', 'a.py').split()[1]
+        (root / 'a.py').write_text('a = 2\n', encoding='utf-8')
+        found = source_measures.blob_sha(root / 'a.py')
+        assert found == git(root, 'hash-object', '--', 'a.py').strip()
+        assert found != indexed
+
+    def test_a_missing_file_is_refused_naming_it(self, tmp_path: Path) -> None:
+        root = _indexed_repo(tmp_path / 'repo', {'a.py': 'a = 1\n'})
+        missing = root / 'gone.py'
+        with pytest.raises(source_measures.MetricsError) as refused:
+            source_measures.blob_sha(missing)
+        assert str(missing) in str(refused.value)
+
+
 class TestTrackedPythonFilesFailsHard:
     """A listing that failed would read as an empty tree, so it raises instead."""
 

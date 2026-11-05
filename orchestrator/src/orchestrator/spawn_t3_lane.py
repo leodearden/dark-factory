@@ -51,11 +51,10 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from orchestrator import session_registry, t3_mcp_client
+from orchestrator import session_registry, spawn_t3_provider, t3_mcp_client
 from orchestrator.session_ownership_probes import ProcessTree
 
 MESSAGE_CHAR_LIMIT = 120_000
-CLAUDE_PROVIDER_INSTANCE = 'claudeAgent'
 PENDING_RUN_STATUSES = frozenset({'preparing', 'queued', 'starting'})
 ENDED_RUN_STATUSES = frozenset({'failed', 'cancelled', 'interrupted', 'rolled_back'})
 STARTUP_FAILURE_STATUSES = frozenset({'failed', 'cancelled', 'rolled_back'})
@@ -321,8 +320,8 @@ def _spill_pointer(spill: Path) -> str:
     return f'Read {spill} and follow it as your brief; that file holds your whole task.'
 
 
-def _start_argv(cwd: str, title: str, model: str | None) -> list[str]:
-    model_flags = ['--provider', CLAUDE_PROVIDER_INSTANCE, '--model', model] if model else []
+def _start_argv(cwd: str, title: str, model: str | None, provider: str) -> list[str]:
+    model_flags = ['--provider', provider, '--model', model] if model else []
     return ['thread', 'start', '--json', '--title', title, *model_flags, cwd, '-']
 
 
@@ -333,8 +332,10 @@ class LaunchedThread:
     run_id: str | None
 
 
-def _start_thread(cwd: str, title: str, model: str | None, message: str) -> LaunchedThread:
-    launched = run_t3(_start_argv(cwd, title, model), stdin=message)
+def _start_thread(
+    cwd: str, title: str, model: str | None, provider: str, message: str
+) -> LaunchedThread:
+    launched = run_t3(_start_argv(cwd, title, model, provider), stdin=message)
     if not isinstance(launched, dict) or not launched.get('threadId'):
         raise T3CommandFailed('t3 thread start printed no threadId')
     return LaunchedThread(
@@ -393,6 +394,32 @@ def _usable_parent(parent: str | None) -> str | None:
     return parent or None
 
 
+def provider_instance(
+    cwd: str, explicit: str | None, env: Mapping[str, str]
+) -> spawn_t3_provider.ProviderChoice:
+    """The instance a thread for *cwd* runs on; see ``spawn_t3_provider`` for the order."""
+    try:
+        project = containing_project(cwd, registered_projects(env))
+    except ProjectStoreUnreadable as exc:
+        logger.warning(f'provider enablement is checked environment-wide: {exc}')
+        project = None
+    return _provider_for(project, explicit, env)
+
+
+def _provider_for(
+    project: T3Project | None, explicit: str | None, env: Mapping[str, str]
+) -> spawn_t3_provider.ProviderChoice:
+    project_id = project.project_id if project else None
+    return spawn_t3_provider.resolve_instance(t3_userdata_dir(env), project_id, explicit)
+
+
+def _provider_verdict(choice: spawn_t3_provider.ProviderChoice) -> str:
+    named = {'instance_id': choice.instance_id, 'source': choice.source.value}
+    if choice.enabled is False:
+        return _verdict('refused', reason='provider-disabled', **named)
+    return _verdict('instance', **named)
+
+
 def launch(
     cwd: str,
     title: str,
@@ -401,6 +428,7 @@ def launch(
     model: str | None,
     env: Mapping[str, str],
     *,
+    provider: str | None = None,
     parent: str | None = None,
 ) -> str:
     if shutil.which('t3') is None:
@@ -416,11 +444,15 @@ def launch(
         detail = os.path.realpath(project.workspace_root) if project else None
         return _verdict('refused', reason='cwd-not-project-root', detail=detail)
 
+    choice = _provider_for(project, provider, env)
+    if model and choice.enabled is False:
+        return _provider_verdict(choice)
+
     _sweep_project_listing(cwd)
     message = _message_for(Path(prompt_file).read_text(encoding='utf-8'), record_dir)
     launched_at = datetime.now(UTC)
     try:
-        launched = _start_thread(cwd, title, model, message)
+        launched = _start_thread(cwd, title, model, choice.instance_id, message)
     except T3CommandFailed as exc:
         logger.warning(str(exc))
         recovered = _find_launched_after_failure(cwd, title, launched_at, project)
@@ -938,12 +970,17 @@ def _build_parser() -> argparse.ArgumentParser:
     verbs = parser.add_subparsers(dest='verb', required=True)
     verbs.add_parser('detect', help='print t3 when this process is hosted by a T3 thread')
 
+    provider_p = verbs.add_parser('provider', help='resolve the provider instance for a launch')
+    provider_p.add_argument('--cwd', required=True)
+    provider_p.add_argument('--provider', default=None, help='explicit provider instance id')
+
     launch_p = verbs.add_parser('launch', help='start a T3 thread for a spawn')
     launch_p.add_argument('--cwd', required=True)
     launch_p.add_argument('--title', required=True)
     launch_p.add_argument('--prompt-file', required=True)
     launch_p.add_argument('--record', required=True, help="record dir, '' when none")
     launch_p.add_argument('--model', default=None)
+    launch_p.add_argument('--provider', default=None, help='explicit provider instance id')
     launch_p.add_argument('--parent', default=None, help="the spawner's record slug")
 
     started_p = verbs.add_parser('await-started', help='wait for the thread to start, then bind')
@@ -984,8 +1021,11 @@ def _dispatch(args: argparse.Namespace) -> str:
             args.record,
             args.model,
             os.environ,
+            provider=args.provider,
             parent=args.parent,
         )
+    if args.verb == 'provider':
+        return _provider_verdict(provider_instance(args.cwd, args.provider, os.environ))
     if args.verb == 'await-started':
         return await_started(args.thread_id, args.cwd, args.record, args.timeout, args.since)
     if args.verb == 'wait':

@@ -830,6 +830,11 @@ def mock_config(tmp_path) -> FusedMemoryConfig:
     ``overreach_guard.shadow_enabled`` is pinned off for the same reason: with
     it on, every decision write in a unit test would reach the real overreach
     judge; a test of the shadow opts in on its own config.
+    ``mem0.persist_history`` is pinned off too: with it on, any test that
+    builds a real mem0 instance from this config would write the
+    process-shared, xdist-contended, sandbox-read-only
+    ``$MEM0_DIR/history.db`` rather than a private in-memory DB; a test of the
+    persisted default opts in on its own config.
     """
     config = FusedMemoryConfig(
         llm=LLMConfig(
@@ -862,6 +867,7 @@ def mock_config(tmp_path) -> FusedMemoryConfig:
     )
     config.write_triage.enabled = False
     config.overreach_guard.shadow_enabled = False
+    config.mem0.persist_history = False
     return config
 
 

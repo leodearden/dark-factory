@@ -1584,9 +1584,10 @@ class TaskInterceptor:
             # task_kind=None / pure_gate=False — fail-safe TOWARD live. What
             # the forwarding enables at gate 2 is live_workflow_detector's
             # task_kind-scoped rules: rule 2 (blocked + deterministic, task
-            # 2067), rule 3 (blocked + normal + bare, task 2409) and rule 5
-            # (pending + deterministic + pure gate, task 3751). Only rule 5
-            # actually changes gate 2's verdict — rule 3 already fired there
+            # 2067), rule 3 (blocked + normal + bare, task 2409), rule 5
+            # (pending + deterministic + pure gate, task 3751) and rule 6
+            # (pending + normal + awaiting a dependency, task 8330). Only
+            # rules 5 and 6 change gate 2's verdict — rule 3 already fired there
             # on the previous implicit task_kind=None, and rule 2's extra
             # coverage is masked because gate 2 reads is_live, which ORs in
             # the per-task worktree/commit evidence. See check()'s Gate 2
@@ -1627,6 +1628,11 @@ class TaskInterceptor:
                 # boolean, matching the recon_write_policy.check(agent_id: str)
                 # signature below.
                 assert isinstance(agent_id, str)
+                # Read under the same _write_lock as `before`, so no interceptor write
+                # can move a dependency before the status write; see check()'s Gate 2.
+                dependency_statuses = await recon_write_policy.read_dependency_statuses(
+                    tm, before, project_root=project_root, tag=tag,
+                )
                 verdict = await recon_write_policy.check(
                     'set_task_status',
                     task_id=task_id,
@@ -1637,6 +1643,7 @@ class TaskInterceptor:
                     snapshot_token=None,
                     task_metadata=before.get('metadata') if isinstance(before, dict) else None,
                     task_snapshot=before if isinstance(before, dict) else None,
+                    dependency_statuses=dependency_statuses,
                 )
                 if verdict.is_rejection:
                     return verdict.to_error_dict()

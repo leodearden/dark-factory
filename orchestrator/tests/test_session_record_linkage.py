@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest  # pyright: ignore[reportMissingImports]
 from _process_tree_fakes import claude_process_tree
+from _reap_report_wait import await_reap_report
 
 from orchestrator import session_hooks as sh
 from orchestrator import session_registry as sr
@@ -384,6 +385,7 @@ class TestPointerSweepDrivers:
         slug = sr.build_session_slug('unblock', 'df', '2085', 4242)
         expected_dir = sr.record_path_for_slug(slug, root=tmp_path).parent
         assert capsys.readouterr().out == f'{expected_dir}\n'
+        await_reap_report(tmp_path)
         assert not sr.session_pointer_path_for_pid(_DEAD_PID, root=tmp_path).exists()
 
 

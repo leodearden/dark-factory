@@ -129,6 +129,7 @@ def test_sketch_2_an_unmeasured_census_is_unknown_and_says_why(served_bodies):
     assert census['value'] is None and census['as_of'] is None
     assert (census['reason'] or '').strip(), 'an unknown census must say why'
     assert body['TASKS_COUNT_UNKNOWN_PROJECTS'] == ['dark-factory']
+    assert body['TASKS_COUNT_STALE_PROJECTS'] == [], 'no value, so not a stale one'
     assert _census(body, 'reify')['state'] == 'fresh', 'the healthy project stays measured'
 
 
@@ -141,6 +142,10 @@ def test_sketch_3_a_failed_refresh_serves_the_last_good_census_as_stale(served_b
     assert _served_at(body) - datetime.fromisoformat(census['as_of']) == timedelta(hours=3)
     assert 'ReadTimeout' in census['reason'], census['reason']
     assert census['value']['total'] == 5459, 'the stale value is the last good one'
+    assert body['TASKS_COUNT_STALE_PROJECTS'] == ['dark-factory']
+    assert body['TASKS_COUNT_UNKNOWN_PROJECTS'] == [], (
+        'a census serving its last good value is not an unknown count'
+    )
 
 
 def test_sketch_4_every_root_census_partitions_its_total(served_bodies):
@@ -176,6 +181,10 @@ def test_sketch_13_a_transient_failure_ages_the_census_then_recovers(served_bodi
     assert aged['as_of'] == measured['as_of'], 'the stale census is the measured one, at its instant'
     assert recovered['state'] == 'fresh', recovered
     assert datetime.fromisoformat(recovered['as_of']) == _served_at(after)
+    assert [
+        (body['TASKS_COUNT_UNKNOWN_PROJECTS'], body['TASKS_COUNT_STALE_PROJECTS'])
+        for body in (before, during, after)
+    ] == [([], []), ([], ['dark-factory']), ([], [])]
 
 
 def test_sketch_6_the_sampler_persists_the_census_the_route_serves(served_bodies):

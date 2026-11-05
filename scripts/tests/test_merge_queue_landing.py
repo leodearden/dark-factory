@@ -296,6 +296,35 @@ def _assert_untouched(repo, before, scratch):
     _assert_left_nothing_behind(repo, scratch)
 
 
+CEILING_SECS = 1
+
+
+class _ManualClock:
+    """A monotonic clock that stands still until a test moves it."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+def _refused_at_the_ceiling(repo, queue, *, passed_by):
+    """The LandingNotConfirmed land_file raises through *queue* on a
+    CEILING_SECS budget whose clock passes the ceiling as the queue answers
+    *passed_by*, however long git setup and the queue calls really take."""
+    clock = _ManualClock()
+    handlers = queue.handlers()
+    handlers[passed_by] = _acting_after(
+        handlers[passed_by], lambda: clock.advance(CEILING_SECS + 1),
+    )
+    with FakeEscalationMcp(tool_handlers=handlers) as server:
+        return _refusal(repo, server.port, timeout_secs=CEILING_SECS, clock=clock)
+
+
 @pytest.mark.parametrize("terminal", [
     {"state": "blocked", "reason": "verify failed: 3 tests"},
     {"state": "conflict"},
@@ -402,10 +431,27 @@ def test_a_request_still_live_at_the_ceiling_is_cancelled(repo, scratch):
     before = _main(repo)
     queue = FakeMergeQueue(repo, states=["verifying"])
 
-    refusal = _refused_by(repo, queue, timeout_secs=1)
+    refusal = _refused_at_the_ceiling(repo, queue, passed_by="merge_status")
 
     assert refusal.failure is LandingFailure.TIMED_OUT
+    assert len(queue.calls_to("merge_status")) == 1
     assert "verifying" in refusal.detail, refusal.detail
+    assert queue.calls_to("merge_cancel") == [{"request_id": queue.request_id}]
+    _assert_untouched(repo, before, scratch)
+
+
+def test_a_ceiling_passed_during_the_submit_cancels_without_a_poll(repo, scratch):
+    """The ceiling counts the submit's own time: a request whose submit
+    answers past it is cancelled on the submit's state, and the abandoned
+    request leaves nothing behind."""
+    before = _main(repo)
+    queue = FakeMergeQueue(repo, states=["verifying"])
+
+    refusal = _refused_at_the_ceiling(repo, queue, passed_by="merge_request")
+
+    assert refusal.failure is LandingFailure.TIMED_OUT
+    assert "still queued" in refusal.detail, refusal.detail
+    assert queue.calls_to("merge_status") == []
     assert queue.calls_to("merge_cancel") == [{"request_id": queue.request_id}]
     _assert_untouched(repo, before, scratch)
 
@@ -420,9 +466,10 @@ def test_a_cancel_refused_while_live_keeps_the_deploy_branch(repo, scratch):
         "code": "finalize_window",
     })
 
-    refusal = _refused_by(repo, queue, timeout_secs=1)
+    refusal = _refused_at_the_ceiling(repo, queue, passed_by="merge_status")
 
     assert refusal.failure is LandingFailure.TIMED_OUT
+    assert len(queue.calls_to("merge_status")) == 1
     (submitted,) = queue.calls_to("merge_request")
     worktree, branch = submitted["worktree"], f"task/{submitted['branch']}"
     assert os.path.isdir(worktree), "a live request's worktree was removed"
@@ -951,9 +998,10 @@ def test_a_lost_submit_the_queue_never_answers_for_keeps_the_deploy_branch(repo,
     would land from is kept."""
     queue = FakeMergeQueue(repo, lose_submit_reply=True, states=[TRANSPORT_FAULT])
 
-    refusal = _refused_by(repo, queue, timeout_secs=1)
+    refusal = _refused_at_the_ceiling(repo, queue, passed_by="merge_status")
 
     assert refusal.failure is LandingFailure.TIMED_OUT
+    assert len(queue.calls_to("merge_status")) == 1
     assert refusal.state == "unknown"
     assert queue.calls_to("merge_cancel") == []
     (submitted,) = queue.calls_to("merge_request")

@@ -1468,6 +1468,15 @@ takes no arguments: it always re-reads that process's own
   with no task-role verify: the merge gate verifies every landing (task 1724),
   so that verdict had no reader. `true` restores the advisory post-rebase
   re-verify — a rollback switch only, read at each merge attempt.
+- `implementer_brief_variant` (default `whole-plan`; task 5385). `one-step`
+  makes each EXECUTE iteration's implementer complete exactly one plan step:
+  the iteration cap becomes the plan's item count + 3, and the implementer's
+  `max_turns`/`budget_usd` are a third of its resolved route — on every
+  implementer-role pass, so the amender and post-escalation resume passes are
+  cut too, and per-iteration eval metrics must count EXECUTE iterations
+  apart from them. An eval axis
+  (`<candidate>@one-step`, `plans/live-shadow-eval-prd.md` decision 14); no
+  production config sets it. Read at each brief, cap check and route.
 
 **Red tier (restart-only — the edit is accepted into the file but has no
 effect until a full restart):**
@@ -3540,16 +3549,22 @@ supersedes `data/afk-digest.md`, which was last written 2026-08-19.
 
 1. **Prepare.** A headless `claude --print` run on Fable follows the
    prepare-sitting mode's nightly form and records its judgement (options,
-   ramifications, a recommendation or an explicit no-lean). Its one write
-   channel is a per-run inbox, `data/sitting/inbox/<run>/`: it writes JSON
-   batch files there and runs `prepare_sitting.py record --from <file>`.
-   It is read-only otherwise, by construction: it runs
-   under `--permission-mode dontAsk`, with an allowlist and an explicit
-   denylist of every apply verb, both in `nightly_prepare.py`, reading no
-   settings file (`--setting-sources ''`), and its
-   environment sets `SITTING_NIGHTLY_CONFINED` to the run's inbox. The CLI
-   allow rule plus the absence of settings files confine the agent's own
-   file writes to that inbox. `prepare_sitting.py` confines in code what
+   ramifications, a recommendation or an explicit no-lean). It writes JSON
+   batch files to a per-run inbox, `data/sitting/inbox/<run>/`, and runs
+   `prepare_sitting.py record --from <file>`. Three layers confine it, all
+   in `nightly_prepare.py`. The write boundary is Landlock: the CLI runs
+   under it with the tree read-only except `data/sitting/`, `~/.cache/uv`,
+   `/tmp` and `.task/` (Landlock always grants its cwd's `.task/`, and the
+   run's cwd is the repo root because its prepare command is
+   repo-relative). Without Landlock the run is refused (`prepare=2`), never
+   launched unconfined; bwrap is not a fallback, since its mount order
+   leaves the host `/tmp` read-only. The CLI rules are the first gate, not the boundary: it runs
+   under `--permission-mode dontAsk` with an allowlist and an explicit
+   denylist of every apply verb, reading no settings file
+   (`--setting-sources ''`); the CLI matches those rules against raw
+   command text, so a shell-quoted spelling can pass a deny. Its
+   environment sets `SITTING_NIGHTLY_CONFINED` to the run's inbox, under
+   which `prepare_sitting.py` confines in code what
    `record` reads (a `.json` file directly in that inbox, never stdin or
    another path, so never an earlier night's batch) and where it writes
    (the default store in `data/sitting/`), and refuses everything but `brief`
@@ -3559,8 +3574,11 @@ supersedes `data/afk-digest.md`, which was last written 2026-08-19.
    on the project config being approved for a headless run, and playwright
    never starts. Its account comes from the shared pool, as a
    lease that is read and handed straight back, so the night's Fable spend
-   is invisible to the gate. With nothing leasable, it inherits the unit's
-   environment. It stops itself after 2700s.
+   is invisible to the gate. Its `CLAUDE_CONFIG_DIR` is a per-run directory
+   under `data/sitting/config/` holding the leased token, which is removed
+   on every exit short of a SIGKILL. With nothing leasable the night is
+   skipped (`prepare=1`, `no pool account free; skipping`): the run never
+   uses the host's own login. It stops itself after 2700s.
 2. **Render.** This step is deterministic and runs whatever prepare
    returned. Every figure on the page comes from its own fresh measurement
    and carries a stamp, and a store it cannot read is a stated shortfall in
@@ -3575,6 +3593,7 @@ is no commit seam, unlike the 05:00 census:
 | `data/sitting/ledger-nightly.json` | The night's item numbering, carried over from the night before so an item keeps its number; a watcher seeds its sitting from it |
 | `data/sitting/preparation.json` | The prepared judgement, per open item |
 | `data/sitting/inbox/<run>/` | The night's batch files, kept for forensics |
+| `data/sitting/config/claude-config-nightly-prepare-<run>/` | The night's CLI config dir and session transcript, kept for forensics |
 
 **The regen commands**, which are the two invocations the wrapper makes, run
 from the repo root:
@@ -3599,7 +3618,7 @@ journalctl --user -u return-brief.service -n 100
 systemctl --user list-timers return-brief.timer
 ```
 
-- `prepare=1` means the Fable run failed, timed out, hit a usage limit or
+- `prepare=1` means the Fable run was skipped (no pool account free), failed, timed out, hit a usage limit or
   recorded nothing; its log line carries both stream tails, or, for a run
   that recorded nothing, the counts of what the inbox offered and could not decode. That is
   routine, not an incident:
@@ -3609,7 +3628,7 @@ systemctl --user list-timers return-brief.timer
   of <m>, undecodable=<u>, permission_denials=<d>)`; a high `undecodable`
   means the agent's entries failed validation even though some were recorded.
 - `prepare=2` is a configuration error, such as no `claude` on the unit's
-  PATH.
+  PATH, or no Landlock (`refusing to run unconfined`).
 - `brief=` other than 0 means the page was not written. That is the one
   worth acting on.
 
@@ -3965,13 +3984,21 @@ cap or outcome row ever recorded the loss. `data.stage` splits it:
 | `stage` | Meaning | `data` |
 |---|---|---|
 | `pre_flight` | We corroborated, found nothing (and could not rehydrate), and dispatched fresh. | `{stage, session_id, role, restore}` — `restore` is the rehydration **outcome**: `disabled` \| `miss` \| `fault` \| `published` (see below) |
-| `cli` | The resume WAS armed and the CLI rejected it; `invoke_with_cap_retry` retried fresh and returned a **success**, so nothing else records the loss. | `{stage, session_id, session_ids, role, fallbacks}` — `fallbacks` is the count of fresh retries this one invocation had to make, `session_ids` the ids they dropped (oldest first; `session_id` is the first, i.e. the resume the orchestrator adopted) |
+| `cli` | The resume WAS armed and the CLI rejected it before any model turn; `invoke_with_cap_retry` retried fresh (a retry that can itself fail), so nothing else records the loss. A resumed run that did work and *then* ended non-success (the `ended_awaiting_background` downgrade, a budget kill) is **not** reported here: it is a surviving resume, returned to the caller. | `{stage, session_id, session_ids, role, fallbacks}` — `fallbacks` is the count of fresh retries this one invocation had to make, `session_ids` the ids they dropped (oldest first; `session_id` is the first, i.e. the resume the orchestrator adopted) |
 
 ```sql
 SELECT json_extract(data, '$.stage') AS stage, COUNT(*)
   FROM events WHERE event_type = 'session_resume_failed'
  GROUP BY stage;
 ```
+
+The steward emits `cli` rows too, carrying `role = 'steward'`. Those are
+live-continuation resumes the `_run_slot` guard never adopted, so filter them
+out of any ratio reading with
+`AND json_extract(data, '$.role') != 'steward'`. Rows written before task 5579
+also include completed-but-downgraded runs: the old branch counted every
+resumed non-success, and 0 of 25 such rows measured on dark_factory and reify
+were rejections.
 
 `data.restore` on the `pre_flight` rows is what tells you *which* thing is
 broken, so split on it before concluding anything:
@@ -4000,7 +4027,8 @@ silently inflates the attempt count. Read it against `session_resume` alone:
 
 That reading holds because BOTH stages are subsets of the adopted-resume
 population by construction: `pre_flight` fires only where a recovered session
-was about to be armed, and `cli` fires only when `_invoke` actually armed one.
+was about to be armed, and a non-steward `cli` row fires only when `_invoke`
+actually armed one.
 The underlying `AgentResult.resume_fallbacks` counter is *wider* than that — it
 also counts a resume `invoke_with_cap_retry` re-armed internally after a cap
 hit, which a plain fresh dispatch can reach — so the emit is gated on the

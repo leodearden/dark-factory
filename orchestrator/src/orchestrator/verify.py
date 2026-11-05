@@ -6752,6 +6752,11 @@ def _verify_admission_active(config: OrchestratorConfig) -> bool:
     return config.verify_admission_enabled
 
 
+def admission_active(config: OrchestratorConfig) -> bool:
+    """Whether verify admission is on now."""
+    return _verify_admission_active(config)
+
+
 _ADMISSION_EXECUTOR_MAX_WORKERS = 64
 
 _admission_executor_singleton: concurrent.futures.ThreadPoolExecutor | None = None
@@ -6779,7 +6784,7 @@ def _admission_executor() -> concurrent.futures.ThreadPoolExecutor:
     return _admission_executor_singleton
 
 
-def _admission_policy(config: OrchestratorConfig) -> AdmissionPolicy:
+def admission_policy(config: OrchestratorConfig) -> AdmissionPolicy:
     """The admission gate's policy as *config* states it now (read at each grant)."""
     return AdmissionPolicy(
         slots=config.verify_admission_task_slots,
@@ -6814,11 +6819,15 @@ async def _admission_slot(
             f'role={role!r} came without one',
         )
     gate = gate_for(Path(config.verify_admission_slots_dir))
-    async with (
-        gate.admit(request, lambda: _admission_policy(config)) as grant,
-        _flock_slot(role, config) as held,
-    ):
-        yield replace(grant, slot_held=held)
+    async with gate.admit(request, lambda: admission_policy(config)) as grant:
+        _mark_plan_granted(grant.request)
+        async with _flock_slot(role, config) as held:
+            yield replace(grant, slot_held=held)
+
+
+def _mark_plan_granted(request: AdmissionRequest | None) -> None:
+    if request is not None and request.plan_latch is not None:
+        request.plan_latch.mark_granted()
 
 
 @contextlib.asynccontextmanager
@@ -7085,6 +7094,31 @@ def _log_event_channel(label: str, channel: VerifyEventChannel) -> None:
             label, channel.run_starts, len(channel.run_finishes),
             channel.fatal_slot_timeouts, channel.soft_slot_timeouts,
         )
+
+
+_Gathered = TypeVar('_Gathered')
+
+
+async def _gather_unwound(*aws: Awaitable[_Gathered]) -> list[_Gathered]:
+    """``asyncio.gather``, except that it raises only once every child has ended.
+
+    A plain gather raises at its first cancelled or failed child, so a sibling
+    still killing its subprocess would outlive the verify that spawned it.
+    Here, as in a ``TaskGroup``, the other children are cancelled and awaited
+    first; the exception raised is the one the gather raised.  A child already
+    asked to cancel (a cancelled gather asks every child) is not asked again,
+    which would interrupt the kill it is awaiting.
+    """
+    children = [asyncio.ensure_future(aw) for aw in aws]
+    try:
+        return await asyncio.gather(*children)
+    except BaseException:
+        for child in children:
+            if not (isinstance(child, asyncio.Task) and child.cancelling()):
+                child.cancel()
+        if children:
+            await asyncio.wait(children)
+        raise
 
 
 async def run_verification(
@@ -7401,6 +7435,8 @@ async def run_verification(
             prefix = _resolve_nice_prefix(config, role)
             if prefix:
                 cmd = f'{shlex.join(prefix)} /bin/bash -c {shlex.quote(cmd)}'
+        if label is LegSlot.TEST and not admission:
+            _mark_plan_granted(admission_request)
         slot_requested = time.monotonic()
         async with (
             _admission_slot(role, config, admission_request) if admission
@@ -7752,7 +7788,7 @@ async def run_verification(
         # `break` below, so it is always bound whenever the loop exits — no
         # pre-loop sentinel scaffolding needed.
         if concurrent:
-            attempt = VerifyAttempt(list(await asyncio.gather(
+            attempt = VerifyAttempt(list(await _gather_unwound(
                 _run_or_skip_timed(test_cmd, label=LegSlot.TEST, current_attempt=current_attempt_id),
                 _run_or_skip_timed(lint_cmd, label=LegSlot.LINT, current_attempt=current_attempt_id),
                 _run_or_skip_timed(type_cmd, label=LegSlot.TYPE, current_attempt=current_attempt_id),
@@ -8349,7 +8385,7 @@ async def run_full_verification(
             'Full verification: running %d subprojects in parallel',
             len(module_configs),
         )
-        results = await asyncio.gather(
+        results = await _gather_unwound(
             *(
                 run_verification(
                     project_root, config, mc, role=role, max_retries=max_retries,
@@ -8891,13 +8927,15 @@ async def run_scoped_verification(
     force_workspace: bool = False,
     role: Literal['merge', 'task'] = 'task',
     event_store: 'EventStore | None' = None,
+    admission_plan: AdmissionPlan | None = None,
 ) -> VerifyResult:
     """Run verification scoped to specific subprojects and optionally to task files.
 
     A gated *role* verifies as ONE admission plan, stamped here so every leg
     and retry keeps the plan's place in the admission gate's order, and
     recorded on *event_store* as a ``verify_admission_plan`` event (task 5628;
-    see :func:`_recorded_admission_plan`).
+    see :func:`_recorded_admission_plan`). A caller that moves a verify between
+    hosts passes its *admission_plan* so the plan keeps its arrival.
 
     Scoping modes (in priority order):
 
@@ -8927,7 +8965,14 @@ async def run_scoped_verification(
     :func:`_is_verify_cold`.  Set this to ``True`` from the merge-queue
     call sites so post-merge verifies get the cold timeout.
     """
-    admission_plan = begin_plan(role, task_id=task_id)
+    if admission_plan is None:
+        admission_plan = begin_plan(role, task_id=task_id)
+    elif (admission_plan.role, admission_plan.task_id) != (role, task_id):
+        raise ValueError(
+            f'an admission plan must carry its verify role and task: plan role='
+            f'{admission_plan.role!r}, task_id={admission_plan.task_id!r}; verify role='
+            f'{role!r}, task_id={task_id!r}',
+        )
     scoped_verify = _run_scoped_verification_body(
         worktree, config, module_configs, task_files,
         max_retries=max_retries,
@@ -9064,7 +9109,7 @@ async def _run_scoped_verification_body(
                             plan_dict, worktree, attempt_id=attempt_id,
                             task_id=task_id, archive_root=archive_root,
                         )
-                        results = await asyncio.gather(*(
+                        results = await _gather_unwound(*(
                             _verify_module(mc, _test_scope_kind(plan, mc.prefix)) for mc in scoped
                         ))
                         aggregated = _aggregate_results(list(results))
@@ -9250,7 +9295,7 @@ async def _run_scoped_verification_body(
                         'Verification mode: per-subproject fan-out (%d subprojects)',
                         len(module_configs),
                     )
-                    results = await asyncio.gather(*(
+                    results = await _gather_unwound(*(
                         _verify_module(mc) for mc in module_configs
                     ))
                     return _aggregate_results(list(results))
@@ -9345,7 +9390,7 @@ async def _run_scoped_verification_body(
                 plan = None
                 plan_dict = None
                 logger.info('Verification mode: subproject-scoped (%d subprojects)', len(module_configs))
-            results = await asyncio.gather(
+            results = await _gather_unwound(
                 *(_verify_module(mc, _test_scope_kind(plan, mc.prefix)) for mc in scoped)
             )
             aggregated = _aggregate_results(list(results))

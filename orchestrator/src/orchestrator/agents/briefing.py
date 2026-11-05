@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 from shared.briefing_queries import BriefingScope
@@ -22,9 +23,34 @@ from orchestrator.agents.review_briefing import (
     review_action_section,
 )
 from orchestrator.config import OrchestratorConfig
+from orchestrator.implementer_brief_variant import ImplementerBriefVariant, is_one_step
 from orchestrator.plan_descope import DESCOPE_DISPOSITIONS, DoneStepIntegrityVerdict
 
 logger = logging.getLogger(__name__)
+
+IMPLEMENTER_ACTIONS: Mapping[ImplementerBriefVariant, str] = MappingProxyType({
+    ImplementerBriefVariant.WHOLE_PLAN: (
+        'Execute the next pending steps in TDD order. Commit after each step. '
+        'Call `mark_step_done(step_id, commit_sha)` to record progress. '
+        'Stop at a logical boundary.'
+    ),
+    ImplementerBriefVariant.ONE_STEP: (
+        'One-step mode: complete exactly ONE plan step this session — the next '
+        'pending item in `.task/plan.json`, prerequisites first, then steps. Do it '
+        'in TDD order, commit, call `mark_step_done(step_id, commit_sha)`, then '
+        'stop, even if more steps are pending; the orchestrator re-invokes you for '
+        'the next step.'
+    ),
+})
+"""The implementer brief's Action paragraph per ``config.implementer_brief_variant``."""
+
+
+def _implementer_action(variant: ImplementerBriefVariant) -> str:
+    """The Action paragraph *variant* selects, by the :func:`is_one_step` rule the cap and the bounds also use."""
+    return IMPLEMENTER_ACTIONS[
+        ImplementerBriefVariant.ONE_STEP if is_one_step(variant) else ImplementerBriefVariant.WHOLE_PLAN
+    ]
+
 
 DIFF_ONLY_DIFF_CAP_CHARS = 50_000
 """Where the incumbent reviewer briefing cuts its diff; ``diff_cap_chars=0`` lifts the cut."""
@@ -955,7 +981,9 @@ suggestions-only on this exact tree — call
         string is the one that can lie, because the retry ladder replays an
         assembled prompt verbatim into a fresh session
         (shared/src/shared/cli_invoke.py::_reset_for_fresh_retry). Pinned by
-        orchestrator/tests/test_briefing_progress_spot.py.
+        orchestrator/tests/test_briefing_progress_spot.py. The Action paragraph
+        follows config.implementer_brief_variant and, for the same reason, names
+        no step id.
         """
         scope = _plan_scope(plan, task_id)
         if context is None:
@@ -1058,7 +1086,7 @@ Before writing any new code, walk the pending steps in plan order:
 
 # Action
 
-Execute the next pending steps in TDD order. Commit after each step. Call `mark_step_done(step_id, commit_sha)` to record progress. Stop at a logical boundary.
+{_implementer_action(self.config.implementer_brief_variant)}
 """
 
     async def build_amender_prompt(

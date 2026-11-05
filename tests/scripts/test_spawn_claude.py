@@ -1437,69 +1437,72 @@ def test_registry_write_refresh_reap_two_way_boundary(tmp_path: pathlib.Path) ->
     written = session_registry.SessionRecord.from_json(record_path.read_text())
     assert written.status == session_registry.Status.EXITED
 
-    # Backdate the mtime so the refresh's heartbeat bump is unambiguous even
-    # on filesystems with coarse mtime resolution.
-    backdated_ts = record_path.stat().st_mtime - 100
-    os.utime(record_path, (backdated_ts, backdated_ts))
+    # The real spawn started a detached `reap`; holding its lock waits that
+    # out and keeps any other out, so the reap below is the only one.
+    with session_registry.reap_lock(fleet_root):
+        # Backdate the mtime so the refresh's heartbeat bump is unambiguous even
+        # on filesystems with coarse mtime resolution.
+        backdated_ts = record_path.stat().st_mtime - 100
+        os.utime(record_path, (backdated_ts, backdated_ts))
 
-    # --- Consumer: a simulated hook write refreshes under the SAME key ----
-    # The exact CLI invocation the T6 SessionStart hook will make.
-    rc = session_registry.main(
-        ["refresh", "--record", str(slug_dir), "--status", "running"]
-    )
-    assert rc == 0
+        # --- Consumer: a simulated hook write refreshes under the SAME key ----
+        # The exact CLI invocation the T6 SessionStart hook will make.
+        rc = session_registry.main(
+            ["refresh", "--record", str(slug_dir), "--status", "running"]
+        )
+        assert rc == 0
 
-    refreshed_paths = list((fleet_root / "sessions").glob("*/record.json"))
-    assert refreshed_paths == [record_path], (
-        f"refresh must update the SAME record.json path (same key), "
-        f"found: {refreshed_paths}"
-    )
-    refreshed = session_registry.SessionRecord.from_json(record_path.read_text())
-    assert refreshed.session_slug == written.session_slug
-    assert refreshed.status == session_registry.Status.RUNNING
-    assert record_path.stat().st_mtime > backdated_ts, (
-        "refresh must bump the record's mtime heartbeat"
-    )
+        refreshed_paths = list((fleet_root / "sessions").glob("*/record.json"))
+        assert refreshed_paths == [record_path], (
+            f"refresh must update the SAME record.json path (same key), "
+            f"found: {refreshed_paths}"
+        )
+        refreshed = session_registry.SessionRecord.from_json(record_path.read_text())
+        assert refreshed.session_slug == written.session_slug
+        assert refreshed.status == session_registry.Status.RUNNING
+        assert record_path.stat().st_mtime > backdated_ts, (
+            "refresh must bump the record's mtime heartbeat"
+        )
 
-    # --- Upsert-on-absent: a hand-launched session with no prior write ----
-    # (the T6 hand-launched-capture path -- no spawn-claude.sh write exists
-    # for this slug at all).
-    absent_slug = "unblock-df-999-424242"
-    assert not session_registry.record_path_for_slug(absent_slug, root=fleet_root).is_file()
+        # --- Upsert-on-absent: a hand-launched session with no prior write ----
+        # (the T6 hand-launched-capture path -- no spawn-claude.sh write exists
+        # for this slug at all).
+        absent_slug = "unblock-df-999-424242"
+        assert not session_registry.record_path_for_slug(absent_slug, root=fleet_root).is_file()
 
-    upserted = session_registry.refresh_record(
-        absent_slug, root=fleet_root, status=session_registry.Status.AWAITING_INPUT,
-    )
-    assert upserted.session_slug == absent_slug
-    assert upserted.status == session_registry.Status.AWAITING_INPUT
-    assert upserted.schema_version == session_registry.SCHEMA_VERSION
-    assert upserted.start_ts, "an upserted record must still get a populated start_ts"
-    upserted_path = session_registry.record_path_for_slug(absent_slug, root=fleet_root)
-    assert upserted_path.is_file()
-    assert session_registry.read_record(absent_slug, root=fleet_root) == upserted
+        upserted = session_registry.refresh_record(
+            absent_slug, root=fleet_root, status=session_registry.Status.AWAITING_INPUT,
+        )
+        assert upserted.session_slug == absent_slug
+        assert upserted.status == session_registry.Status.AWAITING_INPUT
+        assert upserted.schema_version == session_registry.SCHEMA_VERSION
+        assert upserted.start_ts, "an upserted record must still get a populated start_ts"
+        upserted_path = session_registry.record_path_for_slug(absent_slug, root=fleet_root)
+        assert upserted_path.is_file()
+        assert session_registry.read_record(absent_slug, root=fleet_root) == upserted
 
-    # --- The hook-refreshed record still reaps correctly -------------------
-    # Force a guaranteed-dead launcher_pid (the real spawn's own $$ has
-    # already exited by now, but relying on incidental PID death would be
-    # racy under PID reuse) and age it past the non-terminal heartbeat TTL,
-    # so it reaps via the stale_pid rule now that its status is RUNNING
-    # (non-terminal) after the hook's refresh.
-    dead_record = session_registry.SessionRecord.from_json(record_path.read_text())
-    dead_record.launcher_pid = _DEAD_PID
-    record_path.write_text(dead_record.to_json())
-    now = datetime.now(UTC)
-    stale_ts = (
-        now - session_registry.NON_TERMINAL_HEARTBEAT_TTL - timedelta(hours=1)
-    ).timestamp()
-    os.utime(record_path, (stale_ts, stale_ts))
+        # --- The hook-refreshed record still reaps correctly -------------------
+        # Force a guaranteed-dead launcher_pid (the real spawn's own $$ has
+        # already exited by now, but relying on incidental PID death would be
+        # racy under PID reuse) and age it past the non-terminal heartbeat TTL,
+        # so it reaps via the stale_pid rule now that its status is RUNNING
+        # (non-terminal) after the hook's refresh.
+        dead_record = session_registry.SessionRecord.from_json(record_path.read_text())
+        dead_record.launcher_pid = _DEAD_PID
+        record_path.write_text(dead_record.to_json())
+        now = datetime.now(UTC)
+        stale_ts = (
+            now - session_registry.NON_TERMINAL_HEARTBEAT_TTL - timedelta(hours=1)
+        ).timestamp()
+        os.utime(record_path, (stale_ts, stale_ts))
 
-    reaped = session_registry.reap_stale_records(root=fleet_root, now=now)
-    reaped_by_slug = {r.session_slug: r.reason for r in reaped}
-    assert reaped_by_slug.get(dead_record.session_slug) == "stale_pid"
-    assert not slug_dir.exists()
-    assert absent_slug not in reaped_by_slug, (
-        "the freshly-upserted record must not be reaped -- its heartbeat is new"
-    )
+        reaped = session_registry.reap_stale_records(root=fleet_root, now=now)
+        reaped_by_slug = {r.session_slug: r.reason for r in reaped}
+        assert reaped_by_slug.get(dead_record.session_slug) == "stale_pid"
+        assert not slug_dir.exists()
+        assert absent_slug not in reaped_by_slug, (
+            "the freshly-upserted record must not be reaped -- its heartbeat is new"
+        )
 
 
 # ===========================================================================
@@ -5366,6 +5369,62 @@ def test_t3_sibling_mode_returns_with_a_running_t3_record(tmp_path: pathlib.Path
     argv = start.argv
     assert argv[argv.index("--model") + 1] == "sonnet"
     assert argv[argv.index("--title") + 1] == "worker:df#7489 t3-lane-test"
+
+
+_PROXY_ONLY_T3_SETTINGS = {
+    "defaultModelSelection": {"instanceId": "claude-proxy", "model": "claude-opus-5-5"},
+    "providerInstances": {
+        "claudeAgent": {"driver": "claudeAgent", "enabled": False},
+        "claude-proxy": {"driver": "claudeAgent", "enabled": True},
+    },
+}
+
+
+def _with_proxy_only_settings(lane: _T3Lane) -> _T3Lane:
+    settings = pathlib.Path(lane.env["T3CODE_HOME"]) / "userdata" / "settings.json"
+    settings.write_text(json.dumps(_PROXY_ONLY_T3_SETTINGS))
+    return lane
+
+
+def test_t3_lane_runs_a_pinned_model_on_the_projects_enabled_instance(tmp_path: pathlib.Path) -> None:
+    lane = _with_proxy_only_settings(_T3Lane(tmp_path))
+    lane.env["CLAUDE_SPAWN_MODE"] = "sibling"
+    lane.env["CLAUDE_SPAWN_MODEL"] = "fable"
+
+    result = lane.run()
+
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+    (start,) = lane.started_threads()
+    argv = start.argv
+    assert (argv[argv.index("--provider") + 1], argv[argv.index("--model") + 1]) == ("claude-proxy", "fable")
+    record = lane.record()
+    assert record.display is not None and record.display.t3_thread_id
+
+
+@pytest.mark.parametrize(("model", "provider", "settings_override", "expected_stderr"), [
+    ("fable", "claudeAgent", {}, "CLAUDE_SPAWN_T3_PROVIDER names it"),
+    ("", "claudeAgent", {}, "without CLAUDE_SPAWN_MODEL"),
+    ("fable", "", {"defaultModelSelection": None, "providerInstances": {
+        "claudeAgent": {"driver": "claudeAgent", "enabled": False},
+    }}, "the fallback is disabled"),
+])
+def test_t3_lane_refuses_a_provider_it_cannot_use_and_writes_no_record(
+    tmp_path: pathlib.Path, model: str, provider: str, settings_override: dict, expected_stderr: str,
+) -> None:
+    lane = _with_proxy_only_settings(_T3Lane(tmp_path))
+    if settings_override:
+        settings = pathlib.Path(lane.env["T3CODE_HOME"]) / "userdata" / "settings.json"
+        settings.write_text(json.dumps({**_PROXY_ONLY_T3_SETTINGS, **settings_override}))
+    lane.env["CLAUDE_SPAWN_MODE"] = "sibling"
+    lane.env["CLAUDE_SPAWN_MODEL"] = model
+    lane.env["CLAUDE_SPAWN_T3_PROVIDER"] = provider
+
+    result = lane.run()
+
+    assert result.returncode == 145, f"stderr: {result.stderr.decode()}"
+    assert expected_stderr in result.stderr.decode()
+    assert not lane.records(), "a refused provider must precede the launching record"
+    assert not lane.started_threads()
 
 
 @pytest.mark.parametrize(("spawn_mode", "spawner_env", "expected_parent"), [
