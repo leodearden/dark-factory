@@ -7,7 +7,7 @@ schema_version: 1
 signal_leaves: ["θ"]
 tasks:
   - label: "α"
-    task_id: null
+    task_id: 8558
     title: "tasks.created_at + created_at_source: v5→v6 migration, stamp in add_task, projection keys, dashboard Filed column, backfill script"
     capabilities:
       - name: "created-at-columns-in-ddl-and-ladder"
@@ -43,7 +43,7 @@ tasks:
           paths: ["scripts/backfill_task_created_at.py"]
           expect: present
   - label: "β1"
-    task_id: null
+    task_id: 8559
     title: "Scheduler snapshot truth: flush at pause/resume/restore/shutdown; shared cross-checking reader; dashboard paused list consumes it"
     capabilities:
       - name: "flush-called-from-harness"
@@ -71,7 +71,7 @@ tasks:
           paths: ["dashboard/src/dashboard/data/scheduler.py", "fused-memory/src/fused_memory/mcp_tools/scheduler_state.py"]
           expect: present
   - label: "β2"
-    task_id: null
+    task_id: 8560
     title: "Run-store counters: lifetime review_cycles, cap-pause before finish_run, persisted digest window"
     capabilities:
       - name: "review-cycles-from-lifetime-counter"
@@ -97,7 +97,7 @@ tasks:
           kind: manual
           reason: "an ordering of two existing calls inside Harness.run; pinned by β2's ordering test, not expressible as a stable grep"
   - label: "γ"
-    task_id: null
+    task_id: 8561
     title: "Merge-halt events and the 7-day halt-hours datum"
     capabilities:
       - name: "halt-event-types"
@@ -125,7 +125,7 @@ tasks:
           paths: ["dashboard/src/dashboard/data/merge_halt.py"]
           expect: present
   - label: "δ"
-    task_id: null
+    task_id: 8562
     title: "Resolution provenance: ruled_by_human, level-2 class requirement, resolver_tier(record), skill and sitting-path stamping, analytics and shadow-ruling relabel"
     capabilities:
       - name: "ruled-by-human-field"
@@ -175,7 +175,7 @@ tasks:
           kind: manual
           reason: "a dependency edge on 8422, wired at decompose"
   - label: "ε"
-    task_id: null
+    task_id: 8563
     title: "Brief over the registry's roots with activity fields; landed over landings(); digest done-in-window via to_thread; relabel the former counts"
     capabilities:
       - name: "brief-roots-from-registry"
@@ -209,7 +209,7 @@ tasks:
           paths: ["scripts/sitting/fleet_state.py"]
           expect: present
   - label: "ζ"
-    task_id: null
+    task_id: 8564
     title: "Counting rules beside the stores and docs/data-map.md; burndown measured_snapshots view; OPERATIONS.md corrections; review-all header and Phase 0 refresh"
     capabilities:
       - name: "data-map-exists"
@@ -237,7 +237,7 @@ tasks:
           paths: ["skills/review-all/"]
           expect: present
   - label: "η"
-    task_id: null
+    task_id: 8565
     title: "Deploy gate (OPERATOR GATE): delete the return-brief drop-in, drop the autotrade root, drained fleet sweep, amend the owner tasks"
     capabilities:
       - name: "units-and-drop-in-patched"
@@ -253,7 +253,7 @@ tasks:
           kind: manual
           reason: "a fleet restart, verified by θ"
   - label: "θ"
-    task_id: null
+    task_id: 8566
     title: "Integration gate: boundary rows 1–21 against the live df and reify stores (rows 3–5 on a fixture orchestrator), observed postconditions recorded in the PRD"
     capabilities:
       - name: "boundary-sketch-observed"
@@ -265,7 +265,7 @@ tasks:
           paths: ["plans/instruments-honesty-prd.md"]
           expect: present
   - label: "ι"
-    task_id: null
+    task_id: 8567
     title: "Observation 7 days after θ: producers wrote in production; record appended to the PRD"
     capabilities:
       - name: "observation-record"
