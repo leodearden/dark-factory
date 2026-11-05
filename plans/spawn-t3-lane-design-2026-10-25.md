@@ -391,6 +391,11 @@ section records what β changed against §4 and §8.
   without a record). A launch whose reply is lost (transport unreachable or
   protocol) is sent once more with the same key, and T3 replays the same
   thread rather than starting a second.
+- **Call bounds.** `t3_thread_wait` waits one slice plus the client's HTTP
+  margin. Every other lane call waits at most `CALL_TIMEOUT_SECS` (60 s) for
+  its reply, replacing the deleted CLI seam's 300 s per subprocess.
+  `await-started`'s reads are also bounded by its remaining deadline. A
+  stalled launch reply counts as lost and is resent with the same key.
 - **Join.** Each `wait` pass reads the thread (`t3_thread_read`), sweeps the
   project's t3 records from one complete `t3_thread_list`, maintains the
   binding and asks the unchanged `JoinTracker`. With no verdict it holds one

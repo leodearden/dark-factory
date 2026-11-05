@@ -50,12 +50,16 @@ STARTUP_FAILURE_STATUSES = frozenset({'failed', 'cancelled', 'rolled_back'})
 SERVER_START_TOLERANCE_SECS = 120
 STARTED_POLL_SECS = 5.0
 WAIT_SLICE_SECS = min(600, t3_mcp_client.T3_MAX_WAIT_SLICE_SECS)
+CALL_TIMEOUT_SECS = 60.0
+"""The reply bound on every lane MCP call but ``t3_thread_wait``."""
 SETTLED_RECHECK_SECS = 60.0
 """The pause after a wait slice T3 did not hold: it answers at once for a settled run."""
 ENDED_RUN_GRACE_SECS = 120.0
 UNREACHABLE_GRACE_SECS = 600.0
 INTERNAL_FAULT_EXIT = 3
 _PROCESS_TREE_MAX_HOPS = 64
+_READ_TIMEOUT_FLOOR_SECS = 0.1
+"""A deadline-shortened reply bound never drops to a socket timeout of 0, which does not block at all."""
 _TRANSCRIPT_HEAD_LINES = 200
 
 
@@ -160,11 +164,13 @@ class ThreadUnread:
     gone: bool
 
 
-def _read_thread(client: t3_mcp_client.T3McpClient | None, thread_id: str) -> Mapping[str, Any] | ThreadUnread:
+def _read_thread(
+    client: t3_mcp_client.T3McpClient | None, thread_id: str, *, read_timeout: float
+) -> Mapping[str, Any] | ThreadUnread:
     """``t3_thread_read``'s ``thread`` detail."""
     if client is None:
         return ThreadUnread(gone=False)
-    reply = client.call('t3_thread_read', {'threadId': thread_id, 'limit': 1})
+    reply = client.call('t3_thread_read', {'threadId': thread_id, 'limit': 1}, read_timeout=read_timeout)
     if isinstance(reply, t3_mcp_client.ToolFailed) and reply.code == 'thread_not_found':
         return ThreadUnread(gone=True)
     thread = reply.value.get('thread') if isinstance(reply, t3_mcp_client.ToolOk) else None
@@ -196,7 +202,8 @@ def _paged(
     items: list[Mapping[str, Any]] = []
     cursors: list[int] = []
     while True:
-        reply = client.call(tool, {**arguments, 'limit': PAGE_LIMIT, **({'cursor': cursors[-1]} if cursors else {})})
+        page_arguments = {**arguments, 'limit': PAGE_LIMIT, **({'cursor': cursors[-1]} if cursors else {})}
+        reply = client.call(tool, page_arguments, read_timeout=CALL_TIMEOUT_SECS)
         if not isinstance(reply, t3_mcp_client.ToolOk):
             return _incomplete(tool, reply)
         page, cursor = reply.value.get(key), reply.value.get('nextCursor')
@@ -417,11 +424,11 @@ _LOST_REPLY = frozenset({t3_mcp_client.TransportFault.UNREACHABLE, t3_mcp_client
 
 def _send_launch(client: t3_mcp_client.T3McpClient, arguments: Mapping[str, Any]) -> t3_mcp_client.CallResult:
     """t3_thread_launch, resent with the same clientRequestId while its reply is lost: T3 replays that thread."""
-    reply = client.call('t3_thread_launch', arguments)
+    reply = client.call('t3_thread_launch', arguments, read_timeout=CALL_TIMEOUT_SECS)
     for _ in range(LAUNCH_ATTEMPTS - 1):
         if not (isinstance(reply, t3_mcp_client.TransportFailed) and reply.fault in _LOST_REPLY):
             break
-        reply = client.call('t3_thread_launch', arguments)
+        reply = client.call('t3_thread_launch', arguments, read_timeout=CALL_TIMEOUT_SECS)
     return reply
 
 
@@ -746,7 +753,10 @@ def await_started(
     deadline = time.monotonic() + timeout
     session = _Session(env)
     while True:
-        verdict = _started_verdict(_read_thread(session.client(), thread_id), cwd, record_dir, since)
+        client = session.client()
+        read_timeout = max(_READ_TIMEOUT_FLOOR_SECS, min(CALL_TIMEOUT_SECS, deadline - time.monotonic()))
+        thread = _read_thread(client, thread_id, read_timeout=read_timeout)
+        verdict = _started_verdict(thread, cwd, record_dir, since)
         if verdict is not None:
             break
         remaining = deadline - time.monotonic()
@@ -877,7 +887,7 @@ def _observe(
     client: t3_mcp_client.T3McpClient | None, thread_id: str, cwd: str, record_dir: str
 ) -> ThreadObservation:
     """The thread's state, after one sweep of its project and the binding's upkeep."""
-    thread = _read_thread(client, thread_id)
+    thread = _read_thread(client, thread_id, read_timeout=CALL_TIMEOUT_SECS)
     project_id = None if isinstance(thread, ThreadUnread) else thread.get('projectId')
     if client is not None and isinstance(project_id, str):
         _sweep_listed_threads(client, project_id, cwd)
