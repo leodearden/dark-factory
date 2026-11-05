@@ -24,6 +24,7 @@ from datetime import UTC, datetime
 from types import MappingProxyType
 from typing import Any
 
+from shared.capability_manifest import CapabilityManifestDoc
 from shared.task_metadata import Milestone
 from shared.task_statuses import TERMINAL, TaskStatus
 from shared.timestamps import parse_timestamp_or_warn
@@ -403,6 +404,65 @@ class TaskActivity:
     completed: Mapping[int, datetime]
     ever_started: frozenset[int]
     first_event_at: datetime | None
+
+
+class SignalMark(enum.StrEnum):
+    """Whether a PRD's goal signal is delivered, read from its signal leaves' status (§4.7)."""
+
+    DELIVERED = 'delivered'
+    PARTIAL = 'partial'
+    NOT_YET = 'not_yet'
+    UNKNOWN = 'unknown'
+
+
+class SignalCause(enum.StrEnum):
+    """Why a PRD's signal mark is unknown: the closed set of §4.7."""
+
+    NO_SIDECAR = 'no_sidecar'
+    SIDECAR_INVALID = 'sidecar_invalid'
+    NAMES_NO_LEAF = 'names_no_leaf'
+    UNBOUND_LABEL = 'unbound_label'
+    LEAF_NOT_IN_STORE = 'leaf_not_in_store'
+    STALE_BINDING = 'stale_binding'
+    EXTERNAL_LEAF = 'external_leaf'
+    LEAF_CANCELLED = 'leaf_cancelled'
+
+
+SIGNAL_CAUSE_TEXT: MappingProxyType[SignalCause, str] = MappingProxyType({
+    SignalCause.NO_SIDECAR: 'no capability-manifest sidecar',
+    SignalCause.SIDECAR_INVALID: 'sidecar fails to load',
+    SignalCause.NAMES_NO_LEAF: 'PRD names no signal leaf',
+    SignalCause.UNBOUND_LABEL: 'signal leaf bound to no task',
+    SignalCause.LEAF_NOT_IN_STORE: 'signal leaf task absent from the store',
+    SignalCause.STALE_BINDING: "signal leaf task's PRD is not this PRD",
+    SignalCause.EXTERNAL_LEAF: 'signal leaf is an external task',
+    SignalCause.LEAF_CANCELLED: 'signal leaf cancelled',
+})
+
+_UNREAD_SIDECAR_CAUSES = frozenset({SignalCause.NO_SIDECAR, SignalCause.SIDECAR_INVALID})
+
+
+@dataclass(frozen=True, slots=True)
+class SidecarUnread:
+    """A PRD's sidecar that was not read: absent, or failing to load with ``detail`` as its error."""
+
+    cause: SignalCause
+    detail: str | None
+
+    def __post_init__(self) -> None:
+        if self.cause not in _UNREAD_SIDECAR_CAUSES:
+            allowed = ', '.join(sorted(_UNREAD_SIDECAR_CAUSES))
+            raise ValueError(f'SidecarUnread.cause must be one of {allowed}; got {self.cause!s}')
+        if self.cause is SignalCause.SIDECAR_INVALID and not self.detail:
+            raise ValueError('SidecarUnread: a sidecar that fails to load must carry its error')
+
+
+@dataclass(frozen=True, slots=True)
+class PrdDocument:
+    """What a PRD's own files say: its H1 title, and its sidecar or why that is unread."""
+
+    title: str | None
+    sidecar: CapabilityManifestDoc | SidecarUnread
 
 
 @dataclass(frozen=True)
