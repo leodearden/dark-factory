@@ -6,8 +6,11 @@ produces a distinct ``logger.warning`` and a non-``None`` ``EnvelopeParseError``
 so its callers can always distinguish "got a value" from "something went wrong".
 
 ``tool_text_blocks`` and ``tool_error_text`` are quiet readers: they never log.
-They find an envelope's text blocks by the same locator ``parse_tool_result``
-uses, so the readers and the parser cannot disagree on which blocks hold text.
+They take one level less than ``parse_tool_result`` does: the CallToolResult,
+which is the JSON-RPC body's ``result`` member, never the whole body. They find
+its text blocks by the same locator ``parse_tool_result`` applies to
+``result['result']``, so the readers and the parser cannot disagree on which
+blocks hold text.
 
 Public API::
 
@@ -132,7 +135,7 @@ def _fail(
 
 
 def _text_content_blocks(reply: Mapping[str, Any]) -> tuple[dict[str, Any], ...]:
-    """The ``type=='text'`` blocks of a tool result, in order; none when ``content`` is missing, null or not a list."""
+    """The ``type=='text'`` blocks of a CallToolResult, in order; none when ``content`` is missing, null or not a list."""
     content = reply.get('content')
     if not isinstance(content, list):
         return ()
@@ -140,9 +143,10 @@ def _text_content_blocks(reply: Mapping[str, Any]) -> tuple[dict[str, Any], ...]
 
 
 def tool_text_blocks(reply: Mapping[str, Any]) -> tuple[str, ...]:
-    """The text of each ``text`` content block of a tool result, in order.
+    """The text of each ``text`` content block of the CallToolResult *reply*, in order.
 
-    An envelope whose ``content`` is missing, null or not a list carries no text.
+    *reply* is the JSON-RPC body's ``result`` member. A *reply* whose ``content``
+    is missing, null or not a list carries no text, so the whole body yields ().
     """
     return tuple(str(block.get('text', '')) for block in _text_content_blocks(reply))
 
@@ -154,6 +158,10 @@ def tool_error_text(reply: Mapping[str, Any]) -> str | None:
     well-formed envelope carrying ``isError``, not by breaking the transport.
     Nothing about that envelope's shape says it failed, so a reader that
     checks only the shape would take the error prose for a result.
+
+    *reply* is the CallToolResult, the JSON-RPC body's ``result`` member,
+    which is where ``isError`` lives. The whole body has no ``isError``, so
+    passing it yields None and a failure would read as success.
     """
     if not reply.get('isError'):
         return None
