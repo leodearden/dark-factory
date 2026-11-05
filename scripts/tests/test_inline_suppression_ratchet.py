@@ -26,6 +26,8 @@ scan budget is pinned as COUNTED WORK, and
 Subprocesses therefore get a generous ``timeout=`` rather than a clock guard.
 """
 
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -1179,7 +1181,26 @@ def _live_report(capsys, *extra: str) -> dict:
     return json.loads(captured.out)
 
 
-def test_the_live_tree_reports_the_signal_this_scanner_exists_to_produce(capsys):
+# One loadgroup worker runs every consumer of `live_json_report`, so the live
+# tree is scanned once for them rather than once per worker that drew one.
+_LIVE_JSON_GROUP_NAME = 'inline_suppression_live_json'
+
+
+@pytest.fixture(scope='module')
+def live_json_report() -> dict:
+    """``_live_report`` with no extra argv, run once for every consumer.
+
+    Redirects the streams itself because capsys is function-scoped.
+    """
+    stdout, stderr = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        code = inline_suppressions.main(['--json', '--root', str(REPO_ROOT)])
+    assert code == 0, stderr.getvalue()
+    return json.loads(stdout.getvalue())
+
+
+@pytest.mark.xdist_group(_LIVE_JSON_GROUP_NAME)
+def test_the_live_tree_reports_the_signal_this_scanner_exists_to_produce(live_json_report: dict):
     """The NON-VACUITY FLOOR, because "nothing was read" and "nothing was wrong"
     are otherwise the same output.
 
@@ -1199,7 +1220,7 @@ def test_the_live_tree_reports_the_signal_this_scanner_exists_to_produce(capsys)
     that is a statement about the report's SHAPE, which no corpus can falsify.
     The four assertions above already carry the whole non-vacuity floor.
     """
-    report = _live_report(capsys)
+    report = live_json_report
 
     assert report['files_enumerated'] >= 1000
     assert report['sites'] >= 1000
@@ -1237,7 +1258,8 @@ def test_the_live_tree_carries_no_disposition_faults(tmp_path: Path, capsys):
     )
 
 
-def test_the_live_scan_tokenizes_exactly_the_marker_bearing_files(capsys):
+@pytest.mark.xdist_group(_LIVE_JSON_GROUP_NAME)
+def test_the_live_scan_tokenizes_exactly_the_marker_bearing_files(live_json_report: dict):
     """THE ≤10 s BUDGET, PINNED AS COUNTED WORK AND NEVER AS A CLOCK.
 
     The budget fits only because of the prefilter, so the honest guard is that
@@ -1269,7 +1291,7 @@ def test_the_live_scan_tokenizes_exactly_the_marker_bearing_files(capsys):
             for spec in specs
         )
 
-    report = _live_report(capsys)
+    report = live_json_report
 
     assert report['files_enumerated'] == len(tracked)
     assert report['files_tokenized'] < report['files_enumerated']
