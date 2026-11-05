@@ -9200,8 +9200,8 @@ class Harness:
         This method therefore also never raises.
 
         Logging is tiered against what git_ops already logs for the pass:
-          * rc==0   → DEBUG, because git_ops' per-pass ``reclaim pass`` record
-            is the INFO line
+          * rc==0   → DEBUG, because git_ops' preceding line reports the pass:
+            the INFO ``reclaim pass`` record, or an "uncounted" WARNING
           * rc==127 → INFO, cause-free; git_ops' preceding line names the
             cause: a lease deferral at INFO; a pool refusal, script not found
             (naming both candidates) or unexpected error at WARNING
@@ -9218,8 +9218,8 @@ class Harness:
         rc = await self.git_ops._run_warm_lane_gc_reclaim()
         if rc == 0:
             logger.debug(
-                'Warm-lane GC reclaim pass: script exited 0 (counts in the '
-                '_run_warm_lane_gc_reclaim reclaim pass record)',
+                'Warm-lane GC reclaim pass: script exited 0 (see the preceding '
+                '_run_warm_lane_gc_reclaim line)',
             )
         elif rc == 127:
             logger.info(

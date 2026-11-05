@@ -157,14 +157,6 @@ def _messages(caplog: pytest.LogCaptureFixture, logger_name: str, level: int) ->
     ]
 
 
-def _gc_leg_only_harness(tmp_path: Path) -> Harness:
-    """A harness whose pass logs come from the GC leg alone (real GitOps kept)."""
-    harness, _rs = _make_harness(tmp_path)
-    harness._run_interactive_worktree_reaper_pass = AsyncMock()
-    harness._reclaim_terminal_lane_records = AsyncMock(return_value=0)
-    return harness
-
-
 class TestWarmLaneGcPassRecord:
     """A real GitOps runs a stub gc.sh; the pass record is read back from the log.
 
@@ -188,7 +180,7 @@ class TestWarmLaneGcPassRecord:
     ) -> None:
         stub_dir = tmp_path / 'scripts' if origin == 'project' else df_warm_lane_script_dir()
         stub = _write_gc_stub(stub_dir / 'warm-lane-gc.sh', f"printf '%s\\n' '{summary}'\n")
-        harness = _gc_leg_only_harness(tmp_path)
+        harness, _rs = _make_harness(tmp_path)
         caplog.set_level(logging.DEBUG)
 
         await harness._run_warm_lane_gc_pass()
@@ -211,7 +203,7 @@ class TestWarmLaneGcPassRecord:
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
     ) -> None:
         stub = _write_gc_stub(tmp_path / 'scripts' / 'warm-lane-gc.sh', 'exit 0\n')
-        harness = _gc_leg_only_harness(tmp_path)
+        harness, _rs = _make_harness(tmp_path)
         caplog.set_level(logging.DEBUG)
 
         await harness._run_warm_lane_gc_pass()
@@ -240,7 +232,7 @@ class TestWarmLaneGcPassRecord:
             f"printf '%s\\n' '{_REIFY_SUMMARY}'\n",
             mode=0o644,
         )
-        harness = _gc_leg_only_harness(tmp_path)
+        harness, _rs = _make_harness(tmp_path)
         caplog.set_level(logging.DEBUG)
 
         await harness._run_warm_lane_gc_pass()
@@ -253,6 +245,15 @@ class TestWarmLaneGcPassRecord:
 
 
 _HARNESS_LOGGER = 'orchestrator.harness'
+_RECLAIM_LINE = '_run_warm_lane_gc_reclaim'
+
+
+def _gc_leg_only_harness(tmp_path: Path) -> Harness:
+    """A harness whose own pass logs come from the GC leg alone."""
+    harness, _rs = _make_harness(tmp_path)
+    harness._run_interactive_worktree_reaper_pass = AsyncMock()
+    harness._reclaim_terminal_lane_records = AsyncMock(return_value=0)
+    return harness
 
 
 async def _tick_lines(
@@ -282,7 +283,7 @@ class TestWarmLaneGcPassTickVisibility:
         ], caplog.text
 
     @pytest.mark.asyncio
-    async def test_rc127_tick_asserts_no_cause(
+    async def test_rc127_tick_points_at_the_preceding_reclaim_line(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
     ) -> None:
         """127 also means a lease deferral, a pool refusal or a spawn failure."""
@@ -290,7 +291,19 @@ class TestWarmLaneGcPassTickVisibility:
 
         tick = [r.getMessage() for r in records if 'rc=127' in r.getMessage()]
         assert tick, caplog.text
-        assert not [m for m in tick if 'script absent' in m]
+        assert all(_RECLAIM_LINE in m for m in tick), tick
+
+    @pytest.mark.asyncio
+    async def test_rc0_tick_is_debug_and_points_at_the_preceding_reclaim_line(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The pass's INFO record, or its uncounted WARNING, comes from git_ops."""
+        records = await _tick_lines(tmp_path, caplog, rc=0)
+
+        tick = [r for r in records if 'exited 0' in r.getMessage()]
+        assert tick, caplog.text
+        assert all(r.levelno == logging.DEBUG for r in tick), tick
+        assert all(_RECLAIM_LINE in r.getMessage() for r in tick), tick
 
     @pytest.mark.asyncio
     async def test_other_nonzero_rc_still_warns(
