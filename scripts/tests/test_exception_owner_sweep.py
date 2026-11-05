@@ -57,6 +57,7 @@ from exception_owner_sweep import (
     scan,
 )
 from inline_suppression_fixtures import RUFF_CONFIG, SUBPROCESS_TIMEOUT_SECS, track_fixture_tree
+from inline_suppressions import BASELINE_PATH
 from shared.governed_exceptions import (
     Debt,
     Disposition,
@@ -791,6 +792,15 @@ def test_scenario_24_slack_files_one_tighten_task_across_runs(project_root, seed
     assert submitted['metadata'][FINDING_KEY_FIELD] == TIGHTEN_KEY.record()
     assert TIGHTEN_COMMAND == 'uv run --project shared python scripts/inline_suppressions.py --tighten'
     assert TIGHTEN_COMMAND in submitted['description']
+
+
+def test_the_tighten_task_declares_the_baseline_file_it_changes(project_root, seed):
+    stub = StubMcp(seed([]))
+
+    sweep_once(view(slack_total=54), ports_for(project_root, stub))
+
+    (submitted,) = stub.tool_calls('submit_task')
+    assert submitted['metadata']['files'] == [BASELINE_PATH]
 
 
 def test_no_slack_files_no_tighten_task(project_root, seed):
