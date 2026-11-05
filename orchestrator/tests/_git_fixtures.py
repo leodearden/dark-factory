@@ -64,6 +64,10 @@ class RepoSeed:
 
 
 README_SEED = RepoSeed(files=(('README.md', '# Test\n'),), message='Initial commit')
+LIB_VARIABLE_SEED = RepoSeed(files=(('lib.py', 'x = 1\n'),), message='Initial')
+LIB_FUNCTION_SEED = RepoSeed(
+    files=(('lib.py', 'def greet(name): return name\n'),), message='Initial commit',
+)
 
 
 def _git_env(cwd: Path) -> dict[str, str]:
