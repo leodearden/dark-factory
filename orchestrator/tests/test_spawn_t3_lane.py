@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from unittest.mock import ANY
 
 import pytest
 from _fake_t3_server import (
@@ -489,7 +490,7 @@ class TestLaunch:
                 'modelSelection': {'instanceId': 'claudeAgent', 'model': 'opus'},
                 'runtimeMode': 'full-access',
                 'workspaceStrategy': {'type': 'root'},
-                'clientRequestId': 'unblock-df-7489-4242',
+                'clientRequestId': ANY,
             }
         ]
         record = sr.read_record(Path(record_dir).name, root=env.fleet)
@@ -525,6 +526,15 @@ class TestLaunch:
         launch_line(capsys, tmp_path, env.project)
 
         assert 'modelSelection' not in sent_launch(t3)
+
+    def test_a_slug_reused_by_a_later_record_does_not_replay_the_earlier_thread(
+        self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        launch_line(capsys, tmp_path, env.project, record=spawn_record(env))
+        launch_line(capsys, tmp_path, env.project, record=spawn_record(env))
+
+        request_ids = [call['clientRequestId'] for call in t3.tool_calls('t3_thread_launch')]
+        assert len(set(request_ids)) == 2
 
     def test_without_a_record_each_launch_gets_its_own_request_id(
         self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -789,7 +799,7 @@ class TestLaunchFailures:
 
         assert line == f'started thread_id={THREAD_ID} project_id={PROJECT_ID} run_id={RUN_ID}'
         request_ids = [call['clientRequestId'] for call in t3.tool_calls('t3_thread_launch')]
-        assert request_ids == ['unblock-df-7489-4242', 'unblock-df-7489-4242']
+        assert len(request_ids) == 2 and len(set(request_ids)) == 1
 
     def test_a_reply_lost_twice_is_launch_failed(
         self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -816,7 +826,7 @@ class TestLaunchFailures:
 
         assert line == f'started thread_id={THREAD_ID} project_id={PROJECT_ID} run_id={RUN_ID}'
         request_ids = [call['clientRequestId'] for call in t3.tool_calls('t3_thread_launch')]
-        assert request_ids == ['unblock-df-7489-4242'] * 2
+        assert len(request_ids) == 2 and len(set(request_ids)) == 1
         assert time.monotonic() - started < STALL_CAP_SECS / 2
 
     def test_no_credential_and_no_t3_to_self_pair_is_no_launcher(

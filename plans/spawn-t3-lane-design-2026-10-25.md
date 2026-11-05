@@ -387,10 +387,13 @@ section records what β changed against §4 and §8.
   `existing_worktree` launch, with T3's message as the detail. The lane never
   parses that message. `provider-disabled` and the `CLAUDE_SPAWN_CLAUDE_ARGS`
   refusal are unchanged.
-- **Lost launch reply.** `clientRequestId` is the record's slug (a fresh uuid
-  without a record). A launch whose reply is lost (transport unreachable or
-  protocol) is sent once more with the same key, and T3 replays the same
-  thread rather than starting a second.
+- **Lost launch reply.** `clientRequestId` is a fresh uuid per `launch`
+  invocation, not the record slug the brief named: a slug repeats once its
+  launcher pid recycles, and T3 replays any accepted launch whose thread is
+  not deleted (archived included), so a slug key could silently hand a new
+  spawn an old thread. A launch whose reply is lost (transport unreachable or
+  protocol) is sent once more within the same invocation with the same key,
+  and T3 replays the same thread rather than starting a second.
 - **Call bounds.** `t3_thread_wait` waits one slice plus the client's HTTP
   margin. Every other lane call waits at most `CALL_TIMEOUT_SECS` (60 s) for
   its reply, replacing the deleted CLI seam's 300 s per subprocess.

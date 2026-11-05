@@ -384,11 +384,6 @@ class WorkspaceStrategy:
         return {'type': 'existing_worktree', 'worktreePath': self.worktree_path}
 
 
-def _client_request_id(record_dir: str) -> str:
-    """The record's slug, so a resent launch replays the same thread; a fresh key without a record."""
-    return _record_key(record_dir)[0] if record_dir else str(uuid.uuid4())
-
-
 def _launch_arguments(
     project: T3Project,
     title: str,
@@ -543,7 +538,7 @@ def launch(
         choice.instance_id,
         skip_permissions=skip_permissions,
         strategy=strategy,
-        request_id=_client_request_id(record_dir),
+        request_id=str(uuid.uuid4()),
     )
     launched = _launch_outcome(_send_launch(client, arguments), strategy)
     if isinstance(launched, str):
