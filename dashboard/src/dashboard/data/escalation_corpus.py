@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from types import MappingProxyType
+from typing import TypeVar
 
 from escalation.models import Escalation
 from escalation.queue import iter_all_escalation_paths
@@ -44,8 +45,11 @@ from dashboard.config import DashboardConfig
 from dashboard.data.datum import Datum, DatumState, unknown_datum
 from dashboard.data.mcp_fanout import TTLCache
 from dashboard.data.served_read import ServedRead
+from dashboard.data.task_ids import parse_task_id
 
 logger = logging.getLogger(__name__)
+
+_TaskKey = TypeVar('_TaskKey', str, int)
 
 CORPUS_TTL_SECONDS = 60.0
 """How long one walk is served before the next request walks again."""
@@ -322,9 +326,9 @@ def pending_level2_by_task(
 ) -> Datum[Mapping[int, tuple[str, ...]]]:
     """Each task's pending human-level escalations in the live queue *queue_id*, sorted.
 
-    A record whose task id is not a string of ASCII digits (a null, a number, a
-    label) names no task in the store, so it is left out. The datum is as partial as that queue's scan, as :func:`views_over`
-    scopes a count.
+    A record whose task id names no task (``dashboard.data.task_ids.parse_task_id``)
+    is left out. The datum is as partial as that queue's scan, as
+    :func:`views_over` scopes a count.
     """
     corpus = corpus_datum.value
     bound = corpus_datum.freshness_bound_seconds
@@ -334,22 +338,27 @@ def pending_level2_by_task(
         scan = corpus.scan(queue_id)
     except KeyError:
         return unknown_datum(f'the escalation corpus carries no queue {queue_id}', bound)
-    by_task: dict[int, list[str]] = {}
-    for record in scan.records:
-        escalation = record.escalation
-        if (
-            EscalationView.QUEUE_PENDING.admits(record)
-            and escalation.level == HUMAN_LEVEL
-            and isinstance(escalation.task_id, str)
-            and escalation.task_id.isascii()
-            and escalation.task_id.isdecimal()
-        ):
-            by_task.setdefault(int(escalation.task_id), []).append(escalation.id)
     state, reason = _scope_provenance(corpus_datum, [scan])
-    return Datum(
-        MappingProxyType({task_id: tuple(sorted(ids)) for task_id, ids in by_task.items()}),
-        corpus_datum.as_of, state, reason, bound,
-    )
+    return Datum(_pending_ids_by(scan, _human_level_task), corpus_datum.as_of, state, reason, bound)
+
+
+def _human_level_task(escalation: Escalation) -> int | None:
+    return parse_task_id(escalation.task_id) if escalation.level == HUMAN_LEVEL else None
+
+
+def _pending_ids_by(
+    scan: QueueScan, task_of: Callable[[Escalation], _TaskKey | None],
+) -> Mapping[_TaskKey, tuple[str, ...]]:
+    """*scan*'s pending live escalation ids, sorted, by the task *task_of* reads off each.
+
+    An escalation *task_of* reads None off is left out.
+    """
+    by_task: dict[_TaskKey, list[str]] = {}
+    for record in scan.records:
+        task = task_of(record.escalation)
+        if task is not None and EscalationView.QUEUE_PENDING.admits(record):
+            by_task.setdefault(task, []).append(record.escalation.id)
+    return MappingProxyType({task: tuple(sorted(ids)) for task, ids in by_task.items()})
 
 
 @dataclass(frozen=True, slots=True)
@@ -393,10 +402,4 @@ def pending_escalation_ids(
         return None
     if not _live_queue_fully_read(scan):
         return None
-    by_task: dict[str, list[str]] = {}
-    for record in scan.records:
-        if EscalationView.QUEUE_PENDING.admits(record):
-            by_task.setdefault(record.escalation.task_id, []).append(record.escalation.id)
-    return PendingEscalations(
-        MappingProxyType({task_id: tuple(sorted(ids)) for task_id, ids in by_task.items()})
-    )
+    return PendingEscalations(_pending_ids_by(scan, lambda escalation: escalation.task_id))

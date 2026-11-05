@@ -41,6 +41,7 @@ from dashboard.data.prd_view import (
     is_ready,
     priority_of,
 )
+from dashboard.data.task_ids import parse_task_id
 
 CONTENTION_TOP_N = 5
 """How many of the most-wanted lock keys the line serves; the client renders every one."""
@@ -273,8 +274,8 @@ def _lock_keys(row: Mapping[str, Any], lock_depth: int) -> tuple[str, ...]:
 def _holder(holder_id: str | None, status_map: Mapping[int, str]) -> Holder | None:
     if holder_id is None:
         return None
-    is_task_id = holder_id.isascii() and holder_id.isdecimal()
-    return Holder(holder_id, status_map.get(int(holder_id)) if is_task_id else None)
+    task_id = parse_task_id(holder_id)
+    return Holder(holder_id, None if task_id is None else status_map.get(task_id))
 
 
 def _held_share(ready: Sequence[Mapping[str, Any]], wants: _Wants) -> Mapping[str, BandShare]:

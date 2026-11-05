@@ -25,6 +25,7 @@ from shared.timestamps import parse_timestamp_or_warn
 from dashboard.data.datum import Datum, DatumState, unknown_datum
 from dashboard.data.prd_view import MOVING_WINDOW_DAYS, TaskActivity
 from dashboard.data.served_read import ServedRead
+from dashboard.data.task_ids import parse_task_id
 
 RUNS_DB = Path('data') / 'orchestrator' / 'runs.db'
 """Where a project keeps its run ledger, relative to its root."""
@@ -121,7 +122,7 @@ async def _measure(conn: aiosqlite.Connection, store: Path, now: datetime) -> Da
         completed=MappingProxyType(completed),
         ever_started=frozenset(
             task_id for row in await _query(conn, 'ever_started')
-            if (task_id := _task_id(row[0])) is not None
+            if (task_id := parse_task_id(row[0])) is not None
         ),
         first_event_at=_instant(first_rows[0][0]) if first_rows else None,
     )
@@ -145,15 +146,10 @@ def _latest(rows: Iterable[Sequence[object]]) -> dict[int, datetime]:
     """``{task id: instant}`` from ``(task_id, timestamp)`` rows, skipping unnumbered tasks."""
     latest: dict[int, datetime] = {}
     for raw_id, raw_at in rows:
-        task_id, at = _task_id(raw_id), _instant(raw_at)
+        task_id, at = parse_task_id(raw_id), _instant(raw_at)
         if task_id is not None and at is not None:
             latest[task_id] = at
     return latest
-
-
-def _task_id(raw: object) -> int | None:
-    text = str(raw) if raw is not None else ''
-    return int(text) if text.isascii() and text.isdigit() else None
 
 
 def _instant(raw: object) -> datetime | None:
