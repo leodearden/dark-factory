@@ -1257,6 +1257,19 @@ class TaskArtifacts:
                 reviews[path.stem] = json.loads(path.read_text())
         return reviews
 
+    def clear_reviews(self) -> None:
+        """Remove every review so the next aggregation holds only reviews written after this call."""
+        reviews_dir = self.artifact_path('reviews')
+        if not reviews_dir.is_dir():
+            return
+        removed = []
+        for entry in reviews_dir.iterdir():
+            if entry.is_symlink() or not entry.is_dir():
+                entry.unlink(missing_ok=True)
+                removed.append(entry.name)
+        if removed:
+            logger.info('TaskArtifacts: cleared reviews %s from %s', sorted(removed), reviews_dir)
+
     def aggregate_reviews(self) -> ReviewAggregation:
         """Aggregate every review as ``orchestrator/review_payload.py::normalize_review`` reads it.
 
