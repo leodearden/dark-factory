@@ -49,6 +49,7 @@ from inline_suppression_kinds import KIND_SPECS, Kind
 from inline_suppression_scan import scan_tree
 from shared.governed_exceptions import INLINE_MARKER_FORMS, Policy
 from shared.ratchet import BASELINE_README, SCHEMA_VERSION, load
+from shared.testing_xdist_groups import single_xdist_group
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = REPO_ROOT / 'scripts' / 'inline_suppressions.py'
@@ -1297,3 +1298,17 @@ def test_the_live_tree_passes_the_gate_once_the_baseline_is_seeded(capsys):
     assert inline_suppressions.main(['--check', '--root', str(REPO_ROOT)]) == 0, (
         capsys.readouterr().err
     )
+
+
+def test_the_live_json_report_consumers_share_one_xdist_worker(request):
+    consumers = {
+        test_the_live_tree_reports_the_signal_this_scanner_exists_to_produce,
+        test_the_live_scan_tokenizes_exactly_the_marker_bearing_files,
+    }
+    selected = [
+        item for item in request.session.items if getattr(item, 'function', None) in consumers
+    ]
+    if not selected:
+        pytest.skip('no consumer of the live --json report is selected in this session')
+
+    assert single_xdist_group(selected) == _LIVE_JSON_GROUP_NAME
