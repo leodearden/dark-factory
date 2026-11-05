@@ -39,12 +39,17 @@
 # Backend selection -- $CLAUDE_SPAWN_BACKEND names where the session lives:
 #   auto (or unset) — t3 when this script runs inside a T3 Code-hosted
 #     session (spawn_t3_lane.py `detect`), else wm.
-#   t3 — a T3 Code thread in the project whose root is <cwd>; no terminal.
-#     The lane refuses (exit 145) skip_permissions=false and any
+#   t3 — a T3 Code thread in the T3 project containing <cwd>, run in <cwd>:
+#     the project root, or a worktree T3 lists for it; no terminal. The lane
+#     reaches T3's MCP server with this host's credential (spawn_t3_lane.py
+#     `pair`). skip_permissions picks the runtime mode (true full-access,
+#     false approval-required). The lane refuses (exit 145) any
 #     $CLAUDE_SPAWN_CLAUDE_ARGS; $CLAUDE_SPAWN_MODEL becomes the thread's
 #     model, on the instance resolve_t3_provider picks ($CLAUDE_SPAWN_T3_PROVIDER
-#     names one explicitly; a disabled one is refused, exit 145). Child mode joins on the thread's result.md or archive and exits
-#     with spawn_t3_lane.py `wait`'s code. The started-grace defaults to 300s.
+#     names one explicitly; a disabled one is refused, exit 145). Child mode
+#     joins on the thread's result.md or archive, records spawn_t3_lane.py
+#     `wait`'s code as the session's exit and exits with it. The started-grace
+#     defaults to 300s.
 #   tmux — bypass terminal-emulator discovery entirely
 #     and launch in a crash-survivable, reattachable tmux window instead
 #     (Fleet Cockpit C6). Per-project session `fleet-<project>` (project from
@@ -67,18 +72,21 @@
 #            spawn_t3_lane.py `wait`'s code: 0 (final result.md, or thread
 #            archived) or 1 (the thread's last run ended without one)
 #   126    — no usable launcher (no terminal emulator found / tmux missing in tmux mode /
-#            t3, python3 or T3's server-runtime.json missing on the t3 lane); on the
-#            t3 lane also `wait`'s "T3 server unreachable beyond its grace" (a deleted
-#            thread ends the same way: its `thread show` fails)
+#            on the t3 lane: python3 or T3's server-runtime.json missing, T3 unreachable,
+#            or this host's MCP credential unpaired, expired or not self-pairable -- run
+#            spawn_t3_lane.py `pair`); on the t3 lane also `wait`'s "T3 server unreachable
+#            beyond its grace"
 #   127    — launcher itself failed (emulator exited before writing the sentinel,
 #            or the sentinel never settled to a numeric exit code within the launch grace;
 #            on the t3 lane, the thread launch failed or spawn_t3_lane.py faulted). On the
-#            t3 lane also `wait`'s "show reported no thread", and "join lost": `wait` faulted
+#            t3 lane also `wait`'s "the thread was deleted", and "join lost": `wait` faulted
 #            while the thread may still be running (stderr names the thread and record)
 #   129    — terminal window closed while the session was alive (SIGHUP)
 #   143    — the session's payload shell was sent SIGTERM
 #   144    — Claude never started within the started-grace window (registry marked failed-to-start)
-#   145    — the selected lane cannot honour an input (t3 lane only, today)
+#   145    — the selected lane cannot honour an input (t3 lane only, today: claude CLI
+#            arguments, a disabled provider instance, a cwd in no live T3 project, or
+#            a worktree T3 does not list for its project)
 #   2      — bad usage
 
 set -u
@@ -154,6 +162,13 @@ verdict_field() {
     case "$w" in "$2="*) printf '%s' "${w#"$2="}"; return 0 ;; esac
   done
   return 1
+}
+
+# verdict_field with the lane's percent-encoding undone, for a message.
+verdict_text() {
+  local v
+  v=$(verdict_field "$1" "$2") || return 1
+  printf '%b' "${v//%/\\x}"
 }
 
 t3_host_detected() {
@@ -250,10 +265,6 @@ resolve_t3_provider() {
 }
 
 refuse_inputs_the_t3_lane_cannot_honour() {
-  if [ "$skip_perms" != "true" ]; then
-    t3_lane_refuse "skip_permissions=$skip_perms" \
-      "a T3 thread runs in its project's runtime mode; pass true, or set CLAUDE_SPAWN_BACKEND=tmux or wm"
-  fi
   if [ -n "${CLAUDE_SPAWN_CLAUDE_ARGS:-}" ]; then
     t3_lane_refuse "CLAUDE_SPAWN_CLAUDE_ARGS='$CLAUDE_SPAWN_CLAUDE_ARGS'" \
       "a T3 thread takes no claude CLI arguments; unset it, or set CLAUDE_SPAWN_BACKEND=tmux or wm"
@@ -827,6 +838,15 @@ _sentinel_settled() {
   printf '%s\n' "$v"
 }
 
+# The one registry write of a session's final exit code $1 (task 2285), for
+# every lane. The code is already decided, so a registry fault here can never
+# change the spawn's exit-code contract.
+record_exit() {
+  if [ -n "$SESSION_RECORD_DIR" ] && command -v python3 >/dev/null 2>&1; then
+    python3 "$SESSION_REGISTRY_PY" exit --record "$SESSION_RECORD_DIR" --code "$1" || true
+  fi
+}
+
 finish() {
   # Bounded re-poll for a sentinel that EXISTS but has not settled yet --
   # the faithful production race: the payload's write is in flight and the
@@ -870,12 +890,7 @@ finish() {
     fi
   fi
   rm -f "$sentinel" "$sentinel.tmp"
-  # Session-registry: record the final exit code (task 2285). rc is already
-  # fully determined from the sentinel above, independent of this call, so a
-  # registry fault here can never change the spawn's exit-code contract.
-  if [ -n "$SESSION_RECORD_DIR" ] && command -v python3 >/dev/null 2>&1; then
-    python3 "$SESSION_REGISTRY_PY" exit --record "$SESSION_RECORD_DIR" --code "$rc" || true
-  fi
+  record_exit "$rc"
   exit "$rc"
 }
 
@@ -1188,6 +1203,7 @@ launch_t3_thread() {
   [ -n "${CLAUDE_SPAWN_MODEL:-}" ] && args+=(--model "$CLAUDE_SPAWN_MODEL")
   [ -n "$t3_provider" ] && args+=(--provider "$t3_provider")
   [ -n "${parent_of_child:-}" ] && args+=(--parent "$parent_of_child")
+  [ "$skip_perms" = "true" ] && args+=(--skip-permissions)
   t3_launch_epoch=$(date +%s)
   t3_lane_call "${args[@]}"
   case "$(verdict_status "$t3_verdict")" in
@@ -1195,18 +1211,51 @@ launch_t3_thread() {
       t3_thread_id=$(verdict_field "$t3_verdict" thread_id)
       [ -n "$t3_thread_id" ] || t3_lane_unexpected launch
       ;;
-    no-launcher)
-      echo "spawn-claude.sh: the t3 lane, selected $t3_lane_origin, has no launcher ($(verdict_field "$t3_verdict" reason)) -- install t3 / start T3 Code, or set CLAUDE_SPAWN_BACKEND=tmux or wm" >&2
-      exit 126
-      ;;
-    refused)
-      [ "$(verdict_field "$t3_verdict" reason)" = "provider-disabled" ] && refuse_disabled_t3_provider
-      t3_lane_refuse "cwd=$cwd ($(verdict_field "$t3_verdict" reason); project root $(verdict_field "$t3_verdict" detail))" \
-        "a T3 thread always runs in its project's root; pass that root as cwd, or set CLAUDE_SPAWN_BACKEND=tmux or wm"
-      ;;
+    no-launcher) report_no_t3_launcher ;;
+    refused) refuse_the_t3_launch ;;
     launch-failed)
-      echo "spawn-claude.sh: t3 lane: t3 thread start failed and no thread titled '$thread_title' appeared" >&2
+      echo "spawn-claude.sh: t3 lane: the thread launch failed -- $(verdict_text "$t3_verdict" detail)" >&2
       exit 127
+      ;;
+    *) t3_lane_unexpected launch ;;
+  esac
+}
+
+# $t3_verdict is launch's `no-launcher reason=<word> [detail=...]`; only the
+# credential family of reasons is spelled t3-mcp-*.
+report_no_t3_launcher() {
+  local reason detail
+  reason=$(verdict_field "$t3_verdict" reason)
+  detail=$(verdict_text "$t3_verdict" detail)
+  case "$reason" in
+    t3-mcp-*)
+      echo "spawn-claude.sh: the t3 lane, selected $t3_lane_origin, cannot reach T3's MCP server with this host's credential ($reason${detail:+: $detail}) -- pair it with 'PYTHONPATH=$REPO_ROOT/orchestrator/src python3 $SPAWN_T3_LANE_PY pair' ('pair --code <code>' off the T3 host), or set CLAUDE_SPAWN_BACKEND=tmux or wm" >&2
+      ;;
+    *)
+      echo "spawn-claude.sh: the t3 lane, selected $t3_lane_origin, has no launcher ($reason${detail:+: $detail}) -- start T3 Code, or set CLAUDE_SPAWN_BACKEND=tmux or wm" >&2
+      ;;
+  esac
+  exit 126
+}
+
+# $t3_verdict is launch's `refused reason=<word> [detail=...]`.
+refuse_the_t3_launch() {
+  local reason detail
+  reason=$(verdict_field "$t3_verdict" reason)
+  detail=$(verdict_text "$t3_verdict" detail)
+  case "$reason" in
+    provider-disabled) refuse_disabled_t3_provider ;;
+    cwd-not-project-worktree)
+      t3_lane_refuse "cwd=$cwd ($reason: $detail)" \
+        "T3 does not list it as a worktree of its project; pass the project root or a worktree T3 lists, or set CLAUDE_SPAWN_BACKEND=tmux or wm"
+      ;;
+    project-archived)
+      t3_lane_refuse "cwd=$cwd ($reason: $detail)" \
+        "the T3 project at that root is archived; unarchive it in T3, or set CLAUDE_SPAWN_BACKEND=tmux or wm"
+      ;;
+    cwd-outside-projects)
+      t3_lane_refuse "cwd=$cwd ($reason)" \
+        "no T3 project contains it; add its project to T3, or set CLAUDE_SPAWN_BACKEND=tmux or wm"
       ;;
     *) t3_lane_unexpected launch ;;
   esac
@@ -1244,6 +1293,7 @@ join_t3_thread() {
   fi
   code=$(verdict_field "$t3_verdict" code)
   case "$code" in ''|*[!0-9]*) t3_lane_join_lost "spawn_t3_lane.py wait answered '$t3_verdict'" ;; esac
+  record_exit "$code"
   exit "$code"
 }
 
