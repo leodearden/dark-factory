@@ -17,6 +17,7 @@ import pytest
 import quality_metrics_snapshot as snapshot
 import quality_snapshot_cadence as cadence
 from git_listing import git
+from quality_snapshot_identity import below_run_id_and_cost
 
 REPO_ROOT = Path(__file__).parents[2]
 
@@ -74,15 +75,6 @@ def _main_sha(root: Path) -> str:
 def _worktrees(root: Path) -> list[Path]:
     listing = git(root, 'worktree', 'list', '--porcelain').splitlines()
     return [Path(line.removeprefix('worktree ')) for line in listing if line.startswith('worktree ')]
-
-
-def _below_run_id_and_cost(path: Path) -> list[str]:
-    """*path*'s lines without the two a re-run changes: run_id and the wall clock."""
-    return [
-        line
-        for line in path.read_text(encoding='utf-8').splitlines()
-        if not line.startswith(('  "run_id": ', '    "wall_clock_s": '))
-    ]
 
 
 def _shim(tmp_path: Path, body: str) -> Path:
@@ -152,7 +144,7 @@ class TestTheIdentitySkip:
         shutil.copyfile(out, first)
         assert _cadence(root, data, '--force') == 0
         assert 'already measured' not in capfd.readouterr().out
-        assert _below_run_id_and_cost(out) == _below_run_id_and_cost(first)
+        assert below_run_id_and_cost(out) == below_run_id_and_cost(first)
         assert snapshot.load_snapshot(out)['run_id'] != snapshot.load_snapshot(first)['run_id']
 
     def test_a_changed_params_re_measures(
@@ -169,6 +161,23 @@ class TestTheIdentitySkip:
         assert _cadence(root, data) == 0
         assert 'already measured' not in capfd.readouterr().out
         assert snapshot.load_snapshot(out)['params'] == snapshot.measurement_params()
+
+    def test_an_older_schema_snapshot_has_no_identity_and_is_re_measured(
+        self, tmp_path: Path, capfd: pytest.CaptureFixture[str]
+    ) -> None:
+        root = _repo(tmp_path)
+        data = tmp_path / 'data'
+        assert _cadence(root, data) == 0
+        out = data / 'fixture' / f'{_main_sha(root)}.json'
+        older = snapshot.load_snapshot(out)
+        older['schema_version'] = 2
+        del older['params']['python_version'], older['params']['instrument']
+        out.write_text(snapshot.render_snapshot(older), encoding='utf-8')
+        capfd.readouterr()
+        assert _cadence(root, data) == 0
+        assert 'already measured' not in capfd.readouterr().out
+        assert snapshot.load_snapshot(out)['schema_version'] == snapshot.SCHEMA_VERSION
+
 
 
 class TestAnExplicitShaList:

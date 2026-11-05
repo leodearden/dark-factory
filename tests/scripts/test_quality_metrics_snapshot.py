@@ -23,6 +23,7 @@ import pytest
 import quality_metrics_snapshot as snapshot
 import source_measures
 from git_listing import git
+from quality_snapshot_identity import below_run_id_and_cost
 
 REPO_ROOT = Path(__file__).parents[2]
 
@@ -103,6 +104,27 @@ def _measured(tmp_path: Path, files: dict[str, str]) -> dict[str, Any]:
     out = tmp_path / 'out' / 'snapshot.json'
     assert _run(root, out) == 0
     return json.loads(out.read_text(encoding='utf-8'))
+
+
+def _run_in_a_process(root: Path, out: Path, run_id: str, *, hash_seed: str) -> None:
+    """Measure *root* through the real entry point, in a process of its own with *hash_seed*."""
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith('GIT_') or key == 'GIT_CEILING_DIRECTORIES'
+    }
+    env['PYTHONHASHSEED'] = hash_seed
+    proc = subprocess.run(
+        [
+            sys.executable, str(REPO_ROOT / 'scripts' / 'quality_metrics_snapshot.py'),
+            '--run-id', run_id, '--out', str(out), '--root', str(root),
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
 
 
 # ---------------------------------------------------------------------------
@@ -293,20 +315,8 @@ class TestTheCommandLine:
         assert printed[-1] == 'no previous snapshot given; since = none'
 
     def test_the_real_entry_point_measures_and_writes(self, tmp_path: Path) -> None:
-        root = _repo(tmp_path, _BASE)
         out = tmp_path / 'out' / 'snapshot.json'
-        env = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
-        proc = subprocess.run(
-            [
-                sys.executable, str(REPO_ROOT / 'scripts' / 'quality_metrics_snapshot.py'),
-                '--run-id', 'r', '--out', str(out), '--root', str(root),
-            ],
-            capture_output=True,
-            text=True,
-            env=env,
-            check=False,
-        )
-        assert proc.returncode == 0, proc.stderr
+        _run_in_a_process(_repo(tmp_path, _BASE), out, 'r', hash_seed='0')
         assert out.is_file()
 
     @pytest.mark.parametrize(
@@ -1181,47 +1191,80 @@ class TestASchema2SnapshotIsStillRead:
         assert 'params keys' in str(raised.value)
 
 
-def _below_run_id_and_cost(path: Path) -> list[str]:
-    """*path*'s lines without the two a re-run changes: run_id and the wall clock."""
-    return [
-        line
-        for line in path.read_text(encoding='utf-8').splitlines()
-        if not line.startswith(('  "run_id": ', '    "wall_clock_s": '))
-    ]
-
-
 class TestMeasurementIdentity:
     @pytest.fixture
     def taken(self, tmp_path: Path) -> dict[str, Any]:
         return _measured(tmp_path, _GRAPH)
 
-    def test_it_is_the_recorded_sha_and_params(self, taken: dict[str, Any]) -> None:
+    def test_it_is_the_recorded_sha_and_params_as_canonical_json(self, taken: dict[str, Any]) -> None:
         identity = snapshot.measurement_identity(taken)
-        assert identity == (taken['as_of_sha'], taken['params'])
-        assert (identity.as_of_sha, identity.params) == (taken['as_of_sha'], taken['params'])
+        params_json = json.dumps(taken['params'], sort_keys=True)
+        assert identity == snapshot.MeasurementIdentity(taken['as_of_sha'], params_json)
+        assert identity == snapshot.MeasurementIdentity.of(taken['as_of_sha'], taken['params'])
+        assert str(identity) == f"{taken['as_of_sha']} {params_json}"
+
+    def test_it_is_a_hashable_value_its_snapshot_cannot_change(self, taken: dict[str, Any]) -> None:
+        identity = snapshot.measurement_identity(taken)
+        assert {identity: 'measured'}[snapshot.measurement_identity(copy.deepcopy(taken))] == 'measured'
+        before = str(identity)
+        taken['params']['complexipy_version'] = '0.0.0'
+        assert str(identity) == before
+        assert snapshot.measurement_identity(taken) != identity
 
     def test_two_runs_at_one_identity_are_byte_identical_below_run_id_and_cost(
         self, tmp_path: Path
     ) -> None:
-        # The PRD's decision-17 invariant: identity is (as_of_sha, params), not the checkout path.
+        # Decision 17: identity is (as_of_sha, params), not the checkout path nor the str-hash
+        # seed. Seeds 1 and 5 iterate this fixture's import-edge set in different orders.
         root = _repo(tmp_path, _SUMMARY_FILES)
         pinned = tmp_path / 'pinned'
         git(root, 'worktree', 'add', '--detach', str(pinned), 'HEAD')
         first, second = tmp_path / 'a.json', tmp_path / 'b.json'
-        assert snapshot.main(['--run-id', 'run-a', '--out', str(first), '--root', str(root)]) == 0
-        assert snapshot.main(['--run-id', 'run-b', '--out', str(second), '--root', str(pinned)]) == 0
+        _run_in_a_process(root, first, 'run-a', hash_seed='1')
+        _run_in_a_process(pinned, second, 'run-b', hash_seed='5')
         a, b = snapshot.load_snapshot(first), snapshot.load_snapshot(second)
         assert snapshot.measurement_identity(a) == snapshot.measurement_identity(b)
-        assert _below_run_id_and_cost(first) == _below_run_id_and_cost(second)
+        assert below_run_id_and_cost(first) == below_run_id_and_cost(second)
         assert a['run_id'] != b['run_id']
 
-    def test_a_schema_2_rendering_never_shares_a_schema_3_identity(
-        self, taken: dict[str, Any]
+    @pytest.mark.parametrize('as_older', [_as_schema_2, _as_schema_1], ids=['schema-2', 'schema-1'])
+    def test_an_older_schema_has_no_identity(
+        self, taken: dict[str, Any], as_older: Callable[[dict[str, Any]], dict[str, Any]]
     ) -> None:
-        # Its instrument is unknown, so it never counts as already measured.
-        old = _as_schema_2(taken)
-        assert old['as_of_sha'] == taken['as_of_sha']
-        assert snapshot.measurement_identity(old) != snapshot.measurement_identity(taken)
+        old = as_older(taken)
+        assert not snapshot.identity_known(old)
+        with pytest.raises(source_measures.MetricsError) as raised:
+            snapshot.measurement_identity(old)
+        assert 'records no instrument, python_version' in str(raised.value)
+
+    @pytest.mark.parametrize(
+        'pair',
+        [
+            pytest.param(lambda t: (t, copy.deepcopy(t)), id='one-identity'),
+            pytest.param(lambda t: (t, _with_complexipy(t, '0.0.0')), id='params-changed'),
+            pytest.param(lambda t: (t, _as_schema_2(t)), id='schema-3-and-2'),
+            pytest.param(lambda t: (_as_schema_2(t), _as_schema_2(t)), id='both-schema-2'),
+        ],
+    )
+    def test_a_shared_identity_is_exactly_a_diff_without_params_differ(
+        self,
+        taken: dict[str, Any],
+        pair: Callable[[dict[str, Any]], tuple[dict[str, Any], dict[str, Any]]],
+    ) -> None:
+        current, previous = pair(taken)
+        shared = (
+            snapshot.identity_known(current)
+            and snapshot.identity_known(previous)
+            and snapshot.measurement_identity(current) == snapshot.measurement_identity(previous)
+        )
+        differs = snapshot.diff_lines(current, previous)[0].startswith('params differ: ')
+        assert shared is not differs
+
+
+def _with_complexipy(taken: dict[str, Any], version: str) -> dict[str, Any]:
+    edited = copy.deepcopy(taken)
+    edited['params']['complexipy_version'] = version
+    return edited
 
 
 _NOT_ATTRIBUTABLE = (

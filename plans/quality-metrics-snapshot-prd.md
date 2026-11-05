@@ -204,13 +204,16 @@ enumeration (amended 2026-10-05: 5414 is done, `cdc15a6b56`).
    changed" premise nothing proves. `scripts/quality_snapshot_cadence.py` skips only when a
    snapshot with the same measurement identity, (`as_of_sha`, `params`), already exists. The
    identity test (`tests/scripts/test_quality_metrics_snapshot.py::TestMeasurementIdentity`)
-   proves that a second run at one identity is byte-identical below `run_id` and `cost`. So the
+   proves that a second run at one identity is byte-identical below `run_id` and `cost`. It runs
+   each measurement in its own process with a different hash seed. So the
    skip declines to re-measure an object already measured; it does not judge that nothing
    changed. The skip is keyed on identity alone, and a changed `params` always re-measures. This
    decision stands for everything else: no blob cache. Two contract updates. The snapshot is now
    schema 3: `params` gains `python_version` and `instrument`, schemas 1 and 2 read their
    `instrument` and `python_version` as unknown, `--diff` opens with a `params differ:` line
-   when any params key differs or is unknown, and the fields are in
+   when any params key differs or is unknown. Because unknown equals nothing,
+   `measurement_identity` refuses a schema-1 or schema-2 snapshot, `identity_known` says so
+   beforehand, and the wrapper re-measures such a file. The fields are in
    `plans/quality-dashboard-prd.md` §Contract (Snapshot identity). The command line gains
    `--params` (print the params a measurement would record; measure nothing), so boundary row
    14's "a `schema_version` of 3 … exit 2" now reads 4. Decision 8 is unchanged: the wrapper

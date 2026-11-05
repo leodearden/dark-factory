@@ -79,10 +79,6 @@ def _state_home(project_id: str) -> Path:
     return Path(base) / 'dark-factory' / 'quality-snapshot' / project_id
 
 
-def _identity_text(identity: snapshot.MeasurementIdentity) -> str:
-    return f'{identity.as_of_sha} {json.dumps(dict(identity.params), sort_keys=True)}'
-
-
 def _predicted_params(python: Path) -> dict[str, Any]:
     """The params a measurement by *python* would record, asked of the instrument itself."""
     command = [str(python), str(INSTRUMENT), '--params']
@@ -165,24 +161,28 @@ def _utc_stamp() -> str:
     return datetime.datetime.now(datetime.UTC).strftime('%Y%m%dT%H%M%S.%fZ')
 
 
+def _already_measured(out: Path, wanted: snapshot.MeasurementIdentity) -> bool:
+    """Whether *out* holds a measurement at *wanted*; one whose schema predates the identity holds none."""
+    if not out.exists():
+        return False
+    existing = snapshot.load_snapshot(out)
+    return snapshot.identity_known(existing) and snapshot.measurement_identity(existing) == wanted
+
+
 def _cadence_one(settings: _Settings, sha: str, params: Mapping[str, Any]) -> str:
     """Measure *sha* unless its file already records this identity; the line to print."""
     out = settings.data_dir / settings.project_id / f'{sha}.json'
-    wanted = snapshot.MeasurementIdentity(sha, params)
-    if (
-        not settings.force
-        and out.exists()
-        and snapshot.measurement_identity(snapshot.load_snapshot(out)) == wanted
-    ):
-        return f'already measured: {_identity_text(wanted)}'
+    wanted = snapshot.MeasurementIdentity.of(sha, params)
+    if not settings.force and _already_measured(out, wanted):
+        return f'already measured: {wanted}'
     run_id = f'quality-snapshot-{settings.project_id}-{sha[:12]}-{_utc_stamp()}'
     with _pinned(settings.root, sha, _state_home(settings.project_id)) as tree:
         _measure(settings.python, sha, tree, out, run_id)
     recorded = snapshot.measurement_identity(snapshot.load_snapshot(out))
     if recorded != wanted:
         raise source_measures.MetricsError(
-            f'{out}: the measurement recorded the identity {_identity_text(recorded)}, not the '
-            f'predicted {_identity_text(wanted)}; the instrument or its interpreter changed mid-run'
+            f'{out}: the measurement recorded the identity {recorded}, not the '
+            f'predicted {wanted}; the instrument or its interpreter changed mid-run'
         )
     return f'measured: {sha} -> {out}'
 

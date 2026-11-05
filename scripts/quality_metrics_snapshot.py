@@ -25,7 +25,7 @@ import time
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
-from typing import Any, NamedTuple, Protocol, TypeGuard
+from typing import Any, Protocol, TypeGuard
 
 import _checkout as _checkout
 import source_measures
@@ -575,14 +575,35 @@ def take_snapshot(root: Path, *, run_id: str, since: str) -> dict[str, Any]:
     return validate_snapshot(snapshot, origin='this measurement')
 
 
-class MeasurementIdentity(NamedTuple):
+@dataclasses.dataclass(frozen=True)
+class MeasurementIdentity:
+    """plans/quality-dashboard-prd.md decision 17: the params held as canonical JSON, so the value is hashable and fixed."""
+
     as_of_sha: str
-    params: Mapping[str, Any]
+    params_json: str
+
+    @classmethod
+    def of(cls, as_of_sha: str, params: Mapping[str, Any]) -> MeasurementIdentity:
+        return cls(as_of_sha, json.dumps(params, sort_keys=True))
+
+    def __str__(self) -> str:
+        return f'{self.as_of_sha} {self.params_json}'
+
+
+def identity_known(snapshot: Mapping[str, Any]) -> bool:
+    """Whether a validated snapshot's schema records every params key, so that it has an identity."""
+    return not _unknown_params(snapshot)
 
 
 def measurement_identity(snapshot: Mapping[str, Any]) -> MeasurementIdentity:
-    """A validated snapshot's identity: plans/quality-dashboard-prd.md decision 17."""
-    return MeasurementIdentity(snapshot['as_of_sha'], snapshot['params'])
+    """A validated snapshot's identity; refused when it is not *identity_known*, since unknown equals nothing."""
+    unknown = _unknown_params(snapshot)
+    if unknown:
+        raise source_measures.MetricsError(
+            f'a schema-{snapshot["schema_version"]} snapshot records no {", ".join(unknown)}: '
+            'its measurement identity is unknown, and unknown equals no identity'
+        )
+    return MeasurementIdentity.of(snapshot['as_of_sha'], snapshot['params'])
 
 
 # ---------------------------------------------------------------------------
@@ -824,6 +845,15 @@ _SCHEMAS: Mapping[int, _Schema] = {
 _SNAPSHOTS: Mapping[int, _Object] = {
     version: _snapshot_shape(version, schema) for version, schema in _SCHEMAS.items()
 }
+
+#: Every params key a read schema records, so a key neither side records still reads unknown.
+_PARAMS_KEYS = tuple(sorted({key for schema in _SCHEMAS.values() for key in schema.params.fields}))
+
+
+def _unknown_params(snapshot: Mapping[str, Any]) -> list[str]:
+    """The params keys *snapshot*'s schema does not record: unknown, which equals nothing, not even unknown."""
+    recorded = _SCHEMAS[snapshot['schema_version']].params.fields
+    return [key for key in _PARAMS_KEYS if key not in recorded]
 
 
 def _require_evidence_agrees(snapshot: Mapping[str, Any], origin: str) -> None:
@@ -1078,13 +1108,9 @@ def _record_pairs(
 
 def _param_rendered(snapshot: Mapping[str, Any], key: str) -> str:
     """*key*'s value as JSON, or bare unknown when *snapshot*'s schema does not record it."""
-    if key not in _SCHEMAS[snapshot['schema_version']].params.fields:
+    if key in _unknown_params(snapshot):
         return _UNKNOWN
     return json.dumps(snapshot['params'][key], sort_keys=True)
-
-
-#: Every params key a read schema records, so a key neither side records still reads unknown.
-_PARAMS_KEYS = tuple(sorted({key for schema in _SCHEMAS.values() for key in schema.params.fields}))
 
 
 def _params_entries(current: Mapping[str, Any], previous: Mapping[str, Any]) -> list[str]:
