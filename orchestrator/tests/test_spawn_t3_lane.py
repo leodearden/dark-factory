@@ -1,9 +1,13 @@
-"""Tests for orchestrator.spawn_t3_lane, driven through its verbs with a fake ``t3`` on PATH.
+"""Tests for orchestrator.spawn_t3_lane, driven through its verbs against a fake T3.
 
-The fake's JSON shapes are the module-level ``*_JSON`` constants below, copied
-from ``~/src/t3code`` v0.1.2: ``apps/server/src/cli/thread.ts`` (what each
-command prints) and ``packages/contracts/src/orchestratorMcp.ts`` (the item
-schemas). ``FAKE_T3_SOURCE`` reads its scripted responses from
+``launch`` and ``provider`` talk to ``_fake_t3_server.FakeT3Server`` over
+``/mcp``; the ``t3`` fixture seeds this host's credential for it. Its tool
+replies are the module-level ``*_JSON`` constants below, in T3 Code v0.1.6's
+shapes (``~/src/t3code-v0.1.6``): ``packages/contracts/src/project.ts::Project``
+and ``apps/server/src/mcp/toolkits/project/tools.ts`` (``t3_project_list``,
+``t3_thread_launch``), ``packages/contracts/src/orchestratorMcp.ts`` (the
+thread list). ``await-started`` and ``wait`` still drive a fake ``t3`` CLI on
+PATH, ``FAKE_T3_SOURCE``, which reads its scripted responses from
 ``$FAKE_T3_SCRIPT`` and logs every call to ``$FAKE_T3_LOG``.
 """
 
@@ -11,7 +15,6 @@ from __future__ import annotations
 
 import json
 import os
-import sqlite3
 import subprocess
 import sys
 import textwrap
@@ -23,7 +26,17 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from _fake_t3_server import DEAD_ORIGIN, ENVIRONMENT_ID, FakeT3Server, put_fake_t3_cli_on_path
+from _fake_t3_server import (
+    DEAD_ORIGIN,
+    ENVIRONMENT_ID,
+    HANG_UP,
+    FakeT3Server,
+    ToolAnswer,
+    ToolFailure,
+    ToolSuccess,
+    put_fake_t3_cli_on_path,
+    replies_in_turn,
+)
 
 from orchestrator import session_registry as sr
 from orchestrator import spawn_t3_lane as lane
@@ -37,11 +50,42 @@ PROJECT_ID = '5a05e1d3-5bd0-40e5-8ce7-24b2cd160300'
 RUN_ID = 'b2c4e6f8-0a1c-4e3a-8b5d-7f9e1a2b3c4d'
 SESSION_ID = '15fbcf7c-12af-481c-a641-9b00c03a741e'
 
-THREAD_START_JSON: dict[str, Any] = {'threadId': THREAD_ID, 'projectId': PROJECT_ID, 'runId': RUN_ID}
-"""``t3 thread start --json`` without ``--wait``: thread.ts ``ThreadLaunchResult``; runId may be null."""
+PROJECT_JSON: dict[str, Any] = {
+    'id': PROJECT_ID,
+    'title': 'proj',
+    'workspaceRoot': '/replaced/by/project',
+    'repositoryIdentity': None,
+    'defaultModelSelection': None,
+    'scripts': [],
+    'archivedAt': None,
+    'createdAt': '2026-10-20T08:00:00.000Z',
+    'updatedAt': '2026-10-20T08:00:00.000Z',
+    'deletedAt': None,
+}
+"""One ``Project`` of ``t3_project_list``'s ``{projects, nextCursor}`` (abridged);
+:func:`project` sets its ``workspaceRoot``."""
+
+THREAD_LAUNCH_JSON: dict[str, Any] = {
+    'threadId': THREAD_ID,
+    'projectId': PROJECT_ID,
+    'modelSelection': {'instanceId': 'claudeAgent', 'model': 'claude-opus-5-5'},
+    'runId': RUN_ID,
+    'status': 'starting',
+}
+"""``t3_thread_launch``'s success; ``runId`` and ``status`` may be null."""
+
+THREAD_LIST_JSON: dict[str, Any] = {
+    'projectId': PROJECT_ID,
+    'currentThreadId': None,
+    'threads': [],
+    'nextCursor': None,
+    'total': 0,
+}
+"""``t3_thread_list``'s ``OrchestratorMcpThreadListResult`` for a project with no active thread."""
 
 THREAD_LIST_ITEM_JSON: dict[str, Any] = {
     'threadId': THREAD_ID,
+    'projectId': PROJECT_ID,
     'title': 'unblock:df#7489 t3-lane',
     'createdBy': 'user',
     'creationSource': 'mcp',
@@ -63,10 +107,10 @@ THREAD_LIST_ITEM_JSON: dict[str, Any] = {
     'createdAt': '2026-10-25T08:04:00.000Z',
     'updatedAt': '2026-10-25T08:05:43.000Z',
 }
-"""One element of ``t3 thread list --json``, which prints a bare JSON ARRAY of these
-(``OrchestratorMcpThreadListItem``); archived threads are never listed. ``status`` is
-``idle`` or a run status: preparing|queued|starting|running|waiting|completed|
-interrupted|failed|cancelled|rolled_back."""
+"""One ``OrchestratorMcpThreadListItem``; the fake CLI's ``thread list --json`` prints a
+bare array of these, and archived threads are never listed. ``status`` is ``idle``
+or a run status: preparing|queued|starting|running|waiting|completed|interrupted|
+failed|cancelled|rolled_back."""
 
 THREAD_SHOW_JSON: dict[str, Any] = {
     'thread': {
@@ -83,15 +127,8 @@ THREAD_SHOW_JSON: dict[str, Any] = {
     },
     'messages': [],
 }
-"""``t3 thread show <id> --json``: ``{thread: OrchestratorMcpThreadDetail, messages}``
+"""The fake CLI's ``thread show <id> --json``: ``{thread: OrchestratorMcpThreadDetail, messages}``
 (detail abridged to the fields the lane reads, ``archived`` among them)."""
-
-PROJECTS_TABLE_SQL = (
-    'CREATE TABLE projection_projects (project_id TEXT PRIMARY KEY, title TEXT NOT NULL, '
-    'workspace_root TEXT NOT NULL, deleted_at TEXT)'
-)
-"""The columns of ``$T3CODE_HOME/userdata/statev2.sqlite`` table ``projection_projects``
-that ``launch`` reads for the registered project roots."""
 
 SERVER_RUNTIME_JSON: dict[str, Any] = {
     'version': 1,
@@ -100,12 +137,11 @@ SERVER_RUNTIME_JSON: dict[str, Any] = {
     'origin': DEAD_ORIGIN,
     'startedAt': '2026-10-23T09:09:43.139Z',
     'serviceManaged': True,
-    'serverVersion': '0.1.2',
+    'serverVersion': '0.1.6',
 }
 """``$T3CODE_HOME/userdata/server-runtime.json`` as the live server writes it, but
-naming an origin nothing answers: a ``pair`` or ``status`` test that forgets
-:func:`point_runtime_at` fails as descriptor-unreachable instead of pairing with
-the workstation's real T3 on :3773."""
+naming an origin nothing answers: a test that forgets :func:`point_runtime_at`
+fails as descriptor-unreachable instead of reaching the workstation's real T3 on :3773."""
 
 FAKE_T3_SOURCE = textwrap.dedent(
     '''\
@@ -155,6 +191,14 @@ def listed(**overrides: Any) -> dict[str, Any]:
     return {**THREAD_LIST_ITEM_JSON, **overrides}
 
 
+def project(root: Path | str, **overrides: Any) -> dict[str, Any]:
+    return {**PROJECT_JSON, 'workspaceRoot': str(root), **overrides}
+
+
+def projects_page(*projects: dict[str, Any], next_cursor: int | None = None) -> ToolSuccess:
+    return ToolSuccess({'projects': list(projects), 'nextCursor': next_cursor})
+
+
 @dataclass
 class FakeT3:
     script_path: Path
@@ -170,8 +214,40 @@ class FakeT3:
         return [entry for entry in entries if entry['argv'][1:2] == [verb]]
 
 
+@dataclass
+class Env:
+    project: Path
+    t3_home: Path
+    fleet: Path
+    projects_dir: Path
+
+
+def path_without_t3() -> str:
+    """PATH minus every directory holding a ``t3``, so a self-pair never reaches the workstation's real one."""
+    dirs = os.environ.get('PATH', '').split(os.pathsep)
+    return os.pathsep.join(d for d in dirs if d and not (Path(d) / 't3').exists())
+
+
 @pytest.fixture
-def fake_t3(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeT3:
+def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Env:
+    project_dir = tmp_path / 'proj'
+    (project_dir / 'sub').mkdir(parents=True)
+    t3_home = tmp_path / 't3home'
+    userdata = t3_home / 'userdata'
+    userdata.mkdir(parents=True)
+    (userdata / 'server-runtime.json').write_text(json.dumps(SERVER_RUNTIME_JSON))
+    fleet = tmp_path / 'fleet'
+    projects_dir = tmp_path / 'claude-projects'
+    monkeypatch.setenv('T3CODE_HOME', str(t3_home))
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(fleet))
+    monkeypatch.setenv('CLAUDE_PROJECTS_DIR', str(projects_dir))
+    monkeypatch.setenv('SPAWN_T3_POLL_SECS', '0')
+    monkeypatch.setenv('PATH', path_without_t3())
+    return Env(project_dir, t3_home, fleet, projects_dir)
+
+
+@pytest.fixture
+def fake_t3(env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeT3:
     bin_dir = tmp_path / 'bin'
     bin_dir.mkdir()
     executable = bin_dir / 't3'
@@ -185,36 +261,61 @@ def fake_t3(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeT3:
     return fake
 
 
-@dataclass
-class Env:
-    project: Path
-    t3_home: Path
-    fleet: Path
-    projects_dir: Path
+@pytest.fixture
+def t3_server() -> Iterator[FakeT3Server]:
+    with FakeT3Server.running() as server:
+        yield server
+
+
+def point_runtime_at(env: Env, server: FakeT3Server) -> None:
+    """Make server-runtime.json name the fake server, never the host's real :3773."""
+    write_runtime_origin(env, server.origin)
+
+
+def write_runtime_origin(env: Env, origin: object) -> None:
+    runtime = {**SERVER_RUNTIME_JSON, 'origin': origin}
+    (env.t3_home / 'userdata' / 'server-runtime.json').write_text(json.dumps(runtime))
+
+
+def remove_runtime(env: Env) -> None:
+    (env.t3_home / 'userdata' / 'server-runtime.json').unlink()
+
+
+def seed_credential(env: Env, server: FakeT3Server, *, access_token: str | None = None) -> None:
+    """This host's credential for ``server``, on a bearer it issued unless ``access_token`` is given."""
+    paired_at = datetime.now(UTC).replace(microsecond=0)
+    credential = t3_mcp_client.Credential(
+        schema_version=t3_mcp_client.CREDENTIAL_SCHEMA_VERSION,
+        origin=server.origin,
+        environment_id=server.environment_id,
+        server_version=server.server_version,
+        access=t3_mcp_client.ACCESS,
+        client_id='mcp-client-1',
+        access_token=access_token if access_token is not None else server.issue_token(),
+        expires_at=paired_at + timedelta(days=30),
+        paired_at=paired_at,
+        paired_by=t3_mcp_client.PairedBy.SELF_PAIR,
+    )
+    t3_mcp_client.write_credential(credential, root=env.fleet)
+
+
+def stored_credential(env: Env) -> t3_mcp_client.Credential:
+    credential = t3_mcp_client.read_credential_status(ENVIRONMENT_ID, root=env.fleet).credential
+    assert credential is not None
+    return credential
 
 
 @pytest.fixture
-def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Env:
-    project = tmp_path / 'proj'
-    (project / 'sub').mkdir(parents=True)
-    t3_home = tmp_path / 't3home'
-    userdata = t3_home / 'userdata'
-    userdata.mkdir(parents=True)
-    (userdata / 'server-runtime.json').write_text(json.dumps(SERVER_RUNTIME_JSON))
-    with sqlite3.connect(userdata / 'statev2.sqlite') as connection:
-        connection.execute(PROJECTS_TABLE_SQL)
-        connection.execute(
-            'INSERT INTO projection_projects VALUES (?, ?, ?, NULL)',
-            (PROJECT_ID, 'proj', str(project)),
-        )
-    connection.close()
-    fleet = tmp_path / 'fleet'
-    projects_dir = tmp_path / 'claude-projects'
-    monkeypatch.setenv('T3CODE_HOME', str(t3_home))
-    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(fleet))
-    monkeypatch.setenv('CLAUDE_PROJECTS_DIR', str(projects_dir))
-    monkeypatch.setenv('SPAWN_T3_POLL_SECS', '0')
-    return Env(project, t3_home, fleet, projects_dir)
+def t3(env: Env, t3_server: FakeT3Server) -> FakeT3Server:
+    """The fake T3 the runtime names, this host paired with it, one live project at ``env.project``."""
+    point_runtime_at(env, t3_server)
+    seed_credential(env, t3_server)
+    t3_server.tool_replies |= {
+        't3_project_list': projects_page(project(env.project)),
+        't3_thread_launch': ToolSuccess(THREAD_LAUNCH_JSON),
+        't3_thread_list': ToolSuccess(THREAD_LIST_JSON),
+    }
+    return t3_server
 
 
 def run_verb(capsys: pytest.CaptureFixture[str], *argv: str) -> str:
@@ -245,6 +346,21 @@ def prompt_file(tmp_path: Path, text: str) -> str:
     return str(path)
 
 
+def launch_line(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path, cwd: Path | str, *flags: str,
+    record: str = '', title: str = 't', prompt: str = 'p',
+) -> str:
+    return run_verb(
+        capsys, 'launch', '--cwd', str(cwd), '--title', title,
+        '--prompt-file', prompt_file(tmp_path, prompt), '--record', record, *flags,
+    )
+
+
+def sent_launch(server: FakeT3Server) -> dict[str, Any]:
+    [arguments] = server.tool_calls('t3_thread_launch')
+    return arguments
+
+
 PROXY_SETTINGS: dict[str, Any] = {
     'defaultModelSelection': {'instanceId': 'claude-proxy', 'model': 'claude-opus-5-5'},
     'providerInstances': {
@@ -254,6 +370,11 @@ PROXY_SETTINGS: dict[str, Any] = {
 }
 """``$T3CODE_HOME/userdata/settings.json`` on a host whose only enabled Claude instance
 is ``claude-proxy`` (v0.1.6 shapes, abridged)."""
+
+PROJECT_DISABLES_PROXY: dict[str, Any] = {
+    **PROXY_SETTINGS,
+    'projectSettingsOverrides': {PROJECT_ID: {'providerInstances': {'claude-proxy': {'enabled': False}}}},
+}
 
 
 def write_settings(env: Env, settings: dict[str, Any]) -> None:
@@ -267,7 +388,7 @@ def write_settings(env: Env, settings: dict[str, Any]) -> None:
 
 class TestProvider:
     def test_the_projects_live_instance_is_named_with_its_source(
-        self, env: Env, capsys: pytest.CaptureFixture[str]
+        self, env: Env, t3: FakeT3Server, capsys: pytest.CaptureFixture[str]
     ) -> None:
         write_settings(env, PROXY_SETTINGS)
 
@@ -276,7 +397,7 @@ class TestProvider:
         assert line == 'instance instance_id=claude-proxy source=project'
 
     def test_a_disabled_explicit_instance_is_refused(
-        self, env: Env, capsys: pytest.CaptureFixture[str]
+        self, env: Env, t3: FakeT3Server, capsys: pytest.CaptureFixture[str]
     ) -> None:
         write_settings(env, PROXY_SETTINGS)
 
@@ -286,18 +407,28 @@ class TestProvider:
 
         assert line == 'refused reason=provider-disabled instance_id=claudeAgent source=explicit'
 
-    def test_a_project_disable_is_read_through_the_project_store(
-        self, env: Env, capsys: pytest.CaptureFixture[str]
+    def test_a_project_disable_is_read_through_the_project_list(
+        self, env: Env, t3: FakeT3Server, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        overrides = {PROJECT_ID: {'providerInstances': {'claude-proxy': {'enabled': False}}}}
-        write_settings(env, {**PROXY_SETTINGS, 'projectSettingsOverrides': overrides})
+        write_settings(env, PROJECT_DISABLES_PROXY)
 
         line = run_verb(capsys, 'provider', '--cwd', str(env.project))
 
         assert line == 'refused reason=provider-disabled instance_id=claudeAgent source=fallback'
+        assert t3.tool_calls('t3_project_list') == [{'limit': 100}]
+
+    def test_without_a_credential_enablement_is_checked_environment_wide(
+        self, env: Env, t3_server: FakeT3Server, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        point_runtime_at(env, t3_server)
+        write_settings(env, PROJECT_DISABLES_PROXY)
+
+        line = run_verb(capsys, 'provider', '--cwd', str(env.project))
+
+        assert line == 'instance instance_id=claude-proxy source=project'
 
     def test_no_settings_falls_back_to_claude_agent_unverified(
-        self, env: Env, capsys: pytest.CaptureFixture[str]
+        self, env: Env, t3: FakeT3Server, capsys: pytest.CaptureFixture[str]
     ) -> None:
         line = run_verb(capsys, 'provider', '--cwd', str(env.project))
 
@@ -409,108 +540,115 @@ class TestDetectWithAFakeProc:
 
 
 class TestLaunch:
-    def test_started_sends_the_prompt_and_stamps_the_record(
-        self, env: Env, fake_t3: FakeT3, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    def test_started_sends_the_launch_request_and_stamps_the_record(
+        self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        fake_t3.script(start=[ok(THREAD_START_JSON)])
         record_dir = spawn_record(env)
 
-        line = run_verb(
-            capsys, 'launch', '--cwd', str(env.project), '--title', 'unblock:df#7489 x',
-            '--prompt-file', prompt_file(tmp_path, 'do the thing'), '--record', record_dir,
-            '--model', 'opus',
+        line = launch_line(
+            capsys, tmp_path, env.project, '--skip-permissions', '--model', 'opus',
+            record=record_dir, title='unblock:df#7489 x', prompt='do the thing',
         )
 
         assert line == f'started thread_id={THREAD_ID} project_id={PROJECT_ID} run_id={RUN_ID}'
-        [call] = fake_t3.calls('start')
-        assert call['argv'] == [
-            'thread', 'start', '--json', '--title', 'unblock:df#7489 x',
-            '--provider', 'claudeAgent', '--model', 'opus', str(env.project), '-',
+        assert t3.tool_calls('t3_thread_launch') == [
+            {
+                'projectId': PROJECT_ID,
+                'title': 'unblock:df#7489 x',
+                'message': 'do the thing',
+                'modelSelection': {'instanceId': 'claudeAgent', 'model': 'opus'},
+                'runtimeMode': 'full-access',
+                'workspaceStrategy': {'type': 'root'},
+                'clientRequestId': 'unblock-df-7489-4242',
+            }
         ]
-        assert call['stdin'] == 'do the thing'
         record = sr.read_record(Path(record_dir).name, root=env.fleet)
         assert record.status == sr.Status.RUNNING
         assert record.display == sr.Display(
-            kind='t3', wm_title='unblock:df#7489 x', t3_thread_id=THREAD_ID
+            kind='t3', wm_title='unblock:df#7489 x', t3_thread_id=THREAD_ID,
+            t3_environment_id=ENVIRONMENT_ID,
         )
+
+    @pytest.mark.parametrize(
+        ('flags', 'runtime_mode'),
+        [(['--skip-permissions'], 'full-access'), ([], 'approval-required')],
+        ids=['skip-permissions', 'approvals'],
+    )
+    @pytest.mark.parametrize('in_worktree', [False, True], ids=['root', 'worktree'])
+    def test_the_runtime_mode_follows_the_flag_and_the_workspace_follows_the_cwd(
+        self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+        flags: list[str], runtime_mode: str, in_worktree: bool,
+    ) -> None:
+        worktree = env.project / '.worktrees' / '8123'
+        worktree.mkdir(parents=True)
+
+        line = launch_line(capsys, tmp_path, worktree if in_worktree else env.project, *flags)
+
+        assert line.startswith('started ')
+        strategy = {'type': 'existing_worktree', 'worktreePath': str(worktree)} if in_worktree else {'type': 'root'}
+        sent = sent_launch(t3)
+        assert (sent['runtimeMode'], sent['workspaceStrategy']) == (runtime_mode, strategy)
+
+    def test_no_model_sends_no_model_selection(
+        self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        launch_line(capsys, tmp_path, env.project)
+
+        assert 'modelSelection' not in sent_launch(t3)
+
+    def test_without_a_record_each_launch_gets_its_own_request_id(
+        self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        t3.tool_replies['t3_thread_launch'] = ToolSuccess({**THREAD_LAUNCH_JSON, 'runId': None})
+
+        first = launch_line(capsys, tmp_path, env.project)
+        launch_line(capsys, tmp_path, env.project)
+
+        assert first == f'started thread_id={THREAD_ID} project_id={PROJECT_ID} run_id=none'
+        request_ids = [call['clientRequestId'] for call in t3.tool_calls('t3_thread_launch')]
+        assert all(isinstance(key, str) and key for key in request_ids)
+        assert len(set(request_ids)) == 2
 
     @pytest.mark.parametrize(
         ('parent_args', 'expected'),
         [(['--parent', 'watcher-df-9'], 'watcher-df-9'), ([], None), (['--parent', '../x'], None)],
     )
     def test_parent_is_stamped_only_when_given_as_a_record_key(
-        self, env: Env, fake_t3: FakeT3, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+        self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str],
         parent_args: list[str], expected: str | None,
     ) -> None:
-        fake_t3.script(start=[ok(THREAD_START_JSON)])
         record_dir = spawn_record(env)
 
-        line = run_verb(
-            capsys, 'launch', '--cwd', str(env.project), '--title', 't',
-            '--prompt-file', prompt_file(tmp_path, 'p'), '--record', record_dir, *parent_args,
-        )
+        line = launch_line(capsys, tmp_path, env.project, *parent_args, record=record_dir)
 
         assert line.startswith('started ')
         record = sr.read_record(Path(record_dir).name, root=env.fleet)
         assert (record.parent_session_id, record.status) == (expected, sr.Status.RUNNING)
         assert record.display is not None and record.display.t3_thread_id == THREAD_ID
 
-    def test_a_null_run_id_and_no_record(
-        self, env: Env, fake_t3: FakeT3, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        fake_t3.script(start=[ok({**THREAD_START_JSON, 'runId': None})])
-
-        line = run_verb(
-            capsys, 'launch', '--cwd', str(env.project), '--title', 't',
-            '--prompt-file', prompt_file(tmp_path, 'p'), '--record', '',
-        )
-
-        assert line == f'started thread_id={THREAD_ID} project_id={PROJECT_ID} run_id=none'
-        assert '--model' not in fake_t3.calls('start')[0]['argv']
-
     def test_a_model_runs_on_the_projects_live_claude_instance(
-        self, env: Env, fake_t3: FakeT3, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+        self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         write_settings(env, PROXY_SETTINGS)
-        fake_t3.script(start=[ok(THREAD_START_JSON)])
 
-        line = run_verb(
-            capsys, 'launch', '--cwd', str(env.project), '--title', 't',
-            '--prompt-file', prompt_file(tmp_path, 'p'), '--record', '', '--model', 'fable',
-        )
+        line = launch_line(capsys, tmp_path, env.project, '--model', 'fable')
 
         assert line.startswith('started ')
-        argv = fake_t3.calls('start')[0]['argv']
-        assert argv[argv.index('--provider') + 1 :][:3] == ['claude-proxy', '--model', 'fable']
+        assert sent_launch(t3)['modelSelection'] == {'instanceId': 'claude-proxy', 'model': 'fable'}
 
     def test_a_disabled_explicit_instance_is_refused_before_any_start(
-        self, env: Env, fake_t3: FakeT3, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+        self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         write_settings(env, PROXY_SETTINGS)
         record_dir = spawn_record(env)
 
-        line = run_verb(
-            capsys, 'launch', '--cwd', str(env.project), '--title', 't',
-            '--prompt-file', prompt_file(tmp_path, 'p'), '--record', record_dir,
-            '--model', 'fable', '--provider', 'claudeAgent',
+        line = launch_line(
+            capsys, tmp_path, env.project, '--model', 'fable', '--provider', 'claudeAgent', record=record_dir
         )
 
         assert line == 'refused reason=provider-disabled instance_id=claudeAgent source=explicit'
-        assert fake_t3.calls('start') == [] and fake_t3.calls('list') == []
+        assert t3.tool_calls('t3_thread_launch') == [] and t3.tool_calls('t3_thread_list') == []
         assert sr.read_record(Path(record_dir).name, root=env.fleet).display is None
-
-    def test_no_t3_on_path_is_no_launcher(
-        self, env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        monkeypatch.setenv('PATH', str(tmp_path / 'empty'))
-
-        line = run_verb(
-            capsys, 'launch', '--cwd', str(env.project), '--title', 't',
-            '--prompt-file', prompt_file(tmp_path, 'p'), '--record', '',
-        )
-
-        assert line == 'no-launcher reason=t3-missing'
 
     def test_no_server_runtime_is_no_launcher(
         self, env: Env, fake_t3: FakeT3, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -525,163 +663,149 @@ class TestLaunch:
         assert line == 'no-launcher reason=server-runtime-missing'
         assert fake_t3.calls('start') == []
 
-    def test_a_cwd_inside_a_project_is_refused_naming_its_root(
-        self, env: Env, fake_t3: FakeT3, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        line = run_verb(
-            capsys, 'launch', '--cwd', str(env.project / 'sub'), '--title', 't',
-            '--prompt-file', prompt_file(tmp_path, 'p'), '--record', '',
-        )
-
-        assert line == f'refused reason=cwd-not-project-root detail={env.project.resolve()}'
-        assert fake_t3.calls('start') == []
-
-    def test_a_cwd_outside_every_project_is_refused(
-        self, env: Env, fake_t3: FakeT3, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        line = run_verb(
-            capsys, 'launch', '--cwd', str(tmp_path), '--title', 't',
-            '--prompt-file', prompt_file(tmp_path, 'p'), '--record', '',
-        )
-
-        assert line == 'refused reason=cwd-not-project-root detail=none'
-
-    def test_an_unreadable_project_store_is_refused_as_unverifiable(
-        self, env: Env, fake_t3: FakeT3, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        (env.t3_home / 'userdata' / 'statev2.sqlite').unlink()
-
-        line = run_verb(
-            capsys, 'launch', '--cwd', str(env.project), '--title', 't',
-            '--prompt-file', prompt_file(tmp_path, 'p'), '--record', '',
-        )
-
-        assert line == 'refused reason=cwd-not-project-root detail=unverifiable'
-
-    def test_a_failed_start_with_no_thread_afterwards_is_launch_failed(
-        self, env: Env, fake_t3: FakeT3, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        stale = listed(title='t', createdAt='2020-01-01T00:00:00.000Z')
-        fake_t3.script(start=[unreachable()], list=[ok([stale])])
-
-        line = run_verb(
-            capsys, 'launch', '--cwd', str(env.project), '--title', 't',
-            '--prompt-file', prompt_file(tmp_path, 'p'), '--record', '',
-        )
-
-        assert line == 'launch-failed'
-        assert len(fake_t3.calls('list')) == 2
-
-    def test_a_malformed_listing_skips_the_sweep_but_not_the_launch(
-        self, env: Env, fake_t3: FakeT3, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        fake_t3.script(start=[ok(THREAD_START_JSON)], list=[ok([{'title': 'no thread id'}])])
-
-        line = run_verb(
-            capsys, 'launch', '--cwd', str(env.project), '--title', 't',
-            '--prompt-file', prompt_file(tmp_path, 'p'), '--record', '',
-        )
-
-        assert line.startswith('started ')
-        with pytest.raises(lane.T3CommandFailed):
-            lane.list_threads(str(env.project))
-
-    def test_two_threads_with_the_title_since_the_launch_is_launch_failed(
-        self, env: Env, fake_t3: FakeT3, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        just_now = (datetime.now(UTC) + timedelta(seconds=5)).isoformat()
-        twins = [listed(title='t', createdAt=just_now), listed(threadId='twin', title='t', createdAt=just_now)]
-        fake_t3.script(start=[unreachable()], list=[ok(twins)])
-
-        line = run_verb(
-            capsys, 'launch', '--cwd', str(env.project), '--title', 't',
-            '--prompt-file', prompt_file(tmp_path, 'p'), '--record', '',
-        )
-
-        assert line == 'launch-failed'
-
     def test_launch_first_sweeps_the_projects_records_whose_thread_is_gone(
-        self, env: Env, fake_t3: FakeT3, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+        self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         stale_dir = spawn_record(env, 'sibling-df-1-1')
         sr.update_display('sibling-df-1-1', root=env.fleet, kind='t3', t3_thread_id='th-vanished')
         time.sleep(0.01)
-        fake_t3.script(start=[ok(THREAD_START_JSON)], list=[ok([listed()])])
 
-        run_verb(
-            capsys, 'launch', '--cwd', str(env.project), '--title', 't',
-            '--prompt-file', prompt_file(tmp_path, 'p'), '--record', '',
-        )
+        launch_line(capsys, tmp_path, env.project)
 
         stale = sr.read_record(Path(stale_dir).name, root=env.fleet)
         assert (stale.status, stale.exit_code) == (sr.Status.EXITED, sr.ORPHAN_EXIT_CODE)
+        assert t3.tool_calls('t3_thread_list') == [{'projectId': PROJECT_ID, 'limit': 100}]
 
-    def test_a_failure_after_the_send_finds_the_launched_thread(
-        self, env: Env, fake_t3: FakeT3, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    def test_an_incomplete_thread_listing_sweeps_nothing(
+        self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        just_now = (datetime.now(UTC) + timedelta(seconds=5)).isoformat()
-        fake_t3.script(
-            start=[unreachable()], list=[ok([listed(title='other'), listed(title='t', createdAt=just_now)])]
-        )
-        record_dir = spawn_record(env)
-
-        line = run_verb(
-            capsys, 'launch', '--cwd', str(env.project), '--title', 't',
-            '--prompt-file', prompt_file(tmp_path, 'p'), '--record', record_dir,
+        stale_dir = spawn_record(env, 'sibling-df-1-1')
+        sr.update_display('sibling-df-1-1', root=env.fleet, kind='t3', t3_thread_id='th-vanished')
+        time.sleep(0.01)
+        t3.tool_replies['t3_thread_list'] = replies_in_turn(
+            ToolSuccess({**THREAD_LIST_JSON, 'nextCursor': 1}), ToolFailure('orchestration_error', 'page lost')
         )
 
-        assert line == f'started thread_id={THREAD_ID} project_id={PROJECT_ID} run_id={RUN_ID}'
-        record = sr.read_record(Path(record_dir).name, root=env.fleet)
-        assert record.display is not None and record.display.t3_thread_id == THREAD_ID
+        line = launch_line(capsys, tmp_path, env.project)
+
+        assert line.startswith('started ')
+        assert len(t3.tool_calls('t3_thread_list')) == 2
+        assert sr.read_record(Path(stale_dir).name, root=env.fleet).status == sr.Status.LAUNCHING
 
     def test_a_prompt_over_the_ceiling_is_spilled_into_the_record_dir(
-        self, env: Env, fake_t3: FakeT3, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+        self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        fake_t3.script(start=[ok(THREAD_START_JSON)])
         record_dir = spawn_record(env)
         big = 'x' * (lane.MESSAGE_CHAR_LIMIT + 1)
 
-        run_verb(
-            capsys, 'launch', '--cwd', str(env.project), '--title', 't',
-            '--prompt-file', prompt_file(tmp_path, big), '--record', record_dir,
-        )
+        launch_line(capsys, tmp_path, env.project, record=record_dir, prompt=big)
 
         spill = Path(record_dir) / 'prompt.md'
         assert spill.read_text() == big
-        assert fake_t3.calls('start')[0]['stdin'] == (
+        assert sent_launch(t3)['message'] == (
             f'Read {spill} and follow it as your brief; that file holds your whole task.'
         )
 
     def test_a_prompt_at_the_ceiling_is_sent_whole(
-        self, env: Env, fake_t3: FakeT3, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+        self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        fake_t3.script(start=[ok(THREAD_START_JSON)])
         exact = 'y' * lane.MESSAGE_CHAR_LIMIT
 
-        run_verb(
-            capsys, 'launch', '--cwd', str(env.project), '--title', 't',
-            '--prompt-file', prompt_file(tmp_path, exact), '--record', '',
-        )
+        launch_line(capsys, tmp_path, env.project, prompt=exact)
 
-        assert fake_t3.calls('start')[0]['stdin'] == exact
+        assert sent_launch(t3)['message'] == exact
 
     def test_a_spill_without_a_record_goes_to_a_temp_file(
-        self, env: Env, fake_t3: FakeT3, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+        self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        fake_t3.script(start=[ok(THREAD_START_JSON)])
         big = 'z' * (lane.MESSAGE_CHAR_LIMIT + 1)
 
-        run_verb(
-            capsys, 'launch', '--cwd', str(env.project), '--title', 't',
-            '--prompt-file', prompt_file(tmp_path, big), '--record', '',
-        )
+        launch_line(capsys, tmp_path, env.project, prompt=big)
 
-        message = fake_t3.calls('start')[0]['stdin']
+        message = sent_launch(t3)['message']
         spill = Path(message.removeprefix('Read ').split(' and follow')[0])
         try:
             assert spill.read_text() == big
         finally:
             spill.unlink()
+
+
+@dataclass
+class PagedProjects:
+    worktree: Path
+    archived: Path
+    pages: dict[int | None, ToolAnswer]
+    """``t3_project_list``'s reply by the call's ``cursor``."""
+
+
+@pytest.fixture
+def paged(env: Env, t3: FakeT3Server, tmp_path: Path) -> PagedProjects:
+    """Three pages: a deleted project at the worktree, an archived one elsewhere, then the live one."""
+    worktree = env.project / '.worktrees' / '8123'
+    worktree.mkdir(parents=True)
+    archived = tmp_path / 'archived'
+    (archived / 'sub').mkdir(parents=True)
+    pages: dict[int | None, ToolAnswer] = {
+        None: projects_page(
+            project(worktree, id='deleted-project', deletedAt='2026-10-30T00:00:00.000Z'), next_cursor=1
+        ),
+        1: projects_page(
+            project(archived, id='archived-project', archivedAt='2026-10-30T00:00:00.000Z'), next_cursor=2
+        ),
+        2: projects_page(project(env.project)),
+    }
+    t3.tool_replies['t3_project_list'] = lambda arguments: pages[arguments.get('cursor')]
+    return PagedProjects(worktree, archived, pages)
+
+
+class TestProjectResolution:
+    def test_every_page_is_read_and_the_live_project_takes_its_worktree(
+        self, t3: FakeT3Server, paged: PagedProjects, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        line = launch_line(capsys, tmp_path, paged.worktree)
+
+        assert line == f'started thread_id={THREAD_ID} project_id={PROJECT_ID} run_id={RUN_ID}'
+        assert t3.tool_calls('t3_project_list') == [
+            {'limit': 100}, {'limit': 100, 'cursor': 1}, {'limit': 100, 'cursor': 2}
+        ]
+        sent = sent_launch(t3)
+        assert (sent['projectId'], sent['workspaceStrategy']) == (
+            PROJECT_ID, {'type': 'existing_worktree', 'worktreePath': str(paged.worktree)}
+        )
+
+    def test_a_cwd_only_an_archived_project_contains_is_refused_naming_its_root(
+        self, env: Env, t3: FakeT3Server, paged: PagedProjects, tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        record_dir = spawn_record(env)
+
+        line = launch_line(capsys, tmp_path, paged.archived / 'sub', record=record_dir)
+
+        assert line == lane._verdict('refused', reason='project-archived', detail=os.path.realpath(paged.archived))
+        assert t3.tool_calls('t3_thread_launch') == []
+        assert sr.read_record(Path(record_dir).name, root=env.fleet).display is None
+
+    def test_a_cwd_outside_every_project_is_refused(
+        self, t3: FakeT3Server, paged: PagedProjects, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        line = launch_line(capsys, tmp_path, tmp_path)
+
+        assert line == 'refused reason=cwd-outside-projects'
+        assert t3.tool_calls('t3_thread_launch') == []
+
+    @pytest.mark.parametrize(
+        'lost_page', [ToolFailure('orchestration_error', 'page lost'), HANG_UP], ids=['tool-failure', 'hang-up']
+    )
+    def test_a_project_page_that_fails_is_launch_failed(
+        self, t3: FakeT3Server, paged: PagedProjects, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+        lost_page: ToolAnswer,
+    ) -> None:
+        paged.pages[1] = lost_page
+
+        line = launch_line(capsys, tmp_path, paged.worktree)
+
+        assert line.split()[0] == 'launch-failed'
+        assert t3.tool_calls('t3_thread_launch') == []
 
 
 # ---------------------------------------------------------------------------
@@ -1154,22 +1278,19 @@ class TestSelfRecord:
 
 
 def test_a_path_with_a_space_is_percent_escaped(
-    env: Env, fake_t3: FakeT3, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    spaced = env.project / 'with space'
+    spaced = tmp_path / 'with space'
     spaced.mkdir()
 
-    line = run_verb(
-        capsys, 'launch', '--cwd', str(spaced), '--title', 't',
-        '--prompt-file', prompt_file(tmp_path, 'p'), '--record', '',
-    )
+    line = launch_line(capsys, tmp_path, spaced)
 
-    assert line == f'refused reason=cwd-not-project-root detail={env.project.resolve()}'
+    assert line == 'refused reason=cwd-outside-projects'
     assert lane._verdict('x', detail='/a b') == 'x detail=/a%20b'
 
 
 def test_an_internal_fault_exits_3_with_nothing_on_stdout(
-    env: Env, fake_t3: FakeT3, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     rc = lane.main([
         'launch', '--cwd', str(env.project), '--title', 't',
@@ -1193,32 +1314,6 @@ def test_the_module_runs_by_path_with_only_pythonpath(tmp_path: Path) -> None:
     )
 
     assert (completed.returncode, completed.stdout) == (0, 'not-t3\n'), completed.stderr
-
-
-@pytest.fixture
-def t3_server() -> Iterator[FakeT3Server]:
-    with FakeT3Server.running() as server:
-        yield server
-
-
-def point_runtime_at(env: Env, server: FakeT3Server) -> None:
-    """Make server-runtime.json name the fake server, never the host's real :3773."""
-    write_runtime_origin(env, server.origin)
-
-
-def write_runtime_origin(env: Env, origin: object) -> None:
-    runtime = {**SERVER_RUNTIME_JSON, 'origin': origin}
-    (env.t3_home / 'userdata' / 'server-runtime.json').write_text(json.dumps(runtime))
-
-
-def remove_runtime(env: Env) -> None:
-    (env.t3_home / 'userdata' / 'server-runtime.json').unlink()
-
-
-def stored_credential(env: Env) -> t3_mcp_client.Credential:
-    credential = t3_mcp_client.read_credential_status(ENVIRONMENT_ID, root=env.fleet).credential
-    assert credential is not None
-    return credential
 
 
 class TestPairAndStatus:
