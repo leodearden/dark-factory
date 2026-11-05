@@ -152,7 +152,9 @@ def lanes_tree(
         ),
         # Row 16: the moving inputs.
         'started_13d': Scenario({201: task('pending')}, started={201: ago(13)}),
-        'started_15d': Scenario({211: task('pending')}, started={211: ago(15)}),
+        'started_15d': Scenario(
+            {211: task('pending', pending_since=ago(20).isoformat())}, started={211: ago(15)},
+        ),
         'done_completed_in_window': Scenario(
             {221: task('done'), 222: task('pending')}, completed={221: ago(5)},
         ),
@@ -189,6 +191,14 @@ def lanes_tree(
                 'pending', pending_since=ago(43).isoformat(), pending_since_backfilled=True,
             ),
             352: task('pending', pending_since=ago(10).isoformat()),
+        }),
+        # The stuck row's prose, next action and attention order.
+        'blocked_by_other_prd': Scenario({
+            361: LaneTask('pending', {}, dependencies=(OUTSIDE_DEPENDENCY, 131)),
+            362: LaneTask('pending', {}, dependencies=(361,)),
+        }),
+        'stuck_high': Scenario({
+            371: LaneTask('pending', {'pending_since': ago(5).isoformat()}, priority='high'),
         }),
     }
     return MappingProxyType({

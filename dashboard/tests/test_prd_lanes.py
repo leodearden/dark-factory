@@ -7,10 +7,11 @@ liveness is read from /proc (boundary rows 13, 14, 16, 17 and 18).
 
 from __future__ import annotations
 
+import dataclasses
 import subprocess
 import sys
 from collections import Counter
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from datetime import UTC, datetime, timedelta
 from types import MappingProxyType
 from typing import Any
@@ -27,6 +28,7 @@ from dashboard.data.deferral_summary import read_liveness, session_holders
 from dashboard.data.escalation_corpus import HUMAN_LEVEL
 from dashboard.data.prd_attribution import lineage_entry
 from dashboard.data.prd_view import (
+    FIGURE_RULES,
     LANE_DISPLAY_ORDER,
     LANE_LABELS,
     LANE_PRECEDENCE,
@@ -36,10 +38,14 @@ from dashboard.data.prd_view import (
     Lane,
     MilestoneStatus,
     PrdDocument,
+    PrdView,
+    PrdViewContractError,
     PrdViewInputs,
+    PrdViewInvariant,
     TaskActivity,
     build_prd_view,
     milestone_status,
+    validate_prd_view,
 )
 
 NOW = datetime(2026, 11, 5, 12, 0, tzinfo=UTC)
@@ -140,10 +146,15 @@ def lanes_inputs(tree: Mapping[str, Scenario]) -> PrdViewInputs:
 
 
 @pytest.fixture(scope='module')
-def wire(tree) -> dict[str, Any]:
+def view(tree) -> PrdView:
     datum = build_prd_view(lanes_inputs(tree), now=NOW)
     assert datum.value is not None, datum.reason
-    return datum.value.to_wire()
+    return datum.value
+
+
+@pytest.fixture(scope='module')
+def wire(view) -> dict[str, Any]:
+    return view.to_wire()
 
 
 def row(wire: Mapping[str, Any], tree: Mapping[str, Scenario], name: str) -> dict[str, Any]:
@@ -323,3 +334,250 @@ def test_a_stuck_rows_ready_age_runs_from_its_oldest_anchor_as_a_lower_bound(wir
         'count': 2, 'oldest_task_id': 351, 'oldest_pending_days': 43,
         'oldest_is_lower_bound': True,
     }
+
+
+# ---------------------------------------------------------------------------
+# Rows 12, 17, 18: each row's state line, next action and detail
+# ---------------------------------------------------------------------------
+
+
+def lines_of(wire: Mapping[str, Any], tree: Mapping[str, Scenario], *names: str) -> dict[str, str]:
+    return {name: row(wire, tree, name)['state_line'] for name in names}
+
+
+def test_a_ruling_line_names_the_escalation_else_the_gate(wire, tree):
+    assert lines_of(wire, tree, 'ruling_over_tail', 'gate_deps_met', 'gate_blocked') == {
+        'ruling_over_tail': 'awaits ruling on esc-102-1 (#102)',
+        'gate_deps_met': 'awaits ruling on gate #142',
+        'gate_blocked': 'awaits ruling on gate #151',
+    }
+
+
+def test_a_tail_line_counts_the_open_follow_ups(wire, tree):
+    assert row(wire, tree, 'tail_over_moving')['state_line'] == 'signal delivered; 2 follow-ups open'
+
+
+def test_a_moving_line_always_splits_direct_from_follow_up_activity(wire, tree):
+    assert lines_of(wire, tree, 'moving_over_stuck', 'started_13d', 'in_progress_no_event') == {
+        'moving_over_stuck': 'moving: 1 direct, 0 follow-ups started or finished in 14 d',
+        'started_13d': 'moving: 1 direct, 0 follow-ups started or finished in 14 d',
+        'in_progress_no_event': (
+            'moving: 0 direct, 0 follow-ups started or finished in 14 d; 1 in progress'
+        ),
+    }
+
+
+def test_a_parked_line_counts_what_holds_it(wire, tree):
+    assert lines_of(wire, tree, 'parked_caller_kinds', 'milestone_unfired') == {
+        'parked_caller_kinds': 'held: 3 deferred with a recorded trigger',
+        'milestone_unfired': 'held: 1 pending until a milestone fires',
+    }
+
+
+def test_a_stuck_line_with_ready_work_shows_its_age_bounded_only_when_lower(wire, tree):
+    assert lines_of(wire, tree, 'stuck_ready_ages', 'started_15d', 'level1_escalation') == {
+        'stuck_ready_ages': '2 ready, oldest pending ≥43 d; nothing started in 14 d',
+        'started_15d': '1 ready, oldest pending 20 d; nothing started in 14 d',
+        'level1_escalation': '1 ready; nothing started in 14 d',
+    }
+
+
+def test_a_stuck_line_with_nothing_ready_says_why(wire, tree):
+    assert lines_of(
+        wire, tree,
+        'gate_deps_unmet', 'blocked_by_other_prd', 'parked_one_unrecorded', 'all_planning',
+        'milestone_malformed', 'held_by_dead_session',
+    ) == {
+        'gate_deps_unmet': 'nothing ready: waiting on #901 (no PRD)',
+        'blocked_by_other_prd': 'nothing ready: waiting on #131 (plans/moving-over-stuck-prd.md)',
+        'parked_one_unrecorded': '1 deferred with no recorded reason',
+        'all_planning': '2 planning births not yet committed',
+        'milestone_malformed': 'malformed milestone on #341',
+        'held_by_dead_session': 'nothing ready: 1 deferred',
+    }
+
+
+def _action(kind: str, text: str, task_id: int | None = None, escalation_id: str | None = None,
+            prd: str | None = None) -> dict[str, Any]:
+    target = None if task_id is None else {
+        'task_id': task_id, 'escalation_id': escalation_id, 'prd': prd,
+    }
+    return {'kind': kind, 'target': target, 'text': text}
+
+
+def test_each_row_names_its_next_action(wire, tree):
+    actions = {
+        name: row(wire, tree, name)['next_action']
+        for name in (
+            'ruling_over_tail', 'gate_deps_met', 'stuck_ready_ages', 'parked_one_unrecorded',
+            'gate_deps_unmet', 'blocked_by_other_prd', 'all_planning',
+            'moving_over_stuck', 'tail_over_moving', 'parked_caller_kinds',
+        )
+    }
+    assert actions == {
+        'ruling_over_tail': _action('rule_on', 'rule on esc-102-1 (#102)', 102, 'esc-102-1'),
+        'gate_deps_met': _action('rule_on', 'rule on gate #142', 142),
+        'stuck_ready_ages': _action('dispatch', 'dispatch #351', 351),
+        'parked_one_unrecorded': _action('record_deferral', 'record why #292 is deferred', 292),
+        'gate_deps_unmet': _action('unblock_dependency', 'unblock #901 (no PRD)', 901),
+        'blocked_by_other_prd': _action(
+            'unblock_dependency', 'unblock #131 (plans/moving-over-stuck-prd.md)', 131,
+            prd='plans/moving-over-stuck-prd.md',
+        ),
+        'all_planning': _action('none', ''),
+        'moving_over_stuck': _action('none', ''),
+        'tail_over_moving': _action('none', ''),
+        'parked_caller_kinds': _action('none', ''),
+    }
+
+
+def test_a_rows_detail_lists_the_ids_behind_its_figures(wire, tree):
+    assert row(wire, tree, 'blocked_by_other_prd')['detail']['blocker_refs'] == [
+        {'task_id': 131, 'prd': 'plans/moving-over-stuck-prd.md'},
+        {'task_id': 901, 'prd': None},
+    ]
+    assert row(wire, tree, 'ruling_over_tail')['detail']['ruling_refs'] == [
+        {'task_id': 102, 'escalation_id': 'esc-102-1'},
+    ]
+    assert row(wire, tree, 'gate_deps_met')['detail']['ruling_refs'] == [
+        {'task_id': 142, 'escalation_id': None},
+    ]
+    assert row(wire, tree, 'parked_one_unrecorded')['detail']['deferred_unrecorded_ids'] == [292]
+    assert row(wire, tree, 'tail_over_moving')['detail']['high_open_ids'] == [113]
+    assert row(wire, tree, 'stuck_high')['detail']['oldest_ready_high_ids'] == [371]
+    assert row(wire, tree, 'started_15d')['detail'] == {
+        'blocker_refs': [], 'ruling_refs': [], 'oldest_ready_high_ids': [],
+        'deferred_unrecorded_ids': [], 'high_open_ids': [],
+    }
+
+
+def _attention(row: Mapping[str, Any]) -> tuple[int, int, int, str]:
+    age = row['ready']['oldest_pending_days']
+    return (
+        -len(row['detail']['high_open_ids']), -(-1 if age is None else age),
+        -row['ready']['count'], row['key'],
+    )
+
+
+def test_rows_within_a_lane_are_ordered_by_attention(wire, tree):
+    rows = {row['key']: row for row in wire['prds']}
+    for entry in wire['lanes']:
+        assert entry['prd_keys'] == sorted(entry['prd_keys'], key=lambda key: _attention(rows[key]))
+    [stuck] = [entry for entry in wire['lanes'] if entry['lane'] == 'stuck']
+    assert stuck['prd_keys'][:3] == [
+        tree['stuck_high'].key, tree['stuck_ready_ages'].key, tree['started_15d'].key,
+    ]
+
+
+def test_the_rows_are_served_lane_by_lane_in_display_order(wire):
+    assert [row['key'] for row in wire['prds']] == [
+        key for entry in wire['lanes'] for key in entry['prd_keys']
+    ]
+
+
+def test_high_work_under_a_tail_prd_is_listed_in_dark_matter(wire, tree):
+    assert wire['dark_matter']['hidden_high'] == {
+        'count': 1, 'refs': [{'task_id': 113, 'prd': tree['tail_over_moving'].key}],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Row 12 extended: the γ2 figures are present and ruled; the lanes partition
+# ---------------------------------------------------------------------------
+
+_ROW_FIGURES = ('title', 'lane', 'state_line', 'signal', 'next_action', 'activity', 'detail')
+_VIEW_FIGURES = ('lanes', 'signal_coverage')
+
+
+def test_every_row_and_the_view_carry_every_gamma_2_figure(wire):
+    for served in wire['prds']:
+        assert set(_ROW_FIGURES) <= set(served)
+    assert set(_VIEW_FIGURES) <= set(wire)
+    assert 'hidden_high' in wire['dark_matter']
+
+
+def test_the_gamma_2_figures_carry_rule_text():
+    for figure in (
+        FigureId.STATE_LINE, FigureId.NEXT_ACTION, FigureId.DETAIL, FigureId.HIDDEN_HIGH,
+    ):
+        assert FIGURE_RULES[figure].strip()
+    assert 'attention' in FIGURE_RULES[FigureId.LANES]
+
+
+def _replace_lanes(view: PrdView, change: Callable[[list[tuple[Lane, tuple[str, ...]]]], None]):
+    entries = [(entry.lane, entry.prd_keys) for entry in view.lanes]
+    change(entries)
+    return dataclasses.replace(view, lanes=tuple(
+        dataclasses.replace(view.lanes[0], lane=lane, prd_keys=keys) for lane, keys in entries
+    ))
+
+
+def _omit_a_key(view: PrdView) -> PrdView:
+    def change(entries):
+        lane, keys = entries[0]
+        entries[0] = (lane, keys[1:])
+    return _replace_lanes(view, change)
+
+
+def _duplicate_a_key(view: PrdView) -> PrdView:
+    def change(entries):
+        lane, keys = entries[1]
+        entries[1] = (lane, (*keys, entries[0][1][0]))
+    return _replace_lanes(view, change)
+
+
+def _disagree_with_the_row(view: PrdView) -> PrdView:
+    def change(entries):
+        (first, first_keys), (second, second_keys) = entries[0], entries[1]
+        entries[0] = (first, first_keys[1:])
+        entries[1] = (second, (*second_keys, first_keys[0]))
+    return _replace_lanes(view, change)
+
+
+def _without(wire: Mapping[str, Any], path: tuple[str, ...]) -> dict[str, Any]:
+    """*wire* with the figure at *path* removed; a list step descends into its first item."""
+    head, *tail = path
+    if not tail:
+        return {key: value for key, value in wire.items() if key != head}
+    value = wire[head]
+    if isinstance(value, list):
+        first, *rest = value
+        return {**wire, head: [_without(first, tuple(tail)), *rest]}
+    return {**wire, head: _without(value, tuple(tail))}
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _ViewDroppingAFigure(PrdView):
+    path: tuple[str, ...] = ()
+
+    def to_wire(self) -> dict[str, object]:
+        return _without(PrdView.to_wire(self), self.path)
+
+
+def _dropping(*path: str) -> Callable[[PrdView], PrdView]:
+    def tamper(view: PrdView) -> PrdView:
+        fields = {field.name: getattr(view, field.name) for field in dataclasses.fields(view)}
+        return _ViewDroppingAFigure(**fields, path=path)
+    return tamper
+
+
+_LANE_BREACHES = {
+    'omits_a_key': (_omit_a_key, 'lanes_partition'),
+    'duplicates_a_key': (_duplicate_a_key, 'lanes_partition'),
+    'disagrees_with_the_row': (_disagree_with_the_row, 'lanes_partition'),
+    'row_missing_state_line': (_dropping('prds', 'state_line'), 'figure_present'),
+    'view_missing_lanes': (_dropping('lanes'), 'figure_present'),
+    'dark_matter_missing_hidden_high': (
+        _dropping('dark_matter', 'hidden_high'), 'figure_present',
+    ),
+}
+
+
+@pytest.mark.parametrize('breach', list(_LANE_BREACHES.values()), ids=list(_LANE_BREACHES))
+def test_validate_prd_view_refuses_each_lane_breach(breach, view, tree):
+    tamper, rule = breach
+    status_map = dict(lanes_inputs(tree).status_map)
+    validate_prd_view(view, status_map)
+    with pytest.raises(PrdViewContractError) as refused:
+        validate_prd_view(tamper(view), status_map)
+    assert refused.value.rule is PrdViewInvariant(rule)

@@ -279,6 +279,14 @@ def test_a_prd_row_counts_its_members_by_segment():
     assert row.pop('signal')['mark'] == 'unknown'
     assert row.pop('lane') == 'moving'
     assert row.pop('activity') == {'direct': 0, 'followup': 0}
+    assert row.pop('state_line') == (
+        'moving: 0 direct, 0 follow-ups started or finished in 14 d; 1 in progress'
+    )
+    assert row.pop('next_action') == {'kind': 'none', 'target': None, 'text': ''}
+    assert row.pop('detail') == {
+        'blocker_refs': [], 'ruling_refs': [], 'oldest_ready_high_ids': [],
+        'deferred_unrecorded_ids': [], 'high_open_ids': [],
+    }
     assert row == {
         'key': PRD_A,
         'segments': {
@@ -606,9 +614,11 @@ def test_every_figure_on_the_wire_names_a_figure_id():
     figure_ids = {figure.value for figure in FigureId}
     view_figures = set(wire) - _STRUCTURAL_VIEW_KEYS
     row_figures = {key for row in wire['prds'] for key in row} - _STRUCTURAL_ROW_KEYS
+    dark_matter_figures = set(wire['dark_matter']) & figure_ids
     assert view_figures <= figure_ids
     assert row_figures <= figure_ids
-    assert view_figures | row_figures == figure_ids
+    assert dark_matter_figures == {FigureId.HIDDEN_HIGH.value}
+    assert view_figures | row_figures | dark_matter_figures == figure_ids
 
 
 def test_the_segment_legend_is_served_in_display_order():
