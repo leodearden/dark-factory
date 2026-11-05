@@ -41,7 +41,7 @@ from fastapi.testclient import TestClient
 from shared.task_statuses import TaskStatus
 
 from dashboard.api import prds
-from dashboard.data import task_lineage
+from dashboard.data import escalation_corpus, task_lineage
 from dashboard.data.census import build_census
 from dashboard.data.prd_view import Segment
 
@@ -251,6 +251,82 @@ def test_a_slow_lineage_read_lands_for_the_next_request(client, tmp_path, monkey
     assert later['state'] == 'fresh'
     assert {state['state'] for state in later['value']['inputs']} == {'fresh'}
     assert len(_projected_reads(slow)) == 1
+
+
+# --- the request-wide reads are bounded and guarded -------------------------
+
+_SLOW_WALK_SECONDS = 2.0
+
+
+def _unreadable_walk(queues):
+    raise OSError('queue directory unreadable')
+
+
+def test_a_corpus_walk_that_raises_degrades_only_the_view(client, tmp_path, monkeypatch):
+    monkeypatch.setattr(escalation_corpus, 'walk_corpus', _unreadable_walk)
+    with canned_prd_roots(client, tmp_path, {ROOT: prd_tree()}) as render:
+        body = render(T0)
+    view = body['PRD_VIEW'][ROOT]
+    assert view['state'] == 'unknown'
+    assert 'escalations: ' in view['reason']
+    assert 'OSError' in view['reason']
+    assert body['PRD_CONTENTION'][ROOT]['state'] == 'fresh'
+
+
+def test_a_slow_corpus_walk_never_holds_the_response_and_lands_for_the_next_request(
+    client, tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(prds, 'REQUEST_READS_WAIT_SECONDS', 0.05)
+    walk = escalation_corpus.walk_corpus
+
+    def _slow_walk(queues):
+        time.sleep(_SLOW_WALK_SECONDS)
+        return walk(queues)
+
+    monkeypatch.setattr(escalation_corpus, 'walk_corpus', _slow_walk)
+    with canned_prd_roots(client, tmp_path, {ROOT: prd_tree()}) as render:
+        started = time.monotonic()
+        first = render(T0)
+        elapsed = time.monotonic() - started
+        later = _render_until_fresh(render, T0 + timedelta(seconds=20))
+
+    assert elapsed < _SLOW_WALK_SECONDS
+    assert first['PRD_VIEW'][ROOT]['state'] == 'unknown'
+    assert 'escalations: ' in first['PRD_VIEW'][ROOT]['reason']
+    assert first['PRD_CONTENTION'][ROOT]['state'] == 'fresh'
+    assert later['state'] == 'fresh'
+    assert {state['state'] for state in later['value']['inputs']} == {'fresh'}
+
+
+def test_a_failed_corpus_walk_after_a_good_one_serves_the_last_good_walk(
+    client, tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(escalation_corpus, 'CORPUS_TTL_SECONDS', 0.0)
+    with canned_prd_roots(client, tmp_path, {ROOT: prd_tree()}) as render:
+        first = render(T0)['PRD_VIEW'][ROOT]
+        monkeypatch.setattr(escalation_corpus, 'walk_corpus', _unreadable_walk)
+        second = render(T0 + timedelta(seconds=1))['PRD_VIEW'][ROOT]
+
+    assert first['state'] == 'fresh', first['reason']
+    assert second['state'] == 'stale'
+    assert _input(second, 'escalations')['state'] == 'stale'
+    assert _row(second, PRD_A)
+
+
+def test_a_run_ledger_walk_that_raises_degrades_the_activity_input_not_the_response(
+    client, tmp_path, monkeypatch,
+):
+    """project_dbs.py's docstring declares its helpers' underscore vestigial, so this patches a public name."""
+    async def _raises(config, pool, relative):
+        raise RuntimeError('pool bug')
+
+    monkeypatch.setattr(prds, '_project_scoped_dbs_labeled', _raises)
+    with canned_prd_roots(client, tmp_path, {ROOT: prd_tree()}) as render:
+        body = render(T0)
+    for datum in (body['PRD_VIEW'][ROOT], body['PRD_CONTENTION'][ROOT]):
+        assert 'activity: ' in datum['reason']
+        assert 'run-ledger walk' in datum['reason']
+        assert 'no runs.db' not in datum['reason']
 
 
 # --- rows 13–19 end to end: the lanes tree through every input --------------
