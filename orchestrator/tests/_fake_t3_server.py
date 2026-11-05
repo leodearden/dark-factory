@@ -8,7 +8,9 @@ streamable-HTTP ``/mcp`` endpoint, framed as a JSON body or as SSE frames.
 :func:`install_fake_t3_cli` writes an executable ``t3`` that answers
 ``--version`` and mints pairing codes on that server, the way the real CLI
 writes the real server's state; :func:`put_fake_t3_cli_on_path` installs it
-first on a test's PATH. :data:`DEAD_ORIGIN` is an origin nothing answers.
+first on a test's PATH. :meth:`FakeT3Server.write_paired_credential` stands in for
+a completed pairing, storing this host's credential for the server.
+:data:`DEAD_ORIGIN` is an origin nothing answers.
 
 WHERE THE SHAPES COME FROM.  Every canned payload and refusal is copied from
 T3 Code v0.1.6 (``~/src/t3code-v0.1.6``):
@@ -48,12 +50,15 @@ import threading
 import uuid
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from email.message import Message
 from enum import Enum, StrEnum
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import parse_qs, urlencode, urlsplit
+
+from orchestrator import t3_mcp_client
 
 if TYPE_CHECKING:
     import pytest
@@ -295,6 +300,24 @@ class FakeT3Server(ThreadingHTTPServer):
             self._tokens.add(token)
             self._issued_tokens.append(token)
         return token
+
+    def write_paired_credential(self, root: Path | str, *, access_token: str | None = None) -> Path:
+        """This host's credential for the server under fleet ``root``, on a bearer it issued unless one is given."""
+        paired_at = datetime.now(UTC).replace(microsecond=0)
+        credential = t3_mcp_client.Credential(
+            schema_version=t3_mcp_client.CREDENTIAL_SCHEMA_VERSION,
+            origin=self.origin,
+            environment_id=self.environment_id,
+            server_version=self.server_version,
+            access=t3_mcp_client.ACCESS,
+            client_id='mcp-client-1',
+            access_token=access_token if access_token is not None else self.issue_token(),
+            expires_at=paired_at + timedelta(days=30),
+            paired_at=paired_at,
+            paired_by=t3_mcp_client.PairedBy.SELF_PAIR,
+        )
+        t3_mcp_client.write_credential(credential, root=root)
+        return t3_mcp_client.credential_path(self.environment_id, root=root)
 
     def revoke_tokens(self) -> None:
         with self._lock:

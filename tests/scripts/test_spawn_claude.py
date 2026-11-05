@@ -78,7 +78,6 @@ from df_pytest_isolation import (  # noqa: E402
 from orchestrator import (  # noqa: E402
     session_hooks,  # pyright: ignore[reportAttributeAccessIssue]
     session_registry,  # pyright: ignore[reportAttributeAccessIssue]
-    t3_mcp_client,  # pyright: ignore[reportAttributeAccessIssue]
 )
 
 # Branch routing: the script dispatches on the first word of $CLAUDE_TERMINAL_CMD.
@@ -5005,23 +5004,6 @@ def _write_t3_home(tmp_path: pathlib.Path, pid: int, started_at: str, origin: st
     return home
 
 
-def _seed_credential(server: FakeT3Server, fleet_root: str) -> None:
-    """This host's credential for *server*, on a bearer it issued."""
-    paired_at = datetime.now(UTC).replace(microsecond=0)
-    t3_mcp_client.write_credential(t3_mcp_client.Credential(
-        schema_version=t3_mcp_client.CREDENTIAL_SCHEMA_VERSION,
-        origin=server.origin,
-        environment_id=server.environment_id,
-        server_version=server.server_version,
-        access=t3_mcp_client.ACCESS,
-        client_id="mcp-client-7489",
-        access_token=server.issue_token(),
-        expires_at=paired_at + timedelta(days=30),
-        paired_at=paired_at,
-        paired_by=t3_mcp_client.PairedBy.SELF_PAIR,
-    ), root=fleet_root)
-
-
 _ORCH_MODULE_DIR = _ORCH_SRC / "orchestrator"
 
 # Runs the real module of the same name, except for the verbs listed in
@@ -5100,7 +5082,7 @@ class _T3Lane:
         }
         self._launched = False
         self._reads = 0
-        _seed_credential(server, self.env["CLAUDE_FLEET_ROOT"])
+        self.credential = server.write_paired_credential(self.env["CLAUDE_FLEET_ROOT"])
         server.tool_replies |= {
             "t3_project_list": self.answer_project_list,
             "t3_thread_launch": self.answer_launch,
@@ -5176,7 +5158,7 @@ class _T3Lane:
         return self.server.tool_calls("t3_thread_launch")
 
     def unpair(self) -> None:
-        t3_mcp_client.credential_path(self.server.environment_id, root=self.env["CLAUDE_FLEET_ROOT"]).unlink()
+        self.credential.unlink()
 
     def log_registry_calls(self, faulting_lane_verbs: set[str] | None = None) -> None:
         self.script = _spawn_script_with_faulting_lane_verbs(

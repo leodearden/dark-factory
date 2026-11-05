@@ -197,24 +197,6 @@ def remove_runtime(env: Env) -> None:
     (env.t3_home / 'userdata' / 'server-runtime.json').unlink()
 
 
-def seed_credential(env: Env, server: FakeT3Server, *, access_token: str | None = None) -> None:
-    """This host's credential for ``server``, on a bearer it issued unless ``access_token`` is given."""
-    paired_at = datetime.now(UTC).replace(microsecond=0)
-    credential = t3_mcp_client.Credential(
-        schema_version=t3_mcp_client.CREDENTIAL_SCHEMA_VERSION,
-        origin=server.origin,
-        environment_id=server.environment_id,
-        server_version=server.server_version,
-        access=t3_mcp_client.ACCESS,
-        client_id='mcp-client-1',
-        access_token=access_token if access_token is not None else server.issue_token(),
-        expires_at=paired_at + timedelta(days=30),
-        paired_at=paired_at,
-        paired_by=t3_mcp_client.PairedBy.SELF_PAIR,
-    )
-    t3_mcp_client.write_credential(credential, root=env.fleet)
-
-
 def stored_credential(env: Env) -> t3_mcp_client.Credential:
     credential = t3_mcp_client.read_credential_status(ENVIRONMENT_ID, root=env.fleet).credential
     assert credential is not None
@@ -225,7 +207,7 @@ def stored_credential(env: Env) -> t3_mcp_client.Credential:
 def t3(env: Env, t3_server: FakeT3Server) -> FakeT3Server:
     """The fake T3 the runtime names, this host paired with it, one live project at ``env.project``."""
     point_runtime_at(env, t3_server)
-    seed_credential(env, t3_server)
+    t3_server.write_paired_credential(env.fleet)
     t3_server.tool_replies |= {
         't3_project_list': projects_page(project(env.project)),
         't3_thread_launch': ToolSuccess(THREAD_LAUNCH_JSON),
@@ -806,7 +788,7 @@ class TestLaunchFailures:
     def test_a_bearer_t3_refuses_with_no_t3_to_re_pair_is_credential_expired(
         self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        seed_credential(env, t3, access_token='revoked')
+        t3.write_paired_credential(env.fleet, access_token='revoked')
 
         line = launch_line(capsys, tmp_path, env.project)
 

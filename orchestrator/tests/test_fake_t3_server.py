@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterator, Mapping
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -34,20 +33,7 @@ def server() -> Iterator[FakeT3Server]:
 @pytest.fixture
 def mcp(server: FakeT3Server, tmp_path: Path) -> client.T3McpClient:
     """A client on a server-issued bearer, stored the way a pairing stores it."""
-    paired_at = datetime.now(UTC).replace(microsecond=0)
-    credential = client.Credential(
-        schema_version=client.CREDENTIAL_SCHEMA_VERSION,
-        origin=server.origin,
-        environment_id=server.environment_id,
-        server_version=server.server_version,
-        access=client.ACCESS,
-        client_id='mcp-client-1',
-        access_token=server.issue_token(),
-        expires_at=paired_at + timedelta(days=30),
-        paired_at=paired_at,
-        paired_by=client.PairedBy.OPERATOR,
-    )
-    client.write_credential(credential, root=tmp_path)
+    server.write_paired_credential(tmp_path)
     connected = client.connect(server.origin, root=tmp_path)
     assert isinstance(connected, client.T3McpClient)
     return connected
