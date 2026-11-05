@@ -34,6 +34,7 @@ from pydantic import (
 )
 from pydantic_core import PydanticCustomError
 
+from shared.declared_scope import DECLARED_SCOPE_METADATA_KEY, DeclaredScope
 from shared.strand_conversion import STRAND_CONVERTED_METADATA_KEY, StrandConverted
 from shared.task_deferral import DeferralRecord
 
@@ -1100,6 +1101,9 @@ register_metadata_submodel('deferral', DeferralRecord, cardinality='dict')
 
 # strand_converted: shared/src/shared/strand_conversion.py.
 register_metadata_submodel(STRAND_CONVERTED_METADATA_KEY, StrandConverted, cardinality='dict')
+
+# declared_scope: plans/follow-up-filing-shape-prd.md §4.2.
+register_metadata_submodel(DECLARED_SCOPE_METADATA_KEY, DeclaredScope, cardinality='dict')
 
 
 def _normalize_legacy_memory_hints(value: object) -> object:
