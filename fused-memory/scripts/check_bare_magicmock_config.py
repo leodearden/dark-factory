@@ -842,8 +842,9 @@ def _wall_clock_overrun_msg(entry: _DebtEntry, found: int) -> str:
         ' The reported sites are simply the LAST in source order: the anchor is'
         ' positional and is NOT a claim that these exact sites are the new ones.'
         ' Fix by migrating a load-bearing wait in this file onto wait_responsive(...)'
-        ' with a descriptive label=, or by deriving its bound from'
-        ' MERGE_RESULT_TIMEOUT instead of writing a number, or by adding'
+        f' ({_WAIT_RESPONSIVE_REF}), or a poll onto poll_responsive(predicate, ...)'
+        f' ({_POLL_RESPONSIVE_REF}), with a descriptive label=, or by deriving its'
+        ' bound from MERGE_RESULT_TIMEOUT instead of writing a number, or by adding'
         ' # noqa: wall-clock-deadline — <reason> above a deliberate one.'
         + _WALL_CLOCK_REMEDY_REACH
         + ' Do NOT raise the recorded budget in check_bare_magicmock_config.py.'

@@ -2310,6 +2310,23 @@ class TestWallClockDeadlineDebtBaseline:
                 f'Rule C overrun message must not offer {foreign!r}: {message!r}'
             )
 
+    def test_overrun_message_cites_both_responsive_helpers_at_their_homes(self):
+        """An overrun may be a new poll as well as a new wait, so it names both remedies.
+
+        A debt file's budget now counts clock-deadline polls and timeout blocks, whose
+        remedy is poll_responsive, not wait_responsive.
+        """
+        entry, budget = _live_rule_c_debt_entry()
+        [overrun] = _rule_c(_RULE_C_ONE_HIT * (budget + 1), entry)
+        for citation in (
+            'orchestrator/tests/_orch_helpers.py::wait_responsive',
+            'orchestrator/tests/_poll_responsive.py::poll_responsive',
+            'poll_responsive(predicate, ...)',
+        ):
+            assert citation in overrun.message, (
+                f'the Rule C overrun message must cite {citation!r}; got {overrun.message!r}'
+            )
+
     def test_both_budget_builders_are_required_and_keyword_only(self):
         """A future Rule D must not be able to inherit another rule's remedy by omission.
 
