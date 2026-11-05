@@ -34,9 +34,11 @@ from dashboard.data.prd_view import (
     PrdViewInputs,
     PrdViewInvariant,
     Segment,
+    TaskActivity,
     build_prd_view,
     is_human_gate,
     is_ready,
+    open_work_keys,
     segment_of,
     validate_prd_view,
 )
@@ -182,6 +184,16 @@ SNAPSHOT_BOUND = 30
 LINEAGE_BOUND = 900
 SNAPSHOT_AS_OF = NOW - timedelta(seconds=5)
 LINEAGE_AS_OF = NOW - timedelta(seconds=120)
+ESCALATIONS_AS_OF = NOW - timedelta(seconds=10)
+ESCALATIONS_BOUND = 60
+ACTIVITY_AS_OF = NOW - timedelta(seconds=20)
+ACTIVITY_BOUND = 180
+DOCUMENTS_AS_OF = NOW - timedelta(seconds=30)
+DOCUMENTS_BOUND = 90
+NO_ACTIVITY = TaskActivity(
+    started=MappingProxyType({}), completed=MappingProxyType({}),
+    ever_started=frozenset(), first_event_at=None,
+)
 
 
 def _pending_since(days: float) -> str:
@@ -227,6 +239,10 @@ def _inputs(
     census: Datum[TaskCensus] | None = None,
     rows: Datum[list[dict]] | None = None,
     lineage: Datum[Any] | None = None,
+    escalations: Datum[Any] | None = None,
+    activity: Datum[TaskActivity] | None = None,
+    documents: Datum[Any] | None = None,
+    liveness: Datum[Any] | None = None,
 ) -> PrdViewInputs:
     status_map = (
         {task_id: status for task_id, (status, _, _) in tasks.items()}
@@ -238,6 +254,12 @@ def _inputs(
         census=census or _fresh(build_census(status_map), SNAPSHOT_AS_OF, SNAPSHOT_BOUND),
         rows=rows or _fresh(_rows(tasks), SNAPSHOT_AS_OF, SNAPSHOT_BOUND),
         lineage=lineage or _fresh(MappingProxyType(_lineage(tasks)), LINEAGE_AS_OF, LINEAGE_BOUND),
+        escalations=escalations or _fresh(
+            MappingProxyType({}), ESCALATIONS_AS_OF, ESCALATIONS_BOUND,
+        ),
+        activity=activity or _fresh(NO_ACTIVITY, ACTIVITY_AS_OF, ACTIVITY_BOUND),
+        documents=documents or _fresh(MappingProxyType({}), DOCUMENTS_AS_OF, DOCUMENTS_BOUND),
+        liveness=liveness or _fresh(MappingProxyType({}), SNAPSHOT_AS_OF, SNAPSHOT_BOUND),
     )
 
 
@@ -253,6 +275,8 @@ def _wire(inputs: PrdViewInputs | None = None) -> dict[str, Any]:
 
 def test_a_prd_row_counts_its_members_by_segment():
     [row] = _wire()['prds']
+    assert row.pop('title') == PRD_A
+    assert row.pop('signal')['mark'] == 'unknown'
     assert row == {
         'key': PRD_A,
         'segments': {
@@ -438,12 +462,20 @@ def test_a_view_over_fresh_inputs_is_fresh_as_of_its_oldest_input():
 
 
 def test_the_view_lists_each_input_with_its_own_provenance():
-    snapshot_as_of = SNAPSHOT_AS_OF.astimezone(UTC).isoformat()
-    lineage_as_of = LINEAGE_AS_OF.astimezone(UTC).isoformat()
+    def fresh_at(name: str, as_of: datetime) -> dict[str, Any]:
+        return {
+            'name': name, 'as_of': as_of.astimezone(UTC).isoformat(),
+            'state': 'fresh', 'reason': None,
+        }
+
     assert _wire()['inputs'] == [
-        {'name': 'status_map', 'as_of': snapshot_as_of, 'state': 'fresh', 'reason': None},
-        {'name': 'active_rows', 'as_of': snapshot_as_of, 'state': 'fresh', 'reason': None},
-        {'name': 'lineage', 'as_of': lineage_as_of, 'state': 'fresh', 'reason': None},
+        fresh_at('status_map', SNAPSHOT_AS_OF),
+        fresh_at('active_rows', SNAPSHOT_AS_OF),
+        fresh_at('lineage', LINEAGE_AS_OF),
+        fresh_at('escalations', ESCALATIONS_AS_OF),
+        fresh_at('activity', ACTIVITY_AS_OF),
+        fresh_at('signals', DOCUMENTS_AS_OF),
+        fresh_at('liveness', SNAPSHOT_AS_OF),
     ]
 
 
@@ -463,7 +495,7 @@ def test_an_input_past_its_own_bound_at_now_is_judged_stale():
     assert datum.reason == 'active_rows: measured 31s before it was served, past the 30s freshness bound'
     assert datum.value is not None
     assert [state.state for state in datum.value.inputs] == [
-        DatumState.FRESH, DatumState.STALE, DatumState.FRESH,
+        DatumState.FRESH, DatumState.STALE, *[DatumState.FRESH] * 5,
     ]
 
 
@@ -475,6 +507,40 @@ def test_every_non_fresh_input_is_named_in_the_reason():
     datum = build_prd_view(_inputs(rows=rows, lineage=lineage), now=NOW)
     assert datum.state is DatumState.STALE
     assert datum.reason == 'active_rows: rows lag; lineage: lineage lag'
+
+
+def test_stale_activity_makes_a_stale_view_naming_the_activity_reason():
+    activity = Datum(
+        NO_ACTIVITY, ACTIVITY_AS_OF, DatumState.STALE, 'read still in flight after 4.0s',
+        ACTIVITY_BOUND,
+    )
+    datum = build_prd_view(_inputs(activity=activity), now=NOW)
+    assert datum.state is DatumState.STALE
+    assert datum.reason == 'activity: read still in flight after 4.0s'
+    assert datum.value is not None
+
+
+def test_unknown_documents_make_an_unknown_view_naming_the_signals_input():
+    documents = unknown_datum('project root /gone is not a readable directory', DOCUMENTS_BOUND)
+    datum = build_prd_view(_inputs(documents=documents), now=NOW)
+    assert datum.state is DatumState.UNKNOWN
+    assert datum.value is None
+    assert datum.reason == 'signals: project root /gone is not a readable directory'
+    validate_datum(datum, NOW)
+
+
+@pytest.mark.parametrize('name', ['escalations', 'activity', 'liveness'])
+def test_an_unknown_escalations_activity_or_liveness_input_makes_an_unknown_view(name):
+    datum = build_prd_view(_inputs(**{name: unknown_datum('boom', 60)}), now=NOW)
+    assert datum.state is DatumState.UNKNOWN
+    assert datum.reason == f'{name}: boom'
+
+
+def test_open_work_keys_are_the_keys_of_the_rows_the_view_draws():
+    inputs = _inputs()
+    assert inputs.rows.value is not None and inputs.lineage.value is not None
+    keys = open_work_keys(ROOT, inputs.status_map, inputs.rows.value, inputs.lineage.value)
+    assert keys == tuple(row.key for row in _view(inputs).prds) == (PRD_A,)
 
 
 def test_unknown_lineage_makes_an_unknown_view_naming_the_lineage_reason():
@@ -525,10 +591,6 @@ def test_an_off_vocabulary_status_makes_an_unknown_view_with_the_census_error():
 
 _STRUCTURAL_VIEW_KEYS = {'prds', 'inputs', 'rules', 'segment_legend'}
 _STRUCTURAL_ROW_KEYS = {'key'}
-_GAMMA_2_KEYS = {
-    'title', 'lane', 'state_line', 'signal', 'next_action', 'activity', 'detail',
-    'lanes', 'signal_coverage', 'hidden_high',
-}
 
 
 def test_every_figure_id_has_rule_text_shipped_in_the_view():
@@ -552,18 +614,6 @@ def test_the_segment_legend_is_served_in_display_order():
         {'segment': segment.value, 'label': SEGMENT_LABELS[segment], 'tone': SEGMENT_TONES[segment]}
         for segment in Segment
     ]
-
-
-def _all_keys(value: Any) -> set[str]:
-    if isinstance(value, dict):
-        return set(value) | {key for child in value.values() for key in _all_keys(child)}
-    if isinstance(value, list):
-        return {key for child in value for key in _all_keys(child)}
-    return set()
-
-
-def test_the_wire_carries_no_gamma_2_figure():
-    assert not _all_keys(_wire()) & _GAMMA_2_KEYS
 
 
 def test_every_open_id_appears_exactly_once():

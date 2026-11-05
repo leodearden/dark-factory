@@ -1,18 +1,41 @@
-"""The PRD documents a view reads: each open-work PRD's sidecar and H1 title, off disk."""
+"""A PRD's signal mark: its sidecar and H1 title read off disk, and the mark built from them.
+
+The reader half reads real files under a tmp project root; the mark half
+builds views with ``build_prd_view`` over a small tree and those documents
+(PRD ``plans/dashboard-prd-lanes-prd.md`` §4.7).
+"""
 
 from __future__ import annotations
 
 import os
-from datetime import UTC, datetime
+from collections.abc import Mapping
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import MappingProxyType
+from typing import Any
 
 import pytest
-from shared.capability_manifest import CapabilityManifestDoc, sidecar_path
+from shared.capability_manifest import (
+    CapabilityManifestDoc,
+    parse_capability_manifest,
+    sidecar_path,
+)
 
 from dashboard.data import prd_signal
-from dashboard.data.datum import DatumState
+from dashboard.data.census import build_census
+from dashboard.data.datum import Datum, DatumState
+from dashboard.data.prd_attribution import lineage_entry
 from dashboard.data.prd_signal import clear_prd_documents, read_prd_documents
-from dashboard.data.prd_view import PrdDocument, SidecarUnread, SignalCause
+from dashboard.data.prd_view import (
+    SIGNAL_CAUSE_TEXT,
+    PrdDocument,
+    PrdView,
+    PrdViewInputs,
+    SidecarUnread,
+    SignalCause,
+    TaskActivity,
+    build_prd_view,
+)
 
 NOW = datetime(2026, 11, 5, 9, 0, tzinfo=UTC)
 KEY = 'plans/x-prd.md'
@@ -234,3 +257,208 @@ async def test_a_changed_key_set_reads_the_new_key(tmp_path):
     assert second[OTHER].title == 'Other'
     assert isinstance(second[OTHER].sidecar, CapabilityManifestDoc)
     assert second[KEY].sidecar is first[KEY].sidecar
+
+
+# ---------------------------------------------------------------------------
+# The mark: built by the view from each row's document and the store
+# ---------------------------------------------------------------------------
+
+ROOT = '/srv/project'
+AS_OF = NOW - timedelta(seconds=5)
+BOUND = 60
+
+
+def done_as(kind: str) -> dict[str, Any]:
+    return {'prd_path': KEY, 'done_provenance': {'kind': kind, 'stamped_at': AS_OF.isoformat()}}
+
+
+TREE: Mapping[int, tuple[str, Mapping[str, Any]]] = MappingProxyType({
+    1: ('done', done_as('merged')),
+    2: ('done', done_as('already_done')),
+    3: ('pending', {'prd_path': KEY}),
+    4: ('cancelled', {'prd_path': KEY}),
+    5: ('pending', {'prd_path': OTHER}),
+    6: ('in-progress', {'prd_path': KEY}),
+})
+ABSENT = 99
+
+
+def fresh(value: Any) -> Datum[Any]:
+    return Datum(value, AS_OF, DatumState.FRESH, None, BOUND)
+
+
+def manifest(*blocks: Mapping[str, Any], leaves: list[str] | None) -> CapabilityManifestDoc:
+    raw: dict[str, Any] = {
+        'prd': KEY,
+        'schema_version': 1,
+        'tasks': [{**block, 'capabilities': []} for block in blocks],
+    }
+    if leaves is not None:
+        raw['signal_leaves'] = leaves
+    return parse_capability_manifest(raw)
+
+
+def bound(label: str, task_id: int) -> dict[str, Any]:
+    return {'label': label, 'task_id': task_id}
+
+
+def signal_view(documents: Mapping[str, PrdDocument]) -> PrdView:
+    status_map = {task_id: status for task_id, (status, _) in TREE.items()}
+    rows = [
+        {'id': task_id, 'status': status, 'dependencies': [], 'metadata': dict(metadata)}
+        for task_id, (status, metadata) in TREE.items()
+        if status not in {'done', 'cancelled'}
+    ]
+    lineage = {task_id: lineage_entry(metadata, ROOT) for task_id, (_, metadata) in TREE.items()}
+    inputs = PrdViewInputs(
+        project_root=ROOT,
+        status_map=status_map,
+        census=fresh(build_census(status_map)),
+        rows=fresh(rows),
+        lineage=fresh(MappingProxyType(lineage)),
+        escalations=fresh(MappingProxyType({})),
+        activity=fresh(TaskActivity(MappingProxyType({}), MappingProxyType({}), frozenset(), None)),
+        documents=fresh(MappingProxyType(dict(documents))),
+        liveness=fresh(MappingProxyType({})),
+    )
+    datum = build_prd_view(inputs, now=NOW)
+    assert datum.value is not None, datum.reason
+    return datum.value
+
+
+def row_wire(sidecar: CapabilityManifestDoc | SidecarUnread, title: str | None = None) -> dict:
+    view = signal_view({KEY: PrdDocument(title=title, sidecar=sidecar)})
+    [row] = [row for row in view.to_wire()['prds'] if row['key'] == KEY]
+    return row
+
+
+def leaf(label: str, task_id: int | None, status: str | None, done_kind: str | None = None):
+    return {'label': label, 'task_id': task_id, 'status': status, 'done_kind': done_kind}
+
+
+def test_every_leaf_done_is_delivered_and_each_leaf_shows_its_done_kind():
+    signal = row_wire(manifest(bound('a', 1), bound('b', 2), leaves=['a', 'b']))['signal']
+
+    assert signal == {
+        'mark': 'delivered',
+        'cause': None,
+        'reason': None,
+        'leaves': [leaf('a', 1, 'done', 'merged'), leaf('b', 2, 'done', 'already_done')],
+    }
+
+
+def test_some_leaves_done_none_cancelled_is_partial():
+    signal = row_wire(manifest(bound('a', 1), bound('c', 3), leaves=['a', 'c']))['signal']
+
+    assert signal['mark'] == 'partial'
+    assert signal['cause'] is None
+    assert signal['leaves'] == [leaf('a', 1, 'done', 'merged'), leaf('c', 3, 'pending')]
+
+
+def test_no_leaf_done_none_cancelled_is_not_yet():
+    signal = row_wire(manifest(bound('c', 3), bound('f', 6), leaves=['c', 'f']))['signal']
+
+    assert signal['mark'] == 'not_yet'
+    assert signal['leaves'] == [leaf('c', 3, 'pending'), leaf('f', 6, 'in-progress')]
+
+
+def test_only_the_named_leaves_count_toward_the_mark():
+    sidecar = manifest(bound('a', 1), bound('c', 3), leaves=['a'])
+
+    assert row_wire(sidecar)['signal']['mark'] == 'delivered'
+
+
+_UNKNOWN_SIGNALS: dict[str, tuple[CapabilityManifestDoc | SidecarUnread, SignalCause]] = {
+    'no-sidecar': (SidecarUnread(SignalCause.NO_SIDECAR, None), SignalCause.NO_SIDECAR),
+    'names-no-leaf': (manifest(bound('a', 1), leaves=None), SignalCause.NAMES_NO_LEAF),
+    'unbound-label': (
+        manifest({'label': 'a', 'task_id': None}, leaves=['a']), SignalCause.UNBOUND_LABEL,
+    ),
+    'leaf-not-in-store': (
+        manifest(bound('a', ABSENT), leaves=['a']), SignalCause.LEAF_NOT_IN_STORE,
+    ),
+    'stale-binding': (manifest(bound('a', 5), leaves=['a']), SignalCause.STALE_BINDING),
+    'external-leaf': (
+        manifest({'label': 'a', 'external_task_id': 'reify:12'}, leaves=['a']),
+        SignalCause.EXTERNAL_LEAF,
+    ),
+    'cancelled-beside-done': (
+        manifest(bound('a', 1), bound('d', 4), leaves=['a', 'd']), SignalCause.LEAF_CANCELLED,
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    ('sidecar', 'cause'), list(_UNKNOWN_SIGNALS.values()), ids=list(_UNKNOWN_SIGNALS),
+)
+def test_each_unknown_signal_names_its_cause_and_its_text(sidecar, cause):
+    signal = row_wire(sidecar)['signal']
+
+    assert signal['mark'] == 'unknown'
+    assert signal['cause'] == cause.value
+    assert signal['reason'].startswith(SIGNAL_CAUSE_TEXT[cause])
+
+
+def test_a_sidecar_that_fails_to_load_reads_unknown_with_the_validation_error():
+    error = "ValidationError: signal_leaves label 'x' names no task block"
+    signal = row_wire(SidecarUnread(SignalCause.SIDECAR_INVALID, error))['signal']
+
+    assert signal['mark'] == 'unknown'
+    assert signal['cause'] == 'sidecar_invalid'
+    assert error in signal['reason']
+
+
+def test_a_prd_naming_no_signal_leaf_reads_exactly_that_and_no_other_cause():
+    signal = row_wire(manifest(bound('a', 1), leaves=None))['signal']
+
+    assert signal['reason'] == 'PRD names no signal leaf'
+    assert SIGNAL_CAUSE_TEXT[SignalCause.NAMES_NO_LEAF] == 'PRD names no signal leaf'
+    assert list(SIGNAL_CAUSE_TEXT.values()).count('PRD names no signal leaf') == 1
+    assert set(SIGNAL_CAUSE_TEXT) == set(SignalCause)
+
+
+def test_an_unbound_leaf_is_served_with_no_task():
+    signal = row_wire(manifest({'label': 'a', 'task_id': None}, leaves=['a']))['signal']
+
+    assert signal['leaves'] == [leaf('a', None, None)]
+
+
+def test_a_stale_binding_names_the_other_prd_the_bound_task_belongs_to():
+    signal = row_wire(manifest(bound('a', 5), leaves=['a']))['signal']
+
+    assert signal['cause'] == 'stale_binding'
+    assert OTHER in signal['reason']
+    assert signal['leaves'] == [leaf('a', 5, 'pending')]
+
+
+def test_a_cancelled_leaf_beside_done_ones_is_never_delivered():
+    signal = row_wire(manifest(bound('a', 1), bound('d', 4), leaves=['a', 'd']))['signal']
+
+    assert signal['mark'] == 'unknown'
+    assert signal['reason'].startswith('signal leaf cancelled')
+
+
+def test_the_first_failing_leaf_in_signal_leaves_order_names_the_cause():
+    sidecar = manifest(
+        bound('d', 4), {'label': 'u', 'task_id': None}, bound('a', 1), leaves=['u', 'd', 'a'],
+    )
+    signal = row_wire(sidecar)['signal']
+
+    assert signal['cause'] == 'unbound_label'
+    assert [served['label'] for served in signal['leaves']] == ['u', 'd', 'a']
+
+
+def test_a_rows_title_is_its_documents_title_else_its_key():
+    sidecar = SidecarUnread(SignalCause.NO_SIDECAR, None)
+
+    assert row_wire(sidecar, title='Lanes by need')['title'] == 'Lanes by need'
+    assert row_wire(sidecar, title=None)['title'] == KEY
+
+
+def test_signal_coverage_counts_rows_whose_loaded_sidecar_names_a_leaf_over_all_rows():
+    named = PrdDocument(title=None, sidecar=manifest(bound('a', 1), leaves=['a']))
+
+    view = signal_view({KEY: named})
+
+    assert [row.key for row in view.prds] == [KEY, OTHER]
+    assert view.to_wire()['signal_coverage'] == {'named': 1, 'of': 2}
