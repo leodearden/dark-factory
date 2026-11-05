@@ -202,24 +202,6 @@ def _make_inflight_entry(
     )
 
 
-# ── The retired §5.3 sub-check, read through its PUBLIC surfaces ─────────────
-#
-# Until task 5302, two_layer_invariants() composed a verify-base sub-check
-# (iii), worded 'verify-base⊄frozen-tip …'.  It re-judged a dispatch-time rule
-# against post-dispatch main, so the marker is kept only to assert, on both
-# composed surfaces, that the sub-check stays gone.
-_VERIFY_BASE_MARKER = 'verify-base⊄frozen-tip'
-
-
-def _verify_base_violations(worker: SpeculativeMergeWorker, main_sha: str) -> list[str]:
-    """Every retired verify-base string on either composed surface: always []."""
-    reported = [
-        *worker.two_layer_invariants(main_sha),
-        *worker.snapshot()['two_layer_invariants'],
-    ]
-    return [v for v in reported if _VERIFY_BASE_MARKER in v]
-
-
 def _install_frozen_head(
     worker: SpeculativeMergeWorker, config: OrchestratorConfig, git_repo: Path,
     *, task_id: str, base_sha: str, merge_commit: str,
@@ -302,7 +284,6 @@ class TestVerifyBaseIsNotAnInvariant:
 
         assert worker.two_layer_invariants(main_sha) == []
         assert worker.snapshot()['two_layer_invariants'] == []
-        assert _verify_base_violations(worker, main_sha) == []
 
     async def test_healthy_chained_prefix_has_no_violation(
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
@@ -374,15 +355,18 @@ class TestRemergeCarveOutAfterTheSplit:
         worker = _make_worker(git_ops)
         middle, tail = self._three_entry_prefix(worker, config, git_repo, marked=True)
 
-        violations = worker.check_frozen_prefix_invariant('M0')
+        violations = worker.two_layer_invariants('M0')
 
-        flagged = [v for v in violations if middle.request.request_id in v]
-        assert len(flagged) == 1 and 'recovery re-merge (expected)' in flagged[0], violations
-        assert not [v for v in violations if tail.request.request_id in v], (
-            f'the healthy tail must NOT be flagged — the chain advanced past '
-            f'the recovery entry, got: {violations}'
+        assert len(violations) == 1, (
+            f'expected exactly the annotated middle link: the healthy tail must '
+            f'NOT be flagged, as the chain advanced past the recovery entry, and '
+            f'no snapshot-time verify-base check may report, got: {violations}'
         )
-        assert _verify_base_violations(worker, 'M0') == []
+        assert violations[0].startswith(
+            f'frozen-prefix base-chain broken at {middle.request.request_id}: '
+            f"expected base 'C0' but item has 'real-main' [recovery re-merge (expected):"
+        ), violations
+        assert worker.check_frozen_prefix_invariant('M0') == violations
 
     async def test_unmarked_link_break_is_not_annotated(
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,

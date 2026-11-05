@@ -48,8 +48,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import pytest
 from _merge_lane_fakes import (
@@ -273,10 +274,24 @@ def _guard_warn(
 
 
 async def _dispatch(
-    worker: SpeculativeMergeWorker, item: SpeculativeItem,
+    worker: SpeculativeMergeWorker,
+    git_ops: GitOps,
+    item: SpeculativeItem,
+    get_main_sha: Callable[..., Awaitable[str]],
 ) -> InflightEntry | None:
-    """Drive *item* through the lane's dispatch step."""
-    return await worker._dispatch_item(item)
+    """Drive *item* through the lane's dispatch step while git's main read is
+    *get_main_sha*.  The verify the dispatch launches is a no-op, so a row
+    observes only what dispatch itself decided."""
+    import unittest.mock as mock
+
+    async def _noop_verify(_item, _lease, **_kwargs):
+        return None
+
+    with (
+        mock.patch.object(git_ops, 'get_main_sha', side_effect=get_main_sha),
+        mock.patch.object(worker, '_run_inflight_verify', _noop_verify),
+    ):
+        return await worker._dispatch_item(item)
 
 
 def _assert_divergence(
@@ -1110,15 +1125,16 @@ class TestGuardWarningCarriesCallTimeContext:
     ) -> None:
         """(1) task_id, request_id, actual base, expected tip and verify_depth.
 
-        Task 1999 notes this call-time context is NOT available on the
-        invariant/snapshot surface — the dispatch guard is the only place it
-        can be captured, so it must not be dropped by a reword.
+        The WARNING and the ``VerifyBaseDivergence`` record carry the same
+        call-time context (task 5302).  The record, in
+        ``snapshot()['verify_base_divergences']``, is the durable copy; the
+        WARNING is the journal's, so a reword must not drop it either.
 
         Every needle is DERIVED from the fixture's own request/item/worker
         state rather than re-typed as a short literal, and verify_depth is
         pinned as the RENDERED PAIR ``verify_depth=1``.  A bare ``'1'`` would
         be satisfied vacuously — the message body itself contains 'ε=1890',
-        'task-3082' and 'task 3206' — so it would pin the label while letting
+        '§5.3' and 'esc-3206-3' — so it would pin the label while letting
         the %d argument be dropped or reordered against the other three.
         """
         import logging
@@ -1157,8 +1173,8 @@ class TestGuardWarningCarriesCallTimeContext:
             ('verify_depth=1', 'verify_depth label AND value'),
         ):
             assert needle in text, (
-                f'WARNING lost its {what} ({needle!r}) — task 1999: this '
-                f'call-time context exists on NO other §5.3 surface. Got: {text!r}'
+                f'WARNING lost its {what} ({needle!r}): the journal copy of the '
+                f'context the VerifyBaseDivergence record carries. Got: {text!r}'
             )
 
 
@@ -1168,7 +1184,8 @@ class TestGuardWarningCarriesCallTimeContext:
 @pytest.mark.asyncio
 class TestFinalizingHeadInFrozenPrefix:
     """_finalizing_head is included in the frozen prefix when its phase is
-    verifying/gate_reverify/finalizing, and excluded for other phases.
+    verifying/gate_reverify/finalizing and it is not vacated (task 5302), and
+    excluded otherwise.
 
     These tests exercise the _frozen_inflight_entries() branch for
     self._finalizing_head that was untested by the original step-01/02 tests.
@@ -1401,8 +1418,6 @@ class TestDispatchItemGuardWiring:
         Confirms the integration wiring: _dispatch_item returns a verifying
         InflightEntry even when the guard's git call fails.
         """
-        import unittest.mock as mock
-
         worker = _make_worker(git_ops)
 
         # Build an item that passes all _dispatch_item early-bailout checks:
@@ -1420,14 +1435,7 @@ class TestDispatchItemGuardWiring:
         async def _raise_on_get_main(*_args, **_kwargs):
             raise RuntimeError('simulated transient git error')
 
-        async def _noop_verify(_item, _lease, **_kwargs):
-            return None
-
-        with (
-            mock.patch.object(git_ops, 'get_main_sha', side_effect=_raise_on_get_main),
-            mock.patch.object(worker, '_run_inflight_verify', _noop_verify),
-        ):
-            result = await _dispatch(worker, item)
+        result = await _dispatch(worker, git_ops, item, _raise_on_get_main)
 
         # Fail-open: dispatch must return a verifying InflightEntry, not None.
         assert result is not None, (
@@ -1461,7 +1469,6 @@ class TestDispatchItemGuardWiring:
         the rid, confirming the integration seam is active.
         """
         import logging
-        import unittest.mock as mock
 
         worker = _make_worker(git_ops)
 
@@ -1485,15 +1492,8 @@ class TestDispatchItemGuardWiring:
         async def _return_main(*_args, **_kwargs) -> str:
             return 'fake-main'
 
-        async def _noop_verify(_item, _lease, **_kwargs):
-            return None
-
-        with (
-            mock.patch.object(git_ops, 'get_main_sha', side_effect=_return_main),
-            mock.patch.object(worker, '_run_inflight_verify', _noop_verify),
-            caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'),
-        ):
-            result = await _dispatch(worker, item_e)
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
+            result = await _dispatch(worker, git_ops, item_e, _return_main)
 
         # Guard must have fired at least one WARNING naming the dispatched rid.
         warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
@@ -1541,24 +1541,22 @@ async def _dispatch_on_main(
     """Dispatch *item* for real-verify while main reads *main_sha*, then admit
     the entry to the in-flight region as the verifier loop does.
 
-    The verify itself is a no-op, as in :class:`TestDispatchItemGuardWiring`.
+    The verify itself is a no-op (:func:`_dispatch`).
     """
-    import unittest.mock as mock
-
     async def _return_main(*_args, **_kwargs) -> str:
         return main_sha
 
-    async def _noop_verify(_item, _lease, **_kwargs):
-        return None
-
-    with (
-        mock.patch.object(git_ops, 'get_main_sha', side_effect=_return_main),
-        mock.patch.object(worker, '_run_inflight_verify', _noop_verify),
-    ):
-        entry = await _dispatch(worker, item)
+    entry = await _dispatch(worker, git_ops, item, _return_main)
     assert entry is not None and entry.verify_task is not None, 'dispatch was refused'
     _seed_frozen(worker, entry)
     return entry
+
+
+class _FailingEscalations(RecordingEscalations):
+    """An escalation queue whose every filing raises."""
+
+    def submit(self, escalation: Any) -> None:
+        raise RuntimeError('simulated escalation-queue outage')
 
 
 async def _settle(*entries: InflightEntry) -> None:
@@ -1582,9 +1580,10 @@ class TestVerifyBaseDetectorKey:
 
     def _lane(
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+        escalations: RecordingEscalations | None = None,
     ) -> tuple[SpeculativeMergeWorker, RecordingEscalations]:
         """A lane whose frozen prefix is one verifying head with merge commit 'sha-Dc'."""
-        escalations = RecordingEscalations()
+        escalations = RecordingEscalations() if escalations is None else escalations
         worker = make_lane(
             git_ops, verifier=FakeVerifier(), clock=FakeClock(), escalation_queue=escalations,
         )
@@ -1613,6 +1612,28 @@ class TestVerifyBaseDetectorKey:
         assert published[0]['expected_tip'] == 'sha-Dc'
         filed = [e for e in escalations.filed if e.category == _DIVERGENCE_CATEGORY]
         assert len(filed) == 1 and filed[0].level == 1
+        await _settle(entry)
+
+    async def test_a_failed_filing_neither_blocks_dispatch_nor_goes_silent(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        import logging
+
+        worker, _ = self._lane(git_ops, config, git_repo, _FailingEscalations())
+        item_e = self._candidate('t-e', 'wrong-base', config, git_repo)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
+            entry = await _dispatch_on_main(worker, git_ops, item_e, 'fake-main')
+
+        published = worker.snapshot()['verify_base_divergences']
+        assert [d['request_id'] for d in published] == [item_e.request.request_id]
+        failed = [r for r in caplog.records if 'failed to file' in r.getMessage()]
+        assert len(failed) == 1 and failed[0].levelno == logging.WARNING, failed
+        assert failed[0].exc_info is not None, 'the filing failure lost its traceback'
         await _settle(entry)
 
     async def test_divergent_successor_reads_as_a_chain_link_break_not_a_verify_base_string(

@@ -51,7 +51,7 @@ NAME (grep/search), never trust a PRD line offset.
       stay [] (task 5302 retired the ξ=1999 I5 false positive), and the item
       drains.
   11. snapshot() keys are additive-only across the whole module-split batch
-      (13 keys total, resource_audit being the newest).
+      (14 keys total, verify_base_divergences being the newest, task 5302).
   12. InFlightMergeRegistry.acquire/attach fan-out mirror + the
       coalesce_or_enqueue_merge_request dispatched/in_flight/alias contract
       are unchanged by the split.
