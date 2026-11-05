@@ -1646,24 +1646,17 @@ class TaskArtifacts:
     # ──────────────────────────────────────────────────────────────────
 
     def write_verdict(self, role: str, envelope: dict) -> None:
-        """Write ``.task/verdicts/{role}.json``.
+        """Write ``verdicts/{role}.json``.
 
-        Best-effort: if the artifacts root has been removed (worktree gone
-        out-of-band), skip the write rather than raising. Skipping fails
-        closed, because ``_run_reviewer`` treats a missing verdict as ERROR.
-        This method assumes ``init()`` has already created the verdicts' root.
+        Best-effort through ``_write_json``'s default root-gone no-op: a
+        vanished root (worktree gone out-of-band) skips the write and is never
+        recreated. Skipping fails closed, because ``_run_reviewer`` treats a
+        missing verdict as ERROR.
 
         Raises:
             ValueError: if *role* is invalid — see ``_validate_verdict_role``.
         """
         _validate_verdict_role(role)
-        root = self._root_for('verdicts')
-        if not root.is_dir():
-            logger.info(
-                'TaskArtifacts: skipping write_verdict %r — root %s no longer exists',
-                role, root,
-            )
-            return
         self._write_json(f'verdicts/{role}.json', envelope)
 
     def read_verdict(self, role: str) -> dict | None:
@@ -1817,11 +1810,12 @@ class TaskArtifacts:
         single owner of their byte format and their durability guarantees.
 
         It is also the single owner of what a vanished root (the worktree
-        deleted out-of-band) means for a write. By default the write is a
-        logged no-op. A caller whose artifact must not be lost passes
-        *on_root_gone*: the root is then never recreated, only the artifact's
-        own directory below it, and a root found gone raises
-        ``on_root_gone(root)``.
+        deleted out-of-band) means for a write. A write never recreates its
+        root: only ``init()`` creates roots, so the write creates just the
+        artifact's own directory directly below the root. A root found gone,
+        before or during the write, makes the write a logged no-op. A caller
+        whose artifact must not be lost passes *on_root_gone*, and the write
+        raises ``on_root_gone(root)`` instead.
 
         What a concurrent reader may rely on: it observes either the complete
         OLD contents or the complete NEW contents — never a truncated file,
@@ -1867,7 +1861,7 @@ class TaskArtifacts:
         and no current site has a defensible reason to opt out.  Should a
         future caller genuinely write in a loop, give THAT caller the flag
         rather than flipping the default underneath the recovery artifacts.
-        The kwargs this contract turns on are pinned by
+        The ``fsync`` kwarg this contract turns on is pinned by
         ``TestWriteJsonDelegatesToSharedSafeIo``.
 
         An EXISTING target keeps its own permission bits across the swap (see
@@ -1915,24 +1909,22 @@ class TaskArtifacts:
                     'dangling symlink?) — refusing to materialise a stray '
                     'file at the link path'
                 )
-            if on_root_gone is not None and path.parent != root:
+            if path.parent != root:
                 path.parent.mkdir(exist_ok=True)
             # ``_existing_mode`` is inside the try so a NON-FileNotFoundError
             # stat failure (EACCES/ELOOP/ENAMETOOLONG) surfaces through the
             # same path as any other write failure.  It swallows
             # FileNotFoundError ITSELF and reports the target as new, so a
             # vanished target does NOT short-circuit here — it reaches
-            # ``atomic_write_text``, which re-creates the parent chain under
-            # ``mkdir=True``, exactly as the superseded
-            # ``path.parent.mkdir(parents=True)`` did.  The tolerated no-op
-            # branch below is therefore reached from the WRITE, never from
-            # the mode lookup.
+            # ``atomic_write_text``, whose temp-file create raises
+            # FileNotFoundError when the root is gone.  The root-gone branch
+            # below is therefore reached from the directory creation or the
+            # WRITE, never from the mode lookup.
             safe_io.atomic_write_text(
                 target,
                 json.dumps(data, indent=2) + '\n',  # byte format UNCHANGED
                 mode=_existing_mode(target),
                 fsync=True,
-                mkdir=on_root_gone is None,
             )
         except FileNotFoundError as exc:
             if root.is_dir():
