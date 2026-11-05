@@ -14,6 +14,11 @@ from audit_delivered_checks import StalePathSweep, load_manifest_checks, stale_p
 from git_checkout_root import checkout_root_or_skip
 from shared.testing_xdist_groups import single_xdist_group
 
+# Every test here consumes `sweep` or checks this pin, so one loadgroup worker
+# builds the module fixture once.
+_SWEEP_GROUP_NAME = "sidecar_delivered_check_sweep"
+pytestmark = pytest.mark.xdist_group(_SWEEP_GROUP_NAME)
+
 _REMEDY = (
     "repath BOTH halves (this sidecar, and the task record via update_task) to "
     "where the code lives now, or drop the descriptor"
