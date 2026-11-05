@@ -18,11 +18,7 @@ from _git_fixtures import seed_repo
 from _merge_lane_fakes import FakeVerifier, VerifyScript, fails, lane_scene_config, passes
 from _merge_worker_drive import HEAVY_BARRIER_TEST_TIMEOUT
 from _orch_helpers import wait_responsive
-from test_merge_queue_concurrent_verify import (
-    _gated_runner,
-    _GatedVerifier,
-    _inject_two_host_allocator,
-)
+from test_merge_queue_concurrent_verify import _gated_runner, _GatedVerifier
 from test_merge_queue_rebased_landing_dead_base import (
     _land_foreign_commit,
     _running_lane,
@@ -103,11 +99,11 @@ class TestOrdinaryDispatchFacts:
             'in-a': VerifyScript(result=passes().result, release=head_gate),
         })
         store = _LateArrivalFakeEventStore()
+        remote = _gated_runner(b_release, b_entered, passed=True, name='remote-in')
 
-        async with _running_lane(git_ops, verifier=verifier, event_store=store) as (lane, queue):
-            _inject_two_host_allocator(
-                lane, _gated_runner(b_release, b_entered, passed=True, name='remote-in'),
-            )
+        async with _running_lane(
+            git_ops, verifier=verifier, event_store=store, remote_runners=[remote],
+        ) as (_, queue):
             req_a = await _submitted(git_ops, config, 'in-a')
             req_b = await _submitted(git_ops, config, 'in-b')
             await queue.put(req_a)
@@ -203,9 +199,11 @@ async def _cascade(
     )
     b_release, b_entered = asyncio.Event(), asyncio.Event()
     store = _LateArrivalFakeEventStore()
+    laptop = _gated_runner(b_release, b_entered, name='laptop')
 
-    async with _running_lane(git_ops, verifier=verifier, event_store=store) as (lane, queue):
-        _inject_two_host_allocator(lane, _gated_runner(b_release, b_entered, name='laptop'))
+    async with _running_lane(
+        git_ops, verifier=verifier, event_store=store, remote_runners=[laptop],
+    ) as (lane, queue):
         req_a = await _submitted(git_ops, config, f'{prefix}-a')
         req_b = await _submitted(git_ops, config, f'{prefix}-b')
         await queue.put(req_a)
