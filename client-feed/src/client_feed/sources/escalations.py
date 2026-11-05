@@ -15,12 +15,13 @@ from types import MappingProxyType
 from typing import Final
 
 from pydantic import BaseModel, ConfigDict, ValidationError
-from shared.project_layout import escalation_queue_dir
+from shared.project_layout import ESCALATION_QUEUE_RELPATH
 
 from client_feed.contract import NonNegativeInt, Source
 from client_feed.sources.store import StoreProblem, StoreReadError
 from client_feed.sources.task_id import task_id_of
 
+QUEUE_RELPATH: Final = Path(ESCALATION_QUEUE_RELPATH)
 _RECORD_NAME: Final = 'esc-*.json'
 
 
@@ -77,18 +78,18 @@ class _Record(BaseModel):
 
 def _record_paths(root: Path) -> list[Path]:
     """The root's record files in name order; a queue that cannot be listed raises, never reads as empty."""
-    queue = escalation_queue_dir(root)
-    relpath = queue.relative_to(root)
+    queue = root / QUEUE_RELPATH
     try:
         names = os.listdir(queue)
     except FileNotFoundError as exc:
         raise StoreReadError(
-            source=Source.EVENTS, relpath=relpath, problem=StoreProblem.MISSING,
+            source=Source.EVENTS, relpath=QUEUE_RELPATH, problem=StoreProblem.MISSING,
             detail='no such directory',
         ) from exc
     except OSError as exc:
         raise StoreReadError(
-            source=Source.EVENTS, relpath=relpath, problem=StoreProblem.UNREADABLE, detail=str(exc)
+            source=Source.EVENTS, relpath=QUEUE_RELPATH, problem=StoreProblem.UNREADABLE,
+            detail=str(exc),
         ) from exc
     records = sorted(name for name in names if fnmatchcase(name, _RECORD_NAME))
     return [queue / name for name in records]

@@ -15,7 +15,6 @@ from types import MappingProxyType
 from typing import Final, TypeVar
 
 from pydantic import BaseModel, ConfigDict
-from shared.project_layout import ESCALATION_QUEUE_RELPATH
 
 from client_feed.budget import counted_set
 from client_feed.contract import (
@@ -42,7 +41,7 @@ from client_feed.policy import Policy
 from client_feed.redact import redact_paths
 from client_feed.reveals import Answer, RevealOutput, answered_in, reveal_events
 from client_feed.sources.archive import ArchiveReadError
-from client_feed.sources.escalations import OpenEscalations, read_open_escalations
+from client_feed.sources.escalations import QUEUE_RELPATH, OpenEscalations, read_open_escalations
 from client_feed.sources.events import (
     FactoryStatus,
     SkippedRow,
@@ -182,7 +181,7 @@ def _escalations_unit(root: Path, degraded: list[Degradation]) -> OpenEscalation
     if escalations is not None:
         skipped = ((record.name, record.reason) for record in escalations.skipped)
         degraded.extend(
-            _skipped(Source.EVENTS, skipped, unit=f'records in {ESCALATION_QUEUE_RELPATH}')
+            _skipped(Source.EVENTS, skipped, unit=f'records in {QUEUE_RELPATH}')
         )
     return escalations
 
