@@ -51,6 +51,7 @@ try:
     import exception_register
     from _task_db_scan import UNREADABLE_STORE_ERRORS, tasks_db_path
     from dashboard.config import DEFAULT_FUSED_MEMORY_URLS, DashboardConfig
+    from inline_suppressions import BASELINE_PATH
     from shared.governed_exceptions import (
         MalformedDisposition,
         TaskRef,
@@ -698,6 +699,7 @@ def _tighten_body(slack: int) -> _Body:
         ),
         remedy=remedy,
         observation=f'baseline slack_total {slack}',
+        files=(BASELINE_PATH,),
     )
 
 
