@@ -11,6 +11,7 @@ from shared.declared_scope import (
     derive_declared_scope,
     preserves_stamp,
 )
+from shared.task_metadata import is_known_metadata_key, parse_metadata
 
 _TINY = 'fix it'
 
@@ -131,3 +132,38 @@ def test_preserves_stamp_truth_table(
     preserved: bool,
 ) -> None:
     assert preserves_stamp(_blob(stored), _blob(payload), replace=replace) is preserved
+
+
+def test_declared_scope_is_a_known_metadata_key() -> None:
+    assert is_known_metadata_key('declared_scope')
+
+
+def test_a_derived_stamp_passes_the_enforced_write_boundary_typed() -> None:
+    record = derive_declared_scope(['a.py'], 'd', '', basis='submit')
+
+    metadata, warnings = parse_metadata(
+        {'declared_scope': record.model_dump()}, direction='write', enforce=True,
+    )
+
+    assert warnings == []
+    assert metadata.model_extra is not None
+    assert metadata.model_extra['declared_scope'] == record
+    assert isinstance(metadata.model_extra['declared_scope'], DeclaredScope)
+
+
+def test_a_list_valued_slice_is_the_wrong_cardinality() -> None:
+    blob = {'declared_scope': [_STAMP]}
+
+    _, warnings = parse_metadata(blob, direction='read')
+
+    assert [(w.field, w.code) for w in warnings] == [('declared_scope', 'wrong_cardinality')]
+    with pytest.raises(TypeError):
+        parse_metadata(blob, direction='write', enforce=True)
+
+
+def test_a_stored_band_that_disagrees_with_its_counts_reads_as_an_invalid_submodel() -> None:
+    blob = {'declared_scope': {**_STAMP, 'band': 'broad'}}
+
+    _, warnings = parse_metadata(blob, direction='read')
+
+    assert [(w.field, w.code) for w in warnings] == [('declared_scope', 'invalid_submodel')]
