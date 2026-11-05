@@ -7,19 +7,23 @@ escalation, survives a restart, and a resume restarts every window.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import logging
 import sqlite3
+import threading
 from datetime import UTC, datetime, timedelta
 
 import pytest
 import pytest_asyncio
+from _orch_helpers import wait_responsive
 from _shadow_coordinator_doubles import (
     INCUMBENTS,
     PROJECT_ID,
     RUN_ID,
     START,
     CoordinatorRig,
+    RecordingEscalator,
     build_coordinator,
     completed,
     make_task,
@@ -529,6 +533,57 @@ class TestCostGuardsEscape:
         assert {cell.state for cell in _cells(rig)} == {_S.SETTLED}
         assert _causes(rig) == expected
         assert rig.coordinator.storm_state().paused is bool(expected)
+
+
+class _AnnouncingEscalator(RecordingEscalator):
+    """A recording escalator that also signals, thread-safely, once a trip is filed."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.announced = threading.Event()
+
+    async def __call__(self, trip: StormTrip) -> None:
+        await super().__call__(trip)
+        self.announced.set()
+
+
+class TestConcurrentStormEvaluations:
+    @pytest.mark.asyncio
+    async def test_a_stale_calm_snapshot_does_not_overwrite_a_concurrent_pause(
+        self, tmp_path, costs, monkeypatch,
+    ):
+        escalator = _AnnouncingEscalator()
+        rig = build_coordinator(
+            tmp_path, costs, config=shadow_config(daily_budget_usd=1.0), escalator=escalator,
+        )
+        _seed(rig, _S.AWAITING_REFERENCE, task_id='budget-a', cost_usd=0.6)
+        loop = asyncio.get_running_loop()
+        snapshot_taken = asyncio.Event()
+        held: list[bool] = []
+        find = rig.store.find_shadow_cells
+
+        def find_then_hold(query: ShadowCellQuery) -> list[ShadowCell]:
+            cells = find(query)
+            if query.newest_first and not held:
+                held.append(True)
+                loop.call_soon_threadsafe(snapshot_taken.set)
+                escalator.announced.wait(timeout=1.0)
+            return cells
+
+        monkeypatch.setattr(rig.store, 'find_shadow_cells', find_then_hold)
+
+        try:
+            evaluation_a = asyncio.create_task(rig.coordinator.expire(rig.clock.now()))
+            await wait_responsive(snapshot_taken.wait(), label='the first storm snapshot is held')
+            _seed(rig, _S.AWAITING_REFERENCE, task_id='budget-b', cost_usd=0.6)
+            await rig.coordinator.expire(rig.clock.now())
+            await evaluation_a
+        finally:
+            escalator.announced.set()
+
+        assert _causes(rig) == [ShadowStormCause.DAILY_BUDGET]
+        assert rig.coordinator.storm_state() == StormState.of(rig.store.get_shadow_storm(PROJECT_ID))
+        assert rig.coordinator.storm_state().paused is True
 
 
 async def _unreadable_cost(project_id: str, task_ids, **_: object) -> float:
