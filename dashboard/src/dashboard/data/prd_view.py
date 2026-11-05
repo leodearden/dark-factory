@@ -102,6 +102,8 @@ class ViewInput(enum.StrEnum):
 
 HIGH_PRIORITIES = frozenset({'critical', 'high'})
 TOP_SOURCES = 5
+MOVING_WINDOW_DAYS = 14
+"""How recent a member's start or completion must be for its PRD to be moving."""
 UNRECORDED = 'unrecorded'
 OTHER_SOURCES = 'other'
 
@@ -385,6 +387,22 @@ class PrdView:
                 for segment in Segment
             ],
         }
+
+
+@dataclass(frozen=True, slots=True)
+class TaskActivity:
+    """One project's task activity, as its run ledger records it.
+
+    ``started`` holds each task's latest start inside the moving window;
+    ``completed`` each task's latest done completion, ever; ``ever_started``
+    every task that has started at all; ``first_event_at`` the ledger's
+    earliest event, ``None`` for an empty ledger.
+    """
+
+    started: Mapping[int, datetime]
+    completed: Mapping[int, datetime]
+    ever_started: frozenset[int]
+    first_event_at: datetime | None
 
 
 @dataclass(frozen=True)
