@@ -83,6 +83,33 @@ THREAD_LIST_JSON: dict[str, Any] = {
 }
 """``t3_thread_list``'s ``OrchestratorMcpThreadListResult`` for a project with no active thread."""
 
+THREAD_READ_JSON: dict[str, Any] = {
+    'thread': {
+        'threadId': THREAD_ID,
+        'projectId': PROJECT_ID,
+        'title': 'unblock:df#7489 t3-lane',
+        'status': 'running',
+        'latestRunId': RUN_ID,
+        'activeRunId': RUN_ID,
+        'providerInstanceId': 'claudeAgent',
+        'model': 'claude-opus-5-5',
+        'runtimeMode': 'full-access',
+        'worktreePath': None,
+        'runCount': 1,
+        'itemCount': 3,
+        'pendingRequestCount': 0,
+        'archived': False,
+        'settled': False,
+        'settledAt': None,
+    },
+    'recentRuns': [],
+    'items': [],
+    'nextPosition': None,
+    'hasMore': False,
+}
+"""``t3_thread_read``'s ``OrchestratorMcpThreadReadResult``
+(``packages/contracts/src/orchestratorMcp.ts``, the detail abridged); :func:`thread_read` varies it."""
+
 THREAD_LIST_ITEM_JSON: dict[str, Any] = {
     'threadId': THREAD_ID,
     'projectId': PROJECT_ID,
@@ -189,6 +216,11 @@ def unreachable() -> dict[str, Any]:
 
 def listed(**overrides: Any) -> dict[str, Any]:
     return {**THREAD_LIST_ITEM_JSON, **overrides}
+
+
+def thread_read(**thread: Any) -> ToolSuccess:
+    """``t3_thread_read``'s reply with the thread's ``status``, ``archived`` or ``latestRunId`` overridden."""
+    return ToolSuccess({**THREAD_READ_JSON, 'thread': {**THREAD_READ_JSON['thread'], **thread}})
 
 
 def project(root: Path | str, **overrides: Any) -> dict[str, Any]:
@@ -976,9 +1008,9 @@ class TestAwaitStarted:
         )
 
     def test_started_binds_the_transcript_and_folds_the_hand_launched_record(
-        self, env: Env, fake_t3: FakeT3, capsys: pytest.CaptureFixture[str]
+        self, env: Env, t3: FakeT3Server, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        fake_t3.script(list=[ok([listed(status='preparing')]), ok([listed(status='running')])])
+        t3.tool_replies['t3_thread_read'] = replies_in_turn(thread_read(status='preparing'), thread_read(status='running'))
         record_dir = spawn_record(env)
         write_transcript(env, SESSION_ID, trailer(record_dir))
         hand_slug = hand_record(env, SESSION_ID, owner_pid=424242)
@@ -996,9 +1028,9 @@ class TestAwaitStarted:
         assert (folded.status, folded.exit_code) == (sr.Status.EXITED, sr.FOLDED_EXIT_CODE)
 
     def test_started_binds_without_a_pid_when_no_hand_launched_record_exists(
-        self, env: Env, fake_t3: FakeT3, capsys: pytest.CaptureFixture[str]
+        self, env: Env, t3: FakeT3Server, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        fake_t3.script(list=[ok([listed(status='waiting')])])
+        t3.tool_replies['t3_thread_read'] = thread_read(status='waiting')
         record_dir = spawn_record(env)
         write_transcript(env, SESSION_ID, trailer(record_dir))
 
@@ -1008,9 +1040,9 @@ class TestAwaitStarted:
         assert sr.read_record(Path(record_dir).name, root=env.fleet).claude_owner_pid is None
 
     def test_a_session_already_pointing_at_the_spawn_record_folds_nothing(
-        self, env: Env, fake_t3: FakeT3, capsys: pytest.CaptureFixture[str]
+        self, env: Env, t3: FakeT3Server, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        fake_t3.script(list=[ok([listed(status='running')])])
+        t3.tool_replies['t3_thread_read'] = thread_read(status='running')
         record_dir = spawn_record(env)
         slug = Path(record_dir).name
         record = sr.read_record(slug, root=env.fleet)
@@ -1025,9 +1057,9 @@ class TestAwaitStarted:
         assert sr.read_record(slug, root=env.fleet).status == sr.Status.LAUNCHING
 
     def test_started_with_no_transcript_naming_the_record_is_unbound(
-        self, env: Env, fake_t3: FakeT3, capsys: pytest.CaptureFixture[str]
+        self, env: Env, t3: FakeT3Server, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        fake_t3.script(list=[ok([listed(status='running')])])
+        t3.tool_replies['t3_thread_read'] = thread_read(status='running')
         record_dir = spawn_record(env)
         write_transcript(env, 'not-in-first-message', 'hello', later_text=trailer(record_dir))
         write_transcript(env, 'too-old', trailer(record_dir), mtime=time.time() - 3600)
@@ -1040,25 +1072,25 @@ class TestAwaitStarted:
         assert sr.read_record(Path(record_dir).name, root=env.fleet).claude_session_id is None
 
     def test_started_without_a_record_skips_discovery(
-        self, env: Env, fake_t3: FakeT3, capsys: pytest.CaptureFixture[str]
+        self, env: Env, t3: FakeT3Server, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        fake_t3.script(list=[ok([listed(status='completed')])])
+        t3.tool_replies['t3_thread_read'] = thread_read(status='completed')
 
         assert self._await(capsys, env, '') == 'started sid=none hand_slug=none bound=no'
 
     @pytest.mark.parametrize('status', sorted(lane.STARTUP_FAILURE_STATUSES))
     def test_a_failure_status_before_any_transcript_is_failed_to_start(
-        self, env: Env, fake_t3: FakeT3, capsys: pytest.CaptureFixture[str], status: str
+        self, env: Env, t3: FakeT3Server, capsys: pytest.CaptureFixture[str], status: str
     ) -> None:
-        fake_t3.script(list=[ok([listed(status=status)])])
+        t3.tool_replies['t3_thread_read'] = thread_read(status=status)
 
         assert self._await(capsys, env, spawn_record(env)) == 'failed-to-start'
         assert self._await(capsys, env, '') == 'failed-to-start'
 
     def test_a_failure_status_after_the_transcript_appeared_is_started(
-        self, env: Env, fake_t3: FakeT3, capsys: pytest.CaptureFixture[str]
+        self, env: Env, t3: FakeT3Server, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        fake_t3.script(list=[ok([listed(status='failed')])])
+        t3.tool_replies['t3_thread_read'] = thread_read(status='failed')
         record_dir = spawn_record(env)
         write_transcript(env, SESSION_ID, trailer(record_dir))
 
@@ -1067,25 +1099,42 @@ class TestAwaitStarted:
         )
 
     def test_an_interrupted_run_is_started(
-        self, env: Env, fake_t3: FakeT3, capsys: pytest.CaptureFixture[str]
+        self, env: Env, t3: FakeT3Server, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        fake_t3.script(list=[ok([listed(status='interrupted')])])
+        t3.tool_replies['t3_thread_read'] = thread_read(status='interrupted')
 
         assert self._await(capsys, env, '') == 'started sid=none hand_slug=none bound=no'
 
     def test_a_thread_that_never_leaves_preparation_times_out(
-        self, env: Env, fake_t3: FakeT3, capsys: pytest.CaptureFixture[str]
+        self, env: Env, t3: FakeT3Server, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        fake_t3.script(list=[ok([listed(status='queued')])])
+        t3.tool_replies['t3_thread_read'] = thread_read(status='queued')
 
         assert self._await(capsys, env, spawn_record(env), timeout='0.3') == 'timeout'
 
-    def test_an_unreachable_server_times_out(
-        self, env: Env, fake_t3: FakeT3, capsys: pytest.CaptureFixture[str]
+    def test_a_thread_t3_does_not_know_times_out(
+        self, env: Env, t3: FakeT3Server, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        fake_t3.script(list=[unreachable()])
+        t3.tool_replies['t3_thread_read'] = ToolFailure('thread_not_found', f'Thread {THREAD_ID} was not found.')
 
         assert self._await(capsys, env, '', timeout='0.3') == 'timeout'
+
+    def test_a_server_hanging_up_times_out(
+        self, env: Env, t3: FakeT3Server, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        t3.hangs_up = True
+
+        assert self._await(capsys, env, '', timeout='0.3') == 'timeout'
+
+    def test_the_read_names_the_thread(
+        self, env: Env, t3: FakeT3Server, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        t3.tool_replies['t3_thread_read'] = thread_read(status='running')
+
+        self._await(capsys, env, '')
+
+        reads = t3.tool_calls('t3_thread_read')
+        assert reads and all(read['threadId'] == THREAD_ID for read in reads)
 
 
 def test_a_spilled_launch_message_is_discovered(env: Env) -> None:
