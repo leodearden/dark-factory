@@ -616,7 +616,9 @@ def _scan_source_trees() -> tuple[_ScannedModule, ...]:
     the same 509 files is 10.05s.  So the dominant cost was never the I/O the
     ``_read_tree`` cache above removes — it was the two AST tests each parsing
     the whole corpus.  They now share one pass, which is worth ~10s of this
-    module's wall clock against ~1s for de-duplicating the reads.
+    module's wall clock against ~1s for de-duplicating the reads.  Under
+    ``-n auto --dist loadgroup`` the cache is per worker, so the pass is shared
+    only because both tests carry ``_SWEEP_GROUP_NAME``.
 
     Caching the parsed trees instead would save the same 10s and retain
     352.5 MB (tracemalloc, same 509 files) for the rest of the pytest session,
@@ -634,6 +636,9 @@ def _scan_source_trees() -> tuple[_ScannedModule, ...]:
             )
         )
     return tuple(scanned)
+
+
+_SWEEP_GROUP_NAME = 'atomic_write_regrowth_sweep'
 
 
 def _iter_source_files():
@@ -776,6 +781,7 @@ class TestNoRegrownAtomicWriters:
         )
         assert _find_renamers(prose_only) == []
 
+    @pytest.mark.xdist_group(_SWEEP_GROUP_NAME)
     def test_no_unapproved_renamers_in_source_trees(self):
         """Every rename-into-place in a ``_SRC_TREES`` tree is a known, reasoned survivor."""
         actual = {
@@ -808,6 +814,7 @@ class TestNoRegrownAtomicWriters:
             'describing reality.'
         )
 
+    @pytest.mark.xdist_group(_SWEEP_GROUP_NAME)
     def test_atomic_write_text_helpers_only_delegate(self):
         """The surviving ``_atomic_write_text`` names must stay one-liners.
 
