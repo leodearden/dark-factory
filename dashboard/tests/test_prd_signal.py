@@ -460,5 +460,5 @@ def test_signal_coverage_counts_rows_whose_loaded_sidecar_names_a_leaf_over_all_
 
     view = signal_view({KEY: named})
 
-    assert [row.key for row in view.prds] == [KEY, OTHER]
+    assert {row.key for row in view.prds} == {KEY, OTHER}
     assert view.to_wire()['signal_coverage'] == {'named': 1, 'of': 2}

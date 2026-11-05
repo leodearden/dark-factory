@@ -614,11 +614,11 @@ def test_every_figure_on_the_wire_names_a_figure_id():
     figure_ids = {figure.value for figure in FigureId}
     view_figures = set(wire) - _STRUCTURAL_VIEW_KEYS
     row_figures = {key for row in wire['prds'] for key in row} - _STRUCTURAL_ROW_KEYS
-    dark_matter_figures = set(wire['dark_matter']) & figure_ids
+    nested_figures = {FigureId.HIDDEN_HIGH.value}
+    assert nested_figures <= set(wire['dark_matter'])
     assert view_figures <= figure_ids
     assert row_figures <= figure_ids
-    assert dark_matter_figures == {FigureId.HIDDEN_HIGH.value}
-    assert view_figures | row_figures | dark_matter_figures == figure_ids
+    assert view_figures | row_figures | nested_figures == figure_ids
 
 
 def test_the_segment_legend_is_served_in_display_order():

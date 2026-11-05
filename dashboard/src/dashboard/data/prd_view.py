@@ -167,6 +167,10 @@ class FigureId(enum.StrEnum):
     LANE = 'lane'
     LANES = 'lanes'
     ACTIVITY = 'activity'
+    STATE_LINE = 'state_line'
+    NEXT_ACTION = 'next_action'
+    DETAIL = 'detail'
+    HIDDEN_HIGH = 'hidden_high'
 
 
 class ViewInput(enum.StrEnum):
@@ -266,13 +270,37 @@ FIGURE_RULES: MappingProxyType[FigureId, str] = MappingProxyType({
     FigureId.LANES: (
         "The drawn PRDs partitioned by lane, in display order "
         f"{', '.join(lane.value for lane in LANE_DISPLAY_ORDER)}, each lane with its rule. A "
-        f"PRD is in the first lane, in precedence order {_PRECEDENCE_TEXT}, whose rule it meets."
+        f"PRD is in the first lane, in precedence order {_PRECEDENCE_TEXT}, whose rule it meets. "
+        "Within a lane, rows are in attention order: most open high or critical members first, "
+        "then the oldest ready member's age, oldest first, then most ready members, then key."
     ),
     FigureId.ACTIVITY: (
         f"Members, open or done, that started or finished within {MOVING_WINDOW_DAYS} days, "
         "split by direct and follow-up attribution. A done member with no completion event "
         "counts when its done_provenance stamp is in the window. An open member in progress "
         "with no event in the window moves its PRD but is not counted here."
+    ),
+    FigureId.STATE_LINE: (
+        "The row's lane reason with its figures: the escalation or gate awaiting a ruling; the "
+        "open follow-ups under a delivered signal; what holds a parked PRD; activity in the "
+        "window, direct and follow-up apart; for a stuck PRD its ready work and oldest pending "
+        "age, else its unrecorded deferrals, planning births, malformed milestones and the "
+        "first dependency outside it, else its open segments."
+    ),
+    FigureId.NEXT_ACTION: (
+        "What would move the PRD: rule on the escalation, else the gate; for a stuck PRD "
+        "dispatch the oldest ready member, else record why an unrecorded deferral is deferred, "
+        "else unblock the lowest-id open dependency outside the PRD (with that task's own PRD). "
+        "None for moving, tail and parked PRDs, whose state line shows their counts."
+    ),
+    FigureId.DETAIL: (
+        "The ids behind the row's figures: open dependencies outside the PRD with their own "
+        "PRD, the ruling subjects, ready high or critical members oldest first, deferred "
+        "members with no record, and every open high or critical member."
+    ),
+    FigureId.HIDDEN_HIGH: (
+        "Every open high or critical member of a Tail PRD, by id, so a collapsed tail never "
+        "hides high work."
     ),
 })
 
@@ -431,6 +459,10 @@ class RowActivity:
     direct: int
     followup: int
 
+    @property
+    def total(self) -> int:
+        return self.direct + self.followup
+
     def to_wire(self) -> dict[str, object]:
         return {'direct': self.direct, 'followup': self.followup}
 
@@ -442,12 +474,15 @@ class PrdRow:
     key: str
     title: str
     lane: Lane
+    state_line: str
     segments: Mapping[Segment, int]
     total: int
     direct_open_ids: tuple[int, ...]
     followup_open: tuple[Followup, ...]
     ready: ReadyAge
     signal: Signal
+    next_action: NextAction
+    detail: Detail
     activity: RowActivity
 
     def to_wire(self) -> dict[str, object]:
@@ -455,7 +490,10 @@ class PrdRow:
             'key': self.key,
             FigureId.TITLE.value: self.title,
             FigureId.LANE.value: self.lane.value,
+            FigureId.STATE_LINE.value: self.state_line,
             FigureId.SIGNAL.value: self.signal.to_wire(),
+            FigureId.NEXT_ACTION.value: self.next_action.to_wire(),
+            FigureId.DETAIL.value: self.detail.to_wire(),
             FigureId.ACTIVITY.value: self.activity.to_wire(),
             FigureId.SEGMENTS.value: {segment.value: n for segment, n in self.segments.items()},
             FigureId.TOTAL.value: self.total,
@@ -503,6 +541,7 @@ class DarkMatter:
     by_reason: Mapping[UnresolvedReason, int]
     ready_high_ids: tuple[int, ...]
     members: Mapping[UnresolvedReason, tuple[int, ...]]
+    hidden_high: HiddenHigh
 
     def to_wire(self) -> dict[str, object]:
         return {
@@ -513,6 +552,7 @@ class DarkMatter:
             'by_reason': {reason.value: n for reason, n in self.by_reason.items()},
             'ready_high_ids': list(self.ready_high_ids),
             'members': {reason.value: list(ids) for reason, ids in self.members.items()},
+            FigureId.HIDDEN_HIGH.value: self.hidden_high.to_wire(),
         }
 
 
@@ -880,6 +920,7 @@ class _RowContext:
 
     status_map: Mapping[int, str]
     entries: Mapping[int, LineageEntry]
+    attributions: Mapping[int, Attribution]
     documents: Mapping[str, PrdDocument]
     escalations: Mapping[int, tuple[str, ...]]
     activity: TaskActivity
@@ -908,6 +949,7 @@ def _shape_view(
     context = _RowContext(
         status_map=inputs.status_map,
         entries=attributed.entries,
+        attributions=attributed.attributions,
         documents=value(ViewInput.SIGNALS),
         escalations=value(ViewInput.ESCALATIONS),
         activity=value(ViewInput.ACTIVITY),
@@ -936,7 +978,7 @@ def _shape_view(
         lanes=_lanes(prd_rows),
         closed=closed,
         unattributed_done=unattributed_done,
-        dark_matter=_dark_matter(dark, inputs.status_map),
+        dark_matter=_dark_matter(dark, inputs.status_map, _hidden_high(prd_rows)),
         multi_link=attributed.multi_link,
         signal_coverage=SignalCoverage(
             named=sum(_names_a_leaf(context.document(row.key)) for row in prd_rows),
@@ -967,7 +1009,19 @@ def _prd_rows(
         else:
             closed_prds += 1
             closed_tasks += len(members)
+    rows.sort(key=lambda row: (_DISPLAY_INDEX[row.lane], *_attention(row)))
     return tuple(rows), Closed(prds=closed_prds, tasks=closed_tasks)
+
+
+_DISPLAY_INDEX: Mapping[Lane, int] = MappingProxyType(
+    {lane: index for index, lane in enumerate(LANE_DISPLAY_ORDER)},
+)
+
+
+def _attention(row: PrdRow) -> tuple[int, int, int, str]:
+    """Most open high work, then the oldest ready age, then most ready, then key."""
+    age = row.ready.oldest_pending_days
+    return (-len(row.detail.high_open_ids), -(-1 if age is None else age), -row.ready.count, row.key)
 
 
 def _prd_row(
@@ -978,19 +1032,14 @@ def _prd_row(
 ) -> PrdRow:
     document = context.document(key)
     signal = signal_of(key, document, context.status_map, context.entries)
-    recent = [member for member in members if _recently_active(member, context)]
-    facts = _LaneFacts(
-        ruling_refs=_ruling_refs(open_members, context),
-        signal=signal.mark,
-        holds=tuple(_member_hold(member, context) for member in open_members),
-        recently_active=bool(recent),
-        in_progress=any(member.segment is Segment.IN_PROGRESS for member in open_members),
-    )
+    facts = _row_facts(key, members, open_members, signal.mark, context)
+    lane = _lane_of(facts)
     counts = Counter(member.segment for member in members)
     return PrdRow(
         key=key,
         title=document.title or key,
-        lane=_lane_of(facts),
+        lane=lane,
+        state_line=_STATE_LINES[lane](facts),
         signal=signal,
         segments=MappingProxyType({segment: counts[segment] for segment in Segment}),
         total=len(members),
@@ -998,12 +1047,44 @@ def _prd_row(
         followup_open=tuple(
             Followup(m.task_id, m.attribution.hops) for m in open_members if not m.attribution.direct
         ),
-        ready=_ready_age([member for member in members if member.segment is Segment.READY],
-                         context.now),
+        ready=facts.ready,
+        next_action=_NEXT_ACTIONS[lane](facts),
+        detail=Detail(
+            blocker_refs=facts.blockers,
+            ruling_refs=facts.ruling_refs,
+            oldest_ready_high_ids=_oldest_first(m for m in facts.ready_members if _is_high(m)),
+            deferred_unrecorded_ids=facts.held_as(MemberHold.UNRECORDED_DEFERRAL),
+            high_open_ids=tuple(m.task_id for m in open_members if _is_high(m)),
+        ),
+        activity=facts.activity,
+    )
+
+
+def _row_facts(
+    key: str,
+    members: Sequence[_Member],
+    open_members: Sequence[_Member],
+    signal: SignalMark,
+    context: _RowContext,
+) -> _RowFacts:
+    recent = [member for member in members if _recently_active(member, context)]
+    ready = tuple(member for member in members if member.segment is Segment.READY)
+    direct_open = sum(member.attribution.direct for member in open_members)
+    return _RowFacts(
+        ruling_refs=_ruling_refs(open_members, context),
+        signal=signal,
+        holds=MappingProxyType({m.task_id: _member_hold(m, context) for m in open_members}),
         activity=RowActivity(
             direct=sum(member.attribution.direct for member in recent),
             followup=sum(not member.attribution.direct for member in recent),
         ),
+        in_progress=sum(member.segment is Segment.IN_PROGRESS for member in open_members),
+        ready=_ready_age(ready, context.now),
+        ready_members=ready,
+        blockers=_outside_blockers(key, open_members, context),
+        open_segments=MappingProxyType(Counter(member.segment for member in open_members)),
+        direct_open=direct_open,
+        followup_open=len(open_members) - direct_open,
     )
 
 
@@ -1052,27 +1133,114 @@ class RulingRef:
         return {'task_id': self.task_id, 'escalation_id': self.escalation_id}
 
 
+class NextActionKind(enum.StrEnum):
+    """What would move a PRD, by lane (§4.8's next-action chip)."""
+
+    RULE_ON = 'rule_on'
+    DISPATCH = 'dispatch'
+    UNBLOCK_DEPENDENCY = 'unblock_dependency'
+    RECORD_DEFERRAL = 'record_deferral'
+    NONE = 'none'
+
+
 @dataclass(frozen=True, slots=True)
-class _LaneFacts:
-    """What one PRD's lane is decided from."""
+class ActionTarget:
+    """The task a next action names, its escalation for a ruling, its own PRD for a blocker."""
+
+    task_id: int
+    escalation_id: str | None
+    prd: str | None
+
+    def to_wire(self) -> dict[str, object]:
+        return {'task_id': self.task_id, 'escalation_id': self.escalation_id, 'prd': self.prd}
+
+
+@dataclass(frozen=True, slots=True)
+class NextAction:
+    kind: NextActionKind
+    target: ActionTarget | None
+    text: str
+
+    def to_wire(self) -> dict[str, object]:
+        return {
+            'kind': self.kind.value,
+            'target': None if self.target is None else self.target.to_wire(),
+            'text': self.text,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class TaskRef:
+    """A task and the PRD it belongs to, ``None`` for one no PRD owns."""
+
+    task_id: int
+    prd: str | None
+
+    def to_wire(self) -> dict[str, object]:
+        return {'task_id': self.task_id, 'prd': self.prd}
+
+
+@dataclass(frozen=True, slots=True)
+class Detail:
+    """The ids behind a row's figures."""
+
+    blocker_refs: tuple[TaskRef, ...]
+    ruling_refs: tuple[RulingRef, ...]
+    oldest_ready_high_ids: tuple[int, ...]
+    deferred_unrecorded_ids: tuple[int, ...]
+    high_open_ids: tuple[int, ...]
+
+    def to_wire(self) -> dict[str, object]:
+        return {
+            'blocker_refs': [ref.to_wire() for ref in self.blocker_refs],
+            'ruling_refs': [ref.to_wire() for ref in self.ruling_refs],
+            'oldest_ready_high_ids': list(self.oldest_ready_high_ids),
+            'deferred_unrecorded_ids': list(self.deferred_unrecorded_ids),
+            'high_open_ids': list(self.high_open_ids),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class HiddenHigh:
+    """Every open high or critical member of a Tail PRD."""
+
+    refs: tuple[TaskRef, ...]
+
+    def to_wire(self) -> dict[str, object]:
+        return {'count': len(self.refs), 'refs': [ref.to_wire() for ref in self.refs]}
+
+
+@dataclass(frozen=True, slots=True)
+class _RowFacts:
+    """What one PRD's lane, state line, next action and detail are read from."""
 
     ruling_refs: tuple[RulingRef, ...]
     signal: SignalMark
-    holds: tuple[MemberHold, ...]
-    recently_active: bool
-    in_progress: bool
+    holds: Mapping[int, MemberHold]
+    activity: RowActivity
+    in_progress: int
+    ready: ReadyAge
+    ready_members: tuple[_Member, ...]
+    blockers: tuple[TaskRef, ...]
+    open_segments: Mapping[Segment, int]
+    direct_open: int
+    followup_open: int
+
+    def held_as(self, hold: MemberHold) -> tuple[int, ...]:
+        """The open members with *hold*, by id."""
+        return tuple(task_id for task_id, verdict in self.holds.items() if verdict is hold)
 
 
-_LANE_TESTS: Mapping[Lane, Callable[[_LaneFacts], bool]] = MappingProxyType({
+_LANE_TESTS: Mapping[Lane, Callable[[_RowFacts], bool]] = MappingProxyType({
     Lane.RULING: lambda facts: bool(facts.ruling_refs),
     Lane.TAIL: lambda facts: facts.signal is SignalMark.DELIVERED,
-    Lane.PARKED: lambda facts: all(hold in _HOLDING for hold in facts.holds),
-    Lane.MOVING: lambda facts: facts.recently_active or facts.in_progress,
+    Lane.PARKED: lambda facts: all(hold in _HOLDING for hold in facts.holds.values()),
+    Lane.MOVING: lambda facts: facts.activity.total > 0 or facts.in_progress > 0,
     Lane.STUCK: lambda facts: True,
 })
 
 
-def _lane_of(facts: _LaneFacts) -> Lane:
+def _lane_of(facts: _RowFacts) -> Lane:
     return next(lane for lane in LANE_PRECEDENCE if _LANE_TESTS[lane](facts))
 
 
@@ -1164,6 +1332,190 @@ def _in_window(at: datetime | None, now: datetime) -> bool:
     return at is not None and now - at <= _MOVING_WINDOW
 
 
+def _outside_blockers(
+    key: str, open_members: Sequence[_Member], context: _RowContext,
+) -> tuple[TaskRef, ...]:
+    """The open members' non-terminal dependencies outside this PRD, by id, with their own PRD."""
+    outside: set[int] = set()
+    for member in open_members:
+        for dependency in (member.row or {}).get('dependencies') or ():
+            status = context.status_map.get(dependency)
+            if status is not None and status not in TERMINAL and _prd_of(dependency, context) != key:
+                outside.add(dependency)
+    return tuple(TaskRef(task_id, _prd_of(task_id, context)) for task_id in sorted(outside))
+
+
+def _prd_of(task_id: int, context: _RowContext) -> str | None:
+    return context.attributions.get(task_id, _LINEAGE_PENDING).prd
+
+
+def _is_high(member: _Member) -> bool:
+    return _recorded(_row_value(member.row, 'priority')) in HIGH_PRIORITIES
+
+
+def _oldest_first(members: Iterable[_Member]) -> tuple[int, ...]:
+    """*members*' ids by pending anchor, oldest first; those with no anchor last, by id."""
+    def age_key(member: _Member) -> tuple[bool, float, int]:
+        anchor = _pending_anchor(_metadata_of(member.row))
+        return (anchor is None, 0.0 if anchor is None else anchor.timestamp(), member.task_id)
+    return tuple(member.task_id for member in sorted(members, key=age_key))
+
+
+def _hidden_high(rows: Sequence[PrdRow]) -> HiddenHigh:
+    refs = (
+        TaskRef(task_id, row.key)
+        for row in rows if row.lane is Lane.TAIL
+        for task_id in row.detail.high_open_ids
+    )
+    return HiddenHigh(tuple(sorted(refs, key=lambda ref: ref.task_id)))
+
+
+# ---------------------------------------------------------------------------
+# State lines and next actions, one builder per lane (§4.8)
+# ---------------------------------------------------------------------------
+
+
+def _plural(count: int, noun: str) -> str:
+    return f'{count} {noun}' if count == 1 else f'{count} {noun}s'
+
+
+def _ruling_subject(ref: RulingRef) -> str:
+    if ref.escalation_id is None:
+        return f'gate #{ref.task_id}'
+    return f'{ref.escalation_id} (#{ref.task_id})'
+
+
+def _with_prd(ref: TaskRef) -> str:
+    return f'#{ref.task_id} ({ref.prd or "no PRD"})'
+
+
+def _ruling_line(facts: _RowFacts) -> str:
+    first, *rest = facts.ruling_refs
+    more = f' and {len(rest)} more' if rest else ''
+    return f'awaits ruling on {_ruling_subject(first)}{more}'
+
+
+def _tail_line(facts: _RowFacts) -> str:
+    direct = f'{facts.direct_open} direct, ' if facts.direct_open else ''
+    return f'signal delivered; {direct}{_plural(facts.followup_open, "follow-up")} open'
+
+
+def _parked_line(facts: _RowFacts) -> str:
+    deferred = len(facts.held_as(MemberHold.HELD_DEFERRAL))
+    milestones = len(facts.held_as(MemberHold.HELD_MILESTONE))
+    parts = (
+        f'{deferred} deferred with a recorded trigger' if deferred else '',
+        f'{milestones} pending until a milestone fires' if milestones else '',
+    )
+    return 'held: ' + ', '.join(part for part in parts if part)
+
+
+def _moving_line(facts: _RowFacts) -> str:
+    activity = facts.activity
+    line = (
+        f'moving: {activity.direct} direct, {_plural(activity.followup, "follow-up")} '
+        f'started or finished in {MOVING_WINDOW_DAYS} d'
+    )
+    if activity.total:
+        return line
+    return f'{line}; {facts.in_progress} in progress'
+
+
+def _stuck_line(facts: _RowFacts) -> str:
+    if facts.ready.count:
+        return f'{_ready_clause(facts.ready)}; nothing started in {MOVING_WINDOW_DAYS} d'
+    clauses = [clause for build in _STUCK_CLAUSES if (clause := build(facts))]
+    if clauses:
+        return '; '.join(clauses)
+    open_counts = (
+        f'{n} {SEGMENT_LABELS[segment]}'
+        for segment in Segment if (n := facts.open_segments.get(segment, 0))
+    )
+    return f'nothing ready: {", ".join(open_counts)}'
+
+
+def _ready_clause(ready: ReadyAge) -> str:
+    if ready.oldest_pending_days is None:
+        return f'{ready.count} ready'
+    bound = '≥' if ready.oldest_is_lower_bound else ''
+    return f'{ready.count} ready, oldest pending {bound}{ready.oldest_pending_days} d'
+
+
+def _unrecorded_clause(facts: _RowFacts) -> str | None:
+    unrecorded = len(facts.held_as(MemberHold.UNRECORDED_DEFERRAL))
+    return f'{unrecorded} deferred with no recorded reason' if unrecorded else None
+
+
+def _planning_clause(facts: _RowFacts) -> str | None:
+    births = len(facts.held_as(MemberHold.PLANNING_BIRTH))
+    return f'{_plural(births, "planning birth")} not yet committed' if births else None
+
+
+def _malformed_clause(facts: _RowFacts) -> str | None:
+    malformed = facts.held_as(MemberHold.MALFORMED_MILESTONE)
+    if not malformed:
+        return None
+    noun = 'malformed milestone' if len(malformed) == 1 else 'malformed milestones'
+    return f'{noun} on {", ".join(f"#{task_id}" for task_id in malformed)}'
+
+
+def _blocker_clause(facts: _RowFacts) -> str | None:
+    if not facts.blockers:
+        return None
+    return f'nothing ready: waiting on {_with_prd(facts.blockers[0])}'
+
+
+_STUCK_CLAUSES: tuple[Callable[[_RowFacts], str | None], ...] = (
+    _unrecorded_clause, _planning_clause, _malformed_clause, _blocker_clause,
+)
+
+_STATE_LINES: Mapping[Lane, Callable[[_RowFacts], str]] = MappingProxyType({
+    Lane.RULING: _ruling_line,
+    Lane.TAIL: _tail_line,
+    Lane.PARKED: _parked_line,
+    Lane.MOVING: _moving_line,
+    Lane.STUCK: _stuck_line,
+})
+
+_NO_ACTION = NextAction(NextActionKind.NONE, None, '')
+
+
+def _rule_on(facts: _RowFacts) -> NextAction:
+    ref = facts.ruling_refs[0]
+    target = ActionTarget(ref.task_id, ref.escalation_id, None)
+    return NextAction(NextActionKind.RULE_ON, target, f'rule on {_ruling_subject(ref)}')
+
+
+def _unstick(facts: _RowFacts) -> NextAction:
+    """Dispatch the oldest ready member, else record a deferral, else unblock a dependency."""
+    if facts.ready_members:
+        oldest = facts.ready.oldest_task_id
+        task_id = min(m.task_id for m in facts.ready_members) if oldest is None else oldest
+        target = ActionTarget(task_id, None, None)
+        return NextAction(NextActionKind.DISPATCH, target, f'dispatch #{task_id}')
+    if unrecorded := facts.held_as(MemberHold.UNRECORDED_DEFERRAL):
+        target = ActionTarget(unrecorded[0], None, None)
+        return NextAction(
+            NextActionKind.RECORD_DEFERRAL, target, f'record why #{unrecorded[0]} is deferred',
+        )
+    if facts.blockers:
+        blocker = facts.blockers[0]
+        target = ActionTarget(blocker.task_id, None, blocker.prd)
+        return NextAction(
+            NextActionKind.UNBLOCK_DEPENDENCY, target, f'unblock {_with_prd(blocker)}',
+        )
+    return _NO_ACTION
+
+
+_NEXT_ACTIONS: Mapping[Lane, Callable[[_RowFacts], NextAction]] = MappingProxyType({
+    Lane.RULING: _rule_on,
+    Lane.TAIL: lambda _: _NO_ACTION,
+    Lane.PARKED: lambda _: _NO_ACTION,
+    Lane.MOVING: lambda _: _NO_ACTION,
+    Lane.STUCK: _unstick,
+})
+
+
 def _ready_age(ready: Sequence[_Member], now: datetime) -> ReadyAge:
     lower_bound = False
     oldest: tuple[datetime, int] | None = None
@@ -1190,7 +1542,9 @@ def _pending_anchor(metadata: Mapping[str, Any]) -> datetime | None:
 
 
 def _dark_matter(
-    dark: Mapping[UnresolvedReason, list[_Member]], status_map: Mapping[int, str],
+    dark: Mapping[UnresolvedReason, list[_Member]],
+    status_map: Mapping[int, str],
+    hidden_high: HiddenHigh,
 ) -> DarkMatter:
     everyone = [member for members in dark.values() for member in members]
     priorities = Counter(_recorded(_row_value(m.row, 'priority')) for m in everyone)
@@ -1214,6 +1568,7 @@ def _dark_matter(
             for reason in UnresolvedReason
             if dark.get(reason)
         }),
+        hidden_high=hidden_high,
     )
 
 
@@ -1338,6 +1693,8 @@ class PrdViewInvariant(enum.StrEnum):
     DARK_MATTER_TOTAL = 'dark_matter_total'
     OPEN_ID_ONCE = 'open_id_once'
     FIGURE_RULE = 'figure_rule'
+    LANES_PARTITION = 'lanes_partition'
+    FIGURE_PRESENT = 'figure_present'
 
 
 class PrdViewContractError(DatumContractError):
@@ -1360,7 +1717,10 @@ def validate_prd_view(view: PrdView, status_map: Mapping[int, str]) -> None:
     _check_dark_matter_total(view.dark_matter)
     _check_census_identity(view, build_census(status_map))
     _check_open_ids_once(view, status_map)
-    _check_figure_rules(view)
+    _check_lanes_partition(view)
+    wire = view.to_wire()
+    _check_figure_rules(wire)
+    _check_figures_present(wire)
 
 
 def _check_row(row: PrdRow) -> None:
@@ -1415,7 +1775,7 @@ def _check_open_ids_once(view: PrdView, status_map: Mapping[int, str]) -> None:
         'missing': sorted(expected - listed.keys()),
         'not open': sorted(listed.keys() - expected),
     }
-    named = [f'{label} {_ids(ids)}' for label, ids in problems.items() if ids]
+    named = [f'{label} {_listed(ids)}' for label, ids in problems.items() if ids]
     if named:
         raise PrdViewContractError(
             PrdViewInvariant.OPEN_ID_ONCE,
@@ -1431,9 +1791,56 @@ def _listed_open_ids(view: PrdView) -> Iterable[int]:
         yield from ids
 
 
-def _check_figure_rules(view: PrdView) -> None:
-    view_figures = set(view.to_wire()) - _STRUCTURAL_VIEW_KEYS
-    row_figures = {key for row in view.prds for key in row.to_wire()} - _STRUCTURAL_ROW_KEYS
+def _check_lanes_partition(view: PrdView) -> None:
+    listed = Counter(key for entry in view.lanes for key in entry.prd_keys)
+    row_lanes = {row.key: row.lane for row in view.prds}
+    filed = {key: entry.lane for entry in view.lanes for key in entry.prd_keys}
+    problems = {
+        'duplicated': sorted(key for key, n in listed.items() if n > 1),
+        'missing': sorted(row_lanes.keys() - listed.keys()),
+        'not drawn': sorted(listed.keys() - row_lanes.keys()),
+        'in another lane than its row': sorted(
+            key for key, lane in filed.items() if key in row_lanes and row_lanes[key] is not lane
+        ),
+    }
+    named = [f'{label} {_listed(keys)}' for label, keys in problems.items() if keys]
+    if named:
+        raise PrdViewContractError(
+            PrdViewInvariant.LANES_PARTITION,
+            f'every drawn PRD must be in exactly its row\'s lane: {"; ".join(named)}',
+        )
+
+
+_REQUIRED_ROW_FIGURES = (
+    FigureId.TITLE, FigureId.LANE, FigureId.STATE_LINE, FigureId.SIGNAL, FigureId.NEXT_ACTION,
+    FigureId.ACTIVITY, FigureId.DETAIL,
+)
+_REQUIRED_VIEW_FIGURES = (FigureId.LANES, FigureId.SIGNAL_COVERAGE, FigureId.DARK_MATTER)
+
+
+def _check_figures_present(wire: Mapping[str, object]) -> None:
+    missing = [figure.value for figure in _REQUIRED_VIEW_FIGURES if figure.value not in wire]
+    dark_matter = wire.get(FigureId.DARK_MATTER.value)
+    if isinstance(dark_matter, Mapping) and FigureId.HIDDEN_HIGH.value not in dark_matter:
+        missing.append(f'{FigureId.DARK_MATTER}.{FigureId.HIDDEN_HIGH}')
+    rows = wire.get('prds')
+    for row in rows if isinstance(rows, list) else ():
+        missing.extend(
+            f'{row.get("key")}.{figure}' for figure in _REQUIRED_ROW_FIGURES if figure.value not in row
+        )
+    if missing:
+        raise PrdViewContractError(
+            PrdViewInvariant.FIGURE_PRESENT,
+            f'required figures missing from the wire: {_listed(missing)}',
+        )
+
+
+def _check_figure_rules(wire: Mapping[str, object]) -> None:
+    rows = wire.get('prds')
+    view_figures = set(wire) - _STRUCTURAL_VIEW_KEYS
+    row_figures = {
+        key for row in (rows if isinstance(rows, list) else ()) for key in row
+    } - _STRUCTURAL_ROW_KEYS
     unnamed = sorted((view_figures | row_figures) - {figure.value for figure in FigureId})
     if unnamed:
         raise PrdViewContractError(
@@ -1442,7 +1849,7 @@ def _check_figure_rules(view: PrdView) -> None:
         )
 
 
-def _ids(ids: Sequence[int]) -> str:
-    shown = ', '.join(str(task_id) for task_id in ids[:_LISTED_IDS_CAP])
-    more = len(ids) - _LISTED_IDS_CAP
+def _listed(items: Sequence[object]) -> str:
+    shown = ', '.join(str(item) for item in items[:_LISTED_IDS_CAP])
+    more = len(items) - _LISTED_IDS_CAP
     return f'[{shown}]' + (f' (+{more} more)' if more > 0 else '')
