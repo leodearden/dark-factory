@@ -32,7 +32,7 @@ from _shadow_coordinator_doubles import (
 from shared.cost_store import CostStore
 
 from orchestrator.event_store import EventType, ShadowSkipReason
-from orchestrator.run_store import ShadowCell, ShadowCellQuery
+from orchestrator.run_store import ShadowCell, ShadowCellQuery, ShadowStormRecord
 from orchestrator.shadow_eval import (
     COST_UNREADABLE_PAUSE,
     PRODUCTION_COST_BASIS,
@@ -584,6 +584,39 @@ class TestConcurrentStormEvaluations:
         assert _causes(rig) == [ShadowStormCause.DAILY_BUDGET]
         assert rig.coordinator.storm_state() == StormState.of(rig.store.get_shadow_storm(PROJECT_ID))
         assert rig.coordinator.storm_state().paused is True
+
+    @pytest.mark.asyncio
+    async def test_a_stale_paused_snapshot_does_not_overwrite_a_concurrent_resume(
+        self, tmp_path, costs, monkeypatch,
+    ):
+        rig = await _tripped_streak(tmp_path, costs)
+        loop = asyncio.get_running_loop()
+        snapshot_taken = asyncio.Event()
+        resumed = threading.Event()
+        held: list[bool] = []
+        get = rig.store.get_shadow_storm
+
+        def get_then_hold(project_id: str) -> ShadowStormRecord:
+            storm = get(project_id)
+            if storm.paused and not held:
+                held.append(True)
+                loop.call_soon_threadsafe(snapshot_taken.set)
+                resumed.wait(timeout=1.0)
+            return storm
+
+        monkeypatch.setattr(rig.store, 'get_shadow_storm', get_then_hold)
+
+        evaluation = asyncio.create_task(rig.coordinator.expire(rig.clock.now()))
+        await wait_responsive(snapshot_taken.wait(), label='a paused storm snapshot is held')
+        try:
+            assert await rig.coordinator.resume() is True
+        finally:
+            resumed.set()
+        await evaluation
+
+        assert rig.store.get_shadow_storm(PROJECT_ID).paused is False
+        assert rig.coordinator.storm_state() == StormState(paused=False, cause=None, detail=None)
+        assert len(rig.escalator.trips) == 1
 
 
 async def _unreadable_cost(project_id: str, task_ids, **_: object) -> float:
