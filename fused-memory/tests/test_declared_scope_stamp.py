@@ -201,3 +201,96 @@ async def test_only_tasks_filed_after_the_stamp_carry_it(stack: Stack, curator_c
     assert 'declared_scope' not in await stack.metadata(pre_deploy)
     found = await stack.call('find_tasks_by_metadata', key='declared_scope')
     assert {str(row['task_id']) for row in found['results']} == filed
+
+
+# Decision 7: update_task may not add, alter or remove the stamp; an unchanged echo passes.
+
+_MODES = ['merge', 'additive', 'replace']
+
+
+async def _stamped(stack: Stack, title: str, files: list[str]) -> tuple[str, dict[str, Any]]:
+    task_id = await stack.file_planned(title=title, description=f'{title} body', metadata={'files': files})
+    return task_id, await stack.metadata(task_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mode', _MODES)
+@pytest.mark.parametrize(
+    'alteration', [{'band': 'moderate', 'files': 3}, {'basis': 'combine'}], ids=['band', 'basis'],
+)
+async def test_update_task_cannot_alter_the_stamp(
+    stack: Stack, mode: str, alteration: dict[str, Any],
+) -> None:
+    task_id, metadata = await _stamped(stack, f'alter {mode}', _files(1))
+    altered = {**metadata['declared_scope'], **alteration}
+    payload = {**metadata, 'declared_scope': altered} if mode == 'replace' else {'declared_scope': altered}
+
+    result = await stack.call('update_task', id=task_id, metadata=payload, metadata_mode=mode)
+
+    _assert_write_authority(result, task_id)
+    assert (await stack.metadata(task_id))['declared_scope'] == metadata['declared_scope']
+
+
+@pytest.mark.asyncio
+async def test_a_replace_that_omits_the_stamp_is_refused(stack: Stack) -> None:
+    task_id, metadata = await _stamped(stack, 'replace drops the stamp', _files(1))
+    without = {key: value for key, value in metadata.items() if key != 'declared_scope'}
+
+    result = await stack.call('update_task', id=task_id, metadata=without, metadata_mode='replace')
+
+    _assert_write_authority(result, task_id)
+    assert (await stack.metadata(task_id))['declared_scope'] == metadata['declared_scope']
+
+
+@pytest.mark.asyncio
+async def test_update_task_cannot_stamp_a_pre_deploy_task(stack: Stack) -> None:
+    pre_deploy = await stack.seed('filed before the stamp existed', {'files': _files(1)})
+
+    result = await stack.call(
+        'update_task', id=pre_deploy, metadata={'declared_scope': _FORGED}, metadata_mode='merge',
+    )
+
+    _assert_write_authority(result, pre_deploy)
+    assert 'declared_scope' not in await stack.metadata(pre_deploy)
+
+
+@pytest.mark.asyncio
+async def test_a_replace_carrying_the_stamp_verbatim_is_accepted(stack: Stack) -> None:
+    task_id, metadata = await _stamped(stack, 'replace carries the stamp', _files(1))
+
+    result = await stack.call(
+        'update_task', id=task_id, metadata={**metadata, 'x_note': 'changed'}, metadata_mode='replace',
+    )
+
+    assert result.get('error') is None, result
+    after = await stack.metadata(task_id)
+    assert after['x_note'] == 'changed'
+    assert after['declared_scope'] == metadata['declared_scope']
+
+
+@pytest.mark.asyncio
+async def test_a_merge_echoing_the_stamp_is_accepted(stack: Stack) -> None:
+    task_id, metadata = await _stamped(stack, 'merge echoes the stamp', _files(1))
+
+    result = await stack.call(
+        'update_task', id=task_id,
+        metadata={'declared_scope': metadata['declared_scope'], 'x_note': 'echoed'}, metadata_mode='merge',
+    )
+
+    assert result.get('error') is None, result
+    after = await stack.metadata(task_id)
+    assert after['x_note'] == 'echoed'
+    assert after['declared_scope'] == metadata['declared_scope']
+
+
+@pytest.mark.asyncio
+async def test_rewriting_files_does_not_re_derive_the_stamp(stack: Stack) -> None:
+    task_id, metadata = await _stamped(stack, 'files refined at planning', [])
+    assert metadata['declared_scope']['band'] == 'undeclared'
+
+    result = await stack.call('update_task', id=task_id, metadata={'files': _files(8)}, metadata_mode='merge')
+
+    assert result.get('error') is None, result
+    after = await stack.metadata(task_id)
+    assert after['files'] == _files(8)
+    assert (after['declared_scope']['band'], after['declared_scope']['files']) == ('undeclared', 0)
