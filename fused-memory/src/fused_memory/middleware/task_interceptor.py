@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypedDict, get_args
 import shared.deploy_state  # noqa: F401  # populate W3 metadata registry with the deploy_state sub-model (DS shared-visible registration; §5.2)
 from pydantic import ValidationError
 from shared import process_identity
+from shared.declared_scope import preserves_stamp
 from shared.defects import DeclareEvent, OutcomeEvent
 from shared.mcp_envelope import write_failure_reason
 from shared.task_metadata import DoneProvenance, SchemaWarning, parse_metadata
@@ -33,6 +34,7 @@ from fused_memory.backends.defect_records import (
 from fused_memory.backends.metadata_lookup import DEFAULT_LOOKUP_LIMIT
 from fused_memory.backends.sqlite_task_backend import task_timestamp_now
 from fused_memory.backends.task_backend_errors import (
+    DeclaredScopeWriteAuthorityError,
     DefectRecordsWriteAuthorityError,
     DeferralWriteAuthorityError,
     DoneProvenanceWriteAuthorityError,
@@ -4124,6 +4126,8 @@ class TaskInterceptor:
         incoming_metadata = coerce_task_metadata(metadata)
         if 'deferral' in (incoming_metadata or {}):
             return DeferralWriteAuthorityError(None).to_error_dict()
+        if not preserves_stamp({}, incoming_metadata or {}, replace=False):
+            return DeclaredScopeWriteAuthorityError(None).to_error_dict()
         # Before the planning_mode split, so both creation paths refuse
         # synchronously, before a ticket or a row is written.
         try:
