@@ -1856,14 +1856,15 @@ def render_markdown(report: Report) -> str:
         'Simulating over the live corpus can only ever move a fact the regex '
         'ALREADY matched, so when the regex matches nothing this table is '
         'necessarily all zeroes — that is the finding, not an omission. The '
-        'independent corroboration runs against the sweep suite\'s full pinned '
-        'precision parametrization, mechanically, in:',
+        'independent corroboration runs against the extraction suite\'s full '
+        'pinned precision parametrization, mechanically, in:',
         '',
         f'    {report.revalidation_test}',
         '',
         'That gate parametrizes over the shared pinned corpora in '
-        '`fused-memory/tests/reconciliation/plural_enum_shapes.py`, which the '
-        'sweep suite parametrizes off too, so a shape appended there '
+        '`fused-memory/tests/reconciliation/plural_enum_shapes.py`, which '
+        '`fused-memory/tests/reconciliation/test_status_snapshot_extraction.py` '
+        'parametrizes off too, so a shape appended there '
         're-validates both candidates automatically.',
         '',
         '## Enumeration coverage',
