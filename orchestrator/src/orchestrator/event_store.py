@@ -210,6 +210,15 @@ class EventType(StrEnum):
     # on); vocabulary in orchestrator/src/orchestrator/merge_verify_facts.py,
     # rationale in plans/merge-lane-policy-prd.md D10.
     merge_verify = 'merge_verify'
+    # The merge lane cancelled a still-running merge verify (task 8523).
+    # task_id-keyed, phase='merge'; emitted by
+    # orchestrator/src/orchestrator/merge_lane/worker.py::
+    # SpeculativeMergeWorker._teardown_verify_task.  data {elapsed_ms, fraction,
+    # cause, host} per orchestrator/src/orchestrator/merge_lane/
+    # verify_cancellation.py::merge_verify_cancelled_data: elapsed from the
+    # entry's dispatch; fraction against the host's rolling median completed
+    # verify, null until that host has completed one in this process.
+    merge_verify_cancelled = 'merge_verify_cancelled'
     # A merge-role scoped-verify red that the isolated-rerun-confirm gate
     # (verify.apply_merge_flake_suppression, PRD task α) demonstrated was a
     # CPU-starvation flake and suppressed so the merge could proceed.
