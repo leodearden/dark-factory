@@ -80,8 +80,11 @@ from __future__ import annotations
 import ast
 import importlib.util
 import re
+import sys
 import tomllib
 from pathlib import Path
+
+import pytest
 
 REPO_ROOT = Path(__file__).parents[2]
 _THIS_DIR = Path(__file__).parent
@@ -453,4 +456,37 @@ def test_no_missing_imports_pragma_on_resolvable_import() -> None:
         f'exactly so these resolve, and removing one is a TWO-gate outage '
         f'(`pyright scripts/` and `pyright tests/scripts/` both run from the '
         f'repo root against this same table)'
+    )
+
+
+def test_an_import_reachable_only_through_a_session_sys_path_entry_is_not_an_installed_module(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    helper = '_vestigial_pragma_guard_session_only_helper'
+    helpers_dir = tmp_path / 'helpers'
+    helpers_dir.mkdir()
+    (helpers_dir / f'{helper}.py').write_text('VALUE = 1\n')
+    suite_dir = tmp_path / 'suite'
+    suite_dir.mkdir()
+    (suite_dir / 'test_probe.py').write_text(
+        f'from {helper} import VALUE  # {_PRAGMA}\n'
+        f'import pytest  # {_PRAGMA}\n'
+        f'import sys  # {_PRAGMA}\n'
+    )
+
+    monkeypatch.syspath_prepend(str(helpers_dir))
+    importlib.import_module(helper)
+    # Re-registered through setitem so teardown deletes it: delitem on a key
+    # that is not yet present records nothing to undo.
+    monkeypatch.setitem(sys.modules, helper, sys.modules.pop(helper))
+
+    offenders = _installed_module_offenders(_pragma_carrying_imports([suite_dir]))
+
+    judged_installed = [module for *_, module in offenders]
+    assert judged_installed == ['pytest', 'sys'], (
+        f'expected exactly the third-party `pytest` and the builtin `sys` to be '
+        f'judged installed, got {judged_installed}. `{helper}` must not be among '
+        f'them: its directory {helpers_dir} reached sys.path only through this '
+        f'test session, the way a collected test module puts one there, so the '
+        f'environment pyright resolves from does not provide it'
     )
