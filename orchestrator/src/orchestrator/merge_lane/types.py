@@ -1792,13 +1792,15 @@ class PendingGate:
     stays parked at the front of ``_inflight`` (task 6155).
 
     ``candidate`` is what the CAS was landing when it rebased; ``rebased_sha``
-    onto ``rebased_onto`` is what the gate is re-verifying.
+    onto ``rebased_onto`` is what the gate is re-verifying.  ``started_at``
+    is when the gate was parked, on the worker clock's wall ``now()`` scale.
     """
 
     task: asyncio.Task[MergeOutcome | GateClearance]
     candidate: LandingCandidate
     rebased_sha: str
     rebased_onto: str
+    started_at: float | None = None
 
 
 class LeaseActivity(StrEnum):

@@ -230,6 +230,13 @@ from orchestrator.merge_lane.verify_base_detector import (
     alarm_verify_base_divergence,
     detect_verify_base_divergence,
 )
+from orchestrator.merge_lane.verify_cancellation import (
+    RecordedDispatches,
+    VerifyCancel,
+    VerifyCancelCause,
+    VerifyDurationWindow,
+    merge_verify_cancelled_data,
+)
 from orchestrator.merge_verify_facts import (
     BaseRelation,
     MergeVerifyDispatchFacts,
@@ -4462,6 +4469,7 @@ class _TrainMergeHost(Protocol):
         verify_task: asyncio.Task[Any] | None,
         task_id: str,
         *,
+        cancel: VerifyCancel | None,
         shutdown_defensive: bool = False,
     ) -> None: ...
 
@@ -5961,6 +5969,13 @@ async def _run_verify_reaped(
     return task.result()
 
 
+def _slot_cancel(
+    cause: VerifyCancelCause, entry_slot: InflightEntrySlot | None, lease: HostLease | None,
+) -> VerifyCancel:
+    """The cancel of the verify *entry_slot* wraps, running on *lease*."""
+    return VerifyCancel.of(cause, entry_slot.entry if entry_slot is not None else None, lease)
+
+
 class _TrainVerifyHost:
     """The host a train's verifies run on: the slot it leased, or unleased local."""
 
@@ -6027,7 +6042,7 @@ class _TrainVerifyHost:
         """
         return await _run_verify_reaped(verify, reap=functools.partial(
             self._worker._teardown_verify_task,
-            self._lease, task_id=self._task_id, shutdown_defensive=True,
+            self._lease, task_id=self._task_id, cancel=None, shutdown_defensive=True,
         ))
 
     async def release(self, *, aborted: bool) -> None:
@@ -8440,6 +8455,10 @@ class SpeculativeMergeWorker:
         # that first recorded it (task 8523).  Bounded so it cannot grow
         # unboundedly across a long worker lifetime.
         self._dead_base_commits = DeadBaseLedger(cap=_DEAD_BASE_COMMITS_CAP)
+        # merge_verify_cancelled state (task 8523): per-host completed-verify
+        # durations (the fraction's denominator) and the dispatches already recorded.
+        self._verify_durations = VerifyDurationWindow(maxlen=20)
+        self._cancelled_dispatches = RecordedDispatches(cap=256)
         # γ cross-iteration state promoted from loop-locals: set by finalize after
         # each head result; read by dispatch to decide chain re-merge.
         # Single-host: byte-identical (deque is always empty at dispatch point).
@@ -13613,6 +13632,7 @@ class SpeculativeMergeWorker:
             # racing its own finally-block releases is safe.
             await self._teardown_verify_task(
                 _fh_entry.lease, _fh_entry.verify_task, _fh_req.task_id,
+                cancel=VerifyCancel.of(VerifyCancelCause.SHUTDOWN, _fh_entry),
                 shutdown_defensive=True,
             )
             if _fh_entry.merge_wt is not None:
@@ -13731,6 +13751,7 @@ class SpeculativeMergeWorker:
                 # CancelledError cannot abort the drain loop.
                 await self._teardown_verify_task(
                     _ie.lease, _ie.verify_task, _ie_req.task_id,
+                    cancel=VerifyCancel.of(VerifyCancelCause.SHUTDOWN, _ie),
                     shutdown_defensive=True,
                 )
             await self._release_drained_worktrees(_ie)
@@ -13875,6 +13896,29 @@ class SpeculativeMergeWorker:
                 event_type, task_id=task_id, phase='merge',
                 data={k: str(v) for k, v in data.items()},
             )
+
+    def _note_verify_completed(
+        self, out: MergeOutcome | None, entry_slot: InflightEntrySlot | None, lease: Any,
+    ) -> None:
+        """Add a verify that ran to a verdict to its host's duration window."""
+        entry = entry_slot.entry if entry_slot is not None else None
+        if lease is None or entry is None or entry.started_at is None:
+            return
+        if out is not None and out.verify_skipped:
+            return
+        self._verify_durations.record(
+            lease.name, (self._clock.now() - entry.started_at) * 1000,
+        )
+
+    def _emit_verify_cancelled(self, task_id: str, cancel: VerifyCancel) -> None:
+        if not self._event_store or not self._cancelled_dispatches.claim(task_id, cancel):
+            return
+        self._event_store.emit(
+            EventType.merge_verify_cancelled, task_id=task_id, phase='merge',
+            data=merge_verify_cancelled_data(
+                cancel, now=self._clock.now(), window=self._verify_durations,
+            ),
+        )
 
     def _emit_verdict_voided(
         self, req: MergeRequest, item: SpeculativeItem, dead_link: str, *, point: str,
@@ -15396,7 +15440,7 @@ class SpeculativeMergeWorker:
     async def _release_parked_gate_head(self, head: InflightEntry) -> None:
         """Tear down a detached head's gate, then release its lease, speculation
         permit and drift base."""
-        await self._teardown_parked_gate(head)
+        await self._teardown_parked_gate(head, VerifyCancelCause.SHUTDOWN)
         with contextlib.suppress(BaseException):
             await self._cancel_and_release_tracked(head.lease)
         head.lease = None
@@ -15404,7 +15448,9 @@ class SpeculativeMergeWorker:
             self._speculation_ledger.release(head.permit)
         self._drift_base.pop(head.item.request.request_id, None)
 
-    async def _teardown_parked_gate(self, entry: InflightEntry) -> Path | None:
+    async def _teardown_parked_gate(
+        self, entry: InflightEntry, cause: VerifyCancelCause,
+    ) -> Path | None:
         """Cancel and reap *entry*'s parked gate re-verify and return its worktree.
 
         Returns that worktree, already released (warm or cold, as the
@@ -15420,7 +15466,11 @@ class SpeculativeMergeWorker:
         if gate is None:
             return None
         await self._teardown_verify_task(
-            None, gate.task, entry.item.request.task_id, shutdown_defensive=True,
+            None, gate.task, entry.item.request.task_id,
+            cancel=VerifyCancel(
+                cause, gate.started_at, entry.lease.name if entry.lease else None,
+            ),
+            shutdown_defensive=True,
         )
         with contextlib.suppress(BaseException):
             await self._release_or_cleanup(
@@ -15436,7 +15486,7 @@ class SpeculativeMergeWorker:
         first, and the entry's own merge worktree is cold-removed only when it
         is a different path, so a warm lane is never released and then removed.
         """
-        gate_wt = await self._teardown_parked_gate(entry)
+        gate_wt = await self._teardown_parked_gate(entry, VerifyCancelCause.SHUTDOWN)
         if entry.merge_wt is not None and entry.merge_wt != gate_wt:
             with contextlib.suppress(BaseException):
                 await self._cleanup_owned_merge_worktree(entry.merge_wt)
@@ -15452,7 +15502,7 @@ class SpeculativeMergeWorker:
         """
         await self._finalize_inflight(entry)
         if entry.gate is not None:
-            await self._teardown_parked_gate(entry)
+            await self._teardown_parked_gate(entry, VerifyCancelCause.FINALIZE_ERROR)
             raise RuntimeError(
                 f'task {entry.item.request.task_id}: a passthrough finalize '
                 'parked on a gate re-verify',
@@ -15867,6 +15917,7 @@ class SpeculativeMergeWorker:
                                     _entry.lease,
                                     _entry.verify_task,
                                     _entry.item.request.task_id,
+                                    cancel=VerifyCancel.of(VerifyCancelCause.CASCADE, _entry),
                                 )
                                 # Peek at the completed result to detect REQUEUED
                                 # (operator-halt): the request is already back on
@@ -16695,10 +16746,17 @@ class SpeculativeMergeWorker:
         verify_task: asyncio.Task | None,
         task_id: str,
         *,
+        cancel: VerifyCancel | None,
         shutdown_defensive: bool = False,
     ) -> None:
         """THE verify-abort teardown: signal the REMOTE verify, then cancel and
         reap the LOCAL verify task (task 3204).
+
+        *cancel* (required keyword) is the deliberate canceller's record: when
+        it is given and *verify_task* is still running, one
+        ``merge_verify_cancelled`` row is written before the abort.  Reaps
+        reacting to an outer cancel pass ``None``, because the canceller of
+        the outer task already recorded it.
 
         The sole caller of BOTH steps — :meth:`_abort_remote_verify` and
         ``verify_task.cancel()`` — enforced by
@@ -16787,6 +16845,8 @@ class SpeculativeMergeWorker:
         the teardown at several sites are likewise left in place: they differ
         in both order and content between sites.
         """
+        if cancel is not None and verify_task is not None and not verify_task.done():
+            self._emit_verify_cancelled(task_id, cancel)
         if lease is not None:
             if shutdown_defensive:
                 with contextlib.suppress(BaseException):
@@ -17102,7 +17162,7 @@ class SpeculativeMergeWorker:
                     ),
                     reap=functools.partial(
                         self._teardown_verify_task,
-                        lease, task_id=req.task_id, shutdown_defensive=True,
+                        lease, task_id=req.task_id, cancel=None, shutdown_defensive=True,
                     ),
                 )
             except RunnerUnavailable as exc:
@@ -17575,6 +17635,7 @@ class SpeculativeMergeWorker:
                 )
                 if verify_task in done:
                     out = verify_task.result()
+                    self._note_verify_completed(out, entry_slot, lease)
                     # ── task 3186 (PRD δ): THE ADOPT DECISION ──────────────
                     # Made HERE, the moment the verdict exists, because the
                     # `finally` below runs BEFORE the chain arm's exit block
@@ -17591,7 +17652,10 @@ class SpeculativeMergeWorker:
                 # DROP the request.  Checked first so a gave-up waiter wins
                 # over the operator-halt re-queue when both hold simultaneously.
                 if self._request_abandoned(req):
-                    await self._teardown_verify_task(lease, verify_task, req.task_id)
+                    await self._teardown_verify_task(
+                        lease, verify_task, req.task_id,
+                        cancel=_slot_cancel(VerifyCancelCause.ABANDONED, entry_slot, lease),
+                    )
                     await _dispose_verify_worktree()
                     # task 2420 amend (reviewer finding, resource_cleanup): this
                     # request is DROPPED (sole waiter gave up) — the per-task
@@ -17638,7 +17702,10 @@ class SpeculativeMergeWorker:
                         'and re-queuing merge for re-verify after un-halt',
                         req.task_id,
                     )
-                    await self._teardown_verify_task(lease, verify_task, req.task_id)
+                    await self._teardown_verify_task(
+                        lease, verify_task, req.task_id,
+                        cancel=_slot_cancel(VerifyCancelCause.OPERATOR_HALT, entry_slot, lease),
+                    )
                     await _dispose_verify_worktree()
                     await self._requeue_from_verify(item, entry_slot)
                     # task 3003 amend (robustness): an operator-halt requeue is
@@ -17703,7 +17770,10 @@ class SpeculativeMergeWorker:
                         _abort.max_strikes,
                     )
                     emit_no_progress_abort(self._event_store, _abort)
-                    await self._teardown_verify_task(lease, verify_task, req.task_id)
+                    await self._teardown_verify_task(
+                        lease, verify_task, req.task_id,
+                        cancel=_slot_cancel(VerifyCancelCause.NO_PROGRESS, entry_slot, lease),
+                    )
                     await _dispose_verify_worktree()
                     # task 3003 amend (robustness): a no-progress abort — requeue
                     # or busy-loop cap — is not lane contention either (the verify
@@ -18240,7 +18310,7 @@ class SpeculativeMergeWorker:
                             asyncio.shield(
                                 self._teardown_verify_task(
                                     None, verify_task, req.task_id,
-                                    shutdown_defensive=True,
+                                    cancel=None, shutdown_defensive=True,
                                 )
                             ),
                             timeout=self.ORPHAN_REAP_TIMEOUT_SECS,
@@ -18745,6 +18815,7 @@ class SpeculativeMergeWorker:
             )
             await self._teardown_verify_task(
                 head.lease, head.verify_task, head_task_id,
+                cancel=VerifyCancel.of(VerifyCancelCause.TIP_ADOPTED, head),
             )
             await self._cancel_and_release_tracked(head.lease)
             head.lease = None
@@ -20076,6 +20147,7 @@ class SpeculativeMergeWorker:
             candidate=candidate,
             rebased_sha=rebased_sha,
             rebased_onto=rebased_onto,
+            started_at=self._clock.now(),
         )
         return False
 

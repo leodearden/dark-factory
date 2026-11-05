@@ -8,6 +8,11 @@ import dataclasses
 import statistics
 from collections import deque
 from enum import StrEnum
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from orchestrator.merge_lane.types import InflightEntry
+    from orchestrator.verify_runner import HostLease
 
 
 class VerifyCancelCause(StrEnum):
@@ -41,6 +46,50 @@ class VerifyCancel:
     cause: VerifyCancelCause
     started_at: float | None
     host: str | None
+
+    @classmethod
+    def of(
+        cls,
+        cause: VerifyCancelCause,
+        entry: InflightEntry | None,
+        lease: HostLease | None = None,
+    ) -> VerifyCancel:
+        """The cancel of *entry*'s verify, on *lease* or else the entry's own lease."""
+        holder = lease if lease is not None else (entry.lease if entry is not None else None)
+        return cls(
+            cause,
+            started_at=entry.started_at if entry is not None else None,
+            host=holder.name if holder is not None else None,
+        )
+
+
+class RecordedDispatches:
+    """The verify dispatches whose cancel has a row, so each gets exactly one.
+
+    A dispatch is its task id and ``started_at``.  A second canceller can
+    reach a verify an abort trigger already cancelled, e.g. ``stop()``
+    draining the entry while the trigger still cleans up.  Past *cap* the
+    oldest dispatch is forgotten.  A cancel with no ``started_at`` names no
+    dispatch and is always claimed.
+    """
+
+    def __init__(self, *, cap: int) -> None:
+        if cap < 1:
+            raise ValueError(f'RecordedDispatches cap must be >= 1, got cap={cap}')
+        self._cap = cap
+        self._claimed: dict[tuple[str, float], None] = {}
+
+    def claim(self, task_id: str, cancel: VerifyCancel) -> bool:
+        """True the first time *task_id*'s dispatch is claimed."""
+        if cancel.started_at is None:
+            return True
+        key = (task_id, cancel.started_at)
+        if key in self._claimed:
+            return False
+        self._claimed[key] = None
+        while len(self._claimed) > self._cap:
+            del self._claimed[next(iter(self._claimed))]
+        return True
 
 
 class VerifyDurationWindow:

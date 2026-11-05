@@ -58,7 +58,6 @@ from _orch_helpers import (
     MERGE_RESULT_TIMEOUT,
     wait_responsive,
 )
-from _recording_event_store import _RecordingEventStore
 from _verify_result_doubles import (
     fail_open_records,
     format_fail_open_records,
@@ -4902,7 +4901,9 @@ class TestVerifyTeardownHelper:
         ``merge_verify_cancelled`` row; a finished task, or a reap
         (``cancel=None``), writes none.
         """
-        store = _RecordingEventStore()
+        from test_merge_speculation import _LateArrivalFakeEventStore
+
+        store = _LateArrivalFakeEventStore()
         clock = FakeClock(time=1000.0)
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), store, clock=clock)
         cancel = VerifyCancel(VerifyCancelCause.SHUTDOWN, started_at=clock.time - 2.0, host='local')
@@ -4914,9 +4915,37 @@ class TestVerifyTeardownHelper:
         await worker._teardown_verify_task(None, _never_finishes(), 'tid-reap', cancel=None)
 
         assert [
-            (row['task_id'], row['data']) for kind, row in store.events
-            if kind == EventType.merge_verify_cancelled
+            (row['task_id'], row['data'])
+            for row in store.speculative_events(EventType.merge_verify_cancelled)
         ] == [('tid', {'elapsed_ms': 2000, 'fraction': None, 'cause': 'shutdown', 'host': 'local'})]
+
+    async def test_a_second_canceller_of_one_dispatch_records_nothing(
+        self, git_ops: GitOps,
+    ) -> None:
+        """An abort trigger cancels the inner verify, then stop() drains the
+        entry's outer task while the trigger still cleans up: one dispatch,
+        one row.
+        """
+        from test_merge_speculation import _LateArrivalFakeEventStore
+
+        store = _LateArrivalFakeEventStore()
+        clock = FakeClock(time=1000.0)
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), store, clock=clock)
+
+        def _cancel(cause: VerifyCancelCause) -> VerifyCancel:
+            return VerifyCancel(cause, started_at=clock.time - 1.0, host='local')
+
+        await worker._teardown_verify_task(
+            None, _never_finishes(), 'tid', cancel=_cancel(VerifyCancelCause.OPERATOR_HALT),
+        )
+        await worker._teardown_verify_task(
+            None, _never_finishes(), 'tid', cancel=_cancel(VerifyCancelCause.SHUTDOWN),
+        )
+
+        assert [
+            row['data']['cause']
+            for row in store.speculative_events(EventType.merge_verify_cancelled)
+        ] == ['operator_halt']
 
 # ---------------------------------------------------------------------------
 # task 4164: stop()'s shutdown-drain teardowns must pass shutdown_defensive=True

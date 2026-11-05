@@ -2273,10 +2273,6 @@ def _local_factory() -> _FakeLocalRunner:
     return _FakeLocalRunner()
 
 
-async def _noop_sleep(_: float) -> None:
-    pass
-
-
 @pytest.mark.asyncio
 class TestAcquireStampsRunnerReason:
     """``acquire`` stamps ``HostLease.reason`` with the allocation decision.

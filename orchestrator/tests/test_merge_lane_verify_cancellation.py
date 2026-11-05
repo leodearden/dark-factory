@@ -10,6 +10,7 @@ from __future__ import annotations
 import pytest
 
 from orchestrator.merge_lane.verify_cancellation import (
+    RecordedDispatches,
     VerifyCancel,
     VerifyCancelCause,
     VerifyDurationWindow,
@@ -89,6 +90,43 @@ class TestMergeVerifyCancelledData:
             window=VerifyDurationWindow(maxlen=3),
         )
         assert data['elapsed_ms'] == 0
+
+
+class TestRecordedDispatches:
+    """One row per verify dispatch, whichever canceller reaches it first."""
+
+    def test_a_dispatch_is_claimed_once(self) -> None:
+        recorded = RecordedDispatches(cap=4)
+        halt = VerifyCancel(VerifyCancelCause.OPERATOR_HALT, started_at=100.0, host='local')
+        drain = VerifyCancel(VerifyCancelCause.SHUTDOWN, started_at=100.0, host='local')
+        assert recorded.claim('t1', halt)
+        assert not recorded.claim('t1', drain)
+
+    def test_another_dispatch_or_task_is_claimed_afresh(self) -> None:
+        recorded = RecordedDispatches(cap=4)
+        first = VerifyCancel(VerifyCancelCause.CASCADE, started_at=100.0, host='laptop')
+        redispatch = VerifyCancel(VerifyCancelCause.CASCADE, started_at=105.0, host='laptop')
+        assert recorded.claim('t1', first)
+        assert recorded.claim('t1', redispatch)
+        assert recorded.claim('t2', first)
+
+    def test_a_cancel_with_no_start_is_always_claimed(self) -> None:
+        recorded = RecordedDispatches(cap=4)
+        unknown = VerifyCancel(VerifyCancelCause.SHUTDOWN, started_at=None, host=None)
+        assert recorded.claim('t1', unknown)
+        assert recorded.claim('t1', unknown)
+
+    def test_past_the_cap_the_oldest_claim_is_forgotten(self) -> None:
+        recorded = RecordedDispatches(cap=1)
+        a = VerifyCancel(VerifyCancelCause.CASCADE, started_at=1.0, host='local')
+        b = VerifyCancel(VerifyCancelCause.CASCADE, started_at=2.0, host='local')
+        assert recorded.claim('t1', a)
+        assert recorded.claim('t1', b)
+        assert recorded.claim('t1', a)
+
+    def test_a_cap_below_one_is_refused(self) -> None:
+        with pytest.raises(ValueError, match='cap'):
+            RecordedDispatches(cap=0)
 
 
 def test_cause_vocabulary_is_closed() -> None:
