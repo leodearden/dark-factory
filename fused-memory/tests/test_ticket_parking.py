@@ -12,7 +12,7 @@ from collections import deque
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta
 from typing import Any, cast
-from unittest.mock import AsyncMock, patch
+from unittest.mock import ANY, AsyncMock, patch
 
 import pytest
 import pytest_asyncio
@@ -200,6 +200,7 @@ _REWRITE = RewrittenTask(
 )
 
 _CALLER_METADATA = {'source': 'parking-test', 'spawn_context': 'manual'}
+_FILED_METADATA = {**_CALLER_METADATA, 'declared_scope': ANY}
 
 
 class TestUncappedCurationUnchanged:
@@ -220,12 +221,13 @@ class TestUncappedCurationUnchanged:
             'status': 'created', 'task_id': '101', 'reason': 'create: nothing like it',
             'result_json': {'id': '101', 'title': 'New work'},
         }
-        assert taskmaster.add_task_calls == [{
+        [call] = taskmaster.add_task_calls
+        assert {**call, 'metadata': json.loads(call['metadata'])} == {
             'project_root': PROJECT_ROOT,
-            'metadata': json.dumps(_CALLER_METADATA),
+            'metadata': _FILED_METADATA,
             'title': 'New work',
             'description': 'New work description',
-        }]
+        }
 
     @pytest.mark.asyncio
     async def test_drop_onto_an_existing_task(self, make_interceptor, store, taskmaster):
@@ -316,7 +318,7 @@ class TestUncappedCurationUnchanged:
             'result_json': {'id': '101', 'title': 'Restart the server'},
         }
         assert taskmaster.added_metadata() == [{
-            **_CALLER_METADATA, 'task_kind': 'deterministic', 'always_escalates': True,
+            **_FILED_METADATA, 'task_kind': 'deterministic', 'always_escalates': True,
         }]
 
 
@@ -816,7 +818,7 @@ class TestDedupeSkippedMarker:
         answer = await _resolve(interceptor, ticket_id)
 
         assert answer['reason'] == 'create: curator-unavailable: disabled'
-        assert taskmaster.added_metadata() == [_CALLER_METADATA]
+        assert taskmaster.added_metadata() == [_FILED_METADATA]
 
     @pytest.mark.asyncio
     async def test_marker_merges_into_caller_metadata(self, make_interceptor, taskmaster):
@@ -827,7 +829,7 @@ class TestDedupeSkippedMarker:
         [metadata] = await _created_metadata(make_interceptor(curator), taskmaster, 'Work')
 
         assert metadata == {
-            **_CALLER_METADATA,
+            **_FILED_METADATA,
             DEDUPE_SKIPPED_KEY: {'reason': 'llm-failed: boom', 'at': metadata[DEDUPE_SKIPPED_KEY]['at']},
         }
 

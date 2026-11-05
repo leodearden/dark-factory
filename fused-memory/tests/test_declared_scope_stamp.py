@@ -200,4 +200,4 @@ async def test_only_tasks_filed_after_the_stamp_carry_it(stack: Stack, curator_c
 
     assert 'declared_scope' not in await stack.metadata(pre_deploy)
     found = await stack.call('find_tasks_by_metadata', key='declared_scope')
-    assert {row['task_id'] for row in found['results']} == filed
+    assert {str(row['task_id']) for row in found['results']} == filed

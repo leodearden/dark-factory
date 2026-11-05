@@ -8,7 +8,7 @@ import logging
 import os
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
@@ -387,14 +387,14 @@ async def test_add_task_persists_metadata_atomically(interceptor_facade, taskmas
     taskmaster.add_task.assert_called_once()
     kwargs = taskmaster.add_task.call_args.kwargs
     # Metadata forwarded as a JSON string (the MCP wire format).
-    assert kwargs.get('metadata') == json.dumps(metadata)
+    assert json.loads(kwargs['metadata']) == {**metadata, 'declared_scope': ANY}
     # No follow-up update_task for metadata — the atomic path wrote it.
     taskmaster.update_task.assert_not_called()
 
 
 @pytest.mark.asyncio
 async def test_add_task_metadata_string_passed_through(interceptor_facade, taskmaster):
-    """Pre-serialised metadata JSON is forwarded unchanged."""
+    """Pre-serialised metadata JSON reaches the backend as the same object, not double-encoded."""
     metadata_json = '{"escalation_id":"esc-1","suggestion_hash":"x"}'
     await _submit_and_resolve(
         interceptor_facade,
@@ -403,7 +403,7 @@ async def test_add_task_metadata_string_passed_through(interceptor_facade, taskm
         metadata=metadata_json,
     )
     kwargs = taskmaster.add_task.call_args.kwargs
-    assert kwargs.get('metadata') == metadata_json
+    assert json.loads(kwargs['metadata']) == {**json.loads(metadata_json), 'declared_scope': ANY}
 
 
 @pytest.mark.asyncio
@@ -411,9 +411,9 @@ async def test_add_task_without_metadata_skips_update(interceptor_facade, taskma
     """add_task without metadata does not call update_task."""
     await _submit_and_resolve(interceptor_facade, '/project', prompt='Test')
     taskmaster.update_task.assert_not_called()
-    # Backend still receives metadata=None kwarg but the value is falsy.
+    # The only metadata the backend receives is the submit-time declared_scope stamp.
     kwargs = taskmaster.add_task.call_args.kwargs
-    assert kwargs.get('metadata') in (None, '')
+    assert json.loads(kwargs['metadata']) == {'declared_scope': ANY}
 
 
 @pytest.mark.asyncio
@@ -460,7 +460,7 @@ async def test_add_task_falls_back_to_two_step_on_typeerror(event_buffer, tmp_pa
         tm.update_task.assert_called_once()
         kwargs = tm.update_task.call_args.kwargs
         assert kwargs['task_id'] == '7'
-        assert kwargs['metadata'] == json.dumps(metadata)
+        assert json.loads(kwargs['metadata']) == {**metadata, 'declared_scope': ANY}
     finally:
         await store.close()
         if interceptor is not None:
@@ -8388,7 +8388,8 @@ class TestSubmitTaskGuardrail:
     ):
         """Persistence contract: submit_task for /dark-factory stores a row whose
         project_id is 'dark_factory' and whose candidate_json blob contains the
-        un-mutated kwargs (title, description) and metadata=None.
+        un-mutated kwargs (title, description) and metadata holding only the
+        submit-time declared_scope stamp.
 
         This is the single owning test for the candidate_json serialisation format;
         update here when the blob schema intentionally changes.
@@ -8432,8 +8433,8 @@ class TestSubmitTaskGuardrail:
         assert blob['kwargs']['description'] == 'harness deadlock', (
             f'Expected description in blob kwargs un-mutated, got: {blob["kwargs"].get("description")!r}'
         )
-        assert blob['metadata'] is None, (
-            f'Expected metadata=None in blob (no metadata was passed), got: {blob["metadata"]!r}'
+        assert blob['metadata'] == {'declared_scope': ANY}, (
+            f'Expected only the declared_scope stamp in blob metadata, got: {blob["metadata"]!r}'
         )
 
     @pytest.mark.asyncio
@@ -12200,7 +12201,7 @@ async def test_planning_mode_persists_human_decomposed_metadata(
     assert metadata_arg is not None
     decoded = json.loads(metadata_arg)
     assert decoded.pop('deferral')['kind'] == 'planning'
-    assert decoded == {'human_decomposed': True}
+    assert decoded == {'human_decomposed': True, 'declared_scope': ANY}
 
 
 @pytest.mark.asyncio
@@ -12221,6 +12222,7 @@ async def test_planning_mode_merges_caller_metadata(
         'source': 'planning-session',
         'files': ['m1', 'm2'],
         'human_decomposed': True,
+        'declared_scope': ANY,
     }
 
 
@@ -12238,7 +12240,7 @@ async def test_planning_mode_accepts_metadata_json_string(
     )
     decoded = json.loads(taskmaster.add_task.call_args.kwargs['metadata'])
     assert decoded.pop('deferral')['kind'] == 'planning'
-    assert decoded == {'escalation_id': 'esc-1', 'human_decomposed': True}
+    assert decoded == {'escalation_id': 'esc-1', 'human_decomposed': True, 'declared_scope': ANY}
 
 
 @pytest.mark.asyncio

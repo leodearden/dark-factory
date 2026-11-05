@@ -16,7 +16,11 @@ from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypedDict, get_args
 import shared.deploy_state  # noqa: F401  # populate W3 metadata registry with the deploy_state sub-model (DS shared-visible registration; §5.2)
 from pydantic import ValidationError
 from shared import process_identity
-from shared.declared_scope import preserves_stamp
+from shared.declared_scope import (
+    DECLARED_SCOPE_METADATA_KEY,
+    derive_declared_scope,
+    preserves_stamp,
+)
 from shared.defects import DeclareEvent, OutcomeEvent
 from shared.mcp_envelope import write_failure_reason
 from shared.task_metadata import DoneProvenance, SchemaWarning, parse_metadata
@@ -585,6 +589,20 @@ def _dedupe_skipped_reason(
     if decision is None or decision.degraded or decision.action in ('combine', 'drop'):
         return ': '.join(_create_labels(decision, curator_unavailable=curator_unavailable))
     return None
+
+
+def _with_declared_scope_stamp(metadata: Any, kwargs: dict[str, Any]) -> Any:
+    """*metadata* plus its ``declared_scope`` stamp; an unreadable wire value is returned as is."""
+    readable = coerce_task_metadata(metadata)
+    if readable is None:
+        return metadata
+    stamp = derive_declared_scope(
+        extract_files(readable),
+        kwargs.get('description') or '',
+        kwargs.get('details') or '',
+        basis='submit',
+    )
+    return {**readable, DECLARED_SCOPE_METADATA_KEY: stamp.model_dump()}
 
 
 class TaskInterceptor:
@@ -4153,6 +4171,7 @@ class TaskInterceptor:
         # which is a different mechanism, not this declared-tag coercion.
         metadata = inject_operational_routing(metadata)
         attribution = CreationAttribution.from_submission(metadata, agent_id)
+        metadata = _with_declared_scope_stamp(metadata, kwargs)
 
         planning_mode = bool(kwargs.pop('planning_mode', False))
         if planning_mode:

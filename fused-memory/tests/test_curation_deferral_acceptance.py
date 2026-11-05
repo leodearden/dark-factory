@@ -21,7 +21,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, NamedTuple, TypeVar, cast
-from unittest.mock import AsyncMock, patch
+from unittest.mock import ANY, AsyncMock, patch
 
 import pytest
 import pytest_asyncio
@@ -522,7 +522,7 @@ async def test_a_fail_open_create_carries_the_dedupe_skipped_marker(server):
     [created] = server.taskmaster.add_task_calls
     metadata = json.loads(created['metadata'])
     marker = metadata.pop(DEDUPE_SKIPPED_KEY)
-    assert metadata == _CALLER_METADATA
+    assert metadata == {**_CALLER_METADATA, 'declared_scope': ANY}
     assert marker['reason'] == reason
     assert datetime.fromisoformat(marker['at']).utcoffset() == timedelta(0)
 
