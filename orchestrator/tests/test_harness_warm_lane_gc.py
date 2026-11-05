@@ -252,6 +252,58 @@ class TestWarmLaneGcPassRecord:
         assert not _messages(caplog, _SUMMARY_LOGGER, logging.INFO)
 
 
+_HARNESS_LOGGER = 'orchestrator.harness'
+
+
+async def _tick_lines(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, rc: int,
+) -> list[logging.LogRecord]:
+    """The harness's own records for one pass whose reclaim returned ``rc``."""
+    harness = _gc_leg_only_harness(tmp_path)
+    harness.git_ops._run_warm_lane_gc_reclaim = AsyncMock(return_value=rc)
+    caplog.set_level(logging.DEBUG)
+
+    await harness._run_warm_lane_gc_pass()
+
+    return [r for r in caplog.records if r.name == _HARNESS_LOGGER]
+
+
+class TestWarmLaneGcPassTickVisibility:
+    """A tick on which no reclaim ran is visible at default verbosity."""
+
+    @pytest.mark.asyncio
+    async def test_rc127_tick_is_logged_at_info_or_above(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        records = await _tick_lines(tmp_path, caplog, rc=127)
+
+        assert [
+            r for r in records if r.levelno >= logging.INFO and 'rc=127' in r.getMessage()
+        ], caplog.text
+
+    @pytest.mark.asyncio
+    async def test_rc127_tick_asserts_no_cause(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """127 also means a lease deferral, a pool refusal or a spawn failure."""
+        records = await _tick_lines(tmp_path, caplog, rc=127)
+
+        tick = [r.getMessage() for r in records if 'rc=127' in r.getMessage()]
+        assert tick, caplog.text
+        assert not [m for m in tick if 'script absent' in m]
+
+    @pytest.mark.asyncio
+    async def test_other_nonzero_rc_still_warns(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        records = await _tick_lines(tmp_path, caplog, rc=1)
+
+        assert [
+            r for r in records
+            if r.levelno == logging.WARNING and 'non-zero rc=1' in r.getMessage()
+        ], caplog.text
+
+
 # ---------------------------------------------------------------------------
 # task 5504: the gc record-age bound may not undercut the digest census
 # ---------------------------------------------------------------------------
