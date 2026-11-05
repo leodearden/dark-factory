@@ -787,6 +787,7 @@ class TestPolicyTableRows:
     """POLICY_TABLE: the one enumeration of executor classes (PRD §5.1)."""
 
     _FOUND_ON_MAIN = 'found_on_main at 1a2b3c4d; git merge-base --is-ancestor 1a2b3c4d main rc=0'
+    _FOUND_ON_MAIN_NO_SHA = 'found_on_main; git merge-base --is-ancestor main rc=0'
 
     def test_table_is_a_tuple_of_rows_with_unique_slugs(self) -> None:
         assert isinstance(POLICY_TABLE, tuple)
@@ -820,9 +821,7 @@ class TestPolicyTableRows:
         assert {PolicyAction.DONE_FLIP, PolicyAction.CLOSE_ONLY} <= row.actions
         assert row.reversible is False
         assert row.evidence_present(self._FOUND_ON_MAIN)
-        assert not row.evidence_present(
-            'found_on_main; git merge-base --is-ancestor main rc=0'
-        )
+        assert not row.evidence_present(self._FOUND_ON_MAIN_NO_SHA)
 
     def test_found_on_main_matches_any_category(self) -> None:
         row = policy_row('found_on_main')
