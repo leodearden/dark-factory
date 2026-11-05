@@ -8,10 +8,13 @@ No clock read: every instant is the caller's injected *now*. The TTL is
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
-from collections.abc import Awaitable, Callable, Hashable
+from collections.abc import Awaitable, Callable, Coroutine, Hashable
 from datetime import datetime
-from typing import Generic, TypeVar
+from typing import Any, Generic, TypeVar
+
+from shared.asyncio_tasks import track_task
 
 from dashboard.data.datum import Datum, DatumState, aged_at, unknown_datum
 from dashboard.data.mcp_fanout import TTLCache
@@ -20,6 +23,35 @@ logger = logging.getLogger(__name__)
 
 K = TypeVar('K', bound=Hashable)
 V = TypeVar('V')
+T = TypeVar('T')
+
+_OUTLIVED_WAITS: set[asyncio.Task[Any]] = set()
+
+
+async def wait_shielded(
+    work: Coroutine[Any, Any, T], wait_seconds: float | None, *, what: str,
+) -> T:
+    """*work*'s outcome, waited on at most *wait_seconds*; past that ``TimeoutError``.
+
+    Work its caller stops waiting on runs on, held until it ends, so it still
+    lands for the next caller. Nobody is left to receive a failure it then
+    ends in, so that failure is logged as a BUG naming *what*.
+    """
+    task = asyncio.ensure_future(work)
+    try:
+        return await asyncio.wait_for(asyncio.shield(task), wait_seconds)
+    finally:
+        if not task.done():
+            track_task(task, _OUTLIVED_WAITS, on_done=functools.partial(_log_late_failure, what))
+
+
+def _log_late_failure(what: str, task: asyncio.Task[Any]) -> None:
+    if task.cancelled() or (failure := task.exception()) is None:
+        return
+    logger.warning(
+        '%s failed after its caller stopped waiting on it; this is a BUG, not an outage',
+        what, exc_info=failure,
+    )
 
 
 class ServedRead(Generic[K, V]):
@@ -67,9 +99,11 @@ class ServedRead(Generic[K, V]):
         cached = self._cache.get_fresh(key)
         if cached is not None:
             return aged_at(cached, now)
-        refresh = asyncio.ensure_future(self._refresh(key, read, self._generation))
         try:
-            outcome = await asyncio.wait_for(asyncio.shield(refresh), wait_seconds)
+            outcome = await wait_shielded(
+                self._refresh(key, read, self._generation), wait_seconds,
+                what=f'served read for {key!r}',
+            )
         except TimeoutError:
             return self._fallback(key, f'read still in flight after {wait_seconds}s')
         if outcome.value is None:

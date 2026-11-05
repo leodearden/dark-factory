@@ -65,6 +65,7 @@ from dashboard.data.prd_view import (
     validate_prd_view,
 )
 from dashboard.data.scheduler import SCHEDULER_STATE_REQUEST_WAIT_SECONDS, acquire_scheduler_state
+from dashboard.data.served_read import wait_shielded
 from dashboard.data.task_activity import (
     ACTIVITY_REQUEST_WAIT_SECONDS,
     RUNS_DB,
@@ -150,8 +151,8 @@ async def _open_run_ledgers(
     """Each root's runs.db connection by root, or none and why the walk gave none."""
     wait = REQUEST_READS_WAIT_SECONDS
     try:
-        labeled = await asyncio.wait_for(
-            asyncio.shield(_project_scoped_dbs_labeled(config, pool, RUNS_DB)), wait,
+        labeled = await wait_shielded(
+            _project_scoped_dbs_labeled(config, pool, RUNS_DB), wait, what='the run-ledger walk',
         )
     except TimeoutError:
         logger.warning(

@@ -8,8 +8,10 @@ Boundary rows 8, 9, 11 and 13–19 at the endpoint (PRD dashboard-prd-lanes §4.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import logging
+import threading
 import time
 from collections import Counter
 from collections.abc import Callable, Iterator
@@ -41,7 +43,7 @@ from fastapi.testclient import TestClient
 from shared.task_statuses import TaskStatus
 
 from dashboard.api import prds
-from dashboard.data import escalation_corpus, task_lineage
+from dashboard.data import escalation_corpus, served_read, task_lineage
 from dashboard.data.census import build_census
 from dashboard.data.prd_view import Segment
 
@@ -240,12 +242,9 @@ def test_a_slow_lineage_read_lands_for_the_next_request(client, tmp_path, monkey
     slow = prd_tree()
     slow.projection_delay = _PROJECTION_DELAY
     with canned_prd_roots(client, tmp_path, {ROOT: slow}) as render:
-        started = time.monotonic()
         first = render(T0)['PRD_VIEW'][ROOT]
-        elapsed = time.monotonic() - started
         later = _render_until_fresh(render, T0 + timedelta(seconds=20))
 
-    assert elapsed < _PROJECTION_DELAY
     assert first['state'] == 'unknown'
     assert first['reason'].startswith('lineage: ')
     assert later['state'] == 'fresh'
@@ -255,9 +254,8 @@ def test_a_slow_lineage_read_lands_for_the_next_request(client, tmp_path, monkey
 
 # --- the request-wide reads are bounded and guarded -------------------------
 
-_SLOW_WALK_SECONDS = 3.0
 _REQUEST_READS_WAIT = 0.5
-"""Well under the slow walk, yet long enough for the run-ledger walk the same wait bounds."""
+"""Short, yet long enough for the run-ledger walk the same wait bounds."""
 
 
 def _unreadable_walk(queues):
@@ -278,21 +276,23 @@ def test_a_corpus_walk_that_raises_degrades_only_the_view(client, tmp_path, monk
 def test_a_slow_corpus_walk_never_holds_the_response_and_lands_for_the_next_request(
     client, tmp_path, monkeypatch,
 ):
+    """The walk is released only once the first response is back, so that response cannot have waited on it."""
     monkeypatch.setattr(prds, 'REQUEST_READS_WAIT_SECONDS', _REQUEST_READS_WAIT)
     walk = escalation_corpus.walk_corpus
+    answered = threading.Event()
 
-    def _slow_walk(queues):
-        time.sleep(_SLOW_WALK_SECONDS)
+    def _walk_after_the_first_response(queues):
+        answered.wait(_SETTLE_DEADLINE)
         return walk(queues)
 
-    monkeypatch.setattr(escalation_corpus, 'walk_corpus', _slow_walk)
+    monkeypatch.setattr(escalation_corpus, 'walk_corpus', _walk_after_the_first_response)
     with canned_prd_roots(client, tmp_path, {ROOT: prd_tree()}) as render:
-        started = time.monotonic()
-        first = render(T0)
-        elapsed = time.monotonic() - started
+        try:
+            first = render(T0)
+        finally:
+            answered.set()
         later = _render_until_fresh(render, T0 + timedelta(seconds=20))
 
-    assert elapsed < _SLOW_WALK_SECONDS
     assert first['PRD_VIEW'][ROOT]['state'] == 'unknown'
     assert 'escalations: ' in first['PRD_VIEW'][ROOT]['reason']
     assert first['PRD_CONTENTION'][ROOT]['state'] == 'fresh'
@@ -313,6 +313,46 @@ def test_a_failed_corpus_walk_after_a_good_one_serves_the_last_good_walk(
     assert second['state'] == 'stale'
     assert _input(second, 'escalations')['state'] == 'stale'
     assert _row(second, PRD_A)
+
+
+def _logged_raising(caplog: pytest.LogCaptureFixture, kind: type[BaseException]) -> logging.LogRecord | None:
+    deadline = time.monotonic() + _SETTLE_DEADLINE
+    while time.monotonic() < deadline:
+        for record in caplog.records:
+            if record.exc_info is not None and isinstance(record.exc_info[1], kind):
+                return record
+        time.sleep(0.05)
+    return None
+
+
+class _LatePoolBug(RuntimeError):
+    pass
+
+
+def test_a_run_ledger_walk_that_raises_after_its_wait_is_still_logged_as_a_bug(
+    client, tmp_path, monkeypatch, caplog,
+):
+    monkeypatch.setattr(prds, 'REQUEST_READS_WAIT_SECONDS', _REQUEST_READS_WAIT)
+    answered = threading.Event()
+
+    async def _raises_after_the_response(config, pool, relative):
+        await asyncio.to_thread(answered.wait, _SETTLE_DEADLINE)
+        raise _LatePoolBug('pool bug')
+
+    monkeypatch.setattr(prds, '_project_scoped_dbs_labeled', _raises_after_the_response)
+    with (
+        canned_prd_roots(client, tmp_path, {ROOT: prd_tree()}) as render,
+        caplog.at_level(logging.WARNING, logger=served_read.__name__),
+    ):
+        try:
+            render(T0)
+        finally:
+            answered.set()
+        bug = _logged_raising(caplog, _LatePoolBug)
+
+    assert bug is not None
+    assert 'run-ledger walk' in bug.getMessage()
+    assert 'BUG' in bug.getMessage()
 
 
 def test_a_run_ledger_walk_that_raises_degrades_the_activity_input_not_the_response(

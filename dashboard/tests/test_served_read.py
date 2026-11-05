@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
+from dashboard.data import served_read
 from dashboard.data.datum import Datum, DatumState, unknown_datum
-from dashboard.data.served_read import ServedRead
+from dashboard.data.served_read import ServedRead, wait_shielded
 
 T0 = datetime(2026, 11, 5, 9, 0, tzinfo=UTC)
 BOUND = 30
@@ -211,3 +215,89 @@ async def test_slots_are_kept_apart():
     datum = await served.serve(('b', 1), Reads(failed('b is down')), now=T0)
 
     assert datum == unknown_datum('b is down', BOUND)
+
+
+class _PastTheGuard(BaseException):
+    """Escapes a read's ``Exception`` guard, as a bug inside the cache itself would."""
+
+
+async def _record_raising(
+    caplog: pytest.LogCaptureFixture, kind: type[BaseException],
+) -> logging.LogRecord | None:
+    for _ in range(200):
+        found = [
+            record for record in caplog.records
+            if record.exc_info is not None and isinstance(record.exc_info[1], kind)
+        ]
+        if found:
+            return found[0]
+        await asyncio.sleep(0.01)
+    return None
+
+
+async def test_work_inside_its_wait_answers_with_its_own_outcome():
+    async def answers() -> int:
+        return 7
+
+    async def raises() -> int:
+        raise ValueError('its own failure')
+
+    assert await wait_shielded(answers(), 1.0, what='the answer') == 7
+    with pytest.raises(ValueError, match='its own failure'):
+        await wait_shielded(raises(), 1.0, what='the failure')
+
+
+async def test_work_that_outlives_its_wait_runs_on_and_a_late_failure_is_logged_as_a_bug(caplog):
+    release = asyncio.Event()
+
+    async def walk() -> int:
+        await release.wait()
+        raise RuntimeError('walk bug')
+
+    with caplog.at_level(logging.WARNING, logger=served_read.__name__):
+        with pytest.raises(TimeoutError):
+            await wait_shielded(walk(), 0.01, what='the test walk')
+        release.set()
+        record = await _record_raising(caplog, RuntimeError)
+
+    assert record is not None
+    assert 'the test walk' in record.getMessage()
+    assert 'BUG' in record.getMessage()
+
+
+async def test_work_that_outlives_its_wait_and_then_answers_logs_nothing(caplog):
+    release = asyncio.Event()
+    landed = asyncio.Event()
+
+    async def walk() -> int:
+        await release.wait()
+        landed.set()
+        return 7
+
+    with caplog.at_level(logging.WARNING, logger=served_read.__name__):
+        with pytest.raises(TimeoutError):
+            await wait_shielded(walk(), 0.01, what='the test walk')
+        release.set()
+        await asyncio.wait_for(landed.wait(), 2.0)
+        await asyncio.sleep(0.01)
+
+    assert not [record for record in caplog.records if record.name == served_read.__name__]
+
+
+async def test_a_served_read_that_fails_after_its_wait_is_logged_as_a_bug_naming_its_key(caplog):
+    served = make([60.0])
+    release = asyncio.Event()
+
+    async def read() -> Datum[int]:
+        await release.wait()
+        raise _PastTheGuard('cache bug')
+
+    with caplog.at_level(logging.WARNING, logger=served_read.__name__):
+        waited = await served.serve('root', read, now=T0, wait_seconds=0.01)
+        release.set()
+        record = await _record_raising(caplog, _PastTheGuard)
+
+    assert waited.state is DatumState.UNKNOWN
+    assert record is not None
+    assert "'root'" in record.getMessage()
+    assert 'BUG' in record.getMessage()
