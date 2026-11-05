@@ -678,9 +678,10 @@ _BINDING_BARRIER_RE: re.Pattern[str] = re.compile(
 _TASK_COMPLEMENT_LEAD_RE: re.Pattern[str] = re.compile(r'\s+(?:as\s+)?', re.IGNORECASE)
 
 # An auxiliary right before 'once' makes it the adverb 'formerly' ('was once merged'),
-# so the cue is not a temporal lead. Python lookbehind is fixed-width, hence one per width.
-_NOT_AFTER_AN_AUXILIARY: str = (
-    r'(?<!\bis\s)(?<!\b(?:was|are|has|had)\s)(?<!\b(?:were|have|been)\s)'
+# so that 'once' is not a temporal lead. Every other cue after an auxiliary still is
+# ('is until merged'). Python lookbehind is fixed-width, hence one per width.
+_NOT_ADVERBIAL_ONCE: str = (
+    r'(?:(?!once\b)|(?<!\bis\s)(?<!\b(?:was|are|has|had)\s)(?<!\b(?:were|have|been)\s))'
 )
 
 # A marker with no subject of its own binds forward only. After a determiner it is
@@ -690,7 +691,7 @@ _NOT_AFTER_AN_AUXILIARY: str = (
 # cue) and ::TestAttributiveMarkersBindForwardOnly (determiner).
 _FORWARD_ONLY_LEAD_RE: re.Pattern[str] = re.compile(
     r'(?:\b(?:the|a|an|its|their|our|your|his|her|my)|'
-    + _NOT_AFTER_AN_AUXILIARY + _TEMPORAL_CUE + r')'
+    + _NOT_ADVERBIAL_ONCE + _TEMPORAL_CUE + r')'
     r'\s+(?:(?:\w+ly|already|just|now)\s+)?$',
     re.IGNORECASE,
 )

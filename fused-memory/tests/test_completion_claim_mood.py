@@ -263,6 +263,10 @@ class TestNonAssertiveScopes:
                 id='esc-unverified-claim-536-1',
             ),
             pytest.param(
+                _ESC_536_1_MEMORY, 'solar_challenge_platform',
+                id='esc-unverified-claim-536-1-record',
+            ),
+            pytest.param(
                 'On branch task/1053 (holds once merged), the warning reads X.',
                 'solar_challenge',
                 id='esc-unverified-claim-1053-1',
@@ -305,29 +309,22 @@ class TestNonAssertiveScopes:
             pytest.param('task 5422 (holds once fully merged)', 'reify', id='adverb'),
             pytest.param('task 5422 stays open until cancelled', 'reify', id='disposition'),
             pytest.param('task 5422 runs once queued', 'reify', id='filing'),
+            pytest.param('The freeze on task 5422 is until merged', 'reify', id='copular-until'),
+            pytest.param(
+                'the branch task/5422 guard is when merged', 'reify', id='copular-when',
+            ),
+            pytest.param(
+                'the branch task/5422 guard was after merged', 'reify', id='copular-after',
+            ),
         ],
     )
     def test_a_verbless_temporal_clause_is_not_a_claim(self, text, project):
         assert _triples(text, project) == []
 
-    @pytest.mark.parametrize(
-        ('text', 'project', 'task'),
-        [
-            pytest.param(
-                _ESC_536_1_MEMORY, 'solar_challenge_platform', '536',
-                id='esc-unverified-claim-536-1-record',
-            ),
-            pytest.param(
-                _ESC_1053_1_MEMORY, 'solar_challenge', '1053',
-                id='esc-unverified-claim-1053-1-record',
-            ),
-        ],
-    )
-    def test_a_verbless_temporal_clause_does_not_claim_its_branch_task(
-        self, text, project, task,
-    ):
-        claimed = {(subject, ref) for _, subject, ref in _triples(text, project)}
-        assert ('task', task) not in claimed
+    def test_the_1053_record_does_not_claim_its_branch_task(self):
+        # Not '== []': the record also states task 894's true landing, which the gate misses.
+        claimed = {(subject, ref) for _, subject, ref in _triples(_ESC_1053_1_MEMORY, 'solar_challenge')}
+        assert ('task', '1053') not in claimed
 
     @pytest.mark.parametrize(
         ('text', 'ref'),
