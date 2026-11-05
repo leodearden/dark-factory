@@ -39,9 +39,11 @@ _REASON_CHARS = 80
 
 _EVAL_HARNESS_PROJECT = 'dark_factory'
 """The eval harness is dark-factory's instrument, so its LLM calls are
-dark-factory sessions whichever repository's fixture they grade. It is meant
-to name the same project as dark-factory-orchestrator.yaml's
-``fused_memory.project_id``; nothing derives or checks that."""
+dark-factory sessions whichever repository's fixture they grade. It names the
+same project as dark-factory-orchestrator.yaml's ``fused_memory.project_id``,
+which nothing derives:
+orchestrator/tests/test_eval_spawn_identity.py::test_eval_calls_file_under_the_operational_project_id
+checks it."""
 
 
 class MeasurementStage(StrEnum):
@@ -53,7 +55,7 @@ class MeasurementStage(StrEnum):
     SYNTHESIZER = 'synthesizer'
 
 
-def _spawn_identity(stage: MeasurementStage) -> dict[str, str]:
+def _eval_spawn_env(stage: MeasurementStage) -> dict[str, str]:
     return {
         'CLAUDE_SPAWN_ROLE': f'eval_{stage.value}',
         'CLAUDE_SPAWN_PROJECT': _EVAL_HARNESS_PROJECT,
@@ -245,12 +247,17 @@ async def measured_call(
     ``cost_usd`` is the spend summed over every attempt. With *usage_gate* the
     call runs through ``invoke_with_cap_retry``, which injects each account's
     credentials into *invoke_kwargs*. Any other exception propagates. Every
-    call declares the fleet identity ``_spawn_identity`` builds for *stage*
-    via ``spawn_env``, because the ``/tmp`` cwd the judges run in names no
-    project.
+    call declares the fleet identity ``_eval_spawn_env`` builds for *stage*
+    as ``spawn_env``, because the ``/tmp`` cwd the judges run in names no
+    project; a caller passing its own ``spawn_env`` gets a ``TypeError``.
     """
+    if 'spawn_env' in invoke_kwargs:
+        raise TypeError(
+            'measured_call declares the eval fleet identity itself; got a '
+            f'caller spawn_env={invoke_kwargs["spawn_env"]!r}'
+        )
     name = label or str(stage)
-    spawn_env = _spawn_identity(stage)
+    spawn_env = _eval_spawn_env(stage)
     spent = 0.0
 
     async def _attempt(**dispatch: Any) -> AgentResult:

@@ -6,22 +6,27 @@ the session registry's ``tmp`` bucket. ``measured_call`` is the one seam every
 eval call passes through; it declares role ``eval_<stage>`` and project
 ``dark_factory`` itself.
 
+These tests read only what each dispatch was handed, so a call is answered
+with a refusal wherever its answer does not gate a later dispatch.
+
 Hermetic: no LLM, no network.
 """
 
 from __future__ import annotations
 
-import json
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from _eval_probe_fixture import a_wins_assessment, eval_result, fixture_task
+from _eval_refusal import answered, refused_agent_result
 from _orch_helpers import build_usage_gate
 from shared.cli_invoke import AgentResult, apply_spawn_env
 from shared.config_models import AccountConfig
 
+from orchestrator.config import OrchestratorConfig
 from orchestrator.evals.compare import compare_models
 from orchestrator.evals.judge import judge_plan_quality, run_judge
 from orchestrator.evals.measurement import (
@@ -30,27 +35,13 @@ from orchestrator.evals.measurement import (
     json_answer,
     measured_call,
 )
-from orchestrator.evals.results import EvalResult
 from orchestrator.session_registry import parse_spawn_identity
 
-_FIXTURE_ID = 'df_task_9001'
 _TMP = Path('/tmp')
 
 
-def _identity_for(stage: MeasurementStage) -> dict[str, str]:
+def _eval_spawn_env_for(stage: MeasurementStage) -> dict[str, str]:
     return {'CLAUDE_SPAWN_ROLE': f'eval_{stage.value}', 'CLAUDE_SPAWN_PROJECT': 'dark_factory'}
-
-
-def _answer(payload: dict, *, cost_usd: float = 0.0) -> AgentResult:
-    return AgentResult(success=True, output=json.dumps(payload),
-                       structured_output=payload, cost_usd=cost_usd)
-
-
-def _cap_result() -> AgentResult:
-    return AgentResult(
-        success=False, output="You've hit your session limit · resets 8pm",
-        cost_usd=0.0, duration_ms=1200, turns=0, subtype='error', api_error_status=429,
-    )
 
 
 def _recording_invoke(
@@ -76,13 +67,36 @@ def _recording_invoke(
     MeasurementStage.MATCHER,
 ])
 async def test_measured_call_declares_the_eval_identity(stage: MeasurementStage) -> None:
-    invoke, calls = _recording_invoke(_answer({'x': 1}))
+    invoke, calls = _recording_invoke(answered({'x': 1}))
 
     outcome = await measured_call(invoke, json_answer, stage=stage, backend='claude', prompt='P')
 
     assert isinstance(outcome, Scored)
     assert len(calls) == 1
-    assert calls[0]['spawn_env'] == _identity_for(stage)
+    assert calls[0]['spawn_env'] == _eval_spawn_env_for(stage)
+
+
+@pytest.mark.asyncio
+async def test_eval_calls_file_under_the_operational_project_id() -> None:
+    """The project TaskWorkflow agents file under: the operational yaml's, loaded by the autouse config fixture."""
+    invoke, calls = _recording_invoke(answered({'x': 1}))
+
+    await measured_call(invoke, json_answer, stage=MeasurementStage.JUDGE, backend='claude', prompt='P')
+
+    assert calls[0]['spawn_env']['CLAUDE_SPAWN_PROJECT'] == OrchestratorConfig().fused_memory.project_id
+
+
+@pytest.mark.asyncio
+async def test_a_caller_supplied_spawn_env_is_refused_before_dispatch() -> None:
+    invoke, calls = _recording_invoke(answered({'x': 1}))
+
+    with pytest.raises(TypeError, match='measured_call declares the eval fleet identity itself'):
+        await measured_call(
+            invoke, json_answer, stage=MeasurementStage.JUDGE, backend='claude', prompt='P',
+            spawn_env={'CLAUDE_SPAWN_ROLE': 'caller'},
+        )
+
+    assert calls == []
 
 
 @pytest.mark.asyncio
@@ -94,7 +108,7 @@ async def test_gated_measured_call_declares_the_identity_on_every_attempt() -> N
         ],
         ['tok-a', 'tok-b'],
     )
-    invoke, calls = _recording_invoke(_cap_result(), _answer({'x': 2}))
+    invoke, calls = _recording_invoke(refused_agent_result(), answered({'x': 2}))
 
     with patch('shared.cli_invoke.asyncio.sleep', AsyncMock()):
         outcome = await measured_call(
@@ -106,7 +120,7 @@ async def test_gated_measured_call_declares_the_identity_on_every_attempt() -> N
     assert len(calls) == 2
     assert calls[1]['oauth_token'] == 'tok-b'
     for call in calls:
-        assert call['spawn_env'] == _identity_for(MeasurementStage.JUDGE)
+        assert call['spawn_env'] == _eval_spawn_env_for(MeasurementStage.JUDGE)
 
 
 # ---------------------------------------------------------------------------
@@ -114,64 +128,36 @@ async def test_gated_measured_call_declares_the_identity_on_every_attempt() -> N
 # own identity cascade.
 # ---------------------------------------------------------------------------
 
-_ASSESSMENT = {
-    'winner': 'A', 'confidence': 0.9, 'summary': 's',
-    'strengths_a': [], 'weaknesses_a': [], 'strengths_b': [], 'weaknesses_b': [],
-    'circumstances': '',
-}
-_SYNTHESIS = {
-    'overall_winner': 'A', 'executive_summary': 'e', 'circumstantial_analysis': 'c',
-    'cost_quality_tradeoff': 't', 'workflow_recommendations': 'w',
-}
-_TASK = {
-    'id': _FIXTURE_ID,
-    'name': 'spawn identity probe',
-    'pre_task_commit': 'a' * 40,
-    'task_definition': {'description': 'd'},
-}
-
-
-def _eval_result(config_name: str, worktree: Path) -> EvalResult:
-    worktree.mkdir()
-    return EvalResult(task_id=_FIXTURE_ID, config_name=config_name, outcome='done',
-                      metrics={}, worktree_path=str(worktree))
-
-
-def _repeating_invoke(payload: dict) -> tuple[Callable[..., Awaitable[AgentResult]], list[dict[str, Any]]]:
-    calls: list[dict[str, Any]] = []
-
-    async def invoke(**kwargs: Any) -> AgentResult:
-        calls.append(kwargs)
-        return _answer(payload)
-
-    return invoke, calls
-
-
 async def _pairwise_judge(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> list[dict[str, Any]]:
-    invoke, calls = _repeating_invoke({'winner': 'A', 'confidence': 0.9, 'reasoning': 'r'})
+    invoke, calls = _recording_invoke(refused_agent_result())
     monkeypatch.setattr('orchestrator.evals.judge.invoke_agent', invoke)
-    await run_judge({'diff': '+a', 'config_name': 'A'}, {'diff': '+b', 'config_name': 'B'}, _TASK)
+    await run_judge({'diff': '+a', 'config_name': 'A'}, {'diff': '+b', 'config_name': 'B'}, fixture_task())
     return calls
 
 
 async def _plan_judge(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> list[dict[str, Any]]:
-    invoke, calls = _repeating_invoke({'plan_quality': 0.5, 'reasoning': 'r'})
+    invoke, calls = _recording_invoke(refused_agent_result())
     monkeypatch.setattr('orchestrator.evals.judge.invoke_agent', invoke)
     plan = {'steps': [{'id': 'step-1', 'type': 'test', 'description': 'write the test'}]}
-    await judge_plan_quality(plan, '+landed', _TASK)
+    await judge_plan_quality(plan, '+landed', fixture_task())
     return calls
 
 
 async def _compare_models_calls(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> list[dict[str, Any]]:
-    """One fixture compared once: the assessor dispatch, then the synthesizer's."""
-    invoke, calls = _repeating_invoke({**_ASSESSMENT, **_SYNTHESIS})
+    """One fixture compared once: the assessor dispatch, then the synthesizer's.
+
+    The assessment must measure, because only a measured assessment reaches
+    the synthesizer.
+    """
+    invoke, calls = _recording_invoke(answered(a_wins_assessment()), refused_agent_result())
     monkeypatch.setattr('orchestrator.evals.compare.invoke_agent', invoke)
     monkeypatch.setattr('orchestrator.evals.compare.get_diff', AsyncMock(return_value='+x'))
+    task = fixture_task()
     await compare_models(
-        [_eval_result('A', tmp_path / 'wt_a'), _eval_result('B', tmp_path / 'wt_b')],
-        ['A'], ['B'], {_FIXTURE_ID: _TASK},
+        [eval_result('A', tmp_path / 'wt_a'), eval_result('B', tmp_path / 'wt_b')],
+        ['A'], ['B'], {task['id']: task},
     )
     assert len(calls) == 2, 'expected one assessor and one synthesizer dispatch'
     return calls
