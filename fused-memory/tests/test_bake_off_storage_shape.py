@@ -33,12 +33,13 @@ import dataclasses
 import functools
 import re
 import subprocess
+import tempfile
 import types
 import uuid
 from collections.abc import Container
 from pathlib import Path
 
-from _fm_helpers import load_script_module
+from _fm_helpers import isolated_lease_dir, load_script_module
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'bake_off_storage_shape.py'
 
@@ -4632,10 +4633,6 @@ _SMALL_RUN = {'cluster_limit': 2, 'distractor_limit': 12, 'project_suffix': 'ute
 #: the probe on, so they cover its passes too.
 _SIX_ARM_RUN = {**_SMALL_RUN, 'regrowth': False}
 
-import tempfile  # noqa: E402
-
-from _fm_helpers import isolated_lease_dir  # noqa: E402
-
 #: Every class that reads a recorded run shares one xdist worker, so the
 #: recording — and the per-process warm-up its first `run_bake_off` pays — is
 #: paid once rather than once per worker `--dist loadgroup` scatters them to.
@@ -5040,8 +5037,6 @@ class TestRunBakeOffWiring:
         one existed, which is what `_driver_config`'s `./data/queue` was put
         there for.
         """
-        import tempfile  # noqa: PLC0415
-
         shared = _driver_config().queue.data_dir
         runs = (small_run, six_arm_run)
 
@@ -5095,8 +5090,6 @@ class TestRunBakeOffWiring:
         call it unguarded rather than swallowing close failures on the happy
         path too.
         """
-        import tempfile  # noqa: PLC0415
-
         mod = _mod()
         drops = _install_driver_doubles(monkeypatch)
 

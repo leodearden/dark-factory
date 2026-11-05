@@ -34,13 +34,14 @@ in-progress and claims that module.
 """
 from __future__ import annotations
 
+import dataclasses
 import functools
 import types
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, NamedTuple
 
-from _fm_helpers import load_script_module
+from _fm_helpers import isolated_lease_dir, load_script_module
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'bake_off_storage_shape.py'
 
@@ -1333,10 +1334,6 @@ def _argv(tmp_path, name: str, *extra: str) -> list[str]:
         *extra,
     ]
 
-
-import dataclasses  # noqa: E402
-
-from _fm_helpers import isolated_lease_dir  # noqa: E402
 
 #: Every class that reads `cli_legs` shares one xdist worker, so the legs —
 #: and the per-process warm-up the first `main()` pays — are paid once rather
