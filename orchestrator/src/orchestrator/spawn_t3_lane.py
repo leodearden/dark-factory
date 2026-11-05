@@ -222,6 +222,41 @@ def _connect(env: Mapping[str, str]) -> t3_mcp_client.T3McpClient | NoLauncher:
     return connected
 
 
+class _Session:
+    """One verb's MCP client across its polls, connected again on the poll after a failed connect."""
+
+    def __init__(self, env: Mapping[str, str]) -> None:
+        self._env = env
+        self._client: t3_mcp_client.T3McpClient | None = None
+
+    def client(self) -> t3_mcp_client.T3McpClient | None:
+        if self._client is None:
+            connected = _connect(self._env)
+            if isinstance(connected, NoLauncher):
+                logger.warning(f'cannot reach T3 over MCP: {connected.verdict()}')
+                return None
+            self._client = connected
+        return self._client
+
+
+@dataclass(frozen=True)
+class ThreadUnread:
+    """No thread detail; ``gone`` only when T3 answered that it has no such thread."""
+
+    gone: bool
+
+
+def _read_thread(client: t3_mcp_client.T3McpClient | None, thread_id: str) -> Mapping[str, Any] | ThreadUnread:
+    """``t3_thread_read``'s ``thread`` detail."""
+    if client is None:
+        return ThreadUnread(gone=False)
+    reply = client.call('t3_thread_read', {'threadId': thread_id, 'limit': 1})
+    if isinstance(reply, t3_mcp_client.ToolFailed) and reply.code == 'thread_not_found':
+        return ThreadUnread(gone=True)
+    thread = reply.value.get('thread') if isinstance(reply, t3_mcp_client.ToolOk) else None
+    return thread if isinstance(thread, Mapping) else ThreadUnread(gone=False)
+
+
 @dataclass(frozen=True)
 class Incomplete:
     """A listing not read whole; ``transport`` is the failed call's, when the transport failed."""
@@ -791,10 +826,13 @@ def maintain_binding(record_dir: str, cwd: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def await_started(thread_id: str, cwd: str, record_dir: str, timeout: float, since: float) -> str:
+def await_started(
+    thread_id: str, cwd: str, record_dir: str, timeout: float, since: float, env: Mapping[str, str]
+) -> str:
     deadline = time.monotonic() + timeout
+    session = _Session(env)
     while True:
-        verdict = _started_verdict(thread_id, cwd, record_dir, since)
+        verdict = _started_verdict(_read_thread(session.client(), thread_id), cwd, record_dir, since)
         if verdict is not None:
             break
         remaining = deadline - time.monotonic()
@@ -812,16 +850,14 @@ def await_started(thread_id: str, cwd: str, record_dir: str, timeout: float, sin
     )
 
 
-def _started_verdict(thread_id: str, cwd: str, record_dir: str, since: float) -> str | None:
-    """None while preparing; a startup-failure status is failed-to-start until a transcript names the record."""
-    try:
-        summary = list_threads(cwd).get(thread_id)
-    except T3CommandFailed as exc:
-        logger.warning(str(exc))
+def _started_verdict(
+    thread: Mapping[str, Any] | ThreadUnread, cwd: str, record_dir: str, since: float
+) -> str | None:
+    """None while unread or preparing; a startup-failure status is failed-to-start until a transcript names the record."""
+    status = None if isinstance(thread, ThreadUnread) else thread.get('status')
+    if not isinstance(status, str) or status in PENDING_RUN_STATUSES:
         return None
-    if summary is None or summary.status in PENDING_RUN_STATUSES:
-        return None
-    if summary.status in STARTUP_FAILURE_STATUSES and not (
+    if status in STARTUP_FAILURE_STATUSES and not (
         record_dir and discover_transcript(cwd, record_dir, since)
     ):
         return 'failed-to-start'
@@ -1163,7 +1199,7 @@ def _dispatch(args: argparse.Namespace) -> str:
     if args.verb == 'provider':
         return _provider_verdict(provider_instance(args.cwd, args.provider, os.environ))
     if args.verb == 'await-started':
-        return await_started(args.thread_id, args.cwd, args.record, args.timeout, args.since)
+        return await_started(args.thread_id, args.cwd, args.record, args.timeout, args.since, os.environ)
     if args.verb == 'wait':
         return wait(args.thread_id, args.cwd, args.record, os.environ)
     if args.verb == 'pair':
