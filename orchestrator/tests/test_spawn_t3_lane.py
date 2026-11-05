@@ -650,19 +650,6 @@ class TestLaunch:
         assert t3.tool_calls('t3_thread_launch') == [] and t3.tool_calls('t3_thread_list') == []
         assert sr.read_record(Path(record_dir).name, root=env.fleet).display is None
 
-    def test_no_server_runtime_is_no_launcher(
-        self, env: Env, fake_t3: FakeT3, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        (env.t3_home / 'userdata' / 'server-runtime.json').unlink()
-
-        line = run_verb(
-            capsys, 'launch', '--cwd', str(env.project), '--title', 't',
-            '--prompt-file', prompt_file(tmp_path, 'p'), '--record', '',
-        )
-
-        assert line == 'no-launcher reason=server-runtime-missing'
-        assert fake_t3.calls('start') == []
-
     def test_launch_first_sweeps_the_projects_records_whose_thread_is_gone(
         self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
@@ -806,6 +793,124 @@ class TestProjectResolution:
 
         assert line.split()[0] == 'launch-failed'
         assert t3.tool_calls('t3_thread_launch') == []
+
+
+def forget_credential(env: Env) -> None:
+    t3_mcp_client.credential_path(ENVIRONMENT_ID, root=env.fleet).unlink()
+
+
+class TestLaunchFailures:
+    def test_t3_refusing_a_worktree_launch_as_invalid_is_refused_with_its_message(
+        self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        worktree = env.project / '.worktrees' / '8123'
+        worktree.mkdir(parents=True)
+        message = 'The request was rejected.'
+        t3.tool_replies['t3_thread_launch'] = ToolFailure('invalid_request', message)
+        record_dir = spawn_record(env)
+
+        line = launch_line(capsys, tmp_path, worktree, record=record_dir)
+
+        assert line == lane._verdict('refused', reason='cwd-not-project-worktree', detail=message)
+        record = sr.read_record(Path(record_dir).name, root=env.fleet)
+        assert (record.display, record.status) == (None, sr.Status.LAUNCHING)
+        assert len(t3.tool_calls('t3_thread_launch')) == 1
+
+    def test_an_invalid_root_launch_is_launch_failed_whatever_its_message_says(
+        self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        message = "Path '/x' is not a worktree of this project."
+        t3.tool_replies['t3_thread_launch'] = ToolFailure('invalid_request', message)
+        record_dir = spawn_record(env)
+
+        line = launch_line(capsys, tmp_path, env.project, record=record_dir)
+
+        assert line == lane._verdict('launch-failed', detail=f'invalid_request: {message}')
+        assert sr.read_record(Path(record_dir).name, root=env.fleet).display is None
+
+    def test_another_failure_of_a_worktree_launch_is_launch_failed(
+        self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        worktree = env.project / '.worktrees' / '8123'
+        worktree.mkdir(parents=True)
+        t3.tool_replies['t3_thread_launch'] = ToolFailure('orchestration_error', 'the provider is down')
+
+        line = launch_line(capsys, tmp_path, worktree)
+
+        assert line == lane._verdict('launch-failed', detail='orchestration_error: the provider is down')
+
+    def test_a_lost_reply_is_resent_once_with_the_same_request_id(
+        self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        t3.tool_replies['t3_thread_launch'] = replies_in_turn(HANG_UP, ToolSuccess(THREAD_LAUNCH_JSON))
+        record_dir = spawn_record(env)
+
+        line = launch_line(capsys, tmp_path, env.project, record=record_dir)
+
+        assert line == f'started thread_id={THREAD_ID} project_id={PROJECT_ID} run_id={RUN_ID}'
+        request_ids = [call['clientRequestId'] for call in t3.tool_calls('t3_thread_launch')]
+        assert request_ids == ['unblock-df-7489-4242', 'unblock-df-7489-4242']
+
+    def test_a_reply_lost_twice_is_launch_failed(
+        self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        t3.tool_replies['t3_thread_launch'] = replies_in_turn(HANG_UP)
+
+        line = launch_line(capsys, tmp_path, env.project)
+
+        assert line.split()[0] == 'launch-failed'
+        assert len(t3.tool_calls('t3_thread_launch')) == 2
+
+    def test_no_credential_and_no_t3_to_self_pair_is_no_launcher(
+        self, env: Env, t3_server: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        point_runtime_at(env, t3_server)
+
+        line = launch_line(capsys, tmp_path, env.project)
+
+        assert line.startswith('no-launcher reason=t3-mcp-pair-failed detail=')
+        assert t3_server.mcp_requests() == []
+
+    def test_no_credential_self_pairs_on_the_t3_host(
+        self, env: Env, t3: FakeT3Server, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        forget_credential(env)
+        put_fake_t3_cli_on_path(t3, tmp_path, monkeypatch, version_line='t3 v0.1.6')
+
+        line = launch_line(capsys, tmp_path, env.project)
+
+        assert line.startswith('started ')
+        assert stored_credential(env).paired_by is t3_mcp_client.PairedBy.SELF_PAIR
+
+    def test_a_bearer_t3_refuses_with_no_t3_to_re_pair_is_credential_expired(
+        self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        seed_credential(env, t3, access_token='revoked')
+
+        line = launch_line(capsys, tmp_path, env.project)
+
+        assert line.startswith('no-launcher reason=t3-mcp-credential-expired detail=')
+        assert t3.tool_calls('t3_thread_launch') == []
+
+    def test_no_server_runtime_is_no_launcher(
+        self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        remove_runtime(env)
+
+        line = launch_line(capsys, tmp_path, env.project)
+
+        assert line == 'no-launcher reason=server-runtime-missing'
+        assert t3.mcp_requests() == []
+
+    def test_a_runtime_origin_nothing_answers_is_no_launcher(
+        self, env: Env, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        write_runtime_origin(env, DEAD_ORIGIN)
+
+        line = launch_line(capsys, tmp_path, env.project)
+
+        assert line.startswith('no-launcher reason=descriptor-unreachable detail=')
 
 
 # ---------------------------------------------------------------------------
