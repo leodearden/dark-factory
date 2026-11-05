@@ -68,6 +68,9 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import NamedTuple
 
+import pytest
+from shared.testing_xdist_groups import single_xdist_group
+
 # tests/scripts/<file>.py and shared/tests/<file>.py are both exactly two levels
 # below the repo root, so this constant carried over verbatim from the guard's
 # old home.  Shared by the relocated guard and by the boundary tests at the
@@ -878,6 +881,20 @@ class TestNoRegrownAtomicWriters:
             'These helpers stopped delegating to shared.safe_io.atomic_write_text '
             'and re-inlined their own implementation:\n  ' + '\n  '.join(offenders)
         )
+
+
+def test_the_source_tree_sweeps_share_one_xdist_worker(request):
+    sweeps = {
+        TestNoRegrownAtomicWriters.test_no_unapproved_renamers_in_source_trees,
+        TestNoRegrownAtomicWriters.test_atomic_write_text_helpers_only_delegate,
+    }
+    selected = [
+        item for item in request.session.items if getattr(item, 'function', None) in sweeps
+    ]
+    if not selected:
+        pytest.skip('no source-tree sweep is selected in this session')
+
+    assert single_xdist_group(selected) == _SWEEP_GROUP_NAME
 
 
 # ---------------------------------------------------------------------------
