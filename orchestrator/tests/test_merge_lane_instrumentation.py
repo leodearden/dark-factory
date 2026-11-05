@@ -16,7 +16,11 @@ from _merge_lane_fakes import FakeVerifier, VerifyScript, fails, lane_scene_conf
 from _merge_worker_drive import HEAVY_BARRIER_TEST_TIMEOUT
 from _orch_helpers import wait_responsive
 from test_merge_queue_concurrent_verify import _gated_runner, _inject_two_host_allocator
-from test_merge_queue_rebased_landing_dead_base import _running_lane, _submitted
+from test_merge_queue_rebased_landing_dead_base import (
+    _land_foreign_commit,
+    _running_lane,
+    _submitted,
+)
 from test_merge_speculation import _LateArrivalFakeEventStore
 
 from orchestrator.config import GitConfig, OrchestratorConfig
@@ -132,4 +136,37 @@ class TestOrdinaryDispatchFacts:
         assert [row['attempt'] for row in rows] == [0, 1]
         assert _dispatch_facts(store, 'in-retry') == [
             ('prefer_local_free', 'main'), ('retry_held_host', 'main'),
+        ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)
+class TestGateReverifyDispatchFacts:
+
+    async def test_a_rebased_head_gates_on_its_own_local_host_against_main(
+        self, git_ops: GitOps, git_repo: Path, git_config: GitConfig,
+    ) -> None:
+        config = lane_scene_config(
+            git_repo, git_config, verify_host_policy='prefer_local',
+            merge_verify_breadth='full', merge_gate_history_pure=False,
+        )
+        head_gate = asyncio.Event()
+        verifier = FakeVerifier(scripts={
+            'gt-a': VerifyScript(result=passes().result, release=head_gate),
+        })
+        store = _LateArrivalFakeEventStore()
+
+        async with _running_lane(git_ops, verifier=verifier, event_store=store) as (_, queue):
+            req = await _submitted(git_ops, config, 'gt-a')
+            await queue.put(req)
+            await asyncio.wait_for(verifier.await_entry(1), timeout=_SETTLE_TIMEOUT)
+            await _land_foreign_commit(git_repo)
+            head_gate.set()
+            outcome = await wait_responsive(req.result, label='gt-a outcome')
+
+        assert outcome.status == 'done', outcome
+        verified, gated = [row['merge_sha'] for row in _rows(store, EventType.merge_verify, 'gt-a')]
+        assert verified != gated == outcome.merge_sha, 'precondition: A lands rebased'
+        assert _dispatch_facts(store, 'gt-a') == [
+            ('prefer_local_free', 'main'), ('gate_on_head_host', 'main'),
         ]
