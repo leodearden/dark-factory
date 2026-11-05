@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -86,6 +87,11 @@ def _fresh(corpus: EscalationCorpus) -> Datum[EscalationCorpus]:
 def _reason(datum: Datum) -> str:
     assert datum.reason is not None
     return datum.reason
+
+
+def _by_task(datum: Datum[Mapping[int, tuple[str, ...]]]) -> dict[int, tuple[str, ...]]:
+    assert datum.value is not None, datum.reason
+    return dict(datum.value)
 
 
 def _corpus(datum: Datum[EscalationCorpus]) -> EscalationCorpus:
@@ -567,7 +573,7 @@ class TestPendingLevel2ByTask:
         assert datum.reason is None
         assert datum.as_of == NOW
         assert datum.freshness_bound_seconds == CORPUS_FRESHNESS_BOUND_SECONDS
-        assert dict(datum.value) == {3546: ('esc-3546-2',)}
+        assert _by_task(datum) == {3546: ('esc-3546-2',)}
 
     def test_only_pending_human_records_at_the_root_on_a_numbered_task_are_listed(self, config):
         queue = EscalationQueue(config.escalations_dir)
@@ -581,14 +587,14 @@ class TestPendingLevel2ByTask:
 
         datum = self._ruling(config)
 
-        assert dict(datum.value) == {3546: ('esc-3546-2',)}
+        assert _by_task(datum) == {3546: ('esc-3546-2',)}
 
     def test_two_human_records_on_one_task_are_both_listed_in_order(self, config):
         queue = EscalationQueue(config.escalations_dir)
         _file(queue, 'esc-20-3', '20')
         _file(queue, 'esc-20-1', '20')
 
-        assert dict(self._ruling(config).value) == {20: ('esc-20-1', 'esc-20-3')}
+        assert _by_task(self._ruling(config)) == {20: ('esc-20-1', 'esc-20-3')}
 
     def test_another_roots_missing_queue_does_not_make_this_projects_ruling_partial(
         self, config, tmp_path,
@@ -604,7 +610,7 @@ class TestPendingLevel2ByTask:
         assert corpus_datum.state is DatumState.LOWER_BOUND
         assert datum.state is DatumState.FRESH
         assert datum.reason is None
-        assert dict(datum.value) == {3546: ('esc-3546-2',)}
+        assert _by_task(datum) == {3546: ('esc-3546-2',)}
 
     def test_this_projects_missing_queue_makes_its_ruling_a_lower_bound_naming_it(self, config):
         config.escalations_dir.rmdir()
@@ -613,7 +619,7 @@ class TestPendingLevel2ByTask:
 
         assert datum.state is DatumState.LOWER_BOUND
         assert str(config.escalations_dir) in _reason(datum)
-        assert dict(datum.value) == {}
+        assert _by_task(datum) == {}
 
     def test_an_unknown_corpus_is_an_unknown_ruling_with_its_reason(self, config):
         unread = unknown_datum('corpus walk timed out', CORPUS_FRESHNESS_BOUND_SECONDS)

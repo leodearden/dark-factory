@@ -328,7 +328,9 @@ def signal_view(documents: Mapping[str, PrdDocument]) -> PrdView:
 
 def row_wire(sidecar: CapabilityManifestDoc | SidecarUnread, title: str | None = None) -> dict:
     view = signal_view({KEY: PrdDocument(title=title, sidecar=sidecar)})
-    [row] = [row for row in view.to_wire()['prds'] if row['key'] == KEY]
+    rows = view.to_wire()['prds']
+    assert isinstance(rows, list)
+    [row] = [row for row in rows if row['key'] == KEY]
     return row
 
 

@@ -541,7 +541,8 @@ def test_unknown_documents_make_an_unknown_view_naming_the_signals_input():
 
 @pytest.mark.parametrize('name', ['escalations', 'activity', 'liveness'])
 def test_an_unknown_escalations_activity_or_liveness_input_makes_an_unknown_view(name):
-    datum = build_prd_view(_inputs(**{name: unknown_datum('boom', 60)}), now=NOW)
+    inputs = dataclasses.replace(_inputs(), **{name: unknown_datum('boom', 60)})
+    datum = build_prd_view(inputs, now=NOW)
     assert datum.state is DatumState.UNKNOWN
     assert datum.reason == f'{name}: boom'
 
