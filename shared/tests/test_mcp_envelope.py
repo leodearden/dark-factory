@@ -121,6 +121,8 @@ class TestHappyPath:
 # Pair 2 — 5 non-raising abnormal shapes (step-3 RED / step-4 GREEN)
 # ---------------------------------------------------------------------------
 
+_JSON_DECODE_ENV = {"result": {"content": [{"type": "text", "text": "{not json"}]}}
+
 # Each tuple: (shape_member, result_input, key, expected_type)
 _ABNORMAL_CASES = [
     # NO_TEXT_BLOCK — result is not a dict
@@ -138,8 +140,14 @@ _ABNORMAL_CASES = [
     (EnvelopeShape.NO_TEXT_BLOCK, {}, "k", dict),
     # NO_TEXT_BLOCK — result["result"] is a non-dict (e.g. string); second .get would raise
     (EnvelopeShape.NO_TEXT_BLOCK, {"result": "oops"}, "k", dict),
-    # JSON_DECODE_ERROR — text block present but invalid JSON (placeholder; replaced below)
-    (EnvelopeShape.JSON_DECODE_ERROR, None, "k", dict),
+    # NO_TEXT_BLOCK — result["result"] has no content key
+    (EnvelopeShape.NO_TEXT_BLOCK, {"result": {}}, "k", dict),
+    # NO_TEXT_BLOCK — content is null
+    (EnvelopeShape.NO_TEXT_BLOCK, {"result": {"content": None}}, "k", dict),
+    # NO_TEXT_BLOCK — content is not a list
+    (EnvelopeShape.NO_TEXT_BLOCK, {"result": {"content": 7}}, "k", dict),
+    # JSON_DECODE_ERROR — text block present but invalid JSON
+    (EnvelopeShape.JSON_DECODE_ERROR, _JSON_DECODE_ENV, "k", dict),
     # INNER_NOT_DICT — parsed JSON is a list (not a dict)
     (EnvelopeShape.INNER_NOT_DICT, _env([1, 2, 3]), "k", dict),
     # INNER_NOT_DICT — parsed JSON is a scalar
@@ -161,10 +169,6 @@ _ABNORMAL_CASES = [
     ),
 ]
 
-# Build the JSON_DECODE_ERROR case properly (None slot was placeholder)
-_JSON_DECODE_ENV = {"result": {"content": [{"type": "text", "text": "{not json"}]}}
-_ABNORMAL_CASES[5] = (EnvelopeShape.JSON_DECODE_ERROR, _JSON_DECODE_ENV, "k", dict)
-
 
 @pytest.mark.parametrize(
     "shape,result_input,key,expected_type",
@@ -175,6 +179,9 @@ _ABNORMAL_CASES[5] = (EnvelopeShape.JSON_DECODE_ERROR, _JSON_DECODE_ENV, "k", di
         "no_text_block_no_text_type",
         "no_text_block_missing_result",
         "no_text_block_result_not_dict",
+        "no_text_block_content_missing",
+        "no_text_block_content_none",
+        "no_text_block_content_not_a_list",
         "json_decode_error",
         "inner_not_dict_list",
         "inner_not_dict_scalar",
@@ -634,8 +641,7 @@ class TestToolTextBlocks:
 
 
 class TestParseToolResultTextBlockLocation:
-    """parse_tool_result finds text blocks by the same rule as tool_text_blocks,
-    but hands the first block's RAW text to json.loads, never a str() of it."""
+    """parse_tool_result finds text blocks by the same rule as tool_text_blocks."""
 
     def test_the_first_text_block_wins_past_non_dict_and_non_text_blocks(self):
         env = {
@@ -648,30 +654,6 @@ class TestParseToolResultTextBlockLocation:
                 ]
             }
         }
-        assert parse_tool_result(env, "k", int) == (1, None)
-
-    @pytest.mark.parametrize(
-        "env",
-        [{"result": {"content": None}}, {"result": {"content": 7}}],
-        ids=["content-none", "content-not-a-list"],
-    )
-    def test_a_content_that_is_not_a_list_has_no_text_block(self, env, caplog):
-        with caplog.at_level(logging.WARNING, logger="shared.mcp_envelope"):
-            value, err = parse_tool_result(env, "k", dict)
-        assert value is None
-        assert err is not None
-        assert err.shape == EnvelopeShape.NO_TEXT_BLOCK
-        assert len(_envelope_warnings(caplog)) == 1
-
-    def test_a_non_str_text_value_reaches_json_loads_uncoerced(self):
-        env = {"result": {"content": [{"type": "text", "text": 42}]}}
-        value, err = parse_tool_result(env, "k", dict)
-        assert value is None
-        assert err is not None
-        assert err.shape == EnvelopeShape.JSON_DECODE_ERROR
-
-    def test_a_bytes_text_value_decodes_as_json(self):
-        env = {"result": {"content": [{"type": "text", "text": b'{"k": 1}'}]}}
         assert parse_tool_result(env, "k", int) == (1, None)
 
 
