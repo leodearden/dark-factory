@@ -15,6 +15,7 @@ from shared.scheduler_state import SchedulerStateSnapshot
 
 import dashboard.data.scheduler as sched
 from dashboard.config import DashboardConfig
+from dashboard.data.active_tasks import TASKS_BUDGET
 from dashboard.data.datum import DatumState
 
 NOW = datetime(2026, 11, 5, 9, 0, tzinfo=UTC)
@@ -161,3 +162,10 @@ async def test_both_clear_hooks_forget_the_state(config, forget):
     await acquire(config, scheduler, now=NOW + timedelta(seconds=1))
 
     assert scheduler.calls == [URL1, URL1]
+
+
+def test_the_whole_read_bound_sits_above_the_scheduler_tabs_handler_deadline():
+    handler_deadline = TASKS_BUDGET.total
+
+    assert handler_deadline < sched.SCHEDULER_STATE_READ_TIMEOUT
+    assert sched.SCHEDULER_STATE_TTL_SECONDS < sched.SCHEDULER_STATE_FRESHNESS_BOUND_SECONDS
