@@ -95,6 +95,7 @@ from orchestrator.agents.write_set import (
 from orchestrator.artifacts import (
     PLAN_SCHEMA_VERSION,
     ReviewAggregation,
+    ReviewsRootMissing,
     TaskArtifacts,
     iteration_entry_written_by_orchestrator,
     plan_base_commit,
@@ -11367,9 +11368,7 @@ class TaskWorkflow:
         so only a corrupt, hand-edited or cross-role artifact can reach disk
         under someone else's name.  It still matters: ``_run_reviewer``'s
         return is mirrored verbatim into ``reviews/<role>.json`` (``_review``
-        -> ``artifacts.write_review``), and that mirror — despite
-        ``write_review``'s "debugging aid, not load-bearing" docstring
-        (``artifacts.py:851-852``) — is the SOLE input to
+        -> ``artifacts.write_review``), and that mirror is the SOLE input to
         ``aggregate_reviews()``, which makes the blocking-issue decision.  A
         cross-role payload returned verbatim would be filed, and its issues
         counted, under the wrong reviewer's name.
@@ -14129,10 +14128,14 @@ class TaskWorkflow:
         )
 
     def _write_merge_failure_review(self, category: str, detail: str) -> None:
-        """Write a review-format JSON describing a merge failure to .task/reviews/.
+        """Write a review-format JSON describing a merge failure to reviews/.
 
         Uses the same schema as reviewer agents so humans and retry agents
-        can consume it uniformly.
+        can consume it uniformly. The record is forensic: every caller routes
+        the same detail onward (as a block reason, or into main-health
+        auto-heal), and both ``clear_reviews()`` call sites run before any
+        aggregation, so it is never aggregated. Losing it to a vanished root
+        is logged, not raised.
         """
         if not self.artifacts:
             return
@@ -14149,7 +14152,13 @@ class TaskWorkflow:
             ],
             'summary': detail[:200],
         }
-        self.artifacts.write_review('merge', review)
+        try:
+            self.artifacts.write_review('merge', review)
+        except ReviewsRootMissing as exc:
+            logger.warning(
+                'Task %s: merge-failure review (%s) not written: %s',
+                self.task_id, category, exc,
+            )
 
     def _build_agent_env(self, role: AgentRole) -> dict[str, str] | None:
         """Build the env_overrides dict for this agent invocation.

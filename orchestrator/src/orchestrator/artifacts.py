@@ -84,6 +84,23 @@ class ArtifactWriteError(OSError):
     """
 
 
+class ReviewsRootMissing(FileNotFoundError):
+    """A review could not be written because the root holding reviews/ is gone.
+
+    Built from a single message, so ``errno`` stays None and
+    ``workflow_types.py::classify_failure`` blocks the task, as it does
+    ``git_ops.py::WorktreeMissing``.
+    """
+
+    def __init__(self, reviewer_name: str, root: Path):
+        self.reviewer_name = reviewer_name
+        self.root = root
+        super().__init__(
+            f'review {reviewer_name!r} cannot reach the review gate: '
+            f'its root {root} no longer exists'
+        )
+
+
 class PlanMutexNotHeld(RuntimeError):
     """A plan.json read-modify-write reached its write without holding ``plan_mutex()``.
 
@@ -1230,22 +1247,19 @@ class TaskArtifacts:
         self._clear_path('iterations.jsonl')
 
     def write_review(self, reviewer_name: str, review: dict) -> None:
-        """Write .task/reviews/{name}.json.
+        """Write ``reviews/{reviewer_name}.json``.
 
-        Best-effort: if the artifacts root has been removed (worktree gone
-        out-of-band), skip the write rather than raising — the review JSON
-        is a debugging aid, not load-bearing for workflow correctness. This
-        method assumes ``init()`` has already created the reviews' root:
-        reviews are a post-implementation workflow phase, so init() has
-        always run by the time a reviewer's output is written.
+        reviews/ is load-bearing: ``aggregate_reviews()`` is the review gate's
+        only input. A skipped write would leave an aggregation with no
+        blocking issues and no errors, which the gate reads as PASS, so a
+        vanished root raises instead. The root is never recreated.
+
+        Raises:
+            ReviewsRootMissing: the root holding reviews/ no longer exists.
         """
         root = self._root_for('reviews')
         if not root.is_dir():
-            logger.info(
-                'TaskArtifacts: skipping write_review %r — root %s no longer exists',
-                reviewer_name, root,
-            )
-            return
+            raise ReviewsRootMissing(reviewer_name, root)
         self._write_json(f'reviews/{reviewer_name}.json', review)
 
     def read_reviews(self) -> dict[str, dict]:
@@ -1635,9 +1649,9 @@ class TaskArtifacts:
         """Write ``.task/verdicts/{role}.json``.
 
         Best-effort: if the artifacts root has been removed (worktree gone
-        out-of-band), skip the write rather than raising — mirrors
-        ``write_review``'s root-gone guard. This method assumes ``init()``
-        has already created the verdicts' root.
+        out-of-band), skip the write rather than raising. Skipping fails
+        closed, because ``_run_reviewer`` treats a missing verdict as ERROR.
+        This method assumes ``init()`` has already created the verdicts' root.
 
         Raises:
             ValueError: if *role* is invalid — see ``_validate_verdict_role``.
@@ -1877,9 +1891,9 @@ class TaskArtifacts:
         makes a truncated log still usable line-by-line.
         """
         # Tolerate a vanished worktree.  Callers that care about durability
-        # (init, plan, base_commit, etc.) check their root themselves; the
-        # opportunistic writes (reviews, iteration log) just want a no-op
-        # when the worktree has been deleted out-of-band.
+        # (init, plan, base_commit, reviews, etc.) check their root
+        # themselves; the opportunistic writes (verdicts, for one) just want
+        # a no-op when the worktree has been deleted out-of-band.
         path = self.artifact_path(name)
         try:
             # Resolve FIRST — write through a symlink, never onto it.  Order
