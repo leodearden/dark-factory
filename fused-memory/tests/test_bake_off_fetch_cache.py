@@ -1334,6 +1334,70 @@ def _argv(tmp_path, name: str, *extra: str) -> list[str]:
     ]
 
 
+import dataclasses  # noqa: E402
+
+from _fm_helpers import isolated_lease_dir  # noqa: E402
+
+#: Every class that reads `cli_legs` shares one xdist worker, so the legs —
+#: and the per-process warm-up the first `main()` pays — are paid once rather
+#: than once per worker `--dist loadgroup` scatters them to.
+_ON_THE_RECORDING_WORKER = pytest.mark.xdist_group('bake_off_fetch_cache_recorded_legs')
+
+
+@dataclasses.dataclass(frozen=True)
+class _CliLegs:
+    """Three doubled `main()` legs over one cache: plain, live (dumping), replay."""
+
+    plain_report: str
+    live_report: str
+    replay_report: str
+    cache_text: str
+    cache_path: Path
+    replay_services: tuple[_FakeMemoryService, ...]
+    replay_drop_calls: tuple[tuple[str, ...], ...]
+    replay_cache_reads: tuple[str, ...]
+
+
+def _record_cli_legs(directory: Path) -> _CliLegs:
+    mod = _mod()
+    cache = directory / 'cache.json'
+    with pytest.MonkeyPatch.context() as mp:
+        isolated_lease_dir(mp, directory / 'leases')
+        _install_driver_doubles(mp)
+        assert mod.main(_argv(directory, 'plain')) == 0
+
+        _install_driver_doubles(mp)
+        assert mod.main(_argv(directory, 'live', '--dump-fetches', str(cache))) == 0
+
+        # The counter goes in AFTER the live leg: only the REPLAY's parses
+        # are being measured.
+        drops = _install_driver_doubles(mp)
+        reads = _count_cache_reads(mp, mod)
+        assert mod.main(_argv(directory, 'replay', '--replay-fetches', str(cache))) == 0
+        replay_services = tuple(_FakeMemoryService.instances)
+        replay_drop_calls = tuple(tuple(call) for call in drops.calls)
+
+    def report(name: str) -> str:
+        return (directory / f'{name}.json').read_text(encoding='utf-8')
+
+    return _CliLegs(
+        plain_report=report('plain'),
+        live_report=report('live'),
+        replay_report=report('replay'),
+        cache_text=cache.read_text(encoding='utf-8'),
+        cache_path=cache,
+        replay_services=replay_services,
+        replay_drop_calls=replay_drop_calls,
+        replay_cache_reads=tuple(reads),
+    )
+
+
+@pytest.fixture(scope='module')
+def cli_legs(tmp_path_factory) -> _CliLegs:
+    """The three legs, recorded once per module; every field is immutable."""
+    return _record_cli_legs(tmp_path_factory.mktemp('cli-legs'))
+
+
 class TestFetchCacheCliDefaults:
     """Both flags default to None, so `TestBuildParser` in the E2 module —
     which asserts defaults BY ATTRIBUTE, not flag-set exhaustiveness — keeps
@@ -1361,6 +1425,7 @@ class TestFetchCacheCliDefaults:
         assert '--replay-fetches' in message
 
 
+@_ON_THE_RECORDING_WORKER
 class TestDumpFetchesFlag:
     """`--dump-fetches` is additive: it writes the cache and changes nothing."""
 
@@ -1413,7 +1478,7 @@ def _rekey_a_curator_gate_canonical(registry: dict) -> None:
         pair['successor_hash'] = new_hash
 
 
-def _recorded_cache_in(tmp_path: Path, cli_legs) -> Path:
+def _recorded_cache_in(tmp_path: Path, cli_legs: _CliLegs) -> Path:
     """A private copy of the recorded live leg's cache, for a test to mutate."""
     cache = tmp_path / 'cache.json'
     cache.write_text(cli_legs.cache_text, encoding='utf-8')
@@ -1425,6 +1490,7 @@ def _recorded_cache_in(tmp_path: Path, cli_legs) -> Path:
 # --timeout=300. Sized per plans/pytest-per-test-timeout-measurement-2026-09-17.md:
 # 8x the worst measured wall clock, never below the pyproject default.
 @pytest.mark.timeout(540)
+@_ON_THE_RECORDING_WORKER
 class TestReplayFetchesFlag:
     """`--replay-fetches` must touch NOTHING. Not fewer calls — none."""
 
