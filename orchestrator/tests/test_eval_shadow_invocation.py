@@ -16,8 +16,7 @@ from uuid import uuid4
 
 import pytest
 
-from orchestrator import config as orch_config_module
-from orchestrator.config import OrchestratorConfig, SandboxConfig
+from orchestrator.config import OrchestratorConfig, SandboxConfig, diff_config
 from orchestrator.evals import runner
 from orchestrator.evals.configs import EvalConfig
 from orchestrator.evals.live_fixture import build_live_fixture
@@ -45,9 +44,8 @@ def _shadow_fixture(project_root: Path) -> dict:
 
 
 def _changed_leaf_paths(a: OrchestratorConfig, b: OrchestratorConfig) -> set[str]:
-    a_leaves = dict(orch_config_module._iter_leaves(a))
-    b_leaves = dict(orch_config_module._iter_leaves(b))
-    return {path for path, a_val in a_leaves.items() if a_val != b_leaves[path]}
+    diff = diff_config(a, b)
+    return set(diff.applied_candidates) | set(diff.restart_required)
 
 
 def test_strict_mcp_and_null_memory_are_inherited_from_the_eval_profile(tmp_path: Path) -> None:
