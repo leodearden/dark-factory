@@ -2066,6 +2066,29 @@ class TestWorktreeMissingTolerance:
 
         # _write_json into an artifact whose root is gone — should swallow
         ta._write_json('reviews/foo.json', {'a': 1})  # no exception
+        assert not ta.task_root.exists()
+        assert not worktree.exists()
+
+    @pytest.mark.parametrize('write', [
+        pytest.param(lambda ta: ta.set_review_counters(review_cycles_total=1),
+                     id='set_review_counters'),
+        pytest.param(lambda ta: ta.record_review_verdict('tree', 'PASS', False),
+                     id='record_review_verdict'),
+        pytest.param(lambda ta: ta.write_plan({'task_id': 't', 'title': 'p', 'steps': []}),
+                     id='write_plan'),
+        pytest.param(lambda ta: ta.write_blocking_dependency('7', 'r', 'sha'),
+                     id='write_blocking_dependency'),
+    ])
+    def test_default_path_writers_leave_a_vanished_root_gone(self, tmp_path: Path, write):
+        worktree = tmp_path / 'gone-default'
+        worktree.mkdir()
+        ta = TaskArtifacts(worktree)
+        ta.init('task-d', 'gone', 'desc')
+        shutil.rmtree(worktree)
+
+        write(ta)
+
+        assert not worktree.exists()
 
     def test_write_review_still_raises_for_genuine_io_errors(
         self, tmp_path: Path, monkeypatch
@@ -2077,12 +2100,10 @@ class TestWorktreeMissingTolerance:
         # Root exists, so the FileNotFoundError tolerance in ``_write_json``
         # must NOT engage and a genuine I/O failure must surface.
         #
-        # The patch deliberately targets ``Path.mkdir`` — a seam BOTH write
-        # strategies traverse: the historical ``path.parent.mkdir(...)`` +
-        # ``path.write_text(...)`` pair, and the atomic
-        # ``safe_io.atomic_write_text(..., mkdir=True)`` delegation that
-        # replaced it (which calls ``p.parent.mkdir(parents=True,
-        # exist_ok=True)`` itself).  Do NOT re-narrow this to ``write_text``:
+        # The patch deliberately targets ``Path.mkdir``: ``_write_json``
+        # creates the artifact's own directory (here reviews/) with
+        # ``Path.mkdir`` before the atomic write, which is why patching it
+        # still exercises the seam.  Do NOT re-narrow this to ``write_text``:
         # the atomic writer writes through an ``os.fdopen`` handle and never
         # calls it, so such a patch would stop exercising anything.
         import pathlib
@@ -2279,6 +2300,7 @@ class TestReadPlanNewThenOldCompat:
         (legacy_root / 'plan.json').write_text(json.dumps(legacy_plan))
 
         ta = TaskArtifacts(worktree, meta_root)
+        ta.init('task-1', 'Test Task', 'Desc')
         ta.write_plan({'steps': [{'id': 'new-step', 'status': 'pending', 'commit': None}]})
 
         read = ta.read_plan()
@@ -2796,6 +2818,8 @@ class TestDualRootRouting(_DualRootLayout):
         arts.write_verdict('judge', _VERDICT)
         with arts.plan_mutex():
             pass
+        arts.set_review_counters(review_cycles_total=1)
+        arts.write_plan(copy.deepcopy(_PLAN))
         assert not task.exists()
 
         arts.write_blocking_dependency('7', 'r', 'sha')
@@ -3420,9 +3444,10 @@ class TestWriteJsonFollowsSymlinks:
     ):
         """The dangling check must be gated on `is_symlink()`.
 
-        For an ordinary path a missing parent is NOT an error — `mkdir=True`
-        creates it, which is how `reviews/` and `verdicts/` come into being.
-        An unconditional parent check would break artifact creation outright.
+        For an ordinary path a missing parent is NOT an error — `_write_json`
+        creates the artifact's own directory with `Path.mkdir`, which is how
+        `reviews/` and `verdicts/` come into being under a live root.  An
+        unconditional parent check would break artifact creation outright.
         """
         import shutil
         shutil.rmtree(artifacts.artifact_path('verdicts'))
@@ -3439,12 +3464,10 @@ class TestWriteJsonFollowsSymlinks:
 # task 3957 amendment — the DELEGATION contract of ``_write_json``.
 #
 # Everything else in this group asserts an observable property (torn reads,
-# mode, symlink write-through).  The two kwargs below have no observable
-# property to assert against on a live filesystem: dropping ``fsync=True``
-# leaves the whole orchestrator suite green while silently retiring the
-# durability half of the docstring's contract, and dropping ``mkdir=True``
-# only shows up as a FileNotFoundError on the first write into a directory
-# nothing has created yet.  So they are pinned directly.
+# mode, symlink write-through).  The kwarg below has no observable property
+# to assert against on a live filesystem: dropping ``fsync=True`` leaves the
+# whole orchestrator suite green while silently retiring the durability half
+# of the docstring's contract.  So it is pinned directly.
 # ---------------------------------------------------------------------------
 
 
@@ -3478,7 +3501,7 @@ class TestWriteJsonDelegatesToSharedSafeIo:
         monkeypatch.setattr(safe_io, 'atomic_write_text', spy)
         return calls
 
-    def test_the_plan_write_is_fsynced_and_creates_its_parent(
+    def test_the_plan_write_is_fsynced(
         self, artifacts: TaskArtifacts, monkeypatch
     ):
         calls = self._spy(monkeypatch)
@@ -3496,20 +3519,13 @@ class TestWriteJsonDelegatesToSharedSafeIo:
             'safe_io defaults it to False — so dropping or flipping the '
             f'kwarg silently retires the guarantee.  Saw: {call["kwargs"]}'
         )
-        assert call['kwargs'].get('mkdir') is True, (
-            f'mkdir=True creates the artifact\'s parent.  Saw: {call["kwargs"]}'
-        )
         # The write really happened — the spy is not standing in for it.
         assert json.loads(artifacts.artifact_path('plan.json').read_text())['title'] == 'p'
 
     def test_a_nested_artifact_delegates_on_the_same_terms(
         self, artifacts: TaskArtifacts, monkeypatch
     ):
-        """The contract belongs to the seam, not to ``write_plan``.
-
-        ``verdicts/<role>.json`` also exercises ``mkdir=True`` for real: the
-        parent directory is what ``mkdir`` has to conjure.
-        """
+        """The contract belongs to the seam, not to ``write_plan``."""
         import shutil
         shutil.rmtree(artifacts.artifact_path('verdicts'))
         calls = self._spy(monkeypatch)
@@ -3520,6 +3536,5 @@ class TestWriteJsonDelegatesToSharedSafeIo:
         })
 
         assert [c['kwargs'].get('fsync') for c in calls] == [True]
-        assert [c['kwargs'].get('mkdir') for c in calls] == [True]
         assert calls[0]['path'] == artifacts.artifact_path('verdicts') / 'judge.json'
         assert artifacts.read_verdict('judge') is not None
