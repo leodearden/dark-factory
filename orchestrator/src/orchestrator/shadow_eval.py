@@ -1188,16 +1188,17 @@ class ShadowCoordinator:
     # -- storm escape -------------------------------------------------------
 
     def storm_state(self) -> StormState:
-        """The pause this coordinator last observed or wrote; advisory, never the open gate."""
+        """The latest pause this coordinator observed or wrote; advisory, never the open gate."""
         return self._storm
 
     async def resume(self) -> bool:
         """Lift the pause, restarting every storm window now; False when none stood."""
-        resumed = await asyncio.to_thread(
-            self._deps.store.resume_shadow_storm, self.project_id, self._deps.clock(),
-        )
-        self._storm = _UNPAUSED
-        self._cost_unreadable_streak = 0
+        async with self._storm_lock:
+            resumed = await asyncio.to_thread(
+                self._deps.store.resume_shadow_storm, self.project_id, self._deps.clock(),
+            )
+            self._storm = _UNPAUSED
+            self._cost_unreadable_streak = 0
         return resumed
 
     async def _evaluate_storm(self) -> None:
