@@ -9017,20 +9017,12 @@ class TestBuildParser:
 class TestMain:
     """`main(argv)` driven directly — no subprocess."""
 
-    def test_a_successful_run_writes_both_artifacts_and_returns_zero(
-        self, monkeypatch, tmp_path,
-    ):
+    def test_a_successful_run_writes_both_artifacts_and_returns_zero(self, main_legs):
         mod = _mod()
-        _install_driver_doubles(monkeypatch)
-        json_out, md_out = tmp_path / 'report.json', tmp_path / 'report.md'
+        leg = main_legs[()]
 
-        code = mod.main([
-            '--clusters', '2', '--distractors', '12', '--project-suffix', 'utest',
-            '--json-out', str(json_out), '--md-out', str(md_out),
-        ])
-
-        assert code == 0
-        assert list(json.loads(json_out.read_text())['arms']) == list(mod.ARM_VARIANTS)
+        assert leg.code == 0
+        assert list(json.loads(leg.report_json)['arms']) == list(mod.ARM_VARIANTS)
 
     def test_a_missing_fixture_exits_2_before_a_single_collection_exists(
         self, monkeypatch, tmp_path,
@@ -9101,31 +9093,15 @@ class TestMain:
         ('argv', 'expected'), [([], True), (['--no-regrowth'], False)],
     )
     def test_the_switch_reaches_run_bake_off_rather_than_stopping_at_the_parser(
-        self, monkeypatch, tmp_path, argv, expected,
+        self, main_legs, argv, expected,
     ):
         """A flag the driver never receives is a flag that silently does
         nothing — and the artifact would then say `regrowth_probed: true`
         for a run the operator asked to skip."""
-        mod = _mod()
-        _install_driver_doubles(monkeypatch)
-        seen: list = []
-        real = mod.run_bake_off
+        leg = main_legs[tuple(argv)]
 
-        async def _spy(**kwargs):
-            seen.append(kwargs.get('regrowth'))
-            return await real(**kwargs)
-
-        monkeypatch.setattr(mod, 'run_bake_off', _spy)
-
-        code = mod.main([
-            *argv, '--clusters', '2', '--distractors', '12',
-            '--project-suffix', 'utest',
-            '--json-out', str(tmp_path / 'r.json'),
-            '--md-out', str(tmp_path / 'r.md'),
-        ])
-
-        assert code == 0
-        assert seen == [expected]
+        assert leg.code == 0
+        assert list(leg.regrowth_seen) == [expected]
 
 
 # ===========================================================================
