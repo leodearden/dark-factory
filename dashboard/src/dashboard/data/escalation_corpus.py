@@ -292,6 +292,43 @@ def views_over(
     }
 
 
+HUMAN_LEVEL = 2
+"""The escalation level a human rules on (``escalation/src/escalation/models.py``'s L2)."""
+
+
+def pending_level2_by_task(
+    corpus_datum: Datum[EscalationCorpus], queue_id: str,
+) -> Datum[Mapping[int, tuple[str, ...]]]:
+    """Each task's pending human-level escalations in the live queue *queue_id*, sorted.
+
+    A record whose task id is not a number names no task in the store, so it is
+    left out. The datum is as partial as that queue's scan, as :func:`views_over`
+    scopes a count.
+    """
+    corpus = corpus_datum.value
+    bound = corpus_datum.freshness_bound_seconds
+    if corpus is None:
+        return unknown_datum(corpus_datum.reason or 'the escalation corpus was not read', bound)
+    try:
+        scan = corpus.scan(queue_id)
+    except KeyError:
+        return unknown_datum(f'the escalation corpus carries no queue {queue_id}', bound)
+    by_task: dict[int, list[str]] = {}
+    for record in scan.records:
+        escalation = record.escalation
+        if (
+            EscalationView.QUEUE_PENDING.admits(record)
+            and escalation.level == HUMAN_LEVEL
+            and escalation.task_id.isdigit()
+        ):
+            by_task.setdefault(int(escalation.task_id), []).append(escalation.id)
+    state, reason = _scope_provenance(corpus_datum, [scan])
+    return Datum(
+        MappingProxyType({task_id: tuple(sorted(ids)) for task_id, ids in by_task.items()}),
+        corpus_datum.as_of, state, reason, bound,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class PendingEscalations:
     """One orchestrator queue's pending live escalations, by the id of the task each names.
