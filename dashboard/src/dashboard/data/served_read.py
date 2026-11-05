@@ -35,13 +35,23 @@ class ServedRead(Generic[K, V]):
     With a *wait_seconds*, a request waits that long and is then served the
     last good value as ``stale`` (unknown before any success). The read is
     shielded, so it still lands for the next request.
+
+    A last good value is kept per *last_good_slot* of the key, the key itself
+    by default. Keys sharing a slot share one value, the latest success among
+    them, so a slot that many short-lived keys pass through holds one value
+    rather than one per key.
     """
 
     def __init__(
-        self, *, ttl_seconds: float | Callable[[], float], freshness_bound_seconds: int,
+        self,
+        *,
+        ttl_seconds: float | Callable[[], float],
+        freshness_bound_seconds: int,
+        last_good_slot: Callable[[K], Hashable] = lambda key: key,
     ) -> None:
         self._cache: TTLCache[Datum[V], K] = TTLCache(ttl_seconds)
-        self._last_good: dict[K, Datum[V]] = {}
+        self._last_good: dict[Hashable, Datum[V]] = {}
+        self._last_good_slot = last_good_slot
         self._freshness_bound_seconds = freshness_bound_seconds
         self._generation = 0
 
@@ -82,7 +92,7 @@ class ServedRead(Generic[K, V]):
             key, lambda: self._guarded(key, read), cache_ok=current,
         )
         if current(outcome):
-            self._last_good[key] = outcome
+            self._last_good[self._last_good_slot(key)] = outcome
         return outcome
 
     async def _guarded(self, key: K, read: Callable[[], Awaitable[Datum[V]]]) -> Datum[V]:
@@ -98,7 +108,7 @@ class ServedRead(Generic[K, V]):
             )
 
     def _fallback(self, key: K, reason: str) -> Datum[V]:
-        good = self._last_good.get(key)
+        good = self._last_good.get(self._last_good_slot(key))
         if good is None:
             return unknown_datum(reason, self._freshness_bound_seconds)
         return Datum(

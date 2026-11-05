@@ -174,3 +174,40 @@ async def test_keys_are_served_independently():
 
     assert other == unknown_datum('b is down', BOUND)
     assert same == fresh(1)
+
+
+def make_by_root(ttl: list[float]) -> ServedRead[tuple[str, int], int]:
+    return ServedRead(
+        ttl_seconds=lambda: ttl[0], freshness_bound_seconds=BOUND,
+        last_good_slot=lambda key: key[0],
+    )
+
+
+async def test_a_key_with_no_success_of_its_own_falls_back_to_its_slots_last_good_value():
+    served = make_by_root([60.0])
+    await served.serve(('root', 1), Reads(fresh(1)), now=T0)
+
+    datum = await served.serve(('root', 2), Reads(failed('substrate offline')), now=T0)
+
+    assert datum == Datum(1, T0, DatumState.STALE, 'substrate offline', BOUND)
+
+
+async def test_a_slot_keeps_only_its_latest_success_however_many_keys_share_it():
+    ttl = [60.0]
+    served = make_by_root(ttl)
+    for n in range(1, 6):
+        await served.serve(('root', n), Reads(fresh(n, as_of=T0 + timedelta(seconds=n))), now=T0)
+    ttl[0] = 0.0
+
+    datum = await served.serve(('root', 1), Reads(failed('substrate offline')), now=T0)
+
+    assert (datum.value, datum.state) == (5, DatumState.STALE)
+
+
+async def test_slots_are_kept_apart():
+    served = make_by_root([60.0])
+    await served.serve(('a', 1), Reads(fresh(1)), now=T0)
+
+    datum = await served.serve(('b', 1), Reads(failed('b is down')), now=T0)
+
+    assert datum == unknown_datum('b is down', BOUND)

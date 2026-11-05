@@ -67,9 +67,18 @@ class _Reading:
 
 _sidecars: dict[str, _Parsed[Sidecar]] = {}
 _titles: dict[str, _Parsed[str | None]] = {}
-_documents: ServedRead[tuple[str, frozenset[str]], Mapping[str, PrdDocument]] = ServedRead(
+_DocumentsKey = tuple[str, frozenset[str]]
+"""A documents read's root and the PRD keys it reads."""
+
+
+def _root_of(key: _DocumentsKey) -> str:
+    return key[0]
+
+
+_documents: ServedRead[_DocumentsKey, Mapping[str, PrdDocument]] = ServedRead(
     ttl_seconds=lambda: PRD_DOCUMENTS_TTL_SECONDS,
     freshness_bound_seconds=PRD_DOCUMENTS_FRESHNESS_BOUND_SECONDS,
+    last_good_slot=_root_of,
 )
 
 
@@ -84,7 +93,9 @@ async def read_prd_documents(
 
     A missing or unloadable sidecar is that PRD's own fact, carried in its
     document. A root that is not a readable directory is unknown, because it
-    cannot be told from an unmounted volume.
+    cannot be told from an unmounted volume. A read that fails or misses its
+    wait serves the root's last good documents, read for whichever keys were
+    asked for then, as ``stale``.
     """
     root = str(project_root)
     wanted = frozenset(keys)

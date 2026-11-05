@@ -462,3 +462,17 @@ def test_signal_coverage_counts_rows_whose_loaded_sidecar_names_a_leaf_over_all_
 
     assert {row.key for row in view.prds} == {KEY, OTHER}
     assert view.to_wire()['signal_coverage'] == {'named': 1, 'of': 2}
+
+
+async def test_a_new_key_set_that_fails_serves_the_roots_last_good_documents_stale(tmp_path):
+    root = tmp_path / 'project'
+    write_sidecar(root, KEY, sidecar_yaml(KEY))
+    await documents_of(root, KEY)
+    root.rename(tmp_path / 'unmounted')
+
+    datum = await read_prd_documents(str(root), (KEY, OTHER), now=NOW)
+
+    assert datum.state is DatumState.STALE
+    assert datum.value is not None
+    assert set(datum.value) == {KEY}
+    assert str(root) in (datum.reason or '')
