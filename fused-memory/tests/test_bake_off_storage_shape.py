@@ -5463,17 +5463,13 @@ class TestRegrowthPassKey:
             assert name.startswith(prefix)
 
 
-@pytest.mark.asyncio
 class TestRunBakeOffRegrowthWiring:
     """The probe's effect on the world, measured through the same doubles."""
 
-    async def test_the_default_run_seeds_both_injected_passes(self, monkeypatch):
+    def test_the_default_run_seeds_both_injected_passes(self, small_run):
         mod = _mod()
-        _install_driver_doubles(monkeypatch)
 
-        await mod.run_bake_off(**_SMALL_RUN)
-
-        seeded_projects = set(_FakeMemoryService.instances[-1].mem0._stored)
+        seeded_projects = set(small_run.service.mem0._stored)
         assert seeded_projects == {
             mod.arm_project_id(shape, suffix='utest') for shape in mod.ARM_SHAPES
         } | {
@@ -5481,17 +5477,14 @@ class TestRunBakeOffRegrowthWiring:
             for mode in mod.REGROWTH_MODES
         }
 
-    async def test_the_default_run_returns_a_complete_regrowth_block(
-        self, monkeypatch,
+    def test_the_default_run_returns_a_complete_regrowth_block(
+        self, small_run,
     ):
         """Complete, not merely present: `_check_regrowth` is the gate, and
         this asserts the DRIVER hands it something that passes."""
         mod = _mod()
-        _install_driver_doubles(monkeypatch)
 
-        report = await mod.run_bake_off(**_SMALL_RUN)
-
-        regrowth = report['regrowth']
+        regrowth = small_run.report['regrowth']
         assert regrowth is not None
         assert regrowth['shape'] == mod.REGROWTH_SHAPE
         assert list(regrowth['modes']) == list(mod.REGROWTH_MODES)
@@ -5505,49 +5498,42 @@ class TestRunBakeOffRegrowthWiring:
                     mod._regrowth_metric_keys()
                 )
 
-    async def test_the_probe_respects_the_cluster_subset(self, monkeypatch):
+    def test_the_probe_respects_the_cluster_subset(self, small_run):
         """`--clusters N` has to filter the injections too, or a smoke run
         injects re-emissions for topics whose claims it never seeded — and
         cross-validation, which runs over the SUBSET, would reject them."""
-        mod = _mod()
-        _install_driver_doubles(monkeypatch)
-
-        report = await mod.run_bake_off(**_SMALL_RUN)
+        report = small_run.report
 
         assert report['regrowth']['topics_injected'] == 2
         assert report['protocol']['regrowth_injections_measured'] == 2
 
-    async def test_the_probe_records_that_it_ran_in_the_protocol_block(
-        self, monkeypatch,
+    def test_the_probe_records_that_it_ran_in_the_protocol_block(
+        self, small_run,
     ):
         """Same reason `clusters_measured` is there: a reader holding the
         artifact must not have to infer the probe's coverage from whether a
         table looks populated."""
-        mod = _mod()
-        _install_driver_doubles(monkeypatch)
-
-        report = await mod.run_bake_off(**_SMALL_RUN)
+        report = small_run.report
 
         assert report['protocol']['regrowth_probed'] is True
         assert report['protocol']['regrowth_injections_measured'] > 0
 
-    async def test_the_injected_collections_are_dropped_before_and_after(
-        self, monkeypatch,
+    def test_the_injected_collections_are_dropped_before_and_after(
+        self, small_run,
     ):
         """THE LEAK.  A probe that seeds into a collection the `finally` does
         not name leaves it live on every run, and the report looks perfect."""
         mod = _mod()
-        drops = _install_driver_doubles(monkeypatch)
+        drop_calls = small_run.drop_calls
         expected = set(
             mod.ephemeral_collections(suffix='utest').values()
         ) | _regrowth_collection_names(mod, suffix='utest')
 
-        await mod.run_bake_off(**_SMALL_RUN)
+        assert len(drop_calls) == 2
+        assert set(drop_calls[0]) == expected
+        assert set(drop_calls[-1]) == expected
 
-        assert len(drops.calls) == 2
-        assert set(drops.calls[0]) == expected
-        assert set(drops.calls[-1]) == expected
-
+    @pytest.mark.asyncio
     async def test_the_injected_collections_are_dropped_when_a_query_raises(
         self, monkeypatch,
     ):
@@ -5562,31 +5548,26 @@ class TestRunBakeOffRegrowthWiring:
 
         assert set(drops.calls[-1]) == expected
 
-    async def test_disabling_the_probe_creates_no_collection_and_reads_no_fixture(
-        self, monkeypatch,
+    def test_disabling_the_probe_creates_no_collection_and_reads_no_fixture(
+        self, six_arm_run,
     ):
         """`regrowth=False` is a real skip, not a measured-then-discarded
         pass: it must cost no seeding, name no extra collection, and open no
         injection fixture."""
         mod = _mod()
-        drops = _install_driver_doubles(monkeypatch)
-        opened: list = []
-        real_loader = mod.load_regrowth_injections
-        monkeypatch.setattr(mod, 'load_regrowth_injections', lambda *a, **k: (
-            opened.append(a), real_loader(*a, **k))[1])
         passes = _regrowth_collection_names(mod, suffix='utest')
+        report = six_arm_run.report
 
-        report = await mod.run_bake_off(regrowth=False, **_SMALL_RUN)
-
-        assert opened == []
-        assert drops.dropped.isdisjoint(passes)
-        assert set(_FakeMemoryService.instances[-1].mem0._stored) == {
+        assert six_arm_run.injection_loads == ()
+        assert six_arm_run.dropped.isdisjoint(passes)
+        assert set(six_arm_run.service.mem0._stored) == {
             mod.arm_project_id(shape, suffix='utest') for shape in mod.ARM_SHAPES
         }
         assert report['regrowth'] is None
         assert report['protocol']['regrowth_probed'] is False
         assert report['protocol']['regrowth_injections_measured'] == 0
 
+    @pytest.mark.asyncio
     async def test_a_subset_that_retains_no_injection_is_not_published_as_probed(
         self, monkeypatch,
     ):
@@ -5626,16 +5607,13 @@ class TestRunBakeOffRegrowthWiring:
             mod.arm_project_id(shape, suffix='utest') for shape in mod.ARM_SHAPES
         }
 
-    async def test_a_probe_less_run_claims_no_provenance_for_the_injection_fixture(
-        self, monkeypatch,
+    def test_a_probe_less_run_claims_no_provenance_for_the_injection_fixture(
+        self, small_run, six_arm_run,
     ):
         """Provenance for a file the run never opened is a false audit trail."""
         mod = _mod()
-        _install_driver_doubles(monkeypatch)
         relative = mod._repo_relative(mod.DEFAULT_REGROWTH_INJECTION_PATH)
-
-        skipped = await mod.run_bake_off(regrowth=False, **_SMALL_RUN)
-        probed = await mod.run_bake_off(**_SMALL_RUN)
+        skipped, probed = six_arm_run.report, small_run.report
 
         assert relative not in [
             row['path'] for row in skipped['protocol']['fixtures']
@@ -5644,16 +5622,10 @@ class TestRunBakeOffRegrowthWiring:
             row['path'] for row in probed['protocol']['fixtures']
         ]
 
-    async def test_the_probe_does_not_disturb_the_six_arm_rows(self, monkeypatch):
+    def test_the_probe_does_not_disturb_the_six_arm_rows(self, small_run, six_arm_run):
         """The decision table is the ratified artifact; the probe rides
         alongside it and must not move a single one of its cells."""
-        mod = _mod()
-        _install_driver_doubles(monkeypatch)
-
-        without = await mod.run_bake_off(regrowth=False, **_SMALL_RUN)
-        with_probe = await mod.run_bake_off(**_SMALL_RUN)
-
-        assert with_probe['arms'] == without['arms']
+        assert small_run.report['arms'] == six_arm_run.report['arms']
 
 
 class TestRegrowthFetchCache:
