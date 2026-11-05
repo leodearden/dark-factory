@@ -234,6 +234,7 @@ class Display:
     tmux_target: a tmux target spec (e.g. ``'session:window.pane'``), for a
         'tmux' kind.
     t3_thread_id: the T3 Code thread hosting the session, for a 't3' kind.
+    t3_environment_id: the T3 environment that thread lives in, for a 't3' kind.
     """
 
     kind: str
@@ -241,6 +242,7 @@ class Display:
     wm_window_id: str | None = None
     tmux_target: str | None = None
     t3_thread_id: str | None = None
+    t3_environment_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -249,6 +251,7 @@ class Display:
             'wm_window_id': self.wm_window_id,
             'tmux_target': self.tmux_target,
             't3_thread_id': self.t3_thread_id,
+            't3_environment_id': self.t3_environment_id,
         }
 
     @classmethod
@@ -259,6 +262,7 @@ class Display:
             wm_window_id=data.get('wm_window_id'),
             tmux_target=data.get('tmux_target'),
             t3_thread_id=data.get('t3_thread_id'),
+            t3_environment_id=data.get('t3_environment_id'),
         )
 
 

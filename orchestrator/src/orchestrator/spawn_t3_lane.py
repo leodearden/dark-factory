@@ -36,25 +36,25 @@ import contextlib
 import json
 import logging
 import os
-import shutil
-import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
 import traceback
+import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeGuard
 from urllib.parse import quote
 
 from orchestrator import session_registry, spawn_t3_provider, t3_mcp_client
 from orchestrator.session_ownership_probes import ProcessTree
 
 MESSAGE_CHAR_LIMIT = 120_000
+PAGE_LIMIT = 100
 PENDING_RUN_STATUSES = frozenset({'preparing', 'queued', 'starting'})
 ENDED_RUN_STATUSES = frozenset({'failed', 'cancelled', 'interrupted', 'rolled_back'})
 STARTUP_FAILURE_STATUSES = frozenset({'failed', 'cancelled', 'rolled_back'})
@@ -188,31 +188,114 @@ def read_server_runtime(env: Mapping[str, str]) -> Mapping[str, Any] | None:
     return runtime if isinstance(runtime, dict) else None
 
 
+# ---------------------------------------------------------------------------
+# T3 over MCP: the connection, paged listings, projects
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class NoLauncher:
+    """No MCP session with T3: server-runtime.json names no usable origin, or connecting failed."""
+
+    reason: str
+    detail: str | None = None
+
+    def verdict(self) -> str:
+        return _verdict('no-launcher', reason=self.reason, **({} if self.detail is None else {'detail': self.detail}))
+
+
+_NO_LAUNCHER_REASON: Mapping[t3_mcp_client.ConnectFailure | t3_mcp_client.DescriptorFailure, str] = {
+    **{failure: f't3-mcp-{failure.value}' for failure in t3_mcp_client.ConnectFailure},
+    **{failure: failure.value for failure in t3_mcp_client.DescriptorFailure},
+}
+
+
+def _connect(env: Mapping[str, str]) -> t3_mcp_client.T3McpClient | NoLauncher:
+    """A client on this host's credential, self-pairing through the ``t3`` CLI when it has none."""
+    origin = _runtime_origin(env)
+    if isinstance(origin, RuntimeOriginFailed):
+        return NoLauncher(origin.reason.value, origin.detail)
+    connected = t3_mcp_client.connect(origin, repair=t3_mcp_client.CliCodeSource())
+    if isinstance(connected, t3_mcp_client.ConnectFailed):
+        return NoLauncher(_NO_LAUNCHER_REASON[connected.reason], connected.detail)
+    return connected
+
+
+@dataclass(frozen=True)
+class Incomplete:
+    """A listing not read whole; ``transport`` is the failed call's, when the transport failed."""
+
+    detail: str
+    transport: t3_mcp_client.TransportFailed | None = None
+
+
+def _incomplete(tool: str, reply: t3_mcp_client.ToolFailed | t3_mcp_client.TransportFailed) -> Incomplete:
+    if isinstance(reply, t3_mcp_client.TransportFailed):
+        return Incomplete(f'{tool}: {reply.detail}', reply)
+    return Incomplete(f'{tool}: {reply.code}: {reply.message}')
+
+
+def _is_new_cursor(cursor: object, seen: Sequence[int]) -> TypeGuard[int | None]:
+    return cursor is None or (type(cursor) is int and cursor not in seen)
+
+
+def _paged(
+    client: t3_mcp_client.T3McpClient, tool: str, arguments: Mapping[str, Any], key: str
+) -> list[Mapping[str, Any]] | Incomplete:
+    """Every item of a cursor-paged listing, or Incomplete when any page fails or is malformed."""
+    items: list[Mapping[str, Any]] = []
+    cursors: list[int] = []
+    while True:
+        reply = client.call(tool, {**arguments, 'limit': PAGE_LIMIT, **({'cursor': cursors[-1]} if cursors else {})})
+        if not isinstance(reply, t3_mcp_client.ToolOk):
+            return _incomplete(tool, reply)
+        page, cursor = reply.value.get(key), reply.value.get('nextCursor')
+        if not isinstance(page, list) or not _is_new_cursor(cursor, cursors):
+            return Incomplete(f'{tool}: a malformed page')
+        items.extend(item for item in page if isinstance(item, Mapping))
+        if cursor is None:
+            return items
+        cursors.append(cursor)
+
+
+def _failed_call_verdict(failed: Incomplete) -> str:
+    transport = failed.transport
+    if transport is not None and transport.fault is t3_mcp_client.TransportFault.CREDENTIAL_EXPIRED:
+        return NoLauncher('t3-mcp-credential-expired', transport.detail).verdict()
+    return _verdict('launch-failed', detail=failed.detail)
+
+
 @dataclass(frozen=True)
 class T3Project:
     project_id: str
     workspace_root: str
+    archived: bool
+
+    @classmethod
+    def from_json(cls, item: Mapping[str, Any]) -> T3Project | None:
+        """None for a deleted project, or one without an id and a root."""
+        project_id, root = item.get('id'), item.get('workspaceRoot')
+        if item.get('deletedAt') is not None or not isinstance(project_id, str) or not isinstance(root, str):
+            return None
+        return cls(project_id, root, archived=item.get('archivedAt') is not None)
 
 
-class ProjectStoreUnreadable(Exception):
-    """The T3 state store or its ``projection_projects`` table cannot be read."""
+def _projects(client: t3_mcp_client.T3McpClient) -> list[T3Project] | Incomplete:
+    listed = _paged(client, 't3_project_list', {}, 'projects')
+    if isinstance(listed, Incomplete):
+        return listed
+    return [project for project in map(T3Project.from_json, listed) if project is not None]
 
 
-def registered_projects(env: Mapping[str, str]) -> list[T3Project]:
-    store = t3_userdata_dir(env) / 'statev2.sqlite'
-    if not store.is_file():
-        raise ProjectStoreUnreadable(f'no T3 state store at {store}')
-    try:
-        with contextlib.closing(
-            sqlite3.connect(f'{store.as_uri()}?mode=ro', uri=True, timeout=10)
-        ) as connection:
-            rows = connection.execute(
-                'SELECT project_id, workspace_root FROM projection_projects '
-                'WHERE deleted_at IS NULL'
-            ).fetchall()
-    except sqlite3.Error as exc:
-        raise ProjectStoreUnreadable(f'{store}: {exc}') from exc
-    return [T3Project(project_id=str(pid), workspace_root=str(root)) for pid, root in rows]
+def _target_project(cwd: str, projects: Sequence[T3Project]) -> T3Project | str:
+    """The live project a thread for *cwd* runs in, else the refusal verdict."""
+    live = containing_project(cwd, [project for project in projects if not project.archived])
+    if live is not None:
+        return live
+    archived = containing_project(cwd, [project for project in projects if project.archived])
+    if archived is not None:
+        return _verdict('refused', reason='project-archived', detail=os.path.realpath(archived.workspace_root))
+    return _verdict('refused', reason='cwd-outside-projects')
 
 
 def containing_project(cwd: str, projects: Sequence[T3Project]) -> T3Project | None:
@@ -320,9 +403,56 @@ def _spill_pointer(spill: Path) -> str:
     return f'Read {spill} and follow it as your brief; that file holds your whole task.'
 
 
-def _start_argv(cwd: str, title: str, model: str | None, provider: str) -> list[str]:
-    model_flags = ['--provider', provider, '--model', model] if model else []
-    return ['thread', 'start', '--json', '--title', title, *model_flags, cwd, '-']
+def _runtime_mode(skip_permissions: bool) -> str:
+    return 'full-access' if skip_permissions else 'approval-required'
+
+
+@dataclass(frozen=True)
+class WorkspaceStrategy:
+    worktree_path: str | None
+    """The existing worktree the thread is bound to; None for the project root."""
+
+    @classmethod
+    def for_cwd(cls, project: T3Project, cwd: str) -> WorkspaceStrategy:
+        at_root = os.path.realpath(cwd) == os.path.realpath(project.workspace_root)
+        return cls(None if at_root else cwd)
+
+    @property
+    def binds_worktree(self) -> bool:
+        return self.worktree_path is not None
+
+    def to_json(self) -> dict[str, str]:
+        if self.worktree_path is None:
+            return {'type': 'root'}
+        return {'type': 'existing_worktree', 'worktreePath': self.worktree_path}
+
+
+def _client_request_id(record_dir: str) -> str:
+    """The record's slug, so a resent launch replays the same thread; a fresh key without a record."""
+    return _record_key(record_dir)[0] if record_dir else str(uuid.uuid4())
+
+
+def _launch_arguments(
+    project: T3Project,
+    title: str,
+    message: str,
+    model: str | None,
+    instance_id: str,
+    *,
+    skip_permissions: bool,
+    strategy: WorkspaceStrategy,
+    request_id: str,
+) -> dict[str, Any]:
+    model_selection = {'modelSelection': {'instanceId': instance_id, 'model': model}} if model else {}
+    return {
+        'projectId': project.project_id,
+        'title': title,
+        'message': message,
+        **model_selection,
+        'runtimeMode': _runtime_mode(skip_permissions),
+        'workspaceStrategy': strategy.to_json(),
+        'clientRequestId': request_id,
+    }
 
 
 @dataclass(frozen=True)
@@ -332,50 +462,28 @@ class LaunchedThread:
     run_id: str | None
 
 
-def _start_thread(
-    cwd: str, title: str, model: str | None, provider: str, message: str
-) -> LaunchedThread:
-    launched = run_t3(_start_argv(cwd, title, model, provider), stdin=message)
-    if not isinstance(launched, dict) or not launched.get('threadId'):
-        raise T3CommandFailed('t3 thread start printed no threadId')
-    return LaunchedThread(
-        thread_id=str(launched['threadId']),
-        project_id=launched.get('projectId'),
-        run_id=launched.get('runId'),
-    )
-
-
-def _find_launched_after_failure(
-    cwd: str, title: str, launched_at: datetime, project: T3Project
-) -> LaunchedThread | None:
-    """A thread titled *title* created since *launched_at*: a launch the CLI failed to report."""
-    try:
-        threads = list_threads(cwd)
-    except T3CommandFailed as exc:
-        logger.warning(f'cannot list threads after a failed launch: {exc}')
-        return None
-    matches = [
-        summary
-        for summary in threads.values()
-        if summary.title == title and summary.created_at and summary.created_at >= launched_at
-    ]
-    if len(matches) > 1:
-        logger.warning(f'{len(matches)} threads titled {title!r} since the launch; not guessing')
-    if len(matches) != 1:
-        return None
-    [summary] = matches
-    return LaunchedThread(summary.thread_id, project.project_id, summary.latest_run_id)
+def _launch_outcome(reply: t3_mcp_client.CallResult) -> LaunchedThread | str:
+    """The launched thread, else the verdict line."""
+    if not isinstance(reply, t3_mcp_client.ToolOk):
+        return _failed_call_verdict(_incomplete('t3_thread_launch', reply))
+    thread_id = reply.value.get('threadId')
+    if not isinstance(thread_id, str) or not thread_id:
+        return _verdict('launch-failed', detail='t3_thread_launch answered no threadId')
+    return LaunchedThread(thread_id, reply.value.get('projectId'), reply.value.get('runId'))
 
 
 def _stamp_launched_record(
-    record_dir: str, title: str, thread_id: str, parent: str | None
+    record_dir: str, title: str, launched: LaunchedThread, environment_id: str, parent: str | None
 ) -> None:
     """One read-modify-write: the t3 display, status running, and the parent when given."""
     slug, root = _record_key(record_dir)
     try:
         record = session_registry.read_record(slug, root=root)
         record.display = session_registry.Display(
-            kind=session_registry.DisplayKind.T3.value, wm_title=title, t3_thread_id=thread_id
+            kind=session_registry.DisplayKind.T3.value,
+            wm_title=title,
+            t3_thread_id=launched.thread_id,
+            t3_environment_id=environment_id,
         )
         if parent is not None:
             record.parent_session_id = parent
@@ -398,12 +506,17 @@ def provider_instance(
     cwd: str, explicit: str | None, env: Mapping[str, str]
 ) -> spawn_t3_provider.ProviderChoice:
     """The instance a thread for *cwd* runs on; see ``spawn_t3_provider`` for the order."""
-    try:
-        project = containing_project(cwd, registered_projects(env))
-    except ProjectStoreUnreadable as exc:
-        logger.warning(f'provider enablement is checked environment-wide: {exc}')
-        project = None
-    return _provider_for(project, explicit, env)
+    return _provider_for(_live_project_softly(cwd, env), explicit, env)
+
+
+def _live_project_softly(cwd: str, env: Mapping[str, str]) -> T3Project | None:
+    client = _connect(env)
+    projects = client if isinstance(client, NoLauncher) else _projects(client)
+    project = projects if isinstance(projects, NoLauncher | Incomplete) else _target_project(cwd, projects)
+    if not isinstance(project, T3Project):
+        logger.warning(f'provider enablement is checked environment-wide: {project}')
+        return None
+    return project
 
 
 def _provider_for(
@@ -430,37 +543,38 @@ def launch(
     *,
     provider: str | None = None,
     parent: str | None = None,
+    skip_permissions: bool,
 ) -> str:
-    if shutil.which('t3') is None:
-        return _verdict('no-launcher', reason='t3-missing')
-    if read_server_runtime(env) is None:
-        return _verdict('no-launcher', reason='server-runtime-missing')
-    try:
-        project = containing_project(cwd, registered_projects(env))
-    except ProjectStoreUnreadable as exc:
-        logger.warning(f'cannot verify that {cwd} is a T3 project root: {exc}')
-        return _verdict('refused', reason='cwd-not-project-root', detail='unverifiable')
-    if project is None or os.path.realpath(project.workspace_root) != os.path.realpath(cwd):
-        detail = os.path.realpath(project.workspace_root) if project else None
-        return _verdict('refused', reason='cwd-not-project-root', detail=detail)
-
+    client = _connect(env)
+    if isinstance(client, NoLauncher):
+        return client.verdict()
+    projects = _projects(client)
+    if isinstance(projects, Incomplete):
+        return _failed_call_verdict(projects)
+    project = _target_project(cwd, projects)
+    if isinstance(project, str):
+        return project
     choice = _provider_for(project, provider, env)
     if model and choice.enabled is False:
         return _provider_verdict(choice)
 
-    _sweep_project_listing(cwd)
+    _sweep_listed_threads(client, project.project_id, cwd)
     message = _message_for(Path(prompt_file).read_text(encoding='utf-8'), record_dir)
-    launched_at = datetime.now(UTC)
-    try:
-        launched = _start_thread(cwd, title, model, choice.instance_id, message)
-    except T3CommandFailed as exc:
-        logger.warning(str(exc))
-        recovered = _find_launched_after_failure(cwd, title, launched_at, project)
-        if recovered is None:
-            return _verdict('launch-failed')
-        launched = recovered
+    arguments = _launch_arguments(
+        project,
+        title,
+        message,
+        model,
+        choice.instance_id,
+        skip_permissions=skip_permissions,
+        strategy=WorkspaceStrategy.for_cwd(project, cwd),
+        request_id=_client_request_id(record_dir),
+    )
+    launched = _launch_outcome(client.call('t3_thread_launch', arguments))
+    if isinstance(launched, str):
+        return launched
     if record_dir:
-        _stamp_launched_record(record_dir, title, launched.thread_id, _usable_parent(parent))
+        _stamp_launched_record(record_dir, title, launched, client.environment_id, _usable_parent(parent))
     return _verdict(
         'started',
         thread_id=launched.thread_id,
@@ -824,14 +938,15 @@ def wait(
         time.sleep(_wait_poll_secs(env))
 
 
-def _sweep_project_listing(cwd: str) -> None:
+def _sweep_listed_threads(client: t3_mcp_client.T3McpClient, project_id: str, cwd: str) -> None:
+    """Sweep *cwd*'s t3 records against the project's active threads, only from a complete listing."""
     listed_at = datetime.now(UTC)
-    try:
-        threads = list_threads(cwd)
-    except T3CommandFailed as exc:
-        logger.warning(f't3 session sweep skipped, no thread listing: {exc}')
+    threads = _paged(client, 't3_thread_list', {'projectId': project_id}, 'threads')
+    thread_ids = None if isinstance(threads, Incomplete) else [thread.get('threadId') for thread in threads]
+    if thread_ids is None or not all(isinstance(thread_id, str) for thread_id in thread_ids):
+        logger.warning(f't3 session sweep skipped: no complete thread listing of project {project_id}')
         return
-    _sweep_project(cwd, dict.fromkeys(threads, False), listed_at)
+    _sweep_project(cwd, dict.fromkeys(map(str, thread_ids), False), listed_at)
 
 
 def _sweep_project(cwd: str, known: Mapping[str, bool], listed_at: datetime) -> None:
@@ -982,6 +1097,7 @@ def _build_parser() -> argparse.ArgumentParser:
     launch_p.add_argument('--model', default=None)
     launch_p.add_argument('--provider', default=None, help='explicit provider instance id')
     launch_p.add_argument('--parent', default=None, help="the spawner's record slug")
+    launch_p.add_argument('--skip-permissions', action='store_true', help='full-access; approval-required without it')
 
     started_p = verbs.add_parser('await-started', help='wait for the thread to start, then bind')
     started_p.add_argument('--thread-id', required=True)
@@ -1023,6 +1139,7 @@ def _dispatch(args: argparse.Namespace) -> str:
             os.environ,
             provider=args.provider,
             parent=args.parent,
+            skip_permissions=args.skip_permissions,
         )
     if args.verb == 'provider':
         return _provider_verdict(provider_instance(args.cwd, args.provider, os.environ))
