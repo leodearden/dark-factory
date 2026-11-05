@@ -4633,6 +4633,32 @@ _SMALL_RUN = {'cluster_limit': 2, 'distractor_limit': 12, 'project_suffix': 'ute
 _SIX_ARM_RUN = {**_SMALL_RUN, 'regrowth': False}
 
 
+class TestTheRecordedDriverRun:
+    """The recorded runs the wiring tests read are safe to share."""
+
+    def test_it_held_its_lease_in_a_private_directory_never_the_machine_global_one(
+        self, small_run, six_arm_run, tmp_path_factory,
+    ):
+        """Module fixtures are set up BEFORE the autouse, function-scoped
+        `lease_dir` fixture, so a recording that did not isolate its own lease
+        would hold it in the directory the live 6-hourly cron reads."""
+        reaper = _mod().load_cleanup_script()
+        basetemp = tmp_path_factory.getbasetemp()
+
+        for run in (small_run, six_arm_run):
+            assert run.lease_dir != reaper.DEFAULT_LEASE_DIR
+            assert run.lease_dir.is_relative_to(basetemp), run.lease_dir
+
+    def test_a_handed_out_run_is_a_private_copy(self, small_run, _small_run_record):
+        """Every wiring test reads the same run, so a test that mutated what
+        it was handed would change what the next one reads."""
+        small_run.report['arms'].clear()
+        small_run.service.mem0.searches.clear()
+
+        assert _small_run_record.report['arms']
+        assert _small_run_record.service.mem0.searches
+
+
 class TestEphemeralCollectionIdentity:
     """A collection nobody can reap is a leak, so its NAME is a contract."""
 
@@ -4757,12 +4783,11 @@ class TestGuardProbeSelfDrop:
         ), 'no arm splits a probing write across several records'
 
 
-@pytest.mark.asyncio
 class TestRunBakeOffWiring:
     """What the driver does to the world, measured through doubles."""
 
 
-    async def test_it_holds_a_live_lease_at_the_moment_it_seeds(self, monkeypatch):
+    def test_it_holds_a_live_lease_at_the_moment_it_seeds(self, small_run):
         """The bake-off seeds under a prefix the 6-hourly cron deletes, so a
         sweep landing between its seed and measure phases empties the corpus
         out from under it.
@@ -4774,24 +4799,7 @@ class TestRunBakeOffWiring:
         before the seeding began, which is the failure this has to exclude.
         """
         mod = _mod()
-        drops = _install_driver_doubles(monkeypatch)
-        reaper = mod.load_cleanup_script()
-        at_drop: list[list[dict]] = []
-        at_seed: list[list[dict]] = []
-        seed_arm = mod.seed_arm
-
-        def _drop_and_look(*args, **kwargs):
-            at_drop.append(reaper.live_leases())
-            return drops(*args, **kwargs)
-
-        async def _seed_and_look(*args, **kwargs):
-            at_seed.append(reaper.live_leases())
-            return await seed_arm(*args, **kwargs)
-
-        monkeypatch.setattr(mod, 'drop_collections', _drop_and_look)
-        monkeypatch.setattr(mod, 'seed_arm', _seed_and_look)
-
-        await mod.run_bake_off(**_SMALL_RUN)
+        at_drop, at_seed = small_run.leases_at_drop, small_run.leases_at_seed
 
         assert at_drop and at_seed, 'the observation seams never fired'
         for live in (at_drop[0], at_seed[0]):
@@ -4800,17 +4808,12 @@ class TestRunBakeOffWiring:
             assert mod.__name__ in owner, owner
             assert mod.worker_suffix() in owner, owner
 
-    async def test_the_lease_is_released_once_the_run_returns(self, monkeypatch):
+    def test_the_lease_is_released_once_the_run_returns(self, small_run):
         """Held for the run, not for the process.  A lease that outlived the
         run would wedge the cron until the pytest session ended."""
-        mod = _mod()
-        _install_driver_doubles(monkeypatch)
-        reaper = mod.load_cleanup_script()
+        assert small_run.leases_after == []
 
-        await mod.run_bake_off(**_SMALL_RUN)
-
-        assert reaper.live_leases() == []
-
+    @pytest.mark.asyncio
     async def test_the_lease_is_released_when_the_run_raises(self, monkeypatch):
         """A failed bake-off must not hold the cron off — the case a TTL
         would exist to bound, and the reason none is needed."""
@@ -4828,8 +4831,8 @@ class TestRunBakeOffWiring:
 
         assert reaper.live_leases() == []
 
-    async def test_the_reaper_is_resolved_before_any_resource_is_acquired(
-        self, monkeypatch,
+    def test_the_reaper_is_resolved_before_any_resource_is_acquired(
+        self, small_run,
     ):
         """Nothing that can raise may sit between an acquisition and the
         `try` whose `finally` releases it.
@@ -4849,72 +4852,42 @@ class TestRunBakeOffWiring:
         resolves the reaper three times before `mkdtemp` either way, so an
         index comparison would pass on the unfixed driver.
         """
-        import tempfile  # noqa: PLC0415
-
-        mod = _mod()
-        _install_driver_doubles(monkeypatch)
-        order: list[str] = []
-        resolve = mod.load_cleanup_script
-        mkdtemp = tempfile.mkdtemp
-
-        def _record_resolve():
-            order.append('reaper')
-            return resolve()
-
-        def _record_mkdtemp(*args, **kwargs):
-            order.append('queue_dir')
-            return mkdtemp(*args, **kwargs)
-
-        monkeypatch.setattr(mod, 'load_cleanup_script', _record_resolve)
-        monkeypatch.setattr(tempfile, 'mkdtemp', _record_mkdtemp)
-
-        await mod.run_bake_off(**_SMALL_RUN)
+        order = list(small_run.acquisitions)
 
         assert 'queue_dir' in order, order
         assert 'reaper' in order, order
         assert 'reaper' not in order[order.index('queue_dir'):], order
 
-    async def test_it_seeds_exactly_three_collections_for_six_arms(self, monkeypatch):
+    def test_it_seeds_exactly_three_collections_for_six_arms(self, six_arm_run):
         mod = _mod()
-        _install_driver_doubles(monkeypatch)
 
-        report = await mod.run_bake_off(**_SIX_ARM_RUN)
-
-        service = _FakeMemoryService.instances[-1]
-        assert len(_FakeMemoryService.instances) == 1
+        service = six_arm_run.service
+        assert len(six_arm_run.services) == 1
         assert sorted(service.mem0._stored) == sorted(
             mod.arm_project_id(shape, suffix='utest') for shape in mod.ARM_SHAPES
         )
-        assert list(report['arms']) == list(mod.ARM_VARIANTS)
+        assert list(six_arm_run.report['arms']) == list(mod.ARM_VARIANTS)
 
-    async def test_the_ephemeral_prefix_is_set_on_the_config_not_just_the_project_id(
-        self, monkeypatch,
+    def test_the_ephemeral_prefix_is_set_on_the_config_not_just_the_project_id(
+        self, small_run,
     ):
         """Collections are f'{collection_prefix}_{project_id}'.  A driver that
         scoped only the project_id would write under the default 'fused'
         prefix, which the reaper does not match — a permanent leak."""
         mod = _mod()
-        _install_driver_doubles(monkeypatch)
 
-        await mod.run_bake_off(**_SMALL_RUN)
-
-        config = _FakeMemoryService.instances[-1].config
+        config = small_run.service.config
         assert config.mem0.collection_prefix == mod.ephemeral_collection_prefix()
 
-    async def test_it_clears_the_api_key_so_a_real_embedder_is_used(self, monkeypatch):
+    def test_it_clears_the_api_key_so_a_real_embedder_is_used(self, small_run):
         """A stub constant vector would make every ranking in the report
         meaningless; nulling the config key makes mem0 fall back to the real
         OPENAI_API_KEY (the probe_config recipe)."""
-        mod = _mod()
-        _install_driver_doubles(monkeypatch)
-
-        await mod.run_bake_off(**_SMALL_RUN)
-
-        config = _FakeMemoryService.instances[-1].config
+        config = small_run.service.config
         assert config.embedder.providers.openai.api_key is None
 
-    async def test_it_never_attaches_to_the_shared_durable_write_queue(
-        self, monkeypatch,
+    def test_it_never_attaches_to_the_shared_durable_write_queue(
+        self, small_run, six_arm_run,
     ):
         """The data-loss guard at bake_off_storage_shape.py:2947-2967.
 
@@ -4934,22 +4907,16 @@ class TestRunBakeOffWiring:
         """
         import tempfile  # noqa: PLC0415
 
-        mod = _mod()
-        _install_driver_doubles(monkeypatch)
         shared = _driver_config().queue.data_dir
-
-        await mod.run_bake_off(**_SMALL_RUN)
-        await mod.run_bake_off(**_SMALL_RUN)
+        runs = (small_run, six_arm_run)
 
         # Read at `initialize()`, not after the run: the repoint has to have
         # happened BEFORE the queue is built to be worth anything, and the
         # config is held by reference so an after-the-fact read cannot tell
         # the two apart.
-        attached = [
-            service.queue_data_dir_at_initialize
-            for service in _FakeMemoryService.instances
-        ]
-        assert len(attached) == 2 and all(a is not None for a in attached)
+        attached = [run.service.queue_data_dir_at_initialize for run in runs]
+        assert [len(run.services) for run in runs] == [1, 1]
+        assert all(a is not None for a in attached)
 
         for a in attached:
             assert a != shared, (
@@ -4974,6 +4941,7 @@ class TestRunBakeOffWiring:
         # either — which a fixed path outside the checkout would still allow.
         assert attached[0] != attached[1]
 
+    @pytest.mark.asyncio
     async def test_a_failed_initialize_still_tears_the_run_down(self, monkeypatch):
         """The queue temp dir and the service were acquired OUTSIDE the
         `try:`/`finally:` that cleans them up, so the one failure mode the
@@ -5026,31 +4994,24 @@ class TestRunBakeOffWiring:
         # the next run to measure.
         assert drops.calls, 'nothing was dropped on the failure path'
 
-    async def test_it_copies_the_config_rather_than_mutating_the_callers(
-        self, monkeypatch,
+    def test_it_copies_the_config_rather_than_mutating_the_callers(
+        self, small_run,
     ):
-        mod = _mod()
-        _install_driver_doubles(monkeypatch)
-        caller_config = _driver_config()
-
-        await mod.run_bake_off(config=caller_config, **_SMALL_RUN)
+        caller_config = small_run.caller_config
 
         assert caller_config.mem0.collection_prefix == 'fused'
         assert caller_config.embedder.providers.openai.api_key == 'sk-fake-must-be-cleared'
         assert caller_config.mem0.persist_history is True
 
-    async def test_every_seeded_arm_keeps_mem0_history_off_the_shared_db(
-        self, monkeypatch,
+    def test_every_seeded_arm_keeps_mem0_history_off_the_shared_db(
+        self, small_run,
     ):
         """mem0's shared SQLite history DB is process-shared and contended (and
         read-only in the sandbox).  It is not the question under test, and its
         failure would mask the one that is."""
         mod = _mod()
-        _install_driver_doubles(monkeypatch)
 
-        await mod.run_bake_off(**_SMALL_RUN)
-
-        snapshots = _FakeMemoryService.instances[-1].mem0.persist_history_at_add
+        snapshots = small_run.service.mem0.persist_history_at_add
         # Every seeded project, the two INJECTED passes included: they go
         # through the same `seed_arm`, so a persisting instance there is the
         # same contended write, in a collection nobody was watching.
@@ -5058,18 +5019,15 @@ class TestRunBakeOffWiring:
         assert len(seeded_projects) == len(mod.ARM_SHAPES) + len(mod.REGROWTH_MODES)
         assert all(persist is False for _, persist in snapshots), snapshots
 
-    async def test_the_distractor_slab_is_seeded_into_every_arm(self, monkeypatch):
+    def test_the_distractor_slab_is_seeded_into_every_arm(self, small_run):
         """The contamination floor is a controlled variable: an arm that got a
         smaller slab would be ranking against a thinner field and would win for
         a reason the decision table does not name."""
         mod = _mod()
-        _install_driver_doubles(monkeypatch)
         slab = mod.load_distractor_slab()[:_SMALL_RUN['distractor_limit']]
         slab_contents = {d.content for d in slab}
 
-        await mod.run_bake_off(**_SMALL_RUN)
-
-        added = _FakeMemoryService.instances[-1].mem0.added
+        added = small_run.service.mem0.added
         by_project: dict[str, set[str]] = {}
         for project_id, content in added:
             by_project.setdefault(project_id, set()).add(content)
@@ -5083,26 +5041,23 @@ class TestRunBakeOffWiring:
         for contents in by_project.values():
             assert slab_contents <= contents
 
-    async def test_seeding_is_bounded_rather_than_one_unbounded_gather(
-        self, monkeypatch,
+    def test_seeding_is_bounded_rather_than_one_unbounded_gather(
+        self, small_run,
     ):
         """A gather over the whole slab opens hundreds of concurrent embedding
         requests at once — rate-limited into retries at best, and a run whose
         wall clock is set by the throttler rather than the experiment."""
         mod = _mod()
-        _install_driver_doubles(monkeypatch)
 
-        await mod.run_bake_off(**_SMALL_RUN)
-
-        mem0 = _FakeMemoryService.instances[-1].mem0
+        mem0 = small_run.service.mem0
         smallest_arm = min(
             len(bucket) for bucket in mem0._stored.values()
         )
         assert smallest_arm > mod.SEED_CONCURRENCY  # the bound has to actually bite
         assert mem0.max_inflight <= mod.SEED_CONCURRENCY
 
-    async def test_fetching_stays_serial_because_concurrent_reads_aborted_the_live_run(
-        self, monkeypatch,
+    def test_fetching_stays_serial_because_concurrent_reads_aborted_the_live_run(
+        self, small_run,
     ):
         """The read side stays serial until someone re-measures it.
 
@@ -5122,15 +5077,13 @@ class TestRunBakeOffWiring:
         confront this test rather than route around it.
         """
         mod = _mod()
-        _install_driver_doubles(monkeypatch)
 
-        await mod.run_bake_off(**_SMALL_RUN)
-
-        mem0 = _FakeMemoryService.instances[-1].mem0
+        mem0 = small_run.service.mem0
         per_arm = len(mem0.searches) / len(mod.ARM_SHAPES)
         assert per_arm > 1  # there is something to overlap, so this can fail
         assert mem0.max_search_inflight == 1
 
+    @pytest.mark.asyncio
     async def test_a_failed_seed_leaves_no_write_in_flight_past_teardown(
         self, monkeypatch,
     ):
@@ -5169,18 +5122,15 @@ class TestRunBakeOffWiring:
         # Teardown really did run underneath the raise.
         assert len(drops.calls) == 2
 
-    async def test_the_pin_variants_reuse_their_shapes_hits_instead_of_requerying(
-        self, monkeypatch,
+    def test_the_pin_variants_reuse_their_shapes_hits_instead_of_requerying(
+        self, small_run,
     ):
         """Pin-on and pin-off must run over the SAME ranked list, or the
         comparison is two ANN draws rather than a controlled A/B — and the run
         pays for six arms' worth of embeddings to answer a four-arm question."""
         mod = _mod()
-        _install_driver_doubles(monkeypatch)
 
-        await mod.run_bake_off(**_SMALL_RUN)
-
-        searches = _FakeMemoryService.instances[-1].mem0.searches
+        searches = small_run.service.mem0.searches
         issued = [(project_id, query) for project_id, query, _ in searches]
         assert len(issued) == len(set(issued))          # no query issued twice
         # One project per seeded corpus, the two injected passes included:
@@ -5191,8 +5141,8 @@ class TestRunBakeOffWiring:
             len(mod.ARM_SHAPES) + len(mod.REGROWTH_MODES)
         )
 
-    async def test_the_guard_probe_over_fetches_to_cover_its_own_removal(
-        self, monkeypatch,
+    def test_the_guard_probe_over_fetches_to_cover_its_own_removal(
+        self, small_run,
     ):
         """The probing write's own record has to leave its own guard window:
         in the real timeline that write had not landed when the guard ran, and
@@ -5206,11 +5156,8 @@ class TestRunBakeOffWiring:
         still happens at GUARD_TOP_K, which `guard_adequacy` enforces on its
         own (server/tools.py:1556 runs production's pre-check at limit=5)."""
         mod = _mod()
-        _install_driver_doubles(monkeypatch)
 
-        await mod.run_bake_off(**_SMALL_RUN)
-
-        limits = {limit for _, _, limit in _FakeMemoryService.instances[-1].mem0.searches}
+        limits = {limit for _, _, limit in small_run.service.mem0.searches}
         assert mod.GUARD_FETCH_LIMIT == mod.GUARD_TOP_K + 1     # the FLOOR
         assert mod.guard_fetch_limit(set()) == mod.GUARD_TOP_K
         assert mod.guard_fetch_limit({'a', 'b', 'c'}) == mod.GUARD_TOP_K + 3
@@ -5221,13 +5168,12 @@ class TestRunBakeOffWiring:
         assert min(probe_limits) >= mod.GUARD_FETCH_LIMIT
         assert max(probe_limits) > mod.GUARD_FETCH_LIMIT
 
-    async def test_the_probing_write_is_never_its_own_guard_match(
-        self, monkeypatch,
+    def test_the_probing_write_is_never_its_own_guard_match(
+        self, small_run,
     ):
         """The over-fetched slot is worthless unless the self-hit is actually
         dropped, so assert the drop and not merely the fetch depth."""
         mod = _mod()
-        _install_driver_doubles(monkeypatch)
         clusters = mod.load_calibration_clusters()
         probe_by_cluster = {}
         for cluster_id in sorted(clusters)[:_SMALL_RUN['cluster_limit']]:
@@ -5236,19 +5182,7 @@ class TestRunBakeOffWiring:
                 probe_by_cluster[cluster_id] = probe['memory_id']
         assert probe_by_cluster  # the subset really does contain a probeable cluster
 
-        captured: list[dict[str, list[str]]] = []
-        real_fetch = mod.fetch_arm
-
-        async def _capture(backend, seeded, queries, probes, **kwargs):
-            fetched = await real_fetch(backend, seeded, queries, probes, **kwargs)
-            captured.append({
-                cluster_id: [hit.record.record_id for hit in hits]
-                for cluster_id, hits in fetched['probes'].items()
-            })
-            return fetched
-
-        monkeypatch.setattr(mod, 'fetch_arm', _capture)
-        await mod.run_bake_off(**_SMALL_RUN)
+        captured = small_run.probe_hits
 
         # Per seeded corpus, injected passes included: those carry the same
         # `status_quo`-free flat peers, but the drop is provenance-based and
@@ -5261,21 +5195,20 @@ class TestRunBakeOffWiring:
             for cluster_id, probe_id in probe_by_cluster.items():
                 assert probe_id not in arm[cluster_id]
 
-    async def test_every_collection_is_dropped_before_and_after_the_run(
-        self, monkeypatch,
+    def test_every_collection_is_dropped_before_and_after_the_run(
+        self, six_arm_run,
     ):
         """Before AND after: a swallowed teardown then self-heals on the next
         run instead of poisoning it with a half-seeded arm."""
         mod = _mod()
-        drops = _install_driver_doubles(monkeypatch)
+        drop_calls = six_arm_run.drop_calls
         expected = set(mod.ephemeral_collections(suffix='utest').values())
 
-        await mod.run_bake_off(**_SIX_ARM_RUN)
+        assert len(drop_calls) == 2
+        assert set(drop_calls[0]) == expected
+        assert set(drop_calls[-1]) == expected
 
-        assert len(drops.calls) == 2
-        assert set(drops.calls[0]) == expected
-        assert set(drops.calls[-1]) == expected
-
+    @pytest.mark.asyncio
     async def test_the_collections_are_dropped_even_when_a_query_raises(
         self, monkeypatch,
     ):
@@ -5291,15 +5224,13 @@ class TestRunBakeOffWiring:
         assert set(drops.calls[-1]) == expected
         assert _FakeMemoryService.instances[-1].closed is True
 
-    async def test_the_report_it_returns_is_the_one_build_report_validated(
-        self, monkeypatch,
+    def test_the_report_it_returns_is_the_one_build_report_validated(
+        self, small_run,
     ):
         """Not a second, looser assembly path: the completeness check that
         refuses to publish a partial decision table has to be on THIS road."""
         mod = _mod()
-        _install_driver_doubles(monkeypatch)
-
-        report = await mod.run_bake_off(**_SMALL_RUN)
+        report = small_run.report
 
         assert report['schema_version'] == mod.REPORT_SCHEMA_VERSION
         assert set(report) == {
@@ -5313,6 +5244,7 @@ class TestRunBakeOffWiring:
         assert report['protocol']['distractor_slab_size'] == 12
         assert report['protocol']['embedder_model'] == 'text-embedding-3-small'
 
+    @pytest.mark.asyncio
     async def test_a_second_run_does_not_re_audit_the_same_alpha_fixture(
         self, monkeypatch,
     ):
