@@ -8,7 +8,8 @@ other (PRD ``plans/dashboard-prd-lanes-prd.md`` §4.8, boundary rows 13–18).
 Each :class:`Scenario` is one PRD: its tasks, the run-ledger events and
 escalations naming them, and its sidecar's signal leaves when it has one.
 :data:`OUTSIDE_TASKS` are the tasks no PRD owns that scenarios point at: a
-pending carrier and a pending outside dependency. Task ids are unique across
+pending, a done and a cancelled carrier, and a pending outside dependency.
+:data:`MISSING_CARRIER` is a carrier the store does not hold. Task ids are unique across
 the whole tree, so every scenario can be drawn from one status map. The
 session holders the tree names are real processes, from :func:`holder_processes`.
 """
@@ -28,6 +29,7 @@ from shared.task_deferral import (
     CarriedByDeferral,
     Deferral,
     HeldBySessionDeferral,
+    LegacyUnknownDeferral,
     PlanningDeferral,
     UntilConditionDeferral,
     record_to_json,
@@ -37,6 +39,12 @@ CARRIER = 900
 """A pending task carrying held work, owned by no PRD."""
 OUTSIDE_DEPENDENCY = 901
 """A pending task scenarios depend on, owned by no PRD."""
+DONE_CARRIER = 902
+"""A done task still named as a carrier, owned by no PRD."""
+CANCELLED_CARRIER = 903
+"""A cancelled task still named as a carrier, owned by no PRD."""
+MISSING_CARRIER = 999
+"""A carrier no store row holds."""
 STAMPED_BY = 'claude-task-6584-fixture'
 CONDITION = 'the upstream 2.0 release ships'
 _NO_EVENTS: Mapping[int, datetime] = MappingProxyType({})
@@ -74,6 +82,8 @@ class Scenario(NamedTuple):
 OUTSIDE_TASKS: Mapping[int, LaneTask] = MappingProxyType({
     CARRIER: LaneTask('pending', {}),
     OUTSIDE_DEPENDENCY: LaneTask('pending', {}),
+    DONE_CARRIER: LaneTask('done', {}),
+    CANCELLED_CARRIER: LaneTask('cancelled', {}),
 })
 
 
@@ -182,6 +192,9 @@ def lanes_tree(
         'gate_milestone_unfired': Scenario(
             {171: task('done'), 172: gate('pending', 171, milestone=future)},
         ),
+        'gate_external_deps': Scenario(
+            {175: task('done'), 176: gate('pending', 175, external_deps=['reify:12'])},
+        ),
         'level2_escalation': Scenario(
             {181: task('pending')}, escalations=(FiledEscalation('esc-181-2', 181, 2),),
         ),
@@ -220,6 +233,25 @@ def lanes_tree(
         'held_by_dead_session': Scenario(
             {311: deferred(HeldBySessionDeferral(holder=dead_holder, **stamped(2)))},
         ),
+        'carried_by_done_carrier': Scenario(
+            {312: deferred(CarriedByDeferral(carrier_task_id=DONE_CARRIER, **stamped(2)))},
+        ),
+        'carried_by_cancelled_carrier': Scenario(
+            {313: deferred(CarriedByDeferral(carrier_task_id=CANCELLED_CARRIER, **stamped(2)))},
+        ),
+        'carried_by_missing_carrier': Scenario(
+            {314: deferred(CarriedByDeferral(carrier_task_id=MISSING_CARRIER, **stamped(2)))},
+        ),
+        'condition_stale': Scenario(
+            {315: deferred(UntilConditionDeferral(condition=CONDITION, **stamped(40)))},
+        ),
+        'condition_expiry_overdue': Scenario({
+            316: deferred(UntilConditionDeferral(
+                condition=CONDITION, expires_at=ago(1), **stamped(2),
+            )),
+        }),
+        'invalid_record': Scenario({317: task('deferred', deferral={'kind': 'no_such_kind'})}),
+        'legacy_record': Scenario({318: deferred(LegacyUnknownDeferral(**stamped(2)))}),
         'milestone_unfired': Scenario({321: task('pending', milestone=future)}),
         'milestone_fired': Scenario({331: task('pending', milestone=past)}),
         'milestone_malformed': Scenario({341: task('pending', milestone={'mode': 'dated'})}),

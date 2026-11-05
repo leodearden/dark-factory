@@ -383,6 +383,11 @@ _EXPECTED_LANES = {
     'parked_over_moving': 'parked',
     'parked_caller_kinds': 'parked',
     'held_by_dead_session': 'stuck',
+    'carried_by_done_carrier': 'stuck',
+    'condition_stale': 'stuck',
+    'invalid_record': 'stuck',
+    'legacy_record': 'stuck',
+    'gate_external_deps': 'stuck',
     'moving_over_stuck': 'moving',
     'started_13d': 'moving',
     'started_15d': 'stuck',
@@ -407,6 +412,12 @@ def test_every_lanes_fixture_prd_is_served_in_its_lane(bodies):
     assert view['state'] == 'fresh', view['reason']
     served = {name: _lanes_row(bodies['prd_lanes'], name)['lane'] for name in _EXPECTED_LANES}
     assert served == _EXPECTED_LANES
+
+
+def test_a_deferral_whose_holder_is_dead_is_served_as_needing_a_human(bodies):
+    held = _lanes_row(bodies['prd_lanes'], 'held_by_dead_session')
+    assert held['state_line'].startswith('1 deferral needs a human: #311')
+    assert held['detail']['needs_human_refs'] == [{'task_id': 311, 'reason': 'holder_dead'}]
 
 
 def test_the_served_lanes_partition_the_served_rows(bodies):

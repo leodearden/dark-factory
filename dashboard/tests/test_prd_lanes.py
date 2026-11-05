@@ -18,6 +18,7 @@ import pytest
 from _prd_lanes_tree import Scenario, holder_processes, lanes_tree, sidecar, tree_tasks
 from shared.capability_manifest import parse_capability_manifest
 from shared.process_identity import Liveness
+from shared.task_deferral import NeedsHumanReason
 from shared.task_statuses import TERMINAL
 
 from dashboard.data.census import build_census
@@ -31,6 +32,7 @@ from dashboard.data.prd_view import (
     LANE_LABELS,
     LANE_PRECEDENCE,
     LANE_RULES,
+    NEEDS_HUMAN_TEXT,
     FigureId,
     Lane,
     MilestoneStatus,
@@ -186,12 +188,13 @@ def test_only_actionable_gates_and_level2_escalations_put_a_prd_in_ruling(wire, 
     assert lanes_of(
         wire, tree,
         'gate_deps_met', 'gate_blocked', 'gate_deps_unmet', 'gate_milestone_unfired',
-        'level2_escalation', 'level1_escalation',
+        'gate_external_deps', 'level2_escalation', 'level1_escalation',
     ) == {
         'gate_deps_met': 'ruling',
         'gate_blocked': 'ruling',
         'gate_deps_unmet': 'stuck',
         'gate_milestone_unfired': 'parked',
+        'gate_external_deps': 'stuck',
         'level2_escalation': 'ruling',
         'level1_escalation': 'stuck',
     }
@@ -232,6 +235,18 @@ def test_a_rows_activity_counts_recent_members_split_direct_from_followup(wire, 
 # ---------------------------------------------------------------------------
 
 
+_NEEDING_A_HUMAN: Mapping[str, tuple[int, NeedsHumanReason]] = MappingProxyType({
+    'carried_by_done_carrier': (312, NeedsHumanReason.CLOSABLE),
+    'carried_by_cancelled_carrier': (313, NeedsHumanReason.ORPHANED),
+    'carried_by_missing_carrier': (314, NeedsHumanReason.CARRIER_MISSING),
+    'condition_stale': (315, NeedsHumanReason.STALE_CONDITION),
+    'condition_expiry_overdue': (316, NeedsHumanReason.EXPIRY_OVERDUE),
+    'invalid_record': (317, NeedsHumanReason.INVALID_RECORD),
+    'legacy_record': (318, NeedsHumanReason.LEGACY_UNKNOWN),
+})
+"""Each scenario whose one deferral needs a human: that member and why."""
+
+
 def test_the_session_holders_are_a_live_and_a_reaped_process(tree):
     liveness = lanes_inputs(tree).liveness.value
     assert liveness == {283: Liveness.ALIVE, 311: Liveness.DEAD}
@@ -241,16 +256,35 @@ def test_parked_needs_every_open_member_held_by_a_recorded_trigger(wire, tree):
     assert lanes_of(
         wire, tree,
         'parked_caller_kinds', 'parked_one_unrecorded', 'all_planning', 'held_by_dead_session',
-        'milestone_unfired', 'milestone_fired', 'milestone_malformed',
+        *_NEEDING_A_HUMAN, 'milestone_unfired', 'milestone_fired', 'milestone_malformed',
     ) == {
         'parked_caller_kinds': 'parked',
         'parked_one_unrecorded': 'stuck',
         'all_planning': 'stuck',
         'held_by_dead_session': 'stuck',
+        **{name: 'stuck' for name in _NEEDING_A_HUMAN},
         'milestone_unfired': 'parked',
         'milestone_fired': 'stuck',
         'milestone_malformed': 'stuck',
     }
+
+
+def test_a_session_hold_whose_liveness_was_not_read_needs_a_human(tree):
+    inputs = lanes_inputs(tree)
+    unread = dataclasses.replace(inputs, liveness=_fresh(MappingProxyType({311: Liveness.DEAD})))
+
+    datum = build_prd_view(unread, now=NOW)
+
+    assert datum.value is not None, datum.reason
+    parked = row(datum.value.to_wire(), tree, 'parked_caller_kinds')
+    assert parked['lane'] == 'stuck'
+    assert parked['state_line'] == _needs_human_line(283, NeedsHumanReason.LIVENESS_UNKNOWN)
+    assert parked['detail']['needs_human_refs'] == [{'task_id': 283, 'reason': 'liveness_unknown'}]
+
+
+def test_every_needs_human_reason_has_its_text():
+    assert set(NEEDS_HUMAN_TEXT) == set(NeedsHumanReason)
+    assert all(text.strip() for text in NEEDS_HUMAN_TEXT.values())
 
 
 _DELAYED = {'mode': 'delayed', 'after_secs': 3600}
@@ -305,6 +339,10 @@ def lines_of(wire: Mapping[str, Any], tree: Mapping[str, Scenario], *names: str)
     return {name: row(wire, tree, name)['state_line'] for name in names}
 
 
+def _needs_human_line(task_id: int, reason: NeedsHumanReason) -> str:
+    return f'1 deferral needs a human: #{task_id} ({NEEDS_HUMAN_TEXT[reason]})'
+
+
 def test_a_ruling_line_names_the_escalation_else_the_gate(wire, tree):
     assert lines_of(wire, tree, 'ruling_over_tail', 'gate_deps_met', 'gate_blocked') == {
         'ruling_over_tail': 'awaits ruling on esc-102-1 (#102)',
@@ -353,7 +391,14 @@ def test_a_stuck_line_with_nothing_ready_says_why(wire, tree):
         'parked_one_unrecorded': '1 deferred with no recorded reason',
         'all_planning': '2 planning births not yet committed',
         'milestone_malformed': 'malformed milestone on #341',
-        'held_by_dead_session': 'nothing ready: 1 deferred',
+        'held_by_dead_session': _needs_human_line(311, NeedsHumanReason.HOLDER_DEAD),
+    }
+
+
+def test_a_stuck_line_names_each_deferral_that_needs_a_human_and_why(wire, tree):
+    assert lines_of(wire, tree, *_NEEDING_A_HUMAN) == {
+        name: _needs_human_line(task_id, reason)
+        for name, (task_id, reason) in _NEEDING_A_HUMAN.items()
     }
 
 
@@ -372,6 +417,7 @@ def test_each_row_names_its_next_action(wire, tree):
             'ruling_over_tail', 'gate_deps_met', 'stuck_ready_ages', 'parked_one_unrecorded',
             'gate_deps_unmet', 'blocked_by_other_prd', 'all_planning',
             'moving_over_stuck', 'tail_over_moving', 'parked_caller_kinds',
+            'invalid_record', 'legacy_record', 'held_by_dead_session', 'carried_by_done_carrier',
         )
     }
     assert actions == {
@@ -388,6 +434,10 @@ def test_each_row_names_its_next_action(wire, tree):
         'moving_over_stuck': _action('none', ''),
         'tail_over_moving': _action('none', ''),
         'parked_caller_kinds': _action('none', ''),
+        'invalid_record': _action('record_deferral', 'record why #317 is deferred', 317),
+        'legacy_record': _action('record_deferral', 'record why #318 is deferred', 318),
+        'held_by_dead_session': _action('none', ''),
+        'carried_by_done_carrier': _action('none', ''),
     }
 
 
@@ -403,11 +453,14 @@ def test_a_rows_detail_lists_the_ids_behind_its_figures(wire, tree):
         {'task_id': 142, 'escalation_id': None},
     ]
     assert row(wire, tree, 'parked_one_unrecorded')['detail']['deferred_unrecorded_ids'] == [292]
+    assert row(wire, tree, 'held_by_dead_session')['detail']['needs_human_refs'] == [
+        {'task_id': 311, 'reason': 'holder_dead'},
+    ]
     assert row(wire, tree, 'tail_over_moving')['detail']['high_open_ids'] == [113]
     assert row(wire, tree, 'stuck_high')['detail']['oldest_ready_high_ids'] == [371]
     assert row(wire, tree, 'started_15d')['detail'] == {
         'blocker_refs': [], 'ruling_refs': [], 'oldest_ready_high_ids': [],
-        'deferred_unrecorded_ids': [], 'high_open_ids': [],
+        'deferred_unrecorded_ids': [], 'needs_human_refs': [], 'high_open_ids': [],
     }
 
 

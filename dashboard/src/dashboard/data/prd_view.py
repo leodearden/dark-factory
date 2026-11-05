@@ -1,8 +1,8 @@
-"""The per-PRD view of one root: segments, readiness, attribution and signal, composed.
+"""The per-PRD view of one root: segments, readiness, attribution, signal and lane, composed.
 
-PURE (PRD ``plans/dashboard-prd-lanes-prd.md`` §4.3–§4.5, §4.7, §4.9–§4.10,
-§5.5): no I/O and no clock read but the injected *now*. It reads one root's
-six inputs, handed in by the caller: its status map, its raw active rows, its
+PURE (PRD ``plans/dashboard-prd-lanes-prd.md`` §4.3–§4.10, §5.5): no I/O
+and no clock read but the injected *now*. It reads one root's inputs, handed
+in by the caller: its status map, its raw active rows, its
 lineage index, its pending human-level escalations, its run-ledger activity,
 its PRD documents and its session holders' liveness. It never imports the
 modules that acquire them; the value types those modules serve are defined
@@ -11,9 +11,11 @@ does not depend on *now*; it is keyed on the very rows and lineage values it
 was computed from, so it can only ever answer for those.
 
 :func:`build_prd_view` serves per-PRD segments, totals, open members, ready
-age, title and signal mark; closed PRDs; unattributed done; dark matter; the
-lineage multi-link count; signal coverage; each input's provenance; and the
-rule text of every figure. :func:`open_work_keys` names the PRDs it draws, so
+age, title, signal mark, lane, state line, next action, activity and detail;
+the lanes in display order with their precedence; closed PRDs; unattributed
+done; dark matter, with the high work under Tail PRDs; the lineage multi-link
+count; signal coverage; each input's provenance; and the rule text of every
+figure. :func:`open_work_keys` names the PRDs it draws, so
 the caller knows which documents to read.
 """
 
@@ -31,9 +33,11 @@ from shared.capability_manifest import CapabilityManifestDoc, ManifestTask
 from shared.process_identity import Liveness
 from shared.task_deferral import (
     CALLER_KINDS,
+    STALE_CONDITION_AFTER_SECS,
     CarriedByDeferral,
     Deferral,
     InvalidRecord,
+    NeedsHumanReason,
     PlanningDeferral,
     needs_human,
     parse_record,
@@ -284,19 +288,22 @@ FIGURE_RULES: MappingProxyType[FigureId, str] = MappingProxyType({
         "The row's lane reason with its figures: the escalation or gate awaiting a ruling; the "
         "open follow-ups under a delivered signal; what holds a parked PRD; activity in the "
         "window, direct and follow-up apart; for a stuck PRD its ready work and oldest pending "
-        "age, else its unrecorded deferrals, planning births, malformed milestones and the "
-        "first dependency outside it, else its open segments."
+        "age, else its unrecorded deferrals, deferrals needing a human and why, planning "
+        "births, malformed milestones and the first dependency outside it, else its open "
+        "segments."
     ),
     FigureId.NEXT_ACTION: (
         "What would move the PRD: rule on the escalation, else the gate; for a stuck PRD "
-        "dispatch the oldest ready member, else record why an unrecorded deferral is deferred, "
-        "else unblock the lowest-id open dependency outside the PRD (with that task's own PRD). "
+        "dispatch the oldest ready member, else record why a deferral with no record, an "
+        "invalid record or a legacy record is deferred, else unblock the lowest-id open "
+        "dependency outside the PRD (with that task's own PRD). "
         "None for moving, tail and parked PRDs, whose state line shows their counts."
     ),
     FigureId.DETAIL: (
         "The ids behind the row's figures: open dependencies outside the PRD with their own "
         "PRD, the ruling subjects, ready high or critical members oldest first, deferred "
-        "members with no record, and every open high or critical member."
+        "members with no record, deferred members whose hold needs a human with why, and "
+        "every open high or critical member."
     ),
     FigureId.HIDDEN_HIGH: (
         "Every open high or critical member of a Tail PRD, by id, so a collapsed tail never "
@@ -581,7 +588,7 @@ class InputState:
 
 @dataclass(frozen=True, slots=True)
 class PrdView:
-    """One root's per-PRD view (the γ1 subset of PRD §5.5's ``PrdView``)."""
+    """One root's per-PRD view (PRD §5.5's ``PrdView``)."""
 
     prds: tuple[PrdRow, ...]
     lanes: tuple[LaneEntry, ...]
@@ -1060,6 +1067,7 @@ def _prd_row(
             ruling_refs=facts.ruling_refs,
             oldest_ready_high_ids=_oldest_first(m for m in facts.ready_members if _is_high(m)),
             deferred_unrecorded_ids=facts.held_as(MemberHold.UNRECORDED_DEFERRAL),
+            needs_human_refs=facts.needs_human_refs(),
             high_open_ids=tuple(m.task_id for m in open_members if _is_high(m)),
         ),
         activity=facts.activity,
@@ -1113,9 +1121,32 @@ class MemberHold(enum.StrEnum):
     HELD_MILESTONE = 'held_milestone'
     UNRECORDED_DEFERRAL = 'unrecorded_deferral'
     PLANNING_BIRTH = 'planning_birth'
-    DEFERRAL_NEEDS_HUMAN = 'deferral_needs_human'
     MALFORMED_MILESTONE = 'malformed_milestone'
     NOT_HELD = 'not_held'
+
+
+_Hold = MemberHold | NeedsHumanReason
+"""An open member's hold; a recorded deferral that needs a human holds nothing, and reads as why."""
+
+NEEDS_HUMAN_TEXT: MappingProxyType[NeedsHumanReason, str] = MappingProxyType({
+    NeedsHumanReason.MISSING_RECORD: 'no deferral record',
+    NeedsHumanReason.INVALID_RECORD: 'invalid deferral record',
+    NeedsHumanReason.LEGACY_UNKNOWN: 'legacy record with no reason',
+    NeedsHumanReason.CLOSABLE: 'carrier done',
+    NeedsHumanReason.ORPHANED: 'carrier cancelled',
+    NeedsHumanReason.CARRIER_MISSING: 'carrier missing',
+    NeedsHumanReason.STALE_PLANNING: 'planning birth stale',
+    NeedsHumanReason.STALE_CONDITION: (
+        f'condition stamped over {STALE_CONDITION_AFTER_SECS // 86400} d ago'
+    ),
+    NeedsHumanReason.EXPIRY_OVERDUE: 'expiry overdue',
+    NeedsHumanReason.HOLDER_DEAD: 'holder dead',
+    NeedsHumanReason.HOLDER_OTHER_HOST: 'holder on another host',
+    NeedsHumanReason.LIVENESS_UNKNOWN: 'holder liveness unknown',
+})
+
+_RECORD_AGAIN = frozenset({NeedsHumanReason.INVALID_RECORD, NeedsHumanReason.LEGACY_UNKNOWN})
+"""The needs-human reasons a human answers by recording the deferral again."""
 
 
 _HOLDING = frozenset({MemberHold.HELD_DEFERRAL, MemberHold.HELD_MILESTONE})
@@ -1187,6 +1218,17 @@ class TaskRef:
 
 
 @dataclass(frozen=True, slots=True)
+class NeedsHumanRef:
+    """A deferred member whose hold needs a human, and why."""
+
+    task_id: int
+    reason: NeedsHumanReason
+
+    def to_wire(self) -> dict[str, object]:
+        return {'task_id': self.task_id, 'reason': self.reason.value}
+
+
+@dataclass(frozen=True, slots=True)
 class Detail:
     """The ids behind a row's figures."""
 
@@ -1194,6 +1236,7 @@ class Detail:
     ruling_refs: tuple[RulingRef, ...]
     oldest_ready_high_ids: tuple[int, ...]
     deferred_unrecorded_ids: tuple[int, ...]
+    needs_human_refs: tuple[NeedsHumanRef, ...]
     high_open_ids: tuple[int, ...]
 
     def to_wire(self) -> dict[str, object]:
@@ -1202,6 +1245,7 @@ class Detail:
             'ruling_refs': [ref.to_wire() for ref in self.ruling_refs],
             'oldest_ready_high_ids': list(self.oldest_ready_high_ids),
             'deferred_unrecorded_ids': list(self.deferred_unrecorded_ids),
+            'needs_human_refs': [ref.to_wire() for ref in self.needs_human_refs],
             'high_open_ids': list(self.high_open_ids),
         }
 
@@ -1222,7 +1266,7 @@ class _RowFacts:
 
     ruling_refs: tuple[RulingRef, ...]
     signal: SignalMark
-    holds: Mapping[int, MemberHold]
+    holds: Mapping[int, _Hold]
     activity: RowActivity
     in_progress: int
     ready: ReadyAge
@@ -1235,6 +1279,13 @@ class _RowFacts:
     def held_as(self, hold: MemberHold) -> tuple[int, ...]:
         """The open members with *hold*, by id."""
         return tuple(task_id for task_id, verdict in self.holds.items() if verdict is hold)
+
+    def needs_human_refs(self) -> tuple[NeedsHumanRef, ...]:
+        """The open deferred members whose hold needs a human, and why."""
+        return tuple(
+            NeedsHumanRef(task_id, verdict)
+            for task_id, verdict in self.holds.items() if isinstance(verdict, NeedsHumanReason)
+        )
 
 
 _LANE_TESTS: Mapping[Lane, Callable[[_RowFacts], bool]] = MappingProxyType({
@@ -1278,7 +1329,7 @@ def _actionable_gate(member: _Member, context: _RowContext) -> bool:
     )
 
 
-def _member_hold(member: _Member, context: _RowContext) -> MemberHold:
+def _member_hold(member: _Member, context: _RowContext) -> _Hold:
     metadata = _metadata_of(member.row)
     status = context.status_map[member.task_id]
     if status == TaskStatus.DEFERRED:
@@ -1291,7 +1342,7 @@ def _member_hold(member: _Member, context: _RowContext) -> MemberHold:
 
 def _deferral_hold(
     record: Deferral | InvalidRecord | None, task_id: int, context: _RowContext,
-) -> MemberHold:
+) -> _Hold:
     """A deferred member's hold, by ``shared.task_deferral.needs_human`` over the store."""
     if record is None:
         return MemberHold.UNRECORDED_DEFERRAL
@@ -1303,10 +1354,10 @@ def _deferral_hold(
         _carrier_status(record, context.status_map),
         context.liveness.get(task_id),
     )
+    if verdict is not None:
+        return verdict
     caller_kind = not isinstance(record, InvalidRecord) and record.kind in CALLER_KINDS
-    return MemberHold.HELD_DEFERRAL if caller_kind and verdict is None else (
-        MemberHold.DEFERRAL_NEEDS_HUMAN
-    )
+    return MemberHold.HELD_DEFERRAL if caller_kind else MemberHold.NOT_HELD
 
 
 def _carrier_status(
@@ -1452,6 +1503,19 @@ def _unrecorded_clause(facts: _RowFacts) -> str | None:
     return f'{unrecorded} deferred with no recorded reason' if unrecorded else None
 
 
+def _needs_human_clause(facts: _RowFacts) -> str | None:
+    refs = facts.needs_human_refs()
+    if not refs:
+        return None
+    first, *rest = refs
+    verb = 'need' if rest else 'needs'
+    more = f' and {len(rest)} more' if rest else ''
+    return (
+        f'{_plural(len(refs), "deferral")} {verb} a human: '
+        f'#{first.task_id} ({NEEDS_HUMAN_TEXT[first.reason]}){more}'
+    )
+
+
 def _planning_clause(facts: _RowFacts) -> str | None:
     births = len(facts.held_as(MemberHold.PLANNING_BIRTH))
     return f'{_plural(births, "planning birth")} not yet committed' if births else None
@@ -1472,7 +1536,7 @@ def _blocker_clause(facts: _RowFacts) -> str | None:
 
 
 _STUCK_CLAUSES: tuple[Callable[[_RowFacts], str | None], ...] = (
-    _unrecorded_clause, _planning_clause, _malformed_clause, _blocker_clause,
+    _unrecorded_clause, _needs_human_clause, _planning_clause, _malformed_clause, _blocker_clause,
 )
 
 _STATE_LINES: Mapping[Lane, Callable[[_RowFacts], str]] = MappingProxyType({
@@ -1499,10 +1563,14 @@ def _unstick(facts: _RowFacts) -> NextAction:
         task_id = min(m.task_id for m in facts.ready_members) if oldest is None else oldest
         target = ActionTarget(task_id, None, None)
         return NextAction(NextActionKind.DISPATCH, target, f'dispatch #{task_id}')
-    if unrecorded := facts.held_as(MemberHold.UNRECORDED_DEFERRAL):
-        target = ActionTarget(unrecorded[0], None, None)
+    to_record = (
+        *facts.held_as(MemberHold.UNRECORDED_DEFERRAL),
+        *(ref.task_id for ref in facts.needs_human_refs() if ref.reason in _RECORD_AGAIN),
+    )
+    if to_record:
+        target = ActionTarget(to_record[0], None, None)
         return NextAction(
-            NextActionKind.RECORD_DEFERRAL, target, f'record why #{unrecorded[0]} is deferred',
+            NextActionKind.RECORD_DEFERRAL, target, f'record why #{to_record[0]} is deferred',
         )
     if facts.blockers:
         blocker = facts.blockers[0]
@@ -1686,7 +1754,7 @@ def _top_sources(sources: Counter[str]) -> dict[str, int]:
 
 
 # ---------------------------------------------------------------------------
-# validate_prd_view: the γ1 subset of §5.5's shaping validators
+# validate_prd_view: §5.5's shaping validators
 # ---------------------------------------------------------------------------
 
 

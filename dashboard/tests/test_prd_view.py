@@ -285,7 +285,7 @@ def test_a_prd_row_counts_its_members_by_segment():
     assert row.pop('next_action') == {'kind': 'none', 'target': None, 'text': ''}
     assert row.pop('detail') == {
         'blocker_refs': [], 'ruling_refs': [], 'oldest_ready_high_ids': [],
-        'deferred_unrecorded_ids': [], 'high_open_ids': [],
+        'deferred_unrecorded_ids': [], 'needs_human_refs': [], 'high_open_ids': [],
     }
     assert row == {
         'key': PRD_A,

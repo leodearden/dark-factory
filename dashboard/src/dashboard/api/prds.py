@@ -292,7 +292,10 @@ async def _acquire_within_budget(
 
 
 def _unserved(label: str, reason: str) -> RootUnserved:
-    logger.warning('project %s: %s; its PRD view is UNKNOWN for this render', label, reason)
+    logger.warning(
+        'project %s: %s; its PRD view and contention line are UNKNOWN for this render',
+        label, reason,
+    )
     return RootUnserved(reason)
 
 
