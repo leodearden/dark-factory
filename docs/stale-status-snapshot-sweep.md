@@ -932,10 +932,11 @@ assertion instead of merely losing it. (task 3037)
 
 ### The template
 
-`'As of {date}, task {task_id} has status {status}.'` is RESULTING-STATE-ONLY,
-and every word of it is load-bearing. Two independent hazards rule out the
-wordings a reader reaches for first. Both were measured on the extractor and
-on `task_filter`'s write guards, and both are pinned by
+`fused-memory/src/fused_memory/reconciliation/stale_status_snapshot_edge_sweep.py::_SUPERSEDE_FACT_TEMPLATE`
+is RESULTING-STATE-ONLY, and every word of it is load-bearing. Two
+independent hazards rule out the wordings a reader reaches for first. Both
+were measured on the extractor and on `task_filter`'s write guards, and both
+are pinned by
 `tests/reconciliation/test_stale_status_snapshot_edge_sweep.py::TestBuildSupersedeFact`.
 
 1. 'Task {N} was blocked and is now pending' is FORBIDDEN, twice over. The
@@ -997,20 +998,20 @@ failure must not consume the task's one-write-per-cycle budget.
 
 ### The per-cycle ceiling
 
-`_MAX_SUPERSEDE_WRITES_PER_CYCLE` (50) caps superseding writes per cycle
-(task 3037). Each write is a real Graphiti write plus an embedding
-round-trip, awaited SERIALLY inside the per-stale-edge invalidation loop. Its
-count is bounded only by how many distinct blocked-asserted tasks are
-contradicted in the cycle. On the FIRST cycle after it shipped, every blocked
-assertion accumulated since the sweep was written became eligible at once.
-An unbounded number of sequential network writes would blow the cycle's
-liveness budget (§"Extraction cost as a liveness property") by minutes on
-the drain cycle.
+`stale_status_snapshot_edge_sweep.py::_MAX_SUPERSEDE_WRITES_PER_CYCLE` caps
+superseding writes per cycle (task 3037). Each write is a real Graphiti write
+plus an embedding round-trip, awaited SERIALLY inside the per-stale-edge
+invalidation loop. Its count is bounded only by how many distinct
+blocked-asserted tasks are contradicted in the cycle. On the FIRST cycle
+after it shipped, every blocked assertion accumulated since the sweep was
+written became eligible at once. An unbounded number of sequential network
+writes would blow the cycle's liveness budget (§"Extraction cost as a
+liveness property") by minutes on the drain cycle.
 
-50 keeps the worst-case added latency in the same order as the enumeration
-cost already budgeted for, while sitting far above steady state: once the
-backlog has drained, a cycle supersedes roughly one fact per task unblocked
-since the previous cycle, single digits.
+The ceiling is sized to keep the worst-case added latency in the same order
+as the enumeration cost already budgeted for, while sitting far above steady
+state: once the backlog has drained, a cycle supersedes roughly one fact
+per task unblocked since the previous cycle, single digits.
 
 NO SILENT CAP: truncation is tallied into `stats['supersede_skipped']` and
 logged at WARNING with the count. And it IS a loss, not a deferral: the edges
