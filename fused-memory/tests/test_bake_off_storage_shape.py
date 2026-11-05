@@ -4655,6 +4655,7 @@ class _DriverRun:
     lease_dir: Path
     acquisitions: tuple[str, ...]
     probe_hits: tuple[dict[str, list[str]], ...]
+    injection_loads: tuple[tuple, ...]
     caller_config: _FakeConfig
 
     @property
@@ -4678,6 +4679,7 @@ def _record_driver_run(run_kwargs: dict, directory: Path) -> _DriverRun:
     lease_dirs: set[Path] = set()
     acquisitions: list[str] = []
     probe_hits: list[dict[str, list[str]]] = []
+    injection_loads: list[tuple] = []
     with pytest.MonkeyPatch.context() as mp:
         isolated_lease_dir(mp, directory / 'leases')
         drops = _install_driver_doubles(mp)
@@ -4685,7 +4687,7 @@ def _record_driver_run(run_kwargs: dict, directory: Path) -> _DriverRun:
         # own reaper reads never enter `acquisitions`.
         reaper = mod.load_cleanup_script()
         resolve, seed_arm, fetch_arm = mod.load_cleanup_script, mod.seed_arm, mod.fetch_arm
-        mkdtemp = tempfile.mkdtemp
+        mkdtemp, load_injections = tempfile.mkdtemp, mod.load_regrowth_injections
 
         def _drop_and_look(*args, **kwargs):
             leases_at_drop.append(reaper.live_leases())
@@ -4712,11 +4714,16 @@ def _record_driver_run(run_kwargs: dict, directory: Path) -> _DriverRun:
             })
             return fetched
 
+        def _record_injection_load(*args, **kwargs):
+            injection_loads.append(args)
+            return load_injections(*args, **kwargs)
+
         mp.setattr(mod, 'drop_collections', _drop_and_look)
         mp.setattr(mod, 'seed_arm', _seed_and_look)
         mp.setattr(mod, 'load_cleanup_script', _record_resolve)
         mp.setattr(tempfile, 'mkdtemp', _record_mkdtemp)
         mp.setattr(mod, 'fetch_arm', _capture_probe_hits)
+        mp.setattr(mod, 'load_regrowth_injections', _record_injection_load)
         caller_config = _driver_config()
 
         report = asyncio.run(mod.run_bake_off(config=caller_config, **run_kwargs))
@@ -4732,6 +4739,7 @@ def _record_driver_run(run_kwargs: dict, directory: Path) -> _DriverRun:
             lease_dir=lease_dir,
             acquisitions=tuple(acquisitions),
             probe_hits=tuple(probe_hits),
+            injection_loads=tuple(injection_loads),
             caller_config=caller_config,
         )
 
@@ -5463,6 +5471,7 @@ class TestRegrowthPassKey:
             assert name.startswith(prefix)
 
 
+@_ON_THE_RECORDING_WORKER
 class TestRunBakeOffRegrowthWiring:
     """The probe's effect on the world, measured through the same doubles."""
 
