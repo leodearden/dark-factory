@@ -386,6 +386,11 @@ def segment_of(
     return _STATUS_SEGMENTS.get(status)
 
 
+def priority_of(row: Mapping[str, Any] | None) -> str:
+    """*row*'s priority band; ``unrecorded`` when it is missing or blank."""
+    return _recorded(_row_value(row, 'priority'))
+
+
 def _metadata_of(row: Mapping[str, Any] | None) -> Mapping[str, Any]:
     metadata = None if row is None else row.get('metadata')
     return metadata if isinstance(metadata, Mapping) else MappingProxyType({})
@@ -797,7 +802,7 @@ def build_prd_view(inputs: PrdViewInputs, *, now: datetime) -> Datum[PrdView]:
     unknown = [datum for datum in aged.values() if datum.state is DatumState.UNKNOWN]
     if unknown or any(datum.value is None for datum in aged.values()):
         bound = (unknown[0] if unknown else census).freshness_bound_seconds
-        return unknown_datum(_degradation_reason(aged) or 'an input has no value', bound)
+        return unknown_datum(degradation_reason(aged) or 'an input has no value', bound)
     states = tuple(
         InputState(name, datum.as_of, datum.state, datum.reason) for name, datum in aged.items()
     )
@@ -826,7 +831,8 @@ def open_work_keys(
     }))
 
 
-def _degradation_reason(aged: Mapping[ViewInput, Datum[Any]]) -> str | None:
+def degradation_reason(aged: Mapping[ViewInput, Datum[Any]]) -> str | None:
+    """Each of the *aged* inputs that is not fresh, named with its own reason; ``None`` if all are."""
     named = [
         f'{name}: {datum.reason or datum.state.value}'
         for name, datum in aged.items()
@@ -849,7 +855,7 @@ def composite(value: V, aged: Mapping[ViewInput, Datum[Any]]) -> Datum[V]:
         value=value,
         as_of=as_of,
         state=state,
-        reason=_degradation_reason(aged),
+        reason=degradation_reason(aged),
         freshness_bound_seconds=oldest.freshness_bound_seconds,
     )
 
@@ -1350,7 +1356,7 @@ def _prd_of(task_id: int, context: _RowContext) -> str | None:
 
 
 def _is_high(member: _Member) -> bool:
-    return _recorded(_row_value(member.row, 'priority')) in HIGH_PRIORITIES
+    return priority_of(member.row) in HIGH_PRIORITIES
 
 
 def _oldest_first(members: Iterable[_Member]) -> tuple[int, ...]:
@@ -1547,7 +1553,7 @@ def _dark_matter(
     hidden_high: HiddenHigh,
 ) -> DarkMatter:
     everyone = [member for members in dark.values() for member in members]
-    priorities = Counter(_recorded(_row_value(m.row, 'priority')) for m in everyone)
+    priorities = Counter(priority_of(m.row) for m in everyone)
     sources = Counter(_recorded(_metadata_of(m.row).get('source')) for m in everyone)
     by_status = Counter(TaskStatus(status_map[m.task_id]) for m in everyone)
     return DarkMatter(
@@ -1561,7 +1567,7 @@ def _dark_matter(
         ready_high_ids=tuple(sorted(
             m.task_id for m in everyone
             if m.segment is Segment.READY
-            and _recorded(_row_value(m.row, 'priority')) in HIGH_PRIORITIES
+            and priority_of(m.row) in HIGH_PRIORITIES
         )),
         members=MappingProxyType({
             reason: tuple(sorted(m.task_id for m in dark[reason]))

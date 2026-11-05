@@ -49,7 +49,7 @@ _GATE = {'task_kind': 'deterministic', 'always_escalates': True}
 def _task(
     status: str,
     priority: str,
-    files: list[str] | None = None,
+    files: list[Any] | None = None,
     dependencies: tuple[int, ...] = (),
     **metadata: Any,
 ) -> dict[str, Any]:
