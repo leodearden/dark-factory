@@ -23,12 +23,21 @@ import enum
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import MappingProxyType
 from typing import Any, TypeVar
 
 from shared.capability_manifest import CapabilityManifestDoc, ManifestTask
 from shared.process_identity import Liveness
+from shared.task_deferral import (
+    CALLER_KINDS,
+    CarriedByDeferral,
+    Deferral,
+    InvalidRecord,
+    PlanningDeferral,
+    needs_human,
+    parse_record,
+)
 from shared.task_metadata import Milestone
 from shared.task_statuses import TERMINAL, TaskStatus
 from shared.timestamps import parse_timestamp_or_warn
@@ -85,6 +94,61 @@ SEGMENT_LABELS: MappingProxyType[Segment, str] = MappingProxyType({
 })
 
 
+MOVING_WINDOW_DAYS = 14
+"""How recent a member's start or completion must be for its PRD to be moving."""
+
+
+class Lane(enum.StrEnum):
+    """What a PRD needs (§4.8); a PRD is in the first lane of :data:`LANE_PRECEDENCE` it meets."""
+
+    RULING = 'ruling'
+    TAIL = 'tail'
+    PARKED = 'parked'
+    MOVING = 'moving'
+    STUCK = 'stuck'
+
+
+LANE_PRECEDENCE: tuple[Lane, ...] = (Lane.RULING, Lane.TAIL, Lane.PARKED, Lane.MOVING, Lane.STUCK)
+LANE_DISPLAY_ORDER: tuple[Lane, ...] = (
+    Lane.RULING, Lane.MOVING, Lane.STUCK, Lane.PARKED, Lane.TAIL,
+)
+
+LANE_LABELS: MappingProxyType[Lane, str] = MappingProxyType({
+    Lane.RULING: 'needs a ruling',
+    Lane.TAIL: 'tail',
+    Lane.PARKED: 'parked',
+    Lane.MOVING: 'moving',
+    Lane.STUCK: 'stuck',
+})
+
+LANE_RULES: MappingProxyType[Lane, str] = MappingProxyType({
+    Lane.RULING: (
+        "Some open member is an actionable human gate (a deterministic task that always "
+        "escalates, with no unfired or malformed milestone, either blocked or pending with every "
+        "dependency done or cancelled and no external dependency), or the subject of a pending "
+        "level-2 escalation in this project's queue. A gate still waiting on a dependency or a "
+        "milestone does not count, nor does a level-1 escalation."
+    ),
+    Lane.TAIL: "The PRD's signal is delivered: every signal leaf its sidecar names is done.",
+    Lane.PARKED: (
+        "Every open member is held by a recorded trigger: deferred with a valid carried_by, "
+        "until_condition or held_by_session record that needs no human (a carrier still open, "
+        "a condition not stale or overdue, a holder session alive), or pending with an unfired "
+        "milestone. A planning birth, a deferral with no record and a malformed milestone are "
+        "not holds."
+    ),
+    Lane.MOVING: (
+        f"Some member, open or done, started or finished within the last {MOVING_WINDOW_DAYS} "
+        "days, as the project's runs.db records it (a done member with no completion event "
+        "counts through its done_provenance stamp), or an open member is in progress now."
+    ),
+    Lane.STUCK: (
+        f"Everything else: open work remains, nothing started or finished in {MOVING_WINDOW_DAYS} "
+        "days, no ruling is pending, and not every open member is held."
+    ),
+})
+
+
 class FigureId(enum.StrEnum):
     """Every figure the view serves; each value IS the figure's wire field name."""
 
@@ -100,6 +164,9 @@ class FigureId(enum.StrEnum):
     TITLE = 'title'
     SIGNAL = 'signal'
     SIGNAL_COVERAGE = 'signal_coverage'
+    LANE = 'lane'
+    LANES = 'lanes'
+    ACTIVITY = 'activity'
 
 
 class ViewInput(enum.StrEnum):
@@ -117,12 +184,11 @@ class ViewInput(enum.StrEnum):
 
 HIGH_PRIORITIES = frozenset({'critical', 'high'})
 TOP_SOURCES = 5
-MOVING_WINDOW_DAYS = 14
-"""How recent a member's start or completion must be for its PRD to be moving."""
 UNRECORDED = 'unrecorded'
 OTHER_SOURCES = 'other'
 
 _LINK_CHAIN = ' > '.join(field.value for field in LinkField)
+_PRECEDENCE_TEXT = ' > '.join(lane.value for lane in LANE_PRECEDENCE)
 _ATTRIBUTION_RULE = (
     "A task belongs to the PRD its own metadata names (prd_path, else prd, else prd_ref); "
     f"failing that, to the first PRD up its {_LINK_CHAIN} chain within this project, "
@@ -134,8 +200,8 @@ FIGURE_RULES: MappingProxyType[FigureId, str] = MappingProxyType({
         "A PRD's members are the tasks attributed to it, cancelled excluded. Each falls in one "
         "segment: done; in progress (in-progress, review, merge-deferred, infra-hold); blocked; "
         "deferred; ready (pending and could dispatch, see ready); waiting (pending and not "
-        "ready: an unmet or unknown dependency, an external dependency, an unfired milestone, "
-        "a human gate, or no active row)."
+        "ready: an unmet or unknown dependency, an external dependency, an unfired or "
+        "malformed milestone, a human gate, or no active row)."
     ),
     FigureId.TOTAL: "The PRD's members, cancelled excluded: the sum of its segments.",
     FigureId.DIRECT_OPEN: f"Open members whose own metadata names this PRD. {_ATTRIBUTION_RULE}",
@@ -145,7 +211,8 @@ FIGURE_RULES: MappingProxyType[FigureId, str] = MappingProxyType({
     ),
     FigureId.READY: (
         "Pending members that could dispatch: every dependency known and done or cancelled, no "
-        "external dependency, no unfired milestone, and not a human gate (a deterministic task "
+        "external dependency, no unfired or malformed milestone, and not a human gate (a "
+        "deterministic task "
         "that always escalates). It does not evaluate delivered checks on dependencies, pins, "
         "parks, requeue cool-downs or external statuses, so it is an upper bound on what the "
         "scheduler dispatches. A pending task with no active row counts waiting. The age is the "
@@ -192,6 +259,21 @@ FIGURE_RULES: MappingProxyType[FigureId, str] = MappingProxyType({
         "PRDs. A mark unknown everywhere beside low coverage is a missing producer, not a "
         "signal not yet delivered."
     ),
+    FigureId.LANE: (
+        f"The first lane, in precedence order {_PRECEDENCE_TEXT}, whose rule this PRD meets; "
+        "each lane's rule is served with the lanes."
+    ),
+    FigureId.LANES: (
+        "The drawn PRDs partitioned by lane, in display order "
+        f"{', '.join(lane.value for lane in LANE_DISPLAY_ORDER)}, each lane with its rule. A "
+        f"PRD is in the first lane, in precedence order {_PRECEDENCE_TEXT}, whose rule it meets."
+    ),
+    FigureId.ACTIVITY: (
+        f"Members, open or done, that started or finished within {MOVING_WINDOW_DAYS} days, "
+        "split by direct and follow-up attribution. A done member with no completion event "
+        "counts when its done_provenance stamp is in the window. An open member in progress "
+        "with no event in the window moves its PRD but is not counted here."
+    ),
 })
 
 _IN_PROGRESS_STATUSES = VIEWS[TaskView.IN_FLIGHT] - {TaskStatus.BLOCKED}
@@ -205,6 +287,7 @@ _MILESTONE_ANCHOR_KEY = 'milestone_deps_satisfied_at'
 _PENDING_SINCE_KEY = 'pending_since'
 _PENDING_SINCE_BACKFILLED_KEY = 'pending_since_backfilled'
 _SECONDS_PER_DAY = 86_400
+_MOVING_WINDOW = timedelta(days=MOVING_WINDOW_DAYS)
 _EMPTY_MAP_REASON = 'the status map measured no tasks'
 _LINEAGE_PENDING = Attribution(prd=None, hops=0, unresolved=UnresolvedReason.LINEAGE_PENDING)
 _STATE_SEVERITY: Mapping[DatumState, int] = MappingProxyType({
@@ -213,7 +296,7 @@ _STATE_SEVERITY: Mapping[DatumState, int] = MappingProxyType({
     DatumState.STALE: 2,
     DatumState.UNKNOWN: 3,
 })
-_STRUCTURAL_VIEW_KEYS = frozenset({'prds', 'inputs', 'rules', 'segment_legend'})
+_STRUCTURAL_VIEW_KEYS = frozenset({'prds', 'inputs', 'rules', 'segment_legend', 'lane_precedence'})
 _STRUCTURAL_ROW_KEYS = frozenset({'key'})
 _LISTED_IDS_CAP = 5
 
@@ -243,14 +326,20 @@ def is_ready(
     if status_map.get(task_id) != TaskStatus.PENDING or row is None:
         return False
     metadata = _metadata_of(row)
-    dependencies = row.get('dependencies') or ()
-    external_deps = metadata.get('external_deps')
     return (
-        all(status_map.get(dep) in _SATISFIED_DEPENDENCY_STATUSES for dep in dependencies)
-        and not (isinstance(external_deps, list) and external_deps)
-        and not _milestone_unfired(metadata, now)
+        _dependencies_met(row, status_map)
+        and milestone_status(metadata, now) not in _UNDISPATCHABLE_MILESTONES
         and not is_human_gate(metadata)
     )
+
+
+def _dependencies_met(row: Mapping[str, Any], status_map: Mapping[int, str]) -> bool:
+    """Every dependency of *row* known and done or cancelled, and no external dependency."""
+    dependencies = row.get('dependencies') or ()
+    external_deps = _metadata_of(row).get('external_deps')
+    return all(
+        status_map.get(dep) in _SATISFIED_DEPENDENCY_STATUSES for dep in dependencies
+    ) and not (isinstance(external_deps, list) and external_deps)
 
 
 def segment_of(
@@ -274,18 +363,31 @@ def _metadata_of(row: Mapping[str, Any] | None) -> Mapping[str, Any]:
     return metadata if isinstance(metadata, Mapping) else MappingProxyType({})
 
 
-def _milestone_unfired(metadata: Mapping[str, Any], now: datetime) -> bool:
-    """A milestone that has not fired, where a malformed one never fires."""
+class MilestoneStatus(enum.StrEnum):
+    """Where a task's ``metadata.milestone`` stands at an instant."""
+
+    NONE = 'none'
+    UNFIRED = 'unfired'
+    FIRED = 'fired'
+    MALFORMED = 'malformed'
+
+
+_UNDISPATCHABLE_MILESTONES = frozenset({MilestoneStatus.UNFIRED, MilestoneStatus.MALFORMED})
+
+
+def milestone_status(metadata: Mapping[str, Any], now: datetime) -> MilestoneStatus:
+    """*metadata*'s milestone at *now*; a spec or anchor that does not parse is malformed."""
     spec = metadata.get('milestone')
     if not spec:
-        return False
+        return MilestoneStatus.NONE
     anchor = metadata.get(_MILESTONE_ANCHOR_KEY)
     if anchor is not None and not isinstance(anchor, str):
-        return True
+        return MilestoneStatus.MALFORMED
     try:
-        return not Milestone.model_validate(spec).fired(anchor, now)
+        fired = Milestone.model_validate(spec).fired(anchor, now)
     except ValueError:
-        return True
+        return MilestoneStatus.MALFORMED
+    return MilestoneStatus.FIRED if fired else MilestoneStatus.UNFIRED
 
 
 # ---------------------------------------------------------------------------
@@ -323,28 +425,59 @@ class Followup:
 
 
 @dataclass(frozen=True, slots=True)
+class RowActivity:
+    """How many of a PRD's members started or finished in the moving window, by attribution."""
+
+    direct: int
+    followup: int
+
+    def to_wire(self) -> dict[str, object]:
+        return {'direct': self.direct, 'followup': self.followup}
+
+
+@dataclass(frozen=True, slots=True)
 class PrdRow:
     """One PRD with at least one open member."""
 
     key: str
     title: str
+    lane: Lane
     segments: Mapping[Segment, int]
     total: int
     direct_open_ids: tuple[int, ...]
     followup_open: tuple[Followup, ...]
     ready: ReadyAge
     signal: Signal
+    activity: RowActivity
 
     def to_wire(self) -> dict[str, object]:
         return {
             'key': self.key,
             FigureId.TITLE.value: self.title,
+            FigureId.LANE.value: self.lane.value,
             FigureId.SIGNAL.value: self.signal.to_wire(),
+            FigureId.ACTIVITY.value: self.activity.to_wire(),
             FigureId.SEGMENTS.value: {segment.value: n for segment, n in self.segments.items()},
             FigureId.TOTAL.value: self.total,
             FigureId.DIRECT_OPEN.value: list(self.direct_open_ids),
             FigureId.FOLLOWUP_OPEN.value: [followup.to_wire() for followup in self.followup_open],
             FigureId.READY.value: self.ready.to_wire(),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class LaneEntry:
+    """One lane and the keys of the PRDs in it, in the order they are drawn."""
+
+    lane: Lane
+    prd_keys: tuple[str, ...]
+
+    def to_wire(self) -> dict[str, object]:
+        return {
+            'lane': self.lane.value,
+            'label': LANE_LABELS[self.lane],
+            'rule': LANE_RULES[self.lane],
+            'prd_keys': list(self.prd_keys),
         }
 
 
@@ -406,6 +539,7 @@ class PrdView:
     """One root's per-PRD view (the γ1 subset of PRD §5.5's ``PrdView``)."""
 
     prds: tuple[PrdRow, ...]
+    lanes: tuple[LaneEntry, ...]
     closed: Closed
     unattributed_done: int
     dark_matter: DarkMatter
@@ -416,6 +550,8 @@ class PrdView:
     def to_wire(self) -> dict[str, object]:
         return {
             'prds': [row.to_wire() for row in self.prds],
+            FigureId.LANES.value: [entry.to_wire() for entry in self.lanes],
+            'lane_precedence': [lane.value for lane in LANE_PRECEDENCE],
             FigureId.CLOSED.value: self.closed.to_wire(),
             FigureId.UNATTRIBUTED_DONE.value: self.unattributed_done,
             FigureId.DARK_MATTER.value: self.dark_matter.to_wire(),
@@ -625,14 +761,7 @@ def build_prd_view(inputs: PrdViewInputs, *, now: datetime) -> Datum[PrdView]:
     states = tuple(
         InputState(name, datum.as_of, datum.state, datum.reason) for name, datum in aged.items()
     )
-    view = _shape_view(
-        inputs,
-        aged[ViewInput.ACTIVE_ROWS].value,
-        aged[ViewInput.LINEAGE].value,
-        aged[ViewInput.SIGNALS].value,
-        states,
-        now,
-    )
+    view = _shape_view(inputs, aged, states, now)
     validate_prd_view(view, inputs.status_map)
     return composite(view, aged)
 
@@ -745,21 +874,46 @@ def _attributed_for(
     return memo
 
 
+@dataclass(frozen=True, slots=True)
+class _RowContext:
+    """What every row of one view is read against, at the view's *now*."""
+
+    status_map: Mapping[int, str]
+    entries: Mapping[int, LineageEntry]
+    documents: Mapping[str, PrdDocument]
+    escalations: Mapping[int, tuple[str, ...]]
+    activity: TaskActivity
+    liveness: Mapping[int, Liveness | None]
+    now: datetime
+
+    def document(self, key: str) -> PrdDocument:
+        return self.documents.get(key, _NO_DOCUMENT)
+
+
 def _shape_view(
     inputs: PrdViewInputs,
-    rows: Sequence[Mapping[str, Any]],
-    lineage: Mapping[int, LineageEntry],
-    documents: Mapping[str, PrdDocument],
+    aged: Mapping[ViewInput, Datum[Any]],
     states: tuple[InputState, ...],
     now: datetime,
 ) -> PrdView:
-    attributed = _attributed_for(inputs.project_root, rows, lineage)
+    def value(name: ViewInput) -> Any:
+        datum = aged[name]
+        if datum.value is None:
+            raise ValueError(f'{name} reached the shaping with no value: {datum.reason}')
+        return datum.value
 
-    def headline(key: str) -> tuple[str, Signal]:
-        document = documents.get(key, _NO_DOCUMENT)
-        signal = signal_of(key, document, inputs.status_map, attributed.entries)
-        return document.title or key, signal
-
+    attributed = _attributed_for(
+        inputs.project_root, value(ViewInput.ACTIVE_ROWS), value(ViewInput.LINEAGE),
+    )
+    context = _RowContext(
+        status_map=inputs.status_map,
+        entries=attributed.entries,
+        documents=value(ViewInput.SIGNALS),
+        escalations=value(ViewInput.ESCALATIONS),
+        activity=value(ViewInput.ACTIVITY),
+        liveness=value(ViewInput.LIVENESS),
+        now=now,
+    )
     by_prd: dict[str, list[_Member]] = {}
     dark: dict[UnresolvedReason, list[_Member]] = {}
     unattributed_done = 0
@@ -776,15 +930,16 @@ def _shape_view(
             unattributed_done += 1
         elif member.attribution.unresolved is not None:
             dark.setdefault(member.attribution.unresolved, []).append(member)
-    prd_rows, closed = _prd_rows(by_prd, headline, now)
+    prd_rows, closed = _prd_rows(by_prd, context)
     return PrdView(
         prds=prd_rows,
+        lanes=_lanes(prd_rows),
         closed=closed,
         unattributed_done=unattributed_done,
         dark_matter=_dark_matter(dark, inputs.status_map),
         multi_link=attributed.multi_link,
         signal_coverage=SignalCoverage(
-            named=sum(_names_a_leaf(documents.get(row.key, _NO_DOCUMENT)) for row in prd_rows),
+            named=sum(_names_a_leaf(context.document(row.key)) for row in prd_rows),
             of=len(prd_rows),
         ),
         inputs=states,
@@ -797,9 +952,7 @@ def _names_a_leaf(document: PrdDocument) -> bool:
 
 
 def _prd_rows(
-    by_prd: Mapping[str, list[_Member]],
-    headline: Callable[[str], tuple[str, Signal]],
-    now: datetime,
+    by_prd: Mapping[str, list[_Member]], context: _RowContext,
 ) -> tuple[tuple[PrdRow, ...], Closed]:
     rows: list[PrdRow] = []
     closed_prds = closed_tasks = 0
@@ -810,8 +963,7 @@ def _prd_rows(
             key=lambda member: member.task_id,
         )
         if open_members:
-            title, signal = headline(key)
-            rows.append(_prd_row(key, title, signal, members, open_members, now))
+            rows.append(_prd_row(key, members, open_members, context))
         else:
             closed_prds += 1
             closed_tasks += len(members)
@@ -820,16 +972,25 @@ def _prd_rows(
 
 def _prd_row(
     key: str,
-    title: str,
-    signal: Signal,
     members: Sequence[_Member],
     open_members: Sequence[_Member],
-    now: datetime,
+    context: _RowContext,
 ) -> PrdRow:
+    document = context.document(key)
+    signal = signal_of(key, document, context.status_map, context.entries)
+    recent = [member for member in members if _recently_active(member, context)]
+    facts = _LaneFacts(
+        ruling_refs=_ruling_refs(open_members, context),
+        signal=signal.mark,
+        holds=tuple(_member_hold(member, context) for member in open_members),
+        recently_active=bool(recent),
+        in_progress=any(member.segment is Segment.IN_PROGRESS for member in open_members),
+    )
     counts = Counter(member.segment for member in members)
     return PrdRow(
         key=key,
-        title=title,
+        title=document.title or key,
+        lane=_lane_of(facts),
         signal=signal,
         segments=MappingProxyType({segment: counts[segment] for segment in Segment}),
         total=len(members),
@@ -837,8 +998,170 @@ def _prd_row(
         followup_open=tuple(
             Followup(m.task_id, m.attribution.hops) for m in open_members if not m.attribution.direct
         ),
-        ready=_ready_age([member for member in members if member.segment is Segment.READY], now),
+        ready=_ready_age([member for member in members if member.segment is Segment.READY],
+                         context.now),
+        activity=RowActivity(
+            direct=sum(member.attribution.direct for member in recent),
+            followup=sum(not member.attribution.direct for member in recent),
+        ),
     )
+
+
+def _lanes(rows: Sequence[PrdRow]) -> tuple[LaneEntry, ...]:
+    return tuple(
+        LaneEntry(lane, tuple(row.key for row in rows if row.lane is lane))
+        for lane in LANE_DISPLAY_ORDER
+    )
+
+
+# ---------------------------------------------------------------------------
+# Lanes: what a PRD needs (§4.8)
+# ---------------------------------------------------------------------------
+
+
+class MemberHold(enum.StrEnum):
+    """Whether an open member is held by a recorded trigger, and if not, why not."""
+
+    HELD_DEFERRAL = 'held_deferral'
+    HELD_MILESTONE = 'held_milestone'
+    UNRECORDED_DEFERRAL = 'unrecorded_deferral'
+    PLANNING_BIRTH = 'planning_birth'
+    DEFERRAL_NEEDS_HUMAN = 'deferral_needs_human'
+    MALFORMED_MILESTONE = 'malformed_milestone'
+    NOT_HELD = 'not_held'
+
+
+_HOLDING = frozenset({MemberHold.HELD_DEFERRAL, MemberHold.HELD_MILESTONE})
+_MILESTONE_HOLDS: Mapping[MilestoneStatus, MemberHold] = MappingProxyType({
+    MilestoneStatus.NONE: MemberHold.NOT_HELD,
+    MilestoneStatus.UNFIRED: MemberHold.HELD_MILESTONE,
+    MilestoneStatus.FIRED: MemberHold.NOT_HELD,
+    MilestoneStatus.MALFORMED: MemberHold.MALFORMED_MILESTONE,
+})
+_DEFERRAL_KEY = 'deferral'
+
+
+@dataclass(frozen=True, slots=True)
+class RulingRef:
+    """What a PRD awaits a ruling on: a pending level-2 escalation, or an actionable gate."""
+
+    task_id: int
+    escalation_id: str | None
+
+    def to_wire(self) -> dict[str, object]:
+        return {'task_id': self.task_id, 'escalation_id': self.escalation_id}
+
+
+@dataclass(frozen=True, slots=True)
+class _LaneFacts:
+    """What one PRD's lane is decided from."""
+
+    ruling_refs: tuple[RulingRef, ...]
+    signal: SignalMark
+    holds: tuple[MemberHold, ...]
+    recently_active: bool
+    in_progress: bool
+
+
+_LANE_TESTS: Mapping[Lane, Callable[[_LaneFacts], bool]] = MappingProxyType({
+    Lane.RULING: lambda facts: bool(facts.ruling_refs),
+    Lane.TAIL: lambda facts: facts.signal is SignalMark.DELIVERED,
+    Lane.PARKED: lambda facts: all(hold in _HOLDING for hold in facts.holds),
+    Lane.MOVING: lambda facts: facts.recently_active or facts.in_progress,
+    Lane.STUCK: lambda facts: True,
+})
+
+
+def _lane_of(facts: _LaneFacts) -> Lane:
+    return next(lane for lane in LANE_PRECEDENCE if _LANE_TESTS[lane](facts))
+
+
+def _ruling_refs(open_members: Sequence[_Member], context: _RowContext) -> tuple[RulingRef, ...]:
+    """The open members' pending level-2 escalations, then their actionable gates."""
+    escalated = [
+        RulingRef(member.task_id, escalation_id)
+        for member in open_members
+        for escalation_id in context.escalations.get(member.task_id, ())
+    ]
+    gates = [
+        RulingRef(member.task_id, None)
+        for member in open_members
+        if _actionable_gate(member, context)
+    ]
+    return (*escalated, *gates)
+
+
+def _actionable_gate(member: _Member, context: _RowContext) -> bool:
+    """A human gate that can be ruled on now: no milestone to wait for, blocked or deps met."""
+    metadata = _metadata_of(member.row)
+    if member.row is None or not is_human_gate(metadata):
+        return False
+    if milestone_status(metadata, context.now) in _UNDISPATCHABLE_MILESTONES:
+        return False
+    status = context.status_map[member.task_id]
+    return status == TaskStatus.BLOCKED or (
+        status == TaskStatus.PENDING and _dependencies_met(member.row, context.status_map)
+    )
+
+
+def _member_hold(member: _Member, context: _RowContext) -> MemberHold:
+    metadata = _metadata_of(member.row)
+    status = context.status_map[member.task_id]
+    if status == TaskStatus.DEFERRED:
+        record = parse_record(metadata.get(_DEFERRAL_KEY))
+        return _deferral_hold(record, member.task_id, context)
+    if status == TaskStatus.PENDING:
+        return _MILESTONE_HOLDS[milestone_status(metadata, context.now)]
+    return MemberHold.NOT_HELD
+
+
+def _deferral_hold(
+    record: Deferral | InvalidRecord | None, task_id: int, context: _RowContext,
+) -> MemberHold:
+    """A deferred member's hold, by ``shared.task_deferral.needs_human`` over the store."""
+    if record is None:
+        return MemberHold.UNRECORDED_DEFERRAL
+    if isinstance(record, PlanningDeferral):
+        return MemberHold.PLANNING_BIRTH
+    verdict = needs_human(
+        record,
+        context.now,
+        _carrier_status(record, context.status_map),
+        context.liveness.get(task_id),
+    )
+    caller_kind = not isinstance(record, InvalidRecord) and record.kind in CALLER_KINDS
+    return MemberHold.HELD_DEFERRAL if caller_kind and verdict is None else (
+        MemberHold.DEFERRAL_NEEDS_HUMAN
+    )
+
+
+def _carrier_status(
+    record: Deferral | InvalidRecord, status_map: Mapping[int, str],
+) -> TaskStatus | None:
+    if not isinstance(record, CarriedByDeferral):
+        return None
+    status = status_map.get(record.carrier_task_id)
+    return None if status is None else TaskStatus(status)
+
+
+def _recently_active(member: _Member, context: _RowContext) -> bool:
+    """Started or finished in the window; a done member with no completion event by its stamp."""
+    activity = context.activity
+    if _in_window(activity.started.get(member.task_id), context.now):
+        return True
+    completed = activity.completed.get(member.task_id)
+    if completed is not None:
+        return _in_window(completed, context.now)
+    entry = context.entries.get(member.task_id)
+    return (
+        member.segment is Segment.DONE
+        and entry is not None
+        and _in_window(entry.done_stamped_at, context.now)
+    )
+
+
+def _in_window(at: datetime | None, now: datetime) -> bool:
+    return at is not None and now - at <= _MOVING_WINDOW
 
 
 def _ready_age(ready: Sequence[_Member], now: datetime) -> ReadyAge:
