@@ -344,7 +344,9 @@ class TestMcpToolCallInvalidatesOnHang:
     TimeoutError from its own wait_for and never invalidated at all).
     """
 
+    @virtual_clock_test
     async def test_cancellation_invalidates_the_cached_session(self):
+        """Runs on shared/src/shared/testing_virtual_clock.py::virtual_clock_test."""
         from dashboard.data.memory import _get_session, _sessions, mcp_tool_call
 
         deadline_seconds = 0.05
