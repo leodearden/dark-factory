@@ -81,8 +81,7 @@ from typing import Any
 # measures a stale spelling of the thing it claims to measure, and would keep
 # reporting a reassuring zero after the code it audits had changed underneath
 # it. Any drift now surfaces as an ImportError, not as a wrong number.
-_SRC = Path(__file__).resolve().parent.parent / 'src'
-if str(_SRC) not in sys.path:
+if str(_SRC := Path(__file__).resolve().parent.parent / 'src') not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 # The SHIPPED pagination engine and the SHIPPED population definition. The
@@ -97,7 +96,7 @@ if str(_SRC) not in sys.path:
 # the probe defines no attribute by that name. That is how a future author
 # re-growing a private census helper gets caught. The alias also makes it
 # unambiguous at the call site that the SHIPPED helper is the one running.
-from fused_memory.backends.graphiti_client import (  # noqa: E402
+from fused_memory.backends.graphiti_client import (
     _ALL_VALID_EDGES_MATCH,
     _DEFAULT_READ_PAGE_SIZE,
     _MAX_READ_PAGES,
@@ -108,12 +107,12 @@ from fused_memory.backends.graphiti_client import (  # noqa: E402
     INCOMPLETE_STRUCTURAL_REFUSAL,
     _paged_ro_query,
 )
-from fused_memory.backends.graphiti_client import (  # noqa: E402
+from fused_memory.backends.graphiti_client import (
     _census_count as _shipped_census_count,
 )
 
 # The shipped regex and the guard whose recall this probe measures.
-from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (  # noqa: E402
+from fused_memory.reconciliation.status_snapshot_extraction import (
     _ENUM_PREP_WORD_RE,
     PLURAL_ENUM_SNAPSHOT_RE,
     _enumeration_is_prepositional_complement,
@@ -398,7 +397,7 @@ CANDIDATE_NAMES: tuple[str, ...] = ('shipped', 'a', 'b')
 def extract_plural_ids(fact: str, *, candidate: str = 'shipped') -> set[int]:
     """Ids the PLURAL path yields for *fact* under the named guard.
 
-    Delegates to the sweep module's own ``_plural_enum_ids``, passing the
+    Delegates to the extraction module's own ``_plural_enum_ids``, passing the
     candidate guard in — it does NOT re-implement the arm. That is the same
     argument the import block at the top of this file makes about the regex
     and the guard, applied one step further out: a hand-copied arm keeps
@@ -1857,14 +1856,15 @@ def render_markdown(report: Report) -> str:
         'Simulating over the live corpus can only ever move a fact the regex '
         'ALREADY matched, so when the regex matches nothing this table is '
         'necessarily all zeroes — that is the finding, not an omission. The '
-        'independent corroboration runs against the sweep suite\'s full pinned '
-        'precision parametrization, mechanically, in:',
+        'independent corroboration runs against the extraction suite\'s full '
+        'pinned precision parametrization, mechanically, in:',
         '',
         f'    {report.revalidation_test}',
         '',
         'That gate parametrizes over the shared pinned corpora in '
-        '`fused-memory/tests/reconciliation/plural_enum_shapes.py`, which the '
-        'sweep suite parametrizes off too, so a shape appended there '
+        '`fused-memory/tests/reconciliation/plural_enum_shapes.py`, which '
+        '`fused-memory/tests/reconciliation/test_status_snapshot_extraction.py` '
+        'parametrizes off too, so a shape appended there '
         're-validates both candidates automatically.',
         '',
         '## Enumeration coverage',

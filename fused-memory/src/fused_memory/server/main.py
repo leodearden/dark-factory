@@ -573,15 +573,13 @@ async def run_server():
     await memory_service.initialize()
 
     # Initialize write journal
+    from fused_memory.services.journal_retention import prune_every_table_at_startup
     from fused_memory.services.mem0_write_retry import (
         DEFAULT_MEM0_RETRY_POLICY,
         run_periodic_mem0_retry,
     )
     from fused_memory.services.write_journal import WriteJournal
-    from fused_memory.services.write_ops_retention import (
-        prune_write_ops_pass,
-        run_periodic_write_ops_prune,
-    )
+    from fused_memory.services.write_ops_retention import run_periodic_write_ops_prune
 
     wj_data_dir = Path(config.reconciliation.data_dir) if config.reconciliation else Path('./data')
     write_journal = WriteJournal(wj_data_dir)
@@ -596,40 +594,10 @@ async def run_server():
     _mem0_recovery = await memory_service.recover_mem0_intents()
     logger.info(f'mem0 intent recovery at startup: {_mem0_recovery}')
 
-    # Bounded retention: age out old terminal mem0_intents so the write-ahead
-    # journal does not grow without bound (one row accrues per successful mem0
-    # write). Runs after recovery so no still-pending intent is ever pruned;
-    # 'dead' dead-letters are preserved for manual replay. Fire-and-forget.
-    _mem0_pruned = await write_journal.prune_mem0_intents()
-    if _mem0_pruned:
-        logger.info(f'mem0 intent retention prune at startup: {_mem0_pruned} rows')
-
-    # Bounded retention: age out old idempotent_ops so the client-idempotency
-    # key table does not grow without bound (one row accrues per mutating task
-    # write). An idempotency key only needs to outlive the transport-retry
-    # window it guards, so the default TTL is aggressive. Fire-and-forget.
-    _idempotent_pruned = await write_journal.prune_idempotent_ops()
-    if _idempotent_pruned:
-        logger.info(
-            f'idempotent_ops retention prune at startup: {_idempotent_pruned} rows'
-        )
-
-    # Bounded retention: age out old write_ops so the journal does not grow
-    # without bound. UNLIKE its two siblings above this prune is BATCHED,
-    # ROW-BUDGETED and DEADLINE-BOUNDED: write_ops was measured at 35.4M rows /
-    # 16 GB, and an unbounded DELETE here would hold the write lock past the
-    # watchdog's 120 s startup grace (STARTUP_GRACE_SECS in
-    # scripts/orchestrator-watchdog.py) while silently dropping journal rows —
-    # log_write_op swallows its own errors and busy_timeout is only 5000 ms — so
-    # it would corrupt the very telemetry it is pruning. The periodic loop
-    # started below now carries the drain, not successive restarts; this pass
-    # catches up after downtime, and every partial pass discloses its backlog at
-    # WARNING. Fire-and-forget.
-    _write_ops_pruned = await prune_write_ops_pass(write_journal, config.write_journal)
-    if _write_ops_pruned:
-        logger.info(
-            f'write_ops retention prune at startup: {_write_ops_pruned} rows'
-        )
+    # Must follow mem0 intent recovery, so no still-pending intent is pruned.
+    _pruned = await prune_every_table_at_startup(write_journal, config.write_journal)
+    if any(_pruned.values()):
+        logger.info(f'write journal retention prune at startup: {_pruned}')
 
     # Initialize task backend (SqliteTaskBackend).
     taskmaster = None
@@ -818,6 +786,7 @@ async def run_server():
             burst_cooldown_seconds=config.reconciliation.burst_cooldown_seconds,
             stale_lock_seconds=config.reconciliation.stale_lock_seconds,
             queue_stats_fn=memory_service.durable_queue.get_stats if memory_service.durable_queue else None,
+            coalesce_task_events=config.reconciliation.coalesce_task_events,
         )
         await event_buffer.initialize()
 

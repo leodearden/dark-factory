@@ -138,10 +138,10 @@ async def inspect_systemd_unit(
         # a grandchild inheriting the stdout pipe) would otherwise strand
         # the caller identically to task 2087's signature. This process is
         # NOT spawned with start_new_session=True (unlike
-        # DeterministicRunner._default_run_script's), so it shares the
-        # orchestrator's own process group — killing via
-        # `_terminate_process_tree`'s `os.killpg` would risk a
-        # self-inflicted SIGKILL. A direct `proc.kill()` is sufficient: a
+        # orchestrator/src/orchestrator/before_done_script.py::run_script's), so
+        # it shares the orchestrator's own process group — killing via
+        # orchestrator/src/orchestrator/before_done_script.py::terminate_process_tree's
+        # `os.killpg` would risk a self-inflicted SIGKILL. A direct `proc.kill()` is sufficient: a
         # plain `systemctl show` isn't expected to fork grandchildren the
         # way a deploy script can.
         with contextlib.suppress(ProcessLookupError, OSError):

@@ -212,9 +212,9 @@ def _call_wait_budget(call: ast.Call, visible: Mapping[str, float]) -> float:
     (``is_asyncio_wait_for_call``), ``_await_outcome(...)`` (whose hidden default is ``MERGE_RESULT_TIMEOUT``
     when no ``timeout=`` kwarg is given), ``wait_responsive(...)``
     (task 3980), billed by ``_wait_responsive_budget`` as an unconditional
-    upper bound on its wall clock, and the ``_stop_worker(...)`` teardown,
-    whose join is billed its ``join_timeout=`` kwarg or hidden default
-    ``STOP_WORKER_JOIN_TIMEOUT``. Within a recognised shape, a named value
+    upper bound on its wall clock, and the ``stop_merge_worker(...)`` teardown
+    (``_merge_worker_drive.py::stop_merge_worker``), whose join is billed its
+    ``join_timeout=`` kwarg or hidden default ``STOP_WORKER_JOIN_TIMEOUT``. Within a recognised shape, a named value
     resolves through *visible* (the scanned module's numeric constants, else
     ``_KNOWN_WAIT_CONSTANTS``, never a name the method rebinds) and a value
     the scan cannot read bills ``math.inf`` (``_resolve_wait_value``), so a
@@ -239,7 +239,7 @@ def _call_wait_budget(call: ast.Call, visible: Mapping[str, float]) -> float:
         return _resolve_wait_value(timeout, visible)
     if isinstance(func, ast.Name) and func.id == 'wait_responsive':
         return _wait_responsive_budget(call, visible)
-    if isinstance(func, ast.Name) and func.id == '_stop_worker':
+    if isinstance(func, ast.Name) and func.id == 'stop_merge_worker':
         join_timeout = _keyword(call, 'join_timeout')
         if join_timeout is None:
             return STOP_WORKER_JOIN_TIMEOUT

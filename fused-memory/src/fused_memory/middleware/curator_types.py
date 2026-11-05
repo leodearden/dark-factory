@@ -20,16 +20,14 @@ from fused_memory.utils.clip_disclosure import elide_text
 class CuratorFailureError(RuntimeError):
     """Raised when the curator's LLM call fails and cannot be salvaged.
 
-    The curator no longer degrades silently to ``action='create'`` on LLM
-    errors; instead the interceptor translates this into an L1 escalation or
-    a hard failure at the MCP boundary so operators notice breakage.
+    The curator does not degrade silently to ``action='create'`` on LLM
+    errors; ``TaskCurator._failure_decision`` reports this to the escalator,
+    which files an L1 escalation, and decides the candidate.
 
     Attaches ``timed_out``, ``duration_ms``, ``subtype``, ``schema_tool_denied``,
     and ``cost_usd`` from the underlying ``AgentResult`` so
-    :class:`CuratorEscalator` can surface them in the L1 escalation detail and
-    so the bisecting fallback in
-    :meth:`TaskCurator._call_llm_batch_with_fallback` can branch on the
-    failure subtype without leaking the underlying ``AgentResult`` outside
+    :class:`CuratorEscalator` can surface them in the L1 escalation detail
+    without the ``AgentResult`` leaking outside
     :meth:`TaskCurator._invoke_curator`, whose failures
     ``task_curator.py::_failure_error`` maps to this one error.
     Defaults make the attributes safe to read even when the failure
@@ -114,7 +112,7 @@ class CandidateTask:
     files_to_modify: list[str] = field(default_factory=list)
     priority: str = DEFAULT_PRIORITY
     spawned_from: str | None = None  # task id of the review-chain anchor
-    spawn_context: str = 'manual'  # review | steward-triage | planning | manual
+    spawn_context: str = 'manual'  # review | steward-triage | planning | agent_followup | manual
     # metadata.execution_class ('code_tdd' | 'operational' | 'decision' | None) —
     # consulted by operational_ask_registry.match_candidate. Its routing axis
     # (task 2687) is DEMOTED (task δ): a tagged operational/decision candidate is
@@ -199,8 +197,8 @@ class CuratorDecision:
     pool_sizes: dict[str, int] = field(default_factory=dict)
     latency_ms: int = 0
     cost_usd: float = 0.0
-    # Set only by curate_batch when a candidate is a duplicate of another
-    # candidate in the same batch (neither yet materialised as a task).
+    # Set only by TaskCurator.curate_prepared when a candidate is a duplicate
+    # of another candidate in the same batch (neither yet materialised as a task).
     # The worker substitutes the sibling's resulting task_id at dispatch time.
     batch_target_index: int | None = None
     # True for a fail-open create that no dedupe judgement stands behind: the
@@ -276,6 +274,22 @@ class PreparedCandidate:
     withheld: PoolWithheld | None = None
     corpus_error: str | None = None
 
+    @classmethod
+    def corpus_failed(cls, candidate: CandidateTask, error: str) -> PreparedCandidate:
+        """The bundle of a candidate whose corpus could not be assembled.
+
+        It costs no prompt tokens: the pipeline defers it ``corpus-failed``
+        without ever rendering it into a prompt.
+        """
+        return cls(
+            candidate=candidate,
+            pool=[],
+            pool_sizes=empty_pool_sizes(),
+            prompt_tokens=0,
+            withheld=PoolWithheld(),
+            corpus_error=error,
+        )
+
 
 @dataclass(frozen=True)
 class PoolWithheld:
@@ -289,13 +303,15 @@ class PoolWithheld:
     ``create`` or ``combine`` as if the pool were complete.
 
     ``by_source`` counts the eligible entries each cap excluded, keyed by the
-    stream that lost them (``module`` / ``embedding`` / ``dependency``) plus
+    stream that lost them (``sibling`` / ``module`` / ``embedding`` /
+    ``dependency``) plus
     ``total_cap`` for the final ``task_curator.py::_trim_pool`` pass. ``caps``
     carries the configured limits that produced those counts, so a reader can
     tell a pool one entry over its cap from one that lost forty.
 
-    The ``module`` and ``dependency`` counts are corpus-exhaustive — both
-    streams scan every task. The ``embedding`` count is NOT: it is taken over
+    The ``module``, ``sibling`` and ``dependency`` counts are
+    corpus-exhaustive — module and dependency scan every task, and sibling
+    counts come from an exact store lookup. The ``embedding`` count is NOT: it is taken over
     a fixed qdrant retrieval window (``pool_embedding_cap + 20`` points), so
     at most 20 neighbours can ever be reported however many near-duplicates
     the corpus holds. A stream whose count is ceilinged that way is named in
@@ -350,7 +366,8 @@ class PoolWithheld:
         return block
 
 
-POOL_SOURCES: Final = ('anchor', 'module', 'embedding', 'dependency')
+# Strongest-first; task_curator.py::_trim_pool drops in the reverse order.
+POOL_SOURCES: Final = ('anchor', 'sibling', 'module', 'embedding', 'dependency')
 
 
 def empty_pool_sizes() -> dict[str, int]:

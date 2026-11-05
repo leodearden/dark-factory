@@ -57,6 +57,7 @@ from orchestrator.workflow import (
     StewardResolved,
     StewardTerminalDecision,
     TaskWorkflow,
+    TerminalReport,
     WorkflowOutcome,
     WorkflowState,
 )
@@ -870,7 +871,7 @@ class TestReviewLoop:
             async def _architect(self, cwd: Path) -> AgentResult:
                 """On re-plan, add a new step to address the review feedback."""
                 nonlocal review_round
-                task_dir = TaskArtifacts(cwd).root
+                task_dir = TaskArtifacts(cwd).task_root
                 plan_path = task_dir / 'plan.json'
 
                 if plan_path.exists():
@@ -952,26 +953,12 @@ class TestReviewLoop:
 @pytest.mark.asyncio
 @pytest.mark.mocks_dry_run_unblock
 class TestBaseCommitDiff:
-    """Verify review uses base_commit diff, not moving main ref."""
+    """The creation-time base_commit is stored, and the diff primitive honours a given base."""
 
     async def test_worktree_base_commit_written_to_artifacts(
         self, config, git_ops, task_assignment, monkeypatch
     ):
-        """Verify that create_worktree's base_commit flows to artifacts.init().
-
-        This test verifies the fix for: "Reviewers receive empty diff, rubber-stamp PASS"
-
-        The bug occurred when:
-        1. Worktree A is created based on main at SHA M1
-        2. While A runs, another task B merges to main (advancing main to M2)
-        3. In review, workflow called get_diff_from_main() using `git diff main...HEAD`
-        4. Since main now points to M2, the diff would be empty
-        5. Reviewers would see no changes and rubber-stamp PASS
-
-        The fix: workflow captures base_commit=main's SHA at worktree creation,
-        passes it to artifacts.init() to persist, then reads it during review
-        and uses get_diff_from_base(worktree, base_commit) instead.
-        """
+        """create_worktree's base_commit flows to artifacts.init() and is stored as a full SHA."""
 
         class MinimalStub(AgentStub):
             async def _architect(self, cwd: Path) -> AgentResult:
@@ -1003,8 +990,6 @@ class TestBaseCommitDiff:
             )),
         )
 
-        # Verify pre-condition: main advancing would normally cause empty diff
-        # But we verify base_commit is captured and stored
         await workflow.run()
 
         # Either way the workflow completes, we can verify base_commit was stored
@@ -1013,17 +998,10 @@ class TestBaseCommitDiff:
             assert stored is not None, "base_commit should have been stored"
             assert len(stored) == 40, f"base_commit should be 40-char SHA, got {stored!r}"
 
-    async def test_review_uses_base_commit_diff(
+    async def test_diff_from_base_keeps_branch_changes_when_main_advances(
         self, config, git_ops, task_assignment, monkeypatch
     ):
-        """Verify get_diff_from_base returns branch changes when main advances.
-
-        This is the critical test for the fix - simulates the scenario where:
-        1. Worktree is created based on main at SHA M1
-        2. Branch makes changes
-        3. Another task advances main to M2
-        4. get_diff_from_base must still return branch changes (not empty)
-        """
+        """get_diff_from_base from the creation base still shows the branch's changes after main advances."""
         # Create worktree and capture the base_commit
         worktree_info = await git_ops.create_worktree('df-review-test')
         base_commit = worktree_info.base_commit
@@ -1041,9 +1019,6 @@ class TestBaseCommitDiff:
         diff_from_base = await git_ops.get_diff_from_base(worktree_info.path, base_commit)
         assert 'branch_change.py' in diff_from_base, \
             f"get_diff_from_base should return branch changes after main advances, got: {diff_from_base[:200]}"
-
-        # Verify the old method might return empty/different (proves base_commit needed)
-        # Note: we don't assert on this as behavior varies by git merge topology
 
 
 # ---------------------------------------------------------------------------
@@ -1130,7 +1105,7 @@ class TestBlastRadiusExpansion:
                 plan = dict(PLAN)
                 plan['files'] = ['lib.py', 'test_lib.py']  # wider than assigned ['lib']
                 plan['_schema_version'] = 1
-                task_dir = TaskArtifacts(cwd).root
+                task_dir = TaskArtifacts(cwd).task_root
                 task_dir.mkdir(parents=True, exist_ok=True)
                 (task_dir / 'plan.json').write_text(json.dumps(plan, indent=2) + '\n')
                 return AgentResult(success=True, output='Plan created', cost_usd=0.50)
@@ -1162,7 +1137,7 @@ class TestBlastRadiusExpansion:
                 plan = dict(PLAN)
                 plan['files'] = ['lib.py', 'locked_module.py']
                 plan['_schema_version'] = 1
-                task_dir = TaskArtifacts(cwd).root
+                task_dir = TaskArtifacts(cwd).task_root
                 task_dir.mkdir(parents=True, exist_ok=True)
                 (task_dir / 'plan.json').write_text(json.dumps(plan, indent=2) + '\n')
                 return AgentResult(success=True, output='Plan created', cost_usd=0.50)
@@ -1953,7 +1928,7 @@ class TestCorruptedIterationLogEscalation:
                 result = await super()._architect(cwd)
                 # Inject a corrupted iteration log line so the orchestrator
                 # finds it when it reads the log before the first implementer call
-                log_path = TaskArtifacts(cwd).root / 'iterations.jsonl'
+                log_path = TaskArtifacts(cwd).artifact_path('iterations.jsonl')
                 log_path.write_text(r'{"bad\!escape": true}' + '\n')
                 return result
 
@@ -2092,6 +2067,13 @@ class TestDoneIsTerminal:
 # ---------------------------------------------------------------------------
 
 
+class _ReviewArmRun(NamedTuple):
+    report: TerminalReport
+    scheduler: FakeScheduler
+    queue: EscalationQueue
+    reviewer_calls: int
+
+
 @pytest.mark.asyncio
 @pytest.mark.mocks_dry_run_unblock
 class TestReviewerErrors:
@@ -2223,6 +2205,130 @@ class TestReviewerErrors:
         # comprehensive reviewer was called twice (initial fail + retry success)
         assert call_counts['reviewer_comprehensive'] == 2
 
+    async def _run_with_reviewer_result(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path,
+        reviewer_result: AgentResult, *, retries: int = 2,
+    ) -> _ReviewArmRun:
+        config.max_reviewer_retries = retries
+        config.reviewer_stagger_secs = 0.0
+        reviewer_calls: list[str] = []
+
+        class FixedReviewerStub(AgentStub):
+            def _reviewer(self, role: str, output_schema: dict | None) -> AgentResult:
+                reviewer_calls.append(role)
+                return reviewer_result
+
+        stub = FixedReviewerStub()
+        workflow, scheduler, queue = _build_workflow_with_escalation(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+        report = await workflow.run()
+        return _ReviewArmRun(report, scheduler, queue, len(reviewer_calls))
+
+    async def test_server_error_requeues_without_retry_burn_or_escalation(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path
+    ):
+        run = await self._run_with_reviewer_result(
+            config, git_ops, task_assignment, monkeypatch, tmp_path,
+            AgentResult(
+                success=False, output='API Error: 529 Overloaded',
+                api_error_status=529, structured_output=None,
+            ),
+        )
+
+        tid = task_assignment.task_id
+        assert run.report.outcome == WorkflowOutcome.REQUEUED
+        assert run.report.api_error_status == 529
+        assert 'agent API error: HTTP 529' in run.report.reason
+        assert run.reviewer_calls == 1
+        assert 'pending' in run.scheduler.statuses.get(tid, [])
+        assert 'blocked' not in run.scheduler.statuses.get(tid, [])
+        assert run.queue.get_by_task(tid) == []
+
+    async def test_zero_work_requeues_after_free_in_phase_retries(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path
+    ):
+        run = await self._run_with_reviewer_result(
+            config, git_ops, task_assignment, monkeypatch, tmp_path,
+            AgentResult(
+                success=False, output='Agent produced no output',
+                subtype='error_empty_output', transcript_turns=0,
+            ),
+        )
+
+        tid = task_assignment.task_id
+        assert run.report.outcome == WorkflowOutcome.REQUEUED
+        assert run.report.api_error_status is None
+        assert run.reviewer_calls == 3
+        assert 'blocked' not in run.scheduler.statuses.get(tid, [])
+        assert run.queue.get_by_task(tid) == []
+
+    async def test_productive_kill_blocks(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path
+    ):
+        run = await self._run_with_reviewer_result(
+            config, git_ops, task_assignment, monkeypatch, tmp_path,
+            AgentResult(
+                success=False, output='Agent produced no output',
+                subtype='error_empty_output', transcript_turns=40,
+            ),
+        )
+
+        assert run.report.outcome == WorkflowOutcome.BLOCKED
+
+    async def test_turn_cap_blocks_naming_the_cap(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path
+    ):
+        run = await self._run_with_reviewer_result(
+            config, git_ops, task_assignment, monkeypatch, tmp_path,
+            AgentResult(
+                success=False, output='', subtype='error_max_turns',
+                turns=31, cost_usd=2.6,
+            ),
+        )
+
+        assert run.report.outcome == WorkflowOutcome.BLOCKED
+        assert 'turn cap' in run.report.reason
+        assert 'infrastructure' not in run.report.reason.lower()
+        l0_summaries = [
+            e.summary for e in run.queue.get_by_task(task_assignment.task_id, level=0)
+        ]
+        assert any('turn cap' in summary for summary in l0_summaries)
+
+    async def test_budget_cap_blocks_naming_the_cap(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path
+    ):
+        run = await self._run_with_reviewer_result(
+            config, git_ops, task_assignment, monkeypatch, tmp_path,
+            AgentResult(
+                success=False, output='', subtype='error_max_budget_usd',
+                turns=24, cost_usd=5.07,
+            ),
+        )
+
+        assert run.report.outcome == WorkflowOutcome.BLOCKED
+        assert 'budget' in run.report.reason
+        assert 'infrastructure' not in run.report.reason.lower()
+
+    async def test_completed_run_without_verdict_blocks(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path
+    ):
+        run = await self._run_with_reviewer_result(
+            config, git_ops, task_assignment, monkeypatch, tmp_path,
+            AgentResult(success=True, output='looks fine', structured_output=None),
+        )
+
+        assert run.report.outcome == WorkflowOutcome.BLOCKED
+        assert 'without a usable verdict' in run.report.reason
+
 
 # ---------------------------------------------------------------------------
 # Tests: Ghost-Loop Guard (stale worktree false positive)
@@ -2293,7 +2399,7 @@ class TestGhostLoopGuard:
         # 1. Create worktree and simulate prior implementation
         wt_info = await git_ops.create_worktree(task_assignment.task_id)
         wt = wt_info.path
-        task_dir = TaskArtifacts(wt).root
+        task_dir = TaskArtifacts(wt).lane_root
         task_dir.mkdir(parents=True, exist_ok=True)
         (task_dir / 'plan.json').write_text(json.dumps(PLAN, indent=2) + '\n')
 
@@ -2522,7 +2628,7 @@ class StringPrereqsArchitectStub(AgentStub):
     """AgentStub subclass that writes a plan with plain-string prerequisites."""
 
     async def _architect(self, cwd: Path) -> AgentResult:
-        task_dir = TaskArtifacts(cwd).root
+        task_dir = TaskArtifacts(cwd).task_root
         task_dir.mkdir(parents=True, exist_ok=True)
         bad_plan = {
             'task_id': '42',
@@ -2620,7 +2726,7 @@ class TestPlanFinalizeMarker:
 
         class CappedAfterFinalizeStub(AgentStub):
             async def _architect(self, cwd: Path) -> AgentResult:
-                task_dir = TaskArtifacts(cwd).root
+                task_dir = TaskArtifacts(cwd).task_root
                 task_dir.mkdir(parents=True, exist_ok=True)
                 plan = dict(PLAN)  # PLAN carries _finalized_at
                 plan['_schema_version'] = 1
@@ -2664,7 +2770,7 @@ class TestPlanFinalizeMarker:
 
         class CappedBeforeFinalizeStub(AgentStub):
             async def _architect(self, cwd: Path) -> AgentResult:
-                task_dir = TaskArtifacts(cwd).root
+                task_dir = TaskArtifacts(cwd).task_root
                 task_dir.mkdir(parents=True, exist_ok=True)
                 plan = {k: v for k, v in PLAN.items() if k != '_finalized_at'}
                 plan['_schema_version'] = 1
@@ -2707,7 +2813,7 @@ class TestPlanFinalizeMarker:
 
         class SuccessNoFinalizeStub(AgentStub):
             async def _architect(self, cwd: Path) -> AgentResult:
-                task_dir = TaskArtifacts(cwd).root
+                task_dir = TaskArtifacts(cwd).task_root
                 task_dir.mkdir(parents=True, exist_ok=True)
                 plan = {k: v for k, v in PLAN.items() if k != '_finalized_at'}
                 plan['_schema_version'] = 1
@@ -3104,7 +3210,7 @@ class TestMarkBlockedFalseDoneGuard:
 
         workflow.merge_queue = asyncio.Queue()
         with patch(
-            'orchestrator.merge_lane.worker.enqueue_merge_request', _fake_enqueue,
+            'orchestrator.merge_lane.intake.enqueue_merge_request', _fake_enqueue,
         ):
             outcome = await workflow._submit_to_merge_queue(
                 task_assignment.task_id, pre_rebased=False, merge_phase=True,
@@ -3173,7 +3279,7 @@ class TestMarkBlockedFalseDoneGuard:
 
         workflow.merge_queue = asyncio.Queue()
         with patch(
-            'orchestrator.merge_lane.worker.enqueue_merge_request', _fake_enqueue,
+            'orchestrator.merge_lane.intake.enqueue_merge_request', _fake_enqueue,
         ):
             outcome = await workflow._submit_to_merge_queue(
                 task_assignment.task_id, pre_rebased=False, merge_phase=True,
@@ -3241,7 +3347,7 @@ class TestMarkBlockedFalseDoneGuard:
 
         workflow.merge_queue = asyncio.Queue()
         with patch(
-            'orchestrator.merge_lane.worker.enqueue_merge_request', _fake_enqueue,
+            'orchestrator.merge_lane.intake.enqueue_merge_request', _fake_enqueue,
         ):
             outcome = await workflow._submit_to_merge_queue(
                 task_assignment.task_id, pre_rebased=False, merge_phase=True,
@@ -4023,7 +4129,7 @@ class TestRecoverIfAlreadyMerged:
         # 1. Create worktree and write an implementer iteration entry
         wt_info = await git_ops.create_worktree(task_assignment.task_id)
         wt = wt_info.path
-        task_dir = TaskArtifacts(wt).root
+        task_dir = TaskArtifacts(wt).lane_root
         task_dir.mkdir(parents=True, exist_ok=True)
 
         # 1a. Capture base_commit BEFORE making the implementation commit and
@@ -4716,7 +4822,7 @@ class TestRecoverIfAlreadyMerged:
         # 1. Create worktree, stamp implementer entry, commit + merge to main
         wt_info = await git_ops.create_worktree(task_assignment.task_id)
         wt = wt_info.path
-        task_dir = TaskArtifacts(wt).root
+        task_dir = TaskArtifacts(wt).lane_root
         task_dir.mkdir(parents=True, exist_ok=True)
 
         # Capture base_commit BEFORE the implementation commit and stamp metadata.json
@@ -5054,12 +5160,12 @@ class TestRedispatchIterationLogHygiene:
         iterations.jsonl silently survives across re-dispatch — the exact
         signature behind the task 2125/2315/2340 false-DONE recurrence.
         """
-        # 1. Pre-seed the sibling .task-meta/<task_id> root — the exact
+        # 1. Pre-seed both .task-meta roots of the task — the exact
         #    location a prior, since-abandoned dispatch would have left
         #    behind — with an OLD (fake) base_commit and a stale iteration
         #    log entry, BEFORE the workflow creates its own fresh worktree.
         worktree_path_to_be = git_ops.worktree_base / task_assignment.task_id
-        stale_artifacts = TaskArtifacts(worktree_path_to_be)
+        stale_artifacts = TaskArtifacts.for_task(worktree_path_to_be, task_assignment.task_id)
         old_base = 'f' * 40
         stale_artifacts.init(
             task_assignment.task_id, task_assignment.task['title'],
@@ -5105,12 +5211,12 @@ class TestRedispatchIterationLogHygiene:
         """
         # 1. The fresh worktree's base_commit will be the current main tip
         #    (no remote configured — _freshen_main falls back to local main).
-        #    Seed the sibling .task-meta/<task_id> root with THAT SAME sha as
+        #    Seed both .task-meta roots of the task with THAT SAME sha as
         #    the OLD base_commit, so create_worktree's fresh base matches it
         #    exactly (same-base crash-resume, not a re-dispatch).
         main_sha = await git_ops.get_main_sha()
         worktree_path_to_be = git_ops.worktree_base / task_assignment.task_id
-        stale_artifacts = TaskArtifacts(worktree_path_to_be)
+        stale_artifacts = TaskArtifacts.for_task(worktree_path_to_be, task_assignment.task_id)
         stale_artifacts.init(
             task_assignment.task_id, task_assignment.task['title'],
             task_assignment.task['description'], base_commit=main_sha,
@@ -5218,7 +5324,7 @@ class TestRunPrePlanRecovery:
         # 1. Create worktree, stamp implementer entry, commit + merge to main
         wt_info = await git_ops.create_worktree(task_assignment.task_id)
         wt = wt_info.path
-        task_dir = TaskArtifacts(wt).root
+        task_dir = TaskArtifacts(wt).lane_root
         task_dir.mkdir(parents=True, exist_ok=True)
         (task_dir / 'plan.json').write_text(json.dumps(PLAN, indent=2) + '\n')
         (task_dir / 'iterations.jsonl').write_text(
@@ -5672,10 +5778,10 @@ class TestEscalatePlanOverwriteMessage:
 
         # Manually initialise artifacts (normally done inside workflow.run)
         workflow.artifacts = TaskArtifacts(tmp_path)
-        workflow.artifacts.root.mkdir(parents=True, exist_ok=True)
+        workflow.artifacts.task_root.mkdir(parents=True, exist_ok=True)
 
         # plan.json exists but has no _session_id
-        plan_path = workflow.artifacts.root / 'plan.json'
+        plan_path = workflow.artifacts.artifact_path('plan.json')
         plan_path.write_text(json.dumps({'steps': [{'description': 'x'}]}))
 
         workflow._escalate_plan_overwrite()
@@ -5696,9 +5802,9 @@ class TestEscalatePlanOverwriteMessage:
         workflow.session_id = 'sess-current'
 
         workflow.artifacts = TaskArtifacts(tmp_path)
-        workflow.artifacts.root.mkdir(parents=True, exist_ok=True)
+        workflow.artifacts.task_root.mkdir(parents=True, exist_ok=True)
 
-        plan_path = workflow.artifacts.root / 'plan.json'
+        plan_path = workflow.artifacts.artifact_path('plan.json')
         plan_path.write_text(json.dumps({
             '_session_id': 'sess-foreign',
             'steps': [{'description': 'x'}],
@@ -5789,7 +5895,7 @@ class TestAmendOverwriteHaltsLoop:
         async def _amend_overwrites_plan(in_scope, amendment_round):
             amend_calls.append(amendment_round)
             assert workflow.artifacts is not None
-            plan_path = workflow.artifacts.root / 'plan.json'
+            plan_path = workflow.artifacts.artifact_path('plan.json')
             data = json.loads(plan_path.read_text())
             data['_session_id'] = 'foreign-session'
             plan_path.write_text(json.dumps(data))

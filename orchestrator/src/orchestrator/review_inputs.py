@@ -2,7 +2,7 @@
 
 Production (``workflow.py::TaskWorkflow._review``) and the reviewer trial
 (``evals/reviewer_trial/runner.py``) both call this module, so the trial
-scores the inputs production gathers. Callers pass the main branch and the
+scores the inputs production gathers. Callers pass the review base and the
 conventions path; nothing here reads config.
 """
 
@@ -26,18 +26,6 @@ from orchestrator.agents.review_briefing import (
 logger = logging.getLogger(__name__)
 
 _GIT_TIMEOUT_SECS = 120.0
-
-
-async def review_fork_point(checkout: Path, main_branch: str) -> str | None:
-    """Where HEAD forked from *main_branch*, derived now; ``None`` when git cannot say.
-
-    Re-derived at use time rather than read from a write-once stored base,
-    which goes stale once main is merged into the branch (task 5695).
-    """
-    result = await run_git(
-        ['git', 'merge-base', 'HEAD', main_branch], cwd=checkout, timeout=_GIT_TIMEOUT_SECS,
-    )
-    return result.stdout if result.ok and result.stdout else None
 
 
 async def collect_review_change(checkout: Path, base: str) -> ReviewChange:

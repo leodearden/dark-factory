@@ -375,6 +375,19 @@ class Mem0BackendConfig(BaseModel):
 
     qdrant_url: str = Field(default='http://localhost:6333')
     collection_prefix: str = Field(default='fused')
+    persist_history: bool = Field(
+        default=True,
+        description=(
+            'When False, mem0 keeps its change history in a private in-memory '
+            'SQLite DB that dies with the instance, instead of the '
+            'process-shared $MEM0_DIR/history.db. For tests and scratch runs, '
+            'where the shared file is xdist-contended or read-only in the '
+            'sandbox; leave it True in production, because out-of-band readers '
+            'such as fused-memory/scripts/build_write_triage_v2_soak_baseline.py '
+            'read the shared file. Restart-only: Mem0Backend reads it once, '
+            'when it creates the instance for a project.'
+        ),
+    )
 
 
 # --- Routing ---
@@ -446,10 +459,11 @@ class QueueConfig(BaseModel):
 # --- Write journal ---
 
 class WriteJournalConfig(BaseModel):
-    """Retention horizons and prune budgets for the ``write_ops`` journal.
+    """Retention horizons and prune budgets for the write journal's tables.
 
-    RESTART-ONLY BY CONSTRUCTION. The prune runs at startup and every
-    ``prune_interval_seconds`` (``services/write_ops_retention.py``), and both
+    RESTART-ONLY BY CONSTRUCTION. Every table with a horizon is pruned once at
+    startup (``services/journal_retention.py``) and ``write_ops`` again every
+    ``prune_interval_seconds`` (``services/write_ops_retention.py``); both
     capture this section once at startup, so nothing re-reads it afterwards.
     ``config/reload.py::RELOADABLE_FIELDS`` is an opt-in allowlist and this
     section is deliberately absent from it, which makes a changed leaf report
@@ -472,7 +486,8 @@ class WriteJournalConfig(BaseModel):
     #: (task 3214), both of which evaluate over trailing baseline windows.
     search_retention_days: float = Field(default=365.0, gt=0)
     #: Writes — the durable audit trail joined by ``causation_id``; 0.73% of
-    #: volume, so a long horizon costs essentially nothing.
+    #: volume, so a long horizon costs essentially nothing. Also governs
+    #: ``backend_ops``, the Layer-2 half of each write.
     write_retention_days: float = Field(default=730.0, gt=0)
     #: Rows deleted per transaction. Each batch commits separately so the
     #: write lock is released between batches, which makes one batch the
@@ -480,16 +495,22 @@ class WriteJournalConfig(BaseModel):
     #: that in the ``write_journal`` block of ``fused-memory/config/config.yaml``.
     prune_batch_size: int = Field(default=500, gt=0)
     #: Ceiling on one sweep. A backlog drains over successive passes and each
-    #: partial run says so at WARNING.
+    #: partial run says so at WARNING. The startup sweep shares it across
+    #: ``write_ops`` and ``backend_ops``.
     prune_max_rows_per_run: int = Field(default=500_000, gt=0)
     #: Wall-clock ceiling on one sweep, checked between batches. This is the
     #: bound that actually matters: the watchdog's startup grace is a TIME
-    #: budget, and rows-per-second is not knowable in advance.
+    #: budget, and rows-per-second is not knowable in advance. The startup
+    #: sweep shares it across ``write_ops`` and ``backend_ops``.
     prune_max_seconds: float = Field(default=30.0, gt=0)
     #: Seconds between background prune passes, each bounded by the same
     #: ``prune_max_seconds`` / ``prune_max_rows_per_run``. The sizing basis is
     #: in the ``write_journal`` block of ``fused-memory/config/config.yaml``.
     prune_interval_seconds: float = Field(default=1800.0, gt=0)
+    #: ``referent_findings``, a diagnosis log whose reader (the phase-5 replay
+    #: pass) re-verifies every row against the live graph, so a long horizon
+    #: loses nothing.
+    referent_findings_retention_days: float = Field(default=365.0, gt=0)
 
     @model_validator(mode='after')
     def _validate_search_outlives_reads(self) -> 'WriteJournalConfig':
@@ -875,10 +896,10 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
        ``eval worktree``) at ``min_phrase_hits=2``, so a note that merely
        named the eval worktree in both spellings scored 2 and was blocked
        with no plan-tools / venv / shadowing content in it at all. This is
-       the same defect class the no-nesting invariant test guards
-       (``test_no_seeded_phrase_nests_inside_another_in_the_same_cluster``)
+       the same defect class the one-occurrence invariant test guards
+       (``test_no_two_seeded_phrases_can_share_one_occurrence``)
        but it slips past that test, because the two spellings are siblings
-       rather than one nesting inside the other. The matcher-level fix --
+       that no single occurrence holds together. The matcher-level fix --
        counting spelling variants of one concept once -- is task 4179 and
        is deliberately NOT part of this seed.
 
@@ -1137,10 +1158,13 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
             # ("Default 2 so a single incidental keyword never triggers a
             # false block"). Omitting them costs zero coverage: every corpus
             # entry containing a flag-suffixed form also contains bare
-            # 'ruff format'. The hazard is generic to the matcher rather than
-            # special to this seed, so the guarding invariant test (no phrase
-            # nests inside another in the same cluster) is asserted over ALL
-            # seeded clusters, not just this one.
+            # 'ruff format'. The rule is wider than nesting: no two phrases
+            # may share one occurrence, which also covers one phrase's end
+            # overlapping another's start on a whole word: bare 'format-clean'
+            # beside 'ruff format' would let 'ruff format-clean' score 2 hits.
+            # The hazard is generic to the matcher rather than special to
+            # this seed, so test_no_two_seeded_phrases_can_share_one_occurrence
+            # asserts it over ALL seeded clusters, not just this one.
             #
             # GENERIC-TOKEN EXCLUSIONS (the venv-shadowing over-match lesson
             # -- see this module's seed docstring): 'lint_command',
@@ -1180,7 +1204,7 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
                 'ruff check',
                 'enforced gate',
                 'enforced lint gate',
-                'format-clean',
+                'not format-clean',
             ],
             min_phrase_hits=2,
             hint=(
@@ -1280,7 +1304,7 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
             # single occurrence would score three distinct hits and satisfy
             # min_phrase_hits alone. Same hazard as 'ruff format --check'
             # above; asserted over ALL clusters by
-            # test_no_seeded_phrase_nests_inside_another_in_the_same_cluster.
+            # test_no_two_seeded_phrases_can_share_one_occurrence.
             #
             # THREE ACCEPTED RESIDUALS, all PINNED by positive tests so a
             # future tuner can tell them from a regression:
@@ -1443,6 +1467,9 @@ class ReconciliationConfig(BaseModel):
     # Buffer triggers
     buffer_size_threshold: int = Field(default=10)
     max_staleness_seconds: int = Field(default=1800)
+    # Task 4278 (recon lever 3): fold repeat task events per task at push time.
+    # Restart-only: EventBuffer captures it at construction.
+    coalesce_task_events: bool = Field(default=True)
 
     # WP-B: fire-and-forget in-memory event queue sits in front of the
     # SQLite event buffer on the MCP write path. Capacity bounds how many
@@ -2201,17 +2228,23 @@ class ReconciliationConfig(BaseModel):
         default_factory=lambda: ['orchestrator'],
         description=(
             'Resolved-caller prefixes permitted to record a `deterministic-*` '
-            'done provenance (PRD C5). The orchestrator sends no agent_id, so '
-            'server/tools.py::_resolve_identity falls back to the '
-            'clientInfo.name the orchestrator advertises '
-            '(orchestrator/src/orchestrator/mcp_lifecycle.py::ORCHESTRATOR_MCP_IDENTITY, '
-            'sent by shared/src/shared/mcp_session.py::McpSession.initialize) '
-            "— the literal 'orchestrator', which is why that is the "
+            'done provenance (PRD C5). orchestrator/src/orchestrator/scheduler.py'
+            '::Scheduler.set_task_status sends agent_id='
+            "'orchestrator' explicitly "
+            '(orchestrator/src/orchestrator/mcp_lifecycle.py::ORCHESTRATOR_MCP_IDENTITY), '
+            'because fused-memory serves stateless HTTP, where a tools/call '
+            'session never receives an InitializeRequest and '
+            'fused-memory/src/fused_memory/server/tools.py::_resolve_identity '
+            'has no clientInfo to fall '
+            "back to — which is why 'orchestrator' is the "
             'sole default. DENY-ON-MISSING is the consumer contract: a caller '
             'matching no prefix is refused, and an EMPTY list denies every '
             'caller (the live kill switch for the provenance kind). The '
-            'finished one-shot scripts/cgl_eta_finalize_gate.py (clientInfo '
-            "'cgl-sched-gate') is deliberately NOT in the default — it has "
+            'finished one-shot fused-memory/scripts/cgl_eta_finalize_gate.py '
+            '(which sends no agent_id; its clientInfo is '
+            "'cgl-sched-gate', advertised by "
+            'fused-memory/scripts/cgl_eta_scheduler_gate.py::McpClient) is '
+            'deliberately NOT in the default — it has '
             'already run, and shipping a retired caller in an allowlist is how '
             'an allowlist stops meaning anything. NOTE: the identity this bar '
             'reads is SELF-REPORTED, so it deters a cooperating caller rather '
@@ -2313,7 +2346,7 @@ class CuratorConfig(BaseModel):
     # 8 leaves headroom for harder combine-vs-create decisions.
     max_turns: int = Field(default=8, ge=3)
 
-    # Corpus caps — see design notes in shared/docs (the four-stream pool).
+    # Corpus caps — see design notes in shared/docs (the pool streams).
     #
     # Re-tuned by task 5397 against the ``pool_truncated`` census
     # (``curator_types.py::PoolWithheld``) and the decisions the curator took
@@ -2340,8 +2373,8 @@ class CuratorConfig(BaseModel):
     # dependency entries first, then the embedding tail, leaving
     # 29 - 1 - 20 = 8 embedding entries. The floor is 5: ranks 1-5 held 41 of
     # the embedding stream's 42 targets, so a module cap leaving fewer than 5
-    # would cut measured targets. A pool whose module stream fits the old cap
-    # of 15 keeps every stream at its cap.
+    # would cut measured targets. A sibling-free pool whose module stream fits
+    # the old cap of 15 keeps every stream at its cap.
     #
     # The trade: the worst-case pool is unchanged, so cost and batch fan-in at
     # the maximum are unchanged too. Input is ~4.7K + ~930 tokens per entry; a
@@ -2357,11 +2390,26 @@ class CuratorConfig(BaseModel):
     # The sample is two days and 86 decisions, hence a token-neutral step. The
     # module figures predate task 6708's active-only module stream.
     #
+    # The sample also predates task 6227's sibling stream (pool_sibling_cap
+    # below). The trim cuts siblings only after the module stream, so with the
+    # module stream full each sibling costs one embedding entry: s siblings
+    # leave 8 - s. The floor of 5 therefore holds up to 3 siblings, the
+    # per-parent p90 measured for that cap, and not at its p99 of 4.
+    #
     # ``test_config_schema.py::TestCuratorPoolCaps`` pins these relationships.
     pool_module_cap: int = Field(default=20)
     pool_embedding_cap: int = Field(default=10)
     pool_dependency_cap: int = Field(default=3)
     pool_total_cap: int = Field(default=29)
+    # Caps the sibling stream (task 6227): an agent-followup candidate's
+    # non-cancelled tasks that share its metadata.spawned_from. 10 comes from
+    # the live store, measured 2026-10-30: 1,406 agent_followup parents, 2,140
+    # follow-ups, 484 parents with more than one; non-cancelled per parent p90
+    # 3, p99 4, max 11; one parent exceeds 10. Siblings count toward
+    # pool_total_cap but are trimmed after every stream except the anchor, so
+    # none is ever cut while 1 + pool_sibling_cap <= pool_total_cap
+    # (``test_config_schema.py::TestCuratorSiblingCap``). 0 disables the stream.
+    pool_sibling_cap: int = Field(default=10, ge=0)
 
     # COARSE FALLBACK ONLY — this is not the depth the curator normally uses.
     # Module-pool keys must match the *scheduler's* lock_depth to be
@@ -2415,13 +2463,12 @@ class CuratorConfig(BaseModel):
     # single_call_budget_cap_usd — 4x headroom. batch_token_threshold stays at
     # 50K deliberately: it is what holds a multi-candidate batch under that
     # same flat per-call ceiling, so easing batch fan-in is the soft threshold
-    # working as designed, not a regression to patch. Easier fan-in did carry
-    # one real cost — a batch that lands at size 1 takes
-    # ``task_curator.py::TaskCurator.curate_batch_prepared``'s short-circuit,
-    # which used to DISCARD the already-built corpus and reassemble it
-    # (get_tasks over the whole tree + an embedder call + a qdrant query).
-    # That path now hands the prepared bundle to ``curate``, so a smaller
-    # batch no longer costs a rebuild.
+    # working as designed, not a regression to patch. Easier fan-in once
+    # carried one real cost — a batch that landed at size 1 used to DISCARD
+    # the already-built corpus and reassemble it (get_tasks over the whole
+    # tree + an embedder call + a qdrant query). The prepared bundle now flows
+    # through ``task_curator.py::TaskCurator.curate_prepared`` at every batch
+    # size, so a smaller batch costs no rebuild.
     entry_description_chars: int = Field(default=2000, ge=1)
     entry_details_chars: int = Field(default=1500, ge=1)
 
@@ -2923,7 +2970,9 @@ class WriteTriageConfig(BaseModel):
             'calibration/write_triage_judge_field_chars_report.md. Bounded ge=1 '
             'because a zero cap would elide every field to nothing and show the '
             'model empty records. Green-tier hot-reloadable, read live per '
-            'middle-band write.'
+            'middle-band write. The same cap bounds a contesting child\'s text '
+            'in grouped search and get_memory_by_id reads '
+            '(server/grouped_read.py::_digest_entry).'
         ),
     )
     judge_accuracy_report_path: str | None = Field(

@@ -887,6 +887,13 @@ def tracked_python_files(root: Path) -> tuple[str, ...]:
     return tracked_files(root, '*.py')
 
 
+def blob_sha(path: Path) -> str:
+    """Git's blob id of *path*'s content on disk, equal to its index entry when committed and unmodified."""
+    if not path.is_file():
+        raise MetricsError(f'{path}: no such file, so it has no blob id')
+    return _git_output(path.parent, 'hash-object', '--', path.name).strip()
+
+
 # ---------------------------------------------------------------------------
 # The workspace domain: each member's tracked .py files, classified.
 

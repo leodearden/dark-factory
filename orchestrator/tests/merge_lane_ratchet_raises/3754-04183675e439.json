@@ -1,0 +1,18 @@
+{
+  "task_id": "3754",
+  "reason": "Net-additive coverage (task 3754, review finding on heuristic 10): new TestGateReFireIsBounded::test_gating_record_filed_after_the_wait_parks_with_l1 in test_workflow_merge_gating_strand.py pins the merge-entry single-shot still_gating re-check in TaskWorkflow._handle_merge_gate_escalations, which had no live test after the widened wait tail moved the chained-L2 case onto the _HumanHandoff arm. It reaches the same workflow seams the file's sibling tests use (_steward_factory, _run_merge_phase, _steward, and a _wait_for_resolution wrapper beside _time_the_wait): +5 private reads, no production code changed.",
+  "measures": [
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_workflow_merge_gating_strand.py",
+      "baseline": 43,
+      "current": 48
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6430,
+      "current": 6435
+    }
+  ]
+}

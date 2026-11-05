@@ -18,6 +18,7 @@ import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 
 import staleness from '../../src/dashboard/static/redux/endpoint_staleness.js';
+import pollScope from '../../src/dashboard/static/redux/poll_scope.js';
 
 const REDUX = '../../src/dashboard/static/redux/';
 const LOAD_CHAIN = [
@@ -25,7 +26,9 @@ const LOAD_CHAIN = [
 ].map(name => REDUX + name);
 
 function loadSystemHealth() {
-  globalThis.window = { DF_ENDPOINT_STALENESS: staleness, dispatchEvent() {} };
+  globalThis.window = {
+    DF_ENDPOINT_STALENESS: staleness, DF_POLL_SCOPE: pollScope, dispatchEvent() {},
+  };
   const require = createRequire(import.meta.url);
   for (const specifier of LOAD_CHAIN) delete require.cache[require.resolve(specifier)];
   const [datumApi, , bannerApi, readingsApi, healthApi] = LOAD_CHAIN.map(specifier => require(specifier));
@@ -170,6 +173,12 @@ test('taskStore: per-root failures are amber, the sub naming each notice kind an
 test('taskStore: an unmeasured done count alone is amber', () => {
   const row = taskStoreHealth(tasksData({ TASKS_COUNT_UNKNOWN_PROJECTS: ['c'], TASKS_PROJECT_COUNT: 4 }));
   assert.equal(row.sub, 'count-unknown');
+  assert.equal(healthTone(row), 'warn');
+});
+
+test('taskStore: a stale done count alone is amber', () => {
+  const row = taskStoreHealth(tasksData({ TASKS_COUNT_STALE_PROJECTS: ['c'], TASKS_PROJECT_COUNT: 4 }));
+  assert.equal(row.sub, 'count-stale');
   assert.equal(healthTone(row), 'warn');
 });
 

@@ -14,6 +14,7 @@ from typing import Any
 from shared.safe_io import atomic_write_text
 
 from .measurement import MeasurementStage, UnmeasuredCause, UnmeasuredRecord
+from .metrics import RoleUnderTest
 
 logger = logging.getLogger(__name__)
 
@@ -135,8 +136,16 @@ def _invocation_errors_from_marker(metrics: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
+def _role_under_test_from_legacy(metrics: dict[str, Any]) -> dict[str, Any]:
+    """A pre-6738 roleless cell as the run_eval implementer cell it was (PRD §7 D3)."""
+    stored = metrics.get('role_under_test')
+    role = RoleUnderTest.IMPLEMENTER if stored is None else RoleUnderTest(stored)
+    return {**metrics, 'role_under_test': role}
+
+
 LEGACY_METRIC_RULES: tuple[Callable[[dict[str, Any]], dict[str, Any]], ...] = (
     _invocation_errors_from_marker,
+    _role_under_test_from_legacy,
 )
 
 

@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from _orch_helpers import HermeticMcpSession
 from _recording_event_store import _RecordingEventStore
 from shared.locking import directory_locks
 from shared.task_metadata_wire import coerce_task_metadata
@@ -24,10 +25,16 @@ from orchestrator.config import (
 from orchestrator.evals.runner import _StubMcpSession
 from orchestrator.event_store import EventType
 from orchestrator.fm_retry import fm_retry_backoffs
+from orchestrator.lock_table import ModuleLockTable
+from orchestrator.pause_policy import (
+    HaltNotPermittedError,
+    PauseClass,
+    PausePolicy,
+    policy_for,
+)
 from orchestrator.scheduler import (
     BlastRadiusResult,
     ExternalResolverError,
-    ModuleLockTable,
     Scheduler,
     SchedulerCallbacks,
     TickContext,
@@ -3192,9 +3199,10 @@ class TestFairness:
         # H's park on m1 blocks ALL other tasks (including shadowed L).
         assert not scheduler.lock_table.try_acquire('X', ['m1'])   # stranger blocked
         assert not scheduler.lock_table.try_acquire('L', ['m1'])   # shadowed L blocked (INV-2)
-        # L's park on m2 remains active — H cannot acquire m2.
+        # L's park on m2 remains active: it blocks a parkless task, and H,
+        # which outranks it, passes it (task 7799, INV-8).
         assert not scheduler.lock_table.try_acquire('Y', ['m2'])   # L's active park
-        assert not scheduler.lock_table.try_acquire('H', ['m2'])   # H cannot acquire L's m2
+        assert scheduler.lock_table.park_owners_blocking('H', ['m2']) == []
 
         # L's skip_count was NOT cleared by preemption.
         assert scheduler._skip_count['L'] == 3
@@ -4966,15 +4974,18 @@ class TestBlastRadiusRefinement:
         assert lt.try_acquire(
             'other', ['crates/reify-compiler/src/conformance.rs']
         )
-        # 936 can't expand; since update_task → set_task_status hit MCP,
-        # patch scheduler methods to no-ops for this assertion scope.
-        scheduler.update_task = AsyncMock(return_value=True)  # type: ignore[method-assign]
-        scheduler.set_task_status = AsyncMock(return_value=None)  # type: ignore[method-assign]
-        ok = await scheduler.handle_blast_radius_expansion(
-            '936',
-            current=['crates/reify-compiler/src/lib.rs'],
-            needed=['crates/reify-compiler/src/conformance.rs'],
-        )
+        # 936 can't expand; since get_task, update_task and set_task_status
+        # hit MCP, stub all three for this assertion scope.
+        with (
+            patch.object(scheduler, 'get_task', AsyncMock(return_value={'id': '936'})),
+            patch.object(scheduler, 'update_task', AsyncMock(return_value=True)),
+            patch.object(scheduler, 'set_task_status', AsyncMock(return_value=None)),
+        ):
+            ok = await scheduler.handle_blast_radius_expansion(
+                '936',
+                current=['crates/reify-compiler/src/lib.rs'],
+                needed=['crates/reify-compiler/src/conformance.rs'],
+            )
         assert ok.applied is False
         # Full release ran: 936 should no longer hold anything
         assert '936' not in lt._held
@@ -8273,15 +8284,70 @@ class TestSchedulerPause:
         return scheduler
 
     def test_pause_sets_is_paused_and_reason(self, scheduler: Scheduler):
-        scheduler.pause('parked-threshold')
+        scheduler.pause('parked-threshold', PauseClass.PARK_STOP)
         assert scheduler.is_paused is True
         assert scheduler.pause_reason == 'parked-threshold'
 
     def test_resume_clears_pause(self, scheduler: Scheduler):
-        scheduler.pause('parked-threshold')
+        scheduler.pause('parked-threshold', PauseClass.PARK_STOP)
         scheduler.resume()
         assert scheduler.is_paused is False
         assert scheduler.pause_reason is None
+
+    def test_pause_records_its_class(self, scheduler: Scheduler):
+        scheduler.pause('cost_ceiling_orch_exceeded', PauseClass.COST_CEILING)
+        assert scheduler.is_paused is True
+        assert scheduler.pause_class is PauseClass.COST_CEILING
+
+    def test_resume_clears_the_class(self, scheduler: Scheduler):
+        scheduler.pause('cost_ceiling_orch_exceeded', PauseClass.COST_CEILING)
+        scheduler.resume()
+        assert scheduler.pause_class is None
+
+    def test_second_pause_keeps_the_original_class(self, scheduler: Scheduler):
+        scheduler.pause('cost_ceiling_orch_exceeded', PauseClass.COST_CEILING)
+        scheduler.pause('operator halt', PauseClass.OPERATOR)
+        assert scheduler.pause_class is PauseClass.COST_CEILING
+        assert scheduler.pause_reason == 'cost_ceiling_orch_exceeded'
+
+    def test_snapshot_reports_the_pause_class(self, scheduler: Scheduler):
+        scheduler.pause('cost_ceiling_orch_exceeded', PauseClass.COST_CEILING)
+        assert scheduler.get_state_snapshot().pause_class == 'cost_ceiling'
+        scheduler.resume()
+        assert scheduler.get_state_snapshot().pause_class is None
+
+    @staticmethod
+    def _refusing_ewa_rate(pause_class: PauseClass) -> PausePolicy:
+        policy = policy_for(pause_class)
+        if pause_class is PauseClass.EWA_RATE:
+            return dataclasses.replace(policy, may_halt=False)
+        return policy
+
+    def test_a_class_the_policy_refuses_is_never_held(self):
+        scheduler = Scheduler(
+            OrchestratorConfig(max_per_module=1),
+            pause_policy_lookup=self._refusing_ewa_rate,
+        )
+
+        with pytest.raises(HaltNotPermittedError, match='ewa_rate'):
+            scheduler.pause('digest halt', PauseClass.EWA_RATE)
+
+        assert scheduler.is_paused is False
+        assert scheduler.pause_reason is None
+        assert scheduler.pause_class is None
+
+    def test_a_refused_class_is_refused_even_over_an_existing_hold(self):
+        scheduler = Scheduler(
+            OrchestratorConfig(max_per_module=1),
+            pause_policy_lookup=self._refusing_ewa_rate,
+        )
+        scheduler.pause('operator halt', PauseClass.OPERATOR)
+
+        with pytest.raises(HaltNotPermittedError):
+            scheduler.pause('digest halt', PauseClass.EWA_RATE)
+
+        assert scheduler.pause_class is PauseClass.OPERATOR
+        assert scheduler.pause_reason == 'operator halt'
 
     @pytest.mark.asyncio
     async def test_acquire_next_returns_none_when_paused(self, scheduler: Scheduler):
@@ -8303,7 +8369,7 @@ class TestSchedulerPause:
         scheduler.release('1')
 
         # Now pause and confirm acquire_next returns None.
-        scheduler.pause('test')
+        scheduler.pause('test', PauseClass.OPERATOR)
         result_paused = await scheduler.acquire_next()
         assert result_paused is None, (
             f'Expected None while paused; got {result_paused}'
@@ -8334,7 +8400,7 @@ class TestSchedulerPause:
 
         # After pause — snapshot must reflect the paused state.
         reason = 'park-stop: 3 tasks parked in 1h'
-        scheduler.pause(reason)
+        scheduler.pause(reason, PauseClass.PARK_STOP)
         snap_paused = scheduler.get_state_snapshot()
         assert snap_paused.is_paused is True, (
             f"Expected is_paused=True after pause; got {snap_paused.is_paused!r}"
@@ -8546,10 +8612,10 @@ class TestParkStopTrip:
         scheduler = Scheduler(config)
         scheduler.finish_startup()
 
-        callback_args: list[str] = []
+        callback_args: list[tuple[str, PauseClass]] = []
 
-        async def recording_callback(reason: str) -> None:
-            callback_args.append(reason)
+        async def recording_callback(reason: str, pause_class: PauseClass) -> None:
+            callback_args.append((reason, pause_class))
 
         scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_park_stop_trip=recording_callback)
         mock = AsyncMock(return_value={})
@@ -8564,8 +8630,10 @@ class TestParkStopTrip:
         assert len(callback_args) == 1, (
             f'Expected callback called once; got {len(callback_args)}'
         )
+        assert scheduler.pause_class is PauseClass.PARK_STOP
+        reason, pause_class = callback_args[0]
+        assert pause_class is PauseClass.PARK_STOP
         # Reason must reference the trip parameters.
-        reason = callback_args[0]
         assert re.search(r'3', reason), f'Reason must mention threshold count: {reason!r}'
         assert re.search(r'1\.0', reason), f'Reason must mention window hours: {reason!r}'
 
@@ -8583,7 +8651,7 @@ class TestParkStopTrip:
 
         callback_count = [0]
 
-        async def counting_callback(reason: str) -> None:
+        async def counting_callback(reason: str, pause_class: PauseClass) -> None:
             callback_count[0] += 1
 
         scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_park_stop_trip=counting_callback)
@@ -8593,7 +8661,7 @@ class TestParkStopTrip:
         # Pause manually before the third transition reaches the threshold.
         await scheduler.set_task_status('1', 'blocked')
         await scheduler.set_task_status('2', 'blocked')
-        scheduler.pause('manual')  # already paused; trip check should be suppressed
+        scheduler.pause('manual', PauseClass.OPERATOR)  # already paused; trip check should be suppressed
         await scheduler.set_task_status('3', 'blocked')
         await asyncio.sleep(0)
 
@@ -8625,7 +8693,7 @@ class TestParkStopTrip:
 
         callback_count = [0]
 
-        async def counting_callback(reason: str) -> None:
+        async def counting_callback(reason: str, pause_class: PauseClass) -> None:
             callback_count[0] += 1
 
         scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_park_stop_trip=counting_callback)
@@ -8671,10 +8739,10 @@ class TestParkStopTrip:
 
         callback_args: list[str] = []
 
-        async def recording_callback(reason: str) -> None:
+        async def recording_callback(reason: str, pause_class: PauseClass) -> None:
             # Mirror harness.pause_scheduler shape: call scheduler.pause()
             # so any concurrent guard check sees _paused=True immediately.
-            scheduler.pause(reason)
+            scheduler.pause(reason, pause_class)
             callback_args.append(reason)
 
         scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_park_stop_trip=recording_callback)
@@ -8721,11 +8789,11 @@ class TestParkStopTrip:
 
         callback_count = [0]
 
-        async def trip_callback(reason: str) -> None:
+        async def trip_callback(reason: str, pause_class: PauseClass) -> None:
             callback_count[0] += 1
             # Mirror harness.pause_scheduler — scheduler.pause is idempotent
             # because the synchronous latch already set _paused=True.
-            scheduler.pause(reason)
+            scheduler.pause(reason, pause_class)
 
         scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_park_stop_trip=trip_callback)
         mock = AsyncMock(return_value={})
@@ -8775,7 +8843,7 @@ class TestParkStopDisabled:
 
         callback_count = [0]
 
-        async def recording_callback(reason: str) -> None:
+        async def recording_callback(reason: str, pause_class: PauseClass) -> None:
             callback_count[0] += 1
 
         scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_park_stop_trip=recording_callback)
@@ -11098,7 +11166,7 @@ class TestAcquireNextDepBackfillFromGetStatuses:
     @pytest.fixture
     def scheduler(self) -> Scheduler:
         config = OrchestratorConfig(max_per_module=1)
-        scheduler = Scheduler(config)
+        scheduler = Scheduler(config, mcp_session=HermeticMcpSession())
         scheduler.finish_startup()
         return scheduler
 
@@ -12925,6 +12993,83 @@ class TestConsultAlreadyLanded:
         assert {call.args[0] for call in gate.await_args_list} == {'Z', 'Y'}
         assert all(call.kwargs['tick_view'] is None for call in gate.await_args_list)
         assert any(record.levelname == 'WARNING' for record in caplog.records)
+
+    async def test_the_pending_escalations_are_read_once_after_the_view_and_threaded(self):
+        """Task 8073: one store read per consult, whatever the candidate count."""
+        reads: list[str] = []
+        snapshot = {'B': []}
+
+        async def read_view() -> AlreadyLandedTickView:
+            reads.append('view')
+            return AlreadyLandedTickView(local_branches=frozenset())
+
+        async def read_escalations() -> dict:
+            reads.append('escalations')
+            return snapshot
+
+        async def gate(task_id: str, **kwargs) -> bool:
+            reads.append(f'gate:{task_id}')
+            return False
+
+        scheduler = Scheduler(
+            OrchestratorConfig(max_per_module=1),
+            callbacks=SchedulerCallbacks(
+                read_already_landed_tick_view=read_view,
+                read_pending_escalations_by_task=read_escalations,
+            ),
+        )
+        scheduler.finish_startup()
+        spy = AsyncMock(side_effect=gate)
+        scheduler._already_landed_gate = spy
+        candidates = [_pending_task(tid) for tid in ('A', 'B', 'C')]
+
+        await scheduler._consult_already_landed(candidates)
+
+        assert reads == ['view', 'escalations', 'gate:A', 'gate:B', 'gate:C']
+        assert all(
+            call.kwargs['pending_escalations'] is snapshot for call in spy.await_args_list
+        )
+
+    async def test_without_an_escalation_reader_the_gate_reads_per_candidate(self):
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler.finish_startup()
+        gate = AsyncMock(return_value=False)
+        scheduler._already_landed_gate = gate
+
+        await scheduler._consult_already_landed([_pending_task('Z')])
+
+        (call,) = gate.await_args_list
+        assert call.kwargs['pending_escalations'] is None
+
+    async def test_a_raising_escalation_reader_fails_open_to_per_candidate_reads(
+        self, caplog,
+    ):
+        caplog.set_level('WARNING')
+        view = AlreadyLandedTickView(local_branches=frozenset())
+        scheduler = Scheduler(
+            OrchestratorConfig(max_per_module=1),
+            callbacks=SchedulerCallbacks(
+                read_already_landed_tick_view=AsyncMock(return_value=view),
+                read_pending_escalations_by_task=AsyncMock(
+                    side_effect=OSError('escalation queue dir unreadable'),
+                ),
+            ),
+        )
+        scheduler.finish_startup()
+        gate = AsyncMock(side_effect=lambda task_id, **_: task_id == 'Z')
+        scheduler._already_landed_gate = gate
+
+        result = await scheduler._consult_already_landed(
+            [_pending_task('Z'), _pending_task('Y')]
+        )
+
+        assert result == {'Z'}
+        assert all(call.kwargs['pending_escalations'] is None for call in gate.await_args_list)
+        assert all(call.kwargs['tick_view'] is view for call in gate.await_args_list)
+        assert any(
+            record.levelname == 'WARNING' and 'pending escalation snapshot' in record.getMessage()
+            for record in caplog.records
+        )
 
     async def test_without_a_gate_the_tick_view_is_not_read(self):
         reader = AsyncMock(return_value=AlreadyLandedTickView(local_branches=frozenset()))

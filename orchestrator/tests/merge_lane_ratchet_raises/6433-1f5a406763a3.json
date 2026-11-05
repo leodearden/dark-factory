@@ -1,0 +1,84 @@
+{
+  "task_id": "6433",
+  "reason": "instrument correction, not new coupling: the lane patch-target measure now resolves an object-form patch (patch.object / monkeypatch.setattr) through a merge_lane SUBMODULE bound by 'from orchestrator.merge_lane import <sub>', 'import orchestrator.merge_lane.<sub> as x' or the spelled chain, under the same '<sub>.<name>' leaf the string-path form already had. No test or lane code changed; the newly counted rows were already patching those lookup sites.",
+  "measures": [
+    {
+      "measure": "patch_targets",
+      "key": "orchestrator/tests/test_branch_work_landed.py",
+      "baseline": 0,
+      "current": 1
+    },
+    {
+      "measure": "patch_targets",
+      "key": "orchestrator/tests/test_merge_boundary_effective_module_configs.py",
+      "baseline": 1,
+      "current": 2
+    },
+    {
+      "measure": "patch_targets",
+      "key": "orchestrator/tests/test_merge_disposition.py",
+      "baseline": 0,
+      "current": 1
+    },
+    {
+      "measure": "patch_targets",
+      "key": "orchestrator/tests/test_merge_gates.py",
+      "baseline": 3,
+      "current": 4
+    },
+    {
+      "measure": "patch_targets",
+      "key": "orchestrator/tests/test_merge_gates_equivalence.py",
+      "baseline": 0,
+      "current": 1
+    },
+    {
+      "measure": "patch_targets",
+      "key": "orchestrator/tests/test_merge_gates_git_probes.py",
+      "baseline": 0,
+      "current": 1
+    },
+    {
+      "measure": "patch_targets",
+      "key": "orchestrator/tests/test_merge_queue_build_chain.py",
+      "baseline": 0,
+      "current": 1
+    },
+    {
+      "measure": "patch_targets",
+      "key": "orchestrator/tests/test_merge_queue_deep_integration_gate.py",
+      "baseline": 1,
+      "current": 2
+    },
+    {
+      "measure": "patch_targets",
+      "key": "orchestrator/tests/test_merge_queue_deep_landing.py",
+      "baseline": 1,
+      "current": 2
+    },
+    {
+      "measure": "patch_targets",
+      "key": "orchestrator/tests/test_merge_queue_single_writer_asserts.py",
+      "baseline": 0,
+      "current": 1
+    },
+    {
+      "measure": "patch_targets",
+      "key": "orchestrator/tests/test_merge_queue_verify_retry.py",
+      "baseline": 0,
+      "current": 4
+    },
+    {
+      "measure": "patch_targets",
+      "key": "orchestrator/tests/test_verify_runner.py",
+      "baseline": 0,
+      "current": 1
+    },
+    {
+      "measure": "total:patch_targets",
+      "key": "<cluster>",
+      "baseline": 56,
+      "current": 65
+    }
+  ]
+}

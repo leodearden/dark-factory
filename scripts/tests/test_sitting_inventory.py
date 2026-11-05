@@ -313,6 +313,22 @@ class TestQueueTag:
             assert re.fullmatch(r'[a-z0-9]*', mod.queue_tag(queue))
 
 
+class TestQueueProjectRoots:
+    def test_maps_each_queue_to_its_folded_project_root(self, tmp_path, df_root):
+        reify = tmp_path / 'src' / 'reify'
+        (reify / 'data' / 'escalations').mkdir(parents=True)
+        reify_queue = normalize_escalations_dir(reify / 'data' / 'escalations')
+
+        roots = mod.queue_project_roots([
+            _queue(df_root), _recon_queue(df_root), reify_queue, str(tmp_path / 'elsewhere' / 'queue'),
+        ])
+
+        assert roots == {
+            'dark_factory': Path(_queue(df_root)).parents[1],
+            'reify': Path(reify_queue).parents[1],
+        }
+
+
 class TestFailOpen:
     def test_truncated_files_in_either_store_are_counted_shortfalls(self, fleet, df_root):
         queue = df_root / 'data' / 'escalations'

@@ -194,9 +194,6 @@ async def test_seeded_mem0_needle_reaches_the_merged_top5(
 
     scope = Scope(project_id=rrf_project_id)
     backend = Mem0Backend(rrf_config)
-    inst = await backend._get_instance(scope)
-    # Shared SQLite history writer: xdist-contended and irrelevant here.
-    inst.db.add_history = lambda *a, **kw: None
 
     try:
         for content in (*DISTRACTORS, NEEDLE):

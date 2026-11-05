@@ -838,3 +838,29 @@ class TestTheAbstainWord:
     @pytest.mark.parametrize('word', ['YES', 'NO', 'CENTRAL', 'SECONDARY', 'TIED', None, 'unclear'])
     def test_no_other_word_abstains(self, word: str | None) -> None:
         assert not _mod().is_abstain(word)
+
+
+class TestTheCrossFamilyRole:
+    def test_is_a_rater_role(self) -> None:
+        rubric = _mod()
+        assert rubric.Role.CROSS_FAMILY == 'cross_family'
+        assert rubric.Role.CROSS_FAMILY in rubric.RATER_ROLES
+
+    def test_its_rows_keep_the_evidence_contract(self) -> None:
+        row = _row(role='cross_family', conflict='YES')
+        del row['conflict_quote']
+        assert 'conflict_quote' in (_mod().row_violation(row) or '')
+
+    def test_its_rows_keep_the_skipped_follow_up_contract(self) -> None:
+        violation = _mod().row_violation(_row(role='cross_family', home='YES', conflict='NO'))
+        assert 'lacks loss' in (violation or '')
+
+    def test_a_valid_row_has_no_violation(self) -> None:
+        assert _mod().row_violation(_row(role='cross_family', home='NO', conflict='NO')) is None
+
+    def test_a_corpus_refuses_its_rows_because_they_never_vote(self) -> None:
+        rows = [_row(rater='r1', role='primary', home='YES', conflict='NO', loss='NO'),
+                _row(rater='r2', role='second', home='NO', conflict='NO'),
+                _row(rater='gpt:high', role='cross_family', home='YES', conflict='NO', loss='NO')]
+        with pytest.raises(ValueError, match='verdict row 2.*cross_family never votes'):
+            _mod().resolve_judgements(rows)

@@ -129,6 +129,7 @@ def test_sketch_2_an_unmeasured_census_is_unknown_and_says_why(served_bodies):
     assert census['value'] is None and census['as_of'] is None
     assert (census['reason'] or '').strip(), 'an unknown census must say why'
     assert body['TASKS_COUNT_UNKNOWN_PROJECTS'] == ['dark-factory']
+    assert body['TASKS_COUNT_STALE_PROJECTS'] == [], 'no value, so not a stale one'
     assert _census(body, 'reify')['state'] == 'fresh', 'the healthy project stays measured'
 
 
@@ -141,6 +142,10 @@ def test_sketch_3_a_failed_refresh_serves_the_last_good_census_as_stale(served_b
     assert _served_at(body) - datetime.fromisoformat(census['as_of']) == timedelta(hours=3)
     assert 'ReadTimeout' in census['reason'], census['reason']
     assert census['value']['total'] == 5459, 'the stale value is the last good one'
+    assert body['TASKS_COUNT_STALE_PROJECTS'] == ['dark-factory']
+    assert body['TASKS_COUNT_UNKNOWN_PROJECTS'] == [], (
+        'a census serving its last good value is not an unknown count'
+    )
 
 
 def test_sketch_4_every_root_census_partitions_its_total(served_bodies):
@@ -176,6 +181,10 @@ def test_sketch_13_a_transient_failure_ages_the_census_then_recovers(served_bodi
     assert aged['as_of'] == measured['as_of'], 'the stale census is the measured one, at its instant'
     assert recovered['state'] == 'fresh', recovered
     assert datetime.fromisoformat(recovered['as_of']) == _served_at(after)
+    assert [
+        (body['TASKS_COUNT_UNKNOWN_PROJECTS'], body['TASKS_COUNT_STALE_PROJECTS'])
+        for body in (before, during, after)
+    ] == [([], []), ([], ['dark-factory']), ([], [])]
 
 
 def test_sketch_6_the_sampler_persists_the_census_the_route_serves(served_bodies):
@@ -255,8 +264,11 @@ def test_sketch_9_a_window_counts_its_own_merges_and_each_attempt_once(served_bo
     assert block['recent_total']['state'] == 'fresh', 'a readable runs.db window total is measured'
     assert block['speculative']['state'] == 'fresh', 'a readable runs.db speculative count is measured'
     assert block['recent_total']['value'] == len(block['recent']) == len(in_window)
-    latency = block['latency']
-    assert sum(block['outcomes']['values']) == latency['with_duration'] + latency['without_duration']
+    assert block['attempts']['state'] == 'fresh', 'a readable runs.db attempt window is measured'
+    assert block['depth']['state'] == 'fresh', 'a readable runs.db depth series is measured'
+    attempts = block['attempts']['value']
+    latency = attempts['latency']
+    assert sum(attempts['outcomes']['values']) == latency['with_duration'] + latency['without_duration']
     assert latency['with_duration'] == sum(1 for attempt in in_window if attempt.duration_ms)
     assert latency['without_duration'] == sum(1 for attempt in in_window if not attempt.duration_ms)
 
@@ -270,7 +282,7 @@ def test_sketch_9_the_two_windows_hold_different_merges(served_bodies):
 
 @pytest.mark.parametrize('window, bucket_minutes', [('24h', 15), ('7d', 60)])
 def test_the_served_depth_names_the_width_its_labels_are_spaced_at(served_bodies, window, bucket_minutes):
-    depth = served_bodies[f'merge_{window}']['MERGE_QUEUE']['dark-factory']['depth']
+    depth = served_bodies[f'merge_{window}']['MERGE_QUEUE']['dark-factory']['depth']['value']
     starts = [datetime.fromisoformat(label) for label in depth['labels']]
 
     assert depth['bucket_minutes'] == bucket_minutes

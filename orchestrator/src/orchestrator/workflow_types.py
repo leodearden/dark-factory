@@ -306,6 +306,7 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
         WorktreeConflictError,
         WorktreeMissing,
     )
+    from orchestrator.lane_branch_holder import BranchCheckedOutElsewhere
     from orchestrator.recut_ruling import RecutRulingUnreadable, RecutRulingViolation
     from orchestrator.verify import VerifyInfraError
 
@@ -603,6 +604,22 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
             requeue_kind=RequeueKind.BLOCK,
             counts_against_requeue_cap=True,
             reason_prefix='Re-cut ruling unreadable',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
+        # Raised by acquire_warm_lane before any lane is touched, and
+        # deliberately NOT a WarmLaneRequeue so it can never feed the
+        # task-4930 steal-retry loop. A foreign worktree, a quarantined lane
+        # or a refused detach does not clear on its own. A lane the pool holds
+        # (REFUSE_HELD_LANE) can: a steal race, or a 4930 retry still holding a
+        # declined lane, frees it within seconds. That case blocks and
+        # escalates all the same, as the generic acquire FAULT did before
+        # task 5565.
+        BranchCheckedOutElsewhere: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=True,
+            requeue_kind=RequeueKind.BLOCK,
+            counts_against_requeue_cap=True,
+            reason_prefix='Task branch checked out in another worktree',
             block_class=BlockClass.AGENT_FAILURE,
         ),
         # ── BD-2 completeness rows: exported by the 4 covered modules, but

@@ -26,6 +26,7 @@ from _briefing_helpers import (
     _result,
     recorded_search_text,
 )
+from shared.elision import elision_marker
 from shared.memory_supersession import SUPERSEDED_BY_METADATA_KEY
 
 from orchestrator.agents.memory_recall import (
@@ -819,18 +820,45 @@ class TestContestingChildRender:
 
         assert render_memory_results(results).count(full_body) == 1
 
-    def test_a_digest_only_contesting_child_is_still_marked_and_first(self):
+    def test_a_parent_only_contesting_child_renders_in_full_and_first(self):
         results = _recorded_results('only-parent-matched')
         parent = _grouped_parent_of(results)
         contesting = _amendment(parent, contested=True)
         plain = _amendment(parent, contested=False)
+        full_body = _top_level(_recorded_results('child-also-matched'), contesting['id'])['content']
 
-        lines = render_memory_results(results).splitlines()
+        rendered = render_memory_results(results)
 
+        lines = rendered.splitlines()
         contests_at = _line_index(lines, lambda line: line.startswith(_CONTESTING_BULLET))
         plain_at = _line_index(lines, lambda line: line.endswith(f'] {plain["digest"]}'))
         assert contests_at < plain_at, lines
-        assert lines[contests_at].endswith(f'] {contesting["digest"]}')
+        assert lines[contests_at].endswith(f'] {full_body}'), lines
+        assert contesting['digest'] not in rendered
+
+    def test_the_childs_own_hit_outranks_the_capped_grouped_text(self):
+        results = _recorded_results('child-also-matched')
+        parent = _grouped_parent_of(results)
+        contesting = _amendment(parent, contested=True)
+        full_body = _top_level(results, contesting['id'])['content']
+        capped = {**contesting, 'content': full_body[:50] + elision_marker(len(full_body) - 50)}
+        grouped = {
+            **parent['grouped'],
+            'amendments': [
+                capped if child is contesting else child
+                for child in parent['grouped']['amendments']
+            ],
+        }
+        recapped = tuple(
+            {**entry, 'grouped': grouped} if entry is parent else entry for entry in results
+        )
+
+        rendered = render_memory_results(recapped)
+
+        lines = rendered.splitlines()
+        contests_at = _line_index(lines, lambda line: line.startswith(_CONTESTING_BULLET))
+        assert lines[contests_at].endswith(f'] {full_body}'), lines
+        assert 'chars elided]' not in rendered
 
     @pytest.mark.parametrize('name', ['child-also-matched', 'only-parent-matched'])
     def test_an_uncontested_digest_renders_unchanged(self, name):
@@ -877,7 +905,7 @@ class TestContestingChildRender:
         contests_at = _line_index(lines, lambda line: line.startswith(_CONTESTING_BULLET))
         assert ' · graphiti] ' in lines[contests_at], lines
 
-    def test_a_digest_only_contesting_child_renders_under_its_parents_store(self):
+    def test_a_parent_only_contesting_child_renders_under_its_parents_store(self):
         results = _recorded_results('only-parent-matched')
         parent = _grouped_parent_of(results)
         moved = tuple(

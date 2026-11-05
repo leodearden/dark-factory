@@ -44,6 +44,7 @@ from .measurement import (
 )
 from .metrics import (
     EvalMetrics,
+    RoleUnderTest,
     compose_cost_source,
     is_proxied_endpoint,
     read_decline_artifacts,
@@ -80,8 +81,15 @@ def architect_eval_mcp_scope(worktree: Path) -> dict[str, Any]:
     The PAIR is the invariant (task 4757). A plan-tools config without the
     strict flag still ambient-merges the worktree's tracked ``.mcp.json``, i.e.
     the live escalation (:8102) and fused-memory (:8002) servers.
+
+    The meta root is also the task root, matching ``open_eval_artifacts``:
+    parallel trials of one task id must not share ``.task-meta/task-<id>``.
     """
-    return {'mcp_config': _inject_plan_tools_mcp(None, worktree), 'strict_mcp_config': True}
+    meta_root = _meta_root_for_worktree(worktree)
+    return {
+        'mcp_config': _inject_plan_tools_mcp(None, worktree, task_root=meta_root),
+        'strict_mcp_config': True,
+    }
 
 
 def open_eval_artifacts(worktree: Path) -> TaskArtifacts:
@@ -557,7 +565,7 @@ def assemble_metrics(
     ]
     return EvalMetrics(
         plan_quality=_plan_quality(plan, scoring, share),
-        role_under_test='architect',
+        role_under_test=RoleUnderTest.ARCHITECT,
         terminal_kind=resolve_terminal_kind(plan, attempt.declines),
         replay_frame=REPLAY_FRAME_ID,
         tests_pass=None,
