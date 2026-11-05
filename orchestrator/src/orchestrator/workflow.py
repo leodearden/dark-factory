@@ -95,6 +95,7 @@ from orchestrator.agents.write_set import (
 from orchestrator.artifacts import (
     PLAN_SCHEMA_VERSION,
     ReviewAggregation,
+    ReviewsRootMissing,
     TaskArtifacts,
     iteration_entry_written_by_orchestrator,
     plan_base_commit,
@@ -8424,13 +8425,13 @@ class TaskWorkflow:
 
     async def _execute_verify_review_loop(self) -> WorkflowOutcome:
         """Execute → Verify → Review loop with retry limits."""
-        # Clear stale merge-failure review from prior runs — prevents
-        # the review phase from re-surfacing resolved merge issues.
+        # Dispatch-boundary freshness guard: once per dispatch and per
+        # post-escalation re-entry, before EXECUTE, so no prior dispatch's
+        # verdicts (warm-lane reuse, cross-lane re-dispatch, cold reuse) remain
+        # in reviews/ even when this dispatch stops before REVIEW. The
+        # per-round guard lives in _review.
         if self.artifacts:
-            stale_merge = self.artifacts.artifact_path('reviews/merge.json')
-            if stale_merge.exists():
-                logger.info('Task %s: removing stale merge.json review', self.task_id)
-                stale_merge.unlink()
+            self.artifacts.clear_reviews()
 
         # Seed the loop counters from the persisted task-lifetime totals
         # (task 2749) so max_amendment_rounds / max_review_cycles bound the
@@ -11203,6 +11204,9 @@ class TaskWorkflow:
     async def _review(self, amendment_ctx: AmendmentReviewContext | None = None):
         """Run the reviewer roster with staggered launches and aggregate it.
 
+        reviews/ is cleared first, so the returned aggregation covers exactly
+        this round's roster.
+
         Errored reviewers are retried in-phase up to ``max_reviewer_retries``
         unless their failure kind's policy skips in-phase retry
         (``orchestrator/reviewer_failure.py::should_retry_reviewer``).
@@ -11214,6 +11218,7 @@ class TaskWorkflow:
         enforceable guarantee; this only reduces wasted reviewer effort.
         """
         assert self.worktree is not None and self.artifacts is not None
+        self.artifacts.clear_reviews()
         briefing = self.config.review.reviewer_briefing
         roster = reviewers_for(briefing)
         subject = None
@@ -11275,7 +11280,10 @@ class TaskWorkflow:
             )
 
         for role, result in zip(roster, results, strict=True):
-            if isinstance(result, Exception):
+            # BaseException, not Exception: gather returns a child's own
+            # CancelledError as a result, and a reviewer with no review would
+            # vanish from the aggregation, which the gate reads as PASS.
+            if isinstance(result, BaseException):
                 logger.error(
                     f'Reviewer {role.name} failed after retries: {result}',
                     exc_info=result,
@@ -11285,8 +11293,7 @@ class TaskWorkflow:
                     classify_reviewer_exception(result),
                     summary=f'Reviewer exception: {result}',
                 )
-            if isinstance(result, dict):
-                self.artifacts.write_review(role.name, result)
+            self.artifacts.write_review(role.name, result)
 
         return self.artifacts.aggregate_reviews()
 
@@ -11363,9 +11370,7 @@ class TaskWorkflow:
         so only a corrupt, hand-edited or cross-role artifact can reach disk
         under someone else's name.  It still matters: ``_run_reviewer``'s
         return is mirrored verbatim into ``reviews/<role>.json`` (``_review``
-        -> ``artifacts.write_review``), and that mirror — despite
-        ``write_review``'s "debugging aid, not load-bearing" docstring
-        (``artifacts.py:851-852``) — is the SOLE input to
+        -> ``artifacts.write_review``), and that mirror is the SOLE input to
         ``aggregate_reviews()``, which makes the blocking-issue decision.  A
         cross-role payload returned verbatim would be filed, and its issues
         counted, under the wrong reviewer's name.
@@ -14125,10 +14130,14 @@ class TaskWorkflow:
         )
 
     def _write_merge_failure_review(self, category: str, detail: str) -> None:
-        """Write a review-format JSON describing a merge failure to .task/reviews/.
+        """Write a review-format JSON describing a merge failure to reviews/.
 
         Uses the same schema as reviewer agents so humans and retry agents
-        can consume it uniformly.
+        can consume it uniformly. The record is forensic: every caller routes
+        the same detail onward (as a block reason, or into main-health
+        auto-heal), and both ``clear_reviews()`` call sites run before any
+        aggregation, so it is never aggregated. Losing it to a vanished root
+        is logged, not raised.
         """
         if not self.artifacts:
             return
@@ -14145,7 +14154,13 @@ class TaskWorkflow:
             ],
             'summary': detail[:200],
         }
-        self.artifacts.write_review('merge', review)
+        try:
+            self.artifacts.write_review('merge', review)
+        except ReviewsRootMissing as exc:
+            logger.warning(
+                'Task %s: merge-failure review (%s) not written: %s',
+                self.task_id, category, exc,
+            )
 
     def _build_agent_env(self, role: AgentRole) -> dict[str, str] | None:
         """Build the env_overrides dict for this agent invocation.

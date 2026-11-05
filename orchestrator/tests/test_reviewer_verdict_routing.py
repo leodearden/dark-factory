@@ -35,18 +35,28 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import shutil
 from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
+from _review_payloads import blocking_review
 from _workflow_helpers import _make
 from shared.cli_invoke import AgentResult, AllAccountsCappedException
 from shared.usage_gate import SessionBudgetExhausted
 
-from orchestrator.agents.roles import REVIEWER_COMPREHENSIVE
+from orchestrator.agents.review_briefing import ReviewBriefing
+from orchestrator.agents.roles import REVIEWER_COMPREHENSIVE, reviewers_for
+from orchestrator.artifacts import ReviewsRootMissing
 from orchestrator.mcp.verdict_tools import _envelope
-from orchestrator.reviewer_failure import ReviewerFailure, ReviewerFailureKind
+from orchestrator.reviewer_failure import (
+    ReviewerFailure,
+    ReviewerFailureKind,
+    classify_reviewer_exception,
+    error_review,
+)
+from orchestrator.workflow_types import RequeueKind, classify_failure
 
 
 class TestReviewerGrantSurface:
@@ -919,6 +929,134 @@ class TestReviewMirrorCarriesSalvagedVerdict:
         # No retry burned => clear_verdict() never destroyed the artifact.
         assert f.wf._invoke.call_count == 1
         assert aggregation.reviewer_errors == []
+
+
+# reviews/ files a prior round or dispatch would leave behind, as (name, payload).
+_STALE_SEEDS: dict[str, tuple[str, dict]] = {
+    'retired_blocking': ('reviewer_retired', blocking_review('reviewer_retired')),
+    'merge_failure': ('merge', {
+        'verdict': 'ISSUES_FOUND',
+        'issues': [{
+            'severity': 'blocking', 'location': 'merge',
+            'category': 'merge_conflict', 'description': 'stale merge failure',
+        }],
+        'summary': 'Merge failed: merge_conflict',
+    }),
+    'retired_error': ('reviewer_retired', error_review(
+        'reviewer_retired', classify_reviewer_exception(RuntimeError('stale')),
+        summary='stale error',
+    )),
+}
+
+
+@pytest.mark.asyncio
+class TestReviewRoundAggregatesOnlyItsOwnRoster:
+    """A review round's aggregation holds exactly the reviews its own roster
+    wrote (task 3158; PRD plans/task-meta-task-keying-prd.md boundary B7)."""
+
+    def _setup(self, tmp_path: Path):
+        f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+        f.wf.briefing.build_reviewer_prompt = AsyncMock(return_value='prompt')
+        f.wf.git_ops.get_diff_from_base = AsyncMock(return_value='diff')
+        f.wf.config.reviewer_stagger_secs = 0
+        f.wf.config.max_reviewer_retries = 0
+        return f
+
+    @pytest.mark.parametrize('seed', sorted(_STALE_SEEDS))
+    async def test_a_stale_review_file_is_not_aggregated(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, seed: str,
+    ):
+        f = self._setup(tmp_path)
+        f.artifacts.write_review(*_STALE_SEEDS[seed])
+        monkeypatch.setattr(f.wf, '_invoke', AsyncMock(
+            side_effect=_invoke_writes_review_verdict(f, verdict='PASS', summary='ok'),
+        ))
+
+        aggregation = await f.wf._review()
+
+        assert aggregation.has_blocking_issues is False
+        assert aggregation.reviewer_errors == []
+        assert set(aggregation.reviews) == {'reviewer_comprehensive'}
+        reviews_dir = f.artifacts.artifact_path('reviews')
+        assert {p.stem for p in reviews_dir.glob('*.json')} == {'reviewer_comprehensive'}
+
+    async def test_the_inputs_unavailable_path_aggregates_only_its_roster(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        f = self._setup(tmp_path)
+        f.wf.config.review.reviewer_briefing = ReviewBriefing.CONTEXT_COMPLETE
+        monkeypatch.setattr(
+            f.wf, '_context_complete_review_subject',
+            AsyncMock(side_effect=RuntimeError('boom')),
+        )
+        f.artifacts.write_review(*_STALE_SEEDS['retired_blocking'])
+
+        aggregation = await f.wf._review()
+
+        assert aggregation.reviewer_errors == [
+            r.name for r in reviewers_for(ReviewBriefing.CONTEXT_COMPLETE)
+        ]
+        assert all(i['reviewer'] != 'reviewer_retired' for i in aggregation.blocking_issues)
+        assert aggregation.has_blocking_issues is False
+
+    async def test_a_reviewer_cancelled_on_its_own_aggregates_as_an_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """gather(return_exceptions=True) hands back a child's own
+        CancelledError as a result. With reviews/ cleared first, a reviewer
+        left without a review would vanish from the aggregation, which the
+        gate reads as PASS."""
+        f = self._setup(tmp_path)
+        monkeypatch.setattr(f.wf, '_invoke', AsyncMock(side_effect=asyncio.CancelledError()))
+
+        aggregation = await f.wf._review()
+
+        assert aggregation.reviewer_errors == ['reviewer_comprehensive']
+        failure = ReviewerFailure.from_review(aggregation.errored_reviews['reviewer_comprehensive'])
+        assert failure.kind is ReviewerFailureKind.EXCEPTION
+        assert 'CancelledError' in failure.detail
+
+
+class TestReviewRefusesAVanishedReviewsRoot:
+    """A review round whose reviews root vanishes raises rather than return
+    an aggregation with no reviews, which the gate would read as PASS
+    (task 3158)."""
+
+    @pytest.mark.asyncio
+    async def test_the_round_raises_when_the_root_goes_mid_review(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+        f.wf.briefing.build_reviewer_prompt = AsyncMock(return_value='prompt')
+        f.wf.git_ops.get_diff_from_base = AsyncMock(return_value='diff')
+        f.wf.config.reviewer_stagger_secs = 0
+        f.wf.config.max_reviewer_retries = 0
+        writes_verdict = _invoke_writes_review_verdict(f, verdict='PASS', summary='ok')
+
+        async def writes_verdict_then_root_vanishes(*args, **kwargs):
+            result = await writes_verdict(*args, **kwargs)
+            shutil.rmtree(f.artifacts.task_root)
+            return result
+
+        monkeypatch.setattr(f.wf, '_invoke', AsyncMock(
+            side_effect=writes_verdict_then_root_vanishes,
+        ))
+
+        with pytest.raises(ReviewsRootMissing):
+            await f.wf._review()
+
+        assert not f.artifacts.task_root.exists()
+
+    def test_the_raise_blocks_the_task_without_escalating(self):
+        """errno stays None, so the error is not read as an infra OSError."""
+        exc = ReviewsRootMissing('reviewer_comprehensive', Path('/gone'))
+
+        disposition = classify_failure(exc)
+
+        assert exc.errno is None
+        assert disposition.requeue_kind is RequeueKind.BLOCK
+        assert disposition.escalate_to_human is False
+        assert disposition == classify_failure(RuntimeError('any unrecognised failure'))
 
 
 @pytest.mark.asyncio
