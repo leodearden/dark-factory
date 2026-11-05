@@ -35,6 +35,7 @@ from _shadow_coordinator_doubles import (
 from shared.cost_store import CostStore
 
 from orchestrator.config import PsiAdmissionConfig
+from orchestrator.evals.configs import get_config_by_name
 from orchestrator.evals.live_fixture import live_stratum
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.run_store import CellChange, RunStore, ShadowCell, ShadowCellQuery
@@ -231,6 +232,29 @@ async def test_a_blank_credential_is_a_named_skip(tmp_path, costs):
     )
 
     assert await _plan_exit(rig, make_task('5387')) == []
+    assert _skip_reasons(rig) == ['no_credentials']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('base_url', 'api_key'), [
+    ('https://token-plan-sgp.xiaomimimo.com/anthropic', ''),
+    (None, 'tp-test'),
+], ids=['blank-key', 'unset-base-url'])
+async def test_an_unprovisioned_mimo_candidate_is_a_named_skip(
+    tmp_path, costs, monkeypatch, base_url, api_key,
+):
+    if base_url is None:
+        monkeypatch.delenv('MIMO_ANTHROPIC_BASE_URL', raising=False)
+    else:
+        monkeypatch.setenv('MIMO_ANTHROPIC_BASE_URL', base_url)
+    monkeypatch.setenv('MIMO_API_KEY', api_key)
+    rig = build_coordinator(
+        tmp_path, costs,
+        config=shadow_config(candidates=['mimo-v2.6-pro-endpoint']),
+        resolve_candidate=get_config_by_name,
+    )
+
+    assert await _plan_exit(rig, make_task('7991')) == []
     assert _skip_reasons(rig) == ['no_credentials']
 
 

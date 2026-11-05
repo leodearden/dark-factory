@@ -36,6 +36,7 @@ from orchestrator.agents.roles import (
     reviewers_for,
 )
 from orchestrator.agents.write_set import compute_write_set
+from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.scheduler import TaskAssignment
@@ -325,7 +326,7 @@ async def _invoke_probe(role, config, git_ops, task_assignment, mcp=None):
     Returns (call_kwargs, workflow, cwd) — the kwargs invoke_with_cap_retry
     was awaited with, the workflow instance (so callers can assert against
     workflow.modules), and the worktree path (a real linked worktree, so the
-    write-set wiring tests can recompute compute_write_set(cwd).writable_paths()).
+    write-set wiring tests can recompute compute_write_set(cwd, task_id=...).writable_paths()).
     ``mcp`` defaults to a bare ``FakeMcp()`` (empty mcpServers); callers may
     pass a fake that pre-populates a server (e.g. ``_FakeMcpWithFusedMemory``)
     to distinguish "server added alongside an existing one" from "server is
@@ -395,7 +396,7 @@ class TestInvokeDerivesGatingFromRole:
         sandbox_modules=[] (the empty-list value is the sandbox-on gate — no
         per-module dirs) and delivers the full contract write set (worktree
         root + carve-outs) via
-        sandbox_extras == compute_write_set(cwd).writable_paths(). Still gated
+        sandbox_extras == compute_write_set(cwd, task_id=...).writable_paths(). Still gated
         off role.sandboxed, not role.name.
         """
 
@@ -410,9 +411,13 @@ class TestInvokeDerivesGatingFromRole:
             f"got {call_kwargs.get('sandbox_modules')!r}. _invoke must gate "
             'sandboxing off role.sandboxed, not role.name.'
         )
-        expected_extras = [str(p) for p in compute_write_set(cwd).writable_paths()]
+        expected_extras = [
+            str(p) for p in compute_write_set(cwd, task_id=task_assignment.task_id).writable_paths()
+        ]
+        task_root = TaskArtifacts.task_root_for(cwd.parent, task_assignment.task_id).resolve()
+        assert str(task_root) in call_kwargs.get('sandbox_extras', [])
         assert call_kwargs.get('sandbox_extras') == expected_extras, (
-            'Expected sandbox_extras == compute_write_set(cwd).writable_paths() '
+            'Expected sandbox_extras == compute_write_set(cwd, task_id=...).writable_paths() '
             f"(the full contract set), but got {call_kwargs.get('sandbox_extras')!r}."
         )
 
@@ -423,7 +428,7 @@ class TestInvokeDerivesGatingFromRole:
         """Each shipped sandboxed role (implementer/debugger/simple_task) drives
         _invoke's sandbox block to the whole-worktree wiring: sandbox_modules=[]
         (the sandbox-on gate) and sandbox_extras == the FULL contract write set
-        (worktree root + carve-outs) from compute_write_set(cwd) — the single
+        (worktree root + carve-outs) from compute_write_set(cwd, task_id=...) — the single
         source of truth (INV-5). This is the α3 SIGNAL: a live wrap_command for
         these roles now carries the full contract set."""
 
@@ -434,7 +439,11 @@ class TestInvokeDerivesGatingFromRole:
             f'{role_name}: expected sandbox_modules == [] (whole-worktree gate), '
             f"got {call_kwargs.get('sandbox_modules')!r}."
         )
-        expected_extras = [str(p) for p in compute_write_set(cwd).writable_paths()]
+        expected_extras = [
+            str(p) for p in compute_write_set(cwd, task_id=task_assignment.task_id).writable_paths()
+        ]
+        task_root = TaskArtifacts.task_root_for(cwd.parent, task_assignment.task_id).resolve()
+        assert str(task_root) in call_kwargs.get('sandbox_extras', [])
         assert call_kwargs.get('sandbox_extras') == expected_extras, (
             f'{role_name}: expected sandbox_extras == the full compute_write_set '
             f"contract list, got {call_kwargs.get('sandbox_extras')!r}."
@@ -459,6 +468,26 @@ class TestInvokeDerivesGatingFromRole:
             f"(role.mcp_families={{'plan_tools'}}) but got {mcp_config!r}. _invoke "
             "must gate the plan-tools injection off 'plan_tools' in "
             'role.mcp_families, not role.name in _PLAN_TOOLS_ROLES.'
+        )
+
+    @pytest.mark.parametrize(
+        ('family', 'server'), [('plan_tools', 'plan-tools'), ('verdict_tools', 'verdict-tools')],
+    )
+    async def test_agent_side_server_gets_the_task_root(
+        self, family, server, config, git_ops, task_assignment,
+    ):
+        """Task 3155: the agent-side server is launched on the same task root
+        the workflow reads, or the agent writes plan/verdicts where nobody looks."""
+        role = AgentRole(
+            name=f'probe_{family}', system_prompt='x', allowed_tools=[],
+            mcp_families=frozenset({family}),
+        )
+        call_kwargs, _workflow, cwd = await _invoke_probe(role, config, git_ops, task_assignment)
+
+        args = call_kwargs['mcp_config']['mcpServers'][server]['args']
+        idx = args.index('--task-root')
+        assert args[idx + 1] == str(
+            TaskArtifacts.task_root_for(cwd.parent, task_assignment.task_id)
         )
 
     async def test_orchestrator_family_wires_mcp_config_regardless_of_name(

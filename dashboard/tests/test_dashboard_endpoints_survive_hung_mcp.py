@@ -48,6 +48,7 @@ _TINY_BUDGET = 0.05
 
 _TARGET_MODULES = {
     'dashboard.data.task_lookup',
+    'dashboard.data.task_lineage',
 }
 """The modules whose hang this probe must actually REACH, or it proves nothing.
 
@@ -58,6 +59,9 @@ few ids its rows name, and that module's ``fetch_task`` binding is the seam
 both now wait on. The hang must be reached THERE, for EACH endpoint's root —
 the sweep test checks the escalation probe's root separately — or that
 endpoint's bound is unexercised.
+
+``dashboard.data.task_lineage`` is ``/prds``' lineage index, whose background
+refresh is the one caller of ``fetch_metadata_projection``.
 
 ``dashboard.data.orchestrator`` was the third, and is deliberately no longer
 here: task 5587 removed ``discover_orchestrators``' task fetch outright, so it
@@ -112,6 +116,7 @@ def hung_mcp(monkeypatch, tmp_path, client):
     from dashboard.data import (
         escalation_corpus,
         orchestrator,
+        task_lineage,
         task_lookup,
         task_snapshot,
     )
@@ -132,13 +137,13 @@ def hung_mcp(monkeypatch, tmp_path, client):
 
     # Patch the binding in EVERY module that imported the name by value —
     # patching dashboard.data.tasks.fetch_tasks alone would miss all of them.
-    # ``dashboard.app`` still binds it for the /healthz probe, which this
-    # sweep does not reach. ``dashboard.api.escalations`` binds no task read
+    # ``dashboard.app`` is absent: its /healthz probe reads ``fetch_task_page``
+    # (task 6321) and holds no ``fetch_tasks`` binding, and this sweep does
+    # not reach /healthz anyway. ``dashboard.api.escalations`` binds no task read
     # at all (task 5596): its owner probe reads the snapshot unit's active
     # rows and its cards go through task_lookup. ``dashboard.data.orchestrator``
     # is absent because it binds the name no longer — see _TARGET_MODULES.
     for module_name in (
-        'dashboard.app',
         # The Tasks tab's binding travelled to the snapshot unit with the read
         # itself (task 5587); active_tasks holds no fetch name at all now.
         'dashboard.data.task_snapshot',
@@ -152,6 +157,11 @@ def hung_mcp(monkeypatch, tmp_path, client):
         'dashboard.data.task_lookup.fetch_task',
         _make_stub('dashboard.data.task_lookup'),
     )
+    # /prds' lineage index reads one projected get_tasks per root.
+    monkeypatch.setattr(
+        'dashboard.data.task_lineage.fetch_metadata_projection',
+        _make_stub('dashboard.data.task_lineage'),
+    )
 
     # The lookup's ONE deadline encloses its snapshot read before any
     # fetch_task miss, and that read pays the shrunk PER_CALL_TIMEOUT below
@@ -164,9 +174,14 @@ def hung_mcp(monkeypatch, tmp_path, client):
     # real 5 000-task trees (task 4884), and against a stub that never
     # returns the sweep would otherwise pay it per call per root.
     monkeypatch.setattr(task_snapshot, 'PER_CALL_TIMEOUT', _TINY_BUDGET)
+    # The request waits on the lineage refresh, and the refresh on the hang,
+    # for these and no longer.
+    monkeypatch.setattr(task_lineage, 'LINEAGE_REQUEST_WAIT_SECONDS', _TINY_BUDGET)
+    monkeypatch.setattr(task_lineage, 'LINEAGE_READ_TIMEOUT', _TINY_BUDGET)
 
     def _clear_caches() -> None:
         task_snapshot.clear_snapshot_cache()
+        task_lineage.clear_lineage_state()
         task_lookup._lookup_cache_clear()
         escalation_corpus._corpus_cache_clear()
         _esc._analytics_memo_clear()

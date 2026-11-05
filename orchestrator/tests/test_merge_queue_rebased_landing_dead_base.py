@@ -279,6 +279,13 @@ class TestRebasedLandingRecordsItsPreRebaseCommitDead:
             await _land_foreign_commit(git_repo)
             head_gate.set()
             await _assert_landed_rebased(store, req_a, a_pre)
+            # The 2026-08-12 shape (task 5302): B verifies on A's superseded
+            # speculative commit, so it is an INV-3 dead link, not a
+            # verify-base divergence — B was dispatched on the right tip.
+            mid_flight = lane.two_layer_invariants(await git_ops.get_main_sha())
+            naming_b = [v for v in mid_flight if req_b.request_id in v]
+            assert len(naming_b) == 1 and 'INV-3' in naming_b[0], mid_flight
+            assert lane.snapshot()['verify_base_divergences'] == []
             b_release.set()
 
             outcome_b = await wait_responsive(req_b.result, label='mv-b outcome')
@@ -326,6 +333,9 @@ class TestRebasedLandingRecordsItsPreRebaseCommitDead:
             assert await git_ops.get_main_sha() == a_pre
 
             await _land_foreign_commit(git_repo)
+            # B's base is A's LANDED commit, never dead: pure main drift under
+            # an in-flight verify is silent (task 5302).
+            assert lane.two_layer_invariants(await git_ops.get_main_sha()) == []
             b_release.set()
 
             outcome_b = await wait_responsive(req_b.result, label='pl-b outcome')

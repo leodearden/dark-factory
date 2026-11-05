@@ -120,4 +120,6 @@ in `docs/legibility/design-invariants.md`, under STRUCTURAL as
 `vacuous_present_comment_only`. It does so only because the lint's comment
 markers (`shared/src/shared/delivered_check_polarity.py::_COMMENT_MARKERS`) read
 a leading markdown `#` as a comment. The heading IS the capability, so the
-descriptor is correct and was deliberately left unchanged.
+descriptor is correct and was deliberately left unchanged. Since task 6037
+the comment rule reads markdown headings and bullets as content, so the
+audit no longer lists this descriptor.

@@ -980,6 +980,23 @@ class TestResumePriorProposal:
         )
 
 
+@pytest.mark.asyncio
+class TestResumePromptArgumentPlacement:
+    """``escalation_summary`` and ``resolution`` are both positional ``str``,
+    and the template renders the issue before the resolution, so a swap shows
+    up as the two arguments arriving out of order."""
+
+    async def test_issue_renders_before_resolution(self, briefing: BriefingAssembler):
+        with patch.object(
+            BriefingAssembler, '_get_memory_context', return_value='# Context\n\n_stub_',
+        ):
+            prompt = await briefing.build_resume_prompt(
+                {'id': '3754', 'metadata': {}}, {}, 'ISSUE-SENTINEL', 'RESOLUTION-SENTINEL',
+            )
+
+        assert prompt.index('ISSUE-SENTINEL') < prompt.index('RESOLUTION-SENTINEL')
+
+
 class TestPriorProposalStaleness:
     """Staleness guard + robustness for ``_format_prior_proposal``.
 

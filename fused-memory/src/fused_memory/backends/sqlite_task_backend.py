@@ -45,6 +45,7 @@ from shared.task_metadata import (
 )
 from shared.task_metadata_wire import coerce_task_metadata
 from shared.task_statuses import TERMINAL, TaskStatus
+from shared.task_store_schema import TASK_STORE_DDL
 
 from fused_memory.backends.defect_records import (
     DEFECT_RECORD_KEYS,
@@ -82,6 +83,7 @@ from fused_memory.backends.task_backend_types import (
     UpdateTaskResult,
     ValidateDependenciesResult,
 )
+from fused_memory.backends.task_projection import parse_task_projection
 from fused_memory.backends.task_text_markup_gate import refuse_leaked_task_text
 from fused_memory.config.schema import TaskmasterConfig
 from fused_memory.middleware.candidate_key import compute_candidate_key
@@ -134,43 +136,6 @@ _warned_malformed_task_ids: set[tuple[str, str, int]] = set()
 # key, same growth bound, same "restart re-emits" discipline.
 _warned_machine_authored_task_ids: set[tuple[str, str, int]] = set()
 
-
-_SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS tasks (
-    tag             TEXT NOT NULL DEFAULT 'master',
-    id              INTEGER NOT NULL,
-    title           TEXT NOT NULL,
-    description     TEXT,
-    details         TEXT,
-    test_strategy   TEXT,
-    status          TEXT NOT NULL,
-    priority        TEXT,
-    metadata        TEXT,
-    updated_at      TEXT NOT NULL,
-    claimant_run_id TEXT,
-    heartbeat_at    TEXT,
-    candidate_key   TEXT,
-    PRIMARY KEY (tag, id)
-);
-
-CREATE INDEX IF NOT EXISTS ix_tasks_status ON tasks (tag, status);
-
-CREATE TABLE IF NOT EXISTS dependencies (
-    tag        TEXT NOT NULL DEFAULT 'master',
-    task_id    INTEGER NOT NULL,
-    depends_on INTEGER NOT NULL,
-    PRIMARY KEY (tag, task_id, depends_on)
-);
-
--- Monotonic id high-water mark per tag sequence.  ``add_task`` allocates
--- ``max(MAX(tasks.id), max_id) + 1`` so a deleted id is NEVER reissued.
--- Applied idempotently via executescript on every connection open.
-CREATE TABLE IF NOT EXISTS id_counters (
-    tag    TEXT NOT NULL DEFAULT 'master',
-    max_id INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (tag)
-);
-"""
 
 DEFAULT_TAG = 'master'
 
@@ -381,7 +346,7 @@ async def _migrate(
       ``parent_id`` column: rebuild all three tables without it (straggler
       subtask rows with parent_id != 0 are silently dropped — by soak + DF-B
       there are none). If parent_id is already absent (fresh DB opened with
-      the new ``_SCHEMA_SQL``), this step just stamps version 1 — no rebuild
+      the new ``TASK_STORE_DDL``), this step just stamps version 1 — no rebuild
       needed.
     * v1 → v2: see :func:`_migrate_v1_to_v2` — add ``claimant_run_id`` /
       ``heartbeat_at`` (task 2182, PRD plans/task-status-authority-prd.md).
@@ -395,7 +360,7 @@ async def _migrate(
       preceding step is self-gating (see the dispatch below).
 
     Each ALTER step is column-presence-guarded, so a fresh DB whose
-    ``_SCHEMA_SQL`` already created every column runs all steps as no-op
+    ``TASK_STORE_DDL`` already created every column runs all steps as no-op
     ALTERs and only advances the ``user_version`` stamps.
     """
     row = await (await conn.execute('PRAGMA user_version')).fetchone()
@@ -506,12 +471,12 @@ async def _migrate_v1_to_v2(conn: aiosqlite.Connection) -> None:
 
     Adds whichever column is missing via
     ``shared/src/shared/sqlite_column_migration.py::add_column_if_missing``
-    (idempotent -- a fresh DB created by ``_SCHEMA_SQL`` already has both, so
+    (idempotent -- a fresh DB created by ``TASK_STORE_DDL`` already has both, so
     neither ALTER fires), then stamps ``user_version = 2``. Reached only after
     the v0->v1 step, so ``parent_id`` is already gone by the time this runs.
 
     IMPORTANT: never short-circuit to "parent_id absent -> just stamp the
-    version". ``_SCHEMA_SQL`` uses ``CREATE TABLE IF NOT EXISTS`` and never
+    version". ``TASK_STORE_DDL`` uses ``CREATE TABLE IF NOT EXISTS`` and never
     adds columns to an existing table, so an already-migrated v1 production DB
     (the common case) would silently keep missing columns forever if this step
     only stamped the version without also running the ALTERs.
@@ -526,7 +491,7 @@ async def _migrate_v2_to_v3(conn: aiosqlite.Connection) -> None:
     """v2 -> v3 (fm-task-dedup W8 task A1): add + backfill ``candidate_key``.
 
     Adds the nullable ``candidate_key`` column when ``tasks`` doesn't already
-    have it (fresh DBs get it straight from ``_SCHEMA_SQL``, so this is a
+    have it (fresh DBs get it straight from ``TASK_STORE_DDL``, so this is a
     no-op there), then backfills it for every NON-cancelled row from that
     row's title + metadata files. Cancelled rows are deliberately left NULL:
     a cancelled task's work may be legitimately re-filed later, so a
@@ -695,7 +660,7 @@ async def _migrate_v3_to_v4(
     The failure path additionally rolls the connection back, so a
     partially-applied heal can never survive on the cached connection.
 
-    Deliberately NOT added to ``_SCHEMA_SQL``: a fresh-schema ``executescript``
+    Deliberately NOT added to ``TASK_STORE_DDL``: a fresh-schema ``executescript``
     run at every connection-open would raise ``IntegrityError`` building the
     index against a DB that still holds residual duplicates, defeating the
     self-gating fail-safe. Fresh DBs still get the index via the full
@@ -1787,7 +1752,7 @@ class SqliteTaskBackend:
             conn.row_factory = aiosqlite.Row
             await apply_full_durability_pragmas(conn, busy_timeout_ms=5000)
             await conn.execute('PRAGMA foreign_keys=OFF')
-            await conn.executescript(_SCHEMA_SQL)
+            await conn.executescript(TASK_STORE_DDL)
             await conn.commit()
             await _migrate(
                 conn,
@@ -2101,10 +2066,14 @@ class SqliteTaskBackend:
     async def get_tasks(
         self, project_root: str, tag: str | None = None,
         statuses: list[str] | None = None,
+        fields: Sequence[str] | None = None,
     ) -> GetTasksResult:
+        projection = parse_task_projection(fields)
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG
         tasks = await self._get_tasks_internal(project_root, tag, statuses=statuses)
+        if projection is not None:
+            tasks = [projection.apply(task) for task in tasks]
         return {'tasks': tasks}
 
     async def get_task(

@@ -28,7 +28,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
 
-from _task_db_scan import TaskDbUnreadable, connect_ro, discover_project_roots, tasks_db_path
+from _task_db_scan import discover_project_roots, tasks_db_path
 from escalation.models import Escalation
 from escalation.queue import iter_all_escalation_paths, read_escalation_for_scan
 from orchestrator.session_registry import (
@@ -42,6 +42,7 @@ from orchestrator.session_registry import (
 )
 from shared.project_id import fold_project_token
 from shared.project_layout import ESCALATION_QUEUE_RELPATH
+from shared.tasks_db_readonly import TaskDbUnreadable, connect_ro
 
 QUEUE_TAGS: Mapping[Path, str] = MappingProxyType({
     Path(ESCALATION_QUEUE_RELPATH): '',

@@ -375,6 +375,19 @@ class Mem0BackendConfig(BaseModel):
 
     qdrant_url: str = Field(default='http://localhost:6333')
     collection_prefix: str = Field(default='fused')
+    persist_history: bool = Field(
+        default=True,
+        description=(
+            'When False, mem0 keeps its change history in a private in-memory '
+            'SQLite DB that dies with the instance, instead of the '
+            'process-shared $MEM0_DIR/history.db. For tests and scratch runs, '
+            'where the shared file is xdist-contended or read-only in the '
+            'sandbox; leave it True in production, because out-of-band readers '
+            'such as fused-memory/scripts/build_write_triage_v2_soak_baseline.py '
+            'read the shared file. Restart-only: Mem0Backend reads it once, '
+            'when it creates the instance for a project.'
+        ),
+    )
 
 
 # --- Routing ---
@@ -446,10 +459,11 @@ class QueueConfig(BaseModel):
 # --- Write journal ---
 
 class WriteJournalConfig(BaseModel):
-    """Retention horizons and prune budgets for the ``write_ops`` journal.
+    """Retention horizons and prune budgets for the write journal's tables.
 
-    RESTART-ONLY BY CONSTRUCTION. The prune runs at startup and every
-    ``prune_interval_seconds`` (``services/write_ops_retention.py``), and both
+    RESTART-ONLY BY CONSTRUCTION. Every table with a horizon is pruned once at
+    startup (``services/journal_retention.py``) and ``write_ops`` again every
+    ``prune_interval_seconds`` (``services/write_ops_retention.py``); both
     capture this section once at startup, so nothing re-reads it afterwards.
     ``config/reload.py::RELOADABLE_FIELDS`` is an opt-in allowlist and this
     section is deliberately absent from it, which makes a changed leaf report
@@ -472,7 +486,8 @@ class WriteJournalConfig(BaseModel):
     #: (task 3214), both of which evaluate over trailing baseline windows.
     search_retention_days: float = Field(default=365.0, gt=0)
     #: Writes — the durable audit trail joined by ``causation_id``; 0.73% of
-    #: volume, so a long horizon costs essentially nothing.
+    #: volume, so a long horizon costs essentially nothing. Also governs
+    #: ``backend_ops``, the Layer-2 half of each write.
     write_retention_days: float = Field(default=730.0, gt=0)
     #: Rows deleted per transaction. Each batch commits separately so the
     #: write lock is released between batches, which makes one batch the
@@ -480,16 +495,22 @@ class WriteJournalConfig(BaseModel):
     #: that in the ``write_journal`` block of ``fused-memory/config/config.yaml``.
     prune_batch_size: int = Field(default=500, gt=0)
     #: Ceiling on one sweep. A backlog drains over successive passes and each
-    #: partial run says so at WARNING.
+    #: partial run says so at WARNING. The startup sweep shares it across
+    #: ``write_ops`` and ``backend_ops``.
     prune_max_rows_per_run: int = Field(default=500_000, gt=0)
     #: Wall-clock ceiling on one sweep, checked between batches. This is the
     #: bound that actually matters: the watchdog's startup grace is a TIME
-    #: budget, and rows-per-second is not knowable in advance.
+    #: budget, and rows-per-second is not knowable in advance. The startup
+    #: sweep shares it across ``write_ops`` and ``backend_ops``.
     prune_max_seconds: float = Field(default=30.0, gt=0)
     #: Seconds between background prune passes, each bounded by the same
     #: ``prune_max_seconds`` / ``prune_max_rows_per_run``. The sizing basis is
     #: in the ``write_journal`` block of ``fused-memory/config/config.yaml``.
     prune_interval_seconds: float = Field(default=1800.0, gt=0)
+    #: ``referent_findings``, a diagnosis log whose reader (the phase-5 replay
+    #: pass) re-verifies every row against the live graph, so a long horizon
+    #: loses nothing.
+    referent_findings_retention_days: float = Field(default=365.0, gt=0)
 
     @model_validator(mode='after')
     def _validate_search_outlives_reads(self) -> 'WriteJournalConfig':
@@ -2207,17 +2228,23 @@ class ReconciliationConfig(BaseModel):
         default_factory=lambda: ['orchestrator'],
         description=(
             'Resolved-caller prefixes permitted to record a `deterministic-*` '
-            'done provenance (PRD C5). The orchestrator sends no agent_id, so '
-            'server/tools.py::_resolve_identity falls back to the '
-            'clientInfo.name the orchestrator advertises '
-            '(orchestrator/src/orchestrator/mcp_lifecycle.py::ORCHESTRATOR_MCP_IDENTITY, '
-            'sent by shared/src/shared/mcp_session.py::McpSession.initialize) '
-            "— the literal 'orchestrator', which is why that is the "
+            'done provenance (PRD C5). orchestrator/src/orchestrator/scheduler.py'
+            '::Scheduler.set_task_status sends agent_id='
+            "'orchestrator' explicitly "
+            '(orchestrator/src/orchestrator/mcp_lifecycle.py::ORCHESTRATOR_MCP_IDENTITY), '
+            'because fused-memory serves stateless HTTP, where a tools/call '
+            'session never receives an InitializeRequest and '
+            'fused-memory/src/fused_memory/server/tools.py::_resolve_identity '
+            'has no clientInfo to fall '
+            "back to — which is why 'orchestrator' is the "
             'sole default. DENY-ON-MISSING is the consumer contract: a caller '
             'matching no prefix is refused, and an EMPTY list denies every '
             'caller (the live kill switch for the provenance kind). The '
-            'finished one-shot scripts/cgl_eta_finalize_gate.py (clientInfo '
-            "'cgl-sched-gate') is deliberately NOT in the default — it has "
+            'finished one-shot fused-memory/scripts/cgl_eta_finalize_gate.py '
+            '(which sends no agent_id; its clientInfo is '
+            "'cgl-sched-gate', advertised by "
+            'fused-memory/scripts/cgl_eta_scheduler_gate.py::McpClient) is '
+            'deliberately NOT in the default — it has '
             'already run, and shipping a retired caller in an allowlist is how '
             'an allowlist stops meaning anything. NOTE: the identity this bar '
             'reads is SELF-REPORTED, so it deters a cooperating caller rather '
@@ -2912,7 +2939,9 @@ class WriteTriageConfig(BaseModel):
             'calibration/write_triage_judge_field_chars_report.md. Bounded ge=1 '
             'because a zero cap would elide every field to nothing and show the '
             'model empty records. Green-tier hot-reloadable, read live per '
-            'middle-band write.'
+            'middle-band write. The same cap bounds a contesting child\'s text '
+            'in grouped search and get_memory_by_id reads '
+            '(server/grouped_read.py::_digest_entry).'
         ),
     )
     judge_accuracy_report_path: str | None = Field(

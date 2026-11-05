@@ -920,16 +920,17 @@ async def test_resolve_ticket_wakes_on_worker_completion(
 
 
 # ---------------------------------------------------------------------------
-# step-41: resolve_ticket timeout returns failed without mutating the row
+# step-41: resolve_ticket timeout answers open pending without mutating the row
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_resolve_ticket_timeout_returns_failed_without_mutating_row(
+async def test_resolve_ticket_timeout_answers_pending_without_mutating_row(
     interceptor_with_store, ticket_store, taskmaster,
 ):
-    """When resolve_ticket times out, it returns a synthetic failed dict
-    but the ticket row remains status='pending' (unchanged in the store).
+    """When resolve_ticket times out, it answers the open ``pending`` status
+    with the ticket and reason ``wait_timeout``, and the ticket row remains
+    status='pending' (unchanged in the store).
     """
     # Block the worker by using a slow curator mock (won't be called because
     # we block the worker via a never-resolving event, but we also need the
@@ -969,10 +970,7 @@ async def test_resolve_ticket_timeout_returns_failed_without_mutating_row(
             ticket_id, '/project', timeout_seconds=0.1,
         )
 
-    # Result must indicate timeout failure (not raise)
-    assert result['status'] == 'failed', f'Expected failed: {result}'
-    assert result.get('reason') == 'timeout', f'Expected reason=timeout: {result}'
-    assert result.get('task_id') is None, f'Expected task_id=None: {result}'
+    assert result == {'status': 'pending', 'ticket': ticket_id, 'reason': 'wait_timeout'}
 
     # The ticket row must still be pending (no mutation)
     row = await ticket_store.get(ticket_id)
@@ -992,13 +990,13 @@ async def test_resolve_ticket_unknown_ticket_returns_failed(
     interceptor_with_store,
 ):
     """Calling resolve_ticket with an id that doesn't exist in the store
-    returns {status:failed, reason:unknown_ticket} without raising.
+    returns {status:failed, reason:unknown_ticket}, with no task_id key, without raising.
     """
     result = await interceptor_with_store.resolve_ticket(
         'tkt_nonexistent', '/project',
     )
 
-    assert result == {'status': 'failed', 'reason': 'unknown_ticket', 'task_id': None}, (
+    assert result == {'status': 'failed', 'reason': 'unknown_ticket'}, (
         f'Expected unknown_ticket response: {result}'
     )
 
@@ -1374,13 +1372,13 @@ async def test_per_project_ticket_queues_do_not_serialise(
 
 
 @pytest.mark.asyncio
-async def test_resolve_ticket_returns_server_closed_when_store_closes_post_wake(
+async def test_resolve_ticket_answers_store_unavailable_when_store_closes_post_wake(
     interceptor_with_store,
     ticket_store,
 ):
     """Regression: if TicketStore.close() runs between the event signal and the
-    post-wake re-read, resolve_ticket must return
-    ``{'status': 'failed', 'reason': 'server_closed', 'task_id': None}``
+    post-wake re-read, resolve_ticket must answer the ticket open,
+    ``{'status': 'pending', 'ticket': <id>, 'reason': 'store_unavailable'}``,
     instead of raising RuntimeError.
 
     Scenario
@@ -1394,12 +1392,7 @@ async def test_resolve_ticket_returns_server_closed_when_store_closes_post_wake(
     3. Schedule ``interceptor._signal_ticket_event(ticket_id)`` to fire after a
        short delay so the resolve_ticket waiter wakes and enters the re-read
        path.
-    4. Assert ``resolve_ticket`` returns the ``server_closed`` sentinel.
-
-    Under the OLD code the RuntimeError propagates out of ``_resolve_ticket_raw``
-    and ``asyncio.wait_for`` raises it instead of returning the sentinel.
-    Under the FIXED code a ``try/except RuntimeError`` at the re-read site
-    catches it and returns ``server_closed``.
+    4. Assert ``resolve_ticket`` answers ``pending/store_unavailable``.
     """
     ti = interceptor_with_store
 
@@ -1435,9 +1428,8 @@ async def test_resolve_ticket_returns_server_closed_when_store_closes_post_wake(
         timeout=2.0,
     )
 
-    # Assert: server_closed sentinel returned, not a bare RuntimeError
-    assert result == {'status': 'failed', 'reason': 'server_closed', 'task_id': None}, (
-        f'Expected server_closed sentinel, got: {result!r}'
+    assert result == {'status': 'pending', 'ticket': ticket_id, 'reason': 'store_unavailable'}, (
+        f'Expected the open store_unavailable answer, got: {result!r}'
     )
     assert call_count == 2, (
         f'Expected exactly 2 ticket_store.get() calls, got {call_count}'
@@ -1445,16 +1437,16 @@ async def test_resolve_ticket_returns_server_closed_when_store_closes_post_wake(
 
 
 @pytest.mark.asyncio
-async def test_resolve_ticket_returns_server_closed_when_store_closed_before_initial_read(
+async def test_resolve_ticket_answers_store_unavailable_when_store_closed_before_initial_read(
     interceptor_with_store,
     ticket_store,
 ):
     """Regression: if TicketStore.close() has already run when resolve_ticket
     makes its initial ``ticket_store.get()`` call, the RuntimeError from
-    ``_require_access()`` must be caught and the server_closed sentinel returned —
-    not a bare RuntimeError escaping the coroutine.
+    ``_require_access()`` must be caught and the ticket answered open with
+    reason ``store_unavailable`` — not a bare RuntimeError escaping the coroutine.
 
-    Complements ``test_resolve_ticket_returns_server_closed_when_store_closes_post_wake``
+    Complements ``test_resolve_ticket_answers_store_unavailable_when_store_closes_post_wake``
     by covering the *initial*-read call-site rather than the post-wake one.
     """
     ti = interceptor_with_store
@@ -1473,9 +1465,10 @@ async def test_resolve_ticket_returns_server_closed_when_store_closed_before_ini
         timeout=2.0,
     )
 
-    assert result == {'status': 'failed', 'reason': 'server_closed', 'task_id': None}, (
-        f'Expected server_closed sentinel from initial-read path, got: {result!r}'
-    )
+    assert result == {
+        'status': 'pending', 'ticket': fake_ticket_id, 'reason': 'store_unavailable',
+    }, f'Expected the open store_unavailable answer from initial-read path, got: {result!r}'
+
 
 
 # ---------------------------------------------------------------------------

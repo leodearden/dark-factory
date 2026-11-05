@@ -389,7 +389,26 @@ async def test_readmit_resolves_the_skew_l1(scene: _Scene):
     await scene.tick()
 
     assert scene.open_l1s() == []
-    assert scene.events.of(EventType.verify_host_recovered)[-1]['quarantine_class'] == 'skew'
+    recovered = scene.events.of(EventType.verify_host_recovered)[-1]
+    assert (recovered['quarantine_class'], recovered['evidence']) == ('skew', 'ensure_gate')
+
+
+@pytest.mark.asyncio
+async def test_a_sticky_skew_alarm_resolved_while_benched_reopens_on_the_next_tick(scene: _Scene):
+    """The same re-assert rule as the 'ru' class (task 5290): benched means alarmed."""
+    scene.bench('gate')
+    await scene.tick()
+    scene.bench('gate')
+    [l1] = scene.open_l1s()
+    scene.escalations.resolve(
+        l1.id, 'Self-resolved — occupancy.by_host shows laptop verifying',
+        resolved_by='escalation-watcher',
+    )
+
+    await scene.tick()
+
+    [reopened] = scene.open_l1s()
+    assert (reopened.id != l1.id, reopened.task_id) == (True, l1.task_id)
 
 
 # ---------------------------------------------------------------------------
@@ -413,6 +432,22 @@ async def test_the_operator_clear_lifts_a_sticky_bench(scene: _Scene):
     assert scene.open_l1s() == []
     scene.bench('gate')
     assert scene.host()['sticky'] is False, 'a clear resets the count, as a restart does'
+
+
+@pytest.mark.asyncio
+async def test_an_operator_clear_names_itself_as_the_recovery_evidence(scene: _Scene):
+    """Health is not probed on a clear, so the alarm must not say it was (task 5290)."""
+    for _ in range(3):
+        scene.bench('transport')
+    [l1] = scene.open_l1s()
+
+    await scene.worker.clear_host_quarantine(_HOST)
+
+    [resolved] = [esc for esc in scene.escalations.get_by_task(l1.task_id) if esc.id == l1.id]
+    assert resolved.status == 'resolved'
+    assert 'operator_clear' in (resolved.resolution or '')
+    assert 'automatically via SSH' not in (resolved.resolution or '')
+    assert scene.events.of(EventType.verify_host_recovered)[-1]['evidence'] == 'operator_clear'
 
 
 @pytest.mark.asyncio

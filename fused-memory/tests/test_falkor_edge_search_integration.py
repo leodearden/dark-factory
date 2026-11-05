@@ -5,7 +5,7 @@ stock edge legs as a scan re-executed once per input row.  These tests drive
 graphiti's real ``search_utils`` legs through the hardened driver against a
 seeded scratch graph provisioned by the production sweep, and pin the plan of the
 Cypher actually issued (against a stock negative control), the rows, and for
-BM25 a wall-clock budget.
+BM25 a work budget: the records FalkorDB's profile counts per operator.
 
 Requires a running FalkorDB; skipped when one is not reachable, and deselected by
 the default ``-m 'not integration'`` addopts.  Graphs and backends come only from
@@ -16,14 +16,13 @@ from __future__ import annotations
 
 import copy
 import math
-import time
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 
 import pytest
 import pytest_asyncio
 from _falkor_index_live import live_backends, scratch_graphs
-from _falkor_plans import explain, non_leaf_scans, spy_on_queries
+from _falkor_plans import explain, non_leaf_scans, peak_records_produced, profile, spy_on_queries
 from _fm_helpers import await_index_operational, falkor_skipif
 from _query_recorder import IssuedQuery, recording_driver
 from falkordb.asyncio.graph import AsyncGraph
@@ -40,16 +39,12 @@ pytestmark = [
     pytest.mark.integration,
 ]
 
-# Large enough that stock BM25 (one index scan per hit x Entity node) overruns
-# the server TIMEOUT: measured past 1000 ms at 800 x 800.
+# Large enough that SIMILARITY_MIN_SCORE cuts the cosine ranking between the two
+# limits of test_returns_the_top_scoring_entity_edges: roughly 440 to 2000 edges.
 EDGE_COUNT = 800
 
 # Not a graphiti stopword, alphanumeric, and a single RediSearch token.
 CANARY_TOKEN = 'edgesearchcanary'
-
-# Half of production's GRAPH.CONFIG TIMEOUT of 1000 ms.  The direct bind
-# measured ~30 ms for all 800 hits on the seeded graph.
-BM25_BUDGET_SECONDS = 0.5
 
 SEEDED_AT = '2026-10-03T00:00:00+00:00'
 
@@ -131,6 +126,11 @@ class SeededGraph:
     entity_edges: dict[str, SeededEdge]
     off_label_edge: SeededEdge
 
+    @property
+    def canary_fact_count(self) -> int:
+        """Edges whose fact carries CANARY_TOKEN: every entity edge and the off-label twin."""
+        return len(self.entity_edges) + 1
+
     def seeded_endpoints(self, edges: list[EntityEdge]) -> list[tuple[str, str]]:
         return [
             (
@@ -188,10 +188,18 @@ async def seed_ring(scratch, live_backend_factory) -> Callable[[int], Awaitable[
 SearchLeg = Callable[[GraphDriver], Awaitable[list[EntityEdge]]]
 
 
-async def issued_by_hardened_driver(seeded: SeededGraph, leg: SearchLeg) -> IssuedQuery:
+async def run_on_hardened_driver(
+    seeded: SeededGraph, leg: SearchLeg
+) -> tuple[list[EntityEdge], IssuedQuery]:
+    """*leg*'s rows through the hardened driver, and the one query it issued for them."""
     issued = spy_on_queries(seeded.driver)
-    await leg(seeded.driver)
+    edges = await leg(seeded.driver)
     (query,) = issued
+    return edges, query
+
+
+async def issued_by_hardened_driver(seeded: SeededGraph, leg: SearchLeg) -> IssuedQuery:
+    _, query = await run_on_hardened_driver(seeded, leg)
     return query
 
 
@@ -241,15 +249,27 @@ class TestEdgeFulltextLeg:
 
     @pytest.mark.asyncio
     async def test_returns_topology_endpoints_within_budget(self, seed_ring):
+        """No operator of the issued Cypher's profile yields more records than the fulltext hits."""
         seeded = await seed_ring(EDGE_COUNT)
 
-        started = time.perf_counter()
-        edges = await bm25_leg(seeded.name, 20)(seeded.driver)
-        elapsed = time.perf_counter() - started
+        edges, query = await run_on_hardened_driver(seeded, bm25_leg(seeded.name, 20))
+        plan = await profile(seeded.graph, query)
 
         assert len(edges) == 20
         assert returned_endpoints(edges) == seeded.seeded_endpoints(edges)
-        assert elapsed < BM25_BUDGET_SECONDS
+        assert peak_records_produced(plan) == seeded.canary_fact_count, str(plan)
+
+    @pytest.mark.asyncio
+    async def test_stock_cypher_exceeds_the_budget(self, seed_ring):
+        """Negative control: stock's per-row scan multiplies the hits, so the budget above discriminates.
+
+        A small ring, so profiling stock's per-row scan stays cheap on the shared server.
+        """
+        seeded = await seed_ring(50)
+
+        plan = await profile(seeded.graph, await issued_by_stock_graphiti(bm25_leg(seeded.name, 20)))
+
+        assert peak_records_produced(plan) > seeded.canary_fact_count, str(plan)
 
     @pytest.mark.asyncio
     async def test_returns_the_edge_set_of_graphiti_builtin_cypher(self, seed_ring):

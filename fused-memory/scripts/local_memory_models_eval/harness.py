@@ -82,6 +82,7 @@ from fused_memory.arm_harness.corpus import (
 )
 from fused_memory.arm_harness.embedding_graph_phase import (
     SEARCH_K,
+    ArmGraphClient,
     ArmScratchGraph,
     EmbeddingRunCheckFailed,
     EmbeddingSearchBackend,
@@ -251,9 +252,7 @@ class ScratchGraph(ArmScratchGraph, Protocol):
     async def delete(self) -> None: ...
 
 
-class ScratchGraphClient(Protocol):
-    async def list_graphs(self) -> list[str]: ...
-
+class ScratchGraphClient(ArmGraphClient, Protocol):
     def select_graph(self, graph_id: str, /) -> ScratchGraph: ...
 
 

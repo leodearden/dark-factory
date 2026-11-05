@@ -4458,23 +4458,13 @@ def clean_probe_collection(probe_config, probe_project_id):
 
 
 @contextlib.asynccontextmanager
-async def _seeded_memory_service(probe_config, probe_project_id):
-    """An initialized MemoryService over the ephemeral collection, closed on exit.
-
-    mem0's SQLite history writer is process-shared and xdist-contended (and
-    read-only in the sandbox), so it is stubbed here, for the same reason
-    test_recon_dedup_premise.py stubs it: it is not the question under test,
-    and its failure would mask the one that is. This is the one place these
-    tests reach mem0's private instance.
-    """
-    from fused_memory.models.scope import Scope  # noqa: PLC0415
+async def _seeded_memory_service(probe_config):
+    """An initialized MemoryService over the ephemeral collection, closed on exit."""
     from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
 
     memory = MemoryService(probe_config)
     await memory.initialize()
     try:
-        instance = await memory.mem0._get_instance(Scope(project_id=probe_project_id))
-        instance.db.add_history = lambda *a, **kw: None
         yield memory
     finally:
         await memory.close()
@@ -4523,7 +4513,7 @@ class TestSeededInducedRegression:
         self, probe_config, probe_project_id, clean_probe_collection, tmp_path,
     ):
         m = _mod()
-        async with _seeded_memory_service(probe_config, probe_project_id) as memory:
+        async with _seeded_memory_service(probe_config) as memory:
             seeded = await memory.add_memory(
                 FLIP_CANONICAL, category='procedural_knowledge',
                 project_id=probe_project_id, agent_id='e1-probe-seed',
@@ -4649,7 +4639,7 @@ class TestSeededBriefingTopicFlip:
     ):
         m = _mod()
         registry = _seeded_briefing_registry(probe_project_id)
-        async with _seeded_memory_service(probe_config, probe_project_id) as memory:
+        async with _seeded_memory_service(probe_config) as memory:
             seeded_ids = {}
             for topic, (text, category) in BRIEFING_SEEDS.items():
                 seeded = await memory.add_memory(
