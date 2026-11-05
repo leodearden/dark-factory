@@ -31,6 +31,7 @@ from dashboard.data.datum import Datum, DatumState, unknown_datum, validate_datu
 from dashboard.data.escalation_corpus import (
     CORPUS_FRESHNESS_BOUND_SECONDS,
     CORPUS_TTL_SECONDS,
+    HUMAN_LEVEL,
     EscalationCorpus,
     EscalationView,
     Location,
@@ -692,6 +693,19 @@ class TestPendingLevel2ByTask:
 
         datum = self._ruling(config)
 
+        assert _by_task(datum) == {3546: ('esc-3546-2',)}
+
+    @pytest.mark.parametrize('task_id', [None, 7])
+    def test_a_human_record_whose_task_id_is_not_a_digit_string_is_left_out(
+        self, config, task_id,
+    ):
+        _file(EscalationQueue(config.escalations_dir), 'esc-3546-2', '3546')
+        record = _record('esc-none-1') | {'task_id': task_id, 'level': HUMAN_LEVEL}
+        _write(config.escalations_dir, record)
+
+        datum = self._ruling(config)
+
+        assert datum.state is DatumState.FRESH
         assert _by_task(datum) == {3546: ('esc-3546-2',)}
 
     def test_two_human_records_on_one_task_are_both_listed_in_order(self, config):

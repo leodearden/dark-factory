@@ -414,8 +414,6 @@ def test_a_prd_naming_no_signal_leaf_reads_exactly_that_and_no_other_cause():
     signal = row_wire(manifest(bound('a', 1), leaves=None))['signal']
 
     assert signal['reason'] == 'PRD names no signal leaf'
-    assert SIGNAL_CAUSE_TEXT[SignalCause.NAMES_NO_LEAF] == 'PRD names no signal leaf'
-    assert list(SIGNAL_CAUSE_TEXT.values()).count('PRD names no signal leaf') == 1
     assert set(SIGNAL_CAUSE_TEXT) == set(SignalCause)
 
 

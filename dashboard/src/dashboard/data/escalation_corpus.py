@@ -322,8 +322,8 @@ def pending_level2_by_task(
 ) -> Datum[Mapping[int, tuple[str, ...]]]:
     """Each task's pending human-level escalations in the live queue *queue_id*, sorted.
 
-    A record whose task id is not a number names no task in the store, so it is
-    left out. The datum is as partial as that queue's scan, as :func:`views_over`
+    A record whose task id is not a string of ASCII digits (a null, a number, a
+    label) names no task in the store, so it is left out. The datum is as partial as that queue's scan, as :func:`views_over`
     scopes a count.
     """
     corpus = corpus_datum.value
@@ -340,7 +340,9 @@ def pending_level2_by_task(
         if (
             EscalationView.QUEUE_PENDING.admits(record)
             and escalation.level == HUMAN_LEVEL
-            and escalation.task_id.isdigit()
+            and isinstance(escalation.task_id, str)
+            and escalation.task_id.isascii()
+            and escalation.task_id.isdecimal()
         ):
             by_task.setdefault(int(escalation.task_id), []).append(escalation.id)
     state, reason = _scope_provenance(corpus_datum, [scan])
