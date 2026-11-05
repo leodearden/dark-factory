@@ -7,12 +7,16 @@ run across the flip, so every case here is spelled out for both field sets.
 from __future__ import annotations
 
 import dataclasses
+import logging
+import re
+from pathlib import Path
 
 import pytest
 
 from orchestrator.warm_lane_gc_summary import (
     ReclaimSummary,
     ReclaimSummaryError,
+    log_reclaim_outcome,
     parse_reclaim_summary,
 )
 
@@ -125,3 +129,93 @@ class TestReclaimSummaryEnforcesItsInvariantAtConstruction:
         summary = parse_reclaim_summary(DF_LINE)
 
         pytest.raises(dataclasses.FrozenInstanceError, setattr, summary, 'fields', ())
+
+
+_LOGGER = 'orchestrator.warm_lane_gc_summary'
+_PASS_RECORD = '_run_warm_lane_gc_reclaim: reclaim pass'
+_SCRIPT = Path('/x/warm-lane-gc.sh')
+
+
+def _kv(message: str) -> dict[str, str]:
+    return dict(re.findall(r'(\w+)=(\S+)', message))
+
+
+def _records(caplog: pytest.LogCaptureFixture, level: int) -> list[str]:
+    return [
+        r.getMessage() for r in caplog.records
+        if r.name == _LOGGER and r.levelno == level
+    ]
+
+
+def _log(caplog: pytest.LogCaptureFixture, *, rc: int, stdout: str, stderr: str = '',
+         origin: str = 'dark-factory', duration_secs: float = 1.25) -> None:
+    with caplog.at_level(logging.DEBUG, logger=_LOGGER):
+        log_reclaim_outcome(
+            rc=rc, stdout=stdout, stderr=stderr, script=_SCRIPT,
+            origin=origin, duration_secs=duration_secs,
+        )
+
+
+class TestLogReclaimOutcomePassRecord:
+    @pytest.mark.parametrize(
+        ('origin', 'line'), [('dark-factory', DF_LINE), ('project', REIFY_LINE)],
+    )
+    def test_one_info_record_carries_origin_script_duration_and_every_field(
+        self, caplog: pytest.LogCaptureFixture, origin: str, line: str,
+    ) -> None:
+        _log(caplog, rc=0, stdout=line + '\n', origin=origin)
+
+        infos = _records(caplog, logging.INFO)
+        assert len(infos) == 1, infos
+        assert infos[0].startswith(_PASS_RECORD)
+        fields = _kv(infos[0])
+        assert fields['origin'] == origin
+        assert fields['script'] == str(_SCRIPT)
+        assert float(fields['duration_s']) == 1.25
+        for name, value in _expected_fields(line).items():
+            assert fields[name] == str(value)
+        assert _records(caplog, logging.WARNING) == []
+
+    def test_a_reify_pass_carries_no_record_gate_field(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        _log(caplog, rc=0, stdout=REIFY_LINE, origin='project')
+
+        (info,) = _records(caplog, logging.INFO)
+        assert 'preserved_assigned' not in _kv(info)
+
+
+class TestLogReclaimOutcomeUncountedPass:
+    def test_rc0_without_a_summary_warns_uncounted(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        _log(caplog, rc=0, stdout='HEADROOM lanes=1\n', origin='project')
+
+        assert _records(caplog, logging.INFO) == []
+        (warning,) = _records(caplog, logging.WARNING)
+        assert str(_SCRIPT) in warning
+        assert 'project' in warning
+        assert 'uncounted' in warning
+        assert 'seed script' not in warning
+
+    def test_rc0_with_a_malformed_summary_names_the_missing_field(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        _log(caplog, rc=0, stdout='reclaim: reset=1 removed=0\n')
+
+        assert _records(caplog, logging.INFO) == []
+        (warning,) = _records(caplog, logging.WARNING)
+        assert 'preserved' in warning
+        assert 'uncounted' in warning
+
+
+class TestLogReclaimOutcomeScriptFailure:
+    def test_nonzero_rc_warns_with_stderr_and_records_no_pass(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        _log(caplog, rc=2, stdout=DF_LINE + '\n', stderr='boom')
+
+        assert _records(caplog, logging.INFO) == []
+        (warning,) = _records(caplog, logging.WARNING)
+        assert 'script exited 2' in warning
+        assert 'boom' in warning
