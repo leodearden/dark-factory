@@ -827,6 +827,127 @@ class TestAcquireClearsForeignTaskMeta:
 
 
 # ---------------------------------------------------------------------------
+# reviews/ freshness across a real warm-lane handoff (task 3158; PRD
+# plans/task-meta-task-keying-prd.md M4, boundary B7). Every view is built the
+# way a production dispatch builds it, through TaskArtifacts.for_task.
+# ---------------------------------------------------------------------------
+
+
+def _blocking_review(reviewer: str) -> dict:
+    return {
+        'reviewer': reviewer,
+        'verdict': 'ISSUES_FOUND',
+        'issues': [{
+            'severity': 'blocking', 'location': 'a.py:1',
+            'category': 'bug', 'description': f'stale finding from {reviewer}',
+        }],
+        'summary': 'stale',
+    }
+
+
+def _dispatch_view(lane: Path, task_id: str) -> TaskArtifacts:
+    arts = TaskArtifacts.for_task(lane, task_id)
+    arts.init(task_id, f'Task {task_id}', 'desc')
+    return arts
+
+
+@pytest.mark.asyncio
+class TestWarmLaneHandoffReviewFreshness:
+    """A lane handoff never shows the incoming dispatch another dispatch's
+    reviews, and never destroys another task's task-lifetime reviews."""
+
+    async def test_recycle_to_another_task_neither_leaks_nor_destroys_reviews(
+        self, git_repo: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        await _add_warm_lane_scripts(git_repo)
+        git_ops = GitOps(_warm_config(), git_repo, warm_lane_pool_size=1)
+        start_ref = await _get_head(git_repo)
+
+        first = await git_ops.acquire_warm_lane('OLD', start_ref)
+        assert isinstance(first, WorktreeInfo), f'Expected WorktreeInfo; got {first!r}'
+        lane = first.path
+        _dispatch_view(lane, 'OLD').write_review(
+            'reviewer_comprehensive', _blocking_review('reviewer_comprehensive'),
+        )
+        assert git_ops.warm_lane_pool is not None
+        await git_ops.warm_lane_pool.release(lane)
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.git_ops'):
+            result = await git_ops.acquire_warm_lane('NEW', start_ref)
+
+        assert isinstance(result, WorktreeInfo), f'Expected WorktreeInfo; got {result!r}'
+        assert result.path == lane
+        _assert_route_logged(caplog, AcquireRoute.RECYCLE)
+        agg = _dispatch_view(result.path, 'NEW').aggregate_reviews()
+        assert agg.reviews == {} and agg.errored_reviews == {}
+        assert agg.has_blocking_issues is False
+        assert set(TaskArtifacts.for_task(lane, 'OLD').read_reviews()) == {
+            'reviewer_comprehensive',
+        }
+
+    async def test_same_task_reuse_never_reads_lane_root_review_residue(
+        self, git_repo: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        await _add_warm_lane_scripts(git_repo)
+        git_ops = GitOps(_warm_config(), git_repo, warm_lane_pool_size=1)
+        start_ref = await _get_head(git_repo)
+
+        first = await git_ops.acquire_warm_lane('OLD', start_ref)
+        assert isinstance(first, WorktreeInfo), f'Expected WorktreeInfo; got {first!r}'
+        lane = first.path
+        _dispatch_view(lane, 'OLD')
+        residue_dir = TaskArtifacts.meta_root_for(git_ops.worktree_base, lane.name) / 'reviews'
+        residue_dir.mkdir(parents=True, exist_ok=True)
+        (residue_dir / 'reviewer_comprehensive.json').write_text(
+            json.dumps(_blocking_review('reviewer_comprehensive'))
+        )
+        assert git_ops.warm_lane_pool is not None
+        await git_ops.warm_lane_pool.release(lane)
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.git_ops'):
+            result = await git_ops.acquire_warm_lane('OLD', start_ref)
+
+        assert isinstance(result, WorktreeInfo), f'Expected WorktreeInfo; got {result!r}'
+        assert result.path == lane
+        _assert_route_logged(caplog, AcquireRoute.DISK_BACKSTOP_REUSE)
+        agg = _dispatch_view(result.path, 'OLD').aggregate_reviews()
+        assert agg.reviews == {} and agg.errored_reviews == {}
+        assert agg.has_blocking_issues is False
+
+    async def test_same_task_reuse_carries_prior_reviews_until_cleared(
+        self, git_repo: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        await _add_warm_lane_scripts(git_repo)
+        git_ops = GitOps(_warm_config(), git_repo, warm_lane_pool_size=1)
+        start_ref = await _get_head(git_repo)
+
+        first = await git_ops.acquire_warm_lane('OLD', start_ref)
+        assert isinstance(first, WorktreeInfo), f'Expected WorktreeInfo; got {first!r}'
+        lane = first.path
+        prior = _dispatch_view(lane, 'OLD')
+        prior.write_plan({'steps': [{'id': 'step-1', 'status': 'done', 'commit': 'abc'}]})
+        prior.set_review_counters(review_cycles_total=1)
+        prior.write_review('reviewer_comprehensive', _blocking_review('reviewer_comprehensive'))
+        assert git_ops.warm_lane_pool is not None
+        await git_ops.warm_lane_pool.release(lane)
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.git_ops'):
+            result = await git_ops.acquire_warm_lane('OLD', start_ref)
+
+        assert isinstance(result, WorktreeInfo), f'Expected WorktreeInfo; got {result!r}'
+        assert result.path == lane
+        _assert_route_logged(caplog, AcquireRoute.DISK_BACKSTOP_REUSE)
+        redispatch = _dispatch_view(result.path, 'OLD')
+        assert set(redispatch.read_reviews()) == {'reviewer_comprehensive'}
+
+        redispatch.clear_reviews()
+
+        assert redispatch.read_reviews() == {}
+        assert [s['id'] for s in redispatch.read_plan()['steps']] == ['step-1']
+        assert redispatch.get_review_cycles_total() == 1
+
+
+# ---------------------------------------------------------------------------
 # Identity guard must read the RELOCATED .task-meta (W11 epsilon1 regression):
 # read_worktree_title used to read only <worktree>/.task/, which the epsilon1
 # relocation leaves permanently empty, so identities_match(None, ...) fails

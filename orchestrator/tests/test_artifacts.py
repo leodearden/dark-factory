@@ -5,6 +5,7 @@ import errno
 import json
 import os
 import re
+import shutil
 import stat
 import sys
 import threading
@@ -2828,6 +2829,97 @@ class TestDualRootRouting(_DualRootLayout):
     def test_unheld_mutex_claim_names_the_task_plan(self, arts, task):
         with pytest.raises(PlanMutexNotHeld, match=re.escape(str(task / 'plan.json'))):
             arts.write_plan(copy.deepcopy(_PLAN), mutex_held=True)
+
+
+def _blocking_review(reviewer: str) -> dict:
+    return {
+        'reviewer': reviewer,
+        'verdict': 'ISSUES_FOUND',
+        'issues': [{
+            'severity': 'blocking', 'location': 'a.py:1',
+            'category': 'bug', 'description': f'stale finding from {reviewer}',
+        }],
+        'summary': 'stale',
+    }
+
+
+def _pass_review(reviewer: str) -> dict:
+    return {'reviewer': reviewer, 'verdict': 'PASS', 'issues': [], 'summary': 'ok'}
+
+
+class TestClearReviews(_DualRootLayout):
+    """``clear_reviews()`` empties reviews/ so the next aggregation holds only
+    reviews written after it (task 3158; PRD plans/task-meta-task-keying-prd.md
+    boundary B7)."""
+
+    def test_removes_every_review_and_keeps_the_dir(self, artifacts: TaskArtifacts):
+        artifacts.write_review('reviewer_comprehensive', _pass_review('reviewer_comprehensive'))
+        artifacts.write_review('merge', _blocking_review('merge'))
+        reviews_dir = artifacts.artifact_path('reviews')
+        (reviews_dir / 'notes.txt').write_text('stray\n')
+
+        artifacts.clear_reviews()
+
+        assert reviews_dir.is_dir()
+        assert list(reviews_dir.iterdir()) == []
+        assert artifacts.read_reviews() == {}
+
+    def test_a_retired_reviewers_blocking_file_is_not_aggregated_after_clear(
+        self, artifacts: TaskArtifacts,
+    ):
+        artifacts.write_review('reviewer_retired', _blocking_review('reviewer_retired'))
+
+        artifacts.clear_reviews()
+        artifacts.write_review('reviewer_comprehensive', _pass_review('reviewer_comprehensive'))
+
+        agg = artifacts.aggregate_reviews()
+        assert agg.has_blocking_issues is False
+        assert set(agg.reviews) == {'reviewer_comprehensive'}
+        assert agg.reviewer_errors == []
+
+    def test_leaves_archives_verdicts_review_state_and_plan_alone(
+        self, artifacts: TaskArtifacts,
+    ):
+        archive = artifacts.review_archive_dir('amend-1')
+        archive.mkdir()
+        (archive / 'reviewer_comprehensive.json').write_text(
+            json.dumps(_blocking_review('reviewer_comprehensive'))
+        )
+        artifacts.write_verdict('judge', _VERDICT)
+        artifacts.set_review_counters(review_cycles_total=2)
+        artifacts.write_plan(copy.deepcopy(_PLAN))
+        artifacts.write_review('reviewer_comprehensive', _pass_review('reviewer_comprehensive'))
+
+        artifacts.clear_reviews()
+
+        assert (archive / 'reviewer_comprehensive.json').is_file()
+        assert artifacts.read_verdict('judge') == _VERDICT
+        assert artifacts.get_review_cycles_total() == 2
+        assert artifacts.read_plan()['steps'] == _PLAN['steps']
+
+    def test_is_idempotent(self, artifacts: TaskArtifacts):
+        artifacts.write_review('reviewer_comprehensive', _pass_review('reviewer_comprehensive'))
+
+        artifacts.clear_reviews()
+        artifacts.clear_reviews()
+
+        assert artifacts.read_reviews() == {}
+
+    def test_root_gone_is_a_no_op_that_recreates_nothing(self, artifacts: TaskArtifacts):
+        shutil.rmtree(artifacts.task_root)
+
+        artifacts.clear_reviews()
+
+        assert not artifacts.task_root.exists()
+
+    def test_dual_root_empties_the_task_root_reviews(self, arts, task):
+        arts.write_review('reviewer_comprehensive', _pass_review('reviewer_comprehensive'))
+        assert (task / 'reviews' / 'reviewer_comprehensive.json').is_file()
+
+        arts.clear_reviews()
+
+        assert (task / 'reviews').is_dir()
+        assert list((task / 'reviews').iterdir()) == []
 
 
 class TestReadTitle:
