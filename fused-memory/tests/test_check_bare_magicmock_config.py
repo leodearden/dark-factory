@@ -16,14 +16,11 @@ import subprocess
 import sys
 from collections.abc import Iterable
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, NamedTuple
+from typing import NamedTuple
 
 import pytest
 from _fm_helpers import load_script_module
 from shared.testing_xdist_groups import single_xdist_group
-
-if TYPE_CHECKING:
-    from _lint_cli import Violation
 
 # Load the checker script via importlib to avoid sys.path pollution.
 # fused-memory/scripts/ is not on PYTHONPATH per pyproject.toml (pythonpath=['src']).
@@ -33,6 +30,7 @@ SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'check_bare_magicmock_c
 _checker = load_script_module(SCRIPT_PATH, mod_name='check_bare_magicmock_config')
 find_violations = _checker.find_violations
 _lint_cli = load_script_module(SCRIPT_PATH.with_name('_lint_cli.py'))
+Violation = _lint_cli.Violation
 
 
 class TestFindViolationsConfigNameDetection:
