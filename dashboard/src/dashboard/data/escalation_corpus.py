@@ -4,7 +4,7 @@ Declared by ``plans/dashboard-one-datum-one-path-prd.md``, decision 13, and
 this module is that datum's single access implementation: every escalation
 surface — the Escalations tab's live-queue table and the analytics
 aggregates — reads the same walk through :func:`acquire_corpus` and its one
-cache. "Pending in the live queue" and "open in history" are two named views
+cache, directly or through :func:`serve_corpus`'s bounded wait. "Pending in the live queue" and "open in history" are two named views
 over that walk (:class:`EscalationView`), so the two can no longer count
 different populations at different freshnesses.
 
@@ -43,6 +43,7 @@ from shared.task_tags import DEFAULT_TAG
 from dashboard.config import DashboardConfig
 from dashboard.data.datum import Datum, DatumState, unknown_datum
 from dashboard.data.mcp_fanout import TTLCache
+from dashboard.data.served_read import ServedRead
 
 logger = logging.getLogger(__name__)
 
@@ -227,9 +228,15 @@ _corpus_cache: TTLCache[Datum[EscalationCorpus], tuple[QueueRef, ...]] = TTLCach
 )
 
 
+_served_corpus: ServedRead[tuple[QueueRef, ...], EscalationCorpus] = ServedRead(
+    ttl_seconds=lambda: 0.0, freshness_bound_seconds=CORPUS_FRESHNESS_BOUND_SECONDS,
+)
+
+
 def _corpus_cache_clear() -> None:
-    """Clear the corpus cache (test/admin hook)."""
+    """Clear the corpus cache and its last good walk (test/admin hook)."""
     _corpus_cache.clear()
+    _served_corpus.clear()
 
 
 def measure_corpus(queues: Iterable[QueueRef], *, now: datetime) -> Datum[EscalationCorpus]:
@@ -251,6 +258,20 @@ async def acquire_corpus(
 
     return await _corpus_cache.get_or_refresh(
         key, _refresh, cache_ok=lambda datum: datum.value is not None and datum.value.reached_any,
+    )
+
+
+async def serve_corpus(
+    queues: Iterable[QueueRef], *, now: datetime, wait_seconds: float | None,
+) -> Datum[EscalationCorpus]:
+    """:func:`acquire_corpus`, waited on for at most *wait_seconds* and never raising.
+
+    A walk that raises or misses the wait is served as the last good walk, stale,
+    or unknown before any; a slow walk still lands in the one walk cache.
+    """
+    key = tuple(queues)
+    return await _served_corpus.serve(
+        key, lambda: acquire_corpus(key, now=now), now=now, wait_seconds=wait_seconds,
     )
 
 
