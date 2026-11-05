@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import closing, contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -22,12 +22,14 @@ import aiosqlite
 import httpx
 from _canned_mcp import CannedMCP, _raw_row
 from _dt_helpers import make_fixed_datetime_cls
+from _prd_lanes_tree import Scenario, holder_processes, lanes_tree, sidecar, tree_tasks
 from _prd_tree import prd_tree_tasks
-from _runs_db_fixture import EVENTS_DDL, runs_db_path
+from _runs_db_fixture import EVENTS_DDL, EventRow, runs_db_path, write_runs_db
 from escalation.archive import archive_dir_for_date
 from escalation.models import DeliveredCheckOwner, Escalation
 from escalation.queue import EscalationQueue
 from fastapi.testclient import TestClient
+from shared.capability_manifest import sidecar_path
 from shared.locking import files_to_modules
 from shared.task_statuses import TaskStatus
 
@@ -38,7 +40,9 @@ from dashboard.config import DashboardConfig
 from dashboard.data import escalation_corpus
 from dashboard.data.active_tasks import reset_task_snapshot_state
 from dashboard.data.burndown import BURNDOWN_SCHEMA, collect_snapshot
-from dashboard.data.scheduler import _scheduler_cache_clear
+from dashboard.data.prd_signal import clear_prd_documents
+from dashboard.data.scheduler import _scheduler_cache_clear, clear_scheduler_state
+from dashboard.data.task_activity import clear_activity_state
 from dashboard.data.task_lineage import clear_lineage_state
 
 T0 = datetime(2026, 10, 4, 9, 0, 0, tzinfo=UTC)
@@ -157,6 +161,15 @@ LOCKED_FILE = 'src/m/x.py'
 LOCK_DEPTH = 2
 LOCKED_MODULE = files_to_modules([LOCKED_FILE], LOCK_DEPTH)[0]
 
+SCHEDULER_SNAPSHOT_AT = T0 - timedelta(hours=2)
+"""When every canned root's scheduler last wrote its state file: hours before any read of it."""
+CANNED_SCHEDULER_STATE: Mapping[str, Any] = {
+    'lock_depth': LOCK_DEPTH,
+    'current_holders': {LOCKED_MODULE: '1'},
+    'snapshot_at': SCHEDULER_SNAPSHOT_AT.isoformat(),
+}
+"""The scheduler state every canned root serves unless its scenario names another."""
+
 
 def ragged_day(index: int) -> datetime:
     """The instant of daily sample *index*: 7 is t2, 6 is t1."""
@@ -226,6 +239,40 @@ class _ByRoot:
         return await substrate(client, url, tool, args, **kwargs)
 
 
+class _SchedulerByRoot:
+    """The scheduler fan-out, one canned state per root label; a label mapped to ``None`` is
+    unreachable. Every other root serves :data:`CANNED_SCHEDULER_STATE`, and no root has events."""
+
+    def __init__(self, states: Mapping[str, Mapping[str, Any] | None]) -> None:
+        self._states = states
+
+    async def __call__(self, _client, _url, tool, args, **_kwargs):
+        state = self._states.get(Path(args['project_root']).name, CANNED_SCHEDULER_STATE)
+        if state is None:
+            raise httpx.ConnectError('canned scheduler unreachable')
+        return dict(state) if tool == 'get_scheduler_state' else []
+
+
+def quiet_ledgers(root: Path) -> None:
+    """An empty run ledger and an empty escalation queue: a project that has recorded nothing."""
+    write_runs_db(root)
+    (root / 'data' / 'escalations').mkdir(parents=True, exist_ok=True)
+
+
+def _quietly(labels: Iterable[str]) -> dict[str, Callable[[Path], object]]:
+    return dict.fromkeys(labels, quiet_ledgers)
+
+
+def _forget_served_reads() -> None:
+    """Every access store a route reads, forgotten through its own public hook."""
+    reset_task_snapshot_state()
+    clear_lineage_state()
+    clear_scheduler_state()
+    clear_activity_state()
+    clear_prd_documents()
+    _clear_corpus()
+
+
 def _get(client: TestClient, path: str, **params: str) -> dict[str, Any]:
     resp = client.get(path, params=params)
     assert resp.status_code == 200, resp.text
@@ -234,21 +281,29 @@ def _get(client: TestClient, path: str, **params: str) -> dict[str, Any]:
 
 @contextmanager
 def _canned_roots(
-    client: TestClient, workdir: Path, substrates: Mapping[str, CannedMCP],
+    client: TestClient,
+    workdir: Path,
+    substrates: Mapping[str, CannedMCP],
+    *,
+    schedulers: Mapping[str, Mapping[str, Any] | None] | None = None,
+    furnish: Mapping[str, Callable[[Path], object]] | None = None,
 ) -> Iterator[Callable[[datetime], dict[str, Any]]]:
     """Configure the app over one tmp root per substrate; yield GET /tasks at a named instant.
 
     Every task read under it, by any route or by the sampler, is answered by
-    the substrate its root is labelled with. The unit TTL is zero, so every
-    acquisition reads the substrate and a failure lands on the very next one;
-    the last good store is what survives.
+    the substrate its root is labelled with, and every scheduler read by
+    *schedulers* (see :class:`_SchedulerByRoot`), so no read reaches a live
+    fused-memory. *furnish* lays out a labelled root's files before the first
+    read. The unit TTL is zero, so every acquisition reads the substrate and a
+    failure lands on the very next one; the last good store is what survives.
     """
     roots = [workdir / label for label in substrates]
     for root in roots:
         root.mkdir(parents=True)
+        if furnish is not None and root.name in furnish:
+            furnish[root.name](root)
     app.state.config = DashboardConfig(project_root=roots[0], known_project_roots=roots[1:])
-    reset_task_snapshot_state()
-    clear_lineage_state()
+    _forget_served_reads()
 
     def render(at: datetime) -> dict[str, Any]:
         with patch('dashboard.api.tasks.resolve_now', new=lambda _now: at):
@@ -257,13 +312,13 @@ def _canned_roots(
     try:
         with (
             patch('dashboard.data.tasks.mcp_tool_call', new=_ByRoot(substrates)),
+            patch('dashboard.data.scheduler.mcp_tool_call', new=_SchedulerByRoot(schedulers or {})),
             patch('dashboard.data.active_tasks.fetch_task_runtime', new=AsyncMock(return_value={})),
             patch.object(snapshot_mod, 'SNAPSHOT_TTL_SECONDS', 0.0),
         ):
             yield render
     finally:
-        reset_task_snapshot_state()
-        clear_lineage_state()
+        _forget_served_reads()
 
 
 def _census_family(client: TestClient, workdir: Path) -> dict[str, Any]:
@@ -587,10 +642,17 @@ def _render_prds(client: TestClient, at: datetime) -> dict[str, Any]:
 
 @contextmanager
 def canned_prd_roots(
-    client: TestClient, workdir: Path, substrates: Mapping[str, CannedMCP],
+    client: TestClient,
+    workdir: Path,
+    substrates: Mapping[str, CannedMCP],
+    *,
+    schedulers: Mapping[str, Mapping[str, Any] | None] | None = None,
 ) -> Iterator[Callable[[datetime], dict[str, Any]]]:
-    """:func:`_canned_roots`, yielding GET /prds at a named instant."""
-    with _canned_roots(client, workdir, substrates):
+    """:func:`_canned_roots` over quiet roots (:func:`quiet_ledgers`), yielding GET /prds at a
+    named instant."""
+    with _canned_roots(
+        client, workdir, substrates, schedulers=schedulers, furnish=_quietly(substrates),
+    ):
         yield lambda at: _render_prds(client, at)
 
 
@@ -604,23 +666,151 @@ def prd_view_family(client: TestClient, workdir: Path) -> dict[str, Any]:
     bodies: dict[str, Any] = {}
 
     two_projects = {'dark-factory': prd_tree(), 'reify': _substrate(REIFY_COUNTS)}
-    with _canned_roots(client, workdir / 'prd_view_fresh', two_projects):
+    with _canned_roots(
+        client, workdir / 'prd_view_fresh', two_projects, furnish=_quietly(two_projects),
+    ):
         bodies['prd_view_fresh'] = _render_prds(client, T0)
 
     growing = prd_tree()
-    with _canned_roots(client, workdir / 'prd_view_overlay', {'dark-factory': growing}):
+    with _canned_roots(
+        client, workdir / 'prd_view_overlay', {'dark-factory': growing},
+        furnish=_quietly(['dark-factory']),
+    ):
         _render_prds(client, T0)
         _grow_past_lineage(growing)
         bodies['prd_view_overlay'] = _render_prds(client, T0 + timedelta(seconds=20))
 
     failing = prd_tree()
-    with _canned_roots(client, workdir / 'prd_view_map_failed', {'dark-factory': failing}) as render_tasks:
+    with _canned_roots(
+        client, workdir / 'prd_view_map_failed', {'dark-factory': failing},
+        furnish=_quietly(['dark-factory']),
+    ) as render_tasks:
         _render_prds(client, T0)
         _fail_status_map(failing)
         failed_at = T0 + timedelta(seconds=20)
         bodies['prd_view_map_failed'] = _render_prds(client, failed_at)
         bodies['prd_view_map_failed_tasks'] = render_tasks(failed_at)
 
+    return bodies
+
+
+LANES_ROOT = 'dark-factory'
+"""The lanes family's root holding the lanes tree, its run ledger, queue, sidecars and PRD files."""
+QUEUELESS_ROOT = 'reify'
+"""The lanes family's second root: a run ledger but no escalation queue, so the corpus as a
+whole is a lower bound while :data:`LANES_ROOT`'s own queue is read whole."""
+
+
+def lane_title(key: str) -> str:
+    """The H1 of the fixture PRD file at *key*."""
+    return f'Lanes fixture {key}'
+
+
+def lanes_substrate(tree: Mapping[str, Scenario]) -> CannedMCP:
+    """*tree*'s tasks, the outside tasks included, served raw as one project's substrate."""
+    tasks = tree_tasks(tree)
+    rows = [
+        _raw_row(
+            task_id, task.status, priority=task.priority,
+            dependencies=list(task.dependencies), metadata=dict(task.metadata),
+        )
+        for task_id, task in tasks.items()
+    ]
+    return CannedMCP(rows, {task_id: task.status for task_id, task in tasks.items()}, status_page_size=2000)
+
+
+def _lane_events(tree: Mapping[str, Scenario]) -> list[EventRow]:
+    events: list[EventRow] = []
+    for scenario in tree.values():
+        events.extend((at, str(task_id), 'task_started', {}) for task_id, at in scenario.started.items())
+        events.extend(
+            (at, str(task_id), 'task_completed', {'outcome': 'done'})
+            for task_id, at in scenario.completed.items()
+        )
+    return events
+
+
+def _file_lane_escalations(root: Path, tree: Mapping[str, Scenario]) -> None:
+    queue = EscalationQueue(root / 'data' / 'escalations')
+    for scenario in tree.values():
+        for filed in scenario.escalations:
+            queue.submit(Escalation(
+                id=filed.escalation_id,
+                task_id=str(filed.task_id),
+                agent_role='boundary-suite',
+                severity='blocking',
+                category='cleanup_needed',
+                summary=f'lanes escalation on #{filed.task_id}',
+                timestamp=(T0 - timedelta(hours=1)).isoformat(),
+                status='pending',
+                level=filed.level,
+            ))
+
+
+def _furnish_lanes(tree: Mapping[str, Scenario], *, ledger_readable: bool = True) -> Callable[[Path], None]:
+    """Lay out :data:`LANES_ROOT`: its run ledger (or bytes that are no database), its escalation
+    queue, and each scenario's PRD file and sidecar."""
+
+    def furnish(root: Path) -> None:
+        if ledger_readable:
+            write_runs_db(root, _lane_events(tree))
+        else:
+            runs_db_path(root).parent.mkdir(parents=True)
+            runs_db_path(root).write_bytes(b'this is not a sqlite database\n' * 64)
+        _file_lane_escalations(root, tree)
+        for scenario in tree.values():
+            prd_file = root / scenario.key
+            prd_file.parent.mkdir(parents=True, exist_ok=True)
+            prd_file.write_text(f'# {lane_title(scenario.key)}\n\nA lanes fixture PRD.\n')
+            if (raw := sidecar(scenario)) is not None:
+                (root / sidecar_path(scenario.key)).write_text(json.dumps(raw))
+
+    return furnish
+
+
+def _projected_read(call: dict) -> bool:
+    return call['tool'] == 'get_tasks' and call['args'].get('fields') is not None
+
+
+def prd_lanes_family(client: TestClient, workdir: Path) -> dict[str, Any]:
+    """Boundary rows 13–19 end to end: the lanes tree served through every γ2 input.
+
+    :data:`LANES_ROOT` serves the lanes tree with its run ledger, escalation
+    queue, sidecars and PRD files, and :data:`QUEUELESS_ROOT` a plain tree with
+    a run ledger and no queue. The live session holder is a real process alive
+    while every body is served. ``prd_lanes_scheduler_offline`` has an
+    unreachable scheduler on :data:`LANES_ROOT`; ``prd_lanes_runs_db_unreadable``
+    a run ledger that is no database; ``prd_lanes_lineage_failed`` a lineage
+    read that fails.
+    """
+    bodies: dict[str, Any] = {}
+    with holder_processes() as (live, dead):
+        tree = lanes_tree(T0, live_holder=live, dead_holder=dead)
+
+        def serve(
+            name: str,
+            *,
+            schedulers: Mapping[str, Mapping[str, Any] | None] | None = None,
+            ledger_readable: bool = True,
+            lineage_fails: bool = False,
+        ) -> None:
+            substrate = lanes_substrate(tree)
+            if lineage_fails:
+                substrate.fail_when = _projected_read
+            substrates = {LANES_ROOT: substrate, QUEUELESS_ROOT: _substrate(REIFY_COUNTS)}
+            furnish = {
+                LANES_ROOT: _furnish_lanes(tree, ledger_readable=ledger_readable),
+                QUEUELESS_ROOT: write_runs_db,
+            }
+            with _canned_roots(
+                client, workdir / name, substrates, schedulers=schedulers, furnish=furnish,
+            ):
+                bodies[name] = _render_prds(client, T0)
+
+        serve('prd_lanes')
+        serve('prd_lanes_scheduler_offline', schedulers={LANES_ROOT: None})
+        serve('prd_lanes_runs_db_unreadable', ledger_readable=False)
+        serve('prd_lanes_lineage_failed', lineage_fails=True)
     return bodies
 
 
@@ -649,4 +839,5 @@ def build_all(workdir: Path) -> dict[str, Any]:
             **_corpus_family(client, workdir),
             **_check_owner_family(client, workdir),
             **prd_view_family(client, workdir),
+            **prd_lanes_family(client, workdir),
         }

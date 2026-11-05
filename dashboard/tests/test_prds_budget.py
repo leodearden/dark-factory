@@ -3,7 +3,8 @@
 Written in the idiom of ``test_tasks_budget.py``: shipped constants only, no
 fakes and no event loop, the browser's fetch abort parsed out of the shipped
 ``data.js``, and every name read is public. The /prds handler acquires each
-root's snapshot unit and lineage index inside a per-root share of a
+root's snapshot unit, lineage index, scheduler state and task activity
+together, then that root's PRD documents, inside a per-root share of a
 whole-handler deadline, so the same arithmetic must hold here: each part
 fits the layer above it, and the whole fits the browser's abort.
 """
@@ -14,7 +15,15 @@ import re
 from pathlib import Path
 
 from dashboard.api import prds
-from dashboard.data import task_lineage, task_snapshot, tasks
+from dashboard.data import (
+    escalation_corpus,
+    prd_signal,
+    scheduler,
+    task_activity,
+    task_lineage,
+    task_snapshot,
+    tasks,
+)
 
 _DATA_JS = Path(prds.__file__).parent.parent / 'static' / 'redux' / 'data.js'
 _ABORT_MS_RE = re.compile(r'DEFAULT_TIMEOUT_MS\s*=\s*(\d+)')
@@ -50,6 +59,32 @@ def test_prds_budget_is_structurally_deliverable() -> None:
     assert 1 < budget.root_concurrency <= 8
 
 
+_REQUEST_WAITS = {
+    'lineage': task_lineage.LINEAGE_REQUEST_WAIT_SECONDS,
+    'scheduler state': scheduler.SCHEDULER_STATE_REQUEST_WAIT_SECONDS,
+    'activity': task_activity.ACTIVITY_REQUEST_WAIT_SECONDS,
+    'documents': prd_signal.PRD_DOCUMENTS_REQUEST_WAIT_SECONDS,
+}
+
+
+def test_every_request_wait_lands_as_a_degraded_input_not_a_degraded_root() -> None:
+    per_project = prds.PRDS_BUDGET.per_project
+    over = {name: wait for name, wait in _REQUEST_WAITS.items() if wait >= per_project}
+    assert not over, (
+        f'request waits {over} reach the {per_project}s per-root share, so a slow read '
+        'would degrade the whole root instead of landing for the next poll'
+    )
+
+
+def test_the_documents_stage_fits_after_the_snapshot_reads() -> None:
+    snapshot_reads = task_snapshot.PER_CALL_TIMEOUT * len(task_snapshot.PER_PROJECT_MCP_CALLS)
+    sequential = snapshot_reads + prd_signal.PRD_DOCUMENTS_REQUEST_WAIT_SECONDS
+    assert sequential <= prds.PRDS_BUDGET.per_project, (
+        f'the documents read waits after the snapshot unit, {sequential}s in all, beyond '
+        f'the {prds.PRDS_BUDGET.per_project}s per-root share'
+    )
+
+
 def test_the_lineage_read_releases_its_slot_before_the_next_refresh() -> None:
     cold_read = len(tasks.COLD_SESSION_POSTS) * task_lineage.LINEAGE_PER_CALL_TIMEOUT
     assert task_lineage.LINEAGE_TTL_SECONDS < task_lineage.LINEAGE_FRESHNESS_BOUND_SECONDS
@@ -58,7 +93,14 @@ def test_the_lineage_read_releases_its_slot_before_the_next_refresh() -> None:
 
 
 def test_a_stand_in_view_states_the_loosest_input_bound() -> None:
-    loosest = max(task_snapshot.FRESHNESS_BOUND_SECONDS, task_lineage.LINEAGE_FRESHNESS_BOUND_SECONDS)
+    loosest = max(
+        task_snapshot.FRESHNESS_BOUND_SECONDS,
+        task_lineage.LINEAGE_FRESHNESS_BOUND_SECONDS,
+        escalation_corpus.CORPUS_FRESHNESS_BOUND_SECONDS,
+        scheduler.SCHEDULER_STATE_FRESHNESS_BOUND_SECONDS,
+        task_activity.ACTIVITY_FRESHNESS_BOUND_SECONDS,
+        prd_signal.PRD_DOCUMENTS_FRESHNESS_BOUND_SECONDS,
+    )
     assert loosest == prds.STAND_IN_VIEW_BOUND_SECONDS
 
 

@@ -9,17 +9,21 @@ Each :class:`Scenario` is one PRD: its tasks, the run-ledger events and
 escalations naming them, and its sidecar's signal leaves when it has one.
 :data:`OUTSIDE_TASKS` are the tasks no PRD owns that scenarios point at: a
 pending carrier and a pending outside dependency. Task ids are unique across
-the whole tree, so every scenario can be drawn from one status map.
+the whole tree, so every scenario can be drawn from one status map. The
+session holders the tree names are real processes, from :func:`holder_processes`.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import subprocess
+import sys
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from types import MappingProxyType
 from typing import Any, NamedTuple
 
-from shared.process_identity import ProcessIdentity
+from shared.process_identity import ProcessIdentity, capture
 from shared.task_deferral import (
     CarriedByDeferral,
     Deferral,
@@ -71,6 +75,40 @@ OUTSIDE_TASKS: Mapping[int, LaneTask] = MappingProxyType({
     CARRIER: LaneTask('pending', {}),
     OUTSIDE_DEPENDENCY: LaneTask('pending', {}),
 })
+
+
+@contextmanager
+def holder_processes() -> Iterator[tuple[ProcessIdentity, ProcessIdentity]]:
+    """A live holder, a real process alive until the block exits, and a dead one, already reaped."""
+    live = _blocked_child()
+    try:
+        dead = _blocked_child()
+        try:
+            dead_identity = _identity(dead)
+        finally:
+            _reap(dead)
+        yield _identity(live), dead_identity
+    finally:
+        _reap(live)
+
+
+def _blocked_child() -> subprocess.Popen[bytes]:
+    """A real process that runs until its stdin is closed."""
+    return subprocess.Popen(
+        [sys.executable, '-c', 'import sys; sys.stdin.read()'], stdin=subprocess.PIPE,
+    )
+
+
+def _identity(child: subprocess.Popen[bytes]) -> ProcessIdentity:
+    holder = capture(child.pid)
+    assert holder is not None, f'could not identify spawned child {child.pid}'
+    return holder
+
+
+def _reap(child: subprocess.Popen[bytes]) -> None:
+    assert child.stdin is not None
+    child.stdin.close()
+    child.wait(timeout=10)
 
 
 def prd_key(name: str) -> str:

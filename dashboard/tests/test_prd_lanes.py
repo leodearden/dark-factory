@@ -8,8 +8,6 @@ liveness is read from /proc (boundary rows 13, 14, 16, 17 and 18).
 from __future__ import annotations
 
 import dataclasses
-import subprocess
-import sys
 from collections import Counter
 from collections.abc import Callable, Iterator, Mapping
 from datetime import UTC, datetime, timedelta
@@ -17,9 +15,9 @@ from types import MappingProxyType
 from typing import Any
 
 import pytest
-from _prd_lanes_tree import Scenario, lanes_tree, sidecar, tree_tasks
+from _prd_lanes_tree import Scenario, holder_processes, lanes_tree, sidecar, tree_tasks
 from shared.capability_manifest import parse_capability_manifest
-from shared.process_identity import Liveness, ProcessIdentity, capture
+from shared.process_identity import Liveness
 from shared.task_statuses import TERMINAL
 
 from dashboard.data.census import build_census
@@ -54,46 +52,10 @@ AS_OF = NOW - timedelta(seconds=5)
 BOUND = 60
 
 
-def _blocked_child() -> subprocess.Popen[bytes]:
-    """A real process that runs until its stdin is closed."""
-    return subprocess.Popen(
-        [sys.executable, '-c', 'import sys; sys.stdin.read()'], stdin=subprocess.PIPE,
-    )
-
-
-def _identity(child: subprocess.Popen[bytes]) -> ProcessIdentity:
-    holder = capture(child.pid)
-    assert holder is not None, f'could not identify spawned child {child.pid}'
-    return holder
-
-
-def _reap(child: subprocess.Popen[bytes]) -> None:
-    assert child.stdin is not None
-    child.stdin.close()
-    child.wait(timeout=10)
-
-
 @pytest.fixture(scope='module')
-def live_holder() -> Iterator[ProcessIdentity]:
-    child = _blocked_child()
-    try:
-        yield _identity(child)
-    finally:
-        _reap(child)
-
-
-@pytest.fixture(scope='module')
-def dead_holder() -> ProcessIdentity:
-    child = _blocked_child()
-    try:
-        return _identity(child)
-    finally:
-        _reap(child)
-
-
-@pytest.fixture(scope='module')
-def tree(live_holder, dead_holder) -> Mapping[str, Scenario]:
-    return lanes_tree(NOW, live_holder=live_holder, dead_holder=dead_holder)
+def tree() -> Iterator[Mapping[str, Scenario]]:
+    with holder_processes() as (live, dead):
+        yield lanes_tree(NOW, live_holder=live, dead_holder=dead)
 
 
 def _fresh(value: Any) -> Datum[Any]:

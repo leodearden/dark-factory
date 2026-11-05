@@ -1,8 +1,9 @@
-"""Tests for ``GET /api/v2/dashboard/prds``: the per-root PRD view served as a Datum.
+"""Tests for ``GET /api/v2/dashboard/prds``: the per-root PRD view and contention line.
 
-Boundary rows 8, 9 and 11 at the endpoint (PRD dashboard-prd-lanes §4.4, §5.6),
-driven over the ``prd_view`` family of ``_boundary_payloads`` and its CannedMCP
-substrates. The pure view's own cases live in ``test_prd_view.py``.
+Boundary rows 8, 9, 11 and 13–19 at the endpoint (PRD dashboard-prd-lanes §4.4,
+§5.6), driven over the ``prd_view`` and ``prd_lanes`` families of
+``_boundary_payloads`` and their CannedMCP substrates. The pure halves live in
+``test_prd_view.py``, ``test_prd_lanes.py`` and ``test_prd_contention.py``.
 """
 
 from __future__ import annotations
@@ -10,6 +11,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import time
+from collections import Counter
 from collections.abc import Callable, Iterator
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -18,15 +20,22 @@ from typing import Any
 
 import pytest
 from _boundary_payloads import (
+    LANES_ROOT,
+    LOCK_DEPTH,
     ORPHAN,
     OVERLAY_ROW,
     PRD_C,
+    QUEUELESS_ROOT,
+    SCHEDULER_SNAPSHOT_AT,
     T0,
     canned_prd_roots,
+    lane_title,
+    prd_lanes_family,
     prd_tree,
     prd_view_family,
 )
 from _canned_mcp import CannedMCP
+from _prd_lanes_tree import prd_key
 from _prd_tree import PRD_A
 from fastapi.testclient import TestClient
 from shared.task_statuses import TaskStatus
@@ -53,6 +62,11 @@ def bodies(_client: TestClient, tmp_path_factory: pytest.TempPathFactory) -> dic
     return prd_view_family(_client, tmp_path_factory.mktemp('prd_view'))
 
 
+@pytest.fixture(scope='module')
+def lanes(_client: TestClient, tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
+    return prd_lanes_family(_client, tmp_path_factory.mktemp('prd_lanes'))
+
+
 def _row(view: dict[str, Any], key: str) -> dict[str, Any]:
     [row] = [row for row in view['value']['prds'] if row['key'] == key]
     return row
@@ -66,12 +80,18 @@ def _open_ids_listed(value: dict[str, Any]) -> list[int]:
     ]
 
 
-def test_the_body_carries_the_view_and_its_serving_instant(bodies):
-    assert set(bodies['prd_view_fresh']) == {'PRD_VIEW', 'served_at'}
+def test_the_body_carries_both_datums_and_its_serving_instant(bodies):
+    assert set(bodies['prd_view_fresh']) == {'PRD_VIEW', 'PRD_CONTENTION', 'served_at'}
 
 
-def test_the_view_is_keyed_by_every_configured_root(bodies):
+def test_both_datums_are_keyed_by_every_configured_root(bodies):
     assert set(bodies['prd_view_fresh']['PRD_VIEW']) == {ROOT, 'reify'}
+    assert set(bodies['prd_view_fresh']['PRD_CONTENTION']) == {ROOT, 'reify'}
+
+
+def test_a_quiet_root_serves_a_fresh_contention_line(bodies):
+    contention = bodies['prd_view_fresh']['PRD_CONTENTION'][ROOT]
+    assert contention['state'] == 'fresh', contention['reason']
 
 
 def test_a_fresh_view_counts_its_prd_exactly(bodies):
@@ -229,5 +249,114 @@ def test_a_slow_lineage_read_lands_for_the_next_request(client, tmp_path, monkey
     assert first['state'] == 'unknown'
     assert first['reason'].startswith('lineage: ')
     assert later['state'] == 'fresh'
-    assert [state['state'] for state in later['value']['inputs']] == ['fresh', 'fresh', 'fresh']
+    assert {state['state'] for state in later['value']['inputs']} == {'fresh'}
     assert len(_projected_reads(slow)) == 1
+
+
+# --- rows 13–19 end to end: the lanes tree through every input --------------
+
+
+_EXPECTED_LANES = {
+    'ruling_over_tail': 'ruling',
+    'gate_deps_met': 'ruling',
+    'level2_escalation': 'ruling',
+    'level1_escalation': 'stuck',
+    'tail_over_moving': 'tail',
+    'parked_over_moving': 'parked',
+    'parked_caller_kinds': 'parked',
+    'held_by_dead_session': 'stuck',
+    'moving_over_stuck': 'moving',
+    'started_13d': 'moving',
+    'started_15d': 'stuck',
+}
+
+
+def _lanes_view(body: dict[str, Any]) -> dict[str, Any]:
+    return body['PRD_VIEW'][LANES_ROOT]
+
+
+def _lanes_row(body: dict[str, Any], name: str) -> dict[str, Any]:
+    return _row(_lanes_view(body), prd_key(name))
+
+
+def _input(view: dict[str, Any], name: str) -> dict[str, Any]:
+    [state] = [state for state in view['value']['inputs'] if state['name'] == name]
+    return state
+
+
+def test_every_lanes_fixture_prd_is_served_in_its_lane(lanes):
+    view = _lanes_view(lanes['prd_lanes'])
+    assert view['state'] == 'fresh', view['reason']
+    served = {name: _lanes_row(lanes['prd_lanes'], name)['lane'] for name in _EXPECTED_LANES}
+    assert served == _EXPECTED_LANES
+
+
+def test_the_served_lanes_partition_the_served_rows(lanes):
+    value = _lanes_view(lanes['prd_lanes'])['value']
+    listed = Counter(key for entry in value['lanes'] for key in entry['prd_keys'])
+    assert listed == Counter(row['key'] for row in value['prds'])
+
+
+def test_rule_on_names_the_level2_escalation_from_the_projects_own_queue(lanes):
+    assert _lanes_row(lanes['prd_lanes'], 'ruling_over_tail')['next_action'] == {
+        'kind': 'rule_on',
+        'target': {'task_id': 102, 'escalation_id': 'esc-102-1', 'prd': None},
+        'text': 'rule on esc-102-1 (#102)',
+    }
+
+
+def test_the_escalations_input_is_fresh_despite_another_roots_missing_queue(lanes):
+    body = lanes['prd_lanes']
+    assert _input(_lanes_view(body), 'escalations')['state'] == 'fresh'
+    queueless = body['PRD_VIEW'][QUEUELESS_ROOT]
+    assert _input(queueless, 'escalations')['state'] == 'lower_bound'
+
+
+def test_signal_marks_and_titles_read_each_prds_own_files(lanes):
+    body = lanes['prd_lanes']
+    marks = {
+        name: _lanes_row(body, name)['signal']['mark']
+        for name in ('ruling_over_tail', 'tail_over_moving', 'started_13d')
+    }
+    assert marks == {'ruling_over_tail': 'delivered', 'tail_over_moving': 'delivered', 'started_13d': 'unknown'}
+    assert _lanes_row(body, 'started_13d')['signal']['cause'] == 'no_sidecar'
+    assert _lanes_row(body, 'started_13d')['title'] == lane_title(prd_key('started_13d'))
+
+
+def test_the_contention_line_serves_the_scheduler_files_own_stamp(lanes):
+    contention = lanes['prd_lanes']['PRD_CONTENTION'][LANES_ROOT]
+    assert contention['state'] == 'fresh', contention['reason']
+    assert contention['value']['snapshot_at'] == SCHEDULER_SNAPSHOT_AT.isoformat()
+    assert contention['value']['lock_depth'] == LOCK_DEPTH
+
+
+def test_never_started_reads_task_started_from_the_projects_run_ledger(lanes):
+    never_started = lanes['prd_lanes']['PRD_CONTENTION'][LANES_ROOT]['value']['never_started']
+    assert never_started == {
+        'count': 2, 'of': 2, 'ids': [113, 371],
+        'window_start': (T0 - timedelta(days=20)).isoformat(),
+    }
+
+
+def test_an_unreachable_scheduler_degrades_only_the_contention_line(lanes):
+    offline = lanes['prd_lanes_scheduler_offline']
+    contention = offline['PRD_CONTENTION'][LANES_ROOT]
+    assert contention['state'] == 'unknown'
+    assert 'get_scheduler_state' in contention['reason']
+    assert offline['PRD_VIEW'][LANES_ROOT] == lanes['prd_lanes']['PRD_VIEW'][LANES_ROOT]
+
+
+def test_a_failed_lineage_read_degrades_only_the_view(lanes):
+    failed = lanes['prd_lanes_lineage_failed']
+    view = failed['PRD_VIEW'][LANES_ROOT]
+    assert view['state'] == 'unknown'
+    assert view['reason'].startswith('lineage: ')
+    assert failed['PRD_CONTENTION'][LANES_ROOT] == lanes['prd_lanes']['PRD_CONTENTION'][LANES_ROOT]
+
+
+def test_an_unreadable_run_ledger_makes_the_activity_input_unknown(lanes):
+    body = lanes['prd_lanes_runs_db_unreadable']
+    view = body['PRD_VIEW'][LANES_ROOT]
+    assert view['state'] == 'unknown'
+    assert 'activity: ' in view['reason']
+    assert 'activity: ' in body['PRD_CONTENTION'][LANES_ROOT]['reason']
