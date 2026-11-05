@@ -79,6 +79,11 @@ from orchestrator.main_health_fix_owner import (
     ensure_main_fix_owner,
 )
 from orchestrator.merge_lane.coalesce_unwind import restore_pre_stack_tips
+from orchestrator.merge_lane.dead_base_ledger import (
+    DeadBaseKiller,
+    DeadBaseLedger,
+    DeadBaseSite,
+)
 from orchestrator.merge_lane.disposition import (
     MergeFailureDisposition,
     SkewEvidence,
@@ -329,7 +334,7 @@ dead commit only needs to stay catchable until its stragglers re-dispatch —
 which the prompt-invalidation cascade + the dispatch/adoption dead-base checks
 do promptly — so evicting very old entries is safe: a false-negative on an
 ancient dead commit is unreachable in practice (such an item is long since
-re-merged).  Overridable per-instance via ``worker._dead_base_commits_cap`` in tests."""
+re-merged).  A test builds a smaller ledger with ``DeadBaseLedger(cap=...)``."""
 
 _TRAIN_PREDECESSOR_SETTLE_POLL_SECS = 0.05
 """Poll interval for :meth:`SpeculativeMergeWorker._await_unadvanced_predecessor`.
@@ -8431,14 +8436,10 @@ class SpeculativeMergeWorker:
         # SET of merge commits that were failed/ejected/superseded/re-merged since
         # creation — orphaned speculative bases that will never land on main.  A
         # speculative item whose base_sha ∈ this set has a BROKEN chain and its
-        # verdict is VOID (see _chain_dead_link).  Membership is the primary
-        # structure (checked in the hot path); _dead_base_order tracks FIFO
-        # insertion order so _record_dead_base can evict the oldest past the cap.
-        # Bounded so it cannot grow unboundedly across a long worker lifetime.
-        self._dead_base_commits: set[str] = set()
-        self._dead_base_order: collections.deque[str] = collections.deque()
-        # Overridable in tests for fast eviction checks (mirrors _shutdown_timeout).
-        self._dead_base_commits_cap: int = _DEAD_BASE_COMMITS_CAP
+        # verdict is VOID (see _chain_dead_link).  Each entry keeps the killer
+        # that first recorded it (task 8523).  Bounded so it cannot grow
+        # unboundedly across a long worker lifetime.
+        self._dead_base_commits = DeadBaseLedger(cap=_DEAD_BASE_COMMITS_CAP)
         # γ cross-iteration state promoted from loop-locals: set by finalize after
         # each head result; read by dispatch to decide chain re-merge.
         # Single-host: byte-identical (deque is always empty at dispatch point).
@@ -10563,7 +10564,7 @@ class SpeculativeMergeWorker:
             if (d := e.verify_base_divergence) is not None
         )
 
-    def _record_dead_base(self, *shas: str) -> None:
+    def _record_dead_base(self, *shas: str, killer: DeadBaseKiller) -> None:
         """Record merge commit(s) as dead bases in the INV-3 chain-liveness ledger.
 
         A commit passed here was failed/ejected/superseded/re-merged, so any
@@ -10572,28 +10573,18 @@ class SpeculativeMergeWorker:
         (head-failure cascade, dispatch chain-invalidation discard, adoption-time
         void, RUNNER_UNAVAILABLE re-merge, rebased landing) so a built-awaiting-host
         straggler that the cascade missed is still caught at its next dispatch.
-
-        Bounded FIFO (cap ``self._dead_base_commits_cap``): past the cap the
-        oldest recorded commit is evicted from BOTH the membership set and the
-        order deque.  Empty/blank SHAs and already-recorded duplicates are
-        no-ops.  Pure / synchronous.
+        *killer* names that site; the ledger keeps a commit's first killer.
         """
         for sha in shas:
-            if not sha:
-                continue
-            s = sha.strip()
-            if not s or s in self._dead_base_commits:
-                continue
-            self._dead_base_commits.add(s)
-            self._dead_base_order.append(s)
-            while len(self._dead_base_order) > self._dead_base_commits_cap:
-                evicted = self._dead_base_order.popleft()
-                self._dead_base_commits.discard(evicted)
+            self._dead_base_commits.record(sha, killer)
 
-    def _record_item_commit_dead(self, item: SpeculativeItem) -> None:
+    def _record_item_commit_dead(self, item: SpeculativeItem, site: DeadBaseSite) -> None:
         """Record *item*'s own merge commit as a dead base; a DecidedItem built none."""
         if isinstance(item, RealMergeItem):
-            self._record_dead_base(item.merge_result.merge_commit or '')
+            self._record_dead_base(
+                item.merge_result.merge_commit or '',
+                killer=DeadBaseKiller(site, item.request.task_id),
+            )
 
     def _chain_dead_link(self, item: SpeculativeItem, main_sha: str) -> str | None:
         """Return the dead base link iff *item*'s chain is BROKEN, else None (INV-3).
@@ -15790,7 +15781,7 @@ class SpeculativeMergeWorker:
                     # (enforcement (a)) instead of verifying against it.  Each
                     # downstream entry's OLD commit is recorded below, just before
                     # its own _remerge replaces the item.
-                    self._record_item_commit_dead(head.item)
+                    self._record_item_commit_dead(head.item, DeadBaseSite.HEAD_FAILED)
 
                     # Detect whether the head failure was due to operator halt
                     # (REQUEUED sentinel).  In that case downstream tasks will
@@ -15946,7 +15937,9 @@ class SpeculativeMergeWorker:
                             # is about to be re-merged away, so a straggler stacked
                             # on it now has a dangling successor edge.  Recording it
                             # dead makes that straggler catchable at dispatch.
-                            self._record_item_commit_dead(_entry.item)
+                            self._record_item_commit_dead(
+                                _entry.item, DeadBaseSite.CASCADE_REMERGE,
+                            )
                             _rid = _entry.item.request.request_id
                             _from_state = self._lifecycle.current(_rid)
                             if _from_state is not None:
@@ -18551,7 +18544,7 @@ class SpeculativeMergeWorker:
             req.request_id, ItemLifecycleState.FINALIZING,
             ItemLifecycleState.MERGING, live_obj=entry,
         )
-        self._record_item_commit_dead(item)
+        self._record_item_commit_dead(item, DeadBaseSite.ADOPTION_VOID)
         # §5.3 re-merge carve-out, consumer 2/5 — INV-3 adoption-time void
         # (PRD §5.3).  This site is also the reason §5.3 needs no dispatch-time
         # enforcement: it is where a verdict built on a known-dead base is
@@ -19534,7 +19527,7 @@ class SpeculativeMergeWorker:
                 # record it dead so a straggler stacked on it is caught at
                 # dispatch (parity with the head-failure cascade + Mechanism-2
                 # discard remerge sites).
-                self._record_item_commit_dead(entry.item)
+                self._record_item_commit_dead(entry.item, DeadBaseSite.RUNNER_UNAVAILABLE)
                 self._note_transition(
                     req.request_id, ItemLifecycleState.FINALIZING,
                     ItemLifecycleState.MERGING, live_obj=entry,
@@ -20021,7 +20014,9 @@ class SpeculativeMergeWorker:
             )
             return True
         # INV-3 (task 6273): the rebase superseded current_sha; it will never be on main.
-        self._record_dead_base(current_sha)
+        self._record_dead_base(
+            current_sha, killer=DeadBaseKiller(DeadBaseSite.GATE_REBASED, req.task_id),
+        )
         # ι=1894: count this as a merge retry — main advanced under the
         # request, so a fresh re-verify is required.  Both cas_failed and
         # rebased_pending_reverify are included in retries_per_landing (see
@@ -20364,7 +20359,7 @@ class SpeculativeMergeWorker:
             # other invalidation sites (head-failure cascade, RUNNER_UNAVAILABLE,
             # and the Mechanism-2 staleness discard just below), all of which
             # record the old commit dead for the identical reason.
-            self._record_item_commit_dead(item)
+            self._record_item_commit_dead(item, DeadBaseSite.DISPATCH_VOID)
             # §5.3 re-merge carve-out, consumer 4/5 — dead-base straggler at
             # dispatch (PRD §5.3).  This site is the CIRCULARITY argument in the
             # flesh: it exists to ESCAPE a base known dead, and
@@ -20499,7 +20494,7 @@ class SpeculativeMergeWorker:
                 # this stale merge is about to be re-merged away — record its
                 # now-orphaned commit dead so a straggler stacked on it is caught
                 # by the dispatch-time dead-base re-check.
-                self._record_item_commit_dead(item)
+                self._record_item_commit_dead(item, DeadBaseSite.STALE_DISCARD)
                 # §5.3 re-merge carve-out, consumer 5/5 — Mechanism-2
                 # staleness / chain-invalidation: targets real main, not
                 # frozen_prefix_tip().  PRD §5.3.
