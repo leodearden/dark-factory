@@ -13,7 +13,9 @@ Covers:
 """
 from __future__ import annotations
 
+import logging
 import re
+from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -120,6 +122,134 @@ class TestWarmLaneGcPass:
 
         harness._reclaim_terminal_lane_records.assert_awaited_once()
 
+
+
+# ---------------------------------------------------------------------------
+# task 7857: the reclaim pass record, end to end through the production entry
+# ---------------------------------------------------------------------------
+
+
+_SUMMARY_LOGGER = 'orchestrator.warm_lane_gc_summary'
+_GIT_OPS_LOGGER = 'orchestrator.git_ops'
+_PASS_RECORD = '_run_warm_lane_gc_reclaim: reclaim pass'
+_REIFY_SUMMARY = 'reclaim: reset=2 removed=0 preserved=6 preserved_live_ref=1 reset_cold=1'
+_DF_SUMMARY = (
+    'reclaim: reset=3 removed=1 preserved=5 preserved_live_ref=2 '
+    'preserved_assigned=4 downgraded_assigned=0 reset_cold=1 skipped_unchanged=7'
+)
+
+
+def _write_gc_stub(path: Path, body: str, mode: int = 0o755) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('#!/usr/bin/env bash\n' + body)
+    path.chmod(mode)
+    return path
+
+
+def _kv(message: str) -> dict[str, str]:
+    return dict(re.findall(r'(\w+)=(\S+)', message))
+
+
+def _messages(caplog: pytest.LogCaptureFixture, logger_name: str, level: int) -> list[str]:
+    return [
+        r.getMessage() for r in caplog.records
+        if r.name == logger_name and r.levelno == level
+    ]
+
+
+def _gc_leg_only_harness(tmp_path: Path) -> Harness:
+    """A harness whose pass logs come from the GC leg alone (real GitOps kept)."""
+    harness, _rs = _make_harness(tmp_path)
+    harness._run_interactive_worktree_reaper_pass = AsyncMock()
+    harness._reclaim_terminal_lane_records = AsyncMock(return_value=0)
+    return harness
+
+
+class TestWarmLaneGcPassRecord:
+    """A real GitOps runs a stub gc.sh; the pass record is read back from the log.
+
+    The project copy wins resolution when present; the autouse conftest pin
+    keeps dark-factory's copy absent unless ``df_warm_lane_script_dir`` opts in.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('origin', 'summary'),
+        [('project', _REIFY_SUMMARY), ('dark-factory', _DF_SUMMARY)],
+        ids=['project-reify-shaped', 'dark-factory-df-shaped'],
+    )
+    async def test_rc0_logs_one_pass_record_with_origin_and_counts(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        df_warm_lane_script_dir: Callable[..., Path],
+        origin: str,
+        summary: str,
+    ) -> None:
+        stub_dir = tmp_path / 'scripts' if origin == 'project' else df_warm_lane_script_dir()
+        stub = _write_gc_stub(stub_dir / 'warm-lane-gc.sh', f"printf '%s\\n' '{summary}'\n")
+        harness = _gc_leg_only_harness(tmp_path)
+        caplog.set_level(logging.DEBUG)
+
+        await harness._run_warm_lane_gc_pass()
+
+        records = [
+            m for m in _messages(caplog, _SUMMARY_LOGGER, logging.INFO)
+            if m.startswith(_PASS_RECORD)
+        ]
+        assert len(records) == 1, caplog.text
+        fields = _kv(records[0])
+        expected = _kv(summary)
+        assert fields['origin'] == origin
+        assert fields['script'] == str(stub)
+        assert float(fields['duration_s']) >= 0
+        for name in ('reset', 'removed', 'preserved'):
+            assert fields[name] == expected[name]
+
+    @pytest.mark.asyncio
+    async def test_rc0_without_a_summary_warns_uncounted(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        stub = _write_gc_stub(tmp_path / 'scripts' / 'warm-lane-gc.sh', 'exit 0\n')
+        harness = _gc_leg_only_harness(tmp_path)
+        caplog.set_level(logging.DEBUG)
+
+        await harness._run_warm_lane_gc_pass()
+
+        warnings = _messages(caplog, _SUMMARY_LOGGER, logging.WARNING)
+        assert len(warnings) == 1, caplog.text
+        assert str(stub) in warnings[0]
+        assert 'uncounted' in warnings[0]
+        assert not [
+            m for m in _messages(caplog, _SUMMARY_LOGGER, logging.INFO)
+            if m.startswith(_PASS_RECORD)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_spawn_that_raises_is_warned_as_an_unexpected_error(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A present but non-executable project copy reaches the spawn, which raises.
+
+        Resolution keys on existence, not the execute bit, so the 0o644 stub is
+        chosen and ``PermissionError`` from the spawn lands in git_ops' exception
+        arm (rc 127), which had no test before task 7857.
+        """
+        _write_gc_stub(
+            tmp_path / 'scripts' / 'warm-lane-gc.sh',
+            f"printf '%s\\n' '{_REIFY_SUMMARY}'\n",
+            mode=0o644,
+        )
+        harness = _gc_leg_only_harness(tmp_path)
+        caplog.set_level(logging.DEBUG)
+
+        await harness._run_warm_lane_gc_pass()
+
+        assert any(
+            m.startswith('_run_warm_lane_gc_reclaim: unexpected error')
+            for m in _messages(caplog, _GIT_OPS_LOGGER, logging.WARNING)
+        ), caplog.text
+        assert not _messages(caplog, _SUMMARY_LOGGER, logging.INFO)
 
 
 # ---------------------------------------------------------------------------
