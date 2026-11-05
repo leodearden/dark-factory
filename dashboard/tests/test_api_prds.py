@@ -255,7 +255,9 @@ def test_a_slow_lineage_read_lands_for_the_next_request(client, tmp_path, monkey
 
 # --- the request-wide reads are bounded and guarded -------------------------
 
-_SLOW_WALK_SECONDS = 2.0
+_SLOW_WALK_SECONDS = 3.0
+_REQUEST_READS_WAIT = 0.5
+"""Well under the slow walk, yet long enough for the run-ledger walk the same wait bounds."""
 
 
 def _unreadable_walk(queues):
@@ -276,7 +278,7 @@ def test_a_corpus_walk_that_raises_degrades_only_the_view(client, tmp_path, monk
 def test_a_slow_corpus_walk_never_holds_the_response_and_lands_for_the_next_request(
     client, tmp_path, monkeypatch,
 ):
-    monkeypatch.setattr(prds, 'REQUEST_READS_WAIT_SECONDS', 0.05)
+    monkeypatch.setattr(prds, 'REQUEST_READS_WAIT_SECONDS', _REQUEST_READS_WAIT)
     walk = escalation_corpus.walk_corpus
 
     def _slow_walk(queues):

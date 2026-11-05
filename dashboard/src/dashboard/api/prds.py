@@ -10,7 +10,9 @@ Each root ACQUIRES its inputs inside a budgeted fan-out: its snapshot unit,
 the same cache ``/tasks`` reads, its lineage index, its scheduler state and its
 run ledger's activity together, then the documents of the PRDs it draws. The
 escalation corpus and the run-ledger connections are acquired once per
-request, before the fan-out and under its deadline. Each datum is then built
+request, each waited on at most ``REQUEST_READS_WAIT_SECONDS`` before the
+fan-out, and a read that fails or misses that wait degrades its own input,
+never the response. Each datum is then built
 at ``served_at`` and validated again here. The two degrade apart: a scheduler
 failure degrades only ``PRD_CONTENTION``, a lineage failure only
 ``PRD_VIEW``, and any failure degrades that one root's datum to an explained
@@ -44,9 +46,9 @@ from dashboard.data.datum import (
 from dashboard.data.db import DbPool
 from dashboard.data.escalation_corpus import (
     EscalationCorpus,
-    acquire_corpus,
     corpus_queues,
     pending_level2_by_task,
+    serve_corpus,
 )
 from dashboard.data.prd_contention import (
     Contention,
@@ -88,10 +90,19 @@ its snapshot unit's roster, ``task_snapshot.PER_CALL_TIMEOUT`` (4.4) x its
 three bounded operations = 13.2 s; the lineage index, scheduler state and
 activity run beside it and wait at most 5.0, 4.0 and 4.0 s. The second is its
 PRD documents, waiting at most ``prd_signal.PRD_DOCUMENTS_REQUEST_WAIT_SECONDS``
-(4.0): 13.2 + 4.0 = 17.2 s. ``total`` (20.0 s) is 10 s under ``data.js``'s
-30 s fetch abort, so a degraded payload still renders. ``root_concurrency`` (4)
-keeps the walk parallel but bounded. ``dashboard/tests/test_prds_budget.py``
-checks the constraints.
+(4.0): 13.2 + 4.0 = 17.2 s. ``total`` (20.0 s) is the request stage's
+``REQUEST_READS_WAIT_SECONDS`` (2.0) plus one root's share, and 10 s under
+``data.js``'s 30 s fetch abort, so a degraded payload still renders.
+``root_concurrency`` (4) keeps the walk parallel but bounded.
+``dashboard/tests/test_prds_budget.py`` checks the constraints.
+"""
+
+REQUEST_READS_WAIT_SECONDS = 2.0
+"""The longest a request waits on the escalation corpus and on the run-ledger roots
+walk before the per-root fan-out.
+
+2.0 + ``PRDS_BUDGET.per_project`` (18.0) = ``PRDS_BUDGET.total`` (20.0), so the
+stage never shortens a root's share. A read still in flight lands for the next poll.
 """
 
 STAND_IN_VIEW_BOUND_SECONDS = 900
@@ -122,10 +133,52 @@ class RootInputs:
 
 @dataclass(frozen=True, slots=True)
 class _RequestReads:
-    """The reads one request makes once for every root: the corpus and each root's runs.db."""
+    """The reads one request makes once for every root: the corpus and each root's runs.db.
+
+    ``runs_db_absent_reason`` says why the request has no run-ledger
+    connections; it is None when the walk finished.
+    """
 
     corpus: Datum[EscalationCorpus]
     runs_dbs: Mapping[str, aiosqlite.Connection | None]
+    runs_db_absent_reason: str | None
+
+
+async def _open_run_ledgers(
+    config: DashboardConfig, pool: DbPool,
+) -> tuple[Mapping[str, aiosqlite.Connection | None], str | None]:
+    """Each root's runs.db connection by root, or none and why the walk gave none."""
+    wait = REQUEST_READS_WAIT_SECONDS
+    try:
+        labeled = await asyncio.wait_for(
+            asyncio.shield(_project_scoped_dbs_labeled(config, pool, RUNS_DB)), wait,
+        )
+    except TimeoutError:
+        logger.warning(
+            'the run-ledger walk did not finish within its %.1fs request wait; every '
+            "root's activity is served its last good value or UNKNOWN for this render",
+            wait,
+        )
+        return {}, f'the run-ledger walk did not finish within {wait:.1f}s'
+    except Exception as exc:
+        logger.warning(
+            "the run-ledger walk raised; every root's activity is served its last good "
+            'value or UNKNOWN for this render; this is a BUG, not an outage',
+            exc_info=True,
+        )
+        return {}, f'the run-ledger walk raised {type(exc).__name__}: {exc}'
+    return dict(labeled), None
+
+
+async def _acquire_request_reads(
+    config: DashboardConfig, pool: DbPool, *, now: datetime,
+) -> _RequestReads:
+    """The corpus and the run-ledger connections, each waited on at most REQUEST_READS_WAIT_SECONDS."""
+    corpus, (runs_dbs, absent_reason) = await asyncio.gather(
+        serve_corpus(corpus_queues(config), now=now, wait_seconds=REQUEST_READS_WAIT_SECONDS),
+        _open_run_ledgers(config, pool),
+    )
+    return _RequestReads(corpus=corpus, runs_dbs=runs_dbs, runs_db_absent_reason=absent_reason)
 
 
 async def _acquire_inputs(
@@ -143,7 +196,9 @@ async def _acquire_inputs(
             client, config, root, now=now, wait_seconds=SCHEDULER_STATE_REQUEST_WAIT_SECONDS,
         ),
         acquire_activity(
-            reads.runs_dbs.get(str(root)), root, now=now, wait_seconds=ACTIVITY_REQUEST_WAIT_SECONDS,
+            reads.runs_dbs.get(str(root)), root, now=now,
+            wait_seconds=ACTIVITY_REQUEST_WAIT_SECONDS,
+            absent_reason=reads.runs_db_absent_reason,
         ),
     )
     keys = open_work_keys(
@@ -187,18 +242,15 @@ async def _acquire_within_budget(
     Mirrors ``dashboard/src/dashboard/data/active_tasks.py::_serve_roots_within_budget``
     without its admission rotation: one deadline, a bounded semaphore, and a
     per-root ``wait_for`` sized after admission, so one slow or broken root
-    never blanks the others. The request-wide reads come first, inside the
-    same deadline, so what they spend comes out of every root's remaining time.
+    never blanks the others. The request-wide reads come first, each waited on
+    at most ``REQUEST_READS_WAIT_SECONDS``, and one that fails or misses that
+    wait degrades its own input, never the response.
     """
     loop = asyncio.get_running_loop()
     deadline = loop.time() + budget.total
     slots = asyncio.Semaphore(budget.root_concurrency)
     labels = config.project_labels
-    corpus, runs_dbs = await asyncio.gather(
-        acquire_corpus(corpus_queues(config), now=now),
-        _project_scoped_dbs_labeled(config, pool, RUNS_DB),
-    )
-    reads = _RequestReads(corpus=corpus, runs_dbs=dict(runs_dbs))
+    reads = await _acquire_request_reads(config, pool, now=now)
 
     async def _one(root: Path) -> RootInputs | RootUnserved:
         label = labels.of(root)
