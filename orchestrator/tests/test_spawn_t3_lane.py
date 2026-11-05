@@ -16,6 +16,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
@@ -31,6 +32,7 @@ from _fake_t3_server import (
     FakeT3Server,
     ToolAnswer,
     ToolFailure,
+    ToolResponder,
     ToolSuccess,
     put_fake_t3_cli_on_path,
     replies_in_turn,
@@ -214,6 +216,28 @@ def t3(env: Env, t3_server: FakeT3Server) -> FakeT3Server:
         't3_thread_list': ToolSuccess(THREAD_LIST_JSON),
     }
     return t3_server
+
+
+STALL_CAP_SECS = 10.0
+"""The longest a stalled reply is held: a call the lane leaves unbounded fails a test's elapsed bound instead of hanging it."""
+
+StallThen = Callable[[ToolAnswer], ToolResponder]
+
+
+@pytest.fixture
+def stalling(t3: FakeT3Server) -> Iterator[StallThen]:
+    """``stall_then(answer)``: a responder holding each call until released or capped, then answering ``answer``."""
+    released = threading.Event()
+
+    def stall_then(answer: ToolAnswer) -> ToolResponder:
+        def respond(arguments: Mapping[str, Any]) -> ToolAnswer:
+            released.wait(STALL_CAP_SECS)
+            return answer
+
+        return respond
+
+    yield stall_then
+    released.set()
 
 
 def run_verb(capsys: pytest.CaptureFixture[str], *argv: str) -> str:
@@ -696,6 +720,20 @@ class TestProjectResolution:
         assert line.split()[0] == 'launch-failed'
         assert t3.tool_calls('t3_thread_launch') == []
 
+    def test_a_stalled_project_page_is_launch_failed_without_a_launch(
+        self, env: Env, t3: FakeT3Server, stalling: StallThen, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        monkeypatch.setattr(lane, 'CALL_TIMEOUT_SECS', 1.0)
+        t3.tool_replies['t3_project_list'] = stalling(projects_page(project(env.project)))
+
+        started = time.monotonic()
+        line = launch_line(capsys, tmp_path, env.project)
+
+        assert line.split()[0] == 'launch-failed'
+        assert t3.tool_calls('t3_thread_launch') == []
+        assert time.monotonic() - started < STALL_CAP_SECS / 2
+
 
 def forget_credential(env: Env) -> None:
     t3_mcp_client.credential_path(ENVIRONMENT_ID, root=env.fleet).unlink()
@@ -762,6 +800,24 @@ class TestLaunchFailures:
 
         assert line.split()[0] == 'launch-failed'
         assert len(t3.tool_calls('t3_thread_launch')) == 2
+
+    def test_a_stalled_launch_reply_is_resent_once_with_the_same_request_id(
+        self, env: Env, t3: FakeT3Server, stalling: StallThen, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        monkeypatch.setattr(lane, 'CALL_TIMEOUT_SECS', 1.0)
+        t3.tool_replies['t3_thread_launch'] = replies_in_turn(
+            stalling(ToolSuccess(THREAD_LAUNCH_JSON)), ToolSuccess(THREAD_LAUNCH_JSON)
+        )
+        record_dir = spawn_record(env)
+
+        started = time.monotonic()
+        line = launch_line(capsys, tmp_path, env.project, record=record_dir)
+
+        assert line == f'started thread_id={THREAD_ID} project_id={PROJECT_ID} run_id={RUN_ID}'
+        request_ids = [call['clientRequestId'] for call in t3.tool_calls('t3_thread_launch')]
+        assert request_ids == ['unblock-df-7489-4242'] * 2
+        assert time.monotonic() - started < STALL_CAP_SECS / 2
 
     def test_no_credential_and_no_t3_to_self_pair_is_no_launcher(
         self, env: Env, t3_server: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -996,6 +1052,16 @@ class TestAwaitStarted:
 
         assert self._await(capsys, env, '', timeout='0.3') == 'timeout'
 
+    def test_a_stalled_thread_read_times_out_within_the_verbs_bound(
+        self, env: Env, t3: FakeT3Server, stalling: StallThen, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        t3.tool_replies['t3_thread_read'] = stalling(thread_read(status='queued'))
+
+        started = time.monotonic()
+
+        assert self._await(capsys, env, '', timeout='1.0') == 'timeout'
+        assert time.monotonic() - started < STALL_CAP_SECS / 2
+
     def test_the_read_names_the_thread(
         self, env: Env, t3: FakeT3Server, capsys: pytest.CaptureFixture[str]
     ) -> None:
@@ -1219,6 +1285,20 @@ class TestWait:
         assert wait_for(env, '', clock) == 'finished code=126'
         assert clock.now > lane.UNREACHABLE_GRACE_SECS
         assert set(clock.sleeps) == {lane.SETTLED_RECHECK_SECS}
+
+    def test_a_stalled_thread_read_counts_as_unreachable_for_that_pass(
+        self, env: Env, t3: FakeT3Server, stalling: StallThen, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(lane, 'CALL_TIMEOUT_SECS', 1.0)
+        t3.tool_replies |= {
+            't3_thread_read': replies_in_turn(stalling(thread_read(archived=True)), thread_read(archived=True)),
+            't3_thread_wait': waited(timed_out=True),
+        }
+
+        started = time.monotonic()
+
+        assert wait_for(env, spawn_record(env), FakeClock()) == 'finished code=0'
+        assert time.monotonic() - started < STALL_CAP_SECS / 2
 
     def test_wait_stops_at_a_slice_boundary_once_its_caller_is_gone(self, env: Env, t3: FakeT3Server) -> None:
         t3.tool_replies |= {'t3_thread_read': thread_read(), 't3_thread_wait': waited(timed_out=True)}
