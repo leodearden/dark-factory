@@ -1096,6 +1096,21 @@ def _raw_wall_clock_literal(call: ast.Call, *, is_bare_wait_for: bool) -> str | 
     return None
 
 
+def _asyncio_function_name(call: ast.Call) -> str | None:
+    """Return *attr* if *call* is ``asyncio.<attr>(...)``, spelled through the ``asyncio`` name.
+
+    ``gate.wait_for(...)`` and ``self.timeout(...)`` are not, so they return None.
+    """
+    func = call.func
+    if (
+        isinstance(func, ast.Attribute)
+        and isinstance(func.value, ast.Name)
+        and func.value.id == 'asyncio'
+    ):
+        return func.attr
+    return None
+
+
 def _wall_clock_deadline_violations(
     node: ast.AST, lines: list[str], filename: str
 ) -> list[Violation]:
@@ -1154,12 +1169,7 @@ def _wait_call_violations(call: ast.Call, lines: list[str], filename: str) -> li
         return []
 
     func = call.func
-    is_bare_wait_for = (
-        isinstance(func, ast.Attribute)
-        and func.attr == 'wait_for'
-        and isinstance(func.value, ast.Name)
-        and func.value.id == 'asyncio'
-    )
+    is_bare_wait_for = _asyncio_function_name(call) == 'wait_for'
     if is_bare_wait_for:
         describe = _load_bearing_wait_target
     elif isinstance(func, ast.Name) and func.id in _RESPONSIVE_WAIT_HELPERS:
@@ -1385,15 +1395,12 @@ def _deadline_context(item: ast.withitem) -> tuple[ast.expr, _DeadlineContext] |
     nothing, and another context's keyword is a TypeError, not a deadline.
     """
     call = item.context_expr
-    if not (
-        isinstance(call, ast.Call)
-        and isinstance(call.func, ast.Attribute)
-        and isinstance(call.func.value, ast.Name)
-        and call.func.value.id == 'asyncio'
-        and call.func.attr in _DEADLINE_CONTEXTS
-    ):
+    if not isinstance(call, ast.Call):
         return None
-    context = _DEADLINE_CONTEXTS[call.func.attr]
+    name = _asyncio_function_name(call)
+    if name not in _DEADLINE_CONTEXTS:
+        return None
+    context = _DEADLINE_CONTEXTS[name]
     keyword_bounds = [kw.value for kw in call.keywords if kw.arg == context.keyword]
     bounds = keyword_bounds or call.args[:1]
     if not bounds:
