@@ -13898,13 +13898,17 @@ class SpeculativeMergeWorker:
             )
 
     def _note_verify_completed(
-        self, out: MergeOutcome | None, entry_slot: InflightEntrySlot | None, lease: Any,
+        self, out: object, entry_slot: InflightEntrySlot | None, lease: Any,
     ) -> None:
-        """Add a verify that ran to a verdict to its host's duration window."""
+        """Add a verify that ran to a verdict to its host's duration window.
+
+        *out* is whatever the verify task returned; only a low-disk
+        ``verify_skipped`` outcome is left out, because it ran no verify.
+        """
         entry = entry_slot.entry if entry_slot is not None else None
         if lease is None or entry is None or entry.started_at is None:
             return
-        if out is not None and out.verify_skipped:
+        if isinstance(out, MergeOutcome) and out.verify_skipped:
             return
         self._verify_durations.record(
             lease.name, (self._clock.now() - entry.started_at) * 1000,
