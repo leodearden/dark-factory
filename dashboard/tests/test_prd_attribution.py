@@ -166,7 +166,7 @@ def test_unresolvable_link_refuses_a_reason_it_cannot_carry():
 
 def test_lineage_entry_without_prd_or_link():
     assert lineage_entry({}, ROOT) == LineageEntry(
-        own_prd=None, link=None, multi_link=False, done_stamped_at=None,
+        own_prd=None, link=None, multi_link=False, done_stamped_at=None, done_kind=None,
     )
 
 
@@ -208,6 +208,36 @@ def test_lineage_entry_done_stamped_at_parsed():
 def test_lineage_entry_done_stamped_at_none(done_provenance):
     entry = lineage_entry({'done_provenance': done_provenance}, ROOT)
     assert entry.done_stamped_at is None
+
+
+def test_lineage_entry_done_kind_is_the_provenance_kind():
+    entry = lineage_entry(
+        {'done_provenance': {'kind': 'merged', 'stamped_at': '2026-11-01T10:00:00+00:00'}},
+        ROOT,
+    )
+    assert entry.done_kind == 'merged'
+    assert entry.done_stamped_at == datetime(2026, 11, 1, 10, 0, tzinfo=UTC)
+
+
+def test_lineage_entry_done_kind_without_a_stamp():
+    entry = lineage_entry({'done_provenance': {'kind': 'operator'}}, ROOT)
+    assert entry.done_kind == 'operator'
+    assert entry.done_stamped_at is None
+
+
+@pytest.mark.parametrize(
+    'metadata',
+    [
+        {},
+        {'done_provenance': 'merged'},
+        {'done_provenance': {'stamped_at': '2026-11-01T10:00:00+00:00'}},
+        {'done_provenance': {'kind': 7}},
+        {'done_provenance': {'kind': ''}},
+    ],
+    ids=['absent', 'non_dict', 'no_kind', 'non_str_kind', 'empty_kind'],
+)
+def test_lineage_entry_done_kind_none(metadata):
+    assert lineage_entry(metadata, ROOT).done_kind is None
 
 
 def test_lineage_metadata_keys_pin_the_read():
