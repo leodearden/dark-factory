@@ -12,21 +12,10 @@ and ``status`` manage this host's credential for T3's ``/mcp``
 (``t3_mcp_client``): ``pair`` prints ``paired`` or ``pair-failed``, and
 ``status`` prints ``paired``, ``expired``, ``unpaired`` or ``status-failed``.
 
-Two facts of ``t3`` v0.1.2 shape this module:
-
-* No ``t3`` command prints a project's ``workspaceRoot``: ``thread start``
-  resolves a path to the deepest registered project containing it through the
-  MCP tool ``t3_project_list`` and runs the thread at that project's root
-  (``apps/server/src/cli/thread.ts::resolveProject``). ``launch`` therefore
-  reads the registered roots from the server's state store,
-  ``$T3CODE_HOME/userdata/statev2.sqlite`` table ``projection_projects``, the
-  table ``t3_project_list`` is served from
-  (``apps/server/src/orchestration-v2/ProjectStore.ts``), read-only, and
-  refuses when it cannot.
-* ``thread list --json`` carries active threads only
-  (``ThreadManagementService.listProjectThreads`` reads location ``active``),
-  so a thread missing from it is archived or deleted; ``wait`` tells which
-  from ``thread show --json``'s ``thread.archived``.
+``launch``, ``provider``, ``await-started`` and ``wait`` reach T3 only through
+``t3_mcp_client``'s ``/mcp`` client; ``detect`` and ``self-record`` read the
+process tree and ``server-runtime.json``. The tool contract the lane relies on
+is plans/spawn-t3-lane-mcp-and-host-registry-prd.md's.
 """
 
 from __future__ import annotations
@@ -36,7 +25,6 @@ import contextlib
 import json
 import logging
 import os
-import subprocess
 import sys
 import tempfile
 import time
@@ -61,11 +49,12 @@ ENDED_RUN_STATUSES = frozenset({'failed', 'cancelled', 'interrupted', 'rolled_ba
 STARTUP_FAILURE_STATUSES = frozenset({'failed', 'cancelled', 'rolled_back'})
 SERVER_START_TOLERANCE_SECS = 120
 STARTED_POLL_SECS = 5.0
-DEFAULT_WAIT_POLL_SECS = 30.0
+WAIT_SLICE_SECS = min(600, t3_mcp_client.T3_MAX_WAIT_SLICE_SECS)
+SETTLED_RECHECK_SECS = 60.0
+"""The pause after a wait slice T3 did not hold: it answers at once for a settled run."""
 ENDED_RUN_GRACE_SECS = 120.0
 UNREACHABLE_GRACE_SECS = 600.0
 INTERNAL_FAULT_EXIT = 3
-_T3_TIMEOUT_SECS = 300
 _PROCESS_TREE_MAX_HOPS = 64
 _TRANSCRIPT_HEAD_LINES = 200
 
@@ -87,59 +76,6 @@ def _verdict(word: str, **fields: object) -> str:
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# The t3 CLI seam: every call to t3 goes through run_t3
-# ---------------------------------------------------------------------------
-
-
-class T3CommandFailed(Exception):
-    """``t3`` is missing, exited non-zero, timed out, or printed no JSON."""
-
-
-def run_t3(args: Sequence[str], stdin: str | None = None) -> Any:
-    """Run ``t3 <args>`` and return its stdout parsed as JSON."""
-    try:
-        completed = subprocess.run(
-            ['t3', *args],
-            input=stdin,
-            capture_output=True,
-            text=True,
-            timeout=_T3_TIMEOUT_SECS,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise T3CommandFailed(f't3 {args[:2]}: {exc}') from exc
-    if completed.returncode != 0:
-        raise T3CommandFailed(
-            f't3 {args[:2]} exited {completed.returncode}: {completed.stderr.strip()}'
-        )
-    try:
-        return json.loads(completed.stdout)
-    except ValueError as exc:
-        raise T3CommandFailed(f't3 {args[:2]} printed no JSON') from exc
-
-
-@dataclass(frozen=True)
-class ThreadSummary:
-    """One entry of ``t3 thread list --json`` (``OrchestratorMcpThreadListItem``)."""
-
-    thread_id: str
-    title: str
-    status: str
-    latest_run_id: str | None
-    created_at: datetime | None
-
-    @classmethod
-    def from_json(cls, item: Mapping[str, Any]) -> ThreadSummary:
-        return cls(
-            thread_id=str(item['threadId']),
-            title=str(item.get('title') or ''),
-            status=str(item.get('status') or ''),
-            latest_run_id=item.get('latestRunId'),
-            created_at=_parse_instant(item.get('createdAt')),
-        )
-
-
 def _parse_instant(value: object) -> datetime | None:
     if not isinstance(value, str):
         return None
@@ -147,28 +83,6 @@ def _parse_instant(value: object) -> datetime | None:
         return datetime.fromisoformat(value)
     except ValueError:
         return None
-
-
-def list_threads(cwd: str) -> dict[str, ThreadSummary]:
-    """The active threads of the project *cwd* resolves to, keyed by thread id."""
-    items = run_t3(['thread', 'list', '--project', cwd, '--json'])
-    if not isinstance(items, list):
-        raise T3CommandFailed('t3 thread list printed no array')
-    try:
-        summaries = [ThreadSummary.from_json(item) for item in items]
-    except (KeyError, TypeError, AttributeError) as exc:
-        raise T3CommandFailed(f't3 thread list printed a malformed item: {exc!r}') from exc
-    return {summary.thread_id: summary for summary in summaries}
-
-
-def thread_detail(thread_id: str) -> Mapping[str, Any] | None:
-    """``thread show --json``'s ``thread`` object, or None when a successful show carries none.
-
-    Raises ``T3CommandFailed`` when the show itself fails.
-    """
-    shown = run_t3(['thread', 'show', thread_id, '--messages', '1', '--json'])
-    thread = shown.get('thread') if isinstance(shown, dict) else None
-    return thread if isinstance(thread, dict) else None
 
 
 # ---------------------------------------------------------------------------
@@ -881,7 +795,7 @@ def _bind_within(record_dir: str, cwd: str, since: float, deadline: float) -> Bi
 
 
 class ThreadState(StrEnum):
-    LISTED = 'listed'
+    PRESENT = 'present'
     ARCHIVED = 'archived'
     GONE = 'gone'
     UNREACHABLE = 'unreachable'
@@ -919,33 +833,6 @@ class JoinTracker:
         return 1 if now - self._ended_run[1] >= ENDED_RUN_GRACE_SECS else None
 
 
-def observe_thread(thread_id: str, cwd: str) -> tuple[ThreadObservation, dict[str, bool] | None]:
-    """The thread's state, and the project's listing as thread id -> archived for the sweep."""
-    try:
-        threads = list_threads(cwd)
-    except T3CommandFailed:
-        return ThreadObservation(ThreadState.UNREACHABLE), None
-    known = dict.fromkeys(threads, False)
-    if thread_id in threads:
-        return _listed(threads[thread_id]), known
-    try:
-        detail = thread_detail(thread_id)
-    except T3CommandFailed:
-        return ThreadObservation(ThreadState.UNREACHABLE), known
-    if detail is None:
-        return ThreadObservation(ThreadState.GONE), known
-    known[thread_id] = detail.get('archived') is True
-    if known[thread_id]:
-        return ThreadObservation(ThreadState.ARCHIVED), known
-    return ThreadObservation(
-        ThreadState.LISTED, str(detail.get('status') or ''), detail.get('latestRunId')
-    ), known
-
-
-def _listed(summary: ThreadSummary) -> ThreadObservation:
-    return ThreadObservation(ThreadState.LISTED, summary.status, summary.latest_run_id)
-
-
 def result_is_final(record_dir: str) -> bool:
     if not record_dir:
         return False
@@ -954,13 +841,6 @@ def result_is_final(record_dir: str) -> bool:
     except (OSError, ValueError):
         return False
     return session_registry.parse_result_outcome(text) in session_registry.TERMINAL_RESULT_OUTCOMES
-
-
-def _wait_poll_secs(env: Mapping[str, str]) -> float:
-    try:
-        return max(0.0, float(env.get('SPAWN_T3_POLL_SECS') or DEFAULT_WAIT_POLL_SECS))
-    except ValueError:
-        return DEFAULT_WAIT_POLL_SECS
 
 
 class CallerGone(Exception):
@@ -972,25 +852,56 @@ def wait(
     cwd: str,
     record_dir: str,
     env: Mapping[str, str],
+    *,
     parent_pid: Callable[[], int] = os.getppid,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> str:
+    """Observe, then wait one slice in T3, until the join has its exit code."""
     caller = parent_pid()
     tracker = JoinTracker()
+    session = _Session(env)
     while True:
         if parent_pid() != caller:
             raise CallerGone(f'caller {caller} is gone; stopped waiting on thread {thread_id}')
-        listed_at = datetime.now(UTC)
-        observation, known = observe_thread(thread_id, cwd)
-        if known is not None:
-            _sweep_project(cwd, known, listed_at)
-        if record_dir:
-            _maintain_binding_softly(record_dir, cwd)
-        code = tracker.verdict(
-            observation, result_final=result_is_final(record_dir), now=time.monotonic()
-        )
+        client = session.client()
+        observation = _observe(client, thread_id, cwd, record_dir)
+        code = tracker.verdict(observation, result_final=result_is_final(record_dir), now=clock())
         if code is not None:
             return _verdict('finished', code=code)
-        time.sleep(_wait_poll_secs(env))
+        if _needs_pause(_wait_slice(client, thread_id), record_dir):
+            sleep(SETTLED_RECHECK_SECS)
+
+
+def _observe(
+    client: t3_mcp_client.T3McpClient | None, thread_id: str, cwd: str, record_dir: str
+) -> ThreadObservation:
+    """The thread's state, after one sweep of its project and the binding's upkeep."""
+    thread = _read_thread(client, thread_id)
+    project_id = None if isinstance(thread, ThreadUnread) else thread.get('projectId')
+    if client is not None and isinstance(project_id, str):
+        _sweep_listed_threads(client, project_id, cwd)
+    if record_dir:
+        _maintain_binding_softly(record_dir, cwd)
+    if isinstance(thread, ThreadUnread):
+        return ThreadObservation(ThreadState.GONE if thread.gone else ThreadState.UNREACHABLE)
+    if thread.get('archived') is True:
+        return ThreadObservation(ThreadState.ARCHIVED)
+    return ThreadObservation(ThreadState.PRESENT, str(thread.get('status') or ''), thread.get('latestRunId'))
+
+
+def _wait_slice(client: t3_mcp_client.T3McpClient | None, thread_id: str) -> bool:
+    """Hold ``t3_thread_wait`` for up to one slice; whether T3 held it until the slice ran out."""
+    if client is None:
+        return False
+    arguments = {'threadId': thread_id, 'timeoutMs': WAIT_SLICE_SECS * 1000}
+    reply = client.call('t3_thread_wait', arguments, read_timeout=WAIT_SLICE_SECS + t3_mcp_client.HTTP_TIMEOUT_SECS)
+    return isinstance(reply, t3_mcp_client.ToolOk) and reply.value.get('timedOut') is True
+
+
+def _needs_pause(slice_held: bool, record_dir: str) -> bool:
+    """A slice T3 answered at once is followed by a pause, unless a final result ends the join on the next pass."""
+    return not slice_held and not result_is_final(record_dir)
 
 
 def _sweep_listed_threads(client: t3_mcp_client.T3McpClient, project_id: str, cwd: str) -> None:
