@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -41,6 +42,7 @@ from dashboard.data.escalation_corpus import (
     measure_corpus,
     pending_escalation_ids,
     pending_level2_by_task,
+    serve_corpus,
     views_over,
     walk_corpus,
 )
@@ -522,6 +524,109 @@ class TestAcquireCorpus:
         )
 
         assert first is second
+
+
+class _CountedWalk:
+    """``walk_corpus`` as patched in: counts its calls, optionally sleeping or raising first."""
+
+    def __init__(self, *, sleep_seconds: float = 0.0, error: Exception | None = None) -> None:
+        self.calls = 0
+        self.sleep_seconds = sleep_seconds
+        self.error = error
+
+    def __call__(self, queues) -> EscalationCorpus:
+        self.calls += 1
+        time.sleep(self.sleep_seconds)
+        if self.error is not None:
+            raise self.error
+        return walk_corpus(queues)
+
+
+def _unreadable_walk() -> _CountedWalk:
+    return _CountedWalk(error=OSError('queue directory unreadable'))
+
+
+class TestServeCorpus:
+    """The corpus served with a bounded wait, an exception guard and its last good walk."""
+
+    @pytest.fixture
+    def queue(self, tmp_path) -> QueueRef:
+        queue_dir = tmp_path / 'escalations'
+        _sketch_10(queue_dir)
+        return _queue(queue_dir)
+
+    async def test_a_walk_that_raises_before_any_success_is_unknown_naming_it(
+        self, queue, monkeypatch,
+    ):
+        monkeypatch.setattr(escalation_corpus, 'walk_corpus', _unreadable_walk())
+
+        served = await serve_corpus((queue,), now=NOW, wait_seconds=None)
+
+        assert served.state is DatumState.UNKNOWN
+        assert served.value is None
+        assert 'OSError' in _reason(served)
+        assert 'queue directory unreadable' in _reason(served)
+        assert served.freshness_bound_seconds == CORPUS_FRESHNESS_BOUND_SECONDS
+
+    async def test_a_walk_that_raises_after_a_good_one_serves_the_last_good_walk(
+        self, queue, monkeypatch,
+    ):
+        monkeypatch.setattr(escalation_corpus, 'CORPUS_TTL_SECONDS', 0.0)
+        good = await serve_corpus((queue,), now=NOW, wait_seconds=None)
+        monkeypatch.setattr(escalation_corpus, 'walk_corpus', _unreadable_walk())
+
+        served = await serve_corpus((queue,), now=NOW + timedelta(seconds=1), wait_seconds=None)
+
+        assert good.state is DatumState.FRESH
+        assert served.state is DatumState.STALE
+        assert _corpus(served).scans == _corpus(good).scans
+        assert served.as_of == NOW
+        assert 'OSError' in _reason(served)
+
+    async def test_a_slow_walk_is_not_waited_on_and_lands_for_a_later_call(
+        self, queue, monkeypatch,
+    ):
+        walk = _CountedWalk(sleep_seconds=0.5)
+        monkeypatch.setattr(escalation_corpus, 'walk_corpus', walk)
+
+        started = time.monotonic()
+        waited = await serve_corpus((queue,), now=NOW, wait_seconds=0.05)
+        elapsed = time.monotonic() - started
+
+        assert elapsed < walk.sleep_seconds
+        assert waited.state is DatumState.UNKNOWN
+        assert 'in flight' in _reason(waited)
+
+        deadline = time.monotonic() + 5.0
+        landed = waited
+        while landed.state is not DatumState.FRESH and time.monotonic() < deadline:
+            landed = await serve_corpus((queue,), now=NOW, wait_seconds=None)
+
+        assert landed.state is DatumState.FRESH
+        assert _counts(landed, queue) == (2, 5)
+        assert walk.calls == 1
+
+    async def test_the_cache_clear_hook_forgets_the_last_good_walk_too(
+        self, queue, monkeypatch,
+    ):
+        await serve_corpus((queue,), now=NOW, wait_seconds=None)
+        escalation_corpus._corpus_cache_clear()
+        monkeypatch.setattr(escalation_corpus, 'walk_corpus', _unreadable_walk())
+
+        served = await serve_corpus((queue,), now=NOW + timedelta(seconds=1), wait_seconds=None)
+
+        assert served.state is DatumState.UNKNOWN
+
+    async def test_two_calls_inside_the_ttl_walk_once(self, queue, monkeypatch):
+        walk = _CountedWalk()
+        monkeypatch.setattr(escalation_corpus, 'walk_corpus', walk)
+
+        first = await serve_corpus((queue,), now=NOW, wait_seconds=None)
+        second = await serve_corpus((queue,), now=NOW + timedelta(seconds=1), wait_seconds=None)
+
+        assert walk.calls == 1
+        assert first.state is second.state is DatumState.FRESH
+        assert second.as_of == NOW
 
 
 def _file(queue: EscalationQueue, esc_id: str, task_id: str, *, level: int = 2) -> None:
