@@ -5644,6 +5644,11 @@ class TaskInterceptor:
            project threshold; returns ``BacklogVerdict.to_error_dict()`` which has the
            shape ``{'error': '<msg>', 'error_type': 'ReconciliationBacklogExceeded', …}``
            (no ``success`` key).
+        4. ``_declared_scope_refusal`` — under the write lock, refuses any add, alter or
+           removal of ``metadata.declared_scope`` (an unchanged echo passes) with
+           ``DeclaredScopeWriteAuthorityError.to_error_dict()``. It is here, not in the
+           backend floor, because ``_execute_combine``'s sanctioned ``basis='combine'``
+           re-stamp writes through the backend directly.
 
         Callers must use :func:`interceptor_write_succeeded` to distinguish a successful
         write from a gate rejection — do NOT re-implement the formula inline.
@@ -5764,6 +5769,9 @@ class TaskInterceptor:
                 ):
                     return err
 
+            if err := await self._declared_scope_refusal(tm, task_id, project_root, kwargs, before):
+                return err
+
             async def _do_update_task_write() -> Any:
                 return await self._journal_around(
                     'update_task',
@@ -5873,6 +5881,32 @@ class TaskInterceptor:
                     )
         await self._idempotency_record(client_op_id, 'update_task', result)
         return result
+
+    async def _declared_scope_refusal(
+        self,
+        tm: TaskBackendProtocol,
+        task_id: str,
+        project_root: str,
+        kwargs: Mapping[str, Any],
+        before: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """The refusal for an update that would add, alter or remove ``metadata.declared_scope``.
+
+        Called under the write lock. The stored row is read only when the payload carries the key
+        or replaces the whole blob; a recon-stage write reuses its ``before`` read.
+        """
+        raw = kwargs.get('metadata')
+        payload = None if raw is None else coerce_task_metadata(raw)
+        if payload is None:
+            return None
+        replace = kwargs.get('metadata_mode') == 'replace'
+        if not replace and DECLARED_SCOPE_METADATA_KEY not in payload:
+            return None
+        row = before if before is not None else await tm.get_task(task_id, project_root)
+        stored = coerce_task_metadata(row.get('metadata')) or {}
+        if preserves_stamp(stored, payload, replace=replace):
+            return None
+        return DeclaredScopeWriteAuthorityError(task_id).to_error_dict()
 
     async def _with_bounded_audit_trail(
         self, result: dict[str, Any], task_id: str, project_root: str, project_id: str,
