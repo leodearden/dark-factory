@@ -25,6 +25,7 @@ from _curator_helpers import (
     pool_with_ids,
     prepared,
     submit_as_one_batch,
+    tripwire,
     zot_agent_result,
 )
 from shared.cli_invoke import AgentResult, AllAccountsCappedException
@@ -610,7 +611,7 @@ class TestCuratorFailuresDecidedByThePipeline:
         no_orchestrator = CuratorFailureError('no orchestrator is running', zero_output_timeout=True)
         curator = _real_curator(
             invoke=invoke_by_role(
-                single=zot_agent_result(), batch=AssertionError('one ticket is a batch of one'),
+                single=zot_agent_result(), batch=tripwire('one ticket is a batch of one'),
             ),
             escalator=_escalator_raising(no_orchestrator),
         )
@@ -642,6 +643,20 @@ class TestCuratorFailuresDecidedByThePipeline:
         assert taskmaster.add_task_calls == []
 
     @pytest.mark.asyncio
+    async def test_a_curator_answering_fewer_decisions_than_bundles_parks_curator_raised(
+        self, make_interceptor, store, taskmaster,
+    ):
+        curator = _real_curator(invoke=must_not_invoke())
+        curator.curate_prepared = AsyncMock(return_value=[])
+        interceptor = make_interceptor(curator)
+
+        ticket_id = await _submit(interceptor, 'Work')
+
+        assert await _resolve(interceptor, ticket_id) == _parked_answer(ticket_id, DeferReason.CURATOR_RAISED)
+        assert await _parked_row(store, ticket_id) == _parked(DeferReason.CURATOR_RAISED)
+        assert taskmaster.add_task_calls == []
+
+    @pytest.mark.asyncio
     async def test_a_parked_llm_failure_resolves_on_a_later_combine(self, make_interceptor, store, taskmaster):
         taskmaster.tasks['7'] = {'id': '7', 'title': 'Existing task', 'status': 'pending', 'metadata': {}}
         llm_down = True
@@ -658,7 +673,7 @@ class TestCuratorFailuresDecidedByThePipeline:
             })
 
         curator = _real_curator(invoke=invoke_by_role(
-            single=single, batch=AssertionError('one ticket is a batch of one'),
+            single=single, batch=tripwire('one ticket is a batch of one'),
         ))
 
         async def bundle_over_task_7(candidate: CandidateTask, *_args: Any) -> PreparedCandidate:

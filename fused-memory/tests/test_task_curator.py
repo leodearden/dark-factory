@@ -24,6 +24,7 @@ from _curator_helpers import (
     escalator_double,
     invoke_by_role,
     must_not_invoke,
+    tripwire,
     zot_agent_result,
 )
 from _curator_helpers import make_config as _make_config
@@ -4674,7 +4675,7 @@ class TestBatchBisectFallback:
             return batch_create_result(n)
 
         invoke = invoke_by_role(
-            batch=batch, single=AssertionError('the halves are batches, not singles'),
+            batch=batch, single=tripwire('the halves are batches, not singles'),
         )
         curator = TaskCurator(config=_make_config(), taskmaster=None, invoke=invoke)
         decisions = await curator.curate_prepared(
@@ -4738,7 +4739,7 @@ class TestBatchBisectFallback:
             ]})
 
         invoke = invoke_by_role(
-            batch=batch, single=AssertionError('the halves are batches, not singles'),
+            batch=batch, single=tripwire('the halves are batches, not singles'),
         )
         curator = TaskCurator(config=_make_config(), taskmaster=None, invoke=invoke)
         decisions = await curator.curate_prepared(
@@ -5481,7 +5482,7 @@ class TestCurateBatchCacheCheck:
         prompt for one item."""
         invoke = invoke_by_role(
             single=_agent_result({'action': 'create', 'justification': 'new-from-llm'}),
-            batch=AssertionError('one uncached candidate uses the single spec'),
+            batch=tripwire('one uncached candidate uses the single spec'),
         )
         curator = TaskCurator(config=_make_config(), taskmaster=None, invoke=invoke)
         c_cached1 = CandidateTask(title='Cached-One')

@@ -52,7 +52,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TypeAlias
+from typing import TYPE_CHECKING, Any, Required, TypeAlias, TypedDict
 
 from shared.cli_invoke import (
     AgentResult,
@@ -355,7 +355,7 @@ class PruneResult:
 
 
 def _corpus_failed_deferral(
-    candidate: CandidateTask, error: object, start: float,
+    candidate: CandidateTask, error: str, start: float,
 ) -> CuratorDecision:
     """Defer *candidate* because its corpus could not be assembled."""
     logger.warning(
@@ -363,9 +363,7 @@ def _corpus_failed_deferral(
         candidate.title, error,
     )
     return CuratorDecision.deferred(
-        DeferReason.CORPUS_FAILED,
-        pool_sizes=empty_pool_sizes(),
-        latency_ms=int((time.monotonic() - start) * 1000),
+        DeferReason.CORPUS_FAILED, pool_sizes=empty_pool_sizes(), latency_ms=_elapsed_ms(start),
     )
 
 
@@ -546,6 +544,7 @@ class _CuratorCall:
     ledger_role: str
     project_id: str
     failure_context: str
+    parse: Callable[[AgentResult, Sequence[PreparedCandidate], int], list[CuratorDecision]]
 
     @classmethod
     def single(cls, cfg: CuratorConfig, project_id: str, pool_size: int) -> _CuratorCall:
@@ -572,6 +571,7 @@ class _CuratorCall:
             ledger_role='task_curator',
             project_id=project_id,
             failure_context='curator LLM call failed:',
+            parse=_parse_single_call,
         )
 
     @classmethod
@@ -598,6 +598,7 @@ class _CuratorCall:
             ledger_role='task_curator_batch',
             project_id=project_id,
             failure_context=f'curator batch LLM call failed: batch_size={n}',
+            parse=_parse_batch_call,
         )
 
 
@@ -1602,7 +1603,7 @@ class TaskCurator:
             action='create',
             justification=justification,
             pool_sizes=pool_sizes,
-            latency_ms=int((time.monotonic() - start) * 1000),
+            latency_ms=_elapsed_ms(start),
             degraded=True,
             degraded_by_zot=degraded_by_zot,
             zot_escalation_id=zot_escalation_id,
@@ -1666,14 +1667,14 @@ class TaskCurator:
         (``degraded_by_zot``), and an unusable response degrades to a
         ``create``.
 
-        Raises only a ``POOL_UNAVAILABLE_ERRORS`` error and
-        :exc:`asyncio.CancelledError`. A pool error from the LLM call is not
-        one of them: :meth:`_failure_decision` defers each bundle under the
-        pool's reason. The re-raise is for a pool error from anywhere else in
-        the pipeline, which none of today's guards produces, so the caller can
-        defer it under that reason too. Any other exception defers every bundle
+        Raises only :exc:`asyncio.CancelledError` and a
+        ``POOL_UNAVAILABLE_ERRORS`` error from a guard, which none of today's
+        guards raises; the caller defers that under the pool's reason. Any
+        other exception from a guard defers every bundle
         ``CURATOR_RAISED``, so a curator that raises instead of deciding parks
-        its tickets rather than failing or creating them.
+        its tickets rather than failing or creating them. A raise out of the
+        LLM dispatch defers only the bundles it was given (see
+        :meth:`_dispatch_deferring_raises`).
 
         The guards run in PRD decision-10 order (see :meth:`_run_pipeline` and
         :meth:`_decide_before_llm`); what none of them decides goes to
@@ -1692,13 +1693,7 @@ class TaskCurator:
                 'project %s; deferring every one of them',
                 len(prepared), project_id,
             )
-            latency_ms = _elapsed_ms(start)
-            return [
-                CuratorDecision.deferred(
-                    DeferReason.CURATOR_RAISED, pool_sizes=bundle.pool_sizes, latency_ms=latency_ms,
-                )
-                for bundle in prepared
-            ]
+            return _deferred_each(prepared, DeferReason.CURATOR_RAISED, start)
 
     async def _run_pipeline(
         self,
@@ -1761,7 +1756,7 @@ class TaskCurator:
                 decided[i] = decision
 
         if llm_bound:
-            llm_decisions = await self._dispatch_llm(
+            llm_decisions = await self._dispatch_deferring_raises(
                 [bundles[i] for i in llm_bound], project_id, project_root, start,
             )
             for i, local in zip(llm_bound, llm_decisions, strict=True):
@@ -1782,6 +1777,35 @@ class TaskCurator:
                 )
 
         return [decided[i] for i in range(len(bundles))]
+
+    async def _dispatch_deferring_raises(
+        self,
+        bundles: list[PreparedCandidate],
+        project_id: str,
+        project_root: str,
+        start: float,
+    ) -> list[CuratorDecision]:
+        """:meth:`_dispatch_llm`, with a raise deferring just *bundles*.
+
+        A raise means the failure mapper itself failed, say an escalator that
+        cannot write its state. Only the bundles sent to the LLM share that
+        failure; a sibling a guard decided keeps its decision, exactly as it
+        would alone (PRD B7). A pool error defers under the pool's reason,
+        anything else ``CURATOR_RAISED``.
+        """
+        try:
+            return await self._dispatch_llm(bundles, project_id, project_root, start)
+        except Exception as exc:
+            reason = (
+                pool_defer_reason(exc) if isinstance(exc, POOL_UNAVAILABLE_ERRORS)
+                else DeferReason.CURATOR_RAISED
+            )
+            logger.exception(
+                'task_curator: the LLM dispatch raised for %d candidate(s) of project %s; '
+                'deferring them %s',
+                len(bundles), project_id, reason,
+            )
+            return _deferred_each(bundles, reason, start)
 
     async def _flag_unverified_claims_of(self, candidates: list[CandidateTask]) -> None:
         """Run the claim advisory (task 2438) over *candidates*, building the probe at most once.
@@ -2895,7 +2919,7 @@ class TaskCurator:
                 for bundle in bundles
             ]
         return await self._decisions_from_result(
-            agent_result, bundles, project_id, project_root, start,
+            agent_result, call, bundles, project_id, project_root, start,
         )
 
     async def _bisect(
@@ -2935,12 +2959,13 @@ class TaskCurator:
     async def _decisions_from_result(
         self,
         agent_result: AgentResult,
+        call: _CuratorCall,
         bundles: list[PreparedCandidate],
         project_id: str,
         project_root: str,
         start: float,
     ) -> list[CuratorDecision]:
-        """Parse a successful call into one decision per bundle, and account for it."""
+        """Parse a successful *call* into one decision per bundle, and account for it."""
         # A completed round-trip disproves a wedged backend, which is all the
         # ZOT breaker asserts, so it closes however unusable the payload turns
         # out to be (task 4143). That includes a breaker a concurrent bisect
@@ -2948,19 +2973,7 @@ class TaskCurator:
         # (pinned by TestZeroOutputBreakerBatchReset).
         self._zero_output_breaker.close()
 
-        latency_ms = _elapsed_ms(start)
-        if len(bundles) == 1:
-            [only] = bundles
-            decisions = [_parse_decision(
-                agent_result, pool_sizes=only.pool_sizes, latency_ms=latency_ms, pool=only.pool,
-            )]
-        else:
-            decisions = _parse_batch_decisions(
-                agent_result,
-                pools=[bundle.pool for bundle in bundles],
-                pool_sizes_list=[bundle.pool_sizes for bundle in bundles],
-                latency_ms=latency_ms,
-            )
+        decisions = call.parse(agent_result, bundles, _elapsed_ms(start))
 
         # The streak, unlike the breaker, needs a usable DECISION: the parsers
         # fail items open to a degraded 'create' without raising. One usable
@@ -2990,14 +3003,9 @@ class TaskCurator:
         """The one mapping from a failed LLM call to *bundle*'s decision.
 
         A pool that cannot serve defers under its pool reason. Any other
-        failure is reported to the escalator and then defers ``LLM_FAILED``,
-        except a zero-output hang, which counts on the breaker and creates,
-        marked ``degraded_by_zot``. With no orchestrator running, the escalator
-        raises :exc:`CuratorFailureError` instead of filing; that raise is
-        logged and the failure decided exactly as on the orchestrator path, so
-        nothing escapes the pipeline. Only a ZOT that reached an escalator is
-        justified ``llm-error-escalated``; one that did not cites the
-        escalator's raise, or with no escalator wired the failure itself.
+        failure is reported through :meth:`_escalate_failure` and then defers
+        ``LLM_FAILED``, except a zero-output hang, which counts on the breaker
+        and creates, marked ``degraded_by_zot``.
         """
         candidate = bundle.candidate
         if isinstance(exc, POOL_UNAVAILABLE_ERRORS):
@@ -3014,28 +3022,9 @@ class TaskCurator:
                 'task_curator: LLM call failed with unexpected %s', type(exc).__name__,
                 exc_info=exc,
             )
-        escalation_id: str | None = None
-        escalated = False
-        escalator_raised: CuratorFailureError | None = None
-        if self._escalator is None:
-            logger.warning('task_curator: LLM failure with no escalator wired: %s', exc)
-        else:
-            try:
-                escalation_id = await self._escalator.report_failure(
-                    project_root=project_root,
-                    project_id=project_id,
-                    candidate_title=candidate.title,
-                    pool_sizes=bundle.pool_sizes,
-                    **_failure_report(exc),
-                )
-                escalated = True
-            except CuratorFailureError as raised:
-                logger.error(
-                    'task_curator: no orchestrator to escalate the curator failure for %r '
-                    'to (%s); deciding it here',
-                    candidate.title, exception_summary(raised),
-                )
-                escalator_raised = raised
+        escalation = await self._escalate_failure(
+            exc, bundle, project_id=project_id, project_root=project_root,
+        )
 
         if not (isinstance(exc, CuratorFailureError) and exc.zero_output_timeout):
             logger.warning(
@@ -3055,18 +3044,85 @@ class TaskCurator:
                 self._zero_output_breaker.cooldown_seconds,
             )
         return await self._degraded_create(
-            justification=(
-                'llm-error-escalated' if escalated
-                else f'curator-failed: {exception_summary(escalator_raised or exc)}'
-            ),
+            justification=escalation.zot_justification(exc),
             pool_sizes=bundle.pool_sizes,
             start=start,
             candidate=candidate,
             project_id=project_id,
             project_root=project_root,
             degraded_by_zot=True,
-            zot_escalation_id=escalation_id,
+            zot_escalation_id=escalation.escalation_id,
         )
+
+    async def _escalate_failure(
+        self,
+        exc: Exception,
+        bundle: PreparedCandidate,
+        *,
+        project_id: str,
+        project_root: str,
+    ) -> _Escalation:
+        """Report a failed LLM call to the escalator, and say what came of it.
+
+        With no orchestrator running, the escalator raises
+        :exc:`CuratorFailureError` instead of filing. That raise is logged and
+        returned as the outcome's ``refusal``, so the failure is still decided
+        exactly as on the orchestrator path.
+        """
+        if self._escalator is None:
+            logger.warning('task_curator: LLM failure with no escalator wired: %s', exc)
+            return _Escalation(escalated=False)
+        try:
+            escalation_id = await self._escalator.report_failure(
+                project_root=project_root,
+                project_id=project_id,
+                candidate_title=bundle.candidate.title,
+                pool_sizes=bundle.pool_sizes,
+                **_failure_report(exc),
+            )
+        except CuratorFailureError as refusal:
+            logger.error(
+                'task_curator: no orchestrator to escalate the curator failure for %r '
+                'to (%s); deciding it here',
+                bundle.candidate.title, exception_summary(refusal),
+            )
+            return _Escalation(escalated=False, refusal=refusal)
+        return _Escalation(escalated=True, escalation_id=escalation_id)
+
+
+@dataclass(frozen=True)
+class _Escalation:
+    """What reporting one curator failure to the escalator came to."""
+
+    escalated: bool
+    escalation_id: str | None = None
+    refusal: CuratorFailureError | None = None
+
+    def zot_justification(self, exc: Exception) -> str:
+        """The justification of the create a zero-output hang *exc* degrades to.
+
+        Only a hang an escalator accepted is ``llm-error-escalated``. One it
+        refused cites the refusal; with no escalator wired, the hang itself.
+        """
+        if self.escalated:
+            return 'llm-error-escalated'
+        return f'curator-failed: {exception_summary(self.refusal or exc)}'
+
+
+class _FailureReport(TypedDict, total=False):
+    """The ``report_failure`` keyword arguments that describe a failed call itself."""
+
+    justification: Required[str]
+    timed_out: bool | None
+    duration_ms: int | None
+    schema_tool_denied: bool
+    zero_output_timeout: bool
+    account_name: str | None
+    proc_tree: str | None
+    subtype: str | None
+    cost_usd: float | None
+    transcript_turns: int | None
+    tools_used: tuple[str, ...] | None
 
 
 # ----------------------------------------------------------------------
@@ -3078,7 +3134,17 @@ def _elapsed_ms(start: float) -> int:
     return int((time.monotonic() - start) * 1000)
 
 
-def _failure_report(exc: Exception) -> dict[str, Any]:
+def _deferred_each(
+    bundles: Sequence[PreparedCandidate], reason: DeferReason, start: float,
+) -> list[CuratorDecision]:
+    latency_ms = _elapsed_ms(start)
+    return [
+        CuratorDecision.deferred(reason, pool_sizes=bundle.pool_sizes, latency_ms=latency_ms)
+        for bundle in bundles
+    ]
+
+
+def _failure_report(exc: Exception) -> _FailureReport:
     """The ``report_failure`` fields that describe *exc* itself."""
     if isinstance(exc, CuratorFailureError):
         return {
@@ -3665,3 +3731,25 @@ def _parse_batch_decisions(
         )
 
     return results
+
+
+def _parse_single_call(
+    agent_result: AgentResult, bundles: Sequence[PreparedCandidate], latency_ms: int,
+) -> list[CuratorDecision]:
+    """:attr:`_CuratorCall.parse` for the single spec: the one bundle's decision."""
+    [only] = bundles
+    return [_parse_decision(
+        agent_result, pool_sizes=only.pool_sizes, latency_ms=latency_ms, pool=only.pool,
+    )]
+
+
+def _parse_batch_call(
+    agent_result: AgentResult, bundles: Sequence[PreparedCandidate], latency_ms: int,
+) -> list[CuratorDecision]:
+    """:attr:`_CuratorCall.parse` for the batch spec: one decision per bundle."""
+    return _parse_batch_decisions(
+        agent_result,
+        pools=[bundle.pool for bundle in bundles],
+        pool_sizes_list=[bundle.pool_sizes for bundle in bundles],
+        latency_ms=latency_ms,
+    )

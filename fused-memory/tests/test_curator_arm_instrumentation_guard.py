@@ -8,8 +8,9 @@ which no signal distinguishes from a healthy one.
    the one failure mapper, ``_failure_decision``. Every return of the mapper
    is a ``CuratorDecision.deferred`` (a defer creates nothing, so it cannot
    pass for a healthy create) or a ``_degraded_create`` (which counts it), and
-   the mapper reports to the escalator through ``report_failure``. Neither
-   method constructs a ``CuratorDecision`` directly.
+   the mapper reports to the escalator through ``_escalate_failure``, which
+   calls ``report_failure``. Neither method constructs a ``CuratorDecision``
+   directly.
 2. No ``TaskCurator`` method builds an ``action='create'`` decision except the
    ``_degraded_create`` funnel, which is what advances the degraded streak.
 3. Every ``CuratorDecision(action='create', ...)`` in the module states its
@@ -47,6 +48,7 @@ CURATOR_CLASS = 'TaskCurator'
 LLM_CALL = '_invoke_curator'
 DISPATCH = '_dispatch_llm'
 MAPPER = '_failure_decision'
+ESCALATE = '_escalate_failure'
 REPORT_CALL = 'report_failure'
 DEFER_FUNNEL = 'deferred'
 
@@ -151,9 +153,10 @@ def test_every_mapper_return_is_a_defer_or_a_counted_create():
         'either defer, which creates nothing, or create through the funnel '
         'that counts it on the degraded streak.'
     )
-    assert calls_named(mapper, REPORT_CALL), (
-        f'{CURATOR_CLASS}.{MAPPER} never calls {REPORT_CALL}(): an LLM failure '
-        'would be decided without the escalator hearing of it.'
+    assert calls_named(mapper, ESCALATE) and calls_named(_curator_method(ESCALATE), REPORT_CALL), (
+        f'{CURATOR_CLASS}.{MAPPER} never reaches {REPORT_CALL}() through '
+        f'{ESCALATE}(): an LLM failure would be decided without the escalator '
+        'hearing of it.'
     )
 
 

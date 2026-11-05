@@ -33,6 +33,7 @@ from _curator_helpers import (
     pool_with_ids,
     prepared,
     submit_as_one_batch,
+    tripwire,
     zot_agent_result,
 )
 from shared.cli_invoke import AgentResult, AllAccountsCappedException
@@ -151,7 +152,7 @@ class TestOnePipeline:
                 config=build_config(tmp_path), taskmaster=None, cwd=tmp_path,
                 escalator=escalator_double(),
                 invoke=invoke_by_role(
-                    single=AssertionError('a guard hit must not reach the LLM'),
+                    single=tripwire('a guard hit must not reach the LLM'),
                     batch=_create_each_in_batch,
                 ),
             )
@@ -169,9 +170,38 @@ class TestOnePipeline:
         assert alone == in_batch[1]
         assert [d.action for d in (in_batch[0], in_batch[2])] == ['create', 'create']
 
+    @pytest.mark.parametrize('guard', sorted(_GUARD_HITS))
+    async def test_a_guard_hit_keeps_its_decision_beside_a_sibling_whose_failure_raises(
+        self, guard, tmp_path,
+    ):
+        """B7: a raise while deciding the LLM-bound sibling defers only that sibling."""
+        build_config, hit, setup = _GUARD_HITS[guard]
+
+        def fresh() -> TaskCurator:
+            escalator = escalator_double()
+            escalator.report_failure = AsyncMock(side_effect=OSError('escalation state unwritable'))
+            curator = TaskCurator(
+                config=build_config(tmp_path), taskmaster=None, cwd=tmp_path, escalator=escalator,
+                invoke=invoke_by_role(
+                    single=_max_turns_failure(), batch=tripwire('one LLM-bound sibling is a batch of one'),
+                ),
+            )
+            setup(curator)
+            return curator
+
+        bundle = prepared(hit.title, candidate=hit)
+        [alone] = await fresh().curate_prepared([bundle], PROJECT_ID, PROJECT_ROOT)
+        in_batch = await fresh().curate_prepared(
+            [bundle, _llm_bound('Neighbour')], PROJECT_ID, PROJECT_ROOT,
+        )
+
+        assert alone.action != 'defer'
+        assert in_batch[0] == alone
+        assert (in_batch[1].action, in_batch[1].defer_reason) == ('defer', DeferReason.CURATOR_RAISED)
+
     async def test_the_exact_match_runs_inside_a_batch(self):
         invoke = invoke_by_role(
-            single=AssertionError('a batch of two must use the batch spec'),
+            single=tripwire('a batch of two must use the batch spec'),
             batch=_create_each_in_batch,
         )
         curator = TaskCurator(
@@ -239,7 +269,7 @@ class TestOnePipeline:
                 single=lambda kwargs: (
                     zot_agent_result() if 'Hung' in kwargs['prompt'] else _max_turns_failure()
                 ),
-                batch=AssertionError('each call here is a batch of one'),
+                batch=tripwire('each call here is a batch of one'),
             ),
         )
 
@@ -255,7 +285,7 @@ class TestOnePipeline:
         curator = TaskCurator(
             config=make_config(), taskmaster=None, escalator=None,
             invoke=invoke_by_role(
-                single=zot_agent_result(), batch=AssertionError('one bundle is a batch of one'),
+                single=zot_agent_result(), batch=tripwire('one bundle is a batch of one'),
             ),
         )
 
@@ -392,7 +422,7 @@ def _breaker_scene(
     async def answer(**kwargs: Any) -> AgentResult:
         titles = tuple(candidate_titles(kwargs['prompt']))
         if titles not in script:
-            raise AssertionError(f'unscripted curator call over {titles!r}')
+            pytest.fail(f'unscripted curator call over {titles!r}')
         scripted = script[titles]
         await asyncio.sleep(0)
         if isinstance(scripted, tuple):

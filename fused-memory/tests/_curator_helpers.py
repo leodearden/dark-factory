@@ -7,9 +7,10 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
-from typing import Any
+from typing import Any, NoReturn
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 from shared.cli_invoke import AgentResult
 
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig
@@ -118,6 +119,20 @@ def candidate_titles(prompt: str) -> list[str]:
 InvokeArm = AgentResult | BaseException | Callable[[dict[str, Any]], AgentResult]
 
 
+def tripwire(reason: str) -> Callable[..., NoReturn]:
+    """An invoke arm, or a side effect, that fails the test outright when reached.
+
+    The pipeline decides every ``Exception`` its invoker raises, so an
+    ``AssertionError`` there becomes a deferral the test may never notice.
+    ``pytest.fail`` raises a ``BaseException``, which no ``except Exception``
+    arm absorbs.
+    """
+    def fail(*_args: Any, **_kwargs: Any) -> NoReturn:
+        pytest.fail(reason)
+
+    return fail
+
+
 def _answer(arm: InvokeArm, kwargs: dict[str, Any]) -> AgentResult:
     if isinstance(arm, BaseException):
         raise arm
@@ -132,14 +147,15 @@ def invoke_by_role(*, single: InvokeArm, batch: InvokeArm) -> AsyncMock:
     A ``'task_curator'`` call is answered by *single* and a
     ``'task_curator_batch'`` call by *batch*. An arm is returned when it is an
     ``AgentResult``, raised when it is an exception, and otherwise called with
-    the call's keyword arguments. Any other role fails the test.
+    the call's keyword arguments, so a :func:`tripwire` arm fails the test.
+    Any other role fails the test too.
     """
     arms = {'task_curator': single, 'task_curator_batch': batch}
 
     async def invoke(**kwargs: Any) -> AgentResult:
         role = kwargs.get('role')
         if role not in arms:
-            raise AssertionError(f'unexpected curator invocation role {role!r}')
+            pytest.fail(f'unexpected curator invocation role {role!r}')
         return _answer(arms[role], kwargs)
 
     return AsyncMock(side_effect=invoke)
@@ -147,7 +163,7 @@ def invoke_by_role(*, single: InvokeArm, batch: InvokeArm) -> AsyncMock:
 
 def must_not_invoke() -> AsyncMock:
     """An ``invoke_with_cap_retry`` stand-in for paths that must never reach the LLM."""
-    return AsyncMock(side_effect=AssertionError('the curator must not call the LLM'))
+    return AsyncMock(side_effect=tripwire('the curator must not call the LLM'))
 
 
 def zot_agent_result() -> AgentResult:
