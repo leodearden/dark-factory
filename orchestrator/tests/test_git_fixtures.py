@@ -32,7 +32,7 @@ def _out(repo: Path, *args: str) -> str:
 
 def _worktree_files(repo: Path) -> dict[str, str]:
     return {
-        path.relative_to(repo).as_posix(): path.read_text(encoding='utf-8')
+        path.relative_to(repo).as_posix(): path.read_bytes().decode('utf-8')
         for path in repo.rglob('*')
         if path.is_file() and '.git' not in path.relative_to(repo).parts
     }
@@ -174,7 +174,8 @@ def test_a_tree_seed_commits_every_file_under_the_directory(
     templates: RepoTemplates, tmp_path: Path,
 ) -> None:
     src = tmp_path / 'src'
-    contents = _write_workspace_tree(src)
+    contents = {**_write_workspace_tree(src), 'dos.txt': 'one\r\ntwo\r\n'}
+    (src / 'dos.txt').write_bytes(b'one\r\ntwo\r\n')
     seed = RepoSeed.from_tree(src, 'initial workspace')
 
     repo = templates.seed(tmp_path / 'repo', seed)
