@@ -1209,13 +1209,14 @@ class ShadowCoordinator:
         """
         try:
             async with self._storm_lock:
-                created = await self._check_storm()
+                created = await self._pause_if_tripped()
             if created is not None:
                 await self._escalate(created)
         except Exception:
             logger.exception('shadow coordinator: storm evaluation failed')
 
-    async def _check_storm(self) -> StormTrip | None:
+    async def _pause_if_tripped(self) -> StormTrip | None:
+        """Snapshot, decide and pause; the trip only when this call created the pause."""
         threshold = self._config.failure_streak_pause
         snapshot = await asyncio.to_thread(self._storm_snapshot, threshold)
         if snapshot.storm.paused:
