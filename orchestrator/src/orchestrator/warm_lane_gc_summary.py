@@ -6,8 +6,12 @@ differing between dark-factory's and reify's copies) is documented in
 """
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 SUMMARY_PREFIX = 'reclaim:'
 REQUIRED_FIELDS = ('reset', 'removed', 'preserved')
@@ -87,3 +91,31 @@ def _parse_token(token: str) -> tuple[str, int]:
     if match is None:
         raise ReclaimSummaryError(f'reclaim summary token {token!r} is not name=count')
     return match.group(1), int(match.group(2))
+
+
+def log_reclaim_outcome(
+    *, rc: int, stdout: str, stderr: str, script: Path, origin: str, duration_secs: float,
+) -> None:
+    """Log one reclaim run's outcome as the orchestrator arm's per-pass record.
+
+    A countable rc=0 run logs ONE INFO ``reclaim pass`` line of ``name=value``
+    fields, summable by key across the journal; on ``origin=dark-factory`` it
+    is task 3078's evidence item 1. An uncountable rc=0 run, or a non-zero
+    exit, logs a WARNING instead.
+    """
+    if rc != 0:
+        logger.warning('_run_warm_lane_gc_reclaim: script exited %d (stderr=%r)', rc, stderr)
+        return
+    try:
+        summary = parse_reclaim_summary(stdout)
+    except ReclaimSummaryError as exc:
+        logger.warning(
+            '_run_warm_lane_gc_reclaim: %s (%s) exited 0 without a countable reclaim '
+            'summary — %s; this pass is uncounted (stdout=%r)',
+            script, origin, exc, stdout[:_STDOUT_QUOTE_LIMIT],
+        )
+        return
+    logger.info(
+        '_run_warm_lane_gc_reclaim: reclaim pass origin=%s script=%s duration_s=%.3f %s',
+        origin, script, duration_secs, summary.render(),
+    )
