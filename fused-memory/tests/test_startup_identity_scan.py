@@ -144,7 +144,7 @@ class TestRepairDuplicateEdgeUuids:
 
     @pytest.mark.asyncio
     async def test_remints_all_but_first_edge_in_dup_group(
-        self, mock_config, make_backend, make_graph_mock,
+        self, mock_config, make_backend, make_graph_driver, make_graph_mock,
     ):
         """A three-edge dup-uuid group re-mints the last two (the survivor
         keeps eids[0]'s original uuid), returning the re-mint count. Neither
@@ -152,8 +152,6 @@ class TestRepairDuplicateEdgeUuids:
         group_id predicate -- the repair is graph-key-scoped so EVERY
         RELATES_TO edge reaches per-uuid uniqueness, regardless of its
         group_id property."""
-        backend = make_backend(mock_config)
-
         async def router(cypher, params=None):
             result = MagicMock()
             if 'collect(ID(e))' in cypher:
@@ -164,7 +162,7 @@ class TestRepairDuplicateEdgeUuids:
 
         graph = make_graph_mock([])
         graph.ro_query = AsyncMock(side_effect=router)
-        backend._driver._get_graph = MagicMock(return_value=graph)
+        backend = make_backend(mock_config, driver=make_graph_driver({'g1': graph}))
 
         result = await backend._repair_duplicate_edge_uuids(group_id='g1')
 
@@ -217,13 +215,12 @@ class TestRepairDuplicateEdgeUuids:
 
     @pytest.mark.asyncio
     async def test_clean_graph_no_dup_uuids_is_noop(
-        self, mock_config, make_backend, make_graph_mock,
+        self, mock_config, make_backend, make_graph_driver, make_graph_mock,
     ):
         """No dup-uuid groups -> return 0 and zero GRAPH.QUERY write commands
         (only the read-only detection ran)."""
-        backend = make_backend(mock_config)
         graph = make_graph_mock([])
-        backend._driver._get_graph = MagicMock(return_value=graph)
+        backend = make_backend(mock_config, driver=make_graph_driver({'g1': graph}))
 
         result = await backend._repair_duplicate_edge_uuids(group_id='g1')
 
@@ -484,8 +481,11 @@ class TestScanDuplicateEntityNamesLiveFalkorDB:
             {'gid': graph_name},
         )
 
-        backend = GraphitiBackend(mock_config)
-        backend._driver = _MultiTenantFalkorDriver(host=FALKOR_HOST, port=FALKOR_PORT)
+        backend = GraphitiBackend.with_driver(
+            mock_config,
+            _MultiTenantFalkorDriver(host=FALKOR_HOST, port=FALKOR_PORT),
+            registered_graph_ids=(),
+        )
         try:
             with caplog.at_level(logging.WARNING, logger='fused_memory.backends.graphiti_client'):
                 result = await backend._scan_duplicate_entity_names(graph_name)
@@ -551,8 +551,11 @@ class TestRepairDuplicateEdgeUuidsLiveFalkorDB:
         await seed_edge('c', 'd', 'dup', 'c relates to d', [3.0, 4.0])
         await seed_edge('a', 'd', 'dup', 'a relates to d', [5.0, 6.0])
 
-        backend = GraphitiBackend(mock_config)
-        backend._driver = _MultiTenantFalkorDriver(host=FALKOR_HOST, port=FALKOR_PORT)
+        backend = GraphitiBackend.with_driver(
+            mock_config,
+            _MultiTenantFalkorDriver(host=FALKOR_HOST, port=FALKOR_PORT),
+            registered_graph_ids=(),
+        )
         try:
             result = await backend._repair_duplicate_edge_uuids(graph_name)
             # (a) One dup-uuid group of size 2 -> re-mint 1, keep 1 survivor.
@@ -622,8 +625,11 @@ class TestRepairDuplicateEdgeUuidsLiveFalkorDB:
         await graph.query("CREATE (:Entity {uuid: 'v1', name: 'V'})")
         await graph.delete()
 
-        backend = GraphitiBackend(mock_config)
-        backend._driver = _MultiTenantFalkorDriver(host=FALKOR_HOST, port=FALKOR_PORT)
+        backend = GraphitiBackend.with_driver(
+            mock_config,
+            _MultiTenantFalkorDriver(host=FALKOR_HOST, port=FALKOR_PORT),
+            registered_graph_ids=(),
+        )
         client = FalkorDB(host=FALKOR_HOST, port=FALKOR_PORT)
         try:
             with contextlib.suppress(ResponseError):
