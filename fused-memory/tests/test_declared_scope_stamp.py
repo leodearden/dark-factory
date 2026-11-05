@@ -19,6 +19,8 @@ from shared.declared_scope import derive_declared_scope
 
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig, TaskmasterConfig
+from fused_memory.middleware.curator_types import CuratorDecision
+from fused_memory.middleware.task_curator import TaskCurator
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.middleware.ticket_store import TicketStore
 from fused_memory.reconciliation.event_buffer import EventBuffer
@@ -42,6 +44,29 @@ class Stack:
 
     async def task_count(self) -> int:
         return len((await self.call('get_tasks'))['tasks'])
+
+    async def metadata(self, task_id: str) -> dict[str, Any]:
+        result = await self.call('get_task', id=task_id)
+        assert 'error' not in result, result
+        return result['metadata']
+
+    async def seed(self, title: str, metadata: dict[str, Any]) -> str:
+        created = await self.backend.add_task(
+            project_root=self.root, title=title, metadata=json.dumps(metadata),
+        )
+        return str(created['id'])
+
+    async def file_normal(self, **args: Any) -> str:
+        submitted = await self.call('submit_task', **args)
+        assert 'ticket' in submitted, submitted
+        resolved = await self.call('resolve_ticket', ticket=submitted['ticket'], timeout_seconds=30)
+        assert resolved.get('status') == 'created', resolved
+        return resolved['task_id']
+
+    async def file_planned(self, **args: Any) -> str:
+        result = await self.call('submit_task', planning_mode=True, **args)
+        assert 'error' not in result, result
+        return result['task_id']
 
 
 @pytest_asyncio.fixture
@@ -96,3 +121,83 @@ async def test_submit_task_refuses_a_caller_declared_scope(
     _assert_write_authority(result, None)
     assert 'ticket' not in result
     assert await stack.task_count() == before
+
+
+@pytest.fixture
+def curator_creates(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every curated candidate is created as filed, so the row carries what the ticket carried."""
+
+    async def _create_each(self, prepared, project_id, project_root):
+        return [CuratorDecision(action='create', justification='declared-scope test') for _ in prepared]
+
+    monkeypatch.setattr(TaskCurator, 'curate_prepared', _create_each)
+
+
+def _files(count: int) -> list[str]:
+    return [f'src/app/module_{index}.py' for index in range(count)]
+
+
+# Row 20 (stamp half): every task filed through submit_task carries the stamp, on both paths.
+
+
+@pytest.mark.asyncio
+async def test_a_fileless_normal_submission_is_stamped_undeclared(
+    stack: Stack, curator_creates: None,
+) -> None:
+    description, details = 'A fileless follow-up.', 'Some details.'
+
+    task_id = await stack.file_normal(
+        title='row 20 fileless', description=description, details=details, metadata={'x_note': 'n'},
+    )
+
+    assert (await stack.metadata(task_id))['declared_scope'] == {
+        'band': 'undeclared',
+        'files': 0,
+        'text_chars': len(description) + len(details),
+        'basis': 'submit',
+        'rule': 'v1',
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_normal_submission_counts_its_declared_files(
+    stack: Stack, curator_creates: None,
+) -> None:
+    task_id = await stack.file_normal(
+        title='row 20 three files', description='Touches three modules.', metadata={'files': _files(3)},
+    )
+
+    stamp = (await stack.metadata(task_id))['declared_scope']
+    assert (stamp['band'], stamp['files'], stamp['basis']) == ('moderate', 3, 'submit')
+
+
+@pytest.mark.asyncio
+async def test_a_planning_mode_submission_is_stamped_on_the_deferred_row(stack: Stack) -> None:
+    task_id = await stack.file_planned(
+        title='row 20 planned', description='One short planned change.', metadata={'files': _files(1)},
+    )
+
+    stamp = (await stack.metadata(task_id))['declared_scope']
+    assert (stamp['band'], stamp['files'], stamp['basis']) == ('narrow', 1, 'submit')
+
+
+@pytest.mark.asyncio
+async def test_a_submission_without_metadata_is_stamped_undeclared(
+    stack: Stack, curator_creates: None,
+) -> None:
+    task_id = await stack.file_normal(title='row 20 no metadata', description='No metadata at all.')
+
+    assert (await stack.metadata(task_id))['declared_scope']['band'] == 'undeclared'
+
+
+@pytest.mark.asyncio
+async def test_only_tasks_filed_after_the_stamp_carry_it(stack: Stack, curator_creates: None) -> None:
+    pre_deploy = await stack.seed('filed before the stamp existed', {'files': _files(2)})
+    filed = {
+        await stack.file_normal(title='post-deploy normal', description='Normal path.'),
+        await stack.file_planned(title='post-deploy planned', description='Planning path.'),
+    }
+
+    assert 'declared_scope' not in await stack.metadata(pre_deploy)
+    found = await stack.call('find_tasks_by_metadata', key='declared_scope')
+    assert {row['task_id'] for row in found['results']} == filed
