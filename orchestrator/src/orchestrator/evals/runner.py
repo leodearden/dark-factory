@@ -11,7 +11,7 @@ import time
 from collections.abc import Awaitable, Callable, Iterable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from shared.eval_lane import is_eval_fixture_task_id
 from shared.usage_gate import UsageGate
@@ -349,6 +349,20 @@ def build_eval_orch_config(
     return profiled.model_copy(update=update)
 
 
+class OrchConfigBuilder(Protocol):
+    """How a workflow cell's OrchestratorConfig is built from its candidate, fixture and base."""
+
+    def __call__(
+        self,
+        config: EvalConfig,
+        task: dict,
+        base_config: OrchestratorConfig | None = None,
+        memory_endpoint: str | None = None,
+        architect_config: EvalConfig | None = None,
+        judge_config: EvalConfig | None = None,
+    ) -> OrchestratorConfig: ...
+
+
 async def run_eval(
     task_path: Path,
     config: EvalConfig,
@@ -361,6 +375,7 @@ async def run_eval(
     *,
     usage_gate: InjectedGate = GATE_UNSET,
     store: ResultStore | None = None,
+    orch_config_builder: OrchConfigBuilder | None = None,
 ) -> EvalResult:
     """Run one (task, config) pair through PLAN→EXECUTE→VERIFY→REVIEW on its frozen plan.
 
@@ -373,6 +388,9 @@ async def run_eval(
     implementer stays pinned to *config*, and the cell is a JUDGE cell labelled
     by the judge candidate, so ``select_survivors`` ranks judges as their own
     axis. Without it the cell is an IMPLEMENTER cell labelled by *config*.
+
+    A caller running the cell under another profile — the shadow profile —
+    passes its builder as *orch_config_builder* (``None``: ``build_eval_orch_config``).
     """
     task = load_task(task_path)
     if worktree_path is not None:
@@ -386,7 +404,7 @@ async def run_eval(
         )
     return await _run_workflow_cell(
         task,
-        lambda: build_eval_orch_config(
+        lambda: (orch_config_builder or build_eval_orch_config)(
             config, task, base_config, memory_endpoint=memory_endpoint,
             judge_config=judge_config,
         ),
@@ -478,6 +496,7 @@ async def run_end_to_end(
     *,
     usage_gate: InjectedGate = GATE_UNSET,
     store: ResultStore | None = None,
+    orch_config_builder: OrchConfigBuilder | None = None,
 ) -> EvalResult:
     """Run ONE both-live end-to-end cell: the architect plans live and feeds the live implementer.
 
@@ -486,12 +505,14 @@ async def run_end_to_end(
     question exists (PRD decision 9). The cell is labelled
     ``<architect>+<implementer>``, is an END_TO_END cell, and its architect is
     briefed in the replay frame. It persists into *store* (``None``:
-    :meth:`ResultStore.packaged`).
+    :meth:`ResultStore.packaged`). A caller running the cell under another
+    profile — the shadow profile — passes its builder as *orch_config_builder*
+    (``None``: ``build_eval_orch_config``).
     """
     task = load_task(task_path)
     return await _run_workflow_cell(
         task,
-        lambda: build_eval_orch_config(
+        lambda: (orch_config_builder or build_eval_orch_config)(
             impl_config, task, base_config,
             memory_endpoint=memory_endpoint, architect_config=arch_config,
         ),
