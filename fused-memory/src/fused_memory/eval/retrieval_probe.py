@@ -29,9 +29,10 @@ and are deliberately NOT emitted here.
 a day-one alarm source, and per G6/M2 every threshold, tolerance,
 grandfather set and alarm lives in leaf α's limits evaluator. No pass rate,
 bound or verdict appears in this module, in the registry fixture, or in any
-of its tests. The only numeric parameter is ``k`` (``--k``, defaulting to 5
-and 10), which is a metric *parameterisation* — "is the canonical in this
-list of five" is set membership, not a tuned bound.
+of its tests. The only numeric parameter is the depth ``k`` (a caller passes
+several as ``ks``, :data:`DEFAULT_KS` being 5 and 10), which is a metric
+*parameterisation* — "is the canonical in this list of five" is set
+membership, not a tuned bound.
 
 **Schema home (D2).** :func:`build_series` assembles the M1 artifact from the
 models, path helper and validator of :mod:`shared.memory_eval_metrics`; none
@@ -104,7 +105,7 @@ is "is the canonical in this list", and the list has to have some length.
 """
 
 DEFAULT_KS: tuple[int, ...] = (5, 10)
-"""Default ``--k`` values. A parameterisation, not a limit (see module docstring)."""
+"""Default ``ks``: the depths scored when a caller names none. A parameterisation, not a limit (see module docstring)."""
 
 _WHITESPACE_RE = re.compile(r'\s+')
 
@@ -320,7 +321,8 @@ def canonical_hit(
     ranking problem and an absence problem need different fixes.
 
     *ranks* is :func:`rank_index` of the same list, threaded in by a caller
-    that already built it (the probe band calls this once per ``k``). Optional
+    that already built it (a caller scoring several depths calls this once per
+    ``k``). Optional
     rather than required so every direct caller and test keeps the one-argument
     shape; computed here when absent, and the answer is identical either way.
     """
@@ -809,7 +811,7 @@ def _proportion(
     direction: Literal['higher_is_worse', 'lower_is_worse'],
     *,
     details_path: str | None = None,
-):
+) -> Metric | None:
     """A proportion Metric, or None when nothing was scored.
 
     ``None`` rather than a 0/0 metric: the shared validator rejects a
@@ -884,8 +886,8 @@ def _disclosure_counts(observations: ProbeObservations) -> dict[str, int]:
             1 for c in observations.claims if not c.degraded and not c.scorable
         ),
         # Per QUERY, not per observation: a degraded search is one event
-        # whatever depth it is later scored at, and this is the number the
-        # degraded-queries report section enumerates.
+        # whatever depth it is later scored at, so this counts the
+        # `ProbeObservations.degraded_queries` records one for one.
         'degraded_queries': len(observations.degraded_queries),
     }
     # Which store answered, and how many observations degraded, at each depth.
@@ -903,7 +905,7 @@ def _disclosure_counts(observations: ProbeObservations) -> dict[str, int]:
             counts[key] = counts.get(key, 0) + 1
     # The inversion family's own depth-named disclosure. `superseded-above-
     # successor` carries no depth suffix in its metric_id and leaf alpha joins
-    # by metric_id alone, so without a row naming the depth a --k change reads
+    # by metric_id alone, so without a row naming the depth a change of `ks` reads
     # to the evaluator as a rate move rather than a re-parameterisation.
     # `pairs_registered` is published because it is the un-narrowed population
     # `pairs_comparable` is a subset of; the two together separate "fewer
@@ -941,7 +943,7 @@ def build_series(
     project_id: str,
     stamp: str,
     ks: tuple[int, ...] = DEFAULT_KS,
-):
+) -> MetricSeries:
     """Assemble the M1 metric series for one probe run.
 
     Emits at most the seven metrics this leaf owns, in the pinned vocabulary.
@@ -958,7 +960,7 @@ def build_series(
     # absolute path from this machine would be a dangling pointer there.
     details_path = report_artifact_path('.', EVAL_ID, stamp).name
 
-    metrics: list[Any] = []
+    metrics: list[Metric] = []
 
     items = tripwire_items(observations, TRIPWIRE_K)
     if items:
@@ -988,7 +990,7 @@ def build_series(
     # question (is the canonical in this list of five) over different phrasing
     # populations, so trending them at one k keeps them comparable. Emitting a
     # held-out variant per k would also grow the metric vocabulary every time
-    # someone passed another --k.
+    # a caller added another depth to `ks`.
     held_out = [o for o in scored_phrasings if o.k == TRIPWIRE_K and o.held_out]
     metric = _proportion(
         METRIC_CANONICAL_IN_TOP_K_HELD_OUT.format(k=TRIPWIRE_K),
@@ -1046,7 +1048,7 @@ def build_series(
         if key in counts:
             raise ValueError(
                 f'corpus_counts key {key!r} collides with a run disclosure this '
-                'runner computes. Rename the caller-supplied key: silently '
+                'module computes. Rename the caller-supplied key: silently '
                 'overwriting either one would hide a narrowing.'
             )
         counts[key] = value
@@ -1065,15 +1067,15 @@ def build_series(
 def normalise_ks(ks: tuple[int, ...]) -> tuple[int, ...]:
     """*ks* with :data:`TRIPWIRE_K` guaranteed present, caller's order kept.
 
-    ``--k`` is a repeatable parameterisation, so ``--k 7`` is a legitimate
-    request — but two metrics are DEFINED at k=5 and cannot be computed
-    without it: the ``topic-canonical-present`` tripwire and the held-out
-    proportion. Without this, ``--k 7`` emitted neither, and did so silently:
-    leaf α's evaluator joins a run to its baseline window BY metric_id, so an
-    absent metric is not an error there, it simply stops being trended. A
-    metric that quietly stops existing is worse than one that crashes.
+    *ks* is a parameterisation, so ``ks=(7,)`` is a legitimate request — but
+    two metrics are DEFINED at k=5 and cannot be computed without it: the
+    ``topic-canonical-present`` tripwire and the held-out proportion. Without
+    this, ``ks=(7,)`` emitted neither, and did so silently: leaf α's evaluator
+    joins a run to its baseline window BY metric_id, so an absent metric is not
+    an error there, it simply stops being trended. A metric that quietly stops
+    existing is worse than one that crashes.
 
-    Normalising rather than rejecting keeps ``--k 7`` legal — the extra depth
+    Normalising rather than rejecting keeps ``ks=(7,)`` legal — the extra depth
     is genuinely useful — while making the pinned metric set a guaranteed
     superset of every run's, which is what keeps α's join keys stable. The
     added depth is disclosed in the report; it is not left to be inferred
@@ -1103,7 +1105,7 @@ def pinned_metric_ids(ks: tuple[int, ...]) -> tuple[str, ...]:
     )
 
 
-def metric_families_not_measured(series, ks: tuple[int, ...]) -> list[str]:
+def metric_families_not_measured(series: MetricSeries, ks: tuple[int, ...]) -> list[str]:
     """Pinned metric ids *series* does not carry, in the pinned order.
 
     Every family in this module declines to emit rather than emit a

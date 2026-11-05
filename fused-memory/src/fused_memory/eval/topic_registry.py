@@ -564,9 +564,9 @@ def load_topic_registry(path: str | Path) -> TopicRegistry:
         )
     # A stale, truncated, or half-written registry decodes as a well-formed
     # object carrying zero entries. Loading it would emit `"metrics": []` and
-    # exit 0 — silence leaf alpha cannot distinguish from a healthy run, and a
-    # file `is_initial_run` counts, which would burn the D1 initial-state
-    # snapshot on an empty artifact. Fail at the door instead.
+    # exit 0 — silence leaf alpha cannot distinguish from a healthy run, and an
+    # artifact the first-run check counts, which would burn the D1
+    # initial-state snapshot on an empty artifact. Fail at the door instead.
     if not raw_entries:
         raise RegistryError(
             f'topic registry {str(path)!r} carries zero entries. An artifact '

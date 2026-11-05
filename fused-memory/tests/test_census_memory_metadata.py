@@ -1355,7 +1355,7 @@ class TestRegistryCoverageGauge:
         return _mod.build_report(cells, cov, top_n=50, registry=registry, **kwargs)
 
     def test_a_registry_the_strict_loader_rejects_is_disclosed_by_name(self, tmp_path):
-        # The census reuses the probe's strict loader rather than a hand-rolled
+        # The census reuses the registry's strict loader rather than a hand-rolled
         # json.load, so a registry it rejects comes back as the loader's own
         # named RegistryError -- disclosed, never fatal to the census.
         path = tmp_path / 'registry.json'
