@@ -5,7 +5,12 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from shared.declared_scope import DeclaredScope, derive_declared_scope, preserves_stamp
+from shared.declared_scope import (
+    DeclaredScope,
+    DeclaredScopeBasis,
+    derive_declared_scope,
+    preserves_stamp,
+)
 
 _TINY = 'fix it'
 
@@ -35,7 +40,7 @@ def test_v1_band_table(file_count: int, description: str, details: str, band: st
 
 
 @pytest.mark.parametrize('basis', ['submit', 'combine'])
-def test_the_record_carries_its_counts_basis_and_rule(basis: str) -> None:
+def test_the_record_carries_its_counts_basis_and_rule(basis: DeclaredScopeBasis) -> None:
     record = derive_declared_scope(_files(2), 'describe', 'the details', basis=basis)
 
     assert (record.files, record.text_chars, record.basis, record.rule) == (
@@ -65,7 +70,7 @@ def _fields(**overrides: object) -> dict[str, object]:
 )
 def test_a_malformed_record_is_refused(fields: dict[str, object]) -> None:
     with pytest.raises(ValidationError):
-        DeclaredScope(**fields)
+        DeclaredScope.model_validate(fields)
 
 
 @pytest.mark.parametrize('missing', ['band', 'files', 'text_chars', 'basis', 'rule'])
@@ -74,12 +79,12 @@ def test_every_field_is_required(missing: str) -> None:
     del fields[missing]
 
     with pytest.raises(ValidationError):
-        DeclaredScope(**fields)
+        DeclaredScope.model_validate(fields)
 
 
 @pytest.mark.parametrize('field', ['band', 'files', 'text_chars', 'basis', 'rule'])
 def test_is_frozen(field: str) -> None:
-    record = DeclaredScope(**_fields())
+    record = DeclaredScope.model_validate(_fields())
 
     with pytest.raises(ValidationError):
         setattr(record, field, 'moderate')
@@ -87,7 +92,7 @@ def test_is_frozen(field: str) -> None:
 
 def test_a_band_that_disagrees_with_its_counts_is_refused_by_name() -> None:
     with pytest.raises(ValidationError) as exc_info:
-        DeclaredScope(**_fields(band='narrow', files=9, text_chars=12))
+        DeclaredScope.model_validate(_fields(band='narrow', files=9, text_chars=12))
 
     message = str(exc_info.value)
     assert "'narrow'" in message
@@ -97,7 +102,7 @@ def test_a_band_that_disagrees_with_its_counts_is_refused_by_name() -> None:
 
 _STAMP = derive_declared_scope(_files(1), _TINY, '', basis='submit').model_dump()
 _ALTERED = {**_STAMP, 'band': 'broad', 'files': 6}
-_OTHER = {'x_note': 'kept'}
+_OTHER: dict[str, object] = {'x_note': 'kept'}
 
 
 def _blob(stamp: dict[str, object] | None) -> dict[str, object]:
