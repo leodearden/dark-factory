@@ -14,11 +14,16 @@ import re
 import shutil
 import subprocess
 import sys
+from collections.abc import Iterable
 from pathlib import Path, PurePosixPath
+from typing import TYPE_CHECKING, NamedTuple
 
 import pytest
 from _fm_helpers import load_script_module
 from shared.testing_xdist_groups import single_xdist_group
+
+if TYPE_CHECKING:
+    from _lint_cli import Violation
 
 # Load the checker script via importlib to avoid sys.path pollution.
 # fused-memory/scripts/ is not on PYTHONPATH per pyproject.toml (pythonpath=['src']).
@@ -1319,6 +1324,9 @@ class TestFusedMemoryTestsDirectoryClean:
 # whole minute. Family rationale: orchestrator/tests/_orch_helpers.py::WHOLE_TREE_SCAN_TEST_TIMEOUT.
 MAGICMOCK_REPO_SCAN_TEST_TIMEOUT = 540
 
+# Both scan classes run on one loadgroup worker, so `repo_test_scan` is built once per run.
+_REPO_SCAN_GROUP_NAME = 'bare_magicmock_repo_scan'
+
 # Worst root-bound wall clock of these scans under real load, task 5442; corpus is plans/pytest-per-test-timeout-measurement-2026-09-17.md.
 _REPO_SCAN_MEASURED_UNDER_LOAD_WORST_CASE = 61.52
 # Canonical home is orchestrator/tests/_orch_helpers.py::UNDER_LOAD_HEADROOM_FACTOR; fused-memory's tests cannot import orchestrator's test helpers.
@@ -1372,6 +1380,63 @@ def test_the_repo_wide_scans_share_one_xdist_worker(request):
     assert single_xdist_group(scan_items) == _REPO_SCAN_GROUP_NAME
 
 
+class _ScannedTestFile(NamedTuple):
+    """What the two repo-wide scans need from one scanned file; its tree is not kept."""
+
+    path: Path
+    relpath: str
+    gate_violations: tuple[Violation, ...]
+    rule_c_count: int
+    syntax_error: SyntaxError | None
+
+
+def _rule_c_count(tree: ast.Module, lines: list[str], entry: str) -> int:
+    """Count *tree*'s Rule C violations with the checker's own predicate, before any debt budget."""
+    return sum(
+        len(_checker._wall_clock_deadline_violations(node, lines, entry))
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+    )
+
+
+def _scan_test_file(path: Path, relpath: str) -> _ScannedTestFile:
+    source = path.read_text(encoding='utf-8')
+    try:
+        tree = ast.parse(source, filename=str(path))
+    except SyntaxError as exc:
+        return _ScannedTestFile(path, relpath, gate_violations=(), rule_c_count=0, syntax_error=exc)
+    return _ScannedTestFile(
+        path,
+        relpath,
+        gate_violations=tuple(_checker.find_violations_in_tree(tree, source, str(path))),
+        rule_c_count=_rule_c_count(tree, source.splitlines(), relpath),
+        syntax_error=None,
+    )
+
+
+def _scan_repo_test_dirs(
+    repo_root: Path, scanned_dirs: Iterable[str]
+) -> tuple[_ScannedTestFile, ...]:
+    """Parse every file the lint call sites scan ONCE, for both the gate and the Rule C census.
+
+    The file set, the strict utf-8 read and the filename are run_cli's, so the gate
+    sees what the CLI would. Facts, not trees: every ast.Module of seven packages'
+    tests, retained, would cost on the order of a GB of RSS on the scanning worker.
+    """
+    return tuple(
+        _scan_test_file(path, path.relative_to(repo_root).as_posix())
+        for scanned_dir in scanned_dirs
+        if (repo_root / scanned_dir).is_dir()
+        for path in _checker.discover_scan_targets(repo_root / scanned_dir)
+    )
+
+
+@pytest.fixture(scope='module')
+def repo_test_scan() -> tuple[_ScannedTestFile, ...]:
+    return _scan_repo_test_dirs(_REPO_ROOT, TestAllScannedTestDirsClean._SCANNED_DIRS)
+
+
+@pytest.mark.xdist_group(_REPO_SCAN_GROUP_NAME)
 @pytest.mark.timeout(MAGICMOCK_REPO_SCAN_TEST_TIMEOUT)
 class TestAllScannedTestDirsClean:
     """Non-regression gate for all nine call sites: every scanned tests/ dir stays clean.
@@ -1386,6 +1451,9 @@ class TestAllScannedTestDirsClean:
     counterpart to TestRuleBIsUnconditional and TestWallClockDeadlineDebtBaseline:
     those classes pin what may and may not be grandfathered, this one pins that
     nothing else was missed.
+
+    It runs the checker in-process over the shared ``repo_test_scan``; the CLI
+    boundary itself is TestCliExitCodes' and TestCliDirectoryScan's.
     """
 
     _SCANNED_DIRS = (
@@ -1398,19 +1466,18 @@ class TestAllScannedTestDirsClean:
         'cockpit/tests',
     )
 
-    def test_every_scanned_tests_directory_exits_zero(self):
-        """The checker exits 0 over every directory the nine call sites scan."""
+    def test_every_scanned_tests_directory_exits_zero(self, repo_test_scan):
+        """The checker reports no violation over every directory the nine call sites scan."""
         present = [d for d in self._SCANNED_DIRS if (_REPO_ROOT / d).is_dir()]
         assert present, (
             f'No scanned tests/ directory found under {_REPO_ROOT} — the repo-root '
             'reach (Path(__file__).parent.parent.parent) is probably wrong'
         )
-        result = subprocess.run(
-            [sys.executable, str(SCRIPT_PATH), *(str(_REPO_ROOT / d) for d in present)],
-            capture_output=True,
-            text=True,
+        violations = sorted(
+            (v for record in repo_test_scan for v in record.gate_violations),
+            key=lambda v: (v.filename, v.lineno, v.col_offset),
         )
-        assert result.returncode == 0, (
+        assert violations == [], (
             'check_bare_magicmock_config found violations in the directories scanned '
             'by the nine configured call sites (seven package orchestrator.yaml '
             'lint_commands, dark-factory-orchestrator.yaml, hooks/project-checks). '
@@ -1421,8 +1488,8 @@ class TestAllScannedTestDirsClean:
             '  wall-clock-deadline   → wait_responsive(...) with a label= / bound derived from MERGE_RESULT_TIMEOUT,\n'
             '                          or, for a debt-baseline slack report, lower the named budget\n'
             f'Scanned: {present}\n'
-            f'Violations:\n{result.stdout}\n'
-            f'stderr:\n{result.stderr}'
+            'Violations:\n'
+            + ''.join(f'{v.filename}:{v.lineno}:{v.col_offset}: {v.message}\n' for v in violations)
         )
 
 
@@ -2442,6 +2509,7 @@ class TestDebtBaselineIsolation:
         assert 'mock_orch_config' in violations[0].message
 
 
+@pytest.mark.xdist_group(_REPO_SCAN_GROUP_NAME)
 @pytest.mark.timeout(MAGICMOCK_REPO_SCAN_TEST_TIMEOUT)
 class TestWallClockDeadlineBaselineIntegrity:
     """The Rule C baseline names exactly the real files that carry Rule C debt.
@@ -2460,16 +2528,6 @@ class TestWallClockDeadlineBaselineIntegrity:
     is why the existence test stays.
     """
 
-    def _live_count(self, path: Path, entry: str) -> int:
-        """Recount *path*'s Rule C violations with the checker's own predicates."""
-        source = path.read_text(encoding='utf-8')
-        lines = source.splitlines()
-        return sum(
-            len(_checker._wall_clock_deadline_violations(node, lines, entry))
-            for node in ast.walk(ast.parse(source, filename=str(path)))
-            if isinstance(node, ast.Call)
-        )
-
     def test_every_debt_entry_resolves_to_an_existing_file(self):
         """A deleted or renamed file must not leave a stale blanket suppression behind."""
         missing = [
@@ -2483,7 +2541,7 @@ class TestWallClockDeadlineBaselineIntegrity:
             'and would grandfather a NEW file created at that path. Remove them.'
         )
 
-    def test_no_scanned_file_outside_the_baseline_carries_a_violation(self):
+    def test_no_scanned_file_outside_the_baseline_carries_a_violation(self, repo_test_scan):
         """The baseline is complete: every offending file in the seven scanned dirs is listed.
 
         The complement of test_every_debt_entry_resolves_to_an_existing_file — that one
@@ -2493,17 +2551,13 @@ class TestWallClockDeadlineBaselineIntegrity:
         """
         listed = set(_checker._WALL_CLOCK_DEADLINE_DEBT)
         unlisted = []
-        for scanned in TestAllScannedTestDirsClean._SCANNED_DIRS:
-            root = _REPO_ROOT / scanned
-            if not root.is_dir():
+        for record in repo_test_scan:
+            if record.relpath in listed:
                 continue
-            for path in _checker.discover_scan_targets(root):
-                entry = str(path.relative_to(_REPO_ROOT))
-                if entry in listed:
-                    continue
-                count = self._live_count(path, entry)
-                if count:
-                    unlisted.append(f'{entry}: {count}')
+            if record.syntax_error is not None:
+                raise record.syntax_error
+            if record.rule_c_count:
+                unlisted.append(f'{record.relpath}: {record.rule_c_count}')
         assert unlisted == [], (
             'These scanned files carry Rule C violations but are NOT on the baseline, '
             'so their package lint_command is RED:\n  ' + '\n  '.join(unlisted)
