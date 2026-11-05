@@ -13876,6 +13876,32 @@ class SpeculativeMergeWorker:
                 data={k: str(v) for k, v in data.items()},
             )
 
+    def _emit_verdict_voided(
+        self, req: MergeRequest, item: SpeculativeItem, dead_link: str, *, point: str,
+    ) -> None:
+        """Emit ``verdict_voided`` with the voided item's commit and its base's killer.
+
+        Not through :meth:`_emit_speculative`, which str()-ifies every value:
+        ``killer`` is a nested ``{site, task_id}`` object.  Call it before the
+        site records the item's own commit dead, so the killer looked up is
+        the base's.
+        """
+        if not self._event_store:
+            return
+        killer = self._dead_base_commits.killer_of(dead_link)
+        self._event_store.emit(
+            EventType.verdict_voided, task_id=req.task_id, phase='merge',
+            data={
+                'dead_link': dead_link,
+                'reason': 'chain_dead',
+                'point': point,
+                'item_commit': (
+                    item.merge_result.merge_commit if isinstance(item, RealMergeItem) else None
+                ),
+                'killer': killer.to_wire() if killer is not None else None,
+            },
+        )
+
     # ------------------------------------------------------------------
     # Out-of-band delivery helper
     # ------------------------------------------------------------------
@@ -18536,10 +18562,7 @@ class SpeculativeMergeWorker:
         _spec_warm = vr.spec_warm if vr is not None else False
         if _wt is not None:
             await self._release_or_cleanup(_wt, spec_warm=_spec_warm)
-        self._emit_speculative(
-            EventType.verdict_voided, req.task_id,
-            dead_link=dead_link, reason='chain_dead', point='adoption',
-        )
+        self._emit_verdict_voided(req, item, dead_link, point='adoption')
         self._note_transition(
             req.request_id, ItemLifecycleState.FINALIZING,
             ItemLifecycleState.MERGING, live_obj=entry,
@@ -20343,10 +20366,7 @@ class SpeculativeMergeWorker:
             # merge_wt is a required non-None Path on a RealMergeItem (task ο);
             # _chain_dead_link returned non-None → item is a RealMergeItem here.
             await self._cleanup_owned_merge_worktree(item.merge_wt)
-            self._emit_speculative(
-                EventType.verdict_voided, req.task_id,
-                dead_link=_dispatch_dead, reason='chain_dead', point='dispatch',
-            )
+            self._emit_verdict_voided(req, item, _dispatch_dead, point='dispatch')
             logger.info(
                 'Task %s: dead-base straggler at dispatch (dead link %s) — '
                 're-merging against actual main instead of burning a verify',

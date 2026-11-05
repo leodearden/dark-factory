@@ -405,7 +405,10 @@ class EventType(StrEnum):
     # item's base_sha points at a dead commit (failed/ejected/superseded/
     # re-merged since verify dispatch).  A distinct type (not speculative_discard)
     # so the phantom-block-avoided signal is separately countable via the event
-    # census.  data: {dead_link, reason ('chain_dead'), point ('dispatch'|'adoption')}.
+    # census.  data: {dead_link, reason ('chain_dead'), point ('dispatch'|'adoption'),
+    # item_commit (the voided item's own merge commit), killer ({site, task_id}:
+    # the DeadBaseSite and task whose lane event recorded dead_link dead, null
+    # when unknown; vocabulary in merge_lane/dead_base_ledger.py, task 8523)}.
     verdict_voided = 'verdict_voided'
 
     # Task lifecycle
