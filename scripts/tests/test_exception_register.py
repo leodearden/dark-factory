@@ -1473,25 +1473,39 @@ def test_report_exit_code_is_the_report_verbs_exit_code(
 # Invariants only, never populations: declarations, candidates, the seed and
 # NOT_EXCEPTION_LISTS all change legitimately as the batch's later tasks land.
 
+# One loadgroup worker runs every consumer of `live_register`, so the real tree
+# is measured (corpus read, inline-scanner subprocess) once per run.
+_LIVE_TREE_GROUP_NAME = 'exception_register_live_tree'
 
-def test_the_live_register_is_clean(tmp_path: Path, capsys):
+
+@pytest.fixture(scope='module')
+def live_register(tmp_path_factory: pytest.TempPathFactory) -> exception_register.Register:
+    return exception_register.measure(
+        REPO_ROOT,
+        sweep_state=tmp_path_factory.mktemp('sweep') / 'absent.json',
+        now=datetime.datetime.now(datetime.UTC),
+    )
+
+
+@pytest.mark.xdist_group(_LIVE_TREE_GROUP_NAME)
+def test_the_live_register_is_clean(live_register: exception_register.Register):
     """Every Policy in every declaration, inline marker and class-table row
     names a row of the real ratification table, and nothing is malformed."""
-    code = exception_register.main(
-        ['--report', '--root', str(REPO_ROOT), '--sweep-state', str(tmp_path / 'absent.json')]
+    report = exception_register.render_report(live_register)
+
+    assert report.startswith('grandfathered (unowned): ')
+    assert exception_register.report_exit_code(live_register) == 0, '\n'.join(
+        violation.render() for violation in live_register.violations
     )
 
-    assert code == 0, capsys.readouterr().err
 
-
-def test_the_live_register_document_reads_the_real_tree(tmp_path: Path, capsys):
-    capsys.readouterr()
-    code = exception_register.main(
-        ['--json', '--root', str(REPO_ROOT), '--sweep-state', str(tmp_path / 'absent.json')]
+@pytest.mark.xdist_group(_LIVE_TREE_GROUP_NAME)
+def test_the_live_register_document_reads_the_real_tree(
+    live_register: exception_register.Register,
+):
+    document = json.loads(
+        json.dumps(exception_register.register_document(live_register), sort_keys=True)
     )
-    captured = capsys.readouterr()
-    assert code == 0, captured.err
-    document = json.loads(captured.out)
 
     assert document['inline']['sites'] >= 1000
     assert document['discovery']['files_parsed'] >= 1
@@ -1539,7 +1553,10 @@ def test_every_not_exception_row_names_a_live_container():
 _CLOSED_RULINGS_TASK = TaskRef(5603)
 
 
-def test_no_live_declaration_cites_the_closed_rulings_task():
+@pytest.mark.xdist_group(_LIVE_TREE_GROUP_NAME)
+def test_no_live_declaration_cites_the_closed_rulings_task(
+    live_register: exception_register.Register,
+):
     """No declaration's default or override is a Debt owned by task 5603.
 
     5603 is δ, the operator decision gate whose sitting produced the day-one
@@ -1547,11 +1564,10 @@ def test_no_live_declaration_cites_the_closed_rulings_task():
     owner sweep (κ2) activates only once nothing cites it, so a copy of the old
     placeholder literal must fail here rather than wait for the sweep.
     """
-    discovery = exception_register.discover_declarations(REPO_ROOT)
     placeholder = Debt(_CLOSED_RULINGS_TASK)
     citing = sorted(
         f'{d.path}:{d.line} {d.list_id}'
-        for d in discovery.declarations
+        for d in live_register.discovery.declarations
         if placeholder in (d.default, *d.overrides.values())
     )
 
