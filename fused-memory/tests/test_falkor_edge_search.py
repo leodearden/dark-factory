@@ -414,10 +414,20 @@ class TestNodeBfsSearch:
         assert 'group_ids' not in issued[0].params
 
     @pytest.mark.asyncio
-    async def test_applies_graphiti_search_filter_predicates(self) -> None:
+    async def test_every_origin_label_leg_applies_the_node_predicates(self) -> None:
+        """A leg missing one returns its own unfiltered nodes, which only the live parity tests see."""
         _, issued = await self._search(search_filter=SearchFilters(node_labels=['Preference']))
 
-        assert 'n:Preference' in issued[0].cypher
+        (query,) = issued
+        legs = ('MATCH (origin:Entity)', 'MATCH (origin:Episodic)')
+        assert all(leg in query.cypher for leg in legs)
+        for predicate in (
+            'origin.uuid IN $bfs_origin_node_uuids',
+            'n.group_id = origin.group_id',
+            'origin.group_id IN $group_ids',
+            'n:Preference',
+        ):
+            assert query.cypher.count(predicate) == len(legs), predicate
 
     @pytest.mark.asyncio
     async def test_parses_records_into_entity_nodes(self) -> None:

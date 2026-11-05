@@ -285,16 +285,11 @@ class TestEdgeFulltextLeg:
         A small ring, so the built-in per-row scan finishes inside the server TIMEOUT.
         """
         seeded = await seed_ring(50)
-        leg = bm25_leg(seeded.name, 1000)
-        builtin_driver = without_search_interface(seeded.driver)
-        issued_by_builtin = spy_on_queries(builtin_driver)
 
-        rewritten = {edge.uuid for edge in await leg(seeded.driver)}
-        builtin = {edge.uuid for edge in await leg(builtin_driver)}
+        edges, builtin_edges = await hardened_and_builtin_rows(seeded, bm25_leg(seeded.name, 1000))
 
-        (oracle_query,) = issued_by_builtin
-        assert 'MATCH' in oracle_query.cypher, 'the oracle must run the built-in Cypher'
-        assert rewritten == builtin == set(seeded.entity_edges)
+        rewritten = {edge.uuid for edge in edges}
+        assert rewritten == {edge.uuid for edge in builtin_edges} == set(seeded.entity_edges)
         assert seeded.off_label_edge.uuid not in rewritten
 
 
@@ -377,6 +372,7 @@ BFS_DEPTH = 3
 BFS_ENTITY_ORIGIN = 1
 BFS_MENTIONED = 10
 BFS_EPISODE_UUID = 'episode-bfs-origin'
+BFS_ORIGINS = (f'node-{BFS_ENTITY_ORIGIN}', BFS_EPISODE_UUID)
 
 SEED_EPISODE_CYPHER = (
     'MATCH (n:Entity {uuid: $mentioned}) '
@@ -414,7 +410,7 @@ def bfs_expected(count: int) -> set[str]:
 def bfs_leg(group_id: str, limit: int) -> SearchLeg:
     return lambda driver: search_utils.edge_bfs_search(
         driver,
-        [f'node-{BFS_ENTITY_ORIGIN}', BFS_EPISODE_UUID],
+        list(BFS_ORIGINS),
         BFS_DEPTH,
         SearchFilters(),
         [group_id],
@@ -533,7 +529,7 @@ def node_bfs_leg(
 ) -> NodeSearchLeg:
     return lambda driver: search_utils.node_bfs_search(
         driver,
-        [f'node-{BFS_ENTITY_ORIGIN}', BFS_EPISODE_UUID],
+        list(BFS_ORIGINS),
         search_filter or SearchFilters(),
         BFS_DEPTH,
         group_ids,
@@ -571,6 +567,19 @@ async def seed_node_bfs(seed_bfs) -> Callable[[int], Awaitable[SeededGraph]]:
         return seeded
 
     return seed
+
+
+SEVERAL_PATHS_CYPHER = (
+    f'MATCH path = (origin)-[:RELATES_TO|MENTIONS*1..{BFS_DEPTH}]->(n:Entity)'
+    ' WHERE origin.uuid IN $origins'
+    ' WITH n, count(path) AS paths WHERE paths > 1 RETURN n.uuid'
+)
+
+
+async def nodes_on_several_bfs_paths(seeded: SeededGraph) -> set[str]:
+    """The Entity nodes that more than one path of the BFS links to BFS_ORIGINS."""
+    result = await seeded.graph.query(SEVERAL_PATHS_CYPHER, {'origins': list(BFS_ORIGINS)})
+    return {uuid for (uuid,) in result.result_set}
 
 
 GroupIdsOf = Callable[[SeededGraph], list[str] | None]
@@ -624,15 +633,15 @@ class TestNodeBfsLeg:
         """
         seeded = await seed_node_bfs(50)
 
+        assert await nodes_on_several_bfs_paths(seeded), 'else one row per node holds vacuously'
+
         nodes, builtin_nodes = await hardened_and_builtin_rows(
             seeded, node_bfs_leg(group_ids_of(seeded), 1000)
         )
 
-        builtin = {node.uuid for node in builtin_nodes}
-        assert len(builtin_nodes) > len(builtin), 'stock must return some node once per path'
         rewritten = {node.uuid for node in nodes}
         assert rewritten.isdisjoint({BFS_DETOUR_NODE, BFS_FOREIGN_NODE})
-        assert rewritten == builtin == node_bfs_expected(50)
+        assert rewritten == {node.uuid for node in builtin_nodes} == node_bfs_expected(50)
         assert len(nodes) == len(rewritten)
         assert {node.group_id for node in nodes} == {seeded.name}
 
