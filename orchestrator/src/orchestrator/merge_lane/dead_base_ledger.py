@@ -1,4 +1,5 @@
-"""The INV-3 dead-base ledger: merge commits that will never reach main, and what killed each.
+"""The INV-3 dead-base ledger: merge commits that will never reach main, what killed
+each, and where a verdict built on one was voided.
 
 Rationale: ``plans/merge-verdict-integrity-prd.md`` §1 INV-3 for the ledger,
 ``plans/merge-lane-policy-prd.md`` D10 for the killer provenance.
@@ -27,6 +28,13 @@ class DeadBaseSite(StrEnum):
     DISPATCH_VOID = 'dispatch_void'
     #: A stale merge discarded at dispatch (Mechanism 2).
     STALE_DISCARD = 'stale_discard'
+
+
+class VoidPoint(StrEnum):
+    """The INV-3 enforcement point that voided a verdict built on a dead base."""
+
+    DISPATCH = 'dispatch'
+    ADOPTION = 'adoption'
 
 
 @dataclasses.dataclass(frozen=True)

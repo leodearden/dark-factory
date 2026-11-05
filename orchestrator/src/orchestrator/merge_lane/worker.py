@@ -83,6 +83,7 @@ from orchestrator.merge_lane.dead_base_ledger import (
     DeadBaseKiller,
     DeadBaseLedger,
     DeadBaseSite,
+    VoidPoint,
 )
 from orchestrator.merge_lane.disposition import (
     MergeFailureDisposition,
@@ -13898,7 +13899,7 @@ class SpeculativeMergeWorker:
             )
 
     def _note_verify_completed(
-        self, out: object, entry_slot: InflightEntrySlot | None, lease: Any,
+        self, out: object, entry_slot: InflightEntrySlot | None, lease: HostLease | None,
     ) -> None:
         """Add a verify that ran to a verdict to its host's duration window.
 
@@ -13915,6 +13916,7 @@ class SpeculativeMergeWorker:
         )
 
     def _emit_verify_cancelled(self, task_id: str, cancel: VerifyCancel) -> None:
+        """Write one ``merge_verify_cancelled`` row, unless this dispatch already has one."""
         if not self._event_store or not self._cancelled_dispatches.claim(task_id, cancel):
             return
         self._event_store.emit(
@@ -13925,14 +13927,14 @@ class SpeculativeMergeWorker:
         )
 
     def _emit_verdict_voided(
-        self, req: MergeRequest, item: SpeculativeItem, dead_link: str, *, point: str,
+        self, req: MergeRequest, item: SpeculativeItem, dead_link: str, *, point: VoidPoint,
     ) -> None:
         """Emit ``verdict_voided`` with the voided item's commit and its base's killer.
 
         Not through :meth:`_emit_speculative`, which str()-ifies every value:
         ``killer`` is a nested ``{site, task_id}`` object.  Call it before the
-        site records the item's own commit dead, so the killer looked up is
-        the base's.
+        site records the item's own commit dead, so a full ledger cannot evict
+        *dead_link* before its killer is looked up.
         """
         if not self._event_store:
             return
@@ -13942,7 +13944,7 @@ class SpeculativeMergeWorker:
             data={
                 'dead_link': dead_link,
                 'reason': 'chain_dead',
-                'point': point,
+                'point': point.value,
                 'item_commit': (
                     item.merge_result.merge_commit if isinstance(item, RealMergeItem) else None
                 ),
@@ -16758,7 +16760,8 @@ class SpeculativeMergeWorker:
 
         *cancel* (required keyword) is the deliberate canceller's record: when
         it is given and *verify_task* is still running, one
-        ``merge_verify_cancelled`` row is written before the abort.  Reaps
+        ``merge_verify_cancelled`` row is written before the abort, unless
+        this dispatch already has one (``RecordedDispatches``).  Reaps
         reacting to an outer cancel pass ``None``, because the canceller of
         the outer task already recorded it.
 
@@ -18636,7 +18639,7 @@ class SpeculativeMergeWorker:
         _spec_warm = vr.spec_warm if vr is not None else False
         if _wt is not None:
             await self._release_or_cleanup(_wt, spec_warm=_spec_warm)
-        self._emit_verdict_voided(req, item, dead_link, point='adoption')
+        self._emit_verdict_voided(req, item, dead_link, point=VoidPoint.ADOPTION)
         self._note_transition(
             req.request_id, ItemLifecycleState.FINALIZING,
             ItemLifecycleState.MERGING, live_obj=entry,
@@ -20253,12 +20256,13 @@ class SpeculativeMergeWorker:
         return candidate.reanchored(item, gate.rebased_sha)
 
     def _frontier_base_commits(self) -> tuple[set[str], set[str]]:
-        """The in-flight merge commits and gate-rebased heads a dispatch may be built on."""
+        """The frozen prefix's merge commits and gate-rebased heads a dispatch may be built on."""
+        frozen = self._frozen_inflight_entries()
         stacked_on = {
-            e.item.merge_result.merge_commit for e in self._inflight
+            e.item.merge_result.merge_commit for e in frozen
             if isinstance(e.item, RealMergeItem) and e.item.merge_result.merge_commit
         }
-        rebased_heads = {e.gate.rebased_sha for e in self._inflight if e.gate is not None}
+        rebased_heads = {e.gate.rebased_sha for e in frozen if e.gate is not None}
         return stacked_on, rebased_heads
 
     async def _dispatch_item(
@@ -20442,7 +20446,7 @@ class SpeculativeMergeWorker:
             # merge_wt is a required non-None Path on a RealMergeItem (task ο);
             # _chain_dead_link returned non-None → item is a RealMergeItem here.
             await self._cleanup_owned_merge_worktree(item.merge_wt)
-            self._emit_verdict_voided(req, item, _dispatch_dead, point='dispatch')
+            self._emit_verdict_voided(req, item, _dispatch_dead, point=VoidPoint.DISPATCH)
             logger.info(
                 'Task %s: dead-base straggler at dispatch (dead link %s) — '
                 're-merging against actual main instead of burning a verify',

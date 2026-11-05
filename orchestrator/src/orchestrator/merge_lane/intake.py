@@ -145,6 +145,7 @@ async def enqueue_merge_request(
         if registry is not None
         else None
     )
+    queued_at = time.monotonic()
 
     def _on_finalized(fut: asyncio.Future) -> None:  # noqa: ANN001
         # --- derive terminal state -------------------------------------------
@@ -226,7 +227,6 @@ async def enqueue_merge_request(
                     req.request_id, req.task_id, exc_info=True,
                 )
 
-    queued_at = time.monotonic()
     req.result.add_done_callback(_on_finalized)
     await queue.put(req)
     _emit_merge_queued(event_store, req, queue_depth=queue.qsize(), source=source)
