@@ -226,7 +226,9 @@ from orchestrator.merge_lane.verify_base_detector import (
     detect_verify_base_divergence,
 )
 from orchestrator.merge_verify_facts import (
+    BaseRelation,
     MergeVerifyDispatchFacts,
+    RunnerReason,
     classify_base_relation,
 )
 from orchestrator.remote_gate import GateIdentityPair, RunnerUnavailableKind
@@ -2425,6 +2427,19 @@ async def _record_flake_observation(
         event_store=event_store,
         escalation_queue=escalation_queue,
     )
+
+
+def _gate_dispatch_facts(
+    lease: HostLease | None, history_leg_command: str | None, *, fell_back: bool,
+) -> MergeVerifyDispatchFacts:
+    """The dispatch facts of a gate re-verify, which verifies the head rebased onto main."""
+    if fell_back:
+        reason = RunnerReason.REMOTE_QUARANTINED
+    elif lease is None or history_leg_command is not None:
+        reason = RunnerReason.LOCAL_ONLY_RULE
+    else:
+        reason = RunnerReason.GATE_ON_HEAD_HOST
+    return MergeVerifyDispatchFacts(runner_reason=reason, base_relation=BaseRelation.MAIN)
 
 
 async def _run_post_merge_verify(
@@ -17055,12 +17070,16 @@ class SpeculativeMergeWorker:
         ``on_unavailable`` chokepoint and the gate re-runs on local, leaseless,
         never blocking the item; its restart-drain deadline restarts with it.
         An interrupted remote attempt is aborted on its host while still live.
+        Each row's ``runner_reason`` says which of these arms ran it.
         """
+        fell_back = False
         if lease is not None and not lease.is_local and history_leg_command is None:
             try:
                 return await _run_verify_reaped(
                     self._lane_post_merge_verify(
-                        git_ops, req, merge_wt, runner=lease.runner, **gate_kwargs,
+                        git_ops, req, merge_wt, runner=lease.runner,
+                        dispatch_facts=_gate_dispatch_facts(lease, None, fell_back=False),
+                        **gate_kwargs,
                     ),
                     reap=functools.partial(
                         self._teardown_verify_task,
@@ -17075,8 +17094,11 @@ class SpeculativeMergeWorker:
                 )
                 self.bench_unavailable_runner(lease.name, exc)
                 self._note_verify_started(req.request_id)
+                fell_back = True
         return await self._lane_post_merge_verify(
-            git_ops, req, merge_wt, history_leg_command=history_leg_command, **gate_kwargs,
+            git_ops, req, merge_wt, history_leg_command=history_leg_command,
+            dispatch_facts=_gate_dispatch_facts(lease, history_leg_command, fell_back=fell_back),
+            **gate_kwargs,
         )
 
     async def _run_inflight_verify(
