@@ -24,6 +24,7 @@ from orchestrator.artifacts import (
     ArtifactWriteError,
     PlanMutexNotHeld,
     ReviewAggregation,
+    ReviewsRootMissing,
     TaskArtifacts,
     _normalize_plan,
     iteration_entry_written_by_orchestrator,
@@ -2034,21 +2035,24 @@ class TestStringItemResilience:
 
 
 class TestWorktreeMissingTolerance:
-    """Best-effort writes survive a deleted worktree without raising."""
+    """A deleted worktree: the best-effort writes (write_verdict, _write_json)
+    survive it without raising, while write_review, whose output is the review
+    gate's only input, refuses loudly."""
 
-    def test_write_review_skips_when_root_gone(self, tmp_path: Path, caplog):
+    def test_write_review_raises_when_root_gone(self, tmp_path: Path):
         worktree = tmp_path / 'gone'
         worktree.mkdir()
         ta = TaskArtifacts(worktree)
         ta.init('task-x', 'gone', 'desc')
-        # Remove the worktree out-of-band
-        import shutil
         shutil.rmtree(worktree)
         assert not ta.task_root.is_dir()
 
-        # Must not raise
-        ta.write_review('reviewer-x', {'verdict': 'PASS', 'issues': []})
-        # And nothing was created
+        with pytest.raises(ReviewsRootMissing) as excinfo:
+            ta.write_review('reviewer-x', {'verdict': 'PASS', 'issues': []})
+
+        assert isinstance(excinfo.value, FileNotFoundError)
+        assert 'reviewer-x' in str(excinfo.value)
+        assert str(ta.task_root) in str(excinfo.value)
         assert not ta.task_root.exists()
 
     def test_write_verdict_skips_when_root_gone(self, tmp_path: Path):
@@ -2801,11 +2805,11 @@ class TestDualRootRouting(_DualRootLayout):
         stored = json.loads((task / 'plan.json').read_text())
         assert stored['steps'][0]['status'] == 'done'
 
-    def test_task_root_gone_is_tolerated(self, arts, lane, task):
-        import shutil
+    def test_task_root_gone_refuses_only_the_review_write(self, arts, lane, task):
         shutil.rmtree(task)
 
-        arts.write_review('r', {'verdict': 'PASS'})
+        with pytest.raises(ReviewsRootMissing):
+            arts.write_review('r', {'verdict': 'PASS'})
         arts.write_verdict('judge', _VERDICT)
         with arts.plan_mutex():
             pass
