@@ -9,15 +9,18 @@ backend. Strict MCP and the null memory sentinel are inherited from
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
 
 from orchestrator import config as orch_config_module
 from orchestrator.config import OrchestratorConfig, SandboxConfig
+from orchestrator.evals import runner
 from orchestrator.evals.configs import EvalConfig
 from orchestrator.evals.live_fixture import build_live_fixture
-from orchestrator.evals.runner import build_eval_orch_config
+from orchestrator.evals.runner import build_eval_orch_config, run_end_to_end, run_eval
 from orchestrator.evals.shadow_invocation import build_shadow_orch_config
 from orchestrator.fm_retry import FM_NULL_SENTINEL_URL
 
@@ -105,3 +108,118 @@ def test_a_memory_endpoint_is_refused(tmp_path: Path) -> None:
 def test_a_missing_base_config_is_refused(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match='base_config'):
         build_shadow_orch_config(_IMPL, _shadow_fixture(tmp_path), None)
+
+
+class _Sentinel(Exception):
+    """Stops a runner at the seam under test, before any workflow runs."""
+
+
+class _RecordingBuilder:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    def __call__(
+        self,
+        config: EvalConfig,
+        task: dict,
+        base_config: OrchestratorConfig | None = None,
+        memory_endpoint: str | None = None,
+        architect_config: EvalConfig | None = None,
+        judge_config: EvalConfig | None = None,
+    ) -> OrchestratorConfig:
+        self.calls.append({
+            'config': config, 'task': task, 'base_config': base_config,
+            'memory_endpoint': memory_endpoint, 'architect_config': architect_config,
+            'judge_config': judge_config,
+        })
+        raise _Sentinel
+
+
+@pytest.mark.asyncio
+async def test_run_eval_builds_the_cell_config_with_the_injected_builder(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    fixture = _shadow_fixture(tmp_path)
+    monkeypatch.setattr(runner, 'load_task', lambda _path: fixture)
+    base = OrchestratorConfig(project_root=tmp_path)
+    judge = EvalConfig('judge', 'claude', 'haiku', 'low')
+    recorder = _RecordingBuilder()
+
+    with pytest.raises(_Sentinel):
+        await run_eval(
+            tmp_path / 'task.json', _IMPL, base,
+            worktree_path=tmp_path, memory_endpoint='http://127.0.0.1:54321',
+            judge_config=judge, orch_config_builder=recorder,
+        )
+
+    assert recorder.calls == [{
+        'config': _IMPL, 'task': fixture, 'base_config': base,
+        'memory_endpoint': 'http://127.0.0.1:54321', 'architect_config': None,
+        'judge_config': judge,
+    }]
+
+
+@pytest.mark.asyncio
+async def test_run_end_to_end_builds_the_cell_config_with_the_injected_builder(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    fixture = _shadow_fixture(tmp_path)
+    monkeypatch.setattr(runner, 'load_task', lambda _path: fixture)
+    monkeypatch.setattr(
+        runner, 'create_eval_worktree', AsyncMock(return_value=(tmp_path / 'wt', 'run-e2e')),
+    )
+    base = OrchestratorConfig(project_root=tmp_path)
+    architect = EvalConfig('arch', 'claude', 'opus', 'high')
+    recorder = _RecordingBuilder()
+
+    with pytest.raises(_Sentinel):
+        await run_end_to_end(
+            tmp_path / 'task.json', architect, _IMPL, base,
+            memory_endpoint='http://127.0.0.1:54321', orch_config_builder=recorder,
+        )
+
+    assert recorder.calls == [{
+        'config': _IMPL, 'task': fixture, 'base_config': base,
+        'memory_endpoint': 'http://127.0.0.1:54321', 'architect_config': architect,
+        'judge_config': None,
+    }]
+
+
+async def _workflow_config_run_eval_builds(
+    tmp_path: Path, monkeypatch, **builder: Any,
+) -> OrchestratorConfig:
+    """The OrchestratorConfig ``run_eval`` hands ``build_workflow`` for a shadow fixture."""
+    captured: dict[str, Any] = {}
+
+    def stop_at_build_workflow(**kwargs: Any):
+        captured.update(kwargs)
+        raise _Sentinel
+
+    monkeypatch.setattr(runner, 'load_task', lambda _path: _shadow_fixture(tmp_path))
+    monkeypatch.setattr(runner, 'build_workflow', stop_at_build_workflow)
+
+    with pytest.raises(_Sentinel):
+        await run_eval(
+            tmp_path / 'task.json', _IMPL, OrchestratorConfig(project_root=tmp_path),
+            worktree_path=tmp_path, usage_gate=None, **builder,
+        )
+
+    return captured['config']
+
+
+@pytest.mark.asyncio
+async def test_run_eval_under_the_shadow_builder_runs_its_cell_sandboxed(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    config = await _workflow_config_run_eval_builds(
+        tmp_path, monkeypatch, orch_config_builder=build_shadow_orch_config,
+    )
+
+    assert config.sandbox.enabled is True
+
+
+@pytest.mark.asyncio
+async def test_run_eval_by_default_runs_its_cell_unsandboxed(tmp_path: Path, monkeypatch) -> None:
+    config = await _workflow_config_run_eval_builds(tmp_path, monkeypatch)
+
+    assert config.sandbox.enabled is False
