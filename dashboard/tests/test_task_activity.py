@@ -12,6 +12,7 @@ import aiosqlite
 import pytest
 from _runs_db_fixture import runs_db_path, write_runs_db
 
+import dashboard.data.task_activity as task_activity
 from dashboard.data.datum import DatumState
 from dashboard.data.prd_view import MOVING_WINDOW_DAYS
 from dashboard.data.task_activity import ACTIVITY_QUERIES, acquire_activity, clear_activity_state
@@ -105,6 +106,32 @@ async def test_no_runs_db_is_unknown_naming_where_it_was_looked_for(tmp_path):
     assert datum.state is DatumState.UNKNOWN
     assert datum.value is None
     assert str(runs_db_path(tmp_path)) in (datum.reason or '')
+
+
+WALK_TIMED_OUT = 'the request walk of run ledgers did not finish within 2.0s'
+
+
+async def test_no_connection_for_a_known_reason_is_unknown_with_that_reason(tmp_path):
+    datum = await acquire_activity(None, tmp_path, now=NOW, absent_reason=WALK_TIMED_OUT)
+
+    assert datum.state is DatumState.UNKNOWN
+    assert datum.reason == WALK_TIMED_OUT
+
+
+async def test_no_connection_after_a_good_read_serves_the_last_good_activity(
+    tmp_path, monkeypatch,
+):
+    good = await activity_of(tmp_path, events=EVENTS, task_results=TASK_RESULTS)
+    monkeypatch.setattr(task_activity, 'ACTIVITY_TTL_SECONDS', 0.0)
+
+    datum = await acquire_activity(
+        None, tmp_path, now=NOW + timedelta(seconds=1), absent_reason=WALK_TIMED_OUT,
+    )
+
+    assert datum.state is DatumState.STALE
+    assert datum.reason == WALK_TIMED_OUT
+    assert datum.value == good.value
+    assert datum.as_of == NOW
 
 
 async def test_a_runs_db_without_task_results_is_a_lower_bound_naming_the_table(tmp_path):
