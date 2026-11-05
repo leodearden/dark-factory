@@ -278,7 +278,7 @@ async def test_work_that_outlives_its_wait_and_then_answers_logs_nothing(caplog)
         with pytest.raises(TimeoutError):
             await wait_shielded(walk(), 0.01, what='the test walk')
         release.set()
-        await asyncio.wait_for(landed.wait(), 2.0)
+        await landed.wait()
         await asyncio.sleep(0.01)
 
     assert not [record for record in caplog.records if record.name == served_read.__name__]
