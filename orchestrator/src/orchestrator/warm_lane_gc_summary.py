@@ -16,8 +16,8 @@ logger = logging.getLogger(__name__)
 SUMMARY_PREFIX = 'reclaim:'
 REQUIRED_FIELDS = ('reset', 'removed', 'preserved')
 
-_FIELD_NAME = re.compile(r'[a-z][a-z_]*')
-_TOKEN = re.compile(r'([a-z][a-z_]*)=([0-9]+)')
+_FIELD_NAME = re.compile(r'[a-z][a-z0-9_]*')
+_TOKEN = re.compile(rf'({_FIELD_NAME.pattern})=([0-9]+)')
 _STDOUT_QUOTE_LIMIT = 200
 
 
@@ -33,21 +33,6 @@ class ReclaimSummary:
 
     def __post_init__(self) -> None:
         _check_fields(self.fields)
-
-    def count(self, name: str) -> int | None:
-        return dict(self.fields).get(name)
-
-    @property
-    def reset(self) -> int:
-        return dict(self.fields)['reset']
-
-    @property
-    def removed(self) -> int:
-        return dict(self.fields)['removed']
-
-    @property
-    def preserved(self) -> int:
-        return dict(self.fields)['preserved']
 
     def render(self) -> str:
         return ' '.join(f'{name}={value}' for name, value in self.fields)
@@ -79,8 +64,7 @@ def parse_reclaim_summary(stdout: str) -> ReclaimSummary:
     ]
     if len(summaries) != 1:
         raise ReclaimSummaryError(
-            f'expected exactly one {SUMMARY_PREFIX!r} line on stdout, found '
-            f'{len(summaries)} (stdout={stdout[:_STDOUT_QUOTE_LIMIT]!r})',
+            f'expected exactly one {SUMMARY_PREFIX!r} line on stdout, found {len(summaries)}',
         )
     body = summaries[0].removeprefix(SUMMARY_PREFIX)
     return ReclaimSummary(fields=tuple(_parse_token(token) for token in body.split()))
@@ -94,28 +78,30 @@ def _parse_token(token: str) -> tuple[str, int]:
 
 
 def log_reclaim_outcome(
-    *, rc: int, stdout: str, stderr: str, script: Path, origin: str, duration_secs: float,
+    *, context: str, rc: int, stdout: str, stderr: str, script: Path, origin: str,
+    duration_secs: float,
 ) -> None:
     """Log one reclaim run's outcome as the orchestrator arm's per-pass record.
 
+    Every line is prefixed ``<context>:``, the caller that ran the script.
     A countable rc=0 run logs ONE INFO ``reclaim pass`` line of ``name=value``
     fields, summable by key across the journal; on ``origin=dark-factory`` it
     is task 3078's evidence item 1. An uncountable rc=0 run, or a non-zero
     exit, logs a WARNING instead.
     """
     if rc != 0:
-        logger.warning('_run_warm_lane_gc_reclaim: script exited %d (stderr=%r)', rc, stderr)
+        logger.warning('%s: script exited %d (stderr=%r)', context, rc, stderr)
         return
     try:
         summary = parse_reclaim_summary(stdout)
     except ReclaimSummaryError as exc:
         logger.warning(
-            '_run_warm_lane_gc_reclaim: %s (%s) exited 0 without a countable reclaim '
-            'summary — %s; this pass is uncounted (stdout=%r)',
-            script, origin, exc, stdout[:_STDOUT_QUOTE_LIMIT],
+            '%s: %s (%s) exited 0 without a countable reclaim summary — %s; '
+            'this pass is uncounted (stdout=%r)',
+            context, script, origin, exc, stdout[:_STDOUT_QUOTE_LIMIT],
         )
         return
     logger.info(
-        '_run_warm_lane_gc_reclaim: reclaim pass origin=%s script=%s duration_s=%.3f %s',
-        origin, script, duration_secs, summary.render(),
+        '%s: reclaim pass origin=%s script=%s duration_s=%.3f %s',
+        context, origin, script, duration_secs, summary.render(),
     )

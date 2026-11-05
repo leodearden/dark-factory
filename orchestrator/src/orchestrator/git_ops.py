@@ -6328,8 +6328,8 @@ class GitOps:
             started = time.monotonic()
             rc, out, err = await _run(cmd, cwd=self.project_root)
             log_reclaim_outcome(
-                rc=rc, stdout=out, stderr=err, script=script, origin=origin,
-                duration_secs=time.monotonic() - started,
+                context='_run_warm_lane_gc_reclaim', rc=rc, stdout=out, stderr=err,
+                script=script, origin=origin, duration_secs=time.monotonic() - started,
             )
             return rc
         except Exception:

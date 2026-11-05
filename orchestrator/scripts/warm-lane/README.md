@@ -1390,7 +1390,9 @@ Anything else resets, as before. That includes a `NaN` `exited_at`, which
     `orchestrator/src/orchestrator/warm_lane_gc_summary.py::parse_reclaim_summary`
     (task 7857). It keys on field names, so either copy's set is accepted;
     reify's has `reset_cold` and no record-gate fields. It REQUIRES `reset`,
-    `removed` and `preserved`, so renaming one of them makes every pass log
+    `removed` and `preserved`, and every token to be `name=N`, `name`
+    matching `[a-z][a-z0-9_]*` and `N` a decimal count. Renaming a required
+    field, or appending a token outside that grammar, makes every pass log
     an "uncounted" WARNING. Each rc=0 pass logs one INFO "reclaim pass"
     record carrying `origin`, `script` and `duration_s` plus every field.
     S-discard1 pins the full line.

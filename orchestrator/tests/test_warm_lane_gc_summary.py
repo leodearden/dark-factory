@@ -33,6 +33,10 @@ def _expected_fields(line: str) -> dict[str, int]:
     return {name: int(value) for name, value in (t.split('=') for t in body.split())}
 
 
+def _counts(summary: ReclaimSummary) -> dict[str, int]:
+    return dict(summary.fields)
+
+
 class TestParseAcceptsEitherCopy:
     @pytest.mark.parametrize('line', [DF_LINE, REIFY_LINE, REIFY_9611_LINE])
     def test_every_field_is_readable_by_name(self, line: str) -> None:
@@ -40,24 +44,24 @@ class TestParseAcceptsEitherCopy:
 
         summary = parse_reclaim_summary(line + '\n')
 
-        assert summary.reset == expected['reset']
-        assert summary.removed == expected['removed']
-        assert summary.preserved == expected['preserved']
-        for name, value in expected.items():
-            assert summary.count(name) == value
+        assert _counts(summary) == expected
 
     def test_parser_keys_on_names_not_positions(self) -> None:
         summary = parse_reclaim_summary(
             'reclaim: preserved=5 reset_cold=1 removed=1 reset=3',
         )
 
-        assert (summary.reset, summary.removed, summary.preserved) == (3, 1, 5)
-        assert summary.count('reset_cold') == 1
+        assert _counts(summary) == {'reset': 3, 'removed': 1, 'preserved': 5, 'reset_cold': 1}
 
-    def test_a_field_the_copy_does_not_emit_counts_as_none(self) -> None:
+    def test_a_field_the_copy_does_not_emit_is_absent(self) -> None:
         summary = parse_reclaim_summary(REIFY_LINE)
 
-        assert summary.count('preserved_assigned') is None
+        assert 'preserved_assigned' not in _counts(summary)
+
+    def test_an_appended_field_name_may_carry_digits(self) -> None:
+        summary = parse_reclaim_summary(DF_LINE + ' reset_v2=4')
+
+        assert _counts(summary)['reset_v2'] == 4
 
     @pytest.mark.parametrize('line', [DF_LINE, REIFY_LINE, REIFY_9611_LINE])
     def test_render_reproduces_the_body_in_emitted_order(self, line: str) -> None:
@@ -78,14 +82,14 @@ class TestParseRejectsAnUncountableSummary:
             parse_reclaim_summary(stdout)
 
     def test_two_summary_lines_are_rejected(self) -> None:
-        with pytest.raises(ReclaimSummaryError, match='2'):
+        with pytest.raises(ReclaimSummaryError, match='found 2'):
             parse_reclaim_summary(f'{DF_LINE}\n{REIFY_LINE}\n')
 
     def test_a_missing_required_field_is_named(self) -> None:
         with pytest.raises(ReclaimSummaryError, match='preserved'):
             parse_reclaim_summary('reclaim: reset=1 removed=0')
 
-    @pytest.mark.parametrize('token', ['reset=x', 'reset', 'reset=-1', 'Reset=1'])
+    @pytest.mark.parametrize('token', ['reset=x', 'reset', 'reset=-1', 'Reset=1', '2reset=1'])
     def test_a_malformed_token_is_named(self, token: str) -> None:
         line = f'reclaim: {token} removed=0 preserved=0'
 
@@ -122,6 +126,13 @@ class TestReclaimSummaryEnforcesItsInvariantAtConstruction:
                 fields=(('reset', 1), ('removed', 0), ('preserved', 0), ('Bad-Name', 1)),
             )
 
+    def test_a_name_with_digits_after_the_first_letter_is_accepted(self) -> None:
+        summary = ReclaimSummary(
+            fields=(('reset', 1), ('removed', 0), ('preserved', 0), ('reset_v2', 1)),
+        )
+
+        assert _counts(summary)['reset_v2'] == 1
+
     def test_the_error_is_a_value_error(self) -> None:
         assert issubclass(ReclaimSummaryError, ValueError)
 
@@ -132,7 +143,8 @@ class TestReclaimSummaryEnforcesItsInvariantAtConstruction:
 
 
 _LOGGER = 'orchestrator.warm_lane_gc_summary'
-_PASS_RECORD = '_run_warm_lane_gc_reclaim: reclaim pass'
+_CONTEXT = 'some_reclaim_caller'
+_PASS_RECORD = f'{_CONTEXT}: reclaim pass'
 _SCRIPT = Path('/x/warm-lane-gc.sh')
 
 
@@ -151,7 +163,7 @@ def _log(caplog: pytest.LogCaptureFixture, *, rc: int, stdout: str, stderr: str 
          origin: str = 'dark-factory', duration_secs: float = 1.25) -> None:
     with caplog.at_level(logging.DEBUG, logger=_LOGGER):
         log_reclaim_outcome(
-            rc=rc, stdout=stdout, stderr=stderr, script=_SCRIPT,
+            context=_CONTEXT, rc=rc, stdout=stdout, stderr=stderr, script=_SCRIPT,
             origin=origin, duration_secs=duration_secs,
         )
 
@@ -193,10 +205,19 @@ class TestLogReclaimOutcomeUncountedPass:
 
         assert _records(caplog, logging.INFO) == []
         (warning,) = _records(caplog, logging.WARNING)
+        assert warning.startswith(f'{_CONTEXT}: ')
         assert str(_SCRIPT) in warning
         assert 'project' in warning
         assert 'uncounted' in warning
         assert 'seed script' not in warning
+
+    def test_the_uncounted_warning_quotes_stdout_once(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        _log(caplog, rc=0, stdout='HEADROOM lanes=1\n')
+
+        (warning,) = _records(caplog, logging.WARNING)
+        assert warning.count('HEADROOM lanes=1') == 1, warning
 
     def test_rc0_with_a_malformed_summary_names_the_missing_field(
         self, caplog: pytest.LogCaptureFixture,
@@ -217,5 +238,5 @@ class TestLogReclaimOutcomeScriptFailure:
 
         assert _records(caplog, logging.INFO) == []
         (warning,) = _records(caplog, logging.WARNING)
-        assert 'script exited 2' in warning
+        assert warning.startswith(f'{_CONTEXT}: script exited 2')
         assert 'boom' in warning
