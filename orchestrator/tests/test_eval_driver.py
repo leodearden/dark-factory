@@ -187,6 +187,7 @@ class TestBuildEvalOrchConfigAdmitsCandidateModel:
             ('architect', lambda: {'config': _impl_cfg(), 'architect_config': _fable_arch_cfg()}),
             ('judge', lambda: {'config': _impl_cfg(), 'judge_config': _off_allowlist_judge_cfg()}),
         ],
+        ids=['implementer', 'architect', 'judge'],
     )
     def test_claude_candidate_seat_is_admitted_and_routes_unrejected(
         self, tmp_path: Path, role_name: str, build_kwargs,
