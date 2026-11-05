@@ -134,6 +134,66 @@ class TestBuildEvalOrchConfigArchitectOverride:
 
 
 # ---------------------------------------------------------------------------
+# task 8371 — a claude-backend endpoint candidate whose model string is outside
+# the project's routing.allowed_models is admitted into the CELL's allowlist, so
+# resolve_route does not silently fall back to the role default model.
+# ---------------------------------------------------------------------------
+
+class TestBuildEvalOrchConfigAdmitsCandidateModel:
+    _ENDPOINT_MODEL = 'mimo-v2.6-pro'
+
+    def _endpoint_cfg(self) -> EvalConfig:
+        return EvalConfig(
+            'mimo-v2.6-pro-endpoint', 'claude', self._ENDPOINT_MODEL, 'high',
+            env_overrides={
+                'ANTHROPIC_BASE_URL': 'https://endpoint.invalid/anthropic',
+                'ANTHROPIC_AUTH_TOKEN': 'dummy',
+            },
+        )
+
+    @staticmethod
+    def _route_implementer(cfg):
+        from orchestrator.routing import RoleDefaults, RouteInputs, resolve_route
+
+        return resolve_route(
+            RouteInputs(
+                role_name='implementer',
+                task_id='shadow_1_a',
+                task_metadata={},
+                plan_shape=None,
+                routing_tier=0,
+                dispatch_count=0,
+                role_defaults=RoleDefaults('sonnet', 'high', 5.0, 50),
+            ),
+            cfg,
+        )
+
+    def test_endpoint_candidate_is_admitted_and_routes_unrejected(self, tmp_path: Path):
+        from orchestrator.evals.runner import build_eval_orch_config
+
+        base = _base_config(tmp_path)
+        assert self._ENDPOINT_MODEL not in base.routing.allowed_models
+
+        cfg = build_eval_orch_config(self._endpoint_cfg(), {}, base)
+
+        assert self._ENDPOINT_MODEL in cfg.routing.allowed_models
+        decision = self._route_implementer(cfg)
+        assert decision.model == self._ENDPOINT_MODEL
+        assert decision.rejected == ()
+        # The base config is not mutated, and the ladder is left alone.
+        assert self._ENDPOINT_MODEL not in base.routing.allowed_models
+        assert cfg.routing.ladder == base.routing.ladder
+
+    def test_stock_candidate_leaves_allowed_models_unchanged(self, tmp_path: Path):
+        from orchestrator.evals.runner import build_eval_orch_config
+
+        base = _base_config(tmp_path)
+        cfg = build_eval_orch_config(_impl_cfg(), {}, base)
+
+        assert cfg.routing.allowed_models == base.routing.allowed_models
+
+
+# ---------------------------------------------------------------------------
 # task 2847 BUG 2a — build_eval_orch_config pins the eval verify interpreter to
 # the target's .python-version via verify_env['UV_PYTHON'], so `uv run
 # pytest/ruff/pyright` runs under the worktree's own 3.13 venv. Absent a

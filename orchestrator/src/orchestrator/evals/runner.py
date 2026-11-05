@@ -271,6 +271,15 @@ def build_eval_orch_config(
         'env_overrides': config.env_overrides,
         'implementer_brief_variant': config.harness_variant,
     }
+    # A claude-backend candidate outside the project's routing.allowed_models
+    # (e.g. a Claude-harness endpoint control: backend 'claude' + a proxied
+    # ANTHROPIC_BASE_URL) would be rejected by resolve_route's layer-3 allowlist
+    # check, silently dispatching the role default model at the candidate's
+    # endpoint. Admit it into THIS cell's allowlist only; the project yaml,
+    # ladder and ceilings stay untouched. Non-claude backends skip the allowlist.
+    if config.backend == 'claude':
+        admitted = list(dict.fromkeys([*profiled.routing.allowed_models, config.model]))
+        update['routing'] = profiled.routing.model_copy(update={'allowed_models': admitted})
     # BUG 2a: pin the eval verify interpreter to the target's own
     # .python-version (via verify_env['UV_PYTHON']) so `uv run pytest/ruff/
     # pyright` runs under the target's own 3.13 venv. verify_env is overlaid
