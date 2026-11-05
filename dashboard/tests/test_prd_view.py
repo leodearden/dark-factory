@@ -277,6 +277,8 @@ def test_a_prd_row_counts_its_members_by_segment():
     [row] = _wire()['prds']
     assert row.pop('title') == PRD_A
     assert row.pop('signal')['mark'] == 'unknown'
+    assert row.pop('lane') == 'moving'
+    assert row.pop('activity') == {'direct': 0, 'followup': 0}
     assert row == {
         'key': PRD_A,
         'segments': {
@@ -589,7 +591,7 @@ def test_an_off_vocabulary_status_makes_an_unknown_view_with_the_census_error():
 
 # --- row 12: every figure carries its rule --------------------------------
 
-_STRUCTURAL_VIEW_KEYS = {'prds', 'inputs', 'rules', 'segment_legend'}
+_STRUCTURAL_VIEW_KEYS = {'prds', 'inputs', 'rules', 'segment_legend', 'lane_precedence'}
 _STRUCTURAL_ROW_KEYS = {'key'}
 
 
