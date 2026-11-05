@@ -18,6 +18,7 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 from _fm_helpers import load_script_module
+from shared.testing_xdist_groups import single_xdist_group
 
 # Load the checker script via importlib to avoid sys.path pollution.
 # fused-memory/scripts/ is not on PYTHONPATH per pyproject.toml (pythonpath=['src']).
@@ -1362,6 +1363,15 @@ def test_only_the_repo_wide_scans_run_under_their_own_ceiling(request):
     )
 
 
+def test_the_repo_wide_scans_share_one_xdist_worker(request):
+    scan_classes = (TestAllScannedTestDirsClean, TestWallClockDeadlineBaselineIntegrity)
+    scan_items = [item for item in request.session.items if getattr(item, 'cls', None) in scan_classes]
+    if not scan_items:
+        pytest.skip('no repo-wide scan item is selected in this session')
+
+    assert single_xdist_group(scan_items) == _REPO_SCAN_GROUP_NAME
+
+
 @pytest.mark.timeout(MAGICMOCK_REPO_SCAN_TEST_TIMEOUT)
 class TestAllScannedTestDirsClean:
     """Non-regression gate for all nine call sites: every scanned tests/ dir stays clean.
@@ -2498,6 +2508,104 @@ class TestWallClockDeadlineBaselineIntegrity:
             'These scanned files carry Rule C violations but are NOT on the baseline, '
             'so their package lint_command is RED:\n  ' + '\n  '.join(unlisted)
         )
+
+
+def _assert_the_tree_seam_agrees(source: str, filename: str) -> list:
+    expected = find_violations(source, filename)
+    tree = ast.parse(source, filename=filename)
+    assert _checker.find_violations_in_tree(tree, source, filename) == expected
+    return expected
+
+
+class TestFindViolationsInTree:
+    """The tree-taking seam is find_violations after its parse, for every rule."""
+
+    @pytest.mark.parametrize(
+        'source',
+        [
+            pytest.param(_RULE_A_SOURCE, id='rule-a'),
+            pytest.param(
+                '# noqa: bare-magicmock — exempted for the seam test\n' + _RULE_A_SOURCE,
+                id='rule-a-exempted',
+            ),
+            pytest.param(_RULE_B_SOURCE, id='rule-b'),
+            pytest.param(_RULE_C_SOURCE, id='rule-c'),
+        ],
+    )
+    def test_agrees_with_find_violations_on_each_rule(self, source: str):
+        _assert_the_tree_seam_agrees(source, _NON_DEBT_FILE)
+
+    @pytest.mark.parametrize('offset', [-1, 0, 1], ids=['below', 'at', 'above'])
+    def test_agrees_with_find_violations_on_the_debt_budget(self, offset: int):
+        entry, budget = _live_rule_c_debt_entry()
+
+        _assert_the_tree_seam_agrees(_RULE_C_ONE_HIT * (budget + offset), entry)
+
+    def test_agrees_with_find_violations_on_a_source_carrying_all_three(self):
+        source = _RULE_A_SOURCE + _RULE_B_SOURCE + _RULE_C_SOURCE
+
+        violations = _assert_the_tree_seam_agrees(source, _NON_DEBT_FILE)
+
+        assert [v.lineno for v in violations] == [1, 2, 3, 3]
+
+
+class TestScanRepoTestDirs:
+    """One parse per scanned file yields both the gate's violations and Rule C's count."""
+
+    _DIRS = ('pkg_a/tests', 'pkg_b/tests', 'absent/tests')
+
+    @pytest.fixture
+    def fake_repo(self, tmp_path: Path) -> Path:
+        files = {
+            'pkg_a/tests/test_bad.py': _RULE_A_SOURCE,
+            'pkg_a/tests/conftest.py': 'import pytest\n',
+            'pkg_a/tests/_helper.py': _RULE_C_ONE_HIT,
+            'pkg_a/tests/notes.py': _RULE_A_SOURCE,
+            'pkg_b/tests/sub/test_broken.py': 'def broken(:\n',
+        }
+        for rel, source in files.items():
+            path = tmp_path / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(source, encoding='utf-8')
+        return tmp_path
+
+    def test_scans_exactly_the_discovered_files_of_each_present_dir(self, fake_repo: Path):
+        scanned = _scan_repo_test_dirs(fake_repo, self._DIRS)
+
+        assert [record.path for record in scanned] == [
+            *_checker.discover_scan_targets(fake_repo / 'pkg_a/tests'),
+            *_checker.discover_scan_targets(fake_repo / 'pkg_b/tests'),
+        ]
+        assert [record.relpath for record in scanned] == [
+            'pkg_a/tests/_helper.py',
+            'pkg_a/tests/conftest.py',
+            'pkg_a/tests/test_bad.py',
+            'pkg_b/tests/sub/test_broken.py',
+        ]
+
+    def test_gate_violations_carry_the_filename_the_cli_passes(self, fake_repo: Path):
+        by_relpath = {r.relpath: r for r in _scan_repo_test_dirs(fake_repo, self._DIRS)}
+        bad = fake_repo / 'pkg_a/tests/test_bad.py'
+
+        assert by_relpath['pkg_a/tests/test_bad.py'].gate_violations == tuple(
+            find_violations(_RULE_A_SOURCE, str(bad))
+        )
+        assert by_relpath['pkg_a/tests/test_bad.py'].gate_violations[0].filename == str(bad)
+        assert by_relpath['pkg_a/tests/conftest.py'].gate_violations == ()
+
+    def test_rule_c_sites_are_counted_in_a_debt_free_file(self, fake_repo: Path):
+        by_relpath = {r.relpath: r for r in _scan_repo_test_dirs(fake_repo, self._DIRS)}
+
+        assert by_relpath['pkg_a/tests/_helper.py'].rule_c_count == 1
+        assert by_relpath['pkg_a/tests/test_bad.py'].rule_c_count == 0
+
+    def test_a_syntax_error_is_recorded_with_no_gate_violation(self, fake_repo: Path):
+        by_relpath = {r.relpath: r for r in _scan_repo_test_dirs(fake_repo, self._DIRS)}
+        broken = by_relpath['pkg_b/tests/sub/test_broken.py']
+
+        assert isinstance(broken.syntax_error, SyntaxError)
+        assert broken.gate_violations == ()
+        assert by_relpath['pkg_a/tests/test_bad.py'].syntax_error is None
 
 
 _MERGE_SPECULATION = 'orchestrator/tests/test_merge_speculation.py'
