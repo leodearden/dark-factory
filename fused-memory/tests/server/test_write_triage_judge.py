@@ -23,6 +23,7 @@ No test in this file needs an API key, a network, or Qdrant.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -30,12 +31,14 @@ import subprocess
 import sys
 import types
 import uuid
-from collections.abc import Callable, MutableMapping
+from collections.abc import Callable, Iterator, MutableMapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
+import httpx
+import openai
 import pytest
 from _mock_openai_server import mock_openai_server
 from _sdk_client_stubs import sdk_client_double
@@ -2952,6 +2955,21 @@ async def _live_judge_verdict(**judge_kwargs: Any) -> TriageJudgeVerdict:
         )
 
 
+_RESPONSES_REQUEST = httpx.Request('POST', 'https://api.openai.com/v1/responses')
+
+
+@contextlib.contextmanager
+def _raises_without_skipping(
+    expected: type[BaseException],
+) -> Iterator[pytest.ExceptionInfo[BaseException]]:
+    """`pytest.raises`, except a skip fails: a skipped guard test would hide a widened `except`."""
+    try:
+        with pytest.raises(expected) as excinfo:
+            yield excinfo
+    except pytest.skip.Exception as skipped:
+        pytest.fail(f'skipped instead of raising {expected.__name__}: {skipped}')
+
+
 class TestTheLiveWordingBudgetGuard:
     """`_live_judge_verdict` skips only a call past the judge budget; the rest stays red."""
 
@@ -3000,16 +3018,27 @@ class TestTheLiveWordingBudgetGuard:
         self, make_client: Callable[[], MagicMock],
     ) -> None:
         with patch('openai.AsyncOpenAI', return_value=make_client()), \
-                pytest.raises(JudgeOutputError):
+                _raises_without_skipping(JudgeOutputError):
             await _live_judge_verdict(**self._judge_kwargs())
 
     @pytest.mark.asyncio
-    async def test_a_transport_error_stays_red(self) -> None:
+    @pytest.mark.parametrize(
+        'error',
+        [
+            RuntimeError('boom'),
+            openai.APITimeoutError(request=_RESPONSES_REQUEST),
+            openai.APIConnectionError(request=_RESPONSES_REQUEST),
+        ],
+        ids=['runtime-error', 'sdk-timeout', 'sdk-connection-error'],
+    )
+    async def test_a_transport_error_stays_red(self, error: Exception) -> None:
         client = sdk_client_double()
-        client.responses.create = AsyncMock(side_effect=RuntimeError('boom'))
+        client.responses.create = AsyncMock(side_effect=error)
         with patch('openai.AsyncOpenAI', return_value=client), \
-                pytest.raises(RuntimeError):
+                _raises_without_skipping(type(error)) as excinfo:
             await _live_judge_verdict(**self._judge_kwargs())
+
+        assert excinfo.value is error
 
 
 @pytest.mark.integration
