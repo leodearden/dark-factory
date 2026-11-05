@@ -71,6 +71,7 @@ from shared.transcript_archive import (
 
 from orchestrator import chronic_flake
 from orchestrator.agents.briefing import PriorAttemptCause, VerifyAttemptContext
+from orchestrator.agents.invocation_scope import invocation_scope
 from orchestrator.agents.invoke import AgentResult, invoke_agent
 from orchestrator.agents.review_briefing import ReviewBriefing, ReviewSubject
 from orchestrator.agents.roles import (
@@ -14497,19 +14498,17 @@ class TaskWorkflow:
             timeout_val = timeouts_cfg.reviewer
             backend_val = backends_cfg.reviewer
 
-        # Determine the sandbox write-set based on role (role.sandboxed is a
-        # property of the role object — see roles.py's AgentRole/W9-η).
-        # Whole-worktree granularity (PRD os-sandbox D1): sandbox_modules=[] is
-        # the empty-list sandbox-on gate (no per-module writable dirs), and the
-        # full contract write set (worktree root + carve-outs) rides on
-        # sandbox_extras via compute_write_set — the INV-5 single source. Both
-        # channels are set together so a broken half-state (extras without the
-        # gate) never arises. compute_write_set is allowed to raise on a
-        # malformed worktree (fail-loud; the fail-closed backend-unavailable
-        # posture is a separate concern, not folded in here).
-        sandbox_modules = None
+        scope = invocation_scope(self.config, role)
+
+        # The full contract write set (worktree root + carve-outs) rides on
+        # sandbox_extras via compute_write_set — the INV-5 single source —
+        # alongside scope's sandbox-on gate, so a broken half-state (extras
+        # without the gate) never arises. compute_write_set is allowed to raise
+        # on a malformed worktree (fail-loud; the fail-closed
+        # backend-unavailable posture is a separate concern, not folded in here).
+        sandbox_modules = scope.sandbox_modules
         sandbox_extras = None
-        if self.config.sandbox.enabled and role.sandboxed:
+        if sandbox_modules is not None:
             write_set = compute_write_set(
                 cwd, task_id=self.task_id, task_root=self._artifact_roots(cwd)[1],
             )
@@ -14518,7 +14517,6 @@ class TaskWorkflow:
             # exists before sandbox_extras (below) is built (task 2996) — see
             # ensure_claude_fleet_dir for the full backend rationale.
             self._ensure_sandbox_dirs(write_set)
-            sandbox_modules = []
             sandbox_extras = [str(p) for p in write_set.writable_paths()]
             # Fail-CLOSED (task 2908, PRD D4 / INV-4): refuse to dispatch this
             # sandboxed role when no OS backend resolves rather than silently
@@ -14583,7 +14581,7 @@ class TaskWorkflow:
         # Strict scoping is a no-op without a truthy --mcp-config, so a role
         # whose families composed none gets the zero-server one rather than
         # keeping the worktree's ambient .mcp.json.
-        strict_mcp = self.config.strict_mcp_config or role.strict_mcp_scope
+        strict_mcp = scope.strict_mcp_config
         if strict_mcp and not mcp_config:
             mcp_config = no_mcp_servers_config()
 

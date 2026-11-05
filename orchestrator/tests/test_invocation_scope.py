@@ -68,5 +68,4 @@ def test_sandbox_modules_is_a_fresh_list_per_access() -> None:
 def test_invocation_scope_is_frozen() -> None:
     scope = InvocationScope(strict_mcp_config=True, sandboxed=False)
 
-    with pytest.raises(dataclasses.FrozenInstanceError):
-        setattr(scope, 'sandboxed', True)
+    pytest.raises(dataclasses.FrozenInstanceError, setattr, scope, 'sandboxed', True)
