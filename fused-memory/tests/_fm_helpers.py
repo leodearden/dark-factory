@@ -2088,6 +2088,19 @@ def _lease_dir_env() -> str:
     return load_script_module(_CLEANUP_TEST_COLLECTIONS_SCRIPT).LEASE_DIR_ENV
 
 
+def isolated_lease_dir(monkeypatch, directory: pathlib.Path) -> pathlib.Path:
+    """Point the reaper's lease directory at *directory*, through *monkeypatch*.
+
+    The one mechanism behind `lease_dir_fixture`, for callers that need the
+    same isolation outside a function-scoped test: a module-scoped fixture is
+    set up BEFORE the autouse `lease_dir` fixture runs, so anything it does
+    there would otherwise lease the machine-global directory.  *directory* is
+    not created, for the reason `lease_dir_fixture` gives.
+    """
+    monkeypatch.setenv(_lease_dir_env(), str(directory))
+    return directory
+
+
 @pytest.fixture(autouse=True, name='lease_dir')
 def lease_dir_fixture(tmp_path, monkeypatch):
     """Point ``DF_EPHEMERAL_COLLECTION_LEASE_DIR`` at a per-test directory.
@@ -2117,9 +2130,7 @@ def lease_dir_fixture(tmp_path, monkeypatch):
     shadowed by every ``def test_x(self, lease_dir)`` parameter, which ruff
     reports as F811 once per test.
     """
-    directory = tmp_path / 'ephemeral-collection-leases'
-    monkeypatch.setenv(_lease_dir_env(), str(directory))
-    return directory
+    return isolated_lease_dir(monkeypatch, tmp_path / 'ephemeral-collection-leases')
 
 
 def as_async_run_git(side_effect):

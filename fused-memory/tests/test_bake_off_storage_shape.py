@@ -4632,7 +4632,133 @@ _SMALL_RUN = {'cluster_limit': 2, 'distractor_limit': 12, 'project_suffix': 'ute
 #: the probe on, so they cover its passes too.
 _SIX_ARM_RUN = {**_SMALL_RUN, 'regrowth': False}
 
+import tempfile  # noqa: E402
 
+from _fm_helpers import isolated_lease_dir  # noqa: E402
+
+#: Every class that reads a recorded run shares one xdist worker, so the
+#: recording — and the per-process warm-up its first `run_bake_off` pays — is
+#: paid once rather than once per worker `--dist loadgroup` scatters them to.
+_ON_THE_RECORDING_WORKER = pytest.mark.xdist_group('bake_off_storage_shape_recorded_runs')
+
+
+@dataclasses.dataclass(frozen=True)
+class _DriverRun:
+    """What one doubled `run_bake_off` showed its doubles, captured as it returned."""
+
+    report: dict
+    services: tuple[_FakeMemoryService, ...]
+    drop_calls: tuple[tuple[str, ...], ...]
+    leases_at_drop: tuple[list[dict], ...]
+    leases_at_seed: tuple[list[dict], ...]
+    leases_after: list[dict]
+    lease_dir: Path
+    acquisitions: tuple[str, ...]
+    probe_hits: tuple[dict[str, list[str]], ...]
+    caller_config: _FakeConfig
+
+    @property
+    def service(self) -> _FakeMemoryService:
+        return self.services[-1]
+
+    @property
+    def dropped(self) -> set[str]:
+        return {name for call in self.drop_calls for name in call}
+
+
+def _record_driver_run(run_kwargs: dict, directory: Path) -> _DriverRun:
+    """Run `run_bake_off(**run_kwargs)` once, through every observation double.
+
+    Each double delegates to the real callable exactly once, so installing
+    them together changes nothing any one of them observes.
+    """
+    mod = _mod()
+    leases_at_drop: list[list[dict]] = []
+    leases_at_seed: list[list[dict]] = []
+    lease_dirs: set[Path] = set()
+    acquisitions: list[str] = []
+    probe_hits: list[dict[str, list[str]]] = []
+    with pytest.MonkeyPatch.context() as mp:
+        isolated_lease_dir(mp, directory / 'leases')
+        drops = _install_driver_doubles(mp)
+        # Resolved before `_record_resolve` is installed, so the observers'
+        # own reaper reads never enter `acquisitions`.
+        reaper = mod.load_cleanup_script()
+        resolve, seed_arm, fetch_arm = mod.load_cleanup_script, mod.seed_arm, mod.fetch_arm
+        mkdtemp = tempfile.mkdtemp
+
+        def _drop_and_look(*args, **kwargs):
+            leases_at_drop.append(reaper.live_leases())
+            return drops(*args, **kwargs)
+
+        async def _seed_and_look(*args, **kwargs):
+            leases_at_seed.append(reaper.live_leases())
+            lease_dirs.add(reaper.lease_dir())
+            return await seed_arm(*args, **kwargs)
+
+        def _record_resolve():
+            acquisitions.append('reaper')
+            return resolve()
+
+        def _record_mkdtemp(*args, **kwargs):
+            acquisitions.append('queue_dir')
+            return mkdtemp(*args, **kwargs)
+
+        async def _capture_probe_hits(backend, seeded, queries, probes, **kwargs):
+            fetched = await fetch_arm(backend, seeded, queries, probes, **kwargs)
+            probe_hits.append({
+                cluster_id: [hit.record.record_id for hit in hits]
+                for cluster_id, hits in fetched['probes'].items()
+            })
+            return fetched
+
+        mp.setattr(mod, 'drop_collections', _drop_and_look)
+        mp.setattr(mod, 'seed_arm', _seed_and_look)
+        mp.setattr(mod, 'load_cleanup_script', _record_resolve)
+        mp.setattr(tempfile, 'mkdtemp', _record_mkdtemp)
+        mp.setattr(mod, 'fetch_arm', _capture_probe_hits)
+        caller_config = _driver_config()
+
+        report = asyncio.run(mod.run_bake_off(config=caller_config, **run_kwargs))
+
+        (lease_dir,) = lease_dirs
+        return _DriverRun(
+            report=report,
+            services=tuple(_FakeMemoryService.instances),
+            drop_calls=tuple(tuple(call) for call in drops.calls),
+            leases_at_drop=tuple(leases_at_drop),
+            leases_at_seed=tuple(leases_at_seed),
+            leases_after=reaper.live_leases(),
+            lease_dir=lease_dir,
+            acquisitions=tuple(acquisitions),
+            probe_hits=tuple(probe_hits),
+            caller_config=caller_config,
+        )
+
+
+@pytest.fixture(scope='module')
+def _small_run_record(tmp_path_factory) -> _DriverRun:
+    return _record_driver_run(_SMALL_RUN, tmp_path_factory.mktemp('small-run'))
+
+
+@pytest.fixture(scope='module')
+def _six_arm_run_record(tmp_path_factory) -> _DriverRun:
+    return _record_driver_run(_SIX_ARM_RUN, tmp_path_factory.mktemp('six-arm-run'))
+
+
+@pytest.fixture
+def small_run(_small_run_record) -> _DriverRun:
+    """`run_bake_off(**_SMALL_RUN)`, recorded once per module; a private copy."""
+    return copy.deepcopy(_small_run_record)
+
+
+@pytest.fixture
+def six_arm_run(_six_arm_run_record) -> _DriverRun:
+    """`run_bake_off(**_SIX_ARM_RUN)`, recorded once per module; a private copy."""
+    return copy.deepcopy(_six_arm_run_record)
+
+
+@_ON_THE_RECORDING_WORKER
 class TestTheRecordedDriverRun:
     """The recorded runs the wiring tests read are safe to share."""
 
@@ -4783,6 +4909,7 @@ class TestGuardProbeSelfDrop:
         ), 'no arm splits a probing write across several records'
 
 
+@_ON_THE_RECORDING_WORKER
 class TestRunBakeOffWiring:
     """What the driver does to the world, measured through doubles."""
 
