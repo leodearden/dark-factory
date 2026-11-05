@@ -23,7 +23,7 @@ from pathlib import Path
 
 import exception_register
 import pytest
-from _task_db_scan import tasks_db_path
+from _task_db_scan import decode_metadata, tasks_db_path
 from exception_owner_liveness import Liveness
 from exception_owner_sweep import (
     FAILURE_TASK_ID,
@@ -319,16 +319,6 @@ NOW = datetime.datetime(2026, 10, 17, 6, 0, tzinfo=datetime.UTC)
 FIRST_CREATED_ID = 9001
 
 
-def _stored_files(raw: str | None) -> list[object]:
-    """A stored row's ``metadata.files``; seeded metadata may be malformed, and then declares none."""
-    try:
-        metadata = json.loads(raw or '{}')
-    except json.JSONDecodeError:
-        return []
-    files = metadata.get('files') if isinstance(metadata, dict) else None
-    return files if isinstance(files, list) else []
-
-
 class StubMcp:
     """Both MCP servers, in process, at the sweep's ToolCall port signature.
 
@@ -395,7 +385,11 @@ class StubMcp:
                 "SELECT id, title, metadata FROM tasks WHERE tag = 'master' AND status != 'cancelled'"
             ).fetchall()
         return next(
-            (row_id for row_id, title, raw in rows if compute_candidate_key(title, _stored_files(raw)) == key),
+            (
+                row_id
+                for row_id, title, raw in rows
+                if compute_candidate_key(title, decode_metadata(raw).get('files')) == key
+            ),
             None,
         )
 
