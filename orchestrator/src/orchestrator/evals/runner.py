@@ -25,6 +25,7 @@ from orchestrator.config import (
     ModelsConfig,
     OrchestratorConfig,
     PriceEntry,
+    RoutingConfig,
     SandboxConfig,
 )
 from orchestrator.git_ops import GitOps
@@ -122,6 +123,30 @@ def load_task(task_path: Path) -> dict:
         task['project_root'] = str(repo_root)
 
     return task
+
+
+def _admit_claude_role_models(
+    routing: RoutingConfig,
+    models: ModelsConfig,
+    backends: BackendsConfig,
+) -> RoutingConfig:
+    """Return *routing* with every claude-backend role's model in ``allowed_models``.
+
+    Restores, for one eval cell, the invariant
+    ``orchestrator/config.py::OrchestratorConfig._validate_models_in_allowlist``
+    enforces at load time and ``model_copy`` skips. Without it, a candidate
+    model outside the project allowlist (a proxied-endpoint implementer, a
+    fable architect) is rejected by ``resolve_route``'s allowlist layer and
+    the cell silently dispatches the role default under the candidate's label.
+    Only ``allowed_models`` changes; the ladder, ceilings and rules are kept.
+    """
+    claude_role_models = [
+        getattr(models, role)
+        for role in type(models).model_fields
+        if getattr(backends, role, 'claude') == 'claude'
+    ]
+    admitted = list(dict.fromkeys([*routing.allowed_models, *claude_role_models]))
+    return routing.model_copy(update={'allowed_models': admitted})
 
 
 def build_eval_orch_config(
@@ -270,16 +295,8 @@ def build_eval_orch_config(
         'project_root': Path(task.get('project_root', str(base.project_root))),
         'env_overrides': config.env_overrides,
         'implementer_brief_variant': config.harness_variant,
+        'routing': _admit_claude_role_models(profiled.routing, models, backends),
     }
-    # A claude-backend candidate outside the project's routing.allowed_models
-    # (e.g. a Claude-harness endpoint control: backend 'claude' + a proxied
-    # ANTHROPIC_BASE_URL) would be rejected by resolve_route's layer-3 allowlist
-    # check, silently dispatching the role default model at the candidate's
-    # endpoint. Admit it into THIS cell's allowlist only; the project yaml,
-    # ladder and ceilings stay untouched. Non-claude backends skip the allowlist.
-    if config.backend == 'claude':
-        admitted = list(dict.fromkeys([*profiled.routing.allowed_models, config.model]))
-        update['routing'] = profiled.routing.model_copy(update={'allowed_models': admitted})
     # BUG 2a: pin the eval verify interpreter to the target's own
     # .python-version (via verify_env['UV_PYTHON']) so `uv run pytest/ruff/
     # pyright` runs under the target's own 3.13 venv. verify_env is overlaid

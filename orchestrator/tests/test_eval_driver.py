@@ -134,54 +134,77 @@ class TestBuildEvalOrchConfigArchitectOverride:
 
 
 # ---------------------------------------------------------------------------
-# task 8371 — a claude-backend endpoint candidate whose model string is outside
-# the project's routing.allowed_models is admitted into the CELL's allowlist, so
-# resolve_route does not silently fall back to the role default model.
+# task 8371 — every claude-backend seat's model (implementer, architect, judge)
+# that is outside the project's routing.allowed_models is admitted into the
+# CELL's allowlist, so resolve_route does not silently fall back to the role
+# default model. Non-claude seats are never checked against it, so never admitted.
 # ---------------------------------------------------------------------------
 
+def _endpoint_impl_cfg() -> EvalConfig:
+    return EvalConfig(
+        'mimo-v2.6-pro-endpoint', 'claude', 'mimo-v2.6-pro', 'high',
+        env_overrides={
+            'ANTHROPIC_BASE_URL': 'https://endpoint.invalid/anthropic',
+            'ANTHROPIC_AUTH_TOKEN': 'dummy',
+        },
+    )
+
+
+def _fable_arch_cfg() -> EvalConfig:
+    from orchestrator.evals.configs import get_config_by_name
+
+    arch = get_config_by_name('architect-fable-high')
+    assert arch is not None
+    return arch
+
+
+def _off_allowlist_judge_cfg() -> EvalConfig:
+    return EvalConfig('judge-fable', 'claude', 'claude-fable-5', 'medium', role=RoleUnderTest.JUDGE)
+
+
+def _route(cfg, role_name: str):
+    from orchestrator.routing import RoleDefaults, RouteInputs, resolve_route
+
+    return resolve_route(
+        RouteInputs(
+            role_name=role_name,
+            task_id='shadow_1_a',
+            task_metadata={},
+            plan_shape=None,
+            routing_tier=0,
+            dispatch_count=0,
+            role_defaults=RoleDefaults('sonnet', 'high', 5.0, 50),
+        ),
+        cfg,
+    )
+
+
 class TestBuildEvalOrchConfigAdmitsCandidateModel:
-    _ENDPOINT_MODEL = 'mimo-v2.6-pro'
-
-    def _endpoint_cfg(self) -> EvalConfig:
-        return EvalConfig(
-            'mimo-v2.6-pro-endpoint', 'claude', self._ENDPOINT_MODEL, 'high',
-            env_overrides={
-                'ANTHROPIC_BASE_URL': 'https://endpoint.invalid/anthropic',
-                'ANTHROPIC_AUTH_TOKEN': 'dummy',
-            },
-        )
-
-    @staticmethod
-    def _route_implementer(cfg):
-        from orchestrator.routing import RoleDefaults, RouteInputs, resolve_route
-
-        return resolve_route(
-            RouteInputs(
-                role_name='implementer',
-                task_id='shadow_1_a',
-                task_metadata={},
-                plan_shape=None,
-                routing_tier=0,
-                dispatch_count=0,
-                role_defaults=RoleDefaults('sonnet', 'high', 5.0, 50),
-            ),
-            cfg,
-        )
-
-    def test_endpoint_candidate_is_admitted_and_routes_unrejected(self, tmp_path: Path):
+    @pytest.mark.parametrize(
+        ('role_name', 'build_kwargs'),
+        [
+            ('implementer', lambda: {'config': _endpoint_impl_cfg()}),
+            ('architect', lambda: {'config': _impl_cfg(), 'architect_config': _fable_arch_cfg()}),
+            ('judge', lambda: {'config': _impl_cfg(), 'judge_config': _off_allowlist_judge_cfg()}),
+        ],
+    )
+    def test_claude_candidate_seat_is_admitted_and_routes_unrejected(
+        self, tmp_path: Path, role_name: str, build_kwargs,
+    ):
         from orchestrator.evals.runner import build_eval_orch_config
 
+        kwargs = build_kwargs()
         base = _base_config(tmp_path)
-        assert self._ENDPOINT_MODEL not in base.routing.allowed_models
+        cfg = build_eval_orch_config(task={}, base_config=base, **kwargs)
+        candidate_model = getattr(cfg.models, role_name)
+        assert candidate_model not in base.routing.allowed_models
 
-        cfg = build_eval_orch_config(self._endpoint_cfg(), {}, base)
-
-        assert self._ENDPOINT_MODEL in cfg.routing.allowed_models
-        decision = self._route_implementer(cfg)
-        assert decision.model == self._ENDPOINT_MODEL
+        assert candidate_model in cfg.routing.allowed_models
+        decision = _route(cfg, role_name)
+        assert decision.model == candidate_model
+        assert decision.source_layer == 'config'
         assert decision.rejected == ()
-        # The base config is not mutated, and the ladder is left alone.
-        assert self._ENDPOINT_MODEL not in base.routing.allowed_models
+        assert candidate_model not in base.routing.allowed_models
         assert cfg.routing.ladder == base.routing.ladder
 
     def test_stock_candidate_leaves_allowed_models_unchanged(self, tmp_path: Path):
@@ -189,6 +212,17 @@ class TestBuildEvalOrchConfigAdmitsCandidateModel:
 
         base = _base_config(tmp_path)
         cfg = build_eval_orch_config(_impl_cfg(), {}, base)
+
+        assert cfg.routing.allowed_models == base.routing.allowed_models
+
+    def test_non_claude_candidate_model_is_not_admitted(self, tmp_path: Path):
+        from orchestrator.evals.configs import get_config_by_name
+        from orchestrator.evals.runner import build_eval_orch_config
+
+        codex = get_config_by_name('codex-gpt6-astra')
+        assert codex is not None and codex.backend != 'claude'
+        base = _base_config(tmp_path)
+        cfg = build_eval_orch_config(codex, {}, base)
 
         assert cfg.routing.allowed_models == base.routing.allowed_models
 
