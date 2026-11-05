@@ -2,12 +2,14 @@
 
 Every fixture is a small REAL single-package git repository measured by the
 real instrument in a subprocess; a mid-run event is simulated by a ``--python``
-shim that acts and then execs the real interpreter, so no module is patched.
+shim that acts and then execs the real interpreter, or by a ``git`` shim on
+PATH that runs the real git and then acts, so no module is patched.
 """
 from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -28,12 +30,12 @@ _FILES: dict[str, str] = {
     'tests/test_mod.py': 'def test_x():\n    assert True\n',
 }
 
-_IDENTITY = ('-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid')
+_COMMITTER = ('-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid')
 
 
 def _commit(root: Path, message: str) -> str:
     git(root, 'add', '-A')
-    git(root, *_IDENTITY, 'commit', '--no-verify', '--allow-empty', '-q', '-m', message)
+    git(root, *_COMMITTER, 'commit', '--no-verify', '--allow-empty', '-q', '-m', message)
     return git(root, 'rev-parse', 'HEAD').strip()
 
 
@@ -179,7 +181,6 @@ class TestTheIdentitySkip:
         assert snapshot.load_snapshot(out)['schema_version'] == snapshot.SCHEMA_VERSION
 
 
-
 class TestAnExplicitShaList:
     def test_each_sha_is_measured_and_named_by_its_full_sha(self, tmp_path: Path) -> None:
         root = _repo(tmp_path)
@@ -209,6 +210,18 @@ class TestThePinnedTree:
         assert _worktrees(root) == [root.resolve()]
         assert list(_pinned_trees_home(state_home).iterdir()) == []
 
+    def test_the_projects_checkout_hooks_do_not_run(self, tmp_path: Path) -> None:
+        root = _repo(tmp_path)
+        hooks, ran = tmp_path / 'hooks', tmp_path / 'hook-ran'
+        hooks.mkdir()
+        hook = hooks / 'post-checkout'
+        hook.write_text(f'#!/bin/sh\ntouch {shlex.quote(str(ran))}\nexit 3\n', encoding='utf-8')
+        hook.chmod(0o755)
+        git(root, 'config', 'core.hooksPath', str(hooks))
+        assert _cadence(root, tmp_path / 'data') == 0
+        assert not ran.exists()
+        assert _worktrees(root) == [root.resolve()]
+
 
 # ---------------------------------------------------------------------------
 # Refusals: exit 2, the cause named on stderr, the pinned tree removed.
@@ -233,12 +246,38 @@ _MISPREDICTS = '''if '--params' in sys.argv:
     sys.exit(0)'''
 
 
-#: The instrument failing after locking its pinned tree, so that removing the tree fails too.
-_LOCKS_AND_FAILS = '''if '--run-id' in sys.argv:
+#: The instrument locking its pinned tree before it measures, so that removing the tree fails.
+_LOCKS_ITS_TREE = '''if '--run-id' in sys.argv:
     tree = sys.argv[sys.argv.index('--root') + 1]
-    subprocess.run(['git', '-C', tree, 'worktree', 'lock', tree], check=True)
+    subprocess.run(['git', '-C', tree, 'worktree', 'lock', tree], check=True)'''
+
+#: The same, then failing, so that removing the tree fails after the measurement did.
+_LOCKS_AND_FAILS = _LOCKS_ITS_TREE + '''
     print('shim: the measurement failed', file=sys.stderr)
     sys.exit(1)'''
+
+
+def _git_shim(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, after_add: str) -> None:
+    """Put on PATH a ``git`` whose ``worktree add`` runs the real one, then *after_add*, then exits 3.
+
+    Exit 3 after a completed add is what a failing post-checkout hook leaves: a
+    populated tree that git has registered.
+    """
+    bin_dir = tmp_path / 'git-bin'
+    bin_dir.mkdir()
+    shim = bin_dir / 'git'
+    shim.write_text(
+        f'#!{sys.executable}\nimport subprocess\nimport sys\nfrom pathlib import Path\n\n'
+        f'code = subprocess.run([{shutil.which("git")!r}, *sys.argv[1:]]).returncode\n'
+        "if code == 0 and 'worktree' in sys.argv and 'add' in sys.argv:\n"
+        "    tree = Path(sys.argv[sys.argv.index('--detach') + 1])\n"
+        f'    {after_add}\n'
+        '    sys.exit(3)\n'
+        'sys.exit(code)\n',
+        encoding='utf-8',
+    )
+    shim.chmod(0o755)
+    monkeypatch.setenv('PATH', f'{bin_dir}{os.pathsep}{os.environ["PATH"]}')
 
 
 class TestRefusals:
@@ -311,6 +350,51 @@ class TestRefusals:
         err = capfd.readouterr().err
         [left_behind] = _pinned_trees_home(state_home).iterdir()
         assert err.index('shim: the measurement failed') < err.index(str(left_behind))
+        assert f'  following: the instrument exited 1 measuring {_main_sha(root)}' in err
+
+    def test_a_tree_left_behind_after_a_measurement_is_named_alone(
+        self, tmp_path: Path, capfd: pytest.CaptureFixture[str], state_home: Path
+    ) -> None:
+        root = _repo(tmp_path)
+        data = tmp_path / 'data'
+        assert _cadence(root, data, python=str(_shim(tmp_path, _LOCKS_ITS_TREE))) == 2
+        err = capfd.readouterr().err
+        [left_behind] = _pinned_trees_home(state_home).iterdir()
+        assert str(left_behind) in err
+        assert 'following:' not in err
+
+    def test_a_refused_add_removes_the_tree_git_registered(
+        self,
+        tmp_path: Path,
+        capfd: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+        state_home: Path,
+    ) -> None:
+        root = _repo(tmp_path)
+        data = tmp_path / 'data'
+        _git_shim(tmp_path, monkeypatch, 'pass')
+        assert 'worktree add --detach' in _refused(root, data, capfd)
+        assert list(_pinned_trees_home(state_home).iterdir()) == []
+        assert not data.exists()
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason='root removes a read-only directory')
+    def test_a_refused_add_whose_tree_cannot_be_removed_names_it(
+        self,
+        tmp_path: Path,
+        capfd: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+        state_home: Path,
+    ) -> None:
+        root = _repo(tmp_path)
+        _git_shim(tmp_path, monkeypatch, "(tree / 'src' / 'pkg').chmod(0o500)")
+        assert _cadence(root, tmp_path / 'data') == 2
+        first, *following = capfd.readouterr().err.splitlines()
+        [left_behind] = _pinned_trees_home(state_home).iterdir()
+        (left_behind / 'src' / 'pkg').chmod(0o700)
+        assert str(left_behind) in first
+        assert 'PermissionError' in first
+        assert following[0].startswith('  following: `git ')
+        assert 'worktree add --detach' in following[0]
 
     def test_a_project_id_that_is_not_a_path_segment_is_an_argparse_exit_2(
         self, tmp_path: Path

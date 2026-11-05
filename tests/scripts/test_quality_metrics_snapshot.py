@@ -57,7 +57,7 @@ _BASE: dict[str, str] = {
 
 _BASE_DOMAIN = frozenset(path for path in _BASE if not path.startswith('hooks/'))
 
-_IDENTITY = ('-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid')
+_COMMITTER = ('-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid')
 
 
 def _write(root: Path, files: dict[str, str]) -> None:
@@ -74,7 +74,7 @@ def _repo(tmp_path: Path, files: dict[str, str]) -> Path:
     git(root, 'init', '-q')
     _write(root, {'pyproject.toml': _PYPROJECT, **files})
     git(root, 'add', '-A')
-    git(root, *_IDENTITY, 'commit', '--no-verify', '-q', '-m', 'base')
+    git(root, *_COMMITTER, 'commit', '--no-verify', '-q', '-m', 'base')
     return root
 
 
@@ -92,7 +92,7 @@ def _commit(
     for source, destination in moves:
         git(root, 'mv', source, destination)
     git(root, 'add', '-A')
-    git(root, *_IDENTITY, 'commit', '--no-verify', '--allow-empty', '-q', '-m', message)
+    git(root, *_COMMITTER, 'commit', '--no-verify', '--allow-empty', '-q', '-m', message)
 
 
 def _run(root: Path, out: Path, *extra: str) -> int:

@@ -15,6 +15,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -26,7 +27,7 @@ import quality_metrics_snapshot as snapshot
 import source_measures
 
 FACTORY_ROOT = Path(__file__).resolve().parents[1]
-INSTRUMENT = FACTORY_ROOT / 'scripts' / 'quality_metrics_snapshot.py'
+INSTRUMENT_SCRIPT = FACTORY_ROOT / 'scripts' / 'quality_metrics_snapshot.py'
 DEFAULT_PYTHON = FACTORY_ROOT / '.venv' / 'bin' / 'python'
 DEFAULT_DATA_DIR = FACTORY_ROOT / 'data' / 'quality-metrics'
 
@@ -58,6 +59,11 @@ def _git(root: Path, *args: str) -> str:
     return _stdout(['git', '-C', str(root), *args])
 
 
+def _worktree(root: Path, *args: str) -> str:
+    """``git worktree *args`` with the project's own hooks off: pinning a tree runs none of them."""
+    return _git(root, '-c', 'core.hooksPath=/dev/null', 'worktree', *args)
+
+
 def _full_sha(root: Path, rev: str) -> str:
     return _git(root, 'rev-parse', '--verify', '--end-of-options', f'{rev}^{{commit}}').strip()
 
@@ -81,7 +87,7 @@ def _state_home(project_id: str) -> Path:
 
 def _predicted_params(python: Path) -> dict[str, Any]:
     """The params a measurement by *python* would record, asked of the instrument itself."""
-    command = [str(python), str(INSTRUMENT), '--params']
+    command = [str(python), str(INSTRUMENT_SCRIPT), '--params']
     printed = _stdout(command)
     try:
         params = json.loads(printed)
@@ -107,18 +113,34 @@ def _added_worktree(root: Path, sha: str, home: Path) -> Path:
             f'{exc.__class__.__name__}: {exc}'
         ) from exc
     try:
-        _git(root, 'worktree', 'add', '--detach', str(tree), sha)
-    except source_measures.MetricsError:
-        tree.rmdir()
+        _worktree(root, 'add', '--detach', str(tree), sha)
+    except source_measures.MetricsError as refusal:
+        _discard_refused_tree(root, tree, refusal)
         raise
     return tree
+
+
+def _discard_refused_tree(root: Path, tree: Path, refusal: source_measures.MetricsError) -> None:
+    """Remove what a refused add left at *tree*, registered or not; a tree that stays is named, chained to *refusal*."""
+    try:
+        _worktree(root, 'remove', '--force', str(tree))
+    except source_measures.MetricsError:
+        try:
+            shutil.rmtree(tree)
+        except OSError as exc:
+            raise source_measures.MetricsError(
+                f'{tree}: the pinned tree a refused `git worktree add` left could not be removed -- '
+                f'{exc.__class__.__name__}: {exc}'
+            ) from refusal
 
 
 def _remove_worktree(root: Path, tree: Path, *, after: BaseException | None) -> None:
     """Remove *tree*; a failure names the tree left behind, chained to the failure *after* which it ran."""
     try:
-        _git(root, 'worktree', 'remove', '--force', str(tree))
+        _worktree(root, 'remove', '--force', str(tree))
     except source_measures.MetricsError as removal:
+        if after is None:
+            raise
         raise removal from after
 
 
@@ -136,7 +158,7 @@ def _pinned(root: Path, sha: str, home: Path) -> Iterator[Path]:
 
 def _measure(python: Path, sha: str, tree: Path, out: Path, run_id: str) -> None:
     """Run the instrument on *tree*, its stdout and stderr this process's own."""
-    command = [str(python), str(INSTRUMENT), '--run-id', run_id, '--out', str(out), '--root', str(tree)]
+    command = [str(python), str(INSTRUMENT_SCRIPT), '--run-id', run_id, '--out', str(out), '--root', str(tree)]
     returncode = _run(command, capture=False).returncode
     if returncode != 0:
         raise source_measures.MetricsError(
@@ -233,6 +255,16 @@ def _require_executable(python: Path) -> None:
         )
 
 
+def _failure_lines(failure: source_measures.MetricsError) -> list[str]:
+    """*failure*, then each earlier failure it followed; a cause of another type is already in its text."""
+    lines = [f'quality_snapshot_cadence: {failure}']
+    cause = failure.__cause__
+    while isinstance(cause, source_measures.MetricsError):
+        lines.append(f'  following: {cause}')
+        cause = cause.__cause__
+    return lines
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point; see the module docstring for the exit codes."""
     args = _build_parser().parse_args(argv)
@@ -244,7 +276,7 @@ def main(argv: list[str] | None = None) -> int:
         for sha in shas:
             print(_cadence_one(settings, sha, params), flush=True)
     except source_measures.MetricsError as exc:
-        print(f'quality_snapshot_cadence: {exc}', file=sys.stderr)
+        print(*_failure_lines(exc), sep='\n', file=sys.stderr)
         return 2
     return 0
 
