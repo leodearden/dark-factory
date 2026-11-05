@@ -298,8 +298,10 @@ Reversing this decision means updating this section, `CLAUDE.md` and
     (`timeout=`, `max_wall_s=`, or `asyncio.wait_for`'s positional timeout).
     The same deadline written two more ways is flagged too: an
     `asyncio.timeout(...)`/`asyncio.timeout_at(...)` block wrapping a poll or
-    a load-bearing await, and an async poll loop that gives up against a
-    wall-clock read (`loop.time()`, `time.monotonic()` and the like).
+    a load-bearing await, and an async poll loop whose comparison reads a
+    wall clock directly (`loop.time() < deadline`,
+    `deadline - time.monotonic() > 0` and the like); a clock read held in a
+    variable and compared later is not seen yet.
     Remedy: `wait_responsive(...)` with a descriptive `label=` — or, for a
     poll, `poll_responsive(predicate, ...)` from
     `orchestrator/tests/_poll_responsive.py` — and a bound

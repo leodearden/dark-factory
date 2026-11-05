@@ -170,8 +170,12 @@ The same defect is also written as a POLL, so a further leg covers it:
   3. CLOCK-DEADLINE POLL (task 7800): an async ``while`` loop that gives up against a
      wall-clock read — a ``Compare`` in its test or its own body with a DIRECT
      operand that is a zero-argument ``.time()``, ``.monotonic()`` or
-     ``.perf_counter()`` call, on any receiver.  One violation, at the ``while``.
+     ``.perf_counter()`` call, on any receiver, or a remaining time
+     (``deadline - loop.time() > 0``), which is always measured against a deadline.
+     One violation, at the ``while``.
      Its bound is arithmetic in another statement, so it has no raw-literal kind.
+     A read held in a variable (``remaining = deadline - loop.time()``, then
+     ``if remaining <= 0``) is not seen yet: ticket tkt_0RWM0CNQ4KSK1K2Y3TPDEAR3M1.
      Two structural discriminators keep it to polls.  ANOTHER-EXIT admits an
      elapsed-time operand (``loop.time() - t0 < timeout``) only when the loop can
      also end some other way: a test conjunct that reads no clock, or a ``break`` or
@@ -1274,6 +1278,22 @@ def _elapsed_clock_read(node: ast.expr) -> ast.Call | None:
     return None
 
 
+def _give_up_clock_read(node: ast.expr) -> ast.Call | None:
+    """Return the clock read in *node* if it is one measured against a deadline.
+
+    That is the read itself, or a remaining time, ``<deadline> - <clock read>``.
+    """
+    if _is_wall_clock_read(node):
+        return node
+    if (
+        isinstance(node, ast.BinOp)
+        and isinstance(node.op, ast.Sub)
+        and _is_wall_clock_read(node.right)
+    ):
+        return node.right
+    return None
+
+
 def _ends_other_than_by_its_clock(loop: ast.While) -> bool:
     """Return True if *loop* has an exit that no clock governs.
 
@@ -1311,11 +1331,11 @@ def _clock_deadline_read(loop: ast.While) -> ast.Call | None:
     """Return the wall-clock read *loop* compares against to give up, else None.
 
     That is a DIRECT operand of a ``Compare`` in the loop's test or own body that is a
-    wall-clock read.  Failing one, it is the read inside an elapsed-time operand
-    (``_elapsed_clock_read``), but only for a loop that ``_ends_other_than_by_its_clock``.
-    A nested ``while`` or scope is not searched: its comparison is its own.  A nested
-    ``for`` IS searched: a ``for`` loop is not a leg of its own, so its comparison
-    belongs to the enclosing ``while``.
+    wall-clock read or a remaining time (``_give_up_clock_read``).  Failing one, it is
+    the read inside an elapsed-time operand (``_elapsed_clock_read``), but only for a
+    loop that ``_ends_other_than_by_its_clock``.  A nested ``while`` or scope is not
+    searched: its comparison is its own.  A nested ``for`` IS searched: a ``for`` loop
+    is not a leg of its own, so its comparison belongs to the enclosing ``while``.
     """
     own_code = _walk_own_scope(
         [loop.test, *loop.body],
@@ -1326,8 +1346,9 @@ def _clock_deadline_read(loop: ast.While) -> ast.Call | None:
         if not isinstance(node, ast.Compare):
             continue
         for operand in (node.left, *node.comparators):
-            if _is_wall_clock_read(operand):
-                return operand
+            give_up = _give_up_clock_read(operand)
+            if give_up is not None:
+                return give_up
             elapsed = _elapsed_clock_read(operand)
             if elapsed is not None:
                 elapsed_reads.append(elapsed)

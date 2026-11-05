@@ -218,6 +218,40 @@ class TestClockDeadlinePollLeg:
         assert len(violations) == 1, violations
         assert violations[0].lineno == _line_of(source, 'while ')
 
+    @pytest.mark.parametrize(
+        'source',
+        [
+            pytest.param(
+                """
+                async def test_x():
+                    while deadline - loop.time() > 0:
+                        await asyncio.sleep(0.01)
+                """,
+                id='in-the-test',
+            ),
+            pytest.param(
+                """
+                async def test_x():
+                    while True:
+                        if deadline - time.monotonic() <= 0:
+                            pytest.fail('x')
+                        await asyncio.sleep(0.01)
+                """,
+                id='in-the-body',
+            ),
+        ],
+    )
+    def test_a_remaining_time_operand_flags_like_a_direct_read(self, source):
+        """`deadline - loop.time() > 0` is the one-line rewrite of `loop.time() < deadline`.
+
+        A remaining time is always measured against a deadline, so unlike an
+        elapsed time it needs no other exit to count as a poll's give-up.
+        """
+        violations = _rule_c(source)
+
+        assert len(violations) == 1, violations
+        assert violations[0].lineno == _line_of(source, 'while ')
+
     def test_a_clock_check_in_a_for_loop_belongs_to_the_enclosing_while(self):
         source = """
             async def test_x():
