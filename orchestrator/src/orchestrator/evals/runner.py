@@ -633,7 +633,7 @@ def _cell_workflow(
         git_ops=GitOps(orch_config.git, orch_config.project_root),
         scheduler=scheduler,
         briefing=briefing,
-        mcp=_EvalMcpStub(orch_config.fused_memory.url),
+        mcp=eval_mcp_lifecycle(orch_config),
         initial_plan=initial_plan,
         usage_gate=usage_gate,
     )
@@ -1323,6 +1323,11 @@ class _EvalMcpStub:
 
     def mcp_config_json(self, escalation_url: str | None = None) -> dict:
         return {}
+
+
+def eval_mcp_lifecycle(orch_config: OrchestratorConfig) -> _EvalMcpStub:
+    """The harness MCP lifecycle every eval cell's workflow is built with."""
+    return _EvalMcpStub(orch_config.fused_memory.url)
 
 
 class _RecordingMemoryHandler(BaseHTTPRequestHandler):

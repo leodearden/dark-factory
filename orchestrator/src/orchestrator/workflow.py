@@ -104,7 +104,7 @@ from orchestrator.artifacts import (
 )
 from orchestrator.branch_base import own_work_base
 from orchestrator.branch_mergeability import Mergeability, read_branch_state
-from orchestrator.config import ModuleConfig, OrchestratorConfig
+from orchestrator.config import EscalationConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.curator_submit import SubmitBatchResult, submit_task_batch
 from orchestrator.delivered_checks import (
     DeliveredChecksBlock,
@@ -280,6 +280,12 @@ def _meta_root_for_worktree(worktree: Path) -> Path:
     return TaskArtifacts.meta_root_for(worktree.parent, worktree.name)
 
 
+PLAN_TOOLS_MCP_SERVER = 'plan-tools'
+VERDICT_TOOLS_MCP_SERVER = 'verdict-tools'
+#: The servers spawned for one invocation and bound to its worktree; neither reaches a shared service.
+PER_INVOCATION_MCP_SERVERS = frozenset({PLAN_TOOLS_MCP_SERVER, VERDICT_TOOLS_MCP_SERVER})
+
+
 def _inject_plan_tools_mcp(mcp_config: dict | None, cwd: Path, *, task_root: Path) -> dict:
     """Inject the plan-tools stdio MCP server entry into *mcp_config*.
 
@@ -311,7 +317,7 @@ def _inject_plan_tools_mcp(mcp_config: dict | None, cwd: Path, *, task_root: Pat
     """
     if not mcp_config:
         mcp_config = {'mcpServers': {}}
-    mcp_config.setdefault('mcpServers', {})['plan-tools'] = plan_tools_mcp_server(
+    mcp_config.setdefault('mcpServers', {})[PLAN_TOOLS_MCP_SERVER] = plan_tools_mcp_server(
         _ORCH_PROJECT_DIR, cwd, python_executable=sys.executable,
         meta_root=_meta_root_for_worktree(cwd), task_root=task_root,
     )
@@ -355,10 +361,54 @@ def _inject_verdict_tools_mcp(
     """
     if not mcp_config:
         mcp_config = {'mcpServers': {}}
-    mcp_config.setdefault('mcpServers', {})['verdict-tools'] = verdict_tools_mcp_server(
+    mcp_config.setdefault('mcpServers', {})[VERDICT_TOOLS_MCP_SERVER] = verdict_tools_mcp_server(
         _ORCH_PROJECT_DIR, cwd, role.name, python_executable=sys.executable,
         meta_root=_meta_root_for_worktree(cwd), task_root=task_root,
     )
+    return mcp_config
+
+
+class McpConfigSource(Protocol):
+    """The harness MCP lifecycle's half of an invocation's ``--mcp-config``."""
+
+    def mcp_config_json(self, escalation_url: str | None = None) -> dict: ...
+
+
+def escalation_mcp_url(escalation: EscalationConfig) -> str:
+    return f'http://{escalation.host}:{escalation.port}/mcp'
+
+
+def compose_invocation_mcp_config(
+    role: AgentRole,
+    *,
+    mcp: McpConfigSource | None,
+    escalation_url: str | None,
+    cwd: Path,
+    task_root: Path,
+    strict_mcp_config: bool,
+) -> dict | None:
+    """The ``mcp_config`` one *role* invocation in *cwd* is dispatched with.
+
+    Each server is gated on ``role.mcp_families`` (W9-η). The ``orchestrator``
+    family takes the harness lifecycle's servers. ``plan_tools`` and
+    ``verdict_tools`` each add a stdio server bound to *cwd*. The injectors
+    build a skeleton when the config is None, so the reviewer, which has no
+    ``orchestrator`` family, still gets verdict-tools.
+
+    ``--strict-mcp-config`` stops the CLI from merging in the ambient
+    project and user ``.mcp.json``. Strict scoping does nothing without a
+    truthy ``--mcp-config``, so a strict role whose families composed no
+    servers gets the zero-server config, not the worktree's ambient one.
+    """
+    mcp_config = None
+    if 'orchestrator' in role.mcp_families and mcp is not None:
+        mcp_config = mcp.mcp_config_json(escalation_url=escalation_url)
+    if 'plan_tools' in role.mcp_families and cwd:
+        mcp_config = _inject_plan_tools_mcp(mcp_config, cwd, task_root=task_root)
+    if 'verdict_tools' in role.mcp_families and cwd:
+        mcp_config = _inject_verdict_tools_mcp(mcp_config, cwd, role, task_root=task_root)
+    if strict_mcp_config and not mcp_config:
+        mcp_config = no_mcp_servers_config()
     return mcp_config
 
 
@@ -14537,53 +14587,17 @@ class TaskWorkflow:
         # dispatched without an escalation queue wired up.
         self._maybe_warn_missing_escalation(role.name)
 
-        # Build MCP config — fused-memory always, escalation when available.
-        # Judge gets MCP so its jcodemunch tools (in allowed_tools) actually
-        # work; it does not use escalation tools but mcp_config_json handles
-        # escalation_url=None fine. Gated on role.mcp_families (W9-η) rather
-        # than a role.name membership tuple.
-        mcp_config = None
-        if 'orchestrator' in role.mcp_families:
-            escalation_url = None
-            if self.escalation_queue:
-                esc = self.config.escalation
-                escalation_url = f'http://{esc.host}:{esc.port}/mcp'
-            if self.mcp is not None:
-                mcp_config = self.mcp.mcp_config_json(escalation_url=escalation_url)
-
-        # Plan-tools stdio MCP server — architect builds plans, implementer/
-        # debugger/simple_task mark steps done.  Per-invocation isolation: each
-        # agent gets its own server bound to the worktree path.  Fast-start flags
-        # (--no-sync, --frozen) reuse the already-synced orchestrator venv to
-        # avoid cold-resolve stalls under load (reify esc-4415-240/esc-4437-123).
-        if 'plan_tools' in role.mcp_families and cwd:
-            mcp_config = _inject_plan_tools_mcp(
-                mcp_config, cwd, task_root=self._artifact_roots(cwd)[1],
-            )
-
-        # Verdict-tools stdio MCP server — reviewer/judge/merger submit a
-        # constrained verdict artifact (PRD task β, task 2482). Gated on
-        # role.mcp_families exactly like plan-tools above; the per-invocation
-        # --verdict-role is role.name. _inject_verdict_tools_mcp skeletons a
-        # config when None, so the reviewer (no 'orchestrator' family) still
-        # acquires it.
-        if 'verdict_tools' in role.mcp_families and cwd:
-            mcp_config = _inject_verdict_tools_mcp(
-                mcp_config, cwd, role, task_root=self._artifact_roots(cwd)[1],
-            )
-
-        # --strict-mcp-config stops the CLI unioning in the ambient project/user
-        # .mcp.json. EVAL_PROFILE scopes every role (task 4757). A role whose
-        # servers are all spawned above per invocation is scoped too, so its
-        # verdict tool is not deferred behind ToolSearch (task 3849; the
-        # reviewer trial does the same in
-        # orchestrator/src/orchestrator/evals/reviewer_trial/runner.py::_review).
-        # Strict scoping is a no-op without a truthy --mcp-config, so a role
-        # whose families composed none gets the zero-server one rather than
-        # keeping the worktree's ambient .mcp.json.
         strict_mcp = scope.strict_mcp_config
-        if strict_mcp and not mcp_config:
-            mcp_config = no_mcp_servers_config()
+        mcp_config = compose_invocation_mcp_config(
+            role,
+            mcp=self.mcp,
+            escalation_url=(
+                escalation_mcp_url(self.config.escalation) if self.escalation_queue else None
+            ),
+            cwd=cwd,
+            task_root=self._artifact_roots(cwd)[1],
+            strict_mcp_config=strict_mcp,
+        )
 
         # Session-resume lifecycle: if the harness recovered a sidecar that
         # matches the role we're about to invoke, resume the prior session

@@ -23,7 +23,7 @@ from orchestrator.config import OrchestratorConfig
 from orchestrator.evals.configs import EvalConfig
 from orchestrator.evals.live_fixture import build_live_fixture
 from orchestrator.evals.profile import apply_eval_profile
-from orchestrator.evals.runner import build_eval_orch_config
+from orchestrator.evals.runner import build_eval_orch_config, eval_mcp_lifecycle
 from orchestrator.evals.shadow_invocation import build_shadow_orch_config
 from orchestrator.evals.shadow_isolation import (
     IsolationGap,
@@ -37,6 +37,8 @@ from orchestrator.evals.shadow_isolation import (
 from orchestrator.evals.snapshots import eval_worktree_root
 from orchestrator.event_store import EventType
 from orchestrator.fm_retry import FM_NULL_SENTINEL_URL
+from orchestrator.mcp_lifecycle import McpLifecycle
+from orchestrator.workflow import PER_INVOCATION_MCP_SERVERS, PLAN_TOOLS_MCP_SERVER
 from orchestrator.workflow_types import WorkflowState
 
 _SHADOW_ID = 'shadow_4242_0123456789abcdef0123456789abcdef'
@@ -77,9 +79,10 @@ def _eval_cwd(project_root: Path) -> Path:
 
 
 def _production_implementer_leg(tmp_path: Path) -> LegInvocation:
+    production = OrchestratorConfig(project_root=tmp_path)
     return workflow_leg(
-        OrchestratorConfig(project_root=tmp_path), IMPLEMENTER,
-        task_id=_SHADOW_ID, cwd=_eval_cwd(tmp_path), resolve_backend=_landlock,
+        production, IMPLEMENTER, task_id=_SHADOW_ID, cwd=_eval_cwd(tmp_path),
+        mcp=McpLifecycle(production), resolve_backend=_landlock,
     )
 
 
@@ -115,6 +118,34 @@ def test_the_built_legs_cover_every_role_plus_the_architect_eval(tmp_path: Path)
     assert architect_eval.sandbox_modules is None
 
 
+def test_the_built_legs_carry_only_per_invocation_mcp_servers(tmp_path: Path) -> None:
+    legs = shadow_leg_invocations(OrchestratorConfig(project_root=tmp_path), resolve_backend=_landlock)
+
+    assert all(leg.mcp_servers <= PER_INVOCATION_MCP_SERVERS for leg in legs)
+    assert _workflow_leg_for(legs, 'implementer').mcp_servers == {PLAN_TOOLS_MCP_SERVER}
+    [architect_eval] = [leg for leg in legs if leg.dispatch is LegDispatch.ARCHITECT_EVAL]
+    assert architect_eval.mcp_servers == {PLAN_TOOLS_MCP_SERVER}
+
+
+def test_a_shadow_leg_handed_the_production_mcp_lifecycle_is_live_mcp_server(
+    tmp_path: Path,
+) -> None:
+    shadow = build_shadow_orch_config(
+        _IMPL, _shadow_fixture(tmp_path), OrchestratorConfig(project_root=tmp_path),
+    )
+    leg = workflow_leg(
+        shadow, IMPLEMENTER, task_id=_SHADOW_ID, cwd=_eval_cwd(tmp_path),
+        mcp=McpLifecycle(shadow), resolve_backend=_landlock,
+    )
+
+    [finding] = probe_isolation((leg,)).findings
+
+    assert finding.gap is IsolationGap.LIVE_MCP_SERVER
+    assert 'fused-memory' in finding.observed
+    assert 'escalation' in finding.observed
+    assert PLAN_TOOLS_MCP_SERVER not in finding.observed
+
+
 def test_the_built_shadow_profile_has_no_isolation_gap(tmp_path: Path) -> None:
     base = OrchestratorConfig(project_root=tmp_path)
 
@@ -130,7 +161,7 @@ def test_a_production_profile_leg_is_ambient_mcp_and_live_memory(tmp_path: Path)
 
     assert verdict.isolation_unavailable is True
     assert [finding.gap for finding in verdict.findings] == [
-        IsolationGap.STRICT_MCP_OFF, IsolationGap.LIVE_MEMORY_ENDPOINT,
+        IsolationGap.STRICT_MCP_OFF, IsolationGap.LIVE_MCP_SERVER, IsolationGap.LIVE_MEMORY_ENDPOINT,
     ]
 
 
@@ -140,7 +171,8 @@ def test_dropping_strict_mcp_alone_is_exactly_strict_mcp_off(tmp_path: Path) -> 
     )
 
     leg = workflow_leg(
-        config, IMPLEMENTER, task_id=_SHADOW_ID, cwd=_eval_cwd(tmp_path), resolve_backend=_landlock,
+        config, IMPLEMENTER, task_id=_SHADOW_ID, cwd=_eval_cwd(tmp_path),
+        mcp=eval_mcp_lifecycle(config), resolve_backend=_landlock,
     )
 
     assert _gaps([leg]) == [IsolationGap.STRICT_MCP_OFF]
@@ -148,9 +180,10 @@ def test_dropping_strict_mcp_alone_is_exactly_strict_mcp_off(tmp_path: Path) -> 
 
 def test_a_production_task_id_and_lane_is_escalation_uncontained(tmp_path: Path) -> None:
     cwd = tmp_path / '.worktrees' / '4242'
+    config = apply_eval_profile(OrchestratorConfig(project_root=tmp_path))
     leg = workflow_leg(
-        apply_eval_profile(OrchestratorConfig(project_root=tmp_path)), IMPLEMENTER,
-        task_id='4242', cwd=cwd, resolve_backend=_landlock,
+        config, IMPLEMENTER, task_id='4242', cwd=cwd,
+        mcp=eval_mcp_lifecycle(config), resolve_backend=_landlock,
     )
 
     [finding] = probe_isolation((leg,)).findings
@@ -167,7 +200,7 @@ def test_a_corpus_profile_sandboxed_leg_is_sandbox_off(tmp_path: Path) -> None:
 
     legs = [
         workflow_leg(corpus, role, task_id=_SHADOW_ID, cwd=_eval_cwd(tmp_path),
-                     resolve_backend=_landlock)
+                     mcp=eval_mcp_lifecycle(corpus), resolve_backend=_landlock)
         for role in ROLES.values()
     ]
     findings = probe_isolation(tuple(legs)).findings
@@ -183,7 +216,7 @@ def test_a_shadow_profile_leg_under_no_backend_is_sandbox_unwrapped(tmp_path: Pa
 
     leg = workflow_leg(
         shadow, IMPLEMENTER, task_id=_SHADOW_ID, cwd=_eval_cwd(tmp_path),
-        resolve_backend=_no_backend,
+        mcp=eval_mcp_lifecycle(shadow), resolve_backend=_no_backend,
     )
 
     assert _gaps([leg]) == [IsolationGap.SANDBOX_UNWRAPPED]
