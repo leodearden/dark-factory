@@ -724,6 +724,7 @@ class ShadowCoordinator:
         self._drives: set[asyncio.Task[None]] = set()
         self._closing = False
         self._open_lock = asyncio.Lock()
+        self._storm_lock = asyncio.Lock()
         self._storm = _UNPAUSED
         self._cost_unreadable_streak = 0
 
@@ -1200,18 +1201,25 @@ class ShadowCoordinator:
         return resumed
 
     async def _evaluate_storm(self) -> None:
-        """Pause on a tripped storm guard; run after every cell end, expire and start. Never raises."""
+        """Pause on a tripped storm guard; run after every cell end, expire and start. Never raises.
+
+        Evaluations run one at a time, so none acts on a snapshot another has
+        overtaken; the escalation is filed after the lock is released.
+        """
         try:
-            await self._check_storm()
+            async with self._storm_lock:
+                created = await self._check_storm()
+            if created is not None:
+                await self._escalate(created)
         except Exception:
             logger.exception('shadow coordinator: storm evaluation failed')
 
-    async def _check_storm(self) -> None:
+    async def _check_storm(self) -> StormTrip | None:
         threshold = self._config.failure_streak_pause
         snapshot = await asyncio.to_thread(self._storm_snapshot, threshold)
         if snapshot.storm.paused:
             self._storm = StormState.of(snapshot.storm)
-            return
+            return None
         settled = [cell for cell in snapshot.window if cell.state is ShadowCellState.SETTLED]
         ratios = await self._measured_ratios(settled)
         facts = StormFacts(
@@ -1227,8 +1235,8 @@ class ShadowCoordinator:
         trip = evaluate_storm(facts)
         if trip is None:
             self._storm = StormState.of(snapshot.storm)
-            return
-        await self._pause(trip)
+            return None
+        return trip if await self._pause(trip) else None
 
     def _storm_snapshot(self, threshold: int) -> _StormSnapshot:
         store = self._deps.store
@@ -1289,8 +1297,8 @@ class ShadowCoordinator:
         ceiling = self._config.cost_ratio_ceiling
         return {candidate: cost_ratio_verdict(found, ceiling) for candidate, found in pairs.items()}
 
-    async def _pause(self, trip: StormTrip) -> None:
-        """Write the durable pause; only the call that created it files the escalation."""
+    async def _pause(self, trip: StormTrip) -> bool:
+        """Write the durable pause and the advisory state; True only for the call that created it."""
         store = self._deps.store
         created = await asyncio.to_thread(
             store.pause_shadow_storm, self.project_id, trip.cause, trip.detail, self._deps.clock(),
@@ -1299,9 +1307,12 @@ class ShadowCoordinator:
             self._storm = StormState.of(
                 await asyncio.to_thread(store.get_shadow_storm, self.project_id),
             )
-            return
+            return False
         self._storm = StormState(paused=True, cause=trip.cause, detail=trip.detail)
         logger.warning('shadow coordinator: paused on %s: %s', trip.cause.value, trip.detail)
+        return True
+
+    async def _escalate(self, trip: StormTrip) -> None:
         try:
             await self._deps.escalate(trip)
         except Exception:
