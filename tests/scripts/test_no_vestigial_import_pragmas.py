@@ -529,3 +529,27 @@ def test_an_import_reachable_only_through_a_session_sys_path_entry_is_not_an_ins
         f'test session, the way a collected test module puts one there, so the '
         f'environment pyright resolves from does not provide it'
     )
+
+
+def test_a_module_at_the_pyright_execution_root_resolves_on_the_class_a_search_roots(
+    tmp_path: Path,
+) -> None:
+    root_modules = sorted(path.stem for path in REPO_ROOT.glob('*.py'))
+    assert root_modules, (
+        f'no *.py module found at {REPO_ROOT}, so this test would pass vacuously'
+    )
+
+    unresolved = [
+        module
+        for module in root_modules
+        if _resolving_root(module, _import_search_roots(tmp_path)) is None
+    ]
+
+    assert not unresolved, (
+        f'{unresolved} sit at the pyright execution root {REPO_ROOT}, the '
+        f'directory holding the root pyproject.toml, and pyright resolves local '
+        f'imports against it. So a suppression on an import of one is vestigial, '
+        f'and class (a) must report it. A fresh interpreter of this environment '
+        f'cannot import these modules, so without this root they would escape '
+        f'BOTH guards'
+    )
