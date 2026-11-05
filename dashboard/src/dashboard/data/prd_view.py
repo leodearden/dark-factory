@@ -1,30 +1,34 @@
-"""The per-PRD view of one root: segments, readiness and attribution, composed.
+"""The per-PRD view of one root: segments, readiness, attribution and signal, composed.
 
-PURE (PRD ``plans/dashboard-prd-lanes-prd.md`` §4.3–§4.5, §4.9–§4.10, §5.5):
-no I/O and no clock read but the injected *now*. It reads one root's status
-map, its raw active rows and its lineage index, handed in by the caller, and
-never imports the modules that acquire them. Its one piece of state is a
-per-root memo of the attribution, which does not depend on *now*; it is keyed
-on the very rows and lineage values it was computed from, so it can only
-ever answer for those.
+PURE (PRD ``plans/dashboard-prd-lanes-prd.md`` §4.3–§4.5, §4.7, §4.9–§4.10,
+§5.5): no I/O and no clock read but the injected *now*. It reads one root's
+six inputs, handed in by the caller: its status map, its raw active rows, its
+lineage index, its pending human-level escalations, its run-ledger activity,
+its PRD documents and its session holders' liveness. It never imports the
+modules that acquire them; the value types those modules serve are defined
+here. Its one piece of state is a per-root memo of the attribution, which
+does not depend on *now*; it is keyed on the very rows and lineage values it
+was computed from, so it can only ever answer for those.
 
-:func:`build_prd_view` serves the γ1 subset of §5.5's ``PrdView``: per-PRD
-segments, totals, open members and ready age; closed PRDs; unattributed done;
-dark matter; the lineage multi-link count; each input's provenance; and the
-rule text of every figure. γ2 adds lanes, signals, activity and contention.
+:func:`build_prd_view` serves per-PRD segments, totals, open members, ready
+age, title and signal mark; closed PRDs; unattributed done; dark matter; the
+lineage multi-link count; signal coverage; each input's provenance; and the
+rule text of every figure. :func:`open_work_keys` names the PRDs it draws, so
+the caller knows which documents to read.
 """
 
 from __future__ import annotations
 
 import enum
 from collections import Counter
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from types import MappingProxyType
-from typing import Any
+from typing import Any, TypeVar
 
-from shared.capability_manifest import CapabilityManifestDoc
+from shared.capability_manifest import CapabilityManifestDoc, ManifestTask
+from shared.process_identity import Liveness
 from shared.task_metadata import Milestone
 from shared.task_statuses import TERMINAL, TaskStatus
 from shared.timestamps import parse_timestamp_or_warn
@@ -43,6 +47,8 @@ from dashboard.data.prd_attribution import (
     Attribution,
     LineageEntry,
     LinkField,
+    PrdKey,
+    Unresolved,
     UnresolvedReason,
     attribute,
     lineage_entry,
@@ -91,6 +97,9 @@ class FigureId(enum.StrEnum):
     UNATTRIBUTED_DONE = 'unattributed_done'
     DARK_MATTER = 'dark_matter'
     MULTI_LINK = 'multi_link'
+    TITLE = 'title'
+    SIGNAL = 'signal'
+    SIGNAL_COVERAGE = 'signal_coverage'
 
 
 class ViewInput(enum.StrEnum):
@@ -99,6 +108,11 @@ class ViewInput(enum.StrEnum):
     STATUS_MAP = 'status_map'
     ACTIVE_ROWS = 'active_rows'
     LINEAGE = 'lineage'
+    ESCALATIONS = 'escalations'
+    ACTIVITY = 'activity'
+    SIGNALS = 'signals'
+    LIVENESS = 'liveness'
+    SCHEDULER_STATE = 'scheduler_state'
 
 
 HIGH_PRIORITIES = frozenset({'critical', 'high'})
@@ -159,6 +173,25 @@ FIGURE_RULES: MappingProxyType[FigureId, str] = MappingProxyType({
         f"Tasks carrying two or more lineage link keys; the first present in {_LINK_CHAIN} "
         "order is the one followed."
     ),
+    FigureId.TITLE: (
+        "The first line of the PRD file starting '# ', the marker stripped; the PRD key when "
+        "the file is missing or has no such line."
+    ),
+    FigureId.SIGNAL: (
+        "Whether the PRD's goal signal is delivered, read from the signal_leaves its "
+        "capability-manifest sidecar names and those tasks' status in the store: delivered when "
+        "every leaf is done (each leaf's done kind shown), partial when some are done and none "
+        "is cancelled, not yet when none is done and none is cancelled. Unknown, with its "
+        "cause, when there is no sidecar or it fails to load, the PRD names no signal leaf, or "
+        "a leaf is unbound, bound to a task absent from the store, bound to a task whose own "
+        "PRD is another (a stale binding), bound to an external task, or cancelled. Leaves are "
+        "checked in signal_leaves order and the first failing one names the cause."
+    ),
+    FigureId.SIGNAL_COVERAGE: (
+        "How many drawn PRDs have a sidecar that loads and names a signal leaf, of all drawn "
+        "PRDs. A mark unknown everywhere beside low coverage is a missing producer, not a "
+        "signal not yet delivered."
+    ),
 })
 
 _IN_PROGRESS_STATUSES = VIEWS[TaskView.IN_FLIGHT] - {TaskStatus.BLOCKED}
@@ -183,6 +216,8 @@ _STATE_SEVERITY: Mapping[DatumState, int] = MappingProxyType({
 _STRUCTURAL_VIEW_KEYS = frozenset({'prds', 'inputs', 'rules', 'segment_legend'})
 _STRUCTURAL_ROW_KEYS = frozenset({'key'})
 _LISTED_IDS_CAP = 5
+
+V = TypeVar('V')
 
 
 def is_human_gate(metadata: Mapping[str, Any]) -> bool:
@@ -292,15 +327,19 @@ class PrdRow:
     """One PRD with at least one open member."""
 
     key: str
+    title: str
     segments: Mapping[Segment, int]
     total: int
     direct_open_ids: tuple[int, ...]
     followup_open: tuple[Followup, ...]
     ready: ReadyAge
+    signal: Signal
 
     def to_wire(self) -> dict[str, object]:
         return {
             'key': self.key,
+            FigureId.TITLE.value: self.title,
+            FigureId.SIGNAL.value: self.signal.to_wire(),
             FigureId.SEGMENTS.value: {segment.value: n for segment, n in self.segments.items()},
             FigureId.TOTAL.value: self.total,
             FigureId.DIRECT_OPEN.value: list(self.direct_open_ids),
@@ -371,6 +410,7 @@ class PrdView:
     unattributed_done: int
     dark_matter: DarkMatter
     multi_link: int
+    signal_coverage: SignalCoverage
     inputs: tuple[InputState, ...]
 
     def to_wire(self) -> dict[str, object]:
@@ -380,6 +420,7 @@ class PrdView:
             FigureId.UNATTRIBUTED_DONE.value: self.unattributed_done,
             FigureId.DARK_MATTER.value: self.dark_matter.to_wire(),
             FigureId.MULTI_LINK.value: self.multi_link,
+            FigureId.SIGNAL_COVERAGE.value: self.signal_coverage.to_wire(),
             'inputs': [state.to_wire() for state in self.inputs],
             'rules': {figure.value: text for figure, text in FIGURE_RULES.items()},
             'segment_legend': [
@@ -465,12 +506,75 @@ class PrdDocument:
     sidecar: CapabilityManifestDoc | SidecarUnread
 
 
+_NO_DOCUMENT = PrdDocument(
+    title=None, sidecar=SidecarUnread(SignalCause.NO_SIDECAR, 'no document was read for this PRD'),
+)
+
+
+@dataclass(frozen=True, slots=True)
+class SignalLeaf:
+    """One signal leaf as the store reads it; ``done_kind`` only for a done leaf."""
+
+    label: str
+    task_id: int | None
+    status: str | None
+    done_kind: str | None
+
+    def to_wire(self) -> dict[str, object]:
+        return {
+            'label': self.label,
+            'task_id': self.task_id,
+            'status': self.status,
+            'done_kind': self.done_kind,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class Signal:
+    """A PRD's signal mark, the leaves it was read from, and why it is unknown when it is."""
+
+    mark: SignalMark
+    cause: SignalCause | None
+    reason: str | None
+    leaves: tuple[SignalLeaf, ...]
+
+    def __post_init__(self) -> None:
+        unknown = self.mark is SignalMark.UNKNOWN
+        if unknown != (self.cause is not None) or unknown != (self.reason is not None):
+            raise ValueError(
+                'Signal: an unknown mark carries a cause and a reason, any other mark neither; '
+                f'got mark={self.mark!s}, cause={self.cause!s}, reason={self.reason!r}'
+            )
+
+    def to_wire(self) -> dict[str, object]:
+        return {
+            'mark': self.mark.value,
+            'cause': None if self.cause is None else self.cause.value,
+            'reason': self.reason,
+            'leaves': [leaf.to_wire() for leaf in self.leaves],
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class SignalCoverage:
+    """How many drawn PRDs name a signal leaf in a sidecar that loads, of all drawn PRDs."""
+
+    named: int
+    of: int
+
+    def to_wire(self) -> dict[str, object]:
+        return {'named': self.named, 'of': self.of}
+
+
 @dataclass(frozen=True)
 class PrdViewInputs:
     """What one root's view is built from.
 
     ``census`` is the status-map half's provenance; ``status_map`` is the
-    population and the only source of each task's status.
+    population and the only source of each task's status. ``escalations``
+    maps a task to its pending human-level escalations; ``documents`` holds
+    a document for every PRD :func:`open_work_keys` names; ``liveness``
+    carries the active rows' provenance.
     """
 
     project_root: str
@@ -478,6 +582,10 @@ class PrdViewInputs:
     census: Datum[TaskCensus]
     rows: Datum[list[dict]]
     lineage: Datum[Mapping[int, LineageEntry]]
+    escalations: Datum[Mapping[int, tuple[str, ...]]]
+    activity: Datum[TaskActivity]
+    documents: Datum[Mapping[str, PrdDocument]]
+    liveness: Datum[Mapping[int, Liveness | None]]
 
 
 # ---------------------------------------------------------------------------
@@ -494,10 +602,14 @@ def build_prd_view(inputs: PrdViewInputs, *, now: datetime) -> Datum[PrdView]:
     its state is the worst input state, its ``as_of`` and bound the oldest
     input's. The value is checked by :func:`validate_prd_view` before return.
     """
-    aged = {
+    aged: dict[ViewInput, Datum[Any]] = {
         ViewInput.STATUS_MAP: aged_at(inputs.census, now),
         ViewInput.ACTIVE_ROWS: aged_at(inputs.rows, now),
         ViewInput.LINEAGE: aged_at(inputs.lineage, now),
+        ViewInput.ESCALATIONS: aged_at(inputs.escalations, now),
+        ViewInput.ACTIVITY: aged_at(inputs.activity, now),
+        ViewInput.SIGNALS: aged_at(inputs.documents, now),
+        ViewInput.LIVENESS: aged_at(inputs.liveness, now),
     }
     census = aged[ViewInput.STATUS_MAP]
     if census.value is None or not inputs.status_map:
@@ -507,16 +619,42 @@ def build_prd_view(inputs: PrdViewInputs, *, now: datetime) -> Datum[PrdView]:
     except CensusVocabularyError as drift:
         return unknown_datum(str(drift), census.freshness_bound_seconds)
     unknown = [datum for datum in aged.values() if datum.state is DatumState.UNKNOWN]
-    rows, lineage = aged[ViewInput.ACTIVE_ROWS].value, aged[ViewInput.LINEAGE].value
-    if unknown or rows is None or lineage is None:
+    if unknown or any(datum.value is None for datum in aged.values()):
         bound = (unknown[0] if unknown else census).freshness_bound_seconds
         return unknown_datum(_degradation_reason(aged) or 'an input has no value', bound)
     states = tuple(
         InputState(name, datum.as_of, datum.state, datum.reason) for name, datum in aged.items()
     )
-    view = _shape_view(inputs, rows, lineage, states, now)
+    view = _shape_view(
+        inputs,
+        aged[ViewInput.ACTIVE_ROWS].value,
+        aged[ViewInput.LINEAGE].value,
+        aged[ViewInput.SIGNALS].value,
+        states,
+        now,
+    )
     validate_prd_view(view, inputs.status_map)
-    return _composite(view, aged)
+    return composite(view, aged)
+
+
+def open_work_keys(
+    project_root: str,
+    status_map: Mapping[int, str],
+    rows: Sequence[Mapping[str, Any]],
+    lineage: Mapping[int, LineageEntry],
+) -> tuple[str, ...]:
+    """The keys of the PRDs the view draws a row for, those with an open member, sorted.
+
+    Read through the same memoised attribution :func:`build_prd_view` uses.
+    """
+    attributions = _attributed_for(project_root, rows, lineage).attributions
+    return tuple(sorted({
+        attribution.prd
+        for task_id, status in status_map.items()
+        if status not in TERMINAL
+        and (attribution := attributions.get(task_id)) is not None
+        and attribution.prd is not None
+    }))
 
 
 def _degradation_reason(aged: Mapping[ViewInput, Datum[Any]]) -> str | None:
@@ -528,12 +666,18 @@ def _degradation_reason(aged: Mapping[ViewInput, Datum[Any]]) -> str | None:
     return '; '.join(named) or None
 
 
-def _composite(view: PrdView, aged: Mapping[ViewInput, Datum[Any]]) -> Datum[PrdView]:
+def composite(value: V, aged: Mapping[ViewInput, Datum[Any]]) -> Datum[V]:
+    """*value* with the provenance of the *aged* inputs it was built from.
+
+    Its state is the worst input state, its ``as_of`` and bound the oldest
+    input's, and its reason names every input that is not fresh. Every input
+    must be measured.
+    """
     measured = [(datum.as_of, datum) for datum in aged.values() if datum.as_of is not None]
     as_of, oldest = min(measured, key=lambda pair: pair[0])
     state = max((datum.state for datum in aged.values()), key=_STATE_SEVERITY.__getitem__)
     return Datum(
-        value=view,
+        value=value,
         as_of=as_of,
         state=state,
         reason=_degradation_reason(aged),
@@ -558,6 +702,7 @@ class _Attributed:
     rows: Sequence[Mapping[str, Any]]
     lineage: Mapping[int, LineageEntry]
     rows_by_id: Mapping[int, Mapping[str, Any]]
+    entries: Mapping[int, LineageEntry]
     attributions: Mapping[int, Attribution]
     multi_link: int
 
@@ -592,7 +737,10 @@ def _attributed_for(
         },
     }
     attributions, multi_link = attribute(entries)
-    memo = _Attributed(rows, lineage, MappingProxyType(rows_by_id), attributions, multi_link)
+    memo = _Attributed(
+        rows, lineage, MappingProxyType(rows_by_id), MappingProxyType(entries), attributions,
+        multi_link,
+    )
     _attributed[project_root] = memo
     return memo
 
@@ -601,10 +749,17 @@ def _shape_view(
     inputs: PrdViewInputs,
     rows: Sequence[Mapping[str, Any]],
     lineage: Mapping[int, LineageEntry],
+    documents: Mapping[str, PrdDocument],
     states: tuple[InputState, ...],
     now: datetime,
 ) -> PrdView:
     attributed = _attributed_for(inputs.project_root, rows, lineage)
+
+    def headline(key: str) -> tuple[str, Signal]:
+        document = documents.get(key, _NO_DOCUMENT)
+        signal = signal_of(key, document, inputs.status_map, attributed.entries)
+        return document.title or key, signal
+
     by_prd: dict[str, list[_Member]] = {}
     dark: dict[UnresolvedReason, list[_Member]] = {}
     unattributed_done = 0
@@ -621,19 +776,30 @@ def _shape_view(
             unattributed_done += 1
         elif member.attribution.unresolved is not None:
             dark.setdefault(member.attribution.unresolved, []).append(member)
-    prd_rows, closed = _prd_rows(by_prd, now)
+    prd_rows, closed = _prd_rows(by_prd, headline, now)
     return PrdView(
         prds=prd_rows,
         closed=closed,
         unattributed_done=unattributed_done,
         dark_matter=_dark_matter(dark, inputs.status_map),
         multi_link=attributed.multi_link,
+        signal_coverage=SignalCoverage(
+            named=sum(_names_a_leaf(documents.get(row.key, _NO_DOCUMENT)) for row in prd_rows),
+            of=len(prd_rows),
+        ),
         inputs=states,
     )
 
 
+def _names_a_leaf(document: PrdDocument) -> bool:
+    sidecar = document.sidecar
+    return isinstance(sidecar, CapabilityManifestDoc) and sidecar.signal_leaves is not None
+
+
 def _prd_rows(
-    by_prd: Mapping[str, list[_Member]], now: datetime,
+    by_prd: Mapping[str, list[_Member]],
+    headline: Callable[[str], tuple[str, Signal]],
+    now: datetime,
 ) -> tuple[tuple[PrdRow, ...], Closed]:
     rows: list[PrdRow] = []
     closed_prds = closed_tasks = 0
@@ -644,7 +810,8 @@ def _prd_rows(
             key=lambda member: member.task_id,
         )
         if open_members:
-            rows.append(_prd_row(key, members, open_members, now))
+            title, signal = headline(key)
+            rows.append(_prd_row(key, title, signal, members, open_members, now))
         else:
             closed_prds += 1
             closed_tasks += len(members)
@@ -652,11 +819,18 @@ def _prd_rows(
 
 
 def _prd_row(
-    key: str, members: Sequence[_Member], open_members: Sequence[_Member], now: datetime,
+    key: str,
+    title: str,
+    signal: Signal,
+    members: Sequence[_Member],
+    open_members: Sequence[_Member],
+    now: datetime,
 ) -> PrdRow:
     counts = Counter(member.segment for member in members)
     return PrdRow(
         key=key,
+        title=title,
+        signal=signal,
         segments=MappingProxyType({segment: counts[segment] for segment in Segment}),
         total=len(members),
         direct_open_ids=tuple(m.task_id for m in open_members if m.attribution.direct),
@@ -717,6 +891,92 @@ def _dark_matter(
             for reason in UnresolvedReason
             if dark.get(reason)
         }),
+    )
+
+
+# ---------------------------------------------------------------------------
+# signal_of: the signal mark (§4.7)
+# ---------------------------------------------------------------------------
+
+
+def signal_of(
+    key: str,
+    document: PrdDocument,
+    status_map: Mapping[int, str],
+    entries: Mapping[int, LineageEntry],
+) -> Signal:
+    """*key*'s signal mark, its leaves resolved in ``signal_leaves`` order.
+
+    *entries* are the lineage entries with the active rows overlaid, the same
+    the attribution walks, so each leaf's own PRD and done kind read as the
+    view's members do. The first leaf that cannot be read names the unknown
+    cause; a cancelled leaf is one, so a PRD with one is never delivered.
+    """
+    sidecar = document.sidecar
+    if isinstance(sidecar, SidecarUnread):
+        return _unknown_signal(sidecar.cause, sidecar.detail, ())
+    if sidecar.signal_leaves is None:
+        return _unknown_signal(SignalCause.NAMES_NO_LEAF, None, ())
+    blocks = {block.label: block for block in sidecar.tasks}
+    resolved = [
+        _resolve_leaf(key, blocks[label], status_map, entries) for label in sidecar.signal_leaves
+    ]
+    leaves = tuple(leaf for leaf, _ in resolved)
+    failure = next((failure for _, failure in resolved if failure is not None), None)
+    if failure is not None:
+        return _unknown_signal(*failure, leaves)
+    done = sum(leaf.status == TaskStatus.DONE for leaf in leaves)
+    if done == len(leaves):
+        return Signal(SignalMark.DELIVERED, None, None, leaves)
+    return Signal(SignalMark.PARTIAL if done else SignalMark.NOT_YET, None, None, leaves)
+
+
+_LeafFailure = tuple[SignalCause, str]
+
+
+def _resolve_leaf(
+    key: str,
+    block: ManifestTask,
+    status_map: Mapping[int, str],
+    entries: Mapping[int, LineageEntry],
+) -> tuple[SignalLeaf, _LeafFailure | None]:
+    label = block.label
+    if block.external_task_id is not None:
+        failure = (SignalCause.EXTERNAL_LEAF, f'label {label!r} is bound to {block.external_task_id}')
+        return SignalLeaf(label, None, None, None), failure
+    if block.task_id is None:
+        return SignalLeaf(label, None, None, None), (SignalCause.UNBOUND_LABEL, f'label {label!r}')
+    task_id = block.task_id
+    status = status_map.get(task_id)
+    entry = entries.get(task_id)
+    done_kind = entry.done_kind if entry is not None and status == TaskStatus.DONE else None
+    leaf = SignalLeaf(label, task_id, status, done_kind)
+    bound_to = f'label {label!r} is bound to task {task_id}'
+    if status is None:
+        return leaf, (SignalCause.LEAF_NOT_IN_STORE, bound_to)
+    if entry is None or entry.own_prd != PrdKey(key):
+        return leaf, (SignalCause.STALE_BINDING, f'{bound_to}, whose PRD is {_own_prd_of(entry)}')
+    if status == TaskStatus.CANCELLED:
+        return leaf, (SignalCause.LEAF_CANCELLED, bound_to)
+    return leaf, None
+
+
+def _own_prd_of(entry: LineageEntry | None) -> str:
+    if entry is None:
+        return 'unread'
+    if isinstance(entry.own_prd, PrdKey):
+        return entry.own_prd.key
+    if isinstance(entry.own_prd, Unresolved):
+        return f'unresolved ({entry.own_prd.reason})'
+    return 'not named on the task'
+
+
+def _unknown_signal(
+    cause: SignalCause, detail: str | None, leaves: tuple[SignalLeaf, ...],
+) -> Signal:
+    text = SIGNAL_CAUSE_TEXT[cause]
+    return Signal(
+        SignalMark.UNKNOWN, cause, text if detail is None else f'{text}: {detail}', leaves,
     )
 
 
