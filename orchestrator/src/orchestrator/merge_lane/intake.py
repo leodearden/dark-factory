@@ -135,6 +135,10 @@ async def enqueue_merge_request(
     one's outcome without a row of their own: the waiters and door-coalesced
     ids of the *registry* slot *req* owns at enqueue time, else ``[]``
     (PRD plans/merge-status-durable-non-landed-prd.md D7).
+
+    Its ``queue_to_land_secs`` is measured on the monotonic clock from this
+    call's enqueue, which is the request's last ``merge_queued``: every call
+    emits exactly one, queue_store's restart re-enqueue included.
     """
     absorbing = (
         registry.primary_entry(req.branch.bare_id, req.result)
@@ -212,6 +216,7 @@ async def enqueue_merge_request(
                             if absorbing is not None
                             else []
                         ),
+                        'queue_to_land_secs': round(time.monotonic() - queued_at, 3),
                     },
                 )
             except Exception:  # noqa: BLE001
@@ -221,6 +226,7 @@ async def enqueue_merge_request(
                     req.request_id, req.task_id, exc_info=True,
                 )
 
+    queued_at = time.monotonic()
     req.result.add_done_callback(_on_finalized)
     await queue.put(req)
     _emit_merge_queued(event_store, req, queue_depth=queue.qsize(), source=source)

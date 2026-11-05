@@ -339,13 +339,17 @@ class EventType(StrEnum):
     # Emitted from enqueue_merge_request's terminal done-callback when a
     # MergeRequest future reaches its final state (resolved, cancelled, or
     # exception).  Payload shape: {request_id, branch, state, snapshot_tip,
-    # merge_sha, superseded_by, generation, reason, landed_via_chain}.  state
+    # merge_sha, superseded_by, generation, reason, landed_via_chain,
+    # absorbed_request_ids, queue_to_land_secs}.  state
     # is one of MergeOutcome.status values, 'abandoned' (cancelled future), or
     # 'error' (unexpected exception).  landed_via_chain is 1 on an item landed
     # by a deep merge-ahead chain walk and None otherwise (task 3186 δ); it is
     # what scripts/merge-deep-canary-predicate.sh sums for its items-landed-
     # per-deep-verify statistic.  (superseded_by/generation/reason had been
     # emitted but undocumented here; listed now rather than left stale.)
+    # queue_to_land_secs (task 8523) is seconds on the monotonic clock from
+    # this request's own enqueue to its finalize, present on every state;
+    # readers filter state='done'.
     merge_finalized = 'merge_finalized'
     # Unconditional observability of the generic merge-blocked fall-through in
     # TaskWorkflow._submit_to_merge_queue.  Emitted BEFORE _mark_blocked and
