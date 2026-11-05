@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 from legibility import account_pool
+from orchestrator.agents import landlock, sandbox, sandbox_dispatch
 from shared.cli_invoke import build_claude_argv, resolve_claude_binary
 from shared.usage_gate import AccountLease
 from sitting import nightly_prepare as mod
@@ -26,7 +27,10 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 OK_RESULT = json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False, 'result': 'recorded 3'})
 BANNER = "You've hit your usage limit · resets 5am (Europe/London)"
-ENV_KEYS = ('CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN', 'SITTING_TEST_MARKER', 'SITTING_NIGHTLY_CONFINED')
+ENV_KEYS = (
+    'CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN',
+    'SITTING_TEST_MARKER', 'SITTING_NIGHTLY_CONFINED', 'CLAUDE_CONFIG_DIR',
+)
 TIMEOUT_SECS = '3'
 """Outlasts the fake's interpreter start under ``-n auto`` load (0.5s did not, 2 runs in 10), far short of its sleep."""
 STALLED_CLI_TIMEOUT_SECS = 0.2
@@ -77,6 +81,10 @@ record = {{
     'env': {{key: os.environ.get(key) for key in spec['env_keys']}},
     'env_has': {{key: key in os.environ for key in spec['env_keys']}},
 }}
+credentials = Path(os.environ.get('CLAUDE_CONFIG_DIR', '/nonexistent'), '.credentials.json')
+if credentials.exists():
+    record['credentials'] = credentials.read_text()
+    record['credentials_mode'] = credentials.stat().st_mode & 0o777
 if {system_prompt_file_flag!r} in argv:
     path = argv[argv.index({system_prompt_file_flag!r}) + 1]
     record['sysprompt_path'] = path
@@ -94,6 +102,25 @@ sys.stderr.flush()
 time.sleep(spec['sleep'])
 sys.exit(spec['exit_code'])
 '''
+
+
+@pytest.fixture(autouse=True)
+def _restore_sandbox_backend():
+    """The run sets the process-global backend; put it back after each test."""
+    saved = sandbox_dispatch.get_backend()
+    sandbox_dispatch.reset_escalation_dedupe()
+    yield
+    sandbox_dispatch.set_backend(saved)
+    sandbox_dispatch.reset_escalation_dedupe()
+
+
+@pytest.fixture
+def host_home(tmp_path, monkeypatch):
+    """A HOME of the test's own, so the run's ``~/.cache/uv`` grant is observable and no real HOME is touched."""
+    home = tmp_path / 'home'
+    (home / '.claude').mkdir(parents=True)
+    monkeypatch.setenv('HOME', str(home))
+    return home
 
 
 @dataclass
@@ -199,7 +226,7 @@ def _run(fake: FakeClaude, *, gate=None, **overrides) -> int:
     settings = mod.Settings(**{
         'claude_bin': str(fake.bin), 'model': mod.DEFAULT_MODEL, 'budget_usd': mod.DEFAULT_BUDGET_USD,
         'timeout_secs': mod.DEFAULT_TIMEOUT_SECS, 'max_turns': mod.DEFAULT_MAX_TURNS,
-        'mcp_json': mod.DEFAULT_MCP_JSON, 'root': fake.root, **overrides,
+        'mcp_json': mod.DEFAULT_MCP_JSON, 'root': fake.root, 'sandbox_backend': 'none', **overrides,
     })
     return mod.run(settings, gate=gate if gate is not None else _live_gate())
 
@@ -322,7 +349,8 @@ def test_the_child_runs_in_the_root_it_was_given(tmp_path):
 def test_main_works_in_the_root_it_is_given_and_forwards_the_cli_flags(tmp_path):
     fake = _fake_claude(tmp_path)
 
-    rc = mod.main(['--claude-bin', str(fake.bin), '--model', 'opus', '--max-turns', '17'], gate=_live_gate(), root=tmp_path)
+    rc = mod.main(['--claude-bin', str(fake.bin), '--model', 'opus', '--max-turns', '17'], gate=_live_gate(), root=tmp_path,
+                  sandbox_backend='none')
 
     call = fake.only_call()
     assert rc == mod.EXIT_OK
@@ -416,6 +444,20 @@ def test_the_only_bash_allowed_is_git_show_git_log_and_the_two_prepare_subcomman
     assert mod.PREPARE_COMMAND.endswith(' scripts/sitting/prepare_sitting.py')
 
 
+def test_every_allowed_git_read_has_its_output_flag_denied(tmp_path):
+    fake = _fake_claude(tmp_path)
+
+    _run(fake)
+
+    argv = fake.only_call()['argv']
+    allowed = _flag_values(argv, '--allowed-tools')
+    denied = _flag_values(argv, '--disallowed-tools')
+    git_reads = {match.group(1) for tool in allowed if (match := re.fullmatch(r'Bash\(git (\S+):\*\)', tool))}
+    assert git_reads
+    for sub in git_reads:
+        assert f'Bash(git {sub} *--output*)' in denied
+
+
 def test_every_allowed_mcp_tool_is_a_read():
     reads = [tool.rsplit('__', 1)[1] for tool in mod.NIGHTLY_READ_TOOLS if tool.startswith('mcp__')]
 
@@ -489,6 +531,49 @@ def test_the_child_runs_the_prepare_script_confined_to_data_sitting(tmp_path):
     assert prepare_sitting.DEFAULT_PREPARATION.parent == REPO_ROOT / 'data' / 'sitting'
 
 
+def _landlock_grants(argv: list[str]) -> set[Path]:
+    head = argv[:argv.index('--')]
+    return {Path(head[i + 1]) for i, token in enumerate(head) if token == '--writable'}
+
+
+@pytest.mark.skipif(not landlock.is_landlock_available(), reason='needs a Landlock kernel to run the fake confined')
+def test_the_cli_runs_under_landlock_writing_only_the_run_grants(tmp_path, monkeypatch, host_home):
+    spawned: list[list[str]] = []
+    real_popen = subprocess.Popen
+
+    def recording_popen(args, *rest, **kwargs):
+        spawned.append(list(args))
+        return real_popen(args, *rest, **kwargs)
+
+    monkeypatch.setattr(subprocess, 'Popen', recording_popen)
+    fake = _fake_claude(tmp_path)
+
+    assert _run(fake, sandbox_backend='landlock') == mod.EXIT_OK
+
+    [argv] = spawned
+    assert Path(argv[1]).name == 'landlock_exec.py'
+    assert argv[argv.index('--') + 1] == str(fake.bin)
+    root = tmp_path.resolve()
+    grants = _landlock_grants(argv)
+    assert grants == {root / '.task', root / 'data' / 'sitting', host_home / '.cache' / 'uv'}
+    config_dir = Path(fake.only_call()['env']['CLAUDE_CONFIG_DIR'])
+    assert config_dir.is_absolute()
+    assert any(config_dir.is_relative_to(grant) for grant in grants)
+
+
+def test_without_landlock_the_run_is_refused_even_where_bwrap_is_available(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(landlock, 'is_landlock_available', lambda: False)
+    monkeypatch.setattr(sandbox, 'is_bwrap_available', lambda: True)
+    fake = _fake_claude(tmp_path)
+    gate = _live_gate()
+
+    rc = _run(fake, gate=gate, sandbox_backend='landlock')
+
+    assert rc == mod.EXIT_CONFIG
+    assert (gate.leases, fake.calls()) == (0, [])
+    assert 'refusing to run unconfined' in capsys.readouterr().err
+
+
 # ---------------------------------------------------------------------------
 # 3. The account comes from the shared pool; the API key never rides along.
 # ---------------------------------------------------------------------------
@@ -510,13 +595,12 @@ def test_a_leased_account_supplies_the_child_env(tmp_path, monkeypatch):
     assert gate.released == ['tok-max-h'], 'the lease is handed straight back'
 
 
-@pytest.mark.parametrize('gate', [_live_gate, lambda: FakeGate([('max-b', True), ('max-h', True)])], ids=['leased', 'no-lease'])
-def test_a_proxied_shells_endpoint_selection_does_not_reach_the_child(tmp_path, monkeypatch, gate):
+def test_a_proxied_shells_endpoint_selection_does_not_reach_the_child(tmp_path, monkeypatch):
     monkeypatch.setenv('ANTHROPIC_BASE_URL', 'http://127.0.0.1:8317')
     monkeypatch.setenv('ANTHROPIC_AUTH_TOKEN', 'proxy-key')
     fake = _fake_claude(tmp_path)
 
-    assert _run(fake, gate=gate()) == mod.EXIT_OK
+    assert _run(fake, gate=_live_gate()) == mod.EXIT_OK
 
     env_has = fake.only_call()['env_has']
     assert not env_has['ANTHROPIC_BASE_URL']
@@ -541,20 +625,40 @@ def test_a_real_pool_lease_is_handed_back_before_the_run(tmp_path, monkeypatch, 
     )
 
 
-def test_no_lease_inherits_the_parent_env_and_still_runs(tmp_path, monkeypatch):
-    monkeypatch.setenv('ANTHROPIC_API_KEY', 'sk-ant-must-not-survive')
-    monkeypatch.setenv('SITTING_TEST_MARKER', 'kept')
-    monkeypatch.setenv('CLAUDE_CODE_OAUTH_TOKEN', 'ambient-login')
+def test_no_lease_skips_the_night_without_launching_the_cli(tmp_path, capsys, host_home):
+    (host_home / '.claude' / '.credentials.json').write_text('{"claudeAiOauth": {"accessToken": "host"}}')
     fake = _fake_claude(tmp_path)
     gate = FakeGate([('max-b', True), ('max-h', True)])
 
-    assert _run(fake, gate=gate) == mod.EXIT_OK
+    assert _run(fake, gate=gate) == mod.EXIT_FAILED
+
+    assert fake.calls() == []
+    assert 'skipping: the nightly never uses the host login' in capsys.readouterr().err
+    assert not list((tmp_path / 'data' / 'sitting' / 'config').iterdir())
+
+
+def test_the_entry_point_pins_landlock(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(landlock, 'is_landlock_available', lambda: False)
+    monkeypatch.setattr(sandbox, 'is_bwrap_available', lambda: True)
+    fake = _fake_claude(tmp_path)
+    gate = _live_gate()
+
+    rc = mod.main(['--claude-bin', str(fake.bin)], gate=gate, root=tmp_path)
+
+    assert rc == mod.EXIT_CONFIG
+    assert (gate.leases, fake.calls()) == (0, [])
+    assert "backend='landlock'" in capsys.readouterr().err
+
+
+def test_the_leased_token_is_the_config_dirs_login_for_the_run_only(tmp_path):
+    fake = _fake_claude(tmp_path)
+
+    assert _run(fake) == mod.EXIT_OK
 
     call = fake.only_call()
-    assert call['env']['CLAUDE_CODE_OAUTH_TOKEN'] == 'ambient-login'
-    assert call['env']['SITTING_TEST_MARKER'] == 'kept'
-    assert not call['env_has']['ANTHROPIC_API_KEY']
-    assert os.environ['ANTHROPIC_API_KEY'] == 'sk-ant-must-not-survive', 'the parent env is not mutated'
+    assert json.loads(call['credentials']) == {'claudeAiOauth': {'accessToken': 'tok-max-h'}}
+    assert call['credentials_mode'] == 0o600
+    assert not (Path(call['env']['CLAUDE_CONFIG_DIR']) / '.credentials.json').exists()
 
 
 # ---------------------------------------------------------------------------
@@ -673,7 +777,7 @@ def test_the_entry_point_runs_standalone_without_the_test_sys_path(tmp_path):
 def test_main_never_raises(tmp_path, capsys):
     fake = _fake_claude(tmp_path)
 
-    rc = mod.main(['--claude-bin', str(fake.bin)], gate=ExplodingGate(), root=tmp_path)
+    rc = mod.main(['--claude-bin', str(fake.bin)], gate=ExplodingGate(), root=tmp_path, sandbox_backend='none')
 
     assert rc == mod.EXIT_FAILED
     assert 'roster unreadable: simulated' in capsys.readouterr().err

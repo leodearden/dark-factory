@@ -133,8 +133,8 @@ class AgentRole:
                 )
 
 
-# --- Read-only tools for analysis roles ---
-_READ_ONLY_TOOLS = ['Read', 'Glob', 'Grep', 'Bash(git:*)']
+# --- Tools offered to analysis roles (advisory under bypassPermissions; not read-only) ---
+_ANALYSIS_TOOLS = ['Read', 'Glob', 'Grep', 'Bash(git:*)']
 
 # --- jCodeMunch tools for structured code retrieval ---
 _JCODEMUNCH_TOOLS = ['mcp__jcodemunch__*']
@@ -1240,7 +1240,7 @@ def build_reviewer_role(
     return AgentRole(
         name=f'reviewer_{name}',
         system_prompt=spec.in_code_constant,
-        allowed_tools=[*_READ_ONLY_TOOLS, *_VERDICT_TOOLS],
+        allowed_tools=[*_ANALYSIS_TOOLS, *_VERDICT_TOOLS],
         disallowed_tools=['Edit', 'Write', *_NO_TASK_STATUS_WRITE],
         default_model='sonnet',
         default_budget=2.0,
@@ -1349,7 +1349,7 @@ Submit your verdict by calling submit_completion_verdict(complete,
 reasoning, uncovered_plan_steps, substantive_work). Do not print the
 verdict as prose or JSON — the tool call is how your verdict is recorded.
 """,
-    allowed_tools=[*_READ_ONLY_TOOLS, *_JCODEMUNCH_TOOLS, *_VERDICT_TOOLS],
+    allowed_tools=[*_ANALYSIS_TOOLS, *_JCODEMUNCH_TOOLS, *_VERDICT_TOOLS],
     disallowed_tools=['Edit', 'Write', *_NO_TASK_STATUS_WRITE],
     default_model='sonnet',
     default_budget=0.50,
