@@ -112,46 +112,82 @@ def read_server_runtime(env: Mapping[str, str]) -> Mapping[str, Any] | None:
 # ---------------------------------------------------------------------------
 
 
+def _detail_field(detail: str | None) -> dict[str, str]:
+    return {} if detail is None else {'detail': detail}
+
+
 @dataclass(frozen=True)
 class NoLauncher:
     """No MCP session with T3: server-runtime.json names no usable origin, or connecting failed."""
 
-    reason: str
+    reason: RuntimeOriginFailure | t3_mcp_client.ConnectFailure | t3_mcp_client.DescriptorFailure
     detail: str | None = None
 
     def verdict(self) -> str:
-        return _verdict('no-launcher', reason=self.reason, **({} if self.detail is None else {'detail': self.detail}))
+        credential_fault = isinstance(self.reason, t3_mcp_client.ConnectFailure)
+        word = f't3-mcp-{self.reason.value}' if credential_fault else self.reason.value
+        return _verdict('no-launcher', reason=word, **_detail_field(self.detail))
 
 
-_NO_LAUNCHER_REASON: Mapping[t3_mcp_client.ConnectFailure | t3_mcp_client.DescriptorFailure, str] = {
-    **{failure: f't3-mcp-{failure.value}' for failure in t3_mcp_client.ConnectFailure},
-    **{failure: failure.value for failure in t3_mcp_client.DescriptorFailure},
-}
+class PlacementRefusal(StrEnum):
+    PROJECT_ARCHIVED = 'project-archived'
+    CWD_OUTSIDE_PROJECTS = 'cwd-outside-projects'
+    CWD_NOT_PROJECT_WORKTREE = 'cwd-not-project-worktree'
 
 
-def _connect(env: Mapping[str, str]) -> t3_mcp_client.T3McpClient | NoLauncher:
-    """A client on this host's credential, self-pairing through the ``t3`` CLI when it has none."""
+@dataclass(frozen=True)
+class Refused:
+    """No live T3 project hosts a thread in this cwd."""
+
+    reason: PlacementRefusal
+    detail: str | None = None
+
+    def verdict(self) -> str:
+        return _verdict('refused', reason=self.reason.value, **_detail_field(self.detail))
+
+
+@dataclass(frozen=True)
+class LaunchFailed:
+    detail: str
+
+    def verdict(self) -> str:
+        return _verdict('launch-failed', detail=self.detail)
+
+
+NotLaunched = NoLauncher | Refused | LaunchFailed
+
+
+def _connect(
+    env: Mapping[str, str], repair: t3_mcp_client.CodeSource | None
+) -> t3_mcp_client.T3McpClient | NoLauncher:
+    """A client on this host's credential, self-pairing through *repair* when it has none."""
     origin = _runtime_origin(env)
     if isinstance(origin, RuntimeOriginFailed):
-        return NoLauncher(origin.reason.value, origin.detail)
-    connected = t3_mcp_client.connect(origin, repair=t3_mcp_client.CliCodeSource())
+        return NoLauncher(origin.reason, origin.detail)
+    connected = t3_mcp_client.connect(origin, repair=repair)
     if isinstance(connected, t3_mcp_client.ConnectFailed):
-        return NoLauncher(_NO_LAUNCHER_REASON[connected.reason], connected.detail)
+        return NoLauncher(connected.reason, connected.detail)
     return connected
 
 
 class _Session:
-    """One verb's MCP client across its polls, connected again on the poll after a failed connect."""
+    """One verb's MCP client across its polls, connected again on the poll after a failed connect.
+
+    A self-pair that failed is not tried again: each try mints a pairing code.
+    """
 
     def __init__(self, env: Mapping[str, str]) -> None:
         self._env = env
         self._client: t3_mcp_client.T3McpClient | None = None
+        self._repair: t3_mcp_client.CodeSource | None = t3_mcp_client.CliCodeSource()
 
     def client(self) -> t3_mcp_client.T3McpClient | None:
         if self._client is None:
-            connected = _connect(self._env)
+            connected = _connect(self._env, self._repair)
             if isinstance(connected, NoLauncher):
                 logger.warning(f'cannot reach T3 over MCP: {connected.verdict()}')
+                if connected.reason is t3_mcp_client.ConnectFailure.PAIR_FAILED:
+                    self._repair = None
                 return None
             self._client = connected
         return self._client
@@ -198,9 +234,14 @@ def _is_new_cursor(cursor: object, seen: Sequence[int]) -> TypeGuard[int | None]
 def _paged(
     client: t3_mcp_client.T3McpClient, tool: str, arguments: Mapping[str, Any], key: str
 ) -> list[Mapping[str, Any]] | Incomplete:
-    """Every item of a cursor-paged listing, or Incomplete when any page fails or is malformed."""
+    """Every item of a cursor-paged listing, or Incomplete when any page fails or is malformed.
+
+    T3 pages by offset, so a listing whose reported ``total`` moved between
+    pages, or that collected other than ``total`` items, may have skipped one.
+    """
     items: list[Mapping[str, Any]] = []
     cursors: list[int] = []
+    totals: set[object] = set()
     while True:
         page_arguments = {**arguments, 'limit': PAGE_LIMIT, **({'cursor': cursors[-1]} if cursors else {})}
         reply = client.call(tool, page_arguments, read_timeout=CALL_TIMEOUT_SECS)
@@ -210,16 +251,17 @@ def _paged(
         if not isinstance(page, list) or not _is_new_cursor(cursor, cursors):
             return Incomplete(f'{tool}: a malformed page')
         items.extend(item for item in page if isinstance(item, Mapping))
+        totals.add(reply.value.get('total'))
         if cursor is None:
-            return items
+            return items if totals in ({None}, {len(items)}) else Incomplete(f'{tool}: the listing moved while paged')
         cursors.append(cursor)
 
 
-def _failed_call_verdict(failed: Incomplete) -> str:
+def _failed_call(failed: Incomplete) -> NoLauncher | LaunchFailed:
     transport = failed.transport
     if transport is not None and transport.fault is t3_mcp_client.TransportFault.CREDENTIAL_EXPIRED:
-        return NoLauncher('t3-mcp-credential-expired', transport.detail).verdict()
-    return _verdict('launch-failed', detail=failed.detail)
+        return NoLauncher(t3_mcp_client.ConnectFailure.CREDENTIAL_EXPIRED, transport.detail)
+    return LaunchFailed(failed.detail)
 
 
 @dataclass(frozen=True)
@@ -237,26 +279,23 @@ class T3Project:
         return cls(project_id, root, archived=item.get('archivedAt') is not None)
 
 
-def _projects(client: t3_mcp_client.T3McpClient) -> list[T3Project] | Incomplete:
+def _target_project(client: t3_mcp_client.T3McpClient, cwd: str) -> T3Project | NotLaunched:
+    """The live project of T3's whole project list that a thread for *cwd* runs in."""
     listed = _paged(client, 't3_project_list', {}, 'projects')
     if isinstance(listed, Incomplete):
-        return listed
-    return [project for project in map(T3Project.from_json, listed) if project is not None]
-
-
-def _target_project(cwd: str, projects: Sequence[T3Project]) -> T3Project | str:
-    """The live project a thread for *cwd* runs in, else the refusal verdict."""
+        return _failed_call(listed)
+    projects = [project for project in map(T3Project.from_json, listed) if project is not None]
     live = containing_project(cwd, [project for project in projects if not project.archived])
     if live is not None:
         return live
     archived = containing_project(cwd, [project for project in projects if project.archived])
     if archived is not None:
-        return _verdict('refused', reason='project-archived', detail=os.path.realpath(archived.workspace_root))
-    return _verdict('refused', reason='cwd-outside-projects')
+        return Refused(PlacementRefusal.PROJECT_ARCHIVED, os.path.realpath(archived.workspace_root))
+    return Refused(PlacementRefusal.CWD_OUTSIDE_PROJECTS)
 
 
 def containing_project(cwd: str, projects: Sequence[T3Project]) -> T3Project | None:
-    """The project ``t3`` resolves *cwd* into: the deepest real root containing it."""
+    """The deepest project whose real workspace root contains *cwd*."""
     target = os.path.realpath(cwd)
     containing = [
         project
@@ -427,17 +466,17 @@ def _send_launch(client: t3_mcp_client.T3McpClient, arguments: Mapping[str, Any]
     return reply
 
 
-def _launch_outcome(reply: t3_mcp_client.CallResult, strategy: WorkspaceStrategy) -> LaunchedThread | str:
-    """The launched thread, else the verdict line; T3, not the lane, judges whether a worktree is the project's."""
+def _launch_outcome(reply: t3_mcp_client.CallResult, strategy: WorkspaceStrategy) -> LaunchedThread | NotLaunched:
+    """The launched thread, else why none is; T3, not the lane, judges whether a worktree is the project's."""
     if isinstance(reply, t3_mcp_client.ToolFailed):
         if reply.code == 'invalid_request' and strategy.binds_worktree:
-            return _verdict('refused', reason='cwd-not-project-worktree', detail=reply.message)
-        return _verdict('launch-failed', detail=f'{reply.code}: {reply.message}')
+            return Refused(PlacementRefusal.CWD_NOT_PROJECT_WORKTREE, reply.message)
+        return LaunchFailed(f'{reply.code}: {reply.message}')
     if isinstance(reply, t3_mcp_client.TransportFailed):
-        return _failed_call_verdict(_incomplete('t3_thread_launch', reply))
+        return _failed_call(_incomplete('t3_thread_launch', reply))
     thread_id = reply.value.get('threadId')
     if not isinstance(thread_id, str) or not thread_id:
-        return _verdict('launch-failed', detail='t3_thread_launch answered no threadId')
+        return LaunchFailed('t3_thread_launch answered no threadId')
     return LaunchedThread(thread_id, reply.value.get('projectId'), reply.value.get('runId'))
 
 
@@ -479,13 +518,12 @@ def provider_instance(
 
 
 def _live_project_softly(cwd: str, env: Mapping[str, str]) -> T3Project | None:
-    client = _connect(env)
-    projects = client if isinstance(client, NoLauncher) else _projects(client)
-    project = projects if isinstance(projects, NoLauncher | Incomplete) else _target_project(cwd, projects)
-    if not isinstance(project, T3Project):
-        logger.warning(f'provider enablement is checked environment-wide: {project}')
-        return None
-    return project
+    client = _connect(env, t3_mcp_client.CliCodeSource())
+    project = client if isinstance(client, NoLauncher) else _target_project(client, cwd)
+    if isinstance(project, T3Project):
+        return project
+    logger.warning(f'provider enablement is checked environment-wide: {project.verdict()}')
+    return None
 
 
 def _provider_for(
@@ -514,15 +552,12 @@ def launch(
     parent: str | None = None,
     skip_permissions: bool,
 ) -> str:
-    client = _connect(env)
+    client = _connect(env, t3_mcp_client.CliCodeSource())
     if isinstance(client, NoLauncher):
         return client.verdict()
-    projects = _projects(client)
-    if isinstance(projects, Incomplete):
-        return _failed_call_verdict(projects)
-    project = _target_project(cwd, projects)
-    if isinstance(project, str):
-        return project
+    project = _target_project(client, cwd)
+    if not isinstance(project, T3Project):
+        return project.verdict()
     choice = _provider_for(project, provider, env)
     if model and choice.enabled is False:
         return _provider_verdict(choice)
@@ -541,8 +576,8 @@ def launch(
         request_id=str(uuid.uuid4()),
     )
     launched = _launch_outcome(_send_launch(client, arguments), strategy)
-    if isinstance(launched, str):
-        return launched
+    if not isinstance(launched, LaunchedThread):
+        return launched.verdict()
     if record_dir:
         _stamp_launched_record(record_dir, title, launched, client.environment_id, _usable_parent(parent))
     return _verdict(

@@ -615,6 +615,21 @@ class TestLaunch:
         assert len(t3.tool_calls('t3_thread_list')) == 2
         assert sr.read_record(Path(stale_dir).name, root=env.fleet).status == sr.Status.LAUNCHING
 
+    def test_a_thread_listing_whose_total_moves_between_pages_sweeps_nothing(
+        self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """T3 pages by offset: a thread archived between the reads shifts the record's live thread past page 2."""
+        record_dir = stale_t3_record(env)
+        t3.tool_replies['t3_thread_list'] = replies_in_turn(
+            ToolSuccess({**THREAD_LIST_JSON, 'threads': [{'threadId': 'th-archived'}], 'nextCursor': 1, 'total': 2}),
+            ToolSuccess({**THREAD_LIST_JSON, 'threads': [], 'total': 1}),
+        )
+
+        line = launch_line(capsys, tmp_path, env.project)
+
+        assert line.startswith('started ')
+        assert sr.read_record(Path(record_dir).name, root=env.fleet).status == sr.Status.LAUNCHING
+
     def test_a_prompt_over_the_ceiling_is_spilled_into_the_record_dir(
         self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
@@ -704,7 +719,7 @@ class TestProjectResolution:
 
         line = launch_line(capsys, tmp_path, paged.archived / 'sub', record=record_dir)
 
-        assert line == lane._verdict('refused', reason='project-archived', detail=os.path.realpath(paged.archived))
+        assert line == f'refused reason=project-archived detail={os.path.realpath(paged.archived)}'
         assert t3.tool_calls('t3_thread_launch') == []
         assert sr.read_record(Path(record_dir).name, root=env.fleet).display is None
 
@@ -755,13 +770,12 @@ class TestLaunchFailures:
     ) -> None:
         worktree = env.project / '.worktrees' / '8123'
         worktree.mkdir(parents=True)
-        message = 'The request was rejected.'
-        t3.tool_replies['t3_thread_launch'] = ToolFailure('invalid_request', message)
+        t3.tool_replies['t3_thread_launch'] = ToolFailure('invalid_request', 'The request was rejected.')
         record_dir = spawn_record(env)
 
         line = launch_line(capsys, tmp_path, worktree, record=record_dir)
 
-        assert line == lane._verdict('refused', reason='cwd-not-project-worktree', detail=message)
+        assert line == 'refused reason=cwd-not-project-worktree detail=The%20request%20was%20rejected.'
         record = sr.read_record(Path(record_dir).name, root=env.fleet)
         assert (record.display, record.status) == (None, sr.Status.LAUNCHING)
         assert len(t3.tool_calls('t3_thread_launch')) == 1
@@ -769,13 +783,14 @@ class TestLaunchFailures:
     def test_an_invalid_root_launch_is_launch_failed_whatever_its_message_says(
         self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        message = "Path '/x' is not a worktree of this project."
-        t3.tool_replies['t3_thread_launch'] = ToolFailure('invalid_request', message)
+        t3.tool_replies['t3_thread_launch'] = ToolFailure('invalid_request', "Path '/x' is not a worktree of this project.")
         record_dir = spawn_record(env)
 
         line = launch_line(capsys, tmp_path, env.project, record=record_dir)
 
-        assert line == lane._verdict('launch-failed', detail=f'invalid_request: {message}')
+        assert line == (
+            'launch-failed detail=invalid_request:%20Path%20%27/x%27%20is%20not%20a%20worktree%20of%20this%20project.'
+        )
         assert sr.read_record(Path(record_dir).name, root=env.fleet).display is None
 
     def test_another_failure_of_a_worktree_launch_is_launch_failed(
@@ -787,7 +802,7 @@ class TestLaunchFailures:
 
         line = launch_line(capsys, tmp_path, worktree)
 
-        assert line == lane._verdict('launch-failed', detail='orchestration_error: the provider is down')
+        assert line == 'launch-failed detail=orchestration_error:%20the%20provider%20is%20down'
 
     def test_a_lost_reply_is_resent_once_with_the_same_request_id(
         self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -1295,6 +1310,16 @@ class TestWait:
         assert wait_for(env, '', clock) == 'finished code=126'
         assert clock.now > lane.UNREACHABLE_GRACE_SECS
         assert set(clock.sleeps) == {lane.SETTLED_RECHECK_SECS}
+
+    def test_a_self_pair_that_fails_is_not_retried_on_later_passes(
+        self, env: Env, t3: FakeT3Server, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        forget_credential(env)
+        put_fake_t3_cli_on_path(t3, tmp_path, monkeypatch, version_line='t3 v0.1.6')
+        t3.decision_state_override = 'forged'
+
+        assert wait_for(env, '', FakeClock()) == 'finished code=126'
+        assert len(t3.issued_pairing_codes()) == 1
 
     def test_a_stalled_thread_read_counts_as_unreachable_for_that_pass(
         self, env: Env, t3: FakeT3Server, stalling: StallThen, monkeypatch: pytest.MonkeyPatch
