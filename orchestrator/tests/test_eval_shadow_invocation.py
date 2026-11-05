@@ -8,6 +8,7 @@ backend. Strict MCP and the null memory sentinel are inherited from
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
@@ -21,7 +22,11 @@ from orchestrator.evals import runner
 from orchestrator.evals.configs import EvalConfig
 from orchestrator.evals.live_fixture import build_live_fixture
 from orchestrator.evals.runner import build_eval_orch_config, run_end_to_end, run_eval
-from orchestrator.evals.shadow_invocation import build_shadow_orch_config
+from orchestrator.evals.shadow_invocation import (
+    build_shadow_orch_config,
+    run_shadow_end_to_end,
+    run_shadow_eval,
+)
 from orchestrator.fm_retry import FM_NULL_SENTINEL_URL
 
 _IMPL = EvalConfig('probe', 'claude', 'sonnet', 'high')
@@ -185,10 +190,10 @@ async def test_run_end_to_end_builds_the_cell_config_with_the_injected_builder(
     }]
 
 
-async def _workflow_config_run_eval_builds(
-    tmp_path: Path, monkeypatch, **builder: Any,
+async def _workflow_config_built_by(
+    tmp_path: Path, monkeypatch, run: Callable[[OrchestratorConfig], Awaitable[object]],
 ) -> OrchestratorConfig:
-    """The OrchestratorConfig ``run_eval`` hands ``build_workflow`` for a shadow fixture."""
+    """The OrchestratorConfig *run* hands ``build_workflow`` for a shadow fixture."""
     captured: dict[str, Any] = {}
 
     def stop_at_build_workflow(**kwargs: Any):
@@ -196,13 +201,13 @@ async def _workflow_config_run_eval_builds(
         raise _Sentinel
 
     monkeypatch.setattr(runner, 'load_task', lambda _path: _shadow_fixture(tmp_path))
+    monkeypatch.setattr(
+        runner, 'create_eval_worktree', AsyncMock(return_value=(tmp_path / 'wt', 'run-shadow')),
+    )
     monkeypatch.setattr(runner, 'build_workflow', stop_at_build_workflow)
 
     with pytest.raises(_Sentinel):
-        await run_eval(
-            tmp_path / 'task.json', _IMPL, OrchestratorConfig(project_root=tmp_path),
-            worktree_path=tmp_path, usage_gate=None, **builder,
-        )
+        await run(OrchestratorConfig(project_root=tmp_path))
 
     return captured['config']
 
@@ -211,8 +216,12 @@ async def _workflow_config_run_eval_builds(
 async def test_run_eval_under_the_shadow_builder_runs_its_cell_sandboxed(
     tmp_path: Path, monkeypatch,
 ) -> None:
-    config = await _workflow_config_run_eval_builds(
-        tmp_path, monkeypatch, orch_config_builder=build_shadow_orch_config,
+    config = await _workflow_config_built_by(
+        tmp_path, monkeypatch,
+        lambda base: run_eval(
+            tmp_path / 'task.json', _IMPL, base, worktree_path=tmp_path, usage_gate=None,
+            orch_config_builder=build_shadow_orch_config,
+        ),
     )
 
     assert config.sandbox.enabled is True
@@ -220,6 +229,38 @@ async def test_run_eval_under_the_shadow_builder_runs_its_cell_sandboxed(
 
 @pytest.mark.asyncio
 async def test_run_eval_by_default_runs_its_cell_unsandboxed(tmp_path: Path, monkeypatch) -> None:
-    config = await _workflow_config_run_eval_builds(tmp_path, monkeypatch)
+    config = await _workflow_config_built_by(
+        tmp_path, monkeypatch,
+        lambda base: run_eval(
+            tmp_path / 'task.json', _IMPL, base, worktree_path=tmp_path, usage_gate=None,
+        ),
+    )
 
     assert config.sandbox.enabled is False
+
+
+@pytest.mark.asyncio
+async def test_run_shadow_eval_runs_its_cell_sandboxed(tmp_path: Path, monkeypatch) -> None:
+    config = await _workflow_config_built_by(
+        tmp_path, monkeypatch,
+        lambda base: run_shadow_eval(
+            tmp_path / 'task.json', _IMPL, base, worktree_path=tmp_path, usage_gate=None,
+        ),
+    )
+
+    assert config.sandbox.enabled is True
+
+
+@pytest.mark.asyncio
+async def test_run_shadow_end_to_end_runs_its_cell_sandboxed(tmp_path: Path, monkeypatch) -> None:
+    architect = EvalConfig('arch', 'claude', 'opus', 'high')
+
+    config = await _workflow_config_built_by(
+        tmp_path, monkeypatch,
+        lambda base: run_shadow_end_to_end(
+            tmp_path / 'task.json', architect, _IMPL, base, usage_gate=None,
+        ),
+    )
+
+    assert config.sandbox.enabled is True
+    assert config.models.architect == 'opus'

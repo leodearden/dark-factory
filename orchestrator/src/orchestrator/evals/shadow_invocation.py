@@ -1,4 +1,4 @@
-"""The invocation profile a live shadow cell runs under.
+"""The invocation profile a live shadow cell runs under, and the only entry points that run one.
 
 Leaf δ of ``plans/live-shadow-eval-prd.md`` (task 5386). The probe that refuses
 a cell until this profile isolates is ``evals/shadow_isolation.py``.
@@ -6,13 +6,17 @@ a cell until this profile isolates is ``evals/shadow_isolation.py``.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from shared.eval_lane import SHADOW_FIXTURE_ID_RE
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.evals.configs import EvalConfig
-from orchestrator.evals.runner import build_eval_orch_config
+from orchestrator.evals.eval_gate import GATE_UNSET, InjectedGate
+from orchestrator.evals.results import EvalResult, ResultStore
+from orchestrator.evals.runner import build_eval_orch_config, run_end_to_end, run_eval
 
-__all__ = ['build_shadow_orch_config']
+__all__ = ['build_shadow_orch_config', 'run_shadow_end_to_end', 'run_shadow_eval']
 
 
 def build_shadow_orch_config(
@@ -48,4 +52,42 @@ def build_shadow_orch_config(
     assert base_config is not None, 'build_eval_orch_config refuses a None base_config'
     return evaled.model_copy(
         update={'sandbox': base_config.sandbox.model_copy(update={'enabled': True})},
+    )
+
+
+async def run_shadow_eval(
+    task_path: Path,
+    config: EvalConfig,
+    base_config: OrchestratorConfig,
+    *,
+    trial: int = 1,
+    timeout_override: int | None = None,
+    worktree_path: Path | None = None,
+    judge_config: EvalConfig | None = None,
+    usage_gate: InjectedGate = GATE_UNSET,
+    store: ResultStore | None = None,
+) -> EvalResult:
+    """``run_eval`` with its cell config built by ``build_shadow_orch_config``."""
+    return await run_eval(
+        task_path, config, base_config, trial, timeout_override, worktree_path,
+        judge_config=judge_config, usage_gate=usage_gate, store=store,
+        orch_config_builder=build_shadow_orch_config,
+    )
+
+
+async def run_shadow_end_to_end(
+    task_path: Path,
+    arch_config: EvalConfig,
+    impl_config: EvalConfig,
+    base_config: OrchestratorConfig,
+    *,
+    trial: int = 1,
+    timeout_override: int | None = None,
+    usage_gate: InjectedGate = GATE_UNSET,
+    store: ResultStore | None = None,
+) -> EvalResult:
+    """``run_end_to_end`` with its cell config built by ``build_shadow_orch_config``."""
+    return await run_end_to_end(
+        task_path, arch_config, impl_config, base_config, trial, timeout_override,
+        usage_gate=usage_gate, store=store, orch_config_builder=build_shadow_orch_config,
     )
