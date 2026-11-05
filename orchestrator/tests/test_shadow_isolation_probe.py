@@ -17,16 +17,17 @@ from shared.cost_store import CostStore
 from shared.eval_lane import is_eval_fixture_task_id
 
 from orchestrator.agents.roles import IMPLEMENTER, ROLES
+from orchestrator.agents.sandbox_dispatch import Backend
 from orchestrator.config import OrchestratorConfig
 from orchestrator.evals.configs import EvalConfig
 from orchestrator.evals.live_fixture import build_live_fixture
 from orchestrator.evals.profile import apply_eval_profile
 from orchestrator.evals.runner import build_eval_orch_config
-from orchestrator.evals.shadow_invocation import (
+from orchestrator.evals.shadow_invocation import build_shadow_orch_config
+from orchestrator.evals.shadow_isolation import (
     IsolationGap,
     LegDispatch,
     LegInvocation,
-    build_shadow_orch_config,
     probe_isolation,
     shadow_isolation_available,
     shadow_leg_invocations,
@@ -42,11 +43,11 @@ _IMPL = EvalConfig('probe', 'claude', 'sonnet', 'high')
 _SANDBOXED_ROLES = {role.name for role in ROLES.values() if role.sandboxed}
 
 
-def _landlock() -> str:
+def _landlock() -> Backend:
     return 'landlock'
 
 
-def _no_backend() -> str:
+def _no_backend() -> Backend:
     return 'none'
 
 
