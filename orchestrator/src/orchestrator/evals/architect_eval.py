@@ -294,12 +294,12 @@ class _ArchitectCall:
                 f'Architect eval {self.label}',
                 invoke_fn=timed_attempt,
                 backend=self.config.backend,
-                **_architect_invocation(self.task, self.config, prompt, self.worktree),
+                **architect_invocation(self.task, self.config, prompt, self.worktree),
             )
         return result, artifacts
 
 
-def _architect_invocation(
+def architect_invocation(
     task: dict, config: EvalConfig, prompt: str, worktree: Path,
 ) -> dict[str, Any]:
     """This candidate's architect invocation, scoped to plan-tools alone."""
