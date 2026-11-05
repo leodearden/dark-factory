@@ -27,6 +27,7 @@ from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import (
+    CANCEL_PROBE_INTERVAL_SECS,
     GIT_PUSH_SSH_CONFIG,
     HEARTBEAT_STOP_JOIN_SECS,
     LocalRunner,
@@ -36,6 +37,7 @@ from orchestrator.verify_runner import (
     VerifyCommand,
     VerifyRunner,
     VerifyRunnerPool,
+    poll_until_clean,
     result_from_dict,
     result_from_json,
     result_to_dict,
@@ -7250,7 +7252,7 @@ class TestRemoteRunnerMainBranchPush:
 
 @pytest.mark.asyncio
 class TestRemoteRunnerRequestId:
-    """run_merge_verify passes --request-id <id> appended to the ssh argv."""
+    """run_merge_verify passes --request-id <id> in the ssh argv, ahead of --spec."""
 
     def _make_runner_and_calls(self, *, config_path=None):
         """Return (runner, calls) where calls tracks (argv, cwd) pairs."""
@@ -7275,7 +7277,7 @@ class TestRemoteRunnerRequestId:
         return runner, calls
 
     async def test_request_id_in_remote_cmd(self):
-        """ssh remote command contains --request-id fixed-id (appended)."""
+        """ssh remote command contains --request-id fixed-id."""
 
         runner, calls = self._make_runner_and_calls()
         await runner.run_merge_verify('abc123', _make_spec())
@@ -7317,31 +7319,18 @@ class TestRemoteRunnerRequestId:
         parsed = gate_argv(ssh_call[0][-1])
         assert parsed[:3] == ['verify-merge', '--sha', 'abc123']
 
-    async def test_request_id_appended_after_spec(self):
-        """--request-id appears after --spec (appended at end)."""
+    @pytest.mark.parametrize('config_path', [None, '/etc/orch.yaml'])
+    async def test_request_id_precedes_the_spec_and_the_config(self, config_path):
+        """--request-id follows --sha, ahead of the unbounded --spec JSON, so the
+        cancel probe's pgrep finds it inside a 4096-byte command-line read."""
 
-        runner, calls = self._make_runner_and_calls()
+        runner, calls = self._make_runner_and_calls(config_path=config_path)
         await runner.run_merge_verify('abc123', _make_spec())
 
         ssh_call = next(c for c in calls if c[0][0] == 'ssh')
         parsed = gate_argv(ssh_call[0][-1])
 
-        spec_idx = parsed.index('--spec')
-        rid_idx = parsed.index('--request-id')
-        assert rid_idx > spec_idx, '--request-id must be appended after --spec'
-
-    async def test_request_id_with_config_path(self):
-        """--request-id is still appended after --config when config_path is set."""
-
-        runner, calls = self._make_runner_and_calls(config_path='/etc/orch.yaml')
-        await runner.run_merge_verify('abc123', _make_spec())
-
-        ssh_call = next(c for c in calls if c[0][0] == 'ssh')
-        parsed = gate_argv(ssh_call[0][-1])
-
-        cfg_idx = parsed.index('--config')
-        rid_idx = parsed.index('--request-id')
-        assert rid_idx > cfg_idx, '--request-id must come after --config'
+        assert parsed[:6] == ['verify-merge', '--sha', 'abc123', '--request-id', 'fixed-id', '--spec']
 
     async def test_dispatch_not_in_flight_after_exception(self):
         """The dispatch is no longer in flight after RunnerUnavailable (cleared in the finally)."""
@@ -7432,8 +7421,8 @@ class TestRemoteRunnerCancelVerify:
         )
         return runner, calls
 
-    async def _cancel_mid_verify(self, *, config_path=None, cancel_rc=0):
-        """Cancel a real dispatch while its verify ssh is held; return (cancel rc, recorded argvs)."""
+    async def _cancel_mid_verify(self, *, config_path=None, cancel_rc=0, probe_rc=1, probe_error=None):
+        """Cancel a real dispatch while its verify ssh is held; return (cancel rc, recorded argvs, runner)."""
         from orchestrator.verify_runner import RunnerUnavailable
 
         calls: list[list[str]] = []
@@ -7446,7 +7435,9 @@ class TestRemoteRunnerCancelVerify:
             if 'cancel-verify' in argv[-1]:
                 return (cancel_rc, '', '')
             if 'pgrep' in argv[-1]:
-                return (1, '', '')
+                if probe_error is not None:
+                    raise probe_error
+                return (probe_rc, '', '')
             entered.set()
             await release.wait()
             return (137, '', 'Killed')
@@ -7466,7 +7457,7 @@ class TestRemoteRunnerCancelVerify:
         release.set()
         with pytest.raises(RunnerUnavailable):
             await dispatch
-        return rc, calls
+        return rc, calls, runner
 
     @staticmethod
     def _cancel_ssh_calls(calls):
@@ -7483,7 +7474,7 @@ class TestRemoteRunnerCancelVerify:
     async def test_cancel_verify_issues_correct_argv(self):
         """cancel_verify() issues ssh BatchMode/ConnectTimeout cancel-verify --request-id."""
 
-        _, calls = await self._cancel_mid_verify(cancel_rc=0)
+        _, calls, _ = await self._cancel_mid_verify(cancel_rc=0)
 
         ssh_calls = self._cancel_ssh_calls(calls)
         assert len(ssh_calls) == 1
@@ -7501,7 +7492,7 @@ class TestRemoteRunnerCancelVerify:
     async def test_cancel_verify_appends_config_when_set(self):
         """cancel_verify() appends --config <path> when config_path is set."""
 
-        _, calls = await self._cancel_mid_verify(config_path='/etc/orch.yaml', cancel_rc=0)
+        _, calls, _ = await self._cancel_mid_verify(config_path='/etc/orch.yaml', cancel_rc=0)
 
         ssh_calls = self._cancel_ssh_calls(calls)
         remote_cmd = ssh_calls[0][-1]
@@ -7511,12 +7502,19 @@ class TestRemoteRunnerCancelVerify:
 
     async def test_cancel_verify_returns_ssh_rc(self):
         """cancel_verify() returns the ssh return code."""
-        rc, _ = await self._cancel_mid_verify(cancel_rc=1)
+        rc, _, _ = await self._cancel_mid_verify(cancel_rc=1)
         assert rc == 1
 
+    async def test_probe_clean_without_a_cancel_issues_no_ssh(self):
+        """probe_clean() with nothing cancelled → True with no ssh at all."""
+        runner, calls = self._make_runner_and_calls(probe_rc=0)
+        assert await runner.probe_clean() is True
+        assert calls == []
+
     async def test_probe_clean_true_when_pgrep_rc_is_1(self):
-        """probe_clean() issues ssh pgrep -f verify-merge; rc==1 (no match) → True."""
-        runner, calls = self._make_runner_and_calls(probe_rc=1)
+        """probe_clean() pgreps the cancelled request's verify; rc==1 (no match) → True."""
+        _, calls, runner = await self._cancel_mid_verify(cancel_rc=1, probe_rc=1)
+        calls.clear()
         result = await runner.probe_clean()
         assert result is True
 
@@ -7524,31 +7522,26 @@ class TestRemoteRunnerCancelVerify:
         assert len(ssh_calls) == 1
         remote_cmd = ssh_calls[0][-1]
         assert 'pgrep' in remote_cmd
+        assert 'req-42' in remote_cmd
         assert 'verify-merge' in remote_cmd
+        assert 'verify-task' in remote_cmd
 
     async def test_probe_clean_false_when_pgrep_rc_is_0(self):
-        """probe_clean() rc==0 (process running) → False."""
-        runner, calls = self._make_runner_and_calls(probe_rc=0)
+        """probe_clean() rc==0 (the cancelled request still runs) → False."""
+        _, _, runner = await self._cancel_mid_verify(cancel_rc=1, probe_rc=0)
         result = await runner.probe_clean()
         assert result is False
 
     async def test_probe_clean_false_when_pgrep_rc_is_2(self):
         """probe_clean() rc>=2 (error) → False (conservative: stay parked)."""
-        runner, _ = self._make_runner_and_calls(probe_rc=2)
+        _, _, runner = await self._cancel_mid_verify(cancel_rc=1, probe_rc=2)
         result = await runner.probe_clean()
         assert result is False
 
     async def test_probe_clean_false_on_oserror(self):
         """probe_clean() on OSError → False (fail-safe)."""
-        async def raising_run(argv, *, cwd=None):
-            raise OSError('connection refused')
-
-        runner = gated_remote_runner(
-            name='laptop',
-            ssh_host='laptop.local',
-            git_remote='origin',
-            cwd='/repo',
-            run=raising_run,
+        _, _, runner = await self._cancel_mid_verify(
+            cancel_rc=1, probe_error=OSError('connection refused'),
         )
         result = await runner.probe_clean()
         assert result is False
@@ -9412,6 +9405,42 @@ class TestRemoteRunnerMainPushMirror:
         result = await runner.run_merge_verify('abc123', _make_spec(), event_store=None)
         assert result == expected
         assert '+main:refs/heads/main' in _push_refspecs(calls)
+
+
+@pytest.mark.asyncio
+class TestPollUntilClean:
+    """The one cancel-probe loop the merge allocator and the task host pool share."""
+
+    @staticmethod
+    def _probe(*answers: bool):
+        reads = iter(answers)
+        probes: list[int] = []
+
+        async def probe() -> bool:
+            probes.append(1)
+            return next(reads)
+
+        return probe, probes
+
+    async def test_polls_interval_apart_with_no_sleep_after_the_last(self):
+        probe, probes = self._probe(False, False, False)
+        slept: list[float] = []
+
+        async def sleep(secs: float) -> None:
+            slept.append(secs)
+
+        assert await poll_until_clean(probe, attempts=3, sleep=sleep) is False
+        assert (len(probes), slept) == (3, [CANCEL_PROBE_INTERVAL_SECS] * 2)
+
+    async def test_stops_at_the_first_clean_read(self):
+        probe, probes = self._probe(False, True, False)
+        slept: list[float] = []
+
+        async def sleep(secs: float) -> None:
+            slept.append(secs)
+
+        assert await poll_until_clean(probe, attempts=3, sleep=sleep) is True
+        assert (len(probes), len(slept)) == (2, 1)
 
 
 def _raw_recording_runner(inner):
