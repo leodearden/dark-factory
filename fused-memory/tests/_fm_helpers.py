@@ -27,7 +27,7 @@ import types
 import uuid
 import warnings
 import weakref
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
@@ -2091,14 +2091,42 @@ def _lease_dir_env() -> str:
 def isolated_lease_dir(monkeypatch, directory: pathlib.Path) -> pathlib.Path:
     """Point the reaper's lease directory at *directory*, through *monkeypatch*.
 
-    The one mechanism behind `lease_dir_fixture`, for callers that need the
-    same isolation outside a function-scoped test: a module-scoped fixture is
-    set up BEFORE the autouse `lease_dir` fixture runs, so anything it does
-    there would otherwise lease the machine-global directory.  *directory* is
-    not created, for the reason `lease_dir_fixture` gives.
+    The one mechanism behind `lease_dir_fixture` and
+    `lease_isolated_monkeypatch`.  *directory* is not created, for the reason
+    `lease_dir_fixture` gives.
     """
     monkeypatch.setenv(_lease_dir_env(), str(directory))
     return directory
+
+
+@contextlib.contextmanager
+def lease_isolated_monkeypatch(
+    reaper: types.ModuleType, lease_directory: pathlib.Path,
+) -> Iterator[tuple[pytest.MonkeyPatch, list[pathlib.Path]]]:
+    """A `pytest.MonkeyPatch.context()` for a recording made at module scope.
+
+    A module-scoped fixture is set up BEFORE the autouse `lease_dir` fixture,
+    so a recorder that opened a bare context would lease the machine-global
+    directory the live cron reads.  This one yields its monkeypatch with the
+    lease directory already isolated to *lease_directory*, together with a
+    list that gains the directory every `reaper.hold_lease` inside the
+    context resolved, so a recording can carry where its leases really went
+    rather than only that it asked.
+
+    *reaper* is the module the code under test resolves, passed in for the
+    reason `_lease_dir_env` keeps no module reference of its own.
+    """
+    held_in: list[pathlib.Path] = []
+    hold_lease = reaper.hold_lease
+
+    def _observed_hold_lease(*args, directory=None, **kwargs):
+        held_in.append(reaper.lease_dir() if directory is None else pathlib.Path(directory))
+        return hold_lease(*args, directory=directory, **kwargs)
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        isolated_lease_dir(monkeypatch, lease_directory)
+        monkeypatch.setattr(reaper, 'hold_lease', _observed_hold_lease)
+        yield monkeypatch, held_in
 
 
 @pytest.fixture(autouse=True, name='lease_dir')

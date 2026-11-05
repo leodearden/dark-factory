@@ -41,7 +41,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, NamedTuple
 
-from _fm_helpers import isolated_lease_dir, load_script_module
+from _fm_helpers import lease_isolated_monkeypatch, load_script_module
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'bake_off_storage_shape.py'
 
@@ -1335,9 +1335,16 @@ def _argv(tmp_path, name: str, *extra: str) -> list[str]:
     ]
 
 
-#: Every class that reads `cli_legs` shares one xdist worker, so the legs —
-#: and the per-process warm-up the first `main()` pays — are paid once rather
-#: than once per worker `--dist loadgroup` scatters them to.
+#: Every class that reads `cli_legs` carries this group AND
+#: `@pytest.mark.timeout(540)`.  The group puts them on one xdist worker, so
+#: the three legs, and the warm-up the process's first `main()` pays, are paid
+#: once rather than once per worker `--dist loadgroup` scatters them to.  The
+#: timeout covers whichever reader requests `cli_legs` first on that worker,
+#: which records all three legs: the first in collection order in a full-file
+#: run, but any of them under `-k` or a node-id selection; and
+#: `test_a_replay_survives_a_registry_edit_e2_does_not_read` runs two legs of
+#: its own under it.  It overrides verify's --timeout=300, sized per
+#: plans/pytest-per-test-timeout-measurement-2026-09-17.md.
 _ON_THE_RECORDING_WORKER = pytest.mark.xdist_group('bake_off_fetch_cache_recorded_legs')
 
 
@@ -1350,16 +1357,17 @@ class _CliLegs:
     replay_report: str
     cache_text: str
     cache_path: Path
-    replay_services: tuple[_FakeMemoryService, ...]
+    replay_services_constructed: int
     replay_drop_calls: tuple[tuple[str, ...], ...]
     replay_cache_reads: tuple[str, ...]
+    lease_dirs: tuple[Path, ...]
 
 
 def _record_cli_legs(directory: Path) -> _CliLegs:
     mod = _mod()
     cache = directory / 'cache.json'
-    with pytest.MonkeyPatch.context() as mp:
-        isolated_lease_dir(mp, directory / 'leases')
+    reaper = mod.load_cleanup_script()
+    with lease_isolated_monkeypatch(reaper, directory / 'leases') as (mp, lease_dirs):
         _install_driver_doubles(mp)
         assert mod.main(_argv(directory, 'plain')) == 0
 
@@ -1371,7 +1379,7 @@ def _record_cli_legs(directory: Path) -> _CliLegs:
         drops = _install_driver_doubles(mp)
         reads = _count_cache_reads(mp, mod)
         assert mod.main(_argv(directory, 'replay', '--replay-fetches', str(cache))) == 0
-        replay_services = tuple(_FakeMemoryService.instances)
+        replay_services_constructed = len(_FakeMemoryService.instances)
         replay_drop_calls = tuple(tuple(call) for call in drops.calls)
 
     def report(name: str) -> str:
@@ -1383,9 +1391,10 @@ def _record_cli_legs(directory: Path) -> _CliLegs:
         replay_report=report('replay'),
         cache_text=cache.read_text(encoding='utf-8'),
         cache_path=cache,
-        replay_services=replay_services,
+        replay_services_constructed=replay_services_constructed,
         replay_drop_calls=replay_drop_calls,
         replay_cache_reads=tuple(reads),
+        lease_dirs=tuple(lease_dirs),
     )
 
 
@@ -1393,6 +1402,26 @@ def _record_cli_legs(directory: Path) -> _CliLegs:
 def cli_legs(tmp_path_factory) -> _CliLegs:
     """The three legs, recorded once per module; every field is immutable."""
     return _record_cli_legs(tmp_path_factory.mktemp('cli-legs'))
+
+
+@pytest.mark.timeout(540)
+@_ON_THE_RECORDING_WORKER
+class TestTheRecordedLegs:
+    """The recorded legs the CLI tests read are safe to share."""
+
+    def test_they_held_their_leases_in_a_private_directory_never_the_machine_global_one(
+        self, cli_legs, tmp_path_factory,
+    ):
+        """`cli_legs` is set up BEFORE the autouse, function-scoped `lease_dir`
+        fixture, so a recording that did not isolate its own leases would hold
+        them in the directory the live 6-hourly cron reads."""
+        reaper = _mod().load_cleanup_script()
+        basetemp = tmp_path_factory.getbasetemp()
+
+        assert cli_legs.lease_dirs, 'the recording took no lease to locate'
+        for lease_dir in cli_legs.lease_dirs:
+            assert lease_dir != reaper.DEFAULT_LEASE_DIR
+            assert lease_dir.is_relative_to(basetemp), lease_dir
 
 
 class TestFetchCacheCliDefaults:
@@ -1422,6 +1451,7 @@ class TestFetchCacheCliDefaults:
         assert '--replay-fetches' in message
 
 
+@pytest.mark.timeout(540)
 @_ON_THE_RECORDING_WORKER
 class TestDumpFetchesFlag:
     """`--dump-fetches` is additive: it writes the cache and changes nothing."""
@@ -1482,10 +1512,6 @@ def _recorded_cache_in(tmp_path: Path, cli_legs: _CliLegs) -> Path:
     return cache
 
 
-# The first test to read `cli_legs` is charged with recording its three legs,
-# and each negative case runs its own replay; this overrides verify's
-# --timeout=300. Sized per plans/pytest-per-test-timeout-measurement-2026-09-17.md:
-# 8x the worst measured wall clock, never below the pyproject default.
 @pytest.mark.timeout(540)
 @_ON_THE_RECORDING_WORKER
 class TestReplayFetchesFlag:
@@ -1495,7 +1521,7 @@ class TestReplayFetchesFlag:
         # No MemoryService was even CONSTRUCTED — so no durable write queue
         # was recovered, no config was deep-copied and repointed, and no
         # embedder was resolved.
-        assert cli_legs.replay_services == ()
+        assert cli_legs.replay_services_constructed == 0
         # And no collection was created or dropped: a replay that reaped
         # collections could destroy a concurrent live run's arms.
         assert cli_legs.replay_drop_calls == ()

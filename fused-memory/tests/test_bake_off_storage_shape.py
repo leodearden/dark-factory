@@ -39,7 +39,7 @@ import uuid
 from collections.abc import Container
 from pathlib import Path
 
-from _fm_helpers import isolated_lease_dir, load_script_module
+from _fm_helpers import lease_isolated_monkeypatch, load_script_module
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'bake_off_storage_shape.py'
 
@@ -4649,7 +4649,7 @@ class _DriverRun:
     leases_at_drop: tuple[list[dict], ...]
     leases_at_seed: tuple[list[dict], ...]
     leases_after: list[dict]
-    lease_dir: Path
+    lease_dirs: tuple[Path, ...]
     acquisitions: tuple[str, ...]
     probe_hits: tuple[dict[str, list[str]], ...]
     injection_loads: tuple[tuple, ...]
@@ -4673,16 +4673,14 @@ def _record_driver_run(run_kwargs: dict, directory: Path) -> _DriverRun:
     mod = _mod()
     leases_at_drop: list[list[dict]] = []
     leases_at_seed: list[list[dict]] = []
-    lease_dirs: set[Path] = set()
     acquisitions: list[str] = []
     probe_hits: list[dict[str, list[str]]] = []
     injection_loads: list[tuple] = []
-    with pytest.MonkeyPatch.context() as mp:
-        isolated_lease_dir(mp, directory / 'leases')
+    # Resolved before `_record_resolve` is installed, so the observers' own
+    # reaper reads never enter `acquisitions`.
+    reaper = mod.load_cleanup_script()
+    with lease_isolated_monkeypatch(reaper, directory / 'leases') as (mp, lease_dirs):
         drops = _install_driver_doubles(mp)
-        # Resolved before `_record_resolve` is installed, so the observers'
-        # own reaper reads never enter `acquisitions`.
-        reaper = mod.load_cleanup_script()
         resolve, seed_arm, fetch_arm = mod.load_cleanup_script, mod.seed_arm, mod.fetch_arm
         mkdtemp, load_injections = tempfile.mkdtemp, mod.load_regrowth_injections
 
@@ -4692,7 +4690,6 @@ def _record_driver_run(run_kwargs: dict, directory: Path) -> _DriverRun:
 
         async def _seed_and_look(*args, **kwargs):
             leases_at_seed.append(reaper.live_leases())
-            lease_dirs.add(reaper.lease_dir())
             return await seed_arm(*args, **kwargs)
 
         def _record_resolve():
@@ -4725,7 +4722,6 @@ def _record_driver_run(run_kwargs: dict, directory: Path) -> _DriverRun:
 
         report = asyncio.run(mod.run_bake_off(config=caller_config, **run_kwargs))
 
-        (lease_dir,) = lease_dirs
         return _DriverRun(
             report=report,
             services=tuple(_FakeMemoryService.instances),
@@ -4733,7 +4729,7 @@ def _record_driver_run(run_kwargs: dict, directory: Path) -> _DriverRun:
             leases_at_drop=tuple(leases_at_drop),
             leases_at_seed=tuple(leases_at_seed),
             leases_after=reaper.live_leases(),
-            lease_dir=lease_dir,
+            lease_dirs=tuple(lease_dirs),
             acquisitions=tuple(acquisitions),
             probe_hits=tuple(probe_hits),
             injection_loads=tuple(injection_loads),
@@ -4768,17 +4764,24 @@ class TestTheRecordedDriverRun:
     """The recorded runs the wiring tests read are safe to share."""
 
     def test_it_held_its_lease_in_a_private_directory_never_the_machine_global_one(
-        self, small_run, six_arm_run, tmp_path_factory,
+        self, small_run, six_arm_run, main_legs, tmp_path_factory,
     ):
         """Module fixtures are set up BEFORE the autouse, function-scoped
         `lease_dir` fixture, so a recording that did not isolate its own lease
-        would hold it in the directory the live 6-hourly cron reads."""
+        would hold it in the directory the live 6-hourly cron reads.  Every
+        recording in this module is checked, `TestMain`'s legs included."""
         reaper = _mod().load_cleanup_script()
         basetemp = tmp_path_factory.getbasetemp()
+        recordings = {
+            'small_run': small_run, 'six_arm_run': six_arm_run,
+            **{f'main_legs[{argv}]': leg for argv, leg in main_legs.items()},
+        }
 
-        for run in (small_run, six_arm_run):
-            assert run.lease_dir != reaper.DEFAULT_LEASE_DIR
-            assert run.lease_dir.is_relative_to(basetemp), run.lease_dir
+        for name, recording in recordings.items():
+            assert recording.lease_dirs, f'{name} took no lease to locate'
+            for lease_dir in recording.lease_dirs:
+                assert lease_dir != reaper.DEFAULT_LEASE_DIR, name
+                assert lease_dir.is_relative_to(basetemp), (name, lease_dir)
 
     def test_a_handed_out_run_is_a_private_copy(self, small_run, _small_run_record):
         """Every wiring test reads the same run, so a test that mutated what
@@ -9007,6 +9010,11 @@ class TestBuildParser:
         assert '--dump-fetches' in capsys.readouterr().err
 
 
+#: Each extra argv `main` is recorded with, and the `regrowth` it must hand
+#: `run_bake_off`.
+_REGROWTH_SWITCH_CASES = (((), True), (('--no-regrowth',), False))
+
+
 @dataclasses.dataclass(frozen=True)
 class _MainLeg:
     """What one doubled `main(argv)` returned, handed `run_bake_off`, and wrote."""
@@ -9014,14 +9022,15 @@ class _MainLeg:
     code: int
     regrowth_seen: tuple
     report_json: str
+    lease_dirs: tuple[Path, ...]
 
 
 def _record_main_leg(extra_argv: tuple[str, ...], directory: Path) -> _MainLeg:
     mod = _mod()
     regrowth_seen: list = []
     json_out = directory / 'report.json'
-    with pytest.MonkeyPatch.context() as mp:
-        isolated_lease_dir(mp, directory / 'leases')
+    reaper = mod.load_cleanup_script()
+    with lease_isolated_monkeypatch(reaper, directory / 'leases') as (mp, lease_dirs):
         _install_driver_doubles(mp)
         real = mod.run_bake_off
 
@@ -9043,15 +9052,16 @@ def _record_main_leg(extra_argv: tuple[str, ...], directory: Path) -> _MainLeg:
         # Empty when no artifact was written, so the reading test's own
         # assertion is what reports the failed leg.
         report_json=json_out.read_text() if json_out.exists() else '',
+        lease_dirs=tuple(lease_dirs),
     )
 
 
 @pytest.fixture(scope='module')
 def main_legs(tmp_path_factory) -> types.MappingProxyType[tuple[str, ...], _MainLeg]:
-    """One recorded `main()` leg per extra argv; every field is immutable."""
+    """One recorded `main()` leg per `_REGROWTH_SWITCH_CASES` argv; every field is immutable."""
     return types.MappingProxyType({
         argv: _record_main_leg(argv, tmp_path_factory.mktemp('main-leg'))
-        for argv in ((), ('--no-regrowth',))
+        for argv, _ in _REGROWTH_SWITCH_CASES
     })
 
 
@@ -9131,16 +9141,14 @@ class TestMain:
         # artifact gets published as if it were a fresh measurement.
         assert code == 2
 
-    @pytest.mark.parametrize(
-        ('argv', 'expected'), [([], True), (['--no-regrowth'], False)],
-    )
+    @pytest.mark.parametrize(('argv', 'expected'), _REGROWTH_SWITCH_CASES)
     def test_the_switch_reaches_run_bake_off_rather_than_stopping_at_the_parser(
         self, main_legs, argv, expected,
     ):
         """A flag the driver never receives is a flag that silently does
         nothing — and the artifact would then say `regrowth_probed: true`
         for a run the operator asked to skip."""
-        leg = main_legs[tuple(argv)]
+        leg = main_legs[argv]
 
         assert leg.code == 0
         assert list(leg.regrowth_seen) == [expected]
