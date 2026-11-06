@@ -650,3 +650,91 @@ class TestAuditRefusals:
         assert rc == 3
         assert 'ASK BACK' in text
         assert self._written(bench, record) == before
+
+
+class TestPolicyStateVerb:
+    """The policy-state verb only reads through load_class_states and writes through set_class_state."""
+
+    @pytest.fixture
+    def queue(self, tmp_path, monkeypatch) -> Path:
+        monkeypatch.delenv(prep_mod.NIGHTLY_CONFINEMENT_ENV, raising=False)
+        queue = tmp_path / 'src' / 'alpha' / 'data' / 'escalations'
+        queue.mkdir(parents=True)
+        return queue
+
+    def _run(self, capsys, *argv: str) -> tuple[int, str, str]:
+        try:
+            rc = mod.main(['policy-state', *argv])
+        except SystemExit as exc:
+            rc = exc.code
+        out, err = capsys.readouterr()
+        return rc, out, err
+
+    def test_without_a_class_it_prints_every_class_switch(self, queue, capsys):
+        rc, out, _ = self._run(capsys, '--queue-dir', str(queue))
+
+        assert rc == 0
+        assert json.loads(out) == {name: str(switch) for name, switch in policy_state.load_class_states(queue).items()}
+
+    def test_a_class_walks_off_shadow_live_shadow(self, queue, capsys):
+        policy_state.policy_state_path(queue).write_text(json.dumps({'classes': {LANDING: 'off'}}))
+
+        for before, after in (('off', 'shadow'), ('shadow', 'live'), ('live', 'shadow')):
+            rc, out, err = self._run(capsys, '--queue-dir', str(queue), '--class', LANDING, '--state', after)
+
+            assert rc == 0, err
+            assert json.loads(out) == {'queue_dir': normalize_escalations_dir(queue), 'policy_class': LANDING,
+                                       'before': before, 'after': after}
+            assert policy_state.load_class_states(queue)[LANDING] == ClassSwitch(after)
+
+    def test_a_move_outside_the_transitions_is_refused_and_writes_nothing(self, queue, capsys):
+        policy_state.set_class_state(queue, LANDING, ClassSwitch.LIVE)
+        before = policy_state.policy_state_path(queue).read_bytes()
+
+        rc, out, err = self._run(capsys, '--queue-dir', str(queue), '--class', LANDING, '--state', 'off')
+
+        assert rc == 4
+        assert 'live -> off' in out + err
+        assert policy_state.policy_state_path(queue).read_bytes() == before
+
+    def test_a_move_to_the_current_switch_is_a_no_op(self, queue, capsys):
+        policy_state.set_class_state(queue, LANDING, ClassSwitch.LIVE)
+
+        rc, out, _ = self._run(capsys, '--queue-dir', str(queue), '--class', LANDING, '--state', 'live')
+
+        assert rc == 0
+        row = json.loads(out)
+        assert row['before'] == row['after'] == 'live'
+
+    @pytest.mark.parametrize('argv', [
+        ['--class', 'no_such_class', '--state', 'shadow'],
+        ['--class', LANDING, '--state', 'paused'],
+        ['--class', LANDING],
+        ['--state', 'shadow'],
+    ])
+    def test_an_unknown_class_or_state_or_a_lone_flag_exits_2(self, queue, capsys, argv):
+        rc, _, _ = self._run(capsys, '--queue-dir', str(queue), *argv)
+
+        assert rc == 2
+        assert not policy_state.policy_state_path(queue).exists()
+
+    @pytest.mark.parametrize('argv', [[], ['--class', LANDING, '--state', 'live']])
+    def test_an_unreadable_state_file_exits_2_naming_it(self, queue, capsys, argv):
+        path = policy_state.policy_state_path(queue)
+        path.write_text('{not json')
+
+        rc, _, err = self._run(capsys, '--queue-dir', str(queue), *argv)
+
+        assert rc == 2
+        assert str(path) in err
+        assert path.read_text() == '{not json'
+
+    def test_a_queue_that_does_not_exist_exits_2_and_is_not_created(self, tmp_path, capsys, monkeypatch):
+        monkeypatch.delenv(prep_mod.NIGHTLY_CONFINEMENT_ENV, raising=False)
+        absent = tmp_path / 'absent' / 'data' / 'escalations'
+
+        rc, _, err = self._run(capsys, '--queue-dir', str(absent), '--class', LANDING, '--state', 'live')
+
+        assert rc == 2
+        assert err.strip()
+        assert not absent.exists()
