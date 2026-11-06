@@ -33,6 +33,7 @@ from escalation.authority import (
     COORDINATOR_IDENTITY,
     EXECUTOR_DENY_ROLES,
     EXECUTOR_IDENTITY,
+    HOST_FILER_ROLES,
     L2_AUTO_CLOSE_ACTION,
     L2_AUTO_CLOSE_ALLOWLIST,
     L2_AUTO_CLOSE_DENY_CATEGORIES,
@@ -48,6 +49,7 @@ from escalation.authority import (
     PolicyRefusal,
     PolicyRow,
     RefusalCode,
+    audit_escape_target,
     check_class_transition,
     claim_refusal,
     coordinator_denied,
@@ -942,6 +944,10 @@ class TestExecutorIdentity:
         watchdogs = {'orchestrator-watchdog', 'harness-dashboard-watchdog'}
         assert L2_AUTO_CLOSE_DENY_ROLES | watchdogs == EXECUTOR_DENY_ROLES
 
+    def test_host_filer_roles_are_the_two_watchdogs_the_executor_denies(self) -> None:
+        assert {'orchestrator-watchdog', 'harness-dashboard-watchdog'} == HOST_FILER_ROLES
+        assert EXECUTOR_DENY_ROLES == L2_AUTO_CLOSE_DENY_ROLES | HOST_FILER_ROLES
+
     def test_dashboard_watchdog_role_is_denied_in_lockstep(self) -> None:
         """The deny entry names the role the dashboard watchdog REALLY files under.
 
@@ -1194,3 +1200,33 @@ class TestClassTransitions:
     )
     def test_storm_escape_leaves_everything_else(self, current: ClassSwitch, closes: int) -> None:
         assert storm_escape_target(current, closes, 30) is None
+
+
+class TestAuditEscape:
+    """The audit flip rule (PRD §3 decision 8): a live class whose audited closes run wrong drops to shadow."""
+
+    @pytest.mark.parametrize(
+        ('audited', 'wrong', 'expected'),
+        (
+            (3, 1, ClassSwitch.SHADOW),
+            (3, 0, None),
+            (20, 1, None),
+            (20, 2, ClassSwitch.SHADOW),
+            (40, 2, None),
+        ),
+        ids=('below-n-any-wrong', 'below-n-none-wrong', 'at-the-ceiling', 'above-the-ceiling', 'under-the-ceiling'),
+    )
+    def test_a_live_class(self, audited: int, wrong: int, expected: ClassSwitch | None) -> None:
+        assert audit_escape_target(ClassSwitch.LIVE, audited, wrong) is expected
+
+    @pytest.mark.parametrize('current', (ClassSwitch.SHADOW, ClassSwitch.OFF))
+    @pytest.mark.parametrize(('audited', 'wrong'), ((3, 1), (20, 20), (0, 0)))
+    def test_nothing_to_escape_unless_live(self, current: ClassSwitch, audited: int, wrong: int) -> None:
+        assert audit_escape_target(current, audited, wrong) is None
+
+    @pytest.mark.parametrize(('audited', 'wrong'), ((1, 2), (-1, 0), (3, -1)))
+    def test_impossible_counts_are_refused_naming_both(self, audited: int, wrong: int) -> None:
+        with pytest.raises(ValueError) as excinfo:
+            audit_escape_target(ClassSwitch.LIVE, audited, wrong)
+        message = str(excinfo.value)
+        assert str(audited) in message and str(wrong) in message
