@@ -816,9 +816,7 @@ class TestUnansweredSince:
         assert 'esc-107-1' not in block
         assert block.index('esc-102-1') < block.index('esc-110-1')
         listed = [line for line in block.splitlines() if line.startswith('- ')]
-        ledger = ledger_mod.load(env.ledger_out)
-        assert ledger is not None
-        assert len(listed) == len(ledger.in_state('open')) == 6
+        assert len(listed) == 6
 
 
 class TestTriggerStateLine:

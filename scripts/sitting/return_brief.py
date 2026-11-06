@@ -1,11 +1,20 @@
 #!/usr/bin/env python3
 """Write the cross-project return brief Leo pulls on return: what needs him, then what the fleet did while he was away.
 
-Six sections in the order the task mandates. Section 1 is the prepare-sitting
-brief, always recommend-only, rendered by ``brief.render_brief`` so one
-numbered-entry renderer serves both documents. Sections 2-6 and the header are
-``fleet_state`` measurements, each printed with its own stamp. A store that
-cannot be read is a stated shortfall in its section; no section is ever omitted.
+The header, then a Host block, then six sections in the order the task
+mandates. The header states the generation stamp, the window, the queues
+scanned, the project roots measured and where that list came from (with every
+scanned queue outside them), the preparation's freshness, the preparer trial,
+and the sitting trigger evaluator's last run (``sitting.trigger_state``). The
+Host block lists every pending record a host filer raised
+(``authority.HOST_FILER_ROLES``), whatever its level, before anything else.
+Section 1 is the prepare-sitting brief, always recommend-only, rendered by
+``brief.render_brief`` so one numbered-entry renderer serves both documents,
+followed by the "Unanswered since" list: each numbered item, oldest first,
+with the stamp its ledger entry was first presented at. Sections 2-6, the Host
+block and the header's figures are ``fleet_state`` measurements, each printed
+with its own stamp. A store that cannot be read is a stated shortfall in its
+section; no section is ever omitted.
 
 Sections 2 and 6 stay apart on purpose. Section 2 is the standing-policy
 adjudicator's shadow agreement; section 6 is this preparer's own carve-out
@@ -46,13 +55,15 @@ for _path in (_REPO_ROOT / 'orchestrator' / 'src', _REPO_ROOT / 'scripts'):
 from _task_db_scan import discover_project_roots  # noqa: E402
 from orchestrator.digest import ModelRoleRow  # noqa: E402
 from orchestrator.session_registry import decisions_dir, fleet_root, sessions_dir  # noqa: E402
+from shared.project_layout import KNOWN_PROJECT_ROOTS_ENV, known_project_roots  # noqa: E402
 from shared.safe_io import atomic_write_text  # noqa: E402
-from sitting import audits, brief, fleet_state, prepare_sitting  # noqa: E402
+from sitting import audits, brief, fleet_state, prepare_sitting, trigger_state  # noqa: E402
 from sitting import ledger as ledgers  # noqa: E402
 from sitting.audits import AuditDraw, ExecutorClose  # noqa: E402
 from sitting.fleet_state import (  # noqa: E402
     AutonomousClose,
     AutonomousCloses,
+    HostAlarm,
     Measurement,
     PreparerTrial,
     ProjectState,
@@ -60,12 +71,22 @@ from sitting.fleet_state import (  # noqa: E402
     StuckRow,
     Window,
 )
-from sitting.inventory import AUDIT_KIND, Shortfall, audit_key, key_str, parse_stamp  # noqa: E402
+from sitting.inventory import (  # noqa: E402
+    AUDIT_KIND,
+    Shortfall,
+    age_days,
+    audit_key,
+    key_str,
+    parse_stamp,
+    queue_project_root,
+)
 from sitting.prepare_sitting import Sitting  # noqa: E402
+from sitting.trigger_state import TriggerLastRun  # noqa: E402
 
 DEFAULT_OUTPUT = _REPO_ROOT / 'data' / 'return-brief.md'
 DEFAULT_LEDGER_OUT = _REPO_ROOT / 'data' / 'sitting' / 'ledger-nightly.json'
 DEFAULT_PREPARATION = prepare_sitting.DEFAULT_PREPARATION
+DEFAULT_TRIGGER_STATE = trigger_state.DEFAULT_PATH
 SUPERSEDED_DIGEST = 'data/afk-digest.md'
 
 EXIT_OK, EXIT_CONFIG = 0, 2
@@ -97,9 +118,33 @@ class PreparationFreshness:
 
 
 @dataclass(frozen=True)
+class RootsStatement:
+    """The project roots the per-project sections measured, where that list came from, and each queue outside them."""
+
+    roots: tuple[str, ...]
+    source: str
+    outside: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class UnansweredRow:
+    number: int
+    record_id: str
+    first_presented_at: str
+    age_days: float | None
+
+
+TriggerReading = TriggerLastRun | Shortfall | None
+"""The evaluator's last run; None when it has never run; a Shortfall when its file cannot be read."""
+
+
+@dataclass(frozen=True)
 class ReturnBriefDocument:
     generated_at: str
     window: Window
+    roots: RootsStatement
+    trigger: TriggerReading
+    host_alarms: Measurement[tuple[HostAlarm, ...]]
     sitting: Sitting
     preparation: PreparationFreshness
     projects: Mapping[str, ProjectState]
@@ -110,11 +155,13 @@ class ReturnBriefDocument:
 def build(
     *,
     project_roots: Sequence[str],
+    roots_source: str,
     decisions_root: Path,
     sessions_root: Path,
     handover_override: prepare_sitting.HandoverOverride | None,
     preparation_path: Path,
     previous_ledger: Path | None,
+    trigger_state_path: Path,
     window: Window,
     now: datetime,
 ) -> ReturnBriefDocument:
@@ -129,16 +176,19 @@ def build(
     )
     if unseeded is not None:
         sitting = replace(sitting, shortfalls=(*sitting.shortfalls, unseeded))
-    seed = now.date().isoformat()
+    draw_seed = now.date().isoformat()
     audit_draw = fleet_state.unreadable_if_raises(
-        'decision_registry', str(decisions_dir(decisions_root)), _no_draw(seed),
-        lambda: _audit_draw(decisions_root, sources.inventory.escalation_index, seed, now), now=now,
+        'decision_registry', str(decisions_dir(decisions_root)), _no_draw(draw_seed),
+        lambda: _audit_draw(decisions_root, sources.inventory.escalation_index, draw_seed, now), now=now,
     )
     if audit_draw.ok:
         sitting = replace(sitting, ledger=_number_audits(sitting.ledger, audit_draw.value, now))
     return ReturnBriefDocument(
         generated_at=now.isoformat(),
         window=window,
+        roots=_roots_statement(project_roots, roots_source, sources.queues_scanned),
+        trigger=_read_trigger(trigger_state_path),
+        host_alarms=fleet_state.host_alarms(sources.inventory.pending, now=now),
         sitting=sitting,
         preparation=_freshness(sources, sitting),
         projects=fleet_state.measure_projects(project_roots, sources.inventory.pending, window=window, now=now),
@@ -156,6 +206,7 @@ def render(document: ReturnBriefDocument) -> str:
     projects = list(document.projects)
     return '\n'.join([
         _header(document),
+        _host_section(document.host_alarms),
         _decisions_section(document.sitting, heading['decisions']),
         _per_project_section(heading['standing_policy'], projects, measured['standing_policy'], _agreement_lines,
                              preface=_standing_policy_preface(document)),
@@ -180,11 +231,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         document = build(
             project_roots=args.project_roots or discover_project_roots(),
+            roots_source=_roots_source(args.project_roots),
             decisions_root=fleet_root(args.decisions_root),
             sessions_root=args.sessions_root if args.sessions_root is not None else sessions_dir(),
             handover_override=args.handover,
             preparation_path=args.preparation,
             previous_ledger=args.ledger_out,
+            trigger_state_path=args.trigger_state,
             window=Window.trailing(now, days=args.window_days),
             now=now,
         )
@@ -197,6 +250,26 @@ def main(argv: Sequence[str] | None = None) -> int:
     statuses = section_statuses(document)
     print(f'done ({", ".join(f"{slug}={status}" for slug, status in statuses.items())})')
     return EXIT_OK
+
+
+def _roots_source(command_line_roots: Sequence[str] | None) -> str:
+    """Which rung of ``_task_db_scan.resolve_project_roots``'s precedence supplied the roots."""
+    if command_line_roots:
+        return '--project-root'
+    return KNOWN_PROJECT_ROOTS_ENV if known_project_roots() else 'default'
+
+
+def _roots_statement(project_roots: Sequence[str], source: str, queues_scanned: Sequence[str]) -> RootsStatement:
+    measured = {Path(root).resolve() for root in project_roots}
+    outside = tuple(queue for queue in queues_scanned if queue_project_root(queue) not in measured)
+    return RootsStatement(tuple(project_roots), source, outside)
+
+
+def _read_trigger(path: Path) -> TriggerReading:
+    try:
+        return trigger_state.load(path)
+    except trigger_state.TriggerStateUnreadable as exc:
+        return Shortfall('trigger_state', str(exc.path), exc.reason)
 
 
 def _previous_numbering(path: Path | None) -> tuple[ledgers.Ledger | None, Shortfall | None]:
@@ -264,11 +337,38 @@ def _header(document: ReturnBriefDocument) -> str:
         f'- generated_at: {document.generated_at}',
         f'- window: {window.start.isoformat()} to {window.end.isoformat()}',
         f'- queues scanned: {", ".join(document.sitting.queues_scanned) or "none"}',
+        f'- project roots (source: {document.roots.source}): {", ".join(document.roots.roots) or "none"}',
+        f'- queues scanned outside those roots: {", ".join(document.roots.outside) or "none"}',
         f'- preparation: {_freshness_text(document.preparation, document.generated_at)}',
         '- preparer trial (recommend-only; agreement counts Leo choosing the recommended option):',
         *(trial_lines or ['  - no project root was measured']),
+        f'- sitting trigger: {_trigger_text(document.trigger, document.generated_at)}',
         f'- supersedes `{SUPERSEDED_DIGEST}`: this page is the pull-on-return surface.',
+        *(_shortfall_lines([document.trigger]) if isinstance(document.trigger, Shortfall) else []),
     ])
+
+
+def _trigger_text(trigger: TriggerReading, generated_at: str) -> str:
+    if trigger is None:
+        return 'evaluator has not run'
+    if isinstance(trigger, Shortfall):
+        return f'unreadable — {trigger.reason}'
+    lane = f' (lane {trigger.lane})' if trigger.lane else ''
+    return (f'last ran {trigger.ran_at} ({_hours_apart(trigger.ran_at, generated_at)}); '
+            f'outcome {trigger.outcome}: {trigger.reason}; last launch {trigger.last_launch_at or "never"}{lane}')
+
+
+def _host_section(measurement: Measurement[tuple[HostAlarm, ...]]) -> str:
+    lines = ['## Host', '', _stamp_line(measurement), '']
+    alarms = measurement.value
+    lines += [_host_line(alarm) for alarm in alarms] or ['No host alarm pending.']
+    return _text([*lines, '', *_shortfall_lines(measurement.shortfalls)])
+
+
+def _host_line(alarm: HostAlarm) -> str:
+    age = 'age unknown' if alarm.age_days is None else f'{alarm.age_days:.1f}d old'
+    return (f'- {alarm.escalation_id} ({alarm.project or alarm.queue_dir}) L{alarm.level} {alarm.severity}, '
+            f'{age}, filed by {alarm.agent_role}: {alarm.summary}')
 
 
 def _freshness_text(freshness: PreparationFreshness, generated_at: str) -> str:
@@ -306,7 +406,26 @@ def _decisions_section(sitting: Sitting, heading: str) -> str:
     )
     docket = (f'Docket page: recommended — {sitting.docket_reason}.' if sitting.docket_reason
               else 'Docket page: not needed; answer by number.')
-    return rendered + '\n' + _text([docket, '', *_shortfall_lines(sitting.shortfalls)])
+    unanswered = [_unanswered_line(row) for row in _unanswered(sitting)] or ['Nothing numbered awaits an answer.']
+    return rendered + '\n' + _text([
+        '### Unanswered since', '', *unanswered, '', docket, '', *_shortfall_lines(sitting.shortfalls),
+    ])
+
+
+def _unanswered(sitting: Sitting) -> tuple[UnansweredRow, ...]:
+    """Every numbered question item with the stamp its ledger entry was first presented at, oldest first."""
+    now = parse_stamp(sitting.generated_at)
+    rows = []
+    for entry in sitting.numbered:
+        presented = sitting.ledger.entries[key_str(entry.item.key)].first_presented_at
+        age = age_days(presented, now) if now is not None else None
+        rows.append(UnansweredRow(entry.number, entry.item.key[-1], presented, age))
+    return tuple(sorted(rows, key=lambda row: (parse_stamp(row.first_presented_at) or now, row.number)))
+
+
+def _unanswered_line(row: UnansweredRow) -> str:
+    age = 'age unknown' if row.age_days is None else f'{row.age_days:.1f}d unanswered'
+    return f'- {row.number} ({row.record_id}): first presented {row.first_presented_at}, {age}'
 
 
 def _standing_policy_preface(document: ReturnBriefDocument) -> list[str]:
@@ -474,6 +593,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument('--handover', type=prepare_sitting.parse_handover_override, metavar='PROJECT=PATH',
                         help="read PATH as PROJECT's handover (default: each project root's own)")
     parser.add_argument('--preparation', type=Path, default=DEFAULT_PREPARATION)
+    parser.add_argument('--trigger-state', type=Path, default=DEFAULT_TRIGGER_STATE,
+                        help="the sitting trigger evaluator's last-run file (default: trigger_state.DEFAULT_PATH)")
     parser.add_argument('--window-days', type=_positive_days, default=1.0)
     parser.add_argument('--now', type=prepare_sitting.parse_instant, help='ISO-8601 instant to run at (default: now)')
     return parser
