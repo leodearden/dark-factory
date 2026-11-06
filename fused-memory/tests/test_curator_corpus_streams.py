@@ -1,10 +1,12 @@
-"""The curator's sibling stream, driven through TaskCurator.prepare_candidate over a real SQLite store.
+"""The curator's corpus streams, driven through TaskCurator.prepare_candidate over a real SQLite store.
 
 An agent-followup candidate's pool always holds the parent's other
-non-cancelled follow-ups, whatever files they touch (task 6227). The
+non-cancelled follow-ups, whatever files they touch (task 6227). The module
+and dependency streams read only the open backlog (task 6708). The
 embedding stream is switched off through the public config by pointing
 ``mem0.qdrant_url`` at a closed loopback port, so these cases never patch a
-private name and never reach a live Qdrant.
+private name and never reach a live Qdrant; the embedding stream is
+therefore unavailable in every case here.
 """
 
 from __future__ import annotations
@@ -18,10 +20,12 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
-from _curator_helpers import make_config
+from _curator_helpers import make_config, must_not_invoke
+from shared.task_statuses import ACTIVE
 
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 from fused_memory.config.schema import FusedMemoryConfig, TaskmasterConfig
@@ -43,7 +47,7 @@ _PARENT_ID_PAST_SQLITE_INTEGER = str(2**64)
 
 
 @dataclass(frozen=True)
-class SiblingStack:
+class CorpusStack:
     root: str
     backend: SqliteTaskBackend
     config: FusedMemoryConfig
@@ -57,7 +61,7 @@ class SiblingStack:
         added = await self.backend.add_task(
             project_root=self.root,
             title=title,
-            description=f'{title} (sibling-stream fixture)',
+            description=f'{title} (corpus-stream fixture)',
             metadata=json.dumps(metadata) if metadata is not None else None,
             status=status,
         )
@@ -95,6 +99,26 @@ class _TextLookupFailsBackend(SqliteTaskBackend):
         return await super().find_tasks_by_metadata(project_root, key, value, **kwargs)
 
 
+class _RecordingBackend(SqliteTaskBackend):
+    """Records the statuses every get_tasks call asked for and the id every get_task call read."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.get_tasks_statuses: list[list[str] | None] = []
+        self.get_task_ids: list[str] = []
+
+    async def get_tasks(
+        self, project_root: str, tag: str | None = None,
+        statuses: list[str] | None = None, fields: Any = None,
+    ) -> Any:
+        self.get_tasks_statuses.append(statuses)
+        return await super().get_tasks(project_root, tag, statuses=statuses, fields=fields)
+
+    async def get_task(self, task_id: str, project_root: str, tag: str | None = None) -> dict:
+        self.get_task_ids.append(str(task_id))
+        return await super().get_task(task_id, project_root, tag)
+
+
 class _SiblingFetchFailsBackend(SqliteTaskBackend):
     async def get_task(self, task_id: str, project_root: str, tag: str | None = None) -> dict:
         task = await super().get_task(task_id, project_root, tag)
@@ -105,8 +129,11 @@ class _SiblingFetchFailsBackend(SqliteTaskBackend):
 
 @asynccontextmanager
 async def _open_stack(
-    project_dir: Path, backend_cls: type[SqliteTaskBackend],
-) -> AsyncIterator[SiblingStack]:
+    project_dir: Path,
+    backend_cls: type[SqliteTaskBackend],
+    *,
+    invoke: AsyncMock | None = None,
+) -> AsyncIterator[CorpusStack]:
     project_dir.mkdir(parents=True)
     subprocess.run(['git', 'init', '-q', str(project_dir)], check=True, capture_output=True)
     root = str(project_dir.resolve())
@@ -114,22 +141,31 @@ async def _open_stack(
     await backend.start()
     config = make_config()
     config.mem0.qdrant_url = _CLOSED_LOOPBACK_URL
-    curator = TaskCurator(config=config, taskmaster=backend)
+    curator = TaskCurator(
+        config=config, taskmaster=backend,
+        invoke=invoke if invoke is not None else must_not_invoke(),
+    )
     try:
-        yield SiblingStack(root, backend, config, curator)
+        yield CorpusStack(root, backend, config, curator)
     finally:
         await curator.close()
         await backend.close()
 
 
 @pytest_asyncio.fixture
-async def stack(tmp_path: Path) -> AsyncIterator[SiblingStack]:
+async def stack(tmp_path: Path) -> AsyncIterator[CorpusStack]:
     async with _open_stack(tmp_path / 'project', SqliteTaskBackend) as opened:
         yield opened
 
 
 @pytest_asyncio.fixture
-async def failing_lookup_stack(tmp_path: Path) -> AsyncIterator[SiblingStack]:
+async def recording_stack(tmp_path: Path) -> AsyncIterator[CorpusStack]:
+    async with _open_stack(tmp_path / 'project', _RecordingBackend) as opened:
+        yield opened
+
+
+@pytest_asyncio.fixture
+async def failing_lookup_stack(tmp_path: Path) -> AsyncIterator[CorpusStack]:
     async with _open_stack(tmp_path / 'project', _LookupFailsBackend) as opened:
         yield opened
 
@@ -352,3 +388,69 @@ async def test_a_sibling_whose_full_fetch_fails_is_pooled_thin_from_its_lookup_r
     assert entry.title.startswith(_SIBLING_TITLE_PREFIX)
     assert entry.status == 'unknown'
     assert entry.combine_eligible is False
+
+
+def _recorded(stack: CorpusStack) -> _RecordingBackend:
+    assert isinstance(stack.backend, _RecordingBackend)
+    return stack.backend
+
+
+def _review_of(anchor_id: str) -> CandidateTask:
+    """A review candidate with no files: only the anchor, embedding and dependency streams apply."""
+    return CandidateTask(
+        title='Review finding on the anchor', spawned_from=anchor_id, spawn_context='review',
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_module_stream_reads_only_the_open_backlog(recording_stack):
+    stack = recording_stack
+    module = {'files': [_MODULE_FILE]}
+    pending_id = await stack.seed('pending neighbour', metadata=module)
+    in_progress_id = await stack.seed('in-progress neighbour', status='in-progress', metadata=module)
+    done_id = await stack.seed('done neighbour', status='done', metadata=module)
+
+    prepared = await stack.prepare(CandidateTask(title='t', files_to_modify=[_CANDIDATE_FILE]))
+
+    recorded = _recorded(stack).get_tasks_statuses
+    assert recorded
+    open_backlog = {status.value for status in ACTIVE}
+    assert all(statuses is not None and set(statuses) == open_backlog for statuses in recorded)
+    assert _ids_from(prepared.pool, 'module') == {pending_id, in_progress_id}
+    assert _entries(prepared.pool, done_id) == []
+
+
+@pytest.mark.asyncio
+async def test_the_dependency_stream_pools_the_anchors_open_neighbours(recording_stack):
+    stack = recording_stack
+    anchor_id = await stack.seed('anchor')
+    pending_dependency = await stack.seed('pending dependency')
+    done_dependency = await stack.seed('done dependency', status='done')
+    in_progress_dependent = await stack.seed('in-progress dependent', status='in-progress')
+    cancelled_dependent = await stack.seed('cancelled dependent', status='cancelled')
+    await stack.backend.add_dependency(anchor_id, pending_dependency, stack.root)
+    await stack.backend.add_dependency(anchor_id, done_dependency, stack.root)
+    await stack.backend.add_dependency(in_progress_dependent, anchor_id, stack.root)
+    await stack.backend.add_dependency(cancelled_dependent, anchor_id, stack.root)
+
+    prepared = await stack.prepare(_review_of(anchor_id))
+
+    assert _ids_from(prepared.pool, 'dependency') == {pending_dependency, in_progress_dependent}
+    assert _recorded(stack).get_tasks_statuses == []
+
+
+@pytest.mark.asyncio
+async def test_the_dependency_cap_bounds_the_full_row_reads(recording_stack):
+    stack = recording_stack
+    stack.config.curator.pool_dependency_cap = 1
+    anchor_id = await stack.seed('anchor')
+    dependents = {await stack.seed(f'dependent {n}') for n in range(3)}
+    for dependent in dependents:
+        await stack.backend.add_dependency(dependent, anchor_id, stack.root)
+
+    prepared = await stack.prepare(_review_of(anchor_id))
+
+    assert len(_ids_from(prepared.pool, 'dependency')) == 1
+    assert prepared.withheld is not None
+    assert prepared.withheld.by_source['dependency'] == 2
+    assert len([tid for tid in _recorded(stack).get_task_ids if tid in dependents]) <= 1
