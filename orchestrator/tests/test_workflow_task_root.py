@@ -165,18 +165,25 @@ async def test_external_worktree_investigation_reads_reviews_from_its_lane_root(
 ):
     """The dispatch's own root decision, not a re-derived task root, tells the
     dry-run investigator where this run's reviewers wrote."""
-    worktree = await _eval_worktree(config, tmp_path)
-    workflow, _ = _build_workflow(config, git_ops, task_assignment, stub)
-    workflow.worktree = worktree
-    await workflow.run()
     investigations: list[dict] = []
 
     async def record_investigation(**investigation) -> None:
         investigations.append(investigation)
 
     monkeypatch.setattr('orchestrator.workflow.run_dry_run_unblock', record_investigation)
+    monkeypatch.setattr(
+        'orchestrator.workflow.run_scoped_verification',
+        AsyncMock(return_value=VerifyResult(
+            passed=False, test_output='FAILED', lint_output='', type_output='',
+            summary='tests failed',
+        )),
+    )
     config.unblock_auto.enabled = True
-    workflow._spawn_dry_run_unblock('blocked: demo', 'detail')
+    worktree = await _eval_worktree(config, tmp_path)
+    workflow, _ = _build_workflow(config, git_ops, task_assignment, stub)
+    workflow.worktree = worktree
+
+    await workflow.run()
     await asyncio.gather(*(
         t for t in asyncio.all_tasks() if t.get_name() == investigation_task_name('42')
     ))
