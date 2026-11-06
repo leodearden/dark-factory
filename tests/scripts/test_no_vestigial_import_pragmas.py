@@ -9,8 +9,9 @@ are vestigial for DIFFERENT reasons and have DIFFERENT remedies:
   ``[tool.pyright]`` ``venvPath``/``venv`` keys pin, never from ``extraPaths``
   at all.
 * ``test_no_missing_imports_pragma_on_resolvable_import`` — class (a), about
-  static import RESOLUTION via ``extraPaths``. This is the task-3456 case
-  proper.
+  static import RESOLUTION on pyright's search roots: the root ``extraPaths``,
+  the importing file's own directory and the execution root. This is the
+  task-3456 case proper.
 
 A single blanket "no such pragma anywhere in this directory" assertion would
 collapse that distinction, hand a reader whichever remedy happened to be
@@ -78,10 +79,16 @@ parses as an import statement" rather than on a substring scan.
 from __future__ import annotations
 
 import ast
-import importlib.util
+import importlib
+import json
 import re
+import subprocess
+import sys
 import tomllib
+from collections.abc import Iterable
 from pathlib import Path
+
+import pytest
 
 REPO_ROOT = Path(__file__).parents[2]
 _THIS_DIR = Path(__file__).parent
@@ -191,8 +198,10 @@ def _parse_import_statement(code: str) -> ast.Import | ast.ImportFrom | None:
     return None
 
 
-def _pragma_carrying_imports() -> list[tuple[Path, int, str, ast.Import | ast.ImportFrom]]:
-    """Every ``(path, lineno, line, node)`` in the scanned suites where an import is suppressed.
+def _pragma_carrying_imports(
+    directories: Iterable[Path],
+) -> list[tuple[Path, int, str, ast.Import | ast.ImportFrom]]:
+    """Every ``(path, lineno, line, node)`` in *directories* where an import is suppressed.
 
     ONE scanner for both guards, so they cannot disagree about what counts as
     an import site — only about which sites are legitimate.
@@ -203,7 +212,7 @@ def _pragma_carrying_imports() -> list[tuple[Path, int, str, ast.Import | ast.Im
     necessarily the comment delimiter.
     """
     sites: list[tuple[Path, int, str, ast.Import | ast.ImportFrom]] = []
-    for directory in _SCANNED_DIRS:
+    for directory in directories:
         assert directory.is_dir(), (
             f'{directory} does not exist, so this guard silently stopped covering it. '
             f'If that suite moved or was renamed, update _SCANNED_DIRS — a guard that '
@@ -250,7 +259,7 @@ def _import_search_roots(importing_dir: Path) -> list[Path]:
     DERIVED FROM CONFIG, never hardcoded — see this guard's docstring for why
     that is the whole point rather than a stylistic preference.
 
-    Two sources, and the second is not redundant:
+    Three sources, and neither the second nor the third is redundant:
 
     1. Every ROOT ``[tool.pyright] extraPaths`` entry, resolved relative to the
        repo root. This is what makes the flat ``scripts/`` imports here resolve
@@ -264,9 +273,11 @@ def _import_search_roots(importing_dir: Path) -> list[Path]:
        same-directory sibling and would otherwise be misjudged unresolvable.
        Taking it per-file rather than as a constant is what lets one scanner
        serve both scanned suites without either borrowing the other's siblings.
+    3. The execution root, which pyright resolves local imports against and
+       which holds ``conftest.py`` and ``df_pytest_isolation.py``.
     """
     extra_paths = _load_root_pyright_config().get('extraPaths', [])
-    return [REPO_ROOT / entry for entry in extra_paths] + [importing_dir]
+    return [REPO_ROOT / entry for entry in extra_paths] + [importing_dir, REPO_ROOT]
 
 
 def _imported_top_level_modules(node: ast.Import | ast.ImportFrom) -> list[str]:
@@ -295,20 +306,85 @@ def _resolving_root(module: str, roots: list[Path]) -> Path | None:
     return None
 
 
-def _resolves_in_running_interpreter(module: str) -> bool:
-    """True when *module* is importable in the interpreter running this test.
+def _class_a_root(path: Path, module: str) -> Path | None:
+    """The class-(a) search root on which *module*, imported by *path*, resolves, else None.
 
-    Asks the interpreter rather than naming modules, so this covers ``pytest``,
-    ``yaml`` and every other declared dependency with one rule and needs no edit
-    when a new third-party import lands in either scanned suite.
-
-    ``find_spec`` does not execute *module* — it only locates it — and a
-    top-level name has no parent package to import as a side effect.
+    The one predicate both guards split on, so they cannot both claim a site,
+    nor both miss it.
     """
+    return _resolving_root(module, _import_search_roots(path.parent))
+
+
+def _resolvable_import_offenders(
+    sites: Iterable[tuple[Path, int, str, ast.Import | ast.ImportFrom]],
+) -> list[tuple[Path, int, str, str, Path]]:
+    """The ``(path, lineno, line, module, root)`` among *sites* whose module resolves on *root*."""
+    return [
+        (path, lineno, code, module, root)
+        for path, lineno, code, node in sites
+        for module in _imported_top_level_modules(node)
+        if (root := _class_a_root(path, module)) is not None
+    ]
+
+
+# The verdict goes on its own final line because site's `sitecustomize` and
+# `.pth` lines run before this code and may print to stdout themselves.
+_FIND_SPEC_PROBE = '''
+import importlib.util
+import json
+import sys
+
+
+def found(name):
     try:
-        return importlib.util.find_spec(module) is not None
+        return importlib.util.find_spec(name) is not None
     except (ImportError, ValueError):
         return False
+
+
+print()
+print(json.dumps([name for name in sys.argv[1:] if found(name)]))
+'''
+
+
+def _installed_modules(modules: Iterable[str]) -> frozenset[str]:
+    """Those of *modules* that a fresh ``-I`` interpreter of this environment can locate.
+
+    That interpreter sees the venv's site-packages and ``.pth`` entries, but not
+    the sys.path and sys.modules entries that collected test modules add.
+    """
+    probe = subprocess.run(
+        [sys.executable, '-I', '-c', _FIND_SPEC_PROBE, *sorted(modules)],
+        capture_output=True,
+        text=True,
+    )
+    assert probe.returncode == 0, (
+        f'the installed-module probe exited {probe.returncode} under '
+        f'{sys.executable}:\n{probe.stderr}'
+    )
+    return frozenset(json.loads(probe.stdout.splitlines()[-1]))
+
+
+def _installed_module_offenders(
+    sites: Iterable[tuple[Path, int, str, ast.Import | ast.ImportFrom]],
+) -> list[tuple[Path, int, str, str]]:
+    """The ``(path, lineno, line, module)`` among *sites* whose module is installed.
+
+    A module that resolves on class (a)'s search roots is excluded first, so it
+    is never reported here as well.
+    """
+    candidates = [
+        (path, lineno, code, module)
+        for path, lineno, code, node in sites
+        for module in _imported_top_level_modules(node)
+        if _class_a_root(path, module) is None
+    ]
+    installed = _installed_modules(module for *_, module in candidates)
+    return [
+        (path, lineno, code, module)
+        for path, lineno, code, module in candidates
+        if module in installed
+    ]
 
 
 def test_no_missing_imports_pragma_on_installed_module_import() -> None:
@@ -329,7 +405,7 @@ def test_no_missing_imports_pragma_on_installed_module_import() -> None:
     interpreter. A suppression on this line converts that env fault into
     silence.
 
-    ASKS THE INTERPRETER, rather than naming ``pytest``. The five pragmas task
+    ASKS A FRESH INTERPRETER OF THIS ENVIRONMENT, rather than naming ``pytest``. The five pragmas task
     4516 deleted in this class all sat on ``import pytest``, but the rationale
     above is a property of "resolved from the venv", not of that one name:
     ``import yaml`` under the same suppression would be equally vestigial and
@@ -338,10 +414,9 @@ def test_no_missing_imports_pragma_on_installed_module_import() -> None:
     class (a)'s search roots either.
 
     THE SPLIT IS PRESERVED by checking class (a) FIRST: a module that resolves
-    on the ``extraPaths`` search roots belongs to the other guard and its other
-    remedy, and is skipped here even though the running interpreter can also
-    import it (each suite's ``conftest.py`` puts those same directories on
-    sys.path, so it always can).
+    on class (a)'s search roots belongs to the other guard and its other
+    remedy, and is skipped here even when a fresh interpreter can also import
+    it.
 
     These pragmas were provably copy-paste cargo rather than considered
     suppressions, which is visible without appeal to intent because they were
@@ -352,13 +427,7 @@ def test_no_missing_imports_pragma_on_installed_module_import() -> None:
     below carried none; and in ``test_trial_module_tagger_haiku.py`` the
     polarity was simply reversed.
     """
-    offenders = [
-        (path, lineno, code, module)
-        for path, lineno, code, node in _pragma_carrying_imports()
-        for module in _imported_top_level_modules(node)
-        if _resolving_root(module, _import_search_roots(path.parent)) is None
-        and _resolves_in_running_interpreter(module)
-    ]
+    offenders = _installed_module_offenders(_pragma_carrying_imports(_SCANNED_DIRS))
 
     assert not offenders, (
         f'{len(offenders)} import(s) of an installed module carry a '
@@ -367,7 +436,7 @@ def test_no_missing_imports_pragma_on_installed_module_import() -> None:
         f'all count):\n'
         + '\n'.join(
             f'  {path.relative_to(REPO_ROOT)}:{lineno}: {code}\n'
-            f'      `{module}` is importable in the running interpreter'
+            f'      `{module}` is importable by a fresh interpreter of this environment'
             for path, lineno, code, module in offenders
         )
         + f'\nDELETE the suppression; keep the import byte-identical. These '
@@ -421,12 +490,7 @@ def test_no_missing_imports_pragma_on_resolvable_import() -> None:
     is a TWO-gate outage, ``pyright scripts/`` and ``pyright tests/scripts/``
     both — not re-adding suppressions to either suite.
     """
-    offenders = [
-        (path, lineno, code, module, root)
-        for path, lineno, code, node in _pragma_carrying_imports()
-        for module in _imported_top_level_modules(node)
-        if (root := _resolving_root(module, _import_search_roots(path.parent))) is not None
-    ]
+    offenders = _resolvable_import_offenders(_pragma_carrying_imports(_SCANNED_DIRS))
 
     assert not offenders, (
         f'{len(offenders)} import(s) carry a suppression covering '
@@ -445,7 +509,8 @@ def test_no_missing_imports_pragma_on_resolvable_import() -> None:
         f'REAL {_PRAGMA_RULE} if one appears on that line later — which is '
         f'the whole defect task 4516 removed. These roots are read from the '
         f'ROOT [tool.pyright] extraPaths at test time (plus the importing '
-        f'file\'s own directory, for same-directory sibling modules), so this '
+        f'file\'s own directory, for same-directory sibling modules, and the '
+        f'execution root, for root-level modules), so this '
         f'list is what pyright actually resolves against, not a snapshot of '
         f'it. IF AN IMPORT HERE EVER STOPS RESOLVING, THE FIX IS RESTORING THE '
         f'extraPaths ENTRIES, NOT RE-ADDING PRAGMAS: task 3456 added '
@@ -453,4 +518,71 @@ def test_no_missing_imports_pragma_on_resolvable_import() -> None:
         f'exactly so these resolve, and removing one is a TWO-gate outage '
         f'(`pyright scripts/` and `pyright tests/scripts/` both run from the '
         f'repo root against this same table)'
+    )
+
+
+def test_an_import_reachable_only_through_a_session_sys_path_entry_is_not_an_installed_module(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    helper = '_vestigial_pragma_guard_session_only_helper'
+    helpers_dir = tmp_path / 'helpers'
+    helpers_dir.mkdir()
+    (helpers_dir / f'{helper}.py').write_text('VALUE = 1\n')
+    suite_dir = tmp_path / 'suite'
+    suite_dir.mkdir()
+    (suite_dir / 'test_probe.py').write_text(
+        f'from {helper} import VALUE  # {_PRAGMA}\n'
+        f'import pytest  # {_PRAGMA}\n'
+        f'import sys  # {_PRAGMA}\n'
+    )
+
+    monkeypatch.syspath_prepend(str(helpers_dir))
+    importlib.import_module(helper)
+    # Re-registered through setitem so teardown deletes it: delitem on a key
+    # that is not yet present records nothing to undo.
+    monkeypatch.setitem(sys.modules, helper, sys.modules.pop(helper))
+
+    offenders = _installed_module_offenders(_pragma_carrying_imports([suite_dir]))
+
+    judged_installed = [module for *_, module in offenders]
+    assert judged_installed == ['pytest', 'sys'], (
+        f'expected exactly the third-party `pytest` and the builtin `sys` to be '
+        f'judged installed, got {judged_installed}. `{helper}` must not be among '
+        f'them: its directory {helpers_dir} reached sys.path only through this '
+        f'test session, the way a collected test module puts one there, so the '
+        f'environment pyright resolves from does not provide it'
+    )
+
+
+def test_a_suppressed_import_of_a_module_at_the_pyright_execution_root_is_reported_by_class_a(
+    tmp_path: Path,
+) -> None:
+    root_modules = sorted(path.stem for path in REPO_ROOT.glob('*.py'))
+    assert root_modules, (
+        f'no *.py module found at {REPO_ROOT}, so this test would pass vacuously'
+    )
+    suite_dir = tmp_path / 'suite'
+    suite_dir.mkdir()
+    (suite_dir / 'test_probe.py').write_text(
+        ''.join(f'import {module}  # {_PRAGMA}\n' for module in root_modules)
+    )
+    sites = _pragma_carrying_imports([suite_dir])
+
+    reported_by_class_a = {
+        module: root for *_, module, root in _resolvable_import_offenders(sites)
+    }
+    reported_by_class_b = [module for *_, module in _installed_module_offenders(sites)]
+
+    assert reported_by_class_a == dict.fromkeys(root_modules, REPO_ROOT), (
+        f'{root_modules} sit at the pyright execution root {REPO_ROOT}, the '
+        f'directory holding the root pyproject.toml, and pyright resolves local '
+        f'imports against it. So a suppression on an import of one is vestigial, '
+        f'and class (a) must report it at that root; it reported '
+        f'{reported_by_class_a}. A fresh interpreter of this environment cannot '
+        f'import these modules, so without this root they would escape BOTH '
+        f'guards'
+    )
+    assert not reported_by_class_b, (
+        f'class (b) also reported {reported_by_class_b}, which class (a) already '
+        f'claims; each site belongs to exactly one guard and its one remedy'
     )
