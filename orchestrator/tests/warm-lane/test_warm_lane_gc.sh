@@ -247,12 +247,10 @@ _TMPDIRS+=("$ERR_FILE")
 # other call site (same idiom as K4's PATH prefix and O-env's).
 #
 # The pin is behaviour-NEUTRAL, not merely believed to be. $LANE_PROTECT_GLOB_FALLBACK
-# is a strict SUPERSET of what gc.sh renders by default: the same bands, plus
-# `_merge-verify` (already covered by `_merge-*`) and `.lane-state`/`.task-meta`
-# (dot-prefixed, and gc.sh's candidate loop is `"$WORKTREES_DIR"/*/` with no
-# `shopt -s dotglob` anywhere, so neither can ever match an enumerated entry).
-# If pinning ever MOVES an existing assert, that superset argument has broken
-# and the seam — not the assert — is what needs revisiting.
+# EQUALS, byte for byte, what gc.sh renders by default, and
+# orchestrator/tests/test_lane_state_lib.py::TestProtectGlobFallbackIsAVerbatimRender
+# fails the build on any difference in either direction. If pinning ever MOVES
+# an existing assert, the seam — not the assert — is what needs revisiting.
 #
 # >>> A BLOCK THAT ASSERTS WHAT THE **DEFAULT** PROTECTS MUST CALL
 # >>> run_helper_live_default, OR IT SILENTLY TESTS THE PIN INSTEAD OF THE

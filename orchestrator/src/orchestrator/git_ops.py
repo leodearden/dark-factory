@@ -6443,7 +6443,9 @@ class GitOps:
         regresses, this wrapper provides no independent defense. See
         ``TestRunThinWarmLaneFlockContention`` in ``test_git_ops.py`` for a
         unit test that exercises this against a real held flock (not just a
-        scripted exit code).
+        scripted exit code).  The script also refuses, with the same 75, a
+        lane a live process references; see
+        ``orchestrator/scripts/warm-lane/README.md`` "Delta 17".
 
         **Lane-lock coupling gap (task 2442 review — CLOSED by task 2599)**:
         the mutual exclusion above additionally requires the OTHER party in
@@ -6476,14 +6478,19 @@ class GitOps:
         exclusion between this method and :meth:`_seed_warm_lane` racing
         each other on the SAME lock file.
 
-        Exit-code taxonomy (per the reify δ contract):
-            0   — thinned (``target/`` removed).
+        Exit-code taxonomy (per the reify δ contract).  Every code the script
+        itself returns is logged with its stderr:
+            0   — thinned (``target/`` removed), logged at INFO.  A degraded
+                  ``/proc`` fails the T4 gate open, and its only trace is
+                  ``lib_live_refs.sh``'s ``live-ref scan DEGRADED`` line there.
             1   — guard refusal (logged at WARNING).
-            2   — usage error (logged at WARNING).
-            75  — EX_TEMPFAIL: the lane's own flock is held (already
-                  re-acquired concurrently) — a BENIGN skip, never logged at
-                  WARNING (§9.5 inv.11: release-thin is not an
-                  escalation/fault).
+            2   — usage/wiring error, incl. a missing sibling
+                  ``lib_live_refs.sh`` (logged at WARNING).
+            75  — lane busy: its flock is held (re-acquired concurrently) OR
+                  a live process references it (thin's T4 gate, task 5307) —
+                  both a BENIGN skip, never logged at WARNING (§9.5 inv.11:
+                  release-thin is not an escalation/fault), logged at DEBUG;
+                  the stderr token names the cause.
             127 — no implementation at either location, pool storage absent,
                   or unexpected exception (fail-soft sentinel).
 
@@ -6507,12 +6514,14 @@ class GitOps:
             cmd = [str(script), str(lane_dir)]
             rc, _, err = await _run(cmd, cwd=self.project_root)
             if rc == 0:
-                logger.info('_run_thin_warm_lane: thinned %s', lane_dir)
+                logger.info(
+                    '_run_thin_warm_lane: thinned %s (stderr=%r)', lane_dir, err,
+                )
             elif rc == 75:
                 logger.debug(
-                    '_run_thin_warm_lane: lane %s already re-acquired '
-                    '(rc=75, flock held) — benign skip',
-                    lane_dir,
+                    '_run_thin_warm_lane: lane %s busy (rc=75, EX_TEMPFAIL) '
+                    '— benign skip (stderr=%r)',
+                    lane_dir, err,
                 )
             else:
                 logger.warning(
@@ -8851,7 +8860,12 @@ class GitOps:
            idle-hold of a divergent ``target/`` is eliminated.  Best-effort /
            never-raise (:meth:`_run_thin_warm_lane` never raises), so a thin
            hiccup can never strand the pool release or the scheduler
-           (inv.11: release-thin is not an escalation/fault).
+           (inv.11: release-thin is not an escalation/fault).  On a live
+           process reference the thin is SKIPPED, not deferred: no retry is
+           scheduled, and the preserved ``target/`` is reclaimed by the next
+           acquire's re-seed (D10) or the next gc pass, whose Pass-1 per-lane
+           live-reference gate covers it
+           (``orchestrator/scripts/warm-lane/README.md`` "Delta 17").
 
         Absent the knob (default False), ``target/`` is left in place
         incidentally (CoW-cheap, harmless) — the *next*
