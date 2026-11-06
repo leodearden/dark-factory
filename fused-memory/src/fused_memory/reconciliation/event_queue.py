@@ -64,7 +64,7 @@ def _release_row_once_written(
     event_id: str,
     ok: bool,
 ) -> None:
-    """``on_written`` hook of a journaled event's dead-letter write.
+    """``on_settled`` hook of a journaled event's dead-letter write.
 
     Runs before the write's future resolves: on the writer thread, or inline
     when the hand-off itself failed. The journal's connection is
@@ -538,17 +538,17 @@ class EventQueue:
         resolves ``True`` once the record is written, ``False`` if it failed;
         a coroutine awaiting it through ``asyncio.wrap_future`` resumes only
         after that release has run, because the release is the write's
-        ``on_written`` hook, queued on the loop before the future resolves.
+        ``on_settled`` hook, queued on the loop before the future resolves.
         """
-        on_written = None
+        release_row = None
         if self._journal is not None:
-            on_written = functools.partial(
+            release_row = functools.partial(
                 _release_row_once_written,
                 asyncio.get_running_loop(), self._journal, event.id,
             )
         return self._dead_letter_writer.append(
             _dead_letter_record(event, reason=reason, attempts=attempts),
-            on_written=on_written,
+            on_settled=release_row,
         )
 
     # ── read dead-letters ──────────────────────────────────────────────
