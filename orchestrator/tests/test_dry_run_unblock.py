@@ -34,6 +34,7 @@ from shared.process_cost import ProcessCostBasis
 from shared.testing import make_gate_mock
 
 from orchestrator.agents import sandbox_dispatch
+from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import OrchestratorConfig, TranscriptArchiveConfig
 from orchestrator.dry_run_unblock import _TASK_EMPTY_STATE, _TASK_UNAVAILABLE_STATE
 from orchestrator.scheduler import Scheduler
@@ -2860,6 +2861,15 @@ class TestPromptCarriesTaskContext:
         assert 'verify exhausted' in prompt, prompt
         assert 'All 5 attempts timed out' in prompt, prompt
         assert 'Investigate and emit your structured proposal.' in prompt, prompt
+
+    @pytest.mark.asyncio
+    async def test_prompt_names_the_task_scoped_reviews_directory(self, tmp_path):
+        """Reviewer verdicts live in the task root, which no lane `.task/` link reaches."""
+        prompt = await _capture_investigation_prompt(tmp_path, _TaskDocScheduler())
+
+        reviews_dir = TaskArtifacts.for_task(tmp_path, '42').artifact_path('reviews')
+        assert f'**Reviews directory:** {reviews_dir}' in prompt.splitlines(), prompt
+        assert str(tmp_path / '.task' / 'reviews') not in prompt, prompt
 
     @pytest.mark.asyncio
     async def test_oversized_task_text_is_bounded_and_marked(self, tmp_path):
