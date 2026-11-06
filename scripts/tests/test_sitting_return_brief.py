@@ -726,6 +726,46 @@ class TestExecutorAuditDraw:
         match = DONE_LINE.match(out.splitlines()[-1])
         assert match is not None and match.group(6) == 'degraded'
 
+    def test_pruned_or_unreadable_closes_outside_the_audit_week_leave_the_section_ok(self, env, capsys):
+        _twelve_executor_closes(env)
+        archive = env.queue / 'archive' / '2026-09-25'
+        pruned = _executor_close(env, 40, closed_at=_hours_before_now(40 * 24))
+        corrupt = _executor_close(env, 41, closed_at=_hours_before_now(40 * 24))
+        (archive / f'{pruned.escalation_id}.json').unlink()
+        (archive / f'{corrupt.escalation_id}.json').write_text('{not json')
+
+        rc, out = _run(capsys, env.argv())
+
+        assert rc == 0
+        section = _sections(env.output.read_text())[TITLES[5]]
+        assert 'shortfall: executor_close' not in section
+        assert len(_audit_items(section)) == audits.SAMPLE_SIZE
+        match = DONE_LINE.match(out.splitlines()[-1])
+        assert match is not None and match.group(6) == 'ok'
+
+    def test_an_in_window_close_whose_escalation_aged_out_is_stated_once_not_a_shortfall(self, env, capsys):
+        _twelve_executor_closes(env)
+        pruned = _executor_close(env, 30, closed_at=_hours_before_now(3))
+        (env.queue / 'archive' / '2026-09-25' / f'{pruned.escalation_id}.json').unlink()
+
+        rc, out = _run(capsys, env.argv())
+
+        assert rc == 0
+        section = _sections(env.output.read_text())[TITLES[5]]
+        assert section.count(mod.AGED_OUT.format(count=1)) == 1
+        assert 'shortfall: executor_close' not in section
+        match = DONE_LINE.match(out.splitlines()[-1])
+        assert match is not None and match.group(6) == 'ok'
+
+    def test_with_nothing_aged_out_the_aged_out_line_is_absent(self, env, capsys):
+        _twelve_executor_closes(env)
+
+        _run(capsys, env.argv())
+
+        section = _sections(env.output.read_text())[TITLES[5]]
+        assert mod.AGED_OUT.format(count=1) not in section
+        assert mod.AGED_OUT.format(count=0) not in section
+
     def test_a_drawn_audit_is_answerable_by_the_audit_verb_and_leaves_the_next_draw(self, env, capsys):
         _twelve_executor_closes(env)
         _run(capsys, env.argv())
