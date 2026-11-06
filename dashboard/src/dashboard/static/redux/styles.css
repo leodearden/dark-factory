@@ -562,6 +562,7 @@ table { border-collapse: collapse; width: 100%; }
 
 /* ── Tasks tab: the PRD lanes page (prd_lanes.jsx, task 6585) ── */
 .prd-lanes { display: flex; flex-direction: column; gap: 12px; padding: 4px 0; }
+.prd-lanes-head { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; font-size: 11px; color: var(--fg-1); }
 .prd-legend { display: flex; flex-wrap: wrap; gap: 10px; font-size: 10px; color: var(--fg-2); font-family: var(--mono); }
 .prd-legend-item { display: inline-flex; align-items: center; gap: 4px; }
 .prd-legend-swatch { width: 8px; height: 8px; border-radius: 2px; flex: none; }
@@ -616,12 +617,15 @@ table { border-collapse: collapse; width: 100%; }
 }
 .dark-matter-row:hover { color: var(--accent); }
 .prd-footer { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; font-size: 11px; color: var(--fg-3); }
-.prd-footer .pip { display: inline-flex; align-items: center; gap: 4px; font-family: var(--mono); font-size: 10px; }
-.prd-footer .pip-dot { width: 7px; height: 7px; border-radius: 50%; }
+.prd-footer .pip, .prd-lanes-head .pip, .prd-contention-head .pip {
+  display: inline-flex; align-items: center; gap: 4px; font-family: var(--mono); font-size: 10px;
+}
+.prd-footer .pip-dot, .prd-lanes-head .pip-dot, .prd-contention-head .pip-dot { width: 7px; height: 7px; border-radius: 50%; }
 .prd-contention {
   display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
   padding: 4px 0 8px; font-size: 11px; font-family: var(--mono); color: var(--fg-2);
 }
+.prd-contention-head { display: inline-flex; align-items: center; gap: 6px; color: var(--fg-1); }
 .prd-contention-entry { color: var(--fg-1); }
 .prd-unknown { font-style: normal; }
 

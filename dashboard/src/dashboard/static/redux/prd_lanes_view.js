@@ -58,6 +58,12 @@ function projectPrdContention(data, project) {
   return prdsDatum(data, 'PRD_CONTENTION', project);
 }
 
+// ── A figure's title: its row detail, if any, then the served rule ──
+
+function figureTitle(rule, detail) {
+  return detail ? `${detail}\n\n${rule}` : rule;
+}
+
 // ── A row's cells ──
 
 function readyCell(ready) {
@@ -167,6 +173,7 @@ const PRD_LANES_VIEW_API = {
   darkMatterPage,
   membersDrawn,
   inputPip,
+  figureTitle,
 };
 
 if (typeof module !== 'undefined' && module.exports) {
