@@ -909,13 +909,15 @@ working directory. See
 `env` reaches the script on every path. A predicate, no-target or
 cross-unit deploy runs the script with `env` overlaid on the
 orchestrator's own environment. A self-target deploy (`target_unit` is the
-orchestrator's own unit) passes each entry as `systemd-run --setenv`. That
-script starts from the systemd user manager's environment, not the
+orchestrator's own unit) runs the script in a `systemd-run` transient unit
+as `/bin/sh -c 'KEY=value … <script> <args>'`. That script starts from the
+systemd user manager's environment plus `env`, not from the
 orchestrator's, because `systemd-run` passes on none of its caller's
-environment. Keys must be environment variable names: no `=` and no NUL.
-A self-target deploy refuses `PYTHONPATH` in `env` with a born-at-L2
-`infra_issue`, because the RP-4 on-failure submit child owns that variable
-in the same transient unit. The mechanism is
+environment. The assignments prefix the script alone, so the unit's RP-4
+on-failure escalation submit sees none of `env`. Keys must be portable
+environment variable names, matching `[A-Za-z_][A-Za-z0-9_]*`. A deploy
+(`target_unit` set) refuses any other key with a born-at-L2 `infra_issue`
+and does not run the script. The mechanism is
 `orchestrator/src/orchestrator/proc_supervision.py::RestartPlan`.
 
 **`metadata.always_escalates`** (`bool`, default `false`) — file a

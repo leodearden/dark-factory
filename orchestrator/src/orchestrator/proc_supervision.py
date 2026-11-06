@@ -61,11 +61,13 @@ import importlib
 import importlib.util
 import logging
 import os
+import re
 import shlex
 import sys
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 from orchestrator.systemd_inspect import _empty_baseline_fresh, inspect_systemd_unit
@@ -101,9 +103,10 @@ silently drift apart (task 3404).
 # ``escalation.queue`` -> ``shared.timestamps`` -> ``shared/__init__.py``.
 _SUBMIT_CHILD_PACKAGES: tuple[str, ...] = ('escalation', 'shared')
 
-# The environment variable the RP-4 submit child's ``--setenv`` owns inside a
-# detached transient unit; ``RestartPlan.env`` may not also set it there.
-_SUBMIT_CHILD_ENV_KEY = 'PYTHONPATH'
+# The portable environment variable name (POSIX shell ``name``) every
+# ``RestartPlan.env`` key must match. The detached path relies on it: it
+# renders each entry as an unquoted ``KEY=`` shell assignment.
+_PORTABLE_ENV_NAME = re.compile(r'[A-Za-z_][A-Za-z0-9_]*')
 
 
 def _submit_child_pythonpath() -> str:
@@ -189,7 +192,7 @@ def _submit_child_setenv_args() -> list[str]:
             'gives it (per-package causes logged above)',
         )
         return []
-    return [f'--setenv={_SUBMIT_CHILD_ENV_KEY}={pythonpath}']
+    return [f'--setenv=PYTHONPATH={pythonpath}']
 
 
 def _warn_if_submit_module_unimportable(transient_unit: str | None) -> None:
@@ -437,7 +440,9 @@ class RestartPlan:
     the RP-4 on-failure wrapper.
 
     ``env`` holds the extra environment variables the restart script
-    receives, and every ``execute()`` path delivers them.
+    receives, and every ``execute()`` path delivers them to the script alone.
+    It is stored as a read-only copy, so the ``__post_init__`` checks hold for
+    the plan's whole life.
     """
 
     script: Path
@@ -459,29 +464,18 @@ class RestartPlan:
             )
         if not self.script.is_absolute():
             object.__setattr__(self, 'script', self.cwd / self.script)
+        object.__setattr__(self, 'env', MappingProxyType(dict(self.env)))
         self._check_env()
 
     def _check_env(self) -> None:
-        """Refuse an ``env`` that some spawn path would mis-deliver silently."""
+        """Refuse an ``env`` key that is not a portable variable name, so every
+        spawn path accepts exactly the same keys."""
         for key in self.env:
-            if not key or '=' in key or '\x00' in key:
+            if not _PORTABLE_ENV_NAME.fullmatch(key):
                 raise ValueError(
-                    f'RestartPlan.env keys must be environment variable names '
-                    f'(non-empty, no "=" or NUL); got {key!r}'
+                    f'RestartPlan.env keys must be portable environment variable '
+                    f'names matching {_PORTABLE_ENV_NAME.pattern}; got {key!r}'
                 )
-        if (
-            self.transient_unit
-            and self.on_failure_escalation is not None
-            and _SUBMIT_CHILD_ENV_KEY in self.env
-        ):
-            raise ValueError(
-                f'RestartPlan.env[{_SUBMIT_CHILD_ENV_KEY!r}] is refused on a plan '
-                f'with on_failure_escalation and transient_unit='
-                f'{self.transient_unit!r}: the detached payload and its RP-4 '
-                f'submit child share one transient unit, and the submit '
-                f'child\'s --setenv={_SUBMIT_CHILD_ENV_KEY} owns that variable '
-                f'there, so one of the two would be silently overridden'
-            )
 
     def _child_environ(self) -> dict[str, str] | None:
         """``env`` overlaid on ``os.environ``, or None (full inherit) when empty: the
@@ -867,14 +861,25 @@ class RestartPlan:
         So the token is emitted GATED on ``on_failure_escalation`` — it exists
         solely so the RP-4 ``python -m escalation submit`` child can import,
         and a plan with no escalation spec has no submit token in its payload,
-        keeping that argv byte-identical. The plan's own ``env`` tokens are
-        NOT gated, and precede it. See :func:`_submit_child_pythonpath`
+        keeping that argv byte-identical. See :func:`_submit_child_pythonpath`
         for how the value is built, and :meth:`EscalationSpec.to_submit_argv`
         for the OTHER leg of the child's importability (interpreter identity,
         which PYTHONPATH cannot cover).
+
+        The plan's own ``env`` is scoped to the payload command, NOT the unit:
+        each entry is a ``KEY=<quoted value>`` shell assignment prefixing the
+        script, so the RP-4 submit child sees none of it and keeps only the
+        user manager's environment plus its own PYTHONPATH. ``_check_env``'s
+        name rule is what makes the unquoted ``KEY=`` a valid assignment.
         """
         on_active_secs = max(int(self.on_active_secs), 5)
-        payload = ' '.join(shlex.quote(p) for p in [str(self.script), *self.args])
+        env_assignments = [
+            f'{key}={shlex.quote(value)}' for key, value in self.env.items()
+        ]
+        payload = ' '.join([
+            *env_assignments,
+            *(shlex.quote(p) for p in [str(self.script), *self.args]),
+        ])
         if self.on_failure_escalation is not None:
             _warn_if_submit_module_unimportable(self.transient_unit)
             on_failure_argv = self.on_failure_escalation.to_submit_argv(sys.executable)
@@ -936,7 +941,6 @@ class RestartPlan:
         else:
             wrapped = payload
             setenv_args = []
-        env_args = [f'--setenv={key}={value}' for key, value in self.env.items()]
 
         argv = [
             'systemd-run', '--user',
@@ -944,7 +948,6 @@ class RestartPlan:
             f'--unit={self.transient_unit}',
             '--collect',
             f'--working-directory={self.cwd}',
-            *env_args,
             *setenv_args,
             '/bin/sh', '-c', wrapped,
         ]

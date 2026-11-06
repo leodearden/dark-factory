@@ -11427,9 +11427,9 @@ class TestOperationalLlmGateMarker:
 
 # ---------------------------------------------------------------------------
 # Task 8598: before_done.env reaches the self-target detached restart. The
-# DEFAULT restart scheduler builds a RestartPlan whose systemd-run argv must
-# carry each entry as --setenv, because systemd-run passes on none of this
-# process's environment.
+# DEFAULT restart scheduler builds a RestartPlan whose /bin/sh -c payload
+# prefixes the script with one KEY=value assignment per entry, because
+# systemd-run passes on none of this process's environment.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -11467,27 +11467,32 @@ class TestSelfTargetRestartCarriesBeforeDoneEnv:
         ]
         return outcome, systemd_run_calls, script_runner, scheduler, queue
 
-    async def test_before_done_env_reaches_systemd_run_argv(self, tmp_path: Path):
+    async def test_before_done_env_reaches_the_payload_command(self, tmp_path: Path):
         from orchestrator.workflow import WorkflowOutcome
 
         outcome, systemd_run_calls, script_runner, _scheduler, _queue = (
-            await self._run_self_target(tmp_path, {'DEPLOY_FLAG': 'canary'})
+            await self._run_self_target(
+                tmp_path, {'DEPLOY_FLAG': 'canary', 'PYTHONPATH': '/payload-only'},
+            )
         )
 
         assert outcome == WorkflowOutcome.DONE
         assert len(systemd_run_calls) == 1
         argv = systemd_run_calls[0].args
-        assert '--setenv=DEPLOY_FLAG=canary' in argv, (
-            f'before_done.env must reach the transient unit: {argv!r}'
+        assert argv[-1].startswith('DEPLOY_FLAG=canary PYTHONPATH=/payload-only /'), (
+            f'before_done.env must prefix the deploy script: {argv[-1]!r}'
         )
-        assert argv.index('--setenv=DEPLOY_FLAG=canary') < argv.index('/bin/sh')
+        assert not any(
+            token.startswith(('--setenv=DEPLOY_FLAG', '--setenv=PYTHONPATH=/payload-only'))
+            for token in argv
+        ), f'before_done.env must not become a unit-wide --setenv: {argv!r}'
         script_runner.assert_not_awaited()
 
-    async def test_pythonpath_in_env_is_refused_loudly_not_dropped(self, tmp_path: Path):
+    async def test_non_portable_env_key_is_refused_loudly(self, tmp_path: Path):
         from orchestrator.workflow import WorkflowOutcome
 
         outcome, systemd_run_calls, _script_runner, scheduler, queue = (
-            await self._run_self_target(tmp_path, {'PYTHONPATH': '/x'})
+            await self._run_self_target(tmp_path, {'FOO-BAR': 'x'})
         )
 
         assert outcome == WorkflowOutcome.BLOCKED
@@ -11495,7 +11500,7 @@ class TestSelfTargetRestartCarriesBeforeDoneEnv:
         pending = queue.get_by_task('8598', status='pending')
         assert len(pending) == 1
         assert pending[0].category == 'infra_issue'
-        assert 'PYTHONPATH' in pending[0].detail
+        assert 'FOO-BAR' in pending[0].detail
         assert all(
             'done' not in call.args for call in scheduler.set_task_status.call_args_list
         ), 'a refused env must never be reported as a scheduled DONE'
@@ -11574,8 +11579,8 @@ class TestCrossUnitDeployCarriesBeforeDoneEnv:
 
     async def test_invalid_env_key_is_refused_loudly(self, tmp_path: Path):
         """RestartPlan refuses an env key holding '='. On this path the refusal
-        must still file a born-at-L2 infra_issue, as the exec-time failure of
-        the same key did before RestartPlan carried env."""
+        must file a born-at-L2 infra_issue that names the plan refusal, not a
+        deploy script failure: the script never ran."""
         from orchestrator.deterministic_runner import DeterministicRunner
         from orchestrator.workflow import WorkflowOutcome
 
@@ -11601,5 +11606,8 @@ class TestCrossUnitDeployCarriesBeforeDoneEnv:
         pending = queue.get_by_task('8598e', status='pending')
         assert len(pending) == 1
         assert pending[0].category == 'infra_issue'
+        assert pending[0].summary == (
+            'Deploy plan refused before_done: orchestrator-reify.service'
+        )
         assert 'A=B' in pending[0].detail
         assert 'environment variable name' in pending[0].detail

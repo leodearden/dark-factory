@@ -3735,9 +3735,6 @@ class DeterministicRunner:
                 paths = self._before_done_paths(before_done)
 
                 try:
-                    # Built inside the try: RestartPlan refuses an env it would
-                    # mis-deliver, and that refusal must reach the born-at-L2
-                    # catch-all below rather than escape run().
                     plan = RestartPlan(
                         script=paths.script,
                         args=list(before_done.get('args') or []),
@@ -3756,6 +3753,22 @@ class DeterministicRunner:
                         transient_unit=None,
                         env=dict(before_done.get('env') or {}),
                     )
+                except ValueError as exc:
+                    refusal_detail = '\n'.join([
+                        description,
+                        f'Target unit: {target_unit}',
+                        f'The deploy plan refused before_done, so the deploy script '
+                        f'was NOT run: {exc}',
+                        'before_done_ran_at is already stamped (I1) — the deploy is NOT re-run.',
+                    ])
+                    return await self._file_infra_issue_and_block(
+                        task_id,
+                        summary=f'Deploy plan refused before_done: {target_unit}',
+                        detail=refusal_detail,
+                        metadata=metadata,
+                    )
+
+                try:
                     outcome = await asyncio.wait_for(
                         plan.execute(runner=_shim_runner, inspector=_capturing_inspector),
                         timeout=outer_timeout,
