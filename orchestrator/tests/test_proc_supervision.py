@@ -1992,3 +1992,62 @@ class TestBlockingAndLeafSpawnCarryEnv:
 
         assert blocking_runner.calls[0][1].get('env') is None
         assert leaf_runner.calls[0][1].get('env') is None
+
+
+class TestEnvInvariants:
+    """``RestartPlan.__post_init__`` refuses an env that a spawn path would
+    mis-deliver silently."""
+
+    @pytest.mark.parametrize('key', ['A=B', '', 'A\x00B'])
+    def test_env_key_with_equals_or_empty_is_refused(self, key: str) -> None:
+        with pytest.raises(ValueError) as excinfo:
+            _leaf_plain_spawn_plan(env={key: 'v'})
+
+        message = str(excinfo.value)
+        assert 'environment variable name' in message
+        assert repr(key) in message
+
+    def test_detached_plan_with_submit_child_refuses_pythonpath_in_env(
+        self, tmp_queue_dir: Path,
+    ) -> None:
+        import dataclasses
+
+        with pytest.raises(ValueError) as excinfo:
+            dataclasses.replace(
+                detached_rp4_plan(tmp_queue_dir, with_spec=True),
+                env={'PYTHONPATH': '/x'},
+            )
+
+        message = str(excinfo.value)
+        assert 'PYTHONPATH' in message
+        assert 'on_failure_escalation' in message
+        assert 'orch-redeploy-restart-99.service' in message
+
+    @pytest.mark.asyncio
+    async def test_pythonpath_allowed_without_submit_child(
+        self, tmp_queue_dir: Path,
+    ) -> None:
+        import dataclasses
+
+        from orchestrator.proc_supervision import EscalationSpec
+
+        spec_less = dataclasses.replace(
+            detached_rp4_plan(tmp_queue_dir, with_spec=False),
+            env={'PYTHONPATH': '/x'},
+        )
+        dataclasses.replace(
+            _build_cross_unit_verify_plan(
+                on_failure_escalation=EscalationSpec(
+                    queue_dir=str(tmp_queue_dir),
+                    task_id='task-55',
+                    summary='Cross-unit deploy verify failed',
+                ),
+            ),
+            env={'PYTHONPATH': '/x'},
+        )
+        runner = FakeRunner(returncode=0)
+
+        await spec_less.execute(runner=runner)
+
+        argv, _kwargs = runner.calls[0]
+        assert '--setenv=PYTHONPATH=/x' in argv
