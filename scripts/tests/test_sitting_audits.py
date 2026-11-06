@@ -175,15 +175,49 @@ class TestExecutorCloses:
         assert _ids(found.in_window) == [f'dec-{SAMPLED_CLASS}-1']
         assert found.shortfalls == ()
 
-    def test_a_close_outside_the_window_is_not_in_it_but_counts_for_its_class(self, fleet):
+    def test_a_close_outside_the_window_is_not_in_it_but_its_audit_counts_for_its_class(self, fleet):
         fleet.executor_close(1)
-        fleet.executor_close(2, closed_at=OUTSIDE_WINDOW)
+        audited_old = fleet.executor_close(2, closed_at=OUTSIDE_WINDOW)
         fleet.executor_close(3, policy_class=FULL_CLASS, closed_at=OUTSIDE_WINDOW)
+        fleet.audit(audited_old, AuditVerdict.OK)
 
         found = fleet.closes()
 
         assert _ids(found.in_window) == [f'dec-{SAMPLED_CLASS}-1']
-        assert dict(found.lifetime_by_class) == {SAMPLED_CLASS: 2, FULL_CLASS: 1}
+        assert dict(found.audited_by_class) == {SAMPLED_CLASS: 1}
+
+    def test_the_audit_count_is_fleet_wide_by_recorded_class_and_outlives_the_archive(self, fleet, tmp_path):
+        elsewhere = tmp_path / 'src' / 'reify' / 'data' / 'escalations'
+        audited = [
+            fleet.executor_close(1),
+            fleet.executor_close(2, closed_at=OUTSIDE_WINDOW),
+            fleet.executor_close(3, policy_class=FULL_CLASS, closed_at=OUTSIDE_WINDOW),
+            fleet.executor_close(4, queue=elsewhere),
+        ]
+        fleet.executor_close(5)
+        fleet.executor_close(6, closed_at=OUTSIDE_WINDOW)
+        for record in audited:
+            fleet.audit(record, AuditVerdict.OK)
+        expected = {SAMPLED_CLASS: 3, FULL_CLASS: 1}
+
+        assert dict(fleet.closes().audited_by_class) == expected
+        for path in [*fleet.queue.rglob('esc-*.json'), *elsewhere.rglob('esc-*.json')]:
+            path.unlink()
+        assert dict(fleet.closes().audited_by_class) == expected
+
+    def test_closes_outside_the_window_are_never_joined(self, fleet, tmp_path):
+        fleet.executor_close(1)
+        fleet.executor_close(2, closed_at=OUTSIDE_WINDOW)
+        (fleet.queue / 'archive' / '2026-09-25' / 'esc-702-1.json').unlink()
+        fleet.executor_close(3, closed_at=OUTSIDE_WINDOW)
+        (fleet.queue / 'archive' / '2026-09-25' / 'esc-703-1.json').write_text('{not json')
+        fleet.executor_close(4, closed_at=OUTSIDE_WINDOW, queue=tmp_path / 'src' / 'reify' / 'data' / 'escalations')
+
+        found = fleet.closes()
+
+        assert _ids(found.in_window) == [f'dec-{SAMPLED_CLASS}-1']
+        assert found.shortfalls == ()
+        assert found.aged_out == 0
 
     def test_an_audited_close_carries_its_outcome(self, fleet):
         record = fleet.executor_close(1)
@@ -206,19 +240,31 @@ class TestExecutorCloses:
         assert f'dec-{SAMPLED_CLASS}-1' in shortfall.reason
         assert shortfall.path == normalize_escalations_dir(elsewhere)
 
-    def test_an_unreadable_or_missing_escalation_record_is_a_shortfall(self, fleet):
+    def test_an_unreadable_in_window_escalation_record_is_a_shortfall(self, fleet):
         fleet.executor_close(1)
         (fleet.queue / 'esc-950-1.json').write_text('{not json')
         fleet.decision('dec-unreadable', 'esc-950-1', closed_at=_in_window(2))
-        fleet.decision('dec-missing', 'esc-951-1', closed_at=_in_window(3))
 
         found = fleet.closes()
 
         assert _ids(found.in_window) == [f'dec-{SAMPLED_CLASS}-1']
-        assert {s.path for s in found.shortfalls} >= {str(fleet.queue / 'esc-950-1.json')}
-        reasons = ' '.join(s.reason for s in found.shortfalls)
-        assert 'dec-unreadable' in reasons and 'dec-missing' in reasons
-        assert len(found.shortfalls) == 2
+        (shortfall,) = found.shortfalls
+        assert shortfall.path == str(fleet.queue / 'esc-950-1.json')
+        assert 'dec-unreadable' in shortfall.reason
+        assert found.aged_out == 0
+
+    def test_an_in_window_close_whose_escalation_aged_out_is_counted_not_a_shortfall(self, fleet):
+        fleet.executor_close(1)
+        pruned = fleet.decision('dec-missing', 'esc-951-1', closed_at=_in_window(3))
+
+        found = fleet.closes()
+
+        assert _ids(found.in_window) == [f'dec-{SAMPLED_CLASS}-1']
+        assert found.shortfalls == ()
+        assert found.aged_out == 1
+        assert mod.executor_close_of(pruned, fleet.index()) == mod.AgedOut(
+            decision_id='dec-missing', escalation_id='esc-951-1', queue_dir=fleet.queue_dir,
+        )
 
 
 class TestDraw:
@@ -229,7 +275,7 @@ class TestDraw:
         self._twelve(fleet)
         found = fleet.closes()
 
-        draw = mod.draw(found.in_window, seed='2026-09-26', lifetime_by_class=found.lifetime_by_class,
+        draw = mod.draw(found.in_window, seed='2026-09-26', audited_by_class=found.audited_by_class,
                         sample_size=10)
 
         assert draw.state == 'drawn'
@@ -246,7 +292,7 @@ class TestDraw:
 
         def drawn(seed: str) -> frozenset[str]:
             closes = tuple(reversed(found.in_window))
-            draw = mod.draw(closes, seed=seed, lifetime_by_class=found.lifetime_by_class, sample_size=10)
+            draw = mod.draw(closes, seed=seed, audited_by_class=found.audited_by_class, sample_size=10)
             return frozenset(_ids(draw.sampled))
 
         assert drawn('2026-09-26') == drawn('2026-09-26')
@@ -258,7 +304,7 @@ class TestDraw:
             fleet.audit(record, AuditVerdict.OK)
         found = fleet.closes()
 
-        draw = mod.draw(found.in_window, seed='2026-09-26', lifetime_by_class=found.lifetime_by_class,
+        draw = mod.draw(found.in_window, seed='2026-09-26', audited_by_class=found.audited_by_class,
                         sample_size=10)
 
         assert sorted(_ids(draw.sampled)) == sorted(record.id for record in records[3:])
@@ -270,7 +316,7 @@ class TestDraw:
         self._twelve(fleet)
         found = fleet.closes()
 
-        draw = mod.draw(found.in_window, seed='2026-09-26', lifetime_by_class=found.lifetime_by_class,
+        draw = mod.draw(found.in_window, seed='2026-09-26', audited_by_class=found.audited_by_class,
                         sample_size=10)
 
         assert sorted(_ids(draw.full)) == sorted(record.id for record in full)
@@ -283,16 +329,43 @@ class TestDraw:
         found = fleet.closes()
         reached = {FULL_CLASS: _audit_full_until(FULL_CLASS)}
 
-        draw = mod.draw(found.in_window, seed='2026-09-26', lifetime_by_class=reached, sample_size=10)
+        draw = mod.draw(found.in_window, seed='2026-09-26', audited_by_class=reached, sample_size=10)
 
         assert draw.full == ()
         assert len(draw.sampled) == 3
+
+    def test_a_class_one_audit_short_of_its_full_count_is_still_drawn_whole(self, fleet):
+        full = [fleet.executor_close(n, policy_class=FULL_CLASS) for n in range(20, 23)]
+        found = fleet.closes()
+        short = {FULL_CLASS: _audit_full_until(FULL_CLASS) - 1}
+
+        draw = mod.draw(found.in_window, seed='2026-09-26', audited_by_class=short, sample_size=10)
+
+        assert sorted(_ids(draw.full)) == sorted(record.id for record in full)
+        assert draw.sampled == ()
+
+    def test_unaudited_closes_do_not_advance_a_class_toward_its_full_count(self, fleet):
+        for n in range(30, 30 + _audit_full_until(FULL_CLASS)):
+            fleet.executor_close(n, policy_class=FULL_CLASS, closed_at=OUTSIDE_WINDOW)
+        fresh = fleet.executor_close(1, policy_class=FULL_CLASS)
+        found = fleet.closes()
+
+        draw = mod.draw(found.in_window, seed='2026-09-26', audited_by_class=found.audited_by_class)
+
+        assert _ids(draw.full) == [fresh.id]
+
+    def test_the_draw_carries_the_aged_out_count(self, fleet):
+        fleet.executor_close(1)
+        found = fleet.closes()
+
+        assert mod.draw(found.in_window, seed='2026-09-26', audited_by_class={}, aged_out=2).aged_out == 2
+        assert mod.draw(found.in_window, seed='2026-09-26', audited_by_class={}).aged_out == 0
 
     def test_a_class_no_longer_in_the_table_is_drawn_as_ordinary(self, fleet):
         fleet.executor_close(1, policy_class=RETIRED_CLASS)
         found = fleet.closes()
 
-        draw = mod.draw(found.in_window, seed='2026-09-26', lifetime_by_class=found.lifetime_by_class)
+        draw = mod.draw(found.in_window, seed='2026-09-26', audited_by_class=found.audited_by_class)
 
         assert draw.full == ()
         assert _ids(draw.sampled) == [f'dec-{RETIRED_CLASS}-1']
@@ -303,7 +376,7 @@ class TestDraw:
 
 class TestDrawStates:
     def test_no_executor_close_in_the_window(self):
-        draw = mod.draw((), seed='2026-09-26', lifetime_by_class={})
+        draw = mod.draw((), seed='2026-09-26', audited_by_class={})
 
         assert (draw.state, draw.full, draw.sampled, draw.population) == ('no_executor_close', (), (), 0)
 
@@ -311,7 +384,7 @@ class TestDrawStates:
         fleet.audit(fleet.executor_close(1), AuditVerdict.OK)
         found = fleet.closes()
 
-        draw = mod.draw(found.in_window, seed='2026-09-26', lifetime_by_class=found.lifetime_by_class)
+        draw = mod.draw(found.in_window, seed='2026-09-26', audited_by_class=found.audited_by_class)
 
         assert (draw.state, draw.full, draw.sampled, draw.population) == ('all_audited', (), (), 1)
 
@@ -334,16 +407,27 @@ class TestClassTally:
         fleet.audit(old_wrong, AuditVerdict.WRONG)
         fleet.audit(full_wrong, AuditVerdict.WRONG)
         fleet.audit(other_queue_wrong, AuditVerdict.WRONG)
-        index = fleet.index(elsewhere)
+        table = {
+            (fleet.queue_dir, SAMPLED_CLASS): (3, 2),
+            (fleet.queue_dir, FULL_CLASS): (1, 1),
+            (normalize_escalations_dir(elsewhere), SAMPLED_CLASS): (1, 1),
+            (fleet.queue_dir, RETIRED_CLASS): (0, 0),
+        }
 
-        assert mod.class_tally(fleet.root, index, fleet.queue_dir, SAMPLED_CLASS) == (3, 2)
-        assert mod.class_tally(fleet.root, index, fleet.queue_dir, FULL_CLASS) == (1, 1)
-        assert mod.class_tally(fleet.root, index, normalize_escalations_dir(elsewhere), SAMPLED_CLASS) == (1, 1)
-        assert mod.class_tally(fleet.root, index, fleet.queue_dir, RETIRED_CLASS) == (0, 0)
+        def tallies() -> dict[tuple[str, str], tuple[int, int]]:
+            return {(queue, cls): mod.class_tally(fleet.root, queue, cls) for queue, cls in table}
 
-    def test_an_audited_close_that_was_not_the_executors_is_not_counted(self, fleet):
-        fleet.escalation('esc-901-1', resolved_by='sitting-preparer')
-        carveout = fleet.decision('dec-carveout', 'esc-901-1', closed_at=_in_window(1))
-        fleet.audit(carveout, AuditVerdict.WRONG)
+        assert tallies() == table
+        for path in [*fleet.queue.rglob('esc-*.json'), *elsewhere.rglob('esc-*.json')]:
+            path.unlink()
+        assert tallies() == table
 
-        assert mod.class_tally(fleet.root, fleet.index(), fleet.queue_dir, SAMPLED_CLASS) == (0, 0)
+    def test_the_tally_counts_the_class_the_audit_recorded(self, fleet):
+        record = fleet.executor_close(1)
+        fleet.audit(record, AuditVerdict.WRONG)
+        fleet.escalation('esc-701-1', resolved_by=COORDINATOR_IDENTITY, policy_class=FULL_CLASS)
+
+        assert mod.class_tally(fleet.root, fleet.queue_dir, SAMPLED_CLASS) == (1, 1)
+        assert mod.class_tally(fleet.root, fleet.queue_dir, FULL_CLASS) == (0, 0)
+        (fleet.queue / 'archive' / '2026-09-25' / 'esc-701-1.json').unlink()
+        assert mod.class_tally(fleet.root, fleet.queue_dir, SAMPLED_CLASS) == (1, 1)

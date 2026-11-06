@@ -623,7 +623,8 @@ class TestAuditRefusals:
     def test_a_close_that_no_longer_joins_to_an_executor_close_is_refused(self, bench, capsys):
         record = bench.executor_close(1)
         n = bench.number_audit(record)
-        (bench.queue / 'archive' / '2026-09-25' / 'esc-501-1.json').unlink()
+        archived = bench.queue / 'archive' / '2026-09-25' / 'esc-501-1.json'
+        archived.write_text(json.dumps({**json.loads(archived.read_text()), 'resolved_by': COORDINATOR_IDENTITY}))
         before = self._written(bench, record)
 
         rc, rows, _ = bench.run(capsys, f'{n}=wrong')
@@ -631,6 +632,23 @@ class TestAuditRefusals:
         assert rc == 4
         assert rows[0]['refusal']['code'] == 'not_an_executor_close'
         assert self._written(bench, record) == before
+
+    def test_a_close_whose_escalation_aged_out_is_refused_and_writes_nothing(self, bench, capsys):
+        bench.go_live()
+        record = bench.executor_close(1)
+        n = bench.number_audit(record)
+        (bench.queue / 'archive' / '2026-09-25' / 'esc-501-1.json').unlink()
+        state_file = policy_state.policy_state_path(Path(bench.queue_dir))
+        decision_before = decision_path_for_id(record.id, root=bench.fleet).read_bytes()
+        state_before = state_file.read_bytes()
+
+        rc, rows, _ = bench.run(capsys, f'{n}=wrong')
+
+        assert rc == 4
+        assert rows[0]['refusal'] == {'code': 'escalation_aged_out', 'escalation_id': 'esc-501-1',
+                                      'queue_dir': bench.queue_dir}
+        assert decision_path_for_id(record.id, root=bench.fleet).read_bytes() == decision_before
+        assert state_file.read_bytes() == state_before
 
     def test_a_question_item_is_asked_back(self, bench, capsys):
         record = bench.executor_close(1)
