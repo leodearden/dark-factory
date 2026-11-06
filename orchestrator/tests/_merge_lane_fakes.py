@@ -40,7 +40,7 @@ from typing import Any
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.merge_lane import MergeLane
 from orchestrator.merge_lane.gates import PostMergePyrightResult
-from orchestrator.merge_lane.ports import ClockPort
+from orchestrator.merge_lane.ports import ClockPort, VerifyPort
 from orchestrator.merge_lane.types import DiskGuardOutcome, MergeOutcome
 from orchestrator.merge_lane.worker import MAIN_HEALTH_PROBE_PENDING_NOTE
 from orchestrator.verify import VerifyResult
@@ -462,8 +462,8 @@ def make_lane(
     git_ops: Any,
     queue: asyncio.Queue[Any] | None = None,
     *,
-    verifier: Any = None,
-    clock: Any = None,
+    verifier: VerifyPort | None = None,
+    clock: ClockPort | None = None,
     escalation_queue: Any = None,
     **kwargs: Any,
 ) -> MergeLane:
