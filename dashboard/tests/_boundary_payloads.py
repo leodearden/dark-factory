@@ -770,9 +770,11 @@ def _file_lane_escalations(root: Path, tree: Mapping[str, Scenario]) -> None:
             ))
 
 
-def _furnish_lanes(tree: Mapping[str, Scenario], *, ledger_readable: bool = True) -> Callable[[Path], None]:
+def _furnish_lanes(
+    tree: Mapping[str, Scenario], *, ledger_readable: bool = True, queue: bool = True,
+) -> Callable[[Path], None]:
     """Lay out :data:`LANES_ROOT`: its run ledger (or bytes that are no database), its escalation
-    queue, and each scenario's PRD file and sidecar."""
+    queue unless *queue* is False, and each scenario's PRD file and sidecar."""
 
     def furnish(root: Path) -> None:
         if ledger_readable:
@@ -780,7 +782,8 @@ def _furnish_lanes(tree: Mapping[str, Scenario], *, ledger_readable: bool = True
         else:
             runs_db_path(root).parent.mkdir(parents=True)
             runs_db_path(root).write_bytes(b'this is not a sqlite database\n' * 64)
-        _file_lane_escalations(root, tree)
+        if queue:
+            _file_lane_escalations(root, tree)
         for scenario in tree.values():
             prd_file = root / scenario.key
             prd_file.parent.mkdir(parents=True, exist_ok=True)
@@ -841,7 +844,8 @@ def prd_lanes_family(client: TestClient, workdir: Path) -> dict[str, Any]:
     :data:`LANES_ROOT`; ``prd_lanes_runs_db_unreadable`` a run ledger that is no
     database; ``prd_lanes_lineage_failed`` a lineage read that fails;
     ``prd_lanes_contended`` adds :data:`CONTENDED_IDS` under a scheduler whose
-    lock :data:`CARRIER` holds.
+    lock :data:`CARRIER` holds; ``prd_lanes_queueless`` lays out no escalation
+    queue, so its view is a lower bound that still draws every row.
     """
     bodies: dict[str, Any] = {}
     with holder_processes() as (live, dead):
@@ -855,6 +859,7 @@ def prd_lanes_family(client: TestClient, workdir: Path) -> dict[str, Any]:
             lineage_fails: bool = False,
             contended: bool = False,
             tasks_body: str | None = None,
+            queue: bool = True,
         ) -> None:
             substrate = lanes_substrate(tree)
             if lineage_fails:
@@ -863,7 +868,7 @@ def prd_lanes_family(client: TestClient, workdir: Path) -> dict[str, Any]:
                 _contend(substrate)
             substrates = {LANES_ROOT: substrate, QUEUELESS_ROOT: _substrate(REIFY_COUNTS)}
             furnish = {
-                LANES_ROOT: _furnish_lanes(tree, ledger_readable=ledger_readable),
+                LANES_ROOT: _furnish_lanes(tree, ledger_readable=ledger_readable, queue=queue),
                 QUEUELESS_ROOT: write_runs_db,
             }
             with _canned_roots(
@@ -881,6 +886,7 @@ def prd_lanes_family(client: TestClient, workdir: Path) -> dict[str, Any]:
             'prd_lanes_contended', contended=True,
             schedulers={LANES_ROOT: _CARRIER_HOLDS_LOCKED_MODULE},
         )
+        serve('prd_lanes_queueless', queue=False)
     return bodies
 
 

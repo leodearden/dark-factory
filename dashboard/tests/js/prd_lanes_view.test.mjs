@@ -29,7 +29,7 @@ const { api: lanesView, window: loadedWindow } = loadPrdLanesView();
 const { projectPrdView, projectPrdContention, PRDS_ENDPOINT } = lanesView;
 const { readyCell, READY_OVERDUE_DAYS, barSegments, doneOfTotal, signalCell } = lanesView;
 const { contentionEntryText, heldShareText, neverStartedText, countsText } = lanesView;
-const { darkMatterPage, DARK_MATTER_PAGE_SIZE, membersDrawn, inputPip } = lanesView;
+const { darkMatterPage, DARK_MATTER_PAGE_SIZE, membersDrawn, inputPip, figureTitle } = lanesView;
 const { servedDatum } = loadedWindow.DF_DATUM;
 
 const EXPECTED_FUNCTION_NAMES = [
@@ -46,6 +46,7 @@ const EXPECTED_FUNCTION_NAMES = [
   'darkMatterPage',
   'membersDrawn',
   'inputPip',
+  'figureTitle',
 ];
 
 test('prd_lanes_view.js exports its functions and publishes them as window.DF_PRD_LANES_VIEW', () => {
@@ -339,4 +340,15 @@ test('inputPip: a non-fresh input says its state in words, never colour alone, t
 test('inputPip: a non-fresh input with no reason falls back to its as-of instant', () => {
   const pip = inputPip({ name: 'activity', as_of: '2026-10-04T08:00:00+00:00', state: 'stale', reason: null });
   assert.equal(pip.title, '2026-10-04T08:00:00+00:00');
+});
+
+// ── A figure's title: its row detail, then the served rule ──
+
+test('figureTitle: a figure with no row detail is titled with its rule alone', () => {
+  assert.equal(figureTitle('R', null), 'R');
+  assert.equal(figureTitle('R', ''), 'R');
+});
+
+test('figureTitle: a row detail comes first, a blank line before the rule', () => {
+  assert.equal(figureTitle('R', 'K'), 'K\n\nR');
 });

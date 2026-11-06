@@ -71,12 +71,11 @@ function click(window, element) {
   window.React.act(() => element.dispatchEvent(new window.MouseEvent('click', { bubbles: true })));
 }
 
-// ProjectPrdLanes over the window's served view and rows, with a member
-// renderer that draws one li per row title, and every onSelect recorded.
-function mountLanes(ctx) {
+// ProjectPrdLanes over the window's served view (or `view`) and rows, with a
+// member renderer that draws one li per row title, and every onSelect recorded.
+function mountLanes(ctx, view = ctx.helpers.projectPrdView(ctx.D, PROJECT)) {
   const { window, D, helpers } = ctx;
   const { React } = window;
-  const view = helpers.projectPrdView(D, PROJECT);
   const pool = window.DF_TASK_SNAPSHOT.projectRows(D, PROJECT).value || [];
   const selected = [];
   const renderMembers = rows => React.createElement(
@@ -96,11 +95,34 @@ function expandTail(window, root) {
   click(window, root.querySelector('.prd-lane[data-lane="tail"] .prd-tail-line'));
 }
 
-// The title and the text of the one Datum reading inside `scope`'s `selector`.
+// The title and the text of the one titled figure inside `scope`'s `selector`.
 function reading(scope, selector) {
   const el = scope.querySelector(`${selector} [title]`);
   assert.ok(el, `no titled reading under ${selector}`);
   return { title: el.title, text: el.textContent };
+}
+
+// The one pip heading a block: the only reading of its Datum's provenance.
+function headPip(scope, selector) {
+  const pips = scope.querySelectorAll(`${selector} .pip`);
+  assert.equal(pips.length, 1, `expected one pip heading ${selector}`);
+  return { el: pips[0], title: pips[0].title, text: pips[0].textContent };
+}
+
+// Every figure a row head draws, as [cell, expected title, expected text].
+function rowFigures(helpers, rules, row) {
+  const { figureTitle, doneOfTotal, signalCell, readyCell } = helpers;
+  const total = doneOfTotal(row);
+  const signal = signalCell(row.signal);
+  const figures = [
+    ['.prd-title', figureTitle(rules.title, row.key), row.title],
+    ['.prd-state', figureTitle(rules.state_line, null), row.state_line],
+    ['.prd-total', figureTitle(rules.total, total.detail), total.text],
+    ['.prd-signal', figureTitle(rules.signal, signal.detail), signal.text],
+    ['.prd-ready', figureTitle(rules.ready, null), readyCell(row.ready).text],
+  ];
+  if (row.next_action.kind !== 'none') figures.push(['.prd-action', figureTitle(rules.next_action, null), row.next_action.text]);
+  return figures;
 }
 
 test('prd lanes #20: the lanes render in the served display order, each header titled with its rule', t => {
@@ -166,10 +188,10 @@ test('prd lanes #20: every row bar draws the six served segments in legend order
   assert.ok(empties > 0, 'the served rows hold no empty segment, so the empty class goes unchecked');
 });
 
-test('prd lanes #20: each row figure is titled with its served rule and reads the helpers\' text', t => {
+test('prd lanes #20: each row figure is titled with its served rule and row detail, and reads the helpers\' text', t => {
   const ctx = servedWindow(t, 'prd_lanes', 'prd_lanes_tasks');
   const { root, view } = mountLanes(ctx);
-  const { readyCell, doneOfTotal, signalCell } = ctx.helpers;
+  const { readyCell } = ctx.helpers;
   const { rules } = view.value;
   const byKey = rowsByKey(view);
   expandTail(ctx.window, root);
@@ -179,28 +201,12 @@ test('prd lanes #20: each row figure is titled with its served rule and reads th
   for (const rowEl of root.querySelectorAll('.prd-row')) {
     const row = byKey.get(rowEl.dataset.key);
     const head = rowEl.querySelector('.prd-row-head');
-
-    const title = reading(head, '.prd-title');
-    assert.ok(title.title.startsWith(row.key) && title.title.endsWith(rules.title), title.title);
-    assert.equal(title.text, row.title);
-
-    assert.deepEqual(reading(head, '.prd-state'), { title: rules.state_line, text: row.state_line });
-
-    const total = doneOfTotal(row);
-    const totalReading = reading(head, '.prd-total');
-    assert.equal(totalReading.text, total.text);
-    assert.ok(totalReading.title.includes(total.detail) && totalReading.title.endsWith(rules.total), totalReading.title);
-
-    const signal = signalCell(row.signal);
-    const signalReading = reading(head, '.prd-signal');
-    assert.equal(signalReading.text, signal.text);
-    assert.ok(signalReading.title.endsWith(rules.signal), signalReading.title);
-    if (signal.detail) assert.ok(signalReading.title.startsWith(signal.detail), signalReading.title);
+    for (const [cell, title, text] of rowFigures(ctx.helpers, rules, row)) {
+      assert.deepEqual(reading(head, cell), { title, text }, `${row.key} ${cell}`);
+    }
 
     const ready = readyCell(row.ready);
-    const readyEl = head.querySelector('.prd-ready');
-    assert.deepEqual(reading(head, '.prd-ready'), { title: rules.ready, text: ready.text });
-    assert.equal(readyEl.classList.contains('overdue'), ready.overdue, row.key);
+    assert.equal(head.querySelector('.prd-ready').classList.contains('overdue'), ready.overdue, row.key);
     overdue += ready.overdue ? 1 : 0;
 
     const action = head.querySelector('.prd-action');
@@ -210,10 +216,58 @@ test('prd lanes #20: each row figure is titled with its served rule and reads th
     }
     actions += 1;
     assert.ok(action.classList.contains(`prd-action-${row.next_action.kind}`), action.className);
-    assert.deepEqual(reading(head, '.prd-action'), { title: rules.next_action, text: row.next_action.text });
   }
   assert.ok(overdue > 0, 'no served row is overdue, so the overdue class goes unchecked');
   assert.ok(actions > 0, 'no served row has a next action');
+});
+
+test('prd lanes #20: a fresh view is headed by one pip counting its PRDs, titled with the lanes rule', t => {
+  const ctx = servedWindow(t, 'prd_lanes', 'prd_lanes_tasks');
+  const { root, view } = mountLanes(ctx);
+  const { prds, rules } = view.value;
+  const pip = headPip(root, '.prd-lanes-head');
+
+  assert.equal(view.state, 'fresh');
+  assert.equal(pip.text, `${prds.length} PRDs with open work`);
+  assert.equal(pip.title, rules.lanes);
+});
+
+test('prd lanes #20: a lower-bound view marks only its head, and every figure keeps its rule and row data on hover', t => {
+  const ctx = servedWindow(t, 'prd_lanes_queueless', 'prd_lanes_tasks');
+  const { root, view } = mountLanes(ctx);
+  const { LOWER_BOUND_PREFIX } = ctx.window.DF_DATUM;
+  const { rules, lanes } = view.value;
+  const byKey = rowsByKey(view);
+  expandTail(ctx.window, root);
+
+  assert.equal(view.state, 'lower_bound');
+  const pip = headPip(root, '.prd-lanes-head');
+  assert.ok(pip.text.startsWith(LOWER_BOUND_PREFIX), pip.text);
+  assert.equal(pip.title, view.reason);
+
+  assert.deepEqual(
+    [...root.querySelectorAll('.prd-lane-head')].map(head => reading(head.parentElement, '.prd-lane-head')),
+    lanes.map(entry => ({ title: entry.rule, text: `${entry.label} (${entry.prd_keys.length})` })),
+  );
+  const rows = [...root.querySelectorAll('.prd-row')];
+  assert.equal(rows.length, view.value.prds.length);
+  for (const rowEl of rows) {
+    const row = byKey.get(rowEl.dataset.key);
+    const head = rowEl.querySelector('.prd-row-head');
+    for (const [cell, title, text] of rowFigures(ctx.helpers, rules, row)) {
+      assert.deepEqual(reading(head, cell), { title, text }, `${row.key} ${cell}`);
+    }
+  }
+
+  // The same served view restated fresh draws the same footer and strip text:
+  // the lower bound qualifies the view once, at its head, never its figures.
+  const fresh = mountLanes(ctx, { ...view, state: 'fresh', reason: null }).root;
+  for (const cell of ['.dark-matter-head', '.prd-closed', '.prd-coverage']) {
+    assert.deepEqual(reading(root, cell), reading(fresh, cell), cell);
+  }
+
+  const titledWithReason = [...root.querySelectorAll('[title]')].filter(el => el.title === view.reason);
+  assert.deepEqual(titledWithReason, [pip.el], 'the reason must title the head pip alone');
 });
 
 test('prd lanes #20: the contention line renders every served top entry unsliced, and an unknown line says why', t => {
@@ -225,6 +279,8 @@ test('prd lanes #20: the contention line renders every served top entry unsliced
   const line = contended.harness.mount(PrdContentionLine, { contention }).container;
 
   assert.ok(value.top.length > 0);
+  const pip = headPip(line, '.prd-contention-head');
+  assert.deepEqual({ title: pip.title, text: pip.text }, { title: value.rules.top, text: `${value.top.length} most-wanted lock keys` });
   const entries = [...line.querySelectorAll('.prd-contention-entry')];
   assert.deepEqual(
     entries.map(entry => ({ title: entry.querySelector('[title]').title, text: entry.textContent })),
@@ -412,6 +468,20 @@ test('prd lanes #21: a project with no stored grouping opens on the lanes, and n
   assert.ok(panel.querySelectorAll('.prd-lane').length > 0, 'the default view draws no lanes');
   assert.equal(panel.querySelectorAll('.node').length, 0, 'a collapsed lanes page draws no graph');
   assert.equal(tab.window.localStorage.getItem(GROUPING_KEY), null, 'the default grouping was stored');
+
+  // reify serves a lower-bound view with no rows: its head says so, and
+  // nothing under it does.
+  const reify = projectPanel(tab.container, 'reify');
+  const view = tab.helpers.projectPrdView(tab.D, 'reify');
+  const { lanes, closed } = view.value;
+  assert.equal(view.state, 'lower_bound');
+  assert.equal(view.value.prds.length, 0);
+  assert.ok(headPip(reify, '.prd-lanes-head').text.startsWith(tab.window.DF_DATUM.LOWER_BOUND_PREFIX));
+  assert.deepEqual(
+    [...reify.querySelectorAll('.prd-lane-head')].map(head => head.textContent),
+    lanes.map(entry => `${entry.label} (0)`),
+  );
+  assert.equal(reify.querySelector('.prd-closed').textContent, `${closed.prds} PRDs closed (${closed.tasks} tasks)`);
 });
 
 test('prd lanes #21: a project stored as listed flat opens on the graph, and by PRD removes the key', t => {

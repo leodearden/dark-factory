@@ -390,3 +390,15 @@ def test_prd_lanes_20_the_served_view_fills_every_lane_in_display_order(served_b
         degraded = served_bodies[scenario][key][LANES_ROOT]
         assert degraded['state'] == 'unknown', degraded
         assert (degraded['reason'] or '').strip(), f'{scenario}: an unknown {key} must say why'
+
+
+def test_prd_lanes_20_a_queueless_view_is_a_lower_bound_that_still_draws_rows(served_bodies):
+    view = served_bodies['prd_lanes_queueless']['PRD_VIEW'][LANES_ROOT]
+    assert view['state'] == 'lower_bound', view
+    assert (view['reason'] or '').strip(), 'a lower-bound view must say why'
+    lanes = {entry['lane']: entry['prd_keys'] for entry in view['value']['lanes']}
+
+    assert all(lanes.get(lane.value) for lane in LANE_DISPLAY_ORDER), 'an empty lane renders nothing to check'
+    rows = view['value']['prds']
+    assert any(row['signal']['reason'] for row in rows), 'no row serves a signal reason to keep on hover'
+    assert any(row['followup_open'] for row in rows), 'no row serves an open follow-up to split on hover'
