@@ -6,12 +6,9 @@ same exit 75 it uses for a held flock.  This pins the wrapper's side of that
 contract end to end: the refusal stays a benign DEBUG skip (never WARNING,
 inv.11), dark-factory's log can still tell WHICH gate refused, because the
 script's ``LANE_LIVE_REF:`` token reaches it, and the same lane thins once the
-reference clears.
-
-Driven through ``_run_thin_warm_lane`` rather than ``release_warm_lane``, which
-composes it as its last step and passes its rc through unchanged: the public
-path would need a configured pool and a git lane, and would emit unrelated
-WARNINGs that collide with the no-WARNING assertion.
+reference clears.  A successful thin's log line carries the script's stderr
+too, because that is where a fail-open scan's ``live-ref scan DEGRADED``
+warning lands.
 """
 from __future__ import annotations
 
@@ -90,3 +87,17 @@ async def test_a_live_reference_is_an_attributed_benign_skip_until_it_clears(
 
     assert thinned_rc == 0
     assert not (lane / 'target').exists()
+
+
+async def test_a_successful_thin_logs_the_scripts_stderr(
+    git_ops: GitOps, lane: Path, caplog,
+) -> None:
+    with caplog.at_level(logging.INFO, logger='orchestrator.git_ops'):
+        rc = await git_ops._run_thin_warm_lane(lane)
+
+    assert rc == 0
+    info = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+    assert any('Thinned lane:' in message for message in info), (
+        'the success line drops the script stderr, so a degraded /proc that let '
+        f'the T4 gate fail open leaves no trace in dark-factory\'s log: {info}'
+    )

@@ -6478,16 +6478,19 @@ class GitOps:
         exclusion between this method and :meth:`_seed_warm_lane` racing
         each other on the SAME lock file.
 
-        Exit-code taxonomy (per the reify δ contract):
-            0   — thinned (``target/`` removed).
+        Exit-code taxonomy (per the reify δ contract).  Every code the script
+        itself returns is logged with its stderr:
+            0   — thinned (``target/`` removed), logged at INFO.  A degraded
+                  ``/proc`` fails the T4 gate open, and its only trace is
+                  ``lib_live_refs.sh``'s ``live-ref scan DEGRADED`` line there.
             1   — guard refusal (logged at WARNING).
             2   — usage/wiring error, incl. a missing sibling
                   ``lib_live_refs.sh`` (logged at WARNING).
             75  — lane busy: its flock is held (re-acquired concurrently) OR
                   a live process references it (thin's T4 gate, task 5307) —
                   both a BENIGN skip, never logged at WARNING (§9.5 inv.11:
-                  release-thin is not an escalation/fault).  The DEBUG line
-                  carries the script's stderr, whose token names the cause.
+                  release-thin is not an escalation/fault), logged at DEBUG;
+                  the stderr token names the cause.
             127 — no implementation at either location, pool storage absent,
                   or unexpected exception (fail-soft sentinel).
 
@@ -6511,7 +6514,9 @@ class GitOps:
             cmd = [str(script), str(lane_dir)]
             rc, _, err = await _run(cmd, cwd=self.project_root)
             if rc == 0:
-                logger.info('_run_thin_warm_lane: thinned %s', lane_dir)
+                logger.info(
+                    '_run_thin_warm_lane: thinned %s (stderr=%r)', lane_dir, err,
+                )
             elif rc == 75:
                 logger.debug(
                     '_run_thin_warm_lane: lane %s busy (rc=75, EX_TEMPFAIL) '

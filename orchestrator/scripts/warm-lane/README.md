@@ -1630,7 +1630,9 @@ case is a negative that cannot short-circuit, paid on a never-raise tail.
 - A caller whose own cwd is inside the lane is itself a live reference and
   always gets 75.
 - A degraded `/proc` fails OPEN; `lib_live_refs.sh`'s env probe makes that
-  attributable with a one-time stderr warning rather than silent.
+  attributable with a one-time stderr warning rather than silent, and
+  `_run_thin_warm_lane` logs the script's stderr on success too, so the warning
+  reaches dark-factory's log.
 
 **Divergences from reify's post-5823 file.** `SCRIPT_DIR` by parameter
 expansion rather than a `dirname` fork (Delta 7); its prose re-pointed, since
