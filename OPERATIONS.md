@@ -1382,7 +1382,11 @@ remote grant (contract: `plans/remote-task-leg-verify-prd.md` §5.7):
 - `verify_task_remote_red_confirms_locally` (default `false`): a remote red
   re-runs the ordinary local verify, and the local verdict is returned.
 - `verify_task_remote_cross_check_every_n` (default `0`, off): every n-th
-  eligible verify runs on both hosts, with the local verdict authoritative.
+  verify that returns a remote verdict, green or red, is re-run locally, with
+  the local verdict authoritative. The count is per orchestrator process and
+  covers exactly the verifies whose dispatch record has `reason` `remote`,
+  `cross_check` or `red_confirm`. A verify that ran local for any other
+  reason does not advance it.
 
 Off `local`, each verify the dispatcher considers leaves
 `data/verify-logs/<task>/attempt-N.dispatch-<stamp>.json`. Its `decision`

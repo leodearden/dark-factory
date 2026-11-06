@@ -5642,7 +5642,8 @@ class OrchestratorConfig(BaseSettings):
         default=0,
         ge=0,
         description=(
-            'Parity knob: every n-th eligible task verify runs remote AND local, '
+            'Parity knob: every n-th task verify that returns a remote verdict, '
+            'green or red, counted per orchestrator process, is re-run locally, '
             'the local verdict authoritative, recording the agreement in the '
             'dispatch sidecar (the false-green direction).  0 (default) is off.  '
             'See plans/remote-task-leg-verify-prd.md decision 9.'
