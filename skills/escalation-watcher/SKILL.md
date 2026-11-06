@@ -696,7 +696,11 @@ carries the brief. Check "Always ask — keyed on record content" below first: i
     `done_provenance`, and `git merge-base --is-ancestor <commit> main` in that project's repo. The
     task must have no dependents, no branch commits (`git rev-list --count main..task/<id>` is 0)
     and no pin. A FALSE claim needs corpus repair, so it still goes to Leo (Leo, 2026-10-29,
-    solar_challenge_platform esc-1558-2; precedent esc-1185-2).
+    solar_challenge_platform esc-1558-2; precedent esc-1185-2). The same holds when the flagged
+    text makes no completion claim at all, such as a past-tense "dispatched before task N merged"
+    scope or a "needs task N merged first" prerequisite: read the flagged sentence yourself and
+    confirm that what it does state is true (Leo, 2026-11-06, scoping_intake esc-670-2 and
+    esc-683-2).
 12. Marking a task done `found_on_main` when another task's commit already delivered its whole
     outcome, then `close_only` on its L2. Verify yourself: the delivering commit is an ancestor of
     main, and every item of the task's ask is present on main (read the file, and grep for the text
