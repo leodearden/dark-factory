@@ -63,7 +63,7 @@ import logging
 import os
 import shlex
 import sys
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -71,6 +71,8 @@ from typing import TYPE_CHECKING
 from orchestrator.systemd_inspect import _empty_baseline_fresh, inspect_systemd_unit
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from escalation.models import Escalation
     from escalation.queue import EscalationQueue
 
@@ -429,6 +431,9 @@ class RestartPlan:
     stat-checked here (would race / force hermetic tests to create real
     files) — a missing script surfaces at runtime as exit-127, escalated by
     the RP-4 on-failure wrapper.
+
+    ``env`` holds the extra environment variables the restart script
+    receives, and every ``execute()`` path delivers them.
     """
 
     script: Path
@@ -440,6 +445,7 @@ class RestartPlan:
     verify: FreshPidVerify | None
     transient_unit: str | None = None
     on_active_secs: int = 60
+    env: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.cwd.is_absolute():
@@ -828,7 +834,8 @@ class RestartPlan:
         So the token is emitted GATED on ``on_failure_escalation`` — it exists
         solely so the RP-4 ``python -m escalation submit`` child can import,
         and a plan with no escalation spec has no submit token in its payload,
-        keeping that argv byte-identical. See :func:`_submit_child_pythonpath`
+        keeping that argv byte-identical. The plan's own ``env`` tokens are
+        NOT gated, and precede it. See :func:`_submit_child_pythonpath`
         for how the value is built, and :meth:`EscalationSpec.to_submit_argv`
         for the OTHER leg of the child's importability (interpreter identity,
         which PYTHONPATH cannot cover).
@@ -896,6 +903,7 @@ class RestartPlan:
         else:
             wrapped = payload
             setenv_args = []
+        env_args = [f'--setenv={key}={value}' for key, value in self.env.items()]
 
         argv = [
             'systemd-run', '--user',
@@ -903,6 +911,7 @@ class RestartPlan:
             f'--unit={self.transient_unit}',
             '--collect',
             f'--working-directory={self.cwd}',
+            *env_args,
             *setenv_args,
             '/bin/sh', '-c', wrapped,
         ]
