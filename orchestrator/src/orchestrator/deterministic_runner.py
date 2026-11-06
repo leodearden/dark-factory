@@ -3733,25 +3733,29 @@ class DeterministicRunner:
                     inspect_timeout_secs=self._inspect_timeout_secs,
                 )
                 paths = self._before_done_paths(before_done)
-                plan = RestartPlan(
-                    script=paths.script,
-                    args=list(before_done.get('args') or []),
-                    cwd=paths.cwd,
-                    target_unit=target_unit,
-                    # own_unit must be truthy and provably non-self here (this
-                    # branch is only reached when the runner's OWN self_target
-                    # check above already ruled out self-target), so
-                    # RestartPlan.execute() takes the RP-2 cross-unit-blocking
-                    # path — never RP-1's fail-closed refuse — even when
-                    # ORCH_UNIT is unset (own_unit == ''), preserving the
-                    # existing fail-open-to-cross-unit behaviour.
-                    own_unit=own_unit or _CROSS_UNIT_OWN_UNIT_SENTINEL,
-                    on_failure_escalation=None,
-                    verify=verify,
-                    transient_unit=None,
-                )
 
                 try:
+                    # Built inside the try: RestartPlan refuses an env it would
+                    # mis-deliver, and that refusal must reach the born-at-L2
+                    # catch-all below rather than escape run().
+                    plan = RestartPlan(
+                        script=paths.script,
+                        args=list(before_done.get('args') or []),
+                        cwd=paths.cwd,
+                        target_unit=target_unit,
+                        # own_unit must be truthy and provably non-self here (this
+                        # branch is only reached when the runner's OWN self_target
+                        # check above already ruled out self-target), so
+                        # RestartPlan.execute() takes the RP-2 cross-unit-blocking
+                        # path — never RP-1's fail-closed refuse — even when
+                        # ORCH_UNIT is unset (own_unit == ''), preserving the
+                        # existing fail-open-to-cross-unit behaviour.
+                        own_unit=own_unit or _CROSS_UNIT_OWN_UNIT_SENTINEL,
+                        on_failure_escalation=None,
+                        verify=verify,
+                        transient_unit=None,
+                        env=dict(before_done.get('env') or {}),
+                    )
                     outcome = await asyncio.wait_for(
                         plan.execute(runner=_shim_runner, inspector=_capturing_inspector),
                         timeout=outer_timeout,

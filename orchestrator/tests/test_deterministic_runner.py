@@ -11571,3 +11571,35 @@ class TestCrossUnitDeployCarriesBeforeDoneEnv:
 
         assert outcome == WorkflowOutcome.DONE
         assert seen.read_text() == 'canary'
+
+    async def test_invalid_env_key_is_refused_loudly(self, tmp_path: Path):
+        """RestartPlan refuses an env key holding '='. On this path the refusal
+        must still file a born-at-L2 infra_issue, as the exec-time failure of
+        the same key did before RestartPlan carried env."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(
+            task_id='8598e',
+            target_unit='orchestrator-reify.service',
+            env={'A=B': 'v'},
+        )
+        queue = EscalationQueue(tmp_path)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        runner = DeterministicRunner(
+            scheduler=_mock_scheduler(task),
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(side_effect=[_BASELINE_UNIT_STATE, _FRESH_UNIT_STATE]),
+            script_runner=script_runner,
+            own_unit_resolver=lambda: 'orchestrator.service',
+        )
+
+        outcome = await runner.run(_make_assignment(task))
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        script_runner.assert_not_awaited()
+        pending = queue.get_by_task('8598e', status='pending')
+        assert len(pending) == 1
+        assert pending[0].category == 'infra_issue'
+        assert 'A=B' in pending[0].detail
+        assert 'environment variable name' in pending[0].detail
