@@ -1387,6 +1387,8 @@ Add to digest: `PROMOTED (L2 <id>): <category> — <task_id> — <summary>`
 
 Fused-memory reconciliation problems — may indicate systematic issues. These often cluster under one infra-level root cause.
 
+**Precheck: which queue.** These categories are native to the reconciliation queue (`$DARK_FACTORY_ROOT/data/reconciliation/escalations`, served on port 8103, flat with no levels), which this rotation never drains: every record you hold came from your own orchestrator queue's `get_pending_escalations`. That queue has its own consumer: the hand-run `recon-escalation-watcher` loop today, and a supervised recon executor rotation (`escalation-executor-recon`, hosted by dark-factory's harness) once decision-stream PRD task β lands (`plans/decision-stream-prd.md` §3.10, §5.3). So never read or act on reconciliation-queue records from here, and never assume a `recon_*` record in YOUR queue is that consumer's: it stays yours and is promoted as below.
+
 Root_cause: `"recon-issue:<category-slug>"` (e.g. `"recon-issue:backlog-overflow"`)
 
 ```python
@@ -1481,6 +1483,12 @@ Mode: <"full (promote_to_l2 + filing pair available)" | "DEGRADED (missing: <too
 ### Auto-closed L1 (info-only cluster)
 - AUTO-CLOSED (L1 esc-…): info-only-cluster — <task_id> — <member summary> [benign]
 
+### Auto-closed L1 (stale-L0 strand recover-and-route)
+- AUTO-CLOSED (L1 esc-__stale_l0_strand_sweep__-9): stale-l0-strand-recover-and-route — 2 note(s): esc-6969-1→appended to task 6969; esc-877-1→filed as task 8801 (created) [converted]
+
+### Left for the release edge (Q6 veto-streak)
+- LEFT FOR RELEASE EDGE (L1 esc-__recovery_veto_streak__3535-1): q6-veto-streak — __recovery_veto_streak__3535 — pin esc-3535-2 held by pending L2 esc-3535-4
+
 ### Auto-closed L2 (narrow carve-out)
 - AUTO-CLOSED (L2 esc-main-sweep-abc123def456-1): superseded_main_sweep — main-sweep-abc123def456 — newer sweep esc-main-sweep-9f8e7d6c5b4a; swept SHA abc123def456 is-ancestor of clean tip [benign]
 - AUTO-CLOSED (L2 esc-77-3): self_cleared_infra — task-77 — live probe: curator paused=false [benign]
@@ -1493,6 +1501,6 @@ Mode: <"full (promote_to_l2 + filing pair available)" | "DEGRADED (missing: <too
 - PENDING: dependency_discovered — task-33 — no matching task for: "GraphitiV2 migration complete"
 ```
 
-The trailing `[actionable]` / `[benign]` / `[converted]` tag on each `DISPATCHED`, `FILED` and `AUTO-CLOSED` line is the `resolution_class` you stamped on that resolve/close — recorded on **every** `resolve_issue` you make (see [Classify the resolution](#classify-the-resolution-resolution_class)). `PROMOTED` lines carry no class (promotion does not resolve).
+The trailing `[actionable]` / `[benign]` / `[converted]` tag on each `DISPATCHED`, `FILED` and `AUTO-CLOSED` line (the stale-L0 strand recover-and-route close included) is the `resolution_class` you stamped on that resolve/close — recorded on **every** `resolve_issue` you make (see [Classify the resolution](#classify-the-resolution-resolution_class)). `PROMOTED` and `LEFT FOR RELEASE EDGE` lines carry no class (nothing was resolved).
 
 Maintain a running in-context summary as you handle each escalation. Emit the final digest only once, as your last output before returning.
