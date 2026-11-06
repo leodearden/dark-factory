@@ -299,6 +299,9 @@ MAX_CONCURRENT_RESOLUTIONS = 8
 #: excluded for a different reason: it is not fail-soft at all. The caller is
 #: told and can act, so there is no silent degradation for an escape to
 #: surface.
+#:
+#: An outage is counted per :class:`UnavailableReason`, so a slow resolver and
+#: an unreachable one fire separate alarms.
 STORM_COUNTED_OUTCOMES: frozenset[str] = frozenset({'forwarded_ambiguous', 'resolver_unavailable'})
 
 
@@ -440,6 +443,7 @@ class _Outage(Exception):
         super().__init__(str(cause))
         self.token = token
         self.store = cause.store
+        self.reason = cause.reason
 
 
 class _Planned(NamedTuple):
@@ -1130,14 +1134,16 @@ class UuidPrefixGuardMiddleware(Middleware):
         outcome: FactOutcome,
         agent_id: str | None,
         project: str,
+        reason: UnavailableReason | None = None,
     ) -> None:
         """Emit one ``uuid_prefix_detected``, and never change an outcome.
 
         ONE builder for every arm, so the contracted key set cannot drift
         between them. The record is COMPLETE even where the answer is
         ``None``: ``namespace`` is present and null for a cross-namespace
-        ambiguity and for an unreachable store, so a consumer never has to
-        tell "no single namespace" apart from "that arm forgot the key".
+        ambiguity and for an unreachable store, and ``reason`` is null on
+        every arm but the outage, so a consumer never has to tell "no such
+        value" apart from "that arm forgot the key".
 
         Logged at INFO, not WARNING. `expanded` is the DESIGNED success path —
         the same measurement that keeps it out of :data:`STORM_COUNTED_OUTCOMES`
@@ -1155,6 +1161,7 @@ class UuidPrefixGuardMiddleware(Middleware):
             'namespace': next(iter(namespaces)) if len(namespaces) == 1 else None,
             'agent_id': agent_id,
             'project': project,
+            'reason': reason,
         }
         logger.info(
             'uuid prefix guard: %s tool=%s field=%s token=%s candidates=%r project=%r',
@@ -1167,7 +1174,7 @@ class UuidPrefixGuardMiddleware(Middleware):
     # -- the one degraded path (INV-11) -----------------------------------
 
     async def _forward_outage(self, context, call_next, name, arguments, project, outage):
-        """A store could not be reached: forward unchanged, and say so.
+        """A store gave no resolution: forward unchanged, and say so.
 
         This is the guard's ONLY degraded path, and the ruling behind it is
         not negotiable: a boundary guard that turns a store outage into lost
@@ -1190,16 +1197,18 @@ class UuidPrefixGuardMiddleware(Middleware):
         await self._emit_fact(
             name, outage.token, (),
             outcome=_FACT_OUTCOME[PrefixAction.FORWARD_UNCHANGED],
-            agent_id=_agent_id(arguments), project=project,
+            agent_id=_agent_id(arguments), project=project, reason=outage.reason,
         )
         logger.warning(
-            'uuid prefix guard: the %s store could not be reached; %r forwarded '
+            'uuid prefix guard: no resolution from the %s store (%s); %r forwarded '
             'unchanged with its prefixes unresolved',
-            outage.store, name,
+            outage.store, outage.reason, name,
         )
-        report: dict[str, Any] = {'resolver': 'unavailable', 'store': outage.store}
+        report: dict[str, Any] = {
+            'resolver': 'unavailable', 'store': outage.store, 'reason': outage.reason,
+        }
         storm = await self._storms.record(
-            _FACT_OUTCOME[PrefixAction.FORWARD_UNCHANGED], project
+            _FACT_OUTCOME[PrefixAction.FORWARD_UNCHANGED], project, reason=outage.reason
         )
         if storm is not None:
             report['storm'] = storm
