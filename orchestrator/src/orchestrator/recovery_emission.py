@@ -485,7 +485,7 @@ def pending_holder_candidates(escalation_queue: Any, site: RecoverySite | str) -
         return []
     try:
         return list(escalation_queue.get_pending())
-    except Exception as exc:  # noqa: BLE001 — a failed read must not abort a sweep
+    except Exception as exc:
         logger.warning(
             'recovery emission: pending-queue read failed at site %s (%s); '
             'no cross-task holders this pass', site, exc,
