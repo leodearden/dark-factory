@@ -769,6 +769,24 @@ def _alarms(harness, tid: str = 'T1') -> list:
     )
 
 
+def _outside_l2(
+    queue: EscalationQueue,
+    esc_id: str,
+    *,
+    members: tuple[str, ...],
+    task_id: str = '9',
+    severity: str = 'blocking',
+) -> Escalation:
+    """A pending cluster L2 the auto-watcher filed under ANOTHER task id."""
+    l2 = Escalation(
+        id=esc_id, task_id=task_id, agent_role='escalation-watcher-auto',
+        severity=severity, category='risk_identified', summary='cluster',
+        level=2, members=list(members),
+    )
+    queue.submit(l2)
+    return l2
+
+
 @pytest.mark.asyncio
 class TestVetoStreakAlarm:
     async def test_the_first_two_sweeps_file_nothing(self, clocked):
@@ -1080,6 +1098,65 @@ class TestHumanParkedHoldsDoNotAlarm:
         _bind_reports(harness, {'T1': _pinned_hold(escalations=[
             _ref('esc-1', level=1), _ref('esc-2', level=2, members=('esc-other',)),
         ])})
+
+        await _sweeps(harness, clock, 3)
+
+        assert len(_alarms(harness)) == 1
+
+    # -- task 7716: the L2 holding the L1 was filed under ANOTHER task id --
+
+    async def test_an_l1_held_by_an_l2_filed_under_another_task_files_no_alarm(
+        self, clocked,
+    ):
+        """``promote_to_l2`` mints a cluster L2 under one task id, so the task's
+        own read never sees it; the pending queue does."""
+        harness, clock = clocked
+        _outside_l2(_queue(harness), 'esc-9-2', members=('esc-1',))
+        _bind_reports(harness, {'T1': _pinned_hold(escalations=[_ref('esc-1', level=1)])})
+
+        await _sweeps(harness, clock, 8)
+
+        assert _alarms(harness) == []
+
+    async def test_outside_holder_suppression_is_not_blindness(self, clocked):
+        """The veto rows still name the task's own pin, and never the outside L2."""
+        harness, clock = clocked
+        _outside_l2(_queue(harness), 'esc-9-2', members=('esc-1',))
+        _bind_reports(harness, {'T1': _pinned_hold(escalations=[_ref('esc-1', level=1)])})
+
+        await _sweeps(harness, clock, 8)
+
+        rows = _rows(harness, EventType.recovery_vetoed)
+        assert rows
+        assert all('esc-1' in json.dumps(r['data']) for r in rows)
+        assert not [r for r in rows if 'esc-9-2' in json.dumps(r['data'])]
+
+    async def test_an_outside_l2_holding_another_id_still_alarms(self, clocked):
+        """COUNTER-SIGNAL: the outside L2 leaves this task's L1 unpromoted."""
+        harness, clock = clocked
+        _outside_l2(_queue(harness), 'esc-9-2', members=('esc-other',))
+        _bind_reports(harness, {'T1': _pinned_hold(escalations=[_ref('esc-1', level=1)])})
+
+        await _sweeps(harness, clock, 3)
+
+        assert len(_alarms(harness)) == 1
+
+    async def test_a_resolved_outside_l2_holds_nothing(self, clocked):
+        """COUNTER-SIGNAL: a closed L2 is no longer in front of anyone."""
+        harness, clock = clocked
+        holder = _outside_l2(_queue(harness), 'esc-9-2', members=('esc-1',))
+        _queue(harness).resolve(holder.id, 'answered')
+        _bind_reports(harness, {'T1': _pinned_hold(escalations=[_ref('esc-1', level=1)])})
+
+        await _sweeps(harness, clock, 3)
+
+        assert len(_alarms(harness)) == 1
+
+    async def test_an_info_outside_l2_holds_nothing(self, clocked):
+        """COUNTER-SIGNAL: link 1 makes an info L2 an annotation, not a handoff."""
+        harness, clock = clocked
+        _outside_l2(_queue(harness), 'esc-9-2', members=('esc-1',), severity='info')
+        _bind_reports(harness, {'T1': _pinned_hold(escalations=[_ref('esc-1', level=1)])})
 
         await _sweeps(harness, clock, 3)
 
