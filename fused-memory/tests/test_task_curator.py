@@ -51,6 +51,7 @@ from fused_memory.middleware.candidate_key import compute_candidate_key, normali
 from fused_memory.middleware.curation_deferral import DeferReason
 from fused_memory.middleware.curator_escalator import CuratorEscalator
 from fused_memory.middleware.curator_types import (
+    POOL_SOURCES,
     CandidateTask,
     CuratorDecision,
     CuratorFailureError,
@@ -494,6 +495,74 @@ class TestPoolWithheld:
         census = PoolWithheld(by_source={'module': 1})
         with pytest.raises(dataclasses.FrozenInstanceError):
             census.by_source = {'module': 2}  # type: ignore[misc]
+
+    def test_a_failed_stream_renders_even_when_nothing_was_truncated(self):
+        census = PoolWithheld(unavailable_streams=('embedding',))
+        assert census.total == 0
+        rendered = census.render()
+        assert rendered is not None
+        assert 'stream embedding unavailable: absence is not proof of no overlap' in (
+            rendered.splitlines()
+        )
+        assert 'pool_truncated:' not in rendered
+
+    def test_each_failed_stream_gets_its_own_line_in_the_order_given(self):
+        rendered = PoolWithheld(unavailable_streams=('module', 'embedding')).render()
+        assert rendered is not None
+        assert [line for line in rendered.splitlines() if 'unavailable' in line] == [
+            'stream module unavailable: absence is not proof of no overlap',
+            'stream embedding unavailable: absence is not proof of no overlap',
+        ]
+
+    def test_truncation_and_failed_streams_render_together(self):
+        census = PoolWithheld(
+            by_source={'module': 7}, caps={'module': 15}, unavailable_streams=('dependency',),
+        )
+        rendered = census.render()
+        assert rendered is not None
+        assert self._payload(rendered)['withheld'] == {'module': 7}
+        assert 'stream dependency unavailable: absence is not proof of no overlap' in (
+            rendered.splitlines()
+        )
+
+    def test_an_unknown_stream_name_is_refused(self):
+        with pytest.raises(ValueError, match='nonsense') as excinfo:
+            PoolWithheld(unavailable_streams=('nonsense',))
+        for source in POOL_SOURCES:
+            assert source in str(excinfo.value)
+
+
+class TestFailedStreamCensusOnDecisions:
+    """The failed corpus streams travel from the bundle onto the decision's log fields."""
+
+    def test_a_decision_logs_its_failed_streams(self):
+        decision = CuratorDecision(
+            action='create', degraded=False, unavailable_streams=('module', 'embedding'),
+        )
+        assert decision.to_log_fields()['unavailable_streams'] == ['module', 'embedding']
+
+    def test_a_default_decision_logs_no_failed_streams(self):
+        assert CuratorDecision(action='create', degraded=False).to_log_fields()[
+            'unavailable_streams'
+        ] == []
+
+    def test_a_decision_refuses_an_unknown_stream_name(self):
+        with pytest.raises(ValueError, match='nonsense'):
+            CuratorDecision(action='create', degraded=False, unavailable_streams=('nonsense',))
+
+    def test_a_corpus_failed_bundle_carries_the_streams_that_failed(self):
+        bundle = PreparedCandidate.corpus_failed(
+            CandidateTask(title='t'), 'boom', unavailable_streams=('module', 'embedding'),
+        )
+        assert bundle.corpus_error == 'boom'
+        assert bundle.withheld is not None
+        assert bundle.withheld.unavailable_streams == ('module', 'embedding')
+
+    def test_the_two_argument_corpus_failed_bundle_has_an_empty_census(self):
+        bundle = PreparedCandidate.corpus_failed(CandidateTask(title='t'), 'boom')
+        assert bundle.withheld is not None
+        assert bundle.withheld.unavailable_streams == ()
+        assert bundle.withheld.render() is None
 
 
 class TestCandidateHash:
