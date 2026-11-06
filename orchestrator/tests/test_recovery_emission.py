@@ -12,7 +12,11 @@ import json
 
 import pytest
 
-from orchestrator.recovery_emission import STREAK_CHARGING_SITES
+from orchestrator.recovery_emission import (
+    STREAK_CHARGING_SITES,
+    LeaveReason,
+    RecoverySite,
+)
 
 # ---------------------------------------------------------------------------
 # S3 — the pure payload primitives
@@ -1671,6 +1675,31 @@ class TestPendingHolderCandidates:
     """``pending_holder_candidates``: the pending queue, read only where a
     ``human_parked`` answer gates a filing (task 7716)."""
 
+    #: An ``escalation_pinned`` hold with a readable store and the suppressed
+    #: filing switched on — the one input shape whose answer gates a filing.
+    _GATING = {
+        'reason': LeaveReason.escalation_pinned,
+        'store_unavailable': False,
+        'streak_escalation_enabled': True,
+        'suppress_human_parked': True,
+    }
+
+    class _CountingQueue:
+        """Hands back one outside holder, counting the root scans that fetch it."""
+
+        def __init__(self):
+            self.scans = 0
+
+        def get_pending(self):
+            self.scans += 1
+            return [_row('esc-9-2', level=2, members=('esc-1',), task_id='9')]
+
+    @classmethod
+    def _read(cls, queue, site=RecoverySite.reconcile_sweep, **overrides):
+        from orchestrator.recovery_emission import pending_holder_candidates
+
+        return pending_holder_candidates(queue, site, **{**cls._GATING, **overrides})
+
     @staticmethod
     def _seeded_queue(tmp_path):
         from escalation.queue import EscalationQueue
@@ -1683,31 +1712,64 @@ class TestPendingHolderCandidates:
 
     @pytest.mark.parametrize('site', sorted(STREAK_CHARGING_SITES))
     def test_a_streak_charging_site_reads_exactly_the_pending_records(self, tmp_path, site):
-        from orchestrator.recovery_emission import pending_holder_candidates
-
         queue = self._seeded_queue(tmp_path)
 
-        assert [esc.id for esc in pending_holder_candidates(queue, site)] == ['esc-9-2']
+        assert [esc.id for esc in self._read(queue, site)] == ['esc-9-2']
 
-    @pytest.mark.parametrize('site', ['scheduler_blocked_redispatch', 'already_landed_gate'])
-    def test_a_per_tick_site_reads_nothing(self, tmp_path, site):
-        from orchestrator.recovery_emission import RecoverySite, pending_holder_candidates
+    def test_the_gating_shape_scans_the_queue_once(self):
+        queue = self._CountingQueue()
 
-        queue = self._seeded_queue(tmp_path)
+        assert [esc.id for esc in self._read(queue)] == ['esc-9-2']
+        assert queue.scans == 1
 
-        assert pending_holder_candidates(queue, RecoverySite(site)) == []
+    @pytest.mark.parametrize('site', sorted(set(RecoverySite) - STREAK_CHARGING_SITES))
+    def test_a_per_tick_site_scans_nothing(self, site):
+        queue = self._CountingQueue()
+
+        assert self._read(queue, site) == []
+        assert queue.scans == 0
+
+    @pytest.mark.parametrize(
+        'reason', [*sorted(set(LeaveReason) - {LeaveReason.escalation_pinned}), None],
+    )
+    def test_a_reason_the_suppression_never_covers_scans_nothing(self, reason):
+        queue = self._CountingQueue()
+
+        assert self._read(queue, reason=reason) == []
+        assert queue.scans == 0
+
+    @pytest.mark.parametrize('override', [
+        {'store_unavailable': True},
+        {'streak_escalation_enabled': False},
+        {'suppress_human_parked': False},
+    ], ids=['store-unavailable', 'streak-alarm-off', 'suppression-off'])
+    def test_an_answer_that_gates_no_filing_scans_nothing(self, override):
+        """``human_parked`` is never True over an unreadable store, and with
+        either switch off no filing reads it."""
+        queue = self._CountingQueue()
+
+        assert self._read(queue, **override) == []
+        assert queue.scans == 0
 
     def test_no_queue_reads_nothing(self):
-        from orchestrator.recovery_emission import RecoverySite, pending_holder_candidates
+        assert self._read(None) == []
 
-        assert pending_holder_candidates(None, RecoverySite.reconcile_sweep) == []
-
-    def test_a_failed_read_fails_open_to_no_candidates(self):
-        """Losing the cross-task suppression only means the alarm files."""
-        from orchestrator.recovery_emission import RecoverySite, pending_holder_candidates
+    def test_a_failed_read_fails_open_to_no_candidates_and_says_so(self, caplog):
+        """Losing the cross-task suppression only means the alarm files.  The
+        WARNING is all that tells a failed read apart from an empty queue."""
+        import logging
 
         class _UnreadableQueue:
             def get_pending(self):
                 raise OSError('queue root unreadable')
 
-        assert pending_holder_candidates(_UnreadableQueue(), RecoverySite.reconcile_sweep) == []
+        with caplog.at_level(logging.WARNING, logger='orchestrator.recovery_emission'):
+            assert self._read(_UnreadableQueue()) == []
+
+        warnings = [
+            r.getMessage() for r in caplog.records
+            if r.name == 'orchestrator.recovery_emission' and r.levelno == logging.WARNING
+        ]
+        assert len(warnings) == 1
+        assert 'reconcile_sweep' in warnings[0]
+        assert 'queue root unreadable' in warnings[0]

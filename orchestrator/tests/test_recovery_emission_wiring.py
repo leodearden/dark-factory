@@ -787,6 +787,19 @@ def _outside_l2(
     return l2
 
 
+def _count_pending_scans(monkeypatch, queue: EscalationQueue) -> list[None]:
+    """One entry per ``queue.get_pending()`` call — each a full root scan."""
+    scans: list[None] = []
+    real = queue.get_pending
+
+    def counted():
+        scans.append(None)
+        return real()
+
+    monkeypatch.setattr(queue, 'get_pending', counted)
+    return scans
+
+
 @pytest.mark.asyncio
 class TestVetoStreakAlarm:
     async def test_the_first_two_sweeps_file_nothing(self, clocked):
@@ -1160,6 +1173,36 @@ class TestHumanParkedHoldsDoNotAlarm:
 
         await _sweeps(harness, clock, 3)
 
+        assert len(_alarms(harness)) == 1
+
+    async def test_each_sweep_scans_the_pending_queue_once_per_held_task(
+        self, clocked, monkeypatch,
+    ):
+        harness, clock = clocked
+        _outside_l2(_queue(harness), 'esc-9-2', members=('esc-1',))
+        _bind_reports(harness, {'T1': _pinned_hold(escalations=[_ref('esc-1', level=1)])})
+        scans = _count_pending_scans(monkeypatch, _queue(harness))
+
+        await _sweeps(harness, clock, 3)
+
+        assert len(scans) == 3
+
+    async def test_with_the_suppression_off_no_sweep_scans_the_pending_queue(
+        self, clocked, monkeypatch,
+    ):
+        """Every pending read is a root scan, and with the knob off no filing
+        reads the answer."""
+        harness, clock = clocked
+        harness.config.recovery_emission = RecoveryEmissionConfig(
+            streak_escalation_suppress_human_parked=False,
+        )
+        _outside_l2(_queue(harness), 'esc-9-2', members=('esc-1',))
+        _bind_reports(harness, {'T1': _pinned_hold(escalations=[_ref('esc-1', level=1)])})
+        scans = _count_pending_scans(monkeypatch, _queue(harness))
+
+        await _sweeps(harness, clock, 3)
+
+        assert scans == []
         assert len(_alarms(harness)) == 1
 
 
