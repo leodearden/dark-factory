@@ -109,6 +109,13 @@ _SUBMIT_CHILD_PACKAGES: tuple[str, ...] = ('escalation', 'shared')
 _PORTABLE_ENV_NAME = re.compile(r'[A-Za-z_][A-Za-z0-9_]*')
 
 
+def _systemd_execstart_literal(text: str) -> str:
+    """systemd expands ``${NAME}`` and ``$$`` inside an ExecStart argv element,
+    even within shell single quotes. Doubling every ``$`` makes systemd hand
+    /bin/sh the original text."""
+    return text.replace('$', '$$')
+
+
 def _submit_child_pythonpath() -> str:
     """Build the PYTHONPATH value for the deferred submit child.
 
@@ -871,10 +878,14 @@ class RestartPlan:
         script, so the RP-4 submit child sees none of it and keeps only the
         user manager's environment plus its own PYTHONPATH. ``_check_env``'s
         name rule is what makes the unquoted ``KEY=`` a valid assignment.
+        Values are also escaped for systemd's ExecStart ``$`` expansion
+        (:func:`_systemd_execstart_literal`), so they reach the script
+        byte-for-byte.
         """
         on_active_secs = max(int(self.on_active_secs), 5)
         env_assignments = [
-            f'{key}={shlex.quote(value)}' for key, value in self.env.items()
+            f'{key}={_systemd_execstart_literal(shlex.quote(value))}'
+            for key, value in self.env.items()
         ]
         payload = ' '.join([
             *env_assignments,
