@@ -4,8 +4,9 @@ A guard's storm escape (``shared.boundary_storm_escape``) fires at most once
 per window and leaves dedup to its sink, because only the sink can see the
 queue. A defect running for hours would otherwise file one record per hour.
 :func:`file_storm_once` folds every fire into the single open alarm until an
-operator resolves it (INV-4). A :class:`GuardStormAlarm` names whose alarm it
-is, so each guard on a server shares this one filer.
+operator resolves it (INV-4), noting on it any outcome it does not yet name. A
+:class:`GuardStormAlarm` names whose alarm it is, so each guard on a server
+shares this one filer.
 """
 
 from __future__ import annotations
@@ -14,6 +15,8 @@ import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
+
+from shared.boundary_storm_escape import storm_outcome_label
 
 from escalation.categories import EscalationCategory
 from escalation.models import Escalation
@@ -56,7 +59,9 @@ def file_storm_once(
     ``getattr`` keeps an older record shape lacking either field from raising.
 
     A failed read falls THROUGH to filing: losing duplicate suppression is
-    strictly better than losing the alarm for an active defect.
+    strictly better than losing the alarm for an active defect. So does a
+    burst of a new outcome that cannot be noted on the open alarm
+    (:func:`_folded`).
 
     Level 1 and 'blocking': a rate alarm about a condition, not a hold on any
     one caller's payload. Unstamped by design (task 3550): no task-workflow
@@ -80,11 +85,8 @@ def file_storm_once(
         # directory glob, and ids carry a monotonic sequence, so the lowest is
         # the record that opened the alarm.
         open_alarm = min(mine, key=lambda esc: esc.id)
-        logger.info(
-            '%s: %s already open (storm %r now); not duplicating',
-            alarm.agent_role, open_alarm.id, dict(record),
-        )
-        return open_alarm.id
+        if _folded(queue, alarm, open_alarm, record):
+            return open_alarm.id
 
     return queue.submit(Escalation(
         id=queue.make_id(alarm.anchor_task_id),
@@ -92,12 +94,61 @@ def file_storm_once(
         agent_role=alarm.agent_role,
         severity='blocking',
         category=alarm.category,
-        summary=(
-            f'{record.get("count")} {record.get("outcome")} MCP call(s) in '
-            f'{record.get("window_seconds")}s for project={record.get("project")!r} '
-            f'— {alarm.condition}'
-        ),
+        summary=f'{_burst_line(record)} — {alarm.condition}',
         detail='\n'.join(f'{key}={record[key]!r}' for key in sorted(record)),
         suggested_action=alarm.suggested_action,
         level=1,
     ))
+
+
+def _outcome_phrase(record: Mapping[str, Any]) -> str:
+    """How an alarm's text names a burst's outcome: one rendering, to write it and to find it."""
+    return f' {storm_outcome_label(record)} MCP call(s) '
+
+
+def _burst_line(record: Mapping[str, Any]) -> str:
+    return (
+        f'{record.get("count")}{_outcome_phrase(record)}in {record.get("window_seconds")}s '
+        f'for project={record.get("project")!r}'
+    )
+
+
+def _folded(
+    queue: EscalationQueue, alarm: GuardStormAlarm, open_alarm: Escalation,
+    record: Mapping[str, Any],
+) -> bool:
+    """Fold *record* into *open_alarm*; False when its new outcome could not be noted there.
+
+    The open alarm's summary names the outcome it was filed for, and that is
+    what an operator acts on. A burst of ANOTHER outcome (a resolver that went
+    from slow to down) folded in silently would leave the alarm naming only the
+    first, so it is appended to the alarm as an amendment and logged at
+    WARNING. A burst whose outcome the alarm already names folds at INFO.
+
+    A note that cannot land (the amend raised, or the alarm closed after it was
+    read) returns False, so the burst is filed as an alarm of its own.
+    """
+    phrase = _outcome_phrase(record)
+    named = [open_alarm.summary, *(note.get('summary', '') for note in open_alarm.amendments)]
+    if any(phrase in text for text in named):
+        logger.info(
+            '%s: %s already open (storm %r now); not duplicating',
+            alarm.agent_role, open_alarm.id, dict(record),
+        )
+        return True
+    logger.warning(
+        '%s: %s is open naming another outcome; noting this %s burst on it (storm %r)',
+        alarm.agent_role, open_alarm.id, storm_outcome_label(record), dict(record),
+    )
+    try:
+        noted = queue.amend(
+            open_alarm.id, summary=f'also folded in: {_burst_line(record)}',
+            agent_role=alarm.agent_role,
+        )
+    except Exception:
+        logger.exception(
+            '%s: could not note the burst on %s; filing it as an alarm of its own',
+            alarm.agent_role, open_alarm.id,
+        )
+        return False
+    return noted['status'] in ('amended', 'repeat_framing')

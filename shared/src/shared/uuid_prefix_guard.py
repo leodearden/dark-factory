@@ -31,9 +31,13 @@ strings and nothing else — the INV-8 occupancy bound on that scan is
 ``shared.uuid_prefix``'s to state. A call that DOES carry prefixes pays at most
 :data:`MAX_DISTINCT_PREFIXES_PER_CALL` resolver walks, overlapped
 :data:`MAX_CONCURRENT_RESOLUTIONS` at a time; beyond the ceiling it is
-forwarded unchanged with the reason on ``meta``. At the PRD's measured ~0.2s
-per walk that is ~0.4s of added latency in the worst case rather than the
-unbounded N x 0.2s a serial, uncapped resolve would have cost.
+forwarded unchanged with the reason on ``meta``. So the added latency is at
+most ceil(MAX_DISTINCT_PREFIXES_PER_CALL / MAX_CONCURRENT_RESOLUTIONS) rounds
+of the resolver's own latency, rather than one round per citation. What a
+round costs is the resolver's to bound: for the escalation servers' HTTP
+resolver, see ``escalation/src/escalation/prefix_resolver_client.py``'s module
+docstring (INV-8), and for the route's measured latency
+``plans/uuid-prefix-resolution-prd.md`` §4-C5, erratum 2026-11-05.
 
 That ceiling bounds DISTINCT tokens ONLY, which is worth saying out loud
 because reading it as a bound on the whole call is what once let an unbounded
@@ -114,6 +118,7 @@ __all__ = [
     'ResolverUnavailable',
     'ToolClass',
     'UUID_PREFIX_STORM_ERROR_TYPE',
+    'UnavailableReason',
     'UuidPrefixGuardMiddleware',
     'project_from_arguments',
 ]
@@ -175,19 +180,36 @@ class Resolution(NamedTuple):
     candidates: tuple[Candidate, ...]
 
 
+class UnavailableReason(enum.StrEnum):
+    """WHY a prefix got no resolution — orthogonal to WHICH store it concerned."""
+
+    #: The named store could not be reached, or the service reported that it
+    #: could not reach it.
+    UNREACHABLE = 'unreachable'
+    #: No answer arrived within the caller's deadline. The store may be
+    #: healthy but slow.
+    TIMED_OUT = 'timed_out'
+    #: An answer arrived that is not a :class:`Resolution`.
+    BAD_RESPONSE = 'bad_response'
+
+
 class ResolverUnavailable(Exception):
-    """A store could not be reached, so the prefix was never actually checked.
+    """A store gave no usable answer, so the prefix was never actually checked.
 
     Carries WHICH store failed, because "the resolver is down" is not
     actionable and "mem0 is down" is. The distinction this type exists to
     protect is the one INV-11 turns on: a store that cannot be reached must
     never be reported as a store that held nothing, or a live id silently
     becomes a `none` and the guard goes quietly inert on a real citation.
+
+    ``reason`` adds WHY there was no resolution, on an axis orthogonal to
+    ``store``: a slow store and an unreachable one call for different actions.
     """
 
-    def __init__(self, store: str) -> None:
-        super().__init__(f'prefix resolution unavailable: the {store} store could not be reached')
+    def __init__(self, store: str, *, reason: UnavailableReason = UnavailableReason.UNREACHABLE) -> None:
+        super().__init__(f'prefix resolution unavailable ({reason}): the {store} store')
         self.store = store
+        self.reason = reason
 
 
 class ToolClass(enum.StrEnum):
@@ -263,10 +285,12 @@ POLICY_MATRIX: Mapping[tuple[ResolutionOutcome, ToolClass], PrefixAction] = Mapp
 MAX_DISTINCT_PREFIXES_PER_CALL = 16
 
 #: How many of those resolutions are in flight at once. The resolutions run
-#: CONCURRENTLY — serial awaits would make the per-call bound 16 x ~0.2s ≈ 3.2s
-#: of latency on a single write — but not UNBOUNDED: an unlimited fan-out turns
+#: CONCURRENTLY — serial awaits would cost a single write one round of resolver
+#: latency per distinct prefix — but not UNBOUNDED: an unlimited fan-out turns
 #: one verbose call into sixteen simultaneous two-store walks, which is a way
-#: to brown out the stores the guard depends on.
+#: to brown out the stores the guard depends on. The cap is per CALL, not per
+#: process: N concurrent guarded calls put up to N times this many walks on the
+#: resolver.
 MAX_CONCURRENT_RESOLUTIONS = 8
 
 
@@ -281,6 +305,9 @@ MAX_CONCURRENT_RESOLUTIONS = 8
 #: excluded for a different reason: it is not fail-soft at all. The caller is
 #: told and can act, so there is no silent degradation for an escape to
 #: surface.
+#:
+#: An outage is counted per :class:`UnavailableReason`, so a slow resolver and
+#: an unreachable one fire separate storms.
 STORM_COUNTED_OUTCOMES: frozenset[str] = frozenset({'forwarded_ambiguous', 'resolver_unavailable'})
 
 
@@ -422,6 +449,7 @@ class _Outage(Exception):
         super().__init__(str(cause))
         self.token = token
         self.store = cause.store
+        self.reason = cause.reason
 
 
 class _Planned(NamedTuple):
@@ -843,7 +871,7 @@ class UuidPrefixGuardMiddleware(Middleware):
         that discuss one record at length.
 
         CONCURRENT, under a semaphore. Serially, a call citing sixteen distinct
-        prefixes would add sixteen ~0.2s store walks to one tool call, and the
+        prefixes would add sixteen store walks, end to end, to one tool call, and the
         corpus says the overwhelming majority of them cost that walk only to
         arrive at `none`. So the walks overlap, up to
         :data:`MAX_CONCURRENT_RESOLUTIONS` — bounded, because an unlimited
@@ -1112,14 +1140,16 @@ class UuidPrefixGuardMiddleware(Middleware):
         outcome: FactOutcome,
         agent_id: str | None,
         project: str,
+        reason: str | None = None,
     ) -> None:
         """Emit one ``uuid_prefix_detected``, and never change an outcome.
 
         ONE builder for every arm, so the contracted key set cannot drift
         between them. The record is COMPLETE even where the answer is
         ``None``: ``namespace`` is present and null for a cross-namespace
-        ambiguity and for an unreachable store, so a consumer never has to
-        tell "no single namespace" apart from "that arm forgot the key".
+        ambiguity and for an unreachable store, and ``reason`` is null on
+        every arm but the outage, so a consumer never has to tell "no such
+        value" apart from "that arm forgot the key".
 
         Logged at INFO, not WARNING. `expanded` is the DESIGNED success path —
         the same measurement that keeps it out of :data:`STORM_COUNTED_OUTCOMES`
@@ -1137,6 +1167,7 @@ class UuidPrefixGuardMiddleware(Middleware):
             'namespace': next(iter(namespaces)) if len(namespaces) == 1 else None,
             'agent_id': agent_id,
             'project': project,
+            'reason': reason,
         }
         logger.info(
             'uuid prefix guard: %s tool=%s field=%s token=%s candidates=%r project=%r',
@@ -1149,7 +1180,7 @@ class UuidPrefixGuardMiddleware(Middleware):
     # -- the one degraded path (INV-11) -----------------------------------
 
     async def _forward_outage(self, context, call_next, name, arguments, project, outage):
-        """A store could not be reached: forward unchanged, and say so.
+        """A store gave no resolution: forward unchanged, and say so.
 
         This is the guard's ONLY degraded path, and the ruling behind it is
         not negotiable: a boundary guard that turns a store outage into lost
@@ -1168,20 +1199,24 @@ class UuidPrefixGuardMiddleware(Middleware):
         the arguments that reach the tool are byte-identical to the ones
         submitted, so "forwarded unchanged" is structurally true rather than
         very nearly true.
+
+        The reason leaves as its plain value: the fact, ``meta`` and the storm
+        record all cross into sinks that render whatever they are handed.
         """
+        reason = outage.reason.value
         await self._emit_fact(
             name, outage.token, (),
             outcome=_FACT_OUTCOME[PrefixAction.FORWARD_UNCHANGED],
-            agent_id=_agent_id(arguments), project=project,
+            agent_id=_agent_id(arguments), project=project, reason=reason,
         )
         logger.warning(
-            'uuid prefix guard: the %s store could not be reached; %r forwarded '
+            'uuid prefix guard: no resolution from the %s store (%s); %r forwarded '
             'unchanged with its prefixes unresolved',
-            outage.store, name,
+            outage.store, reason, name,
         )
-        report: dict[str, Any] = {'resolver': 'unavailable', 'store': outage.store}
+        report: dict[str, Any] = {'resolver': 'unavailable', 'store': outage.store, 'reason': reason}
         storm = await self._storms.record(
-            _FACT_OUTCOME[PrefixAction.FORWARD_UNCHANGED], project
+            _FACT_OUTCOME[PrefixAction.FORWARD_UNCHANGED], project, reason=reason
         )
         if storm is not None:
             report['storm'] = storm
