@@ -220,7 +220,8 @@ class TestApplyAcrossTwoPorts:
             agreed = payloads.parse_agreed_marker(record.triage_note or '')
             assert isinstance(agreed, payloads.AgreedMarker)
             assert (agreed.answer, agreed.answer_rounds) == ('A', 1)
-        assert payloads.parse_agreed_marker(_record(s.alpha, 'esc-100-1').triage_note).agreed is True
+        alpha_marker = payloads.parse_agreed_marker(_record(s.alpha, 'esc-100-1').triage_note or '')
+        assert isinstance(alpha_marker, payloads.AgreedMarker) and alpha_marker.agreed is True
         assert isinstance(payloads.parse_prepared_marker(_record(s.alpha, 'esc-100-1').triage_note),
                           payloads.PreparedMarker)
         assert payloads.parse_prepared_marker(_record(s.beta, 'esc-200-1').triage_note) is None
@@ -272,6 +273,7 @@ class TestApplyAcrossTwoPorts:
         assert s.apply([s.answer(alpha_n, 'A')], {str(alpha_n): 'resume'}).exit_code == 0
 
         saved = ledger_mod.load(s.ledger)
+        assert saved is not None
         assert ledger_mod.resolution_turns(saved, s.key(s.alpha.queue_dir, 'esc-100-1')) == 1
 
 
@@ -569,7 +571,8 @@ class TestAuditVerdicts:
         rc, _, text = bench.run(capsys, f'{n}=ok')
 
         assert rc == 0, text
-        assert _decision_of(bench.fleet, record.id).audit_outcome.verdict == AuditVerdict.OK
+        outcome = _decision_of(bench.fleet, record.id).audit_outcome
+        assert outcome is not None and outcome.verdict == AuditVerdict.OK
         assert bench.state() == ClassSwitch.LIVE
 
     @pytest.mark.parametrize(('earlier_wrong', 'expected'), [(0, ClassSwitch.LIVE), (1, ClassSwitch.SHADOW)])
@@ -592,7 +595,8 @@ class TestAuditVerdicts:
         rc, _, text = bench.run(capsys, f'{n}=wrong')
 
         assert rc == 0, text
-        assert _decision_of(bench.fleet, record.id).audit_outcome.verdict == AuditVerdict.WRONG
+        outcome = _decision_of(bench.fleet, record.id).audit_outcome
+        assert outcome is not None and outcome.verdict == AuditVerdict.WRONG
         assert not policy_state.policy_state_path(Path(bench.queue_dir)).exists()
 
 
@@ -666,6 +670,7 @@ class TestPolicyStateVerb:
         try:
             rc = mod.main(['policy-state', *argv])
         except SystemExit as exc:
+            assert isinstance(exc.code, int)
             rc = exc.code
         out, err = capsys.readouterr()
         return rc, out, err

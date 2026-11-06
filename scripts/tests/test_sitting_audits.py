@@ -5,6 +5,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 from escalation.authority import COORDINATOR_IDENTITY, EXECUTOR_IDENTITY, policy_row
@@ -69,7 +70,7 @@ class Fleet:
     def decision(self, decision_id: str, esc_id: str, *, queue: Path | None = None,
                  closed_at: str | None = None, evidence: str | None = None) -> DecisionRecord:
         """A DecisionRecord over *esc_id*: closed with evidence at *closed_at*, or open when it is None."""
-        closed = {} if closed_at is None else {
+        closed: dict[str, Any] = {} if closed_at is None else {
             'state': 'answered', 'closed_at': closed_at,
             'closing_evidence': evidence or f'quoted evidence for {decision_id}',
         }
@@ -111,6 +112,12 @@ def _ids(closes) -> list[str]:
 
 def _sort_key(close: mod.ExecutorClose) -> tuple[str, str]:
     return close.closed_at, close.decision_id
+
+
+def _audit_full_until(policy_class: str) -> int:
+    row = policy_row(policy_class)
+    assert row is not None, policy_class
+    return row.audit_full_until
 
 
 class TestExecutorCloses:
@@ -250,7 +257,7 @@ class TestDraw:
         assert draw.population == 12
 
     def test_a_class_below_its_full_audit_count_is_drawn_whole_beside_the_ten(self, fleet):
-        assert policy_row(FULL_CLASS).audit_full_until > 3
+        assert _audit_full_until(FULL_CLASS) > 3
         full = [fleet.executor_close(n, policy_class=FULL_CLASS) for n in range(20, 23)]
         self._twelve(fleet)
         found = fleet.closes()
@@ -266,7 +273,7 @@ class TestDraw:
         for n in range(20, 23):
             fleet.executor_close(n, policy_class=FULL_CLASS)
         found = fleet.closes()
-        reached = {FULL_CLASS: policy_row(FULL_CLASS).audit_full_until}
+        reached = {FULL_CLASS: _audit_full_until(FULL_CLASS)}
 
         draw = mod.draw(found.in_window, seed='2026-09-26', lifetime_by_class=reached, sample_size=10)
 

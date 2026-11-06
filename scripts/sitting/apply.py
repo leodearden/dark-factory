@@ -43,21 +43,20 @@ from pathlib import Path
 from typing import Any, Literal, Protocol
 
 # Bind scripts/ and orchestrator/ to THIS checkout, never an editable install's (tasks 2881/2882).
-_REPO_ROOT = Path(__file__).resolve().parents[2]
-for _path in (_REPO_ROOT / 'orchestrator' / 'src', _REPO_ROOT / 'scripts'):
-    if str(_path) not in sys.path:
-        sys.path.insert(0, str(_path))
+# Bare sys.path calls, the one statement ruff's E402 lets an import follow.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'orchestrator' / 'src'))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts'))
 
-from dashboard.config import DEFAULT_FUSED_MEMORY_URLS  # noqa: E402
-from escalation.authority import (  # noqa: E402
+from dashboard.config import DEFAULT_FUSED_MEMORY_URLS
+from escalation.authority import (
     COORDINATOR_IDENTITY,
     ClassSwitch,
     IllegalClassTransition,
     audit_escape_target,
     coordinator_denied,
 )
-from escalation.models import Escalation  # noqa: E402
-from orchestrator.session_registry import (  # noqa: E402
+from escalation.models import Escalation
+from orchestrator.session_registry import (
     AuditVerdict,
     DecisionAuditRefused,
     DecisionRecord,
@@ -67,19 +66,19 @@ from orchestrator.session_registry import (  # noqa: E402
     normalize_escalations_dir,
     record_audit_outcome,
 )
-from shared.mcp_session import McpCallError, SyncMcpSession  # noqa: E402
-from sitting import audits, brief, payloads, ports  # noqa: E402
-from sitting import ledger as ledgers  # noqa: E402
-from sitting.inventory import AUDIT_KIND, index_queue, key_str, parse_key  # noqa: E402
-from sitting.payloads import AgreedMarker, ApplyPayload, PreparedMarker, Ruling  # noqa: E402
-from sitting.ports import PortUnknown, QueuePort  # noqa: E402
-from sitting.preparation import (  # noqa: E402
+from shared.mcp_session import McpCallError, SyncMcpSession
+from sitting import audits, brief, payloads, ports
+from sitting import ledger as ledgers
+from sitting.inventory import AUDIT_KIND, index_queue, key_str, parse_key
+from sitting.payloads import AgreedMarker, ApplyPayload, PreparedMarker, Ruling
+from sitting.ports import PortUnknown, QueuePort
+from sitting.preparation import (
     NIGHTLY_CONFINEMENT_ENV,
     NoLean,
     Preparation,
     Recommended,
 )
-from sitting.prepare_sitting import (  # noqa: E402
+from sitting.prepare_sitting import (
     AnswerTurn,
     Sources,
     answer_turn,
@@ -89,7 +88,7 @@ from sitting.prepare_sitting import (  # noqa: E402
     stores_arguments,
 )
 
-from escalation import policy_state  # noqa: E402
+from escalation import policy_state
 
 EXIT_OK, EXIT_STEP_FAILED, EXIT_CONFIG, EXIT_ASK_BACK, EXIT_REFUSED = 0, 1, 2, 3, 4
 
@@ -217,7 +216,7 @@ def _open_targets(turn: AnswerTurn) -> list[_Target]:
 
 
 def _gone_targets(loaded: ledgers.Ledger, gone: frozenset[str], answers: Sequence[ledgers.Answer]) -> list[_Target]:
-    keys = {ledgers.key_for_ref(loaded, answer.item_ref) for answer in answers} & gone
+    keys = gone.intersection(ledgers.key_for_ref(loaded, answer.item_ref) for answer in answers)
     targets = []
     for key in sorted(keys, key=lambda key: loaded.entries[key].number):
         _, queue_dir, esc_id = parse_key(key)
@@ -385,6 +384,8 @@ class _ApplyContext:
     def _execute(self, name: str, payload: ApplyPayload, port: QueuePort | PortUnknown | None) -> dict[str, Any]:
         if payload.tool == payloads.SESSION_REGISTRY_TOOL:
             return _run_registry(name, payload, self._fleet_root)
+        if not isinstance(payload.args, dict):
+            raise ValueError(f'{payload.tool!r} carries argv lists, which only {payloads.SESSION_REGISTRY_TOOL!r} runs')
         if payload.tool in ESCALATION_TOOLS and isinstance(port, QueuePort):
             reply = self._sessions.for_port(port).call_tool(payload.tool, payload.args)
         elif payload.tool in FUSED_MEMORY_TOOLS:

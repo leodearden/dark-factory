@@ -47,20 +47,19 @@ from pathlib import Path
 from typing import Any, Literal
 
 # Bind scripts/ and orchestrator/ to THIS checkout, never an editable install's (tasks 2881/2882).
-_REPO_ROOT = Path(__file__).resolve().parents[2]
-for _path in (_REPO_ROOT / 'orchestrator' / 'src', _REPO_ROOT / 'scripts'):
-    if str(_path) not in sys.path:
-        sys.path.insert(0, str(_path))
+# Bare sys.path calls, the one statement ruff's E402 lets an import follow.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'orchestrator' / 'src'))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts'))
 
-from _task_db_scan import discover_project_roots  # noqa: E402
-from orchestrator.digest import ModelRoleRow  # noqa: E402
-from orchestrator.session_registry import decisions_dir, fleet_root, sessions_dir  # noqa: E402
-from shared.project_layout import KNOWN_PROJECT_ROOTS_ENV, known_project_roots  # noqa: E402
-from shared.safe_io import atomic_write_text  # noqa: E402
-from sitting import audits, brief, fleet_state, prepare_sitting, trigger_state  # noqa: E402
-from sitting import ledger as ledgers  # noqa: E402
-from sitting.audits import AuditDraw, ExecutorClose  # noqa: E402
-from sitting.fleet_state import (  # noqa: E402
+from _task_db_scan import discover_project_roots
+from orchestrator.digest import ModelRoleRow
+from orchestrator.session_registry import decisions_dir, fleet_root, sessions_dir
+from shared.project_layout import KNOWN_PROJECT_ROOTS_ENV, known_project_roots
+from shared.safe_io import atomic_write_text
+from sitting import audits, brief, fleet_state, prepare_sitting, trigger_state
+from sitting import ledger as ledgers
+from sitting.audits import AuditDraw, ExecutorClose
+from sitting.fleet_state import (
     AutonomousClose,
     AutonomousCloses,
     HostAlarm,
@@ -71,7 +70,7 @@ from sitting.fleet_state import (  # noqa: E402
     StuckRow,
     Window,
 )
-from sitting.inventory import (  # noqa: E402
+from sitting.inventory import (
     AUDIT_KIND,
     Shortfall,
     age_days,
@@ -80,9 +79,10 @@ from sitting.inventory import (  # noqa: E402
     parse_stamp,
     queue_project_root,
 )
-from sitting.prepare_sitting import Sitting  # noqa: E402
-from sitting.trigger_state import TriggerLastRun  # noqa: E402
+from sitting.prepare_sitting import Sitting
+from sitting.trigger_state import TriggerLastRun
 
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_OUTPUT = _REPO_ROOT / 'data' / 'return-brief.md'
 DEFAULT_LEDGER_OUT = _REPO_ROOT / 'data' / 'sitting' / 'ledger-nightly.json'
 DEFAULT_PREPARATION = prepare_sitting.DEFAULT_PREPARATION

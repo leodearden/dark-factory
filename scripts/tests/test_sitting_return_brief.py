@@ -632,6 +632,7 @@ class TestExecutorAuditDraw:
         for decision_id, number in drawn.items():
             block = _item_block(section, number)
             record = records[decision_id]
+            assert record.escalation_id is not None
             assert SAMPLED_CLASS in block and record.escalation_id in block
             assert brief.fence_safe(record.closing_evidence) in block
             assert f'audit {number}=ok|wrong[:note]' in block

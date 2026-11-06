@@ -93,7 +93,7 @@ def serve_project_queue(project_root: Path, project_id: str) -> Iterator[ServedQ
         try:
             server = uvicorn.Server(uvicorn.Config(mcp.http_app(), log_level='error', ws='none'))
             loop.run_until_complete(server.serve(sockets=[listener]))
-        except BaseException as exc:  # noqa: BLE001 - a startup failure is reported below
+        except BaseException as exc:
             if not state['stopping']:
                 state['serve_error'] = exc
         finally:
