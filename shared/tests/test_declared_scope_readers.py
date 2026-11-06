@@ -3,7 +3,10 @@
 plans/follow-up-filing-shape-prd.md §3 decision 8: the declared-scope band is filing-time evidence
 for the curator, the packing sweep and the calibration report. Verify admission, verify scope, the
 merge-lane disjoint skip, the verify-result cache, simple-path triage and model routing must never
-read it, so a module outside ALLOWED_IMPORTERS that imports it fails here.
+read it, so a module outside ALLOWED_IMPORTERS that imports it fails here. A FORBIDDEN_READERS module
+also fails if it names the metadata key or any name ``shared.declared_scope`` exports, because a raw
+``task_metadata.get('declared_scope')`` or the ``DeclaredScope`` that ``shared.task_metadata`` binds
+needs no import of this module.
 """
 
 from __future__ import annotations
@@ -17,6 +20,9 @@ from typing import NamedTuple
 
 import pytest
 from silent_fallthrough_scan import ParsedFile
+
+from shared import declared_scope
+from shared.declared_scope import DECLARED_SCOPE_METADATA_KEY
 
 _TARGET = 'shared.declared_scope'
 _TARGET_PACKAGE, _, _TARGET_NAME = _TARGET.rpartition('.')
@@ -34,6 +40,10 @@ ALLOWED_IMPORTERS: Mapping[str, Allowed] = MappingProxyType({
     'fused-memory/src/fused_memory/backends/task_backend_errors.py': Allowed('refusal', _DECISION_8),
     'fused-memory/src/fused_memory/middleware/task_curator.py': Allowed('reader (γ)', _DECISION_8),
     'scripts/followup_filing_shape_report.py': Allowed('reader (θ)', _DECISION_8),
+})
+
+_PENDING: Mapping[str, str] = MappingProxyType({
+    'scripts/followup_filing_shape_report.py': 'θ',
 })
 
 FORBIDDEN_READERS: frozenset[str] = frozenset({
@@ -128,6 +138,53 @@ def test_forbidden_readers_are_real_and_never_allowed(first_party_tree: tuple[Pa
     assert present >= FORBIDDEN_READERS, f'renamed or removed: {sorted(FORBIDDEN_READERS - present)}'
 
 
+def test_every_allowlist_entry_is_real_unless_pending(first_party_tree: tuple[ParsedFile, ...]) -> None:
+    present = {record.relpath for record in first_party_tree}
+    landed = sorted(set(_PENDING) & present)
+    missing = sorted(set(ALLOWED_IMPORTERS) - set(_PENDING) - present)
+
+    assert set(_PENDING) <= set(ALLOWED_IMPORTERS)
+    assert not landed, f'landed, so delete its _PENDING entry: {landed}'
+    assert not missing, f'renamed or removed, so the grant is stale: {missing}'
+
+
+_EXPORTED_NAMES = frozenset({*declared_scope.__all__, DECLARED_SCOPE_METADATA_KEY})
+
+
+def _names_declared_scope(node: ast.AST) -> bool:
+    match node:
+        case ast.Constant(value=str() as value):
+            return value == DECLARED_SCOPE_METADATA_KEY
+        case ast.Name(id=name) | ast.Attribute(attr=name) | ast.alias(name=name):
+            return name in _EXPORTED_NAMES
+    return False
+
+
+def forbidden_reader_mentions(records: Iterable[ParsedFile]) -> dict[str, list[int]]:
+    """``relpath -> line numbers`` where a FORBIDDEN_READERS module names the key or an exported name."""
+    found: dict[str, list[int]] = {}
+    for record in records:
+        if record.tree is None or record.relpath not in FORBIDDEN_READERS:
+            continue
+        lines = sorted({
+            node.lineno for node in ast.walk(record.tree)
+            if isinstance(node, ast.expr | ast.alias) and _names_declared_scope(node)
+        })
+        if lines:
+            found[record.relpath] = lines
+    return found
+
+
+def test_no_forbidden_reader_names_declared_scope(first_party_tree: tuple[ParsedFile, ...]) -> None:
+    mentions = forbidden_reader_mentions(first_party_tree)
+
+    assert not mentions, (
+        f'these forbidden readers name {DECLARED_SCOPE_METADATA_KEY!r} or a {_TARGET} export: '
+        f'{mentions}\nThe declared-scope band must not steer verify, merge, triage or routing '
+        f'({_DECISION_8}).'
+    )
+
+
 def _probe(relpath: str, source: str) -> ParsedFile:
     source = textwrap.dedent(source)
     return ParsedFile(
@@ -180,8 +237,41 @@ def test_a_forbidden_reader_importing_declared_scope_is_reported(relpath: str, s
         ('orchestrator/src/orchestrator/routing.py', 'import shared.task_metadata\n'),
         ('orchestrator/src/orchestrator/routing.py', 'from shared import task_metadata\n'),
         ('orchestrator/src/orchestrator/routing.py', 'from .declared_scope import DeclaredScope\n'),
-        ('orchestrator/src/orchestrator/routing.py', "SLICE = 'declared_scope'\n"),
     ],
 )
 def test_a_lookalike_is_not_an_importer(relpath: str, source: str) -> None:
     assert declared_scope_importers([_probe(relpath, source)]) == {}
+
+
+_MENTION_SPELLINGS = (
+    "SLICE = 'declared_scope'\n",
+    "band = inputs.task_metadata.get('declared_scope', {}).get('band')\n",
+    "scope = parse_metadata(blob).model_extra['declared_scope']\n",
+    'from shared.task_metadata import DeclaredScope\n',
+    'import shared.task_metadata as tm\nrecord_type = tm.DeclaredScope\n',
+    'key = task_metadata.DECLARED_SCOPE_METADATA_KEY\n',
+    'violation = scope_module.stamp_violation({}, {}, replace=True)\n',
+)
+
+
+@pytest.mark.parametrize(
+    ('relpath', 'source'),
+    [(relpath, source) for relpath in sorted(FORBIDDEN_READERS) for source in _MENTION_SPELLINGS],
+)
+def test_a_forbidden_reader_naming_declared_scope_is_reported(relpath: str, source: str) -> None:
+    mentions = forbidden_reader_mentions([_probe(relpath, source)])
+
+    assert list(mentions) == [relpath]
+
+
+@pytest.mark.parametrize(
+    ('relpath', 'source'),
+    [
+        ('orchestrator/src/orchestrator/routing.py', '"""This module never reads declared_scope."""\n'),
+        ('orchestrator/src/orchestrator/routing.py', "KEY = 'declared_scope_extra'\n"),
+        ('orchestrator/src/orchestrator/routing.py', 'scope = declared_scope_like\n'),
+        ('fused-memory/src/fused_memory/middleware/task_curator.py', "SLICE = 'declared_scope'\n"),
+    ],
+)
+def test_a_lookalike_or_an_allowed_reader_is_not_a_mention(relpath: str, source: str) -> None:
+    assert forbidden_reader_mentions([_probe(relpath, source)]) == {}
