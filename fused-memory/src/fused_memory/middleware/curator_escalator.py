@@ -241,7 +241,8 @@ def _file_zot_escalation(project_root: str, *, project_id: str, detail: str) -> 
         infra_dedupe_categories=(_ZOT_CATEGORY,),
         key_fn=content_fingerprint_key,  # type: ignore[possibly-unbound]
     )
-    return submit_or_dedupe(queue, escalation, config)  # type: ignore[possibly-unbound]
+    response = submit_or_dedupe(queue, escalation, config)  # type: ignore[possibly-unbound]
+    return response
 
 
 async def _file_zot_logged(
