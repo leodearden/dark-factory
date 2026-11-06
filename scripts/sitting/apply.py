@@ -138,6 +138,13 @@ class _Skip:
     reason: str
 
 
+@dataclass(frozen=True)
+class _Failed:
+    """A step builder's own read failed, so the step fails without being sent."""
+
+    reason: str
+
+
 def coordinator_session(port: QueuePort) -> SyncMcpSession:
     """A session on *port*'s server asserting the coordinator identity."""
     return SyncMcpSession(port.base_url, client_name=CLIENT_NAME, headers={IDENTITY_HEADER: COORDINATOR_IDENTITY})
@@ -324,7 +331,7 @@ class _ApplyContext:
         record: Mapping[str, Any] | None,
         port: QueuePort | PortUnknown | None,
         ruling_text: str,
-    ) -> list[tuple[str, Callable[[], ApplyPayload | _Skip]]]:
+    ) -> list[tuple[str, Callable[[], ApplyPayload | _Skip | _Failed]]]:
         item = entry.item
         turns = ledgers.resolution_turns(self._turn.persisted, row.key)
         no_escalation = _Skip('a decision item has no escalation record')
@@ -343,7 +350,7 @@ class _ApplyContext:
             return payloads.resolve_issue_payload(item.escalation_id, ruling_text, action,
                                                   resolved_by=COORDINATOR_IDENTITY, resolution_turns=turns)
 
-        def x_ruling() -> ApplyPayload | _Skip:
+        def x_ruling() -> ApplyPayload | _Skip | _Failed:
             if not item.escalation_id or action is None:
                 return no_escalation
             if not isinstance(port, QueuePort) or port.kind != 'project' or port.project_root is None:
@@ -355,6 +362,8 @@ class _ApplyContext:
                 return _Skip('the escalation names a sentinel, not a task')
             root = str(port.project_root)
             task = self._fused.call_tool('get_task', {'id': task_id, 'project_root': root})
+            if 'error' in task:
+                return _Failed(f'get_task {task_id} could not read the prior ruling: {task["error"]}')
             existing = (task.get('metadata') or {}).get(payloads.X_RULING_KEY)
             ruling = Ruling(item.escalation_id, action, ruling_text, COORDINATOR_IDENTITY, self._now.isoformat())
             return payloads.update_task_payload(task_id, root, ruling, existing=existing)
@@ -374,12 +383,14 @@ class _ApplyContext:
         ]
 
     def _run(
-        self, name: str, build: Callable[[], ApplyPayload | _Skip], port: QueuePort | PortUnknown | None,
+        self, name: str, build: Callable[[], ApplyPayload | _Skip | _Failed], port: QueuePort | PortUnknown | None,
     ) -> dict[str, Any]:
         try:
             payload = build()
             if isinstance(payload, _Skip):
                 return _step(name, 'skipped', payload.reason)
+            if isinstance(payload, _Failed):
+                return _step(name, 'failed', payload.reason)
             return self._execute(name, payload, port)
         except McpCallError as exc:
             return _step(name, 'failed', str(exc))

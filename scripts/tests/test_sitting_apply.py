@@ -293,6 +293,16 @@ class TestApplyAcrossTwoPorts:
         assert step['outcome'] == 'failed'
         assert 'supersedes' not in step
 
+    def test_an_unreadable_prior_ruling_fails_the_step_and_writes_no_ruling(self, sitting):
+        fused = RecordingToolCaller({'get_task': {'error': 'database is locked'}})
+
+        exit_code, step = self._update_task_step(sitting, fused)
+
+        assert exit_code == mod.EXIT_STEP_FAILED
+        assert step['outcome'] == 'failed'
+        assert 'database is locked' in step['detail']
+        assert 'update_task' not in fused.names()
+
     def test_one_row_per_item_names_every_step(self, sitting):
         s = sitting
         alpha_n, beta_n = s.number(s.alpha.queue_dir, 'esc-100-1'), s.number(s.beta.queue_dir, 'esc-200-1')
