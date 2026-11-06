@@ -11499,3 +11499,75 @@ class TestSelfTargetRestartCarriesBeforeDoneEnv:
         assert all(
             'done' not in call.args for call in scheduler.set_task_status.call_args_list
         ), 'a refused env must never be reported as a scheduled DONE'
+
+
+@pytest.mark.asyncio
+class TestCrossUnitDeployCarriesBeforeDoneEnv:
+    """run()'s cross-unit deploy: the RestartPlan it builds records
+    before_done.env, and a real deploy script sees it."""
+
+    async def test_plan_carries_before_done_env(self, tmp_path: Path):
+        from unittest.mock import patch
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.proc_supervision import (
+            RestartDisposition,
+            RestartOutcome,
+            RestartPlan,
+        )
+
+        task = _deploy_task(
+            task_id='8598c',
+            target_unit='orchestrator-reify.service',
+            env={'DEPLOY_FLAG': 'canary'},
+        )
+        runner = DeterministicRunner(
+            scheduler=_mock_scheduler(task),
+            escalation_queue=EscalationQueue(tmp_path),
+            unit_inspector=AsyncMock(side_effect=[_BASELINE_UNIT_STATE, _FRESH_UNIT_STATE]),
+            script_runner=AsyncMock(return_value=(0, 'ok')),
+            own_unit_resolver=lambda: 'orchestrator.service',
+        )
+        captured_plans: list = []
+        canned = RestartOutcome(disposition=RestartDisposition.DEPLOYED_AND_VERIFIED)
+
+        async def _fake_execute(self, *, runner=None, inspector=None):
+            captured_plans.append(self)
+            return canned
+
+        with patch.object(RestartPlan, 'execute', _fake_execute):
+            await runner.run(_make_assignment(task))
+
+        assert len(captured_plans) == 1
+        assert captured_plans[0].env == {'DEPLOY_FLAG': 'canary'}, (
+            'the plan must describe the env its deploy runs with'
+        )
+
+    async def test_real_deploy_script_sees_before_done_env(self, tmp_path: Path):
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        script = tmp_path / 'env-deploy.sh'
+        script.write_text('#!/bin/sh\nprintf %s "$DEPLOY_FLAG" > "$1"\n')
+        script.chmod(0o755)
+        seen = tmp_path / 'seen'
+        task = _deploy_task(
+            task_id='8598d',
+            target_unit='orchestrator-reify.service',
+            script=str(script),
+            args=[str(seen)],
+            cwd=str(tmp_path),
+            env={'DEPLOY_FLAG': 'canary'},
+        )
+        runner = DeterministicRunner(
+            scheduler=_mock_scheduler(task),
+            escalation_queue=EscalationQueue(tmp_path),
+            unit_inspector=AsyncMock(side_effect=[_BASELINE_UNIT_STATE, _FRESH_UNIT_STATE]),
+            script_runner=None,
+            own_unit_resolver=lambda: 'orchestrator.service',
+        )
+
+        outcome = await asyncio.wait_for(runner.run(_make_assignment(task)), timeout=20)
+
+        assert outcome == WorkflowOutcome.DONE
+        assert seen.read_text() == 'canary'
