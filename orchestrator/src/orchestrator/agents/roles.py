@@ -613,6 +613,16 @@ agent — passing your own id there would hide everyone else's memories from you
 # drift after the fact, it does not prevent it structurally.
 MANDATED_STAGING_COMMAND = 'git add -- .'
 
+# The opening of every "## CRITICAL: Git Staging Rules" section below, spliced
+# like SCOPE_BOUNDARY_GUIDANCE. Each role follows it with its own code block.
+_TASK_DIR_NEVER_COMMITTED = """\
+`.task/` inside this worktree is orchestrator state: the `.task/plan.json` and
+`.task/iterations.jsonl` links into durable task storage that survives
+worktree resets, plus the Claude config dir. It must NEVER be committed. It is
+gitignored at the repo root, so an ordinary staging command already excludes
+it — no exclusion pathspec is needed:
+"""
+
 
 # Canonical rc=0/1/128 check for `git merge-base --is-ancestor`, spliced into
 # both STEWARD "Marking tasks done" call sites (kind="merged" and
@@ -950,8 +960,8 @@ You are a TDD implementer. You execute a structured plan by writing code, step b
 """ + BASH_CAPABLE_ROLE_PREAMBLE + """
 ## Session Startup Protocol
 
-1. Read `.task/plan.json` to understand the full plan — it is a symlink into the durable `<worktree_base>/.task-meta/<worktree-name>/plan.json` (which survives worktree resets), so reading either path resolves to the same plan.
-2. Read `<worktree_base>/.task-meta/<worktree-name>/iterations.jsonl` (this one is NOT symlinked into the lane) to see what's been done in prior iterations.
+1. Read `.task/plan.json` to understand the full plan.
+2. Read `.task/iterations.jsonl` to see what's been done in prior iterations (absent until the first iteration is logged, meaning there is no prior history).
 3. Run `git log --oneline -10` to see recent commits in this worktree.
 4. Identify the next pending step(s) in the plan.
 
@@ -965,14 +975,7 @@ You are a TDD implementer. You execute a structured plan by writing code, step b
 
 ## CRITICAL: Git Staging Rules
 
-Task metadata (plan.json, iterations.jsonl, etc.) now lives in the sibling
-`<worktree_base>/.task-meta/<worktree-name>/` directory, OUTSIDE this
-worktree — `git add -A`/`git clean`/`git checkout` here cannot reach it.
-`.task/` inside the worktree is retained for the compat window and for the
-Claude config dir, and must still NEVER be committed. It is gitignored at
-the repo root, so an ordinary staging command already excludes it — no
-exclusion pathspec is needed:
-
+""" + _TASK_DIR_NEVER_COMMITTED + """
 ```bash
 # CORRECT — stage by specific files, or stage everything at once:
 git add src/module/file.py tests/test_file.py
@@ -1016,8 +1019,8 @@ You are a debugger. You fix test, lint, and type-check failures.
 You will be given:
 - The failure output (test errors, lint violations, type errors). A section headed `## Test Output` or `## Type Check Output` means no failure marker matched, so read that raw tail and the full logs under `## Verify Logs` before concluding there is nothing to fix; an "Excerpt: N of M characters shown" line under a block means the output was cut.
 - Which verify attempt this is and, from the second attempt on, the causes of the earlier failed attempts in this loop (a # Verify Attempt section)
-- The task plan from `.task/plan.json` — a symlink into the durable `<worktree_base>/.task-meta/<worktree-name>/plan.json` (which survives worktree resets)
-- The iteration history from `<worktree_base>/.task-meta/<worktree-name>/iterations.jsonl` (NOT symlinked into the lane)
+- The task plan from `.task/plan.json`
+- The iteration history from `.task/iterations.jsonl`
 
 ## Rules
 
@@ -1028,12 +1031,7 @@ You will be given:
 
 ## CRITICAL: Git Staging Rules
 
-Task metadata now lives in the sibling `<worktree_base>/.task-meta/<worktree-name>/`
-directory, OUTSIDE this worktree. `.task/` inside the worktree is retained for
-the compat window and for the Claude config dir, and must still NEVER be
-committed. It is gitignored at the repo root, so an ordinary staging command
-already excludes it — no exclusion pathspec is needed:
-
+""" + _TASK_DIR_NEVER_COMMITTED + """
 ```bash
 # CORRECT:
 git add src/module/file.py tests/test_file.py
@@ -1425,16 +1423,13 @@ never keep it.
 
 ## CRITICAL: Git Staging Rules
 
-Task metadata now lives in the sibling `<worktree_base>/.task-meta/<worktree-name>/`
-directory, OUTSIDE this worktree. `.task/` inside the worktree is retained for
-the compat window and must still NEVER be committed — it is gitignored at the
-repo root (so an ordinary staging command already excludes it), and a
-pre-commit hook backstops this by stripping any `.task/` path that still gets
-staged. Never force-add it (`git add -f .task/...`):
-
+""" + _TASK_DIR_NEVER_COMMITTED + """
 ```bash
 git add -- .
 ```
+
+Never force-add it (`git add -f .task/...`). As a backstop, a pre-commit hook
+strips any `.task/` path that still gets staged.
 
 ## Important
 
@@ -1802,16 +1797,13 @@ wording differs.
 """ + MERGE_HALT_SAFETY_RULE + STEWARD_MERGE_CONFLICT_RULE + """
 ## CRITICAL: Git Staging Rules
 
-Task metadata now lives in the sibling `<worktree_base>/.task-meta/<worktree-name>/`
-directory, OUTSIDE this worktree. `.task/` inside the worktree is retained for
-the compat window and must still NEVER be committed — it is gitignored at the
-repo root (so an ordinary staging command already excludes it), and a
-pre-commit hook backstops this by stripping any `.task/` path that still gets
-staged. Never force-add it (`git add -f .task/...`):
-
+""" + _TASK_DIR_NEVER_COMMITTED + """
 ```bash
 git add -- .
 ```
+
+Never force-add it (`git add -f .task/...`). As a backstop, a pre-commit hook
+strips any `.task/` path that still gets staged.
 
 ## Session Continuity
 
@@ -2161,13 +2153,7 @@ dispatch.
 
 ## CRITICAL: Git Staging Rules
 
-Task metadata now lives in the sibling `<worktree_base>/.task-meta/<worktree-name>/`
-directory, OUTSIDE this worktree. `.task/` inside the worktree is retained for
-the compat window and must still NEVER be committed — it is gitignored at the
-repo root, so an ordinary staging command already excludes it (a pre-commit
-hook also backstops this by stripping any `.task/` path that still gets
-staged).
-
+""" + _TASK_DIR_NEVER_COMMITTED + """
 ```bash
 # CORRECT:
 git add path/to/file.py
@@ -2176,6 +2162,9 @@ git add -- .
 # WRONG — force-adds .task/ past the gitignore (never do this):
 # git add -f .task/plan.json
 ```
+
+As a backstop, a pre-commit hook strips any `.task/` path that still gets
+staged.
 """ + SCOPE_BOUNDARY_GUIDANCE_SIMPLE + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
     allowed_tools=[
         'Read', 'Glob', 'Grep', 'Edit', 'Write', 'Bash',
