@@ -386,8 +386,7 @@ def _assert_violation_output(stdout: str, bad_file: Path) -> None:
     Checks: full bad_file path present, mock_orch_config present,
     MagicMock(spec_set=pydantic_spec(...)) present, task 1339 reference present.
 
-    Shared by TestCliExitCodes (sys.executable) and TestStdlibOnlyProof
-    (python3 -I -S) so both tests track the same output contract.
+    Shared by TestCliExitCodes and TestCliBoundary so both track the same output contract.
     """
     assert str(bad_file) in stdout, f'Expected bad_file path in violation output, got: {stdout!r}'
     assert 'mock_orch_config' in stdout, (
@@ -569,70 +568,52 @@ class TestCliErrorHandling:
         assert str(other) in capsys.readouterr().out
 
 
-class TestStdlibOnlyProof:
-    """Running the script under python3 -I -S proves it imports only stdlib modules.
+class TestCliBoundary:
+    """The checker spawned exactly as hooks/project-checks and the lint_commands spawn it."""
 
-    ``python3 -I`` alone does NOT block venv site-packages on this machine (python 3.14,
-    uv-managed venv): ``-I`` only disables *user* site-packages (implies ``-s``), not system
-    or venv site-packages.  ``-I -S`` additionally skips site.py, so venv site-packages are
-    never added to sys.path — any accidental third-party import in the script would raise
-    ModuleNotFoundError at interpreter startup, loudly failing this test.
+    def test_hook_invocation_is_stdlib_only_and_reports_every_rule(self, tmp_path: Path):
+        """The single test that crosses the process boundary the nine call sites cross.
 
-    Three cases are exercised:
-      1. Empty directory: no test_*.py → exit 0, empty stdout (startup isolation).
-      2. Clean file: parse/scan runs → exit 0, empty stdout (scan path isolation).
-      3. Violation file: exit 1, stdout has violation + alternatives + 1339 (print path).
-    """
-
-    def test_script_runs_under_isolated_python3_proves_stdlib_only(self, tmp_path: Path):
-        """python3 -I -S three-case stdlib-only proof."""
+        ``-I -S`` keeps venv site-packages off sys.path, so a third-party import anywhere in
+        any rule's path fails startup. A startup crash also exits 1, but with empty stdout, so
+        the stdout assertions are what make rc == 1 meaningful. Every other CLI behaviour is
+        driven in process through main().
+        """
         if shutil.which('python3') is None:
             pytest.skip('python3 not found on PATH — cannot verify hook runtime assumption')
 
-        # --- Case 1: empty directory (startup + import isolation) ---
+        rule_a_file = tmp_path / 'test_rule_a.py'
+        rule_a_file.write_text(_VIOLATION_SOURCE)
+        rule_b_file = tmp_path / 'test_rule_b.py'
+        rule_b_file.write_text(_TASK_3980_SHAPE)
+        rule_c_file = tmp_path / 'test_rule_c.py'
+        rule_c_file.write_text(_RULE_C_SOURCE)
+        (tmp_path / 'test_clean.py').write_text(_CLEAN_SOURCE)
+
         result = subprocess.run(
             ['python3', '-I', '-S', str(SCRIPT_PATH), str(tmp_path)],
             capture_output=True,
             text=True,
         )
-        assert result.returncode == 0, (
-            f'Script exited non-zero under python3 -I -S:\n'
+
+        assert result.returncode == 1, (
+            f'expected exit 1 under python3 -I -S, got {result.returncode}:\n'
             f'  stdout: {result.stdout!r}\n'
             f'  stderr: {result.stderr!r}'
         )
-        assert result.stdout == '', (
-            f'Expected empty stdout (no scan targets in empty dir), got: {result.stdout!r}'
+        assert 'Traceback' not in result.stderr, result.stderr
+        _assert_violation_output(result.stdout, rule_a_file)
+        reported = result.stdout.splitlines()
+        rule_b_report = [line for line in reported if line.startswith(f'{rule_b_file}:')]
+        rule_c_report = [line for line in reported if line.startswith(f'{rule_c_file}:')]
+        for needle in ('bare-dataclass-double', 'VerifyResult', 'fake_verify_result', 'verify_skipped'):
+            assert any(needle in line for line in rule_b_report), (
+                f'expected {needle!r} on a {rule_b_file.name} line; got: {result.stdout!r}'
+            )
+        assert any('wall-clock-deadline' in line for line in rule_c_report), (
+            f'expected a wall-clock-deadline report for {rule_c_file.name}; got: {result.stdout!r}'
         )
-
-        # --- Case 2: clean file (parse/scan path isolation) ---
-        clean_file = tmp_path / 'test_clean.py'
-        clean_file.write_text(_CLEAN_SOURCE)
-        result2 = subprocess.run(
-            ['python3', '-I', '-S', str(SCRIPT_PATH), str(tmp_path)],
-            capture_output=True,
-            text=True,
-        )
-        assert result2.returncode == 0, (
-            f'Script exited non-zero (clean scan) under python3 -I -S:\n'
-            f'  stdout: {result2.stdout!r}\n'
-            f'  stderr: {result2.stderr!r}'
-        )
-        assert result2.stdout == '', f'Expected empty stdout (clean file), got: {result2.stdout!r}'
-
-        # --- Case 3: violation file (print-violations branch isolation) ---
-        bad_file = tmp_path / 'test_bad.py'
-        bad_file.write_text(_VIOLATION_SOURCE)
-        result3 = subprocess.run(
-            ['python3', '-I', '-S', str(SCRIPT_PATH), str(bad_file)],
-            capture_output=True,
-            text=True,
-        )
-        assert result3.returncode == 1, (
-            f'Script should exit 1 under python3 -I -S, got {result3.returncode}:\n'
-            f'  stdout: {result3.stdout!r}\n'
-            f'  stderr: {result3.stderr!r}'
-        )
-        _assert_violation_output(result3.stdout, bad_file)
+        assert 'test_clean.py' not in result.stdout
 
 
 class TestHooksIntegration:
@@ -1101,40 +1082,6 @@ class TestDataclassDoubleMessage:
         assert '# noqa: bare-dataclass-double' in message, (
             f'the message must instruct the Rule B noqa code verbatim; got {message!r}'
         )
-
-    def test_rule_b_path_runs_under_isolated_python3_stdlib_only(self, tmp_path: Path):
-        """The registry, walk and message builder add no third-party import.
-
-        Reuses TestStdlibOnlyProof's harness: under ``python3 -I -S`` no venv
-        site-packages are on sys.path, so any accidental third-party import in the
-        Rule B path would raise ModuleNotFoundError at startup instead of reporting.
-        """
-        if shutil.which('python3') is None:
-            pytest.skip('python3 not found on PATH — cannot verify hook runtime assumption')
-
-        bad_file = tmp_path / 'test_bad_double.py'
-        bad_file.write_text(_TASK_3980_SHAPE)
-        result = subprocess.run(
-            ['python3', '-I', '-S', str(SCRIPT_PATH), str(bad_file)],
-            capture_output=True,
-            text=True,
-        )
-        assert result.returncode == 1, (
-            f'Rule B should exit 1 under python3 -I -S, got {result.returncode}:\n'
-            f'  stdout: {result.stdout!r}\n'
-            f'  stderr: {result.stderr!r}'
-        )
-        for needle in (
-            str(bad_file),
-            'VerifyResult',
-            'fake_verify_result',
-            'verify_skipped',
-            'bare-dataclass-double',
-        ):
-            assert needle in result.stdout, (
-                f'Expected {needle!r} in Rule B stdout under python3 -I -S, '
-                f'got: {result.stdout!r}'
-            )
 
 
 _RULE_B_SOURCE = "bare = MagicMock(passed=False, summary='x')\n"
