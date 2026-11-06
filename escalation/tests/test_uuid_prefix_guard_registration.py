@@ -480,6 +480,26 @@ class TestStormBurstAlarm:
         alarms = self._alarms(queue)
         assert len(alarms) == 1, f'a second burst must fold into the open alarm, found {len(alarms)}'
         assert alarms[0].id == first[0].id
+        assert alarms[0].amendments == []
+
+    @pytest.mark.asyncio
+    async def test_a_burst_of_another_reason_is_noted_on_the_open_alarm(self, tmp_path: Path):
+        """The alarm an operator is reading says "timed out"; when fused-memory
+        then goes down, the unreachable burst folds in AS A NOTE, not silently."""
+        queue, slow = build(tmp_path, http_resolver(answers_after=30, timeout_seconds=0.05))
+        await self._burst(slow)
+        _, down = self._outage_server(tmp_path)
+
+        await self._burst(down)
+
+        alarms = self._alarms(queue)
+        assert len(alarms) == 1, f'expected the burst folded into one alarm, found {len(alarms)}'
+        alarm = alarms[0]
+        assert 'resolver_unavailable (timed_out)' in alarm.summary
+        assert "reason='timed_out'" in alarm.detail.splitlines()
+        notes = [note.get('summary', '') for note in alarm.amendments]
+        assert len(notes) == 1, f'expected one note naming the new reason, found {notes}'
+        assert 'resolver_unavailable (unreachable)' in notes[0]
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(('category', 'agent_role'), [

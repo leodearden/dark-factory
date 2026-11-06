@@ -1010,10 +1010,12 @@ _UUID_PREFIX_STORM_ALARM = GuardStormAlarm(
     condition='truncated-uuid citations are being forwarded unresolved',
     suggested_action=(
         'read the uuid_prefix_detected facts. resolver_unavailable carries a reason: '
-        'timed_out means fused-memory POST /resolve-prefix answered slower than the '
-        'client deadline (load, not an outage); unreachable means no connection, or a '
-        '503 naming the store; bad_response means a non-200 or malformed answer '
-        '(client/route contract drift). forwarded_ambiguous names the colliding ids '
+        'timed_out means fused-memory POST /resolve-prefix gave no answer within the '
+        'client deadline, usually load; a sustained burst can mean it is wedged, so '
+        'check its liveness. unreachable means no connection, or a 503 naming the '
+        'store; bad_response means a non-200 or malformed answer (client/route '
+        'contract drift). forwarded_ambiguous names the colliding ids. A burst of '
+        'another outcome folded into this open alarm is noted in its amendments '
         '(plans/uuid-prefix-resolution-prd.md)'
     ),
 )
