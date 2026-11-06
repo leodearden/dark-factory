@@ -978,9 +978,8 @@ def resolve_xdist_worker_id(request_or_session: pytest.FixtureRequest | pytest.S
 # background work is done" sites — fragile under host CPU oversubscription,
 # since the hardcoded window may elapse before the background
 # drainer/worker/watchdog is even scheduled — into a bounded poll on the same
-# post-condition. A genuinely
-# stuck background task still surfaces as a clear AssertionError once the
-# (generous) deadline passes.
+# post-condition. A genuinely stuck background task still surfaces as a clear
+# AssertionError once the (generous) deadline passes.
 # ---------------------------------------------------------------------------
 
 async def poll_until(
@@ -1000,9 +999,8 @@ async def poll_until(
 
     Checks *before* sleeping, so an already-true predicate returns on the
     first call with no sleep at all. Uses the asyncio event-loop monotonic
-    clock (see :func:`poll_until_dead` below) rather than
-    wall-clock/perf_counter, to avoid the same class of timing fragility
-    this helper exists to remove.
+    clock rather than wall-clock/perf_counter, to avoid the same class of
+    timing fragility this helper exists to remove.
 
     Args:
         predicate: Zero-arg sync or async callable evaluated each iteration.
@@ -1065,9 +1063,9 @@ async def poll_until_dead(
     last_counts: dict = {}
 
     async def _dead_count_reached():
-        stats = await q.get_stats(group_id=group_id)
-        last_counts.update(stats['counts'])
-        return stats['counts'].get('dead', 0) >= expected_dead
+        nonlocal last_counts
+        last_counts = (await q.get_stats(group_id=group_id))['counts']
+        return last_counts.get('dead', 0) >= expected_dead
 
     try:
         await poll_until(_dead_count_reached, timeout=timeout, interval=0.05)
@@ -1681,13 +1679,15 @@ def _init_single_commit_repo(path, files: dict[str, str], message: str) -> str:
     """Create a repo at *path* whose ``main`` holds one commit writing *files*
     (name -> content); return that commit's full SHA.
 
-    Signing is off and the commit skips hooks, so a developer's global
-    gpgsign setting or a stray hook cannot hang or fail a throwaway repo.
+    Signing is off and ``core.hooksPath`` points nowhere, so neither a
+    developer's global gpgsign setting nor any hook can hang or fail a later
+    git command in the repo.
     """
     subprocess.run(['git', 'init', '-q', '-b', 'main', str(path)], check=True)
     git_stdout(path, 'config', 'user.email', 't@e.example')
     git_stdout(path, 'config', 'user.name', 'T')
     git_stdout(path, 'config', 'commit.gpgsign', 'false')
+    git_stdout(path, 'config', 'core.hooksPath', '/dev/null')
     for name, content in files.items():
         (path / name).write_text(content)
     git_stdout(path, 'add', '-A')

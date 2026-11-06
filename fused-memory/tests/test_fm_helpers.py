@@ -13,7 +13,10 @@ import pytest
 from _fm_helpers import (
     _LOADED_SCRIPT_MODULE_NAMES,
     LoopFreedomProbe,
+    _init_git_repo,
     git_stdout,
+    init_ab_commit_repo,
+    init_merge_history_repo,
     load_script_module,
     submit_and_resolve,
 )
@@ -964,6 +967,18 @@ class TestPollUntilDead:
         assert 'Timed out waiting for 2 dead item(s)' in message
         assert "group_id='g1'" in message
         assert "'retry': 3" in message
+
+    @pytest.mark.asyncio
+    async def test_timeout_reports_latest_snapshot_not_a_merge_of_past_polls(self):
+        """get_stats GROUPs BY status, so a drained status vanishes from counts."""
+        from _fm_helpers import poll_until_dead
+
+        q = _ScriptedStatsQueue([{'pending': 1}, {'dead': 1}])
+
+        with pytest.raises(AssertionError) as exc_info:
+            await poll_until_dead(q, group_id='g1', expected_dead=2, timeout=0.2)
+
+        assert "last counts={'dead': 1}" in str(exc_info.value)
 
 
 # ---------------------------------------------------------------------------
@@ -2185,10 +2200,13 @@ class TestGitStdout:
 
 def _hostile_global_git_config(tmp_path, monkeypatch) -> None:
     """Point git's global config at one that forces signing through a failing
-    gpg program and routes every commit/merge hook to ``exit 1``."""
+    gpg program and routes every hook a builder's commands can trigger to
+    ``exit 1``, including the ones ``--no-verify`` does not bypass."""
     hooks = tmp_path / 'hostile-hooks'
     hooks.mkdir()
-    for hook in ('pre-commit', 'commit-msg', 'pre-merge-commit'):
+    for hook in (
+        'pre-commit', 'commit-msg', 'pre-merge-commit', 'prepare-commit-msg', 'post-checkout',
+    ):
         script = hooks / hook
         script.write_text('#!/bin/sh\nexit 1\n')
         script.chmod(0o755)
@@ -2203,17 +2221,15 @@ class TestRepoBuildersIgnoreDeveloperGitConfig:
     """Every builder survives a developer's global gpgsign and commit hooks."""
 
     @pytest.mark.parametrize(
-        'builder_name', ['_init_git_repo', 'init_ab_commit_repo', 'init_merge_history_repo'],
+        'builder', [_init_git_repo, init_ab_commit_repo, init_merge_history_repo],
     )
     def test_builder_succeeds_under_global_gpgsign_and_failing_hooks(
-        self, tmp_path, monkeypatch, builder_name,
+        self, tmp_path, monkeypatch, builder,
     ):
-        import _fm_helpers
-
         _hostile_global_git_config(tmp_path, monkeypatch)
         repo = tmp_path / 'repo'
 
-        getattr(_fm_helpers, builder_name)(repo)
+        builder(repo)
 
         assert git_stdout(repo, 'config', '--get', 'commit.gpgsign') == 'false'
         assert git_stdout(repo, 'status', '--porcelain') == ''
