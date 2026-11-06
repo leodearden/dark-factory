@@ -814,8 +814,8 @@ def _index_escalations(
     best-effort, and on ``OSError`` leaves the RESOLVED record in the root.
     The test is POSITIVE (``status`` is ``pending``), so a status vocabulary
     that grows a new terminal state does not silently start rendering as open;
-    ``park()`` keeps a genuinely-open L2 at ``pending``, and a null ``status``
-    reads as pending.  An UNRECOGNISED status is skipped and NAMED, unlike the
+    ``park()`` keeps a genuinely-open L2 at ``pending``.  An UNRECOGNISED
+    status, a null one included, is skipped and NAMED, unlike the
     resolved/dismissed skip, which is the filter doing its job.
     ``Escalation.from_dict`` validates no field types, so ``status`` and
     ``dedupe_fingerprint`` are type-guarded before use.
@@ -847,7 +847,7 @@ def _index_escalations(
         if record.location is not Location.ROOT or escalation.category != _EVAL_REGRESSION_CATEGORY:
             continue
         status = escalation.status
-        if status is not None and status != _OPEN_ESCALATION_STATUS:
+        if status != _OPEN_ESCALATION_STATUS:
             # ``isinstance`` FIRST: an unhashable status (``[]``, ``{}``) would
             # make the set membership test raise ``TypeError``.
             if isinstance(status, str) and status in _CLOSED_ESCALATION_STATUSES:

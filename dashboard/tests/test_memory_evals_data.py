@@ -36,7 +36,13 @@ from unittest.mock import MagicMock, patch
 
 from dashboard.config import DashboardConfig
 from dashboard.data.datum import Datum
-from dashboard.data.escalation_corpus import EscalationCorpus, measure_corpus, reconciliation_queue
+from dashboard.data.escalation_corpus import (
+    EscalationCorpus,
+    EscalationView,
+    Location,
+    measure_corpus,
+    reconciliation_queue,
+)
 
 # The real committed exemplar tree (3207), consumed read-only by the
 # consumer-side boundary test.  dashboard/tests/ -> dashboard/ -> <repo root>.
@@ -1505,6 +1511,37 @@ class TestEscalationJoin:
         assert row['escalation']['id'] == 'esc-alarmed-open'
         assert payload['issue_count'] == 0
 
+    def test_explicit_null_status_is_named_and_not_open_on_either_surface(
+        self, tmp_path: Path,
+    ) -> None:
+        """``"status": null`` survives ``Escalation.from_dict``, which supplies its
+        default only for an ABSENT key.  The corpus' live-pending view does not
+        admit it, so the join names it rather than rendering it as an open alarm
+        the Escalations tab does not count as pending.
+        """
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _join_tree(tmp_path)
+        body = json.loads((esc_dir / 'esc-alarmed-open.json').read_text())
+        body['status'] = None
+        (esc_dir / 'esc-alarmed-open.json').write_text(json.dumps(body))
+        corpus = _corpus(esc_dir)
+        assert corpus.value is not None
+        (record,) = [
+            r for r in corpus.value.scan(_RECON_QUEUE).records
+            if r.escalation.id == 'esc-alarmed-open'
+        ]
+        assert not EscalationView.QUEUE_PENDING.admits(record)
+
+        payload = build_memory_evals(root, corpus, _RECON_QUEUE)
+        row = _only(payload['evals'][0]['metrics'], 'alarmed-open')
+
+        assert row['escalation'] is None
+        assert row['parity'] == 'alarmed_unlinked'
+        assert [issue['kind'] for issue in payload['issues']] == ['unknown_escalation_status']
+        assert 'esc-alarmed-open' in payload['issues'][0]['detail']
+        assert 'None' in payload['issues'][0]['detail']
+
     def test_unrecognised_status_is_skipped_and_named(self, tmp_path: Path) -> None:
         """The openness test is POSITIVE, and the resulting skip is a real discard.
 
@@ -1720,8 +1757,16 @@ class TestEscalationJoin:
             dedupe_fingerprint=_FP_ALARMED_OPEN, timestamp=_JOIN_ESC_TIMESTAMP,
         )
         _corrupt(_write_escalation(archive, 'esc-archived-corrupt'))
+        corpus = _corpus(esc_dir)
+        assert corpus.value is not None
+        scan = corpus.value.scan(_RECON_QUEUE)
+        assert [
+            r.escalation.id for r in scan.records
+            if r.location is Location.ARCHIVE and r.escalation.dedupe_fingerprint == _FP_ALARMED_OPEN
+        ] == ['esc-alarmed-open']
+        assert [u.location for u in scan.unreadable] == [Location.ARCHIVE]
 
-        payload = build_memory_evals(root, _corpus(esc_dir), _RECON_QUEUE)
+        payload = build_memory_evals(root, corpus, _RECON_QUEUE)
 
         row = _only(payload['evals'][0]['metrics'], 'alarmed-open')
         assert row['escalation'] is None
