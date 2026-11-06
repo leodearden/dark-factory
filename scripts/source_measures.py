@@ -20,7 +20,7 @@ import subprocess
 import tokenize
 import tomllib
 from collections import Counter
-from collections.abc import Collection, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from io import StringIO
 from pathlib import Path
 from types import MappingProxyType
@@ -1007,13 +1007,36 @@ class DomainMember:
     files: tuple[DomainFile, ...]
 
 
+def unique_import_paths(
+    domain: Iterable[DomainMember], names_of: Callable[[DomainFile], Iterable[str]]
+) -> dict[str, str]:
+    """Each name *names_of* gives a file of *domain*, to the path of the one file it names.
+
+    An import of a name two files share is ambiguous, so MetricsError names each
+    such name and its sorted paths.
+    """
+    holders: dict[str, set[str]] = {}
+    for member in domain:
+        for domain_file in member.files:
+            for name in names_of(domain_file):
+                holders.setdefault(name, set()).add(domain_file.path)
+    shared = {name: sorted(paths) for name, paths in sorted(holders.items()) if len(paths) > 1}
+    if shared:
+        raise MetricsError(
+            'import name(s) shared by two or more source files, so an import of one is '
+            'ambiguous: ' + '; '.join(f'{name!r} names {paths!r}' for name, paths in shared.items())
+        )
+    return {name: path for name, (path,) in holders.items()}
+
+
 _SCRIPTS_PSEUDO_MEMBER = MemberRoots(
     name='scripts',
     pseudo=True,
     src_root='scripts',
     tests_root='scripts/tests',
     # scripts/tests/conftest.py puts these on sys.path, mirrored by the root
-    # pyproject.toml [tool.pyright].extraPaths and pinned equal to them by
+    # pyproject.toml [tool.pyright].extraPaths. Pinned equal to the first by
+    # scripts/tests/test_source_measures_import_roots.py and to the second by
     # tests/scripts/test_source_measures.py::TestExtraImportNames.
     extra_import_roots=('scripts/legibility', 'scripts/local-model-serving'),
 )

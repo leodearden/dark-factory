@@ -280,14 +280,9 @@ class TestCensus:
 
 
 class TestFirstPartyIsTheDomain:
-    def test_a_legibility_module_is_first_party_by_its_dotted_and_its_bare_name(self, scripts):
-        assert scripts.distinct_private_targets == frozenset(
-            {'legibility.ledger._x', 'ledger._x', 'tool._y'}
-        )
+    def test_a_legibility_attribute_patched_through_both_names_is_one_target(self, scripts):
+        assert scripts.distinct_private_targets == frozenset({'legibility.ledger._x', 'tool._y'})
         assert scripts.tests_with_private_patch == 4
-
-    def test_a_bare_legibility_module_name_is_first_party(self, scripts):
-        assert 'ledger._x' in scripts.distinct_private_targets
 
     def test_a_member_namespace_package_without_init_is_first_party(self, pkgb):
         assert pkgb.distinct_private_targets == frozenset({'nsb.state._s'})
@@ -326,7 +321,10 @@ class TestExtraImportRoots:
     def test_a_bare_name_is_first_party_for_string_and_object_patches(self, bare_scripts):
         # The object form reaches a hyphen-directory module through its bare import.
         assert bare_scripts.tests_with_private_patch == 2
-        assert bare_scripts.distinct_private_targets == frozenset({'ledger._x', 'lms_ctl._c'})
+        # Each is spelled through its file's first importable name.
+        assert bare_scripts.distinct_private_targets == frozenset(
+            {'legibility.ledger._x', 'lms_ctl._c'}
+        )
 
     def test_a_prose_constant_counts_through_a_bare_import(self, bare_scripts):
         assert (bare_scripts.prose_assertion_sites, bare_scripts.tests_with_prose_assertion) == (
@@ -344,7 +342,7 @@ class TestExtraImportRoots:
         with pytest.raises(MetricsError) as refused:
             pinning.measure_python_tree(tree)
         message = str(refused.value)
-        assert 'ledger' in message
+        assert "'ledger' names" in message
         assert 'scripts/ledger.py' in message
         assert 'scripts/legibility/ledger.py' in message
 

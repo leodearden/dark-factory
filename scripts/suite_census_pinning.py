@@ -18,6 +18,7 @@ from types import MappingProxyType
 
 from source_measures import (
     PSEUDO_MEMBERS,
+    DomainFile,
     DomainMember,
     FileKind,
     MemberRoots,
@@ -26,6 +27,7 @@ from source_measures import (
     file_size_measures_in_tree,
     patch_calls_in_tree,
     private_reads_in_tree,
+    unique_import_paths,
     workspace_domain,
 )
 
@@ -77,38 +79,41 @@ def _importable(dotted: str) -> bool:
     return all(segment.isidentifier() for segment in dotted.split('.'))
 
 
-def _module_paths(domain: Iterable[DomainMember]) -> dict[str, str]:
-    """Each importable name of the domain's files, to the one file it names."""
-    holders: defaultdict[str, set[str]] = defaultdict(set)
-    for member in domain:
-        for file in member.files:
-            for name in filter(_importable, file.import_names):
-                holders[name].add(file.path)
-    shared = {name: sorted(paths) for name, paths in sorted(holders.items()) if len(paths) > 1}
-    if shared:
-        raise MetricsError(
-            'import name(s) shared by two or more source files, so the census cannot '
-            'tell which file a test importing one reads: '
-            + '; '.join(f'{name!r} names {paths!r}' for name, paths in shared.items())
-        )
-    return {name: next(iter(paths)) for name, paths in holders.items()}
+def _importable_names(file: DomainFile) -> tuple[str, ...]:
+    return tuple(filter(_importable, file.import_names))
 
 
 @dataclass(frozen=True)
 class _FirstParty:
     roots: frozenset[str]
     modules: MappingProxyType[str, str]
+    primary_names: MappingProxyType[str, str]
 
     @classmethod
-    def of(cls, domain: Iterable[DomainMember]) -> _FirstParty:
-        modules = _module_paths(domain)
+    def of(cls, domain: Sequence[DomainMember]) -> _FirstParty:
+        modules = unique_import_paths(domain, _importable_names)
+        primary_names = {
+            file.path: names[0]
+            for member in domain for file in member.files
+            if (names := _importable_names(file))
+        }
         return cls(
             roots=frozenset(name.split('.', 1)[0] for name in modules),
             modules=MappingProxyType(modules),
+            primary_names=MappingProxyType(primary_names),
         )
 
     def owns(self, dotted: str) -> bool:
         return dotted.split('.', 1)[0] in self.roots
+
+    def canonical(self, dotted: str) -> str:
+        """*dotted* respelled through the primary name of its longest first-party module prefix."""
+        segments = dotted.split('.')
+        for end in range(len(segments), 0, -1):
+            path = self.modules.get('.'.join(segments[:end]))
+            if path is not None:
+                return '.'.join((self.primary_names[path], *segments[end:]))
+        return dotted
 
 
 class _ProseIndex:
@@ -201,11 +206,11 @@ class _PatchJudge:
 
     def target(self, call: PatchCall) -> str | None:
         if call.target is not None:
-            return call.target
+            return self.first_party.canonical(call.target)
         if isinstance(call.receiver, ast.Name):
             module = self.bindings.get(call.receiver.id)
             if module in self.first_party.modules:
-                return f'{module}.{call.attribute}'
+                return self.first_party.canonical(f'{module}.{call.attribute}')
         return None
 
     def _is_private(self, call: PatchCall) -> bool:
@@ -482,7 +487,9 @@ Rows are in package-name order and are not ranked.
 - **patch sites outside tests**: the same calls in fixtures, helpers and module
   scope, counted here rather than attributed to the tests that use them.
 - **distinct targets**: string targets plus object-form targets whose receiver
-  is a first-party module import.
+  is a first-party module import, each spelled through its file's first name
+  (`legibility.x`, or the bare `x` where the dotted name is not importable), so a
+  module reached by both names counts each attribute once.
 - **prose asserts**: `assert` statements comparing (`in`, `not in`, `==`, `!=`)
   a string of 3+ characters that occurs inside a module-level string constant
   of 6+ words in a first-party module the file imports. These are candidates

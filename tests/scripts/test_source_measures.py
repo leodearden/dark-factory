@@ -1242,6 +1242,29 @@ class TestExtraImportNames:
         )
 
 
+def _primary_name(domain_file: source_measures.DomainFile) -> tuple[str, ...]:
+    return () if domain_file.import_name is None else (domain_file.import_name,)
+
+
+class TestUniqueImportPaths:
+    def test_each_name_maps_to_the_one_file_it_names(self, tmp_path: Path) -> None:
+        domain = source_measures.workspace_domain(_domain_repo(tmp_path / 'repo'))
+        paths = source_measures.unique_import_paths(domain, lambda f: f.import_names)
+        assert paths['legibility.y'] == paths['y'] == 'scripts/legibility/y.py'
+        assert paths['alpha.sub.deep'] == 'alpha/src/alpha/sub/deep.py'
+        assert 'test_x' not in paths
+
+    def test_a_name_two_files_share_is_refused_naming_it_and_its_sorted_paths(
+        self, tmp_path: Path
+    ) -> None:
+        repo = _domain_repo(tmp_path / 'repo', tracked=(*_DOMAIN_TRACKED, 'scripts/y.py'))
+        domain = source_measures.workspace_domain(repo)
+        with pytest.raises(source_measures.MetricsError) as refused:
+            source_measures.unique_import_paths(domain, lambda f: f.import_names)
+        assert "'y' names ['scripts/legibility/y.py', 'scripts/y.py']" in str(refused.value)
+        assert source_measures.unique_import_paths(domain, _primary_name)['y'] == 'scripts/y.py'
+
+
 def _workspace(*members: str) -> str:
     return '[tool.uv.workspace]\nmembers = [{}]\n'.format(
         ', '.join(f'"{member}"' for member in members)
