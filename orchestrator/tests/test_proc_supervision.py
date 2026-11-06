@@ -1909,3 +1909,86 @@ class TestDetachedSystemdRunCarriesEnv:
 
         assert default_plan.env == {}
         assert default_runner.calls[0][0] == explicit_runner.calls[0][0]
+
+
+def _leaf_plain_spawn_plan(**overrides):
+    """The leaf plain-spawn plan shape from ``TestDetachedLeafPlainSpawn``."""
+    from orchestrator.proc_supervision import RestartPlan
+
+    fields = {
+        'script': Path('/proj/scripts/restart-fused-memory.sh'),
+        'args': ['--drain'],
+        'cwd': Path('/proj'),
+        'target_unit': 'fused-memory.service',
+        'own_unit': '',
+        'on_failure_escalation': None,
+        'verify': None,
+        'transient_unit': None,
+    }
+    fields.update(overrides)
+    return RestartPlan(**fields)
+
+
+_FRESH_CROSS_UNIT_STATE = {
+    'MainPID': 99,
+    'ActiveState': 'active',
+    'ActiveEnterTimestampMonotonic': 2000,
+}
+
+
+@pytest.mark.asyncio
+class TestBlockingAndLeafSpawnCarryEnv:
+    """The cross-unit blocking and leaf plain-spawn paths overlay
+    ``RestartPlan.env`` on this process's environment, the same rule as
+    ``orchestrator/src/orchestrator/before_done_script.py::run_script``."""
+
+    async def test_cross_unit_blocking_overlays_env_on_os_environ(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import dataclasses
+
+        from orchestrator.proc_supervision import RestartDisposition
+
+        monkeypatch.setenv('DF_8598_INHERITED', 'kept')
+        runner = FakeRunner(returncode=0)
+        plan = dataclasses.replace(
+            _build_cross_unit_verify_plan(on_failure_escalation=None),
+            env={'DEPLOY_FLAG': 'canary'},
+        )
+
+        outcome = await plan.execute(
+            runner=runner, inspector=make_fake_inspector(_FRESH_CROSS_UNIT_STATE),
+        )
+
+        _args, kwargs = runner.calls[0]
+        assert kwargs['env']['DEPLOY_FLAG'] == 'canary'
+        assert kwargs['env']['DF_8598_INHERITED'] == 'kept', (
+            'the child must keep the inherited environment (PATH, HOME, ...)'
+        )
+        assert outcome.disposition == RestartDisposition.DEPLOYED_AND_VERIFIED
+
+    async def test_leaf_plain_spawn_overlays_env_on_os_environ(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv('DF_8598_INHERITED', 'kept')
+        runner = FakeRunner(returncode=0)
+        plan = _leaf_plain_spawn_plan(env={'DEPLOY_FLAG': 'canary'})
+
+        await plan.execute(runner=runner)
+
+        _args, kwargs = runner.calls[0]
+        assert kwargs['env']['DEPLOY_FLAG'] == 'canary'
+        assert kwargs['env']['DF_8598_INHERITED'] == 'kept'
+
+    async def test_empty_env_inherits(self) -> None:
+        blocking_runner = FakeRunner(returncode=0)
+        leaf_runner = FakeRunner(returncode=0)
+
+        await _build_cross_unit_verify_plan(on_failure_escalation=None).execute(
+            runner=blocking_runner,
+            inspector=make_fake_inspector(_FRESH_CROSS_UNIT_STATE),
+        )
+        await _leaf_plain_spawn_plan().execute(runner=leaf_runner)
+
+        assert blocking_runner.calls[0][1].get('env') is None
+        assert leaf_runner.calls[0][1].get('env') is None
