@@ -212,6 +212,9 @@ class CuratorDecision:
     degraded_by_zot: bool = False
     zot_escalation_id: str | None = None
     defer_reason: DeferReason | None = None
+    # The corpus streams whose read failed for this candidate: see
+    # PoolWithheld.unavailable_streams.
+    unavailable_streams: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if (self.action == 'defer') != (self.defer_reason is not None):
@@ -219,6 +222,7 @@ class CuratorDecision:
                 "CuratorDecision.defer_reason must be set iff action == 'defer', got "
                 f'action={self.action!r} defer_reason={self.defer_reason!r}'
             )
+        _require_pool_streams(self.unavailable_streams, 'CuratorDecision')
 
     @classmethod
     def deferred(
@@ -246,6 +250,7 @@ class CuratorDecision:
             'latency_ms': self.latency_ms,
             'cost_usd': self.cost_usd,
             'defer_reason': self.defer_reason,
+            'unavailable_streams': list(self.unavailable_streams),
         }
 
 
@@ -275,8 +280,16 @@ class PreparedCandidate:
     corpus_error: str | None = None
 
     @classmethod
-    def corpus_failed(cls, candidate: CandidateTask, error: str) -> PreparedCandidate:
+    def corpus_failed(
+        cls,
+        candidate: CandidateTask,
+        error: str,
+        unavailable_streams: tuple[str, ...] = (),
+    ) -> PreparedCandidate:
         """The bundle of a candidate whose corpus could not be assembled.
+
+        *unavailable_streams* names the streams whose failure made the corpus
+        unusable, when assembly got far enough to know them.
 
         It costs no prompt tokens: the pipeline defers it ``corpus-failed``
         without ever rendering it into a prompt.
@@ -286,7 +299,7 @@ class PreparedCandidate:
             pool=[],
             pool_sizes=empty_pool_sizes(),
             prompt_tokens=0,
-            withheld=PoolWithheld(),
+            withheld=PoolWithheld(unavailable_streams=unavailable_streams),
             corpus_error=error,
         )
 
@@ -327,6 +340,12 @@ class PoolWithheld:
     census keyed on the final trim alone would miss most of what the pool
     loses.
 
+    ``unavailable_streams`` names the streams whose read FAILED, so their
+    empty contribution to the pool is not evidence that nothing overlaps
+    (INV-11). Each renders as its own line, even when no cap withheld
+    anything: an outage is a fact about the pool whether or not it was also
+    truncated.
+
     An empty census renders nothing: a pool that fit says nothing about
     fitting, exactly as a complete result surface carries no delta.
     """
@@ -334,6 +353,10 @@ class PoolWithheld:
     by_source: Mapping[str, int] = field(default_factory=dict)
     caps: Mapping[str, int] = field(default_factory=dict)
     lower_bounds: tuple[str, ...] = ()
+    unavailable_streams: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        _require_pool_streams(self.unavailable_streams, 'PoolWithheld')
 
     @property
     def total(self) -> int:
@@ -341,7 +364,23 @@ class PoolWithheld:
         return sum(self.by_source.values())
 
     def render(self) -> str | None:
-        """Render the prompt block, or ``None`` when nothing was withheld."""
+        """Render the prompt block, or ``None`` when nothing was withheld or failed."""
+        blocks = [
+            block
+            for block in (self._render_truncation(), self._render_unavailable())
+            if block is not None
+        ]
+        return '\n'.join(blocks) if blocks else None
+
+    def _render_unavailable(self) -> str | None:
+        if not self.unavailable_streams:
+            return None
+        return '\n'.join(
+            f'stream {name} unavailable: absence is not proof of no overlap'
+            for name in self.unavailable_streams
+        )
+
+    def _render_truncation(self) -> str | None:
         if self.total == 0:
             return None
         payload: dict[str, object] = {
@@ -368,6 +407,16 @@ class PoolWithheld:
 
 # Strongest-first; task_curator.py::_trim_pool drops in the reverse order.
 POOL_SOURCES: Final = ('anchor', 'sibling', 'module', 'embedding', 'dependency')
+
+
+def _require_pool_streams(names: tuple[str, ...], owner: str) -> None:
+    """Refuse any corpus-stream name outside :data:`POOL_SOURCES`."""
+    unknown = [name for name in names if name not in POOL_SOURCES]
+    if unknown:
+        raise ValueError(
+            f'{owner}.unavailable_streams names unknown streams {unknown!r}; '
+            f'valid streams are {list(POOL_SOURCES)!r}'
+        )
 
 
 def empty_pool_sizes() -> dict[str, int]:
