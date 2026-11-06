@@ -10048,8 +10048,10 @@ class SpeculativeMergeWorker:
         it after a passing :meth:`probe_host`, and keeps the per-(host, sha)
         skew count that makes the next skew bench sticky;
         :meth:`clear_host_quarantine` (the operator clear) calls it without a
-        probe and then resets that count, as a restart does.  Returns whether
-        the host was re-admitted.
+        probe and then resets that count, as a restart does.  A readmission
+        then calls the harness's ``on_host_readmitted`` hook, fault-isolated,
+        so the task pool re-offers the host (task 6670).  Returns whether the
+        host was re-admitted.
         """
         _readmit = getattr(self._host_allocator, 'readmit', None)
         if _readmit is None:
@@ -10069,7 +10071,20 @@ class SpeculativeMergeWorker:
             self._escalation_queue, self._event_store, name,
             downtime_s=downtime_s, evidence=evidence,
         )
+        self._notify_host_readmitted(name)
         return True
+
+    def _notify_host_readmitted(self, name: str) -> None:
+        """Tell the harness *name* is back; a task-pool fault never undoes the readmission."""
+        if self._on_host_readmitted is None:
+            return
+        try:
+            self._on_host_readmitted(name)
+        except Exception:
+            logger.exception(
+                'on_host_readmitted hook raised for re-admitted verify host %r; '
+                'the merge-lane readmission stands', name,
+            )
 
     async def clear_host_quarantine(self, name: str) -> dict[str, Any]:
         """The operator clear (escalation tool ``clear_verify_host_quarantine``).
