@@ -66,7 +66,7 @@ Understanding the system helps you form accurate root-cause hypotheses without p
 
 **Monitor signal** — a synthetic sentinel `task_id` that reports ON a task rather than recording work done on one:
 - Signature: the `task_id` is not a task number but a sentinel — `__recovery_veto_streak__<real_task_id>` (the same recovery veto held a task for N consecutive sweeps) and, by the same shape, `__zero_progress_requeue__<real_task_id>`. The record pins nothing real: the sentinel exists precisely so that observing a hold cannot deepen it, which is why an open L2 in this class never blocks the task it names.
-- Promote a record of either sentinel class under its sentinel `task_id` VERBATIM, never under the real id read out of its body: for both classes the server refuses a real id with `code: 'sentinel_task_id_required'` (`escalation.authority.PROMOTE_SENTINEL_BOUND_ROLES`) and returns the `required_task_ids` to re-issue with.
+- Promote a record of either sentinel class, when it is promoted at all — see [Sentinel detector L1s — Q6 rules](#sentinel-detector-l1s--q6-rules) — under its sentinel `task_id` VERBATIM, never under the real id read out of its body: for both classes the server refuses a real id with `code: 'sentinel_task_id_required'` (`escalation.authority.PROMOTE_SENTINEL_BOUND_ROLES`) and returns the `required_task_ids` to re-issue with.
 - Every record in a class like this looks alike at the mechanism level, so clustering by that shared mechanism over-folds unrelated incidents into one L2. Key each by its ORIGINATING cause instead — for veto streaks, the escalations the record already names as open on the held task: see [Recovery veto-streak sentinel L1s](#recovery-veto-streak-sentinel-l1s-__recovery_veto_streak__).
 
 ## Shallow-by-default → Deepen-on-signal RCA
@@ -379,7 +379,8 @@ Every auto-closed L2 **MUST** be enumerated in the rotation digest — see [Dige
    resolve it (autonomous dispatch: path-guard scope_violation closes / dependency / stranded),
    file-and-resolve it (Convert to tracked work, including cleanup_needed and review_suggestions), or
    promote it to L2 (judgement classes and anything you cannot address — see routing table below)
-5b. Check that every work_batch member was resolved, filed-and-resolved or promoted;
+5b. Check that every work_batch member was resolved, filed-and-resolved or promoted,
+    or left for the release edge under the Q6 veto-streak rule;
     an item in none of those states is a triage bug — promote it
 6. Increment escalations_handled by len(work_batch) — already-promoted items filtered in step 3
    do NOT count toward the rotation limit
@@ -550,13 +551,14 @@ Every L1 in `work_batch` leaves the rotation in exactly one of three states:
 - **File-and-resolve it** (`submit_task` → `resolve_ticket` → `resolve_issue`) — see [Convert to tracked work](#convert-to-tracked-work-file-and-resolve).
 - **Promote it** (`promote_to_l2`) — anything you cannot yourself address: anything needing authority above `{0,1}`, a code edit, merge-queue, infra or a ref-move, a human ruling, and anything you are unsure about.
 
-There is NO fourth branch. An assessment that ends without one of the three ends in a promotion.
+There is NO fourth branch you may choose; the two named states at the end of this list are the only exceptions. An assessment that ends without one of the three ends in a promotion.
 
 - **"Hold for an Nth occurrence" is retired.** It cannot release itself: one drain samples one moment, nothing counts occurrences across tasks or rotations, and nothing re-examines the criterion. A recurrence question worth asking is a filed task whose description asks it; one that needs a human is a promotion.
 - **A `stamp_triage` stamp is not a disposition.** It changes neither status nor level, so a stamped-only L1 is still parked.
 - **A parked record costs every later rotation.** `orchestrator/src/orchestrator/harness.py::Harness._watcher_has_actionable_l1` counts every pending L1 outside a pending L2's members, so a parked record re-arms rotations indefinitely.
 - **Pending L2s are the human's queue**, not records you parked; the L2 guards above stand.
-- The one non-terminal state is the `promote_to_l2`-absent defect in [Graceful Degradation](#graceful-degradation). It is not a disposition.
+- The `promote_to_l2`-absent defect in [Graceful Degradation](#graceful-degradation) is a non-terminal state. It is not a disposition.
+- The [Q6 veto-streak hold](#recovery-veto-streak-sentinel-l1s-__recovery_veto_streak__) is the one DELIBERATE non-terminal state, ruled by Leo: a veto-streak L1 whose listed pin a pending L2 holds is stamped and left for its detector's release edge. Its cost: `Harness._watcher_has_actionable_l1` still counts it, so rotations keep re-arming while its holding L2 is pending; the stamp keeps those rotations from re-deriving it.
 
 ### Convert to tracked work (file-and-resolve)
 
@@ -1220,6 +1222,13 @@ Pinning escalations: esc-1000-2 (age unknown), esc-5000-3 (age unknown), esc-999
 ```
 
 yields `esc-1000-2`, `esc-5000-3`, `esc-9999-1`. The emitter already renders these **sorted and deduplicated** across its buckets (`_flatten_ids` returns `sorted(set(...))`), so read them in the order given — do not re-sort, re-order, or drop any. That format is pinned by `orchestrator/tests/test_recovery_emission.py::TestEmitRecoveryVetoStreakEscalation::test_the_pinning_escalations_line_is_sorted_deduped_and_age_annotated`, so you may rely on it rather than re-deriving the order.
+
+**Q6 no-promote check — run it first** ([Sentinel detector L1s — Q6 rules](#sentinel-detector-l1s--q6-rules)):
+- **When.** After every other `work_batch` item is dispositioned, because this rotation may itself have just promoted a listed pin. Re-read `mcp__escalation__get_pending_escalations(level=2, compact=True)` then.
+- **Predicate.** `held = {l2["id"] for l2 in pending_l2s} | {m for l2 in pending_l2s for m in l2.get("member_ids", [])}`. It fires when ANY id read off the `Pinning escalations:` line is in `held` ("include", per the ruling): one human-facing record already covers this task's hold.
+- **When it fires, neither `promote_to_l2` nor `resolve_issue`.** The release edge (`orchestrator/src/orchestrator/recovery_emission.py::resolve_recovery_veto_streak_escalation`) resolves the record once a sweep finds the task no longer held; it closed 28 such records unaided in Q6's window. Since task 7716 the detector files no new alarm while every pin is human-parked (`escalation/src/escalation/pins.py::pinned_only_by_human_parked`). `stamp_triage` it with a predicate naming the OTHER record, e.g. `pin esc-X-2 held by pending L2 esc-X-5 | probe: get_pending_escalations(level=2, compact=True) -> esc-X-5 member_ids contains esc-X-2`: a world fact that changes when the human acts, not the banned [self-referential predicate](#triage-ack-freshness-contract). When the stamp goes stale (~6h), re-run the predicate: still held → re-stamp; no longer held → fall through to the promote below.
+- **Digest:** `LEFT FOR RELEASE EDGE (L1 <esc_id>): q6-veto-streak — <sentinel_task_id> — pin <listed_id> held by pending L2 <l2_id>`
+- When it does not fire (no listed id held, or the line names nothing), continue below unchanged.
 
 **That line is not filtered to pins — read this before you word the options.** Despite its label it lists EVERY escalation the pin sweep found open on the task. The emitter flattens all three buckets of `orchestrator/src/orchestrator/recovery_emission.py::pin_buckets`, which the production caller hands it whole: `queue_handoff` (a live supervised handoff — PINS), `dead_l0` (vetoes a done-flip but does NOT pin recovery) and `non_pinning` (an `info`-severity record — never pins, at any level). Those three readings are defined at `escalation/src/escalation/pins.py::PinReport`. No bucket label survives into the text, so from this line alone you **cannot** tell a live hold from an incidental info record. Two consequences to carry, neither fixable from this prompt and both cheaper than the single over-folded bucket this rule replaces:
 
