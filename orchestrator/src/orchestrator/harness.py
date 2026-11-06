@@ -12432,17 +12432,27 @@ class Harness:
 
         The allocator is ensured first, so the host is managed and the
         unreachability thresholds come from config before the bench.  Without
-        a merge worker there is no tracker to bench on: logged, no-op.
+        a running merge worker there is no tracker to bench on and no reprobe
+        sweep to readmit the host: logged, no-op.  A merge-lane fault is
+        logged and never reaches the task verify, as the worker's readmit
+        hook never lets a task-pool fault reach the merge lane.
         """
-        worker = self._merge_worker
+        task = self._merge_worker_task
+        worker = self._merge_worker if task is not None and not task.done() else None
         if worker is None:
             logger.warning(
                 'Remote verify host %s is unavailable (%s), but no merge worker '
                 'is running to bench it', name, exc,
             )
             return
-        worker.ensure_host_allocator(self.config)
-        worker.bench_unavailable_runner(name, exc)
+        try:
+            worker.ensure_host_allocator(self.config)
+            worker.bench_unavailable_runner(name, exc)
+        except Exception:
+            logger.exception(
+                'Benching unavailable remote verify host %r on the merge lane raised; '
+                'the task verify goes on without the bench', name,
+            )
 
     def _note_verify_host_readmitted(self, name: str) -> None:
         """The merge lane's readmission hook: re-offer *name* to the task pool's waiters."""

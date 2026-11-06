@@ -40,6 +40,7 @@ _GIT = GitConfig(
     worktree_dir='.worktrees', push_after_advance=False,
 )
 _HOST = 'laptop'
+_HARNESS_LOGGER = 'orchestrator.harness'
 
 
 @pytest.fixture(autouse=True)
@@ -149,6 +150,33 @@ class TestWithTheMergeWorker:
         row = _laptop_row(started)
         assert (row['quarantined'], row['quarantine_class'], row['streak']) == (True, 'ru', 1)
         assert started._host_pool.policy(_HOST, started.config).slots == 0
+
+    async def test_a_merge_lane_fault_in_the_bench_never_reaches_the_task_verify(
+        self, started: Harness, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The task lane's call into the merge lane is fault-isolated, as the readmit hook is."""
+        assert started._merge_worker is not None
+        fault = OSError('escalation queue write failed')
+
+        with patch.object(started._merge_worker, 'bench_unavailable_runner', side_effect=fault), \
+             caplog.at_level(logging.ERROR, logger=_HARNESS_LOGGER):
+            started._host_pool.mark_unavailable(_HOST, _transport_down())
+
+        [error] = [r for r in caplog.records if r.name == _HARNESS_LOGGER and r.levelno == logging.ERROR]
+        assert _HOST in error.getMessage()
+        assert error.exc_info is not None and error.exc_info[1] is fault
+
+    async def test_a_bench_after_the_worker_stops_is_a_logged_no_op(
+        self, started: Harness, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A stopped worker has no reprobe sweep, so a bench there would strand the host."""
+        await started._stop_merge_worker()
+
+        with caplog.at_level(logging.WARNING, logger=_HARNESS_LOGGER):
+            started._host_pool.mark_unavailable(_HOST, _transport_down())
+
+        assert [r for r in caplog.records if r.name == _HARNESS_LOGGER and _HOST in r.getMessage()]
+        assert started._host_pool.policy(_HOST, started.config).slots > 0
 
     async def test_the_bench_survives_a_merge_worker_rebuild(self, started: Harness) -> None:
         started._host_pool.mark_unavailable(_HOST, _transport_down())
