@@ -1,0 +1,42 @@
+{
+  "task_id": "3076",
+  "reason": "net-additive \u03b4 work \u2014 GitOps.lane_in_use span holding a pool lane's record at IN_USE while a dark-factory child runs in it",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 1422,
+      "current": 1424
+    },
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 15857,
+      "current": 15882
+    },
+    {
+      "measure": "prose_lines",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 9280,
+      "current": 9293
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 4841,
+      "current": 4843
+    },
+    {
+      "measure": "total:lines",
+      "key": "<cluster>",
+      "baseline": 57433,
+      "current": 57458
+    },
+    {
+      "measure": "total:prose_lines",
+      "key": "<cluster>",
+      "baseline": 31974,
+      "current": 31987
+    }
+  ]
+}

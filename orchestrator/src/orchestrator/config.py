@@ -50,6 +50,7 @@ from orchestrator.config_census_ignore import (  # noqa: F401 (re-exported for t
     audit_census_ignore_entries,
     parse_census_ignore_entries,
 )
+from orchestrator.implementer_brief_variant import ImplementerBriefVariant
 from orchestrator.routing import DEFAULT_ALLOWED_MODELS, DEFAULT_LADDER
 from orchestrator.shadow_types import ShadowShape
 from orchestrator.verify_admission_gate import AdmissionOrder
@@ -103,6 +104,10 @@ AGE_HALF_SECS: float = 259200.0
 CONTINUITY_CREDIT: float = 120.0
 CONTINUITY_PROBE_TTL_SECS: float = 300.0
 CONTINUITY_CREDIT_MAX_AGE_SECS: float = 604800.0
+
+# Default of DeterministicConfig.predicate_recheck_stall_cap
+# (plans/completion-driven-triggers-prd.md C1).
+PREDICATE_RECHECK_STALL_CAP: int = 30
 
 # Per-process warn-once dedup for coerce_tier()'s unrecognized-value WARNING
 # below, keyed by a length-capped repr(value) (safe for unhashable/non-str
@@ -625,6 +630,26 @@ class FairnessConfig(BaseModel):
                 )
             )
         return int(self.skip_threshold)
+
+
+class DeterministicConfig(BaseModel):
+    """Deterministic-task runner knobs (plans/completion-driven-triggers-prd.md C1).
+
+    ``predicate_recheck_stall_cap`` is how many consecutive exit-75 "not yet"
+    verdicts a re-arming predicate may return before ``DeterministicRunner``
+    files ``milestone_check_stalled``. ``Harness._run_deterministic_slot``
+    reads it whenever a slot builds its runner, so every leaf is green-tier.
+    Calibrate it from ``predicate_recheck_stalled`` events.
+    """
+
+    predicate_recheck_stall_cap: int = Field(
+        default=PREDICATE_RECHECK_STALL_CAP,
+        ge=1,
+        description=(
+            'Consecutive exit-75 "not yet" verdicts a re-arming predicate may return '
+            'before the runner files milestone_check_stalled (PRD C1).'
+        ),
+    )
 
 
 class ScoringConfig(BaseModel):
@@ -3650,6 +3675,11 @@ class OrchestratorConfig(BaseSettings):
 
     # Iteration limits
     max_execute_iterations: int = Field(default=10)
+    # Whole-plan or one-step implementer brief, and the bounds each implies:
+    # orchestrator/src/orchestrator/implementer_brief_variant.py (live-shadow-eval PRD decision 14).
+    implementer_brief_variant: ImplementerBriefVariant = Field(
+        default=ImplementerBriefVariant.WHOLE_PLAN,
+    )
     # Independent bound on progress-timeout+resume churn. A ceiling-kill of a
     # productive run (transcript_turns>0) followed by its resume counts as
     # ONE iteration against max_execute_iterations (see
@@ -5362,6 +5392,9 @@ class OrchestratorConfig(BaseSettings):
     # knobs, which the anchor-coverage gate still falls back to.
     scoring: ScoringConfig = Field(default_factory=ScoringConfig)
 
+    # Deterministic-task runner knobs (PRD completion-driven-triggers C1).
+    deterministic: DeterministicConfig = Field(default_factory=DeterministicConfig)
+
     # Scheduler starvation watchdog (task 1880).
     starvation_watchdog: StarvationWatchdogConfig = Field(
         default_factory=StarvationWatchdogConfig,
@@ -6579,6 +6612,9 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     # I-1 / I-3 still bind a reload through apply_reload's whole-config
     # re-validation.
     _submodel_leaf_paths('scoring', ScoringConfig),
+    # Read when each deterministic slot builds its runner, so a reload applies
+    # from the next dispatch.
+    _submodel_leaf_paths('deterministic', DeterministicConfig),
     # Unknown-config-key census escape hatch (task 2989) — same whole-submodel
     # idiom.  Green-tier ON PURPOSE: the born-at-L2 this census files tells the
     # operator to add a path to config_key_census.ignore and hot-reload, and a
@@ -6616,6 +6652,9 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # the shared live config object, so a flip applies from the next
         # merge attempt.
         'pre_merge_reverify',
+        # Flat field read at use by the brief, the EXECUTE cap and resolve_route off
+        # the shared live object (task 5385), like pre_merge_reverify.
+        'implementer_brief_variant',
         # EASY-backfill admission (task 3823 / PRD C7).  Explicit literals, not
         # a _submodel_leaf_paths group: these are FLAT top-level fields, not a
         # submodel.  Green-tier on purpose — PRD Open Q3 ships safety_factor

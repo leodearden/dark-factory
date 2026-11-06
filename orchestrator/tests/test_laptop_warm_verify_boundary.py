@@ -155,8 +155,8 @@ from orchestrator.verify_runner import (
 # this guard into a whole-tree scanner; a new module that drives the harness
 # must be added to it.  Self-parsing AST guards are an established idiom in
 # this suite (test_marker_registration_drift.py,
-# test_git_repo_isolation_guard.py, test_lock_release_single_writer_guard.py,
-# test_event_loop_antipattern_guard.py) and cost nothing at runtime -- pure
+# test_git_repo_isolation_guard.py, test_lock_release_single_writer_guard.py)
+# and cost nothing at runtime -- pure
 # parse, no subprocess, no timing.
 #
 # Both sweeps live here, beside the rows, because their sibling

@@ -613,7 +613,7 @@ gates):
 |---|---|---|
 | `vacuous_present` | `expect: present` check already passes at authoring (the pattern matches, or every listed path exists) | task **5799** asserted `present` for patterns its own diff was scoped to *remove* — necessarily present already, which is what made them removable; the wedge landed on dependent 5919 |
 | `vacuous_present_self_referential` | the only matches are the descriptor's own `pattern:` line in a manifest | task **2863**'s `fable-architect-eval-decision`, whose first match was the sidecar declaring it |
-| `vacuous_present_comment_only` | the only matches are comments, not code | task **2792**'s `archive_task_transcripts`, matching one fossil comment in `git_ops.py` |
+| `vacuous_present_comment_only` | the only matches are comments, not code; in a markdown file only an HTML `<!--` comment line counts, and a heading or bullet is content | task **2792**'s `archive_task_transcripts`, matching one fossil comment in `git_ops.py` |
 | `vacuous_absent` | `expect: absent` check already passes at authoring (the pattern does not match, or no listed path exists) | the mirror cell: nothing to remove, so the check is green before any work starts |
 | `filename_shaped` | `kind: grep`, `expect: present` pattern has zero content matches and either names a tracked **filename**, or is exactly the basename or stem of a file the task declares in `metadata.files` inside the check's `paths` (the file need not exist yet) | task **3536**'s `test_workflow_merge_gating_strand` — authored before 3536 created that module, and a test module does not mention its own name, so `git grep` (which reads *contents*) could never see it. The rejection names the `kind: "path"` descriptor that says what was meant (see *Choosing a descriptor*) |
 | `shim_path` | a `kind: grep`, `expect: present` check whose `paths` names a `.py` file that rebinds `sys.modules[__name__]`: an alias shim, so the code it asserts lives elsewhere | task **5036** left `orchestrator/src/orchestrator/merge_queue.py`, `landing_evidence.py`, `merge_gates.py` and others as 12-line shims over `orchestrator/merge_lane/`, stranding checks of 2886, 2887, 4033, 4646–4648, 4651, 4652, 4830 and 5388 |
@@ -693,8 +693,11 @@ only on `broken` (a done producer whose capability is nowhere on main),
 check) and an actionable stale path (a live producer, or a done one with open
 dependents; the rest are listed report-only); `superseded` — a correct
 descriptor that later work legitimately undid — is reported and never
-actionable. A separate report-only section lists sidecar
-descriptors carrying a structural code (`vacuous_present_self_referential`,
+actionable. Grep and path descriptors both get a disposition; a grep's
+supersession is read from the commits that changed its pattern's occurrences,
+a path's from the commits that deleted it (expect: present) or created it
+(expect: absent). A separate report-only
+section lists sidecar descriptors carrying a structural code (`vacuous_present_self_referential`,
 `vacuous_present_comment_only`, `filename_shaped`). Those codes are measured
 against today's tree, and a reworded comment or a later file flips them, so
 they never affect the exit code and no gating test sweeps them.
@@ -888,7 +891,7 @@ dependency gate as every other task (§3).
 {
   script: "<repo-relative path>",  # must exist & be executable
   args: [],                         # list[str], default []
-  env: {},                          # dict[str,str], default {}
+  env: {},                          # dict[str,str], default {}; reaches the script on every path, see below
   cwd: "<project_root>",            # default: project_root
   timeout_secs: 120,                # int, required; runner kills + escalates on timeout
   target_unit: None,                # str|None; None → cross-unit (no self-kill)
@@ -902,6 +905,20 @@ against the orchestrator's **configured** `project_root` — the `project_root` 
 validates the script under — never against the orchestrator process's
 working directory. See
 `shared/src/shared/before_done_paths.py::resolve_before_done_paths`.
+
+`env` reaches the script on every path. A predicate, no-target or
+cross-unit deploy runs the script with `env` overlaid on the
+orchestrator's own environment. A self-target deploy (`target_unit` is the
+orchestrator's own unit) runs the script in a `systemd-run` transient unit
+as `/bin/sh -c 'KEY=value … <script> <args>'`. That script starts from the
+systemd user manager's environment plus `env`, not from the
+orchestrator's, because `systemd-run` passes on none of its caller's
+environment. The assignments prefix the script alone, so the unit's RP-4
+on-failure escalation submit sees none of `env`. Keys must be portable
+environment variable names, matching `[A-Za-z_][A-Za-z0-9_]*`. A deploy
+(`target_unit` set) refuses any other key with a born-at-L2 `infra_issue`
+and does not run the script. The mechanism is
+`orchestrator/src/orchestrator/proc_supervision.py::RestartPlan`.
 
 **`metadata.always_escalates`** (`bool`, default `false`) — file a
 born-at-L2 escalation after the action completes (or immediately if no
@@ -1446,6 +1463,25 @@ Tier-A blessed. Only the status writers write it: `set_task_status` and
 `deferral_write_authority`; an unchanged echo of the stored record passes.
 Its shapes and use are §9 "Deferring a task".
 
+`declared_scope` is the size a task declared when it was filed. It is a
+registered submodel (`shared/src/shared/declared_scope.py::DeclaredScope`,
+cardinality dict), machine-only and deliberately not Tier-A blessed. Its
+`band` is one of `undeclared`, `narrow`, `moderate`, `broad`; the thresholds
+live only in that module's `derive_declared_scope`. `submit_task` stamps it
+once, `basis='submit'`, on both creation paths (ticket and planning mode).
+`submit_task` and `update_task` refuse any add, alter or removal with
+`declared_scope_write_authority`; an unchanged echo passes, so a replace-mode
+write must carry it verbatim. The refusal's `reason` is `added`, `altered` or
+`removed` (a replace that omits the key), and its `stored` is the stamp on the
+row, or null when it has none. It is never re-derived at plan refinement or at
+`done`. The only re-stamp is a curator combine (`basis='combine'`, task
+8415). An absent key, on a task filed before the stamp existed, means no
+information, never `undeclared`. The modules allowed to import it are pinned
+by `shared/tests/test_declared_scope_readers.py`
+(`plans/follow-up-filing-shape-prd.md` §3 decisions 6–8), and no verify,
+merge-lane, triage or routing path may read it: the same test fails if one of
+those modules names the key or anything `shared.declared_scope` exports.
+
 `claimant_exception` is the machine ledger entry
 `{claimant_run_id, target_status, agent_id, tag, stamped_at}`. The
 fused-memory interceptor writes it, atomically with the status, on a `done`
@@ -1544,7 +1580,7 @@ ahead of the queue.
 request inherits `metadata.merge_lane`, under the precedence **`lane`
 argument > `metadata.merge_lane` > `'normal'`**. An unrecognised value in a
 task's *metadata* is silently normalised to `'normal'` by
-`orchestrator/src/orchestrator/merge_lane/worker.py::_normalize_lane`, so a typo
+`orchestrator/src/orchestrator/merge_lane/intake.py::normalize_lane`, so a typo
 *here* is a silent downgrade — which is exactly why the companion `lane`
 parameter rejects an unknown value loudly instead (see its docstring in
 `escalation/src/escalation/server.py::merge_request` for that contract). The
@@ -2150,6 +2186,41 @@ within the grace window.
 a dead holder's row and a lapsed `expires_at` stay `deferred` until someone
 releases them. A session that ends without landing its hold releases it
 first.
+
+### Amending a planned task's text
+
+When a task is planned, the orchestrator stamps a fingerprint of its
+description and details into `metadata.plan_text_fp`, with the plan's time
+in `metadata.plan_authored_at`. An `update_task` that supplies `title`,
+`description`, `details` or `prompt` is compared against that stamp. So is
+a reconciliation write whose audit-trail rotation (§10) rewrote the
+description. If the fingerprint of the post-write description and details
+no longer matches, the result carries `amendment_advisory`:
+
+| Field | Meaning |
+|---|---|
+| `task_id` | the amended task |
+| `plan_authored_at` | when the current plan was written |
+| `fields_changed` | the text fields this write supplied, plus `description` when the rotation rewrote it |
+| `will_replan` | False for a `done` or `cancelled` task, whose amendment reaches no work |
+| `plan_text_fp_before` | the stamped plan fingerprint |
+| `task_text_fp_after` | the fingerprint of the text now stored |
+
+A task with no stamp, a metadata-only write that rotates nothing, and a
+whitespace-only reflow get no advisory. The running agent of an
+`in-progress` task does not see the amendment. Its next dispatch takes the
+revalidation path (task 4031) and re-plans against the new text.
+
+`will_replan` True is a prediction, not an observation. It assumes the
+orchestrator's default `plan_text_fp_gate_enabled: true`, which fused-memory
+cannot read, and a later dispatch. An `in-progress` task whose running agent
+marks it done first never gets one.
+
+Every such amendment also journals a `task_text_amended` reconciliation
+event carrying the advisory plus `writer_source` (`update_task` or
+`curator_combine`) and `agent_id`. That includes a curator combine
+rewriting a planned task's text, which no caller is told about. Contract:
+`plans/task-amendment-delivery-prd.md` §9 C7.
 
 ## 10. Rotating a long-running audit-trail task
 

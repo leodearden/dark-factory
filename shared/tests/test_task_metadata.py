@@ -16,6 +16,7 @@ from __future__ import annotations
 import copy
 import json
 import re
+from datetime import UTC, datetime, timedelta
 from typing import get_args
 
 import pytest
@@ -677,6 +678,60 @@ class TestMilestone:
         m = Milestone(mode='delayed', after_secs=604800, x_extra='keep')  # type: ignore[call-arg]
         dumped = m.model_dump()
         assert dumped['x_extra'] == 'keep'
+
+
+
+class TestMilestoneFired:
+    """``Milestone.fired(anchor, now)`` — the pure home of milestone semantics."""
+
+    NOW = datetime(2026, 11, 4, 12, 0, tzinfo=UTC)
+
+    @staticmethod
+    def _dated(at: str) -> Milestone:
+        return Milestone.model_validate({'mode': 'dated', 'at': at})
+
+    @staticmethod
+    def _delayed(after_secs: int = 3600) -> Milestone:
+        return Milestone.model_validate({'mode': 'delayed', 'after_secs': after_secs})
+
+    def test_dated_in_the_past_fires(self):
+        assert self._dated('2026-11-03T12:00:00+00:00').fired(None, self.NOW)
+
+    def test_dated_at_now_fires(self):
+        assert self._dated(self.NOW.isoformat()).fired(None, self.NOW)
+
+    def test_dated_in_the_future_does_not_fire(self):
+        assert not self._dated('2026-11-05T12:00:00+00:00').fired(None, self.NOW)
+
+    def test_dated_naive_at_is_read_as_utc(self):
+        milestone = self._dated('2026-11-04T12:00:00')
+        assert milestone.fired(None, self.NOW)
+        assert not milestone.fired(None, self.NOW - timedelta(seconds=1))
+
+    def test_dated_ignores_anchor(self):
+        milestone = self._dated('2026-11-05T12:00:00+00:00')
+        assert not milestone.fired('2020-01-01T00:00:00+00:00', self.NOW)
+
+    @pytest.mark.parametrize('anchor', [None, ''], ids=['none', 'empty'])
+    def test_delayed_without_anchor_never_fires(self, anchor):
+        assert not self._delayed().fired(anchor, self.NOW)
+
+    def test_delayed_at_anchor_plus_after_secs_fires(self):
+        anchor = (self.NOW - timedelta(seconds=3600)).isoformat()
+        assert self._delayed(3600).fired(anchor, self.NOW)
+
+    def test_delayed_before_anchor_plus_after_secs_does_not_fire(self):
+        anchor = (self.NOW - timedelta(seconds=3599)).isoformat()
+        assert not self._delayed(3600).fired(anchor, self.NOW)
+
+    def test_delayed_naive_anchor_is_read_as_utc(self):
+        milestone = self._delayed(3600)
+        assert milestone.fired('2026-11-04T11:00:00', self.NOW)
+        assert not milestone.fired('2026-11-04T11:00:01', self.NOW)
+
+    def test_delayed_unparseable_anchor_raises(self):
+        with pytest.raises(ValueError):
+            self._delayed().fired('not-a-timestamp', self.NOW)
 
 
 class TestRecurrence:

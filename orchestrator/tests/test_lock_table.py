@@ -14,11 +14,14 @@ test_scheduler.py alongside TestModuleLockTable / TestHierarchicalLocking.
 from __future__ import annotations
 
 import logging
+import subprocess
+import sys
 from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from orchestrator.config import PRIORITY_RANK, OrchestratorConfig
+from orchestrator.lock_table import ModuleLockTable
 from orchestrator.pin_reservation import (
     Blocker,
     BlockerKind,
@@ -26,7 +29,6 @@ from orchestrator.pin_reservation import (
     ReservationSource,
     park_rank,
 )
-from orchestrator.scheduler import ModuleLockTable
 
 #: Fixed park-install instant for the park-age tests (task 3823 / PRD task η).
 PARK_T0 = datetime(2026, 8, 1, 0, 0, 0, tzinfo=UTC)
@@ -137,8 +139,8 @@ class TestInstallParksIsIdempotentPerOwner:
         assert _stack(lt, 'm1') == [('T', PRIORITY_RANK['critical'])], (
             'the owner must keep its single critical-rank entry'
         )
-        competitor_installed, _ = lt.install_parks('C', ['m1'], 'critical')
-        assert competitor_installed == [], 'a same-tier competitor must not shadow T'
+        competitor_installed, _ = lt.install_parks('U', ['m1'], 'critical')
+        assert competitor_installed == [], 'a same-tier competitor that T precedes must not shadow T'
         assert _stack(lt, 'm1')[-1] == ('T', PRIORITY_RANK['critical']), (
             'T must stay the active top on m1'
         )
@@ -224,8 +226,10 @@ class TestInstallParksPreemption:
         assert lt.has_parks('L')  # L is retained in the shadow stack (INV-5)
         # H's park on m1 means L cannot acquire m1 while H is on top (INV-2).
         assert not lt.try_acquire('L', ['m1'])
-        # L's park on m2 remains — H cannot acquire m2.
-        assert not lt.try_acquire('H', ['m2'])
+        # L's park on m2 remains: a parkless task cannot acquire m2, while H
+        # outranks it and passes it (task 7799, INV-8).
+        assert not lt.try_acquire('X', ['m2'])
+        assert lt.park_owners_blocking('H', ['m2']) == []
         # After H completes (clear), L is RESTORED as the active top on m1 (INV-4).
         lt.clear_parks_for('H')
         assert lt.try_acquire('L', ['m1'])
@@ -330,7 +334,7 @@ class TestParkStackInvariants:
         assert lt.try_acquire('H', ['m1']), 'Active-top H must be able to acquire its module'
 
     def test_inv3_same_tier_blocks_install_no_push(self):
-        """INV-3: same-priority existing top BLOCKS a new install (no push, no shadow)."""
+        """INV-3: a same-tier existing top that precedes the installer (A before B) BLOCKS it (no push, no shadow)."""
         lt = _lt()
         lt.install_parks('A', ['m1'], 'medium')
         installed, shadowed = lt.install_parks('B', ['m1'], 'medium')
@@ -1257,3 +1261,32 @@ class TestPinReservationRank:
 
         assert lt.blockers('P', ['w.py', 'x.py']) == []
         assert lt.try_acquire('P', ['w.py', 'x.py']) is True
+
+
+class TestRelease:
+    """``release`` returns the modules it freed, as ``release_subset`` does."""
+
+    def test_release_returns_the_freed_modules_sorted(self):
+        lt = _lt()
+        assert lt.try_acquire('T', ['b', 'a'])
+
+        assert lt.release('T') == ['a', 'b']
+        assert not lt.is_held('T')
+
+    def test_release_of_a_task_holding_nothing_returns_empty(self):
+        assert _lt().release('nobody') == []
+
+
+class TestModuleBoundary:
+    """The lock table is its own module: it loads no scheduler, and the
+    scheduler does not re-export it."""
+
+    def test_importing_the_lock_table_loads_no_scheduler(self):
+        probe = 'import sys, orchestrator.lock_table; print("orchestrator.scheduler" in sys.modules)'
+        out = subprocess.run([sys.executable, '-c', probe], capture_output=True, text=True, check=True)
+        assert out.stdout.strip() == 'False'
+
+    def test_scheduler_does_not_re_export_the_lock_table(self):
+        import orchestrator.scheduler
+
+        assert 'ModuleLockTable' not in orchestrator.scheduler.__all__

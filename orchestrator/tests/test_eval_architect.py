@@ -1985,7 +1985,9 @@ class TestRunArchitectEval:
         # the RELOCATED .task-meta/<name>/ root (matching production
         # _inject_plan_tools_mcp), so the plan-tools server writes plan.json where
         # the TaskArtifacts(worktree, meta_root=_meta_root_for_worktree(worktree))
-        # readback reads it.
+        # readback reads it. That meta root is also its task root (task 3155):
+        # the eval stays single-root, since parallel trials of one task id would
+        # otherwise share one .task-meta/task-<id>.
         import sys
 
         from orchestrator.workflow import _meta_root_for_worktree
@@ -2005,6 +2007,7 @@ class TestRunArchitectEval:
             '-m', 'orchestrator.mcp.plan_tools',
             '--worktree', str(Path('/fake/wt')),
             '--meta-root', str(expected_meta_root),
+            '--task-root', str(expected_meta_root),
         ]
 
 
@@ -4396,10 +4399,10 @@ class TestPinnedTaintSemanticsSurviveTheCapRetrySeam:
 def _zero_account_gate():
     """A UsageGate that CONSTRUCTS successfully but resolves ZERO accounts.
 
-    Not a hypothetical: ``_init_accounts`` logs "No accounts configured and no
-    default credential found" and returns ``[]`` whenever ``usage_cap.enabled``
-    is on but no ``CLAUDE_OAUTH_*`` env is exported and no
-    ``~/.claude/.credentials.json`` exists — an ordinary CI/cron shell. The
+    Not a hypothetical: ``_init_accounts`` warns that the pool is empty and
+    returns ``[]`` whenever ``usage_cap.enabled`` is on but no
+    ``CLAUDE_OAUTH_*`` env is exported and ``fallback_to_default_credential``
+    is off — an ordinary CI/cron shell. The
     constructor SUCCEEDS, so the enabled-guard and the try/except around
     construction both pass it straight through.
     """
@@ -4468,8 +4471,8 @@ class TestArchitectEvalZeroAccountGate:
 
         # Loud about it — an empty pool where the operator asked for one is a
         # misconfiguration worth seeing in the campaign log.
-        assert 'ZERO accounts' in caplog.text
-        assert 'without failover' in caplog.text
+        assert 'no accounts resolved' in caplog.text
+        assert 'UNGATED' in caplog.text
 
         # …and the cell is a NORMAL cell: one invoke, measured, judged,
         # INCLUDED. An empty pool has nothing to fail over TO, so the ungated

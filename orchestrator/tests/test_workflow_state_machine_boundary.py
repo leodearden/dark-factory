@@ -79,6 +79,7 @@ from _workflow_helpers import (
     _make,
     _make_review,
     _make_warmlane_workflow,
+    agent_side_artifacts,
     fixed_prompt,
 )
 from escalation.models import Escalation
@@ -475,9 +476,9 @@ class _WideningArchitectStub(AgentStub):
         plan = dict(PLAN)
         plan['files'] = ['lib.py', 'locked_module.py']
         plan['_schema_version'] = 1
-        task_dir = TaskArtifacts(cwd).root
-        task_dir.mkdir(parents=True, exist_ok=True)
-        (task_dir / 'plan.json').write_text(json.dumps(plan, indent=2) + '\n')
+        plan_path = agent_side_artifacts(cwd).artifact_path('plan.json')
+        plan_path.parent.mkdir(parents=True, exist_ok=True)
+        plan_path.write_text(json.dumps(plan, indent=2) + '\n')
         return AgentResult(success=True, output='Plan created', cost_usd=0.50)
 
 
@@ -508,7 +509,7 @@ class _WideningReplanStub(AgentStub):
         )
 
     async def _architect(self, cwd: Path) -> AgentResult:
-        plan_path = TaskArtifacts(cwd).root / 'plan.json'
+        plan_path = agent_side_artifacts(cwd).artifact_path('plan.json')
         if plan_path.exists():
             plan = json.loads(plan_path.read_text())
             plan['files'] = [*plan['files'], 'locked_module.py']
@@ -602,8 +603,8 @@ def _wire_simple_task_run(
         stub.calls.append('simple_task')
         if simple_widens:
             cwd: Path = kwargs['cwd']
-            root = TaskArtifacts(cwd, TaskArtifacts.meta_root_for(cwd.parent, cwd.name)).root
-            root.mkdir(parents=True, exist_ok=True)
+            plan_path = agent_side_artifacts(cwd).artifact_path('plan.json')
+            plan_path.parent.mkdir(parents=True, exist_ok=True)
             plan = {
                 **PLAN, '_schema_version': 1,
                 'files': ['lib.py', 'locked_module.py'],
@@ -612,7 +613,7 @@ def _wire_simple_task_run(
                     for step in PLAN['steps']
                 ],
             }
-            (root / 'plan.json').write_text(json.dumps(plan, indent=2) + '\n')
+            plan_path.write_text(json.dumps(plan, indent=2) + '\n')
         return AgentResult(success=True, output='Simple task done', cost_usd=0.30)
 
     monkeypatch.setattr('orchestrator.workflow.invoke_agent', _invoke)
@@ -1166,9 +1167,9 @@ class TestStateMachineLegalityAndConsistency:
 
         async def _agent_reports_unactionable(*, cwd: Path, **kwargs) -> AgentResult:
             dispatched.append(cwd)
-            TaskArtifacts(
-                cwd, TaskArtifacts.meta_root_for(cwd.parent, cwd.name),
-            ).write_unactionable_task(reason='the spec contradicts itself', evidence='ev')
+            agent_side_artifacts(cwd).write_unactionable_task(
+                reason='the spec contradicts itself', evidence='ev',
+            )
             return AgentResult(success=True, output='', cost_usd=0.5)
 
         monkeypatch.setattr(scheduler, 'set_task_status', _cancelled_row_refuses_the_park)

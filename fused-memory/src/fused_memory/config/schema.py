@@ -375,6 +375,19 @@ class Mem0BackendConfig(BaseModel):
 
     qdrant_url: str = Field(default='http://localhost:6333')
     collection_prefix: str = Field(default='fused')
+    persist_history: bool = Field(
+        default=True,
+        description=(
+            'When False, mem0 keeps its change history in a private in-memory '
+            'SQLite DB that dies with the instance, instead of the '
+            'process-shared $MEM0_DIR/history.db. For tests and scratch runs, '
+            'where the shared file is xdist-contended or read-only in the '
+            'sandbox; leave it True in production, because out-of-band readers '
+            'such as fused-memory/scripts/build_write_triage_v2_soak_baseline.py '
+            'read the shared file. Restart-only: Mem0Backend reads it once, '
+            'when it creates the instance for a project.'
+        ),
+    )
 
 
 # --- Routing ---
@@ -446,10 +459,11 @@ class QueueConfig(BaseModel):
 # --- Write journal ---
 
 class WriteJournalConfig(BaseModel):
-    """Retention horizons and prune budgets for the ``write_ops`` journal.
+    """Retention horizons and prune budgets for the write journal's tables.
 
-    RESTART-ONLY BY CONSTRUCTION. The prune runs at startup and every
-    ``prune_interval_seconds`` (``services/write_ops_retention.py``), and both
+    RESTART-ONLY BY CONSTRUCTION. Every table with a horizon is pruned once at
+    startup (``services/journal_retention.py``) and ``write_ops`` again every
+    ``prune_interval_seconds`` (``services/write_ops_retention.py``); both
     capture this section once at startup, so nothing re-reads it afterwards.
     ``config/reload.py::RELOADABLE_FIELDS`` is an opt-in allowlist and this
     section is deliberately absent from it, which makes a changed leaf report
@@ -472,7 +486,8 @@ class WriteJournalConfig(BaseModel):
     #: (task 3214), both of which evaluate over trailing baseline windows.
     search_retention_days: float = Field(default=365.0, gt=0)
     #: Writes — the durable audit trail joined by ``causation_id``; 0.73% of
-    #: volume, so a long horizon costs essentially nothing.
+    #: volume, so a long horizon costs essentially nothing. Also governs
+    #: ``backend_ops``, the Layer-2 half of each write.
     write_retention_days: float = Field(default=730.0, gt=0)
     #: Rows deleted per transaction. Each batch commits separately so the
     #: write lock is released between batches, which makes one batch the
@@ -480,16 +495,22 @@ class WriteJournalConfig(BaseModel):
     #: that in the ``write_journal`` block of ``fused-memory/config/config.yaml``.
     prune_batch_size: int = Field(default=500, gt=0)
     #: Ceiling on one sweep. A backlog drains over successive passes and each
-    #: partial run says so at WARNING.
+    #: partial run says so at WARNING. The startup sweep shares it across
+    #: ``write_ops`` and ``backend_ops``.
     prune_max_rows_per_run: int = Field(default=500_000, gt=0)
     #: Wall-clock ceiling on one sweep, checked between batches. This is the
     #: bound that actually matters: the watchdog's startup grace is a TIME
-    #: budget, and rows-per-second is not knowable in advance.
+    #: budget, and rows-per-second is not knowable in advance. The startup
+    #: sweep shares it across ``write_ops`` and ``backend_ops``.
     prune_max_seconds: float = Field(default=30.0, gt=0)
     #: Seconds between background prune passes, each bounded by the same
     #: ``prune_max_seconds`` / ``prune_max_rows_per_run``. The sizing basis is
     #: in the ``write_journal`` block of ``fused-memory/config/config.yaml``.
     prune_interval_seconds: float = Field(default=1800.0, gt=0)
+    #: ``referent_findings``, a diagnosis log whose reader (the phase-5 replay
+    #: pass) re-verifies every row against the live graph, so a long horizon
+    #: loses nothing.
+    referent_findings_retention_days: float = Field(default=365.0, gt=0)
 
     @model_validator(mode='after')
     def _validate_search_outlives_reads(self) -> 'WriteJournalConfig':
@@ -2207,17 +2228,23 @@ class ReconciliationConfig(BaseModel):
         default_factory=lambda: ['orchestrator'],
         description=(
             'Resolved-caller prefixes permitted to record a `deterministic-*` '
-            'done provenance (PRD C5). The orchestrator sends no agent_id, so '
-            'server/tools.py::_resolve_identity falls back to the '
-            'clientInfo.name the orchestrator advertises '
-            '(orchestrator/src/orchestrator/mcp_lifecycle.py::ORCHESTRATOR_MCP_IDENTITY, '
-            'sent by shared/src/shared/mcp_session.py::McpSession.initialize) '
-            "— the literal 'orchestrator', which is why that is the "
+            'done provenance (PRD C5). orchestrator/src/orchestrator/scheduler.py'
+            '::Scheduler.set_task_status sends agent_id='
+            "'orchestrator' explicitly "
+            '(orchestrator/src/orchestrator/mcp_lifecycle.py::ORCHESTRATOR_MCP_IDENTITY), '
+            'because fused-memory serves stateless HTTP, where a tools/call '
+            'session never receives an InitializeRequest and '
+            'fused-memory/src/fused_memory/server/tools.py::_resolve_identity '
+            'has no clientInfo to fall '
+            "back to — which is why 'orchestrator' is the "
             'sole default. DENY-ON-MISSING is the consumer contract: a caller '
             'matching no prefix is refused, and an EMPTY list denies every '
             'caller (the live kill switch for the provenance kind). The '
-            'finished one-shot scripts/cgl_eta_finalize_gate.py (clientInfo '
-            "'cgl-sched-gate') is deliberately NOT in the default — it has "
+            'finished one-shot fused-memory/scripts/cgl_eta_finalize_gate.py '
+            '(which sends no agent_id; its clientInfo is '
+            "'cgl-sched-gate', advertised by "
+            'fused-memory/scripts/cgl_eta_scheduler_gate.py::McpClient) is '
+            'deliberately NOT in the default — it has '
             'already run, and shipping a retired caller in an allowlist is how '
             'an allowlist stops meaning anything. NOTE: the identity this bar '
             'reads is SELF-REPORTED, so it deters a cooperating caller rather '
@@ -2321,28 +2348,59 @@ class CuratorConfig(BaseModel):
 
     # Corpus caps — see design notes in shared/docs (the pool streams).
     #
-    # For a pool without siblings, pool_total_cap is UNREACHABLE at these
-    # stock values, and that is worth knowing before tuning any of them: a
-    # maximal such pool is anchor(<=1) + 15 + 10 + 3 = 29 <= 30, so
-    # ``_trim_pool``'s ``len(pool) <= total_cap`` short-circuits. An
-    # agent-followup candidate with two or more siblings does reach the trim
-    # at stock caps, and the trim then takes dependency entries first. The
-    # binding constraints are the three
-    # STREAM caps, which is where a genuinely overlapping task is actually
-    # lost — the module stream especially, since it is ordered by status and
-    # priority rather than relevance (see the lock_depth note below).
-    # ``test_config_schema.py::TestCuratorEntryCharCaps`` pins this
-    # arithmetic so an edit that re-strands or un-strands the final trim is
-    # caught here rather than as a silent census.
+    # Re-tuned by task 5397 against the ``pool_truncated`` census
+    # (``curator_types.py::PoolWithheld``) and the decisions the curator took
+    # on it. Measured 2026-10-28 from archived curator transcripts
+    # (data/orchestrator/agent-transcripts/fm-curator-*, 2026-10-26..28): 435
+    # distinct candidates, 86 drop/combine decisions, at caps 15/10/3/30.
     #
-    # These four are deliberately NOT re-tuned by task 5364. Nothing measured
-    # how often they bind; the ``pool_truncated`` census that task installs
-    # (``curator_types.py::PoolWithheld``) IS that instrument, and tuning waits
-    # on what it reports rather than repeating the 2026-04 guess.
-    pool_module_cap: int = Field(default=15)
-    pool_embedding_cap: int = Field(default=10)
-    pool_dependency_cap: int = Field(default=3)
-    pool_total_cap: int = Field(default=30)
+    #   stream      capped on  withheld when capped   drop/combine targets
+    #   module      64.4%      p50 91, p90 575        31, spread over ranks 1-14
+    #   embedding   100%       17-20 (window floor)   42: 31 at rank 1, 40 in 1-3
+    #   dependency  10.1%      p50 2, max 7           0
+    #   total_cap   0%         unreachable: 1+15+10+3 = 29 <= 30
+    #
+    # The embedding stream is ordered by similarity and its tail is nearly
+    # dead: one target past rank 5, at rank 10. The module stream is ordered
+    # by status/priority/id, so its targets run flat to the cap (6 in ranks
+    # 11-15); in 165 of the 280 capped pools the cut fell among pending,
+    # combine-eligible tasks. The embedding count is no signal on its own: the
+    # qdrant window filled on every candidate, so it is always a floor.
+    #
+    # The re-tune moves slots instead of adding them: pool_module_cap 15 -> 20,
+    # and pool_total_cap 30 -> 29, the old reachable maximum, so ``_trim_pool``
+    # is the live control. With the module stream full, the trim takes
+    # dependency entries first, then the embedding tail, leaving
+    # 29 - 1 - 20 = 8 embedding entries. The floor is 5: ranks 1-5 held 41 of
+    # the embedding stream's 42 targets, so a module cap leaving fewer than 5
+    # would cut measured targets. A sibling-free pool whose module stream fits
+    # the old cap of 15 keeps every stream at its cap.
+    #
+    # The trade: the worst-case pool is unchanged, so cost and batch fan-in at
+    # the maximum are unchanged too. Input is ~4.7K + ~930 tokens per entry; a
+    # 28+-entry pool cost p50 $0.18 (max $0.36) against the flat $2.00
+    # single_call_budget_cap_usd. All 74 observed multi-candidate batches still
+    # fit batch_token_threshold; 25/10/3/35 would have split 62 of them. The
+    # mean pool grows 23.6 -> 24.9 entries.
+    #
+    # Limits: a larger module cap is not that stream's fix — at 20 it is still
+    # capped on 57% of candidates; its defect is the ordering. Embedding 10 and
+    # dependency 3 stay: neither tail showed targets worth more slots, and the
+    # trim already gives their slots to the module stream when it needs them.
+    # The sample is two days and 86 decisions, hence a token-neutral step. The
+    # module figures predate task 6708's active-only module stream.
+    #
+    # The sample also predates task 6227's sibling stream (pool_sibling_cap
+    # below). The trim cuts siblings only after the module stream, so with the
+    # module stream full each sibling costs one embedding entry: s siblings
+    # leave 8 - s. The floor of 5 therefore holds up to 3 siblings, the
+    # per-parent p90 measured for that cap, and not at its p99 of 4.
+    #
+    # ``test_config_schema.py::TestCuratorPoolCaps`` pins these relationships.
+    pool_module_cap: int = Field(default=20, ge=0)
+    pool_embedding_cap: int = Field(default=10, ge=0)
+    pool_dependency_cap: int = Field(default=3, ge=0)
+    pool_total_cap: int = Field(default=29, ge=1)
     # Caps the sibling stream (task 6227): an agent-followup candidate's
     # non-cancelled tasks that share its metadata.spawned_from. 10 comes from
     # the live store, measured 2026-10-30: 1,406 agent_followup parents, 2,140
@@ -2405,13 +2463,12 @@ class CuratorConfig(BaseModel):
     # single_call_budget_cap_usd — 4x headroom. batch_token_threshold stays at
     # 50K deliberately: it is what holds a multi-candidate batch under that
     # same flat per-call ceiling, so easing batch fan-in is the soft threshold
-    # working as designed, not a regression to patch. Easier fan-in did carry
-    # one real cost — a batch that lands at size 1 takes
-    # ``task_curator.py::TaskCurator.curate_batch_prepared``'s short-circuit,
-    # which used to DISCARD the already-built corpus and reassemble it
-    # (get_tasks over the whole tree + an embedder call + a qdrant query).
-    # That path now hands the prepared bundle to ``curate``, so a smaller
-    # batch no longer costs a rebuild.
+    # working as designed, not a regression to patch. Easier fan-in once
+    # carried one real cost — a batch that landed at size 1 used to DISCARD
+    # the already-built corpus and reassemble it (get_tasks over the whole
+    # tree + an embedder call + a qdrant query). The prepared bundle now flows
+    # through ``task_curator.py::TaskCurator.curate_prepared`` at every batch
+    # size, so a smaller batch costs no rebuild.
     entry_description_chars: int = Field(default=2000, ge=1)
     entry_details_chars: int = Field(default=1500, ge=1)
 
@@ -2454,9 +2511,10 @@ class CuratorConfig(BaseModel):
     #   budget = min(max_budget_usd + per_pool_entry_budget_usd * len(pool),
     #                single_call_budget_cap_usd)
     # Durable flat $2.00 ceiling (task 1980 / esc-task-curator-194): a full
-    # 30-entry pool (pool_total_cap=30) costs ~$0.30574 (esc-task-curator-191)
-    # — comfortably under $2.00 with no per-size tuning required. The prior
-    # scaled cap (0.75, derived from 0.30 + 0.0125*30 = $0.675) was raised
+    # 30-entry pool, measured when pool_total_cap was 30, cost ~$0.30574
+    # (esc-task-curator-191) — comfortably under $2.00 with no per-size tuning
+    # required. The prior scaled cap (0.75, derived from 0.30 + 0.0125*30 =
+    # $0.675) was raised
     # alongside max_budget_usd to the SAME $2.00 value: single_call_budget_cap_usd
     # must be >= max_budget_usd or it silently clamps the raised base back
     # down, defeating the durable raise (see TestCuratorConfigBudgetRaise in
@@ -2912,7 +2970,9 @@ class WriteTriageConfig(BaseModel):
             'calibration/write_triage_judge_field_chars_report.md. Bounded ge=1 '
             'because a zero cap would elide every field to nothing and show the '
             'model empty records. Green-tier hot-reloadable, read live per '
-            'middle-band write.'
+            'middle-band write. The same cap bounds a contesting child\'s text '
+            'in grouped search and get_memory_by_id reads '
+            '(server/grouped_read.py::_digest_entry).'
         ),
     )
     judge_accuracy_report_path: str | None = Field(

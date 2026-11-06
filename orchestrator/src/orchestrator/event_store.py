@@ -12,10 +12,12 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum, StrEnum, unique
 from pathlib import Path
+from typing import Any
 
 from shared.sqlite_sync_base import CheckpointResult, apply_full_durability_pragmas_sync
 
@@ -569,15 +571,18 @@ class EventType(StrEnum):
     # That is also why this population, and not the guard's, is dense enough to
     # carry an alarm — see the streak note below.
     #
-    # THE INV-4 STORM STREAK'S SOLE GENUINE FEEDER since task ε/3733. Every row
-    # here is also reported to Harness.note_resume_failed, which subtracts the
-    # by-design carve-out and counts what is left as a chained run. FEEDS the
-    # streak: stage='cli' always (the restore ran a phase earlier and is not
-    # what failed), and stage='pre_flight' with restore 'fault' or 'published'.
-    # Does NOT feed it: restore 'disabled' (the kill switch) and 'miss' (the
-    # archive-COVERAGE signal, which belongs on a RATE watch rather than a
-    # consecutive-run detector) — harness.py::_BY_DESIGN_RESTORE_OUTCOMES. A
-    # restore outcome added later is GENUINE by default and must be added to
+    # THE INV-4 STORM STREAK'S SOLE GENUINE FEEDER since task ε/3733. Every
+    # TaskWorkflow row here is also reported to Harness.note_resume_failed,
+    # which subtracts the by-design carve-out and counts what is left as a
+    # chained run. FEEDS the streak: stage='cli' from a task workflow — since
+    # task 5579 that means the CLI rejected the armed session before any model
+    # turn (the restore ran a phase earlier and is not what failed) — and
+    # stage='pre_flight' with restore 'fault' or 'published'. Does NOT feed it:
+    # restore 'disabled' (the kill switch) and 'miss' (the archive-COVERAGE
+    # signal, which belongs on a RATE watch rather than a consecutive-run
+    # detector) — harness.py::_BY_DESIGN_RESTORE_OUTCOMES — and steward rows
+    # (data.role == 'steward'), which never reach Harness.note_resume_failed.
+    # A restore outcome added later is GENUINE by default and must be added to
     # that constant to be exempted. No new EventType was introduced for the
     # feeder and no fourth term was added to the ratio denominator below: these
     # rows already ARE the population, and a second event would be a second
@@ -586,10 +591,10 @@ class EventType(StrEnum):
     # NOT part of the ratio recipe's denominator above, and this is the one
     # thing to get right when querying it. The three events above are emitted by
     # the _run_slot guard, exactly once per DISPATCH that carried a recovered
-    # session. This one is emitted by TaskWorkflow._invoke, i.e. once per
-    # INVOCATION — and a single dispatch invokes several roles — so adding it to
-    # that sum would compare populations counted on different units and silently
-    # inflate the attempt count.
+    # session. This one is emitted by TaskWorkflow._invoke (and by the steward),
+    # i.e. once per INVOCATION — and a single dispatch invokes several roles —
+    # so adding it to that sum would compare populations counted on different
+    # units and silently inflate the attempt count.
     #
     # data.stage splits the two ways an adopted resume dies:
     #   pre_flight — _invoke corroborated the session against the config dir it
@@ -608,9 +613,11 @@ class EventType(StrEnum):
     #                'published' (restore claimed success yet the CLI-facing
     #                locator still cannot see it: pathological, unreachable by
     #                construction, counted rather than assumed away).
-    #   cli        — the resume WAS armed and the CLI rejected it;
-    #                invoke_with_cap_retry silently retried fresh and returned a
-    #                SUCCESS, so nothing else anywhere records the loss. data:
+    #   cli        — the resume WAS armed and the CLI REJECTED it before any
+    #                model turn (shared/cli_invoke.py::is_resume_rejected), so
+    #                invoke_with_cap_retry retried fresh — a retry that may
+    #                itself fail — and nothing else anywhere records the loss.
+    #                data, built by cli_resume_failed_data:
     #                {stage, session_id, session_ids, role, fallbacks}, where
     #                `fallbacks` is AgentResult.resume_fallbacks — the count of
     #                fresh retries this one invocation had to make — and
@@ -621,15 +628,26 @@ class EventType(StrEnum):
     #                resume its retry loop re-armed internally after a cap hit,
     #                which a plain fresh dispatch can reach, and counting those
     #                would inflate the ratio below past 1.
+    #                A resumed run that ran turns and THEN ended non-success
+    #                (the ended_awaiting_background downgrade, a budget kill) is
+    #                a SURVIVING resume: it emits nothing here and reports
+    #                note_resume_succeeded (task 5579). Rows written before 5579
+    #                are contaminated by exactly that population: 0 of 25
+    #                measured were rejections.
+    #                The steward also emits stage='cli' rows, data.role ==
+    #                'steward'. Those are live-continuation resumes, never
+    #                adopted by the _run_slot guard and never fed to the INV-4
+    #                streak, so exclude them from the ratio below.
     #
     # SQL split, alongside session_resume_fallback's '$.reasons' /
     # '$.archive_available' ones:
     #   SELECT json_extract(data, '$.stage') AS stage, COUNT(*)
     #     FROM events WHERE event_type = 'session_resume_failed'
     #    GROUP BY stage;
-    # Read it against session_resume (the adopted-resume count) rather than
-    # against the three-event sum: it answers "of the resumes we decided to
-    # make, how many did not survive to the agent?".
+    # Read it, without the steward rows, against session_resume (the
+    # adopted-resume count) rather than against the three-event sum: it answers
+    # "of the resumes we decided to make, how many did not survive to the
+    # agent?".
     session_resume_failed = 'session_resume_failed'
 
     # Scheduler fairness
@@ -1100,6 +1118,13 @@ class EventType(StrEnum):
     #   (INV-4). Age surfacing only; nothing times out. Payload:
     #   {waiter: {task_id, module, role, plan_id, wait_secs}, aged_count, alarm_secs}
     verify_admission_wait_aged = 'verify_admission_wait_aged'
+    # predicate_rearmed / predicate_recheck_stalled — from DeterministicRunner
+    #   when a declared predicate exits 75 ("not yet") and re-arms, or reaches
+    #   deterministic.predicate_recheck_stall_cap and files milestone_check_stalled
+    #   (plans/completion-driven-triggers-prd.md C1). Payload:
+    #   {rc, consecutive, stall_cap, recheck_secs, next_check_at, verdict}
+    predicate_rearmed = 'predicate_rearmed'
+    predicate_recheck_stalled = 'predicate_recheck_stalled'
 
     # Shadow eval (plans/live-shadow-eval-prd.md C2). task_id is the PRODUCTION
     # task the cell shadows; shadow_cell_skipped's data.reason is a
@@ -1110,6 +1135,28 @@ class EventType(StrEnum):
     shadow_cell_skipped = 'shadow_cell_skipped'
     shadow_cell_settled = 'shadow_cell_settled'
     shadow_cell_ended = 'shadow_cell_ended'
+
+
+def cli_resume_failed_data(
+    *,
+    armed_session_id: str | None,
+    role: str,
+    fallbacks: int,
+    dropped_session_ids: Sequence[str],
+) -> dict[str, Any] | None:
+    """The ``session_resume_failed`` stage='cli' payload, or None unless the
+    caller's own armed resume was rejected (see the
+    ``EventType.session_resume_failed`` taxonomy note)."""
+    if not (fallbacks and armed_session_id):
+        return None
+    ids = [str(s) for s in dropped_session_ids]
+    return {
+        'stage': 'cli',
+        'session_id': ids[0] if ids else armed_session_id,
+        'session_ids': ids,
+        'role': role,
+        'fallbacks': fallbacks,
+    }
 
 
 @unique

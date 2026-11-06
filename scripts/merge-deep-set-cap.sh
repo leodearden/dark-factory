@@ -84,8 +84,10 @@ while i < len(lines):
         body = []
         while i < len(lines) and (lines[i][:1] in (' ', '\t') or lines[i].strip() == ''):
             body.append(lines[i]); i += 1
-        while body and body[-1].strip() == '':   # don't strand chain_cap after blanks
-            body.pop()
+        end = len(body)
+        while end and body[end - 1].strip() == '':
+            end -= 1
+        body, trailing = body[:end], body[end:]   # chain_cap goes above trailing blanks; blanks are kept
         replaced = False
         for b in body:
             if re.match(r'^\s+chain_cap:\s', b):
@@ -94,6 +96,7 @@ while i < len(lines):
                 out.append(b)
         if not replaced:
             out.append(f'  chain_cap: {cap}')
+        out += trailing
         done = True
         continue
     out.append(line); i += 1

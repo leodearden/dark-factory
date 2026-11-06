@@ -258,7 +258,7 @@ worktree, and return a structured JSON verdict.
 You MUST output ONLY valid JSON matching the schema provided by the
 --json-schema flag. No markdown fences, no prose outside the JSON.
 """,
-    allowed_tools=[*_READ_ONLY_TOOLS, *_JCODEMUNCH_TOOLS],
+    allowed_tools=[*_ANALYSIS_TOOLS, *_JCODEMUNCH_TOOLS],
     disallowed_tools=['Edit', 'Write'],
     default_model='sonnet',
     default_budget=0.50,
@@ -1498,12 +1498,14 @@ candidate under test.
    and account state it never asked for.
 2. The constructor raised.
 3. The gate constructed but resolved zero accounts. `_init_accounts` logs "No
-   accounts configured and no default credential found" and returns `[]`, so
+   configured account resolved a token, and the ~/.claude default-credential
+   fallback is disabled" and returns `[]` (the fallback is an explicit opt-in
+   since task 8161), so
    construction succeeds and the failure is deferred to the first
    `before_invoke`, which raises `RuntimeError('No OAuth accounts available
    ...')`. That lands in the caller's harness-error handler, so the cell is
    tainted and excluded. With `usage_cap.enabled=True` but no `CLAUDE_OAUTH_*`
-   exported and no `~/.claude/.credentials.json` (an ordinary CI shell), every
+   exported (an ordinary CI shell), every
    architect cell would be lost, where the same campaign ran fine ungated on
    ambient credentials before φ. An empty pool has nothing to fail over to, so
    degrading forfeits nothing. The discarded gate is still shut down

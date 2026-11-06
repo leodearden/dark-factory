@@ -148,6 +148,7 @@ _KEY_FOR_FULL_PAYLOAD: dict[EventType, str | None] = {
     EventType.task_created: None,
     EventType.task_deleted: None,
     EventType.deferral_restamped: None,
+    EventType.task_text_amended: None,
     EventType.memory_added: None,
     EventType.memory_updated: None,
     EventType.memory_deleted: None,

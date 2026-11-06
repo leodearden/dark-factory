@@ -148,7 +148,7 @@ CONFIG_DIR_ARCHIVAL_EXCEPTIONS = governed_exceptions(
     'being archived first, either by design or as a recorded gap.',
     _occurrence_keys((site['path'], site['qualname']) for site in _UNARCHIVED_CONFIG_DIR_SITES),
     default=Policy('inv12-config-dir-unarchived-by-design'),
-    default_covers=3,
+    default_covers=4,
 )
 
 BLESSED_TASK_METADATA_KEYS = governed_exceptions(
@@ -177,6 +177,7 @@ RUFF_CONFIG_SUPPRESSIONS = governed_exceptions(
     dispositions={
         'tool.ruff.lint.ignore::E501': Policy('inv12-ruff-e501-line-length'),
         'orchestrator/pyproject.toml::tool.ruff.lint.per-file-ignores::tests/**/*.py::F811': Debt(TaskRef(7137)),
+        'orchestrator/pyproject.toml::tool.ruff.lint.per-file-ignores::src/**/*.py::TID251': Debt(TaskRef(8622)),
     },
 )
 

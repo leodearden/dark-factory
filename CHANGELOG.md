@@ -10,6 +10,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+#### `mem0.persist_history` keeps mem0's change history off the shared DB (task 6100)
+
+New restart-only leaf `Mem0BackendConfig.persist_history`. It defaults to True, and
+under that default the config mem0 receives is byte-identical to before. At False,
+each mem0 instance keeps its history in a private in-memory SQLite DB instead of the
+process-shared `$MEM0_DIR/history.db`. The conftest `mock_config` and
+`fused-memory/scripts/bake_off_storage_shape.py::run_bake_off` now turn it off, and no
+longer patch mem0's private `instance.db.add_history`.
+
 #### `consolidate_memories` teaches the write-time topic guard its topic (task 3135)
 
 Removes the manual human hop that was supposed to teach `add_memory`'s topic guard a
@@ -1695,6 +1704,22 @@ contain it.)  The renamed event's pre-1230 form (`reservation_installed` +
 `data.reason='reserve_now'`) had zero in-repo consumers.
 
 ### Fixed
+
+#### Fairness parks can no longer deadlock pending owners (task 7799)
+
+Two pending owners could each hold a partial park and need a key the other had parked.
+Each one's acquire was refused by the other's park, and only the score-top ever retried
+its install, so neither moved until someone deferred one of them or the orchestrator
+restarted. solar_challenge hit this four times between 10-27 and 11-01, once for about
+31 h. Park entries now have one order, `scheduler.py::_ParkKey`: rank, then older
+numeric id, then id. A foreign park blocks a requester that owns parks only when its key
+precedes the requester's best key, and install shadows or blocks by the same key. A
+requester that owns no park is still blocked by every park. Every park wait therefore
+points at a strictly smaller key, and no cycle can form. What an operator will see:
+`reservation_shadowed` events now also occur between same-tier owners (the older id
+shadows), and a park owner can pass a lower-key park on a key it has not parked.
+`request_park_eviction` behaves as before. Rationale:
+`plans/scheduler-dispatch-scoring-and-lock-layer-prd.md` §7, Amendment (task 7799).
 
 #### resolve_escalation_shas reports git faults as failed_shas (task 7485)
 
