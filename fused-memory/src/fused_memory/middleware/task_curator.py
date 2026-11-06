@@ -74,7 +74,7 @@ from shared.locking import files_to_modules
 from shared.neutral_cwd import neutral_cli_cwd
 from shared.prompt_artifact import PromptArtifactStore, PromptSpec, default_artifacts_root
 from shared.streak import KeyedStreaks
-from shared.task_statuses import ACTIVE, TaskStatus
+from shared.task_statuses import ACTIVE
 from shared.transcript_archive import ArchiveBeforeDelete, archive_before_delete
 
 from fused_memory.backends.sdk_client_lifecycle import close_wrapped_sdk_clients
@@ -93,6 +93,7 @@ from fused_memory.middleware.curation_deferral import (
 )
 from fused_memory.middleware.curator_types import (
     DEFAULT_PRIORITY,
+    NON_CANCELLED_STATUSES,
     POOL_SOURCES,
     CandidateTask,
     CuratorDecision,
@@ -2710,7 +2711,7 @@ class TaskCurator:
             try:
                 page = await taskmaster.find_tasks_by_metadata(
                     project_root, 'spawned_from', value,
-                    statuses=list(_SIBLING_LOOKUP_STATUSES), limit=_SIBLING_LOOKUP_PAGE,
+                    statuses=list(NON_CANCELLED_STATUSES), limit=_SIBLING_LOOKUP_PAGE,
                 )
             except Exception as exc:
                 logger.warning(
@@ -3352,9 +3353,6 @@ def _dependents_of(anchor_id: str, edges: Mapping[int, Sequence[int]]) -> set[st
 
 
 _SIBLING_STREAM_SPAWN_CONTEXT = 'agent_followup'
-_SIBLING_LOOKUP_STATUSES: tuple[str, ...] = tuple(
-    sorted(status.value for status in TaskStatus if status is not TaskStatus.CANCELLED),
-)
 # One lookup page, far above the measured maximum of 11 siblings per parent;
 # rows past it are neither ranked nor counted.
 _SIBLING_LOOKUP_PAGE = 100

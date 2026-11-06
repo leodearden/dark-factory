@@ -101,6 +101,11 @@ Action = Literal['drop', 'combine', 'create', 'route_deterministic', 'refuse', '
 
 DEFAULT_PRIORITY = 'medium'  # canonical fallback used by both record_task and backfill_corpus
 
+# Every status but cancelled: what a dedupe lookup treats as existing work.
+NON_CANCELLED_STATUSES: Final[tuple[str, ...]] = tuple(
+    sorted(status.value for status in TaskStatus if status is not TaskStatus.CANCELLED),
+)
+
 
 @dataclass
 class CandidateTask:

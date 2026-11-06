@@ -46,9 +46,14 @@ from fused_memory.backends.task_backend_errors import (
     LeakedEnvelopeMarkupError,
     MetadataNotAnObjectError,
     StatusWriteAuthorityError,
+    TaskNotFoundError,
 )
 from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
-from fused_memory.backends.task_backend_types import AmendmentAdvisory, MetadataLookupResult
+from fused_memory.backends.task_backend_types import (
+    AmendmentAdvisory,
+    MetadataLookupResult,
+    MetadataLookupRow,
+)
 from fused_memory.config.schema import CuratorConfig
 from fused_memory.middleware import deferral_gate, recon_write_policy
 from fused_memory.middleware.amendment_advisory import (
@@ -66,6 +71,7 @@ from fused_memory.middleware.curation_deferral import (
     pool_defer_reason,
 )
 from fused_memory.middleware.curator_types import (
+    NON_CANCELLED_STATUSES,
     CandidateTask,
     CuratorDecision,
     PreparedCandidate,
@@ -305,6 +311,9 @@ def _resolve_backend_label(taskmaster: Any) -> str:
 # rather than imported, since the interceptor only ever forwards these values
 # and never compares them to the backend's sentinel.
 _UNSET = object()
+
+# One R4 lookup page; a suggestion_hash shared past it is paged, not missed.
+_R4_LOOKUP_PAGE = 100
 
 
 def _maybe_kwargs(sentinel: object, **pairs: object) -> dict:
@@ -4010,9 +4019,13 @@ class TaskInterceptor:
     ) -> tuple[dict | None, bool]:
         """Return ``(hit, check_failed)`` where ``hit`` is an existing task's
         identity if ``(escalation_id, suggestion_hash)`` in ``metadata``
-        matches a non-cancelled task, and ``check_failed`` is ``True`` when
-        ``get_tasks`` raised (so callers can fall through to CREATE rather than
-        treating a failure as a clean no-hit).
+        matches a non-cancelled task, and ``check_failed`` is ``True`` when the
+        metadata lookup or its confirming read raised (so callers can fall
+        through to CREATE rather than treating a failure as a clean no-hit).
+
+        The store is asked for the tasks carrying the ``suggestion_hash``, and
+        each match's ``escalation_id`` is confirmed with one read, so the check
+        is bounded by the matching rows, not by the task tree.
 
         R4: authoritative and cheap — no LLM, no embedding lookup.
         Works even when the curator is disabled or broken, which is
@@ -4032,44 +4045,68 @@ class TaskInterceptor:
         if self.taskmaster is None:
             return (None, False)
         try:
-            tasks_result = await self.taskmaster.get_tasks(project_root)
+            row = await self._escalation_match(self.taskmaster, project_root, esc_id, sug_hash)
         except Exception:
             logger.warning(
-                'r4: get_tasks failed during idempotency check',
+                'r4: metadata lookup failed during idempotency check',
                 exc_info=True,
             )
             return (None, True)
-        for task in flatten_task_tree(tasks_result):
-            tmeta = task.get('metadata')
-            if not isinstance(tmeta, dict):
-                continue
-            if tmeta.get('escalation_id') != esc_id:
-                continue
-            if tmeta.get('suggestion_hash') != sug_hash:
-                continue
-            if str(task.get('status', '')) == 'cancelled':
-                continue
-            tid = str(task.get('id', ''))
-            if not tid:
-                continue
-            logger.warning(
-                'r4: idempotency hit — returning existing task %s for '
-                'escalation_id=%s suggestion_hash=%s',
-                tid,
-                esc_id,
-                sug_hash,
+        if row is None:
+            return (None, False)
+        tid = str(row['task_id'])
+        logger.warning(
+            'r4: idempotency hit — returning existing task %s for '
+            'escalation_id=%s suggestion_hash=%s',
+            tid,
+            esc_id,
+            sug_hash,
+        )
+        return (
+            {
+                'id': tid,
+                'title': str(row['title']),
+                'deduplicated': True,
+                'action': 'idempotency_hit',
+                'reason': 'escalation+suggestion matched',
+            },
+            False,
+        )
+
+    async def _escalation_match(
+        self,
+        taskmaster: TaskBackendProtocol,
+        project_root: str,
+        esc_id: str,
+        sug_hash: str,
+    ) -> MetadataLookupRow | None:
+        """The first non-cancelled task carrying *sug_hash* whose ``escalation_id`` is *esc_id*."""
+        offset = 0
+        while True:
+            page = await taskmaster.find_tasks_by_metadata(
+                project_root, key='suggestion_hash', value=sug_hash,
+                statuses=list(NON_CANCELLED_STATUSES), limit=_R4_LOOKUP_PAGE, offset=offset,
             )
-            return (
-                {
-                    'id': tid,
-                    'title': str(task.get('title', '')),
-                    'deduplicated': True,
-                    'action': 'idempotency_hit',
-                    'reason': 'escalation+suggestion matched',
-                },
-                False,
-            )
-        return (None, False)
+            rows = list(page['results'])
+            if not rows:
+                return None
+            for row in rows:
+                if await self._carries_escalation(taskmaster, project_root, row['task_id'], esc_id):
+                    return row
+            offset += len(rows)
+            if offset >= page['total']:
+                return None
+
+    async def _carries_escalation(
+        self, taskmaster: TaskBackendProtocol, project_root: str, task_id: int, esc_id: str,
+    ) -> bool:
+        """Whether task *task_id* still exists and its metadata names *esc_id*."""
+        try:
+            task = await taskmaster.get_task(str(task_id), project_root)
+        except TaskNotFoundError:
+            return False
+        task_meta = self._extract_metadata_dict(task.get('metadata'))
+        return bool(task_meta) and task_meta.get('escalation_id') == esc_id
 
     async def submit_task(
         self, project_root: str, *, agent_id: str | None = None, **kwargs: Any

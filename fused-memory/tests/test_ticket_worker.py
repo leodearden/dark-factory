@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
-from _curator_helpers import answer_each_with, submit_as_one_batch
+from _curator_helpers import answer_each_with, serve_existing_task, submit_as_one_batch
 from _fm_helpers import poll_until, poll_until_stable, pydantic_spec
 from shared.async_sqlite_base import CheckpointResult
 from test_ticket_janitor import _make_orchestrator_layout, _project_id_for
@@ -495,7 +495,7 @@ async def test_worker_r4_escalation_idempotency_returns_existing_task(
             'suggestion_hash': 'h1',
         },
     }
-    taskmaster.get_tasks = AsyncMock(return_value={'tasks': [existing_task]})
+    serve_existing_task(taskmaster, existing_task)
 
     mock_curator = MagicMock()
     mock_curator.curate = AsyncMock()  # should NOT be called
@@ -1901,10 +1901,10 @@ class TestWorkerBatchDispatch:
     async def test_idempotency_hit_resolves_combined_and_is_not_curated(
         self, make_batch_interceptor, taskmaster,
     ):
-        taskmaster.get_tasks = AsyncMock(return_value={'tasks': [{
+        serve_existing_task(taskmaster, {
             'id': '99', 'title': 'Existing Escalation Task', 'status': 'pending',
             'metadata': {'escalation_id': 'e1', 'suggestion_hash': 'h1'},
-        }]})
+        })
         curator = _batch_curator(
             CuratorDecision(action='create', justification='new a'),
             CuratorDecision(action='create', justification='new c'),

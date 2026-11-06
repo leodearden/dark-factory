@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from shared.cli_invoke import AgentResult
 
+from fused_memory.backends.task_backend_types import MetadataLookupResult
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig
 from fused_memory.middleware.curator_types import (
     CandidateTask,
@@ -225,6 +226,29 @@ def curator_returning(*decisions: CuratorDecision) -> MagicMock:
     curator.reembed_task = AsyncMock(return_value=None)
     curator.close = AsyncMock()
     return curator
+
+
+def serve_existing_task(taskmaster: AsyncMock, task: Mapping[str, Any]) -> None:
+    """Make *taskmaster* hold *task* as the one match of every metadata lookup.
+
+    Its ``find_tasks_by_metadata`` answers with a one-row page for *task*, and
+    its ``get_task`` returns *task*: the two reads the R4 idempotency check
+    makes.
+    """
+    page: MetadataLookupResult = {
+        'results': [{
+            'task_id': int(task['id']),
+            'title': task['title'],
+            'status': task['status'],
+            'priority': task.get('priority', 'medium'),
+            'updated_at': '',
+        }],
+        'total': 1,
+        'tasks_with_key': 1,
+        'malformed_metadata_ids': [],
+    }
+    taskmaster.find_tasks_by_metadata = AsyncMock(return_value=page)
+    taskmaster.get_task = AsyncMock(return_value=dict(task))
 
 
 def hold_first_prepare(curator: Any) -> asyncio.Event:
