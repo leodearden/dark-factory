@@ -3310,8 +3310,10 @@ class TestBuildCorpusWithheldCensus(_CorpusHarness):
     so a census keyed on the final trim alone would miss them.
     """
 
-    def _every_stream_overflowing(self, config) -> tuple[TaskCurator, CandidateTask, list[str]]:
-        """A curator whose four streams each hold more than their cap admits."""
+    def _every_non_sibling_stream_overflowing(
+        self, config,
+    ) -> tuple[TaskCurator, CandidateTask, list[str]]:
+        """An anchored candidate whose module, embedding and dependency streams each overflow their cap; it has no siblings."""
         cur = config.curator
         anchor = self._anchor_task('100')
         modules = [self._module_task(str(200 + i)) for i in range(cur.pool_module_cap + 5)]
@@ -3334,7 +3336,8 @@ class TestBuildCorpusWithheldCensus(_CorpusHarness):
         )
         return curator, candidate, neighbor_ids
 
-    def _full_stream_pool(self, cur) -> int:
+    def _untrimmed_pool_size(self, cur) -> int:
+        """The pool ``_every_non_sibling_stream_overflowing`` yields before ``_trim_pool``: the anchor and three streams at their caps."""
         return 1 + cur.pool_module_cap + cur.pool_embedding_cap + cur.pool_dependency_cap
 
     @pytest.mark.asyncio
@@ -3463,14 +3466,14 @@ class TestBuildCorpusWithheldCensus(_CorpusHarness):
         """
         config = _make_config()
         cur = config.curator
-        curator, candidate, neighbor_ids = self._every_stream_overflowing(config)
+        curator, candidate, neighbor_ids = self._every_non_sibling_stream_overflowing(config)
 
         pool, sizes, withheld = await self._corpus(
             curator, candidate, neighbor_ids=neighbor_ids,
         )
 
         assert len(pool) == cur.pool_total_cap
-        assert withheld.by_source['total_cap'] == self._full_stream_pool(cur) - cur.pool_total_cap
+        assert withheld.by_source['total_cap'] == self._untrimmed_pool_size(cur) - cur.pool_total_cap
         assert sizes == {
             'anchor': 1,
             'sibling': 0,
@@ -3489,7 +3492,7 @@ class TestBuildCorpusWithheldCensus(_CorpusHarness):
         config = _make_config()
         cur = config.curator
         cur.pool_total_cap = cur.pool_module_cap
-        curator, candidate, neighbor_ids = self._every_stream_overflowing(config)
+        curator, candidate, neighbor_ids = self._every_non_sibling_stream_overflowing(config)
 
         pool, sizes, withheld = await self._corpus(
             curator, candidate, neighbor_ids=neighbor_ids,
@@ -3503,7 +3506,7 @@ class TestBuildCorpusWithheldCensus(_CorpusHarness):
             'dependency': 0,
             'embedding': 0,
         }
-        assert withheld.by_source['total_cap'] == self._full_stream_pool(cur) - cur.pool_total_cap
+        assert withheld.by_source['total_cap'] == self._untrimmed_pool_size(cur) - cur.pool_total_cap
         assert withheld.caps['total_cap'] == cur.pool_total_cap
 
     @pytest.mark.asyncio
@@ -3523,13 +3526,15 @@ class TestBuildCorpusWithheldCensus(_CorpusHarness):
     async def test_pool_sizes_shape_is_untouched(self):
         """The census must not leak into `pool_sizes` (owned by task 4718)."""
         config = _make_config()
-        tasks = [self._module_task(str(200 + i)) for i in range(20)]
+        cap = config.curator.pool_module_cap
+        tasks = [self._module_task(str(200 + i)) for i in range(cap + 5)]
         curator = TaskCurator(config=config, taskmaster=self._taskmaster(tasks))
 
-        _pool, sizes, _withheld = await self._corpus(
+        _pool, sizes, withheld = await self._corpus(
             curator, CandidateTask(title='T', files_to_modify=[self.MODULE_FILE]),
         )
 
+        assert withheld.total > 0
         assert set(sizes) == {'anchor', 'sibling', 'module', 'embedding', 'dependency'}
         assert sizes == {
             'anchor': 0,
