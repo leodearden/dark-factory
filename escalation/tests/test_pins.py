@@ -26,6 +26,7 @@ Covers:
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import typing
 from pathlib import Path
@@ -836,11 +837,14 @@ class TestPinnedOnlyByHumanParked:
         *,
         live_claimant: bool = False,
         live_claimant_id: str | None = None,
+        holder_candidates: typing.Any = (),
     ) -> bool:
         report = classify_pins(
             '42', records, live_claimant=live_claimant, live_claimant_id=live_claimant_id,
         )
-        return pinned_only_by_human_parked(report, records)
+        return pinned_only_by_human_parked(
+            report, records, holder_candidates=holder_candidates,
+        )
 
     def test_a_single_l2_is_human_parked(self) -> None:
         assert self._parked([_esc(level=2)]) is True
@@ -997,51 +1001,38 @@ class TestPinnedOnlyByHumanParked:
 
     # -- task 7716: a holder outside the read --
 
-    @staticmethod
-    def _parked_with(
-        records: typing.Any,
-        candidates: typing.Any,
-        *,
-        live_claimant: bool = False,
-        live_claimant_id: str | None = None,
-    ) -> bool:
-        report = classify_pins(
-            '42', records, live_claimant=live_claimant, live_claimant_id=live_claimant_id,
-        )
-        return pinned_only_by_human_parked(report, records, holder_candidates=candidates)
-
     def test_an_l1_an_outside_l2_holds_is_human_parked(self) -> None:
         """``promote_to_l2`` mints a cluster L2 under ONE task id, so the L2
         holding this task's L1 may sit outside the task's own read."""
         records = [_rec(id='esc-42-1', level=1)]
         candidates = [_rec(id='esc-7-2', level=2, members=('esc-42-1',))]
 
-        assert self._parked_with(records, candidates) is True
-        assert self._parked_with(records, ()) is False
+        assert self._parked(records, holder_candidates=candidates) is True
+        assert self._parked(records) is False
 
     def test_an_l1_an_outside_l2_holds_is_human_parked_on_real_escalations(self) -> None:
         records = [_esc(id='esc-42-1', level=1)]
         candidates = [_esc(id='esc-7-2', level=2, members=('esc-42-1',), task_id='7')]
 
-        assert self._parked_with(records, candidates) is True
+        assert self._parked(records, holder_candidates=candidates) is True
 
     def test_an_outside_candidate_holding_another_id_holds_nothing(self) -> None:
         records = [_rec(id='esc-42-1', level=1)]
         candidates = [_rec(id='esc-7-2', level=2, members=('esc-7-1',))]
 
-        assert self._parked_with(records, candidates) is False
+        assert self._parked(records, holder_candidates=candidates) is False
 
     def test_an_info_outside_candidate_holds_nothing(self) -> None:
         records = [_rec(id='esc-42-1', level=1)]
         candidates = [_rec(id='esc-7-2', level=2, severity='info', members=('esc-42-1',))]
 
-        assert self._parked_with(records, candidates) is False
+        assert self._parked(records, holder_candidates=candidates) is False
 
     def test_an_outside_candidate_below_human_level_holds_nothing(self) -> None:
         records = [_rec(id='esc-42-1', level=1)]
         candidates = [_rec(id='esc-7-2', level=1, members=('esc-42-1',))]
 
-        assert self._parked_with(records, candidates) is False
+        assert self._parked(records, holder_candidates=candidates) is False
 
     @pytest.mark.parametrize('level', ['2', 2.0, True, None])
     def test_an_outside_candidate_level_that_is_not_an_int_holds_nothing(
@@ -1051,38 +1042,37 @@ class TestPinnedOnlyByHumanParked:
         records = [_rec(id='esc-42-1', level=1)]
         candidates = [_rec(id='esc-7-2', level=level, members=('esc-42-1',))]
 
-        assert self._parked_with(records, candidates) is False
+        assert self._parked(records, holder_candidates=candidates) is False
 
     @pytest.mark.parametrize('members', [None, 'esc-42-1'], ids=['none', 'bare-string'])
     def test_outside_candidate_members_that_are_not_a_list_or_tuple_hold_nothing(
         self, members: typing.Any,
     ) -> None:
         records = [_rec(id='esc-42-1', level=1)]
-        candidates = [
-            _rec(id='esc-7-2', level=2, members=typing.cast('tuple[str, ...]', members)),
-        ]
+        candidates = [_rec(id='esc-7-2', level=2, members=members)]
 
-        assert self._parked_with(records, candidates) is False
+        assert self._parked(records, holder_candidates=candidates) is False
 
     def test_an_outside_candidate_parks_nothing_on_its_own(self) -> None:
         """A candidate only holds members; it never pins this task."""
         candidates = [_rec(id='esc-7-2', level=2, members=('esc-42-1',))]
 
-        assert self._parked_with([], candidates) is False
+        assert self._parked([], holder_candidates=candidates) is False
 
     def test_an_unheld_l1_beside_an_outside_held_one_is_not(self) -> None:
         records = [_rec(id='esc-42-1', level=1), _rec(id='esc-42-3', level=1)]
         candidates = [_rec(id='esc-7-2', level=2, members=('esc-42-1',))]
 
-        assert self._parked_with(records, candidates) is False
+        assert self._parked(records, holder_candidates=candidates) is False
 
     def test_an_outside_candidate_cannot_park_an_l0_it_names(self) -> None:
         """A held member must be a genuine int L1, wherever its holder sits."""
         records = [_rec(id='esc-42-1', level=0, severity='blocking', filing=LIVE_ID)]
         candidates = [_rec(id='esc-7-2', level=2, members=('esc-42-1',))]
 
-        parked = self._parked_with(
-            records, candidates, live_claimant=True, live_claimant_id=LIVE_ID,
+        parked = self._parked(
+            records, holder_candidates=candidates,
+            live_claimant=True, live_claimant_id=LIVE_ID,
         )
 
         assert parked is False
@@ -1095,7 +1085,7 @@ class TestPinnedOnlyByHumanParked:
         ]
         candidates = [_rec(id='esc-7-2', level=2, members=('esc-42-2',))]
 
-        assert self._parked_with(records, candidates) is True
+        assert self._parked(records, holder_candidates=candidates) is True
 
     def test_an_unreadable_store_is_not_even_with_an_outside_holder(self) -> None:
         report = classify_pins('42', None, live_claimant=False)
@@ -1106,15 +1096,14 @@ class TestPinnedOnlyByHumanParked:
         assert parked is False
 
     def test_holder_candidates_are_not_mutated(self) -> None:
-        records = [_rec(id='esc-42-1', level=1)]
-        candidates = [_rec(id='esc-7-2', level=2, members=('esc-42-1',))]
-        before = [dataclasses.replace(rec) for rec in candidates]
+        """Candidates are the pending queue's own rows, whose ``members`` is a
+        mutable list."""
+        records = [_esc(id='esc-42-1', level=1)]
+        candidates = [_esc(id='esc-7-2', level=2, members=('esc-42-1',), task_id='7')]
+        before = copy.deepcopy(candidates)
 
-        first = self._parked_with(records, candidates)
-        second = self._parked_with(records, candidates)
-
+        assert self._parked(records, holder_candidates=candidates) is True
         assert candidates == before
-        assert first == second
 
 
 # ---------------------------------------------------------------------------
