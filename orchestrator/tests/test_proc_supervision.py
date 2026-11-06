@@ -9,7 +9,9 @@ Shared proc_supervision test scaffolding lives in _proc_supervision_doubles.
 
 from __future__ import annotations
 
+import re
 import shlex
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -1851,6 +1853,17 @@ def _write_env_probe(path: Path, *, record_to: Path, exit_code: int) -> Path:
     return path
 
 
+_SYSTEMD_EXECSTART_EXPANSION = re.compile(r'\$(?:\$|\{([A-Za-z_][A-Za-z0-9_]*)\})')
+
+
+def _as_systemd_execstart_runs(command: str, unit_env: Mapping[str, str]) -> str:
+    """Model systemd's ``$$`` -> ``$`` and ``${NAME}`` expansion inside an ExecStart argv word."""
+    return _SYSTEMD_EXECSTART_EXPANSION.sub(
+        lambda m: '$' if m.group(0) == '$$' else unit_env.get(m.group(1), ''),
+        command,
+    )
+
+
 @pytest.mark.asyncio
 class TestDetachedPayloadCarriesEnv:
     """Each ``RestartPlan.env`` entry becomes a ``KEY=<quoted value>``
@@ -1915,6 +1928,22 @@ class TestDetachedPayloadCarriesEnv:
         assert default_plan.env == {}
         assert default_runner.calls[0][0] == explicit_runner.calls[0][0]
 
+    async def test_env_value_dollars_survive_systemd_expansion(
+        self, tmp_queue_dir: Path,
+    ) -> None:
+        import dataclasses
+
+        runner = FakeRunner(returncode=0)
+        plan = dataclasses.replace(
+            detached_rp4_plan(tmp_queue_dir, with_spec=False),
+            env={'X': 'a$b ${HOME}'},
+        )
+
+        await plan.execute(runner=runner)
+
+        argv, _kwargs = runner.calls[0]
+        assert argv[-1] == "X='a$$b $${HOME}' /proj/scripts/restart-orchestrator.sh --foo"
+
     async def test_env_reaches_the_payload_but_not_the_submit_child(
         self, tmp_path: Path, tmp_queue_dir: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -1936,13 +1965,14 @@ class TestDetachedPayloadCarriesEnv:
             detached_rp4_plan(tmp_queue_dir, with_spec=True),
             script=payload,
             cwd=tmp_path,
-            env={'MODE': 'two words', 'PYTHONPATH': '/payload-only'},
+            env={'MODE': 'two $$words ${HOME}', 'PYTHONPATH': '/payload-only'},
         )
         runner = FakeRunner(returncode=0)
         await plan.execute(runner=runner)
 
         proc = await asyncio.create_subprocess_exec(
-            '/bin/sh', '-c', runner.calls[0][0][-1],
+            '/bin/sh', '-c',
+            _as_systemd_execstart_runs(runner.calls[0][0][-1], {'HOME': '/home/unit-user'}),
             env={'PATH': os.environ['PATH']},
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
@@ -1950,7 +1980,7 @@ class TestDetachedPayloadCarriesEnv:
         out, _ = await proc.communicate()
 
         assert proc.returncode == 7, out
-        assert payload_saw.read_text() == '[two words][/payload-only]'
+        assert payload_saw.read_text() == '[two $$words ${HOME}][/payload-only]'
         assert submit_saw.read_text() == '[unset][unset]', (
             'the plan env must reach the payload alone, never the RP-4 submit child'
         )
