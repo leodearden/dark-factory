@@ -1646,6 +1646,24 @@ script's entries in `test_warm_lane_scripts_shipped.py`'s
 `TestSiblingResolutionIgnoresTheCallersCwd` parametrize lists; and end to end
 through the Python wrapper by `orchestrator/tests/test_run_thin_warm_lane_live_ref.py`.
 
+### Delta 18 — `lib_live_refs.sh`'s header names `thin-warm-lane.sh` as a third consumer
+
+**`lib_live_refs.sh` diverges from reify a second time** (after Delta 15).
+Added by **task 6368**, as a follow-up from task 5307. It is comment-only. Since
+Delta 17, thin sources the lib and calls `live_ref_present`, but the header's
+"Sourced by" list still named only `warm-lane-gc.sh` and `warm-lane-gc-sweep.sh`.
+The list now says "three consumers" and gives thin an entry stating its call
+placement. For the gate's rationale, see Delta 17.
+
+**Why patch here despite Delta 11.** Delta 11 left a vendored lib's stale prose
+alone because a note would have been the only hunk in an otherwise byte-clean
+file. That reason does not hold here: Delta 15 already diverged this file,
+header included, so one more comment hunk costs the drift check nothing.
+
+reify's own copy carries the same stale header, although reify's thin has
+sourced the lib since reify task 5823. That fix is left to reify. A future
+re-sync of this file must re-apply this hunk along with Delta 15's.
+
 ## Sibling-seed defaults, and who resolves them
 
 Two of the relocated scripts default their `--seed-script` to a **sibling**
