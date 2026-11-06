@@ -34,6 +34,7 @@ from _briefing_helpers import (
     recorded_search_text,
 )
 from shared.briefing_queries import TASK_SEMANTIC, BriefingScope, queries_for
+from shared.mcp_session import McpCallError, McpFailureKind
 
 from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.memory_recall import (
@@ -382,26 +383,31 @@ class TestDistilledRendering:
         assert '- [uncategorized · undated · mem0] Native canonical.' in context
         assert '  - [sighting · undated · mem0] NATIVE SIGHTING BODY' in context
 
+    @pytest.mark.parametrize('scenario', ['child-also-matched', 'only-parent-matched'])
     async def test_the_briefing_shows_the_contesting_child_in_full(
-        self, briefing: BriefingAssembler,
+        self, briefing: BriefingAssembler, scenario: str,
     ):
-        """A correction recalled with the claim it contests reaches the agent
-        whole and marked as contesting it, not as a cut digest under it."""
+        """A correction reaches the agent whole and marked as contesting its
+        parent, not as a cut digest under it — whether the correction itself
+        matched the query or only the claim it contests did."""
+        # The oracle is the scenario where the correction is its own top-level
+        # hit, so its full body comes from a field the render under test never
+        # has to produce.
         results = json.loads(recorded_search_text('child-also-matched'))['results']
         parent = next(entry for entry in results if 'grouped' in entry)
-        contesting_id = next(
-            child['id'] for child in parent['grouped']['amendments'] if child.get('contested')
+        contesting = next(
+            child for child in parent['grouped']['amendments'] if child.get('contested')
         )
-        full_body = next(entry['content'] for entry in results if entry['id'] == contesting_id)
+        full_body = next(entry['content'] for entry in results if entry['id'] == contesting['id'])
 
-        context = await _recall(
-            briefing, _answering(recorded_search_envelope('child-also-matched')),
-        )
+        context = await _recall(briefing, _answering(recorded_search_envelope(scenario)))
 
         assert any(
             line.startswith('  - [contests its parent · ') and line.endswith(f'] {full_body}')
             for line in context.splitlines()
         ), context
+        assert contesting['digest'].endswith('…')
+        assert contesting['digest'] not in context
 
     async def test_the_section_headings_come_from_the_specs(
         self, briefing: BriefingAssembler,
@@ -1039,19 +1045,21 @@ class TestMemoryContextProvenanceCaveat:
 class TestFailureClassification:
     """A slow memory service reads differently from an unreachable one.
 
-    ``mcp_call`` re-raises a plain ``RuntimeError`` once its retries exhaust,
-    keeping the cause only as ``__cause__``; these tests raise exactly that.
+    ``mcp_call`` raises a ``McpCallError`` of kind ``TRANSPORT`` once its
+    retries exhaust, keeping the cause only as ``__cause__``; these tests
+    raise exactly that.
     """
 
     @staticmethod
-    def _exhausted(cause: Exception) -> RuntimeError:
-        """The wrap ``McpSession._raw_call`` raises on retry exhaustion.
+    def _exhausted(cause: Exception) -> McpCallError:
+        """The wrap ``shared.mcp_session.McpSession.call`` raises on retry exhaustion.
 
         The shape itself is pinned against the real retry loop in
-        ``test_mcp_retry.py::TestTimeoutCausePredicate``.
+        ``shared/tests/test_mcp_session.py::TestIsTimeoutFailure``.
         """
-        err = RuntimeError(
-            f'MCP tools/call failed after 3 attempts: {type(cause).__name__}: {cause}'
+        err = McpCallError(
+            McpFailureKind.TRANSPORT,
+            f'MCP tools/call failed after 3 attempts: {type(cause).__name__}: {cause}',
         )
         err.__cause__ = cause
         return err

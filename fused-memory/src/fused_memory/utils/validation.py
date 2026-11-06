@@ -14,6 +14,8 @@ import os
 import re
 import uuid
 
+from shared.project_id import normalize_project_id
+
 logger = logging.getLogger(__name__)
 
 # Module-level flag for warn-once behaviour when no registry is configured.
@@ -327,39 +329,23 @@ class PathShapedProjectIdError(ValueError):
     """Raised when a project_id looks like a mangled filesystem path rather
     than a clean project key (e.g. '-home-leo-src-dark-factory').
 
-    Path-shaped ids must NEVER be silently normalized: lower() +
-    replace('-', '_') would map a mangled path to a NEW, wrong canonical
-    key (e.g. '-home-leo-src-dark-factory' -> '_home_leo_src_dark_factory'),
-    compounding the RCA §4 cross-graph leak hazard instead of fixing it.
-    Callers must reject path-shaped input LOUDLY rather than canonicalizing
-    it. Subclasses ValueError so ``except ValueError`` callers still catch it.
+    Path-shaped ids must NEVER be silently normalized:
+    ``shared.project_id.normalize_project_id`` would map a mangled path to a
+    NEW, wrong canonical key (e.g. '-home-leo-src-dark-factory' ->
+    '_home_leo_src_dark_factory'), compounding the RCA §4 cross-graph leak
+    hazard instead of fixing it. Callers must reject path-shaped input LOUDLY
+    rather than canonicalizing it. Subclasses ValueError so ``except
+    ValueError`` callers still catch it.
     """
 
 
-def _to_underscore_canonical(raw: str) -> str:
-    """Pure normalization step: lowercase *raw* and map hyphens to underscores.
-
-    No validation or rejection here -- this is only the mapping rule itself,
-    factored out so it has a single source of truth. Shared by:
-
-    - :func:`canonicalize_project_id` below, which applies this AFTER its
-      path-shape guard (raw project_id input may be path-shaped and must be
-      rejected, not normalized).
-    - :func:`fused_memory.models.scope.resolve_project_id`, which applies
-      this to an already-extracted path basename (via ``PurePosixPath(...).name``),
-      where the path-shape guard does not apply -- resolve_project_id's
-      long-standing contract is to always normalize, never raise, and is
-      relied on by ~15 call sites across the codebase.
-
-    Leading underscore marks this as an internal helper for those two known
-    call sites, not a general-purpose public API.
-    """
-    return raw.lower().replace('-', '_')
+# Exists only for server/tools.py's import; retires with ticket tkt_0RVP2CC33JWTGSYBHCTT9BQT3T. Do not use.
+_to_underscore_canonical = normalize_project_id
 
 
 def canonicalize_project_id(raw: str) -> str:
-    """Return the underscore-canonical form of *raw*: lowercased, with
-    hyphens mapped to underscores.
+    """Return ``shared.project_id.normalize_project_id(raw)``, the one
+    project-id rule, after refusing path-shaped input.
 
     This is a normalizer, not a validator: it does not reject empty strings
     or enforce a charset allowlist (see validate_project_id for that). Its
@@ -369,8 +355,8 @@ def canonicalize_project_id(raw: str) -> str:
     a mangled path would produce a NEW, wrong canonical key (RCA §4).
 
     Idempotent: canonicalize_project_id(canonicalize_project_id(x)) ==
-    canonicalize_project_id(x) for any non-path-shaped x, since lower() and
-    replace('-', '_') are each idempotent and a non-path-shaped input's
+    canonicalize_project_id(x) for any non-path-shaped x, since
+    normalize_project_id is idempotent and a non-path-shaped input's
     canonical form is itself never path-shaped.
     """
     if is_path_shaped_name(raw):
@@ -380,4 +366,4 @@ def canonicalize_project_id(raw: str) -> str:
             'would silently produce a new, wrong canonical key). Pass the '
             'resolved project_id instead.'
         )
-    return _to_underscore_canonical(raw)
+    return normalize_project_id(raw)

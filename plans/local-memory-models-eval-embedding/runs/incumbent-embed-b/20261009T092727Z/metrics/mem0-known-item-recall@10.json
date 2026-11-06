@@ -1,0 +1,19 @@
+{
+  "arm_id": "incumbent-embed-b",
+  "arm_role": "control",
+  "axis": "embedding",
+  "code_sha": "8bb8c8893b0f58957753954ab0338d47f4b609b9",
+  "corpus_sha": "1eb3ed883afb5396fcba47a240e41f4b501d5b678789c48541325eb7c811b287",
+  "incomplete": false,
+  "measured_at": "2026-10-09T09:33:31.334446Z",
+  "metric": {
+    "denominator": 42,
+    "direction": "lower_is_worse",
+    "kind": "proportion",
+    "metric_id": "mem0-known-item-recall@10",
+    "n": 42,
+    "value": 0.30952380952380953
+  },
+  "preregistration_sha": null,
+  "schema_version": 1
+}

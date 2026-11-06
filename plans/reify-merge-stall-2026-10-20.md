@@ -1,0 +1,102 @@
+# Reify merge stall, 2026-10-20 — root cause
+
+Lead: /team (fable), session team-reify-3593804. Leo present. Read-only investigation; no state changed on reify.
+Seats: journal (sonnet/high), stores (sonnet/medium), laptop host (sonnet/medium), merge-lane code map (opus/high), critic (opus/high, on the assembled draft). All times UTC unless marked BST. Corrected after the critic pass; the critic's refutations are folded in and marked.
+
+## Verdict
+
+**The queue was not wedged, and no merge-lane code landing from the throughput programme misfired.** Reify landed 8669 at 14:15Z and 8560 at 20:09Z. After the 20:10Z restart it landed 8628 (20:45Z) and 6179 (21:28Z); 8666's speculative verify failed at 21:01Z (see Current state). As of 21:28Z the queue is empty.
+
+What held the lane for most of 13:47Z–20:10Z was the programme's **deploy mechanics** acting on pre-existing merge-lane design properties, plus a heavily loaded workstation:
+
+| Window | What held it | Caused by |
+|---|---|---|
+| 14:16Z → 17:47Z (3.5 h) | Lane empty. The 14:16Z drain-restart cancelled nine in-flight reify workflows, two of them (8560, 8628) among today's four; 8628 had already passed its workflow verify and was in review, and lost ~4 h. The rest of the gap was slow task-role verifies on a workstation at loadavg 80–100 (8560's re-run: 4035 s, 1792 s of it slot wait). *(critic R1: "redo work" was overstated; load was the larger factor)* | watchdog fleet-staleness redeploy (Stage A 14:08Z); workstation load |
+| 18:12Z → 20:09Z (1 h 57 m) | 8560's verified merge was declared `disjoint_untrusted` because the direct commit `349aa26775` (chain_cap=6) moved main under it. The gate re-verify ran **local, unleased, global-scope, cold, inline**: it blocked the verifier loop, held the laptop lease idle, and shared the workstation with the offline-deep lane and ~6 task-role verifies. *(critic R2: the 24 min laptop pass was scoped; the gate ran "global (no scope info)" — the time came from lost scope + cold target + local placement + load together)* | task 3189's deploy script committing straight to reify main; it could fire because deploy 7238 counted as `done` while only *scheduled* |
+| 17:56Z → 20:10Z (2 h 13 m) | Merge admission halted at drain Stage A; Stage B waited 8009 s for reify's gate re-verify (counted as in-flight). **For reify the halt was redundant** — the inline gate already blocked dispatch from 18:12Z and the first follower queued at 18:25Z. It **did** bind for the units after reify in the sweep order: dark-factory's queue held 5 requests undispatched (18:30Z–20:10Z) and the laptop ran no verify-merge at all 18:11Z–20:11Z. *(critic R3)* | deploy 7238 `restart-all-orchestrators.sh --drain` |
+
+"Nothing merged since 13:47Z" read the merge commit's author stamp (`b3ab0d719e`, 14:47 BST); `merge_finalized` for 8669 is 14:15:46Z. "Four queued, at most one verifying" was the picture at ~20:0xZ: 8560 in `gate_reverify` with its laptop lease held, three followers queued behind the inline finalize.
+
+## Timeline (evidence)
+
+- **13:37Z** 6689 landed. **13:47:03Z** 8669 `merge_queued`; laptop verify 13:47–14:15Z passed; **14:15:46Z** `merge_finalized` done `b3ab0d71`.
+- **14:08:34Z** `Merge admission halted: fleet restart drain requested_ts=1792505309` (watchdog: "flagging for fleet-wide staleness redeploy", newest watched commit `f127e1aef5` 13:49Z; sweep pid 4068001). **14:15:51Z** `fleet_drain … waited_secs 442 outcome drained`. **14:16:48Z** reify restarted onto DF `f127e1aef5` (pre-A3, pre-B4). `task_completed outcome=cancelled` ×9 incl. 8560, 8628. (8628 had also been cancelled by the 11:48Z restart.)
+- **14:17Z–17:47Z** no merge-lane lines. 6179 dispatched 15:11Z, 8560 re-dispatched 15:29Z, 8628 re-dispatched 15:55Z (re-verified 15:55–18:09Z), 8666 dispatched 16:21Z.
+- **17:47:36Z** 8560 `merge_queued`; laptop verify (`4c3e70d5`, scoped, 10 task_files) 17:47:48–18:11:54Z passed, 24 min. The laptop CLI ran DF `96624cb2` (B4) for it.
+- **17:55:18Z** dark-factory task 7238 closed `done`, `done_provenance.kind=deterministic-deploy-scheduled`; transient unit `orch-redeploy-restart-7238.service` started **17:56:17Z** (18:56:17 BST). **17:56:19Z** reify: `Merge admission halted: fleet restart drain requested_ts=1792518977`. Sweep order restarted autopilot-video, pump-web-ui, know-live, my-solar-challenge first, then sat "awaiting in-flight merge verify on orchestrator-reify.service" from 18:07:55Z.
+- **18:08:28–18:08:54Z** dark-factory task 3189 (`scripts/merge-deep-set-cap.sh 6 /home/leo/src/reify/dark-factory-orchestrator.yaml 8100`) ran: direct commit `349aa26775` on reify main (18:08:33Z), `config_reload applied {merge_deep.chain_cap: 0→6}`. Its dependency 7238 was `done`, two hours before 7238's restart happened.
+- **18:12:05Z** `advance_main: reverify_on_rebase — rebased tree parked at 91864d5c; returning rebased_pending_reverify`. **18:12:06Z** `Task 8560: re-verify gate re-verifying (disjoint_untrusted) for rebased tree 91864d5c, verified 4c3e70d5, delta 075ed408..349aa267; overlap 0 file(s) []; blockers [intervening main tip 349aa267 was not landed green by this queue (unverified drift)]` (runs.db `merge_reverify_gate`, the 5064 row); then `Verification mode: global (no scope info)`, `Cold-cache verify: using 10800s timeout`, in `_merge-e6471a5a` (created 17:47:41Z, removed 20:09:26Z).
+- **18:12Z–20:08Z** heartbeats: `head=task 8560 (state=gate_reverify …) | verifying 1/2 hosts: laptop=8560`. No laptop verify-merge START for any project 18:11:54Z–20:11:04Z. `merge_verify runner=local passed=true duration_ms=7008071 chain_items=1`. Concurrent on the workstation: offline-deep lane reset to 349aa267 at 18:09Z (numeric sub-run 1428 s), task-role verifies at 18:44/19:03/19:19/19:35/19:40/19:48Z, PSI deferrals of task 5493.
+- **18:25:31Z** 8628, **19:17:37Z** 8666, **19:53:57Z** 6179 `merge_queued`; no `merge_dequeued`/`speculative_merge` for any of them before 20:10:55Z.
+- **20:08:54Z** `gate cleared (reverified); advancing with rebased SHA 91864d5c (gate attempt 1/5)`; **20:09:26Z** `merged to main successfully`; **20:09:45Z** `fleet_drain … waited_secs 8008.95 outcome drained, merge_verifies_awaited [8560 verify, finalizing, gate_reverify, finalizing], merge_verifies_killed []`.
+- **20:10:44Z** reify restarted (MainPID 36092; logger pid 36233) onto DF `c79ece2310` (A3, B4, 6668 live). `merge_finalized state=blocked reason="Merge worker shutting down"` ×3, then `_recover_pending_merges: recovered=3`. `Reconcile: reverted task {6179,8628,8666} to pending` 20:11:17–22Z. **20:10:59Z** 8628 verify start on laptop; **20:11:57Z** 8666 `_spec-0` local (`speculative_merge depth=1`); 6179 `speculative_merge depth=2`.
+- **20:44:56Z** 8628 laptop verify passed; **20:45:08Z** landed `2adf30861e`; `Reconcile: marked task 8628 done (reason=dispatch-gate-already-on-main)` 21:00:38Z.
+- **21:01:54Z** 8666 speculative verify FAILED: `run_all.sh` hit its 30 m outer timeout at 191/192 with no FAIL line (loaded workstation); lane disposition `branch_bug`; `merge_finalized blocked`; task left `pending`, `dry_run_proposals[-1].risk_label=human-review-required`. Same second: 6668's cancel-verify path killed 6179's speculative verify (rc=137) — first live exercise of 6668.
+- **21:02:40–21:28:43Z** 6179 re-dispatched non-speculative on laptop, passed; **21:28:55Z** landed `42fdc39360`; marked done 21:30:56Z. Queue empty since.
+
+## Why each piece behaved as it did (code)
+
+1. **Gate re-verify runs local, cold, global-scope, inline.** `merge_lane/worker.py::SpeculativeMergeWorker._finalize_inflight` ('rebased_pending_reverify' arm) calls `merge_lane/gates.py::_reverify_rebased_tree` with no runner; `worker.py::_run_post_merge_verify(runner=None)` builds a LocalRunner pool "out of slot accounting". `verify_host_policy: prefer_remote` is never consulted on this path. The verify runs in the merger's ephemeral `_merge-<uuid>` worktree (a remote-leased head skips the warm-lane swap in `merge_lane/liveness.py::_acquire_warm_verify_worktree`) with no scope info, so it is a cold global build. It is awaited inline in `worker.py::_verifier_loop` FINALIZE-HEAD, so DISPATCH-FILL cannot run and the head's laptop lease stays BUSY until `_finalize_inflight`'s `finally`. The heartbeat's `laptop=8560` is the lease name, not the runner.
+2. **Why `disjoint_untrusted`.** `gates.py::_disjoint_skip_blockers` P2: `rebased_onto` must satisfy `main_tip_is_queue_verified`, i.e. be in `gates.py::_QUEUE_VERIFIED_MAIN_TIPS`, which only this queue's own landings populate. A direct commit is never recorded there, so the gate fires on every direct commit to the target's main, restart or not *(critic R5)*. Kill switch: `merge_disjoint_skip_requires_verified_drift` (green tier, default True, absent on reify). 6647's same-tree skip (`merge_gate_history_pure`) is absent on reify and moot (the yaml drift changes the tree).
+3. **Why followers were not verified on the idle host.** FINALIZE-HEAD's inline await blocked dispatch from 18:12Z; the first follower arrived 18:25Z. Admission was also halted from 17:56:19Z (`worker.py::halt_admission`, re-asserted each heartbeat from `data/fleet/<unit>.drain.json` by `merge_lane/fleet_drain.py::_steer`; `::_pop_next_pickable` returns None while halted), but for reify that was redundant. `chain_cap` plays no part: its readers are `worker.py::_deep_chain_placement` (one call site, in `_dispatch_item`, speculative items only) and the halving reset in `::_run_inflight_verify` (speculative only); 8560 was the non-speculative head. The predicate is byte-identical pre- and post-B4 (`f127e1aef5` vs HEAD). dark-factory-30's scout independently found the chain_cap/coalesce test failure is test coupling.
+4. **Why the drain waited 8009 s, and whom it cost.** `scripts/restart-all-orchestrators.sh` Stage B waits while `worker.py::_verifies_in_flight` is non-empty, bounded by `ORCH_DRAIN_VERIFY_MAX_WAIT_SECS` (default 11400 = 10800 + 600, script line 243). `_RESTAMPED_STATES` includes GATE_REVERIFY and FINALIZING, so the gate re-verify is an in-flight verify and never overdue. Stage A halts every unit up front; units earlier in the order resume at their own restart, units later (scoping-intake, solar-challenge-platform, dark-factory last) stay halted until the sweep reaches them. Cost: DF queued 4002 (18:30Z), 6528, 6406, 6967, 4524 (20:02Z) and dispatched none until 20:10:54Z; the laptop idled fleet-wide for two hours. *(critic: the largest cost of the episode)*
+5. **Why 3189 fired early.** `orchestrator/src/orchestrator/dependency_verdict.py::_local_verdict`: `if dep_status in TERMINAL_STATUSES: continue`; it never reads `done_provenance` or `deploy_state.phase`. `deterministic_runner.py::_is_scheduled_self_deploy_complete` only prevents the deploy re-running itself. Leo's ruling that 3189 "flips only after 3188 and 6132 are landed AND deployed" was not enforceable by the edge. Note: 7238's `deploy_state.phase` still reads `scheduled` at 21:47Z, 1.5 h after its sweep finished ("All 8 orchestrator unit(s) restarted and verified fresh" 20:11:07Z) — nothing advances a scheduled self-deploy to `verified`, so a fix that gates on phase also needs that writer.
+6. **Post-restart `reverted … to pending`.** `harness.py::Harness._revert_in_progress_if_no_live_claimant` (startup `_reconcile_stranded_in_progress(mid_run=False)`) reverts an in-progress task with no live claimant without consulting the `InFlightMergeRegistry` that `_recover_pending_merges` populated moments earlier. 7022's predicate (`merge_deferred_recovery.py` `ParkedOwner.SINGLE_REQUEST`) covers merge-deferred rows in the mid-run sweep only. `scheduler.py::Scheduler._eligible_for_dispatch` has no merge-in-flight guard. After a landing, `Harness._already_landed_dispatch_gate` marks the task done (`dispatch-gate-already-on-main`), so the duplicate-dispatch window is the verify period (~34 min for 8628), not unbounded *(critic R4)*. The real consequence showed on **8666**: its recovered request failed with no workflow to own the failure, so the task sits `pending` rather than blocked, and will be re-dispatched as a fresh workflow unless a human acts.
+
+## Per-landing disposition (code live on reify 14:16Z–20:10Z = DF `f127e1aef5`)
+
+| Landing | On reify | Role in this stall |
+|---|---|---|
+| 7022 `fc9bd9934c` | active, merge-deferred rows only | none |
+| 3860 slice `033fb940d6` | active | none (observability) |
+| 6580/4537/7097 `97aa134292` | 6580 active (task-role post-rebase verify skipped: 8560's took 0.1 s); 4537/7097 inert (`verify_env_probes` absent) | none: the gate keys on main moving after the merge verify, which 6580 does not touch |
+| B1 `8b3142f414` | 6647 INERT (`merge_gate_history_pure` absent); 7196 active (`is_ancestor_checked` correctly did not fire); 3310 active | none |
+| 3788 `94291e1c6d` | active | none (no failing verify in the window) |
+| 4614 `1f325e68e1` | active, task side | none |
+| 5064 `42a09a097b` | active | recorded the `disjoint_untrusted` decision (helpful) |
+| A3 `7f4790550f` (15:45Z) | not loaded in-process until 20:10Z | none |
+| B4 `96624cb209` (17:04Z) | not loaded in-process until 20:10Z (laptop CLI ran it out-of-process for 8560's 17:47Z verify, passed) | none |
+| 6668 `c79ece2310` (17:38Z) | live from 20:10Z | first live exercise at 21:01:54Z: cancel-verify rc=137 on 6179's speculative verify, then clean re-dispatch and landing |
+| 3189 chain_cap=6 (18:08Z) | live via hot reload | its **direct commit** forced the 1 h 57 m re-verify; the cap value itself did nothing (`chain_items=1`) |
+| 7238 `--drain` deploy | — | halted DF's queue and idled the laptop 17:56Z→20:10Z; restart re-pended 3 reify tasks |
+| 72 h cadence `2590bce6bc` | DF coordinator | side effect: `orchestrator restart FORCE-FIRING … skip redeploy … 259200s cap (pending retained)` every 15 s, visible from at least 14:07Z |
+
+Restart cadence on reify, 2026-10-19 06:47Z → 10-20 20:10Z: **nine** drain-restarts (3 merge self-restarts, deploys 7175, 7201, 7213, 7216, 7238, the watchdog staleness redeploy at 14:08Z). Each cancels every in-flight reify workflow; 8628 was cancelled twice today (11:48Z, 14:16Z).
+
+## Host and environment
+
+- Workstation: loadavg 80–100 through the window; task-role slot waits up to 1792 s; offline-deep lane and ~6 task-role verifies concurrent with the gate re-verify; PSI mem deferrals. This is the common driver behind every long window *(critic "missed")*.
+- leo-laptop: reachable (ssh 0.45 s), load 25→47 later (shared with a DF `full` merge verify), **65 GiB free on /home, under the 70 GiB re-trim line** (memory `project_laptop_disk_space_2026_10_16`), not benched/quarantined/parked; `runner_stale`→`runner_synced df_checkout` at 13:02Z, 17:47Z, 20:10Z all succeeded. 40 orphaned `bash …/_merge-verify/tests/infra/run_all.sh` processes (ppid 1, 0 % CPU, up to 46 h old): leaked process groups, 6668 territory.
+- Main green (`42fdc39360` after 6179). No pending reify escalation touches the queue; two `stale_l0_strand_sweep` escalations (esc-9097-2, esc-8560-1 dismissed across the restart). Other reify sessions (`ListAgents`): reify-9d/2d/86/4c; none holds the queue.
+
+## Current state (critic read, ~22:23Z)
+
+- `merge_queue.json` = {} ; last heartbeat 21:26:30Z (depth 1, 6179 verifying). 8628 and 6179 landed and marked done. No re-dispatch (`task_started`) of 8628/8666/6179 since 20:11Z.
+- **8666 needs a human**: `pending`, no claimant, recovered merge request failed 21:01:54Z on `run_all.sh`'s 30 m outer timeout at 191/192 with no FAIL line (infra on a loaded workstation, not a branch bug, though the lane recorded `disposition: branch_bug`); `dry_run_proposals[-1]` clamped to human-review-required. Options: re-queue the branch (`task/8666`, tip `423e22ed87`, merge-tree clean against main) or let the scheduler re-dispatch it as a fresh workflow. **Ask Leo before acting on reify.**
+
+## Follow-ups (dark-factory unless stated)
+
+Filed with test-per-bug where a code defect was found (dark-factory tasks **7276**, **7277**, **7278**):
+- **D1 (defect, task 7276)** `deps_verdict` treats a `deterministic-deploy-scheduled` done as satisfied before the restart lands → 3189 ran against pre-B4 code. Fix must also add the writer that moves a scheduled self-deploy's `deploy_state.phase` to `verified` when the sweep completes (today it never leaves `scheduled`).
+- **D2 (defect, task 7277)** startup reconcile reverts to `pending` a task whose merge request was just recovered into the lane; no dispatch guard during its verify; a failed recovered request leaves the task `pending` with nobody owning the failure (8666). Skip tasks in `InFlightMergeRegistry` in `_revert_in_progress_if_no_live_claimant` (or hold them merge-deferred), and route a recovered request's failure to a blocked status + escalation.
+- **D3 (defect, small, task 7278)** DF coordinator logs FORCE-FIRING + skip every 15 s under the 72 h cap.
+
+Leo's rulings (2026-10-21):
+- **R1 — RULED YES.** The gate re-verify goes through `HostAllocator` (prefer_remote), **keeps the request's verify scope**, uses a warm lane when warm lanes are enabled, and runs as an in-flight entry so DISPATCH-FILL continues. Owners: existing **6278** (run the gate on the head's own leased host; Leo's 2026-10-09 amendment forbids release-and-reacquire, which deadlocks under in-order finalize with K=2) and **6155** (non-blocking gate: DISPATCH-FILL keeps running), both re-affirmed by this ruling; new **7295** carries the two residuals neither owns — scope retention (no "global (no scope info)" fallback) and warm-lane use — and depends on both. Recurs on every direct commit to a target's main until R2 lands too.
+- **R2 — RULED: deploy flips go through the queue, task 7296.** Deploy scripts that commit a yaml flip to a target project's main (`scripts/merge-deep-set-cap.sh`, any knob flip) land the commit through the target's merge queue instead of a direct commit, so the queue records it as verified main and no in-flight merge pays a gate re-verify. The `merge_disjoint_skip_requires_verified_drift=false` option was not taken.
+- **R3 — RULED 2026-10-21: per unit, hand-carried as task 7297.** Stage A now halts a unit's merge admission only when the sweep reaches it (its drain request is written at its own gate; the per-unit `ORCH_DRAIN_VERIFY_MAX_WAIT_SECS` counts from that request), and a sweep-wide ceiling `ORCH_DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS` (default 10300, derived in one place — the comment above `DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS` in `scripts/restart-all-orchestrators.sh` — to fit under the fixed 14400 s fleet lease for the 8 units running) force-restarts the awaited unit and restarts every later unit at its first acknowledged poll, so the sweep cannot outlive its lease. The unit side (`fleet_drain.py`, request format, refusals) is unchanged. Reviewer (opus, fresh) verdict LAND after one fix round; follow-up **7307** derives the ceiling from the live unit count and validates numeric drain knobs. Yesterday's cost would have fallen on reify alone (its own inline gate, R1's lever), not on DF and the laptop.
+- **R4 — no further action.** Deploy cadence is already reduced to one coordinator redeploy per 72 h plus explicit deploy tasks for high-value deployments; the nine restarts on 10-19/20 were that explicit-deploy burst plus merge self-restarts and one watchdog staleness redeploy.
+
+Reify ops (for Leo): 8666 disposition (above); laptop re-trim (65 GiB free); reap the 40 orphan `run_all.sh` process groups.
+
+## Seat table
+
+| Seat | Model/effort | Tokens | Min | Outcome |
+|---|---|---|---|---|
+| A journal | sonnet/high | 153k | 17 | full timeline, restarts, per-request table |
+| B stores | sonnet/medium | 136k | 9 | runs.db events incl. the 5064 gate row; premise correction |
+| C laptop | sonnet/medium | 100k | 10 | host busy/healthy; disk < 70 GiB; orphan pgids |
+| D code map | opus/high | 335k | 85 | symbol-pinned mechanism for every window; chain_cap hypothesis refuted |
+| E critic | opus/high | 211k | 44 | refuted window-1 attribution, the cold-vs-warm comparison, the halt's effect on reify, the restart's role in P2; surfaced DF's 2 h collateral, 8666's failure, 7238's stuck phase |
+
+Lead inline: ~5 scout/digest commands, task-store reads. Dropped/unverified: whether the 3788 main-health regex is inert for nextest ids (irrelevant here); sccache hit rate during the gate re-verify (RUSTC_WRAPPER was set, so "cold" means target/, not necessarily every compile).

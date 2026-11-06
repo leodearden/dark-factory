@@ -14,7 +14,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
-from merge_lane_metrics import tracked_files
+from source_measures import tracked_files
 
 _NO_CRATE = '(none)'
 _TOTAL = 'total'

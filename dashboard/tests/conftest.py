@@ -55,17 +55,20 @@ import httpx  # noqa: E402
 import pytest  # noqa: E402
 from _dashboard_helpers import RECONCILIATION_SCHEMA, apply_isolated_env  # noqa: E402
 from df_pytest_isolation import (  # noqa: E402
+    _df_claude_binary_unset,  # noqa: F401  — the binding IS the wiring  # debt: task 6997
     _df_deploy_clocks_unwritten,  # noqa: F401  — the binding IS the wiring
     _df_git_ceiling_at_basetemp,  # noqa: F401  — the binding IS the wiring
     _df_git_env_hermetic,  # noqa: F401  — the binding IS the wiring
+    arm_leaked_drain_process_guard,
     reject_unsafe_basetemp,
 )
 from starlette.testclient import TestClient  # noqa: E402
 
 
 def pytest_configure(config):
-    """Refuse a --basetemp aimed inside a live task worktree (esc-3072-3)."""
+    """Refuse a --basetemp aimed inside a live task worktree (esc-3072-3); arm the drain-leak guard."""
     reject_unsafe_basetemp(config)
+    arm_leaked_drain_process_guard(config)
 
 
 @pytest.fixture(scope='session', autouse=True)
@@ -121,6 +124,21 @@ async def dummy_client():
 
 
 @pytest.fixture()
+def fresh_task_snapshot_state():
+    """A test using this starts and leaves the task-snapshot collectors' state empty.
+
+    That per-process state is the snapshot unit cache, the last-good store
+    and the root rotation. Modules opt in with
+    ``pytestmark = pytest.mark.usefixtures('fresh_task_snapshot_state')``.
+    """
+    from dashboard.data.active_tasks import reset_task_snapshot_state
+
+    reset_task_snapshot_state()
+    yield
+    reset_task_snapshot_state()
+
+
+@pytest.fixture()
 def dummy_config(tmp_path):
     from dashboard.config import DashboardConfig
 
@@ -144,7 +162,17 @@ def two_url_config(tmp_path):
 
 
 @pytest.fixture()
-def client():
+def samplers_off(monkeypatch):
+    """Any app lifespan started later in this test runs without the two background samplers.
+
+    Request it from a test that builds its own ``TestClient(app)`` and asserts
+    on a patched MCP seam (task 5826).
+    """
+    monkeypatch.setenv('DASHBOARD_SAMPLERS', 'off')
+
+
+@pytest.fixture()
+def client(samplers_off):
     """Create a TestClient for the dashboard FastAPI app.
 
     Its lifespan is isolated on BOTH axes by the session-scoped
@@ -154,6 +182,9 @@ def client():
     rather than the operator's live instance on 8002 (task 5185).  The second
     half is not cosmetic: without it every lifespan here makes two real MCP
     round trips, and one slow response wedges ``TestClient.__exit__``.
+
+    The samplers are off, because their discovery ``ps``-scans the real host
+    and their reads land on whatever MCP seam the test patched (task 5826).
     """
     from dashboard.app import app
 
@@ -162,7 +193,7 @@ def client():
 
 
 @pytest.fixture()
-def two_url_client(monkeypatch):
+def two_url_client(monkeypatch, samplers_off):
     """TestClient running the lifespan with a two-URL fused-memory config.
 
     Uses monkeypatch.setenv so DashboardConfig.from_env() inside the lifespan
@@ -172,6 +203,9 @@ def two_url_client(monkeypatch):
     Only the fused-memory URLs are overridden here; project_root still comes
     from the session-scoped ``_isolated_project_root`` temp dir, so this
     lifespan does not touch the operator's live checkout either (task 3503).
+
+    The samplers are off, because their discovery ``ps``-scans the real host
+    and their reads land on whatever MCP seam the test patched (task 5826).
     """
     from dashboard.app import app
 
@@ -285,44 +319,6 @@ def reconciliation_db(tmp_path):
             'idle',
             (now - timedelta(hours=1)).isoformat(),
             None,
-        ),
-    )
-
-    # Journal entries for run-001
-    conn.execute(
-        """INSERT INTO journal_entries
-           (id, run_id, stage, timestamp, operation, target_system,
-            before_state, after_state, reasoning, evidence)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            'je-001',
-            'run-001',
-            'memory_consolidation',
-            (now - timedelta(hours=1, minutes=55)).isoformat(),
-            'consolidate',
-            'mem0',
-            '{"count": 5}',
-            '{"count": 3}',
-            'Merged duplicate memories',
-            '[{"source": "mem0", "id": "m-1"}]',
-        ),
-    )
-    conn.execute(
-        """INSERT INTO journal_entries
-           (id, run_id, stage, timestamp, operation, target_system,
-            before_state, after_state, reasoning, evidence)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            'je-002',
-            'run-001',
-            'task_knowledge_sync',
-            (now - timedelta(hours=1, minutes=50)).isoformat(),
-            'sync',
-            'graphiti',
-            None,
-            '{"entities": 2}',
-            '',
-            '[]',
         ),
     )
 

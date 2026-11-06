@@ -34,9 +34,9 @@ from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, MergeResult
-from orchestrator.merge_disposition import MergeFailureDisposition
+from orchestrator.merge_lane.disposition import MergeFailureDisposition
 from orchestrator.merge_lane.gates import _MAX_EVENT_EVIDENCE_ITEMS
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.worker import (
     MAIN_HEALTH_PROBE_PENDING_NOTE,
     InflightEntry,
     MergeOutcome,

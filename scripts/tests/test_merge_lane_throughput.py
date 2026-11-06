@@ -11,12 +11,14 @@ from __future__ import annotations
 import argparse
 import json
 import sqlite3
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import merge_lane_throughput as mlt
 import pytest
+from shared.project_layout import default_project_root, runs_db
 
 # ---------------------------------------------------------------------------
 # parse_window — clock-free: ``now`` is always injected, never read inside.
@@ -106,87 +108,18 @@ def test_iso_formats_the_spelling_the_events_table_stores():
     )
 
 
-# ---------------------------------------------------------------------------
-# Fixture builder — DDL copied verbatim from event_store.py::_SCHEMA.
-#
-# The house convention (scripts/tests/test_audit_wiped_metadata_files.py,
-# test_analyze_speculation_depth.py) is to inline the DDL and build the DB in
-# tmp_path rather than check a binary .db into git: a "known answer" has to be
-# legible to a reviewer, and a blob makes the input to every asserted number
-# unreviewable in a diff.
-# ---------------------------------------------------------------------------
-
-_EVENTS_SCHEMA = """
-CREATE TABLE IF NOT EXISTS events (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp   TEXT    NOT NULL,
-    run_id      TEXT    NOT NULL,
-    task_id     TEXT,
-    event_type  TEXT    NOT NULL,
-    phase       TEXT,
-    role        TEXT,
-    data        TEXT    DEFAULT '{}',
-    cost_usd    REAL,
-    duration_ms INTEGER
-);
-
-CREATE INDEX IF NOT EXISTS idx_events_run  ON events(run_id);
-CREATE INDEX IF NOT EXISTS idx_events_task ON events(run_id, task_id);
-CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);
-CREATE INDEX IF NOT EXISTS idx_events_ts   ON events(timestamp);
-"""
-
-
-def _make_runs_db(
-    tmp_path: Path, events: list[dict[str, Any]], name: str = 'runs.db'
-) -> Path:
-    """Build a temp runs.db mirroring the live events schema and insert *events*.
-
-    Each event dict may carry: ``event_type`` (required), ``task_id``,
-    ``run_id``, ``timestamp``, ``phase``, ``role``, ``data``, ``cost_usd`` and
-    ``duration_ms``. ``data`` is passed through VERBATIM when it is a str or
-    None — so a test can inject malformed JSON or a NULL payload — and
-    json-encoded otherwise. Rows are inserted in list order, so *events* order
-    IS ascending ``id`` order.
-    """
-    db_path = tmp_path / name
-    conn = sqlite3.connect(db_path)
-    try:
-        conn.executescript(_EVENTS_SCHEMA)
-        for i, event in enumerate(events):
-            data = event.get('data')
-            if data is not None and not isinstance(data, str):
-                data = json.dumps(data)
-            task_id = event.get('task_id')
-            conn.execute(
-                'INSERT INTO events (timestamp, run_id, task_id, event_type, '
-                'phase, role, data, cost_usd, duration_ms) '
-                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-                (
-                    event.get('timestamp', f'2026-08-11T00:00:{i:02d}+00:00'),
-                    event.get('run_id', 'run-1'),
-                    None if task_id is None else str(task_id),
-                    event['event_type'],
-                    event.get('phase'),
-                    event.get('role'),
-                    data,
-                    event.get('cost_usd'),
-                    event.get('duration_ms'),
-                ),
-            )
-        conn.commit()
-    finally:
-        conn.close()
-    return db_path
+# runs.db is built in tmp_path by conftest's `make_runs_db`, never checked in
+# as a binary blob, so every asserted number's input stays legible in a diff.
 
 
 def _make_project_root(
-    tmp_path: Path, name: str, events: list[dict[str, Any]]
+    make_runs_db: Callable[..., Path], tmp_path: Path, name: str,
+    events: list[dict[str, Any]],
 ) -> Path:
     """Materialise a synthetic project root holding data/orchestrator/runs.db."""
     root = tmp_path / name
     (root / 'data' / 'orchestrator').mkdir(parents=True)
-    _make_runs_db(root / 'data' / 'orchestrator', events)
+    make_runs_db(events, directory=root / 'data' / 'orchestrator')
     return root
 
 
@@ -374,47 +307,12 @@ def corpus_b() -> list[dict[str, Any]]:
 
 
 @pytest.fixture
-def corpus_roots(tmp_path):
+def corpus_roots(tmp_path, make_runs_db):
     """Two synthetic project roots, A and B, each with its own runs.db."""
     return (
-        _make_project_root(tmp_path, 'proj_a', corpus_a()),
-        _make_project_root(tmp_path, 'proj_b', corpus_b()),
+        _make_project_root(make_runs_db, tmp_path, 'proj_a', corpus_a()),
+        _make_project_root(make_runs_db, tmp_path, 'proj_b', corpus_b()),
     )
-
-
-# ---------------------------------------------------------------------------
-# Fixture-builder self-checks — every later assertion rests on these producing
-# live-shaped rows.
-# ---------------------------------------------------------------------------
-
-
-def test_make_runs_db_inserts_rows_in_list_order_with_ascending_ids(tmp_path):
-    db = _make_runs_db(tmp_path, [
-        {'event_type': 'merge_verify', 'task_id': 1, 'timestamp': _ts(11, 1)},
-        {'event_type': 'merge_verify', 'task_id': 2, 'timestamp': _ts(11, 2)},
-        {'event_type': 'merge_verify', 'task_id': 3, 'timestamp': _ts(11, 3)},
-    ])
-    conn = sqlite3.connect(db)
-    try:
-        rows = conn.execute('SELECT id, task_id FROM events ORDER BY id').fetchall()
-    finally:
-        conn.close()
-    assert [r[1] for r in rows] == ['1', '2', '3']
-    assert [r[0] for r in rows] == sorted(r[0] for r in rows)
-
-
-def test_make_runs_db_passes_data_through_verbatim_for_str_and_none(tmp_path):
-    db = _make_runs_db(tmp_path, [
-        {'event_type': 'merge_verify', 'data': '{not json'},
-        {'event_type': 'merge_verify', 'data': None},
-        {'event_type': 'merge_verify', 'data': {'runner': 'local'}},
-    ])
-    conn = sqlite3.connect(db)
-    try:
-        rows = [r[0] for r in conn.execute('SELECT data FROM events ORDER BY id')]
-    finally:
-        conn.close()
-    assert rows == ['{not json', None, '{"runner": "local"}']
 
 
 # ---------------------------------------------------------------------------
@@ -422,8 +320,8 @@ def test_make_runs_db_passes_data_through_verbatim_for_str_and_none(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_connect_ro_opens_readable_and_refuses_writes(tmp_path):
-    db = _make_runs_db(tmp_path, [{'event_type': 'merge_verify'}])
+def test_connect_ro_opens_readable_and_refuses_writes(make_runs_db):
+    db = make_runs_db([{'event_type': 'merge_verify'}])
     conn = mlt._connect_ro(db)
     try:
         assert conn.execute('SELECT COUNT(*) FROM events').fetchone()[0] == 1
@@ -443,8 +341,8 @@ def test_connect_ro_refuses_a_missing_database(tmp_path):
         mlt._connect_ro(tmp_path / 'nope.db')
 
 
-def test_load_events_returns_only_in_window_rows_of_the_requested_type(tmp_path):
-    db = _make_runs_db(tmp_path, [
+def test_load_events_returns_only_in_window_rows_of_the_requested_type(make_runs_db):
+    db = make_runs_db([
         # Before lo.
         {'event_type': 'merge_verify', 'task_id': 'early', 'timestamp': _ts(10, 11),
          'data': {'runner': 'local'}},
@@ -473,8 +371,8 @@ def test_load_events_returns_only_in_window_rows_of_the_requested_type(tmp_path)
                        'data': {'runner': 'local'}}
 
 
-def test_load_events_degrades_malformed_and_null_data_to_empty_dict(tmp_path):
-    db = _make_runs_db(tmp_path, [
+def test_load_events_degrades_malformed_and_null_data_to_empty_dict(make_runs_db):
+    db = make_runs_db([
         {'event_type': 'merge_verify', 'task_id': 'bad', 'timestamp': _ts(12, 1),
          'data': '{not json'},
         {'event_type': 'merge_verify', 'task_id': 'null', 'timestamp': _ts(12, 2),
@@ -494,8 +392,8 @@ def test_load_events_degrades_malformed_and_null_data_to_empty_dict(tmp_path):
     assert [r['data'] for r in rows] == [{}, {}, {}, {'runner': 'local'}]
 
 
-def test_load_events_returns_empty_list_when_nothing_matches(tmp_path):
-    db = _make_runs_db(tmp_path, [
+def test_load_events_returns_empty_list_when_nothing_matches(make_runs_db):
+    db = make_runs_db([
         {'event_type': 'merge_verify', 'timestamp': _ts(12, 1), 'data': {}},
     ])
     conn = mlt._connect_ro(db)
@@ -1936,12 +1834,6 @@ def test_chains_tolerates_a_non_numeric_landed_via_chain():
 # ---------------------------------------------------------------------------
 
 
-def test_resolve_runs_db_is_data_orchestrator_runs_db_under_the_root(tmp_path):
-    assert mlt.resolve_runs_db(tmp_path / 'proj') == (
-        tmp_path / 'proj' / 'data' / 'orchestrator' / 'runs.db'
-    )
-
-
 def test_project_root_flag_is_repeatable(corpus_roots):
     root_a, root_b = corpus_roots
     args = mlt.build_parser().parse_args(
@@ -1953,13 +1845,12 @@ def test_project_root_flag_is_repeatable(corpus_roots):
     ]
 
 
-def test_resolve_project_roots_normalises_every_root():
+def test_resolve_project_roots_normalises_every_root(tmp_path):
     # The root is the project LABEL, not just an input path, so '.' and a
     # trailing '/..' must not produce two different labels for one project.
-    roots = mlt.resolve_project_roots([
-        str(mlt.DEFAULT_PROJECT_ROOT / 'scripts' / '..'),
-    ])
-    assert roots == [mlt.DEFAULT_PROJECT_ROOT]
+    (tmp_path / 'scripts').mkdir()
+    roots = mlt.resolve_project_roots([str(tmp_path / 'scripts' / '..')])
+    assert roots == [tmp_path.resolve()]
     assert roots[0].is_absolute()
 
 
@@ -1986,21 +1877,19 @@ def test_main_reports_a_repeated_root_once_in_both_renderings(capsys, corpus_roo
     assert len(json.loads(raw)['projects']) == 1
 
 
-def test_project_root_defaults_to_this_checkout_when_not_given():
+def test_project_root_defaults_to_the_main_checkout_when_not_given():
     args = mlt.build_parser().parse_args([])
     # argparse's append action leaves None, not []; the default is applied by
     # resolve_project_roots so a caller passing None gets the same answer.
     assert args.project_root is None
-    roots = mlt.resolve_project_roots(args.project_root)
-    assert roots == [mlt.DEFAULT_PROJECT_ROOT]
-    assert (mlt.DEFAULT_PROJECT_ROOT / 'scripts' / 'merge_lane_throughput.py').is_file()
+    assert mlt.resolve_project_roots(args.project_root) == [default_project_root()]
 
 
 def test_collect_project_labels_its_bundle_with_the_root_it_read(corpus_roots):
     root_a, _ = corpus_roots
     bundle = mlt.collect_project(root_a, CORPUS_LO_DT, CORPUS_HI_DT)
     assert bundle['project_root'] == str(root_a)
-    assert bundle['runs_db'] == str(mlt.resolve_runs_db(root_a))
+    assert bundle['runs_db'] == str(runs_db(root_a))
     assert bundle['error'] is None
     assert bundle['window'] == (CORPUS_LO, CORPUS_HI)
 
@@ -2191,7 +2080,7 @@ def test_collect_project_reports_a_missing_db_as_a_labelled_error(tmp_path):
     assert bundle['error'] is not None
     # Loud: the message names the path that was actually looked for, so the
     # operator can see whether it was the root or the layout that was wrong.
-    assert str(mlt.resolve_runs_db(missing)) in bundle['error']
+    assert str(runs_db(missing)) in bundle['error']
     # And empty — NOT a bundle of zeros. "This DB could not be read" must never
     # render identically to "this project landed nothing in the window".
     assert bundle['sections'] == {}
@@ -2203,7 +2092,7 @@ def test_collect_project_reports_an_unreadable_db_as_a_labelled_error(tmp_path):
     (root / 'data' / 'orchestrator' / 'runs.db').write_text('not a sqlite database')
     bundle = mlt.collect_project(root, CORPUS_LO_DT, CORPUS_HI_DT)
     assert bundle['error'] is not None
-    assert str(mlt.resolve_runs_db(root)) in bundle['error']
+    assert str(runs_db(root)) in bundle['error']
     assert bundle['sections'] == {}
 
 
@@ -2616,7 +2505,7 @@ def test_main_returns_nonzero_when_a_projects_db_is_unreadable(
     )
     assert code != 0
     # Loud on stderr, naming the path actually looked for...
-    assert str(mlt.resolve_runs_db(missing)) in err
+    assert str(runs_db(missing)) in err
     # ...and the healthy project's rows are still printed.
     assert 'median 2.0' in out
     assert str(root_a) in out
@@ -2657,19 +2546,19 @@ def test_main_rejects_a_malformed_window_loudly_without_a_traceback(capsys):
     assert out == ''
 
 
-def test_main_defaults_to_this_checkout_when_no_project_root_is_given(capsys):
-    # Read-only against the real store; asserts only the LABEL, never a number
-    # (runs.db is mutated continuously by the running orchestrator).
+def test_main_defaults_to_the_main_checkout_when_no_project_root_is_given(capsys):
+    # Read-only against the main checkout's store, window-bounded; asserts
+    # only the LABEL, never a number (runs.db is mutated continuously by the
+    # running orchestrator).
+    main_checkout = default_project_root()
     code, out, _ = _run(capsys, '--window', '2026-01-01..2026-01-02', '--json')
     payload = json.loads(out)
-    assert list(payload['projects']) == [str(mlt.DEFAULT_PROJECT_ROOT)]
-    # The exit code is derived rather than hardcoded: a task worktree carries
-    # no data/orchestrator/runs.db (only the main checkout does), so a bare
-    # `assert code == 0` would pass in one tree and fail in the other — the
-    # non-hermeticity this module's docstring forbids. Deriving it pins the
-    # contract in BOTH trees: readable store -> 0, unreadable -> 1.
-    has_store = mlt.resolve_runs_db(mlt.DEFAULT_PROJECT_ROOT).is_file()
+    assert list(payload['projects']) == [str(main_checkout)]
+    # The exit code is derived rather than hardcoded: a host whose main
+    # checkout has no data/orchestrator/runs.db (a fresh clone, a CI runner)
+    # must not fail where the live host passes — the non-hermeticity this
+    # module's docstring forbids. Deriving it pins the contract on BOTH:
+    # readable store -> 0, unreadable -> 1.
+    has_store = runs_db(main_checkout).is_file()
     assert code == (0 if has_store else 1)
-    assert (payload['projects'][str(mlt.DEFAULT_PROJECT_ROOT)]['error'] is None) is (
-        has_store
-    )
+    assert (payload['projects'][str(main_checkout)]['error'] is None) is has_store

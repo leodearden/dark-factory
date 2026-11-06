@@ -124,10 +124,11 @@ class TestIncumbents:
 
 def _arch_cfgs():
     from orchestrator.evals.configs import EvalConfig
+    from orchestrator.evals.metrics import RoleUnderTest
 
     return [
-        EvalConfig('architect-opus-high', 'claude', 'opus', 'high', role='architect'),
-        EvalConfig('architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect'),
+        EvalConfig('architect-opus-high', 'claude', 'opus', 'high', role=RoleUnderTest.ARCHITECT),
+        EvalConfig('architect-sonnet-high', 'claude', 'sonnet', 'high', role=RoleUnderTest.ARCHITECT),
     ]
 
 
@@ -182,15 +183,17 @@ class TestMatrixPairs:
 class TestSameFamily:
     def test_same_model_and_backend_is_true(self):
         from orchestrator.evals.configs import EvalConfig, same_family
+        from orchestrator.evals.metrics import RoleUnderTest
 
-        a = EvalConfig('architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect')
+        a = EvalConfig('architect-sonnet-high', 'claude', 'sonnet', 'high', role=RoleUnderTest.ARCHITECT)
         b = EvalConfig('claude-sonnet-max', 'claude', 'sonnet', 'max')
         assert same_family(a, b) is True
 
     def test_different_model_is_false(self):
         from orchestrator.evals.configs import EvalConfig, same_family
+        from orchestrator.evals.metrics import RoleUnderTest
 
-        a = EvalConfig('architect-opus-high', 'claude', 'opus', 'high', role='architect')
+        a = EvalConfig('architect-opus-high', 'claude', 'opus', 'high', role=RoleUnderTest.ARCHITECT)
         b = EvalConfig('claude-sonnet-max', 'claude', 'sonnet', 'max')
         assert same_family(a, b) is False
 

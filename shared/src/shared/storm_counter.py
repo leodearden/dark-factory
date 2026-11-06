@@ -14,9 +14,8 @@ Task 3689 PROMOTED it to ``shared`` when that fourth consumer arrived:
 ``shared.mcp_markup_middleware`` keys a burst by ``(project, policy_outcome)``,
 and ``shared`` is the base layer every other package imports, so it may not
 import ``fused_memory``. The old module is now a re-export shim naming this one
-as the single home; every existing importer (``server/markup_tripwire``,
-``services/memory_service``) and fused-memory's own test suite keep working
-unedited, which is what pins the shim honest.
+as the single home; fused-memory's own test suite keeps exercising the
+contract through that path, which is what pins the shim honest.
 
 Uses bulk_reset_guard's guard-side injectable-clock convention
 (``time_provider`` stored as ``self._now``) so a 3600s window can be tested by
@@ -43,15 +42,18 @@ stay restart-only. A consumer whose threshold comes from a green-tier config
 leaf (``mem0_update.storm_threshold``) must read it live on every call, or the
 leaf is restart-only in disguise — registered in ``RELOADABLE_FIELDS`` while
 silently ignoring reloads. Callers whose thresholds are module constants
-(``MarkupStormCounter``) simply pass their stored values through.
+simply pass their stored values through.
+
+KEYED REGISTRY — :class:`KeyedStormCounters` is the single home of "one
+counter per key, built lazily, dormant ones swept".
 """
 
 from __future__ import annotations
 
 import time
 from collections import deque
-from collections.abc import Callable
-from typing import Any, Literal, get_args
+from collections.abc import Callable, Hashable
+from typing import Any, Generic, Literal, TypeVar, get_args
 
 #: The accepted ``fire_mode`` spellings as a TYPE. The mode is structural and
 #: fixed by the call site (see the class docstring), which is exactly the case
@@ -70,6 +72,27 @@ FireMode = Literal['rate_limited', 'latched']
 FIRE_MODES: tuple[FireMode, ...] = get_args(FireMode)
 
 
+def _require_fire_mode(fire_mode: FireMode) -> FireMode:
+    """Return *fire_mode*, or raise if it is not one of :data:`FIRE_MODES`.
+
+    Kept despite the :data:`FireMode` annotation, which only closes the TYPED
+    call sites: a mode arriving as a dynamically-computed string (a
+    dict-splatted kwarg, a plain-script import) is still checked here. Every
+    constructor that takes a mode calls this, so a bad one fails at
+    construction even where counters are built lazily.
+    """
+    if fire_mode not in FIRE_MODES:
+        raise ValueError(
+            f'fire_mode={fire_mode!r} is not a StormCounter fire mode; '
+            f'accepted spellings are {", ".join(repr(m) for m in FIRE_MODES)}. '
+            'The mode is structural and fixed by the call site, so an '
+            'unrecognised spelling is a wiring bug: defaulting it would '
+            'silently degrade a latched consumer to per-window rate '
+            'limiting.'
+        )
+    return fire_mode
+
+
 class StormCounter:
     """Rolling-window burst detector over labelled events.
 
@@ -80,8 +103,7 @@ class StormCounter:
     two labels into a bare count would let the caller attribute the whole burst
     to whichever event happened to cross the threshold. Labels are opaque
     strings carrying no schema, so the same class serves per-``project_root``
-    keying (``MarkupStormCounter``) and per-``agent_id`` keying
-    (``MemoryService.update_memory``).
+    and per-``agent_id`` attribution alike.
 
     A counter built with ``count_distinct=True`` gains a SECOND, orthogonal
     dimension: the per-call ``key``. The threshold is then compared against the
@@ -141,24 +163,12 @@ class StormCounter:
         count_distinct: bool = False,
         fire_mode: FireMode = 'rate_limited',
     ) -> None:
-        # Kept despite the :data:`FireMode` annotation, which only closes the
-        # TYPED call sites: a mode arriving as a dynamically-computed string (a
-        # dict-splatted kwarg, a plain-script import) is still checked here.
-        if fire_mode not in FIRE_MODES:
-            raise ValueError(
-                f'fire_mode={fire_mode!r} is not a StormCounter fire mode; '
-                f'accepted spellings are {", ".join(repr(m) for m in FIRE_MODES)}. '
-                'The mode is structural and fixed by the call site, so an '
-                'unrecognised spelling is a wiring bug: defaulting it would '
-                'silently degrade a latched consumer to per-window rate '
-                'limiting.'
-            )
         self._now = time_provider
         self._count_distinct = count_distinct
         # Annotated, not inferred: pyright widens a literal to its base type
         # when inferring a mutable attribute, which would make this ``str`` and
         # silently drop the guarantee :data:`FireMode` exists to give.
-        self._fire_mode: FireMode = fire_mode
+        self._fire_mode: FireMode = _require_fire_mode(fire_mode)
         self._events: deque[tuple[float, str | None, str | None]] = deque()
         self._last_fire_ts: float | None = None
         self._latched: bool = False
@@ -338,9 +348,8 @@ class StormCounter:
         ``ValueError`` — see :meth:`observe`, which owns that guard.
 
         *now* is an optional PER-CALL clock override, as an epoch float. The
-        constructor-injected *time_provider* remains the default and is what
-        every consumer holding its counter for the process lifetime uses
-        (``MarkupStormCounter``, ``MemoryService``). ``now=`` exists for a
+        constructor-injected *time_provider* remains the default, for a
+        consumer holding one counter for the process lifetime. ``now=`` exists for a
         caller that already carries a per-call injected timestamp of its own:
         ``reconciliation/harness.py``'s three storm counters take
         ``now: datetime | None`` on every recording method (the
@@ -419,3 +428,102 @@ class StormCounter:
             # nothing to escalate them against, so they are simply not named.
             'labels': sorted({lbl for _, lbl, _ in self._events if lbl is not None}),
         }
+
+
+K = TypeVar('K', bound=Hashable)
+
+
+def _registry_counters_have_no_clock() -> float:
+    raise RuntimeError(
+        'a KeyedStormCounters counter tried to read a clock of its own; the '
+        'registry has none, so every record and sweep must pass now='
+    )
+
+
+class KeyedStormCounters(Generic[K]):
+    """One :class:`StormCounter` per key, built lazily; dormant ones swept.
+
+    One counter per key, because a label buys a burst ATTRIBUTION, never a
+    per-key THRESHOLD: a single counter's count spans every event in its
+    window, so pooling keys would fire an alarm naming a key that never burst.
+
+    Keys are caller-supplied and unbounded, so every *sweep_every* records the
+    counters of other keys whose :meth:`StormCounter.prune` returns ``0`` are
+    dropped. That is behaviour-preserving by ``prune``'s licence, and the key
+    just recorded is never swept.
+
+    The registry holds NO clock: every :meth:`record` names its instant. A
+    consumer's own injectable clock is then the only one it has, and a call
+    cannot silently fall back to a wall-clock default that ignores it. The
+    per-key counters are built with a clock that raises, so a call path inside
+    this class that forgot its instant fails loudly instead of reading time.
+
+    *threshold* and *window_seconds* are per :meth:`record` call (RELOAD
+    SAFETY, module docstring). *fire_mode* is structural and applies to every
+    counter. There is no ``count_distinct``: no keyed consumer needs one, and
+    adding it later is additive.
+    """
+
+    def __init__(
+        self,
+        *,
+        fire_mode: FireMode = 'rate_limited',
+        sweep_every: int = 1,
+    ) -> None:
+        if sweep_every < 1:
+            raise ValueError(
+                f'sweep_every={sweep_every!r} must be >= 1: it is how many '
+                'records pass between sweeps of dormant counters.'
+            )
+        self._fire_mode: FireMode = _require_fire_mode(fire_mode)
+        self._sweep_every = sweep_every
+        self._records_since_sweep = 0
+        self._counters: dict[K, StormCounter] = {}
+
+    @property
+    def fire_mode(self) -> FireMode:
+        """The FIRE POLICY every per-key counter is built with."""
+        return self._fire_mode
+
+    @property
+    def tracked_keys(self) -> frozenset[K]:
+        """The keys currently holding a counter; read-only by construction."""
+        return frozenset(self._counters)
+
+    def record(
+        self,
+        key: K,
+        *,
+        threshold: int,
+        window_seconds: float,
+        now: float,
+        label: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Record one event for *key* at *now*; return its storm summary iff it fired.
+
+        The summary is :meth:`StormCounter.record`'s, over *key*'s window only.
+        The sweep ages every other key against the same *now*.
+        """
+        counter = self._counters.get(key)
+        if counter is None:
+            counter = StormCounter(
+                time_provider=_registry_counters_have_no_clock,
+                fire_mode=self._fire_mode,
+            )
+            self._counters[key] = counter
+        summary = counter.record(
+            threshold=threshold,
+            window_seconds=window_seconds,
+            label=label,
+            now=now,
+        )
+        self._records_since_sweep += 1
+        if self._records_since_sweep >= self._sweep_every:
+            self._records_since_sweep = 0
+            self._sweep(key, window_seconds, now)
+        return summary
+
+    def _sweep(self, current: K, window_seconds: float, now: float) -> None:
+        for other, dormant in list(self._counters.items()):
+            if other != current and dormant.prune(window_seconds, now=now) == 0:
+                del self._counters[other]

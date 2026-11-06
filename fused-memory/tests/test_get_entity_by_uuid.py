@@ -12,6 +12,7 @@ import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _id_resolver_fakes import FakeGraphiti, FakeMem0, make_resolver
 
 from fused_memory.backends.graphiti_client import NodeNotFoundError
 from fused_memory.services.memory_service import MemoryService
@@ -140,3 +141,138 @@ class TestGetEntityByUuidTool:
         parsed = _parse_tool_result(result)
         assert 'error' in parsed
         assert parsed.get('error_type') == 'NodeNotFoundError'
+
+
+_NODE = 'bff81530-70e5-4ab6-939e-507299d1bcd2'
+_SIBLING = 'bff81530-0000-4000-8000-000000000002'
+
+
+class TestGetEntityByUuidPrefixArm:
+    """A uuid PREFIX given as entity_uuid (PRD C4, task 5323).
+
+    A prefix naming exactly one Entity node is read through to it; any other
+    prefix gets the same miss report / refusal vocabulary get_memory_by_id
+    uses. Full uuids and non-prefix ids keep the existing NodeNotFoundError
+    shape — that asymmetry is deliberate and pinned here.
+    """
+
+    @staticmethod
+    def _service(*, miss: bool = False) -> MagicMock:
+        svc = MagicMock()
+        if miss:
+            svc.get_entity_by_uuid = AsyncMock(side_effect=NodeNotFoundError('Entity node not found'))
+        else:
+            svc.get_entity_by_uuid = AsyncMock(
+                side_effect=lambda entity_uuid, project_id: {
+                    'uuid': entity_uuid, 'name': 'Resolver', 'summary': 's',
+                },
+            )
+        return svc
+
+    @staticmethod
+    async def _call(svc, resolver, entity_uuid: str) -> dict:
+        from fused_memory.server.tools import create_mcp_server
+
+        server = create_mcp_server(svc, id_resolver=resolver)
+        return _parse_tool_result(await server._tool_manager.call_tool(
+            'get_entity_by_uuid', {'entity_uuid': entity_uuid, 'project_id': 'reify'},
+        ))
+
+    @pytest.mark.asyncio
+    async def test_a_prefix_naming_one_node_reads_it_and_says_it_was_resolved(self):
+        svc = self._service()
+        resolver = make_resolver(graphiti=FakeGraphiti(nodes={_NODE: 'Resolver'}))
+
+        result = await self._call(svc, resolver, 'bff81530')
+
+        assert result == {'uuid': _NODE, 'name': 'Resolver', 'summary': 's', 'resolved_from_prefix': 'bff81530'}
+        svc.get_entity_by_uuid.assert_awaited_once_with(entity_uuid=_NODE, project_id='reify')
+
+    @pytest.mark.asyncio
+    async def test_a_node_deleted_between_resolution_and_read_still_says_it_was_resolved(self):
+        svc = self._service(miss=True)
+        resolver = make_resolver(graphiti=FakeGraphiti(nodes={_NODE: 'Resolver'}))
+
+        result = await self._call(svc, resolver, 'bff81530')
+
+        assert result == {
+            'error': 'Entity node not found',
+            'error_type': 'NodeNotFoundError',
+            'entity_uuid': _NODE,
+            'resolved_from_prefix': 'bff81530',
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_prefix_with_no_live_match_is_a_miss_report(self):
+        svc = self._service()
+
+        result = await self._call(svc, make_resolver(), 'bff81530')
+
+        assert result['hint']
+        assert {k: v for k, v in result.items() if k != 'hint'} == {
+            'found': False,
+            'prefix_checked': True,
+            'prefix': 'bff81530',
+            'project_id': 'reify',
+            'namespaces': {'mem0': [], 'mem0_tombstone': [], 'graphiti_node': [], 'graphiti_edge': []},
+        }
+        svc.get_entity_by_uuid.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_prefix_naming_a_live_memory_reports_it_rather_than_claiming_no_id(self):
+        svc = self._service()
+        resolver = make_resolver(mem0=FakeMem0({_NODE: {'data': 'a memory'}}))
+
+        result = await self._call(svc, resolver, 'bff81530')
+
+        assert result['found'] is False
+        assert result['prefix_checked'] is True
+        assert result['namespaces']['mem0'] == [{'id': _NODE, 'preview': 'a memory'}]
+        svc.get_entity_by_uuid.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_ambiguous_prefix_is_refused_with_its_candidates(self):
+        svc = self._service()
+        resolver = make_resolver(graphiti=FakeGraphiti(nodes={_NODE: 'a'}, edges={_SIBLING: 'b'}))
+
+        result = await self._call(svc, resolver, 'bff81530')
+
+        assert result['error_type'] == 'ambiguous_uuid_prefix'
+        assert result['candidates'] == [
+            {'namespace': 'graphiti_node', 'id': _NODE, 'preview': 'a'},
+            {'namespace': 'graphiti_edge', 'id': _SIBLING, 'preview': 'b'},
+        ]
+        assert 'found' not in result
+        svc.get_entity_by_uuid.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_store_is_unavailable(self):
+        svc = self._service()
+        resolver = make_resolver(mem0=FakeMem0(scroll_error=ConnectionError('qdrant down')))
+
+        result = await self._call(svc, resolver, 'bff81530')
+
+        assert result['error_type'] == 'resolver_unavailable'
+        assert result['store'] == 'mem0'
+        assert result['prefix_checked'] is False
+        assert 'found' not in result
+
+    @pytest.mark.asyncio
+    async def test_a_full_uuid_miss_keeps_the_node_not_found_shape_without_resolving(self):
+        svc = self._service(miss=True)
+        mem0 = FakeMem0({_NODE: {'data': 'a memory'}})
+
+        result = await self._call(svc, make_resolver(mem0=mem0), _NODE)
+
+        assert result == {'error': 'Entity node not found', 'error_type': 'NodeNotFoundError'}
+        assert mem0.scroll_calls == []
+
+    @pytest.mark.asyncio
+    async def test_a_non_prefix_id_goes_straight_to_the_service(self):
+        svc = self._service()
+        mem0 = FakeMem0()
+
+        await self._call(svc, make_resolver(mem0=mem0), 'node-x')
+
+        svc.get_entity_by_uuid.assert_awaited_once_with(entity_uuid='node-x', project_id='reify')
+        assert mem0.scroll_calls == []

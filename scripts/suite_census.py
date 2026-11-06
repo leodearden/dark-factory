@@ -21,9 +21,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 
+import _checkout as _checkout
 import suite_census_pinning
 import suite_census_rust
-from merge_lane_metrics import MetricsError
+from source_measures import MetricsError
 from suite_census_evidence import nextest_evidence, pytest_evidence
 from suite_census_outcomes import Evidence, OutcomeCensus, census_outcomes
 from suite_census_outcomes import render_markdown as render_outcomes

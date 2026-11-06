@@ -98,7 +98,7 @@ REFUSAL_CEILING = 7200
 # The constant this census feeds, named in the report so an operator running it
 # knows where the number lands.
 FEEDS_CONSTANT = (
-    'tests/scripts/test_module_verify_budgets.py::ORCHESTRATOR_BUDGET_CENSUS'
+    'tests/scripts/verify_budget_census_records.py::ORCHESTRATOR_BUDGET_CENSUS'
 )
 
 

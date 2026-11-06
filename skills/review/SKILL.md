@@ -114,7 +114,7 @@ Is the codebase internally consistent, complete, and cheap to change? Detail: `r
 
 0. Compute the changed scope (incremental) and re-verify the carry set (both modes).
 1. Project `/audit`, when the project ships one.
-1.5. Read the inputs: latest hotspot and `/review-all` reports, and the confusion codebook (§9).
+1.5. Read the inputs: latest hotspot and `/review-all` reports, the confusion codebook (§9), and the latest committed metrics snapshot — the newest `plans/quality-metrics/*.json` by commit (`git log -1 --diff-filter=A --name-only --format= -- plans/quality-metrics/`), rendered with `scripts/quality_metrics_snapshot.py --summary`. The snapshot is context for choosing Step 4's modules, never a ranking (contract §10).
 2. Stub and placeholder audit.
 3. Critical-path tracing (requires briefing).
 4. Deep read of high-risk modules, including the heuristic look-fors.
@@ -186,9 +186,13 @@ Next run: {chain form and task ids}
 | tasks | mechanical findings, acceptances, the trigger chain — all through fused-memory MCP with `metadata.source: "review"` |
 | fused-memory | review summary and pattern observations |
 
+### Report home
+
+`review/reports/` is tracked, and its only reports are `<run_id>.json` and `<run_id>.md` (contract §5). Files there from the retired three-file format, `phase[12]-*.json` and `summary-*.md`, carry no `as_of_sha` and are not reports. No step reads them: `since` comes only from committed `review-*.json` ("Pin the run" step 5). A project may keep exactly those two globs gitignored, as dark-factory's root `.gitignore` does. Nothing else in the home is ever ignored: if `git add` refuses a record path as ignored, the project's rule is too broad (a wholesale `review/reports/` or `review/`, still present in some projects), so narrow it to those two globs and commit that `.gitignore` change with the report.
+
 ### Committing the report
 
-After the last phase run, write both files under `<project_root>/review/reports/` and commit only them to main by the project's direct-commit rule (in dark-factory: `git add` the two paths, then `git commit --only` them, never while a merge verify is in flight — `CLAUDE.md` §"Working in the main checkout"). A project that forbids direct commits gets them through `/merge-queue`. An uncommitted report is invisible to the next run's `since`. Then `git worktree remove` the pinned tree.
+After the last phase run, write both files under `<project_root>/review/reports/` and commit only them (plus the `.gitignore` narrowed per "Report home", if one was needed) to main by the project's direct-commit rule (in dark-factory: `git add` the two paths, then `git commit --only` them, never while a merge verify is in flight — `CLAUDE.md` §"Working in the main checkout"). A project that forbids direct commits gets them through `/merge-queue`. An uncommitted report is invisible to the next run's `since`. Then `git worktree remove` the pinned tree.
 
 ## Graceful degradation
 
@@ -196,7 +200,7 @@ After the last phase run, write both files under `<project_root>/review/reports/
 |---------|-----------|
 | Review briefing | Warn, suggest `/review-briefing`, skip smoke and path tracing |
 | Prior committed report | `mode: full`, `since: none` |
-| Task store unreachable (MCP and read-only sqlite) | Report only; file nothing, say so (§8) |
+| Task store unreachable (`find_tasks_by_metadata` errors or is unreachable) | Report only; file nothing, say so (§8) |
 | fused-memory MCP down | No memory context, no filing; report says so |
 | Test suite / lint / typecheck config | Skip that command, note it in `phase1` |
 | `$QUALITY_DOC` (no `docs/code-quality.md` and no `guidance()` render) | Stop Phase 2: judging without the definition is not this skill |
@@ -209,11 +213,11 @@ After the last phase run:
 
 ```
 add_memory(
-  content="Review {run_id} for {scope} at {as_of_sha:10}: {n} findings ({high} high), {filed} filed, {structural} for deliberation, {fixed} fixed since {since:10}. Key concerns: {list}.",
+  content="Review {run_id} for {scope} at {as_of_sha:10}: {n} findings ({high} high), {filed} filed, {structural} for deliberation, {fixed} fixed since {since:10}. Key concerns: {list}. Next run gated by task 3127.",
   category="observations_and_summaries",
   project_id="<project_id>",
   agent_id="claude-review",
-  entities=[]
+  entities=[{'kind': 'task', 'id': 3127}]  # replace 3127 with the human gate of the chain this run filed (contract §11), here and in content; if it filed none, as under --findings-only, use [] and drop the gate sentence from content
 )
 ```
 

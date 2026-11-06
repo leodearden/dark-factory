@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import json
 import logging
 from pathlib import Path
@@ -14,8 +15,12 @@ from _orch_helpers import make_mock_gate as _make_gate  # centralized factory (t
 from escalation import archive
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
+from shared.cli_invoke import AllAccountsCappedException
+from shared.testing_resume_rejection import measured_resume_rejection
 from shared.usage_gate import AccountLease, InvokeSlot
 
+from orchestrator.artifacts import TaskArtifacts
+from orchestrator.event_store import EventType
 from orchestrator.steward import (
     StewardMetrics,
     TaskSteward,
@@ -38,7 +43,6 @@ def _sole_invocation_end_data(emit_mock) -> dict:
     no longer holds. Filter to the ``invocation_end`` call (asserting it fired
     exactly once) rather than relaxing to the last-call heuristic.
     """
-    from orchestrator.event_store import EventType
     calls = [
         c for c in emit_mock.call_args_list
         if c.args and c.args[0] == EventType.invocation_end
@@ -63,7 +67,7 @@ def _attach_invoke_slot(gate: MagicMock) -> MagicMock:
     ``gate.release_probe_slot`` on the mock.
     """
     @contextlib.asynccontextmanager
-    async def _cm(scope=None, *, park=True):
+    async def _cm(scope=None, *, park=True, max_wait_secs=None):
         token = await gate.before_invoke()
         # gate.before_invoke() is mocked to return a bare token (task W4-δ
         # changed the real UsageGate.before_invoke to return an AccountLease
@@ -162,6 +166,20 @@ def _make_result(
         timed_out=timed_out,
         subtype=subtype,
         ended_awaiting_background=ended_awaiting_background,
+    )
+
+
+def _make_capped_result(session_id='sess-capped', cost=1.0):
+    from shared.cap_markers import REAL_CLI_CAP_HIT_MESSAGES
+    from shared.cli_invoke import AgentResult
+    return AgentResult(
+        success=False,
+        output='',
+        stderr=REAL_CLI_CAP_HIT_MESSAGES[0],
+        cost_usd=cost,
+        duration_ms=5000,
+        turns=1,
+        session_id=session_id,
     )
 
 
@@ -458,9 +476,11 @@ class TestStewardInvokeWithCapRetryWiring:
     async def test_rebuild_prompt_hook_regathers_pending_and_rebuilds_initial(
         self, steward, worktree, mock_mcp, mock_briefing,
     ):
-        """The rebuild_prompt closure re-queries pending escalations and calls
-        build_steward_initial_prompt with the freshly-gathered list."""
-        esc = _make_escalation()
+        """The rebuild_prompt closure re-reads the live record, re-queries pending
+        escalations and calls build_steward_initial_prompt with both."""
+        live = _make_escalation(detail='as filed')
+        esc = dataclasses.replace(live, detail='pre-triaged', summary='triaged summary')
+        steward.escalation_queue.get.return_value = live
         mcp_config = mock_mcp.mcp_config_json()
         fresh_pending = [_make_escalation(id='esc-42-9')]
         steward.escalation_queue.get_by_task.return_value = fresh_pending
@@ -478,14 +498,15 @@ class TestStewardInvokeWithCapRetryWiring:
             )
 
         rebuild_prompt = mock_iwcr.call_args.kwargs['rebuild_prompt']
-        result = await rebuild_prompt(True)
+        result = await rebuild_prompt()
 
+        steward.escalation_queue.get.assert_called_with(esc.id)
         steward.escalation_queue.get_by_task.assert_called_with(
             steward.task_id, status='pending',
         )
         mock_briefing.build_steward_initial_prompt.assert_called_once_with(
             task=steward.task,
-            escalation=esc.to_dict(),
+            escalation={**live.to_dict(), 'detail': esc.detail, 'summary': esc.summary},
             pending_escalations=[e.to_dict() for e in fresh_pending],
             worktree=steward.worktree,
         )
@@ -580,6 +601,8 @@ class TestStewardWedgeGuardInheritance:
         steward._session_id = 'sess-wedged'
         steward.usage_gate = _make_pre_triage_gate()
         mock_briefing.build_steward_initial_prompt.return_value = 'REBUILT-INITIAL'
+        esc = _make_escalation()
+        steward.escalation_queue.get.return_value = esc  # still pending: the retry proceeds
 
         wedge_result = _make_result(
             success=False, cost=0, turns=0, duration_ms=1_800_000,
@@ -599,7 +622,7 @@ class TestStewardWedgeGuardInheritance:
                 cwd=worktree,
                 mcp_config={},
                 per_invocation_budget=5.0,
-                escalation=_make_escalation(),
+                escalation=esc,
             )
 
         assert mock_invoke.call_count == 2
@@ -611,6 +634,118 @@ class TestStewardWedgeGuardInheritance:
         # session (reviewer_comprehensive: robustness_context_loss).
         assert second_call.kwargs.get('prompt') == 'REBUILT-INITIAL'
         assert result is success_result
+
+
+@pytest.mark.asyncio
+class TestStewardResumeRejectionOnly:
+    """Task 5579 at the steward: only a CLI-rejected resume replaces the session.
+
+    A resumed run that did work is returned and its session kept; a proven
+    rejection is retried fresh, and the replacement is reported as a
+    ``session_resume_failed(stage='cli', role='steward')`` row.
+    """
+
+    @staticmethod
+    def _resume_failed_emits(steward) -> list:
+        return [
+            c.kwargs for c in steward.event_store.emit.call_args_list
+            if c.args and c.args[0] is EventType.session_resume_failed
+        ]
+
+    async def _invoke(self, steward, worktree, side_effect, *, gate=None):
+        steward.usage_gate = gate or _make_pre_triage_gate()
+        steward.event_store = MagicMock(run_id='run-5579')
+        esc = _make_escalation()
+        steward.escalation_queue.get.return_value = esc
+        with (
+            patch(
+                'orchestrator.steward.invoke_agent', new_callable=AsyncMock,
+                side_effect=side_effect,
+            ) as mock_invoke,
+            patch('asyncio.sleep', new_callable=AsyncMock),
+        ):
+            result = await steward._invoke_with_session(
+                prompt='handle this escalation', cwd=worktree, mcp_config={},
+                per_invocation_budget=5.0, escalation=esc,
+            )
+        return result, mock_invoke
+
+    async def test_a_completed_resumed_run_is_kept(self, steward, worktree):
+        steward._session_id = 'sess-old'
+        downgraded = _make_result(
+            success=False, subtype='success', ended_awaiting_background=True,
+            turns=40, cost=2.195, session_id='sess-old',
+        )
+
+        result, mock_invoke = await self._invoke(steward, worktree, [downgraded])
+
+        mock_invoke.assert_awaited_once()
+        assert mock_invoke.await_args_list[0].kwargs['resume_session_id'] == 'sess-old'
+        assert result is downgraded
+        assert steward._session_id == 'sess-old'
+        assert self._resume_failed_emits(steward) == []
+
+    async def test_a_budget_kill_is_surfaced_not_rerun(self, steward, worktree):
+        steward._session_id = 'sess-old'
+        budget_kill = _make_result(
+            success=False, subtype='error_max_budget_usd', turns=1, cost=4.96,
+            session_id='sess-old',
+        )
+
+        result, mock_invoke = await self._invoke(steward, worktree, [budget_kill])
+
+        mock_invoke.assert_awaited_once()
+        assert result is budget_kill
+        assert result.cost_usd == 4.96
+        assert steward._session_id == 'sess-old'
+        assert self._resume_failed_emits(steward) == []
+
+    async def test_a_proven_rejection_is_reported_and_replaces_the_session(
+        self, steward, worktree, mock_briefing, caplog,
+    ):
+        steward._session_id = 'sess-old'
+        mock_briefing.build_steward_initial_prompt.return_value = 'REBUILT-INITIAL'
+        caplog.set_level(logging.WARNING, logger='orchestrator.steward')
+
+        result, mock_invoke = await self._invoke(
+            steward, worktree,
+            [measured_resume_rejection('sess-old'), _make_result(session_id='sess-fresh')],
+        )
+
+        assert mock_invoke.await_count == 2
+        assert 'resume_session_id' not in mock_invoke.await_args_list[1].kwargs
+        assert steward._session_id == 'sess-fresh'
+        assert self._resume_failed_emits(steward) == [{
+            'task_id': steward.task_id,
+            'data': {
+                'stage': 'cli', 'session_id': 'sess-old', 'session_ids': ['sess-old'],
+                'role': 'steward', 'fallbacks': 1,
+            },
+        }]
+        assert any(
+            r.levelno == logging.WARNING
+            and 'sess-old' in r.getMessage() and 'sess-fresh' in r.getMessage()
+            for r in caplog.records
+        )
+        assert result.session_id == 'sess-fresh'
+
+    async def test_a_loop_rearmed_rejection_is_not_reported(self, steward, worktree, mock_briefing):
+        steward._session_id = None
+        mock_briefing.build_steward_initial_prompt.return_value = 'REBUILT-INITIAL'
+
+        _result, mock_invoke = await self._invoke(
+            steward, worktree,
+            [
+                _make_capped_result(session_id='sess-capped'),
+                measured_resume_rejection('sess-capped'),
+                _make_result(session_id='sess-fresh'),
+            ],
+            gate=_make_pre_triage_gate(cap_effects=[True, False, False]),
+        )
+
+        assert mock_invoke.await_count == 3
+        assert mock_invoke.await_args_list[1].kwargs['resume_session_id'] == 'sess-capped'
+        assert self._resume_failed_emits(steward) == []
 
 
 # ---------------------------------------------------------------------------
@@ -636,9 +771,9 @@ class TestStewardCapHitBackoff:
         from shared.cli_invoke import _CAP_HIT_COOLDOWN_SECS
 
         esc = _make_escalation()
-        steward.escalation_queue.get.return_value = _make_escalation(
-            status='resolved', resolution='fixed',
-        )
+        # Still pending while the cap retry runs: a resolved record would
+        # (correctly) make the steward's prompt builder decline the retry.
+        steward.escalation_queue.get.return_value = esc
 
         steward.usage_gate = _make_pre_triage_gate(cap_effects=[True, False])
 
@@ -646,7 +781,10 @@ class TestStewardCapHitBackoff:
             patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke,
             patch('asyncio.sleep', new_callable=AsyncMock) as mock_sleep,
         ):
-            mock_invoke.return_value = _make_result(session_id='sess-new')
+            mock_invoke.side_effect = [
+                _make_capped_result(),
+                _make_result(session_id='sess-new'),
+            ]
             await steward._handle_escalation(esc)
 
             # Value-level check on the single cap hit's cooldown (first cycle,
@@ -677,16 +815,20 @@ class TestStewardCapHitBackoff:
         it as an invocation count.
         """
         esc = _make_escalation()
-        steward.escalation_queue.get.return_value = _make_escalation(
-            status='resolved', resolution='fixed',
-        )
+        # Still pending while the cap retries run: a resolved record would
+        # (correctly) make the steward's prompt builder decline the retry.
+        steward.escalation_queue.get.return_value = esc
         steward.usage_gate = _make_pre_triage_gate(cap_effects=[True, True, False])
 
         with (
             patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke,
             patch('asyncio.sleep', new_callable=AsyncMock),
         ):
-            mock_invoke.return_value = _make_result(session_id='sess-new')
+            mock_invoke.side_effect = [
+                _make_capped_result(),
+                _make_capped_result(),
+                _make_result(session_id='sess-new'),
+            ]
             await steward._handle_escalation(esc)
 
         assert mock_invoke.call_count == 3, (
@@ -709,9 +851,9 @@ class TestStewardCapHitBackoff:
         # Set an existing session so _handle_escalation takes the continuation path
         steward._session_id = 'sess-existing'
         esc = _make_escalation()
-        steward.escalation_queue.get.return_value = _make_escalation(
-            status='resolved', resolution='fixed',
-        )
+        # Still pending while the cap retry runs: a resolved record would
+        # (correctly) make the steward's prompt builder decline the retry.
+        steward.escalation_queue.get.return_value = esc
 
         steward.usage_gate = _make_pre_triage_gate(cap_effects=[True, False])
 
@@ -719,21 +861,27 @@ class TestStewardCapHitBackoff:
             patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke,
             patch('asyncio.sleep', new_callable=AsyncMock),
         ):
-            mock_invoke.return_value = _make_result(session_id='sess-capped')
+            mock_invoke.side_effect = [
+                _make_capped_result(session_id='sess-capped'),
+                _make_result(session_id='sess-new'),
+            ]
             await steward._handle_escalation(esc)
 
             # Second call should resume with the capped session
             second_call = mock_invoke.call_args_list[1]
             assert second_call.kwargs.get('resume_session_id') == 'sess-capped'
-            # Briefing should NOT have been rebuilt (was continuation, not initial)
-            mock_briefing.build_steward_initial_prompt.assert_not_called()
+            # The builder is consulted before the resumed retry (so a finished
+            # escalation could cancel it), but the resumed session is NOT sent
+            # its rebuilt initial briefing.
+            from shared.cli_invoke import CAP_HIT_RESUME_PROMPT
+            assert second_call.kwargs.get('prompt') == CAP_HIT_RESUME_PROMPT
 
     async def test_rebuilds_prompt_only_when_no_session(self, steward, mock_briefing):
         """Cap hit with empty session_id → full prompt rebuild in _invoke_with_session."""
         esc = _make_escalation()
-        steward.escalation_queue.get.return_value = _make_escalation(
-            status='resolved', resolution='fixed',
-        )
+        # Still pending while the cap retry runs: a resolved record would
+        # (correctly) make the steward's prompt builder decline the retry.
+        steward.escalation_queue.get.return_value = esc
 
         steward.usage_gate = _make_pre_triage_gate(cap_effects=[True, False])
 
@@ -743,7 +891,7 @@ class TestStewardCapHitBackoff:
         ):
             # First call: cap hit with no session_id
             mock_invoke.side_effect = [
-                _make_result(session_id=''),
+                _make_capped_result(session_id=''),
                 _make_result(session_id='sess-new'),
             ]
             await steward._handle_escalation(esc)
@@ -830,13 +978,17 @@ class TestStewardAccountName:
         ))
 
         esc = _make_escalation()
+        steward.escalation_queue.get.return_value = esc  # still pending: the retry proceeds
         mcp_config = mock_mcp.mcp_config_json()
 
         with (
             patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke,
             patch('asyncio.sleep', new_callable=AsyncMock),
         ):
-            mock_invoke.return_value = _make_result(session_id='sess-new')
+            mock_invoke.side_effect = [
+                _make_capped_result(),
+                _make_result(session_id='sess-new'),
+            ]
             result = await steward._invoke_with_session(
                 prompt='test prompt',
                 cwd=worktree,
@@ -1047,18 +1199,23 @@ class TestStewardTimeoutPassthrough:
         mock_config.timeouts.steward = 900.0
 
         steward.usage_gate = _make_pre_triage_gate(cap_effects=[True, False])
+        esc = _make_escalation()
+        steward.escalation_queue.get.return_value = esc  # still pending: the retry proceeds
 
         with (
             patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke,
             patch('asyncio.sleep', new_callable=AsyncMock),
         ):
-            mock_invoke.return_value = _make_result(session_id='sess-t')
+            mock_invoke.side_effect = [
+                _make_capped_result(),
+                _make_result(session_id='sess-t'),
+            ]
             await steward._invoke_with_session(
                 prompt='do work',
                 cwd=steward.worktree,
                 mcp_config={},
                 per_invocation_budget=5.0,
-                escalation=_make_escalation(),
+                escalation=esc,
             )
 
         assert mock_invoke.call_count == 2
@@ -2053,43 +2210,34 @@ class TestNextEscalation:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestStewardDefaultConfig:
 
-    def test_default_steward_max_attempts_is_one(self, monkeypatch, tmp_path):
+    def test_default_steward_max_attempts_is_one(self):
         """steward_max_attempts default must be 1 (the renamed field)."""
         from orchestrator.config import OrchestratorConfig
 
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = OrchestratorConfig()
         assert config.steward_max_attempts == 1
 
-    def test_default_steward_wall_clock_timeout_is_1800(self, monkeypatch, tmp_path):
+    def test_default_steward_wall_clock_timeout_is_1800(self):
         """timeouts.steward default must be 1800s (per-invocation wall-clock)."""
         from orchestrator.config import OrchestratorConfig
 
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = OrchestratorConfig()
         assert config.timeouts.steward == 1800.0
 
-    def test_default_steward_max_timeouts_per_escalation_is_3(
-        self, monkeypatch, tmp_path,
-    ):
+    def test_default_steward_max_timeouts_per_escalation_is_3(self):
         """steward_max_timeouts_per_escalation default must be 3."""
         from orchestrator.config import OrchestratorConfig
 
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = OrchestratorConfig()
         assert config.steward_max_timeouts_per_escalation == 3
 
-    def test_timeout_cap_default_respects_policy_window(self, monkeypatch, tmp_path):
+    def test_timeout_cap_default_respects_policy_window(self):
         """Default steward_max_timeouts_per_escalation must be in the policy range [2, 5]."""
         from orchestrator.config import OrchestratorConfig
 
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = OrchestratorConfig()
         assert 2 <= config.steward_max_timeouts_per_escalation <= 5
 
@@ -2200,7 +2348,7 @@ class TestPreTriageUsageGateCleanup:
 
         TRIAGE is the REAL AgentRole (imported before the module is replaced)
         so role.name/system_prompt/allowed_tools stay genuine — steward.py's
-        _inject_verdict_tools_mcp(None, self.worktree, TRIAGE) call reads
+        _inject_verdict_tools_mcp(..., self.worktree, TRIAGE, task_root=...) call reads
         role.name for real, and a MagicMock stand-in would smuggle a Mock
         object into the --verdict-role subprocess arg. extract_triage_verdict
         is stubbed to always succeed, standing in for parse_triage_result's
@@ -2276,11 +2424,14 @@ class TestPreTriageUsageGateCleanup:
         """
         gate = _make_pre_triage_gate(cap_effects=[True, False])
         steward.usage_gate = gate
-        mock_result = _make_result(cost=0.3, session_id='sess-triage')
 
         with (
             patch('orchestrator.steward.invoke_agent',
-                  new_callable=AsyncMock, return_value=mock_result) as mock_invoke,
+                  new_callable=AsyncMock,
+                  side_effect=[
+                      _make_capped_result(),
+                      _make_result(cost=0.3, session_id='sess-triage'),
+                  ]) as mock_invoke,
             patch('asyncio.sleep', new_callable=AsyncMock),
         ):
             await steward._pre_triage_suggestions(self._esc())
@@ -2298,7 +2449,7 @@ class TestPreTriageUsageGateCleanup:
         gate = _make_pre_triage_gate(cap_effects=[True, False])
         steward.usage_gate = gate
 
-        cap_result = _make_result(cost=0.1, session_id='sess-cap')
+        cap_result = _make_capped_result(session_id='sess-cap', cost=0.1)
         success_result = _make_result(cost=0.3, session_id='sess-resumed')
 
         with (
@@ -2439,7 +2590,7 @@ class TestPreTriageSuggestionsPath:
 
         TRIAGE is the REAL AgentRole (imported before the module is replaced)
         so role.name/system_prompt/allowed_tools stay genuine — steward.py's
-        _inject_verdict_tools_mcp(None, self.worktree, TRIAGE) call reads
+        _inject_verdict_tools_mcp(..., self.worktree, TRIAGE, task_root=...) call reads
         role.name for real, and a MagicMock stand-in would smuggle a Mock
         object into the --verdict-role subprocess arg. extract_triage_verdict
         is stubbed to always succeed, standing in for parse_triage_result's
@@ -2609,8 +2760,33 @@ class TestPreTriageSuggestionsPath:
         assert 'verdict-tools' in call_kwargs['mcp_config']['mcpServers']
         assert 'output_schema' not in call_kwargs
 
-    async def test_pre_triage_uses_project_root_as_cwd(self, steward):
-        """_pre_triage_suggestions passes config.project_root (not worktree) as cwd."""
+    async def test_pre_triage_verdict_round_trips_through_the_task_root(
+        self, steward, _mock_triage,
+    ):
+        """Task 3155: verdict-tools is launched on the task root, and the
+        triage verdict consumed is the one there, never a lane-root decoy."""
+        artifacts = TaskArtifacts.for_task(steward.worktree, steward.task_id)
+
+        def _submit_triage(**_kwargs):
+            for root, accepted in ((artifacts.lane_root, 'decoy'), (artifacts.task_root, 'real')):
+                (root / 'verdicts').mkdir(parents=True, exist_ok=True)
+                (root / 'verdicts' / 'triage.json').write_text(
+                    json.dumps({'verdict': {'accepted': accepted}}),
+                )
+            return _make_result()
+
+        with patch('orchestrator.steward.invoke_agent',
+                   new_callable=AsyncMock, side_effect=_submit_triage) as mock_invoke:
+            await steward._pre_triage_suggestions(self._esc_with_suggestions(12))
+
+        args = mock_invoke.call_args.kwargs['mcp_config']['mcpServers']['verdict-tools']['args']
+        assert args[args.index('--task-root') + 1] == str(artifacts.task_root)
+        _mock_triage.extract_triage_verdict.assert_called_once_with(
+            {'verdict': {'accepted': 'real'}},
+        )
+
+    async def test_pre_triage_uses_worktree_as_cwd(self, steward):
+        """_pre_triage_suggestions runs in the task worktree, never the main checkout."""
         esc = self._esc_with_suggestions(12)
         # Patches invoke_agent at definition site — invoke_with_cap_retry delegates to it
         # via module-level reference, so patching here intercepts calls through the wrapper.
@@ -2619,8 +2795,130 @@ class TestPreTriageSuggestionsPath:
             await steward._pre_triage_suggestions(esc)
 
         call_kwargs = mock_invoke.call_args.kwargs
-        assert call_kwargs['cwd'] == steward.config.project_root
-        assert call_kwargs['cwd'] != steward.worktree
+        assert call_kwargs['cwd'] == steward.worktree
+        assert call_kwargs['cwd'] != steward.config.project_root
+
+    @pytest.mark.parametrize('spent', [11.5, 10.0])
+    async def test_pre_triage_skipped_unless_remaining_exceeds_triage_budget(
+        self, steward, mock_config, spent,
+    ):
+        """Remaining at or below the triage budget falls back without invoking."""
+        mock_config.steward_lifetime_budget = 12.0
+        mock_config.budgets.triage = 2.0
+        steward.metrics.total_cost_usd = spent
+        esc = self._esc_with_suggestions(12)
+
+        with patch('orchestrator.steward.invoke_agent',
+                   new_callable=AsyncMock, return_value=_make_result()) as mock_invoke:
+            result = await steward._pre_triage_suggestions(esc)
+
+        mock_invoke.assert_not_called()
+        assert result is esc
+        assert steward.metrics.total_cost_usd == pytest.approx(spent)
+
+    async def test_pre_triage_invoked_with_resolved_budget_when_remaining_exceeds_it(
+        self, steward, mock_config,
+    ):
+        mock_config.steward_lifetime_budget = 12.0
+        mock_config.budgets.triage = 2.0
+        steward.metrics.total_cost_usd = 9.5
+        esc = self._esc_with_suggestions(12)
+
+        with patch('orchestrator.steward.invoke_agent',
+                   new_callable=AsyncMock, return_value=_make_result()) as mock_invoke:
+            await steward._pre_triage_suggestions(esc)
+
+        mock_invoke.assert_called_once()
+        assert mock_invoke.call_args.kwargs['max_budget_usd'] == 2.0
+
+    async def test_main_invocation_budget_positive_after_near_exhausted_skip(
+        self, steward, mock_config,
+    ):
+        """Skipped triage leaves the main --max-budget-usd at the positive remainder."""
+        mock_config.steward_lifetime_budget = 12.0
+        mock_config.budgets.steward = 5.0
+        steward.metrics.total_cost_usd = 11.5
+        esc = self._esc_with_suggestions(12)
+        steward.escalation_queue.get.return_value = _make_escalation(
+            status='resolved', resolution='fixed',
+        )
+
+        with patch('orchestrator.steward.invoke_agent',
+                   new_callable=AsyncMock, return_value=_make_result()) as mock_invoke:
+            await steward._handle_escalation(esc)
+
+        mock_invoke.assert_called_once()
+        assert mock_invoke.call_args.kwargs['max_budget_usd'] == pytest.approx(0.5)
+
+    async def test_triage_overshooting_its_budget_gives_up_before_main_invocation(
+        self, steward, mock_config,
+    ):
+        """A triage that spends past the lifetime budget leaves nothing to invoke."""
+        mock_config.steward_lifetime_budget = 12.0
+        mock_config.budgets.triage = 2.0
+        steward.metrics.total_cost_usd = 9.5
+        esc = self._esc_with_suggestions(12)
+
+        with patch('orchestrator.steward.invoke_agent',
+                   new_callable=AsyncMock, return_value=_make_result(cost=3.0)) as mock_invoke:
+            await steward._handle_escalation(esc)
+
+        assert mock_invoke.call_count == 1
+        steward.escalation_queue.submit.assert_called_once()
+        submitted = steward.escalation_queue.submit.call_args[0][0]
+        assert submitted.level == 1
+        assert 'budget exhausted' in submitted.summary.lower()
+
+    async def test_second_handle_of_same_escalation_does_not_retriage(self, steward):
+        """Re-handling the same L0 reuses the cached pre-triage outcome."""
+        esc = self._esc_with_suggestions(12)
+        with patch('orchestrator.steward.invoke_agent',
+                   new_callable=AsyncMock, return_value=_make_result()) as mock_invoke:
+            first = await steward._pre_triage_suggestions(esc)
+            second = await steward._pre_triage_suggestions(esc)
+
+        assert mock_invoke.call_count == 1
+        assert second is first
+
+    async def test_triage_without_verdict_is_not_rerun(self, steward, _mock_triage):
+        _mock_triage.extract_triage_verdict.return_value = None
+        esc = self._esc_with_suggestions(12)
+        with patch('orchestrator.steward.invoke_agent',
+                   new_callable=AsyncMock, return_value=_make_result()) as mock_invoke:
+            first = await steward._pre_triage_suggestions(esc)
+            second = await steward._pre_triage_suggestions(esc)
+
+        assert mock_invoke.call_count == 1
+        assert first is esc
+        assert second is esc
+
+    async def test_budget_skip_is_retried_once_budget_allows(self, steward, mock_config):
+        mock_config.steward_lifetime_budget = 12.0
+        mock_config.budgets.triage = 2.0
+        steward.metrics.total_cost_usd = 11.5
+        esc = self._esc_with_suggestions(12)
+        with patch('orchestrator.steward.invoke_agent',
+                   new_callable=AsyncMock, return_value=_make_result()) as mock_invoke:
+            await steward._pre_triage_suggestions(esc)
+            mock_config.steward_lifetime_budget = 20.0
+            await steward._pre_triage_suggestions(esc)
+
+        mock_invoke.assert_called_once()
+
+    async def test_capped_skip_is_retried_on_next_handle(self, steward):
+        cap_exc = AllAccountsCappedException(
+            retries=2, elapsed_secs=30.0, label='Steward for task 42 [pre-triage]',
+        )
+        esc = self._esc_with_suggestions(12)
+        with patch('orchestrator.steward.invoke_with_cap_retry',
+                   new_callable=AsyncMock,
+                   side_effect=[cap_exc, _make_result()]) as mock_iwcr:
+            first = await steward._pre_triage_suggestions(esc)
+            second = await steward._pre_triage_suggestions(esc)
+
+        assert mock_iwcr.await_count == 2
+        assert first is esc
+        assert second is not esc
 
     async def test_handle_escalation_strips_hash_prefix_for_threshold(
         self, steward,

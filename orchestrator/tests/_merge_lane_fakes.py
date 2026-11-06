@@ -4,7 +4,9 @@ Injected in place of the production adapters through
 ``MergeLane(..., verifier=FakeVerifier(...), clock=FakeClock(...))``.
 ``FakeVerifier`` scripts the verify outcome per task id or in call order,
 and records each scoped verify as a ``ScopedVerifyCall``; ``FakeClock`` is a
-hand-advanced clock whose ``sleep`` advances it instead of waiting;
+hand-advanced clock whose ``sleep`` advances it and waits at most
+``sleep_cap`` of real time, and ``healthy_verify_clock`` one on which an
+in-flight verify keeps writing;
 ``RecordingEscalations`` stands in for the escalation queue and keeps what
 the lane filed; ``lane_state``/``lane_entry`` read an item's state back off
 the lane's public ``snapshot()`` census. ``make_lane`` builds a lane on all three at once, so a test
@@ -16,6 +18,11 @@ nothing is draining. ``main_health_probe_spawned`` reads off a red
 ``MergeOutcome`` whether it left a detached main-health probe running, and
 ``lane_scene_config`` builds a scene's ``OrchestratorConfig`` with that probe
 off.
+
+Since task 5037 every merge-lane module, and ``suffix_graph``, logs under
+exactly ``'orchestrator.merge_lane'``; filter caplog by that name. A
+NEGATIVE assertion over records filtered by a logger name nothing emits
+under passes vacuously, so pair it with a positive capture.
 
 Imported by bare module name (``from _merge_lane_fakes import ...``), like
 ``_orch_helpers`` -- ``orchestrator/tests/`` has no ``__init__.py``.
@@ -31,11 +38,11 @@ from pathlib import Path
 from typing import Any
 
 from orchestrator.config import GitConfig, OrchestratorConfig
-from orchestrator.merge_gates import PostMergePyrightResult
 from orchestrator.merge_lane import MergeLane
-from orchestrator.merge_lane.types import DiskGuardOutcome
-from orchestrator.merge_queue import MAIN_HEALTH_PROBE_PENDING_NOTE
-from orchestrator.merge_types import MergeOutcome
+from orchestrator.merge_lane.gates import PostMergePyrightResult
+from orchestrator.merge_lane.ports import ClockPort
+from orchestrator.merge_lane.types import DiskGuardOutcome, MergeOutcome
+from orchestrator.merge_lane.worker import MAIN_HEALTH_PROBE_PENDING_NOTE
 from orchestrator.verify import VerifyResult
 
 
@@ -93,11 +100,15 @@ def main_health_probe_spawned(outcome: MergeOutcome) -> bool:
 def lane_scene_config(
     project_root: Path, git: GitConfig, **overrides: Any,
 ) -> OrchestratorConfig:
-    """The ``OrchestratorConfig`` for a lane scene over a real tmp repo.
+    """The ``OrchestratorConfig`` for a merge-lane test scene.
 
     The main-health probe is off (``escalate_preexisting_main_break=False``);
     ``main_health_probe_spawned`` says why. *overrides* are any further
-    ``OrchestratorConfig`` fields the scene needs.
+    ``OrchestratorConfig`` fields the scene needs. A scene that exercises the
+    probe builds ``OrchestratorConfig`` itself with
+    ``escalate_preexisting_main_break`` named, and
+    ``test_lane_scene_config_guard.py`` holds every worker-constructing module
+    to that.
     """
     return OrchestratorConfig(
         project_root=project_root, git=git,
@@ -300,24 +311,30 @@ class FakeClock:
     Two independent readings, exactly as production has them: ``now`` reads
     the wall-clock ``time`` (what the lane stamps with) and ``monotonic``
     reads ``mono`` (what it measures durations against). ``sleep`` advances
-    BOTH by the requested seconds and yields once so other tasks run,
-    keeping every requested sleep in ``sleeps``.
+    BOTH by the requested seconds and really waits ``min(secs, sleep_cap)``,
+    keeping every requested sleep in ``sleeps``. The real wait stops a
+    started lane's periodic loops (``_heartbeat_loop``, ``_reprobe_loop``)
+    from spinning a core; the cap keeps their production-sized periods off
+    the wall clock. ``sleep_cap=0`` restores the bare yield, for a test that
+    drives a single loop through a production-sized poll count with nothing
+    else needing real time.
 
     ``wait_for_any`` is the lane's poll cadence, and it charges ``mono``
     the FULL requested timeout while really waiting only ``wait_cap``.
     So a loop that polls on this clock and measures its budget off
     ``monotonic()`` -- the in-flight verify abort-poll is the one that does
-    -- reaches that budget in a bounded number of polls with no real time
-    elapsed, and the task being polled still gets real timer slack to
-    finish in. Every requested timeout lands in ``waits``.
+    -- reaches that budget with no real time elapsed. Every requested
+    timeout lands in ``waits``.
 
-    That slack is finite and DERIVED, so it is worth stating: a polled task
-    gets ``budget / poll * wait_cap`` seconds of real time before the loop
-    exhausts its budget and calls the task dead -- 0.2s at the settings
-    test_merge_queue_lifecycle_registry.py uses (budget 0.2, poll 0.02). A
-    test whose fake verify genuinely needs longer -- an awaited subprocess,
-    a git operation, a loaded host -- raises ``wait_cap`` rather than
-    false-aborting a healthy verify.
+    How much real time the polled task gets before that is NOT dependable.
+    A started lane's loops charge 150s (heartbeat 30s + reprobe 120s) per
+    ``sleep_cap`` of real sleep and the abort poll charges its full poll
+    interval per ``wait_cap``, so at the defaults a parked verify's
+    no-progress budget runs out in under a second of real time. Load
+    only lengthens that, but it is still no load-safe slack: a scene that must not call a verify dead shows the
+    content progress a healthy verify makes -- ``healthy_verify_clock`` --
+    and only a scene exercising the dead-verify abort leaves
+    ``content_mtime`` frozen.
 
     ``tick`` additionally advances ``mono`` on every ``monotonic()`` read,
     for a lane loop that measures elapsed time off this clock but waits on
@@ -333,6 +350,8 @@ class FakeClock:
     advances it by ``content_tick`` per probe, so a ``content_tick`` above
     zero is a verify that keeps writing. Every probed root is kept in
     ``content_probes``, the way ``sleeps`` keeps every requested sleep.
+    ``verify_cpu_ticks`` mirrors it for the verify process tree's CPU time:
+    ``cpu_ticks`` advanced by ``cpu_tick`` per probe, roots in ``cpu_probes``.
     """
 
     def __init__(
@@ -342,17 +361,24 @@ class FakeClock:
         tick: float = 0.0,
         content_mtime: float | None = None,
         content_tick: float = 0.0,
+        cpu_ticks: int | None = None,
+        cpu_tick: int = 0,
         wait_cap: float = 0.02,
+        sleep_cap: float = 0.02,
     ) -> None:
         self.time = time
         self.mono = time
         self.tick = tick
         self.content_mtime = content_mtime
         self.content_tick = content_tick
+        self.cpu_ticks = cpu_ticks
+        self.cpu_tick = cpu_tick
         self.wait_cap = wait_cap
+        self.sleep_cap = sleep_cap
         self.sleeps: list[float] = []
         self.waits: list[float] = []
         self.content_probes: list[Path] = []
+        self.cpu_probes: list[Path] = []
 
     def now(self) -> float:
         return self.time
@@ -369,13 +395,22 @@ class FakeClock:
             self.content_mtime = reading + self.content_tick
         return reading
 
+    def verify_cpu_ticks(self, root: Path) -> int | None:
+        self.cpu_probes.append(root)
+        reading = self.cpu_ticks
+        if reading is not None:
+            self.cpu_ticks = reading + self.cpu_tick
+        return reading
+
     async def sleep(self, secs: float) -> None:
         self.sleeps.append(secs)
         self.time += secs
         self.mono += secs
-        await asyncio.sleep(0)
+        await asyncio.sleep(min(secs, self.sleep_cap))
 
-    async def wait_for_any(self, aws: Collection[Any], timeout: float) -> set[Any]:
+    async def wait_for_any(
+        self, aws: Collection[asyncio.Future[Any]], timeout: float,
+    ) -> set[asyncio.Future[Any]]:
         self.waits.append(timeout)
         # A REAL bounded wait, never a bare yield: a yield reschedules on the
         # ready queue without letting any timer fire, which starves whatever
@@ -384,6 +419,16 @@ class FakeClock:
         done, _ = await asyncio.wait(aws, timeout=min(timeout, self.wait_cap))
         self.mono += timeout
         return done
+
+
+_FAKE_CLOCK_IS_A_CLOCK_PORT: ClockPort = FakeClock()
+
+
+def healthy_verify_clock() -> FakeClock:
+    """A ``FakeClock`` on which an in-flight verify keeps writing to its merge
+    worktree, as a healthy one does, so the lane's no-progress abort never
+    calls it dead however far the lane's loops have run ``monotonic()``."""
+    return FakeClock(content_mtime=1.0, content_tick=1.0)
 
 
 class RecordingEscalations:
@@ -426,9 +471,9 @@ def make_lane(
 
     The verifier and clock default to fresh fakes rather than to the
     production adapters, so a test that forgets to pass one still gets a
-    lane that neither shells out nor waits on the wall clock. *queue*
-    defaults to a fresh ``asyncio.Queue`` on the running loop. Anything else
-    ``MergeLane`` accepts passes through in *kwargs*.
+    lane that neither shells out nor waits out a production-sized sleep.
+    *queue* defaults to a fresh ``asyncio.Queue`` on the running loop.
+    Anything else ``MergeLane`` accepts passes through in *kwargs*.
     """
     return MergeLane(
         git_ops,

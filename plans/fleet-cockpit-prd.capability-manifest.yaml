@@ -1,0 +1,10 @@
+prd: plans/fleet-cockpit-prd.md
+schema_version: 1
+tasks:
+- label: C10
+  task_id: 2303
+  title: 'Fleet Cockpit C10: operator acceptance gate'
+  note: 'Minimal sidecar written by task 6588 (plans/dashboard-prd-lanes-prd.md §9 ε): this PRD predates YAML sidecars, so only its signal leaf is declared, hand-bound to the task whose prd_task_label is C10.'
+  capabilities: []
+signal_leaves:
+- C10

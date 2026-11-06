@@ -5,6 +5,8 @@ defaults adopted for the four surfaced choices, all noted in §Resolved).
 **Project:** dark_factory. **Approach:** light B+H (contract + boundary-test
 sketch; G5 heuristic hit: 3 modules, load-bearing shared config object).
 
+> **Amended 2026-10-12** by plans/offline-lane-red-path-prd.md: `git.offline_lane_red_advances_before_blocker` is removed; `git.offline_lane_persist_passes`, `git.offline_lane_recheck_secs` and `git.offline_lane_red_unlanded_hours` join the list.
+
 ## Goal
 
 An operator (or an L2 escalation-watcher session) can apply a **safe,

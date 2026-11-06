@@ -40,7 +40,7 @@ rather than something callers reach past.
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 from _fm_helpers import complete_paged_read
 
@@ -58,11 +58,13 @@ def make_scope(project_id: str, project_root: str) -> ProjectScope:
 def make_consolidator(
     project_root: str = '/tmp/test',
     recon_report_port: int | None = None,
+    project_id: str = 'test_project',
 ) -> MemoryConsolidator:
     """Build a MemoryConsolidator with mocked deps — mirrors test_stages.py ~L1418.
 
     ``recon_report_port`` is forwarded to the constructor only when given, so
     ``BaseStage``'s own default stays the single point of truth for the port.
+    ``project_id`` names the stage's scope project.
 
     NOTE: callers must pass a non-empty absolute ``project_root``. Passing
     ``project_root=''`` (the pre-task-2146 "unset root" sentinel) raises
@@ -91,6 +93,9 @@ def make_consolidator(
     memory_mock.graphiti.enumerate_all_valid_edges = AsyncMock(
         return_value=({}, complete_paged_read()),
     )
+    # EXPLICIT for the same reason: a sync read that a bare AsyncMock would
+    # answer with a coroutine. None = no Graphiti write executing.
+    memory_mock.earliest_unfinished_graphiti_write_start = MagicMock(return_value=None)
 
     port_kwargs = {} if recon_report_port is None else {'recon_report_port': recon_report_port}
     stage = MemoryConsolidator(
@@ -99,7 +104,7 @@ def make_consolidator(
         AsyncMock(),  # taskmaster
         AsyncMock(),  # journal
         config,
-        scope=make_scope('test_project', project_root),
+        scope=make_scope(project_id, project_root),
         **port_kwargs,
     )
     stage.episode_limit = 5

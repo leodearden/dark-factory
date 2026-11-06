@@ -21,6 +21,8 @@ import { createRequire } from 'node:module';
 
 import staleness from '../../src/dashboard/static/redux/endpoint_staleness.js';
 
+import { loadDataJs } from './_data_loader.mjs';
+
 const REDUX = '../../src/dashboard/static/redux/';
 const LOAD_CHAIN = ['datum.js', 'window_chip.js'].map(name => REDUX + name);
 
@@ -31,20 +33,6 @@ function loadWindowChip() {
   for (const specifier of LOAD_CHAIN) delete require.cache[require.resolve(specifier)];
   const [, chipApi] = LOAD_CHAIN.map(specifier => require(specifier));
   return { api: chipApi, window: win };
-}
-
-// data.js is loaded on its own shim, as endpoint_staleness.test.mjs does, so
-// the registry check reads the real endpointsFor() table.
-function loadDataJs() {
-  globalThis.window = { dispatchEvent: () => {}, DF_ENDPOINT_STALENESS: staleness };
-  globalThis.fetch = () => Promise.resolve({ ok: true, json: async () => ({}) });
-  const require = createRequire(import.meta.url);
-  const datumSpecifier = REDUX + 'datum.js';
-  delete require.cache[require.resolve(datumSpecifier)];
-  require(datumSpecifier);
-  const specifier = REDUX + 'data.js';
-  delete require.cache[require.resolve(specifier)];
-  return require(specifier);
 }
 
 const { api: chip, window: loadedWindow } = loadWindowChip();
@@ -128,7 +116,7 @@ test('TAB_WINDOWS: exactly the chip tabs, each with its vocabulary and the endpo
 test('every TAB_WINDOWS endpoint is a real endpointsFor() path', () => {
   // A table that silently stops matching a renamed endpoint would read no
   // echo forever, and every header would sit on the placeholder.
-  const { endpointsFor, pollKey } = loadDataJs();
+  const { endpointsFor, pollKey } = loadDataJs().api;
   const real = new Set(Object.keys(endpointsFor('24h')).map(pollKey));
   for (const [tab, { endpoint }] of Object.entries(TAB_WINDOWS)) {
     assert.ok(real.has(endpoint), `TAB_WINDOWS[${tab}] names ${endpoint}, not one of: ${[...real].join(', ')}`);

@@ -171,3 +171,5 @@ tasks:
     delivered_check:
       kind: manual
       reason: the task's own before_done predicate is the check
+signal_leaves:
+- θ

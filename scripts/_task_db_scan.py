@@ -11,19 +11,23 @@ extraction, no behaviour change" stays checkable by diff.
 This module is NOT a CLI in its own right — the leading underscore marks it as
 importable-by-sibling-scripts only. It hosts three tiers:
 
-* **Tier 1, discovery** (``_DEFAULT_PROJECT_ROOTS``, :func:`tasks_db_path`,
+* **Tier 1, discovery** (:func:`tasks_db_path`, :func:`runs_db_path`,
   :func:`decode_metadata`, :func:`resolve_project_roots`,
   :func:`discover_project_roots`, :func:`discover_db_paths`) — adopted by ALL
-  FOUR sweep scripts, plus ``census_tagger_debris.py`` (task 4525).
-  :func:`decode_metadata` is the exception to "adopted by all four": it is
-  used only by the two AUDIT scripts (task 4782), which are the only ones
-  that decode a ``metadata`` column at all. :func:`connect_ro`, with
-  :class:`TaskDbUnreadable` and :class:`TaskDbProblem`, is the same tier's
-  "…and OPEN it" half (task 5330): Tier 1 owned the path and nothing owned the
-  open, so ~10 call sites spell it themselves and none turns a wrong path into
-  an actionable message. Its callers are the forensic readers of ONE named
-  store; the sweep scripts keep their own opens because a sweep over many
-  projects wants the opposite policy — skip an unreadable store silently.
+  FOUR sweep scripts, plus ``census_tagger_debris.py`` (task 4525). The store
+  paths and the known/default roots delegate to ``shared.project_layout``
+  (task 6713). :func:`decode_metadata` is the exception to "adopted by all four": it is
+  adopted by the scripts that decode a ``metadata`` column, among them the
+  audit scripts ``audit_combine_gate_marker_loss.py`` and
+  ``audit_manifest_descriptor_drift.py`` (task 4782) and
+  ``audit_delivered_checks.py`` (task 6037). The tier's "…and OPEN it" half
+  (task 5330) lives in ``shared/src/shared/tasks_db_readonly.py::connect_ro``
+  (task 6268), and importers take it from there; this tier imports only the
+  refusal class, to name it in :data:`UNREADABLE_STORE_ERRORS`. Both kinds of
+  reader open through it. A forensic
+  reader of ONE named store lets the refusal surface; the sweep tiers below
+  catch it through :data:`UNREADABLE_STORE_ERRORS` and warn-and-skip that one
+  store. Discovery still drops a MISSING store silently, before any open.
 * **Tier 2, leak-scanner CLI plumbing** (:func:`sweep_databases`,
   :func:`run_scan_cli`, :func:`add_db_discovery_args`,
   :data:`NO_DB_RESOLVED_MESSAGE`, :func:`format_json`, :func:`truncate`,
@@ -67,11 +71,12 @@ for why the audit spelling does not port to Tier 2 and vice versa.
 THE THIRD COPY OF THE TIER-3 SKELETON, AND WHY IT STAYS OUT (task 3817).
 ``repair_wiped_metadata_files.py`` — the WRITE counterpart to
 ``audit_wiped_metadata_files.py`` — keeps its own ``EXIT_*`` ladder and its own
-per-root ``sqlite3.Error`` loop inside ``main_async`` instead of adopting
+per-root skip loop inside ``main_async`` instead of adopting
 :func:`run_audit_cli`. That is a decision, not an oversight. It reaches Tier 1
 discovery only second-hand, through the ``discover_project_roots`` re-export in
-``audit_wiped_metadata_files.py``, and holds NO direct import of this module at
-all. Four things Tier 3 cannot express, each measured in the source:
+``audit_wiped_metadata_files.py``. Its ONE direct import from this module is
+:data:`UNREADABLE_STORE_ERRORS`, so its per-root loop skips exactly what this
+tier skips. Four things Tier 3 cannot express, each measured in the source:
 
 1. ``main_async`` is ``async`` and awaits ``repair_project`` (itself
    ``async def``), while :func:`run_audit_cli` and :func:`sweep_project_roots`
@@ -122,6 +127,8 @@ Therefore: never relocate this module into a package, and never invoke any of
 the three sweep scripts via ``python -m`` — either change breaks every CLI
 test at once. (In-process pytest resolution is separately handled by
 ``scripts/tests/conftest.py``, which already puts ``scripts/`` on sys.path.)
+Its ``shared.*`` imports resolve through the ``_checkout`` binding, not
+``sys.path[0]``, so they leave this contract unchanged.
 """
 from __future__ import annotations
 
@@ -131,22 +138,33 @@ import os
 import sqlite3
 import sys
 from collections.abc import Callable, Sequence
-from enum import Enum
 from pathlib import Path
 from typing import Any, NamedTuple
+
+import _checkout as _checkout
+from shared.project_layout import (
+    StrPath,
+    default_project_root,
+    known_project_roots,
+    runs_db,
+    tasks_db,
+)
+
+from shared import tasks_db_readonly
 
 # ---------------------------------------------------------------------------
 # Tier 1 — tasks.db discovery (adopted by all three sweep scripts).
 # ---------------------------------------------------------------------------
 
-# Multi-project discovery fallback, mirroring
-# scripts/migrate_metadata_modules_to_files.py's DEFAULT_ROOTS.
-_DEFAULT_PROJECT_ROOTS = ("/home/leo/src/dark-factory",)
 
-
-def tasks_db_path(project_root: str) -> Path:
+def tasks_db_path(project_root: StrPath) -> Path:
     """``<root>/.taskmaster/tasks/tasks.db`` — the live task store."""
-    return Path(project_root) / ".taskmaster" / "tasks" / "tasks.db"
+    return tasks_db(project_root)
+
+
+def runs_db_path(project_root: StrPath) -> Path:
+    """``<root>/data/orchestrator/runs.db`` — the orchestrator's event log."""
+    return runs_db(project_root)
 
 
 def decode_metadata(raw: object) -> dict:
@@ -171,130 +189,12 @@ def decode_metadata(raw: object) -> dict:
     return payload
 
 
-class TaskDbProblem(Enum):
-    """Why :func:`connect_ro` refused a path — the discriminator to branch on.
-
-    An enum member rather than a substring of the message, so callers and
-    tests never grow an ad-hoc parser of prose that is free to improve.
-    """
-
-    ABSENT = "absent"
-    IS_A_DIRECTORY = "is_a_directory"
-    EMPTY_STUB = "empty_stub"
-    NO_TABLES = "no_tables"
-    NOT_A_DATABASE = "not_a_database"
-
-
-_REFUSAL_REMEDY = {
-    TaskDbProblem.ABSENT: (
-        "no such file. The live task store is the MAIN checkout's "
-        ".taskmaster/tasks/tasks.db; .taskmaster/ is not tracked in git, so it "
-        "never exists inside a worktree. `git worktree list --porcelain` names "
-        "the main checkout on its first line."
-    ),
-    TaskDbProblem.IS_A_DIRECTORY: (
-        "a directory, not a file. Two spellings land here: naming the "
-        "CONTAINING directory (.taskmaster/tasks) instead of the store inside "
-        "it (.taskmaster/tasks/tasks.db), and an EMPTY path string, which "
-        "resolves to the current working directory. sqlite opens neither — it "
-        "reports `disk I/O error`, which names no path and suggests a failing "
-        "disk rather than a mistyped argument."
-    ),
-    TaskDbProblem.EMPTY_STUB: (
-        "0 bytes — an empty stub, not a task store. Opening it read-only would "
-        "succeed and then answer `no such table: tasks`. Two things produce "
-        "one: the decoy .taskmaster/tasks.db that sits one directory ABOVE the "
-        "live .taskmaster/tasks/tasks.db, and a read-write sqlite3.connect of a "
-        "path that did not exist."
-    ),
-    TaskDbProblem.NO_TABLES: (
-        "a readable sqlite database with NO tables in it, so every query "
-        "against it answers `no such table: tasks`. This is what pointing at "
-        "the wrong .db file looks like from the inside — and it is also what "
-        "the 0-byte decoy above the live store becomes the moment any process "
-        "opens it read-write, which is why size alone cannot catch it."
-    ),
-    TaskDbProblem.NOT_A_DATABASE: (
-        "not a sqlite database at all — its bytes carry no database header, "
-        "so no query of any shape will run against it. A reader who lands "
-        "here is pointing at something other than a task store; the live one "
-        "is the MAIN checkout's .taskmaster/tasks/tasks.db."
-    ),
-}
-
-
-_SQLITE_NOTADB_ERRORCODE = 26
-
-TABLE_NAMES_SQL = (
-    "SELECT name FROM sqlite_master "
-    "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+# What a multi-store sweep treats as ONE unreadable store, to warn about and
+# skip: a sqlite failure, or a connect_ro refusal.
+UNREADABLE_STORE_ERRORS: tuple[type[Exception], ...] = (
+    sqlite3.Error,
+    tasks_db_readonly.TaskDbUnreadable,
 )
-
-
-class TaskDbUnreadable(Exception):
-    """*path* is not a readable task store, for the structured *reason*.
-
-    Carries the resolved :attr:`path` and a :class:`TaskDbProblem`
-    :attr:`reason` as fields; the formatted message is for the human only.
-
-    Deliberately NOT a ``sqlite3.Error`` subclass. This module's sweep tiers
-    catch that to skip an unreadable store SILENTLY, which is the right policy
-    for a sweep over many projects and the exact opposite of what a reader
-    interrogating one named store needs.
-    """
-
-    def __init__(self, path: Path, reason: TaskDbProblem) -> None:
-        self.path = path
-        self.reason = reason
-        super().__init__(f"{path}: {_REFUSAL_REMEDY[reason]}")
-
-
-def connect_ro(path: str | Path) -> sqlite3.Connection:
-    """Open *path* strictly read-only, or refuse with :class:`TaskDbUnreadable`.
-
-    Raises rather than returning a connection whose first query answers
-    ``no such table: tasks`` — an error that reads as "this store is empty"
-    when it in fact means "you are looking at the wrong file".
-
-    A store that cannot be OPENED for some other reason — permissions, a lock,
-    a file that vanished mid-call — propagates as the original
-    :class:`sqlite3.Error`. Only sqlite's own ``SQLITE_NOTADB`` becomes a
-    refusal, because only that code means the bytes are not a database;
-    ``SQLITE_IOERR`` for a directory is caught EARLIER, by ``is_dir()``, since
-    that code is indistinguishable from a genuinely failing disk;
-    :class:`sqlite3.OperationalError` is a SUBCLASS of
-    :class:`sqlite3.DatabaseError`, so branching on the exception class would
-    report every unreadable store as "not a database".
-
-    The URI is built from the RESOLVED absolute path, so a relative one cannot
-    be re-resolved against a different cwd by a subprocess or a later chdir —
-    the ``unable to open database file`` shape of the same confusion.
-
-    This is the single home for an idiom spelled at ~10 other sites. Migrating
-    them is deliberately a separate change: each is a sweep that drops an
-    unreadable store SILENTLY on purpose, so adopting this refusal needs a
-    judgement call per site rather than a rename.
-    """
-    resolved = Path(path).resolve()
-    if not resolved.exists():
-        raise TaskDbUnreadable(resolved, TaskDbProblem.ABSENT)
-    if resolved.is_dir():
-        raise TaskDbUnreadable(resolved, TaskDbProblem.IS_A_DIRECTORY)
-    if resolved.stat().st_size == 0:
-        raise TaskDbUnreadable(resolved, TaskDbProblem.EMPTY_STUB)
-
-    conn = sqlite3.connect(f"file:{resolved}?mode=ro", uri=True)
-    try:
-        first_table = conn.execute(f"{TABLE_NAMES_SQL} LIMIT 1").fetchone()
-    except sqlite3.DatabaseError as exc:
-        conn.close()
-        if exc.sqlite_errorcode != _SQLITE_NOTADB_ERRORCODE:
-            raise
-        raise TaskDbUnreadable(resolved, TaskDbProblem.NOT_A_DATABASE) from exc
-    if first_table is None:
-        conn.close()
-        raise TaskDbUnreadable(resolved, TaskDbProblem.NO_TABLES)
-    return conn
 
 
 def resolve_project_roots(
@@ -317,11 +217,10 @@ def resolve_project_roots(
     if project_roots is not None:
         return list(project_roots)
 
-    environ = env if env is not None else os.environ
-    roots_env = (environ.get("DASHBOARD_KNOWN_PROJECT_ROOTS") or "").strip()
-    if roots_env:
-        return [r.strip() for r in roots_env.split(",") if r.strip()]
-    return list(_DEFAULT_PROJECT_ROOTS)
+    known = known_project_roots(env if env is not None else os.environ)
+    if known:
+        return [str(root) for root in known]
+    return [str(default_project_root())]
 
 
 def discover_project_roots(
@@ -487,9 +386,10 @@ def sweep_databases(
     A single unreadable database (e.g. a stale/corrupt file, or a transient
     "database is locked"/"file is not a database" condition) does not abort the
     sweep: it is logged to stderr and skipped so every other resolvable
-    database is still scanned and reported. Only ``sqlite3.Error`` is caught —
-    any other exception propagates, so a real bug in *scan_fn* surfaces instead
-    of being silently downgraded to "unreadable database".
+    database is still scanned and reported. Only
+    :data:`UNREADABLE_STORE_ERRORS` is caught — any other exception propagates,
+    so a real bug in *scan_fn* surfaces instead of being silently downgraded to
+    "unreadable database".
 
     Writes the per-database warnings during the loop and the aggregate
     "results below are incomplete" warning after it, so a caller printing its
@@ -500,7 +400,7 @@ def sweep_databases(
     for db_path in db_paths:
         try:
             matches.extend(scan_fn(db_path))
-        except sqlite3.Error as exc:
+        except UNREADABLE_STORE_ERRORS as exc:
             print(f"warning: skipping unreadable database {db_path}: {exc}", file=sys.stderr)
             unreadable.append(db_path)
 
@@ -618,7 +518,8 @@ def sweep_project_roots(
     """Run *audit_fn* over every root in *roots*, returning (audits, unreadable).
 
     CONTRACT — :func:`run_audit_cli`'s exit-3 gate depends on it: *audit_fn*
-    returns EXACTLY ONE audit object per root, or raises ``sqlite3.Error``.
+    returns EXACTLY ONE audit object per root, or raises one of
+    :data:`UNREADABLE_STORE_ERRORS`.
     Under that contract ``len(audits) + len(unreadable) == len(roots)`` always
     holds, so "no audits but some unreadable" is precisely "every root failed".
     An *audit_fn* that instead returned None to "skip" a root would break that
@@ -628,9 +529,9 @@ def sweep_project_roots(
     A single unreadable project (e.g. a corrupt/locked tasks.db, or a transient
     "database is locked"/"file is not a database" condition) does not abort the
     sweep: it is logged to stderr and skipped so every other resolvable project
-    is still audited and reported. Only ``sqlite3.Error`` is caught — any other
-    exception propagates, so a real bug in *audit_fn* surfaces instead of being
-    silently downgraded to "unreadable project".
+    is still audited and reported. Only :data:`UNREADABLE_STORE_ERRORS` is
+    caught — any other exception propagates, so a real bug in *audit_fn*
+    surfaces instead of being silently downgraded to "unreadable project".
 
     Writes the per-project warnings during the loop and the aggregate "results
     below are incomplete" warning after it, so a caller printing its report
@@ -645,7 +546,7 @@ def sweep_project_roots(
     for root in roots:
         try:
             audits.append(audit_fn(root))
-        except sqlite3.Error as exc:
+        except UNREADABLE_STORE_ERRORS as exc:
             print(f"warning: skipping unreadable project {root}: {exc}", file=sys.stderr)
             unreadable.append(root)
 

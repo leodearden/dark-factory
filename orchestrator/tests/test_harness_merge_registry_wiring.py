@@ -17,7 +17,7 @@ import pytest
 from _orch_helpers import _init_harness_state_for_test
 
 from orchestrator.harness import Harness
-from orchestrator.merge_queue import InFlightMergeRegistry
+from orchestrator.merge_lane.worker import InFlightMergeRegistry
 from orchestrator.scheduler import TaskAssignment
 
 # ---------------------------------------------------------------------------
@@ -71,7 +71,6 @@ class TestStartEscalationServerInjectsRegistry:
         h = _build_harness(mock_orch_config)
 
         # Set up attributes _start_escalation_server reads from config
-        mock_orch_config.escalation.queue_dir = str(tmp_path / 'esc')
         mock_orch_config.escalation.host = '127.0.0.1'
         mock_orch_config.escalation.port = 19999
         # _start_escalation_server wires review_checkpoint if not None
@@ -172,10 +171,10 @@ class TestStartMergeWorkerCallsLivenessGuard:
 
         Patching strategy
         -----------------
-        _start_merge_worker does a LOCAL import ``from orchestrator.merge_queue
+        _start_merge_worker does a LOCAL import ``from orchestrator.merge_lane.worker
         import enforce_merge_liveness_margin`` (added in step-4, mirroring the
-        existing ``from orchestrator.merge_queue import SpeculativeMergeWorker``).
-        Patching the SOURCE module attribute (``orchestrator.merge_queue.
+        existing ``from orchestrator.merge_lane.worker import SpeculativeMergeWorker``).
+        Patching the SOURCE module attribute (``orchestrator.merge_lane.worker.
         enforce_merge_liveness_margin``) is what the local import picks up at call
         time; patching ``orchestrator.harness.*`` would have no effect because
         no module-level binding exists in harness.py for this symbol.
@@ -183,16 +182,14 @@ class TestStartMergeWorkerCallsLivenessGuard:
         h = _build_harness(mock_orch_config)
 
         # SpeculativeMergeWorker is imported locally inside _start_merge_worker
-        # via ``from orchestrator.merge_queue import SpeculativeMergeWorker``;
+        # via ``from orchestrator.merge_lane.worker import SpeculativeMergeWorker``;
         # patch the SOURCE module attribute so the local import picks up the mock.
-        with patch('orchestrator.merge_queue.SpeculativeMergeWorker') as mock_smw_cls, \
+        with patch('orchestrator.merge_lane.worker.SpeculativeMergeWorker') as mock_smw_cls, \
              patch.object(h, '_build_service_restart_coordinator') as mock_build_coord, \
              patch('asyncio.create_task') as mock_create_task, \
              patch('orchestrator.merge_lane.liveness.enforce_merge_liveness_margin') as mock_guard:
 
-            # SpeculativeMergeWorker.run() must be awaitable to satisfy create_task
             mock_smw = MagicMock()
-            mock_smw.run = AsyncMock(return_value=None)
             mock_smw_cls.return_value = mock_smw
 
             # Coordinator mock — note_merge is the on_merge_landed callback

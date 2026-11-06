@@ -320,7 +320,6 @@ class TestHarnessTaskStatusLookup:
     ):
         """_start_escalation_server() calls create_server with non-None task_status_lookup."""
         # Arrange: wire minimal escalation config on the harness's config mock.
-        harness.config.escalation.queue_dir = str(tmp_path / 'esc')
         harness.config.escalation.host = '127.0.0.1'
         harness.config.escalation.port = 18100
         harness.config.project_root = tmp_path
@@ -373,7 +372,6 @@ class TestHarnessTaskStatusLookup:
         self, harness: Harness, tmp_path: Path,
     ):
         """The task_status_lookup kwarg is the callable built by _build_task_status_lookup()."""
-        harness.config.escalation.queue_dir = str(tmp_path / 'esc')
         harness.config.escalation.host = '127.0.0.1'
         harness.config.escalation.port = 18100
         harness.config.project_root = tmp_path

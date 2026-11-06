@@ -127,3 +127,5 @@ tasks:
       paths:
       - orchestrator/src/orchestrator/agents/roles.py
       expect: present
+signal_leaves:
+- β

@@ -20,16 +20,17 @@ import httpx
 import openai
 import pytest
 from _fm_helpers import load_script_module
+from _sdk_client_stubs import sdk_client_double
 
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.models.enums import SourceStore
 from fused_memory.models.memory import MemoryResult
 from fused_memory.server import write_triage_judge
 from fused_memory.server.write_triage_judge import (
-    _ELIDED_MARKER,
     resolve_judge_field_chars,
     resolve_judge_timeout,
 )
+from fused_memory.utils.clip_disclosure import elision_marker
 
 SCRIPTS = Path(__file__).parent.parent / 'scripts'
 
@@ -96,6 +97,7 @@ def _write(candidates: list[dict] | None = None, band_winner_id: str | None = 'c
         'band': 'judge', 'band_winner_id': band_winner_id, 'similarity': 0.85,
         'retrieved_count': 20, 'self_retrieved': False, 'own_children_dropped': 0,
         'candidates': _slate_of_20() if candidates is None else candidates,
+        'slates': 'frozen',
     }
 
 
@@ -117,10 +119,8 @@ def _response(
 
 
 def _client(respond: Callable[..., Any]) -> MagicMock:
-    """A fake ``AsyncOpenAI`` that is its own async context manager, as the SDK is."""
-    client = MagicMock()
-    client.__aenter__ = AsyncMock(return_value=client)
-    client.__aexit__ = AsyncMock(return_value=False)
+    """A fake ``AsyncOpenAI`` whose Responses calls *respond* answers."""
+    client = sdk_client_double()
     client.responses.create = AsyncMock(side_effect=respond)
     client.chat.completions.create = AsyncMock()
     return client
@@ -227,7 +227,7 @@ class TestTheWire:
         _judge(client, _arm('gpt-4o-mini@5'))
         rendered = client.responses.create.call_args.kwargs['input']
         for field in ('y' * 5_000, 'x' * 5_000):
-            assert field[:cap] + _ELIDED_MARKER in rendered
+            assert field[:cap] + elision_marker(len(field) - cap) in rendered
             assert field[:cap + 1] not in rendered
 
     def test_only_the_openai_provider_is_judged(self) -> None:
@@ -255,7 +255,7 @@ class TestTheRow:
             'timeout_seconds': resolve_judge_timeout(_service()),
             'memory_id': 'w', 'project_id': 'reify', 'category': 'procedural_knowledge',
             'recon_marker': True, 'declares_attach_keys': False,
-            'band': 'judge', 'band_winner_id': 'c12',
+            'band': 'judge', 'band_winner_id': 'c12', 'slates': 'frozen',
             'outcome': 'amended', 'verdict_candidate_id': 'c00', 'judged_candidate_id': 'c12',
             'raw_text': text,
             'usage': {'prompt_tokens': 1_000, 'completion_tokens': 50, 'reasoning_tokens': 3},
@@ -826,6 +826,22 @@ class TestPublishRefuses:
         published.judge_a_write_outside_the_snapshot('gpt-6-luna:low@5')
         with pytest.raises(ValueError, match='gpt-6-luna:low@5'):
             published.pairs()
+
+    def test_a_row_judged_on_write_time_slates(self, published: _Published) -> None:
+        published.rows['gpt-6-luna:low@5'][2]['slates'] = 'write-time'
+        with pytest.raises(ValueError, match='gpt-6-luna:low@5'):
+            published.artifact()
+        with pytest.raises(ValueError, match='gpt-6-luna:low@5'):
+            published.pairs()
+
+
+def test_rows_saying_frozen_publish_beside_rows_that_predate_the_field(
+    published: _Published,
+) -> None:
+    for rows in published.rows.values():
+        rows[0]['slates'] = 'frozen'
+    assert len(published.artifact()['arms']) == len(_mod().ARMS)
+    published.pairs()
 
 
 class TestThePublishCommand:

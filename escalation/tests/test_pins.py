@@ -33,7 +33,15 @@ from pathlib import Path
 import pytest
 
 from escalation.models import BORN_AT_L2_SEVERITIES, KNOWN_SEVERITIES, Escalation
-from escalation.pins import PinClass, PinRecord, PinReport, classify_pins
+from escalation.pins import (
+    ClusterPinRecord,
+    PinClass,
+    PinRecord,
+    PinReport,
+    classify_pins,
+    is_queue_handoff,
+    pinned_only_by_human_parked,
+)
 
 # ---------------------------------------------------------------------------
 # step-3 — pure type-surface contract
@@ -105,6 +113,16 @@ class TestPinRecordProtocol:
         record: PinRecord = esc
         assert record.id == 'esc-42-1'
 
+    def test_escalation_satisfies_cluster_pin_record_statically(self) -> None:
+        """The members-carrying sub-protocol accepts the server-side record too."""
+        esc = Escalation(
+            id='esc-42-2', task_id='42', agent_role='escalation-watcher-auto',
+            severity='blocking', category='infra_issue', summary='s', level=2,
+            members=['esc-42-1'],
+        )
+        record: ClusterPinRecord = esc
+        assert list(record.members) == ['esc-42-1']
+
 
 class TestPinsModuleExports:
     def test_all_exports_the_public_surface(self) -> None:
@@ -113,7 +131,9 @@ class TestPinsModuleExports:
         that each name exists and is importable."""
         import escalation.pins as pins_mod
 
-        assert {'PinClass', 'PinRecord', 'PinReport', 'classify_pins'} <= set(pins_mod.__all__)
+        assert {
+            'PinClass', 'PinRecord', 'PinReport', 'classify_pins', 'is_queue_handoff',
+        } <= set(pins_mod.__all__)
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +155,7 @@ class _Rec:
     level: int
     severity: str
     filing_claimant_run_id: str | None
+    members: tuple[str, ...] = ()
 
 
 def _rec(
@@ -143,12 +164,14 @@ def _rec(
     level: int = 0,
     severity: str | None = 'blocking',
     filing: str | None = None,
+    members: tuple[str, ...] = (),
 ) -> _Rec:
     return _Rec(
         id=id,
         level=level,
         severity=typing.cast('str', severity),
         filing_claimant_run_id=filing,
+        members=members,
     )
 
 
@@ -354,10 +377,8 @@ class TestDeadL0FilingIncarnationRule:
 
         Governs every record whose filing identity is unknown: legacy rows
         written before task 3550, and producers that still do not stamp (see
-        the inventory on ``pins.classify_pins`` — most are moot above link 4,
-        but ``merge_queue._file_main_health_escalation`` reaches THIS branch
-        with a real task_id, which is exactly the residual gap the inventory
-        names)."""
+        the inventory on ``pins.classify_pins`` — most are moot above link
+        4)."""
         bucket = _bucket_of(
             _rec(level=0, severity='blocking', filing=filing),
             live_claimant=True,
@@ -726,6 +747,7 @@ def _esc(
     level: int = 0,
     severity: str = 'blocking',
     filing_claimant_run_id: str | None = None,
+    members: tuple[str, ...] = (),
 ) -> Escalation:
     """A real ``escalation.models.Escalation`` — the server-side PinRecord."""
     return Escalation(
@@ -737,6 +759,7 @@ def _esc(
         summary='s',
         level=level,
         filing_claimant_run_id=filing_claimant_run_id,
+        members=list(members),
     )
 
 
@@ -813,8 +836,6 @@ class TestPinnedOnlyByHumanParked:
         live_claimant: bool = False,
         live_claimant_id: str | None = None,
     ) -> bool:
-        from escalation.pins import pinned_only_by_human_parked
-
         report = classify_pins(
             '42', records, live_claimant=live_claimant, live_claimant_id=live_claimant_id,
         )
@@ -898,8 +919,123 @@ class TestPinnedOnlyByHumanParked:
 
     def test_a_handoff_id_the_records_do_not_carry_is_not(self) -> None:
         """A report and records that disagree prove nothing about who holds the task."""
-        from escalation.pins import pinned_only_by_human_parked
-
         report = classify_pins('42', [_rec(id='esc-42-1', level=2)], live_claimant=False)
 
         assert pinned_only_by_human_parked(report, [_rec(id='esc-42-2', level=2)]) is False
+
+    # -- task 7709: an L1 a human-level handoff holds as a member is parked --
+
+    def test_an_l1_its_l2_holds_is_human_parked(self) -> None:
+        """The promoted hold: the L2 names the L1 it was promoted from."""
+        records = [
+            _rec(id='esc-42-1', level=1),
+            _rec(id='esc-42-2', level=2, members=('esc-42-1',)),
+        ]
+        assert self._parked(records) is True
+
+    def test_an_l1_its_l2_holds_is_human_parked_on_real_escalations(self) -> None:
+        records = [
+            _esc(id='esc-42-1', level=1),
+            _esc(id='esc-42-2', level=2, members=('esc-42-1',)),
+        ]
+        assert self._parked(records) is True
+
+    def test_an_unheld_l1_beside_a_held_one_is_not(self) -> None:
+        records = [
+            _rec(id='esc-42-1', level=1),
+            _rec(id='esc-42-2', level=2, members=('esc-42-1',)),
+            _rec(id='esc-42-3', level=1),
+        ]
+        assert self._parked(records) is False
+
+    def test_an_info_l2_holds_nothing(self) -> None:
+        """Link 1 makes an info L2 an annotation, not a handoff, so it is no
+        proof that anyone must act on its members."""
+        records = [
+            _rec(id='esc-42-1', level=1),
+            _rec(id='esc-42-2', level=2, severity='info', members=('esc-42-1',)),
+        ]
+        assert self._parked(records) is False
+
+    def test_a_holder_below_human_level_parks_nothing(self) -> None:
+        records = [
+            _rec(id='esc-42-1', level=1),
+            _rec(id='esc-42-2', level=1, members=('esc-42-1',)),
+        ]
+        assert self._parked(records) is False
+
+    @pytest.mark.parametrize('level', ['1', 1.0, True, None, 0])
+    def test_a_held_member_that_is_not_a_genuine_l1_is_not(self, level: typing.Any) -> None:
+        """``promote_to_l2``: members stay at L1.  Anything else is contradictory
+        state, and a level is never coerced."""
+        records = [
+            _rec(id='esc-42-1', level=level),
+            _rec(id='esc-42-2', level=2, members=('esc-42-1',)),
+        ]
+        assert self._parked(records, live_claimant=True) is False
+
+    @pytest.mark.parametrize('members', [None, 'esc-42-1'], ids=['none', 'bare-string'])
+    def test_members_that_are_not_a_list_or_tuple_hold_nothing(
+        self, members: typing.Any,
+    ) -> None:
+        """Never coerced, and a bare string is never substring-matched."""
+        records = [
+            _rec(id='esc-42-1', level=1),
+            _rec(id='esc-42-2', level=2, members=typing.cast('tuple[str, ...]', members)),
+        ]
+        assert self._parked(records) is False
+
+    def test_an_unreadable_store_is_not_even_with_a_held_l1(self) -> None:
+        records = [
+            _rec(id='esc-42-1', level=1),
+            _rec(id='esc-42-2', level=2, members=('esc-42-1',)),
+        ]
+        report = classify_pins('42', None, live_claimant=False)
+
+        assert pinned_only_by_human_parked(report, records) is False
+
+
+# ---------------------------------------------------------------------------
+# is_queue_handoff — the one-record gating answer (task 5221)
+# ---------------------------------------------------------------------------
+
+#: (record, expected is_queue_handoff) over the severity x level table.
+_HANDOFF_TABLE: list[tuple[Escalation, bool]] = [
+    # Link 1: info never gates, at any level, whatever its spelling.
+    (_esc(id='esc-42-1', severity='info', level=0), False),
+    (_esc(id='esc-42-2', severity='info', level=1), False),
+    (_esc(id='esc-42-3', severity='info', level=2), False),
+    (_esc(id='esc-42-4', severity=' INFO ', level=0), False),
+    # Link 3: queue-backed L1/L2 handoffs gate.
+    (_esc(id='esc-42-5', severity='blocking', level=1), True),
+    (_esc(id='esc-42-6', severity='blocking', level=2), True),
+    # Link 4: with no live id to compare, an L0 fails safe to a handoff.
+    (_esc(id='esc-42-7', severity='blocking', level=0), True),
+    (_esc(id='esc-42-8', severity='blocking', level=0, filing_claimant_run_id=LIVE_ID), True),
+    # Link 3b: born-at-L2 severities gate at either level.
+    (_esc(id='esc-42-9', severity='critical', level=2), True),
+    (_esc(id='esc-42-10', severity='critical', level=0), True),
+    # Link 2: an unknown severity fails safe to a handoff.
+    (_esc(id='esc-42-11', severity='', level=2), True),
+    (_esc(id='esc-42-12', severity='weird', level=2), True),
+]
+
+
+class TestIsQueueHandoff:
+    """``is_queue_handoff`` answers "does this ONE open record gate a live run?"
+    by delegating to the shared chain, never by a second predicate (INV-5)."""
+
+    @pytest.mark.parametrize(('record', 'expected'), _HANDOFF_TABLE, ids=lambda v: getattr(v, 'id', None))
+    def test_answer_over_the_severity_level_table(self, record: Escalation, expected: bool) -> None:
+        assert is_queue_handoff(record) is expected
+
+    @pytest.mark.parametrize(('record', 'expected'), _HANDOFF_TABLE, ids=lambda v: getattr(v, 'id', None))
+    def test_parity_with_the_shared_chain(self, record: Escalation, expected: bool) -> None:
+        report = classify_pins(record.task_id, [record], live_claimant=True)
+        assert is_queue_handoff(record) == (record.id in report.queue_handoff)
+
+    @pytest.mark.parametrize(('record', 'expected'), _HANDOFF_TABLE, ids=lambda v: getattr(v, 'id', None))
+    def test_is_pure(self, record: Escalation, expected: bool) -> None:
+        before = record.to_dict()
+        is_queue_handoff(record)
+        assert record.to_dict() == before

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -16,22 +16,31 @@ from fused_memory.models.reconciliation import (
     StageReport,
     Watermark,
 )
+from fused_memory.reconciliation.child_memory_link import render_parent_link
 from fused_memory.reconciliation.cli_stage_runner import (
     STAGE1_DISALLOWED,
+)
+from fused_memory.reconciliation.consolidation_auto_executor import (
+    auto_consolidation_initial_stats,
+    run_auto_consolidation,
 )
 from fused_memory.reconciliation.curator_gate_resolution_sweep import (
     extract_open_gate_task_ids,
     sweep_resolved_curator_gates,
 )
+from fused_memory.reconciliation.dangling_citation import render_dangling_citation_line
 from fused_memory.reconciliation.degenerate_task_node_sweep import (
     extract_terminal_task_ids,
     sweep_degenerate_task_nodes,
 )
+from fused_memory.reconciliation.episode_window import (
+    UNFINISHED_WRITE_START_STAT,
+    unfinished_write_start_stat,
+)
 from fused_memory.reconciliation.flag_dedup import (
     EntityStandingSuppressionResult,
     acknowledge_resolved_flags,
-    compute_content_fingerprint_signature,
-    compute_flag_signature,
+    compute_marker_signature,
     dedup_flags,
     filter_accounted_cluster_growth_flags,
     filter_already_recorded_caveat_flags,
@@ -57,6 +66,7 @@ from fused_memory.reconciliation.live_workflow_section import (
 from fused_memory.reconciliation.orphaned_recon_escalation_sweep import (
     sweep_orphaned_recon_escalations,
 )
+from fused_memory.reconciliation.overreach_flags import render_overreach_flags_section
 from fused_memory.reconciliation.preservation_specimen_guard import (
     filter_preservation_specimen_flags,
     maybe_escalate_preservation_suppression_storm,
@@ -105,10 +115,16 @@ from fused_memory.reconciliation.task_filter import (
     format_filtered_task_tree,
     strip_snapshot_lines,
 )
-from fused_memory.server.grouped_read import PARENT_ID_KEY, _parent_id_in_meta
+from fused_memory.reconciliation.tree_read_instant import resolve_tree_read_instant
+from fused_memory.reconciliation.unlanded_path_check import (
+    UnlandedPathCheckResult,
+    check_unlanded_path_claims,
+)
+from fused_memory.utils.clip_disclosure import clip_note, elide_text, fetch_cap_note
 
 if TYPE_CHECKING:
     from fused_memory.services.memory_service import MemoryService
+    from fused_memory.services.overreach_shadow import OverreachFlagPage
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +136,7 @@ logger = logging.getLogger(__name__)
 # enforce_summary_pool_cap call trims the pool to at most this many members by
 # deleting the OLDEST entries — deterministically via Qdrant scroll, NOT semantic search.
 STAGE1_CYCLE_SUMMARY_POOL_CAP: int = 2
+_RECORD_BODY_CHARS = 2_000  # basis: plans/recon-evidence-caps-measurement-2026-10.md
 _STAGE1_CYCLE_SUMMARY_TRIM_SOURCE = 'stage1_cycle_summary_trim'
 
 
@@ -167,9 +184,10 @@ class MemoryConsolidator(BaseStage):
     # INCLUSION CRITERION — a section belongs here iff the shipped Stage-1 prompt
     # tells the model to draw an inference from that section's ABSENCE. Today
     # prompts/stage1.py says: "If `### Live-Workflow Signals` is absent from the
-    # payload, no task is live this cycle — neither through a per-task signal nor
-    # through the project-wide lock — and none has landing evidence; no
-    # live-workflow suppression applies …". That makes absence load-bearing: a
+    # payload, no task the `### Active Task Tree` lists is live this cycle —
+    # neither through a per-task signal nor through the project-wide lock — and
+    # none of them has landing evidence; no live-workflow suppression applies to
+    # them …". That makes absence load-bearing: a
     # payload builder that omits the section does not merely produce a terser
     # payload, it makes the model conclude something FALSE. Every builder therefore renders these
     # via _render_required_sections() — adding a section is ONE edit here, not
@@ -190,6 +208,9 @@ class MemoryConsolidator(BaseStage):
     #     an unconditional directive with NO absence-inference in any prompt, so
     #     it falls outside this tuple's inclusion criterion. It keeps its own
     #     dedicated tests instead (task 2552).
+    #   * render_overreach_flags_section — 2 of 3 by design (task 6137): the
+    #     shadow's flags are a full-cycle handoff, and no prompt draws an
+    #     inference from the section's absence.
     REQUIRED_SECTIONS: tuple[RequiredSection, ...] = (
         RequiredSection('### Live-Workflow Signals', '_build_live_workflow_section'),
     )
@@ -211,6 +232,8 @@ class MemoryConsolidator(BaseStage):
 
     # Active task tree — set by harness before run() (task 455)
     filtered_task_tree: FilteredTaskTree | None = None
+    # Set with filtered_task_tree: the instant that tree, and every heartbeat_at in it, was read.
+    filtered_task_tree_fetched_at: datetime | None = None
 
     # Authoritative task-count cross-verification record — set by harness (task 1785).
     # None when the status map was unavailable (e.g. taskmaster down) or in remediation passes.
@@ -223,6 +246,10 @@ class MemoryConsolidator(BaseStage):
     # FalkorDB index-provisioning health record — set by harness (task 3709).
     # None when the graph was unreadable, absent, or in remediation passes.
     index_health: dict | None = None
+
+    # The overreach shadow's next page of flags not yet handed over — set by harness
+    # (design.md §6.1 O4, task 6137). None when unavailable or in remediation passes.
+    overreach_flags: OverreachFlagPage | None = None
 
     # Cached project_status_correction memory vs. live get_statuses census
     # diff/supersede record — set by harness (task 1938).
@@ -247,6 +274,9 @@ class MemoryConsolidator(BaseStage):
     # design invariant INV-2 structured-facts-at-failure.
     _undatable_freshness_records: int
 
+    # Sampled just before the episode fetch; see reconciliation/episode_window.py.
+    _unfinished_graphiti_write_start: datetime | None
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # Per-instance initialisation: avoids shared-mutable-default hazard.
@@ -255,6 +285,7 @@ class MemoryConsolidator(BaseStage):
         # state across all instances (and across reused-instance runs).
         self._fetch_degraded_sources: list = []
         self._undatable_freshness_records: int = 0
+        self._unfinished_graphiti_write_start: datetime | None = None
         self._live_workflow_snapshot: LiveWorkflowSnapshot | None = None
 
     async def run(
@@ -290,12 +321,18 @@ class MemoryConsolidator(BaseStage):
             self._entity_summary_snapshot_lines_stripped
         )
         report.stats['stage1_fetch_degraded'] = self._fetch_degraded_sources or []
+        report.stats['stage1_assembled_budget'] = (
+            self.assembled_payload.budget_report() if self.assembled_payload is not None else None
+        )
 
         # Always present (task 4574, mirrors stage1_fetch_degraded above): set BEFORE
         # the remediation early-return so the key is unconditionally present, including
         # on remediation passes (which never call assemble_payload's freshness filters
         # and so leave the per-instance counter at its __init__/reset value of 0).
         report.stats['stage1_undatable_freshness_records'] = self._undatable_freshness_records
+        report.stats[UNFINISHED_WRITE_START_STAT] = unfinished_write_start_stat(
+            self._unfinished_graphiti_write_start
+        )
 
         # Always present (task-2312): set BEFORE the remediation early-return below
         # so downstream consumers see this key on every run, including remediation
@@ -364,6 +401,8 @@ class MemoryConsolidator(BaseStage):
         report.stats['orphaned_recon_escalations_unresolvable'] = 0
         report.stats['orphaned_recon_escalations_errors'] = 0
         report.stats['orphaned_recon_escalations_flags_emitted'] = 0
+        # Same always-present contract for the unlanded-path check (task 5626).
+        report.stats.update(UnlandedPathCheckResult.empty().stats())
 
         # Always present (task 2896 γ): count of recon flags suppressed this cycle
         # by an ACTIVE entity_standing_decision (Hook A).  Overwritten below to the
@@ -470,6 +509,10 @@ class MemoryConsolidator(BaseStage):
         # remediation passes, when filtered_task_tree is unset, and when no
         # active task is human-gate-owned.
         report.stats['gate_owned_suggested_actions_normalized'] = 0
+
+        # Always present (task 5240), the same convention as the pre-inits above;
+        # the key set's one home is auto_consolidation_initial_stats.
+        report.stats.update(auto_consolidation_initial_stats())
 
         # Skip dedup for remediation passes
         if self.remediation_findings is not None:
@@ -586,6 +629,32 @@ class MemoryConsolidator(BaseStage):
                 )
                 report.stats['curator_gate_resolution_errors'] = gate_sweep['errors']
 
+        # ── Auto-consolidation executor (task 5240) ────────────────────────────
+        # Contract: plans/memory-auto-consolidation-prd.md C4.
+        try:
+            await run_auto_consolidation(
+                self.memory,
+                self.taskmaster,
+                self._escalation_queue,
+                project_id=self.project_id,
+                project_root=self.project_root,
+                run_id=run_id,
+                config=self.memory.config.consolidation_auto,
+                active_tasks=(
+                    self.filtered_task_tree.active_tasks
+                    if self.filtered_task_tree is not None
+                    else None
+                ),
+                report=report,
+            )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            logger.exception(
+                'reconciliation.auto_consolidation_failed',
+                extra={'project_id': self.project_id, 'run_id': run_id},
+            )
+
         # ── Orphaned recon-escalation sweep (task 3052) ────────────────────────
         # Flag pending L1 ``reconciliation_stale_*`` records whose subject task
         # has gone terminal (done/cancelled) or vanished from its own project's
@@ -666,6 +735,12 @@ class MemoryConsolidator(BaseStage):
                 report.stats['orphaned_recon_escalations_flags_emitted'] = len(
                     orphan_sweep['flags'],
                 )
+
+        # Done-task memories naming paths the branch added then removed before merge (task 5626);
+        # emits flags, so it sits above dedup_flags — see reconciliation/unlanded_path_check.py.
+        unlanded = await check_unlanded_path_claims(self.memory, self.project_id, self.project_root, events)
+        report.items_flagged = (report.items_flagged or []) + list(unlanded.flags)
+        report.stats.update(unlanded.stats())
 
         # Always present (task-2029 amendment): downstream consumers that read this
         # stat symmetrically with stats['stage2_flag_markers_acknowledged'] (which is
@@ -875,16 +950,9 @@ class MemoryConsolidator(BaseStage):
             report.stats['entity_standing_decision_suppressed'] = sum(
                 _esd_result.suppressed_by_decision.values()
             )
-            _esd_kept_signatures = {
-                sig for f in report.items_flagged
-                if (sig := (compute_flag_signature(f) or compute_content_fingerprint_signature(f)))
-                is not None
-            }
-            esd_suppressed_signatures = {
-                sig for f in _pre_esd_flags
-                if (sig := (compute_flag_signature(f) or compute_content_fingerprint_signature(f)))
-                is not None and sig not in _esd_kept_signatures
-            }
+            esd_suppressed_signatures = _marker_signatures(
+                _pre_esd_flags, project_id=self.project_id
+            ) - _marker_signatures(report.items_flagged, project_id=self.project_id)
             # Per-cycle "storm escape": one active decision suppressing more than the
             # threshold in a single cycle is a signal it may be over-broad or the
             # entity's situation changed — file one L1 recon escalation for that
@@ -957,16 +1025,9 @@ class MemoryConsolidator(BaseStage):
             # separately above, out of dedup_flags' `stats` out-dict, alongside
             # the `reconciliation.stage1_flag_cross_project_fix_task_suppressed`
             # INFO log that names the specific fix task behind each drop.
-            _post_dedup_signatures = {
-                sig for f in report.items_flagged
-                if (sig := (compute_flag_signature(f) or compute_content_fingerprint_signature(f)))
-                is not None
-            }
-            suppressed_signatures = {
-                sig for f in _pre_dedup_flags
-                if (sig := (compute_flag_signature(f) or compute_content_fingerprint_signature(f)))
-                is not None and sig not in _post_dedup_signatures
-            }
+            suppressed_signatures = _marker_signatures(
+                _pre_dedup_flags, project_id=self.project_id
+            ) - _marker_signatures(report.items_flagged, project_id=self.project_id)
             # Fold in the entity-standing-decision drops (task 2896 γ): they are a
             # suppression, not a resolution, so — exactly like dedup_flags' own
             # suppression drops above — their signatures are excluded from
@@ -992,17 +1053,13 @@ class MemoryConsolidator(BaseStage):
             # list through each filter, so none of the filters' contracts change.
             # suppressed_signatures (computed above) is explicitly subtracted out —
             # suppression is not the same as resolved; see the snapshot comment above.
-            surviving_signatures = {
-                sig for f in report.items_flagged
-                if (sig := (compute_flag_signature(f) or compute_content_fingerprint_signature(f)))
-                is not None
-            }
+            surviving_signatures = _marker_signatures(
+                report.items_flagged, project_id=self.project_id
+            )
             dropped_flags = [
                 f for f in _pre_filter_flags
-                if (sig := (compute_flag_signature(f) or compute_content_fingerprint_signature(f)))
-                is not None
-                and sig not in surviving_signatures
-                and sig not in suppressed_signatures
+                if _marker_signatures([f], project_id=self.project_id)
+                - surviving_signatures - suppressed_signatures
             ]
             report.stats['stage1_flag_markers_acknowledged'] = await acknowledge_resolved_flags(
                 memory_service=self.memory,
@@ -1293,6 +1350,9 @@ class MemoryConsolidator(BaseStage):
         # `..._enumeration_incomplete_kind` names which way it was partial.
         # Two additions, one pattern — 0-vs-N ambiguities resolved in the
         # stats rather than left for a reader to reconstruct from logs.
+        # The `_candidates`/`_errors` pair closes the last one (task 4851):
+        # `_invalidated` alone cannot tell "nothing was stale" from "every
+        # invalidation failed".
         # Best-effort: a sweep failure must never abort the stage or leave a
         # partial/incorrect stat — it is logged and swallowed, and NONE of
         # these stats is set for this cycle.  That includes the enumeration
@@ -1319,6 +1379,12 @@ class MemoryConsolidator(BaseStage):
             )
             report.stats['stale_status_snapshot_edges_scanned'] = (
                 snapshot_sweep_stats['scanned']
+            )
+            report.stats['stale_status_snapshot_edges_candidates'] = (
+                snapshot_sweep_stats['candidate_edges']
+            )
+            report.stats['stale_status_snapshot_edges_errors'] = (
+                snapshot_sweep_stats['errors']
             )
             report.stats['stale_blocked_edges_superseded'] = (
                 snapshot_sweep_stats['superseded']
@@ -1538,11 +1604,15 @@ class MemoryConsolidator(BaseStage):
         # leak hazard as _fetch_degraded_sources above, so it gets the identical
         # precede-every-early-return placement.
         self._undatable_freshness_records = 0
+        self._unfinished_graphiti_write_start = None
 
         # Remediation mode: return focused payload with findings only
         if self.remediation_findings is not None:
             return await self._assemble_remediation_payload()
 
+        self._unfinished_graphiti_write_start = (
+            self.memory.earliest_unfinished_graphiti_write_start(self.project_id)
+        )
         # 1. Episodes since last reconciliation
         try:
             episodes = await self.memory.get_episodes(
@@ -1648,10 +1718,24 @@ class MemoryConsolidator(BaseStage):
         # 7b. Task Count Census (task 1785)
         task_count_census_section = self._build_task_count_census_section()
 
+        # 7c. Overreach shadow flags (design.md §6.1 O4, task 6137)
+        overreach_flags_section = render_overreach_flags_section(self.overreach_flags)
+
         # 8. Format
         episodes_str, ep_n = _format_episodes(new_episodes)
         memories_str, mem_n = _format_memories(new_memories)
         self._entity_summary_snapshot_lines_stripped = ep_n + mem_n
+        # Episodes arrive newest-first (undatable last), so one the watermark filter
+        # dropped proves nothing newer lay past the cap. mem0's get_all scrolls in
+        # point-id order, which proves nothing, so its note rests on the count alone.
+        if len(new_episodes) == len(episodes):
+            episodes_str = _append_note(episodes_str, fetch_cap_note(
+                fetched=len(episodes), noun='episode(s)', cap_name='episode_limit', cap=self.episode_limit,
+            ))
+        memories_str = _append_note(memories_str, fetch_cap_note(
+            fetched=len(mem0_memories), noun='memory record(s)', cap_name='memory_limit',
+            cap=self.memory_limit,
+        ))
 
         return f"""## Reconciliation Run — Stage 1: Memory Consolidation
 ## Project: {self.project_id}
@@ -1670,7 +1754,7 @@ class MemoryConsolidator(BaseStage):
 
 ### Previous Reconciliation
 {_format_watermark(watermark, include_freshness_cutoffs=True)}
-{prior_s3_section}{cycle_fence_section}{task_tree_section}{task_count_census_section}{await self._render_required_sections()}
+{prior_s3_section}{cycle_fence_section}{task_tree_section}{task_count_census_section}{overreach_flags_section}{await self._render_required_sections()}
 ## Your Task
 Review the above data and perform memory consolidation:
 1. Within Mem0: identify duplicates, contradictions, stale entries. Merge/delete as needed.
@@ -1713,8 +1797,17 @@ Review the above data and perform memory consolidation:
         # value from a prior time-windowed assemble_payload call (task 4574, same
         # leak hazard as _fetch_degraded_sources above).
         self._undatable_freshness_records = 0
+        self._unfinished_graphiti_write_start = None
 
         event_summary = _format_events(ap.events)
+        deferred_events_note = clip_note(
+            omitted=ap.events_remaining,
+            omitted_noun='buffered event(s)',
+            cap_name='reconciliation.token_budget',
+            cap=ap.token_budget,
+            dropped_first='the newest events (still buffered for a later chunk)',
+        )
+        event_summary = _append_note(event_summary, deferred_events_note)
 
         # Store status (cheap fetch, always useful)
         status = await self._fetch_status()
@@ -1746,6 +1839,9 @@ Review the above data and perform memory consolidation:
         # Task Count Census (task 1785)
         task_count_census_section = self._build_task_count_census_section()
 
+        # Overreach shadow flags (design.md §6.1 O4, task 6137)
+        overreach_flags_section = render_overreach_flags_section(self.overreach_flags)
+
         ctx_str, ctx_n = _format_context_items(ap.context_items)
         self._entity_summary_snapshot_lines_stripped = ctx_n
 
@@ -1763,7 +1859,7 @@ Review the above data and perform memory consolidation:
 
 ### Previous Reconciliation
 {_format_watermark(watermark)}
-{prior_s3_section}{cycle_fence_section}{task_tree_section}{task_count_census_section}{await self._render_required_sections()}
+{prior_s3_section}{cycle_fence_section}{task_tree_section}{task_count_census_section}{overreach_flags_section}{await self._render_required_sections()}
 ## Your Task
 Review the above data and perform memory consolidation:
 1. Within Mem0: identify duplicates, contradictions, stale entries. Merge/delete as needed.
@@ -1843,13 +1939,21 @@ Review the above data and perform memory consolidation:
         snapshot is retained for :meth:`run`'s citation guard.  A tree with no
         active task yields a real, empty snapshot, because an absent section
         tells this stage that no task is live; only an unset tree leaves it
-        None, and the guard inert.
+        None, and the guard inert.  Claimant heartbeats are aged at
+        ``filtered_task_tree_fetched_at``, the instant the tree was read, not
+        at render time (task 6027).
         """
         if self.filtered_task_tree is None:
             return ''
+        claims_read_at = resolve_tree_read_instant(
+            self.filtered_task_tree_fetched_at,
+            event='reconciliation.stage1_task_tree_read_instant_missing',
+            extra={'project_id': self.project_id},
+        )
         self._live_workflow_snapshot = await build_live_workflow_snapshot(
             self.filtered_task_tree.active_tasks,
             self.scope.project_root,
+            claims_read_at=claims_read_at,
         )
         section = self._live_workflow_snapshot.render()
         return '\n' + section if section else ''
@@ -1904,6 +2008,17 @@ This is a focused remediation run. Address ONLY the specific findings listed abo
 
 {_STAGE1_PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}{self._build_project_root_directive()}
 """
+
+
+def _marker_signatures(
+    flags: Iterable[dict[str, Any]], *, project_id: str
+) -> set[tuple[str, str]]:
+    """The ``stage1_flag_marker`` identities of *flags*, so every diff in
+    :meth:`MemoryConsolidator.run` compares keys from one identity space."""
+    return {
+        sig for f in flags
+        if (sig := compute_marker_signature(f, project_id=project_id)) is not None
+    }
 
 
 def _to_utc(dt: datetime) -> datetime:
@@ -1978,6 +2093,10 @@ def _format_events(events: list[ReconciliationEvent]) -> str:
     return '\n'.join(lines)
 
 
+def _append_note(body: str, note: str) -> str:
+    return f'{body}\n\n{note}' if note else body
+
+
 def _format_episodes(episodes: list[dict]) -> tuple[str, int]:
     if not episodes:
         return 'No new episodes.', 0
@@ -1987,17 +2106,9 @@ def _format_episodes(episodes: list[dict]) -> tuple[str, int]:
         raw = ep.get('content') or ''
         cleaned, n = strip_snapshot_lines(raw)
         total_stripped += n
-        content = cleaned[:500]
+        content = elide_text(cleaned, _RECORD_BODY_CHARS, field='content').text
         lines.append(f'- [{ep.get("uuid", "?")}] {ep.get("created_at", "?")}: {content}')
     return '\n'.join(lines), total_stripped
-
-
-def _parent_link(meta: Mapping[str, Any]) -> str:
-    """Render a child's parent link for prompts/stage1.py::CHILD_MEMORY_AUTHORITY_RULE."""
-    parent_id = _parent_id_in_meta(meta)
-    if parent_id is None:
-        return ''
-    return f' {PARENT_ID_KEY}={parent_id} kind={meta["kind"]}'
 
 
 def _format_memories(memories: list[dict]) -> tuple[str, int]:
@@ -2009,10 +2120,10 @@ def _format_memories(memories: list[dict]) -> tuple[str, int]:
         raw = m.get('memory') or ''
         cleaned, n = strip_snapshot_lines(raw)
         total_stripped += n
-        content = cleaned[:500]
+        content = elide_text(cleaned, _RECORD_BODY_CHARS, field='content').text
         meta = m.get('metadata', {}) or {}
         cat = meta.get('category', '?')
-        lines.append(f'- [{m.get("id", "?")}]{_parent_link(meta)} ({cat}): {content}')
+        lines.append(f'- [{m.get("id", "?")}]{render_parent_link(meta)} ({cat}): {content}')
     return '\n'.join(lines), total_stripped
 
 
@@ -2039,7 +2150,9 @@ def _format_findings(findings: list[dict]) -> str:
 
     Each finding is formatted with its header fields (description, severity,
     category, suggested_action) followed by the four typed citation lists
-    (cited_entities, cited_edges, cited_tasks, cited_memories) from PRD §9.3.
+    (cited_entities, cited_edges, cited_tasks, cited_memories) from PRD §9.3,
+    then the dangling-citation line naming the repair ids when the finding
+    carries that handoff record (task 5749).
     Empty citation lists are omitted from output.
 
     Rendering limits (reviewer finding incomplete_rendering):
@@ -2130,6 +2243,10 @@ def _format_findings(findings: list[dict]) -> str:
                 memory_strs += f', ... +{extra} more'
                 logger.debug('_format_findings: finding %d cited_memories truncated (%d dropped)', i, extra)
             parts.append(f'   Cited memories: {memory_strs}')
+
+        line = render_dangling_citation_line(f)
+        if line is not None:
+            parts.append(f'   {line}')
 
         lines.append('\n'.join(parts))
     return '\n'.join(lines)

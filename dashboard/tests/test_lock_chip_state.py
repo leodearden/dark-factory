@@ -22,6 +22,7 @@ import json
 import subprocess
 
 import pytest
+from _dashboard_helpers import node_path
 from _lock_chip_matrix import (
     CELL_MATRIX,
     MODULE_PATH,
@@ -32,7 +33,6 @@ from _lock_chip_matrix import (
     heatmap_module,
     heatmap_row,
     lock_chip_states_for,
-    node_path,
 )
 
 # Node driver: extracts the pure-JS helper section from scheduler_utils.jsx

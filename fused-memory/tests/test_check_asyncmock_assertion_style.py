@@ -479,3 +479,60 @@ class TestCliErrorHandling:
         # Read failure from the broken file is reported on stderr.
         assert 'test_broken.py' in captured.err
         assert 'simulated transient read error' in captured.err
+
+    def test_undecodable_file_reports_on_stderr_and_keeps_other_violations(
+        self, tmp_path: Path, capsys
+    ):
+        """Undecodable bytes are a read error (exit 2), not a traceback.
+
+        The bad file is named to sort first, so an implementation that returned
+        early on the read error would print no violations at all.
+        """
+        (tmp_path / 'test_a_unreadable.py').write_bytes(b'\xff\xfe not utf-8 at all\n')
+        (tmp_path / 'test_b_violating.py').write_text(_MIXED_STYLE_SOURCE)
+
+        assert _checker.main([str(tmp_path)]) == 2
+        captured = capsys.readouterr()
+        assert 'test_a_unreadable.py' in captured.err
+        assert 'test_b_violating.py' in captured.out, (
+            'a read error discarded violations collected from other files'
+        )
+
+    def test_violations_are_reported_in_sorted_file_and_line_order(
+        self, tmp_path: Path, capsys
+    ):
+        """Output is sorted by (file, line) across files, whatever the argument order.
+
+        The nested function's violation sits ABOVE the outer function's in the
+        source, but ast.walk is breadth-first and reaches the outer one first.
+        """
+        z = tmp_path / 'test_z.py'
+        z.write_text(
+            'def outer():\n'
+            '    def inner():\n'
+            '        m.x.assert_not_called()\n'
+            '        m.x.assert_not_awaited()\n'
+            '    m.y.assert_not_awaited()\n'
+            '    m.y.assert_not_called()\n'
+        )
+        a = tmp_path / 'test_a.py'
+        a.write_text(_MIXED_STYLE_SOURCE)
+
+        assert _checker.main([str(z), str(a)]) == 1
+        printed = [
+            (m.group(1), int(m.group(2)))
+            for m in re.finditer(r'^(.+?):(\d+):\d+: ', capsys.readouterr().out, re.MULTILINE)
+        ]
+        assert printed == [(str(a), 3), (str(z), 3), (str(z), 6)]
+
+    def test_explicit_non_test_file_is_still_scanned(self, tmp_path: Path, capsys):
+        """An explicit path bypasses the directory globs.
+
+        hooks/project-checks passes every staged .py under fused-memory/tests,
+        helper modules included, so a helper must be scanned when named.
+        """
+        helper = tmp_path / '_helper.py'
+        helper.write_text(_MIXED_STYLE_SOURCE)
+
+        assert _checker.main([str(helper)]) == 1
+        assert str(helper) in capsys.readouterr().out

@@ -28,6 +28,7 @@ import json
 import shlex
 import shutil
 import subprocess
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -610,6 +611,60 @@ class TestLaneStateReadPublishesUpdatedAt:
         assert published['UPDATED'] == '', (
             f'the pre-read default must be the unjudgeable reading; {published!r}'
         )
+
+
+def _epoch(timestamp: str) -> tuple[int, list[str]]:
+    """Run the SHIPPED ``lane_state_epoch`` on *timestamp*: its rc, and stdout lines."""
+    proc = _run_sourced(
+        f'lane_state_epoch {shlex.quote(timestamp)}\nprintf \'RC=%s\\n\' "$?"',
+    )
+    lines = proc.stdout.splitlines()
+    assert lines and lines[-1].startswith('RC='), (
+        f'the snippet did not report a return code; stdout={proc.stdout!r} '
+        f'stderr={proc.stderr!r}'
+    )
+    return int(lines[-1].removeprefix('RC=')), lines[:-1]
+
+
+class TestLaneStateEpoch:
+    """``lane_state_epoch`` is the ONE parse of a record's ``updated_at``.
+
+    Two consumers judge a lane's age by it (warm-lane-gc.sh's Pass-1 gate and
+    warm-lane-audit.sh's ``age_min``), so the unjudgeable readings must be the
+    same in both: a non-zero return and NOTHING on stdout.
+    """
+
+    @pytest.mark.parametrize(
+        'timestamp',
+        [
+            _ASSIGNED_RECORD['updated_at'],
+            # datetime.isoformat() of an aware datetime with microseconds: the
+            # shape LaneRecord actually stamps.
+            '2026-07-26T12:43:10.704531+00:00',
+        ],
+    )
+    def test_the_producers_shape_converts_to_epoch_seconds(self, timestamp: str) -> None:
+        rc, printed = _epoch(timestamp)
+        assert rc == 0, f'{timestamp!r} must be judgeable; printed={printed!r}'
+        # GNU date truncates the fractional seconds, as int() does.
+        assert printed == [str(int(datetime.fromisoformat(timestamp).timestamp()))], (
+            f'{timestamp!r} must print exactly its epoch seconds; got {printed!r}'
+        )
+
+    def test_the_empty_string_is_unjudgeable(self) -> None:
+        """The gotcha this function exists to own: GNU ``date -d ''`` exits 0.
+
+        It answers today's midnight, so a parse that handed it an unstamped
+        record's empty ``updated_at`` would read that record as stamped today.
+        """
+        rc, printed = _epoch('')
+        assert rc == 1, f'an empty stamp must be unjudgeable; rc={rc} printed={printed!r}'
+        assert printed == [], f'an unjudgeable stamp must print nothing; {printed!r}'
+
+    def test_garbage_is_unjudgeable(self) -> None:
+        rc, printed = _epoch('not-a-timestamp')
+        assert rc == 1, f'garbage must be unjudgeable; rc={rc} printed={printed!r}'
+        assert printed == [], f'an unjudgeable stamp must print nothing; {printed!r}'
 
 
 class TestLaneStateClass:

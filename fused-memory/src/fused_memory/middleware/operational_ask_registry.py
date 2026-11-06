@@ -69,12 +69,9 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
 
+from fused_memory.middleware.curator_types import CandidateTask
 from fused_memory.utils.safe_yaml import load_yaml_list_file
-
-if TYPE_CHECKING:
-    from fused_memory.middleware.task_curator import CandidateTask
 
 logger = logging.getLogger(__name__)
 _LOG_LABEL = "operational_ask_registry"

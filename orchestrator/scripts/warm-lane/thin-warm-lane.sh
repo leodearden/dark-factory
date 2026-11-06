@@ -75,7 +75,7 @@
 #   T4 — a live process reference at or under lane_dir (cwd / open fd / mmap)
 #        refuses (75), checked under the held T3 flock immediately before the
 #        rm. Mechanism: lib_live_refs.sh::live_ref_present; rationale: README.md
-#        "Delta 12".
+#        "Delta 17".
 
 set -euo pipefail
 

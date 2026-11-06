@@ -1,0 +1,25 @@
+{
+ "stream": "S10",
+ "prd_path": "docs/prds/review-all-planner-boundary-contracts.md",
+ "manifest_path": "docs/prds/review-all-planner-boundary-contracts.capability-manifest.yaml",
+ "leaves_estimate": 9,
+ "lead_rulings_on_open_questions": [
+  "Q1: the device-encoder half of fk-643fb20ec130 (device-neutral DispatchIntent with a control-owned encoder) stays open on task 699 (blocked, real-GX milestone): a dated note is appended and the key stamped there; S10 covers the prose half only.",
+  "Q2: keep C2's edge \u2014 S10-epsilon is held on S1's governed-finance builder leaf (x_seam_wait S1).",
+  "Q3: the S10 leaf that rewrites each optimiser docstring removes its .task/plan.json pointer and allowlist entry (alpha: base.py, persistence.py; gamma/delta: runner.py; eta: backtest.py, cache.py, weather_api.py); forecast/__init__.py stays with S25-zeta (1085); 420/859 already carry the note; second to land adapts."
+ ],
+ "lead_actions_at_decompose": [
+  "delta = task 516 amended in place; theta = task 1020 amended in place",
+  "add_dependency 601 (P-Fleet beta2a) -> S10-epsilon with a dated note",
+  "epsilon held on S1; gamma held on S4-iota/kappa if S4 unfiled",
+  "high leaves beta, delta, epsilon -> gate 1065"
+ ],
+ "cross_reference_lines": [
+  "Seam table: 'billing/config.py governed-finance builder' \u2014 S1 produces the code, S10 owns the seam contract (PRD \u00a79.5); 'Forecast shape' \u2014 S10 PRD \u00a79.1 is the contract MPC binds to.",
+  "S18: S10-epsilon inserts a stratum for optimiser directly above ingestion/billing (below simulator/ops/schemas) in docs/package-strata.toml in the commit that adds the optimiser->billing edge (confirmed).",
+  "S27: INV-5's second enforcer = tests/optimiser/test_finance_as_of.py::test_future_dated_finance_prices_the_window_as_of_its_start (S10-epsilon).",
+  "S20: BatchOutcome satisfies PlannedOutcome structurally; build_optimiser_batch(store, optimiser_interval) loses session_scope; composition call site adapts.",
+  "S16/S7: contention on identity.resolve; second to land adapts.",
+  "S3: require_schema_head makes the has_table branch unreachable."
+ ]
+}

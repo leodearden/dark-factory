@@ -34,7 +34,7 @@ import subprocess
 import sys
 import time
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 import pytest
@@ -47,7 +47,11 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
-from nested_pytest_session import binding_conftest, run_nested_pytest  # noqa: E402
+from nested_pytest_session import (  # noqa: E402
+    NESTED_SESSION_TIMEOUT_SECS,
+    binding_conftest,
+    run_nested_pytest,
+)
 
 import df_pytest_isolation  # noqa: E402
 from df_pytest_isolation import (  # noqa: E402
@@ -65,6 +69,7 @@ from df_pytest_isolation import (  # noqa: E402
     read_leaked_pid,
     run_in_new_session,
     run_in_new_session_until,
+    run_in_new_session_while_progressing,
     wait_pid_gone,
     wait_proof_grace_secs,
 )
@@ -470,6 +475,102 @@ class TestRunInNewSessionUntil:
             )
         finally:
             _reap(leaked_pid)
+
+
+def _line_count(path: Path) -> Callable[[], int]:
+    """A progress probe: how many lines *path* holds, 0 while it is absent."""
+    def progress() -> int:
+        try:
+            return len(path.read_text().splitlines())
+        except OSError:
+            return 0
+    return progress
+
+
+class TestRunInNewSessionWhileProgressing:
+    """The must-not-hang bound counts only time in which the child made no progress."""
+
+    def test_progress_re_arms_the_stall_bound(self, tmp_path: Path) -> None:
+        ticks = tmp_path / 'ticks'
+        env = dict(os.environ)
+        env['TICKS'] = str(ticks)
+
+        started = time.monotonic()
+        result = run_in_new_session_while_progressing(
+            ['bash', '-c', 'for i in 1 2 3 4 5 6 7 8; do echo x >> "$TICKS"; sleep 0.5; done; echo DONE'],
+            progress=_line_count(ticks), stall_timeout=3, env=env,
+        )
+        elapsed = time.monotonic() - started
+
+        assert isinstance(result, subprocess.CompletedProcess)
+        assert result.returncode == 0
+        assert result.stdout == 'DONE\n'
+        assert elapsed >= 3, (
+            f'the run took {elapsed:.1f}s, inside its own 3s stall bound, so it '
+            'never needed the bound re-armed and proves nothing about progress.'
+        )
+
+    def test_a_stalled_child_is_stopped_with_its_whole_group(self, tmp_path: Path) -> None:
+        pidfile = tmp_path / 'leaked.pid'
+        leaker = _leaker_script(tmp_path)
+        leaked_pid = None
+        try:
+            with pytest.raises(subprocess.TimeoutExpired) as exc_info:
+                run_in_new_session_while_progressing(
+                    ['bash', str(leaker)], progress=_pid_recorded(pidfile),
+                    stall_timeout=2, env=_leaker_env(pidfile),
+                )
+            leaked_pid = read_leaked_pid(pidfile)
+
+            assert exc_info.value.timeout == 2
+            stdout = exc_info.value.stdout
+            text = stdout.decode(errors='replace') if isinstance(stdout, bytes) else stdout
+            assert 'MAIN_UP' in (text or ''), (
+                f'partial stdout was lost on the stall path; got {text!r}'
+            )
+            assert wait_pid_gone(leaked_pid), (
+                f'pid {leaked_pid} is STILL ALIVE after the stall bound fired: the '
+                'stall path did not stop the whole process group.'
+            )
+        finally:
+            _reap(leaked_pid)
+
+    def test_a_raising_progress_probe_never_leaks_the_group(self, tmp_path: Path) -> None:
+        pidfile = tmp_path / 'leaked.pid'
+        leaker = _leaker_script(tmp_path)
+        pid_recorded = _pid_recorded(pidfile)
+
+        def progress() -> bool:
+            if pid_recorded():
+                raise RuntimeError('progress blew up')
+            return False
+
+        leaked_pid = None
+        try:
+            with pytest.raises(RuntimeError, match='progress blew up'):
+                run_in_new_session_while_progressing(
+                    ['bash', str(leaker)], progress=progress,
+                    stall_timeout=60, env=_leaker_env(pidfile),
+                )
+            leaked_pid = read_leaked_pid(pidfile)
+
+            assert wait_pid_gone(leaked_pid), (
+                f'pid {leaked_pid} is STILL ALIVE after the progress probe raised: '
+                'an exception escaping the poll loop left the process group running.'
+            )
+        finally:
+            _reap(leaked_pid)
+
+    def test_a_normal_exit_is_a_completed_process(self) -> None:
+        result = run_in_new_session_while_progressing(
+            ['bash', '-c', 'echo hi; echo boom >&2; exit 3'],
+            progress=lambda: 0, stall_timeout=30,
+        )
+
+        assert isinstance(result, subprocess.CompletedProcess)
+        assert result.returncode == 3
+        assert result.stdout == 'hi\n'
+        assert result.stderr == 'boom\n'
 
 
 class TestWaitProofGraceSecs:
@@ -1033,6 +1134,11 @@ class TestGuardIsLiveInThisRun:
 _LEAKER_NAME = 'restart-all-orchestrators.sh'
 _LEAKED_PIDFILE_NAME = 'leaked.pid'
 
+# A must-not-hang bound on a condition that normally holds within milliseconds,
+# derived to sit strictly below the outer cap so the nested test's own
+# diagnostic, not a TimeoutExpired, is what surfaces if the premise ever fails.
+_LEAKER_VISIBLE_CEILING_SECS = NESTED_SESSION_TIMEOUT_SECS // 4
+
 # 45s: long enough to still be alive at the nested session's teardown (~2-4s)
 # by a wide margin, short enough that a residue from a BROKEN guard expires on
 # its own rather than sitting on the box. The trailing statement keeps bash
@@ -1044,54 +1150,86 @@ sleep 45
 echo unreachable-inside-this-test
 '''
 
+# Models the window between `Popen` returning and /proc showing the drain
+# script, stretched from microseconds to a deterministic second: the SAME pid
+# carries no marker until it execs into the leaker. A stall that models a race,
+# as in scripts/tests/test_restart_all_orchestrators.py::
+# test_a_slow_start_still_defers_before_the_drain_lands — not a remedy.
+_LATE_EXEC_LAUNCHER_NAME = 'late-exec-launcher.sh'
+_LATE_EXEC_LAUNCHER = f'''\
+sleep 1
+exec bash "${{0%/*}}/{_LEAKER_NAME}"
+'''
 
-def _nested_test_source(*, leaks: bool) -> str:
+
+_LEAKING_TEST_BODY = '''\
+    proc = subprocess.Popen(
+        ["bash", str(SCRIPT)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True, env=dict(os.environ),
+    )
+    PIDFILE.write_text(str(proc.pid))
+    token = os.environ[LEAK_TOKEN_ENV]
+    deadline = time.monotonic() + VISIBLE_WITHIN_SECS
+    while proc.pid not in {pid for pid, _ in leaked_drain_processes(token)}:
+        assert proc.poll() is None and time.monotonic() < deadline, (
+            f'leaker pid {proc.pid} never became visible to the guard scan '
+            f'(returncode={proc.returncode})'
+        )
+        time.sleep(0.05)
+'''
+
+
+def _nested_test_source(*, leaks: bool, entrypoint: str = _LEAKER_NAME) -> str:
     """Source for the nested test module — which PASSES either way.
 
     The spawn mirrors both real spawners: ``dict(os.environ)`` for the child
     env, which is what hands it the NESTED session's token. That is also what
     keeps THIS session's guard blind to it — a different token — so the outer
-    run cannot fail on the leak its own test deliberately created.
+    run cannot fail on the leak its own test deliberately created. The leaking
+    test does not return until the guard's own scan can see its leaker, because
+    ``Popen`` returning does not mean ``/proc`` shows the new image yet.
     """
-    body = (
-        (
-            '    proc = subprocess.Popen(\n'
-            '        ["bash", str(SCRIPT)],\n'
-            '        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,\n'
-            '        start_new_session=True, env=dict(os.environ),\n'
-            '    )\n'
-            '    PIDFILE.write_text(str(proc.pid))\n'
-        )
-        if leaks
-        else '    pass\n'
-    )
     return (
         'import os\n'
         'import subprocess\n'
+        'import time\n'
         'from pathlib import Path\n'
         '\n'
+        # Never the guard fixture itself: see _GUARD_NAME on shadowing.
+        'from df_pytest_isolation import LEAK_TOKEN_ENV, leaked_drain_processes\n'
+        '\n'
         'HERE = Path(__file__).resolve().parent\n'
-        f'SCRIPT = HERE / {_LEAKER_NAME!r}\n'
+        f'SCRIPT = HERE / {entrypoint!r}\n'
         f'PIDFILE = HERE / {_LEAKED_PIDFILE_NAME!r}\n'
+        f'VISIBLE_WITHIN_SECS = {_LEAKER_VISIBLE_CEILING_SECS!r}\n'
         '\n'
         '\n'
         'def test_a_forgetful_spawner():\n'
         '    """PASSES. The damage is the surviving process, not this result."""\n'
-        + body
+        + (_LEAKING_TEST_BODY if leaks else '    pass\n')
     )
 
 
-def _nested_run(root: Path, *, leaks: bool) -> subprocess.CompletedProcess[str]:
+def _nested_run(
+    root: Path,
+    *,
+    leaks: bool,
+    extra_files: Mapping[str, str] | None = None,
+    entrypoint: str = _LEAKER_NAME,
+) -> subprocess.CompletedProcess[str]:
     """Run a throwaway pytest session wired to the guard, in its own tmp tree.
 
     *root* is passed in rather than derived so the caller knows the pidfile path
     BEFORE the run starts, and can therefore reap a leaker even when this call
-    raises.
+    raises. *extra_files* join the nested tree; *entrypoint* names the one the
+    leaking test spawns.
     """
     return run_nested_pytest(root, {
         'conftest.py': binding_conftest(_GUARD_NAME),
         _LEAKER_NAME: _NESTED_LEAKER,
-        'test_forgetful.py': _nested_test_source(leaks=leaks),
+        'test_forgetful.py': _nested_test_source(leaks=leaks, entrypoint=entrypoint),
+        **(extra_files or {}),
     })
 
 
@@ -1133,6 +1271,32 @@ def _reap_leaker(pid: int | None) -> None:
     _reap(pid)
 
 
+def _assert_the_leak_failed_the_run(
+    result: subprocess.CompletedProcess[str], pidfile: Path,
+) -> None:
+    """The nested test passed, yet the guard failed the run naming its leaker."""
+    combined = result.stdout + result.stderr
+    leaked_pid = _read_pid_file(pidfile)
+
+    assert result.returncode != 0, (
+        'a run that leaked a drain process exited 0 — the guard is '
+        f'inert. stdout={result.stdout!r}'
+    )
+    assert '1 passed' in combined, (
+        'the nested TEST must still pass, or this proves nothing about '
+        f'a green suite being caught. output={combined!r}'
+    )
+    assert leaked_pid is not None, (
+        f'the nested test recorded no pid in {pidfile}; the harness is '
+        'broken, which says nothing either way about the guard.'
+    )
+    assert str(leaked_pid) in combined, (
+        f'the guard did not name the leaked pid {leaked_pid}. Triage '
+        f'has to be possible from the failure output alone: {combined!r}'
+    )
+    assert 'run_in_new_session' in combined, combined
+
+
 class TestTheGuardFailsTheRunEndToEnd:
     """A leak must cost the RUN, not merely log something."""
 
@@ -1142,27 +1306,29 @@ class TestTheGuardFailsTheRunEndToEnd:
         root = tmp_path / 'leaking'
         pidfile = root / _LEAKED_PIDFILE_NAME
         try:
-            result = _nested_run(root, leaks=True)
-            combined = result.stdout + result.stderr
-            leaked_pid = _read_pid_file(pidfile)
+            _assert_the_leak_failed_the_run(_nested_run(root, leaks=True), pidfile)
+        finally:
+            _reap_leaker(_read_pid_file(pidfile))
 
-            assert result.returncode != 0, (
-                'a run that leaked a drain process exited 0 — the guard is '
-                f'inert. stdout={result.stdout!r}'
+    def test_a_leaker_whose_exec_lands_late_still_fails_the_session(
+        self, tmp_path: Path,
+    ) -> None:
+        """The nested test must not return before the guard's scan can see its leaker.
+
+        The launcher holds the leaker's pid marker-free for a second before it
+        execs into the drain-named script, so a nested test that returns as soon
+        as ``Popen`` does hands the guard a process it correctly cannot match.
+        """
+        root = tmp_path / 'late-exec'
+        pidfile = root / _LEAKED_PIDFILE_NAME
+        try:
+            result = _nested_run(
+                root,
+                leaks=True,
+                extra_files={_LATE_EXEC_LAUNCHER_NAME: _LATE_EXEC_LAUNCHER},
+                entrypoint=_LATE_EXEC_LAUNCHER_NAME,
             )
-            assert '1 passed' in combined, (
-                'the nested TEST must still pass, or this proves nothing about '
-                f'a green suite being caught. output={combined!r}'
-            )
-            assert leaked_pid is not None, (
-                f'the nested test recorded no pid in {pidfile}; the harness is '
-                'broken, which says nothing either way about the guard.'
-            )
-            assert str(leaked_pid) in combined, (
-                f'the guard did not name the leaked pid {leaked_pid}. Triage '
-                f'has to be possible from the failure output alone: {combined!r}'
-            )
-            assert 'run_in_new_session' in combined, combined
+            _assert_the_leak_failed_the_run(result, pidfile)
         finally:
             _reap_leaker(_read_pid_file(pidfile))
 
@@ -1179,3 +1345,77 @@ class TestTheGuardFailsTheRunEndToEnd:
             f'stdout={result.stdout!r} stderr={result.stderr!r}'
         )
         assert 'LEAKED' not in result.stdout
+
+
+def _arming_conftest() -> str:
+    """Source for a nested conftest, one directory below the root, that arms the guard.
+
+    It reaches the guard through :func:`df_pytest_isolation.arm_leaked_drain_process_guard`
+    from ``pytest_configure``, the way the subproject conftests do, and binds no
+    fixture by import.
+    """
+    return (
+        'import sys\n'
+        'from pathlib import Path\n'
+        '\n'
+        'sys.path.insert(0, str(Path(__file__).resolve().parents[1]))\n'
+        '\n'
+        'from df_pytest_isolation import arm_leaked_drain_process_guard\n'
+        '\n'
+        '\n'
+        'def pytest_configure(config):\n'
+        '    arm_leaked_drain_process_guard(config)\n'
+    )
+
+
+def _armed_suite(suite: str, *, leaks: bool) -> dict[str, str]:
+    """One test root, *suite*, armed by :func:`_arming_conftest`.
+
+    *suite* must not start with ``test``: pytest loads such a directory's
+    conftest with the initial conftests, and this tree exists to have it
+    discovered mid-collection instead.  It also names the test module, since
+    two suites' modules may not share a basename.
+    """
+    return {
+        f'{suite}/conftest.py': _arming_conftest(),
+        f'{suite}/{_LEAKER_NAME}': _NESTED_LEAKER,
+        f'{suite}/test_forgetful_{suite}.py': _nested_test_source(leaks=leaks),
+    }
+
+
+class TestArmLeakedDrainProcessGuard:
+    """The subproject conftests' wiring arms the guard with no conftest binding.
+
+    A suite named on the command line loads its conftest before configure, as a
+    subproject's own ``pytest tests/`` does. A tree collected whole from the
+    nested root discovers it mid-collection instead, where ``pytest_plugins``
+    is refused.
+    """
+
+    @pytest.mark.parametrize(
+        'targets', [('suite_a',), ()], ids=['loaded-at-startup', 'found-mid-collection'],
+    )
+    def test_a_leak_under_an_armed_suite_fails_the_run(
+        self, tmp_path: Path, targets: tuple[str, ...],
+    ) -> None:
+        root = tmp_path / 'armed'
+        pidfile = root / 'suite_a' / _LEAKED_PIDFILE_NAME
+        try:
+            result = run_nested_pytest(
+                root, _armed_suite('suite_a', leaks=True), targets=targets,
+            )
+            _assert_the_leak_failed_the_run(result, pidfile)
+        finally:
+            _reap_leaker(_read_pid_file(pidfile))
+
+    def test_two_suites_arming_in_one_session_run_clean(self, tmp_path: Path) -> None:
+        """Arming twice is a no-op, not pytest's duplicate-plugin error."""
+        result = run_nested_pytest(tmp_path / 'two-roots', {
+            **_armed_suite('suite_a', leaks=False),
+            **_armed_suite('suite_b', leaks=False),
+        })
+
+        assert result.returncode == 0, (
+            f'stdout={result.stdout!r} stderr={result.stderr!r}'
+        )
+        assert '2 passed' in result.stdout, result.stdout

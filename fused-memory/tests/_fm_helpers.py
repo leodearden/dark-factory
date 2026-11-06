@@ -27,8 +27,9 @@ import types
 import uuid
 import warnings
 import weakref
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -36,14 +37,13 @@ import httpx
 import pytest
 from openai import RateLimitError
 from pydantic import BaseModel
+from shared.project_layout import tasks_db
 
 from fused_memory.backends.graphiti_client import (
-    INCOMPLETE_CENSUS_UNAVAILABLE,
-    INCOMPLETE_SHORT_READ,
-    INCOMPLETE_STRUCTURAL_KINDS,
+    INCOMPLETE_KINDS,
     PagedRead,
+    ReadCompleteness,
 )
-from fused_memory.utils.target_store_preflight import task_store_path
 
 # Constants for the process lifetime — lifted out of pydantic_spec (task 1426)
 # to avoid re-computing BaseModel reflection on every call.
@@ -155,6 +155,11 @@ class MockEdge:
     episodes: list[str] = field(default_factory=list)
     valid_at: Any = None
     invalid_at: Any = None
+    # graphiti_core's EntityEdge carries `expired_at` (graphiti_core/edges.py).
+    # A restored edge keeps it with `invalid_at` cleared; the double carries it so
+    # tests can express that signature (task 4714).
+    expired_at: Any = None
+    created_at: Any = None
 
 
 @dataclass
@@ -323,11 +328,6 @@ def extract_params(call_args: Any) -> dict:
 # projects into stats — so the two must be settable independently.
 # ---------------------------------------------------------------------------
 
-_KNOWN_INCOMPLETE_KINDS: frozenset[str] = INCOMPLETE_STRUCTURAL_KINDS | {
-    INCOMPLETE_CENSUS_UNAVAILABLE,
-    INCOMPLETE_SHORT_READ,
-}
-
 
 def complete_paged_read(
     *, rows_seen: int = 0, expected_rows: int | None = None
@@ -357,7 +357,7 @@ def incomplete_paged_read(
 ) -> PagedRead:
     """A PagedRead reporting an INCOMPLETE enumeration of the given kind.
 
-    `kind` is validated against the four `INCOMPLETE_*` constants rather than
+    `kind` is validated against `INCOMPLETE_KINDS` rather than
     taken on trust: a typo'd kind string matches no policy branch, so it would
     quietly behave like a complete read and the test would pass for the wrong
     reason.
@@ -366,9 +366,9 @@ def incomplete_paged_read(
     mirroring the real backend's shape closely enough that an assertion on the
     reason reaching an operator-facing message is meaningful.
     """
-    assert kind in _KNOWN_INCOMPLETE_KINDS, (
+    assert kind in INCOMPLETE_KINDS, (
         f'unknown incomplete_kind {kind!r}; expected one of '
-        f'{sorted(_KNOWN_INCOMPLETE_KINDS)}'
+        f'{sorted(INCOMPLETE_KINDS)}'
     )
     if reason is None:
         reason = (
@@ -384,6 +384,11 @@ def incomplete_paged_read(
         reason=reason,
         incomplete_kind=kind,
     )
+
+
+#: The verdict for a proven-complete read, for the StaleSummaryResult fields a
+#: test does not care about (task 4914).
+COMPLETE_READ = ReadCompleteness(complete=True, incomplete_kind=None)
 
 
 # ---------------------------------------------------------------------------
@@ -1597,6 +1602,60 @@ def _init_git_repo(path) -> str:
     ).stdout.strip()
 
 
+def make_db_without_claimant_columns(db_path: pathlib.Path, *, status: str = 'pending') -> None:
+    """Create a tasks.db in the v1 shape but stamped ``user_version = 2`` (columns absent).
+
+    Simulates a connection whose claimant columns never got ALTERed in —
+    e.g. a routine orchestrator restart racing ahead of the fused-memory
+    deploy that ships this migration. Opening it runs only the v2->v3
+    candidate_key step (the v1->v2 claimant ALTER is gated on ``version < 2``
+    and is skipped for an already-v2 DB), so the claimant columns stay
+    absent, exercising set_task_status's fail-safe (WARNING, no error) path.
+
+    ``status`` seeds the single row's status column (default ``'pending'``,
+    matching every pre-existing caller); pass e.g. ``'done'`` to exercise
+    the fail-safe path on an already-terminal row.
+    """
+    import sqlite3
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS tasks (
+            tag           TEXT NOT NULL DEFAULT 'master',
+            id            INTEGER NOT NULL,
+            title         TEXT NOT NULL,
+            description   TEXT,
+            details       TEXT,
+            test_strategy TEXT,
+            status        TEXT NOT NULL,
+            priority      TEXT,
+            metadata      TEXT,
+            updated_at    TEXT NOT NULL,
+            PRIMARY KEY (tag, id)
+        );
+        CREATE INDEX IF NOT EXISTS ix_tasks_status ON tasks (tag, status);
+        CREATE TABLE IF NOT EXISTS dependencies (
+            tag        TEXT NOT NULL DEFAULT 'master',
+            task_id    INTEGER NOT NULL,
+            depends_on INTEGER NOT NULL,
+            PRIMARY KEY (tag, task_id, depends_on)
+        );
+        CREATE TABLE IF NOT EXISTS id_counters (
+            tag    TEXT NOT NULL DEFAULT 'master',
+            max_id INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (tag)
+        );
+    """)
+    conn.execute(
+        "INSERT INTO tasks (tag, id, title, status, updated_at) "
+        "VALUES ('master', 1, 'stranded-shape task', ?, '2026-01-01T00:00:00.000Z')",
+        (status,),
+    )
+    conn.execute("PRAGMA user_version = 2")
+    conn.commit()
+    conn.close()
+
+
 def _make_rate_limit_error(
     message: str = 'Rate limit exceeded.',
     code: str = 'insufficient_quota',
@@ -1982,7 +2041,7 @@ def make_populated_task_store(project_root: pathlib.Path) -> pathlib.Path:
     file; agreement with the real backend is pinned once, in
     tests/test_target_store_preflight.py.
     """
-    db = task_store_path(project_root)
+    db = tasks_db(project_root)
     db.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(db)
     try:
@@ -2000,7 +2059,7 @@ def make_zero_byte_task_store(project_root: pathlib.Path) -> pathlib.Path:
     The residue shape ``target_store_preflight``'s guard must refuse, and the
     counterpart of :func:`make_populated_task_store`.
     """
-    db = task_store_path(project_root)
+    db = tasks_db(project_root)
     db.parent.mkdir(parents=True)
     db.touch()
     return db
@@ -2027,6 +2086,47 @@ def _lease_dir_env() -> str:
     to a module object they may replace is a hazard with nothing to buy it.
     """
     return load_script_module(_CLEANUP_TEST_COLLECTIONS_SCRIPT).LEASE_DIR_ENV
+
+
+def isolated_lease_dir(monkeypatch, directory: pathlib.Path) -> pathlib.Path:
+    """Point the reaper's lease directory at *directory*, through *monkeypatch*.
+
+    The one mechanism behind `lease_dir_fixture` and
+    `lease_isolated_monkeypatch`.  *directory* is not created, for the reason
+    `lease_dir_fixture` gives.
+    """
+    monkeypatch.setenv(_lease_dir_env(), str(directory))
+    return directory
+
+
+@contextlib.contextmanager
+def lease_isolated_monkeypatch(
+    reaper: types.ModuleType, lease_directory: pathlib.Path,
+) -> Iterator[tuple[pytest.MonkeyPatch, list[pathlib.Path]]]:
+    """A `pytest.MonkeyPatch.context()` for a recording made at module scope.
+
+    A module-scoped fixture is set up BEFORE the autouse `lease_dir` fixture,
+    so a recorder that opened a bare context would lease the machine-global
+    directory the live cron reads.  This one yields its monkeypatch with the
+    lease directory already isolated to *lease_directory*, together with a
+    list that gains the directory every `reaper.hold_lease` inside the
+    context resolved, so a recording can carry where its leases really went
+    rather than only that it asked.
+
+    *reaper* is the module the code under test resolves, passed in for the
+    reason `_lease_dir_env` keeps no module reference of its own.
+    """
+    held_in: list[pathlib.Path] = []
+    hold_lease = reaper.hold_lease
+
+    def _observed_hold_lease(*args, directory=None, **kwargs):
+        held_in.append(reaper.lease_dir() if directory is None else pathlib.Path(directory))
+        return hold_lease(*args, directory=directory, **kwargs)
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        isolated_lease_dir(monkeypatch, lease_directory)
+        monkeypatch.setattr(reaper, 'hold_lease', _observed_hold_lease)
+        yield monkeypatch, held_in
 
 
 @pytest.fixture(autouse=True, name='lease_dir')
@@ -2058,9 +2158,7 @@ def lease_dir_fixture(tmp_path, monkeypatch):
     shadowed by every ``def test_x(self, lease_dir)`` parameter, which ruff
     reports as F811 once per test.
     """
-    directory = tmp_path / 'ephemeral-collection-leases'
-    monkeypatch.setenv(_lease_dir_env(), str(directory))
-    return directory
+    return isolated_lease_dir(monkeypatch, tmp_path / 'ephemeral-collection-leases')
 
 
 def as_async_run_git(side_effect):
@@ -2229,3 +2327,33 @@ class FakeMemoryLookup:
         if isinstance(verdict, BaseException):
             raise verdict
         return verdict
+
+
+async def seed_resolved_ticket(
+    store: Any,
+    db_path: pathlib.Path,
+    project_id: str,
+    *,
+    status: str,
+    latency_s: float,
+    resolved_at: datetime,
+    reason: str | None = None,
+) -> str:
+    """Submit and resolve one ticket, then pin its age and resolve latency.
+
+    The ticket goes through ``TicketStore``'s public writers, which both stamp
+    the wall clock; the timestamps are then rewritten through an independent
+    connection to *db_path*, treating the db file as the fixture.
+    """
+    import aiosqlite
+
+    ticket_id = await store.submit(project_id, '{}')
+    await store.mark_resolved(ticket_id, status=status, task_id='1', reason=reason)
+    created_at = resolved_at - timedelta(seconds=latency_s)
+    async with aiosqlite.connect(str(db_path), timeout=5) as db:
+        await db.execute(
+            'UPDATE tickets SET created_at = ?, resolved_at = ? WHERE ticket_id = ?',
+            (created_at.isoformat(), resolved_at.isoformat(), ticket_id),
+        )
+        await db.commit()
+    return ticket_id

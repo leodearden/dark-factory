@@ -3,28 +3,16 @@
 
 Scores a session transcript's confusion signals with a single zero-token
 pass (:func:`score_signals`), classifies its agent class
-(:func:`classify_agent_class`), collapses near-duplicate shapes
+(:func:`detectors.classify_agent_class`), collapses near-duplicate shapes
 (:func:`shape_fingerprint` / :func:`dedupe_shapes`), and picks a
 budget-bounded, stratified subset for the nightly digest
 (:func:`stratified_sample`). :func:`main` wires
-``config.load_config -> inventory.enumerate_sessions -> score_signals ->
-classify_agent_class -> stratified_sample -> render_manifest`` into the
-CLI acceptance surface.
+``config.load_config -> inventory.enumerate_sessions -> score_session ->
+stratified_sample -> render_manifest`` into the CLI acceptance surface.
 
 Task β of the confusion-reduction PRD (plans/confusion-reduction-prd.md
-§5.2, contract §7.4). It owns its own signal-scoring primitives, reusing
-only the low-level JSONL-line iterator
-(:func:`legibility.inventory.iter_json_lines`) from its own sibling
-module rather than duplicating it.
-
-This module was originally "self-contained — does not import task α's
-``digest.py``". That is now deliberately relaxed for exactly one reason:
-``budgets.max_daily_digest_bytes`` is a DIGEST-OUTPUT budget, and charging
-a record's real cost against it means knowing how big its digest will be,
-which only the digest renderer can answer (:func:`digest_byte_cost_fn`).
-The signal-scoring primitives remain unshared; the dependency is on
-α's renderer alone, and it is one-directional (``digest.py`` imports
-nothing from ``legibility.*``, so there is no cycle).
+§5.2, contract §7.4). Signal hits come from :mod:`legibility.detectors`
+(PRD §7.2.4).
 """
 from __future__ import annotations
 
@@ -34,10 +22,11 @@ import logging
 import math
 import re
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 # Self-bootstrap for standalone `python scripts/legibility/sampling.py` runs
@@ -47,7 +36,7 @@ from typing import Any
 if __name__ == '__main__':
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from legibility import digest  # noqa: E402
+from legibility import detectors, digest  # noqa: E402  # debt: task 6760
 from legibility.config import LegibilityConfig, load_config  # noqa: E402
 from legibility.inventory import (  # noqa: E402
     SessionRecord,
@@ -58,393 +47,130 @@ from legibility.inventory import (  # noqa: E402
 
 logger = logging.getLogger('legibility.sampling')
 
-# iter_json_lines lives in legibility.inventory — this module reuses that
-# single fire-and-forget-transcript-read implementation rather than keeping
-# its own byte-for-byte copy (a future fix to the graceful-degrade contract
-# then only needs to land in one place).
-
 
 # ---------------------------------------------------------------------------
-# score_signals — 5-class zero-token confusion-signal scorer (PRD §7.2)
+# score_signals — the zero-token per-session signal tally (PRD §7.2)
 # ---------------------------------------------------------------------------
 
-_NOT_FOUND_PATTERNS: tuple[str, ...] = (
-    'no such file',
-    'not found',
-    'does not exist',
-    'command not found',
-)
-"""Case-insensitive substrings; matched against any record's flattened text."""
+class SignalCounts(Mapping[detectors.SignalClass, int]):
+    """How many records of one session hold each signal class. Every
+    :class:`detectors.SignalClass` is a key, 0 where *counts* has none, and
+    the counts are read-only."""
 
-_SELF_CORRECT_PATTERNS: tuple[str, ...] = (
-    'actually,',
-    'wait,',
-    'let me reconsider',
-    "that's wrong",
-    'my mistake',
-)
-"""Case-insensitive substrings; matched ONLY against assistant text blocks
-(native-carrier scoping) — never a tool_result or a tool_use input, so an
-agent authoring test data containing one of these phrases is never
-mis-scored as a real self-correction."""
+    __slots__ = ('_counts',)
 
-_DF_GUARD_TEXT_PATTERNS: tuple[str, ...] = (
-    'phantom-done',
-    'phantom_done',
-    'premise-lint',
-    'premise_lint',
-    'false premise',
-    'guard trip',
-    'scope_violation',
-    'done_gate_missing_files',
-)
-"""Case-insensitive substrings drawn from real dark_factory guard/refusal
-vocabulary: the phantom-done gate (orchestrator/scheduler.py,
-fused-memory/middleware/task_interceptor.py), the premise-lint guard
-(fused-memory/reconciliation/recon_self_model.py,
-fused-memory/middleware/premise_lint_guard.py), and escalation
-categorization (escalation/server.py)."""
+    def __init__(self, counts: Mapping[detectors.SignalClass, int]) -> None:
+        strays = [key for key in counts if not isinstance(key, detectors.SignalClass)]
+        if strays:
+            raise TypeError(f'signal counts are keyed by detectors.SignalClass, not {strays!r}')
+        self._counts: Mapping[detectors.SignalClass, int] = MappingProxyType({
+            signal: counts.get(signal, 0) for signal in detectors.SignalClass
+        })
 
-_DF_GUARD_TOOL_NAMES: frozenset[str] = frozenset({
-    'mcp__plan-tools__report_false_premise',
-    'mcp__plan-tools__report_unactionable_task',
-    'mcp__plan-tools__report_task_already_done',
-    'mcp__plan-tools__report_blocking_dependency',
-})
-"""The real plan-tools guard/refusal tool names
-(orchestrator/src/orchestrator/mcp/plan_tools.py) — a structural
-tool_use.name match, never a text/substring guess."""
+    @classmethod
+    def of(cls, **counts: int) -> SignalCounts:
+        """Counts named by signal-class value, e.g. ``SignalCounts.of(tool_error=1)``."""
+        vocabulary = [signal.value for signal in detectors.SignalClass]
+        unknown = sorted(set(counts) - set(vocabulary))
+        if unknown:
+            raise ValueError(f'unknown signal classes {unknown}; the vocabulary is {vocabulary}')
+        return cls({detectors.SignalClass(name): count for name, count in counts.items()})
 
-_INTERRUPT_PATTERNS: tuple[str, ...] = ('interrupted by user',)
+    def __getitem__(self, signal: detectors.SignalClass) -> int:
+        return self._counts[signal]
 
+    def __iter__(self) -> Iterator[detectors.SignalClass]:
+        return iter(self._counts)
 
-def _message_content(record: dict[str, Any]) -> Any:
-    message = record.get('message')
-    if not isinstance(message, dict):
-        return None
-    return message.get('content')
+    def __len__(self) -> int:
+        return len(self._counts)
 
+    def __hash__(self) -> int:
+        return hash(tuple(self._counts.values()))
 
-def _record_text(record: dict[str, Any]) -> str:
-    """Flatten a record's message.content into one lowercased text blob.
-
-    ``content`` is either a plain string or a list of content blocks; each
-    block contributes its 'text' field (assistant/user text, thinking) and
-    its 'content' field (tool_result output, itself sometimes a string).
-    Used for the plain substring-scan classes (not_found, df_guard text
-    patterns, interrupt) — never for self_correct, which is scoped to
-    assistant text blocks only via :func:`_assistant_text`.
-    """
-    content = _message_content(record)
-    if isinstance(content, str):
-        return content.lower()
-    if isinstance(content, list):
-        parts = []
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            text = block.get('text')
-            if isinstance(text, str):
-                parts.append(text)
-            block_content = block.get('content')
-            if isinstance(block_content, str):
-                parts.append(block_content)
-        return '\n'.join(parts).lower()
-    return ''
-
-
-def _assistant_text(record: dict[str, Any]) -> str:
-    """Flatten only assistant 'text' content blocks (native-carrier scoping)."""
-    if record.get('type') != 'assistant':
-        return ''
-    content = _message_content(record)
-    if not isinstance(content, list):
-        return ''
-    # Walrus-bound so the isinstance narrowing reaches the element expression;
-    # see the note in digest.py's _first_text_block. Filtering is unchanged.
-    parts = [
-        block_text for block in content
-        if isinstance(block, dict) and block.get('type') == 'text'
-        and isinstance(block_text := block.get('text'), str)
-    ]
-    return '\n'.join(parts).lower()
-
-
-def _classify_tool_errors(record: dict[str, Any]) -> tuple[bool, bool]:
-    """Return (has_genuine_error, has_designed_outcome) for one *record*.
-
-    Entry into the scan is structural only — a block counts iff it is a
-    tool_result with a truthy ``is_error`` flag, never a text/"FAIL"
-    substring match (mirrors the decoy-FAIL suppression decision applied
-    to task α's digest.py). Only AFTER a block has qualified structurally
-    is its already-extracted content passed to the classifier, so no
-    substring hunt can resurrect a decoy.
-
-    Splitting genuine from designed reuses digest's SINGLE definition --
-    the one PUBLIC entry point :func:`digest.classify_error_content`,
-    which takes a raw tool_result ``content`` field and returns
-    ``(exit_code, designed_label)`` -- rather than growing a second one
-    here or reaching across the module boundary into digest's private
-    helpers. Before task 3610 this module's parallel five-class
-    tally ranked a ceiling-only session as 13 tool_errors while the
-    digest reported 0 — a silent divergence between two things both
-    documented as "PRD §7.2 signal_counts" (07-31 census cluster 1.3).
-
-    Returns two INDEPENDENT booleans, not a partition of the record: a
-    record carrying both a real failure and a declared ceiling reports
-    True for both, and each class increments once. That preserves the
-    one-increment-per-class-per-RECORD semantics documented on
-    :func:`score_signals`.
-    """
-    if record.get('type') != 'user':
-        return False, False
-    content = _message_content(record)
-    if not isinstance(content, list):
-        return False, False
-
-    genuine = designed = False
-    for block in content:
-        if not (isinstance(block, dict) and block.get('type') == 'tool_result'):
-            continue
-        if not block.get('is_error'):
-            continue
-        _, label = digest.classify_error_content(block.get('content'))
-        if label is None:
-            genuine = True
-        else:
-            designed = True
-    return genuine, designed
-
-
-def _has_guard_tool_use(record: dict[str, Any]) -> bool:
-    """True iff *record* is an assistant record invoking a known guard/refusal tool."""
-    if record.get('type') != 'assistant':
-        return False
-    content = _message_content(record)
-    if not isinstance(content, list):
-        return False
-    return any(
-        isinstance(block, dict) and block.get('type') == 'tool_use'
-        and block.get('name') in _DF_GUARD_TOOL_NAMES
-        for block in content
-    )
-
-
-@dataclass(frozen=True)
-class SignalCounts:
-    """Per-class confusion-signal counts for one session (PRD §7.2 signal_counts)."""
-
-    tool_error: int = 0
-    not_found: int = 0
-    self_correct: int = 0
-    df_guard: int = 0
-    interrupt: int = 0
-    designed_outcome: int = 0
+    def __repr__(self) -> str:
+        fields = ', '.join(f'{signal.value}={count}' for signal, count in self._counts.items())
+        return f'{type(self).__name__}({fields})'
 
     @property
     def total_signal(self) -> int:
-        """Sum of the five SCORED confusion classes — the sampler's ranking scale.
-
-        ``designed_outcome`` is deliberately excluded. A declared
-        bounded-poll ceiling is a designed loop-continuation, not agent
-        confusion, so it is counted for visibility but must not lift a
-        session's rank; this mirrors digest.py leaving it out of
-        SIGNAL_WEIGHTS (task 3610, 07-31 census cluster 1.3).
-
-        Excluded from the scale means excluded from the zero-signal gate
-        too, since that gate is ``score > 0`` over this value: a session
-        whose ONLY structured errors are designed outcomes totals 0, is
-        counted into ``zero_signal_dropped``, and never reaches the digest
-        stage — so its ``designed_outcome`` count is never observable
-        downstream. That is intended (such a session carries no confusion
-        signal to read), but it bounds the "counted for visibility" claim
-        to MIXED sessions; see PRD §7.2.1.
-        """
-        return (
-            self.tool_error + self.not_found + self.self_correct
-            + self.df_guard + self.interrupt
-        )
+        """The sampler's ranking scale: the confusion classes only. A
+        designed outcome is counted but never ranks a session, so a session
+        holding nothing else scores 0 and is dropped before digest time
+        (PRD §7.2.1)."""
+        return sum(self._counts[signal] for signal in detectors.CONFUSION_CLASSES)
 
 
-def _score_and_find_first_turn(path: Path) -> tuple[SignalCounts, dict[str, Any] | None]:
-    """Single pass over *path*, producing both a signal score and the first user turn.
+@dataclass(frozen=True)
+class TranscriptScan:
+    """What one read of a transcript yields: its signal counts, its agent
+    class, the text of its first non-sidechain, non-meta user turn ('' when
+    there is none), and the first ``sessionId`` any record carries (the
+    session string the digest frontmatter, and so every coding record and
+    ledger row, carries)."""
 
-    :func:`score_signals` already has to read every record in *path* (a
-    confusion signal can occur anywhere in the file); :func:`main`'s
-    scoring loop separately called :func:`_find_first_user_turn` on the
-    same path, re-opening and re-parsing the same transcript purely to
-    locate its first non-sidechain, non-meta user turn
-    (reviewer_comprehensive/performance, task 2573 amendment pass #2).
-    This helper folds both searches into the SAME iteration over
-    :func:`legibility.inventory.iter_json_lines`, so a session transcript
-    is read once instead of twice. :func:`score_signals` and
-    :func:`_find_first_user_turn` both delegate to this function, so every
-    other caller (including the direct unit tests of :func:`score_signals`)
-    keeps its existing single-purpose signature and exact return value.
-    """
-    tool_error = not_found = self_correct = df_guard = interrupt = 0
-    designed_outcome = 0
-    first_turn: dict[str, Any] | None = None
+    counts: SignalCounts
+    agent_class: detectors.AgentClass
+    first_turn_text: str
+    session_id: str | None
+
+
+def _record_session_id(record: dict[str, Any]) -> str | None:
+    return record.get('sessionId') or None
+
+
+def peek_session_id(path: Path) -> str | None:
+    """The ``session_id`` :func:`scan_transcript` reports for *path*, read
+    only as far as the first record that carries one, so a caller can
+    cheaply skip a session it already holds before paying for a full scan.
+    Unreadable input yields ``None``."""
     try:
         for record in iter_json_lines(path):
-            has_genuine, has_designed = _classify_tool_errors(record)
-            if has_genuine:
-                tool_error += 1
-            if has_designed:
-                designed_outcome += 1
-
-            text = _record_text(record)
-            if text and any(pattern in text for pattern in _NOT_FOUND_PATTERNS):
-                not_found += 1
-            if text and any(pattern in text for pattern in _INTERRUPT_PATTERNS):
-                interrupt += 1
-
-            assistant_text = _assistant_text(record)
-            if assistant_text and any(
-                pattern in assistant_text for pattern in _SELF_CORRECT_PATTERNS
-            ):
-                self_correct += 1
-
-            has_guard_text = bool(text) and any(
-                pattern in text for pattern in _DF_GUARD_TEXT_PATTERNS
-            )
-            if _has_guard_tool_use(record) or has_guard_text:
-                df_guard += 1
-
-            if (
-                first_turn is None
-                and record.get('type') == 'user'
-                and not record.get('isSidechain')
-                and not record.get('isMeta')
-            ):
-                first_turn = record
+            if session_id := _record_session_id(record):
+                return session_id
     except OSError:
-        return SignalCounts(), None
+        return None
+    return None
 
-    counts = SignalCounts(
-        tool_error=tool_error,
-        not_found=not_found,
-        self_correct=self_correct,
-        df_guard=df_guard,
-        interrupt=interrupt,
-        designed_outcome=designed_outcome,
+
+def scan_transcript(path: Path) -> TranscriptScan:
+    """Read *path* once, producing everything the sampler needs from it.
+
+    Each class counts the RECORDS holding at least one of its hits, so a
+    record carrying several synonymous markers still counts once. Every
+    record is folded in as it is read and dropped before the next, so
+    memory stays bounded by the largest single record. Unreadable input
+    degrades to an empty scan.
+    """
+    counts = dict.fromkeys(detectors.SignalClass, 0)
+    evidence = detectors.AgentClassEvidence.for_path(path)
+    session_id: str | None = None
+    try:
+        for record in iter_json_lines(path):
+            hits = detectors.record_hits(record)
+            for signal in detectors.SignalClass:
+                if hits.count(signal):
+                    counts[signal] += 1
+            evidence = evidence.observe(record)
+            session_id = session_id or _record_session_id(record)
+    except OSError:
+        return TranscriptScan(SignalCounts({}), detectors.AgentClass.UNKNOWN, '', None)
+    return TranscriptScan(
+        SignalCounts(counts), evidence.agent_class, evidence.first_turn_text or '', session_id,
     )
-    return counts, first_turn
 
 
 def score_signals(path: Path) -> SignalCounts:
-    """Zero-token single pass over a transcript, counting the 5 confusion-signal classes.
-
-    One increment per class per RECORD (not per pattern match) — a record
-    carrying multiple synonymous markers for the same class still counts
-    once. ``tool_error``/``designed_outcome`` and the tool-use half of
-    ``df_guard`` are structural checks; every other class is a plain
-    case-insensitive substring scan. ``tool_error`` counts only GENUINE
-    failures: declared-designed outcomes are split off into
-    ``designed_outcome`` by :func:`_classify_tool_errors`, which reuses
-    digest's classifier so the two modules cannot drift. Malformed/unreadable input degrades to an all-zero
-    :class:`SignalCounts` rather than raising. Delegates to
-    :func:`_score_and_find_first_turn` (shared with
-    :func:`_find_first_user_turn` so :func:`main`'s scoring loop can get
-    both in one file read); see its docstring for why.
-    """
-    counts, _ = _score_and_find_first_turn(path)
-    return counts
+    """The counts of :func:`scan_transcript`."""
+    return scan_transcript(path).counts
 
 
-# ---------------------------------------------------------------------------
-# classify_agent_class — 5-stratum classifier (PRD §5.2 point 2)
-# ---------------------------------------------------------------------------
-
-STRATA: tuple[str, ...] = (
-    'recon', 'curator-classifier', 'watcher', 'orchestrated-task', 'interactive',
+STRATA: tuple[detectors.AgentClass, ...] = tuple(
+    agent_class for agent_class in detectors.AgentClass
+    if agent_class is not detectors.AgentClass.UNKNOWN
 )
-"""The 5 agent-class strata the sampler groups by."""
-
-_WORKTREE_DIR_MARKERS: tuple[str, ...] = (
-    '--worktrees-', '--claude-worktrees-',
-    # reify's warm-lane and build-worktree encoded-dir shapes (task 2612):
-    # encode_cwd (inventory.py) maps '/', '.' and '_' all to '-', so
-    # /home/leo/src/reify/.warm-lanes/worktrees/<id> and
-    # .../reify/build-worktrees/<id> never produce the double-dash
-    # '--worktrees-'/'--claude-worktrees-' form above.
-    # The two are deliberately asymmetric: 'build-worktrees' is a generic
-    # enough phrase that an unqualified '-build-worktrees-' marker could
-    # false-match an unrelated repo's own build/worktrees dir (e.g. a repo
-    # named '...-build'), so it's qualified with the repo name; whereas
-    # 'warm-lanes-worktrees' is distinctive enough on its own that no
-    # project qualifier is needed.
-    '-warm-lanes-worktrees-', '-reify-build-worktrees-',
-)
-
-_RECON_HEADER_PREFIXES: tuple[str, ...] = (
-    '## Reconciliation Run',
-    '## Stage 2: Task-Knowledge Sync',
-)
-_RECON_SUBSTRING_MARKERS: tuple[str, ...] = ('memory_consolidator',)
-
-_WATCHER_SUBSTRING_MARKERS: tuple[str, ...] = ('recon-escalation-watcher',)
-"""skills/recon-escalation-watcher — a real dark_factory skill/slash-command."""
-
-_CURATOR_CLASSIFIER_SUBSTRING_MARKERS: tuple[str, ...] = ('review suggestion classifier',)
-"""Verbatim opening of TRIAGE_SYSTEM_PROMPT
-(orchestrator/src/orchestrator/agents/triage.py:131), matched
-case-insensitively."""
-
-
-def _first_user_turn_text(record: dict[str, Any] | None) -> str:
-    """Flatten a first-non-sidechain-user-turn record's text content to a string.
-
-    *record* is the RAW transcript-line dict the caller already located
-    (this function does no file I/O); returns '' when *record* is None
-    (no such turn found) or carries no text content.
-    """
-    if record is None:
-        return ''
-    content = _message_content(record)
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = [
-            block_text for block in content
-            if isinstance(block, dict) and block.get('type') == 'text'
-            and isinstance(block_text := block.get('text'), str)
-        ]
-        return '\n'.join(parts)
-    return ''
-
-
-def classify_agent_class(record: dict[str, Any] | None, path: Path) -> str:
-    """Classify a session's agent class (one of :data:`STRATA`).
-
-    Priority: *path*'s encoded-dir SHAPE is checked first — only its
-    parent directory's name is inspected, never any file content — an
-    orchestrated-worktree marker (dark_factory's ``--worktrees-``/
-    ``--claude-worktrees-``, or reify's ``-warm-lanes-worktrees-``/
-    ``-reify-build-worktrees-``; see :data:`_WORKTREE_DIR_MARKERS`) means
-    ``'orchestrated-task'`` and wins even over a recon-marker turn.
-    Otherwise, cheap content markers in *record* (the session's
-    already-located first non-sidechain, non-meta user turn) decide:
-    recon header / ``memory_consolidator`` -> ``'recon'``;
-    ``recon-escalation-watcher`` -> ``'watcher'``; the triage classifier's
-    system-prompt opening -> ``'curator-classifier'``. Falls back to
-    ``'interactive'`` — a main-dir freeform human turn, or no matching
-    user turn at all (*record* is None).
-    """
-    encoded_dir = path.parent.name
-    if any(marker in encoded_dir for marker in _WORKTREE_DIR_MARKERS):
-        return 'orchestrated-task'
-
-    text = _first_user_turn_text(record)
-    if text.startswith(_RECON_HEADER_PREFIXES) or any(
-        marker in text for marker in _RECON_SUBSTRING_MARKERS
-    ):
-        return 'recon'
-    if any(marker in text for marker in _WATCHER_SUBSTRING_MARKERS):
-        return 'watcher'
-    if any(marker in text.lower() for marker in _CURATOR_CLASSIFIER_SUBSTRING_MARKERS):
-        return 'curator-classifier'
-    return 'interactive'
+"""The agent-class strata the sampler groups by. UNKNOWN is an empty
+transcript, which carries no signal and never passes the zero-signal gate."""
 
 
 # ---------------------------------------------------------------------------
@@ -455,15 +181,15 @@ def classify_agent_class(record: dict[str, Any] | None, path: Path) -> str:
 class ScoredRecord:
     """A :class:`~legibility.inventory.SessionRecord` enriched with its
     signal score and agent-class stratum — the unit :func:`stratified_sample`
-    operates on. Produced by :func:`main` via
-    ``inventory.enumerate_sessions -> score_signals -> classify_agent_class``,
-    or constructed directly for pure in-memory testing (PRD §8.4).
+    operates on. Produced by :func:`score_session`, or constructed directly
+    for pure in-memory testing (PRD §8.4).
     """
 
     session: SessionRecord
-    stratum: str
+    stratum: detectors.AgentClass
     counts: SignalCounts
     first_turn_text: str = ''
+    session_id: str | None = None
 
     @property
     def score(self) -> int:
@@ -476,6 +202,18 @@ class ScoredRecord:
     @property
     def path(self) -> Path:
         return self.session.path
+
+
+def score_session(session: SessionRecord) -> ScoredRecord:
+    """Scan, classify and summarise one enumerated session for sampling."""
+    scan = scan_transcript(session.path)
+    return ScoredRecord(
+        session=session,
+        stratum=scan.agent_class,
+        counts=scan.counts,
+        first_turn_text=scan.first_turn_text,
+        session_id=scan.session_id,
+    )
 
 
 _DIGITS_RE = re.compile(r'\d+')
@@ -502,13 +240,9 @@ def shape_fingerprint(record: ScoredRecord) -> tuple[str, tuple[bool, ...], str]
     first-turn skeleton (:func:`_normalize_first_turn`) absorbs
     date/number drift between otherwise-identical clone runs.
     """
-    counts = record.counts
-    signal_shape = (
-        bool(counts.tool_error),
-        bool(counts.not_found),
-        bool(counts.self_correct),
-        bool(counts.df_guard),
-        bool(counts.interrupt),
+    signal_shape = tuple(
+        bool(record.counts[signal]) for signal in detectors.SignalClass
+        if signal in detectors.CONFUSION_CLASSES
     )
     return (record.stratum, signal_shape, _normalize_first_turn(record.first_turn_text))
 
@@ -1011,24 +745,11 @@ def format_sample_summary_line(result: SampleResult, *, max_bytes: int) -> str:
     )
 
 
-def _find_first_user_turn(path: Path) -> dict[str, Any] | None:
-    """Find a session's first non-sidechain, non-meta user-turn record.
-
-    Returns the raw record dict (as :func:`classify_agent_class` expects),
-    or None if the transcript has no such turn. Malformed/unreadable input
-    degrades to None rather than raising. Delegates to
-    :func:`_score_and_find_first_turn`; see its docstring for why.
-    """
-    _, first_turn = _score_and_find_first_turn(path)
-    return first_turn
-
-
 def main(argv: Sequence[str]) -> int:
     """CLI entry point: the full inventory -> score -> classify -> sample -> render pipeline.
 
     Wires ``config.load_config -> inventory.enumerate_sessions ->
-    score_signals -> classify_agent_class -> stratified_sample ->
-    render_manifest``. Prints the JSONL manifest to stdout and a
+    score_session -> stratified_sample -> render_manifest``. Prints the JSONL manifest to stdout and a
     per-stratum-counts / zero-signal-drops / budget-accounting summary to
     stderr. This is the CLI acceptance surface — a manual run against live
     ``~/.claude/projects`` is the observable, not a pytest.
@@ -1075,18 +796,7 @@ def main(argv: Sequence[str]) -> int:
         ),
     )
 
-    scored: list[ScoredRecord] = []
-    for session in sessions:
-        counts, first_turn = _score_and_find_first_turn(session.path)
-        stratum = classify_agent_class(first_turn, session.path)
-        scored.append(
-            ScoredRecord(
-                session=session,
-                stratum=stratum,
-                counts=counts,
-                first_turn_text=_first_user_turn_text(first_turn),
-            )
-        )
+    scored = [score_session(session) for session in sessions]
 
     result = stratified_sample(
         scored, cfg, cost_fn=digest_byte_cost_fn(max_bytes=DEFAULT_DIGEST_MAX_BYTES),

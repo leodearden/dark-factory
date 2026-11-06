@@ -2,12 +2,14 @@
 """Repair ``metadata.files`` wiped by the DONE path — the WRITE counterpart to
 ``scripts/audit_wiped_metadata_files.py``.
 
-Task 3329. ``TaskWorkflow._reconcile_metadata_files_for_done``
-(orchestrator/src/orchestrator/workflow.py:2007) blanks a task's
-``metadata.files`` on two branches — reaching DONE with no merge sha, and its
-``if err is not None: files = []`` arm, which fires WITH a real sha present.
-Task 3113 owns the forward fix and is still ``pending``; this script backfills
-the records the wiper already damaged, using the plan scope the audit recovers.
+Before task 3113,
+``orchestrator/src/orchestrator/workflow.py::TaskWorkflow._reconcile_metadata_files_for_done``
+blanked a task's ``metadata.files`` on two branches — reaching DONE with no
+merge sha, and its ``if err is not None: files = []`` arm, which fired WITH a
+real sha present. 3113's fix reached main in 1f2f858e40: the reconcile now
+keeps the recorded scope when the merge diff is uncomputable. This script
+backfills the pre-fix damage, using the plan scope the audit recovers. Task
+3329 ran pass one and task 3427 pass two.
 
 WHAT THIS SCRIPT REFUSES TO DO
 ------------------------------
@@ -17,8 +19,8 @@ That is not fastidiousness — it is measured. Across this task's planning
 sessions three read-only audit runs returned 40, then 43, then 45 candidates,
 and in between one task (id 3086) MOVED from the repairable set into
 ``contradicted_real_merge_sha``. Repairing from the older payload would have
-written files onto a task the contradicted rule forbids touching. The wiper is
-live, so the population keeps drifting; only a fresh sweep is safe.
+written files onto a task the contradicted rule forbids touching. The wiper was
+live then, so the population kept drifting; only a fresh sweep is safe.
 
 SAFETY MODEL
 ------------
@@ -62,6 +64,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, NamedTuple, Protocol
 
+from _task_db_scan import UNREADABLE_STORE_ERRORS
 from audit_wiped_metadata_files import (
     CONTRADICTED_REAL_MERGE_SHA,
     FIDELITY_FILE_LEVEL,
@@ -196,8 +199,9 @@ def plan_files_rejection_reason(candidate: WipeCandidate) -> str | None:
 # The write payload.
 # ---------------------------------------------------------------------------
 
-# This task's id, stamped into every backfill so a later reader can attribute
-# the write without consulting the event log.
+# The --task-id default: the task that built this tool and ran its first pass.
+# Whichever id a run carries is stamped into every backfill, so a later reader
+# can attribute the write without consulting the event log.
 REPAIR_TASK_ID = "3329"
 
 # WHY x_-PREFIXED, and not the bare `files_backfill_provenance` the task
@@ -217,7 +221,12 @@ REPAIR_TASK_ID = "3329"
 PROVENANCE_KEY = "x_files_backfill_provenance"
 
 
-def build_repair_payload(candidate: WipeCandidate, *, now_iso: str) -> dict:
+def build_repair_payload(
+    candidate: WipeCandidate,
+    *,
+    now_iso: str,
+    repair_task_id: str,
+) -> dict:
     """Build the metadata patch that restores *candidate*'s wiped file scope.
 
     A MINIMAL ADDITIVE PATCH: exactly two keys, both of which this write is
@@ -249,7 +258,7 @@ def build_repair_payload(candidate: WipeCandidate, *, now_iso: str) -> dict:
     return {
         "files": list(writable_plan_files(candidate)),
         PROVENANCE_KEY: {
-            "task": REPAIR_TASK_ID,
+            "task": repair_task_id,
             "src": candidate.plan_files_source,
             "sig": candidate.wipe_signature,
             "fidelity": candidate.plan_files_fidelity,
@@ -326,8 +335,8 @@ def classify_live_task(live_task: object, candidate: WipeCandidate) -> str:
     it is guaranteed to be undone — hence :data:`SKIP_NOT_TERMINAL`.
 
     :data:`SKIP_FILES_PRESENT` is what makes this script idempotent: a second
-    pass (the one the addendum predicts will be needed once 3113 lands) re-runs
-    cheaply and touches only what is still empty.
+    pass (task 3427's, run after 3113 landed) re-runs cheaply and touches only
+    what is still empty.
 
     The emptiness test reuses the audit's ``_coerce_file_list`` rather than
     bare truthiness, so the predicate deciding "this task still has no scope"
@@ -506,6 +515,7 @@ async def repair_one(
     candidate: WipeCandidate,
     *,
     now_iso: str,
+    repair_task_id: str,
 ) -> RepairOutcome:
     """Write ONE candidate's recovered scope back, and never raise.
 
@@ -529,7 +539,9 @@ async def repair_one(
     strand the remaining 23: the failure is captured, attributed and reported,
     and drives a non-zero exit at the end.
     """
-    payload = build_repair_payload(candidate, now_iso=now_iso)
+    payload = build_repair_payload(
+        candidate, now_iso=now_iso, repair_task_id=repair_task_id
+    )
     try:
         result = await client.call_tool(
             "update_task",
@@ -633,6 +645,7 @@ async def repair_project(
     *,
     apply: bool,
     now_iso: str,
+    repair_task_id: str,
 ) -> RepairResult:
     """Audit *project_root* fresh, then repair what is safe to repair.
 
@@ -887,7 +900,15 @@ async def repair_project(
             )
             continue
 
-        outcomes.append(await repair_one(client, project_root, candidate, now_iso=now_iso))
+        outcomes.append(
+            await repair_one(
+                client,
+                project_root,
+                candidate,
+                now_iso=now_iso,
+                repair_task_id=repair_task_id,
+            )
+        )
 
     return RepairResult(
         project_root=project_root,
@@ -1042,7 +1063,14 @@ DEFAULT_SERVER = "http://127.0.0.1:8002"
 # these repair writes in the journal and the event stream under an unrelated,
 # long-finished migration — making the backfill unattributable exactly when
 # someone is trying to work out who touched a historical record.
-CLIENT_NAME = "repair-wiped-metadata-files-3329"
+CLIENT_NAME_PREFIX = "repair-wiped-metadata-files"
+
+
+def client_name_for(repair_task_id: str) -> str:
+    return f"{CLIENT_NAME_PREFIX}-{repair_task_id}"
+
+
+CLIENT_NAME = client_name_for(REPAIR_TASK_ID)
 
 # Exit codes, named rather than spelled inline so the epilog, main()'s
 # docstring and the returns can never drift into disagreeing about what a
@@ -1086,7 +1114,7 @@ def _transport_error_types() -> tuple[type[BaseException], ...]:
     return (httpx.HTTPError, OSError, RuntimeError)
 
 
-def _make_client(server_url: str):
+def _make_client(server_url: str, *, repair_task_id: str):
     """Construct the MCP client. Imported LAZILY, on the apply path only.
 
     ``migrate_metadata_modules_to_files`` imports httpx at module scope, so
@@ -1111,9 +1139,24 @@ def _make_client(server_url: str):
         Guarded in tests/scripts/test_repair_wiped_metadata_files.py.
         """
 
-        _client_name = CLIENT_NAME
+        _client_name = client_name_for(repair_task_id)
 
     return RepairFusedMemoryClient(server_url)
+
+
+def parse_task_id(value: str) -> str:
+    """The ``--task-id`` type: a positive integer in its one canonical spelling.
+
+    Rejected at parse time because the value is persisted, as the provenance
+    stamp on historical task records and as the write's ``agent_id``, by a
+    write that cannot cheaply be undone. An empty, padded or zero-led id there
+    is unattributable or names no task.
+    """
+    if value.isascii() and value.isdigit() and not value.startswith("0"):
+        return value
+    raise argparse.ArgumentTypeError(
+        f"expected a positive integer task id such as {REPAIR_TASK_ID}, got {value!r}"
+    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -1152,6 +1195,16 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--task-id", dest="repair_task_id", metavar="TASK_ID",
+        default=REPAIR_TASK_ID, type=parse_task_id,
+        help=(
+            "The task this run writes on behalf of (a positive integer id), stamped into "
+            f"{PROVENANCE_KEY}.task and the MCP clientInfo.name. Defaults to "
+            f"{REPAIR_TASK_ID}, the task that built this tool and ran its first "
+            "pass."
+        ),
+    )
+    parser.add_argument(
         "--json", action="store_true",
         help="Emit a JSON object (dispositions + coverage) instead of a report.",
     )
@@ -1166,8 +1219,10 @@ async def main_async(args: argparse.Namespace) -> int:
     """Repair every resolved root, and never let one bad root eat the run.
 
     ONE UNREADABLE ROOT IS NOT A FAILED RUN. Mirroring the audit's main()
-    (audit_wiped_metadata_files.py:899-933), a ``sqlite3.Error`` from root N is
-    warned to stderr, recorded, and skipped so the remaining roots still run.
+    (audit_wiped_metadata_files.py:899-933), an unreadable store at root N —
+    one of ``_task_db_scan.py::UNREADABLE_STORE_ERRORS``, exactly what the
+    audit's own sweep tier skips — is warned to stderr, recorded, and skipped
+    so the remaining roots still run.
     On ``--apply`` that resilience is not a nicety: without it, an unreadable
     root aborts before the summary prints, and the record of the writes already
     applied to roots 1..N-1 is LOST — the reporting-honesty failure this
@@ -1193,9 +1248,15 @@ async def main_async(args: argparse.Namespace) -> int:
     async def _repair_root(root: str, client: _ToolClient | None) -> None:
         try:
             results.append(
-                await repair_project(client, root, apply=args.apply, now_iso=now_iso)
+                await repair_project(
+                    client,
+                    root,
+                    apply=args.apply,
+                    now_iso=now_iso,
+                    repair_task_id=args.repair_task_id,
+                )
             )
-        except sqlite3.Error as exc:
+        except UNREADABLE_STORE_ERRORS as exc:
             # Same wording as the audit's warning, deliberately: one phrasing
             # for one condition, so the two tools cannot describe the same
             # unreadable database differently.
@@ -1212,7 +1273,9 @@ async def main_async(args: argparse.Namespace) -> int:
         transport_errors = _transport_error_types()
         async with contextlib.AsyncExitStack() as stack:
             try:
-                client = await stack.enter_async_context(_make_client(args.server_url))
+                client = await stack.enter_async_context(
+                    _make_client(args.server_url, repair_task_id=args.repair_task_id)
+                )
             except transport_errors as exc:
                 # A down server is a NAMED outcome, not a traceback. The catch
                 # is scoped to the handshake alone — a transport failure

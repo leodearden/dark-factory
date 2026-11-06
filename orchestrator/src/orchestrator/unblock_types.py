@@ -62,7 +62,7 @@ def classify_block_reason(reason: str) -> BlockClass:
     mapping must never raise here, since this runs on the fire-and-forget
     dry-run-investigation producer path.
 
-    Imports the 4 canonical prefix constants from ``orchestrator.merge_gates``
+    Imports the 4 canonical prefix constants from ``orchestrator.merge_lane.gates``
     LAZILY (inside this function body, not at module top level): merge_gates
     imports ``orchestrator.event_store`` and ``orchestrator.git_ops``, which
     are heavy. ``orchestrator.b3_gate`` imports ``BlockClass``/``BlockRecord``
@@ -78,7 +78,7 @@ def classify_block_reason(reason: str) -> BlockClass:
     NOT mapped here, to avoid re-declaring a new prefix constant — task η
     passes ``block_class`` explicitly instead of relying on this classifier.
     """
-    from orchestrator.merge_gates import (
+    from orchestrator.merge_lane.gates import (
         DROPPED_PLAN_TARGETS_REASON_PREFIX,
         PLAN_FILES_NOT_TOUCHED_REASON_PREFIX,
         POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,

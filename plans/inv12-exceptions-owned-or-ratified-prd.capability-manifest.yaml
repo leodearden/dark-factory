@@ -223,3 +223,5 @@ tasks:
           pattern: "exception_register"
           paths: ["OPERATIONS.md"]
           expect: present
+signal_leaves:
+- θ

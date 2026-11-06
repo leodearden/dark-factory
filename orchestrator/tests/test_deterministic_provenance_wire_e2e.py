@@ -157,7 +157,7 @@ class TestDeterministicProvenanceOverTheWire:
         assert provenance['escalation_id'] == _GATE_ESCALATION_ID
 
         rows = [
-            row for row in await rig.journal.get_ops_since('1970-01-01')
+            row for row in await rig.journal.get_stored_ops_since('1970-01-01')
             if row['operation'] == 'set_task_status'
         ]
         assert len(rows) == 1, rows

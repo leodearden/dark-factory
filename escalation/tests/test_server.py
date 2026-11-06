@@ -12,7 +12,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import time
 import types
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -21,12 +20,19 @@ from typing import Any
 
 import pytest
 from _escalation_seed import seed_escalation
+from _filing_tools import call_blocker, call_info, call_promote
+from _merge_tool_calls import call_merge_cancel, call_merge_request, call_merge_status
+from _resolve_issue_call import call_resolve_issue
+from shared.merge_state import MergeReason
 
 from escalation import server as escalation_server
+from escalation.amendments import MAX_AMENDMENTS
 from escalation.canonical import canonical_root_cause
 from escalation.dedupe import DedupeConfig, summary_dedupe_key
+from escalation.grant_delivery import GrantDelivery
+from escalation.merge_status_answer import hint_for
 from escalation.models import Escalation
-from escalation.queue import _MAX_AMENDMENTS, EscalationQueue
+from escalation.queue import EscalationQueue
 from escalation.server import (
     _AMENDMENT_TRUNCATION_ANCHOR_TASK_ID,
     _AMENDMENT_TRUNCATION_STORM_THRESHOLD,
@@ -38,29 +44,29 @@ from escalation.server import (
 )
 
 # ---------------------------------------------------------------------------
-# Cross-package orchestrator imports — used by TestMergeStatus.
+# Cross-package orchestrator imports — used by the merge-tool test classes.
 # Guarded so the rest of the file is still collected when the orchestrator
 # package is absent (e.g. in an escalation-only install).
 # ---------------------------------------------------------------------------
 try:
     from orchestrator.config import OrchestratorConfig  # type: ignore[reportMissingImports]
     from orchestrator.event_store import EventStore, EventType  # type: ignore[reportMissingImports]
-    from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+    from orchestrator.merge_lane.types import TerminalOutcomeRecord
+    from orchestrator.merge_lane.worker import (
         MergeRequest,
         QueuedBranch,
         RealMergeItem,
         SpeculativeItem,
         SpeculativeMergeWorker,
-        TerminalOutcomeRecord,
         TerminalOutcomeRetention,
     )
     _ORCHESTRATOR_AVAILABLE = True
 except ImportError:
     _ORCHESTRATOR_AVAILABLE = False
-    # Satisfy pyright's definite-assignment check.  The TestMergeStatus class
-    # is guarded by @pytest.mark.skipif(not _ORCHESTRATOR_AVAILABLE) so these
-    # stubs are never exercised at runtime.  Annotating as Any lets pyright
-    # treat every subsequent use (calls, attribute access) as valid.
+    # Satisfy pyright's definite-assignment check.  Every merge-tool test
+    # class is guarded by @pytest.mark.skipif(not _ORCHESTRATOR_AVAILABLE) so
+    # these stubs are never exercised at runtime.  Annotating as Any lets
+    # pyright treat every subsequent use (calls, attribute access) as valid.
     OrchestratorConfig: Any = None
     EventStore: Any = None
     EventType: Any = None
@@ -82,16 +88,6 @@ _COMMON_KWARGS: dict[str, Any] = {
     'category': 'scope_violation',
     'summary': 'born-at-L2 test',
 }
-
-
-async def _blocker(server, **kwargs: Any) -> dict[str, Any]:
-    tool = await server.get_tool('escalate_blocker')
-    return await tool.fn(**kwargs)
-
-
-async def _info(server, **kwargs: Any) -> dict[str, Any]:
-    tool = await server.get_tool('escalate_info')
-    return await tool.fn(**kwargs)
 
 
 async def _get_pending(server, **kwargs: Any) -> list[dict[str, Any]]:
@@ -139,7 +135,7 @@ class TestBornAtL2:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _blocker(server, severity='critical', **_COMMON_KWARGS)
+        result = await call_blocker(server, severity='critical', **_COMMON_KWARGS)
 
         assert result['status'] == 'queued', f"Expected 'queued', got: {result}"
 
@@ -153,7 +149,7 @@ class TestBornAtL2:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _blocker(
+        result = await call_blocker(
             server, severity='critical',
             **{**_COMMON_KWARGS, 'agent_role': 'orchestrator-watcher-supervisor'},
         )
@@ -173,7 +169,7 @@ class TestBornAtL2:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _blocker(
+        result = await call_blocker(
             server, severity=severity,
             **{**_COMMON_KWARGS, 'agent_role': 'orchestrator-watcher-supervisor'},
         )
@@ -193,7 +189,7 @@ class TestBornAtL2:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _info(
+        result = await call_info(
             server, severity=severity,
             **{**_COMMON_KWARGS, 'agent_role': 'orchestrator-watcher-supervisor'},
         )
@@ -210,7 +206,7 @@ class TestBornAtL2:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _blocker(server, **_COMMON_KWARGS)
+        result = await call_blocker(server, **_COMMON_KWARGS)
 
         esc = queue.get(result['id'])
         assert esc is not None
@@ -222,7 +218,7 @@ class TestBornAtL2:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _info(server, **_COMMON_KWARGS)
+        result = await call_info(server, **_COMMON_KWARGS)
 
         esc = queue.get(result['id'])
         assert esc is not None
@@ -234,7 +230,7 @@ class TestBornAtL2:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _blocker(server, severity='blocking', **_COMMON_KWARGS)
+        result = await call_blocker(server, severity='blocking', **_COMMON_KWARGS)
 
         esc = queue.get(result['id'])
         assert esc is not None
@@ -246,7 +242,7 @@ class TestBornAtL2:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _info(server, severity='info', **_COMMON_KWARGS)
+        result = await call_info(server, severity='info', **_COMMON_KWARGS)
 
         esc = queue.get(result['id'])
         assert esc is not None
@@ -868,7 +864,7 @@ class TestL2DedupeBypass:
         # Child call: same category, overlapping summary, but born-at-L2.
         # Uses sentinel agent_role so the C4/D3 downgrade is bypassed —
         # dedupe-bypass coverage requires level==2 on the child record.
-        result = await _info(
+        result = await call_info(
             server,
             task_id='task-999',
             agent_role='orchestrator-watcher-supervisor',
@@ -903,7 +899,7 @@ class TestL2DedupeBypass:
         queue.submit(parent)
         parent_id = parent.id
 
-        await _info(
+        await call_info(
             server,
             task_id='task-999',
             agent_role='orchestrator-watcher-supervisor',
@@ -936,7 +932,7 @@ class TestL2DedupeBypass:
 
         # Uses sentinel agent_role so the C4/D3 downgrade is bypassed and
         # the born-at-L2 + terminal-task auto-resolve combination is covered.
-        result = await _blocker(
+        result = await call_blocker(
             server, severity='critical',
             **{**_COMMON_KWARGS, 'agent_role': 'orchestrator-watcher-supervisor'},
         )
@@ -964,7 +960,7 @@ class TestL2DedupeBypass:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue, task_status_lookup=_lookup)
 
-        result = await _info(
+        result = await call_info(
             server,
             task_id='task-999',
             agent_role='implementer',
@@ -998,7 +994,7 @@ class TestL2DedupeBypass:
 
         # Uses sentinel agent_role so the C4/D3 downgrade is bypassed —
         # dedupe-bypass coverage requires the urgent escalation to stay at L2.
-        result = await _blocker(
+        result = await call_blocker(
             server,
             task_id='task-999',
             agent_role='orchestrator-watcher-supervisor',
@@ -1029,7 +1025,7 @@ class TestSeverityValidation:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _blocker(server, severity='CRITICAL', **_COMMON_KWARGS)
+        result = await call_blocker(server, severity='CRITICAL', **_COMMON_KWARGS)
 
         assert 'error' in result, f"Expected error for 'CRITICAL' (case-sensitive), got: {result}"
 
@@ -1039,7 +1035,7 @@ class TestSeverityValidation:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _info(server, severity='Urgent', **_COMMON_KWARGS)
+        result = await call_info(server, severity='Urgent', **_COMMON_KWARGS)
 
         assert 'error' in result, f"Expected error for 'Urgent' (case-sensitive), got: {result}"
 
@@ -1049,7 +1045,7 @@ class TestSeverityValidation:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _blocker(server, severity='criticial', **_COMMON_KWARGS)
+        result = await call_blocker(server, severity='criticial', **_COMMON_KWARGS)
 
         assert 'error' in result, f"Expected error for typo severity 'criticial', got: {result}"
         assert len(queue.get_pending()) == 0, (
@@ -1063,7 +1059,7 @@ class TestSeverityValidation:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _blocker(server, severity=severity, **_COMMON_KWARGS)
+        result = await call_blocker(server, severity=severity, **_COMMON_KWARGS)
 
         assert 'error' in result, (
             f"Expected error for severity={severity!r} (case-sensitive gate), got: {result}"
@@ -1077,7 +1073,7 @@ class TestSeverityValidation:
         server = create_server(queue)
 
         for sev in KNOWN_SEVERITIES:
-            result = await _blocker(
+            result = await call_blocker(
                 server,
                 task_id=f'task-{sev}',
                 agent_role='implementer',
@@ -1091,24 +1087,22 @@ class TestSeverityValidation:
 
 
 # ---------------------------------------------------------------------------
-# TestStrandedBlockedCategory: 'stranded_blocked' is registered in CATEGORIES
+# TestStrandedBlockedCategory: 'stranded_blocked' is a registered category
 # ---------------------------------------------------------------------------
 
 
 class TestStrandedBlockedCategory:
-    """CATEGORIES constant must include 'stranded_blocked' (PRD-3 D5 data-contract)."""
+    """'stranded_blocked' must be a registered category (PRD-3 D5 data-contract)."""
 
     def test_stranded_blocked_in_categories(self):
-        """'stranded_blocked' must be a member of CATEGORIES at runtime.
+        """'stranded_blocked' must be a member of EscalationCategory at runtime.
 
-        This is a data-contract assertion on a runtime constant — not a prose
-        test.  CATEGORIES is the canonical list downstream consumers (task ε,
-        task ι, task ζ) rely on to recognise the category.
+        ``escalation.categories.EscalationCategory`` is the canonical registry
+        downstream consumers (task ε, task ι, task ζ) rely on to recognise the
+        category, and the queue rejects a filing outside it.
         """
-        from escalation.server import CATEGORIES
-        assert 'stranded_blocked' in CATEGORIES, (
-            f"'stranded_blocked' missing from CATEGORIES; current list: {CATEGORIES}"
-        )
+        from escalation.categories import EscalationCategory
+        assert 'stranded_blocked' in EscalationCategory
 
 
 # ---------------------------------------------------------------------------
@@ -1140,7 +1134,7 @@ class TestResolveIssueActionEnum:
         server = create_server(queue)
         esc = self._seed_pending(queue)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='done', terminate=True,
         )
 
@@ -1160,7 +1154,7 @@ class TestResolveIssueActionEnum:
         server = create_server(queue)
         esc = self._seed_pending(queue)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='done', terminate=False,
         )
 
@@ -1181,7 +1175,7 @@ class TestResolveIssueActionEnum:
         server = create_server(queue)
         esc = self._seed_pending(queue)
 
-        result = await _resolve_issue(server, escalation_id=esc.id, resolution='fixed')
+        result = await call_resolve_issue(server, escalation_id=esc.id, resolution='fixed')
 
         assert result.get('status') == 'resolved', f"Expected resolved; got: {result}"
 
@@ -1192,7 +1186,7 @@ class TestResolveIssueActionEnum:
         server = create_server(queue)
         esc = self._seed_pending(queue)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='fixed', action='resume',
         )
 
@@ -1207,7 +1201,7 @@ class TestResolveIssueActionEnum:
         server = create_server(queue)
         esc = self._seed_pending(queue)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='restart approved', action='restart',
         )
 
@@ -1226,7 +1220,7 @@ class TestResolveIssueActionEnum:
         server = create_server(queue)
         esc = self._seed_pending(queue)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='parked', action='park',
         )
 
@@ -1241,7 +1235,7 @@ class TestResolveIssueActionEnum:
         server = create_server(queue)
         esc = self._seed_pending(queue)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='abandoned', action='abandon',
         )
 
@@ -1254,7 +1248,7 @@ class TestResolveIssueActionEnum:
         server = create_server(queue)
         esc = self._seed_pending(queue)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='closed', action='close_only',
         )
 
@@ -1310,7 +1304,7 @@ class TestResolveIssueTableBGate:
         server = create_server(queue)
         esc = self._seed_pending(queue)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='fixed', action='bogus',
         )
 
@@ -1327,18 +1321,17 @@ class TestResolveIssueTableBGate:
 
     @pytest.mark.asyncio
     async def test_novel_category_does_not_narrow_legality(self, tmp_path: Path):
-        """A category absent from server.CATEGORIES (e.g. 'milestone_gate') still resolves.
+        """A category outside the original agent set (e.g. 'milestone_gate') still resolves.
 
         Proves the Table B gate does not narrow legality by category — the G6
-        archive verification found live resolutions across a wide, open
-        category vocabulary that server.CATEGORIES (inert/unvalidated) does
-        not even fully list.
+        archive verification found live resolutions across a wide category
+        vocabulary, far beyond the original agent set.
         """
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
         esc = self._seed_pending(queue, esc_id='esc-tb-0002', category='milestone_gate')
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='fixed', action='resume',
         )
 
@@ -1377,7 +1370,7 @@ class TestResolveIssueResolutionActionPersisted:
         server = create_server(queue)
         esc = self._seed_pending(queue)
 
-        await _resolve_issue(
+        await call_resolve_issue(
             server, escalation_id=esc.id, resolution='parked for human review', action='park',
         )
 
@@ -1399,7 +1392,7 @@ class TestResolveIssueResolutionActionPersisted:
         server = create_server(queue)
         esc = self._seed_pending(queue)
 
-        await _resolve_issue(
+        await call_resolve_issue(
             server, escalation_id=esc.id, resolution='fixed', action='resume',
         )
 
@@ -1417,7 +1410,7 @@ class TestResolveIssueResolutionActionPersisted:
         server = create_server(queue)
         esc = self._seed_pending(queue)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='closed', action='close_only',
         )
 
@@ -1449,7 +1442,7 @@ class TestResolveIssueResolutionClass:
         server = create_server(queue)
         esc = self._seed_pending(queue)
 
-        await _resolve_issue(
+        await call_resolve_issue(
             server, escalation_id=esc.id, resolution='done', action='close_only',
             resolution_class='actionable',
         )
@@ -1474,7 +1467,7 @@ class TestResolveIssueResolutionClass:
         server = create_server(queue)
         esc = self._seed_pending(queue)
 
-        await _resolve_issue(
+        await call_resolve_issue(
             server, escalation_id=esc.id, resolution='fixed', action='resume',
         )
 
@@ -1489,7 +1482,7 @@ class TestResolveIssueResolutionClass:
         server = create_server(queue)
         esc = self._seed_pending(queue)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='fixed', action='resume',
             resolution_class='meh',
         )
@@ -1507,6 +1500,28 @@ class TestResolveIssueResolutionClass:
         assert record.resolution_class is None, (
             f"Record must remain unstamped; got {record.resolution_class!r}"
         )
+
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'cls', ['addressed', 'observation-consumed', 'converted', 'status-info'],
+    )
+    async def test_info_l0_disposition_class_round_trips(self, tmp_path: Path, cls: str):
+        """The info-L0 disposition classes (plans/info-l0-disposition-router-prd.md D14)
+        pass resolve_issue's validator and persist on the record."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_pending(queue)
+
+        result = await call_resolve_issue(
+            server, escalation_id=esc.id, resolution='done', action='close_only',
+            resolution_class=cls,
+        )
+
+        assert 'error' not in result, f"Expected {cls!r} to be accepted; got: {result}"
+        record = queue.get(esc.id)
+        assert record is not None
+        assert record.resolution_class == cls
 
 
 class TestResolveIssueGrantedFiles:
@@ -1531,7 +1546,7 @@ class TestResolveIssueGrantedFiles:
         server = create_server(queue)
         esc = self._seed_pending(queue)
 
-        await _resolve_issue(
+        await call_resolve_issue(
             server, escalation_id=esc.id, resolution='granted', action='resume',
             granted_files=['crate/Cargo.toml'],
         )
@@ -1549,13 +1564,171 @@ class TestResolveIssueGrantedFiles:
         server = create_server(queue)
         esc = self._seed_pending(queue)
 
-        await _resolve_issue(
+        await call_resolve_issue(
             server, escalation_id=esc.id, resolution='fixed', action='resume',
         )
 
         record = queue.get(esc.id)
         assert record is not None
         assert record.granted_files == []
+
+
+_GRANT_TASK = 't-grant-delivery'
+_GRANTED = ['pkg/b.py']
+
+
+def _probe_harness(blocker: GrantDelivery | None) -> types.SimpleNamespace:
+    return types.SimpleNamespace(granted_files_delivery_blocker=lambda _task_id: blocker)
+
+
+def _raising_probe_harness() -> types.SimpleNamespace:
+    def _probe(_task_id: str) -> GrantDelivery | None:
+        raise RuntimeError('probe exploded')
+
+    return types.SimpleNamespace(granted_files_delivery_blocker=_probe)
+
+
+def _assert_shortfall(result: dict[str, Any], expected: GrantDelivery) -> None:
+    assert result['granted_files_delivery'] == expected
+    reason = result['granted_files_delivery_reason']
+    assert _GRANT_TASK in reason
+    for path in _GRANTED:
+        assert path in reason
+
+
+class TestResolveIssueGrantedFilesDelivery:
+    """Every success return of resolve_issue says what became of granted_files (task 5650).
+
+    ``granted_files_delivery`` is always present, mirroring
+    ``late_resolution_captured``: the returned record looks identically
+    healthy whether or not the grant will land.
+    """
+
+    def _seed(self, queue: EscalationQueue) -> Escalation:
+        return seed_escalation(queue, level=0, task_id=_GRANT_TASK)
+
+    @pytest.mark.asyncio
+    async def test_no_grant_is_none_granted(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue, harness=_probe_harness(None))
+        esc = self._seed(queue)
+
+        result = await call_resolve_issue(
+            server, escalation_id=esc.id, resolution='fixed', action='resume',
+        )
+
+        assert result['granted_files_delivery'] == GrantDelivery.NONE_GRANTED
+        assert 'granted_files_delivery_reason' not in result
+
+    @pytest.mark.asyncio
+    async def test_an_unblocked_resume_grant_is_scheduled(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue, harness=_probe_harness(None))
+        esc = self._seed(queue)
+
+        result = await call_resolve_issue(
+            server, escalation_id=esc.id, resolution='granted', action='resume',
+            granted_files=_GRANTED,
+        )
+
+        assert result['granted_files_delivery'] == GrantDelivery.SCHEDULED
+        assert 'granted_files_delivery_reason' not in result
+
+    @pytest.mark.asyncio
+    async def test_no_harness_is_no_orchestrator(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed(queue)
+
+        result = await call_resolve_issue(
+            server, escalation_id=esc.id, resolution='granted', action='resume',
+            granted_files=_GRANTED,
+        )
+
+        _assert_shortfall(result, GrantDelivery.NO_ORCHESTRATOR)
+
+    @pytest.mark.asyncio
+    async def test_a_probe_blocker_is_reported(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(
+            queue, harness=_probe_harness(GrantDelivery.NO_PLAN_TO_WIDEN),
+        )
+        esc = self._seed(queue)
+
+        result = await call_resolve_issue(
+            server, escalation_id=esc.id, resolution='granted', action='resume',
+            granted_files=_GRANTED,
+        )
+
+        _assert_shortfall(result, GrantDelivery.NO_PLAN_TO_WIDEN)
+
+    @pytest.mark.asyncio
+    async def test_a_close_only_grant_does_not_apply(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue, harness=_probe_harness(None))
+        esc = self._seed(queue)
+
+        result = await call_resolve_issue(
+            server, escalation_id=esc.id, resolution='closed', action='close_only',
+            granted_files=_GRANTED,
+        )
+
+        _assert_shortfall(result, GrantDelivery.ACTION_DOES_NOT_APPLY_GRANTS)
+
+    @pytest.mark.asyncio
+    async def test_a_park_grant_is_reported_and_discarded(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue, harness=_probe_harness(None))
+        esc = self._seed(queue)
+
+        result = await call_resolve_issue(
+            server, escalation_id=esc.id, resolution='parked', action='park',
+            granted_files=_GRANTED,
+        )
+
+        _assert_shortfall(result, GrantDelivery.ACTION_DOES_NOT_APPLY_GRANTS)
+        record = queue.get(esc.id)
+        assert record is not None
+        assert record.granted_files == [], 'park discards the grant outright'
+
+    @pytest.mark.asyncio
+    async def test_a_grant_on_an_already_closed_record_is_record_not_open(
+        self, tmp_path: Path,
+    ):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue, harness=_probe_harness(None))
+        esc = self._seed(queue)
+        await call_resolve_issue(
+            server, escalation_id=esc.id, resolution='closed', action='close_only',
+        )
+
+        result = await call_resolve_issue(
+            server, escalation_id=esc.id, resolution='granted', action='resume',
+            granted_files=_GRANTED,
+        )
+
+        _assert_shortfall(result, GrantDelivery.RECORD_NOT_OPEN)
+        record = queue.get(esc.id)
+        assert record is not None
+        assert record.granted_files == []
+
+    @pytest.mark.asyncio
+    async def test_a_raising_probe_still_resolves_and_reports_scheduled(
+        self, tmp_path: Path,
+    ):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue, harness=_raising_probe_harness())
+        esc = self._seed(queue)
+
+        result = await call_resolve_issue(
+            server, escalation_id=esc.id, resolution='granted', action='resume',
+            granted_files=_GRANTED,
+        )
+
+        assert result['granted_files_delivery'] == GrantDelivery.SCHEDULED
+        record = queue.get(esc.id)
+        assert record is not None
+        assert record.status == 'resolved'
 
 
 # ---------------------------------------------------------------------------
@@ -1655,7 +1828,7 @@ class TestChokepointSeverityDowngrade:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _blocker(
+        result = await call_blocker(
             server,
             task_id='task-999',
             agent_role='implementer',
@@ -1677,7 +1850,7 @@ class TestChokepointSeverityDowngrade:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _blocker(
+        result = await call_blocker(
             server,
             task_id='task-999',
             agent_role='implementer',
@@ -1710,7 +1883,7 @@ class TestChokepointSeverityDowngrade:
         server = create_server(queue)
         original_summary = f'original {severity} summary'
 
-        result = await _blocker(
+        result = await call_blocker(
             server,
             task_id='task-999',
             agent_role='implementer',
@@ -1743,7 +1916,7 @@ class TestChokepointSeverityDowngrade:
         server = create_server(queue)
 
         with caplog.at_level(logging.WARNING, logger='escalation.server'):
-            await _blocker(
+            await call_blocker(
                 server,
                 task_id='task-999',
                 agent_role='implementer',
@@ -1769,7 +1942,7 @@ class TestChokepointSeverityDowngrade:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _info(
+        result = await call_info(
             server,
             task_id='task-999',
             agent_role='implementer',
@@ -1805,7 +1978,7 @@ class TestChokepointSeverityDowngrade:
         server = create_server(queue)
         original_summary = f'original {severity} info summary'
 
-        result = await _info(
+        result = await call_info(
             server,
             task_id='task-999',
             agent_role='implementer',
@@ -1838,7 +2011,7 @@ class TestChokepointSeverityDowngrade:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _blocker(
+        result = await call_blocker(
             server,
             task_id='task-999',
             agent_role=sentinel_role,
@@ -1872,7 +2045,7 @@ class TestChokepointSeverityDowngrade:
         server = create_server(queue)
         original_summary = 'sentinel critical escalation'
 
-        result = await _blocker(
+        result = await call_blocker(
             server,
             task_id='task-999',
             agent_role=sentinel_role,
@@ -1904,7 +2077,7 @@ class TestChokepointSeverityDowngrade:
         server = create_server(queue)
 
         with caplog.at_level(logging.WARNING, logger='escalation.server'):
-            await _blocker(
+            await call_blocker(
                 server,
                 task_id='task-999',
                 agent_role=sentinel_role,
@@ -1945,19 +2118,6 @@ class TestChokepointSeverityDowngrade:
 # ---------------------------------------------------------------------------
 # Helpers for promote_to_l2 tests
 # ---------------------------------------------------------------------------
-
-async def _promote_to_l2(server, **kwargs: Any) -> dict[str, Any]:
-    """Invoke the promote_to_l2 MCP tool directly."""
-    tool = await server.get_tool('promote_to_l2')
-    return await tool.fn(**kwargs)
-
-
-async def _resolve_issue(server, **kwargs: Any) -> dict[str, Any]:
-    """Invoke the resolve_issue MCP tool directly (sync tool)."""
-    tool = await server.get_tool('resolve_issue')
-    # resolve_issue is a sync def, so tool.fn(...) returns directly
-    return tool.fn(**kwargs)
-
 
 _L2_DEFAULTS: dict[str, Any] = {
     'task_id': 't-1',
@@ -2011,7 +2171,7 @@ class TestPromoteToL2Create:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _promote_to_l2(
+        result = await call_promote(
             server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1']},
         )
 
@@ -2026,7 +2186,7 @@ class TestPromoteToL2Create:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _promote_to_l2(
+        result = await call_promote(
             server,
             task_id='t-1',
             agent_role='watcher-auto',
@@ -2052,7 +2212,7 @@ class TestPromoteToL2Create:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _promote_to_l2(
+        result = await call_promote(
             server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-solo']},
         )
 
@@ -2069,7 +2229,7 @@ class TestPromoteToL2Create:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _promote_to_l2(
+        result = await call_promote(
             server, **{**_L2_DEFAULTS, 'member_ids': []},
         )
 
@@ -2082,7 +2242,7 @@ class TestPromoteToL2Create:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _promote_to_l2(
+        result = await call_promote(
             server,
             **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1'], 'root_cause': ''},
         )
@@ -2096,7 +2256,7 @@ class TestPromoteToL2Create:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _promote_to_l2(
+        result = await call_promote(
             server,
             **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1'], 'root_cause': '   '},
         )
@@ -2116,7 +2276,7 @@ class TestPromoteToL2Create:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _promote_to_l2(
+        result = await call_promote(
             server,
             **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1'], 'severity': 'CRITICAL'},
         )
@@ -2133,7 +2293,7 @@ class TestPromoteToL2Create:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _promote_to_l2(
+        result = await call_promote(
             server,
             **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1'], 'severity': severity},
         )
@@ -2150,7 +2310,7 @@ class TestPromoteToL2Create:
         server = create_server(queue)
 
         for sev in KNOWN_SEVERITIES:
-            result = await _promote_to_l2(
+            result = await call_promote(
                 server,
                 task_id=f'task-{sev}',
                 agent_role='watcher',
@@ -2175,7 +2335,7 @@ class TestPromoteToL2Create:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _promote_to_l2(
+        result = await call_promote(
             server,
             **{
                 **_L2_DEFAULTS,
@@ -2214,10 +2374,10 @@ class TestPromoteToL2Dedup:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        first = await _promote_to_l2(
+        first = await call_promote(
             server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1']},
         )
-        second = await _promote_to_l2(
+        second = await call_promote(
             server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-2']},
         )
 
@@ -2233,11 +2393,11 @@ class TestPromoteToL2Dedup:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        await _promote_to_l2(
+        await call_promote(
             server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1']},
         )
         # Pass both the existing member (should not duplicate) and a new one
-        second = await _promote_to_l2(
+        second = await call_promote(
             server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1', 'esc-l1-2']},
         )
 
@@ -2253,8 +2413,8 @@ class TestPromoteToL2Dedup:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        await _promote_to_l2(server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1']})
-        await _promote_to_l2(server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-2']})
+        await call_promote(server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1']})
+        await call_promote(server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-2']})
 
         pending_l2 = [e for e in queue.get_pending() if e.level == 2]
         assert len(pending_l2) == 1, (
@@ -2270,7 +2430,7 @@ class TestPromoteToL2Dedup:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        first = await _promote_to_l2(
+        first = await call_promote(
             server,
             task_id='t-1',
             agent_role='watcher',
@@ -2281,7 +2441,7 @@ class TestPromoteToL2Dedup:
             summary='First summary',
         )
         # Second call with different evidence, options, summary — should NOT overwrite
-        await _promote_to_l2(
+        await call_promote(
             server,
             task_id='t-2',
             agent_role='watcher',
@@ -2305,11 +2465,11 @@ class TestPromoteToL2Dedup:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        first = await _promote_to_l2(
+        first = await call_promote(
             server,
             **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1'], 'root_cause': 'root cause A'},
         )
-        second = await _promote_to_l2(
+        second = await call_promote(
             server,
             **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-2'], 'root_cause': 'root cause B'},
         )
@@ -2329,13 +2489,13 @@ class TestPromoteToL2Dedup:
         server = create_server(queue)
 
         # Create and resolve the first L2
-        first = await _promote_to_l2(
+        first = await call_promote(
             server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1']},
         )
         queue.resolve(first['id'], 'Previous resolution')
 
         # Second call: same root_cause, but first is resolved → new L2 (status='created')
-        second = await _promote_to_l2(
+        second = await call_promote(
             server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-2']},
         )
 
@@ -2371,7 +2531,7 @@ class TestPromoteToL2Dedup:
             queue, 'add_members_to_l2', lambda esc_id, ids, **kwargs: None,
         )
 
-        result = await _promote_to_l2(
+        result = await call_promote(
             server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1']},
         )
 
@@ -2402,50 +2562,10 @@ class TestPromoteToL2SeverityInheritance:
 
     The explicit argument stays fully honoured — a cluster of individually
     informational findings CAN be collectively blocking, and the watcher must
-    still be able to say so.
+    still be able to say so.  A derivation that lands on 'info' is now REFUSED
+    rather than minted (PRD info-l0-disposition-router D4, task 5222), and is
+    observable through the refusal's ``derived_severity``.
     """
-
-    @pytest.mark.asyncio
-    async def test_lone_info_member_yields_info_l2(self, tmp_path: Path):
-        """(a) The esc-3037 regression: an info L1 must not mint a blocking L2.
-
-        Observed incident: esc-3037-1 (L0, info, architect) → esc-3037-3 (L1,
-        info, harness-orphan-reaper — severity faithfully preserved) →
-        esc-3037-4 (L2, *blocking*, escalation-watcher-auto,
-        members=['esc-3037-3'], later closed as benign).  The inflation happens
-        at the promotion seam and only there.
-        """
-        queue = EscalationQueue(tmp_path / 'esc')
-        server = create_server(queue)
-        _seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
-
-        result = await _promote_to_l2(
-            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info']},
-        )
-
-        assert 'error' not in result, f'Unexpected error: {result}'
-        record = queue.get(result['id'])
-        assert record is not None
-        assert record.severity == 'info', (
-            f'Lone info member must yield an info L2, got {record.severity!r}'
-        )
-        assert record.level == 2, f'Expected level=2, got {record.level}'
-
-    @pytest.mark.asyncio
-    async def test_all_info_members_yield_info_l2(self, tmp_path: Path):
-        """(b) An all-info member set inherits 'info'."""
-        queue = EscalationQueue(tmp_path / 'esc')
-        server = create_server(queue)
-        _seed_l1(queue, 'esc-l1-a', 'task-1', 'info')
-        _seed_l1(queue, 'esc-l1-b', 'task-2', 'info')
-
-        result = await _promote_to_l2(
-            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-a', 'esc-l1-b']},
-        )
-
-        record = queue.get(result['id'])
-        assert record is not None
-        assert record.severity == 'info', f'Expected info, got {record.severity!r}'
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -2464,7 +2584,7 @@ class TestPromoteToL2SeverityInheritance:
         _seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
         _seed_l1(queue, 'esc-l1-blk', 'task-2', 'blocking')
 
-        result = await _promote_to_l2(server, **{**_L2_DEFAULTS, 'member_ids': order})
+        result = await call_promote(server, **{**_L2_DEFAULTS, 'member_ids': order})
 
         record = queue.get(result['id'])
         assert record is not None
@@ -2490,7 +2610,7 @@ class TestPromoteToL2SeverityInheritance:
         _seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
         _seed_l1(queue, 'esc-l1-crit', 'task-2', 'critical')
 
-        result = await _promote_to_l2(server, **{**_L2_DEFAULTS, 'member_ids': order})
+        result = await call_promote(server, **{**_L2_DEFAULTS, 'member_ids': order})
 
         record = queue.get(result['id'])
         assert record is not None
@@ -2514,7 +2634,7 @@ class TestPromoteToL2SeverityInheritance:
         _seed_l1(queue, 'esc-l1-a', 'task-1', 'info')
         _seed_l1(queue, 'esc-l1-b', 'task-2', 'info')
 
-        result = await _promote_to_l2(
+        result = await call_promote(
             server,
             **{
                 **_L2_DEFAULTS,
@@ -2541,7 +2661,7 @@ class TestPromoteToL2SeverityInheritance:
         server = create_server(queue)
         _seed_l1(queue, 'esc-l1-blk', 'task-1', 'blocking')
 
-        result = await _promote_to_l2(
+        result = await call_promote(
             server,
             **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-blk'], 'severity': 'info'},
         )
@@ -2569,7 +2689,7 @@ class TestPromoteToL2SeverityInheritance:
         server = create_server(queue)
 
         with caplog.at_level(logging.WARNING, logger='escalation.server'):
-            result = await _promote_to_l2(
+            result = await call_promote(
                 server, **{**_L2_DEFAULTS, 'member_ids': ['esc-phantom-1']},
             )
 
@@ -2608,7 +2728,7 @@ class TestPromoteToL2SeverityInheritance:
         _seed_l1(queue, 'esc-l1-warn', 'task-1', 'warn')
 
         with caplog.at_level(logging.WARNING, logger='escalation.server'):
-            result = await _promote_to_l2(
+            result = await call_promote(
                 server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-warn']},
             )
 
@@ -2645,7 +2765,7 @@ class TestPromoteToL2SeverityInheritance:
         _seed_l1(queue, 'esc-l1-info', 'task-2', 'info')
 
         for order in (['esc-l1-warn', 'esc-l1-info'], ['esc-l1-info', 'esc-l1-warn']):
-            result = await _promote_to_l2(
+            result = await call_promote(
                 server,
                 **{
                     **_L2_DEFAULTS,
@@ -2653,12 +2773,12 @@ class TestPromoteToL2SeverityInheritance:
                     'root_cause': f'corrupt-sibling {order[0]}',
                 },
             )
-            record = queue.get(result['id'])
-            assert record is not None
-            assert record.severity == 'info', (
+            assert result['status'] == 'refused', result
+            assert result['derived_severity'] == 'info', (
                 f'Order {order} must derive from the valid subset only, got '
-                f'{record.severity!r}'
+                f'{result!r}'
             )
+        assert await _get_pending(server, level=2) == []
 
     @pytest.mark.asyncio
     async def test_partial_resolution_derives_from_the_resolvable_subset(
@@ -2674,16 +2794,15 @@ class TestPromoteToL2SeverityInheritance:
         _seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
 
         with caplog.at_level(logging.WARNING, logger='escalation.server'):
-            result = await _promote_to_l2(
+            result = await call_promote(
                 server,
                 **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info', 'esc-phantom-2']},
             )
 
-        record = queue.get(result['id'])
-        assert record is not None
-        assert record.severity == 'info', (
+        assert result['status'] == 'refused', result
+        assert result['derived_severity'] == 'info', (
             'Partial resolution must derive from the resolvable subset, '
-            f'got {record.severity!r}'
+            f'got {result!r}'
         )
         warned = [
             r for r in caplog.records
@@ -2708,7 +2827,7 @@ class TestPromoteToL2SeverityInheritance:
         server = create_server(queue)
         _seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
 
-        result = await _promote_to_l2(
+        result = await call_promote(
             server,
             **{
                 **_L2_DEFAULTS,
@@ -2742,16 +2861,20 @@ class TestPromoteToL2SeverityInResponse:
     async def test_create_response_reports_the_inherited_severity(
         self, tmp_path: Path,
     ):
-        """(a) An inherited severity is visible in the response and matches disk."""
+        """(a) An inherited severity is visible in the response and matches disk.
+
+        A lone 'critical' member, because an inherited 'critical' cannot be
+        mistaken for the create path's fail-safe 'blocking'.
+        """
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
-        _seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
+        _seed_l1(queue, 'esc-l1-crit', 'task-1', 'critical')
 
-        result = await _promote_to_l2(
-            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info']},
+        result = await call_promote(
+            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-crit']},
         )
 
-        assert result['severity'] == 'info', (
+        assert result['severity'] == 'critical', (
             f'Response must report the inherited severity, got: {result}'
         )
         assert result['severity'] == queue.get(result['id']).severity  # type: ignore[union-attr]
@@ -2765,7 +2888,7 @@ class TestPromoteToL2SeverityInResponse:
         server = create_server(queue)
         _seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
 
-        result = await _promote_to_l2(
+        result = await call_promote(
             server,
             **{
                 **_L2_DEFAULTS,
@@ -2785,7 +2908,7 @@ class TestPromoteToL2SeverityInResponse:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _promote_to_l2(
+        result = await call_promote(
             server, **{**_L2_DEFAULTS, 'member_ids': ['esc-phantom-1']},
         )
 
@@ -2801,13 +2924,14 @@ class TestPromoteToL2SeverityInResponse:
         server = create_server(queue)
         _seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
 
-        first = await _promote_to_l2(
-            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info']},
+        first = await call_promote(
+            server,
+            **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info'], 'severity': 'info'},
         )
         assert first['severity'] == 'info'
 
         _seed_l1(queue, 'esc-l1-blk', 'task-2', 'blocking')
-        second = await _promote_to_l2(
+        second = await call_promote(
             server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-blk']},
         )
 
@@ -2824,12 +2948,12 @@ class TestPromoteToL2SeverityInResponse:
         """(e) The added key is purely additive — no existing consumer breaks."""
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
-        _seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
+        _seed_l1(queue, 'esc-l1-blk', 'task-1', 'blocking')
 
-        created = await _promote_to_l2(
-            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info']},
+        created = await call_promote(
+            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-blk']},
         )
-        updated = await _promote_to_l2(
+        updated = await call_promote(
             server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-other']},
         )
 
@@ -2864,12 +2988,12 @@ class TestPromoteToL2FramingPreservation:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        created = await _promote_to_l2(
+        created = await call_promote(
             server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1']},
         )
         assert created['status'] == 'created', f'Unexpected first result: {created}'
 
-        result = await _promote_to_l2(server, **{
+        result = await call_promote(server, **{
             **_L2_DEFAULTS,
             'member_ids': ['esc-l1-2'],
             'evidence': 'SECOND-pass evidence, authored by this promote',
@@ -2916,7 +3040,7 @@ class TestPromoteToL2FramingPreservation:
         # early and silently discard everything it was handed.
         before = queue.get(created['id'])
         assert before is not None
-        third = await _promote_to_l2(server, **{
+        third = await call_promote(server, **{
             **_L2_DEFAULTS,
             'member_ids': ['esc-l1-2'],  # already a member: nothing new to add
             'evidence': 'THIRD-pass evidence',
@@ -2962,7 +3086,7 @@ class TestAmendmentTruncationStorm:
     @staticmethod
     async def _fold(server, tag: str) -> dict[str, Any]:
         """Promote the same root_cause again — always a fold, always framing."""
-        return await _promote_to_l2(server, **{
+        return await call_promote(server, **{
             **_L2_DEFAULTS,
             'member_ids': ['esc-l1-1'],  # already a member after the first call
             'evidence': f'fold evidence {tag}',
@@ -2980,7 +3104,7 @@ class TestAmendmentTruncationStorm:
         def pending_ids() -> set[str]:
             return {e.id for e in queue.get_pending()}
 
-        created = await _promote_to_l2(
+        created = await call_promote(
             server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1']},
         )
         assert created['status'] == 'created', f'Unexpected first result: {created}'
@@ -2989,7 +3113,7 @@ class TestAmendmentTruncationStorm:
 
         # Fill the amendment list exactly to the cap — no truncation yet, so
         # nothing may be filed.  Bound derived from the NAME, never the value.
-        for i in range(_MAX_AMENDMENTS):
+        for i in range(MAX_AMENDMENTS):
             filled = await self._fold(server, f'fill-{i}')
             assert filled['status'] == 'updated', f'Expected a fold, got {filled}'
         at_cap = queue.get(l2_id)
@@ -3069,7 +3193,7 @@ class TestAmendmentTruncationStorm:
         assert crossed['status'] == 'updated', f'Expected a fold, got {crossed}'
         assert crossed['id'] == l2_id
         assert crossed['amendment_recorded'] is True, f'framing must still land: {crossed}'
-        assert crossed['amendments'] == _MAX_AMENDMENTS, (
+        assert crossed['amendments'] == MAX_AMENDMENTS, (
             f'the list stays capped while truncating: {crossed}'
         )
         assert crossed['severity'] == 'blocking', f'severity must still report: {crossed}'
@@ -3107,13 +3231,13 @@ class TestAmendmentTruncationStorm:
         def pending_ids() -> set[str]:
             return {e.id for e in queue.get_pending()}
 
-        created = await _promote_to_l2(
+        created = await call_promote(
             server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1']},
         )
         assert created['status'] == 'created', f'Unexpected first result: {created}'
 
         # Fill to the cap, then burst past the threshold on server #1.
-        for i in range(_MAX_AMENDMENTS + _AMENDMENT_TRUNCATION_STORM_THRESHOLD):
+        for i in range(MAX_AMENDMENTS + _AMENDMENT_TRUNCATION_STORM_THRESHOLD):
             await self._fold(server, f'first-{i}')
         known = pending_ids()
         assert len(known) == 2, (
@@ -3145,7 +3269,9 @@ class TestPromoteToL2SeverityFloorOnUpdate:
     The root-cause dedup path appends members to an existing pending L2.  Now
     that an L2 can be born `info`, that path must raise the record when the
     incoming members justify it — otherwise the inherited default would trade
-    the old inflation for under-escalation, which is strictly worse.
+    the old inflation for under-escalation, which is strictly worse.  The info
+    L2s below are minted with an explicit ``severity='info'``, because a silent
+    all-info promote is refused rather than minted (task 5222).
     """
 
     @pytest.mark.asyncio
@@ -3159,13 +3285,14 @@ class TestPromoteToL2SeverityFloorOnUpdate:
         server = create_server(queue)
         _seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
 
-        first = await _promote_to_l2(
-            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info']},
+        first = await call_promote(
+            server,
+            **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info'], 'severity': 'info'},
         )
         assert queue.get(first['id']).severity == 'info'  # type: ignore[union-attr]
 
         _seed_l1(queue, 'esc-l1-blk', 'task-2', 'blocking')
-        second = await _promote_to_l2(
+        second = await call_promote(
             server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-blk']},
         )
 
@@ -3184,14 +3311,15 @@ class TestPromoteToL2SeverityFloorOnUpdate:
         server = create_server(queue)
         _seed_l1(queue, 'esc-l1-blk', 'task-1', 'blocking')
 
-        first = await _promote_to_l2(
+        first = await call_promote(
             server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-blk']},
         )
         assert queue.get(first['id']).severity == 'blocking'  # type: ignore[union-attr]
 
         _seed_l1(queue, 'esc-l1-info', 'task-2', 'info')
-        second = await _promote_to_l2(
-            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info']},
+        second = await call_promote(
+            server,
+            **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info'], 'severity': 'info'},
         )
 
         assert second['status'] == 'updated'
@@ -3215,14 +3343,15 @@ class TestPromoteToL2SeverityFloorOnUpdate:
         server = create_server(queue)
         _seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
 
-        first = await _promote_to_l2(
-            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info']},
+        first = await call_promote(
+            server,
+            **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info'], 'severity': 'info'},
         )
         assert queue.get(first['id']).severity == 'info'  # type: ignore[union-attr]
 
         # Explicit UP on an append: honoured.
         _seed_l1(queue, 'esc-l1-b', 'task-2', 'info')
-        raised = await _promote_to_l2(
+        raised = await call_promote(
             server,
             **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-b'], 'severity': 'critical'},
         )
@@ -3233,7 +3362,7 @@ class TestPromoteToL2SeverityFloorOnUpdate:
 
         # Explicit DOWN on an append: capped by the monotonic floor.
         _seed_l1(queue, 'esc-l1-c', 'task-3', 'info')
-        lowered = await _promote_to_l2(
+        lowered = await call_promote(
             server,
             **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-c'], 'severity': 'info'},
         )
@@ -3267,15 +3396,16 @@ class TestPromoteToL2SeverityFloorOnUpdate:
         server = create_server(queue)
         _seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
 
-        first = await _promote_to_l2(
-            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info']},
+        first = await call_promote(
+            server,
+            **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info'], 'severity': 'info'},
         )
         before = queue.get(first['id'])
         assert before is not None and before.severity == 'info'
         updated_at_before = before.updated_at
 
         # Same root_cause → update path, with a member id that resolves to nothing.
-        appended = await _promote_to_l2(
+        appended = await call_promote(
             server, **{**_L2_DEFAULTS, 'member_ids': ['esc-phantom-typo']},
         )
 
@@ -3309,11 +3439,12 @@ class TestPromoteToL2SeverityFloorOnUpdate:
         server = create_server(queue)
         _seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
 
-        first = await _promote_to_l2(
-            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info']},
+        first = await call_promote(
+            server,
+            **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info'], 'severity': 'info'},
         )
         # Append a phantom id once so it is already a member...
-        await _promote_to_l2(
+        await call_promote(
             server, **{**_L2_DEFAULTS, 'member_ids': ['esc-phantom-typo']},
         )
         before = queue.get(first['id'])
@@ -3322,7 +3453,7 @@ class TestPromoteToL2SeverityFloorOnUpdate:
 
         # ...then re-promote the SAME unresolvable id: nothing to append, and
         # nothing derivable to floor with.
-        again = await _promote_to_l2(
+        again = await call_promote(
             server, **{**_L2_DEFAULTS, 'member_ids': ['esc-phantom-typo']},
         )
 
@@ -3359,7 +3490,7 @@ class TestPromoteToL2Cascade:
         _seed_l1(queue, 'esc-l1-1', 'task-1')
         _seed_l1(queue, 'esc-l1-2', 'task-2')
 
-        await _promote_to_l2(
+        await call_promote(
             server,
             **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1', 'esc-l1-2']},
         )
@@ -3382,14 +3513,14 @@ class TestPromoteToL2Cascade:
         _seed_l1(queue, 'esc-l1-1', 'task-1')
         _seed_l1(queue, 'esc-l1-2', 'task-2')
 
-        l2_result = await _promote_to_l2(
+        l2_result = await call_promote(
             server,
             **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1', 'esc-l1-2']},
         )
         l2_id = l2_result['id']
 
         # Resolve the L2 via MCP tool
-        resolve_result = await _resolve_issue(server, escalation_id=l2_id, resolution='Root cause fixed')
+        resolve_result = await call_resolve_issue(server, escalation_id=l2_id, resolution='Root cause fixed')
 
         assert resolve_result.get('status') == 'resolved', (
             f'Expected L2 resolved, got: {resolve_result}'
@@ -3410,12 +3541,12 @@ class TestPromoteToL2Cascade:
         server = create_server(queue)
 
         _seed_l1(queue, 'esc-l1-1', 'task-1')
-        l2_result = await _promote_to_l2(
+        l2_result = await call_promote(
             server,
             **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1']},
         )
 
-        await _resolve_issue(server, escalation_id=l2_result['id'], resolution='Fix confirmed in prod')
+        await call_resolve_issue(server, escalation_id=l2_result['id'], resolution='Fix confirmed in prod')
 
         m1 = queue.get('esc-l1-1')
         assert m1 is not None
@@ -3430,13 +3561,13 @@ class TestPromoteToL2Cascade:
         server = create_server(queue)
 
         _seed_l1(queue, 'esc-l1-1', 'task-1')
-        l2_result = await _promote_to_l2(
+        l2_result = await call_promote(
             server,
             **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1']},
         )
         l2_id = l2_result['id']
 
-        await _resolve_issue(server, escalation_id=l2_id, resolution='Fixed')
+        await call_resolve_issue(server, escalation_id=l2_id, resolution='Fixed')
 
         m1 = queue.get('esc-l1-1')
         assert m1 is not None
@@ -3452,12 +3583,12 @@ class TestPromoteToL2Cascade:
 
         _seed_l1(queue, 'esc-l1-1', 'task-1')
         _seed_l1(queue, 'esc-l1-2', 'task-2')
-        l2_result = await _promote_to_l2(
+        l2_result = await call_promote(
             server,
             **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1', 'esc-l1-2']},
         )
 
-        await _resolve_issue(
+        await call_resolve_issue(
             server,
             escalation_id=l2_result['id'],
             resolution='Not actionable',
@@ -3478,6 +3609,8 @@ class TestPromoteToL2Cascade:
 
 _STREAK_SENTINEL_5469 = '__recovery_veto_streak__5469'
 _STREAK_SENTINEL_7000 = '__recovery_veto_streak__7000'
+_ZERO_PROGRESS_SENTINEL_5469 = '__zero_progress_requeue__5469'
+_ZERO_PROGRESS_SENTINEL_7000 = '__zero_progress_requeue__7000'
 
 
 def _seed_streak_alarm(queue: EscalationQueue, esc_id: str, sentinel: str) -> Escalation:
@@ -3489,6 +3622,21 @@ def _seed_streak_alarm(queue: EscalationQueue, esc_id: str, sentinel: str) -> Es
         severity='blocking',
         category='risk_identified',
         summary='recovery veto streak alarm',
+        level=1,
+    )
+    queue.submit(esc)
+    return esc
+
+
+def _seed_zero_progress_alarm(queue: EscalationQueue, esc_id: str, sentinel: str) -> Escalation:
+    """Seed a pending zero-progress-requeue alarm L1, filed the way the orchestrator files it."""
+    esc = Escalation(
+        id=esc_id,
+        task_id=sentinel,
+        agent_role='orchestrator-zero-progress-requeue',
+        severity='blocking',
+        category='risk_identified',
+        summary='zero-progress requeue alarm',
         level=1,
     )
     queue.submit(esc)
@@ -3515,7 +3663,7 @@ class TestPromoteToL2SentinelIdentity:
         _seed_streak_alarm(queue, 'esc-streak-5469-1', _STREAK_SENTINEL_5469)
         member_before = queue.get('esc-streak-5469-1')
 
-        result = await _promote_to_l2(
+        result = await call_promote(
             server,
             **{**_L2_DEFAULTS, 'task_id': '5469', 'member_ids': ['esc-streak-5469-1']},
         )
@@ -3535,7 +3683,7 @@ class TestPromoteToL2SentinelIdentity:
         server = create_server(queue)
         _seed_streak_alarm(queue, 'esc-streak-5469-1', _STREAK_SENTINEL_5469)
 
-        result = await _promote_to_l2(
+        result = await call_promote(
             server,
             **{
                 **_L2_DEFAULTS,
@@ -3558,7 +3706,7 @@ class TestPromoteToL2SentinelIdentity:
         _seed_streak_alarm(queue, 'esc-streak-7000-1', _STREAK_SENTINEL_7000)
         _seed_streak_alarm(queue, 'esc-streak-5469-1', _STREAK_SENTINEL_5469)
 
-        result = await _promote_to_l2(
+        result = await call_promote(
             server,
             **{
                 **_L2_DEFAULTS,
@@ -3582,7 +3730,7 @@ class TestPromoteToL2SentinelIdentity:
         _seed_streak_alarm(queue, 'esc-streak-5469-1', _STREAK_SENTINEL_5469)
         _seed_streak_alarm(queue, 'esc-streak-7000-1', _STREAK_SENTINEL_7000)
 
-        result = await _promote_to_l2(
+        result = await call_promote(
             server,
             **{
                 **_L2_DEFAULTS,
@@ -3604,7 +3752,7 @@ class TestPromoteToL2SentinelIdentity:
         _seed_streak_alarm(queue, 'esc-streak-5469-1', _STREAK_SENTINEL_5469)
         _seed_l1(queue, 'esc-5469-3', '5469')
 
-        result = await _promote_to_l2(
+        result = await call_promote(
             server,
             **{
                 **_L2_DEFAULTS,
@@ -3624,7 +3772,7 @@ class TestPromoteToL2SentinelIdentity:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _promote_to_l2(
+        result = await call_promote(
             server,
             **{**_L2_DEFAULTS, 'task_id': '5469', 'member_ids': ['esc-ghost-1']},
         )
@@ -3640,7 +3788,7 @@ class TestPromoteToL2SentinelIdentity:
         server = create_server(queue)
         _seed_streak_alarm(queue, 'esc-streak-5469-1', _STREAK_SENTINEL_5469)
 
-        result = await _promote_to_l2(
+        result = await call_promote(
             server,
             **{
                 **_L2_DEFAULTS,
@@ -3660,7 +3808,7 @@ class TestPromoteToL2SentinelIdentity:
         _seed_streak_alarm(queue, 'esc-streak-5469-1', _STREAK_SENTINEL_5469)
         _seed_streak_alarm(queue, 'esc-streak-5469-2', _STREAK_SENTINEL_5469)
         root_cause = 'recovery-veto-streak-noise-from-pending-l2-pin:esc-5469-9'
-        first = await _promote_to_l2(
+        first = await call_promote(
             server,
             **{
                 **_L2_DEFAULTS,
@@ -3671,7 +3819,7 @@ class TestPromoteToL2SentinelIdentity:
         )
         assert first.get('status') == 'created', first
 
-        second = await _promote_to_l2(
+        second = await call_promote(
             server,
             **{
                 **_L2_DEFAULTS,
@@ -3699,7 +3847,7 @@ class TestPromoteToL2SentinelIdentity:
             lambda: {'x-escalation-identity': 'not-a-promote-identity'},
         )
 
-        result = await _promote_to_l2(
+        result = await call_promote(
             server,
             **{**_L2_DEFAULTS, 'task_id': '5469', 'member_ids': ['esc-streak-5469-1']},
         )
@@ -3712,12 +3860,76 @@ class TestPromoteToL2SentinelIdentity:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _promote_to_l2(
+        result = await call_promote(
             server, **{**_L2_DEFAULTS, 'task_id': '5469', 'member_ids': []},
         )
 
         assert 'error' in result, result
         assert result.get('code') != 'sentinel_task_id_required', result
+
+    @pytest.mark.asyncio
+    async def test_zero_progress_only_cluster_under_real_id_mints_nothing(self, tmp_path: Path):
+        """(h) The zero-progress requeue alarm is sentinel-bound too (task 5880)."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        _seed_zero_progress_alarm(queue, 'esc-zp-5469-1', _ZERO_PROGRESS_SENTINEL_5469)
+        member_before = queue.get('esc-zp-5469-1')
+
+        result = await call_promote(
+            server,
+            **{**_L2_DEFAULTS, 'task_id': '5469', 'member_ids': ['esc-zp-5469-1']},
+        )
+
+        assert result.get('code') == 'sentinel_task_id_required', result
+        assert result['required_task_ids'] == [_ZERO_PROGRESS_SENTINEL_5469]
+        assert [e.id for e in queue.get_pending() if e.level == 2] == []
+        assert queue.get('esc-zp-5469-1') == member_before
+
+    @pytest.mark.asyncio
+    async def test_zero_progress_only_cluster_under_its_sentinel_id_is_created(
+        self, tmp_path: Path,
+    ):
+        """(h cont.) Minted under the alarm's own sentinel id, the promote goes through."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        _seed_zero_progress_alarm(queue, 'esc-zp-5469-1', _ZERO_PROGRESS_SENTINEL_5469)
+
+        result = await call_promote(
+            server,
+            **{
+                **_L2_DEFAULTS,
+                'task_id': _ZERO_PROGRESS_SENTINEL_5469,
+                'member_ids': ['esc-zp-5469-1'],
+            },
+        )
+
+        assert result.get('status') == 'created', result
+        minted = queue.get(result['id'])
+        assert minted is not None
+        assert minted.task_id == _ZERO_PROGRESS_SENTINEL_5469
+
+    @pytest.mark.asyncio
+    async def test_cross_class_sentinel_cluster_names_both_sentinels(self, tmp_path: Path):
+        """(h cont.) Alarms of two sentinel classes compose: the refusal names both sentinels."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        _seed_streak_alarm(queue, 'esc-streak-5469-1', _STREAK_SENTINEL_5469)
+        _seed_zero_progress_alarm(queue, 'esc-zp-7000-1', _ZERO_PROGRESS_SENTINEL_7000)
+
+        result = await call_promote(
+            server,
+            **{
+                **_L2_DEFAULTS,
+                'task_id': '5469',
+                'member_ids': ['esc-streak-5469-1', 'esc-zp-7000-1'],
+            },
+        )
+
+        assert result.get('code') == 'sentinel_task_id_required', result
+        assert result['required_task_ids'] == sorted(
+            [_STREAK_SENTINEL_5469, _ZERO_PROGRESS_SENTINEL_7000],
+        )
+        assert [e.id for e in queue.get_pending() if e.level == 2] == []
 
 
 # ---------------------------------------------------------------------------
@@ -3725,13 +3937,8 @@ class TestPromoteToL2SentinelIdentity:
 # ---------------------------------------------------------------------------
 
 
-async def _call_merge_request(server, **kwargs: Any) -> dict[str, Any]:
-    """Invoke the merge_request MCP tool directly."""
-    tool = await server.get_tool('merge_request')
-    return await tool.fn(**kwargs)
-
-
 @pytest.mark.asyncio
+@pytest.mark.skipif(not _ORCHESTRATOR_AVAILABLE, reason='orchestrator package not installed')
 class TestMergeRequestDedup:
     """Server-level de-dup tests for merge_request.
 
@@ -3741,13 +3948,8 @@ class TestMergeRequestDedup:
     repo or worker is needed.
     """
 
-    def _make_orch_config(self, tmp_path: Path):
-        """Create a minimal OrchestratorConfig without a git remote."""
-        from orchestrator.config import OrchestratorConfig  # type: ignore[reportMissingImports]
-        return OrchestratorConfig(project_root=tmp_path)
-
     def _make_registry(self):
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             InFlightMergeRegistry,
         )
         return InFlightMergeRegistry()
@@ -3764,7 +3966,7 @@ class TestMergeRequestDedup:
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
         mq: asyncio.Queue = asyncio.Queue()
-        orch_config = self._make_orch_config(tmp_path / 'repo')
+        orch_config = OrchestratorConfig(project_root=tmp_path / 'repo')
         registry = self._make_registry()
 
         # Pre-seed the registry: acquire branch 'X' with a never-resolving future
@@ -3783,7 +3985,7 @@ class TestMergeRequestDedup:
         # Call merge_request for branch 'X' — should return in_flight immediately
         # (asyncio.wait_for with 2s proves it does NOT block on the future)
         result = await asyncio.wait_for(
-            _call_merge_request(
+            call_merge_request(
                 server,
                 task_id='X',
                 branch='X',
@@ -3817,14 +4019,12 @@ class TestMergeRequestDedup:
         """
         import asyncio
 
-        from orchestrator import merge_queue as _mq_mod  # type: ignore[reportMissingImports]
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
-            MergeDispatchResult,
-        )
+        from orchestrator.merge_lane import intake
+        from orchestrator.merge_lane.types import MergeDispatchResult
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
         mq: asyncio.Queue = asyncio.Queue()
-        orch_config = self._make_orch_config(tmp_path / 'repo')
+        orch_config = OrchestratorConfig(project_root=tmp_path / 'repo')
         registry = self._make_registry()
 
         # The disk-scan arm needs a real git repo + worktree to reach, so return
@@ -3836,7 +4036,7 @@ class TestMergeRequestDedup:
             )
 
         monkeypatch.setattr(
-            _mq_mod, 'coalesce_or_enqueue_merge_request', _fake_coalesce,
+            intake, 'coalesce_or_enqueue_merge_request', _fake_coalesce,
         )
 
         server = create_server(
@@ -3846,7 +4046,7 @@ class TestMergeRequestDedup:
             merge_inflight_registry=registry,
         )
         result = await asyncio.wait_for(
-            _call_merge_request(
+            call_merge_request(
                 server, task_id='X', branch='X',
                 worktree=str(tmp_path / 'wt'), description='',
             ),
@@ -3871,7 +4071,7 @@ class TestMergeRequestDedup:
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
         mq: asyncio.Queue = asyncio.Queue()
-        orch_config = self._make_orch_config(tmp_path / 'repo')
+        orch_config = OrchestratorConfig(project_root=tmp_path / 'repo')
         registry = self._make_registry()
 
         never_future: asyncio.Future = asyncio.get_running_loop().create_future()
@@ -3888,7 +4088,7 @@ class TestMergeRequestDedup:
         )
         try:
             result = await asyncio.wait_for(
-                _call_merge_request(
+                call_merge_request(
                     server, task_id='X', branch='X',
                     worktree=str(tmp_path / 'wt'), description='',
                 ),
@@ -3926,7 +4126,7 @@ class TestMergeRequestDedup:
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
         mq: asyncio.Queue = asyncio.Queue()
-        orch_config = self._make_orch_config(tmp_path / 'repo')
+        orch_config = OrchestratorConfig(project_root=tmp_path / 'repo')
         registry = self._make_registry()
 
         never_future: asyncio.Future = asyncio.get_running_loop().create_future()
@@ -3940,7 +4140,7 @@ class TestMergeRequestDedup:
         )
         try:
             result = await asyncio.wait_for(
-                _call_merge_request(
+                call_merge_request(
                     server, task_id='X', branch='X',
                     worktree=str(tmp_path / 'wt'), description='',
                 ),
@@ -3972,7 +4172,7 @@ class TestMergeRequestDedup:
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
         mq: asyncio.Queue = asyncio.Queue()
-        orch_config = self._make_orch_config(tmp_path / 'repo')
+        orch_config = OrchestratorConfig(project_root=tmp_path / 'repo')
         registry = self._make_registry()
 
         server = create_server(
@@ -3982,7 +4182,7 @@ class TestMergeRequestDedup:
             merge_inflight_registry=registry,
         )
         result = await asyncio.wait_for(
-            _call_merge_request(
+            call_merge_request(
                 server, task_id='D', branch='D',
                 worktree=str(tmp_path / 'wt'), description='',
             ),
@@ -4004,11 +4204,13 @@ class TestMergeRequestDedup:
         """
         import asyncio
 
-        from orchestrator.merge_queue import MergeOutcome  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
+            MergeOutcome,
+        )
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
         mq: asyncio.Queue = asyncio.Queue()
-        orch_config = self._make_orch_config(tmp_path / 'repo')
+        orch_config = OrchestratorConfig(project_root=tmp_path / 'repo')
         registry = self._make_registry()
 
         server = create_server(
@@ -4029,7 +4231,7 @@ class TestMergeRequestDedup:
         worker_task = asyncio.create_task(_worker())
 
         result = await asyncio.wait_for(
-            _call_merge_request(
+            call_merge_request(
                 server,
                 task_id='Y',
                 branch='Y',
@@ -4062,11 +4264,13 @@ class TestMergeRequestDedup:
         """
         import asyncio
 
-        from orchestrator.merge_queue import MergeOutcome  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
+            MergeOutcome,
+        )
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
         mq: asyncio.Queue = asyncio.Queue()
-        orch_config = self._make_orch_config(tmp_path / 'repo')
+        orch_config = OrchestratorConfig(project_root=tmp_path / 'repo')
         registry = self._make_registry()
 
         server = create_server(
@@ -4088,7 +4292,7 @@ class TestMergeRequestDedup:
         worker_task = asyncio.create_task(_worker())
 
         result = await asyncio.wait_for(
-            _call_merge_request(
+            call_merge_request(
                 server,
                 task_id='RFO',
                 branch='RFO',
@@ -4113,11 +4317,13 @@ class TestMergeRequestDedup:
         False — the default is a strict no-op (unchanged behavior)."""
         import asyncio
 
-        from orchestrator.merge_queue import MergeOutcome  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
+            MergeOutcome,
+        )
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
         mq: asyncio.Queue = asyncio.Queue()
-        orch_config = self._make_orch_config(tmp_path / 'repo')
+        orch_config = OrchestratorConfig(project_root=tmp_path / 'repo')
         registry = self._make_registry()
 
         server = create_server(
@@ -4139,7 +4345,7 @@ class TestMergeRequestDedup:
         worker_task = asyncio.create_task(_worker())
 
         await asyncio.wait_for(
-            _call_merge_request(
+            call_merge_request(
                 server,
                 task_id='RFO2',
                 branch='RFO2',
@@ -4171,14 +4377,12 @@ class TestMergeRequestDedup:
         import asyncio
         from pathlib import Path as _Path
 
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
-            MergeRequest,
-            register_and_enqueue_merge_request,
-        )
+        from orchestrator.merge_lane.intake import register_and_enqueue_merge_request
+        from orchestrator.merge_lane.worker import MergeRequest
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
         mq: asyncio.Queue = asyncio.Queue()
-        orch_config = self._make_orch_config(tmp_path / 'repo')
+        orch_config = OrchestratorConfig(project_root=tmp_path / 'repo')
         registry = self._make_registry()
 
         # Simulate the workflow-path enqueue: build a MergeRequest inline
@@ -4209,7 +4413,7 @@ class TestMergeRequestDedup:
         )
 
         # MCP merge_request for the same branch 'B' must coalesce
-        result = await _call_merge_request(
+        result = await call_merge_request(
             server,
             task_id='mcp-caller',
             branch='B',
@@ -4264,7 +4468,7 @@ class TestMergeRequestDedup:
             git_ops=stub_git, _merge_worker=None, _terminal_retention=None
         )
         esc_queue = EscalationQueue(tmp_path / 'esc')
-        orch_config = self._make_orch_config(tmp_path / 'repo')
+        orch_config = OrchestratorConfig(project_root=tmp_path / 'repo')
 
         server = create_server(
             esc_queue,
@@ -4273,14 +4477,14 @@ class TestMergeRequestDedup:
             merge_queue=asyncio.Queue(),
         )
 
-        bare_result = await _call_merge_request(
+        bare_result = await call_merge_request(
             server,
             task_id='123',
             branch='123',
             worktree=str(tmp_path / 'wt-bare'),
             description='',
         )
-        prefixed_result = await _call_merge_request(
+        prefixed_result = await call_merge_request(
             server,
             task_id='123',
             branch='task/123',
@@ -4304,6 +4508,21 @@ class TestMergeRequestDedup:
         )
 
 
+def _stub_patch_content_contained(monkeypatch: pytest.MonkeyPatch, stub: object) -> None:
+    """Install *stub* where both readers of ``patch_content_contained`` look it up.
+
+    The server reads it through the façade, whose home for it is
+    ``orchestrator.merge_lane.landing_evidence``; the C3 gate of
+    ``coalesce_or_enqueue_merge_request`` reads it through
+    ``orchestrator.merge_lane.tip_relation.resolve_divergent``.
+    """
+    import orchestrator.merge_lane.landing_evidence as landing_evidence
+    import orchestrator.merge_lane.tip_relation as tip_relation
+
+    for module in (tip_relation, landing_evidence):
+        monkeypatch.setattr(module, 'patch_content_contained', stub)
+
+
 # ---------------------------------------------------------------------------
 # TestMergeRequestWorkflowVerifyEmission — step-1/3 (2411): verified_green
 # ---------------------------------------------------------------------------
@@ -4315,20 +4534,10 @@ class TestMergeRequestDedup:
 # workflow.py:1724-1733 (task 2381 alpha / 2383 beta).
 
 
-async def _call_merge_cancel(server, **kwargs: Any) -> dict[str, Any]:
-    """Invoke the merge_cancel MCP tool directly."""
-    tool = await server.get_tool('merge_cancel')
-    return await tool.fn(**kwargs)
-
-
 @pytest.mark.asyncio
+@pytest.mark.skipif(not _ORCHESTRATOR_AVAILABLE, reason='orchestrator package not installed')
 class TestMergeRequestWorkflowVerifyEmission:
     """merge_request(verified_green=True) emits a workflow_verify row."""
-
-    def _make_orch_config(self, tmp_path: Path):
-        """Create a minimal OrchestratorConfig without a git remote."""
-        from orchestrator.config import OrchestratorConfig  # type: ignore[reportMissingImports]
-        return OrchestratorConfig(project_root=tmp_path)
 
     async def test_verified_green_emits_workflow_verify(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -4344,24 +4553,20 @@ class TestMergeRequestWorkflowVerifyEmission:
         import asyncio
         from unittest.mock import AsyncMock
 
-        import orchestrator.merge_queue as orchestrator_merge_queue  # type: ignore[reportMissingImports]
+        import orchestrator.merge_lane.worker as orchestrator_merge_queue
 
         tip = 't' * 40
         sentinel_base_sha = 's' * 40
         monkeypatch.setattr(
             orchestrator_merge_queue,
-            '_resolve_dispatch_time_merge_base',
+            'resolve_dispatch_time_merge_base',
             AsyncMock(return_value=sentinel_base_sha),
         )
         # is_ancestor is stubbed False to reach the fresh-dispatch path; the
         # task-2945 patch-id backstop then runs after that miss.  Stub it False
         # (this SimpleNamespace git_ops has no project_root for a real
         # `git cherry`, and a genuine fresh dispatch is not patch-id-contained).
-        monkeypatch.setattr(
-            orchestrator_merge_queue,
-            'patch_content_contained',
-            AsyncMock(return_value=False),
-        )
+        _stub_patch_content_contained(monkeypatch, AsyncMock(return_value=False))
 
         stub_git = types.SimpleNamespace(
             resolve_branch_sha=AsyncMock(
@@ -4376,7 +4581,7 @@ class TestMergeRequestWorkflowVerifyEmission:
             git_ops=stub_git, _merge_worker=None, _terminal_retention=None,
         )
         esc_queue = EscalationQueue(tmp_path / 'esc')
-        orch_config = self._make_orch_config(tmp_path / 'repo')
+        orch_config = OrchestratorConfig(project_root=tmp_path / 'repo')
         event_store = EventStore(tmp_path / 'runs.db', 'run-wf-verify')
 
         server = create_server(
@@ -4387,7 +4592,7 @@ class TestMergeRequestWorkflowVerifyEmission:
             merge_queue=asyncio.Queue(),
         )
 
-        result = await _call_merge_request(
+        result = await call_merge_request(
             server,
             task_id='777',
             branch='777',
@@ -4420,7 +4625,7 @@ class TestMergeRequestWorkflowVerifyEmission:
             assert result.get('status') == 'queued', (
                 f'Expected status queued, got: {result}'
             )
-            await _call_merge_cancel(server, request_id=result['request_id'])
+            await call_merge_cancel(server, request_id=result['request_id'])
 
     async def test_default_verified_green_emits_nothing(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -4432,22 +4637,18 @@ class TestMergeRequestWorkflowVerifyEmission:
         """
         from unittest.mock import AsyncMock
 
-        import orchestrator.merge_queue as orchestrator_merge_queue  # type: ignore[reportMissingImports]
+        import orchestrator.merge_lane.worker as orchestrator_merge_queue
 
         tip = 't' * 40
         monkeypatch.setattr(
             orchestrator_merge_queue,
-            '_resolve_dispatch_time_merge_base',
+            'resolve_dispatch_time_merge_base',
             AsyncMock(return_value='s' * 40),
         )
         # is_ancestor False → reach the dispatch path; the task-2945 patch-id
         # backstop then runs.  Stub it False (SimpleNamespace git_ops has no
         # project_root for `git cherry`; a fresh dispatch is not contained).
-        monkeypatch.setattr(
-            orchestrator_merge_queue,
-            'patch_content_contained',
-            AsyncMock(return_value=False),
-        )
+        _stub_patch_content_contained(monkeypatch, AsyncMock(return_value=False))
 
         stub_git = types.SimpleNamespace(
             resolve_branch_sha=AsyncMock(
@@ -4459,7 +4660,7 @@ class TestMergeRequestWorkflowVerifyEmission:
         stub_harness = types.SimpleNamespace(
             git_ops=stub_git, _merge_worker=None, _terminal_retention=None,
         )
-        orch_config = self._make_orch_config(tmp_path / 'repo')
+        orch_config = OrchestratorConfig(project_root=tmp_path / 'repo')
         event_store = EventStore(tmp_path / 'runs.db', 'run-wf-verify-default')
 
         server = create_server(
@@ -4470,7 +4671,7 @@ class TestMergeRequestWorkflowVerifyEmission:
             merge_queue=asyncio.Queue(),
         )
 
-        result = await _call_merge_request(
+        result = await call_merge_request(
             server,
             task_id='778',
             branch='778',
@@ -4486,7 +4687,7 @@ class TestMergeRequestWorkflowVerifyEmission:
             assert result.get('status') == 'queued', (
                 f'Expected status queued, got: {result}'
             )
-            await _call_merge_cancel(server, request_id=result['request_id'])
+            await call_merge_cancel(server, request_id=result['request_id'])
 
     async def test_verified_green_false_explicit_emits_nothing(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -4497,22 +4698,18 @@ class TestMergeRequestWorkflowVerifyEmission:
         """
         from unittest.mock import AsyncMock
 
-        import orchestrator.merge_queue as orchestrator_merge_queue  # type: ignore[reportMissingImports]
+        import orchestrator.merge_lane.worker as orchestrator_merge_queue
 
         tip = 't' * 40
         monkeypatch.setattr(
             orchestrator_merge_queue,
-            '_resolve_dispatch_time_merge_base',
+            'resolve_dispatch_time_merge_base',
             AsyncMock(return_value='s' * 40),
         )
         # is_ancestor False → reach the dispatch path; the task-2945 patch-id
         # backstop then runs.  Stub it False (SimpleNamespace git_ops has no
         # project_root for `git cherry`; a fresh dispatch is not contained).
-        monkeypatch.setattr(
-            orchestrator_merge_queue,
-            'patch_content_contained',
-            AsyncMock(return_value=False),
-        )
+        _stub_patch_content_contained(monkeypatch, AsyncMock(return_value=False))
 
         stub_git = types.SimpleNamespace(
             resolve_branch_sha=AsyncMock(
@@ -4524,7 +4721,7 @@ class TestMergeRequestWorkflowVerifyEmission:
         stub_harness = types.SimpleNamespace(
             git_ops=stub_git, _merge_worker=None, _terminal_retention=None,
         )
-        orch_config = self._make_orch_config(tmp_path / 'repo')
+        orch_config = OrchestratorConfig(project_root=tmp_path / 'repo')
         event_store = EventStore(tmp_path / 'runs.db', 'run-wf-verify-explicit-false')
 
         server = create_server(
@@ -4535,7 +4732,7 @@ class TestMergeRequestWorkflowVerifyEmission:
             merge_queue=asyncio.Queue(),
         )
 
-        result = await _call_merge_request(
+        result = await call_merge_request(
             server,
             task_id='779',
             branch='779',
@@ -4552,7 +4749,7 @@ class TestMergeRequestWorkflowVerifyEmission:
             assert result.get('status') == 'queued', (
                 f'Expected status queued, got: {result}'
             )
-            await _call_merge_cancel(server, request_id=result['request_id'])
+            await call_merge_cancel(server, request_id=result['request_id'])
 
     async def test_verified_green_true_but_already_merged_emits_nothing(
         self, tmp_path: Path,
@@ -4575,7 +4772,7 @@ class TestMergeRequestWorkflowVerifyEmission:
         stub_harness = types.SimpleNamespace(
             git_ops=stub_git, _merge_worker=None, _terminal_retention=None,
         )
-        orch_config = self._make_orch_config(tmp_path / 'repo')
+        orch_config = OrchestratorConfig(project_root=tmp_path / 'repo')
         event_store = EventStore(tmp_path / 'runs.db', 'run-wf-verify-already-merged')
 
         server = create_server(
@@ -4586,7 +4783,7 @@ class TestMergeRequestWorkflowVerifyEmission:
             merge_queue=asyncio.Queue(),
         )
 
-        result = await _call_merge_request(
+        result = await call_merge_request(
             server,
             task_id='780',
             branch='780',
@@ -4621,7 +4818,7 @@ class TestMergeRequestWorkflowVerifyEmission:
         """
         from unittest.mock import AsyncMock
 
-        import orchestrator.merge_queue as orchestrator_merge_queue  # type: ignore[reportMissingImports]
+        import orchestrator.merge_lane.worker as orchestrator_merge_queue
 
         tip = 't' * 40
         # Monkeypatched for determinism even though the post-step-4 gate
@@ -4629,17 +4826,13 @@ class TestMergeRequestWorkflowVerifyEmission:
         # is None — avoids relying on a real git subprocess pre-step-4.
         monkeypatch.setattr(
             orchestrator_merge_queue,
-            '_resolve_dispatch_time_merge_base',
+            'resolve_dispatch_time_merge_base',
             AsyncMock(return_value='s' * 40),
         )
         # is_ancestor False → reach the gate path; the task-2945 patch-id
         # backstop then runs.  Stub it False (SimpleNamespace git_ops has no
         # project_root for `git cherry`; a fresh dispatch is not contained).
-        monkeypatch.setattr(
-            orchestrator_merge_queue,
-            'patch_content_contained',
-            AsyncMock(return_value=False),
-        )
+        _stub_patch_content_contained(monkeypatch, AsyncMock(return_value=False))
 
         stub_git = types.SimpleNamespace(
             resolve_branch_sha=AsyncMock(
@@ -4651,7 +4844,7 @@ class TestMergeRequestWorkflowVerifyEmission:
         stub_harness = types.SimpleNamespace(
             git_ops=stub_git, _merge_worker=None, _terminal_retention=None,
         )
-        orch_config = self._make_orch_config(tmp_path / 'repo')
+        orch_config = OrchestratorConfig(project_root=tmp_path / 'repo')
 
         server = create_server(
             EscalationQueue(tmp_path / 'esc'),
@@ -4661,7 +4854,7 @@ class TestMergeRequestWorkflowVerifyEmission:
             merge_queue=asyncio.Queue(),
         )
 
-        result = await _call_merge_request(
+        result = await call_merge_request(
             server,
             task_id='781',
             branch='781',
@@ -4677,7 +4870,7 @@ class TestMergeRequestWorkflowVerifyEmission:
             )
         finally:
             if result.get('status') == 'queued':
-                await _call_merge_cancel(server, request_id=result['request_id'])
+                await call_merge_cancel(server, request_id=result['request_id'])
 
     async def test_verified_green_true_on_resubmit_attach_emits_second_row(
         self, tmp_path: Path,
@@ -4694,7 +4887,7 @@ class TestMergeRequestWorkflowVerifyEmission:
         gracefully instead of the emission being skipped.
         """
         esc_queue = EscalationQueue(tmp_path / 'esc')
-        orch_config = self._make_orch_config(tmp_path / 'repo')
+        orch_config = OrchestratorConfig(project_root=tmp_path / 'repo')
         event_store = EventStore(tmp_path / 'runs.db', 'run-wf-verify-attach')
 
         server = create_server(
@@ -4708,7 +4901,7 @@ class TestMergeRequestWorkflowVerifyEmission:
             merge_queue=asyncio.Queue(),
         )
 
-        first = await _call_merge_request(
+        first = await call_merge_request(
             server,
             task_id='790',
             branch='790',
@@ -4722,7 +4915,7 @@ class TestMergeRequestWorkflowVerifyEmission:
         )
 
         try:
-            second = await _call_merge_request(
+            second = await call_merge_request(
                 server,
                 task_id='790',
                 branch='790',
@@ -4751,7 +4944,7 @@ class TestMergeRequestWorkflowVerifyEmission:
                     f"Expected data['branch']=='task/790', got: {row}"
                 )
         finally:
-            await _call_merge_cancel(server, request_id=first['request_id'])
+            await call_merge_cancel(server, request_id=first['request_id'])
 
 
 # ---------------------------------------------------------------------------
@@ -4766,12 +4959,21 @@ async def _call_get_merge_queue(server) -> dict[str, Any]:
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(not _ORCHESTRATOR_AVAILABLE, reason='orchestrator package not installed')
 class TestGetMergeQueue:
     """Tests for the get_merge_queue escalation MCP tool."""
 
-    def _make_orch_config(self, tmp_path: Path):
-        from orchestrator.config import OrchestratorConfig  # type: ignore[reportMissingImports]
-        return OrchestratorConfig(project_root=tmp_path)
+    @staticmethod
+    async def _finalize_through_gate(worker, entry) -> bool:
+        """``_finalize_inflight`` *entry*, resuming it while it parks on a gate
+        re-verify (task 6155), as
+        ``orchestrator/tests/_merge_queue_harness.py::finalize_through_gate``
+        does for the orchestrator suite.  Returns True iff main advanced.
+        """
+        while True:
+            advanced = await worker._finalize_inflight(entry)
+            if entry.gate is None:
+                return advanced
 
     def _make_finalize_fixture(
         self,
@@ -4796,7 +4998,7 @@ class TestGetMergeQueue:
         import types
 
         from orchestrator.git_ops import MergeResult  # type: ignore[reportMissingImports]
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             InflightEntry,
             ItemLifecycleState,
             MergeRequest,
@@ -4805,7 +5007,7 @@ class TestGetMergeQueue:
         )
 
         loop = asyncio.get_running_loop()
-        config = self._make_orch_config(tmp_path / 'repo')
+        config = OrchestratorConfig(project_root=tmp_path / 'repo')
         mq: asyncio.Queue = asyncio.Queue()
 
         merge_wt = tmp_path / 'merge'
@@ -4820,9 +5022,13 @@ class TestGetMergeQueue:
         async def fake_cleanup_merge_worktree(path):
             pass
 
+        async def not_on_main(ancestor, descendant):
+            return False
+
         git_ops_stub = types.SimpleNamespace(
             advance_main=fake_advance_main,
             cleanup_merge_worktree=fake_cleanup_merge_worktree,
+            is_ancestor_checked=not_on_main,
             config=config,
         )
         worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)  # type: ignore[reportArgumentType]
@@ -4879,13 +5085,13 @@ class TestGetMergeQueue:
         import asyncio
         import time
 
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             GroupMergeRequest,
             MergeRequest,
         )
 
         loop = asyncio.get_running_loop()
-        config = self._make_orch_config(tmp_path / 'repo')
+        config = OrchestratorConfig(project_root=tmp_path / 'repo')
 
         req = MergeRequest(
             task_id='T1',
@@ -4937,13 +5143,13 @@ class TestGetMergeQueue:
         import asyncio
         import types
 
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             MergeRequest,
             SpeculativeMergeWorker,
         )
 
         loop = asyncio.get_running_loop()
-        config = self._make_orch_config(tmp_path / 'repo')
+        config = OrchestratorConfig(project_root=tmp_path / 'repo')
         mq: asyncio.Queue = asyncio.Queue()
 
         git_ops_stub = types.SimpleNamespace()
@@ -4982,20 +5188,20 @@ class TestGetMergeQueue:
         assert isinstance(entry['age_secs'], (int, float))
         assert entry['age_secs'] >= 0
 
-    # ── step-7: waiter_alive reflects cancelled future ────────────────────
+    # ── step-7: a cancelled queued request is not listed (task 3860) ──────
 
-    async def test_waiter_alive_reflects_cancelled_future(self, tmp_path: Path):
-        """waiter_alive=True for a live future, False for a cancelled future."""
+    async def test_cancelled_queued_request_is_not_listed(self, tmp_path: Path):
+        """A cancelled request still in the queue is gone from the snapshot."""
         import asyncio
         import types
 
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             MergeRequest,
             SpeculativeMergeWorker,
         )
 
         loop = asyncio.get_running_loop()
-        config = self._make_orch_config(tmp_path / 'repo')
+        config = OrchestratorConfig(project_root=tmp_path / 'repo')
         mq: asyncio.Queue = asyncio.Queue()
 
         git_ops_stub = types.SimpleNamespace()
@@ -5026,14 +5232,12 @@ class TestGetMergeQueue:
         live_entry = next((e for e in entries if e['task_id'] == 'LIVE'), None)
         dead_entry = next((e for e in entries if e['task_id'] == 'DEAD'), None)
 
+        assert dead_entry is None, f'a cancelled queued request is listed: {dead_entry}'
         assert live_entry is not None, 'LIVE entry missing from snapshot'
-        assert dead_entry is not None, 'DEAD entry missing from snapshot'
         assert live_entry['waiter_alive'] is True, (
             f'Expected waiter_alive=True for live future, got: {live_entry}'
         )
-        assert dead_entry['waiter_alive'] is False, (
-            f'Expected waiter_alive=False for cancelled future, got: {dead_entry}'
-        )
+        assert result['depth'] == 1, f'depth counts the cancelled request: {result}'
 
     # ── step-9: verifier/queue-level state mapping ────────────────────────
 
@@ -5046,7 +5250,7 @@ class TestGetMergeQueue:
         import types
 
         from orchestrator.git_ops import MergeResult  # type: ignore[reportMissingImports]
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             InflightEntry,
             ItemLifecycleState,
             MergeRequest,
@@ -5055,7 +5259,7 @@ class TestGetMergeQueue:
         )
 
         loop = asyncio.get_running_loop()
-        config = self._make_orch_config(tmp_path / 'repo')
+        config = OrchestratorConfig(project_root=tmp_path / 'repo')
         mq: asyncio.Queue = asyncio.Queue()
         git_ops_stub = types.SimpleNamespace()
         worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)  # type: ignore[reportArgumentType]
@@ -5181,7 +5385,7 @@ class TestGetMergeQueue:
             AdvanceOutcome,
             MergeResult,
         )
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             InflightEntry,
             ItemLifecycleState,
             MergeRequest,
@@ -5190,7 +5394,7 @@ class TestGetMergeQueue:
         )
 
         loop = asyncio.get_running_loop()
-        config = self._make_orch_config(tmp_path / 'repo')
+        config = OrchestratorConfig(project_root=tmp_path / 'repo')
         mq: asyncio.Queue = asyncio.Queue()
 
         merge_wt = tmp_path / 'merge'
@@ -5220,9 +5424,13 @@ class TestGetMergeQueue:
         async def fake_cleanup_merge_worktree(path):
             pass
 
+        async def not_on_main(ancestor, descendant):
+            return False
+
         git_ops_stub = types.SimpleNamespace(
             advance_main=fake_advance_main,
             cleanup_merge_worktree=fake_cleanup_merge_worktree,
+            is_ancestor_checked=not_on_main,
             config=config,
         )
         worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)  # type: ignore[reportArgumentType]
@@ -5312,7 +5520,7 @@ class TestGetMergeQueue:
             AdvanceOutcome,
             MergeResult,
         )
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             InflightEntry,
             ItemLifecycleState,
             MergeRequest,
@@ -5321,7 +5529,7 @@ class TestGetMergeQueue:
         )
 
         loop = asyncio.get_running_loop()
-        config = self._make_orch_config(tmp_path / 'repo')
+        config = OrchestratorConfig(project_root=tmp_path / 'repo')
         mq: asyncio.Queue = asyncio.Queue()
 
         merge_wt = tmp_path / 'merge'
@@ -5364,11 +5572,15 @@ class TestGetMergeQueue:
         async def fake_cleanup_merge_worktree(path):
             pass
 
+        async def not_on_main(ancestor, descendant):
+            return False
+
         # Deliberately NO _last_advanced_sha/_rebased_from/_rebased_onto —
         # the SHAs must ride the AdvanceOutcome return value alone (task 1997).
         git_ops_stub = types.SimpleNamespace(
             advance_main=fake_advance_main,
             cleanup_merge_worktree=fake_cleanup_merge_worktree,
+            is_ancestor_checked=not_on_main,
             config=config,
         )
         worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)  # type: ignore[reportArgumentType]
@@ -5409,7 +5621,7 @@ class TestGetMergeQueue:
         # production VERIFYING->FINALIZING->GATE_REVERIFY transitions take effect.
         worker._register_item(item, initial=ItemLifecycleState.VERIFYING)
 
-        import orchestrator.merge_queue as mq_module  # type: ignore[reportMissingImports]
+        import orchestrator.merge_lane.worker as mq_module
 
         captured_reverify_kwargs: dict = {}
 
@@ -5433,7 +5645,7 @@ class TestGetMergeQueue:
         original_reverify = mq_module._reverify_rebased_tree
         mq_module._reverify_rebased_tree = fake_reverify_rebased_tree  # type: ignore[attr-defined]
         try:
-            await worker._finalize_inflight(entry)
+            await self._finalize_through_gate(worker, entry)
         finally:
             mq_module._reverify_rebased_tree = original_reverify  # type: ignore[attr-defined]
 
@@ -5507,7 +5719,9 @@ class TestGetMergeQueue:
         and snapshot() reports an active 'gate_reverify' state.
         """
         from orchestrator.git_ops import AdvanceOutcome  # type: ignore[reportMissingImports]
-        from orchestrator.merge_queue import MergeOutcome  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
+            MergeOutcome,
+        )
 
         REBASED_SHA = 'rebased0abc'
         REBASED_FROM = 'from0sha'
@@ -5527,7 +5741,7 @@ class TestGetMergeQueue:
             merge_commit='deadbeef00000002',
         )
 
-        import orchestrator.merge_queue as mq_module  # type: ignore[reportMissingImports]
+        import orchestrator.merge_lane.worker as mq_module
 
         GATE_FAIL = MergeOutcome('blocked', reason='post-rebase reverify gate failed')
 
@@ -5539,7 +5753,7 @@ class TestGetMergeQueue:
         original_reverify = mq_module._reverify_rebased_tree
         mq_module._reverify_rebased_tree = fake_reverify_rebased_tree  # type: ignore[attr-defined]
         try:
-            await worker._finalize_inflight(entry)
+            await self._finalize_through_gate(worker, entry)
         finally:
             mq_module._reverify_rebased_tree = original_reverify  # type: ignore[attr-defined]
 
@@ -5609,7 +5823,7 @@ class TestGetMergeQueue:
         cleanly via ``unhalt_wip()``.
         """
         from orchestrator.git_ops import AdvanceOutcome  # type: ignore[reportMissingImports]
-        from orchestrator.merge_queue import (
+        from orchestrator.merge_lane.worker import (
             ItemLifecycleState,  # type: ignore[reportMissingImports]
         )
 
@@ -5667,12 +5881,12 @@ class TestGetMergeQueue:
             f'wip_overlap, got: {bad_states}'
         )
 
-        # (5) The halt reverses cleanly — retirement did not corrupt
-        # _lane_halt.
+        # (5) The halt reverses cleanly — retirement did not corrupt the
+        # lane halt state.
         worker.unhalt_wip()
         assert not worker.is_wip_halted, (
             'Expected is_wip_halted False after unhalt_wip() — retirement '
-            'must not have corrupted _lane_halt'
+            'must not have corrupted the lane halt state'
         )
 
 
@@ -5723,7 +5937,7 @@ class TestDowngradeDedupeCorrectness:
         server = create_server(queue, dedupe_config=DedupeConfig())
         S = self._SUMMARY_A
 
-        result = await _blocker(
+        result = await call_blocker(
             server,
             task_id='task-999',
             agent_role='implementer',
@@ -5778,7 +5992,7 @@ class TestDowngradeDedupeCorrectness:
         queue.submit(parent)
 
         # File an agent critical with the SAME summary — should fold into parent
-        result = await _blocker(
+        result = await call_blocker(
             server,
             task_id='task-999',
             agent_role='implementer',
@@ -5810,7 +6024,7 @@ class TestDowngradeDedupeCorrectness:
         server = create_server(queue, dedupe_config=DedupeConfig())
         S = self._SUMMARY_A
 
-        first = await _blocker(
+        first = await call_blocker(
             server,
             task_id='task-1',
             agent_role='implementer',
@@ -5820,7 +6034,7 @@ class TestDowngradeDedupeCorrectness:
         )
         assert first['status'] == 'queued', f'Expected first to be queued, got: {first}'
 
-        second = await _blocker(
+        second = await call_blocker(
             server,
             task_id='task-2',
             agent_role='implementer',
@@ -5852,7 +6066,7 @@ class TestDowngradeDedupeCorrectness:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue, dedupe_config=DedupeConfig())
 
-        first = await _blocker(
+        first = await call_blocker(
             server,
             task_id='task-1',
             agent_role='implementer',
@@ -5864,7 +6078,7 @@ class TestDowngradeDedupeCorrectness:
             f'Expected first (SUMMARY_A) to be queued, got: {first}'
         )
 
-        second = await _blocker(
+        second = await call_blocker(
             server,
             task_id='task-2',
             agent_role='implementer',
@@ -5924,7 +6138,7 @@ class TestDowngradeDedupeCorrectness:
         queue.submit(parent)
 
         # File an agent critical with the same summary — should fold into parent
-        result = await _blocker(
+        result = await call_blocker(
             server,
             task_id='task-999',
             agent_role='implementer',
@@ -5947,12 +6161,6 @@ class TestDowngradeDedupeCorrectness:
 # ---------------------------------------------------------------------------
 
 
-async def _call_merge_status(server, **kwargs) -> dict:
-    """Invoke the merge_status MCP tool (async tool)."""
-    tool = await server.get_tool('merge_status')
-    return await tool.fn(**kwargs)
-
-
 @pytest.mark.asyncio
 @pytest.mark.skipif(not _ORCHESTRATOR_AVAILABLE, reason='orchestrator package not installed')
 class TestMergeStatus:
@@ -5965,29 +6173,32 @@ class TestMergeStatus:
         esc_queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(esc_queue)
 
-        result = await _call_merge_status(server)
+        result = await call_merge_status(server)
 
         assert isinstance(result, dict), f'Expected dict, got {type(result)}'
         assert 'error' in result, f'Expected error key, got: {result}'
 
-    # ── step-5b: standalone unknown + hint ───────────────────────────────────
+    # ── step-5b: standalone clean miss ───────────────────────────────────────
 
-    async def test_standalone_returns_unknown_with_hint(self, tmp_path: Path) -> None:
-        """On a server with no event_store/harness, merge_status returns unknown + hint."""
+    async def test_standalone_returns_no_record_with_derived_hint(self, tmp_path: Path) -> None:
+        """On a server with no event_store/harness, merge_status returns no_record + its hint."""
         esc_queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(esc_queue)  # standalone: no event_store, no harness
 
-        result = await _call_merge_status(server, request_id='mr-deadbeef')
+        result = await call_merge_status(server, request_id='mr-deadbeef')
 
         assert isinstance(result, dict), f'Expected dict, got {type(result)}'
-        assert result.get('state') == 'unknown', f'Expected state=unknown, got: {result}'
+        assert result.get('state') == 'no_record', f'Expected state=no_record, got: {result}'
+        assert result.get('reason') == MergeReason.never_submitted, (
+            f'Expected reason=never_submitted, got: {result}'
+        )
+        assert result.get('hint') == hint_for(MergeReason.never_submitted), (
+            f'Expected the hint derived from the reason, got: {result}'
+        )
+        assert result.get('source') == 'none', f'Expected source=none, got: {result}'
         assert result.get('generation') == 1, f'Expected generation=1, got: {result}'
         assert result.get('request_id') == 'mr-deadbeef', (
             f'Expected request_id echoed, got: {result}'
-        )
-        assert 'hint' in result, f'Expected hint key in result: {result}'
-        assert 'git log' in result['hint'].lower() or 'git' in result['hint'], (
-            f'Expected hint to mention git, got: {result["hint"]!r}'
         )
 
     # ── step-7: event-store tier + state mapping ──────────────────────────────
@@ -6032,7 +6243,7 @@ class TestMergeStatus:
         stub_harness = types.SimpleNamespace(_merge_worker=None)
         server = create_server(esc_queue, harness=stub_harness, event_store=event_store)
 
-        result = await _call_merge_status(server, request_id='mr-statetest')
+        result = await call_merge_status(server, request_id='mr-statetest')
 
         assert result.get('state') == expected_coarse, (
             f'raw={raw_state!r}: expected coarse={expected_coarse!r}, got state={result.get("state")!r}'
@@ -6042,7 +6253,7 @@ class TestMergeStatus:
         )
         assert result.get('generation') == 1
         assert result.get('request_id') == 'mr-statetest'
-        # finished_at must be an ISO-8601 string (same type as ring tier after normalisation)
+        # finished_at must be an ISO-8601 string
         fa = result.get('finished_at')
         assert isinstance(fa, str), f'Expected ISO-8601 string for finished_at, got {type(fa)}: {fa!r}'
         assert fa.startswith('20'), f'Expected ISO-8601 date string, got: {fa!r}'
@@ -6064,7 +6275,7 @@ class TestMergeStatus:
         stub_harness = types.SimpleNamespace(_merge_worker=None)
         server = create_server(esc_queue, harness=stub_harness, event_store=event_store)
 
-        result = await _call_merge_status(server, branch='feat-branch')
+        result = await call_merge_status(server, branch='feat-branch')
 
         assert result.get('state') == 'done', f'Expected done (most-recent), got: {result}'
         assert result.get('request_id') == 'mr-new', (
@@ -6087,70 +6298,44 @@ class TestMergeStatus:
         stub_harness = types.SimpleNamespace(_merge_worker=None)
         server = create_server(esc_queue, harness=stub_harness, event_store=event_store)
 
-        result = await _call_merge_status(server, task_id='T-tid')
+        result = await call_merge_status(server, task_id='T-tid')
 
         assert result.get('state') == 'done', f'Expected done (most-recent), got: {result}'
         assert result.get('request_id') == 'mr-later', (
             f'Expected resolved request_id=mr-later, got: {result.get("request_id")!r}'
         )
 
-    async def test_event_store_miss_falls_through_to_unknown(self, tmp_path: Path) -> None:
-        """An id not in the event store falls through to unknown+hint."""
+    async def test_event_store_miss_returns_no_record_with_derived_hint(
+        self, tmp_path: Path,
+    ) -> None:
+        """An id in no tier is no_record / never_submitted, with that reason's hint."""
         event_store, EventType = self._make_event_store(tmp_path)
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
         stub_harness = types.SimpleNamespace(_merge_worker=None)
         server = create_server(esc_queue, harness=stub_harness, event_store=event_store)
 
-        result = await _call_merge_status(server, request_id='mr-nothere')
+        result = await call_merge_status(server, request_id='mr-nothere')
 
-        assert result.get('state') == 'unknown', f'Expected unknown, got: {result}'
-        assert 'hint' in result
+        assert result.get('state') == 'no_record', f'Expected no_record, got: {result}'
+        assert result.get('reason') == MergeReason.never_submitted, f'got: {result}'
+        assert result.get('hint') == hint_for(MergeReason.never_submitted), f'got: {result}'
 
-    # ── step-9: ring tier ─────────────────────────────────────────────────────
+    # ── the retention ring is written by merge_request, never read here ──────
 
-    async def test_ring_tier_returns_terminal_record(self, tmp_path: Path) -> None:
-        """Ring tier: a request_id in the ring returns the recorded terminal state."""
-        ring = TerminalOutcomeRetention()
-        finished = time.time() - 5.0
-        ring.record(TerminalOutcomeRecord(
-            request_id='mr-aaaa1111',
-            task_id='T-ring',
-            branch='branch-ring',
-            state='done',
-            finished_at=finished,
-        ))
-
-        esc_queue = EscalationQueue(tmp_path / 'esc')
-        stub_harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=ring)
-        server = create_server(esc_queue, harness=stub_harness)
-
-        result = await _call_merge_status(server, request_id='mr-aaaa1111')
-
-        assert result.get('state') == 'done', f'Expected done from ring, got: {result}'
-        assert result.get('request_id') == 'mr-aaaa1111'
-        assert result.get('generation') == 1
-        assert result.get('outcome') == 'done'
-        # finished_at is normalised to ISO-8601 string (same type as event-store tier)
-        fa = result.get('finished_at')
-        assert isinstance(fa, str), f'Expected ISO-8601 string for finished_at, got {type(fa)}: {fa!r}'
-        assert fa.startswith('20'), f'Expected ISO-8601 date string, got: {fa!r}'
-
-    async def test_ring_wins_over_event_store(self, tmp_path: Path) -> None:
-        """Ring tier precedes event store: ring record wins when both have the same request_id."""
-        event_store = EventStore(tmp_path / 'runs.db', 'run-ring-vs-ev')
+    async def test_retention_ring_record_is_not_read(self, tmp_path: Path) -> None:
+        """A ring record disagreeing with the event store does not answer merge_status."""
+        event_store = EventStore(tmp_path / 'runs.db', 'run-ring-unread')
         event_store.emit(
             EventType.merge_finalized,
-            task_id='T-rv',
-            data={'request_id': 'mr-ringwin', 'branch': 'b-rv', 'state': 'done'},
+            task_id='T-ru',
+            data={'request_id': 'mr-ring-unread', 'branch': 'b-ru', 'state': 'conflict'},
         )
-
-        # Ring says 'blocked' — this should win over event store's 'done'
         ring = TerminalOutcomeRetention()
         ring.record(TerminalOutcomeRecord(
-            request_id='mr-ringwin',
-            task_id='T-rv',
-            branch='b-rv',
+            request_id='mr-ring-unread',
+            task_id='T-ru',
+            branch='b-ru',
             state='blocked',
         ))
 
@@ -6158,81 +6343,21 @@ class TestMergeStatus:
         stub_harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=ring)
         server = create_server(esc_queue, harness=stub_harness, event_store=event_store)
 
-        result = await _call_merge_status(server, request_id='mr-ringwin')
-
-        assert result.get('state') == 'blocked', (
-            f'Expected ring value (blocked) to beat event store (done), got: {result}'
-        )
-        assert result.get('outcome') == 'blocked'
-
-    async def test_ring_miss_falls_through_to_event_store(self, tmp_path: Path) -> None:
-        """Ring miss falls through to the event store tier."""
-        event_store = EventStore(tmp_path / 'runs.db', 'run-ring-miss')
-        event_store.emit(
-            EventType.merge_finalized,
-            task_id='T-rm',
-            data={'request_id': 'mr-in-ev-only', 'branch': 'b-rm', 'state': 'conflict'},
-        )
-
-        # Ring is empty — miss should fall through to event store
-        ring = TerminalOutcomeRetention()
-
-        esc_queue = EscalationQueue(tmp_path / 'esc')
-        stub_harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=ring)
-        server = create_server(esc_queue, harness=stub_harness, event_store=event_store)
-
-        result = await _call_merge_status(server, request_id='mr-in-ev-only')
+        result = await call_merge_status(server, request_id='mr-ring-unread')
 
         assert result.get('state') == 'conflict', (
-            f'Expected conflict from event-store fallback, got: {result}'
+            f'Expected the event-store row (conflict), not the ring (blocked), got: {result}'
         )
+        assert result.get('source') == 'event_store', f'got: {result}'
 
-    # ── step-7 (2554): failure reason surfaces through both durable tiers ────
+    # ── step-7 (2554): failure reason surfaces through the event-store tier ──
 
-    async def test_reason_surfaces_through_both_durable_tiers(
+    async def test_reason_surfaces_through_event_store_tier(
         self, tmp_path: Path,
     ) -> None:
-        """A terminal 'blocked' outcome's failure reason surfaces via merge_status.
-
-        (i) Ring survivor: a TerminalOutcomeRecord carrying reason= is served
-            directly from the retention ring (Tier 2).
-        (ii) Post-restart event-store: an empty ring + a merge_finalized event
-            carrying reason= in its data dict is served from the event-store
-            tier (Tier 3) — simulating a restart that dropped the ring.
-
-        RED: _OPTIONAL_TERMINAL_META_FIELDS omits 'reason' and the durable
-        resp builder has no reason plumbing, so resp['reason'] is absent in
-        both cases (the event-store tier additionally relies on step-6's
-        latest_merge_finalized row already carrying 'reason').
-        """
+        """A terminal 'blocked' outcome's free-text failure reason surfaces via merge_status."""
         REASON = 'verify failed: gui_tsc'
 
-        # (i) Ring survivor
-        ring = TerminalOutcomeRetention()
-        ring.record(TerminalOutcomeRecord(
-            request_id='mr-reason-ring',
-            task_id='r1',
-            branch='r1',
-            state='blocked',
-            reason=REASON,
-        ))
-        esc_queue = EscalationQueue(tmp_path / 'esc')
-        stub_harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=ring)
-        server = create_server(esc_queue, harness=stub_harness)
-
-        result_ring = await _call_merge_status(server, request_id='mr-reason-ring')
-
-        assert result_ring.get('state') == 'blocked', (
-            f'Expected state=blocked from ring, got: {result_ring}'
-        )
-        assert result_ring.get('outcome') == 'blocked', (
-            f'Expected outcome=blocked from ring, got: {result_ring}'
-        )
-        assert result_ring.get('reason') == REASON, (
-            f'Expected reason={REASON!r} surfaced from ring tier, got: {result_ring}'
-        )
-
-        # (ii) Post-restart event-store: empty ring, same reason via event data.
         event_store = EventStore(tmp_path / 'runs.db', 'run-reason-ev')
         event_store.emit(
             EventType.merge_finalized,
@@ -6244,16 +6369,11 @@ class TestMergeStatus:
                 'reason': REASON,
             },
         )
-        empty_ring = TerminalOutcomeRetention()
-        esc_queue2 = EscalationQueue(tmp_path / 'esc2')
-        stub_harness2 = types.SimpleNamespace(
-            _merge_worker=None, _terminal_retention=empty_ring
-        )
-        server2 = create_server(
-            esc_queue2, harness=stub_harness2, event_store=event_store
-        )
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        stub_harness = types.SimpleNamespace(_merge_worker=None)
+        server = create_server(esc_queue, harness=stub_harness, event_store=event_store)
 
-        result_ev = await _call_merge_status(server2, request_id='mr-reason-ev')
+        result_ev = await call_merge_status(server, request_id='mr-reason-ev')
 
         assert result_ev.get('state') == 'blocked', (
             f'Expected state=blocked from event store, got: {result_ev}'
@@ -6262,188 +6382,37 @@ class TestMergeStatus:
             f'Expected reason={REASON!r} surfaced from event-store tier, got: {result_ev}'
         )
 
-    # ── step-9 (1749): ring tier branch/task_id/alias lookup ─────────────────
+    async def test_event_store_request_id_over_branch_precedence(self, tmp_path: Path) -> None:
+        """When request_id is supplied and misses the event store, branch is NOT consulted.
 
-    async def test_ring_tier_returns_terminal_record_by_branch(
-        self, tmp_path: Path,
-    ) -> None:
-        """Ring tier: a branch= poll resolves to the ring's recorded terminal state."""
-        ring = TerminalOutcomeRetention()
-        ring.record(TerminalOutcomeRecord(
-            request_id='mr-branchpoll',
-            task_id='T-bpoll',
-            branch='branch-bylookup',
-            state='done',
-        ))
-
-        esc_queue = EscalationQueue(tmp_path / 'esc')
-        stub_harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=ring)
-        server = create_server(esc_queue, harness=stub_harness)
-
-        result = await _call_merge_status(server, branch='branch-bylookup')
-
-        assert result.get('state') == 'done', (
-            f'Expected done from ring branch lookup, got: {result}'
-        )
-        assert result.get('request_id') == 'mr-branchpoll', (
-            f'Expected resolved record request_id, got: {result}'
-        )
-        assert result.get('outcome') == 'done', (
-            f'Expected outcome=done, got: {result}'
-        )
-
-    async def test_ring_tier_returns_terminal_record_by_task_id(
-        self, tmp_path: Path,
-    ) -> None:
-        """Ring tier: a task_id= poll resolves to the ring's recorded terminal state."""
-        ring = TerminalOutcomeRetention()
-        ring.record(TerminalOutcomeRecord(
-            request_id='mr-taskpoll',
-            task_id='T-ltask',
-            branch='branch-ltask',
-            state='blocked',
-        ))
-
-        esc_queue = EscalationQueue(tmp_path / 'esc')
-        stub_harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=ring)
-        server = create_server(esc_queue, harness=stub_harness)
-
-        result = await _call_merge_status(server, task_id='T-ltask')
-
-        assert result.get('state') == 'blocked', (
-            f'Expected blocked from ring task_id lookup, got: {result}'
-        )
-        assert result.get('request_id') == 'mr-taskpoll', (
-            f'Expected resolved record request_id, got: {result}'
-        )
-
-    async def test_ring_wins_over_event_store_by_branch(self, tmp_path: Path) -> None:
-        """Ring branch= record wins over event store when both have the same branch."""
-        event_store = EventStore(tmp_path / 'runs.db', 'run-ring-vs-ev-branch')
-        event_store.emit(
-            EventType.merge_finalized,
-            task_id='T-rb',
-            data={'request_id': 'mr-evbranch', 'branch': 'branch-ring-wins', 'state': 'done'},
-        )
-
-        # Ring says 'blocked' for this branch — ring must win over event store's 'done'
-        ring = TerminalOutcomeRetention()
-        ring.record(TerminalOutcomeRecord(
-            request_id='mr-ringbranch',
-            task_id='T-rb',
-            branch='branch-ring-wins',
-            state='blocked',
-        ))
-
-        esc_queue = EscalationQueue(tmp_path / 'esc')
-        stub_harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=ring)
-        server = create_server(esc_queue, harness=stub_harness, event_store=event_store)
-
-        result = await _call_merge_status(server, branch='branch-ring-wins')
-
-        assert result.get('state') == 'blocked', (
-            f'Expected ring value (blocked) to beat event store (done) on branch= poll, '
-            f'got: {result}'
-        )
-
-    async def test_ring_tier_coalesced_id_via_alias(self, tmp_path: Path) -> None:
-        """Coalesced id resolves to primary's terminal record via alias."""
-        ring = TerminalOutcomeRetention()
-        primary = TerminalOutcomeRecord(
-            request_id='mr-primary-alias',
-            task_id='T-alias',
-            branch='branch-alias',
-            state='done',
-        )
-        ring.record(primary)
-        ring.record_alias('mr-coalesced-alias', 'mr-primary-alias')
-
-        esc_queue = EscalationQueue(tmp_path / 'esc')
-        stub_harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=ring)
-        server = create_server(esc_queue, harness=stub_harness)
-
-        result = await _call_merge_status(server, request_id='mr-coalesced-alias')
-
-        assert result.get('state') == 'done', (
-            f'Expected done from coalesced-id alias resolution, got: {result}'
-        )
-        assert result.get('request_id') == 'mr-primary-alias', (
-            f'Expected resolved primary request_id, got: {result}'
-        )
-
-    async def test_ring_request_id_over_branch_precedence(self, tmp_path: Path) -> None:
-        """When request_id is supplied and misses the ring, branch is NOT consulted.
-
-        The Tier-2 elif chain applies request_id > branch > task_id precedence:
-        if request_id is given (even if it misses the ring), the branch key is
-        never checked in the ring.  This pins the deliberate precedence choice
-        so a regression that accidentally fell through to get_by_branch on a
-        request_id miss would be caught.
+        Lookup applies request_id > branch > task_id precedence: if request_id
+        is given (even if it misses), the branch key is never checked.  This
+        pins the deliberate precedence choice so a regression that fell
+        through to a branch lookup on a request_id miss would be caught.
         """
-        # Ring has a record for branch 'prec-branch' but NOT for request_id 'mr-miss'
-        ring = TerminalOutcomeRetention()
-        ring.record(TerminalOutcomeRecord(
-            request_id='mr-other-prec',
-            task_id='T-prec',
-            branch='prec-branch',
-            state='done',
-        ))
-
-        esc_queue = EscalationQueue(tmp_path / 'esc')
-        stub_harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=ring)
-        server = create_server(esc_queue, harness=stub_harness)
-
-        # Supply both request_id (ring-miss) and branch (ring-hit).
-        # The ring tier must NOT resolve via branch because request_id is present.
-        result = await _call_merge_status(server, request_id='mr-miss', branch='prec-branch')
-
-        # Should fall through to unknown (not 'done' from the ring's branch record)
-        assert result.get('state') == 'unknown', (
-            f'Expected unknown (request_id-only lookup; branch ignored on ring-miss), '
-            f'got: {result}'
+        event_store, EventType = self._make_event_store(tmp_path)
+        self._emit_finalized(
+            event_store, EventType,
+            request_id='mr-other-prec', task_id='T-prec', branch='prec-branch', state='done',
         )
 
-    async def test_ring_wins_over_event_store_by_task_id(self, tmp_path: Path) -> None:
-        """Ring task_id= record wins over event store when both have the same task_id."""
-        event_store = EventStore(tmp_path / 'runs.db', 'run-ring-vs-ev-task')
-        event_store.emit(
-            EventType.merge_finalized,
-            task_id='T-rtask',
-            data={'request_id': 'mr-evtask', 'branch': 'b-rtask', 'state': 'done'},
-        )
-
-        # Ring says 'conflict' for this task_id — ring must win over event store's 'done'
-        ring = TerminalOutcomeRetention()
-        ring.record(TerminalOutcomeRecord(
-            request_id='mr-ringtask',
-            task_id='T-rtask',
-            branch='b-rtask',
-            state='conflict',
-        ))
-
         esc_queue = EscalationQueue(tmp_path / 'esc')
-        stub_harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=ring)
+        stub_harness = types.SimpleNamespace(_merge_worker=None)
         server = create_server(esc_queue, harness=stub_harness, event_store=event_store)
 
-        result = await _call_merge_status(server, task_id='T-rtask')
+        result = await call_merge_status(server, request_id='mr-miss', branch='prec-branch')
 
-        assert result.get('state') == 'conflict', (
-            f'Expected ring value (conflict) to beat event store (done) on task_id= poll, '
+        assert result.get('state') == 'no_record', (
+            f'Expected no_record (request_id-only lookup; branch ignored on a miss), '
             f'got: {result}'
-        )
-        assert result.get('outcome') == 'conflict', (
-            f'Expected outcome=conflict from ring, got: {result}'
         )
 
     # ── step-11: live-snapshot tier ───────────────────────────────────────────
 
-    def _make_orch_config(self, tmp_path: Path):
-        return OrchestratorConfig(project_root=tmp_path)
-
     async def test_live_snapshot_state_mapping(self, tmp_path: Path) -> None:
         """Live snapshot states map to the public vocabulary."""
         loop = asyncio.get_running_loop()
-        config = self._make_orch_config(tmp_path / 'repo')
+        config = OrchestratorConfig(project_root=tmp_path / 'repo')
         mq: asyncio.Queue = asyncio.Queue()
         git_ops_stub = types.SimpleNamespace()
         worker = SpeculativeMergeWorker(
@@ -6462,7 +6431,7 @@ class TestMergeStatus:
         stub_harness = types.SimpleNamespace(_merge_worker=worker)
         server = create_server(esc_queue, harness=stub_harness)
 
-        result = await _call_merge_status(server, request_id=req.request_id)
+        result = await call_merge_status(server, request_id=req.request_id)
 
         assert result.get('state') == 'queued', f'Expected queued, got: {result}'
         assert result.get('request_id') == req.request_id
@@ -6476,7 +6445,7 @@ class TestMergeStatus:
     async def test_live_snapshot_lookup_by_branch(self, tmp_path: Path) -> None:
         """branch= lookup resolves to the live entry's request_id."""
         loop = asyncio.get_running_loop()
-        config = self._make_orch_config(tmp_path / 'repo')
+        config = OrchestratorConfig(project_root=tmp_path / 'repo')
         mq: asyncio.Queue = asyncio.Queue()
         git_ops_stub = types.SimpleNamespace()
         worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)  # type: ignore
@@ -6491,7 +6460,7 @@ class TestMergeStatus:
         stub_harness = types.SimpleNamespace(_merge_worker=worker)
         server = create_server(esc_queue, harness=stub_harness)
 
-        result = await _call_merge_status(server, branch='branch-bylookup')
+        result = await call_merge_status(server, branch='branch-bylookup')
 
         assert result.get('state') == 'queued', f'Expected queued, got: {result}'
         assert result.get('request_id') == req.request_id, (
@@ -6501,7 +6470,7 @@ class TestMergeStatus:
     async def test_live_snapshot_lookup_by_task_id(self, tmp_path: Path) -> None:
         """task_id= lookup resolves to the live entry's request_id."""
         loop = asyncio.get_running_loop()
-        config = self._make_orch_config(tmp_path / 'repo')
+        config = OrchestratorConfig(project_root=tmp_path / 'repo')
         mq: asyncio.Queue = asyncio.Queue()
         git_ops_stub = types.SimpleNamespace()
         worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)  # type: ignore
@@ -6516,17 +6485,17 @@ class TestMergeStatus:
         stub_harness = types.SimpleNamespace(_merge_worker=worker)
         server = create_server(esc_queue, harness=stub_harness)
 
-        result = await _call_merge_status(server, task_id='T-ltask')
+        result = await call_merge_status(server, task_id='T-ltask')
 
         assert result.get('state') == 'queued', f'Expected queued, got: {result}'
         assert result.get('request_id') == req.request_id, (
             f'Expected resolved request_id={req.request_id!r}, got: {result.get("request_id")!r}'
         )
 
-    async def test_live_snapshot_beats_ring_and_event_store(self, tmp_path: Path) -> None:
-        """Live snapshot tier wins over ring and event store for the same request_id."""
+    async def test_live_snapshot_beats_event_store(self, tmp_path: Path) -> None:
+        """Live snapshot tier wins over the event store for the same request_id."""
         loop = asyncio.get_running_loop()
-        config = self._make_orch_config(tmp_path / 'repo')
+        config = OrchestratorConfig(project_root=tmp_path / 'repo')
         mq: asyncio.Queue = asyncio.Queue()
         git_ops_stub = types.SimpleNamespace()
         worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)  # type: ignore
@@ -6537,16 +6506,6 @@ class TestMergeStatus:
         )
         await mq.put(req)
 
-        # Ring says 'done'
-        ring = TerminalOutcomeRetention()
-        ring.record(TerminalOutcomeRecord(
-            request_id=req.request_id,
-            task_id=req.task_id,
-            branch=req.branch.bare_id,
-            state='done',
-        ))
-
-        # Event store also says 'done'
         event_store = EventStore(tmp_path / 'runs.db', 'run-prec')
         event_store.emit(
             EventType.merge_finalized,
@@ -6555,15 +6514,13 @@ class TestMergeStatus:
         )
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
-        stub_harness = types.SimpleNamespace(_merge_worker=worker, _terminal_retention=ring)
+        stub_harness = types.SimpleNamespace(_merge_worker=worker)
         server = create_server(esc_queue, harness=stub_harness, event_store=event_store)
 
-        result = await _call_merge_status(server, request_id=req.request_id)
+        result = await call_merge_status(server, request_id=req.request_id)
 
-        # Live snapshot is 'queued'; ring+event store have 'done'
-        # Live must win
         assert result.get('state') == 'queued', (
-            f'Expected live state (queued) to beat ring/ev (done), got: {result}'
+            f'Expected live state (queued) to beat the event store (done), got: {result}'
         )
         assert 'position' in result, 'Live entry should carry position'
 
@@ -6580,7 +6537,7 @@ class TestMergeStatus:
     ) -> None:
         """Live snapshot state mapping covers all documented phase values."""
         loop = asyncio.get_running_loop()
-        config = self._make_orch_config(tmp_path / 'repo')
+        config = OrchestratorConfig(project_root=tmp_path / 'repo')
         mq: asyncio.Queue = asyncio.Queue()
         git_ops_stub = types.SimpleNamespace()
         worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)  # type: ignore
@@ -6592,7 +6549,7 @@ class TestMergeStatus:
         )
 
         from orchestrator.git_ops import MergeResult  # type: ignore[reportMissingImports]
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane.worker import (
             InflightEntry,
             ItemLifecycleState,
         )
@@ -6648,22 +6605,21 @@ class TestMergeStatus:
         stub_harness = types.SimpleNamespace(_merge_worker=worker)
         server = create_server(esc_queue, harness=stub_harness)
 
-        result = await _call_merge_status(server, request_id=req.request_id)
+        result = await call_merge_status(server, request_id=req.request_id)
 
         assert result.get('state') == expected, (
             f'verify_phase={verify_phase!r}: expected {expected!r}, got {result.get("state")!r}'
         )
 
-    # ── Tier-1 degradation: snapshot() failure falls through to durable tiers ─
+    # ── live-tier probe failure: snapshot() raising ends the walk ────────────
 
-    async def test_snapshot_failure_degrades_to_durable_tier(self, tmp_path: Path) -> None:
-        """Tier-1 fire-safe wrapper: a snapshot() exception falls through to ring/event-store.
+    async def test_snapshot_failure_is_a_live_probe_failure(self, tmp_path: Path) -> None:
+        """A snapshot() exception answers unknown / probe_failed from the live tier.
 
-        This covers the most safety-critical branch: merge_status must return a
-        durable-tier result (not propagate the exception) when the live worker
-        is present but snapshot() itself raises.
+        merge_status must not propagate the exception, and must not fall
+        through to a durable tier: a live entry it could not read may be the
+        present truth, so the event-store row below must not answer.
         """
-        # Populate the event store so the durable tier has a result to serve.
         event_store = EventStore(tmp_path / 'runs.db', 'run-snap-fail')
         event_store.emit(
             EventType.merge_finalized,
@@ -6678,21 +6634,19 @@ class TestMergeStatus:
         )
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
-        stub_harness = types.SimpleNamespace(
-            _merge_worker=broken_worker,
-            _terminal_retention=None,
-        )
+        stub_harness = types.SimpleNamespace(_merge_worker=broken_worker)
         server = create_server(esc_queue, harness=stub_harness, event_store=event_store)
 
-        # Should NOT raise; should fall through to the event-store tier.
-        result = await _call_merge_status(server, request_id='mr-snapfail')
+        result = await call_merge_status(server, request_id='mr-snapfail')
 
-        assert result.get('state') == 'done', (
-            f'Expected durable-tier result after snapshot() failure, got: {result}'
+        assert result.get('state') == 'unknown', (
+            f'Expected unknown after snapshot() failure, got: {result}'
         )
+        assert result.get('reason') == MergeReason.probe_failed, f'got: {result}'
+        assert result.get('source') == 'live', f'got: {result}'
+        assert result.get('hint') == hint_for(MergeReason.probe_failed), f'got: {result}'
         assert result.get('request_id') == 'mr-snapfail'
-        assert result.get('outcome') == 'done'
-        assert 'finished_at' in result
+        assert 'outcome' not in result, f'A durable row leaked into the answer: {result}'
 
 
 # ---------------------------------------------------------------------------
@@ -6795,9 +6749,10 @@ async def _call_tool(server: Any, name: str, **kwargs: Any) -> Any:
     """Invoke an async MCP tool by name.
 
     *server* is intentionally typed ``Any`` so pyright does not reach into
-    FastMCP's ``Tool`` internals (``.fn``) — mirroring the ``_blocker`` /
-    ``_info`` / ``_call_merge_status`` helpers above, which the type-check gate
-    accepts for exactly this reason.
+    FastMCP's ``Tool`` internals (``.fn``) — mirroring
+    ``_filing_tools.py::call_blocker`` / ``call_info`` and
+    ``_merge_tool_calls.py::call_merge_status``,
+    which the type-check gate accepts for exactly this reason.
     """
     tool = await server.get_tool(name)
     return await tool.fn(**kwargs)
@@ -6987,7 +6942,7 @@ class TestEscalateEvidenceParam:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _blocker(server, evidence=self._EVIDENCE, **_COMMON_KWARGS)
+        result = await call_blocker(server, evidence=self._EVIDENCE, **_COMMON_KWARGS)
 
         esc = queue.get(result['id'])
         assert esc is not None
@@ -6999,7 +6954,7 @@ class TestEscalateEvidenceParam:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _info(server, evidence=self._EVIDENCE, **_COMMON_KWARGS)
+        result = await call_info(server, evidence=self._EVIDENCE, **_COMMON_KWARGS)
 
         esc = queue.get(result['id'])
         assert esc is not None
@@ -7011,7 +6966,7 @@ class TestEscalateEvidenceParam:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _blocker(server, **_COMMON_KWARGS)
+        result = await call_blocker(server, **_COMMON_KWARGS)
 
         esc = queue.get(result['id'])
         assert esc is not None
@@ -7023,7 +6978,7 @@ class TestEscalateEvidenceParam:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _info(server, **_COMMON_KWARGS)
+        result = await call_info(server, **_COMMON_KWARGS)
 
         esc = queue.get(result['id'])
         assert esc is not None
@@ -7066,7 +7021,7 @@ class TestResolveIssueEscalateModel:
         server = create_server(queue, harness=harness)
         esc = self._seed_pending(queue)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='fixed',
             action='resume', escalate_model=True,
         )
@@ -7081,7 +7036,7 @@ class TestResolveIssueEscalateModel:
         server = create_server(queue, harness=harness)
         esc = self._seed_pending(queue)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='fixed',
             action='restart', escalate_model=True,
         )
@@ -7096,7 +7051,7 @@ class TestResolveIssueEscalateModel:
         server = create_server(queue, harness=harness)
         esc = self._seed_pending(queue)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='fixed',
             action='resume', escalate_model=False,
         )
@@ -7113,7 +7068,7 @@ class TestResolveIssueEscalateModel:
         server = create_server(queue, harness=harness)
         esc = self._seed_pending(queue)
 
-        await _resolve_issue(
+        await call_resolve_issue(
             server, escalation_id=esc.id, resolution='needs human',
             action='park', escalate_model=True,
         )
@@ -7144,7 +7099,7 @@ class TestEscalateBlockerLevelParam:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _blocker(server, level=1, **_COMMON_KWARGS)
+        result = await call_blocker(server, level=1, **_COMMON_KWARGS)
 
         assert 'error' not in result, f'Unexpected error: {result}'
         esc = queue.get(result['id'])
@@ -7157,7 +7112,7 @@ class TestEscalateBlockerLevelParam:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _blocker(server, **_COMMON_KWARGS)
+        result = await call_blocker(server, **_COMMON_KWARGS)
 
         esc = queue.get(result['id'])
         assert esc is not None
@@ -7169,7 +7124,7 @@ class TestEscalateBlockerLevelParam:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _blocker(server, level=0, **_COMMON_KWARGS)
+        result = await call_blocker(server, level=0, **_COMMON_KWARGS)
 
         assert 'error' not in result, f'Unexpected error: {result}'
         esc = queue.get(result['id'])
@@ -7187,7 +7142,7 @@ class TestEscalateBlockerLevelParam:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _blocker(server, level=2, **_COMMON_KWARGS)
+        result = await call_blocker(server, level=2, **_COMMON_KWARGS)
 
         assert 'error' in result, f'Expected an error response, got: {result}'
         assert 'id' not in result, f'Nothing should be submitted, got: {result}'
@@ -7218,7 +7173,7 @@ class TestEscalateBlockerLevelParam:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _blocker(server, level=bad_level, **_COMMON_KWARGS)
+        result = await call_blocker(server, level=bad_level, **_COMMON_KWARGS)
 
         assert 'error' in result, f'level={bad_level!r}: expected error, got: {result}'
         assert queue.get_pending() == [], f'level={bad_level!r} must not submit any record'
@@ -7234,7 +7189,7 @@ class TestEscalateBlockerLevelParam:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _blocker(
+        result = await call_blocker(
             server, level=1, severity='critical',
             **{**_COMMON_KWARGS, 'agent_role': 'orchestrator-watcher-supervisor'},
         )
@@ -7265,7 +7220,7 @@ class TestUnexpectedLevel1FilerIsObservable:
         server = create_server(queue)
 
         with caplog.at_level(logging.WARNING, logger='escalation.server'):
-            result = await _blocker(
+            result = await call_blocker(
                 server, level=1,
                 **{**_COMMON_KWARGS, 'agent_role': 'implementer', 'task_id': 'task-777'},
             )
@@ -7290,7 +7245,7 @@ class TestUnexpectedLevel1FilerIsObservable:
         server = create_server(queue)
 
         with caplog.at_level(logging.WARNING, logger='escalation.server'):
-            result = await _blocker(
+            result = await call_blocker(
                 server, level=1, **{**_COMMON_KWARGS, 'agent_role': 'steward'},
             )
 
@@ -7310,7 +7265,7 @@ class TestUnexpectedLevel1FilerIsObservable:
         server = create_server(queue)
 
         with caplog.at_level(logging.WARNING, logger='escalation.server'):
-            await _blocker(server, **{**_COMMON_KWARGS, 'agent_role': 'implementer'})
+            await call_blocker(server, **{**_COMMON_KWARGS, 'agent_role': 'implementer'})
 
         unexpected = [
             r.message for r in caplog.records
@@ -7335,7 +7290,7 @@ class TestLevelEchoIsPresentOnEveryResponseBranch:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _blocker(server, level=1, **_COMMON_KWARGS)
+        result = await call_blocker(server, level=1, **_COMMON_KWARGS)
 
         assert result.get('level') == 1, f'Expected level echo on queued, got: {result}'
 
@@ -7358,7 +7313,7 @@ class TestLevelEchoIsPresentOnEveryResponseBranch:
 
         queue.get = _boom  # type: ignore[method-assign]
         try:
-            result = await _blocker(server, level=1, **_COMMON_KWARGS)
+            result = await call_blocker(server, level=1, **_COMMON_KWARGS)
         finally:
             queue.get = real_get  # type: ignore[method-assign]
 
@@ -7381,8 +7336,8 @@ class TestLevelEchoIsPresentOnEveryResponseBranch:
             'category': 'infra_issue',
             'summary': 'docker daemon unreachable',
         }
-        first = await _blocker(server, level=1, **kwargs)
-        second = await _blocker(server, level=1, **kwargs)
+        first = await call_blocker(server, level=1, **kwargs)
+        second = await call_blocker(server, level=1, **kwargs)
 
         assert second.get('status') == 'dedup_skipped', (
             f'Expected the second filing to fold into the first ({first}), got: {second}'
@@ -7401,7 +7356,7 @@ class TestLevelEchoIsPresentOnEveryResponseBranch:
 
         server = create_server(queue, task_status_lookup=_terminal_lookup)
 
-        result = await _blocker(server, level=1, **_COMMON_KWARGS)
+        result = await call_blocker(server, level=1, **_COMMON_KWARGS)
 
         assert result.get('status') != 'queued', (
             f'Expected the terminal-task auto-resolve branch, got: {result}'
@@ -7431,14 +7386,14 @@ class TestPromoteToL2CanonicalFold:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        created = await _promote_to_l2(server, **{
+        created = await call_promote(server, **{
             **_L2_DEFAULTS,
             'member_ids': ['esc-l1-1'],
             'root_cause': 'Watcher lease stolen.',
         })
         assert created['status'] == 'created', f'Unexpected first result: {created}'
 
-        folded = await _promote_to_l2(server, **{
+        folded = await call_promote(server, **{
             **_L2_DEFAULTS,
             'member_ids': ['esc-l1-2'],
             'root_cause': 'watcher  lease STOLEN',
@@ -7469,12 +7424,12 @@ class TestPromoteToL2CanonicalFold:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        created = await _promote_to_l2(server, **{
+        created = await call_promote(server, **{
             **_L2_DEFAULTS,
             'member_ids': ['esc-l1-1'],
             'root_cause': 'Watcher lease stolen.',
         })
-        await _promote_to_l2(server, **{
+        await call_promote(server, **{
             **_L2_DEFAULTS,
             'member_ids': ['esc-l1-2'],
             'root_cause': 'watcher  lease STOLEN',
@@ -7491,19 +7446,21 @@ class TestPromoteToL2CanonicalFold:
     ):
         """The over-fold evidence trail: the incoming spelling lands in `amendments`.
 
-        This is also what proves ``_framing_view`` was NOT canonicalised — if it
-        had been, a spelling-only difference would read as a REPEAT and be
-        suppressed, emptying the slot task 3997 built for exactly this.
+        This is also what proves
+        ``escalation/src/escalation/amendments.py::_framing_view`` was NOT
+        canonicalised — if it had been, a spelling-only difference would read
+        as a REPEAT and be suppressed, emptying the slot task 3997 built for
+        exactly this.
         """
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        created = await _promote_to_l2(server, **{
+        created = await call_promote(server, **{
             **_L2_DEFAULTS,
             'member_ids': ['esc-l1-1'],
             'root_cause': 'Watcher lease stolen.',
         })
-        folded = await _promote_to_l2(server, **{
+        folded = await call_promote(server, **{
             **_L2_DEFAULTS,
             'member_ids': ['esc-l1-2'],
             'root_cause': 'watcher  lease STOLEN',
@@ -7530,10 +7487,10 @@ class TestPromoteToL2CanonicalFold:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        first = await _promote_to_l2(server, **{
+        first = await call_promote(server, **{
             **_L2_DEFAULTS, 'member_ids': ['esc-l1-1'], 'root_cause': 'risk:3184',
         })
-        second = await _promote_to_l2(server, **{
+        second = await call_promote(server, **{
             **_L2_DEFAULTS, 'member_ids': ['esc-l1-2'], 'root_cause': 'risk:318:4',
         })
 
@@ -7564,7 +7521,7 @@ class TestPromoteToL2CanonicalFold:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _promote_to_l2(server, **{
+        result = await call_promote(server, **{
             **_L2_DEFAULTS, 'member_ids': ['esc-l1-1'], 'root_cause': root_cause,
         })
 
@@ -7582,7 +7539,7 @@ class TestPromoteToL2CanonicalFold:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _promote_to_l2(server, **{
+        result = await call_promote(server, **{
             **_L2_DEFAULTS, 'member_ids': ['esc-l1-1'], 'root_cause': 'ロック競合:2370',
         })
 
@@ -7620,7 +7577,7 @@ class TestRootCauseOverfoldReport:
     @staticmethod
     async def _fold(server, spelling: str, member: str) -> dict[str, Any]:
         """Fold into the same canonical cluster under a DISTINCT spelling."""
-        return await _promote_to_l2(server, **{
+        return await call_promote(server, **{
             **_L2_DEFAULTS,
             'member_ids': [member],
             'root_cause': spelling,
@@ -7806,7 +7763,7 @@ class TestRootCauseOverfoldReport:
         )
 
         for i in range(_ROOT_CAUSE_OVERFOLD_VARIANT_THRESHOLD + 2):
-            result = await _promote_to_l2(server, **{
+            result = await call_promote(server, **{
                 **_L2_DEFAULTS,
                 'member_ids': [f'esc-l1-{i}'],
                 'root_cause': f'genuinely-distinct-cause:{i}',
@@ -7953,7 +7910,7 @@ class TestFilingClaimantIdentityStamp:
             startup_sweep=False,
         )
 
-        result = await _blocker(server, **_COMMON_KWARGS)
+        result = await call_blocker(server, **_COMMON_KWARGS)
 
         esc = queue.get(result['id'])
         assert esc is not None
@@ -7969,7 +7926,7 @@ class TestFilingClaimantIdentityStamp:
             startup_sweep=False,
         )
 
-        result = await _info(server, **_COMMON_KWARGS)
+        result = await call_info(server, **_COMMON_KWARGS)
 
         esc = queue.get(result['id'])
         assert esc is not None
@@ -7985,7 +7942,7 @@ class TestFilingClaimantIdentityStamp:
             startup_sweep=False,
         )
 
-        await _blocker(server, **_COMMON_KWARGS)
+        await call_blocker(server, **_COMMON_KWARGS)
 
         assert calls == ['task-999']
 
@@ -7999,7 +7956,7 @@ class TestFilingClaimantIdentityStamp:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue, startup_sweep=False)
 
-        result = await _blocker(server, **_COMMON_KWARGS)
+        result = await call_blocker(server, **_COMMON_KWARGS)
 
         esc = queue.get(result['id'])
         assert esc is not None
@@ -8022,7 +7979,7 @@ class TestFilingClaimantIdentityStamp:
         server = create_server(queue, task_claimant_lookup=_boom, startup_sweep=False)
 
         with caplog.at_level(logging.WARNING):
-            result = await _blocker(server, **_COMMON_KWARGS)
+            result = await call_blocker(server, **_COMMON_KWARGS)
 
         esc = queue.get(result['id'])
         assert esc is not None
@@ -8050,7 +8007,7 @@ class TestFilingClaimantIdentityStamp:
             startup_sweep=False,
         )
 
-        result = await _blocker(server, **_COMMON_KWARGS)
+        result = await call_blocker(server, **_COMMON_KWARGS)
 
         esc = queue.get(result['id'])
         assert esc is not None
@@ -8076,7 +8033,7 @@ class TestFilingClaimantIdentityStamp:
             startup_sweep=False,
         )
 
-        result = await _blocker(server, **_COMMON_KWARGS)
+        result = await call_blocker(server, **_COMMON_KWARGS)
 
         assert result['status'] == 'resolved', f'expected auto-resolve, got: {result}'
         esc = queue.get(result['id'])
@@ -8094,7 +8051,7 @@ class TestFilingClaimantIdentityStamp:
             startup_sweep=False,
         )
 
-        result = await _blocker(
+        result = await call_blocker(
             server, severity='critical',
             **{**_COMMON_KWARGS, 'agent_role': 'orchestrator-watcher-supervisor'},
         )
@@ -8115,7 +8072,7 @@ class TestFilingClaimantIdentityStamp:
             startup_sweep=False,
         )
 
-        result = await _blocker(server, severity='critical', **_COMMON_KWARGS)
+        result = await call_blocker(server, severity='critical', **_COMMON_KWARGS)
 
         esc = queue.get(result['id'])
         assert esc is not None
@@ -8134,7 +8091,7 @@ class TestFilingClaimantIdentityStamp:
             startup_sweep=False,
         )
 
-        result = await _blocker(
+        result = await call_blocker(
             server, level=1, **{**_COMMON_KWARGS, 'agent_role': 'steward'},
         )
 
@@ -8178,7 +8135,7 @@ class TestResolveIssueSurfacesLateResolution:
         server = create_server(queue)
         self._auto_dismissed(queue)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id='esc-3902-1', resolution=self.LATE_TEXT,
             resolved_by='claude-task-3902-steward',
         )
@@ -8219,7 +8176,7 @@ class TestResolveIssueSurfacesLateResolution:
         )
         queue.submit(esc)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id='esc-3902-2', resolution='really fixed it',
             resolved_by='claude-task-3902-steward',
         )
@@ -8236,17 +8193,16 @@ class TestResolveIssueSurfacesLateResolution:
     async def test_already_terminal_path_does_not_resurrect_the_archived_record(
         self, tmp_path: Path,
     ):
-        """(c) The `rec.status == 'pending'` guard still skips the pre-stamp rewrite.
+        """(c) The already-terminal path leaves no queue-root copy.
 
-        `queue._rewrite` targets the queue ROOT, so running it on an archived
-        record would leave a second copy there — the orphan state
-        `TestResolveIdempotent` exists to prevent.
+        A second copy in the queue ROOT beside the archived one is the orphan
+        state `TestResolveIdempotent` exists to prevent.
         """
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
         self._auto_dismissed(queue)
 
-        await _resolve_issue(
+        await call_resolve_issue(
             server, escalation_id='esc-3902-1', resolution=self.LATE_TEXT,
             resolved_by='claude-task-3902-steward',
         )
@@ -8266,7 +8222,7 @@ class TestResolveIssueSurfacesLateResolution:
         server = create_server(queue)
         self._auto_dismissed(queue)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id='esc-3902-1', resolution=self.LATE_TEXT,
             resolved_by='claude-task-3902-steward', resolution_class='not-a-class',
         )
@@ -8300,7 +8256,7 @@ class TestResolveIssueSurfacesLateResolution:
         server = create_server(queue)
         self._auto_dismissed(queue)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id='esc-3902-1', resolution=self.LATE_TEXT,
             resolved_by='claude-task-3902-steward', resolution_class='benign',
         )
@@ -8351,6 +8307,7 @@ class TestResolveIssueDeclaredPinGuard:
         esc_id: str = 'esc-3371-2',
         task_id: str = '3371',
         level: int = 1,
+        pin_declared_reason: str = '',
     ) -> Escalation:
         esc = Escalation(
             id=esc_id,
@@ -8360,6 +8317,7 @@ class TestResolveIssueDeclaredPinGuard:
             category='design_concern',
             summary='a load-bearing pending record',
             level=level,
+            pin_declared_reason=pin_declared_reason,
         )
         queue.submit(esc)
         return esc
@@ -8377,7 +8335,7 @@ class TestResolveIssueDeclaredPinGuard:
         server = create_server(queue)
         esc = self._seed_declared(queue)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='bulk close', action='close_only',
         )
 
@@ -8390,7 +8348,7 @@ class TestResolveIssueDeclaredPinGuard:
         server = create_server(queue)
         esc = self._seed_declared(queue)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='bulk close', action='close_only',
         )
 
@@ -8409,7 +8367,7 @@ class TestResolveIssueDeclaredPinGuard:
         server = create_server(queue)
         esc = self._seed_declared(queue)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='bulk close', action='close_only',
         )
 
@@ -8429,7 +8387,7 @@ class TestResolveIssueDeclaredPinGuard:
         server = create_server(queue)
         esc = self._seed_declared(queue)
 
-        await _resolve_issue(
+        await call_resolve_issue(
             server, escalation_id=esc.id, resolution='bulk close', action='close_only',
         )
 
@@ -8452,7 +8410,7 @@ class TestResolveIssueDeclaredPinGuard:
         server = create_server(queue)
         esc = self._seed_declared(queue, esc_id=f'esc-3371-{action}')
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='closing', action=action,
         )
 
@@ -8470,7 +8428,7 @@ class TestResolveIssueDeclaredPinGuard:
         server = create_server(queue)
         esc = self._seed(queue, esc_id=f'esc-plain-{action}')
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='closing', action=action,
         )
 
@@ -8486,13 +8444,9 @@ class TestResolveIssueDeclaredPinGuard:
         """The declarer list is the marker, not the prose."""
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
-        esc = self._seed(queue)
-        rec = queue.get(esc.id)
-        assert rec is not None
-        rec.pin_declared_reason = 'I feel like this one matters'
-        queue._rewrite(esc.id, rec)
+        esc = self._seed(queue, pin_declared_reason='I feel like this one matters')
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='closing', action='close_only',
         )
 
@@ -8516,7 +8470,7 @@ class TestResolveIssueDeclaredPinGuard:
         server = create_server(queue)
         esc = self._seed_declared(queue)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='bulk close', action='bogus',
         )
 
@@ -8546,7 +8500,7 @@ class TestResolveIssueDeclaredPinGuard:
             escalation_server, 'get_http_headers', lambda: {'x-escalation-levels': '0,1'},
         )
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='bulk close', action='close_only',
         )
 
@@ -8590,7 +8544,7 @@ class TestResolveIssueDeclaredPinGuard:
         server = create_server(queue)
         l2 = self._homogeneous_cluster(queue)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=l2.id, resolution='rubber-stamp bulk close',
             action='close_only',
         )
@@ -8605,7 +8559,7 @@ class TestResolveIssueDeclaredPinGuard:
         server = create_server(queue)
         l2 = self._homogeneous_cluster(queue)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=l2.id, resolution='bulk close', action='close_only',
         )
 
@@ -8621,7 +8575,7 @@ class TestResolveIssueDeclaredPinGuard:
         server = create_server(queue)
         l2 = self._homogeneous_cluster(queue)
 
-        await _resolve_issue(
+        await call_resolve_issue(
             server, escalation_id=l2.id, resolution='bulk close', action='close_only',
         )
 
@@ -8639,7 +8593,7 @@ class TestResolveIssueDeclaredPinGuard:
         server = create_server(queue)
         l2 = self._homogeneous_cluster(queue, marked=('esc-3237-1', 'esc-3371-2'))
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=l2.id, resolution='bulk close', action='close_only',
         )
 
@@ -8666,7 +8620,7 @@ class TestResolveIssueDeclaredPinGuard:
         )
         queue.submit(l2)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=l2.id, resolution='bulk close', action='close_only',
         )
 
@@ -8690,7 +8644,7 @@ class TestResolveIssueDeclaredPinGuard:
         l2 = self._homogeneous_cluster(queue)
 
         # The operator deliberately spends the pin on the member alone.
-        spend = await _resolve_issue(
+        spend = await call_resolve_issue(
             server, escalation_id='esc-3371-2', resolution='deliberately spending it',
             action='close_only', acknowledge_declared_pins=['esc-3371-2'],
         )
@@ -8702,7 +8656,7 @@ class TestResolveIssueDeclaredPinGuard:
             'must filter on status rather than on the marker alone'
         )
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=l2.id, resolution='bulk close', action='close_only',
         )
 
@@ -8717,14 +8671,14 @@ class TestResolveIssueDeclaredPinGuard:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
         esc = self._seed_declared(queue)
-        await _resolve_issue(
+        await call_resolve_issue(
             server, escalation_id=esc.id, resolution='deliberately spending it',
             action='close_only', acknowledge_declared_pins=[esc.id],
         )
 
         # A second close of the now-archived record: queue.resolve no-ops, so
         # there is no pin left to spend and nothing to refuse.
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='again', action='close_only',
         )
 
@@ -8738,7 +8692,7 @@ class TestResolveIssueDeclaredPinGuard:
         server = create_server(queue)
         l2 = self._homogeneous_cluster(queue, marked=())
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=l2.id, resolution='bulk close', action='close_only',
         )
 
@@ -8757,7 +8711,7 @@ class TestResolveIssueDeclaredPinGuard:
         server = create_server(queue)
         l2 = self._homogeneous_cluster(queue)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=l2.id, resolution='holding for a human', action='park',
         )
 
@@ -8776,7 +8730,7 @@ class TestResolveIssueDeclaredPinGuard:
         server = create_server(queue)
         esc = self._seed_declared(queue)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='deliberately spending it',
             action='close_only', acknowledge_declared_pins=[esc.id],
         )
@@ -8792,7 +8746,7 @@ class TestResolveIssueDeclaredPinGuard:
         server = create_server(queue)
         l2 = self._homogeneous_cluster(queue)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=l2.id, resolution='deliberately spending it',
             action='close_only', acknowledge_declared_pins=['esc-3371-2'],
         )
@@ -8813,7 +8767,7 @@ class TestResolveIssueDeclaredPinGuard:
         server = create_server(queue)
         l2 = self._homogeneous_cluster(queue, marked=('esc-3237-1', 'esc-3371-2'))
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=l2.id, resolution='bulk close',
             action='close_only', acknowledge_declared_pins=['esc-3237-1'],
         )
@@ -8831,7 +8785,7 @@ class TestResolveIssueDeclaredPinGuard:
         server = create_server(queue)
         esc = self._seed_declared(queue)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='bulk close',
             action='close_only', acknowledge_declared_pins=['esc-not-in-this-cluster'],
         )
@@ -8846,7 +8800,7 @@ class TestResolveIssueDeclaredPinGuard:
         server = create_server(queue)
         esc = self._seed_declared(queue)
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='bulk close',
             action='close_only', acknowledge_declared_pins=None,
         )
@@ -8864,7 +8818,7 @@ class TestResolveIssueDeclaredPinGuard:
         esc = self._seed_declared(queue)
 
         with caplog.at_level(logging.WARNING, logger='escalation.queue'):
-            await _resolve_issue(
+            await call_resolve_issue(
                 server, escalation_id=esc.id, resolution='deliberately spending it',
                 action='close_only', acknowledge_declared_pins=[esc.id],
             )
@@ -9235,7 +9189,7 @@ class TestDeclarePinTool:
         await _declare_pin(
             server, escalation_id=esc.id, declared_by=[self.DECLARER], reason=self.REASON,
         )
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='bulk close', action='close_only',
         )
 

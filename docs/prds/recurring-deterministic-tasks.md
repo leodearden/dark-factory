@@ -104,6 +104,10 @@ atomic with the status write — the crash window between them leaves a chain wh
 surfaces. Mint failure is fail-soft: it never fails the status write, logs a structured ERROR,
 and leaves the same gauge-visible broken state (INV-4: the standing gauge enumeration is the
 escape, not a silent suppressor).
+*(Amended, task 6572 — Leo's 2026-10-09 ruling on esc-4681-3, option D: a re-mint sweep at
+fused-memory startup and hourly mints the successor of every chain whose current link is done,
+so the broken state is repaired as well as surfaced by R-D5's gauge; current link defined once
+in shared/src/shared/recurrence_chains.py::current_links.)*
 
 **Idempotence/dedup**: before minting, the hook checks for an existing non-terminal link with
 the same `recurrence.key`; if one exists, it skips (protects against replayed transitions and
@@ -115,7 +119,8 @@ predecessor is terminal, so runs never overlap — no lock, no exclusion guard.
 - `done` → successor minted: same title/description/`before_done`/`recurrence`, `milestone.at`
   advanced to `terminal_time + interval_secs`, `metadata.recurrence.minted_from = <predecessor
   id>`, status `pending` (machine-minted; no planning phase — it is a copy of an
-  already-vetted spec, and its provenance says so).
+  already-vetted spec, and its provenance says so). *(Amended, task 4866: the title carries a
+  run label rather than being copied verbatim — see C-3, esc-4866-5.)*
 - `cancelled` → chain **ends** (cancel is the operator's stop verb; visible in the tree).
 - `blocked` (predicate failed / timed out) → chain **pauses**: no successor until the pending
   escalation is resolved and the link reaches a terminal status. The pending L2 is the standing
@@ -169,10 +174,17 @@ submit with a structured error.
 exists afterwards for that `key` (minted, or pre-existing non-terminal → skip). On `cancelled`:
 none is minted. On any non-terminal status: none. The mint never fails the status write; a mint
 failure logs structured ERROR and leaves the broken state visible per C-4.
+*(Amended, task 6572 — Leo's 2026-10-09 ruling on esc-4681-3, option D: a re-mint sweep at
+fused-memory startup and hourly mints the successor of every chain whose current link is done,
+so the broken state is repaired as well as surfaced by R-D5's gauge; current link defined once
+in shared/src/shared/recurrence_chains.py::current_links.)*
 
 **C-3 (successor shape).** Copies title/description/`before_done`/`recurrence.{key,
 interval_secs}`; `milestone.at = terminal_time + interval_secs`; `recurrence.minted_from =
 predecessor id`; `status='pending'`; carries `metadata.source='recurrence-mint'`.
+*(Amended, task 4866.)* The title is copied with a ` [due <at>]` run label, not verbatim: the
+fm-task-dedup partial UNIQUE index `ux_tasks_candidate_key` covers `done` rows, so a verbatim
+title + `files` copy is refused with `DuplicateCandidateKeyError` (esc-4866-5).
 
 **C-4 (gauge).** The chain-state function of R-D5 is total over every task carrying
 `recurrence.key`: every chain resolves to exactly one of
@@ -285,7 +297,13 @@ path; the gauge computation is per-root, ms-scale, in the dashboard.
 
 1. **Overdue grace window size** (how far past `at` before `overdue`). Suggested: one full
    `interval_secs`, capped at 24h. Decide during r4.
-2. **Whether the minted successor copies `metadata.files`** (lock-set inheritance). Suggested:
-   yes, verbatim — same job, same locks. Decide during r2.
+   **Resolved in r4 (task 4679):** grace = min(interval_secs, 24h); the 24h cap when the
+   link's recurrence does not validate. A current link that is neither blocked nor terminal
+   (in-progress, deferred, infra-hold, …) is read by its fire time like pending; one whose
+   dated `at` cannot be read is overdue, because the scheduler withholds a malformed
+   milestone indefinitely. Served by
+   `dashboard/src/dashboard/data/recurrence_gauge.py::chain_state`.
+2. **Whether the minted successor copies `metadata.files`** (lock-set inheritance).
+   **Resolved in r2 (task 4866): yes, verbatim** — same job, same locks.
 3. **Seed cadences for r6's two chains.** Suggested: 24h both, matching their documented timer
    slots. Decide during r6.

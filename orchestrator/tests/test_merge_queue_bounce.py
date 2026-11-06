@@ -5,19 +5,21 @@ Covers:
     ``MERGE_BOUNCE_CAP``, ``MergeBounceRegistry`` — as pure values;
   * the bounce as a RUNNING lane performs it over a real git repo: an item
     that conflicts with the frozen-prefix tip is diverted before it can
-    consume a verify slot, and an item that is clean against that tip is
-    left alone and lands;
+    consume a verify slot and is never reported again, and an item that is
+    clean against that tip is left alone and lands;
   * the bookkeeping a bounce leaves behind — the per-branch bounce count,
     the untouched enqueue time, the ``needs_rebase`` log line, and the
     ``get_main_sha`` fail-open — read off ``SuffixConflictTracker``'s own
-    public state.
+    public state;
+  * bounce escalations stay signature-distinct, so they never walk
+    ``workflow.py``'s ``consecutive_merge_thrash`` ladder (task 3910).
 
 Task 5030 (PRD ``plans/merge-lane-quality-prd.md`` task γ7) replaced this
 file's drive mechanism. Every test here used to reach into the worker: it
 seeded ``_inflight`` with a hand-built ``InflightEntry`` carrying a fake
-merge commit, pushed requests straight into ``_lane_buffers``, assigned a
-``_suffix_conflict_graph``, then called the private
-``_bounce_conflicting_suffix_items()`` / ``_acquire_next_request()`` — one
+merge commit, pushed requests straight into the lane buffers, assigned a
+``suffix_conflict_graph``, then called the private
+``bounce_conflicting_suffix_items()`` / ``_acquire_next_request()`` — one
 test going as far as replacing three private methods with stubs purely to
 pin the ORDER they are called in. That froze the lane's internals rather
 than its behaviour: none of it would have noticed the bounce being wired
@@ -29,9 +31,9 @@ injected ``FakeVerifier`` was asked to verify. The frozen prefix is a real
 one: the first request's verify is held open by ``hangs_until``, which is
 what puts its merge commit at the tip while the second request is probed
 against it. The bookkeeping tests drive ``SuffixConflictTracker`` — the
-bounce layer's own class (``orchestrator.suffix_graph``) — through the four
-accessor callables it is constructed with, so the lane buffers they assert
-on belong to the test.
+bounce layer's own class (``orchestrator.suffix_graph``) — through the five
+accessor callables it is constructed with, so the lane buffers and the
+retirements they assert on belong to the test.
 
 The core bounce paths (clean rebase re-queues, real conflict escalates, cap
 exceeded escalates without rebasing, trains are skipped, an empty
@@ -47,24 +49,28 @@ import collections
 import contextlib
 import logging
 from pathlib import Path
+from typing import Literal
 from unittest.mock import AsyncMock
 
 import pytest
-from _merge_lane_fakes import FakeVerifier, hangs_until
+from _merge_lane_fakes import FakeVerifier, hangs_until, lane_scene_config, lane_state
 from _orch_helpers import wait_responsive
+from shared.task_metadata import RetryLedger
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_lane import MergeLane
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.outcome_facts import ConflictEvidence, MergeBlockCategory
+from orchestrator.merge_lane.types import MergeBounceRegistry, QueuedBranch
+from orchestrator.merge_lane.worker import (
     MERGE_BOUNCE_CAP,
     NEEDS_REBASE_REASON_PREFIX,
-    MergeBounceRegistry,
+    ItemLifecycleState,
     MergeOutcome,
     MergeRequest,
 )
-from orchestrator.merge_types import QueuedBranch
 from orchestrator.suffix_graph import SuffixConflictGraph, SuffixConflictTracker
+from orchestrator.workflow import _evaluate_merge_thrash
 
 _STOP_TIMEOUT = 30.0
 
@@ -113,7 +119,7 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
 
 @pytest.fixture
 def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
-    return OrchestratorConfig(project_root=git_repo, git=git_config)
+    return lane_scene_config(git_repo, git_config)
 
 
 # ── Helpers: a running lane over a real repo ─────────────────────────────────
@@ -218,6 +224,19 @@ async def _until_probed_against_the_tip(
     )
 
 
+async def _until_the_census_is_empty(lane, timeout: float = 10.0) -> None:
+    """Wait until ``snapshot()`` lists no request at all."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if lane.snapshot()['depth'] == 0:
+            return
+        await asyncio.sleep(0.05)
+    raise AssertionError(
+        f'the lane still lists {lane.snapshot()["entries"]!r} after {timeout}s'
+    )
+
+
 # ── Helpers: the bounce layer's own seam ─────────────────────────────────────
 
 
@@ -228,6 +247,7 @@ def _make_req(
     git_repo: Path,
     *,
     merge_first_enqueued_at: float | None = 1000.0,
+    lane: Literal['normal', 'high'] = 'normal',
 ) -> MergeRequest:
     """Build a minimal MergeRequest with a fresh event-loop future.
 
@@ -242,7 +262,7 @@ def _make_req(
         module_configs=[],
         config=config,
         result=asyncio.get_running_loop().create_future(),
-        lane='normal',
+        lane=lane,
         merge_first_enqueued_at=merge_first_enqueued_at,
     )
 
@@ -252,18 +272,28 @@ def _make_tracker(
     *,
     lane_buffers: dict[str, collections.deque],
     frozen_tip: str,
+    retired: list[tuple[str, bool]] | None = None,
 ) -> SuffixConflictTracker:
     """A tracker over the TEST's lane buffers and a fixed frozen-prefix tip.
 
-    The four accessors the tracker is constructed with are the whole seam: no
+    The accessors the tracker is constructed with are the whole seam: no
     worker is involved, so every piece of state these tests assert on is one
-    the test owns or one the tracker publishes.
+    the test owns or one the tracker publishes. With *retired*, each
+    retirement is recorded there with whether the request was still buffered
+    when it was retired.
     """
+    def _record(rid: str) -> None:
+        if retired is None:
+            return
+        buffered = any(r.request_id == rid for lane in lane_buffers.values() for r in lane)
+        retired.append((rid, buffered))
+
     return SuffixConflictTracker(
         git_ops=lambda: git_ops,
         lane_buffers=lambda: lane_buffers,
-        frozen_prefix=lambda: (),
+        frozen_requests=lambda: (),
         frozen_prefix_tip=lambda _main_sha: frozen_tip,
+        retire_item=_record,
     )
 
 
@@ -275,6 +305,79 @@ def _conflicting(req: MergeRequest) -> SuffixConflictGraph:
         footprint_edges=frozenset(),
         conflicts_with_main=frozenset({req.request_id}),
     )
+
+
+async def _escalate_at_tracker(
+    tracker: SuffixConflictTracker,
+    buffers: dict[str, collections.deque],
+    req: MergeRequest,
+) -> MergeOutcome:
+    """Queue *req*, mark it conflicting, bounce it, and return its escalation."""
+    buffers['normal'].append(req)
+    tracker.graph = _conflicting(req)
+    tracker.signature = ((req.request_id,), 'abc123')
+    await tracker.bounce_conflicting_suffix_items()
+    assert req.result.done(), f'{req.request_id} was not escalated'
+    assert req not in buffers['normal'], f'{req.request_id} stayed queued'
+    return req.result.result()
+
+
+async def _cap_out_at_tracker(
+    tracker: SuffixConflictTracker,
+    buffers: dict[str, collections.deque],
+    req: MergeRequest,
+) -> MergeOutcome:
+    """Bring *req*'s branch to the bounce cap, then return the cap-out escalation."""
+    for _ in range(MERGE_BOUNCE_CAP):
+        tracker.bounce_registry.record_bounce(req.branch.bare_id)
+    return await _escalate_at_tracker(tracker, buffers, req)
+
+
+def _resubmission(req: MergeRequest) -> MergeRequest:
+    """A fresh request for *req*'s branch, as the post-steward resubmission is.
+
+    Built field by field rather than with ``dataclasses.replace``, which would
+    copy ``request_id``: a resubmission is a new request with a new identity.
+    """
+    return MergeRequest(
+        task_id=req.task_id,
+        branch=req.branch,
+        worktree=req.worktree,
+        pre_rebased=req.pre_rebased,
+        task_files=req.task_files,
+        module_configs=req.module_configs,
+        config=req.config,
+        result=asyncio.get_running_loop().create_future(),
+        lane=req.lane,
+    )
+
+
+# ── Helpers: workflow.py's merge-thrash ladder ───────────────────────────────
+
+
+def _signature(outcome: MergeOutcome) -> str:
+    """The ladder key workflow.py computes for a blocked *outcome*."""
+    return RetryLedger.compute_merge_outcome_signature(
+        outcome.failure_category, outcome.failure_cause_hint, outcome.reason,
+    )
+
+
+def _fold_through_thrash_ladder(
+    outcomes: list[MergeOutcome], threshold: int,
+) -> tuple[RetryLedger, list[bool]]:
+    """Feed *outcomes*, in order, through workflow.py's shipped ladder.
+
+    Returns the final ledger and each step's escalate flag.
+    """
+    ledger = RetryLedger()
+    escalations: list[bool] = []
+    for outcome in outcomes:
+        verdict = _evaluate_merge_thrash(
+            ledger, ledger.last_merge_outcome_signature, _signature(outcome), threshold,
+        )
+        ledger = verdict.ledger
+        escalations.append(verdict.escalate)
+    return ledger, escalations
 
 
 # ── The bounce primitives ────────────────────────────────────────────────────
@@ -291,7 +394,7 @@ class TestBouncePrimitives:
     def test_needs_rebase_reason_prefix_is_distinct(self) -> None:
         """NEEDS_REBASE_REASON_PREFIX differs from the other *_REASON_PREFIX constants."""
         from orchestrator.merge_lane import PLAN_FILES_NOT_TOUCHED_REASON_PREFIX
-        from orchestrator.merge_queue import (
+        from orchestrator.merge_lane.worker import (
             DROPPED_PLAN_TARGETS_REASON_PREFIX,
             POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
         )
@@ -404,8 +507,64 @@ class TestBounceDrivenByTheLane:
                     'the bounced item consumed a verify slot: the bounce must divert it '
                     f'before dispatch, but the verifier was asked for {verifier.verified!r}'
                 )
+                assert outcome.block_category is MergeBlockCategory.MERGE_NEEDS_REBASE
+                assert outcome.conflict_evidence == ConflictEvidence(
+                    conflicted_paths=('shared.txt',), counterpart_task_ids=('frozen-a',),
+                )
             finally:
                 release.set()
+
+    async def test_bounced_item_leaves_the_queue_census(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """A bounced item is never reported again: not queued, not head of line.
+
+        The mr-f887c154 shape: the request is resolved ``blocked`` by the
+        bounce, yet the lane went on listing it as the position-0 'queued'
+        head of line for as long as the process lived, so ``merge_status``
+        answered 'queued' and the queue never read idle.
+        """
+        release = asyncio.Event()
+        verifier = FakeVerifier(scripts={'frozen-a': hangs_until(release)})
+        async with _running_lane(git_ops, verifier) as (lane, queue):
+            frozen = await _prepare(
+                git_ops, config, 'frozen-a', 'shared.txt', 'line1\nFROZEN-LINE2\nline3\n',
+            )
+            suffix = await _prepare(
+                git_ops, config, 'suffix-b', 'shared.txt', 'line1\nSUFFIX-LINE2\nline3\n',
+            )
+
+            await queue.put(frozen)
+            await _await_frozen_tip(lane)
+            await queue.put(suffix)
+            outcome = await wait_responsive(suffix.result, label='conflicting suffix bounce')
+
+            try:
+                assert outcome.status == 'blocked', f'expected a bounce, got {outcome!r}'
+                assert outcome.reason is not None
+                assert outcome.reason.startswith(NEEDS_REBASE_REASON_PREFIX), (
+                    f'expected a needs_rebase escalation, got reason={outcome.reason!r}'
+                )
+                assert lane_state(lane, suffix.request_id) is None, (
+                    'the bounced item is decided, yet the lane still reports it as '
+                    f'{lane_state(lane, suffix.request_id)!r}'
+                )
+                assert lane._lifecycle.current(suffix.request_id) is ItemLifecycleState.TERMINAL, (
+                    'the bounce resolved the request but left it live in the lifecycle registry: '
+                    f'{lane._lifecycle.current(suffix.request_id)!r}'
+                )
+                assert suffix.request_id not in lane._live_items
+            finally:
+                release.set()
+
+            frozen_outcome = await wait_responsive(
+                frozen.result, label='frozen-prefix item lands',
+            )
+            assert frozen_outcome.status == 'done', (
+                f'expected the frozen item to land, got {frozen_outcome!r}'
+            )
+            await _until_the_census_is_empty(lane)
+            assert lane.snapshot()['head_of_line'] is None
 
     async def test_item_clean_against_frozen_tip_is_not_bounced(
         self, git_ops: GitOps, config: OrchestratorConfig,
@@ -478,7 +637,8 @@ class TestBounceBookkeeping:
     on a clean rebase, escalated on a real conflict or a busted cap, skipped
     for a train). These pin what the bounce records while doing it -- the
     per-branch count, the untouched enqueue time, the log line an operator
-    greps for, and the fail-open when the tip cannot be established at all.
+    greps for, the retirement of every request it diverts, and the fail-open
+    when the tip cannot be established at all.
     """
 
     async def test_clean_rebase_records_one_bounce_and_keeps_the_enqueue_time(
@@ -586,3 +746,301 @@ class TestBounceBookkeeping:
         assert any('get_main_sha' in r.message for r in caplog.records), (
             'expected a warning naming get_main_sha but none was logged'
         )
+
+    async def test_real_conflict_escalation_retires_the_request(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A diverted request leaves the caller's registry as well as its lane.
+
+        Left registered, it stays LANE_BUFFERED in a buffer that no longer
+        holds it: never pickable, and listed as queued until a restart.
+        """
+        req = _make_req('591', '591', config, git_repo)
+        buffers = {'high': collections.deque(), 'normal': collections.deque()}
+        retired: list[tuple[str, bool]] = []
+        tracker = _make_tracker(
+            git_ops, lane_buffers=buffers, frozen_tip='deadbeefcafe3333', retired=retired,
+        )
+        monkeypatch.setattr(git_ops, 'rebase_onto_main', AsyncMock(return_value=False))
+
+        outcome = await _escalate_at_tracker(tracker, buffers, req)
+
+        assert retired == [(req.request_id, False)], (
+            f'expected one retirement after the request left its lane, got {retired!r}'
+        )
+        assert outcome.status == 'blocked'
+        assert outcome.reason is not None
+        assert outcome.reason.startswith(NEEDS_REBASE_REASON_PREFIX)
+
+    async def test_cap_exceeded_escalation_retires_the_request(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        req = _make_req('591', '591', config, git_repo)
+        buffers = {'high': collections.deque(), 'normal': collections.deque()}
+        retired: list[tuple[str, bool]] = []
+        tracker = _make_tracker(
+            git_ops, lane_buffers=buffers, frozen_tip='deadbeefcafe4444', retired=retired,
+        )
+        rebase_spy = AsyncMock(return_value=True)
+        monkeypatch.setattr(git_ops, 'rebase_onto_main', rebase_spy)
+
+        outcome = await _cap_out_at_tracker(tracker, buffers, req)
+
+        assert retired == [(req.request_id, False)], (
+            f'expected one retirement after the request left its lane, got {retired!r}'
+        )
+        rebase_spy.assert_not_awaited()
+        assert outcome.reason is not None
+        assert 'bounce cap exceeded' in outcome.reason
+
+    async def test_clean_rebase_retires_nothing(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        req = _make_req('591', '591', config, git_repo)
+        buffers = {'high': collections.deque(), 'normal': collections.deque([req])}
+        retired: list[tuple[str, bool]] = []
+        tracker = _make_tracker(
+            git_ops, lane_buffers=buffers, frozen_tip='deadbeefcafe5555', retired=retired,
+        )
+        tracker.graph = _conflicting(req)
+        tracker.signature = ((req.request_id,), 'abc123')
+        monkeypatch.setattr(git_ops, 'rebase_onto_main', AsyncMock(return_value=True))
+
+        await tracker.bounce_conflicting_suffix_items()
+
+        assert retired == [], f'a re-queued request was retired: {retired!r}'
+        assert req in buffers['normal'], 'a cleanly rebased item stays queued'
+
+    async def test_item_buffered_under_a_lane_its_field_does_not_name_is_still_diverted(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        git_repo: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The divert removes the request from the lane it was found in.
+
+        ``req.lane`` need not name that lane:
+        ``orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._buffer_owned_request``
+        files a request under its normalized lane, not under the field.
+        """
+        req = _make_req('591', '591', config, git_repo, lane='high')
+        buffers = {'high': collections.deque(), 'normal': collections.deque([req])}
+        retired: list[tuple[str, bool]] = []
+        tracker = _make_tracker(
+            git_ops, lane_buffers=buffers, frozen_tip='deadbeefcafe6666', retired=retired,
+        )
+        tracker.graph = _conflicting(req)
+        tracker.signature = ((req.request_id,), 'abc123')
+        monkeypatch.setattr(git_ops, 'rebase_onto_main', AsyncMock(return_value=False))
+
+        await tracker.bounce_conflicting_suffix_items()
+
+        assert req not in buffers['normal'], 'the conflicting request stayed queued'
+        assert req.result.result().status == 'blocked'
+        assert retired == [(req.request_id, False)], f'{retired!r}'
+
+
+# ── Bounce escalations and workflow.py's merge-thrash ladder ─────────────────
+
+
+_DISTINCTNESS_FAILURE = (
+    'task 3910: bounce escalations must never render an invariant reason -- '
+    'with no failure_category/failure_cause_hint the ladder keys on the reason '
+    'alone, so two bounces of one branch hash identically and '
+    'consecutive_merge_thrash walks to a false L1'
+)
+
+
+class TestBounceEscalationsNeverFeedTheThrashLadder:
+    """Task 3910: a bounce escalation must not look like a repeated failure.
+
+    The incident shape (tasks 3763/3404/3764/5031/5237/5099): one branch is
+    bounced twice against one frozen tip, 2.5s to 12min apart.  Each
+    escalation rides workflow.py's ordinary blocked path, both render the
+    same reason, the merge-outcome signature repeats, and
+    ``consecutive_merge_thrash`` reaches its threshold of 2 -- a false L1 for
+    what is a fresh collision each time.
+
+    Every outcome here is folded through the SHIPPED ``_evaluate_merge_thrash``
+    at the SHIPPED ``max_consecutive_merge_thrash``; the control proves that
+    fold escalates on genuinely identical input.
+    """
+
+    def test_identical_outcomes_reach_the_threshold(
+        self, config: OrchestratorConfig,
+    ) -> None:
+        """CONTROL: the fold is not inert -- a repeated outcome does escalate."""
+        threshold = config.max_consecutive_merge_thrash
+        repeated = MergeOutcome('blocked', reason=f'{NEEDS_REBASE_REASON_PREFIX}: x')
+
+        ledger, escalations = _fold_through_thrash_ladder(
+            [repeated] * threshold, threshold,
+        )
+
+        assert ledger.consecutive_merge_thrash == threshold
+        assert escalations[-1] is True
+
+    @pytest.mark.asyncio
+    async def test_two_real_conflict_escalations_of_one_branch_are_signature_distinct(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """Two real-conflict escalations of one branch, one tip: distinct keys."""
+        frozen_tip = 'deadbeefcafe3910'
+        buffers = {'high': collections.deque(), 'normal': collections.deque()}
+        tracker = _make_tracker(git_ops, lane_buffers=buffers, frozen_tip=frozen_tip)
+        git_ops.rebase_onto_main = AsyncMock(return_value=False)  # type: ignore[method-assign]
+
+        o1 = await _escalate_at_tracker(
+            tracker, buffers, _make_req('591', '591', config, git_repo),
+        )
+        o2 = await _escalate_at_tracker(
+            tracker, buffers, _make_req('591', '591', config, git_repo),
+        )
+
+        for outcome in (o1, o2):
+            assert outcome.status == 'blocked', outcome
+            assert outcome.reason.startswith(NEEDS_REBASE_REASON_PREFIX), outcome.reason
+            assert frozen_tip in outcome.reason, outcome.reason
+            assert 'real rebase conflict' in outcome.reason, outcome.reason
+            assert outcome.failure_category == '', (
+                'a constant failure_category would collapse every bounce onto '
+                f'one signature; got {outcome.failure_category!r}'
+            )
+        assert _signature(o1) != _signature(o2), (
+            f'{_DISTINCTNESS_FAILURE}; reasons: {o1.reason!r} / {o2.reason!r}'
+        )
+
+        ledger, escalations = _fold_through_thrash_ladder(
+            [o1, o2], config.max_consecutive_merge_thrash,
+        )
+        assert not any(escalations), escalations
+        assert ledger.consecutive_merge_thrash == 1
+
+    @pytest.mark.asyncio
+    async def test_two_cap_exceeded_escalations_of_one_branch_are_signature_distinct(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """The cap arm needs its own guard: its rendered count is a constant.
+
+        It fires at the first count past the cap and then clears the registry,
+        so the ``count=`` it renders is always ``MERGE_BOUNCE_CAP + 1``.
+        """
+        buffers = {'high': collections.deque(), 'normal': collections.deque()}
+        tracker = _make_tracker(
+            git_ops, lane_buffers=buffers, frozen_tip='deadbeefcafe3910',
+        )
+        rebase_spy = AsyncMock(return_value=True)
+        git_ops.rebase_onto_main = rebase_spy  # type: ignore[method-assign]
+
+        outcomes: list[MergeOutcome] = []
+        for _round in range(2):
+            outcomes.append(await _cap_out_at_tracker(
+                tracker, buffers, _make_req('591', '591', config, git_repo),
+            ))
+        o1, o2 = outcomes
+
+        rebase_spy.assert_not_awaited()
+        for outcome in (o1, o2):
+            assert outcome.status == 'blocked', outcome
+            assert outcome.reason.startswith(NEEDS_REBASE_REASON_PREFIX), outcome.reason
+            assert 'bounce cap exceeded' in outcome.reason, outcome.reason
+            assert outcome.failure_category == '', outcome.failure_category
+        assert _signature(o1) != _signature(o2), (
+            f'{_DISTINCTNESS_FAILURE}; reasons: {o1.reason!r} / {o2.reason!r}'
+        )
+
+        ledger, escalations = _fold_through_thrash_ladder(
+            [o1, o2], config.max_consecutive_merge_thrash,
+        )
+        assert not any(escalations), escalations
+        assert ledger.consecutive_merge_thrash == 1
+
+    @pytest.mark.asyncio
+    async def test_cap_outs_either_side_of_a_restart_are_signature_distinct(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """Every process builds a fresh tracker, so its ordinal restarts at #1.
+
+        The ladder's ledger is persisted in task metadata and outlives the
+        process, so the last cap-out before a restart and the first one after
+        it are consecutive on the ladder.  The cap arm renders no frozen tip,
+        so nothing else in its reason changes across the restart.
+        """
+        git_ops.rebase_onto_main = AsyncMock(return_value=True)  # type: ignore[method-assign]
+
+        outcomes: list[MergeOutcome] = []
+        for _process in range(2):
+            buffers = {'high': collections.deque(), 'normal': collections.deque()}
+            tracker = _make_tracker(
+                git_ops, lane_buffers=buffers, frozen_tip='deadbeefcafe3910',
+            )
+            outcomes.append(await _cap_out_at_tracker(
+                tracker, buffers, _make_req('591', '591', config, git_repo),
+            ))
+        o1, o2 = outcomes
+
+        assert _signature(o1) != _signature(o2), (
+            f'{_DISTINCTNESS_FAILURE}; reasons: {o1.reason!r} / {o2.reason!r}'
+        )
+        _, escalations = _fold_through_thrash_ladder(
+            [o1, o2], config.max_consecutive_merge_thrash,
+        )
+        assert not any(escalations), escalations
+
+    @pytest.mark.asyncio
+    async def test_two_lane_bounces_of_one_branch_against_one_frozen_tip_do_not_thrash(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """The incident end to end: submit, bounce, resubmit, bounce again."""
+        release = asyncio.Event()
+        verifier = FakeVerifier(scripts={'frozen-a': hangs_until(release)})
+        async with _running_lane(git_ops, verifier) as (lane, queue):
+            frozen = await _prepare(
+                git_ops, config, 'frozen-a', 'shared.txt', 'line1\nFROZEN-LINE2\nline3\n',
+            )
+            suffix = await _prepare(
+                git_ops, config, 'suffix-b', 'shared.txt', 'line1\nSUFFIX-LINE2\nline3\n',
+            )
+
+            try:
+                await queue.put(frozen)
+                tip = await _await_frozen_tip(lane)
+
+                await queue.put(suffix)
+                o1 = await wait_responsive(suffix.result, label='first bounce')
+                resubmitted = _resubmission(suffix)
+                await queue.put(resubmitted)
+                o2 = await wait_responsive(resubmitted.result, label='second bounce')
+
+                for outcome in (o1, o2):
+                    assert outcome.status == 'blocked', outcome
+                    assert outcome.reason.startswith(NEEDS_REBASE_REASON_PREFIX), (
+                        outcome.reason
+                    )
+                    assert tip in outcome.reason, (
+                        f'both rounds must bounce off the same frozen tip {tip!r}; '
+                        f'got {outcome.reason!r}'
+                    )
+                assert _signature(o1) != _signature(o2), (
+                    f'{_DISTINCTNESS_FAILURE}; reasons: {o1.reason!r} / {o2.reason!r}'
+                )
+                _, escalations = _fold_through_thrash_ladder(
+                    [o1, o2], config.max_consecutive_merge_thrash,
+                )
+                assert not any(escalations), escalations
+                assert 'suffix-b' not in verifier.verified, verifier.verified
+            finally:
+                release.set()

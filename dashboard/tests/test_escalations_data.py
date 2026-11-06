@@ -163,6 +163,32 @@ class TestLoadQueueEscalations:
         assert loaded['worktree'] == '/home/leo/src/proj/.worktrees/3'
         assert loaded['extra_field'] == 'should-survive'
 
+    def test_non_escalation_json_resident_is_not_read(self, tmp_path):
+        """A well-formed non-``esc-*`` JSON file in the queue root is not an escalation.
+
+        The queue directory has a second writer:
+        ``orchestrator/src/orchestrator/b3_gate.py::STATE_FILENAME`` keeps
+        ``b3-state.json`` there.  Read as an escalation it becomes a row with
+        no ``id``.  It is a permanent resident, not a read failure, so it is
+        not reported in *skipped* either.
+        """
+        from dashboard.data.escalations import load_queue_escalations
+
+        esc_dir = tmp_path / 'escalations'
+        esc_dir.mkdir()
+        good = _esc('esc-good-1', task_id='1', level=1, status='pending')
+        _write_esc(esc_dir, 'esc-good-1.json', good)
+        _write_esc(esc_dir, 'b3-state.json', {
+            'launches': [],
+            'charges': [{'task_id': '1615', 'charged_at': '2026-09-20T00:00:00+00:00'}],
+        })
+
+        skipped: list = []
+        result = load_queue_escalations(esc_dir, skipped=skipped)
+
+        assert result == [good]
+        assert skipped == []
+
     # -- the opt-in ``skipped`` out-parameter -------------------------------
     #
     # Skipping an unparseable file is correct — one corrupt escalation must not
@@ -195,8 +221,8 @@ class TestLoadQueueEscalations:
     def test_skipped_records_os_errors_not_just_decode_errors(self, tmp_path):
         """BOTH arms of ``except (JSONDecodeError, OSError)`` report, not just JSON.
 
-        ``Path.glob('*.json')`` yields directories too, so a directory named
-        ``weird.json`` makes ``read_text()`` raise ``IsADirectoryError`` — a
+        ``Path.glob('esc-*.json')`` yields directories too, so a directory named
+        ``esc-weird.json`` makes ``read_text()`` raise ``IsADirectoryError`` — a
         deterministic OSError needing no permission games or monkeypatching.
         A reader that only reported the decode arm would still lose every
         unreadable/permission-denied file silently, which is the more likely
@@ -207,7 +233,7 @@ class TestLoadQueueEscalations:
         esc_dir = tmp_path / 'escalations'
         esc_dir.mkdir()
         _write_esc(esc_dir, 'esc-good-1.json', _esc('esc-good-1', task_id='1'))
-        weird = esc_dir / 'weird.json'
+        weird = esc_dir / 'esc-weird.json'
         weird.mkdir()
 
         skipped: list = []
@@ -681,6 +707,65 @@ class TestBuildEscalationQueuesSubsections:
         assert shaped['ESCALATIONS']['summary']['skipped_count'] == 2
 
 
+def _dependency_capability_record(owner) -> dict:
+    """A ``dependency_capability`` escalation as orchestrator/src/orchestrator/harness.py files it."""
+    from escalation.models import Escalation
+
+    return Escalation(
+        id='esc-7600-1', task_id='7600', agent_role='orchestrator-scheduler',
+        severity='critical', category='dependency_capability',
+        summary='delivered check graph-index-provisioned fails on main', level=2,
+        timestamp='2026-09-01T00:00:00+00:00', delivered_check_owner=owner,
+    ).to_dict()
+
+
+def _served_rows(config) -> list[dict]:
+    """Every row of *config*'s corpus as ``/escalations`` serves it: shaped, then JSON round-tripped."""
+    from dashboard.data import redux_api
+    from dashboard.data.escalations import card_datums
+
+    built = _build(config)
+    body = json.loads(json.dumps(
+        redux_api.shape_escalations(built, card_datums(built, {}), served_at=NOW),
+    ))
+    return [row for sub in body['ESCALATIONS']['subsections'] for row in sub['escalations']]
+
+
+class TestDeliveredCheckOwnerReachesTheWire:
+    """Task 7725: a record's ``delivered_check_owner`` reaches the served row verbatim.
+
+    The sidebar renders the owning task, its declaration sites and the
+    sidecar's on_main state from this one field, so the data layer must carry
+    it whole. A record written before task 7514 still serves the key, as null.
+    """
+
+    @pytest.mark.parametrize('owner', [
+        {'task_id': '7514', 'check_name': 'graph-index-provisioned',
+         'sidecar': {'path': 'plans/x.capabilities.yaml', 'on_main': 'declares'}},
+        {'task_id': '7514', 'check_name': 'graph-index-provisioned', 'sidecar': None},
+    ], ids=['declaring-sidecar', 'no-sidecar'])
+    def test_the_owner_is_served_verbatim(self, tmp_path, owner):
+        primary = tmp_path / 'primary'
+        config = _config(primary)
+        _put(_queues_dir(primary), _dependency_capability_record(owner))
+
+        (row,) = _served_rows(config)
+
+        assert row['delivered_check_owner'] == owner
+
+    def test_a_record_written_without_the_key_serves_null(self, tmp_path):
+        primary = tmp_path / 'primary'
+        config = _config(primary)
+        record = _dependency_capability_record(None)
+        del record['delivered_check_owner']
+        _put(_queues_dir(primary), record)
+
+        (row,) = _served_rows(config)
+
+        assert 'delivered_check_owner' in row
+        assert row['delivered_check_owner'] is None
+
+
 class TestOwnerAttribution:
     """Each row's owning root: its queue's, or — for reconciliation — worktree, then active rows."""
 
@@ -752,7 +837,7 @@ class TestOwnerAttribution:
 
         (row,) = _sub(_build(config, active), 'reconciliation')['escalations']
 
-        assert row['project'] == 'proj'
+        assert row['project'] == 'b/proj'
         assert row['project_root'] == str(other.resolve())
 
     def test_a_reconciliation_row_active_nowhere_has_no_owner(self, tmp_path):

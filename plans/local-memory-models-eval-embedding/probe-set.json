@@ -1,0 +1,1618 @@
+{
+  "corpus_sha": "850cf7c937c745b0d224a0ba975efc1c69080ad61d84c5369d06287cdd16f2e8",
+  "known_items": [
+    {
+      "episode_uuid": "000f10d5-cad4-4bab-bfb3-e5b96f358825",
+      "query": "project dark_factory has 5 in_progress tasks as of 2026-05-28: 1526"
+    },
+    {
+      "episode_uuid": "0029bce2-f2a8-4947-87ee-8052043721b4",
+      "query": "Task 1999 (MQ-invariants ξ) prerequisite pre-1 investigation: grepped `journalctl --user"
+    },
+    {
+      "episode_uuid": "01945cfa-ac9b-4964-9ed7-50384ee0018e",
+      "query": "Task 3301 reached terminal status 'done' via done_provenance.kind=found_on_main (not merged),"
+    },
+    {
+      "episode_uuid": "021a2f8e-5870-4192-8ece-84fb5ddad06a",
+      "query": "Task 1374 ('[auto-eval redo] Fix mock_orch_config fixture — pydantic_spec must"
+    },
+    {
+      "episode_uuid": "021d0d26-5a98-4c86-8aab-cc2ef27d7433",
+      "query": "2026-05-08 (commit 281b02c9a4): TaskInterceptor._worker_intent: set[str] populated BEFORE queue.put in submit_task,"
+    },
+    {
+      "episode_uuid": "0291d55b-5069-4891-b408-df2d1cd23849",
+      "query": "As of 2026-05-16: Task 1447 (Apply SQLite pragma triad to"
+    },
+    {
+      "episode_uuid": "039e96c0-4bdc-400e-84e0-7afc5707c377",
+      "query": "Decision (2026-05-06): Dashboard Window chip uses \"Option A — honest"
+    },
+    {
+      "episode_uuid": "05833968-92b2-4454-b66c-6f99dc4612a0",
+      "query": "Task 2401 (marked done 2026-07-09T20:50:32Z, done_provenance commit cdb63b2e04d895c7d93f4c022fd85ded0dfe59bc) claimed to"
+    },
+    {
+      "episode_uuid": "05d3f6c1-126f-43c5-ba75-7741757be2e0",
+      "query": "Task 880 escalation notice (2026-04-21, cycle 0903cbda): harness._fetch_filtered_task_tree passes project_id"
+    },
+    {
+      "episode_uuid": "070fd767-3bec-40a7-9c4e-90924974867f",
+      "query": "When confirming a suspected duplicate Graphiti entity before merge_entities, do"
+    },
+    {
+      "episode_uuid": "0822b486-9860-4247-b1ab-8992015da925",
+      "query": "Decided 2026-08-03 (Leo-approved) to SPLIT writer W3 out of DF"
+    },
+    {
+      "episode_uuid": "084bdf01-9a7a-4c8d-9288-3a88f61f861d",
+      "query": "Orchestrator staleness gap CLOSED at the planning level 2026-07-02: escalation"
+    },
+    {
+      "episode_uuid": "08ab1613-2421-4f8c-a093-e8d5d2e98d4e",
+      "query": "DECISION (2026-07-02, Leo attended): consolidated the two offline-lane reify deterministic"
+    },
+    {
+      "episode_uuid": "0abd7131-23f1-43c5-9942-9d4863a8409e",
+      "query": "As of 2026-05-15T19:55Z (recon run 5d7c7325): dark_factory task count snapshot"
+    },
+    {
+      "episode_uuid": "0c97f0e4-0d1c-49f9-b14e-de36b77f53db",
+      "query": "Decision: ε removed plan_completion_pct from composite_score formula (was quality ×"
+    },
+    {
+      "episode_uuid": "0cd74727-029e-450e-bc48-dfbdb0715331",
+      "query": "Task 1250 (curator-dash 5/7: /api/v2/dashboard/curator endpoint + shape_curator) is done"
+    },
+    {
+      "episode_uuid": "0d132397-dcde-4a88-a396-fbd74ee719e3",
+      "query": "Pattern for holding a deterministic PURE GATE task open pending"
+    },
+    {
+      "episode_uuid": "0d615854-1a9c-4941-a20e-cfbb00c4ea2e",
+      "query": "Decision (2026-07-09, /deb xdist verify flake): the recurring \"orchestrator full-suite"
+    },
+    {
+      "episode_uuid": "0ea92419-3cb6-43df-89e3-260e3be800cf",
+      "query": "Decision precedent (esc-2938-1 vs esc-2944-2, 2026-07-22): when repairing tool-call-XML-leak corruption"
+    },
+    {
+      "episode_uuid": "12f1482d-8159-4554-ae0f-382e02a5ee23",
+      "query": "CostStore wiring completed (2026-04-04). The CostStore class existed in shared/cost_store.py"
+    },
+    {
+      "episode_uuid": "1598076a-0c59-4ed4-9d29-e2ce16e87fdf",
+      "query": "Task 1253 was completed via commit c8c71bcb14aa9ebb55f6b67c6c9cfa5431672b43 — Stage2FlagPartition NamedTuple"
+    },
+    {
+      "episode_uuid": "1659ef70-9f1a-4a10-bca1-f311349b0615",
+      "query": "Python's list/dict invariance bites propagation of TypedDict annotations through the"
+    },
+    {
+      "episode_uuid": "165ecc00-02ee-4bd3-aad7-44223b604661",
+      "query": "DECISION 2026-08-03 (dark_factory, Leo): task 3274 CANCELLED as fully superseded,"
+    },
+    {
+      "episode_uuid": "1786191c-16d6-4b9f-aed7-30585c23a96f",
+      "query": "The G7 design-invariants walk at /prd decompose of memory-referent-fidelity (2026-08-05)"
+    },
+    {
+      "episode_uuid": "18052e2d-742f-4403-9466-80149b2b769f",
+      "query": "Escalation MCP server ImportError (fastmcp.server.tasks.routing) that made the server unavailable"
+    },
+    {
+      "episode_uuid": "19fc6361-65ca-4e1b-84c7-ea2e32a9d365",
+      "query": "As of 2026-05-27: project dark_factory task status snapshot — total=1491,"
+    },
+    {
+      "episode_uuid": "1cdc1a57-35cd-4ae4-9108-f57d3fc9b133",
+      "query": "Task 3302 reached terminal status 'done' via direct merge, commit"
+    },
+    {
+      "episode_uuid": "1e7885b4-1e08-470c-a6eb-236f203ac7bd",
+      "query": "Taskmaster cascade-cancellation trigger contained 2026-04-30 (commit 2ab571fc6e, merged via 04c321259a)."
+    },
+    {
+      "episode_uuid": "21ed3f83-e6b5-45c3-9b6e-cab70a648605",
+      "query": "Bridge max_tokens clamping was updated 2026-04-12 (commit 5f7a2aab30): the previous"
+    },
+    {
+      "episode_uuid": "2203fde9-b56b-42e0-99ab-41c9ed824863",
+      "query": "Decision (2026-04-30): skip the diagnostic-first instrumentation pass for capturing the"
+    },
+    {
+      "episode_uuid": "23503e72-b7d1-4156-9b3b-3e985d3b6463",
+      "query": "F-infra pipeline status shows that the /audit skill is done"
+    },
+    {
+      "episode_uuid": "25ce74ce-3878-404b-b460-3805bc4533ed",
+      "query": "Stage 2 write-counter audit failure mode (identified run 6d0d4f54): When"
+    },
+    {
+      "episode_uuid": "263fe90f-da12-4f9a-baa2-5739dcc01864",
+      "query": "Fact: The `my_solar_challenge` project (canonical id underscore form; directory /home/leo/src/my-solar-challenge,"
+    },
+    {
+      "episode_uuid": "27270d8a-d883-4c05-b8ba-099502620d05",
+      "query": "RECURRING ROOT CAUSE (flagged to Leo jun8 via /unblock 4349,"
+    },
+    {
+      "episode_uuid": "2a2cab22-2d0a-45c3-9829-4511df4fdfb8",
+      "query": "DECISION (2026-07-17, escalation-watcher): Operational post-merge escalations were dispositioned by DISRUPTIVENESS,"
+    },
+    {
+      "episode_uuid": "2a6f5ad1-5e7e-43c9-a90c-06b62e693580",
+      "query": "Substrate-gate main-RED cluster partition (esc-1838-15 L2, resolved by task-1837 steward"
+    },
+    {
+      "episode_uuid": "2a7dccd8-21d4-4bdf-9cbc-3886ed1a4763",
+      "query": "Task 1228 is done in project dark_factory. Merged with commit"
+    },
+    {
+      "episode_uuid": "2a872d73-e696-4dec-ace7-0067836cb010",
+      "query": "Decision: for the planned v2 concurrent fanout in the vLLM"
+    },
+    {
+      "episode_uuid": "2ad8e3ea-8822-45f2-9af1-7b2aa275cc16",
+      "query": "Task 1017 (_check_plan_targets_in_tree reviewer suggestions in merge_queue.py) transitioned to done"
+    },
+    {
+      "episode_uuid": "2aeacacc-a61a-40b2-ad30-bf73f3f18fc1",
+      "query": "/unblock-auto is DRY-RUN ONLY for the first AFK round —"
+    },
+    {
+      "episode_uuid": "2b67c58c-a901-4011-b445-dfc4c14c63f1",
+      "query": "esc-task-curator-191 RCA + fix (2026-06-15, task 1760 + plans/curator-single-call-budget-prd.md, commit"
+    },
+    {
+      "episode_uuid": "2c5c29cf-c5f6-40bc-80cb-fa4979082c17",
+      "query": "As of 2026-07-28T16:55:30Z, Task 3116's stored priority field is 'low'."
+    },
+    {
+      "episode_uuid": "2ce78a1e-84a6-49bd-9064-4c0f1c30eb08",
+      "query": "As of 2026-05-17: dark_factory project has 4 pending tasks —"
+    },
+    {
+      "episode_uuid": "2d5903fd-348d-4a33-9b1e-17c59d18c0d6",
+      "query": "Set priority override for task 3117: {'boost_tier': 'critical', 'pinned': True,"
+    },
+    {
+      "episode_uuid": "2ebac138-dd6e-4d58-a7f5-0d5231d10b3c",
+      "query": "Cross-project task provenance: The orchestrator completion detection false-positive bug is"
+    },
+    {
+      "episode_uuid": "3067456a-33c3-448c-833b-d6d4221989c7",
+      "query": "As of 2026-06-15T12:30: WatchdogSec successfully reverted from 600 to 120"
+    },
+    {
+      "episode_uuid": "337d8223-308f-40d6-8f91-af3a36620044",
+      "query": "DECISION 2026-07-30: WITHDREW an escalated operator recommendation to override module-lock"
+    },
+    {
+      "episode_uuid": "33ddd7ba-3587-40d3-9726-3c652278aa11",
+      "query": "Decision: _mark_blocked ghost-loop fix uses defense-in-depth with three layered guards"
+    },
+    {
+      "episode_uuid": "34166007-8e18-4410-af5a-54e68777ffe3",
+      "query": "Task 2993 (\"Audit write_cycle_summary call site + remediation-flag logic for"
+    },
+    {
+      "episode_uuid": "346dd8ed-91f4-4077-bd36-fda7a66b4074",
+      "query": "Decision: activate the inert `merge=ours` .gitattributes entry by registering `git"
+    },
+    {
+      "episode_uuid": "351a0aa8-f178-4e66-9ace-61cbeaf19c6c",
+      "query": "Escalation esc-1139-159 is pending at blocking severity for Task 1139"
+    },
+    {
+      "episode_uuid": "353085e1-f14d-4f1b-b8da-ba992a110f07",
+      "query": "Design decision (2026-04-18 WP-F): curator `combine` was hardened, not removed."
+    },
+    {
+      "episode_uuid": "3548e633-13b5-4f13-bcef-00f53ea45eef",
+      "query": "Decision (Leo, 2026-08-03, esc-3446-3 curator-combine metadata wipe): remediate the live"
+    },
+    {
+      "episode_uuid": "36bfa303-9ce6-4c13-82bc-65d95fc24303",
+      "query": "Task 1703 (A′ gate: go/no-go decision on the coupling-tolerant train"
+    },
+    {
+      "episode_uuid": "3934397f-8202-48ed-805a-f957e6ea8bf3",
+      "query": "Post-b242 false-done sweep (2026-04-21): ~40 tasks across three projects (reify,"
+    },
+    {
+      "episode_uuid": "3a01f609-bdc7-48a4-bfbd-da1d3c22b963",
+      "query": "AFK C1 systemd watchdog — chose TCP-listen probe via `ss"
+    },
+    {
+      "episode_uuid": "3aef58d8-ac3e-4e96-8b37-7732473c24c3",
+      "query": "Decision: Architect plan revalidation on blast-radius requeue (commit 0108828d99, 2026-04-16)."
+    },
+    {
+      "episode_uuid": "3e03e95a-34ca-4ded-8a42-b1e6baaa7f4f",
+      "query": "Dark-factory task-count snapshot as of 2026-05-09 (recon cycle 17922dbf): total=1177,"
+    },
+    {
+      "episode_uuid": "3e46614a-4e13-4c59-a064-e54274747ff2",
+      "query": "W3 task-metadata-schema decision (2026-07-06): the shared TaskMetadata schema's sub-model extension"
+    },
+    {
+      "episode_uuid": "43cab89e-6abc-4c80-bcb8-318b1b27ca89",
+      "query": "Task 1031 (Dashboard performance data should scan escalation archive directory)"
+    },
+    {
+      "episode_uuid": "4481adff-4580-42e1-afe1-9fac0d3e102a",
+      "query": "Decision: for `--stop-on-first-failure` in the planned v2 concurrent vLLM eval"
+    },
+    {
+      "episode_uuid": "448b9df1-5895-416c-b10f-48e878bdc773",
+      "query": "Decision: in `git_ops.create_worktree`'s post-positioning merge-base capture, use `start_ref` (the freshened"
+    },
+    {
+      "episode_uuid": "4932e10c-e48a-44cf-a106-3a8e56a46bd7",
+      "query": "2026-07-29: decided to append the merge-worktree-leak root-cause findings to EXISTING"
+    },
+    {
+      "episode_uuid": "496a3251-a735-4ffc-8978-3787a12a73cb",
+      "query": "Decision (2026-07-22, decompose of stage1-entity-standing-decision PRD): the whole 7-task batch"
+    },
+    {
+      "episode_uuid": "51ab61c7-6929-43a7-afb6-f0255ed5c35d",
+      "query": "Decompose-time G7 (design-invariants) walk on the architect-already-complete-exits PRD surfaced two"
+    },
+    {
+      "episode_uuid": "51fb2623-8917-4862-b784-604b2b6802b6",
+      "query": "Bridge max_tokens clamping fix (commit 5f7a2aab30, 2026-04-12): The hard 8192"
+    },
+    {
+      "episode_uuid": "5220ab2b-b65f-4e6e-b1ad-ef556e741631",
+      "query": "Decision (2026-04-27): `update_task` stays accessible to all workflow agents —"
+    },
+    {
+      "episode_uuid": "52c8d1c9-aa6c-446f-85e8-73660d522b75",
+      "query": "Decision: Park Devstral-Small-2505 from the dark-factory eval pipeline. Tested end-to-end"
+    },
+    {
+      "episode_uuid": "52d14f57-5f56-471b-9b1e-d4fa49e4e5e9",
+      "query": "ENACTED 2026-07-20 (Leo-authorized): DROPPED triage from routing PRD task κ."
+    },
+    {
+      "episode_uuid": "591bf2c7-a1df-47e0-bbc7-8445ed3e8271",
+      "query": "Task 2166 (W3-γ: fused-memory policy-layer parser collapse + delete _VALID_PROVENANCE_KINDS"
+    },
+    {
+      "episode_uuid": "5a225972-9e76-499f-b228-f9e9c19e59bd",
+      "query": "Supplementary design decisions in the dashboard-taskgraph-legibility PRD (2026-07-13, beyond the"
+    },
+    {
+      "episode_uuid": "5a33faef-76ca-492b-94d1-9b5979a9b2ca",
+      "query": "TASK-590-DONE: Reviewer panel restructuring trial (task 590) is complete. The"
+    },
+    {
+      "episode_uuid": "5d40b6b9-54d1-4873-bbef-a78793b4dd02",
+      "query": "Task 1409 (Complete module_configs_or_empty normalization contract) was completed with merged"
+    },
+    {
+      "episode_uuid": "5eb1d893-fc7a-45e2-b1ff-b42a75265f3b",
+      "query": "STAGE2_FLAG cycle 1f6b7d9d: Task 1018 'Tune bulk-reset circuit breaker to"
+    },
+    {
+      "episode_uuid": "6203055b-aea5-42de-ad1b-80a75aa3950d",
+      "query": "DECISION: When draining a large overnight escalation backlog (~30 L1s)"
+    },
+    {
+      "episode_uuid": "62382e21-eb72-4523-bfaa-6c44bdbd0447",
+      "query": "Patched shared/src/shared/cli_invoke.py to log full stdout (not just first 500"
+    },
+    {
+      "episode_uuid": "62e4d0d2-69aa-4a46-bc21-14c1188f7cd1",
+      "query": "add_subtask was removed from Stage 2 reconciliation's tool surface by"
+    },
+    {
+      "episode_uuid": "640b2937-efa6-47ca-959c-98a4a80a4515",
+      "query": "Task 1585 shipped via fused-memory/tests/reconciliation/test_recon_transport_guard.py. Commit 9a718c2a5db6aa77fadb52b20611ea9bb87fd12a (\"test(recon-transport-guard): spec config"
+    },
+    {
+      "episode_uuid": "64311714-68bb-464a-b035-14b2fe50a869",
+      "query": "Task 3516 split the dashboard Tasks-tab per-project header's merged \"N"
+    },
+    {
+      "episode_uuid": "650af25c-1c75-470e-9149-0f6619e121d7",
+      "query": "Task 1704 (A′ α: union-scope the train verify — fix"
+    },
+    {
+      "episode_uuid": "6708e144-2a10-4d3d-b250-dc5e2bef0580",
+      "query": "Task 1819 (σ — pytest AST-scan lint gate, silent-fallthrough-dedup PRD"
+    },
+    {
+      "episode_uuid": "67d3bacf-bed4-431c-9637-f128370ea62e",
+      "query": "Task 1818 (scripts/reviewer_redundancy_diagnostic: report dropped corrupt review files) was unblocked"
+    },
+    {
+      "episode_uuid": "6841b1d7-4559-4e23-910c-3249bf8cc0a1",
+      "query": "A8 transport chosen = HTTP direct, project-routed (dark_factory→127.0.0.1:8102, reify→127.0.0.1:8100). Considered"
+    },
+    {
+      "episode_uuid": "6d513047-e2e3-47a8-8b9a-66ad70c7eef8",
+      "query": "When optimizing the factory-init skill description, I deliberately did NOT"
+    },
+    {
+      "episode_uuid": "6d5dcdba-e5fb-49fe-8749-a068adf535b0",
+      "query": "As of 2026-07-23: Task 2999 (human gate for task 2954"
+    },
+    {
+      "episode_uuid": "71120dd2-4422-406b-adad-e42b68a4219c",
+      "query": "Documentation architecture decisions (Leo, 2026-07-22): (1) CLAUDE.md was migrate-and-slimmed, not"
+    },
+    {
+      "episode_uuid": "716dcb56-2fbe-4aea-a271-568e02691220",
+      "query": "Tier-1 prompt-opt reviewer-sequencing decision (2026-07-12): when the seam-check found the"
+    },
+    {
+      "episode_uuid": "72ca5a4e-e4cc-46b8-9469-bafbacd44918",
+      "query": "DECISION (2026-07-06): closed the no-code data-ops task 4995 (esc-4995-1, a"
+    },
+    {
+      "episode_uuid": "7453e548-62b4-4fa4-a464-94a26f771ceb",
+      "query": "A remediation pass's Stage 1 (memory_consolidator) executes a focused analytical"
+    },
+    {
+      "episode_uuid": "745aed59-c1c9-47a1-b26a-08e5caa499aa",
+      "query": "Decision + residual risk (esc-1573-11, 2026-06-01): task 1573 (cross-cycle dedup"
+    },
+    {
+      "episode_uuid": "74bd0aa5-5eb3-471d-ae40-d237ae6ac0cd",
+      "query": "Decision: During task 175 unblock, cherry-picked only the rebuild_entity_summaries commits"
+    },
+    {
+      "episode_uuid": "74cd3800-2024-4e6c-916d-7e8c03f4a9f2",
+      "query": "MiniMax M2.7 released 2026-04-11. 229B total / 10B active MoE,"
+    },
+    {
+      "episode_uuid": "7558c127-0394-46c3-9969-450c479202ce",
+      "query": "As of 2026-05-14 (recon run d4fab8a4): project dark_factory has task"
+    },
+    {
+      "episode_uuid": "75cd5ebd-2cf0-4bdf-8f3f-b93817e1c20d",
+      "query": "Decided to queue the three reify-cancel-revert fix tasks as single-package"
+    },
+    {
+      "episode_uuid": "76ea8d47-d96d-44f5-be70-d708c621d159",
+      "query": "Decision 2026-05-11: When the orchestrator MCP server disappears mid-session (port"
+    },
+    {
+      "episode_uuid": "787aaddd-4890-42e6-9e9a-bf2051ff2b7e",
+      "query": "Multi-account Max failover pool updated 2026-04-08: a new account max-g"
+    },
+    {
+      "episode_uuid": "7958bded-a23c-4ada-bc5d-e0b619c919e9",
+      "query": "2026-04-29: fused-memory was restarted via scripts/restart-fused-memory.sh (per user request during"
+    },
+    {
+      "episode_uuid": "7b8f6f67-9503-4f3f-8171-ffc1edc7fdd5",
+      "query": "Decision rationale for merge-request identity semantics (merge-worktree-lifecycle-integrity PRD C3, 2026-07-22,"
+    },
+    {
+      "episode_uuid": "7b916a58-fe29-4b4d-a2de-d35e70ba7df3",
+      "query": "Orchestrator runtime state observed 2026-05-27 ~15:40Z: BOTH a dark-factory orchestrator"
+    },
+    {
+      "episode_uuid": "7c87af62-bc2a-4a7b-a8fc-2fdef90b4a6e",
+      "query": "Task 1290 ('Decide pin_queue_reordered emission contract for add/remove (or document"
+    },
+    {
+      "episode_uuid": "7d24569a-90d8-4090-a2d3-4f932931b184",
+      "query": "DECISION 2026-08-04 (Leo, interactive, dark_factory): task 3523 raised from priority"
+    },
+    {
+      "episode_uuid": "80bae079-9c1b-4823-9a78-7dbf2c01735c",
+      "query": "Task 3410 (orchestrator/src/orchestrator/evals/judge.py) extracted clamp_unit_score(score) -> float — round(min(max(score,0.0),1.0),4) —"
+    },
+    {
+      "episode_uuid": "821954bc-4769-4094-a2ad-b505658d3f18",
+      "query": "As of 2026-07-09, task 2293 (Fleet Cockpit C3: priority scoring"
+    },
+    {
+      "episode_uuid": "82f3476b-d5e0-4313-a470-6a7fb0de1202",
+      "query": "As of 2026-05-28: the pre-commit bare-magicmock check passes without --no-verify."
+    },
+    {
+      "episode_uuid": "8341016f-f88b-4f72-aff3-f2cc669514de",
+      "query": "Task 2192 (thread request-scoped now through burndown.py + clock-discipline guard"
+    },
+    {
+      "episode_uuid": "843e94ed-1072-4cfd-9ac1-d0d473481cda",
+      "query": "Decision 2026-05-01: Fix 1 (phantom-done gate stale metadata.files) will UPDATE"
+    },
+    {
+      "episode_uuid": "850de06b-80c5-4efc-9a0d-5e91e5d43241",
+      "query": "Task 1373 ('Steward verify timeout cap too tight for orchestrator"
+    },
+    {
+      "episode_uuid": "854e8b22-b2b0-4d1a-8e2e-05eb7f5b4143",
+      "query": "Decision (2026-05-02): the legacy `prompt=` parameter on the update_task MCP"
+    },
+    {
+      "episode_uuid": "86fb523e-36ef-4e6a-a315-144c4ce22db1",
+      "query": "Decision (task 1447 unblock, 2026-05-16): when a sentinel + kwargs"
+    },
+    {
+      "episode_uuid": "87d54457-5d95-47da-84ea-323c568a7ae2",
+      "query": "Decision (2026-04-26): _extract_cause_hint signature stays unchanged (no rc parameter added)."
+    },
+    {
+      "episode_uuid": "8a53a08a-059a-4ad8-bf52-cbe5a45cd196",
+      "query": "Task 3237 (make test_default_status_fetcher_raises_status_fetch_unavailable_when_unreachable hermetic) is in-progress as of 2026-07-31,"
+    },
+    {
+      "episode_uuid": "8a73b546-509a-461c-a3ec-c92cc0bfee4d",
+      "query": "Task 1833 (Lock-charter guard γ — submit_task/commit_planning directory-lock backstop, fused-memory,"
+    },
+    {
+      "episode_uuid": "8d34f255-f67a-4a42-8320-b0632cca5b8d",
+      "query": "Task 1445 (Post-1401 cap-wait policy cleanup: consolidate per-module aliases and"
+    },
+    {
+      "episode_uuid": "8d99290f-010d-4a2e-be80-b55307310b00",
+      "query": "Scheduler fairness design chose Option C (skip-count + reservation hybrid)"
+    },
+    {
+      "episode_uuid": "916727e6-20ff-470f-a976-e27f435ea1c0",
+      "query": "CGL-ι Phase-2 human-review data decisions (Leo, 2026-07-14) for consolidate_namespace_families.py: (a)"
+    },
+    {
+      "episode_uuid": "920a4d7a-dd07-458f-a9e7-4844408bf8ac",
+      "query": "Decision (dark_factory /unblock 2057, 2026-07-04): when a task is discovered"
+    },
+    {
+      "episode_uuid": "92f662ec-8cfc-4426-9322-c8e2ecbfb02c",
+      "query": "Task 3083's WORK item (a) root-cause question is open and"
+    },
+    {
+      "episode_uuid": "9347f842-c1dd-49ec-bd0b-f4af37c91709",
+      "query": "During /prd decompose of plans/memory-referent-fidelity-prd.md (2026-08-05), leaf ι (declaration-rate telemetry,"
+    },
+    {
+      "episode_uuid": "94efe05d-e007-4ac9-b979-7b78217032cd",
+      "query": "Always verify .mcp.json explicitly to determine which orchestrator's escalation server"
+    },
+    {
+      "episode_uuid": "96d356d8-3746-4de5-a3ab-42d8bfd0d76a",
+      "query": "Task 471 (extract _insert_snapshot_for_root helper) was superseded by task 470"
+    },
+    {
+      "episode_uuid": "97fe0ae9-fe88-473a-81fb-229457ba102e",
+      "query": "A liveness/status check performed at 2026-07-22T18:10:00+00:00 (Stage 1 memory_consolidator, run"
+    },
+    {
+      "episode_uuid": "9936d8e1-5777-40b4-8724-5a679da3b779",
+      "query": "Scheduler v2 is the current scheduler in production for both"
+    },
+    {
+      "episode_uuid": "9998526f-c741-44fe-ac1e-2ba2e065c8b8",
+      "query": "Stage 1 filter_task_tree() bug does NOT affect Stage 2 memory_hints"
+    },
+    {
+      "episode_uuid": "9c827503-d921-4340-a064-43c4a371fd4d",
+      "query": "FLAG-STAGE2-DEAD-LETTER-QUEUE (2026-04-23, run 4f20975a): Reconciliation dead-letter queue continues to have"
+    },
+    {
+      "episode_uuid": "9de39b5d-efa5-4f9d-b115-b63679843d42",
+      "query": "Task 917 (Fix add_task MCP timeouts — curator_lock contention) is"
+    },
+    {
+      "episode_uuid": "9e6fe136-f8b9-4bd1-920d-a507220febfe",
+      "query": "OCCT throttle Layer 2 chose nice/ionice over a smarter (PSI-feedback"
+    },
+    {
+      "episode_uuid": "9f2a08f3-42aa-4897-a8f1-b09654ff2170",
+      "query": "stage1_flag_suppression system fully implemented across tasks 1185, 1186, and 1188"
+    },
+    {
+      "episode_uuid": "9f6d3c24-eba4-4724-8fc7-22a1dfb66b78",
+      "query": "Decision (deterministic task_kind PRD, df 2026-06-23): blocking-vs-detached restart is DETERMINED"
+    },
+    {
+      "episode_uuid": "9f97cf21-cc91-46dc-8ef6-974b491b46cb",
+      "query": "Task df_task_12 completed: verify.py fixed to use bash executable. Added"
+    },
+    {
+      "episode_uuid": "a0229db3-1187-46ac-adfd-901a94e7c558",
+      "query": "As of 2026-05-14: project dark_factory has 1279 total tasks —"
+    },
+    {
+      "episode_uuid": "a0506092-5d7a-40f7-9b6c-ca0f6a3dc1ec",
+      "query": "Decision: Chose prompt scoping (option 2) over diff filtering or"
+    },
+    {
+      "episode_uuid": "a4b9548e-63f2-4134-9529-c6073475efb0",
+      "query": "Task 1074 ('Document pydantic-methods gotcha in mock_orch_config fixture docstring') should"
+    },
+    {
+      "episode_uuid": "a7aa92cd-c78d-45f3-8e90-c544dcb5cd80",
+      "query": "Operator ruling (Leo, 2026-08-03): interactive/human-launched work on the shared dev"
+    },
+    {
+      "episode_uuid": "a7d13b71-3665-4aa8-8203-aab3c89029aa",
+      "query": "Task 1491 (soft-cancel watcher too slow fix) was completed via"
+    },
+    {
+      "episode_uuid": "a923615a-1f87-4a46-b3e9-b3abe06897b1",
+      "query": "DECISION (2026-06-07, Leo): for the Reify build-pipeline phase-ordering inversion blocking"
+    },
+    {
+      "episode_uuid": "a986e4df-d05c-4a04-a3d8-fba33e292b2e",
+      "query": "Decision (2026-05-01, commit 48bacef035): the gate is the single authoritative"
+    },
+    {
+      "episode_uuid": "ab8aa357-9808-4468-8f85-8de17b9304c6",
+      "query": "Decision (2026-04-08): verified runpod-toolkit retry decorator with a mock-based test,"
+    },
+    {
+      "episode_uuid": "acf128a1-00ae-4c62-920d-5425a059649a",
+      "query": "shared.pytest_jobserver module: a ~60-line pytest plugin at `shared/src/shared/pytest_jobserver.py` with `pytest_configure`/`pytest_unconfigure`"
+    },
+    {
+      "episode_uuid": "ad78774d-3182-450b-bf06-5392f84b137a",
+      "query": "Task 1429 (Tighten test_suggestion_triage.py: rename stale mcp-none test, assert on"
+    },
+    {
+      "episode_uuid": "add9a054-cd75-475b-a851-51ca18148d27",
+      "query": "Fleet Cockpit verification-gate design (2026-07-07): C10 (2303) is a deterministic"
+    },
+    {
+      "episode_uuid": "ae098722-be29-4d0e-a261-c5b5465a1ac3",
+      "query": "Eval instrument finding (task 2863, 2026-07-30): the architect eval's two"
+    },
+    {
+      "episode_uuid": "b31e6044-f195-448b-8d35-7aaa4a7607bb",
+      "query": "Design decision (2026-05-01) for SIGHUP reload-all-tokens fix in dark-factory's UsageGate:"
+    },
+    {
+      "episode_uuid": "b38c0d31-2025-47df-ad1f-b6e8049b7220",
+      "query": "TaskInterceptor has a fully async end-to-end curator path: task_interceptor.py:1007 awaits"
+    },
+    {
+      "episode_uuid": "b4cf42ce-f576-4a49-b6fb-591fdd92809e",
+      "query": "W6 fm-memory-identity design decision: the write-time entity-identity guarantee is a"
+    },
+    {
+      "episode_uuid": "b58a1c54-5503-4ffd-9743-eb07dd4007bd",
+      "query": "DECISION (Leo, 2026-07-26): the warm-lane pool's cross-repo seam moves from"
+    },
+    {
+      "episode_uuid": "b629e1e8-2079-4a5f-93c9-4737bb9f194b",
+      "query": "Decision (2026-04-08): For the new completion judge agent (work item"
+    },
+    {
+      "episode_uuid": "b84d5d5a-d0c7-46c0-b0ea-d3265954fd98",
+      "query": "Decision: Default eval concurrency from 1 to 5 tasks in"
+    },
+    {
+      "episode_uuid": "b8ec14d6-d88c-4e32-82e1-be8ce195292d",
+      "query": "As of 2026-06-04: P4 multi-waiter work (tasks 1639-1642) of the"
+    },
+    {
+      "episode_uuid": "b9eac377-8903-4534-b3a5-422c4b88cf99",
+      "query": "Task 2115 (\"Cross-graph entity leak: shared-driver race in add_episode +"
+    },
+    {
+      "episode_uuid": "bbad7fbd-187b-43e6-a7b2-e9fc2be97a77",
+      "query": "Task 1611 (Rewrite auto-watcher Main Loop: bounded waits, rotation-clock recheck,"
+    },
+    {
+      "episode_uuid": "be6ed0ca-6438-491e-8da9-13e30e5e4b5f",
+      "query": "Design decisions for the WIP-safe merge queue fix (approved 2026-04-07,"
+    },
+    {
+      "episode_uuid": "c0da7797-93f6-47c8-ba7b-9b440a4f38c2",
+      "query": "leo-laptop verify-host architecture: this workstation (hostname leo-MS-7C35) runs the reify"
+    },
+    {
+      "episode_uuid": "c1224934-d7e9-4f61-bfc2-5d77cedee72e",
+      "query": "Task 3279 (warm-lane dirname-fork fix) settled \"patch the byte-copy in"
+    },
+    {
+      "episode_uuid": "c30d6165-2da4-4033-9ba0-0c39b00fe383",
+      "query": "Memory-eval-program PRD (docs/prds/memory-eval-program.md, commit b799b37194, 2026-07-29) load-bearing decisions and why:"
+    },
+    {
+      "episode_uuid": "c3a855cb-9f3a-4fd3-a39b-ffe9240d5954",
+      "query": "dark_factory task 1171 (Make stats_verifier alias pass robust against chained"
+    },
+    {
+      "episode_uuid": "c64b436d-b95e-423e-b4b2-80efc4e940c4",
+      "query": "The task Scheduler state endpoint (task 1230) has a status"
+    },
+    {
+      "episode_uuid": "c7c1d559-b3e7-4b4e-ad4e-9930caaf89cc",
+      "query": "Decision (worktree-wipe fix, esc-4146-268, settled with user): (1) create_worktree's line-702"
+    },
+    {
+      "episode_uuid": "c7dab3dd-5643-482d-868e-a24b71e1e7fe",
+      "query": "The output of the architect-effort eval campaign was confirmed to"
+    },
+    {
+      "episode_uuid": "ca992580-c92a-472f-8589-6d8749bfb745",
+      "query": "Task 1724 (\"merge_queue skip-reverification is unsound when task-level verify scope"
+    },
+    {
+      "episode_uuid": "cb3bbb41-38c1-493d-bfec-6fd465ddca44",
+      "query": "Root cause of recon escalation esc-3803-1 (reify task 3803, 2026-05-29)"
+    },
+    {
+      "episode_uuid": "cbfa1da4-59d4-40f6-af00-e5abe7439f6f",
+      "query": "Merge conflict resolution for task/1836 (merged main, commit 5a3e134a3e): all"
+    },
+    {
+      "episode_uuid": "cde85843-e9c7-4a36-8441-b088c40551ca",
+      "query": "BacklogPolicy.current_backlog counts db_count + queue_depth + retry_in_flight for a given"
+    },
+    {
+      "episode_uuid": "cfe062b9-406b-4aaf-b672-3200421cde51",
+      "query": "Set priority override for task 3256: {'boost_tier': 'high', 'pinned': True,"
+    },
+    {
+      "episode_uuid": "d022c184-d08e-478f-993f-3c5008d3bbdc",
+      "query": "AFK C1 watchdog kill policy — chose two-phase `systemctl --user"
+    },
+    {
+      "episode_uuid": "d284f1cb-5fce-41c1-a063-835f3fd687e1",
+      "query": "Task 450 created (2026-04-05): \"Burndown view: show all registered projects,"
+    },
+    {
+      "episode_uuid": "d509f4b3-c70f-46ee-8e14-ff6f7e00a29a",
+      "query": "As of 2026-05-16: Task 1449 (Initialize digest counters in Harness.__new__-based"
+    },
+    {
+      "episode_uuid": "d80a2fd7-5863-49e3-bee3-817ced2a2338",
+      "query": "Task 846 status changed to done on 2026-04-20T12:08:56.050Z. The task"
+    },
+    {
+      "episode_uuid": "d8891ed7-5d24-4ba0-bb8e-b9492232a742",
+      "query": "Decision (fused-memory, 2026-07-13): fixed the curator false-drop-against-orphan bug with a"
+    },
+    {
+      "episode_uuid": "dab0f7ba-97af-4906-ba7d-4a62e8e2213a",
+      "query": "Design principle for rebuild_entity_summaries pipeline: keep refresh_entity_summary as a self-contained"
+    },
+    {
+      "episode_uuid": "dc696997-12a9-4eae-9531-13bdeba96ef9",
+      "query": "A census.py `--dry-run-filing` run is NOT replayable. Only external task"
+    },
+    {
+      "episode_uuid": "dd84d192-55d8-4d0d-90fd-f3730200e4d9",
+      "query": "Set priority override for task 2365: {'boost_tier': 'critical', 'reserve_now': True,"
+    },
+    {
+      "episode_uuid": "e031d902-37fd-4bdf-a421-88f1504b930a",
+      "query": "State-graph PRD batch FILED AND PENDING 2026-08-02: tasks 3533(α pin"
+    },
+    {
+      "episode_uuid": "e045db1b-2314-4f11-9e64-256aa93d721f",
+      "query": "Decision (2026-05-12 dashboard pyright sweep): refactored `_parse_window` in `dashboard/src/dashboard/app.py:106` from"
+    },
+    {
+      "episode_uuid": "e15d6c93-4bd8-40e1-af52-96ae8a419c8e",
+      "query": "Decision (2026-04-27): fused-memory reads the dashboard's existing DASHBOARD_KNOWN_PROJECT_ROOTS env var"
+    },
+    {
+      "episode_uuid": "e20d1fab-b9ca-4a48-87a1-15194524a1be",
+      "query": "Cancellation sweep uses is_orchestrator_live_for(project_root) as the liveness signal that distinguishes"
+    },
+    {
+      "episode_uuid": "e434a889-0e84-4100-a53a-a0dd577a20fc",
+      "query": "The orchestrator \"amender\" agent has no dedicated role in orchestrator/agents/roles.py"
+    },
+    {
+      "episode_uuid": "e4b03886-3996-4679-b1ab-d10a810eea3e",
+      "query": "Tasks newly done as of 2026-05-15T22:42Z (recon run 9f47b78e): Task"
+    },
+    {
+      "episode_uuid": "e62c7c59-ef13-4687-8c50-6596ad69e824",
+      "query": "Cross-project contract (verify-retry-failed-only PRD, DF task 2834 D2 producer): DF"
+    },
+    {
+      "episode_uuid": "e645f334-8a42-413b-9f37-55bb44cf51e6",
+      "query": "Task 557 ('Fix regex quality in line-number guards in test_graphiti_quality_433.py')"
+    },
+    {
+      "episode_uuid": "ec418d54-f670-4b96-8d91-4cdde1fd3b58",
+      "query": "Task 2115 (cross-graph entity leak: shared-driver race in add_episode +"
+    },
+    {
+      "episode_uuid": "ed05a104-899a-448f-aa76-ba1974bd99e1",
+      "query": "/unblock task 2247 (W9-γ TerminalReport): the starvation escalation esc-2247-5 was"
+    },
+    {
+      "episode_uuid": "ef2e2e69-7ac2-4703-91fc-823fd1ab88c6",
+      "query": "Decision: when patching eval result files to replace the old"
+    },
+    {
+      "episode_uuid": "ef4b22ec-a156-4d86-8f9d-9a2a0045d1b2",
+      "query": "Task 939 was completed on 2026-04-23 via commit 503bc0c7c0032bb43d47129d5bb13810a53f3311."
+    },
+    {
+      "episode_uuid": "ef6b21ed-dc74-45ca-beb5-40537f5efea3",
+      "query": "Tasks 1020, 1030, 1135, 1142, and 1151 all completed on"
+    },
+    {
+      "episode_uuid": "f0df74d6-35fa-4353-acca-d5b839c62f2c",
+      "query": "As of 2026-07-11: DecisionRecord.update_decision_state() and set_manual_boost() (orchestrator/src/orchestrator/session_registry.py) are protected by"
+    },
+    {
+      "episode_uuid": "f3049884-005b-4ef7-9374-71c3ca1d6184",
+      "query": "The Implementer uses the mark_step_done tool with the plan-tools MCP."
+    },
+    {
+      "episode_uuid": "f4a66746-20a0-48f2-9564-799afc60b766",
+      "query": "Routing κ TRIAGE sub-task (df#2816, deferred) input-replayability spike, run 2026-07-20:"
+    },
+    {
+      "episode_uuid": "f5fc4167-1690-46ad-a007-656f9e0440cf",
+      "query": "Task 1453 diagnosed the recurring fictional-premise tasks in the reconciliation"
+    },
+    {
+      "episode_uuid": "f67d3642-0787-46d4-89f6-282989f881da",
+      "query": "As of 2026-04-24 reconciliation cycle 1621dea8, the fused-memory systemd service"
+    },
+    {
+      "episode_uuid": "f7376806-43e1-494b-a1c1-8b344caf6fbe",
+      "query": "Decision (dark_factory, 2026-06-26): for the 1883 reconcile double-get_task fix in"
+    },
+    {
+      "episode_uuid": "f74a56a6-5f68-4442-9fde-d6d832735394",
+      "query": "Decision (2026-06-09): For reify merge-queue throughput (which is queue-bound: a"
+    },
+    {
+      "episode_uuid": "f8004244-907a-48c5-80e1-d5c4ba9ae4c1",
+      "query": "M2 supervision-quick-fixes PRD (bug-hotspot remediation program 2026-07-06) authored and decomposed:"
+    },
+    {
+      "episode_uuid": "f838f544-61e5-4529-affe-7fb46646e9f0",
+      "query": "run_verification retries on *pure* timeout only — not on real"
+    },
+    {
+      "episode_uuid": "f8c3d814-984d-49ea-a9e2-035ff975e321",
+      "query": "DECISION (recommendation presented 2026-07-13, unopposed): The adaptive-model-routing PRD (plans/adaptive-model-routing-prd.md, authored"
+    },
+    {
+      "episode_uuid": "f917b2fd-ff9e-4e31-a88f-5f85736e653b",
+      "query": "format_snapshot_fact helper in fused-memory/src/fused_memory/reconciliation/stages/memory_consolidator.py:407 has been dead code since task"
+    },
+    {
+      "episode_uuid": "fa50f127-7a45-4c07-b5e4-1077bf4cfae7",
+      "query": "Decision (human-ratified 2026-07-09, filed as dark_factory task 2380): the orchestrator"
+    },
+    {
+      "episode_uuid": "fbd88caa-fb1a-48c0-82ab-509e8a72245f",
+      "query": "Decision (2026-04-17): pytest-jobserver.service seeded with N=32 tokens. Rationale: host is"
+    },
+    {
+      "episode_uuid": "fdab6bf5-0c84-48f3-a430-114c36935be9",
+      "query": "Tier-1 prompt-optimization PRD design forks resolved with Leo 2026-07-12 (PRD"
+    },
+    {
+      "episode_uuid": "fe026793-1ced-4721-be26-525ba7d527a8",
+      "query": "As of 2026-05-15: fairness.scheduler_v2 remains false in orchestrator/src/orchestrator/defaults.yaml (and FairnessConfig"
+    }
+  ],
+  "mem0_known_items": [
+    {
+      "canonical_content_hash": "ebb9d194e83d8039",
+      "canonical_last_known_id": "56b12a6a-d03e-4ca2-9f0f-c45e8bca7385",
+      "held_out": false,
+      "phrasing": "architect already-done report main reachability",
+      "topic": "architect-report-task-already-done-main-reachability"
+    },
+    {
+      "canonical_content_hash": "ebb9d194e83d8039",
+      "canonical_last_known_id": "56b12a6a-d03e-4ca2-9f0f-c45e8bca7385",
+      "held_out": false,
+      "phrasing": "report_task_already_done needs a main-reachable commit",
+      "topic": "architect-report-task-already-done-main-reachability"
+    },
+    {
+      "canonical_content_hash": "ebb9d194e83d8039",
+      "canonical_last_known_id": "56b12a6a-d03e-4ca2-9f0f-c45e8bca7385",
+      "held_out": true,
+      "phrasing": "the planner claimed the work existed but the commit was never merged",
+      "topic": "architect-report-task-already-done-main-reachability"
+    },
+    {
+      "canonical_content_hash": "b33f9f8f2460c253",
+      "canonical_last_known_id": "291042ae-efa7-4b31-9d4c-cb6d326eb37e",
+      "held_out": false,
+      "phrasing": "conventions and gotchas for briefing memory rescope shared query templates scoped task",
+      "topic": "briefing-conventions-area"
+    },
+    {
+      "canonical_content_hash": "b33f9f8f2460c253",
+      "canonical_last_known_id": "291042ae-efa7-4b31-9d4c-cb6d326eb37e",
+      "held_out": false,
+      "phrasing": "conventions and gotchas for shared orchestrator briefing agents queries",
+      "topic": "briefing-conventions-area"
+    },
+    {
+      "canonical_content_hash": "b33f9f8f2460c253",
+      "canonical_last_known_id": "291042ae-efa7-4b31-9d4c-cb6d326eb37e",
+      "held_out": true,
+      "phrasing": "pitfalls when editing how the orchestrator assembles an agent briefing prompt",
+      "topic": "briefing-conventions-area"
+    },
+    {
+      "canonical_content_hash": "c1d4ea8041628de4",
+      "canonical_last_known_id": "a1792a9a-b15e-4c27-b905-77a739267000",
+      "held_out": false,
+      "phrasing": "conventions, norms and gotchas for working in this repository",
+      "topic": "briefing-conventions-generic"
+    },
+    {
+      "canonical_content_hash": "c1d4ea8041628de4",
+      "canonical_last_known_id": "a1792a9a-b15e-4c27-b905-77a739267000",
+      "held_out": true,
+      "phrasing": "what repo-wide working habits should an agent know before editing anything here",
+      "topic": "briefing-conventions-generic"
+    },
+    {
+      "canonical_content_hash": "c1d4ea8041628de4",
+      "canonical_last_known_id": "a1792a9a-b15e-4c27-b905-77a739267000",
+      "held_out": true,
+      "phrasing": "which house rules apply to every change in this codebase",
+      "topic": "briefing-conventions-generic"
+    },
+    {
+      "canonical_content_hash": "2dde0a968c0de55a",
+      "canonical_last_known_id": "5fae4719-75ed-47a4-9a1c-5d2b7485b6c2",
+      "held_out": false,
+      "phrasing": "Briefing memory rescope: shared query templates, scoped task-derived queries, distilled render, loud degradation orchestrator agents",
+      "topic": "briefing-task-semantic"
+    },
+    {
+      "canonical_content_hash": "2dde0a968c0de55a",
+      "canonical_last_known_id": "5fae4719-75ed-47a4-9a1c-5d2b7485b6c2",
+      "held_out": false,
+      "phrasing": "Briefing memory rescope: shared query templates, scoped task-derived queries, distilled render, loud degradation task",
+      "topic": "briefing-task-semantic"
+    },
+    {
+      "canonical_content_hash": "2dde0a968c0de55a",
+      "canonical_last_known_id": "5fae4719-75ed-47a4-9a1c-5d2b7485b6c2",
+      "held_out": true,
+      "phrasing": "what did reworking the memory context handed to dispatched agents actually change",
+      "topic": "briefing-task-semantic"
+    },
+    {
+      "canonical_content_hash": "51a9d5ec99157944",
+      "canonical_last_known_id": "3db6b426-d90d-45af-af9a-1757bdf5d86c",
+      "held_out": false,
+      "phrasing": "escalation read API blast radius",
+      "topic": "escalation-store-ambiguity"
+    },
+    {
+      "canonical_content_hash": "51a9d5ec99157944",
+      "canonical_last_known_id": "3db6b426-d90d-45af-af9a-1757bdf5d86c",
+      "held_out": true,
+      "phrasing": "two callers disagree about where an escalation record actually lives",
+      "topic": "escalation-store-ambiguity"
+    },
+    {
+      "canonical_content_hash": "51a9d5ec99157944",
+      "canonical_last_known_id": "3db6b426-d90d-45af-af9a-1757bdf5d86c",
+      "held_out": false,
+      "phrasing": "which escalation store does a read hit",
+      "topic": "escalation-store-ambiguity"
+    },
+    {
+      "canonical_content_hash": "d150f6f19a6163fd",
+      "canonical_last_known_id": "0929cff6-8efc-4a49-a672-e83f0a41bbfb",
+      "held_out": false,
+      "phrasing": "plan-tools MCP server missing in the eval worktree",
+      "topic": "eval-worktree-plan-tools-missing"
+    },
+    {
+      "canonical_content_hash": "d150f6f19a6163fd",
+      "canonical_last_known_id": "0929cff6-8efc-4a49-a672-e83f0a41bbfb",
+      "held_out": true,
+      "phrasing": "the planning tools are absent from this checkout, what is the ruling",
+      "topic": "eval-worktree-plan-tools-missing"
+    },
+    {
+      "canonical_content_hash": "d150f6f19a6163fd",
+      "canonical_last_known_id": "0929cff6-8efc-4a49-a672-e83f0a41bbfb",
+      "held_out": false,
+      "phrasing": "why is create_plan unavailable when running in an eval worktree",
+      "topic": "eval-worktree-plan-tools-missing"
+    },
+    {
+      "canonical_content_hash": "6ba084f680c41b09",
+      "canonical_last_known_id": "382c0499-75ab-4d4e-a089-1fce525de317",
+      "held_out": false,
+      "phrasing": "editable install shadows the worktree package",
+      "topic": "eval-worktree-venv-shadowing"
+    },
+    {
+      "canonical_content_hash": "6ba084f680c41b09",
+      "canonical_last_known_id": "382c0499-75ab-4d4e-a089-1fce525de317",
+      "held_out": false,
+      "phrasing": "eval worktree conftest shadowing",
+      "topic": "eval-worktree-venv-shadowing"
+    },
+    {
+      "canonical_content_hash": "6ba084f680c41b09",
+      "canonical_last_known_id": "382c0499-75ab-4d4e-a089-1fce525de317",
+      "held_out": true,
+      "phrasing": "imports resolve to the wrong checkout when both trees are installed",
+      "topic": "eval-worktree-venv-shadowing"
+    },
+    {
+      "canonical_content_hash": "1b569e4d8388549d",
+      "canonical_last_known_id": "8b4af703-ece4-4439-8bcd-316e256522a4",
+      "held_out": false,
+      "phrasing": "committing a single path under contention",
+      "topic": "git-conventions"
+    },
+    {
+      "canonical_content_hash": "1b569e4d8388549d",
+      "canonical_last_known_id": "8b4af703-ece4-4439-8bcd-316e256522a4",
+      "held_out": false,
+      "phrasing": "git commit --only pathspec error",
+      "topic": "git-conventions"
+    },
+    {
+      "canonical_content_hash": "1b569e4d8388549d",
+      "canonical_last_known_id": "8b4af703-ece4-4439-8bcd-316e256522a4",
+      "held_out": true,
+      "phrasing": "staging one file while another process is writing the index",
+      "topic": "git-conventions"
+    },
+    {
+      "canonical_content_hash": "8f6a0c77220163bd",
+      "canonical_last_known_id": "fea3f9ad-7826-44b5-b26f-83f43a0641a5",
+      "held_out": true,
+      "phrasing": "an entry argued from a benchmark that nobody can reproduce",
+      "topic": "memory-hygiene"
+    },
+    {
+      "canonical_content_hash": "8f6a0c77220163bd",
+      "canonical_last_known_id": "fea3f9ad-7826-44b5-b26f-83f43a0641a5",
+      "held_out": false,
+      "phrasing": "how should a procedural memory justify its guidance",
+      "topic": "memory-hygiene"
+    },
+    {
+      "canonical_content_hash": "8f6a0c77220163bd",
+      "canonical_last_known_id": "fea3f9ad-7826-44b5-b26f-83f43a0641a5",
+      "held_out": false,
+      "phrasing": "memory hygiene norm for performance claims",
+      "topic": "memory-hygiene"
+    },
+    {
+      "canonical_content_hash": "a87fa4f3b2ec59ce",
+      "canonical_last_known_id": "b7c59390-0c58-4e4d-8961-8fc0dc6a2dde",
+      "held_out": false,
+      "phrasing": "patch the import site not the definition site",
+      "topic": "patch_import_site_testing"
+    },
+    {
+      "canonical_content_hash": "a87fa4f3b2ec59ce",
+      "canonical_last_known_id": "b7c59390-0c58-4e4d-8961-8fc0dc6a2dde",
+      "held_out": true,
+      "phrasing": "the stub was installed but the code under test still called the real thing",
+      "topic": "patch_import_site_testing"
+    },
+    {
+      "canonical_content_hash": "a87fa4f3b2ec59ce",
+      "canonical_last_known_id": "b7c59390-0c58-4e4d-8961-8fc0dc6a2dde",
+      "held_out": false,
+      "phrasing": "why did my monkeypatch silently stop taking effect",
+      "topic": "patch_import_site_testing"
+    },
+    {
+      "canonical_content_hash": "beff63cfad8bac7b",
+      "canonical_last_known_id": "34bc000d-6a0b-4177-b817-a75919c7fc30",
+      "held_out": true,
+      "phrasing": "a gate that actually altered the outcome rather than rubber-stamping it",
+      "topic": "prd-gates"
+    },
+    {
+      "canonical_content_hash": "beff63cfad8bac7b",
+      "canonical_last_known_id": "34bc000d-6a0b-4177-b817-a75919c7fc30",
+      "held_out": false,
+      "phrasing": "has a design-invariant walk ever changed a design",
+      "topic": "prd-gates"
+    },
+    {
+      "canonical_content_hash": "beff63cfad8bac7b",
+      "canonical_last_known_id": "34bc000d-6a0b-4177-b817-a75919c7fc30",
+      "held_out": false,
+      "phrasing": "worked example of the prd G6 premise check",
+      "topic": "prd-gates"
+    },
+    {
+      "canonical_content_hash": "0788efd4a9fca4a1",
+      "canonical_last_known_id": "8bb3eb15-1133-4e7b-ac1f-5bac10329b51",
+      "held_out": false,
+      "phrasing": "how do I force a test to run serially under xdist",
+      "topic": "pytest-xdist-serial-override"
+    },
+    {
+      "canonical_content_hash": "0788efd4a9fca4a1",
+      "canonical_last_known_id": "8bb3eb15-1133-4e7b-ac1f-5bac10329b51",
+      "held_out": true,
+      "phrasing": "one test must not share a worker with the rest of its file",
+      "topic": "pytest-xdist-serial-override"
+    },
+    {
+      "canonical_content_hash": "0788efd4a9fca4a1",
+      "canonical_last_known_id": "8bb3eb15-1133-4e7b-ac1f-5bac10329b51",
+      "held_out": false,
+      "phrasing": "orchestrator pytest-xdist gotcha",
+      "topic": "pytest-xdist-serial-override"
+    },
+    {
+      "canonical_content_hash": "2f558d78052d67d1",
+      "canonical_last_known_id": "c64c22ca-2610-4122-b61b-c6eb3c661a6e",
+      "held_out": false,
+      "phrasing": "importlib relative import gotcha in tests",
+      "topic": "pytest_importlib_relative_import_gotcha"
+    },
+    {
+      "canonical_content_hash": "2f558d78052d67d1",
+      "canonical_last_known_id": "c64c22ca-2610-4122-b61b-c6eb3c661a6e",
+      "held_out": false,
+      "phrasing": "pytest conftest module name collision",
+      "topic": "pytest_importlib_relative_import_gotcha"
+    },
+    {
+      "canonical_content_hash": "2f558d78052d67d1",
+      "canonical_last_known_id": "c64c22ca-2610-4122-b61b-c6eb3c661a6e",
+      "held_out": true,
+      "phrasing": "two test packages with the same basename collided at collection time",
+      "topic": "pytest_importlib_relative_import_gotcha"
+    },
+    {
+      "canonical_content_hash": "e4064af2d35b0d83",
+      "canonical_last_known_id": "696e1816-f681-400a-9e3e-3686da53c8f6",
+      "held_out": true,
+      "phrasing": "budgeting for the memory-sync pass on a quiet day",
+      "topic": "reconciliation_cost_model"
+    },
+    {
+      "canonical_content_hash": "e4064af2d35b0d83",
+      "canonical_last_known_id": "696e1816-f681-400a-9e3e-3686da53c8f6",
+      "held_out": false,
+      "phrasing": "reconciliation token cost model",
+      "topic": "reconciliation_cost_model"
+    },
+    {
+      "canonical_content_hash": "e4064af2d35b0d83",
+      "canonical_last_known_id": "696e1816-f681-400a-9e3e-3686da53c8f6",
+      "held_out": false,
+      "phrasing": "what does a reconciliation run cost",
+      "topic": "reconciliation_cost_model"
+    }
+  ],
+  "mem0_snapshot": {
+    "excluded_empty": 0,
+    "point_count": 31237,
+    "sha256": "7114411c67aaec1e60eea176465c167413723e2712e48e9ff3d5834c6f0359b7",
+    "source": "fused_dark_factory"
+  },
+  "query_words": 10,
+  "reference": {
+    "edge_count": 3101,
+    "graph": "evalmem_lme_ref_incumbent_a",
+    "node_count": 1834,
+    "topology_hash": "56de651d10aff70b81e78911cc125eb8be0e81a254a856ef8e3c923c01a9085f"
+  },
+  "schema_version": 1,
+  "transcript": {
+    "path": "corpus-20261009T091224Z.jsonl",
+    "queries": [
+      "architect max_turns plan.json salvage finalized completion pass revalidation skip",
+      "MergeProvenance consume landed outbox prune static façade train tip",
+      "derive_modules files_to_modules test divergence directory alpha strip lock_depth same-module pair",
+      "eval diff get_diff callers error handling swallow try/except judge compare rereview",
+      "eval get_diff reads .task/metadata.json but production writes .task-meta relocation empty diff",
+      "_StubMcpSession eval stub dispatch_tool branch tripwire scheduler",
+      "ruff isort import ordering shared package first-party third-party orchestrator tests",
+      "_StubMcpSession eval stub dispatch_tool literal parity tripwire scheduler branches",
+      "EVAL_PROFILE extending non-bool entry parity tripwire test_eval_profile documented keys",
+      "running orchestrator tests in worktree venv vs main checkout; orchestrator asyncio_mode pytest marker",
+      "eval boundary suite quality_from_review_artifact scoring substrate Phase-1",
+      "flaky timing tests full-suite parallel load test_workflow_cancellation test_laptop_warm_verify_boundary heartbeat timeout",
+      "collect_metrics hermetic test harness MagicMock workflow patch run_verification eval",
+      "eval fixture cohort-scoped audit band revival-zeta; evals/scoring.py contract-agnostic P4 recovery scoring",
+      "orchestrator pytest xdist addopts no:xdist unrecognized arguments",
+      "reviewer_trial CLI command local imports patching test convention",
+      "running orchestrator pytest xdist addopts -p no:xdist unrecognized arguments",
+      "orchestrator pytest xdist addopts no:xdist unrecognized arguments",
+      "eval-revival codex pi candidate bundles configs.py additive selector pattern",
+      "eval Phase-4 candidate bundle selector get_config_by_name additive EVAL_CONFIGS",
+      "narrowing pass plan tightening empty branch work already on main report_task_already_done",
+      "pre-commit hook only runs ruff pyright checks on main branch",
+      "WIP auto-commit safety net before rebase not verified by pre-commit hook pyright gaps",
+      "prompt_opt run_optimization_loop split_corpus minimum corpus size selection test split ValueError 2:1:7",
+      "default_artifacts_root normalization resolve prompt artifact guard",
+      "metadata.files persisted only on module change handle_blast_radius_expansion scope invariant tripwire granularity",
+      "files_to_modules lock_depth module derivation path components test",
+      "REVIEWER_COMPREHENSIVE output_schema StructuredOutput verdict_tools role reuse structured output failure",
+      "orchestrator pytest async tests asyncio_mode marker rootdir subproject",
+      "VIRTUAL_ENV mismatch uv run worktree wrong package resolves to main checkout",
+      "eval-gated adoption task prerequisite live eval campaign not reproducible in worktree verdict recorded before code steps",
+      "eval C4 composite table architect rows quality 0.0 tests_pass gate",
+      "orchestrator.yaml verify-command config vs dark-factory-orchestrator.yaml models hot-reload flip target",
+      "scripts/ changes verified by root tests/scripts via scripts/orchestrator.yaml",
+      "module_tagger haiku trial live run sample size eligible done tasks metadata.files",
+      "standalone script invoke_agent Not logged in oauth_token CLAUDE_OAUTH_TOKEN account pool",
+      "re-scoped task stale plan.json pending step contradicts ratified decision implementer escalate",
+      "restart after task description amendment re-dispatches implementer with stale plan.json architect not re-run",
+      "pyright test cast SimpleNamespace duck-typed self unbound method mock assertion call_args",
+      "architect plan revalidation branch already rebased implemented run tests coherence check",
+      "adaptive routing Phase 4 rule defaults.yaml resolver simple_saturated min_routing_tier no routing.py change",
+      "model_role_rollup turn_cap_saturation run_id scope digest.py",
+      "FakeScheduler update_task metadata_mode routing integration test rig",
+      "run_scoped_verification side_effect merge phase workflow.run additional verify call StopIteration",
+      "orchestrator tests conftest _isolate_orch_config ORCH_CONFIG_PATH code_default_config operational yaml vs defaults.yaml",
+      "monkeypatch orchestrator.workflow.invoke_agent fake agent runner integration gate rig _workflow_helpers _derive_meta_root_like_production autouse import by name",
+      "worktree python import resolves to main checkout editable install conftest sys.path pytest",
+      "route review suggestion subset to curator ReviewAggregation _route_review_suggestions_to_curator",
+      "roles.py submit_only_instructions definition order module-level constant append system_prompt",
+      "worktree python import resolves to main checkout installed package not worktree src",
+      "_safe_close asyncio.wait_for timeout budget vs resource-raised TimeoutError classification shutdown",
+      "testing fire-and-forget asyncio task tracked in set with done-callback discard timing AsyncMock",
+      "pyright parameter name mismatch assigning callable to typed method attribute in tests",
+      "config hot-reload leaf diff _iter_leaves Optional submodel KeyError pydantic",
+      "worktree python import resolves to main checkout editable install PYTHONPATH pytest",
+      "GitOps constructor receives GitConfig not OrchestratorConfig config wiring",
+      "scripts/legibility tests monkeypatch import inventory bare vs from legibility import double module object",
+      "stdlib-only ops script mirror orchestrator config default drift-guard test convention",
+      "pathlib Path.is_file is_dir swallows ENOENT re-raises other OSError testing never-raise stat guard",
+      "transcript archive mtime skip idempotent gzip plain jsonl gotcha",
+      "directory-scoped verify test_command per-package orchestrator.yaml uv run --directory relative to repo root",
+      "boundary gate test rows land green on first run over already-integrated code, mutation check to prove not a tautology",
+      "patch create=True mock target not yet imported TDD RED test",
+      "pyright AsyncMock cast mocked method type error await_args call_args MethodType",
+      "run-scoped event store reader fetch_events_by_type cross-run durability fleet redeploy prior run_id",
+      "_get_head_commit returns empty string on failed git rev-parse fail-closed guard",
+      "orchestrator pytest single test xdist -n0 addopts invocation",
+      "run-scoped fetch_events_by_type vs all-runs reader durable event cross-restart consumer",
+      "SchedulerFacade Protocol adding method requires updating FakeScheduler test doubles conformance",
+      "SchedulerFacade Protocol conformance FakeScheduler adding member requires updating doubles",
+      "merge-phase stamp workflow note_merge_phase_entered merge_retry_pending durable",
+      "MagicMock side_effect distinguishing bare vs keyword call to force RED test for added kwarg dedup gate",
+      "test abandoned merge request halt early-out SpeculativeMergeWorker advance_main",
+      "git_ops _run subprocess helper stdin input git patch-id equivalent commit remap",
+      "ensure_lane_plan_symlink single-sources plan.json lane .task iterations.jsonl meta-root symlink",
+      "narrowing pass all files flagged branch zero commits work already on main report_task_already_done",
+      "worktree .task/plan.lock never exists in production meta-root single-sourced reconciliation applier",
+      "_make_workflow init drops base_commit reconcile no-op test false-green",
+      "adding new public submodule to shared package requires updating test_public_api.py __all__ enumeration",
+      "dashboard tests conftest rootdir worktree shared/src sys.path editable install new submodule ModuleNotFoundError",
+      "flaky tests under parallel load xdist worker crash node down proc_group SIGKILL reap timing",
+      "dashboard tests own pyproject pytest rootdir conftest front-load worktree shared/src new shared module ModuleNotFoundError",
+      "flaky merge worker concurrency test xdist parallel dispatch race claimant heartbeat leak",
+      "flaky timeout test_concurrent_verify_boundary test_atomic_train_merge asyncio wait_for xdist CPU starvation",
+      "fused-memory pytest-timeout xdist worker deadlock max-worker-restart verify flake",
+      "pytest xdist -n auto worker timeout host contention verify flake unknown_test_failure",
+      "live_workflow_detector consumers recon write guard renderer funnel is_workflow_live_for_task",
+      "per-module orchestrator.yaml merge-verify test_command --timeout pytest 60s flaky node down",
+      "architect resume worktree HEAD already contains committed implementation not on main produce plan vs report_task_already_done",
+      "write_agent_session signature spy test_liveness_boundary_gate sidecar",
+      "fail-safe JSON reader artifacts.py returns None on corrupt must also guard int coercion from_mapping ValueError",
+      "test LogRecord extra attribute getattr pyright ruff B009 caplog structured fact",
+      "integration marker deselects tests from merge-verify no -m integration lane coverage gap",
+      "de-flake async test replace fixed asyncio.sleep with bounded loop.time() poll under CPU contention",
+      "shared _fm_helpers Qdrant test scaffolding ensure_fresh_collection collection_vector_size de-flake xdist",
+      "shared package public API __all__ test_public_api registration submodule contract",
+      "session-resume resume_count increment workflow _pending_resume_count guarded injection harness",
+      "silent_fallthrough_allowlist qualname content hash rename function breaks gate",
+      "bare python import fused_memory imports main checkout not worktree source .pth editable",
+      "predicate task execution_class code_tdd always_escalates coercion recon",
+      "orchestrator full test suite sharding pytest -n auto 300s timeout background",
+      "scheduler_overrides.db project_root normalization resolve_main_checkout reader reconciliation",
+      "get_pin_queue pinned=1 filter vs full scheduler_overrides table priority-override edges",
+      "delivered-check gate reblock recurrence held-tick cache main_sha stale masking defect 2728 2730 2732",
+      "delivered check cache FAILED sticky monotone-safe caching",
+      "reblock_guard escalation_created event emission missing harness born-at-L2",
+      "execution_class operational task reaching TDD architect unactionable Mem0 consolidation routing deterministic coercion",
+      "GitOps self.config is GitConfig not OrchestratorConfig transcript_archive wiring harness",
+      "orchestrator pytest xdist -k name filter no tests ran node id selection",
+      "stranded in-progress sweep CANDIDATE mode found_on_main foreign commit branch tip attribution _resolve_branch_state",
+      "_run_inflight_verify cancellation orphaned _run_post_merge_verify task",
+      "orchestrator pytest xdist addopts -n0 run tests serially",
+      "scripts/ not in pyright include scope isolated pyright false import errors",
+      "reconcile stranded test ON_MAIN provenance commit sha find_task_citation_commit resolve_branch_sha",
+      "_reconcile_one_stranded MARK_DONE_WITH_PROVENANCE downgrade guard degenerate effect-present delivered_checks",
+      "simple_task routing per-role default lockstep config.py defaults.yaml roles.py",
+      "simple_task per-role config resolution defaults.yaml config.py lockstep resolve_route budgets max_turns",
+      "escalation server.py runtime reverse import orchestrator MergeRequest construction boundary",
+      "pyright worktree VIRTUAL_ENV uv run cross-package import resolution false error",
+      "escalation-watcher-auto WATCHER_ALLOWED_TOOLS git cat-file diff-tree merge-base permission",
+      "execution_class typed field task_metadata vs middleware guard operational_mode",
+      "submit_task deterministic_task_error runs before inject_operational_routing operational before_done always_escalates rejected before coercion",
+      "middleware guard reuse TaskInterceptor staticmethod lazy import circular import fused-memory submit_task inject chain",
+      "ruff isort I001 blank line before comment preceding import",
+      "recon Stage 1 cannot submit_task DISALLOW_TASK_WRITES tool grants",
+      "mark_step_done commit sha abbreviated git commit hash",
+      "reconciliation escalation queue_dir mismatch orchestrator data/escalations vs data/reconciliation/escalations get_pending_escalations empty",
+      "EscalationQueue archive listing cache staleness cross-process get returns None",
+      "EscalationQueue archive listing memo staleness cross-process",
+      "D1 .task-meta relocation drift eval runner resume plan.json",
+      "eval runner --worktree resume plan.json .task-meta relocation D1 drift",
+      "resolve_project_id pure no-I/O basename derivation registry builders rename-stable declared project_id",
+      "flaky timing test tests/scripts subprocess timeout blocks unrelated task verify",
+      "build_composite_report composite is cost-normalized cheaper config advantaged confound",
+      "test_spawn_claude failed-to-start flaky timing SPAWN_STARTED_GRACE_SECS concurrent load",
+      "autopilot_video contamination ceiling guardrail Stage 2 update after creating tasks",
+      "GNU touch mtime settle helper de-flake create utimensat race",
+      "marker mtime settling race touch create utimensat xdist flake wait_for_marker",
+      "SEMAPHORE_TIMEOUT classifier _classify_environmental veto INFRA_TRANSIENT_CATEGORIES sole producer",
+      "verify_classify.py self-contained duplicate regex names verify.py cross-module convention",
+      "RemoteRunner archive passing remote merge-verify pass-summary auditability",
+      "test_merge_queue_main_health autouse fixture _BASELINE_FAILING_IDS_CACHE vs _PROBE_CACHE clearing baseline cache",
+      "get_statuses unknown sentinel fail-open ACTIVE_TASK_STATUSES vs TERMINAL gate",
+      "build_eval_orch_config test double signature monkeypatch eval memory isolation",
+      "Stage-3 reconciliation false-positive suppression per-project policy filter flag_dedup IntegrityCheck",
+      "pytest xdist parallelism real subprocess killpg tests signal sibling workers",
+      "fcntl flock same inode independent fd self-conflict lane lock reset merge-verify",
+      "CLI verify-merge span holding lane lock self-conflict reset_persistent_merge_worktree acquire_host_verify_worktree",
+      "verify_classify rustc couldn't read No such file or directory ambiguity false positive",
+      "reify data/verify-logs archive external inline grounded constants classifier replay",
+      "worktree absolute path Read Edit tool edits main checkout instead of worktree scope lock",
+      "narrowed retry partial per-test map warm shadow baseline phantom divergence",
+      "worktree python -c import resolves against main checkout editable install not worktree source PYTHONPATH",
+      "merge_verify event emission runs.db generic JSON data column VerifyRunnerPool.dispatch",
+      "Path.read_text UnicodeDecodeError guard except OSError file read degrade None",
+      "verify.py run_scoped_verification task_files existing_files deletions on-disk filter",
+      "orchestrator pytest xdist no:xdist addopts unrecognized arguments",
+      "test_laptop_warm_verify_boundary.py flaky watchdog env override timing under full suite load",
+      "pyright reportMissingImports false positive fallback file-scoped repo root test file not owned by subproject",
+      "EscalationQueue submit durability fsync non-durable atomic write vanished pending escalation",
+      "EscalationQueue submit durability fsync seq counter",
+      "eval framework relocated .task-meta plan.json D1 relocation drift legacy .task worktree",
+      "build_eval_orch_config monkeypatch stub keyword-only signature test_eval_memory_isolation",
+      "escalation MCP server hosted in orchestrator process port 8102 standalone service restart",
+      "eval verify UV_PYTHON pin worktree .python-version setup uv sync interpreter split",
+      "monkeypatch create_eval_worktree hermetic test run_architect_eval snapshots module attribute",
+      "merge_queue ItemLifecycle transition hardcoded from_state re-entry tolerant _note_requeue current()",
+      "warm-lane acquire routes shared tail reseed verification BranchResetError guard",
+      "shared package __all__ pinned exact set test_public_api new public symbol excluded AccountLease",
+      "usage_gate config_models __all__ pinned exact set test_public_api byte-equivalence",
+      "deterministic cap-hit test invoke_with_cap_retry max_cap_retries heuristic AllAccountsCappedException",
+      "invoke_slot gate mock factory scope kwarg compat test _FakeGate make_gate_mock",
+      "usage gate model-scoped caps scope-wait mechanism open question resolution fable",
+      "scoped per-attempt verify only runs touched test file misses cross-file breakage in other tests",
+      "scoped file-level verify masks cross-file test double mock signature breakage when shared API changes",
+      "CAP_HIT_PREFIXES cap-hit stderr message classification real UsageGate detect_cap_hit",
+      "claude-fable-5 not in allowed_models resolver test model-capacity-exhausted vs model-not-in-allowlist ordering",
+      "decision record INV-2 raw observation vs interpretation citing prior campaign statistics",
+      "eval campaign artifacts gitignored evals/results main checkout not in worktree",
+      "architect eval cell plan_steps plan quality vs outcome done metric planRate",
+      "eval results directory contains cells from multiple campaign waves; filter by mtime wave when analyzing per-fixture",
+      "eval campaign raw dump JSON schema flat vs per-cell result JSON metrics nested run_id",
+      "score_plan_structure plan_quality floor no-plan cell scoring",
+      "make_gate usage gate test helper wait_for_reset default divergence cap_retry scope suites",
+      "handle_blast_radius_expansion persist metadata.files pure widen gated on stale under-locking restart",
+      "git merge-base --is-ancestor exit code fail-open rc 1 rc 128 ancestor filter merge skew",
+      "audit_found_on_main_provenance CITATION_PATTERN duplicate of orchestrator citation pattern",
+      "merge-skew classifier integration_skew harness-ratchet failing_tests discriminator",
+      "merge_verify_lease flock per-lane holder-pgid global worktree_base lane_lock_path",
+      "uv creates venv at subproject path when UV_PROJECT_ENVIRONMENT scrubbed cd subproject uv sync",
+      "eval worktree python pin pre_task_commit .python-version 3.14t 3.13 setup verify",
+      "eval runner executor capturing test build_eval_orch_config _Sentinel try block short-circuit",
+      "eval worktree EVAL_VERIFY_EXTRA_DEPS aiosqlite provision cross-member dep pytest collection",
+      "recover_red_main reify non-fast-forward guard bypass sanction main gate",
+      "reference-transaction hook exit 0 abort transaction git",
+      "pyright MagicMock return_value MethodType attribute error test mocking",
+      "default-off warm_lane_* knobs omitted from defaults.yaml rely on Field default False",
+      "warm-lane pool lazy provisioning lanes materialize on demand create-once",
+      "eval null sentinel fused-memory URL McpSession 120s fm_retry retry overhead",
+      "eval worktree relocated outside repo relative_to REPO ValueError eval_worktree_root",
+      "merge verify adoptable verdict role merge is_merge_verify discriminator run_scoped_verification",
+      "python -c imports orchestrator from main checkout not worktree editable install pytest",
+      "RemoteRunner test harness fake_run transport VerifyRunnerPool merge-verdict-integrity capstone doubles",
+      "merge_queue concurrent verify cascade tests flaky timeout under xdist parallel load",
+      "unit test head-failure cascade _verifier_loop inline drive pre-populate _inflight",
+      "reach-back patch guard ALLOWLIST merge_queue satellite module monkeypatch",
+      "escalation resolve dismiss close_only avoids blocked to pending re-pend WORKFLOW_NONE",
+      "pytest xdist worker crashed slow real-git test 60s timeout os._exit @pytest.mark.timeout diagnosis",
+      "running tests in worktree PYTHONPATH editable install resolves main checkout",
+      "found_on_main mark-done test wiring git_ops mocks validate_landing_evidence CANDIDATE mode",
+      "spawn-claude.sh record.prompt original prompt before result-handback trailer appended",
+      "pyright httpx import could not be resolved scripts/legibility lazy import _default_poster",
+      "fused-memory pre-commit ruff check lint vs ruff format not enforced verification gate",
+      "ruff isort I001 combine-as-imports aliased import split function-level noqa PLC0415",
+      "fused-memory pytest test collection slow import timeout graphiti",
+      "test_lock_charter_guard extension drift guard reify sibling repo stale lane base unrelated failure",
+      "lock-charter extension drift guard reify cross-repo live checkout stale lane base failure",
+      "MemoryConsolidator.run test real ReconLedgerStore AsyncMock edge sweep coroutine not iterable swallowed",
+      "recon_report finding field must be added to combined_flag projection to reach Stage 2 payload",
+      "recon_report_systemic combined_flag projection drops fields re-keying Stage 2 payload _format_flagged",
+      "recon_self_model import-light invariant prompt path aiosqlite recon_ledger",
+      "dry run creates the file it gates on; existence check disarmed by store initialize mkdir CREATE TABLE IF NOT EXISTS",
+      "pyright scripts directory excluded from include, scoped verify catches errors unscoped run misses",
+      "one-shot migration script silently creates an empty SQLite ledger from a relative data_dir and reports success; gate --apply on the target existing",
+      "pyright narrowing is_full_uuid TypeGuard bool predicate isinstance str guard",
+      "dry run creates the state its apply gate reads self-disarming preflight",
+      "pyright type narrowing issubclass assert breaks later attribute access in test",
+      "reconciliation data_dir relative path CWD-dependent script creates empty parallel ledger database",
+      "capability manifest verified live row drift re-measure before planning backfill",
+      "OS sandbox compute_write_set writable_extras call-site wiring workflow α3",
+      "_invoke_probe duplicated test pins sandbox wiring test_workflow_state_machine_boundary row-12 writable_extras",
+      "WIP safety commit before inter-iteration rebase implementer pre-flight check",
+      "landlock _add_path skips non-existent writable dirs; denial target parent must exist for EACCES not ENOENT; sandbox test scaffold",
+      "running orchestrator pytest asyncio_mode auto worktree invocation",
+      "create_worktree idempotent git config per-worktree site core.hooksPath gc.auto",
+      "orchestrator _invoke sandbox fail-closed test mock landlock bwrap backend none",
+      "escalation_created event data payload summary reason category fields heterogeneous",
+      "refs/heads/main moving target live fleet ref comparison bracket before after",
+      "grep -c marker line count report embedded script false positive containment probe acceptance check",
+      "mark_step_done prerequisite measurement-only no code change which commit sha",
+      "Bash tool git diff output compacted or summarized, hunks missing; use command git --no-pager diff to see the raw unified diff",
+      "fleet census orchestrator config roots solar-challenge project root path DASHBOARD_KNOWN_PROJECT_ROOTS registry",
+      "pydantic config model default disagrees with defaults.yaml deep merge; extra ignore silently drops typo'd config keys in tests",
+      "landlock syscall numbers x86_64 architecture aarch64 arm64 support",
+      "slow YAML parse whole repo sweep confusion-codebook.yaml test cost",
+      "architect replan step type for deleting a test: impl vs test, implementer confirms test steps fail",
+      "plan.json done step commit SHA stale after rebase, not ancestor of HEAD, orchestrator remaps via find_equivalent_commit patch-id",
+      "sweep_orphan_flag_markers terminal-drain project scoping cross-project deletion",
+      "build_known_projects_map primary root seeded DASHBOARD_KNOWN_PROJECT_ROOTS unset one-entry map",
+      "DASHBOARD_KNOWN_PROJECT_ROOTS not in .env, only in installed fused-memory.service unit; scripts resolving project registry collapse to dark_factory",
+      "systemd user timer Persistent=true boot catch-up minimal PATH uv not found status 127",
+      "build_known_projects_map Path.resolve non-strict nonexistent root admitted project_id registry",
+      "systemd unit does not inherit fused-memory.service environment DASHBOARD_KNOWN_PROJECT_ROOTS single project sweep",
+      "test_harness run_loop driven loop timing spins cycles mocked run_full_cycle grace",
+      "judge halt cooldown_until semantics; get_queue_stats durable write queue vs reconciliation backlog current_backlog probe",
+      "pyright type-check verify command uv run vs npx in worktree",
+      "how to load FusedMemoryConfig config.yaml CONFIG_PATH entrypoint no load_config function",
+      "bare import subprocess baseline timing test flake CLI overhead",
+      "patch _run_post_merge_verify directly instead of run_scoped_verification to avoid racing test budget with real git work",
+      "git worktree remove fails admin dir removed leaves tree rmtree fallback merge teardown",
+      "acquire_merge_verify_flock non-blocking try-acquire timeout zero worktree removal lease",
+      "merge-verify flock lock file never unlinked leak glob assertion",
+      "worktree namespace classifier is_lane infra merge crash recovery orphan reaper prefix",
+      "pytest xdist exact node id no tests ran orchestrator -n0 targeted run",
+      "decide_c3_submit_action C3 disposition table shared submit recovery path",
+      "Bash tail cat wc large file AST nodes parse limit test_merge_queue",
+      "merge_request MCP path retention ring TerminalOutcomeRetention not threaded coalesce_or_enqueue Tier-2",
+      "make_placeholder_future used inside recover_pending_merges seeded MergeRequest journal test",
+      "recovery harness real GitOps rebind worktree_base crash recovery test fixture pattern",
+      "cross-device link cargo target tmp test_atomic_train_merge sandbox environment",
+      "merge reaper RESOURCE_AUDIT_WORKTREE_GRACE_SECS grace window test back-date mtime vacuous",
+      "merge verify in-flight concurrency count _inflight finalize head popped before verify awaited",
+      "worktree venv python editable install main checkout tests wrong module",
+      "review finding in files outside task scope sibling branch contamination wrong branch base warm worktree",
+      "wm_window_id decimal hex WINDOWID wmctrl focus is_alive canonicalize",
+      "running pytest in worktree imports main checkout editable install PYTHONPATH",
+      "plan.json step commit SHAs stale after rebase re-stamp mark_step_done",
+      "wm_window_id canonicalization mirrors padded unpadded hex session_hooks session_registry cockpit wm normalize",
+      "sweep script leaked tool-call parameter name XML fragment task description corruption detector",
+      "flock contention timing test baseline import cost subtraction verify-merge load flake",
+      "baseline subtraction discriminant timing test docstring overclaim same-shape",
+      "baseline subprocess shape mismatch subtract import cost flaky test wall clock",
+      "same-shape baseline de-flake helper seam injection unit test task 2819",
+      "FastMCP stdio server startup banner PyPI update-check network call MCP_TIMEOUT dropped",
+      "Bash cat output of Python file strips comments; use Read tool or sed",
+      "cross-cycle streak counter persistence substrate reconciliation ledger payload journal recompute",
+      "MemoryConsolidator filter chain runs only under if report.items_flagged zero-flag cycle skipped",
+      "bash cat shadowed shell function strips comments from python files",
+      "patch_content_contained fail-open git cherry WorktreeMissing exception test stub",
+      "reachback ratchet monkeypatch orchestrator.merge_queue private public helper patch_content_contained",
+      "escalation.dedupe submit_or_dedupe content fingerprint pattern for new escalator",
+      "_make_test_harness builds UsageGate by default usage_gate test fixture",
+      "Qdrant missing collection 404 doesn't exist error detection",
+      "npx pyright fails sandbox EACCES npm cache use venv binary",
+      "pyright test mock assert_not_called type ignore attr-defined UnexpectedResponse httpx.Headers",
+      "Qdrant missing collection 404 UnexpectedResponse scroll_by_metadata un-provisioned project mem0 auto-creates collection",
+      "shipped config test explicit value equals schema default raw-text assertion pin in-file presence",
+      "legibility census claude CLI invoke timeout coder _invoke_cli 120s verify synthesis",
+      "streamable-HTTP MCP 406 Accept header text/event-stream legibility posters httpx",
+      "_target_subprocess_env ORCH_ env leak into target verify subprocess pydantic-settings namespace",
+      "verify subprocess env scrub ORCH_ namespace isolation target project",
+      "restart-all-orchestrators.sh restart_and_verify verify timeout grace test which tests FAILED path",
+      "fake systemctl drift guard verbatim boundary FAKE_SYSTEMCTL_SRC restart-all-orchestrators tests coupling",
+      "test_stages.py subprocess not imported at module level side_effect closure NameError",
+      "_make_test_harness hard-coded project_root /tmp/test-project test isolation filesystem reads",
+      "live_workflow_detector consumers must pass identical kwargs status task_kind pure_gate corroborated",
+      "_sweep_stale_mem0_pool enum_filters generalization flag_for_stage2",
+      "_sweep_stale_mem0_pool shared skeleton enum_filters override source filter",
+      "test_boundaryN naming scheme orchestrator watchdog boundary suite fixed 1-10 numbering",
+      "fake systemctl drift guard duplicate copies restart-all-orchestrators test",
+      "ruff format --check wrapper orchestrator repo",
+      "plan.json not regenerated after branch archive rescope ratified decision orphaned step commit",
+      "bwrap mount argument order /dev/null ro-bind",
+      "bwrap breakage legacy-passthrough os-sandbox worktree-containment PRD",
+      "bwrap breakage details what broke Bun kernel segfault user namespace",
+      "/var/tmp PermissionError agent sandbox scope test_landlock verify",
+      "steward regenerates plan.json directly during escalation, resumed implementer calls mark_step_done to register through sanctioned tool path",
+      "test_git_ops.py TestRunCancellationReapsChild flaky timeout child never started",
+      "xdist full suite flaky test subprocess timeout under load orchestrator",
+      "debugger agent sandbox write-set /var/tmp not writable landlock full test suite rerun false failures",
+      "var/tmp permission denied test running inside sandboxed agent session landlock verification",
+      "test_coalesce_integration_gate flaky worker crashed xdist",
+      "/var/tmp permission denied cross-device link EXDEV pytest full suite host flake",
+      "worker gwNN crashed while running quoted message format not matching _XDIST_WORKER_CRASH_RE regex gap",
+      "landlock grants only existing paths compute_write_set pure no makedirs pre-create writable extra",
+      "delivered-check cache terminal dep record cache staleness in-place metadata edit descriptor digest",
+      "git stash worktree .worktrees gitignored parent directory project_root",
+      "MemoryConsolidator.run always-present stat key requires updating exact report.stats assertion in test_stages TestProjectIdValidation",
+      "ruff SIM300 Yoda condition uppercase constant comparison in assert",
+      "patching BaseStage.run in reconciliation stage tests seam",
+      "citation_verifier stage1 prefix stats BaseStage.run patch seam reconciliation stage tests",
+      "phantom-done gate flags declared file untouched because fix hoisted into shared base class; architect narrowing pass",
+      "patch run_stage_via_cli instead of BaseStage.run reconciliation stage tests",
+      "recon_report cite_memory citation entry shape metadata_fingerprint cited_memories dict fields",
+      "recon_report get_assembled_report projection mutation does not persist; patching BaseStage.run bypasses post-processing in tests",
+      "pipefail grep -q SIGPIPE broken pipe footgun in bash installer scripts systemctl list-timers verification",
+      "subprocess timeout TimeoutExpired not OSError best-effort never-raise git wrapper fail-safe",
+      "_mock_scheduler get_task returns snapshot deterministic_runner test fresh read override",
+      "uv run worktree test venv PYTHONPATH cross-device rename failure",
+      "two LaneState enums warm_lane_pool lane_lifecycle FREE ASSIGNED QUARANTINED",
+      "adding a tool to escalation server create_server requires classifying it in fused-memory test_stages _REVIEWED_STAGE_SAFE",
+      "warm lane sole writer I2 invariant source scan note_assigned transition RELEASED crash recovery",
+      "_assigned_durable_records_with_statuses seam abort sentinel warm lane durable records reader",
+      "npx pyright type check fails npm cache permission sandbox worktree",
+      "threshold callback rate-limiting consecutive-failure counter dedup scan hot path",
+      "counts_against_requeue_cap BlockDisposition consumed record_requeue warm-lane requeue cap",
+      "reload_config report dict exact equality test shape unknown_config_keys scope",
+      "config_key_census unknown config key census escape hatch x_ prefix allowlist",
+      "pydantic extra ignore silently drops unknown config keys OrchestratorConfig nested submodel",
+      "uv run cross-device link error building worktree pytest workaround",
+      "uv sync fails in worktree pluggy build isolation hardlink venv shadowing canonical",
+      "canonical venv shared virtualenv UV_PROJECT_ENVIRONMENT worktree editable install shadow",
+      "how to run pytest tests in a task worktree without uv sync rebuilding packages",
+      "pytest /tmp cross-device link EXDEV rename failure cargo test_atomic_train_merge environment",
+      "update_task metadata_mode merge delete key omission preserved replace",
+      "orphan reaper divergence false positive liveness merge phase routing.latest is_actively_held",
+      "untracked files main checkout cannot be cleaned via worktree merge flow operator cleanup",
+      "unit test TaskWorkflow._invoke sandbox branch set_backend none guard_sandbox deterministic",
+      "sandbox backend does not create nonexistent writable carve-out path pre-create before dispatch",
+      "compute_write_set pure no makedirs sandbox skips nonexistent path claude/fleet pre-create before dispatch",
+      "verify.py _run_cmd ghost-venv isolation _target_subprocess_env subprocess env scrub",
+      "test exercising a guard in a state the production caller can never produce; dead-code filter validity",
+      "flaky test wall-clock timeout run_loop asyncio.wait_for test_harness pytest xdist",
+      "Escalation.from_dict drops non-dataclass keys extra fields escalation JSON",
+      "BacklogPolicy current_backlog global queue depth per-project signal wedge fan-out guard",
+      "test fixture regex alternation independently matches unchanged alternative false confidence",
+      "architect report_task_already_done fails commit not on main merge-landing desync task branch already implemented",
+      "running pytest in a worktree uv sync build fails cross-device link overlayfs EXDEV PYTHONPATH main venv",
+      "routing.latest.decided_at freshness lock-free reviewer_comprehensive liveness orphan reaper",
+      "architect plan files list should only include files actually created or modified, not regression suites merely run",
+      "MergeVerifyLeaseContended RuntimeError subclass pytest.raises test pinning lane lock",
+      "flaky test wall-clock elapsed timing assertion pytest-xdist workers loaded machine",
+      "corrupted uv venv truncated dist-info missing RECORD not repaired by uv sync reinstall verify failure ModuleNotFoundError",
+      "BlockClass unblock_types closed enum b3_gate only POST_MERGE_RED_MAIN distinct classify_block_reason",
+      "uv sync EXDEV cross-device link worktree venv broken run tests workaround PYTHONPATH main venv",
+      "uv cross-device link EXDEV cache venv corruption ModuleNotFoundError orphaned dist-info verify",
+      "ProjectPrefixRegistry orchestrator project_root cross-project registry location",
+      "stale bulk get_statuses recurrence backend defect cache materialized view invalidation",
+      "stale get_statuses vs get_task root cause WAL snapshot pinned connection fix 2455 2651 2694",
+      "live-FalkorDB integration test pytest marker deselect not integration addopts",
+      "Graphiti RELATES_TO edge move endpoint reassign CREATE DELETE preserve embedding vecf32",
+      "reassign_edge duplicate-uuid guard self-loop uuid-keyed Cypher endpoint move",
+      "GraphitiBackend node minting create Entity node _resolve_or_create_entity never creates",
+      "architect plan revalidation after requeue or lock re-acquisition",
+      "merge verify infra vs branch routing VerifyResult.category INFRA_TRANSIENT_CATEGORIES VerifyInfraError no handler merge_queue",
+      "MemoryConsolidator run wiring test AsyncMock memory best-effort sweep swallowed coroutine error",
+      "operational_mode llm gate awaits human decision gate_escalated_at detection",
+      "throwaway _merge- verify worktree owned ledger lease reaper cold shadow drift",
+      "GitOps._run no timeout wrap asyncio.wait_for cancellation-safe",
+      "fake clock _NOW test seed real time.time() construction rate-limit gate",
+      "merge_verify_lease lane_lock_path remove_merge_worktree_guarded same inode liveness signal",
+      "detection threshold versus destruction deadline separate constants reap grace",
+      "merge_queue _heartbeat_loop separate try/except per concern swallow-and-log convention",
+      "testing asyncio fail-open guard raising stub inside heartbeat loop wait_for re-raises task exception",
+      "reap_orphaned_merge_worktrees startup-only periodic resource audit observation-only decision 4",
+      "pyright uv sync cross-device link EXDEV corrupted venv worktree",
+      "pytest collect-only fully deselected -m marker exit code returncode integration guard",
+      "verify.py has_structural widening multi-clause type_check_command scope fallback tool subproject",
+      "uv run --project resolves relative path against current working directory fleet type_check_command cd chain",
+      "recon_code_fix_premise_registry source_assertions raw file text stage prompt constant interpolation",
+      "recon_code_fix_premise_registry deterministic chokepoint drop recon-filed candidate before LLM",
+      "escalation server create_server shared between orchestrator and reconciliation queues recon stage tool surface DISALLOW_ESCALATION_READS",
+      "test_recon_sandbox_guard /var/tmp mkdtemp PermissionError session sandbox confinement preexisting failure",
+      "test_recon_sandbox_guard /var/tmp mkdtemp PermissionError agent sandbox spurious full-suite failure not a regression",
+      "reconciliation stage escalation MCP server queue dir separate from orchestrator escalation queue port 8103 8102",
+      "pyright narrowing fixture-installed AsyncMock type ignore attach_mock scheduler mock tests",
+      "update_task metadata_mode replace required to delete a key; merge preserves omitted keys",
+      "scheduler update_task metadata_mode replace required to delete a metadata key merge preserves omitted keys",
+      "merge_retry_pending resume fast-path HEAD match skips planning clean merge conflict",
+      "top-level tests directory in repo root, relative path pytest stray file worktree",
+      "Scheduler.update_task returns False on MCP failure instead of raising; get_task returns None on failure — best-effort call sites must check return values",
+      "plan files list read-only import test helper phantom-done gate declared but untouched",
+      "re-homed cross-repo task already done on main under original reify task label",
+      "warm_lane_pool LaneState DurableLaneState two enums FREE ASSIGNED lane_lifecycle",
+      "warm lane pool QUARANTINED durable record drift IllegalLaneTransition note_assigned",
+      "git cat-file -e vs merge-base --is-ancestor sha on-branch reachability guard shared object store",
+      "pytest asyncio class marker async function filterwarnings error orchestrator tests",
+      "_mark_blocked spawns dry_run_unblock regardless of skip_escalation; terminal exit persisting blocked row directly",
+      "in-progress row with no open escalation reverted to pending by recovery table REVERT_TO_PENDING sweep",
+      "born-at-L2 escalation sentinel agent_role prefix harness- orchestrator- not downgraded",
+      "architect task-rejection artifact dispatch chain order in workflow _plan sites",
+      "review verdict cache reviewer_fingerprint positive match required before skipping review",
+      "pytest parametrize Literal pyright reportArgumentType cast Any in tests",
+      "landlock sandbox enforcement matrix tests fail /var/tmp permission denied inside agent sandbox",
+      "merge-base --is-ancestor sha reachability guard accepts base commit false-DONE",
+      "FakeBriefing test double signature must mirror BriefingAssembler build_ prompt kwargs",
+      "_iteration_entry_is_work _has_prior_implementation iteration log work classification false-DONE",
+      "git merge-base --is-ancestor reachability does not prove beyond-base work provenance",
+      "prompt-content test convention: assert tool-name presence not prose windows or wording pins on system_prompt",
+      "plan-tools MCP tool allowlist allowed_tools roles.py gate unreachable grant",
+      "task 2919 precedent invalidate stale blocked edge superseding temporal_fact unblock",
+      "CountingStr __len__ probe extraction pipeline entries snapshot edge sweep pyright str None",
+      "reconciliation sweep stat counter reads zero while edge was invalidated; Stage-1 LLM ad-hoc update_edge invisible to sweep stats",
+      "property test parametrized over the same hand-picked example table cannot catch over-selection; per-family algorithm data shared regex pattern builder",
+      "grep-source meta-test inspect.getsource removal behavioral replacement sys.modules import guard",
+      "cycle_summary Mem0 mirror pool cap-2 trim absent mirror is not data loss authoritative ReconLedgerStore",
+      "cycle_summary Mem0 mirror pool cap trim deletes older mirrors, authoritative ledger row is source of truth",
+      "/var/tmp not writable in agent sandbox landlock test PermissionError full test suite",
+      "landlock sandbox guard test /var/tmp permission denied agent session",
+      "status snapshot edge sweep regex marker alternation gate word boundary underscore",
+      "uv run --active resolves to main checkout venv instead of worktree, wrong module imported during verification",
+      "task 3042 blocked status marker stale_status_snapshot_edge_sweep complete ready for merge",
+      "transitive verb marker hazard closed-class connective regex extraction sweep task 2824",
+      "task 2824 PRESENT_TENSE_COMPLETION_RE transitive verb precedent mandatory copula",
+      "stale_status_snapshot_edge_sweep blocked status marker regex anchoring precision",
+      "plan files list should only declare files the task edits, not regression suites kept green; phantom-done narrowing gate",
+      "_host_allocator MagicMock isinstance HostAllocator gate merge_queue allocator accessor",
+      "HostAllocator cancel_and_release PARKED slot unreachable remote verify host stranded",
+      "HostAllocator PARKED slot quarantine acquire_remote test fixture",
+      "prompt coupling test assert constant presence not prose absence drift guard",
+      "assembled prompt drift-guard test convention assert constants appear in system prompt",
+      "reconciliation stage report stats dumped verbatim into Stage 3 LLM prompt _format_report",
+      "write journal derive_stage_stats submit_task resolve_ticket not journaled task-interceptor agent_id",
+      "canonical_queued_branch_name branch prefix double-prefix QueuedBranch parse non-task branch names",
+      "L2 auto-watcher which component re-probes open level-2 escalations watcher.py inotify escalation-watcher-auto skill",
+      "remediation deferral persistence counter completed runs per reconciliation cycle",
+      "pyright narrowing AsyncMock assigned to attribute in test helper MethodType",
+      "aiosqlite fetchall Iterable Row pyright len Sized type error",
+      "remediation run inline tail of run_full_cycle reconciliation drain capacity",
+      "event_buffer cleanup_drained deletes drained rows retention inflow history",
+      "uv run stderr warning corrupts JSON output when piping 2>&1",
+      "test asserts by re-executing the implementation expression tautological assertion pins nothing",
+      "aiosqlite cursor async iteration fetchmany iter_chunk_size round-trips",
+      "MCP tool enrichment field gated on wired collaborator keeps payload byte-identical exact-equality tests",
+      "rerere rr-cache conflict resolution not recorded from task worktree sandbox; git merge-tree read-only conflict probe",
+      "SqliteTaskBackend TaskBackendProtocol lifecycle start close stop method",
+      "two escalation queues orchestrator 8102 versus reconciliation queue 8103 A7b sole closer",
+      "get_statuses_fresh get_statuses defaults to a single tag DEFAULT_TAG list_tags cross-tag aggregation task census",
+      "prompt-contract test denied tool names assembled system prompt disallow list",
+      "MemoryConsolidator report.stats always-present key exact dict equality test_stages regression",
+      "amendment-pass precedent: measurement falsified the reviewer's suggested remedy but not the finding",
+      "get_statuses_fresh fails open to empty dict on any error; empty census treated as evidence",
+      "task ids are per-tag PRIMARY KEY (tag, id) cross-tag census merge collision",
+      "fused-memory tests sys.path import a helper from another test module tests/__init__.py pytest prepend import mode",
+      "warm lane reseed dangling .task/plan.json symlink worktrees/.task-meta plan loss report_task_already_done",
+      "pydantic model_validator return annotation quoted forward reference config schema NameError",
+      "consolidation-closure norm metadata.topic stamping superseded cluster survivors",
+      "recon task metadata UUID lists not memory ids; 8-char hex list elements truncated UUIDs vs commit SHAs",
+      "is_gate_submission only covers operational; inject_operational_routing coerces decision into always-escalating gate",
+      "SqliteTaskBackend add_task stamps pending_since into task metadata; test asserting stored metadata equals seed",
+      "TaskInterceptor has no memory_service; write-time guards needing memory lookups live in server/tools.py create_mcp_server",
+      "mark_done stamp seam inventory found_on_main delivered_checks guard",
+      "mark_done stamp sites found_on_main merged inventory chokepoint orchestrator",
+      "merge-deferred status recovery edge stranded sweep warm lane reclaim protected wedge",
+      "source-introspection meta-test asserting production identifier names rejected on review",
+      "merge-deferred status no recovery edge stranded sweep warm lane reclaim protected wedge",
+      "found_on_main mark_done stamp seams delivered_checks guard inventory attribution",
+      "kill switch forwarded to shared guard versus short-circuit before metadata pre-read fail-safe",
+      "pyright test mock call_args await_args Optional cast MethodType convention",
+      "pre-commit pyright path-filtered docs-only commit skipped timeout",
+      "CLAUDE.md OPERATIONS.md CONTRIBUTING.md duplicate the same guidance at three depths, drift when behaviour changes",
+      "pre-commit pyright path-filter skipped staged Python package prefix scripts",
+      "subprocess process group kill start_new_session orphan child test assertion",
+      "reify run_all.sh FAILED marker partial outer timeout parser",
+      "deleting a production symbol breaks unittest.mock.patch in other test modules AttributeError",
+      "cargo-nextest test filter id binary-id bare test name reify verify retry subset env delimiter",
+      "config knob tunable to zero used as threshold destructive recovery advice floor",
+      "git stash create fails empty stderr under index.lock advance_main stash_failed merge queue halt",
+      "pyright narrowing does not propagate across function return boundary test helper optional fields",
+      "_map_advance_failure side channel MagicMock auto-vivification merge_gates git_ops config"
+    ],
+    "sha256": "9f490da28eaaa74f5d4c8f6008975966cfe763f773a4a69a871ce720432e0d4e"
+  },
+  "uncited_episodes": 1
+}

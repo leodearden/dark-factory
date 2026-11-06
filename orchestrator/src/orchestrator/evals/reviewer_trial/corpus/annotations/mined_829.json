@@ -8,6 +8,94 @@
       "severity": "suggestion",
       "description": "The inspect.markcoroutinefunction(self) marking is unnecessary. AsyncMock awaits any side_effect return value for which asyncio.iscoroutine() is true, and __call__ is async def so it always returns a coroutine; the marker changes no behavior on any Python version (as the inline comment itself notes). It adds complexity without functional effect.",
       "mutation_type": "style"
+    },
+    {
+      "id": "mined_829_pool_01",
+      "location": "fused-memory/tests/test_rebuild_entity_summaries.py:79",
+      "category": "python_version_compat",
+      "severity": "blocking",
+      "description": "_UuidDispatcher (an instance with async __call__) is passed as AsyncMock side_effect; AsyncMock awaits a side_effect only when iscoroutinefunction(effect) is true, which for an instance holds only after inspect.markcoroutinefunction (3.12+). On Python 3.11, which fused-memory declares supported (requires-python >=3.11, pyright pythonVersion 3.11), the guard is skipped and AsyncMock returns an un-awaited coroutine, so every converted call site (test_force_rebuilds_all, test_partial_failure_continues, the TestMemoryServiceRebuildEntitySummaries service fixture) hands production a coroutine (rebuild_entity_summaries raises TypeError on non-dict results) and assert_all_dispatched fails. The inline comment claiming AsyncMock 'checks asyncio.iscoroutine(result)' on 3.11 is false. The replaced async-def closure worked on every version.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_829_pool_02",
+      "location": "fused-memory/tests/test_rebuild_entity_summaries.py:212",
+      "category": "test_does_not_test_claim",
+      "severity": "blocking",
+      "description": "test_works_without_markcoroutinefunction claims to prove _UuidDispatcher works on Python 3.11 (markcoroutinefunction absent), but it awaits dispatch(...) directly and never routes through AsyncMock(side_effect=dispatch), the only path where the marker matters. It passes in exactly the configuration where real usage returns an un-awaited coroutine, so it cannot detect the 3.11 breakage it names.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_829_pool_03",
+      "location": "fused-memory/tests/test_rebuild_entity_summaries.py:1081",
+      "category": "test_coupling",
+      "severity": "suggestion",
+      "description": "test_delegates_to_backend reaches the dispatcher via service.graphiti.rebuild_entity_from_edges.side_effect.assert_all_dispatched() because the service fixture builds the dispatcher without exposing it; the call is untyped (mock attribute) and couples the test to the fixture's wiring, and the other tests sharing the fixture never check dispatch completeness.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_829_pool_04",
+      "location": "fused-memory/tests/test_rebuild_entity_summaries.py:98",
+      "category": "redundant_state",
+      "severity": "suggestion",
+      "description": "_UuidDispatcher.dispatched duplicates the call record AsyncMock already keeps (await_args_list), so completeness could be asserted statelessly from the mock. The task explicitly requested a tracking set plus assert_all_dispatched, so the redundancy is task-mandated and minor; the residual cost is the stateful class that this choice motivated.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_829_pool_05",
+      "location": "fused-memory/tests/test_rebuild_entity_summaries.py:62",
+      "category": "duplicated_documentation",
+      "severity": "suggestion",
+      "description": "_uuid_dispatch became a one-line pass-through to the _UuidDispatcher constructor, and the class and factory carry near-identical multi-paragraph docstrings (value types, unexpected-uuid behaviour, tracking API): two names and two copies of one contract that can drift (and already contain the false 3.11 and 'surfaces immediately' claims). A closure or a single entity with one short docstring would suffice; the mapping is also typed as bare dict.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_829_pool_06",
+      "location": "fused-memory/tests/test_rebuild_entity_summaries.py:199",
+      "category": "tautological_test",
+      "severity": "suggestion",
+      "description": "test_dispatch_docstring_documents_exception_support only asserts the two docstrings are non-empty; its name claims it checks that exception support is documented. It pins prose existence, guards no behaviour, and its own docstring concedes the behavioural tests already cover the feature.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_829_pool_07",
+      "location": "fused-memory/tests/test_rebuild_entity_summaries.py:2203",
+      "category": "weakened_guard_and_misnaming",
+      "severity": "suggestion",
+      "description": "The AST cross-reference guard in test_partial_failure_continues_still_raises_runtime_error_not_value_error was loosened from 'RuntimeError appears in a raise' to 'RuntimeError appears as any bare-name Call'; the set is still named error_names but now collects every called name (_uuid_dispatch, AsyncMock, StaleSummaryResult, ...), and any stray RuntimeError(...) anywhere in the test body would satisfy it, so it no longer shows RuntimeError reaches the dispatcher or is raised.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_829_pool_08",
+      "location": "fused-memory/tests/test_rebuild_entity_summaries.py:62",
+      "category": "file_too_large",
+      "severity": "suggestion",
+      "description": "The test module, already past 2,600 lines, grows by ~155 lines of generic mock-dispatch infrastructure plus its own unit-test class (TestUuidDispatch), none specific to rebuild_entity_summaries; the helper and its self-tests would sit better in conftest.py or a small test-helper module.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_829_pool_09",
+      "location": "fused-memory/tests/test_rebuild_entity_summaries.py:97",
+      "category": "incomplete_check",
+      "severity": "suggestion",
+      "description": "assert_all_dispatched checks only for mapped uuids that were never called, not for unexpected uuids, although dispatched records them. The docstrings say an unexpected uuid 'surfaces immediately', but MemoryService.rebuild_entity_summaries runs asyncio.gather(..., return_exceptions=True) and accumulates the AssertionError as an errors entry, so a test that does not inspect errors (e.g. test_delegates_to_backend) would pass with extra dispatches.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_829_pool_10",
+      "location": "fused-memory/tests/test_rebuild_entity_summaries.py:136",
+      "category": "test_duplication",
+      "severity": "suggestion",
+      "description": "The TestUuidDispatch tests rebuild the same Alice/Bob result-dict mapping literals and dispatch-call boilerplate in each test instead of sharing a constant or builder.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_829_pool_11",
+      "location": "fused-memory/tests/test_rebuild_entity_summaries.py:88",
+      "category": "typing",
+      "severity": "suggestion",
+      "description": "The mapping parameter is typed as bare dict although its contract is Mapping[str, dict | BaseException]; re-raising the same exception instance on repeated dispatch of a uuid accumulates traceback frames, a minor hazard for error-detail assertions.",
+      "mutation_type": "pooled_2026_10_22"
     }
   ],
   "provenance": {

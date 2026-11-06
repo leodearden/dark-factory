@@ -1,0 +1,102 @@
+{
+  "task_id": "5248",
+  "reason": "net-additive: task 5248 lets merge_cancel reach a queued or verifying request by id, whoever awaits it -- the cancel states and refusal tiers in types.py/worker.py, the chain-walk and gate re-verify honouring a cancel, and the await-bearing half of the coalesce pass moved unchanged into _stack_coalesce_train (cognitive 43, the existing step-6 body, so the _coalescing_ids guard can wrap it)",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+      "baseline": 74,
+      "current": 80
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 2249,
+      "current": 2271
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_finalize_inflight",
+      "baseline": 102,
+      "current": 105
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_land_chain_prefix",
+      "baseline": 34,
+      "current": 36
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py::retire_cancelled_merge_request",
+      "baseline": 21,
+      "current": 22
+    },
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/__init__.py",
+      "baseline": 93,
+      "current": 96
+    },
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+      "baseline": 2021,
+      "current": 2098
+    },
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 22663,
+      "current": 22777
+    },
+    {
+      "measure": "new_function_over_ceiling",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_stack_coalesce_train",
+      "baseline": 15,
+      "current": 43
+    },
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_merge_queue_deep_landing.py",
+      "baseline": 84,
+      "current": 86
+    },
+    {
+      "measure": "prose_lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+      "baseline": 1038,
+      "current": 1060
+    },
+    {
+      "measure": "prose_lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 12617,
+      "current": 12652
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 4941,
+      "current": 4969
+    },
+    {
+      "measure": "total:lines",
+      "key": "<cluster>",
+      "baseline": 58217,
+      "current": 58411
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6581,
+      "current": 6586
+    },
+    {
+      "measure": "total:prose_lines",
+      "key": "<cluster>",
+      "baseline": 31843,
+      "current": 31900
+    }
+  ]
+}

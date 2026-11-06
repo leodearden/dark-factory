@@ -685,7 +685,7 @@ class TestProjectWeightKeysOfAnyYamlType:
 
     ``2085:`` parses as an int, ``1.5:`` as a float, ``yes:`` as a bool and
     ``~:`` as None. The project_weights key fold added by this task sorts its
-    keys, and ``normalize_project_token(k) == k`` is False for every one of
+    keys, and ``fold_project_token(k) == k`` is False for every one of
     those AND for a non-canonical str key like the very ``dark-factory:`` the
     fold exists to repair -- so both land in the SAME first-element sort group
     and the tuple comparison falls through to the RAW key, comparing e.g. an

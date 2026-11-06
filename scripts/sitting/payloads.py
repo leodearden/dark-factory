@@ -115,6 +115,8 @@ class AgreedMarker:
 def resolve_issue_payload(
     escalation_id: str, resolution: str, action: str, *, resolved_by: str, resolution_turns: int,
 ) -> ApplyPayload:
+    """The call's arguments only; the server may still refuse a legal action
+    (``escalation/src/escalation/server.py::resolve_issue`` "Gate precedence")."""
     if action not in RESOLVE_ACTIONS:
         raise ValueError(f'unknown resolve action {action!r}; expected one of {list(RESOLVE_ACTIONS)}')
     _require_positive_int('resolution_turns', resolution_turns)

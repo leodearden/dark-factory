@@ -1,23 +1,47 @@
-"""Tests for the ACTIVE_TASKS aggregator that joins task tree + worktrees."""
+"""Tests for the task-row aggregator behind ``TASKS_SNAPSHOT[p].rows`` and the
+scheduler page, which joins the task tree with per-task runtime state."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
 import pytest
+from _canned_mcp import CannedMCP
+from _deferral_fixture import (
+    CARRIED_LIVE,
+    CARRIER_DONE,
+    CARRIER_GONE,
+    CLOSABLE,
+    HELD_LIVE,
+    ORPHANED,
+    PLAIN,
+    STRAY,
+    UNRECORDED,
+    FixtureRow,
+    deferral_fixture,
+    expected_needs_human,
+    raw_rows,
+    status_map,
+)
+from _deferral_fixture import NOW as DEFERRAL_NOW
+from shared.process_identity import capture
+from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL
 from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
 from shared.task_statuses import ACTIVE, TaskStatus
 
 from dashboard.config import DashboardConfig
 from dashboard.data.active_tasks import (
+    TASKS_BUDGET,
+    TasksBudget,
     _build_task_row,
     _minutes_since,
-    collect_active_tasks,
     collect_tasks_with_counts,
     shape_terminal_rows,
 )
@@ -25,45 +49,18 @@ from dashboard.data.census import TaskCensus
 from dashboard.data.datum import DatumState
 from dashboard.data.task_snapshot import SnapshotHealth, TaskSnapshot, classify
 
+# REQUIRED, not tidy. The rotation offset advances on every collector call,
+# so a test asserting WHICH roots were served, or in what order, would
+# otherwise depend on how many collector calls EARLIER tests made. The unit
+# cache and last-good store are keyed by project-root STRING and tests here
+# reuse root names across ``tmp_path`` directories, so a test's first
+# acquisition could otherwise be answered from an earlier test's cache, or
+# served an earlier test's rows as ``stale``.
+pytestmark = pytest.mark.usefixtures('fresh_task_snapshot_state')
+
 # ---------------------------------------------------------------------------
 # helpers used inside the aggregator
 # ---------------------------------------------------------------------------
-
-
-@pytest.fixture(autouse=True)
-def _reset_root_rotation_between_tests():
-    """Start every test from rotation offset 0.
-
-    REQUIRED, not tidy. ``active_tasks._root_rotation_offset`` is module state
-    that ``collect_tasks_with_counts`` advances on every call (task 4884), so
-    without this any test that asserts WHICH roots were served — or in what
-    order they were admitted — silently depends on how many times an EARLIER
-    test in the session happened to call the collector. That is a test that
-    passes or fails by file order, which is worse than one that fails.
-    """
-    import dashboard.data.active_tasks as at_mod
-
-    at_mod._reset_root_rotation()
-    yield
-    at_mod._reset_root_rotation()
-
-
-@pytest.fixture(autouse=True)
-def _clear_the_snapshot_unit_between_tests():
-    """No test may be served the previous test's snapshot.
-
-    REQUIRED for the same reason as the rotation reset above. The unit holds
-    a 15 s TTL cache AND a never-expiring last-good store, both keyed by
-    project-root STRING, and tests here reuse root names across ``tmp_path``
-    directories. Without this a test's first acquisition can be answered from
-    an earlier test's cache — issuing no MCP call at all — or, worse, served
-    an earlier test's rows as ``stale``.
-    """
-    import dashboard.data.task_snapshot as snapshot_mod
-
-    snapshot_mod._snapshot_cache_clear()
-    yield
-    snapshot_mod._snapshot_cache_clear()
 
 
 def test_minutes_since_handles_z_suffix_and_naive_iso():
@@ -124,7 +121,7 @@ def test_minutes_since_no_now_resolves_via_clock():
 
 
 # ---------------------------------------------------------------------------
-# collect_active_tasks against in-memory MCP-shaped fixture
+# collect_tasks_with_counts against in-memory MCP-shaped fixture
 # ---------------------------------------------------------------------------
 
 
@@ -224,7 +221,7 @@ def _register_fetch_tasks(monkeypatch, fetch) -> None:
     # keyword raises TypeError instead of shaping rows.
     async def _narrowed(
         client, config, project_root, *,
-        statuses=None, chunk_size=None, timeout=None,
+        statuses=None, timeout=None,
     ):
         rows = await fetch(client, config, project_root)
         if not isinstance(rows, list):
@@ -407,8 +404,8 @@ def two_project_config(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_collect_active_tasks_filters_to_active_statuses(two_project_config, dummy_client):
-    active, _ = await collect_active_tasks(client=dummy_client, config=two_project_config)
+async def test_collect_tasks_with_counts_filters_to_active_statuses(two_project_config, dummy_client):
+    active, _ = await collect_tasks_with_counts(client=dummy_client, config=two_project_config)
     statuses = {t['status'] for t in active}
     assert statuses <= {'in-progress', 'blocked', 'pending'}
     # Done tasks (17, 15) should not appear.
@@ -418,8 +415,8 @@ async def test_collect_active_tasks_filters_to_active_statuses(two_project_confi
 
 
 @pytest.mark.asyncio
-async def test_collect_active_tasks_resolves_deps_with_done_flags(two_project_config, dummy_client):
-    active, _ = await collect_active_tasks(client=dummy_client, config=two_project_config)
+async def test_collect_tasks_with_counts_resolves_deps_with_done_flags(two_project_config, dummy_client):
+    active, _ = await collect_tasks_with_counts(client=dummy_client, config=two_project_config)
     by_id = {t['id']: t for t in active}
     t19 = by_id['dark-factory/T-19']
     assert {d['id']: d['done'] for d in t19['deps']} == {
@@ -432,8 +429,8 @@ async def test_collect_active_tasks_resolves_deps_with_done_flags(two_project_co
 
 
 @pytest.mark.asyncio
-async def test_collect_active_tasks_pulls_metadata_and_loops(two_project_config, dummy_client):
-    active, _ = await collect_active_tasks(client=dummy_client, config=two_project_config)
+async def test_collect_tasks_with_counts_pulls_metadata_and_loops(two_project_config, dummy_client):
+    active, _ = await collect_tasks_with_counts(client=dummy_client, config=two_project_config)
     t19 = next(t for t in active if t['id'] == 'dark-factory/T-19')
     assert t19['agent'] == 'claude-task-19'
     assert t19['loops'] == 2
@@ -445,8 +442,8 @@ async def test_collect_active_tasks_pulls_metadata_and_loops(two_project_config,
 
 
 @pytest.mark.asyncio
-async def test_collect_active_tasks_started_uses_provided_now(tmp_path, monkeypatch, dummy_client):
-    """collect_active_tasks(now=fixed) computes every row's `started` against that one instant."""
+async def test_collect_tasks_with_counts_started_uses_provided_now(tmp_path, monkeypatch, dummy_client):
+    """collect_tasks_with_counts(now=fixed) computes every row's `started` against that one instant."""
     fixed = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
     created_at = (fixed - timedelta(minutes=42)).isoformat()
     root, shaped = _make_project(
@@ -462,7 +459,7 @@ async def test_collect_active_tasks_started_uses_provided_now(tmp_path, monkeypa
     _register_runtime(monkeypatch, {'fixedclock': [_runtime_entry(1, started=created_at)]})
     cfg = DashboardConfig(project_root=root)
 
-    active, _ = await collect_active_tasks(client=dummy_client, config=cfg, now=fixed)
+    active, _ = await collect_tasks_with_counts(client=dummy_client, config=cfg, now=fixed)
     assert len(active) == 1
     assert active[0]['started'] == 42
 
@@ -526,9 +523,9 @@ async def test_collect_tasks_with_counts_stamps_every_snapshot_at_the_provided_n
     live clock BEFORE the request, which inverts production's ordering. That
     inversion is how 350 green dashboard tests sat over a handler that routed
     every project to ``unknown`` on every cache-miss render.
-    ``dashboard/src/dashboard/data/scheduler.py::collect_scheduler_state`` and
-    ``collect_active_tasks`` already forwarded ``now``; ``api_tasks`` was the
-    only call site that did not.
+    ``dashboard/src/dashboard/data/scheduler.py::collect_scheduler_state``
+    already forwarded ``now``; ``api_tasks`` was the only call site that did
+    not.
     """
     fixed = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
     df_root = tmp_path / 'df'
@@ -555,7 +552,7 @@ async def test_collect_tasks_with_counts_stamps_every_snapshot_at_the_provided_n
 
 
 @pytest.mark.asyncio
-async def test_collect_active_tasks_handles_missing_worktree_metadata(tmp_path, monkeypatch, dummy_client):
+async def test_collect_tasks_with_counts_handles_missing_worktree_metadata(tmp_path, monkeypatch, dummy_client):
     """A pending task absent from an ONLINE runtime map still appears, with honest zeros."""
     root, shaped = _make_project(
         tmp_path, project_dir='solo',
@@ -571,7 +568,7 @@ async def test_collect_active_tasks_handles_missing_worktree_metadata(tmp_path, 
     # from an offline project (see the runtime-offline tests below).
     _register_runtime(monkeypatch, {'solo': []})
     cfg = DashboardConfig(project_root=root)
-    active, _ = await collect_active_tasks(client=dummy_client, config=cfg)
+    active, _ = await collect_tasks_with_counts(client=dummy_client, config=cfg)
     assert active == [{
         'id': 'solo/T-1', 'project': 'solo', 'title': 'lonely',
         'status': 'pending', 'agent': None,
@@ -619,7 +616,7 @@ async def test_no_task_row_carries_description_or_details(tmp_path, monkeypatch,
 
     active, snapshots = await collect_tasks_with_counts(client=dummy_client, config=cfg)
     terminal = shape_terminal_rows(
-        root,
+        'prose',
         [task for task in shaped if task['status'] in ('done', 'cancelled')],
         now=datetime.now(UTC),
     )
@@ -633,7 +630,7 @@ async def test_no_task_row_carries_description_or_details(tmp_path, monkeypatch,
 
 
 @pytest.mark.asyncio
-async def test_collect_active_tasks_surfaces_offline_projects(tmp_path, monkeypatch, dummy_client):
+async def test_collect_tasks_with_counts_surfaces_offline_projects(tmp_path, monkeypatch, dummy_client):
     """A project whose MCP fetch returns an offline marker is reported."""
     root = tmp_path / 'offline-project'
     root.mkdir()
@@ -643,9 +640,9 @@ async def test_collect_active_tasks_surfaces_offline_projects(tmp_path, monkeypa
 
     _register_fetch_tasks(monkeypatch, _fake_fetch_tasks)
     cfg = DashboardConfig(project_root=root)
-    active, offline_projects = await collect_active_tasks(client=dummy_client, config=cfg)
+    active, snapshots = await collect_tasks_with_counts(client=dummy_client, config=cfg)
     assert active == []
-    assert offline_projects == ['offline-project']
+    assert _offline(snapshots) == ['offline-project']
 
 
 # ---------------------------------------------------------------------------
@@ -654,7 +651,7 @@ async def test_collect_active_tasks_surfaces_offline_projects(tmp_path, monkeypa
 
 
 @pytest.mark.asyncio
-async def test_collect_active_tasks_runtime_join_populates_lane_phase_lane_state(
+async def test_collect_tasks_with_counts_runtime_join_populates_lane_phase_lane_state(
     tmp_path, monkeypatch, dummy_client,
 ):
     """An online runtime entry's loops/attempts/lane/phase/lane_state/agent all
@@ -679,7 +676,7 @@ async def test_collect_active_tasks_runtime_join_populates_lane_phase_lane_state
     })
     cfg = DashboardConfig(project_root=root)
 
-    active, _ = await collect_active_tasks(client=dummy_client, config=cfg, now=fixed)
+    active, _ = await collect_tasks_with_counts(client=dummy_client, config=cfg, now=fixed)
     assert len(active) == 1
     row = active[0]
     assert row['loops'] == 3
@@ -693,7 +690,7 @@ async def test_collect_active_tasks_runtime_join_populates_lane_phase_lane_state
 
 
 @pytest.mark.asyncio
-async def test_collect_active_tasks_runtime_unparseable_started_yields_none_row(
+async def test_collect_tasks_with_counts_runtime_unparseable_started_yields_none_row(
     tmp_path, monkeypatch, dummy_client,
 ):
     """An ONLINE entry whose ``started`` is present-but-unparseable renders as
@@ -718,7 +715,7 @@ async def test_collect_active_tasks_runtime_unparseable_started_yields_none_row(
     })
     cfg = DashboardConfig(project_root=root)
 
-    active, _ = await collect_active_tasks(client=dummy_client, config=cfg)
+    active, _ = await collect_tasks_with_counts(client=dummy_client, config=cfg)
     assert len(active) == 1
     row = active[0]
     assert row['started'] is None
@@ -726,7 +723,7 @@ async def test_collect_active_tasks_runtime_unparseable_started_yields_none_row(
 
 
 @pytest.mark.asyncio
-async def test_collect_active_tasks_runtime_offline_snapshot_yields_all_none(
+async def test_collect_tasks_with_counts_runtime_offline_snapshot_yields_all_none(
     tmp_path, monkeypatch, dummy_client,
 ):
     """A project whose runtime snapshot reports offline=True gets honest None
@@ -747,7 +744,7 @@ async def test_collect_active_tasks_runtime_offline_snapshot_yields_all_none(
     monkeypatch.setattr('dashboard.data.active_tasks.fetch_task_runtime', _offline_fetch_task_runtime)
     cfg = DashboardConfig(project_root=root)
 
-    active, _ = await collect_active_tasks(client=dummy_client, config=cfg)
+    active, _ = await collect_tasks_with_counts(client=dummy_client, config=cfg)
     assert len(active) == 1
     row = active[0]
     for key in ('agent', 'loops', 'attempts', 'started', 'lane', 'phase', 'lane_state'):
@@ -760,7 +757,7 @@ async def test_collect_active_tasks_runtime_offline_snapshot_yields_all_none(
 
 
 @pytest.mark.asyncio
-async def test_collect_active_tasks_no_escalation_url_treated_as_offline(
+async def test_collect_tasks_with_counts_no_escalation_url_treated_as_offline(
     tmp_path, monkeypatch, dummy_client,
 ):
     """A project absent from the runtime map entirely (no escalation URL
@@ -779,7 +776,7 @@ async def test_collect_active_tasks_no_escalation_url_treated_as_offline(
     _register_runtime(monkeypatch, {})  # no label registered for 'nourl' at all
     cfg = DashboardConfig(project_root=root)
 
-    active, _ = await collect_active_tasks(client=dummy_client, config=cfg)
+    active, _ = await collect_tasks_with_counts(client=dummy_client, config=cfg)
     assert len(active) == 1
     row = active[0]
     for key in ('agent', 'loops', 'attempts', 'started', 'lane', 'phase', 'lane_state'):
@@ -791,7 +788,7 @@ async def test_collect_active_tasks_no_escalation_url_treated_as_offline(
 
 
 @pytest.mark.asyncio
-async def test_collect_active_tasks_runtime_per_task_read_failure_stays_online(
+async def test_collect_tasks_with_counts_runtime_per_task_read_failure_stays_online(
     tmp_path, monkeypatch, dummy_client,
 ):
     """A per-task artifact read failure (loops/attempts/started/phase=None,
@@ -815,7 +812,7 @@ async def test_collect_active_tasks_runtime_per_task_read_failure_stays_online(
     })
     cfg = DashboardConfig(project_root=root)
 
-    active, _ = await collect_active_tasks(client=dummy_client, config=cfg)
+    active, _ = await collect_tasks_with_counts(client=dummy_client, config=cfg)
     assert len(active) == 1
     row = active[0]
     assert row['loops'] is None
@@ -860,7 +857,7 @@ async def _one_task_row_with_snapshot(
     monkeypatch.setattr(
         'dashboard.data.active_tasks.fetch_task_runtime', _fake_fetch_task_runtime,
     )
-    active, _ = await collect_active_tasks(
+    active, _ = await collect_tasks_with_counts(
         client=dummy_client, config=DashboardConfig(project_root=root),
     )
     assert len(active) == 1
@@ -869,7 +866,7 @@ async def _one_task_row_with_snapshot(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('reason', ['deadline_exceeded', 'unreachable'])
-async def test_collect_active_tasks_row_carries_probe_reason(
+async def test_collect_tasks_with_counts_row_carries_probe_reason(
     tmp_path, monkeypatch, dummy_client, reason,
 ):
     """The probe's fault-domain discriminator reaches the task row intact.
@@ -891,7 +888,7 @@ async def test_collect_active_tasks_row_carries_probe_reason(
 
 
 @pytest.mark.asyncio
-async def test_collect_active_tasks_online_snapshot_with_entry_is_ok(
+async def test_collect_tasks_with_counts_online_snapshot_with_entry_is_ok(
     tmp_path, monkeypatch, dummy_client,
 ):
     row = await _one_task_row_with_snapshot(
@@ -904,7 +901,7 @@ async def test_collect_active_tasks_online_snapshot_with_entry_is_ok(
 
 
 @pytest.mark.asyncio
-async def test_collect_active_tasks_includes_merge_deferred_and_train_field(
+async def test_collect_tasks_with_counts_includes_merge_deferred_and_train_field(
     tmp_path, monkeypatch, dummy_client
 ):
     """merge-deferred tasks survive the active filter and carry the `train` field.
@@ -942,7 +939,7 @@ async def test_collect_active_tasks_includes_merge_deferred_and_train_field(
 
     _register_fetch_tasks(monkeypatch, _fake_fetch_tasks)
     cfg = DashboardConfig(project_root=root)
-    active, _ = await collect_active_tasks(client=dummy_client, config=cfg)
+    active, _ = await collect_tasks_with_counts(client=dummy_client, config=cfg)
 
     ids = {t['id'] for t in active}
     assert 'trainyard/T-101' in ids, (
@@ -989,7 +986,7 @@ def _make_done_project(root, *, project_dir, active_tasks, done_tasks):
 
 
 @pytest.mark.asyncio
-async def test_collect_active_tasks_excludes_done_rows(tmp_path, monkeypatch, dummy_client):
+async def test_collect_tasks_with_counts_excludes_done_rows(tmp_path, monkeypatch, dummy_client):
     """The collector must return NO done row — for the scheduler or anyone else.
 
     This used to be the DEFAULT behaviour, switchable on by a cap. There is no
@@ -1015,12 +1012,11 @@ async def test_collect_active_tasks_excludes_done_rows(tmp_path, monkeypatch, du
     from dashboard.config import DashboardConfig
     cfg = DashboardConfig(project_root=root)
 
-    # Call with NO max_done_per_project — default behaviour
-    active, _ = await collect_active_tasks(client=dummy_client, config=cfg)
+    active, _ = await collect_tasks_with_counts(client=dummy_client, config=cfg)
 
     done_rows = [t for t in active if t['status'] == 'done']
     assert done_rows == [], (
-        'Default collect_active_tasks must NOT return done rows — '
+        'collect_tasks_with_counts must NOT return done rows — '
         'scheduler.py must not receive done tasks'
     )
 
@@ -1074,148 +1070,23 @@ def test_build_task_row_external_deps_ignores_non_str_and_empty():
 
 
 # ---------------------------------------------------------------------------
-# prd field coalescing on task rows (step-1 / step-2)
+# prd field on task rows (coalescing itself: test_prd_attribution.py)
 # ---------------------------------------------------------------------------
 
 
-def test_build_task_row_prd_field_from_prd_path():
-    """_build_task_row coalesces metadata.prd_path into row['prd'] verbatim."""
+def test_shaped_row_prd_is_the_coalesced_provenance():
+    """A shaped row's 'prd' is its metadata's PRD provenance, suffix stripped."""
     task = {
-        'id': 1, 'title': 'x', 'status': 'pending',
-        'metadata': {'prd_path': 'plans/dashboard-taskgraph-legibility-prd.md'},
+        'id': 7, 'title': 'x', 'status': 'done', 'dependencies': [],
+        'metadata': {'prd_path': 'plans/x-prd.md#notes'},
+        'updated_at': '2026-11-01T00:00:00+00:00',
     }
-    row = _build_task_row('p', task, 1, {}, 'p/T-1')
-    assert row['prd'] == 'plans/dashboard-taskgraph-legibility-prd.md'
-
-
-def test_build_task_row_prd_field_strips_anchor_suffix():
-    """A trailing '#anchor' fragment on prd_path is stripped."""
-    task = {
-        'id': 1, 'title': 'x', 'status': 'pending',
-        'metadata': {'prd_path': 'plans/foo-prd.md#implementation-notes'},
-    }
-    row = _build_task_row('p', task, 1, {}, 'p/T-1')
-    assert row['prd'] == 'plans/foo-prd.md'
-
-
-def test_build_task_row_prd_field_strips_section_suffix():
-    """A trailing '§section' fragment on prd_path is stripped."""
-    task = {
-        'id': 1, 'title': 'x', 'status': 'pending',
-        'metadata': {'prd_path': 'plans/foo-prd.md§Contract'},
-    }
-    row = _build_task_row('p', task, 1, {}, 'p/T-1')
-    assert row['prd'] == 'plans/foo-prd.md'
-
-
-def test_build_task_row_prd_field_trims_whitespace():
-    """Surrounding whitespace on prd_path is trimmed."""
-    task = {
-        'id': 1, 'title': 'x', 'status': 'pending',
-        'metadata': {'prd_path': '  plans/foo-prd.md  '},
-    }
-    row = _build_task_row('p', task, 1, {}, 'p/T-1')
-    assert row['prd'] == 'plans/foo-prd.md'
-
-
-def test_build_task_row_prd_field_legacy_prd_key():
-    """Legacy 'prd' key is coalesced when prd_path is absent."""
-    task = {
-        'id': 1, 'title': 'x', 'status': 'pending',
-        'metadata': {'prd': 'docs/legacy-prd.md'},
-    }
-    row = _build_task_row('p', task, 1, {}, 'p/T-1')
-    assert row['prd'] == 'docs/legacy-prd.md'
-
-
-def test_build_task_row_prd_field_legacy_prd_ref_key():
-    """Legacy 'prd_ref' key is coalesced when prd_path and prd are absent."""
-    task = {
-        'id': 1, 'title': 'x', 'status': 'pending',
-        'metadata': {'prd_ref': 'docs/legacy-ref-prd.md'},
-    }
-    row = _build_task_row('p', task, 1, {}, 'p/T-1')
-    assert row['prd'] == 'docs/legacy-ref-prd.md'
-
-
-def test_build_task_row_prd_field_precedence_prd_path_over_prd_and_ref():
-    """When multiple provenance keys are present, prd_path wins over prd and prd_ref."""
-    task = {
-        'id': 1, 'title': 'x', 'status': 'pending',
-        'metadata': {
-            'prd_path': 'plans/winner-prd.md',
-            'prd': 'plans/loser-prd.md',
-            'prd_ref': 'plans/loser-ref-prd.md',
-        },
-    }
-    row = _build_task_row('p', task, 1, {}, 'p/T-1')
-    assert row['prd'] == 'plans/winner-prd.md'
-
-
-def test_build_task_row_prd_field_empty_prd_path_falls_through_to_prd():
-    """An empty-string prd_path is skipped in favor of a non-empty prd."""
-    task = {
-        'id': 1, 'title': 'x', 'status': 'pending',
-        'metadata': {'prd_path': '', 'prd': 'plans/fallback-prd.md'},
-    }
-    row = _build_task_row('p', task, 1, {}, 'p/T-1')
-    assert row['prd'] == 'plans/fallback-prd.md'
-
-
-def test_build_task_row_prd_field_suffix_only_prd_path_falls_through():
-    """A prd_path that is ONLY a suffix (cleans to '') falls through to the next key."""
-    task = {
-        'id': 1, 'title': 'x', 'status': 'pending',
-        'metadata': {'prd_path': '#just-an-anchor', 'prd': 'plans/fallback-prd.md'},
-    }
-    row = _build_task_row('p', task, 1, {}, 'p/T-1')
-    assert row['prd'] == 'plans/fallback-prd.md'
-
-
-def test_build_task_row_prd_field_none_when_no_provenance_keys():
-    """row['prd'] is None when no prd_path/prd/prd_ref keys are present."""
-    task = {'id': 1, 'title': 'x', 'status': 'pending', 'metadata': {}}
-    row = _build_task_row('p', task, 1, {}, 'p/T-1')
-    assert row['prd'] is None
-
-
-def test_build_task_row_prd_field_non_string_values_skipped():
-    """Non-string prd_path values (int, None) are skipped, yielding None."""
-    task = {
-        'id': 1, 'title': 'x', 'status': 'pending',
-        'metadata': {'prd_path': 123},
-    }
-    row = _build_task_row('p', task, 1, {}, 'p/T-1')
-    assert row['prd'] is None
-
-    task_none = {
-        'id': 1, 'title': 'x', 'status': 'pending',
-        'metadata': {'prd_path': None},
-    }
-    row_none = _build_task_row('p', task_none, 1, {}, 'p/T-1')
-    assert row_none['prd'] is None
-
-
-def test_build_task_row_prd_kwarg_overrides_metadata_coalescing():
-    """An explicit prd= kwarg wins verbatim over metadata coalescing.
-
-    Callers that already ran _coalesce_prd (e.g. the terminal-bucket loop, to
-    decide live-PRD membership) pass the result through instead of paying for
-    the split/strip work a second time; this proves the passthrough is used
-    rather than silently re-deriving from metadata.
-    """
-    task = {
-        'id': 1, 'title': 'x', 'status': 'pending',
-        'metadata': {'prd_path': 'plans/metadata-derived-prd.md'},
-    }
-    row = _build_task_row('p', task, 1, {}, 'p/T-1', prd='plans/explicit-prd.md')
-    assert row['prd'] == 'plans/explicit-prd.md', (
-        'an explicit prd kwarg must win over metadata coalescing'
-    )
+    [row] = shape_terminal_rows('p', [task], now=datetime(2026, 11, 4, tzinfo=UTC))
+    assert row['prd'] == 'plans/x-prd.md'
 
 
 @pytest.mark.asyncio
-async def test_collect_active_tasks_includes_external_deps_with_unknown_sentinel(
+async def test_collect_tasks_with_counts_includes_external_deps_with_unknown_sentinel(
     tmp_path, monkeypatch, dummy_client,
 ):
     """A task carrying metadata.external_deps surfaces external_deps with 'unknown' sentinels."""
@@ -1239,7 +1110,7 @@ async def test_collect_active_tasks_includes_external_deps_with_unknown_sentinel
     _register_fetch_tasks(monkeypatch, _fake)
     cfg = DashboardConfig(project_root=root)
 
-    active, _ = await collect_active_tasks(client=dummy_client, config=cfg)
+    active, _ = await collect_tasks_with_counts(client=dummy_client, config=cfg)
     assert len(active) == 1
     row = active[0]
     assert row['external_deps'] == [
@@ -1249,7 +1120,7 @@ async def test_collect_active_tasks_includes_external_deps_with_unknown_sentinel
 
 
 @pytest.mark.asyncio
-async def test_collect_active_tasks_external_deps_empty_when_absent(
+async def test_collect_tasks_with_counts_external_deps_empty_when_absent(
     tmp_path, monkeypatch, dummy_client,
 ):
     """Tasks without external_deps carry external_deps=[] (no KeyError)."""
@@ -1268,7 +1139,7 @@ async def test_collect_active_tasks_external_deps_empty_when_absent(
     _register_fetch_tasks(monkeypatch, _fake)
     cfg = DashboardConfig(project_root=root)
 
-    active, _ = await collect_active_tasks(client=dummy_client, config=cfg)
+    active, _ = await collect_tasks_with_counts(client=dummy_client, config=cfg)
     assert len(active) == 1
     assert active[0]['external_deps'] == []
 
@@ -1498,7 +1369,7 @@ async def test_collect_tasks_with_counts_resolve_external_skips_completed_rows(
 
 
 @pytest.mark.asyncio
-async def test_collect_active_tasks_excludes_cancelled(
+async def test_collect_tasks_with_counts_excludes_cancelled(
     tmp_path, monkeypatch, dummy_client,
 ):
     """The collector must return ZERO cancelled rows, for the same reason."""
@@ -1521,11 +1392,11 @@ async def test_collect_active_tasks_excludes_cancelled(
     from dashboard.config import DashboardConfig
     cfg = DashboardConfig(project_root=root)
 
-    active, _ = await collect_active_tasks(client=dummy_client, config=cfg)
+    active, _ = await collect_tasks_with_counts(client=dummy_client, config=cfg)
 
     cancelled_rows = [t for t in active if t['status'] == 'cancelled']
     assert cancelled_rows == [], (
-        'collect_active_tasks must NOT return cancelled rows'
+        'collect_tasks_with_counts must NOT return cancelled rows'
     )
 
 
@@ -1535,7 +1406,7 @@ async def test_collect_active_tasks_excludes_cancelled(
 
 
 @pytest.mark.asyncio
-async def test_collect_active_tasks_includes_deferred_via_active_path(
+async def test_collect_tasks_with_counts_includes_deferred_via_active_path(
     tmp_path, monkeypatch, dummy_client,
 ):
     """deferred tasks must flow through the ACTIVE path (with resolved deps + started).
@@ -1577,7 +1448,7 @@ async def test_collect_active_tasks_includes_deferred_via_active_path(
     _register_fetch_tasks(monkeypatch, _fake_fetch)
     cfg = DashboardConfig(project_root=root)
 
-    active, _ = await collect_active_tasks(client=dummy_client, config=cfg)
+    active, _ = await collect_tasks_with_counts(client=dummy_client, config=cfg)
 
     ids = {t['id'] for t in active}
     assert 'proj/T-30' in ids, (
@@ -2144,14 +2015,14 @@ class TestDepsOutsideTheFetchedRows:
 
 
 class TestTheReturnedUnitsCarryTheShapedRows:
-    """``snapshots[label].rows.value`` is the row list ``ACTIVE_TASKS`` is joined from.
+    """``snapshots[label].rows.value`` is what ``/tasks`` serves, and the flat list is joined from it.
 
     The CACHED unit holds the raw MCP rows, because the next render shapes
-    from them. The unit the collector RETURNS must carry the shaped rows, in
-    the same ``TaskRow`` shape as ``ACTIVE_TASKS``, because that is what goes
-    on the wire. These tests pin that the two exposures cannot disagree, and
-    that putting shaped rows on the wire does not use up the raw rows in the
-    cache.
+    from them. The unit the collector RETURNS must carry the shaped rows, as
+    the shaped ``TaskRow`` list, because that is what goes on the wire. These
+    tests pin that the two exposures (the flat list the scheduler reads and
+    the units ``/tasks`` serves) cannot disagree, and that putting shaped rows
+    on the wire does not use up the raw rows in the cache.
 
     Every read goes through ``dashboard.data.tasks.mcp_tool_call``, so the real
     ``acquire_snapshot`` and its cache run underneath.
@@ -2169,13 +2040,13 @@ class TestTheReturnedUnitsCarryTheShapedRows:
         rows = [_raw_row(1, 'in-progress'), _raw_row(2, 'pending'), _raw_row(3, 'blocked')]
         return rows, {int(row['id']): row['status'] for row in rows}
 
-    async def test_active_tasks_is_the_units_rows_joined_in_root_order(
+    async def test_the_flat_list_is_the_units_rows_joined_in_root_order(
         self, tmp_path, monkeypatch, dummy_client,
     ):
-        """ACTIVE_TASKS is every root's ``rows.value``, concatenated in canonical root order.
+        """The flat list is every root's ``rows.value``, concatenated in canonical root order.
 
-        Then the two exposures cannot disagree, and γ3 can retire
-        ``ACTIVE_TASKS`` by deleting it.
+        Then the scheduler page, which reads the flat list, and ``/tasks``,
+        which reads the units, cannot disagree.
         """
         df, reify = self._roots(tmp_path, 'df', 'reify')
         mcp, _calls = _canned_mcp(*self._tree())
@@ -2247,15 +2118,15 @@ class TestTheReturnedUnitsCarryTheShapedRows:
     ):
         """A cut-off root's unit keeps ``value is None``, even when it was measured before.
 
-        The render shaped no rows for it, so ``ACTIVE_TASKS`` gets none, and
+        The render shaped no rows for it, so the flat list gets none, and
         its unit must agree. The unit could otherwise only carry the last
         good RAW list, which is unshaped and heavy on the wire, or the empty
         shaped list, which claims a measured zero at the last good's instant.
         Its census still ages, because a count needs no shaping.
 
-        The budget is squeezed through the module constant, the same idiom
-        ``TestCollectTasksBudget._tighten`` uses. That is the only way to cut
-        off a real acquisition without waiting out the shipped 14 s budget.
+        The per-project bound is injected small through ``budget=``, so a
+        real acquisition is cut off without waiting out the shipped 14 s
+        share.
         """
         import dashboard.data.task_snapshot as snapshot_mod
 
@@ -2271,9 +2142,9 @@ class TestTheReturnedUnitsCarryTheShapedRows:
 
         monkeypatch.setattr('dashboard.data.tasks.mcp_tool_call', _hangs)
         monkeypatch.setattr(snapshot_mod, 'SNAPSHOT_TTL_SECONDS', 0.0)
-        monkeypatch.setattr('dashboard.data.active_tasks._TASKS_PER_PROJECT_BUDGET', 0.05)
         active, snapshots = await collect_tasks_with_counts(
             dummy_client, config, now=_STUB_AS_OF + timedelta(seconds=20),
+            budget=replace(TASKS_BUDGET, per_project=0.05),
         )
 
         unit = snapshots['df']
@@ -2349,12 +2220,11 @@ class TestTheReturnedUnitsCarryTheShapedRows:
         Both go through ``task_is_stranded`` at ``rows.as_of``, the instant the
         rows were measured. Judging the badge at the render instant instead
         would, once the substrate has been unreachable longer than
-        ``STRANDED_HEARTBEAT_TTL``, badge every claim as abandoned while the
+        ``DEFAULT_CLAIMANT_HEARTBEAT_TTL``, badge every claim as abandoned while the
         split (judged at ``as_of``) reports none — the same rows disagreeing
         with themselves on one wire payload.
         """
         import dashboard.data.task_snapshot as snapshot_mod
-        from dashboard.data.tasks import STRANDED_HEARTBEAT_TTL
 
         (root,) = self._roots(tmp_path, 'df')
         claimed = _raw_row(1, 'in-progress')
@@ -2375,7 +2245,7 @@ class TestTheReturnedUnitsCarryTheShapedRows:
 
         monkeypatch.setattr('dashboard.data.tasks.mcp_tool_call', _rows_read_fails)
         monkeypatch.setattr(snapshot_mod, 'SNAPSHOT_TTL_SECONDS', 0.0)
-        much_later = _STUB_AS_OF + STRANDED_HEARTBEAT_TTL + timedelta(minutes=1)
+        much_later = _STUB_AS_OF + DEFAULT_CLAIMANT_HEARTBEAT_TTL + timedelta(minutes=1)
         active, snapshots = await collect_tasks_with_counts(dummy_client, config, now=much_later)
 
         unit = snapshots['df']
@@ -2486,11 +2356,9 @@ class TestCollectTasksBudget:
         _register_runtime(monkeypatch, {})
 
     @staticmethod
-    def _tighten(monkeypatch, *, total, per_project):
-        monkeypatch.setattr('dashboard.data.active_tasks._TASKS_TOTAL_BUDGET', total)
-        monkeypatch.setattr(
-            'dashboard.data.active_tasks._TASKS_PER_PROJECT_BUDGET', per_project
-        )
+    def _tighten(*, total: float, per_project: float) -> TasksBudget:
+        """The shipped budget with its total and per-project bounds shrunk."""
+        return replace(TASKS_BUDGET, total=total, per_project=per_project)
 
     async def test_returns_rows_and_one_validated_snapshot_per_root(
         self, monkeypatch, tmp_path, dummy_client
@@ -2533,9 +2401,9 @@ class TestCollectTasksBudget:
         so ``delta`` and ``epsilon`` are guaranteed to find a non-positive
         remaining budget — they can only be reached by the deadline branch.
 
-        ``_TASKS_ROOT_CONCURRENCY`` is pinned to 1 for exactly that reason,
-        and the pin is what makes the derivation above true rather than a
-        coincidence. This test is about the DEADLINE branch, not about the
+        The budget's ``root_concurrency`` is pinned to 1 for exactly that
+        reason, and the pin is what makes the derivation above true rather
+        than a coincidence. This test is about the DEADLINE branch, not about the
         width: at the shipped width the fast roots slot into the first wave
         and the never-reached branch is simply not the one under test. That
         the branch still fires at the shipped width is asserted separately by
@@ -2550,16 +2418,15 @@ class TestCollectTasksBudget:
             {'beta': _BUDGET_SLOW, 'gamma': _BUDGET_SLOW},
             done_counts={'alpha': 7},
         )
-        self._tighten(monkeypatch, total=0.3, per_project=0.2)
-        monkeypatch.setattr(
-            'dashboard.data.active_tasks._TASKS_ROOT_CONCURRENCY', 1
+        budget = replace(
+            TASKS_BUDGET, total=0.3, per_project=0.2, root_concurrency=1,
         )
         config = _budget_config(
             tmp_path, ['alpha', 'beta', 'gamma', 'delta', 'epsilon']
         )
 
         active, snapshots = await collect_tasks_with_counts(
-            client=dummy_client, config=config,
+            client=dummy_client, config=config, budget=budget,
         )
         offline, counts, degraded = (
             _offline(snapshots), _done_counts(snapshots), _degraded(snapshots)
@@ -2601,12 +2468,12 @@ class TestCollectTasksBudget:
             {'beta': _BUDGET_SLOW},
             done_counts={'alpha': 1, 'gamma': 2},
         )
-        self._tighten(monkeypatch, total=10.0, per_project=0.2)
+        budget = self._tighten(total=10.0, per_project=0.2)
         config = _budget_config(tmp_path, ['alpha', 'beta', 'gamma'])
 
         started = time.monotonic()
         active, snapshots = await collect_tasks_with_counts(
-            client=dummy_client, config=config,
+            client=dummy_client, config=config, budget=budget,
         )
         elapsed = time.monotonic() - started
         offline, counts, degraded = (
@@ -2637,11 +2504,11 @@ class TestCollectTasksBudget:
             offline=('beta',),
             done_counts={'alpha': 4},
         )
-        self._tighten(monkeypatch, total=10.0, per_project=0.2)
+        budget = self._tighten(total=10.0, per_project=0.2)
         config = _budget_config(tmp_path, ['alpha', 'beta', 'gamma'])
 
         _active, snapshots = await collect_tasks_with_counts(
-            client=dummy_client, config=config,
+            client=dummy_client, config=config, budget=budget,
         )
         offline, counts, degraded = (
             _offline(snapshots), _done_counts(snapshots), _degraded(snapshots)
@@ -2738,15 +2605,13 @@ class TestCollectTasksBudget:
         self, monkeypatch, tmp_path, dummy_client
     ):
         """(e) the whole call is bounded, not merely each project within it."""
-        import dashboard.data.active_tasks as active_tasks_mod
-
         delays = {label: _BUDGET_SLOW for label in ('beta', 'gamma', 'delta')}
         _register_shaper(monkeypatch, delays)
-        self._tighten(monkeypatch, total=0.5, per_project=0.2)
+        budget = self._tighten(total=0.5, per_project=0.2)
         config = _budget_config(tmp_path, ['alpha', 'beta', 'gamma', 'delta'])
 
         started = time.monotonic()
-        await collect_tasks_with_counts(client=dummy_client, config=config)
+        await collect_tasks_with_counts(client=dummy_client, config=config, budget=budget)
         elapsed = time.monotonic() - started
 
         sum_of_sleeps = sum(delays.values())
@@ -2757,9 +2622,9 @@ class TestCollectTasksBudget:
         )
         # +0.5s of tolerance for event-loop scheduling, the same convention as
         # test_healthz_deadline.py's elapsed assertions.
-        assert elapsed < active_tasks_mod._TASKS_TOTAL_BUDGET + 0.5, (
+        assert elapsed < budget.total + 0.5, (
             f'elapsed {elapsed:.3f}s exceeded the whole-handler budget of '
-            f'{active_tasks_mod._TASKS_TOTAL_BUDGET}s'
+            f'{budget.total}s'
         )
 
     async def test_external_status_fetch_cannot_overrun_the_handler_budget(
@@ -2781,8 +2646,6 @@ class TestCollectTasksBudget:
         same treatment the ``ext_remaining <= 0`` skip and the per-project
         ``TimeoutError`` branch already give.
         """
-        import dashboard.data.active_tasks as active_tasks_mod
-
         _register_shaper(
             monkeypatch, {}, external_deps=['dark_factory:13', 'reify:8'],
         )
@@ -2797,12 +2660,13 @@ class TestCollectTasksBudget:
         # A positive remainder when the external leg is reached: the
         # ext_remaining <= 0 skip must NOT be what saves us here, or the test
         # would pass against the unbounded code.
-        self._tighten(monkeypatch, total=1.0, per_project=0.5)
+        budget = self._tighten(total=1.0, per_project=0.5)
         config = _budget_config(tmp_path, ['alpha'])
 
         started = time.monotonic()
         active, snapshots = await collect_tasks_with_counts(
             client=dummy_client, config=config, resolve_external=True,
+            budget=budget,
         )
         elapsed = time.monotonic() - started
         offline = _offline(snapshots)
@@ -2812,9 +2676,9 @@ class TestCollectTasksBudget:
             'external-status sleep — the batched external-dep call is still '
             'unbounded, so the handler budget does not bound the handler'
         )
-        assert elapsed < active_tasks_mod._TASKS_TOTAL_BUDGET + 0.5, (
+        assert elapsed < budget.total + 0.5, (
             f'elapsed {elapsed:.3f}s exceeded the whole-handler budget of '
-            f'{active_tasks_mod._TASKS_TOTAL_BUDGET}s'
+            f'{budget.total}s'
         )
         # Degrade honestly: no status was read, so none is fabricated, and the
         # project is NOT declared offline (its rows loaded fine).
@@ -2829,7 +2693,7 @@ class TestCollectTasksBudget:
     ):
         """(f) with fast projects, nothing degrades and the payload is identical."""
         _register_shaper(monkeypatch, {}, done_counts={'alpha': 11, 'beta': 22})
-        # Shipped constants deliberately NOT tightened here: the happy path
+        # The shipped budget deliberately NOT tightened here: the happy path
         # must hold under the values that actually ship.
         config = _budget_config(tmp_path, ['alpha', 'beta'])
 
@@ -2841,32 +2705,6 @@ class TestCollectTasksBudget:
         assert _offline(snapshots) == []
         assert _done_counts(snapshots) == {'alpha': 11, 'beta': 22}
         assert [row['id'] for row in active] == ['alpha/T-1', 'beta/T-1']
-
-    async def test_collect_active_tasks_still_returns_two_elements(
-        self, monkeypatch, tmp_path, dummy_client
-    ):
-        """(g) the scheduler's caller keeps its two-element contract.
-
-        ``data/scheduler.py`` unpacks ``(active, offline)``; the snapshots are
-        absorbed by ``collect_active_tasks``, not leaked to it, and the offline
-        labels it does return are read off their kind rather than carried in a
-        parallel list.
-        """
-        _register_shaper(monkeypatch, {'beta': _BUDGET_SLOW}, done_counts={'alpha': 1})
-        self._tighten(monkeypatch, total=10.0, per_project=0.2)
-        config = _budget_config(tmp_path, ['alpha', 'beta'])
-
-        result = await collect_active_tasks(client=dummy_client, config=config)
-
-        assert len(result) == 2, (
-            f'collect_active_tasks must keep its (active, offline) shape, got '
-            f'{len(result)} elements'
-        )
-        active, offline = result
-        assert [row['project'] for row in active] == ['alpha']
-        # A degraded project is NOT offline here either — the marker is
-        # dropped by this narrower contract, not silently reclassified.
-        assert offline == []
 
 
 # ---------------------------------------------------------------------------
@@ -2980,8 +2818,6 @@ class TestCollectTasksWithCountsConcurrency:
         unbounded ``gather`` would show all 9 — the ``httpx.PoolTimeout``
         hazard ``burndown.py`` records against the shared client.
         """
-        import dashboard.data.active_tasks as at_mod
-
         config = self._n_root_config(tmp_path, 9)
         _register_runtime(monkeypatch, {})
         events = self._tracking_stub(monkeypatch)
@@ -2989,9 +2825,9 @@ class TestCollectTasksWithCountsConcurrency:
         await collect_tasks_with_counts(client=dummy_client, config=config)
 
         peak = self._max_simultaneous(events)
-        assert peak == at_mod._TASKS_ROOT_CONCURRENCY, (
-            f'peak in-flight roots was {peak}, expected exactly '
-            f'_TASKS_ROOT_CONCURRENCY={at_mod._TASKS_ROOT_CONCURRENCY} over 9 '
+        assert peak == TASKS_BUDGET.root_concurrency, (
+            f'peak in-flight roots was {peak}, expected exactly the shipped '
+            f'root_concurrency={TASKS_BUDGET.root_concurrency} over 9 '
             'roots — 1 means the sequential walk that starved the tail is '
             'still in place, 9 means the semaphore is missing (an unbounded '
             'fan-out against the single fused-memory server on the httpx '
@@ -3021,7 +2857,7 @@ class TestCollectTasksWithCountsConcurrency:
 
         import dashboard.data.active_tasks as at_mod
 
-        width = at_mod._TASKS_ROOT_CONCURRENCY
+        width = TASKS_BUDGET.root_concurrency
         config = self._n_root_config(tmp_path, 9)
         _register_runtime(monkeypatch, {})
 
@@ -3059,7 +2895,7 @@ class TestCollectTasksWithCountsConcurrency:
             newly = len(entered) - admitted
             assert 0 < newly <= width, (
                 f'wave {len(wave_sizes) + 1} admitted {newly} roots against a '
-                f'_TASKS_ROOT_CONCURRENCY of {width} — 0 means the walk '
+                f'root_concurrency of {width} — 0 means the walk '
                 'stalled with slots free, more than the width means the '
                 'semaphore is not bounding anything (an unbounded fan-out '
                 'against the single fused-memory server on the httpx client '
@@ -3130,9 +2966,8 @@ class TestCollectTasksWithCountsConcurrency:
     ):
         """(g) Per-root results are paired by ROOT, never by display label.
 
-        ``_project_label`` is the directory BASENAME, so two configured roots
-        can share one (``/a/proj`` and ``/b/proj``). Keying the gathered
-        results by label collapses them: the survivor's rows are extended into
+        Two configured roots can share a directory basename (``/a/proj`` and
+        ``/b/proj``). Keying the gathered results by basename collapses them: the survivor's rows are extended into
         ``all_active`` TWICE — duplicate ``task_uid``s, which the React tab
         uses as its map key — and the other root's rows vanish with no
         offline or degraded marker naming them. That is silent DATA LOSS, and
@@ -3183,20 +3018,17 @@ class TestCollectTasksWithCountsConcurrency:
         first 3 admissions return without awaiting, the rest hang until their
         own per-project budget ends them.
         """
-        import dashboard.data.active_tasks as at_mod
-
         config = self._n_root_config(tmp_path, 9)
         _register_runtime(monkeypatch, {})
         self._tracking_stub(monkeypatch, serve_first=3)
-        monkeypatch.setattr(at_mod, '_TASKS_PER_PROJECT_BUDGET', 0.05)
-        # Generous, deliberately: the TOTAL budget expiring is a DIFFERENT
-        # branch (tested by the fairness class). What must be exercised here
-        # is the per-project expiry.
-        monkeypatch.setattr(at_mod, '_TASKS_TOTAL_BUDGET', 5.0)
+        # The total is generous, deliberately: the TOTAL budget expiring is a
+        # DIFFERENT branch (tested by the fairness class). What must be
+        # exercised here is the per-project expiry.
+        budget = replace(TASKS_BUDGET, per_project=0.05, total=5.0)
 
         with caplog.at_level(logging.WARNING):
-            active, snapshots = (
-                await collect_tasks_with_counts(client=dummy_client, config=config)
+            active, snapshots = await collect_tasks_with_counts(
+                client=dummy_client, config=config, budget=budget,
             )
         offline, counts, degraded = (
             _offline(snapshots), _done_counts(snapshots), _degraded(snapshots)
@@ -3390,8 +3222,6 @@ class TestCollectTasksWithCountsFairness:
         the one ``_rotated_project_roots`` implements; deriving the count here
         keeps this test correct if that choice is ever revisited.
         """
-        import dashboard.data.active_tasks as at_mod
-
         config = self._n_root_config(tmp_path, 9)
         _register_runtime(monkeypatch, {})
         # DETERMINISTIC cut, not a wall-clock one. The served count must be a
@@ -3405,21 +3235,20 @@ class TestCollectTasksWithCountsFairness:
         )
         # Width 1 so the served subset is a contiguous window of the admission
         # order and the arithmetic above is exact rather than probabilistic.
-        monkeypatch.setattr(at_mod, '_TASKS_ROOT_CONCURRENCY', 1)
-        # Small enough that the six hung roots cost ~0.3s per render, large
-        # enough that no scheduling delay can starve a root that the stub
-        # above serves without awaiting. The TOTAL budget is deliberately NOT
-        # the constraint here: it is measured from before the runtime fan-out,
-        # so tightening it would reintroduce exactly the host-speed dependence
-        # this test just removed.
-        monkeypatch.setattr(at_mod, '_TASKS_PER_PROJECT_BUDGET', 0.05)
-        monkeypatch.setattr(at_mod, '_TASKS_TOTAL_BUDGET', 5.0)
-        at_mod._reset_root_rotation()
+        # The per-project share is small enough that the six hung roots cost
+        # ~0.3s per render, large enough that no scheduling delay can starve a
+        # root that the stub above serves without awaiting. The TOTAL budget
+        # is deliberately NOT the constraint here: it is measured from before
+        # the runtime fan-out, so tightening it would reintroduce exactly the
+        # host-speed dependence this test just removed.
+        budget = replace(
+            TASKS_BUDGET, root_concurrency=1, per_project=0.05, total=5.0,
+        )
 
         async def _one_render() -> set[str]:
             admissions.clear()  # serve_first counts within ONE render
-            active, _snapshots = (
-                await collect_tasks_with_counts(client=dummy_client, config=config)
+            active, _snapshots = await collect_tasks_with_counts(
+                client=dummy_client, config=config, budget=budget,
             )
             return {row['project'] for row in active}
 
@@ -3457,20 +3286,17 @@ class TestCollectTasksWithCountsFairness:
         A random shuffle would also spread the starvation but would make both
         of those impossible.
         """
-        import dashboard.data.active_tasks as at_mod
-
         config = self._n_root_config(tmp_path, 5)
         _register_runtime(monkeypatch, {})
         admissions = self._admission_recorder(monkeypatch, dwell=0.0)
         # Width 1 so admission order is unambiguous rather than a race between
         # concurrently-admitted roots.
-        monkeypatch.setattr(at_mod, '_TASKS_ROOT_CONCURRENCY', 1)
-        at_mod._reset_root_rotation()
+        width_one = replace(TASKS_BUDGET, root_concurrency=1)
 
-        await collect_tasks_with_counts(client=dummy_client, config=config)
+        await collect_tasks_with_counts(client=dummy_client, config=config, budget=width_one)
         first = list(admissions)
         admissions.clear()
-        await collect_tasks_with_counts(client=dummy_client, config=config)
+        await collect_tasks_with_counts(client=dummy_client, config=config, budget=width_one)
         second = list(admissions)
 
         assert len(first) == 5 and len(second) == 5, (
@@ -3484,49 +3310,18 @@ class TestCollectTasksWithCountsFairness:
             'operator can reason about across two consecutive renders'
         )
 
-    async def test_all_project_roots_stays_primary_first(
-        self, monkeypatch, tmp_path, dummy_client,
-    ):
-        """(c) The rotation must NOT leak into the shared root helper.
-
-        ``_all_project_roots`` has other callers that depend on primary-first
-        ordering (``app.py``, ``scheduler.py``, ``api/tasks.py``'s root count,
-        and ``test_app.py``'s patch
-        point). Rotating it in place would silently repoint every one of them
-        at a different project — a far larger blast radius than the Tasks tab.
-        """
-        import dashboard.data.active_tasks as at_mod
-
-        config = self._n_root_config(tmp_path, 5)
-        _register_runtime(monkeypatch, {})
-        self._admission_recorder(monkeypatch, dwell=0.0)
-        at_mod._reset_root_rotation()
-
-        for render in range(4):
-            await collect_tasks_with_counts(client=dummy_client, config=config)
-            roots = at_mod._all_project_roots(config)
-            assert roots[0] == config.project_root, (
-                f'after {render + 1} render(s) _all_project_roots returned '
-                f'{[r.name for r in roots]} — the primary root is no longer '
-                'first, so the rotation has leaked into the shared helper and '
-                'every other caller now reads a different project'
-            )
-
     async def test_output_order_is_unaffected_by_rotation(
         self, monkeypatch, tmp_path, dummy_client,
     ):
-        """(d) Rotation changes ADMISSION order only, never rendered order.
+        """(c) Rotation changes ADMISSION order only, never rendered order.
 
         If the rotated order reached the payload, the Tasks table would
         reshuffle on every 3 s poll — a fix for invisibility that trades it
         for unreadability.
         """
-        import dashboard.data.active_tasks as at_mod
-
         config = self._n_root_config(tmp_path, 5)
         _register_runtime(monkeypatch, {})
         self._admission_recorder(monkeypatch, dwell=0.0)
-        at_mod._reset_root_rotation()
 
         expected = [f'proj-{i:02d}' for i in range(5)]
         for render in range(4):
@@ -3539,3 +3334,96 @@ class TestCollectTasksWithCountsFairness:
                 f'{expected} — the rendered order must stay canonical '
                 'primary-first root order at every rotation offset'
             )
+
+
+# ---------------------------------------------------------------------------
+# TestDeferredRowsCarryTheirHold — the `deferral` row key, read against the
+# unit's own referents (task 6527)
+# ---------------------------------------------------------------------------
+
+
+class TestDeferredRowsCarryTheirHold:
+    """The collector words each deferred row's hold from what its unit measured.
+
+    The carrier status comes from the unit's status map, because a done
+    carrier is never among the ACTIVE rows. The holder liveness comes from
+    the unit's own read of /proc.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _isolate(self, monkeypatch):
+        _register_runtime(monkeypatch, {})
+        yield
+
+    @pytest.fixture()
+    def fixture_rows(self) -> tuple[FixtureRow, ...]:
+        live_holder = capture(os.getpid())
+        assert live_holder is not None
+        return deferral_fixture(now=DEFERRAL_NOW, live_holder=live_holder)
+
+    @staticmethod
+    async def _collect(monkeypatch, tmp_path, client, fixture_rows, *, map_fails=False):
+        canned = CannedMCP(rows=raw_rows(fixture_rows), status_map=status_map(fixture_rows))
+        if map_fails:
+            canned.fail_when = lambda call: call['tool'] == 'get_statuses'
+        monkeypatch.setattr('dashboard.data.tasks.mcp_tool_call', canned)
+        root = tmp_path / 'dark-factory'
+        root.mkdir(parents=True, exist_ok=True)
+        active, _snapshots = await collect_tasks_with_counts(
+            client, DashboardConfig(project_root=root), now=DEFERRAL_NOW,
+        )
+        return {int(row['id'].rsplit('T-', 1)[-1]): row for row in active}
+
+    async def test_a_done_carrier_outside_the_rows_reads_closable(
+        self, monkeypatch, tmp_path, dummy_client, fixture_rows
+    ):
+        rows = await self._collect(monkeypatch, tmp_path, dummy_client, fixture_rows)
+
+        assert CARRIER_DONE not in rows, 'a done carrier is never an ACTIVE row'
+        assert rows[CLOSABLE]['deferral']['label'] == (
+            f'parked: carried by #{CARRIER_DONE} (closable)'
+        ), 'the carrier status must come from the unit\'s status map'
+
+    async def test_the_live_holder_reads_live(
+        self, monkeypatch, tmp_path, dummy_client, fixture_rows
+    ):
+        rows = await self._collect(monkeypatch, tmp_path, dummy_client, fixture_rows)
+
+        assert rows[HELD_LIVE]['deferral']['label'].endswith(' (live)')
+        assert rows[HELD_LIVE]['deferral']['state'] == 'held'
+
+    async def test_only_deferred_rows_carry_the_key_and_an_unrecorded_one_is_null(
+        self, monkeypatch, tmp_path, dummy_client, fixture_rows
+    ):
+        rows = await self._collect(monkeypatch, tmp_path, dummy_client, fixture_rows)
+
+        assert 'deferral' in rows[UNRECORDED] and rows[UNRECORDED]['deferral'] is None
+        for task_id in (STRAY, PLAIN):
+            assert 'deferral' not in rows[task_id], task_id
+
+    async def test_every_deferred_row_reads_the_shared_verdict(
+        self, monkeypatch, tmp_path, dummy_client, fixture_rows
+    ):
+        rows = await self._collect(monkeypatch, tmp_path, dummy_client, fixture_rows)
+
+        expected = expected_needs_human(fixture_rows, now=DEFERRAL_NOW)
+        assert {task_id for task_id, row in rows.items() if 'deferral' in row} == set(expected)
+        assert expected.pop(UNRECORDED) is not None
+        shown = {task_id: rows[task_id]['deferral']['needs_human'] for task_id in expected}
+        assert shown == {
+            task_id: None if reason is None else reason.value
+            for task_id, reason in expected.items()
+        }
+
+    async def test_an_unread_status_map_leaves_every_carrier_unknown(
+        self, monkeypatch, tmp_path, dummy_client, fixture_rows
+    ):
+        rows = await self._collect(
+            monkeypatch, tmp_path, dummy_client, fixture_rows, map_fails=True,
+        )
+
+        for task_id in (CLOSABLE, ORPHANED, CARRIED_LIVE, CARRIER_GONE):
+            hold = rows[task_id]['deferral']
+            assert hold['label'].endswith(' (carrier status unknown)'), hold
+            assert hold['state'] == 'unknown'
+            assert hold['needs_human'] is None

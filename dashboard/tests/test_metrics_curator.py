@@ -275,39 +275,32 @@ async def test_get_curator_sparks_order_by_ts(metrics_db_path: Path):
 
 @pytest.mark.asyncio
 async def test_downsample_curator_snapshots_keeps_latest_per_hour(metrics_db_path: Path):
-    """After downsample_metrics, only the latest-per-hour row survives for >7d-old rows."""
-    now = datetime.now(UTC)
-    old = now - timedelta(days=10)
+    """After downsample_metrics, rows older than 7d keep one row per old hour."""
+    now = datetime(2026, 3, 1, 12, 0, tzinfo=UTC)
+    later_old_hour = (now - timedelta(days=10)).replace(minute=0, second=0, microsecond=0)
+    earlier_old_hour = later_old_hour - timedelta(hours=1)
+    seeds = [
+        (earlier_old_hour + timedelta(minutes=10), 11, 0),
+        (earlier_old_hour + timedelta(minutes=50), 19, 0),
+        (later_old_hour + timedelta(minutes=10), 1, 0),
+        (later_old_hour + timedelta(minutes=50), 9, 0),
+        # Very old row (100 days) — should be dropped entirely
+        (now - timedelta(days=100), 99, 1),
+    ]
 
     conn_sync = sqlite3.connect(str(metrics_db_path))
-    ts_early = (old + timedelta(minutes=5)).isoformat()
-    ts_late = (old + timedelta(minutes=55)).isoformat()
-    conn_sync.execute(
+    conn_sync.executemany(
         'INSERT INTO curator_snapshots '
         '(ts, pending_total, capped_now, p50_active_ms, p90_active_ms, p99_active_ms) '
-        'VALUES (?, ?, ?, ?, ?, ?)',
-        (ts_early, 1, 0, None, None, None),
-    )
-    conn_sync.execute(
-        'INSERT INTO curator_snapshots '
-        '(ts, pending_total, capped_now, p50_active_ms, p90_active_ms, p99_active_ms) '
-        'VALUES (?, ?, ?, ?, ?, ?)',
-        (ts_late, 9, 0, None, None, None),
-    )
-    # Very old row (100 days) — should be dropped entirely
-    very_old = (now - timedelta(days=100)).isoformat()
-    conn_sync.execute(
-        'INSERT INTO curator_snapshots '
-        '(ts, pending_total, capped_now, p50_active_ms, p90_active_ms, p99_active_ms) '
-        'VALUES (?, ?, ?, ?, ?, ?)',
-        (very_old, 99, 1, None, None, None),
+        'VALUES (?, ?, ?, NULL, NULL, NULL)',
+        [(ts.isoformat(), pending, capped) for ts, pending, capped in seeds],
     )
     conn_sync.commit()
     conn_sync.close()
 
     rw = await aiosqlite.connect(str(metrics_db_path))
     try:
-        await downsample_metrics(rw)
+        await downsample_metrics(rw, now=now)
     finally:
         await rw.close()
 
@@ -315,7 +308,7 @@ async def test_downsample_curator_snapshots_keeps_latest_per_hour(metrics_db_pat
     rows = inspect.execute('SELECT pending_total FROM curator_snapshots ORDER BY ts').fetchall()
     inspect.close()
 
-    assert rows == [(9,)], f'Expected [(9,)], got {rows}'
+    assert rows == [(19,), (9,)], f'Expected [(19,), (9,)], got {rows}'
 
 
 # ---------------------------------------------------------------------------

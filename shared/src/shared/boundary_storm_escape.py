@@ -19,14 +19,13 @@ near-verbatim copies of ``mcp_markup_middleware``'s, including one 34-line
 contiguous identical block covering the whole of ``_record_storm``. That is the
 lock-step duplication INV-5 forbids and the classic drift shape: a fix to the
 dormant-counter sweep or to the summary's key set would have had two homes and
-only one of them would have been edited. This module is the ONE home.
-``uuid_prefix_guard`` composes it today; migrating ``mcp_markup_middleware``
-onto it is the one obvious follow-up, and until that lands the two bodies still
-differ (that module is outside the extracting task's declared file scope).
+only one of them would have been edited. This module is the ONE home, and
+both guards compose it (``mcp_markup_middleware`` since task 5102).
 
-``StormCounter`` itself is untouched and gains no new mode. This is a
-CONSUMER of it — the per-key dict, the dormant sweep and the summary shape a
-boundary guard needs — not a fourth counting policy.
+Counting is delegated to ``shared.storm_counter.KeyedStormCounters``, the one
+keyed registry. This module owns only the guard-facing half: the storm record's
+shape, the operator-facing ERROR line and the sink filing. It is not a fourth
+counting policy.
 """
 
 from __future__ import annotations
@@ -34,10 +33,10 @@ from __future__ import annotations
 import inspect
 import logging
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
 
-from shared.storm_counter import StormCounter
+from shared.storm_counter import KeyedStormCounters
 
 __all__ = [
     'BoundaryStormEscape',
@@ -53,6 +52,14 @@ logger = logging.getLogger(__name__)
 #: is largely async in this repo, so both shapes are legitimate things to be
 #: handed and :func:`call_sink` accepts either.
 Sink = Callable[[dict[str, Any]], Any | Awaitable[Any]]
+
+#: The keys a storm record (or its sink record) carries of its own. A per-call
+#: ``crossing`` fact may not reuse one: it would silently overwrite the burst's
+#: own numbers, or its attribution, in the record an operator triages.
+_RESERVED_RECORD_KEYS = frozenset({
+    'error_type', 'count', 'threshold', 'window_seconds', 'outcome', 'project',
+    'callers',
+})
 
 
 async def call_sink(sink: Sink, record: dict[str, Any], channel: str, *, owner: str) -> Any:
@@ -96,10 +103,16 @@ class BoundaryStormEscape:
     greppable prefix of the operator-facing ERROR — both are the composing
     guard's vocabulary, which is why they are supplied rather than derived.
 
-    *threshold* and *window_seconds* are PUBLIC and read at every
-    :meth:`record`, never captured into the counters. That is ``StormCounter``'s
-    reload-safety contract: a registration site whose numbers come from a
-    green-tier config leaf can rebind them live.
+    *threshold*, *window_seconds* and *time_provider* are PUBLIC and read at
+    every :meth:`record`, never captured into the counters. That is
+    ``StormCounter``'s reload-safety contract: a registration site whose numbers
+    come from a green-tier config leaf can rebind them live, and a test can tune
+    a REGISTERED guard without reaching private state.
+
+    *names_callers* is structural. When set, every storm carries ``callers``,
+    the distinct per-call ``caller=`` labels of its window. When unset, the
+    record has no such slot and a ``caller=`` is a wiring bug. *log_advice* is a
+    sentence appended to the ERROR line, telling the operator where to route it.
 
     The counters are held PER INSTANCE, so no burst state bleeds between
     servers, or between tests in one process.
@@ -115,22 +128,24 @@ class BoundaryStormEscape:
         threshold: int = 3,
         window_seconds: float = 3600.0,
         time_provider: Callable[[], float] = time.time,
+        names_callers: bool = False,
+        log_advice: str = '',
     ) -> None:
         self.threshold = threshold
         self.window_seconds = window_seconds
+        self.time_provider = time_provider
         self._owner = owner
         self._error_type = error_type
         self._log_event = log_event
+        self._log_advice = log_advice
+        self._names_callers = names_callers
         self._escalation_sink = escalation_sink
-        self._time_provider = time_provider
-        # ONE COUNTER PER KEY, not one counter with a composed label. MEASURED
-        # (``mcp_markup_middleware``): StormCounter holds a single deque and a
-        # single _last_fire_ts, so its count spans EVERY event in the window
-        # regardless of label — a label buys per-key ATTRIBUTION, never a
-        # per-key THRESHOLD. Pooling would fire an alarm naming a project or an
-        # outcome that never burst, and an operator sent chasing a burst that
-        # did not happen learns to ignore the alarm.
-        self._counters: dict[str, StormCounter] = {}
+        self._counters: KeyedStormCounters[str] = KeyedStormCounters()
+
+    @property
+    def names_callers(self) -> bool:
+        """Whether storms carry ``callers``; fixed at construction."""
+        return self._names_callers
 
     @property
     def tracked_keys(self) -> frozenset[str]:
@@ -142,57 +157,93 @@ class BoundaryStormEscape:
         than being inferred from a private dict. Read-only by construction — a
         frozenset, so a reader cannot evict a live counter by accident.
         """
-        return frozenset(self._counters)
+        return self._counters.tracked_keys
 
-    async def record(self, outcome: str, project: str | None) -> dict[str, Any] | None:
+    async def record(
+        self,
+        outcome: str,
+        project: str | None,
+        *,
+        caller: str | None = None,
+        crossing: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
         """Count one absorbed *outcome*; escalate and return a summary iff a burst fired.
 
-        Keyed by ``(project, outcome)`` as a single string, which is both the
-        key the counter dict is indexed by and the label the summary is
-        attributed with — one spelling, so the two cannot disagree.
+        Keyed by ``(project, outcome)`` as a single string, so neither a second
+        project nor a second outcome can pool into a premature fire. *caller*
+        is the event's ATTRIBUTION label, never part of the key: it names who
+        was in the window without changing when the window fires.
+
+        *crossing* holds facts about THIS call, which matter only if it is the
+        one that crosses the threshold. They are merged into the record after
+        its base keys, and none may reuse one of them.
 
         Returns ``None`` on the overwhelmingly common non-firing path, so a
         caller folds the result into its response with a single ``is not None``
         rather than having to know what a quiet window looks like.
-        """
-        key = f'{project}\x1f{outcome}'
-        counter = self._counters.get(key)
-        if counter is None:
-            counter = StormCounter(time_provider=self._time_provider)
-            self._counters[key] = counter
 
-        summary = counter.record(
+        :raises ValueError: on a *caller* without ``names_callers``, or a
+            *crossing* key that collides with the record's own.
+        """
+        crossing = crossing or {}
+        self._require_wiring(caller, crossing)
+        summary = self._counters.record(
+            f'{project}\x1f{outcome}',
             threshold=self.threshold,
             window_seconds=self.window_seconds,
-            label=key,
+            label=caller,
+            now=self.time_provider(),
         )
-
-        # `project` is caller-supplied and one counter per key means one object
-        # per key ever seen — so sweep the dormant ones, exactly as the
-        # MemoryService consumer StormCounter.prune() was written for.
-        for other, dormant in list(self._counters.items()):
-            if other != key and dormant.prune(self.window_seconds) == 0:
-                del self._counters[other]
-
         if summary is None:
             return None
 
-        storm = {
+        storm: dict[str, Any] = {
             'count': summary['count'],
             'threshold': summary['threshold'],
             'window_seconds': summary['window_seconds'],
             'outcome': outcome,
             'project': project,
+            **crossing,
         }
-        # ERROR and greppable. The summary a guard folds into its response
-        # reaches ONLY the caller, which is the one party that already knows
-        # something happened, so the operator-facing half cannot ride on it.
-        logger.error(
-            '%s: %d %s outcome(s) in %ss for project=%r',
-            self._log_event, storm['count'], outcome, storm['window_seconds'], project,
-        )
+        if self._names_callers:
+            storm['callers'] = summary['labels']
+        self._log_burst(storm, crossing)
         await self._file_escalation(storm)
         return storm
+
+    def _require_wiring(self, caller: str | None, crossing: Mapping[str, Any]) -> None:
+        if caller is not None and not self._names_callers:
+            raise ValueError(
+                f'caller={caller!r} was passed to a {self._owner} storm escape '
+                'built without names_callers=True; its storms carry no callers '
+                'slot and would silently drop the attribution. Construct it '
+                'with names_callers=True, or drop the caller.'
+            )
+        collisions = sorted(_RESERVED_RECORD_KEYS.intersection(crossing))
+        if collisions:
+            raise ValueError(
+                f'crossing key(s) {", ".join(map(repr, collisions))} collide with '
+                f"the {self._owner} storm record's own keys and would overwrite "
+                'them; give the crossing fact a name of its own.'
+            )
+
+    def _log_burst(self, storm: dict[str, Any], crossing: Mapping[str, Any]) -> None:
+        """ONE ERROR line per burst, greppable by *log_event*.
+
+        The summary a guard folds into its response reaches ONLY the caller,
+        which is the one party that already knows something happened, so the
+        operator-facing half cannot ride on it. Crossing facts are rendered
+        under the record's own key names, so a key read off an escalation
+        record greps straight to its line.
+        """
+        advice = f' — {self._log_advice}' if self._log_advice else ''
+        rendered = ' '.join(f'{key}={value!r}' for key, value in crossing.items())
+        suffix = f'; crossing call {rendered}' if crossing else ''
+        logger.error(
+            '%s: %d %s outcome(s) in %ss for project=%r%s%s',
+            self._log_event, storm['count'], storm['outcome'],
+            storm['window_seconds'], storm['project'], advice, suffix,
+        )
 
     async def _file_escalation(self, storm: dict[str, Any]) -> None:
         """Hand the burst to the injected sink; never change an outcome.

@@ -4,8 +4,8 @@
 cache's abandon-don't-cancel policy deliberately never cancels — correct while
 the process runs, since a late store still heals the key for the next caller.
 ``lifespan``'s shutdown, though, cancels exactly the tasks it started itself —
-``collector_task``, ``metrics_task`` and the ``http_pool`` orphan reaper — so a
-bypass started under one app outlives it: the caches are
+the burndown and metrics samplers (when ``config.samplers_enabled``) and the
+``http_pool`` orphan reaper — so a bypass started under one app outlives it: the caches are
 module-level and so process-global, and it keeps pinning a connection on an
 ``httpx.AsyncClient`` that is about to be closed.
 
@@ -20,8 +20,8 @@ Its own module rather than a section of ``test_mcp_fanout.py`` (~2900 lines) or
 shutdown contract, which makes sense read in isolation.
 
 The second clause pinned here is the teardown's ORDERING contract: the reap
-sits above the store, pool and client closes, so anything escaping it would
-skip all four and strand exactly the writable WAL connections whose ``__del__``
+runs in a ``try`` whose ``finally`` closes the stores, pool and client, because
+anything escaping a flat reap-then-close sequence would skip all four and strand exactly the writable WAL connections whose ``__del__``
 later queues work onto a closed loop. The hook added to prevent that failure
 would otherwise be capable of causing it.
 
@@ -147,14 +147,16 @@ class TestLifespanReapsDetachedBypassRefreshes:
 class TestLifespanClosesItsResourcesEvenIfTheReapFails:
     """A failing teardown step must not take the closes below it with it.
 
-    ``lifespan``'s teardown is a flat sequence: the reap, then
+    Were ``lifespan``'s teardown a flat sequence — the reap, then
     ``burndown_store.close()``, ``metrics_store.close()``, ``pool.close_all()``
-    and ``http_client.aclose()``. Anything escaping the reap skips all four,
-    stranding two writable WAL connections and a ``DbPool`` — the handles
+    and ``http_client.aclose()`` — anything escaping the reap would skip all
+    four, stranding two writable WAL connections and a ``DbPool``: the handles
     whose finalisers queue work onto a by-then-closed loop, which is the
     ``RuntimeError: Event loop is closed`` failure this same lifespan's
-    docstring records for task 3466. The shutdown hook this task ADDED to
-    prevent stranded work would be capable of causing it.
+    docstring records for task 3466. The shutdown hook added to prevent
+    stranded work would then be capable of causing it. That hazard is why the
+    teardown runs the reap in a ``try`` and the closes in the ``finally``
+    through ``_close_each``.
 
     The hazard is structural, so it is closed structurally rather than by an
     argument that nothing above the closes can raise any more.

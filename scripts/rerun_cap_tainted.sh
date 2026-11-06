@@ -11,8 +11,9 @@
 #
 # WHY A CAP-TAINTED RERUN SHOULD NOW BE RARE. An eval run no longer dies
 # on the first cap it meets: run_architect_eval routes every invocation
-# through invoke_with_cap_retry with 48h of patience, resuming the capped
-# session via --resume on whichever account frees up first, so banked
+# through invoke_with_cap_retry with the shared default cap-wait patience
+# (shared/src/shared/cli_invoke.py::_DEFAULT_CAP_WAIT_SANITY_SECS), resuming
+# the capped session via --resume on whichever account frees up first, so banked
 # spend survives the failover. A trial reaching this script means that
 # tolerance was exhausted, not merely tested. Reach for it when a campaign
 # actually recorded cap_tainted trials — not as a routine second pass.

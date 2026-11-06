@@ -1,7 +1,7 @@
 """Recon-initiated Mem0 deletion tombstones and the protected-record predicates
-(tasks 3041, 4375).
+(tasks 3041, 4375, 6241).
 
-Three units live here, with DIFFERENT consumers. They are attributed
+Four units live here, with DIFFERENT consumers. They are attributed
 separately rather than lumped together because this module's whole value is
 that a reader can tell WHICH deletion paths are guarded without going and
 checking each one:
@@ -20,6 +20,11 @@ checking each one:
   neither, and does not need to: it trims a pool it enumerated by
   construction, so it is never at risk of matching a record belonging to
   someone else. Its only mentions of these names are comments.
+- The pool-membership predicate (:func:`is_foreign_kind_record`, task 6241)
+  is consumed at three points: the in-cycle ``_sweep_stale_mem0_pool`` (for
+  the callers that opt in with ``pool_kind``),
+  ``reconciliation.stages.task_knowledge_sync._TasklessRetirement.permits``,
+  and the manual sweep's ``protection_reason``.
 
 Why this module exists
 ----------------------
@@ -47,10 +52,11 @@ because they are independent vocabularies answering different questions:
   cycle_summary record.
 - ``record_type == 'ledger_stamp'`` (task 2468) DISCRIMINATES the
   deterministic Python-written mirror of the authoritative ledger row from
-  the LLM-authored ``'narrative'`` reconstruction write in
-  ``reconciliation.prompts.stage2``. Task 2468 shipped ``record_type`` as
-  deliberately write-only ("no reader ... one lands alongside the tooling
-  that needs it"); this module is its first real reader.
+  the LLM-authored ``'narrative'`` reconstruction write that task 3734
+  retired, whose records can still exist in historical payloads. Task 2468
+  shipped ``record_type`` as deliberately write-only ("no reader ... one
+  lands alongside the tooling that needs it"); this module is its first real
+  reader.
 
 Checking both means a record missing either tag — an LLM narrative that
 omits ``record_type``, or a mirror whose ``kind`` was overwritten — is still
@@ -106,6 +112,7 @@ import json
 import logging
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
+from typing import TypeGuard
 
 from fused_memory.reconciliation.recon_ledger import (
     RECORD_KIND_MEM0_TOMBSTONE,
@@ -133,6 +140,7 @@ __all__ = [
     'MEM0_TOMBSTONE_TTL_DAYS',
     'PROTECTED_AUDIT_KINDS',
     'RECORD_KIND_MEM0_TOMBSTONE',
+    'is_foreign_kind_record',
     'is_protected_audit_record',
     'is_protected_mirror_record',
     'record_mem0_deletion_tombstone',
@@ -191,10 +199,12 @@ _KIND_CYCLE_SUMMARY: str = CYCLE_SUMMARY_KIND
 # as long as its task stays open. All 40 measured victims would have survived
 # on that arm alone (task 452 is ``deferred``, which is not terminal). This
 # denylist is defence in depth for the residual intersection only: a permanent
-# audit record whose cited task LATER goes terminal. The manual sweep's primary
-# arm is instead its foreign-kind arm
-# (``fused-memory/scripts/sweep_orphan_flag_markers.py::protection_reason``),
-# because its ``--terminal-drain`` inverts the terminal gate.
+# audit record whose cited task LATER goes terminal. That gate is the
+# flag_for_stage2 collector's primary arm. Both stage1_flag_marker collectors —
+# the in-cycle ``_sweep_stale_mem0_flag_markers`` and the manual
+# ``fused-memory/scripts/sweep_orphan_flag_markers.py::protection_reason``,
+# whose ``--terminal-drain`` inverts the terminal gate — use
+# :func:`is_foreign_kind_record` as theirs (tasks 5286, 6241).
 PROTECTED_AUDIT_KINDS: frozenset[str] = frozenset({'cadence_check'})
 
 # Identifying victim keys copied into a tombstone payload. Deliberately an
@@ -290,6 +300,23 @@ def is_protected_audit_record(metadata) -> bool:
         return False
     kind = metadata.get('kind')
     return isinstance(kind, str) and kind in PROTECTED_AUDIT_KINDS
+
+
+def is_foreign_kind_record(metadata, pool_kind: str) -> TypeGuard[dict]:
+    """Return True when *metadata* declares a ``kind`` other than *pool_kind*.
+
+    A marker pool's members carry either no ``kind`` or the pool's own marker
+    kind, so a declared different kind is positive evidence that the record
+    belongs to another pool, and a marker-GC sweep of this pool must not
+    delete it (tasks 5286, 6241).
+
+    Fully defensive: a non-dict returns ``False``, and ``kind`` is compared
+    with ``!=``, never set membership, so an unhashable kind cannot raise.
+    """
+    if not isinstance(metadata, dict):
+        return False
+    kind = metadata.get('kind')
+    return kind is not None and kind != pool_kind
 
 
 def _build_tombstone_record(

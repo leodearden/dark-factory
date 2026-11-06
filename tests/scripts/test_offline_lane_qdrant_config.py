@@ -88,6 +88,11 @@ def test_offline_lane_qdrant_config_round_trips_through_config_model(
         "round-trip 'medium' from the committed YAML — check for a field "
         "rename/typo in config.py"
     )
+    assert command.outage_probe == "python scripts/lane_dependency_probe.py", (
+        "the 'qdrant-integration' entry's .outage_probe did not round-trip "
+        "'python scripts/lane_dependency_probe.py' from the committed YAML — "
+        "check for a field rename/typo in config.py"
+    )
     assert command.enabled is True, (
         "the 'qdrant-integration' entry's .enabled is not True — the "
         "offline-lane runner skips disabled commands entirely, so a committed "

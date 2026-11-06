@@ -46,8 +46,8 @@ def _census_report_damage(path: Path) -> str | None:
         return f'not JSON: {exc}'
     try:
         disclosures = _probe().derive_registry_candidates([], payload, ()).disclosures
-    except (AttributeError, TypeError) as exc:
-        return f"the probe's reader cannot walk it to a topic table: {exc!r}"
+    except _probe().CensusShapeError as exc:
+        return f"the probe's reader refuses its topic table: {exc}"
     bad_values = disclosures['census_rows_malformed_value']
     bad_counts = disclosures['census_rows_malformed_count']
     if bad_values or bad_counts:

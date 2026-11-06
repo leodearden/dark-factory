@@ -1,0 +1,5 @@
+{"stream": "S19", "prd_path": "docs/prds/review-all-device-last-seen-has-one-reader.md", "sidecar_path": "docs/prds/review-all-device-last-seen-has-one-reader.capability-manifest.yaml",
+ "filed": [{"label": "alpha", "task_id": "1067", "priority": "medium", "x_finding_key": ["fk-51d48665cd2b"], "depends_on": ["210"]}, {"label": "beta", "task_id": "1013", "priority": "high", "x_finding_key": ["fk-057a2dcb1a54", "fk-03cb67c8c89b"], "depends_on": ["210", "1067"], "note": "adopted in place; priority raised medium->high"}],
+ "held_leaves": [], "gate_dependencies_added": ["1013"], "commit_planning_result": "1067, 1013 pending; sidecar stamped",
+ "lead_rulings": ["fk-29f40e45f529 stamped on task 210 by the lead (merge-phase task, metadata merge)."],
+ "notes": "S23-beta1's held dependency on S19-alpha resolves to 1067."}

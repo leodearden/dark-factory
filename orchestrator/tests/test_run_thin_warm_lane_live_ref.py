@@ -1,7 +1,7 @@
 """``GitOps._run_thin_warm_lane`` against the REAL shipped thin-warm-lane.sh.
 
 Task 5307.  The script now refuses to thin a lane a live process references
-(its T4 gate; ``orchestrator/scripts/warm-lane/README.md`` "Delta 12") with the
+(its T4 gate; ``orchestrator/scripts/warm-lane/README.md`` "Delta 17") with the
 same exit 75 it uses for a held flock.  This pins the wrapper's side of that
 contract end to end: the refusal stays a benign DEBUG skip (never WARNING,
 inv.11), dark-factory's log can still tell WHICH gate refused, because the

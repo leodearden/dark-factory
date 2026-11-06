@@ -1,10 +1,12 @@
 """Tests for resolve_project_id() — converts filesystem project_root to logical project_id."""
 
 import logging
+import os
 from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
+from shared.project_layout import known_project_roots
 
 from fused_memory.models.scope import (
     KNOWN_PROJECT_ROOTS_ENV,
@@ -94,7 +96,7 @@ class TestReadDeclaredProjectId:
 
     def test_hyphenated_declared_value_is_normalized(self, tmp_path):
         """A hyphenated declared value normalizes with the same
-        _to_underscore_canonical rule resolve_project_id uses."""
+        normalize_project_id rule resolve_project_id uses."""
         d = tmp_path / 'solar-challenge'
         d.mkdir()
         self._write_manifest(d, 'project_id: "my-solar-challenge"\n')
@@ -279,9 +281,15 @@ class TestKnownProjectRootsFromEnv:
         monkeypatch.setenv(KNOWN_PROJECT_ROOTS_ENV, '/a,,,/b,')
         assert known_project_roots_from_env() == ['/a', '/b']
 
-    def test_custom_env_var(self, monkeypatch):
-        monkeypatch.setenv('SOME_OTHER_VAR', '/x,/y')
-        assert known_project_roots_from_env('SOME_OTHER_VAR') == ['/x', '/y']
+    def test_entries_are_path_normalised(self, monkeypatch):
+        monkeypatch.setenv(KNOWN_PROJECT_ROOTS_ENV, ' /a/b/ ,,//c//d/,/e ')
+        assert known_project_roots_from_env() == ['/a/b', '//c/d', '/e']
+
+    def test_agrees_with_the_shared_parser_on_unnormalised_entries(self, monkeypatch):
+        monkeypatch.setenv(KNOWN_PROJECT_ROOTS_ENV, ' /a/b/ ,,//c//d/,/e ')
+        assert known_project_roots_from_env() == [
+            str(root) for root in known_project_roots(os.environ)
+        ]
 
 
 class TestIsPhantomProjectRoot:

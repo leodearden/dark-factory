@@ -138,3 +138,5 @@ tasks:
       paths:
       - dashboard/tests/
       expect: present
+signal_leaves:
+- gamma

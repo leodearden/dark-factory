@@ -19,6 +19,8 @@ INV-11 `no-silent-fail-soft`, INV-4 `storm-escape-required`, INV-9
 `one-fact-one-home` (`docs/legibility/design-invariants.md`).
 **Write-tag:** `agent_id="claude-info-l0-router-prd"`.
 
+> **Amended 2026-10-12** by plans/offline-lane-red-path-prd.md: the lane no longer files an L0 info at filing; it raises one level-1 `dependency_discovered` escalation per covering task after `git.offline_lane_red_unlanded_hours` (D11).
+
 **Code anchors** verified against main `a24b1fb665` (2026-09-08). Main moves
 fast — cite-by-symbol; re-locate at implementation time.
 

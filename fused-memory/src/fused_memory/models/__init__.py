@@ -2,10 +2,14 @@
 
 from fused_memory.models.enums import (
     GRAPHITI_PRIMARY,
+    LLM_CLASSIFIER_FAILURES,
     MEM0_PRIMARY,
+    ClassificationFallback,
     MemoryCategory,
     QueryType,
     SourceStore,
+    routes_to_graphiti,
+    routes_to_mem0,
 )
 from fused_memory.models.memory import (
     AddEpisodeResponse,
@@ -19,9 +23,11 @@ from fused_memory.models.scope import Scope
 
 __all__ = [
     'GRAPHITI_PRIMARY',
+    'LLM_CLASSIFIER_FAILURES',
     'MEM0_PRIMARY',
     'AddEpisodeResponse',
     'AddMemoryResponse',
+    'ClassificationFallback',
     'ClassificationResult',
     'EpisodeStatus',
     'MemoryCategory',
@@ -30,4 +36,6 @@ __all__ = [
     'ReadRouteResult',
     'Scope',
     'SourceStore',
+    'routes_to_graphiti',
+    'routes_to_mem0',
 ]

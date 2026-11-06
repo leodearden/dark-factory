@@ -1335,7 +1335,7 @@ class TestRestartClearsMergeRetryPending:
         manager.attach_mock(harness.scheduler.update_task, 'update_task')  # type: ignore[arg-type]
         manager.attach_mock(harness.scheduler.set_task_status, 'set_task_status')  # type: ignore[arg-type]
 
-        await harness._action_teardown_and_set_status('task-1', 'pending', 'restart')
+        await harness._action_teardown_and_set_status('task-1', 'pending', 'restart', escalation_id='esc-task-1-1')
 
         replaced = _replace_metadata_calls(harness.scheduler.update_task)  # type: ignore[arg-type]
         assert len(replaced) == 1, (
@@ -1367,7 +1367,7 @@ class TestRestartClearsMergeRetryPending:
         )
         harness.is_workflow_active = MagicMock(return_value=False)
 
-        await harness._action_teardown_and_set_status('task-1', 'pending', 'restart')
+        await harness._action_teardown_and_set_status('task-1', 'pending', 'restart', escalation_id='esc-task-1-1')
 
         harness.scheduler.update_task.assert_not_awaited()  # type: ignore[attr-defined]
         harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
@@ -1387,7 +1387,7 @@ class TestRestartClearsMergeRetryPending:
         )
         harness.is_workflow_active = MagicMock(return_value=False)
 
-        await harness._action_teardown_and_set_status('task-1', 'cancelled', 'abandon')
+        await harness._action_teardown_and_set_status('task-1', 'cancelled', 'abandon', escalation_id='esc-task-1-1')
 
         assert _replace_metadata_calls(harness.scheduler.update_task) == [], (  # type: ignore[arg-type]
             'abandon must make no stamp-clearing write'
@@ -1426,7 +1426,7 @@ class TestRestartClearsMergeRetryPending:
         harness.is_workflow_active = MagicMock(side_effect=lambda _tid: not cancelled)
         harness.config.terminal_status_hard_cancel_polls = 3
 
-        await harness._action_teardown_and_set_status('task-1', 'pending', 'restart')
+        await harness._action_teardown_and_set_status('task-1', 'pending', 'restart', escalation_id='esc-task-1-1')
 
         harness.cancel_workflow.assert_called_once_with('task-1')  # type: ignore[attr-defined]
         replaced = _replace_metadata_calls(harness.scheduler.update_task)  # type: ignore[arg-type]
@@ -1455,7 +1455,7 @@ class TestRestartClearsMergeRetryPending:
         harness.is_workflow_active = MagicMock(return_value=False)
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
-            await harness._action_teardown_and_set_status('task-1', 'pending', 'restart')
+            await harness._action_teardown_and_set_status('task-1', 'pending', 'restart', escalation_id='esc-task-1-1')
 
         harness.scheduler.update_task.assert_not_awaited()  # type: ignore[attr-defined]
         assert any(
@@ -1484,7 +1484,7 @@ class TestRestartClearsMergeRetryPending:
         harness.is_workflow_active = MagicMock(return_value=False)
 
         with caplog.at_level(logging.INFO, logger='orchestrator.harness'):
-            await harness._action_teardown_and_set_status('task-1', 'pending', 'restart')
+            await harness._action_teardown_and_set_status('task-1', 'pending', 'restart', escalation_id='esc-task-1-1')
 
         messages = [r.getMessage() for r in caplog.records]
         assert any('was rejected (update_task returned False)' in m for m in messages), (
@@ -1513,7 +1513,7 @@ class TestRestartClearsMergeRetryPending:
         harness.scheduler.update_task = AsyncMock(side_effect=RuntimeError('mcp down'))
         harness.is_workflow_active = MagicMock(return_value=False)
 
-        await harness._action_teardown_and_set_status('task-1', 'pending', 'restart')
+        await harness._action_teardown_and_set_status('task-1', 'pending', 'restart', escalation_id='esc-task-1-1')
 
         harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
             'task-1', 'pending',
