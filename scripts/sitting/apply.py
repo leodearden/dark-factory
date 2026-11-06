@@ -18,6 +18,10 @@ executor close (``sitting.audits``). A ``wrong`` re-counts the class's audits on
 that queue from the registry and, under ``authority.audit_escape_target``,
 moves the class to shadow in the queue's policy-table state.
 
+``policy-state`` reads or moves one queue's class switches; the moves it may
+make are ``authority.CLASS_SWITCH_TRANSITIONS``, enforced by
+``escalation.policy_state.set_class_state``, its only write path.
+
 Exit codes: 0 applied; 1 a step failed after pre-flight; 2 a configuration or
 validation error, nothing written; 3 ask back, a token did not resolve and
 nothing was applied; 4 refused, either at pre-flight (nothing written, the
@@ -47,6 +51,8 @@ for _path in (_REPO_ROOT / 'orchestrator' / 'src', _REPO_ROOT / 'scripts'):
 from dashboard.config import DEFAULT_FUSED_MEMORY_URLS  # noqa: E402
 from escalation.authority import (  # noqa: E402
     COORDINATOR_IDENTITY,
+    ClassSwitch,
+    IllegalClassTransition,
     audit_escape_target,
     coordinator_denied,
 )
@@ -536,6 +542,24 @@ def _audit_one(target: _AuditTarget, decisions_root: Path) -> dict[str, Any]:
     return {**base, 'outcome': 'ok', 'class_state_after': None if after is None else str(after)}
 
 
+def run_policy_state(queue_dir: Path, policy_class: str | None, target: ClassSwitch | None) -> ApplyReport:
+    """Every class's switch on *queue_dir*'s queue, or one class moved to *target* through set_class_state."""
+    if not queue_dir.is_dir():
+        return ApplyReport(EXIT_CONFIG, messages=(f'{queue_dir} is not an existing queue directory; '
+                                                  'policy-state never creates one',))
+    try:
+        if policy_class is None or target is None:
+            states = policy_state.load_class_states(queue_dir)
+            return ApplyReport(EXIT_OK, rows=({name: str(switch) for name, switch in states.items()},))
+        before = policy_state.set_class_state(queue_dir, policy_class, target)
+    except IllegalClassTransition as exc:
+        return ApplyReport(EXIT_REFUSED, messages=(f'refused, nothing written: {exc}',))
+    except ValueError as exc:
+        return ApplyReport(EXIT_CONFIG, messages=(f'nothing written: {exc}',))
+    return ApplyReport(EXIT_OK, rows=({'queue_dir': normalize_escalations_dir(queue_dir), 'policy_class': policy_class,
+                                       'before': str(before), 'after': str(target)},))
+
+
 def parse_action_token(token: str) -> tuple[str, str]:
     """One ``N=ACTION`` token as ``(item number text, action)``; anything else is a ValueError."""
     ref, has_action, action = token.partition('=')
@@ -600,6 +624,15 @@ def _cmd_audit(args: argparse.Namespace) -> int:
     return report.exit_code
 
 
+def _cmd_policy_state(args: argparse.Namespace) -> int:
+    if (args.policy_class is None) != (args.state is None):
+        print('--class and --state are given together or not at all', file=sys.stderr)
+        return EXIT_CONFIG
+    report = run_policy_state(args.queue_dir, args.policy_class, args.state)
+    _print_report(report)
+    return report.exit_code
+
+
 def _print_report(report: ApplyReport) -> None:
     print(report.echo, end='')
     for row in report.rows:
@@ -625,6 +658,12 @@ def _parser() -> argparse.ArgumentParser:
     audit_cmd.add_argument('--decisions-root', type=Path, help='fleet root holding decisions/ (default: fleet_root())')
     audit_cmd.add_argument('--source', choices=sorted(ledgers.ANSWER_SOURCES), default='terminal')
     audit_cmd.set_defaults(handler=_cmd_audit)
+
+    policy = commands.add_parser('policy-state', help="read or move a policy class's switch on one queue")
+    policy.add_argument('--queue-dir', type=Path, required=True, help='an existing escalation queue directory')
+    policy.add_argument('--class', dest='policy_class', help='a POLICY_TABLE class; given with --state')
+    policy.add_argument('--state', type=ClassSwitch, choices=list(ClassSwitch), help='the switch to move it to')
+    policy.set_defaults(handler=_cmd_policy_state)
     return parser
 
 
