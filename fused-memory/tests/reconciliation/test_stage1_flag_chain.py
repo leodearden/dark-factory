@@ -17,6 +17,7 @@ from fused_memory.reconciliation.stage1_flag_chain import (
     FlagChainContext,
     FlagChainOutcome,
     ResolvingFilter,
+    SuppressionStormEscape,
     apply_resolving_filters,
     run_stage1_flag_chain,
 )
@@ -34,11 +35,19 @@ def _memory_without_ledger() -> AsyncMock:
     return memory
 
 
-def _context(taskmaster: AsyncMock, memory: AsyncMock | None = None) -> FlagChainContext:
+async def _no_storm_escape(result: EntityStandingSuppressionResult) -> None:
+    return None
+
+
+def _context(
+    taskmaster: AsyncMock,
+    memory: AsyncMock | None = None,
+    escalate_suppression_storm: SuppressionStormEscape = _no_storm_escape,
+) -> FlagChainContext:
     return FlagChainContext(
         memory_service=memory if memory is not None else _memory_without_ledger(),
         taskmaster=taskmaster,
-        escalation_queue=None,
+        escalate_suppression_storm=escalate_suppression_storm,
         project_id='test_project',
         project_root='/tmp/test',
         known_projects={},
@@ -182,3 +191,22 @@ async def test_outcome_carries_hook_a_result_which_fails_open_without_a_ledger()
     assert outcome.standing_decision_result.suppression_evaluated is False
     assert outcome.standing_decision_result.kept_flags == flags
     assert outcome.stats['entity_standing_decision_suppressed'] == 0
+
+
+@pytest.mark.asyncio
+async def test_chain_hands_hook_a_result_to_the_injected_storm_escape_once():
+    escaped: list[EntityStandingSuppressionResult] = []
+
+    async def record_storm_escape(result: EntityStandingSuppressionResult) -> None:
+        escaped.append(result)
+
+    ctx = _context(
+        _taskmaster_returning(PRESENT_TASK),
+        memory=_memory_without_ledger(),
+        escalate_suppression_storm=record_storm_escape,
+    )
+
+    outcome = await _run([_flag('100', 'missing_deliverable')], ctx)
+
+    assert len(escaped) == 1
+    assert escaped[0] is outcome.standing_decision_result

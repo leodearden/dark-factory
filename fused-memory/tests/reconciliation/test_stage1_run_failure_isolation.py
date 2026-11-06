@@ -16,7 +16,7 @@ from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+from escalation.queue import EscalationQueue
 
 from fused_memory.models.reconciliation import StageId, StageReport, Watermark
 from fused_memory.reconciliation.consolidation_auto_executor import (

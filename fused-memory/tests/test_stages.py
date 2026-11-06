@@ -18649,11 +18649,10 @@ class TestMemoryConsolidatorSuppressionStreak:
         storm = AsyncMock(return_value=[])
         updater = AsyncMock(return_value=[])
         consolidator = 'fused_memory.reconciliation.stages.memory_consolidator'
-        flag_chain = 'fused_memory.reconciliation.stage1_flag_chain'
 
         try:
             with (
-                patch(f'{flag_chain}.maybe_escalate_suppression_storm', new=storm),
+                patch(f'{consolidator}.maybe_escalate_suppression_storm', new=storm),
                 patch(f'{consolidator}.update_suppression_streaks', new=updater),
             ):
                 await self._suppressing_cycle(stage, 'r-shared-n')
