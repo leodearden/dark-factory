@@ -449,8 +449,9 @@ class TestMemoryPayloads:
             assert args['entities'] == [{'kind': 'task', 'id': 4803}]
             assert 'task 4803' in args['content']
 
-    def test_an_item_without_a_task_declares_no_entity(self):
-        decision, rationale = self._payloads(_l2(task_id=None))
+    @pytest.mark.parametrize('task_id', [None, 'dashboard-watchdog'])
+    def test_an_item_without_a_numeric_task_declares_no_entity(self, task_id):
+        decision, rationale = self._payloads(_l2(task_id=task_id))
 
         assert _args(decision)['entities'] == _args(rationale)['entities'] == []
 
