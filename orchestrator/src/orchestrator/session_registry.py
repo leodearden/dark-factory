@@ -539,20 +539,28 @@ class AuditVerdict(StrEnum):
 
 @dataclass(frozen=True)
 class AuditOutcome:
-    """One audit of a closed DecisionRecord: the verdict, the auditor's note, and when."""
+    """One audit of a closed DecisionRecord: the verdict, the auditor's note, when, and the class judged."""
 
     verdict: AuditVerdict
     note: str
     audited_at: str
+    policy_class: str
 
     def __post_init__(self) -> None:
         object.__setattr__(self, 'verdict', AuditVerdict(self.verdict))
         if not isinstance(self.audited_at, str):
             raise ValueError(f'audited_at must be ISO-8601 text, got {self.audited_at!r}')
         datetime.fromisoformat(self.audited_at)
+        if not isinstance(self.policy_class, str) or not self.policy_class:
+            raise ValueError(f'policy_class must be a non-empty class name, got {self.policy_class!r}')
 
     def to_dict(self) -> dict[str, str]:
-        return {'verdict': str(self.verdict), 'note': self.note, 'audited_at': self.audited_at}
+        return {
+            'verdict': str(self.verdict),
+            'note': self.note,
+            'audited_at': self.audited_at,
+            'policy_class': self.policy_class,
+        }
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> AuditOutcome:
@@ -560,6 +568,7 @@ class AuditOutcome:
             verdict=data['verdict'],
             note=str(data.get('note') or ''),
             audited_at=data['audited_at'],
+            policy_class=data['policy_class'],
         )
 
 
@@ -630,7 +639,12 @@ class DecisionRecord:
         (not audited). Written only by record_audit_outcome, never
         overwritten; CUSTODY like ``closing_evidence``, and kept by
         reopen_decision, because an audited close stays history the per-class
-        wrong rate counts.
+        wrong rate counts. The outcome names the policy class the audit
+        judged, copied from the escalation record at audit time: escalation
+        archives are pruned
+        (escalation/src/escalation/archive.py::DEFAULT_RETENTION_DAYS) and the
+        per-class counts must outlive them. The escalation record stays the
+        class's home for the close itself.
 
     Concurrency: unlike SessionRecord (single-writer-per-slug -- only the
     spawning session ever mutates its own record), a single decision id's
@@ -1663,19 +1677,21 @@ def record_audit_outcome(
     expected_project: str,
     expected_escalations_dir: str | Path,
     audited_at: str,
+    policy_class: str,
 ) -> DecisionRecord | None:
     """Record the sitting's *verdict* on *decision_id*'s close, in ONE locked read-modify-write.
 
     The caller names the record exactly as for close_decision_with_evidence,
     and any other record at that id raises DecisionAuditRefused; so does a
     record with no closing evidence (nothing was closed to audit) and one that
-    already carries an outcome (never overwritten). A malformed verdict or
-    stamp raises ValueError before the lock.
+    already carries an outcome (never overwritten). *policy_class* is the
+    class the audit judged. A malformed verdict, stamp or class raises
+    ValueError before the lock.
 
     Otherwise FAIL-SOFT like its sibling setters: None (logged at ERROR) on a
     missing file, a corrupt body, a lock fault or a write failure.
     """
-    outcome = AuditOutcome(verdict=verdict, note=note, audited_at=audited_at)
+    outcome = AuditOutcome(verdict=verdict, note=note, audited_at=audited_at, policy_class=policy_class)
     wanted = _decision_identity(expected_project, expected_escalations_dir)
 
     def _audit(record: DecisionRecord) -> None:

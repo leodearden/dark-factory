@@ -482,7 +482,7 @@ class AuditBench:
         if verdict is not None:
             assert record_audit_outcome(record.id, verdict, '', root=self.fleet, expected_project='alpha',
                                         expected_escalations_dir=self.queue_dir,
-                                        audited_at=self.now.isoformat()) is not None
+                                        audited_at=self.now.isoformat(), policy_class=LANDING) is not None
         return record
 
     def number(self, key: str, *, kinds: frozenset[str] = frozenset({AUDIT_KIND})) -> int:
@@ -551,7 +551,7 @@ class TestAuditRow8:
 
             assert rc == 0, text
             assert _decision_of(bench.fleet, record.id).audit_outcome == AuditOutcome(
-                AuditVerdict.WRONG, 'missed sibling', bench.now.isoformat())
+                AuditVerdict.WRONG, 'missed sibling', bench.now.isoformat(), LANDING)
             assert bench.state() == ClassSwitch.SHADOW
             assert _executor_resolve(served, 'esc-501-1')['code'] == 'level_forbidden'
             (row,) = rows
@@ -610,7 +610,7 @@ class TestAuditRefusals:
         n = bench.number_audit(record)
         assert record_audit_outcome(record.id, AuditVerdict.OK, '', root=bench.fleet, expected_project='alpha',
                                     expected_escalations_dir=bench.queue_dir,
-                                    audited_at=bench.now.isoformat()) is not None
+                                    audited_at=bench.now.isoformat(), policy_class=LANDING) is not None
         before = self._written(bench, record)
 
         rc, rows, _ = bench.run(capsys, f'{n}=wrong')

@@ -526,6 +526,7 @@ def _audit_one(target: _AuditTarget, decisions_root: Path) -> dict[str, Any]:
         written = record_audit_outcome(
             close.decision_id, verdict, row.note, root=decisions_root, expected_project=target.record.project,
             expected_escalations_dir=target.record.escalations_dir, audited_at=row.answered_at,
+            policy_class=close.policy_class,
         )
     except DecisionAuditRefused as exc:
         return {**base, 'outcome': 'failed', 'detail': str(exc), 'class_state_after': base['class_state_before']}

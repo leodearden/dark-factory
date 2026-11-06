@@ -6475,6 +6475,7 @@ def test_same_queue_refile_and_enrichment_agree_on_the_custody_field_set() -> No
         closed_at='2026-08-01T00:00:00+00:00',
         audit_outcome=sr.AuditOutcome(
             verdict=sr.AuditVerdict.OK, note='', audited_at='2026-08-02T00:00:00+00:00',
+            policy_class='landing_provenance',
         ),
     )
     incoming = _make_decision(

@@ -581,7 +581,7 @@ def _executor_close(env: Env, n: int, *, policy_class: str = SAMPLED_CLASS, clos
     _esc(env.queue / 'archive' / '2026-09-25', id=esc_id, status='resolved', resolved_by=EXECUTOR_IDENTITY,
          resolved_at=closed_at or _hours_before_now(8 * n), policy_class=policy_class,
          claimed_by=EXECUTOR_IDENTITY, claimed_at=closed_at or _hours_before_now(8 * n))
-    outcome = None if audited is None else AuditOutcome(audited, '', NOW_ISO)
+    outcome = None if audited is None else AuditOutcome(audited, '', NOW_ISO, policy_class)
     return _closed_decision(env.fleet, f'dec-exec-{policy_class}-{n}', closed_at=closed_at or _hours_before_now(8 * n),
                             escalation_id=esc_id, escalations_dir=normalize_escalations_dir(env.queue),
                             closing_evidence=f'executor evidence for close {n}\nfound_on_main abc1234',

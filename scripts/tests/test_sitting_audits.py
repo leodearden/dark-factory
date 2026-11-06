@@ -89,9 +89,15 @@ class Fleet:
         return self.decision(f'dec-{policy_class}-{n}', esc_id, queue=queue, closed_at=closed_at or _in_window(n))
 
     def audit(self, record: DecisionRecord, verdict: AuditVerdict, note: str = '') -> None:
+        """Audit *record* under the class its escalation record names now, as the audit verb copies it."""
+        assert record.escalation_id is not None
+        path = inventory.index_queue(record.escalations_dir)[record.escalation_id]
+        policy_class = Escalation.from_json(path.read_text()).policy_class
+        assert policy_class is not None, record.id
         audited = record_audit_outcome(
             record.id, verdict, note, root=self.root, expected_project=record.project,
             expected_escalations_dir=record.escalations_dir, audited_at=NOW.isoformat(),
+            policy_class=policy_class,
         )
         assert audited is not None
 
@@ -185,7 +191,9 @@ class TestExecutorCloses:
 
         (close,) = fleet.closes().in_window
 
-        assert close.audited == AuditOutcome(AuditVerdict.WRONG, 'the sibling commit did not carry it', NOW.isoformat())
+        assert close.audited == AuditOutcome(
+            AuditVerdict.WRONG, 'the sibling commit did not carry it', NOW.isoformat(), SAMPLED_CLASS,
+        )
 
     def test_a_close_in_an_unscanned_queue_is_a_shortfall(self, fleet, tmp_path):
         elsewhere = tmp_path / 'src' / 'reify' / 'data' / 'escalations'
