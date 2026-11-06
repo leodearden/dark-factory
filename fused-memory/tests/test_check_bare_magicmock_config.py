@@ -554,9 +554,15 @@ class TestCliErrorHandling:
 
 
 class TestCliBoundary:
-    """The checker spawned exactly as hooks/project-checks and the lint_commands spawn it."""
+    """The checker spawned under ``python3 -I -S``, stricter than any of its call sites.
 
-    def test_hook_invocation_is_stdlib_only_and_reports_every_rule(self, tmp_path: Path):
+    hooks/project-checks and every lint_command run a bare ``python3 <script> <paths>``.
+    ``-I -S`` also drops the script's directory and site-packages from sys.path and ignores
+    PYTHON* env vars, so passing here implies passing there. The converse does not hold: a
+    failure that depends on the caller's environment, such as PYTHONPATH, does not reproduce here.
+    """
+
+    def test_isolated_python3_spawn_is_stdlib_only_and_reports_every_rule(self, tmp_path: Path):
         """The single test that crosses the process boundary the nine call sites cross.
 
         ``-I -S`` keeps venv site-packages off sys.path, so a third-party import anywhere in
