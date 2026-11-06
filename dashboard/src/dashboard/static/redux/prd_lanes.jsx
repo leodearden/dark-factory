@@ -23,7 +23,7 @@ const {
   contentionEntryText,
   heldShareText,
   neverStartedText,
-  countsText,
+  darkMatterSummary,
   darkMatterPage,
   membersDrawn,
   inputPip,
@@ -35,17 +35,25 @@ function ViewFigure({ rule, detail, text }) {
   return <span title={figureTitle(rule, detail)}>{text}</span>;
 }
 
+// The expanded rows are held here, by PRD key, so a row a poll moves to
+// another lane stays expanded.
 function ProjectPrdLanes({ project, view, pool, renderMembers, onSelect }) {
+  const [expanded, setExpanded] = uS_PL(() => new Set());
   if (view.state === 'unknown') return <div className="empty prd-unknown">{view.reason}</div>;
   const { value } = view;
   const { prds, lanes, rules, segment_legend: legend } = value;
   const byKey = new Map(prds.map(row => [row.key, row]));
-  const rowProps = { rules, legend, pool, project, renderMembers };
+  const toggle = key => setExpanded(was => {
+    const next = new Set(was);
+    if (!next.delete(key)) next.add(key);
+    return next;
+  });
+  const rowProps = { rules, legend, pool, project, renderMembers, expanded, toggle };
   return (
     <div className="prd-lanes">
       <div className="prd-lanes-head">
         <Pip_PL datum={view} format={served => String(served.prds.length)} label="PRDs with open work" rule={rules.lanes} />
-        <SegmentLegend legend={legend} />
+        <SegmentLegend legend={legend} rule={rules.segments} />
       </div>
       {lanes.map(entry => (
         <LaneSection key={entry.lane} entry={entry} rows={entry.prd_keys.map(key => byKey.get(key))} rowProps={rowProps} />
@@ -56,9 +64,9 @@ function ProjectPrdLanes({ project, view, pool, renderMembers, onSelect }) {
   );
 }
 
-function SegmentLegend({ legend }) {
+function SegmentLegend({ legend, rule }) {
   return (
-    <div className="prd-legend">
+    <div className="prd-legend" title={rule}>
       {legend.map(item => (
         <span key={item.segment} className="prd-legend-item">
           <span className="prd-legend-swatch" style={{ background: CP_PL[item.tone] }}></span>{item.label}
@@ -68,7 +76,7 @@ function SegmentLegend({ legend }) {
   );
 }
 
-// The tail lane — every PRD whose signal is delivered — starts collapsed.
+// The tail lane starts collapsed; its header carries the served rule.
 function LaneSection({ entry, rows, rowProps }) {
   const [open, setOpen] = uS_PL(entry.lane !== 'tail');
   return (
@@ -80,29 +88,29 @@ function LaneSection({ entry, rows, rowProps }) {
         ? rows.map(row => <PrdRowView key={row.key} row={row} {...rowProps} />)
         : (
           <button type="button" className="prd-tail-line" onClick={() => setOpen(true)}>
-            {`${rows.length} delivered: ${rows.map(row => row.title).join(' · ')}`}
+            {`${rows.length}: ${rows.map(row => row.title).join(' · ')}`}
           </button>
         )}
     </section>
   );
 }
 
-function PrdRowView({ row, rules, legend, pool, project, renderMembers }) {
-  const [open, setOpen] = uS_PL(false);
+function PrdRowView({ row, rules, legend, pool, project, renderMembers, expanded, toggle }) {
+  const open = expanded.has(row.key);
   const total = doneOfTotal(row);
   const signal = signalCell(row.signal);
   const ready = readyCell(row.ready);
   const action = row.next_action;
   return (
     <div className="prd-row" data-key={row.key}>
-      <div className="prd-row-head" role="button" onClick={() => setOpen(was => !was)}>
+      <div className="prd-row-head" role="button" onClick={() => toggle(row.key)}>
         <span className="prd-title"><ViewFigure rule={rules.title} detail={row.key} text={row.title} /></span>
         <span className="prd-state"><ViewFigure rule={rules.state_line} text={row.state_line} /></span>
         <SegmentBar row={row} legend={legend} />
         <span className="prd-total"><ViewFigure rule={rules.total} detail={total.detail} text={total.text} /></span>
         <span className="prd-signal"><ViewFigure rule={rules.signal} detail={signal.detail} text={signal.text} /></span>
         <span className={ready.overdue ? 'prd-ready overdue' : 'prd-ready'}>
-          <ViewFigure rule={rules.ready} text={ready.text} />
+          <ViewFigure rule={rules.ready} detail={ready.detail} text={ready.text} />
         </span>
         {action.kind !== 'none' && (
           <span className={`prd-action prd-action-${action.kind}`}>
@@ -165,18 +173,13 @@ function ChipSection({ className, label, chips }) {
 
 function DarkMatterStrip({ darkMatter, rules, pool, project, onSelect }) {
   const [open, setOpen] = uS_PL(false);
-  const { hidden_high: hiddenHigh, ready_high_ids: readyHigh } = darkMatter;
-  const summary = [
-    `${darkMatter.total} open tasks no PRD owns`,
-    ...['by_reason', 'by_status', 'by_priority', 'by_source'].map(by => countsText(darkMatter[by])).filter(Boolean),
-    ...(readyHigh.length > 0 ? [`ready high ${readyHigh.map(id => `#${id}`).join(' ')}`] : []),
-  ].join(' · ');
+  const { hidden_high: hiddenHigh } = darkMatter;
   const hidden = hiddenHigh.refs.map(ref => `#${ref.task_id} (${ref.prd})`).join(', ');
   return (
     <div className="dark-matter">
       <div className="dark-matter-head">
         <button type="button" className="dark-matter-toggle" onClick={() => setOpen(was => !was)}>{open ? '▾' : '▸'}</button>
-        <ViewFigure rule={rules.dark_matter} text={summary} />
+        <ViewFigure rule={rules.dark_matter} text={darkMatterSummary(darkMatter)} />
       </div>
       {hiddenHigh.count > 0 && (
         <div className="dark-matter-hidden-high">

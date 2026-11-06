@@ -28,7 +28,7 @@ function loadPrdLanesView() {
 const { api: lanesView, window: loadedWindow } = loadPrdLanesView();
 const { projectPrdView, projectPrdContention, PRDS_ENDPOINT } = lanesView;
 const { readyCell, READY_OVERDUE_DAYS, barSegments, doneOfTotal, signalCell } = lanesView;
-const { contentionEntryText, heldShareText, neverStartedText, countsText } = lanesView;
+const { contentionEntryText, heldShareText, neverStartedText, darkMatterSummary } = lanesView;
 const { darkMatterPage, DARK_MATTER_PAGE_SIZE, membersDrawn, inputPip, figureTitle } = lanesView;
 const { servedDatum } = loadedWindow.DF_DATUM;
 
@@ -42,7 +42,7 @@ const EXPECTED_FUNCTION_NAMES = [
   'contentionEntryText',
   'heldShareText',
   'neverStartedText',
-  'countsText',
+  'darkMatterSummary',
   'darkMatterPage',
   'membersDrawn',
   'inputPip',
@@ -130,10 +130,10 @@ for (const { reader, key } of READERS) {
 
 // ── (b) The ready cell ──
 
-test('readyCell: a lower-bound age is shown with ≥, and 43 days is overdue', () => {
+test('readyCell: a lower-bound age is shown with ≥, and 43 days is overdue, the detail saying why in words', () => {
   assert.deepEqual(
     readyCell({ count: 3, oldest_task_id: 7, oldest_pending_days: 43, oldest_is_lower_bound: true }),
-    { text: 'ready 3 · oldest ≥43d', overdue: true },
+    { text: 'ready 3 · oldest ≥43d', overdue: true, detail: 'overdue: the oldest ready member has been pending 30d or more' },
   );
 });
 
@@ -143,20 +143,22 @@ test('readyCell: a real anchor carries no ≥', () => {
   assert.ok(!cell.text.includes('≥'));
 });
 
-test('readyCell: the alarm fires at READY_OVERDUE_DAYS, not a day before', () => {
+test('readyCell: the alarm fires at READY_OVERDUE_DAYS, not a day before, and only an alarm carries a detail', () => {
   const at = days => readyCell({ count: 1, oldest_task_id: 7, oldest_pending_days: days, oldest_is_lower_bound: false });
   assert.equal(at(READY_OVERDUE_DAYS - 1).overdue, false);
+  assert.equal(at(READY_OVERDUE_DAYS - 1).detail, null);
   assert.equal(at(READY_OVERDUE_DAYS).overdue, true);
+  assert.ok(at(READY_OVERDUE_DAYS).detail.includes(`${READY_OVERDUE_DAYS}d`), at(READY_OVERDUE_DAYS).detail);
 });
 
 test('readyCell: with no age the cell is the count alone, and never overdue', () => {
   assert.deepEqual(
     readyCell({ count: 0, oldest_task_id: null, oldest_pending_days: null, oldest_is_lower_bound: false }),
-    { text: 'ready 0', overdue: false },
+    { text: 'ready 0', overdue: false, detail: null },
   );
   assert.deepEqual(
     readyCell({ count: 1, oldest_task_id: null, oldest_pending_days: null, oldest_is_lower_bound: true }),
-    { text: 'ready 1', overdue: false },
+    { text: 'ready 1', overdue: false, detail: null },
   );
 });
 
@@ -274,12 +276,42 @@ test('neverStartedText: the served count of the served total, with the served id
   assert.equal(neverStartedText({ count: 0, of: 0, ids: [], window_start: null }), '0 of 0 ready high never started');
 });
 
-// ── (g) Counts ──
+// ── (g) The dark-matter summary ──
 
-test('countsText: served-order pairs, zero counts skipped', () => {
-  assert.equal(countsText({ pending: 2, 'in-progress': 0, blocked: 1 }), 'pending 2 · blocked 1');
-  assert.equal(countsText({ none: 0 }), '');
-  assert.equal(countsText({}), '');
+function darkMatter(overrides = {}) {
+  return {
+    total: 9,
+    by_reason: { no_link: 5, cycle: 0, missing_target: 4 },
+    by_status: { pending: 7, 'in-progress': 0, blocked: 2 },
+    by_priority: { high: 3, unrecorded: 6 },
+    by_source: { unrecorded: 9 },
+    ready_high_ids: [],
+    ...overrides,
+  };
+}
+
+test('darkMatterSummary: the total, then each group under its dimension, served-order pairs, zero counts skipped', () => {
+  assert.equal(
+    darkMatterSummary(darkMatter()),
+    '9 open tasks no PRD owns · why: no_link 5, missing_target 4 · status: pending 7, blocked 2 · '
+      + 'priority: high 3, unrecorded 6 · source: unrecorded 9',
+  );
+});
+
+test('darkMatterSummary: an unrecorded priority and an unrecorded source read apart', () => {
+  const summary = darkMatterSummary(darkMatter());
+  assert.ok(summary.includes('priority: high 3, unrecorded 6'), summary);
+  assert.ok(summary.includes('source: unrecorded 9'), summary);
+});
+
+test('darkMatterSummary: a group with every count zero, or none, is left out with its label', () => {
+  const summary = darkMatterSummary(darkMatter({ by_reason: { no_link: 0 }, by_source: {} }));
+  assert.equal(summary, '9 open tasks no PRD owns · status: pending 7, blocked 2 · priority: high 3, unrecorded 6');
+});
+
+test('darkMatterSummary: the served ready-high ids close the summary', () => {
+  const summary = darkMatterSummary(darkMatter({ ready_high_ids: [113, 371] }));
+  assert.ok(summary.endsWith(' · ready high: #113 #371'), summary);
 });
 
 // ── (h) The dark-matter page ──

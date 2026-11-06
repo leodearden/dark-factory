@@ -15,7 +15,8 @@
 // labels and tones come from the served segment_legend; lane order, labels and
 // rules from the served lanes. The one vocabulary held here is display text
 // for the signal marks, which the server serves no label for; an unrecognised
-// mark shows as served.
+// mark shows as served. The one threshold held here is READY_OVERDUE_DAYS, the
+// ready cell's alarm, which its title states in words.
 
 // Module scope, no fallback, RENAMED — see the CANONICAL note in datum.js's
 // header.
@@ -34,6 +35,15 @@ const SIGNAL_MARK_TEXT = Object.freeze({
   not_yet: 'not yet',
   unknown: 'unknown',
 });
+
+// The dimension each served dark-matter count group is labelled with, in the
+// order the summary reads them.
+const DARK_MATTER_GROUPS = Object.freeze([
+  ['by_reason', 'why'],
+  ['by_status', 'status'],
+  ['by_priority', 'priority'],
+  ['by_source', 'source'],
+]);
 
 const INPUT_STATE_TONES = Object.freeze({
   fresh: 'ok',
@@ -68,9 +78,14 @@ function figureTitle(rule, detail) {
 
 function readyCell(ready) {
   const days = ready.oldest_pending_days;
-  if (days === null || days === undefined) return { text: `ready ${ready.count}`, overdue: false };
+  if (days === null || days === undefined) return { text: `ready ${ready.count}`, overdue: false, detail: null };
   const bound = ready.oldest_is_lower_bound ? '≥' : '';
-  return { text: `ready ${ready.count} · oldest ${bound}${days}d`, overdue: days >= READY_OVERDUE_DAYS };
+  const overdue = days >= READY_OVERDUE_DAYS;
+  return {
+    text: `ready ${ready.count} · oldest ${bound}${days}d`,
+    overdue,
+    detail: overdue ? `overdue: the oldest ready member has been pending ${READY_OVERDUE_DAYS}d or more` : null,
+  };
 }
 
 function barSegments(row, legend) {
@@ -125,7 +140,20 @@ function countsText(counts) {
   return Object.entries(counts)
     .filter(([, n]) => n !== 0)
     .map(([key, n]) => `${key} ${n}`)
-    .join(' · ');
+    .join(', ');
+}
+
+function darkMatterSummary(darkMatter) {
+  const groups = DARK_MATTER_GROUPS
+    .map(([by, label]) => [label, countsText(darkMatter[by])])
+    .filter(([, counts]) => counts !== '')
+    .map(([label, counts]) => `${label}: ${counts}`);
+  const readyHigh = darkMatter.ready_high_ids.map(id => `#${id}`).join(' ');
+  return [
+    `${darkMatter.total} open tasks no PRD owns`,
+    ...groups,
+    ...(readyHigh === '' ? [] : [`ready high: ${readyHigh}`]),
+  ].join(' · ');
 }
 
 function darkMatterPage(ids, pages) {
@@ -169,7 +197,7 @@ const PRD_LANES_VIEW_API = {
   contentionEntryText,
   heldShareText,
   neverStartedText,
-  countsText,
+  darkMatterSummary,
   darkMatterPage,
   membersDrawn,
   inputPip,

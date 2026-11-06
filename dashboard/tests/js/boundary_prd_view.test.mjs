@@ -81,10 +81,9 @@ function mountLanes(ctx, view = ctx.helpers.projectPrdView(ctx.D, PROJECT)) {
   const renderMembers = rows => React.createElement(
     'ul', { className: 'members-stub' }, rows.map(row => React.createElement('li', { key: row.id }, row.title)),
   );
-  const handle = ctx.harness.mount(window.DF_PRD_LANES.ProjectPrdLanes, {
-    project: PROJECT, view, pool, renderMembers, onSelect: id => selected.push(id),
-  });
-  return { root: handle.container, view, pool, selected };
+  const props = { project: PROJECT, view, pool, renderMembers, onSelect: id => selected.push(id) };
+  const handle = ctx.harness.mount(window.DF_PRD_LANES.ProjectPrdLanes, props);
+  return { root: handle.container, view, pool, selected, handle, props };
 }
 
 function rowsByKey(view) {
@@ -119,7 +118,7 @@ function rowFigures(helpers, rules, row) {
     ['.prd-state', figureTitle(rules.state_line, null), row.state_line],
     ['.prd-total', figureTitle(rules.total, total.detail), total.text],
     ['.prd-signal', figureTitle(rules.signal, signal.detail), signal.text],
-    ['.prd-ready', figureTitle(rules.ready, null), readyCell(row.ready).text],
+    ['.prd-ready', figureTitle(rules.ready, readyCell(row.ready).detail), readyCell(row.ready).text],
   ];
   if (row.next_action.kind !== 'none') figures.push(['.prd-action', figureTitle(rules.next_action, null), row.next_action.text]);
   return figures;
@@ -152,7 +151,8 @@ test('prd lanes #20: the tail lane renders collapsed to one line naming every ta
 
   assert.equal(line.length, 1, 'one collapsed line');
   assert.equal(tail.querySelectorAll('.prd-row').length, 0, 'a collapsed tail draws no row');
-  assert.ok(line[0].textContent.startsWith(`${entry.prd_keys.length} `), line[0].textContent);
+  assert.ok(line[0].textContent.startsWith(`${entry.prd_keys.length}: `), line[0].textContent);
+  assert.ok(!line[0].textContent.includes('delivered'), `the tail line restates the tail rule: ${line[0].textContent}`);
   for (const key of entry.prd_keys) {
     assert.ok(line[0].textContent.includes(byKey.get(key).title), `${key}'s title is missing from the tail line`);
   }
@@ -161,7 +161,7 @@ test('prd lanes #20: the tail lane renders collapsed to one line naming every ta
   assert.deepEqual([...tail.querySelectorAll('.prd-row')].map(row => row.dataset.key), entry.prd_keys);
 });
 
-test('prd lanes #20: every row bar draws the six served segments in legend order, under one legend', t => {
+test('prd lanes #20: every row bar draws the six served segments in legend order, under one legend titled with the segments rule', t => {
   const ctx = servedWindow(t, 'prd_lanes', 'prd_lanes_tasks');
   const { root, view } = mountLanes(ctx);
   const { barSegments } = ctx.helpers;
@@ -171,6 +171,8 @@ test('prd lanes #20: every row bar draws the six served segments in legend order
 
   const legends = root.querySelectorAll('.prd-legend');
   assert.equal(legends.length, 1, 'one legend per project');
+  assert.ok(view.value.rules.segments, 'the served view carries no segments rule');
+  assert.equal(legends[0].title, view.value.rules.segments);
   assert.deepEqual([...legends[0].querySelectorAll('.prd-legend-item')].map(item => item.textContent), legend.map(item => item.label));
 
   const rows = [...root.querySelectorAll('.prd-row')];
@@ -207,6 +209,7 @@ test('prd lanes #20: each row figure is titled with its served rule and row deta
 
     const ready = readyCell(row.ready);
     assert.equal(head.querySelector('.prd-ready').classList.contains('overdue'), ready.overdue, row.key);
+    if (ready.overdue) assert.notEqual(reading(head, '.prd-ready').title, rules.ready, `${row.key}: the title leaves the red unexplained`);
     overdue += ready.overdue ? 1 : 0;
 
     const action = head.querySelector('.prd-action');
@@ -300,16 +303,11 @@ test('prd lanes #20: the contention line renders every served top entry unsliced
 test('prd lanes #20: the dark-matter strip shows the served total and expands to one group per served reason', t => {
   const ctx = servedWindow(t, 'prd_lanes', 'prd_lanes_tasks');
   const { root, view, pool, selected } = mountLanes(ctx);
-  const { countsText, darkMatterPage, membersDrawn, DARK_MATTER_PAGE_SIZE } = ctx.helpers;
+  const { darkMatterSummary, darkMatterPage, membersDrawn, DARK_MATTER_PAGE_SIZE } = ctx.helpers;
   const { dark_matter: darkMatter, rules } = view.value;
   const strip = root.querySelector('.dark-matter');
 
-  const counts = reading(strip, '.dark-matter-head');
-  assert.equal(counts.title, rules.dark_matter);
-  assert.ok(counts.text.startsWith(`${darkMatter.total} `), counts.text);
-  for (const by of ['by_status', 'by_priority', 'by_source', 'by_reason']) {
-    assert.ok(counts.text.includes(countsText(darkMatter[by])), `${by}: ${counts.text}`);
-  }
+  assert.deepEqual(reading(strip, '.dark-matter-head'), { title: rules.dark_matter, text: darkMatterSummary(darkMatter) });
   assert.ok(darkMatter.hidden_high.count > 0);
   const hidden = reading(strip, '.dark-matter-hidden-high');
   assert.equal(hidden.title, rules.hidden_high);
@@ -399,6 +397,35 @@ test('prd lanes #20: an expanded row draws its open members from the pool and li
     }
   }
   for (const [what, n] of Object.entries(checked)) assert.ok(n > 0, `no expanded row exercised ${what}`);
+});
+
+test('prd lanes #20: an expanded row stays expanded when a poll moves it to another lane', t => {
+  const ctx = servedWindow(t, 'prd_lanes', 'prd_lanes_tasks');
+  const { root, view, handle, props } = mountLanes(ctx);
+  const { lanes, prds } = view.value;
+  const from = lanes.find(entry => entry.lane === 'stuck');
+  const to = lanes.find(entry => entry.lane === 'moving');
+  const [key] = from.prd_keys;
+  const rowEl = () => root.querySelector(`.prd-row[data-key="${key}"]`);
+
+  click(ctx.window, rowEl().querySelector('.prd-row-head'));
+  assert.ok(rowEl().querySelector('.prd-row-body'), 'the click did not expand the row');
+
+  const moved = {
+    ...view,
+    value: {
+      ...view.value,
+      lanes: lanes.map(entry => {
+        if (entry === from) return { ...entry, prd_keys: entry.prd_keys.filter(each => each !== key) };
+        if (entry === to) return { ...entry, prd_keys: [key, ...entry.prd_keys] };
+        return entry;
+      }),
+      prds: prds.map(row => (row.key === key ? { ...row, lane: to.lane } : row)),
+    },
+  };
+  handle.rerender({ ...props, view: moved });
+  assert.equal(rowEl().closest('.prd-lane').dataset.lane, to.lane, 'the re-poll did not move the row');
+  assert.ok(rowEl().querySelector('.prd-row-body'), 'the poll that moved the row closed it');
 });
 
 test('prd lanes #20: an unknown view renders its served reason in place of the lanes', t => {
@@ -558,6 +585,34 @@ test('prd lanes #21: an expanded row draws its open members as graph nodes from 
   seedDashboardData(tab.window, { TASKS_SNAPSHOT: snapshot });
   tab.handle.rerender({ ...TAB_PROPS, search: kept.title });
   assert.deepEqual(graphTitles(rowEl()), [renamed], 'the expanded graph did not draw the latest poll\'s title');
+});
+
+test('prd lanes #21: focus on a member narrows the expanded row to its neighborhood, listing the rest as not drawn', t => {
+  const tab = tasksTab(t, 'prd_lanes');
+  const { membersDrawn, projectPrdView } = tab.helpers;
+  const { focusGroupView } = tab.window.DF_GRAPH_LAYOUT;
+  const pool = tab.window.DF_TASK_SNAPSHOT.projectRows(tab.D, PROJECT).value;
+  const focusedOn = anchor => focusGroupView(pool, { focusMode: true, selectedId: anchor.id, focusAnchorId: anchor.id }).shown;
+  // A row whose drawn members focus on one of them would narrow: some, not all.
+  const subjects = projectPrdView(tab.D, PROJECT).value.prds.filter(row => row.lane !== 'tail').flatMap(row => {
+    const members = membersDrawn(pool, PROJECT, openIds(row)).rows;
+    return members.map(anchor => ({ row, members, anchor, focused: membersDrawn(focusedOn(anchor), PROJECT, openIds(row)) }));
+  });
+  const subject = subjects.find(({ members, focused }) => members.length >= 2 && focused.rows.length < members.length);
+  assert.ok(subject, 'no served row has a member whose focus would leave another member out');
+  const { row, anchor, focused } = subject;
+  const panel = projectPanel(tab.container, PROJECT);
+  const rowEl = () => panel.querySelector(`.prd-row[data-key="${row.key}"]`);
+
+  click(tab.window, rowEl().querySelector('.prd-row-head'));
+  const node = [...rowEl().querySelectorAll('.node')].find(el => el.querySelector('.ttl').textContent === anchor.title);
+  assert.ok(node, `${anchor.id} is not drawn in the expanded row`);
+  tab.window.React.act(() => node.dispatchEvent(new tab.window.MouseEvent('dblclick', { bubbles: true })));
+
+  assert.ok(focused.rows.some(member => member.id === anchor.id));
+  assert.deepEqual(graphTitles(rowEl()).sort(), focused.rows.map(member => member.title).sort(), 'focus did not narrow the expanded row');
+  const notDrawnText = rowEl().querySelector('.prd-not-drawn').textContent;
+  for (const id of focused.notDrawn) assert.ok(notDrawnText.includes(`#${id}`), notDrawnText);
 });
 
 test('prd lanes #21: an unknown view shows its served reason, and list still draws the graph', t => {
