@@ -13,7 +13,6 @@ import dataclasses
 import re
 import shutil
 import subprocess
-import sys
 from collections.abc import Iterable
 from pathlib import Path, PurePosixPath
 from typing import NamedTuple
@@ -401,29 +400,21 @@ def _assert_violation_output(stdout: str, bad_file: Path) -> None:
 class TestCliExitCodes:
     """CLI exit-code contract: 1 on violations, 0 on clean input."""
 
-    def test_cli_exits_nonzero_and_prints_violations_on_bad_file(self, tmp_path: Path):
-        """Violations file → returncode 1, stdout contains path/alternatives/1339."""
+    def test_cli_exits_nonzero_and_prints_violations_on_bad_file(self, tmp_path: Path, capsys):
+        """Violations file → exit 1, stdout contains path/alternatives/1339."""
         bad_file = tmp_path / 'test_bad.py'
         bad_file.write_text(_VIOLATION_SOURCE)
-        result = subprocess.run(
-            [sys.executable, str(SCRIPT_PATH), str(bad_file)],
-            capture_output=True,
-            text=True,
-        )
-        assert result.returncode == 1
-        _assert_violation_output(result.stdout, bad_file)
+        exit_code = _checker.main([str(bad_file)])
+        assert exit_code == 1
+        _assert_violation_output(capsys.readouterr().out, bad_file)
 
-    def test_cli_exits_zero_on_clean_file(self, tmp_path: Path):
-        """Clean file (exempted) → returncode 0, stdout empty."""
+    def test_cli_exits_zero_on_clean_file(self, tmp_path: Path, capsys):
+        """Clean file (exempted) → exit 0, stdout empty."""
         clean_file = tmp_path / 'test_clean.py'
         clean_file.write_text(_CLEAN_SOURCE)
-        result = subprocess.run(
-            [sys.executable, str(SCRIPT_PATH), str(clean_file)],
-            capture_output=True,
-            text=True,
-        )
-        assert result.returncode == 0
-        assert result.stdout == ''
+        exit_code = _checker.main([str(clean_file)])
+        assert exit_code == 0
+        assert capsys.readouterr().out == ''
 
 
 class TestCliDirectoryScan:
@@ -432,7 +423,9 @@ class TestCliDirectoryScan:
     Every other .py file is ignored.
     """
 
-    def test_cli_recursively_scans_directory_for_test_files_and_conftest(self, tmp_path: Path):
+    def test_cli_recursively_scans_directory_for_test_files_and_conftest(
+        self, tmp_path: Path, capsys
+    ):
         """Dir scan: test_example.py + conftest.py flagged; other_file.py ignored."""
         subdir = tmp_path / 'sub'
         subdir.mkdir()
@@ -443,19 +436,15 @@ class TestCliDirectoryScan:
         # Should NOT be scanned (not a test_*.py or conftest.py)
         (subdir / 'other_file.py').write_text(_VIOLATION_SOURCE)
 
-        result = subprocess.run(
-            [sys.executable, str(SCRIPT_PATH), str(tmp_path)],
-            capture_output=True,
-            text=True,
-        )
-        assert result.returncode == 1
-        output = result.stdout
+        exit_code = _checker.main([str(tmp_path)])
+        assert exit_code == 1
+        output = capsys.readouterr().out
         assert 'test_example.py' in output
         assert 'conftest.py' in output
         assert 'other_file.py' not in output
 
 
-    def test_cli_scans_underscore_helper_modules(self, tmp_path: Path):
+    def test_cli_scans_underscore_helper_modules(self, tmp_path: Path, capsys):
         """``_*.py`` helpers are scanned, at any depth; other non-test files still are not."""
         (tmp_path / '_helper.py').write_text(_VIOLATION_SOURCE)
         subdir = tmp_path / 'sub'
@@ -463,13 +452,9 @@ class TestCliDirectoryScan:
         (subdir / '_nested_helper.py').write_text(_VIOLATION_SOURCE)
         (tmp_path / 'other_file.py').write_text(_VIOLATION_SOURCE)
 
-        result = subprocess.run(
-            [sys.executable, str(SCRIPT_PATH), str(tmp_path)],
-            capture_output=True,
-            text=True,
-        )
-        assert result.returncode == 1
-        output = result.stdout
+        exit_code = _checker.main([str(tmp_path)])
+        assert exit_code == 1
+        output = capsys.readouterr().out
         assert '_helper.py' in output
         assert '_nested_helper.py' in output
         assert 'other_file.py' not in output
@@ -1238,33 +1223,6 @@ class TestRuleBIsUnconditional:
         )
 
 
-class TestFusedMemoryTestsDirectoryClean:
-    """Regression guard: fused-memory/tests must have zero bare MagicMock() config sites.
-
-    Task 1531 migrated all 26 violation sites in fused-memory/tests off bare
-    MagicMock() and onto MagicMock(spec_set=pydantic_spec(FusedMemoryConfig)).
-    This test re-runs the hook script against the real fused-memory/tests
-    directory so that any future reintroduction is caught at pytest time (not
-    only at commit time, since the hook is repo-wide and operators may skip it
-    locally).
-    """
-
-    def test_fused_memory_tests_directory_has_zero_violations(self):
-        """Running the checker against fused-memory/tests must exit 0 with empty stdout."""
-        tests_dir = Path(__file__).parent
-        result = subprocess.run(
-            [sys.executable, str(SCRIPT_PATH), str(tests_dir)],
-            capture_output=True,
-            text=True,
-        )
-        assert result.returncode == 0, (
-            f'check_bare_magicmock_config found violations in fused-memory/tests '
-            f'(task 1531 regression). Fix by wrapping each bare MagicMock() config '
-            f'with MagicMock(spec_set=pydantic_spec(FusedMemoryConfig)).\n'
-            f'Violations:\n{result.stdout}'
-        )
-
-
 # Each repo-wide scan sweeps all seven packages' tests/; 61.52s x 8 = 492.16, rounded up to a
 # whole minute. Family rationale: orchestrator/tests/_orch_helpers.py::WHOLE_TREE_SCAN_TEST_TIMEOUT.
 MAGICMOCK_REPO_SCAN_TEST_TIMEOUT = 540
@@ -1397,8 +1355,9 @@ class TestAllScannedTestDirsClean:
     those classes pin what may and may not be grandfathered, this one pins that
     nothing else was missed.
 
-    It runs the checker in-process over the shared ``repo_test_scan``; the CLI
-    boundary itself is TestCliExitCodes' and TestCliDirectoryScan's.
+    It runs the checker in-process over the shared ``repo_test_scan``. The process
+    boundary is TestCliBoundary's; the CLI's in-process behaviour is TestCliExitCodes',
+    TestCliDirectoryScan's and TestCliErrorHandling's.
     """
 
     _SCANNED_DIRS = (
@@ -2402,7 +2361,7 @@ class TestWallClockDeadlineDebtSlack:
         )
 
     def test_a_removal_reds_the_owning_packages_own_lint_command_naming_the_edit(
-        self, tmp_path: Path
+        self, tmp_path: Path, capsys
     ):
         """DONE-WHEN (task 6202): the red lands in the author's own package lint.
 
@@ -2413,25 +2372,26 @@ class TestWallClockDeadlineDebtSlack:
         entry, budget = self._live_entry_of_at_least_2()
         debt_file = tmp_path / entry
         debt_file.parent.mkdir(parents=True)
-        package_tests_dir = tmp_path.joinpath(*PurePosixPath(entry).parts[:2])
-        command = [sys.executable, str(SCRIPT_PATH), str(package_tests_dir)]
+        argv = [str(tmp_path.joinpath(*PurePosixPath(entry).parts[:2]))]
 
         debt_file.write_text(_RULE_C_ONE_HIT * (budget - 1))
-        removed = subprocess.run(command, capture_output=True, text=True)
-        assert removed.returncode == 1, (
+        removed_exit = _checker.main(argv)
+        removed = capsys.readouterr()
+        assert removed_exit == 1, (
             f'a removal without the budget edit must red the package lint; '
-            f'stdout={removed.stdout!r} stderr={removed.stderr!r}'
+            f'stdout={removed.out!r} stderr={removed.err!r}'
         )
         edit = f"_WALL_CLOCK_DEADLINE_DEBT['{entry}'] from {budget} to {budget - 1}"
-        assert edit in removed.stdout, (
-            f'the package lint must name the edit {edit!r}; got {removed.stdout!r}'
+        assert edit in removed.out, (
+            f'the package lint must name the edit {edit!r}; got {removed.out!r}'
         )
 
         debt_file.write_text(_RULE_C_ONE_HIT * budget)
-        exact = subprocess.run(command, capture_output=True, text=True)
-        assert exact.returncode == 0, (
+        exact_exit = _checker.main(argv)
+        exact = capsys.readouterr()
+        assert exact_exit == 0, (
             f'a debt file at exactly its budget must leave the package lint green; '
-            f'stdout={exact.stdout!r} stderr={exact.stderr!r}'
+            f'stdout={exact.out!r} stderr={exact.err!r}'
         )
 
 
