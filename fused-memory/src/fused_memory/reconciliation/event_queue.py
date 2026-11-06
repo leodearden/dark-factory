@@ -62,16 +62,17 @@ def _release_row_once_written(
     loop: asyncio.AbstractEventLoop,
     journal: EventJournal,
     event_id: str,
-    written: Future[bool],
+    ok: bool,
 ) -> None:
-    """Done-callback of a journaled event's dead-letter write.
+    """``on_written`` hook of a journaled event's dead-letter write.
 
-    Runs on the writer thread, or inline if the write had already finished.
-    The journal's connection is loop-thread-only, so the release is
-    marshalled onto the loop. A failed write, or a loop that has already
-    closed, keeps the row for :meth:`EventQueue.recover` to redeliver.
+    Runs before the write's future resolves: on the writer thread, or inline
+    when the hand-off itself failed. The journal's connection is
+    loop-thread-only, so the release is marshalled onto the loop, where it
+    runs ahead of every waiter's wake-up. A failed write, or a loop that has
+    already closed, keeps the row for :meth:`EventQueue.recover` to redeliver.
     """
-    if not written.result():
+    if not ok:
         logger.warning(
             'EventQueue: dead-letter record for event=%s was not written; its '
             'journal row is kept for recover()',
@@ -536,17 +537,19 @@ class EventQueue:
         in the journal rather than in neither store. The returned future
         resolves ``True`` once the record is written, ``False`` if it failed;
         a coroutine awaiting it through ``asyncio.wrap_future`` resumes only
-        after that release has run.
+        after that release has run, because the release is the write's
+        ``on_written`` hook, queued on the loop before the future resolves.
         """
-        written = self._dead_letter_writer.append(
-            _dead_letter_record(event, reason=reason, attempts=attempts),
-        )
+        on_written = None
         if self._journal is not None:
-            written.add_done_callback(functools.partial(
+            on_written = functools.partial(
                 _release_row_once_written,
                 asyncio.get_running_loop(), self._journal, event.id,
-            ))
-        return written
+            )
+        return self._dead_letter_writer.append(
+            _dead_letter_record(event, reason=reason, attempts=attempts),
+            on_written=on_written,
+        )
 
     # ── read dead-letters ──────────────────────────────────────────────
 
