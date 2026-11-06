@@ -1,4 +1,4 @@
-"""DecisionRecord.audit_outcome: the sitting's verdict on an executor close, and its one writer."""
+"""DecisionRecord.audit_outcomes: the sitting's verdicts on its executor closes, and their one writer."""
 from __future__ import annotations
 
 import dataclasses
@@ -17,7 +17,7 @@ _CLASS = 'landing_provenance'
 
 
 def _decision(
-    decision_id: str = 'dec-audit', audit_outcome: sr.AuditOutcome | None = None,
+    decision_id: str = 'dec-audit', audit_outcomes: tuple[sr.AuditOutcome, ...] = (),
 ) -> sr.DecisionRecord:
     return sr.DecisionRecord(
         id=decision_id,
@@ -26,7 +26,7 @@ def _decision(
         filed_at='2026-09-20T00:00:00+00:00',
         escalation_id='esc-1-1',
         escalations_dir=_QUEUE,
-        audit_outcome=audit_outcome,
+        audit_outcomes=audit_outcomes,
     )
 
 
@@ -84,29 +84,29 @@ def _only(root: Path) -> sr.DecisionRecord:
 
 
 class TestSerialization:
-    def test_defaults_to_none_and_round_trips(self) -> None:
+    def test_defaults_to_empty_and_round_trips(self) -> None:
         record = _decision()
 
-        assert record.audit_outcome is None
-        assert record.to_dict()['audit_outcome'] is None
+        assert record.audit_outcomes == ()
+        assert record.to_dict()['audit_outcomes'] == []
         assert sr.DecisionRecord.from_json(record.to_json()) == record
 
     def test_a_legacy_body_without_the_key_loads(self) -> None:
         body = _decision().to_dict()
-        del body['audit_outcome']
+        del body['audit_outcomes']
 
-        assert sr.DecisionRecord.from_dict(body).audit_outcome is None
+        assert sr.DecisionRecord.from_dict(body).audit_outcomes == ()
 
     def test_an_outcome_round_trips(self) -> None:
         outcome = sr.AuditOutcome(
             verdict=sr.AuditVerdict.OK, note='', audited_at=_AUDITED_AT, policy_class=_CLASS,
             closed_at='2026-09-25T00:00:00+00:00',
         )
-        record = _decision(audit_outcome=outcome)
+        record = _decision(audit_outcomes=(outcome,))
 
         assert sr.DecisionRecord.from_json(record.to_json()) == record
-        assert record.to_dict()['audit_outcome']['policy_class'] == _CLASS
-        assert record.to_dict()['audit_outcome']['closed_at'] == '2026-09-25T00:00:00+00:00'
+        assert record.to_dict()['audit_outcomes'][0]['policy_class'] == _CLASS
+        assert record.to_dict()['audit_outcomes'][0]['closed_at'] == '2026-09-25T00:00:00+00:00'
 
     @pytest.mark.parametrize('closed_at', ['yesterday', 7])
     def test_an_outcome_naming_a_malformed_close_is_refused(self, closed_at: object) -> None:
@@ -120,27 +120,27 @@ class TestSerialization:
         judged = '2026-09-25T00:00:00+00:00'
         outcome = sr.AuditOutcome(sr.AuditVerdict.OK, '', _AUDITED_AT, _CLASS, closed_at=judged)
 
-        assert dataclasses.replace(_decision(audit_outcome=outcome), closed_at=judged).current_audit == outcome
-        later = dataclasses.replace(_decision(audit_outcome=outcome), closed_at='2026-09-27T00:00:00+00:00')
+        assert dataclasses.replace(_decision(audit_outcomes=(outcome,)), closed_at=judged).current_audit == outcome
+        later = dataclasses.replace(_decision(audit_outcomes=(outcome,)), closed_at='2026-09-27T00:00:00+00:00')
         assert later.current_audit is None
-        assert later.audit_outcome == outcome
+        assert later.audit_outcomes == (outcome,)
         assert _decision().current_audit is None
 
     @pytest.mark.parametrize('verdict', ['maybe', '', None])
     def test_an_unknown_verdict_is_refused(self, verdict: object) -> None:
         body = _decision().to_dict()
-        body['audit_outcome'] = {
+        body['audit_outcomes'] = [{
             'verdict': verdict, 'note': '', 'audited_at': _AUDITED_AT, 'policy_class': _CLASS,
-        }
+        }]
 
         with pytest.raises(ValueError):
             sr.DecisionRecord.from_dict(body)
 
     def test_a_non_iso_audited_at_is_refused(self) -> None:
         body = _decision().to_dict()
-        body['audit_outcome'] = {
+        body['audit_outcomes'] = [{
             'verdict': 'ok', 'note': '', 'audited_at': 'yesterday', 'policy_class': _CLASS,
-        }
+        }]
 
         with pytest.raises(ValueError):
             sr.DecisionRecord.from_dict(body)
@@ -148,12 +148,20 @@ class TestSerialization:
     def test_list_decisions_skips_a_body_with_an_unknown_verdict(self, tmp_path: Path) -> None:
         path = _seed_closed(tmp_path)
         body = json.loads(path.read_text())
-        body['audit_outcome'] = {
+        body['audit_outcomes'] = [{
             'verdict': 'maybe', 'note': '', 'audited_at': _AUDITED_AT, 'policy_class': _CLASS,
-        }
+        }]
         path.write_text(json.dumps(body))
 
         assert sr.list_decisions(tmp_path) == []
+
+    @pytest.mark.parametrize('stored', [{'verdict': 'ok'}, 'ok', [7]])
+    def test_a_history_that_is_not_a_list_of_outcomes_is_refused(self, stored: object) -> None:
+        body = _decision().to_dict()
+        body['audit_outcomes'] = stored
+
+        with pytest.raises(ValueError, match='audit_outcomes'):
+            sr.DecisionRecord.from_dict(body)
 
     def test_an_outcome_with_an_empty_class_is_refused(self) -> None:
         with pytest.raises(ValueError, match='policy_class'):
@@ -168,7 +176,7 @@ class TestSerialization:
 
     def test_a_stored_outcome_without_a_class_fails_to_load(self) -> None:
         body = _decision().to_dict()
-        body['audit_outcome'] = {'verdict': 'ok', 'note': '', 'audited_at': _AUDITED_AT}
+        body['audit_outcomes'] = [{'verdict': 'ok', 'note': '', 'audited_at': _AUDITED_AT}]
 
         with pytest.raises((KeyError, ValueError)):
             sr.DecisionRecord.from_dict(body)
@@ -176,7 +184,7 @@ class TestSerialization:
     def test_list_decisions_skips_a_body_whose_outcome_names_no_class(self, tmp_path: Path) -> None:
         path = _seed_closed(tmp_path)
         body = json.loads(path.read_text())
-        body['audit_outcome'] = {'verdict': 'ok', 'note': '', 'audited_at': _AUDITED_AT}
+        body['audit_outcomes'] = [{'verdict': 'ok', 'note': '', 'audited_at': _AUDITED_AT}]
         path.write_text(json.dumps(body))
 
         assert sr.list_decisions(tmp_path) == []
@@ -193,15 +201,14 @@ class TestRecordAuditOutcome:
             verdict=sr.AuditVerdict.WRONG, note='note', audited_at=_AUDITED_AT, policy_class=_CLASS,
             closed_at=closed_at,
         )
-        assert returned is not None and returned.audit_outcome == expected
+        assert returned is not None and returned.audit_outcomes == (expected,)
         reread = _only(tmp_path)
-        assert reread.audit_outcome == expected
+        assert reread.audit_outcomes == (expected,)
         assert reread.current_audit == expected
-        assert reread.audit_outcome is not None and reread.audit_outcome.policy_class == _CLASS
-        assert reread.to_dict()['audit_outcome'] == {
+        assert reread.to_dict()['audit_outcomes'] == [{
             'verdict': 'wrong', 'note': 'note', 'audited_at': _AUDITED_AT, 'policy_class': _CLASS,
             'closed_at': closed_at,
-        }
+        }]
         assert sr.DecisionRecord.from_json(reread.to_json()) == reread
         assert reread.closing_evidence == _EVIDENCE
 
@@ -260,12 +267,12 @@ class TestRecordAuditOutcome:
 
         _reopen(tmp_path)
 
-        assert _only(tmp_path).audit_outcome == audited.audit_outcome
+        assert _only(tmp_path).audit_outcomes == audited.audit_outcomes
         assert _only(tmp_path).current_audit is None
 
 
 class TestAReopenedRecordClosedAgain:
-    """The outcome names the close it judged, so a later close of the same record is audited in its own right."""
+    """Each outcome names the close it judged, so a later close of the same record is audited in its own right."""
 
     def _closed_twice(self, root: Path) -> tuple[str, str]:
         _seed_closed(root)
@@ -281,10 +288,10 @@ class TestAReopenedRecordClosedAgain:
         record = _only(tmp_path)
         assert second != first
         assert record.current_audit is None
-        assert record.audit_outcome is not None and record.audit_outcome.closed_at == first
+        assert [outcome.closed_at for outcome in record.audit_outcomes] == [first]
 
-    def test_auditing_the_new_close_replaces_the_earlier_audit(self, tmp_path: Path) -> None:
-        _, second = self._closed_twice(tmp_path)
+    def test_auditing_the_new_close_appends_and_keeps_the_earlier_audit(self, tmp_path: Path) -> None:
+        first, second = self._closed_twice(tmp_path)
 
         returned = _audit(tmp_path, verdict=sr.AuditVerdict.OK)
 
@@ -292,6 +299,9 @@ class TestAReopenedRecordClosedAgain:
         record = _only(tmp_path)
         assert record.current_audit is not None
         assert (record.current_audit.verdict, record.current_audit.closed_at) == (sr.AuditVerdict.OK, second)
+        assert [(o.verdict, o.closed_at) for o in record.audit_outcomes] == [
+            (sr.AuditVerdict.WRONG, first), (sr.AuditVerdict.OK, second),
+        ]
 
     def test_a_verdict_on_the_earlier_close_is_refused_untouched(self, tmp_path: Path) -> None:
         first, _ = self._closed_twice(tmp_path)

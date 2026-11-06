@@ -198,14 +198,16 @@ def draw(
 
 @dataclass(frozen=True)
 class RecordedAudits:
-    """Every audit the decision registry holds, one per decision, keyed by decision id with its queue.
+    """Every audit the decision registry holds, one per audited close, keyed by (decision id, closed_at) with its queue.
 
-    Read from the registry alone, so a count outlives the escalation records
-    the archive prunes. :meth:`recording` folds in an audit written since the
-    read, so a run that writes several audits reads the registry once.
+    Keyed by the close, not the decision: a reopened record closed again
+    carries one outcome per audited close, and every one counts. Read from the
+    registry alone, so a count outlives the escalation records the archive
+    prunes. :meth:`recording` folds in an audit written since the read, so a
+    run that writes several audits reads the registry once.
     """
 
-    by_decision: Mapping[str, tuple[str, AuditOutcome]]
+    by_close: Mapping[tuple[str, str], tuple[str, AuditOutcome]]
 
     @classmethod
     def of(cls, records: Iterable[DecisionRecord]) -> RecordedAudits:
@@ -217,25 +219,26 @@ class RecordedAudits:
         return cls.of(records)
 
     def recording(self, record: DecisionRecord) -> RecordedAudits:
-        """These audits with *record*'s own in place of whatever was held for its id."""
+        """These audits with each of *record*'s own in place of whatever was held for that close."""
         return self._with((record,))
 
     def tally(self, queue_dir: str, policy_class: str) -> tuple[int, int]:
         """``(audited, wrong)`` over every audit of *policy_class* on *queue_dir*."""
         queue = normalize_escalations_dir(queue_dir)
-        outcomes = [outcome for held_queue, outcome in self.by_decision.values()
+        outcomes = [outcome for held_queue, outcome in self.by_close.values()
                     if held_queue == queue and outcome.policy_class == policy_class]
         return len(outcomes), sum(outcome.verdict == AuditVerdict.WRONG for outcome in outcomes)
 
     def by_class(self) -> Mapping[str, int]:
         """Fleet-wide, each class's audit count."""
-        return MappingProxyType(dict(Counter(outcome.policy_class for _, outcome in self.by_decision.values())))
+        return MappingProxyType(dict(Counter(outcome.policy_class for _, outcome in self.by_close.values())))
 
     def _with(self, records: Iterable[DecisionRecord]) -> RecordedAudits:
-        held = dict(self.by_decision)
+        held = dict(self.by_close)
         for record in records:
-            if record.audit_outcome is not None:
-                held[record.id] = (normalize_escalations_dir(record.escalations_dir), record.audit_outcome)
+            queue = normalize_escalations_dir(record.escalations_dir)
+            for outcome in record.audit_outcomes:
+                held[(record.id, outcome.closed_at)] = (queue, outcome)
         return RecordedAudits(MappingProxyType(held))
 
 

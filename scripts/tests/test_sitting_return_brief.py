@@ -586,7 +586,7 @@ def _executor_close(env: Env, n: int, *, policy_class: str = SAMPLED_CLASS, clos
     return _closed_decision(env.fleet, f'dec-exec-{policy_class}-{n}', closed_at=closed_at,
                             escalation_id=esc_id, escalations_dir=normalize_escalations_dir(env.queue),
                             closing_evidence=f'executor evidence for close {n}\nfound_on_main abc1234',
-                            audit_outcome=outcome)
+                            audit_outcomes=() if outcome is None else (outcome,))
 
 
 def _twelve_executor_closes(env: Env) -> list[DecisionRecord]:

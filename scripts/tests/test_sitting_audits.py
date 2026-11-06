@@ -14,6 +14,7 @@ from orchestrator.session_registry import (
     AuditOutcome,
     AuditVerdict,
     DecisionRecord,
+    DecisionState,
     close_decision_with_evidence,
     decision_path_for_id,
     normalize_escalations_dir,
@@ -455,6 +456,22 @@ class TestClassTally:
         assert mod.RecordedAudits.read(fleet.root).tally(fleet.queue_dir, FULL_CLASS) == (0, 0)
         (fleet.queue / 'archive' / '2026-09-25' / 'esc-701-1.json').unlink()
         assert mod.RecordedAudits.read(fleet.root).tally(fleet.queue_dir, SAMPLED_CLASS) == (1, 1)
+
+    def test_every_audited_close_of_a_reopened_record_counts(self, fleet):
+        record = fleet.executor_close(1)
+        fleet.audit(record, AuditVerdict.WRONG)
+        identity = {'expected_project': record.project, 'expected_escalations_dir': record.escalations_dir}
+        assert reopen_decision(record.id, fleet.root, **identity) is not None
+        reclosed = close_decision_with_evidence(
+            record.id, DecisionState.ANSWERED, 'executor evidence for the re-close', root=fleet.root, **identity,
+        )
+        assert reclosed is not None and reclosed.closed_at != record.closed_at
+
+        fleet.audit(reclosed, AuditVerdict.OK)
+
+        recorded = mod.RecordedAudits.read(fleet.root)
+        assert recorded.tally(fleet.queue_dir, SAMPLED_CLASS) == (2, 1)
+        assert recorded.by_class()[SAMPLED_CLASS] == 2
 
     def test_recording_folds_in_an_audit_written_after_the_read(self, fleet):
         first, second = fleet.executor_close(1), fleet.executor_close(2)

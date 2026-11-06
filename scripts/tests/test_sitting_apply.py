@@ -802,7 +802,7 @@ class TestAuditRow8:
             rc, rows, text = bench.run(capsys, f'{n}=wrong:missed sibling')
 
             assert rc == 0, text
-            assert _decision_of(bench.fleet, record.id).audit_outcome == AuditOutcome(
+            assert _decision_of(bench.fleet, record.id).current_audit == AuditOutcome(
                 AuditVerdict.WRONG, 'missed sibling', bench.now.isoformat(), LANDING, closed_at=record.closed_at)
             assert bench.state() == ClassSwitch.SHADOW
             assert _executor_resolve(served, 'esc-501-1')['code'] == 'level_forbidden'
@@ -823,7 +823,7 @@ class TestAuditVerdicts:
         rc, _, text = bench.run(capsys, f'{n}=ok')
 
         assert rc == 0, text
-        outcome = _decision_of(bench.fleet, record.id).audit_outcome
+        outcome = _decision_of(bench.fleet, record.id).current_audit
         assert outcome is not None and outcome.verdict == AuditVerdict.OK
         assert bench.state() == ClassSwitch.LIVE
 
@@ -847,7 +847,7 @@ class TestAuditVerdicts:
         rc, _, text = bench.run(capsys, f'{n}=wrong')
 
         assert rc == 0, text
-        outcome = _decision_of(bench.fleet, record.id).audit_outcome
+        outcome = _decision_of(bench.fleet, record.id).current_audit
         assert outcome is not None and outcome.verdict == AuditVerdict.WRONG
         assert not policy_state.policy_state_path(Path(bench.queue_dir)).exists()
 

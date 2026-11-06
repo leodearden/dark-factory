@@ -646,15 +646,15 @@ class DecisionRecord:
         that: a carve-out close targets an L2 that has been open a while.
         Defaults to '' (not closed with evidence, or closed before this field
         existed).
-    audit_outcome: the sitting's AuditOutcome for an executor close, or None
-        (not audited). Written only by record_audit_outcome; CUSTODY like
-        ``closing_evidence``, and kept by reopen_decision, because an audited
-        close stays history the per-class wrong rate counts. The outcome names
-        the close it judged (its ``closed_at``), so a reopened record closed
-        again is unaudited (``current_audit`` is None) until that new close
-        is audited, and that audit replaces the earlier one: a record holds
-        the audit of its latest audited close. An outcome is never
-        overwritten for the close it judged. It names the policy class the
+    audit_outcomes: the sitting's AuditOutcomes for this record's executor
+        closes, oldest first; empty when never audited. APPEND-ONLY: written
+        only by record_audit_outcome, which adds one outcome per audited close
+        and never replaces one. CUSTODY like ``closing_evidence``, and kept by
+        reopen_decision, because every audited close stays history the
+        per-class wrong rate counts. Each outcome names the close it judged
+        (its ``closed_at``), so a reopened record closed again is unaudited
+        (``current_audit`` is None) until that new close is audited in turn,
+        and both verdicts then count. Each names the policy class the
         audit judged, copied from the escalation record at audit time:
         escalation archives are pruned
         (escalation/src/escalation/archive.py::DEFAULT_RETENTION_DAYS) and the
@@ -703,7 +703,7 @@ class DecisionRecord:
     closing_evidence: str = field(default='', kw_only=True)
     closed_at: str = field(default='', kw_only=True)
     record_slug: str = field(default='', kw_only=True)
-    audit_outcome: AuditOutcome | None = field(default=None, kw_only=True)
+    audit_outcomes: tuple[AuditOutcome, ...] = field(default=(), kw_only=True)
 
     @property
     def linked_session_slug(self) -> str | None:
@@ -719,9 +719,9 @@ class DecisionRecord:
 
     @property
     def current_audit(self) -> AuditOutcome | None:
-        """``audit_outcome`` when it judged the close this record carries now, else None."""
-        outcome = self.audit_outcome
-        return outcome if outcome is not None and outcome.closed_at == self.closed_at else None
+        """The outcome that judged the close this record carries now, else None."""
+        return next((outcome for outcome in reversed(self.audit_outcomes)
+                     if outcome.closed_at == self.closed_at), None)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -740,7 +740,7 @@ class DecisionRecord:
             'closing_evidence': self.closing_evidence,
             'closed_at': self.closed_at,
             'record_slug': self.record_slug,
-            'audit_outcome': None if self.audit_outcome is None else self.audit_outcome.to_dict(),
+            'audit_outcomes': [outcome.to_dict() for outcome in self.audit_outcomes],
         }
 
     @classmethod
@@ -766,7 +766,7 @@ class DecisionRecord:
             closing_evidence=data.get('closing_evidence') or '',
             closed_at=data.get('closed_at') or '',
             record_slug=data.get('record_slug') or '',
-            audit_outcome=_audit_outcome_of(data.get('audit_outcome')),
+            audit_outcomes=_audit_outcomes_of(data.get('audit_outcomes')),
         )
 
     def to_json(self) -> str:
@@ -777,12 +777,12 @@ class DecisionRecord:
         return cls.from_dict(json.loads(raw))
 
 
-def _audit_outcome_of(value: Any) -> AuditOutcome | None:
+def _audit_outcomes_of(value: Any) -> tuple[AuditOutcome, ...]:
     if value is None:
-        return None
-    if not isinstance(value, Mapping):
-        raise ValueError(f'audit_outcome must be a mapping or null, got {value!r}')
-    return AuditOutcome.from_dict(value)
+        return ()
+    if not isinstance(value, list) or not all(isinstance(item, Mapping) for item in value):
+        raise ValueError(f'audit_outcomes must be a list of mappings or null, got {value!r}')
+    return tuple(AuditOutcome.from_dict(item) for item in value)
 
 
 # ---------------------------------------------------------------------------
@@ -1663,8 +1663,8 @@ def reopen_decision(
     DecisionReopenRefused. Clears ``closing_evidence`` and ``closed_at``,
     because a close never overwrites evidence, so a re-opened gate could
     otherwise never be closed with evidence again. Every other field is kept,
-    ``filed_at``, ``manual_boost`` and ``audit_outcome`` included (custody);
-    the kept outcome names the close it judged, so the record's next close is
+    ``filed_at``, ``manual_boost`` and ``audit_outcomes`` included (custody);
+    each kept outcome names the close it judged, so the record's next close is
     unaudited until it is audited in turn. It is reopen-only
     rather than a generic state setter, which would bypass the evidence-quoting
     close; see plans/4835-decision-plumbing-decisions.md.
@@ -1711,8 +1711,9 @@ def record_audit_outcome(
     also meets a record with no closing evidence (nothing was closed to
     audit), one whose close is no longer that one (reopened, or closed
     again), and one whose current close already carries an outcome (never
-    overwritten). An outcome that judged an earlier close of a reopened record
-    is replaced. *policy_class* is the class the audit judged. A malformed
+    overwritten). The outcome is APPENDED to ``audit_outcomes``: one that
+    judged an earlier close of a reopened record is kept, so both count.
+    *policy_class* is the class the audit judged. A malformed
     verdict, stamp or class raises ValueError before the lock.
 
     Otherwise FAIL-SOFT like its sibling setters: None (logged at ERROR) on a
@@ -1740,7 +1741,7 @@ def record_audit_outcome(
                 f'{decision_id} was already audited {current.verdict!s} at {current.audited_at}; '
                 'refusing to overwrite it'
             )
-        record.audit_outcome = outcome
+        record.audit_outcomes = (*record.audit_outcomes, outcome)
 
     return _mutate_decision(decision_id, _audit, caller='record_audit_outcome', root=root)
 
@@ -1874,7 +1875,7 @@ def merge_decision_enrichment(
     - ``id`` / ``project``   -- from *existing*. The id is the JOIN KEY: it
       is the whole reason these two records are being merged.
     - ``filed_at`` / ``state`` / ``manual_boost`` / ``closing_evidence`` /
-      ``closed_at`` / ``audit_outcome`` -- from *existing* (CUSTODY). A second
+      ``closed_at`` / ``audit_outcomes`` -- from *existing* (CUSTODY). A second
       watcher must not restamp queue age, re-open or close the record (that is
       update_decision_state's job), reset an operator's C5 cockpit boost,
       erase the evidence a close recorded or when it recorded it, or erase
@@ -1963,7 +1964,7 @@ def merge_same_queue_refile(
       in the cockpit queue forever. This is the whole reason the same-queue
       case is not just routed through merge_decision_enrichment.
     - ``filed_at`` / ``state`` / ``manual_boost`` / ``closing_evidence`` /
-      ``closed_at`` / ``audit_outcome`` -- from *existing* (CUSTODY), and it
+      ``closed_at`` / ``audit_outcomes`` -- from *existing* (CUSTODY), and it
       is the SAME set merge_decision_enrichment keeps, because custody does not depend on
       which queue re-filed. ``closing_evidence`` and ``closed_at`` travel
       with ``state``: they are the evidence for the disposition being held
@@ -2050,7 +2051,7 @@ def merge_same_queue_refile(
         manual_boost=existing.manual_boost,
         closing_evidence=existing.closing_evidence,
         closed_at=existing.closed_at,
-        audit_outcome=existing.audit_outcome,
+        audit_outcomes=existing.audit_outcomes,
     )
 
 
