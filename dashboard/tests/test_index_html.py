@@ -1400,6 +1400,38 @@ def test_prd_grouping_js_load_order(
     )
 
 
+# prd_lanes_view.js stamps the /prds Datums through datum.js::servedDatum,
+# destructured at module scope (task 6585).
+_PRD_LANES_VIEW_PREFIX = '/static/redux/prd_lanes_view.js'
+_PRD_LANES_VIEW_ORDER_CASES = [
+    (_DATUM_PREFIX, 'datum.js', _PRD_LANES_VIEW_PREFIX, 'prd_lanes_view.js', _READS_AT_MODULE_SCOPE),
+]
+
+
+@pytest.mark.parametrize(
+    'before_prefix, before_label, after_prefix, after_label, why',
+    _PRD_LANES_VIEW_ORDER_CASES,
+    ids=['datum-before-prd-lanes-view'],
+)
+def test_prd_lanes_view_js_load_order(
+    index_html_body: str,
+    before_prefix: str,
+    before_label: str,
+    after_prefix: str,
+    after_label: str,
+    why: str,
+) -> None:
+    """The PRD lanes reader loads after every module it reads."""
+    assert_script_loads_before(
+        index_html_body,
+        before_prefix,
+        after_prefix,
+        before_label=before_label,
+        after_label=after_label,
+        consumer_note=f'{after_label} ' + why.format(before=before_label),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Regression guard: datum.js is served and sits between endpoint_staleness.js
 # and its consumers (task 5588, PRD leaf gamma1)
