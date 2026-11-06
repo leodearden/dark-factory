@@ -83,11 +83,13 @@ extend-select = ["TID251"]
 
 [tool.ruff.lint.flake8-tidy-imports.banned-api]
 "asyncio.get_event_loop".msg = "Raises 'no current event loop' once asyncio.run() has cleared it (task 1711): use asyncio.get_running_loop() in an async body or helper, asyncio.run(coro) in a sync driver, or make_placeholder_future() from orchestrator/tests/_orch_helpers.py for a sync test's placeholder future."
+"asyncio.events.get_event_loop".msg = "Raises 'no current event loop' once asyncio.run() has cleared it (task 1711): use asyncio.get_running_loop() in an async body or helper, asyncio.run(coro) in a sync driver, or make_placeholder_future() from orchestrator/tests/_orch_helpers.py for a sync test's placeholder future."
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = ["F811"]
 # src/ still calls asyncio.get_event_loop(), outside the retired AST guard's tests-only scope.
-"src/**/*.py" = ["TID251"]  # debt: task 8622
+# Its owner is recorded in shared/tests/test_shared_governed_lists.py::RUFF_CONFIG_SUPPRESSIONS.
+"src/**/*.py" = ["TID251"]
 
 # NOT an enforced gate — style config only: it shapes an ad-hoc or editor-on-save
 # `ruff format` into a repo-consistent single-quoted diff. Do not delete as unused,
