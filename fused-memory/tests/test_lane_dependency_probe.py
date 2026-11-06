@@ -54,7 +54,7 @@ def lease_files(directory: Path) -> list[str]:
     return sorted(p.name for p in directory.glob('*.lease')) if directory.is_dir() else []
 
 
-def leases_of(pid: int, names: list[str]) -> list[str]:
+def probe_leases_of(pid: int, names: list[str]) -> list[str]:
     return [name for name in names if name.startswith(f'{PROBE_LEASE_PREFIX}{pid}.')]
 
 
@@ -247,7 +247,7 @@ def test_the_qdrant_check_holds_a_lease_in_the_given_lease_dir_while_it_works(
         finish_probe(probe)
 
     [leases] = qdrant.leases_seen_at_listing
-    assert len(leases) == 1 and leases_of(probe.pid, leases) == leases
+    assert len(leases) == 1 and probe_leases_of(probe.pid, leases) == leases
     assert lease_files(lease_dir) == []
 
 
@@ -257,8 +257,12 @@ def test_a_run_leaves_no_probe_lease_in_the_machine_global_lease_dir(lease_dir: 
         result = finish_probe(probe)
 
     assert_names_dependency(result, 'qdrant: create collection: HTTP 403')
-    assert [leases_of(probe.pid, listing) for listing in qdrant.leases_seen_at_listing] == [[]]
-    assert leases_of(probe.pid, lease_files(LEASE_REAPER.DEFAULT_LEASE_DIR)) == []
+    assert len(qdrant.leases_seen_at_listing) == 1, (
+        'GET /collections reached this fake from outside the probe under test'
+        ' (a probe aimed at a released port?)'
+    )
+    assert [probe_leases_of(probe.pid, listing) for listing in qdrant.leases_seen_at_listing] == [[]]
+    assert probe_leases_of(probe.pid, lease_files(LEASE_REAPER.DEFAULT_LEASE_DIR)) == []
 
 
 def test_a_failure_line_never_carries_the_words_of_the_exception() -> None:
