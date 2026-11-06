@@ -1321,6 +1321,37 @@ class TestVerdictRunner:
 
 
 @pytest.mark.asyncio
+class TestVerdictRunnerOverTheRealDispatcher:
+    async def test_a_remote_green_reads_as_the_remote_host(self, tmp_path: Path) -> None:
+        h = _harness(tmp_path, _ORCH_ONLY, transport=_Transport(verify=_answers(_result(True))))
+
+        await h.call()
+
+        assert task_verify_dispatch.verdict_runner(h.dispatcher, '7', 1) == 'laptop'
+
+    async def test_a_local_policy_call_reads_as_local(self, tmp_path: Path) -> None:
+        h = _harness(tmp_path, TaskVerifyPolicy())
+
+        await h.call()
+
+        assert task_verify_dispatch.verdict_runner(
+            h.dispatcher, '7', 1,
+        ) == task_verify_dispatch.LOCAL_RUNNER
+
+    async def test_the_runner_is_read_per_attempt(self, tmp_path: Path) -> None:
+        h = _harness(tmp_path, _ORCH_ONLY, transport=_Transport(verify=_answers(_result(True))))
+        await h.call(attempt_id=1)
+
+        h.policy = TaskVerifyPolicy()
+        await h.call(attempt_id=2)
+
+        assert task_verify_dispatch.verdict_runner(h.dispatcher, '7', 1) == 'laptop'
+        assert task_verify_dispatch.verdict_runner(
+            h.dispatcher, '7', 2,
+        ) == task_verify_dispatch.LOCAL_RUNNER
+
+
+@pytest.mark.asyncio
 class TestStaleDecisionAfterRollback:
     async def test_a_local_call_drops_the_decision_an_earlier_route_recorded(
         self, tmp_path: Path,
