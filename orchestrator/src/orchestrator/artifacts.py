@@ -385,6 +385,9 @@ zero-output-evidence families. ``plan.json.mutex`` is deliberately absent: it
 is derived from the resolved plan.json, so it always sits beside that plan.
 """
 
+LANE_SYMLINKED_ARTIFACTS: tuple[str, ...] = ('plan.json', 'iterations.jsonl')
+"""The task-root artifacts the lane ``.task/`` exposes to agents."""
+
 
 @dataclass
 class ReviewAggregation:
@@ -430,6 +433,15 @@ def _format_issue_section(heading: str, issues: list[dict]) -> str:
             lines.append(f'**Suggested fix:** {fix}')
         lines.append('')
     return '\n'.join(lines)
+
+
+def _replace_with_symlink(link: Path, target: Path) -> None:
+    if link.is_symlink() or link.exists():
+        if link.is_dir() and not link.is_symlink():
+            shutil.rmtree(link)
+        else:
+            link.unlink(missing_ok=True)
+    os.symlink(target, link)
 
 
 class TaskArtifacts:
@@ -678,37 +690,26 @@ class TaskArtifacts:
             )
         self._write_json('plan.json', plan)
 
-    def ensure_lane_plan_symlink(self) -> None:
-        """Single-source plan.json onto the durable meta-root copy.
+    def ensure_lane_symlinks(self) -> None:
+        """Expose each ``LANE_SYMLINKED_ARTIFACTS`` name in the lane ``.task/``.
 
-        Makes the lane copy ``<worktree>/.task/plan.json`` an ABSOLUTE symlink
-        to ``artifact_path('plan.json')`` (the durable meta-root plan). Any
-        residual reader of the lane path then transparently resolves to the
-        meta-root file, so the lane copy can never diverge from the meta-root —
-        the esc-5205-9 stale trap (a remediation agent appended steps to a
-        regular-FILE lane copy that ``mark_step_done`` then rejected) becomes
-        impossible because the lane path IS the meta-root file.
+        Makes ``<worktree>/.task/<name>`` an ABSOLUTE symlink to
+        ``artifact_path(<name>)``, so an agent reading or appending through the
+        lane path reaches the durable file and the lane copy can never diverge
+        from it (the esc-5205-9 stale trap: steps appended to a regular-FILE
+        lane plan that ``mark_step_done`` then rejected).
 
-        Idempotent and recreated each dispatch: replaces a pre-existing regular
-        file, a stale/broken symlink, or a pathological stray directory. No-op
-        when the durable plan already IS ``<worktree>/.task/plan.json`` (legacy
-        single-root mode), where a self-referential symlink would be broken.
+        Idempotent and recreated each dispatch: replaces a regular file, a
+        stale or broken symlink, or a stray directory. Skips a name whose
+        durable path already IS the lane path (legacy single-root mode), where
+        a self-referential symlink would be broken.
         """
-        durable_plan = self.artifact_path('plan.json')
         lane_task = self.worktree / '.task'
-        if durable_plan == lane_task / 'plan.json':
-            return
-        # meta_root mode's init() never creates <worktree>/.task, so make it.
         lane_task.mkdir(parents=True, exist_ok=True)
-        lane_plan = lane_task / 'plan.json'
-        # Clear any occupant: a regular file (the esc-5205-9 stale trap), a
-        # stale/broken symlink, or the pathological stray directory.
-        if lane_plan.is_symlink() or lane_plan.exists():
-            if lane_plan.is_dir() and not lane_plan.is_symlink():
-                shutil.rmtree(lane_plan)
-            else:
-                lane_plan.unlink(missing_ok=True)
-        os.symlink(durable_plan, lane_plan)
+        for name in LANE_SYMLINKED_ARTIFACTS:
+            durable = self.artifact_path(name)
+            if durable != lane_task / name:
+                _replace_with_symlink(lane_task / name, durable)
 
     def write_blocking_dependency(
         self,
@@ -1871,7 +1872,7 @@ class TaskArtifacts:
 
         A SYMLINKED target is written THROUGH, as ``write_text`` wrote through
         it: the path is resolved first and the real file is what gets replaced.
-        This is load-bearing, not hygiene — ``ensure_lane_plan_symlink`` makes
+        This is load-bearing, not hygiene — ``ensure_lane_symlinks`` makes
         ``<worktree>/.task/plan.json`` a symlink onto the meta-root plan, and
         a bare replace onto the link path would swap it for a regular file,
         silently re-forking the lane and meta-root copies (the esc-5205-9

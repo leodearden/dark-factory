@@ -2814,12 +2814,13 @@ class TaskWorkflow:
             self.task.get('description', ''),
             base_commit=base_commit,
         )
-        # Single-source plan.json: make the lane copy
-        # <worktree>/.task/plan.json a symlink into the durable meta-root plan
-        # (task 2763), so any residual reader of the lane path resolves to the
-        # meta-root file — the esc-5205-9 stale-trap is then impossible.
-        # Recreated each dispatch; no-op in legacy meta_root=None mode.
-        self.artifacts.ensure_lane_plan_symlink()
+        # Single-source plan.json and iterations.jsonl: make the lane copies
+        # <worktree>/.task/{plan.json,iterations.jsonl} symlinks into the
+        # durable task root (tasks 2763, 3160), so an agent reading or
+        # appending through the lane path reaches the durable file — the
+        # esc-5205-9 stale-trap is then impossible. Recreated each dispatch;
+        # no-op in legacy meta_root=None mode.
+        self.artifacts.ensure_lane_symlinks()
 
         # ── Layer B: stale iteration-log hygiene on re-dispatch ─────
         # init() only overwrites metadata.json — iterations.jsonl otherwise
