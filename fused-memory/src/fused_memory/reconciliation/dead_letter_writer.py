@@ -13,7 +13,7 @@ import json
 import logging
 import os
 import threading
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -28,6 +28,18 @@ def _running_future() -> Future[Any]:
     return future
 
 
+def _settle(
+    written: Future[bool], ok: bool, on_written: Callable[[bool], None] | None,
+) -> None:
+    """Run ``on_written(ok)``, then resolve ``written``: the hook always goes first."""
+    if on_written is not None:
+        try:
+            on_written(ok)
+        except Exception:
+            logger.exception('DeadLetterWriter: on_written hook raised')
+    written.set_result(ok)
+
+
 class DeadLetterWriter:
     """Appends JSON records to ``path`` from one worker thread, rotating by size.
 
@@ -35,7 +47,8 @@ class DeadLetterWriter:
     worker and returns a future that resolves ``True`` once the line is on
     disk, or ``False`` if the write failed (the failure is logged). The
     future cannot be cancelled, so an awaiter that is itself cancelled cannot
-    drop an accepted record.
+    drop an accepted record, and an ``on_written`` hook runs before it
+    resolves.
     """
 
     def __init__(
@@ -73,13 +86,24 @@ class DeadLetterWriter:
             *(self._rotation_path(i) for i in range(1, self._keep_rotations + 1)),
         ]
 
-    def append(self, record: Mapping[str, Any]) -> Future[bool]:
-        """Hand ``record`` to the worker thread; resolve once it is written or has failed."""
+    def append(
+        self,
+        record: Mapping[str, Any],
+        *,
+        on_written: Callable[[bool], None] | None = None,
+    ) -> Future[bool]:
+        """Hand ``record`` to the worker thread; resolve once it is written or has failed.
+
+        ``on_written`` receives that outcome on the settling thread (the worker,
+        or the caller's thread when the hand-off itself fails) BEFORE the
+        returned future resolves, so anything it schedules precedes every
+        observer of that future and of :meth:`flushed`.
+        """
         written: Future[bool] = _running_future()
         try:
             line = json.dumps(record) + '\n'
             with self._pending_lock:
-                self._executor.submit(self._write, line, written)
+                self._executor.submit(self._write, line, written, on_written)
                 self._last = written
                 self._records_pending += 1
         except Exception as exc:
@@ -88,7 +112,7 @@ class DeadLetterWriter:
                 'its writer thread: %s',
                 self._path, exc,
             )
-            written.set_result(False)
+            _settle(written, False, on_written)
         return written
 
     def flushed(self) -> Future[None]:
@@ -105,7 +129,12 @@ class DeadLetterWriter:
     def _rotation_path(self, index: int) -> Path:
         return Path(f'{self._path}.{index}')
 
-    def _write(self, line: str, written: Future[bool]) -> None:
+    def _write(
+        self,
+        line: str,
+        written: Future[bool],
+        on_written: Callable[[bool], None] | None,
+    ) -> None:
         ok = False
         try:
             self._append_line(line)
@@ -118,7 +147,7 @@ class DeadLetterWriter:
         finally:
             with self._pending_lock:
                 self._records_pending -= 1
-            written.set_result(ok)
+            _settle(written, ok, on_written)
 
     def _append_line(self, line: str) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
