@@ -16,6 +16,7 @@ queue; the remote is a fake whose answers the test sets.
 from __future__ import annotations
 
 import asyncio
+import logging
 import subprocess
 from pathlib import Path
 from typing import Any, ClassVar
@@ -80,6 +81,7 @@ class _Laptop:
         self.name = name
         self.healthy = True
         self.clean = True
+        self.cancel_rc = 0
         self.release = release
         self.entered = asyncio.Event()
         self.verified: list[str] = []
@@ -94,7 +96,7 @@ class _Laptop:
         return self.clean
 
     async def cancel_verify(self) -> int:
-        return 0
+        return self.cancel_rc
 
     async def reap_idle_gates(self) -> None:
         return None
@@ -264,3 +266,118 @@ class TestSymmetricHost:
 
         assert outcome.status == 'done', outcome
         assert len(laptop.verified) == 1
+
+
+# ---------------------------------------------------------------------------
+# Readmission reaches the task pool through on_host_readmitted
+# ---------------------------------------------------------------------------
+
+_LANE_LOGGER = 'orchestrator.merge_lane'
+
+
+async def _until(predicate: Any, *, what: str) -> None:
+    async def poll() -> None:
+        while not predicate():
+            await asyncio.sleep(0.02)
+
+    await wait_responsive(poll(), label=what)
+
+
+def _benched_worker(
+    repo: Path, laptop: _Laptop, **kwargs: Any,
+) -> tuple[SpeculativeMergeWorker, Any]:
+    worker = _worker(repo, remote_runners=[laptop], **kwargs)
+    allocator = worker.ensure_host_allocator(_config(repo))
+    worker.bench_unavailable_runner(_HOST, _transport_down())
+    return worker, allocator
+
+
+@pytest.mark.asyncio
+class TestReadmissionHook:
+    async def test_an_operator_clear_calls_the_hook_once(self, repo: Path) -> None:
+        readmitted: list[str] = []
+        worker, _ = _benched_worker(repo, _Laptop(), on_host_readmitted=readmitted.append)
+
+        outcome = await worker.clear_host_quarantine(_HOST)
+
+        assert outcome['cleared'] is True
+        assert readmitted == [_HOST]
+        assert _rows(worker)[_HOST]['quarantined'] is False
+
+    async def test_a_reprobe_readmission_calls_the_hook(self, repo: Path, tmp_path: Path) -> None:
+        """Row 9 at worker level: no merge is dispatched, the sweep alone readmits."""
+        readmitted: list[str] = []
+        escalations = EscalationQueue(tmp_path / 'escalations')
+        laptop = _Laptop()
+        laptop.healthy = False
+        lane = make_lane(
+            GitOps(_GIT, repo), remote_runners=[laptop], deployed_sha=TEST_DEPLOYED_SHA,
+            escalation_queue=escalations, on_host_readmitted=readmitted.append,
+        )
+
+        async with running_lane(lane):
+            lane.ensure_host_allocator(_config(
+                repo, verify_host_unreachable_escalate_after_n=1, verify_host_reprobe_interval_s=1.0,
+            ))
+            lane.bench_unavailable_runner(_HOST, _transport_down())
+            row = _rows(lane)[_HOST]
+            assert (row['quarantine_class'], row['streak']) == ('ru', 1)
+            [alarm] = [esc for esc in escalations.get_pending() if esc.level == 1]
+            assert alarm.category == 'verify_host_unreachable'
+
+            laptop.healthy = True
+            await _until(
+                lambda: _rows(lane)[_HOST]['quarantined'] is False,
+                what='the reprobe sweep to readmit the laptop',
+            )
+
+        assert readmitted == [_HOST]
+        [resolved] = [
+            esc for esc in escalations.get_by_task(alarm.task_id) if esc.id == alarm.id
+        ]
+        assert resolved.status == 'resolved'
+
+    async def test_a_refused_readmission_does_not_call_the_hook(self, repo: Path) -> None:
+        readmitted: list[str] = []
+        laptop = _Laptop()
+        worker = _worker(repo, remote_runners=[laptop], on_host_readmitted=readmitted.append)
+        allocator = worker.ensure_host_allocator(_config(repo))
+        lease = allocator.acquire_remote()
+        assert lease is not None
+        laptop.cancel_rc, laptop.clean = 1, False
+        await allocator.cancel_and_release(lease, max_attempts=1)
+        worker.bench_unavailable_runner(_HOST, _transport_down())
+
+        outcome = await worker.clear_host_quarantine(_HOST)
+
+        assert outcome['cleared'] is False
+        assert readmitted == []
+        assert _rows(worker)[_HOST]['quarantined'] is True
+
+    async def test_a_hook_that_raises_is_logged_and_the_readmission_stands(
+        self, repo: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        def broken_hook(name: str) -> None:
+            raise RuntimeError(f'task pool fault for {name}')
+
+        caplog.set_level(logging.ERROR, logger=_LANE_LOGGER)
+        worker, _ = _benched_worker(repo, _Laptop(), on_host_readmitted=broken_hook)
+
+        outcome = await worker.clear_host_quarantine(_HOST)
+
+        assert outcome['cleared'] is True
+        assert _rows(worker)[_HOST]['quarantined'] is False
+        errors = [
+            r for r in caplog.records if r.name == _LANE_LOGGER and r.levelno == logging.ERROR
+        ]
+        assert len(errors) == 1
+        assert _HOST in errors[0].getMessage()
+        assert errors[0].exc_info is not None
+
+    async def test_no_hook_readmits_as_before(self, repo: Path) -> None:
+        worker, _ = _benched_worker(repo, _Laptop())
+
+        outcome = await worker.clear_host_quarantine(_HOST)
+
+        assert outcome['cleared'] is True
+        assert _rows(worker)[_HOST]['quarantined'] is False
