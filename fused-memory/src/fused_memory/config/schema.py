@@ -2397,10 +2397,10 @@ class CuratorConfig(BaseModel):
     # per-parent p90 measured for that cap, and not at its p99 of 4.
     #
     # ``test_config_schema.py::TestCuratorPoolCaps`` pins these relationships.
-    pool_module_cap: int = Field(default=20)
-    pool_embedding_cap: int = Field(default=10)
-    pool_dependency_cap: int = Field(default=3)
-    pool_total_cap: int = Field(default=29)
+    pool_module_cap: int = Field(default=20, ge=0)
+    pool_embedding_cap: int = Field(default=10, ge=0)
+    pool_dependency_cap: int = Field(default=3, ge=0)
+    pool_total_cap: int = Field(default=29, ge=1)
     # Caps the sibling stream (task 6227): an agent-followup candidate's
     # non-cancelled tasks that share its metadata.spawned_from. 10 comes from
     # the live store, measured 2026-10-30: 1,406 agent_followup parents, 2,140

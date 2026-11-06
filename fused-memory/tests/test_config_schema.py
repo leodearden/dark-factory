@@ -1751,6 +1751,9 @@ class TestCuratorPoolCaps:
     them and point there rather than restating them.
     """
 
+    EMBEDDING_FLOOR = 5
+    SIBLINGS_PER_PARENT_P90 = 3
+
     def test_stock_pool_caps(self):
         cfg = CuratorConfig()
         caps = (
@@ -1763,7 +1766,9 @@ class TestCuratorPoolCaps:
             f'module/embedding/dependency/total pool caps are {caps}; the '
             f'derivation for 20/10/3/29 is the pool-cap block in '
             f'config/schema.py::CuratorConfig. Move a value only with a new '
-            f'derivation there.'
+            f'derivation there. pool_total_cap 29 is the pre-5397 reachable '
+            f'maximum: raising it spends prompt tokens and batch fan-in under '
+            f'batch_token_threshold, so restate that trade in the block first.'
         )
 
     def test_the_total_cap_binds_when_every_stream_is_full(self):
@@ -1781,25 +1786,33 @@ class TestCuratorPoolCaps:
             f'PoolWithheld census goes permanently silent.'
         )
 
-    def test_the_worst_case_pool_is_no_larger_than_before_the_retune(self):
+    def test_a_full_module_stream_with_p90_siblings_keeps_the_embedding_floor(self):
+        """_trim_pool cuts siblings only after the module stream, so each sibling of a full pool costs one embedding slot."""
         cfg = CuratorConfig()
-        assert cfg.pool_total_cap <= 29, (
-            f'pool_total_cap is {cfg.pool_total_cap}; 29 is the pre-5397 '
-            f'reachable maximum. Raising it spends prompt tokens and batch '
-            f'fan-in under batch_token_threshold — restate that trade in the '
-            f'pool-cap block of config/schema.py::CuratorConfig before the '
-            f'value moves.'
-        )
-
-    def test_a_full_module_stream_leaves_the_embedding_head(self):
-        cfg = CuratorConfig()
-        embedding_left = cfg.pool_total_cap - 1 - cfg.pool_module_cap
-        assert embedding_left >= 5, (
-            f'A full module stream plus the anchor leaves {embedding_left} '
-            f'embedding slots, below the floor of 5. The embedding stream is '
-            f'the only relevance-ordered stream; see the pool-cap block in '
+        siblings = self.SIBLINGS_PER_PARENT_P90
+        embedding_left = cfg.pool_total_cap - 1 - siblings - cfg.pool_module_cap
+        assert embedding_left >= self.EMBEDDING_FLOOR, (
+            f'A full module stream plus the anchor and {siblings} siblings (the '
+            f'per-parent p90 measured for pool_sibling_cap) leaves '
+            f'{embedding_left} embedding slots, below the floor of '
+            f'{self.EMBEDDING_FLOOR}. The embedding stream is the only '
+            f'relevance-ordered stream; see the pool-cap block in '
             f'config/schema.py::CuratorConfig for why its head must survive.'
         )
+
+    @pytest.mark.parametrize(
+        ('field', 'value'),
+        [
+            ('pool_module_cap', -1),
+            ('pool_embedding_cap', -1),
+            ('pool_dependency_cap', -1),
+            ('pool_total_cap', 0),
+        ],
+    )
+    def test_a_cap_below_its_floor_is_refused_at_load(self, field, value):
+        """A stream cap of 0 disables that stream; a total cap of 0 would cut the anchor _trim_pool always keeps."""
+        with pytest.raises(ValidationError, match=field):
+            CuratorConfig(**{field: value})
 
 
 class TestCuratorSiblingCap:
