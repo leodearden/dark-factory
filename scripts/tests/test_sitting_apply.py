@@ -14,17 +14,31 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from escalation.authority import COORDINATOR_IDENTITY, EXECUTOR_IDENTITY
+from escalation.authority import COORDINATOR_IDENTITY, EXECUTOR_IDENTITY, ClassSwitch
 from escalation.classify import classify_resolver_tier
 from escalation.models import Escalation
-from orchestrator.session_registry import DecisionState, list_decisions, normalize_escalations_dir
+from orchestrator.session_registry import (
+    AuditOutcome,
+    AuditVerdict,
+    DecisionRecord,
+    DecisionState,
+    close_decision_with_evidence,
+    decision_path_for_id,
+    list_decisions,
+    normalize_escalations_dir,
+    record_audit_outcome,
+    write_decision,
+)
+from shared.mcp_session import SyncMcpSession
 from sitting import apply as mod
 from sitting import ledger as ledger_mod
 from sitting import payloads, prepare_sitting
 from sitting import preparation as prep_mod
-from sitting.inventory import escalation_key, key_str
+from sitting.inventory import AUDIT_KIND, audit_key, escalation_key, key_str
 from sitting.ports import QueuePort
 from sitting_escalation_servers import RecordingToolCaller, ServedQueue, serve_project_queue
+
+from escalation import policy_state
 
 STEP_NAMES = ['stamp_triage', 'resolve_issue', 'update_task', 'close_decision', 'add_memory', 'add_memory']
 
@@ -419,3 +433,220 @@ class TestCli:
 
         assert rc == 2
         assert prep_mod.NIGHTLY_CONFINEMENT_ENV in err
+
+
+LANDING = 'landing_provenance'
+FOUND_EVIDENCE = 'found_on_main: commit abc1234 is-ancestor of main per merge-base'
+
+
+def _decision_of(fleet: Path, decision_id: str) -> DecisionRecord:
+    return DecisionRecord.from_json(decision_path_for_id(decision_id, root=fleet).read_text())
+
+
+@dataclass
+class AuditBench:
+    """One project queue, a fleet, and a nightly ledger numbering executor closes as ``audit N``."""
+
+    root: Path
+    fleet: Path
+    ledger: Path
+    now: datetime
+
+    @property
+    def queue(self) -> Path:
+        return self.root / 'data' / 'escalations'
+
+    @property
+    def queue_dir(self) -> str:
+        return normalize_escalations_dir(self.queue)
+
+    def file_close(self, esc_id: str, decision_id: str) -> DecisionRecord:
+        opened = DecisionRecord(id=decision_id, project='alpha', text=f'close {esc_id}?',
+                                filed_at=(self.now - timedelta(days=1)).isoformat(),
+                                escalation_id=esc_id, escalations_dir=self.queue_dir)
+        assert write_decision(opened, root=self.fleet)
+        closed = close_decision_with_evidence(decision_id, 'answered', FOUND_EVIDENCE, root=self.fleet,
+                                              expected_project='alpha', expected_escalations_dir=self.queue_dir)
+        assert closed is not None
+        return closed
+
+    def executor_close(self, n: int, *, verdict: AuditVerdict | None = None) -> DecisionRecord:
+        """An executor close written as the server would leave it, optionally already audited."""
+        esc_id = f'esc-{500 + n}-1'
+        _pending(self.queue / 'archive' / '2026-09-25', esc_id, self.now, category='provenance_unattributed',
+                 status='resolved', resolved_by=EXECUTOR_IDENTITY, policy_class=LANDING,
+                 claimed_by=EXECUTOR_IDENTITY, claimed_at=(self.now - timedelta(hours=1)).isoformat())
+        record = self.file_close(esc_id, f'dec-exec-{n}')
+        if verdict is not None:
+            assert record_audit_outcome(record.id, verdict, '', root=self.fleet, expected_project='alpha',
+                                        expected_escalations_dir=self.queue_dir,
+                                        audited_at=self.now.isoformat()) is not None
+        return record
+
+    def number(self, key: str, *, kinds: frozenset[str] = frozenset({AUDIT_KIND})) -> int:
+        current = ledger_mod.load(self.ledger) or ledger_mod.new_sitting(self.now.isoformat())
+        numbered = ledger_mod.assign(current, [key, *(k for k, e in current.entries.items()
+                                                      if e.state != 'done' and json.loads(k)[0] in kinds)],
+                                     lambda k: 0, self.now.isoformat(), kinds=kinds)
+        ledger_mod.save(self.ledger, numbered)
+        return numbered.entries[key].number
+
+    def number_audit(self, record: DecisionRecord) -> int:
+        return self.number(key_str(audit_key(record.id)))
+
+    def run(self, capsys, *answers: str) -> tuple[int, list[dict], str]:
+        tokens = [arg for answer in answers for arg in ('--answer', answer)]
+        rc = mod.main(['audit', '--ledger', str(self.ledger), *tokens,
+                       '--decisions-root', str(self.fleet), '--now', self.now.isoformat()])
+        out, err = capsys.readouterr()
+        rows = [json.loads(line) for line in out.splitlines() if line.startswith('{')]
+        return rc, rows, out + err
+
+    def state(self) -> ClassSwitch:
+        return policy_state.load_class_states(Path(self.queue_dir))[LANDING]
+
+    def go_live(self) -> None:
+        policy_state.set_class_state(Path(self.queue_dir), LANDING, ClassSwitch.LIVE)
+
+
+@pytest.fixture
+def bench(tmp_path, monkeypatch) -> AuditBench:
+    monkeypatch.delenv(prep_mod.NIGHTLY_CONFINEMENT_ENV, raising=False)
+    root = tmp_path / 'src' / 'alpha'
+    (root / 'data' / 'escalations').mkdir(parents=True)
+    fleet = tmp_path / 'fleet'
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(fleet))
+    return AuditBench(root, fleet, tmp_path / 'state' / 'ledger-nightly.json', datetime.now(UTC))
+
+
+def _executor_session(served: ServedQueue) -> SyncMcpSession:
+    return SyncMcpSession(served.base_url, client_name='sitting-test-executor',
+                          headers={mod.IDENTITY_HEADER: EXECUTOR_IDENTITY})
+
+
+def _executor_resolve(served: ServedQueue, esc_id: str) -> dict:
+    with _executor_session(served) as executor:
+        claimed = executor.call_tool('claim_policy_class', {'escalation_id': esc_id, 'policy_class': LANDING})
+        assert 'error' not in claimed, claimed
+        return executor.call_tool('resolve_issue', {
+            'escalation_id': esc_id, 'resolution': FOUND_EVIDENCE, 'action': 'close_only',
+            'resolution_class': 'actionable',
+        })
+
+
+class TestAuditRow8:
+    def test_a_wrong_audit_records_the_outcome_and_flips_the_class_to_shadow(self, bench, capsys):
+        with serve_project_queue(bench.root, 'alpha') as served:
+            bench.go_live()
+            for esc_id in ('esc-500-1', 'esc-501-1'):
+                _pending(served.queue_dir, esc_id, bench.now, category='provenance_unattributed',
+                         agent_role='task-implementer')
+            assert 'error' not in _executor_resolve(served, 'esc-500-1')
+            record = bench.file_close('esc-500-1', 'dec-exec-0')
+            n = bench.number_audit(record)
+
+            rc, rows, text = bench.run(capsys, f'{n}=wrong:missed sibling')
+
+            assert rc == 0, text
+            assert _decision_of(bench.fleet, record.id).audit_outcome == AuditOutcome(
+                AuditVerdict.WRONG, 'missed sibling', bench.now.isoformat())
+            assert bench.state() == ClassSwitch.SHADOW
+            assert _executor_resolve(served, 'esc-501-1')['code'] == 'level_forbidden'
+            (row,) = rows
+            assert {k: row[k] for k in ('number', 'decision_id', 'policy_class', 'queue_dir',
+                                        'class_state_before', 'class_state_after')} == {
+                'number': n, 'decision_id': record.id, 'policy_class': LANDING, 'queue_dir': bench.queue_dir,
+                'class_state_before': 'live', 'class_state_after': 'shadow',
+            }
+
+
+class TestAuditVerdicts:
+    def test_an_ok_audit_leaves_the_class_live(self, bench, capsys):
+        bench.go_live()
+        record = bench.executor_close(1)
+        n = bench.number_audit(record)
+
+        rc, _, text = bench.run(capsys, f'{n}=ok')
+
+        assert rc == 0, text
+        assert _decision_of(bench.fleet, record.id).audit_outcome.verdict == AuditVerdict.OK
+        assert bench.state() == ClassSwitch.LIVE
+
+    @pytest.mark.parametrize(('earlier_wrong', 'expected'), [(0, ClassSwitch.LIVE), (1, ClassSwitch.SHADOW)])
+    def test_at_twenty_audits_only_a_rate_above_five_percent_flips(self, bench, capsys, earlier_wrong, expected):
+        bench.go_live()
+        for n in range(19):
+            bench.executor_close(n, verdict=AuditVerdict.WRONG if n < earlier_wrong else AuditVerdict.OK)
+        record = bench.executor_close(19)
+        number = bench.number_audit(record)
+
+        rc, _, text = bench.run(capsys, f'{number}=wrong')
+
+        assert rc == 0, text
+        assert bench.state() == expected
+
+    def test_a_wrong_on_a_shadow_class_writes_no_state(self, bench, capsys):
+        record = bench.executor_close(1)
+        n = bench.number_audit(record)
+
+        rc, _, text = bench.run(capsys, f'{n}=wrong')
+
+        assert rc == 0, text
+        assert _decision_of(bench.fleet, record.id).audit_outcome.verdict == AuditVerdict.WRONG
+        assert not policy_state.policy_state_path(Path(bench.queue_dir)).exists()
+
+
+class TestAuditRefusals:
+    def _written(self, bench: AuditBench, record: DecisionRecord) -> tuple[bytes, bytes]:
+        return bench.ledger.read_bytes(), decision_path_for_id(record.id, root=bench.fleet).read_bytes()
+
+    def test_an_already_audited_close_is_refused(self, bench, capsys):
+        bench.go_live()
+        record = bench.executor_close(1)
+        n = bench.number_audit(record)
+        assert record_audit_outcome(record.id, AuditVerdict.OK, '', root=bench.fleet, expected_project='alpha',
+                                    expected_escalations_dir=bench.queue_dir,
+                                    audited_at=bench.now.isoformat()) is not None
+        before = self._written(bench, record)
+
+        rc, rows, _ = bench.run(capsys, f'{n}=wrong')
+
+        assert rc == 4
+        assert rows[0]['refusal']['code'] == 'already_audited'
+        assert self._written(bench, record) == before
+        assert bench.state() == ClassSwitch.LIVE
+
+    def test_a_close_that_no_longer_joins_to_an_executor_close_is_refused(self, bench, capsys):
+        record = bench.executor_close(1)
+        n = bench.number_audit(record)
+        (bench.queue / 'archive' / '2026-09-25' / 'esc-501-1.json').unlink()
+        before = self._written(bench, record)
+
+        rc, rows, _ = bench.run(capsys, f'{n}=wrong')
+
+        assert rc == 4
+        assert rows[0]['refusal']['code'] == 'not_an_executor_close'
+        assert self._written(bench, record) == before
+
+    def test_a_question_item_is_asked_back(self, bench, capsys):
+        record = bench.executor_close(1)
+        bench.number_audit(record)
+        question = bench.number(key_str(escalation_key(bench.queue_dir, 'esc-900-1')), kinds=frozenset({'esc'}))
+        before = self._written(bench, record)
+
+        rc, _, text = bench.run(capsys, f'{question}=ok')
+
+        assert rc == 3
+        assert 'ASK BACK' in text
+        assert self._written(bench, record) == before
+
+    def test_a_verdict_outside_ok_and_wrong_is_asked_back(self, bench, capsys):
+        record = bench.executor_close(1)
+        n = bench.number_audit(record)
+        before = self._written(bench, record)
+
+        rc, _, text = bench.run(capsys, f'{n}=maybe')
+
+        assert rc == 3
+        assert 'ASK BACK' in text
+        assert self._written(bench, record) == before
