@@ -32,15 +32,15 @@ def build_dual_root_lane(tmp_path: Path) -> tuple[Path, TaskArtifacts]:
     return wt, arts
 
 
-def assert_lane_paths_resolve(prompt: str, wt: Path, arts: TaskArtifacts) -> None:
+def assert_lane_paths_resolve(label: str, prompt: str, wt: Path, arts: TaskArtifacts) -> None:
     task_root = arts.task_root.resolve()
     for rel in sorted(set(_LANE_PATH.findall(prompt))):
         lane_path = wt / rel
         assert lane_path.resolve().is_relative_to(task_root), (
-            f'{rel} does not resolve into the task root {task_root}'
+            f'{label} names {rel}, which does not resolve into the task root {task_root}'
         )
         assert lane_path.read_text() == arts.artifact_path(Path(rel).name).read_text(), (
-            f'{rel} does not read as this task\'s {Path(rel).name}'
+            f'{label} names {rel}, which does not read as this task\'s {Path(rel).name}'
         )
 
 
@@ -58,10 +58,10 @@ def test_history_reading_roles_name_both_lane_paths(name):
         assert path in prompt, f'{name} does not name {path}'
 
 
-def test_every_lane_path_a_role_names_resolves_to_this_tasks_state(tmp_path):
+@pytest.mark.parametrize('name', sorted(ROLES))
+def test_every_lane_path_a_role_names_resolves_to_this_tasks_state(tmp_path, name):
     wt, arts = build_dual_root_lane(tmp_path)
-    for role in ROLES.values():
-        assert_lane_paths_resolve(role.system_prompt, wt, arts)
+    assert_lane_paths_resolve(f'role {name}', ROLES[name].system_prompt, wt, arts)
 
 
 _PLAN = {'title': 'T', 'analysis': 'A', 'steps': [], 'files': []}
@@ -126,4 +126,4 @@ async def test_every_lane_path_a_briefing_names_resolves_to_this_tasks_state(
     briefing, tmp_path, name,
 ):
     wt, arts = build_dual_root_lane(tmp_path)
-    assert_lane_paths_resolve(await _BRIEFINGS[name](briefing), wt, arts)
+    assert_lane_paths_resolve(f'briefing {name}', await _BRIEFINGS[name](briefing), wt, arts)

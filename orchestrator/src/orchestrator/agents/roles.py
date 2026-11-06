@@ -614,13 +614,19 @@ agent — passing your own id there would hide everyone else's memories from you
 MANDATED_STAGING_COMMAND = 'git add -- .'
 
 # The opening of every "## CRITICAL: Git Staging Rules" section below, spliced
-# like SCOPE_BOUNDARY_GUIDANCE. Each role follows it with its own code block.
+# like SCOPE_BOUNDARY_GUIDANCE. Each role follows it with only its own code
+# block of correct staging commands.
 _TASK_DIR_NEVER_COMMITTED = """\
 `.task/` inside this worktree is orchestrator state: the `.task/plan.json` and
 `.task/iterations.jsonl` links into durable task storage that survives
 worktree resets, plus the Claude config dir. It must NEVER be committed. It is
 gitignored at the repo root, so an ordinary staging command already excludes
-it — no exclusion pathspec is needed:
+it — no exclusion pathspec is needed. Never force-add `.task/`
+(`git add -f .task/...`). As a backstop, a pre-commit hook silently strips any
+`.task/` path that still ends up staged — but that is defense-in-depth, not
+the only guard.
+
+Stage your changes with:
 """
 
 
@@ -977,16 +983,10 @@ You are a TDD implementer. You execute a structured plan by writing code, step b
 
 """ + _TASK_DIR_NEVER_COMMITTED + """
 ```bash
-# CORRECT — stage by specific files, or stage everything at once:
+# Stage by specific files, or stage everything at once:
 git add src/module/file.py tests/test_file.py
 git add -- .
-
-# WRONG — force-adds .task/ past the gitignore (never do this):
-# git add -f .task/plan.json
 ```
-
-As a backstop, a pre-commit hook silently strips any `.task/` path that
-still ends up staged — but that is defense-in-depth, not the only guard.
 
 The workflow for each step is:
 1. Write code (implementation or tests)
@@ -1033,16 +1033,9 @@ You will be given:
 
 """ + _TASK_DIR_NEVER_COMMITTED + """
 ```bash
-# CORRECT:
 git add src/module/file.py tests/test_file.py
 git add -- .
-
-# WRONG — force-adds .task/ past the gitignore (never do this):
-# git add -f .task/plan.json
 ```
-
-As a backstop, a pre-commit hook silently strips any `.task/` path that
-still ends up staged.
 """ + SCOPE_BOUNDARY_GUIDANCE + """
 ## Important
 
@@ -1428,9 +1421,6 @@ never keep it.
 git add -- .
 ```
 
-Never force-add it (`git add -f .task/...`). As a backstop, a pre-commit hook
-strips any `.task/` path that still gets staged.
-
 ## Important
 
 - Read both sides of every conflict carefully.
@@ -1802,9 +1792,6 @@ wording differs.
 git add -- .
 ```
 
-Never force-add it (`git add -f .task/...`). As a backstop, a pre-commit hook
-strips any `.task/` path that still gets staged.
-
 ## Session Continuity
 
 You have a persistent session. Previous escalation context is in your conversation
@@ -2155,16 +2142,9 @@ dispatch.
 
 """ + _TASK_DIR_NEVER_COMMITTED + """
 ```bash
-# CORRECT:
 git add path/to/file.py
 git add -- .
-
-# WRONG — force-adds .task/ past the gitignore (never do this):
-# git add -f .task/plan.json
 ```
-
-As a backstop, a pre-commit hook strips any `.task/` path that still gets
-staged.
 """ + SCOPE_BOUNDARY_GUIDANCE_SIMPLE + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
     allowed_tools=[
         'Read', 'Glob', 'Grep', 'Edit', 'Write', 'Bash',
