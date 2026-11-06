@@ -635,7 +635,7 @@ class TestExecutorAuditDraw:
             assert record.escalation_id is not None
             assert SAMPLED_CLASS in block and record.escalation_id in block
             assert brief.fence_safe(record.closing_evidence) in block
-            assert f'audit {number}=ok|wrong[:note]' in block
+            assert f'answer slot: `{number}=ok|wrong[:note]`' in block
 
     def test_the_draw_reaches_closes_outside_the_one_day_window(self, env, capsys):
         _twelve_executor_closes(env)

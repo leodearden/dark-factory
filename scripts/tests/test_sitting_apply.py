@@ -32,8 +32,8 @@ from orchestrator.session_registry import (
 )
 from shared.mcp_session import SyncMcpSession
 from sitting import apply as mod
+from sitting import audits, payloads, prepare_sitting
 from sitting import ledger as ledger_mod
-from sitting import payloads, prepare_sitting
 from sitting import preparation as prep_mod
 from sitting.inventory import AUDIT_KIND, audit_key, decision_key, escalation_key, key_str
 from sitting.ports import QueuePort
@@ -881,6 +881,20 @@ class TestAuditRefusals:
         assert rc == 3
         assert 'ASK BACK' in text
         assert self._written(bench, record) == before
+
+    def test_an_audit_prefixed_token_is_asked_back_and_the_slot_grammar_records(self, bench, capsys):
+        record = bench.executor_close(1)
+        n = bench.number_audit(record)
+        before = self._written(bench, record)
+
+        rc, _, text = bench.run(capsys, f'audit {n}=ok')
+
+        assert rc == 3
+        assert 'ASK BACK' in text
+        assert self._written(bench, record) == before
+        assert audits.answer_slot(n).startswith(f'{n}=ok|')
+        rc, _, text = bench.run(capsys, f'{n}=ok')
+        assert rc == 0, text
 
     def test_a_verdict_outside_ok_and_wrong_is_asked_back(self, bench, capsys):
         record = bench.executor_close(1)

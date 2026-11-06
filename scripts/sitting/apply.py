@@ -619,10 +619,14 @@ class _AuditTarget:
 def run_audit(
     ledger_path: Path, answers: Sequence[ledgers.Answer], *, decisions_root: Path,
 ) -> ApplyReport:
-    """Record each ``audit N=ok|wrong[:note]`` verdict; a ``wrong`` may flip its class to shadow on its queue.
+    """Record each ``N=ok|wrong[:note]`` verdict on a numbered ``audit N`` item; a ``wrong`` may flip its class.
 
+    *N* is the bare item number, as for every other answer: the token names
+    the number and the ledger knows the item is an audit. A ``wrong`` flips
+    the class to shadow on its queue under ``authority.audit_escape_target``.
     The ledger is read, never saved: an audited close leaves the next draw
-    because its DecisionRecord now carries an outcome.
+    because its DecisionRecord now carries an outcome. Each queue is indexed
+    once and the registry is read once per run.
     """
     loaded = ledgers.load(ledger_path)
     if loaded is None:
@@ -645,9 +649,13 @@ def run_audit(
             policy_state.load_class_states(Path(queue_dir))
     except policy_state.PolicyStateUnreadable as exc:
         return ApplyReport(EXIT_CONFIG, messages=(f'nothing audited: {exc}',))
-    rows = tuple(_audit_one(target, decisions_root) for target in targets)
+    recorded = audits.RecordedAudits.read(decisions_root)
+    rows: list[AuditResult] = []
+    for target in targets:
+        row, recorded = _audit_one(target, decisions_root, recorded)
+        rows.append(row)
     failed = any(row.outcome != StepOutcome.OK for row in rows)
-    return ApplyReport(EXIT_STEP_FAILED if failed else EXIT_OK, rows=rows,
+    return ApplyReport(EXIT_STEP_FAILED if failed else EXIT_OK, rows=tuple(rows),
                        echo=ledgers.render_echo_table(resolved))
 
 
@@ -656,8 +664,9 @@ def _audit_preflight(
 ) -> tuple[list[_AuditTarget], list[RefusedItem]]:
     targets: list[_AuditTarget] = []
     refused: list[RefusedItem] = []
+    indexes: dict[str, Mapping[str, Path]] = {}
     for row in rows:
-        target = _audit_target(row, decisions_root)
+        target = _audit_target(row, decisions_root, indexes)
         if isinstance(target, _AuditTarget):
             targets.append(target)
         else:
@@ -665,7 +674,10 @@ def _audit_preflight(
     return targets, refused
 
 
-def _audit_target(row: ledgers.EchoRow, decisions_root: Path) -> _AuditTarget | Refusal:
+def _audit_target(
+    row: ledgers.EchoRow, decisions_root: Path, indexes: dict[str, Mapping[str, Path]],
+) -> _AuditTarget | Refusal:
+    """*row*'s executor close, joined through *indexes*, which gains each queue the first time one is needed."""
     try:
         record = DecisionRecord.from_json(decision_path_for_id(row.record_id, root=decisions_root).read_text())
     except (OSError, KeyError, TypeError, ValueError) as exc:
@@ -674,7 +686,9 @@ def _audit_target(row: ledgers.EchoRow, decisions_root: Path) -> _AuditTarget | 
         return Refusal(RefusalCode.ALREADY_AUDITED, {'verdict': str(record.audit_outcome.verdict),
                                                       'audited_at': record.audit_outcome.audited_at})
     queue_dir = normalize_escalations_dir(record.escalations_dir)
-    close = audits.executor_close_of(record, {queue_dir: index_queue(queue_dir)})
+    if queue_dir not in indexes:
+        indexes[queue_dir] = index_queue(queue_dir)
+    close = audits.executor_close_of(record, indexes)
     if isinstance(close, audits.AgedOut):
         return Refusal(RefusalCode.ESCALATION_AGED_OUT,
                        {'escalation_id': close.escalation_id, 'queue_dir': close.queue_dir})
@@ -684,7 +698,10 @@ def _audit_target(row: ledgers.EchoRow, decisions_root: Path) -> _AuditTarget | 
     return _AuditTarget(row, record, close)
 
 
-def _audit_one(target: _AuditTarget, decisions_root: Path) -> AuditResult:
+def _audit_one(
+    target: _AuditTarget, decisions_root: Path, recorded: audits.RecordedAudits,
+) -> tuple[AuditResult, audits.RecordedAudits]:
+    """Write *target*'s verdict; return its result and *recorded* with the new audit folded in."""
     close, row = target.close, target.row
     queue = Path(close.queue_dir)
     verdict = AuditVerdict(row.option_label)
@@ -697,16 +714,18 @@ def _audit_one(target: _AuditTarget, decisions_root: Path) -> AuditResult:
             policy_class=close.policy_class,
         )
     except DecisionAuditRefused as exc:
-        return replace(result, outcome=StepOutcome.FAILED, detail=str(exc))
+        return replace(result, outcome=StepOutcome.FAILED, detail=str(exc)), recorded
     if written is None:
-        return replace(result, outcome=StepOutcome.FAILED, detail='the decision registry did not take the write')
+        return replace(result, outcome=StepOutcome.FAILED,
+                       detail='the decision registry did not take the write'), recorded
+    recorded = recorded.recording(written)
     if verdict == AuditVerdict.WRONG and before is not None:
-        audited, wrong = audits.class_tally(decisions_root, close.queue_dir, close.policy_class)
+        audited, wrong = recorded.tally(close.queue_dir, close.policy_class)
         target_state = audit_escape_target(before, audited, wrong)
         if target_state is not None:
             policy_state.set_class_state(queue, close.policy_class, target_state)
-            return replace(result, class_state_after=target_state)
-    return result
+            return replace(result, class_state_after=target_state), recorded
+    return result, recorded
 
 
 def run_policy_state(queue_dir: Path, policy_class: str | None, target: ClassSwitch | None) -> ApplyReport:
@@ -797,7 +816,7 @@ def _parser() -> argparse.ArgumentParser:
 
     audit_cmd = commands.add_parser('audit', parents=[clock_arguments()], help='record verdicts on drawn audits')
     audit_cmd.add_argument('--ledger', type=Path, required=True, help='the ledger that numbered the audits')
-    audit_cmd.add_argument('--answer', action='append', required=True, help="repeatable 'N=ok|wrong[:note]' token")
+    audit_cmd.add_argument('--answer', action='append', required=True, help="repeatable 'N=ok|wrong[:note]' token, N the bare number of an 'audit N' item")
     audit_cmd.add_argument('--decisions-root', type=Path, help='fleet root holding decisions/ (default: fleet_root())')
     audit_cmd.add_argument('--source', choices=sorted(ledgers.ANSWER_SOURCES), default='terminal')
     audit_cmd.set_defaults(handler=_cmd_audit)

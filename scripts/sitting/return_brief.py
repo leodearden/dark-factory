@@ -107,7 +107,6 @@ NO_EXECUTOR_CLOSE = f'no executor close in window (the trailing {audits.AUDIT_WI
 ALL_AUDITED = 'every executor close in the window is audited'
 AGED_OUT = ('{count} close(s) in the window name an escalation that has aged out of the archive; '
             'their class cannot be read')
-AUDIT_SLOT = 'ok|wrong[:note]'
 
 
 @dataclass(frozen=True)
@@ -538,7 +537,7 @@ def _audit_item_lines(close: ExecutorClose, ledger: ledgers.Ledger, marker: str)
         f'#### audit {number}: decision {close.decision_id}{marker}', '',
         f'class {close.policy_class}; escalation {close.escalation_id} in {close.queue_dir}; '
         f'project {close.project}; closed {close.closed_at}', '',
-        f'answer slot: `audit {number}={AUDIT_SLOT}`', '',
+        f'answer slot: `{audits.answer_slot(number)}` (to `apply.py audit --answer`)', '',
         brief.fence_safe(close.evidence),
     ]
 

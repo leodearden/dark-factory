@@ -15,6 +15,7 @@ from orchestrator.session_registry import (
     AuditVerdict,
     DecisionRecord,
     close_decision_with_evidence,
+    decision_path_for_id,
     normalize_escalations_dir,
     record_audit_outcome,
     write_decision,
@@ -394,6 +395,9 @@ class TestAuditOptions:
         assert set(mod.AUDIT_OPTIONS) == {str(verdict) for verdict in AuditVerdict}
         assert all(text.strip() for text in mod.AUDIT_OPTIONS.values())
 
+    def test_the_answer_slot_is_the_bare_number_and_a_verdict(self):
+        assert mod.answer_slot(12) == '12=ok|wrong[:note]'
+
 
 class TestClassTally:
     def test_counts_audited_and_wrong_closes_of_one_class_on_one_queue(self, fleet, tmp_path):
@@ -415,7 +419,8 @@ class TestClassTally:
         }
 
         def tallies() -> dict[tuple[str, str], tuple[int, int]]:
-            return {(queue, cls): mod.class_tally(fleet.root, queue, cls) for queue, cls in table}
+            recorded = mod.RecordedAudits.read(fleet.root)
+            return {(queue, cls): recorded.tally(queue, cls) for queue, cls in table}
 
         assert tallies() == table
         for path in [*fleet.queue.rglob('esc-*.json'), *elsewhere.rglob('esc-*.json')]:
@@ -427,7 +432,21 @@ class TestClassTally:
         fleet.audit(record, AuditVerdict.WRONG)
         fleet.escalation('esc-701-1', resolved_by=COORDINATOR_IDENTITY, policy_class=FULL_CLASS)
 
-        assert mod.class_tally(fleet.root, fleet.queue_dir, SAMPLED_CLASS) == (1, 1)
-        assert mod.class_tally(fleet.root, fleet.queue_dir, FULL_CLASS) == (0, 0)
+        assert mod.RecordedAudits.read(fleet.root).tally(fleet.queue_dir, SAMPLED_CLASS) == (1, 1)
+        assert mod.RecordedAudits.read(fleet.root).tally(fleet.queue_dir, FULL_CLASS) == (0, 0)
         (fleet.queue / 'archive' / '2026-09-25' / 'esc-701-1.json').unlink()
-        assert mod.class_tally(fleet.root, fleet.queue_dir, SAMPLED_CLASS) == (1, 1)
+        assert mod.RecordedAudits.read(fleet.root).tally(fleet.queue_dir, SAMPLED_CLASS) == (1, 1)
+
+    def test_recording_folds_in_an_audit_written_after_the_read(self, fleet):
+        first, second = fleet.executor_close(1), fleet.executor_close(2)
+        fleet.audit(first, AuditVerdict.OK)
+        recorded = mod.RecordedAudits.read(fleet.root)
+        fleet.audit(second, AuditVerdict.WRONG)
+        written = DecisionRecord.from_json(decision_path_for_id(second.id, root=fleet.root).read_text())
+
+        folded = recorded.recording(written)
+
+        assert recorded.tally(fleet.queue_dir, SAMPLED_CLASS) == (1, 0)
+        assert folded.tally(fleet.queue_dir, SAMPLED_CLASS) == (2, 1)
+        assert folded == mod.RecordedAudits.read(fleet.root)
+        assert folded.recording(written) == folded
