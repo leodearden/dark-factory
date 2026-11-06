@@ -631,6 +631,45 @@ test('shell.jsx::RenderFailureBoundary renders a healthy child unchanged, with n
   assert.deepEqual(harness.consoleErrors, []);
 });
 
+// ── The shell's two Datum readers title a reading with its rule ──
+// The non-fresh reason, when datumView gives one, wins over the rule; the rule
+// fills the fresh case; with neither, the reading carries no title at all.
+
+const RULE = 'R: how this figure is counted';
+const DATUM_READERS = [
+  { name: 'DatumReading', outer: container => container.firstElementChild },
+  { name: 'Pip', outer: container => container.querySelector('.pip') },
+];
+const RULED_DATUMS = [
+  { arm: 'a fresh Datum', datum: wireDatum(5) },
+  { arm: 'a stale Datum', datum: wireDatum(5, { state: 'stale', reason: 'the scheduler stopped answering' }) },
+  { arm: 'a lower_bound Datum', datum: wireDatum(5, { state: 'lower_bound', reason: 'the runs ledger starts later' }) },
+  { arm: 'an unknown Datum', datum: wireDatum(null, { state: 'unknown', reason: 'the map could not be read' }) },
+];
+
+for (const reader of DATUM_READERS) {
+  for (const { arm, datum } of RULED_DATUMS) {
+    test(`shell.jsx::${reader.name} over ${arm} with a rule titles the reading with datumView's reason, else the rule`, t => {
+      const harness = openWindow(t);
+      const { DF_SHELL, DF_DATUM } = harness.window;
+      const { container } = harness.mount(DF_SHELL[reader.name], { datum, rule: RULE });
+
+      const view = DF_DATUM.datumView(datum, { now: Date.now() });
+      const outer = reader.outer(container);
+      assert.equal(outer.title, view.title || RULE);
+      if (datum.state !== 'fresh') assert.notEqual(outer.title, RULE, 'a non-fresh reason must replace the rule');
+      assert.ok(outer.textContent.startsWith(view.text), `the reading must start with datumView's text ${view.text}`);
+    });
+  }
+
+  test(`shell.jsx::${reader.name} over a fresh Datum with no rule carries no title`, t => {
+    const harness = openWindow(t);
+    const { container } = harness.mount(harness.window.DF_SHELL[reader.name], { datum: wireDatum(5) });
+
+    assert.equal(reader.outer(container).hasAttribute('title'), false);
+  });
+}
+
 // ── The page app.jsx bootstraps: each fault stays in its own region ──
 // Every fault lands as a malformed payload a poll could deliver, then App's
 // own re-render signal; nothing patches a component or writes DF_DATA directly.
