@@ -382,6 +382,13 @@ class _ApplyContext:
             return _step(name, 'failed', str(exc))
 
     def _execute(self, name: str, payload: ApplyPayload, port: QueuePort | PortUnknown | None) -> dict[str, Any]:
+        """Run *payload*; an ``ok`` row names the value it superseded, so nothing is replaced silently."""
+        outcome = self._dispatch(name, payload, port)
+        if outcome['outcome'] == 'ok' and payload.supersedes:
+            return {**outcome, 'supersedes': payload.supersedes}
+        return outcome
+
+    def _dispatch(self, name: str, payload: ApplyPayload, port: QueuePort | PortUnknown | None) -> dict[str, Any]:
         if payload.tool == payloads.SESSION_REGISTRY_TOOL:
             return _run_registry(name, payload, self._fleet_root)
         if not isinstance(payload.args, dict):
