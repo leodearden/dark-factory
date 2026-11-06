@@ -14,8 +14,8 @@
 #       .reseed-trash candidates (_reap_stale_trash, task 5326).
 #   scripts/thin-warm-lane.sh      — release-thin. Calls live_ref_present
 #       ONCE per invocation (its T4 gate), under the held T3 <lane>.lock flock
-#       and immediately before its `rm -rf <lane>/target`; a hit exits 75 with
-#       LANE_LIVE_REF: (task 5307, README Delta 17).
+#       and immediately before its `rm -rf <lane>/target` (task 5307,
+#       README Delta 17).
 #
 # FUNCTIONS (defined when sourced):
 #   live_referenced_paths RP...
