@@ -223,30 +223,22 @@ def test_the_qdrant_check_holds_a_lease_in_the_given_lease_dir_while_it_works(
     lease_dir: Path,
 ) -> None:
     with write_refusing_qdrant(lease_dir) as qdrant:
-        run_probe('qdrant', lease_dir=lease_dir, env={'QDRANT_URL': qdrant.url})
+        probe = start_probe('qdrant', lease_dir=lease_dir, env={'QDRANT_URL': qdrant.url})
+        finish_probe(probe)
 
     [leases] = qdrant.leases_seen_at_listing
-    assert [name.split('.')[0] for name in leases] == ['lane-dependency-probe']
+    assert len(leases) == 1 and leases_of(probe.pid, leases) == leases
     assert lease_files(lease_dir) == []
 
 
 def test_a_run_leaves_no_probe_lease_in_the_machine_global_lease_dir(lease_dir: Path) -> None:
-    def global_probe_leases() -> list[str]:
-        return [
-            name
-            for name in lease_files(LEASE_REAPER.DEFAULT_LEASE_DIR)
-            if name.startswith(PROBE_LEASE_PREFIX)
-        ]
-
-    before = global_probe_leases()
     with write_refusing_qdrant(LEASE_REAPER.DEFAULT_LEASE_DIR) as qdrant:
-        run_probe('qdrant', lease_dir=lease_dir, env={'QDRANT_URL': qdrant.url})
+        probe = start_probe('qdrant', lease_dir=lease_dir, env={'QDRANT_URL': qdrant.url})
+        result = finish_probe(probe)
 
-    assert global_probe_leases() == before
-    assert [
-        [name for name in listing if name.startswith(PROBE_LEASE_PREFIX)]
-        for listing in qdrant.leases_seen_at_listing
-    ] == [before]
+    assert_names_dependency(result, 'qdrant: create collection: HTTP 403')
+    assert [leases_of(probe.pid, listing) for listing in qdrant.leases_seen_at_listing] == [[]]
+    assert leases_of(probe.pid, lease_files(LEASE_REAPER.DEFAULT_LEASE_DIR)) == []
 
 
 def test_a_failure_line_never_carries_the_words_of_the_exception() -> None:
