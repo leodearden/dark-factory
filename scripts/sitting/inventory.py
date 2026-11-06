@@ -107,6 +107,11 @@ class OpenItem:
     def kind(self) -> str:
         return self.key[0]
 
+    @property
+    def store_task_id(self) -> str | None:
+        """``task_id`` when it names a task in the project's store (all digits); None for a sentinel or no task."""
+        return self.task_id if self.task_id and self.task_id.isdigit() else None
+
 
 @dataclass(frozen=True)
 class PendingRecords:

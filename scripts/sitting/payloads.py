@@ -160,7 +160,7 @@ def memory_payloads(
 ) -> tuple[ApplyPayload, ApplyPayload]:
     """The ruling as a decision memory, then its rationale as an observation, on the item's project."""
     cited = item.escalation_id or item.decision_id or '-'.join(item.key)
-    task_id = item.task_id if item.task_id and item.task_id.isdigit() else None
+    task_id = item.store_task_id
     subject = f'{cited} (task {task_id})' if task_id else cited
     entities = [{'kind': 'task', 'id': int(task_id)}] if task_id else []
     ruled = f'Sitting ruled {subject}: option {option_label}: {option_text}'

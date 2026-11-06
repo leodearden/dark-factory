@@ -350,11 +350,14 @@ class _ApplyContext:
                 return _Skip('a reconciliation queue names no task of its own project')
             if not item.task_id:
                 return _Skip('the escalation names no task')
+            task_id = item.store_task_id
+            if task_id is None:
+                return _Skip('the escalation names a sentinel, not a task')
             root = str(port.project_root)
-            task = self._fused.call_tool('get_task', {'id': item.task_id, 'project_root': root})
+            task = self._fused.call_tool('get_task', {'id': task_id, 'project_root': root})
             existing = (task.get('metadata') or {}).get(payloads.X_RULING_KEY)
             ruling = Ruling(item.escalation_id, action, ruling_text, COORDINATOR_IDENTITY, self._now.isoformat())
-            return payloads.update_task_payload(item.task_id, root, ruling, existing=existing)
+            return payloads.update_task_payload(task_id, root, ruling, existing=existing)
 
         def close() -> ApplyPayload:
             evidence = (f'{ruling_text}\nAnswered at the sitting: item {row.number} = option {row.option_label} '
