@@ -12,13 +12,20 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from escalation.authority import EXECUTOR_IDENTITY, policy_row
 from escalation.models import Escalation
-from orchestrator.session_registry import DecisionRecord, normalize_escalations_dir
-from sitting import brief, fleet_state, payloads
+from orchestrator.session_registry import (
+    AuditOutcome,
+    AuditVerdict,
+    DecisionRecord,
+    normalize_escalations_dir,
+)
+from sitting import apply as apply_mod
+from sitting import audits, brief, fleet_state, payloads
 from sitting import ledger as ledger_mod
 from sitting import preparation as prep_mod
 from sitting import return_brief as mod
-from sitting.inventory import escalation_key
+from sitting.inventory import AUDIT_KIND, audit_key, escalation_key, key_str, parse_key
 from sitting.payloads import AgreedMarker, PreparedMarker
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -538,3 +545,181 @@ class TestMain:
 
         assert rc == 0
         assert (NOW - timedelta(days=7)).isoformat() in _header(env.output.read_text())
+
+
+SAMPLED_CLASS = 'landing_provenance'
+FULL_CLASS = 'b3_low_risk_unblock'
+AUDIT_ITEM = re.compile(r'^#### audit (\d+): decision (\S+)', re.MULTILINE)
+
+
+def _hours_before_now(hours: float) -> str:
+    return (NOW - timedelta(hours=hours)).isoformat()
+
+
+def _executor_close(env: Env, n: int, *, policy_class: str = SAMPLED_CLASS, closed_at: str | None = None,
+                    audited: AuditVerdict | None = None) -> DecisionRecord:
+    """An archived record the executor closed under *policy_class*, and the DecisionRecord that closed it."""
+    esc_id = f'esc-{700 + n}-1'
+    _esc(env.queue / 'archive' / '2026-09-25', id=esc_id, status='resolved', resolved_by=EXECUTOR_IDENTITY,
+         resolved_at=closed_at or _hours_before_now(8 * n), policy_class=policy_class,
+         claimed_by=EXECUTOR_IDENTITY, claimed_at=closed_at or _hours_before_now(8 * n))
+    outcome = None if audited is None else AuditOutcome(audited, '', NOW_ISO)
+    return _closed_decision(env.fleet, f'dec-exec-{policy_class}-{n}', closed_at=closed_at or _hours_before_now(8 * n),
+                            escalation_id=esc_id, escalations_dir=normalize_escalations_dir(env.queue),
+                            closing_evidence=f'executor evidence for close {n}\nfound_on_main abc1234',
+                            audit_outcome=outcome)
+
+
+def _twelve_executor_closes(env: Env) -> list[DecisionRecord]:
+    """Twelve closes inside the audit week, three of them inside the one-day --window-days."""
+    return [_executor_close(env, n) for n in range(12)]
+
+
+def _audit_items(section: str) -> dict[str, int]:
+    """Each rendered audit item's decision id and its number."""
+    return {decision_id: int(number) for number, decision_id in AUDIT_ITEM.findall(section)}
+
+
+def _audit_entries(env: Env) -> dict[str, int]:
+    """The open audit entries of the ledger the last render wrote, decision id to number."""
+    ledger = ledger_mod.load(env.ledger_out)
+    assert ledger is not None
+    return {parse_key(key)[1]: entry.number for key, entry in ledger.entries.items()
+            if parse_key(key)[0] == AUDIT_KIND and entry.state == 'open'}
+
+
+def _item_block(section: str, number: int) -> str:
+    start = section.index(f'#### audit {number}:')
+    rest = section[start + 1:]
+    end = rest.find('\n#### ')
+    return section[start:] if end == -1 else section[start:start + 1 + end]
+
+
+class TestExecutorAuditDraw:
+    def test_ten_of_twelve_executor_closes_are_drawn_and_numbered_into_the_ledger(self, env, capsys):
+        records = {record.id: record for record in _twelve_executor_closes(env)}
+
+        rc, _ = _run(capsys, env.argv())
+
+        assert rc == 0
+        section = _sections(env.output.read_text())[TITLES[5]]
+        drawn = _audit_items(section)
+        assert len(drawn) == audits.SAMPLE_SIZE
+        assert len(set(drawn.values())) == audits.SAMPLE_SIZE
+        assert set(drawn) <= set(records)
+        assert _audit_entries(env) == drawn
+        questions = _numbers(env)
+        question_numbers = [n for key, n in questions.items() if parse_key(key)[0] != AUDIT_KIND]
+        assert min(drawn.values()) > max(question_numbers)
+        for decision_id, number in drawn.items():
+            block = _item_block(section, number)
+            record = records[decision_id]
+            assert SAMPLED_CLASS in block and record.escalation_id in block
+            assert brief.fence_safe(record.closing_evidence) in block
+            assert f'audit {number}=ok|wrong[:note]' in block
+
+    def test_the_draw_reaches_closes_outside_the_one_day_window(self, env, capsys):
+        _twelve_executor_closes(env)
+
+        _run(capsys, env.argv())
+
+        section = _sections(env.output.read_text())[TITLES[5]]
+        outside_the_day = [f'dec-exec-{SAMPLED_CLASS}-{n}' for n in range(4, 12)]
+        assert set(_audit_items(section)) & set(outside_the_day)
+
+    def test_a_rerender_at_the_same_now_keeps_the_same_ten_under_the_same_numbers(self, env, capsys):
+        _twelve_executor_closes(env)
+        _run(capsys, env.argv())
+        first = _audit_entries(env)
+        assert len(first) == audits.SAMPLE_SIZE
+
+        _run(capsys, env.argv())
+
+        assert _audit_entries(env) == first
+        assert _audit_items(_sections(env.output.read_text())[TITLES[5]]) == first
+
+    def test_a_render_a_night_later_keeps_each_carried_items_number(self, env, capsys):
+        _twelve_executor_closes(env)
+        _run(capsys, env.argv())
+        first = _audit_entries(env)
+
+        _run(capsys, [*env.argv(), '--now', NIGHT_TWO])
+
+        second = _audit_entries(env)
+        assert len(second) == audits.SAMPLE_SIZE
+        assert {d: n for d, n in second.items() if d in first} == {d: n for d, n in first.items() if d in second}
+        assert all(n > max(first.values()) for d, n in second.items() if d not in first)
+
+    def test_a_fresh_install_states_no_executor_close_and_leaves_the_carve_out_closes_alone(self, env, capsys):
+        for n in range(2, brief.AUDIT_SAMPLE_EVERY + 1):
+            _closed_decision(env.fleet, f'dec-close-{n}', closed_at=f'2026-09-25T21:{10 * n:02d}:00+00:00')
+
+        _run(capsys, env.argv())
+
+        section = _sections(env.output.read_text())[TITLES[5]]
+        assert 'no executor close in window' in section
+        assert _audit_items(section) == {}
+        assert section.count('AUDIT SAMPLE') == 1
+        assert f'### Close {brief.AUDIT_SAMPLE_EVERY}: decision dec-close-{brief.AUDIT_SAMPLE_EVERY} — AUDIT SAMPLE' in section
+        assert '### Close 1: decision dec-close-1' in section
+        assert _audit_entries(env) == {}
+
+    def test_every_close_already_audited_states_so_and_draws_nothing(self, env, capsys):
+        for n in range(3):
+            _executor_close(env, n, audited=AuditVerdict.OK)
+
+        _run(capsys, env.argv())
+
+        section = _sections(env.output.read_text())[TITLES[5]]
+        assert 'every executor close in the window is audited' in section
+        assert 'no executor close in window' not in section
+        assert _audit_items(section) == {}
+
+    def test_a_full_audit_class_is_drawn_whole_beside_the_ten(self, env, capsys):
+        row = policy_row(FULL_CLASS)
+        assert row is not None and row.audit_full_until == 20
+        _twelve_executor_closes(env)
+        full = [_executor_close(env, 20 + n, policy_class=FULL_CLASS) for n in range(3)]
+
+        _run(capsys, env.argv())
+
+        section = _sections(env.output.read_text())[TITLES[5]]
+        drawn = _audit_items(section)
+        assert len(drawn) == audits.SAMPLE_SIZE + 3
+        assert {record.id for record in full} <= set(drawn)
+        full_numbers = [drawn[record.id] for record in full]
+        assert max(full_numbers) < min(n for d, n in drawn.items() if d not in {r.id for r in full})
+        assert all('FULL AUDIT' in _item_block(section, number) for number in full_numbers)
+
+    def test_an_unreadable_executor_escalation_degrades_the_section_and_is_printed(self, env, capsys):
+        _twelve_executor_closes(env)
+        broken = _executor_close(env, 30)
+        path = env.queue / 'archive' / '2026-09-25' / f'{broken.escalation_id}.json'
+        path.write_text('{not json')
+
+        rc, out = _run(capsys, env.argv())
+
+        assert rc == 0
+        section = _sections(env.output.read_text())[TITLES[5]]
+        assert f'shortfall: executor_close {path}: {broken.id}' in section
+        assert len(_audit_items(section)) == audits.SAMPLE_SIZE
+        match = DONE_LINE.match(out.splitlines()[-1])
+        assert match is not None and match.group(6) == 'degraded'
+
+    def test_a_drawn_audit_is_answerable_by_the_audit_verb_and_leaves_the_next_draw(self, env, capsys):
+        _twelve_executor_closes(env)
+        _run(capsys, env.argv())
+        drawn = _audit_entries(env)
+        decision_id, number = min(drawn.items(), key=lambda pair: pair[1])
+
+        report = apply_mod.run_audit(
+            env.ledger_out, [ledger_mod.Answer(str(number), 'ok', '', NOW_ISO, 'terminal')], decisions_root=env.fleet,
+        )
+        assert report.exit_code == apply_mod.EXIT_OK
+        _run(capsys, env.argv())
+
+        ledger = ledger_mod.load(env.ledger_out)
+        assert ledger is not None
+        entry = ledger.entries[key_str(audit_key(decision_id))]
+        assert entry.state == 'done' and entry.number == number
+        assert decision_id not in _audit_items(_sections(env.output.read_text())[TITLES[5]])
