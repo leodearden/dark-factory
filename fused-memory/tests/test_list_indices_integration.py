@@ -20,6 +20,7 @@ import contextlib
 
 import pytest
 import pytest_asyncio
+from _falkor_index_live import live_backends
 from _fm_helpers import (
     FALKOR_HOST,
     FALKOR_PORT,
@@ -29,8 +30,6 @@ from _fm_helpers import (
     unique_graph_name,
 )
 from falkordb.asyncio import FalkorDB
-
-from fused_memory.backends.graphiti_client import GraphitiBackend, _MultiTenantFalkorDriver
 
 TEST_GRAPH: str = unique_graph_name('530_list_indices_integration')
 
@@ -239,13 +238,9 @@ class TestBackendListIndicesLive:
     @pytest.mark.asyncio
     async def test_list_indices_returns_records_live(self, mock_config, live_test_graph):
         """GraphitiBackend.list_indices() parses live FalkorDB index records correctly."""
-        backend = GraphitiBackend(mock_config)
-        # Inject a real driver directly — list_indices only needs _driver, not a full
-        # Graphiti client stack (see _require_driver vs _require_client in graphiti_client.py).
-        # Skip initialize() so the enumeration-based _ensure_indices pass in
-        # GraphitiBackend.initialize() does not build Graphiti indices on the fixture graph.
-        backend._driver = _MultiTenantFalkorDriver(host=FALKOR_HOST, port=FALKOR_PORT)
-        try:
+        async with live_backends(mock_config) as make:
+            # list_indices never provisions, so no graph needs registering.
+            backend = make(set())
             records = await backend.list_indices(group_id=TEST_GRAPH)
             assert len(records) >= 1
             for rec in records:
@@ -266,5 +261,3 @@ class TestBackendListIndicesLive:
             # is also True, so this works uniformly whether field_val is a list or str).
             field_val = entity_records[0]['field']
             assert 'name' in field_val
-        finally:
-            await backend.close()

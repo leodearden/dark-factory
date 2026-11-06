@@ -268,16 +268,31 @@ def test_a_file_with_no_pyproject_above_it_has_no_ruff_consumer(tmp_path: Path):
     assert _consumer_of(tmp_path, codes=('E402',)) is Consumer.NONE
 
 
-@pytest.mark.parametrize(
-    ('key', 'config'),
-    [
-        ('extend-select', '[tool.ruff.lint]\nselect = ["E"]\nextend-select = ["ANN"]\n'),
-        ('extend', '[tool.ruff]\nextend = "../shared-ruff.toml"\n[tool.ruff.lint]\nselect = ["E"]\n'),
-    ],
-)
-def test_a_config_key_that_could_widen_the_selected_set_is_an_instrument_failure(
-    tmp_path: Path, key: str, config: str
-):
+def test_extend_select_widens_the_selection_the_nearest_config_declares(tmp_path: Path):
+    """Ruff appends ``extend-select`` to the same config's ``select``, so the
+    effective selection is the union.  Refusing it under-read nothing; it only
+    made the gate unusable on a package that layers a ban onto the shared
+    baseline (``orchestrator/pyproject.toml``, task 8395)."""
+    write_files(
+        tmp_path,
+        {
+            'pkg/mod.py': 'x = 1\n',
+            'pyproject.toml': (
+                '[tool.ruff.lint]\n'
+                'select = ["E"]\n'
+                'ignore = ["E501"]\n'
+                'extend-select = ["TID251"]\n'
+            ),
+        },
+    )
+
+    assert _consumer_of(tmp_path, codes=('TID251',)) is Consumer.RUFF
+    assert _consumer_of(tmp_path, codes=('E402',)) is Consumer.RUFF
+    assert _consumer_of(tmp_path, codes=('TID252',)) is Consumer.NONE
+    assert _consumer_of(tmp_path, codes=('E501',)) is Consumer.NONE
+
+
+def test_config_inheritance_through_extend_is_an_instrument_failure(tmp_path: Path):
     """THE SPLIT IS BY DIRECTION OF ERROR, which is the only thing that matters
     for a gate.
 
@@ -289,16 +304,23 @@ def test_a_config_key_that_could_widen_the_selected_set_is_an_instrument_failure
     ``extend`` is the INHERITANCE case, and it widens by the same arithmetic
     from another file: the inherited config carries its own ``select`` /
     ``extend-select``, so the list read here is a subset of the rules ruff
-    actually runs.  Each key is written in the table it may legally appear in,
-    and the refusal names that table.
+    actually runs.
     """
-    write_files(tmp_path, {'pkg/mod.py': 'x = 1\n', 'pyproject.toml': config})
+    write_files(
+        tmp_path,
+        {
+            'pkg/mod.py': 'x = 1\n',
+            'pyproject.toml': (
+                '[tool.ruff]\nextend = "../shared-ruff.toml"\n[tool.ruff.lint]\nselect = ["E"]\n'
+            ),
+        },
+    )
 
     with pytest.raises(InstrumentFailure) as caught:
         _consumer_of(tmp_path, codes=('E402',))
 
     assert 'pyproject.toml' in str(caught.value)
-    assert repr(key) in str(caught.value)
+    assert repr('extend') in str(caught.value)
 
 
 def test_config_keys_that_only_ever_subtract_are_tolerated(tmp_path: Path):
@@ -328,8 +350,17 @@ def test_config_keys_that_only_ever_subtract_are_tolerated(tmp_path: Path):
     assert _consumer_of(tmp_path, codes=('E402',)) is Consumer.RUFF
 
 
-def test_a_ruff_section_that_declares_no_select_is_an_instrument_failure(tmp_path: Path):
-    """The same direction-of-error rule as ``extend-select``, applied to an
+@pytest.mark.parametrize(
+    'config',
+    [
+        pytest.param('[tool.ruff]\nline-length = 100\n', id='no-lint-keys'),
+        pytest.param('[tool.ruff.lint]\nextend-select = ["TID251"]\n', id='extend-select-only'),
+    ],
+)
+def test_a_ruff_section_that_declares_no_select_is_an_instrument_failure(
+    tmp_path: Path, config: str
+):
+    """The same direction-of-error rule as ``extend``, applied to an
     ABSENT key rather than an unmodelled one.
 
     A ``[tool.ruff]`` section with no ``select`` anywhere does not mean "ruff
@@ -341,19 +372,20 @@ def test_a_ruff_section_that_declares_no_select_is_an_instrument_failure(tmp_pat
     gated directories reporting "All checks passed!" while running a rule set
     nobody chose.
 
+    An ``extend-select`` with no ``select`` beside it extends those same
+    built-in defaults, so it must refuse too rather than be read as the union
+    with nothing.
+
     Nothing in this tree reaches the refusal: all eight pyprojects declare
     ``select`` explicitly.
     """
-    write_files(
-        tmp_path,
-        {'pkg/mod.py': 'x = 1\n', 'pyproject.toml': '[tool.ruff]\nline-length = 100\n'},
-    )
+    write_files(tmp_path, {'pkg/mod.py': 'x = 1\n', 'pyproject.toml': config})
 
     with pytest.raises(InstrumentFailure) as caught:
         _consumer_of(tmp_path, codes=('E402',))
 
     assert 'pyproject.toml' in str(caught.value)
-    assert 'select' in str(caught.value)
+    assert 'declares no `select`' in str(caught.value)
 
 
 # ---------------------------------------------------------------------------

@@ -13,7 +13,7 @@ import json
 import os
 import subprocess
 import sys
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -21,7 +21,7 @@ from typing import Any
 import deferral_census
 import pytest
 from deferral_census import NoValidRecord, RowVerdict, classify_deferred, fails_check, referents
-from deferral_fake_fused_memory import FakeFusedMemory
+from deferral_fake_fused_memory import FakeFusedMemory, FakeFusedMemoryServer
 from deferral_store import TaskRow
 from shared.process_identity import Liveness, ProcessIdentity, capture
 from shared.task_deferral import (
@@ -376,9 +376,15 @@ def make_root(tmp_path: Path, project_root_with_tasks_db: Any) -> Any:
 
 
 @pytest.fixture
-def census(capsys: pytest.CaptureFixture[str], units_dir: Path) -> Any:
+def fused_memory() -> Iterator[FakeFusedMemoryServer]:
+    with FakeFusedMemoryServer() as server:
+        yield server
+
+
+@pytest.fixture
+def census(capsys: pytest.CaptureFixture[str], units_dir: Path, fused_memory: FakeFusedMemoryServer) -> Any:
     def _run(*argv: str) -> Census:
-        code = deferral_census.main(['--fused-memory-url', 'http://fake', '--units-dir', str(units_dir), *argv])
+        code = deferral_census.main(['--fused-memory-url', fused_memory.url, '--units-dir', str(units_dir), *argv])
         out, err = capsys.readouterr()
         return Census(code, out, err)
 
@@ -386,11 +392,9 @@ def census(capsys: pytest.CaptureFixture[str], units_dir: Path) -> Any:
 
 
 @pytest.fixture
-def serve(install_fake_httpx: Any) -> Any:
+def serve(fused_memory: FakeFusedMemoryServer) -> Any:
     def _serve(projects: Mapping[str, list[dict[str, Any]]]) -> FakeFusedMemory:
-        fake = FakeFusedMemory(projects)
-        install_fake_httpx(fake.post)
-        return fake
+        return fused_memory.serve(FakeFusedMemory(projects))
 
     return _serve
 

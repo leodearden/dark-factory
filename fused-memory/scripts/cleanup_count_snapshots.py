@@ -52,10 +52,7 @@ from fused_memory.reconciliation.task_filter import (  # noqa: F401
     COUNT_SNAPSHOT_RE,
     is_count_snapshot,
 )
-from fused_memory.utils.store_mutation_preflight import (
-    StoreMutationUnavailable,
-    assert_store_mutation_allowed,
-)
+from fused_memory.utils.store_mutation_preflight import assert_store_mutation_allowed
 
 logger = logging.getLogger('cleanup_count_snapshots')
 
@@ -723,22 +720,16 @@ async def run(
     # its audit memory is written, so each such row would be an
     # already-invalidated edge with no rollback record.
     if args.apply:
-        try:
-            assert_store_mutation_allowed(operation='cleanup_count_snapshots --apply')
-        except StoreMutationUnavailable:
-            logger.error(
-                'cleanup_count_snapshots: --apply NOT started (fail-closed) -- '
-                "this process cannot write mem0's history directory, so each "
-                'invalidation would supersede its edge and then fail to write '
+        assert_store_mutation_allowed(
+            operation='cleanup_count_snapshots --apply',
+            logger=logger,
+            extra_detail=(
+                'each invalidation would supersede its edge and then fail to write '
                 'the audit memory that records the rollback, leaving edges '
-                'invalidated with no way to reconstruct what they said. No '
-                'entity was enumerated, no edge was scanned and nothing was '
-                'mutated. Route the cleanup through the fused-memory MCP '
-                'server (the unsandboxed owner of the store), or re-run from '
-                'an unsandboxed operator shell. To obtain the audit report '
-                'safely from anywhere, re-run without --apply.'
-            )
-            raise
+                'invalidated with no way to reconstruct what they said. No entity '
+                'was enumerated, no edge was scanned and nothing was mutated.'
+            ),
+        )
 
     # Both whole-graph reads below go through the ``enumerate_*`` API rather
     # than the ``list_entity_nodes`` / ``get_all_valid_edges`` shims, which

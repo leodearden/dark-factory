@@ -32,7 +32,7 @@
 // Module scope, no fallback, RENAMED — see the CANONICAL note in datum.js's
 // header.
 const {
-  withReceipt: stampSnapshotReceipt,
+  servedDatum: servedSnapshotDatum,
   unknownDatum: unknownSnapshotDatum,
   combinedDatum: combineSnapshotDatums,
   isDatum: isSnapshotDatum,
@@ -48,8 +48,8 @@ const TASKS_ENDPOINT = '/api/v2/dashboard/tasks';
 
 const SNAPSHOT_NOT_YET_FETCHED = 'not yet fetched';
 
-function snapshotReceipt(data) {
-  return (data.__receipt || {})[TASKS_ENDPOINT] || null;
+function snapshotReceipts(data) {
+  return data.__receipt || {};
 }
 
 function snapshotEntries(data) {
@@ -58,18 +58,13 @@ function snapshotEntries(data) {
 
 // The Datum under one wire key of one project's entry — `census` or `rows`,
 // as TaskSnapshot.to_wire() names them — stamped with the /tasks receipt, or a
-// hole saying which part is missing. No receipt outranks everything else, as
-// in datum.js::plainDatum: before the first payload, nothing that is absent is
-// yet evidence of anything.
+// hole saying which part is missing. The receipt rule is datum.js::servedDatum's.
 function snapshotDatum(data, project, wireKey) {
-  const receipt = snapshotReceipt(data);
-  if (!receipt) return unknownSnapshotDatum(SNAPSHOT_NOT_YET_FETCHED);
   const entry = snapshotEntries(data)[project];
-  if (!entry) return unknownSnapshotDatum('the /tasks payload has no entry for ' + project);
-  if (!isSnapshotDatum(entry[wireKey])) {
-    return unknownSnapshotDatum('the /tasks entry for ' + project + ' has no ' + wireKey + ' Datum');
-  }
-  return stampSnapshotReceipt(entry[wireKey], receipt);
+  const why = entry
+    ? 'the /tasks entry for ' + project + ' has no ' + wireKey + ' Datum'
+    : 'the /tasks payload has no entry for ' + project;
+  return servedSnapshotDatum(entry && entry[wireKey], TASKS_ENDPOINT, why, snapshotReceipts(data));
 }
 
 function projectCensus(data, project) {
@@ -105,7 +100,7 @@ function sameDatum(held, fresh) {
 // one population. A hole in any project is a hole in the total
 // (datum.js::combinedDatum).
 function censusOver(data, projects) {
-  if (!snapshotReceipt(data)) return unknownSnapshotDatum(SNAPSHOT_NOT_YET_FETCHED);
+  if (!snapshotReceipts(data)[TASKS_ENDPOINT]) return unknownSnapshotDatum(SNAPSHOT_NOT_YET_FETCHED);
   const scope = projects === null ? Object.keys(snapshotEntries(data)) : projects;
   return combineSnapshotDatums(
     scope.map(project => [project, projectCensus(data, project)]),

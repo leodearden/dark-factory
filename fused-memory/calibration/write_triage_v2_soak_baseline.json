@@ -1,5 +1,5 @@
 {
-  "rubric": "v2",
+  "rubric": "v2.1",
   "cell_rules": {
     "hidden_detail": "A restated write adds something a reader acting on its record would need (HOME, LOSS, no CONFLICT), and a sighting is only counted, never shown.",
     "hidden_conflict": "A restated write disputes its record (CONFLICT), and the dispute sits in a sighting a reader of the record never sees.",
@@ -26,67 +26,78 @@
     "seed": 7157
   },
   "population": {
-    "n_items": 553,
+    "n_items": 673,
     "by_outcome": {
-      "amended": 40,
+      "amended": 100,
       "contested": 473,
-      "restated": 40,
+      "restated": 100,
       "stored": 0
     },
     "by_stratum": {
-      "amended-sample": 40,
+      "amended-sample": 100,
       "contested-census": 473,
-      "restated-sample": 40
+      "restated-sample": 100
     },
     "strata": {
       "amended-sample": 1224,
       "contested-census": 473,
       "restated-sample": 125
     },
-    "decided": 552,
-    "unclear": 1,
+    "decided": 671,
+    "unclear": 2,
     "unclear_entry_ids": [
-      "e7f06b8d-5bf4-4070-b085-e2db2d29d655"
+      "756c582f-ba18-4d51-88e3-5615cfa6c8cf",
+      "adf43f4e-0405-4c5c-aec4-199fcd617d2e"
     ]
   },
   "kappa": {
     "floor": 0.7,
-    "min_overlap": 60,
+    "min_pairs": 60,
+    "floor_binaries": [
+      "home",
+      "conflict",
+      "loss"
+    ],
     "by_binary": {
       "home": {
-        "n_overlap": 3,
-        "kappa": 0.0,
-        "floor_met": false
+        "n_consumed": 223,
+        "kappa": 0.9462,
+        "floor_met": true
       },
       "loss": {
-        "n_overlap": 80,
-        "kappa": 0.3962,
-        "floor_met": false
+        "n_consumed": 81,
+        "kappa": 0.9212,
+        "floor_met": true
       },
       "conflict": {
-        "n_overlap": 74,
-        "kappa": 0.5826,
-        "floor_met": false
+        "n_consumed": 423,
+        "kappa": 0.8267,
+        "floor_met": true
       },
       "scope": {
-        "n_overlap": 18,
-        "kappa": 0.4906,
-        "floor_met": false
+        "n_consumed": 286,
+        "kappa": 0.844,
+        "floor_met": true
+      },
+      "action_changing": {
+        "n_consumed": 286,
+        "kappa": 0.7744,
+        "floor_met": true
       },
       "digest": {
-        "n_overlap": 48,
-        "kappa": -0.036,
+        "n_consumed": 10,
+        "kappa": null,
         "floor_met": false
       }
     }
   },
   "cells": {
     "triage": {
-      "hidden_detail": 8,
-      "hidden_conflict": 10,
-      "digest_conflict": 5,
-      "wrong_home": 127,
-      "false_conflict": 147,
+      "hidden_detail": 13,
+      "hidden_conflict": 25,
+      "digest_conflict": 14,
+      "wrong_home": 233,
+      "false_conflict": 140,
       "duplicate_clutter": 0,
       "orphaned_conflict": 0,
       "attached_supersession": 12
@@ -97,84 +108,103 @@
       "digest_conflict": 0,
       "wrong_home": 0,
       "false_conflict": 0,
-      "duplicate_clutter": 20,
-      "orphaned_conflict": 340,
+      "duplicate_clutter": 31,
+      "orphaned_conflict": 371,
       "attached_supersession": 0
     }
   },
   "metrics": {
     "m1": {
-      "n": 39,
-      "hits": 18,
-      "rate": 0.4615,
+      "n": 91,
+      "hits": 34,
+      "rate": 0.3736,
       "wilson95": [
-        0.3157,
-        0.6143
+        0.2812,
+        0.4762
       ],
-      "unclear": 0,
-      "population_rate": 0.4697,
+      "unclear": 1,
+      "population_rate": 0.3744,
       "population_interval95": [
-        0.3158,
-        0.6263
+        0.2766,
+        0.4752
       ],
       "band_unknown": 4
     },
+    "m1_as_amended": {
+      "n": 91,
+      "hits": 35,
+      "rate": 0.3846,
+      "wilson95": [
+        0.2913,
+        0.4873
+      ],
+      "unclear": 1,
+      "population_rate": 0.3833,
+      "population_interval95": [
+        0.2857,
+        0.4835
+      ]
+    },
     "m2": {
       "amended": {
-        "n": 40,
-        "hits": 25,
-        "rate": 0.625,
+        "n": 100,
+        "hits": 31,
+        "rate": 0.31,
         "wilson95": [
-          0.4703,
-          0.7578
+          0.2278,
+          0.4063
         ],
         "unclear": 0,
-        "population_rate": 0.625,
+        "population_rate": 0.31,
         "population_interval95": [
-          0.475,
-          0.775
+          0.22,
+          0.4
         ],
         "by_project": {
           "dark_factory": {
-            "n": 10,
-            "hits": 5
+            "n": 27,
+            "hits": 4
           },
           "reify": {
-            "n": 11,
-            "hits": 7
+            "n": 28,
+            "hits": 12
+          },
+          "scoping_intake": {
+            "n": 1,
+            "hits": 0
           },
           "solar_challenge": {
-            "n": 11,
-            "hits": 8
+            "n": 30,
+            "hits": 10
           },
           "solar_challenge_platform": {
-            "n": 8,
+            "n": 14,
             "hits": 5
           }
         }
       },
       "contested": {
         "n": 472,
-        "hits": 315,
-        "rate": 0.6674,
+        "hits": 322,
+        "rate": 0.6822,
         "wilson95": [
-          0.6237,
-          0.7084
+          0.6389,
+          0.7226
         ],
         "unclear": 1,
-        "population_rate": 0.6674,
+        "population_rate": 0.6822,
         "population_interval95": [
-          0.625,
-          0.7091
+          0.6385,
+          0.7246
         ],
         "by_project": {
           "dark_factory": {
             "n": 125,
-            "hits": 89
+            "hits": 90
           },
           "reify": {
-            "n": 116,
-            "hits": 88
+            "n": 115,
+            "hits": 92
           },
           "scoping_intake": {
             "n": 2,
@@ -182,44 +212,44 @@
           },
           "solar_challenge": {
             "n": 132,
-            "hits": 71
+            "hits": 70
           },
           "solar_challenge_platform": {
-            "n": 97,
-            "hits": 65
+            "n": 98,
+            "hits": 68
           }
         }
       },
       "restated": {
-        "n": 40,
-        "hits": 13,
-        "rate": 0.325,
+        "n": 99,
+        "hits": 23,
+        "rate": 0.2323,
         "wilson95": [
-          0.2008,
-          0.4798
+          0.1601,
+          0.3246
         ],
-        "unclear": 0,
-        "population_rate": 0.325,
+        "unclear": 1,
+        "population_rate": 0.2323,
         "population_interval95": [
-          0.175,
-          0.475
+          0.1515,
+          0.3163
         ],
         "by_project": {
           "dark_factory": {
-            "n": 6,
-            "hits": 2
+            "n": 14,
+            "hits": 3
           },
           "reify": {
-            "n": 7,
-            "hits": 2
+            "n": 19,
+            "hits": 6
           },
           "solar_challenge": {
-            "n": 22,
-            "hits": 9
+            "n": 53,
+            "hits": 12
           },
           "solar_challenge_platform": {
-            "n": 5,
-            "hits": 0
+            "n": 13,
+            "hits": 2
           }
         }
       },
@@ -235,70 +265,70 @@
       }
     },
     "m3": {
-      "n": 340,
-      "hits": 15,
-      "rate": 0.0441,
+      "n": 371,
+      "hits": 39,
+      "rate": 0.1051,
       "wilson95": [
-        0.0269,
-        0.0715
+        0.0779,
+        0.1405
       ],
-      "unclear": 1,
-      "population_rate": 0.3618,
+      "unclear": 2,
+      "population_rate": 0.379,
       "population_interval95": [
-        0.1728,
-        0.4986
+        0.2686,
+        0.4673
       ],
       "by_ending": {
-        "restated": 10,
-        "amended": 5,
+        "restated": 25,
+        "amended": 14,
         "stored_unlinked": 0,
-        "contested": 325,
+        "contested": 332,
         "stored_linked": 0
       }
     },
     "m4": {
-      "n": 552,
-      "hits": 127,
-      "rate": 0.2301,
+      "n": 671,
+      "hits": 233,
+      "rate": 0.3472,
       "wilson95": [
-        0.1969,
-        0.267
+        0.3122,
+        0.384
       ],
-      "unclear": 1,
-      "population_rate": 0.2974,
+      "unclear": 2,
+      "population_rate": 0.5416,
       "population_interval95": [
-        0.204,
-        0.3979
+        0.4761,
+        0.6043
       ],
       "by_route": {
         "direct": {
-          "n": 426,
-          "hits": 57,
-          "rate": 0.1338,
+          "n": 503,
+          "hits": 127,
+          "rate": 0.2525,
           "wilson95": [
-            0.1047,
-            0.1694
+            0.2165,
+            0.2922
           ],
-          "unclear": 0,
-          "population_rate": 0.1787,
+          "unclear": 1,
+          "population_rate": 0.4658,
           "population_interval95": [
-            0.0907,
-            0.2831
+            0.3882,
+            0.5418
           ]
         },
         "via_sibling": {
-          "n": 122,
-          "hits": 68,
-          "rate": 0.5574,
+          "n": 164,
+          "hits": 104,
+          "rate": 0.6341,
           "wilson95": [
-            0.4688,
-            0.6424
+            0.5581,
+            0.704
           ],
           "unclear": 1,
-          "population_rate": 0.6732,
+          "population_rate": 0.7749,
           "population_interval95": [
-            0.4652,
-            0.8272
+            0.6694,
+            0.8603
           ]
         },
         "unknown": {
@@ -310,7 +340,7 @@
             0.85
           ],
           "unclear": 0,
-          "population_rate": 0.6735,
+          "population_rate": 0.5294,
           "population_interval95": [
             0.0,
             1.0
@@ -319,33 +349,33 @@
       },
       "by_category": {
         "same": {
-          "n": 363,
-          "hits": 87,
-          "rate": 0.2397,
+          "n": 445,
+          "hits": 156,
+          "rate": 0.3506,
           "wilson95": [
-            0.1986,
-            0.2862
+            0.3077,
+            0.396
           ],
-          "unclear": 0,
-          "population_rate": 0.3467,
+          "unclear": 1,
+          "population_rate": 0.5465,
           "population_interval95": [
-            0.2229,
-            0.4755
+            0.4656,
+            0.6209
           ]
         },
         "cross": {
-          "n": 189,
-          "hits": 40,
-          "rate": 0.2116,
+          "n": 226,
+          "hits": 77,
+          "rate": 0.3407,
           "wilson95": [
-            0.1594,
-            0.2753
+            0.282,
+            0.4047
           ],
           "unclear": 1,
-          "population_rate": 0.1874,
+          "population_rate": 0.5314,
           "population_interval95": [
-            0.0698,
-            0.3402
+            0.4125,
+            0.6395
           ]
         },
         "unknown": {
@@ -361,37 +391,44 @@
     },
     "m5": {
       "n": 472,
-      "hits": 325,
-      "rate": 0.6886,
+      "hits": 332,
+      "rate": 0.7034,
       "wilson95": [
-        0.6454,
-        0.7287
+        0.6607,
+        0.7428
       ],
       "unclear": 1,
-      "population_rate": 0.6886,
+      "population_rate": 0.7034,
       "population_interval95": [
-        0.6469,
-        0.7294
+        0.661,
+        0.7442
       ],
       "by_scope": {
-        "central": 166,
-        "secondary": 156,
-        "unknown": 3
+        "central": 158,
+        "secondary": 140,
+        "unknown": 34
+      },
+      "by_action_changing": {
+        "yes": 273,
+        "no": 32,
+        "unknown": 27
       }
     },
     "m6": {
-      "parent_edited": 13,
-      "attach_time_rated": 13,
-      "drifted": 9,
+      "parent_edited": 20,
+      "attach_time_rated": 20,
+      "drifted": 11,
       "drifted_entry_ids": [
+        "0944c8af-4c77-46f0-802f-fef0d93b4e7f",
         "28bd2462-f06f-4194-9cac-a13c461cf4ec",
         "3c88f869-8247-419b-a985-30c966d68afd",
+        "434bbd68-0ad2-4b69-9b8d-37e0955e303e",
         "51f55850-df72-4eda-8f03-77c24dc7a75b",
+        "56c08b07-48f9-487d-8b87-27e74f597415",
         "5b5850ac-5732-4523-80a2-8304aeb3b594",
         "6d648544-f6a7-4a5c-a68c-ec785825466a",
         "777f6cb1-8a75-4761-8717-7465e6dfb875",
         "8f46293e-67ad-41d1-a0a0-da9186f05b72",
-        "f57607c7-243a-41e5-9461-3c51404d540c",
         "fa50625d-8f99-4041-85eb-3a00a559fc59"
       ],
       "attach_time_undecided": 0,
@@ -399,25 +436,25 @@
     }
   },
   "harm": {
-    "n": 552,
-    "unclear": 1,
+    "n": 671,
+    "unclear": 2,
     "per_write": {
-      "triage": 0.8714,
-      "status_quo": 0.942
+      "triage": 0.9553,
+      "status_quo": 0.8525
     },
-    "delta_per_write": -0.0707,
+    "delta_per_write": 0.1028,
     "delta_interval95": [
-      -0.2228,
-      0.0824
+      -0.0268,
+      0.2377
     ],
     "population_per_write": {
-      "triage": 0.701,
-      "status_quo": 0.4569
+      "triage": 0.9511,
+      "status_quo": 0.4662
     },
-    "population_delta_per_write": 0.2441,
+    "population_delta_per_write": 0.4849,
     "population_delta_interval95": [
-      0.1154,
-      0.3789
+      0.396,
+      0.5742
     ]
   }
 }

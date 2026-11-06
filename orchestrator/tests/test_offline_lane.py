@@ -302,11 +302,10 @@ class TestOfflineLaneCommandsReload:
             f'missing from RELOADABLE_FIELDS'
         )
 
-    def test_commands_edit_lands_in_applied_candidates(self, monkeypatch, tmp_path):
+    @pytest.mark.usefixtures("code_default_config")
+    def test_commands_edit_lands_in_applied_candidates(self):
         from orchestrator.config import LaneCommand, diff_config
 
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         live = OrchestratorConfig(git=GitConfig(offline_lane_commands=[]))
         fresh = OrchestratorConfig(
             git=GitConfig(
@@ -319,11 +318,10 @@ class TestOfflineLaneCommandsReload:
         assert 'git.offline_lane_commands' in diff.applied_candidates
         assert 'git.offline_lane_commands' not in diff.restart_required
 
-    def test_apply_reload_applies_commands_in_place(self, monkeypatch, tmp_path):
+    @pytest.mark.usefixtures("code_default_config")
+    def test_apply_reload_applies_commands_in_place(self):
         from orchestrator.config import LaneCommand, apply_reload
 
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         live = OrchestratorConfig(git=GitConfig(offline_lane_commands=[]))
         fresh = OrchestratorConfig(
             git=GitConfig(
@@ -1791,15 +1789,35 @@ async def test_a_moved_head_runs_a_full_pass_instead_of_the_recheck(tmp_path: Pa
 @_inline_thread_hops()
 @virtual_clock_test
 async def test_a_raising_tick_costs_a_backoff_not_the_loop(tmp_path: Path, caplog: pytest.LogCaptureFixture):
-    """A tick that raises is logged as a failed pass and backed off (60s); the loop then ticks again
-    and goes on working: one bad tick never kills the worker."""
+    """A tick that raises is logged as a failed pass and backed off (60s); the loop then goes on working:
+    one bad tick never kills the worker. The raising tick at a never-run head had already armed the
+    backstop, so the full pass runs straight after the backoff, not after another poll."""
     rig = _LoopRig(tmp_path, [RuntimeError('tick boom')])
 
     with caplog.at_level(logging.ERROR, logger='orchestrator.offline_lane'):
         events = await rig.run_until(ticks=3)
 
-    assert events == ['tick@HEAD1', 'tick@HEAD1', *_FULL_PASS_AT_HEAD1, 'tick@HEAD1']
+    assert events == ['tick@HEAD1', *_FULL_PASS_AT_HEAD1, 'tick@HEAD1', 'tick@HEAD1']
     assert rig.engine.tick_times == [_POLL_SECS, 2 * _POLL_SECS + 60.0, 3 * _POLL_SECS + 60.0]
     assert [r.getMessage() for r in caplog.records] == [
         'offline-lane: run() pass failed (consecutive=1): RuntimeError: tick boom',
     ]
+
+
+@pytest.mark.timeout(10)
+@_inline_thread_hops()
+@virtual_clock_test
+async def test_a_raising_tick_at_a_new_head_still_runs_a_full_pass_there(tmp_path: Path):
+    """Main moving with no trigger is caught by the next poll even when that poll's tick raises: the
+    backstop is armed before the tick, so the full pass at the new head runs straight after the backoff."""
+    rig = _LoopRig(tmp_path, [])
+
+    async def _main_moves_silently() -> None:
+        rig.head = 'HEAD2'
+
+    rig.during['r@HEAD1'] = _main_moves_silently
+    rig.engine.answers = [_NOTHING_DUE, RuntimeError('tick boom')]
+    events = await rig.run_until(ticks=3)
+
+    assert events == ['tick@HEAD1', *_FULL_PASS_AT_HEAD1, 'tick@HEAD2', *_FULL_PASS_AT_HEAD2, 'tick@HEAD2']
+    assert rig.engine.tick_times == [_POLL_SECS, 2 * _POLL_SECS, 3 * _POLL_SECS + 60.0]

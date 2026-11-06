@@ -37,6 +37,7 @@ from dashboard.api import invariants as api_invariants_routes
 from dashboard.api import memory as api_memory_routes
 from dashboard.api import merge_queue as api_merge_queue_routes
 from dashboard.api import orchestrators as api_orchestrators_routes
+from dashboard.api import prds as api_prds_routes
 from dashboard.api import task_prose as api_task_prose_routes
 from dashboard.api import tasks as api_tasks_routes
 from dashboard.api.window import _parse_window, with_window
@@ -62,7 +63,12 @@ from dashboard.data.costs import (
 )
 from dashboard.data.datum import unknown_datum
 from dashboard.data.db import DbPool
-from dashboard.data.escalation_corpus import reconciliation_queue
+from dashboard.data.escalation_corpus import (
+    CORPUS_FRESHNESS_BOUND_SECONDS,
+    acquire_corpus,
+    corpus_queues,
+    reconciliation_queue,
+)
 from dashboard.data.load import get_load_metrics
 from dashboard.data.mcp_fanout import (
     FANOUT_FAILURE_EXCEPTIONS,
@@ -93,7 +99,8 @@ from dashboard.data.reconciliation import (
     partition_burst_state,
 )
 from dashboard.data.scheduler import get_scheduler_snapshot
-from dashboard.data.tasks import fetch_tasks
+from dashboard.data.task_snapshot import ROW_READ_STATUSES
+from dashboard.data.tasks import fetch_task_page
 from dashboard.data.utils import resolve_now, safe_gather_result
 from dashboard.data.write_journal import MEMORY_OPS_FRESHNESS_BOUND_SECONDS, get_memory_ops
 from dashboard.http_pool import reaper_loop
@@ -425,6 +432,7 @@ app.include_router(api_orchestrators_routes.router)
 app.include_router(api_escalations_routes.router)
 app.include_router(api_task_prose_routes.router)
 app.include_router(api_invariants_routes.router)
+app.include_router(api_prds_routes.router)
 
 
 # ---------------------------------------------------------------------------
@@ -488,8 +496,8 @@ _MCP_FANOUT_OK_GRACE_SECONDS = 30.0
 # lapses every 30.0 s and the next /healthz launches a probe it cannot observe
 # inside 0.2 s. Younger than this, that probe reports 'probing' -- it has shown
 # nothing yet -- rather than a false 'timeout'. Older, it has outlived
-# tasks.DEFAULT_WHOLE_OPERATION_BUDGET (the cap on a healthy cold whole-tree
-# fetch) nearly three times over, and the wedge is reported for as long as it
+# tasks.DEFAULT_WHOLE_OPERATION_BUDGET (the cap on one healthy cold task read)
+# nearly three times over, and the wedge is reported for as long as it
 # lasts. Invariant (machine-checked by
 # test_healthz_data_plane_budget_is_structurally_deliverable):
 #   _MCP_PROBE_OUTSTANDING_LIMIT >= tasks.DEFAULT_WHOLE_OPERATION_BUDGET
@@ -655,8 +663,16 @@ async def _fanout_probe_completion(
     would hand a full fresh window to a fan-out that finished long ago, and so
     mask a wedge that began in between. The two readings diverge in precisely
     the case this probe exists to catch.
+
+    It reads ONE row of the snapshot unit's row query, because the verdict
+    needs a completed traversal and not its rows; the reasoning is recorded in
+    ``plans/dashboard-one-datum-one-path-prd.md`` ("The ``/healthz`` probe
+    reads one row of the unit's row query").
     """
-    await fetch_tasks(client, config, config.project_root)
+    await fetch_task_page(
+        client, config, config.project_root,
+        statuses=sorted(ROW_READ_STATUSES), page_size=1, offset=0,
+    )
     return asyncio.get_running_loop().time()
 
 
@@ -698,16 +714,16 @@ async def _probe_mcp_fanout(
        _MCP_FANOUT_OK_GRACE_SECONDS. This is what keeps an occasional 2.0s
        ReadTimeout from flipping the verdict.
     2. PROBE -- start, or JOIN if one is already live, a single-flight
-       background ``fetch_tasks`` and wait at most *budget* using
+       background ``fetch_task_page`` and wait at most *budget* using
        ``asyncio.wait({task}, timeout=...)`` (NOT ``wait_for``, which awaits
        the cancelled operation's unwinding -- the same reason _probe_db uses
        this idiom).
 
-    The probe is deliberately the RAW, uncached ``fetch_tasks``, and nothing
-    another caller stored is consulted: a stored value must never answer for a
-    traversal (one-datum-one-path PRD decision 17), because a read that
-    completed before a wedge began says nothing about whether a caller can get
-    through now.
+    The probe is deliberately the RAW, uncached ``fetch_task_page``, and
+    nothing another caller stored is consulted: a stored value must never
+    answer for a traversal (one-datum-one-path PRD decision 17), because a read
+    that completed before a wedge began says nothing about whether a caller can
+    get through now.
 
     The task is NOT cancelled on expiry and NOT relaunched while live. That is
     what makes the two cases distinguishable at all: a healthy-but-COLD system
@@ -1196,15 +1212,14 @@ async def api_curator(request: Request) -> JSONResponse:
         # Bounded on BOTH layers, like every other probe in task 3871: the
         # budget bounds each individual HTTP request (including pool
         # acquisition), wait_for bounds the whole operation because a cold
-        # session is three posts across up to N urls. Previously this leg took
-        # neither, so /curator could block for roughly N x 3 x 10s during a
-        # fused-memory outage while its fan-out sibling honoured 5s.
-        # TimeoutError lands in safe_gather_result below as the offline state.
+        # session is three posts across up to N urls. The outer bound is
+        # derived via memory.py::enclosing_deadline — see its docstring for
+        # why it must exceed the per-request budget.
         asyncio.wait_for(
             memory_data.get_curator_state(
                 http_client, config, timeout=_CURATOR_ENDPOINT_TIMEOUT_SECONDS,
             ),
-            timeout=_CURATOR_ENDPOINT_TIMEOUT_SECONDS,
+            timeout=memory_data.enclosing_deadline(_CURATOR_ENDPOINT_TIMEOUT_SECONDS),
         ),
         return_exceptions=True,
     )
@@ -1582,12 +1597,12 @@ async def api_memory_evals(request: Request) -> JSONResponse:
     """MEMORY_EVALS — metric trends, verdicts, limits provenance and escalation parity.
 
     The artifact scan (every metrics-*.json across every eval dir, plus the
-    limits/verdicts artifacts and the escalation queue) runs in a worker thread
-    via asyncio.to_thread behind a ~60s single-flight TTL cache, so a cold scan
-    never blocks the event loop and repeated polls within the window are free.
-    No clock read here — the aggregator resolves `now` once internally via
-    resolve_now (clock-discipline guard scans dashboard/data/*.py + app.py;
-    resolve_now is the sanctioned site).
+    limits/verdicts artifacts) runs in a worker thread via asyncio.to_thread
+    behind a ~60s single-flight TTL cache, so a cold scan never blocks the
+    event loop and repeated polls within the window are free. Each rebuild
+    resolves `now` once via resolve_now (the sanctioned clock site); it stamps
+    the payload, and stamps the escalation corpus walk only if this rebuild
+    triggers one.
 
     A scan that never REACHED the tree is served but NOT cached (cache_ok=
     root_scan_succeeded): an absent root and an unwalkable one are both O(1) to
@@ -1611,20 +1626,33 @@ async def api_memory_evals(request: Request) -> JSONResponse:
 
     The escalation source is the reconciliation queue
     (escalation_corpus.py::reconciliation_queue): memory-eval regressions are
-    filed onto the 8103 recon queue (memory-eval-program.md M3), which is the
-    same queue the Escalations tab renders — so a linked alarm and its
-    escalation cannot disagree. The directory read and the queue id the payload
-    names (MEMORY_EVALS.escalation_queue, the key the client's links resolve
-    under) both come from that one QueueRef, so they cannot disagree either.
+    filed onto the 8103 recon queue (memory-eval-program.md M3). It is read
+    through the escalation corpus' one walk and cache, the same the Escalations
+    tab reads, so a linked alarm and its escalation row cannot disagree. The
+    queue joined and the queue id the payload names (MEMORY_EVALS.
+    escalation_queue, the key the client's links resolve under) both come from
+    that one QueueRef, so they cannot disagree either. A corpus walk that
+    raises is joined as an unknown corpus, an unreadable_escalations issue on a
+    payload cached like any degraded row, never a 500.
     """
     config: DashboardConfig = request.app.state.config
     memory_evals_dir = config.memory_evals_dir
     queue = reconciliation_queue(config)
-    escalations_dir = queue.directory
-    key = f'{memory_evals_dir}|{escalations_dir}'
+    key = f'{memory_evals_dir}|{queue.directory}'
 
     async def _refresh() -> dict:
-        return await asyncio.to_thread(build_memory_evals, memory_evals_dir, escalations_dir)
+        now = resolve_now(None)
+        try:
+            corpus = await acquire_corpus(corpus_queues(config), now=now)
+        except Exception as exc:
+            logger.exception('memory-evals: escalation corpus walk failed; joining no escalations')
+            corpus = unknown_datum(
+                f'the escalation corpus walk failed: {type(exc).__name__}: {exc}',
+                CORPUS_FRESHNESS_BOUND_SECONDS,
+            )
+        return await asyncio.to_thread(
+            build_memory_evals, memory_evals_dir, corpus, queue.id, now=now,
+        )
 
     result = await _memory_evals_cache.get_or_refresh(key, _refresh, cache_ok=root_scan_succeeded)
     return JSONResponse(redux_api.shape_memory_evals(**result, escalation_queue=queue.id))

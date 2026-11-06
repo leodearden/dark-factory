@@ -576,6 +576,7 @@ def test_apply_preserved_refuses_a_value_it_cannot_write_faithfully():
 
 _FUSED_MEMORY = "fused-memory"
 _DASHBOARD = "dashboard"
+_CLIENT_FEED = "client-feed"
 
 
 def _units():
@@ -590,8 +591,8 @@ def _module():
     return render_systemd_unit
 
 
-def test_units_registry_holds_exactly_the_two_installed_units():
-    """(a) Both units this renderer installs are registered, and nothing else.
+def test_units_registry_holds_exactly_the_installed_units():
+    """(a) Every unit this renderer installs is registered, and nothing else.
 
     Asserted as EQUALITY rather than containment: a third key appearing without
     a corresponding setup-host.sh call site is a registry nobody renders from,
@@ -599,9 +600,9 @@ def test_units_registry_holds_exactly_the_two_installed_units():
     POLICY section) iterates this mapping, so a key added without its template
     and preserve set would silently widen what those guards claim to cover.
     """
-    assert set(_units()) == {_DASHBOARD, _FUSED_MEMORY}, (
-        f"UNITS registers {sorted(_units())}; expected exactly "
-        f"{sorted((_DASHBOARD, _FUSED_MEMORY))}."
+    expected = {_DASHBOARD, _FUSED_MEMORY, _CLIENT_FEED}
+    assert set(_units()) == expected, (
+        f"UNITS registers {sorted(_units())}; expected exactly {sorted(expected)}."
     )
 
 
@@ -623,7 +624,9 @@ def test_each_policy_family_has_exactly_one_rendered_unit():
     """Every UnitFamily ENV_POLICY declares rows for is rendered by exactly one spec."""
     import systemd_unit_parity
 
-    families = [spec.family for spec in _units().values()]
+    families = [
+        spec.family for spec in _units().values() if spec.family is not None
+    ]
 
     assert len(families) == len(set(families)), families
     assert set(families) == set(systemd_unit_parity.UnitFamily)
@@ -636,6 +639,8 @@ def test_every_specs_preserve_set_is_its_familys_policy_projection():
     import systemd_unit_parity
 
     for key, spec in _units().items():
+        if spec.family is None:
+            continue
         expected = systemd_unit_parity.ENV_POLICY.host_local_names(spec.family)
 
         assert isinstance(spec.host_local_environment, tuple), key
@@ -663,6 +668,7 @@ def test_unit_log_tags_are_distinct_and_non_empty():
 
     assert tags[_DASHBOARD] == "dashboard_unit_render", tags
     assert tags[_FUSED_MEMORY] == "fused_memory_unit_render", tags
+    assert tags[_CLIENT_FEED] == "client_feed_unit_render", tags
     assert all(tag.strip() for tag in tags.values()), (
         f"an empty log tag makes the report unroutable: {tags}"
     )
@@ -685,6 +691,15 @@ def test_dashboard_spec_is_the_modules_existing_public_surface():
     assert spec.log_tag == module.LOG_TAG, (
         f"UNITS['dashboard'].log_tag {spec.log_tag!r} != LOG_TAG {module.LOG_TAG!r}"
     )
+
+
+def test_client_feed_spec_has_no_policy_family_and_preserves_nothing():
+    """The publisher unit declares no Environment= policy, so nothing is host-local."""
+    spec = _units()[_CLIENT_FEED]
+
+    assert spec.family is None
+    assert spec.host_local_environment == ()
+    assert spec.template == "scripts/client-feed.service.template"
 
 
 def test_fused_memory_spec_preserves_the_known_project_roots():
@@ -812,7 +827,9 @@ def test_every_policy_row_is_declared_in_its_familys_template():
     """
     import systemd_unit_parity
 
-    specs = {spec.family: spec for spec in _units().values()}
+    specs = {
+        spec.family: spec for spec in _units().values() if spec.family is not None
+    }
     for row in systemd_unit_parity.ENV_POLICY.rows:
         template = specs[row.unit_family].template
         declared = systemd_unit_parity.environment_map(
@@ -1742,3 +1759,39 @@ def test_an_unknown_unit_is_rejected_rather_than_defaulted(tmp_path, capsys):
         f"unit name: {err}"
     )
     assert "fused_memory" in err, err
+
+
+# ---------------------------------------------------------------------------
+# --unit client-feed — a unit with no Environment= policy
+# ---------------------------------------------------------------------------
+
+CLIENT_FEED_TEMPLATE_PATH = REPO_ROOT / "scripts" / "client-feed.service.template"
+
+
+def test_main_renders_the_client_feed_unit_over_an_installed_copy_without_preserving_it(
+    tmp_path, capsys
+):
+    """A stale installed copy is replaced by the plain render, byte for byte."""
+    output = tmp_path / "unit" / "client-feed@.service"
+    output.parent.mkdir(parents=True)
+    output.write_text(
+        "[Service]\nEnvironment=FOO=bar\nExecStart=/stale\n", encoding="utf-8"
+    )
+
+    rc = _main([
+        "--unit", _CLIENT_FEED,
+        "--template", str(CLIENT_FEED_TEMPLATE_PATH),
+        "--repo-root", _NEW_ROOT,
+        "--uv-path", _NEW_UV,
+        "--output", str(output),
+    ])
+
+    assert rc == 0
+    assert output.read_text(encoding="utf-8") == _render_template(
+        CLIENT_FEED_TEMPLATE_PATH.read_text(encoding="utf-8"),
+        repo_root=_NEW_ROOT,
+        uv_path=_NEW_UV,
+    )
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
+    assert lines, "the run emitted nothing to tag"
+    assert all(line.startswith("[client_feed_unit_render] ") for line in lines), lines

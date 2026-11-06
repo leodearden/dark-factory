@@ -1409,34 +1409,36 @@ class TestScoperTrailingClausePreservation:
 
     _FILES = ['fused-memory/tests/test_harness.py']
 
-    def test_fused_memory_lint_chain_scopes_ruff_and_keeps_both_checkers(self):
+    def test_fused_memory_lint_chain_scopes_ruff_and_keeps_every_checker(self):
         """The task's headline case, as a full literal golden.
 
         The ruff clause is narrowed to the one touched file (its unscoped
-        ``src/ tests/`` targets are gone); both sibling checkers survive
+        ``src/ tests/`` targets are gone); every sibling checker survives
         byte-identically, still pointed at the whole ``fused-memory/tests``
-        directory they assert an invariant over.
+        or ``fused-memory`` tree it asserts an invariant over.
         """
         scoped = _scope_to_keyword(FM_LINT_COMMAND, 'ruff check', self._FILES)
         assert scoped == (
             'uv run --project fused-memory ruff check fused-memory/tests/test_harness.py'
             ' && python3 fused-memory/scripts/check_bare_magicmock_config.py fused-memory/tests'
             ' && python3 fused-memory/scripts/check_asyncmock_assertion_style.py fused-memory/tests'
+            ' && python3 tests/scripts/raw_envelope_literal_guard.py fused-memory'
         )
         assert 'src/ tests/' not in scoped
         for checker in (
             '&& python3 fused-memory/scripts/check_bare_magicmock_config.py fused-memory/tests',
             '&& python3 fused-memory/scripts/check_asyncmock_assertion_style.py fused-memory/tests',
+            '&& python3 tests/scripts/raw_envelope_literal_guard.py fused-memory',
         ):
             assert checker in scoped, f'{checker!r} must survive verbatim'
             assert checker in FM_LINT_COMMAND, 'the slice asserted above must be verbatim'
 
-    def test_dashboard_lint_chain_scopes_ruff_and_keeps_both_checkers(self):
-        """The second 3-segment chain (task 4485), as a full literal golden.
+    def test_dashboard_lint_chain_scopes_ruff_and_keeps_every_checker(self):
+        """The second 4-segment chain (tasks 4485 and 6230), as a full literal golden.
 
         Same shape as the fused-memory case above: the ruff clause narrows
-        to the touched file while both sibling checkers survive verbatim,
-        still pointed at the whole ``dashboard/tests`` directory.
+        to the touched file while every sibling checker survives verbatim,
+        still pointed at the whole ``dashboard/tests`` or ``dashboard`` tree.
         """
         files = ['dashboard/tests/test_index_html.py']
         scoped = _scope_to_keyword(DASHBOARD_LINT_COMMAND, 'ruff check', files)
@@ -1444,11 +1446,13 @@ class TestScoperTrailingClausePreservation:
             'uv run --project dashboard ruff check dashboard/tests/test_index_html.py'
             ' && python3 fused-memory/scripts/check_bare_magicmock_config.py dashboard/tests'
             ' && python3 fused-memory/scripts/check_module_local_testclient.py dashboard/tests'
+            ' && python3 tests/scripts/raw_envelope_literal_guard.py dashboard'
         )
         assert 'src/ tests/' not in scoped
         for checker in (
             '&& python3 fused-memory/scripts/check_bare_magicmock_config.py dashboard/tests',
             '&& python3 fused-memory/scripts/check_module_local_testclient.py dashboard/tests',
+            '&& python3 tests/scripts/raw_envelope_literal_guard.py dashboard',
         ):
             assert checker in scoped, f'{checker!r} must survive verbatim'
             assert checker in DASHBOARD_LINT_COMMAND, 'the slice asserted above must be verbatim'
@@ -2432,15 +2436,15 @@ _FM_TEST_FILE = 'fused-memory/tests/test_harness.py'
 _SWEEP_TEST_FILE = 'orchestrator/tests/test_sweep.py'
 
 _SWEEP_MODULE_CONFIGS: list[tuple[str, ModuleConfig]] = [
-    # The live 2-segment chained lint + the root's cd-chained pyright/pytest.
+    # The live 3-segment chained lint + the root's cd-chained pyright/pytest.
     ('real-chained', ModuleConfig(
         prefix='orchestrator',
         lint_command=MODULE_LINT_COMMANDS['orchestrator'],
         type_check_command=ROOT_TYPE_CHECK_COMMAND,
         test_command=ROOT_TEST_COMMAND,
     )),
-    # The only 3-segment chain in the live configs (two sibling checkers).
-    ('fm-three-segment-lint', ModuleConfig(
+    # A live 4-segment chain (three sibling checkers).
+    ('fm-four-segment-lint', ModuleConfig(
         prefix='orchestrator',
         lint_command=FM_LINT_COMMAND,
         type_check_command='npx pyright',
@@ -3212,3 +3216,53 @@ class TestGoverningAddopts:
     )
     def test_every_refusal_is_the_empty_tuple(self, command, contents):
         assert self._addopts(command, contents) == ()
+
+
+class TestExecutedModulePrefixes:
+    """executed_module_prefixes(plan): the module prefixes a plan actually runs."""
+
+    _MODULES = [
+        ModuleConfig(
+            prefix='orchestrator',
+            test_command='uv run --project orchestrator pytest orchestrator/tests',
+            lint_command='uv run --project orchestrator ruff check orchestrator/src',
+            type_check_command='uv run --project orchestrator pyright orchestrator/src',
+        ),
+        ModuleConfig(
+            prefix='fused_memory',
+            test_command='uv run --project fused_memory pytest fused_memory/tests',
+            lint_command='uv run --project fused_memory ruff check fused_memory/src',
+            type_check_command='uv run --project fused_memory pyright fused_memory/src',
+        ),
+    ]
+
+    def _prefixes(self, files: list[str]) -> frozenset[str]:
+        plan = derive_verify_plan(files, self._MODULES, None, fake_worktree_reader, role='task')
+        return verify_plan_module.executed_module_prefixes(plan)
+
+    def test_a_module_with_no_touched_files_is_not_executed(self):
+        assert self._prefixes(['orchestrator/src/orchestrator/x.py']) == frozenset({'orchestrator'})
+
+    def test_every_touched_module_is_executed(self):
+        files = ['orchestrator/src/orchestrator/x.py', 'fused_memory/src/fused_memory/y.py']
+
+        assert self._prefixes(files) == frozenset({'orchestrator', 'fused_memory'})
+
+    def test_a_trivial_plan_executes_nothing(self):
+        assert self._prefixes(['README.md']) == frozenset()
+
+    def test_a_skipped_slot_beside_a_scoped_slot_still_counts_as_executed(self):
+        test_file = 'orchestrator/tests/test_x.py'
+        plan = VerifyPlan(runs=(
+            PlannedRun('orchestrator', None, ScopeKind.SKIPPED, 'lint: no lint_command configured'),
+            PlannedRun(
+                'orchestrator',
+                parse_config_command(f'uv run --project orchestrator pytest {test_file}'),
+                ScopeKind.FILE_SCOPED,
+                'pytest: touched test files',
+                scoped_targets=(test_file,),
+            ),
+            PlannedRun('fused_memory', None, ScopeKind.SKIPPED, 'no files under prefix'),
+        ))
+
+        assert verify_plan_module.executed_module_prefixes(plan) == frozenset({'orchestrator'})

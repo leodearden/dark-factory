@@ -36,15 +36,20 @@ from __future__ import annotations
 import copy
 import enum
 import json
-import shutil
 import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
 
 import pytest
-from _merge_lane_ratchet_fixtures import metrics, synthetic_report
-from _orch_helpers import assert_isolated_git_repo, git_env_with_ceiling
+from _merge_lane_ratchet_fixtures import (
+    GATE_IMPORT_CLOSURE,
+    RatchetRepo,
+    a_py_cognitive_raise,
+    metrics,
+    record,
+    synthetic_report,
+)
 
 from orchestrator.agents.roles import MERGER
 
@@ -60,20 +65,25 @@ def _report_with(mutate: Callable[[dict], None]) -> dict:
     return report
 
 
-def _raise_lines(report: dict) -> None:
-    report['files']['a.py']['lines'] = 1005
+def _raise_cognitive(report: dict) -> None:
+    report['files']['a.py']['cognitive'] = 125
 
 
-def _lower_lines(report: dict) -> None:
-    report['files']['a.py']['lines'] = 995
+def _lower_cognitive(report: dict) -> None:
+    report['files']['a.py']['cognitive'] = 115
 
 
-def _with_a_py_lines(lines: int) -> dict:
-    """The seed report with a.py's `lines` at *lines* (the seed holds 1000)."""
-    return _report_with(lambda report: report['files']['a.py'].__setitem__('lines', lines))
+def _grow_a_py_size(report: dict) -> None:
+    """a.py 1000 -> 1005 lines and 400 -> 410 prose, and nothing structural."""
+    report['files']['a.py'].update(lines=1005, prose_lines=410)
 
 
-#: The branch ``_Repo.seeded`` leaves HEAD on, and the task ``_record`` defaults to.
+def _with_a_py(measure: str, value: int) -> dict:
+    """The seed report with a.py's *measure* at *value* (seed: cognitive 120, lines 1000)."""
+    return _report_with(lambda report: report['files']['a.py'].__setitem__(measure, value))
+
+
+#: The branch ``_Repo.seeded`` leaves HEAD on, and the task ``record`` defaults to.
 _TASK_BRANCH = 'task/5722'
 
 #: The branch ``_Repo.mid_merge`` merges main into; ``5792`` is the merge's own task.
@@ -87,69 +97,20 @@ class _Baseline(enum.Enum):
     REMOVED = enum.auto()
 
 
-class _Repo:
-    """A throwaway repo carrying the two ratchet artifacts at their real paths.
-
-    Every git invocation goes through :meth:`git`, so ``cwd`` and the ceiling
-    environment are established in exactly one place and no case builder can
-    shell out unguarded (esc-3072-3).
-    """
-
-    def __init__(self, root: Path) -> None:
-        # FIRST, before any subprocess: a rejected root must write nothing.
-        assert_isolated_git_repo(root)
-        self.root = root
-        self.env = git_env_with_ceiling(root)
+class _Repo(RatchetRepo):
+    """The shared throwaway repo, plus the commit-time gate's own moves."""
 
     @classmethod
     def seeded(cls, tmp_path: Path, report: dict | None = None) -> _Repo:
-        """``git init`` plus one commit carrying a baseline and no ledger entry.
+        """``RatchetRepo.seeded``, with HEAD then moved to ``_TASK_BRANCH``.
 
-        HEAD is left on ``_TASK_BRANCH``, a branch of main at that commit: the
-        gate admits a new entry only for the task its branch works on, and
-        ``_record``'s default task is that branch's.
+        ``_TASK_BRANCH`` is a branch of main at the seed commit: the gate admits
+        a new entry only for the task its branch works on, and ``record``'s
+        default task is that branch's.
         """
-        root = tmp_path / 'repo'
-        root.mkdir()
-        # The pre-flight cannot precede `git init` -- it refuses any directory
-        # that is not ALREADY a repo root, which is what this call creates. The
-        # ceiling is applied to the bootstrap on its own, and `git init` only
-        # ever writes into its own cwd.
-        bootstrap = subprocess.run(
-            ['git', 'init', '-b', 'main'],
-            cwd=str(root),
-            capture_output=True,
-            text=True,
-            env=git_env_with_ceiling(root),
-            check=False,
-        )
-        assert bootstrap.returncode == 0, bootstrap.stderr
-        repo = cls(root)
-        repo.git('config', 'user.name', 'ratchet gate test')
-        repo.git('config', 'user.email', 'ratchet@example.invalid')
-        # Pinned explicitly so an operator's GLOBAL core.hooksPath cannot reach
-        # into a throwaway repo and run real hooks over it.
-        repo.git('config', 'core.hooksPath', str(root / '.git' / 'hooks'))
-        repo.write_baseline(report if report is not None else synthetic_report())
-        repo.commit_all('seed the ratchet artifacts')
+        repo = super().seeded(tmp_path, report)
         repo.git('switch', '--quiet', '-c', _TASK_BRANCH)
         return repo
-
-    @classmethod
-    def unborn(cls, tmp_path: Path) -> _Repo:
-        """An initialized repo with NO commit yet -- HEAD names nothing."""
-        root = tmp_path / 'repo'
-        root.mkdir()
-        bootstrap = subprocess.run(
-            ['git', 'init', '-b', 'main'],
-            cwd=str(root),
-            capture_output=True,
-            text=True,
-            env=git_env_with_ceiling(root),
-            check=False,
-        )
-        assert bootstrap.returncode == 0, bootstrap.stderr
-        return cls(root)
 
     @classmethod
     def mid_merge(
@@ -201,7 +162,7 @@ class _Repo:
         self.git('merge', 'main', check=False)
         merge_head = self.git('rev-parse', '-q', '--verify', 'MERGE_HEAD', check=False)
         assert merge_head, '`git merge main` did not stop on the sentinel conflict'
-        self._write('conflict.txt', 'resolved\n')
+        self.write_file('conflict.txt', 'resolved\n')
         self.stage('conflict.txt')
 
     def _commit_side(
@@ -211,65 +172,16 @@ class _Repo:
             self.git('rm', '--quiet', '--', metrics.BASELINE_RELPATH)
         elif baseline is not None:
             self.write_baseline(baseline)
-        for record in entries:
-            self.write_entry(record)
+        for entry in entries:
+            self.write_entry(entry)
         # UNIQUE PER COMMIT: a sentinel main rewrote unchanged since the merge
         # base would merge cleanly, and a second round would never stop.
-        self._write('conflict.txt', f'{side} on {self.git("rev-parse", "HEAD")}\n')
+        self.write_file('conflict.txt', f'{side} on {self.git("rev-parse", "HEAD")}\n')
         self.commit_all(f'{side}: move the ratchet artifacts')
-
-    def git(self, *args: str, check: bool = True) -> str:
-        proc = subprocess.run(
-            ['git', *args],
-            cwd=str(self.root),
-            capture_output=True,
-            text=True,
-            env=self.env,
-            check=False,
-        )
-        if check:
-            assert proc.returncode == 0, (
-                f'git {" ".join(args)} failed (rc={proc.returncode}): '
-                f'{proc.stderr.strip()}'
-            )
-        return proc.stdout.strip()
-
-    def commit_all(self, message: str) -> str:
-        self.git('add', '-A')
-        self.git('commit', '-m', message)
-        return self.git('rev-parse', 'HEAD')
-
-    def _write(self, relpath: str, text: str) -> Path:
-        target = self.root / relpath
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(text, encoding='utf-8')
-        return target
-
-    def write_baseline(self, report: dict) -> Path:
-        return self._write(metrics.BASELINE_RELPATH, metrics.render_baseline(report))
-
-    def write_baseline_text(self, text: str) -> Path:
-        """Raw bytes, for a blob ``render_baseline`` would never produce."""
-        return self._write(metrics.BASELINE_RELPATH, text)
-
-    def write_entry(self, record: dict) -> str:
-        """Record *record* as the writer does; its path, repo-relative."""
-        written = metrics.append_authorization(self.root / metrics.LEDGER_DIR_RELPATH, record)
-        return written.relative_to(self.root).as_posix()
-
-    def stage(self, *relpaths: str) -> None:
-        self.git('add', '--', *relpaths)
 
     def attempt_commit(self, message: str) -> subprocess.CompletedProcess[str]:
         """A real `git commit`, hooks and all, whose outcome is the assertion."""
-        return subprocess.run(
-            ['git', 'commit', '-m', message],
-            cwd=str(self.root),
-            capture_output=True,
-            text=True,
-            env=self.env,
-            check=False,
-        )
+        return self.attempt('commit', '-m', message)
 
     def gate(self) -> subprocess.CompletedProcess[str]:
         """Drive the auditor through its real entry point, as the hook does."""
@@ -280,27 +192,6 @@ class _Repo:
             env=self.env,
             check=False,
         )
-
-
-def _record(raises: list[metrics.Violation], task_id: str = '5722') -> dict:
-    return metrics.authorization_record(
-        metrics.RaiseAuthorization(task_id=task_id, reason=f'net-additive {task_id}'),
-        raises,
-    )
-
-
-def _a_py_lines_raise(was: int, now: int, task_id: str) -> dict:
-    """The record `--authorize-raise` appends when a.py's `lines` rise *was* -> *now*."""
-    b_py_lines = synthetic_report()['files']['b.py']['lines']
-    return _record(
-        [
-            metrics.Violation.rose('lines', 'a.py', was, now),
-            metrics.Violation.rose(
-                'total:lines', metrics.CLUSTER_TOTAL_KEY, was + b_py_lines, now + b_py_lines
-            ),
-        ],
-        task_id,
-    )
 
 
 class TestTheStagedDiffIsAudited:
@@ -339,7 +230,7 @@ class TestTheStagedDiffIsAudited:
 
     def test_a_fall_needs_no_ceremony(self, tmp_path: Path) -> None:
         repo = _Repo.seeded(tmp_path)
-        repo.write_baseline(_report_with(_lower_lines))
+        repo.write_baseline(_report_with(_lower_cognitive))
         repo.stage(metrics.BASELINE_RELPATH)
 
         result = repo.gate()
@@ -351,16 +242,16 @@ class TestTheStagedDiffIsAudited:
         self, tmp_path: Path
     ) -> None:
         repo = _Repo.seeded(tmp_path)
-        repo.write_baseline(_report_with(_raise_lines))
+        repo.write_baseline(_report_with(_raise_cognitive))
         repo.stage(metrics.BASELINE_RELPATH)
 
         result = repo.gate()
 
         assert result.returncode == 1, result.stdout + result.stderr
         message = result.stderr
-        assert 'lines' in message
+        assert 'cognitive' in message
         assert 'a.py' in message
-        assert '1000' in message and '1005' in message
+        assert 'rose 120 -> 125' in message
         # The ONE copy of what to do next, printed verbatim rather than
         # paraphrased into a fourth near-copy (task 5342, esc-5342-1).
         assert metrics.RAISE_REMEDY in message
@@ -369,8 +260,8 @@ class TestTheStagedDiffIsAudited:
         self, tmp_path: Path
     ) -> None:
         repo = _Repo.seeded(tmp_path)
-        repo.write_baseline(_report_with(_raise_lines))
-        repo.write_entry(_a_py_lines_raise(1000, 1005, '5722'))
+        repo.write_baseline(_report_with(_raise_cognitive))
+        repo.write_entry(a_py_cognitive_raise(120, 125, '5722'))
         repo.stage(metrics.BASELINE_RELPATH, metrics.LEDGER_DIR_RELPATH)
 
         result = repo.gate()
@@ -382,15 +273,15 @@ class TestTheStagedDiffIsAudited:
         self, tmp_path: Path
     ) -> None:
         # Through the real writer: `--write-baseline --authorize-raise` run
-        # twice records 1000->1002 and 1002->1005, and the commit's delta reads
-        # 1000->1005, which neither entry reaches alone.
+        # twice records 120->122 and 122->125, and the commit's delta reads
+        # 120->125, which neither entry reaches alone.
         repo = _Repo.seeded(tmp_path)
         target = repo.root / metrics.BASELINE_RELPATH
         ledger = repo.root / metrics.LEDGER_DIR_RELPATH
-        for lines, reason in ((1002, 'first half'), (1005, 'second half')):
+        for cognitive, reason in ((122, 'first half'), (125, 'second half')):
             metrics.write_baseline(
                 target,
-                _with_a_py_lines(lines),
+                _with_a_py('cognitive', cognitive),
                 authorization=metrics.RaiseAuthorization(task_id='5722', reason=reason),
                 ledger=ledger,
             )
@@ -405,16 +296,16 @@ class TestTheStagedDiffIsAudited:
         self, tmp_path: Path
     ) -> None:
         repo = _Repo.seeded(tmp_path)
-        repo.write_baseline(_report_with(_raise_lines))
+        repo.write_baseline(_report_with(_raise_cognitive))
         # Right measure, right key, a SMALLER rise -- the shape a hand-written or
         # copied-forward entry actually has.
-        repo.write_entry(_record([metrics.Violation.rose('lines', 'a.py', 1000, 1003)]))
+        repo.write_entry(record([metrics.Violation.rose('cognitive', 'a.py', 120, 123)]))
         repo.stage(metrics.BASELINE_RELPATH, metrics.LEDGER_DIR_RELPATH)
 
         result = repo.gate()
 
         assert result.returncode == 1, result.stdout + result.stderr
-        assert '1005' in result.stderr
+        assert 'rose 120 -> 125' in result.stderr
 
     def test_a_recorded_raise_in_heads_ledger_is_not_a_standing_permission(
         self, tmp_path: Path
@@ -429,16 +320,16 @@ class TestTheStagedDiffIsAudited:
         # to `unrecorded_raises` would turn the directory into the standing
         # permission list its own README forbids with all of them still green.
         repo = _Repo.seeded(tmp_path)
-        repo.write_entry(_a_py_lines_raise(1000, 1005, '5722'))
+        repo.write_entry(a_py_cognitive_raise(120, 125, '5722'))
         repo.commit_all('record a raise in a commit that does not take it')
 
-        repo.write_baseline(_report_with(_raise_lines))
+        repo.write_baseline(_report_with(_raise_cognitive))
         repo.stage(metrics.BASELINE_RELPATH)
 
         result = repo.gate()
 
         assert result.returncode == 1, result.stdout + result.stderr
-        assert '1005' in result.stderr
+        assert 'rose 120 -> 125' in result.stderr
 
     def test_a_staged_deletion_of_the_baseline_is_refused(
         self, tmp_path: Path
@@ -504,8 +395,11 @@ def _incident_report() -> dict:
 
 
 def _conftest_rise(report: dict) -> None:
-    """The 52d98220ad shape: conftest.py 1172 -> 1187 lines, 752 -> 770 prose."""
-    report['files'][_CONFTEST].update(lines=1187, prose_lines=770)
+    """The 52d98220ad size shape, conftest.py 1172 -> 1187 lines and 752 -> 770 prose.
+
+    Plus function_local_imports 7 -> 8, because size alone no longer raises.
+    """
+    report['files'][_CONFTEST].update(lines=1187, prose_lines=770, function_local_imports=8)
 
 
 def _ports_rise(report: dict) -> None:
@@ -521,9 +415,10 @@ class TestRestoreCarveOut:
     a0fb5cc8e0fb1e9ce363c81538a350dbfc12c191. The measured shape is one step
     back: a0fb5cc8e0 was the value at b79315a31c, 5f577b9613 replaced it with
     0a42c2ee7d, and 3e7d55ce47 put a0fb5cc8e0 straight back --
-    `compare_baseline_files(0a42c2ee7d, a0fb5cc8e0)` measures 4 raises, so the
-    carve-out really does fire for it. Without it, undoing a revert would demand
-    a fresh authorization for a raise nobody re-introduced.
+    `compare_baseline_files(0a42c2ee7d, a0fb5cc8e0)` measured 4 raises while size
+    was still ratcheted, so the carve-out really did fire for it. Without it,
+    undoing a revert would demand a fresh authorization for a raise nobody
+    re-introduced.
 
     NOT "a blob this path ever carried", and not "already reviewed". Both were
     wrong and this class once said both. The images that motivated this task
@@ -561,26 +456,6 @@ class TestRestoreCarveOut:
         # NAMING the provenance commit is what keeps this from reading as the
         # gate simply failing to notice: a reviewer can go look at it.
         assert absorbed in (result.stdout + result.stderr)
-
-    def test_the_ports_incident_is_refused_naming_both_measures(
-        self, tmp_path: Path
-    ) -> None:
-        repo, _absorbed, _high = self._history_with_a_revert(tmp_path)
-        raised = _incident_report()
-        _ports_rise(raised)
-        repo.write_baseline(raised)
-        repo.stage(metrics.BASELINE_RELPATH)
-
-        result = repo.gate()
-
-        # A blob never recorded at this path, with an empty ledger: the
-        # 0b04534c7b case, which reached main unexamined.
-        assert result.returncode == 1, result.stdout + result.stderr
-        message = result.stderr
-        assert _PORTS in message
-        assert 'lines' in message and 'prose_lines' in message
-        assert '255' in message and '274' in message
-        assert '47' in message and '59' in message
 
     def test_a_blob_one_byte_off_the_historical_one_is_refused(
         self, tmp_path: Path
@@ -624,7 +499,7 @@ class TestRestoreCarveOut:
         self, tmp_path: Path
     ) -> None:
         repo, _absorbed, _high = self._history_with_a_revert(tmp_path)
-        repo.write_baseline(_report_with(_lower_lines))
+        repo.write_baseline(_report_with(_lower_cognitive))
         repo.stage(metrics.BASELINE_RELPATH)
 
         result = repo.gate()
@@ -644,6 +519,54 @@ class TestRestoreCarveOut:
         assert result.stdout == '' and result.stderr == ''
 
 
+class TestSizeOnlyMovesPassTheGate:
+    """Size is measured and stored, never ratcheted, so it never needs authorizing.
+
+    PRD plans/review-all-s25-scripts-instruments-prd.md D10. The gate delegates
+    every comparison to the instrument, so these pin that the commit-time face
+    inherited the change rather than keeping a size rule of its own.
+    """
+
+    def test_the_ports_incident_shape_is_no_longer_a_raise(self, tmp_path: Path) -> None:
+        # The 0b04534c7b shape: lines and prose up, nothing structural.
+        repo = _Repo.seeded(tmp_path, report=_incident_report())
+        raised = _incident_report()
+        _ports_rise(raised)
+        repo.write_baseline(raised)
+        repo.stage(metrics.BASELINE_RELPATH)
+
+        result = repo.gate()
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.stderr == ''
+
+    def test_a_structural_rise_beside_a_size_rise_is_refused_naming_only_it(
+        self, tmp_path: Path
+    ) -> None:
+        def grow_and_import(report: dict) -> None:
+            _grow_a_py_size(report)
+            report['files']['a.py']['function_local_imports'] = 4
+
+        repo = _Repo.seeded(tmp_path)
+        repo.write_baseline(_report_with(grow_and_import))
+        repo.stage(metrics.BASELINE_RELPATH)
+
+        result = repo.gate()
+
+        assert result.returncode == 1, result.stdout + result.stderr
+        assert 'function_local_imports rose 3 -> 4' in result.stderr
+        assert 'lines rose' not in result.stderr
+
+    def test_a_size_only_excess_over_both_parents_passes(self, tmp_path: Path) -> None:
+        repo = _Repo.mid_merge(tmp_path, theirs=_with_a_py('lines', 1005))
+        repo.write_baseline(_with_a_py('lines', 1009))
+        repo.stage(metrics.BASELINE_RELPATH)
+
+        result = repo.gate()
+
+        assert result.returncode == 0, result.stdout + result.stderr
+
+
 class TestLedgerIsAppendOnlyAtTheGate:
     """The arm where the LEDGER moves, whether or not the baseline did.
 
@@ -659,14 +582,14 @@ class TestLedgerIsAppendOnlyAtTheGate:
     def _with_history(tmp_path: Path) -> tuple[_Repo, str]:
         repo = _Repo.seeded(tmp_path)
         history = repo.write_entry(
-            _record([metrics.Violation.rose('lines', 'a.py', 990, 1000)], '5485')
+            record([metrics.Violation.rose('lines', 'a.py', 990, 1000)], '5485')
         )
         repo.commit_all('record a historical raise')
         return repo, history
 
     def test_adding_an_entry_alone_is_clean(self, tmp_path: Path) -> None:
         repo, _history = self._with_history(tmp_path)
-        repo.write_entry(_record([], '5722'))
+        repo.write_entry(record([], '5722'))
         repo.stage(metrics.LEDGER_DIR_RELPATH)
 
         result = repo.gate()
@@ -716,8 +639,8 @@ class TestLedgerIsAppendOnlyAtTheGate:
         # TAKES PRECEDENCE, because nothing else in a commit can excuse it.
         repo, history = self._with_history(tmp_path)
         repo.git('rm', '--quiet', '--', history)
-        repo.write_baseline(_report_with(_raise_lines))
-        repo.write_entry(_a_py_lines_raise(1000, 1005, '5722'))
+        repo.write_baseline(_report_with(_raise_cognitive))
+        repo.write_entry(a_py_cognitive_raise(120, 125, '5722'))
         repo.stage(metrics.BASELINE_RELPATH, metrics.LEDGER_DIR_RELPATH)
 
         result = repo.gate()
@@ -730,7 +653,7 @@ class TestLedgerIsAppendOnlyAtTheGate:
         [
             pytest.param('{"measures": ', 'not valid JSON', id='truncated'),
             pytest.param(
-                metrics.render_entry(_record([], '5722')), 'not named for its content',
+                metrics.render_entry(record([], '5722')), 'not named for its content',
                 id='misnamed',
             ),
         ],
@@ -791,7 +714,7 @@ class TestAConflictedMergeLedgerIsAuditedAgainstBothParents:
     ) -> None:
         # THE POINT OF ONE FILE PER ENTRY: two concurrent authorizations used
         # to conflict at the array's tail every time.
-        ours_own, theirs_own = _record([], '5722'), _record([], '3620')
+        ours_own, theirs_own = record([], '5722'), record([], '3620')
         repo = _Repo.mid_merge(
             tmp_path, ours_entries=(ours_own,), theirs_entries=(theirs_own,)
         )
@@ -806,7 +729,7 @@ class TestAConflictedMergeLedgerIsAuditedAgainstBothParents:
         )} == {'5722', '3620'}
 
     def test_a_branch_can_merge_main_again(self, tmp_path: Path) -> None:
-        ours_own, theirs_own = _record([], '5722'), _record([], '3620')
+        ours_own, theirs_own = record([], '5722'), record([], '3620')
         repo = _Repo.mid_merge(
             tmp_path, ours_entries=(ours_own,), theirs_entries=(theirs_own,)
         )
@@ -814,7 +737,7 @@ class TestAConflictedMergeLedgerIsAuditedAgainstBothParents:
         assert first_round.returncode == 0, first_round.stdout + first_round.stderr
         repo.commit_all('merge main')
 
-        repo.merge_main(theirs_entries=(_record([], '3790'),))
+        repo.merge_main(theirs_entries=(record([], '3790'),))
 
         result = repo.gate()
         assert result.returncode == 0, result.stdout + result.stderr
@@ -823,7 +746,7 @@ class TestAConflictedMergeLedgerIsAuditedAgainstBothParents:
         # NOTHING DIFFERS FROM HEAD, which is why a HEAD-only filter never
         # audited this: the resolution kept HEAD's ledger and silently dropped
         # the entry main recorded.
-        repo = _Repo.mid_merge(tmp_path, theirs_entries=(_record([], '3620'),))
+        repo = _Repo.mid_merge(tmp_path, theirs_entries=(record([], '3620'),))
         repo.git('rm', '--quiet', '-r', '-f', '--', metrics.LEDGER_DIR_RELPATH)
 
         result = repo.gate()
@@ -834,21 +757,21 @@ class TestAConflictedMergeLedgerIsAuditedAgainstBothParents:
     def test_an_entry_merge_head_recorded_is_not_a_standing_permission(
         self, tmp_path: Path
     ) -> None:
-        # Main RECORDED 1005 -> 1009 without taking it. Counted as "added vs
+        # Main RECORDED 125 -> 129 without taking it. Counted as "added vs
         # HEAD", that record would license the merge to take the raise -- the
         # standing permission LEDGER_README forbids.
         repo = _Repo.mid_merge(
             tmp_path,
-            theirs=_with_a_py_lines(1005),
-            theirs_entries=(_a_py_lines_raise(1005, 1009, '3620'),),
+            theirs=_with_a_py('cognitive', 125),
+            theirs_entries=(a_py_cognitive_raise(125, 129, '3620'),),
         )
-        repo.write_baseline(_with_a_py_lines(1009))
+        repo.write_baseline(_with_a_py('cognitive', 129))
         repo.stage(metrics.BASELINE_RELPATH)
 
         result = repo.gate()
 
         assert result.returncode == 1, result.stdout + result.stderr
-        assert '1009' in result.stderr
+        assert 'rose 125 -> 129' in result.stderr
 
     def test_a_baseline_merge_head_carries_may_not_be_dropped(
         self, tmp_path: Path
@@ -871,9 +794,9 @@ class TestAConflictedMergeBaselineIsBoundedByBothParents:
     clean file-level merge while the resolver made no choice about the ratchet
     files at all. Against HEAD alone each read as new; against either parent,
     keeping one side's stale value would re-absorb the other side's lowering.
-    The bound is git's own rule per measure: a measure one side moved stands at
-    that side's value, and where both moved, the higher side bounds it. Only
-    entries the merge ITSELF appends cover anything above it.
+    The bound is git's own rule per measure, as
+    scripts/merge_lane_metrics.py::compare_merged_baseline_files defines it.
+    Only entries the merge ITSELF appends cover anything above it.
     """
 
     @staticmethod
@@ -891,9 +814,9 @@ class TestAConflictedMergeBaselineIsBoundedByBothParents:
     def test_the_incident_takes_merge_heads_unrecorded_move_cleanly(
         self, tmp_path: Path
     ) -> None:
-        # Main moved a.py 1000 -> 1005 hook-lessly, with no ledger entry, and
+        # Main moved a.py 120 -> 125 hook-lessly, with no ledger entry, and
         # git's merge carried that move in untouched.
-        repo = _Repo.mid_merge(tmp_path, theirs=_with_a_py_lines(1005))
+        repo = _Repo.mid_merge(tmp_path, theirs=_with_a_py('cognitive', 125))
         baseline = metrics.BASELINE_RELPATH
         assert repo.git('rev-parse', f':{baseline}') == repo.git(
             'rev-parse', f'MERGE_HEAD:{baseline}'
@@ -904,22 +827,22 @@ class TestAConflictedMergeBaselineIsBoundedByBothParents:
         assert result.returncode == 0, result.stdout + result.stderr
 
     def test_exceeding_both_parents_unrecorded_is_refused(self, tmp_path: Path) -> None:
-        repo = _Repo.mid_merge(tmp_path, theirs=_with_a_py_lines(1005))
-        repo.write_baseline(_with_a_py_lines(1009))
+        repo = _Repo.mid_merge(tmp_path, theirs=_with_a_py('cognitive', 125))
+        repo.write_baseline(_with_a_py('cognitive', 129))
         repo.stage(metrics.BASELINE_RELPATH)
 
         result = repo.gate()
 
         assert result.returncode == 1, result.stdout + result.stderr
-        assert 'a.py' in result.stderr and '1009' in result.stderr
+        assert 'a.py' in result.stderr and 'rose 125 -> 129' in result.stderr
         assert metrics.RAISE_REMEDY in result.stderr
 
     def test_a_covering_entry_the_merge_itself_appends_allows_it(
         self, tmp_path: Path
     ) -> None:
-        repo = _Repo.mid_merge(tmp_path, theirs=_with_a_py_lines(1005))
-        repo.write_baseline(_with_a_py_lines(1009))
-        repo.write_entry(_a_py_lines_raise(1005, 1009, '5792'))
+        repo = _Repo.mid_merge(tmp_path, theirs=_with_a_py('cognitive', 125))
+        repo.write_baseline(_with_a_py('cognitive', 129))
+        repo.write_entry(a_py_cognitive_raise(125, 129, '5792'))
         repo.stage(metrics.BASELINE_RELPATH, metrics.LEDGER_DIR_RELPATH)
 
         result = repo.gate()
@@ -930,7 +853,7 @@ class TestAConflictedMergeBaselineIsBoundedByBothParents:
         self, tmp_path: Path
     ) -> None:
         # Clean against HEAD, which is why a HEAD-only audit let it through.
-        repo = _Repo.mid_merge(tmp_path, theirs=_with_a_py_lines(995))
+        repo = _Repo.mid_merge(tmp_path, theirs=_with_a_py('cognitive', 115))
         repo.git('checkout', 'HEAD', '--', metrics.BASELINE_RELPATH)
 
         result = repo.gate()
@@ -944,7 +867,7 @@ class TestAConflictedMergeBaselineIsBoundedByBothParents:
         # The single-parent restore carve-out reads this as "undoing the last
         # change": the seed blob IS the path's previous value in HEAD's history.
         # In a merge it discards HEAD's own lowering, so it must not be asked.
-        repo = _Repo.mid_merge(tmp_path, ours=_with_a_py_lines(995))
+        repo = _Repo.mid_merge(tmp_path, ours=_with_a_py('cognitive', 115))
         repo.write_baseline(synthetic_report())
         repo.stage(metrics.BASELINE_RELPATH)
         baseline = metrics.BASELINE_RELPATH
@@ -961,38 +884,40 @@ class TestAConflictedMergeBaselineIsBoundedByBothParents:
         self, tmp_path: Path
     ) -> None:
         repo = _Repo.mid_merge(
-            tmp_path, ours=_with_a_py_lines(990), theirs=_with_a_py_lines(1005)
+            tmp_path, ours=_with_a_py('cognitive', 110), theirs=_with_a_py('cognitive', 125)
         )
-        repo.write_baseline(_with_a_py_lines(1005))
+        repo.write_baseline(_with_a_py('cognitive', 125))
         repo.stage(metrics.BASELINE_RELPATH)
 
         result = repo.gate()
 
         assert result.returncode == 0, result.stdout + result.stderr
 
-    def test_two_recorded_raises_of_one_measure_need_the_merges_own_entry(
-        self, tmp_path: Path
-    ) -> None:
-        # Each side RECORDED its raise of a.py, and the honest merge holds both:
-        # 1008. The bound is the higher side, not the sum -- a sum would refuse
-        # two sides that removed overlapping code -- so the excess is the
-        # merge's own raise, and only its own `--authorize-raise` covers it.
+    def test_two_recorded_raises_of_one_measure_compose(self, tmp_path: Path) -> None:
+        # Each side RECORDED its raise of a.py, and the honest merge holds both.
         repo = _Repo.mid_merge(
             tmp_path,
-            ours=_with_a_py_lines(1005),
-            theirs=_with_a_py_lines(1003),
-            ours_entries=(_a_py_lines_raise(1000, 1005, '5722'),),
-            theirs_entries=(_a_py_lines_raise(1000, 1003, '3620'),),
+            ours=_with_a_py('cognitive', 125),
+            theirs=_with_a_py('cognitive', 123),
+            ours_entries=(a_py_cognitive_raise(120, 125, '5722'),),
+            theirs_entries=(a_py_cognitive_raise(120, 123, '3620'),),
         )
-        repo.write_baseline(_with_a_py_lines(1008))
+        repo.write_baseline(_with_a_py('cognitive', 128))
+        repo.stage(metrics.BASELINE_RELPATH)
+
+        composed = repo.gate()
+
+        assert composed.returncode == 0, composed.stdout + composed.stderr
+
+        repo.write_baseline(_with_a_py('cognitive', 129))
         repo.stage(metrics.BASELINE_RELPATH)
 
         refused = repo.gate()
 
         assert refused.returncode == 1, refused.stdout + refused.stderr
-        assert '1005' in refused.stderr and '1008' in refused.stderr
+        assert 'rose 128 -> 129' in refused.stderr
 
-        repo.write_entry(_a_py_lines_raise(1005, 1008, '5792'))
+        repo.write_entry(a_py_cognitive_raise(128, 129, '5792'))
         repo.stage(metrics.LEDGER_DIR_RELPATH)
 
         authorized = repo.gate()
@@ -1002,18 +927,17 @@ class TestAConflictedMergeBaselineIsBoundedByBothParents:
     def test_the_refusal_names_the_workaround_and_the_workaround_passes(
         self, tmp_path: Path
     ) -> None:
-        # Both sides raised a.py; the composed 1008 (what the ratchet-baseline
-        # driver writes) is above the higher side. The write gate records
-        # nothing over a file already holding 1008, so the recipe the refusal
-        # prints is: take ours back, then authorize the rise from it.
+        # Both sides raised a.py and the resolver's 129 exceeds even the composed
+        # 128. The recipe the refusal prints is: take ours back, then authorize
+        # the rise from it.
         repo = _Repo.mid_merge(
             tmp_path,
-            ours=_with_a_py_lines(1005),
-            theirs=_with_a_py_lines(1003),
-            ours_entries=(_a_py_lines_raise(1000, 1005, '5722'),),
-            theirs_entries=(_a_py_lines_raise(1000, 1003, '3620'),),
+            ours=_with_a_py('cognitive', 125),
+            theirs=_with_a_py('cognitive', 123),
+            ours_entries=(a_py_cognitive_raise(120, 125, '5722'),),
+            theirs_entries=(a_py_cognitive_raise(120, 123, '3620'),),
         )
-        repo.write_baseline(_with_a_py_lines(1008))
+        repo.write_baseline(_with_a_py('cognitive', 129))
         repo.stage(metrics.BASELINE_RELPATH)
 
         refused = repo.gate()
@@ -1024,8 +948,8 @@ class TestAConflictedMergeBaselineIsBoundedByBothParents:
         repo.git('checkout', 'HEAD', '--', metrics.BASELINE_RELPATH)
         written = metrics.write_baseline(
             repo.root / metrics.BASELINE_RELPATH,
-            _with_a_py_lines(1008),
-            authorization=metrics.RaiseAuthorization(task_id='5792', reason='both sides'),
+            _with_a_py('cognitive', 129),
+            authorization=metrics.RaiseAuthorization(task_id='5792', reason='beyond both sides'),
             ledger=repo.root / metrics.LEDGER_DIR_RELPATH,
         )
         assert written.record is not None
@@ -1040,9 +964,9 @@ class TestAConflictedMergeBaselineIsBoundedByBothParents:
     ) -> None:
         # No common ancestor: git merges such histories against the empty tree.
         repo = self._unrelated_mid_merge(
-            tmp_path, ours=synthetic_report(), theirs=_with_a_py_lines(1005)
+            tmp_path, ours=synthetic_report(), theirs=_with_a_py('cognitive', 125)
         )
-        repo.write_baseline(_with_a_py_lines(1005))
+        repo.write_baseline(_with_a_py('cognitive', 125))
         repo.stage(metrics.BASELINE_RELPATH)
 
         result = repo.gate()
@@ -1056,13 +980,13 @@ class TestAConflictedMergeBaselineIsBoundedByBothParents:
         # file, so the single-parent arm has nothing to compare and would pass
         # ANY staged baseline as a first write.
         repo = _Repo.mid_merge(tmp_path, ours=_Baseline.REMOVED)
-        repo.write_baseline(_with_a_py_lines(1009))
+        repo.write_baseline(_with_a_py('cognitive', 129))
         repo.stage(metrics.BASELINE_RELPATH)
 
         result = repo.gate()
 
         assert result.returncode == 1, result.stdout + result.stderr
-        assert '1009' in result.stderr
+        assert 'rose 120 -> 129' in result.stderr
 
     def test_a_head_without_a_baseline_may_take_merge_heads(
         self, tmp_path: Path
@@ -1095,11 +1019,8 @@ class TestAConflictedMergeBaselineIsBoundedByBothParents:
 _WIRED_FILES = (
     'hooks/pre-commit',
     'hooks/project-checks',
-    'scripts/merge_lane_metrics.py',
-    'scripts/source_measures.py',
-    'scripts/check_staged_ratchet_raise.py',
-    'scripts/_checkout.py',
-    'pyproject.toml',
+    metrics.COMMIT_GATE_RELPATH,
+    *GATE_IMPORT_CLOSURE,
 )
 
 
@@ -1128,11 +1049,7 @@ def _install_real_hooks(repo: _Repo) -> None:
     The commit that installs them already runs them, harmlessly: it stages no
     ratchet artifact, and it must be made off main.
     """
-    for relpath in _WIRED_FILES:
-        target = repo.root / relpath
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(_REPO_ROOT / relpath, target)
-        target.chmod(0o755)
+    repo.install_from_checkout(*_WIRED_FILES)
     repo.git('config', 'core.hooksPath', 'hooks')
     repo.commit_all('install the real hooks and the instrument')
 
@@ -1142,7 +1059,9 @@ class TestTheHookActuallyRunsTheGate:
 
     Both real incidents are MERGE commits onto main ("Merge task/5485 into
     main", "Merge task/5675 into main"), and main is advanced by the merge
-    worker with `git update-ref`, which runs no hooks at all. Raises are
+    worker with `git update-ref`, which runs no commit hooks (its move is
+    audited by hooks/reference-transaction, pinned in
+    test_merge_lane_ratchet_advance_gate.py). Raises are
     INTRODUCED by commits on task branches, so that is where a commit-time gate
     has to bite -- and until this task, hooks/pre-commit returned 0 on every
     branch that is not main, before project-checks was ever reached.
@@ -1153,15 +1072,15 @@ class TestTheHookActuallyRunsTheGate:
     ) -> None:
         repo = _hook_repo(tmp_path)
         before = repo.git('rev-parse', 'HEAD')
-        repo.write_baseline(_report_with(_raise_lines))
+        repo.write_baseline(_report_with(_raise_cognitive))
         repo.stage(metrics.BASELINE_RELPATH)
 
         result = repo.attempt_commit('absorb a rise nobody recorded')
 
         assert result.returncode != 0
         output = result.stdout + result.stderr
-        assert 'lines' in output and 'a.py' in output
-        assert '1000' in output and '1005' in output
+        assert 'cognitive' in output and 'a.py' in output
+        assert 'rose 120 -> 125' in output
         assert metrics.RAISE_REMEDY in output
         # It really REFUSED the commit rather than merely printing at it.
         assert repo.git('rev-parse', 'HEAD') == before
@@ -1170,13 +1089,24 @@ class TestTheHookActuallyRunsTheGate:
         self, tmp_path: Path
     ) -> None:
         repo = _hook_repo(tmp_path)
-        repo.write_baseline(_report_with(_raise_lines))
-        repo.write_entry(_a_py_lines_raise(1000, 1005, '5722'))
+        repo.write_baseline(_report_with(_raise_cognitive))
+        repo.write_entry(a_py_cognitive_raise(120, 125, '5722'))
         repo.stage(metrics.BASELINE_RELPATH, metrics.LEDGER_DIR_RELPATH)
 
         result = repo.attempt_commit('authorize a net-additive raise')
 
         assert result.returncode == 0, result.stdout + result.stderr
+
+    def test_a_size_only_rise_commits_on_a_task_branch(self, tmp_path: Path) -> None:
+        repo = _hook_repo(tmp_path)
+        before = repo.git('rev-parse', 'HEAD')
+        repo.write_baseline(_report_with(_grow_a_py_size))
+        repo.stage(metrics.BASELINE_RELPATH)
+
+        result = repo.attempt_commit('grow a.py without growing its structure')
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert repo.git('rev-parse', 'HEAD') != before
 
     def test_an_unrelated_commit_never_spawns_the_auditor(
         self, tmp_path: Path
@@ -1194,7 +1124,7 @@ class TestTheHookActuallyRunsTheGate:
 
     def test_a_fall_commits_cleanly_on_a_task_branch(self, tmp_path: Path) -> None:
         repo = _hook_repo(tmp_path)
-        repo.write_baseline(_report_with(_lower_lines))
+        repo.write_baseline(_report_with(_lower_cognitive))
         repo.stage(metrics.BASELINE_RELPATH)
 
         result = repo.attempt_commit('lower a measure')
@@ -1216,7 +1146,7 @@ class TestTheHookAuditsTheCommitThatFinishesAConflictedMerge:
         self, tmp_path: Path
     ) -> None:
         repo = _Repo.mid_merge(
-            tmp_path, theirs=_with_a_py_lines(1005), before_merge=_install_real_hooks
+            tmp_path, theirs=_with_a_py('cognitive', 125), before_merge=_install_real_hooks
         )
         before = repo.git('rev-parse', 'HEAD')
 
@@ -1235,7 +1165,7 @@ class TestTheHookAuditsTheCommitThatFinishesAConflictedMerge:
         # Byte-identical to HEAD, so a filter listing staged artifacts against
         # HEAD alone never spawns the auditor and the commit lands.
         repo = _Repo.mid_merge(
-            tmp_path, theirs=_with_a_py_lines(995), before_merge=_install_real_hooks
+            tmp_path, theirs=_with_a_py('cognitive', 115), before_merge=_install_real_hooks
         )
         repo.git('checkout', 'HEAD', '--', metrics.BASELINE_RELPATH)
         before = repo.git('rev-parse', 'HEAD')
@@ -1303,9 +1233,9 @@ class TestTheCarveOutIsOneStepBack:
 
     @staticmethod
     def _image(n: int) -> dict:
-        """A distinct baseline image, each raising `lines` above the last."""
+        """A distinct baseline image: a.py's `cognitive` at 120 + *n*."""
         return _report_with(lambda report: report['files']['a.py'].__setitem__(
-            'lines', 1000 + n
+            'cognitive', 120 + n
         ))
 
     @classmethod
@@ -1348,7 +1278,7 @@ class TestTheCarveOutIsOneStepBack:
         assert result.returncode == 1, result.stdout + result.stderr
         # It refuses through the ordinary unrecorded-raise arm, so the message
         # names what rose and how to authorize it.
-        assert 'lines' in result.stderr and 'a.py' in result.stderr
+        assert 'cognitive' in result.stderr and 'a.py' in result.stderr
         assert metrics.RAISE_REMEDY in result.stderr
 
     def test_a_deletion_is_not_a_span_to_reach_across(
@@ -1382,10 +1312,10 @@ class TestTheCarveOutIsOneStepBack:
         Measured on this repo's own history: `git rev-list --full-history` over
         the baseline shows blob a0fb5cc8e0 at b79315a31c, then 0a42c2ee7d
         introduced by 5f577b9613 (task 5668), then a0fb5cc8e0 restored by
-        3e7d55ce47. `compare_baseline_files(0a42c2ee7d, a0fb5cc8e0)` measures 4
-        raises -- conftest.py lines 1172->1187, prose_lines 752->770, and both
-        derived totals -- so the carve-out really does fire for it, and
-        narrowing the rule must not take that away.
+        3e7d55ce47. `compare_baseline_files(0a42c2ee7d, a0fb5cc8e0)` measured 4
+        raises while size was still ratcheted -- conftest.py lines 1172->1187,
+        prose_lines 752->770, and both derived totals -- so the carve-out really
+        did fire for it, and narrowing the rule must not take that away.
         """
         # PREVIOUS IS THE HIGHER IMAGE, matching the real revert: 5f577b9613
         # LOWERED the baseline and 3e7d55ce47 put the higher one back, so the
@@ -1415,9 +1345,9 @@ class TestTheCarveOutIsOneStepBack:
         result = repo.gate()
 
         assert result.returncode == 0, result.stderr
-        assert 'lines' in result.stdout
+        assert 'cognitive' in result.stdout
         assert 'a.py' in result.stdout
-        assert '1009' in result.stdout
+        assert '129' in result.stdout
 
 
 
@@ -1462,9 +1392,9 @@ class TestTheLedgerSplitCommit:
     @staticmethod
     def _history() -> tuple[dict, dict, dict]:
         return (
-            _a_py_lines_raise(990, 995, '5485'),
-            _a_py_lines_raise(995, 1000, '5675'),
-            _record([], '3620'),
+            a_py_cognitive_raise(110, 115, '5485'),
+            a_py_cognitive_raise(115, 120, '5675'),
+            record([], '3620'),
         )
 
     def test_an_exact_split_passes(self, tmp_path: Path) -> None:
@@ -1514,8 +1444,8 @@ class TestTheLedgerSplitCommit:
     ) -> None:
         repo = self._with_array(tmp_path, *self._history())
         self._split(repo)
-        fresh = repo.write_entry(_a_py_lines_raise(1000, 1005, '7298'))
-        repo.write_baseline(_report_with(_raise_lines))
+        fresh = repo.write_entry(a_py_cognitive_raise(120, 125, '7298'))
+        repo.write_baseline(_report_with(_raise_cognitive))
         repo.git('add', '-A')
 
         result = repo.gate()
@@ -1528,8 +1458,8 @@ class TestTheLedgerSplitCommit:
         # rebased array carries one entry more.
         first, second, third = self._history()
         repo = self._with_array(tmp_path, first, second, third)
-        for record in (first, second):
-            metrics.append_authorization(repo.root / metrics.LEDGER_DIR_RELPATH, record)
+        for entry in (first, second):
+            metrics.append_authorization(repo.root / metrics.LEDGER_DIR_RELPATH, entry)
 
         split = self._split(repo)
         repo.git('add', '-A')
@@ -1635,8 +1565,8 @@ class TestANewEntryIsAttributedToTheBranchsTask:
 
     @staticmethod
     def _raise_recorded_for(repo: _Repo, task_id: str) -> None:
-        repo.write_baseline(_report_with(_raise_lines))
-        repo.write_entry(_a_py_lines_raise(1000, 1005, task_id))
+        repo.write_baseline(_report_with(_raise_cognitive))
+        repo.write_entry(a_py_cognitive_raise(120, 125, task_id))
         repo.stage(metrics.BASELINE_RELPATH, metrics.LEDGER_DIR_RELPATH)
 
     @staticmethod
@@ -1732,8 +1662,8 @@ class TestANewEntryIsAttributedToTheBranchsTask:
         # The shape that used to cover a raise: hand-written, its measures
         # right, its attribution empty.
         repo = _Repo.seeded(tmp_path)
-        repo.write_baseline(_report_with(_raise_lines))
-        repo.write_entry({**_a_py_lines_raise(1000, 1005, '5722'), field: value})
+        repo.write_baseline(_report_with(_raise_cognitive))
+        repo.write_entry({**a_py_cognitive_raise(120, 125, '5722'), field: value})
         repo.stage(metrics.BASELINE_RELPATH, metrics.LEDGER_DIR_RELPATH)
 
         result = repo.gate()
@@ -1752,7 +1682,7 @@ class TestANewEntryIsAttributedToTheBranchsTask:
 
     def test_an_entry_recorded_without_a_raise_is_checked_too(self, tmp_path: Path) -> None:
         repo = _Repo.seeded(tmp_path)
-        repo.write_entry(_record([], '9999'))
+        repo.write_entry(record([], '9999'))
         repo.stage(metrics.LEDGER_DIR_RELPATH)
 
         result = repo.gate()

@@ -1,8 +1,9 @@
 """Measure the stale status-snapshot sweep over the complete live corpus. (task 4851)
 
 Answers three questions about
-``fused_memory/reconciliation/stale_status_snapshot_edge_sweep.py`` with one
-read per project, and writes the answers to ONE committed artifact pair —
+``fused_memory/reconciliation/stale_status_snapshot_edge_sweep.py`` and its
+extraction module ``fused_memory/reconciliation/status_snapshot_extraction.py``
+with one read per project, and writes the answers to ONE committed artifact pair —
 the only place their figures live:
 
 - #4387 COVERAGE. How much of what the sweep could retire does it retire?
@@ -65,30 +66,33 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from shared.cli_boundary import LoudArgumentParser, run_cli
+
 # The probe IMPORTS what it measures rather than re-spelling it, so a code
 # change can never leave it measuring a stale spelling (the
 # measure_plural_enum_guard_recall.py precedent).
-_SRC = Path(__file__).resolve().parent.parent / 'src'
-if str(_SRC) not in sys.path:
+if str(_SRC := Path(__file__).resolve().parent.parent / 'src') not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from shared.task_statuses import TaskStatus  # noqa: E402
+from shared.task_statuses import TaskStatus
 
-from fused_memory.backends.graphiti_client import PagedRead  # noqa: E402
-from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (  # noqa: E402
+from fused_memory.backends.graphiti_client import PagedRead
+from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (
+    flatten_dedup_edges,
+    select_stale_status_snapshot_edges,
+)
+from fused_memory.reconciliation.status_snapshot_extraction import (
     CLAUSE_BREAK_CHARS,
     SNAPSHOT_STATUS_RE,
     extract_marker_task_ids,
-    flatten_dedup_edges,
     is_token_internal_break,
-    select_stale_status_snapshot_edges,
 )
-from fused_memory.reconciliation.task_filter import (  # noqa: E402
+from fused_memory.reconciliation.task_filter import (
     INACTIVE_TASK_STATUSES,
     TASK_REF_RE,
 )
-from fused_memory.utils.target_store_preflight import (  # noqa: E402
-    TargetStoreMissing,
+from fused_memory.utils.target_store_preflight import (
+    TargetStoreUnpopulated,
     assert_task_store_populated,
 )
 
@@ -194,7 +198,7 @@ _KNOWN_STATUSES = frozenset(TaskStatus)
 
 
 def ids_by_marker(fact: str) -> dict[str, set[int]]:
-    """Per-marker ids, through the sweep's own per-marker seam."""
+    """Per-marker ids, through the extraction module's own per-marker seam."""
     return {
         marker: extract_marker_task_ids(fact, adjective, transitive)
         for marker, (adjective, transitive, _) in _MARKERS.items()
@@ -339,8 +343,22 @@ def build_report(
     return Report(measured_at=measured_at, projects=tuple(projects), triage_note=triage_note)
 
 
+EXIT_RUN_FAILED = 1
+"""The run did not produce a complete canonical report: an enumeration was
+incomplete so only the ``.incomplete`` sidecars were written, the artifact
+pair could not be written, or stdout failed.
+
+Agrees with ``shared.cli_boundary.EXIT_STDOUT_FAILED``.
+"""
+
+EXIT_BAD_INPUT = 2
+"""Nothing can be measured until the input is fixed: a ``--project`` root
+holds no populated task store, or ``--triage-note`` could not be read.
+Argparse's own usage error also exits 2."""
+
+
 def exit_code(report: Report) -> int:
-    return 0 if report.complete else 1
+    return 0 if report.complete else EXIT_RUN_FAILED
 
 
 def _project_payload(project: ProjectMeasurement) -> dict[str, Any]:
@@ -473,8 +491,8 @@ def _parse_project(value: str) -> tuple[str, str]:
     return graph, root
 
 
-def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+def _build_parser() -> LoudArgumentParser:
+    parser = LoudArgumentParser(
         description='Measure the stale status-snapshot sweep over the live corpus (read-only).',
     )
     parser.add_argument(
@@ -497,6 +515,13 @@ async def _main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     args = _build_parser().parse_args(argv)
     projects: list[tuple[str, str]] = args.projects or [('dark_factory', str(_REPO_ROOT))]
+    try:
+        # Only the note read is converted; see
+        # shared/src/shared/cli_boundary.py::run_cli.
+        triage_note = args.triage_note.read_text() if args.triage_note else None
+    except OSError as exc:
+        logger.error('cannot read --triage-note %s: %s', args.triage_note, exc)
+        return EXIT_BAD_INPUT
 
     from datetime import UTC, datetime  # noqa: PLC0415
 
@@ -507,9 +532,9 @@ async def _main(argv: list[str] | None = None) -> int:
     for _graph, root in projects:
         try:
             assert_task_store_populated(root, operation='measure_stale_status_snapshot_sweep')
-        except TargetStoreMissing as refusal:
+        except TargetStoreUnpopulated as refusal:
             logger.error('%s', refusal)
-            return 2
+            return EXIT_BAD_INPUT
 
     measured_at = datetime.now(UTC).isoformat()
     config = FusedMemoryConfig()
@@ -537,9 +562,16 @@ async def _main(argv: list[str] | None = None) -> int:
         await tasks.close()
         await graphiti.close()
 
-    triage_note = args.triage_note.read_text() if args.triage_note else None
     report = build_report(measured, measured_at=measured_at, triage_note=triage_note)
-    written = write_artifacts(report, args.json_out, args.md_out)
+    try:
+        # Only the artifact write is converted; see
+        # shared/src/shared/cli_boundary.py::run_cli.
+        written = write_artifacts(report, args.json_out, args.md_out)
+    except OSError as exc:
+        logger.error(
+            'cannot write the report artifacts (%s, %s): %s', args.json_out, args.md_out, exc,
+        )
+        return EXIT_RUN_FAILED
     logger.info('complete=%s written=%s', report.complete, [str(p) for p in written])
     for project in report.projects:
         if not project.complete:
@@ -555,4 +587,4 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    sys.exit(run_cli(main))

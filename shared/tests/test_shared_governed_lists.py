@@ -148,10 +148,7 @@ CONFIG_DIR_ARCHIVAL_EXCEPTIONS = governed_exceptions(
     'being archived first, either by design or as a recorded gap.',
     _occurrence_keys((site['path'], site['qualname']) for site in _UNARCHIVED_CONFIG_DIR_SITES),
     default=Policy('inv12-config-dir-unarchived-by-design'),
-    default_covers=3,
-    dispositions={
-        'fused-memory/src/fused_memory/middleware/task_curator.py::TaskCurator._transcript_config_dir': Debt(TaskRef(6008)),
-    },
+    default_covers=4,
 )
 
 BLESSED_TASK_METADATA_KEYS = governed_exceptions(
@@ -180,6 +177,7 @@ RUFF_CONFIG_SUPPRESSIONS = governed_exceptions(
     dispositions={
         'tool.ruff.lint.ignore::E501': Policy('inv12-ruff-e501-line-length'),
         'orchestrator/pyproject.toml::tool.ruff.lint.per-file-ignores::tests/**/*.py::F811': Debt(TaskRef(7137)),
+        'orchestrator/pyproject.toml::tool.ruff.lint.per-file-ignores::src/**/*.py::TID251': Debt(TaskRef(8622)),
     },
 )
 
@@ -203,15 +201,8 @@ LOOP_BLOCKING_LEDGER = governed_exceptions(
     default=Debt(TaskRef(5270)),
     default_covers=28,
     dispositions={
-        'fused-memory/src/fused_memory/reconciliation/backlog_policy.py::BacklogPolicy.on_judge_unhalt::8f53c74a5d76': Debt(TaskRef(5270)),
-        'fused-memory/src/fused_memory/reconciliation/backlog_policy.py::BacklogPolicy.on_judge_unhalt::08a103635fd7': Debt(TaskRef(5270)),
-        'fused-memory/src/fused_memory/reconciliation/backlog_policy.py::BacklogPolicy._maybe_write_escalation::0d761c10e563': Debt(TaskRef(5270)),
-        'fused-memory/src/fused_memory/reconciliation/backlog_policy.py::BacklogPolicy.on_judge_unhalt::cb226477b1bf': Debt(TaskRef(6086)),
-        'fused-memory/src/fused_memory/reconciliation/backlog_policy.py::BacklogPolicy.on_judge_unhalt::48269c8edbbd': Debt(TaskRef(6086)),
-        'fused-memory/src/fused_memory/reconciliation/event_queue.py::EventQueue.recover::2f9ae36b2bc7': Debt(TaskRef(6085)),
-        'fused-memory/src/fused_memory/reconciliation/event_queue.py::EventQueue.close::c8191bbaf10a': Debt(TaskRef(6085)),
-        'fused-memory/src/fused_memory/reconciliation/event_queue.py::EventQueue._commit_with_retry::93d589ee10dd': Debt(TaskRef(6085)),
-        'fused-memory/src/fused_memory/reconciliation/event_queue.py::EventQueue._enqueue_on_loop::f46e02910e17': Debt(TaskRef(6085)),
+        'fused-memory/src/fused_memory/mcp_tools/scheduler_state.py::read_scheduler_events::14947dd93734': Debt(TaskRef(7572)),
+        'fused-memory/src/fused_memory/middleware/task_curator.py::TaskCurator._invoke_curator::2be781b317a0': Debt(TaskRef(7572)),
         'fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._recover_one_run::f05da1451b63': Debt(TaskRef(5270)),
         'fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._persist_stage_reports_then_gc_config_dir::f05da1451b63': Debt(TaskRef(5270)),
         'fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._recover_stale_runs::0787c60051a4': Debt(TaskRef(5270)),
@@ -230,8 +221,9 @@ LOOP_BLOCKING_LEDGER = governed_exceptions(
         'fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py::_write_task_count_snapshot::e08ddda37175': Debt(TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ')),
         'fused-memory/src/fused_memory/reconciliation/stale_priority_override_edge_sweep.py::read_live_override_state::7ebd882c849b': Debt(TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ')),
         'fused-memory/src/fused_memory/reconciliation/targeted.py::TargetedReconciler._sweep_cancelled_descendants::b9609c7cf5b4': Debt(TicketRef('tkt_0RT7RKWJG17W03JRC947R8FZZN')),
-        'fused-memory/src/fused_memory/reconciliation/verify.py::CodebaseVerifier.verify.read_file::c04bd0d302eb': Debt(TaskRef(5270)),
-        'fused-memory/src/fused_memory/reconciliation/verify.py::CodebaseVerifier.verify.glob_search::29916e02709d': Debt(TaskRef(6088)),
+        'fused-memory/src/fused_memory/server/main.py::run_server::8a884f86a26c': Debt(TaskRef(7572)),
+        'fused-memory/src/fused_memory/server/main.py::run_server::beb5b61c6b9a': Debt(TaskRef(7572)),
+        'fused-memory/src/fused_memory/server/main.py::run_server::43c97372205c': Debt(TaskRef(7572)),
         'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.get_tasks::81d0d2709341': Debt(TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ')),
         'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.get_statuses::81d0d2709341': Debt(TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ')),
         'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.get_external_statuses::81d0d2709341': Debt(TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ')),
@@ -254,7 +246,9 @@ LOOP_BLOCKING_LEDGER = governed_exceptions(
         'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.get_scheduler_state::81d0d2709341': Debt(TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ')),
         'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.get_scheduler_events::81d0d2709341': Debt(TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ')),
         'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.request_park_eviction::81d0d2709341': Debt(TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ')),
+        'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.request_park_eviction::a0b1b5c60eed': Debt(TaskRef(7572)),
         'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.find_tasks_by_metadata::81d0d2709341': Debt(TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ')),
+        'fused-memory/src/fused_memory/services/overreach_shadow.py::OverreachShadowStore.open_read_only::fa698adde643': Debt(TaskRef(7572)),
     },
 )
 

@@ -16,10 +16,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
-from _curator_helpers import curator_returning
+from _curator_helpers import answer_each_with, curator_returning
 from _fm_helpers import poll_until
 
 from fused_memory.backends.task_backend_errors import DuplicateCandidateKeyError
+from fused_memory.middleware.curator_types import CuratorDecision, RewrittenTask
 from fused_memory.middleware.task_creation_journal import (
     TASK_COMBINED_OPERATION,
     TASK_CREATED_OPERATION,
@@ -29,7 +30,6 @@ from fused_memory.middleware.task_creation_journal import (
     read_run_creation_outcomes,
     task_key,
 )
-from fused_memory.middleware.task_curator import CuratorDecision, RewrittenTask
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.middleware.ticket_store import TicketStore
 from fused_memory.reconciliation.event_buffer import EventBuffer
@@ -649,7 +649,7 @@ class TestOrphanRaceJournal:
             return decision
 
         curator = curator_returning()
-        curator.curate = AsyncMock(side_effect=gated_curate)
+        answer_each_with(curator, gated_curate)
         interceptor = build_interceptor(curator)
 
         ticket = await _submit(interceptor)

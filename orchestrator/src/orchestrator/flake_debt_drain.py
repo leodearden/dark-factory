@@ -26,8 +26,8 @@ The drain's own ledger calls run off the event-loop thread (INV-8);
 :func:`~orchestrator.flake_ledger.open_debt`'s internal sqlite stays on it, unchanged,
 bounded by that function's connection count and by 50 calls per pass.
 
-Import discipline: ``flake_ledger`` and ``shared`` only, and ``escalation.models``
-lazily.  Never a lane module or ``git_ops``: the ancestry read arrives through
+Import discipline: ``flake_ledger`` and ``shared`` only, and ``escalation.models`` lazily.
+Never a lane module or ``git_ops``: the ancestry read arrives through
 :class:`AncestryPort`.
 """
 
@@ -41,7 +41,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Final, Protocol
+from typing import TYPE_CHECKING, Any, Final, Protocol
 
 from escalation.categories import EscalationCategory
 from shared.task_statuses import OwnerLiveness, owner_liveness
@@ -51,11 +51,16 @@ from orchestrator.flake_ledger import (
     DUE_ITEM_STALE_AFTER,
     DUE_ITEM_STALE_MINUTES,
     NEVER_WIDEN_A_TIMEOUT,
+    NOT_RECORDED,
+    DebtContext,
     DebtRow,
+    DebtTrigger,
     DueRow,
     DueSummary,
+    FlakeCallSite,
     FlakeLedgerTaskClient,
     delete_due_item,
+    due_item_context,
     fix_contained,
     name_stale_due_items,
     open_debt,
@@ -65,6 +70,9 @@ from orchestrator.flake_ledger import (
     resolving_commit,
     summarize_due,
 )
+
+if TYPE_CHECKING:
+    from escalation.models import EvidenceEntry
 
 logger = logging.getLogger(__name__)
 
@@ -262,14 +270,94 @@ def _cited_commit(row: DebtRow) -> str:
     return row.prior_resolving_commit or '(none recorded)'
 
 
-def _regression_detail(row: DebtRow, *, item: DueRow) -> str:
+def call_site_evidence(call_site: str, *, observed_at: str) -> EvidenceEntry:
+    """The evidence entry naming the call site whose observation re-entered the debt."""
+    return {
+        'observation': f're-entry observed at call site {call_site}',
+        'measured_at': f'observed_at={observed_at}',
+        'ref': f'call_site={call_site}',
+    }
+
+
+@dataclass(frozen=True)
+class RegressionOrigin:
+    """What re-opened a resolved debt, as the regression escalation words it: the clause
+    naming the observation, and its label/value lines in order."""
+
+    clause: str
+    observation: tuple[tuple[str, str], ...]
+
+
+def _merge_gate_origin(item: DueRow, context: DebtContext | None) -> RegressionOrigin:
+    return RegressionOrigin(
+        clause='a merge-gate suppression',
+        observation=(
+            ('observed at merge_sha:', item.head or '(none)'),
+            ('observing task_id:', item.observing_task_id or '(none)'),
+            ('observed_at:', item.observed_at),
+        ),
+    )
+
+
+_LANE_CLAUSES: Final[Mapping[DebtTrigger, str]] = {
+    DebtTrigger.cleared: 'an offline-lane clear',
+    DebtTrigger.recovered: 'an offline-lane recovery',
+}
+
+
+def _offline_lane_origin(item: DueRow, context: DebtContext | None) -> RegressionOrigin:
+    if context is None:
+        return RegressionOrigin(
+            clause='an offline-lane observation',
+            observation=(
+                ('observed at head:', item.head or NOT_RECORDED),
+                ('observed_at:', item.observed_at),
+            ),
+        )
+    return RegressionOrigin(
+        clause=_LANE_CLAUSES[context.trigger],
+        observation=(
+            ('observed at head:', item.head or NOT_RECORDED),
+            ('trigger:', context.trigger.value),
+            ('command:', context.command or NOT_RECORDED),
+            ('pass ids:', ', '.join(context.pass_ids) or NOT_RECORDED),
+            ('observed_at:', item.observed_at),
+        ),
+    )
+
+
+def _neutral_origin(item: DueRow, context: DebtContext | None) -> RegressionOrigin:
+    return RegressionOrigin(
+        clause=f'an observation at call site {item.call_site}',
+        observation=(
+            ('observed at head:', item.head or NOT_RECORDED),
+            ('call site:', item.call_site),
+            ('observed_at:', item.observed_at),
+        ),
+    )
+
+
+#: The regression wording per :class:`FlakeCallSite`, looked up by the due item's call
+#: site spelling; a call site with no row is worded neutrally.
+_REGRESSION_ORIGINS: Final[
+    Mapping[str, Callable[[DueRow, DebtContext | None], RegressionOrigin]]
+] = {
+    FlakeCallSite.merge_gate: _merge_gate_origin,
+    FlakeCallSite.offline_lane: _offline_lane_origin,
+}
+
+
+def _regression_detail(row: DebtRow, *, item: DueRow, context: DebtContext | None) -> str:
     """The escalation detail for *row*'s regression, observed through *item*: every fact a
     human needs to judge whether the prior fix was cosmetic (§5.5), with the fix's
-    commit quoted VERBATIM or stated as not recorded."""
+    commit quoted VERBATIM or stated as not recorded.  The observation's clause and lines
+    are its call site's (:data:`_REGRESSION_ORIGINS`)."""
+    origin = _REGRESSION_ORIGINS.get(item.call_site, _neutral_origin)(item, context)
+    observation = ''.join(f'  {label:<25}{value}\n' for label, value in origin.observation)
     return (
         f'{row.test_id} flaked again after its de-flake fix landed. The flake ledger '
-        f'closed its debt cycle when the de-flake task was observed done, and a '
-        f'merge-gate suppression has now RE-OPENED it: this is cycle {row.open_count} of '
+        f'closed its debt cycle when the de-flake task was observed done, and '
+        f'{origin.clause} has now RE-OPENED it: this is cycle {row.open_count} of '
         f'the same debt, and the fix below did not hold.\n'
         f'\n'
         f'  test:                    {row.test_id}\n'
@@ -279,10 +367,8 @@ def _regression_detail(row: DebtRow, *, item: DueRow) -> str:
         f'the task done, not when the fix merged)\n'
         f'  opened_at:               {row.opened_at}\n'
         f'  open_count:              {row.open_count}\n'
-        f'  observed at merge_sha:   {item.head or "(none)"}\n'
-        f'  observing task_id:       {item.observing_task_id or "(none)"}\n'
-        f'  observed_at:             {item.observed_at}\n'
-        f'\n'
+        + observation
+        + f'\n'
         f"The ledger files this cycle's de-flake task itself, straight after this "
         f'escalation; `orchestrator flake-ledger` shows its owner, `filing pending` while '
         f'the drain still owes the filing, or the unowned breach if no filing is due.\n'
@@ -292,7 +378,7 @@ def _regression_detail(row: DebtRow, *, item: DueRow) -> str:
 
 
 def _escalate_regressed_after_resolution(
-    escalation_queue: Any, row: DebtRow, *, item: DueRow,
+    escalation_queue: Any, row: DebtRow, *, item: DueRow, context: DebtContext | None,
 ) -> None:
     """File the born-at-L2 ``regressed_after_resolution`` escalation for *row*, a test
     that re-entered flake debt after its de-flake task finished (task η).
@@ -309,12 +395,13 @@ def _escalate_regressed_after_resolution(
         logger.warning(
             'flake_debt_drain: %s — test_id=%s re-entered flake debt (cycle %d) after its '
             'fix landed (prior resolving commit %s), but no escalation queue is wired, '
-            'so it is visible only in `orchestrator flake-ledger` (merge_sha=%s, '
+            'so it is visible only in `orchestrator flake-ledger` (call_site=%s, head=%s, '
             'task_id=%s)',
             REGRESSED_AFTER_RESOLUTION,
             row.test_id,
             row.open_count,
             _cited_commit(row),
+            item.call_site,
             item.head,
             item.observing_task_id,
         )
@@ -352,7 +439,7 @@ def _escalate_regressed_after_resolution(
                 f'Flake regressed after its fix: {row.test_id} re-entered flake debt '
                 f'(cycle {row.open_count})'
             ),
-            detail=_regression_detail(row, item=item),
+            detail=_regression_detail(row, item=item, context=context),
             suggested_action=(
                 f'{inspect_the_fix} and judge whether it was cosmetic — a widened '
                 'timeout, a lengthened sleep, an added retry — before the new '
@@ -367,6 +454,7 @@ def _escalate_regressed_after_resolution(
                     'measured_at': f'opened_at={row.opened_at}',
                     'ref': f'prior_resolving_commit={_cited_commit(row)}',
                 },
+                call_site_evidence(item.call_site, observed_at=item.observed_at),
             ],
         )
     )
@@ -540,15 +628,17 @@ async def _settle(
                 return await _delete(db_path, item)
 
     client = _WatchedTaskClient(task_client)
+    context = due_item_context(item)
     row = await open_debt(
         db_path,
         project_id,
         item.test_id,
         task_client=client,
         on_regressed_after_resolution=functools.partial(
-            _escalate_regressed_after_resolution, escalation_queue, item=item,
+            _escalate_regressed_after_resolution, escalation_queue, item=item, context=context,
         ),
         head_contains_fix=None if check is None else check.for_task,
+        context=context,
     )
     if client.failed:
         return DueFailure.TASK_CLIENT_FAILED

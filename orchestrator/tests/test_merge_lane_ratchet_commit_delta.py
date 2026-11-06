@@ -72,7 +72,7 @@ class TestCompareBaselineFiles:
         self, tmp_path: Path
     ) -> None:
         previous, current = self._pair(
-            tmp_path, lambda report: report['files']['a.py'].__setitem__('lines', 1005)
+            tmp_path, lambda report: report['files']['a.py'].__setitem__('cognitive', 125)
         )
 
         raises = metrics.compare_baseline_files(previous, current)
@@ -82,13 +82,13 @@ class TestCompareBaselineFiles:
         # the same raise. The total comes along because it is DERIVED -- moving
         # the mass to a new path is the shape that check exists for.
         assert [_violation_fields(v) for v in raises] == [
-            _violation_fields(metrics.Violation.rose('lines', 'a.py', 1000, 1005)),
-            ('total:lines', metrics.CLUSTER_TOTAL_KEY, 1200, 1205),
+            _violation_fields(metrics.Violation.rose('cognitive', 'a.py', 120, 125)),
+            ('total:cognitive', metrics.CLUSTER_TOTAL_KEY, 150, 155),
         ]
 
     def test_a_fall_is_clean(self, tmp_path: Path) -> None:
         previous, current = self._pair(
-            tmp_path, lambda report: report['files']['a.py'].__setitem__('lines', 995)
+            tmp_path, lambda report: report['files']['a.py'].__setitem__('cognitive', 115)
         )
 
         # Lowering is the point of a ratchet, so it must never need authorizing.
@@ -108,11 +108,39 @@ class TestCompareBaselineFiles:
         # (previous, current), so a crossed call is a live hazard -- and a
         # crossed call reads CLEAN, which is the failure a gate must never have.
         previous, current = self._pair(
-            tmp_path, lambda report: report['files']['a.py'].__setitem__('lines', 1005)
+            tmp_path, lambda report: report['files']['a.py'].__setitem__('cognitive', 125)
         )
 
         assert metrics.compare_baseline_files(previous, current)
         assert metrics.compare_baseline_files(current, previous) == []
+
+    @pytest.mark.parametrize(
+        'mutate',
+        [
+            pytest.param(
+                lambda report: report['files']['a.py'].__setitem__('lines', 1005),
+                id='lines',
+            ),
+            pytest.param(
+                lambda report: report['files']['a.py'].__setitem__('prose_lines', 460),
+                id='prose_lines',
+            ),
+            pytest.param(
+                lambda report: report['files'].__setitem__(
+                    'new.py', blank_file_entry(lines=1500, prose_lines=700)
+                ),
+                id='new-path-at-the-ceiling',
+            ),
+        ],
+    )
+    def test_a_size_only_move_between_images_raises_nothing(
+        self, tmp_path: Path, mutate
+    ) -> None:
+        # PRD plans/review-all-s25-scripts-instruments-prd.md D10: size is
+        # measured and stored, never ratcheted, per path or in the total.
+        previous, current = self._pair(tmp_path, mutate)
+
+        assert metrics.compare_baseline_files(previous, current) == []
 
     def test_a_new_oversized_path_breaches_the_ceiling(self, tmp_path: Path) -> None:
         # Proves ``_check_ceilings`` is reached, not just the four rise arms: a
@@ -167,10 +195,10 @@ class TestCompareMergedBaselineFiles:
     MERGE_HEAD moved is a raise; read against either parent, keeping one side's
     stale value re-absorbs the other side's lowering. The bound is what git does
     to the file text, applied per measure against the merge base: a measure one
-    side moved stands at that side's value, up or down, and where both moved,
-    the higher side bounds it.
+    side moved stands at that side's value, up or down, and one both sides moved
+    is bounded by scripts/merge_lane_metrics.py::_both_moved_bound.
 
-    The seed's numbers: a.py lines 1000, b.py lines 200, total:lines 1200.
+    The seed's numbers: a.py cognitive 120, b.py cognitive 30, total:cognitive 150.
     """
 
     @staticmethod
@@ -208,18 +236,18 @@ class TestCompareMergedBaselineFiles:
     ) -> None:
         # THE INCIDENT'S SHAPE: ours never touched the baseline, so the bound IS
         # theirs' image -- and the reported baseline is the bound, not HEAD's.
-        seed, theirs = synthetic_report(), self._moved(('a.py', 'lines', 1005))
+        seed, theirs = synthetic_report(), self._moved(('a.py', 'cognitive', 125))
 
         assert self._bounded(tmp_path, theirs, base=seed, ours=seed, theirs=theirs) == []
         assert self._bounded(
             tmp_path,
-            self._moved(('a.py', 'lines', 1006)),
+            self._moved(('a.py', 'cognitive', 126)),
             base=seed,
             ours=seed,
             theirs=theirs,
         ) == [
-            ('lines', 'a.py', 1005, 1006),
-            ('total:lines', metrics.CLUSTER_TOTAL_KEY, 1205, 1206),
+            ('cognitive', 'a.py', 125, 126),
+            ('total:cognitive', metrics.CLUSTER_TOTAL_KEY, 155, 156),
         ]
 
     @pytest.mark.parametrize('lowered_by', ['ours', 'theirs'])
@@ -227,9 +255,9 @@ class TestCompareMergedBaselineFiles:
         self, tmp_path: Path, lowered_by: str
     ) -> None:
         # THE CASE EVERY EITHER-PARENT RULE ADMITS. Keeping the unmoved side's
-        # 1000 is clean against that side, and in a conflicted merge on main it
+        # 120 is clean against that side, and in a conflicted merge on main it
         # would land an unrecorded widening.
-        seed, lowered = synthetic_report(), self._moved(('a.py', 'lines', 995))
+        seed, lowered = synthetic_report(), self._moved(('a.py', 'cognitive', 115))
 
         assert self._bounded(
             tmp_path,
@@ -238,51 +266,98 @@ class TestCompareMergedBaselineFiles:
             ours=lowered if lowered_by == 'ours' else seed,
             theirs=lowered if lowered_by == 'theirs' else seed,
         ) == [
-            ('lines', 'a.py', 995, 1000),
-            ('total:lines', metrics.CLUSTER_TOTAL_KEY, 1195, 1200),
+            ('cognitive', 'a.py', 115, 120),
+            ('total:cognitive', metrics.CLUSTER_TOTAL_KEY, 145, 150),
         ]
 
     def test_own_moves_stand_per_measure_not_per_path(self, tmp_path: Path) -> None:
         # Both sides moved a.py, but different MEASURES of it: taking theirs'
-        # whole entry keeps theirs' cognitive lowering and undoes ours' lines one.
-        ours = self._moved(('a.py', 'lines', 995))
+        # whole entry keeps theirs' cognitive lowering and undoes ours'
+        # function_local_imports one.
+        ours = self._moved(('a.py', 'function_local_imports', 2))
         theirs = self._moved(('a.py', 'cognitive', 110))
 
         assert self._bounded(
             tmp_path, theirs, base=synthetic_report(), ours=ours, theirs=theirs
         ) == [
-            ('lines', 'a.py', 995, 1000),
-            ('total:lines', metrics.CLUSTER_TOTAL_KEY, 1195, 1200),
+            ('function_local_imports', 'a.py', 2, 3),
+            ('total:function_local_imports', metrics.CLUSTER_TOTAL_KEY, 3, 4),
         ]
 
-    def test_where_both_sides_moved_a_measure_the_higher_bounds_it(
-        self, tmp_path: Path
+    @pytest.mark.parametrize('raised_by', ['ours', 'theirs'])
+    def test_where_the_sides_moved_a_measure_oppositely_the_higher_side_bounds_it(
+        self, tmp_path: Path, raised_by: str
     ) -> None:
         seed = synthetic_report()
-        ours = self._moved(('a.py', 'lines', 990))
-        theirs = self._moved(('a.py', 'lines', 1005))
+        raised = self._moved(('a.py', 'cognitive', 125))
+        lowered = self._moved(('a.py', 'cognitive', 110))
+        ours, theirs = (raised, lowered) if raised_by == 'ours' else (lowered, raised)
 
-        assert self._bounded(tmp_path, theirs, base=seed, ours=ours, theirs=theirs) == []
+        assert self._bounded(tmp_path, raised, base=seed, ours=ours, theirs=theirs) == []
         assert self._bounded(
             tmp_path,
-            self._moved(('a.py', 'lines', 1006)),
+            self._moved(('a.py', 'cognitive', 126)),
             base=seed,
             ours=ours,
             theirs=theirs,
         ) == [
-            ('lines', 'a.py', 1005, 1006),
-            ('total:lines', metrics.CLUSTER_TOTAL_KEY, 1205, 1206),
+            ('cognitive', 'a.py', 125, 126),
+            ('total:cognitive', metrics.CLUSTER_TOTAL_KEY, 155, 156),
+        ]
+
+    def test_where_both_sides_raised_a_measure_the_raises_compose(
+        self, tmp_path: Path
+    ) -> None:
+        seed = synthetic_report()
+        ours = self._moved(('a.py', 'cognitive', 125))
+        theirs = self._moved(('a.py', 'cognitive', 123))
+
+        assert self._bounded(
+            tmp_path,
+            self._moved(('a.py', 'cognitive', 128)),
+            base=seed,
+            ours=ours,
+            theirs=theirs,
+        ) == []
+        assert self._bounded(
+            tmp_path,
+            self._moved(('a.py', 'cognitive', 129)),
+            base=seed,
+            ours=ours,
+            theirs=theirs,
+        ) == [
+            ('cognitive', 'a.py', 128, 129),
+            ('total:cognitive', metrics.CLUSTER_TOTAL_KEY, 158, 159),
+        ]
+
+    def test_where_both_sides_lowered_a_measure_the_higher_still_bounds_it(
+        self, tmp_path: Path
+    ) -> None:
+        seed = synthetic_report()
+        ours = self._moved(('a.py', 'cognitive', 115))
+        theirs = self._moved(('a.py', 'cognitive', 110))
+
+        assert self._bounded(tmp_path, theirs, base=seed, ours=ours, theirs=theirs) == []
+        assert self._bounded(
+            tmp_path,
+            self._moved(('a.py', 'cognitive', 116)),
+            base=seed,
+            ours=ours,
+            theirs=theirs,
+        ) == [
+            ('cognitive', 'a.py', 115, 116),
+            ('total:cognitive', metrics.CLUSTER_TOTAL_KEY, 145, 146),
         ]
 
     def test_moves_on_different_paths_add_up_in_the_derived_total(
         self, tmp_path: Path
     ) -> None:
         # ONE side moved each path, so each move stands, and the total is
-        # DERIVED from the bound: 1215. A per-measure max of the parents' own
-        # totals would read 1210 and refuse the merge.
-        ours = self._moved(('a.py', 'lines', 1005))
-        theirs = self._moved(('b.py', 'lines', 210))
-        merged = self._moved(('a.py', 'lines', 1005), ('b.py', 'lines', 210))
+        # DERIVED from the bound: 165. A per-measure max of the parents' own
+        # totals would read 160 and refuse the merge.
+        ours = self._moved(('a.py', 'cognitive', 125))
+        theirs = self._moved(('b.py', 'cognitive', 40))
+        merged = self._moved(('a.py', 'cognitive', 125), ('b.py', 'cognitive', 40))
 
         assert self._bounded(
             tmp_path, merged, base=synthetic_report(), ours=ours, theirs=theirs
@@ -292,7 +367,7 @@ class TestCompareMergedBaselineFiles:
         seed, ours = synthetic_report(), synthetic_report()
         del ours['files']['b.py']
 
-        assert ('total:lines', metrics.CLUSTER_TOTAL_KEY, 1000, 1200) in self._bounded(
+        assert ('total:cognitive', metrics.CLUSTER_TOTAL_KEY, 120, 150) in self._bounded(
             tmp_path, seed, base=seed, ours=ours, theirs=seed
         )
 
@@ -302,30 +377,30 @@ class TestCompareMergedBaselineFiles:
         # git's modify/delete conflict: the modification stands.
         ours = synthetic_report()
         del ours['files']['b.py']
-        theirs = self._moved(('b.py', 'lines', 190))
+        theirs = self._moved(('b.py', 'cognitive', 20))
 
         assert self._bounded(
             tmp_path, theirs, base=synthetic_report(), ours=ours, theirs=theirs
         ) == []
 
-    def test_an_absent_base_bounds_each_measure_by_the_higher_parent(
+    def test_an_absent_base_bounds_each_count_by_the_higher_parent(
         self, tmp_path: Path
     ) -> None:
         # No common ancestor, or no baseline at it: git merges such histories
         # against the empty tree, so each side moved every measure it holds.
         ours = synthetic_report()
-        theirs = self._moved(('a.py', 'lines', 1005), ('b.py', 'lines', 190))
+        theirs = self._moved(('a.py', 'cognitive', 125), ('b.py', 'cognitive', 20))
 
         assert self._bounded(
             tmp_path,
-            self._moved(('a.py', 'lines', 1005)),
+            self._moved(('a.py', 'cognitive', 125)),
             base=None,
             ours=ours,
             theirs=theirs,
         ) == []
-        assert ('lines', 'b.py', 200, 201) in self._bounded(
+        assert ('cognitive', 'b.py', 30, 31) in self._bounded(
             tmp_path,
-            self._moved(('a.py', 'lines', 1005), ('b.py', 'lines', 201)),
+            self._moved(('a.py', 'cognitive', 125), ('b.py', 'cognitive', 31)),
             base=None,
             ours=ours,
             theirs=theirs,
@@ -334,16 +409,29 @@ class TestCompareMergedBaselineFiles:
     def test_an_absent_parent_image_moved_nothing(self, tmp_path: Path) -> None:
         # A parent without a baseline must not read as having lowered every
         # measure to nothing, which would refuse a resolver who keeps theirs.
-        seed, theirs = synthetic_report(), self._moved(('a.py', 'lines', 1005))
+        seed, theirs = synthetic_report(), self._moved(('a.py', 'cognitive', 125))
 
         assert self._bounded(tmp_path, theirs, base=seed, ours=None, theirs=theirs) == []
-        assert ('lines', 'a.py', 1005, 1006) in self._bounded(
+        assert ('cognitive', 'a.py', 125, 126) in self._bounded(
             tmp_path,
-            self._moved(('a.py', 'lines', 1006)),
+            self._moved(('a.py', 'cognitive', 126)),
             base=seed,
             ours=None,
             theirs=theirs,
         )
+
+    def test_a_size_only_excess_over_the_bound_raises_nothing(
+        self, tmp_path: Path
+    ) -> None:
+        seed, theirs = synthetic_report(), self._moved(('a.py', 'lines', 1005))
+
+        assert self._bounded(
+            tmp_path,
+            self._moved(('a.py', 'lines', 1100)),
+            base=seed,
+            ours=seed,
+            theirs=theirs,
+        ) == []
 
     def test_a_name_set_both_sides_moved_is_bounded_by_the_side_naming_more(
         self, tmp_path: Path
@@ -358,6 +446,40 @@ class TestCompareMergedBaselineFiles:
         assert self._bounded(tmp_path, ours, base=seed, ours=ours, theirs=theirs) == []
         assert ('patch_targets', 't1.py', 3, 4) in self._bounded(
             tmp_path, widened, base=seed, ours=ours, theirs=theirs
+        )
+
+    def test_a_name_set_both_sides_widened_is_bounded_by_their_set_merge(
+        self, tmp_path: Path
+    ) -> None:
+        # 'qux', added by both sides, counts once, so name lists carry no
+        # overlap slack.
+        seed, ours, theirs = synthetic_report(), synthetic_report(), synthetic_report()
+        ours['tests']['t1.py']['patch_targets'] = ['foo', 'bar', 'qux', 'zap']
+        theirs['tests']['t1.py']['patch_targets'] = ['foo', 'bar', 'qux', 'wib']
+        merged = copy.deepcopy(ours)
+        merged['tests']['t1.py']['patch_targets'].append('wib')
+        widened = copy.deepcopy(merged)
+        widened['tests']['t1.py']['patch_targets'].append('extra')
+
+        assert self._bounded(tmp_path, merged, base=seed, ours=ours, theirs=theirs) == []
+        assert ('patch_targets', 't1.py', 5, 6) in self._bounded(
+            tmp_path, widened, base=seed, ours=ours, theirs=theirs
+        )
+
+    def test_an_absent_base_bounds_a_name_set_by_both_sides_names(
+        self, tmp_path: Path
+    ) -> None:
+        ours, theirs = synthetic_report(), synthetic_report()
+        ours['tests']['t1.py']['patch_targets'] = ['foo', 'bar', 'qux']
+        theirs['tests']['t1.py']['patch_targets'] = ['foo', 'bar', 'zap']
+        merged = copy.deepcopy(ours)
+        merged['tests']['t1.py']['patch_targets'].append('zap')
+        widened = copy.deepcopy(merged)
+        widened['tests']['t1.py']['patch_targets'].append('extra')
+
+        assert self._bounded(tmp_path, merged, base=None, ours=ours, theirs=theirs) == []
+        assert ('patch_targets', 't1.py', 4, 5) in self._bounded(
+            tmp_path, widened, base=None, ours=ours, theirs=theirs
         )
 
 

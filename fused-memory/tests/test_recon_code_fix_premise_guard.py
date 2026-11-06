@@ -11,7 +11,7 @@ import dataclasses
 import shutil
 from pathlib import Path
 
-from fused_memory.middleware.task_curator import CandidateTask
+from fused_memory.middleware.curator_types import CandidateTask
 
 # ──────────────────────────────────────────────────────────────────────────────
 # task-1972 step-03 RED: TestLoadPremiseRegistry

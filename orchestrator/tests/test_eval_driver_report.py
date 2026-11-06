@@ -4,13 +4,15 @@ Pure-function tests over λ's ``build_composite_report``-shaped dict:
   step-13/14  select_survivors (top-K config names per role_under_test)
   step-15/16  build_methodology_report / format_methodology_report (nested stages)
 
-Every test is hermetic: it constructs the composite-report dict directly (the
-only fields select_survivors consumes are ``configs[].config`` /
-``role_under_test`` / ``composite``) — no EvalResult, no I/O, no LLM.
+Every test is hermetic. The ranking tests construct the composite-report dict
+directly (the only fields select_survivors consumes are ``configs[].config`` /
+``role_under_test`` / ``composite``); the boundary tests at the end build cells
+into a tmp ResultStore and read them back through the real report. No LLM.
 """
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 
@@ -461,3 +463,94 @@ class TestMethodologyReport:
         # byte-identically: format renders no wall-clock, sorts rows/sections,
         # and fixes float precision.
         assert format_methodology_report(_mk()) == format_methodology_report(_mk())
+
+
+# ---------------------------------------------------------------------------
+# task 6738 — a cell persisted before roles were stamped on every cell carries no
+# role_under_test; it loads as an implementer cell, so the survivor gate sees it.
+# ---------------------------------------------------------------------------
+
+class TestSurvivorGateOverLegacyCells:
+    def test_roleless_cells_survive_as_implementers(self, tmp_path: Path):
+        from orchestrator.evals.metrics import EvalMetrics, RoleUnderTest
+        from orchestrator.evals.report import build_composite_report, select_survivors
+        from orchestrator.evals.results import EvalResult, ResultStore
+
+        store = ResultStore(tmp_path / 'results')
+
+        def save(config: str, run_id: str, metrics: dict[str, Any]) -> None:
+            store.save(EvalResult(
+                task_id='df_task_1', config_name=config, outcome='done',
+                metrics=metrics, worktree_path='/fake/wt', run_id=run_id,
+            ))
+
+        for run_id in ('r1', 'r2'):
+            legacy = EvalMetrics(
+                tests_pass=True, composite_score=0.8, cost_usd=2.0,
+                workflow_duration_ms=900_000, plan_steps=3,
+            ).to_dict()
+            del legacy['role_under_test']
+            save('claude-sonnet-max', run_id, legacy)
+        save('architect-opus-high', 'r3', EvalMetrics(
+            role_under_test=RoleUnderTest.ARCHITECT, plan_quality=0.7, plan_steps=4,
+            cost_usd=0.3, workflow_duration_ms=60_000, terminal_kind='planned',
+        ).to_dict())
+
+        survivors = select_survivors(
+            build_composite_report(store.load_all()),
+            top_k=3, roles=['implementer', 'architect'],
+        )
+
+        assert survivors == {
+            'implementer': ['claude-sonnet-max'],
+            'architect': ['architect-opus-high'],
+        }
+
+
+# ---------------------------------------------------------------------------
+# task 6738 — role readers read an enum-valued role (a cell from the new
+# producers, or any cell after load) exactly as they read its string value.
+# ---------------------------------------------------------------------------
+
+class TestRoleReadersAcceptTheEnum:
+    def test_enum_roles_select_what_their_values_select(self):
+        from orchestrator.evals.metrics import RoleUnderTest
+        from orchestrator.evals.report import select_survivors
+
+        report = _report([
+            _row('impl-a', 'implementer', 0.9),
+            _row('impl-b', RoleUnderTest.IMPLEMENTER, 0.7),
+            _row('impl-c', 'implementer', 0.5),
+            _row('arch-a', RoleUnderTest.ARCHITECT, 0.4, plan_quality=0.8),
+            _row('arch-b', 'architect', 0.3, plan_quality=0.6),
+        ])
+
+        by_enum = select_survivors(
+            report, top_k=2, roles=(RoleUnderTest.IMPLEMENTER, RoleUnderTest.ARCHITECT),
+        )
+        by_value = select_survivors(report, top_k=2, roles=['implementer', 'architect'])
+
+        assert by_enum == by_value == {
+            'implementer': ['impl-a', 'impl-b'],
+            'architect': ['arch-a', 'arch-b'],
+        }
+
+    def test_select_judge_results_keeps_only_judge_cells(self):
+        from orchestrator.evals.judge_pilot import select_judge_results
+        from orchestrator.evals.metrics import EvalMetrics, RoleUnderTest
+        from orchestrator.evals.results import EvalResult
+
+        def cell(config: str, role: RoleUnderTest) -> EvalResult:
+            return EvalResult(
+                task_id='df_task_1', config_name=config, outcome='done',
+                metrics=EvalMetrics(role_under_test=role).to_dict(), worktree_path='/fake/wt',
+            )
+
+        judge = cell('judge-haiku', RoleUnderTest.JUDGE)
+        cells = [
+            cell('claude-sonnet-max', RoleUnderTest.IMPLEMENTER),
+            judge,
+            cell('architect-opus-max+claude-sonnet-max', RoleUnderTest.END_TO_END),
+        ]
+
+        assert select_judge_results(cells) == [judge]

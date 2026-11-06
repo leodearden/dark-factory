@@ -9,6 +9,7 @@ import pytest
 from client_feed import contract
 from client_feed.contract import (
     ContractViolation,
+    DefectReported,
     EngagementProjection,
     EventHeader,
     FeedError,
@@ -99,6 +100,22 @@ MINIMAL_PAYLOADS: dict[str, dict[str, Any]] = {
     'reveal_refused': {'path': '/etc/passwd', 'reason': 'not_in_tree'},
     'criteria_results': {'run_kind': 'staging', 'commit': None, 'run_at': AT, 'results': []},
     'criteria_declared': {'criteria': []},
+}
+
+REVEAL_REQUEST: dict[str, Any] = {'seq': 1, 'at': AT, 'type': 'reveal_requested', 'path': '../x'}
+RESTATED_REPORT: dict[str, Any] = {
+    'seq': 2,
+    'at': AT,
+    'type': 'defect_reported',
+    'block': 2,
+    'report': 1,
+    'criterion_id': 'C-12',
+    'restater': {'prompt_version': 'restate-v1'},
+    'outcome': {'kind': 'restated', 'observed': 'o', 'expected': 'e', 'steps': ['s']},
+}
+QUARANTINED_REPORT: dict[str, Any] = {
+    **RESTATED_REPORT,
+    'outcome': {'kind': 'quarantined', 'reasons': ['restater_failed']},
 }
 
 ENGAGEMENT = {
@@ -249,9 +266,21 @@ def test_both_refusals_are_feed_errors() -> None:
     assert issubclass(FeedError, Exception)
 
 
-def test_an_inbox_request_parses() -> None:
-    request = {'seq': 1, 'at': AT, 'type': 'reveal_requested', 'path': '../x'}
-    assert parse_inbox_line(json.dumps(request), line_no=1) == RevealRequested.model_validate(request)
+@pytest.mark.parametrize(
+    ('line', 'model'),
+    [
+        (REVEAL_REQUEST, RevealRequested),
+        (RESTATED_REPORT, DefectReported),
+        (QUARANTINED_REPORT, DefectReported),
+    ],
+    ids=['reveal-requested', 'restated-defect', 'quarantined-defect'],
+)
+def test_an_inbox_line_parses_to_the_model_its_type_names(
+    line: dict[str, Any], model: type[RevealRequested | DefectReported]
+) -> None:
+    parsed = parse_inbox_line(json.dumps(line), line_no=1)
+    assert type(parsed) is model
+    assert parsed == model.model_validate(line)
 
 
 @pytest.mark.parametrize(
@@ -263,8 +292,17 @@ def test_an_inbox_request_parses() -> None:
             {'seq': 1, 'at': AT, 'type': 'reveal_requested', 'path': 'a', 'project_id': 'p'}
         ),
         'not json',
+        json.dumps({**RESTATED_REPORT, 'project_id': 'p'}),
+        json.dumps({**RESTATED_REPORT, 'type': 'defect_filed'}),
     ],
-    ids=['extra-key', 'other-type', 'feed-envelope-key', 'not-json'],
+    ids=[
+        'extra-key',
+        'other-type',
+        'feed-envelope-key',
+        'not-json',
+        'defect-feed-envelope-key',
+        'defect-other-type',
+    ],
 )
 def test_a_bad_inbox_line_is_a_violation(text: str) -> None:
     with pytest.raises(ContractViolation) as caught:

@@ -55,7 +55,6 @@ Scenario → test class map:
 
 from __future__ import annotations
 
-import asyncio
 import json
 from collections.abc import Callable
 from pathlib import Path
@@ -67,6 +66,7 @@ from _workflow_helpers import (
     AgentStub,
     _build_workflow,
     _init_repo,
+    agent_side_artifacts,
 )
 from escalation.models import Escalation
 from shared.cli_invoke import (
@@ -99,7 +99,7 @@ def git_repo(tmp_path: Path) -> Path:
     """A bare-minimum git repo with an initial commit."""
     repo = tmp_path / 'repo'
     repo.mkdir()
-    asyncio.run(_init_repo(repo))
+    _init_repo(repo)
     return repo
 
 
@@ -146,19 +146,6 @@ def task_assignment() -> TaskAssignment:
 # ---------------------------------------------------------------------------
 
 
-def _artifacts_for(worktree: Path) -> TaskArtifacts:
-    """Real on-disk TaskArtifacts at the derived .task-meta sibling root for
-    *worktree* — the SAME root ``_invoke``'s ``_inject_verdict_tools_mcp``
-    derives (via ``_meta_root_for_worktree``) and ``TaskWorkflow.artifacts`` /
-    ``TaskSteward``'s own internal ``TaskArtifacts`` read from. Mirrors
-    ``AgentStub``'s explicit-meta_root construction in ``_workflow_helpers.py``
-    (rather than relying on the autouse ``_derive_meta_root_like_production``
-    shim, which exists for legacy bare-``TaskArtifacts(cwd)`` call sites) so
-    this module is self-contained.
-    """
-    return TaskArtifacts(worktree, TaskArtifacts.meta_root_for(worktree.parent, worktree.name))
-
-
 def _seed_workflow_artifacts(
     workflow: TaskWorkflow, *, tmp_path: Path, task_id: str = '42',
 ) -> TaskArtifacts:
@@ -174,7 +161,7 @@ def _seed_workflow_artifacts(
     """
     worktree = tmp_path / 'wt'
     worktree.mkdir(parents=True, exist_ok=True)
-    artifacts = _artifacts_for(worktree)
+    artifacts = TaskArtifacts.for_task(worktree, task_id)
     artifacts.init(task_id, 'Verdict boundary task', 'desc', base_commit='oldbase')
     workflow.artifacts = artifacts
     workflow.worktree = worktree
@@ -222,9 +209,7 @@ def _setup_judge_workflow(
 
     ``get_diff_from_base`` is mocked to return a non-empty diff (mirrors
     ``test_judge_completion_verdict.py``'s ``_setup``) so the judge is
-    actually invoked rather than empty-diff-skipped — ``base_commit='oldbase'``
-    is stamped at ``artifacts.init()`` time (via ``_seed_workflow_artifacts``),
-    so ``_run_completion_judge`` takes the ``get_diff_from_base`` branch.
+    actually invoked rather than empty-diff-skipped.
     """
     workflow, _scheduler = _build_workflow(config, git_ops, task_assignment, AgentStub())
     _seed_workflow_artifacts(workflow, tmp_path=tmp_path)
@@ -260,7 +245,7 @@ def _fake_invoke_writes_merger_verdict(
 
     async def _fake(*, cwd: Path, **kwargs: Any) -> AgentResult:
         if blocked is not None:
-            _artifacts_for(cwd).write_verdict(
+            agent_side_artifacts(cwd).write_verdict(
                 'merger', _envelope('merger', session_id, {'blocked': blocked, 'reason': reason}),
             )
         return AgentResult(success=success, output=output)
@@ -285,7 +270,7 @@ def _fake_invoke_writes_reviewer_verdict(
     async def _fake(*, cwd: Path, **kwargs: Any) -> AgentResult:
         if verdict is not None:
             _submit_review_verdict(
-                _artifacts_for(cwd), role_name, session_id, role_name, verdict,
+                agent_side_artifacts(cwd), role_name, session_id, role_name, verdict,
                 issues or [], summary,
             )
         return AgentResult(success=success, output=output, timed_out=timed_out)
@@ -306,7 +291,7 @@ def _fake_invoke_writes_judge_verdict(
 
     async def _fake(*, cwd: Path, **kwargs: Any) -> AgentResult:
         if artifact is not None:
-            _artifacts_for(cwd).write_verdict('judge', _envelope('judge', session_id, artifact))
+            agent_side_artifacts(cwd).write_verdict('judge', _envelope('judge', session_id, artifact))
         return AgentResult(success=success, output=output, structured_output=structured_output)
 
     return _fake
@@ -317,19 +302,15 @@ def _fake_invoke_writes_triage_verdict(
     skipped: list | None = None, proposed_task_groups: list | None = None,
     success: bool = True, output: str = '', session_id: str = 'sid',
 ) -> Callable[..., Any]:
-    """Closes over *worktree* explicitly rather than reading ``cwd`` from
-    kwargs: ``_pre_triage_suggestions`` invokes with
-    ``cwd=self.config.project_root`` (so the agent can browse the whole repo)
-    but derives its verdict meta_root from ``self.worktree`` — the two
-    deliberately differ (steward.py:727/760/796), so the fake must target the
-    worktree-derived root the steward actually reads back from, not the
-    invocation cwd.
+    """Closes over *worktree* explicitly: the fake must write to the roots
+    ``_pre_triage_suggestions`` derives from ``self.worktree`` and reads back
+    from (``TaskArtifacts.for_task``), whatever cwd the invocation carries.
     """
 
     async def _fake(**kwargs: Any) -> AgentResult:
         if write:
             _submit_triage(
-                _artifacts_for(worktree), 'triage', session_id,
+                agent_side_artifacts(worktree), 'triage', session_id,
                 accepted or [], skipped or [], proposed_task_groups or [],
             )
         return AgentResult(success=success, output=output)
@@ -353,12 +334,12 @@ def _make_triage_escalation(
 
 @pytest.fixture
 def triage_steward(make_steward) -> TaskSteward:
-    """conftest's ``make_steward`` steward, its .task-meta root pre-initialised
+    """conftest's ``make_steward`` steward, its .task-meta roots pre-initialised
     as ``TaskWorkflow._setup`` does in production, so
-    ``_pre_triage_suggestions``'s "meta-root missing" branch never fires.
+    ``_pre_triage_suggestions``'s "artifact root missing" branch never fires.
     """
     steward = make_steward()
-    _artifacts_for(steward.worktree).init(
+    TaskArtifacts.for_task(steward.worktree, steward.task_id).init(
         steward.task_id, steward.task['title'], steward.task['description'],
     )
     return steward
@@ -807,7 +788,7 @@ class TestTriageBoundary:
         NOT leak through as a modified escalation.
         """
         escalation = _make_triage_escalation(self._SUGGESTIONS)
-        _artifacts_for(triage_steward.worktree).write_verdict(
+        agent_side_artifacts(triage_steward.worktree).write_verdict(
             'triage',
             _envelope('triage', 'stale-sid', {
                 'accepted': [{
@@ -851,7 +832,7 @@ class TestFreshnessGuards:
         """
         workflow = _setup_judge_workflow(config, git_ops, task_assignment, tmp_path)
         assert workflow.worktree is not None  # set by _seed_workflow_artifacts above
-        _artifacts_for(workflow.worktree).write_verdict(
+        agent_side_artifacts(workflow.worktree).write_verdict(
             'judge',
             _envelope('judge', 'stale-sid', {
                 'complete': True, 'reasoning': 'stale', 'uncovered_plan_steps': [],
@@ -877,7 +858,7 @@ class TestFreshnessGuards:
         """
         workflow = _setup_merger_workflow(config, git_ops, task_assignment, tmp_path)
         assert workflow.worktree is not None  # set by _seed_workflow_artifacts above
-        _artifacts_for(workflow.worktree).write_verdict(
+        agent_side_artifacts(workflow.worktree).write_verdict(
             'merger', _envelope('merger', 'stale-sid', {'blocked': False, 'reason': ''}),
         )
         monkeypatch.setattr(

@@ -22,18 +22,27 @@ restated.
 WHY THE NEUTRALISING FIXTURE EXISTS AT ALL
 ------------------------------------------
 The preflight's probe touches the REAL `~/.mem0`. Without an autouse fixture
-neutralising it, every `--apply` test in every guarded suite would pass or fail
+redirecting it, every `--apply` test in every guarded suite would pass or fail
 according to whether the machine running pytest happens to be able to write
 mem0's history directory -- and inside an agent sandbox it genuinely cannot,
 which is the whole reason the guard exists. These are deliberately MOCK-unit
 suites; the environment must not be an input to them.
 
-WHY NOT `raising=False`
------------------------
-`neutralise_fixture` does not pass `raising=False` to `monkeypatch.setattr`. If
-the guard is ever removed from a script, the fixture must break loudly with an
-`AttributeError` rather than silently no-op and leave that suite's `--apply`
-tests asserting nothing.
+Both helpers rig the probe's INPUT, never the guard: they set `MEM0_DIR`, which
+`fused-memory/src/fused_memory/utils/store_mutation_preflight.py::resolve_history_dir`
+reads at call time, so the REAL guard runs end to end -- probe, cleanup,
+refusal record, raise. `neutralise_fixture` points it at one writable scratch
+directory per session; `deny` points it at a directory that is never created,
+so the probe fails with ENOENT for every user, root included.
+
+WHY BOTH HELPERS CHECK THE GUARD'S IDENTITY
+-------------------------------------------
+Rigging the probe's directory means nothing unless the script calls the real
+guard. So both helpers first require `mod.assert_store_mutation_allowed` to BE
+that function: a script that dropped the guard fails with `AttributeError`
+rather than leaving its suite's `--apply` tests asserting nothing, and one that
+shadowed it with a local stand-in fails with an `AssertionError` naming the
+module, rather than making every `deny` test vacuous.
 
 WHY THE LOG MESSAGE'S CONTENT IS PINNED
 ---------------------------------------
@@ -47,8 +56,9 @@ handler, its own "fatal error during ..." record shares this logger and this
 level, so neither the level nor the logger name can tell the two apart -- only
 the markers can. Mere record-existence would still pass if the whole diagnosis
 were replaced by "boom", precisely the regression these assertions exist to
-catch. Verified non-vacuous: mutating the marker in the script turns the
-assertions red (task 4127 amendment).
+catch. The record is composed once, by
+`fused-memory/src/fused_memory/utils/store_mutation_preflight.py::_refusal_record_message`;
+mutating the marker there turns these assertions red (task 6014).
 
 Pinned on those two clauses ONLY -- the fail-closed marker and the remedy noun
 -- so every other word of the message stays free to reword.
@@ -57,13 +67,21 @@ Pinned on those two clauses ONLY -- the fail-closed marker and the remedy noun
 from __future__ import annotations
 
 import logging
+import tempfile
+from pathlib import Path
+from uuid import uuid4
 
 import pytest
 
-# The message the rigged preflight refuses with. A single obviously-synthetic
-# token, so a test that accidentally asserts against it reads as a test artefact
-# rather than as a plausible real diagnosis.
+from fused_memory.utils import store_mutation_preflight
+
+# Carried by the name of the directory `deny` points the probe at, so it rides
+# into both the refusal message and the guard's record. A single
+# obviously-synthetic token, so a test that accidentally asserts against it
+# reads as a test artefact rather than as a plausible real diagnosis.
 SENTINEL = 'SENTINEL-store-unwritable'
+
+_NEUTRALISED_HISTORY_DIR_NAME = 'neutralised-mem0-history'
 
 # The clauses a guard site's own ERROR record must carry: the fail-closed
 # marker, and the remedy noun that tells the operator where to route the
@@ -92,18 +110,37 @@ _SHARED_NEUTRALISE_RATIONALE = """Keep this MOCK-unit suite independent of the R
     guard exists. This suite is deliberately MOCK-unit, so the environment must
     not be an input to it.
 
-    Deliberately NOT ``raising=False``: if the guard is ever removed from the
-    script this fixture must break loudly rather than silently no-op.
+    It points the REAL guard's probe at a writable per-session scratch
+    directory, after checking that the script still binds that guard: if the
+    guard is ever removed or shadowed, this fixture breaks loudly rather than
+    leaving the suite asserting nothing.
 
     See ``_store_mutation_preflight_contract`` for the full rationale. This
     suite's own seam:"""
 
 
-def neutralise_fixture(mod, *, note):
-    """Build the autouse fixture that neutralises *mod*'s preflight guard.
+def _require_the_real_guard(mod) -> None:
+    """Fail loudly unless *mod* binds the production guard itself."""
+    bound = mod.assert_store_mutation_allowed
+    if bound is not store_mutation_preflight.assert_store_mutation_allowed:
+        raise AssertionError(
+            f'{mod.__name__} binds {bound!r} as assert_store_mutation_allowed, '
+            'not fused_memory.utils.store_mutation_preflight.'
+            'assert_store_mutation_allowed, so rigging the probe would test '
+            'nothing. Import the guard from that module and call it directly.'
+        )
 
-    *mod* is the script module under test -- the object the suite loaded and
-    whose `assert_store_mutation_allowed` attribute is to be replaced.
+
+def neutralise_fixture(mod, *, note):
+    """Build the autouse fixture that points *mod*'s REAL guard at a scratch dir.
+
+    *mod* is the script module under test -- the object the suite loaded, which
+    must bind the real `assert_store_mutation_allowed`.
+
+    The scratch directory is ONE per session, under pytest's base temp rather
+    than the test's own `tmp_path`, which several suites census: a fresh
+    numbered directory per test would rescan its parent on every call across
+    thousands of tests.
 
     *note* is REQUIRED and keyword-only, carrying the two facts the shared
     rationale above cannot: this suite's seam (which entry point runs the
@@ -119,29 +156,28 @@ def neutralise_fixture(mod, *, note):
     `TypeError` at collection time, not a silent prose deletion.
     """
 
-    def _neutralise(monkeypatch):
-        # Deliberately no `raising=False` -- see the module docstring.
-        monkeypatch.setattr(mod, 'assert_store_mutation_allowed', lambda **_kw: None)
+    def _neutralise(monkeypatch, tmp_path_factory):
+        _require_the_real_guard(mod)
+        scratch = tmp_path_factory.getbasetemp() / _NEUTRALISED_HISTORY_DIR_NAME
+        scratch.mkdir(exist_ok=True)
+        monkeypatch.setenv('MEM0_DIR', str(scratch))
 
     _neutralise.__doc__ = f'{_SHARED_NEUTRALISE_RATIONALE}\n\n    {note}\n    '
     return pytest.fixture(autouse=True)(_neutralise)
 
 
 def deny(mod, monkeypatch):
-    """Rig *mod*'s preflight to refuse, as it would inside an agent sandbox.
+    """Make *mod*'s REAL guard refuse, as it would inside an agent sandbox.
 
-    Raises the module's OWN `StoreMutationUnavailable`, so the exception the
-    script's handlers see is the real type rather than a stand-in, and carries
-    `SENTINEL` as its message. Accepts arbitrary positional and keyword
-    arguments: call sites invoke the guard as `assert_store_mutation_allowed(
-    operation=...)`, but the raiser must not constrain the signature it stands
-    in for.
+    Points the probe at a directory that is never created and whose name
+    carries `SENTINEL`, so the guard raises the production
+    `StoreMutationUnavailable` naming it, and emits its refusal record through
+    whatever logger the script passes. Undone with *monkeypatch*; safe to apply
+    while `neutralise_fixture`'s fixture is active.
     """
-
-    def _raise(*_args, **_kwargs):
-        raise mod.StoreMutationUnavailable(SENTINEL)
-
-    monkeypatch.setattr(mod, 'assert_store_mutation_allowed', _raise)
+    _require_the_real_guard(mod)
+    never_created = Path(tempfile.gettempdir()) / f'{SENTINEL}-{uuid4().hex}'
+    monkeypatch.setenv('MEM0_DIR', str(never_created))
 
 
 def fail_closed_records(caplog, logger_name):
@@ -161,7 +197,7 @@ def fail_closed_records(caplog, logger_name):
     POSITIVE assertion (`assert fail_closed_records(...), ...`) and none asserts
     emptiness, so a broader predicate can only add matches and can never turn a
     green assertion red. The two are extensionally equal on today's tree anyway,
-    since every guard site logs at exactly `logger.error`.
+    since the guard emits its record at exactly `logger.error`.
     """
     return [
         rec for rec in caplog.records

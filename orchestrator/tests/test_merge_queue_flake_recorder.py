@@ -26,6 +26,7 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _flake_golden import merge_gate_deflake_description
 from escalation.queue import EscalationQueue
 from test_flake_debt_drain import _FakeLedgerTaskClient
 from test_merge_boundary_effective_module_configs import (
@@ -53,6 +54,7 @@ from orchestrator.flake_ledger import (
     FlakeVerdict,
     ledger_db_path,
     list_open_debt,
+    read_debt,
     read_due_items,
     read_occurrences,
 )
@@ -657,11 +659,21 @@ class TestDispatcherEnqueuesDebt:
             )
             assert outcome is None, f'suppression {n} must still land; got {outcome!r}'
 
-        assert len(_rows(tmp_path)) == 5, _rows(tmp_path)
+        rows = _rows(tmp_path)
+        assert sorted(r.task_id or '' for r in rows) == [f'storm-{n}' for n in range(5)], rows
+        for r in rows:
+            assert (r.test_id, r.verdict, r.call_site, r.runner, r.merge_sha, r.detail) == (
+                _BETA_FAILING_ID, 'passes_in_isolation', 'merge_gate', _REMOTE, _MERGE_SHA, '{}',
+            )
         assert len(_due_items(tmp_path)) == 5
         assert _debt(tmp_path) == [], 'nothing is filed before the drain runs'
-        storm = queue.get_by_task('merge-flake-suppression-storm', status='pending', level=2)
-        assert len(storm) == 1, storm
+        (storm,) = queue.get_by_task('merge-flake-suppression-storm', status='pending', level=2)
+        assert (storm.category, storm.severity, storm.summary) == (
+            'merge_flake_suppression_storm',
+            'critical',
+            'Merge-verify flake-suppression storm: the isolated-rerun-confirm gate has '
+            'suppressed 5 merge-verify reds since the last reset',
+        )
 
         client = _FakeLedgerTaskClient()
         report = await run_drain_pass(
@@ -675,4 +687,18 @@ class TestDispatcherEnqueuesDebt:
         debt = _debt(tmp_path)
         assert [d.test_id for d in debt] == [_BETA_FAILING_ID], debt
         assert debt[0].owner_task_id, f'section 5.9 breach - the row has no owner: {debt[0]}'
-        assert len(client.submit_calls) == 1, client.submit_calls
+        (block,) = client.submit_calls
+        row = read_debt(ledger_db_path(tmp_path), _BETA_FAILING_ID)
+        assert row is not None
+        assert block['title'] == (
+            f'Flake debt: {_BETA_FAILING_ID} — passes_in_isolation after a merge-gate red '
+            f'was suppressed, cycle 1'
+        )
+        assert block['description'] == merge_gate_deflake_description(row)
+        assert block['metadata'] == {
+            'spawn_context': 'flake_ledger_debt',
+            'flake_debt_test': _BETA_FAILING_ID,
+            'flake_debt_open_count': 1,
+            'flake_debt_opened_at': row.opened_at,
+        }
+        assert (block['priority'], block['planning_mode']) == ('medium', True)

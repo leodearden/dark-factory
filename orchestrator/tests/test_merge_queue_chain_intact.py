@@ -29,6 +29,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _merge_lane_fakes import lane_scene_config
 
 # Bare sibling-import of the pure builders (no tests/__init__.py — tests dir is
 # on sys.path; mirrors test_concurrent_verify_boundary importing from
@@ -92,7 +93,7 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
 
 @pytest.fixture
 def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
-    return OrchestratorConfig(project_root=git_repo, git=git_config)
+    return lane_scene_config(git_repo, git_config)
 
 
 # ── Fake SHAs + entry/allocator builders (mirror TestFinalizeInflightNonPass) ─
@@ -611,7 +612,8 @@ class TestCascadeStragglerCaughtComposition:
     RED: phase 1 records nothing → in phase 2 ``_chain_dead_link`` returns None →
     the straggler burns a verify against the dead base (no ``verdict_voided``,
     ``_run_inflight_verify`` called).  GREEN (step-10): the straggler is caught.
-    ``two_layer_invariants`` stays empty throughout (§5.3 monitored → enforced).
+    ``two_layer_invariants`` stays empty throughout: INV-3 is the invariant it
+    reports over the frozen prefix, and the caught straggler never sits there.
     """
 
     async def test_straggler_on_dead_downstream_base_caught_at_dispatch(
@@ -686,5 +688,5 @@ class TestCascadeStragglerCaughtComposition:
         assert voided[0]['data']['reason'] == 'chain_dead'
         assert voided[0]['data']['point'] == 'dispatch'
 
-        # §5.3 stays clean throughout (monitored → enforced upgrade).
+        # INV-3, the invariant two_layer_invariants reports, reads clean.
         assert worker.two_layer_invariants(main_sha) == []

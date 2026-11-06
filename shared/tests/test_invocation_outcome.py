@@ -350,6 +350,51 @@ class TestParseResetsAt:
         """ZoneInfo raises inside the no-date branch's try → None."""
         assert _parse_resets_at('resets 6pm (Fake/Zone)', now=_MID_JAN) is None
 
+    # --- codex's ChatGPT usage window, "... or try again at H:MM AM". The
+    # text names no zone, so it resolves in the HOST LOCAL zone; every `now`
+    # and expectation is therefore a host-local wall-clock moment (a naive
+    # datetime's .astimezone() reads it as local), so these pass on any host. ---
+
+    CODEX_8_06_AM = (
+        "You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), "
+        'visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 8:06 AM.'
+    )
+
+    @staticmethod
+    def _local(hour: int, minute: int = 0, second: int = 0, *, day: int = 11) -> datetime:
+        return datetime(2026, 9, day, hour, minute, second).astimezone()
+
+    def test_codex_try_again_later_today(self):
+        now = self._local(3)  # 03:00 local is before 08:06, so the reset is later today
+        assert _parse_resets_at(self.CODEX_8_06_AM, now=now) == self._local(8, 6)
+
+    def test_codex_try_again_already_past_rolls_to_tomorrow(self):
+        now = self._local(20)  # 20:00 local is ~12h past 08:06, far beyond the grace
+        assert _parse_resets_at(self.CODEX_8_06_AM, now=now) == self._local(8, 6, day=12)
+
+    def test_codex_try_again_pm(self):
+        text = self.CODEX_8_06_AM.replace('8:06 AM', '1:07 PM')
+        now = self._local(3)  # 1:07 PM is 13:07, ahead of 03:00 local
+        assert _parse_resets_at(text, now=now) == self._local(13, 7)
+
+    def test_codex_try_again_just_passed_is_now_not_tomorrow(self):
+        """codex rounds the reset to the minute, so a message naming 8:06
+        can be parsed at 08:06:30. That just-passed instant means "retry
+        now", never a 24-hour sleep."""
+        now = self._local(8, 6, 30)  # 30s after the named minute, inside the grace
+        assert _parse_resets_at(self.CODEX_8_06_AM, now=now) == self._local(8, 6)
+
+    def test_codex_message_without_a_time_returns_none(self):
+        text = "You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro)."
+        assert _parse_resets_at(text, now=self._local(3)) is None
+
+    def test_claude_no_date_branch_keeps_its_rollover_without_grace(self):
+        """The grace belongs to the codex branch alone: 30s past a claude
+        'resets 9pm (Europe/London)' still rolls over to tomorrow, as before."""
+        now = datetime(2026, 1, 1, 21, 0, 30, tzinfo=UTC)  # 21:00:30 GMT; London is GMT in Jan
+        result = _parse_resets_at('resets 9pm (Europe/London)', now=now)
+        assert result == datetime(2026, 1, 2, 21, 0, tzinfo=UTC)
+
 
 class TestExtractCapMessage:
     """_extract_cap_message: returns the sentence containing the matched prefix."""
@@ -933,8 +978,6 @@ class TestClassifyInvocationBackends:
         ('text', 'pattern'),
         [
             ('Error: usage limit reached', 'usage limit reached'),
-            ('Error: rate limit', 'rate limit'),
-            ('Error: quota exceeded', 'quota exceeded'),
             ('Error: insufficient_quota', 'insufficient_quota'),
             ('Error: rate_limit_exceeded', 'rate_limit_exceeded'),
         ],
@@ -947,8 +990,6 @@ class TestClassifyInvocationBackends:
     @pytest.mark.parametrize(
         ('text', 'pattern'),
         [
-            ('Error: quota exceeded', 'quota exceeded'),
-            ('Error: rate limit', 'rate limit'),
             ('Error: resource exhausted', 'resource exhausted'),
             ('Error: RESOURCE_EXHAUSTED', 'RESOURCE_EXHAUSTED'),
             ('Error: quota_exceeded', 'quota_exceeded'),
@@ -971,9 +1012,80 @@ class TestClassifyInvocationBackends:
         assert not isinstance(outcome, CapHit)
 
     def test_backend_patterns_checked_against_stderr_too(self):
-        result = AgentResult(success=False, output='', stderr='Error: quota exceeded')
+        result = AgentResult(success=False, output='', stderr='Error: insufficient_quota')
         outcome = classify_invocation(result, strict_confirm=True, backend='codex')
         assert isinstance(outcome, CapHit)
+
+    @pytest.mark.parametrize('backend', ['codex', 'gemini'])
+    @pytest.mark.parametrize('text', ['Error: rate limit', 'Error: quota exceeded'])
+    def test_generic_phrase_without_confirm_keyword_is_not_a_cap(self, backend, text):
+        result = AgentResult(success=False, output=text)
+        outcome = classify_invocation(result, strict_confirm=True, backend=backend)
+        assert isinstance(outcome, Failure)
+
+    @pytest.mark.parametrize(
+        ('backend', 'text', 'reason'),
+        [
+            (
+                'codex',
+                'Quota exceeded. Check your plan and billing details.',
+                'Codex cap hit: quota exceeded',
+            ),
+            (
+                'codex',
+                'Rate limit reached for gpt-6-astra. Please try again in 20s.',
+                'Codex cap hit: rate limit',
+            ),
+            (
+                'gemini',
+                'Error: rate limit exceeded, please try again later.',
+                'Gemini cap hit: rate limit',
+            ),
+        ],
+    )
+    def test_generic_phrase_with_confirm_keyword_is_a_cap(self, backend, text, reason):
+        result = AgentResult(success=False, output=text)
+        outcome = classify_invocation(result, strict_confirm=True, backend=backend)
+        assert isinstance(outcome, CapHit)
+        assert outcome.reason == reason
+
+    def test_codex_quota_exceeded_billing_text_has_no_reset(self):
+        """codex-cli 0.154.0's own QuotaExceeded text names no reset time."""
+        result = AgentResult(
+            success=False, output='Quota exceeded. Check your plan and billing details.',
+        )
+        outcome = classify_invocation(result, strict_confirm=True, backend='codex')
+        assert outcome == CapHit(resets_at=None, reason='Codex cap hit: quota exceeded')
+
+    @pytest.mark.parametrize('backend', ['codex', 'gemini'])
+    def test_failed_reply_discussing_rate_limits_is_not_a_cap(self, backend):
+        """The reviewer's scenario: a reply that talks about rate limits, then
+        fails for an unrelated reason, is that unrelated failure."""
+        result = AgentResult(success=False, output=(
+            'The cap-retry loop backs off on a rate limit before it fails over.\n'
+            "Codex ran out of room in the model's context window. "
+            'Start a new thread or clear earlier history before retrying.'
+        ))
+        outcome = classify_invocation(result, strict_confirm=True, backend=backend)
+        assert isinstance(outcome, Failure)
+
+    def test_probe_regime_accepts_a_generic_phrase_alone(self):
+        """strict_confirm=False skips the confirm keyword, as it does for claude."""
+        result = AgentResult(success=False, output='Error: rate limit')
+        outcome = classify_invocation(result, strict_confirm=False, backend='codex')
+        assert isinstance(outcome, CapHit)
+
+    def test_codex_chatgpt_usage_window_is_a_codex_cap_with_its_reset(self):
+        """The measured ChatGPT usage-window message is a codex cap, not a
+        fall-through to the claude prefix ladder, and carries its reset."""
+        result = AgentResult(success=False, output=(
+            "You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), "
+            'visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 1:07 PM.'
+        ))
+        outcome = classify_invocation(result, strict_confirm=True, backend='codex')
+        assert isinstance(outcome, CapHit)
+        assert outcome.reason.startswith('Codex cap hit')
+        assert outcome.resets_at is not None
 
 
 class TestClassifyInvocationWedgeOkFailure:

@@ -55,7 +55,6 @@ from fused_memory.models.reconciliation import (
     StageReport,
     Watermark,
 )
-from fused_memory.models.scope import ProjectScope
 from fused_memory.reconciliation import live_workflow_section as section_module
 from fused_memory.reconciliation.curator_gate_resolution_sweep import (
     GATE_RESOLUTION_FLAG_TYPE,
@@ -84,19 +83,7 @@ from fused_memory.services.live_workflow_detector import WorkflowLiveness
 # callable, and bound the guard to a private name this file was free to rename.
 # Add a new shared consolidator fixture there, not here.
 from reconciliation.consolidator_fixtures import make_consolidator, make_scope
-
-
-def _rescope(stages, scope: ProjectScope) -> list:
-    """Re-scope each pinned stage instance in *stages* to *scope*, in place.
-
-    Local mirror of test_harness.py's `_rescope` — lets this file's single
-    `_make_stages` monkeypatch shim (below) honor whatever scope production
-    code passes in.
-    """
-    for s in stages:
-        s.scope = scope
-    return stages
-
+from reconciliation.harness_fixtures import make_harness, make_harness_config
 
 # ---------------------------------------------------------------------------
 # project_root in legacy (time-windowed) assemble_payload
@@ -472,23 +459,13 @@ def _make_dedup_harness(tmp_path: Path, queue_subdir: str = 'recon_esc'):
     """
     from escalation.queue import EscalationQueue
 
-    from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
-    from fused_memory.reconciliation.harness import ReconciliationHarness
-
-    config = FusedMemoryConfig(
-        reconciliation=ReconciliationConfig(
-            enabled=True,
-            judge_enabled=False,  # no Judge; avoids needing real journal for Judge.init
-            agent_llm_provider='anthropic',
-            agent_llm_model='claude-sonnet-4-20250514',
-        )
-    )
-    harness = ReconciliationHarness(
-        memory_service=AsyncMock(),
-        taskmaster=None,
+    harness = make_harness(
         journal=MagicMock(),
         event_buffer=MagicMock(),
-        config=config,
+        memory_service=AsyncMock(),
+        taskmaster=None,
+        # No Judge: it would need a real journal to initialise.
+        config=make_harness_config(judge_enabled=False),
         known_projects={},
     )
     queue_dir = tmp_path / queue_subdir
@@ -1028,7 +1005,7 @@ class TestMemoryConsolidatorRunWiring:
         with (
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                 new=dedup_mock,
             ),
         ):
@@ -1096,7 +1073,7 @@ class TestMemoryConsolidatorRunWiring:
         with (
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                 new=dedup_mock,
             ),
         ):
@@ -1156,7 +1133,7 @@ class TestMemoryConsolidatorRunWiring:
         with (
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                 new=dedup_mock,
             ),
         ):
@@ -1219,7 +1196,7 @@ class TestMemoryConsolidatorRunWiring:
         with (
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                 new=dedup_mock,
             ),
         ):
@@ -1269,7 +1246,7 @@ class TestMemoryConsolidatorRunWiring:
         with (
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                 new=dedup_mock,
             ),
         ):
@@ -1326,7 +1303,7 @@ class TestMemoryConsolidatorRunWiring:
         with (
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                 new=dedup_mock,
             ),
         ):
@@ -1382,7 +1359,7 @@ class TestMemoryConsolidatorTaskCountVerificationWiring:
         with (
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                 new=dedup_mock,
             ),
         ):
@@ -1427,7 +1404,7 @@ class TestMemoryConsolidatorTaskCountVerificationWiring:
         with (
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                 new=dedup_mock,
             ),
             caplog.at_level(logging.WARNING),
@@ -1461,7 +1438,7 @@ class TestMemoryConsolidatorTaskCountVerificationWiring:
         with (
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                 new=dedup_mock,
             ),
         ):
@@ -1516,7 +1493,7 @@ class TestMemoryConsolidatorGraphitiQueueHealthWiring:
         with (
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                 new=dedup_mock,
             ),
         ):
@@ -1557,7 +1534,7 @@ class TestMemoryConsolidatorGraphitiQueueHealthWiring:
         with (
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                 new=dedup_mock,
             ),
             caplog.at_level(logging.WARNING),
@@ -1591,7 +1568,7 @@ class TestMemoryConsolidatorGraphitiQueueHealthWiring:
         with (
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                 new=dedup_mock,
             ),
         ):
@@ -1641,7 +1618,7 @@ class TestMemoryConsolidatorIndexHealthWiring:
                 BaseStage, 'run', new=AsyncMock(return_value=self._base_report())
             ),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                 new=dedup_mock,
             ),
         ):
@@ -1693,7 +1670,7 @@ class TestMemoryConsolidatorIndexHealthWiring:
                 BaseStage, 'run', new=AsyncMock(return_value=self._base_report())
             ),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                 new=dedup_mock,
             ),
             caplog.at_level(logging.WARNING),
@@ -1741,7 +1718,7 @@ class TestMemoryConsolidatorIndexHealthWiring:
                 BaseStage, 'run', new=AsyncMock(return_value=self._base_report())
             ),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                 new=dedup_mock,
             ),
             caplog.at_level(logging.WARNING),
@@ -1816,7 +1793,7 @@ class TestMemoryConsolidatorStatusCorrectionReconciliationWiring:
         with (
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                 new=dedup_mock,
             ),
         ):
@@ -1852,7 +1829,7 @@ class TestMemoryConsolidatorStatusCorrectionReconciliationWiring:
         with (
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                 new=dedup_mock,
             ),
         ):
@@ -2025,7 +2002,7 @@ class TestStaleCountSnapshotCorrectionWiring:
         with (
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                 new=dedup_mock,
             ),
         ):
@@ -2795,7 +2772,7 @@ class TestDegenerateTaskNodeSweepWiring:
         with (
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                 new=dedup_mock,
             ),
             patch(
@@ -2944,7 +2921,7 @@ class TestDegenerateTaskNodeSweepGuards:
         with (
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                 new=dedup_mock,
             ),
             patch(
@@ -3283,7 +3260,7 @@ class TestStaleStatusSnapshotEdgeSweepWiring:
         with (
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                 new=dedup_mock,
             ),
             patch(
@@ -3740,7 +3717,7 @@ class TestAlreadyTrackedSystemicPatternWiring:
         with (
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                 new=dedup_mock,
             ),
         ):
@@ -3797,7 +3774,7 @@ class TestAlreadyTrackedSystemicPatternWiring:
         with (
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                 new=dedup_mock,
             ),
         ):
@@ -3850,7 +3827,7 @@ class TestDedupFlagsCrossProjectWiring:
         with (
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                 new=dedup_mock,
             ),
         ):
@@ -4075,7 +4052,7 @@ class TestCrossProjectSuppressedFlagIsNotAcknowledged:
         with (
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.'
+                'fused_memory.reconciliation.stage1_flag_chain.'
                 'acknowledge_resolved_flags',
                 new=ack_mock,
             ),
@@ -4358,7 +4335,7 @@ class TestMemoryConsolidatorGateBacklogWiring:
                 BaseStage, 'run', new=AsyncMock(return_value=self._base_report())
             ),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                 new=AsyncMock(return_value=[]),
             ),
         ):
@@ -4565,7 +4542,7 @@ class TestCuratorGateResolutionSweepWiring:
         with (
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                 new=dedup_mock,
             ),
             patch(
@@ -4633,7 +4610,7 @@ class TestCuratorGateResolutionSweepWiring:
                 BaseStage, 'run', new=AsyncMock(return_value=self._base_report()),
             ),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                 new=dedup_mock,
             ),
             patch(
@@ -4678,7 +4655,7 @@ class TestCuratorGateResolutionSweepWiring:
                 BaseStage, 'run', new=AsyncMock(return_value=self._base_report(items_flagged=[])),
             ),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                 new=dedup_mock,
             ),
             patch(
@@ -4722,7 +4699,7 @@ class TestCuratorGateResolutionSweepWiring:
                 BaseStage, 'run', new=AsyncMock(return_value=self._base_report()),
             ),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                 new=AsyncMock(side_effect=lambda **kw: kw['flags']),
             ),
             patch(
@@ -4779,7 +4756,7 @@ class TestCuratorGateResolutionSweepWiring:
                 BaseStage, 'run', new=AsyncMock(return_value=self._base_report()),
             ),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                 new=AsyncMock(side_effect=lambda **kw: kw['flags']),
             ),
         ):
@@ -4857,7 +4834,7 @@ class TestCuratorGateResolutionSweepGuards:
                 new=AsyncMock(return_value=base_report or self._base_report()),
             ),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                 new=AsyncMock(side_effect=lambda **kw: kw['flags']),
             ),
             patch(
@@ -5223,7 +5200,7 @@ class TestStyleOnlyAuthorshipFlagWiring:
         with (
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                 new=AsyncMock(side_effect=_dedup),
             ),
         ):
@@ -5305,7 +5282,7 @@ class TestStyleOnlyAuthorshipFlagWiring:
         with (
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                 new=AsyncMock(side_effect=lambda **kw: kw['flags']),
             ),
         ):
@@ -5393,7 +5370,7 @@ class TestAccountedClusterGrowthWiring:
         with (
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                 new=dedup_mock,
             ),
         ):
@@ -5580,7 +5557,7 @@ class TestGateOwnedActionPhrasingWiring:
                 new=AsyncMock(return_value=self._base_report(items_flagged)),
             ),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                 new=AsyncMock(side_effect=lambda **kw: kw['flags']),
             ),
             patch(
@@ -5792,7 +5769,7 @@ class TestGateOwnedActionPhrasingWiring:
                 new=AsyncMock(return_value=self._base_report([self._citing_flag('645')])),
             ),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                 new=AsyncMock(side_effect=lambda **kw: kw['flags']),
             ),
         ):
@@ -5832,8 +5809,9 @@ class TestGateOwnedActionPhrasingWiring:
 
 class TestStage1LiveStateFreshnessSection:
     """The Stage-1 live-state freshness section (task 5271) renders its benign
-    deleter list from recon_self_model.MEM0_TOMBSTONE_DELETERS, the tuple the
-    code-side sweep_deletion_guard reads, so the two cannot drift apart."""
+    deleter list as the shared recon_self_model.format_mem0_tombstone_deleters()
+    list, built from the tuple the code-side sweep_deletion_guard reads, so the
+    two cannot drift apart."""
 
     def _section(self) -> str:
         from fused_memory.reconciliation.prompts.stage1 import (
@@ -5853,13 +5831,12 @@ class TestStage1LiveStateFreshnessSection:
 
         assert STAGE1_SYSTEM_PROMPT.count(LIVE_STATE_FRESHNESS_HEADING) == 1
 
-    def test_every_documented_deleter_is_rendered_in_the_section(self):
-        from fused_memory.reconciliation.recon_self_model import MEM0_TOMBSTONE_DELETERS
+    def test_section_renders_the_shared_deleter_list(self):
+        from fused_memory.reconciliation.recon_self_model import format_mem0_tombstone_deleters
 
-        section = self._section()
-        missing = [d for d in MEM0_TOMBSTONE_DELETERS if d not in section]
-        assert not missing, (
-            f'the section must name every documented sweep deleter; missing {missing!r}'
+        deleters = format_mem0_tombstone_deleters()
+        assert deleters in self._section(), (
+            f'the section must render the shared deleter list {deleters!r}'
         )
 
 
@@ -5941,7 +5918,7 @@ async def _run_assembling_payload(stage: MemoryConsolidator, flags: list[dict]) 
     with (
         patch.object(BaseStage, 'run', new=assemble_then_report),
         patch(
-            'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+            'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
             new=dedup_passthrough,
         ),
     ):

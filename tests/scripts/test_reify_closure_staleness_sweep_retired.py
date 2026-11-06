@@ -72,6 +72,25 @@ ALLOWED_UNCONDITIONALLY = {
         'names the retired wiring is data, not a live reference; editing it '
         'would break the pinned sha and falsify what the raters see'
     ),
+    'fused-memory/calibration/write_triage_eval_set_v2_live_slates.jsonl': (
+        'FROZEN measurement artifact — task 7160\'s rebuilt live slates, quoting '
+        'historical Mem0 memory texts verbatim from a store snapshot and pinned '
+        'by sha256 in the eval set\'s summary. A quoted memory that names the '
+        'retired wiring is data, not a live reference; editing it would break '
+        'the pinned sha and falsify what the raters saw'
+    ),
+    'plans/followup-packing-sweep-prd.pack-pool-2026-11-04.json': (
+        'FROZEN pool snapshot — the held-follow-up packing sweep PRD\'s '
+        '2026-11-04 pool capture, consumed as a fixture by tasks 8451 and '
+        '8454. A held task\'s file list that names the retired wiring is '
+        'data about that task, not a live reference; editing it would '
+        'falsify the snapshot the pack judge was calibrated on (task 8468)'
+    ),
+    'plans/followup-packing-sweep-prd.packs-a2c2.csv': (
+        'FROZEN pool snapshot — the a2/c2 generator output over the same '
+        '2026-11-04 pool, consumed as a fixture by tasks 8451 and 8454; '
+        'same reasoning as the pool JSON above (task 8468)'
+    ),
 }
 
 # A second allowlist, merged into the same exclusion set as the dict above:

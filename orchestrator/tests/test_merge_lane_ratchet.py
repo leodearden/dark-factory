@@ -9,8 +9,10 @@ guard it supersedes (``test_merge_queue_reachback_patch_guard.py`` carries its
 Ratchet contract
 ----------------
 ``orchestrator/tests/merge_lane_ratchet_baseline.json`` freezes every measure at
-its value on the commit that introduced it. The gate FAILS on any measure that
-rises above its baseline (ratchet semantics). Equality is permitted -- this is a
+its value on the commit that introduced it, except the two size measures
+(``metrics.REPORTED_ONLY_MEASURES``), which are reported but never ratcheted.
+The gate FAILS on any other measure that rises above its baseline (ratchet
+semantics). Equality is permitted -- this is a
 ratchet, not a day-one gate, and on the introducing commit 62 lane functions
 already exceed cognitive 15 and ``merge_queue.py`` is 21,550 lines. The two
 CEILINGS (1,500 lines per file, cognitive 15 per function) therefore apply only
@@ -569,10 +571,23 @@ class TestTheMeasuresOverTheRealCluster:
 
 # ---------------------------------------------------------------------------
 # Test-suite patch targets into lane internals: the ratchet's binding of the
-# patch-target measure to ``LANE_PATCH_MODULES``, driven through its public
-# seam. Every snippet imports a lane module, so it is in the measure's domain.
+# patch-target measure to the lane package and its submodules, driven through
+# its public seam. Every snippet imports a lane module, so it is in the
+# measure's domain.
 
 _LANE_IMPORT = 'from orchestrator.merge_lane.worker import W\n'
+
+#: A synthetic module universe, so these rows do not depend on the real package.
+#: SpeculativeMergeWorker is deliberately absent: a class is not a submodule.
+_PATCH_MODULES = frozenset(
+    {
+        'orchestrator.merge_lane',
+        'orchestrator.merge_lane.worker',
+        'orchestrator.merge_lane.gates',
+        'orchestrator.merge_lane.pkg',
+        'orchestrator.merge_lane.pkg.leaf',
+    }
+)
 
 
 class TestLanePatchTargets:
@@ -638,10 +653,65 @@ class TestLanePatchTargets:
                 [],
                 id='unrelated-attribute-sharing-the-leaf-not-counted',
             ),
+            pytest.param(
+                "_GATE = 'orchestrator.merge_lane.worker.gate_mark_done_on_delivered_checks'\n"
+                'patch(_GATE, x)\n',
+                ['worker.gate_mark_done_on_delivered_checks'],
+                id='module-constant-indirection',
+            ),
+            pytest.param(
+                "_WORKER = 'orchestrator.merge_lane.worker'\npatch(f'{_WORKER}.spin', x)\n",
+                ['worker.spin'],
+                id='f-string-over-module-constant',
+            ),
+            pytest.param(
+                'from orchestrator.merge_lane import gates\n'
+                "monkeypatch.setattr(gates, 'POST_ADVANCE_GATES', x)\n",
+                ['gates.POST_ADVANCE_GATES'],
+                id='from-import-of-a-submodule',
+            ),
+            pytest.param(
+                'from orchestrator.merge_lane import worker\n'
+                "p = patch.object(worker, '_debug', 1)\n",
+                ['worker._debug'],
+                id='from-import-of-a-submodule-private-name',
+            ),
+            pytest.param(
+                'import orchestrator.merge_lane.worker as mq\n'
+                "monkeypatch.setattr(mq, '_x', 1)\n",
+                ['worker._x'],
+                id='import-as-of-a-submodule',
+            ),
+            pytest.param(
+                "patch.object(orchestrator.merge_lane.gates, 'x', 1)\n",
+                ['gates.x'],
+                id='bare-attribute-chain-to-a-submodule',
+            ),
+            pytest.param(
+                'from orchestrator.merge_lane.pkg import leaf\n'
+                "monkeypatch.setattr(leaf, '_y', 1)\n",
+                ['pkg.leaf._y'],
+                id='from-import-of-a-nested-submodule',
+            ),
+            pytest.param(
+                'from orchestrator.merge_lane import gates\n'
+                "monkeypatch.setattr(gates, 'X', 1)\n"
+                "patch('orchestrator.merge_lane.gates.X', y)\n",
+                ['gates.X'],
+                id='object-and-string-forms-share-one-leaf',
+            ),
+            pytest.param(
+                'from orchestrator.merge_lane import SpeculativeMergeWorker\n'
+                "patch.object(SpeculativeMergeWorker, '_x', 1)\n",
+                [],
+                id='non-module-name-from-the-package-not-counted',
+            ),
         ],
     )
     def test_the_lane_binding(self, body: str, expected: list[str]) -> None:
-        measures = metrics.test_file_measures(_LANE_IMPORT + body, path='t.py')
+        measures = metrics.test_file_measures(
+            _LANE_IMPORT + body, path='t.py', patch_modules=_PATCH_MODULES
+        )
         assert measures is not None
         assert measures['patch_targets'] == expected
 
@@ -682,6 +752,32 @@ class TestLanePatchTargets:
         assert 'worker.run_scoped_verification' in union
 
 
+_LANE_SRC = 'orchestrator/src/orchestrator/merge_lane'
+
+
+class TestLanePatchModules:
+    def test_the_package_and_every_module_under_it_on_disk(self, tmp_path: Path) -> None:
+        root = _committed_tree(
+            tmp_path,
+            {
+                f'{_LANE_SRC}/__init__.py': '',
+                f'{_LANE_SRC}/gates.py': '',
+                f'{_LANE_SRC}/pkg/__init__.py': '',
+                f'{_LANE_SRC}/pkg/leaf.py': '',
+            },
+        )
+        assert metrics.lane_patch_modules(root) == {
+            'orchestrator.merge_lane',
+            'orchestrator.merge_lane.gates',
+            'orchestrator.merge_lane.pkg',
+            'orchestrator.merge_lane.pkg.leaf',
+        }
+
+    def test_a_tree_without_the_package_still_names_the_package(self, tmp_path: Path) -> None:
+        root = _committed_tree(tmp_path, {'README.md': 'x\n'})
+        assert metrics.lane_patch_modules(root) == {metrics.LANE_PACKAGE}
+
+
 # ---------------------------------------------------------------------------
 # Lane-importing test files.
 
@@ -700,6 +796,23 @@ class TestImportsLaneModule:
 
     def test_from_orchestrator_import_of_a_cluster_leaf_is_lane_importing(self) -> None:
         assert metrics.imports_lane_module('from orchestrator import offline_lane\n', path='t.py') is True
+
+    def test_from_orchestrator_import_of_the_package_is_lane_importing(self) -> None:
+        assert metrics.imports_lane_module('from orchestrator import merge_lane\n', path='t.py') is True
+
+    @pytest.mark.parametrize(
+        'source',
+        [
+            'import orchestrator.moved_lane\n',
+            'from orchestrator.moved_lane.worker import W\n',
+            'from orchestrator import moved_lane\n',
+        ],
+    )
+    def test_the_package_is_named_by_lane_package_alone(
+        self, source: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(metrics, 'LANE_PACKAGE', 'orchestrator.moved_lane')
+        assert metrics.imports_lane_module(source, path='t.py') is True
 
     def test_an_unrelated_orchestrator_module_is_not_lane_importing(self) -> None:
         assert metrics.imports_lane_module('import orchestrator.workflow\n', path='t.py') is False
@@ -745,8 +858,10 @@ class TestTheTreeAndSourceFormsAgree:
                 id='imports_lane_module',
             ),
             pytest.param(
-                lambda src: metrics.test_file_measures(src, path='t.py'),
-                lambda src, tree: metrics.test_file_measures_in_tree(tree),
+                lambda src: metrics.test_file_measures(
+                    src, path='t.py', patch_modules=_PATCH_MODULES
+                ),
+                lambda src, tree: metrics.test_file_measures_in_tree(tree, _PATCH_MODULES),
                 id='test_file_measures',
             ),
         ],
@@ -766,7 +881,7 @@ class TestTestFileMeasures:
         # non-lane-importing file can never be summed into the report by
         # accident.
         source = 'import orchestrator.workflow\n\nworker._x\n'
-        assert metrics.test_file_measures(source, path='t.py') is None
+        assert metrics.test_file_measures(source, path='t.py', patch_modules=_PATCH_MODULES) is None
 
     def test_a_lane_importing_file_yields_both_measures(self) -> None:
         source = (
@@ -775,7 +890,7 @@ class TestTestFileMeasures:
             "patch('orchestrator.merge_lane.worker.foo', x)\n"
             'worker._a._b\n'
         )
-        assert metrics.test_file_measures(source, path='t.py') == {
+        assert metrics.test_file_measures(source, path='t.py', patch_modules=_PATCH_MODULES) == {
             'patch_targets': ['worker.foo'],
             'private_reads': 2,
         }
@@ -786,7 +901,7 @@ class TestTestFileMeasures:
             "patch('orchestrator.merge_lane.worker.z', x)\n"
             "patch('orchestrator.merge_lane.worker.a', x)\n"
         )
-        measures = metrics.test_file_measures(source, path='t.py')
+        measures = metrics.test_file_measures(source, path='t.py', patch_modules=_PATCH_MODULES)
         assert measures is not None
         assert measures['patch_targets'] == ['worker.a', 'worker.z']
 
@@ -1115,6 +1230,32 @@ class TestTestTreeSweep:
         assert block['unreadable'] == []
         assert block['test_tree'] == {'requested': 1, 'resolved': 0}
 
+    def test_a_patch_through_a_submodule_binding_is_counted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # ``only_in_tmp`` exists in no real checkout, so a module set read from
+        # anywhere but the swept root would leave the receiver unbound.
+        monkeypatch.setattr(metrics, 'TESTS_ROOT', 'orchestrator/tests')
+        root = _committed_tree(
+            tmp_path,
+            {
+                f'{_LANE_SRC}/__init__.py': '',
+                f'{_LANE_SRC}/only_in_tmp.py': '',
+                'orchestrator/tests/test_g.py': (
+                    'from orchestrator.merge_lane import only_in_tmp\n\n'
+                    'def test_g(monkeypatch):\n'
+                    "    monkeypatch.setattr(only_in_tmp, 'X', [])\n"
+                ),
+            },
+        )
+        sweep = metrics.sweep_repo(root)
+        assert sweep.tests == {
+            'orchestrator/tests/test_g.py': {
+                'patch_targets': ['only_in_tmp.X'],
+                'private_reads': 0,
+            }
+        }
+
     def test_an_unreadable_cluster_path_is_not_masked_by_a_clean_sweep(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1384,15 +1525,15 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
     ) -> None:
         target = self._seeded(tmp_path)
         current = copy.deepcopy(_ratchet_baseline())
-        current['files'][_MQ]['lines'] += 103  # the real task-5342 shape
+        current['files'][_MQ]['cognitive'] += 15
 
         with pytest.raises(metrics.UnauthorizedRaise) as excinfo:
             metrics.write_baseline(target, current)
 
         message = str(excinfo.value)
-        assert 'lines' in message
+        assert 'cognitive' in message
         assert _MQ in message
-        assert '21550' in message and '21653' in message
+        assert '2133' in message and '2148' in message
         # The refusal must name the sanctioned path, not merely forbid the move.
         assert '--authorize-raise' in message
 
@@ -1401,7 +1542,7 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
     ) -> None:
         target = self._seeded(tmp_path)
         current = copy.deepcopy(_ratchet_baseline())
-        current['files'][_MQ]['lines'] += 103
+        current['files'][_MQ]['cognitive'] += 15
 
         with pytest.raises(metrics.UnauthorizedRaise) as excinfo:
             metrics.write_baseline(target, current)
@@ -1420,7 +1561,7 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
         target = self._seeded(tmp_path)
         before = target.read_text(encoding='utf-8')
         current = copy.deepcopy(_ratchet_baseline())
-        current['files'][_MQ]['lines'] += 103
+        current['files'][_MQ]['cognitive'] += 15
 
         with pytest.raises(metrics.UnauthorizedRaise):
             metrics.write_baseline(target, current)
@@ -1484,12 +1625,27 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
         # Lowering is the POINT. It must cost nothing extra.
         target = self._seeded(tmp_path)
         current = copy.deepcopy(_ratchet_baseline())
-        current['files'][_MQ]['lines'] -= 4000
+        current['files'][_MQ]['cognitive'] -= 400
 
         written = metrics.write_baseline(target, current)
         assert written.path == target
         assert written.record is None
         assert target.read_text(encoding='utf-8') == metrics.render_baseline(current)
+
+    def test_a_size_only_rise_is_written_without_authorization(
+        self, tmp_path: Path
+    ) -> None:
+        target = self._seeded(tmp_path)
+        ledger = tmp_path / 'raises'
+        current = copy.deepcopy(_ratchet_baseline())
+        _grow_mq_size(current)
+        current['files'][self._NEW_PATH] = blank_file_entry(lines=1400, prose_lines=600)
+
+        written = metrics.write_baseline(target, current, ledger=ledger)
+
+        assert written.record is None
+        assert target.read_text(encoding='utf-8') == metrics.render_baseline(current)
+        assert not ledger.exists()
 
     def test_a_recorded_raise_authorizes_no_later_one(self, tmp_path: Path) -> None:
         # THE BYPASS THE DESIGN EXISTS TO CLOSE: pre-write a record, then
@@ -1501,7 +1657,7 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
         target = self._seeded(tmp_path)
         ledger = tmp_path / 'raises'
         first = copy.deepcopy(_ratchet_baseline())
-        first['files'][_MQ]['lines'] += 103
+        first['files'][_MQ]['cognitive'] += 15
         metrics.write_baseline(
             target, first, authorization=self._AUTHORIZATION, ledger=ledger
         )
@@ -1509,7 +1665,7 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
         assert metrics.load_ledger(ledger)
 
         further = copy.deepcopy(first)
-        further['files'][_MQ]['lines'] += 50
+        further['files'][_MQ]['cognitive'] += 5
         with pytest.raises(metrics.UnauthorizedRaise):
             metrics.write_baseline(target, further, ledger=ledger)
 
@@ -1526,7 +1682,7 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
         target = self._seeded(tmp_path)
         ledger = _corrupt_ledger(tmp_path)
         lowered = copy.deepcopy(_ratchet_baseline())
-        lowered['files'][_MQ]['lines'] -= 4000
+        lowered['files'][_MQ]['cognitive'] -= 400
 
         assert metrics.write_baseline(target, lowered, ledger=ledger).record is None
         assert _ledger_files(ledger) == {'corrupt.json': '{ not json at all'}
@@ -1588,29 +1744,18 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
         ]
         assert [v.key for v in breaches] == [f'{_MQ}::brand_new']
 
-    def test_a_new_file_exactly_at_the_line_ceiling_is_no_ceiling_breach(
+    def test_a_new_file_exactly_at_the_line_ceiling_is_written_without_authorization(
         self, tmp_path: Path
     ) -> None:
         # A ceiling is a ceiling, not a floor -- mirrors
         # TestCeilingsApplyOnlyToNewKeys::test_a_new_file_exactly_at_the_line_ceiling_is_allowed.
-        #
-        # It is asserted as "no ceiling violation" rather than "the write
-        # succeeds" because it cannot be the latter: 1,500 new lines raise
-        # total:lines by 1,500, so this write is refused by the TOTALS arm
-        # whatever the ceiling says. Contriving the fixture to net the totals to
-        # zero would only hide which arm fired.
         target = self._seeded(tmp_path)
         current = copy.deepcopy(_ratchet_baseline())
         current['files'][self._NEW_PATH] = blank_file_entry(
             lines=metrics.FILE_LINE_CEILING
         )
 
-        with pytest.raises(metrics.UnauthorizedRaise) as excinfo:
-            metrics.write_baseline(target, current)
-
-        assert 'new_file_over_ceiling' not in {
-            v.measure for v in excinfo.value.violations
-        }
+        assert metrics.write_baseline(target, current).record is None
 
     def test_the_git_ops_size_exemption_holds_on_the_write_path(
         self, tmp_path: Path
@@ -1674,9 +1819,9 @@ class TestAuthorizedRaise:
 
     @staticmethod
     def _raised() -> dict:
-        """The real task-5342 shape: several measures up across two sections."""
+        """Several measures up across two sections, as task 5342's raise was."""
         current = copy.deepcopy(_ratchet_baseline())
-        current['files'][_MQ]['lines'] += 103
+        current['files'][_MQ]['function_local_imports'] += 2
         current['files'][_MQ]['cognitive'] += 15
         current['functions'][_VERIFIER_LOOP] += 7
         return current
@@ -1755,10 +1900,25 @@ class TestAuthorizedRaise:
         measures = metrics.load_ledger(ledger)[0]['measures']
         totals = [row for row in measures if row['measure'].startswith('total:')]
         assert {row['measure'] for row in totals} == {
-            'total:lines', 'total:cognitive'
+            'total:cognitive', 'total:function_local_imports'
         }
         assert all(row['key'] == metrics.CLUSTER_TOTAL_KEY for row in totals)
         assert {row['key'] for row in measures} >= {_MQ, _VERIFIER_LOOP}
+
+    def test_a_size_rise_riding_with_an_authorized_raise_is_not_recorded(
+        self, tmp_path: Path
+    ) -> None:
+        target, ledger = self._seeded(tmp_path)
+        current = self._raised()
+        _grow_mq_size(current)
+
+        metrics.write_baseline(
+            target, current, authorization=self._authorization(), ledger=ledger
+        )
+
+        recorded = {row['measure'] for row in metrics.load_ledger(ledger)[0]['measures']}
+        assert not recorded & {'lines', 'prose_lines', 'total:lines', 'total:prose_lines'}
+        assert {'cognitive', 'function_local_imports'} <= recorded
 
     @pytest.mark.parametrize(
         ('task_id', 'reason', 'field'),
@@ -1810,7 +1970,7 @@ class TestAuthorizedRaise:
         # the real ones harder to read.
         target, ledger = self._seeded(tmp_path)
         lowered = copy.deepcopy(_ratchet_baseline())
-        lowered['files'][_MQ]['lines'] -= 4000
+        lowered['files'][_MQ]['cognitive'] -= 400
 
         written = metrics.write_baseline(
             target, lowered, authorization=self._authorization(), ledger=ledger
@@ -2045,14 +2205,18 @@ def _add_file(measure: str):
     return mutate
 
 
+def _grow_mq_size(current: dict) -> None:
+    """The real task-5342 size shape: worker.py 103 lines and 50 prose lines longer."""
+    current['files'][_MQ]['lines'] += 103
+    current['files'][_MQ]['prose_lines'] += 50
+
+
 #: (test id, mutation, expected violation measure, expected violation key).
-#: THE SEEDED-FIXTURE SELF-TEST (INV-10 tier 1): every ratcheted measure and
-#: every derived total gets its own +1, and the ratchet must EXECUTE to a named
-#: violation for it. A measure missing from this table is a measure nothing
-#: proves is actually compared.
+#: THE SEEDED-FIXTURE SELF-TEST (INV-10 tier 1): every RATCHETED measure and
+#: every derived total of one gets its own +1, and the ratchet must EXECUTE to a
+#: named violation for it. A measure missing from this table is a measure
+#: nothing proves is actually compared.
 _SEEDS = [
-    ('files.lines', _bump_file('lines'), 'lines', _MQ),
-    ('files.prose_lines', _bump_file('prose_lines'), 'prose_lines', _MQ),
     ('files.cognitive', _bump_file('cognitive'), 'cognitive', _MQ),
     (
         'files.function_local_imports',
@@ -2082,13 +2246,6 @@ _SEEDS = [
         lambda cur: cur['tests'][_TEST_FILE]['patch_targets'].append('_new_leaf'),
         'patch_targets',
         _TEST_FILE,
-    ),
-    ('total.lines', _add_file('lines'), 'total:lines', metrics.CLUSTER_TOTAL_KEY),
-    (
-        'total.prose_lines',
-        _add_file('prose_lines'),
-        'total:prose_lines',
-        metrics.CLUSTER_TOTAL_KEY,
     ),
     (
         'total.cognitive',
@@ -2128,6 +2285,17 @@ _SEEDS = [
     ),
 ]
 
+#: (test id, mutation): a rise in a SIZE measure alone, per path and in the
+#: derived total. Size is measured and reported, never ratcheted (PRD
+#: plans/review-all-s25-scripts-instruments-prd.md D10).
+_SIZE_ONLY_SEEDS = [
+    ('files.lines', _bump_file('lines')),
+    ('files.prose_lines', _bump_file('prose_lines')),
+    ('total.lines', _add_file('lines')),
+    ('total.prose_lines', _add_file('prose_lines')),
+    ('files.task_5342_shape', _grow_mq_size),
+]
+
 
 class TestCheckAgainstBaseline:
     @pytest.mark.parametrize(
@@ -2152,6 +2320,29 @@ class TestCheckAgainstBaseline:
         # is firing on a measure nobody touched.
         others = [v for v in violations if v is not matching[0]]
         assert all(v.measure == f'total:{measure}' for v in others), others
+
+    @pytest.mark.parametrize(
+        'mutate', [pytest.param(m, id=name) for name, m in _SIZE_ONLY_SEEDS]
+    )
+    def test_a_rise_in_a_size_measure_alone_is_no_violation(self, mutate) -> None:
+        baseline = _ratchet_baseline()
+        current = copy.deepcopy(baseline)
+        mutate(current)
+
+        assert metrics.check_against_baseline(current, baseline) == []
+
+    def test_a_structural_rise_beside_a_size_rise_is_reported_alone(self) -> None:
+        baseline = _ratchet_baseline()
+        current = copy.deepcopy(baseline)
+        _grow_mq_size(current)
+        current['files'][_MQ]['function_local_imports'] += 1
+
+        violations = metrics.check_against_baseline(current, baseline)
+
+        assert [(v.measure, v.key, v.baseline, v.current) for v in violations] == [
+            ('function_local_imports', _MQ, 12, 13),
+            ('total:function_local_imports', metrics.CLUSTER_TOTAL_KEY, 17, 18),
+        ]
 
     def test_an_identical_current_is_clean(self) -> None:
         baseline = _ratchet_baseline()
@@ -2241,15 +2432,15 @@ class TestCeilingsApplyOnlyToNewKeys:
         ]
 
     def test_the_exemption_is_scoped_to_the_ceiling_not_to_the_ratchet(self) -> None:
-        # git_ops.py's 14,721 lines are exempt from the CEILING and still frozen
-        # by the RATCHET, so they cannot grow unwatched.
+        # git_ops.py is exempt from the CEILING, and its structural measures
+        # are still frozen by the RATCHET, so they cannot grow unwatched.
         baseline = _ratchet_baseline()
         current = copy.deepcopy(baseline)
-        current['files'][_GIT_OPS]['lines'] += 1
+        current['files'][_GIT_OPS]['cognitive'] += 1
         assert [
             v
             for v in metrics.check_against_baseline(current, baseline)
-            if v.measure == 'lines' and v.key == _GIT_OPS
+            if v.measure == 'cognitive' and v.key == _GIT_OPS
         ]
 
     def test_a_new_function_over_the_cognitive_ceiling_is_a_violation(self) -> None:
@@ -2322,7 +2513,7 @@ class TestComparatorPreconditions:
         baseline = _ratchet_baseline()
         current = copy.deepcopy(baseline)
         current['enumeration']['complete'] = False
-        current['files'][_MQ]['lines'] += 5000
+        current['files'][_MQ]['cognitive'] += 5000
         with pytest.raises(metrics.RatchetError):
             metrics.check_against_baseline(current, baseline)
 
@@ -2331,7 +2522,7 @@ class TestViolationShape:
     def test_a_violation_carries_both_numbers_and_a_stable_order(self) -> None:
         baseline = _ratchet_baseline()
         current = copy.deepcopy(baseline)
-        current['files'][_MQ]['lines'] += 1
+        current['files'][_MQ]['function_local_imports'] += 1
         current['files'][_GIT_OPS]['cognitive'] += 1
         violations = metrics.check_against_baseline(current, baseline)
         per_path = [v for v in violations if v.key in (_MQ, _GIT_OPS)]
@@ -2346,7 +2537,7 @@ class TestViolationShape:
     def test_the_comparator_mutates_neither_input(self) -> None:
         baseline = _ratchet_baseline()
         current = copy.deepcopy(baseline)
-        current['files'][_MQ]['lines'] += 1
+        current['files'][_MQ]['cognitive'] += 1
         before = (json.dumps(current, sort_keys=True), json.dumps(baseline, sort_keys=True))
         metrics.check_against_baseline(current, baseline)
         after = (json.dumps(current, sort_keys=True), json.dumps(baseline, sort_keys=True))
@@ -2408,6 +2599,23 @@ class TestReportCli:
         totals = metrics.derive_totals(stub_measurement)
         assert str(totals['cognitive']) in out
         assert str(totals['lines']) in out
+
+    def test_report_still_prints_both_size_columns_and_totals(
+        self, stub_measurement: dict, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # Size leaves the RATCHET, never the report: --report is where a reader
+        # still sees how big each file is.
+        assert metrics.main(['--report']) == 0
+        rows = capsys.readouterr().out.splitlines()
+        totals = metrics.derive_totals(stub_measurement)
+
+        header = next(row for row in rows if row.startswith('path ')).split()
+        assert header[1:3] == ['lines', 'prose']
+        totals_row = next(row for row in rows if row.startswith('TOTALS ')).split()
+        assert totals_row[1:3] == [str(totals['lines']), str(totals['prose_lines'])]
+        for path, entry in stub_measurement['files'].items():
+            row = next(row for row in rows if row.startswith(f'{path} ')).split()
+            assert row[1] == str(entry['lines']), path
 
     def test_report_carries_the_test_suite_measures(
         self, stub_measurement: dict, capsys: pytest.CaptureFixture[str]
@@ -2488,13 +2696,26 @@ class TestCheckCli:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         doctored = copy.deepcopy(stub_measurement)
-        doctored['files'][_MQ]['lines'] -= 10
+        doctored['files'][_MQ]['cognitive'] -= 10
         baseline = tmp_path / 'baseline.json'
         metrics.write_baseline(baseline, doctored)
         assert metrics.main(['--check', '--baseline', str(baseline)]) == 1
         err = capsys.readouterr().err
         assert _MQ in err
-        assert 'lines' in err
+        assert 'cognitive' in err
+
+    def test_check_passes_a_tree_whose_size_alone_rose(
+        self, stub_measurement: dict, tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        doctored = copy.deepcopy(stub_measurement)
+        doctored['files'][_MQ]['lines'] -= 10
+        doctored['files'][_MQ]['prose_lines'] -= 10
+        baseline = tmp_path / 'baseline.json'
+        metrics.write_baseline(baseline, doctored)
+
+        assert metrics.main(['--check', '--baseline', str(baseline)]) == 0
+        assert capsys.readouterr().err == ''
 
     def test_check_resolves_its_defaults_and_exits_clean(
         self, stub_measurement: dict, no_private_tree_scan: None,
@@ -2579,7 +2800,7 @@ class TestAuthorizeRaiseCli:
         target = tmp_path / 'b.json'
         metrics.write_baseline(target, stub)
         raised = copy.deepcopy(stub)
-        raised['files'][_MQ]['lines'] += 103
+        raised['files'][_MQ]['cognitive'] += 15
         return target, tmp_path / 'raises', raised
 
     def test_an_authorized_raise_is_written_and_recorded(
@@ -2719,7 +2940,7 @@ class TestAuthorizeRaiseCli:
         ledger = tmp_path / 'raises'
         metrics.write_baseline(target, stub_measurement)
         lowered = copy.deepcopy(stub_measurement)
-        lowered['files'][_MQ]['lines'] -= 10
+        lowered['files'][_MQ]['cognitive'] -= 10
         monkeypatch.setattr(metrics, 'build_report', lambda root: copy.deepcopy(lowered))
 
         assert metrics.main([
@@ -2808,6 +3029,7 @@ class TestTheBlockMessageNamesTheAuthorizedPath:
             # baseline deleted first" -- which a gate now does see, so the
             # sentence a blocked reader most needs was the one that was false.
             metrics.COMMIT_GATE_RELPATH,
+            metrics.ADVANCE_GATE_RELPATH,
         ):
             assert fragment in metrics.RAISE_REMEDY, fragment
 
@@ -2819,6 +3041,7 @@ class TestTheBlockMessageNamesTheAuthorizedPath:
         # notice it going stale. Renaming or moving the auditor would leave a
         # blocked agent grepping for nothing, with the pin still green.
         assert (metrics.repo_root() / metrics.COMMIT_GATE_RELPATH).is_file()
+        assert (metrics.repo_root() / metrics.ADVANCE_GATE_RELPATH).is_file()
 
     def test_the_committed_baseline_bytes_state_the_mechanism(self) -> None:
         # THE SITE THAT MATTERED. Not the docstring, not the CLI -- the file a
@@ -2847,7 +3070,7 @@ class TestTheBlockMessageNamesTheAuthorizedPath:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         doctored = copy.deepcopy(stub_measurement)
-        doctored['files'][_MQ]['lines'] -= 10
+        doctored['files'][_MQ]['cognitive'] -= 10
         baseline = tmp_path / 'baseline.json'
         metrics.write_baseline(baseline, doctored)
 

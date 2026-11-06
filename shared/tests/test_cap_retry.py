@@ -12,12 +12,13 @@ import json
 import logging
 import re
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, call, patch
 
 import pytest
 from _usage_gate_test_helpers import make_gate as _shared_make_gate
+from _usage_gate_test_helpers import scripted_invoke
 
 import shared.cli_invoke as cli_invoke_module
 from shared.cap_markers import REAL_CLI_CAP_HIT_MESSAGES
@@ -41,6 +42,7 @@ from shared.invocation_outcome import (
     ZeroOutputWedge,
 )
 from shared.testing import make_gate_mock
+from shared.testing_resume_rejection import measured_resume_rejection
 from shared.usage_gate import (
     AccountLease,
     AccountPhase,
@@ -492,7 +494,7 @@ class TestCapRetryResume:
         assert second.kwargs.get('prompt') == 'original'
 
     async def test_resume_failure_falls_back_to_fresh(self):
-        """Resume fails (success=False, not cap hit) -> falls back to fresh with original prompt."""
+        """The CLI rejects the resume -> falls back to fresh with original prompt."""
         gate = _mock_gate(
             account_count=2,
             before_invoke=AsyncMock(side_effect=['tok-a', 'tok-b', 'tok-a']),
@@ -500,7 +502,7 @@ class TestCapRetryResume:
             active_account_name='acct-a',
         )
         capped = make_cap_result(session_id='sess-1')
-        resume_fail = make_result(success=False, output='resume broke')
+        resume_fail = measured_resume_rejection('sess-1')
         ok = make_result()
         with (
             patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[capped, resume_fail, ok]) as mock_inv,
@@ -563,7 +565,7 @@ class TestCapRetryResume:
             active_account_name='acct-b',
         )
         capped1 = make_cap_result(session_id='sess-1')
-        resume_fail = make_result(success=False)
+        resume_fail = measured_resume_rejection('sess-1')
         # Second cycle: cap hit again, this time without session_id
         capped2 = make_cap_result(session_id='')
         ok = make_result()
@@ -663,7 +665,7 @@ class TestCapRetryResume:
         )
 
     async def test_fresh_fallback_regenerates_session_id(self):
-        """Fresh fallback after a failed resume regenerates a fresh session_id.
+        """Fresh fallback after a rejected resume regenerates a fresh session_id.
 
         Regression for the reify-3604 wedge: the resume attempt may have already
         committed the pre-allocated UUID to disk, so reusing it on the fresh
@@ -677,9 +679,7 @@ class TestCapRetryResume:
             detect_cap_hit=MagicMock(side_effect=[False, False]),
             active_account_name='acct',
         )
-        # cost_usd defaults to 0.5 in make_result, so the resume failure does NOT
-        # trip the zero-cost heuristic — it routes through the resume-fallback branch.
-        resume_fail = make_result(success=False, output='resume broke')
+        resume_fail = measured_resume_rejection('sess-orig')
         ok = make_result()
         with (
             patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[resume_fail, ok]) as mock_inv,
@@ -1690,7 +1690,7 @@ class TestCapRetryEdgeCases:
             active_account_name='acct',
         )
         capped = make_cap_result(session_id='sess-1')
-        resume_fail = make_result(success=False)
+        resume_fail = measured_resume_rejection('sess-1')
         ok = make_result()
         with (
             patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[capped, resume_fail, ok]) as mock_inv,
@@ -1716,10 +1716,10 @@ class TestCapRetryEdgeCases:
             detect_cap_hit=MagicMock(side_effect=[True, False, True, False, False]),
             active_account_name='acct',
         )
-        # Cycle 1: cap with session -> resume fails -> fresh
+        # Cycle 1: cap with session -> resume rejected -> fresh
         # Cycle 2: cap without session -> fresh succeeds
         r1 = make_cap_result(session_id='s1')
-        r2 = make_result(success=False)  # resume fail
+        r2 = measured_resume_rejection('s1')
         r3 = make_cap_result(session_id='')  # cap hit, no session
         r4 = make_result()  # success
         with (
@@ -2919,8 +2919,21 @@ class TestInvokeFnParameter:
         assert kw['oauth_token'] == 'fake-token-a'
         assert kw['model'] == 'sonnet'
 
-    async def test_backend_forwarded_to_detect_cap_hit(self):
-        """backend parameter is forwarded to slot.detect_cap_hit."""
+    @pytest.mark.parametrize(
+        ('backend', 'expected_detect_calls'),
+        [
+            ('claude', ['claude']),
+            ('pi', ['pi']),
+            ('codex', []),
+            ('gemini', []),
+        ],
+    )
+    async def test_only_pool_backends_reach_detect_cap_hit(
+        self, backend, expected_detect_calls,
+    ):
+        """A backend that spends the leased Claude token forwards itself to
+        slot.detect_cap_hit; codex and gemini never ask the Claude pool's
+        detector, because their caps are not that account's."""
         gate = make_gate(['a'])
         detect_calls: list[str] = []
         orig_detect = gate.detect_cap_hit
@@ -2938,9 +2951,9 @@ class TestInvokeFnParameter:
         )
         with patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=result):
             await invoke_with_cap_retry(
-                gate, 'lbl', backend='codex', prompt='hi',
+                gate, 'lbl', backend=backend, prompt='hi',
             )
-        assert detect_calls == ['codex']
+        assert detect_calls == expected_detect_calls
 
     async def test_default_invoke_fn_is_claude(self):
         """When invoke_fn is omitted, invoke_claude_agent is used."""
@@ -2951,6 +2964,215 @@ class TestInvokeFnParameter:
         with patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=result) as mock_inv:
             await invoke_with_cap_retry(gate, 'lbl', prompt='hi')
         mock_inv.assert_awaited_once()
+
+
+# ===================================================================
+# TestNonPoolBackendCapWait
+# ===================================================================
+
+
+def _codex_usage_window_text(reset_at: datetime) -> str:
+    """codex-cli 0.154.0's ChatGPT usage-window message, naming *reset_at*'s
+    local wall-clock minute in the same zone-less 12-hour form codex prints."""
+    meridiem = 'AM' if reset_at.hour < 12 else 'PM'
+    return (
+        "You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), "
+        'visit https://chatgpt.com/codex/settings/usage to purchase more credits or try '
+        f'again at {reset_at.hour % 12 or 12}:{reset_at.minute:02d} {meridiem}.'
+    )
+
+
+def _backend_cap(output: str) -> AgentResult:
+    """A failed, zero-cost, instant backend cap: the shape codex exec reports."""
+    return make_result(success=False, output=output, cost_usd=0.0, duration_ms=900)
+
+
+@pytest.mark.asyncio
+class TestNonPoolBackendCapWait:
+    """A codex or gemini cap is the backend's own window, never a Claude
+    account's: the loop waits it out on the SAME account instead of capping
+    one and failing over. pi spends the leased Claude token, so its caps
+    still cap that account.
+
+    ``wait_for_reset=False`` keeps a wrongly capped account from being
+    reopened by a background probe mid-test, and ``park_on_frozen_pool=False``
+    turns a wrongly frozen pool into a loud PoolFrozen instead of a park.
+    """
+
+    @staticmethod
+    def _gate() -> UsageGate:
+        return make_gate(['a', 'b'], wait_for_reset=False)
+
+    @staticmethod
+    def _assert_pool_untouched(gate: UsageGate) -> None:
+        assert gate.active_account_name == 'a'
+        assert gate.is_paused is False
+        assert gate.soonest_resets_at is None
+
+    async def test_known_reset_sleeps_until_it_on_the_same_account(self):
+        gate = self._gate()
+        now_local = datetime.now().astimezone()
+        reset_at = (now_local + timedelta(hours=2)).replace(second=0, microsecond=0)
+        cli = scripted_invoke(
+            _backend_cap(_codex_usage_window_text(reset_at)),
+            make_result(output='complete', cost_usd=0.3),
+        )
+        with patch(_SLEEP_PATCH, new_callable=AsyncMock) as mock_sleep:
+            got = await invoke_with_cap_retry(
+                gate, 'lbl', invoke_fn=cli, backend='codex',
+                park_on_frozen_pool=False, prompt='review this',
+            )
+
+        assert got.success is True
+        assert mock_sleep.await_count == 1
+        real_delta = (reset_at - now_local).total_seconds()
+        assert abs(mock_sleep.await_args_list[0].args[0] - real_delta) <= 120
+        assert [c['oauth_token'] for c in cli.calls] == ['fake-token-a', 'fake-token-a']
+        assert cli.calls[1]['prompt'] == 'review this'
+        assert not cli.calls[1].get('resume_session_id')
+        self._assert_pool_untouched(gate)
+
+    async def test_passed_reset_still_backs_off_before_redispatching(self):
+        """codex rounds its reset to the minute, so the minute it names can
+        already have passed and be named again until the window reopens. Each
+        such hit waits the doubling cooldown rather than redispatching at once."""
+        gate = self._gate()
+        passed_minute = datetime.now().astimezone().replace(second=0, microsecond=0)
+        cap = _backend_cap(_codex_usage_window_text(passed_minute))
+        cli = scripted_invoke(cap, cap, make_result(output='complete'))
+        with patch(_SLEEP_PATCH, new_callable=AsyncMock) as mock_sleep:
+            got = await invoke_with_cap_retry(
+                gate, 'lbl', invoke_fn=cli, backend='codex',
+                park_on_frozen_pool=False, prompt='hi',
+            )
+
+        assert got.success is True
+        assert [c.args[0] for c in mock_sleep.await_args_list] == [
+            _CAP_HIT_COOLDOWN_SECS, 2 * _CAP_HIT_COOLDOWN_SECS,
+        ]
+        self._assert_pool_untouched(gate)
+
+    @pytest.mark.parametrize(
+        ('backend', 'cap_text'),
+        [
+            ('codex', 'Quota exceeded. Check your plan and billing details.'),
+            ('gemini', 'Error: RESOURCE_EXHAUSTED'),
+        ],
+    )
+    async def test_unknown_reset_backs_off_without_capping(self, backend, cap_text):
+        gate = self._gate()
+        cli = scripted_invoke(
+            _backend_cap(cap_text), _backend_cap(cap_text), make_result(output='complete'),
+        )
+        with patch(_SLEEP_PATCH, new_callable=AsyncMock) as mock_sleep:
+            got = await invoke_with_cap_retry(
+                gate, 'lbl', invoke_fn=cli, backend=backend,
+                park_on_frozen_pool=False, prompt='hi',
+            )
+
+        assert got.success is True
+        assert [c.args[0] for c in mock_sleep.await_args_list] == [
+            _CAP_HIT_COOLDOWN_SECS, 2 * _CAP_HIT_COOLDOWN_SECS,
+        ]
+        assert {c['oauth_token'] for c in cli.calls} == {'fake-token-a'}
+        self._assert_pool_untouched(gate)
+
+    async def test_max_cap_retries_bounds_the_wait_without_capping(self):
+        gate = self._gate()
+        cli = scripted_invoke(_backend_cap('Error: usage limit reached'))
+        with (
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+            pytest.raises(AllAccountsCappedException),
+        ):
+            await invoke_with_cap_retry(
+                gate, 'lbl', invoke_fn=cli, backend='codex', max_cap_retries=1,
+                park_on_frozen_pool=False, prompt='hi',
+            )
+
+        assert len(cli.calls) == 1
+        self._assert_pool_untouched(gate)
+
+    async def test_failed_reply_discussing_rate_limits_is_returned_without_waiting(self):
+        """A reply that talks about rate limits and then fails for another
+        reason is that failure: one dispatch, no wait, no retry."""
+        gate = self._gate()
+        failed = _backend_cap(
+            'The cap-retry loop backs off on a rate limit before it fails over.\n'
+            "Codex ran out of room in the model's context window. "
+            'Start a new thread or clear earlier history before retrying.'
+        )
+        cli = scripted_invoke(failed, make_result(output='complete'))
+        with patch(_SLEEP_PATCH, new_callable=AsyncMock) as mock_sleep:
+            got = await invoke_with_cap_retry(
+                gate, 'lbl', invoke_fn=cli, backend='codex',
+                park_on_frozen_pool=False, prompt='hi',
+            )
+
+        assert got.success is False
+        assert got.output == failed.output
+        assert len(cli.calls) == 1
+        mock_sleep.assert_not_awaited()
+        self._assert_pool_untouched(gate)
+
+    async def test_pi_cap_still_caps_the_leased_account(self):
+        gate = self._gate()
+        cli = scripted_invoke(
+            make_result(
+                success=False,
+                output="You've hit your usage limit for Claude Pro. Your plan resets in 3 hours.",
+            ),
+            make_result(output='complete'),
+        )
+        with patch(_SLEEP_PATCH, new_callable=AsyncMock):
+            got = await invoke_with_cap_retry(
+                gate, 'lbl', invoke_fn=cli, backend='pi', prompt='hi',
+            )
+
+        assert got.success is True
+        assert [c['oauth_token'] for c in cli.calls] == ['fake-token-a', 'fake-token-b']
+        assert gate.active_account_name == 'b'
+        assert gate.soonest_resets_at is not None
+
+
+@pytest.mark.asyncio
+class TestNonPoolBackendFailureSkipsHeuristicNet:
+    """The zero-cost instant-exit heuristic net guesses at an unrecognised
+    Claude cap. A non-pool backend's failure is never a Claude account's cap,
+    so the net is backend-scoped, not disabled."""
+
+    @staticmethod
+    def _instant_generic_failure() -> AgentResult:
+        return make_result(
+            success=False, output='codex: unexpected failure',
+            cost_usd=0.0, turns=0, duration_ms=800,
+        )
+
+    async def test_codex_failure_is_returned_without_touching_the_pool(self):
+        gate = make_gate(['a', 'b'], wait_for_reset=False)
+        cli = scripted_invoke(self._instant_generic_failure(), make_result(output='complete'))
+        with patch(_SLEEP_PATCH, new_callable=AsyncMock) as mock_sleep:
+            got = await invoke_with_cap_retry(
+                gate, 'lbl', invoke_fn=cli, backend='codex', prompt='hi',
+            )
+
+        assert got.success is False
+        assert got.output == 'codex: unexpected failure'
+        assert len(cli.calls) == 1
+        assert gate.active_account_name == 'a'
+        assert gate.is_paused is False
+        mock_sleep.assert_not_awaited()
+
+    async def test_claude_failure_still_trips_the_net_and_fails_over(self):
+        gate = make_gate(['a', 'b'], wait_for_reset=False)
+        cli = scripted_invoke(self._instant_generic_failure(), make_result(output='complete'))
+        with patch(_SLEEP_PATCH, new_callable=AsyncMock):
+            got = await invoke_with_cap_retry(
+                gate, 'lbl', invoke_fn=cli, backend='claude', prompt='hi',
+            )
+
+        assert got.success is True
+        assert [c['oauth_token'] for c in cli.calls] == ['fake-token-a', 'fake-token-b']
+        assert gate.active_account_name == 'b'
 
 
 # ===================================================================
@@ -3576,16 +3798,16 @@ class TestCapRetryResumeDeliversPrompt:
 
 @pytest.mark.asyncio
 class TestCapRetryResumeFailureRebuildsPrompt:
-    """When a live-continuation resume (resume_delivers_prompt=True) fails
-    with a non-cap error, the fresh-fallback retry must rebuild context via
-    the caller's rebuild_prompt hook rather than reusing the stale
-    continuation original_prompt.
+    """When the CLI rejects a live-continuation resume
+    (resume_delivers_prompt=True), the fresh-fallback retry must rebuild
+    context via the caller's rebuild_prompt hook rather than reusing the
+    stale continuation original_prompt.
 
     With resume_delivers_prompt=True, original_prompt IS the continuation
     prompt (valid only inside the resumed session) — handing it back
     unchanged to a brand-new session is context-less. This mirrors the two
     existing fresh-fallback rebuild call sites (TestCapRetryRebuildPrompt)
-    for the third, non-cap-hit resume-failure site.
+    for the third, resume-rejection site.
     """
 
     async def test_non_cap_resume_failure_rebuilds_prompt(self):
@@ -3595,10 +3817,7 @@ class TestCapRetryResumeFailureRebuildsPrompt:
             detect_cap_hit=MagicMock(side_effect=[False, False]),
             active_account_name='acct',
         )
-        # cost_usd defaults to 0.5 in make_result, so this does NOT trip the
-        # zero-cost heuristic — it routes through the non-cap resume-failure
-        # branch.
-        resume_fail = make_result(success=False, output='resume broke')
+        resume_fail = measured_resume_rejection('sess-1')
         ok = make_result()
         rebuild = AsyncMock(return_value='REBUILT-FULL-PROMPT')
         with (
@@ -3628,7 +3847,7 @@ class TestCapRetryWedgeAndAuthRebuildPrompt:
     """The two remaining reset-to-fresh branches — zero-output-wedge
     (cli_invoke.py ~961) and auth-failure (~923) — must ALSO rebuild context
     via the caller's ``rebuild_prompt`` hook, mirroring the fix step-7 applied
-    to the non-cap resume-failure branch (``TestCapRetryResumeFailureRebuildsPrompt``).
+    to the resume-rejection branch (``TestCapRetryResumeFailureRebuildsPrompt``).
 
     With ``resume_delivers_prompt=True`` (the steward), ``original_prompt`` IS
     the per-escalation continuation prompt — valid only inside the resumed

@@ -20,12 +20,13 @@ const {
   unknownDatum: unknownDatumPlaceholder,
 } = window.DF_DATUM;
 
-// The surface -> endpoint maps that decide what is polled (pollSetFor). Module
-// scope, no fallback, RENAMED, for the same reason as the destructure above.
+// poll_scope.js's surface -> endpoint maps, which decide what is polled
+// (pollSetFor). Module scope, no fallback, RENAMED, for the same reason as the
+// destructure above: poll_scope.js owns the bare names.
 const {
   TAB_ENDPOINTS: POLL_TAB_ENDPOINTS,
   CHROME_ENDPOINTS: POLL_CHROME_ENDPOINTS,
-} = window.DF_ENDPOINT_STALENESS;
+} = window.DF_POLL_SCOPE;
 
 // How the wire delivers a key: 'plain' is a bare value, 'datum' is the
 // five-key envelope data/datum.py::Datum.to_wire() emits. Two shared frozen
@@ -60,7 +61,8 @@ function endpointsFor(win) {
   return {
     '/api/v2/dashboard/orchestrators':                { 'ORCHESTRATORS': PLAIN, 'PROJECTS': PLAIN, 'ORCHESTRATORS_SPARK': PLAIN },
     '/api/v2/dashboard/tasks':                        { 'TASKS_OFFLINE': PLAIN, 'TASKS_OFFLINE_PROJECTS': PLAIN,
-                                                        'TASKS_DEGRADED_PROJECTS': PLAIN, 'TASKS_COUNT_UNKNOWN_PROJECTS': PLAIN, 'TASKS_PROJECT_COUNT': PLAIN,
+                                                        'TASKS_DEGRADED_PROJECTS': PLAIN, 'TASKS_COUNT_UNKNOWN_PROJECTS': PLAIN,
+                                                        'TASKS_COUNT_STALE_PROJECTS': PLAIN, 'TASKS_PROJECT_COUNT': PLAIN,
                                                         'TASKS_SNAPSHOT': PLAIN },
     '/api/v2/dashboard/invariants':                   { 'INVARIANTS': PLAIN },
     '/api/v2/dashboard/memory':                       { 'MEMORY_STATUS': PLAIN },
@@ -153,6 +155,8 @@ window.DF_DATA = {
   // the done count was never measured — neither offline nor degraded. Without
   // this list they would render as healthy with a confident "0 done".
   TASKS_COUNT_UNKNOWN_PROJECTS: [],
+  // Projects whose census is shown from its last measurement, with its age.
+  TASKS_COUNT_STALE_PROJECTS: [],
   // N for the banner's "k of N": how many task project roots the tasks handler
   // fanned out over. Comes from the server so it denominates the same
   // population TASKS_OFFLINE_PROJECTS is drawn from — PROJECTS (orchestrator-
@@ -199,14 +203,15 @@ window.DF_DATA = {
     verdict: null,
     runs: [],
   },
-  // MERGE_QUEUE: {project_label: {depth, outcomes, latency: {p50, p95, p99,
-  //   mean_ms, with_duration, without_duration}, recent, recent_total: Datum,
+  // MERGE_QUEUE: {project_label: {depth: Datum ({labels, values,
+  //   bucket_minutes}), attempts: Datum ({outcomes, latency: {p50, p95, p99,
+  //   mean_ms, with_duration, without_duration}}), recent, recent_total: Datum,
   //   speculative: Datum, active, in_queue: Datum, live_probe_configured,
   //   active_spark, halt, train_events:
   //   [{event_type, task_id, run_id, timestamp, data: {train_id,
-  //   member_task_ids, ...event-specific keys}}]}}; every recent and active
-  //   row's title is a Datum. The payload's top-level served_at is the receipt
-  //   merge_queue.js stamps those Datums with.
+  //   member_task_ids, ...event-specific keys}}], train_throughput: Datum}};
+  //   every recent and active row's title is a Datum. The payload's top-level
+  //   served_at is the receipt merge_queue.js stamps those Datums with.
   MERGE_QUEUE: {},
   COSTS: {
     summary: { total: 0, runs: 0, today: 0, tokens: null, p95_run_cost: null, delta_pct: null, delta_hint: null },
@@ -333,9 +338,14 @@ window.DF_DATA = {
   // Do not reintroduce it.
   __stale: {},
   // Per-endpoint RECEIPTS, keyed by the same flow-control key __stale uses:
-  // each entry is `{servedAt, receivedAt, window}`, published by refreshOne
-  // on the SUCCESS path only. datum.js::plainDatum reads this to give a value
-  // that is not yet served as a Datum the provenance it does have.
+  // each entry is `{servedAt, receivedAt, window, pacingHoldMs}`, published by
+  // refreshOne on the SUCCESS path only. datum.js::plainDatum reads this to
+  // give a value that is not yet served as a Datum the provenance it does have.
+  //
+  // `pacingHoldMs` is the slowness-pacing hold this success imposed, measured
+  // from its request's start (0 when not paced); datum.js::plainDatum adds it
+  // to its bound. It shares the success-only lifetime because it describes the
+  // delivery that put these values on screen.
   //
   // `window` is the served-window echo (`WINDOW: {requested, served, days}`)
   // the four windowed endpoints carry, or null. It lives here, not in the key
@@ -479,22 +489,23 @@ function recordFailure(st, forced, deps) {
 // data_poll.test.mjs's "Slowness pacing" section.
 const MAX_POLL_DUTY_CYCLE = 0.5;
 
-// Unlike recordFailure, a forced attempt still paces: pacing is a pure
-// function of the latest measurement, so clicks cannot inflate it.
 // Pacing never holds an endpoint past BACKOFF_MAX_MS after its request started.
 // The fetch deadline does not bound serviceMs: it races only fetchImpl, so a
 // slow body read, an injected deps.timeoutMs or a wall-clock jump
 // (suspend/resume) can each exceed it, and uncapped would freeze the endpoint
 // with failures at 0 and no staleness banner.
-function recordSuccess(st, deps, startedAt, receivedAt) {
-  const serviceMs = receivedAt - startedAt;
+function slownessPacingHoldMs(deps, serviceMs) {
   const paced = deps.pollIntervalMs !== undefined
     && serviceMs > MAX_POLL_DUTY_CYCLE * deps.pollIntervalMs;
+  return paced ? Math.min(serviceMs / MAX_POLL_DUTY_CYCLE, BACKOFF_MAX_MS) : 0;
+}
+
+// Unlike recordFailure, a forced attempt still paces: pacing is a pure
+// function of the latest measurement, so clicks cannot inflate it.
+function recordSuccess(st, startedAt, receivedAt, holdMs) {
   st.failures = 0;
   st.lastSuccessAt = receivedAt;
-  st.nextAllowedAt = paced
-    ? startedAt + Math.min(serviceMs / MAX_POLL_DUTY_CYCLE, BACKOFF_MAX_MS)
-    : 0;
+  st.nextAllowedAt = holdMs > 0 ? startedAt + holdMs : 0;
 }
 
 // Jitter: spreads the 13 endpoint fetches across part of the 3s interval
@@ -722,9 +733,11 @@ async function refreshOne(url, keySpecs, state, deps, stateKey = pollKey(url)) {
     // ONE clock reading for the whole response, so every key it carries shares
     // a single arrival instant — and so `lastSuccessAt` below cannot drift
     // from `receivedAt` by however long the applies took.
-    const receipt = { servedAt: body.served_at ?? null, receivedAt: deps.now(), window: body.WINDOW ?? null };
+    const receivedAt = deps.now();
+    const pacingHoldMs = slownessPacingHoldMs(deps, receivedAt - startedAt);
+    const receipt = { servedAt: body.served_at ?? null, receivedAt, window: body.WINDOW ?? null, pacingHoldMs };
     Object.entries(keySpecs).forEach(([k, spec]) => applyKey(k, body[k], spec, receipt));
-    recordSuccess(st, deps, startedAt, receipt.receivedAt);
+    recordSuccess(st, startedAt, receivedAt, pacingHoldMs);
     publishReceipt(stateKey, receipt);
     return REFRESH_OUTCOMES.applied;
   } catch (err) {
@@ -749,9 +762,10 @@ let currentWin = '24h';
 
 // Module-scope tab — announced by app.jsx through scopePollingToTab(tab).
 //
-// THE POLL SET IS CHROME_ENDPOINTS ∪ TAB_ENDPOINTS[tab] (pollSetFor): the open
-// tab's own endpoints in full, plus the always-on chrome, with /tasks narrowed
-// to ?projection=census whenever the tab itself does not list it.
+// THE POLL SET IS CHROME_ENDPOINTS ∪ TAB_ENDPOINTS[tab] (pollSetFor), both
+// declared in poll_scope.js: the open tab's own endpoints in full, plus the
+// always-on chrome, with /tasks narrowed to ?projection=census whenever the
+// tab itself does not list it.
 //
 // UNTIL A TAB IS NAMED, OR FOR A TAB ID WITH NO TAB_ENDPOINTS ENTRY, EVERY
 // ENDPOINT IS POLLED. The script-load first poll runs before the text/babel

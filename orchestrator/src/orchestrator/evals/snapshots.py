@@ -307,7 +307,7 @@ async def get_diff(worktree_path: Path, base_commit: str) -> str:
     """Get the full committed diff of an eval worktree vs its base commit.
 
     ``base_commit`` is the authoritative ``task['pre_task_commit']`` carried
-    on the task record — the same base ``metrics._git_diff_stats`` uses. The
+    on the task record — the same base ``runner._git_diff_stats`` uses. The
     diff is ``git diff {base_commit}..HEAD`` (two-dot range), i.e. the full
     change committed on the ``evals/<id>`` branch.
 

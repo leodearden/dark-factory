@@ -10,6 +10,9 @@ All other escalations start at L0 (level=0) and are promoted by handlers.
 
 L2 cluster fields (default-empty; L0/L1 are unaffected):
   members:    list of member L1 escalation ids forming this cluster
+  member_folded_at:
+              member id -> ISO time a fold appended it (`queue.add_members_to_l2`);
+              members present at creation are absent and joined at `timestamp`
   root_cause: dedup key for pending-L2 lookup, matched on its CANONICAL form
               (`escalation.canonical.canonical_root_cause`; task 3998), so
               near-duplicates differing only in case/whitespace/punctuation fold.
@@ -21,24 +24,32 @@ Structured-evidence field (default-empty; task 2558):
   evidence:   list of EvidenceEntry {observation, measured_at, ref} raw
               OBSERVATIONS backing the escalation (not causal diagnoses)
 
+Pause-detector trip facts (default None; task 4686):
+  ewa_rate_trip / park_stop_trip:
+              EwaRateTripFacts / ParkStopTripFacts carried by the escalation
+              a non-halting pause detector files instead of halting
+
 Incoming-framing amendments (default-empty; task 3997):
   amendments: append-only list of Amendment entries -- the framing
               (root_cause/summary/detail/options) a fold carried in, preserved
               instead of discarded.  NEVER overwrites the record's own fields
               above: the original human-facing framing stays immutable.
   amendments_truncated:
-              count of oldest entries shed to the `queue._MAX_AMENDMENTS` cap;
+              count of oldest entries shed to the
+              `escalation/src/escalation/amendments.py::MAX_AMENDMENTS` cap;
               a durable structured fact so the loss is assertable from the
               record rather than only by log-scrape.
   amendments_chars_elided:
               the BYTE-side counterpart: count of characters dropped by the
-              per-field caps (`queue._MAX_AMENDMENT_LINE_CHARS` /
-              `_MAX_AMENDMENT_DETAIL_CHARS` / `_MAX_AMENDMENT_OPTIONS`).  An
+              per-field caps in `escalation/src/escalation/amendments.py`
+              (`MAX_AMENDMENT_LINE_CHARS` / `MAX_AMENDMENT_DETAIL_CHARS` /
+              `MAX_AMENDMENT_OPTIONS`).  An
               entry count alone bounds nothing when one field is unbounded free
               text, so the two counters together are what make the list's size
               envelope assertable from the record.
-  APPEND-AND-TRIM POLICY: `queue._append_amendment_capped`, the single home
-  every writer of these three fields goes through.
+  APPEND-AND-TRIM POLICY:
+  `escalation/src/escalation/amendments.py::append_amendment_capped`, the
+  single home every writer of these three fields goes through.
 
 Over-fold evidence (default-empty; task 3998):
   root_cause_variants:
@@ -126,7 +137,7 @@ import json
 import logging
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
-from typing import TypedDict
+from typing import Literal, TypedDict
 
 logger = logging.getLogger(__name__)
 
@@ -143,6 +154,29 @@ class TrainState(TypedDict):
     order: int            # this task's position in the train (0-based)
     parked_members: list[str]  # sibling task_ids at merge-deferred, excluding self
     failing_member: str   # this task's id (the one that triggered BLOCKED)
+
+
+SidecarOnMain = Literal['declares', 'does_not_declare', 'unverified']
+
+
+class CheckSidecarSite(TypedDict):
+    """The owner's capability-manifest sidecar, as read at main when the escalation was filed."""
+
+    path: str  # shared.capability_manifest.sidecar_path(owner's metadata.prd_path), repo-relative
+    on_main: SidecarOnMain
+
+
+class DeliveredCheckOwner(TypedDict):
+    """Who declares a failing delivered check, and where (`dependency_capability`, task 7514).
+
+    `task_id` is the DEPENDENCY whose metadata.delivered_checks carries `check_name`;
+    the record's own task_id is the blocked dependent, which is only ever re-pended.
+    `sidecar` is None when the owner has no prd_path.
+    """
+
+    task_id: str
+    check_name: str
+    sidecar: CheckSidecarSite | None
 
 
 class IndexHealthState(TypedDict):
@@ -168,6 +202,41 @@ class IndexHealthState(TypedDict):
     missing: list[list[str]]       # expected-but-absent specs, sorted
     unexpected: list[list[str]]    # present-but-unexpected specs (reported, never acted on)
     expected_total: int            # size of the expected set this was diffed against
+
+
+class EwaRateTripFacts(TypedDict):
+    """The EWA submission-rate detector's facts at the moment it tripped.
+
+    Carried as FIRST-CLASS FIELDS so no consumer scrapes prose for a fact the
+    detector already had in a variable (INV-2;
+    plans/scheduler-pause-halt-retirement-prd.md §6 invariant 5).
+
+    TypedDict at runtime is a plain dict; existing from_dict / to_dict /
+    asdict() paths are unaffected — round-trip fidelity is unchanged.
+    """
+
+    ewa: float                 # the EWA of submissions per done that tripped
+    threshold: float           # the configured trip threshold
+    ratio: float               # this step's submissions / max(dones, 1)
+    window_secs: float         # the digest window the ratio was measured over
+    dones_in_window: int       # tasks that reached done in that window
+    submissions_in_step: int   # tasks submitted in that step
+
+
+class ParkStopTripFacts(TypedDict):
+    """The park-stop detector's facts at the moment it tripped.
+
+    Carried as FIRST-CLASS FIELDS so no consumer scrapes prose for a fact the
+    detector already had in a variable (INV-2;
+    plans/scheduler-pause-halt-retirement-prd.md §6 invariant 5).
+
+    TypedDict at runtime is a plain dict; existing from_dict / to_dict /
+    asdict() paths are unaffected — round-trip fidelity is unchanged.
+    """
+
+    blocked_in_window: int     # tasks that transitioned to blocked in the window
+    window_secs: float         # the sliding window those transitions were counted in
+    threshold: int             # the configured trip threshold
 
 
 class EvidenceEntry(TypedDict):
@@ -216,8 +285,9 @@ class Amendment(TypedDict):
     the write chokepoint owns its clock (mirroring `stamp_triage`/`triaged_at`),
     so a caller cannot backdate an amendment.
 
-    Every free-text field is stored ELIDED to the queue's per-field caps, with
-    an in-band marker naming what was dropped (`queue._build_amendment`), and
+    Every free-text field is stored ELIDED to the amendments module's per-field
+    caps, with an in-band marker naming what was dropped
+    (`escalation/src/escalation/amendments.py::_build_amendment`), and
     `options` is capped in length.  A field ending in that marker is the HEAD of
     what was submitted, not all of it; the record-level `amendments_chars_elided`
     holds the running character total.
@@ -434,9 +504,15 @@ AGENT_FILABLE_LEVELS: frozenset[int] = frozenset({0, 1})
 # 'moot-terminal-subject' they are deliberately neither 'benign' nor
 # 'actionable'.  The decision vocabulary lives in
 # escalation/src/escalation/disposition.py.
+#
+# NOTE_TO_FILE_CLASS is stamped only by escalate_info(note_to_file=True), filed
+# resolved at filing; like 'moot-terminal-subject' it is neither benign nor
+# actionable.  Rationale: plans/plan-deviation-recording-prd.md D2.
+NOTE_TO_FILE_CLASS: str = 'note-to-file'
 RESOLUTION_CLASSES: frozenset[str] = frozenset({
     'benign', 'actionable', 'moot-terminal-subject', 'stale-strand',
     'addressed', 'observation-consumed', 'converted', 'status-info',
+    NOTE_TO_FILE_CLASS,
 })
 
 
@@ -490,6 +566,10 @@ class Escalation:
     # Old JSON files (pre-L2) deserialise correctly via from_dict's __dataclass_fields__
     # filter: absent keys map to the dataclass defaults without any migration required.
     members: list[str] = field(default_factory=list)  # member L1 escalation ids (cluster composition)
+    # Member id -> ISO time a promote_to_l2 fold appended it.  Members present
+    # at creation are absent: they joined at `timestamp`.  SOLE WRITER:
+    # `queue.add_members_to_l2`.  Zero migration via the from_dict filter.
+    member_folded_at: dict[str, str] = field(default_factory=dict)
     root_cause: str = ''  # root-cause hypothesis; dedup key for pending-L2 lookup, matched on its CANONICAL form (task 3998) but stored verbatim
     options: list[str] = field(default_factory=list)  # proposed resolution options ['A: ...', 'B: ...']
     # Structured raw-OBSERVATION entries backing this escalation (task 2558).
@@ -513,6 +593,12 @@ class Escalation:
     # _atomic_write / resolve / park / stamp_triage are field-agnostic
     # passthroughs that need no change.
     index_health: IndexHealthState | None = None
+    # Task 7514 — the dependency that declares the failing delivered check, for
+    # `dependency_capability` escalations filed by the harness.  None for every
+    # other escalation kind; legacy JSON (pre-field) deserialises to None via the
+    # from_dict __dataclass_fields__ filter — zero migration, same pattern as
+    # train_state / index_health above.
+    delivered_check_owner: DeliveredCheckOwner | None = None
     # C1 action chosen at resolve_issue time (resume/restart/park/abandon/close_only).
     # None for records resolved before α1 or for L2 cascade members (β derives theirs
     # from the parent via resolved_by='l2-cascade:<id>' attribution).
@@ -570,9 +656,9 @@ class Escalation:
     # overwrites this record's own root_cause / detail / options / summary — the
     # original human-facing framing is immutable and every incoming reframing is
     # kept alongside it.  Every writer appends through
-    # `queue._append_amendment_capped`, the single home of the append-and-trim
-    # policy (it sheds the OLDEST past `queue._MAX_AMENDMENTS`, counting each
-    # drop in amendments_truncated).  Zero migration, same pattern
+    # `escalation/src/escalation/amendments.py::append_amendment_capped`, the
+    # single home of the append-and-trim policy (it sheds the OLDEST past
+    # `MAX_AMENDMENTS` there, counting each drop in amendments_truncated).  Zero migration, same pattern
     # as members / evidence / train_state / the triage quad / granted_files /
     # filing_claimant_run_id above: legacy JSON without these keys deserialises
     # to the defaults via the from_dict __dataclass_fields__ filter below,
@@ -616,8 +702,9 @@ class Escalation:
     # by is that failure's only observable signature.
     #
     # NOT DERIVABLE FROM `amendments`, which is why this is a field and not a
-    # scan: that list sheds its OLDEST entries at `queue._MAX_AMENDMENTS` and
-    # elides each field at `_MAX_AMENDMENT_LINE_CHARS`, so a derived count would
+    # scan: that list sheds its OLDEST entries at
+    # `escalation/src/escalation/amendments.py::MAX_AMENDMENTS` and elides each
+    # field at `MAX_AMENDMENT_LINE_CHARS` there, so a derived count would
     # silently plateau and then UNDER-report precisely during the runaway the
     # count exists to catch — reintroducing the silent suppression it is meant to
     # close.
@@ -705,8 +792,29 @@ class Escalation:
     # `fused_memory/reconciliation/orphaned_recon_escalation_sweep.py::escalation_project_id`.
     # Zero migration by the same from_dict __dataclass_fields__ filter as
     # every field above.  Deliberately NOT added to
-    # `_COMPACT_ESCALATION_FIELDS` (server.py) — its readers load full records.
+    # `_COMPACT_ESCALATION_FIELDS` (server.py) — its readers load full records;
+    # the reasoning (task 5776, won't-fix) is recorded beside that tuple.
     project_id: str | None = None
+    # NOTE TO FILE (plans/plan-deviation-recording-prd.md D2) — a filer-declared
+    # record that requests nothing: never pending (EscalationQueue.submit), and
+    # filed by EscalationQueue.submit_resolved.  Every resolution-class stamp
+    # site refuses this flag without NOTE_TO_FILE_CLASS, and that class without
+    # this flag, via note_to_file_class_conflict.  Zero migration via the
+    # from_dict filter.
+    note_to_file: bool = False
+    # Trip facts from the EWA-rate detector (task 4687) and the park-stop
+    # detector (task 4688) when they escalate instead of halting.  None for
+    # every other escalation; zero migration via the from_dict
+    # __dataclass_fields__ filter.
+    ewa_rate_trip: EwaRateTripFacts | None = None
+    park_stop_trip: ParkStopTripFacts | None = None
+    # The executor's policy-class claim (task 8422). Sole writer:
+    # queue.claim_policy_class. The fields survive resolution, so a closed
+    # record still names the class it was closed under. Zero migration via the
+    # from_dict filter.
+    policy_class: str | None = None
+    claimed_at: str | None = None
+    claimed_by: str | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -721,3 +829,14 @@ class Escalation:
     @classmethod
     def from_json(cls, text: str) -> Escalation:
         return cls.from_dict(json.loads(text))
+
+
+def note_to_file_class_conflict(escalation: Escalation, resolution_class: str | None) -> str | None:
+    """Why *escalation* cannot carry *resolution_class* under the note-to-file pairing, else None."""
+    if escalation.note_to_file == (resolution_class == NOTE_TO_FILE_CLASS):
+        return None
+    return (
+        f'escalation {escalation.id}: note_to_file={escalation.note_to_file} with '
+        f'resolution_class={resolution_class!r}; {NOTE_TO_FILE_CLASS!r} is stamped on a '
+        'note_to_file record and on nothing else'
+    )

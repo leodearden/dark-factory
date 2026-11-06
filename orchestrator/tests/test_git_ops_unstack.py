@@ -2,9 +2,13 @@
 
 stack_train_branches records the base each member was stacked onto, and
 GitOps.unstack_from_unlanded_base strips a never-landed base's commits from a
-member so the member carries only its own delta.  stack_train_branches also
-reports each member's tip from just before stacking, and
-GitOps.restore_pre_stack_tip puts a member back on it (task 4953).
+member so the member carries only its own delta.  The train's anchor is
+un-stacked too, before anything is stacked onto it (task 6133).
+stack_train_branches also reports each member's tip from just before
+stacking, and
+GitOps.restore_pre_stack_tip puts a member back on it (task 4953).  A
+requeued member resumed through GitOps._reuse_warm_lane is un-stacked first
+(task 6219).
 
 Real temp git repositories throughout.  Members live at
 ``git_ops.worktree_base / <id>`` on branch ``task/<id>``, the layout
@@ -28,6 +32,7 @@ from pathlib import Path
 import pytest
 import pytest_asyncio
 
+from orchestrator.artifacts import TaskArtifacts
 from orchestrator.branch_stack import (
     STACKED_ON_UNLANDED_BASE_REASON_PREFIX,
     PreStackTip,
@@ -37,7 +42,7 @@ from orchestrator.branch_stack import (
     UnstackResult,
 )
 from orchestrator.config import GitConfig
-from orchestrator.git_ops import GitOps, _run
+from orchestrator.git_ops import GitOps, WorktreeInfo, _run
 
 # ---------------------------------------------------------------------------
 # Helpers (copied locally from test_git_ops_train_solo.py, per-file convention)
@@ -243,6 +248,65 @@ class TestStackRecordsBase:
         assert second.survivors == ['P2', 'M']
         assert await _diff_vs_main(repo.root, 'task/M') == {'p2.txt', 'm.txt'}
         assert await repo.ledger.base_of('task/M') == await repo.sha('task/P2')
+
+
+# ---------------------------------------------------------------------------
+# stack_train_branches un-stacks the anchor too (task 6133)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestStackUnstacksTheAnchor:
+    async def test_anchor_stacked_on_an_unlanded_base_is_stacked_from_its_own_delta(
+        self, repo: Repo,
+    ) -> None:
+        await _stack_p_and_m(repo)
+        await _add_member(repo.git_ops, 'X', 'main', {'x.txt': 'x\n'})
+
+        result = await repo.git_ops.stack_train_branches(['M', 'X'])
+
+        assert result.survivors == ['M', 'X']
+        assert await _diff_vs_main(repo.root, 'task/M') == {'m.txt'}
+        assert await _diff_vs_main(repo.root, 'task/X') == {'m.txt', 'x.txt'}
+        assert await repo.ledger.base_of('task/M') is None
+        assert await repo.ledger.base_of('task/X') == await repo.sha('task/M')
+
+    async def test_anchor_that_cannot_be_unstacked_abandons_the_train(
+        self, repo: Repo,
+    ) -> None:
+        await _stack_p_and_m(repo)
+        await _add_member(repo.git_ops, 'X', 'main', {'x.txt': 'x\n'})
+        (repo.wt('M') / 'm.txt').write_text('uncommitted edit\n')
+        m_before = await repo.sha('task/M')
+        x_before = await repo.sha('task/X')
+
+        result = await repo.git_ops.stack_train_branches(['M', 'X'])
+
+        assert (result.survivors, result.ejected, result.pre_stack_tips) == (
+            [], ['M'], (),
+        )
+        assert await repo.sha('task/X') == x_before
+        assert await repo.sha('task/M') == m_before
+        assert await repo.ledger.base_of('task/X') is None
+        assert await repo.ledger.base_of('task/M') == await repo.sha('task/P')
+        assert (repo.wt('M') / 'm.txt').read_text() == 'uncommitted edit\n'
+
+    async def test_anchor_whose_own_delta_conflicts_abandons_the_train(
+        self, repo: Repo,
+    ) -> None:
+        await _stack_p_and_m(repo, m_writes={'m.txt': 'm\n', 'other.txt': 'm\n'})
+        await repo.advance_main({'shared.txt': 'main\n', 'other.txt': 'main\n'})
+        await _add_member(repo.git_ops, 'X', 'main', {'x.txt': 'x\n'})
+        m_before = await repo.sha('task/M')
+        x_before = await repo.sha('task/X')
+
+        result = await repo.git_ops.stack_train_branches(['M', 'X'])
+
+        assert (result.survivors, result.ejected) == ([], ['M'])
+        assert await repo.sha('task/X') == x_before
+        assert await repo.sha('task/M') == m_before
+        assert await repo.ledger.base_of('task/X') is None
+        assert await repo.ledger.base_of('task/M') == await repo.sha('task/P')
 
 
 # ---------------------------------------------------------------------------
@@ -575,6 +639,195 @@ class TestRestorePreStackTip:
         assert await _rev_parse(repo.wt('M'), 'HEAD') == stacked
         assert (await _git(repo.wt('M'), 'status', '--porcelain')).strip() == ''
         assert await repo.ledger.base_of('task/M') == await repo.sha('task/P')
+
+
+# ---------------------------------------------------------------------------
+# A requeue through GitOps._reuse_warm_lane is un-stacked first (task 6219)
+# ---------------------------------------------------------------------------
+
+
+def _seed_warm_base(root: Path) -> None:
+    """Copy of test_git_ops.py::_seed_default_warm_base: a non-empty warm base
+    and the ``.pool-root`` sentinel, so acquire_warm_lane's base-health gate
+    and create-once mount guard admit."""
+    base = root / '.worktrees' / '_merge-verify' / 'target'
+    base.mkdir(parents=True, exist_ok=True)
+    (base / '.keep').write_text('warm base sentinel\n')
+    (root / '.worktrees' / '.pool-root').touch()
+
+
+async def _commit_warm_lane_scripts(root: Path) -> None:
+    """Commit the seed-warm-lane.sh stub test_git_ops.py::_add_warm_lane_scripts
+    uses, plus a .gitignore that keeps the seeded target/ out of every commit."""
+    seed = root / 'scripts' / 'seed-warm-lane.sh'
+    seed.parent.mkdir(parents=True, exist_ok=True)
+    seed.write_text(
+        '#!/usr/bin/env bash\nmkdir -p "$2/target"\necho seeded > "$2/target/seeded.bin"\n'
+    )
+    seed.chmod(0o755)
+    (root / '.gitignore').write_text('target/\n')
+    await _git(root, 'add', '--', 'scripts/seed-warm-lane.sh', '.gitignore')
+    await _git(root, 'commit', '-m', 'add warm-lane seed stub')
+
+
+@pytest_asyncio.fixture
+async def warm_repo(tmp_path: Path) -> Repo:
+    root = tmp_path / 'repo'
+    root.mkdir()
+    await _init_repo(root)
+    await _commit_files(root, {'shared.txt': 'v0\n', 'other.txt': 'v0\n'}, 'initial')
+    await _commit_warm_lane_scripts(root)
+    _seed_warm_base(root)
+    cfg = GitConfig(
+        main_branch='main',
+        branch_prefix='task/',
+        remote='origin',
+        worktree_dir='.worktrees',
+        push_after_advance=False,
+        warm_lane_pool=True,
+    )
+    return Repo(root=root, git_ops=GitOps(cfg, root, warm_lane_pool_size=1))
+
+
+def _lane(repo: Repo) -> Path:
+    pool = repo.git_ops.warm_lane_pool
+    assert pool is not None
+    return pool.lane_paths()[0]
+
+
+async def _release_into_lane(repo: Repo, name: str) -> Path:
+    """Move member *name*'s worktree into the pool lane and release it there,
+    leaving the shape the disk-backstop route sees: a detached lane whose HEAD
+    is the branch tip and whose metadata.json names the task."""
+    lane = _lane(repo)
+    await _git(repo.root, 'worktree', 'move', str(repo.wt(name)), str(lane))
+    TaskArtifacts.for_task(lane, name).init(name, name, '')
+    await repo.git_ops.release_warm_lane(lane, name)
+    assert (await _git(lane, 'rev-parse', '--abbrev-ref', 'HEAD')).strip() == 'HEAD'
+    return lane
+
+
+async def _assert_resumed_on_own_delta(repo: Repo) -> None:
+    assert await _diff_vs_main(repo.root, 'task/M') == {'m.txt'}
+    assert await repo.git_ops.is_ancestor('main', 'task/M')
+    assert await repo.ledger.base_of('task/M') is None
+
+
+async def _assert_attached_to_m(wt: Path, repo: Repo) -> None:
+    assert (await _git(wt, 'symbolic-ref', 'HEAD')).strip() == 'refs/heads/task/M'
+    assert await _rev_parse(wt, 'HEAD') == await repo.sha('task/M')
+
+
+@pytest.mark.asyncio
+class TestRequeueReuseUnstacks:
+    async def test_detached_lane_requeue_resumes_on_own_delta(
+        self, warm_repo: Repo,
+    ) -> None:
+        await _stack_p_and_m(warm_repo)
+        lane = await _release_into_lane(warm_repo, 'M')
+        main_sha = await warm_repo.advance_main({'unrelated.txt': 'main moved\n'})
+
+        info = await warm_repo.git_ops.acquire_warm_lane('M', main_sha)
+
+        assert isinstance(info, WorktreeInfo)
+        assert info.path == lane
+        await _assert_attached_to_m(lane, warm_repo)
+        await _assert_resumed_on_own_delta(warm_repo)
+
+    async def test_reattached_lane_requeue_resumes_on_own_delta(
+        self, warm_repo: Repo,
+    ) -> None:
+        await _stack_p_and_m(warm_repo)
+        await _git(warm_repo.root, 'worktree', 'remove', '--force', str(warm_repo.wt('M')))
+        main_sha = await warm_repo.advance_main({'unrelated.txt': 'main moved\n'})
+
+        info = await warm_repo.git_ops.acquire_warm_lane('M', main_sha)
+
+        assert isinstance(info, WorktreeInfo)
+        assert info.path == _lane(warm_repo)
+        await _assert_attached_to_m(info.path, warm_repo)
+        await _assert_resumed_on_own_delta(warm_repo)
+
+    async def test_cold_reattach_resumes_on_own_delta(self, repo: Repo) -> None:
+        await _stack_p_and_m(repo)
+        await _git(repo.root, 'worktree', 'remove', '--force', str(repo.wt('M')))
+        await repo.advance_main({'unrelated.txt': 'main moved\n'})
+
+        info = await repo.git_ops.create_worktree('M')
+
+        assert info.path == repo.wt('M')
+        await _assert_resumed_on_own_delta(repo)
+
+    async def test_conflicting_unstack_leaves_the_lane_on_its_old_base(
+        self, warm_repo: Repo,
+    ) -> None:
+        await _stack_p_and_m(warm_repo)
+        await _commit_files(warm_repo.wt('M'), {'shared.txt': 'm on p\n'}, 'M builds on P')
+        tip_before = await warm_repo.sha('task/M')
+        p_tip = await warm_repo.sha('task/P')
+        lane = await _release_into_lane(warm_repo, 'M')
+        main_sha = await warm_repo.advance_main({'unrelated.txt': 'main moved\n'})
+
+        info = await warm_repo.git_ops.acquire_warm_lane('M', main_sha)
+
+        assert isinstance(info, WorktreeInfo)
+        assert info.path == lane
+        assert await warm_repo.sha('task/M') == tip_before
+        assert (await _git(lane, 'symbolic-ref', 'HEAD')).strip() == 'refs/heads/task/M'
+        await _assert_clean_and_not_rebasing(lane)
+        assert await warm_repo.ledger.base_of('task/M') == p_tip
+
+    async def test_failed_rebind_leaves_the_detached_lane_on_its_old_base(
+        self, warm_repo: Repo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        await _stack_p_and_m(warm_repo)
+        tip_before = await warm_repo.sha('task/M')
+        p_tip = await warm_repo.sha('task/P')
+        lane = await _release_into_lane(warm_repo, 'M')
+        main_sha = await warm_repo.advance_main({'unrelated.txt': 'main moved\n'})
+        shim = tmp_path / 'shim'
+        _fail_git(monkeypatch, shim, 'checkout -B task/M')
+
+        info = await warm_repo.git_ops.acquire_warm_lane('M', main_sha)
+
+        assert (shim / 'matched').exists()
+        assert isinstance(info, WorktreeInfo)
+        assert info.path == lane
+        assert await warm_repo.sha('task/M') == tip_before
+        assert await _rev_parse(lane, 'HEAD') == tip_before
+        await _assert_clean_and_not_rebasing(lane)
+        assert await warm_repo.ledger.base_of('task/M') == p_tip
+
+    async def test_cold_reattach_of_a_train_successor_keeps_its_stack(
+        self, repo: Repo,
+    ) -> None:
+        await _stack_p_and_m(repo)
+        p_tip = await repo.sha('task/P')
+        await _git(repo.root, 'worktree', 'remove', '--force', str(repo.wt('M')))
+        await repo.advance_main({'unrelated.txt': 'main moved\n'})
+
+        info = await repo.git_ops.create_worktree(
+            'M', train={'id': 'T', 'order': 1, 'members': ['P', 'M']},
+        )
+
+        assert info.path == repo.wt('M')
+        assert await repo.ledger.base_of('task/M') == p_tip
+        assert await _diff_vs_main(repo.root, 'task/M') == {
+            'shared.txt', 'p_only.txt', 'm.txt',
+        }
+
+    async def test_cold_reattach_of_a_train_anchor_is_unstacked(self, repo: Repo) -> None:
+        await _stack_p_and_m(repo)
+        await _git(repo.root, 'worktree', 'remove', '--force', str(repo.wt('M')))
+        await repo.advance_main({'unrelated.txt': 'main moved\n'})
+
+        info = await repo.git_ops.create_worktree(
+            'M', train={'id': 'T', 'order': 0, 'members': ['M']},
+        )
+
+        assert info.path == repo.wt('M')
+        assert await _diff_vs_main(repo.root, 'task/M') == {'m.txt'}
+        assert await repo.ledger.base_of('task/M') is None
 
 
 class TestUnstackResultInvariant:

@@ -1,12 +1,13 @@
-"""Task 4503 end to end: a submission the curator pool cannot judge waits for a real verdict.
+"""End to end: a submission the curator cannot judge waits for a real verdict.
 
 Real components throughout: a :class:`TicketStore` on a file, a
 :class:`TaskInterceptor`, and the :class:`TicketJanitor` that
 ``server/main.py::_build_ticket_janitor`` builds, ticked explicitly. Only the
 curator is a double, except where a real :class:`TaskCurator` meets a real
-frozen :class:`UsageGate`. Neither the janitor nor the interceptor has a clock
-seam, so simulated time is the ticket's age: ``created_at`` is pinned through
-an independent connection, as the store suite does.
+frozen :class:`UsageGate` or a failing LLM call. Neither the janitor nor the
+interceptor has a clock seam, so simulated time is the ticket's age:
+``created_at`` is pinned through an independent connection, as the store suite
+does.
 """
 
 from __future__ import annotations
@@ -20,31 +21,40 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, NamedTuple, TypeVar, cast
-from unittest.mock import patch
+from unittest.mock import ANY, AsyncMock, patch
 
 import pytest
 import pytest_asyncio
+from _curator_helpers import (
+    agent_result,
+    empty_corpus,
+    escalator_double,
+    pool_with_ids,
+    prepared,
+    zot_agent_result,
+)
 from escalation.queue import EscalationQueue
+from shared.cli_invoke import AllAccountsCappedException
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.invocation_outcome import CapHit
 from shared.project_layout import escalation_queue_dir
 from shared.usage_gate import UsageGate
 
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig, TicketJanitorConfig
+from fused_memory.middleware.candidate_key import normalize_title
 from fused_memory.middleware.curation_deferral import DEDUPE_SKIPPED_KEY, DeferReason
-from fused_memory.middleware.task_curator import (
+from fused_memory.middleware.curator_types import (
     CandidateTask,
     CuratorDecision,
     CuratorFailureError,
     PoolWithheld,
     PreparedCandidate,
     RewrittenTask,
-    TaskCurator,
-    normalize_title,
 )
+from fused_memory.middleware.task_curator import TaskCurator
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.middleware.ticket_janitor import TicketJanitor, curation_backlog_anchor
-from fused_memory.middleware.ticket_store import AWAITING_CURATION, TicketStore
+from fused_memory.middleware.ticket_store import TicketStatus, TicketStore
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.server.main import _build_ticket_janitor
 
@@ -77,7 +87,6 @@ class _Curator:
 
     def __init__(self, answer: Callable[[str], Verdict]) -> None:
         self._answer = answer
-        self.batch_raises: deque[BaseException] = deque()
         self.asked: list[str] = []
         self.holding = asyncio.Event()
 
@@ -97,17 +106,10 @@ class _Curator:
     ) -> PreparedCandidate:
         return PreparedCandidate(candidate=candidate, pool=[], pool_sizes={}, prompt_tokens=0)
 
-    async def curate_batch_prepared(
+    async def curate_prepared(
         self, prepared: list[PreparedCandidate], project_id: str, project_root: str,
     ) -> list[CuratorDecision]:
-        if self.batch_raises:
-            raise self.batch_raises.popleft()
         return [await self._verdict(p.candidate.title) for p in prepared]
-
-    async def curate(
-        self, candidate: CandidateTask, project_id: str, project_root: str,
-    ) -> CuratorDecision:
-        return await self._verdict(candidate.title)
 
     def note_created(self, project_id: str, candidate: CandidateTask, task_id: str) -> None:
         return None
@@ -181,7 +183,7 @@ class _Server:
         return store
 
     def interceptor(
-        self, config: FusedMemoryConfig, store: TicketStore, curator: _Curator | None = None,
+        self, config: FusedMemoryConfig, store: TicketStore, curator: _Curator | TaskCurator | None = None,
         **kwargs: Any,
     ) -> TaskInterceptor:
         interceptor = TaskInterceptor(
@@ -192,7 +194,8 @@ class _Server:
         return interceptor
 
     async def boot(
-        self, config: FusedMemoryConfig, curator: _Curator, *, known_projects: dict[str, str] | None = None,
+        self, config: FusedMemoryConfig, curator: _Curator | TaskCurator, *,
+        known_projects: dict[str, str] | None = None,
     ) -> _Run:
         store = await self.open_store()
         interceptor = self.interceptor(config, store, curator)
@@ -236,13 +239,16 @@ async def _resolve(interceptor: TaskInterceptor, ticket_id: str) -> dict:
     )
 
 
-def _parked_answer(reason: DeferReason = DeferReason.ALL_ACCOUNTS_CAPPED) -> dict:
-    return {'status': AWAITING_CURATION, 'reason': f'curation-deferred: {reason}'}
+def _parked_answer(ticket_id: str, reason: DeferReason = DeferReason.ALL_ACCOUNTS_CAPPED) -> dict:
+    return {
+        'status': TicketStatus.AWAITING_CURATION, 'ticket': ticket_id,
+        'reason': f'curation-deferred: {reason}',
+    }
 
 
 async def _park(interceptor: TaskInterceptor, title: str, **kwargs: Any) -> str:
     ticket_id = await _submit(interceptor, title, **kwargs)
-    assert await _resolve(interceptor, ticket_id) == _parked_answer()
+    assert await _resolve(interceptor, ticket_id) == _parked_answer(ticket_id)
     return ticket_id
 
 
@@ -309,13 +315,13 @@ async def test_a_long_outage_never_creates(server):
         _age_ticket(server.db_path, ticket_id, submitted_at - tick * simulated_step)
         await _let_tiny_backoff_pass()
         await _bounded(janitor.tick())
-        assert await _resolve(interceptor, ticket_id) == _parked_answer()
+        assert await _resolve(interceptor, ticket_id) == _parked_answer(ticket_id)
 
     row = await _row(store, ticket_id)
     age = datetime.now(UTC) - datetime.fromisoformat(row['created_at'])
     assert age > 2 * OLD_TERMINAL_BOUND
     assert (row['status'], row['task_id'], row['resolved_at'], row['attempts']) == (
-        AWAITING_CURATION, None, None, ticks + 1,
+        TicketStatus.AWAITING_CURATION, None, None, ticks + 1,
     )
     assert curator.asked == ['Capped work'] * (ticks + 1)
     assert server.taskmaster.add_task_calls == []
@@ -327,12 +333,12 @@ async def test_parked_ticket_survives_restart_and_is_curated_after(server):
     first, first_janitor, first_store = await server.boot(config, _Curator(lambda title: CAPPED))
     ticket_id = await _park(first, 'Capped work')
     await _bounded(first_janitor.tick())
-    assert (await _row(first_store, ticket_id))['status'] == AWAITING_CURATION
+    assert (await _row(first_store, ticket_id))['status'] == TicketStatus.AWAITING_CURATION
     await _bounded(first.close())
 
     curator = _Curator(lambda title: CuratorDecision(action='create', justification='nothing like it'))
     second, second_janitor, second_store = await server.boot(config, curator)
-    assert await _resolve(second, ticket_id) == _parked_answer()
+    assert await _resolve(second, ticket_id) == _parked_answer(ticket_id)
     assert curator.asked == []
 
     await _bounded(second_janitor.tick())
@@ -357,8 +363,8 @@ async def test_requeued_in_flight_ticket_is_reparked_on_restart_not_failed(serve
     curator = _Curator(lambda title: CuratorDecision(action='create', justification='nothing like it'))
     second, second_janitor, second_store = await server.boot(_config(), curator)
     row = await _row(second_store, ticket_id)
-    assert (row['status'], row['attempts'], row['next_attempt_at']) == (AWAITING_CURATION, 1, None)
-    assert await _resolve(second, ticket_id) == _parked_answer()
+    assert (row['status'], row['attempts'], row['next_attempt_at']) == (TicketStatus.AWAITING_CURATION, 1, None)
+    assert await _resolve(second, ticket_id) == _parked_answer(ticket_id)
 
     await _bounded(second_janitor.tick())
 
@@ -396,12 +402,6 @@ async def _frozen_gate() -> UsageGate:
     return gate
 
 
-async def _an_empty_corpus(
-    self: TaskCurator, candidate: CandidateTask, project_id: str, project_root: str,
-) -> tuple[list, dict[str, int], PoolWithheld]:
-    return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
-
-
 @pytest.mark.asyncio
 async def test_submitter_never_hangs_on_a_frozen_pool(server):
     gate = await _frozen_gate()
@@ -413,16 +413,16 @@ async def test_submitter_never_hangs_on_a_frozen_pool(server):
     await _bounded(interceptor.start())
 
     try:
-        with patch.object(TaskCurator, '_build_corpus', _an_empty_corpus):
+        with patch.object(TaskCurator, '_build_corpus', empty_corpus):
             ticket_id = await _submit(interceptor, 'Frozen work')
             answer = await _resolve(interceptor, ticket_id)
     finally:
         await _bounded(gate.shutdown())
 
-    assert answer == _parked_answer()
+    assert answer == _parked_answer(ticket_id)
     row = await _row(store, ticket_id)
     assert (row['status'], row['attempts'], row['defer_reason']) == (
-        AWAITING_CURATION, 1, DeferReason.ALL_ACCOUNTS_CAPPED.value,
+        TicketStatus.AWAITING_CURATION, 1, DeferReason.ALL_ACCOUNTS_CAPPED.value,
     )
     assert server.taskmaster.add_task_calls == []
 
@@ -453,7 +453,7 @@ async def test_one_backlog_escalation_per_outage(server, tmp_path):
     titles = [f'capped-{n}' for n in range(8)] + [f'auth-{n}' for n in range(3)]
     tickets = {title: await _submit(interceptor, title) for title in titles}
     for title, ticket_id in tickets.items():
-        assert await _resolve(interceptor, ticket_id) == _parked_answer(_group_reason(title))
+        assert await _resolve(interceptor, ticket_id) == _parked_answer(ticket_id, _group_reason(title))
     for _ in range(2):
         await _bounded(janitor.tick())
     assert pending_per_group() == {reason: [] for reason in DeferReason}
@@ -464,11 +464,15 @@ async def test_one_backlog_escalation_per_outage(server, tmp_path):
         for _ in range(3):
             await _bounded(janitor.tick())
             for title, ticket_id in tickets.items():
-                assert await _resolve(interceptor, ticket_id) == _parked_answer(_group_reason(title))
+                assert await _resolve(interceptor, ticket_id) == _parked_answer(ticket_id, _group_reason(title))
 
     pending = pending_per_group()
-    assert {reason: len(records) for reason, records in pending.items()} == {
+    parked_reasons = {DeferReason.ALL_ACCOUNTS_CAPPED, DeferReason.ACCOUNTS_AUTH_FAILED}
+    assert {reason: len(pending[reason]) for reason in parked_reasons} == {
         DeferReason.ALL_ACCOUNTS_CAPPED: 1, DeferReason.ACCOUNTS_AUTH_FAILED: 1,
+    }
+    assert {reason: records for reason, records in pending.items() if reason not in parked_reasons} == {
+        reason: [] for reason in DeferReason if reason not in parked_reasons
     }
     [capped], [auth_failed] = pending[DeferReason.ALL_ACCOUNTS_CAPPED], pending[DeferReason.ACCOUNTS_AUTH_FAILED]
     assert (capped.severity, auth_failed.severity) == ('info', 'blocking')
@@ -480,21 +484,114 @@ _CALLER_METADATA = {'source': 'acceptance-test', 'spawn_context': 'manual'}
 
 @pytest.mark.asyncio
 async def test_a_fail_open_create_carries_the_dedupe_skipped_marker(server):
-    curator = _Curator(_in_turn({'Work': [CAPPED, CuratorFailureError('llm down')]}))
-    interceptor, janitor, _ = await server.boot(_config(), curator)
+    """A parked ticket whose retry hits a zero-output hang, with no orchestrator
+    to escalate to, is created by the pipeline's failure mapper, marked."""
+    capped = True
+
+    async def invoke(**_kwargs: Any):
+        if capped:
+            raise AllAccountsCappedException(retries=3, elapsed_secs=120.0, label='task-curator[p]')
+        return zot_agent_result()
+
+    escalator = escalator_double()
+    escalator.report_failure = AsyncMock(
+        side_effect=CuratorFailureError('no orchestrator is running', zero_output_timeout=True),
+    )
+    config = _config()
+    curator = TaskCurator(
+        config=config, taskmaster=None, escalator=escalator, invoke=AsyncMock(side_effect=invoke),
+    )
+
+    async def bundle_for(candidate: CandidateTask, *_args: Any) -> PreparedCandidate:
+        return prepared(candidate.title, candidate=candidate)
+
+    curator.prepare_candidate = AsyncMock(side_effect=bundle_for)
+    curator.record_task = AsyncMock()
+    curator.search_corpus = AsyncMock(return_value=[])
+    interceptor, janitor, _ = await server.boot(config, curator)
     ticket_id = await _park(interceptor, 'Work', metadata=_CALLER_METADATA)
-    curator.batch_raises.append(CuratorFailureError('batch down'))
+    capped = False
 
     await _let_tiny_backoff_pass()
     await _bounded(janitor.tick())
+    answer = await _resolve(interceptor, ticket_id)
 
-    reason = 'curator-failed: CuratorFailureError: llm down'
-    assert await _resolve(interceptor, ticket_id) == {
-        'status': 'created', 'task_id': '101', 'reason': f'create: {reason}',
-    }
+    assert (answer['status'], answer['task_id']) == ('created', '101')
+    reason = answer['reason'].removeprefix('create: ')
+    assert reason.startswith('curator-failed: CuratorFailureError')
     [created] = server.taskmaster.add_task_calls
     metadata = json.loads(created['metadata'])
     marker = metadata.pop(DEDUPE_SKIPPED_KEY)
-    assert metadata == _CALLER_METADATA
+    assert metadata == {**_CALLER_METADATA, 'declared_scope': ANY}
     assert marker['reason'] == reason
     assert datetime.fromisoformat(marker['at']).utcoffset() == timedelta(0)
+
+
+def _overlapping_or_new(prompt: str) -> dict[str, Any]:
+    if 'Overlapping work' in prompt:
+        return {
+            'action': 'combine',
+            'target_id': '7',
+            'target_fingerprint': 'Existing task',
+            'justification': 'overlaps 7',
+            'rewritten_task': {'title': 'Existing task, widened', 'description': 'both asks', 'details': 'merged'},
+        }
+    return {'action': 'create', 'justification': 'genuinely new'}
+
+
+async def _a_corpus_holding_task_7(
+    self: TaskCurator, candidate: CandidateTask, project_id: str, project_root: str,
+) -> tuple[list, dict[str, int], PoolWithheld]:
+    return pool_with_ids(('7', 'pending')), {'anchor': 0, 'module': 1, 'embedding': 0, 'dependency': 0}, PoolWithheld()
+
+
+@pytest.mark.asyncio
+async def test_llm_outage_queues_escalates_then_curates(server, tmp_path):
+    backoff_seconds = 1.0
+    config = _config(backoff_seconds=backoff_seconds)
+    config.curator.batch_max = 1
+    server.taskmaster.tasks['7'] = {'id': '7', 'title': 'Existing task', 'status': 'pending', 'metadata': {}}
+    llm_down = True
+
+    async def invoke(**kwargs: Any):
+        if llm_down:
+            raise FileNotFoundError(2, 'No such file or directory', 'claude')
+        return agent_result(_overlapping_or_new(kwargs['prompt']))
+
+    curator = TaskCurator(config=config, taskmaster=None, invoke=AsyncMock(side_effect=invoke))
+
+    titles = ['Overlapping work', 'New work A', 'New work B']
+    queue = EscalationQueue(escalation_queue_dir(str(tmp_path)))
+    with (
+        patch.object(TaskCurator, '_build_corpus', _a_corpus_holding_task_7),
+        patch.object(TaskCurator, 'record_task', AsyncMock()),
+    ):
+        interceptor, janitor, _ = await server.boot(
+            config, curator, known_projects={PROJECT_ID: str(tmp_path)},
+        )
+        tickets = {title: await _submit(interceptor, title) for title in titles}
+        for ticket_id in tickets.values():
+            assert await _resolve(interceptor, ticket_id) == _parked_answer(ticket_id, DeferReason.LLM_FAILED)
+        await asyncio.sleep(backoff_seconds * 1.2)
+        await _bounded(janitor.tick())
+        for ticket_id in tickets.values():
+            assert await _resolve(interceptor, ticket_id) == _parked_answer(ticket_id, DeferReason.LLM_FAILED)
+        await _bounded(janitor.tick())
+
+        [backlog] = queue.get_by_task(curation_backlog_anchor(DeferReason.LLM_FAILED), status='pending')
+        assert backlog.severity == 'blocking'
+        assert server.taskmaster.add_task_calls == []
+
+        llm_down = False
+        await asyncio.sleep(backoff_seconds * 1.2)
+        await _bounded(janitor.tick())
+        answers = {title: await _resolve(interceptor, ticket_id) for title, ticket_id in tickets.items()}
+
+    assert answers == {
+        'Overlapping work': {'status': 'combined', 'task_id': '7', 'reason': 'combine: overlaps 7'},
+        'New work A': {'status': 'created', 'task_id': '101', 'reason': 'create: genuinely new'},
+        'New work B': {'status': 'created', 'task_id': '102', 'reason': 'create: genuinely new'},
+    }
+    assert len(server.taskmaster.add_task_calls) == 2
+    for call in server.taskmaster.add_task_calls:
+        assert DEDUPE_SKIPPED_KEY not in json.loads(call.get('metadata') or '{}')

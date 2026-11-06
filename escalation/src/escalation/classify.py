@@ -28,13 +28,18 @@ from __future__ import annotations
 
 from collections.abc import Set as AbstractSet
 
+from escalation.authority import COORDINATOR_IDENTITY
 from escalation.models import Escalation
 
 # Resolver→tier classification table (plans/escalation-lifecycle-dashboard-prd.md
 # Contract Seam 1). Exact-membership frozensets for the tiers whose
 # resolved_by values are fixed literals; 'cascade' and 'steward' are matched
 # by prefix/suffix instead since they're parameterised by escalation id / task id.
-_HUMAN_RESOLVERS: frozenset[str] = frozenset({'interactive', 'escalation-watcher'})
+# The coordinator is a human sitting, so its closes count in the human tier
+# (plans/decision-stream-prd.md §3 decision 3).
+_HUMAN_RESOLVERS: frozenset[str] = frozenset({
+    'interactive', 'escalation-watcher', COORDINATOR_IDENTITY,
+})
 _AUTO_WATCHER_RESOLVERS: frozenset[str] = frozenset(
     {'escalation-watcher-auto', 'orchestrator-escalation-watcher-auto'}
 )

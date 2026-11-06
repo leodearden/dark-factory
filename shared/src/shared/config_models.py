@@ -78,12 +78,13 @@ class UsageCapConfig(BaseModel):
     )
     accounts: list[AccountConfig] = Field(default_factory=list)
     fallback_to_default_credential: bool = Field(
-        default=True,
+        default=False,
         description=(
-            'When no configured account resolves a token, adopt the operator\'s '
-            'own ~/.claude login as a single "default" account. False leaves the '
-            'pool empty instead, so a caller never authenticates as that login '
-            '(consumer: scripts/legibility, task 6042).'
+            'Explicit opt-in for interactive tooling: when no configured account '
+            'resolves a token, adopt the operator\'s own ~/.claude login as a '
+            'single "default" account. Off by default, so fleet tooling never '
+            'authenticates as that login and an unresolvable roster leaves the '
+            'pool empty (ruling 2026-11-01, task 8161; task 6042).'
         ),
     )
     accounts_file: str | None = Field(

@@ -6,6 +6,10 @@ import logging
 from collections.abc import Mapping
 
 from fused_memory.models.reconciliation import FINDING_SEVERITY_VALUES, FindingSeverity
+from fused_memory.reconciliation.dangling_citation import (
+    DANGLING_CITATION_LINE_LABEL,
+    DANGLING_CROSS_RUN_CITATION_FLAG_TYPE,
+)
 from fused_memory.reconciliation.recon_self_model import (
     ENTITY_STANDING_DECISIONS_HEADING,
     INVESTIGATION_OUTCOME_RECORDS_HEADING,
@@ -102,18 +106,9 @@ destroys entities and edges exclusively sourced from that episode.\
 # Stage 3 is denied it are all stage-independent facts. Stage 3 must NOT
 # interpolate it — pinned by test_recon_report_stage_gated_tool_advertisement.py.
 #
-# The block states the TRIGGER, not only the capability, because an
-# advertisement whose trigger is unstated is inert. Measured while writing it:
-# no MCP tool either stage holds reads a closed run's findings back (the
-# recon-report surface writes the in-flight report and repairs the journal; it
-# has no journal READ), and no stage prompt describes a handoff from the stage
-# that detects a dangling cross-run citation to the two that may repair one —
-# stage3.py names neither the defect nor the tool, which is correct for the
-# denial but leaves the detect->repair route unbuilt. So the block says
-# plainly that the caller does not prospect for candidates and that the ids
-# must arrive from outside the tool. Building that handoff is deliberately NOT
-# this task (it would touch stage3.py and the Stage 3 detector, both outside
-# its scope); it is filed as follow-up work.
+# The trigger it states is produced by the Stage-3 detector,
+# reconciliation/cross_run_citation_scan.py::scan_cross_run_citations; the
+# handoff record and its constants live in reconciliation/dangling_citation.py.
 #
 # MUST NOT contain the literal '## Available Tools' — build_stage2_system_prompt
 # raises RuntimeError unless that sentinel appears exactly once in
@@ -125,10 +120,13 @@ destroys entities and edges exclusively sourced from that episode.\
 # `run_id` and `target_run_id`, pinned by
 # test_recon_report_stage_gated_tool_advertisement.py: the existing assembled-
 # prompt run_id scan is scoped to the shared-guidance tools and does not reach
-# this one. Not an f-string: it is interpolated INTO f-strings, and braces
-# inside an interpolated value are not re-parsed by the enclosing f-string, so
-# its own text needs no {{/}} escaping.
-CITATION_REPAIR_TOOL_BLOCK = """\
+# this one. Built from adjacent string literals with an f-string only on the
+# segment that interpolates the dangling_citation constants (the house form the
+# entity-standing-decision writer listing's comment records), so no other
+# segment needs {{/}} escaping; braces inside the value are not re-parsed by the
+# stage f-strings it is interpolated into.
+CITATION_REPAIR_TOOL_BLOCK = (
+    """\
 ## Repairing a Prior Run's Dangling Citation
 You hold `mcp__recon-report__repair_memory_citation`. Stage 1 and Stage 2 both hold it; \
 Stage 3 is denied it because Stage 3 is read-only and is the stage that DETECTS dangling \
@@ -147,11 +145,19 @@ journal instead, which is why it is the only path.
 tool you hold reads a closed run's findings back, so you cannot enumerate candidates and \
 must not try. Act only when something OUTSIDE this tool has already named both ids for \
 you: an operator instruction or an escalation that carries them, or a finding in your own \
-payload that does. Note there is currently no automated handoff from detection to repair \
-— the stage positioned to detect a dangling cross-run citation is read-only by contract \
-and nothing routes its detection here — so absent such a pointer, this tool is not your \
-move.
+payload that does. """
+    f"""For `memory_not_found` only, that finding is filed automatically: the \
+integrity-check stage runs a deterministic journal scan and files one finding per \
+confirmed-absent mem0 citation, with `flag_type='{DANGLING_CROSS_RUN_CITATION_FLAG_TYPE}'`. \
+Each carries a line beginning `{DANGLING_CITATION_LINE_LABEL}` that names `target_run_id`, \
+`finding_id` and `memory_id` verbatim. Those findings are delivered to Stage 1 — in a \
+remediation pass's findings and in the next cycle's prior Stage 3 findings — and never to \
+Stage 2. A `wrong_memory` defect is never detected automatically and still needs an \
+operator instruction or an escalation carrying the ids. Absent such a pointer, this tool is \
+not your move.
 
+"""
+    """\
 **Call shape.**
 `mcp__recon-report__repair_memory_citation(run_id=<your current run_id>, \
 target_run_id=<the run that OWNS the finding>, finding_id=..., memory_id=<the cited \
@@ -181,6 +187,7 @@ lookup or write.
 On success `status` is `"repaired"`. Every refusal is keyed by `"error"` and carries no \
 `"status"`, so `status` is safe to branch on.\
 """
+)
 
 # ---------------------------------------------------------------------------
 # Shared referent-declaration guidance (task 3675)

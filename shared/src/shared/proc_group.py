@@ -83,7 +83,8 @@ logger = logging.getLogger(__name__)
 
 
 #: The procfs mount every /proc read in this module goes through: the snapshot,
-#: the at-or-under scan, the group-member walk and the single-pid probe.
+#: the at-or-under scan, the group-member walk, the single-pid probe and the
+#: CPU-time fingerprint.
 #:
 #: Module-level solely so the synthetic-/proc tests in ``test_proc_group`` can
 #: point those reads at a fabricated tree by monkeypatching it, the same way
@@ -129,13 +130,20 @@ class MalformedStatLine(ValueError):
         super().__init__(f"{path}: not a 'pid (comm) state ppid pgrp ...' stat line: {text!r}")
 
 
-def _parse_stat_line(path: Path, text: str) -> StatFields:
-    """Parse *text*, read from *path*; comm runs up to the LAST ``)``, so it may hold parens."""
+def _stat_tail(path: Path, text: str) -> tuple[str, list[str]]:
+    """Split *text*, read from *path*, into comm and the fields after it.
+
+    comm runs up to the LAST ``)``, so it may hold parens.
+    """
     rparen = text.rfind(')')
     if rparen < 0:
         raise MalformedStatLine(path, text)
-    comm = text[text.find('(') + 1 : rparen]
-    fields = text[rparen + 2 :].split()
+    return text[text.find('(') + 1 : rparen], text[rparen + 2 :].split()
+
+
+def _parse_stat_line(path: Path, text: str) -> StatFields:
+    """Parse *text*, read from *path*, into its leading fields."""
+    comm, fields = _stat_tail(path, text)
     try:
         return StatFields(
             comm=comm, state=fields[0], ppid=int(fields[1]), pgrp=int(fields[2])
@@ -165,6 +173,21 @@ def read_stat_fields(entry: Path, *, skip_malformed: bool) -> StatFields | None:
         raise
 
 
+def read_cpu_ticks(entry: Path) -> int | None:
+    """utime+stime+cutime+cstime of ``<entry>/stat`` in clock ticks; None if unreadable or malformed.
+
+    cutime and cstime include REAPED children, so a shell that keeps spawning
+    short-lived tools keeps the sum moving.
+    """
+    path = entry / 'stat'
+    try:
+        _comm, fields = _stat_tail(path, _read_proc_text(path))
+        # stat fields 14-17, counted from the pid; fields[0] is field 3, state.
+        return int(fields[11]) + int(fields[12]) + int(fields[13]) + int(fields[14])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
 def pid_running(pid: int) -> bool:
     """True iff *pid* has a ``/proc`` entry that has not terminated.
 
@@ -183,7 +206,8 @@ def snapshot_process_group(pgid: int) -> str:
     function the process is currently blocked in), comm (executable name, capped
     at 15 chars by the kernel), and cmdline (full argv from ``/proc/<pid>/cmdline``,
     truncated to ~200 chars — identifies the culprit process by name and arguments
-    rather than just the short comm).
+    rather than just the short comm).  cmdline reads ``(empty)`` when the kernel
+    publishes no argv (a member mid-exec, or exiting), and ``?`` when it is unreadable.
 
     Designed to be called from ``_run_subprocess``'s ``TimeoutError`` handler
     **before** ``proc.terminate()`` / ``terminate_process_group`` — at that
@@ -205,6 +229,27 @@ def snapshot_process_group(pgid: int) -> str:
         # permissions, or unexpected exception), return a diagnostic string
         # rather than propagating.
         return f'snapshot_process_group({pgid}): unexpected error — see logs'
+
+
+_UNREADABLE = '?'
+_NO_ARGV = '(empty)'
+_CMDLINE_DISPLAY_CHARS = 200
+
+
+def _display_cmdline(entry: Path) -> str:
+    """``<entry>/cmdline`` as a space-joined, truncated argv.
+
+    ``?`` when the file is unreadable; ``(empty)`` when no argv is published.
+    """
+    try:
+        argv = _read_proc_text(entry / 'cmdline').replace('\x00', ' ').strip()
+    except OSError:
+        return _UNREADABLE
+    if not argv:
+        return _NO_ARGV
+    if len(argv) > _CMDLINE_DISPLAY_CHARS:
+        return argv[:_CMDLINE_DISPLAY_CHARS] + '…'
+    return argv
 
 
 def _snapshot_process_group_unsafe(pgid: int) -> str:
@@ -235,21 +280,9 @@ def _snapshot_process_group_unsafe(pgid: int) -> str:
         try:
             wchan = _read_proc_text(entry / 'wchan').strip()
         except OSError:
-            wchan = '?'
+            wchan = _UNREADABLE
 
-        # Read /proc/<pid>/cmdline (NUL-separated argv → spaces) for the full
-        # command-line.  Kernel threads have an empty cmdline; fall back to
-        # comm so the field is always populated.  Truncate to ~200 chars for
-        # log friendliness.  Mirrors the wchan try/except idiom so
-        # snapshot_process_group never raises (module invariant).
-        try:
-            cmdline = _read_proc_text(entry / 'cmdline').replace('\x00', ' ').strip()
-            if not cmdline:
-                cmdline = fields.comm  # kernel thread — fall back to short comm
-            if len(cmdline) > 200:
-                cmdline = cmdline[:200] + '…'
-        except OSError:
-            cmdline = '?'
+        cmdline = _display_cmdline(entry)
 
         rows.append(
             f'  pid={pid} ppid={fields.ppid} state={fields.state} wchan={wchan} '
@@ -302,6 +335,77 @@ def unsafe_pgid_reason(pgid: int, proc_pid: int | None = None) -> str | None:
     return None
 
 
+_SURVIVOR_POLL_FIRST_SECS = 0.1
+_SURVIVOR_POLL_MAX_SECS = 1.0
+
+
+def _killable_survivors_of_reaped_leader(pgid: int) -> list[ProcessGroupMember]:
+    """The running members of group *pgid* still ours to SIGKILL, once its leader is reaped.
+
+    The kernel never reallocates a pid number while any process, zombies
+    included, still uses it as a pgid: so a survivor seen in group *pgid* pins
+    it at that instant, and a process with pid == *pgid* after the leader's
+    reap proves the number was recycled, which yields [] although group *pgid*
+    may hold running processes: they are a stranger's, and none of ours remain.
+    """
+    members = process_group_members(pgid)
+    if any(m.pid == pgid for m in members):
+        logger.warning(
+            'terminate_process_group: pid %s exists again although the leader '
+            'with that pid was reaped, so the number was recycled and group %s '
+            "is a stranger's; not signalling it",
+            pgid,
+            pgid,
+        )
+        return []
+    return [m for m in members if not m.terminated]
+
+
+async def _group_terminated_within(
+    proc: asyncio.subprocess.Process, pgid: int, timeout: float
+) -> bool:
+    """True iff *proc* exits and none of its group *pgid* still runs within *timeout*.
+
+    Each /proc walk reads every host pid's stat on a worker thread and can cost
+    hundreds of milliseconds, or over a second on a loaded host, so the walks
+    back off from ``_SURVIVOR_POLL_FIRST_SECS``, doubling up to
+    ``_SURVIVOR_POLL_MAX_SECS``, and never sleep past the deadline.  A walk
+    started before the deadline can still end well after it.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    try:
+        await asyncio.wait_for(proc.wait(), timeout)
+    except TimeoutError:
+        return False
+    poll_secs = _SURVIVOR_POLL_FIRST_SECS
+    while await asyncio.to_thread(_killable_survivors_of_reaped_leader, pgid):
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return False
+        await asyncio.sleep(min(poll_secs, remaining))
+        poll_secs = min(poll_secs * 2, _SURVIVOR_POLL_MAX_SECS)
+    return True
+
+
+async def _sigkill_remaining(proc: asyncio.subprocess.Process, pgid: int) -> bool:
+    """SIGKILL whatever still runs in group *pgid*; True iff a SIGKILL was dispatched."""
+    if proc.returncode is None:
+        return sigkill_process_group(proc, pgid) is not SigkillDispatch.NOT_SIGNALLED
+    survivors = await asyncio.to_thread(_killable_survivors_of_reaped_leader, pgid)
+    if not survivors:
+        return False
+    with contextlib.suppress(OSError):
+        os.killpg(pgid, signal.SIGKILL)
+    logger.debug(
+        'terminate_process_group: SIGKILLed group %s, whose reaped leader left '
+        'running: %s',
+        pgid,
+        ', '.join(f'pid={m.pid} comm={m.comm}' for m in survivors),
+    )
+    return True
+
+
 async def terminate_process_group(
     proc: asyncio.subprocess.Process,
     pgid: int,
@@ -317,20 +421,27 @@ async def terminate_process_group(
 
     Behaviour:
     1. If *proc* has already been reaped (``returncode is not None``), return
-       immediately.  The group is already gone with the leader.
+       immediately without signalling: its pid may be recycled, so surviving
+       members are deliberately forgone, as in :func:`sigkill_process_group`.
     2. Sanity-check *pgid* via :func:`unsafe_pgid_reason`.  If unsafe, log
        and return without signalling.
     3. ``os.killpg(pgid, SIGTERM)``.  Wait up to *grace_secs* for *proc* to
-       exit.
-    4. If *proc* is still alive, ``os.killpg(pgid, SIGKILL)`` and wait
-       another *grace_secs*.
+       exit AND every member of the group to terminate: the leader exiting
+       is not enough.
+    4. If anything still runs, SIGKILL it: through :func:`sigkill_process_group`
+       while the leader is unreaped, and once it is reaped only while a running
+       survivor pins the pgid (:func:`_killable_survivors_of_reaped_leader`).  Then wait
+       another *grace_secs*.  Returning does not mean *proc* was reaped: this
+       SIGKILL leg is bounded by *grace_secs* as well, so ``proc.returncode``
+       may still be ``None``, and a caller that needs the exit status must
+       reap *proc* itself.
 
-    All ``killpg`` calls are wrapped in ``contextlib.suppress(ProcessLookupError,
-    OSError)`` because the group may vanish between our liveness check and
-    the signal dispatch.
+    No ``killpg`` failure propagates, because the group may vanish between our
+    liveness check and the signal dispatch.
     """
     if proc.returncode is not None:
-        # Already reaped — the entire group has exited along with the leader.
+        # Reaped before we were called: its pid may be recycled, so survivors
+        # are deliberately forgone (see sigkill_process_group).
         return
 
     reason = unsafe_pgid_reason(pgid, proc.pid)
@@ -344,17 +455,10 @@ async def terminate_process_group(
 
     with contextlib.suppress(ProcessLookupError, OSError):
         os.killpg(pgid, signal.SIGTERM)
-
-    try:
-        await asyncio.wait_for(proc.wait(), grace_secs)
-    except TimeoutError:
-        # Re-check liveness before escalating.
-        if proc.returncode is not None:
-            return
-        with contextlib.suppress(ProcessLookupError, OSError):
-            os.killpg(pgid, signal.SIGKILL)
-        with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(proc.wait(), grace_secs)
+    if await _group_terminated_within(proc, pgid, grace_secs):
+        return
+    if await _sigkill_remaining(proc, pgid):
+        await _group_terminated_within(proc, pgid, grace_secs)
 
 
 class SigkillDispatch(Enum):
@@ -375,9 +479,8 @@ def sigkill_process_group(proc: asyncio.subprocess.Process, pgid: int) -> Sigkil
     *proc* — see the module docstring's "Why the caller captures pgid".  The
     caller owns ``await proc.wait()``.
 
-    Immediate SIGKILL rather than :func:`terminate_process_group`'s SIGTERM
-    stage: that helper stops escalating once the LEADER exits, so a grandchild
-    that ignores SIGTERM would survive.
+    No SIGTERM grace, unlike :func:`terminate_process_group`: for a caller
+    that wants the group dead now and reaps it itself.
 
     An already-reaped *proc* gets no signal (its pid may be recycled), so any
     grandchildren still running are deliberately forgone: refusing to kill a
@@ -634,6 +737,57 @@ def scan_process_groups_under_path(
             exc_info=True,
         )
         return set()
+
+
+def _cpu_ticks_if_under(entry: Path, root: str, exclude: frozenset[int]) -> int | None:
+    """The CPU ticks of the pid at *entry* if its cwd is at-or-under *root*, outside *exclude*."""
+    fields = read_stat_fields(entry, skip_malformed=True)
+    if fields is None or fields.pgrp in exclude:
+        return None
+    try:
+        cwd = os.readlink(entry / 'cwd')
+    except OSError:
+        return None
+    return read_cpu_ticks(entry) if _path_at_or_under(cwd, root) else None
+
+
+def _cpu_ticks_under_path_unsafe(root: str, exclude: frozenset[int]) -> int | None:
+    """Implement cpu_ticks_under_path; may raise — caller wraps it."""
+    try:
+        entries = list(_PROC_ROOT.iterdir())
+    except OSError:
+        return None
+    total: int | None = None
+    for entry in entries:
+        ticks = _cpu_ticks_if_under(entry, root, exclude) if entry.name.isdigit() else None
+        if ticks is not None:
+            total = ticks + (total or 0)
+    return total
+
+
+def cpu_ticks_under_path(
+    root: str | os.PathLike[str],
+    *,
+    exclude_pgids: Iterable[int] = frozenset(),
+) -> int | None:
+    """Sum :func:`read_cpu_ticks` over the pids whose cwd is at-or-under *root*.
+
+    None when no such pid is found or /proc is unavailable, so "no process"
+    is never read as "an idle process".  The sum is not monotonic: a process
+    exiting removes its ticks, so callers compare samples for CHANGE.
+
+    Deliberately cwd-only: a stat read and a readlink per pid, cheaper than
+    :func:`scan_process_groups_under_path`'s fd and maps walk.  Verify
+    subprocesses (bash, pytest and its xdist workers, cargo/rustc) run with
+    their cwd inside the worktree.  Never raises, like that scan.
+    """
+    try:
+        return _cpu_ticks_under_path_unsafe(str(root), frozenset(exclude_pgids))
+    except Exception:
+        logger.warning(
+            'cpu_ticks_under_path(%s): unexpected error — returning None', root, exc_info=True,
+        )
+        return None
 
 
 def _drop_dead_pgids(pgids: list[int], grace_secs: float, poll_step: float) -> list[int]:

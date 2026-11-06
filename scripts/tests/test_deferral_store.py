@@ -1,19 +1,20 @@
 """Tests for ``scripts/deferral_store.py``, the deferral scripts' typed MCP boundary.
 
-Every call goes over the real transport (``census_trigger.post_mcp_tool_call``)
-into ``FakeFusedMemory`` through ``install_fake_httpx``; a store built on a
-plain ``post`` callable stands in only where the reply itself must be malformed.
+Every call goes from a store built by the public ``store_from_args`` over a real
+socket into ``FakeFusedMemory``; a store built on a plain ``post`` callable
+stands in only where the reply itself must be malformed.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import argparse
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
 import deferral_store
 import pytest
-from deferral_fake_fused_memory import FakeFusedMemory
+from deferral_fake_fused_memory import FakeFusedMemory, FakeFusedMemoryServer
 from deferral_store import (
     Changed,
     DeferralStore,
@@ -24,7 +25,6 @@ from deferral_store import (
     TaskRow,
     Unechoed,
 )
-from legibility import census_trigger
 from shared.task_deferral import (
     CarriedByDeferral,
     CarriedByRequest,
@@ -47,17 +47,19 @@ def root(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-def store() -> DeferralStore:
-    return DeferralStore(url=URL, post=census_trigger.post_mcp_tool_call)
+def fused_memory() -> Iterator[FakeFusedMemoryServer]:
+    with FakeFusedMemoryServer() as server:
+        yield server
 
 
 @pytest.fixture
-def serve(install_fake_httpx: Callable[..., Any]) -> Callable[[FakeFusedMemory], FakeFusedMemory]:
-    def _serve(fake: FakeFusedMemory) -> FakeFusedMemory:
-        install_fake_httpx(fake.post)
-        return fake
+def store(fused_memory: FakeFusedMemoryServer) -> DeferralStore:
+    return deferral_store.store_from_args(argparse.Namespace(fused_memory_url=fused_memory.url))
 
-    return _serve
+
+@pytest.fixture
+def serve(fused_memory: FakeFusedMemoryServer) -> Callable[[FakeFusedMemory], FakeFusedMemory]:
+    return fused_memory.serve
 
 
 def _replying(reply: Any) -> DeferralStore:

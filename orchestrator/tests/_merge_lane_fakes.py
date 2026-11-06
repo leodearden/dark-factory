@@ -40,6 +40,7 @@ from typing import Any
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.merge_lane import MergeLane
 from orchestrator.merge_lane.gates import PostMergePyrightResult
+from orchestrator.merge_lane.ports import ClockPort
 from orchestrator.merge_lane.types import DiskGuardOutcome, MergeOutcome
 from orchestrator.merge_lane.worker import MAIN_HEALTH_PROBE_PENDING_NOTE
 from orchestrator.verify import VerifyResult
@@ -99,11 +100,15 @@ def main_health_probe_spawned(outcome: MergeOutcome) -> bool:
 def lane_scene_config(
     project_root: Path, git: GitConfig, **overrides: Any,
 ) -> OrchestratorConfig:
-    """The ``OrchestratorConfig`` for a lane scene over a real tmp repo.
+    """The ``OrchestratorConfig`` for a merge-lane test scene.
 
     The main-health probe is off (``escalate_preexisting_main_break=False``);
     ``main_health_probe_spawned`` says why. *overrides* are any further
-    ``OrchestratorConfig`` fields the scene needs.
+    ``OrchestratorConfig`` fields the scene needs. A scene that exercises the
+    probe builds ``OrchestratorConfig`` itself with
+    ``escalate_preexisting_main_break`` named, and
+    ``test_lane_scene_config_guard.py`` holds every worker-constructing module
+    to that.
     """
     return OrchestratorConfig(
         project_root=project_root, git=git,
@@ -345,6 +350,8 @@ class FakeClock:
     advances it by ``content_tick`` per probe, so a ``content_tick`` above
     zero is a verify that keeps writing. Every probed root is kept in
     ``content_probes``, the way ``sleeps`` keeps every requested sleep.
+    ``verify_cpu_ticks`` mirrors it for the verify process tree's CPU time:
+    ``cpu_ticks`` advanced by ``cpu_tick`` per probe, roots in ``cpu_probes``.
     """
 
     def __init__(
@@ -354,6 +361,8 @@ class FakeClock:
         tick: float = 0.0,
         content_mtime: float | None = None,
         content_tick: float = 0.0,
+        cpu_ticks: int | None = None,
+        cpu_tick: int = 0,
         wait_cap: float = 0.02,
         sleep_cap: float = 0.02,
     ) -> None:
@@ -362,11 +371,14 @@ class FakeClock:
         self.tick = tick
         self.content_mtime = content_mtime
         self.content_tick = content_tick
+        self.cpu_ticks = cpu_ticks
+        self.cpu_tick = cpu_tick
         self.wait_cap = wait_cap
         self.sleep_cap = sleep_cap
         self.sleeps: list[float] = []
         self.waits: list[float] = []
         self.content_probes: list[Path] = []
+        self.cpu_probes: list[Path] = []
 
     def now(self) -> float:
         return self.time
@@ -383,13 +395,22 @@ class FakeClock:
             self.content_mtime = reading + self.content_tick
         return reading
 
+    def verify_cpu_ticks(self, root: Path) -> int | None:
+        self.cpu_probes.append(root)
+        reading = self.cpu_ticks
+        if reading is not None:
+            self.cpu_ticks = reading + self.cpu_tick
+        return reading
+
     async def sleep(self, secs: float) -> None:
         self.sleeps.append(secs)
         self.time += secs
         self.mono += secs
         await asyncio.sleep(min(secs, self.sleep_cap))
 
-    async def wait_for_any(self, aws: Collection[Any], timeout: float) -> set[Any]:
+    async def wait_for_any(
+        self, aws: Collection[asyncio.Future[Any]], timeout: float,
+    ) -> set[asyncio.Future[Any]]:
         self.waits.append(timeout)
         # A REAL bounded wait, never a bare yield: a yield reschedules on the
         # ready queue without letting any timer fire, which starves whatever
@@ -398,6 +419,9 @@ class FakeClock:
         done, _ = await asyncio.wait(aws, timeout=min(timeout, self.wait_cap))
         self.mono += timeout
         return done
+
+
+_FAKE_CLOCK_IS_A_CLOCK_PORT: ClockPort = FakeClock()
 
 
 def healthy_verify_clock() -> FakeClock:

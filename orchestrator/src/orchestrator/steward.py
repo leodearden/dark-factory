@@ -57,10 +57,11 @@ from shared.cli_invoke import (
     is_timed_out_with_progress,
 )
 from shared.proc_group import terminate_process_group
+from shared.process_cost import next_resume_prior
 
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.roles import STEWARD
-from orchestrator.event_store import EventStore, EventType
+from orchestrator.event_store import EventStore, EventType, cli_resume_failed_data
 from orchestrator.guard_state import PersistentMap, PersistentSet, guard_path
 from orchestrator.routing import RoleDefaults
 from orchestrator.routing_dispatch import resolve_and_record_route
@@ -162,6 +163,7 @@ class TaskSteward:
         self.cost_store = cost_store
 
         self._session_id: str | None = None
+        self._session_reported_total_usd: float | None = None
         self._stopped = False
         self._task: asyncio.Task | None = None
         # The four guards below are restart-durable and TTL-bounded (task
@@ -702,6 +704,8 @@ class TaskSteward:
                     # denominator.
                     'ended_awaiting_background': result.ended_awaiting_background,
                     'retry_aborted': result.retry_aborted,
+                    'cost_basis': result.cost_basis.value,
+                    'cost_delta_clamped': result.cost_delta_clamped,
                 },
             )
 
@@ -740,7 +744,7 @@ class TaskSteward:
             # session id so the next attempt rebuilds a fresh initial prompt at the
             # current cwd instead of repeating the same instant failure.
             cleared = self._session_id is not None
-            self._session_id = None
+            self._drop_session()
             logger.warning(
                 f'Steward for task {self.task_id}: invocation produced no output '
                 f'(empty stdout) — retry_count NOT incremented '
@@ -828,7 +832,10 @@ class TaskSteward:
         auth routing) to the shared ``invoke_with_cap_retry``.  This method
         does only session-id bookkeeping: it forwards ``self._session_id``
         as ``resume_session_id`` when a prior session exists, and captures
-        the result's ``session_id`` for the next call.
+        the result's ``session_id`` for the next call.  A fresh session
+        replaces ``_session_id`` only after the CLI provably rejected the
+        armed resume, and that replacement is reported
+        (``_note_rejected_resume``).
 
         The steward is always a LIVE continuation, never a crash-recovery
         resume: ``prompt`` (built by ``_handle_escalation``) carries the new
@@ -904,6 +911,9 @@ class TaskSteward:
         )
         if self._session_id is not None:
             kwargs['resume_session_id'] = self._session_id
+            if self._session_reported_total_usd is not None:
+                kwargs['resume_prior_total_cost_usd'] = self._session_reported_total_usd
+        armed = kwargs.get('resume_session_id')
 
         # `backend` below reaches invoke_agent: invoke_with_cap_retry forwards
         # it into invoke_kwargs only when a custom invoke_fn is supplied, and
@@ -937,10 +947,52 @@ class TaskSteward:
             **kwargs,
         )
 
-        if result.session_id:
-            self._session_id = result.session_id
+        self._note_rejected_resume(armed, result)
+        self._adopt_session(result)
 
         return result
+
+    def _note_rejected_resume(self, armed: str | None, result) -> None:
+        """Report that the CLI rejected the steward's own armed resume.
+
+        No resume-outcome-sink call: a steward resume is a live continuation,
+        never an adopted crash-recovery resume, so it must not feed the INV-4
+        storm streak.
+        """
+        data = cli_resume_failed_data(
+            armed_session_id=armed,
+            role=STEWARD.name,
+            fallbacks=result.resume_fallbacks,
+            dropped_session_ids=result.resume_fallback_session_ids,
+        )
+        if data is None:
+            return
+        logger.warning(
+            'Steward for task %s: the CLI rejected resume of session %s before '
+            'any model turn — adopting fresh session %s',
+            self.task_id, data['session_id'], result.session_id,
+        )
+        if self.event_store:
+            self.event_store.emit(
+                EventType.session_resume_failed, task_id=self.task_id, data=data,
+            )
+
+    def _adopt_session(self, result) -> None:
+        """Resume *result*'s session next time, carrying its reported total as the prior."""
+        if not result.session_id:
+            return
+        self._session_reported_total_usd = next_resume_prior(
+            armed_session_id=self._session_id,
+            armed_prior_usd=self._session_reported_total_usd,
+            result_session_id=result.session_id,
+            result_reported_total_usd=result.reported_total_cost_usd,
+        )
+        self._session_id = result.session_id
+
+    def _drop_session(self) -> None:
+        """Start the next invocation fresh: forget the session and its prior total together."""
+        self._session_id = None
+        self._session_reported_total_usd = None
 
     # ------------------------------------------------------------------
     # Pre-triage for large suggestion sets
@@ -1011,26 +1063,27 @@ class TaskSteward:
         suggestions = json.loads(_strip_hash_prefix(escalation.detail))
         prompt = build_triage_prompt(suggestions, self.task)
 
-        meta_root = TaskArtifacts.meta_root_for(self.worktree.parent, self.worktree.name)
-        if not meta_root.is_dir():
-            # TaskWorkflow._setup normally creates this (via artifacts.init())
-            # for this exact worktree before any steward is ever constructed
-            # against it. If it's still missing here, the verdict-tools
-            # server spawned below (same --meta-root) would silently no-op
-            # its write_verdict call, and read_verdict() further down would
-            # return None indistinguishably from a genuine triage failure —
-            # log distinctly and create it so a misconfigured meta-root is
-            # diagnosable instead of masquerading as an ordinary fallback.
+        artifacts = TaskArtifacts.for_task(self.worktree, self.task_id)
+        for root in (artifacts.lane_root, artifacts.task_root):
+            if root.is_dir():
+                continue
+            # TaskWorkflow._setup normally creates both roots (via
+            # artifacts.init()) for this exact dispatch before any steward is
+            # ever constructed against it. If one is still missing here, the
+            # verdict-tools server spawned below (same roots) would silently
+            # no-op its write_verdict call, and read_verdict() further down
+            # would return None indistinguishably from a genuine triage
+            # failure — log distinctly and create it so a misconfigured root
+            # is diagnosable instead of masquerading as an ordinary fallback.
             logger.warning(
-                'Steward for task %s: pre-triage meta-root %s did not '
+                'Steward for task %s: pre-triage artifact root %s did not '
                 'exist — creating it now. This should already have been '
                 'created by workflow setup; a missing root here means '
                 'pre-triage would otherwise silently and permanently '
                 'degrade to inline triage.',
-                self.task_id, meta_root,
+                self.task_id, root,
             )
-            meta_root.mkdir(parents=True, exist_ok=True)
-        artifacts = TaskArtifacts(self.worktree, meta_root)
+            root.mkdir(parents=True, exist_ok=True)
         artifacts.clear_verdict('triage')  # I-FRESH: never consume a stale verdict
 
         # Base the injected config on the steward's own fused-memory wiring
@@ -1044,6 +1097,7 @@ class TaskSteward:
         # escalation_url: TRIAGE grants no escalation tools.
         mcp_config = _inject_verdict_tools_mcp(
             self.mcp.mcp_config_json(), self.worktree, TRIAGE,
+            task_root=artifacts.task_root,
         )
 
         try:

@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from orchestrator.session_registry import SessionRecord
+from orchestrator.session_registry import SessionRecord, parse_result_outcome
 from review_all_program_fixture import (
     FIXTURE_DIR,
     PROGRAM_DIR,
@@ -28,7 +28,6 @@ from review_all_program_fixture import (
     load_state,
     running_fake_store,
 )
-from sitting.ownership import parse_result_outcome
 
 from shared import task_statuses
 
@@ -891,12 +890,6 @@ SESSION_SCENARIOS = {
 }
 
 
-def _header_lines(result_md: Path) -> list[str]:
-    lines = result_md.read_text().splitlines()
-    assert lines[0] == '---'
-    return lines[1:lines.index('---', 1)]
-
-
 @pytest.mark.parametrize('scenario', sorted(SESSION_SCENARIOS))
 def test_b10_session_records_and_result_headers(scenario: str) -> None:
     status, outcome = SESSION_SCENARIOS[scenario]
@@ -904,10 +897,7 @@ def test_b10_session_records_and_result_headers(scenario: str) -> None:
     assert record.status == status
     assert record.title.partition(':')[0] == record.role
     result_md = SESSIONS / scenario / 'result.md'
-    if outcome == 'in-progress':
-        assert 'outcome: in-progress' in _header_lines(result_md)
-    else:
-        assert parse_result_outcome(result_md.read_text()) == outcome
+    assert parse_result_outcome(result_md.read_text()) == outcome
 
 
 def test_b10_the_final_session_is_the_checkpoints_and_its_inbox_return_validates(

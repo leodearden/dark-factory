@@ -7126,6 +7126,51 @@ class TestFilterTerminalMetadataFlags:
             'task_metadata_stale alias must also be dropped for cancelled tasks'
         )
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'flag_type',
+        ['Stale-Metadata', 'metadata_stale', 'Task Metadata Stale', 'STALE_TASK_METADATA'],
+    )
+    async def test_canonical_variant_spellings_are_dropped_for_a_terminal_task(self, flag_type):
+        """A case/separator/word-order respelling of a known spelling is checked and dropped.
+
+        This widening (task 6005) is intentional: the filter matches through
+        STALE_METADATA_FAMILY, and the drop still requires a live terminal status.
+        """
+        from fused_memory.reconciliation.flag_dedup import filter_terminal_metadata_flags
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value={'status': 'cancelled'})
+
+        flag = {'task_id': '1703', 'flag_type': flag_type}
+        result = await filter_terminal_metadata_flags(taskmaster, '/proj', [flag])
+
+        assert result == []
+        taskmaster.get_task.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_possible_drift_log_keeps_its_event_name_and_names_the_family(self, caplog):
+        from fused_memory.reconciliation.flag_dedup import filter_terminal_metadata_flags
+
+        flags = [
+            {'task_id': None, 'flag_type': 'stale_task_reference'},
+            {'task_id': None, 'flag_type': 'Stale_Metadata'},
+            {'task_id': None, 'flag_type': 'orphaned_knowledge'},
+        ]
+
+        with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.flag_dedup'):
+            await filter_terminal_metadata_flags(AsyncMock(), '/proj', flags)
+
+        drift = [
+            r.getMessage()
+            for r in caplog.records
+            if 'terminal_metadata_filter_possible_drift' in r.getMessage()
+        ]
+        assert len(drift) == 1, drift
+        assert drift[0].startswith('reconciliation.terminal_metadata_filter_possible_drift ')
+        assert 'family=stale_metadata' in drift[0]
+        assert "unmatched_flag_types=['stale_task_reference']" in drift[0]
+
 
 # ---------------------------------------------------------------------------
 # task-3007 step-1 — filter_stale_bulk_get_statuses_flags
@@ -7421,6 +7466,32 @@ class TestFilterStaleBulkGetStatusesFlags:
             'scoped reads must be issued only for the two task-bearing matching '
             'flags (100, 200) — never for the non-matching (999) or no-task-id flag'
         )
+
+    @pytest.mark.asyncio
+    async def test_possible_drift_log_keeps_its_event_name_and_names_the_family(self, caplog):
+        from fused_memory.reconciliation.flag_dedup import filter_stale_bulk_get_statuses_flags
+
+        taskmaster = AsyncMock()
+        flags = [
+            {'task_id': None, 'flag_type': 'get_statuses_latency_regression'},
+            {'task_id': None, 'flag_type': 'Bulk-Get-Statuses-Stale'},
+        ]
+
+        with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.flag_dedup'):
+            await filter_stale_bulk_get_statuses_flags(taskmaster, '/proj', flags)
+
+        drift = [
+            r.getMessage()
+            for r in caplog.records
+            if 'stale_bulk_get_statuses_filter_possible_drift' in r.getMessage()
+        ]
+        assert len(drift) == 1, drift
+        assert drift[0].startswith(
+            'reconciliation.stale_bulk_get_statuses_filter_possible_drift '
+        )
+        assert 'family=stale_bulk_get_statuses' in drift[0]
+        assert "unmatched_flag_types=['get_statuses_latency_regression']" in drift[0]
+        taskmaster.get_statuses.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -11945,7 +12016,7 @@ class TestFilterStyleOnlyAuthorshipFlags:
 
     @pytest.mark.asyncio
     async def test_non_candidate_flag_type_passes_through_without_lookup(self):
-        """(SCOPE) Only AUTHORSHIP_SUSPICION_FLAG_TYPES are checked."""
+        """(SCOPE) Only flag_types AUTHORSHIP_SUSPICION_FAMILY matches are checked."""
         from fused_memory.reconciliation.flag_dedup import (
             filter_style_only_authorship_flags,
         )
@@ -12095,6 +12166,69 @@ class TestFilterStyleOnlyAuthorshipFlags:
             'the input list itself must never be mutated'
         )
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'flag_type',
+        ['Prompt-Injection', 'injection_possible', 'Foreign Authorship', 'CONTENT_FABRICATED'],
+    )
+    async def test_canonical_variant_spellings_are_candidates_and_dropped_when_house_authored(
+        self, flag_type,
+    ):
+        """A case/separator/word-order respelling of a known spelling is a candidate.
+
+        This widening (task 6005) is intentional and safe: the filter matches
+        through AUTHORSHIP_SUSPICION_FAMILY, and dropping still requires
+        wholly-house-authored provenance.
+        """
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_style_only_authorship_flags,
+        )
+
+        flag = self._make_authorship_flag(flag_type=flag_type)
+        memory_service = AsyncMock()
+        memory_service.get_memory_by_id = AsyncMock(
+            return_value=self._record('recon-stage-memory_consolidator'),
+        )
+
+        result = await filter_style_only_authorship_flags(
+            memory_service, 'dark_factory', [flag],
+        )
+
+        assert result == []
+        memory_service.get_memory_by_id.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_possible_drift_log_keeps_its_event_name_and_names_the_family(self, caplog):
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_style_only_authorship_flags,
+        )
+
+        flags = [
+            {'flag_type': 'injection_risk_detected'},
+            {'flag_type': 'fabrication_suspected'},
+            {'flag_type': 'foreign_key_violation'},
+            {'flag_type': 'Possible-Injection'},
+            {'flag_type': 'stale_metadata'},
+        ]
+
+        with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.flag_dedup'):
+            await filter_style_only_authorship_flags(AsyncMock(), 'dark_factory', flags)
+
+        drift = [
+            r.getMessage()
+            for r in caplog.records
+            if 'style_only_authorship_filter_possible_drift' in r.getMessage()
+        ]
+        assert len(drift) == 1, drift
+        assert drift[0].startswith(
+            'reconciliation.style_only_authorship_filter_possible_drift '
+        )
+        assert 'family=authorship_suspicion' in drift[0]
+        assert (
+            "unmatched_flag_types=['injection_risk_detected', 'fabrication_suspected', "
+            "'foreign_key_violation']"
+        ) in drift[0]
+
 
 # ---------------------------------------------------------------------------
 # ---- task 3476 step-1 ----
@@ -12212,7 +12346,7 @@ class TestFlagTypeFamily:
     _FAMILY = flag_dedup.FlagTypeFamily(
         name='widget_anomaly',
         spellings=frozenset({'widget_anomaly_detected'}),
-        drift_token='widget',
+        drift_tokens=frozenset({'widget'}),
     )
 
     def test_without_unseen_tokens_only_canonical_variants_match(self):
@@ -12245,6 +12379,38 @@ class TestFlagTypeFamily:
             )
 
         assert caplog.records == []
+
+    def test_log_drift_logs_a_flag_type_carrying_any_drift_token(self, caplog):
+        family = flag_dedup.FlagTypeFamily(
+            name='authorship_like',
+            spellings=frozenset({'possible_injection'}),
+            drift_tokens=frozenset({'inject', 'fabricat'}),
+        )
+        flags = [
+            {'flag_type': 'injection_risk'},
+            {'flag_type': 'Fabrication_Suspected'},
+            {'flag_type': 'Possible-Injection'},
+            {'flag_type': 'stale_metadata'},
+        ]
+
+        with caplog.at_level(logging.INFO):
+            family.log_drift(flags, log_event='reconciliation.x_filter_possible_drift')
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert len(messages) == 1, messages
+        assert messages[0].startswith('reconciliation.x_filter_possible_drift ')
+        assert "unmatched_flag_types=['injection_risk', 'Fabrication_Suspected']" in messages[0]
+
+    @pytest.mark.parametrize(
+        'drift_tokens',
+        [frozenset(), frozenset({''}), frozenset({'Widget'}), 'widget', {'widget'}],
+        ids=['empty_set', 'empty_token', 'not_casefolded', 'bare_str', 'mutable_set'],
+    )
+    def test_construction_rejects_malformed_drift_tokens(self, drift_tokens):
+        with pytest.raises(ValueError, match='drift_tokens'):
+            flag_dedup.FlagTypeFamily(
+                name='w', spellings=frozenset({'w_x'}), drift_tokens=drift_tokens,
+            )
 
 
 # ---------------------------------------------------------------------------

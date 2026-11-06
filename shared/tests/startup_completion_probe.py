@@ -728,7 +728,8 @@ def sample_proc(pid: int | None) -> dict:
     """Sample ``/proc/<pid>`` — liveness, scheduler state char, argv, direct children.
 
     Total: every field degrades to ``None``/``[]`` rather than raising, because a
-    probe that crashes on a racing exit loses the whole (paid-for) capture.
+    probe that crashes on a racing exit loses the whole (paid-for) capture.  Each
+    comm comes from the same stat read as its state.
     """
     out: dict[str, Any] = {
         'pid': pid,
@@ -746,8 +747,7 @@ def sample_proc(pid: int | None) -> dict:
     out['alive'] = True
     fields = read_stat_fields(proc, skip_malformed=True)
     out['state'] = None if fields is None else fields.state
-    with contextlib.suppress(OSError):
-        out['comm'] = (proc / 'comm').read_text().strip()
+    out['comm'] = None if fields is None else fields.comm
     try:
         raw = (proc / 'cmdline').read_bytes().decode('utf-8', 'replace')
         argv = [part for part in raw.split('\0') if part]
@@ -757,11 +757,12 @@ def sample_proc(pid: int | None) -> dict:
     try:
         child_pids = (proc / 'task' / str(pid) / 'children').read_text().split()
         for child in child_pids:
-            try:
-                comm = Path(f'/proc/{child}/comm').read_text().strip()
-            except OSError:
-                comm = None
-            out['children'].append({'pid': int(child), 'comm': comm})
+            child_pid = int(child)
+            child_fields = read_stat_fields(
+                proc.parent / str(child_pid), skip_malformed=True
+            )
+            comm = None if child_fields is None else child_fields.comm
+            out['children'].append({'pid': child_pid, 'comm': comm})
     except (OSError, ValueError):
         pass
     return out

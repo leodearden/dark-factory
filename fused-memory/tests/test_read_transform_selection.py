@@ -3473,6 +3473,25 @@ class TestTheGuardIsWiredNotMerelyAvailable:
 
         assert 'e2_query_set.jsonl' in str(excinfo.value)
 
+    def test_score_from_cache_ignores_a_drifted_registry_digest(self, tmp_path):
+        """The topic registry is pinned by the corpus fingerprint, not its
+        bytes, so `score_from_cache` must not compare a registry digest even
+        when the cache carries one that disagrees with the tree."""
+        mod = _mod()
+        bake = _bake_off()
+        doc = json.loads(COMMITTED_FETCH_CACHE.read_text(encoding='utf-8'))
+        [registry_row] = bake.fixture_digests([bake.DEFAULT_REGISTRY_PATH])
+        doc['provenance']['fixtures'].append(
+            {'path': registry_row['path'], 'sha256': 'deadbeef' * 8},
+        )
+        target = tmp_path / 'e2_fetch_cache.json'
+        target.write_text(json.dumps(doc, indent=2, sort_keys=True) + '\n',
+                          encoding='utf-8')
+
+        scored = mod.score_from_cache(fetch_cache=target)
+
+        assert set(scored['e2']) == set(mod.ARM_KEYS)
+
     def test_main_reports_the_refusal_without_a_traceback(
         self, tmp_path, capsys,
     ):

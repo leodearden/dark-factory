@@ -604,7 +604,8 @@ _CLOSING: Mapping[RefusalKind, str] = {
 }
 
 
-def _report(outcome: Applied | Refused, subject: str | Path, *, prefix: str = '') -> int:
+def report(outcome: Applied | Refused, subject: str | Path, *, prefix: str = '') -> int:
+    """Print an application's digest, or its refusal on stderr; 0 when applied, 1 when refused."""
     if isinstance(outcome, Refused):
         for line in outcome.lines:
             print(line, file=sys.stderr)
@@ -644,11 +645,11 @@ def _validated(parser: argparse.ArgumentParser, args: argparse.Namespace) -> Non
 
 def _run(args: argparse.Namespace) -> int:
     if args.check is not None:
-        return _report(check(args.check, amend=args.amend), args.check, prefix='check ok: ')
+        return report(check(args.check, amend=args.amend), args.check, prefix='check ok: ')
     if args.file is not None:
-        return _report(apply(args.file, amend=args.amend), args.file)
+        return report(apply(args.file, amend=args.amend), args.file)
     outcome = from_store(state.run_home(args.run), args.from_store)
-    return _report(outcome, f'--from-store {args.from_store}')
+    return report(outcome, f'--from-store {args.from_store}')
 
 
 def main(argv: Sequence[str] | None = None) -> int:

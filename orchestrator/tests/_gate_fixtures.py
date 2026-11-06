@@ -69,11 +69,18 @@ def gated_run(inner: Run, *, built: bool = False) -> Run:
 
 
 def gated_remote_runner(
-    name: str, ssh_host: str, git_remote: str, cwd: Any, **kwargs: Any,
+    name: str, ssh_host: str, git_remote: str, cwd: Any, *, gate_built: bool = False,
+    **kwargs: Any,
 ) -> RemoteRunner:
-    """A RemoteRunner on the test gate layout whose ``run`` answers the gate calls."""
+    """A RemoteRunner on the test gate layout whose ``run`` answers the gate calls.
+
+    *gate_built* makes ensure-gate report that it built the gate for the call;
+    it needs an injected ``run``, which is what answers ensure-gate.
+    """
+    if gate_built and kwargs.get('run') is None:
+        raise ValueError('gate_built needs an injected run to answer ensure-gate')
     if kwargs.get('run') is not None:
-        kwargs['run'] = gated_run(kwargs['run'])
+        kwargs['run'] = gated_run(kwargs['run'], built=gate_built)
     kwargs.setdefault('df_remote_checkout', TEST_DF_REMOTE)
     kwargs.setdefault('gate_checkouts_path', TEST_GATE_ROOT)
     kwargs.setdefault('deployed_sha', TEST_DEPLOYED_SHA)

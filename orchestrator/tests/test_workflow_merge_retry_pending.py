@@ -636,11 +636,14 @@ class TestResumeGuard:
     ):
         """HEAD still matches the stamp, but main advanced and introduced a conflict.
 
-        The stamped branch is unchanged (HEAD match), so the pre-3024 guard
-        fast-pathed straight to _merge_and_finalise with an empty ``plan.files``
-        — tripping the merge-entry scope invariant and looping forever.  The
-        clean-merge probe must void the now-unsatisfiable stamp and fall back to
-        the full plan/execute/verify/review pipeline instead.
+        The stamped branch is unchanged (HEAD match), but a stale obligation
+        must not merge a branch that no longer applies onto current main.  So
+        the clean-merge probe voids the now-unsatisfiable stamp and the full
+        plan/execute/verify/review pipeline runs instead.  (The empty
+        ``plan.files`` merge-entry loop was esc-3388-9's separate cause, closed
+        by the plan read and pinned by
+        test_head_match_populates_self_plan_before_delegating and
+        test_workflow_merge_retry_resume_merge_entry.py.)
         """
         f = _make(metadata={'merge_retry_pending': {**_STAMP, 'branch_head': 'HEAD-SHA'}})
         spies = _wire_resume_guard_spies(f)
@@ -657,7 +660,7 @@ class TestResumeGuard:
         assert outcome is None
         # A confirmed conflict voids the resume obligation — clear it.
         spies.clear_merge_retry_pending.assert_awaited_once()
-        # ...and never hand an empty-plan workflow to the merge phase.
+        # ...and never merge a branch that no longer applies.
         spies.merge_and_finalise.assert_not_awaited()
         f.git_ops.merge_tree_conflicts.assert_awaited_once_with('BASE-SHA', 'HEAD-SHA')
 

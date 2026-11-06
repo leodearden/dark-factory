@@ -26,6 +26,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from shared.sqlite_column_migration import add_column_if_missing_sync
+
 from fused_memory.maintenance.link_heal import (
     BasisSource,
     HealAction,
@@ -137,13 +139,6 @@ _ACTION_COLUMNS = (
 )
 _HEALS_ONLY = f"basis_source != '{BasisSource.UNDO}'"
 _RUN_PREFIX = re.compile(r'[0-9a-f]{8,32}')
-
-
-def _add_missing_columns(conn: sqlite3.Connection) -> None:
-    """Bring a ledger written before ``runs.plan_path`` existed up to ``_SCHEMA``."""
-    columns = {row['name'] for row in conn.execute('PRAGMA table_info(runs)')}
-    if 'plan_path' not in columns:
-        conn.execute('ALTER TABLE runs ADD COLUMN plan_path TEXT')
 
 
 def new_run_id() -> str:
@@ -282,7 +277,8 @@ class LinkHealLedger:
         self._conn = sqlite3.connect(db_path)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
-        _add_missing_columns(self._conn)
+        # A ledger written before runs.plan_path existed.
+        add_column_if_missing_sync(self._conn, 'runs', 'plan_path', 'TEXT')
         self._conn.commit()
 
     def close(self) -> None:

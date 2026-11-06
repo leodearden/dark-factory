@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import logging
 import subprocess
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
@@ -151,6 +152,15 @@ def _capturing_async_detector(captured: dict, result: bool = False):
         return result
 
     return _spy
+
+
+_SCHEMA_WARNING = 'task_metadata.schema_warning'
+
+
+def _discard_lines(caplog, source: str) -> list[str]:
+    """The census lines that name *source* as the reader that discarded metadata."""
+    messages = (r.getMessage() for r in caplog.records)
+    return [m for m in messages if _SCHEMA_WARNING in m and f'source={source}' in m]
 
 
 # ---------------------------------------------------------------------------
@@ -466,8 +476,8 @@ class TestCheckGate2LiveWorkflow:
         assert captured['kwargs'].get('pure_gate') is False
 
     async def test_gate_2_coerces_json_string_task_metadata(self, monkeypatch):
-        """A JSON-object-string metadata blob is coerced via
-        _coerce_metadata_dict, the module's existing shared idiom."""
+        """A JSON-object-string metadata blob is resolved through
+        metadata_dict.raw_metadata_dict, the shared wire rule."""
         captured = self._capture_detector_kwargs(monkeypatch)
         await _check(
             'set_task_status',
@@ -501,6 +511,30 @@ class TestCheckGate2LiveWorkflow:
         assert captured['kwargs'].get('task_kind') is None
         assert captured['kwargs'].get('pure_gate') is False
         assert verdict.is_rejection is False
+
+    @pytest.mark.parametrize(
+        ('task_metadata', 'census_lines'),
+        [('not json', 1), (42, 1), ('[]', 1), (['a'], 1), (None, 0), ('', 0)],
+        ids=['invalid-json', 'int', 'json-list', 'list', 'none', 'empty-str'],
+    )
+    async def test_gate_2_logs_unreadable_task_metadata_once_and_absent_never(
+        self, monkeypatch, caplog, task_metadata, census_lines
+    ):
+        """Unreadable task_metadata still fails safe toward live, and is
+        logged once under source=recon_write_policy.check; absent metadata
+        is not logged."""
+        captured = self._capture_detector_kwargs(monkeypatch)
+        with caplog.at_level(logging.WARNING):
+            await _check(
+                'set_task_status',
+                task_id='7',
+                live_status='pending',
+                task_metadata=task_metadata,
+            )
+
+        assert captured['kwargs'].get('task_kind') is None
+        assert captured['kwargs'].get('pure_gate') is False
+        assert len(_discard_lines(caplog, 'recon_write_policy.check')) == census_lines
 
 
 # ---------------------------------------------------------------------------
@@ -862,6 +896,13 @@ class TestExtractSnapshotToken:
 
     def test_extract_from_dict_with_empty_string_value_is_none(self):
         assert recon_write_policy.extract_snapshot_token({'snapshot_status': ''}) is None
+
+    @pytest.mark.parametrize('metadata', ['{not json', 42], ids=repr)
+    def test_unreadable_metadata_is_none_and_logs_one_census_line(self, metadata, caplog):
+        with caplog.at_level(logging.WARNING):
+            assert recon_write_policy.extract_snapshot_token(metadata) is None
+        source = 'recon_write_policy.extract_snapshot_token'
+        assert len(_discard_lines(caplog, source)) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1305,7 +1346,7 @@ class TestIsTerminalAnnotationExempt:
         ) is False
 
     def test_add_plus_causation_id_via_json_string_metadata_is_true(self):
-        """JSON-string metadata (the _coerce_metadata_dict string-coercion
+        """JSON-string metadata (the raw_metadata_dict string-coercion
         path recon-stage writes can also arrive via) carrying an x_ key plus
         _causation_id must still be exempt — _annotation_content_keys strips
         tracing co-keys from the already-parsed dict, after string
@@ -1314,6 +1355,14 @@ class TestIsTerminalAnnotationExempt:
         assert recon_write_policy.is_terminal_annotation_exempt(
             {'metadata': '{"x_foo": 1, "_causation_id": "run-1"}'},
         ) is True
+
+    def test_unreadable_metadata_is_false_and_logs_one_census_line(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            assert recon_write_policy.is_terminal_annotation_exempt(
+                {'metadata': '{not json'},
+            ) is False
+        source = 'recon_write_policy.terminal_annotation_merge'
+        assert len(_discard_lines(caplog, source)) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -2297,6 +2346,244 @@ class TestGate2TaskKindForwardingIsBehaviorPreserving:
 
         assert result.get('error_type') == 'ReconLiveWorkflowWriteRejected'
         taskmaster.set_task_status.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Gate 2: a pending task awaiting an unmet dependency (detector rule 6, task 8330)
+# ---------------------------------------------------------------------------
+
+
+def _task_8162(**overrides) -> dict:
+    """reify task 8162's shape: pending, normal, unclaimed, awaiting local dep 9739."""
+    task = {
+        'id': '8162',
+        'status': 'pending',
+        'title': 'T',
+        'claimant_run_id': None,
+        'heartbeat_at': None,
+        'dependencies': [9739],
+        'metadata': {'task_kind': 'normal'},
+    }
+    task.update(overrides)
+    return task
+
+
+class TestGate2PendingAwaitingDependency:
+    """The bare project lock no longer rejects a recon-stage status write for an
+    unclaimed pending normal task whose local dependency is positively unmet: the
+    scheduler will not dispatch it, so there is no pipeline to race.
+
+    Real detector, lock forced live, git against the non-existent '/project'
+    (fails safe to no worktree and no commit) unless patched.
+    """
+
+    @staticmethod
+    def _force_orchestrator_live(monkeypatch) -> None:
+        from fused_memory.services import live_workflow_detector
+
+        monkeypatch.setattr(
+            live_workflow_detector, 'is_orchestrator_live_for', lambda *a, **k: True,
+        )
+
+    @staticmethod
+    def _arrange(taskmaster, monkeypatch, task: dict, dependency_statuses) -> None:
+        taskmaster.get_task = AsyncMock(return_value=task)
+        if isinstance(dependency_statuses, Exception):
+            taskmaster.get_statuses_raw = AsyncMock(side_effect=dependency_statuses)
+        else:
+            taskmaster.get_statuses_raw = AsyncMock(return_value=dependency_statuses)
+        TestGate2PendingAwaitingDependency._force_orchestrator_live(monkeypatch)
+
+    @staticmethod
+    async def _cancel(interceptor) -> dict:
+        return await interceptor.set_task_status('8162', 'cancelled', '/project', agent_id=AGENT_ID)
+
+    @pytest.mark.asyncio
+    async def test_unclaimed_pending_task_awaiting_dependency_is_writable(
+        self, interceptor, taskmaster, monkeypatch,
+    ):
+        self._arrange(taskmaster, monkeypatch, _task_8162(), {'9739': 'pending'})
+
+        result = await self._cancel(interceptor)
+
+        assert result.get('error_type') != 'ReconLiveWorkflowWriteRejected'
+        taskmaster.set_task_status.assert_awaited_once()
+        taskmaster.get_statuses_raw.assert_awaited_once_with('/project', tag=None, ids=['9739'])
+
+    @pytest.mark.parametrize(
+        ('dependencies', 'statuses'),
+        [
+            ([9739], {'9739': 'done'}),
+            ([9739, 9740], {'9739': 'done', '9740': 'cancelled'}),
+        ],
+        ids=['one_done', 'done_and_cancelled'],
+    )
+    @pytest.mark.asyncio
+    async def test_satisfied_dependencies_keep_the_lock(
+        self, interceptor, taskmaster, monkeypatch, dependencies, statuses,
+    ):
+        self._arrange(taskmaster, monkeypatch, _task_8162(dependencies=dependencies), statuses)
+
+        result = await self._cancel(interceptor)
+
+        assert result.get('error_type') == 'ReconLiveWorkflowWriteRejected'
+        taskmaster.set_task_status.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_registered_worktree_keeps_the_task_live(
+        self, interceptor, taskmaster, monkeypatch,
+    ):
+        self._arrange(taskmaster, monkeypatch, _task_8162(), {'9739': 'pending'})
+
+        def _git(args, **kwargs):
+            return subprocess.CompletedProcess(
+                args=args, returncode=0,
+                stdout=_worktree_porcelain_registering('task/8162'), stderr='',
+            )
+
+        with patch.object(detector_module, 'run_git', side_effect=as_async_run_git(_git)):
+            result = await self._cancel(interceptor)
+
+        assert result.get('error_type') == 'ReconLiveWorkflowWriteRejected'
+        taskmaster.set_task_status.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_claimant_with_fresh_heartbeat_keeps_the_lock(
+        self, interceptor, taskmaster, monkeypatch,
+    ):
+        task = _task_8162(claimant_run_id='run-8162', heartbeat_at=_heartbeat(_FRESH_HEARTBEAT))
+        self._arrange(taskmaster, monkeypatch, task, {'9739': 'pending'})
+
+        result = await self._cancel(interceptor)
+
+        assert result.get('error_type') == 'ReconLiveWorkflowWriteRejected'
+        taskmaster.set_task_status.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        'dependency_statuses',
+        [RuntimeError('status read failed'), {'9739': 'merge-deferred'}],
+        ids=['read_raises', 'merge_deferred'],
+    )
+    @pytest.mark.asyncio
+    async def test_no_positive_evidence_keeps_the_lock(
+        self, interceptor, taskmaster, monkeypatch, dependency_statuses,
+    ):
+        self._arrange(taskmaster, monkeypatch, _task_8162(), dependency_statuses)
+
+        result = await self._cancel(interceptor)
+
+        assert result.get('error_type') == 'ReconLiveWorkflowWriteRejected'
+        taskmaster.set_task_status.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_eligible_task_keeps_the_lock_without_a_read(
+        self, interceptor, taskmaster, monkeypatch,
+    ):
+        self._arrange(taskmaster, monkeypatch, _task_8162(dependencies=[]), {'9739': 'pending'})
+
+        result = await self._cancel(interceptor)
+
+        assert result.get('error_type') == 'ReconLiveWorkflowWriteRejected'
+        taskmaster.set_task_status.assert_not_awaited()
+        taskmaster.get_statuses_raw.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_deterministic_task_outside_rule_5_keeps_the_lock(
+        self, interceptor, taskmaster, monkeypatch,
+    ):
+        task = _task_8162(metadata={'task_kind': 'deterministic'})
+        self._arrange(taskmaster, monkeypatch, task, {'9739': 'pending'})
+
+        result = await self._cancel(interceptor)
+
+        assert result.get('error_type') == 'ReconLiveWorkflowWriteRejected'
+        taskmaster.set_task_status.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        ('statuses_kwargs', 'rejected'),
+        [({'dependency_statuses': {'9739': 'pending'}}, False), ({}, True)],
+        ids=['statuses_given', 'statuses_omitted'],
+    )
+    @pytest.mark.asyncio
+    async def test_check_drops_the_lock_only_with_dependency_statuses(
+        self, monkeypatch, statuses_kwargs, rejected,
+    ):
+        self._force_orchestrator_live(monkeypatch)
+
+        verdict = await _check(
+            'set_task_status',
+            task_id='8162',
+            project_root='/project',
+            target_status='cancelled',
+            live_status='pending',
+            task_metadata={'task_kind': 'normal'},
+            task_snapshot=_task_8162(),
+            **statuses_kwargs,
+        )
+
+        assert verdict.is_rejection is rejected
+        assert (verdict.error_type == 'ReconLiveWorkflowWriteRejected') is rejected
+
+
+class _FakeStatusReader:
+    """A DependencyStatusReader recording each read and answering with *result*."""
+
+    def __init__(self, result: dict[str, str] | Exception):
+        self.result = result
+        self.calls: list[tuple[str, str | None, list[str] | None]] = []
+
+    async def get_statuses_raw(
+        self, project_root: str, tag: str | None = None, ids: list[str] | None = None,
+    ) -> dict[str, str]:
+        self.calls.append((project_root, tag, ids))
+        if isinstance(self.result, Exception):
+            raise self.result
+        return self.result
+
+
+class TestReadDependencyStatuses:
+    """read_dependency_statuses: one batch read of a task's dependency statuses,
+    returning None (rule 6 inert) whenever there is nothing to read or the read fails."""
+
+    @pytest.mark.parametrize(
+        'snapshot',
+        [_task_8162(dependencies=[]), None, 'x'],
+        ids=['no_dependencies', 'none', 'str'],
+    )
+    @pytest.mark.asyncio
+    async def test_nothing_to_read_returns_none_without_reading(self, snapshot):
+        reader = _FakeStatusReader({'9739': 'pending'})
+
+        result = await recon_write_policy.read_dependency_statuses(
+            reader, snapshot, project_root='/p', tag=None,
+        )
+
+        assert result is None
+        assert reader.calls == []
+
+    @pytest.mark.asyncio
+    async def test_read_result_is_returned_unchanged(self):
+        reader = _FakeStatusReader({'9739': 'pending'})
+
+        result = await recon_write_policy.read_dependency_statuses(
+            reader, _task_8162(), project_root='/p', tag='master',
+        )
+
+        assert result == {'9739': 'pending'}
+        assert reader.calls == [('/p', 'master', ['9739'])]
+
+    @pytest.mark.asyncio
+    async def test_raising_read_returns_none_and_warns(self, caplog):
+        reader = _FakeStatusReader(RuntimeError('db locked'))
+
+        with caplog.at_level(logging.WARNING, logger=recon_write_policy.__name__):
+            result = await recon_write_policy.read_dependency_statuses(
+                reader, _task_8162(), project_root='/p', tag=None,
+            )
+
+        assert result is None
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert any('8162' in r.getMessage() for r in warnings)
 
 
 # ---------------------------------------------------------------------------

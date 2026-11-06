@@ -59,6 +59,7 @@ from orchestrator.agents.invoke import AgentResult
 from orchestrator.agents.roles import IMPLEMENTER
 from orchestrator.config import GitConfig, OrchestratorConfig, TimeoutsConfig
 from orchestrator.git_ops import GitOps, _run
+from orchestrator.resume_resolution import CarriedResolution
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.steward import TaskSteward
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
@@ -284,7 +285,7 @@ def _time_the_wait(workflow: TaskWorkflow) -> dict[str, float]:
     timing: dict[str, float] = {}
     original = workflow._wait_for_resolution
 
-    async def _timed() -> str:
+    async def _timed() -> tuple[CarriedResolution, ...]:
         started = asyncio.get_running_loop().time()
         try:
             return await original()

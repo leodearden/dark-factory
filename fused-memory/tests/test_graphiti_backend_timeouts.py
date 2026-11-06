@@ -76,8 +76,7 @@ _READS = (
         lambda b: b.search_nodes('q', group_ids=[_GROUP]),
     ),
     _TimedCall(
-        'retrieve_episodes',
-        lambda b: patch.object(EpisodicNode, 'get_by_group_ids', AsyncMock(side_effect=_hang)),
+        'retrieve_episodes', _graph_hanging_on('ro_query'),
         lambda b: b.retrieve_episodes([_GROUP]),
     ),
     _TimedCall(
@@ -128,19 +127,33 @@ _WRITES = (
     _TimedCall(
         'update_edge.save',
         lambda b: patch.object(
-            EntityEdge, 'get_by_uuid', AsyncMock(return_value=_loaded_with_hanging('save')),
+            EntityEdge, 'get_by_uuid', AsyncMock(return_value=MagicMock(
+                save=AsyncMock(side_effect=_hang), generate_embedding=AsyncMock(),
+            )),
         ),
-        lambda b: b.update_edge('edge-1', group_id=_GROUP, invalid_at=datetime.now(UTC)),
+        lambda b: b.update_edge('edge-1', 'new fact', group_id=_GROUP),
     ),
     _TimedCall(
-        'update_edge.clear_invalid_at',
+        'update_edge.invalid_at',
         lambda b: _all_of(
             patch.object(
-                EntityEdge, 'get_by_uuid', AsyncMock(return_value=MagicMock(save=AsyncMock())),
+                EntityEdge, 'get_by_uuid', AsyncMock(return_value=MagicMock()),
+            ),
+            _graph_hanging_on('query')(b),
+        ),
+        lambda b: b.update_edge('edge-1', group_id=_GROUP, invalid_at=datetime.now(UTC)),
+        variant='set',
+    ),
+    _TimedCall(
+        'update_edge.invalid_at',
+        lambda b: _all_of(
+            patch.object(
+                EntityEdge, 'get_by_uuid', AsyncMock(return_value=MagicMock()),
             ),
             _graph_hanging_on('query')(b),
         ),
         lambda b: b.update_edge('edge-1', group_id=_GROUP, clear_invalid_at=True),
+        variant='clear',
     ),
     _TimedCall(
         'redact_episode_content.write', _graph_hanging_on('query'), _redact,

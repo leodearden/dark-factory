@@ -20,16 +20,15 @@ holds a live one (servers ``escalation``, ``fused-memory``).  Under
 is unreviewed MCP **write** access, blast radius including ``halt_scheduler``
 and ``delete_memory``.
 
-A caller closes the hole in one of exactly two ways:
-
-* ``mcp_config=no_mcp_servers_config()`` **together with**
-  ``strict_mcp_config=True`` — see
-  ``shared/src/shared/cli_invoke.py::no_mcp_servers_config``.  The config must
-  stay TRUTHY: ``--strict-mcp-config`` is emitted inside ``build_claude_argv``'s
-  ``if mcp_config:`` block, so a bare ``{}`` silently no-ops and reinstates the
-  hole while looking correct.
-* run at ``shared/src/shared/neutral_cwd.py::neutral_cli_cwd()`` — an empty
-  scratch directory, so there is no ambient ``.mcp.json`` to merge.
+A caller closes the hole one way: ``mcp_config=no_mcp_servers_config()``
+**together with** ``strict_mcp_config=True`` — see
+``shared/src/shared/cli_invoke.py::no_mcp_servers_config``.  The config must
+stay TRUTHY: ``--strict-mcp-config`` is emitted inside ``build_claude_argv``'s
+``if mcp_config:`` block, so a bare ``{}`` silently no-ops and reinstates the
+hole while looking correct.  Running at
+``shared/src/shared/neutral_cwd.py::neutral_cli_cwd()`` does not close MCP —
+account-scoped claude.ai connectors still connect there — so it is not
+accepted.
 
 Tasks 4145 and 4242 each closed one instance of this by hand.  This gate
 generalises those two fixes so a third instance cannot be introduced silently.
@@ -62,7 +61,6 @@ from pathlib import Path
 import pytest
 from silent_fallthrough_scan import ParsedFile
 from wildcard_mcp_scoping_scan import (
-    EXEMPT_NEUTRAL_CWD,
     EXEMPT_STRICT_MCP,
     NOT_EXEMPT,
     WildcardMcpScopingSite,
@@ -378,16 +376,14 @@ class TestNonMatchingCallsAreNotSites:
         ''') == []
 
 
-
-class TestNeutralCwdExemption:
-    """The cwd exemption checks WHAT was assigned, not that an assignment exists.
-
-    Without these, step-5's one-hop resolution could decay into a blanket pass
-    — any local name, any attribute — and the whole-tree gate would stay green
-    the whole way down, because its tree is green either way.
+class TestNeutralCwdIsNotAProtection:
+    """A neutral cwd removes only the ambient project ``.mcp.json``.  An
+    account-scoped claude.ai connector still connected at an empty neutral cwd
+    and exposed write tools (CLI 2.1.283 system/init inventory, task 3995), so
+    only explicit strict scoping closes MCP.
     """
 
-    def test_a_direct_neutral_cwd_call_is_compliant(self) -> None:
+    def test_a_direct_neutral_cwd_call_is_a_violation(self) -> None:
         sites = _scan('''
             def call_the_model():
                 return invoke_with_cap_retry(
@@ -397,27 +393,12 @@ class TestNeutralCwdExemption:
                 )
         ''')
         assert len(sites) == 1, f'got {sites!r}'
-        assert sites[0].exemption == EXEMPT_NEUTRAL_CWD, f'got {sites[0]!r}'
+        (site,) = sites
+        assert site.exemption == NOT_EXEMPT, f'got {site!r}'
+        assert is_violation(site), f'got {site!r}'
 
-    def test_the_attribute_spelling_of_the_call_is_compliant(self) -> None:
-        """``neutral_cwd.neutral_cli_cwd()`` is the same call, module-qualified."""
-        sites = _scan('''
-            def call_the_model():
-                return invoke_with_cap_retry(
-                    disallowed_tools=['*'],
-                    output_schema=SCHEMA,
-                    cwd=neutral_cwd.neutral_cli_cwd(),
-                )
-        ''')
-        assert len(sites) == 1, f'got {sites!r}'
-        assert sites[0].exemption == EXEMPT_NEUTRAL_CWD, f'got {sites[0]!r}'
-
-    def test_a_local_name_assigned_from_the_call_is_compliant(self) -> None:
-        """The synthetic twin of all three real neutral-cwd sites.
-
-        Without this fixture, a refactor that dropped the local-name resolution
-        would red the whole-tree gate with no synthetic test explaining why.
-        """
+    def test_a_local_name_bound_to_a_neutral_cwd_is_a_violation(self) -> None:
+        """The pre-6003 PathScopeAdjudicator.adjudicate shape."""
         sites = _scan('''
             class Curator:
                 async def _call_llm(self, prompt):
@@ -430,110 +411,9 @@ class TestNeutralCwdExemption:
                     )
         ''')
         assert len(sites) == 1, f'got {sites!r}'
-        assert sites[0].exemption == EXEMPT_NEUTRAL_CWD, f'got {sites[0]!r}'
-
-    def test_an_annotated_assignment_from_the_call_is_compliant(self) -> None:
-        sites = _scan('''
-            def call_the_model():
-                cwd: Path = neutral_cli_cwd()
-                return invoke_with_cap_retry(
-                    disallowed_tools=['*'],
-                    output_schema=SCHEMA,
-                    cwd=cwd,
-                )
-        ''')
-        assert len(sites) == 1, f'got {sites!r}'
-        assert sites[0].exemption == EXEMPT_NEUTRAL_CWD, f'got {sites[0]!r}'
-
-    def test_every_target_of_a_chained_assignment_is_bound(self) -> None:
-        """``cwd`` is the SECOND target, so reading only the first misses it."""
-        sites = _scan('''
-            def call_the_model():
-                scratch = cwd = neutral_cli_cwd()
-                return invoke_with_cap_retry(
-                    disallowed_tools=['*'],
-                    output_schema=SCHEMA,
-                    cwd=cwd,
-                )
-        ''')
-        assert len(sites) == 1, f'got {sites!r}'
-        assert sites[0].exemption == EXEMPT_NEUTRAL_CWD, f'got {sites[0]!r}'
-
-    def test_a_local_name_assigned_from_something_else_is_a_violation(self) -> None:
-        """The single most important negative case: it proves the resolution
-        checks WHAT was assigned, not merely that a local assignment exists.
-        """
-        sites = _scan('''
-            def call_the_model(self):
-                cwd = some_other_root()
-                return invoke_with_cap_retry(
-                    disallowed_tools=['*'],
-                    output_schema=SCHEMA,
-                    cwd=cwd,
-                )
-        ''')
-        assert len(sites) == 1, f'got {sites!r}'
         assert is_violation(sites[0]), f'got {sites[0]!r}'
 
-    def test_an_attribute_cwd_is_a_violation(self) -> None:
-        """Function-local ONLY, pinned together with the attribute exclusion:
-        the enclosing function DOES bind a neutral cwd, to a different name and
-        never to this argument. A guard that accepted ``cwd=self._cwd`` would
-        accept any instance attribute whatsoever — the exact silent-exposure
-        shape this gate exists to catch.
-        """
-        sites = _scan('''
-            class Runner:
-                async def go(self):
-                    neutral = neutral_cli_cwd()
-                    return await invoke_with_cap_retry(
-                        disallowed_tools=['*'],
-                        output_schema=SCHEMA,
-                        cwd=self._cwd,
-                    )
-        ''')
-        assert len(sites) == 1, f'got {sites!r}'
-        assert is_violation(sites[0]), f'got {sites[0]!r}'
-
-    def test_a_neutral_binding_of_a_different_name_is_a_violation(self) -> None:
-        """The bound name must actually be the one passed."""
-        sites = _scan('''
-            def call_the_model(cwd_param):
-                other = neutral_cli_cwd()
-                return invoke_with_cap_retry(
-                    disallowed_tools=['*'],
-                    output_schema=SCHEMA,
-                    cwd=cwd_param,
-                )
-        ''')
-        assert len(sites) == 1, f'got {sites!r}'
-        assert is_violation(sites[0]), f'got {sites[0]!r}'
-
-    def test_a_binding_in_an_enclosing_function_is_a_violation(self) -> None:
-        """No transitive chains and no enclosing-scope reads — deliberate, not
-        accidental. Resolution searches the NEAREST enclosing function's own
-        body; a closure over an outer binding does not carry the exemption in.
-        """
-        sites = _scan('''
-            def outer():
-                cwd = neutral_cli_cwd()
-
-                def inner():
-                    return invoke_with_cap_retry(
-                        disallowed_tools=['*'],
-                        output_schema=SCHEMA,
-                        cwd=cwd,
-                    )
-                return inner
-        ''')
-        assert len(sites) == 1, f'got {sites!r}'
-        assert is_violation(sites[0]), f'got {sites[0]!r}'
-
-    def test_both_protections_report_the_explicit_one(self) -> None:
-        """A doubly-protected call is compliant, and the precedence is PINNED
-        rather than incidental: the exemption named is the one the call STATES,
-        not the one it inherits from where it happens to run.
-        """
+    def test_strict_scoping_at_a_neutral_cwd_is_compliant(self) -> None:
         sites = _scan('''
             def call_the_model():
                 cwd = neutral_cli_cwd()
@@ -631,25 +511,126 @@ class TestRegistryFilterSites:
         assert is_violation(sites[0]), f'got {sites[0]!r}'
 
 
+class TestInjectedInvokerSites:
+    """A call through a name bound to a target callee is the same call.
+
+    A constructor-injected invoker defaults to ``invoke_with_cap_retry`` and is
+    then called as ``self._invoke(...)``. Matching callee spellings alone would
+    lose that site, and the gate would report a load-bearing caller GONE while
+    its MCP scoping went unguarded.
+    """
+
+    def test_a_constructor_injected_invoker_called_through_self_is_a_site(self) -> None:
+        sites = _scan('''
+            class Curator:
+                def __init__(self, invoke=invoke_with_cap_retry):
+                    self._invoke = invoke
+                async def _invoke_curator(self, prompt):
+                    return await self._invoke(
+                        prompt=prompt,
+                        disallowed_tools=['*'],
+                        output_schema=SCHEMA,
+                        cwd=self._root,
+                    )
+        ''')
+        assert len(sites) == 1, f'got {sites!r}'
+        (site,) = sites
+        assert site.qualname == 'Curator._invoke_curator', f'got {site!r}'
+        assert site.callee == '_invoke', f'got {site!r}'
+        assert site.exemption == NOT_EXEMPT, f'got {site!r}'
+        assert is_violation(site), f'got {site!r}'
+
+    def test_a_strictly_scoped_injected_invoker_call_is_compliant(self) -> None:
+        sites = _scan('''
+            class Curator:
+                def __init__(self, invoke=invoke_with_cap_retry):
+                    self._invoke = invoke
+                async def _invoke_curator(self, prompt):
+                    return await self._invoke(
+                        prompt=prompt,
+                        disallowed_tools=['*'],
+                        output_schema=SCHEMA,
+                        mcp_config=no_mcp_servers_config(),
+                        strict_mcp_config=True,
+                        cwd=self._root,
+                    )
+        ''')
+        assert len(sites) == 1, f'got {sites!r}'
+        assert sites[0].exemption == EXEMPT_STRICT_MCP, f'got {sites[0]!r}'
+        assert not is_violation(sites[0]), f'got {sites[0]!r}'
+
+    def test_a_call_through_the_defaulted_parameter_is_a_site(self) -> None:
+        """The attribute-spelled default binds the parameter just the same."""
+        sites = _scan('''
+            def ask(root, invoke=cli_invoke.invoke_claude_agent):
+                return invoke(available_tools=['Read'], cwd=root)
+        ''')
+        assert len(sites) == 1, f'got {sites!r}'
+        assert sites[0].qualname == 'ask', f'got {sites[0]!r}'
+        assert sites[0].callee == 'invoke', f'got {sites[0]!r}'
+        assert is_violation(sites[0]), f'got {sites[0]!r}'
+
+    def test_a_class_field_default_is_a_site(self) -> None:
+        """The dataclass-field form of the same binding."""
+        sites = _scan('''
+            @dataclass(frozen=True)
+            class Deps:
+                cap_retry: CapRetry = invoke_with_cap_retry
+
+            async def run(deps, root):
+                return await deps.cap_retry(
+                    disallowed_tools=['*'],
+                    output_schema=S,
+                    cwd=root,
+                )
+        ''')
+        assert len(sites) == 1, f'got {sites!r}'
+        assert sites[0].qualname == 'run', f'got {sites[0]!r}'
+        assert sites[0].callee == 'cap_retry', f'got {sites[0]!r}'
+        assert is_violation(sites[0]), f'got {sites[0]!r}'
+
+    @pytest.mark.parametrize('init_signature', [
+        'def __init__(self, invoke):',
+        'def __init__(self, invoke=some_other_helper):',
+    ])
+    def test_a_name_never_bound_to_a_target_is_not_a_site(self, init_signature: str) -> None:
+        """The kwargs alone still mean nothing: an attribute that is never bound
+        to a target callee is an unrelated callee.
+        """
+        assert _scan(f'''
+            class Curator:
+                {init_signature}
+                    self._invoke = invoke
+                async def _invoke_curator(self, r):
+                    return await self._invoke(
+                        disallowed_tools=['*'],
+                        output_schema=S,
+                        cwd=r,
+                    )
+        ''') == []
+
+
 # --------------------------------------------------------------------------- #
 # The whole-tree gate
 # --------------------------------------------------------------------------- #
 
-#: Every matching call site in the first-party tree, measured on 2026-10-07
-#: (task 4344): 5 matched, 0 violations; AgentLoop._call_claude_cli now
-#: matches through available_tools. Four are protected by
-#: ``no_mcp_servers_config()`` + ``strict_mcp_config=True``; only
-#: ``PathScopeAdjudicator.adjudicate`` relies on running at
-#: ``neutral_cli_cwd()``. Kept as an exact SET, not a count: a new
+#: Every matching call site in the first-party tree, re-measured on 2026-10-25
+#: (task 6706): 5 matched, 0 violations, all five protected by
+#: ``no_mcp_servers_config()`` + ``strict_mcp_config=True``;
+#: AgentLoop._call_claude_cli matches through available_tools (task 4344), and
+#: ClaudeShardAsker.__call__ and TaskCurator._invoke_curator match through
+#: their injected invokers, whose constructor default is invoke_with_cap_retry.
+#: The curator's single and batch calls share that one site.
+#: Kept as an exact SET, not a count: a new
 #: matching caller anywhere in the tree must be looked at even when it is
 #: correctly scoped, and none of these five may silently vanish.
 _KNOWN_SITES: frozenset[tuple[str, str]] = frozenset({
+    ('fused-memory/src/fused_memory/maintenance/link_adjudicator.py',
+     'ClaudeShardAsker.__call__'),
     ('fused-memory/src/fused_memory/middleware/path_scope_adjudicator.py',
      'PathScopeAdjudicator.adjudicate'),
     ('fused-memory/src/fused_memory/middleware/task_curator.py',
-     'TaskCurator._call_llm'),
-    ('fused-memory/src/fused_memory/middleware/task_curator.py',
-     'TaskCurator._call_llm_batch'),
+     'TaskCurator._invoke_curator'),
     ('fused-memory/src/fused_memory/reconciliation/agent_loop.py',
      'AgentLoop._call_claude_cli'),
     ('fused-memory/src/fused_memory/reconciliation/judge.py',
@@ -719,12 +700,13 @@ class TestWholeTreeGate:
             f"the '*' with --tools '' whenever an output_schema is present, "
             f'because the schema rides on a synthetic StructuredOutput tool a '
             f"wildcard would block. --tools '' removes built-in and deferred tools "
-            f'but does NOT filter MCP, so MCP tools stay REACHABLE — and the CLI '
-            f'ambient-merges the .mcp.json at cwd. Under bypassPermissions, which '
+            f'but does NOT filter MCP, so MCP tools stay REACHABLE — the CLI '
+            f'ambient-merges the .mcp.json at cwd, and account-scoped claude.ai '
+            f'connectors connect wherever cwd is. Under bypassPermissions, which '
             f'every one of these callers uses, that is unreviewed MCP WRITE access; '
             f'halt_scheduler and delete_memory are in the blast radius.\n'
             f'\n'
-            f'TO FIX, either close MCP explicitly at the call:\n'
+            f'TO FIX, close MCP explicitly at the call:\n'
             f'    mcp_config=no_mcp_servers_config(),\n'
             f'    strict_mcp_config=True,\n'
             f'  — both spelled literally AT the call; the gate does not look '
@@ -733,8 +715,9 @@ class TestWholeTreeGate:
             f'build_claude_argv\'s `if mcp_config:` block, so a bare {{}} emits '
             f'NEITHER flag and silently reinstates the hole while looking '
             f'correct. See cli_invoke.py::no_mcp_servers_config.\n'
-            f'OR run somewhere with no ambient .mcp.json to merge:\n'
-            f'    cwd=neutral_cli_cwd(),   # shared/src/shared/neutral_cwd.py\n'
+            f'A neutral cwd (neutral_cli_cwd()) is NOT a fix: it removes only the '
+            f'project .mcp.json, and account-scoped connectors still connect '
+            f'there.\n'
             f'\n'
             f'shared/tests is the FIRST segment of the repo test_command, so this '
             f'red blocks verify for EVERY subsequent task until it is resolved. '

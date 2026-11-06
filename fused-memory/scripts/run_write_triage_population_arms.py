@@ -309,10 +309,7 @@ async def judge_for_arm(
         raise ValueError(f'the arms run on {_ARM_PROVIDER!r}; the config resolves {provider!r}')
     if write['band'] != OUTCOME_JUDGE:
         raise ValueError(f'write {write["memory_id"]} is in band {write["band"]!r}, not the judge')
-    selected = select_judge_candidates(
-        [_as_memory_result(c) for c in write['candidates']], arm.width,
-        canonical_id=write['band_winner_id'],
-    )
+    selected = _judge_slate(write, arm.width)
     field_chars = resolve_judge_field_chars(service)
     timeout_seconds = resolve_judge_timeout(service)
     prompt = build_judge_prompt(write['content'], selected, field_chars=field_chars)
@@ -336,7 +333,7 @@ async def judge_for_arm(
         return identity | _fail_open(
             arm.model, exc, raw_text=reply.text, usage=usage, seconds=seconds,
         )
-    canonical_of = {c['memory_id']: c['canonical_id'] for c in write['candidates']}
+    canonical_of = _canonical_of(write)
     return identity | _answer(
         outcome=verdict.outcome,
         verdict_candidate_id=verdict.candidate_id,
@@ -345,6 +342,29 @@ async def judge_for_arm(
         ),
         raw_text=reply.text, usage=usage, model=arm.model, seconds=seconds, failure=None,
     )
+
+
+def _judge_slate(write: Mapping[str, Any], width: int) -> list[MemoryResult]:
+    """The candidates the shipped selector shows the judge at *width*, in its order."""
+    return select_judge_candidates(
+        [_as_memory_result(c) for c in write['candidates']], width,
+        canonical_id=write['band_winner_id'],
+    )
+
+
+def _canonical_of(write: Mapping[str, Any]) -> dict[str, str]:
+    """Each slate candidate's id, and the canonical id an attach naming it lands on."""
+    return {c['memory_id']: c['canonical_id'] for c in write['candidates']}
+
+
+def top_targets(write: Mapping[str, Any], width: int) -> list[str]:
+    """The canonical id of each candidate the judge is shown at *width*: once each, in rank order.
+
+    These are the records a judge verdict on *write* can attach it to, as
+    :func:`judge_for_arm` records them.
+    """
+    canonical_of = _canonical_of(write)
+    return list(dict.fromkeys(canonical_of[result.id] for result in _judge_slate(write, width)))
 
 
 # --- the runner ----------------------------------------------------------------
@@ -888,8 +908,8 @@ def _wording_population(
 ) -> dict[str, Any]:
     """Each non-shipped arm against its shipped twin on the same writes, keyed by its name.
 
-    Label-free: contested shares and the paired discordance, with ι's exact
-    McNemar p on the discordant counts.
+    Label-free: contested shares and the paired discordance, with
+    ``score_write_triage_pairs.py::mcnemar_exact`` on the discordant counts.
     """
     readout: dict[str, Any] = {}
     for arm in ARMS:
@@ -908,9 +928,7 @@ def _wording_population(
             arm.wording: _wording_side(other),
             'contested_only_shipped': only_shipped,
             f'contested_only_{arm.wording.replace("-", "_")}': only_other,
-            # A private reach into ι, the one home of the flip-gate statistics, so its test
-            # is reused rather than re-spelled. Promoting it is a follow-up of task 6151.
-            'mcnemar_p': _scorer._mcnemar_exact(only_shipped, only_other),
+            'mcnemar_p': _scorer.mcnemar_exact(only_shipped, only_other),
         }
     return readout
 
@@ -1038,11 +1056,14 @@ def _capped(text: str | None) -> str | None:
     return f'{text[:_PAIR_TEXT_CHARS]}…[truncated, {len(text)} chars total]'
 
 
-def _target_text(snapshot: Mapping[str, Any], write: Mapping[str, Any], target_id: str) -> str | None:
+def target_text(
+    snapshot_targets: Mapping[str, Any], write: Mapping[str, Any], target_id: str,
+) -> str | None:
+    """*target_id*'s text: its slate candidate's content, else the snapshot targets map's, else None."""
     on_slate = [c for c in write['candidates'] if c['memory_id'] == target_id]
     if on_slate:
         return on_slate[0]['content']
-    return (snapshot['targets'].get(target_id) or {}).get('content')
+    return (snapshot_targets.get(target_id) or {}).get('content')
 
 
 def build_pairs_to_rate(
@@ -1096,7 +1117,7 @@ def _pair_rows(
         'entry_id': entry_id,
         'target_id': target_id,
         'entry_text': _capped(writes[entry_id]['content']),
-        'target_text': _capped(_target_text(snapshot, writes[entry_id], target_id)),
+        'target_text': _capped(target_text(snapshot['targets'], writes[entry_id], target_id)),
     } for entry_id, target_id in pairs]
     return rows, {
         'n_pairs': len(rows),

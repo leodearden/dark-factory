@@ -102,6 +102,7 @@ from fused_memory.backends.mem0_client import (
     DEFAULT_SCROLL_MAX_PAGES,
     ScrollPageBudgetExhausted,
 )
+from fused_memory.eval.topic_registry import TopicRegistry, load_topic_registry
 from fused_memory.models.enums import GRAPHITI_PRIMARY, MEM0_PRIMARY, MemoryCategory
 
 # THE shared slug predicate and fold, imported and called -- never
@@ -565,11 +566,11 @@ def build_report(
         # are DISCLOSED rather than rendered as an all-zero (or perfect) score.
         registry_error = registry_error or 'no topic registry supplied'
     else:
-        # SCORING is guarded as well as LOADING. `topic_registry_loader` is
-        # lazily memoized and `load_registry_or_error` catches everything, so
-        # an unloadable probe already degrades to `registry_error` -- but the
-        # scoring below reaches `entry.project_id` / `entry.topic` by attribute
-        # on objects owned by ANOTHER script's dataclass. A `RegistryEntry`
+        # SCORING is guarded as well as LOADING. `load_registry_or_error`
+        # catches everything, so a registry that fails to load already
+        # degrades to `registry_error` -- but the scoring below reaches
+        # `entry.project_id` / `entry.topic` by attribute on objects owned by
+        # fused_memory/eval/topic_registry.py::RegistryEntry. A `RegistryEntry`
         # field rename raised straight out of build_report and took the whole
         # nightly census with it (no report, no markdown, no trend row) from a
         # block the design says is OPTIONAL. Same disclosure, same shape as
@@ -710,74 +711,8 @@ DEFAULT_REGISTRY_PATH = str(
     / 'memory_eval_topic_registry.json'
 )
 
-_PROBE_SCRIPT_PATH = _REPO_ROOT / 'fused-memory' / 'scripts' / 'memory_eval_retrieval_probe.py'
 
-
-def _load_probe_module() -> Any:
-    """Load ``memory_eval_retrieval_probe`` by path.
-
-    ``scripts/`` is not a package, so a plain import cannot reach it. This is
-    the same importlib idiom
-    ``fused-memory/scripts/retro_stamp_topics.py::_load_probe_module`` already
-    established for exactly this cross-script reuse, including the
-    ``sys.modules``-first lookup: that slot may already hold a module another
-    by-path loader executed, and re-executing would hand back a DIFFERENT
-    class object for ``RegistryEntry``, silently breaking identity across the
-    seam.
-    """
-    import importlib.util  # noqa: PLC0415
-
-    mod_name = 'memory_eval_retrieval_probe'
-    cached = sys.modules.get(mod_name)
-    if cached is not None:
-        return cached
-    spec = importlib.util.spec_from_file_location(mod_name, _PROBE_SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {_PROBE_SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    try:
-        spec.loader.exec_module(module)
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
-
-
-#: Memoized holder for the probe's loader. ``None`` means "not loaded yet",
-#: never "unavailable" -- an unavailable probe raises out of the accessor and
-#: is disclosed by :func:`load_registry_or_error`.
-_TOPIC_REGISTRY_LOADER: Any = None
-
-
-def topic_registry_loader() -> Any:
-    """Return the probe's ``load_topic_registry``, loading it on FIRST USE.
-
-    REUSED, never re-parsed: the registry's schema-version check, its
-    zero-entry rejection and its ``RegistryError`` type all stay single-homed
-    in the probe, exactly as
-    ``fused-memory/scripts/retro_stamp_topics.py::load_topic_registry``
-    establishes -- and the reuse stays pinnable by ``is``, through this
-    accessor.
-
-    LAZY and memoized, not an import-time module alias. As an alias the load
-    ran at ``import census_memory_metadata`` time, which made the most likely
-    registry failure -- the probe script renamed, moved, or carrying an import
-    error -- the one mode that could NOT be disclosed: it killed the whole
-    nightly census (no coverage numbers, no report, no trend row) and this
-    module's entire test suite with it, bypassing the ``registry_coverage:
-    null`` + ``registry_error`` path built for exactly that failure. The
-    registry gauge is ONE optional block of the report; it must not be able to
-    take the measurement down with it (INV-11 no-silent-fail-soft cuts both
-    ways -- disclose the shortfall, do not escalate it into a total loss).
-    """
-    global _TOPIC_REGISTRY_LOADER  # noqa: PLW0603 - one-shot memo
-    if _TOPIC_REGISTRY_LOADER is None:
-        _TOPIC_REGISTRY_LOADER = _load_probe_module().load_topic_registry
-    return _TOPIC_REGISTRY_LOADER
-
-
-def load_registry_or_error(path: str) -> tuple[Any | None, str | None]:
+def load_registry_or_error(path: str) -> tuple[TopicRegistry | None, str | None]:
     """Load the topic registry, returning ``(registry, error)``.
 
     Exactly one of the pair is ever non-``None``. Degrades LOUDLY: the caller
@@ -787,10 +722,7 @@ def load_registry_or_error(path: str) -> tuple[Any | None, str | None]:
     value of this gauge is that its zero is meaningful (INV-2).
     """
     try:
-        # The loader itself is resolved INSIDE the try: an unloadable probe
-        # module is a registry failure like any other, and is disclosed the
-        # same way rather than aborting the census.
-        registry = topic_registry_loader()(path)
+        registry = load_topic_registry(path)
     except Exception as exc:  # noqa: BLE001 - every load failure is disclosed
         return None, f'{type(exc).__name__}: {exc}'
     return registry, None
@@ -803,7 +735,7 @@ def _build_registry_coverage(
     """Score the committed registry against measured corpus state.
 
     NOT a duplicate of E1's ``METRIC_TOPIC_CANONICAL_PRESENT`` (INV-5
-    checked). That tripwire is computed from ``_tripwire_items(observations,
+    checked). That tripwire is computed from ``tripwire_items(observations,
     TRIPWIRE_K)`` -- from SEARCH observations -- so it conflates "the
     canonical does not exist" with "it exists but ranks below K". This
     task's whole thesis is that 32/32 fails because the canonicals are

@@ -8,6 +8,7 @@ test_deterministic_task_guard.py's style.
 from __future__ import annotations
 
 import json
+import logging
 
 import pytest
 
@@ -138,3 +139,29 @@ class TestModelOverridesErrorPresenceGate:
     def test_explicit_null_model_overrides_accepts(self):
         """metadata.model_overrides=None (explicit null) -> accept."""
         assert model_overrides_error({'model_overrides': None}) is None
+
+
+# ---------------------------------------------------------------------------
+# Unreadable metadata is discarded loudly, under the shared wire rule
+# ---------------------------------------------------------------------------
+
+_SCHEMA_WARNING = 'task_metadata.schema_warning'
+_SOURCE = 'source=model_overrides_guard'
+
+
+def _discard_lines(caplog) -> list[str]:
+    messages = (r.getMessage() for r in caplog.records)
+    return [m for m in messages if _SCHEMA_WARNING in m and _SOURCE in m]
+
+
+class TestUnreadableMetadataIsDiscardedLoudly:
+    def test_malformed_string_accepts_and_logs_one_census_line(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            assert model_overrides_error('{not json') is None
+        assert len(_discard_lines(caplog)) == 1
+
+    @pytest.mark.parametrize('metadata', [None, ''])
+    def test_absent_metadata_logs_no_census_line(self, metadata, caplog):
+        with caplog.at_level(logging.WARNING):
+            assert model_overrides_error(metadata) is None
+        assert _discard_lines(caplog) == []

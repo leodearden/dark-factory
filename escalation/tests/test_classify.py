@@ -8,6 +8,7 @@ from __future__ import annotations
 import pytest
 from _info_l0_records import done_step_tripwire, info_l0_note, info_scope_divergence
 
+from escalation.authority import COORDINATOR_IDENTITY
 from escalation.classify import (
     DONE_STEP_COMMIT_ORPHAN_CLASS,
     INFO_L0_MECHANICAL_ROLES,
@@ -48,6 +49,10 @@ class TestClassifyResolverTierHuman:
     def test_interactive_is_human(self):
         """resolved_by='interactive' classifies as 'human'."""
         assert classify_resolver_tier('interactive') == 'human'
+
+    def test_coordinator_identity_is_human(self):
+        """A sitting's closes count in the human tier (PRD decision-stream §3 decision 3)."""
+        assert classify_resolver_tier(COORDINATOR_IDENTITY) == 'human'
 
     def test_escalation_watcher_is_human(self):
         """resolved_by='escalation-watcher' (exact) classifies as 'human'."""

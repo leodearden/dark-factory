@@ -3,10 +3,10 @@
 Tickets survive fused-memory restarts via SQLite (sibling DB to reconciliation.db).
 
 Two statuses are non-terminal. ``pending`` is queued for, or in, curation.
-``awaiting_curation`` is parked: the curator's account pool could not judge
-the submission, so it waits for its ``next_attempt_at`` and the ticket janitor
-requeues it to ``pending``. ``attempts`` counts its deferrals and
-``defer_reason`` holds the :class:`DeferReason` of the latest one; both
+``awaiting_curation`` is parked: the curator could not judge the submission,
+so it waits for its ``next_attempt_at`` and the ticket janitor requeues it to
+``pending``. ``attempts`` counts its deferrals and ``defer_reason`` holds the
+:class:`DeferReason` of the latest one, which says why it could not; both
 survive the requeue. A parked ticket has no terminal bound: it waits for a
 verdict.
 
@@ -25,6 +25,7 @@ import time
 from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
@@ -35,13 +36,35 @@ from shared.async_sqlite_base import (
     apply_full_durability_pragmas,
     connect_daemon,
 )
+from shared.sqlite_column_migration import add_column_if_missing
 
 from fused_memory.middleware.curation_deferral import DeferReason, deferral_justification
 
 if TYPE_CHECKING:
     from fused_memory.middleware.curation_deferral import CurationRetryPolicy
 
-AWAITING_CURATION: Final = 'awaiting_curation'
+class TicketStatus(StrEnum):
+    PENDING = 'pending'
+    AWAITING_CURATION = 'awaiting_curation'
+    CREATED = 'created'
+    COMBINED = 'combined'
+    REFUSED = 'refused'
+    FAILED = 'failed'
+    CANCELLED = 'cancelled'
+
+
+OPEN_TICKET_STATUSES: Final = frozenset({TicketStatus.PENDING, TicketStatus.AWAITING_CURATION})
+TERMINAL_TICKET_STATUSES: Final = frozenset(TicketStatus) - OPEN_TICKET_STATUSES
+
+
+class ResolveReason(StrEnum):
+    """A reason resolve_ticket answers with that no ticket row carries."""
+
+    WAIT_TIMEOUT = 'wait_timeout'
+    WAIT_INTERRUPTED = 'wait_interrupted'
+    STORE_UNAVAILABLE = 'store_unavailable'
+    UNKNOWN_TICKET = 'unknown_ticket'
+    STORE_NOT_CONFIGURED = 'ticket_store not configured'
 
 
 @dataclass(frozen=True)
@@ -104,12 +127,12 @@ logger = logging.getLogger(__name__)
 # Table creation runs first; index creation runs after the in-place
 # ``escalated_at`` migration so legacy DBs (without the column) don't trip
 # the ``ix_tickets_status_escalated`` reference during schema bootstrap.
-TABLE_SQL = """
+TABLE_SQL = f"""
 CREATE TABLE IF NOT EXISTS tickets (
     ticket_id   TEXT PRIMARY KEY,
     project_id  TEXT NOT NULL,
     candidate_json TEXT NOT NULL,
-    status      TEXT NOT NULL DEFAULT 'pending',
+    status      TEXT NOT NULL DEFAULT '{TicketStatus.PENDING.value}',
     task_id     TEXT,
     reason      TEXT,
     result_json TEXT,
@@ -145,7 +168,7 @@ CREATE INDEX IF NOT EXISTS ix_tickets_status_next_attempt
 # its cost bounded by the window rather than by the unpruned table.
 DEDUP_HEALTH_SQL = """
 SELECT status, reason, created_at, resolved_at FROM tickets
-WHERE project_id = ? AND status IN ('created', 'combined')
+WHERE project_id = ? AND status IN (?, ?)
   AND resolved_at IS NOT NULL AND resolved_at >= ?
 """
 
@@ -155,9 +178,9 @@ SCHEMA_SQL = TABLE_SQL + INDEX_SQL
 
 
 _CURATION_RETRY_COLUMNS: Final = {
-    'attempts': 'attempts INTEGER NOT NULL DEFAULT 0',
-    'next_attempt_at': 'next_attempt_at TEXT',
-    'defer_reason': 'defer_reason TEXT',
+    'attempts': 'INTEGER NOT NULL DEFAULT 0',
+    'next_attempt_at': 'TEXT',
+    'defer_reason': 'TEXT',
 }
 
 
@@ -180,25 +203,28 @@ async def _recover_orphaned_pending(
     """
     scope_sql, scope_params = ('', ()) if project_id is None else (' AND project_id = ?', (project_id,))
     rows = await db.execute_fetchall(
-        f"SELECT ticket_id, attempts FROM tickets WHERE status = 'pending'{scope_sql} "
+        f'SELECT ticket_id, attempts FROM tickets WHERE status = ?{scope_sql} '
         'ORDER BY created_at, ticket_id',
-        scope_params,
+        (TicketStatus.PENDING, *scope_params),
     )
     reparked_ids = tuple(row['ticket_id'] for row in rows if row['attempts'] > 0)
     failed_ids = tuple(row['ticket_id'] for row in rows if row['attempts'] == 0)
     await db.execute(
         f"""
         UPDATE tickets SET status = ?, next_attempt_at = NULL
-        WHERE status = 'pending' AND attempts > 0{scope_sql}
+        WHERE status = ? AND attempts > 0{scope_sql}
         """,
-        (AWAITING_CURATION, *scope_params),
+        (TicketStatus.AWAITING_CURATION, TicketStatus.PENDING, *scope_params),
     )
     await db.execute(
         f"""
-        UPDATE tickets SET status = 'failed', reason = ?, resolved_at = ?
-        WHERE status = 'pending' AND attempts = 0{scope_sql}
+        UPDATE tickets SET status = ?, reason = ?, resolved_at = ?
+        WHERE status = ? AND attempts = 0{scope_sql}
         """,
-        (reason, datetime.now(UTC).isoformat(), *scope_params),
+        (
+            TicketStatus.FAILED, reason, datetime.now(UTC).isoformat(),
+            TicketStatus.PENDING, *scope_params,
+        ),
     )
     return OrphanedPendingRecovery(failed_ids=failed_ids, reparked_ids=reparked_ids)
 
@@ -252,27 +278,22 @@ class TicketStore:
         """Add the ``escalated_at`` column to existing DBs that pre-date it.
 
         ``CREATE TABLE IF NOT EXISTS`` is a no-op on existing tables, so the
-        column needs an explicit ALTER for legacy DBs. Idempotent: probes
-        ``PRAGMA table_info`` first.
+        column needs an explicit ALTER for legacy DBs.
         """
-        access = self._require_access()
-        cols = {row[1] for row in await access.read_all('PRAGMA table_info(tickets)')}
-        if 'escalated_at' not in cols:
-            async with access.write() as db:
-                await db.execute('ALTER TABLE tickets ADD COLUMN escalated_at TEXT')
+        async with self._require_access().write() as db:
+            added = await add_column_if_missing(db, 'tickets', 'escalated_at', 'TEXT')
+        if added:
             logger.info('TicketStore: migrated tickets table — added escalated_at column')
 
     async def _migrate_add_curation_retry_columns(self) -> None:
-        access = self._require_access()
-        cols = {row[1] for row in await access.read_all('PRAGMA table_info(tickets)')}
-        missing = {
-            name: ddl for name, ddl in _CURATION_RETRY_COLUMNS.items() if name not in cols
-        }
-        if missing:
-            async with access.write() as db:
-                for ddl in missing.values():
-                    await db.execute(f'ALTER TABLE tickets ADD COLUMN {ddl}')
-            logger.info('TicketStore: migrated tickets table — added %s', ', '.join(missing))
+        async with self._require_access().write() as db:
+            added = [
+                column
+                for column, column_ddl in _CURATION_RETRY_COLUMNS.items()
+                if await add_column_if_missing(db, 'tickets', column, column_ddl)
+            ]
+        if added:
+            logger.info('TicketStore: migrated tickets table — added %s', ', '.join(added))
 
     def _require_access(self) -> AtomicConnection:
         if self._access is None:
@@ -300,9 +321,12 @@ class TicketStore:
                 """
                 INSERT INTO tickets
                     (ticket_id, project_id, candidate_json, status, created_at, expires_at)
-                VALUES (?, ?, ?, 'pending', ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (ticket_id, project_id, candidate_json, now.isoformat(), expires_at.isoformat()),
+                (
+                    ticket_id, project_id, candidate_json, TicketStatus.PENDING,
+                    now.isoformat(), expires_at.isoformat(),
+                ),
             )
         return ticket_id
 
@@ -314,7 +338,7 @@ class TicketStore:
         task_id: str | None = None,
         reason: str | None = None,
         result_json: str | None = None,
-        from_statuses: tuple[str, ...] = ('pending',),
+        from_statuses: tuple[str, ...] = (TicketStatus.PENDING,),
     ) -> bool:
         """Update the ticket to a terminal status.
 
@@ -359,8 +383,8 @@ class TicketStore:
         now = datetime.now(UTC) if now is None else now
         async with self._require_access().write() as db:
             row = next(iter(await db.execute_fetchall(
-                "SELECT attempts FROM tickets WHERE ticket_id = ? AND status = 'pending'",
-                (ticket_id,),
+                'SELECT attempts FROM tickets WHERE ticket_id = ? AND status = ?',
+                (ticket_id, TicketStatus.PENDING),
             )), None)
             if row is None:
                 return None
@@ -370,11 +394,11 @@ class TicketStore:
                 """
                 UPDATE tickets
                 SET status = ?, attempts = ?, next_attempt_at = ?, defer_reason = ?, reason = ?
-                WHERE ticket_id = ? AND status = 'pending'
+                WHERE ticket_id = ? AND status = ?
                 """,
                 (
-                    AWAITING_CURATION, attempts, _utc_iso(next_attempt_at),
-                    reason.value, deferral_justification(reason), ticket_id,
+                    TicketStatus.AWAITING_CURATION, attempts, _utc_iso(next_attempt_at),
+                    reason.value, deferral_justification(reason), ticket_id, TicketStatus.PENDING,
                 ),
             )
         return attempts
@@ -388,10 +412,10 @@ class TicketStore:
         async with self._require_access().write() as db:
             cursor = await db.execute(
                 """
-                UPDATE tickets SET status = 'pending', next_attempt_at = NULL
+                UPDATE tickets SET status = ?, next_attempt_at = NULL
                 WHERE ticket_id = ? AND status = ?
                 """,
-                (ticket_id, AWAITING_CURATION),
+                (TicketStatus.PENDING, ticket_id, TicketStatus.AWAITING_CURATION),
             )
         return cursor.rowcount == 1
 
@@ -407,7 +431,7 @@ class TicketStore:
             ORDER BY created_at, ticket_id
             LIMIT ?
             """,
-            (AWAITING_CURATION, _utc_iso(now), limit),
+            (TicketStatus.AWAITING_CURATION, _utc_iso(now), limit),
         )
         return [dict(r) for r in rows]
 
@@ -420,7 +444,7 @@ class TicketStore:
             FROM tickets WHERE status = ?
             GROUP BY project_id, defer_reason ORDER BY project_id, defer_reason
             """,
-            (AWAITING_CURATION,),
+            (TicketStatus.AWAITING_CURATION,),
         )
         return [
             CurationBacklog(
@@ -444,7 +468,7 @@ class TicketStore:
             ORDER BY created_at, ticket_id
             LIMIT ?
             """,
-            (project_id, AWAITING_CURATION, defer_reason.value, limit),
+            (project_id, TicketStatus.AWAITING_CURATION, defer_reason.value, limit),
         )
         return [dict(r) for r in rows]
 
@@ -458,7 +482,7 @@ class TicketStore:
         async with self._require_access().write() as db:
             await db.execute(
                 'UPDATE tickets SET next_attempt_at = NULL WHERE status = ?',
-                (AWAITING_CURATION,),
+                (TicketStatus.AWAITING_CURATION,),
             )
             recovery = await _recover_orphaned_pending(db, reason='server_restart')
         logger.info(
@@ -485,7 +509,7 @@ class TicketStore:
         workers' rows get terminalised as ``failed/worker_dead``.
         """
         rows = await self._require_access().read_all(
-            "SELECT DISTINCT project_id FROM tickets WHERE status = 'pending'",
+            'SELECT DISTINCT project_id FROM tickets WHERE status = ?', (TicketStatus.PENDING,),
         )
         return [row['project_id'] for row in rows]
 
@@ -511,9 +535,7 @@ class TicketStore:
     ) -> list[dict]:
         """Return tickets for a project, newest-first, optionally filtered.
 
-        ``status`` matches against the status column literal ('pending',
-        'awaiting_curation', 'created', 'failed', 'combined', 'refused',
-        'cancelled'). A ``refused`` row is
+        ``status`` matches a :class:`TicketStatus` value. A ``refused`` row is
         terminal and has a NULL ``task_id`` — a deterministic guard rejected
         the candidate and no task was created. ``since`` filters by
         ``created_at``.
@@ -544,7 +566,8 @@ class TicketStore:
         ``'(unrecorded)'``.
         """
         rows = await self._require_access().read_all(
-            DEDUP_HEALTH_SQL, (project_id, since.isoformat()),
+            DEDUP_HEALTH_SQL,
+            (project_id, TicketStatus.CREATED, TicketStatus.COMBINED, since.isoformat()),
         )
         latencies = [
             (
@@ -554,11 +577,11 @@ class TicketStore:
             for row in rows
         ]
         create_reasons = Counter(
-            row['reason'] or '(unrecorded)' for row in rows if row['status'] == 'created'
+            row['reason'] or '(unrecorded)' for row in rows if row['status'] == TicketStatus.CREATED
         )
         return DedupHealth(
             resolved=len(rows),
-            combined=sum(1 for row in rows if row['status'] == 'combined'),
+            combined=sum(1 for row in rows if row['status'] == TicketStatus.COMBINED),
             median_resolve_seconds=statistics.median(latencies) if latencies else None,
             top_create_reasons=tuple(create_reasons.most_common(5)),
         )
@@ -595,14 +618,14 @@ class TicketStore:
         """
         sql = (
             "SELECT * FROM tickets "
-            "WHERE status = 'failed' "
+            "WHERE status = ? "
             "  AND escalated_at IS NULL "
             "  AND (reason IS NULL OR reason != 'idempotency_hit')"
         )
-        params: tuple = ()
+        params: tuple = (TicketStatus.FAILED,)
         if project_id is not None:
             sql += " AND project_id = ?"
-            params = (project_id,)
+            params = (*params, project_id)
         sql += " ORDER BY resolved_at LIMIT ?"
         params = (*params, limit)
         rows = await self._require_access().read_all(sql, params)

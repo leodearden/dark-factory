@@ -22,16 +22,20 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias, assert_never
 
-from shared.branch_names import canonical_queued_branch_name
+from shared.branch_names import bare_queued_branch_id, canonical_queued_branch_name
 
 from orchestrator.branch_stack import PreStackTip
+from orchestrator.critical_gate import critical_filing_gate
 from orchestrator.git_ops import MergeResult
 from orchestrator.merge_lane.disposition import MergeFailureDisposition, SkewEvidence
+from orchestrator.merge_lane.outcome_facts import ConflictEvidence, MergeBlockCategory
+from orchestrator.merge_lane.reverify_gate_decision import GateClearance
 from orchestrator.remote_gate import GateIdentityPair, RunnerUnavailableKind
 from orchestrator.verify import VerifyResult, merge_verify_command_budget_secs
 
 if TYPE_CHECKING:
     from orchestrator.config import ModuleConfig, OrchestratorConfig
+    from orchestrator.verify_runner import HostLease
 
 logger = logging.getLogger('orchestrator.merge_lane')
 
@@ -907,14 +911,14 @@ class QueuedBranch:
         computed by delegating to
         :func:`shared.branch_names.canonical_queued_branch_name` — the
         existing single source of truth for the prepend-unless-present rule
-        — rather than reimplementing it here; ``bare_id`` is then stripped
-        from it the same way the ``merge_queue_store.py`` journal
-        normalization does. This is the ONLY place branch-prefix *pairing*
+        — rather than reimplementing it here; ``bare_id`` is derived by
+        :func:`shared.branch_names.bare_queued_branch_id`, the inverse
+        direction of that same rule. This is the ONLY place branch-prefix *pairing*
         logic should live — callers should not reimplement prefix
         stripping/prepending elsewhere.
         """
         full_name = canonical_queued_branch_name(raw, branch_prefix)
-        bare_id = full_name.removeprefix(branch_prefix)
+        bare_id = bare_queued_branch_id(raw, branch_prefix)
         return cls(bare_id=bare_id, full_name=full_name)
 
 
@@ -940,7 +944,7 @@ class MergeRequest:
 
     Contrast with :attr:`enqueued_at`, which is re-stamped on every resubmission
     and held in-memory only (lost on restart).  ζ's aging comparator at
-    ``_pop_next_pickable`` reads this field; ``None`` for legacy in-flight requests
+    ``MergeIntake.pop_next_pickable`` reads this field; ``None`` for legacy in-flight requests
     created before α was deployed (ζ owns the ``enqueued_at`` fallback for those).
     """
     request_id: str = field(
@@ -1193,6 +1197,14 @@ class MergeOutcome:
     nothing emits no value at all rather than a ``0``.  See
     test_merge_queue_deep_landing.py, which asserts the encoding through a
     verbatim transcription of that predicate rather than restating it."""
+    block_category: MergeBlockCategory = MergeBlockCategory.MERGE_ERROR
+    """The category the workflow files a generic ``blocked`` outcome under,
+    stated by the producer rather than inferred from ``reason`` (task 7302)."""
+    conflict_evidence: ConflictEvidence | None = None
+    """The paths a ``conflict`` outcome, a train whose tip merge conflicted, or
+    a needs-rebase bounce conflicted on, recorded into runs.db; ``None`` when
+    no conflict was probed, the probe failed open, or git could not name the
+    paths (task 7302)."""
 
 
 @dataclass
@@ -1318,7 +1330,8 @@ class DecidedItem:
     permit: SpecPermit | None = None  # ζ: speculation-slot token owned by PermitLedger; threaded/released by η
     # task 3206 / PRD §5.3: mirrors RealMergeItem so BOTH arms of the union
     # carry the marker.  Currently UNREAD on this arm — both §5.3 consumers
-    # (_warn_if_verify_base_not_frozen_tip, _frozen_base_chain) type-narrow to
+    # (merge_lane/verify_base_detector.py::detect_verify_base_divergence and
+    # worker.py::SpeculativeMergeWorker::_frozen_base_chain) type-narrow to
     # RealMergeItem before reading it, because only a real merge has a verify
     # base to check.  It is not decorative, though: _remerge's single-exit
     # chokepoint stamps the marker with dataclasses.replace on whichever
@@ -1587,11 +1600,11 @@ _NON_TERMINAL_OUTCOMES: frozenset[OutcomeKind] = frozenset({
 ``plan_files_narrowed``: a mid-submission waypoint — enqueue / ``merge_queued``
 follows in the same flow.
 
-FROZEN CONTRACT: this exact set is mirrored by the dashboard's
-``_ACTIVE_ONLY`` allowlist (``dashboard/src/dashboard/data/merge_queue.py``),
-which has no import on this module. Changing this set REQUIRES updating that
-allowlist in the same change — see the pinning test in
-``tests/test_outcome_kind.py::TestOutcomeKindFrozenContract``.
+FROZEN CONTRACT: ``scripts/merge_lane_throughput.py::_NON_TERMINAL_OUTCOMES``
+mirrors this exact set as literal strings and does not import this module, so
+nothing fails on its side if this set changes. Changing this set REQUIRES
+updating that mirror in the same change — the pinning test is
+``orchestrator/tests/test_outcome_kind.py::TestOutcomeKindFrozenContract``.
 """
 
 
@@ -1600,8 +1613,8 @@ class ItemLifecycleState(StrEnum):
     (merge-queue-reliability PRD scope-4 iota / task 2164, L-1).
 
     Normalizes today's FOUR redundant state encodings — container
-    membership across the five queues (``_queue``/``_lane_buffers``/
-    ``_verifier_queue``/``_redispatch``/``_dispatch_item``), the free-form
+    membership across the five queues (``_queue``/the lane buffers/
+    ``_verifier_queue``/the redispatch park/``_dispatch_item``), the free-form
     ``InflightEntry.phase: str`` field (deleted by task lambda / task 2173 —
     phase is now derived via ``SpeculativeMergeWorker._entry_phase()``), the
     :class:`InflightStatus` sentinel enum above, and the four worker transient side-fields
@@ -1719,6 +1732,150 @@ class VerifyBaseFacts:
     merge_base_sha: str | None
 
 
+@dataclass(frozen=True)
+class VerifyBaseDivergence:
+    """A real-verify dispatched on a base that was not the frozen-prefix tip
+    (PRD §5.3, task 5302).
+
+    Recorded once, at dispatch, against that moment's freshly read main, so a
+    later move of main can never create or change one.  ``verify_depth`` is
+    the frozen-prefix height the verify joined; ``observed_at`` is the lane
+    clock's reading at dispatch.
+    """
+
+    request_id: str
+    task_id: str
+    base_sha: str
+    expected_tip: str
+    verify_depth: int
+    observed_at: float
+
+    def to_wire(self) -> dict[str, str | int | float]:
+        return {
+            'request_id': self.request_id,
+            'task_id': self.task_id,
+            'base_sha': self.base_sha,
+            'expected_tip': self.expected_tip,
+            'verify_depth': self.verify_depth,
+            'observed_at': self.observed_at,
+        }
+
+
+@dataclass(frozen=True)
+class LandingCandidate:
+    """A verified tree the finalize CAS loop is landing on main (task 6155).
+
+    ``item.base_sha`` is the main the CAS expects, ``sha`` the tree it moves
+    main onto, and ``verified_commit`` the merge commit whose verify passed.
+    ``merge_wt`` and ``spec_warm`` travel together, as ``_release_or_cleanup``
+    needs both.
+    """
+
+    item: RealMergeItem
+    sha: str
+    merge_wt: Path
+    spec_warm: bool
+    warm_results: Mapping[str, str]
+    verified_commit: str
+
+    def reanchored(self, item: RealMergeItem, sha: str) -> LandingCandidate:
+        """The same verified tree, landing *sha* as the rebuilt *item*."""
+        return LandingCandidate(
+            item=item, sha=sha, merge_wt=self.merge_wt, spec_warm=self.spec_warm,
+            warm_results=self.warm_results, verified_commit=self.verified_commit,
+        )
+
+
+@dataclass(frozen=True)
+class PendingGate:
+    """A head's gate re-verify of its rebased tree, running while the head
+    stays parked at the front of ``_inflight`` (task 6155).
+
+    ``candidate`` is what the CAS was landing when it rebased; ``rebased_sha``
+    onto ``rebased_onto`` is what the gate is re-verifying.
+    """
+
+    task: asyncio.Task[MergeOutcome | GateClearance]
+    candidate: LandingCandidate
+    rebased_sha: str
+    rebased_onto: str
+
+
+class LeaseActivity(StrEnum):
+    """What an in-flight entry's held host lease is doing (task 5290).
+
+    DISPATCHING and VERIFYING are the live members: work is about to run, or
+    runs, on the leased host.  NO_LIVE_DISPATCH is a remote lease with no
+    live ssh dispatch while its verify task still runs on THIS host, either
+    before the dispatch claims its request (the main-mirror push, which can
+    hang on an ssh connect) or after it returned (task 2822's cross-check, a
+    task-6155 gate re-verify); the runner does not tell the two apart.
+    FINISHED holds the lease until finalize with nothing left to run.
+    """
+
+    DISPATCHING = 'dispatching'
+    VERIFYING = 'verifying'
+    NO_LIVE_DISPATCH = 'no_live_dispatch'
+    FINISHED = 'finished'
+
+    @property
+    def is_live(self) -> bool:
+        return self in (LeaseActivity.DISPATCHING, LeaseActivity.VERIFYING)
+
+
+def remote_dispatch_live(lease: HostLease) -> bool:
+    """THE "an ssh dispatch is live on this remote lease" predicate (task 5290).
+
+    Shared by Abort trigger 3 and :func:`lease_activity`.  A runner without
+    ``dispatch_in_flight`` reads live, trigger 3's fail-safe.
+    """
+    return not lease.is_local and bool(getattr(lease.runner, 'dispatch_in_flight', True))
+
+
+def lease_activity(lease: HostLease, pending_task: asyncio.Task[object] | None) -> LeaseActivity:
+    """What *lease* is doing while finalize waits on *pending_task* (task 5290).
+
+    *pending_task* is :attr:`InflightEntry.pending_task`, so a parked gate
+    re-verify reads as running.
+    """
+    if pending_task is None:
+        return LeaseActivity.DISPATCHING
+    if pending_task.done():
+        return LeaseActivity.FINISHED
+    if lease.is_local or remote_dispatch_live(lease):
+        return LeaseActivity.VERIFYING
+    return LeaseActivity.NO_LIVE_DISPATCH
+
+
+@dataclass(frozen=True)
+class LeaseRow:
+    """One held host lease: who holds it and what it is doing (task 5290).
+
+    The typed row behind ``snapshot()``'s ``occupancy.leases`` (:meth:`to_wire`)
+    and the heartbeat's ``verifying N/M hosts`` segment.
+    """
+
+    host: str
+    task_id: str
+    request_id: str
+    activity: LeaseActivity
+    host_quarantined: bool
+
+    @property
+    def counts_verifying(self) -> bool:
+        """Whether it counts toward ``verifying_by_host``: live, on a host not quarantined."""
+        return self.activity.is_live and not self.host_quarantined
+
+    def to_wire(self) -> dict[str, str | bool]:
+        return {
+            'host': self.host,
+            'task_id': self.task_id,
+            'request_id': self.request_id,
+            'activity': self.activity.value,
+            'host_quarantined': self.host_quarantined,
+        }
+
+
 @dataclass
 class InflightEntry:
     """An in-flight verify entry held in SpeculativeMergeWorker._inflight deque.
@@ -1801,6 +1958,13 @@ class InflightEntry:
                      to classification, published by the verify itself
                      through :class:`InflightEntrySlot` (task 5447).  ``None``
                      until resolved, and always ``None`` for passthroughs.
+    gate           : the :class:`PendingGate` this head is parked on while its
+                     rebased tree re-verifies, or ``None`` (task 6155).  While
+                     it is set the entry keeps its lease and permit, and the
+                     next ``_finalize_inflight`` call resumes the CAS from it.
+    verify_base_divergence: the :class:`VerifyBaseDivergence` recorded when
+                     this entry's verify was dispatched off the frozen tip, or
+                     ``None`` (task 5302).
     """
 
     item: SpeculativeItem
@@ -1818,6 +1982,22 @@ class InflightEntry:
     verify_wt: VerifyWorktreeHandle | None = None  # δ (task 3186): the verify's POST-swap worktree
     spec_warm: bool = False                 # δ (task 3186): warmth of an ADOPTED head's published merge_wt
     verify_base: VerifyBaseFacts | None = None
+    gate: PendingGate | None = None
+    verify_base_divergence: VerifyBaseDivergence | None = None
+
+    @property
+    def pending_task(self) -> asyncio.Task[object] | None:
+        """The task finalize waits for: the parked gate's, else the verify's."""
+        return self.gate.task if self.gate is not None else self.verify_task
+
+    @property
+    def in_verify_frontier(self) -> bool:
+        """True while finalize has a verify or a gate re-verify to wait on.
+
+        A head adopted on tip authority has no verify task, yet stays in the
+        frontier while its gate runs (task 6155).  A passthrough has neither.
+        """
+        return self.pending_task is not None
 
     @property
     def vacated(self) -> bool:
@@ -1958,6 +2138,33 @@ def escalation_policy(kind: RunnerUnavailableKind, *, sticky: bool) -> Escalatio
     return 'immediate' if sticky or kind == 'wire_shape' else 'ladder'
 
 
+class RecoveryEvidence(StrEnum):
+    """What re-admitted a benched host: the only facts a verify-host alarm may be resolved on.
+
+    Occupancy is deliberately not a member (task 5290): a lease on a host is
+    a proxy, and recovery is a measurement or an explicit operator act.
+    """
+
+    SSH_HEALTH_PROBE = 'ssh_health_probe'
+    ENSURE_GATE = 'ensure_gate'
+    OPERATOR_CLEAR = 'operator_clear'
+
+    def describe(self) -> str:
+        """The clause an alarm resolution names this evidence with, led by its value."""
+        return f'evidence {self.value} ({_RECOVERY_EVIDENCE_DETAIL[self]})'
+
+
+_RECOVERY_EVIDENCE_DETAIL: Mapping[RecoveryEvidence, str] = MappingProxyType({
+    RecoveryEvidence.SSH_HEALTH_PROBE:
+        'the host answered `ssh -o BatchMode=yes -o ConnectTimeout=10 <host> true`',
+    RecoveryEvidence.ENSURE_GATE:
+        "ensure-gate passed: this dispatcher's gate was published, built or reused, "
+        'and handshaken',
+    RecoveryEvidence.OPERATOR_CLEAR:
+        'an operator called clear_verify_host_quarantine; health was not probed',
+})
+
+
 @dataclass
 class _HostUnavailability:
     """Per-host RunnerUnavailable tracker entry (task 1795; kinds, task 6565).
@@ -1983,6 +2190,20 @@ class _HostUnavailability:
     kind: RunnerUnavailableKind = 'transport'
     identity: GateIdentityPair | None = None
     sticky: bool = False
+
+    def alarm_due(self, now: float, *, after_n: int, after_secs: float) -> bool:
+        """THE definition of "this bench episode warrants an open alarm" (task 5290).
+
+        The immediate :func:`escalation_policy`, the *after_n* streak ladder,
+        or *after_secs* of downtime when that gate is enabled (> 0).  The bench
+        site and every still-down reprobe sweep ask it, so a resolve issued
+        while it still holds is re-opened by the next sweep.
+        """
+        return (
+            escalation_policy(self.kind, sticky=self.sticky) == 'immediate'
+            or critical_filing_gate(streak=self.streak, threshold=after_n)
+            or (after_secs > 0 and now - self.first_unavailable_at >= after_secs)
+        )
 
     def to_wire(self, now: float) -> dict[str, Any]:
         """This episode as the heartbeat ``hosts`` block shows it, aged against *now*.

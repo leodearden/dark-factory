@@ -92,9 +92,14 @@ carries its own. A task worktree gets an INDEPENDENT root `.venv`, not a share
 of main's, once it has been cold-verified — `verify_cold_preprovision_command`
 (`uv sync --all-packages && npm ci …`) runs *inside* the worktree, and such a
 venv can even be a different interpreter (measured: several `.worktrees/*/.venv` are CPython
-3.14.0 against main's 3.13.9). Before that it has no `.venv` at all. Meanwhile
-an agent Bash session typically inherits `VIRTUAL_ENV` and a bare `python` from
-the MAIN checkout's `.venv` even when cwd is a worktree.
+3.14.0 against main's 3.13.9). Before that it has no `.venv` at all. A
+dispatched agent's shell has no venv: every agent spawn path drops
+`VIRTUAL_ENV`, uv's project vars and the venv's `bin` from `PATH`
+(`shared/src/shared/python_env.py::without_python_env_selection`, which Claude
+spawns reach via `shared/src/shared/secret_env.py::agent_subprocess_env`).
+There a bare `python` is the system interpreter (3.12 on this host), so name
+the checkout's own `.venv/bin/python` instead in the recipes below. An interactive session keeps its launching
+shell's env, often main's `VIRTUAL_ENV` even in a worktree.
 
 So the venv path is **not derivable from your cwd**. Ask the interpreter; never
 guess a path.
@@ -117,19 +122,16 @@ but raising it is the wrong fix: the scoped query above is ~300x faster.
 
 Third-party packages resolve under `<venv>/lib/python3.X/site-packages/`.
 First-party workspace members do NOT: they are installed **editable**, so they
-resolve into a checkout's `src/` tree instead. WHICH checkout is the question
-that matters — from a worktree shell that inherited main's `VIRTUAL_ENV`,
-`import <member>` hands you MAIN's source, not the code you just edited in your
-worktree. That inheritance is real for **your own Bash session and only there**
-— the orchestrator hands an agent subprocess a plain copy of its own environment
-(`orchestrator/src/orchestrator/agents/invoke.py`), `VIRTUAL_ENV` included. It is
-NOT how verify runs: every verify command is spawned through
-`orchestrator/src/orchestrator/verify.py::_target_subprocess_env`, which strips
-`VIRTUAL_ENV` and drops the venv's `bin` from `PATH` so the target resolves its
-OWN `.venv`. So a hand-run import in your shell can disagree with verify — when
-it does, verify is the one reading your worktree. That asymmetry is the mechanism
-behind the `OPERATIONS.md` Troubleshooting row for an agent reporting an
-`AttributeError` in its own shell for code it just wrote.
+resolve into a checkout's `src/` tree instead. WHICH checkout matters — main's
+interpreter hands you MAIN's source, not your worktree's edits: from an
+interactive shell that inherited main's `VIRTUAL_ENV`, or from a dispatched
+agent naming main's `.venv/bin/python` because its worktree has no `.venv` yet.
+Verify applies the same scrub through
+`orchestrator/src/orchestrator/verify.py::_target_subprocess_env`, so a
+hand-run import can disagree with verify — when it does, verify is the one
+reading your worktree. That asymmetry is the mechanism behind the
+`OPERATIONS.md` Troubleshooting row for an agent reporting an `AttributeError`
+in its own shell for code it just wrote.
 
 <!-- import-provenance-check:begin
      Also EXECUTED verbatim by
@@ -466,6 +468,26 @@ directly, not just interactive agents.
   (incident `13674d3c68`). A stash you push can be popped out from under you
   by an unrelated process, and a `stash pop` on a clean tree can apply another
   task's WIP into yours. Park WIP as commits on a branch instead.
+
+## Killing processes on this host
+
+- **Never** kill by a bare program or script name. `pkill -f PATTERN` and
+  `kill $(pgrep -f PATTERN)` match the full command line of **every** process
+  on this shared host: every project's merge verifies, the offline lane, and
+  production systemd timers. On 2026-11-02 a read-only `/team` investigation
+  subagent stopped its own `/tmp/s2/c.sh` loops by killing whatever
+  `pgrep -f 'c\.sh'` returned. `c\.sh` matches any "gc.sh", so that one
+  command SIGTERMed the offline lane's
+  `orchestrator/tests/warm-lane/test_warm_lane_gc.sh` run and reify's
+  production `reify-warm-lane-gc.service` (task 8231).
+- Stop what you launched by the pid, process group or session id you captured
+  at launch: `setsid` plus a recorded session id, or the task id `Bash`'s
+  `run_in_background` returns. Failing that, anchor the pattern on your own
+  absolute path and preview it with `pgrep -af` before killing. A `pkill -f`
+  whose pattern appears in your own command line also kills the shell running
+  it ("Exit code 144").
+- The full rule's single home is
+  `orchestrator/src/orchestrator/agents/pkill_guidance.py::PKILL_SELF_MATCH_GUIDANCE`.
 
 ## Reference
 
