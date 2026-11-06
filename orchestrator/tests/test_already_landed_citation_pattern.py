@@ -115,6 +115,12 @@ class TestScopeArmAgreesWithDefault:
         assert _default_cites(*_MENTION_ONLY)
         assert not _attributes(*_MENTION_ONLY)
 
+    def test_a_hash_led_qualified_scope_is_the_one_scope_divergence(self) -> None:
+        """``(#N <qual>)`` is scope position here, yet no arm of the default cites it."""
+        subject = 'fix(#4369 step-1): x'
+        assert _attributes(subject, '4369')
+        assert not _default_cites(subject, '4369')
+
 
 def _git(repo: Path, *args: str) -> str:
     assert_isolated_git_repo(repo)

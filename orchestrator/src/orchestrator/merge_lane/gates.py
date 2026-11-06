@@ -487,7 +487,7 @@ ALREADY_LANDED_CITATION_PATTERN: str = (
     r'\(#?{tid}([ ,/][^)]*)?\)!?:'
     r'|^Merge task/{tid} into '
 )
-r"""STRICTER citation template for :func:`_resolve_already_landed_branch`.
+r"""Scope-position citation template for :func:`_resolve_already_landed_branch`.
 
 ``GitOps.DEFAULT_COMMIT_CITATION_PATTERN`` is deliberately permissive — it
 also accepts the UNANCHORED ``\(#?{tid}\)`` / ``\(task {tid}\)`` alternatives
@@ -510,7 +510,9 @@ holds, and only the scope's LEADING id attributes (``fix(4200/3717):`` is
 no hyphen) is stated once, in the doc comment of
 ``orchestrator/src/orchestrator/git_ops.py::DEFAULT_COMMIT_CITATION_PATTERN``;
 ``orchestrator/tests/test_already_landed_citation_pattern.py`` pins that the
-two templates agree on scope-position subjects.
+two templates agree on scope-position subjects, with one exception: a
+``#``-led qualified scope (``fix(#3717 step-1):``) attributes here, but the
+default does not cite it at all.
 
 The narrowing trades recall for precision: a delivery cited only outside
 scope position, as in ``fix(git_ops): ... (task 3717)``, is not attributed
