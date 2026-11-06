@@ -29,7 +29,7 @@ from _git_fixtures import RepoSeed, seed_repo
 from _orch_helpers import wait_responsive
 
 from orchestrator import task_verify_dispatch
-from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
+from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig, apply_reload
 from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.task_verify_dispatch import (
@@ -40,7 +40,7 @@ from orchestrator.task_verify_dispatch import (
     eligible,
 )
 from orchestrator.task_verify_spec import TaskVerifySpec, task_spec_from_json
-from orchestrator.verify import VerifyInfraError, VerifyResult
+from orchestrator.verify import VerifyInfraError, VerifyResult, run_scoped_verification
 from orchestrator.verify_admission_gate import AdmissionPlan
 from orchestrator.verify_categories import INFRA_TRANSIENT_CATEGORIES
 from orchestrator.verify_hosts import HostPool
@@ -1251,3 +1251,88 @@ class TestParity:
 
         assert h.only_sidecar()['reason'] == 'local_granted_first'
         _assert_turn_left(h)
+
+
+# ---------------------------------------------------------------------------
+# The harness's seams: the policy read from config, and the green's runner
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.usefixtures('code_default_config')
+class TestPolicyFromConfig:
+    def test_default_config_is_the_local_policy(self) -> None:
+        assert task_verify_dispatch.policy_from_config(OrchestratorConfig()) == TaskVerifyPolicy()
+
+    def test_every_key_maps_onto_the_policy(self) -> None:
+        config = OrchestratorConfig(
+            verify_task_host_policy='remote_modules',
+            verify_task_remote_modules=['orchestrator'],
+            verify_task_remote_cross_check_every_n=5,
+            verify_task_remote_red_confirms_locally=True,
+        )
+
+        assert task_verify_dispatch.policy_from_config(config) == TaskVerifyPolicy(
+            'remote_modules', ('orchestrator',), 5, True,
+        )
+
+    def test_a_reload_reaches_the_next_read_of_the_same_config(self) -> None:
+        live = OrchestratorConfig()
+        apply_reload(live, OrchestratorConfig(
+            verify_task_host_policy='remote_modules', verify_task_remote_modules=['orchestrator'],
+        ))
+
+        assert task_verify_dispatch.policy_from_config(live) == TaskVerifyPolicy(
+            'remote_modules', ('orchestrator',),
+        )
+
+
+class _RecordingPort:
+    def __init__(self, decision: DispatchDecision | None) -> None:
+        self.decision = decision
+        self.asked: list[tuple[str, int]] = []
+
+    def decision_for(self, task_id: str, attempt_id: int) -> DispatchDecision | None:
+        self.asked.append((task_id, attempt_id))
+        return self.decision
+
+
+class TestVerdictRunner:
+    def test_a_recorded_decision_names_its_runner(self) -> None:
+        port = _RecordingPort(_decision('remote', runner='laptop'))
+
+        assert task_verify_dispatch.verdict_runner(port, '7', 2) == 'laptop'
+        assert port.asked == [('7', 2)]
+
+    def test_no_decision_for_the_attempt_is_local(self) -> None:
+        port = _RecordingPort(None)
+
+        assert task_verify_dispatch.verdict_runner(port, '7', 1) == task_verify_dispatch.LOCAL_RUNNER
+
+    def test_no_port_is_local(self) -> None:
+        assert task_verify_dispatch.verdict_runner(None, '7', 1) == task_verify_dispatch.LOCAL_RUNNER
+
+    def test_the_plain_local_verify_is_local(self) -> None:
+        assert task_verify_dispatch.verdict_runner(
+            run_scoped_verification, '7', 1,
+        ) == task_verify_dispatch.LOCAL_RUNNER
+
+    def test_the_local_runner_is_the_pool_s_local_name(self) -> None:
+        assert task_verify_dispatch.LOCAL_RUNNER == 'local'
+
+
+@pytest.mark.asyncio
+class TestStaleDecisionAfterRollback:
+    async def test_a_local_call_drops_the_decision_an_earlier_route_recorded(
+        self, tmp_path: Path,
+    ) -> None:
+        h = _harness(tmp_path, TaskVerifyPolicy(host_policy='remote_all'), remotes=())
+        await h.call()
+        assert h.dispatcher.decision_for('7', 1).reason == 'no_host'
+
+        h.policy = TaskVerifyPolicy()
+        result = await h.call()
+
+        assert result is h.local.result
+        assert h.local.calls == [h.expected_call(), h.expected_call()]
+        assert len(h.sidecars()) == 1
+        assert h.dispatcher.decision_for('7', 1) is None
