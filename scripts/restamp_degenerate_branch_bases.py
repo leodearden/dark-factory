@@ -54,7 +54,7 @@ from pathlib import Path
 from typing import Any
 
 import _checkout as _checkout
-from _task_db_scan import UNREADABLE_STORE_ERRORS, connect_ro, decode_metadata, tasks_db_path
+from _task_db_scan import UNREADABLE_STORE_ERRORS, decode_metadata, tasks_db_path
 from migrate_metadata_modules_to_files import (
     DEFAULT_SERVER,
     FusedMemoryClient,
@@ -63,6 +63,7 @@ from migrate_metadata_modules_to_files import (
 )
 from orchestrator.config import load_config
 from orchestrator.git_ops import CitationPatternInvalid, GitOps, GitQueryFailed
+from shared.tasks_db_readonly import connect_ro
 
 CONFIG_FILENAME = 'dark-factory-orchestrator.yaml'
 
