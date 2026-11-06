@@ -532,7 +532,8 @@ def clean_worktree_resolution(tmp_path_factory: pytest.TempPathFactory) -> dict[
                    first.
 
     Both in ONE module-scoped fixture, so the two tests cannot be reordered into
-    disagreement and the install happens once.
+    disagreement, and the install happens once per session because its consumers
+    share one xdist_group, pinned by test_the_npx_resolution_consumers_share_one_xdist_worker.
 
     COST, stated rather than left for someone to discover: this fixture is the
     expensive part of the file — measured 25.6s on 2026-08-28 with a warm host
@@ -611,6 +612,7 @@ def test_the_npx_resolution_consumers_share_one_xdist_worker(request: pytest.Fix
     assert single_xdist_group(consumers) == _NPX_RESOLUTION_GROUP
 
 
+@pytest.mark.xdist_group(_NPX_RESOLUTION_GROUP)
 def test_npx_in_a_fresh_worktree_does_not_resolve_the_pin_on_its_own(
     clean_worktree_resolution: dict[str, object],
 ) -> None:
@@ -643,6 +645,7 @@ def test_npx_in_a_fresh_worktree_does_not_resolve_the_pin_on_its_own(
     )
 
 
+@pytest.mark.xdist_group(_NPX_RESOLUTION_GROUP)
 def test_npx_in_a_clean_worktree_resolves_the_pinned_version(
     clean_worktree_resolution: dict[str, object],
 ) -> None:
