@@ -179,15 +179,10 @@ class TestFocusHeaderWiring:
             'shownCount is its shown array\'s length by construction.'
         )
 
-    @pytest.mark.parametrize('component, prop', [('TaskGraph', 'tasks')])
-    def test_group_body_renders_the_array_the_header_counts(
-        self, tasks_tab_code, component, prop
-    ):
+    def test_group_body_renders_the_array_the_header_counts(self, tasks_tab_code):
         """The other half of the header/body agreement: the body is fed ``groupView.shown``."""
-        assert re.search(
-            rf'<{component}\s+{prop}=\{{\s*groupView\.shown\s*\}}', tasks_tab_code
-        ), (
-            f'TasksTab does not pass groupView.shown as <{component} {prop}=...> '
+        assert re.search(r'<TaskGraph\s+tasks=\{\s*groupView\.shown\s*\}', tasks_tab_code), (
+            'TasksTab does not pass groupView.shown as <TaskGraph tasks=...> '
             '— the group body must render the same array whose length the header '
             'displays as shownCount.'
         )
@@ -211,11 +206,8 @@ class TestFocusHeaderWiring:
             'array the group body did not render.'
         )
 
-    @pytest.mark.parametrize('component', ['TaskGraph'])
     @pytest.mark.parametrize('focus_prop', ['focusMode', 'focusAnchorId'])
-    def test_rendering_components_take_no_focus_state(
-        self, tab_tasks_jsx_body, component, focus_prop
-    ):
+    def test_rendering_components_take_no_focus_state(self, tab_tasks_jsx_body, focus_prop):
         """The component the group body renders may not take focus state.
 
         TaskGraph draws ``groupView.shown`` in the flat view and, through the
@@ -236,6 +228,7 @@ class TestFocusHeaderWiring:
         defaulted parameter (``focusMode = false``) is not an exact set member
         but is every bit the focus state this forbids.
         """
+        component = 'TaskGraph'
         params = _parameter_list(tab_tasks_jsx_body, component)
         assert params.strip(), (
             f'{component} declares an empty parameter list. It is rendered with '

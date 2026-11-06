@@ -1,6 +1,6 @@
 /* Tasks tab: per-project dependency graph + filters + detail panel.
    Least-dependent tasks at top; tasks depending on them stack below. */
-const { ProjectGroup: PG_T, Segmented: SEG_T, Pip, DatumReading } = window.DF_SHELL;
+const { ProjectGroup: PG_T, Segmented: SEG_T, Pip } = window.DF_SHELL;
 const { PALETTE: CP_T } = window.DF_CHARTS;
 const DF_T = window.DF_DATA;
 // One namespace alias, so no data.js const is rebound under its own name —
