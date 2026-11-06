@@ -186,16 +186,19 @@ L2_AUTO_CLOSE_DENY_CATEGORIES: frozenset[str] = frozenset({
 # allowlist (denylist-first).
 L2_AUTO_CLOSE_DENY_ROLES: frozenset[str] = frozenset({'orchestrator-deterministic'})
 
-# The executor's deny roles: the sentinel role above plus the two watchdog
-# alarms. Its deny categories ARE L2_AUTO_CLOSE_DENY_CATEGORIES.
-# 'harness-dashboard-watchdog' is the role scripts/dashboard-watchdog.py
-# ::ESCALATION_AGENT_ROLE files under (the PRD's bare 'dashboard-watchdog' is
-# not a role any filer writes); tests/test_authority.py pins it in lockstep.
-# 'orchestrator-watchdog' (PRD boundary row 3) has no filer yet: it reserves
-# the role for the task-8270 host alarm.
-EXECUTOR_DENY_ROLES: frozenset[str] = L2_AUTO_CLOSE_DENY_ROLES | {
+# The roles a host alarm files under. 'harness-dashboard-watchdog' is the role
+# scripts/dashboard-watchdog.py::ESCALATION_AGENT_ROLE files under (the PRD's
+# bare 'dashboard-watchdog' is not a role any filer writes);
+# tests/test_authority.py pins it in lockstep. 'orchestrator-watchdog' (PRD
+# boundary row 3) has no filer yet: it reserves the role for the task-8270
+# host alarm.
+HOST_FILER_ROLES: frozenset[str] = frozenset({
     'orchestrator-watchdog', 'harness-dashboard-watchdog',
-}
+})
+
+# The executor's deny roles: the sentinel role above plus the host alarms.
+# Its deny categories ARE L2_AUTO_CLOSE_DENY_CATEGORIES.
+EXECUTOR_DENY_ROLES: frozenset[str] = L2_AUTO_CLOSE_DENY_ROLES | HOST_FILER_ROLES
 
 # How long an executor claim stays fresh. The code home of the triage-ack
 # freshness window that skills/escalation-watcher-auto/SKILL.md "Triage-ack
@@ -895,3 +898,23 @@ def storm_escape_target(current: ClassSwitch, closes: int, cap: int) -> ClassSwi
     if current == ClassSwitch.LIVE and closes > cap:
         return ClassSwitch.SHADOW
     return None
+
+
+# The audit flip rule (PRD §3 decision 8): below AUDIT_RATE_MIN_N audited
+# closes any wrong one drops a live class; from there on, a wrong rate above
+# the ceiling does.
+AUDIT_RATE_MIN_N = 20
+AUDIT_WRONG_RATE_CEILING = 0.05
+
+
+def audit_escape_target(current: ClassSwitch, audited: int, wrong: int) -> ClassSwitch | None:
+    """SHADOW when a live class's audited closes of one queue run wrong, else ``None``."""
+    if not 0 <= wrong <= audited:
+        raise ValueError(
+            f'audit counts must satisfy 0 <= wrong <= audited; got audited={audited}, wrong={wrong}'
+        )
+    if current != ClassSwitch.LIVE:
+        return None
+    if audited < AUDIT_RATE_MIN_N:
+        return ClassSwitch.SHADOW if wrong >= 1 else None
+    return ClassSwitch.SHADOW if wrong / audited > AUDIT_WRONG_RATE_CEILING else None
