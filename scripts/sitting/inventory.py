@@ -44,9 +44,11 @@ from shared.project_id import fold_project_token
 from shared.project_layout import ESCALATION_QUEUE_RELPATH
 from shared.tasks_db_readonly import TaskDbUnreadable, connect_ro
 
+RECON_QUEUE_RELPATH = Path('data', 'reconciliation', 'escalations')
+RECON_QUEUE_TAG = 'recon'
 QUEUE_TAGS: Mapping[Path, str] = MappingProxyType({
     Path(ESCALATION_QUEUE_RELPATH): '',
-    Path('data', 'reconciliation', 'escalations'): 'recon',
+    RECON_QUEUE_RELPATH: RECON_QUEUE_TAG,
 })
 QUEUE_SUBDIRS: tuple[Path, ...] = tuple(QUEUE_TAGS)
 
@@ -109,7 +111,14 @@ class OpenItem:
 
     @property
     def store_task_id(self) -> str | None:
-        """``task_id`` when it names a task in the project's store (all digits); None for a sentinel or no task."""
+        """``task_id`` when it names a task in ``project``'s store (all digits), else None.
+
+        None for a sentinel, for no task, and for an escalation on a reconciliation
+        queue: that queue carries other projects' gates, so its ``task_id`` is not
+        a task of ``project``, the queue's own project.
+        """
+        if self.kind == 'esc' and queue_tag(self.queue_dir) == RECON_QUEUE_TAG:
+            return None
         return self.task_id if self.task_id and self.task_id.isdigit() else None
 
 

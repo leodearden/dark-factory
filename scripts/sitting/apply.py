@@ -353,13 +353,12 @@ class _ApplyContext:
         def x_ruling() -> ApplyPayload | _Skip | _Failed:
             if not item.escalation_id or action is None:
                 return no_escalation
-            if not isinstance(port, QueuePort) or port.kind != 'project' or port.project_root is None:
-                return _Skip('a reconciliation queue names no task of its own project')
-            if not item.task_id:
-                return _Skip('the escalation names no task')
             task_id = item.store_task_id
             if task_id is None:
-                return _Skip('the escalation names a sentinel, not a task')
+                return _Skip('the escalation names no task of its queue\'s project: none, a sentinel, '
+                             'or a reconciliation gate')
+            if not isinstance(port, QueuePort) or port.project_root is None:
+                return _Skip('the queue names no project root')
             root = str(port.project_root)
             task = self._fused.call_tool('get_task', {'id': task_id, 'project_root': root})
             if 'error' in task:

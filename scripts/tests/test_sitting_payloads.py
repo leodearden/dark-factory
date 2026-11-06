@@ -455,6 +455,15 @@ class TestMemoryPayloads:
 
         assert _args(decision)['entities'] == _args(rationale)['entities'] == []
 
+    def test_a_reconciliation_gate_declares_no_task_of_the_queue_project(self):
+        decision, rationale = self._payloads(_l2(DF_RECON_QUEUE, task_id='7459'))
+
+        for payload in (decision, rationale):
+            args = _args(payload)
+            assert args['entities'] == []
+            assert 'task 7459' not in args['content']
+            assert 'esc-4803-2' in args['content']
+
     def test_a_decision_item_cites_its_decision_id(self):
         item = OpenItem(key=decision_key('dec-77'), decision_id='dec-77', decision_project='reify',
                         project='reify', text='q')

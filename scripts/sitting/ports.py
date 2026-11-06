@@ -21,14 +21,13 @@ from escalation.store_identity import QueueKind
 from orchestrator.session_registry import normalize_escalations_dir
 from shared.mcp_post import mcp_server_base
 from shared.project_layout import ESCALATION_QUEUE_RELPATH
-from sitting.inventory import QUEUE_TAGS, queue_project_root, queue_tag
+from sitting.inventory import QUEUE_TAGS, RECON_QUEUE_TAG, queue_project_root, queue_tag
 
 # Mirrors fused_memory.config.schema.ReconciliationConfig's escalation_host and
 # escalation_port defaults; scripts/tests/test_sitting_ports.py pins the two.
 RECON_ESCALATION_URL = 'http://127.0.0.1:8103/mcp'
 
 _PROJECT_TAG = QUEUE_TAGS[Path(ESCALATION_QUEUE_RELPATH)]
-_RECON_TAG = QUEUE_TAGS[Path('data', 'reconciliation', 'escalations')]
 
 
 @dataclass(frozen=True)
@@ -52,7 +51,7 @@ class PortUnknown:
 def queue_port(queue_dir: str | Path) -> QueuePort | PortUnknown:
     normalized = normalize_escalations_dir(queue_dir)
     tag = queue_tag(normalized)
-    if tag == _RECON_TAG:
+    if tag == RECON_QUEUE_TAG:
         return QueuePort(normalized, 'reconciliation', RECON_ESCALATION_URL, None)
     root = queue_project_root(normalized)
     if tag != _PROJECT_TAG or root is None:

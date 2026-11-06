@@ -303,6 +303,20 @@ class TestStoreTaskId:
 
         assert item.store_task_id == expected
 
+    def test_a_reconciliation_queue_escalation_names_no_task_of_its_project(self):
+        queue = '/src/dark-factory/data/reconciliation/escalations'
+        item = mod.OpenItem(key=mod.escalation_key(queue, 'esc-7459-1'), escalation_id='esc-7459-1',
+                            queue_dir=queue, task_id='7459')
+
+        assert item.store_task_id is None
+
+    def test_a_decision_item_from_a_reconciliation_queue_keeps_its_task(self):
+        queue = '/src/dark-factory/data/reconciliation/escalations'
+        item = mod.OpenItem(key=mod.decision_key('reify-recon-esc-7459-1'), decision_id='reify-recon-esc-7459-1',
+                            decision_project='reify', queue_dir=queue, project='reify', task_id='7459')
+
+        assert item.store_task_id == '7459'
+
 
 class TestQueueTag:
     def test_the_two_known_queue_shapes(self, df_root):
