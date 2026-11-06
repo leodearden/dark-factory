@@ -1294,6 +1294,7 @@
     "orchestrator/tests/test_harness_already_landed_gate_wiring.py": {"patch_targets": [], "private_reads": 270},
     "orchestrator/tests/test_harness_claimant_clear.py": {"patch_targets": [], "private_reads": 17},
     "orchestrator/tests/test_harness_fleet_drain.py": {"patch_targets": [], "private_reads": 5},
+    "orchestrator/tests/test_harness_host_pool.py": {"patch_targets": ["liveness.INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS"], "private_reads": 36},
     "orchestrator/tests/test_harness_infra_resume_truthful.py": {"patch_targets": [], "private_reads": 8},
     "orchestrator/tests/test_harness_interactive_reaper.py": {"patch_targets": [], "private_reads": 21},
     "orchestrator/tests/test_harness_merge_registry_wiring.py": {"patch_targets": ["liveness.enforce_merge_liveness_margin", "worker.SpeculativeMergeWorker"], "private_reads": 23},

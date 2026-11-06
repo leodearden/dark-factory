@@ -16,8 +16,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import subprocess
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -25,13 +24,15 @@ from unittest.mock import MagicMock, patch
 import pytest
 import pytest_asyncio
 from _gate_fixtures import TEST_DEPLOYED_SHA
+from _git_fixtures import seed_repo
+from _host_health_helpers import transport_down, until
 
 from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
 from orchestrator.harness import Harness
+from orchestrator.merge_lane.liveness import MergeLivenessConfigError
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.task_verify_dispatch import TaskVerifyDispatcher
 from orchestrator.verify_admission_gate import AdmissionPlan
-from orchestrator.verify_runner import RunnerUnavailable
 
 pytestmark = pytest.mark.usefixtures('code_default_config')
 
@@ -49,21 +50,9 @@ def _fleet_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv('ORCH_FLEET_DIR', str(tmp_path / 'fleet'))
 
 
-def _git(repo: Path, *args: str) -> None:
-    subprocess.run(['git', '-C', str(repo), *args], check=True, capture_output=True, text=True)
-
-
 @pytest.fixture
 def repo(tmp_path: Path) -> Path:
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    _git(repo, 'init', '-q', '-b', 'main')
-    _git(repo, 'config', 'user.email', 'test@test.com')
-    _git(repo, 'config', 'user.name', 'Test')
-    (repo / 'README.md').write_text('# Test\n')
-    _git(repo, 'add', '-A')
-    _git(repo, 'commit', '-q', '-m', 'Initial commit')
-    return repo
+    return seed_repo(tmp_path / 'repo')
 
 
 def _laptop() -> VerifyRunnerConfig:
@@ -103,20 +92,10 @@ async def started(harness: Harness) -> AsyncIterator[Harness]:
         await harness._stop_merge_worker()
 
 
-def _transport_down() -> RunnerUnavailable:
-    return RunnerUnavailable('ssh: connect to host laptop.invalid: Connection timed out', kind='transport')
-
-
 def _laptop_row(harness: Harness) -> dict[str, Any]:
     assert harness._merge_worker is not None
     rows = {row['name']: row for row in harness._merge_worker.snapshot()['hosts']}
     return rows[_HOST]
-
-
-async def _until(predicate: Callable[[], bool], *, timeout: float = 5.0) -> None:
-    async with asyncio.timeout(timeout):
-        while not predicate():
-            await asyncio.sleep(0.005)
 
 
 class TestBeforeAnyMergeWorker:
@@ -127,7 +106,7 @@ class TestBeforeAnyMergeWorker:
         assert isinstance(harness._task_verify_dispatcher, TaskVerifyDispatcher)
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
-            harness._host_pool.mark_unavailable(_HOST, _transport_down())
+            harness._host_pool.mark_unavailable(_HOST, transport_down())
 
         assert [r for r in caplog.records if _HOST in r.getMessage()], caplog.text
         assert harness._host_pool.policy(_HOST, harness.config).slots > 0
@@ -145,7 +124,7 @@ class TestWithTheMergeWorker:
             assert (row['task_held_by'], row['slot_state']) == ('task:42', 'free')
 
     async def test_a_pool_bench_is_one_merge_lane_bench(self, started: Harness) -> None:
-        started._host_pool.mark_unavailable(_HOST, _transport_down())
+        started._host_pool.mark_unavailable(_HOST, transport_down())
 
         row = _laptop_row(started)
         assert (row['quarantined'], row['quarantine_class'], row['streak']) == (True, 'ru', 1)
@@ -160,7 +139,7 @@ class TestWithTheMergeWorker:
 
         with patch.object(started._merge_worker, 'bench_unavailable_runner', side_effect=fault), \
              caplog.at_level(logging.ERROR, logger=_HARNESS_LOGGER):
-            started._host_pool.mark_unavailable(_HOST, _transport_down())
+            started._host_pool.mark_unavailable(_HOST, transport_down())
 
         [error] = [r for r in caplog.records if r.name == _HARNESS_LOGGER and r.levelno == logging.ERROR]
         assert _HOST in error.getMessage()
@@ -173,13 +152,13 @@ class TestWithTheMergeWorker:
         await started._stop_merge_worker()
 
         with caplog.at_level(logging.WARNING, logger=_HARNESS_LOGGER):
-            started._host_pool.mark_unavailable(_HOST, _transport_down())
+            started._host_pool.mark_unavailable(_HOST, transport_down())
 
         assert [r for r in caplog.records if r.name == _HARNESS_LOGGER and _HOST in r.getMessage()]
         assert started._host_pool.policy(_HOST, started.config).slots > 0
 
     async def test_the_bench_survives_a_merge_worker_rebuild(self, started: Harness) -> None:
-        started._host_pool.mark_unavailable(_HOST, _transport_down())
+        started._host_pool.mark_unavailable(_HOST, transport_down())
         first = started._merge_worker
 
         await started._stop_merge_worker()
@@ -194,7 +173,7 @@ class TestWithTheMergeWorker:
     ) -> None:
         """Row 32: the merge lane's readmission reaches the task pool."""
         pool = started._host_pool
-        pool.mark_unavailable(_HOST, _transport_down())
+        pool.mark_unavailable(_HOST, transport_down())
         gate = pool.gate(_HOST)
         older = AdmissionPlan.begin(role='task', task_id='old')
         younger = AdmissionPlan.begin(role='task', task_id='young')
@@ -206,7 +185,7 @@ class TestWithTheMergeWorker:
                 await release.wait()
 
         waiters = [asyncio.create_task(wait_turn(p)) for p in (younger, older)]
-        await _until(lambda: gate.snapshot().depth == 2)
+        await until(lambda: gate.snapshot().depth == 2, what='both task waiters to queue')
         assert gate.snapshot().holders == ()
 
         assert started._merge_worker is not None
@@ -223,13 +202,12 @@ class TestWithTheMergeWorker:
 class TestMergeWorkerRefusal:
     async def test_the_pool_outlives_a_refused_merge_worker_start(self, harness: Harness) -> None:
         with patch('orchestrator.merge_lane.liveness.INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS', 1.0), \
-             pytest.raises(Exception, match='startup refused') as refused:
+             pytest.raises(MergeLivenessConfigError, match='startup refused'):
             await harness._start_merge_worker()
 
-        assert type(refused.value).__name__ == 'MergeLivenessConfigError'
         assert harness._merge_worker is None
         assert harness._host_pool.hosts == (_HOST,)
-        harness._host_pool.mark_unavailable(_HOST, _transport_down())
+        harness._host_pool.mark_unavailable(_HOST, transport_down())
 
 
 class TestNoRemoteHosts:
@@ -259,7 +237,7 @@ class TestRunSlotInjectsTheDispatcher:
             build.return_value.run = wedge
             slot = asyncio.create_task(harness._run_slot(assignment, asyncio.Semaphore(0)))
             try:
-                await _until(lambda: build.called)
+                await until(lambda: build.called, what='the slot to build its workflow')
                 assert build.call_args.kwargs['task_verify'] is harness._task_verify_dispatcher
             finally:
                 harness.hard_cancel_workflow('42')

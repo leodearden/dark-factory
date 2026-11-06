@@ -17,12 +17,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import subprocess
 from pathlib import Path
 from typing import Any, ClassVar
 
 import pytest
 from _gate_fixtures import TEST_DEPLOYED_SHA
+from _git_fixtures import seed_repo
+from _host_health_helpers import transport_down, until
 from _merge_lane_fakes import (
     FakeClock,
     FakeVerifier,
@@ -40,7 +41,7 @@ from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane.types import QueuedBranch
 from orchestrator.merge_lane.worker import MergeRequest, SpeculativeMergeWorker
 from orchestrator.verify import VerifyResult
-from orchestrator.verify_runner import MergeVerifySpec, RunnerUnavailable
+from orchestrator.verify_runner import MergeVerifySpec
 
 pytestmark = pytest.mark.usefixtures('code_default_config')
 
@@ -51,21 +52,9 @@ _GIT = GitConfig(
 _HOST = 'laptop'
 
 
-def _git(repo: Path, *args: str) -> None:
-    subprocess.run(['git', '-C', str(repo), *args], check=True, capture_output=True, text=True)
-
-
 @pytest.fixture
 def repo(tmp_path: Path) -> Path:
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    _git(repo, 'init', '-q', '-b', 'main')
-    _git(repo, 'config', 'user.email', 'test@test.com')
-    _git(repo, 'config', 'user.name', 'Test')
-    (repo / 'README.md').write_text('# Test\n')
-    _git(repo, 'add', '-A')
-    _git(repo, 'commit', '-q', '-m', 'Initial commit')
-    return repo
+    return seed_repo(tmp_path / 'repo')
 
 
 def _config(repo: Path, **overrides: Any) -> OrchestratorConfig:
@@ -120,10 +109,6 @@ def _rows(worker: SpeculativeMergeWorker) -> dict[str, dict[str, Any]]:
     return {row['name']: row for row in worker.snapshot()['hosts']}
 
 
-def _transport_down(reason: str = 'ssh: connect to host laptop.local: Connection timed out') -> RunnerUnavailable:
-    return RunnerUnavailable(reason, kind='transport')
-
-
 def _laptop_runner_config() -> VerifyRunnerConfig:
     return VerifyRunnerConfig(
         name=_HOST, ssh_host='laptop.local', git_remote='laptop-remote',
@@ -148,7 +133,7 @@ class TestInjectedQuarantine:
         worker = _worker(repo, runner_quarantine=quarantine, remote_runners=[_Laptop()])
         worker.ensure_host_allocator(_config(repo))
 
-        worker.bench_unavailable_runner(_HOST, _transport_down())
+        worker.bench_unavailable_runner(_HOST, transport_down())
 
         assert quarantine == {_HOST}
 
@@ -161,7 +146,7 @@ class TestBenchBeforeAnyMerge:
         worker = _worker(repo, escalation_queue=escalations, remote_runners=[_Laptop()])
         worker.ensure_host_allocator(_config(repo, verify_host_unreachable_escalate_after_n=1))
 
-        worker.bench_unavailable_runner(_HOST, _transport_down())
+        worker.bench_unavailable_runner(_HOST, transport_down())
 
         l1s = [esc for esc in escalations.get_pending() if esc.level == 1]
         assert [esc.category for esc in l1s] == ['verify_host_unreachable']
@@ -172,7 +157,7 @@ class TestBenchBeforeAnyMerge:
         worker = _worker(repo)
         config = _config(repo, verify_runners=[_laptop_runner_config()])
 
-        worker.bench_unavailable_runner(_HOST, _transport_down())
+        worker.bench_unavailable_runner(_HOST, transport_down())
         allocator = worker.ensure_host_allocator(config)
 
         assert _HOST in allocator.host_names
@@ -205,7 +190,7 @@ class TestTaskHeldBy:
         )
         worker.ensure_host_allocator(_config(repo))
 
-        worker.bench_unavailable_runner('gone', _transport_down('gone is gone'))
+        worker.bench_unavailable_runner('gone', transport_down('gone is gone'))
 
         orphan = _rows(worker)['gone']
         assert (orphan['slot_state'], orphan['task_held_by']) == (None, 'task:9')
@@ -275,20 +260,12 @@ class TestSymmetricHost:
 _LANE_LOGGER = 'orchestrator.merge_lane'
 
 
-async def _until(predicate: Any, *, what: str) -> None:
-    async def poll() -> None:
-        while not predicate():
-            await asyncio.sleep(0.02)
-
-    await wait_responsive(poll(), label=what)
-
-
 def _benched_worker(
     repo: Path, laptop: _Laptop, **kwargs: Any,
 ) -> tuple[SpeculativeMergeWorker, Any]:
     worker = _worker(repo, remote_runners=[laptop], **kwargs)
     allocator = worker.ensure_host_allocator(_config(repo))
-    worker.bench_unavailable_runner(_HOST, _transport_down())
+    worker.bench_unavailable_runner(_HOST, transport_down())
     return worker, allocator
 
 
@@ -319,14 +296,14 @@ class TestReadmissionHook:
             lane.ensure_host_allocator(_config(
                 repo, verify_host_unreachable_escalate_after_n=1, verify_host_reprobe_interval_s=1.0,
             ))
-            lane.bench_unavailable_runner(_HOST, _transport_down())
+            lane.bench_unavailable_runner(_HOST, transport_down())
             row = _rows(lane)[_HOST]
             assert (row['quarantine_class'], row['streak']) == ('ru', 1)
             [alarm] = [esc for esc in escalations.get_pending() if esc.level == 1]
             assert alarm.category == 'verify_host_unreachable'
 
             laptop.healthy = True
-            await _until(
+            await until(
                 lambda: _rows(lane)[_HOST]['quarantined'] is False,
                 what='the reprobe sweep to readmit the laptop',
             )
@@ -346,7 +323,7 @@ class TestReadmissionHook:
         assert lease is not None
         laptop.cancel_rc, laptop.clean = 1, False
         await allocator.cancel_and_release(lease, max_attempts=1)
-        worker.bench_unavailable_runner(_HOST, _transport_down())
+        worker.bench_unavailable_runner(_HOST, transport_down())
 
         outcome = await worker.clear_host_quarantine(_HOST)
 
