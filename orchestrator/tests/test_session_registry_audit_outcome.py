@@ -12,6 +12,7 @@ _PROJECT = 'dark_factory'
 _QUEUE = '/srv/df/data/escalations'
 _AUDITED_AT = '2026-09-26T09:15:00+00:00'
 _EVIDENCE = 'row landing_provenance: merge sha abc123 found on main'
+_CLASS = 'landing_provenance'
 
 
 def _decision(
@@ -43,12 +44,14 @@ def _audit(
     *,
     expected_project: str = _PROJECT,
     expected_escalations_dir: str = _QUEUE,
+    policy_class: str = _CLASS,
 ) -> sr.DecisionRecord | None:
     return sr.record_audit_outcome(
         decision_id, sr.AuditVerdict.WRONG, 'note', root,
         expected_project=expected_project,
         expected_escalations_dir=expected_escalations_dir,
         audited_at=_AUDITED_AT,
+        policy_class=policy_class,
     )
 
 
@@ -72,22 +75,29 @@ class TestSerialization:
         assert sr.DecisionRecord.from_dict(body).audit_outcome is None
 
     def test_an_outcome_round_trips(self) -> None:
-        outcome = sr.AuditOutcome(verdict=sr.AuditVerdict.OK, note='', audited_at=_AUDITED_AT)
+        outcome = sr.AuditOutcome(
+            verdict=sr.AuditVerdict.OK, note='', audited_at=_AUDITED_AT, policy_class=_CLASS,
+        )
         record = _decision(audit_outcome=outcome)
 
         assert sr.DecisionRecord.from_json(record.to_json()) == record
+        assert record.to_dict()['audit_outcome']['policy_class'] == _CLASS
 
     @pytest.mark.parametrize('verdict', ['maybe', '', None])
     def test_an_unknown_verdict_is_refused(self, verdict: object) -> None:
         body = _decision().to_dict()
-        body['audit_outcome'] = {'verdict': verdict, 'note': '', 'audited_at': _AUDITED_AT}
+        body['audit_outcome'] = {
+            'verdict': verdict, 'note': '', 'audited_at': _AUDITED_AT, 'policy_class': _CLASS,
+        }
 
         with pytest.raises(ValueError):
             sr.DecisionRecord.from_dict(body)
 
     def test_a_non_iso_audited_at_is_refused(self) -> None:
         body = _decision().to_dict()
-        body['audit_outcome'] = {'verdict': 'ok', 'note': '', 'audited_at': 'yesterday'}
+        body['audit_outcome'] = {
+            'verdict': 'ok', 'note': '', 'audited_at': 'yesterday', 'policy_class': _CLASS,
+        }
 
         with pytest.raises(ValueError):
             sr.DecisionRecord.from_dict(body)
@@ -95,7 +105,35 @@ class TestSerialization:
     def test_list_decisions_skips_a_body_with_an_unknown_verdict(self, tmp_path: Path) -> None:
         path = _seed_closed(tmp_path)
         body = json.loads(path.read_text())
-        body['audit_outcome'] = {'verdict': 'maybe', 'note': '', 'audited_at': _AUDITED_AT}
+        body['audit_outcome'] = {
+            'verdict': 'maybe', 'note': '', 'audited_at': _AUDITED_AT, 'policy_class': _CLASS,
+        }
+        path.write_text(json.dumps(body))
+
+        assert sr.list_decisions(tmp_path) == []
+
+    def test_an_outcome_with_an_empty_class_is_refused(self) -> None:
+        with pytest.raises(ValueError, match='policy_class'):
+            sr.AuditOutcome(verdict=sr.AuditVerdict.OK, note='', audited_at=_AUDITED_AT, policy_class='')
+
+    @pytest.mark.parametrize('policy_class', [7, None, ['landing_provenance']])
+    def test_an_outcome_with_a_non_text_class_is_refused(self, policy_class: object) -> None:
+        body = {'verdict': 'ok', 'note': '', 'audited_at': _AUDITED_AT, 'policy_class': policy_class}
+
+        with pytest.raises(ValueError, match='policy_class'):
+            sr.AuditOutcome.from_dict(body)
+
+    def test_a_stored_outcome_without_a_class_fails_to_load(self) -> None:
+        body = _decision().to_dict()
+        body['audit_outcome'] = {'verdict': 'ok', 'note': '', 'audited_at': _AUDITED_AT}
+
+        with pytest.raises((KeyError, ValueError)):
+            sr.DecisionRecord.from_dict(body)
+
+    def test_list_decisions_skips_a_body_whose_outcome_names_no_class(self, tmp_path: Path) -> None:
+        path = _seed_closed(tmp_path)
+        body = json.loads(path.read_text())
+        body['audit_outcome'] = {'verdict': 'ok', 'note': '', 'audited_at': _AUDITED_AT}
         path.write_text(json.dumps(body))
 
         assert sr.list_decisions(tmp_path) == []
@@ -107,14 +145,27 @@ class TestRecordAuditOutcome:
 
         returned = _audit(tmp_path)
 
-        expected = sr.AuditOutcome(verdict=sr.AuditVerdict.WRONG, note='note', audited_at=_AUDITED_AT)
+        expected = sr.AuditOutcome(
+            verdict=sr.AuditVerdict.WRONG, note='note', audited_at=_AUDITED_AT, policy_class=_CLASS,
+        )
         assert returned is not None and returned.audit_outcome == expected
         reread = _only(tmp_path)
         assert reread.audit_outcome == expected
+        assert reread.audit_outcome.policy_class == _CLASS
         assert reread.to_dict()['audit_outcome'] == {
-            'verdict': 'wrong', 'note': 'note', 'audited_at': _AUDITED_AT,
+            'verdict': 'wrong', 'note': 'note', 'audited_at': _AUDITED_AT, 'policy_class': _CLASS,
         }
+        assert sr.DecisionRecord.from_json(reread.to_json()) == reread
         assert reread.closing_evidence == _EVIDENCE
+
+    def test_an_empty_class_is_refused_before_the_lock(self, tmp_path: Path) -> None:
+        path = _seed_closed(tmp_path)
+        before = path.read_bytes()
+
+        with pytest.raises(ValueError, match='policy_class'):
+            _audit(tmp_path, policy_class='')
+
+        assert path.read_bytes() == before
 
     def test_an_open_record_is_refused_untouched(self, tmp_path: Path) -> None:
         assert sr.write_decision(_decision(), root=tmp_path)
@@ -135,6 +186,7 @@ class TestRecordAuditOutcome:
             sr.record_audit_outcome(
                 'dec-audit', sr.AuditVerdict.OK, '', tmp_path,
                 expected_project=_PROJECT, expected_escalations_dir=_QUEUE, audited_at=_AUDITED_AT,
+                policy_class=_CLASS,
             )
 
         assert path.read_bytes() == before
