@@ -105,6 +105,8 @@ SectionStatus = Literal['ok', 'degraded']
 
 NO_EXECUTOR_CLOSE = f'no executor close in window (the trailing {audits.AUDIT_WINDOW_DAYS} days); nothing to audit'
 ALL_AUDITED = 'every executor close in the window is audited'
+AGED_OUT = ('{count} close(s) in the window name an escalation that has aged out of the archive; '
+            'their class cannot be read')
 AUDIT_SLOT = 'ok|wrong[:note]'
 
 
@@ -517,6 +519,8 @@ def _audit_draw_section(measurement: Measurement[AuditDraw], ledger: ledgers.Led
                       f'drawn {len(draw.full)} in full and {len(draw.sampled)} of at most {audits.SAMPLE_SIZE} '
                       f'at random (seed {draw.seed}). A `wrong` counts toward flipping its class to shadow '
                       'on its queue.']
+        if draw.aged_out > 0:
+            lines += ['', f'{AGED_OUT.format(count=draw.aged_out)}.']
         if draw.state == 'no_executor_close':
             lines += ['', f'Draw: {NO_EXECUTOR_CLOSE}.']
         elif draw.state == 'all_audited':
