@@ -44,6 +44,7 @@ from orchestrator.agents.sandbox_dispatch import (
     resolve_backend_or_refuse,
 )
 from orchestrator.agents.skill_prompt import load_skill_system_prompt
+from orchestrator.artifacts import TaskArtifacts
 from orchestrator.event_store import EventType
 from orchestrator.merge_lane.completion import merge_completion_eligible
 from orchestrator.routing import RoleDefaults
@@ -667,11 +668,13 @@ async def run_dry_run_unblock(
         config_dir = TaskConfigDir(f'{task_id}-unblock', base_dir=Path(worktree) / '.task')
 
         system_prompt = _load_skill_system_prompt()
+        reviews_dir = TaskArtifacts.for_task(Path(worktree), task_id).artifact_path('reviews')
         user_prompt = (
             f'Task ID: {task_id}\n'
             f'Worktree: {worktree}\n'
             f'Block reason: {reason}\n'
-            f'Detail: {detail or "(none)"}\n\n'
+            f'Detail: {detail or "(none)"}\n'
+            f'**Reviews directory:** {reviews_dir}\n\n'
             f'{task_context.block}\n\n'
             'Investigate and emit your structured proposal.'
         )
