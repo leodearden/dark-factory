@@ -7246,9 +7246,7 @@ class TestContradictedEscalation:
     async def test_contradicted_escalation_queue_io_runs_off_the_event_loop(
         self, make_reconciler, tmp_path,
     ):
-        """INV-8: the contradicted-verdict filing stays off the shared event
-        loop through the shared filing helper (a guard for that refactor, so it
-        was green from the start)."""
+        """INV-8: the contradicted-verdict filing stays off the shared event loop."""
         threads: list[int] = []
         reconciler = make_reconciler(
             escalation_queue_factory=_thread_recording_factory(threads),
