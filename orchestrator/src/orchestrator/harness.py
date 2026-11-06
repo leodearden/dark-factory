@@ -228,9 +228,12 @@ from orchestrator.task_status import (
     TERMINAL_STATUSES,
     is_infra_held,
 )
+from orchestrator.task_verify_dispatch import TaskVerifyDispatcher, policy_from_config
 from orchestrator.usage_gate import UsageGate
 from orchestrator.verify_admission_watch import ADMISSION_WATCH_INTERVAL_SECS, AdmissionWatch
 from orchestrator.verify_categories import FailureCategory
+from orchestrator.verify_hosts import HostPool, remote_runner_factory, task_verify_hosts
+from orchestrator.verify_runner import RunnerUnavailable
 from orchestrator.workflow import (
     ResumeFailure,
     TerminalReport,
@@ -2222,6 +2225,22 @@ class Harness:
         self._merge_inflight_registry: InFlightMergeRegistry = InFlightMergeRegistry()
         self._merge_worker: SpeculativeMergeWorker | None = None
         self._merge_worker_task: asyncio.Task | None = None
+        # Remote verify host health for the PROCESS lifetime (task 6670, PRD
+        # plans/remote-task-leg-verify-prd.md §5.6): one quarantine set, shared
+        # by reference with every merge worker built below, and the task path's
+        # pool and dispatcher over it, whether or not a merge worker starts.
+        self._runner_quarantine: set[str] = set()
+        self._host_pool = HostPool(
+            task_verify_hosts(config, deployed_sha=deployed_sha),
+            runner_for=remote_runner_factory(
+                config, config.project_root, deployed_sha=deployed_sha,
+            ),
+            quarantine=self._runner_quarantine,
+            on_unavailable=self._bench_verify_host,
+        )
+        self._task_verify_dispatcher = TaskVerifyDispatcher(
+            self._host_pool, self.git_ops, policy_of=policy_from_config,
+        )
         self._abandoned_member_sweep = AbandonedMemberSweep()
         # This unit's side of the restart drain (task 5371): steers the merge
         # worker's admission from the heartbeat pass, reports at stop.
@@ -10693,6 +10712,7 @@ class Harness:
                 event_store=self.event_store,
                 cost_store=self.cost_store,
                 cancel_event=cancel_event,
+                task_verify=self._task_verify_dispatcher,
                 resume_session_id=recovered_session,
                 run_id=self._run_id,
                 # ε (task 3733): the harness IS the sink — it owns the streak,
@@ -12356,7 +12376,15 @@ class Harness:
             provenance_conflict_sink=self._provenance_conflict_sink,
             deployed_sha=self._deployed_sha,
             verify_hosts=[r.name for r in self.config.verify_runners],
+            runner_quarantine=self._runner_quarantine,
+            host_holder_reader=self._host_pool.holders,
+            on_host_readmitted=self._note_verify_host_readmitted,
         )
+        # Manage every remote host from the start, so a task-path bench before
+        # the first merge lands on a tracked host (task 6670).  Without a
+        # deployed sha no remote verify runs, and the build would refuse.
+        if self._deployed_sha is not None:
+            self._merge_worker.ensure_host_allocator(self.config)
 
         # task 2828 (limb 1) — STARTUP SURVIVOR BARRIER.  Reap any orphaned
         # verify subtree from a PREVIOUS run still alive under the warm
@@ -12398,6 +12426,27 @@ class Harness:
                 await self._merge_worker_task
             self._merge_worker_task = None
             logger.info('Merge worker stopped')
+
+    def _bench_verify_host(self, name: str, exc: RunnerUnavailable) -> None:
+        """The task pool's bench sink: one RunnerUnavailable bench on the merge lane.
+
+        The allocator is ensured first, so the host is managed and the
+        unreachability thresholds come from config before the bench.  Without
+        a merge worker there is no tracker to bench on: logged, no-op.
+        """
+        worker = self._merge_worker
+        if worker is None:
+            logger.warning(
+                'Remote verify host %s is unavailable (%s), but no merge worker '
+                'is running to bench it', name, exc,
+            )
+            return
+        worker.ensure_host_allocator(self.config)
+        worker.bench_unavailable_runner(name, exc)
+
+    def _note_verify_host_readmitted(self, name: str) -> None:
+        """The merge lane's readmission hook: re-offer *name* to the task pool's waiters."""
+        self._host_pool.note_readmitted(name, self.config)
 
     async def _note_merge_all(
         self, task_id: str, base_sha: str, head_sha: str

@@ -76,6 +76,7 @@ def _config(repo: Path, **overrides: Any) -> OrchestratorConfig:
     fields: dict[str, Any] = {
         'project_root': repo, 'git': _GIT, 'verify_runners': [_laptop()],
         'verify_host_unreachable_escalate_after_n': 1,
+        'verify_admission_order': 'arrival', 'verify_admission_task_slots': 1,
     }
     return OrchestratorConfig(**{**fields, **overrides})
 
