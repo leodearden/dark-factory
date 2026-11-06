@@ -2799,8 +2799,11 @@ class _TaskDocScheduler:
         return dict(self._task_doc)
 
 
-async def _capture_investigation_call(tmp_path, scheduler, config=None) -> dict:
-    """Run one investigation and return the kwargs handed to the agent."""
+async def _capture_investigation_call(tmp_path, scheduler, config=None, **overrides) -> dict:
+    """Run one investigation and return the kwargs handed to the agent.
+
+    *overrides* replace or add ``run_dry_run_unblock`` keyword arguments.
+    """
     from orchestrator.dry_run_unblock import run_dry_run_unblock
 
     agent_result = _make_agent_result(structured_output={
@@ -2809,22 +2812,29 @@ async def _capture_investigation_call(tmp_path, scheduler, config=None) -> dict:
         'files_referenced': [],
     })
     mock_invoke = AsyncMock(return_value=agent_result)
+    investigation = {
+        'task_id': '42',
+        'worktree': str(tmp_path),
+        'reason': 'verify exhausted',
+        'detail': 'All 5 attempts timed out',
+        'scheduler': scheduler,
+        'mcp': MagicMock(),
+        'config': config if config is not None else _make_config(),
+        **overrides,
+    }
     with patch('orchestrator.dry_run_unblock.invoke_agent', new=mock_invoke):
-        await run_dry_run_unblock(
-            task_id='42',
-            worktree=str(tmp_path),
-            reason='verify exhausted',
-            detail='All 5 attempts timed out',
-            scheduler=scheduler,
-            mcp=MagicMock(),
-            config=config if config is not None else _make_config(),
-        )
+        await run_dry_run_unblock(**investigation)
+    assert mock_invoke.call_args is not None, 'the investigation never reached the agent'
     return dict(mock_invoke.call_args.kwargs)
 
 
-async def _capture_investigation_prompt(tmp_path, scheduler) -> str:
+async def _capture_investigation_prompt(tmp_path, scheduler, **overrides) -> str:
     """Run one investigation and return the prompt handed to the agent."""
-    return (await _capture_investigation_call(tmp_path, scheduler))['prompt']
+    return (await _capture_investigation_call(tmp_path, scheduler, **overrides))['prompt']
+
+
+def _reviews_directory_line(prompt: str) -> str:
+    return next(line for line in prompt.splitlines() if line.startswith('**Reviews directory:**'))
 
 
 class TestPromptCarriesTaskContext:
@@ -2870,6 +2880,27 @@ class TestPromptCarriesTaskContext:
         reviews_dir = TaskArtifacts.for_task(tmp_path, '42').artifact_path('reviews')
         assert f'**Reviews directory:** {reviews_dir}' in prompt.splitlines(), prompt
         assert str(tmp_path / '.task' / 'reviews') not in prompt, prompt
+
+    @pytest.mark.asyncio
+    async def test_prompt_names_the_reviews_directory_its_caller_chose(self, tmp_path):
+        """The dispatching workflow decides which root holds its reviews (an
+        eval-mode worktree keeps them in its lane root), so its choice wins."""
+        chosen = tmp_path / 'lane-root' / 'reviews'
+        prompt = await _capture_investigation_prompt(
+            tmp_path, _TaskDocScheduler(), reviews_dir=chosen,
+        )
+
+        assert _reviews_directory_line(prompt) == f'**Reviews directory:** {chosen}', prompt
+
+    @pytest.mark.asyncio
+    async def test_unroutable_task_id_degrades_only_the_reviews_line(self, tmp_path):
+        """A task id no task root can be named for costs the investigator its
+        reviews path, never the investigation."""
+        prompt = await _capture_investigation_prompt(tmp_path, _TaskDocScheduler(), task_id='4 2')
+
+        assert _reviews_directory_line(prompt).startswith(
+            "**Reviews directory:** (unavailable: invalid task id '4 2'"
+        ), prompt
 
     @pytest.mark.asyncio
     async def test_oversized_task_text_is_bounded_and_marked(self, tmp_path):

@@ -28,7 +28,8 @@ You have been invoked because a task transitioned to `blocked`. The caller has p
 - `reason` — the high-level block reason (e.g. "verify exhausted", "review failed", "merge conflict")
 - `detail` — additional context captured at the moment of blocking
 - `**Reviews directory:**` — the absolute path of the task's reviewer verdict files,
-  which live in task-scoped storage outside the worktree
+  which live in task-scoped storage outside the worktree; `(unavailable: <reason>)`
+  means no such path exists for this task, so skip the reviews scan
 - the blocked task's own record, rendered as `**Title:**`, `**Description:**` and
   `**Details:**` — each capped per field, with an oversized field clipped and marked
   `... [<field> truncated] ...` so you can see when you are reading a partial value

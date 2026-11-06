@@ -18127,6 +18127,9 @@ class TaskWorkflow:
                 usage_gate=self.usage_gate,
                 cost_store=self.cost_store,
                 block_class=block_class,
+                reviews_dir=(
+                    self.artifacts.artifact_path('reviews') if self.artifacts is not None else None
+                ),
             )
             _task = asyncio.create_task(
                 self._run_in_lane(self.worktree, investigate),

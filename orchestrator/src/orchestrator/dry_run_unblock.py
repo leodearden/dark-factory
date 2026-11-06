@@ -545,6 +545,27 @@ def _load_skill_system_prompt() -> str:
     return load_skill_system_prompt('unblock-auto')
 
 
+def _reviews_directory(worktree: str, task_id: str, reviews_dir: Path | None) -> str:
+    """The prompt's ``**Reviews directory:**`` value.
+
+    The caller's *reviews_dir* when given, since the dispatching workflow owns
+    which root its reviewers write to; else the task root's, the root every
+    non-eval dispatch uses. A task id no task root can be named for degrades
+    this one line to ``(unavailable: <reason>)`` rather than failing the
+    investigation.
+    """
+    if reviews_dir is not None:
+        return str(reviews_dir)
+    try:
+        return str(TaskArtifacts.for_task(Path(worktree), task_id).artifact_path('reviews'))
+    except ValueError as exc:
+        logger.warning(
+            'dry_run_unblock: no reviews directory for task %s — investigating '
+            'without it: %s', task_id, exc,
+        )
+        return f'(unavailable: {exc})'
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -562,6 +583,7 @@ async def run_dry_run_unblock(
     usage_gate: Any = None,
     cost_store: Any = None,
     block_class: BlockClass | None = None,
+    reviews_dir: Path | None = None,
 ) -> None:
     """Investigate a blocked task and write a proposal to metadata.
 
@@ -573,6 +595,9 @@ async def run_dry_run_unblock(
     explicitly (e.g. workflow._spawn_dry_run_unblock classifies `reason`
     up front); when omitted (None), it is derived via
     ``classify_block_reason(reason)`` as a defensive fallback.
+
+    *reviews_dir* is where this dispatch's reviewers wrote their verdicts;
+    when omitted it is the task root's (see ``_reviews_directory``).
     """
     import time
 
@@ -668,13 +693,12 @@ async def run_dry_run_unblock(
         config_dir = TaskConfigDir(f'{task_id}-unblock', base_dir=Path(worktree) / '.task')
 
         system_prompt = _load_skill_system_prompt()
-        reviews_dir = TaskArtifacts.for_task(Path(worktree), task_id).artifact_path('reviews')
         user_prompt = (
             f'Task ID: {task_id}\n'
             f'Worktree: {worktree}\n'
             f'Block reason: {reason}\n'
             f'Detail: {detail or "(none)"}\n'
-            f'**Reviews directory:** {reviews_dir}\n\n'
+            f'**Reviews directory:** {_reviews_directory(worktree, task_id, reviews_dir)}\n\n'
             f'{task_context.block}\n\n'
             'Investigate and emit your structured proposal.'
         )
