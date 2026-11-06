@@ -2376,20 +2376,16 @@ class TaskCurator:
         seen_ids: set[str] = set()
 
         # Stream 1: review-chain anchor
-        anchor_entry: PoolEntry | None = None
-        if candidate.spawned_from and self._taskmaster is not None:
+        anchor_row: dict | None = None
+        if candidate.spawned_from:
             try:
-                anchor_task = await self._taskmaster.get_task(
-                    candidate.spawned_from, project_root,
-                )
-                anchor_entry = _to_pool_entry(
-                    anchor_task, source='anchor', lock_depth=lock_depth,
-                )
-                if anchor_entry is not None:
-                    pool.append(anchor_entry)
-                    seen_ids.add(anchor_entry.task_id)
+                anchor_row = await self._anchor_row(candidate.spawned_from, project_root)
             except Exception as exc:
                 logger.debug('task_curator: anchor fetch failed: %s', exc)
+        anchor_entry = _to_pool_entry(anchor_row, source='anchor', lock_depth=lock_depth)
+        if anchor_entry is not None:
+            pool.append(anchor_entry)
+            seen_ids.add(anchor_entry.task_id)
 
         # Stream 2: the parent's other follow-ups, for an agent-followup candidate
         sibling_overflow_ids: list[str] = []
@@ -2409,40 +2405,18 @@ class TaskCurator:
         if not candidate_modules and anchor_entry is not None:
             candidate_modules = set(anchor_entry.module_keys)
 
-        all_tasks_flat: list[dict] = []
-        if self._taskmaster is not None and candidate_modules:
+        module_overflow_ids: list[str] = []
+        if candidate_modules:
             try:
-                tasks_result = await self._taskmaster.get_tasks(project_root)
-                all_tasks_flat = flatten_task_tree(tasks_result)
+                module_entries, module_overflow_ids = await self._module_stream(
+                    candidate_modules, project_root, lock_depth=lock_depth, exclude=seen_ids,
+                )
             except Exception as exc:
                 logger.debug('task_curator: get_tasks failed: %s', exc)
-
-        module_matches: list[PoolEntry] = []
-        for t in all_tasks_flat:
-            tid = str(t.get('id', ''))
-            if not tid or tid in seen_ids:
-                continue
-            status = str(t.get('status', 'unknown'))
-            if status == 'cancelled':
-                continue
-            task_modules = set(files_to_modules(_task_files(t), depth=lock_depth))
-            if not task_modules or not (task_modules & candidate_modules):
-                continue
-            entry = _to_pool_entry(t, source='module', lock_depth=lock_depth)
-            if entry is not None:
-                module_matches.append(entry)
-
-        module_matches.sort(key=_module_sort_key)
-        module_cap = self._config.curator.pool_module_cap
-        # The sort key is status+priority, NOT relevance, so the entries this
-        # cap discards are not the least-similar ones — a genuinely
-        # overlapping task can sit just past it. Which of them the POOL
-        # actually loses is not known yet: streams 4 and 5 can still admit
-        # one. Hold the ids and count the absent ones once, below.
-        module_overflow_ids = [e.task_id for e in module_matches[module_cap:]]
-        for entry in module_matches[:module_cap]:
-            pool.append(entry)
-            seen_ids.add(entry.task_id)
+                module_entries = []
+            for entry in module_entries:
+                pool.append(entry)
+                seen_ids.add(entry.task_id)
 
         # Stream 4: embedding neighbors
         embedding_matches: list[PoolEntry] = []
@@ -2493,7 +2467,8 @@ class TaskCurator:
                         for p in points[i + 1:]
                     ]
                     # And a hard ceiling in the other direction, unlike the
-                    # corpus-exhaustive module/dependency streams: this tail
+                    # module/dependency streams, which are exhaustive over the
+                    # open backlog: this tail
                     # can hold at most `overfetch - cap` ids because that is
                     # all qdrant was asked for. A full window means neighbours
                     # past it were never fetched, so the count is a FLOOR and
@@ -2509,34 +2484,19 @@ class TaskCurator:
             seen_ids.add(entry.task_id)
 
         # Stream 5: dependency neighbors of the anchor
-        dep_matches: list[PoolEntry] = []
-        if anchor_entry is not None and all_tasks_flat:
-            anchor_deps = _task_dependencies(
-                next(
-                    (t for t in all_tasks_flat if str(t.get('id', '')) == anchor_entry.task_id),
-                    {},
-                ),
-            )
-            dependents = [
-                str(t.get('id', '')) for t in all_tasks_flat
-                if anchor_entry.task_id in _task_dependencies(t)
-            ]
-            candidate_ids = set(anchor_deps) | set(dependents)
-            for t in all_tasks_flat:
-                tid = str(t.get('id', ''))
-                if tid not in candidate_ids or tid in seen_ids:
-                    continue
-                if str(t.get('status', '')) == 'cancelled':
-                    continue
-                entry = _to_pool_entry(t, source='dependency', lock_depth=lock_depth)
-                if entry is not None:
-                    dep_matches.append(entry)
-
-        dependency_cap = self._config.curator.pool_dependency_cap
-        dep_overflow_ids = [e.task_id for e in dep_matches[dependency_cap:]]
-        for entry in dep_matches[:dependency_cap]:
-            pool.append(entry)
-            seen_ids.add(entry.task_id)
+        dep_overflow_ids: list[str] = []
+        if anchor_row is not None and anchor_entry is not None:
+            try:
+                dep_entries, dep_overflow_ids = await self._dependency_stream(
+                    anchor_row, anchor_entry.task_id, project_root,
+                    lock_depth=lock_depth, exclude=seen_ids,
+                )
+            except Exception as exc:
+                logger.debug('task_curator: dependency neighbours failed: %s', exc)
+                dep_entries = []
+            for entry in dep_entries:
+                pool.append(entry)
+                seen_ids.add(entry.task_id)
 
         # Every stream has run, so seen_ids is now the complete admitted set
         # and a stream's overflow can be resolved into what the pool actually
@@ -2567,14 +2527,106 @@ class TaskCurator:
             },
             caps={
                 'sibling': self._config.curator.pool_sibling_cap,
-                'module': module_cap,
+                'module': self._config.curator.pool_module_cap,
                 'embedding': self._config.curator.pool_embedding_cap,
-                'dependency': dependency_cap,
+                'dependency': self._config.curator.pool_dependency_cap,
                 'total_cap': self._config.curator.pool_total_cap,
             },
             lower_bounds=('embedding',) if embedding_window_full else (),
         )
         return pool, pool_sizes, withheld
+
+    async def _anchor_row(self, spawned_from: str, project_root: str) -> dict | None:
+        """The review-chain anchor's task row, or ``None`` when no such task exists."""
+        if self._taskmaster is None:
+            return None
+        try:
+            return await self._taskmaster.get_task(spawned_from, project_root)
+        except TaskNotFoundError:
+            return None
+
+    async def _module_stream(
+        self,
+        candidate_modules: set[str],
+        project_root: str,
+        *,
+        lock_depth: int,
+        exclude: set[str],
+    ) -> tuple[list[PoolEntry], list[str]]:
+        """The open-backlog tasks sharing a module with the candidate, ranked and capped.
+
+        Returns ``(entries, overflow_ids)``: the admitted entries, and the
+        ranked ids that ``pool_module_cap`` kept out.
+        """
+        if self._taskmaster is None:
+            return [], []
+        tasks_result = await self._taskmaster.get_tasks(
+            project_root, statuses=list(_OPEN_BACKLOG_STATUSES),
+        )
+        matches: list[PoolEntry] = []
+        for t in flatten_task_tree(tasks_result):
+            tid = str(t.get('id', ''))
+            if not tid or tid in exclude:
+                continue
+            # The read already asked for the open backlog; a backend that
+            # ignored the filter must not widen the stream.
+            if str(t.get('status', '')) not in _OPEN_BACKLOG_STATUSES:
+                continue
+            task_modules = set(files_to_modules(_task_files(t), depth=lock_depth))
+            if not (task_modules & candidate_modules):
+                continue
+            entry = _to_pool_entry(t, source='module', lock_depth=lock_depth)
+            if entry is not None:
+                matches.append(entry)
+        matches.sort(key=_module_sort_key)
+        cap = self._config.curator.pool_module_cap
+        # The sort key is status+priority, NOT relevance, so the entries this
+        # cap discards are not the least-similar ones — a genuinely
+        # overlapping task can sit just past it. Which of them the POOL
+        # actually loses is not known yet: later streams can still admit one,
+        # so the caller counts the absent ones once every stream has run.
+        return matches[:cap], [e.task_id for e in matches[cap:]]
+
+    async def _dependency_stream(
+        self,
+        anchor_row: dict,
+        anchor_id: str,
+        project_root: str,
+        *,
+        lock_depth: int,
+        exclude: set[str],
+    ) -> tuple[list[PoolEntry], list[str]]:
+        """The anchor's open-backlog dependencies and dependents, in id order and capped.
+
+        Only the admitted ids are read in full, so the stream costs at most
+        ``pool_dependency_cap`` row reads. Returns ``(entries, overflow_ids)``.
+        """
+        taskmaster = self._taskmaster
+        if taskmaster is None:
+            return [], []
+        edges = await taskmaster.get_dependency_edges(project_root)
+        neighbours = (
+            set(_task_dependencies(anchor_row)) | _dependents_of(anchor_id, edges)
+        ) - exclude - {anchor_id}
+        if not neighbours:
+            return [], []
+        statuses = await taskmaster.get_statuses_raw(project_root, ids=sorted(neighbours))
+        open_ids = sorted(
+            (tid for tid, status in statuses.items()
+             if tid in neighbours and status in _OPEN_BACKLOG_STATUSES),
+            key=int,
+        )
+        cap = self._config.curator.pool_dependency_cap
+        entries: list[PoolEntry] = []
+        for tid in open_ids[:cap]:
+            try:
+                task = await taskmaster.get_task(tid, project_root)
+            except TaskNotFoundError:
+                continue
+            entry = _to_pool_entry(task, source='dependency', lock_depth=lock_depth)
+            if entry is not None:
+                entries.append(entry)
+        return entries, open_ids[cap:]
 
     async def _sibling_stream(
         self,
@@ -3210,6 +3262,19 @@ def _task_files(task: dict) -> list[str]:
     if isinstance(files, str):
         return [files]
     return [str(f) for f in files if f]
+
+
+# The module and dependency streams pool the open backlog only: a done task
+# reaches the pool through the similarity-ordered embedding stream.
+_OPEN_BACKLOG_STATUSES: tuple[str, ...] = tuple(sorted(status.value for status in ACTIVE))
+
+
+def _dependents_of(anchor_id: str, edges: Mapping[int, Sequence[int]]) -> set[str]:
+    """The ids of the tasks whose dependency list in *edges* names *anchor_id*."""
+    if not anchor_id.isdecimal():
+        return set()
+    anchor = int(anchor_id)
+    return {str(tid) for tid, deps in edges.items() if anchor in deps}
 
 
 _SIBLING_STREAM_SPAWN_CONTEXT = 'agent_followup'

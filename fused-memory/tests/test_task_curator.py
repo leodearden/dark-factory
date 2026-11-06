@@ -3321,9 +3321,25 @@ class _CorpusHarness:
         async def get_task(tid, project_root=None, **kw):
             return by_id.get(str(tid))
 
+        async def get_tasks(project_root=None, tag=None, statuses=None, **kw):
+            return {'tasks': [t for t in tasks if statuses is None or t['status'] in statuses]}
+
+        async def get_dependency_edges(project_root=None, tag=None):
+            return {
+                int(t['id']): sorted(int(dep) for dep in t['dependencies'])
+                for t in tasks if t.get('dependencies')
+            }
+
+        async def get_statuses_raw(project_root=None, tag=None, ids=None):
+            return {
+                t['id']: t['status'] for t in tasks if ids is None or t['id'] in ids
+            }
+
         tm = AsyncMock()
         tm.get_task = AsyncMock(side_effect=get_task)
-        tm.get_tasks = AsyncMock(return_value={'tasks': tasks})
+        tm.get_tasks = AsyncMock(side_effect=get_tasks)
+        tm.get_dependency_edges = AsyncMock(side_effect=get_dependency_edges)
+        tm.get_statuses_raw = AsyncMock(side_effect=get_statuses_raw)
         return tm
 
     def _neighbor_ids(self, n: int) -> list[str]:
@@ -3455,7 +3471,7 @@ class TestBuildCorpusWithheldCensus(_CorpusHarness):
         ``overfetch = pool_embedding_cap + 20`` bounds how many neighbours are
         ever fetched, so its unvisited tail is at most 20 however many
         near-duplicates the corpus actually holds. Unlike ``module`` and
-        ``dependency`` — both corpus-exhaustive — this count is a FLOOR when
+        ``dependency`` — both exhaustive over the open backlog — this count is a FLOOR when
         the window filled, and the prompt has to say so: it is the one stream
         ordered by actual similarity, so its withheld entries are the likeliest
         duplicates of all.

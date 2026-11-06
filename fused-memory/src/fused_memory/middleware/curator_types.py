@@ -322,9 +322,12 @@ class PoolWithheld:
     carries the configured limits that produced those counts, so a reader can
     tell a pool one entry over its cap from one that lost forty.
 
-    The ``module``, ``sibling`` and ``dependency`` counts are
-    corpus-exhaustive — module and dependency scan every task, and sibling
-    counts come from an exact store lookup. The ``embedding`` count is NOT: it is taken over
+    The ``module`` and ``dependency`` counts cover the OPEN BACKLOG
+    (``shared.task_statuses.ACTIVE``): module over every open task,
+    dependency over the anchor's open neighbours. A done task reaches the
+    pool only through the similarity-ordered embedding stream. The
+    ``sibling`` count comes from an exact store lookup over every
+    non-cancelled status. The ``embedding`` count is NOT exhaustive: it is taken over
     a fixed qdrant retrieval window (``pool_embedding_cap + 20`` points), so
     at most 20 neighbours can ever be reported however many near-duplicates
     the corpus holds. A stream whose count is ceilinged that way is named in
