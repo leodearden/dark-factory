@@ -817,8 +817,8 @@ class MemoryConsolidator(BaseStage):
         The state update sits outside the escalation-queue gate so the streak is
         already real when a queue is wired; only the filing needs the queue.
         Both callees are best-effort and never raise.  The updater's per-cycle
-        cutoff is the N the flag chain hands the per-cycle escape, so a cycle
-        that escape reported is never counted a second time.
+        cutoff is the N that _escalate_suppression_storm hands the per-cycle
+        escape, so a cycle that escape reported is never counted a second time.
         """
         updates = await update_suppression_streaks(
             memory_service=self.memory,
@@ -858,11 +858,11 @@ class MemoryConsolidator(BaseStage):
         Parses each record's raw timestamp exactly once via ``parse_instant``
         and compares it against *watermark* normalized to UTC exactly once per
         call (hoisted out of the loop as ``wm_utc``) — the same two steps
-        ``is_newer_than_watermark`` (task 4574) performs per call, inlined
-        here so a record's timestamp is never parsed twice and the watermark
-        is never re-normalized per record. ``is_newer_than_watermark`` stays
-        the public, independently unit-tested predicate for external callers;
-        this method does not call it.
+        ``stage1_payload_format.py::is_newer_than_watermark`` (task 4574)
+        performs per call, inlined here so a record's timestamp is never
+        parsed twice and the watermark is never re-normalized per record.
+        This method does not call that predicate: it needs the parsed instant
+        itself to tell an undatable record from an older one.
 
         ALSO classifies and counts the "undatable" case here at the call
         site: a record whose timestamp is missing, empty, or unparseable. An
@@ -951,7 +951,7 @@ class MemoryConsolidator(BaseStage):
             self._fetch_degraded_sources.append('episodes')
         new_episodes = episodes
         if watermark.last_episode_timestamp:
-            # WHY is_newer_than_watermark and not `str(watermark...) > str(...)`:
+            # WHY an instant comparison and not `str(watermark...) > str(...)`:
             # str(datetime) renders with a space separator
             # ('2026-08-20 12:00:00+00:00'), while e['created_at'] here comes
             # from services/memory_service.py::_created_at_to_utc_iso as
