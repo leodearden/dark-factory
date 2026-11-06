@@ -4,10 +4,11 @@
 :func:`run_stage1_flag_chain` after every flag-emitting step has appended its
 flags. The chain runs, in order: the resolving filters in
 :data:`RESOLVING_FILTERS_BEFORE_SUPPRESSION`; Hook A, the
-entity-standing-decision suppression, with its per-cycle storm escape;
-``dedup_flags``, which annotates each flag against its ``stage1_flag_marker``
-row; the resolving filters in :data:`RESOLVING_FILTERS_AFTER_DEDUP`; marker
-acknowledgment; and gate-owned ``suggested_action`` normalization.
+entity-standing-decision suppression, then the per-cycle storm escape the
+caller supplies; ``dedup_flags``, which annotates each flag against its
+``stage1_flag_marker`` row; the resolving filters in
+:data:`RESOLVING_FILTERS_AFTER_DEDUP`; marker acknowledgment; and gate-owned
+``suggested_action`` normalization.
 
 The acknowledgment rule. When a resolving filter drops a flag, the action the
 flag requested is moot, so its persisted marker is acknowledged. Suppression is
@@ -54,23 +55,16 @@ from fused_memory.reconciliation.gate_owned_finding_phrasing import (
     extract_human_gated_task_ids,
     normalize_gate_owned_suggested_actions,
 )
-from fused_memory.reconciliation.standing_decision_constants import (
-    SUPPRESSION_STORM_THRESHOLD_PER_CYCLE,
-)
-from fused_memory.reconciliation.standing_decision_storm_escape import (
-    maybe_escalate_suppression_storm,
-)
 from fused_memory.reconciliation.sweep_deletion_guard import (
     filter_benign_sweep_deletion_flags,
 )
 
 if TYPE_CHECKING:
-    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
-
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
     from fused_memory.services.memory_service import MemoryService
 
 Flag = dict[str, Any]
+SuppressionStormEscape = Callable[[EntityStandingSuppressionResult], Awaitable[None]]
 
 
 @dataclass(frozen=True)
@@ -79,7 +73,7 @@ class FlagChainContext:
 
     memory_service: MemoryService
     taskmaster: TaskBackendProtocol | None
-    escalation_queue: EscalationQueue | None
+    escalate_suppression_storm: SuppressionStormEscape
     project_id: str
     project_root: str
     known_projects: dict[str, str]
@@ -226,18 +220,11 @@ async def run_stage1_flag_chain(flags: list[Flag], ctx: FlagChainContext) -> Fla
 async def _suppress_by_standing_decisions(
     flags: list[Flag], ctx: FlagChainContext,
 ) -> EntityStandingSuppressionResult:
-    """Hook A, then its per-cycle storm escape when an escalation queue is wired."""
+    """Hook A, then the caller's per-cycle storm escape over its result."""
     result = await filter_entity_standing_decisions(
         memory_service=ctx.memory_service, project_id=ctx.project_id, flags=flags,
     )
-    if ctx.escalation_queue is not None:
-        await maybe_escalate_suppression_storm(
-            escalation_queue=ctx.escalation_queue,
-            project_id=ctx.project_id,
-            run_id=ctx.run_id,
-            result=result,
-            threshold=SUPPRESSION_STORM_THRESHOLD_PER_CYCLE,
-        )
+    await ctx.escalate_suppression_storm(result)
     return result
 
 

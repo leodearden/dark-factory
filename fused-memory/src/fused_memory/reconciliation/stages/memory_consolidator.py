@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 from collections.abc import Awaitable, Callable, Mapping
@@ -92,6 +93,7 @@ from fused_memory.reconciliation.standing_decision_constants import (
     SUPPRESSION_STORM_THRESHOLD_PER_CYCLE,
 )
 from fused_memory.reconciliation.standing_decision_storm_escape import (
+    maybe_escalate_suppression_storm,
     maybe_escalate_suppression_streak,
     update_suppression_streaks,
 )
@@ -590,13 +592,29 @@ class MemoryConsolidator(BaseStage):
         return FlagChainContext(
             memory_service=self.memory,
             taskmaster=self.taskmaster,
-            escalation_queue=self._escalation_queue,
+            escalate_suppression_storm=functools.partial(
+                self._escalate_suppression_storm, run_id=run_id,
+            ),
             project_id=self.project_id,
             project_root=self.project_root,
             known_projects=self.known_projects,
             run_id=run_id,
             events=events,
             active_tasks=self._active_tasks(),
+        )
+
+    async def _escalate_suppression_storm(
+        self, result: EntityStandingSuppressionResult, run_id: str,
+    ) -> None:
+        """Hook A's per-cycle storm escape, handed to the flag chain."""
+        if self._escalation_queue is None:
+            return
+        await maybe_escalate_suppression_storm(
+            escalation_queue=self._escalation_queue,
+            project_id=self.project_id,
+            run_id=run_id,
+            result=result,
+            threshold=SUPPRESSION_STORM_THRESHOLD_PER_CYCLE,
         )
 
     def _active_tasks(self) -> list[dict] | None:
