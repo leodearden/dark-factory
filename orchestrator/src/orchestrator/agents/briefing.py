@@ -836,8 +836,7 @@ triage it.
 
 # Plan Schema Repair
 
-The plan for this task is on disk at `.task/plan.json` (a symlink into the
-durable `<worktree_base>/.task-meta/<worktree-name>/plan.json`), but it has no
+The plan for this task is on disk at `.task/plan.json`, but it has no
 non-empty top-level `steps` array, so it cannot advance. It is NOT reproduced
 here — read the file in full.
 
@@ -885,9 +884,8 @@ The implementation was reviewed and blocking issues were found.
 
 ## Action
 
-1. Read `.task/plan.json` (a symlink into the durable
-   `<worktree_base>/.task-meta/<worktree-name>/plan.json`) for the current plan
-   and each step's status — it is not reproduced here.
+1. Read `.task/plan.json` for the current plan and each step's status — it
+   is not reproduced here.
 2. Add the steps that address the blocking issues with
    `add_plan_step(step_id, step_type, description)`, using step ids not
    already in the plan. New steps are recorded as pending.
@@ -1062,14 +1060,9 @@ Before writing any new code, walk the pending steps in plan order:
 {wip_section}
 # Session Startup Protocol
 
-1. Read `.task/plan.json` to see the full plan with current status — it is a
-   symlink into the durable
-   `<worktree_base>/.task-meta/<worktree-name>/plan.json` (the
-   worktree-lane-lifecycle W11 relocation keeps plan/iteration state outside
-   the worktree for pooled lanes, and the symlink survives worktree resets),
-   so reading either path resolves to the same plan.
-2. Read `<worktree_base>/.task-meta/<worktree-name>/iterations.jsonl` (NOT
-   symlinked into the lane) to see prior iteration details.
+1. Read `.task/plan.json` to see the full plan with current status.
+2. Read `.task/iterations.jsonl` to see prior iteration details (absent until
+   the first iteration is logged).
 3. Run `git log --oneline -10` to see recent commits.
 4. Identify the next pending step (prerequisites first, then steps).
 5. **Mandatory pre-flight — before writing any code for that step:** run
@@ -1175,9 +1168,7 @@ This task holds locks for the following modules:
    collide with another task's concurrent edits. Where the entries above are
    themselves single files, a new file is necessarily outside that list —
    that is expected, and not something to escalate.
-2. Do NOT modify the plan — it is durable at
-   `<worktree_base>/.task-meta/<worktree-name>/plan.json` (the lane
-   `.task/plan.json` is a symlink into it) and frozen for this pass.
+2. Do NOT modify the plan (`.task/plan.json`) — it is frozen for this pass.
 3. If a suggestion requires EDITING an existing file not covered above,
    skip it and note the reason in your commit message — it will be
    re-surfaced by the next review cycle or escalated as a follow-up task.
@@ -1190,11 +1181,8 @@ This task holds locks for the following modules:
 
 # Action
 
-1. Read `.task/plan.json` (a symlink into the durable
-   `<worktree_base>/.task-meta/<worktree-name>/plan.json`, which survives
-   worktree resets) and
-   `<worktree_base>/.task-meta/<worktree-name>/iterations.jsonl` (NOT
-   symlinked into the lane) to refresh context on what was already done.
+1. Read `.task/plan.json` and `.task/iterations.jsonl` to refresh context on
+   what was already done.
 2. Run `git log --oneline -10` to see recent commits.
 3. Apply each in-scope suggestion above. Commit amendments with `amend:`
    prefixes, grouping related fixes when sensible.
@@ -1442,11 +1430,9 @@ This task was paused because an agent escalated a blocking issue.
 ## Action
 Resume the task applying the resolution(s) that answer this round's
 escalation(s), each attributed to its escalation id. The prior agent's work
-is preserved in the worktree. Read `.task/plan.json` (a symlink into the
-durable `<worktree_base>/.task-meta/<worktree-name>/plan.json`, which survives
-worktree resets) and `<worktree_base>/.task-meta/<worktree-name>/iterations.jsonl`
-(NOT symlinked into the lane) to understand current progress, then continue
-from where the previous agent left off.
+is preserved in the worktree. Read `.task/plan.json` and
+`.task/iterations.jsonl` to understand current progress, then continue from
+where the previous agent left off.
 """
 
     async def build_steward_initial_prompt(
