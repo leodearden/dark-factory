@@ -151,7 +151,7 @@ class TestRecordAuditOutcome:
         assert returned is not None and returned.audit_outcome == expected
         reread = _only(tmp_path)
         assert reread.audit_outcome == expected
-        assert reread.audit_outcome.policy_class == _CLASS
+        assert reread.audit_outcome is not None and reread.audit_outcome.policy_class == _CLASS
         assert reread.to_dict()['audit_outcome'] == {
             'verdict': 'wrong', 'note': 'note', 'audited_at': _AUDITED_AT, 'policy_class': _CLASS,
         }
