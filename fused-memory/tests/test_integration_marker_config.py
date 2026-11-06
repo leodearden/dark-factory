@@ -100,7 +100,7 @@ def _collect(probe_dir: Path, *extra_args: str) -> str:
     The probe file lives under fused-memory/tests/, so pytest also loads
     fused-memory/tests/conftest.py to collect it -- the same GraphitiBackend
     / config-schema imports that earned the real-module test below a 90s
-    subprocess timeout over the file's default 60s test budget.
+    subprocess timeout.
     """
     test_file = probe_dir / 'test_probe.py'
     test_file.write_text(_PROBE_SRC)

@@ -81,10 +81,7 @@ pytestmark = [
     # 10s barrier budgets -- live_vector_graph's build-side barrier (task 3377)
     # plus the post-drop barrier added by task 4748 -- so 15 would make that
     # pathological worst case (10s + 10s) a CERTAIN timeout instead of a rare
-    # flake. fused-memory/pyproject.toml sets timeout_method='thread', whose
-    # handler ends in os._exit(1) and kills the whole xdist worker, which is why
-    # this headroom is not optional. 30 stays well under the pyproject default
-    # of 60. Expected real cost of the added barrier is ~0.2ms on this module's
+    # flake. Expected real cost of the added barrier is ~0.2ms on this module's
     # 1-node fixture graph (one CALL db.indexes() round-trip) -- this is
     # headroom, not spend.
     pytest.mark.timeout(30),
@@ -370,11 +367,10 @@ _OBSERVE_ATTEMPTS = 5
 #: Bounding the retry in attempts ALONE is not enough, because the attempt
 #: count multiplies the barrier budgets: 5 attempts x 4 re-opens x 2 barriers
 #: is 240s of budget that a slow-but-SUCCEEDING barrier can walk through
-#: without any of them ever raising. pytest-timeout runs with
-#: timeout_method='thread' here, whose handler ends in os._exit(1) and kills
-#: the whole xdist worker, so "walks past the class mark" is not a test
-#: failure -- it takes unrelated tests down with it. A wall-clock bound is
-#: what makes the class mark below checkable arithmetic instead of a guess.
+#: without any of them ever raising, until it walks past the class mark and
+#: the test reds on a timeout rather than on any barrier's diagnosis. A
+#: wall-clock bound is what makes the class mark below checkable arithmetic
+#: instead of a guess.
 #:
 #: 100s against a measured retry-phase cost of median 0.10s / max 8.20s, i.e.
 #: >12x the worst observed. It binds only when barriers are running tens of
@@ -645,14 +641,14 @@ class TestReopenRebuildWindowBudget:
 # live_vector_graph and is fast).
 #
 # FAILURE MODE, which is why the number must be derived and not eyeballed.
-# fused-memory/pyproject.toml sets timeout_method='thread', whose handler ends
-# in os._exit(1) -- that kills the whole xdist worker rather than failing one
-# test, taking unrelated tests with it. And pytest-timeout runs here with
-# func_only=False (see the module pytestmark above), so FIXTURE SETUP counts
-# against the mark too. So the mark must sit above the arithmetic worst case
-# of every budget this class can spend, INCLUDING barriers that merely run
-# long while still succeeding -- a 25s barrier inside a 30s budget never
-# raises the clean AssertionError, it just walks the clock.
+# fused-memory/pyproject.toml sets timeout_method='signal', so a breach fails
+# this test red even though every barrier would have succeeded. And
+# pytest-timeout runs here with func_only=False (see the module pytestmark
+# above), so FIXTURE SETUP counts against the mark too. So the mark must sit
+# above the arithmetic worst case of every budget this class can spend,
+# INCLUDING barriers that merely run long while still succeeding -- a 25s
+# barrier inside a 30s budget never raises the clean AssertionError, it just
+# walks the clock.
 #
 # THE ARITHMETIC, worst case, all constants defined above the bulk fixture:
 #
@@ -756,11 +752,9 @@ class TestDropRebuildWindow:
     measured 10-17x contention multiplier on the 10,000-node build (1.3s
     serial vs 2.87-24.45s under 16-way FalkorDB contention). At 50,000 that
     projects well past any sane barrier budget or pytest timeout, trading a
-    ~7% observation flake for a barrier-timeout flake plus the
-    ``os._exit(1)`` xdist-worker kill that ``timeout_method='thread'`` ends
-    in. Retrying at 10,000 keeps the happy path at ~1.4s and pays only on a
-    miss. 1,000 nodes is likewise rejected: 12/15 (80%) even WITH a
-    5ms-interval/5s-deadline poll.
+    ~7% observation flake for a barrier-timeout flake. Retrying at 10,000
+    keeps the happy path at ~1.4s and pays only on a miss. 1,000 nodes is
+    likewise rejected: 12/15 (80%) even WITH a 5ms-interval/5s-deadline poll.
 
     VALIDATION of the task-4972 fix, all on this branch, FalkorDB module
     v41800, 32 cores:
