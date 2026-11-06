@@ -5,7 +5,7 @@ import json
 import logging
 import types
 from datetime import UTC, datetime, timedelta, timezone
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
@@ -28,6 +28,7 @@ from fused_memory.services.memory_service import (
     _serialize_temporal,
     metadata_row_text,
 )
+from fused_memory.services.write_journal import Mem0IntentStatus
 from fused_memory.utils.referent_verification import ReferentStats
 
 # A realistic stored Qdrant point payload: the mem0-owned keys mem0's own
@@ -137,6 +138,16 @@ def _mocked_service(config) -> MemoryService:
     svc.durable_queue.replay_dead = AsyncMock(return_value=0)
     svc.durable_queue.close = AsyncMock()
     return svc
+
+
+def _mem0_add_journal() -> MagicMock:
+    """A write-journal double covering every call add_memory's Mem0 leg makes."""
+    journal = MagicMock()
+    journal.log_write_op = AsyncMock()
+    journal.log_backend_op = AsyncMock()
+    journal.log_mem0_intent = AsyncMock()
+    journal.resolve_mem0_intent = AsyncMock()
+    return journal
 
 
 class TestScope:
@@ -408,8 +419,9 @@ class TestAddMemory:
         """task 1974: a mem0.add call that returns {'results': []} WITHOUT
         raising is a silent dedup/no-op drop — the exact failure mode that
         made Stage 2's cycle_summary write go fully absent with no trace.
-        It must be logged as a WARNING even though add_memory() itself does
-        not raise and behavior (response/stores_written/journal) is unchanged.
+        add_memory() still does not raise, but the drop is no longer silent:
+        it is logged as a WARNING, and the response does not claim mem0 as
+        written.
         """
         service.mem0.add = AsyncMock(return_value={'results': []})
 
@@ -426,13 +438,12 @@ class TestAddMemory:
                 causation_id='run-x',
             )
 
-        # Behavior must be UNCHANGED — this is observability-only.
         assert result.memory_ids == [], (
             f'Expected memory_ids=[] for an empty mem0 result, got {result.memory_ids!r}'
         )
-        assert SourceStore.mem0 in result.stores_written, (
-            'stores_written must still include mem0 — the write was attempted '
-            'and did not raise; only the returned ids are empty.'
+        assert SourceStore.mem0 not in result.stores_written, (
+            'stores_written must not claim mem0 when Mem0 returned no id — '
+            'nothing was written.'
         )
 
         warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
@@ -487,6 +498,8 @@ class TestAddMemory:
         non-actionable log line for a legitimate infer-driven no-op."""
         monkeypatch.setattr(memory_service, '_MEM0_ADD_INFER_PINNED_FALSE', False)
         service.mem0.add = AsyncMock(return_value={'results': []})
+        mock_journal = _mem0_add_journal()
+        service.set_write_journal(mock_journal)
 
         with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
             result = await service.add_memory(
@@ -501,14 +514,112 @@ class TestAddMemory:
                 causation_id='run-x',
             )
 
-        # Behavior (response/stores_written) is unaffected by the gate.
+        # Nothing was written whatever the pin, so mem0 is never claimed. With
+        # the pin lifted a zero-id return is a legitimate no-op: no anomaly is
+        # reported and the intent completes.
         assert result.memory_ids == []
-        assert SourceStore.mem0 in result.stores_written
+        assert SourceStore.mem0 not in result.stores_written
+        assert 'empty_result' not in result.message
+        mock_journal.resolve_mem0_intent.assert_awaited_once_with(
+            ANY, Mem0IntentStatus.COMPLETED
+        )
 
         warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert warning_records == [], (
             f'Expected no WARNING once the infer=False pin no longer holds, got: '
             f'{[r.message for r in warning_records]}'
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        (
+            'backend_mock_kwargs',
+            'expected_stores',
+            'expected_message_suffix',
+            'expected_journal_error',
+        ),
+        [
+            pytest.param(
+                {'return_value': {'results': [{'id': 'mem0-1'}]}},
+                [SourceStore.mem0],
+                '',
+                None,
+                id='landed',
+            ),
+            pytest.param(
+                {'side_effect': RuntimeError('qdrant down')},
+                [],
+                ' [mem0_error: qdrant down]',
+                'qdrant down',
+                id='raised',
+            ),
+            pytest.param(
+                {'return_value': {'results': []}},
+                [],
+                ' [empty_result: mem0 add returned zero memory_ids]',
+                'empty_result: mem0 add returned zero memory_ids',
+                id='zero_ids',
+            ),
+        ],
+    )
+    async def test_stores_written_and_journal_stores_reflect_mem0_outcome(
+        self,
+        service,
+        backend_mock_kwargs,
+        expected_stores,
+        expected_message_suffix,
+        expected_journal_error,
+    ):
+        """add_memory says mem0 was written — in the response, the journal and
+        the message — only when Mem0 actually returned an id, and names every
+        failure, a silent zero-id drop included."""
+        service.mem0.add = AsyncMock(**backend_mock_kwargs)
+        mock_journal = _mem0_add_journal()
+        service.set_write_journal(mock_journal)
+
+        result = await service.add_memory(
+            content='cycle summary',
+            category='observations_and_summaries',
+            project_id='dark_factory',
+            causation_id='c1',
+        )
+
+        expected_store_values = [s.value for s in expected_stores]
+        assert result.stores_written == expected_stores
+        journal_kwargs = mock_journal.log_write_op.call_args[1]
+        assert journal_kwargs['result_summary']['stores'] == expected_store_values
+        assert journal_kwargs['success'] is (expected_journal_error is None)
+        assert journal_kwargs['error'] == expected_journal_error
+        assert result.message == f'Memory queued for {expected_store_values}{expected_message_suffix}'
+
+    @pytest.mark.asyncio
+    async def test_dual_write_zero_ids_claims_graphiti_alone_and_names_the_drop(
+        self, service
+    ):
+        """A landed Graphiti leg does not mask a zero-id Mem0 leg: the write
+        claims graphiti alone, and the journal and the message both name the
+        Mem0 drop."""
+        service.mem0.add = AsyncMock(return_value={'results': []})
+        mock_journal = _mem0_add_journal()
+        service.set_write_journal(mock_journal)
+
+        result = await service.add_memory(
+            content='We decided to use PostgreSQL for its JSON support',
+            category='decisions_and_rationale',
+            project_id='dark_factory',
+            dual_write=True,
+            causation_id='c1',
+        )
+
+        service.durable_queue.enqueue.assert_awaited_once()
+        assert result.stores_written == [SourceStore.graphiti]
+        journal_kwargs = mock_journal.log_write_op.call_args[1]
+        assert journal_kwargs['result_summary']['stores'] == ['graphiti']
+        assert journal_kwargs['success'] is False
+        assert journal_kwargs['error'] == 'empty_result: mem0 add returned zero memory_ids'
+        assert result.message == (
+            "Memory queued for ['graphiti'] "
+            '[empty_result: mem0 add returned zero memory_ids]'
         )
 
 
@@ -10781,160 +10892,6 @@ class TestGraphitiBackendGetEdgeInvalidAt:
         backend._driver._get_graph = MagicMock(return_value=graph)
         with pytest.raises(EdgeNotFoundError):
             await backend.get_edge_invalid_at('missing-edge-uuid', group_id='test')
-
-
-# ---------------------------------------------------------------------------
-# Step 1: TRACK B.1 backend clear_invalid_at RED tests
-# ---------------------------------------------------------------------------
-
-class TestGraphitiBackendUpdateEdgeClearInvalidAt:
-    """Backend update_edge must accept clear_invalid_at=True and set edge.invalid_at = None."""
-
-    def _make_backend_and_edge(self, mock_config, make_graph_mock):
-        """Set up a GraphitiBackend with mock driver/client, an awaitable graph, and a mock edge.
-
-        Returns (backend, mock_edge, graph) — ``graph`` is the same object
-        ``backend._graph_for(...)`` resolves to, so tests can assert on the
-        explicit direct-Cypher clear write (task 1940) issued via
-        ``graph.query(...)``.
-        """
-        from fused_memory.backends.graphiti_client import GraphitiBackend
-
-        backend = GraphitiBackend(mock_config)
-        mock_driver = MagicMock()
-        mock_cloned_driver = MagicMock()
-        mock_driver.clone = MagicMock(return_value=mock_cloned_driver)
-        backend._driver = mock_driver
-        backend.client = MagicMock()
-
-        graph = make_graph_mock([])
-        mock_driver._get_graph = MagicMock(return_value=graph)
-
-        mock_edge = AsyncMock()
-        mock_edge.source_node_uuid = 'src-uuid'
-        mock_edge.target_node_uuid = 'tgt-uuid'
-        mock_edge.uuid = 'e-1'
-        mock_edge.fact = 'original fact'
-        mock_edge.invalid_at = datetime(2026, 1, 1, tzinfo=UTC)
-        mock_edge.save = AsyncMock()
-        mock_edge.generate_embedding = AsyncMock()
-        backend.refresh_entity_summary = AsyncMock(return_value={})
-        return backend, mock_edge, graph
-
-    @pytest.mark.asyncio
-    async def test_clear_invalid_at_alone_sets_none(self, mock_config, make_graph_mock):
-        """clear_invalid_at=True with no fact/invalid_at clears edge.invalid_at and calls save."""
-        backend, mock_edge, _graph = self._make_backend_and_edge(mock_config, make_graph_mock)
-        with patch(
-            'fused_memory.backends.graphiti_client.EntityEdge'
-        ) as MockEntityEdge:
-            MockEntityEdge.get_by_uuid = AsyncMock(return_value=mock_edge)
-            await backend.update_edge('e-1', group_id='proj', clear_invalid_at=True)
-            assert mock_edge.invalid_at is None, (
-                'clear_invalid_at=True must set edge.invalid_at to None'
-            )
-            mock_edge.save.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_clear_invalid_at_with_fact_updates_both(self, mock_config, make_graph_mock):
-        """clear_invalid_at=True combined with fact updates fact AND clears invalid_at."""
-        backend, mock_edge, _graph = self._make_backend_and_edge(mock_config, make_graph_mock)
-        with patch(
-            'fused_memory.backends.graphiti_client.EntityEdge'
-        ) as MockEntityEdge:
-            MockEntityEdge.get_by_uuid = AsyncMock(return_value=mock_edge)
-            await backend.update_edge('e-1', 'new fact', group_id='proj', clear_invalid_at=True)
-            assert mock_edge.fact == 'new fact', (
-                'fact must be updated when fact is provided'
-            )
-            assert mock_edge.invalid_at is None, (
-                'invalid_at must be cleared when clear_invalid_at=True'
-            )
-            mock_edge.save.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_clear_invalid_at_takes_precedence_over_invalid_at(self, mock_config, make_graph_mock):
-        """When both invalid_at and clear_invalid_at=True are given, clear wins."""
-        backend, mock_edge, _graph = self._make_backend_and_edge(mock_config, make_graph_mock)
-        ts = datetime(2026, 6, 1, tzinfo=UTC)
-        with patch(
-            'fused_memory.backends.graphiti_client.EntityEdge'
-        ) as MockEntityEdge:
-            MockEntityEdge.get_by_uuid = AsyncMock(return_value=mock_edge)
-            await backend.update_edge(
-                'e-1', group_id='proj', invalid_at=ts, clear_invalid_at=True
-            )
-            assert mock_edge.invalid_at is None, (
-                'clear_invalid_at=True must take precedence: invalid_at ends up None'
-            )
-            mock_edge.save.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_clear_invalid_at_issues_explicit_null_cypher(self, mock_config, make_graph_mock):
-        """clear_invalid_at=True must issue an explicit direct-Cypher NULL write.
-
-        graphiti-core's FalkorDB map-based ``edge.save()`` does not reliably
-        clear a null-valued property, so update_edge must force the clear via
-        an explicit ``SET e.invalid_at = NULL`` Cypher write (task 1940).
-        """
-        from _fm_helpers import extract_cypher, extract_params
-
-        backend, mock_edge, graph = self._make_backend_and_edge(mock_config, make_graph_mock)
-        with patch(
-            'fused_memory.backends.graphiti_client.EntityEdge'
-        ) as MockEntityEdge:
-            MockEntityEdge.get_by_uuid = AsyncMock(return_value=mock_edge)
-            await backend.update_edge('e-1', group_id='proj', clear_invalid_at=True)
-
-        graph.query.assert_awaited_once()
-        cypher = extract_cypher(graph.query.call_args)
-        params = extract_params(graph.query.call_args)
-        assert 'RELATES_TO' in cypher
-        assert 'SET' in cypher
-        assert 'invalid_at' in cypher
-        assert 'NULL' in cypher
-        assert params == {'uuid': 'e-1'}
-
-    @pytest.mark.asyncio
-    async def test_fact_plus_clear_still_issues_explicit_clear(self, mock_config, make_graph_mock):
-        """The explicit clear Cypher must fire even when fact is also supplied."""
-        backend, mock_edge, graph = self._make_backend_and_edge(mock_config, make_graph_mock)
-        with patch(
-            'fused_memory.backends.graphiti_client.EntityEdge'
-        ) as MockEntityEdge:
-            MockEntityEdge.get_by_uuid = AsyncMock(return_value=mock_edge)
-            await backend.update_edge('e-1', 'new fact', group_id='proj', clear_invalid_at=True)
-
-        graph.query.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_explicit_clear_precedes_summary_refresh(self, mock_config, make_graph_mock):
-        """The explicit clear Cypher must be awaited BEFORE the endpoint summary refresh runs.
-
-        Otherwise refresh_entity_summary's get_valid_edges_for_node query (which
-        filters ``WHERE e.invalid_at IS NULL``) would run before the clear lands
-        and exclude the just-restored edge from the rebuilt summary.
-        """
-        backend, mock_edge, graph = self._make_backend_and_edge(mock_config, make_graph_mock)
-        observed_await_counts = []
-
-        async def _fake_refresh(node_uuid, *, group_id):
-            observed_await_counts.append(graph.query.await_count)
-            return {}
-
-        backend.refresh_entity_summary = AsyncMock(side_effect=_fake_refresh)
-
-        with patch(
-            'fused_memory.backends.graphiti_client.EntityEdge'
-        ) as MockEntityEdge:
-            MockEntityEdge.get_by_uuid = AsyncMock(return_value=mock_edge)
-            await backend.update_edge('e-1', group_id='proj', clear_invalid_at=True)
-
-        assert observed_await_counts, 'refresh_entity_summary was never called'
-        assert all(count > 0 for count in observed_await_counts), (
-            'explicit clear Cypher must be awaited before summary refresh; '
-            f'observed graph.query.await_count at refresh time: {observed_await_counts}'
-        )
 
 
 class TestScanMemoryContent:

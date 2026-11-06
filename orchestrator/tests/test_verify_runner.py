@@ -5,26 +5,39 @@ import dataclasses
 import json
 import os
 import sqlite3
+import threading
 import time
 from pathlib import Path
 from typing import Any, ClassVar
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _gate_fixtures import gate_argv, gated_remote_runner
+from _gate_fixtures import (
+    TEST_CODE_CHECKOUT,
+    TEST_DEPLOYED_SHA,
+    TEST_DF_REMOTE,
+    TEST_GATE_ROOT,
+    gate_argv,
+    gated_remote_runner,
+    gated_run,
+)
 from _orch_helpers import pydantic_spec, wait_responsive
 
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import (
+    CANCEL_PROBE_INTERVAL_SECS,
+    GIT_PUSH_SSH_CONFIG,
     HEARTBEAT_STOP_JOIN_SECS,
     LocalRunner,
     MergeVerifySpec,
+    RemoteRunner,
     UnscopedTypecheckSpec,
     VerifyCommand,
     VerifyRunner,
     VerifyRunnerPool,
+    poll_until_clean,
     result_from_dict,
     result_from_json,
     result_to_dict,
@@ -7239,7 +7252,7 @@ class TestRemoteRunnerMainBranchPush:
 
 @pytest.mark.asyncio
 class TestRemoteRunnerRequestId:
-    """run_merge_verify passes --request-id <id> appended to the ssh argv."""
+    """run_merge_verify passes --request-id <id> in the ssh argv, ahead of --spec."""
 
     def _make_runner_and_calls(self, *, config_path=None):
         """Return (runner, calls) where calls tracks (argv, cwd) pairs."""
@@ -7264,7 +7277,7 @@ class TestRemoteRunnerRequestId:
         return runner, calls
 
     async def test_request_id_in_remote_cmd(self):
-        """ssh remote command contains --request-id fixed-id (appended)."""
+        """ssh remote command contains --request-id fixed-id."""
 
         runner, calls = self._make_runner_and_calls()
         await runner.run_merge_verify('abc123', _make_spec())
@@ -7306,31 +7319,18 @@ class TestRemoteRunnerRequestId:
         parsed = gate_argv(ssh_call[0][-1])
         assert parsed[:3] == ['verify-merge', '--sha', 'abc123']
 
-    async def test_request_id_appended_after_spec(self):
-        """--request-id appears after --spec (appended at end)."""
+    @pytest.mark.parametrize('config_path', [None, '/etc/orch.yaml'])
+    async def test_request_id_precedes_the_spec_and_the_config(self, config_path):
+        """--request-id follows --sha, ahead of the unbounded --spec JSON, so the
+        cancel probe's pgrep finds it inside a 4096-byte command-line read."""
 
-        runner, calls = self._make_runner_and_calls()
+        runner, calls = self._make_runner_and_calls(config_path=config_path)
         await runner.run_merge_verify('abc123', _make_spec())
 
         ssh_call = next(c for c in calls if c[0][0] == 'ssh')
         parsed = gate_argv(ssh_call[0][-1])
 
-        spec_idx = parsed.index('--spec')
-        rid_idx = parsed.index('--request-id')
-        assert rid_idx > spec_idx, '--request-id must be appended after --spec'
-
-    async def test_request_id_with_config_path(self):
-        """--request-id is still appended after --config when config_path is set."""
-
-        runner, calls = self._make_runner_and_calls(config_path='/etc/orch.yaml')
-        await runner.run_merge_verify('abc123', _make_spec())
-
-        ssh_call = next(c for c in calls if c[0][0] == 'ssh')
-        parsed = gate_argv(ssh_call[0][-1])
-
-        cfg_idx = parsed.index('--config')
-        rid_idx = parsed.index('--request-id')
-        assert rid_idx > cfg_idx, '--request-id must come after --config'
+        assert parsed[:6] == ['verify-merge', '--sha', 'abc123', '--request-id', 'fixed-id', '--spec']
 
     async def test_dispatch_not_in_flight_after_exception(self):
         """The dispatch is no longer in flight after RunnerUnavailable (cleared in the finally)."""
@@ -7421,8 +7421,8 @@ class TestRemoteRunnerCancelVerify:
         )
         return runner, calls
 
-    async def _cancel_mid_verify(self, *, config_path=None, cancel_rc=0):
-        """Cancel a real dispatch while its verify ssh is held; return (cancel rc, recorded argvs)."""
+    async def _cancel_mid_verify(self, *, config_path=None, cancel_rc=0, probe_rc=1, probe_error=None):
+        """Cancel a real dispatch while its verify ssh is held; return (cancel rc, recorded argvs, runner)."""
         from orchestrator.verify_runner import RunnerUnavailable
 
         calls: list[list[str]] = []
@@ -7435,7 +7435,9 @@ class TestRemoteRunnerCancelVerify:
             if 'cancel-verify' in argv[-1]:
                 return (cancel_rc, '', '')
             if 'pgrep' in argv[-1]:
-                return (1, '', '')
+                if probe_error is not None:
+                    raise probe_error
+                return (probe_rc, '', '')
             entered.set()
             await release.wait()
             return (137, '', 'Killed')
@@ -7455,7 +7457,7 @@ class TestRemoteRunnerCancelVerify:
         release.set()
         with pytest.raises(RunnerUnavailable):
             await dispatch
-        return rc, calls
+        return rc, calls, runner
 
     @staticmethod
     def _cancel_ssh_calls(calls):
@@ -7472,7 +7474,7 @@ class TestRemoteRunnerCancelVerify:
     async def test_cancel_verify_issues_correct_argv(self):
         """cancel_verify() issues ssh BatchMode/ConnectTimeout cancel-verify --request-id."""
 
-        _, calls = await self._cancel_mid_verify(cancel_rc=0)
+        _, calls, _ = await self._cancel_mid_verify(cancel_rc=0)
 
         ssh_calls = self._cancel_ssh_calls(calls)
         assert len(ssh_calls) == 1
@@ -7490,7 +7492,7 @@ class TestRemoteRunnerCancelVerify:
     async def test_cancel_verify_appends_config_when_set(self):
         """cancel_verify() appends --config <path> when config_path is set."""
 
-        _, calls = await self._cancel_mid_verify(config_path='/etc/orch.yaml', cancel_rc=0)
+        _, calls, _ = await self._cancel_mid_verify(config_path='/etc/orch.yaml', cancel_rc=0)
 
         ssh_calls = self._cancel_ssh_calls(calls)
         remote_cmd = ssh_calls[0][-1]
@@ -7500,12 +7502,19 @@ class TestRemoteRunnerCancelVerify:
 
     async def test_cancel_verify_returns_ssh_rc(self):
         """cancel_verify() returns the ssh return code."""
-        rc, _ = await self._cancel_mid_verify(cancel_rc=1)
+        rc, _, _ = await self._cancel_mid_verify(cancel_rc=1)
         assert rc == 1
 
+    async def test_probe_clean_without_a_cancel_issues_no_ssh(self):
+        """probe_clean() with nothing cancelled → True with no ssh at all."""
+        runner, calls = self._make_runner_and_calls(probe_rc=0)
+        assert await runner.probe_clean() is True
+        assert calls == []
+
     async def test_probe_clean_true_when_pgrep_rc_is_1(self):
-        """probe_clean() issues ssh pgrep -f verify-merge; rc==1 (no match) → True."""
-        runner, calls = self._make_runner_and_calls(probe_rc=1)
+        """probe_clean() pgreps the cancelled request's verify; rc==1 (no match) → True."""
+        _, calls, runner = await self._cancel_mid_verify(cancel_rc=1, probe_rc=1)
+        calls.clear()
         result = await runner.probe_clean()
         assert result is True
 
@@ -7513,31 +7522,26 @@ class TestRemoteRunnerCancelVerify:
         assert len(ssh_calls) == 1
         remote_cmd = ssh_calls[0][-1]
         assert 'pgrep' in remote_cmd
+        assert 'req-42' in remote_cmd
         assert 'verify-merge' in remote_cmd
+        assert 'verify-task' in remote_cmd
 
     async def test_probe_clean_false_when_pgrep_rc_is_0(self):
-        """probe_clean() rc==0 (process running) → False."""
-        runner, calls = self._make_runner_and_calls(probe_rc=0)
+        """probe_clean() rc==0 (the cancelled request still runs) → False."""
+        _, _, runner = await self._cancel_mid_verify(cancel_rc=1, probe_rc=0)
         result = await runner.probe_clean()
         assert result is False
 
     async def test_probe_clean_false_when_pgrep_rc_is_2(self):
         """probe_clean() rc>=2 (error) → False (conservative: stay parked)."""
-        runner, _ = self._make_runner_and_calls(probe_rc=2)
+        _, _, runner = await self._cancel_mid_verify(cancel_rc=1, probe_rc=2)
         result = await runner.probe_clean()
         assert result is False
 
     async def test_probe_clean_false_on_oserror(self):
         """probe_clean() on OSError → False (fail-safe)."""
-        async def raising_run(argv, *, cwd=None):
-            raise OSError('connection refused')
-
-        runner = gated_remote_runner(
-            name='laptop',
-            ssh_host='laptop.local',
-            git_remote='origin',
-            cwd='/repo',
-            run=raising_run,
+        _, _, runner = await self._cancel_mid_verify(
+            cancel_rc=1, probe_error=OSError('connection refused'),
         )
         result = await runner.probe_clean()
         assert result is False
@@ -8846,7 +8850,7 @@ class TestRemoteRunnerPassSummaryArchival:
 # lower BEAT_INTERVAL_SECS, which is what re-creates the additive-delay cliff.
 # The discriminator survives any such widening, because the pre-4195 producer
 # delivers exactly ZERO beats for the whole hog.
-#: The three sizings below are all MULTIPLES of production's teardown bound,
+#: The four sizings below are all MULTIPLES of production's teardown bound,
 #: verify_runner.HEARTBEAT_STOP_JOIN_SECS, rather than independent literals:
 #: that constant is the single home of both the number and the argument for it
 #: (SPOT, docs/code-quality.md #11), and each relationship these comments claim
@@ -8859,25 +8863,50 @@ WEDGED_WRITER_PARK_SECS = 6 * HEARTBEAT_STOP_JOIN_SECS
 
 #: Budget for that test.  A regression to an unbounded join() must fail HERE as
 #: a timeout rather than wedging the suite; sized above the bound it is meant to
-#: observe and under WEDGED_WRITER_PARK_SECS, so it fires before the parked
-#: thread expires on its own.
+#: observe plus LOOP_ANSWER_CEILING_SECS, so a held loop fails as an assertion
+#: rather than as this timeout, and under WEDGED_WRITER_PARK_SECS, so it fires
+#: before the parked thread expires on its own.
 WEDGED_WRITER_TEST_TIMEOUT_SECS = 4 * HEARTBEAT_STOP_JOIN_SECS
 
 #: Join ceiling for the parked thread's own cleanup once released — a wedge
 #: detector, paid only if that thread is already stuck.
 HEARTBEAT_STOP_JOIN_CEILING_SECS = HEARTBEAT_STOP_JOIN_SECS
 
-#: Cadence of that test's loop-responsiveness ticker, and how many of its ticks
-#: must land inside the teardown join.  The discriminator is EXACT in the
-#: failing direction — a synchronous join lets precisely ZERO ticks run between
-#: stop() and the dispatch returning, since nothing else runs on a blocked loop
-#: — so any positive floor detects it and a low one cannot be flaky.  Two, in a
-#: window of HEARTBEAT_STOP_JOIN_SECS: even if every tick cost the ~0.85s worst
-#: single-gap scheduling delay measured at loadavg 113-178
-#: (the ROW_WATCHDOG banner of _verify_boundary_ceilings.py) rather than
-#: this cadence, that window still fits five.
-LOOP_TICK_SECS = 0.05
-LOOP_TICKS_REQUIRED_DURING_TEARDOWN = 2
+#: How long the wedged writer's join() waits for the event loop to answer a
+#: queued marker.  A CEILING, not a floor: a free loop answers within
+#: microseconds, so only a held loop ever reaches it.
+LOOP_ANSWER_CEILING_SECS = HEARTBEAT_STOP_JOIN_SECS
+
+
+class _WedgedHeartbeatWriter(threading.Thread):
+    """A heartbeat writer that ignores stop(); each join() samples once whether the loop answers."""
+
+    def __init__(self) -> None:
+        release = threading.Event()
+        super().__init__(target=release.wait, args=(WEDGED_WRITER_PARK_SECS,), daemon=True)
+        self._release_event = release
+        self._probe_loop = asyncio.get_running_loop()
+        self._probe_loop_thread = threading.get_ident()
+        self._loop_free_verdicts: list[bool] = []
+
+    @property
+    def loop_free_verdicts(self) -> tuple[bool, ...]:
+        return tuple(self._loop_free_verdicts)
+
+    def join(self, timeout: float | None = None) -> None:
+        self._loop_free_verdicts.append(self._loop_answers_while_joining())
+        super().join(timeout)
+
+    def release(self) -> None:
+        self._release_event.set()
+        super().join(HEARTBEAT_STOP_JOIN_CEILING_SECS)
+
+    def _loop_answers_while_joining(self) -> bool:
+        if threading.get_ident() == self._probe_loop_thread:
+            return False
+        loop_answered = threading.Event()
+        self._probe_loop.call_soon_threadsafe(loop_answered.set)
+        return loop_answered.wait(LOOP_ANSWER_CEILING_SECS)
 
 
 BEATS_REQUIRED = 5
@@ -9110,34 +9139,23 @@ class TestDefaultSshHeartbeatRun:
         freeze the orchestrator's shared loop — scheduler, agent dispatch, merge
         worker, uvicorn escalation server — for that whole bound, re-creating on
         the teardown side exactly the stall the beat was moved to a thread to
-        survive. The ticker counts loop iterations between ``stop()`` (the last
-        thing to run before the join) and the dispatch returning; a blocking
-        join admits exactly zero, because nothing else can run on a loop that is
-        blocked.
+        survive. The oracle rides the wedged writer's own join(): it records
+        whether the event loop answered a marker queued while that join was
+        pending, and False at once if the join runs on the loop's thread, which
+        cannot answer while it is the caller. That checks the loop ran during
+        the teardown, not a floor on work completed in a wall-clock window,
+        which reds under contention (the same fix as
+        orchestrator/tests/test_verify_ruff_config_boundary.py::TestProbeDoesNotBlockTheEventLoop,
+        task 4520 / esc-4520-6).
         """
         import os
         import sys
-        import threading
 
         from orchestrator.verify_cancel import HeartbeatHandle
         from orchestrator.verify_runner import _default_ssh_heartbeat_run
 
-        never_set = threading.Event()
-        parked = threading.Thread(
-            target=never_set.wait, args=(WEDGED_WRITER_PARK_SECS,), daemon=True
-        )
+        parked = _WedgedHeartbeatWriter()
         parked.start()
-
-        ticks = 0
-        ticks_at_stop: list[int] = []
-
-        async def ticker():
-            nonlocal ticks
-            while True:
-                await asyncio.sleep(LOOP_TICK_SECS)
-                ticks += 1
-
-        ticker_task = asyncio.create_task(ticker())
         write_fds: list[int] = []
 
         def wedged_start(write_fd, **kw):
@@ -9146,34 +9164,27 @@ class TestDefaultSshHeartbeatRun:
             # thread (verify_cancel.run_stdin_heartbeat) — saying so here is how
             # this test states the ownership contract it is standing in for.
             write_fds.append(write_fd)
-            return HeartbeatHandle(stop=lambda: ticks_at_stop.append(ticks), thread=parked)
+            return HeartbeatHandle(stop=lambda: None, thread=parked)
 
         try:
             rc, stdout, stderr = await _default_ssh_heartbeat_run(
                 [sys.executable, '-c', 'print("DONE")'],
-                heartbeat_interval=LOOP_TICK_SECS,
                 start_heartbeat=wedged_start,
             )
-            ticks_at_return = ticks
             still_parked = parked.is_alive()  # the call returned without waiting it out
         finally:
-            ticker_task.cancel()
-            await asyncio.gather(ticker_task, return_exceptions=True)
-            never_set.set()
-            parked.join(timeout=HEARTBEAT_STOP_JOIN_CEILING_SECS)
+            parked.release()
             for fd in write_fds:
                 os.close(fd)
 
         assert rc == 0
         assert 'DONE' in stdout
         assert still_parked
-
-        (stopped_at,) = ticks_at_stop
-        assert ticks_at_return - stopped_at >= LOOP_TICKS_REQUIRED_DURING_TEARDOWN, (
-            f'the loop ran {ticks_at_return - stopped_at} times while the dispatch waited out '
-            f'its {HEARTBEAT_STOP_JOIN_SECS}s join bound. Zero means the join is synchronous '
-            f'again and the shared event loop — scheduler, merge worker, escalation server — '
-            f'is frozen for that whole bound by every wedged writer.'
+        assert parked.loop_free_verdicts == (True,), (
+            f'teardown join verdicts {parked.loop_free_verdicts}: False means the join held '
+            f'the shared event loop — scheduler, merge worker, escalation server — for its '
+            f'{HEARTBEAT_STOP_JOIN_SECS}s bound on every wedged writer; a missing or extra '
+            f'verdict means the one-join-per-dispatch contract changed.'
         )
 
 
@@ -9394,3 +9405,124 @@ class TestRemoteRunnerMainPushMirror:
         result = await runner.run_merge_verify('abc123', _make_spec(), event_store=None)
         assert result == expected
         assert '+main:refs/heads/main' in _push_refspecs(calls)
+
+
+@pytest.mark.asyncio
+class TestPollUntilClean:
+    """The one cancel-probe loop the merge allocator and the task host pool share."""
+
+    @staticmethod
+    def _probe(*answers: bool):
+        reads = iter(answers)
+        probes: list[int] = []
+
+        async def probe() -> bool:
+            probes.append(1)
+            return next(reads)
+
+        return probe, probes
+
+    async def test_polls_interval_apart_with_no_sleep_after_the_last(self):
+        probe, probes = self._probe(False, False, False)
+        slept: list[float] = []
+
+        async def sleep(secs: float) -> None:
+            slept.append(secs)
+
+        assert await poll_until_clean(probe, attempts=3, sleep=sleep) is False
+        assert (len(probes), slept) == (3, [CANCEL_PROBE_INTERVAL_SECS] * 2)
+
+    async def test_stops_at_the_first_clean_read(self):
+        probe, probes = self._probe(False, True, False)
+        slept: list[float] = []
+
+        async def sleep(secs: float) -> None:
+            slept.append(secs)
+
+        assert await poll_until_clean(probe, attempts=3, sleep=sleep) is True
+        assert (len(probes), len(slept)) == (2, 1)
+
+
+def _raw_recording_runner(inner):
+    """A main_branch='main' RemoteRunner on the gate layout, plus every argv it runs, verbatim.
+
+    Unlike :func:`gated_remote_runner`, which strips ``GIT_PUSH_SSH_CONFIG``
+    before *inner* sees a push, the recorder sits outside the gate wrapping, so
+    it keeps each push's transport options.  *inner* still sees plain argvs.
+    """
+    raw_argvs: list[list[str]] = []
+    gated = gated_run(inner)
+
+    async def recording_run(argv, *, cwd=None):
+        raw_argvs.append(list(argv))
+        return await gated(argv, cwd=cwd)
+
+    runner = RemoteRunner(
+        'laptop', 'laptop.local', 'origin', '/repo',
+        main_branch='main',
+        run=recording_run,
+        id_factory=lambda: 'fixed-id',
+        df_remote_checkout=TEST_DF_REMOTE,
+        gate_checkouts_path=TEST_GATE_ROOT,
+        deployed_sha=TEST_DEPLOYED_SHA,
+        code_checkout=TEST_CODE_CHECKOUT,
+    )
+    return runner, raw_argvs
+
+
+@pytest.mark.asyncio
+class TestRemoteRunnerPushTransport:
+    """Every RemoteRunner push rides GIT_PUSH_SSH_CONFIG under a deadline (task 8121)."""
+
+    _PASS = VerifyResult(passed=True, test_output='', lint_output='', type_output='', summary='ok')
+    _PUSH_PREFIX: ClassVar[list[str]] = ['git', *GIT_PUSH_SSH_CONFIG, 'push', 'origin']
+
+    async def test_fast_forward_and_force_pushes_carry_the_ssh_bounds(self):
+        async def inner(argv, *, cwd=None):
+            if argv[:2] == ['git', 'rev-parse']:
+                return (0, 'MAINSHA', '')
+            if argv[:2] == ['git', 'push'] and argv[3] == 'main:refs/heads/main':
+                return (1, '', 'rejected: non-fast-forward')
+            if argv[0] == 'git':
+                return (0, '', '')
+            return (0, result_to_json(self._PASS), '')
+
+        runner, raw_argvs = _raw_recording_runner(inner)
+        await runner.run_merge_verify('abc123', _make_spec())
+
+        assert self._PUSH_PREFIX + ['main:refs/heads/main'] in raw_argvs
+        assert self._PUSH_PREFIX + ['+main:refs/heads/main'] in raw_argvs
+
+    async def test_ref_cleanup_push_carries_the_ssh_bounds(self):
+        async def inner(argv, *, cwd=None):
+            if argv[:2] == ['git', 'rev-parse']:
+                return (0, 'MAINSHA', '')
+            if argv[0] == 'git':
+                return (0, '', '')
+            return (0, result_to_json(self._PASS), '')
+
+        runner, raw_argvs = _raw_recording_runner(inner)
+        await runner.run_merge_verify('abc123', _make_spec())
+
+        assert self._PUSH_PREFIX + ['--delete', 'refs/merge-verify/fixed-id'] in raw_argvs
+
+    @pytest.mark.parametrize('hung_arg', ['refs/heads/main', '--delete'])
+    async def test_a_best_effort_push_that_never_returns_cannot_stall_the_verify(
+        self, monkeypatch, hung_arg,
+    ):
+        """A hung main-mirror push (FF and force alike) or ref cleanup is cut off and swallowed."""
+        monkeypatch.setattr('orchestrator.verify_runner.ENSURE_CLIENT_TIMEOUT_SECS', 0.05)
+
+        async def inner(argv, *, cwd=None):
+            if argv[:2] == ['git', 'rev-parse']:
+                return (0, 'MAINSHA', '')
+            if argv[:2] == ['git', 'push'] and any(hung_arg in arg for arg in argv[2:]):
+                await asyncio.Event().wait()
+            if argv[0] == 'git':
+                return (0, '', '')
+            return (0, result_to_json(self._PASS), '')
+
+        runner, _ = _raw_recording_runner(inner)
+        result = await asyncio.wait_for(runner.run_merge_verify('abc123', _make_spec()), timeout=5)
+
+        assert result == self._PASS

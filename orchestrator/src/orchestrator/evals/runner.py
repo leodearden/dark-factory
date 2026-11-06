@@ -25,14 +25,15 @@ from orchestrator.config import (
     ModelsConfig,
     OrchestratorConfig,
     PriceEntry,
+    RoutingConfig,
     SandboxConfig,
 )
 from orchestrator.git_ops import GitOps
+from orchestrator.implementer_brief_variant import execute_iteration_cap
 from orchestrator.scheduler import Scheduler, TaskAssignment
 from orchestrator.workflow import (
     TaskWorkflow,
     WorkflowOutcome,
-    _meta_root_for_worktree,
     build_workflow,
 )
 
@@ -45,6 +46,7 @@ from .architect_eval import (
     invoke_architect,
     judge_plan,
     log_architect_cell,
+    open_eval_artifacts,
     read_reference_diff,
 )
 from .configs import (
@@ -123,6 +125,30 @@ def load_task(task_path: Path) -> dict:
     return task
 
 
+def _admit_claude_role_models(
+    routing: RoutingConfig,
+    models: ModelsConfig,
+    backends: BackendsConfig,
+) -> RoutingConfig:
+    """Return *routing* with every claude-backend role's model in ``allowed_models``.
+
+    Restores, for one eval cell, the invariant
+    ``orchestrator/config.py::OrchestratorConfig._validate_models_in_allowlist``
+    enforces at load time and ``model_copy`` skips. Without it, a candidate
+    model outside the project allowlist (a proxied-endpoint implementer, a
+    fable architect) is rejected by ``resolve_route``'s allowlist layer and
+    the cell silently dispatches the role default under the candidate's label.
+    Only ``allowed_models`` changes; the ladder, ceilings and rules are kept.
+    """
+    claude_role_models = [
+        getattr(models, role)
+        for role in type(models).model_fields
+        if getattr(backends, role, 'claude') == 'claude'
+    ]
+    admitted = list(dict.fromkeys([*routing.allowed_models, *claude_role_models]))
+    return routing.model_copy(update={'allowed_models': admitted})
+
+
 def build_eval_orch_config(
     config: EvalConfig,
     task: dict,
@@ -138,7 +164,8 @@ def build_eval_orch_config(
     Reviewer is the new 1× Opus comprehensive reviewer (matches production
     after the reviewer-panel trial replaced the 5× sonnet panel; merged
     via 594658fbe3 / 2c26a30bca).
-    Only the implementer varies per eval config.
+    Only the implementer varies per eval config, and the implementer candidate's
+    ``harness_variant`` becomes the cell's ``implementer_brief_variant``.
 
     ``architect_config`` (eval-revival μ) drives the both-live end-to-end matrix
     /confirm runs (``run_end_to_end``): when supplied, the architect's
@@ -267,6 +294,8 @@ def build_eval_orch_config(
         'sandbox': SandboxConfig(enabled=False),
         'project_root': Path(task.get('project_root', str(base.project_root))),
         'env_overrides': config.env_overrides,
+        'implementer_brief_variant': config.harness_variant,
+        'routing': _admit_claude_role_models(profiled.routing, models, backends),
     }
     # BUG 2a: pin the eval verify interpreter to the target's own
     # .python-version (via verify_env['UV_PYTHON']) so `uv run pytest/ruff/
@@ -713,7 +742,12 @@ async def collect_metrics(
     )
     # False-green guard — catches the 404-bug signature so the same class of
     # silent failure doesn't need manual quarantine in future runs.
-    if is_false_green(m, workflow.config.max_execute_iterations):
+    enforced_cap = execute_iteration_cap(
+        workflow.config.implementer_brief_variant,
+        workflow.config.max_execute_iterations,
+        lambda: plan,
+    )
+    if is_false_green(m, enforced_cap):
         logger.warning(
             'False-green signature for task %s: %d iters @ cap, '
             '$0 cost, 0 lines / 0 files changed, T/T/T — '
@@ -1097,14 +1131,14 @@ async def run_confirm_stage(
 def _resume_plan_from_worktree(worktree: Path, task: dict) -> dict | None:
     """Load the initial plan for a --worktree resume run.
 
-    Reads the RELOCATED plan.json at ``_meta_root_for_worktree(worktree)/plan.json``.
+    Reads the RELOCATED plan.json through ``open_eval_artifacts(worktree)``.
     Production TaskWorkflow moved plan.json out of the legacy ``<worktree>/.task/``
     to the sibling ``.task-meta/<name>/`` root (W11 / task 2258); reading the
     stale legacy path silently missed and discarded completed-step progress on
     resume (D1 drift, task 2812). Falls back to the frozen ``task['plan']`` only
     when the relocated file is absent.
     """
-    existing_plan_path = _meta_root_for_worktree(worktree) / 'plan.json'
+    existing_plan_path = open_eval_artifacts(worktree).artifact_path('plan.json')
     if existing_plan_path.exists():
         initial_plan = json.loads(existing_plan_path.read_text())
         steps = initial_plan.get('steps', [])

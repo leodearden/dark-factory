@@ -44,7 +44,7 @@ def _row(
     the ``judge.cost_usd`` subset. ``lo``/``hi`` default to the point estimate,
     ``quality`` defaults to ``composite`` (matches build_composite_report when the
     efficiency blend is a no-op), and ``sufficient`` to ``n >= 3``
-    (report.mean_ci95's own rule).
+    (stats.mean_ci95's own rule).
     """
     if lo is None:
         lo = composite

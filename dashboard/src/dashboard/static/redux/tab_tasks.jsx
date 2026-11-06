@@ -23,6 +23,16 @@ const {
   terminalWindowEntrants, sameDatum,
   CENSUS_VIEWS: CENSUS_VIEWS_T, EVERY_VIEW: EVERY_VIEW_T,
 } = window.DF_TASK_SNAPSHOT;
+const { createPersistedHooks } = window.DF_PERSISTED_STATE;
+const { usePersistedState } = createPersistedHooks(React);
+
+// A per-project preference map holds only the projects that deviate from the
+// default (an undefined deviation), so a map with every project back at its
+// default is {} and usePersistedState removes its key.
+function withProjectDeviation(map, id, deviation) {
+  const { [id]: _previous, ...rest } = map;
+  return deviation === undefined ? rest : { ...rest, [id]: deviation };
+}
 
 // CSS accent per probe-status tone (runtime_format.js owns which tone each
 // status gets; this only translates a tone into a colour for the banner's
@@ -51,16 +61,6 @@ function DeferralHold({ task }) {
       {cell.needsHuman && <span className="deferral-human">needs human</span>}
     </div>
   );
-}
-
-// Persisted-state hook (same shape as elsewhere)
-function tasksPersistedState(key, def) {
-  const [v, setV] = uS_T(() => {
-    try { const r = localStorage.getItem(key); return r != null ? JSON.parse(r) : def; }
-    catch { return def; }
-  });
-  uE_T(() => { try { localStorage.setItem(key, JSON.stringify(v)); } catch {} }, [key, v]);
-  return [v, setV];
 }
 
 // ── Edge router: draw curves from each parent (dep) to each child node ──
@@ -657,14 +657,14 @@ function TaskDetail({ task, allTasks }) {
 
 function TasksTab({ projectFilter, search }) {
   // Open/closed per project, persisted
-  const [openMap, setOpenMap] = tasksPersistedState('df.tasksOpen', {});
-  const toggle = (id) => setOpenMap(m => ({ ...m, [id]: !m[id] }));
+  const [openMap, setOpenMap] = usePersistedState('df.tasksOpen', {});
+  const toggle = (id) => setOpenMap(m => withProjectDeviation(m, id, m[id] === false ? undefined : false));
 
   // Per-project "group by PRD" view toggle, persisted (same per-project-id
   // map shape as openMap). Key absent/'flat' -> today's ungrouped view;
   // 'prd' -> the grouped-by-PRD view.
-  const [groupByPrdMap, setGroupByPrdMap] = tasksPersistedState('df.tasksGroupByPrd', {});
-  const setGroupByPrd = (id, v) => setGroupByPrdMap(m => ({ ...m, [id]: v }));
+  const [groupByPrdMap, setGroupByPrdMap] = usePersistedState('df.tasksGroupByPrd', {});
+  const setGroupByPrd = (id, v) => setGroupByPrdMap(m => withProjectDeviation(m, id, v === 'prd' ? 'prd' : undefined));
 
   // Selected task (single, across all projects)
   const [selectedId, setSelectedId] = uS_T(null);
@@ -696,7 +696,7 @@ function TasksTab({ projectFilter, search }) {
   // The census views, in-flight and backlog on by default. A new key, not
   // 'df.tasksFilters': an old {active, pending, ...} object would read as
   // "nothing selected" under the view keys.
-  const [filterMap, setFilterMap] = tasksPersistedState('df.tasks.views', { in_flight: true, backlog: true });
+  const [filterMap, setFilterMap] = usePersistedState('df.tasks.views', { in_flight: true, backlog: true, terminal: false });
   const filter = Object.fromEntries(CENSUS_VIEWS_T.map(v => [v.key, !!(filterMap || {})[v.key]]));
   const flipFilter = (key) => setFilterMap({ ...filter, [key]: !filter[key] });
 
@@ -737,7 +737,7 @@ function TasksTab({ projectFilter, search }) {
   // whole-handler budget expires, a silently-missing project would otherwise
   // read as a project with nothing to do.
   //
-  // The three-way distinction itself is decided SERVER-SIDE (app.api_tasks)
+  // The distinction between those cases is decided SERVER-SIDE (app.api_tasks)
   // and turned into copy by tasks_offline_banner.js. Nothing here re-derives
   // it: a `k of N` judgement made in the JSX would drift from the one the
   // handler made. N likewise comes from the server (TASKS_PROJECT_COUNT): the
@@ -751,6 +751,7 @@ function TasksTab({ projectFilter, search }) {
     partial: 'tasks-partial-banner',
     degraded: 'tasks-degraded-banner',
     'count-unknown': 'tasks-count-unknown-banner',
+    'count-stale': 'tasks-count-stale-banner',
   };
 
   // Runtime-probe health, derived frontend-side from the snapshot rows
@@ -761,7 +762,7 @@ function TasksTab({ projectFilter, search }) {
   // row vocabulary by active_tasks._probe_status — grep either end to find
   // the other.
   //
-  // A SIBLING of bannerNotices above, not a fifth kind inside it. The two
+  // A SIBLING of bannerNotices above, not another kind inside it. The two
   // answer different questions: tasksBannerNotices reports whether TASK DATA
   // is available, a distinction decided server-side in app.api_tasks, while
   // rtProbeSummary is a client-side derivation over the snapshot rows

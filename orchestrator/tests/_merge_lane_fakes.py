@@ -100,11 +100,15 @@ def main_health_probe_spawned(outcome: MergeOutcome) -> bool:
 def lane_scene_config(
     project_root: Path, git: GitConfig, **overrides: Any,
 ) -> OrchestratorConfig:
-    """The ``OrchestratorConfig`` for a lane scene over a real tmp repo.
+    """The ``OrchestratorConfig`` for a merge-lane test scene.
 
     The main-health probe is off (``escalate_preexisting_main_break=False``);
     ``main_health_probe_spawned`` says why. *overrides* are any further
-    ``OrchestratorConfig`` fields the scene needs.
+    ``OrchestratorConfig`` fields the scene needs. A scene that exercises the
+    probe builds ``OrchestratorConfig`` itself with
+    ``escalate_preexisting_main_break`` named, and
+    ``test_lane_scene_config_guard.py`` holds every worker-constructing module
+    to that.
     """
     return OrchestratorConfig(
         project_root=project_root, git=git,
@@ -346,6 +350,8 @@ class FakeClock:
     advances it by ``content_tick`` per probe, so a ``content_tick`` above
     zero is a verify that keeps writing. Every probed root is kept in
     ``content_probes``, the way ``sleeps`` keeps every requested sleep.
+    ``verify_cpu_ticks`` mirrors it for the verify process tree's CPU time:
+    ``cpu_ticks`` advanced by ``cpu_tick`` per probe, roots in ``cpu_probes``.
     """
 
     def __init__(
@@ -355,6 +361,8 @@ class FakeClock:
         tick: float = 0.0,
         content_mtime: float | None = None,
         content_tick: float = 0.0,
+        cpu_ticks: int | None = None,
+        cpu_tick: int = 0,
         wait_cap: float = 0.02,
         sleep_cap: float = 0.02,
     ) -> None:
@@ -363,11 +371,14 @@ class FakeClock:
         self.tick = tick
         self.content_mtime = content_mtime
         self.content_tick = content_tick
+        self.cpu_ticks = cpu_ticks
+        self.cpu_tick = cpu_tick
         self.wait_cap = wait_cap
         self.sleep_cap = sleep_cap
         self.sleeps: list[float] = []
         self.waits: list[float] = []
         self.content_probes: list[Path] = []
+        self.cpu_probes: list[Path] = []
 
     def now(self) -> float:
         return self.time
@@ -382,6 +393,13 @@ class FakeClock:
         reading = self.content_mtime
         if reading is not None:
             self.content_mtime = reading + self.content_tick
+        return reading
+
+    def verify_cpu_ticks(self, root: Path) -> int | None:
+        self.cpu_probes.append(root)
+        reading = self.cpu_ticks
+        if reading is not None:
+            self.cpu_ticks = reading + self.cpu_tick
         return reading
 
     async def sleep(self, secs: float) -> None:

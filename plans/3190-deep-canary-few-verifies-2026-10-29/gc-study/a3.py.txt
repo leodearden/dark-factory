@@ -1,0 +1,88 @@
+import re,json,datetime as dt,collections,statistics as st
+U=dt.timezone.utc
+def T(s): return dt.datetime.fromisoformat(s).astimezone(U)
+A=json.load(open('a1.json'))
+resets=[(T(s),T(e),l) for s,e,l,_ in A['resets']]
+# lane events from orchestrator logs (exclude recovery chatter, record-adoption is not a build)
+EV=[]
+kinds=collections.Counter()
+pat=[('route_recycle',r'acquire_warm_lane: route=recycle'),('route_reattach',r'route=reset_in_place_reattach'),('route_reuse',r'acquire_warm_lane: route=reuse'),('reused',r'_reuse_warm_lane: reused'),('stole',r'stole lane'),('acquired',r'acquire_warm_lane: acquired'),('spec_acquire',r'acquire_spec_lane: reset'),('invoke',r'Invoking claude agent'),('command',r'cli_invoke\] Command'),('released',r'release_warm_lane: released'),('term_release',r'release_lane_for_terminal_task'),('verify',r'verify start'),('verify_fail',r'Verification failed'),('reclaim_artifacts','reclaim_worktree_build_artifacts'),('rebase_fail','rebase failed|Pre-merge rebase')]
+for l in open('lane_any.log',errors='replace'):
+    m=re.match(r'^(\S+) ',l)
+    if not m: continue
+    lane=re.search(r'_(lane|spec)-\d+',l)
+    if not lane: continue
+    if 'Recovery:' in l or 'reconciler' in l: continue
+    k=None
+    for n,p in pat:
+        if re.search(p,l): k=n;break
+    if not k: continue
+    kinds[k]+=1
+    EV.append((T(m.group(1)),lane.group(0),k))
+print(kinds.most_common())
+by=collections.defaultdict(list)
+for e in EV: by[e[1]].append(e)
+rs=collections.defaultdict(list)
+for s,e,l in resets: rs[l].append((s,e))
+tot=noop=0;perlane={};d=(resets[-1][1]-resets[0][0]).total_seconds()/86400
+act_kinds=collections.Counter()
+BUILD={'invoke','command','verify','verify_fail','spec_acquire','route_recycle','route_reattach','route_reuse','reused','acquired','stole','released','term_release'}
+noop_gen=0
+gens={ (g[2]):[] for g in A['gens']}
+for t,g,l in A['gens']: gens[l].append((T(t),g))
+for l,v in sorted(rs.items()):
+    v.sort();evs=[x for x in by.get(l,[]) if x[2] in BUILD]
+    n0=0
+    for i in range(1,len(v)):
+        a=v[i-1][1];b=v[i][0]
+        hit=[x for x in evs if a<=x[0]<=b]
+        tot+=1
+        if not hit:
+            n0+=1
+            # gen change?
+        else:
+            for x in hit: act_kinds[x[2]]+=1
+    perlane[l]=(len(v),n0)
+    noop+=n0
+print('pairs',tot,'noop',noop,round(noop/tot,3))
+print('lanes with all noop',[l for l,(n,z) in perlane.items() if z==n-1][:60])
+print('per-lane sample',sorted(perlane.items(),key=lambda x:-x[1][0])[:6])
+print('active kinds in pairs',act_kinds.most_common())
+# same with gen-unchanged
+cnt=collections.Counter()
+for l,v in rs.items():
+    gs=sorted(gens.get(l,[]))
+    def gen_at(t):
+        g=None
+        for x,y in gs:
+            if x<=t: g=y
+        return g
+    evs=[x for x in by.get(l,[]) if x[2] in BUILD]
+    for i in range(1,len(v)):
+        a=v[i-1][1];b=v[i][0]
+        hit=any(a<=x[0]<=b for x in evs)
+        same=gen_at(v[i-1][1])==gen_at(v[i][1])
+        cnt[(hit,same)]+=1
+print('(activity_since_prev, same_gen):',cnt)
+# reuse consumption: for each reuse event, was there a timer reset since last build event on that lane?
+reuse=[e for e in EV if e[2]=='reused'];print('reused',len(reuse),'route_reuse',kinds['route_reuse'])
+res=collections.Counter()
+gapsh=[]
+for t,l,_ in reuse:
+    prior=[x for x in by[l] if x[0]<t and x[2] in ('invoke','command','verify','verify_fail','reused')]
+    last=prior[-1][0] if prior else None
+    rr=[s for s,e in rs.get(l,[]) if e<t]
+    lastr=rr[-1] if rr else None
+    if lastr is None: res['no_timer_reset_in_window']+=1
+    elif last is None or lastr>last:
+        res['timer_seeded_target_consumed']+=1;gapsh.append((t-lastr).total_seconds()/3600)
+    else: res['own_target_since_last_reset']+=1
+print(res,'hrs since reset p50',round(st.median(gapsh),2) if gapsh else None)
+# resets inside an active phase gap: reset where lane had invoke within prior 6h and next invoke within next 6h
+g=collections.Counter();H=dt.timedelta(hours=6)
+for s,e,l in resets:
+    evs=[x for x in by.get(l,[]) if x[2] in ('invoke','verify','command')]
+    before=any(s-H<=x[0]<s for x in evs);after=any(e<x[0]<=e+H for x in evs)
+    g[(before,after)]+=1
+print('resets with build-agent before/after within 6h',g)
+print('days',round(d,2),'acquire-type per day',round((kinds['route_recycle']+kinds['route_reattach'])/d,1),'spec/day',round(kinds['spec_acquire']/d,1),'reuse/day',round(kinds['route_reuse']/d,1),round(kinds['reused']/d,1),'stole',kinds['stole'])

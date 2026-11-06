@@ -371,10 +371,11 @@ def test_summary_rows_match_the_report_layer_field_for_field():
 
     ``cap_excluded`` / ``no_plan`` / ``plan_rate`` / ``mean_plan_quality`` are
     the report layer's per-config accumulator (tasks 3118/3302/3379), built on
-    the SHARED ``_plan_rate`` and ``_mean_plan_quality`` reductions precisely so
-    two adjacent surfaces cannot give contradictory answers about the same
-    quantity. Re-deriving any of them in this driver would create exactly that
-    second surface. This test pins the equality field for field.
+    the SHARED ``cell_admission.plan_rate`` and
+    ``cell_admission.mean_plan_quality`` reductions precisely so two adjacent
+    surfaces cannot give contradictory answers about the same quantity.
+    Re-deriving any of them in this driver would create exactly that second
+    surface. This test pins the equality field for field.
     """
     from orchestrator.evals.report import build_plan_quality_report
 

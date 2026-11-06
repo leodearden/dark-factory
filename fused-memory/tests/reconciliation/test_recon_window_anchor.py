@@ -33,7 +33,10 @@ anchor back to completion: that reopens the hole for external writes.
 The anchor is ``run.started_at``. On a fresh run it is stamped before Stage 1.
 On a resumed run (task sigma) it is the ORIGINAL start of the interrupted run,
 whose Stage 1 may have fetched hours before the resuming invocation -- so a
-clock read taken by the resuming invocation would recreate the hole.
+clock read taken by the resuming invocation would recreate the hole. The
+episode anchor alone is lowered further, to the start of the earliest Graphiti
+write that was still executing at Stage 1's fetch, when that is earlier (task
+4620). Why: ``fused_memory/reconciliation/episode_window.py``.
 
 The task-change window moves too, and the resume argument above applies to it
 unchanged. Its own cost: a task that reaches done between run start and the
@@ -46,9 +49,10 @@ it.
 """
 from __future__ import annotations
 
+import logging
 import uuid
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock
 
 import pytest
@@ -65,6 +69,11 @@ from fused_memory.models.reconciliation import (
     StageId,
     StageReport,
 )
+from fused_memory.reconciliation.episode_window import (
+    UNFINISHED_WRITE_START_STAT,
+    unfinished_write_start_stat,
+)
+from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.reconciliation.task_filter import (
     filter_task_tree,
     select_done_since_boundary,
@@ -73,6 +82,7 @@ from reconciliation.harness_fixtures import make_harness_config, open_harness, s
 
 PROJECT_ID = 'test-project'
 INTERRUPTED_RUN_START = datetime(2026, 9, 1, 12, 0, tzinfo=UTC)
+HARNESS_LOGGER = 'fused_memory.reconciliation.harness'
 
 
 @pytest.fixture
@@ -92,35 +102,96 @@ async def harness(tmp_path, taskmaster):
 
 
 def _stub_stage_runs(
-    monkeypatch: pytest.MonkeyPatch, on_invoke: Callable[[StageId], None],
+    monkeypatch: pytest.MonkeyPatch,
+    on_invoke: Callable[[StageId], None],
+    stage1_stats: dict | None = None,
 ) -> None:
-    """Replace every stage's ``run`` with an empty report, calling *on_invoke* first."""
+    """Replace every stage's ``run`` with a report, calling *on_invoke* first.
+
+    Stage 1's report carries *stage1_stats*; every other report is empty.
+    """
 
     async def fake_run(
         self, events, watermark, prior_reports, run_id, model=None, resume_session_id=None,
     ):
         on_invoke(self.stage_id)
         now = datetime.now(UTC)
-        return StageReport(stage=self.stage_id, started_at=now, completed_at=now)
+        is_stage1 = self.stage_id == StageId.memory_consolidator
+        stats = dict(stage1_stats or {}) if is_stage1 else {}
+        return StageReport(stage=self.stage_id, started_at=now, completed_at=now, stats=stats)
 
     stub_stage_runs(monkeypatch, fake_run)
 
 
 @pytest.fixture
-def stage_invoked_at(monkeypatch):
+def stage1_stats() -> dict:
+    """The stats the stubbed Stage 1 reports; a test fills it before the cycle."""
+    return {}
+
+
+@pytest.fixture
+def stage_invoked_at(monkeypatch, stage1_stats):
     """Stub every stage's ``run`` and record when each stage was invoked."""
     invoked_at: dict[StageId, datetime] = {}
 
     def record(stage_id: StageId) -> None:
         invoked_at[stage_id] = datetime.now(UTC)
 
-    _stub_stage_runs(monkeypatch, record)
+    _stub_stage_runs(monkeypatch, record, stage1_stats)
     return invoked_at
 
 
 def _required(value: datetime | None) -> datetime:
     assert value is not None
     return value
+
+
+def _interrupted_run(instance_id: str, stage1_stats: dict) -> ReconciliationRun:
+    """A run interrupted in Stage 2, after Stage 1 completed with *stage1_stats*."""
+    stage1_report = StageReport(
+        stage=StageId.memory_consolidator,
+        started_at=INTERRUPTED_RUN_START,
+        completed_at=INTERRUPTED_RUN_START,
+        stats=stage1_stats,
+    )
+    return ReconciliationRun(
+        id='run-to-resume',
+        project_id=PROJECT_ID,
+        run_type=RunType.full,
+        trigger_reason='test-trigger',
+        started_at=INTERRUPTED_RUN_START,
+        status=RunStatus.interrupted,
+        stage_reports={StageId.memory_consolidator.value: stage1_report},
+        session_id='S',
+        stage_cursor=StageId.task_knowledge_sync.value,
+        instance_id=instance_id,
+    )
+
+
+async def _persisted_and_reloaded(
+    journal: ReconciliationJournal, run: ReconciliationRun,
+) -> ReconciliationRun:
+    """Write *run* through the journal's own run writes, then read it back."""
+    assert run.session_id is not None and run.stage_cursor is not None
+    await journal.start_run(run)
+    await journal.update_run_stage_reports(run.id, run.stage_reports)
+    await journal.record_run_session(
+        run.id, session_id=run.session_id, stage_cursor=run.stage_cursor,
+    )
+    reloaded = await journal.get_run(run.id)
+    assert reloaded is not None
+    return reloaded
+
+
+def _drained_event() -> ReconciliationEvent:
+    return ReconciliationEvent(
+        id=str(uuid.uuid4()),
+        type=EventType.episode_added,
+        source=EventSource.agent,
+        project_id=PROJECT_ID,
+        timestamp=INTERRUPTED_RUN_START,
+        payload={},
+    )
 
 
 @pytest.mark.asyncio
@@ -146,36 +217,12 @@ async def test_fresh_cycle_anchors_data_windows_at_run_start(harness, stage_invo
 
 @pytest.mark.asyncio
 async def test_resumed_run_anchors_data_windows_at_original_start(harness, stage_invoked_at):
-    stage1_report = StageReport(
-        stage=StageId.memory_consolidator,
-        started_at=INTERRUPTED_RUN_START,
-        completed_at=INTERRUPTED_RUN_START,
-    )
-    interrupted_run = ReconciliationRun(
-        id='run-to-resume',
-        project_id=PROJECT_ID,
-        run_type=RunType.full,
-        trigger_reason='test-trigger',
-        started_at=INTERRUPTED_RUN_START,
-        status=RunStatus.interrupted,
-        stage_reports={StageId.memory_consolidator.value: stage1_report},
-        session_id='S',
-        stage_cursor=StageId.task_knowledge_sync.value,
-        instance_id=harness.buffer.instance_id,
-    )
+    interrupted_run = _interrupted_run(harness.buffer.instance_id, stage1_stats={})
     await harness.journal.start_run(interrupted_run)
-    drained_event = ReconciliationEvent(
-        id=str(uuid.uuid4()),
-        type=EventType.episode_added,
-        source=EventSource.agent,
-        project_id=PROJECT_ID,
-        timestamp=INTERRUPTED_RUN_START,
-        payload={},
-    )
 
     run = await harness.run_full_cycle(
         PROJECT_ID, 'resume_after_restart',
-        resume_run=interrupted_run, events=[drained_event],
+        resume_run=interrupted_run, events=[_drained_event()],
     )
     watermark = await harness.journal.get_watermark(PROJECT_ID)
 
@@ -230,3 +277,53 @@ async def test_task_done_mid_cycle_is_inside_next_cycles_task_change_window(
     audited = {t['id'] for t in next_cycle_audit}
     assert 7001 in audited
     assert 7002 not in audited
+
+
+@pytest.mark.asyncio
+async def test_fresh_cycle_lowers_episode_anchor_below_unfinished_graphiti_write(
+    harness, stage_invoked_at, stage1_stats, caplog,
+):
+    unfinished = datetime.now(UTC) - timedelta(minutes=10)
+    stage1_stats[UNFINISHED_WRITE_START_STAT] = unfinished_write_start_stat(unfinished)
+
+    with caplog.at_level(logging.INFO, logger=HARNESS_LOGGER):
+        run = await harness.run_full_cycle(PROJECT_ID, 'test-trigger')
+    watermark = await harness.journal.get_watermark(PROJECT_ID)
+
+    assert run.status == RunStatus.completed
+    assert watermark.last_episode_timestamp == unfinished
+    assert watermark.last_memory_timestamp == run.started_at
+    stage3_invoked_at = stage_invoked_at[StageId.integrity_check]
+    assert _required(watermark.last_full_run_completed) >= stage3_invoked_at
+    assert watermark.last_full_run_id == run.id
+
+    anchored = [
+        r for r in caplog.records
+        if r.name == HARNESS_LOGGER and r.getMessage() == 'reconciliation.episode_window_anchored'
+    ]
+    assert len(anchored) == 1
+    assert getattr(anchored[0], 'run_id', None) == run.id
+    assert datetime.fromisoformat(getattr(anchored[0], 'anchor', '')) == unfinished
+
+
+@pytest.mark.asyncio
+async def test_resumed_run_anchors_on_persisted_stage1_unfinished_write_start(
+    harness, stage_invoked_at,
+):
+    unfinished = INTERRUPTED_RUN_START - timedelta(minutes=5)
+    interrupted_run = _interrupted_run(
+        harness.buffer.instance_id,
+        stage1_stats={UNFINISHED_WRITE_START_STAT: unfinished_write_start_stat(unfinished)},
+    )
+    reloaded = await _persisted_and_reloaded(harness.journal, interrupted_run)
+
+    run = await harness.run_full_cycle(
+        PROJECT_ID, 'resume_after_restart',
+        resume_run=reloaded, events=[_drained_event()],
+    )
+    watermark = await harness.journal.get_watermark(PROJECT_ID)
+
+    assert run.status == RunStatus.completed
+    assert StageId.memory_consolidator not in stage_invoked_at
+    assert watermark.last_episode_timestamp == unfinished
+    assert watermark.last_memory_timestamp == INTERRUPTED_RUN_START

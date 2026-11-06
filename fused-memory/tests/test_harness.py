@@ -12,6 +12,7 @@ from unittest.mock import DEFAULT, AsyncMock, MagicMock, patch
 import httpx
 import pytest
 import pytest_asyncio
+from _fm_helpers import LoopFreedomProbe
 from _qdrant_responses import missing_collection_404
 from qdrant_client.http.exceptions import UnexpectedResponse
 from reconciliation.harness_fixtures import (
@@ -17229,36 +17230,30 @@ class TestIntegrityGateIsAsyncAndNonBlocking:
     async def test_gate_does_not_block_the_event_loop(
         self, journal, event_buffer, mock_memory_service, tmp_path, monkeypatch, caplog,
     ):
-        """A slow detector must not stall the loop the remediation pass runs on.
+        """A suspended detector must not stall the loop the remediation pass runs on.
 
-        The fake awaits a real 200 ms sleep; a ticker coroutine advancing every
-        10 ms must keep advancing across it. A blocking implementation pins the
-        ticker at ~0.
+        While the gate is suspended inside the detector, a marker queued on the
+        test loop must run: the fake suspends on
+        fused-memory/tests/_fm_helpers.py::LoopFreedomProbe, and a gate that
+        resumed the detector itself instead of awaiting it reads False. This
+        loop-turn oracle replaces a wall-clock tick floor that reds under
+        GIL/host contention (task 5920 introduced the probe; task 5925 for this
+        site).
         """
-        ticks = 0
-
-        async def _ticker():
-            nonlocal ticks
-            while True:
-                await asyncio.sleep(0.01)
-                ticks += 1
+        probe = LoopFreedomProbe()
 
         async def _fake_is_live(_tid, _pr, **kw):
-            await asyncio.sleep(0.2)
+            await probe.suspend()
             return True
 
-        ticker = asyncio.create_task(_ticker())
-        try:
-            await self._run_gate(
-                journal=journal, event_buffer=event_buffer,
-                mock_memory_service=mock_memory_service, tmp_path=tmp_path,
-                monkeypatch=monkeypatch, caplog=caplog,
-                cited_task=self._cited_task(), fake_is_live=_fake_is_live,
-            )
-        finally:
-            ticker.cancel()
+        await self._run_gate(
+            journal=journal, event_buffer=event_buffer,
+            mock_memory_service=mock_memory_service, tmp_path=tmp_path,
+            monkeypatch=monkeypatch, caplog=caplog,
+            cited_task=self._cited_task(), fake_is_live=_fake_is_live,
+        )
 
-        assert ticks >= 5
+        probe.assert_loop_stayed_free()
 
     @pytest.mark.asyncio
     async def test_gate_hoists_the_worktree_index_across_the_cited_task_fan_out(

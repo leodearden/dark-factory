@@ -5,7 +5,7 @@ Tests are grouped per plan step:
 
   pre-1  SCAFFOLD — shared fixtures/helpers (git repo, gated runner, fake remote)
   step-1 RED      — _run_post_merge_verify(runner=<fake>) + runner=None byte-identical
-  step-3 RED      — _inflight/_redispatch/_n_failed/_remerge_occurred attrs + InflightEntry
+  step-3 RED      — _inflight/redispatch-park/_n_failed/_remerge_occurred attrs + InflightEntry
   step-5 RED      — _run_inflight_verify happy paths (LOCAL + REMOTE lease)
   step-7 RED      — _run_inflight_verify abort-poll (abandon + halt)
   step-9 RED      — _run_inflight_verify RUNNER_UNAVAILABLE sentinel
@@ -33,7 +33,7 @@ import inspect
 import logging
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Literal, TypeGuard
+from typing import Any, TypeGuard
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -46,16 +46,15 @@ from _merge_lane_fakes import (
     main_health_probe_spawned,
     raises,
 )
+from _merge_worker_drive import (
+    HEAVY_BARRIER_TEST_TIMEOUT,
+    make_merge_request,
+    make_real_merge_item,
+    stop_merge_worker,
+)
 from _orch_helpers import (
     MERGE_GATE_BARRIER_TIMEOUT,
     MERGE_RESULT_TIMEOUT,
-    # task 4215 moved this constant to _orch_helpers.py, where a runtime
-    # `tomllib` read of orchestrator/pyproject.toml now pins it against the
-    # real `[tool.pytest.ini_options].timeout`
-    # (test_whole_tree_scan_timeout_guard.py).
-    PYPROJECT_DEFAULT_TIMEOUT,
-    STOP_WORKER_JOIN_TIMEOUT,
-    UNDER_LOAD_HEADROOM_FACTOR,
     wait_responsive,
 )
 from _verify_result_doubles import (
@@ -69,13 +68,12 @@ from _wait_hygiene_scan import (
 )
 
 from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
-from orchestrator.git_ops import GitOps, MergeResult, _run
+from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_lane.types import QueuedBranch
 from orchestrator.merge_lane.worker import (
     MERGE_WORKER_SHUTDOWN_REASON,
     MergeOutcome,
     MergeRequest,
-    RealMergeItem,
     SpeculativeMergeWorker,
 )
 from orchestrator.verify import VerifyResult
@@ -140,55 +138,6 @@ async def _make_branch_with_file(
     return worktree
 
 
-def _make_request(
-    task_id: str,
-    branch: str,
-    worktree: Path,
-    config: OrchestratorConfig,
-    pre_rebased: bool = False,
-    lane: Literal['normal', 'high'] = 'normal',
-) -> MergeRequest:
-    """Build a MergeRequest with a fresh Future for the running event loop."""
-    try:
-        future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
-    except RuntimeError:
-        from _orch_helpers import make_placeholder_future
-        future = make_placeholder_future()
-    return MergeRequest(
-        task_id=task_id,
-        branch=QueuedBranch.parse(branch, config.git.branch_prefix),
-        worktree=worktree,
-        pre_rebased=pre_rebased,
-        task_files=None,
-        module_configs=[],
-        config=config,
-        result=future,
-        lane=lane,
-    )
-
-
-def _make_real_item(
-    git_ops: GitOps,
-    config: OrchestratorConfig,
-    task_id: str,
-    base_sha: str,
-) -> RealMergeItem:
-    """Build a dispatch-ready, non-speculative RealMergeItem over a fresh
-    MergeRequest whose merge has notionally succeeded -- the single
-    construction site for tests that hand a worker an item without running
-    a real merge.
-    """
-    req = _make_request(task_id, f'task/{task_id}', git_ops.project_root, config)
-    wt = git_ops.project_root / '.worktrees' / task_id
-    return RealMergeItem(
-        request=req,
-        merge_result=MergeResult(success=True, merge_commit='deadbeef', merge_worktree=wt),
-        merge_wt=wt,
-        base_sha=base_sha,
-        speculative=False,
-    )
-
-
 # THIS FILE CARRIES DEBT under rule `wall-clock-deadline` in
 # fused-memory/scripts/check_bare_magicmock_config.py (task 4246), which checks
 # the SHAPE of a load-bearing wait: a `MergeRequest.result` future or a
@@ -240,73 +189,6 @@ async def _await_outcome(
         )
 
 
-async def _stop_worker(
-    worker: SpeculativeMergeWorker,
-    worker_task: asyncio.Task[None],
-    *,
-    join_timeout: float = STOP_WORKER_JOIN_TIMEOUT,
-) -> None:
-    """Shut *worker* down and join its run task -- the ONE teardown shape
-    shared by this module and every sibling merge-worker test module that
-    imports it, so no site can drift or be forgotten.
-
-    ALWAYS call this from a ``finally:`` whose ``try:`` encloses every wait in
-    the test body (task 3980 amendment, esc-3980-4). ``wait_responsive``
-    gives up by raising ``_pytest.outcomes.Failed``, and an assertion
-    mid-body raises too; on the old straight-line shape either one skipped
-    ``stop()`` entirely and leaked a live merge worker plus its run task into
-    pytest-asyncio teardown. That leak is why one red test used to cascade
-    into unrelated failures elsewhere in the session.
-    ``_wait_hygiene_scan.py::unguarded_worker_teardown_items`` enforces
-    the ``finally:``.
-
-    Safe on the give-up path even when a gate was never released: ``stop()``
-    cancels every in-flight verify task rather than awaiting it
-    (``orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker.stop``),
-    so it cannot itself block on an unreleased ``asyncio.Event``.  Whatever
-    the lane still has to unwind on the way out keeps seeing the injected
-    verifier, which is the lane's own collaborator for its whole lifetime
-    rather than a binding swapped in for a block.
-
-    The join stays best-effort (``suppress(Exception)``): it asserts nothing,
-    and a slow join must not convert a real failure above into a confusing
-    second one. It is also why this wait is exempt from the shared
-    ``wall-clock-deadline`` rule
-    (fused-memory/scripts/check_bare_magicmock_config.py): its target is a
-    bare Name, not a ``.result`` future or a zero-argument ``.wait()`` barrier, so the
-    exemption is structural rather than a listed name. It is still a real
-    wait, so ``_wait_budget_audit.py::_call_wait_budget`` bills its
-    *join_timeout*.
-    """
-    await worker.stop()
-    with contextlib.suppress(Exception):
-        await asyncio.wait_for(worker_task, timeout=join_timeout)
-
-
-# The shared per-test ceiling for every class whose waits outgrow the ambient
-# budget. SHARED, not per-class, so the marks cannot drift apart (task 3477
-# found two that had; task 3492 generalized CASCADE_TEST_TIMEOUT into this).
-#
-# No test's budget is written here or beside its mark:
-# test_wait_budget_coverage_guard.py recomputes each one from source on every
-# run and checks it against the closest timeout mark, or against the ambient
-# budget for an unmarked test -- so leaving a class unmarked is a checked
-# decision too.
-#
-# A literal, pinned by TestHeavyBarrierTimeoutConstant against the measured
-# worst case below x UNDER_LOAD_HEADROOM_FACTOR and against
-# PYPROJECT_DEFAULT_TIMEOUT (never-narrow).  Derivation:
-# plans/pytest-per-test-timeout-measurement-2026-09-17.md.
-HEAVY_BARRIER_TEST_TIMEOUT = 540
-
-# Worst per-test wall clock -- setup+call+teardown, what a pytest-timeout mark
-# bounds -- of any HEAVY_BARRIER- or capstone-marked test: task 5572, 2026-10-08,
-# `-n auto` at loadavg 152 -> 101,
-# test_merge_speculation.py::TestSpecLaneAbortReleasesLane::test_operator_halt_releases_spec_lane.
-# Corpus: plans/pytest-per-test-timeout-measurement-2026-09-17.md.
-_HEAVY_BARRIER_MEASURED_UNDER_LOAD_WORST_CASE = 14.59
-
-
 # ---------------------------------------------------------------------------
 # (d) OrchestratorConfig builders: single-host vs two-host
 # ---------------------------------------------------------------------------
@@ -329,9 +211,9 @@ def _make_config_with_runner(
         git_remote='origin',
         enabled=True,
     )
-    return OrchestratorConfig(
-        project_root=git_repo,
-        git=git_config,
+    return lane_scene_config(
+        git_repo,
+        git_config,
         verify_runners=[runner_cfg],
         verify_host_policy='prefer_local',
     )
@@ -541,7 +423,7 @@ class TestRunPostMergeVerifyRunnerParam:
 
         fake_remote = _make_fake_remote('laptop')
         config = OrchestratorConfig(git=GitConfig(main_branch='main'))
-        req = _make_request('t1', 'task/t1', tmp_path, config)
+        req = make_merge_request('t1', 'task/t1', tmp_path, config)
         git_ops = self._make_git_ops_mock()
 
         outcome = await _run_post_merge_verify(
@@ -560,7 +442,7 @@ class TestRunPostMergeVerifyRunnerParam:
         from orchestrator.merge_lane.worker import _run_post_merge_verify
 
         config = OrchestratorConfig(git=GitConfig(main_branch='main'))
-        req = _make_request('t2', 'task/t2', tmp_path, config)
+        req = make_merge_request('t2', 'task/t2', tmp_path, config)
         git_ops = self._make_git_ops_mock()
 
         outcome = await _run_post_merge_verify(
@@ -581,7 +463,7 @@ class TestRunPostMergeVerifyRunnerParam:
 
         fake_remote = _make_fake_remote('laptop')
         config = OrchestratorConfig(git=GitConfig(main_branch='main'))
-        req = _make_request('t3', 'task/t3', tmp_path, config)
+        req = make_merge_request('t3', 'task/t3', tmp_path, config)
         git_ops = self._make_git_ops_mock()
 
         emitted: list[dict] = []
@@ -616,7 +498,7 @@ class TestRunPostMergeVerifyRunnerParam:
 
 
 class TestInflightStateAttrs:
-    """SpeculativeMergeWorker exposes _inflight/_redispatch/_n_failed/_remerge_occurred.
+    """SpeculativeMergeWorker exposes _inflight/redispatch-park/_n_failed/_remerge_occurred.
     InflightEntry dataclass is importable from merge_queue.
 
     RED until step-4 GREEN adds the dataclass and initialises the attrs.
@@ -633,12 +515,10 @@ class TestInflightStateAttrs:
         assert isinstance(worker._inflight, collections.deque)
         assert len(worker._inflight) == 0
 
-    def test_redispatch_is_empty_deque(self, git_ops: GitOps) -> None:
-        """_redispatch starts as an empty collections.deque."""
-        import collections
+    def test_redispatch_park_starts_empty(self, git_ops: GitOps) -> None:
+        """The redispatch park starts empty."""
         worker = self._make_worker(git_ops)
-        assert isinstance(worker._redispatch, collections.deque)
-        assert len(worker._redispatch) == 0
+        assert worker._intake.pending_redispatch() == ()
 
     def test_n_failed_is_false(self, git_ops: GitOps) -> None:
         """_n_failed starts False."""
@@ -1936,7 +1816,7 @@ class TestSingleHostSerialByteIdentical:
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, q)
 
-        req = _make_request('nf-conflict', 'nf-conflict', git_ops.project_root, config)
+        req = make_merge_request('nf-conflict', 'nf-conflict', git_ops.project_root, config)
         conflict_outcome = MergeOutcome('conflict', reason='merge conflict')
 
         token = DecidedItem(
@@ -2195,7 +2075,7 @@ class TestOverlapSignal:
                 label='ov-b: MergeOutcome (submission-order finalize)',
             )
         finally:
-            await _stop_worker(worker, worker_task, join_timeout=45.0)
+            await stop_merge_worker(worker, worker_task, join_timeout=45.0)
 
         assert outcome_a.status == 'done', f'N: expected done, got {outcome_a}'
         assert outcome_b.status == 'done', f'N+1: expected done, got {outcome_b}'
@@ -2293,7 +2173,7 @@ class TestLastItemOfBurstFinalizes:
                     'GREEN: race persistent getter vs running verify tasks.'
                 )
         finally:
-            await _stop_worker(worker, worker_task)
+            await stop_merge_worker(worker, worker_task)
 
         assert outcome.status == 'done', f'expected done, got {outcome}'
 
@@ -2331,7 +2211,7 @@ class TestChainInvalidationUnderOverlap:
       · cancel_and_release(N+1's lease) → remote cancel_verify called
       · cleans N+1's stale merge worktree
       · _remerge(N+1's req) → fresh SpeculativeItem on actual main
-      · appends to _redispatch → re-dispatched on next fill iteration
+      · appends to the redispatch park → re-dispatched on next fill iteration
     N+1 resolves 'done' and main has ci_b.py; N (ci_a.py) never landed.
     """
 
@@ -2430,7 +2310,7 @@ class TestChainInvalidationUnderOverlap:
                 label='ci-b: MergeOutcome (re-merged and re-verified after N failed)',
             )
         finally:
-            await _stop_worker(worker, worker_task, join_timeout=20.0)
+            await stop_merge_worker(worker, worker_task, join_timeout=20.0)
 
         # A starved-or-hung wait fails loudly by label at the wait_responsive
         # call above; this assertion only ever fires on a WRONG STATUS.
@@ -2440,7 +2320,7 @@ class TestChainInvalidationUnderOverlap:
             'RED: fill-ahead blocking-get deadlocks after N fails — '
             '_inflight still has N+1 but loop waits for queue items. '
             'GREEN (step-20): head-failure cascade clears _inflight, '
-            're-dispatches N+1 via _redispatch → "done".'
+            're-dispatches N+1 via the redispatch park → "done".'
         )
 
         # ── RED: fails here (cancel_verify not called) ───────────────────────
@@ -2478,12 +2358,12 @@ class TestChainInvalidationUnderOverlap:
     ) -> None:
         """The head-failure cascade's remerge-and-park of a downstream entry
         must reconcile the ItemLifecycle registry (VERIFYING -> MERGING ->
-        REDISPATCH_PARKED), not just move the item onto ``_redispatch``.
+        REDISPATCH_PARKED), not just move the item onto the redispatch park.
 
         task 2441: merge_queue.py:9456-9460 re-merges N+1 and appends it to
-        ``_redispatch`` with NO ``_note_transition`` calls, so the registry
+        the redispatch park with NO ``_note_transition`` calls, so the registry
         stays at VERIFYING while the item is physically parked on
-        ``_redispatch``. The later DISPATCH-FILL drain's
+        the redispatch park. The later DISPATCH-FILL drain's
         REDISPATCH_PARKED -> DISPATCHING ``_note_transition`` (9204-9209)
         then fails its from_state cross-check against the diverged VERIFYING
         registry state, firing a dedup'd L1
@@ -2691,13 +2571,13 @@ class TestHaltAndUnavailable:
     ) -> None:
         """OPERATOR-HALT aborts both in-flight verifies and requeues both requests.
 
-        After halt each _run_inflight_verify abort-poll detects _operator_halt
+        After halt each _run_inflight_verify abort-poll detects the operator halt
         and returns REQUEUED (req already back on _queue).  The head-failure
         cascade MUST NOT re-merge REQUEUED items — they are already handled.
 
         RED: cascade fires for N+1 (because N's finalize returns False for
         REQUEUED), calls _remerge(req_b) and puts the re-merged item in
-        _redispatch.  We detect this by spying on _remerge.
+        the redispatch park.  We detect this by spying on _remerge.
         GREEN (step-22): cascade skips REQUEUED entries; _remerge is never
         called; both reqs land on _queue exactly once and are resolved cleanly.
         """
@@ -2763,8 +2643,8 @@ class TestHaltAndUnavailable:
                 label='halt-b: remote verify entered',
             )
 
-            # Set operator halt — both abort-polls fire within 0.01s
-            worker._operator_halt.set()
+            # Operator halt — both abort-polls fire within 0.01s
+            worker.operator_halt('test: concurrent abort')
 
             # Give abort-polls time to fire and requeue
             await asyncio.sleep(0.15)
@@ -2773,7 +2653,7 @@ class TestHaltAndUnavailable:
             gate_a_release.set()
             gate_b_release.set()
         finally:
-            await _stop_worker(worker, worker_task)
+            await stop_merge_worker(worker, worker_task)
 
         # Both futures should be resolved (by stop()→shutdown, not by double-dispatch)
         assert req_a.result.done(), 'req_a.result should be resolved by stop()'
@@ -2886,7 +2766,7 @@ class TestHaltAndUnavailable:
                 label='unav-b: MergeOutcome (re-dispatched on local after quarantine)',
             )
         finally:
-            await _stop_worker(worker, worker_task)
+            await stop_merge_worker(worker, worker_task)
 
         # N should resolve 'done' (local verify passed)
         assert outcome_a.status == 'done', (
@@ -2964,8 +2844,8 @@ class TestStopDrainsInflight:
         verify_task_b = asyncio.ensure_future(_gated_verify_b())
 
         # Build two fake RealMergeItems with fresh futures.
-        item_a = _make_real_item(git_ops, config, 'stop-a', 'aaa')
-        item_b = _make_real_item(git_ops, config, 'stop-b', 'bbb')
+        item_a = make_real_merge_item(git_ops, config, 'stop-a', 'aaa')
+        item_b = make_real_merge_item(git_ops, config, 'stop-b', 'bbb')
 
         entry_a = InflightEntry(
             item=item_a,
@@ -3024,7 +2904,7 @@ class TestStopDrainsInflight:
             return InflightVerifyResult(outcome=None, merge_wt=None, status=None)
 
         verify_task = asyncio.ensure_future(_blocking_verify())
-        req = _make_request('stop-ct', 'task/stop-ct', git_ops.project_root, config)
+        req = make_merge_request('stop-ct', 'task/stop-ct', git_ops.project_root, config)
         item = DecidedItem(
             request=req,
             immediate_outcome=MergeOutcome('blocked', reason='test-filler'),
@@ -3055,31 +2935,31 @@ class TestStopDrainsInflight:
         git_ops: GitOps,
         config: OrchestratorConfig,
     ) -> None:
-        """stop() also drains _redispatch (pending re-dispatch items).
+        """stop() also drains the redispatch park (pending re-dispatch items).
 
-        RED: _redispatch items are not drained; their futures stay pending.
-        GREEN (step-24): _redispatch drained + futures resolved.
+        RED: redispatch-park items are not drained; their futures stay pending.
+        GREEN (step-24): the redispatch park drained + futures resolved.
         """
         from orchestrator.merge_lane.worker import DecidedItem
 
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, q)
 
-        req = _make_request('stop-rd', 'task/stop-rd', git_ops.project_root, config)
+        req = make_merge_request('stop-rd', 'task/stop-rd', git_ops.project_root, config)
         item = DecidedItem(
             request=req,
             immediate_outcome=MergeOutcome('blocked', reason='test-filler'),
             base_sha='ddd',
             speculative=False,
         )
-        worker._redispatch.append(item)
+        worker._intake.request_redispatch(item)
 
         await worker.stop()
 
         assert req.result.done(), (
-            'req.result not resolved after stop() with item in _redispatch. '
-            'RED: stop() does not drain _redispatch. '
-            'GREEN (step-24): _redispatch drained; future resolved with shutdown.'
+            'req.result not resolved after stop() with item in the redispatch park. '
+            'RED: stop() does not drain the redispatch park. '
+            'GREEN (step-24): the redispatch park drained; future resolved with shutdown.'
         )
 
 
@@ -3112,8 +2992,8 @@ class TestSnapshotInflight:
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, q)
 
-        req_a = _make_request('snap-a', 'task/snap-a', git_ops.project_root, config)
-        req_b = _make_request('snap-b', 'task/snap-b', git_ops.project_root, config)
+        req_a = make_merge_request('snap-a', 'task/snap-a', git_ops.project_root, config)
+        req_b = make_merge_request('snap-b', 'task/snap-b', git_ops.project_root, config)
 
         item_a = DecidedItem(
             request=req_a,
@@ -3177,7 +3057,7 @@ class TestSnapshotInflight:
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, q)
 
-        req = _make_request('snap-sh', 'task/snap-sh', git_ops.project_root, config)
+        req = make_merge_request('snap-sh', 'task/snap-sh', git_ops.project_root, config)
         item = DecidedItem(
             request=req,
             immediate_outcome=MergeOutcome('blocked', reason='test-filler'),
@@ -3222,8 +3102,8 @@ class TestSnapshotInflight:
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, q)
 
-        req_a = _make_request('snap-vip-a', 'task/snap-vip-a', git_ops.project_root, config)
-        req_b = _make_request('snap-vip-b', 'task/snap-vip-b', git_ops.project_root, config)
+        req_a = make_merge_request('snap-vip-a', 'task/snap-vip-a', git_ops.project_root, config)
+        req_b = make_merge_request('snap-vip-b', 'task/snap-vip-b', git_ops.project_root, config)
 
         item_a = DecidedItem(
             request=req_a,
@@ -3537,7 +3417,7 @@ class TestRunnerUnavailableHeadCascade:
         # _finalize_inflight(N) returns False → head-failure cascade fires:
         #   · N+1's verify task is cancelled (cascade calls cancel_and_release)
         #   · N+1 is re-merged onto actual main
-        #   · both N and N+1 are re-dispatched via _redispatch
+        #   · both N and N+1 are re-dispatched via the redispatch park
         gate_a_release.set()
 
         # Release N+1's gate so the (possibly still-running) gated task
@@ -3886,7 +3766,7 @@ class TestStopDrainFiresRemoteCancel:
         worker._host_allocator = None     # cancel_and_release never called
 
         # ── REMOTE entry: id-liveness fake ──────────────────────────────────
-        req_remote = _make_request(
+        req_remote = make_merge_request(
             'stop-rc-remote', 'task/stop-rc-remote',
             git_ops.project_root, config,
         )
@@ -3919,7 +3799,7 @@ class TestStopDrainFiresRemoteCancel:
         local_runner = MagicMock()
         local_runner.cancel_verify = AsyncMock(return_value=0)
         local_lease = HostLease(name='local', runner=local_runner, is_local=True)
-        req_local = _make_request(
+        req_local = make_merge_request(
             'stop-rc-local', 'task/stop-rc-local',
             git_ops.project_root, config,
         )
@@ -4306,12 +4186,12 @@ class TestCascadeErrorContainment:
                 label='cascade-err-c: MergeOutcome (loop-survival signal)',
             )
         finally:
-            # esc-3980-4 (see _stop_worker): wait_responsive gives up by
+            # esc-3980-4 (see stop_merge_worker): wait_responsive gives up by
             # raising _pytest.outcomes.Failed, and the two hard asserts above
             # raise too -- so on the old straight-line shape any of those
             # could skip worker.stop() and leak a live worker plus its run
             # task into pytest-asyncio teardown.
-            await _stop_worker(worker, worker_task)
+            await stop_merge_worker(worker, worker_task)
 
         # ── (1) LOOP SURVIVES ────────────────────────────────────────────────
         # A starved-or-hung wait now fails loudly by label at the
@@ -4510,7 +4390,7 @@ class TestCascadeErrorContainment:
                 'A higher value means the not-_entry_released handler over-released.'
             )
         finally:
-            await _stop_worker(worker, worker_task, join_timeout=20.0)
+            await stop_merge_worker(worker, worker_task, join_timeout=20.0)
 
         # ── (1) LOOP SURVIVES ────────────────────────────────────────────────
         # A starved-or-hung wait fails loudly by label at the wait_responsive
@@ -5253,8 +5133,8 @@ class TestStopDrainSurvivesARaisingRemoteAbort:
         config = lane_scene_config(git_repo, git_config, verify_host_policy='prefer_remote')
         wt_a = await _make_branch_with_file(git_ops, 'task/drain-a', 'drain_a.py', 'a = 1\n')
         wt_b = await _make_branch_with_file(git_ops, 'task/drain-b', 'drain_b.py', 'b = 2\n')
-        req_a = _make_request('drain-a', 'task/drain-a', wt_a, config)
-        req_b = _make_request('drain-b', 'task/drain-b', wt_b, config)
+        req_a = make_merge_request('drain-a', 'task/drain-a', wt_a, config)
+        req_b = make_merge_request('drain-b', 'task/drain-b', wt_b, config)
 
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, q)
@@ -5275,7 +5155,7 @@ class TestStopDrainSurvivesARaisingRemoteAbort:
                 label='drain-b: remote verify entered',
             )
         finally:
-            await _stop_worker(worker, worker_task)
+            await stop_merge_worker(worker, worker_task)
 
         remote_a.cancel_verify.assert_awaited()
         remote_b.cancel_verify.assert_awaited()
@@ -5296,7 +5176,7 @@ class TestStopDrainSurvivesARaisingRemoteAbort:
 
 
 # ---------------------------------------------------------------------------
-# task 2063: _redispatch-parked speculative permit accounting (signal test)
+# task 2063: speculative permit accounting on the redispatch park (signal test)
 # ---------------------------------------------------------------------------
 
 
@@ -5342,13 +5222,13 @@ class _DriftCheckTakesRemoteAllocator(HostAllocator):
 @pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3492: a deliberate over-mark -- a loop.time()-deadline poll loop here is invisible to _wait_budget_audit.py::item_wait_budgets
 class TestRedispatchSpeculativeConservation:
     """Signal/e2e regression lock (task 2063): a genuinely speculative item
-    parked on ``_redispatch`` must stay counted by
+    parked on the redispatch park must stay counted by
     ``_inflight_speculative_count()`` throughout the REAL merger/verifier
     pipeline — not just in the hand-constructed unit tests in
     test_merge_queue_resource_audit.py.
 
     MECHANISM — the production route to a speculative item on
-    ``_redispatch``: ``_dispatch_item`` passes its ``free_host_count()``
+    the redispatch park: ``_dispatch_item`` passes its ``free_host_count()``
     guard, then a concurrent non-loop acquirer takes the free slot before its
     ``acquire()``.  That acquirer is
     ``orchestrator/src/orchestrator/merge_drift.py::_run_drift_check``, which
@@ -5361,7 +5241,7 @@ class TestRedispatchSpeculativeConservation:
     SCENARIO: A's local verify is gated then FAILS. While gated, the merger
     speculatively merges B against A's tentative commit and hands it to the
     verifier; dispatching B loses the remote to the modelled drift check and
-    B parks on ``_redispatch``. When A's gate releases (A fails), the
+    B parks on the redispatch park. When A's gate releases (A fails), the
     existing 'previous_failed' chain-invalidation path re-merges B against
     actual main (speculative -> False) and re-dispatches it; B's second
     local verify passes -> 'done'.
@@ -5375,7 +5255,7 @@ class TestRedispatchSpeculativeConservation:
     ) -> None:
         """The I4 speculation-slot identity holds at every heartbeat-observable
         point while a genuinely speculative item sits parked on
-        ``_redispatch``, and no ``merge_resource_leak`` escalation ever fires.
+        the redispatch park, and no ``merge_resource_leak`` escalation ever fires.
 
         Also (task 3477): the disposition classifier must not silently
         degrade to its fail-open path while processing this test's failing
@@ -5421,8 +5301,8 @@ class TestRedispatchSpeculativeConservation:
 
         worker.speculation_accounting_violations = _traced_violations  # type: ignore[method-assign]
 
-        req_a = _make_request('rc-a', 'task/rc-a', wt_a, config)
-        req_b = _make_request('rc-b', 'task/rc-b', wt_b, config)
+        req_a = make_merge_request('rc-a', 'task/rc-a', wt_a, config)
+        req_b = make_merge_request('rc-b', 'task/rc-b', wt_b, config)
 
         worker_task = asyncio.create_task(worker.run())
         try:
@@ -5437,14 +5317,14 @@ class TestRedispatchSpeculativeConservation:
 
             # Bounded poll (not a flat sleep): the merger's real git worktree
             # + commit calls have variable latency, so wait until B has
-            # actually landed on _redispatch rather than guessing a delay.
+            # actually landed on the redispatch park rather than guessing a delay.
             deadline = asyncio.get_running_loop().time() + 15.0
-            while not worker._redispatch and asyncio.get_running_loop().time() < deadline:
+            while not worker._intake.pending_redispatch() and asyncio.get_running_loop().time() < deadline:
                 await asyncio.sleep(0.05)
 
-            parked = list(worker._redispatch)
+            parked = list(worker._intake.pending_redispatch())
             assert len(parked) == 1 and parked[0].speculative, (
-                f'Expected exactly one speculative item parked on _redispatch '
+                f'Expected exactly one speculative item parked on the redispatch park '
                 f'while A is gated (proves the fix is actually exercised); '
                 f'got {parked!r}.'
             )
@@ -5502,12 +5382,12 @@ class TestRedispatchSpeculativeConservation:
             assert all(v == [] for v in heartbeat_samples), (
                 f'speculation-slot identity must hold on every '
                 f'heartbeat-triggered audit call while the speculative item '
-                f'is parked on _redispatch; got {heartbeat_samples!r}'
+                f'is parked on the redispatch park; got {heartbeat_samples!r}'
             )
 
             assert worker.speculation_accounting_violations() == [], (
                 'speculation-slot identity must hold while the speculative '
-                'item is parked on _redispatch'
+                'item is parked on the redispatch park'
             )
 
             # A fails -> the existing 'previous_failed' chain-invalidation
@@ -5535,7 +5415,7 @@ class TestRedispatchSpeculativeConservation:
                 f'{final_heartbeat_samples!r}'
             )
         finally:
-            await _stop_worker(worker, worker_task)
+            await stop_merge_worker(worker, worker_task)
 
         assert outcome_a.status != 'done', (
             f'Expected A to fail (gated verify returns passed=False), got {outcome_a!r}'
@@ -5548,7 +5428,7 @@ class TestRedispatchSpeculativeConservation:
         assert all(v == [] for v in recorded_violations), (
             f'speculation-slot identity must hold at every heartbeat-observable '
             f'point (identity broken pre-fix while B sat uncounted on '
-            f'_redispatch); got samples: {recorded_violations!r}'
+            f'redispatch park); got samples: {recorded_violations!r}'
         )
 
         leak_escalations = [
@@ -5638,7 +5518,7 @@ class TestFinalizeHeadSpeculativeAccountingThroughout:
         from orchestrator.merge_lane.worker import RealMergeItem
 
         wt = await _make_branch_with_file(git_ops, branch, filename, content)
-        req = _make_request(branch, branch, wt, config)
+        req = make_merge_request(branch, branch, wt, config)
         merge_result = await git_ops.merge_to_main(wt, branch)
         assert merge_result.success and merge_result.merge_commit
         assert merge_result.merge_worktree is not None
@@ -5864,36 +5744,6 @@ class TestLoudWaitMigrationRatchet:
             'The following methods call wait_responsive but do not call '
             'worker.stop() from inside a finally: block (esc-3980-4 leak '
             'invariant -- see '
-            'test_merge_queue_concurrent_verify.py::_stop_worker):\n'
+            '_merge_worker_drive.py::stop_merge_worker):\n'
             + '\n'.join(f'  - {offender}' for offender in offenders)
-        )
-
-
-class TestHeavyBarrierTimeoutConstant:
-    """HEAVY_BARRIER_TEST_TIMEOUT is a literal held up by two floors.
-
-    Whether each marked test's waits fit under it is checked per item by
-    test_wait_budget_coverage_guard.py, not here.
-    """
-
-    def test_clears_the_measured_wall_clock_with_headroom(self) -> None:
-        """The constant keeps UNDER_LOAD_HEADROOM_FACTOR over the measured worst case."""
-        required = _HEAVY_BARRIER_MEASURED_UNDER_LOAD_WORST_CASE * UNDER_LOAD_HEADROOM_FACTOR
-        assert required <= HEAVY_BARRIER_TEST_TIMEOUT, (
-            f'HEAVY_BARRIER_TEST_TIMEOUT ({HEAVY_BARRIER_TEST_TIMEOUT}s) no longer '
-            f'clears {UNDER_LOAD_HEADROOM_FACTOR}x the measured-under-load worst '
-            f'case ({_HEAVY_BARRIER_MEASURED_UNDER_LOAD_WORST_CASE}s = {required}s). '
-            'Raise the constant (and re-record the measurement) rather than '
-            'relaxing this arithmetic.'
-        )
-
-    def test_never_narrows_the_ini_default(self) -> None:
-        """The constant never falls below PYPROJECT_DEFAULT_TIMEOUT."""
-        assert HEAVY_BARRIER_TEST_TIMEOUT >= PYPROJECT_DEFAULT_TIMEOUT, (
-            f'HEAVY_BARRIER_TEST_TIMEOUT ({HEAVY_BARRIER_TEST_TIMEOUT}s) is below '
-            f'the pyproject default ({PYPROJECT_DEFAULT_TIMEOUT}s). A timeout mark '
-            'REPLACES the ambient budget rather than flooring it (see '
-            '_orch_helpers.VERIFY_CLI_PER_TEST_TIMEOUT), so below the ini default '
-            'the merge-barrier classes carrying this mark run TIGHTER than every '
-            'unmarked test on a bare local or agent run. Raise the constant.'
         )

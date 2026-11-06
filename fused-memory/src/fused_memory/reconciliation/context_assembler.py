@@ -22,6 +22,7 @@ from fused_memory.models.reconciliation import (
     ReconciliationEvent,
     Watermark,
 )
+from fused_memory.reconciliation.child_memory_link import render_parent_link
 from fused_memory.services.read_telemetry import (
     summarize_search_query,
     summarize_search_results,
@@ -32,6 +33,7 @@ from fused_memory.utils.clip_disclosure import elide_text
 if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
     from fused_memory.config.schema import ReconciliationConfig
+    from fused_memory.models.memory import MemoryResult
     from fused_memory.services.memory_service import MemoryService
 
 logger = logging.getLogger(__name__)
@@ -67,12 +69,12 @@ def format_event(event: ReconciliationEvent) -> str:
     return f'- [{event.type.value}] {event.timestamp.isoformat()}: {json.dumps(event.payload)}'
 
 
-def _format_memory_result(result) -> str:
+def _format_memory_result(result: MemoryResult) -> str:
     """Format a MemoryResult into a context line."""
     content = elide_text(result.content, _MEMORY_BODY_CHARS, field='content').text
     source = result.source_store.value if result.source_store else '?'
     cat = result.category.value if result.category else '?'
-    return f'- [{result.id}] ({source}/{cat}): {content}'
+    return f'- [{result.id}]{render_parent_link(result.metadata)} ({source}/{cat}): {content}'
 
 
 def _format_task(task: dict, *, display_id: str | None = None) -> str:

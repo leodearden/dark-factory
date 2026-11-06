@@ -963,6 +963,9 @@ def _make_run_wf(
     wf.scheduler.get_task = AsyncMock(return_value=None)
     wf.git_ops.get_main_sha = AsyncMock(return_value='deadbeef00')
     wf.git_ops.is_ancestor = AsyncMock(return_value=False)  # not already merged
+    wf.git_ops.is_ancestor_checked = AsyncMock(return_value=False)
+    wf.git_ops.resolve_branch_sha = AsyncMock(return_value=None)
+    wf.git_ops.has_uncommitted_work = AsyncMock(return_value=False)
     wf.git_ops.rebase_onto_main = AsyncMock(return_value=True)
     # run()'s terminal finally awaits git_ops.release_lane_for_terminal_task on
     # the DONE/CANCELLED path (workflow.py:2030) — stub so the plain MagicMock
@@ -1261,6 +1264,10 @@ class TestMergePhaseGraceStampLifecycle:
         wf._check_escalations = MagicMock(return_value=[])  # type: ignore[method-assign]
         wf._recover_before_merge = AsyncMock(return_value=None)  # type: ignore[method-assign]
         wf.git_ops.get_main_sha = AsyncMock(return_value='main_sha')
+        wf.git_ops.is_ancestor = AsyncMock(return_value=False)
+        wf.git_ops.is_ancestor_checked = AsyncMock(return_value=False)
+        wf.git_ops.resolve_branch_sha = AsyncMock(return_value=None)
+        wf.git_ops.has_uncommitted_work = AsyncMock(return_value=False)
         wf.git_ops.rebase_onto_main = AsyncMock(return_value=True)
         wf._submit_to_merge_queue = AsyncMock(  # type: ignore[method-assign]
             return_value=WorkflowOutcome.DONE,

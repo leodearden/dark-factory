@@ -508,7 +508,7 @@ class TestBlendComposite:
         UNCONDITIONAL rather than scoped to *plan_only* — quoting its
         docstring, "so a caller cannot silently bypass it by forgetting the
         flag." Deliberately exercised here at a shape the report layer's
-        ``no_plan = _has_plan_quality_score(m) and not produced_a_plan(m)``
+        ``no_plan = has_plan_quality_score(m) and not produced_a_plan(m)``
         call site never itself builds (it always passes ``plan_only``
         alongside ``no_plan``) — a defence-in-depth contract of this PURE
         function. (Cited by symbol/quote rather than line number: both drift

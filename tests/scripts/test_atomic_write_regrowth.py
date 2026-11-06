@@ -347,15 +347,18 @@ _ALLOWED_RENAMERS = {
         'and the source is gone by the end. atomic_write_text exposes no '
         'pre-replace seam, and the payload is decompressed bytes on disk '
         'rather than a str already in memory.',
-    ('scripts/orchestrator-watchdog.py', '_atomic_write_json'):
+    ('scripts/_watchdog_state.py', 'atomic_write_json'):
         'STDLIB-ONLY STANDALONE ENTRYPOINT — as dashboard-watchdog.save_state '
-        'above, and session_registry._atomic_write_text before it. A '
-        '``#!/usr/bin/env python3`` systemd/cron oneshot; verified by reading '
-        'its imports that the only addition beyond dashboard-watchdog\'s set '
-        'is shlex, i.e. still stdlib. Note this IS already a consolidation '
-        '(task 3764 extracted it so the mkdir/mktemp/write/rename dance is '
-        'defined once for every watchdog state file rather than per call '
-        'site), so the duplication here is one deep, not per-writer.',
+        'above, and session_registry._atomic_write_text before it. A flat '
+        'stdlib sibling that scripts/orchestrator-watchdog.py, a '
+        '``#!/usr/bin/env python3`` systemd/cron oneshot, imports from its own '
+        'directory; verified by reading both files\' imports that they are '
+        'still stdlib-only, so ``from shared import safe_io`` has nothing to '
+        'resolve against. Note this IS already a consolidation (task 3764 '
+        'extracted it so the mkdir/mktemp/write/rename dance is defined once '
+        'for every watchdog state file rather than per call site; task 6448 '
+        'moved it into this sibling), so the duplication here is one deep, '
+        'not per-writer.',
     ('scripts/sweep_toolcall_markup.py', 'write_repaired'):
         'PRE-REPLACE VERIFICATION SEAM. This entry USED to cite '
         'plan_tools._atomic_write_plan for that argument instead of making it. '
@@ -378,7 +381,7 @@ _ALLOWED_RENAMERS = {
     # one path nobody diffs, which is the opposite of what this guard is for.
     ('scripts/render_systemd_unit.py', 'main'):
         'STDLIB-ONLY STANDALONE ENTRYPOINT — the class of dashboard-watchdog.'
-        'save_state and orchestrator-watchdog._atomic_write_json above, and of '
+        'save_state and _watchdog_state.atomic_write_json above, and of '
         'session_registry._atomic_write_text before them, but under a HARDER '
         'constraint than any of them: setup-host.sh invokes it as bare '
         '``python3 <abs path>`` (never ``uv run``) while BOOTSTRAPPING the '

@@ -133,7 +133,7 @@ class TestVerifyMergeRecordsItsWorktree:
     def test_records_acquired_worktree_mid_run_and_clears_it_on_exit(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        invoke = _patched_verify_merge(tmp_path, monkeypatch)
+        invoke = _patched_verify_merge(tmp_path, monkeypatch).invoke
         pgf = pgid_file(tmp_path / '.worktrees', 'req-merge')
         recorded_mid_run: list[Path | None] = []
 
@@ -155,7 +155,7 @@ class TestVerifyMergeRecordsItsWorktree:
     def test_without_request_id_records_nothing(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        invoke = _patched_verify_merge(tmp_path, monkeypatch)
+        invoke = _patched_verify_merge(tmp_path, monkeypatch).invoke
 
         r = invoke()
 

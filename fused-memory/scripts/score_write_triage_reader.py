@@ -260,13 +260,16 @@ def score_reader(
     items: Iterable[Mapping[str, Any]],
     verdicts: Iterable[Mapping[str, Any]],
     *,
+    rubric: str,
     strata: Mapping[str, int] | None = None,
     harm_weights: Mapping[str, float] = PROVISIONAL_HARM_WEIGHTS,
 ) -> dict[str, Any]:
     """Score every item against the verdict corpus; refuse an incomplete one.
 
-    The report carries no timestamps, so scoring the same inputs twice gives
-    the same report.
+    *rubric* labels the rater brief the verdicts were rated under (``v2.1``,
+    ``v2.2``); verdict rows do not say, so the caller must, and the report
+    records it. The report carries no timestamps, so scoring the same inputs
+    twice gives the same report.
     """
     weights = _validated_weights(harm_weights)
     reader_items = _reader_items(items)
@@ -275,7 +278,7 @@ def score_reader(
     scored = [_score(item, judgements) for item in reader_items]
     _refuse_incomplete(scored)
     return {
-        'rubric': 'v2.1',
+        'rubric': rubric,
         'cell_rules': {str(cell): rule for cell, rule in _rubric.CELL_RULES.items()},
         'harm_weights': {str(cell): weight for cell, weight in weights.items()},
         'harm_weights_status': (
@@ -406,22 +409,61 @@ def _population(scored: Sequence[_Scored], strata: Mapping[str, int] | None) -> 
 def _kappa(
     scored: Sequence[_Scored], judgements: Mapping[_rubric.PairKey, _rubric.Judgement],
 ) -> dict[str, Any]:
-    """Cohen's kappa per binary between the primary and second rater, over consumed answers."""
-    pairs: dict[_rubric.Binary, list[tuple[str, str]]] = {binary: [] for binary in _rubric.Binary}
-    for s in scored:
-        if s.decided is None:
-            continue
-        for target, binary in sorted(_consumed(s, s.decided)):
-            judgement = judgements.get(_rubric.PairKey(s.item.entry_id, target, _rubric.Basis.CURRENT))
-            answers = None if judgement is None else _primary_and_second(judgement, binary)
-            if answers is not None:
-                pairs[binary].append(answers)
+    """:func:`kappa_over_consumed` over every decided item's consumed answers."""
+    consumed = [
+        (_rubric.PairKey(s.item.entry_id, target, _rubric.Basis.CURRENT), binary)
+        for s in scored if s.decided is not None
+        for target, binary in _consumed(s, s.decided)
+    ]
+    return kappa_over_consumed(consumed, judgements)
+
+
+ConsumedKey = tuple[_rubric.PairKey, _rubric.Binary]
+"""A current-basis pair key and a binary whose answers a figure read."""
+
+
+def kappa_over_consumed(
+    consumed: Iterable[ConsumedKey], judgements: Mapping[_rubric.PairKey, _rubric.Judgement],
+) -> dict[str, Any]:
+    """Cohen's kappa per binary between the primary and second rater, over *consumed* keys.
+
+    *judgements* is ``resolve_judgements``' output. Each key counts once, and
+    only where :func:`consumed_answer_pairs` finds both raters' answers. A
+    floor binary meets the floor at :data:`KAPPA_MIN_PAIRS` keys and
+    :data:`KAPPA_FLOOR`.
+    """
+    pairs = consumed_answer_pairs(consumed, judgements)
     return {
         'floor': KAPPA_FLOOR,
         'min_pairs': KAPPA_MIN_PAIRS,
         'floor_binaries': [str(binary) for binary in KAPPA_FLOOR_BINARIES],
-        'by_binary': {str(binary): _kappa_block(consumed) for binary, consumed in pairs.items()},
+        'by_binary': {
+            str(binary): _kappa_block([(primary, second) for _, primary, second in answered])
+            for binary, answered in pairs.items()
+        },
     }
+
+
+def consumed_answer_pairs(
+    consumed: Iterable[ConsumedKey], judgements: Mapping[_rubric.PairKey, _rubric.Judgement],
+) -> dict[_rubric.Binary, list[tuple[_rubric.PairKey, str, str]]]:
+    """Each binary's sorted (key, primary answer, second answer) over the distinct *consumed* keys.
+
+    A key is kept only when exactly one primary and one second vote both
+    decided its binary. A key off the current basis is refused: agreement is
+    measured on the current basis (``calibration/write_triage_reader_metrics.md`` §4).
+    """
+    pairs: dict[_rubric.Binary, list[tuple[_rubric.PairKey, str, str]]] = {
+        binary: [] for binary in _rubric.Binary
+    }
+    for key, binary in sorted(set(consumed)):
+        if key.basis != _rubric.Basis.CURRENT:
+            raise ValueError(f'consumed key {key} {binary} is on the {key.basis} basis, not current')
+        judgement = judgements.get(key)
+        answers = None if judgement is None else _primary_and_second(judgement, binary)
+        if answers is not None:
+            pairs[binary].append((key, *answers))
+    return pairs
 
 
 def _consumed(s: _Scored, decided: _rubric.Decided) -> frozenset[tuple[str, _rubric.Binary]]:
@@ -852,7 +894,7 @@ def _read_json_object(path: Path) -> dict[str, Any]:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            'Score write-triage outcomes by what a reader meets (rubric v2.1): metrics M1-M6,'
+            'Score write-triage outcomes by what a reader meets (rubric v2): metrics M1-M6,'
             ' rater agreement and harm per write against storing every write flat.'
             ' Definitions: fused-memory/calibration/write_triage_reader_metrics.md.'
         ),
@@ -864,6 +906,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         '--verdicts', type=Path, nargs='+', required=True, metavar='PATH',
         help='JSONL verdict files, read together as one corpus',
+    )
+    parser.add_argument(
+        '--rubric', required=True, metavar='LABEL',
+        help='the rater brief version the verdicts were rated under, e.g. v2.1; recorded in the report',
     )
     parser.add_argument(
         '--strata', type=Path, metavar='PATH',
@@ -886,6 +932,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         report = score_reader(
             _read_jsonl(args.items),
             _read_jsonl(args.verdicts),
+            rubric=args.rubric,
             strata=None if args.strata is None else _read_json_object(args.strata),
             harm_weights=(
                 PROVISIONAL_HARM_WEIGHTS if args.harm_weights is None

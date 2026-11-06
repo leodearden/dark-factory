@@ -13,6 +13,7 @@ import pytest
 import pytest_asyncio
 from _flag_for_stage2_pool_fake import LiveFlagPool
 from _fm_helpers import (
+    LoopFreedomProbe,
     as_async_run_git,
     assert_id_title_pairing,
     complete_paged_read,
@@ -79,6 +80,7 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
     _FLAG_FOR_STAGE2_MEM0_MAX_AGE_DAYS,
     _FLAG_FOR_STAGE2_TASKLESS_MAX_AGE_DAYS,
     _FLAGGED_ITEMS_CHAR_BUDGET,
+    STAGE1_FLAG_MARKER_MEM0_MAX_AGE_DAYS,
     IntegrityCheck,
     TaskKnowledgeSync,
     _format_flagged,
@@ -89,6 +91,7 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
     _select_proactive_sample,
     _suppress_same_run_human_operator_dups,
     _sweep_stale_mem0_flag_for_stage2_markers,
+    _sweep_stale_mem0_flag_markers,
     queue_briefing_refresh_tasks,
     retire_flag_markers_for_terminal_task,
     select_tasks_needing_hint_attention,
@@ -226,6 +229,10 @@ _REVIEWED_STAGE_SAFE = {
     # an id for and reads no per-task state, so against the reconciliation
     # queue it can only ever answer "not found" — never a categorical [].
     'mcp__escalation__amend_escalation',
+    # claim_policy_class (task 8422) refuses every identity except the
+    # escalation executor, so a recon stage can only ever be refused; it reads
+    # no per-task state.
+    'mcp__escalation__claim_policy_class',
     'mcp__escalation__claim_warm_worktree',
     # clear_verify_host_quarantine (task 6565) is merge-lane control plane: it
     # re-admits a benched verify host and reads no per-task escalation state.
@@ -2472,6 +2479,9 @@ class TestProjectIdValidation(BaseStageValidationTest):
             'stage1_undatable_freshness_records': 0,
             # Always present (task 5499): None because no backlog payload was assembled.
             'stage1_assembled_budget': None,
+            # Always present (task 4620); None because assemble_payload never ran
+            # here, so Stage 1 took no unfinished-Graphiti-write sample.
+            'stage1_unfinished_graphiti_write_start': None,
             # Always present (task 3052), zeroed in the same block as the
             # task-3084 curator-gate trio above and for the same reason: they
             # are set BEFORE the remediation early-return, so a caller reading
@@ -2694,6 +2704,9 @@ class TestProjectIdValidation(BaseStageValidationTest):
             'stage1_undatable_freshness_records': 0,
             # Always present (task 5499): None because no backlog payload was assembled.
             'stage1_assembled_budget': None,
+            # Always present (task 4620); None because assemble_payload never ran
+            # here, so Stage 1 took no unfinished-Graphiti-write sample.
+            'stage1_unfinished_graphiti_write_start': None,
             # Always present (task 3052), zeroed in the same block as the
             # task-3084 curator-gate trio above and for the same reason: they
             # are set BEFORE the remediation early-return, so a caller reading
@@ -3605,6 +3618,7 @@ class TestTierConfig:
         memory_mock.mem0 = AsyncMock()
         memory_mock.mem0.get_all = AsyncMock(return_value={'results': []})
         memory_mock.get_status = AsyncMock(return_value={})
+        memory_mock.earliest_unfinished_graphiti_write_start = MagicMock(return_value=None)
         stage = MemoryConsolidator(
             StageId.memory_consolidator,
             memory_mock, AsyncMock(), AsyncMock(), config,
@@ -3713,6 +3727,7 @@ class TestStagePayloadProjectIdGuideline:
         m.mem0 = AsyncMock()
         m.mem0.get_all = AsyncMock(return_value={'results': []})
         m.get_status = AsyncMock(return_value={})
+        m.earliest_unfinished_graphiti_write_start = MagicMock(return_value=None)
         return m
 
     @pytest.fixture
@@ -4161,6 +4176,7 @@ class TestMemoryConsolidatorFilteredTaskTree:
         svc.get_status = AsyncMock(return_value={})
         svc.mem0 = AsyncMock()
         svc.mem0.get_all = AsyncMock(return_value={'results': []})
+        svc.earliest_unfinished_graphiti_write_start = MagicMock(return_value=None)
         return svc
 
     @pytest.fixture
@@ -9384,6 +9400,140 @@ class TestSweepStaleMem0FlagMarkers:
         assert any("{'kind': 'stage1_flag_marker'}" in m for m in messages)
 
 
+_FOREIGN_KIND_NOW = datetime(2026, 10, 30, 12, 0, 0, tzinfo=UTC)
+_STAGE1_MARKER = 'stage1_flag_marker'
+
+
+def _stage1_member(mid: str, **metadata) -> dict:
+    """A stage1_flag_marker pool member far past the pool's age cutoff."""
+    age = timedelta(days=STAGE1_FLAG_MARKER_MEM0_MAX_AGE_DAYS + 30)
+    return {
+        'id': mid,
+        'created_at': (_FOREIGN_KIND_NOW - age).isoformat(),
+        'metadata': metadata,
+    }
+
+
+class TestSweepStaleMem0FlagMarkersWithholdsForeignKinds:
+    """The in-cycle stage1_flag_marker collector keeps foreign-kind records (task 6241).
+
+    A record declaring a kind other than ``stage1_flag_marker`` belongs to
+    another pool, whatever ``source`` it carries, so this collector and the
+    manual ``sweep_orphan_flag_markers.py`` agree on what the pool is.
+    """
+
+    @pytest.mark.asyncio
+    async def test_foreign_kind_is_kept_on_every_cycle_while_markers_drain(self):
+        pool = LiveFlagPool([
+            _stage1_member('canonical', source=_STAGE1_MARKER, kind=_STAGE1_MARKER),
+            _stage1_member('source-only', source=_STAGE1_MARKER),
+            _stage1_member('kind-only', kind=_STAGE1_MARKER),
+            _stage1_member(
+                'foreign', source=_STAGE1_MARKER, kind='unregistered_audit_log', task_id='452',
+            ),
+        ])
+
+        first = await _sweep_stale_mem0_flag_markers(
+            pool, 'dark_factory', 'r1', now=_FOREIGN_KIND_NOW,
+        )
+
+        assert first == 3
+        assert set(pool.deleted_ids()) == {'canonical', 'source-only', 'kind-only'}
+        assert 'foreign' in pool.members
+
+        second = await _sweep_stale_mem0_flag_markers(
+            pool, 'dark_factory', 'r2', now=_FOREIGN_KIND_NOW,
+        )
+
+        assert second == 0
+        assert len(pool.deleted_ids()) == 3
+        assert 'foreign' in pool.members
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('kind', [[_STAGE1_MARKER], {'nested': 'x'}])
+    async def test_unhashable_kind_is_kept_without_raising(self, kind):
+        pool = LiveFlagPool([
+            _stage1_member('canonical', source=_STAGE1_MARKER, kind=_STAGE1_MARKER),
+            _stage1_member('odd-kind', source=_STAGE1_MARKER, kind=kind),
+        ])
+
+        result = await _sweep_stale_mem0_flag_markers(
+            pool, 'dark_factory', 'r1', now=_FOREIGN_KIND_NOW,
+        )
+
+        assert result == 1
+        assert pool.deleted_ids() == ['canonical']
+        assert 'odd-kind' in pool.members
+
+    @pytest.mark.asyncio
+    async def test_one_aggregate_warning_and_per_record_debug(self, caplog):
+        pool = LiveFlagPool([
+            _stage1_member('foreign-alpha', source=_STAGE1_MARKER, kind='alpha_log'),
+            _stage1_member('foreign-beta', source=_STAGE1_MARKER, kind='beta_log'),
+            _stage1_member('canonical', source=_STAGE1_MARKER, kind=_STAGE1_MARKER),
+        ])
+
+        with caplog.at_level(logging.DEBUG, logger=_TKS_LOGGER):
+            result = await _sweep_stale_mem0_flag_markers(
+                pool, 'dark_factory', 'r1', now=_FOREIGN_KIND_NOW,
+            )
+
+        assert result == 1
+        tks_records = [r for r in caplog.records if r.name == _TKS_LOGGER]
+        foreign_warnings = [
+            r for r in tks_records
+            if r.levelno == logging.WARNING and 'foreign kind' in r.getMessage()
+        ]
+        assert len(foreign_warnings) == 1
+        message = foreign_warnings[0].getMessage()
+        assert 'RETAINED 2 ' in message
+        assert 'alpha_log' in message
+        assert 'beta_log' in message
+        assert '_sweep_stale_mem0_flag_markers' in message
+        assert 'foreign-alpha' not in message
+        assert 'foreign-beta' not in message
+        assert 'protected audit' not in message
+
+        debug_ids = sorted(
+            r.__dict__['memory_id'] for r in tks_records
+            if r.levelno == logging.DEBUG and 'foreign-kind' in r.getMessage()
+        )
+        assert debug_ids == ['foreign-alpha', 'foreign-beta']
+
+    @pytest.mark.asyncio
+    async def test_a_registered_audit_kind_is_attributed_as_audit_not_foreign(self, caplog):
+        pool = LiveFlagPool([
+            _stage1_member('audit', source=_STAGE1_MARKER, kind='cadence_check'),
+        ])
+
+        with caplog.at_level(logging.WARNING, logger=_TKS_LOGGER):
+            result = await _sweep_stale_mem0_flag_markers(
+                pool, 'dark_factory', 'r1', now=_FOREIGN_KIND_NOW,
+            )
+
+        assert result == 0
+        messages = [
+            r.getMessage() for r in caplog.records
+            if r.name == _TKS_LOGGER and r.levelno == logging.WARNING
+        ]
+        assert any('RETAINED 1 protected audit record(s)' in m for m in messages)
+        assert not any('foreign kind' in m for m in messages)
+
+    @pytest.mark.asyncio
+    async def test_the_wide_relay_pool_does_not_opt_in(self):
+        """The flag_for_stage2 pool is drained by its closure gate, not by pool kind."""
+        pool = LiveFlagPool([
+            _relay_marker('relay', _STALE_DAYS, task_id='T', kind='stage1_flag'),
+        ])
+
+        result = await _sweep_stale_mem0_flag_for_stage2_markers(
+            pool, 'dark_factory', 'r1', terminal_task_ids={'T'}, now=_RETIRE_NOW,
+        )
+
+        assert result == 1
+        assert pool.deleted_ids() == ['relay']
+
+
 class TestSweepStaleMem0FlagForStage2Markers:
     """_sweep_stale_mem0_flag_for_stage2_markers age-GCs the Mem0-only
     flag_for_stage2 Stage-1 -> Stage-2 relay pool (task 2966).
@@ -12255,6 +12405,7 @@ class TestMemoryConsolidatorPayloadIncludesProjectRoot:
         m.mem0 = AsyncMock()
         m.mem0.get_all = AsyncMock(return_value={'results': []})
         m.get_status = AsyncMock(return_value={})
+        m.earliest_unfinished_graphiti_write_start = MagicMock(return_value=None)
         return m
 
     @pytest.fixture
@@ -15060,6 +15211,7 @@ class TestMemoryConsolidatorMem0ResultsKeyWarns:
         mem_svc.get_status = AsyncMock(return_value={})
         mem_svc.mem0 = AsyncMock()
         mem_svc.mem0.get_all = AsyncMock(return_value=get_all_return)
+        mem_svc.earliest_unfinished_graphiti_write_start = MagicMock(return_value=None)
         stage = MemoryConsolidator(
             StageId.memory_consolidator,
             mem_svc, AsyncMock(), AsyncMock(), config,
@@ -17933,11 +18085,12 @@ class TestLiveWorkflowRenderIsNonBlocking:
     nothing else on the loop — health checks, heartbeats, MCP replies — could
     run at all.
 
-    The assertion is a TICKER: a coroutine incrementing a counter every 50 ms
-    runs concurrently with a render whose git probes each take real awaited
-    time. A non-blocking renderer lets the ticker keep ticking; a blocking one
-    pins it at ~0. This is what a `loop_lag`-style field could only report
-    after the fact.
+    The assertion is a loop-turn oracle: every stubbed git probe suspends on
+    fused-memory/tests/_fm_helpers.py::LoopFreedomProbe, which records whether
+    a marker queued on the test loop ran while that probe was suspended. A
+    renderer that ran its probes inline instead of awaiting them reads False.
+    It counts loop turns, never seconds, so host or GIL contention cannot red
+    it (task 5920 introduced the probe; task 5925 for this site).
     """
 
     _NOW = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
@@ -17964,50 +18117,28 @@ class TestLiveWorkflowRenderIsNonBlocking:
 
     @pytest.mark.asyncio
     async def test_render_does_not_starve_the_event_loop(self, monkeypatch):
-        import asyncio
-
         from shared.git_async import GitResult
 
         import fused_memory.reconciliation.live_workflow_section as lws_module
         from fused_memory.services import live_workflow_detector as lwd
 
-        probe_delay = 0.02
+        probe = LoopFreedomProbe()
         n_tasks = 20
 
         async def slow_run_git(cmd, cwd=None, *, input_text=None, timeout=None):
-            await asyncio.sleep(probe_delay)
+            await probe.suspend()
             return GitResult(returncode=1, stdout='', stderr='')
 
         monkeypatch.setattr(lwd, 'run_git', slow_run_git)
         monkeypatch.setattr(lws_module, 'is_orchestrator_live_for', lambda _pr: False)
 
-        ticks = 0
-        stop = False
-
-        async def ticker():
-            nonlocal ticks
-            while not stop:
-                await asyncio.sleep(0.005)
-                ticks += 1
-
-        tick_task = asyncio.create_task(ticker())
-        try:
-            await lws_module.render_live_workflow_section(
-                tasks=[{'id': str(i), 'status': 'pending'} for i in range(n_tasks)],
-                project_root=ProjectRoot('/p'),
-                now=self._NOW,
-            )
-        finally:
-            stop = True
-            tick_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await tick_task
-
-        assert ticks > 5, (
-            f'the loop was starved during the render — only {ticks} ticks fired '
-            f'while {n_tasks} tasks were probed; a non-blocking renderer must '
-            f'let other coroutines run'
+        await lws_module.render_live_workflow_section(
+            tasks=[{'id': str(i), 'status': 'pending'} for i in range(n_tasks)],
+            project_root=ProjectRoot('/p'),
+            now=self._NOW,
         )
+
+        probe.assert_loop_stayed_free()
 
 
 # ---------------------------------------------------------------------------
