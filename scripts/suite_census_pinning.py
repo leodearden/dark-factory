@@ -77,6 +77,23 @@ def _importable(dotted: str) -> bool:
     return all(segment.isidentifier() for segment in dotted.split('.'))
 
 
+def _module_paths(domain: Iterable[DomainMember]) -> dict[str, str]:
+    """Each importable name of the domain's files, to the one file it names."""
+    holders: defaultdict[str, set[str]] = defaultdict(set)
+    for member in domain:
+        for file in member.files:
+            for name in filter(_importable, file.import_names):
+                holders[name].add(file.path)
+    shared = {name: sorted(paths) for name, paths in sorted(holders.items()) if len(paths) > 1}
+    if shared:
+        raise MetricsError(
+            'import name(s) shared by two or more source files, so the census cannot '
+            'tell which file a test importing one reads: '
+            + '; '.join(f'{name!r} names {paths!r}' for name, paths in shared.items())
+        )
+    return {name: next(iter(paths)) for name, paths in holders.items()}
+
+
 @dataclass(frozen=True)
 class _FirstParty:
     roots: frozenset[str]
@@ -84,11 +101,7 @@ class _FirstParty:
 
     @classmethod
     def of(cls, domain: Iterable[DomainMember]) -> _FirstParty:
-        modules = {
-            file.import_name: file.path
-            for member in domain for file in member.files
-            if file.import_name is not None and _importable(file.import_name)
-        }
+        modules = _module_paths(domain)
         return cls(
             roots=frozenset(name.split('.', 1)[0] for name in modules),
             modules=MappingProxyType(modules),
@@ -435,6 +448,9 @@ def measure_python_tree(tree_root: Path) -> PythonPinningCensus:
 _DECLARED_TESTS_ROOT = MemberRoots.declared('<member>').tests_root
 _SINGLE_PACKAGE_TESTS_ROOT = MemberRoots.single_package('<name>').tests_root
 _PSEUDO_MEMBERS_TEXT = ', '.join(f'`{m.name}` (`{m.tests_root}/`)' for m in PSEUDO_MEMBERS)
+_EXTRA_IMPORT_ROOTS_TEXT = ' and '.join(
+    f'`{root}/`' for m in PSEUDO_MEMBERS for root in m.extra_import_roots
+)
 
 _DEFINITIONS = f"""\
 A test file is a tracked `.py` file under a workspace member's tests root, as
@@ -446,11 +462,9 @@ package named by its `[project].name`, whose tests root is
 package is its member. First-party
 names are the import names of the domain's source files whose every dotted
 segment is an identifier, so `scripts/` is an import root and
-`scripts/legibility/x.py` is `legibility.x`. A module has no other name here:
-`scripts/tests/conftest.py` also puts `scripts/legibility/` and
-`scripts/local-model-serving/` on `sys.path`, so a test that imports one of
-their modules by its bare name (`import census`) is not seen to import
-first-party code, and its private patches and prose asserts are undercounted.
+`scripts/legibility/x.py` is `legibility.x`. {_EXTRA_IMPORT_ROOTS_TEXT} are
+import roots too, as `scripts/tests/conftest.py` puts them on `sys.path`, so
+that file is also `x`. A name two files share is refused.
 Rows are in package-name order and are not ranked.
 
 - **test fns**: module-level `test*` functions and `test*` methods of `Test*`
