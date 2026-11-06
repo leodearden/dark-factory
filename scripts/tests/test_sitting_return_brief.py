@@ -679,7 +679,8 @@ class TestExecutorAuditDraw:
         row = policy_row(FULL_CLASS)
         assert row is not None and row.audit_full_until == 20
         _twelve_executor_closes(env)
-        full = [_executor_close(env, 20 + n, policy_class=FULL_CLASS) for n in range(3)]
+        full = [_executor_close(env, 20 + n, policy_class=FULL_CLASS, closed_at=_hours_before_now(2 + n))
+                for n in range(3)]
 
         _run(capsys, env.argv())
 

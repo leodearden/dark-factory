@@ -10,7 +10,11 @@ cannot be read is a stated shortfall in its section; no section is ever omitted.
 Sections 2 and 6 stay apart on purpose. Section 2 is the standing-policy
 adjudicator's shadow agreement; section 6 is this preparer's own carve-out
 closes, read back from ``closing_evidence``. Leo audits the two mechanisms
-independently.
+independently. Section 6 also carries the executor audit draw
+(``sitting.audits``): over the trailing week, whatever ``--window-days`` is,
+each unaudited close of a class still below its full-audit count plus a
+random ten seeded by the render date, numbered into the same ledger as
+``audit N`` items the ``apply.py audit`` verb answers.
 
 The night's numbering is a fresh sitting seeded from the previous night's
 ``--ledger-out`` and written back there, so an item keeps its number from night
@@ -43,8 +47,9 @@ from _task_db_scan import discover_project_roots  # noqa: E402
 from orchestrator.digest import ModelRoleRow  # noqa: E402
 from orchestrator.session_registry import decisions_dir, fleet_root, sessions_dir  # noqa: E402
 from shared.safe_io import atomic_write_text  # noqa: E402
-from sitting import brief, fleet_state, prepare_sitting  # noqa: E402
+from sitting import audits, brief, fleet_state, prepare_sitting  # noqa: E402
 from sitting import ledger as ledgers  # noqa: E402
+from sitting.audits import AuditDraw, ExecutorClose  # noqa: E402
 from sitting.fleet_state import (  # noqa: E402
     AutonomousClose,
     AutonomousCloses,
@@ -55,7 +60,7 @@ from sitting.fleet_state import (  # noqa: E402
     StuckRow,
     Window,
 )
-from sitting.inventory import Shortfall, parse_stamp  # noqa: E402
+from sitting.inventory import AUDIT_KIND, Shortfall, audit_key, key_str, parse_stamp  # noqa: E402
 from sitting.prepare_sitting import Sitting  # noqa: E402
 
 DEFAULT_OUTPUT = _REPO_ROOT / 'data' / 'return-brief.md'
@@ -77,6 +82,10 @@ SECTIONS: tuple[tuple[str, str], ...] = (
 
 SectionStatus = Literal['ok', 'degraded']
 
+NO_EXECUTOR_CLOSE = f'no executor close in window (the trailing {audits.AUDIT_WINDOW_DAYS} days); nothing to audit'
+ALL_AUDITED = 'every executor close in the window is audited'
+AUDIT_SLOT = 'ok|wrong[:note]'
+
 
 @dataclass(frozen=True)
 class PreparationFreshness:
@@ -95,6 +104,7 @@ class ReturnBriefDocument:
     preparation: PreparationFreshness
     projects: Mapping[str, ProjectState]
     closes: Measurement[AutonomousCloses]
+    audits: Measurement[AuditDraw]
 
 
 def build(
@@ -119,6 +129,13 @@ def build(
     )
     if unseeded is not None:
         sitting = replace(sitting, shortfalls=(*sitting.shortfalls, unseeded))
+    seed = now.date().isoformat()
+    audit_draw = fleet_state.unreadable_if_raises(
+        'decision_registry', str(decisions_dir(decisions_root)), _no_draw(seed),
+        lambda: _audit_draw(decisions_root, sources.inventory.escalation_index, seed, now), now=now,
+    )
+    if audit_draw.ok:
+        sitting = replace(sitting, ledger=_number_audits(sitting.ledger, audit_draw.value, now))
     return ReturnBriefDocument(
         generated_at=now.isoformat(),
         window=window,
@@ -129,6 +146,7 @@ def build(
             'decision_registry', str(decisions_dir(decisions_root)), AutonomousCloses((), (), 0),
             lambda: fleet_state.autonomous_closes(decisions_root, window, now=now), now=now,
         ),
+        audits=audit_draw,
     )
 
 
@@ -145,6 +163,7 @@ def render(document: ReturnBriefDocument) -> str:
         _per_project_section(heading['stuck'], projects, measured['stuck'], _stuck_lines),
         _per_project_section(heading['spend'], projects, measured['spend'], _spend_lines),
         _closes_section(document.closes, heading['closes']),
+        _audit_draw_section(document.audits, document.sitting.ledger),
     ])
 
 
@@ -190,6 +209,34 @@ def _previous_numbering(path: Path | None) -> tuple[ledgers.Ledger | None, Short
         return None, Shortfall('nightly_ledger', str(exc.path), f'{exc.reason}; numbered afresh')
 
 
+def _no_draw(seed: str) -> AuditDraw:
+    return AuditDraw('no_executor_close', (), (), seed, 0)
+
+
+def _audit_draw(
+    decisions_root: Path, escalation_index: Mapping[str, Mapping[str, Path]], seed: str, now: datetime,
+) -> Measurement[AuditDraw]:
+    """The week's executor closes drawn for audit; a join that fails is a shortfall on an ok draw."""
+    registry = decisions_dir(decisions_root)
+    if not registry.is_dir():
+        missing = Shortfall('decision_registry', str(registry), 'no such directory')
+        return Measurement(_no_draw(seed), now.isoformat(), str(registry), 'source_missing', (missing,))
+    week = Window.trailing(now, days=audits.AUDIT_WINDOW_DAYS)
+    closes = audits.executor_closes(decisions_root, escalation_index, week)
+    drawn = audits.draw(closes.in_window, seed=seed, lifetime_by_class=closes.lifetime_by_class)
+    return Measurement(drawn, now.isoformat(), str(registry), 'ok', closes.shortfalls)
+
+
+def _number_audits(ledger: ledgers.Ledger, draw: AuditDraw, now: datetime) -> ledgers.Ledger:
+    """Number the drawn closes as ``audit`` items, full-audit first; an audit no longer drawn goes done."""
+    order = {
+        key_str(audit_key(close.decision_id)): (rank, close.closed_at)
+        for rank, closes in enumerate((draw.full, draw.sampled))
+        for close in closes
+    }
+    return ledgers.assign(ledger, order, order.__getitem__, now.isoformat(), kinds=frozenset({AUDIT_KIND}))
+
+
 def _freshness(sources: prepare_sitting.Sources, sitting: Sitting) -> PreparationFreshness:
     stamps = [prep.prepared_at for prep in sources.preparations.entries.values()]
     newest = max(stamps, key=lambda stamp: parse_stamp(stamp) or datetime.min.replace(tzinfo=UTC), default=None)
@@ -205,7 +252,7 @@ def _measurements(document: ReturnBriefDocument) -> dict[str, tuple[Measurement[
         'landed': tuple(state.landed for state in states),
         'stuck': tuple(state.stuck for state in states),
         'spend': tuple(state.spend for state in states),
-        'closes': (document.closes,),
+        'closes': (document.closes, document.audits),
     }
 
 
@@ -339,6 +386,37 @@ def _closes_section(measurement: Measurement[AutonomousCloses], heading: str) ->
                 lines += ['', f'#### Decision {close.decision_id}', '',
                           *_close_lines(close, f'closed_at {close.closed_at!r}')]
     return _text([*lines, '', *_shortfall_lines(measurement.shortfalls)])
+
+
+def _audit_draw_section(measurement: Measurement[AuditDraw], ledger: ledgers.Ledger) -> str:
+    """Section 6's executor audit draw: one ``audit N`` block per drawn close, or the state that drew none."""
+    lines = ['### Executor audit draw', '', _stamp_line(measurement)]
+    if measurement.ok:
+        draw = measurement.value
+        lines += ['', f'Executor closes in the trailing {audits.AUDIT_WINDOW_DAYS} days: {draw.population}; '
+                      f'drawn {len(draw.full)} in full and {len(draw.sampled)} of at most {audits.SAMPLE_SIZE} '
+                      f'at random (seed {draw.seed}). A `wrong` counts toward flipping its class to shadow '
+                      'on its queue.']
+        if draw.state == 'no_executor_close':
+            lines += ['', f'Draw: {NO_EXECUTOR_CLOSE}.']
+        elif draw.state == 'all_audited':
+            lines += ['', f'Draw: {ALL_AUDITED}.']
+        for close in draw.full:
+            lines += ['', *_audit_item_lines(close, ledger, ' — FULL AUDIT (its class is below its full-audit count)')]
+        for close in draw.sampled:
+            lines += ['', *_audit_item_lines(close, ledger, '')]
+    return _text([*lines, '', *_shortfall_lines(measurement.shortfalls)])
+
+
+def _audit_item_lines(close: ExecutorClose, ledger: ledgers.Ledger, marker: str) -> list[str]:
+    number = ledger.entries[key_str(audit_key(close.decision_id))].number
+    return [
+        f'#### audit {number}: decision {close.decision_id}{marker}', '',
+        f'class {close.policy_class}; escalation {close.escalation_id} in {close.queue_dir}; '
+        f'project {close.project}; closed {close.closed_at}', '',
+        f'answer slot: `audit {number}={AUDIT_SLOT}`', '',
+        brief.fence_safe(close.evidence),
+    ]
 
 
 def _close_lines(close: AutonomousClose, closed: str) -> list[str]:
