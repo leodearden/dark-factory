@@ -24,7 +24,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
-from _curator_helpers import make_config, must_not_invoke
+from _curator_helpers import agent_result, invoke_by_role, make_config, must_not_invoke, tripwire
+from shared.cli_invoke import AgentResult
 from shared.task_statuses import ACTIVE
 
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
@@ -116,6 +117,29 @@ class _RecordingBackend(SqliteTaskBackend):
 
     async def get_task(self, task_id: str, project_root: str, tag: str | None = None) -> dict:
         self.get_task_ids.append(str(task_id))
+        return await super().get_task(task_id, project_root, tag)
+
+
+class _ModuleReadFailsBackend(SqliteTaskBackend):
+    async def get_tasks(self, *args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError('task tree read unavailable')
+
+
+class _DependencyReadFailsBackend(SqliteTaskBackend):
+    async def get_dependency_edges(self, *args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError('dependency edges unavailable')
+
+
+class _FetchFailsBackend(SqliteTaskBackend):
+    """A store whose get_task raises for every id in ``failing_ids``."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.failing_ids: set[str] = set()
+
+    async def get_task(self, task_id: str, project_root: str, tag: str | None = None) -> dict:
+        if str(task_id) in self.failing_ids:
+            raise RuntimeError('task store unavailable')
         return await super().get_task(task_id, project_root, tag)
 
 
@@ -328,6 +352,8 @@ async def test_a_failed_sibling_lookup_leaves_the_rest_of_the_pool(failing_looku
 
     assert _ids_from(prepared.pool, 'anchor') == {parent_id}
     assert prepared.pool_sizes['sibling'] == 0
+    assert prepared.withheld is not None
+    assert 'sibling' in prepared.withheld.unavailable_streams
     assert any(
         record.name == 'fused_memory.middleware.task_curator'
         and record.levelno == logging.WARNING
@@ -369,6 +395,8 @@ async def test_a_failed_text_lookup_keeps_the_integer_stored_siblings(tmp_path, 
         prepared = await stack.prepare(_followup(parent_id))
 
     assert _ids_from(prepared.pool, 'sibling') == {sibling_id}
+    assert prepared.withheld is not None
+    assert 'sibling' not in prepared.withheld.unavailable_streams
     assert any(
         record.levelno == logging.WARNING and repr(parent_id) in record.getMessage()
         for record in caplog.records
@@ -454,3 +482,108 @@ async def test_the_dependency_cap_bounds_the_full_row_reads(recording_stack):
     assert prepared.withheld is not None
     assert prepared.withheld.by_source['dependency'] == 2
     assert len([tid for tid in _recorded(stack).get_task_ids if tid in dependents]) <= 1
+
+
+_CURATOR_LOGGER = 'fused_memory.middleware.task_curator'
+_EMBEDDING_UNAVAILABLE = 'stream embedding unavailable: absence is not proof of no overlap'
+
+
+def _creating_and_recording(prompts: list[str]) -> Any:
+    """A single-spec invoke arm that records each prompt and answers 'create'."""
+    def answer(kwargs: dict[str, Any]) -> AgentResult:
+        prompts.append(kwargs['prompt'])
+        return agent_result({'action': 'create', 'justification': 'no overlap in the pool'})
+
+    return answer
+
+
+def _unavailable(prepared: PreparedCandidate) -> tuple[str, ...]:
+    assert prepared.withheld is not None
+    return prepared.withheld.unavailable_streams
+
+
+def _anchored(anchor_id: str) -> CandidateTask:
+    """A candidate with files under *anchor_id*: anchor, module, embedding and dependency apply."""
+    return CandidateTask(
+        title='Fix the slate runner', files_to_modify=[_CANDIDATE_FILE], spawned_from=anchor_id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_failed_embedding_stream_is_named_in_the_prompt_and_the_decision(tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger=_CURATOR_LOGGER)
+    prompts: list[str] = []
+    invoke = invoke_by_role(
+        single=_creating_and_recording(prompts),
+        batch=tripwire('one candidate must take the single spec'),
+    )
+    async with _open_stack(tmp_path / 'project', SqliteTaskBackend, invoke=invoke) as stack:
+        await stack.seed_module_task()
+
+        prepared = await stack.prepare(CandidateTask(title='t', files_to_modify=[_CANDIDATE_FILE]))
+        [decision] = await stack.curator.curate_prepared([prepared], 'p', stack.root)
+
+    assert prepared.corpus_error is None
+    assert _unavailable(prepared) == ('embedding',)
+    [prompt] = prompts
+    assert _EMBEDDING_UNAVAILABLE in prompt.splitlines()
+    assert decision.action == 'create'
+    assert decision.to_log_fields()['unavailable_streams'] == ['embedding']
+    curator_records = [r for r in caplog.records if r.name == _CURATOR_LOGGER]
+    assert any(
+        r.levelno == logging.WARNING and 'embedding' in r.getMessage()
+        and 'unavailable' in r.getMessage()
+        for r in curator_records
+    )
+    assert any(
+        r.levelno == logging.INFO and 'decision' in r.getMessage()
+        and 'unavailable_streams' in r.getMessage() and "'embedding'" in r.getMessage()
+        for r in curator_records
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_failed_module_read_is_named_when_other_streams_answered(tmp_path):
+    async with _open_stack(tmp_path / 'project', _ModuleReadFailsBackend) as stack:
+        anchor_id = await stack.seed('anchor')
+
+        prepared = await stack.prepare(_anchored(anchor_id))
+
+    assert _ids_from(prepared.pool, 'anchor') == {anchor_id}
+    assert _unavailable(prepared) == ('module', 'embedding')
+
+
+@pytest.mark.asyncio
+async def test_a_failed_anchor_fetch_is_named(tmp_path):
+    async with _open_stack(tmp_path / 'project', _FetchFailsBackend) as stack:
+        anchor_id = await stack.seed('anchor')
+        module_id = await stack.seed_module_task()
+        assert isinstance(stack.backend, _FetchFailsBackend)
+        stack.backend.failing_ids.add(anchor_id)
+
+        prepared = await stack.prepare(_anchored(anchor_id))
+
+    assert 'anchor' in _unavailable(prepared)
+    assert _ids_from(prepared.pool, 'module') == {module_id}
+
+
+@pytest.mark.asyncio
+async def test_a_spawned_from_naming_no_task_is_absent_not_unavailable(stack):
+    module_id = await stack.seed_module_task()
+
+    prepared = await stack.prepare(_anchored('987654'))
+
+    assert _ids_from(prepared.pool, 'anchor') == set()
+    assert 'anchor' not in _unavailable(prepared)
+    assert _ids_from(prepared.pool, 'module') == {module_id}
+
+
+@pytest.mark.asyncio
+async def test_a_failed_dependency_read_is_named(tmp_path):
+    async with _open_stack(tmp_path / 'project', _DependencyReadFailsBackend) as stack:
+        anchor_id = await stack.seed('anchor')
+
+        prepared = await stack.prepare(_anchored(anchor_id))
+
+    assert _ids_from(prepared.pool, 'anchor') == {anchor_id}
+    assert 'dependency' in _unavailable(prepared)
