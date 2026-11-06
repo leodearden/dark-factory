@@ -1454,23 +1454,7 @@ def test_override_endpoint_rejects_invalid_body(client, body, expected_error):
             resp = client.post('/api/v2/dashboard/scheduler/override', json=body)
 
     assert resp.status_code == 400
-    # Background monitoring tasks call mcp_tool_call via get_memory_status /
-    # get_queue_stats (both defined in memory.py, so they resolve through the
-    # patched module attribute).  Build a robust tool-name extractor that handles
-    # both positional and kwarg-style invocations, then assert an explicit
-    # allowlist: only the two known background tools are permitted; anything else
-    # (including 'set_task_priority_override') signals a regression where the
-    # override endpoint is invoking MCP before validation completes.
-    _BACKGROUND_MCP_TOOLS = frozenset({'get_status', 'get_queue_stats'})
-
-    def _tool_name(c):
-        return c.kwargs.get('tool_name') or (c.args[2] if len(c.args) >= 3 else None)
-
-    unexpected = {_tool_name(c) for c in mock_mcp.call_args_list} - _BACKGROUND_MCP_TOOLS - {None}
-    assert not unexpected, (
-        f'Unexpected MCP tool call(s) on 400 path: {unexpected!r}. '
-        f'Full call list: {mock_mcp.call_args_list}'
-    )
+    assert mock_mcp.call_count == 0
     if expected_error is not None:
         assert resp.json().get('error') == expected_error
 
@@ -1681,7 +1665,7 @@ _EVICT_PARK_INVALID_BODIES = [
 
 @pytest.mark.parametrize('body,expected_error', _EVICT_PARK_INVALID_BODIES)
 def test_evict_park_endpoint_rejects_invalid_body(client, body, expected_error):
-    """Invalid body → 400 with no request_park_eviction MCP call."""
+    """Invalid body → 400 with no MCP call."""
     from unittest.mock import AsyncMock, patch
 
     with patch(_PATCH_TARGET, new=AsyncMock()) as mock_mcp:
@@ -1696,17 +1680,7 @@ def test_evict_park_endpoint_rejects_invalid_body(client, body, expected_error):
 
     assert resp.status_code == 400
     assert resp.json().get('error') == expected_error
-
-    _BACKGROUND_MCP_TOOLS = frozenset({'get_status', 'get_queue_stats'})
-
-    def _tool_name(c):
-        return c.kwargs.get('tool_name') or (c.args[2] if len(c.args) >= 3 else None)
-
-    unexpected = {_tool_name(c) for c in mock_mcp.call_args_list} - _BACKGROUND_MCP_TOOLS - {None}
-    assert not unexpected, (
-        f'Unexpected MCP tool call(s) on 400 path: {unexpected!r}. '
-        f'Full call list: {mock_mcp.call_args_list}'
-    )
+    assert mock_mcp.call_count == 0
 
 
 def test_evict_park_endpoint_proxies_verbatim_on_success(client):
