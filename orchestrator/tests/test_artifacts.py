@@ -9,6 +9,7 @@ import shutil
 import stat
 import sys
 import threading
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
@@ -2487,6 +2488,13 @@ class TestReviewCounters:
         assert rec['reviewer_fingerprint'] == 'FP1'
 
 
+_LANE_ARTIFACT_WRITERS: dict[str, Callable[[TaskArtifacts], None]] = {
+    'plan.json': lambda a: a.write_plan({'steps': [{'id': 'step-1', 'status': 'pending', 'commit': None}]}),
+    'iterations.jsonl': lambda a: a.append_iteration_log({'iteration': 1}),
+}
+"""Plants each `LANE_SYMLINKED_ARTIFACTS` name through its public writer."""
+
+
 class TestEnsureLaneSymlinks:
     """`ensure_lane_symlinks()` single-sources each name in
     `LANE_SYMLINKED_ARTIFACTS`: the lane copy `<worktree>/.task/<name>` becomes
@@ -2508,9 +2516,6 @@ class TestEnsureLaneSymlinks:
         ta = TaskArtifacts(worktree, meta_root)
         ta.init('task-1', 'Test Task', 'Desc')
         return ta
-
-    def test_links_the_plan_and_the_iteration_log(self):
-        assert LANE_SYMLINKED_ARTIFACTS == ('plan.json', 'iterations.jsonl')
 
     @pytest.mark.parametrize('name', LANE_SYMLINKED_ARTIFACTS)
     def test_creates_absolute_symlink_to_meta_root_artifact(
@@ -2604,25 +2609,21 @@ class TestEnsureLaneSymlinks:
         assert lane_link.is_symlink()
         assert lane_link.resolve() == (meta_root / name).resolve()
 
+    @pytest.mark.parametrize('name', LANE_SYMLINKED_ARTIFACTS)
     def test_noop_in_legacy_meta_root_none_mode(
-        self, artifacts: TaskArtifacts, worktree: Path
+        self, artifacts: TaskArtifacts, worktree: Path, name: str
     ):
         # Legacy meta_root=None mode (the `artifacts` fixture builds
-        # TaskArtifacts(worktree), rooted at worktree/.task): pre-existing real
-        # files stay regular FILES — no self-referential symlink is created.
+        # TaskArtifacts(worktree), rooted at worktree/.task): a pre-existing
+        # real file stays a regular FILE — no self-referential symlink.
         assert artifacts.lane_root == artifacts.task_root == worktree / '.task'
-        artifacts.write_plan(
-            {'steps': [{'id': 'step-1', 'status': 'pending', 'commit': None}]}
-        )
-        artifacts.append_iteration_log({'iteration': 1})
-        lane_task = worktree / '.task'
+        _LANE_ARTIFACT_WRITERS[name](artifacts)
 
         artifacts.ensure_lane_symlinks()
 
-        for name in ('plan.json', 'iterations.jsonl'):
-            lane_file = lane_task / name
-            assert lane_file.is_file(), name
-            assert not lane_file.is_symlink(), name
+        lane_file = worktree / '.task' / name
+        assert lane_file.is_file()
+        assert not lane_file.is_symlink()
 
 
 _LANE_ARTIFACT_NAMES = (

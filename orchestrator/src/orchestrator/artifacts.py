@@ -436,11 +436,10 @@ def _format_issue_section(heading: str, issues: list[dict]) -> str:
 
 
 def _replace_with_symlink(link: Path, target: Path) -> None:
-    if link.is_symlink() or link.exists():
-        if link.is_dir() and not link.is_symlink():
-            shutil.rmtree(link)
-        else:
-            link.unlink(missing_ok=True)
+    if link.is_dir() and not link.is_symlink():
+        shutil.rmtree(link)
+    else:
+        link.unlink(missing_ok=True)
     os.symlink(target, link)
 
 
