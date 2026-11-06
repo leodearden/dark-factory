@@ -760,6 +760,17 @@ class TestAlreadyLandedDispatchGateMarkerPath:
         cast(MagicMock, h._escalation_queue).submit.assert_not_called()
 
 
+_CONTENT_TIP_SHA = 'f' * 40
+_CONTENT_MERGE_BASE_SHA = '8' * 40
+
+
+def _expected_twin_lookup(h: Harness):
+    return call(
+        h.git_ops.project_root, _CONTENT_MERGE_BASE_SHA, _CONTENT_TIP_SHA,
+        patch_id_only=True,
+    )
+
+
 def _wired_content_harness(
     mock_orch_config, *, citation_sha, content_in_main, effect_present=True,
     twin_sha: str | None = None,
@@ -803,12 +814,12 @@ def _wired_content_harness(
             return True  # citation modeled as an in-branch work commit
         raise AssertionError(f'unexpected is_ancestor call: {a!r}, {b!r}')
 
-    h.git_ops.resolve_branch_sha = AsyncMock(return_value='f' * 40)
+    h.git_ops.resolve_branch_sha = AsyncMock(return_value=_CONTENT_TIP_SHA)
     h.git_ops.is_ancestor = AsyncMock(side_effect=_is_ancestor)
     h.git_ops.find_merge_marker = AsyncMock(return_value=None)
     h.git_ops.find_task_citation_commit = AsyncMock(return_value=citation_sha)
     h.git_ops.branch_content_in_main = AsyncMock(return_value=content_in_main)
-    h.git_ops.merge_base_with_main = AsyncMock(return_value='8' * 40)
+    h.git_ops.merge_base_with_main = AsyncMock(return_value=_CONTENT_MERGE_BASE_SHA)
     h.git_ops.find_equivalent_commit = AsyncMock(return_value=twin_sha)
     h.git_ops.get_main_sha = AsyncMock(return_value='c' * 40)
     h.git_ops.commit_effect_present_in_main = AsyncMock(return_value=effect_present)
@@ -874,6 +885,9 @@ class TestAlreadyLandedDispatchGateContentEquivalence:
         assert 'no_citation' in esc.detail
         assert "'content_fallback': 'unanchored'" in esc.detail
         assert 'content_fallback_error' not in esc.detail
+        assert cast(AsyncMock, h.git_ops.find_equivalent_commit).await_args_list == [
+            _expected_twin_lookup(h),
+        ]
 
     @pytest.mark.parametrize(
         ('citation_sha', 'twin_sha', 'effect_present', 'evidence_sha', 'twin_lookups'),
@@ -912,9 +926,8 @@ class TestAlreadyLandedDispatchGateContentEquivalence:
         assert call_args.args[1] == evidence_sha
         assert call_args.args[3] == 'dispatch-gate-content-equivalent'
         cast(MagicMock, h._escalation_queue).submit.assert_not_called()
-        twin_lookup = call(h.git_ops.project_root, '8' * 40, 'f' * 40, patch_id_only=True)
         assert cast(AsyncMock, h.git_ops.find_equivalent_commit).await_args_list == (
-            [twin_lookup] * twin_lookups
+            [_expected_twin_lookup(h)] * twin_lookups
         )
 
     async def test_content_equivalent_with_citation_and_effect_absent_escalates(
