@@ -58,7 +58,7 @@ from dashboard.data.prd_view import LANE_DISPLAY_ORDER, Lane
 _JS_DIR = Path(__file__).parent / 'js'
 
 _SKETCH_ROWS = frozenset(range(1, 14))
-_PRD_LANES_ROWS = frozenset({20})
+_PRD_LANES_ROWS = frozenset({20, 21})
 
 # A top-level TAP result for a passing test named 'sketch #N: ...' or
 # 'prd lanes #N: ...'; TAP escapes the '#' because a bare one opens a

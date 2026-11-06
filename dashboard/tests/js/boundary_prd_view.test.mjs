@@ -11,7 +11,7 @@ import assert from 'node:assert/strict';
 
 import { applyServed, loadClient, payload } from './_boundary_client.mjs';
 import { buildDashboardWindow, seedDashboardData } from './dom_harness.mjs';
-import { servingEndpoint } from './wire_fixtures.mjs';
+import { projectRow, receiptsFor, servingEndpoint } from './wire_fixtures.mjs';
 
 const PRDS = '/api/v2/dashboard/prds';
 const PROJECT = 'dark-factory';
@@ -355,5 +355,149 @@ test('prd lanes #20: an unknown view renders its served reason in place of the l
     assert.equal(root.querySelectorAll('.prd-lane').length, 0, name);
     assert.equal(root.querySelector('.prd-legend'), null, name);
   }
+});
+
+// ── Row 21: the Tasks tab hosts the lanes page ──
+
+const TAB_PROPS = { projectFilter: [], search: '' };
+const GROUPING_KEY = 'df.tasksGroupByPrd';
+
+// The real Tasks tab over both served projects, the /tasks body served beside
+// prd_lanes and the /prds body `prdsName`, with `stored` written as the
+// grouping preference before the mount, and every url the page fetches
+// recorded.
+function tasksTab(t, prdsName, { stored = null } = {}) {
+  const ctx = servedWindow(t, prdsName, 'prd_lanes_tasks');
+  const { window } = ctx;
+  seedDashboardData(window, {
+    PROJECTS: Object.keys(payload('prd_lanes_tasks').TASKS_SNAPSHOT).map(projectRow),
+    __receipt: receiptsFor(window.DF_DATA_LOADER, ['PROJECTS']),
+  });
+  if (stored !== null) window.localStorage.setItem(GROUPING_KEY, JSON.stringify(stored));
+  const requested = [];
+  const unsettled = window.fetch;
+  window.fetch = (url, init) => {
+    requested.push(String(url));
+    return unsettled(url, init);
+  };
+  const handle = ctx.harness.mount(window.DF_TASKS.TasksTab, TAB_PROPS);
+  return { ...ctx, handle, container: handle.container, requested };
+}
+
+function projectPanel(container, project) {
+  const head = [...container.querySelectorAll('.proj-head')].find(el => el.querySelector('.name')?.textContent === project);
+  assert.ok(head, `no project group for ${project}`);
+  return head.parentElement;
+}
+
+function groupingButton(panel, label) {
+  const buttons = [...panel.querySelectorAll('.proj-head .seg button')].filter(button => button.textContent === label);
+  assert.equal(buttons.length, 1, `expected one '${label}' grouping button`);
+  return buttons[0];
+}
+
+function graphTitles(scope) {
+  return [...scope.querySelectorAll('.node .ttl')].map(el => el.textContent);
+}
+
+function openIds(row) {
+  return [...row.direct_open_ids, ...row.followup_open.map(followup => followup.task_id)];
+}
+
+test('prd lanes #21: a project with no stored grouping opens on the lanes, and nothing is stored', t => {
+  const tab = tasksTab(t, 'prd_lanes');
+  const panel = projectPanel(tab.container, PROJECT);
+
+  assert.ok(groupingButton(panel, 'by PRD').classList.contains('on'), 'by PRD is not the default');
+  assert.ok(panel.querySelectorAll('.prd-lane').length > 0, 'the default view draws no lanes');
+  assert.equal(panel.querySelectorAll('.node').length, 0, 'a collapsed lanes page draws no graph');
+  assert.equal(tab.window.localStorage.getItem(GROUPING_KEY), null, 'the default grouping was stored');
+});
+
+test('prd lanes #21: a project stored as listed flat opens on the graph, and by PRD removes the key', t => {
+  const tab = tasksTab(t, 'prd_lanes', { stored: { [PROJECT]: 'flat' } });
+  const panel = projectPanel(tab.container, PROJECT);
+
+  assert.ok(groupingButton(panel, 'list').classList.contains('on'), 'the stored list view was not respected');
+  assert.ok(panel.querySelectorAll('.node').length > 0, 'the list view drew no graph');
+  assert.equal(panel.querySelectorAll('.prd-lane').length, 0);
+
+  click(tab.window, groupingButton(panel, 'by PRD'));
+  assert.ok(groupingButton(panel, 'by PRD').classList.contains('on'));
+  assert.ok(panel.querySelectorAll('.prd-lane').length > 0);
+  assert.equal(tab.window.localStorage.getItem(GROUPING_KEY), null, 'by PRD is the default, yet its key is still stored');
+});
+
+test('prd lanes #21: the lanes request no terminal window; only the Complete view does', async t => {
+  const tab = tasksTab(t, 'prd_lanes');
+  const flush = () => new Promise(resolve => setImmediate(resolve));
+  const terminalRequests = () => tab.requested.filter(url => url.includes('terminal='));
+  await flush();
+  assert.deepEqual(terminalRequests(), [], 'the by-PRD view requested a terminal window');
+
+  const { label } = tab.window.DF_TASK_SNAPSHOT.CENSUS_VIEWS.find(view => view.key === 'terminal');
+  const [complete] = [...tab.container.querySelectorAll('.seg button')].filter(button => button.textContent === label);
+  click(tab.window, complete);
+  await flush();
+  const forProject = terminalRequests().filter(url => url.endsWith(`?terminal=${PROJECT}`));
+  assert.equal(forProject.length, 1, `the Complete view must request ${PROJECT}'s window once: ${terminalRequests().join(', ')}`);
+});
+
+test('prd lanes #21: the contention line heads the project in both modes', t => {
+  const tab = tasksTab(t, 'prd_lanes');
+  const panel = projectPanel(tab.container, PROJECT);
+  const contention = tab.helpers.projectPrdContention(tab.D, PROJECT);
+  const heldShare = () => {
+    const lines = panel.querySelectorAll('.prd-contention');
+    assert.equal(lines.length, 1, 'expected one contention line');
+    return reading(lines[0], '.prd-held-share').text;
+  };
+
+  assert.equal(heldShare(), tab.helpers.heldShareText(contention.value.held_share));
+  click(tab.window, groupingButton(panel, 'list'));
+  assert.ok(panel.querySelectorAll('.node').length > 0);
+  assert.equal(heldShare(), tab.helpers.heldShareText(contention.value.held_share));
+});
+
+test('prd lanes #21: an expanded row draws its open members as graph nodes from the narrowed rows', t => {
+  const tab = tasksTab(t, 'prd_lanes');
+  const { membersDrawn, projectPrdView } = tab.helpers;
+  const pool = tab.window.DF_TASK_SNAPSHOT.projectRows(tab.D, PROJECT).value;
+  const subject = projectPrdView(tab.D, PROJECT).value.prds.find(
+    row => row.lane !== 'tail' && membersDrawn(pool, PROJECT, openIds(row)).rows.length >= 2,
+  );
+  assert.ok(subject, 'no served row has two drawn open members to narrow between');
+  const members = membersDrawn(pool, PROJECT, openIds(subject)).rows;
+  const panel = projectPanel(tab.container, PROJECT);
+  const rowEl = () => panel.querySelector(`.prd-row[data-key="${subject.key}"]`);
+
+  click(tab.window, rowEl().querySelector('.prd-row-head'));
+  assert.deepEqual(graphTitles(rowEl()).sort(), members.map(row => row.title).sort());
+
+  const [kept] = members;
+  tab.handle.rerender({ ...TAB_PROPS, search: kept.title });
+  assert.deepEqual(graphTitles(rowEl()), [kept.title], 'the search did not narrow the expanded graph');
+  const { notDrawn } = membersDrawn(pool.filter(row => row.id === kept.id), PROJECT, openIds(subject));
+  assert.ok(notDrawn.length > 0);
+  const notDrawnText = rowEl().querySelector('.prd-not-drawn').textContent;
+  for (const id of notDrawn) assert.ok(notDrawnText.includes(`#${id}`), notDrawnText);
+
+  const renamed = `${kept.title} renamed`;
+  const snapshot = structuredClone(payload('prd_lanes_tasks').TASKS_SNAPSHOT);
+  snapshot[PROJECT].rows.value.find(row => row.id === kept.id).title = renamed;
+  seedDashboardData(tab.window, { TASKS_SNAPSHOT: snapshot });
+  tab.handle.rerender({ ...TAB_PROPS, search: kept.title });
+  assert.deepEqual(graphTitles(rowEl()), [renamed], 'the expanded graph did not draw the latest poll\'s title');
+});
+
+test('prd lanes #21: an unknown view shows its served reason, and list still draws the graph', t => {
+  const tab = tasksTab(t, 'prd_lanes_lineage_failed');
+  const view = tab.helpers.projectPrdView(tab.D, PROJECT);
+  const panel = projectPanel(tab.container, PROJECT);
+
+  assert.equal(view.state, 'unknown');
+  assert.equal(panel.querySelector('.prd-unknown').textContent, view.reason);
+  click(tab.window, groupingButton(panel, 'list'));
+  assert.ok(panel.querySelectorAll('.node').length > 0, 'the list view drew no graph');
 });
 

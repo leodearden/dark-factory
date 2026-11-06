@@ -850,40 +850,22 @@ test('EVERY_VIEW: one row per status member is listed — review and infra-hold 
 
 const PROJECT_IDS = ['dark-factory', 'reify', 'hive'];
 
-test('terminalWindowProjects: the terminal view requests every project, in project order', () => {
-  assert.deepEqual(terminalWindowProjects(PROJECT_IDS, { terminal: true }, []), PROJECT_IDS);
-  assert.deepEqual(terminalWindowProjects(PROJECT_IDS, { terminal: true }, ['hive']), PROJECT_IDS);
+test('terminalWindowProjects: the terminal view requests every visible project, in project order', () => {
+  assert.deepEqual(terminalWindowProjects(PROJECT_IDS, { terminal: true }), PROJECT_IDS);
 });
 
-test('terminalWindowProjects: without the terminal view, only PRD-grouped projects request it', () => {
-  const filter = { in_flight: true, backlog: true, terminal: false };
-  assert.deepEqual(terminalWindowProjects(PROJECT_IDS, filter, ['hive', 'dark-factory']), ['dark-factory', 'hive']);
-  assert.deepEqual(terminalWindowProjects(PROJECT_IDS, {}, ['reify']), ['reify']);
-});
-
-test('terminalWindowProjects: a grouped id that is not a visible project is ignored', () => {
-  assert.deepEqual(terminalWindowProjects(PROJECT_IDS, {}, ['elsewhere', 'reify']), ['reify']);
-});
-
-test('terminalWindowProjects: nothing selected and nothing grouped requests nothing', () => {
-  assert.deepEqual(terminalWindowProjects(PROJECT_IDS, {}, []), []);
-  assert.deepEqual(terminalWindowProjects([], { terminal: true }, ['reify']), []);
-});
-
-test('terminalWindowProjects: each project is requested once', () => {
-  const wanted = terminalWindowProjects(PROJECT_IDS, { terminal: true }, ['reify', 'reify']);
-  assert.deepEqual(wanted, PROJECT_IDS);
-  assert.deepEqual(terminalWindowProjects(PROJECT_IDS, {}, ['reify', 'reify']), ['reify']);
+test('terminalWindowProjects: without the terminal view nothing requests it, the by-PRD lanes included', () => {
+  assert.deepEqual(terminalWindowProjects(PROJECT_IDS, { in_flight: true, backlog: true, terminal: false }), []);
+  assert.deepEqual(terminalWindowProjects(PROJECT_IDS, {}), []);
+  assert.deepEqual(terminalWindowProjects([], { terminal: true }), []);
 });
 
 test('terminalWindowProjects: its inputs are not mutated', () => {
   const projectIds = PROJECT_IDS.slice();
-  const filter = { terminal: false };
-  const grouped = ['hive', 'reify'];
-  terminalWindowProjects(projectIds, filter, grouped);
+  const filter = { terminal: true };
+  terminalWindowProjects(projectIds, filter);
   assert.deepEqual(projectIds, PROJECT_IDS);
-  assert.deepEqual(filter, { terminal: false });
-  assert.deepEqual(grouped, ['hive', 'reify']);
+  assert.deepEqual(filter, { terminal: true });
 });
 
 // ── terminalWindowEntrants: which wanted projects a request is owed ────────

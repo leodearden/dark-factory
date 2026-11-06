@@ -79,6 +79,13 @@ function graphNode(container, task) {
   return [...container.querySelectorAll('.node')].find(node => node.querySelector('.ttl')?.textContent === task.title);
 }
 
+// By PRD is the Tasks tab's default view, and it draws no graph until a lanes
+// row opens; a test that reads graph nodes lists the project flat first, as a
+// user who chose the list would have stored it.
+function listFlat(window) {
+  window.localStorage.setItem('df.tasksGroupByPrd', JSON.stringify({ [PROJECT]: 'flat' }));
+}
+
 // Each site's options are the ones its call site passes, and `render` returns
 // the element the badge belongs in: the task's row, node or detail pane.
 const STRAND_SITES = [
@@ -94,6 +101,7 @@ const STRAND_SITES = [
     site: 'tab_tasks.jsx::TaskGraph renderNode',
     options: { compact: true },
     render(harness, task) {
+      listFlat(harness.window);
       const { container } = harness.mount(harness.window.DF_TASKS.TasksTab, TAB_PROPS);
       return graphNode(container, task);
     },
@@ -102,6 +110,7 @@ const STRAND_SITES = [
     site: 'tab_tasks.jsx::TaskDetail',
     options: undefined,
     render(harness, task) {
+      listFlat(harness.window);
       const { container } = harness.mount(harness.window.DF_TASKS.TasksTab, TAB_PROPS);
       const node = graphNode(container, task);
       assert.ok(node, 'the task never reached the graph, so it cannot be selected');
@@ -979,6 +988,7 @@ function viewButton(window, container, key) {
 function mountTasks(harness) {
   const task = inProgressTask(false);
   seedOneTask(harness.window, task);
+  listFlat(harness.window);
   const handle = harness.mount(harness.window.DF_TASKS.TasksTab, TAB_PROPS);
   assert.ok(graphNode(handle.container, task), 'the seeded task never reached the graph');
   return handle;
@@ -1012,7 +1022,8 @@ function fillStorageToQuota(storage) {
 
 test('tab_tasks.jsx::TasksTab stores none of its preferences while each is at its default', t => {
   const harness = openWindow(t);
-  mountTasks(harness);
+  seedOneTask(harness.window, inProgressTask(false));
+  harness.mount(harness.window.DF_TASKS.TasksTab, TAB_PROPS);
 
   const stored = storedKeys(harness.window);
   assert.deepEqual(TASKS_PREFERENCE_KEYS.filter(key => stored.includes(key)), []);
@@ -1021,6 +1032,7 @@ test('tab_tasks.jsx::TasksTab stores none of its preferences while each is at it
 test('tab_tasks.jsx::TasksTab reports a preference it cannot store on console.warn, and the view still flips', t => {
   const harness = openWindow(t);
   const { window } = harness;
+  listFlat(window);
   const refusal = fillStorageToQuota(window.localStorage);
   assert.equal(refusal?.name, 'QuotaExceededError', 'the fill did not reach the storage quota');
   const warnings = [];
@@ -1074,15 +1086,17 @@ function groupingButton(container, label) {
   return buttons[0];
 }
 
-test('tab_tasks.jsx::TasksTab stores a project grouped by PRD, and removes the key when it is listed flat again', t => {
+test('tab_tasks.jsx::TasksTab stores a project listed flat, and removes the key when grouped by PRD again', t => {
   const harness = openWindow(t);
   const { window } = harness;
-  const { container } = mountTasks(harness);
-  click(window, groupingButton(container, 'by PRD'));
-  assert.equal(JSON.parse(window.localStorage.getItem('df.tasksGroupByPrd'))?.[PROJECT], 'prd', 'the by-PRD grouping was not stored');
-
+  seedOneTask(window, inProgressTask(false));
+  const { container } = harness.mount(window.DF_TASKS.TasksTab, TAB_PROPS);
+  assert.ok(groupingButton(container, 'by PRD').classList.contains('on'), 'by PRD is not the default grouping');
   click(window, groupingButton(container, 'list'));
-  assert.ok(groupingButton(container, 'list').classList.contains('on'), 'the project did not return to the flat list');
+  assert.equal(JSON.parse(window.localStorage.getItem('df.tasksGroupByPrd'))?.[PROJECT], 'flat', 'the flat listing was not stored');
+
+  click(window, groupingButton(container, 'by PRD'));
+  assert.ok(groupingButton(container, 'by PRD').classList.contains('on'), 'the project did not return to the lanes');
   assert.ok(!storedKeys(window).includes('df.tasksGroupByPrd'), 'the grouping is back at its default, yet its key is still stored');
 });
 
