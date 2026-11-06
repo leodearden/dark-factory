@@ -3306,9 +3306,39 @@ class TestBuildCorpusWithheldCensus(_CorpusHarness):
     """`_build_corpus` reports what each cap kept OUT of the pool.
 
     The census must count at every cap, not only at the final `_trim_pool`
-    pass: under stock config a maximal pool is 29 entries against a total cap
-    of 30, so a census keyed on the final trim alone never fires.
+    pass: a stream cap discards entries before `_trim_pool` ever sees them,
+    so a census keyed on the final trim alone would miss them.
     """
+
+    def _every_non_sibling_stream_overflowing(
+        self, config,
+    ) -> tuple[TaskCurator, CandidateTask, list[str]]:
+        """An anchored candidate whose module, embedding and dependency streams each overflow their cap; it has no siblings."""
+        cur = config.curator
+        anchor = self._anchor_task('100')
+        modules = [self._module_task(str(200 + i)) for i in range(cur.pool_module_cap + 5)]
+        deps = [
+            self._dependent_task(str(500 + i), '100')
+            for i in range(cur.pool_dependency_cap + 3)
+        ]
+        neighbor_ids = self._neighbor_ids(cur.pool_embedding_cap + 20)
+        neighbors = []
+        for tid in neighbor_ids:
+            t = self._module_task(tid)
+            t['files_to_modify'] = []
+            neighbors.append(t)
+        curator = TaskCurator(
+            config=config,
+            taskmaster=self._taskmaster([anchor, *modules, *deps, *neighbors]),
+        )
+        candidate = CandidateTask(
+            title='T', files_to_modify=[self.MODULE_FILE], spawned_from='100',
+        )
+        return curator, candidate, neighbor_ids
+
+    def _untrimmed_pool_size(self, cur) -> int:
+        """The pool ``_every_non_sibling_stream_overflowing`` yields before ``_trim_pool``: the anchor and three streams at their caps."""
+        return 1 + cur.pool_module_cap + cur.pool_embedding_cap + cur.pool_dependency_cap
 
     @pytest.mark.asyncio
     async def test_module_cap_excess_is_counted(self):
@@ -3428,70 +3458,56 @@ class TestBuildCorpusWithheldCensus(_CorpusHarness):
         }
 
     @pytest.mark.asyncio
-    async def test_a_full_pool_never_reaches_the_total_cap(self):
-        """FINDING 1: a census keyed only on `_trim_pool` would report nothing.
+    async def test_a_full_pool_is_trimmed_dependency_first_then_embedding_tail(self):
+        """Under stock caps a full pool overruns the total cap.
 
-        anchor(1) + module(15) + embedding(10) + dependency(3) = 29 <= 30, so
-        the final trim short-circuits even when every stream overflowed.
+        The trim spends the dependency stream first, then the embedding tail,
+        so the embedding head and the whole module stream survive.
         """
         config = _make_config()
-        anchor = self._anchor_task('100')
-        modules = [self._module_task(str(200 + i)) for i in range(20)]
-        deps = [self._dependent_task(str(500 + i), '100') for i in range(6)]
-        neighbor_ids = self._neighbor_ids(30)
-        neighbors = []
-        for tid in neighbor_ids:
-            t = self._module_task(tid)
-            t['files_to_modify'] = []
-            neighbors.append(t)
-        curator = TaskCurator(
-            config=config,
-            taskmaster=self._taskmaster([anchor, *modules, *deps, *neighbors]),
-        )
+        cur = config.curator
+        curator, candidate, neighbor_ids = self._every_non_sibling_stream_overflowing(config)
 
         pool, sizes, withheld = await self._corpus(
-            curator,
-            CandidateTask(title='T', files_to_modify=[self.MODULE_FILE], spawned_from='100'),
-            neighbor_ids=neighbor_ids,
+            curator, candidate, neighbor_ids=neighbor_ids,
         )
 
-        assert len(pool) == 29
-        assert len(pool) <= config.curator.pool_total_cap
-        assert withheld.by_source['total_cap'] == 0
-        # ...and yet 28 eligible entries were withheld.
+        assert len(pool) == cur.pool_total_cap
+        assert withheld.by_source['total_cap'] == self._untrimmed_pool_size(cur) - cur.pool_total_cap
+        assert sizes == {
+            'anchor': 1,
+            'sibling': 0,
+            'module': cur.pool_module_cap,
+            'dependency': 0,
+            'embedding': cur.pool_total_cap - 1 - cur.pool_module_cap,
+        }
+        kept_embedding = [e.task_id for e in pool if e.source == 'embedding']
+        assert kept_embedding == neighbor_ids[:sizes['embedding']]
         assert withheld.by_source['module'] == 5
-        assert withheld.by_source['embedding'] == 20
         assert withheld.by_source['dependency'] == 3
-        assert withheld.total == 28
-        assert withheld.render() is not None
 
     @pytest.mark.asyncio
     async def test_total_cap_drops_are_counted_when_the_trim_does_fire(self):
+        """A total cap no larger than the module stream runs the trim through every stream it may cut."""
         config = _make_config()
-        config.curator.pool_total_cap = 20
-        anchor = self._anchor_task('100')
-        modules = [self._module_task(str(200 + i)) for i in range(20)]
-        deps = [self._dependent_task(str(500 + i), '100') for i in range(6)]
-        neighbor_ids = self._neighbor_ids(30)
-        neighbors = []
-        for tid in neighbor_ids:
-            t = self._module_task(tid)
-            t['files_to_modify'] = []
-            neighbors.append(t)
-        curator = TaskCurator(
-            config=config,
-            taskmaster=self._taskmaster([anchor, *modules, *deps, *neighbors]),
+        cur = config.curator
+        cur.pool_total_cap = cur.pool_module_cap
+        curator, candidate, neighbor_ids = self._every_non_sibling_stream_overflowing(config)
+
+        pool, sizes, withheld = await self._corpus(
+            curator, candidate, neighbor_ids=neighbor_ids,
         )
 
-        pool, _sizes, withheld = await self._corpus(
-            curator,
-            CandidateTask(title='T', files_to_modify=[self.MODULE_FILE], spawned_from='100'),
-            neighbor_ids=neighbor_ids,
-        )
-
-        assert len(pool) == 20
-        assert withheld.by_source['total_cap'] == 29 - 20
-        assert withheld.caps['total_cap'] == 20
+        assert len(pool) == cur.pool_total_cap
+        assert sizes == {
+            'anchor': 1,
+            'sibling': 0,
+            'module': cur.pool_total_cap - 1,
+            'dependency': 0,
+            'embedding': 0,
+        }
+        assert withheld.by_source['total_cap'] == self._untrimmed_pool_size(cur) - cur.pool_total_cap
+        assert withheld.caps['total_cap'] == cur.pool_total_cap
 
     @pytest.mark.asyncio
     async def test_an_untruncated_pool_yields_a_quiet_census(self):
@@ -3510,13 +3526,15 @@ class TestBuildCorpusWithheldCensus(_CorpusHarness):
     async def test_pool_sizes_shape_is_untouched(self):
         """The census must not leak into `pool_sizes` (owned by task 4718)."""
         config = _make_config()
-        tasks = [self._module_task(str(200 + i)) for i in range(20)]
+        cap = config.curator.pool_module_cap
+        tasks = [self._module_task(str(200 + i)) for i in range(cap + 5)]
         curator = TaskCurator(config=config, taskmaster=self._taskmaster(tasks))
 
-        _pool, sizes, _withheld = await self._corpus(
+        _pool, sizes, withheld = await self._corpus(
             curator, CandidateTask(title='T', files_to_modify=[self.MODULE_FILE]),
         )
 
+        assert withheld.total > 0
         assert set(sizes) == {'anchor', 'sibling', 'module', 'embedding', 'dependency'}
         assert sizes == {
             'anchor': 0,
@@ -6965,9 +6983,9 @@ class TestSingleCallBudgetScaling:
     async def test_oversized_pool_clamped_at_cap(self):
         """N=50 → unclamped would be 2.00 + 0.0125*50 = 2.625; clamped at $2.00.
 
-        NOTE: In production _trim_pool caps the pool at pool_total_cap (default 30)
-        while the corpus is assembled, so len(pool) can never exceed 30
-        on the normal code path.  The cap (2.00) now equals the base floor, so
+        NOTE: In production _trim_pool caps the pool at pool_total_cap while
+        the corpus is assembled, so len(pool) can never exceed that cap on the
+        normal code path.  The cap (2.00) now equals the base floor, so
         every pool size — including pathologically large ones — clamps to the
         same flat $2.00.  This test verifies the clamping arithmetic but does
         NOT represent a reachable runtime scenario — it bypasses _trim_pool by

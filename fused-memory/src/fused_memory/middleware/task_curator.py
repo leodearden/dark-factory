@@ -2347,10 +2347,10 @@ class TaskCurator:
 
         Returns ``(pool, pool_sizes, withheld)``. ``withheld`` is the
         :class:`PoolWithheld` census of everything the caps kept out, counted
-        at EVERY cap rather than only at the final :func:`_trim_pool` — under
-        stock config that final trim never fires (see the pool-cap block in
-        ``config/schema.py::CuratorConfig``), so the stream caps are where the
-        genuinely-overlapping task is actually lost.
+        at EVERY cap rather than only at the final :func:`_trim_pool` — a
+        stream cap discards entries the trim never sees, so the stream caps are
+        where much of what the pool loses is lost (see the pool-cap block in
+        ``config/schema.py::CuratorConfig``).
         """
         # Resolve lock_depth PER PROJECT, not from a single global scalar:
         # fused-memory serves many projects and each orchestrator resolves its
