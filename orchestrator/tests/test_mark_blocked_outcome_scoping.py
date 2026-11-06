@@ -23,9 +23,9 @@ import pytest
 from _git_fixtures import seed_repo
 from _workflow_helpers import (
     GIT_REPO_SEED,
-    FakeBriefing,
-    FakeMcp,
+    AgentStub,
     FakeScheduler,
+    _build_workflow_with_escalation,
     _config,
     _make_git_ops,
 )
@@ -118,7 +118,7 @@ def _make_busy_on_older_l0_steward(
     class _FakeSteward:
         instances: list[_FakeSteward] = []
 
-        def __init__(self, wt_path: Path, cfg_dir: Path | None) -> None:  # noqa: ARG002
+        def __init__(self, wt_path: Path, cfg_dir: Path | None) -> None:
             self._outcome_channel: asyncio.Queue[PublishedStewardOutcome] | None = None
             self._work: asyncio.Task | None = None
             _FakeSteward.instances.append(self)
@@ -126,7 +126,7 @@ def _make_busy_on_older_l0_steward(
         def set_outcome_channel(self, channel) -> None:
             self._outcome_channel = channel
 
-        def set_wip_probe(self, probe) -> None:  # noqa: ARG002
+        def set_wip_probe(self, probe) -> None:
             pass
 
         def _publish(self, esc_id: str, text: str) -> None:
@@ -177,6 +177,7 @@ async def _build_workflow(
     assignment: TaskAssignment,
     queue: EscalationQueue,
     steward_factory: type,
+    tmp_path: Path,
     *,
     completion_timeout: float,
 ) -> tuple[TaskWorkflow, FakeScheduler]:
@@ -186,16 +187,11 @@ async def _build_workflow(
         unblock_auto=UnblockAutoConfig(enabled=False),
     )
     git_ops = _make_git_ops(git_repo)
-    scheduler = FakeScheduler()
-    workflow = TaskWorkflow(
-        assignment=assignment,
-        config=config,
-        git_ops=git_ops,
-        scheduler=scheduler,  # type: ignore[arg-type]
-        briefing=FakeBriefing(),  # type: ignore[arg-type]
-        mcp=FakeMcp(),  # type: ignore[arg-type]
-        escalation_queue=queue,
+    workflow, scheduler, _queue = _build_workflow_with_escalation(
+        config, git_ops, assignment, AgentStub(), tmp_path,
+        spawn_merge_worker=False,
         steward_factory=steward_factory,
+        queue=queue,
     )
     workflow.worktree = (await git_ops.create_worktree(TASK_ID)).path
     assert await workflow._worktree_has_wip_commits() is False, (
@@ -230,7 +226,7 @@ class TestMarkBlockedWaitIsScopedToItsOwnEscalation:
             queue, older.id, new_l0=NewL0Handling.UNTOUCHED,
         )
         workflow, scheduler = await _build_workflow(
-            git_repo, task_assignment, queue, steward_cls, completion_timeout=0.5,
+            git_repo, task_assignment, queue, steward_cls, tmp_path, completion_timeout=0.5,
         )
 
         try:
@@ -266,7 +262,7 @@ class TestMarkBlockedWaitIsScopedToItsOwnEscalation:
             queue, older.id, new_l0=NewL0Handling.RESOLVED_AFTER_OLDER,
         )
         workflow, _scheduler = await _build_workflow(
-            git_repo, task_assignment, queue, steward_cls, completion_timeout=5.0,
+            git_repo, task_assignment, queue, steward_cls, tmp_path, completion_timeout=5.0,
         )
 
         try:
@@ -275,7 +271,9 @@ class TestMarkBlockedWaitIsScopedToItsOwnEscalation:
                 10,
             )
             [new_id] = _new_l0_ids(queue, older.id)
-            new_status_at_return = queue.get(new_id).status  # type: ignore[union-attr]
+            new = queue.get(new_id)
+            assert new is not None
+            new_status_at_return = new.status
         finally:
             await _stop_all(steward_cls)
 
@@ -297,7 +295,7 @@ class TestMarkBlockedWaitIsScopedToItsOwnEscalation:
             queue, older.id, new_l0=NewL0Handling.RESOLVED_AFTER_OLDER,
         )
         workflow, _scheduler = await _build_workflow(
-            git_repo, task_assignment, queue, steward_cls, completion_timeout=5.0,
+            git_repo, task_assignment, queue, steward_cls, tmp_path, completion_timeout=5.0,
         )
 
         try:
@@ -309,7 +307,9 @@ class TestMarkBlockedWaitIsScopedToItsOwnEscalation:
                 ),
                 10,
             )
-            parent_status_at_return = queue.get(parent.id).status  # type: ignore[union-attr]
+            parent_record = queue.get(parent.id)
+            assert parent_record is not None
+            parent_status_at_return = parent_record.status
         finally:
             await _stop_all(steward_cls)
 
@@ -333,7 +333,7 @@ class TestMarkBlockedWaitIsScopedToItsOwnEscalation:
             new_l0_closer='claude-task-42-steward',
         )
         workflow, _scheduler = await _build_workflow(
-            git_repo, task_assignment, queue, steward_cls, completion_timeout=30.0,
+            git_repo, task_assignment, queue, steward_cls, tmp_path, completion_timeout=30.0,
         )
 
         try:
@@ -372,7 +372,7 @@ class TestMarkBlockedWaitIsScopedToItsOwnEscalation:
             new_l0_dismiss=True,
         )
         workflow, scheduler = await _build_workflow(
-            git_repo, task_assignment, queue, steward_cls, completion_timeout=0.5,
+            git_repo, task_assignment, queue, steward_cls, tmp_path, completion_timeout=0.5,
         )
 
         try:

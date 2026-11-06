@@ -1231,17 +1231,20 @@ def _build_workflow_with_escalation(
     tmp_path: Path,
     *,
     spawn_merge_worker: bool = True,
+    steward_factory: type | None = None,
+    queue: EscalationQueue | None = None,
 ) -> tuple[TaskWorkflow, FakeScheduler, EscalationQueue]:
     """Wire up a TaskWorkflow with an EscalationQueue attached.
 
     When ``spawn_merge_worker=False``, skips the MergeLane/asyncio.create_task
     setup — use for tests that exercise _mark_blocked directly and never enqueue
     merge work; omitting create_task avoids the 'Task was destroyed but it is
-    pending!' warning in pytest teardown.
+    pending!' warning in pytest teardown.  ``queue`` lets a caller submit
+    records, and build a steward that closes over the queue, before the
+    workflow exists; ``steward_factory`` goes to the public constructor argument.
     """
     scheduler = FakeScheduler()
-    queue_dir = tmp_path / 'escalation_queue'
-    queue = EscalationQueue(queue_dir)
+    queue = queue if queue is not None else EscalationQueue(tmp_path / 'escalation_queue')
     merge_queue: asyncio.Queue = asyncio.Queue()
     if spawn_merge_worker:
         worker = MergeLane(git_ops, merge_queue)
@@ -1258,6 +1261,7 @@ def _build_workflow_with_escalation(
         escalation_queue=queue,
         merge_queue=merge_queue,
         merge_worker=worker,
+        steward_factory=steward_factory,
     )
     return workflow, scheduler, queue
 
