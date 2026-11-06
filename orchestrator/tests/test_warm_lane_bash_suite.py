@@ -115,7 +115,7 @@ SCRIPT_COVERAGE = {
 #:
 #: ``test_thin_warm_lane.sh``'s Block C df-delta assert is not a deduction: it is
 #: gated on ``REIFY_WARM_LANE_MOUNT``, which ``_sanitized_env`` always strips, so
-#: 75 is both its floor and its measured count under this driver.
+#: 74 is both its floor and its measured count under this driver.
 #:
 #: Any OTHER shortfall — a block short-circuited by a future edit — fails loudly
 #: here instead of passing as a green item that ran less than it claims.  Leaf γ
@@ -183,7 +183,7 @@ ASSERT_FLOORS = {
     'test_warm_lane_disk_guard.sh': 89,  # 79 + 10 (A10, task 5940)
     'test_warm_lane_degenerate_ref.sh': 84,  # 70 + 11 (K1-K6: the conventional-commit citation arm)
                                              # + 3 (U8, task 5940)
-    'test_thin_warm_lane.sh': 75,  # 45 + 30 (A12 3, B3 2, B3b 6, Block F 19)
+    'test_thin_warm_lane.sh': 74,  # 45 + 29 (A12 3, B3 2, B3b 6, Block F 18)
     'test_warm_lane_gc.sh': 441,  # 214 + 64 (S-pressure 17 + S-age 16 + S-age-degrade 14
                                  #           + A11 12 + A11-boundary 5) + 2 (A11m/A11n, task 5940)
                                  # + 43 (S-discard) + 21 (T) − 8 (S-discard3, root-guarded; task 7862)

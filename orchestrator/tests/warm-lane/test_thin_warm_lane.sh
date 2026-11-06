@@ -525,8 +525,8 @@ assert "D3: target/ is still gone despite the reseed failure" \
 echo ""
 echo "--- Block F: live-process-reference gate (task 5307) ---"
 
-# --seed-script stub: records invocations, so "the refusal precedes any work" is
-# observable rather than assumed. Same shape as Block C's stub.
+# --seed-script stub: records invocations, so F-reseed3's "the refusal precedes
+# the stage" is observable rather than assumed. Same shape as Block C's stub.
 F_SEED_LOG="$(mktemp /tmp/test-thin-warm-lane-f-seedlog-XXXXXX)"
 _TMPDIRS+=("$F_SEED_LOG")
 F_SEED_STUB="$(mktemp /tmp/test-thin-warm-lane-f-seedstub-XXXXXX)"
@@ -571,8 +571,6 @@ assert "F4: stderr does NOT carry LANE_LOCK_CONTENDED (no misattribution; every 
     bash -c '! printf "%s\n" "$1" | grep -qF "LANE_LOCK_CONTENDED"' _ "$ERR_OUT"
 assert "F5: stdout is EMPTY (the resolved lane_dir is printed only on success)" \
     test -z "$OUT"
-assert "F6: seed-script log is EMPTY (the refusal precedes any work)" \
-    bash -c '[ ! -s "$1" ]' _ "$F_SEED_LOG"
 
 # ── F-fd: the OPEN-FD leg, holder cwd deliberately OUTSIDE the lane ───────────
 # F-cwd drives only the cwd leg of the scanner. This drives the open-fd leg

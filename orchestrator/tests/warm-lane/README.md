@@ -148,14 +148,17 @@ reify `3112547dee`), keeping reify's labels so the two files stay diffable:
 - **B3 token pair** (2 asserts) and **B3b** (6 asserts) — a flock refusal
   carries `LANE_LOCK_CONTENDED:` and never `LANE_LIVE_REF:`; on a lane that is
   BOTH flock-held and live-referenced, the flock gate fires first.
-- **Block F** (19 asserts) — with every `<lane>.lock` FREE, a cwd reference
+- **Block F** (18 asserts) — with every `<lane>.lock` FREE, a cwd reference
   (`F-cwd`) and an open-fd reference alone (`F-fd`) each refuse with 75 and
   `LANE_LIVE_REF:`; an unreferenced lane still thins (`F-free`); the refusal
   lifts once the reference clears (`F-temp`); and `--reseed` is gated too
   (`F-reseed`).
 
 reify's **Block E** (its seed-abort discard of an uncertified clone) is
-deliberately absent: dark-factory's thin has no such discard to test.
+deliberately absent: dark-factory's thin has no such discard to test. So is
+reify's F-cwd assert of an empty seed-script log: that run passes no
+`--reseed`, so thin never calls the seed script and the assert cannot fail.
+`F-reseed3` pins that the refusal precedes the seed call.
 
 ## Why these eight
 

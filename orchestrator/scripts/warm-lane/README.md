@@ -1640,7 +1640,7 @@ reify's `docs/prds/warm-lane-pool-space-safety.md` does not exist here; and no
 inv.13 post-abort discard, which dark-factory's thin never had.
 
 **Pinned by** `orchestrator/tests/warm-lane/test_thin_warm_lane.sh` A12, the B3
-token pair, B3b (gate ordering) and Block F (assert floor 45 → 75); by the
+token pair, B3b (gate ordering) and Block F (assert floor 45 → 74); by the
 script's entries in `test_warm_lane_scripts_shipped.py`'s
 `TestSiblingLibsTravelledWithTheScripts` and
 `TestSiblingResolutionIgnoresTheCallersCwd` parametrize lists; and end to end
