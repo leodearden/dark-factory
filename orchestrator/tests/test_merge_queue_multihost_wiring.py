@@ -26,6 +26,15 @@ import pytest
 from _gate_fixtures import TEST_DEPLOYED_SHA, gated_remote_runner
 from _merge_lane_fakes import FakeClock, FakeVerifier, hangs_until, raises
 from _orch_helpers import wait_responsive
+from _verify_host_drive import (
+    RUNNER_UNAVAILABLE_HOST,
+    drive_runner_unavailable,
+    passing_verify_result,
+    probe_free_orch_config,
+    runner_double,
+    verify_git_ops_mock,
+    verify_merge_request,
+)
 
 from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
 from orchestrator.deployed_sha import DeployedSha
@@ -39,30 +48,6 @@ from orchestrator.verify_runner import HostAllocator, HostLease, RemoteRunner, R
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def _make_config(*, verify_runners=None, main_branch='main', drift_every_n=20):
-    """Build an OrchestratorConfig with optional verify_runners.
-
-    ``verify_env_probes`` is pinned EMPTY (Lever C off, task 4537).
-    conftest.py::_isolate_orch_config is autouse and points ORCH_CONFIG_PATH at
-    this repo's own dark-factory-orchestrator.yaml, which declares probes — so
-    without this a config built here inherits them, and
-    orchestrator/src/orchestrator/merge_lane/drift.py::_run_drift_check would
-    capture the LOCAL fingerprint
-    through verify_runner.py::env_probe_local_run: real, untimed
-    subprocesses (npx/uv/node/python3 plus rustc/cargo/sccache) spawned by
-    tests that are about runner-pool wiring, not about env probing.  Any test
-    here that wants Lever C on should say so explicitly.
-    """
-    kwargs = {
-        'git': GitConfig(main_branch=main_branch),
-        'verify_drift_check_every_n_lands': drift_every_n,
-        'verify_env_probes': [],
-    }
-    if verify_runners is not None:
-        kwargs['verify_runners'] = verify_runners
-    return OrchestratorConfig(**kwargs)
 
 
 def _make_runner_cfg(
@@ -96,13 +81,13 @@ class TestBuildRemoteRunners:
 
     def test_empty_verify_runners_returns_empty_list(self):
         """config.verify_runners=[] → returns []."""
-        config = _make_config(verify_runners=[])
+        config = probe_free_orch_config(verify_runners=[])
         result = self._call(config)
         assert result == []
 
     def test_two_enabled_runners_returns_two_remote_runners(self):
         """Two enabled VerifyRunnerConfig → two RemoteRunners in order."""
-        config = _make_config(verify_runners=[
+        config = probe_free_orch_config(verify_runners=[
             _make_runner_cfg('r1', ssh_host='h1.local', git_remote='remote1'),
             _make_runner_cfg('r2', ssh_host='h2.local', git_remote='remote2'),
         ])
@@ -114,13 +99,13 @@ class TestBuildRemoteRunners:
 
     def test_remote_runners_have_is_local_false(self):
         """Returned RemoteRunners have is_local=False."""
-        config = _make_config(verify_runners=[_make_runner_cfg('r1')])
+        config = probe_free_orch_config(verify_runners=[_make_runner_cfg('r1')])
         result = self._call(config)
         assert result[0].is_local is False
 
     def test_runner_built_with_correct_ssh_host(self):
         """RemoteRunner stores the config ssh_host."""
-        config = _make_config(verify_runners=[
+        config = probe_free_orch_config(verify_runners=[
             _make_runner_cfg('r1', ssh_host='my-host.example.com', git_remote='origin'),
         ])
         result = self._call(config)
@@ -128,7 +113,7 @@ class TestBuildRemoteRunners:
 
     def test_runner_built_with_correct_git_remote(self):
         """RemoteRunner stores the config git_remote."""
-        config = _make_config(verify_runners=[
+        config = probe_free_orch_config(verify_runners=[
             _make_runner_cfg('r1', git_remote='my-remote'),
         ])
         result = self._call(config)
@@ -136,13 +121,13 @@ class TestBuildRemoteRunners:
 
     def test_runner_built_with_passed_cwd(self):
         """RemoteRunner._cwd matches the passed cwd argument."""
-        config = _make_config(verify_runners=[_make_runner_cfg('r1')])
+        config = probe_free_orch_config(verify_runners=[_make_runner_cfg('r1')])
         result = self._call(config, cwd='/custom/repo')
         assert str(result[0]._cwd) == '/custom/repo'
 
     def test_runner_built_with_config_path(self):
         """RemoteRunner._config_path matches config.config_path."""
-        config = _make_config(verify_runners=[
+        config = probe_free_orch_config(verify_runners=[
             _make_runner_cfg('r1', config_path='/etc/orch.yaml'),
         ])
         result = self._call(config)
@@ -150,13 +135,13 @@ class TestBuildRemoteRunners:
 
     def test_runner_built_with_main_branch_from_config(self):
         """RemoteRunner._main_branch == config.git.main_branch."""
-        config = _make_config(verify_runners=[_make_runner_cfg('r1')], main_branch='trunk')
+        config = probe_free_orch_config(verify_runners=[_make_runner_cfg('r1')], main_branch='trunk')
         result = self._call(config)
         assert result[0]._main_branch == 'trunk'
 
     def test_disabled_runner_excluded(self):
         """A runner with enabled=False is excluded from the result."""
-        config = _make_config(verify_runners=[
+        config = probe_free_orch_config(verify_runners=[
             _make_runner_cfg('active', enabled=True),
             _make_runner_cfg('disabled', enabled=False),
         ])
@@ -166,7 +151,7 @@ class TestBuildRemoteRunners:
 
     def test_quarantine_excludes_named_runner(self):
         """quarantine={'r1'} excludes r1, keeps r2."""
-        config = _make_config(verify_runners=[
+        config = probe_free_orch_config(verify_runners=[
             _make_runner_cfg('r1'),
             _make_runner_cfg('r2'),
         ])
@@ -176,7 +161,7 @@ class TestBuildRemoteRunners:
 
     def test_quarantine_none_includes_all_enabled(self):
         """quarantine=None (default) includes all enabled runners."""
-        config = _make_config(verify_runners=[
+        config = probe_free_orch_config(verify_runners=[
             _make_runner_cfg('r1'),
             _make_runner_cfg('r2'),
         ])
@@ -185,7 +170,7 @@ class TestBuildRemoteRunners:
 
     def test_quarantine_empty_set_includes_all_enabled(self):
         """quarantine=set() (empty) includes all enabled runners."""
-        config = _make_config(verify_runners=[
+        config = probe_free_orch_config(verify_runners=[
             _make_runner_cfg('r1'),
             _make_runner_cfg('r2'),
         ])
@@ -214,7 +199,7 @@ class TestBuildRemoteRunnersGatePaths:
         )
 
     def test_gate_paths_threaded_from_config(self):
-        config = _make_config(verify_runners=[
+        config = probe_free_orch_config(verify_runners=[
             _make_runner_cfg('r1', df_checkout_path='/remote/df1'),
             _make_runner_cfg('r2', df_checkout_path='/remote/df2', gate_checkouts_path='/g2'),
         ])
@@ -235,7 +220,7 @@ class TestBuildRemoteRunnersGatePaths:
 
         from orchestrator import verify_runner
 
-        config = _make_config(verify_runners=[_make_runner_cfg('r1'), _make_runner_cfg('r2')])
+        config = probe_free_orch_config(verify_runners=[_make_runner_cfg('r1'), _make_runner_cfg('r2')])
         result = self._call(config)
 
         roots = [r._code_checkout for r in result]
@@ -251,31 +236,6 @@ class TestBuildRemoteRunnersGatePaths:
 # ---------------------------------------------------------------------------
 # Helpers for _run_post_merge_verify / _run_cold_shadow_verify tests
 # ---------------------------------------------------------------------------
-
-
-def _make_pass_result(**kw):
-    return VerifyResult(passed=True, test_output='', lint_output='', type_output='', summary='ok', **kw)
-
-
-def _make_merge_request(config, *, task_files=None, worktree=None):
-    """Build a MergeRequest for use in _run_post_merge_verify tests."""
-    import asyncio
-    from pathlib import Path
-
-    from orchestrator.merge_lane.worker import MergeOutcome, MergeRequest
-
-    future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
-
-    return MergeRequest(
-        task_id='task-42',
-        branch=QueuedBranch.parse('task/42', config.git.branch_prefix),
-        worktree=worktree or Path('/repo/task-42'),
-        pre_rebased=False,
-        task_files=task_files,
-        module_configs=[],
-        config=config,
-        result=future,
-    )
 
 
 class _RecordingVerifier(FakeVerifier):
@@ -304,23 +264,13 @@ class _RecordingVerifier(FakeVerifier):
         )
 
 
-def _make_git_ops_mock():
-    """Build a minimal async mock for GitOps."""
-    mock = MagicMock()
-    mock.get_main_sha = AsyncMock(return_value='main-sha')
-    mock.get_free_disk_bytes = AsyncMock(return_value=100 * 1024 ** 3)  # plenty of disk
-    mock.cleanup_merge_worktree = AsyncMock()
-    mock.create_ephemeral_verify_worktree = AsyncMock(return_value='/repo/_throwaway')
-    return mock
-
-
 def _make_drift_git_ops(tmp_path):
-    """``_make_git_ops_mock`` whose throwaway worktree is a real directory.
+    """``verify_git_ops_mock`` whose throwaway worktree is a real directory.
 
     The drift detective runs its verify body under a lane lease keyed to the
     throwaway checkout, so the path it is handed has to exist on disk.
     """
-    mock = _make_git_ops_mock()
+    mock = verify_git_ops_mock()
     throwaway = tmp_path / '_merge-throwaway'
     throwaway.mkdir(exist_ok=True)
     mock.create_ephemeral_verify_worktree = AsyncMock(return_value=throwaway)
@@ -378,25 +328,6 @@ async def _init_merge_wt_with_change(merge_wt, filename='src/x.py'):
     return merge_wt
 
 
-def _runner_double(name, *, is_local, result=None, error=None):
-    """A verify host that reports *result*, or raises *error* when dispatched.
-
-    The pool and the drift detector ask a runner only for ``name``,
-    ``is_local``, ``health()`` and ``run_merge_verify()`` — so a host is an
-    injectable collaborator and no module attribute has to be substituted to
-    decide what a verify on it does.
-    """
-    runner = MagicMock()
-    runner.name = name
-    runner.is_local = is_local
-    runner.health = AsyncMock(return_value=True)
-    if error is not None:
-        runner.run_merge_verify = AsyncMock(side_effect=error)
-    else:
-        runner.run_merge_verify = AsyncMock(return_value=result or _make_pass_result())
-    return runner
-
-
 class _BodyVerifier(FakeVerifier):
     """``FakeVerifier`` whose scoped verify runs an arbitrary async *body*.
 
@@ -430,9 +361,9 @@ class TestRunPostMergeVerifyPoolWiring:
         """
         from orchestrator.merge_lane.worker import _run_post_merge_verify
 
-        config = _make_config(verify_runners=[_make_runner_cfg('laptop')])
-        req = _make_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
-        git_ops = _make_git_ops_mock()
+        config = probe_free_orch_config(verify_runners=[_make_runner_cfg('laptop')])
+        req = verify_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
+        git_ops = verify_git_ops_mock()
         es = _RecordingEventStore()
 
         outcome = await _run_post_merge_verify(
@@ -454,9 +385,9 @@ class TestRunPostMergeVerifyPoolWiring:
         """With enabled runner + task_files=None, derivation runs on dispatching host."""
         from orchestrator.merge_lane.worker import _run_post_merge_verify
 
-        config = _make_config(verify_runners=[_make_runner_cfg('laptop')])
-        req = _make_merge_request(config, task_files=None, worktree=tmp_path)
-        git_ops = _make_git_ops_mock()
+        config = probe_free_orch_config(verify_runners=[_make_runner_cfg('laptop')])
+        req = verify_merge_request(config, task_files=None, worktree=tmp_path)
+        git_ops = verify_git_ops_mock()
         # A real merge worktree, one commit of src/x.py ahead of main: the
         # REAL derivation runs `git diff main...HEAD` here and finds it.
         merge_wt = await _init_merge_wt_with_change(tmp_path / 'merge-wt')
@@ -484,9 +415,9 @@ class TestRunPostMergeVerifyPoolWiring:
         proactively call _derive_task_files_from_git (Lever C gate — byte-identical path)."""
         from orchestrator.merge_lane.worker import _run_post_merge_verify
 
-        config = _make_config(verify_runners=[])  # Lever C off
-        req = _make_merge_request(config, task_files=None, worktree=tmp_path)
-        git_ops = _make_git_ops_mock()
+        config = probe_free_orch_config(verify_runners=[])  # Lever C off
+        req = verify_merge_request(config, task_files=None, worktree=tmp_path)
+        git_ops = verify_git_ops_mock()
 
         # A real merge worktree one commit ahead of main: the derivation WOULD
         # find src/x.py here, so an unscoped verify is only explicable by the
@@ -534,9 +465,9 @@ class TestRunPostMergeVerifyFlockContention:
         from orchestrator.merge_lane.worker import _run_post_merge_verify
         from orchestrator.verify_runner import make_flock_contention_result
 
-        config = _make_config()
-        req = _make_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
-        git_ops = _make_git_ops_mock()
+        config = probe_free_orch_config()
+        req = verify_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
+        git_ops = verify_git_ops_mock()
         stub_remote = self._make_stub_remote(
             make_flock_contention_result(host='leo-laptop', holder_pgid=4242, waiter_pgid=4343)
         )
@@ -570,9 +501,9 @@ class TestRunPostMergeVerifyFlockContention:
         """INVARIANT: a plain non-contention passed=False result files no escalation."""
         from orchestrator.merge_lane.worker import _run_post_merge_verify
 
-        config = _make_config()
-        req = _make_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
-        git_ops = _make_git_ops_mock()
+        config = probe_free_orch_config()
+        req = verify_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
+        git_ops = verify_git_ops_mock()
         plain_fail = VerifyResult(
             passed=False, test_output='FAILED test_x', lint_output='', type_output='',
             summary='1 failure', category='',
@@ -598,9 +529,9 @@ class TestRunPostMergeVerifyFlockContention:
         from orchestrator.merge_lane.worker import _run_post_merge_verify
         from orchestrator.verify_runner import make_flock_contention_result
 
-        config = _make_config()
-        req = _make_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
-        git_ops = _make_git_ops_mock()
+        config = probe_free_orch_config()
+        req = verify_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
+        git_ops = verify_git_ops_mock()
         stub_remote = self._make_stub_remote(
             make_flock_contention_result(host='leo-laptop', holder_pgid=4242, waiter_pgid=4343)
         )
@@ -633,9 +564,9 @@ class TestRunPostMergeVerifyLocalOnly:
         """
         from orchestrator.merge_lane.worker import _run_post_merge_verify
 
-        config = _make_config(verify_runners=[_make_runner_cfg('laptop')])
-        req = _make_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
-        git_ops = _make_git_ops_mock()
+        config = probe_free_orch_config(verify_runners=[_make_runner_cfg('laptop')])
+        req = verify_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
+        git_ops = verify_git_ops_mock()
         es = _RecordingEventStore()
 
         outcome = await _run_post_merge_verify(
@@ -688,7 +619,7 @@ def _green_remote(name='laptop'):
     remote = MagicMock()
     remote.name = name
     remote.is_local = False
-    remote.run_merge_verify = AsyncMock(return_value=_make_pass_result())
+    remote.run_merge_verify = AsyncMock(return_value=passing_verify_result())
     return remote
 
 
@@ -705,8 +636,8 @@ class TestCrossCheckHoldsLaneLockLease:
 
         config = _cross_check_config()
         # task_files non-None → dispatching-host derivation is skipped.
-        req = _make_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
-        git_ops = _make_git_ops_mock()
+        req = verify_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
+        git_ops = verify_git_ops_mock()
         fake_remote = _green_remote()  # green primary → cross-check fires
 
         # An EPHEMERAL speculation lane (the incident's _merge-<hash> shape),
@@ -777,8 +708,8 @@ class TestCrossCheckHoldsLaneLockLease:
             git=GitConfig(main_branch='main', persistent_merge_worktree=False),
             verify_cross_check_remote_green=True,
         )
-        req = _make_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
-        git_ops = _make_git_ops_mock()
+        req = verify_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
+        git_ops = verify_git_ops_mock()
         fake_remote = _green_remote()  # green primary → cross-check fires
         merge_wt = tmp_path / '_merge-98c756bc'
 
@@ -853,8 +784,8 @@ class TestCrossCheckLeaseContentionFailsSafe:
         from orchestrator.verify_cancel import lane_lock_path
 
         config = _cross_check_config()
-        req = _make_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
-        git_ops = _make_git_ops_mock()
+        req = verify_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
+        git_ops = verify_git_ops_mock()
         fake_remote = _green_remote()  # green primary → cross-check fires
         merge_wt = tmp_path / '_merge-98c756bc'
 
@@ -933,7 +864,7 @@ class TestEnsureHostAllocator:
     def _make_worker(self, *, project_root=None, deployed_sha: DeployedSha | None = TEST_DEPLOYED_SHA):
         """Build a minimal SpeculativeMergeWorker with optional project_root."""
         from orchestrator.merge_lane.worker import SpeculativeMergeWorker
-        git_ops = _make_git_ops_mock()
+        git_ops = verify_git_ops_mock()
         if project_root is not None:
             git_ops.project_root = project_root
         else:
@@ -947,14 +878,14 @@ class TestEnsureHostAllocator:
 
     def test_enabled_runners_without_a_deployed_sha_fail_loudly(self, tmp_path):
         """No deployed sha means no gate: never a dispatch through a shared tree (task 6565)."""
-        config = _make_config(verify_runners=[_make_runner_cfg('laptop')])
+        config = probe_free_orch_config(verify_runners=[_make_runner_cfg('laptop')])
         worker = self._make_worker(project_root=tmp_path, deployed_sha=None)
 
         with pytest.raises(RuntimeError, match='deployed sha'):
             worker._ensure_host_allocator(config)
 
     def test_no_enabled_runners_need_no_deployed_sha(self, tmp_path):
-        config = _make_config(verify_runners=[])
+        config = probe_free_orch_config(verify_runners=[])
         worker = self._make_worker(project_root=tmp_path, deployed_sha=None)
 
         assert worker._ensure_host_allocator(config).host_names == ['local']
@@ -963,7 +894,7 @@ class TestEnsureHostAllocator:
         """With enabled_verify_runners=['laptop'], allocator.host_names includes 'laptop'."""
         from orchestrator.verify_runner import HostAllocator
 
-        config = _make_config(verify_runners=[_make_runner_cfg('laptop')])
+        config = probe_free_orch_config(verify_runners=[_make_runner_cfg('laptop')])
         worker = self._make_worker(project_root=tmp_path)
 
         allocator = worker._ensure_host_allocator(config)
@@ -974,7 +905,7 @@ class TestEnsureHostAllocator:
 
     def test_remotes_built_with_stable_cwd_project_root(self, tmp_path):
         """RemoteRunners in the allocator are built with cwd == git_ops.project_root."""
-        config = _make_config(verify_runners=[_make_runner_cfg('laptop')])
+        config = probe_free_orch_config(verify_runners=[_make_runner_cfg('laptop')])
         worker = self._make_worker(project_root=tmp_path)
 
         allocator = worker._ensure_host_allocator(config)
@@ -986,7 +917,7 @@ class TestEnsureHostAllocator:
 
     def test_shared_quarantine_set_is_worker_quarantine(self, tmp_path):
         """Mutating the allocator's quarantine set is visible in worker._runner_quarantine."""
-        config = _make_config(verify_runners=[_make_runner_cfg('laptop')])
+        config = probe_free_orch_config(verify_runners=[_make_runner_cfg('laptop')])
         worker = self._make_worker(project_root=tmp_path)
 
         allocator = worker._ensure_host_allocator(config)
@@ -997,7 +928,7 @@ class TestEnsureHostAllocator:
 
     def test_idempotent_same_instance_on_second_call(self, tmp_path):
         """_ensure_host_allocator returns the SAME instance on repeated calls."""
-        config = _make_config(verify_runners=[_make_runner_cfg('laptop')])
+        config = probe_free_orch_config(verify_runners=[_make_runner_cfg('laptop')])
         worker = self._make_worker(project_root=tmp_path)
 
         first = worker._ensure_host_allocator(config)
@@ -1008,7 +939,7 @@ class TestEnsureHostAllocator:
         """With enabled_verify_runners=[], allocator has only the local slot (no crash)."""
         from orchestrator.verify_runner import HostAllocator
 
-        config = _make_config(verify_runners=[])
+        config = probe_free_orch_config(verify_runners=[])
         worker = self._make_worker(project_root=tmp_path)
 
         allocator = worker._ensure_host_allocator(config)
@@ -1020,7 +951,7 @@ class TestEnsureHostAllocator:
         """With no git_ops.project_root, allocator builds (no remotes) without raising."""
         from orchestrator.verify_runner import HostAllocator
 
-        config = _make_config(verify_runners=[_make_runner_cfg('laptop')])
+        config = probe_free_orch_config(verify_runners=[_make_runner_cfg('laptop')])
         worker = self._make_worker(project_root=None)
 
         allocator = worker._ensure_host_allocator(config)
@@ -1046,13 +977,13 @@ class TestColdShadowVerifyLocalOnly:
         """
         from orchestrator.merge_lane.worker import _run_cold_shadow_verify
 
-        config = _make_config(verify_runners=[_make_runner_cfg('laptop')])
-        req = _make_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
-        git_ops = _make_git_ops_mock()
+        config = probe_free_orch_config(verify_runners=[_make_runner_cfg('laptop')])
+        req = verify_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
+        git_ops = verify_git_ops_mock()
         es = _RecordingEventStore()
 
         with patch('orchestrator.merge_lane.worker.run_scoped_verification',
-                   new=AsyncMock(return_value=_make_pass_result())):
+                   new=AsyncMock(return_value=passing_verify_result())):
             await _run_cold_shadow_verify(git_ops, req, 'abc123', es, verifier=PRODUCTION_VERIFIER)
 
         dispatched_on = es.field('runner')
@@ -1092,7 +1023,7 @@ class TestRunDriftCheck:
         *quarantine* is the same set ``_run_drift_check`` quarantines into, so
         the allocator honours a host it has just quarantined.
         """
-        remote = _runner_double('laptop', is_local=False, result=remote_result)
+        remote = runner_double('laptop', is_local=False, result=remote_result)
         return HostAllocator(
             [remote], quarantine=set() if quarantine is None else quarantine,
         )
@@ -1101,8 +1032,8 @@ class TestRunDriftCheck:
         """When local and remote agree, a verdict_parity_ok event is emitted."""
         from orchestrator.merge_lane.drift import _run_drift_check
 
-        config = _make_config(verify_runners=[_make_runner_cfg('laptop')])
-        req = _make_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
+        config = probe_free_orch_config(verify_runners=[_make_runner_cfg('laptop')])
+        req = verify_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
         git_ops = _make_drift_git_ops(tmp_path)
         eq = self._make_fake_escalation_queue()
         es = _RecordingEventStore()
@@ -1134,12 +1065,12 @@ class TestRunDriftCheck:
         """
         from orchestrator.merge_lane.drift import _run_drift_check
 
-        config = _make_config(verify_runners=[_make_runner_cfg('laptop')])
-        req = _make_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
+        config = probe_free_orch_config(verify_runners=[_make_runner_cfg('laptop')])
+        req = verify_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
         git_ops = _make_drift_git_ops(tmp_path)
         allocator = self._drift_allocator()
 
-        run_scoped = AsyncMock(return_value=_make_pass_result())
+        run_scoped = AsyncMock(return_value=passing_verify_result())
         with patch('orchestrator.merge_lane.worker.run_scoped_verification', new=run_scoped):
             await _run_drift_check(
                 git_ops, req, 'abc123', None, None, set(),
@@ -1168,8 +1099,8 @@ class TestRunDriftCheck:
         """When local passes but remote fails (divergence), escalation submitted + remote quarantined."""
         from orchestrator.merge_lane.drift import _run_drift_check
 
-        config = _make_config(verify_runners=[_make_runner_cfg('laptop')])
-        req = _make_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
+        config = probe_free_orch_config(verify_runners=[_make_runner_cfg('laptop')])
+        req = verify_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
         git_ops = _make_drift_git_ops(tmp_path)
         eq = self._make_fake_escalation_queue()
         es = _RecordingEventStore()
@@ -1221,9 +1152,9 @@ class TestMaybeRunDriftCheck:
         """_maybe_run_drift_check is a no-op when verify_runners is empty."""
         from orchestrator.merge_lane.worker import _maybe_run_drift_check
 
-        config = _make_config(verify_runners=[])
-        req = _make_merge_request(config, worktree=tmp_path)
-        git_ops = _make_git_ops_mock()
+        config = probe_free_orch_config(verify_runners=[])
+        req = verify_merge_request(config, worktree=tmp_path)
+        git_ops = verify_git_ops_mock()
         worker = _drift_gate_worker()
 
         with patch('asyncio.create_task') as mock_create_task:
@@ -1235,12 +1166,12 @@ class TestMaybeRunDriftCheck:
         """With every_n=2, drift check is triggered on 2nd and 4th land."""
         from orchestrator.merge_lane.worker import _maybe_run_drift_check
 
-        config = _make_config(
+        config = probe_free_orch_config(
             verify_runners=[_make_runner_cfg('laptop')],
             drift_every_n=2,
         )
-        req = _make_merge_request(config, worktree=tmp_path)
-        git_ops = _make_git_ops_mock()
+        req = verify_merge_request(config, worktree=tmp_path)
+        git_ops = verify_git_ops_mock()
         worker = _drift_gate_worker()
 
         with patch('asyncio.create_task') as mock_create_task:
@@ -1266,9 +1197,9 @@ class TestMaybeRunDriftCheck:
         """_maybe_run_drift_check increments worker._drift_land_count each call."""
         from orchestrator.merge_lane.worker import _maybe_run_drift_check
 
-        config = _make_config(verify_runners=[_make_runner_cfg('r1')], drift_every_n=100)
-        req = _make_merge_request(config, worktree=tmp_path)
-        git_ops = _make_git_ops_mock()
+        config = probe_free_orch_config(verify_runners=[_make_runner_cfg('r1')], drift_every_n=100)
+        req = verify_merge_request(config, worktree=tmp_path)
+        git_ops = verify_git_ops_mock()
         worker = _drift_gate_worker()
 
         with patch('asyncio.create_task'):
@@ -1298,7 +1229,7 @@ class TestDriftCheckTaskGCSafety:
         """(a) SpeculativeMergeWorker.__init__ sets _drift_check_tasks = set()."""
         from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
-        git_ops = _make_git_ops_mock()
+        git_ops = verify_git_ops_mock()
         worker = SpeculativeMergeWorker(git_ops=git_ops, queue=asyncio.Queue())
         assert hasattr(worker, '_drift_check_tasks'), (
             'SpeculativeMergeWorker must have _drift_check_tasks after __init__'
@@ -1312,11 +1243,11 @@ class TestDriftCheckTaskGCSafety:
         """(b+c) Task is in _drift_check_tasks while in-flight; done-callback clears it."""
         from orchestrator.merge_lane.worker import _maybe_run_drift_check
 
-        config = _make_config(
+        config = probe_free_orch_config(
             verify_runners=[_make_runner_cfg('laptop')],
             drift_every_n=1,
         )
-        req = _make_merge_request(config, worktree=tmp_path)
+        req = verify_merge_request(config, worktree=tmp_path)
         git_ops = _make_drift_git_ops(tmp_path)
         worker = _drift_gate_worker()
 
@@ -1327,7 +1258,7 @@ class TestDriftCheckTaskGCSafety:
         # local trust-anchor leg verifies through a port that parks on `gate`,
         # so the detective is genuinely in flight while the assertions below
         # read the tracking set.  Nothing about the spawn is stubbed.
-        remote = _runner_double('laptop', is_local=False)
+        remote = runner_double('laptop', is_local=False)
         worker._ensure_host_allocator = MagicMock(
             return_value=HostAllocator([remote], quarantine=set())
         )
@@ -1377,7 +1308,7 @@ class TestDriftCheckTaskStopCleanup:
         """stop() cancels in-flight drift tasks; their finally blocks run at shutdown."""
         from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
-        git_ops = _make_git_ops_mock()
+        git_ops = verify_git_ops_mock()
         worker = SpeculativeMergeWorker(
             git_ops=git_ops,
             queue=asyncio.Queue(),
@@ -1467,60 +1398,6 @@ class TestInflightVerifyResultReasonField:
         assert 'Could not resolve hostname' in ivr.reason
 
 
-#: Host name used by the RunnerUnavailable drives below.
-_RU_HOST = 'leo-laptop'
-
-
-async def _drive_runner_unavailable(tmp_path, caplog, reason, *, error=None):
-    """Raise RunnerUnavailable(*reason*) from a REMOTE lease; return (result, warning records).
-
-    *error* replaces the raised RunnerUnavailable, to drive a kind other than
-    'transport'.
-
-    The single injection seam for the ``except RunnerUnavailable`` handler:
-    every test of that branch — the stored ``reason`` (task 1795) and the
-    WARNING's host/rc/trigger (task 4194) — drives it through here, so the
-    one unavoidable reach into ``_run_inflight_verify`` is spelled once.
-    """
-    from orchestrator.merge_lane.worker import RealMergeItem, SpeculativeMergeWorker
-    from orchestrator.verify_runner import HostLease, RunnerUnavailable
-
-    git_ops = _make_git_ops_mock()
-    q: asyncio.Queue = asyncio.Queue()
-    worker = SpeculativeMergeWorker(
-        git_ops=git_ops, queue=q, verifier=FakeVerifier(),
-    )
-
-    merge_result = MagicMock()
-    merge_result.merge_commit = 'abc123def456789abc1'
-    config = _make_config()
-    item = RealMergeItem(
-        request=_make_merge_request(config, task_files=[], worktree=tmp_path),
-        merge_result=merge_result,
-        merge_wt=tmp_path / 'merge-wt',
-        base_sha='base123',
-        speculative=False,
-    )
-
-    # REMOTE lease whose host is genuinely unreachable: a remote-lease
-    # dispatch builds a single-runner pool, so the RunnerUnavailable the
-    # runner raises propagates through the real verify path exactly as a
-    # dead laptop does in production — no module attribute substituted.
-    fake_runner = _runner_double(
-        _RU_HOST, is_local=False, error=error or RunnerUnavailable(reason),
-    )
-    lease = HostLease(name=_RU_HOST, runner=fake_runner, is_local=False)
-
-    with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
-        result = await worker._run_inflight_verify(item, lease)
-
-    records = [
-        r for r in caplog.records
-        if r.levelno >= logging.WARNING and 'remote runner unavailable' in r.message
-    ]
-    return result, records
-
-
 @pytest.mark.asyncio
 class TestRunInflightVerifyRunnerUnavailableReason:
     """_run_inflight_verify captures RunnerUnavailable message into reason (task 1795 step-3).
@@ -1533,7 +1410,7 @@ class TestRunInflightVerifyRunnerUnavailableReason:
         """REMOTE lease RunnerUnavailable → reason field holds the exception message."""
         error_msg = 'ssh: Could not resolve hostname leo-laptop'
 
-        result, _ = await _drive_runner_unavailable(tmp_path, caplog, error_msg)
+        result, _ = await drive_runner_unavailable(tmp_path, caplog, error_msg)
 
         assert result.status == 'RUNNER_UNAVAILABLE'
         # RED: reason is None until step-4 adds `except RunnerUnavailable as exc:` + reason=str(exc)
@@ -1551,7 +1428,7 @@ class TestRunInflightVerifyRunnerUnavailableReason:
         pair = GateIdentityPair(GateIdentity('1' * 40, 'a' * 64), GateIdentity('2' * 40, 'a' * 64))
         error = RunnerUnavailable('handshake mismatch', kind='wire_shape', identity=pair)
 
-        result, _ = await _drive_runner_unavailable(tmp_path, caplog, '', error=error)
+        result, _ = await drive_runner_unavailable(tmp_path, caplog, '', error=error)
 
         assert (result.status, result.kind, result.identity) == (
             'RUNNER_UNAVAILABLE', 'wire_shape', pair,
@@ -1575,13 +1452,13 @@ class TestRunnerUnavailableWarningIsAttributable:
 
     async def test_warning_names_the_host_and_carries_the_rc(self, tmp_path, caplog):
         """One drive pins all three: the machine, the rc that reached journald, the full reason."""
-        reason = f'ssh {_RU_HOST} exited 255: connection reset'
-        result, records = await _drive_runner_unavailable(tmp_path, caplog, reason)
+        reason = f'ssh {RUNNER_UNAVAILABLE_HOST} exited 255: connection reset'
+        result, records = await drive_runner_unavailable(tmp_path, caplog, reason)
 
         assert len(records) == 1, f'expected exactly one warning; got {records!r}'
         # The abandoned machine is named, so a re-dispatch is attributable to a
         # host, and the rc rides along without waiting for the escalation threshold.
-        assert _RU_HOST in records[0].message
+        assert RUNNER_UNAVAILABLE_HOST in records[0].message
         assert 'exited 255' in records[0].message
         assert result.status == 'RUNNER_UNAVAILABLE'
         # The stored reason stays FULL — _quarantine_unreachable_host reads it.
@@ -1592,10 +1469,10 @@ class TestRunnerUnavailableWarningIsAttributable:
     ):
         """A watchdog self-kill reads as one, end to end — the signal this task exists for."""
         reason = (
-            f'ssh {_RU_HOST} exited 1: [INFO] running cargo test\n'
+            f'ssh {RUNNER_UNAVAILABLE_HOST} exited 1: [INFO] running cargo test\n'
             'watchdog_fire_trigger=heartbeat_starvation\n'
         )
-        result, records = await _drive_runner_unavailable(tmp_path, caplog, reason)
+        result, records = await drive_runner_unavailable(tmp_path, caplog, reason)
 
         assert len(records) == 1
         assert 'exited 1' in records[0].message
@@ -1635,11 +1512,11 @@ class TestRunnerUnavailableWarningIsBounded:
         from orchestrator.verify_cancel import JOURNALD_LINE_MAX_BYTES
 
         reason = (
-            f'ssh {_RU_HOST} exited 1: '
+            f'ssh {RUNNER_UNAVAILABLE_HOST} exited 1: '
             + self.FLOOD_CHAR * self.FLOOD
             + '\nwatchdog_fire_trigger=eof\n'
         )
-        result, records = await _drive_runner_unavailable(tmp_path, caplog, reason)
+        result, records = await drive_runner_unavailable(tmp_path, caplog, reason)
 
         assert len(records) == 1
         message = records[0].message
@@ -1657,11 +1534,11 @@ class TestRunnerUnavailableWarningIsBounded:
         import re
 
         reason = (
-            f'ssh {_RU_HOST} exited 1: '
+            f'ssh {RUNNER_UNAVAILABLE_HOST} exited 1: '
             + self.FLOOD_CHAR * self.FLOOD
             + '\nwatchdog_fire_trigger=eof\n'
         )
-        _result, records = await _drive_runner_unavailable(tmp_path, caplog, reason)
+        _result, records = await drive_runner_unavailable(tmp_path, caplog, reason)
 
         message = records[0].message
         marker = re.search(r'(\d+) chars elided', message)
@@ -1675,8 +1552,8 @@ class TestRunnerUnavailableWarningIsBounded:
 
     async def test_short_reason_is_passed_through_verbatim(self, tmp_path, caplog):
         """The common case pays nothing: no marker, nothing dropped."""
-        reason = f'ssh {_RU_HOST} exited 255: connection reset by peer'
-        _result, records = await _drive_runner_unavailable(tmp_path, caplog, reason)
+        reason = f'ssh {RUNNER_UNAVAILABLE_HOST} exited 255: connection reset by peer'
+        _result, records = await drive_runner_unavailable(tmp_path, caplog, reason)
 
         message = records[0].message
         assert reason in message
@@ -1713,8 +1590,8 @@ class TestRunInflightVerifyRunnerUnavailableSpecWarm:
         merge_result = MagicMock()
         merge_result.merge_commit = 'abc123def456789abc1'
         return RealMergeItem(
-            request=_make_merge_request(
-                config or _make_config(), task_files=[], worktree=tmp_path,
+            request=verify_merge_request(
+                config or probe_free_orch_config(), task_files=[], worktree=tmp_path,
             ),
             merge_result=merge_result,
             merge_wt=merge_wt,
@@ -1741,7 +1618,7 @@ class TestRunInflightVerifyRunnerUnavailableSpecWarm:
         cold_wt = tmp_path / '_merge-cold'
         cold_wt.mkdir()
 
-        git_ops = _make_git_ops_mock()
+        git_ops = verify_git_ops_mock()
         # The one production input that decides warm-ness: the pool hands back a
         # seeded lane.  Everything downstream of it is the real code path.
         git_ops.acquire_spec_lane = AsyncMock(return_value=(lane, True))
@@ -1765,7 +1642,7 @@ class TestRunInflightVerifyRunnerUnavailableSpecWarm:
         assert config.git.persistent_merge_worktree_safety_valve_every_n == 0
         item = self._make_item(tmp_path, cold_wt, config=config, speculative=True)
 
-        fake_local = _runner_double('local', is_local=True)
+        fake_local = runner_double('local', is_local=True)
         lease = HostLease(name='local', runner=fake_local, is_local=True)
 
         result = await worker._run_inflight_verify(item, lease)
@@ -1788,7 +1665,7 @@ class TestRunInflightVerifyRunnerUnavailableSpecWarm:
         from orchestrator.merge_lane.worker import SpeculativeMergeWorker
         from orchestrator.verify_runner import HostLease, RunnerUnavailable
 
-        git_ops = _make_git_ops_mock()
+        git_ops = verify_git_ops_mock()
         q: asyncio.Queue = asyncio.Queue()
         worker = SpeculativeMergeWorker(
             git_ops=git_ops, queue=q, verifier=FakeVerifier(),
@@ -1798,7 +1675,7 @@ class TestRunInflightVerifyRunnerUnavailableSpecWarm:
         cold_wt.mkdir()
         item = self._make_item(tmp_path, cold_wt)
 
-        fake_runner = _runner_double(
+        fake_runner = runner_double(
             'leo-laptop', is_local=False, error=RunnerUnavailable('ssh spawn failed'),
         )
         lease = HostLease(name='leo-laptop', runner=fake_runner, is_local=False)
@@ -1831,7 +1708,7 @@ class TestRunInflightVerifyThreadsEscalationQueue:
         from orchestrator.merge_lane.worker import RealMergeItem, SpeculativeMergeWorker
         from orchestrator.verify_runner import HostLease, make_flock_contention_result
 
-        git_ops = _make_git_ops_mock()
+        git_ops = verify_git_ops_mock()
         q: asyncio.Queue = asyncio.Queue()
         worker_eq = _FakeEscalationQueue(open_l1=False)
         worker = SpeculativeMergeWorker(
@@ -1843,8 +1720,8 @@ class TestRunInflightVerifyThreadsEscalationQueue:
         merge_result = MagicMock()
         merge_result.merge_commit = 'abc123def456789abc1'
 
-        config = _make_config()
-        req = _make_merge_request(config, task_files=[], worktree=tmp_path)
+        config = probe_free_orch_config()
+        req = verify_merge_request(config, task_files=[], worktree=tmp_path)
 
         item = RealMergeItem(
             request=req,
@@ -1855,7 +1732,7 @@ class TestRunInflightVerifyThreadsEscalationQueue:
         )
 
         # REMOTE lease — bypasses local warm-swap path (mirrors 1795/step-3's builder)
-        fake_runner = _runner_double(
+        fake_runner = runner_double(
             'leo-laptop', is_local=False,
             result=make_flock_contention_result(
                 host='leo-laptop', holder_pgid=4242, waiter_pgid=4343,
@@ -2017,14 +1894,14 @@ class _HostBenchScene:
             "worker's __init__ defaults"
         )
         self.clock = FakeClock()
-        self.runners = {name: _runner_double(name, is_local=False) for name in remotes}
+        self.runners = {name: runner_double(name, is_local=False) for name in remotes}
         self.events = _RecordingEventStore()
         self.eq = (
             _FakeEscalationQueueWithResolution()
             if isinstance(escalation_queue, _DefaultEscalationQueue)
             else escalation_queue
         )
-        git_ops = _make_git_ops_mock()
+        git_ops = verify_git_ops_mock()
         git_ops.project_root = tmp_path
         self.config = OrchestratorConfig(
             project_root=tmp_path, verify_host_reprobe_interval_s=120.0,
@@ -2412,7 +2289,7 @@ def _make_ru_worker(*, escalate_after_n=2, escalation_queue=_DEFAULT_EQ):
 
     from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
-    git_ops = _make_git_ops_mock()
+    git_ops = verify_git_ops_mock()
     git_ops.project_root = None  # no real git needed for this test
     q: asyncio.Queue = asyncio.Queue()
     eq = (
@@ -2479,7 +2356,7 @@ def _make_ru_entry(
         pre_rebased=False,
         task_files=[],
         module_configs=[],
-        config=_make_config(),
+        config=probe_free_orch_config(),
         result=loop.create_future(),
     )
 
@@ -2865,7 +2742,7 @@ class TestFinalizeInflightRunnerUnavailableWorktreeLedger:
 
         worker, eq, fake_alloc = _make_ru_worker(escalate_after_n=99)
         worker._running = True
-        # _make_git_ops_mock() does not expose release_spec_lane; a bare
+        # verify_git_ops_mock() does not expose release_spec_lane; a bare
         # MagicMock attribute is not awaitable, so install a recording stub.
         worker._git_ops.release_spec_lane = AsyncMock()
 
@@ -4308,10 +4185,10 @@ class TestRunPostMergeVerifyRemoteStderrWiring:
         )
 
         # Build config with project_root=tmp_path so archive resolves there
-        config = _make_config()
+        config = probe_free_orch_config()
         config = config.model_copy(update={'project_root': tmp_path})
-        req = _make_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
-        git_ops = _make_git_ops_mock()
+        req = verify_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
+        git_ops = verify_git_ops_mock()
 
         from orchestrator.event_store import EventStore
 
@@ -4601,7 +4478,7 @@ class TestRunInflightVerifyNeverOrphansVerifyTask:
     def _make_worker_and_item(self, tmp_path, *, verifier=None):
         from orchestrator.merge_lane.worker import RealMergeItem, SpeculativeMergeWorker
 
-        git_ops = _make_git_ops_mock()
+        git_ops = verify_git_ops_mock()
         q: asyncio.Queue = asyncio.Queue()
         worker = SpeculativeMergeWorker(
             git_ops=git_ops, queue=q,
@@ -4611,8 +4488,8 @@ class TestRunInflightVerifyNeverOrphansVerifyTask:
 
         merge_result = MagicMock()
         merge_result.merge_commit = 'abc123def456789abc1'
-        config = _make_config()
-        req = _make_merge_request(config, task_files=[], worktree=tmp_path)
+        config = probe_free_orch_config()
+        req = verify_merge_request(config, task_files=[], worktree=tmp_path)
         item = RealMergeItem(
             request=req,
             merge_result=merge_result,
@@ -4635,13 +4512,13 @@ class TestRunInflightVerifyNeverOrphansVerifyTask:
         """
         from orchestrator.verify_runner import HostLease
 
-        runner = _runner_double(name, is_local=False)
+        runner = runner_double(name, is_local=False)
         entered: list = []
 
         async def _dispatch(*args, **kwargs):
             entered.append(asyncio.current_task())
             if on_verify is None:
-                return _make_pass_result()
+                return passing_verify_result()
             return await on_verify(*args, **kwargs)
 
         runner.run_merge_verify = AsyncMock(side_effect=_dispatch)
@@ -4824,7 +4701,7 @@ class TestRunInflightVerifyNeverOrphansVerifyTask:
         worker, item = self._make_worker_and_item(
             tmp_path, verifier=_BodyVerifier(_fail_on_cancel),
         )
-        local_runner = _runner_double('local', is_local=True)
+        local_runner = runner_double('local', is_local=True)
         lease = HostLease(name='local', runner=local_runner, is_local=True)
 
         await self._cancel_midflight(worker, item, lease, dispatched)
