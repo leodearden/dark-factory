@@ -48,11 +48,11 @@ import os
 import time
 import uuid as uuid_mod
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Required, TypeAlias, TypedDict
+from typing import TYPE_CHECKING, Any, Required, TypeAlias, TypedDict, TypeVar
 
 from shared.cli_invoke import (
     AgentResult,
@@ -1766,17 +1766,11 @@ class TaskCurator:
                 if decision.batch_target_index is None:
                     self._store_cache(hashes[i], decision)
                 decided[i] = decision
-                logger.info(
-                    'task_curator: decision=%s target=%s pool_sizes=%s latency_ms=%d '
-                    'cost_usd=%.4f',
-                    decision.action,
-                    decision.target_id,
-                    decision.pool_sizes,
-                    decision.latency_ms,
-                    decision.cost_usd,
-                )
 
-        return [decided[i] for i in range(len(bundles))]
+        stamped = [_with_stream_census(decided[i], bundle) for i, bundle in enumerate(bundles)]
+        for i in llm_bound:
+            logger.info('task_curator: decision %s', stamped[i].to_log_fields())
+        return stamped
 
     async def _dispatch_deferring_raises(
         self,
@@ -2350,7 +2344,8 @@ class TaskCurator:
         at EVERY cap rather than only at the final :func:`_trim_pool` — a
         stream cap discards entries the trim never sees, so the stream caps are
         where much of what the pool loses is lost (see the pool-cap block in
-        ``config/schema.py::CuratorConfig``).
+        ``config/schema.py::CuratorConfig``). A stream whose read fails is
+        logged at WARNING and named in ``withheld.unavailable_streams``.
         """
         # Resolve lock_depth PER PROJECT, not from a single global scalar:
         # fused-memory serves many projects and each orchestrator resolves its
@@ -2374,29 +2369,37 @@ class TaskCurator:
         )
         pool: list[PoolEntry] = []
         seen_ids: set[str] = set()
+        reads = _StreamReads()
+        has_store = self._taskmaster is not None
 
-        # Stream 1: review-chain anchor
+        def admit(entries: Iterable[PoolEntry]) -> None:
+            for entry in entries:
+                pool.append(entry)
+                seen_ids.add(entry.task_id)
+
+        # Stream 1: review-chain anchor. The store holds integer ids only, so
+        # any other spawned_from names no task.
         anchor_row: dict | None = None
-        if candidate.spawned_from:
-            try:
-                anchor_row = await self._anchor_row(candidate.spawned_from, project_root)
-            except Exception as exc:
-                logger.debug('task_curator: anchor fetch failed: %s', exc)
+        if has_store and candidate.spawned_from and candidate.spawned_from.isdecimal():
+            anchor_row = await reads.read(
+                'anchor', self._anchor_row(candidate.spawned_from, project_root), None,
+            )
         anchor_entry = _to_pool_entry(anchor_row, source='anchor', lock_depth=lock_depth)
         if anchor_entry is not None:
-            pool.append(anchor_entry)
-            seen_ids.add(anchor_entry.task_id)
+            admit([anchor_entry])
 
         # Stream 2: the parent's other follow-ups, for an agent-followup candidate
         sibling_overflow_ids: list[str] = []
         parent_id = _followup_parent_id(candidate)
-        if parent_id is not None:
-            sibling_entries, sibling_overflow_ids = await self._sibling_stream(
-                parent_id, project_root, lock_depth=lock_depth, exclude=seen_ids,
+        if has_store and parent_id is not None and self._config.curator.pool_sibling_cap >= 1:
+            sibling_entries, sibling_overflow_ids = await reads.read(
+                'sibling',
+                self._sibling_stream(
+                    parent_id, project_root, lock_depth=lock_depth, exclude=seen_ids,
+                ),
+                ([], []),
             )
-            for entry in sibling_entries:
-                pool.append(entry)
-                seen_ids.add(entry.task_id)
+            admit(sibling_entries)
 
         # Stream 3: module-lock pool
         candidate_modules = set(
@@ -2404,99 +2407,39 @@ class TaskCurator:
         )
         if not candidate_modules and anchor_entry is not None:
             candidate_modules = set(anchor_entry.module_keys)
-
         module_overflow_ids: list[str] = []
-        if candidate_modules:
-            try:
-                module_entries, module_overflow_ids = await self._module_stream(
+        if has_store and candidate_modules:
+            module_entries, module_overflow_ids = await reads.read(
+                'module',
+                self._module_stream(
                     candidate_modules, project_root, lock_depth=lock_depth, exclude=seen_ids,
-                )
-            except Exception as exc:
-                logger.debug('task_curator: get_tasks failed: %s', exc)
-                module_entries = []
-            for entry in module_entries:
-                pool.append(entry)
-                seen_ids.add(entry.task_id)
+                ),
+                ([], []),
+            )
+            admit(module_entries)
 
         # Stream 4: embedding neighbors
-        embedding_matches: list[PoolEntry] = []
-        embedding_unvisited_ids: list[str] = []
-        embedding_window_full = False
-        try:
-            collection = await self._ensure_collection(project_id)
-            embedder = await self._get_embedder()
-            text = embedding_text(
-                candidate.title, candidate.description, candidate.files_to_modify,
-            )
-            embedding = await embedder.create(text)
-            client = await self._get_qdrant()
-            # Over-fetch so filtering out stream 1-3 overlaps still leaves K.
-            overfetch = self._config.curator.pool_embedding_cap + 20
-            results = await client.query_points(
-                collection_name=collection,
-                query=embedding,
-                limit=overfetch,
-                with_payload=True,
-            )
-            points = list(results.points)
-            for i, point in enumerate(points):
-                payload = point.payload or {}
-                tid = str(payload.get('task_id', ''))
-                if not tid or tid in seen_ids:
-                    continue
-                # We need full task data — try to fetch it, fall back to the
-                # qdrant payload if taskmaster is unavailable.
-                entry = await self._fetch_entry_for_neighbor(
-                    tid, payload, source='embedding',
-                    lock_depth=lock_depth, project_root=project_root,
-                )
-                if entry is None:
-                    continue
-                embedding_matches.append(entry)
-                if len(embedding_matches) >= self._config.curator.pool_embedding_cap:
-                    # The neighbours the cap left unvisited, by id — the count
-                    # is taken below against what the pool finally holds, so a
-                    # neighbour another stream already pooled is not reported
-                    # as lost. It stays an upper bound in one narrower
-                    # respect: an unvisited point might have been unresolvable
-                    # via _fetch_entry_for_neighbor and so never eligible.
-                    # These are ordered by embedding distance, so the closest
-                    # of them are the most likely duplicates in the corpus.
-                    embedding_unvisited_ids = [
-                        str((p.payload or {}).get('task_id', ''))
-                        for p in points[i + 1:]
-                    ]
-                    # And a hard ceiling in the other direction, unlike the
-                    # module/dependency streams, which are exhaustive over the
-                    # open backlog: this tail
-                    # can hold at most `overfetch - cap` ids because that is
-                    # all qdrant was asked for. A full window means neighbours
-                    # past it were never fetched, so the count is a FLOOR and
-                    # is reported as one rather than as a count of everything
-                    # excluded.
-                    embedding_window_full = len(points) >= overfetch
-                    break
-        except Exception as exc:
-            logger.debug('task_curator: embedding neighbors failed: %s', exc)
-
-        for entry in embedding_matches:
-            pool.append(entry)
-            seen_ids.add(entry.task_id)
+        embedding_entries, embedding_unvisited_ids, embedding_window_full = await reads.read(
+            'embedding',
+            self._embedding_stream(
+                candidate, project_id, project_root, lock_depth=lock_depth, exclude=seen_ids,
+            ),
+            ([], [], False),
+        )
+        admit(embedding_entries)
 
         # Stream 5: dependency neighbors of the anchor
         dep_overflow_ids: list[str] = []
         if anchor_row is not None and anchor_entry is not None:
-            try:
-                dep_entries, dep_overflow_ids = await self._dependency_stream(
+            dep_entries, dep_overflow_ids = await reads.read(
+                'dependency',
+                self._dependency_stream(
                     anchor_row, anchor_entry.task_id, project_root,
                     lock_depth=lock_depth, exclude=seen_ids,
-                )
-            except Exception as exc:
-                logger.debug('task_curator: dependency neighbours failed: %s', exc)
-                dep_entries = []
-            for entry in dep_entries:
-                pool.append(entry)
-                seen_ids.add(entry.task_id)
+                ),
+                ([], []),
+            )
+            admit(dep_entries)
 
         # Every stream has run, so seen_ids is now the complete admitted set
         # and a stream's overflow can be resolved into what the pool actually
@@ -2533,6 +2476,7 @@ class TaskCurator:
                 'total_cap': self._config.curator.pool_total_cap,
             },
             lower_bounds=('embedding',) if embedding_window_full else (),
+            unavailable_streams=tuple(reads.unavailable),
         )
         return pool, pool_sizes, withheld
 
@@ -2586,6 +2530,71 @@ class TaskCurator:
         # actually loses is not known yet: later streams can still admit one,
         # so the caller counts the absent ones once every stream has run.
         return matches[:cap], [e.task_id for e in matches[cap:]]
+
+    async def _embedding_stream(
+        self,
+        candidate: CandidateTask,
+        project_id: str,
+        project_root: str,
+        *,
+        lock_depth: int,
+        exclude: set[str],
+    ) -> tuple[list[PoolEntry], list[str], bool]:
+        """The candidate's nearest corpus neighbours by embedding, capped.
+
+        Returns ``(entries, unvisited_ids, window_full)``: the admitted
+        entries, the neighbour ids the cap left unvisited, and whether the
+        retrieval window was full, which makes that count a floor.
+        """
+        collection = await self._ensure_collection(project_id)
+        embedder = await self._get_embedder()
+        text = embedding_text(candidate.title, candidate.description, candidate.files_to_modify)
+        embedding = await embedder.create(text)
+        client = await self._get_qdrant()
+        cap = self._config.curator.pool_embedding_cap
+        # Over-fetch so filtering out stream 1-3 overlaps still leaves K.
+        overfetch = cap + 20
+        results = await client.query_points(
+            collection_name=collection,
+            query=embedding,
+            limit=overfetch,
+            with_payload=True,
+        )
+        points = list(results.points)
+        entries: list[PoolEntry] = []
+        for i, point in enumerate(points):
+            payload = point.payload or {}
+            tid = str(payload.get('task_id', ''))
+            if not tid or tid in exclude:
+                continue
+            # We need full task data — try to fetch it, fall back to the
+            # qdrant payload if taskmaster is unavailable.
+            entry = await self._fetch_entry_for_neighbor(
+                tid, payload, source='embedding',
+                lock_depth=lock_depth, project_root=project_root,
+            )
+            if entry is None:
+                continue
+            entries.append(entry)
+            if len(entries) >= cap:
+                # The neighbours the cap left unvisited, by id — the caller
+                # counts them against what the pool finally holds, so a
+                # neighbour another stream already pooled is not reported as
+                # lost. It stays an upper bound in one narrower respect: an
+                # unvisited point might have been unresolvable via
+                # _fetch_entry_for_neighbor and so never eligible. These are
+                # ordered by embedding distance, so the closest of them are
+                # the most likely duplicates in the corpus.
+                unvisited_ids = [str((p.payload or {}).get('task_id', '')) for p in points[i + 1:]]
+                # And a hard ceiling in the other direction, unlike the
+                # module/dependency streams, which are exhaustive over the
+                # open backlog: this tail can hold at most `overfetch - cap`
+                # ids because that is all qdrant was asked for. A full window
+                # means neighbours past it were never fetched, so the count is
+                # a FLOOR and is reported as one rather than as a count of
+                # everything excluded.
+                return entries, unvisited_ids, len(points) >= overfetch
+        return entries, [], False
 
     async def _dependency_stream(
         self,
@@ -2645,7 +2654,7 @@ class TaskCurator:
         """
         taskmaster = self._taskmaster
         cap = self._config.curator.pool_sibling_cap
-        if taskmaster is None or cap < 1:
+        if taskmaster is None:
             return [], []
         rows = await self._sibling_lookup_rows(taskmaster, parent_id, project_root)
         ranked = sorted(
@@ -2675,9 +2684,13 @@ class TaskCurator:
 
         Each form is looked up on its own, so one failure keeps the rows the
         other forms returned. A decimal id past SQLite's INTEGER range is one
-        such failure: its int form is refused before the store is read.
+        such failure: its int form is refused before the store is read. When
+        EVERY form fails, the last failure is raised: nothing the store
+        vouched for came back.
         """
         rows: dict[int, MetadataLookupRow] = {}
+        failure: Exception | None = None
+        answered = False
         for value in _sibling_lookup_values(parent_id):
             try:
                 page = await taskmaster.find_tasks_by_metadata(
@@ -2689,8 +2702,12 @@ class TaskCurator:
                     'task_curator: sibling lookup failed for parent %s as %r: %s',
                     parent_id, value, exc,
                 )
+                failure = exc
                 continue
+            answered = True
             rows.update((row['task_id'], row) for row in page['results'])
+        if not answered and failure is not None:
+            raise failure
         return list(rows.values())
 
     async def _fetch_entry_for_neighbor(
@@ -3232,6 +3249,36 @@ def _to_input_space(decision: CuratorDecision, llm_bound: list[int]) -> CuratorD
         local, len(llm_bound),
     )
     return replace(decision, batch_target_index=None)
+
+
+_T = TypeVar('_T')
+
+
+@dataclass
+class _StreamReads:
+    """The corpus streams one ``_build_corpus`` call attempted, and those whose read failed."""
+
+    attempted: list[str] = field(default_factory=list)
+    unavailable: list[str] = field(default_factory=list)
+
+    async def read(self, stream: str, read: Awaitable[_T], fallback: _T) -> _T:
+        """Await *stream*'s *read*; a failure is logged, recorded, and answered with *fallback*."""
+        self.attempted.append(stream)
+        try:
+            return await read
+        except Exception as exc:
+            logger.warning(
+                'task_curator: corpus stream %s unavailable: %s', stream, exception_summary(exc),
+            )
+            self.unavailable.append(stream)
+            return fallback
+
+
+def _with_stream_census(decision: CuratorDecision, bundle: PreparedCandidate) -> CuratorDecision:
+    """*decision*, naming the corpus streams that failed for its *bundle*."""
+    if bundle.withheld is None or not bundle.withheld.unavailable_streams:
+        return decision
+    return replace(decision, unavailable_streams=bundle.withheld.unavailable_streams)
 
 
 def _count_absent(task_ids: Iterable[str], admitted: set[str]) -> int:

@@ -3602,6 +3602,7 @@ class TestBuildCorpusWithheldCensus(_CorpusHarness):
 
         _pool, _sizes, withheld = await self._corpus(
             curator, CandidateTask(title='T', files_to_modify=[self.MODULE_FILE]),
+            neighbor_ids=[],
         )
 
         assert withheld.total == 0
