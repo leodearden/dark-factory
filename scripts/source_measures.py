@@ -903,19 +903,40 @@ class FileKind(enum.StrEnum):
     TESTS = 'tests'
 
 
+def _dotted_below(root: str, path: str) -> str:
+    """The dotted name of ``.py`` *path* below *root*; a package's ``__init__.py``
+    is named by its package."""
+    dotted = path[len(root) + 1:].removesuffix('.py').replace('/', '.')
+    return dotted.removesuffix('.__init__')
+
+
 @dataclasses.dataclass(frozen=True)
 class MemberRoots:
     """Where one member's source and test files live, repo-relative.
 
     One rule for real and pseudo members alike: a path under ``tests_root`` is a
     test file, else a path under ``src_root`` is a source file named by its
-    dotted path below that root, else it is not the member's.
+    dotted path below that root, and also by its dotted path below each extra
+    import root that contains it, else it is not the member's.
     """
 
     name: str
     pseudo: bool
     src_root: str | None
     tests_root: str
+    extra_import_roots: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        outside = [
+            root
+            for root in self.extra_import_roots
+            if self.src_root is None or not root.startswith(self.src_root + '/')
+        ]
+        if outside:
+            raise ValueError(
+                f'member {self.name!r}: extra import root(s) {outside!r} must lie '
+                f'strictly below its src_root {self.src_root!r}'
+            )
 
     @classmethod
     def declared(cls, name: str) -> MemberRoots:
@@ -933,19 +954,28 @@ class MemberRoots:
             return FileKind.SRC
         return None
 
+    def _is_source_module(self, path: str) -> bool:
+        return path.endswith('.py') and self.kind_of(path) is FileKind.SRC
+
     def import_name(self, path: str) -> str | None:
         """The dotted import name of source file *path*; None for anything else.
 
         A package's ``__init__.py`` is named by its package.
         """
-        if (
-            self.src_root is None
-            or not path.endswith('.py')
-            or self.kind_of(path) is not FileKind.SRC
-        ):
+        if self.src_root is None or not self._is_source_module(path):
             return None
-        dotted = path[len(self.src_root) + 1:].removesuffix('.py').replace('/', '.')
-        return dotted.removesuffix('.__init__')
+        return _dotted_below(self.src_root, path)
+
+    def extra_import_names(self, path: str) -> tuple[str, ...]:
+        """The dotted names of source file *path* below each extra import root
+        holding it, in ``extra_import_roots`` order; () for anything else."""
+        if not self._is_source_module(path):
+            return ()
+        return tuple(
+            _dotted_below(root, path)
+            for root in self.extra_import_roots
+            if path.startswith(root + '/') and path != f'{root}/__init__.py'
+        )
 
 
 def src_module_name(path: str) -> str | None:
@@ -960,6 +990,14 @@ class DomainFile:
     blob: str
     kind: FileKind
     import_name: str | None
+    extra_import_names: tuple[str, ...]
+
+    @property
+    def import_names(self) -> tuple[str, ...]:
+        """Every name the file imports as: ``import_name``, then the extra names."""
+        if self.import_name is None:
+            return self.extra_import_names
+        return (self.import_name, *self.extra_import_names)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -970,7 +1008,14 @@ class DomainMember:
 
 
 _SCRIPTS_PSEUDO_MEMBER = MemberRoots(
-    name='scripts', pseudo=True, src_root='scripts', tests_root='scripts/tests'
+    name='scripts',
+    pseudo=True,
+    src_root='scripts',
+    tests_root='scripts/tests',
+    # scripts/tests/conftest.py puts these on sys.path, mirrored by the root
+    # pyproject.toml [tool.pyright].extraPaths and pinned equal to them by
+    # tests/scripts/test_source_measures.py::TestExtraImportNames.
+    extra_import_roots=('scripts/legibility', 'scripts/local-model-serving'),
 )
 _TESTS_PSEUDO_MEMBER = MemberRoots(name='tests', pseudo=True, src_root=None, tests_root='tests')
 
@@ -1126,7 +1171,13 @@ def _domain_member(
     member: MemberRoots, entries: tuple[tuple[str, str], ...]
 ) -> DomainMember:
     files = tuple(
-        DomainFile(path=path, blob=blob, kind=kind, import_name=member.import_name(path))
+        DomainFile(
+            path=path,
+            blob=blob,
+            kind=kind,
+            import_name=member.import_name(path),
+            extra_import_names=member.extra_import_names(path),
+        )
         for path, blob in sorted(entries)
         if (kind := member.kind_of(path)) is not None
     )
