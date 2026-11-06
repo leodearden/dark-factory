@@ -45,7 +45,9 @@ def test_each_project_queue_reaches_its_own_roots_port(tmp_path: Path) -> None:
             url='http://127.0.0.1:18102/mcp', project_root=beta.resolve(),
         ),
     }
-    assert mapped[_project_queue(alpha)].base_url == 'http://127.0.0.1:18101'
+    alpha_port = mapped[_project_queue(alpha)]
+    assert isinstance(alpha_port, ports.QueuePort)
+    assert alpha_port.base_url == 'http://127.0.0.1:18101'
 
 
 def test_a_root_naming_no_port_is_port_unknown(tmp_path: Path) -> None:
@@ -68,7 +70,7 @@ def test_the_recon_queue_reaches_the_recon_server_never_the_projects_port(tmp_pa
         queue_dir=_recon_queue(df), kind='reconciliation',
         url=ports.RECON_ESCALATION_URL, project_root=None,
     )
-    assert '18101' not in found.url
+    assert isinstance(found, ports.QueuePort) and '18101' not in found.url
 
 
 def test_a_queue_of_no_known_shape_is_port_unknown(tmp_path: Path) -> None:
