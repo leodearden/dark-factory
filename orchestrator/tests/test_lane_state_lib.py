@@ -1724,6 +1724,13 @@ class TestProtectGlobFallbackIsAVerbatimRender:
 
         return git_ops.render_protect_glob(owned=git_ops.PROTECT_GLOB_OWNED_POOL_BANDS)
 
+    @staticmethod
+    def _swap_registry(monkeypatch, registry: dict[str, str]) -> None:
+        """Replace the registry whole: ``delitem``'s undo re-inserts at the END."""
+        from orchestrator import git_ops
+
+        monkeypatch.setattr(git_ops, 'PROTECTED_PREFIXES', registry)
+
     def test_the_fallback_is_a_verbatim_render_of_the_registry(self, fallback) -> None:
         rendered = self._render()
         assert _fallback_drift_report(rendered, fallback) is None, (
@@ -1759,8 +1766,27 @@ class TestProtectGlobFallbackIsAVerbatimRender:
     ) -> None:
         from orchestrator import git_ops
 
-        monkeypatch.delitem(git_ops.PROTECTED_PREFIXES, '_solo-')
+        self._swap_registry(monkeypatch, {
+            key: owner
+            for key, owner in git_ops.PROTECTED_PREFIXES.items()
+            if key != '_solo-'
+        })
         rendered = self._render()
         assert _uncovered_bands(rendered, fallback) == []
         assert _fallback_band_diff(rendered, fallback) == ([], ['_solo-*'])
         assert _fallback_drift_report(rendered, fallback) is not None
+
+    def test_the_equality_gate_catches_an_order_only_difference(
+        self, fallback, monkeypatch,
+    ) -> None:
+        from orchestrator import git_ops
+
+        registry = dict(git_ops.PROTECTED_PREFIXES)
+        moved = registry.pop('_merge-')
+        self._swap_registry(monkeypatch, {**registry, '_merge-': moved})
+        rendered = self._render()
+        assert _fallback_band_diff(rendered, fallback) == ([], [])
+        report = _fallback_drift_report(rendered, fallback)
+        assert report is not None
+        assert 'same bands, different order' in report, report
+        assert f"LANE_PROTECT_GLOB_FALLBACK='{rendered}'" in report, report
