@@ -60,6 +60,20 @@ def test_a_second_fire_folds_into_the_open_alarm(tmp_path: Path):
     assert [esc.id for esc in _pending_alarms(tmp_path)] == [first]
 
 
+def test_the_summary_names_the_reason_when_the_record_carries_one(tmp_path: Path):
+    file_storm_once(EscalationQueue(tmp_path), ALARM, {**RECORD, 'reason': 'timed_out'})
+
+    [alarm] = _pending_alarms(tmp_path)
+    assert 'resolver_unavailable (timed_out)' in alarm.summary
+
+
+def test_a_reasonless_record_keeps_its_summary(tmp_path: Path):
+    file_storm_once(EscalationQueue(tmp_path), ALARM, RECORD)
+
+    [alarm] = _pending_alarms(tmp_path)
+    assert 'resolver_unavailable MCP call(s)' in alarm.summary
+
+
 def test_a_failed_read_files_the_alarm_rather_than_dropping_it(
     tmp_path: Path, caplog: pytest.LogCaptureFixture,
 ):

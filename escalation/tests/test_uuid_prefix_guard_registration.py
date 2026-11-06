@@ -440,6 +440,7 @@ class TestStormBurstAlarm:
         assert [storm is not None for storm in storms] == [False, False, True]
         assert storms[-1]['count'] == STORM_THRESHOLD
         assert storms[-1]['outcome'] == 'resolver_unavailable'
+        assert storms[-1]['reason'] == 'unreachable'
 
         alarms = self._alarms(queue)
         assert len(alarms) == 1, f'expected one burst alarm, found {len(alarms)}'
@@ -451,6 +452,18 @@ class TestStormBurstAlarm:
         assert alarm.severity not in BORN_AT_L2_SEVERITIES
         assert str(STORM_THRESHOLD) in alarm.summary
         assert 'resolver_unavailable' in alarm.summary
+
+    @pytest.mark.asyncio
+    async def test_a_timed_out_burst_files_one_alarm_naming_the_timeout(self, tmp_path: Path):
+        queue, server = build(tmp_path, http_resolver(answers_after=30, timeout_seconds=0.05))
+
+        results = await self._burst(server)
+
+        storms = [meta_of(result)['uuid_prefix_repair'].get('storm') for result in results]
+        assert storms[-1]['reason'] == 'timed_out'
+        alarms = self._alarms(queue)
+        assert len(alarms) == 1, f'expected one burst alarm, found {len(alarms)}'
+        assert 'timed_out' in alarms[0].summary
 
     @pytest.mark.asyncio
     async def test_a_second_burst_folds_into_the_open_alarm(self, tmp_path: Path):
