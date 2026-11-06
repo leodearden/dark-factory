@@ -1828,3 +1828,84 @@ class TestSubmitChildInterpreterGuarantee:
             'a bare/relative interpreter would resolve against the systemd '
             f'user manager PATH, not this process: {interpreter!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# task 8598: RestartPlan.env reaches the restart script on every execute()
+# path. systemd-run propagates none of the caller's environment, so the
+# detached path must carry each entry on the argv as `--setenv=K=V`.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestDetachedSystemdRunCarriesEnv:
+    """Each ``RestartPlan.env`` entry becomes one ``--setenv=K=V`` option on
+    the detached systemd-run argv, ahead of the submit child's PYTHONPATH."""
+
+    async def test_each_env_entry_becomes_a_setenv_option(
+        self, tmp_queue_dir: Path,
+    ) -> None:
+        import dataclasses
+
+        runner = FakeRunner(returncode=0)
+        plan = dataclasses.replace(
+            detached_rp4_plan(tmp_queue_dir, with_spec=True),
+            env={'DEPLOY_FLAG': 'canary', 'MODE': 'two words'},
+        )
+
+        await plan.execute(runner=runner)
+
+        argv, _kwargs = runner.calls[0]
+        flag_at = argv.index('--setenv=DEPLOY_FLAG=canary')
+        mode_at = argv.index('--setenv=MODE=two words')
+        assert argv.count('--setenv=DEPLOY_FLAG=canary') == 1
+        assert argv.count('--setenv=MODE=two words') == 1
+        assert argv.index('--working-directory=/proj') < flag_at < mode_at
+        sh_at = argv.index('/bin/sh')
+        assert mode_at < sh_at
+        submit_child_tokens = _setenv_pythonpath_tokens(argv)
+        if submit_child_tokens:
+            assert mode_at < argv.index(submit_child_tokens[0]), (
+                'the plan env must precede the submit child PYTHONPATH token'
+            )
+
+        wrapped = argv[sh_at + 2]
+        expected_payload = ' '.join(
+            shlex.quote(p) for p in ['/proj/scripts/restart-orchestrator.sh', '--foo']
+        )
+        assert wrapped.startswith(expected_payload)
+        assert 'DEPLOY_FLAG' not in wrapped
+
+    async def test_env_setenv_emitted_without_escalation_spec(
+        self, tmp_queue_dir: Path,
+    ) -> None:
+        import dataclasses
+
+        runner = FakeRunner(returncode=0)
+        plan = dataclasses.replace(
+            detached_rp4_plan(tmp_queue_dir, with_spec=False),
+            env={'DEPLOY_FLAG': 'canary'},
+        )
+
+        await plan.execute(runner=runner)
+
+        argv, _kwargs = runner.calls[0]
+        setenv_tokens = [t for t in argv if t.startswith('--setenv=')]
+        assert setenv_tokens == ['--setenv=DEPLOY_FLAG=canary'], (
+            'env belongs to the payload, so it is not gated on the RP-4 '
+            f'submit child: {setenv_tokens!r}'
+        )
+
+    async def test_empty_env_argv_unchanged(self, tmp_queue_dir: Path) -> None:
+        import dataclasses
+
+        default_plan = detached_rp4_plan(tmp_queue_dir, with_spec=True)
+        explicit_plan = dataclasses.replace(default_plan, env={})
+        default_runner = FakeRunner(returncode=0)
+        explicit_runner = FakeRunner(returncode=0)
+
+        await default_plan.execute(runner=default_runner)
+        await explicit_plan.execute(runner=explicit_runner)
+
+        assert default_plan.env == {}
+        assert default_runner.calls[0][0] == explicit_runner.calls[0][0]
