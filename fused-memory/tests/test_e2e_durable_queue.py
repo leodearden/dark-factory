@@ -46,6 +46,7 @@ def _mock_backends(svc: MemoryService) -> MemoryService:
     svc.mem0.add = AsyncMock(return_value={'results': [{'id': 'mem0-1'}]})
     svc.mem0.get_all = AsyncMock(return_value={'results': []})
     svc.mem0.delete = AsyncMock(return_value={'message': 'deleted'})
+    svc.mem0.close = AsyncMock()
     return svc
 
 
@@ -202,7 +203,7 @@ class TestIntegrationFlow:
             message='timed out waiting for the episode and mem0 fact items to complete',
         )
         svc.graphiti.add_episode.assert_called_once()
-        assert stats['counts'].get('completed', 0) == 2
+        assert stats['counts'] == {'completed': 2}
         svc.mem0.add.assert_awaited_once()
         assert svc.mem0.add.await_args.kwargs['content'] == fact
 
@@ -875,6 +876,11 @@ class TestTerminalOutcomeWrittenBack:
         row = await journal.get_write_op(write_op_id)
         assert row['terminal_status'] == 'completed'
         assert row['terminal_error'] is None
+        backend_ops = await journal.get_backend_ops_for_write_op(write_op_id)
+        assert [(op['backend'], op['success']) for op in backend_ops] == [
+            ('graphiti', 1)
+        ], 'expected exactly one successful graphiti backend_ops row for this write'
+        assert journal.journal_drop_stats()['dropped_total'] == 0
 
     @pytest.mark.asyncio
     async def test_terminal_state_survives_dead_letter_deletion(
