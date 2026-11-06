@@ -87,6 +87,28 @@ def test_resolver_unavailable_is_an_exception_carrying_the_failed_store() -> Non
     assert 'mem0' in str(error)
 
 
+def test_unavailable_reasons_are_exactly_the_three_declared_ones() -> None:
+    assert {r.value for r in guard.UnavailableReason} == {'unreachable', 'timed_out', 'bad_response'}
+
+
+def test_an_outage_with_no_stated_reason_is_unreachable() -> None:
+    """The default keeps the type's existing meaning, so every current raiser stays correct."""
+    assert guard.ResolverUnavailable('mem0').reason is guard.UnavailableReason.UNREACHABLE
+
+
+def test_an_outage_carries_why_beside_which_store() -> None:
+    error = guard.ResolverUnavailable('fused-memory', reason=guard.UnavailableReason.TIMED_OUT)
+    assert error.store == 'fused-memory'
+    assert error.reason is guard.UnavailableReason.TIMED_OUT
+    assert 'fused-memory' in str(error)
+    assert 'timed_out' in str(error)
+
+
+def test_a_timed_out_outage_does_not_claim_the_store_was_unreachable() -> None:
+    error = guard.ResolverUnavailable('fused-memory', reason=guard.UnavailableReason.TIMED_OUT)
+    assert 'could not be reached' not in str(error)
+
+
 # --- the fact and tool-class vocabularies -------------------------------
 
 
