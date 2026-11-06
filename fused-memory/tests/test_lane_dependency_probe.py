@@ -54,10 +54,14 @@ def lease_files(directory: Path) -> list[str]:
     return sorted(p.name for p in directory.glob('*.lease')) if directory.is_dir() else []
 
 
-def run_probe(
+def leases_of(pid: int, names: list[str]) -> list[str]:
+    return [name for name in names if name.startswith(f'{PROBE_LEASE_PREFIX}{pid}.')]
+
+
+def start_probe(
     *dependencies: str, lease_dir: Path, env: dict[str, str] | None = None
-) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
+) -> subprocess.Popen[str]:
+    return subprocess.Popen(
         [sys.executable, str(SCRIPT), *dependencies],
         cwd=FM_ROOT,
         env={
@@ -66,10 +70,26 @@ def run_probe(
             LEASE_REAPER.LEASE_DIR_ENV: str(lease_dir),
             **(env or {}),
         },
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        timeout=SUBPROCESS_TIMEOUT_SECS,
     )
+
+
+def finish_probe(probe: subprocess.Popen[str]) -> subprocess.CompletedProcess[str]:
+    with probe:
+        try:
+            stdout, stderr = probe.communicate(timeout=SUBPROCESS_TIMEOUT_SECS)
+        except subprocess.TimeoutExpired:
+            probe.kill()
+            raise
+    return subprocess.CompletedProcess(probe.args, probe.returncode, stdout, stderr)
+
+
+def run_probe(
+    *dependencies: str, lease_dir: Path, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
+    return finish_probe(start_probe(*dependencies, lease_dir=lease_dir, env=env))
 
 
 def assert_names_dependency(result: subprocess.CompletedProcess[str], line: str) -> None:
