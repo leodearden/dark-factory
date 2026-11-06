@@ -1916,6 +1916,16 @@ class TaskCurator:
             pool, pool_sizes, withheld = await self._build_corpus(
                 candidate, project_id, project_root,
             )
+        except _CorpusUnavailableError as exc:
+            logger.warning(
+                'task_curator: no corpus stream answered for candidate %r, '
+                'so its curation will defer: %s',
+                candidate.title,
+                exc,
+            )
+            return PreparedCandidate.corpus_failed(
+                candidate, str(exc), unavailable_streams=exc.streams,
+            )
         except Exception as exc:
             logger.warning(
                 'task_curator: corpus assembly failed for candidate %r, '
@@ -2345,7 +2355,9 @@ class TaskCurator:
         stream cap discards entries the trim never sees, so the stream caps are
         where much of what the pool loses is lost (see the pool-cap block in
         ``config/schema.py::CuratorConfig``). A stream whose read fails is
-        logged at WARNING and named in ``withheld.unavailable_streams``.
+        logged at WARNING and named in ``withheld.unavailable_streams``; when
+        every stream it attempted failed, it raises ``_CorpusUnavailableError``
+        instead, since an empty pool would then only look like no overlap.
         """
         # Resolve lock_depth PER PROJECT, not from a single global scalar:
         # fused-memory serves many projects and each orchestrator resolves its
@@ -2440,6 +2452,9 @@ class TaskCurator:
                 ([], []),
             )
             admit(dep_entries)
+
+        if reads.every_attempt_failed():
+            raise _CorpusUnavailableError(tuple(reads.unavailable))
 
         # Every stream has run, so seen_ids is now the complete admitted set
         # and a stream's overflow can be resolved into what the pool actually
@@ -3272,6 +3287,18 @@ class _StreamReads:
             )
             self.unavailable.append(stream)
             return fallback
+
+    def every_attempt_failed(self) -> bool:
+        """Whether some stream was attempted and every attempted stream failed."""
+        return bool(self.attempted) and len(self.unavailable) == len(self.attempted)
+
+
+class _CorpusUnavailableError(RuntimeError):
+    """Every corpus stream ``_build_corpus`` attempted failed, so no pool can be trusted."""
+
+    def __init__(self, streams: tuple[str, ...]) -> None:
+        super().__init__(f'every corpus stream failed: {", ".join(streams)}')
+        self.streams = streams
 
 
 def _with_stream_census(decision: CuratorDecision, bundle: PreparedCandidate) -> CuratorDecision:
