@@ -894,6 +894,7 @@ class DeterministicRunner:
             verify=None,
             transient_unit=transient_unit,
             on_active_secs=on_active_secs,
+            env=dict(before_done.get('env') or {}),
         )
         outcome = await plan.execute()
         if outcome.disposition == RestartDisposition.REGISTRATION_FAILED:
