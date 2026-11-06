@@ -891,7 +891,7 @@ dependency gate as every other task (§3).
 {
   script: "<repo-relative path>",  # must exist & be executable
   args: [],                         # list[str], default []
-  env: {},                          # dict[str,str], default {}
+  env: {},                          # dict[str,str], default {}; reaches the script on every path, see below
   cwd: "<project_root>",            # default: project_root
   timeout_secs: 120,                # int, required; runner kills + escalates on timeout
   target_unit: None,                # str|None; None → cross-unit (no self-kill)
@@ -905,6 +905,18 @@ against the orchestrator's **configured** `project_root` — the `project_root` 
 validates the script under — never against the orchestrator process's
 working directory. See
 `shared/src/shared/before_done_paths.py::resolve_before_done_paths`.
+
+`env` reaches the script on every path. A predicate, no-target or
+cross-unit deploy runs the script with `env` overlaid on the
+orchestrator's own environment. A self-target deploy (`target_unit` is the
+orchestrator's own unit) passes each entry as `systemd-run --setenv`. That
+script starts from the systemd user manager's environment, not the
+orchestrator's, because `systemd-run` passes on none of its caller's
+environment. Keys must be environment variable names: no `=` and no NUL.
+A self-target deploy refuses `PYTHONPATH` in `env` with a born-at-L2
+`infra_issue`, because the RP-4 on-failure submit child owns that variable
+in the same transient unit. The mechanism is
+`orchestrator/src/orchestrator/proc_supervision.py::RestartPlan`.
 
 **`metadata.always_escalates`** (`bool`, default `false`) — file a
 born-at-L2 escalation after the action completes (or immediately if no
