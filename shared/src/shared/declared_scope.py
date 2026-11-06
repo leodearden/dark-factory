@@ -1,15 +1,16 @@
 """``metadata.declared_scope``: the size a task declared when it was filed.
 
 Contract: plans/follow-up-filing-shape-prd.md §4.2 and §3 decisions 6-8. ``submit_task`` stamps the
-record once, ``basis='submit'``; a curator combine re-stamps it, ``basis='combine'``; nothing else
-may add, alter or remove it. An absent key (a task filed before the stamp existed) means no
-information, never ``'undeclared'``. The modules allowed to import this one are pinned by
-``shared/tests/test_declared_scope_readers.py``.
+record once, ``basis='submit'``. ``basis='combine'`` is reserved for the curator-combine re-stamp
+that task 8415 adds in ``_execute_combine``; nothing else may add, alter or remove it. An absent key
+(a task filed before the stamp existed) means no information, never ``'undeclared'``. The modules
+allowed to import this one are pinned by ``shared/tests/test_declared_scope_readers.py``.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from enum import StrEnum
 from typing import Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -19,8 +20,9 @@ __all__ = [
     'DeclaredScope',
     'DeclaredScopeBand',
     'DeclaredScopeBasis',
+    'StampViolation',
     'derive_declared_scope',
-    'preserves_stamp',
+    'stamp_violation',
 ]
 
 DECLARED_SCOPE_METADATA_KEY = 'declared_scope'
@@ -80,10 +82,18 @@ def derive_declared_scope(
     )
 
 
-def preserves_stamp(
+class StampViolation(StrEnum):
+    """How a write would break the stamp: the ``reason`` its refusal reports."""
+
+    ADDED = 'added'
+    ALTERED = 'altered'
+    REMOVED = 'removed'
+
+
+def stamp_violation(
     stored: Mapping[str, object], payload: Mapping[str, object], *, replace: bool,
-) -> bool:
-    """Whether writing ``payload`` over ``stored`` leaves the stamp exactly as it is.
+) -> StampViolation | None:
+    """How writing ``payload`` over ``stored`` would break the stamp; None when it stays exactly as it is.
 
     A payload that carries the key must carry the stored value; a replace must also carry it
     whenever one is stored. Identity is JSON value equality, as for ``metadata.deferral``.
@@ -92,5 +102,7 @@ def preserves_stamp(
     kept = stored.get(DECLARED_SCOPE_METADATA_KEY, absent)
     carried = payload.get(DECLARED_SCOPE_METADATA_KEY, absent)
     if carried is absent:
-        return kept is absent or not replace
-    return carried == kept
+        return StampViolation.REMOVED if replace and kept is not absent else None
+    if kept is absent:
+        return StampViolation.ADDED
+    return None if carried == kept else StampViolation.ALTERED

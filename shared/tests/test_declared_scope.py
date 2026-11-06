@@ -8,8 +8,9 @@ from pydantic import ValidationError
 from shared.declared_scope import (
     DeclaredScope,
     DeclaredScopeBasis,
+    StampViolation,
     derive_declared_scope,
-    preserves_stamp,
+    stamp_violation,
 )
 from shared.task_metadata import is_known_metadata_key, parse_metadata
 
@@ -26,6 +27,8 @@ def _files(count: int) -> list[str]:
         (0, _TINY, '', 'undeclared'),
         (0, 'd' * 4000, 't' * 2000, 'undeclared'),
         (1, 'd' * 5000, 't' * 999, 'narrow'),
+        (2, _TINY, '', 'narrow'),
+        (2, 'd' * 5999, '', 'narrow'),
         (2, 'd' * 3000, 't' * 3000, 'moderate'),
         (1, 'd' * 6000, '', 'moderate'),
         (3, _TINY, '', 'moderate'),
@@ -44,8 +47,8 @@ def test_v1_band_table(file_count: int, description: str, details: str, band: st
 def test_the_record_carries_its_counts_basis_and_rule(basis: DeclaredScopeBasis) -> None:
     record = derive_declared_scope(_files(2), 'describe', 'the details', basis=basis)
 
-    assert (record.files, record.text_chars, record.basis, record.rule) == (
-        2, len('describe') + len('the details'), basis, 'v1',
+    assert (record.band, record.files, record.text_chars, record.basis, record.rule) == (
+        'narrow', 2, len('describe') + len('the details'), basis, 'v1',
     )
 
 
@@ -111,27 +114,27 @@ def _blob(stamp: dict[str, object] | None) -> dict[str, object]:
 
 
 @pytest.mark.parametrize(
-    ('stored', 'payload', 'replace', 'preserved'),
+    ('stored', 'payload', 'replace', 'violation'),
     [
-        pytest.param(None, None, False, True, id='merge-unstamped-untouched'),
-        pytest.param(None, _STAMP, False, False, id='merge-adds-a-stamp'),
-        pytest.param(_STAMP, None, False, True, id='merge-leaves-the-stamp-alone'),
-        pytest.param(_STAMP, _STAMP, False, True, id='merge-echoes-the-stamp'),
-        pytest.param(_STAMP, _ALTERED, False, False, id='merge-alters-the-stamp'),
-        pytest.param(None, None, True, True, id='replace-unstamped-untouched'),
-        pytest.param(None, _STAMP, True, False, id='replace-adds-a-stamp'),
-        pytest.param(_STAMP, None, True, False, id='replace-drops-the-stamp'),
-        pytest.param(_STAMP, _STAMP, True, True, id='replace-carries-the-stamp'),
-        pytest.param(_STAMP, _ALTERED, True, False, id='replace-alters-the-stamp'),
+        pytest.param(None, None, False, None, id='merge-unstamped-untouched'),
+        pytest.param(None, _STAMP, False, StampViolation.ADDED, id='merge-adds-a-stamp'),
+        pytest.param(_STAMP, None, False, None, id='merge-leaves-the-stamp-alone'),
+        pytest.param(_STAMP, _STAMP, False, None, id='merge-echoes-the-stamp'),
+        pytest.param(_STAMP, _ALTERED, False, StampViolation.ALTERED, id='merge-alters-the-stamp'),
+        pytest.param(None, None, True, None, id='replace-unstamped-untouched'),
+        pytest.param(None, _STAMP, True, StampViolation.ADDED, id='replace-adds-a-stamp'),
+        pytest.param(_STAMP, None, True, StampViolation.REMOVED, id='replace-drops-the-stamp'),
+        pytest.param(_STAMP, _STAMP, True, None, id='replace-carries-the-stamp'),
+        pytest.param(_STAMP, _ALTERED, True, StampViolation.ALTERED, id='replace-alters-the-stamp'),
     ],
 )
-def test_preserves_stamp_truth_table(
+def test_stamp_violation_table(
     stored: dict[str, object] | None,
     payload: dict[str, object] | None,
     replace: bool,
-    preserved: bool,
+    violation: StampViolation | None,
 ) -> None:
-    assert preserves_stamp(_blob(stored), _blob(payload), replace=replace) is preserved
+    assert stamp_violation(_blob(stored), _blob(payload), replace=replace) is violation
 
 
 def test_declared_scope_is_a_known_metadata_key() -> None:

@@ -93,12 +93,14 @@ async def stack(tmp_path: Path) -> AsyncIterator[Stack]:
 _FORGED = derive_declared_scope(['pkg/a.py'], 'forged', '', basis='submit').model_dump()
 
 
-def _assert_write_authority(result: Any, task_id: str | None) -> None:
+def _assert_write_authority(
+    result: Any, task_id: str | None, reason: str, stored: dict[str, Any] | None = None,
+) -> None:
     assert result['success'] is False, result
     assert result['error'] == 'declared_scope_write_authority', result
     assert result['error_type'] == 'DeclaredScopeWriteAuthorityError', result
     assert result['path'] == 'metadata.declared_scope', result
-    assert result['task_id'] == task_id, result
+    assert (result['task_id'], result['reason'], result['stored']) == (task_id, reason, stored), result
 
 
 # Row 6: a submission that supplies declared_scope is refused and nothing is filed.
@@ -118,7 +120,7 @@ async def test_submit_task_refuses_a_caller_declared_scope(
         planning_mode=planning_mode, metadata=json.dumps(metadata) if as_json else metadata,
     )
 
-    _assert_write_authority(result, None)
+    _assert_write_authority(result, None, 'added')
     assert 'ticket' not in result
     assert await stack.task_count() == before
 
@@ -227,7 +229,7 @@ async def test_update_task_cannot_alter_the_stamp(
 
     result = await stack.call('update_task', id=task_id, metadata=payload, metadata_mode=mode)
 
-    _assert_write_authority(result, task_id)
+    _assert_write_authority(result, task_id, 'altered', metadata['declared_scope'])
     assert (await stack.metadata(task_id))['declared_scope'] == metadata['declared_scope']
 
 
@@ -238,7 +240,7 @@ async def test_a_replace_that_omits_the_stamp_is_refused(stack: Stack) -> None:
 
     result = await stack.call('update_task', id=task_id, metadata=without, metadata_mode='replace')
 
-    _assert_write_authority(result, task_id)
+    _assert_write_authority(result, task_id, 'removed', metadata['declared_scope'])
     assert (await stack.metadata(task_id))['declared_scope'] == metadata['declared_scope']
 
 
@@ -250,7 +252,7 @@ async def test_update_task_cannot_stamp_a_pre_deploy_task(stack: Stack) -> None:
         'update_task', id=pre_deploy, metadata={'declared_scope': _FORGED}, metadata_mode='merge',
     )
 
-    _assert_write_authority(result, pre_deploy)
+    _assert_write_authority(result, pre_deploy, 'added')
     assert 'declared_scope' not in await stack.metadata(pre_deploy)
 
 
@@ -281,6 +283,26 @@ async def test_a_merge_echoing_the_stamp_is_accepted(stack: Stack) -> None:
     after = await stack.metadata(task_id)
     assert after['x_note'] == 'echoed'
     assert after['declared_scope'] == metadata['declared_scope']
+
+
+@pytest.mark.asyncio
+async def test_a_recon_stage_write_is_judged_against_its_own_before_read(stack: Stack) -> None:
+    task_id, metadata = await _stamped(stack, 'recon-stage writes', _files(1))
+    stamp = metadata['declared_scope']
+
+    altered = await stack.call(
+        'update_task', id=task_id, agent_id='recon-stage-2',
+        metadata={'declared_scope': {**stamp, 'basis': 'combine'}}, metadata_mode='merge',
+    )
+    echoed = await stack.call(
+        'update_task', id=task_id, agent_id='recon-stage-2',
+        metadata={**metadata, 'x_note': 'recon echo'}, metadata_mode='replace',
+    )
+
+    _assert_write_authority(altered, task_id, 'altered', stamp)
+    assert echoed.get('error') is None, echoed
+    after = await stack.metadata(task_id)
+    assert (after['x_note'], after['declared_scope']) == ('recon echo', stamp)
 
 
 @pytest.mark.asyncio

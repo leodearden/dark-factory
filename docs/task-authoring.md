@@ -1457,7 +1457,9 @@ live only in that module's `derive_declared_scope`. `submit_task` stamps it
 once, `basis='submit'`, on both creation paths (ticket and planning mode).
 `submit_task` and `update_task` refuse any add, alter or removal with
 `declared_scope_write_authority`; an unchanged echo passes, so a replace-mode
-write must carry it verbatim. It is never re-derived at plan refinement or at
+write must carry it verbatim. The refusal's `reason` is `added`, `altered` or
+`removed` (a replace that omits the key), and its `stored` is the stamp on the
+row, or null when it has none. It is never re-derived at plan refinement or at
 `done`. The only re-stamp is a curator combine (`basis='combine'`, task
 8415). An absent key, on a task filed before the stamp existed, means no
 information, never `undeclared`. The modules allowed to import it are pinned

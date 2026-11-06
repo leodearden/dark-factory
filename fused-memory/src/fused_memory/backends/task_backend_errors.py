@@ -11,8 +11,9 @@ contract intact across the cutover.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, ClassVar
 
+from shared.declared_scope import DECLARED_SCOPE_METADATA_KEY, StampViolation
 from shared.task_deferral import DeferralRefusalCode
 
 TASKMASTER_TOOL_ERROR: str = 'TASKMASTER_TOOL_ERROR'
@@ -321,21 +322,30 @@ _DECLARED_SCOPE_WRITE_AUTHORITY_HINT = (
 class DeclaredScopeWriteAuthorityError(TaskmasterError):
     """Raised when a caller would add, alter or remove ``metadata.declared_scope``.
 
-    PRD plans/follow-up-filing-shape-prd.md §3 decision 7. Call :meth:`to_error_dict` for the
-    wire shape.
+    PRD plans/follow-up-filing-shape-prd.md §3 decision 7. ``reason`` names the arm the write
+    tripped and ``stored`` is the stamp on the row, None when it has none. Call
+    :meth:`to_error_dict` for the wire shape; callers branch on ``error == ERROR``.
     """
 
-    def __init__(self, task_id: str | None) -> None:
+    ERROR: ClassVar[str] = 'declared_scope_write_authority'
+
+    def __init__(self, task_id: str | None, reason: StampViolation, stored: Any = None) -> None:
         self.task_id = task_id
-        super().__init__('TASKMASTER_TOOL_ERROR', _DECLARED_SCOPE_WRITE_AUTHORITY_HINT)
+        self.reason = reason
+        self.stored = stored
+        super().__init__(
+            'TASKMASTER_TOOL_ERROR', f'{reason.value}: {_DECLARED_SCOPE_WRITE_AUTHORITY_HINT}',
+        )
 
     def to_error_dict(self) -> dict[str, Any]:
         return {
             'success': False,
-            'error': 'declared_scope_write_authority',
-            'error_type': 'DeclaredScopeWriteAuthorityError',
+            'error': self.ERROR,
+            'error_type': type(self).__name__,
             'task_id': self.task_id,
-            'path': 'metadata.declared_scope',
+            'path': f'metadata.{DECLARED_SCOPE_METADATA_KEY}',
+            'reason': self.reason.value,
+            'stored': self.stored,
             'hint': _DECLARED_SCOPE_WRITE_AUTHORITY_HINT,
         }
 

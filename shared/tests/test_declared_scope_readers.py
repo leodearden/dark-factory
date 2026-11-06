@@ -31,6 +31,7 @@ class Allowed(NamedTuple):
 ALLOWED_IMPORTERS: Mapping[str, Allowed] = MappingProxyType({
     'shared/src/shared/task_metadata.py': Allowed('registry', _DECISION_8),
     'fused-memory/src/fused_memory/middleware/task_interceptor.py': Allowed('writer', _DECISION_8),
+    'fused-memory/src/fused_memory/backends/task_backend_errors.py': Allowed('refusal', _DECISION_8),
     'fused-memory/src/fused_memory/middleware/task_curator.py': Allowed('reader (γ)', _DECISION_8),
     'scripts/followup_filing_shape_report.py': Allowed('reader (θ)', _DECISION_8),
 })
@@ -116,6 +117,7 @@ def test_the_sweep_sees_the_known_importers(
     assert {
         'shared/src/shared/task_metadata.py',
         'fused-memory/src/fused_memory/middleware/task_interceptor.py',
+        'fused-memory/src/fused_memory/backends/task_backend_errors.py',
     } <= set(real_importers), f'the sweep missed a known importer: {real_importers}'
 
 

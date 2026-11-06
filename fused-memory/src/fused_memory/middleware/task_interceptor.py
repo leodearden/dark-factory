@@ -19,7 +19,7 @@ from shared import process_identity
 from shared.declared_scope import (
     DECLARED_SCOPE_METADATA_KEY,
     derive_declared_scope,
-    preserves_stamp,
+    stamp_violation,
 )
 from shared.defects import DeclareEvent, OutcomeEvent
 from shared.mcp_envelope import write_failure_reason
@@ -4144,8 +4144,8 @@ class TaskInterceptor:
         incoming_metadata = coerce_task_metadata(metadata)
         if 'deferral' in (incoming_metadata or {}):
             return DeferralWriteAuthorityError(None).to_error_dict()
-        if not preserves_stamp({}, incoming_metadata or {}, replace=False):
-            return DeclaredScopeWriteAuthorityError(None).to_error_dict()
+        if (violation := stamp_violation({}, incoming_metadata or {}, replace=False)) is not None:
+            return DeclaredScopeWriteAuthorityError(None, violation).to_error_dict()
         # Before the planning_mode split, so both creation paths refuse
         # synchronously, before a ticket or a row is written.
         try:
@@ -5647,8 +5647,8 @@ class TaskInterceptor:
         4. ``_declared_scope_refusal`` — under the write lock, refuses any add, alter or
            removal of ``metadata.declared_scope`` (an unchanged echo passes) with
            ``DeclaredScopeWriteAuthorityError.to_error_dict()``. It is here, not in the
-           backend floor, because ``_execute_combine``'s sanctioned ``basis='combine'``
-           re-stamp writes through the backend directly.
+           backend floor, to leave room for the ``basis='combine'`` re-stamp that task
+           8415 adds in ``_execute_combine``, which writes through the backend directly.
 
         Callers must use :func:`interceptor_write_succeeded` to distinguish a successful
         write from a gate rejection — do NOT re-implement the formula inline.
@@ -5902,11 +5902,14 @@ class TaskInterceptor:
         replace = kwargs.get('metadata_mode') == 'replace'
         if not replace and DECLARED_SCOPE_METADATA_KEY not in payload:
             return None
-        row = before if before is not None else await tm.get_task(task_id, project_root)
+        row = before if before is not None else await tm.get_task(task_id, project_root, kwargs.get('tag'))
         stored = coerce_task_metadata(row.get('metadata')) or {}
-        if preserves_stamp(stored, payload, replace=replace):
+        violation = stamp_violation(stored, payload, replace=replace)
+        if violation is None:
             return None
-        return DeclaredScopeWriteAuthorityError(task_id).to_error_dict()
+        return DeclaredScopeWriteAuthorityError(
+            task_id, violation, stored.get(DECLARED_SCOPE_METADATA_KEY),
+        ).to_error_dict()
 
     async def _with_bounded_audit_trail(
         self, result: dict[str, Any], task_id: str, project_root: str, project_id: str,
