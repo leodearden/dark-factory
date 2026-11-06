@@ -117,6 +117,7 @@ def _make_busy_on_older_l0_steward(
 
     class _FakeSteward:
         instances: list[_FakeSteward] = []
+        published: list[str] = []
 
         def __init__(self, wt_path: Path, cfg_dir: Path | None) -> None:
             self._outcome_channel: asyncio.Queue[PublishedStewardOutcome] | None = None
@@ -134,6 +135,7 @@ def _make_busy_on_older_l0_steward(
             self._outcome_channel.put_nowait(
                 PublishedStewardOutcome(esc_id, StewardResolved(text)),
             )
+            _FakeSteward.published.append(esc_id)
 
         def _close_other_pending(self) -> list[str]:
             closed = [
@@ -240,6 +242,10 @@ class TestMarkBlockedWaitIsScopedToItsOwnEscalation:
         finally:
             await _stop_all(steward_cls)
 
+        assert steward_cls.published == [older.id], (
+            "precondition: the older L0's outcome must reach the channel during "
+            'the wait, or BLOCKED proves nothing about scoping'
+        )
         assert outcome == WorkflowOutcome.BLOCKED, (
             "the older L0's StewardResolved must not end the wait for the new L0"
         )

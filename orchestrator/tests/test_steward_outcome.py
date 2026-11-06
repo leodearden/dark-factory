@@ -512,6 +512,39 @@ class TestScopedWaitSettlesOnTheAwaitedRecord:
 
         assert outcome == StewardInterrupted('timeout', wip_commits_present=False)
 
+    async def test_hand_off_close_of_another_tasks_record_does_not_settle(
+        self, tmp_path: Path,
+    ):
+        """A dedupe fold can scope the wait to another task's parent; that
+        task's steward giving up (L1 filed, L0 dismissed by 'steward') is a
+        hand-off to a human, not a resolution, so it must not requeue."""
+        wf, queue, channel, older, _awaited = self._workflow_with_two_l0s(
+            tmp_path, timeout=0.3,
+        )
+        foreign_parent = Escalation(
+            id=queue.make_id('99'), task_id='99', agent_role='implementer',
+            severity='blocking', category='task_failure', summary='main is red',
+        )
+        queue.submit(foreign_parent)
+        queue.submit(Escalation(
+            id=queue.make_id('99'), task_id='99', agent_role='steward',
+            severity='blocking', category='task_failure',
+            summary='steward gave up', level=1,
+        ))
+        queue.resolve(
+            foreign_parent.id, 'Auto-dismissed: re-escalated to level 1',
+            dismiss=True, resolved_by='steward',
+        )
+        channel.put_nowait(
+            PublishedStewardOutcome(older.id, StewardResolved('older fixed')),
+        )
+
+        outcome = await asyncio.wait_for(
+            wf._await_steward_completion(escalation_id=foreign_parent.id), 5,
+        )
+
+        assert outcome == StewardInterrupted('timeout', wip_commits_present=False)
+
     async def test_deadline_consults_the_awaited_record(self, tmp_path: Path):
         wf, queue, _channel, _older, awaited = self._workflow_with_two_l0s(
             tmp_path, timeout=0.2,

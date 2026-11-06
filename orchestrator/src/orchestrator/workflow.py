@@ -19107,13 +19107,19 @@ class TaskWorkflow:
         """The outcome a wait scoped to *escalation_id* settles on when that
         record is found closed by a non-sweep resolver, else ``None``.
 
-        One read of one record by id.  The text mirrors the steward's own
-        lost-race publish (``steward.py::TaskSteward._give_up_with_wip``).
+        A close while the record's OWNING task has an open L1 is a hand-off
+        to a human (``steward.py::TaskSteward._auto_escalate_to_human`` files
+        the L1, then dismisses the L0), not a resolution, so it never settles
+        the wait — the owner may be another task when a dedupe fold put the
+        awaited record there.  The text mirrors the steward's own lost-race
+        publish (``steward.py::TaskSteward._give_up_with_wip``).
         """
         if escalation_id is None or self.escalation_queue is None:
             return None
         record = self.escalation_queue.get(escalation_id)
         if record is None or not closed_by_non_sweep_resolver(record):
+            return None
+        if self.escalation_queue.has_open_l1(record.task_id):
             return None
         logger.info(
             'Task %s: awaited escalation %s found %s by %s with no outcome '
@@ -19168,13 +19174,13 @@ class TaskWorkflow:
             )
             if in_scope:
                 return max(in_scope, key=self._outcome_severity)
-            if cancel_wait in done:
+            if self._cancel_event.is_set():
                 logger.info(
                     f'Task {self.task_id}: cancel-event fired during steward grace — '
                     f'exiting completion wait'
                 )
                 return None
-            if get_wait not in done:
+            if get_wait not in done or loop.time() >= deadline:
                 break
             if (settled := self._awaited_record_outcome(escalation_id)) is not None:
                 return settled
