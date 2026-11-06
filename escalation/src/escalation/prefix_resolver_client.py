@@ -13,14 +13,19 @@ declares, so the guard forwards the call unchanged and says so on ``meta``; it
 would re-raise anything else as a resolver bug. Only cancellation propagates,
 and no failure is ever read as a ``none``. A 503 names the
 store that failed, because "mem0 is down" is actionable where "the resolver is
-down" is not.
+down" is not. Each failure also names WHY, as an ``UnavailableReason``:
+``timed_out`` past a deadline, ``unreachable`` for no connection, an unusable
+*base_url* or a 503, and ``bad_response`` for any other status or a malformed
+200.
 
 The bound (INV-8): one request's TOTAL deadline is
 :data:`REQUEST_DEADLINE_SECONDS`, so this guard occupies a call for at most
-ceil(MAX_DISTINCT_PREFIXES_PER_CALL / MAX_CONCURRENT_RESOLUTIONS) x 1 s = 2 s
-of awaited I/O. That deadline cannot interrupt synchronous work, which blocks
-the shared event loop. Each resolution's synchronous work is building a client
-and decoding a body, a fraction of a millisecond. The TLS context costs ~10 ms
+ceil(MAX_DISTINCT_PREFIXES_PER_CALL / MAX_CONCURRENT_RESOLUTIONS) x 5 s = 10 s
+of awaited I/O. Why 5 s against measured route latency:
+``plans/uuid-prefix-resolution-prd.md`` §4-C5, erratum 2026-11-05. That
+deadline cannot interrupt synchronous work, which blocks the shared event loop.
+Each resolution's synchronous work is building a client and decoding a body,
+a fraction of a millisecond. The TLS context costs ~10 ms
 to build, so :func:`_tls_context` builds it once per process.
 
 The route path and field names are restated here because escalation may not
@@ -47,6 +52,7 @@ from shared.uuid_prefix_guard import (
     Resolution,
     ResolutionOutcome,
     ResolverUnavailable,
+    UnavailableReason,
 )
 
 __all__ = [
@@ -59,15 +65,21 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 RESOLVE_PREFIX_PATH = '/resolve-prefix'
-REQUEST_DEADLINE_SECONDS = 1.0
+REQUEST_DEADLINE_SECONDS = 5.0
 RESOLVER_SERVICE_STORE = 'fused-memory'
 
 
 class _Unanswered(Exception):
-    """Why a request produced no Resolution, and which store to blame for it."""
+    """A response arrived but is no Resolution: what it was, why, and which store to blame."""
 
-    def __init__(self, reason: str, store: str = RESOLVER_SERVICE_STORE) -> None:
-        super().__init__(reason)
+    def __init__(
+        self,
+        detail: str,
+        why: UnavailableReason = UnavailableReason.BAD_RESPONSE,
+        store: str = RESOLVER_SERVICE_STORE,
+    ) -> None:
+        super().__init__(detail)
+        self.why = why
         self.store = store
 
 
@@ -82,6 +94,16 @@ def _describe(exc: BaseException) -> str:
     if isinstance(exc, BaseExceptionGroup):
         return '; '.join(_describe(leaf) for leaf in exc.exceptions)
     return f'{type(exc).__name__}: {exc}'
+
+
+def _why(exc: BaseException) -> UnavailableReason:
+    """A deadline, ours or httpx's, is a timeout — in an anyio group only if every leaf is."""
+    if isinstance(exc, BaseExceptionGroup):
+        timed_out = all(_why(leaf) is UnavailableReason.TIMED_OUT for leaf in exc.exceptions)
+        return UnavailableReason.TIMED_OUT if timed_out else UnavailableReason.UNREACHABLE
+    if isinstance(exc, TimeoutError | httpx.TimeoutException):
+        return UnavailableReason.TIMED_OUT
+    return UnavailableReason.UNREACHABLE
 
 
 def _is_outcome(value: object) -> TypeGuard[ResolutionOutcome]:
@@ -118,10 +140,16 @@ def _resolution(response: httpx.Response) -> Resolution:
     return Resolution(outcome, tuple(_candidate(raw) for raw in candidates))
 
 
+def _unanswered_status(response: httpx.Response) -> _Unanswered:
+    """A 503 is the service naming a store it could not reach; any other status is a bad answer."""
+    detail = f'HTTP {response.status_code}'
+    if response.status_code == 503:
+        return _Unanswered(detail, UnavailableReason.UNREACHABLE, _unavailable_store(response))
+    return _Unanswered(detail)
+
+
 def _unavailable_store(response: httpx.Response) -> str:
-    """A 503 body's ``store``; anything else blames the service as a whole."""
-    if response.status_code != 503:
-        return RESOLVER_SERVICE_STORE
+    """A 503 body's ``store``, or the service as a whole when the body names none."""
     try:
         body = response.json()
     except ValueError:
@@ -157,15 +185,15 @@ class PrefixResolverClient:
         try:
             return await self._request(project_id, prefix)
         except _Unanswered as exc:
-            reason, store, cause = str(exc), exc.store, exc
+            detail, why, store, cause = str(exc), exc.why, exc.store, exc
         except Exception as exc:
-            reason, store, cause = _describe(exc), RESOLVER_SERVICE_STORE, exc
+            detail, why, store, cause = _describe(exc), _why(exc), RESOLVER_SERVICE_STORE, exc
         logger.warning(
-            'prefix resolver: POST %s for project=%s prefix=%s got no resolution (%s); '
+            'prefix resolver: POST %s for project=%s prefix=%s got no resolution (%s: %s); '
             'the %s store is treated as unavailable',
-            self.url, project_id, prefix, reason, store,
+            self.url, project_id, prefix, why, detail, store,
         )
-        raise ResolverUnavailable(store) from cause
+        raise ResolverUnavailable(store, reason=why) from cause
 
     async def _request(self, project_id: str, prefix: str) -> Resolution:
         async with (
@@ -176,5 +204,5 @@ class PrefixResolverClient:
         ):
             response = await client.post(self.url, json={'project_id': project_id, 'prefix': prefix})
         if response.status_code != 200:
-            raise _Unanswered(f'HTTP {response.status_code}', _unavailable_store(response))
+            raise _unanswered_status(response)
         return _resolution(response)
