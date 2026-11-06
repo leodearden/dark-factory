@@ -586,3 +586,36 @@ def test_a_suppressed_import_of_a_module_at_the_pyright_execution_root_is_report
         f'class (b) also reported {reported_by_class_b}, which class (a) already '
         f'claims; each site belongs to exactly one guard and its one remedy'
     )
+
+
+def test_a_suppressed_import_of_a_package_is_reported_at_its_regular_package_root_not_a_namespace_directory(
+    tmp_path: Path,
+) -> None:
+    package = 'orchestrator'
+    namespace_dir = REPO_ROOT / package
+    package_root = REPO_ROOT / package / 'src'
+    assert namespace_dir.is_dir() and not (namespace_dir / '__init__.py').exists(), (
+        f'{namespace_dir} is no longer a bare namespace directory, so this test '
+        f'no longer pins the precedence it exists for'
+    )
+    assert (package_root / package / '__init__.py').is_file(), (
+        f'{package_root} no longer holds the regular package `{package}`'
+    )
+    suite_dir = tmp_path / 'suite'
+    suite_dir.mkdir()
+    (suite_dir / 'test_probe.py').write_text(f'import {package}  # {_PRAGMA}\n')
+
+    reported_by_class_a = {
+        module: root
+        for *_, module, root in _resolvable_import_offenders(
+            _pragma_carrying_imports([suite_dir])
+        )
+    }
+
+    assert reported_by_class_a == {package: package_root}, (
+        f'class (a) reported {reported_by_class_a}. {namespace_dir} is only a '
+        f'namespace directory, and pyright (measured, 1.1.408) resolves a '
+        f'regular package on an extraPaths root ahead of a namespace directory '
+        f'at the execution root, so `{package}` resolves at {package_root}. The '
+        f'reported root must be the one pyright actually uses'
+    )

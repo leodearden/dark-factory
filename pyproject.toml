@@ -40,6 +40,9 @@ extraPaths = [
     "orchestrator/src",
     "sampler/src",
     "shared/src",
+    # Test helpers tests/scripts imports by name (_fake_t3_server, task 8507);
+    # last, so every earlier root wins a name clash.
+    "orchestrator/tests",
 ]
 pythonVersion = "3.11"
 typeCheckingMode = "basic"
