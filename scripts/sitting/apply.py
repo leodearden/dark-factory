@@ -14,6 +14,13 @@ DecisionRecord, write two memories), and a failed step skips the rest of that
 item only. A decision item acts on no escalation, even one its DecisionRecord
 links to: it closes its own DecisionRecord and writes the two memories.
 
+The markers go on first because the server stamps only a pending record. So
+a resolve that is then refused or fails leaves them on the still-pending
+record. That is deliberate: they record Leo's answer against the
+preparation, which is what the preparer trial counts, whether or not the
+answer then applied. A re-run appends a newer pair, and the last pair is the
+one read.
+
 ``audit`` records the sitting's ``ok`` / ``wrong`` verdict on each drawn
 executor close (``sitting.audits``). A ``wrong`` re-counts the class's audits on
 that queue and, under ``authority.audit_escape_target``, moves the class to

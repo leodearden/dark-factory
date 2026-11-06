@@ -595,8 +595,38 @@ class TestServerSideRefusal:
         assert outcomes['resolve_issue']['outcome'] == 'refused'
         assert outcomes['resolve_issue']['code'] == 'claimed_by_executor'
         assert [step['outcome'] for step in rows[alpha_n]['steps'][2:]] == ['skipped'] * 4
-        assert _record(s.alpha, 'esc-100-1').status == 'pending'
+        refused = _record(s.alpha, 'esc-100-1')
+        assert refused.status == 'pending'
         assert {step['outcome'] for step in rows[beta_n]['steps']} == {'ok'}
+
+    def test_the_markers_stamped_before_a_refused_resolve_stay_and_a_rerun_appends_a_newer_pair(self, sitting):
+        s = sitting
+        alpha_n = s.number(s.alpha.queue_dir, 'esc-100-1')
+        alpha_queue = normalize_escalations_dir(s.alpha.queue_dir)
+
+        @contextlib.contextmanager
+        def racing(port: QueuePort):
+            with mod.coordinator_session(port) as session:
+                yield _ClaimBeforeResolve(session, s.alpha, 'esc-100-1') if port.queue_dir == alpha_queue else session
+
+        assert s.apply([s.answer(alpha_n, 'A')], {str(alpha_n): 'resume'}, connect=racing).exit_code == 4
+
+        note = _record(s.alpha, 'esc-100-1').triage_note or ''
+        assert isinstance(payloads.parse_prepared_marker(note), payloads.PreparedMarker)
+        agreed = payloads.parse_agreed_marker(note)
+        assert isinstance(agreed, payloads.AgreedMarker)
+        assert (agreed.answer, agreed.agreed) == ('A', True)
+        _rewrite(s.alpha, 'esc-100-1', claimed_at=(s.now - timedelta(days=1)).isoformat())
+
+        assert s.apply([s.answer(alpha_n, 'B', 'hold after all')], {str(alpha_n): 'close_only'}).exit_code == 0
+
+        resolved = _record(s.alpha, 'esc-100-1')
+        assert resolved.resolved_by == COORDINATOR_IDENTITY
+        note = resolved.triage_note or ''
+        assert note.count(payloads.AGREED_MARKER) == 2
+        latest = payloads.parse_agreed_marker(note)
+        assert isinstance(latest, payloads.AgreedMarker)
+        assert (latest.answer, latest.agreed) == ('B', False)
 
 
 class TestCli:
