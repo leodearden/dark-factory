@@ -122,6 +122,7 @@ def test_a_fold_of_another_outcome_is_noted_on_the_open_alarm_once(
     caplog.set_level(logging.INFO, logger=guard_storm_alarm.__name__)
     queue = EscalationQueue(tmp_path)
     first = file_storm_once(queue, ALARM, TIMED_OUT)
+    assert first is not None
 
     folded = [file_storm_once(queue, ALARM, record) for record in (UNREACHABLE, UNREACHABLE, TIMED_OUT)]
 
