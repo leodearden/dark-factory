@@ -12,6 +12,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+# Which kind of escalation queue a server serves; also the queue a policy row
+# applies to (escalation/src/escalation/authority.py::PolicyRow).
+QueueKind = Literal['project', 'reconciliation']
+
 
 @dataclass(frozen=True)
 class StoreIdentity:
@@ -22,7 +26,7 @@ class StoreIdentity:
     Constructing an incoherent identity raises ``ValueError``.
     """
 
-    kind: Literal['project', 'reconciliation']
+    kind: QueueKind
     queue_dir: Path
     project_id: str | None
     project_root: Path | None

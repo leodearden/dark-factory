@@ -129,9 +129,9 @@ def _isolate_caches():
     """The unit cache may not cross a test."""
     import dashboard.data.task_snapshot as snapshot_mod
 
-    snapshot_mod._snapshot_cache_clear()
+    snapshot_mod.clear_snapshot_cache()
     yield
-    snapshot_mod._snapshot_cache_clear()
+    snapshot_mod.clear_snapshot_cache()
 
 
 class TestAcquireSnapshotHappyPath:
@@ -253,7 +253,7 @@ class TestAcquireSnapshotHappyPath:
 
         canned.fail_when = lambda call: call['tool'] == 'get_statuses'
         import dashboard.data.task_snapshot as snapshot_mod
-        snapshot_mod._snapshot_cache_clear()
+        snapshot_mod.clear_snapshot_cache()
         degraded = await self._acquire(canned, dummy_client, dashboard_config, project_root,
                                        now=NOW)
 
@@ -325,7 +325,10 @@ class TestAcquireSnapshotHappyPath:
             assert f'{FRESHNESS_BOUND_SECONDS}s freshness bound' in (half.reason or '')
         assert served.census.value == snapshot.census.value
         assert served.rows.value == snapshot.rows.value
-        assert classify(served) is SnapshotHealth.COUNT_UNKNOWN
+        assert classify(served) is SnapshotHealth.COUNT_STALE, (
+            'a measured census with an age is count-stale whatever the rows '
+            'show, and the count-stale copy makes no claim about the rows'
+        )
 
     async def test_to_wire_emits_the_contract_keys_and_not_the_raw_map(
         self, project_root, dashboard_config, dummy_client
@@ -429,6 +432,7 @@ class TestAcquireSnapshotHappyPath:
         """
         from dashboard.data.census import build_census
         from dashboard.data.datum import DatumState
+        from dashboard.data.task_snapshot import SnapshotHealth, classify
 
         rows, status_map = _tree()
         status_map[6] = 'not-a-status'
@@ -444,6 +448,9 @@ class TestAcquireSnapshotHappyPath:
             f'{snapshot.census.reason!r}'
         )
         assert snapshot.rows.state is DatumState.FRESH
+        assert classify(snapshot) is SnapshotHealth.COUNT_UNKNOWN, (
+            'a first read has no last good census to serve, so its count is unknown'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -500,6 +507,7 @@ class TestSnapshotDegradation:
     ):
         """(b) The badge ages, the rows do not, and the reason is verbatim."""
         from dashboard.data.datum import DatumState
+        from dashboard.data.task_snapshot import SnapshotHealth, classify
 
         rows, status_map = _tree()
         canned = CannedMCP(rows=rows, status_map=status_map, status_page_size=2000)
@@ -524,12 +532,16 @@ class TestSnapshotDegradation:
         assert degraded.rows.state is DatumState.FRESH
         assert degraded.rows.as_of == later
         assert degraded.skew_seconds == 20, 'the real gap, now that there is one'
+        assert classify(degraded) is SnapshotHealth.COUNT_STALE, (
+            'a census serving its last good value is not an unknown count'
+        )
 
     async def test_recovery_returns_the_census_to_fresh(
         self, project_root, dashboard_config, dummy_client, monkeypatch
     ):
         """(c) A stale badge is not a latch."""
         from dashboard.data.datum import DatumState
+        from dashboard.data.task_snapshot import SnapshotHealth, classify
 
         rows, status_map = _tree()
         canned = CannedMCP(rows=rows, status_map=status_map, status_page_size=2000)
@@ -550,6 +562,7 @@ class TestSnapshotDegradation:
         assert recovered.census.as_of == recovered_at
         assert recovered.census.reason is None
         assert recovered.skew_seconds == 0
+        assert classify(recovered) is SnapshotHealth.OK
 
     async def test_failed_rows_keep_their_split_judged_at_their_own_instant(
         self, project_root, dashboard_config, dummy_client, monkeypatch
@@ -618,7 +631,11 @@ class TestSnapshotDegradation:
     ):
         """(f) Staleness is bounded: past the bound it is no longer evidence."""
         from dashboard.data.datum import DatumState
-        from dashboard.data.task_snapshot import _RETENTION_BOUND_SECONDS
+        from dashboard.data.task_snapshot import (
+            _RETENTION_BOUND_SECONDS,
+            SnapshotHealth,
+            classify,
+        )
 
         rows, status_map = _tree()
         canned = CannedMCP(rows=rows, status_map=status_map, status_page_size=2000)
@@ -636,6 +653,10 @@ class TestSnapshotDegradation:
         assert str(_RETENTION_BOUND_SECONDS) in (expired.census.reason or ''), (
             'the reason must name the bound that disqualified the last good: '
             f'{expired.census.reason!r}'
+        )
+        assert expired.rows.state is DatumState.FRESH
+        assert classify(expired) is SnapshotHealth.COUNT_UNKNOWN, (
+            'with no last good left to serve, the count has no value: unknown, not stale'
         )
 
     async def test_a_budget_expiry_and_a_read_failure_are_different_kinds(
@@ -660,7 +681,7 @@ class TestSnapshotDegradation:
         assert unreachable.failure is SnapshotFailure.UNREACHABLE
         assert unreachable.rows.state is not DatumState.FRESH
 
-        snapshot_mod._snapshot_cache_clear()
+        snapshot_mod.clear_snapshot_cache()
         monkeypatch.setattr(snapshot_mod, 'PER_CALL_TIMEOUT', 0.01)
         slow = CannedMCP(rows=rows, status_map=status_map, status_page_size=2000)
 

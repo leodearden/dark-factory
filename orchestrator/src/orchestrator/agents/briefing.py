@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 from shared.briefing_queries import BriefingScope
@@ -22,8 +23,34 @@ from orchestrator.agents.review_briefing import (
     review_action_section,
 )
 from orchestrator.config import OrchestratorConfig
+from orchestrator.implementer_brief_variant import ImplementerBriefVariant, is_one_step
+from orchestrator.plan_descope import DESCOPE_DISPOSITIONS, DoneStepIntegrityVerdict
 
 logger = logging.getLogger(__name__)
+
+IMPLEMENTER_ACTIONS: Mapping[ImplementerBriefVariant, str] = MappingProxyType({
+    ImplementerBriefVariant.WHOLE_PLAN: (
+        'Execute the next pending steps in TDD order. Commit after each step. '
+        'Call `mark_step_done(step_id, commit_sha)` to record progress. '
+        'Stop at a logical boundary.'
+    ),
+    ImplementerBriefVariant.ONE_STEP: (
+        'One-step mode: complete exactly ONE plan step this session — the next '
+        'pending item in `.task/plan.json`, prerequisites first, then steps. Do it '
+        'in TDD order, commit, call `mark_step_done(step_id, commit_sha)`, then '
+        'stop, even if more steps are pending; the orchestrator re-invokes you for '
+        'the next step.'
+    ),
+})
+"""The implementer brief's Action paragraph per ``config.implementer_brief_variant``."""
+
+
+def _implementer_action(variant: ImplementerBriefVariant) -> str:
+    """The Action paragraph *variant* selects, by the :func:`is_one_step` rule the cap and the bounds also use."""
+    return IMPLEMENTER_ACTIONS[
+        ImplementerBriefVariant.ONE_STEP if is_one_step(variant) else ImplementerBriefVariant.WHOLE_PLAN
+    ]
+
 
 DIFF_ONLY_DIFF_CAP_CHARS = 50_000
 """Where the incumbent reviewer briefing cuts its diff; ``diff_cap_chars=0`` lifts the cut."""
@@ -94,6 +121,31 @@ _TEXT_DRIFT_NOTICES = {
         'confirm_plan() only if it already covers it.'
     ),
 }
+
+
+
+def _integrity_refusal_section(verdict: DoneStepIntegrityVerdict | None) -> str:
+    """The refused done-step changes of a prior revalidation pass, or ''."""
+    if verdict is None:
+        return ''
+    lines = [
+        f'- `{step_id}` @ `{commit}` was dropped without a descope record'
+        for step_id, commit in verdict.undisposed_drops
+    ]
+    lines += [
+        f'- `{dup.commit}` is now the commit of done steps '
+        + ', '.join(f'`{step_id}`' for step_id in dup.step_ids)
+        for dup in verdict.introduced_duplicates
+    ]
+    lines += [f'- invalid descope record: {message}' for message in verdict.invalid_descope_records]
+    return (
+        '## Your Revised Plan Was Refused\n\n'
+        + '\n'.join(lines)
+        + '\n\nRestore each dropped step (`add_plan_step`, then `mark_step_committed` '
+        'when its commit is on the branch) or record it with `record_descoped_step`; '
+        'mark a step done only at its own commit. Then call `confirm_plan()`.\n\n'
+    )
+
 
 _DELIVERED_CHECK_FIELDS_BY_KIND = {
     'grep': ('pattern', 'expect', 'paths'),
@@ -494,6 +546,7 @@ pending: an unnecessary implementer turn is cheap, a false green is not.
         context: str | None = None,
         *,
         text_drift: TaskTextDrift | None = None,
+        integrity_refusal: DoneStepIntegrityVerdict | None = None,
     ) -> str:
         """Build prompt for the architect to revalidate a plan after blast-radius requeue.
 
@@ -534,6 +587,8 @@ pending: an unnecessary implementer turn is cheap, a false green is not.
         plan_json = json.dumps(existing_plan, indent=2)
         notice = _TEXT_DRIFT_NOTICES[text_drift] if text_drift is not None else ''
         text_drift_section = f'{notice}\n\n' if notice else ''
+        refusal_section = _integrity_refusal_section(integrity_refusal)
+        dispositions = ', '.join(f'`{d}`' for d in sorted(DESCOPE_DISPOSITIONS))
 
         return f"""\
 {preamble}
@@ -558,7 +613,7 @@ and either confirm it, update it, or recreate it from scratch.
 
 {files_section}
 
-## Action
+{refusal_section}## Action
 
 1. Read the overlapping files (if any) to understand what changed.
 2. Decide whether your plan is still valid.
@@ -569,7 +624,13 @@ and either confirm it, update it, or recreate it from scratch.
       and/or `add_plan_step(step_id, step_type, description)` to adjust the plan in place.
    c. **Plan is invalid**: call `create_plan(...)` to start fresh, then add steps as usual.
 4. Ensure the `files` list is exhaustive — it drives concurrency locks.
-5. Do NOT remove or replace steps with status "done".
+5. Keep every step with status "done" with its commit. If the revised plan
+   genuinely drops one (e.g. `create_plan` replaced the steps), record it with
+   `record_descoped_step(step_id, commit, disposition, authority, note)`:
+   disposition is one of {dispositions}; authority is an escalation id or a
+   human ratification marker. A revalidation that drops a done step without
+   that record, or newly marks a step done at another done step's commit, is
+   refused.
 """
 
     async def build_plan_completion_prompt(
@@ -775,8 +836,7 @@ triage it.
 
 # Plan Schema Repair
 
-The plan for this task is on disk at `.task/plan.json` (a symlink into the
-durable `<worktree_base>/.task-meta/<worktree-name>/plan.json`), but it has no
+The plan for this task is on disk at `.task/plan.json`, but it has no
 non-empty top-level `steps` array, so it cannot advance. It is NOT reproduced
 here — read the file in full.
 
@@ -824,9 +884,8 @@ The implementation was reviewed and blocking issues were found.
 
 ## Action
 
-1. Read `.task/plan.json` (a symlink into the durable
-   `<worktree_base>/.task-meta/<worktree-name>/plan.json`) for the current plan
-   and each step's status — it is not reproduced here.
+1. Read `.task/plan.json` for the current plan and each step's status — it
+   is not reproduced here.
 2. Add the steps that address the blocking issues with
    `add_plan_step(step_id, step_type, description)`, using step ids not
    already in the plan. New steps are recorded as pending.
@@ -920,7 +979,9 @@ suggestions-only on this exact tree — call
         string is the one that can lie, because the retry ladder replays an
         assembled prompt verbatim into a fresh session
         (shared/src/shared/cli_invoke.py::_reset_for_fresh_retry). Pinned by
-        orchestrator/tests/test_briefing_progress_spot.py.
+        orchestrator/tests/test_briefing_progress_spot.py. The Action paragraph
+        follows config.implementer_brief_variant and, for the same reason, names
+        no step id.
         """
         scope = _plan_scope(plan, task_id)
         if context is None:
@@ -999,14 +1060,9 @@ Before writing any new code, walk the pending steps in plan order:
 {wip_section}
 # Session Startup Protocol
 
-1. Read `.task/plan.json` to see the full plan with current status — it is a
-   symlink into the durable
-   `<worktree_base>/.task-meta/<worktree-name>/plan.json` (the
-   worktree-lane-lifecycle W11 relocation keeps plan/iteration state outside
-   the worktree for pooled lanes, and the symlink survives worktree resets),
-   so reading either path resolves to the same plan.
-2. Read `<worktree_base>/.task-meta/<worktree-name>/iterations.jsonl` (NOT
-   symlinked into the lane) to see prior iteration details.
+1. Read `.task/plan.json` to see the full plan with current status.
+2. Read `.task/iterations.jsonl` to see prior iteration details (absent until
+   the first iteration is logged).
 3. Run `git log --oneline -10` to see recent commits.
 4. Identify the next pending step (prerequisites first, then steps).
 5. **Mandatory pre-flight — before writing any code for that step:** run
@@ -1023,7 +1079,7 @@ Before writing any new code, walk the pending steps in plan order:
 
 # Action
 
-Execute the next pending steps in TDD order. Commit after each step. Call `mark_step_done(step_id, commit_sha)` to record progress. Stop at a logical boundary.
+{_implementer_action(self.config.implementer_brief_variant)}
 """
 
     async def build_amender_prompt(
@@ -1112,9 +1168,7 @@ This task holds locks for the following modules:
    collide with another task's concurrent edits. Where the entries above are
    themselves single files, a new file is necessarily outside that list —
    that is expected, and not something to escalate.
-2. Do NOT modify the plan — it is durable at
-   `<worktree_base>/.task-meta/<worktree-name>/plan.json` (the lane
-   `.task/plan.json` is a symlink into it) and frozen for this pass.
+2. Do NOT modify the plan (`.task/plan.json`) — it is frozen for this pass.
 3. If a suggestion requires EDITING an existing file not covered above,
    skip it and note the reason in your commit message — it will be
    re-surfaced by the next review cycle or escalated as a follow-up task.
@@ -1127,11 +1181,8 @@ This task holds locks for the following modules:
 
 # Action
 
-1. Read `.task/plan.json` (a symlink into the durable
-   `<worktree_base>/.task-meta/<worktree-name>/plan.json`, which survives
-   worktree resets) and
-   `<worktree_base>/.task-meta/<worktree-name>/iterations.jsonl` (NOT
-   symlinked into the lane) to refresh context on what was already done.
+1. Read `.task/plan.json` and `.task/iterations.jsonl` to refresh context on
+   what was already done.
 2. Run `git log --oneline -10` to see recent commits.
 3. Apply each in-scope suggestion above. Commit amendments with `amend:`
    prefixes, grouping related fixes when sensible.
@@ -1377,12 +1428,11 @@ This task was paused because an agent escalated a blocking issue.
 
 {prior_proposal_section}
 ## Action
-Resume the task applying the handler's resolution. The prior agent's work
-is preserved in the worktree. Read `.task/plan.json` (a symlink into the
-durable `<worktree_base>/.task-meta/<worktree-name>/plan.json`, which survives
-worktree resets) and `<worktree_base>/.task-meta/<worktree-name>/iterations.jsonl`
-(NOT symlinked into the lane) to understand current progress, then continue
-from where the previous agent left off.
+Resume the task applying the resolution(s) that answer this round's
+escalation(s), each attributed to its escalation id. The prior agent's work
+is preserved in the worktree. Read `.task/plan.json` and
+`.task/iterations.jsonl` to understand current progress, then continue from
+where the previous agent left off.
 """
 
     async def build_steward_initial_prompt(
@@ -1488,6 +1538,12 @@ Handle this escalation, then call `resolve_issue` with a summary.
         which raises ``TypeError`` on comparison — so a formatting hiccup
         never silently drops persisted analysis.
 
+        Staleness compares ``timestamp`` (falling back to ``investigated_at``),
+        which is re-stamped when a re-block is covered by the latest entry
+        (task 3125), while the rendered
+        'Investigated at' line shows ``investigated_at``, falling back to
+        ``timestamp``.
+
         Called only from retry/resume prompt builders
         (``build_revalidation_prompt``, ``build_resume_prompt``) and, behind
         ``include_prior_proposals=True``, from ``build_architect_prompt``'s
@@ -1505,12 +1561,13 @@ Handle this escalation, then call `resolve_issue` with a summary.
         proposal_text = proposal.get('proposal_text', '')
         risk_label = proposal.get('risk_label', '')
         files_referenced = proposal.get('files_referenced') or []
-        created_at = proposal.get('timestamp') or proposal.get('investigated_at') or ''
+        stamped_at = proposal.get('timestamp') or proposal.get('investigated_at') or ''
+        investigated_at = proposal.get('investigated_at') or proposal.get('timestamp') or ''
 
         last_blocked_at = (task.get('metadata') or {}).get('last_blocked_at')
-        if created_at and last_blocked_at:
+        if stamped_at and last_blocked_at:
             try:
-                is_stale = datetime.fromisoformat(created_at) < datetime.fromisoformat(last_blocked_at)
+                is_stale = datetime.fromisoformat(stamped_at) < datetime.fromisoformat(last_blocked_at)
             except (ValueError, TypeError):
                 pass  # fail open — never silently drop persisted analysis
             else:
@@ -1532,7 +1589,7 @@ A prior block-time investigation concluded the following; verify against the cur
 **Proposal:** {proposal_text}
 **Risk:** {risk_label}
 **Files referenced:** {files_str}
-**Investigated at:** {created_at}
+**Investigated at:** {investigated_at}
 """
 
     def _format_task(

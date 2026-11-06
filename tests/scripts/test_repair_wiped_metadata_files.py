@@ -52,8 +52,6 @@ from _task_db_scan import (
     AUDIT_EXIT_NO_ROOT,
     AUDIT_EXIT_NOTHING_AUDITED,
     AUDIT_EXIT_OK,
-    TaskDbProblem,
-    TaskDbUnreadable,
 )
 from audit_wiped_metadata_files import (
     CLEAN_MERGE_SHA,
@@ -102,6 +100,9 @@ from repair_wiped_metadata_files import (
     select_repairable_candidates,
     writable_plan_files,
 )
+from shared.task_store_schema import TASK_STORE_DDL
+from shared.tasks_db_readonly import TaskDbProblem, TaskDbUnreadable
+from tasks_db_schema import columns_outside, introspect, introspect_ddl
 
 # ---------------------------------------------------------------------------
 # Synthetic candidate builder.
@@ -1139,7 +1140,9 @@ def _make_tasks_db(dir_path: Path, rows: list[dict]) -> Path:
     """Copied from scripts/tests/test_audit_wiped_metadata_files.py — the two
     test directories cannot share imports (same note as
     orchestrator/tests/test_deterministic_runner.py:31-32). Schemas mirror the
-    live ones so the audit exercises real column shapes."""
+    live ones so the audit exercises real column shapes; the subset guard below
+    checks ``_TASKS_SCHEMA`` against
+    ``shared/src/shared/task_store_schema.py::TASK_STORE_DDL``."""
     db_path = dir_path / "tasks.db"
     conn = sqlite3.connect(db_path)
     try:
@@ -1169,6 +1172,11 @@ def _make_tasks_db(dir_path: Path, rows: list[dict]) -> Path:
     finally:
         conn.close()
     return db_path
+
+
+def test_make_tasks_db_declares_only_columns_production_declares(tmp_path):
+    with contextlib.closing(sqlite3.connect(_make_tasks_db(tmp_path, []))) as fixture_conn:
+        assert columns_outside(introspect(fixture_conn), introspect_ddl(TASK_STORE_DDL)) == ()
 
 
 def _make_runs_db(dir_path: Path, events: list[dict]) -> Path:

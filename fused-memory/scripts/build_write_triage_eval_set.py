@@ -31,7 +31,7 @@ committed one). Each refuses inputs other than those the key records:
   awaits a third rater, key a new round of both raters over every pair whose
   derivation reads LOSS, under ``--brief``, retiring the earlier third votes on those pairs; then
   re-render any missing shard text and ``rater_prompt.md``. A rerun under a
-  keyed label keys nothing new.
+  keyed label keys nothing new (``write_triage_rating_rounds.py::ensure_rerate``).
 - ``assemble``: write ``write_triage_eval_set_v2_{writes.jsonl,verdicts.jsonl,summary.json}``
   into ``--out-dir``, refusing while any pair is not fully labelled, or reads
   LOSS outside the latest re-rate. The summary records each re-rate and each
@@ -197,12 +197,9 @@ def _eval_write(
                      target_texts={target: text for target, text in texts.items() if text is not None})
 
 
-Pair = tuple[str, str]
-
-
 def pair_derivations(
     writes: Iterable[Mapping[str, Any]], verdicts: Iterable[Mapping[str, Any]],
-) -> dict[Pair, _rubric.Derivation]:
+) -> dict[_rounds.Pair, _rubric.Derivation]:
     """Each (write, target) pair's :data:`FULL_LABEL_OUTCOME` derivation on the current basis."""
     judgements = _rubric.resolve_judgements(verdicts)
     return {
@@ -214,38 +211,7 @@ def pair_derivations(
     }
 
 
-def _third_round_pairs(derivations: Mapping[Pair, _rubric.Derivation]) -> list[Pair]:
-    """The pairs only a third rater can unblock; an unrated decisive binary is refused."""
-    return _rounds.third_round_blockers(
-        (entry_id, derivation) for (entry_id, _), derivation in derivations.items())
-
-
-def pairs_reading_loss(derivations: Mapping[Pair, _rubric.Derivation]) -> set[Pair]:
-    """The pairs whose derivation consumes LOSS, or leaves it unclear."""
-    loss = _rubric.Binary.LOSS
-    return {
-        pair for pair, derivation in derivations.items()
-        if isinstance(derivation, _rubric.Decided)
-        and any(binary == loss for _, binary in derivation.consumed)
-        or isinstance(derivation, _rubric.Unclear)
-        and any(binary == loss for _, binary in derivation.binaries)
-    }
-
-
-def _refuse_loss_outside_the_latest_rerate(
-    key: Mapping[str, Any], derivations: Mapping[Pair, _rubric.Derivation],
-) -> None:
-    """Once any rerate is keyed, every pair reading LOSS must be one the latest rerate re-rated."""
-    rerates = key.get('rerates', ())
-    if not rerates:
-        return
-    outside = sorted(pairs_reading_loss(derivations) - {tuple(pair) for pair in rerates[-1]['pairs']})
-    if outside:
-        raise ValueError(f'pairs read LOSS but the latest re-rate ({rerates[-1]["version"]}) did not'
-                         ' re-rate them:\n' + '\n'.join(f'{entry} {target}' for entry, target in outside))
-
-
-def _refuse_incomplete(derivations: Mapping[Pair, _rubric.Derivation]) -> None:
+def _refuse_incomplete(derivations: Mapping[_rounds.Pair, _rubric.Derivation]) -> None:
     gaps = [
         f'{gap.kind} {entry_id} {gap.target_id} {gap.binary}'
         for (entry_id, _), derivation in sorted(derivations.items())
@@ -258,7 +224,7 @@ def _refuse_incomplete(derivations: Mapping[Pair, _rubric.Derivation]) -> None:
 
 def _summary(
     inputs: _Inputs, key: Mapping[str, Any], rated: _rounds.Rated,
-    verdicts: Sequence[Mapping[str, Any]], derivations: Mapping[Pair, _rubric.Derivation],
+    verdicts: Sequence[Mapping[str, Any]], derivations: Mapping[_rounds.Pair, _rubric.Derivation],
 ) -> dict[str, Any]:
     decided = {pair: d for pair, d in derivations.items() if isinstance(d, _rubric.Decided)}
     consumed = [
@@ -400,33 +366,14 @@ def _third_command(args: argparse.Namespace) -> dict[str, Any]:
     rounds = _Rounds.read(args)
     derivations = pair_derivations(rounds.inputs.rows(), rounds.finished().rows)
     return _rounds.third_round(rounds.scratch, rounds.key, rounds.inputs.entries(),
-                               _third_round_pairs(derivations))
+                               _rounds.third_round_blockers(derivations))
 
 
 def _rerate_command(args: argparse.Namespace) -> dict[str, Any]:
     rounds = _Rounds.read(args)
-    entries = rounds.inputs.entries()
-    rerate = _rounds.keyed_rerate(rounds.key, args.brief_version, args.brief)
-    new_shards: dict[str, dict[str, int]] = {}
-    if rerate is None:
-        rated = rounds.finished()
-        pending = _third_round_pairs(pair_derivations(rounds.inputs.rows(), rated.rows))
-        if pending:
-            raise ValueError('run third until it shards nothing before a rerate; pairs awaiting'
-                             f' a third rater: {pending}')
-        selected = _rounds.loss_consuming_pairs(rated.rows)
-        rerate = _rounds.rerate_round(rounds.scratch, rounds.key, entries, selected,
-                                      version=args.brief_version)
-        for name in rerate['shards']:
-            spec = rounds.key['shards'][name]
-            new_shards.setdefault(spec['role'], {})[name] = len(spec['items'])
-    rendered = rounds.scratch.render_missing(rounds.key, entries)
-    (args.scratch / 'rater_prompt.md').write_text(_rounds.rater_prompt(args.brief))
-    return {
-        'version': rerate['version'], 'round': rerate['round'], 'pairs': len(rerate['pairs']),
-        'retires_third_raters': rerate['retires_third_raters'],
-        'new_shards': new_shards, 'rendered_again': rendered,
-    }
+    return _rounds.ensure_rerate(
+        rounds.scratch, rounds.key, rounds.inputs.entries(), version=args.brief_version,
+        derivations=lambda: pair_derivations(rounds.inputs.rows(), rounds.finished().rows))
 
 
 def _assemble_command(args: argparse.Namespace) -> dict[str, Any]:
@@ -438,7 +385,7 @@ def _assemble_command(args: argparse.Namespace) -> dict[str, Any]:
     rows = rounds.inputs.rows()
     derivations = pair_derivations(rows, verdicts)
     _refuse_incomplete(derivations)
-    _refuse_loss_outside_the_latest_rerate(rounds.key, derivations)
+    _rounds.refuse_loss_outside_the_latest_rerate(rounds.key, derivations)
     summary = _summary(rounds.inputs, rounds.key, rated, verdicts, derivations)
     out: Path = args.out_dir
     out.mkdir(parents=True, exist_ok=True)

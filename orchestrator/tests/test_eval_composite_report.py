@@ -1,70 +1,20 @@
 """Tests for evals/report.py — the C4 composite report surface (task 2477 λ).
 
-Covers the statistics substrate (mean_ci95, _ratio_score), the per-config
-price table, the composite report over the UNION of configs (retiring the
-all-tasks-intersection collapse), its deterministic renderer, and the
-union-aggregation of Elo ratings.
+Covers _ratio_score, the composite report over the UNION of configs (retiring
+the all-tasks-intersection collapse) and its deterministic renderer. The leaves
+report.py builds on are tested beside them: test_eval_stats, test_eval_prices,
+test_eval_table_render, test_eval_cell_admission and test_eval_elo_report.
 """
 
 from __future__ import annotations
 
 import logging
-from math import sqrt
 
 import pytest
 
 # ---------------------------------------------------------------------------
-# Task 2477 step-05: mean_ci95 (Student-t small-sample CI) + _ratio_score
+# Task 2477 step-05: _ratio_score
 # ---------------------------------------------------------------------------
-
-class TestMeanCI95:
-    """Small-sample Student-t two-sided 95% CI, stdlib-only (no scipy/numpy)."""
-
-    def test_three_values_student_t_interval(self):
-        from orchestrator.evals.report import mean_ci95
-
-        out = mean_ci95([0.4, 0.5, 0.6])
-        assert out['mean'] == pytest.approx(0.5)
-        assert out['n'] == 3
-        assert out['sufficient'] is True
-
-        # Hand-computed: stdev(ddof=1) == 0.1; t(df=2, 0.975) == 4.303;
-        # half-width == 4.303 * 0.1 / sqrt(3) == 0.24843…
-        half = 4.303 * 0.1 / sqrt(3)
-        assert out['lo'] == pytest.approx(0.5 - half, abs=1e-3)
-        assert out['hi'] == pytest.approx(0.5 + half, abs=1e-3)
-        # Cross-check the plan's stated endpoints.
-        assert out['lo'] == pytest.approx(0.2515, abs=1e-3)
-        assert out['hi'] == pytest.approx(0.7485, abs=1e-3)
-
-    def test_single_value_has_no_interval(self):
-        from orchestrator.evals.report import mean_ci95
-
-        out = mean_ci95([0.5])
-        assert out['mean'] == pytest.approx(0.5)
-        assert out['n'] == 1
-        assert out['sufficient'] is False
-        # No CI for n<2 → the interval collapses to the point estimate.
-        assert out['lo'] == pytest.approx(0.5)
-        assert out['hi'] == pytest.approx(0.5)
-
-    def test_empty_is_zero_and_insufficient(self):
-        from orchestrator.evals.report import mean_ci95
-
-        out = mean_ci95([])
-        assert out['mean'] == 0.0
-        assert out['n'] == 0
-        assert out['sufficient'] is False
-
-    def test_two_values_has_interval_but_insufficient(self):
-        """n==2 → a CI IS computed, but 'sufficient' stays False (decision 10)."""
-        from orchestrator.evals.report import mean_ci95
-
-        out = mean_ci95([0.4, 0.6])
-        assert out['n'] == 2
-        assert out['sufficient'] is False
-        assert out['lo'] < out['mean'] < out['hi']
-
 
 class TestRatioScore:
     """best/value normalization, single-config-safe, clamped to [0, 1]."""
@@ -94,127 +44,6 @@ class TestRatioScore:
 
         # A value BETTER than 'best' (best/value > 1) clamps down to 1.0.
         assert _ratio_score(0.5, 1.0) == 1.0
-
-
-# ---------------------------------------------------------------------------
-# Task 2477 step-07: build_price_table — per-config C4 price table
-# ---------------------------------------------------------------------------
-
-def _cfg(name, model, role='implementer'):
-    from orchestrator.evals.configs import EvalConfig
-    from orchestrator.evals.metrics import RoleUnderTest
-
-    return EvalConfig(
-        name=name, backend='claude', model=model, effort='high', role=RoleUnderTest(role),
-    )
-
-
-class TestBuildPriceTable:
-    """{config_name: {role: {input_per_1m, output_per_1m}}} pulled from prices
-    by model — an unlisted model yields an EXPLICIT unpriced marker, never a
-    silently fabricated price.
-    """
-
-    def test_priced_configs_map_role_to_price_entry(self):
-        from orchestrator.evals.report import build_price_table
-
-        prices = {
-            'model-x': {'input_per_1m': 2.0, 'output_per_1m': 8.0},
-            'model-y': {'input_per_1m': 1.0, 'output_per_1m': 4.0},
-        }
-        configs = [
-            _cfg('cfg-a', 'model-x', role='implementer'),
-            _cfg('cfg-b', 'model-y', role='architect'),
-        ]
-        table = build_price_table(configs, prices)
-        assert table['cfg-a'] == {
-            'implementer': {'input_per_1m': 2.0, 'output_per_1m': 8.0},
-        }
-        assert table['cfg-b'] == {
-            'architect': {'input_per_1m': 1.0, 'output_per_1m': 4.0},
-        }
-
-    def test_unlisted_model_gets_explicit_unpriced_marker(self):
-        from orchestrator.evals.report import build_price_table
-
-        prices = {'model-x': {'input_per_1m': 2.0, 'output_per_1m': 8.0}}
-        configs = [_cfg('cfg-z', 'unlisted-model', role='implementer')]
-        table = build_price_table(configs, prices)
-        entry = table['cfg-z']['implementer']
-        # An EXPLICIT marker, NOT a fabricated price.
-        assert 'input_per_1m' not in entry
-        assert entry.get('source') == 'unpriced'
-
-    def test_accepts_price_entry_objects(self):
-        from orchestrator.config import PriceEntry
-        from orchestrator.evals.report import build_price_table
-
-        prices = {'model-x': PriceEntry(input_per_1m=2.0, output_per_1m=8.0)}
-        table = build_price_table([_cfg('cfg-a', 'model-x')], prices)
-        assert table['cfg-a']['implementer'] == {
-            'input_per_1m': 2.0, 'output_per_1m': 8.0,
-        }
-
-    def test_deterministic_sorted_config_keys(self):
-        from orchestrator.evals.report import build_price_table
-
-        prices = {'m': {'input_per_1m': 1.0, 'output_per_1m': 2.0}}
-        configs = [_cfg('z', 'm'), _cfg('a', 'm'), _cfg('m', 'm')]
-        table = build_price_table(configs, prices)
-        assert list(table.keys()) == ['a', 'm', 'z']
-
-
-# ---------------------------------------------------------------------------
-# Task 2478 μ (amend): build_pairwise_price_table — the combined arch+impl
-# price table for the end-to-end (matrix/confirm) stages. Keyed to match
-# run_end_to_end's ``f'{arch.name}+{impl.name}'`` config_name so the rendered
-# price section aligns with the end-to-end composite rows (was individual-keyed).
-# ---------------------------------------------------------------------------
-
-class TestBuildPairwisePriceTable:
-    """{arch+impl: {architect: entry, implementer: entry}} — one combined-name
-    entry per (architect, implementer) pair, carrying BOTH roles' rates.
-    """
-
-    def test_pair_keys_combined_name_with_both_roles(self):
-        from orchestrator.evals.report import build_pairwise_price_table
-
-        prices = {
-            'arch-model': {'input_per_1m': 3.0, 'output_per_1m': 12.0},
-            'impl-model': {'input_per_1m': 1.0, 'output_per_1m': 4.0},
-        }
-        arch = _cfg('architect-x', 'arch-model', role='architect')
-        impl = _cfg('impl-y', 'impl-model', role='implementer')
-        table = build_pairwise_price_table([(arch, impl)], prices)
-        # Key is the combined name run_end_to_end stamps; both roles present.
-        assert table == {
-            'architect-x+impl-y': {
-                'architect': {'input_per_1m': 3.0, 'output_per_1m': 12.0},
-                'implementer': {'input_per_1m': 1.0, 'output_per_1m': 4.0},
-            }
-        }
-
-    def test_unlisted_model_gets_explicit_unpriced_marker(self):
-        from orchestrator.evals.report import build_pairwise_price_table
-
-        arch = _cfg('a', 'unlisted', role='architect')
-        impl = _cfg('b', 'unlisted', role='implementer')
-        table = build_pairwise_price_table([(arch, impl)], {})
-        # EXPLICIT marker for each role, never a fabricated price.
-        assert table['a+b']['architect'] == {'source': 'unpriced'}
-        assert table['a+b']['implementer'] == {'source': 'unpriced'}
-
-    def test_deterministic_sorted_combined_keys(self):
-        from orchestrator.evals.report import build_pairwise_price_table
-
-        prices = {'m': {'input_per_1m': 1.0, 'output_per_1m': 2.0}}
-        i1 = _cfg('impl-b', 'm', role='implementer')
-        pairs = [
-            (_cfg('arch-z', 'm', role='architect'), i1),
-            (_cfg('arch-a', 'm', role='architect'), i1),
-        ]
-        table = build_pairwise_price_table(pairs, prices)
-        assert list(table.keys()) == ['arch-a+impl-b', 'arch-z+impl-b']
 
 
 # ---------------------------------------------------------------------------
@@ -581,8 +410,8 @@ class TestBuildCompositeReport:
         The composite row is the surface ``select_survivors`` ranks on, so a
         fabricated 0 here reads as "this candidate's plan_quality was fully
         validity-bounded" for a corpus in which nothing bounded it — the same
-        inversion ``report._judged_blind_count`` refuses per config, and which
-        task 3632's campaign script inherits by consuming that count rather
+        inversion ``cell_admission.judged_blind_count`` refuses per config, and
+        which task 3632's campaign script inherits by consuming that count rather
         than deriving its own (reviewer: architecture-coherence).
         """
         from orchestrator.evals.report import build_composite_report
@@ -1649,7 +1478,8 @@ class TestPlanRateIsTheReliabilityColumn:
         A fabricated ``0.0`` would slander a config that never ran an architect
         cell ("it never planned"); a fabricated ``1.0`` would flatter it ("it
         always planned"). Only ``None`` says the true thing: we measured
-        nothing (``_mean_plan_quality`` / ``_optional_float_cell`` precedent).
+        nothing (``cell_admission.mean_plan_quality`` /
+        ``table_render.optional_float_cell`` precedent).
         """
         from orchestrator.evals.report import build_composite_report
 
@@ -1672,8 +1502,8 @@ class TestBothSurfacesReportTheSamePlanRate:
     hold (``n`` / ``no_plan``). Deriving it twice would leave two tables free to
     answer the reliability question differently — the "two exclusion surfaces
     that disagree are worse than one" hazard this module repeatedly closes, most
-    recently by :func:`_mean_plan_quality` (task 3099) and
-    :func:`_plan_quality_score` (task 3302).
+    recently by :func:`cell_admission.mean_plan_quality` (task 3099) and
+    :func:`cell_admission.plan_quality_score` (task 3302).
     """
 
     def test_the_theta_aggregate_carries_the_same_hand_computed_rate(self):
@@ -1802,9 +1632,10 @@ class TestCostPerUsablePlan:
         """One admission decision sources both numerator and denominator.
 
         A refused cell's recorded $0.00 is the price of a run that never
-        happened, not a measurement — the same reason ``_is_unmeasurable`` keeps
-        it out of the ``cost`` pool. Letting it into the numerator would DILUTE
-        $/plan with a free run, reporting the cap window as a discount.
+        happened, not a measurement — the same reason
+        ``cell_admission.is_unmeasurable`` keeps it out of the ``cost`` pool.
+        Letting it into the numerator would DILUTE $/plan with a free run,
+        reporting the cap window as a discount.
         """
         from orchestrator.evals.report import build_composite_report
 
@@ -1984,14 +1815,15 @@ class TestTheReliabilityColumnsAreRendered:
 class TestTheDiscardedJudgeScoreIsLoggedNotSwallowed:
     """The floor DISCARDS a persisted LLM-judge score — loudly, or not at all.
 
-    `_plan_quality_score`'s warning is the ONLY runtime signal that a number
-    written to disk was overridden at read time, and the two-scorer disagreement
-    it reports (Graphiti e2066ec6) is exactly what an operator needs to see. An
-    untested log line is a log line a refactor deletes (reviewer: test-coverage);
-    these also exercise the `where=` plumbing that exists solely to serve it.
+    `cell_admission.plan_quality_score`'s warning is the ONLY runtime signal
+    that a number written to disk was overridden at read time, and the
+    two-scorer disagreement it reports (Graphiti e2066ec6) is exactly what an
+    operator needs to see. An untested log line is a log line a refactor deletes
+    (reviewer: test-coverage); these also exercise the `where=` plumbing that
+    exists solely to serve it.
     """
 
-    _LOGGER = 'orchestrator.evals.report'
+    _LOGGER = 'orchestrator.evals.cell_admission'
 
     @staticmethod
     def _floor_records(caplog):
@@ -2060,8 +1892,8 @@ class TestTheDiscardedJudgeScoreIsLoggedNotSwallowed:
         """Each surface reports the floor decisions IT made: the accessor is
         pure, so the warning belongs to the build that read the cell. The CLI
         builds both, so a floored cell warns once per surface — documented on
-        :func:`_plan_quality_score`, and pinned here so the count is a decision
-        rather than an accident.
+        :func:`cell_admission.plan_quality_score`, and pinned here so the count
+        is a decision rather than an accident.
         """
         from orchestrator.evals.report import build_plan_quality_report
 
@@ -2448,104 +2280,6 @@ class TestFormatCompositeTable:
 
         report = self._arch_report()
         assert format_composite_table(report) == format_composite_table(report)
-
-
-# ---------------------------------------------------------------------------
-# _render_fixed_table — the ONE home for the width-computed ljust idiom every
-# deterministic table above shares (task 3118 amendment). It was copied five
-# times, and that duplication is what let the '-'-not-'0.0000' rstrip fix land
-# in only two of the copies. Pinned here so the shared contract can't drift.
-# ---------------------------------------------------------------------------
-
-class TestRenderFixedTable:
-    _COLUMNS = ('name', 'score')
-
-    def test_widths_are_max_of_header_and_cells(self):
-        from orchestrator.evals.report import _render_fixed_table
-
-        lines = _render_fixed_table(
-            self._COLUMNS,
-            [{'name': 'a-very-long-config', 'score': '1.0000'}],
-            header='demo:',
-        )
-        assert lines[0] == 'demo:'
-        # The header cell is padded out to the widest row cell, so the columns
-        # line up; the dashes rule matches those same widths.
-        assert lines[1].startswith('name'.ljust(len('a-very-long-config')))
-        assert len(lines[2].split('  ')[0]) == len('a-very-long-config')
-        assert lines[3].startswith('a-very-long-config')
-
-    def test_trailing_padding_is_stripped(self):
-        # Invisible trailing whitespace makes an otherwise-identical table
-        # differ byte-for-byte, and it hides a line's real ending — the
-        # per-config mean block asserts on a trailing '-' meaning "nothing
-        # scored", which must never read as 0.0000.
-        from orchestrator.evals.report import _render_fixed_table
-
-        lines = _render_fixed_table(
-            self._COLUMNS,
-            [{'name': 'a', 'score': 'a-long-score-cell'}, {'name': 'b', 'score': '-'}],
-            header='demo:',
-        )
-        assert all(ln == ln.rstrip() for ln in lines)
-        assert lines[-1].endswith('-')
-
-    def test_empty_rows_still_render_headers_and_rule(self):
-        # No rows must not mean no table: the header/rule still render at the
-        # header widths rather than raising on the max() of an empty sequence.
-        from orchestrator.evals.report import _render_fixed_table
-
-        lines = _render_fixed_table(self._COLUMNS, [], header='demo:')
-        assert lines[0] == 'demo:'
-        assert lines[1] == 'name  score'
-        assert lines[2] == '----  -----'
-        assert len(lines) == 3
-
-    def test_header_is_optional(self):
-        from orchestrator.evals.report import _render_fixed_table
-
-        lines = _render_fixed_table(self._COLUMNS, [])
-        assert lines[0] == 'name  score'
-
-
-# ---------------------------------------------------------------------------
-# Task 2477 step-13: compute_aggregate_ratings — UNION, not intersection.
-# ---------------------------------------------------------------------------
-
-class TestAggregateRatingsUnion:
-    """The April all-tasks-INTERSECTION collapse is retired: the aggregate
-    leaderboard spans the UNION of configs, each averaged over only the tasks in
-    which it actually appears.
-    """
-
-    def _state(self):
-        from orchestrator.evals.elo import JudgeState, TaskPool
-
-        return JudgeState(per_task={
-            't1': TaskPool(ratings={'A': 1100.0, 'B': 1000.0, 'C': 900.0}),
-            't2': TaskPool(ratings={'A': 1200.0, 'B': 1050.0}),
-        })
-
-    def test_union_includes_config_present_in_only_one_task(self):
-        from orchestrator.evals.report import compute_aggregate_ratings
-
-        agg = compute_aggregate_ratings(self._state())
-        # C ran ONLY in t1 but MUST survive — no collapse-to-2-entries.
-        assert set(agg.keys()) == {'A', 'B', 'C'}
-
-    def test_aggregate_is_mean_over_tasks_where_config_appears(self):
-        from orchestrator.evals.report import compute_aggregate_ratings
-
-        agg = compute_aggregate_ratings(self._state())
-        assert agg['A'] == pytest.approx(1150.0)   # mean(1100, 1200)
-        assert agg['B'] == pytest.approx(1025.0)   # mean(1000, 1050)
-        assert agg['C'] == pytest.approx(900.0)    # only t1 → its t1 rating
-
-    def test_empty_state_is_empty(self):
-        from orchestrator.evals.elo import JudgeState
-        from orchestrator.evals.report import compute_aggregate_ratings
-
-        assert compute_aggregate_ratings(JudgeState(per_task={})) == {}
 
 
 # ---------------------------------------------------------------------------

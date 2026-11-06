@@ -228,7 +228,7 @@ def _run_probe(probe: pathlib.Path) -> subprocess.CompletedProcess[str]:
         )
 
 
-@pytest.mark.timeout(120)
+@pytest.mark.timeout(300)
 def test_root_bound_run_resolves_a_per_test_timeout(root_bound_probe: pathlib.Path) -> None:
     """RUN pytest from the repo root and ask the session what cap it resolved.
 
@@ -242,10 +242,11 @@ def test_root_bound_run_resolves_a_per_test_timeout(root_bound_probe: pathlib.Pa
 
     The explicit ``@pytest.mark.timeout`` is not decoration. This guard is about
     the suite's default per-test budget, so it must never be able to SIT on that
-    default — 120s TIGHTENS rather than raises (the scripts verify leg passes
-    ``--timeout=300``), and a probe that runs one trivial test has no business
-    taking two minutes even behind a pytest startup on a loaded 32-core host.
-    Same reasoning as ``test_merge_gate_parallelism_config.py``'s probes.
+    default. What fails a wedged probe fast is ``PROBE_SUBPROCESS_TIMEOUT_SECS``,
+    which surfaces a ``TimeoutExpired`` carrying the child's output. The marker
+    equals verify's own ``--timeout=300`` so it does not invert that budget and
+    clamp the merge-gating leg; why is in
+    ``shared/src/shared/testing_timeout_markers.py``.
 
     MEASURED RED at base ``832d6faf16``: the probe resolved
     ``inipath=<repo>/pyproject.toml`` with ``getini('timeout') == ''`` and
@@ -313,7 +314,7 @@ def _listing(root: pathlib.Path) -> list[str]:
     return sorted(str(p.relative_to(root)) for p in root.rglob('*'))
 
 
-@pytest.mark.timeout(120)
+@pytest.mark.timeout(300)
 def test_the_root_bound_probe_leaves_the_hosts_default_temp_root_untouched(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -387,6 +388,27 @@ def _pytest_ini_options(pyproject: pathlib.Path) -> dict | None:
     return pytest_table['ini_options']
 
 
+def workspace_members() -> list[str]:
+    """``[tool.uv.workspace].members`` from the root pyproject.toml, never empty.
+
+    The members read shared by this file's sweeps and
+    ``test_timeout_method_policy.py``'s, so for those two files the read and its
+    anti-vacuity guard have a single home.
+    """
+    root_pyproject = REPO_ROOT / 'pyproject.toml'
+    root_data = tomllib.loads(root_pyproject.read_text(encoding='utf-8'))
+    members = root_data.get('tool', {}).get('uv', {}).get('workspace', {}).get('members', [])
+
+    # A typo'd key here would make every discovery loop iterate nothing and turn
+    # every sweep built on it into a silent pass.
+    assert members, (
+        '[tool.uv.workspace].members is empty or missing in the root '
+        'pyproject.toml — this guard reads it to discover which subprojects to '
+        'check, so it would otherwise pass vacuously.'
+    )
+    return members
+
+
 def discovered_pytest_configs() -> dict[str, dict]:
     """Every pyproject.toml in this repo declaring ``[tool.pytest.ini_options]``.
 
@@ -395,23 +417,13 @@ def discovered_pytest_configs() -> dict[str, dict]:
     defect this file guards against is a config that nobody remembered to give a
     cap, and a hand-written list is the same class of forgetting.
 
-    Both anti-vacuity guards live HERE rather than in each caller, because they
-    are properties of DISCOVERY and every sweep in this file depends on them.
+    Both anti-vacuity guards — ``workspace_members``'s non-empty read and the
+    config-count floor below — live in discovery rather than in each caller,
+    because they are properties of DISCOVERY and every sweep in this file
+    depends on them.
     """
-    root_pyproject = REPO_ROOT / 'pyproject.toml'
-    root_data = tomllib.loads(root_pyproject.read_text(encoding='utf-8'))
-    members = root_data.get('tool', {}).get('uv', {}).get('workspace', {}).get('members', [])
-
-    # A typo'd key here would make the loop below iterate nothing and turn every
-    # sweep in this file into a silent pass.
-    assert members, (
-        '[tool.uv.workspace].members is empty or missing in the root '
-        'pyproject.toml — this guard reads it to discover which subprojects to '
-        'check, so it would otherwise pass vacuously.'
-    )
-
     configs: dict[str, dict] = {}
-    for name in [ROOT_CONFIG_NAME, *members]:
+    for name in [ROOT_CONFIG_NAME, *workspace_members()]:
         ini_options = _pytest_ini_options(REPO_ROOT / name / 'pyproject.toml')
         if ini_options is not None:
             configs[name] = ini_options
@@ -498,12 +510,10 @@ def test_every_pytest_config_declares_a_supported_timeout_method() -> None:
     and for the ROOT config that is every root-bound invocation in the repo.
 
     Which method each config declares is deliberately NOT asserted: `signal` and
-    `thread` are a live trade with measured evidence on both sides
-    (``fused-memory/pyproject.toml`` records signal proving unreliable under
-    xdist workers; ``escalation/pyproject.toml`` records signal measured green
-    under the identical flags), and pinning a winner here would settle that trade
-    by guard rather than by measurement. This asserts only that the declared
-    value is one pytest-timeout will accept.
+    `thread` are a trade owned, with its measurement, by
+    ``tests/scripts/test_timeout_method_policy.py``, and pinning a winner here
+    would settle that trade by guard rather than by measurement. This asserts
+    only that the declared value is one pytest-timeout will accept.
     """
     declared = {
         name: ini_options['timeout_method']

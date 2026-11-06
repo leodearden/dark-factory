@@ -1,0 +1,18 @@
+{
+  "task_id": "5307",
+  "reason": "Net-additive test (task 5307): test_run_thin_warm_lane_live_ref.py gains test_a_successful_thin_logs_the_scripts_stderr, which drives the real shipped thin-warm-lane.sh through GitOps._run_thin_warm_lane exactly like the file's existing live-reference test (+1 private read). It pins the new rc=0 stderr logging so a fail-open /proc scan's DEGRADED warning reaches dark-factory's log; release_warm_lane would need a configured pool and git lane and emits unrelated WARNINGs.",
+  "measures": [
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_run_thin_warm_lane_live_ref.py",
+      "baseline": 2,
+      "current": 3
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6383,
+      "current": 6384
+    }
+  ]
+}

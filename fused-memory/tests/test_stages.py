@@ -13,6 +13,7 @@ import pytest
 import pytest_asyncio
 from _flag_for_stage2_pool_fake import LiveFlagPool
 from _fm_helpers import (
+    LoopFreedomProbe,
     as_async_run_git,
     assert_id_title_pairing,
     complete_paged_read,
@@ -79,6 +80,7 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
     _FLAG_FOR_STAGE2_MEM0_MAX_AGE_DAYS,
     _FLAG_FOR_STAGE2_TASKLESS_MAX_AGE_DAYS,
     _FLAGGED_ITEMS_CHAR_BUDGET,
+    STAGE1_FLAG_MARKER_MEM0_MAX_AGE_DAYS,
     IntegrityCheck,
     TaskKnowledgeSync,
     _format_flagged,
@@ -89,6 +91,7 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
     _select_proactive_sample,
     _suppress_same_run_human_operator_dups,
     _sweep_stale_mem0_flag_for_stage2_markers,
+    _sweep_stale_mem0_flag_markers,
     queue_briefing_refresh_tasks,
     retire_flag_markers_for_terminal_task,
     select_tasks_needing_hint_attention,
@@ -226,6 +229,10 @@ _REVIEWED_STAGE_SAFE = {
     # an id for and reads no per-task state, so against the reconciliation
     # queue it can only ever answer "not found" — never a categorical [].
     'mcp__escalation__amend_escalation',
+    # claim_policy_class (task 8422) refuses every identity except the
+    # escalation executor, so a recon stage can only ever be refused; it reads
+    # no per-task state.
+    'mcp__escalation__claim_policy_class',
     'mcp__escalation__claim_warm_worktree',
     # clear_verify_host_quarantine (task 6565) is merge-lane control plane: it
     # re-admits a benched verify host and reads no per-task escalation state.
@@ -6109,7 +6116,7 @@ class TestMemoryConsolidatorFlagDedup:
         with (
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                 new=dedup_mock,
             ),
         ):
@@ -6155,7 +6162,7 @@ class TestMemoryConsolidatorFlagDedup:
         with (
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                 new=dedup_mock,
             ),
         ):
@@ -6233,11 +6240,11 @@ class TestMemoryConsolidatorTerminalMetadataFilter:
         with (
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                 new=_dedup_spy,
             ),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.filter_false_absence_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.filter_false_absence_flags',
                 new=AsyncMock(side_effect=lambda taskmaster, project_root, flags: flags),
             ),
         ):
@@ -6341,15 +6348,15 @@ class TestMemoryConsolidatorStaleBulkGetStatusesFilter:
         with (
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                 new=_dedup_spy,
             ),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.filter_false_absence_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.filter_false_absence_flags',
                 new=AsyncMock(side_effect=lambda taskmaster, project_root, flags: flags),
             ),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.acknowledge_resolved_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.acknowledge_resolved_flags',
                 new=ack_mock,
             ),
         ):
@@ -6424,7 +6431,7 @@ async def _run_consolidator_filter_chain(
         return kwargs.get('flags', [])
 
     ack_mock = AsyncMock(return_value=1)
-    module = 'fused_memory.reconciliation.stages.memory_consolidator'
+    module = 'fused_memory.reconciliation.stage1_flag_chain'
     with (
         patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
         patch(f'{module}.dedup_flags', new=_dedup_spy),
@@ -6693,15 +6700,15 @@ class TestMemoryConsolidatorFlagAcknowledgment:
         with (
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                 new=AsyncMock(side_effect=lambda **kwargs: kwargs.get('flags', [])),
             ),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.filter_false_absence_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.filter_false_absence_flags',
                 new=AsyncMock(side_effect=lambda taskmaster, project_root, flags: flags),
             ),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.acknowledge_resolved_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.acknowledge_resolved_flags',
                 new=ack_mock,
             ),
         ):
@@ -6755,15 +6762,15 @@ class TestMemoryConsolidatorFlagAcknowledgment:
         with (
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                 new=AsyncMock(side_effect=lambda **kwargs: kwargs.get('flags', [])),
             ),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.filter_false_absence_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.filter_false_absence_flags',
                 new=AsyncMock(side_effect=lambda taskmaster, project_root, flags: flags),
             ),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.acknowledge_resolved_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.acknowledge_resolved_flags',
                 new=ack_mock,
             ),
         ):
@@ -6859,15 +6866,15 @@ class TestMemoryConsolidatorFlagAcknowledgment:
         with (
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                 new=AsyncMock(side_effect=_fake_dedup),
             ),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.filter_false_absence_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.filter_false_absence_flags',
                 new=AsyncMock(side_effect=lambda taskmaster, project_root, flags: flags),
             ),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.acknowledge_resolved_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.acknowledge_resolved_flags',
                 new=ack_mock,
             ),
         ):
@@ -6947,15 +6954,15 @@ class TestMemoryConsolidatorFlagAcknowledgment:
         with (
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                 new=AsyncMock(side_effect=_fake_dedup),
             ),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.filter_false_absence_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.filter_false_absence_flags',
                 new=AsyncMock(side_effect=lambda taskmaster, project_root, flags: flags),
             ),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.acknowledge_resolved_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.acknowledge_resolved_flags',
                 new=ack_mock,
             ),
         ):
@@ -7020,7 +7027,7 @@ class TestMemoryConsolidatorStaleOperatorDetector:
 
         with (
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
-            patch('fused_memory.reconciliation.stages.memory_consolidator.dedup_flags', new=dedup_mock),
+            patch('fused_memory.reconciliation.stage1_flag_chain.dedup_flags', new=dedup_mock),
             patch('fused_memory.reconciliation.stages.memory_consolidator.track_human_operator_stalls', new=track_mock),
             patch('fused_memory.reconciliation.stages.memory_consolidator.compute_stalled_task_ids', new=compute_mock),
             patch('fused_memory.reconciliation.stages.memory_consolidator.maybe_escalate_stalled_tasks', new=escalate_mock),
@@ -7064,7 +7071,7 @@ class TestMemoryConsolidatorStaleOperatorDetector:
 
         with (
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
-            patch('fused_memory.reconciliation.stages.memory_consolidator.dedup_flags', new=dedup_mock),
+            patch('fused_memory.reconciliation.stage1_flag_chain.dedup_flags', new=dedup_mock),
             patch('fused_memory.reconciliation.stages.memory_consolidator.track_human_operator_stalls', new=track_mock),
             patch('fused_memory.reconciliation.stages.memory_consolidator.compute_stalled_task_ids', new=compute_mock),
             patch('fused_memory.reconciliation.stages.memory_consolidator.maybe_escalate_stalled_tasks', new=escalate_mock),
@@ -7099,7 +7106,7 @@ class TestMemoryConsolidatorStaleOperatorDetector:
 
         with (
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
-            patch('fused_memory.reconciliation.stages.memory_consolidator.dedup_flags', new=dedup_mock),
+            patch('fused_memory.reconciliation.stage1_flag_chain.dedup_flags', new=dedup_mock),
             patch('fused_memory.reconciliation.stages.memory_consolidator.track_human_operator_stalls', new=track_mock),
             patch('fused_memory.reconciliation.stages.memory_consolidator.maybe_escalate_stalled_tasks', new=escalate_mock),
         ):
@@ -7137,7 +7144,7 @@ class TestMemoryConsolidatorStaleOperatorDetector:
 
         with (
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
-            patch('fused_memory.reconciliation.stages.memory_consolidator.dedup_flags', new=dedup_mock),
+            patch('fused_memory.reconciliation.stage1_flag_chain.dedup_flags', new=dedup_mock),
             patch('fused_memory.reconciliation.stages.memory_consolidator.track_human_operator_stalls', new=track_mock),
             patch('fused_memory.reconciliation.stages.memory_consolidator.maybe_escalate_stalled_tasks', new=escalate_mock),
         ):
@@ -7174,7 +7181,7 @@ class TestMemoryConsolidatorStaleOperatorDetector:
 
         with (
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
-            patch('fused_memory.reconciliation.stages.memory_consolidator.dedup_flags', new=dedup_mock),
+            patch('fused_memory.reconciliation.stage1_flag_chain.dedup_flags', new=dedup_mock),
             patch('fused_memory.reconciliation.stages.memory_consolidator.track_human_operator_stalls', new=track_mock),
             patch('fused_memory.reconciliation.stages.memory_consolidator.maybe_escalate_stalled_tasks', new=escalate_mock),
         ):
@@ -9391,6 +9398,140 @@ class TestSweepStaleMem0FlagMarkers:
         messages = [rec.message for rec in scroll_cap_warnings]
         assert any("{'source': 'stage1_flag_marker'}" in m for m in messages)
         assert any("{'kind': 'stage1_flag_marker'}" in m for m in messages)
+
+
+_FOREIGN_KIND_NOW = datetime(2026, 10, 30, 12, 0, 0, tzinfo=UTC)
+_STAGE1_MARKER = 'stage1_flag_marker'
+
+
+def _stage1_member(mid: str, **metadata) -> dict:
+    """A stage1_flag_marker pool member far past the pool's age cutoff."""
+    age = timedelta(days=STAGE1_FLAG_MARKER_MEM0_MAX_AGE_DAYS + 30)
+    return {
+        'id': mid,
+        'created_at': (_FOREIGN_KIND_NOW - age).isoformat(),
+        'metadata': metadata,
+    }
+
+
+class TestSweepStaleMem0FlagMarkersWithholdsForeignKinds:
+    """The in-cycle stage1_flag_marker collector keeps foreign-kind records (task 6241).
+
+    A record declaring a kind other than ``stage1_flag_marker`` belongs to
+    another pool, whatever ``source`` it carries, so this collector and the
+    manual ``sweep_orphan_flag_markers.py`` agree on what the pool is.
+    """
+
+    @pytest.mark.asyncio
+    async def test_foreign_kind_is_kept_on_every_cycle_while_markers_drain(self):
+        pool = LiveFlagPool([
+            _stage1_member('canonical', source=_STAGE1_MARKER, kind=_STAGE1_MARKER),
+            _stage1_member('source-only', source=_STAGE1_MARKER),
+            _stage1_member('kind-only', kind=_STAGE1_MARKER),
+            _stage1_member(
+                'foreign', source=_STAGE1_MARKER, kind='unregistered_audit_log', task_id='452',
+            ),
+        ])
+
+        first = await _sweep_stale_mem0_flag_markers(
+            pool, 'dark_factory', 'r1', now=_FOREIGN_KIND_NOW,
+        )
+
+        assert first == 3
+        assert set(pool.deleted_ids()) == {'canonical', 'source-only', 'kind-only'}
+        assert 'foreign' in pool.members
+
+        second = await _sweep_stale_mem0_flag_markers(
+            pool, 'dark_factory', 'r2', now=_FOREIGN_KIND_NOW,
+        )
+
+        assert second == 0
+        assert len(pool.deleted_ids()) == 3
+        assert 'foreign' in pool.members
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('kind', [[_STAGE1_MARKER], {'nested': 'x'}])
+    async def test_unhashable_kind_is_kept_without_raising(self, kind):
+        pool = LiveFlagPool([
+            _stage1_member('canonical', source=_STAGE1_MARKER, kind=_STAGE1_MARKER),
+            _stage1_member('odd-kind', source=_STAGE1_MARKER, kind=kind),
+        ])
+
+        result = await _sweep_stale_mem0_flag_markers(
+            pool, 'dark_factory', 'r1', now=_FOREIGN_KIND_NOW,
+        )
+
+        assert result == 1
+        assert pool.deleted_ids() == ['canonical']
+        assert 'odd-kind' in pool.members
+
+    @pytest.mark.asyncio
+    async def test_one_aggregate_warning_and_per_record_debug(self, caplog):
+        pool = LiveFlagPool([
+            _stage1_member('foreign-alpha', source=_STAGE1_MARKER, kind='alpha_log'),
+            _stage1_member('foreign-beta', source=_STAGE1_MARKER, kind='beta_log'),
+            _stage1_member('canonical', source=_STAGE1_MARKER, kind=_STAGE1_MARKER),
+        ])
+
+        with caplog.at_level(logging.DEBUG, logger=_TKS_LOGGER):
+            result = await _sweep_stale_mem0_flag_markers(
+                pool, 'dark_factory', 'r1', now=_FOREIGN_KIND_NOW,
+            )
+
+        assert result == 1
+        tks_records = [r for r in caplog.records if r.name == _TKS_LOGGER]
+        foreign_warnings = [
+            r for r in tks_records
+            if r.levelno == logging.WARNING and 'foreign kind' in r.getMessage()
+        ]
+        assert len(foreign_warnings) == 1
+        message = foreign_warnings[0].getMessage()
+        assert 'RETAINED 2 ' in message
+        assert 'alpha_log' in message
+        assert 'beta_log' in message
+        assert '_sweep_stale_mem0_flag_markers' in message
+        assert 'foreign-alpha' not in message
+        assert 'foreign-beta' not in message
+        assert 'protected audit' not in message
+
+        debug_ids = sorted(
+            r.__dict__['memory_id'] for r in tks_records
+            if r.levelno == logging.DEBUG and 'foreign-kind' in r.getMessage()
+        )
+        assert debug_ids == ['foreign-alpha', 'foreign-beta']
+
+    @pytest.mark.asyncio
+    async def test_a_registered_audit_kind_is_attributed_as_audit_not_foreign(self, caplog):
+        pool = LiveFlagPool([
+            _stage1_member('audit', source=_STAGE1_MARKER, kind='cadence_check'),
+        ])
+
+        with caplog.at_level(logging.WARNING, logger=_TKS_LOGGER):
+            result = await _sweep_stale_mem0_flag_markers(
+                pool, 'dark_factory', 'r1', now=_FOREIGN_KIND_NOW,
+            )
+
+        assert result == 0
+        messages = [
+            r.getMessage() for r in caplog.records
+            if r.name == _TKS_LOGGER and r.levelno == logging.WARNING
+        ]
+        assert any('RETAINED 1 protected audit record(s)' in m for m in messages)
+        assert not any('foreign kind' in m for m in messages)
+
+    @pytest.mark.asyncio
+    async def test_the_wide_relay_pool_does_not_opt_in(self):
+        """The flag_for_stage2 pool is drained by its closure gate, not by pool kind."""
+        pool = LiveFlagPool([
+            _relay_marker('relay', _STALE_DAYS, task_id='T', kind='stage1_flag'),
+        ])
+
+        result = await _sweep_stale_mem0_flag_for_stage2_markers(
+            pool, 'dark_factory', 'r1', terminal_task_ids={'T'}, now=_RETIRE_NOW,
+        )
+
+        assert result == 1
+        assert pool.deleted_ids() == ['relay']
 
 
 class TestSweepStaleMem0FlagForStage2Markers:
@@ -17944,11 +18085,12 @@ class TestLiveWorkflowRenderIsNonBlocking:
     nothing else on the loop — health checks, heartbeats, MCP replies — could
     run at all.
 
-    The assertion is a TICKER: a coroutine incrementing a counter every 50 ms
-    runs concurrently with a render whose git probes each take real awaited
-    time. A non-blocking renderer lets the ticker keep ticking; a blocking one
-    pins it at ~0. This is what a `loop_lag`-style field could only report
-    after the fact.
+    The assertion is a loop-turn oracle: every stubbed git probe suspends on
+    fused-memory/tests/_fm_helpers.py::LoopFreedomProbe, which records whether
+    a marker queued on the test loop ran while that probe was suspended. A
+    renderer that ran its probes inline instead of awaiting them reads False.
+    It counts loop turns, never seconds, so host or GIL contention cannot red
+    it (task 5920 introduced the probe; task 5925 for this site).
     """
 
     _NOW = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
@@ -17975,50 +18117,28 @@ class TestLiveWorkflowRenderIsNonBlocking:
 
     @pytest.mark.asyncio
     async def test_render_does_not_starve_the_event_loop(self, monkeypatch):
-        import asyncio
-
         from shared.git_async import GitResult
 
         import fused_memory.reconciliation.live_workflow_section as lws_module
         from fused_memory.services import live_workflow_detector as lwd
 
-        probe_delay = 0.02
+        probe = LoopFreedomProbe()
         n_tasks = 20
 
         async def slow_run_git(cmd, cwd=None, *, input_text=None, timeout=None):
-            await asyncio.sleep(probe_delay)
+            await probe.suspend()
             return GitResult(returncode=1, stdout='', stderr='')
 
         monkeypatch.setattr(lwd, 'run_git', slow_run_git)
         monkeypatch.setattr(lws_module, 'is_orchestrator_live_for', lambda _pr: False)
 
-        ticks = 0
-        stop = False
-
-        async def ticker():
-            nonlocal ticks
-            while not stop:
-                await asyncio.sleep(0.005)
-                ticks += 1
-
-        tick_task = asyncio.create_task(ticker())
-        try:
-            await lws_module.render_live_workflow_section(
-                tasks=[{'id': str(i), 'status': 'pending'} for i in range(n_tasks)],
-                project_root=ProjectRoot('/p'),
-                now=self._NOW,
-            )
-        finally:
-            stop = True
-            tick_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await tick_task
-
-        assert ticks > 5, (
-            f'the loop was starved during the render — only {ticks} ticks fired '
-            f'while {n_tasks} tasks were probed; a non-blocking renderer must '
-            f'let other coroutines run'
+        await lws_module.render_live_workflow_section(
+            tasks=[{'id': str(i), 'status': 'pending'} for i in range(n_tasks)],
+            project_root=ProjectRoot('/p'),
+            now=self._NOW,
         )
+
+        probe.assert_loop_stayed_free()
 
 
 # ---------------------------------------------------------------------------
@@ -18121,15 +18241,15 @@ class TestMemoryConsolidatorEntityStandingDecision:
             with (
                 patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
                 patch(
-                    'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                    'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                     new=_dedup_spy,
                 ),
                 patch(
-                    'fused_memory.reconciliation.stages.memory_consolidator.filter_false_absence_flags',
+                    'fused_memory.reconciliation.stage1_flag_chain.filter_false_absence_flags',
                     new=AsyncMock(side_effect=lambda taskmaster, project_root, flags: flags),
                 ),
                 patch(
-                    'fused_memory.reconciliation.stages.memory_consolidator.acknowledge_resolved_flags',
+                    'fused_memory.reconciliation.stage1_flag_chain.acknowledge_resolved_flags',
                     new=AsyncMock(return_value=0),
                 ),
             ):
@@ -18176,15 +18296,15 @@ class TestMemoryConsolidatorEntityStandingDecision:
             with (
                 patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
                 patch(
-                    'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                    'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                     new=AsyncMock(side_effect=lambda **kwargs: kwargs.get('flags', [])),
                 ),
                 patch(
-                    'fused_memory.reconciliation.stages.memory_consolidator.filter_false_absence_flags',
+                    'fused_memory.reconciliation.stage1_flag_chain.filter_false_absence_flags',
                     new=AsyncMock(side_effect=lambda taskmaster, project_root, flags: flags),
                 ),
                 patch(
-                    'fused_memory.reconciliation.stages.memory_consolidator.acknowledge_resolved_flags',
+                    'fused_memory.reconciliation.stage1_flag_chain.acknowledge_resolved_flags',
                     new=ack_mock,
                 ),
             ):
@@ -18238,15 +18358,15 @@ class TestMemoryConsolidatorEntityStandingDecision:
             with (
                 patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
                 patch(
-                    'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                    'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                     new=AsyncMock(side_effect=lambda **kwargs: kwargs.get('flags', [])),
                 ),
                 patch(
-                    'fused_memory.reconciliation.stages.memory_consolidator.filter_false_absence_flags',
+                    'fused_memory.reconciliation.stage1_flag_chain.filter_false_absence_flags',
                     new=AsyncMock(side_effect=lambda taskmaster, project_root, flags: flags),
                 ),
                 patch(
-                    'fused_memory.reconciliation.stages.memory_consolidator.acknowledge_resolved_flags',
+                    'fused_memory.reconciliation.stage1_flag_chain.acknowledge_resolved_flags',
                     new=AsyncMock(return_value=0),
                 ),
             ):
@@ -18297,7 +18417,7 @@ class TestMemoryConsolidatorEntityStandingDecision:
         with (
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.'
+                'fused_memory.reconciliation.stage1_flag_chain.'
                 'filter_entity_standing_decisions',
                 new=esd_mock,
             ),
@@ -18363,15 +18483,15 @@ class TestMemoryConsolidatorSuppressionStreak:
                 BaseStage, 'run', new=AsyncMock(return_value=self._make_base_report(flags))
             ),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                 new=AsyncMock(side_effect=lambda **kwargs: kwargs.get('flags', [])),
             ),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.filter_false_absence_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.filter_false_absence_flags',
                 new=AsyncMock(side_effect=lambda taskmaster, project_root, flags: flags),
             ),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.acknowledge_resolved_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.acknowledge_resolved_flags',
                 new=AsyncMock(return_value=0),
             ),
         ):
@@ -18651,29 +18771,33 @@ class TestMemoryConsolidatorPreservationSpecimenGuard:
     def _full_cycle(base_report, **extra):
         """BaseStage.run stubbed to *base_report*, plus the filter-chain stubs.
 
+        An *extra* stub replaces the flag-chain stub of the same name; any other
+        name is stubbed in memory_consolidator.
+
         An ExitStack rather than a parenthesized ``with``: the stub set is built
         per test, and ``with (a, *stubs)`` parses as a TUPLE, not as a group of
         context managers.
         """
+        flag_chain = 'fused_memory.reconciliation.stage1_flag_chain'
+        consolidator = 'fused_memory.reconciliation.stages.memory_consolidator'
         stubs = {
-            'dedup_flags': AsyncMock(side_effect=lambda **kw: kw.get('flags', [])),
-            'filter_false_absence_flags': AsyncMock(
+            f'{flag_chain}.dedup_flags': AsyncMock(
+                side_effect=lambda **kw: kw.get('flags', []),
+            ),
+            f'{flag_chain}.filter_false_absence_flags': AsyncMock(
                 side_effect=lambda taskmaster, project_root, flags: flags,
             ),
-            'acknowledge_resolved_flags': AsyncMock(return_value=0),
+            f'{flag_chain}.acknowledge_resolved_flags': AsyncMock(return_value=0),
         }
-        stubs.update(extra)
+        for name, mock in extra.items():
+            owner = flag_chain if f'{flag_chain}.{name}' in stubs else consolidator
+            stubs[f'{owner}.{name}'] = mock
         with contextlib.ExitStack() as stack:
             stack.enter_context(
                 patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
             )
-            for name, mock in stubs.items():
-                stack.enter_context(
-                    patch(
-                        f'fused_memory.reconciliation.stages.memory_consolidator.{name}',
-                        new=mock,
-                    ),
-                )
+            for target, mock in stubs.items():
+                stack.enter_context(patch(target, new=mock))
             yield
 
     @pytest.mark.asyncio

@@ -8,11 +8,17 @@ import logging
 import os
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
-from _curator_helpers import agent_result, submit_as_one_batch, zot_agent_result
+from _curator_helpers import (
+    agent_result,
+    answer_each_with,
+    prepared,
+    submit_as_one_batch,
+    zot_agent_result,
+)
 from _fm_helpers import _init_git_repo, make_8df8_scenario, poll_until
 from _fm_helpers import submit_and_resolve as _submit_and_resolve
 from shared.async_sqlite_base import CheckpointResult
@@ -31,7 +37,6 @@ from fused_memory.middleware.curator_escalator import CuratorEscalator
 from fused_memory.middleware.curator_types import (
     CandidateTask,
     CuratorDecision,
-    CuratorFailureError,
     PreparedCandidate,
     RewrittenTask,
     is_combine_eligible_status,
@@ -382,14 +387,14 @@ async def test_add_task_persists_metadata_atomically(interceptor_facade, taskmas
     taskmaster.add_task.assert_called_once()
     kwargs = taskmaster.add_task.call_args.kwargs
     # Metadata forwarded as a JSON string (the MCP wire format).
-    assert kwargs.get('metadata') == json.dumps(metadata)
+    assert json.loads(kwargs['metadata']) == {**metadata, 'declared_scope': ANY}
     # No follow-up update_task for metadata — the atomic path wrote it.
     taskmaster.update_task.assert_not_called()
 
 
 @pytest.mark.asyncio
 async def test_add_task_metadata_string_passed_through(interceptor_facade, taskmaster):
-    """Pre-serialised metadata JSON is forwarded unchanged."""
+    """Pre-serialised metadata JSON reaches the backend as the same object, not double-encoded."""
     metadata_json = '{"escalation_id":"esc-1","suggestion_hash":"x"}'
     await _submit_and_resolve(
         interceptor_facade,
@@ -398,7 +403,7 @@ async def test_add_task_metadata_string_passed_through(interceptor_facade, taskm
         metadata=metadata_json,
     )
     kwargs = taskmaster.add_task.call_args.kwargs
-    assert kwargs.get('metadata') == metadata_json
+    assert json.loads(kwargs['metadata']) == {**json.loads(metadata_json), 'declared_scope': ANY}
 
 
 @pytest.mark.asyncio
@@ -406,9 +411,9 @@ async def test_add_task_without_metadata_skips_update(interceptor_facade, taskma
     """add_task without metadata does not call update_task."""
     await _submit_and_resolve(interceptor_facade, '/project', prompt='Test')
     taskmaster.update_task.assert_not_called()
-    # Backend still receives metadata=None kwarg but the value is falsy.
+    # The only metadata the backend receives is the submit-time declared_scope stamp.
     kwargs = taskmaster.add_task.call_args.kwargs
-    assert kwargs.get('metadata') in (None, '')
+    assert json.loads(kwargs['metadata']) == {'declared_scope': ANY}
 
 
 @pytest.mark.asyncio
@@ -455,7 +460,7 @@ async def test_add_task_falls_back_to_two_step_on_typeerror(event_buffer, tmp_pa
         tm.update_task.assert_called_once()
         kwargs = tm.update_task.call_args.kwargs
         assert kwargs['task_id'] == '7'
-        assert kwargs['metadata'] == json.dumps(metadata)
+        assert json.loads(kwargs['metadata']) == {**metadata, 'declared_scope': ANY}
     finally:
         await store.close()
         if interceptor is not None:
@@ -643,16 +648,10 @@ def curator_interceptor(make_curator_interceptor):
 def _mock_curator(decision: CuratorDecision) -> MagicMock:
     """Mock TaskCurator returning a fixed decision."""
     curator = MagicMock()
+    # The per-candidate verdict, so assertions on curator.curate (e.g.
+    # assert_called_once) count the candidates the worker curated.
     curator.curate = AsyncMock(return_value=decision)
-
-    # curate_batch delegates to curate() per candidate so that assertions on
-    # curator.curate (e.g. assert_called_once) continue to pass for tests that
-    # use the batch worker path.  The inner curate call uses the same AsyncMock,
-    # so call counts accumulate correctly.
-    async def _curate_batch(candidates, *a, **kw):
-        return [await curator.curate(c, *a, **kw) for c in candidates]
-
-    curator.curate_batch = AsyncMock(side_effect=_curate_batch)
+    answer_each_with(curator, curator.curate)
     curator.record_task = AsyncMock()
     curator.reembed_task = AsyncMock()
     # note_created is a plain sync method on the real TaskCurator.
@@ -7422,7 +7421,7 @@ async def test_set_task_status_does_not_block_during_add_task_curator(
     # headroom against scheduling jitter under host CPU oversubscription.
     CURATOR_LATENCY_S = 4.0
 
-    async def slow_curate(candidate, project_id, project_root):
+    async def slow_curate(candidate, *_args):
         await asyncio.sleep(CURATOR_LATENCY_S)
         # action='create' so the flow falls through to tm.add_task
         return CuratorDecision(
@@ -7431,14 +7430,10 @@ async def test_set_task_status_does_not_block_during_add_task_curator(
         )
 
     curator = MagicMock()
+    # The per-candidate verdict, so slow_curate is invoked and the
+    # latency-based assertion holds.
     curator.curate = AsyncMock(side_effect=slow_curate)
-
-    # curate_batch delegates to curate() so slow_curate is still invoked
-    # and the latency-based assertion holds.
-    async def _slow_curate_batch(candidates, pid, project_root):
-        return [await curator.curate(c, pid, project_root) for c in candidates]
-
-    curator.curate_batch = AsyncMock(side_effect=_slow_curate_batch)
+    answer_each_with(curator, curator.curate)
     curator.record_task = AsyncMock()
     curator.reembed_task = AsyncMock()
     curator.note_created = MagicMock()
@@ -8393,7 +8388,8 @@ class TestSubmitTaskGuardrail:
     ):
         """Persistence contract: submit_task for /dark-factory stores a row whose
         project_id is 'dark_factory' and whose candidate_json blob contains the
-        un-mutated kwargs (title, description) and metadata=None.
+        un-mutated kwargs (title, description) and metadata holding only the
+        submit-time declared_scope stamp.
 
         This is the single owning test for the candidate_json serialisation format;
         update here when the blob schema intentionally changes.
@@ -8437,8 +8433,8 @@ class TestSubmitTaskGuardrail:
         assert blob['kwargs']['description'] == 'harness deadlock', (
             f'Expected description in blob kwargs un-mutated, got: {blob["kwargs"].get("description")!r}'
         )
-        assert blob['metadata'] is None, (
-            f'Expected metadata=None in blob (no metadata was passed), got: {blob["metadata"]!r}'
+        assert blob['metadata'] == {'declared_scope': ANY}, (
+            f'Expected only the declared_scope stamp in blob metadata, got: {blob["metadata"]!r}'
         )
 
     @pytest.mark.asyncio
@@ -12205,7 +12201,7 @@ async def test_planning_mode_persists_human_decomposed_metadata(
     assert metadata_arg is not None
     decoded = json.loads(metadata_arg)
     assert decoded.pop('deferral')['kind'] == 'planning'
-    assert decoded == {'human_decomposed': True}
+    assert decoded == {'human_decomposed': True, 'declared_scope': ANY}
 
 
 @pytest.mark.asyncio
@@ -12226,6 +12222,7 @@ async def test_planning_mode_merges_caller_metadata(
         'source': 'planning-session',
         'files': ['m1', 'm2'],
         'human_decomposed': True,
+        'declared_scope': ANY,
     }
 
 
@@ -12243,7 +12240,7 @@ async def test_planning_mode_accepts_metadata_json_string(
     )
     decoded = json.loads(taskmaster.add_task.call_args.kwargs['metadata'])
     assert decoded.pop('deferral')['kind'] == 'planning'
-    assert decoded == {'escalation_id': 'esc-1', 'human_decomposed': True}
+    assert decoded == {'escalation_id': 'esc-1', 'human_decomposed': True, 'declared_scope': ANY}
 
 
 @pytest.mark.asyncio
@@ -14993,7 +14990,7 @@ async def test_dispatch_ticket_decision_candidate_key_collision_resolves_combine
         side_effect=DuplicateCandidateKeyError(existing_id=5, existing_status='pending'),
     )
 
-    status, task_id, reason, result_dict, degrade = await interceptor._dispatch_ticket_decision(
+    status, task_id, reason, result_dict = await interceptor._dispatch_ticket_decision(
         ticket_id='t1',
         project_root='/project',
         project_id=resolve_project_id('/project'),
@@ -15012,7 +15009,6 @@ async def test_dispatch_ticket_decision_candidate_key_collision_resolves_combine
     assert result_dict is not None, 'expected a result_dict, got None'
     assert result_dict.get('deduplicated') is True, result_dict
     assert result_dict.get('action') == 'candidate_key_collision', result_dict
-    assert degrade is None, f'expected no curator_degrade_reason; got {degrade!r}'
 
 
 # ── task 2085 step-13 RED: route_deterministic -> deterministic PURE-GATE stamping ──
@@ -15026,7 +15022,7 @@ async def test_dispatch_route_deterministic_creates_task_not_drop_or_combine(
     called exactly once and status=='created'. It never drops or combines,
     even though a route decision carries no target_id (mirrors a fresh
     'create' dispatch, not a dedup)."""
-    status, task_id, reason, result_dict, degrade = await interceptor._dispatch_ticket_decision(
+    status, task_id, reason, result_dict = await interceptor._dispatch_ticket_decision(
         ticket_id='t1',
         project_root='/project',
         project_id=resolve_project_id('/project'),
@@ -15157,7 +15153,7 @@ async def test_dispatch_drop_decision_unaffected_by_pure_gate_stamping(
     create block at all, so no add_task call and no metadata stamping."""
     from fused_memory.middleware.curator_types import CandidateTask
 
-    status, task_id, reason, result_dict, degrade = await interceptor._dispatch_ticket_decision(
+    status, task_id, reason, result_dict = await interceptor._dispatch_ticket_decision(
         ticket_id='t1',
         project_root='/project',
         project_id=resolve_project_id('/project'),
@@ -15183,7 +15179,7 @@ async def test_dispatch_refuse_creates_nothing(interceptor, taskmaster):
     action='drop', target_id=None, which matched neither guarded drop branch and
     fell through to the create path — creating the very candidate the guard's own
     justification said to refuse."""
-    status, task_id, reason, result_dict, degrade = await interceptor._dispatch_ticket_decision(
+    status, task_id, reason, result_dict = await interceptor._dispatch_ticket_decision(
         ticket_id='t1',
         project_root='/project',
         project_id=resolve_project_id('/project'),
@@ -15212,7 +15208,6 @@ async def test_dispatch_refuse_creates_nothing(interceptor, taskmaster):
     assert result_dict.get('created') is False, result_dict
     assert result_dict.get('id') is None, result_dict
     assert result_dict.get('action') == 'refuse', result_dict
-    assert degrade is None, f'expected no curator_degrade_reason; got {degrade!r}'
 
 
 @pytest.mark.asyncio
@@ -15224,7 +15219,7 @@ async def test_dispatch_targetless_llm_drop_still_fails_open_to_create(
     A targetless 'drop' is an LLM dedupe that LOST its target, not a refusal —
     silently discarding it would trade the bug being fixed for task loss in the
     opposite direction. It must still create."""
-    status, task_id, reason, result_dict, degrade = await interceptor._dispatch_ticket_decision(
+    status, task_id, reason, result_dict = await interceptor._dispatch_ticket_decision(
         ticket_id='t1',
         project_root='/project',
         project_id=resolve_project_id('/project'),
@@ -15251,7 +15246,7 @@ async def test_dispatch_refuse_precedes_drop_even_with_stray_target(
     """(c) BRANCH ORDER. A refusal carrying a stray target_id must still refuse.
     The refuse branch precedes the drop branch, so a refusal can never be
     shadowed into the dedupe path and silently reported as 'combined'."""
-    status, task_id, reason, result_dict, degrade = await interceptor._dispatch_ticket_decision(
+    status, task_id, reason, result_dict = await interceptor._dispatch_ticket_decision(
         ticket_id='t1',
         project_root='/project',
         project_id=resolve_project_id('/project'),
@@ -15273,30 +15268,6 @@ async def test_dispatch_refuse_precedes_drop_even_with_stray_target(
 
 
 # ── task 3126 step-5 RED: the user-observable signal — a refusal creates no task ──
-
-
-def _refusal_curator(decision: CuratorDecision) -> MagicMock:
-    """A curator mock whose prepared batch answers *decision* for every candidate.
-
-    Extends :func:`_mock_curator` with the entry points the worker's batch path
-    uses (``prepare_candidate`` / ``curate_batch_prepared``).
-    """
-    from fused_memory.middleware.curator_types import PreparedCandidate
-
-    curator = _mock_curator(decision)
-
-    async def _prepare(candidate, project_id, project_root):
-        return PreparedCandidate(
-            candidate=candidate, pool=[], pool_sizes={}, prompt_tokens=0,
-        )
-
-    curator.prepare_candidate = AsyncMock(side_effect=_prepare)
-
-    async def _batch_prepared(prepared, project_id, project_root):
-        return [await curator.curate(p.candidate, project_id, project_root) for p in prepared]
-
-    curator.curate_batch_prepared = AsyncMock(side_effect=_batch_prepared)
-    return curator
 
 
 def _blocklisted_refusal() -> CuratorDecision:
@@ -15337,7 +15308,7 @@ async def test_refused_ticket_creates_no_task_end_to_end(
     guard's refusal was INERT, so the candidate it named was filed anyway.
     """
     decision = decision_factory()
-    curator_interceptor._curator = _refusal_curator(decision)
+    curator_interceptor._curator = _mock_curator(decision)
 
     submit_result = await curator_interceptor.submit_task(
         '/project',
@@ -15370,8 +15341,8 @@ async def test_batch_sibling_pointing_at_refused_candidate_degrades_to_create(
     at a refused candidate sees task_id=None and must fail OPEN to create —
     refusing one candidate cannot silently discard an unrelated one."""
     refusal = _blocklisted_refusal()
-    mock_curator = _refusal_curator(refusal)
-    mock_curator.curate_batch_prepared = AsyncMock(return_value=[
+    mock_curator = _mock_curator(refusal)
+    mock_curator.curate_prepared = AsyncMock(return_value=[
         refusal,
         CuratorDecision(
             action='drop',
@@ -15408,7 +15379,7 @@ async def test_batch_sibling_pointing_at_refused_candidate_degrades_to_create(
 def _real_blocklist_curator(tmp_path):
     """A REAL TaskCurator wired to a tmp_path blocklist YAML.
 
-    A mock curator would bypass ``curate_batch_prepared``'s pre-batch
+    A mock curator would bypass ``curate_prepared``'s pre-batch
     payload_hash dedup — the very code under test — so this test needs the real
     thing. Only ``prepare_candidate`` (corpus assembly, not under test) is
     stubbed, to keep the test hermetic and off the network.
@@ -16487,9 +16458,8 @@ class TestZotDuplicateSweepWiring:
             pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
             prompt_tokens=0,
         )
-        return await curator.curate(
-            candidate, project_id, _ZOT_PROJECT_ROOT, prepared=prepared,
-        )
+        [decision] = await curator.curate_prepared([prepared], project_id, _ZOT_PROJECT_ROOT)
+        return decision
 
     async def _dispatch(self, interceptor, curator, candidate, decision, project_id):
         return await interceptor._dispatch_ticket_decision(
@@ -16532,7 +16502,7 @@ class TestZotDuplicateSweepWiring:
             stub_escalator=stub_escalator, monkeypatch=monkeypatch,
             scores={_DUP_TASK_ID: 0.80, _NEW_TASK_ID: 1.0},
         )
-        status, task_id, _reason, _result, _degrade = outcome
+        status, task_id, _reason, _result = outcome
 
         assert decision.degraded_by_zot is True
         assert status == 'created'
@@ -16665,7 +16635,7 @@ class TestZotDuplicateSweepWiring:
             stub_escalator=stub_escalator, monkeypatch=monkeypatch,
             scores={_DUP_TASK_ID: 0.80, _NEW_TASK_ID: 1.0},
         )
-        status, _task_id, _reason, result_dict, _degrade = outcome
+        status, _task_id, _reason, result_dict = outcome
         assert status == 'created'
         assert result_dict is not None
         stages = [w['stage'] for w in result_dict.get('post_create_warnings', [])]
@@ -16683,7 +16653,7 @@ class TestZotDuplicateSweepWiring:
             stub_escalator=stub_escalator, monkeypatch=monkeypatch,
             scores={_DUP_TASK_ID: 0.80, _NEW_TASK_ID: 1.0},
         )
-        status, _task_id, _reason, result_dict, _degrade = outcome
+        status, _task_id, _reason, result_dict = outcome
         assert status == 'created'
         assert result_dict is not None
         stages = [w['stage'] for w in result_dict.get('post_create_warnings', [])]
@@ -16727,39 +16697,8 @@ class TestZotDuplicateSweepWiring:
         assert held == {'search': False, 'stamp': True, 'escalation': False}
 
 
-class _ZotRaisingCurator(_ScoredCorpusCurator):
-    """Corpus fake whose curate re-raises a ZOT, as it does with no orchestrator."""
-
-    def __init__(self, scores: dict[str, float], *, prepares: bool) -> None:
-        super().__init__(scores)
-        self._prepares = prepares
-
-    def note_created(self, project_id: str, candidate: CandidateTask, task_id: str) -> None:
-        pass
-
-    async def prepare_candidate(
-        self, candidate: CandidateTask, project_id: str, project_root: str,
-    ) -> PreparedCandidate:
-        if not self._prepares:
-            raise RuntimeError('prepare unavailable')
-        return PreparedCandidate(
-            candidate=candidate, pool=[],
-            pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
-            prompt_tokens=0,
-        )
-
-    async def curate_batch_prepared(self, prepared, project_id: str, project_root: str):
-        raise CuratorFailureError('batch call escaped its bisect')
-
-    async def curate(self, candidate, project_id: str, project_root: str, *, prepared=None):
-        raise CuratorFailureError('no orchestrator is running', zero_output_timeout=True)
-
-    async def close(self) -> None:
-        return None
-
-
 class TestZotDuplicateSweepWithoutOrchestrator:
-    """With no orchestrator the ZOT re-raises, yet the create is still swept and stamped."""
+    """With no orchestrator the curator decides the ZOT as a marked create, still swept and stamped."""
 
     @pytest_asyncio.fixture
     async def setup(self, taskmaster, reconciler, event_buffer, ticket_store, tmp_path):
@@ -16775,9 +16714,24 @@ class TestZotDuplicateSweepWithoutOrchestrator:
         await interceptor.close()
 
     @staticmethod
-    async def _install_curator(interceptor, project_id: str, *, prepares: bool):
-        curator = _ZotRaisingCurator({_DUP_TASK_ID: 0.80}, prepares=prepares)
-        await curator.record_task(_DUP_TASK_ID, CandidateTask(title='Existing gate fix'), project_id)
+    async def _install_curator(interceptor, project_id: str):
+        """A real curator whose LLM hangs and whose escalator finds no orchestrator.
+
+        The corpus is the scored fake, so the sweep finds the existing task.
+        """
+        corpus = _ScoredCorpusCurator({_DUP_TASK_ID: 0.80})
+        await corpus.record_task(_DUP_TASK_ID, CandidateTask(title='Existing gate fix'), project_id)
+        curator = TaskCurator(
+            config=_curator_cfg(), taskmaster=None, escalator=CuratorEscalator(),
+            invoke=AsyncMock(return_value=zot_agent_result()),
+        )
+
+        async def bundle_for(candidate: CandidateTask, *_args: Any) -> PreparedCandidate:
+            return prepared(candidate.title, candidate=candidate)
+
+        curator.prepare_candidate = AsyncMock(side_effect=bundle_for)
+        curator.record_task = corpus.record_task
+        curator.search_corpus = corpus.search_corpus
         interceptor._curator = curator
 
     @staticmethod
@@ -16791,10 +16745,9 @@ class TestZotDuplicateSweepWithoutOrchestrator:
         assert not list((Path(project_root) / 'data' / 'escalations').glob('esc-*.json'))
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize('prepares', [False, True], ids=['backfill', 'batch-fallback'])
-    async def test_batch_paths(self, setup, taskmaster, ticket_store, prepares):
+    async def test_the_worker_path(self, setup, taskmaster, ticket_store):
         interceptor, project_root, project_id = setup
-        await self._install_curator(interceptor, project_id, prepares=prepares)
+        await self._install_curator(interceptor, project_id)
 
         submitted = await interceptor.submit_task(
             project_root, title='Re-filed gate fix', description='same fix again',

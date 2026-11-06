@@ -20,16 +20,14 @@ from fused_memory.utils.clip_disclosure import elide_text
 class CuratorFailureError(RuntimeError):
     """Raised when the curator's LLM call fails and cannot be salvaged.
 
-    The curator no longer degrades silently to ``action='create'`` on LLM
-    errors; instead the interceptor translates this into an L1 escalation or
-    a hard failure at the MCP boundary so operators notice breakage.
+    The curator does not degrade silently to ``action='create'`` on LLM
+    errors; ``TaskCurator._failure_decision`` reports this to the escalator,
+    which files an L1 escalation, and decides the candidate.
 
     Attaches ``timed_out``, ``duration_ms``, ``subtype``, ``schema_tool_denied``,
     and ``cost_usd`` from the underlying ``AgentResult`` so
-    :class:`CuratorEscalator` can surface them in the L1 escalation detail and
-    so the bisecting fallback in
-    :meth:`TaskCurator._call_llm_batch_with_fallback` can branch on the
-    failure subtype without leaking the underlying ``AgentResult`` outside
+    :class:`CuratorEscalator` can surface them in the L1 escalation detail
+    without the ``AgentResult`` leaking outside
     :meth:`TaskCurator._invoke_curator`, whose failures
     ``task_curator.py::_failure_error`` maps to this one error.
     Defaults make the attributes safe to read even when the failure
@@ -199,8 +197,8 @@ class CuratorDecision:
     pool_sizes: dict[str, int] = field(default_factory=dict)
     latency_ms: int = 0
     cost_usd: float = 0.0
-    # Set only by curate_batch when a candidate is a duplicate of another
-    # candidate in the same batch (neither yet materialised as a task).
+    # Set only by TaskCurator.curate_prepared when a candidate is a duplicate
+    # of another candidate in the same batch (neither yet materialised as a task).
     # The worker substitutes the sibling's resulting task_id at dispatch time.
     batch_target_index: int | None = None
     # True for a fail-open create that no dedupe judgement stands behind: the
@@ -276,6 +274,22 @@ class PreparedCandidate:
     withheld: PoolWithheld | None = None
     corpus_error: str | None = None
 
+    @classmethod
+    def corpus_failed(cls, candidate: CandidateTask, error: str) -> PreparedCandidate:
+        """The bundle of a candidate whose corpus could not be assembled.
+
+        It costs no prompt tokens: the pipeline defers it ``corpus-failed``
+        without ever rendering it into a prompt.
+        """
+        return cls(
+            candidate=candidate,
+            pool=[],
+            pool_sizes=empty_pool_sizes(),
+            prompt_tokens=0,
+            withheld=PoolWithheld(),
+            corpus_error=error,
+        )
+
 
 @dataclass(frozen=True)
 class PoolWithheld:
@@ -306,11 +320,12 @@ class PoolWithheld:
     actual similarity — the stream whose withheld entries are the likeliest
     duplicates of all.
 
-    Every count is deliberately per-STREAM and not only at ``total_cap``:
-    under stock config the stream caps are the binding constraints and
-    ``total_cap`` never fires at all (see the pool-cap block in
-    ``config/schema.py::CuratorConfig``), so a census keyed on the final trim
-    alone would be permanently silent.
+    Every count is deliberately per-STREAM and not only at ``total_cap``: a
+    stream cap discards entries before the final trim ever sees them, and
+    under stock config the embedding cap binds on every candidate measured
+    (see the pool-cap block in ``config/schema.py::CuratorConfig``), so a
+    census keyed on the final trim alone would miss most of what the pool
+    loses.
 
     An empty census renders nothing: a pool that fit says nothing about
     fitting, exactly as a complete result surface carries no delta.

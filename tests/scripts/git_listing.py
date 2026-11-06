@@ -13,10 +13,12 @@ Two things every such guard needs from git:
   ``df_pytest_isolation.py::git_redirect_env``, because a variable such as
   ``GIT_LITERAL_PATHSPECS`` blinds a sweep without redirecting it;
   ``tests/scripts/test_git_listing.py`` pins both directions.
-  A missing git or a non-zero exit raises ``AssertionError`` and never skips:
+  A missing git or a non-zero exit raises ``GitCommandFailed`` and never skips:
   a guard whose population git supplies would otherwise pass green without
-  having looked at anything. ``run_git`` is the same call for commands whose
-  exit code IS the answer (e.g. ``check-ignore``), so it does not assert on it.
+  having looked at anything. It is an ``AssertionError``, so a test fails on it
+  like any assertion, but raised explicitly, so ``python3 -O`` cannot strip it.
+  ``run_git`` is the same call for commands whose exit code IS the answer (e.g.
+  ``check-ignore``), so it does not raise on a non-zero exit.
 * ``listed_files`` is ``--cached --others --exclude-standard``: tracked files
   plus untracked ones that are not ignored. So a newly created, uncommitted
   file is swept, while gitignored foreign checkouts (``.worktrees/`` and the
@@ -29,7 +31,9 @@ Two things every such guard needs from git:
 IMPORT ME, DO NOT COPY ME.
 
 Importable from ``tests/scripts/test_*.py`` only because
-``tests/scripts/conftest.py`` puts this directory on ``sys.path``.
+``tests/scripts/conftest.py`` puts this directory on ``sys.path``, and from
+``tests/scripts/raw_envelope_literal_guard.py`` run as a script because Python
+puts the script's own directory there.
 """
 from __future__ import annotations
 
@@ -38,6 +42,10 @@ import subprocess
 from pathlib import Path
 
 _KEPT_GIT_ENV = frozenset({'GIT_CEILING_DIRECTORIES'})
+
+
+class GitCommandFailed(AssertionError):
+    """A git call that could not run, or that :func:`git` saw exit non-zero."""
 
 
 def run_git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -52,15 +60,16 @@ def run_git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
             command, cwd=cwd, capture_output=True, text=True, env=env, check=False,
         )
     except OSError as exc:
-        raise AssertionError(f'could not run {command} in {cwd}: {exc!r}') from exc
+        raise GitCommandFailed(f'could not run {command} in {cwd}: {exc!r}') from exc
 
 
 def git(cwd: Path, *args: str) -> str:
     """The stdout of ``git *args`` run in *cwd*."""
     proc = run_git(cwd, *args)
-    assert proc.returncode == 0, (
-        f'{proc.args} failed in {cwd} with rc={proc.returncode}; stderr: {proc.stderr!r}'
-    )
+    if proc.returncode != 0:
+        raise GitCommandFailed(
+            f'{proc.args} failed in {cwd} with rc={proc.returncode}; stderr: {proc.stderr!r}'
+        )
     return proc.stdout
 
 

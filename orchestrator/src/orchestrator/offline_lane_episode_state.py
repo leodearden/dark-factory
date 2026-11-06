@@ -18,6 +18,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar
 
+from shared.safe_io import load_json_or_warn
 from shared.task_statuses import OwnerLiveness, owner_liveness
 
 from orchestrator.flake_ledger import DebtTrigger
@@ -107,14 +108,14 @@ class _Fields:
     def optional_instant(self, key: str, *, absent: Any = _REQUIRED) -> datetime | None:
         return None if self.raw(key, absent=absent) is None else self.instant(key)
 
-    def strings(self, key: str) -> tuple[str, ...]:
-        values = self.typed(key, list)
+    def strings(self, key: str, *, absent: Any = _REQUIRED) -> tuple[str, ...]:
+        values = self.typed(key, list, absent=absent)
         if not all(isinstance(value, str) for value in values):
             raise ValueError(f'{self._what}: {key!r} must list strings')
         return tuple(values)
 
-    def objects(self, key: str) -> list[object]:
-        return self.typed(key, list)
+    def objects(self, key: str, *, absent: Any = _REQUIRED) -> list[object]:
+        return self.typed(key, list, absent=absent)
 
 
 def _iso(instant: datetime | None) -> str | None:
@@ -326,21 +327,54 @@ class EpisodeStore:
     """The lane's episode records, one whole record per command.  Synchronous: callers on the loop use ``asyncio.to_thread``."""
 
     def __init__(self, project_root: str | Path | None, *, clock: Callable[[], datetime]) -> None:
-        self._map = PersistentMap(guard_path(project_root, EPISODES_FILE), ttl=EPISODE_RETENTION, now=clock)
+        self._path = guard_path(project_root, EPISODES_FILE)
+        self._clock = clock
+        self._map = PersistentMap(self._path, ttl=EPISODE_RETENTION, now=clock)
+
+    @staticmethod
+    def _parsed(command: str, payload: object) -> CommandRecord:
+        record = CommandRecord.from_json(payload)
+        if record.command != command:
+            raise ValueError(f'the record stored under {command!r} names {record.command!r}')
+        return record
 
     def load(self, command: str) -> CommandRecord:
         payload = self._map.get(command)
         if payload is None:
             return CommandRecord.empty(command)
         try:
-            record = CommandRecord.from_json(payload)
+            return self._parsed(command, payload)
         except ValueError as exc:
             logger.error('offline-lane: episode record of %r is malformed, treated as empty: %s', command, exc)
             return CommandRecord.empty(command)
-        if record.command != command:
-            logger.error('offline-lane: episode record under %r names %r, treated as empty', command, record.command)
-            return CommandRecord.empty(command)
-        return record
+
+    def _dropped_rows(self) -> list[str]:
+        """The keys of the file's rows its map could not read; an expired row is kept, so it is not one of them."""
+        if self._path is None:
+            return []
+        stored, _ = load_json_or_warn(self._path, default={}, on_corrupt='fail_closed')
+        if not isinstance(stored, Mapping):
+            raise ValueError(f'the file holds a JSON {type(stored).__name__}, not an object')
+        readable = PersistentMap(self._path, ttl=timedelta.max, now=self._clock)
+        return sorted(set(stored) - set(readable))
+
+    def strict_records(self) -> dict[str, CommandRecord]:
+        """Every live command's record, raising ``ValueError`` wherever :meth:`load` fails open.
+
+        The lane keeps running on what it can read: an unparsable file reads as no
+        records, a malformed row is dropped and a malformed record loads empty.  A reader
+        judging what the lane remembers must not mistake those for absence.
+        """
+        dropped = self._dropped_rows()
+        if dropped:
+            raise ValueError(f'rows that do not parse: {dropped}')
+        records: dict[str, CommandRecord] = {}
+        for command, payload in self._map.items():
+            try:
+                records[command] = self._parsed(command, payload)
+            except ValueError as exc:
+                raise ValueError(f'the record of {command!r}: {exc}') from exc
+        return records
 
     def save(self, record: CommandRecord) -> None:
         self._map[record.command] = record.to_json()
@@ -500,6 +534,44 @@ class PassEffect:
             ],
             'debts_undecided': list(self.debts_undecided),
         }
+
+    @classmethod
+    def from_json(cls, payload: object) -> PassEffect:
+        """Strict on every key but the two debt fields, which an effect written before task 6865 lacks."""
+        fields = _Fields(payload, 'pass effect')
+        return cls(
+            tests_counted=fields.strings('tests_counted'),
+            episodes_started=fields.strings('episodes_started'),
+            episodes_extended=fields.strings('episodes_extended'),
+            episodes_ended=tuple(_ended_from_json(item) for item in fields.objects('episodes_ended')),
+            threshold_reached=fields.strings('threshold_reached'),
+            stale_heads=fields.strings('stale_heads'),
+            no_decision=fields.strings('no_decision'),
+            tasks_filed=fields.strings('tasks_filed'),
+            escalations_raised=fields.strings('escalations_raised'),
+            debts_offered=tuple(_offered_from_json(item) for item in fields.objects('debts_offered', absent=[])),
+            debts_undecided=fields.strings('debts_undecided', absent=[]),
+        )
+
+
+def _ended_from_json(payload: object) -> EndedEpisode:
+    fields = _Fields(payload, 'ended episode')
+    return EndedEpisode(
+        node=fields.typed('node', str),
+        reason=fields.typed('reason', str),
+        counted_passes=fields.typed('counted_passes', int),
+        reproduced_heads=fields.strings('reproduced_heads'),
+    )
+
+
+def _offered_from_json(payload: object) -> OfferedDebt:
+    fields = _Fields(payload, 'offered debt')
+    trigger = fields.typed('trigger', str)
+    try:
+        debt_trigger = DebtTrigger(trigger)
+    except ValueError as exc:
+        raise ValueError(f"offered debt: 'trigger' is not a debt trigger: {trigger!r}") from exc
+    return OfferedDebt(node=fields.typed('node', str), trigger=debt_trigger, head=fields.typed('head', str))
 
 
 @dataclass(frozen=True)

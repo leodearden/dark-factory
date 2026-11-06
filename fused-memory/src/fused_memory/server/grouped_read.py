@@ -45,6 +45,7 @@ from typing import TYPE_CHECKING, Any
 # whole, so an upward-resolved parent's ``metadata`` matches what the SAME
 # record carries when it arrives as a direct search hit.
 from fused_memory.backends.mem0_client import split_managed_metadata
+from fused_memory.config.schema import WriteTriageConfig
 
 # The experimental-key prefix, composed rather than re-spelled — see
 # CONTESTED_METADATA_KEY below.
@@ -58,6 +59,7 @@ from fused_memory.models.memory import MemoryResult
 # the text, and a third private copy would be a fourth place to drift (INV-5).
 from fused_memory.services.memory_service import _MEM0_CONTENT_KEYS
 from fused_memory.utils.async_utils import gather_collect
+from fused_memory.utils.clip_disclosure import elide_text
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Iterable, Mapping, Sequence
@@ -81,6 +83,26 @@ _DIGEST_CHARS = 240
 #: Appended when a body was cut, so a truncated digest is never mistaken for
 #: the whole amendment.
 _DIGEST_ELLIPSIS = '…'
+
+#: The judge's shipped per-field cap, used only when a direct caller names none;
+#: the search and get_memory_by_id tools pass the live value.
+_DEFAULT_CONTESTED_TEXT_CHARS: int = WriteTriageConfig.model_fields['judge_field_chars'].default
+
+
+def _require_positive_text_cap(contested_text_chars: object) -> None:
+    """Reject a bad cap at the entry point, ahead of any fault containment.
+
+    Inside the child reads a bad cap would be reported as ``children_unavailable``
+    — a caller's error mistaken for a backend fault.
+    """
+    if (
+        not isinstance(contested_text_chars, int)
+        or isinstance(contested_text_chars, bool)
+        or contested_text_chars <= 0
+    ):
+        raise ValueError(
+            f'contested_text_chars must be a positive int, got {contested_text_chars!r}'
+        )
 
 #: Max digests listed for one canonical.  A wider fan-out is reported by the
 #: EXACT count plus a ``truncated`` marker rather than by a longer list.
@@ -244,20 +266,22 @@ def _nested_entry_metadata(meta: Mapping[str, Any] | None) -> dict[str, str]:
     }
 
 
-def _digest_entry(row: Mapping[str, Any]) -> dict[str, Any]:
+def _digest_entry(row: Mapping[str, Any], contested_text_chars: int) -> dict[str, Any]:
     """Build one digest entry from a scrolled child row."""
     payload = row.get('metadata') or {}
+    text = _child_text(payload)
     entry = {
         'id': row.get('id'),
-        'digest': _digest(_child_text(payload)),
+        'digest': _digest(text),
         'created_at': row.get('created_at'),
         'kind': payload.get('kind', AMENDMENT_KIND),
     }
-    # A contested child appears in BOTH places — here AND as a surviving
-    # top-level hit — which is strictly more informative than either alone.
-    # Omitted (never False) when uncontested, per the fault-only convention.
+    # A contesting child that did not itself match is no top-level hit, so this
+    # entry is its only copy on the wire: it carries the text whole up to the
+    # judge's cap, house-marked when cut, while ``digest`` stays the pointer.
     if is_contested_child(payload):
         entry['contested'] = True
+        entry['content'] = elide_text(text, contested_text_chars, field='content').text
     # The child's ORIGIN project and supersession mark, so a consumer holding
     # only this digest can still classify the body it carries — see
     # :func:`_nested_entry_metadata`.  Omitted (never ``{}``) when the child
@@ -289,13 +313,16 @@ async def build_grouped_document(
     service: Any,
     project_id: str,
     canonical_id: str,
+    *,
+    contested_text_chars: int = _DEFAULT_CONTESTED_TEXT_CHARS,
 ) -> dict[str, Any] | None:
     """Build the grouped block for *canonical_id*, or ``None`` when childless.
 
     Returns ``{'amendments': [...], 'amendment_count': int, 'sighting_count':
-    int}``.  The sighting count always comes from the EXACT count API — never
-    ``len(scroll)``, which would silently under-report a fan-out wider than
-    the scroll limit.
+    int}``; an amendment entry marked ``contested`` also carries ``content``,
+    its text cut at *contested_text_chars*.  The sighting count always comes
+    from the EXACT count API — never ``len(scroll)``, which would silently
+    under-report a fan-out wider than the scroll limit.
 
     COST ORDERING (mirrors task 3197's delete gate, for the same reason): the
     un-kinded TOTAL child count runs FIRST and short-circuits on zero, so the
@@ -312,10 +339,14 @@ async def build_grouped_document(
     exactly so this distinction survives; collapsing it here would tell an
     operator a canonical has no children because a backend timed out.  Nothing
     partial is returned alongside the marker, so no consumer can read half a
-    grouping as a whole one.
+    grouping as a whole one.  A bad *contested_text_chars* is the caller's
+    error, not a read fault, so it raises ``ValueError`` instead.
     """
+    _require_positive_text_cap(contested_text_chars)
     try:
-        return await _read_grouped_document(service, project_id, canonical_id)
+        return await _read_grouped_document(
+            service, project_id, canonical_id, contested_text_chars,
+        )
     except Exception as exc:
         logger.warning(
             'grouped_read: child reads FAILED for canonical_id=%s in project=%s; '
@@ -332,6 +363,7 @@ async def _read_grouped_document(
     service: Any,
     project_id: str,
     canonical_id: str,
+    contested_text_chars: int,
 ) -> dict[str, Any] | None:
     """The child reads themselves — see :func:`build_grouped_document`.
 
@@ -372,7 +404,10 @@ async def _read_grouped_document(
     for outcome in (sighting_count, amendment_count, rows):
         if isinstance(outcome, Exception):
             raise outcome
-    digests = [_digest_entry(row) for row in sorted(rows or [], key=_digest_sort_key)]
+    digests = [
+        _digest_entry(row, contested_text_chars)
+        for row in sorted(rows or [], key=_digest_sort_key)
+    ]
     # A non-zero total means children EXIST, so the block is emitted even when
     # none of them is an amendment or a sighting — reporting an empty group for
     # a parent that demonstrably has children would be the silent under-report
@@ -652,6 +687,8 @@ async def group_search_results(
     service: Any,
     project_id: str,
     results: Sequence[Any],
+    *,
+    contested_text_chars: int = _DEFAULT_CONTESTED_TEXT_CHARS,
 ) -> list[dict[str, Any]]:
     """Collapse child hits into their parents' grouped documents, in rank order.
 
@@ -675,6 +712,7 @@ async def group_search_results(
         own warning) — this function returns a plain ``list``.  Read those
         attributes BEFORE calling it.
     """
+    _require_positive_text_cap(contested_text_chars)
     hits = list(results)
     # NON-EMPTY is part of "usable id" everywhere in this module: mem0 hits are
     # built with ``id=item.get('id', '')``, so '' is reachable, and it is not an
@@ -724,7 +762,10 @@ async def group_search_results(
     # would be an up-to-1000-wide burst of Qdrant counts on the hottest read
     # path, contending with the search that produced the hits.
     blocks = await _bounded_gather(
-        build_grouped_document(service, project_id, target_id) for target_id in groupable
+        build_grouped_document(
+            service, project_id, target_id, contested_text_chars=contested_text_chars,
+        )
+        for target_id in groupable
     )
     block_by_id: dict[str, Any] = {}
     for target_id, block in zip(groupable, blocks, strict=True):
@@ -812,6 +853,8 @@ async def group_memory_document(
     project_id: str,
     memory_id: str,
     record: Mapping[str, Any],
+    *,
+    contested_text_chars: int = _DEFAULT_CONTESTED_TEXT_CHARS,
 ) -> dict[str, Any] | None:
     """The grouped block for an EXACT point-id read, or ``None`` when there is none.
 
@@ -840,13 +883,18 @@ async def group_memory_document(
     satisfy D6 — a child's content is never unreachable — one by keeping the
     child, the other by surfacing the group.
     """
+    _require_positive_text_cap(contested_text_chars)
     parent_id = child_parent_id(record.get('metadata'))
     if parent_id is None:
-        return await build_grouped_document(service, project_id, memory_id)
+        return await build_grouped_document(
+            service, project_id, memory_id, contested_text_chars=contested_text_chars,
+        )
     # Independent reads, so issued together: the parent's grouping and the
     # existence probe that says whether the pointer resolves at all.
     block, parent_record = await gather_collect((
-        build_grouped_document(service, project_id, parent_id),
+        build_grouped_document(
+            service, project_id, parent_id, contested_text_chars=contested_text_chars,
+        ),
         service.get_memory_by_id(project_id=project_id, memory_id=parent_id),
     ))
     parent: dict[str, Any] = {'id': parent_id}

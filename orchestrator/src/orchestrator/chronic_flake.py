@@ -44,12 +44,10 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, TypeGuard
 
-from shared.mcp_envelope import parse_tool_result
+from shared.mcp_envelope import parse_tool_result, tool_error_text
 from shared.safe_io import load_json_or_warn
 from shared.task_statuses import TERMINAL
 from shared.task_submit import SubmitFailed, SubmitOutcome
-
-from orchestrator.mcp_lifecycle import tool_error_text
 
 if TYPE_CHECKING:
     from orchestrator.config import OrchestratorConfig

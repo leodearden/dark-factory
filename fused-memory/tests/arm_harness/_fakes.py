@@ -20,6 +20,7 @@ from fused_memory.arm_harness.embedding_run_manifest import (
     EmbeddingRunManifest,
     serialize_embedding_run_manifest,
 )
+from fused_memory.arm_harness.fork_slot import ForkHolder
 from fused_memory.arm_harness.instrument_checks import PREREGISTRATION_DOC_PATH
 from fused_memory.arm_harness.llm_metrics import llm_axis_records
 from fused_memory.arm_harness.metrics_record import (
@@ -255,6 +256,34 @@ class FakeArmGraph:
 
     def token_probe(self) -> AbstractAsyncContextManager[TokenMeasurement]:
         return measure_llm_tokens(self.llm_client)
+
+
+class FakeForkServer:
+    """A public-``ServerInfo`` double on fake time: each child holds the fork over [start, end).
+
+    Its ``sleep`` is the only clock: every wait is recorded and advances ``now``.
+    """
+
+    def __init__(self, children: Sequence[tuple[ForkHolder, float, float]] = ()) -> None:
+        self.children = tuple(children)
+        self.now = 0.0
+        self.waits: list[float] = []
+
+    def holders(self) -> frozenset[ForkHolder]:
+        return frozenset(
+            holder for holder, start, end in self.children if start <= self.now < end
+        )
+
+    async def info(self, section: str, /) -> dict[str, int]:
+        assert section == 'persistence'
+        holders = self.holders()
+        return {holder.value: int(holder in holders) for holder in ForkHolder} | {
+            'rdb_changes_since_last_save': 0
+        }
+
+    async def sleep(self, seconds: float) -> None:
+        self.waits.append(seconds)
+        self.now += seconds
 
 
 class RecordingJournal:

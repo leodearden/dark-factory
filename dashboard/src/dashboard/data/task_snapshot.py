@@ -49,7 +49,7 @@ from typing import Any, Generic, TypeVar
 
 import httpx
 from shared.process_identity import Liveness
-from shared.task_statuses import ACTIVE, TERMINAL
+from shared.task_statuses import ACTIVE, TERMINAL, TaskStatus
 
 from dashboard.config import DashboardConfig
 from dashboard.data.census import (
@@ -165,11 +165,15 @@ newer than the cache allows, so its cadence is not the one that governs here.
 _RETENTION_BOUND_SECONDS = 24 * 60 * 60
 """How old a last-good value may be and still be served as ``stale``."""
 
+ROW_READ_STATUSES: frozenset[TaskStatus] = ACTIVE
+"""The statuses the unit's rows half asks for, applied server-side as
+``WHERE status IN (...)``."""
+
 
 class SnapshotFailure(enum.StrEnum):
     """WHY a unit is not wholly measured — structured, never parsed from prose.
 
-    The three project lists ``/api/v2/dashboard/tasks`` emits encode facts the
+    The project lists ``/api/v2/dashboard/tasks`` emits encode facts the
     codebase insists must not be merged: offline means a read DEMONSTRABLY
     failed, degraded means a budget expired and the state is simply unknown.
     ``Datum.reason`` is by contract the producer's VERBATIM failure text, so
@@ -179,7 +183,8 @@ class SnapshotFailure(enum.StrEnum):
     The kind reported on a unit is the ROWS half's, because that is the half
     that decides whether a PROJECT is offline. The map's own fate is carried
     by the census ``Datum``'s state: rows fresh beside a non-fresh census is
-    exactly the count-unknown case, and needs no third enum member.
+    the count-unknown or count-stale case, told apart by that ``Datum``'s own
+    state, and needs no third enum member.
     """
 
     NONE = 'none'
@@ -303,12 +308,12 @@ class _LastGood:
 _last_good: dict[str, dict[str, _LastGood]] = {}
 
 
-def _snapshot_cache_clear() -> None:
-    """Clear the snapshot unit cache AND the last-good store (test/admin hook).
+def clear_snapshot_cache() -> None:
+    """Clear the snapshot unit cache AND the last-good store.
 
     Both, because a test that clears only the TTL would still be served the
     previous test's values as ``stale`` — the one thing a clear hook exists to
-    prevent.
+    prevent. ``active_tasks.reset_task_snapshot_state`` composes it.
     """
     _snapshot_cache.clear()
     _last_good.clear()
@@ -327,6 +332,14 @@ async def _bounded(coro: Awaitable[Any], *, label: str) -> _HalfRead[Any]:
     expiry means this process ran out of budget and the server may be perfectly
     healthy. Collapsing them is what made the 2026-07-30 event get misdiagnosed
     as an orchestrator outage.
+
+    The ``wait_for`` is deliberately bounded at ``PER_CALL_TIMEOUT`` itself, NOT
+    at ``memory.py::enclosing_deadline``. The equal bound keeps every
+    client-side timeout, a saturated pool included, in ``BUDGET``; a larger one
+    would let the fan-out fold it into an offline marker, reported as
+    ``UNREACHABLE``. ``PER_CALL_TIMEOUT`` is also the operation term in
+    ``test_tasks_budget.py``'s assertion (a). Pinned by
+    ``test_saturated_pool_is_diagnosable.py::test_task_snapshot_reports_a_saturated_pool_as_budget_not_offline``.
     """
     try:
         result = await asyncio.wait_for(coro, PER_CALL_TIMEOUT)
@@ -525,7 +538,7 @@ async def _read_unit(
         _bounded(
             fetch_tasks(
                 client, config, project_root,
-                statuses=sorted(ACTIVE),
+                statuses=sorted(ROW_READ_STATUSES),
                 timeout=PER_CALL_TIMEOUT,
             ),
             label='active rows',
@@ -626,7 +639,7 @@ def withhold_rows(snapshot: TaskSnapshot) -> TaskSnapshot:
 class SnapshotHealth(enum.StrEnum):
     """How a consumer must present one root, from its unit alone.
 
-    The four members are the four banners ``/api/v2/dashboard/tasks`` can put
+    The five members are the five banners ``/api/v2/dashboard/tasks`` can put
     a project under, and the codebase insists they stay distinct:
 
     * ``OK`` — both halves measured.
@@ -634,15 +647,23 @@ class SnapshotHealth(enum.StrEnum):
     * ``DEGRADED`` — a budget expired first, so this root's state is simply
       UNKNOWN. Nothing was proven unreachable. Merging this into ``OFFLINE``
       tells an operator to restart a healthy service.
-    * ``COUNT_UNKNOWN`` — the rows are current but the census is not. Without
-      a name of its own such a root renders as healthy with a confident
-      "0 done", which is the invisible failure the envelope exists to remove.
+    * ``COUNT_UNKNOWN`` — the row read did not fail but the census has NO
+      value to show. Without a name of its own such a root renders as healthy
+      with a confident "0 done", which is the invisible failure the envelope
+      exists to remove.
+    * ``COUNT_STALE`` — the row read did not fail and the census carries its
+      last measured value at its own ``as_of``, which every census surface
+      renders with an age badge. Announcing it as unknown would contradict
+      those surfaces. Says nothing about the rows' freshness: a unit
+      :func:`as_served` aged past :data:`FRESHNESS_BOUND_SECONDS` lands here
+      with BOTH halves stale, each carrying its own age.
     """
 
     OK = 'ok'
     OFFLINE = 'offline'
     DEGRADED = 'degraded'
     COUNT_UNKNOWN = 'count_unknown'
+    COUNT_STALE = 'count_stale'
 
 
 def classify(snapshot: TaskSnapshot) -> SnapshotHealth:
@@ -661,9 +682,11 @@ def classify(snapshot: TaskSnapshot) -> SnapshotHealth:
         return SnapshotHealth.OFFLINE
     if snapshot.failure is SnapshotFailure.BUDGET:
         return SnapshotHealth.DEGRADED
-    if snapshot.census.state is not DatumState.FRESH:
-        return SnapshotHealth.COUNT_UNKNOWN
-    return SnapshotHealth.OK
+    if snapshot.census.state is DatumState.FRESH:
+        return SnapshotHealth.OK
+    if snapshot.census.state is DatumState.STALE:
+        return SnapshotHealth.COUNT_STALE
+    return SnapshotHealth.COUNT_UNKNOWN
 
 
 def as_served(snapshot: TaskSnapshot, served_at: datetime) -> TaskSnapshot:
@@ -763,8 +786,12 @@ async def acquire_terminal_window(
     *,
     now: datetime,
     terminal_total: int | None,
+    window: int = _TERMINAL_FETCH_WINDOW,
 ) -> Datum[list[dict]]:
-    """Read the newest :data:`_TERMINAL_FETCH_WINDOW` terminal rows, or say why not.
+    """Read the newest *window* terminal rows (default :data:`_TERMINAL_FETCH_WINDOW`), or say why not.
+
+    *window* is injectable so a caller (a test) can size it without touching
+    the module constant.
 
     Lives beside the unit because it is the same datum family read through the
     same access implementation, under the third slot of
@@ -797,6 +824,8 @@ async def acquire_terminal_window(
     Benign race: *terminal_total* was measured by a different read, so a task
     completing between the two shifts the window by a row.
     """
+    if window < 1:
+        raise ValueError(f'window must be at least 1, got {window!r}')
     if terminal_total is None:
         return unknown_datum(
             'the terminal window cannot be positioned without a measured '
@@ -805,7 +834,6 @@ async def acquire_terminal_window(
             FRESHNESS_BOUND_SECONDS,
         )
 
-    window = _TERMINAL_FETCH_WINDOW
     if terminal_total > window:
         logger.warning(
             'project root %s: %d terminal (done+cancelled) tasks exceed the '

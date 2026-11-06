@@ -21,15 +21,17 @@ from __future__ import annotations
 
 import pytest
 
-# The 2026-09 endpoint slate as LITERALS (task 5384), deliberately not read
-# from the ``*_MODEL`` constants: a pin that reads what it protects guards
-# nothing (INV-10).
+# The endpoint slate as LITERALS, pinned by task 5384 and extended by task
+# 7991, deliberately not read from the ``*_MODEL`` constants: a pin that reads
+# what it protects guards nothing (INV-10).
 _SLATE_MODELS_BY_NAME = {
     'minimax-m3-endpoint': 'MiniMax-M3',
     'glm-5.3-endpoint': 'glm-5.3',
     'glm-5.3-flash-endpoint': 'glm-5.3-flash',
     'deepseek-v4-endpoint': 'deepseek-v4',
     'kimi-endpoint': 'kimi-latest',
+    'mimo-v2.6-pro-endpoint': 'mimo-v2.6-pro',
+    'mimo-v2.6-flash-endpoint': 'mimo-v2.6-flash',
 }
 # (model, input_per_1m, output_per_1m) list prices, USD per 1M tokens.
 _SLATE_LIST_PRICES = [
@@ -38,6 +40,8 @@ _SLATE_LIST_PRICES = [
     ('glm-5.3-flash', 0.15, 0.50),
     ('deepseek-v4', 0.28, 0.42),
     ('kimi-latest', 0.60, 2.50),
+    ('mimo-v2.6-pro', 0.435, 0.87),
+    ('mimo-v2.6-flash', 0.14, 0.28),
 ]
 
 
@@ -216,6 +220,84 @@ class TestEndpointAuthEnvContract:
         assert all(not c.env_overrides for c in incumbents)
 
 
+_MIMO_BUNDLE_NAMES = ('mimo-v2.6-pro-endpoint', 'mimo-v2.6-flash-endpoint')
+
+
+class TestMimoEndpointEnvContract:
+    """The MiMo base URL and key are both operator env vars (task 7992's contract).
+
+    A Token Plan key answers only on its region's cluster, so the base URL is
+    not a literal; with no base URL the key is withheld, which the shadow
+    credential gate reads as no_credentials rather than a run that 401s.
+    """
+
+    def _mimo_bundles(self):
+        from orchestrator.evals.configs import claude_endpoint_candidates
+
+        by_name = {c.name: c for c in claude_endpoint_candidates()}
+        return [by_name[name] for name in _MIMO_BUNDLE_NAMES]
+
+    def test_a_set_base_url_and_key_flow_through_verbatim(self, monkeypatch):
+        base_url = 'https://token-plan-sgp.xiaomimimo.com/anthropic'
+        monkeypatch.setenv('MIMO_ANTHROPIC_BASE_URL', base_url)
+        monkeypatch.setenv('MIMO_API_KEY', 'tp-test')
+
+        for bundle in self._mimo_bundles():
+            assert bundle.backend == 'claude'
+            assert bundle.env_overrides['ANTHROPIC_BASE_URL'] == base_url
+            assert bundle.env_overrides['ANTHROPIC_AUTH_TOKEN'] == 'tp-test'
+
+    @pytest.mark.parametrize('base_url', [None, '   '], ids=['unset', 'whitespace'])
+    def test_a_blank_base_url_withholds_the_key(self, monkeypatch, base_url):
+        if base_url is None:
+            monkeypatch.delenv('MIMO_ANTHROPIC_BASE_URL', raising=False)
+        else:
+            monkeypatch.setenv('MIMO_ANTHROPIC_BASE_URL', base_url)
+        monkeypatch.setenv('MIMO_API_KEY', 'tp-test')
+
+        for bundle in self._mimo_bundles():
+            assert bundle.env_overrides['ANTHROPIC_AUTH_TOKEN'] == ''
+
+    @pytest.mark.parametrize('api_key', ['tp-test', None], ids=['key-set', 'key-unset'])
+    def test_a_blank_base_url_warning_blames_the_base_url_not_the_key(
+        self, monkeypatch, caplog, api_key,
+    ):
+        import logging
+
+        monkeypatch.delenv('MIMO_ANTHROPIC_BASE_URL', raising=False)
+        if api_key is None:
+            monkeypatch.delenv('MIMO_API_KEY', raising=False)
+        else:
+            monkeypatch.setenv('MIMO_API_KEY', api_key)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.evals.configs'):
+            self._mimo_bundles()
+
+        warnings = [
+            record.getMessage() for record in caplog.records
+            if record.levelno == logging.WARNING
+        ]
+        for name in _MIMO_BUNDLE_NAMES:
+            naming_this_bundle = [message for message in warnings if repr(name) in message]
+            assert naming_this_bundle, warnings
+            for message in naming_this_bundle:
+                assert 'no base URL' in message, message
+                assert 'MIMO_API_KEY' not in message, message
+
+    def test_resolving_a_static_config_builds_no_endpoint_bundle(self, monkeypatch, caplog):
+        import logging
+
+        from orchestrator.evals.configs import get_config_by_name
+
+        monkeypatch.delenv('MIMO_ANTHROPIC_BASE_URL', raising=False)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.evals.configs'):
+            config = get_config_by_name('claude-opus-high')
+
+        assert config is not None and config.name == 'claude-opus-high'
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING], caplog.text
+
+
 class TestClaudeEndpointPriceTable:
     """claude_endpoint_price_table(): default seeds + candidate-model prices,
     proven to resolve via λ's resolve_cost_usd (cost_source='price_table')."""
@@ -348,6 +430,8 @@ class TestCandidatePriceCostBasis:
         ('MiniMax-M3', 'metered', False),
         ('deepseek-v4', 'metered', False),
         ('kimi-latest', 'metered', False),
+        ('mimo-v2.6-pro', 'subscription', True),
+        ('mimo-v2.6-flash', 'subscription', True),
     ])
     def test_per_model_cost_basis_is_pinned(self, model, basis, imputed):
         from orchestrator.evals.configs import CANDIDATE_ENDPOINT_PRICES
@@ -368,16 +452,16 @@ class TestCandidatePriceCostBasis:
 
 
 class TestEndpointSlatePin:
-    """The 2026-09 endpoint slate, pinned by LITERAL ids and list prices.
+    """The endpoint slate, pinned by LITERAL ids and list prices.
 
     Every other test in this module reads the ``*_MODEL`` constants, so it
     stays green whatever those constants hold — a guard that reads the thing
     it protects (INV-10). This class restates the slate as literals so a
     stale or placeholder id, an unnoticed addition or removal, or a drifted
-    price fails loudly (task 5384).
+    price fails loudly (task 5384; extended by task 7991).
     """
 
-    def test_roster_is_exactly_the_incumbents_plus_the_2026_09_slate(self):
+    def test_roster_is_exactly_the_incumbents_plus_the_pinned_slate(self):
         from orchestrator.evals.configs import claude_endpoint_candidates
 
         by_name = {c.name: c for c in claude_endpoint_candidates()}
@@ -421,7 +505,8 @@ class TestEndpointSlatePin:
     def test_get_config_by_name_resolves_the_refreshed_bundles(self):
         from orchestrator.evals.configs import get_config_by_name
 
-        for name in ('minimax-m3-endpoint', 'glm-5.3-endpoint', 'glm-5.3-flash-endpoint'):
+        for name, model in _SLATE_MODELS_BY_NAME.items():
             cfg = get_config_by_name(name)
             assert cfg is not None
-            assert cfg.model == _SLATE_MODELS_BY_NAME[name]
+            assert cfg.model == model
+            assert cfg.backend == 'claude'

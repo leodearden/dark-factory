@@ -72,7 +72,7 @@ async def _build_stack(tmp_path, *, enforce: bool):
     ``config`` (curator enabled — the default) so
     ``TaskInterceptor._get_curator()`` actually constructs a
     :class:`TaskCurator` instead of short-circuiting to ``None``. Scenario 1
-    (step-5) neutralizes ``TaskCurator.curate`` at the class level and needs
+    (step-5) neutralizes ``TaskCurator.curate_prepared`` at the class level and needs
     a REAL curator instance for that patch to matter (proving the boundary,
     not a merely-absent curator, coerced); scenario 5 (step-7) needs the
     curator's untagged-legacy substring fallback to genuinely run.
@@ -170,14 +170,14 @@ async def _submit_normal_and_get(
     """Drive a NORMAL (non-planning_mode) submit_task -> resolve_ticket ->
     get_task round-trip, with the curator neutralized to a no-op 'create'.
 
-    Monkeypatches ``TaskCurator.curate`` at the CLASS level to an async stub
-    that always returns a plain ``action='create'`` decision carrying no
-    corpus/LLM-derived routing opinion of its own. Patching the class
+    Monkeypatches ``TaskCurator.curate_prepared`` at the CLASS level to an
+    async stub that answers every bundle with a plain ``action='create'``
+    decision carrying no corpus/LLM-derived routing opinion of its own. Patching the class
     (rather than a specific instance) matters because the interceptor's
     curator is lazily constructed inside the ticket worker
     (``TaskInterceptor._get_curator``) AFTER this helper runs — patching the
     class before the submit call means whichever instance ``_get_curator``
-    goes on to build still resolves ``.curate`` through the patched class
+    goes on to build still resolves ``.curate_prepared`` through the patched class
     attribute, so a REAL ``TaskCurator`` is still consulted (proving the
     boundary — not a merely-absent curator — is what coerces the result).
     This isolates the submit-boundary coercion (``inject_operational_routing``,
@@ -185,10 +185,13 @@ async def _submit_normal_and_get(
     ``task_kind`` on this path: a no-op 'create' decision carries no routing
     opinion of its own.
     """
-    async def _neutral_curate(self, candidate, project_id, project_root, *, prepared=None):
-        return CuratorDecision(action='create', justification='ζ-test-neutralized')
+    async def _neutral_curate_prepared(self, prepared, project_id, project_root):
+        return [
+            CuratorDecision(action='create', justification='ζ-test-neutralized')
+            for _ in prepared
+        ]
 
-    monkeypatch.setattr(TaskCurator, 'curate', _neutral_curate)
+    monkeypatch.setattr(TaskCurator, 'curate_prepared', _neutral_curate_prepared)
 
     server, _interceptor = stack
     submit_result = await server._tool_manager.call_tool(
@@ -353,8 +356,8 @@ async def test_normal_submit_operational_gate_coerces_to_pure_gate(
     + operational_mode='gate' is coerced to a deterministic pure gate, even
     with a REAL (curator-neutralized) curator in the loop.
 
-    Uses _submit_normal_and_get (step-4), which monkeypatches TaskCurator.curate
-    to a no-op 'create' decision carrying no routing opinion of its own — so a
+    Uses _submit_normal_and_get (step-4), which monkeypatches
+    TaskCurator.curate_prepared to a no-op 'create' decision carrying no routing opinion of its own — so a
     deterministic task_kind surviving persist+read-back on THIS path can only
     have come from the submit-boundary coercion (inject_operational_routing,
     task β), never from the curator. Two-way with scenario 2: that scenario
@@ -391,7 +394,7 @@ def _inject_operational_registry(
     regardless of whatever (unread — scenario 5 never touches disk) path
     ``config.curator.operational_ask_registry_path`` names. The curator is
     deliberately left ACTIVE here (unlike ``_submit_normal_and_get``'s
-    ``TaskCurator.curate`` neutralization) — scenario 5 must reach
+    ``TaskCurator.curate_prepared`` neutralization) — scenario 5 must reach
     ``_maybe_route_deterministic`` for real.
     """
     def _fake_load(path):  # noqa: ARG001 — path unread; see docstring

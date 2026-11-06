@@ -458,7 +458,12 @@ For a normal task, `TaskWorkflow._drive()`
    `max_amendment_rounds`). Independently, every `review.interval` merges
    (default 40), a `ReviewCheckpoint` runs `deep_reviewer` across recently-
    merged modules for cross-task integration issues, filing its own
-   tasks/escalations if it finds any.
+   tasks/escalations if it finds any. Before its Phase 1 verification the
+   checkpoint runs any project-declared `review.pre_test_commands` (e.g.
+   rebuilding the frontend bundles e2e tests serve) in the main checkout,
+   fail-soft: a failed or timed-out command is reported to the reviewer and
+   in the saved report, never aborting the review
+   (`orchestrator/src/orchestrator/review_pre_test.py`).
 7. **MERGE.** `_submit_to_merge_queue()` hands the branch to the merge lane
    (§5).
 8. **DONE.** `_finalise_merged_done()` refreshes `metadata.files` from the
@@ -552,7 +557,7 @@ and are not restated here.
     `_file_stop_instruction_and_block`,
     `_file_curator_adjudication_missing_and_block`,
     `_file_milestone_gate_and_block`,
-    `_file_milestone_check_failed_and_block`). Each wraps the status write in
+    `_file_predicate_escalation_and_block`). Each wraps the status write in
     `try`/`except` and *log-and-swallows* a failure (the escalation is already
     durable), so it can file the record and still not write `blocked`. These
     are also the `pending → blocked` edge §3.8 depends on — no workflow, and
@@ -711,6 +716,9 @@ This expresses auto-deploys, act-then-ask gates, pure human gates, and (via
 [docs/task-authoring.md](docs/task-authoring.md)'s "Deterministic tasks" and
 "Milestones" sections for the full field reference; that's task-author-facing
 configuration, not architecture, so it isn't repeated here.
+The runner's internal dispatch state machine (idempotency and quiescence,
+the `before_done` sub-paths, the pure gate's proof ladder) is documented in
+[docs/deterministic-runner.md](docs/deterministic-runner.md).
 
 ---
 
@@ -734,7 +742,7 @@ matter most for reasoning about safety:
 
 | Role | Stage | Purpose | Model / effort / budget / turns |
 |---|---|---|---|
-| `architect` | PLAN | Explores the codebase, verifies premises, builds the TDD plan | opus / max / $15 / 100 |
+| `architect` | PLAN | Explores the codebase, verifies premises, builds the TDD plan | opus / xhigh / $15 / 180 |
 | `implementer` | EXECUTE | RED test → GREEN implementation → commit, per plan step; sandboxed | sonnet / max / $10 / 80 (routed to opus above ~12 steps or ~3 modules) |
 | `debugger` | VERIFY failure loop | Fixes test/lint/typecheck failures with minimal changes; sandboxed | sonnet / max / $5 / 50 |
 | `reviewer_comprehensive` | REVIEW | Sole reviewer: test quality, reuse, architecture, performance, robustness; read-only | opus / high / $5 / 30 (config resolves `reviewer_comprehensive` → the `reviewer` config key) |

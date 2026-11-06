@@ -10,12 +10,11 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 # Cost primitives (the USD/1M fallback rate + the PriceEntry-or-dict accessor)
-# have a SINGLE home in agents.invoke (task 2459); this module re-exports them
-# rather than re-declaring so the three-way copy can never drift (reviewer:
-# code-reuse). resolve_cost_usd below mirrors invoke's Invariant-P5 policy, and
-# report.build_price_table imports _rate FROM here. agents.invoke has no import
-# cycle back to evals (it reaches only config/fm_retry/shared.*), so a
-# module-level import is safe.
+# have a SINGLE home in agents.invoke (task 2459); this module imports them from
+# agents.invoke rather than re-declaring them, so the three-way copy can never
+# drift (reviewer: code-reuse). resolve_cost_usd below mirrors invoke's Invariant-P5 policy.
+# agents.invoke has no import cycle back to evals (it reaches only
+# config/fm_retry/shared.*), so a module-level import is safe.
 from orchestrator.agents.invoke import _FALLBACK_PRICE, _rate
 from orchestrator.shadow_types import ReferenceKind
 
@@ -592,16 +591,17 @@ def blend_composite(
       failing workflow trial does.
 
     The bound *no_plan* closes: flooring such a cell's *quality* axis to ``0.0``
-    (the report layer's :func:`_plan_quality_score`) bounds only the 0.6 quality
-    weight. The remaining 0.2 cost + 0.2 latency is still collected, so an
-    ungated no-plan cell caps at ``0.40`` — and a cell that is the sole member of
-    its ``(fixture, 'plan_only')`` group takes the report layer's all-trials
-    fallback baseline, earning ratios of ``1.0`` on both axes and banking the
-    full ``0.40`` for having FAILED. Measured (task 3302 review): a no-plan cell
-    at ``0.40`` outranked a config that produced a real 6-step plan at ``0.26``
-    and survived ``select_survivors(top_k=2)``, while the plan-producing one was
-    cut. Barring the cell from SEEDING its group's floor closes only the
-    intra-group route; this gate closes the cross-group one.
+    (the report layer's :func:`cell_admission.plan_quality_score`) bounds only
+    the 0.6 quality weight. The remaining 0.2 cost + 0.2 latency is still
+    collected, so an ungated no-plan cell caps at ``0.40`` — and a cell that is
+    the sole member of its ``(fixture, 'plan_only')`` group takes the report
+    layer's all-trials fallback baseline, earning ratios of ``1.0`` on both axes
+    and banking the full ``0.40`` for having FAILED. Measured (task 3302
+    review): a no-plan cell at ``0.40`` outranked a config that produced a real
+    6-step plan at ``0.26`` and survived ``select_survivors(top_k=2)``, while
+    the plan-producing one was cut. Barring the cell from SEEDING its group's
+    floor closes only the intra-group route; this gate closes the cross-group
+    one.
 
     The gate is UNCONDITIONAL rather than scoped to *plan_only*, so a caller
     cannot silently bypass it by forgetting the flag. The report layer computes

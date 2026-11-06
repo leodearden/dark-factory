@@ -162,19 +162,16 @@ REPO_ROOT = pathlib.Path(__file__).parents[2]
 # all. Everything else — the run-by-run figures each is drawn from — is in the
 # owning yaml.
 #
-#   fused-memory  (i) NO GREEN RUN EXISTS. All six runs are rc=1 on the
-#                 PRE-EXISTING failure escalation esc-3473-1 records, red at
-#                 base main 5a7770d239 before this task touched anything. The
-#                 sizing rule says "worst across recorded GREEN runs"; here it
-#                 is applied to RED runs, on the grounds that the failure is one
-#                 fast assertion in a suite that ran to COMPLETION (no -x) and
-#                 adds no measurable wall-clock. An assumption with an error bar,
-#                 not a clean measurement; the 2.6x multiple absorbs it.
-#                 (ii) The ONLY in-scope module under pytest-xdist (addopts =
-#                 "-n auto --dist loadgroup -m 'not integration'"). W is an XDIST
-#                 figure, so a future change to -n or to the dist mode
-#                 INVALIDATES it rather than merely shifting it — RE-MEASURE, do
-#                 not scale.
+#   fused-memory  W is the max of a PRODUCTION CENSUS of task-role verify
+#                 legs, not a hand run of test_command, and that max is a GREEN
+#                 run (task 7882). It is an `-n 8` figure: task legs run with
+#                 the `-n` cap verify appends from
+#                 dark-factory-orchestrator.yaml::verify_admission_pytest_n,
+#                 not with addopts' `-n auto`. A change to that knob, or to
+#                 addopts' `-n` or dist mode, INVALIDATES it rather than merely
+#                 shifting it — RE-MEASURE, do not scale. The census command
+#                 and its figures live in fused-memory/orchestrator.yaml's
+#                 provenance block, their single home.
 #
 #   dashboard     NO PRIOR FIGURE OF ANY KIND existed for this suite (task 3062
 #                 attempt-2 timed out before dashboard's segment started), so
@@ -271,24 +268,25 @@ REPO_ROOT = pathlib.Path(__file__).parents[2]
 #                 below are exercised for this module like every other — only
 #                 (b) and (c) are excepted.
 #
-# ONE METHODOLOGICAL LIMIT ON THE WHOLE TABLE, save two entries. The concurrent
-# arm of the sweep was a 6-WAY wave (the six modules this task closed) for
-# every entry EXCEPT `shared`, whose W was RE-MEASURED under a real NINE-WAY
-# gather (task 5131, see its entry above) — production's own gather width.
-# Production's ``verify.run_full_verification`` gathers over EVERY registered
-# module config — nine today, including the dominant `orchestrator` segment —
-# so for the five 6-way entries the measured wave remains a LOWER BOUND on the
+# ONE METHODOLOGICAL LIMIT ON FOUR ENTRIES. The concurrent arm of the task-3473
+# sweep was a 6-WAY wave, and four entries still come from it: escalation,
+# dashboard, sampler and cockpit. `shared` was RE-MEASURED under a real
+# NINE-WAY gather (task 5131, see its entry above) — production's own gather
+# width. Production's ``verify.run_full_verification`` gathers over EVERY
+# registered module config — nine today, including the dominant `orchestrator`
+# segment — so for those four the measured wave remains a LOWER BOUND on the
 # fully-concurrent cost, not a reproduction of it. See the same note in each
-# of those five yamls' provenance blocks for what bounds the gap; shared's own
+# of those four yamls' provenance blocks for what bounds the gap; shared's own
 # provenance block records the nine-way gather directly, so no such note
-# applies there. Nor does it apply to `orchestrator`, whose figure did not come
-# from that sweep AT ALL — it is a fleet census of production verify runs (see
-# its entry above), so the 6-way/9-way distinction is simply not the axis its
-# error bar lies on.
+# applies there. Nor does it apply to `orchestrator` or `fused-memory`, whose
+# figures did not come from that sweep AT ALL — each is a fleet census of
+# production verify runs (see their entries above), so the 6-way/9-way
+# distinction is not the axis their error bars lie on — nor to `client-feed`,
+# measured separately by task 6966.
 MEASURED_MODULE_SUITE_WORST_SECS: dict[str, float] = {
     'shared': 296.88,
     'escalation': 354.56,
-    'fused-memory': 439.80,
+    'fused-memory': 1695.0841336008161,
     'dashboard': 653.54,
     'sampler': 22.49,
     'cockpit': 130.50,

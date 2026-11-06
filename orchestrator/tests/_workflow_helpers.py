@@ -540,6 +540,7 @@ class FakeBriefing:
     async def build_revalidation_prompt(
         self, task: dict, existing_plan: dict, changed_files: list,
         worktree=None, context: str | None = None, *, text_drift=None,
+        integrity_refusal=None,
     ) -> str:
         return f'Revalidate: {task.get("title", "")}'
 
@@ -687,6 +688,7 @@ def _make(
     config.steward_completion_timeout = 300.0
     config.project_root = project_root
     config.git.branch_prefix = 'task/'
+    config.git.main_branch = 'main'
     config.review.reviewer_briefing = ReviewBriefing.DIFF_ONLY
 
     set_task_status = AsyncMock()
@@ -846,16 +848,32 @@ def _init_git_repo(repo: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+def agent_side_artifacts(cwd: Path) -> TaskArtifacts:
+    """The artifacts an agent-side MCP server dispatched into *cwd* writes.
+
+    Mirrors ``TaskWorkflow._artifact_roots``: the task root when the workflow
+    created one for the lane's task (a dual-root dispatch), else the lane root
+    alone (an external worktree, or a lane no workflow has set up).
+    """
+    lane = TaskArtifacts.meta_root_for(cwd.parent, cwd.name)
+    task_id = TaskArtifacts.read_lane_task_id(lane)
+    if task_id is not None:
+        task_root = TaskArtifacts.task_root_for(cwd.parent, task_id)
+        if task_root.is_dir():
+            return TaskArtifacts(cwd, lane, task_root)
+    return TaskArtifacts(cwd, lane)
+
+
 @pytest.fixture(autouse=True)
 def _derive_meta_root_like_production(monkeypatch):
-    """Mirror ε1 (task 2258) meta_root derivation in the agent-side doubles.
+    """Mirror production's root derivation (ε1 task 2258, task 3155) in the
+    agent-side doubles.
 
     In production the workflow's ``self.artifacts`` is constructed with the
-    derived sibling ``.task-meta/<name>`` root
-    (``TaskArtifacts(worktree, _meta_root_for_worktree(worktree))``) and the
-    real ``plan_tools.py`` MCP writer is launched with the *same* ``--meta-root``
-    — so every reader/writer for a worktree resolves through one consistent
-    ``meta_root``.
+    lane and task roots of ``TaskWorkflow._artifact_roots`` and the real
+    ``plan_tools.py`` MCP writer is launched with the *same* ``--meta-root`` /
+    ``--task-root`` — so every reader/writer for a dispatch resolves through
+    one consistent pair of roots.
 
     These e2e doubles (``AgentStub._architect`` / ``_implementer`` and ~50
     other call sites) bypass the real ``plan_tools.py`` subprocess and emulate
@@ -867,17 +885,18 @@ def _derive_meta_root_like_production(monkeypatch):
     — so ``get_pending_steps()`` never observes completion and the task blocks
     with "Execution iterations exhausted".
 
-    Rather than thread the derived root through every call site, patch the
-    constructor to default ``meta_root`` to the same sibling root production
-    derives whenever it is omitted. Explicit ``meta_root`` args (the workflow's
-    own and ``plan_tools.py``'s) are untouched.
+    Rather than thread the derived roots through every call site, patch the
+    constructor to default BOTH roots to the ones production derives
+    (``agent_side_artifacts``) whenever ``meta_root`` is omitted. Explicit
+    roots (the workflow's own and ``plan_tools.py``'s) are untouched.
     """
     orig_init = TaskArtifacts.__init__
 
-    def _init(self, worktree, meta_root=None):
+    def _init(self, worktree, meta_root=None, task_root=None):
         if meta_root is None:
-            meta_root = TaskArtifacts.meta_root_for(worktree.parent, worktree.name)
-        orig_init(self, worktree, meta_root)
+            derived = agent_side_artifacts(worktree)
+            meta_root, task_root = derived.lane_root, derived.task_root
+        orig_init(self, worktree, meta_root, task_root)
 
     monkeypatch.setattr(TaskArtifacts, '__init__', _init)
 
@@ -953,6 +972,7 @@ class AgentStub:
         self.calls: list[str] = []
         # Last env_overrides seen per role — set by invoke_agent before dispatch.
         self.env_overrides_by_role: dict[str, dict[str, str] | None] = {}
+        self.sandbox_extras_by_role: dict[str, list[str] | None] = {}
         self._impl_iteration = 0
         # Sequence of verify results to return (pops from front)
         self._verify_results = list(verify_results or [VerifyResult(
@@ -999,6 +1019,7 @@ class AgentStub:
         role = self._detect_role(system_prompt)
         self.calls.append(role)
         self.env_overrides_by_role[role] = env_overrides
+        self.sandbox_extras_by_role[role] = sandbox_extras
 
         if role == 'architect':
             return await self._architect(cwd)
@@ -1017,14 +1038,10 @@ class AgentStub:
                 # where the reviewer payload's 'reviewer' field diverges
                 # from the role would otherwise pass silently here even
                 # though the real tool would reject it (reviewer_comprehensive
-                # amendment, task 2484). Written to the .task-meta META_ROOT
-                # the workflow's self.artifacts reads from — NOT
-                # TaskArtifacts(cwd) (the legacy .task root), or the write
-                # would land where _run_reviewer never reads. Same root
-                # pattern as the _architect stub below.
-                rev_artifacts = TaskArtifacts(
-                    cwd, TaskArtifacts.meta_root_for(cwd.parent, cwd.name)
-                )
+                # amendment, task 2484). Written through the same roots the
+                # real verdict-tools server gets (agent_side_artifacts), or
+                # the write would land where _run_reviewer never reads.
+                rev_artifacts = agent_side_artifacts(cwd)
                 so = result.structured_output
                 _submit_review_verdict(
                     rev_artifacts, role, session_id or 'sid',
@@ -1060,29 +1077,24 @@ class AgentStub:
         return 'unknown'
 
     async def _architect(self, cwd: Path) -> AgentResult:
-        """Write plan.json to the task's meta_root.
+        """Write plan.json where the real plan-tools server would.
 
-        The workflow constructs its TaskArtifacts with the relocated
-        ``.task-meta`` sibling root (task 2258 W11-ε1) and reads plan.json from
-        there — NOT the legacy ``<worktree>/.task``. The real agent-side
-        plan-tools MCP writes to the same root via ``--meta-root``; this stub
-        must mirror that or the workflow sees "no plan.json produced".
+        The workflow reads plan.json from its task root (task 3155), and the
+        real agent-side plan-tools MCP writes there via ``--meta-root`` /
+        ``--task-root``; this stub must mirror that or the workflow sees
+        "no plan.json produced".
         """
-        artifacts = TaskArtifacts(
-            cwd, TaskArtifacts.meta_root_for(cwd.parent, cwd.name)
-        )
-        artifacts.root.mkdir(parents=True, exist_ok=True)
+        plan_path = agent_side_artifacts(cwd).artifact_path('plan.json')
+        plan_path.parent.mkdir(parents=True, exist_ok=True)
         plan = dict(PLAN)
         plan['_schema_version'] = 1
-        (artifacts.root / 'plan.json').write_text(json.dumps(plan, indent=2) + '\n')
+        plan_path.write_text(json.dumps(plan, indent=2) + '\n')
         return AgentResult(success=True, output='Plan created', cost_usd=0.50)
 
     async def _implementer(self, cwd: Path) -> AgentResult:
         """Create code files and update plan.json step statuses."""
         self._impl_iteration += 1
-        artifacts = TaskArtifacts(
-            cwd, TaskArtifacts.meta_root_for(cwd.parent, cwd.name)
-        )
+        artifacts = agent_side_artifacts(cwd)
         pending = artifacts.get_pending_steps()
 
         if not pending:
@@ -1158,11 +1170,9 @@ class AgentStub:
         verdict-tools artifact (``verdicts/judge.json``) ONLY — the legacy
         ``result.structured_output`` read is gone. So for a real verdict
         dict this stub must mirror the agent-side submit_completion_verdict
-        tool call by routing through the actual ``_submit_completion_verdict``
-        implementation, writing to the ``.task-meta`` META_ROOT the
-        workflow's ``self.artifacts`` reads from (NOT ``TaskArtifacts(cwd)``,
-        the legacy ``.task`` root) — same root pattern as the reviewer/
-        architect stubs above. ``structured_output`` is retained belt-and-
+        tool call, writing through ``agent_side_artifacts`` to the root the
+        workflow's ``self.artifacts`` reads from — same root pattern as the
+        reviewer/architect stubs above. ``structured_output`` is retained belt-and-
         braces but is no longer consulted by the workflow. The envelope is
         written directly (``_envelope`` + ``write_verdict``) rather than
         through ``_submit_completion_verdict`` so a deliberately malformed
@@ -1190,9 +1200,7 @@ class AgentStub:
         if verdict is None:
             return AgentResult(success=True, output='', structured_output=None, cost_usd=0.05)
 
-        judge_artifacts = TaskArtifacts(
-            cwd, TaskArtifacts.meta_root_for(cwd.parent, cwd.name)
-        )
+        judge_artifacts = agent_side_artifacts(cwd)
         judge_artifacts.write_verdict(
             'judge', _verdict_envelope('judge', session_id, verdict)
         )

@@ -908,8 +908,8 @@ def _wording_population(
 ) -> dict[str, Any]:
     """Each non-shipped arm against its shipped twin on the same writes, keyed by its name.
 
-    Label-free: contested shares and the paired discordance, with ι's exact
-    McNemar p on the discordant counts.
+    Label-free: contested shares and the paired discordance, with
+    ``score_write_triage_pairs.py::mcnemar_exact`` on the discordant counts.
     """
     readout: dict[str, Any] = {}
     for arm in ARMS:
@@ -928,9 +928,7 @@ def _wording_population(
             arm.wording: _wording_side(other),
             'contested_only_shipped': only_shipped,
             f'contested_only_{arm.wording.replace("-", "_")}': only_other,
-            # A private reach into ι, the one home of the flip-gate statistics, so its test
-            # is reused rather than re-spelled. Promoting it is a follow-up of task 6151.
-            'mcnemar_p': _scorer._mcnemar_exact(only_shipped, only_other),
+            'mcnemar_p': _scorer.mcnemar_exact(only_shipped, only_other),
         }
     return readout
 

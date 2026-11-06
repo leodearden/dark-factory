@@ -3,7 +3,7 @@
 # sampler/orchestrator.yaml.
 
 test_command: "uv run --directory client-feed pytest tests/ --tb=short -q --timeout=300"
-lint_command: "uv run --directory client-feed ruff check src/ tests/ && python3 fused-memory/scripts/check_bare_magicmock_config.py client-feed/tests"
+lint_command: "uv run --directory client-feed ruff check src/ tests/ && python3 fused-memory/scripts/check_bare_magicmock_config.py client-feed/tests && python3 tests/scripts/raw_envelope_literal_guard.py client-feed"
 type_check_command: "uv run --directory client-feed pyright --threads 8 src/ tests/"
 
 # Per-module verify budget. Three runs of the test_command above, 2026-10-15,

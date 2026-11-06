@@ -312,6 +312,20 @@ question. `end-to-end` is the live confirm stage, opened only for a survivor can
     pin, because the existing bundle tests assert against the constants they protect and would
     stay green on any value. The `eval-ofat` candidate-selector gap is **not** fixed: the
     coordinator is the screen.
+
+    **Amended 2026-10-31 (Leo, task 7991).** MiMo V2.6 Pro (`mimo-v2.6-pro`, imputed
+    $0.435/$0.87 per 1M in/out) and MiMo V2.6 Flash (`mimo-v2.6-flash`, $0.14/$0.28) join the
+    slate on MiMo Code, at Leo's direction (source `https://mimo.mi.com/docs/en-US/pricing`,
+    retrieved 2026-10-31). `mimo-v2.5*` retired on 2026-10-21 and is not used;
+    `mimo-v2.6-pro-ultraspeed` is out of scope. The Claude-harness controls are
+    `mimo-v2.6-pro-endpoint` and `mimo-v2.6-flash-endpoint`
+    (`orchestrator/src/orchestrator/evals/configs.py::claude_endpoint_candidates`). Access is a
+    Xiaomi MiMo Token Plan: a `tp-` key answers only on its region's cluster,
+    `https://token-plan-{cn|sgp|ams}.xiaomimimo.com/anthropic`, so the base URL is read from
+    `MIMO_ANTHROPIC_BASE_URL` and the key from `MIMO_API_KEY`; a blank value in either skips the
+    cell as `no_credentials` rather than letting it 401. Pay-as-you-go `sk-` keys use
+    `https://api.xiaomimimo.com/anthropic` and are not interchangeable with `tp-` keys. The
+    literal slate pin covers both ids and prices.
 13. **No production config change** is applied by anything in this PRD (as every eval
     PRD in this lineage).
 14. **(Leo) The one-step implementer harness variant is an eval axis, with a control.**
@@ -338,6 +352,11 @@ question. `end-to-end` is the live confirm stage, opened only for a survivor can
     unbuildable arm is a real answer to land rather than a backend to half-build. **The
     Claude-harness control for the same model is mandatory** — the existing `pi-sonnet-control`
     candidate is exactly this pattern, and an arm without its control measures nothing.
+
+    **Amended 2026-10-31 (Leo, task 7991).** MiMo Code is MiMo V2.6's vendor harness, and the
+    same rule applies. The MiMo Code arm is probe-gated (task 7993, following the ZCode arm's
+    precedent in leaf ω, task 5399), and its mandatory same-model Claude-harness controls are
+    the two `-endpoint` bundles named in decision 12.
 16. **A subscription-metered arm gets two cost columns, and the modelled one is tagged (Leo).**
     A GLM Coding Plan bills **credits** against a weekly and rolling-5h allowance, not tokens, so
     a GLM cell meters no dollars. Writing `0` would make the cheapest-looking arm appear free and
@@ -352,6 +371,15 @@ question. `end-to-end` is the live confirm stage, opened only for a survivor can
     `cap_excluded` with reason `credits_exhausted`, and the `cost_ratio_ceiling` storm escape
     compares only within a matching `cost_basis`: across bases it would be permanently
     un-trippable for the subscription arm, a guard present and green and disarmed (INV-4).
+
+    **Amended 2026-10-31 (Leo, task 7991).** The MiMo Token Plan is credit-metered too, so both
+    MiMo price rows are `subscription` and their dollar figures imputed. Credits per token
+    (source `https://mimo.mi.com/docs/en-US/price/token-plan`, retrieved 2026-10-31): Pro 300
+    cache-miss input / 2.5 cache-hit input / 600 output; Flash 100 / 2 / 200. The quota is
+    monthly with no top-ups, and an exhausted plan stops until upgraded, so exhaustion settles a
+    cell `cap_excluded` with reason `credits_exhausted`. Computing `cost_credits` and detecting
+    exhaustion belong to task 7994. The eval-exclusivity ruling above covers the GLM Coding Plan
+    only; nothing is ruled for the Token Plan.
 
 ## Pre-conditions for activating
 
@@ -671,6 +699,29 @@ for the reason vocabulary). Per-leaf capability→evidence bindings:
   `guards-exercise-behaviour` — the probe inspects the built invocation, not a docstring.
   Modules: `orchestrator/evals`, `orchestrator/agents`. Prereqs: α, ν. Depends
   (out-of-batch): **4757**, **3096**.
+
+  > **As built (task 5386).** Where this bullet and the code differ, the code is authoritative.
+  >
+  > - **The S6 gate** was `orchestrator/src/orchestrator/evals/runner.py::build_eval_orch_config`'s
+  >   `sandbox: SandboxConfig(enabled=False)`, not a missing kwarg. `TaskWorkflow._invoke`
+  >   already forwards `sandbox_modules`/`sandbox_extras` once the sandbox is enabled, through
+  >   `orchestrator/src/orchestrator/agents/invocation_scope.py::invocation_scope`, so
+  >   `agents/invoke.py` is unchanged.
+  > - **The profile** is `orchestrator/src/orchestrator/evals/shadow_invocation.py::build_shadow_orch_config`.
+  >   Strict MCP and the null memory endpoint are inherited from `EVAL_PROFILE`, not re-set.
+  >   `run_eval` and `run_end_to_end` take it as `orch_config_builder`.
+  > - **ε2 (task 5388) runs a shadow cell only through**
+  >   `orchestrator/src/orchestrator/evals/shadow_invocation.py::run_shadow_eval` or `::run_shadow_end_to_end`.
+  >   Both fix that builder, so the profile the probe checks is the profile the cell runs under.
+  > - **The coordinator's isolation dep** is
+  >   `orchestrator/src/orchestrator/evals/shadow_isolation.py::shadow_isolation_available`. Its
+  >   findings come from `probe_isolation` over the legs `shadow_leg_invocations` builds, and a
+  >   probe that cannot build its legs fails closed. Beyond strict MCP, memory and containment, it
+  >   also refuses a sandboxed leg whose backend resolves to `none` (`sandbox_unwrapped`). It refuses
+  >   any leg carrying an MCP server that is not spawned per invocation (`live_mcp_server`). A
+  >   workflow leg's servers come from
+  >   `orchestrator/src/orchestrator/workflow.py::compose_invocation_mcp_config`, the composition
+  >   `TaskWorkflow._invoke` dispatches with.
 
 - **ω — ZCode harness arm** *(leaf, probe-gated, task **5399**)*. **Stage 1 is a gate:** probe
   whether ZCode can be driven by the eval runner at all — a headless/non-interactive invocation,
