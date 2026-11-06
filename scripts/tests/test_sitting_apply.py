@@ -47,6 +47,7 @@ def _pending(queue: Path, esc_id: str, now: datetime, **fields) -> Escalation:
 def _project(tmp: Path, name: str, make_tasks_db) -> Path:
     root = tmp / 'src' / name
     (root / 'data' / 'escalations').mkdir(parents=True)
+    (root / '.taskmaster' / 'tasks').mkdir(parents=True)
     make_tasks_db([{'id': 100, 'status': 'blocked'}, {'id': 200, 'status': 'blocked'},
                    {'id': 300, 'status': 'blocked'}], directory=root / '.taskmaster' / 'tasks')
     return root

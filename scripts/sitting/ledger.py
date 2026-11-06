@@ -225,6 +225,15 @@ def resolve_answers(
     return replace(ledger, entries=entries), ResolvedAnswers(rows, unresolved)
 
 
+def key_for_ref(ledger: Ledger, item_ref: str) -> str | None:
+    """The key an item number, as Leo typed it, names in *ledger*; None when it names none."""
+    ref = item_ref.strip()
+    if not _ITEM_NUMBER_RE.fullmatch(ref):
+        return None
+    number = int(ref)
+    return next((key for key, entry in ledger.entries.items() if entry.number == number), None)
+
+
 def resolution_turns(ledger: Ledger, key: str) -> int:
     return _entry(ledger, key).answer_rounds
 
