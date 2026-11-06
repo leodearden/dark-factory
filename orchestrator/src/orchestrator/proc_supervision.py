@@ -101,6 +101,10 @@ silently drift apart (task 3404).
 # ``escalation.queue`` -> ``shared.timestamps`` -> ``shared/__init__.py``.
 _SUBMIT_CHILD_PACKAGES: tuple[str, ...] = ('escalation', 'shared')
 
+# The environment variable the RP-4 submit child's ``--setenv`` owns inside a
+# detached transient unit; ``RestartPlan.env`` may not also set it there.
+_SUBMIT_CHILD_ENV_KEY = 'PYTHONPATH'
+
 
 def _submit_child_pythonpath() -> str:
     """Build the PYTHONPATH value for the deferred submit child.
@@ -185,7 +189,7 @@ def _submit_child_setenv_args() -> list[str]:
             'gives it (per-package causes logged above)',
         )
         return []
-    return [f'--setenv=PYTHONPATH={pythonpath}']
+    return [f'--setenv={_SUBMIT_CHILD_ENV_KEY}={pythonpath}']
 
 
 def _warn_if_submit_module_unimportable(transient_unit: str | None) -> None:
@@ -455,6 +459,29 @@ class RestartPlan:
             )
         if not self.script.is_absolute():
             object.__setattr__(self, 'script', self.cwd / self.script)
+        self._check_env()
+
+    def _check_env(self) -> None:
+        """Refuse an ``env`` that some spawn path would mis-deliver silently."""
+        for key in self.env:
+            if not key or '=' in key or '\x00' in key:
+                raise ValueError(
+                    f'RestartPlan.env keys must be environment variable names '
+                    f'(non-empty, no "=" or NUL); got {key!r}'
+                )
+        if (
+            self.transient_unit
+            and self.on_failure_escalation is not None
+            and _SUBMIT_CHILD_ENV_KEY in self.env
+        ):
+            raise ValueError(
+                f'RestartPlan.env[{_SUBMIT_CHILD_ENV_KEY!r}] is refused on a plan '
+                f'with on_failure_escalation and transient_unit='
+                f'{self.transient_unit!r}: the detached payload and its RP-4 '
+                f'submit child share one transient unit, and the submit '
+                f'child\'s --setenv={_SUBMIT_CHILD_ENV_KEY} owns that variable '
+                f'there, so one of the two would be silently overridden'
+            )
 
     def _child_environ(self) -> dict[str, str] | None:
         """``env`` overlaid on ``os.environ``, or None (full inherit) when empty: the
