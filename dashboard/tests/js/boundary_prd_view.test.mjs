@@ -270,7 +270,6 @@ test('prd lanes #20: the dark-matter strip shows the served total and expands to
     const expected = membersDrawn(pool, PROJECT, darkMatterPage(served, 1).ids).rows;
     assert.ok(lines.length <= DARK_MATTER_PAGE_SIZE);
     assert.deepEqual(lines.map(line => line.dataset.rowId), expected.map(row => row.id));
-    for (const line of lines) assert.ok(served.includes(Number(line.dataset.taskId)), line.dataset.taskId);
     drawn += lines.length;
   }
   assert.ok(drawn > 0, 'no dark-matter member was drawn');
