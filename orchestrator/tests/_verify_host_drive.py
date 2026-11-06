@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 from pathlib import Path
 from typing import Any
@@ -9,13 +10,13 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _merge_lane_fakes import FakeVerifier
+from _merge_worker_drive import make_merge_request
+from _verify_result_doubles import real_verify_result
 
 from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
 from orchestrator.merge_lane.types import (
     InflightVerifyResult,
-    MergeOutcome,
     MergeRequest,
-    QueuedBranch,
     RealMergeItem,
 )
 from orchestrator.merge_lane.worker import SpeculativeMergeWorker
@@ -52,32 +53,18 @@ def probe_free_orch_config(
     return OrchestratorConfig(**kwargs)
 
 
-def passing_verify_result(**kw: Any) -> VerifyResult:
-    return VerifyResult(passed=True, test_output='', lint_output='', type_output='', summary='ok', **kw)
-
-
-def verify_merge_request(
+def merge_request_for_verify(
     config: OrchestratorConfig,
     *,
     task_files: list[str] | None = None,
     worktree: Path | None = None,
 ) -> MergeRequest:
-    """Build a MergeRequest for use in _run_post_merge_verify tests."""
-    future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
-
-    return MergeRequest(
-        task_id='task-42',
-        branch=QueuedBranch.parse('task/42', config.git.branch_prefix),
-        worktree=worktree or Path('/repo/task-42'),
-        pre_rebased=False,
-        task_files=task_files,
-        module_configs=[],
-        config=config,
-        result=future,
-    )
+    """Build task-42's MergeRequest, scoped to *task_files*, for a post-merge verify."""
+    request = make_merge_request('task-42', 'task/42', worktree or Path('/repo/task-42'), config)
+    return dataclasses.replace(request, task_files=task_files)
 
 
-def verify_git_ops_mock() -> MagicMock:
+def git_ops_mock_for_verify() -> MagicMock:
     """Build a minimal async mock for GitOps."""
     mock = MagicMock()
     mock.get_main_sha = AsyncMock(return_value='main-sha')
@@ -108,7 +95,7 @@ def runner_double(
     if error is not None:
         runner.run_merge_verify = AsyncMock(side_effect=error)
     else:
-        runner.run_merge_verify = AsyncMock(return_value=result or passing_verify_result())
+        runner.run_merge_verify = AsyncMock(return_value=result or real_verify_result(True))
     return runner
 
 
@@ -133,7 +120,7 @@ async def drive_runner_unavailable(
     one reach into ``_run_inflight_verify`` those assertions need is spelled
     once, here.
     """
-    git_ops = verify_git_ops_mock()
+    git_ops = git_ops_mock_for_verify()
     q: asyncio.Queue = asyncio.Queue()
     worker = SpeculativeMergeWorker(
         git_ops=git_ops, queue=q, verifier=FakeVerifier(),
@@ -143,7 +130,7 @@ async def drive_runner_unavailable(
     merge_result.merge_commit = 'abc123def456789abc1'
     config = probe_free_orch_config()
     item = RealMergeItem(
-        request=verify_merge_request(config, task_files=[], worktree=tmp_path),
+        request=merge_request_for_verify(config, task_files=[], worktree=tmp_path),
         merge_result=merge_result,
         merge_wt=tmp_path / 'merge-wt',
         base_sha='base123',

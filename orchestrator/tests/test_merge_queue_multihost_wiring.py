@@ -29,12 +29,12 @@ from _orch_helpers import wait_responsive
 from _verify_host_drive import (
     RUNNER_UNAVAILABLE_HOST,
     drive_runner_unavailable,
-    passing_verify_result,
+    git_ops_mock_for_verify,
+    merge_request_for_verify,
     probe_free_orch_config,
     runner_double,
-    verify_git_ops_mock,
-    verify_merge_request,
 )
+from _verify_result_doubles import real_verify_result
 
 from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
 from orchestrator.deployed_sha import DeployedSha
@@ -265,12 +265,12 @@ class _RecordingVerifier(FakeVerifier):
 
 
 def _make_drift_git_ops(tmp_path):
-    """``verify_git_ops_mock`` whose throwaway worktree is a real directory.
+    """``git_ops_mock_for_verify`` whose throwaway worktree is a real directory.
 
     The drift detective runs its verify body under a lane lease keyed to the
     throwaway checkout, so the path it is handed has to exist on disk.
     """
-    mock = verify_git_ops_mock()
+    mock = git_ops_mock_for_verify()
     throwaway = tmp_path / '_merge-throwaway'
     throwaway.mkdir(exist_ok=True)
     mock.create_ephemeral_verify_worktree = AsyncMock(return_value=throwaway)
@@ -362,8 +362,8 @@ class TestRunPostMergeVerifyPoolWiring:
         from orchestrator.merge_lane.worker import _run_post_merge_verify
 
         config = probe_free_orch_config(verify_runners=[_make_runner_cfg('laptop')])
-        req = verify_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
-        git_ops = verify_git_ops_mock()
+        req = merge_request_for_verify(config, task_files=['src/foo.py'], worktree=tmp_path)
+        git_ops = git_ops_mock_for_verify()
         es = _RecordingEventStore()
 
         outcome = await _run_post_merge_verify(
@@ -386,8 +386,8 @@ class TestRunPostMergeVerifyPoolWiring:
         from orchestrator.merge_lane.worker import _run_post_merge_verify
 
         config = probe_free_orch_config(verify_runners=[_make_runner_cfg('laptop')])
-        req = verify_merge_request(config, task_files=None, worktree=tmp_path)
-        git_ops = verify_git_ops_mock()
+        req = merge_request_for_verify(config, task_files=None, worktree=tmp_path)
+        git_ops = git_ops_mock_for_verify()
         # A real merge worktree, one commit of src/x.py ahead of main: the
         # REAL derivation runs `git diff main...HEAD` here and finds it.
         merge_wt = await _init_merge_wt_with_change(tmp_path / 'merge-wt')
@@ -416,8 +416,8 @@ class TestRunPostMergeVerifyPoolWiring:
         from orchestrator.merge_lane.worker import _run_post_merge_verify
 
         config = probe_free_orch_config(verify_runners=[])  # Lever C off
-        req = verify_merge_request(config, task_files=None, worktree=tmp_path)
-        git_ops = verify_git_ops_mock()
+        req = merge_request_for_verify(config, task_files=None, worktree=tmp_path)
+        git_ops = git_ops_mock_for_verify()
 
         # A real merge worktree one commit ahead of main: the derivation WOULD
         # find src/x.py here, so an unscoped verify is only explicable by the
@@ -466,8 +466,8 @@ class TestRunPostMergeVerifyFlockContention:
         from orchestrator.verify_runner import make_flock_contention_result
 
         config = probe_free_orch_config()
-        req = verify_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
-        git_ops = verify_git_ops_mock()
+        req = merge_request_for_verify(config, task_files=['src/foo.py'], worktree=tmp_path)
+        git_ops = git_ops_mock_for_verify()
         stub_remote = self._make_stub_remote(
             make_flock_contention_result(host='leo-laptop', holder_pgid=4242, waiter_pgid=4343)
         )
@@ -502,8 +502,8 @@ class TestRunPostMergeVerifyFlockContention:
         from orchestrator.merge_lane.worker import _run_post_merge_verify
 
         config = probe_free_orch_config()
-        req = verify_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
-        git_ops = verify_git_ops_mock()
+        req = merge_request_for_verify(config, task_files=['src/foo.py'], worktree=tmp_path)
+        git_ops = git_ops_mock_for_verify()
         plain_fail = VerifyResult(
             passed=False, test_output='FAILED test_x', lint_output='', type_output='',
             summary='1 failure', category='',
@@ -530,8 +530,8 @@ class TestRunPostMergeVerifyFlockContention:
         from orchestrator.verify_runner import make_flock_contention_result
 
         config = probe_free_orch_config()
-        req = verify_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
-        git_ops = verify_git_ops_mock()
+        req = merge_request_for_verify(config, task_files=['src/foo.py'], worktree=tmp_path)
+        git_ops = git_ops_mock_for_verify()
         stub_remote = self._make_stub_remote(
             make_flock_contention_result(host='leo-laptop', holder_pgid=4242, waiter_pgid=4343)
         )
@@ -565,8 +565,8 @@ class TestRunPostMergeVerifyLocalOnly:
         from orchestrator.merge_lane.worker import _run_post_merge_verify
 
         config = probe_free_orch_config(verify_runners=[_make_runner_cfg('laptop')])
-        req = verify_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
-        git_ops = verify_git_ops_mock()
+        req = merge_request_for_verify(config, task_files=['src/foo.py'], worktree=tmp_path)
+        git_ops = git_ops_mock_for_verify()
         es = _RecordingEventStore()
 
         outcome = await _run_post_merge_verify(
@@ -619,7 +619,7 @@ def _green_remote(name='laptop'):
     remote = MagicMock()
     remote.name = name
     remote.is_local = False
-    remote.run_merge_verify = AsyncMock(return_value=passing_verify_result())
+    remote.run_merge_verify = AsyncMock(return_value=real_verify_result(True))
     return remote
 
 
@@ -636,8 +636,8 @@ class TestCrossCheckHoldsLaneLockLease:
 
         config = _cross_check_config()
         # task_files non-None → dispatching-host derivation is skipped.
-        req = verify_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
-        git_ops = verify_git_ops_mock()
+        req = merge_request_for_verify(config, task_files=['src/foo.py'], worktree=tmp_path)
+        git_ops = git_ops_mock_for_verify()
         fake_remote = _green_remote()  # green primary → cross-check fires
 
         # An EPHEMERAL speculation lane (the incident's _merge-<hash> shape),
@@ -708,8 +708,8 @@ class TestCrossCheckHoldsLaneLockLease:
             git=GitConfig(main_branch='main', persistent_merge_worktree=False),
             verify_cross_check_remote_green=True,
         )
-        req = verify_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
-        git_ops = verify_git_ops_mock()
+        req = merge_request_for_verify(config, task_files=['src/foo.py'], worktree=tmp_path)
+        git_ops = git_ops_mock_for_verify()
         fake_remote = _green_remote()  # green primary → cross-check fires
         merge_wt = tmp_path / '_merge-98c756bc'
 
@@ -784,8 +784,8 @@ class TestCrossCheckLeaseContentionFailsSafe:
         from orchestrator.verify_cancel import lane_lock_path
 
         config = _cross_check_config()
-        req = verify_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
-        git_ops = verify_git_ops_mock()
+        req = merge_request_for_verify(config, task_files=['src/foo.py'], worktree=tmp_path)
+        git_ops = git_ops_mock_for_verify()
         fake_remote = _green_remote()  # green primary → cross-check fires
         merge_wt = tmp_path / '_merge-98c756bc'
 
@@ -864,7 +864,7 @@ class TestEnsureHostAllocator:
     def _make_worker(self, *, project_root=None, deployed_sha: DeployedSha | None = TEST_DEPLOYED_SHA):
         """Build a minimal SpeculativeMergeWorker with optional project_root."""
         from orchestrator.merge_lane.worker import SpeculativeMergeWorker
-        git_ops = verify_git_ops_mock()
+        git_ops = git_ops_mock_for_verify()
         if project_root is not None:
             git_ops.project_root = project_root
         else:
@@ -978,12 +978,12 @@ class TestColdShadowVerifyLocalOnly:
         from orchestrator.merge_lane.worker import _run_cold_shadow_verify
 
         config = probe_free_orch_config(verify_runners=[_make_runner_cfg('laptop')])
-        req = verify_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
-        git_ops = verify_git_ops_mock()
+        req = merge_request_for_verify(config, task_files=['src/foo.py'], worktree=tmp_path)
+        git_ops = git_ops_mock_for_verify()
         es = _RecordingEventStore()
 
         with patch('orchestrator.merge_lane.worker.run_scoped_verification',
-                   new=AsyncMock(return_value=passing_verify_result())):
+                   new=AsyncMock(return_value=real_verify_result(True))):
             await _run_cold_shadow_verify(git_ops, req, 'abc123', es, verifier=PRODUCTION_VERIFIER)
 
         dispatched_on = es.field('runner')
@@ -1033,7 +1033,7 @@ class TestRunDriftCheck:
         from orchestrator.merge_lane.drift import _run_drift_check
 
         config = probe_free_orch_config(verify_runners=[_make_runner_cfg('laptop')])
-        req = verify_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
+        req = merge_request_for_verify(config, task_files=['src/foo.py'], worktree=tmp_path)
         git_ops = _make_drift_git_ops(tmp_path)
         eq = self._make_fake_escalation_queue()
         es = _RecordingEventStore()
@@ -1066,11 +1066,11 @@ class TestRunDriftCheck:
         from orchestrator.merge_lane.drift import _run_drift_check
 
         config = probe_free_orch_config(verify_runners=[_make_runner_cfg('laptop')])
-        req = verify_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
+        req = merge_request_for_verify(config, task_files=['src/foo.py'], worktree=tmp_path)
         git_ops = _make_drift_git_ops(tmp_path)
         allocator = self._drift_allocator()
 
-        run_scoped = AsyncMock(return_value=passing_verify_result())
+        run_scoped = AsyncMock(return_value=real_verify_result(True))
         with patch('orchestrator.merge_lane.worker.run_scoped_verification', new=run_scoped):
             await _run_drift_check(
                 git_ops, req, 'abc123', None, None, set(),
@@ -1100,7 +1100,7 @@ class TestRunDriftCheck:
         from orchestrator.merge_lane.drift import _run_drift_check
 
         config = probe_free_orch_config(verify_runners=[_make_runner_cfg('laptop')])
-        req = verify_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
+        req = merge_request_for_verify(config, task_files=['src/foo.py'], worktree=tmp_path)
         git_ops = _make_drift_git_ops(tmp_path)
         eq = self._make_fake_escalation_queue()
         es = _RecordingEventStore()
@@ -1153,8 +1153,8 @@ class TestMaybeRunDriftCheck:
         from orchestrator.merge_lane.worker import _maybe_run_drift_check
 
         config = probe_free_orch_config(verify_runners=[])
-        req = verify_merge_request(config, worktree=tmp_path)
-        git_ops = verify_git_ops_mock()
+        req = merge_request_for_verify(config, worktree=tmp_path)
+        git_ops = git_ops_mock_for_verify()
         worker = _drift_gate_worker()
 
         with patch('asyncio.create_task') as mock_create_task:
@@ -1170,8 +1170,8 @@ class TestMaybeRunDriftCheck:
             verify_runners=[_make_runner_cfg('laptop')],
             drift_every_n=2,
         )
-        req = verify_merge_request(config, worktree=tmp_path)
-        git_ops = verify_git_ops_mock()
+        req = merge_request_for_verify(config, worktree=tmp_path)
+        git_ops = git_ops_mock_for_verify()
         worker = _drift_gate_worker()
 
         with patch('asyncio.create_task') as mock_create_task:
@@ -1198,8 +1198,8 @@ class TestMaybeRunDriftCheck:
         from orchestrator.merge_lane.worker import _maybe_run_drift_check
 
         config = probe_free_orch_config(verify_runners=[_make_runner_cfg('r1')], drift_every_n=100)
-        req = verify_merge_request(config, worktree=tmp_path)
-        git_ops = verify_git_ops_mock()
+        req = merge_request_for_verify(config, worktree=tmp_path)
+        git_ops = git_ops_mock_for_verify()
         worker = _drift_gate_worker()
 
         with patch('asyncio.create_task'):
@@ -1229,7 +1229,7 @@ class TestDriftCheckTaskGCSafety:
         """(a) SpeculativeMergeWorker.__init__ sets _drift_check_tasks = set()."""
         from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
-        git_ops = verify_git_ops_mock()
+        git_ops = git_ops_mock_for_verify()
         worker = SpeculativeMergeWorker(git_ops=git_ops, queue=asyncio.Queue())
         assert hasattr(worker, '_drift_check_tasks'), (
             'SpeculativeMergeWorker must have _drift_check_tasks after __init__'
@@ -1247,7 +1247,7 @@ class TestDriftCheckTaskGCSafety:
             verify_runners=[_make_runner_cfg('laptop')],
             drift_every_n=1,
         )
-        req = verify_merge_request(config, worktree=tmp_path)
+        req = merge_request_for_verify(config, worktree=tmp_path)
         git_ops = _make_drift_git_ops(tmp_path)
         worker = _drift_gate_worker()
 
@@ -1308,7 +1308,7 @@ class TestDriftCheckTaskStopCleanup:
         """stop() cancels in-flight drift tasks; their finally blocks run at shutdown."""
         from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
-        git_ops = verify_git_ops_mock()
+        git_ops = git_ops_mock_for_verify()
         worker = SpeculativeMergeWorker(
             git_ops=git_ops,
             queue=asyncio.Queue(),
@@ -1590,7 +1590,7 @@ class TestRunInflightVerifyRunnerUnavailableSpecWarm:
         merge_result = MagicMock()
         merge_result.merge_commit = 'abc123def456789abc1'
         return RealMergeItem(
-            request=verify_merge_request(
+            request=merge_request_for_verify(
                 config or probe_free_orch_config(), task_files=[], worktree=tmp_path,
             ),
             merge_result=merge_result,
@@ -1618,7 +1618,7 @@ class TestRunInflightVerifyRunnerUnavailableSpecWarm:
         cold_wt = tmp_path / '_merge-cold'
         cold_wt.mkdir()
 
-        git_ops = verify_git_ops_mock()
+        git_ops = git_ops_mock_for_verify()
         # The one production input that decides warm-ness: the pool hands back a
         # seeded lane.  Everything downstream of it is the real code path.
         git_ops.acquire_spec_lane = AsyncMock(return_value=(lane, True))
@@ -1665,7 +1665,7 @@ class TestRunInflightVerifyRunnerUnavailableSpecWarm:
         from orchestrator.merge_lane.worker import SpeculativeMergeWorker
         from orchestrator.verify_runner import HostLease, RunnerUnavailable
 
-        git_ops = verify_git_ops_mock()
+        git_ops = git_ops_mock_for_verify()
         q: asyncio.Queue = asyncio.Queue()
         worker = SpeculativeMergeWorker(
             git_ops=git_ops, queue=q, verifier=FakeVerifier(),
@@ -1708,7 +1708,7 @@ class TestRunInflightVerifyThreadsEscalationQueue:
         from orchestrator.merge_lane.worker import RealMergeItem, SpeculativeMergeWorker
         from orchestrator.verify_runner import HostLease, make_flock_contention_result
 
-        git_ops = verify_git_ops_mock()
+        git_ops = git_ops_mock_for_verify()
         q: asyncio.Queue = asyncio.Queue()
         worker_eq = _FakeEscalationQueue(open_l1=False)
         worker = SpeculativeMergeWorker(
@@ -1721,7 +1721,7 @@ class TestRunInflightVerifyThreadsEscalationQueue:
         merge_result.merge_commit = 'abc123def456789abc1'
 
         config = probe_free_orch_config()
-        req = verify_merge_request(config, task_files=[], worktree=tmp_path)
+        req = merge_request_for_verify(config, task_files=[], worktree=tmp_path)
 
         item = RealMergeItem(
             request=req,
@@ -1901,7 +1901,7 @@ class _HostBenchScene:
             if isinstance(escalation_queue, _DefaultEscalationQueue)
             else escalation_queue
         )
-        git_ops = verify_git_ops_mock()
+        git_ops = git_ops_mock_for_verify()
         git_ops.project_root = tmp_path
         self.config = OrchestratorConfig(
             project_root=tmp_path, verify_host_reprobe_interval_s=120.0,
@@ -2289,7 +2289,7 @@ def _make_ru_worker(*, escalate_after_n=2, escalation_queue=_DEFAULT_EQ):
 
     from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
-    git_ops = verify_git_ops_mock()
+    git_ops = git_ops_mock_for_verify()
     git_ops.project_root = None  # no real git needed for this test
     q: asyncio.Queue = asyncio.Queue()
     eq = (
@@ -2742,7 +2742,7 @@ class TestFinalizeInflightRunnerUnavailableWorktreeLedger:
 
         worker, eq, fake_alloc = _make_ru_worker(escalate_after_n=99)
         worker._running = True
-        # verify_git_ops_mock() does not expose release_spec_lane; a bare
+        # git_ops_mock_for_verify() does not expose release_spec_lane; a bare
         # MagicMock attribute is not awaitable, so install a recording stub.
         worker._git_ops.release_spec_lane = AsyncMock()
 
@@ -4187,8 +4187,8 @@ class TestRunPostMergeVerifyRemoteStderrWiring:
         # Build config with project_root=tmp_path so archive resolves there
         config = probe_free_orch_config()
         config = config.model_copy(update={'project_root': tmp_path})
-        req = verify_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
-        git_ops = verify_git_ops_mock()
+        req = merge_request_for_verify(config, task_files=['src/foo.py'], worktree=tmp_path)
+        git_ops = git_ops_mock_for_verify()
 
         from orchestrator.event_store import EventStore
 
@@ -4478,7 +4478,7 @@ class TestRunInflightVerifyNeverOrphansVerifyTask:
     def _make_worker_and_item(self, tmp_path, *, verifier=None):
         from orchestrator.merge_lane.worker import RealMergeItem, SpeculativeMergeWorker
 
-        git_ops = verify_git_ops_mock()
+        git_ops = git_ops_mock_for_verify()
         q: asyncio.Queue = asyncio.Queue()
         worker = SpeculativeMergeWorker(
             git_ops=git_ops, queue=q,
@@ -4489,7 +4489,7 @@ class TestRunInflightVerifyNeverOrphansVerifyTask:
         merge_result = MagicMock()
         merge_result.merge_commit = 'abc123def456789abc1'
         config = probe_free_orch_config()
-        req = verify_merge_request(config, task_files=[], worktree=tmp_path)
+        req = merge_request_for_verify(config, task_files=[], worktree=tmp_path)
         item = RealMergeItem(
             request=req,
             merge_result=merge_result,
@@ -4518,7 +4518,7 @@ class TestRunInflightVerifyNeverOrphansVerifyTask:
         async def _dispatch(*args, **kwargs):
             entered.append(asyncio.current_task())
             if on_verify is None:
-                return passing_verify_result()
+                return real_verify_result(True)
             return await on_verify(*args, **kwargs)
 
         runner.run_merge_verify = AsyncMock(side_effect=_dispatch)

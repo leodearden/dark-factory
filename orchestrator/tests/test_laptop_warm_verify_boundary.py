@@ -93,9 +93,9 @@ from _verify_boundary_harness import (
 )
 from _verify_host_drive import (
     drive_runner_unavailable,
+    git_ops_mock_for_verify,
+    merge_request_for_verify,
     probe_free_orch_config,
-    verify_git_ops_mock,
-    verify_merge_request,
 )
 from click.testing import CliRunner
 from escalation.queue import EscalationQueue
@@ -1652,8 +1652,8 @@ def test_flock_contention_full_two_way_seam_blocks_and_escalates(tmp_path):
 
     async def _drive_consumer():
         config = probe_free_orch_config()
-        req = verify_merge_request(config, task_files=['src/foo.py'], worktree=tmp_path)
-        git_ops = verify_git_ops_mock()
+        req = merge_request_for_verify(config, task_files=['src/foo.py'], worktree=tmp_path)
+        git_ops = git_ops_mock_for_verify()
         return await _run_post_merge_verify(
             git_ops, req, tmp_path,
             timeouts={}, enospc_retries={},
