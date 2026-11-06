@@ -84,6 +84,7 @@ import pytest
 import yaml
 from orchestrator.verify import _AND_CLAUSE_SPLIT_RE, _cd_clause_target
 from orchestrator.verify_cmd import split_top_level_and
+from shared.testing_xdist_groups import single_xdist_group
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 
@@ -494,6 +495,9 @@ def _offline_probe_argv(clause: str) -> list[str]:
     return ["npx", "--yes", "--offline", "pyright", *tokens[2:], "--version"]
 
 
+_NPX_RESOLUTION_GROUP = "pyright_pin_npx_resolution"
+
+
 @pytest.fixture(scope="module")
 def clean_worktree_resolution(tmp_path_factory: pytest.TempPathFactory) -> dict[str, object]:
     """Reproduce a clean worktree + COLD npx cache, and record both resolutions.
@@ -593,6 +597,18 @@ def clean_worktree_resolution(tmp_path_factory: pytest.TempPathFactory) -> dict[
         after = {}
 
     return {"root": root, "before": before, "install": install, "after": after}
+
+
+def test_the_npx_resolution_consumers_share_one_xdist_worker(request: pytest.FixtureRequest) -> None:
+    """Under --dist loadgroup a module-scoped fixture is rebuilt on every worker that runs one of its consumers."""
+    consumers = [
+        item for item in request.session.items
+        if "clean_worktree_resolution" in getattr(item, "fixturenames", ())
+    ]
+    if not consumers:
+        pytest.skip("no clean_worktree_resolution consumer is selected in this session")
+
+    assert single_xdist_group(consumers) == _NPX_RESOLUTION_GROUP
 
 
 def test_npx_in_a_fresh_worktree_does_not_resolve_the_pin_on_its_own(
