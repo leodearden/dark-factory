@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import pathlib
+import threading
 import time
 import uuid
 from datetime import UTC, datetime
@@ -1769,3 +1770,60 @@ async def test_close_leaves_every_handed_off_record_on_disk_and_its_row_released
     assert dead_lettered.isdisjoint(journaled), dead_lettered & journaled
     assert dead_lettered | journaled == {e.id for e in events}
     assert {r['reason'] for r in records} <= {'overflow_drop', 'shutdown_timeout'}
+
+
+@pytest.mark.asyncio
+async def test_flush_dead_letters_returns_only_after_the_journal_row_release_is_scheduled(
+    monkeypatch, tmp_path,
+):
+    """flush_dead_letters(), and so close(), must not return before a written
+    record's journal-row release has been queued on the loop.
+
+    This race lets a dead-lettered event stay journaled (the
+    test_close_leaves_every_handed_off_record_on_disk_and_its_row_released
+    flake). The writer thread's first hop onto the loop is parked to hold
+    that ordering open.
+    """
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    real_hop = loop.call_soon_threadsafe
+    hop_parked = asyncio.Event()
+    unpark = threading.Event()
+    parked = False
+
+    def park_first_off_loop_hop(callback, *args, **kwargs):
+        nonlocal parked
+        if threading.get_ident() != loop_thread and not parked:
+            parked = True
+            real_hop(hop_parked.set)
+            unpark.wait()
+        return real_hop(callback, *args, **kwargs)
+
+    monkeypatch.setattr(loop, 'call_soon_threadsafe', park_first_off_loop_hop)
+    held = hold_fifo(tmp_path / 'dl.jsonl')
+    ej = tmp_path / 'ej.db'
+    q = EventQueue(AsyncMock(), dead_letter_path=held.path, journal_path=ej, maxsize=1)
+    try:
+        e1, e2 = _make_event(), _make_event()
+        assert q.enqueue(e1) is True
+        assert q.enqueue(e2) is False
+        held.release.set()
+        await hop_parked.wait()
+
+        flush = asyncio.ensure_future(q.flush_dead_letters())
+        # Without the ordering guarantee, flush completes within three loop iterations.
+        for _ in range(10):
+            await asyncio.sleep(0)
+        assert not flush.done(), (
+            'flush_dead_letters() returned before the writer thread queued the '
+            'journal-row release'
+        )
+
+        unpark.set()
+        await flush
+        journaled = journaled_ids(ej)
+        assert e2.id not in journaled
+        assert e1.id in journaled
+    finally:
+        unpark.set()
+        await q.close()
