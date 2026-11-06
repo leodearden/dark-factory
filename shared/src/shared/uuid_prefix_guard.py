@@ -114,6 +114,7 @@ __all__ = [
     'ResolverUnavailable',
     'ToolClass',
     'UUID_PREFIX_STORM_ERROR_TYPE',
+    'UnavailableReason',
     'UuidPrefixGuardMiddleware',
     'project_from_arguments',
 ]
@@ -175,19 +176,36 @@ class Resolution(NamedTuple):
     candidates: tuple[Candidate, ...]
 
 
+class UnavailableReason(enum.StrEnum):
+    """WHY a prefix got no resolution — orthogonal to WHICH store it concerned."""
+
+    #: The named store could not be reached, or the service reported that it
+    #: could not reach it.
+    UNREACHABLE = 'unreachable'
+    #: No answer arrived within the caller's deadline. The store may be
+    #: healthy but slow.
+    TIMED_OUT = 'timed_out'
+    #: An answer arrived that is not a :class:`Resolution`.
+    BAD_RESPONSE = 'bad_response'
+
+
 class ResolverUnavailable(Exception):
-    """A store could not be reached, so the prefix was never actually checked.
+    """A store gave no usable answer, so the prefix was never actually checked.
 
     Carries WHICH store failed, because "the resolver is down" is not
     actionable and "mem0 is down" is. The distinction this type exists to
     protect is the one INV-11 turns on: a store that cannot be reached must
     never be reported as a store that held nothing, or a live id silently
     becomes a `none` and the guard goes quietly inert on a real citation.
+
+    ``reason`` adds WHY there was no resolution, on an axis orthogonal to
+    ``store``: a slow store and an unreachable one call for different actions.
     """
 
-    def __init__(self, store: str) -> None:
-        super().__init__(f'prefix resolution unavailable: the {store} store could not be reached')
+    def __init__(self, store: str, *, reason: UnavailableReason = UnavailableReason.UNREACHABLE) -> None:
+        super().__init__(f'prefix resolution unavailable ({reason}): the {store} store')
         self.store = store
+        self.reason = reason
 
 
 class ToolClass(enum.StrEnum):
