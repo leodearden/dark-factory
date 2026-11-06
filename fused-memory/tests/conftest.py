@@ -313,6 +313,27 @@ def _no_inherited_project_registry(monkeypatch):
     monkeypatch.delenv(KNOWN_PROJECT_ROOTS_ENV, raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _isolate_fm_data_dir(monkeypatch, tmp_path):
+    """Pin ``DARK_FACTORY_DATA_DIR`` at this test's ``tmp_path / 'data'`` (task 6456).
+
+    Unpinned, ``fused_memory.middleware.task_interceptor::_combine_audit_path``
+    appends every curator combine to ``<CWD>/data/combine_audit.jsonl``; run
+    from the repo root that is the live service's own audit file, since the
+    service's ``WorkingDirectory`` is the repo root.
+
+    Separate from ``_isolate_fm_config`` because this variable is a
+    module-level ``os.getenv``, not a config leaf.  The ``tmp_path / 'data'``
+    layout mirrors a deployment rooted at ``tmp_path``, which is where
+    ``_isolate_fm_config`` puts ``PROJECT_ROOT``.  ``setenv`` overwrites an
+    inherited value; a test-body ``setenv`` still wins, as
+    ``test_task_interceptor.py::audit_dir`` relies on.  See
+    ``test_data_dir_hermeticity.py`` and
+    ``plans/fused-memory-config-cwd-leak-rca-2026-09-13.md``.
+    """
+    monkeypatch.setenv('DARK_FACTORY_DATA_DIR', str(tmp_path / 'data'))
+
+
 @pytest.fixture
 def code_default_config(monkeypatch, tmp_path):
     """Resolve ``FusedMemoryConfig()`` from the SCHEMA alone, on request.
