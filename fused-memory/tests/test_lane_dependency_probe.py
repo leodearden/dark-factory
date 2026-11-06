@@ -5,6 +5,7 @@ FalkorDB is covered by its unreachable case only; a write-refusing FalkorDB woul
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import socket
@@ -122,6 +123,16 @@ def write_refusing_qdrant(watched_lease_dir: Path | None = None) -> Iterator[Run
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+def test_a_refused_port_turns_connects_away_and_cannot_be_bound_while_held() -> None:
+    with refused_port() as port:
+        with pytest.raises(ConnectionRefusedError):
+            socket.create_connection(('127.0.0.1', port), timeout=5)
+        with pytest.raises(OSError) as bind:
+            ThreadingHTTPServer(('127.0.0.1', port), WriteRefusingQdrant)
+
+    assert bind.value.errno == errno.EADDRINUSE
 
 
 def test_unreachable_qdrant_is_an_outage_naming_qdrant(lease_dir: Path) -> None:
