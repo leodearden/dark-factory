@@ -644,9 +644,8 @@ async def test_a_candidate_with_only_the_embedding_stream_and_it_failed_is_corpu
 
 @pytest.mark.asyncio
 async def test_the_ticket_of_an_all_streams_failed_candidate_parks_awaiting_curation(
-    tmp_path, monkeypatch,
+    tmp_path,
 ):
-    monkeypatch.setenv('DARK_FACTORY_DATA_DIR', str(tmp_path / 'data'))
     async with (
         _open_stack(tmp_path / 'project', _ModuleReadFailsBackend) as stack,
         _interceptor_over(stack, tmp_path) as (interceptor, store),

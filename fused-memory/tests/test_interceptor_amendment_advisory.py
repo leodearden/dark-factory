@@ -90,8 +90,7 @@ BuildStack = Callable[..., Awaitable[Stack]]
 
 
 @pytest_asyncio.fixture
-async def build_stack(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[BuildStack]:
-    monkeypatch.setenv('DARK_FACTORY_DATA_DIR', str(tmp_path / 'data'))
+async def build_stack(tmp_path: Path) -> AsyncIterator[BuildStack]:
     closers: list[Callable[[], Awaitable[object]]] = []
 
     async def _build(*, curator: Any = None, event_queue: Any = None) -> Stack:

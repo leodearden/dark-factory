@@ -515,9 +515,8 @@ class TestCuratorWorkerJournal:
 
     @pytest.mark.asyncio
     async def test_combine_writes_task_combined_for_the_target(
-        self, build_interceptor, write_journal, taskmaster, monkeypatch, tmp_path,
+        self, build_interceptor, write_journal, taskmaster,
     ):
-        monkeypatch.setenv('DARK_FACTORY_DATA_DIR', str(tmp_path / 'data'))
         taskmaster.get_task = AsyncMock(return_value={
             'id': '42', 'title': 'Existing Task', 'status': 'pending', 'metadata': {},
         })

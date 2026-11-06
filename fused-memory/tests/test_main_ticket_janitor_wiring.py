@@ -61,11 +61,6 @@ class _DeferThenHoldCurator:
         return None
 
 
-@pytest.fixture(autouse=True)
-def _combine_audit_in_tmp(monkeypatch, tmp_path):
-    monkeypatch.setenv('DARK_FACTORY_DATA_DIR', str(tmp_path / 'data'))
-
-
 @pytest.fixture
 def config() -> FusedMemoryConfig:
     cfg = FusedMemoryConfig()

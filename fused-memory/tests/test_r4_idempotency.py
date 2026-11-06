@@ -107,11 +107,6 @@ class R4Stack:
         return set(await self.backend.get_statuses_raw(self.root))
 
 
-@pytest.fixture(autouse=True)
-def _data_dir_in_tmp(monkeypatch, tmp_path):
-    monkeypatch.setenv('DARK_FACTORY_DATA_DIR', str(tmp_path / 'data'))
-
-
 @asynccontextmanager
 async def _open_stack(
     tmp_path: Path, backend_cls: type[_RecordingBackend] = _RecordingBackend,

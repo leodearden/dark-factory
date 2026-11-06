@@ -211,11 +211,6 @@ class _Server:
             await store.close()
 
 
-@pytest.fixture(autouse=True)
-def _combine_audit_in_tmp(monkeypatch, tmp_path):
-    monkeypatch.setenv('DARK_FACTORY_DATA_DIR', str(tmp_path / 'data'))
-
-
 @pytest_asyncio.fixture
 async def server(tmp_path):
     buffer = EventBuffer(db_path=tmp_path / 'events.db', buffer_size_threshold=100)
