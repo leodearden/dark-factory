@@ -20,7 +20,6 @@ import json
 import logging
 import threading
 import time
-from types import SimpleNamespace
 from typing import IO, Any, Literal, overload
 
 import pytest
@@ -486,21 +485,16 @@ class TestZeroOutputTimeoutEscalation:
     ):
         """The window counts from the end of the filing attempt, not from its start."""
         clock = _SteppedClock()
-        monkeypatch.setattr(
-            curator_escalator, 'time', SimpleNamespace(time=time.time, monotonic=clock),
-        )
-        real_filing = curator_escalator._file_zot_escalation
+        real_make_id = EscalationQueue.make_id
 
-        def _filing_slower_than_the_window(*args, **kwargs):
-            clock.advance(curator_escalator._ZOT_DEDUP_WINDOW_SECS + 1)
-            return real_filing(*args, **kwargs)
+        def _minting_slower_than_the_window(self, *args, **kwargs):
+            clock.advance(3600)
+            return real_make_id(self, *args, **kwargs)
 
-        monkeypatch.setattr(
-            curator_escalator, '_file_zot_escalation', _filing_slower_than_the_window,
-        )
+        monkeypatch.setattr(EscalationQueue, 'make_id', _minting_slower_than_the_window)
         handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
         try:
-            escalator = CuratorEscalator()
+            escalator = CuratorEscalator(monotonic=clock)
 
             ids = await asyncio.gather(
                 *(escalator.report_failure(**_zot_report(tmp_path)) for _ in range(3)),
