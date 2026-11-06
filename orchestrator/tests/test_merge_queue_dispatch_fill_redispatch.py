@@ -1022,6 +1022,9 @@ class TestGateReverifyDoesNotParkTheLoop:
 
             assert head_outcome.status == 'done', head_outcome
             assert waiter_outcome.status == 'done', waiter_outcome
+            assert head_outcome.merge_sha is not None and waiter_outcome.merge_sha is not None, (
+                head_outcome, waiter_outcome,
+            )
             assert await lane.git_ops.is_ancestor_checked(
                 head_outcome.merge_sha, waiter_outcome.merge_sha,
             ) is True, (head_outcome, waiter_outcome)
@@ -1117,6 +1120,9 @@ class TestGateReverifyDoesNotParkTheLoop:
 
             assert head_outcome.status == 'done', head_outcome
             assert waiter_outcome.status == 'done', waiter_outcome
+            assert head_outcome.merge_sha is not None and waiter_outcome.merge_sha is not None, (
+                head_outcome, waiter_outcome,
+            )
             assert await lane.git_ops.is_ancestor_checked(
                 second_drift, head_outcome.merge_sha,
             ) is True, head_outcome
