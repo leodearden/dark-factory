@@ -13,11 +13,13 @@ would pass while running none of the guard.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 from fastmcp import Client
 from shared.mcp_markup_middleware import MarkupGuardMiddleware
@@ -25,6 +27,7 @@ from shared.toolcall_markup import INVOKE_CLOSER, closer_for
 from shared.uuid_prefix_guard import (
     FACT_UUID_PREFIX_DETECTED,
     Candidate,
+    PrefixResolver,
     Resolution,
     ResolverUnavailable,
     UuidPrefixGuardMiddleware,
@@ -56,6 +59,21 @@ AMBIGUOUS = Resolution('ambiguous', (
     Candidate('graphiti_node', SIBLING, 'a node'),
 ))
 NONE = Resolution('none', ())
+
+#: UNIQUE as fused-memory's POST /resolve-prefix spells it on the wire.
+UNIQUE_BODY = {'outcome': 'unique', 'candidates': [{'namespace': 'mem0', 'id': FULL, 'preview': 'the dead repair'}]}
+
+
+def http_resolver(*, answers_after: float, **client_kwargs: float) -> PrefixResolver:
+    """A REAL PrefixResolverClient whose fused-memory answers UNIQUE after *answers_after* seconds."""
+
+    async def answer(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(answers_after)
+        return httpx.Response(200, json=UNIQUE_BODY)
+
+    return PrefixResolverClient(
+        base_url='http://fused-memory.test', transport=httpx.MockTransport(answer), **client_kwargs,
+    ).resolve_prefix
 
 
 def project_identity(tmp_path: Path) -> StoreIdentity:
@@ -204,6 +222,26 @@ class TestUniqueIsExpanded:
         ]
 
 
+class TestSlowResolverStillResolves:
+    """Measured /resolve-prefix latency reaches ~2.4 s under the guard's 8-wide
+    fan-out; a fused-memory answering in 1.5 s must still expand the citation."""
+
+    @pytest.mark.asyncio
+    async def test_a_resolver_answering_after_1_5s_files_the_full_id(self, tmp_path: Path, caplog):
+        caplog.set_level(logging.INFO, logger='escalation.server')
+        queue, server = build(tmp_path, http_resolver(answers_after=1.5))
+
+        result = await call(server, 'escalate_info', {**REQUIRED, 'detail': CITING_DETAIL})
+
+        esc = queue.get(result.data['id'])
+        assert esc is not None
+        assert FULL in esc.detail
+        repair = meta_of(result)['uuid_prefix_repair']
+        assert 'substitutions' in repair
+        assert 'resolver' not in repair
+        assert [fact['outcome'] for _, fact in prefix_facts(caplog)] == ['expanded']
+
+
 class TestAmbiguousIsForwarded:
     """Every tool on this server forwards on ambiguity: a lost escalation is worse."""
 
@@ -259,11 +297,26 @@ class TestFailOpen:
         esc = queue.get(result.data['id'])
         assert esc is not None
         assert esc.detail == CITING_DETAIL
-        assert meta_of(result)['uuid_prefix_repair'] == {'resolver': 'unavailable', 'store': 'fused-memory'}
+        assert meta_of(result)['uuid_prefix_repair'] == {
+            'resolver': 'unavailable', 'store': 'fused-memory', 'reason': 'unreachable',
+        }
         assert [
             (level, fact['outcome'], fact['project'], fact['token'])
             for level, fact in prefix_facts(caplog)
         ] == [(logging.WARNING, 'resolver_unavailable', 'reify', PREFIX)]
+
+    @pytest.mark.asyncio
+    async def test_a_resolver_past_its_deadline_files_unchanged_naming_the_timeout(self, tmp_path: Path):
+        queue, server = build(tmp_path, http_resolver(answers_after=30, timeout_seconds=0.05))
+
+        result = await call(server, 'escalate_info', {**REQUIRED, 'detail': CITING_DETAIL})
+
+        esc = queue.get(result.data['id'])
+        assert esc is not None
+        assert esc.detail == CITING_DETAIL
+        assert meta_of(result)['uuid_prefix_repair'] == {
+            'resolver': 'unavailable', 'store': 'fused-memory', 'reason': 'timed_out',
+        }
 
 
 class TestNoneIsInert:

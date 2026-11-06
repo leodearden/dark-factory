@@ -18,7 +18,7 @@ from typing import Any
 
 import httpx
 import pytest
-from shared.uuid_prefix_guard import Candidate, Resolution, ResolverUnavailable
+from shared.uuid_prefix_guard import Candidate, Resolution, ResolverUnavailable, UnavailableReason
 
 from escalation import prefix_resolver_client
 from escalation.prefix_resolver_client import PrefixResolverClient
@@ -192,15 +192,69 @@ class TestDeadline:
 
         assert time.monotonic() - started < 1.0
 
+
+class TestSlowButAnswering:
+    """Measured /resolve-prefix latency reaches ~2.4 s under the guard's own
+    8-wide fan-out, so a resolver that answers in 1.5 s is healthy, not down."""
+
     @pytest.mark.asyncio
-    async def test_the_default_deadline_is_one_second_in_total(self):
-        started = time.monotonic()
+    async def test_a_resolver_answering_after_1_5s_resolves_under_the_default_deadline(self, caplog):
+        caplog.set_level(logging.WARNING, logger=prefix_resolver_client.__name__)
 
-        with pytest.raises(ResolverUnavailable):
-            await _resolve(_client(self._hang))
+        async def slow(request: httpx.Request) -> httpx.Response:
+            await asyncio.sleep(1.5)
+            return httpx.Response(200, json={
+                'outcome': 'unique', 'candidates': [{'namespace': 'mem0', 'id': _FULL, 'preview': 'p'}],
+            })
 
-        elapsed = time.monotonic() - started
-        assert 0.9 <= elapsed < 3.0
+        resolution = await _resolve(_client(slow))
+
+        assert resolution == Resolution('unique', (Candidate('mem0', _FULL, 'p'),))
+        assert _client_warnings(caplog) == []
+
+
+def _raise_connect_error(request: httpx.Request) -> httpx.Response:
+    raise httpx.ConnectError('connection refused', request=request)
+
+
+def _raise_read_timeout(request: httpx.Request) -> httpx.Response:
+    raise httpx.ReadTimeout('slow', request=request)
+
+
+class TestReasons:
+    """WHY there was no resolution, orthogonal to WHICH store: each reason is a
+    different operator action (load; down or wrong URL; contract drift)."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('build', 'reason', 'store'), [
+        (lambda: _client(_raise_connect_error), UnavailableReason.UNREACHABLE, 'fused-memory'),
+        (
+            lambda: _client(_Recorder(httpx.Response(503, json={'store': 'graphiti'}))),
+            UnavailableReason.UNREACHABLE, 'graphiti',
+        ),
+        (lambda: _client(_Recorder(httpx.Response(500))), UnavailableReason.BAD_RESPONSE, 'fused-memory'),
+        (
+            lambda: _client(_Recorder(httpx.Response(200, json={'outcome': 'maybe', 'candidates': []}))),
+            UnavailableReason.BAD_RESPONSE, 'fused-memory',
+        ),
+        (lambda: _client(_raise_read_timeout), UnavailableReason.TIMED_OUT, 'fused-memory'),
+        (
+            lambda: _client(TestDeadline._hang, timeout_seconds=0.05),
+            UnavailableReason.TIMED_OUT, 'fused-memory',
+        ),
+        (
+            lambda: PrefixResolverClient(base_url='http://localhost:abc'),
+            UnavailableReason.UNREACHABLE, 'fused-memory',
+        ),
+    ], ids=[
+        'connect-error', '503-naming-a-store', 'http-500', 'malformed-200', 'httpx-read-timeout',
+        'stalled-past-the-deadline', 'unusable-base-url',
+    ])
+    async def test_each_failure_names_why_it_got_no_resolution(self, build, reason, store):
+        with pytest.raises(ResolverUnavailable) as raised:
+            await _resolve(build())
+
+        assert (raised.value.reason, raised.value.store) == (reason, store)
 
 
 class TestCancellation:
