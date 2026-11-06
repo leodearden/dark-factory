@@ -1277,6 +1277,64 @@ The options must NAME those escalations, because acting on one of them is the co
 
 Add to digest: `PROMOTED (L2 <id>): risk_identified — <sentinel_task_id> — <summary>`
 
+#### Stale-L0 strand sweep L1s (`__stale_l0_strand_sweep__`)
+
+`orchestrator/src/orchestrator/harness.py::Harness._file_stale_l0_strand_escalation` files ONE blocking L1 per startup sweep that dismissed L0s already older than `orphan_l0_timeout_secs`. Notes the info-L0 router owns are never strands (`Harness._snapshot_stale_l0_strands` skips them), so every listed note is one nothing else routed.
+
+**Class discriminator.** `task_id == "__stale_l0_strand_sweep__"` AND `agent_role == "harness-stale-l0-strand-sweep"`.
+
+**Extraction.** `detail` holds one line per strand; read every one (the summary's `<B> with a workflow waiting` count must agree with them):
+
+```
+  - <esc_id> (task <task_id>): pending <s>s, severity=<sev>, workflow_blocked=<True|False>, category=<cat>, agent_role=<role>
+```
+
+**Recover and route each `workflow_blocked=False` strand** (Leo's tier-10 grant of 2026-10-22, moved to L1 by §3.12):
+1. Recover the dismissed note: `mcp__escalation__get_task_escalations(task_id=<strand task_id>, status=None)` (archive-inclusive, full rows), and pick the row by id. Not found → routing failure.
+2. `mcp__fused-memory__get_task(<strand task_id>)`. Owner `status == "pending"` → `mcp__fused-memory__update_task(id=<strand task_id>, details="<strand <esc_id>, recovered from stale-L0 sweep <record id>: summary + detail verbatim>", append=True, project_root=<project_root>)`. Pending only: task text is never re-read after dispatch.
+3. Otherwise (owner dispatched, terminal, or absent, such as a synthetic anchor) → [Convert to tracked work](#convert-to-tracked-work-file-and-resolve) steps 1–2 for that note, with `spawned_from` = the strand task id or `'N/A'` and R4 `escalation_id` = the strand's own esc id. A curator-origin note (`fused-memory/task-curator` / `fused-memory/ticket-janitor`) is never filed ([Curator-origin records](#curator-origin-records--promote-never-re-file)); without a pending owner it is a routing failure.
+4. A note with no durable work-shaped content (Convert's criterion (b) fails) is `moot`, only with the reason written down.
+
+**Every strand `workflow_blocked=False` → close** once every note is routed:
+
+```python
+mcp__escalation__resolve_issue(
+  escalation_id=esc["id"],
+  resolution="Stale-L0 strand recover-and-route: <esc_id> → appended to task <id> | filed as task <id> (created|combined) | moot: <reason>; ...",
+  action="close_only",
+  resolved_by="escalation-watcher-auto",
+  resolution_class=<"converted" if any note was filed, else "actionable" if any was appended, else "benign">,
+)
+```
+
+Add to digest: `AUTO-CLOSED (L1 <esc_id>): stale-l0-strand-recover-and-route — <N> note(s): <esc→destination; ...> [<class>]`
+
+**Any `workflow_blocked=True` → route the info strands first as above, then promote.** Fold hint: when the detail cites `Earlier stale-L0 strand records are still open ... (clustered under pending L2 <id>)`, reuse that pending L2's `root_cause` (read from `pending_l2s`); else use the one stable key below.
+
+```python
+mcp__escalation__promote_to_l2(
+  task_id="__stale_l0_strand_sweep__",
+  agent_role="escalation-watcher-auto",
+  member_ids=[esc["id"]],
+  root_cause=<the cited pending L2's root_cause, else "stale-l0-strand-workflow-waiting">,
+  evidence="<the workflow_blocked=True lines verbatim> | info strands: <esc→destination; ...>",
+  options=[
+    "A: find why no steward pass resolved <esc_id> before the restart",
+    "B: re-dispatch task <task_id>",
+    "C: something else",
+  ],
+  summary=esc["summary"],
+  category="risk_identified",
+  # severity omitted — inherited from the member
+)
+```
+
+Add to digest: `PROMOTED (L2 <id>): risk_identified — __stale_l0_strand_sweep__ — <summary>`
+
+**Routing failure** (note unrecoverable, `update_task` error, filing refused, failed or still pending, a curator-origin note without a pending owner) → [Convert](#convert-to-tracked-work-file-and-resolve) step 4: promote this record with root_cause `"unfiled-finding:__stale_l0_strand_sweep__:<sweep record id>"` and every per-note outcome in `evidence`; never leave it pending. A record that also has a `workflow_blocked=True` line takes the promote above instead, with the outcomes in its `evidence`.
+
+An earlier strand record still pending, or clustered under a pending L2, does not change an info-only record's disposition: each record names only its own sweep's strands.
+
 #### `design_concern` / `risk_identified` / `missing_premise`
 
 These require human judgment. Apply shallow RCA: sibling tasks of the same PRD parent often cluster here.
@@ -1285,7 +1343,7 @@ These require human judgment. Apply shallow RCA: sibling tasks of the same PRD p
 
 Root_cause hint:
 - `design_concern` / `missing_premise`: `"design-concern:<module-or-parent-task-slug>"`
-- `risk_identified`: `"risk:<module-or-area-slug>"` — **except** a `risk_identified` L1 whose `task_id` starts with `__recovery_veto_streak__`: those are handled by [Recovery veto-streak sentinel L1s](#recovery-veto-streak-sentinel-l1s-__recovery_veto_streak__) above and must NOT take this generic key.
+- `risk_identified`: `"risk:<module-or-area-slug>"` — **except** a `risk_identified` L1 whose `task_id` starts with `__recovery_veto_streak__` or is `__stale_l0_strand_sweep__`: those are handled by [Recovery veto-streak sentinel L1s](#recovery-veto-streak-sentinel-l1s-__recovery_veto_streak__) and [Stale-L0 strand sweep L1s](#stale-l0-strand-sweep-l1s-__stale_l0_strand_sweep__) above and must NOT take this generic key.
 
 ```python
 mcp__escalation__promote_to_l2(
