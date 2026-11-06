@@ -14,9 +14,10 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from _gate_fixtures import gated_remote_runner
+from _gate_fixtures import TEST_DEPLOYED_SHA, gated_remote_runner
 
-from orchestrator.config import OrchestratorConfig
+from orchestrator import verify_hosts
+from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
 from orchestrator.verify import admission_policy
 from orchestrator.verify_admission_gate import AdmissionPlan, AdmissionPolicy
 from orchestrator.verify_hosts import HostPool
@@ -352,3 +353,166 @@ class TestCancelInFlight:
         assert log == ['cancel', 'unwind', 'probe']
         assert benched == []
         assert any('laptop' in r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
+
+
+# ---------------------------------------------------------------------------
+# The harness's construction seams: which hosts, and a per-turn runner builder
+# ---------------------------------------------------------------------------
+
+_HOSTS_LOGGER = 'orchestrator.verify_hosts'
+
+
+def _runner_config(name: str, **overrides: Any) -> VerifyRunnerConfig:
+    fields: dict[str, Any] = {
+        'name': name, 'ssh_host': f'{name}.local', 'git_remote': f'{name}-remote',
+        'df_checkout_path': f'/home/{name}/dark-factory', 'config_path': f'/etc/{name}.yaml',
+    }
+    fields.update(overrides)
+    return VerifyRunnerConfig(**fields)
+
+
+def _runners_config(tmp_path: Path, *runners: VerifyRunnerConfig) -> OrchestratorConfig:
+    return _config(
+        tmp_path, git=GitConfig(main_branch='trunk'), verify_env_probes=[],
+        verify_runners=list(runners),
+    )
+
+
+@pytest.mark.usefixtures('code_default_config')
+class TestTaskVerifyHosts:
+    def test_enabled_runners_in_config_order(self, tmp_path):
+        config = _runners_config(
+            tmp_path, _runner_config('laptop'), _runner_config('spare', enabled=False),
+            _runner_config('desk'),
+        )
+
+        hosts = verify_hosts.task_verify_hosts(config, deployed_sha=TEST_DEPLOYED_SHA)
+
+        assert hosts == ('laptop', 'desk')
+
+    def test_no_enabled_runner_is_no_host_and_no_warning(self, tmp_path, caplog):
+        caplog.set_level(logging.WARNING, logger=_HOSTS_LOGGER)
+        config = _runners_config(tmp_path, _runner_config('spare', enabled=False))
+
+        assert verify_hosts.task_verify_hosts(config, deployed_sha=TEST_DEPLOYED_SHA) == ()
+        assert verify_hosts.task_verify_hosts(config, deployed_sha=None) == ()
+        assert [r for r in caplog.records if r.name == _HOSTS_LOGGER] == []
+
+    def test_no_deployed_sha_is_no_host_and_one_warning(self, tmp_path, caplog):
+        caplog.set_level(logging.WARNING, logger=_HOSTS_LOGGER)
+        config = _runners_config(tmp_path, _runner_config('laptop'), _runner_config('desk'))
+
+        assert verify_hosts.task_verify_hosts(config, deployed_sha=None) == ()
+
+        [warning] = [r for r in caplog.records if r.name == _HOSTS_LOGGER]
+        assert warning.levelno == logging.WARNING
+        message = warning.getMessage()
+        assert '6565' in message
+        assert 'laptop' in message and 'desk' in message
+
+
+class _ConstructionSpy:
+    """Records each RemoteRunner construction's keywords, then builds the real runner."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    def __call__(self, *args: Any, **kwargs: Any) -> RemoteRunner:
+        self.calls.append(dict(kwargs))
+        return RemoteRunner(*args, **kwargs)
+
+
+@pytest.mark.usefixtures('code_default_config')
+class TestRemoteRunnerFactory:
+    def test_a_built_runner_carries_the_runner_config_and_the_deployed_sha(
+        self, tmp_path, monkeypatch,
+    ):
+        spy = _ConstructionSpy()
+        monkeypatch.setattr(verify_hosts, 'RemoteRunner', spy)
+        laptop = _runner_config('laptop')
+        config = _runners_config(tmp_path, laptop)
+
+        runner = verify_hosts.remote_runner_factory(
+            config, '/repo', deployed_sha=TEST_DEPLOYED_SHA,
+        )('laptop')
+
+        assert isinstance(runner, RemoteRunner)
+        assert runner.name == 'laptop'
+        assert runner.deployed_sha == TEST_DEPLOYED_SHA
+        [kwargs] = spy.calls
+        gate = laptop.gate_paths()
+        assert {k: kwargs[k] for k in (
+            'name', 'ssh_host', 'git_remote', 'cwd', 'config_path', 'main_branch',
+            'df_remote_checkout', 'gate_checkouts_path', 'deployed_sha',
+        )} == {
+            'name': 'laptop', 'ssh_host': 'laptop.local', 'git_remote': 'laptop-remote',
+            'cwd': '/repo', 'config_path': '/etc/laptop.yaml', 'main_branch': 'trunk',
+            'df_remote_checkout': gate.source, 'gate_checkouts_path': gate.root,
+            'deployed_sha': TEST_DEPLOYED_SHA,
+        }
+
+    def test_build_remote_runners_constructs_the_same_runner(self, tmp_path, monkeypatch):
+        spy = _ConstructionSpy()
+        monkeypatch.setattr(verify_hosts, 'RemoteRunner', spy)
+        config = _runners_config(tmp_path, _runner_config('laptop'))
+
+        verify_hosts.remote_runner_factory(config, '/repo', deployed_sha=TEST_DEPLOYED_SHA)('laptop')
+        verify_hosts.build_remote_runners(config, '/repo', deployed_sha=TEST_DEPLOYED_SHA)
+
+        factory_kwargs, list_kwargs = spy.calls
+        assert factory_kwargs == list_kwargs
+
+    def test_each_call_builds_a_fresh_runner(self, tmp_path):
+        config = _runners_config(tmp_path, _runner_config('laptop'))
+        build = verify_hosts.remote_runner_factory(config, '/repo', deployed_sha=TEST_DEPLOYED_SHA)
+
+        assert build('laptop') is not build('laptop')
+
+    @pytest.mark.parametrize('name', ['desk', 'spare'])
+    def test_an_unknown_or_disabled_name_is_refused(self, tmp_path, name):
+        config = _runners_config(
+            tmp_path, _runner_config('laptop'), _runner_config('spare', enabled=False),
+        )
+        build = verify_hosts.remote_runner_factory(config, '/repo', deployed_sha=TEST_DEPLOYED_SHA)
+
+        with pytest.raises(ValueError, match=name):
+            build(name)
+
+    def test_a_benched_host_is_still_built(self, tmp_path):
+        config = _runners_config(tmp_path, _runner_config('laptop'))
+        pool = HostPool(
+            ('laptop',),
+            runner_for=verify_hosts.remote_runner_factory(
+                config, '/repo', deployed_sha=TEST_DEPLOYED_SHA,
+            ),
+            quarantine={'laptop'}, on_unavailable=_Hooks().on_unavailable,
+        )
+
+        assert pool.runner_for_turn('laptop').name == 'laptop'
+
+    def test_no_deployed_sha_never_builds_a_runner(self, tmp_path):
+        config = _runners_config(tmp_path, _runner_config('laptop'))
+        build = verify_hosts.remote_runner_factory(config, '/repo', deployed_sha=None)
+
+        with pytest.raises(RuntimeError, match='6565'):
+            build('laptop')
+
+
+@pytest.mark.usefixtures('code_default_config')
+class TestPoolFromConfig:
+    def test_a_host_the_caller_benches_after_construction_reads_no_slots(self, tmp_path):
+        config = _runners_config(tmp_path, _runner_config('laptop'))
+        quarantine: set[str] = set()
+        pool = HostPool(
+            verify_hosts.task_verify_hosts(config, deployed_sha=TEST_DEPLOYED_SHA),
+            runner_for=verify_hosts.remote_runner_factory(
+                config, config.project_root, deployed_sha=TEST_DEPLOYED_SHA,
+            ),
+            quarantine=quarantine, on_unavailable=_Hooks().on_unavailable,
+        )
+        assert pool.policy('laptop', config).slots == admission_policy(config).slots
+
+        quarantine.add('laptop')
+
+        assert pool.hosts == ('laptop',)
+        assert pool.policy('laptop', config).slots == 0
