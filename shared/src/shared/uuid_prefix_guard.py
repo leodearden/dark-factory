@@ -31,9 +31,13 @@ strings and nothing else — the INV-8 occupancy bound on that scan is
 ``shared.uuid_prefix``'s to state. A call that DOES carry prefixes pays at most
 :data:`MAX_DISTINCT_PREFIXES_PER_CALL` resolver walks, overlapped
 :data:`MAX_CONCURRENT_RESOLUTIONS` at a time; beyond the ceiling it is
-forwarded unchanged with the reason on ``meta``. At the PRD's measured ~0.2s
-per walk that is ~0.4s of added latency in the worst case rather than the
-unbounded N x 0.2s a serial, uncapped resolve would have cost.
+forwarded unchanged with the reason on ``meta``. So the added latency is at
+most ceil(MAX_DISTINCT_PREFIXES_PER_CALL / MAX_CONCURRENT_RESOLUTIONS) rounds
+of the resolver's own latency, rather than one round per citation. What a
+round costs is the resolver's to bound: for the escalation servers' HTTP
+resolver, see ``escalation/src/escalation/prefix_resolver_client.py``'s module
+docstring (INV-8), and for the route's measured latency
+``plans/uuid-prefix-resolution-prd.md`` §4-C5, erratum 2026-11-05.
 
 That ceiling bounds DISTINCT tokens ONLY, which is worth saying out loud
 because reading it as a bound on the whole call is what once let an unbounded
@@ -281,10 +285,12 @@ POLICY_MATRIX: Mapping[tuple[ResolutionOutcome, ToolClass], PrefixAction] = Mapp
 MAX_DISTINCT_PREFIXES_PER_CALL = 16
 
 #: How many of those resolutions are in flight at once. The resolutions run
-#: CONCURRENTLY — serial awaits would make the per-call bound 16 x ~0.2s ≈ 3.2s
-#: of latency on a single write — but not UNBOUNDED: an unlimited fan-out turns
+#: CONCURRENTLY — serial awaits would cost a single write one round of resolver
+#: latency per distinct prefix — but not UNBOUNDED: an unlimited fan-out turns
 #: one verbose call into sixteen simultaneous two-store walks, which is a way
-#: to brown out the stores the guard depends on.
+#: to brown out the stores the guard depends on. The cap is per CALL, not per
+#: process: N concurrent guarded calls put up to N times this many walks on the
+#: resolver.
 MAX_CONCURRENT_RESOLUTIONS = 8
 
 
@@ -301,7 +307,7 @@ MAX_CONCURRENT_RESOLUTIONS = 8
 #: surface.
 #:
 #: An outage is counted per :class:`UnavailableReason`, so a slow resolver and
-#: an unreachable one fire separate alarms.
+#: an unreachable one fire separate storms.
 STORM_COUNTED_OUTCOMES: frozenset[str] = frozenset({'forwarded_ambiguous', 'resolver_unavailable'})
 
 
@@ -865,7 +871,7 @@ class UuidPrefixGuardMiddleware(Middleware):
         that discuss one record at length.
 
         CONCURRENT, under a semaphore. Serially, a call citing sixteen distinct
-        prefixes would add sixteen ~0.2s store walks to one tool call, and the
+        prefixes would add sixteen store walks, end to end, to one tool call, and the
         corpus says the overwhelming majority of them cost that walk only to
         arrive at `none`. So the walks overlap, up to
         :data:`MAX_CONCURRENT_RESOLUTIONS` — bounded, because an unlimited
@@ -1134,7 +1140,7 @@ class UuidPrefixGuardMiddleware(Middleware):
         outcome: FactOutcome,
         agent_id: str | None,
         project: str,
-        reason: UnavailableReason | None = None,
+        reason: str | None = None,
     ) -> None:
         """Emit one ``uuid_prefix_detected``, and never change an outcome.
 
@@ -1193,22 +1199,24 @@ class UuidPrefixGuardMiddleware(Middleware):
         the arguments that reach the tool are byte-identical to the ones
         submitted, so "forwarded unchanged" is structurally true rather than
         very nearly true.
+
+        The reason leaves as its plain value: the fact, ``meta`` and the storm
+        record all cross into sinks that render whatever they are handed.
         """
+        reason = outage.reason.value
         await self._emit_fact(
             name, outage.token, (),
             outcome=_FACT_OUTCOME[PrefixAction.FORWARD_UNCHANGED],
-            agent_id=_agent_id(arguments), project=project, reason=outage.reason,
+            agent_id=_agent_id(arguments), project=project, reason=reason,
         )
         logger.warning(
             'uuid prefix guard: no resolution from the %s store (%s); %r forwarded '
             'unchanged with its prefixes unresolved',
-            outage.store, outage.reason, name,
+            outage.store, reason, name,
         )
-        report: dict[str, Any] = {
-            'resolver': 'unavailable', 'store': outage.store, 'reason': outage.reason,
-        }
+        report: dict[str, Any] = {'resolver': 'unavailable', 'store': outage.store, 'reason': reason}
         storm = await self._storms.record(
-            _FACT_OUTCOME[PrefixAction.FORWARD_UNCHANGED], project, reason=outage.reason
+            _FACT_OUTCOME[PrefixAction.FORWARD_UNCHANGED], project, reason=reason
         )
         if storm is not None:
             report['storm'] = storm

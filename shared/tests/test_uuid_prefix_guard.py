@@ -1422,7 +1422,7 @@ class TestTheOutageReason:
 
     The guard's action is the same whatever the reason — it forwards unchanged
     — so the reason qualifies the outcome rather than being a fifth one. What
-    it buys is that a slow resolver and an unreachable one fire separate alarms.
+    it buys is that a slow resolver and an unreachable one fire separate storms.
     """
 
     CALL = {'content': f'see {BFF}', 'project_id': PROJECT, 'agent_id': AGENT}
@@ -1460,6 +1460,15 @@ class TestTheOutageReason:
         storm = (repair_of(result) or {})['storm']
         for record in (storm, h.escalations[0]):
             assert (record['outcome'], record['reason']) == ('resolver_unavailable', 'timed_out')
+
+    async def test_the_reason_leaves_as_its_plain_value(self) -> None:
+        """A sink rendering ``key=value!r`` must read ``'timed_out'``, not the enum's repr."""
+        h = self.timed_out_harness()
+        for _ in range(3):
+            result = await h.call('add_memory', dict(self.CALL))
+        repair = repair_of(result) or {}
+        reasons = [repair['reason'], repair['storm']['reason'], h.facts[-1]['reason'], h.escalations[0]['reason']]
+        assert [type(reason) for reason in reasons] == [str] * 4
 
 
 class TestAResolverBugIsNotAnOutage:
