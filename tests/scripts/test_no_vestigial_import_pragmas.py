@@ -259,25 +259,27 @@ def _import_search_roots(importing_dir: Path) -> list[Path]:
     DERIVED FROM CONFIG, never hardcoded — see this guard's docstring for why
     that is the whole point rather than a stylistic preference.
 
-    Three sources, and neither the second nor the third is redundant:
+    Three sources, none of them redundant, listed in the order pyright
+    searches them:
 
-    1. Every ROOT ``[tool.pyright] extraPaths`` entry, resolved relative to the
-       repo root. This is what makes the flat ``scripts/`` imports here resolve
-       (task 3456).
-    2. The importing file's OWN directory. ``--import-mode=importlib`` means
-       pytest does not put a test file's own directory on sys.path, so each
-       suite's ``conftest.py`` inserts what it needs explicitly; pyright reaches
-       the same modules because a bare import resolves against the importing
-       file's own directory. ``setup_host_parsing.py`` lives in
-       ``tests/scripts/``, not in ``scripts/``, so it resolves as a
-       same-directory sibling and would otherwise be misjudged unresolvable.
-       Taking it per-file rather than as a constant is what lets one scanner
-       serve both scanned suites without either borrowing the other's siblings.
-    3. The execution root, which pyright resolves local imports against and
+    1. The execution root, which pyright resolves local imports against and
        which holds ``conftest.py`` and ``df_pytest_isolation.py``.
+    2. Every ROOT ``[tool.pyright] extraPaths`` entry, in config order, resolved
+       relative to the repo root. This is what makes the flat ``scripts/``
+       imports here resolve (task 3456).
+    3. The importing file's OWN directory, pyright's last-resort local fallback.
+       ``--import-mode=importlib`` means pytest does not put a test file's own
+       directory on sys.path, so each suite's ``conftest.py`` inserts what it
+       needs explicitly; pyright reaches the same modules because a bare import
+       resolves against the importing file's own directory.
+       ``setup_host_parsing.py`` lives in ``tests/scripts/``, not in
+       ``scripts/``, so it resolves as a same-directory sibling and would
+       otherwise be misjudged unresolvable. Taking it per-file rather than as a
+       constant is what lets one scanner serve both scanned suites without
+       either borrowing the other's siblings.
     """
     extra_paths = _load_root_pyright_config().get('extraPaths', [])
-    return [REPO_ROOT / entry for entry in extra_paths] + [importing_dir, REPO_ROOT]
+    return [REPO_ROOT, *(REPO_ROOT / entry for entry in extra_paths), importing_dir]
 
 
 def _imported_top_level_modules(node: ast.Import | ast.ImportFrom) -> list[str]:
@@ -299,9 +301,16 @@ def _imported_top_level_modules(node: ast.Import | ast.ImportFrom) -> list[str]:
 
 
 def _resolving_root(module: str, roots: list[Path]) -> Path | None:
-    """The first *root* on which *module* resolves as a bare top-level import, else None."""
+    """The *root* pyright resolves *module* on as a bare top-level import, else None.
+
+    The first root holding a module or a regular package wins; a bare namespace
+    directory is taken only when no root holds either.
+    """
     for root in roots:
-        if (root / f'{module}.py').is_file() or (root / module).is_dir():
+        if (root / f'{module}.py').is_file() or (root / module / '__init__.py').is_file():
+            return root
+    for root in roots:
+        if (root / module).is_dir():
             return root
     return None
 
