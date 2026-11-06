@@ -57,9 +57,10 @@ TASK_CITATION_RE = re.compile(r'\btask (\d+)\b', re.IGNORECASE)
 
 _SCAN_CONTEXT = 'sitting.inventory'
 _SCAN_PARSE_ERRORS: tuple[type[BaseException], ...] = (json.JSONDecodeError, KeyError, TypeError, ValueError)
+ESCALATION_KIND = 'esc'
 AUDIT_KIND = 'audit'
-QUESTION_KINDS = frozenset({'esc', 'decision'})
-_KEY_ARITY = {'esc': 3, 'decision': 2, AUDIT_KIND: 2}
+QUESTION_KINDS = frozenset({ESCALATION_KIND, 'decision'})
+_KEY_ARITY = {ESCALATION_KIND: 3, 'decision': 2, AUDIT_KIND: 2}
 
 ItemKey = tuple[str, ...]
 
@@ -117,7 +118,7 @@ class OpenItem:
         queue: that queue carries other projects' gates, so its ``task_id`` is not
         a task of ``project``, the queue's own project.
         """
-        if self.kind == 'esc' and queue_tag(self.queue_dir) == RECON_QUEUE_TAG:
+        if self.kind == ESCALATION_KIND and queue_tag(self.queue_dir) == RECON_QUEUE_TAG:
             return None
         return self.task_id if self.task_id and self.task_id.isdigit() else None
 
@@ -152,7 +153,7 @@ class Glossary:
 
 
 def escalation_key(queue_dir: str, escalation_id: str) -> ItemKey:
-    return ('esc', queue_dir, escalation_id)
+    return (ESCALATION_KIND, queue_dir, escalation_id)
 
 
 def decision_key(decision_id: str) -> ItemKey:

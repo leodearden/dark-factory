@@ -6,17 +6,18 @@ it prepares is an ``ApplyPayload``. This module executes those payloads, so
 the read-only contract over there stands.
 
 ``apply`` resolves Leo's numbered answers against the sitting ledger, then
-pre-flights every answered escalation on the server serving its queue
+pre-flights every answered escalation item on the server serving its queue
 (``sitting.ports``) BEFORE anything is written: one refused item refuses the
 whole batch. Each item then runs the skill's order (stamp the markers,
 ``resolve_issue`` as the coordinator, stamp ``x_ruling``, close the
 DecisionRecord, write two memories), and a failed step skips the rest of that
-item only.
+item only. A decision item acts on no escalation, even one its DecisionRecord
+links to: it closes its own DecisionRecord and writes the two memories.
 
 ``audit`` records the sitting's ``ok`` / ``wrong`` verdict on each drawn
 executor close (``sitting.audits``). A ``wrong`` re-counts the class's audits on
-that queue from the registry and, under ``authority.audit_escape_target``,
-moves the class to shadow in the queue's policy-table state.
+that queue and, under ``authority.audit_escape_target``, moves the class to
+shadow in the queue's policy-table state.
 
 ``policy-state`` reads or moves one queue's class switches; the moves it may
 make are ``authority.CLASS_SWITCH_TRANSITIONS``, enforced by
@@ -37,10 +38,12 @@ import subprocess
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
-from typing import Any, Literal, Protocol
+from types import MappingProxyType
+from typing import Any, Protocol
 
 # Bind scripts/ and orchestrator/ to THIS checkout, never an editable install's (tasks 2881/2882).
 # Bare sys.path calls, the one statement ruff's E402 lets an import follow.
@@ -69,7 +72,7 @@ from orchestrator.session_registry import (
 from shared.mcp_session import McpCallError, SyncMcpSession
 from sitting import audits, brief, payloads, ports
 from sitting import ledger as ledgers
-from sitting.inventory import AUDIT_KIND, index_queue, key_str, parse_key
+from sitting.inventory import AUDIT_KIND, ESCALATION_KIND, index_queue, key_str, parse_key
 from sitting.payloads import AgreedMarker, ApplyPayload, PreparedMarker, Ruling
 from sitting.ports import PortUnknown, QueuePort
 from sitting.preparation import (
@@ -95,14 +98,153 @@ EXIT_OK, EXIT_STEP_FAILED, EXIT_CONFIG, EXIT_ASK_BACK, EXIT_REFUSED = 0, 1, 2, 3
 IDENTITY_HEADER = 'X-Escalation-Identity'
 CLIENT_NAME = 'sitting-apply'
 MEMORY_AGENT_ID = 'sitting-apply'
+REGISTRY_TIMEOUT_SECS = 120
 CLOSING_ACTIONS: tuple[str, ...] = tuple(action for action in payloads.RESOLVE_ACTIONS if action != 'park')
 """The resolve actions that close a record; ``park`` leaves it open, so it is no answer to apply."""
 
 ESCALATION_TOOLS = frozenset({'stamp_triage', 'resolve_issue', 'get_escalation'})
 FUSED_MEMORY_TOOLS = frozenset({'get_task', 'update_task', 'add_memory'})
-STEP_NAMES: Mapping[str, str] = {payloads.SESSION_REGISTRY_TOOL: 'close_decision'}
 
-StepOutcome = Literal['ok', 'failed', 'refused', 'skipped']
+
+class StepOutcome(StrEnum):
+    OK = 'ok'
+    FAILED = 'failed'
+    REFUSED = 'refused'
+    SKIPPED = 'skipped'
+
+    @property
+    def halts(self) -> bool:
+        """A failed or refused step skips the rest of its item."""
+        return self in (StepOutcome.FAILED, StepOutcome.REFUSED)
+
+
+class RefusalCode(StrEnum):
+    """Why an item was refused before anything was written, or a step refused by the server."""
+
+    NO_PORT = 'no_port'
+    UNREACHABLE = 'unreachable'
+    NOT_FOUND = 'not_found'
+    NOT_PENDING = 'not_pending'
+    NOT_OPEN = 'not_open'
+    CLAIMED_BY_EXECUTOR = 'claimed_by_executor'
+    DECISION_UNREADABLE = 'decision_unreadable'
+    ALREADY_AUDITED = 'already_audited'
+    ESCALATION_AGED_OUT = 'escalation_aged_out'
+    NOT_AN_EXECUTOR_CLOSE = 'not_an_executor_close'
+
+
+@dataclass(frozen=True)
+class Refusal:
+    """A refusal's code, which decides the exit, and the facts the report prints beside it."""
+
+    code: RefusalCode
+    facts: Mapping[str, str | None] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'facts', MappingProxyType(dict(self.facts)))
+
+    def to_json(self) -> dict[str, Any]:
+        return {'code': str(self.code), **self.facts}
+
+
+@dataclass(frozen=True)
+class StepResult:
+    """One step of one item; ``supersedes`` names the value an ``ok`` write replaced."""
+
+    step: str
+    outcome: StepOutcome
+    detail: str = ''
+    code: RefusalCode | None = None
+    supersedes: str = ''
+
+    def to_json(self) -> dict[str, Any]:
+        optional = {'detail': self.detail, 'code': self.code and str(self.code), 'supersedes': self.supersedes}
+        return {'step': self.step, 'outcome': str(self.outcome), **{k: v for k, v in optional.items() if v}}
+
+
+@dataclass(frozen=True)
+class ItemResult:
+    number: int
+    escalation_id: str | None
+    decision_id: str | None
+    queue_dir: str
+    steps: tuple[StepResult, ...]
+
+    def to_json(self) -> dict[str, Any]:
+        return {'number': self.number, 'escalation_id': self.escalation_id, 'decision_id': self.decision_id,
+                'queue_dir': self.queue_dir, 'steps': [step.to_json() for step in self.steps]}
+
+
+@dataclass(frozen=True)
+class RefusedItem:
+    """An item refused at pre-flight, named by whichever of its record ids the verb acts on."""
+
+    number: int
+    refusal: Refusal
+    ids: Mapping[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'ids', MappingProxyType(dict(self.ids)))
+
+    def to_json(self) -> dict[str, Any]:
+        return {'number': self.number, **self.ids, 'refusal': self.refusal.to_json()}
+
+
+@dataclass(frozen=True)
+class AuditResult:
+    number: int
+    close: audits.ExecutorClose
+    verdict: AuditVerdict
+    class_state_before: ClassSwitch | None
+    class_state_after: ClassSwitch | None
+    outcome: StepOutcome = StepOutcome.OK
+    detail: str = ''
+
+    def to_json(self) -> dict[str, Any]:
+        close = self.close
+        row = {
+            'number': self.number, 'decision_id': close.decision_id, 'escalation_id': close.escalation_id,
+            'policy_class': close.policy_class, 'queue_dir': close.queue_dir, 'verdict': str(self.verdict),
+            'class_state_before': _switch_text(self.class_state_before),
+            'class_state_after': _switch_text(self.class_state_after), 'outcome': str(self.outcome),
+        }
+        return {**row, 'detail': self.detail} if self.detail else row
+
+
+@dataclass(frozen=True)
+class ClassStates:
+    states: Mapping[str, ClassSwitch]
+
+    def to_json(self) -> dict[str, Any]:
+        return {name: str(switch) for name, switch in self.states.items()}
+
+
+@dataclass(frozen=True)
+class ClassMove:
+    queue_dir: str
+    policy_class: str
+    before: ClassSwitch
+    after: ClassSwitch
+
+    def to_json(self) -> dict[str, Any]:
+        return {'queue_dir': self.queue_dir, 'policy_class': self.policy_class,
+                'before': str(self.before), 'after': str(self.after)}
+
+
+ReportRow = ItemResult | RefusedItem | AuditResult | ClassStates | ClassMove
+
+
+@dataclass(frozen=True)
+class ApplyReport:
+    """What a verb did: its exit code, one row per item, the echo table, and stderr messages."""
+
+    exit_code: int
+    rows: tuple[ReportRow, ...] = ()
+    echo: str = ''
+    messages: tuple[str, ...] = ()
+
+    def json_rows(self) -> tuple[dict[str, Any], ...]:
+        return tuple(row.to_json() for row in self.rows)
 
 
 class ToolCaller(Protocol):
@@ -110,27 +252,27 @@ class ToolCaller(Protocol):
 
 
 Connect = Callable[[QueuePort], AbstractContextManager[ToolCaller]]
-
-
-@dataclass(frozen=True)
-class ApplyReport:
-    """What ``apply`` did: its exit code, one JSON-ready row per item, the echo table, and stderr messages."""
-
-    exit_code: int
-    rows: tuple[dict[str, Any], ...] = ()
-    echo: str = ''
-    messages: tuple[str, ...] = ()
+ConnectFusedMemory = Callable[[], AbstractContextManager[ToolCaller]]
 
 
 @dataclass(frozen=True)
 class _Target:
-    """An answered escalation as pre-flight reads it: its number, its queue, and the server serving that queue."""
+    """An answered escalation item as pre-flight reads it: its number, its queue, and the server serving that queue."""
 
     number: int
     queue_dir: str
     escalation_id: str
     port: QueuePort | PortUnknown
     still_open: bool
+
+
+@dataclass(frozen=True)
+class _Cleared:
+    """An escalation pre-flight cleared: the server serving its queue and the record as that server returned it."""
+
+    port: QueuePort
+    escalation_id: str
+    record: Mapping[str, Any]
 
 
 @dataclass(frozen=True)
@@ -150,6 +292,10 @@ def coordinator_session(port: QueuePort) -> SyncMcpSession:
     return SyncMcpSession(port.base_url, client_name=CLIENT_NAME, headers={IDENTITY_HEADER: COORDINATOR_IDENTITY})
 
 
+def fused_memory_session() -> SyncMcpSession:
+    return SyncMcpSession(DEFAULT_FUSED_MEMORY_URLS[0], client_name=CLIENT_NAME)
+
+
 def run_apply(
     sources: Sources,
     ledger_path: Path,
@@ -157,7 +303,7 @@ def run_apply(
     actions: Mapping[str, str],
     *,
     now: datetime,
-    fused_memory: ToolCaller,
+    fused_memory: ConnectFusedMemory,
     connect: Connect,
     fleet_root: Path,
 ) -> ApplyReport:
@@ -177,14 +323,14 @@ def run_apply(
     if problems:
         return ApplyReport(EXIT_CONFIG, messages=tuple(problems))
     with contextlib.ExitStack() as stack:
-        sessions = _Sessions(connect, stack)
-        refusals, records = _preflight(targets, sessions, now)
-        if refusals:
-            return ApplyReport(EXIT_REFUSED, rows=tuple(refusals), messages=(
-                f'nothing applied: {len(refusals)} item(s) refused at pre-flight',))
-        context = _ApplyContext(turn, sessions, fused_memory, fleet_root, now)
+        sessions = _Sessions(connect, fused_memory, stack)
+        cleared, refused = _preflight(targets, sessions, now)
+        if refused:
+            return ApplyReport(EXIT_REFUSED, rows=tuple(refused), messages=(
+                f'nothing applied: {len(refused)} item(s) refused at pre-flight',))
+        context = _ApplyContext(turn, sessions, fleet_root, now)
         rows = tuple(
-            context.apply_item(row, actions.get(str(row.number)), records.get(row.number))
+            context.apply_item(row, actions.get(str(row.number)), cleared.get(row.number))
             for row in turn.resolved.rows
         )
     ledgers.save(ledger_path, turn.persisted)
@@ -192,24 +338,32 @@ def run_apply(
 
 
 class _Sessions:
-    """One escalation session per queue for the whole run, opened on first use."""
+    """One session per server for the whole run, each opened on its first call, so a refused run opens none it need not."""
 
-    def __init__(self, connect: Connect, stack: contextlib.ExitStack) -> None:
+    def __init__(self, connect: Connect, connect_fused_memory: ConnectFusedMemory, stack: contextlib.ExitStack) -> None:
         self._connect = connect
+        self._connect_fused_memory = connect_fused_memory
         self._stack = stack
-        self._open: dict[str, ToolCaller] = {}
+        self._open: dict[str | None, ToolCaller] = {}
 
     def for_port(self, port: QueuePort) -> ToolCaller:
-        if port.queue_dir not in self._open:
-            self._open[port.queue_dir] = self._stack.enter_context(self._connect(port))
-        return self._open[port.queue_dir]
+        return self._opened(port.queue_dir, lambda: self._connect(port))
+
+    def fused_memory(self) -> ToolCaller:
+        return self._opened(None, self._connect_fused_memory)
+
+    def _opened(self, key: str | None, connect: ConnectFusedMemory) -> ToolCaller:
+        if key not in self._open:
+            self._open[key] = self._stack.enter_context(connect())
+        return self._open[key]
 
 
 def _gone_escalations(loaded: ledgers.Ledger, turn: AnswerTurn) -> frozenset[str]:
     """Escalation keys open when Leo read the ledger whose record has since left the open set."""
     return frozenset(
         key for key, entry in loaded.entries.items()
-        if parse_key(key)[0] == 'esc' and entry.state != 'done' and turn.sitting.ledger.entries[key].state == 'done'
+        if parse_key(key)[0] == ESCALATION_KIND and entry.state != 'done'
+        and turn.sitting.ledger.entries[key].state == 'done'
     )
 
 
@@ -217,7 +371,7 @@ def _open_targets(turn: AnswerTurn) -> list[_Target]:
     targets = []
     for row in turn.resolved.rows:
         item = _entry(turn, row.key).item
-        if item.escalation_id:
+        if item.kind == ESCALATION_KIND and item.escalation_id:
             targets.append(_target(row.number, item.queue_dir, item.escalation_id, still_open=True))
     return targets
 
@@ -253,40 +407,38 @@ def _action_problems(turn: AnswerTurn, targets: Sequence[_Target], actions: Mapp
 
 def _preflight(
     targets: Sequence[_Target], sessions: _Sessions, now: datetime,
-) -> tuple[list[dict[str, Any]], dict[int, dict[str, Any]]]:
-    refusals: list[dict[str, Any]] = []
-    records: dict[int, dict[str, Any]] = {}
+) -> tuple[dict[int, _Cleared], list[RefusedItem]]:
+    cleared: dict[int, _Cleared] = {}
+    refused: list[RefusedItem] = []
     for target in targets:
-        record, refusal = _preflight_one(target, sessions, now)
-        if refusal is not None:
-            refusals.append({'number': target.number, 'escalation_id': target.escalation_id,
-                             'queue_dir': target.queue_dir, 'refusal': refusal})
-        elif record is not None:
-            records[target.number] = record
-    return refusals, records
+        outcome = _preflight_one(target, sessions, now)
+        if isinstance(outcome, Refusal):
+            ids = {'escalation_id': target.escalation_id, 'queue_dir': target.queue_dir}
+            refused.append(RefusedItem(target.number, outcome, ids))
+        else:
+            cleared[target.number] = outcome
+    return cleared, refused
 
 
-def _preflight_one(
-    target: _Target, sessions: _Sessions, now: datetime,
-) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+def _preflight_one(target: _Target, sessions: _Sessions, now: datetime) -> _Cleared | Refusal:
     port = target.port
     if isinstance(port, PortUnknown):
-        return None, {'code': 'no_port', 'reason': port.reason}
+        return Refusal(RefusalCode.NO_PORT, {'reason': port.reason})
     try:
         record = sessions.for_port(port).call_tool('get_escalation', _get_escalation_args(port, target))
     except McpCallError as exc:
-        return None, {'code': 'unreachable', 'reason': str(exc)}
+        return Refusal(RefusalCode.UNREACHABLE, {'reason': str(exc)})
     if 'error' in record:
-        return None, {'code': record.get('code', 'not_found'), 'reason': record['error']}
+        return Refusal(RefusalCode.NOT_FOUND, {'reason': str(record['error'])})
     status = record.get('status')
     if status != 'pending':
-        return None, {'code': 'not_pending', 'status': status}
+        return Refusal(RefusalCode.NOT_PENDING, {'status': None if status is None else str(status)})
     if not target.still_open:
-        return None, {'code': 'not_open', 'status': status}
+        return Refusal(RefusalCode.NOT_OPEN, {'status': status})
     esc = Escalation.from_dict(record)
     if coordinator_denied(esc, now):
-        return None, {'code': 'claimed_by_executor', 'policy_class': esc.policy_class, 'claimed_at': esc.claimed_at}
-    return record, None
+        return Refusal(RefusalCode.CLAIMED_BY_EXECUTOR, {'policy_class': esc.policy_class, 'claimed_at': esc.claimed_at})
+    return _Cleared(port, target.escalation_id, MappingProxyType(record))
 
 
 def _get_escalation_args(port: QueuePort, target: _Target) -> dict[str, Any]:
@@ -294,77 +446,68 @@ def _get_escalation_args(port: QueuePort, target: _Target) -> dict[str, Any]:
     return {'escalation_id': target.escalation_id, **scoped}
 
 
+StepBuilder = Callable[[], ApplyPayload | _Skip | _Failed]
+
+
 class _ApplyContext:
     """Everything one item's steps need; builds each step's payload and runs it through one dispatcher."""
 
-    def __init__(
-        self, turn: AnswerTurn, sessions: _Sessions, fused_memory: ToolCaller, fleet_root: Path, now: datetime,
-    ) -> None:
+    def __init__(self, turn: AnswerTurn, sessions: _Sessions, fleet_root: Path, now: datetime) -> None:
         self._turn = turn
         self._sessions = sessions
-        self._fused = fused_memory
         self._fleet_root = fleet_root
         self._now = now
 
-    def apply_item(self, row: ledgers.EchoRow, action: str | None, record: Mapping[str, Any] | None) -> dict[str, Any]:
-        entry = _entry(self._turn, row.key)
-        item = entry.item
-        port = ports.queue_port(item.queue_dir) if item.escalation_id else None
-        ruling_text = payloads.ruling_resolution(row.option_label, row.option_text, row.note)
-        steps: list[dict[str, Any]] = []
-        halted = False
-        for name, build in self._plan(entry, row, action, record, port, ruling_text):
-            if halted:
-                steps.append(_step(name, 'skipped', 'an earlier step did not complete'))
-                continue
-            outcome = self._run(name, build, port)
-            steps.append(outcome)
-            halted = outcome['outcome'] in ('failed', 'refused')
-        return {'number': row.number, 'escalation_id': item.escalation_id, 'decision_id': item.decision_id,
-                'queue_dir': item.queue_dir, 'steps': steps}
+    def apply_item(self, row: ledgers.EchoRow, action: str | None, cleared: _Cleared | None) -> ItemResult:
+        """Run *row*'s steps; *cleared* is its escalation as pre-flight read it, None for a decision item."""
+        item = _entry(self._turn, row.key).item
+        steps: list[StepResult] = []
+        for name, build in self._plan(row, action, cleared):
+            if any(step.outcome.halts for step in steps):
+                steps.append(StepResult(name, StepOutcome.SKIPPED, 'an earlier step did not complete'))
+            else:
+                steps.append(self._run(name, build, cleared))
+        return ItemResult(row.number, item.escalation_id, item.decision_id, item.queue_dir, tuple(steps))
 
     def _plan(
-        self,
-        entry: brief.BriefEntry,
-        row: ledgers.EchoRow,
-        action: str | None,
-        record: Mapping[str, Any] | None,
-        port: QueuePort | PortUnknown | None,
-        ruling_text: str,
-    ) -> list[tuple[str, Callable[[], ApplyPayload | _Skip | _Failed]]]:
+        self, row: ledgers.EchoRow, action: str | None, cleared: _Cleared | None,
+    ) -> list[tuple[str, StepBuilder]]:
+        entry = _entry(self._turn, row.key)
         item = entry.item
         turns = ledgers.resolution_turns(self._turn.persisted, row.key)
-        no_escalation = _Skip('a decision item has no escalation record')
+        ruling_text = payloads.ruling_resolution(row.option_label, row.option_text, row.note)
+        no_escalation = _Skip('a decision item acts on no escalation; it closes its own DecisionRecord')
 
         def stamp() -> ApplyPayload | _Skip:
-            if not item.escalation_id or record is None:
+            if cleared is None:
                 return no_escalation
             prepared = _prepared_marker(entry.preparation, self._turn.sitting.ledger.sitting_id)
             agreed = (AgreedMarker.for_answer(prepared, row.option_label, answer_rounds=turns, at=row.answered_at)
                       if prepared is not None else AgreedMarker(row.option_label, None, turns, row.answered_at))
-            return payloads.stamp_markers_payload(item.escalation_id, record.get('triage_note') or '', prepared, agreed)
+            note = cleared.record.get('triage_note') or ''
+            return payloads.stamp_markers_payload(cleared.escalation_id, note, prepared, agreed)
 
         def resolve() -> ApplyPayload | _Skip:
-            if not item.escalation_id or action is None:
+            if cleared is None or action is None:
                 return no_escalation
-            return payloads.resolve_issue_payload(item.escalation_id, ruling_text, action,
+            return payloads.resolve_issue_payload(cleared.escalation_id, ruling_text, action,
                                                   resolved_by=COORDINATOR_IDENTITY, resolution_turns=turns)
 
         def x_ruling() -> ApplyPayload | _Skip | _Failed:
-            if not item.escalation_id or action is None:
+            if cleared is None or action is None:
                 return no_escalation
             task_id = item.store_task_id
             if task_id is None:
                 return _Skip('the escalation names no task of its queue\'s project: none, a sentinel, '
                              'or a reconciliation gate')
-            if not isinstance(port, QueuePort) or port.project_root is None:
+            if cleared.port.project_root is None:
                 return _Skip('the queue names no project root')
-            root = str(port.project_root)
-            task = self._fused.call_tool('get_task', {'id': task_id, 'project_root': root})
+            root = str(cleared.port.project_root)
+            task = self._sessions.fused_memory().call_tool('get_task', {'id': task_id, 'project_root': root})
             if 'error' in task:
                 return _Failed(f'get_task {task_id} could not read the prior ruling: {task["error"]}')
             existing = (task.get('metadata') or {}).get(payloads.X_RULING_KEY)
-            ruling = Ruling(item.escalation_id, action, ruling_text, COORDINATOR_IDENTITY, self._now.isoformat())
+            ruling = Ruling(cleared.escalation_id, action, ruling_text, COORDINATOR_IDENTITY, self._now.isoformat())
             return payloads.update_task_payload(task_id, root, ruling, existing=existing)
 
         def close() -> ApplyPayload:
@@ -381,62 +524,62 @@ class _ApplyContext:
             ('close_decision', close), ('add_memory', lambda: decision), ('add_memory', lambda: why),
         ]
 
-    def _run(
-        self, name: str, build: Callable[[], ApplyPayload | _Skip | _Failed], port: QueuePort | PortUnknown | None,
-    ) -> dict[str, Any]:
+    def _run(self, name: str, build: StepBuilder, cleared: _Cleared | None) -> StepResult:
         try:
             payload = build()
             if isinstance(payload, _Skip):
-                return _step(name, 'skipped', payload.reason)
+                return StepResult(name, StepOutcome.SKIPPED, payload.reason)
             if isinstance(payload, _Failed):
-                return _step(name, 'failed', payload.reason)
-            return self._execute(name, payload, port)
+                return StepResult(name, StepOutcome.FAILED, payload.reason)
+            return self._execute(name, payload, cleared)
         except McpCallError as exc:
-            return _step(name, 'failed', str(exc))
+            return StepResult(name, StepOutcome.FAILED, str(exc))
 
-    def _execute(self, name: str, payload: ApplyPayload, port: QueuePort | PortUnknown | None) -> dict[str, Any]:
-        """Run *payload*; an ``ok`` row names the value it superseded, so nothing is replaced silently."""
-        outcome = self._dispatch(name, payload, port)
-        if outcome['outcome'] == 'ok' and payload.supersedes:
-            return {**outcome, 'supersedes': payload.supersedes}
-        return outcome
+    def _execute(self, name: str, payload: ApplyPayload, cleared: _Cleared | None) -> StepResult:
+        """Run *payload*; an ``ok`` result names the value it superseded, so nothing is replaced silently."""
+        result = self._dispatch(name, payload, cleared)
+        if result.outcome == StepOutcome.OK and payload.supersedes:
+            return replace(result, supersedes=payload.supersedes)
+        return result
 
-    def _dispatch(self, name: str, payload: ApplyPayload, port: QueuePort | PortUnknown | None) -> dict[str, Any]:
+    def _dispatch(self, name: str, payload: ApplyPayload, cleared: _Cleared | None) -> StepResult:
         if payload.tool == payloads.SESSION_REGISTRY_TOOL:
             return _run_registry(name, payload, self._fleet_root)
         if not isinstance(payload.args, dict):
             raise ValueError(f'{payload.tool!r} carries argv lists, which only {payloads.SESSION_REGISTRY_TOOL!r} runs')
-        if payload.tool in ESCALATION_TOOLS and isinstance(port, QueuePort):
-            reply = self._sessions.for_port(port).call_tool(payload.tool, payload.args)
+        if payload.tool in ESCALATION_TOOLS and cleared is not None:
+            reply = self._sessions.for_port(cleared.port).call_tool(payload.tool, payload.args)
         elif payload.tool in FUSED_MEMORY_TOOLS:
-            reply = self._fused.call_tool(payload.tool, payload.args)
+            reply = self._sessions.fused_memory().call_tool(payload.tool, payload.args)
         else:
             raise ValueError(f'{payload.tool!r} has no executor in apply')
-        if reply.get('code') == 'claimed_by_executor':
-            return {**_step(name, 'refused', str(reply.get('error', ''))), 'code': 'claimed_by_executor'}
+        if reply.get('code') == RefusalCode.CLAIMED_BY_EXECUTOR:
+            return StepResult(name, StepOutcome.REFUSED, str(reply.get('error', '')),
+                              code=RefusalCode.CLAIMED_BY_EXECUTOR)
         if 'error' in reply:
-            return _step(name, 'failed', str(reply['error']))
-        return _step(name, 'ok')
+            return StepResult(name, StepOutcome.FAILED, str(reply['error']))
+        return StepResult(name, StepOutcome.OK)
 
 
-def _run_registry(name: str, payload: ApplyPayload, fleet_root: Path) -> dict[str, Any]:
+def _run_registry(name: str, payload: ApplyPayload, fleet_root: Path) -> StepResult:
+    """Run the registry verbs in order; one that exits non-zero, times out, or cannot start fails the step."""
     env = {**os.environ, 'CLAUDE_FLEET_ROOT': str(fleet_root)}
     for argv in payload.args:
-        done = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=120, check=False)
+        try:
+            done = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=REGISTRY_TIMEOUT_SECS,
+                                  check=False)
+        except (subprocess.SubprocessError, OSError) as exc:
+            return StepResult(name, StepOutcome.FAILED, f'{argv[2]} did not complete: {type(exc).__name__}: {exc}')
         if done.returncode != 0:
-            return _step(name, 'failed', f'{argv[2]} exited {done.returncode}: {done.stderr.strip()[-400:]}')
-    return _step(name, 'ok')
+            return StepResult(name, StepOutcome.FAILED, f'{argv[2]} exited {done.returncode}: {done.stderr.strip()[-400:]}')
+    return StepResult(name, StepOutcome.OK)
 
 
-def _step(name: str, outcome: StepOutcome, detail: str = '') -> dict[str, Any]:
-    return {'step': name, 'outcome': outcome, **({'detail': detail} if detail else {})}
-
-
-def _exit_code(rows: Sequence[Mapping[str, Any]]) -> int:
-    outcomes = {step['outcome'] for row in rows for step in row['steps']}
-    if 'refused' in outcomes:
+def _exit_code(rows: Sequence[ItemResult]) -> int:
+    outcomes = {step.outcome for row in rows for step in row.steps}
+    if StepOutcome.REFUSED in outcomes:
         return EXIT_REFUSED
-    return EXIT_STEP_FAILED if 'failed' in outcomes else EXIT_OK
+    return EXIT_STEP_FAILED if StepOutcome.FAILED in outcomes else EXIT_OK
 
 
 def _entry(turn: AnswerTurn, key: str) -> brief.BriefEntry:
@@ -460,6 +603,10 @@ def _rationale(prep: Preparation | None, row: ledgers.EchoRow) -> str:
     if prep is not None:
         parts += [option.ramification for option in prep.options if option.label == row.option_label]
     return '; '.join(parts) or 'Leo answered at the sitting without a note'
+
+
+def _switch_text(switch: ClassSwitch | None) -> str | None:
+    return None if switch is None else str(switch)
 
 
 @dataclass(frozen=True)
@@ -489,61 +636,60 @@ def run_audit(
     repeated = sorted({n for n in numbers if numbers.count(n) > 1})
     if repeated:
         return ApplyReport(EXIT_CONFIG, messages=tuple(f'audit {n} is answered more than once' for n in repeated))
-    targets, refusals = _audit_preflight(resolved.rows, decisions_root)
-    if refusals:
-        return ApplyReport(EXIT_REFUSED, rows=tuple(refusals), messages=(
-            f'nothing audited: {len(refusals)} item(s) refused at pre-flight',))
+    targets, refused = _audit_preflight(resolved.rows, decisions_root)
+    if refused:
+        return ApplyReport(EXIT_REFUSED, rows=tuple(refused), messages=(
+            f'nothing audited: {len(refused)} item(s) refused at pre-flight',))
     try:
         for queue_dir in {target.close.queue_dir for target in targets}:
             policy_state.load_class_states(Path(queue_dir))
     except policy_state.PolicyStateUnreadable as exc:
         return ApplyReport(EXIT_CONFIG, messages=(f'nothing audited: {exc}',))
     rows = tuple(_audit_one(target, decisions_root) for target in targets)
-    failed = any(row['outcome'] != 'ok' for row in rows)
+    failed = any(row.outcome != StepOutcome.OK for row in rows)
     return ApplyReport(EXIT_STEP_FAILED if failed else EXIT_OK, rows=rows,
                        echo=ledgers.render_echo_table(resolved))
 
 
 def _audit_preflight(
     rows: Sequence[ledgers.EchoRow], decisions_root: Path,
-) -> tuple[list[_AuditTarget], list[dict[str, Any]]]:
+) -> tuple[list[_AuditTarget], list[RefusedItem]]:
     targets: list[_AuditTarget] = []
-    refusals: list[dict[str, Any]] = []
+    refused: list[RefusedItem] = []
     for row in rows:
         target = _audit_target(row, decisions_root)
         if isinstance(target, _AuditTarget):
             targets.append(target)
         else:
-            refusals.append({'number': row.number, 'decision_id': row.record_id, 'refusal': target})
-    return targets, refusals
+            refused.append(RefusedItem(row.number, target, {'decision_id': row.record_id}))
+    return targets, refused
 
 
-def _audit_target(row: ledgers.EchoRow, decisions_root: Path) -> _AuditTarget | dict[str, Any]:
+def _audit_target(row: ledgers.EchoRow, decisions_root: Path) -> _AuditTarget | Refusal:
     try:
         record = DecisionRecord.from_json(decision_path_for_id(row.record_id, root=decisions_root).read_text())
     except (OSError, KeyError, TypeError, ValueError) as exc:
-        return {'code': 'decision_unreadable', 'reason': f'{type(exc).__name__}: {exc}'}
+        return Refusal(RefusalCode.DECISION_UNREADABLE, {'reason': f'{type(exc).__name__}: {exc}'})
     if record.audit_outcome is not None:
-        return {'code': 'already_audited', 'verdict': str(record.audit_outcome.verdict),
-                'audited_at': record.audit_outcome.audited_at}
+        return Refusal(RefusalCode.ALREADY_AUDITED, {'verdict': str(record.audit_outcome.verdict),
+                                                      'audited_at': record.audit_outcome.audited_at})
     queue_dir = normalize_escalations_dir(record.escalations_dir)
     close = audits.executor_close_of(record, {queue_dir: index_queue(queue_dir)})
     if isinstance(close, audits.AgedOut):
-        return {'code': 'escalation_aged_out', 'escalation_id': close.escalation_id, 'queue_dir': close.queue_dir}
+        return Refusal(RefusalCode.ESCALATION_AGED_OUT,
+                       {'escalation_id': close.escalation_id, 'queue_dir': close.queue_dir})
     if not isinstance(close, audits.ExecutorClose):
         reason = close.reason if close is not None else 'its escalation was not closed by the executor under a class'
-        return {'code': 'not_an_executor_close', 'reason': reason}
+        return Refusal(RefusalCode.NOT_AN_EXECUTOR_CLOSE, {'reason': reason})
     return _AuditTarget(row, record, close)
 
 
-def _audit_one(target: _AuditTarget, decisions_root: Path) -> dict[str, Any]:
+def _audit_one(target: _AuditTarget, decisions_root: Path) -> AuditResult:
     close, row = target.close, target.row
     queue = Path(close.queue_dir)
     verdict = AuditVerdict(row.option_label)
     before = policy_state.load_class_states(queue).get(close.policy_class)
-    base = {'number': row.number, 'decision_id': close.decision_id, 'escalation_id': close.escalation_id,
-            'policy_class': close.policy_class, 'queue_dir': close.queue_dir, 'verdict': str(verdict),
-            'class_state_before': None if before is None else str(before)}
+    result = AuditResult(row.number, close, verdict, before, before)
     try:
         written = record_audit_outcome(
             close.decision_id, verdict, row.note, root=decisions_root, expected_project=target.record.project,
@@ -551,18 +697,16 @@ def _audit_one(target: _AuditTarget, decisions_root: Path) -> dict[str, Any]:
             policy_class=close.policy_class,
         )
     except DecisionAuditRefused as exc:
-        return {**base, 'outcome': 'failed', 'detail': str(exc), 'class_state_after': base['class_state_before']}
+        return replace(result, outcome=StepOutcome.FAILED, detail=str(exc))
     if written is None:
-        return {**base, 'outcome': 'failed', 'detail': 'the decision registry did not take the write',
-                'class_state_after': base['class_state_before']}
-    after = before
+        return replace(result, outcome=StepOutcome.FAILED, detail='the decision registry did not take the write')
     if verdict == AuditVerdict.WRONG and before is not None:
         audited, wrong = audits.class_tally(decisions_root, close.queue_dir, close.policy_class)
         target_state = audit_escape_target(before, audited, wrong)
         if target_state is not None:
             policy_state.set_class_state(queue, close.policy_class, target_state)
-            after = target_state
-    return {**base, 'outcome': 'ok', 'class_state_after': None if after is None else str(after)}
+            return replace(result, class_state_after=target_state)
+    return result
 
 
 def run_policy_state(queue_dir: Path, policy_class: str | None, target: ClassSwitch | None) -> ApplyReport:
@@ -572,15 +716,13 @@ def run_policy_state(queue_dir: Path, policy_class: str | None, target: ClassSwi
                                                   'policy-state never creates one',))
     try:
         if policy_class is None or target is None:
-            states = policy_state.load_class_states(queue_dir)
-            return ApplyReport(EXIT_OK, rows=({name: str(switch) for name, switch in states.items()},))
+            return ApplyReport(EXIT_OK, rows=(ClassStates(policy_state.load_class_states(queue_dir)),))
         before = policy_state.set_class_state(queue_dir, policy_class, target)
     except IllegalClassTransition as exc:
         return ApplyReport(EXIT_REFUSED, messages=(f'refused, nothing written: {exc}',))
     except ValueError as exc:
         return ApplyReport(EXIT_CONFIG, messages=(f'nothing written: {exc}',))
-    return ApplyReport(EXIT_OK, rows=({'queue_dir': normalize_escalations_dir(queue_dir), 'policy_class': policy_class,
-                                       'before': str(before), 'after': str(target)},))
+    return ApplyReport(EXIT_OK, rows=(ClassMove(normalize_escalations_dir(queue_dir), policy_class, before, target),))
 
 
 def parse_action_token(token: str) -> tuple[str, str]:
@@ -601,27 +743,6 @@ def parse_actions(tokens: Sequence[str]) -> dict[str, str]:
     return actions
 
 
-class _LazyMcpSession:
-    """A session that handshakes on its first call, so a run refused before any write never connects."""
-
-    def __init__(self, base_url: str, client_name: str) -> None:
-        self._base_url = base_url
-        self._client_name = client_name
-        self._stack = contextlib.ExitStack()
-        self._session: SyncMcpSession | None = None
-
-    def __enter__(self) -> _LazyMcpSession:
-        return self
-
-    def __exit__(self, *exc_info: object) -> None:
-        self._stack.close()
-
-    def call_tool(self, name: str, arguments: Mapping[str, Any]) -> dict:
-        if self._session is None:
-            self._session = self._stack.enter_context(SyncMcpSession(self._base_url, client_name=self._client_name))
-        return self._session.call_tool(name, arguments)
-
-
 def _cmd_apply(args: argparse.Namespace) -> int:
     now = args.now or datetime.now(UTC)
     try:
@@ -630,11 +751,10 @@ def _cmd_apply(args: argparse.Namespace) -> int:
         print(f'apply refused, nothing written: {exc}', file=sys.stderr)
         return EXIT_CONFIG
     answers = [parse_answer_token(token, args.source, now.isoformat()) for token in args.answer]
-    with _LazyMcpSession(DEFAULT_FUSED_MEMORY_URLS[0], CLIENT_NAME) as fused:
-        report = run_apply(
-            sources_from_args(args), args.ledger, answers, actions, now=now, fused_memory=fused,
-            connect=coordinator_session, fleet_root=fleet_root(args.decisions_root),
-        )
+    report = run_apply(
+        sources_from_args(args), args.ledger, answers, actions, now=now, fused_memory=fused_memory_session,
+        connect=coordinator_session, fleet_root=fleet_root(args.decisions_root),
+    )
     _print_report(report)
     return report.exit_code
 
@@ -658,7 +778,7 @@ def _cmd_policy_state(args: argparse.Namespace) -> int:
 
 def _print_report(report: ApplyReport) -> None:
     print(report.echo, end='')
-    for row in report.rows:
+    for row in report.json_rows():
         print(json.dumps(row, sort_keys=True))
     for message in report.messages:
         print(message, file=sys.stderr)

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import subprocess
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -34,7 +35,7 @@ from sitting import apply as mod
 from sitting import ledger as ledger_mod
 from sitting import payloads, prepare_sitting
 from sitting import preparation as prep_mod
-from sitting.inventory import AUDIT_KIND, audit_key, escalation_key, key_str
+from sitting.inventory import AUDIT_KIND, audit_key, decision_key, escalation_key, key_str
 from sitting.ports import QueuePort
 from sitting_escalation_servers import RecordingToolCaller, ServedQueue, serve_project_queue
 
@@ -102,9 +103,12 @@ class Sitting:
         return key_str(escalation_key(normalize_escalations_dir(queue), esc_id))
 
     def number(self, queue: Path, esc_id: str) -> int:
+        return self.number_of(self.key(queue, esc_id))
+
+    def number_of(self, key: str) -> int:
         loaded = ledger_mod.load(self.ledger)
         assert loaded is not None
-        return loaded.entries[self.key(queue, esc_id)].number
+        return loaded.entries[key].number
 
     def number_brief(self, capsys) -> None:
         assert prepare_sitting.main(['new-sitting', '--ledger', str(self.ledger), '--now', self.now.isoformat()]) == 0
@@ -125,8 +129,8 @@ class Sitting:
     def apply(self, answers, actions, *, fused: RecordingToolCaller | None = None, connect=None) -> mod.ApplyReport:
         return mod.run_apply(
             self.sources(), self.ledger, answers, actions, now=self.now,
-            fused_memory=fused if fused is not None else _fused(), connect=connect or mod.coordinator_session,
-            fleet_root=self.fleet,
+            fused_memory=lambda: contextlib.nullcontext(fused if fused is not None else _fused()),
+            connect=connect or mod.coordinator_session, fleet_root=self.fleet,
         )
 
 
@@ -211,7 +215,7 @@ class TestApplyAcrossTwoPorts:
         report = s.apply([s.answer(alpha_n, 'A', 'as ruled'), s.answer(beta_n, 'A')],
                          {str(alpha_n): 'resume', str(beta_n): 'close_only'}, fused=fused)
 
-        assert report.exit_code == 0, report.rows
+        assert report.exit_code == 0, report.json_rows()
         for served, esc_id in ((s.alpha, 'esc-100-1'), (s.beta, 'esc-200-1')):
             record = _record(served, esc_id)
             assert record.status != 'pending'
@@ -237,7 +241,7 @@ class TestApplyAcrossTwoPorts:
         report = s.apply([s.answer(alpha_n, 'A'), s.answer(beta_n, 'B', 'hold it')],
                          {str(alpha_n): 'resume', str(beta_n): 'close_only'}, fused=fused)
 
-        assert report.exit_code == 0, report.rows
+        assert report.exit_code == 0, report.json_rows()
         updates = {(args['id'], args['project_root']): args for name, args in fused.calls if name == 'update_task'}
         assert set(updates) == {('100', str(s.roots[0])), ('200', str(s.roots[1]))}
         assert all(payloads.X_RULING_KEY in args['metadata'] for args in updates.values())
@@ -253,7 +257,7 @@ class TestApplyAcrossTwoPorts:
 
         report = s.apply([s.answer(alpha_n, 'A')], {str(alpha_n): 'resume'}, fused=fused)
 
-        (row,) = report.rows
+        (row,) = report.json_rows()
         assert json.loads(json.dumps(row, sort_keys=True)) == row
         (step,) = [step for step in row['steps'] if step['step'] == 'update_task']
         return report.exit_code, step
@@ -310,7 +314,7 @@ class TestApplyAcrossTwoPorts:
         report = s.apply([s.answer(alpha_n, 'A'), s.answer(beta_n, 'A')],
                          {str(alpha_n): 'resume', str(beta_n): 'resume'})
 
-        rows = {row['number']: row for row in report.rows}
+        rows = {row['number']: row for row in report.json_rows()}
         assert set(rows) == {alpha_n, beta_n}
         assert (rows[alpha_n]['escalation_id'], rows[alpha_n]['queue_dir']) == (
             'esc-100-1', normalize_escalations_dir(s.alpha.queue_dir))
@@ -348,8 +352,8 @@ class TestSentinelTaskId:
 
         report = s.apply([s.answer(n, 'A')], {str(n): 'close_only'}, fused=fused)
 
-        assert report.exit_code == 0, report.rows
-        (row,) = report.rows
+        assert report.exit_code == 0, report.json_rows()
+        (row,) = report.json_rows()
         outcomes = [(step['step'], step['outcome']) for step in row['steps']]
         assert outcomes == [('stamp_triage', 'ok'), ('resolve_issue', 'ok'), ('update_task', 'skipped'),
                             ('close_decision', 'ok'), ('add_memory', 'ok'), ('add_memory', 'ok')]
@@ -361,6 +365,136 @@ class TestSentinelTaskId:
         decision = _decision_for(s.fleet, s.alpha.queue_dir, esc_id)
         assert decision.state == DecisionState.ANSWERED
         assert decision.closing_evidence
+
+
+class TestARegistryStepThatCannotComplete:
+    @pytest.mark.parametrize('error', [
+        subprocess.TimeoutExpired(['python3'], mod.REGISTRY_TIMEOUT_SECS),
+        FileNotFoundError(2, 'No such file or directory', 'python3'),
+    ], ids=['timeout', 'no_interpreter'])
+    def test_it_fails_its_own_item_and_the_batch_still_reports_and_saves(self, sitting, monkeypatch, error):
+        s = sitting
+        alpha_n, beta_n = s.number(s.alpha.queue_dir, 'esc-100-1'), s.number(s.beta.queue_dir, 'esc-200-1')
+        alpha_queue = normalize_escalations_dir(s.alpha.queue_dir)
+        real_run = subprocess.run
+
+        def run(argv, **kwargs):
+            if alpha_queue in argv:
+                raise error
+            return real_run(argv, **kwargs)
+
+        monkeypatch.setattr(mod.subprocess, 'run', run)
+
+        report = s.apply([s.answer(alpha_n, 'A'), s.answer(beta_n, 'A')],
+                         {str(alpha_n): 'resume', str(beta_n): 'resume'})
+
+        assert report.exit_code == mod.EXIT_STEP_FAILED
+        rows = {row['number']: row for row in report.json_rows()}
+        assert [(step['step'], step['outcome']) for step in rows[alpha_n]['steps']] == [
+            ('stamp_triage', 'ok'), ('resolve_issue', 'ok'), ('update_task', 'ok'),
+            ('close_decision', 'failed'), ('add_memory', 'skipped'), ('add_memory', 'skipped'),
+        ]
+        assert type(error).__name__ in rows[alpha_n]['steps'][3]['detail']
+        assert {step['outcome'] for step in rows[beta_n]['steps']} == {'ok'}
+        saved = ledger_mod.load(s.ledger)
+        assert saved is not None
+        for queue, esc_id in ((s.alpha.queue_dir, 'esc-100-1'), (s.beta.queue_dir, 'esc-200-1')):
+            assert ledger_mod.resolution_turns(saved, s.key(queue, esc_id)) == 1
+
+
+DECISION_STEPS = [('stamp_triage', 'skipped'), ('resolve_issue', 'skipped'), ('update_task', 'skipped'),
+                  ('close_decision', 'ok'), ('add_memory', 'ok'), ('add_memory', 'ok')]
+
+
+class TestDecisionItems:
+    """A decision item acts on no escalation, even one its DecisionRecord links to; it closes only its record."""
+
+    def _file(self, s: Sitting, decision_id: str, esc_id: str | None) -> None:
+        record = DecisionRecord(
+            id=decision_id, project='alpha', text=f'{decision_id}: which scope?',
+            filed_at=(s.now - timedelta(days=1)).isoformat(), escalation_id=esc_id,
+            escalations_dir=normalize_escalations_dir(s.alpha.queue_dir), options=['scope A', 'scope B'],
+        )
+        assert write_decision(record, root=s.fleet)
+
+    def _rebrief(self, s: Sitting, capsys) -> None:
+        assert prepare_sitting.main(['brief', *s.stores(), '--ledger', str(s.ledger)]) == 0
+        capsys.readouterr()
+
+    def _decision(self, s: Sitting, capsys, decision_id: str, esc_id: str | None) -> int:
+        self._file(s, decision_id, esc_id)
+        self._rebrief(s, capsys)
+        return s.number_of(key_str(decision_key(decision_id)))
+
+    def _assert_closed_only(self, s: Sitting, row: dict, decision_id: str) -> None:
+        assert [(step['step'], step['outcome']) for step in row['steps']] == DECISION_STEPS
+        closed = _decision_of(s.fleet, decision_id)
+        assert closed.state == DecisionState.ANSWERED
+        assert closed.closing_evidence
+
+    def test_a_plain_decision_answered_beside_an_escalation_closes_its_record(self, sitting, capsys):
+        s = sitting
+        decision_n = self._decision(s, capsys, 'dec-alpha-scope', None)
+        esc_n = s.number(s.alpha.queue_dir, 'esc-100-1')
+        fused = _fused()
+
+        report = s.apply([s.answer(decision_n, 'A'), s.answer(esc_n, 'A')], {str(esc_n): 'resume'}, fused=fused)
+
+        assert report.exit_code == 0, report.json_rows()
+        rows = {row['number']: row for row in report.json_rows()}
+        self._assert_closed_only(s, rows[decision_n], 'dec-alpha-scope')
+        assert {step['outcome'] for step in rows[esc_n]['steps']} == {'ok'}
+        assert _record(s.alpha, 'esc-100-1').resolved_by == COORDINATOR_IDENTITY
+
+    def test_a_decision_whose_escalation_is_already_resolved_closes_without_touching_it(self, sitting, capsys):
+        s = sitting
+        resolved = _pending(s.alpha.queue_dir, 'esc-300-1', s.now, status='resolved', resolved_by=EXECUTOR_IDENTITY,
+                            resolved_at=s.now.isoformat(), resolution='closed by the executor')
+        decision_n = self._decision(s, capsys, 'dec-alpha-300', 'esc-300-1')
+        fused = _fused()
+
+        report = s.apply([s.answer(decision_n, 'B', 'hold the scope')], {}, fused=fused)
+
+        assert report.exit_code == 0, report.json_rows()
+        (row,) = report.json_rows()
+        assert row['escalation_id'] == 'esc-300-1'
+        self._assert_closed_only(s, row, 'dec-alpha-300')
+        assert _record(s.alpha, 'esc-300-1').to_dict() == resolved.to_dict()
+        assert not {'get_task', 'update_task'} & set(fused.names())
+
+    def test_a_second_decision_on_one_escalation_closes_its_record_and_the_escalation_resolves_once(
+        self, sitting, capsys,
+    ):
+        s = sitting
+        decision_ids = ('dec-alpha-100-a', 'dec-alpha-100-b')
+        for decision_id in decision_ids:
+            self._file(s, decision_id, 'esc-100-1')
+        self._rebrief(s, capsys)
+        loaded = ledger_mod.load(s.ledger)
+        assert loaded is not None
+        (second,) = [d for d in decision_ids if key_str(decision_key(d)) in loaded.entries]
+        decision_n, esc_n = s.number_of(key_str(decision_key(second))), s.number(s.alpha.queue_dir, 'esc-100-1')
+
+        report = s.apply([s.answer(esc_n, 'A'), s.answer(decision_n, 'A')], {str(esc_n): 'resume'})
+
+        assert report.exit_code == 0, report.json_rows()
+        rows = {row['number']: row for row in report.json_rows()}
+        assert {step['outcome'] for step in rows[esc_n]['steps']} == {'ok'}
+        assert rows[esc_n]['decision_id'] in decision_ids and rows[esc_n]['decision_id'] != second
+        self._assert_closed_only(s, rows[decision_n], second)
+        assert _decision_of(s.fleet, rows[esc_n]['decision_id']).state == DecisionState.ANSWERED
+        assert _record(s.alpha, 'esc-100-1').resolved_by == COORDINATOR_IDENTITY
+
+    def test_an_action_given_for_a_decision_item_exits_2_and_writes_nothing(self, sitting, capsys):
+        s = sitting
+        decision_n = self._decision(s, capsys, 'dec-alpha-plain', None)
+        before = _snapshot(s)
+
+        report = s.apply([s.answer(decision_n, 'A')], {str(decision_n): 'resume'})
+
+        assert report.exit_code == mod.EXIT_CONFIG
+        assert any('is a decision, not an escalation' in message for message in report.messages)
+        assert _snapshot(s) == before
 
 
 class TestPreflightRefusals:
@@ -382,7 +516,7 @@ class TestPreflightRefusals:
         report = s.apply(answers, actions, fused=fused)
 
         assert report.exit_code == 4
-        (refused,) = [row for row in report.rows if row.get('refusal')]
+        (refused,) = [row for row in report.json_rows() if row.get('refusal')]
         assert refused['number'] == alpha_n
         assert refused['refusal']['code'] == 'not_pending'
         assert refused['refusal']['status'] == 'dismissed'
@@ -401,7 +535,7 @@ class TestPreflightRefusals:
         report = s.apply(answers, actions, fused=fused)
 
         assert report.exit_code == 4
-        (refused,) = [row for row in report.rows if row.get('refusal')]
+        (refused,) = [row for row in report.json_rows() if row.get('refusal')]
         assert refused['number'] == alpha_n
         assert refused['refusal'] == {
             'code': 'claimed_by_executor', 'policy_class': 'landing_provenance', 'claimed_at': claimed_at,
@@ -420,7 +554,7 @@ class TestPreflightRefusals:
         report = s.apply([s.answer(gamma_n, 'A')], {str(gamma_n): 'resume'})
 
         assert report.exit_code == 4
-        (refused,) = report.rows
+        (refused,) = report.json_rows()
         assert refused['refusal']['code'] == 'no_port'
 
 
@@ -455,7 +589,7 @@ class TestServerSideRefusal:
                          {str(alpha_n): 'resume', str(beta_n): 'resume'}, connect=racing)
 
         assert report.exit_code == 4
-        rows = {row['number']: row for row in report.rows}
+        rows = {row['number']: row for row in report.json_rows()}
         outcomes = {step['step']: step for step in rows[alpha_n]['steps']}
         assert outcomes['resolve_issue']['outcome'] == 'refused'
         assert outcomes['resolve_issue']['code'] == 'claimed_by_executor'

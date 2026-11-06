@@ -33,7 +33,7 @@ def test_each_project_queue_reaches_its_own_roots_port(tmp_path: Path) -> None:
     alpha = _root(tmp_path, 'alpha', {'queue_dir': 'data/escalations', 'port': 18101})
     beta = _root(tmp_path, 'beta', {'queue_dir': 'data/escalations', 'port': 18102})
 
-    mapped = ports.queue_ports([alpha / 'data' / 'escalations', str(beta / 'data' / 'escalations')])
+    mapped = {queue: ports.queue_port(queue) for queue in (_project_queue(alpha), _project_queue(beta))}
 
     assert mapped == {
         _project_queue(alpha): ports.QueuePort(

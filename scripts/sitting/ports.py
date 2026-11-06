@@ -11,10 +11,8 @@ reconciliation escalation server, never by the project's own port.
 """
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from types import MappingProxyType
 
 from dashboard.config import discover_root_escalation_url
 from escalation.store_identity import QueueKind
@@ -63,9 +61,3 @@ def queue_port(queue_dir: str | Path) -> QueuePort | PortUnknown:
             f'project root {root} names no escalation port in its orchestrator config',
         )
     return QueuePort(normalized, 'project', url, root)
-
-
-def queue_ports(queue_dirs: Iterable[str | Path]) -> Mapping[str, QueuePort | PortUnknown]:
-    return MappingProxyType({
-        normalize_escalations_dir(q): queue_port(q) for q in queue_dirs
-    })
