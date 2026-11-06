@@ -1658,6 +1658,17 @@ verify_runners:
 verify_host_policy: prefer_remote
 verify_drift_check_every_n_lands: 10
 verify_cross_check_remote_green: false
+# Remote TASK verifies (task 6670, plans/remote-task-leg-verify-prd.md §5.7): the four
+# verify_task_* keys let an implement-phase task verify run on a verify_runners host
+# (one queue per host, shared with the merge lane's bench). None is set here, so the
+# code default verify_task_host_policy: local stands: every task verify runs locally
+# exactly as before and no dispatch sidecar is written. All four are green tier,
+# read per dispatch and per remote grant. Task ε (DF rollout) sets them, e.g.:
+# verify_task_host_policy: remote_modules        # local | remote_modules | remote_all
+# verify_task_remote_modules: [orchestrator]     # must be non-empty under remote_modules
+# verify_task_remote_red_confirms_locally: true  # a remote red re-runs locally, local wins
+# verify_task_remote_cross_check_every_n: 5      # every 5th eligible verify also runs locally
+# ROLLBACK: verify_task_host_policy: local (or delete the keys) + mcp__escalation__reload_config.
 
 # Pre-merge rebase: the merge phase only REBASES (Leo, 2026-10-09, task 6580).
 # workflow.py's merge phase rebases the task branch onto main and submits it to the
