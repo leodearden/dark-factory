@@ -8034,6 +8034,9 @@ class SpeculativeMergeWorker:
         remote_runners: Sequence[VerifyRunner] | None = None,
         deployed_sha: DeployedSha | None = None,
         verify_hosts: Sequence[str] = (),
+        runner_quarantine: set[str] | None = None,
+        host_holder_reader: Callable[[], Mapping[str, str]] | None = None,
+        on_host_readmitted: Callable[[str], None] | None = None,
     ):
         self._git_ops = git_ops
         # Task 6565: handed to every RemoteRunner this worker builds.
@@ -8385,18 +8388,28 @@ class SpeculativeMergeWorker:
         # durable cross-restart protection.  None-safe: initialised here so
         # bare-worker tests that don't set up remotes stay green.
         #
-        # RESTART RE-TRUST WINDOW: _runner_quarantine resets to empty on worker
-        # restart.  A remote that diverged (remote PASS / local FAIL) becomes
-        # re-eligible immediately after restart.  The dedup'd L1 blocking
-        # escalation (submitted by DriftDetector before quarantine) is the
-        # cross-restart guard: an open verify_drift_divergence L1 escalation
-        # halts the merge queue across restart via the normal EscalationQueue
-        # gate, so the re-trusted remote's verdict is never authoritative for
-        # real merges until the escalation is resolved.  Rely on that coupling
-        # rather than persisting the quarantine set (operational simplicity
-        # tradeoff accepted; see plan.json §Mechanism-4 design notes).
+        # RESTART RE-TRUST WINDOW: an injected *runner_quarantine* is owned by
+        # the harness for the PROCESS lifetime (task 6670, PRD
+        # plans/remote-task-leg-verify-prd.md decision 4, §12 Q4), shared by
+        # reference with the task path's HostPool, so it survives an
+        # in-process worker rebuild; the RU tracker below stays this worker's.
+        # It still resets to empty on a process restart: a remote that
+        # diverged (remote PASS / local FAIL) becomes re-eligible then.  The
+        # dedup'd L1 blocking escalation (submitted by DriftDetector before
+        # quarantine) is the cross-restart guard: an open
+        # verify_drift_divergence L1 halts the merge queue across restart via
+        # the normal EscalationQueue gate, so the re-trusted remote's verdict
+        # is never authoritative for real merges until the escalation is
+        # resolved.  Rely on that coupling rather than persisting the set.
         self._drift_land_count: int = 0
-        self._runner_quarantine: set[str] = set()
+        self._runner_quarantine: set[str] = (
+            set() if runner_quarantine is None else runner_quarantine
+        )
+        # Task 6670: the harness's reader of task-path holds per remote host,
+        # shown as task_held_by on the snapshot's host rows, and its hook for
+        # a readmission (readmit_host), so the task pool re-offers the host.
+        self._host_holder_reader = host_holder_reader
+        self._on_host_readmitted = on_host_readmitted
         # Per-host RunnerUnavailable streak tracker (task 1795).  Keyed by
         # runner name; entries created on first failure, popped on recovery.
         # Used by _record_runner_unavailable / _record_runner_recovered to fire
@@ -9342,6 +9355,16 @@ class SpeculativeMergeWorker:
 
     # ── β host allocator ──────────────────────────────────────────────────
 
+    def ensure_host_allocator(self, config: OrchestratorConfig) -> HostAllocator:
+        """Build the worker-lifetime HostAllocator now, from *config*, if not yet built.
+
+        The harness's seam (task 6670): it calls this before the first merge
+        so a task-path bench lands on a managed host, with the unreachability
+        thresholds read from *config*, and ``task_held_by`` shows in the
+        snapshot.  Idempotent; see :meth:`_ensure_host_allocator`.
+        """
+        return self._ensure_host_allocator(config)
+
     def _ensure_host_allocator(self, config: OrchestratorConfig) -> HostAllocator:
         """Lazily build and cache the worker-lifetime HostAllocator.
 
@@ -9407,6 +9430,10 @@ class SpeculativeMergeWorker:
         gate to dispatch through, and a remote verify must never fall back to
         a shared remote tree (task 6565, design D2).  ``cli.py::run`` refuses
         to start in that state, so this raise is the second line.
+
+        Unfiltered by quarantine (task 6670): the allocator reads the shared
+        set at acquire, and a host benched before this build must still get
+        a slot, or its row is an orphan the reprobe cannot re-adopt.
         """
         enabled = [r.name for r in config.enabled_verify_runners]
         if not enabled:
@@ -9416,9 +9443,7 @@ class SpeculativeMergeWorker:
                 f'merge worker has enabled verify_runners {enabled} but no deployed '
                 'sha to gate them on (task 6565); start it with Harness(deployed_sha=...)'
             )
-        return _build_remote_runners(
-            config, cwd, deployed_sha=self._deployed_sha, quarantine=self._runner_quarantine,
-        )
+        return _build_remote_runners(config, cwd, deployed_sha=self._deployed_sha)
 
     # ── per-host RunnerUnavailable tracker (tasks 1795, 6565) ────────────
 
@@ -9615,7 +9640,7 @@ class SpeculativeMergeWorker:
 
             {name, is_local, slot_state, quarantined, quarantine_class,
              unavailable_since, unavailable_secs, streak, reason,
-             kind, sticky, identity}
+             kind, sticky, identity, task_held_by}
 
         *now* is the snapshot's own clock (``time.time()``), passed in so
         ``unavailable_secs`` is measured against the same instant as every
@@ -9676,12 +9701,17 @@ class SpeculativeMergeWorker:
           ``MagicMock`` double at 79 assignment sites across 15 test files;
           those doubles answer every attribute, so ``hasattr``/duck-typing
           would let them crash or inject garbage into this read-only path.
+        - ``task_held_by`` is the harness's task-hold reading for the host
+          (``'task:<id>[,task:<id>]'``), else None.  It is independent of
+          ``slot_state``: a task turn on a remote host takes no merge slot
+          (task 6670, hosts are symmetric).
         - ``[]`` therefore also means "allocator not built yet (no verify
           dispatched)".  Deliberately NOT a fabricated ``local`` entry — an
           absent allocator is a distinct fact from an idle one.
         """
         if not isinstance(self._host_allocator, HostAllocator):
             return []
+        holders = self._host_holder_reader() if self._host_holder_reader is not None else {}
 
         def _entry(name: str, *, is_local: bool, slot_state: str | None,
                    quarantined: bool) -> dict:
@@ -9696,6 +9726,7 @@ class SpeculativeMergeWorker:
                     if quarantined else None
                 ),
                 **(ru.to_wire(now) if ru is not None else UNTRACKED_HOST_WIRE),
+                'task_held_by': holders.get(name),
             }
 
         out: list[dict] = [
