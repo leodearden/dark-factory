@@ -69,17 +69,17 @@ REQUEST_DEADLINE_SECONDS = 5.0
 RESOLVER_SERVICE_STORE = 'fused-memory'
 
 
-class _Unanswered(Exception):
+class _NoResolution(Exception):
     """A response arrived but is no Resolution: what it was, why, and which store to blame."""
 
     def __init__(
         self,
         detail: str,
-        why: UnavailableReason = UnavailableReason.BAD_RESPONSE,
+        reason: UnavailableReason = UnavailableReason.BAD_RESPONSE,
         store: str = RESOLVER_SERVICE_STORE,
     ) -> None:
         super().__init__(detail)
-        self.why = why
+        self.reason = reason
         self.store = store
 
 
@@ -96,10 +96,10 @@ def _describe(exc: BaseException) -> str:
     return f'{type(exc).__name__}: {exc}'
 
 
-def _why(exc: BaseException) -> UnavailableReason:
+def _reason_for(exc: BaseException) -> UnavailableReason:
     """A deadline, ours or httpx's, is a timeout — in an anyio group only if every leaf is."""
     if isinstance(exc, BaseExceptionGroup):
-        timed_out = all(_why(leaf) is UnavailableReason.TIMED_OUT for leaf in exc.exceptions)
+        timed_out = all(_reason_for(leaf) is UnavailableReason.TIMED_OUT for leaf in exc.exceptions)
         return UnavailableReason.TIMED_OUT if timed_out else UnavailableReason.UNREACHABLE
     if isinstance(exc, TimeoutError | httpx.TimeoutException):
         return UnavailableReason.TIMED_OUT
@@ -116,12 +116,12 @@ def _is_namespace(value: object) -> TypeGuard[Namespace]:
 
 def _candidate(raw: object) -> Candidate:
     if not isinstance(raw, dict):
-        raise _Unanswered(f'HTTP 200 carried a candidate that is not an object: {raw!r}')
+        raise _NoResolution(f'HTTP 200 carried a candidate that is not an object: {raw!r}')
     namespace, candidate_id, preview = raw.get('namespace'), raw.get('id'), raw.get('preview')
     if not _is_namespace(namespace):
-        raise _Unanswered(f'HTTP 200 carried a candidate namespace {namespace!r} outside {NAMESPACES}')
+        raise _NoResolution(f'HTTP 200 carried a candidate namespace {namespace!r} outside {NAMESPACES}')
     if not isinstance(candidate_id, str) or not isinstance(preview, str):
-        raise _Unanswered(f'HTTP 200 carried a candidate without a string id and preview: {raw!r}')
+        raise _NoResolution(f'HTTP 200 carried a candidate without a string id and preview: {raw!r}')
     return Candidate(namespace, candidate_id, preview)
 
 
@@ -129,23 +129,23 @@ def _resolution(response: httpx.Response) -> Resolution:
     try:
         body = response.json()
     except ValueError as exc:
-        raise _Unanswered(f'HTTP 200 body is not JSON: {exc}') from exc
+        raise _NoResolution(f'HTTP 200 body is not JSON: {exc}') from exc
     if not isinstance(body, dict):
-        raise _Unanswered(f'HTTP 200 body is not a JSON object: {body!r}')
+        raise _NoResolution(f'HTTP 200 body is not a JSON object: {body!r}')
     outcome, candidates = body.get('outcome'), body.get('candidates')
     if not _is_outcome(outcome):
-        raise _Unanswered(f'HTTP 200 carried outcome {outcome!r} outside {RESOLUTION_OUTCOMES}')
+        raise _NoResolution(f'HTTP 200 carried outcome {outcome!r} outside {RESOLUTION_OUTCOMES}')
     if not isinstance(candidates, list):
-        raise _Unanswered(f'HTTP 200 carried candidates that are not a list: {candidates!r}')
+        raise _NoResolution(f'HTTP 200 carried candidates that are not a list: {candidates!r}')
     return Resolution(outcome, tuple(_candidate(raw) for raw in candidates))
 
 
-def _unanswered_status(response: httpx.Response) -> _Unanswered:
+def _no_resolution_from_status(response: httpx.Response) -> _NoResolution:
     """A 503 is the service naming a store it could not reach; any other status is a bad answer."""
     detail = f'HTTP {response.status_code}'
     if response.status_code == 503:
-        return _Unanswered(detail, UnavailableReason.UNREACHABLE, _unavailable_store(response))
-    return _Unanswered(detail)
+        return _NoResolution(detail, UnavailableReason.UNREACHABLE, _unavailable_store(response))
+    return _NoResolution(detail)
 
 
 def _unavailable_store(response: httpx.Response) -> str:
@@ -184,16 +184,16 @@ class PrefixResolverClient:
     async def resolve_prefix(self, project_id: str, prefix: str) -> Resolution:
         try:
             return await self._request(project_id, prefix)
-        except _Unanswered as exc:
-            detail, why, store, cause = str(exc), exc.why, exc.store, exc
+        except _NoResolution as exc:
+            detail, reason, store, cause = str(exc), exc.reason, exc.store, exc
         except Exception as exc:
-            detail, why, store, cause = _describe(exc), _why(exc), RESOLVER_SERVICE_STORE, exc
+            detail, reason, store, cause = _describe(exc), _reason_for(exc), RESOLVER_SERVICE_STORE, exc
         logger.warning(
             'prefix resolver: POST %s for project=%s prefix=%s got no resolution (%s: %s); '
             'the %s store is treated as unavailable',
-            self.url, project_id, prefix, why, detail, store,
+            self.url, project_id, prefix, reason, detail, store,
         )
-        raise ResolverUnavailable(store, reason=why) from cause
+        raise ResolverUnavailable(store, reason=reason) from cause
 
     async def _request(self, project_id: str, prefix: str) -> Resolution:
         async with (
@@ -204,5 +204,5 @@ class PrefixResolverClient:
         ):
             response = await client.post(self.url, json={'project_id': project_id, 'prefix': prefix})
         if response.status_code != 200:
-            raise _unanswered_status(response)
+            raise _no_resolution_from_status(response)
         return _resolution(response)
