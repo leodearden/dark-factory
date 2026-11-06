@@ -18,6 +18,7 @@ from orchestrator.session_registry import (
     decision_path_for_id,
     normalize_escalations_dir,
     record_audit_outcome,
+    reopen_decision,
     write_decision,
 )
 from sitting import audits as mod
@@ -98,7 +99,7 @@ class Fleet:
         audited = record_audit_outcome(
             record.id, verdict, note, root=self.root, expected_project=record.project,
             expected_escalations_dir=record.escalations_dir, audited_at=NOW.isoformat(),
-            policy_class=policy_class,
+            policy_class=policy_class, closed_at=record.closed_at,
         )
         assert audited is not None
 
@@ -228,7 +229,25 @@ class TestExecutorCloses:
 
         assert close.audited == AuditOutcome(
             AuditVerdict.WRONG, 'the sibling commit did not carry it', NOW.isoformat(), SAMPLED_CLASS,
+            closed_at=record.closed_at,
         )
+
+    def test_a_reopened_close_closed_again_is_unaudited_while_its_earlier_audit_still_counts(self, fleet):
+        record = fleet.executor_close(1)
+        fleet.audit(record, AuditVerdict.WRONG)
+        assert reopen_decision(record.id, fleet.root, expected_project=record.project,
+                               expected_escalations_dir=record.escalations_dir) is not None
+        assert close_decision_with_evidence(record.id, 'answered', 'closed again', root=fleet.root,
+                                            expected_project=record.project,
+                                            expected_escalations_dir=record.escalations_dir) is not None
+
+        found = fleet.closes(window=Window.trailing(datetime.now(UTC), days=1))
+
+        (close,) = found.in_window
+        assert close.audited is None
+        assert dict(found.audited_by_class) == {SAMPLED_CLASS: 1}
+        drawn = mod.draw(found.in_window, seed='2026-09-26', audited_by_class=found.audited_by_class)
+        assert _ids(drawn.sampled) == [record.id]
 
     def test_a_close_in_an_unscanned_queue_is_a_shortfall(self, fleet, tmp_path):
         elsewhere = tmp_path / 'src' / 'reify' / 'data' / 'escalations'

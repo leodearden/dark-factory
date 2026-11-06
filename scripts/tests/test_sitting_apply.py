@@ -28,6 +28,7 @@ from orchestrator.session_registry import (
     list_decisions,
     normalize_escalations_dir,
     record_audit_outcome,
+    reopen_decision,
     write_decision,
 )
 from shared.mcp_session import SyncMcpSession
@@ -702,7 +703,8 @@ class AuditBench:
         if verdict is not None:
             assert record_audit_outcome(record.id, verdict, '', root=self.fleet, expected_project='alpha',
                                         expected_escalations_dir=self.queue_dir,
-                                        audited_at=self.now.isoformat(), policy_class=LANDING) is not None
+                                        audited_at=self.now.isoformat(), policy_class=LANDING,
+                                        closed_at=record.closed_at) is not None
         return record
 
     def number(self, key: str, *, kinds: frozenset[str] = frozenset({AUDIT_KIND})) -> int:
@@ -771,7 +773,7 @@ class TestAuditRow8:
 
             assert rc == 0, text
             assert _decision_of(bench.fleet, record.id).audit_outcome == AuditOutcome(
-                AuditVerdict.WRONG, 'missed sibling', bench.now.isoformat(), LANDING)
+                AuditVerdict.WRONG, 'missed sibling', bench.now.isoformat(), LANDING, closed_at=record.closed_at)
             assert bench.state() == ClassSwitch.SHADOW
             assert _executor_resolve(served, 'esc-501-1')['code'] == 'level_forbidden'
             (row,) = rows
@@ -830,7 +832,8 @@ class TestAuditRefusals:
         n = bench.number_audit(record)
         assert record_audit_outcome(record.id, AuditVerdict.OK, '', root=bench.fleet, expected_project='alpha',
                                     expected_escalations_dir=bench.queue_dir,
-                                    audited_at=bench.now.isoformat(), policy_class=LANDING) is not None
+                                    audited_at=bench.now.isoformat(), policy_class=LANDING,
+                                    closed_at=record.closed_at) is not None
         before = self._written(bench, record)
 
         rc, rows, _ = bench.run(capsys, f'{n}=wrong')
@@ -839,6 +842,25 @@ class TestAuditRefusals:
         assert rows[0]['refusal']['code'] == 'already_audited'
         assert self._written(bench, record) == before
         assert bench.state() == ClassSwitch.LIVE
+
+    def test_a_reopened_close_closed_again_is_audited_in_its_own_right(self, bench, capsys):
+        bench.go_live()
+        record = bench.executor_close(1, verdict=AuditVerdict.OK)
+        assert reopen_decision(record.id, bench.fleet, expected_project='alpha',
+                               expected_escalations_dir=bench.queue_dir) is not None
+        closed_again = close_decision_with_evidence(record.id, 'answered', FOUND_EVIDENCE, root=bench.fleet,
+                                                    expected_project='alpha', expected_escalations_dir=bench.queue_dir)
+        assert closed_again is not None
+        n = bench.number_audit(record)
+
+        rc, rows, text = bench.run(capsys, f'{n}=wrong:the second close missed it too')
+
+        assert rc == 0, text
+        (row,) = rows
+        assert (row['outcome'], row['verdict']) == ('ok', 'wrong')
+        current = _decision_of(bench.fleet, record.id).current_audit
+        assert current is not None
+        assert (current.verdict, current.closed_at) == (AuditVerdict.WRONG, closed_again.closed_at)
 
     def test_a_close_that_no_longer_joins_to_an_executor_close_is_refused(self, bench, capsys):
         record = bench.executor_close(1)

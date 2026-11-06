@@ -682,9 +682,9 @@ def _audit_target(
         record = DecisionRecord.from_json(decision_path_for_id(row.record_id, root=decisions_root).read_text())
     except (OSError, KeyError, TypeError, ValueError) as exc:
         return Refusal(RefusalCode.DECISION_UNREADABLE, {'reason': f'{type(exc).__name__}: {exc}'})
-    if record.audit_outcome is not None:
-        return Refusal(RefusalCode.ALREADY_AUDITED, {'verdict': str(record.audit_outcome.verdict),
-                                                      'audited_at': record.audit_outcome.audited_at})
+    current = record.current_audit
+    if current is not None:
+        return Refusal(RefusalCode.ALREADY_AUDITED, {'verdict': str(current.verdict), 'audited_at': current.audited_at})
     queue_dir = normalize_escalations_dir(record.escalations_dir)
     if queue_dir not in indexes:
         indexes[queue_dir] = index_queue(queue_dir)
@@ -711,7 +711,7 @@ def _audit_one(
         written = record_audit_outcome(
             close.decision_id, verdict, row.note, root=decisions_root, expected_project=target.record.project,
             expected_escalations_dir=target.record.escalations_dir, audited_at=row.answered_at,
-            policy_class=close.policy_class,
+            policy_class=close.policy_class, closed_at=close.closed_at,
         )
     except DecisionAuditRefused as exc:
         return replace(result, outcome=StepOutcome.FAILED, detail=str(exc)), recorded

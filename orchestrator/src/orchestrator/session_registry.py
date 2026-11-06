@@ -539,12 +539,17 @@ class AuditVerdict(StrEnum):
 
 @dataclass(frozen=True)
 class AuditOutcome:
-    """One audit of a closed DecisionRecord: the verdict, the auditor's note, when, and the class judged."""
+    """One audit of a closed DecisionRecord: the verdict, the auditor's note, when, the class judged, and which close.
+
+    ``closed_at`` is the ``closed_at`` of the close the audit judged; ''
+    judges a close that recorded no instant.
+    """
 
     verdict: AuditVerdict
     note: str
     audited_at: str
     policy_class: str
+    closed_at: str = ''
 
     def __post_init__(self) -> None:
         object.__setattr__(self, 'verdict', AuditVerdict(self.verdict))
@@ -553,6 +558,10 @@ class AuditOutcome:
         datetime.fromisoformat(self.audited_at)
         if not isinstance(self.policy_class, str) or not self.policy_class:
             raise ValueError(f'policy_class must be a non-empty class name, got {self.policy_class!r}')
+        if not isinstance(self.closed_at, str):
+            raise ValueError(f"closed_at must be ISO-8601 text or '', got {self.closed_at!r}")
+        if self.closed_at:
+            datetime.fromisoformat(self.closed_at)
 
     def to_dict(self) -> dict[str, str]:
         return {
@@ -560,6 +569,7 @@ class AuditOutcome:
             'note': self.note,
             'audited_at': self.audited_at,
             'policy_class': self.policy_class,
+            'closed_at': self.closed_at,
         }
 
     @classmethod
@@ -569,6 +579,7 @@ class AuditOutcome:
             note=str(data.get('note') or ''),
             audited_at=data['audited_at'],
             policy_class=data['policy_class'],
+            closed_at=data.get('closed_at') or '',
         )
 
 
@@ -636,12 +647,16 @@ class DecisionRecord:
         Defaults to '' (not closed with evidence, or closed before this field
         existed).
     audit_outcome: the sitting's AuditOutcome for an executor close, or None
-        (not audited). Written only by record_audit_outcome, never
-        overwritten; CUSTODY like ``closing_evidence``, and kept by
-        reopen_decision, because an audited close stays history the per-class
-        wrong rate counts. The outcome names the policy class the audit
-        judged, copied from the escalation record at audit time: escalation
-        archives are pruned
+        (not audited). Written only by record_audit_outcome; CUSTODY like
+        ``closing_evidence``, and kept by reopen_decision, because an audited
+        close stays history the per-class wrong rate counts. The outcome names
+        the close it judged (its ``closed_at``), so a reopened record closed
+        again is unaudited (``current_audit`` is None) until that new close
+        is audited, and that audit replaces the earlier one: a record holds
+        the audit of its latest audited close. An outcome is never
+        overwritten for the close it judged. It names the policy class the
+        audit judged, copied from the escalation record at audit time:
+        escalation archives are pruned
         (escalation/src/escalation/archive.py::DEFAULT_RETENTION_DAYS) and the
         per-class counts must outlive them. The escalation record stays the
         class's home for the close itself.
@@ -701,6 +716,12 @@ class DecisionRecord:
         field directly.
         """
         return self.record_slug or self.session_id or None
+
+    @property
+    def current_audit(self) -> AuditOutcome | None:
+        """``audit_outcome`` when it judged the close this record carries now, else None."""
+        outcome = self.audit_outcome
+        return outcome if outcome is not None and outcome.closed_at == self.closed_at else None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1642,7 +1663,9 @@ def reopen_decision(
     DecisionReopenRefused. Clears ``closing_evidence`` and ``closed_at``,
     because a close never overwrites evidence, so a re-opened gate could
     otherwise never be closed with evidence again. Every other field is kept,
-    ``filed_at`` and ``manual_boost`` included (custody). It is reopen-only
+    ``filed_at``, ``manual_boost`` and ``audit_outcome`` included (custody);
+    the kept outcome names the close it judged, so the record's next close is
+    unaudited until it is audited in turn. It is reopen-only
     rather than a generic state setter, which would bypass the evidence-quoting
     close; see plans/4835-decision-plumbing-decisions.md.
 
@@ -1678,20 +1701,26 @@ def record_audit_outcome(
     expected_escalations_dir: str | Path,
     audited_at: str,
     policy_class: str,
+    closed_at: str,
 ) -> DecisionRecord | None:
     """Record the sitting's *verdict* on *decision_id*'s close, in ONE locked read-modify-write.
 
     The caller names the record exactly as for close_decision_with_evidence,
-    and any other record at that id raises DecisionAuditRefused; so does a
-    record with no closing evidence (nothing was closed to audit) and one that
-    already carries an outcome (never overwritten). *policy_class* is the
-    class the audit judged. A malformed verdict, stamp or class raises
-    ValueError before the lock.
+    and any other record at that id raises DecisionAuditRefused. *closed_at*
+    is the ``closed_at`` of the close the auditor judged; DecisionAuditRefused
+    also meets a record with no closing evidence (nothing was closed to
+    audit), one whose close is no longer that one (reopened, or closed
+    again), and one whose current close already carries an outcome (never
+    overwritten). An outcome that judged an earlier close of a reopened record
+    is replaced. *policy_class* is the class the audit judged. A malformed
+    verdict, stamp or class raises ValueError before the lock.
 
     Otherwise FAIL-SOFT like its sibling setters: None (logged at ERROR) on a
     missing file, a corrupt body, a lock fault or a write failure.
     """
-    outcome = AuditOutcome(verdict=verdict, note=note, audited_at=audited_at, policy_class=policy_class)
+    outcome = AuditOutcome(
+        verdict=verdict, note=note, audited_at=audited_at, policy_class=policy_class, closed_at=closed_at,
+    )
     wanted = _decision_identity(expected_project, expected_escalations_dir)
 
     def _audit(record: DecisionRecord) -> None:
@@ -1700,10 +1729,16 @@ def record_audit_outcome(
             raise DecisionAuditRefused(
                 f'{decision_id} carries no closing evidence; only a closed record is audited'
             )
-        if record.audit_outcome is not None:
+        if record.closed_at != closed_at:
             raise DecisionAuditRefused(
-                f'{decision_id} was already audited {record.audit_outcome.verdict!s} at '
-                f'{record.audit_outcome.audited_at}; refusing to overwrite it'
+                f'{decision_id} now carries the close of {record.closed_at!r}, not the judged close of '
+                f'{closed_at!r}; it was reopened or closed again since it was drawn'
+            )
+        current = record.current_audit
+        if current is not None:
+            raise DecisionAuditRefused(
+                f'{decision_id} was already audited {current.verdict!s} at {current.audited_at}; '
+                'refusing to overwrite it'
             )
         record.audit_outcome = outcome
 

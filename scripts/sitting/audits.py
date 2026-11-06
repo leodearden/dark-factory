@@ -148,7 +148,7 @@ def executor_close_of(
         policy_class=esc.policy_class,
         closed_at=record.closed_at,
         evidence=record.closing_evidence,
-        audited=record.audit_outcome,
+        audited=record.current_audit,
     )
 
 

@@ -1,6 +1,7 @@
 """DecisionRecord.audit_outcome: the sitting's verdict on an executor close, and its one writer."""
 from __future__ import annotations
 
+import dataclasses
 import json
 from pathlib import Path
 
@@ -38,21 +39,43 @@ def _seed_closed(root: Path, decision_id: str = 'dec-audit') -> Path:
     return sr.decision_path_for_id(decision_id, root=root)
 
 
+def _closed_at(root: Path, decision_id: str = 'dec-audit') -> str:
+    """The close *decision_id* carries now, as an auditor drawing it reads it; '' when there is no record."""
+    path = sr.decision_path_for_id(decision_id, root=root)
+    return sr.DecisionRecord.from_json(path.read_text()).closed_at if path.exists() else ''
+
+
 def _audit(
     root: Path,
     decision_id: str = 'dec-audit',
     *,
+    verdict: sr.AuditVerdict = sr.AuditVerdict.WRONG,
     expected_project: str = _PROJECT,
     expected_escalations_dir: str = _QUEUE,
     policy_class: str = _CLASS,
+    closed_at: str | None = None,
 ) -> sr.DecisionRecord | None:
     return sr.record_audit_outcome(
-        decision_id, sr.AuditVerdict.WRONG, 'note', root,
+        decision_id, verdict, 'note', root,
         expected_project=expected_project,
         expected_escalations_dir=expected_escalations_dir,
         audited_at=_AUDITED_AT,
         policy_class=policy_class,
+        closed_at=_closed_at(root, decision_id) if closed_at is None else closed_at,
     )
+
+
+def _reopen(root: Path) -> None:
+    assert sr.reopen_decision(
+        'dec-audit', root, expected_project=_PROJECT, expected_escalations_dir=_QUEUE,
+    ) is not None
+
+
+def _close_again(root: Path) -> None:
+    assert sr.close_decision_with_evidence(
+        'dec-audit', sr.DecisionState.ANSWERED, f'{_EVIDENCE}, closed again', root=root,
+        expected_project=_PROJECT, expected_escalations_dir=_QUEUE,
+    ) is not None
 
 
 def _only(root: Path) -> sr.DecisionRecord:
@@ -77,11 +100,31 @@ class TestSerialization:
     def test_an_outcome_round_trips(self) -> None:
         outcome = sr.AuditOutcome(
             verdict=sr.AuditVerdict.OK, note='', audited_at=_AUDITED_AT, policy_class=_CLASS,
+            closed_at='2026-09-25T00:00:00+00:00',
         )
         record = _decision(audit_outcome=outcome)
 
         assert sr.DecisionRecord.from_json(record.to_json()) == record
         assert record.to_dict()['audit_outcome']['policy_class'] == _CLASS
+        assert record.to_dict()['audit_outcome']['closed_at'] == '2026-09-25T00:00:00+00:00'
+
+    @pytest.mark.parametrize('closed_at', ['yesterday', 7])
+    def test_an_outcome_naming_a_malformed_close_is_refused(self, closed_at: object) -> None:
+        body = {'verdict': 'ok', 'note': '', 'audited_at': _AUDITED_AT, 'policy_class': _CLASS,
+                'closed_at': closed_at}
+
+        with pytest.raises(ValueError):
+            sr.AuditOutcome.from_dict(body)
+
+    def test_the_current_audit_is_the_outcome_that_judged_the_close_carried_now(self) -> None:
+        judged = '2026-09-25T00:00:00+00:00'
+        outcome = sr.AuditOutcome(sr.AuditVerdict.OK, '', _AUDITED_AT, _CLASS, closed_at=judged)
+
+        assert dataclasses.replace(_decision(audit_outcome=outcome), closed_at=judged).current_audit == outcome
+        later = dataclasses.replace(_decision(audit_outcome=outcome), closed_at='2026-09-27T00:00:00+00:00')
+        assert later.current_audit is None
+        assert later.audit_outcome == outcome
+        assert _decision().current_audit is None
 
     @pytest.mark.parametrize('verdict', ['maybe', '', None])
     def test_an_unknown_verdict_is_refused(self, verdict: object) -> None:
@@ -145,15 +188,19 @@ class TestRecordAuditOutcome:
 
         returned = _audit(tmp_path)
 
+        closed_at = _closed_at(tmp_path)
         expected = sr.AuditOutcome(
             verdict=sr.AuditVerdict.WRONG, note='note', audited_at=_AUDITED_AT, policy_class=_CLASS,
+            closed_at=closed_at,
         )
         assert returned is not None and returned.audit_outcome == expected
         reread = _only(tmp_path)
         assert reread.audit_outcome == expected
+        assert reread.current_audit == expected
         assert reread.audit_outcome is not None and reread.audit_outcome.policy_class == _CLASS
         assert reread.to_dict()['audit_outcome'] == {
             'verdict': 'wrong', 'note': 'note', 'audited_at': _AUDITED_AT, 'policy_class': _CLASS,
+            'closed_at': closed_at,
         }
         assert sr.DecisionRecord.from_json(reread.to_json()) == reread
         assert reread.closing_evidence == _EVIDENCE
@@ -183,11 +230,7 @@ class TestRecordAuditOutcome:
         before = path.read_bytes()
 
         with pytest.raises(sr.DecisionAuditRefused):
-            sr.record_audit_outcome(
-                'dec-audit', sr.AuditVerdict.OK, '', tmp_path,
-                expected_project=_PROJECT, expected_escalations_dir=_QUEUE, audited_at=_AUDITED_AT,
-                policy_class=_CLASS,
-            )
+            _audit(tmp_path, verdict=sr.AuditVerdict.OK)
 
         assert path.read_bytes() == before
 
@@ -215,9 +258,47 @@ class TestRecordAuditOutcome:
         audited = _audit(tmp_path)
         assert audited is not None
 
-        reopened = sr.reopen_decision(
-            'dec-audit', tmp_path, expected_project=_PROJECT, expected_escalations_dir=_QUEUE,
-        )
+        _reopen(tmp_path)
 
-        assert reopened is not None
         assert _only(tmp_path).audit_outcome == audited.audit_outcome
+        assert _only(tmp_path).current_audit is None
+
+
+class TestAReopenedRecordClosedAgain:
+    """The outcome names the close it judged, so a later close of the same record is audited in its own right."""
+
+    def _closed_twice(self, root: Path) -> tuple[str, str]:
+        _seed_closed(root)
+        first = _closed_at(root)
+        assert _audit(root) is not None
+        _reopen(root)
+        _close_again(root)
+        return first, _closed_at(root)
+
+    def test_its_new_close_is_unaudited_while_the_earlier_audit_is_kept(self, tmp_path: Path) -> None:
+        first, second = self._closed_twice(tmp_path)
+
+        record = _only(tmp_path)
+        assert second != first
+        assert record.current_audit is None
+        assert record.audit_outcome is not None and record.audit_outcome.closed_at == first
+
+    def test_auditing_the_new_close_replaces_the_earlier_audit(self, tmp_path: Path) -> None:
+        _, second = self._closed_twice(tmp_path)
+
+        returned = _audit(tmp_path, verdict=sr.AuditVerdict.OK)
+
+        assert returned is not None
+        record = _only(tmp_path)
+        assert record.current_audit is not None
+        assert (record.current_audit.verdict, record.current_audit.closed_at) == (sr.AuditVerdict.OK, second)
+
+    def test_a_verdict_on_the_earlier_close_is_refused_untouched(self, tmp_path: Path) -> None:
+        first, _ = self._closed_twice(tmp_path)
+        path = sr.decision_path_for_id('dec-audit', root=tmp_path)
+        before = path.read_bytes()
+
+        with pytest.raises(sr.DecisionAuditRefused, match='closed again'):
+            _audit(tmp_path, closed_at=first)
+
+        assert path.read_bytes() == before
