@@ -5,7 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 
-import staleness from '../../src/dashboard/static/redux/endpoint_staleness.js';
+import pollScope from '../../src/dashboard/static/redux/poll_scope.js';
 
 import { loadDataJs, drain } from './_data_loader.mjs';
 import { EXPECTED_ENDPOINT_COUNT } from './_data_fixtures.mjs';
@@ -19,7 +19,7 @@ const { pollKey } = loadDataJs().api;
 // polled, which is what every other data.js suite relies on.
 // ════════════════════════════════════════════════════════════════════════════
 
-const { TAB_ENDPOINTS, CHROME_ENDPOINTS } = staleness;
+const { TAB_ENDPOINTS, CHROME_ENDPOINTS } = pollScope;
 const DASH = '/api/v2/dashboard';
 const FULL_TASKS_URL = `${DASH}/tasks`;
 const CENSUS_TASKS_URL = `${DASH}/tasks?projection=census`;

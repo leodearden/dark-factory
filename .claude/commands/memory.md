@@ -134,20 +134,17 @@ add_episode(
 ### Query patterns
 
 ```
-# Broad project context
-search(query="project overview and architecture", project_id="dark_factory")
-
 # Specific decisions
 search(query="why was X chosen over Y", project_id="dark_factory", categories=["decisions_and_rationale"])
 
 # Conventions
-search(query="coding conventions and style rules", project_id="dark_factory", categories=["preferences_and_norms"])
+search(query="conventions and gotchas for orchestrator merge lane", project_id="dark_factory", stores=["mem0"], categories=["preferences_and_norms", "procedural_knowledge"])
 
 # Entity relationships
 search(query="what depends on the TaskInterceptor", project_id="dark_factory", stores=["graphiti"])
 
-# Recent changes
-search(query="what changed recently in the reconciliation system", project_id="dark_factory", categories=["temporal_facts"])
+# How one subject changed over time
+search(query="how the reconciliation system changed", project_id="dark_factory", categories=["temporal_facts"])
 
 # How-to
 search(query="how to run tests", project_id="dark_factory", categories=["procedural_knowledge"])
@@ -196,19 +193,9 @@ To execute hints:
 
 ### Starting a session
 
-1. **Search for project context:**
-   ```
-   search(query="project overview and current status", project_id="dark_factory")
-   search(query="recent decisions and changes", project_id="dark_factory")
-   search(query="active conventions and procedures", project_id="dark_factory")
-   ```
+1. **Recall memory context and the task tree:** run the queries in [Context Briefing](#context-briefing) below.
 
-2. **Check task tree:**
-   ```
-   get_tasks(project_root="/home/leo/src/dark-factory")
-   ```
-
-3. **If working on a specific task**, fetch it and execute its memory_hints:
+2. **If working on a specific task**, fetch it and execute its memory_hints:
    ```
    get_task(id="7", project_root="/home/leo/src/dark-factory")
    # Then execute any memory_hints queries and entity lookups
@@ -241,13 +228,21 @@ Reflect on the session and write separate memories for:
 
 ## Context Briefing
 
-To build a comprehensive context briefing (useful at session start or before a complex task):
+To build a context briefing (at session start or before a complex task), run the queries below. Items 1-2 mirror the queries every dispatched agent's briefing fires; `shared/src/shared/briefing_queries.py` is the single home of their phrasing and of the measurements behind it, and where this section and that module disagree, the module wins. Items 3-4 are extra reads for an interactive session that the dispatched briefing does not make.
 
-1. **Project overview**: `search(query="project overview architecture goals", project_id="dark_factory")`
-2. **Recent decisions**: `search(query="recent decisions and rationale", project_id="dark_factory", categories=["decisions_and_rationale"])`
-3. **Active conventions**: `search(query="coding conventions and project norms", project_id="dark_factory", categories=["preferences_and_norms"])`
-4. **Procedures**: `search(query="development workflows and procedures", project_id="dark_factory", categories=["procedural_knowledge"])`
-5. **Task tree**: `get_tasks(project_root="/home/leo/src/dark-factory")`
-6. **Recent activity**: `get_episodes(project_id="dark_factory", last_n=5)`
+1. **Conventions for your working area**: Mem0-scoped, phrased from the prose words of the paths you work in. For example, `fused-memory/src/fused_memory/reconciliation/stages/` gives `fused memory reconciliation stages`:
+   ```
+   search(query="conventions and gotchas for fused memory reconciliation stages", project_id="dark_factory", stores=["mem0"], categories=["preferences_and_norms", "procedural_knowledge"])
+   ```
+   With no working area yet, use the same scoping with `query="conventions, norms and gotchas for working in this repository"`.
+2. **Context for a specific task**: a semantic search phrased from the task's title and area words, never the bare task id, then the graph's record of the task. The entity name is `Task <id>`, as in `orchestrator/src/orchestrator/agents/memory_recall.py::MemoryRecall._task_entity`:
+   ```
+   search(query="<task title> <area words>", project_id="dark_factory")
+   get_entity(name="Task 3127", project_id="dark_factory")
+   ```
+3. **Task tree**: `get_tasks(project_root="/home/leo/src/dark-factory")`
+4. **Recent activity**: `get_episodes(project_id="dark_factory", last_n=5)`. This is the recency read, because `search` has no recency predicate.
+
+Two queries are absent on purpose. There is no search for an overview of the project: memory holds no such entry, so read `CLAUDE.md`, `README.md` and `ARCHITECTURE.md` instead. There is no search for the latest decisions either: `search` cannot express recency, and that query measured 5/5 noise. The rationale lives in `shared/src/shared/briefing_queries.py::QUERY_SPECS`.
 
 Compile results into a structured document with sections for each area. Skip sections with no results.

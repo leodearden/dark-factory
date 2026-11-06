@@ -1,5 +1,6 @@
 """Tests for config schema Literal type validation."""
 
+import itertools
 import json
 import os
 import re
@@ -35,6 +36,7 @@ from fused_memory.config.schema import (
 from fused_memory.server.near_duplicate_guard import (
     _TOPIC_CLUSTER_DEFAULT_HINT,
     build_topic_cluster_block,
+    can_share_one_occurrence,
     find_matching_topic_cluster,
 )
 from fused_memory.services.durable_queue import DEFAULT_TRANSIENT_ERROR_NAMES
@@ -1733,17 +1735,43 @@ class TestCuratorEntryCharCaps:
             f'field (measured p50 1813 vs 0).'
         )
 
-    def test_the_total_cap_is_unreachable_at_stock_stream_caps(self):
-        """FINDING 1, as an executable invariant rather than a comment.
+    @pytest.mark.parametrize('value', [0, -1])
+    @pytest.mark.parametrize('field', ['entry_description_chars', 'entry_details_chars'])
+    def test_a_non_positive_entry_cap_is_refused_at_load(self, field, value):
+        """A cap of 0 or less would make every curator prompt build raise in utils/clip_disclosure.py::TruncationFact, so it is refused when the config loads."""
+        with pytest.raises(ValidationError, match=field):
+            CuratorConfig(**{field: value})
 
-        A maximal pool is anchor(<=1) + module + embedding + dependency. With
-        stock values that is 29 against a total cap of 30, so ``_trim_pool``
-        short-circuits on every call and the STREAM caps are the binding
-        constraints. This is pinned so a future cap edit that silently
-        re-strands or un-strands the final trim is caught here, at the config
-        layer, rather than being discovered as a permanently-silent
-        ``pool_truncated`` census.
-        """
+
+class TestCuratorPoolCaps:
+    """The stock pool caps and the relationships the task-5397 census derivation set.
+
+    The measured figures live once, in the pool-cap comment block of
+    ``config/schema.py::CuratorConfig``; these tests pin what follows from
+    them and point there rather than restating them.
+    """
+
+    EMBEDDING_FLOOR = 5
+    SIBLINGS_PER_PARENT_P90 = 3
+
+    def test_stock_pool_caps(self):
+        cfg = CuratorConfig()
+        caps = (
+            cfg.pool_module_cap,
+            cfg.pool_embedding_cap,
+            cfg.pool_dependency_cap,
+            cfg.pool_total_cap,
+        )
+        assert caps == (20, 10, 3, 29), (
+            f'module/embedding/dependency/total pool caps are {caps}; the '
+            f'derivation for 20/10/3/29 is the pool-cap block in '
+            f'config/schema.py::CuratorConfig. Move a value only with a new '
+            f'derivation there. pool_total_cap 29 is the pre-5397 reachable '
+            f'maximum: raising it spends prompt tokens and batch fan-in under '
+            f'batch_token_threshold, so restate that trade in the block first.'
+        )
+
+    def test_the_total_cap_binds_when_every_stream_is_full(self):
         cfg = CuratorConfig()
         maximal_pool = (
             1
@@ -1751,21 +1779,58 @@ class TestCuratorEntryCharCaps:
             + cfg.pool_embedding_cap
             + cfg.pool_dependency_cap
         )
-        assert maximal_pool <= cfg.pool_total_cap, (
+        assert maximal_pool > cfg.pool_total_cap, (
             f'A maximal pool is {maximal_pool} entries against pool_total_cap '
-            f'{cfg.pool_total_cap}. If this ever flips, _trim_pool becomes '
-            f'reachable and the total_cap arm of the PoolWithheld census stops '
-            f'being dead weight — update the schema comment recording the '
-            f'arithmetic, and re-read whether the stream caps are still the '
-            f'binding constraints.'
+            f'{cfg.pool_total_cap}. _trim_pool is the live budget control; if '
+            f'it becomes unreachable again, the total_cap arm of the '
+            f'PoolWithheld census goes permanently silent.'
         )
 
-    @pytest.mark.parametrize('value', [0, -1])
-    @pytest.mark.parametrize('field', ['entry_description_chars', 'entry_details_chars'])
-    def test_a_non_positive_entry_cap_is_refused_at_load(self, field, value):
-        """A cap of 0 or less would make every curator prompt build raise in utils/clip_disclosure.py::TruncationFact, so it is refused when the config loads."""
+    def test_a_full_module_stream_with_p90_siblings_keeps_the_embedding_floor(self):
+        """_trim_pool cuts siblings only after the module stream, so each sibling of a full pool costs one embedding slot."""
+        cfg = CuratorConfig()
+        siblings = self.SIBLINGS_PER_PARENT_P90
+        embedding_left = cfg.pool_total_cap - 1 - siblings - cfg.pool_module_cap
+        assert embedding_left >= self.EMBEDDING_FLOOR, (
+            f'A full module stream plus the anchor and {siblings} siblings (the '
+            f'per-parent p90 measured for pool_sibling_cap) leaves '
+            f'{embedding_left} embedding slots, below the floor of '
+            f'{self.EMBEDDING_FLOOR}. The embedding stream is the only '
+            f'relevance-ordered stream; see the pool-cap block in '
+            f'config/schema.py::CuratorConfig for why its head must survive.'
+        )
+
+    @pytest.mark.parametrize(
+        ('field', 'value'),
+        [
+            ('pool_module_cap', -1),
+            ('pool_embedding_cap', -1),
+            ('pool_dependency_cap', -1),
+            ('pool_total_cap', 0),
+        ],
+    )
+    def test_a_cap_below_its_floor_is_refused_at_load(self, field, value):
+        """A stream cap of 0 disables that stream; a total cap of 0 would cut the anchor _trim_pool always keeps."""
         with pytest.raises(ValidationError, match=field):
             CuratorConfig(**{field: value})
+
+
+class TestCuratorSiblingCap:
+    """The cap on an agent-followup candidate's same-parent sibling stream (task 6227)."""
+
+    def test_a_sibling_is_never_trimmed_at_stock_caps(self):
+        cfg = CuratorConfig()
+        assert 1 + cfg.pool_sibling_cap <= cfg.pool_total_cap, (
+            f'anchor(1) + pool_sibling_cap ({cfg.pool_sibling_cap}) exceeds '
+            f'pool_total_cap ({cfg.pool_total_cap}). _trim_pool cuts siblings '
+            f'only after every other stream except the anchor, so this '
+            f'inequality is what keeps a sibling from ever being cut.'
+        )
+
+    def test_a_negative_sibling_cap_is_refused_at_load(self):
+        """A cap of 0 is legal and disables the stream; a negative one is refused."""
+        with pytest.raises(ValidationError, match='pool_sibling_cap'):
+            CuratorConfig(pool_sibling_cap=-1)
 
 
 class TestCuratorConfigBudgetRaise:
@@ -2519,45 +2584,27 @@ class TestProceduralTopicGuardClustersDefault:
             assert cluster.phrases, f'{cluster.topic_id} has empty phrases'
             assert cluster.min_phrase_hits >= 1
 
-    def test_no_seeded_phrase_nests_inside_another_in_the_same_cluster(self):
+    def test_no_two_seeded_phrases_can_share_one_occurrence(self):
         """The invariant that keeps every cluster's ``min_phrase_hits`` meaningful.
 
         ``find_matching_topic_cluster`` counts DISTINCT phrases present as
-        plain substrings, so if one phrase nests inside another in the SAME
-        cluster, a SINGLE occurrence of the longer form scores two distinct
-        hits and satisfies ``min_phrase_hits=2`` on its own -- defeating that
-        field's stated purpose ("Default 2 so a single incidental keyword
-        never triggers a false block").
+        substrings, so two phrases that one occurrence can hold (one nesting
+        in the other, or 'ruff format' / 'format-clean' overlapping on a whole
+        word) score two hits from a single construction and defeat
+        ``min_phrase_hits=2``.
 
-        The hazard is generic to the matcher, not specific to any one seed:
-        the concrete temptations are 'ruff format --check' beside bare 'ruff
-        format' (ruff-format cluster, task 3435) and bare 'plan.json' beside
-        '.task/plan.json' (plan-revalidation cluster). So the guard is
-        asserted over EVERY seeded cluster rather than one, and holds for all
-        four today.
-
-        NOT sufficient on its own: the two RETIRED eval-worktree clusters
-        each carried 'eval-worktree' beside 'eval worktree' -- one concept,
-        two spelling-variant phrases, neither nesting inside the other --
-        which scored two distinct hits off a single mention and passed this
-        test cleanly. Sibling spelling variants are task 4179's matcher-level
-        fix, not this invariant's.
-
-        Compared by INDEX, not identity: two phrases that are accidentally
-        equal must fail here too (an exact duplicate is the degenerate
-        nesting case, and ``is not`` would silently skip it only when the
-        interpreter happens to intern both copies to one object).
+        Checked with ``can_share_one_occurrence``, the same definition
+        ``derive_topic_cluster`` enforces on machine-derived clusters.
+        Sibling spelling variants (the retired 'eval-worktree' /
+        'eval worktree' pair) are outside it: task 4179.
         """
         for cluster in ReconciliationConfig().procedural_knowledge_topic_guard_clusters:
-            phrases = [p.lower() for p in cluster.phrases]
-            for i, outer in enumerate(phrases):
-                for j, inner in enumerate(phrases):
-                    if i != j:
-                        assert inner not in outer, (
-                            f'{cluster.topic_id}: {inner!r} nests inside {outer!r} -- one '
-                            f'occurrence would score two distinct hits and defeat '
-                            f'min_phrase_hits'
-                        )
+            for first, second in itertools.combinations(cluster.phrases, 2):
+                assert not can_share_one_occurrence(first, second), (
+                    f'{cluster.topic_id}: {first!r} and {second!r} can share one '
+                    f'occurrence -- it would score two distinct hits and defeat '
+                    f'min_phrase_hits'
+                )
 
 
 class TestTopicClusterAutoseedEnabledLeaf:
@@ -3009,7 +3056,7 @@ class TestRuffFormatNotAnEnforcedGateCluster:
             'ruff check',
             'enforced gate',
             'enforced lint gate',
-            'format-clean',
+            'not format-clean',
         ]
         assert cluster.min_phrase_hits == 2
         assert '3342' in cluster.hint
@@ -3103,7 +3150,7 @@ class TestRuffFormatNotAnEnforcedGateCluster:
 
         Reviewer (test-proportionality): one case per distinct HIT-PROFILE,
         not one per corpus entry. 4ab1c78f is the 4-hit maximum and the sole
-        exerciser of 'format-clean'; d72c66dc carries 'enforced lint gate';
+        exerciser of 'not format-clean'; d72c66dc carries 'enforced lint gate';
         87a4982d sits exactly AT the threshold on the 'ruff format' +
         'ruff check' anchor pair alone, which is what makes 'ruff check'
         load-bearing for the half of the corpus that says nothing about
@@ -3134,6 +3181,10 @@ class TestRuffFormatNotAnEnforcedGateCluster:
                 'I ran ruff format on the file I created so my added lines are '
                 'clean.',
                 id='format-only-note-1-hit',
+            ),
+            pytest.param(
+                'This file is ruff format-clean after my edit.',
+                id='ruff-format-clean-one-construction-1-hit',
             ),
         ],
     )
@@ -4309,6 +4360,7 @@ class TestWriteJournalConfig:
         assert section.prune_max_rows_per_run == 500_000
         assert section.prune_max_seconds == 30.0
         assert section.prune_interval_seconds == 1800.0
+        assert section.referent_findings_retention_days == 365.0
 
     def test_search_rows_outlive_task_read_rows(self):
         section = FusedMemoryConfig().write_journal

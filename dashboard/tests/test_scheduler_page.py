@@ -23,7 +23,16 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from shared.scheduler_state import SchedulerStateSnapshot
 
+from dashboard.data.scheduler import clear_scheduler_state
 from dashboard.data.task_snapshot import SnapshotFailure, unmeasured_snapshot
+
+
+@pytest.fixture(autouse=True)
+def _forget_scheduler_state():
+    """Each test reads its own scheduler state rather than one an earlier test cached."""
+    clear_scheduler_state()
+    yield
+    clear_scheduler_state()
 
 
 def _tasks_read(active=(), *, offline=(), degraded=()):
@@ -601,28 +610,24 @@ async def test_degraded_project_parks_are_never_reported_stranded(
 
 
 # ---------------------------------------------------------------------------
-# task-2218 step-3: guard the first_success + whole-pair-retry + None-sentinel
-# contract that the upcoming _one_project -> first_success conversion must
-# preserve.
+# The first_success + None-sentinel contract, and the two retry axes: the
+# scheduler state fails over inside its own access datum (task 6584), the
+# two event reads fail over together on their own.
 # ---------------------------------------------------------------------------
 
 
-async def test_collect_scheduler_state_retries_whole_pair_on_second_url_when_events_fail(
+async def test_collect_scheduler_state_fails_over_only_the_events_when_events_fail(
     dummy_client, two_url_config
 ):
-    """A mid-run failure on url1 re-issues EVERY call on url2, not just events.
+    """A failed events read on url1 re-issues the two event reads on url2, not the state.
 
-    url1's get_scheduler_state succeeds but get_scheduler_events raises; the
-    whole (state, skip-events, recovery-events) group is then re-issued against
-    url2 rather than reusing url1's already-successful snapshot. Distinguishes
-    the two URLs' snapshots (skip_counts 99 vs 7) so a stray use of url1's
-    snapshot would be caught, and asserts get_scheduler_state is called again
-    on url2 (total 2 calls) rather than only retrying the events leg (which
-    would be 1 state call + N events calls).
+    url1's get_scheduler_state succeeds but get_scheduler_events raises. The
+    state is ``acquire_scheduler_state``'s datum, answered once by url1; only
+    the events legs move to url2. Distinguishes the two URLs' snapshots
+    (skip_counts 99 vs 7), so a row reading url2's snapshot would be caught.
 
-    The two event classes are fetched with independent row budgets, so a
-    successful project issues THREE calls, not two — the retry axis is still
-    the whole group.
+    The two event classes are fetched with independent row budgets, so url2
+    answers TWO events calls.
     """
     from unittest.mock import AsyncMock, patch
 
@@ -676,9 +681,8 @@ async def test_collect_scheduler_state_retries_whole_pair_on_second_url_when_eve
 
     assert project not in offline_projects
     assert len(rows) == 1
-    assert rows[0]['skip_count'] == 7, (
-        'row must reflect url2 snapshot (7) — a stray url1 value (99) means '
-        'the pair was not fully re-issued on url2'
+    assert rows[0]['skip_count'] == 99, (
+        "row must reflect url1's snapshot (99), the state datum's one answer"
     )
 
     composite_key = f'{project}/1'
@@ -687,13 +691,12 @@ async def test_collect_scheduler_state_retries_whole_pair_on_second_url_when_eve
 
     state_calls = [c for c in calls if c[1] == 'get_scheduler_state']
     events_calls = [c for c in calls if c[1] == 'get_scheduler_events']
-    assert len(state_calls) == 2, (
-        'get_scheduler_state must be re-issued on url2, not reused from url1'
+    assert state_calls == [(url1, 'get_scheduler_state')], (
+        'get_scheduler_state is answered once, by url1, inside its own access datum'
     )
     # url1: the skip-events call raises before the recovery one is reached.
     # url2: both event classes are fetched (independent row budgets).
-    assert len(events_calls) == 3
-    assert [c[0] for c in calls] == [url1, url1, url2, url2, url2]
+    assert [c[0] for c in events_calls] == [url1, url2, url2]
 
 
 async def test_collect_scheduler_state_all_urls_fail_marks_project_offline(
@@ -801,6 +804,7 @@ async def test_collect_scheduler_state_surfaces_paused_projects(
         snapshot_at='2026-05-15T00:00:00+00:00',
     )
 
+    clear_scheduler_state()
     mock_mcp_not_paused = AsyncMock(side_effect=[not_paused_snapshot, [], []])
     mock_active2 = AsyncMock(return_value=_tasks_read())
 
@@ -820,6 +824,7 @@ async def test_collect_scheduler_state_surfaces_paused_projects(
         snapshot_at='2026-05-15T00:00:00+00:00',
     )
 
+    clear_scheduler_state()
     mock_mcp_legacy = AsyncMock(side_effect=[legacy_snapshot, [], []])
     mock_active3 = AsyncMock(return_value=_tasks_read())
 

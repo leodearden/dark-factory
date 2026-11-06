@@ -148,6 +148,28 @@ class TestAddMemoryIntentBracketing:
         assert 'mem0 down' in (failed[0]['reason'] or '')
 
     @pytest.mark.asyncio
+    async def test_zero_id_return_marks_intent_failed(
+        self, recovery_service, recovery_journal
+    ):
+        """Under the pinned infer=False a zero-id return inserted nothing, so the
+        intent is 'failed' — replayable — rather than 'completed'."""
+        svc = recovery_service
+        svc.mem0.add = AsyncMock(return_value={'results': []})
+
+        result = await svc.add_memory(
+            content='always run black before commit',
+            category='preferences_and_norms',
+            project_id='proj-x',
+        )
+
+        assert await recovery_journal.get_incomplete_mem0_intents() == []
+        assert await recovery_journal.get_mem0_intents(status='completed') == []
+        failed = await recovery_journal.get_mem0_intents(status='failed')
+        assert len(failed) == 1
+        assert 'empty_result' in (failed[0]['reason'] or '')
+        assert SourceStore.mem0 not in result.stores_written
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         'meta',
         [

@@ -144,6 +144,7 @@ from fused_memory.backends.mem0_client import (
     DEFAULT_SCROLL_MAX_PAGES,
     ScrollPageBudgetExhausted,
 )
+from fused_memory.canonical_marker import is_canonical
 from fused_memory.reconciliation.consolidation_gate import GATE_METADATA_KEY
 from fused_memory.topic_slug import derive_topic_slug, is_valid_topic_slug
 from fused_memory.utils.store_mutation_preflight import assert_store_mutation_allowed
@@ -294,11 +295,10 @@ def load_census_module() -> Any:
     """Load ``census_memory_metadata`` by path.
 
     ``scripts/`` is not a package, so a plain import cannot reach it.  Same
-    importlib idiom — including the ``sys.modules``-first lookup — that
-    ``census_memory_metadata.py::_load_probe_module`` and
-    ``retro_stamp_topics.py::_load_probe_module`` already established for
-    exactly this cross-script reuse: that slot may already hold a module
-    another by-path loader executed, and re-executing would hand back
+    policy — the ``sys.modules``-first lookup, and the slot popped when exec
+    fails — that ``fused-memory/src/fused_memory/utils/script_loader.py::load_script``
+    states once for every cross-script reuse: that slot may already hold a
+    module another by-path loader executed, and re-executing would hand back
     DIFFERENT class objects, silently breaking identity across the seam.
 
     Memoized because the load is not free and because the identity above is
@@ -440,11 +440,7 @@ async def enumerate_topic_bearing(
                 topic = metadata.get('topic')
                 if isinstance(topic, str):
                     occupied_topics.add(topic)
-                    # ``is True``, not truthiness: metadata off a live store is
-                    # not schema-enforced here, and ``canonical: 'false'`` would
-                    # otherwise read as a canonical claim and escalate a mild
-                    # collision into the severe bucket.
-                    if metadata.get('canonical') is True:
+                    if is_canonical(metadata):
                         memory_id = record.get('id')
                         if isinstance(memory_id, str) and memory_id:
                             canonical_ids_by_topic.setdefault(topic, []).append(memory_id)
@@ -460,7 +456,7 @@ async def enumerate_topic_bearing(
                         'topic': topic,
                         **(
                             {'canonical': True}
-                            if metadata.get('canonical') is True else {}
+                            if is_canonical(metadata) else {}
                         ),
                     },
                 })
@@ -664,11 +660,7 @@ def plan_renames(
         if not isinstance(topic, str):
             continue
         observed_topics.add(topic)
-        # ``is True``, not truthiness: metadata comes off a live store and is
-        # not schema-enforced at this seam, so ``canonical: 'false'`` — a
-        # non-empty string — would otherwise read as a canonical claim and
-        # escalate a mild refusal into the severe bucket.
-        if metadata.get('canonical') is True:
+        if is_canonical(metadata):
             memory_id = record.get('id')
             if isinstance(memory_id, str) and memory_id and memory_id not in (
                 canonical_ids_by_topic.get(topic) or ()

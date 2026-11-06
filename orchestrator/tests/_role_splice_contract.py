@@ -11,7 +11,9 @@ than restating it, so there is one place to correct.
 
 It also holds the shared Bash-capable carrier set and predicate
 (``BASH_CAPABLE_UNPINNED_ROLES``, ``bash_capable_unpinned``) that every block
-spliced through harness_guidance.py::BASH_CAPABLE_ROLE_PREAMBLE derives from, and the
+spliced through harness_guidance.py::BASH_CAPABLE_ROLE_PREAMBLE derives from, the
+derived literal-prompt sets (``UNPINNED_ROLES``, ``READ_ONLY_UNPINNED_ROLES``) for
+blocks spliced into every literal-prompt role, and the
 preamble-tail contract (``PreambleTailBlock`` + ``PreambleTailContractTests``),
 which a new tail block adopts with one subclass instead of cloning its tests.
 
@@ -91,6 +93,13 @@ BASH_CAPABLE_UNPINNED_ROLES = frozenset({
 def bash_capable_unpinned(role: AgentRole) -> bool:
     """The capability BASH_CAPABLE_UNPINNED_ROLES derives from; `Bash(git:*)` does not qualify."""
     return role.prompt_spec is None and 'Bash' in role.allowed_tools
+
+
+#: Every role whose system_prompt is literal text a splice reliably reaches (not PromptSpec-backed), derived from ROLES.
+UNPINNED_ROLES = frozenset(name for name, role in ROLES.items() if role.prompt_spec is None)
+
+#: Literal-prompt roles outside BASH_CAPABLE_UNPINNED_ROLES (`judge` today), which build their own chain around the read-only Grep variant. May legitimately be empty.
+READ_ONLY_UNPINNED_ROLES = UNPINNED_ROLES - BASH_CAPABLE_UNPINNED_ROLES
 
 
 def assert_nonempty(name: str, value: str, *, remedy: str) -> None:

@@ -386,10 +386,155 @@ for (const bucketMinutes of [60, null]) {
     const titles = [...container.querySelectorAll('.panel-head > .title')]
       .map(title => title.textContent)
       .filter(text => text.startsWith('Merge attempts'));
-    const caption = harness.window.DF_MERGE_QUEUE.depthBucketCaption(block.depth);
+    const caption = harness.window.DF_MERGE_QUEUE.depthBucketCaption(block.depth.value);
     assert.deepEqual(titles, [`Merge attempts · ${caption}`]);
   });
 }
+
+// ── An unread runs.db (merge_queue.js::attemptsOver, worstP95Over, projectAttempts) ──
+// A project whose runs.db could not be read renders every runs.db reading as
+// unknown: no measured-looking 0, and no chart drawn over nothing.
+
+function mountMergeTab(t, block) {
+  const harness = openWindow(t);
+  seedDashboardData(harness.window, {
+    MERGE_QUEUE: { [PROJECT]: block },
+    __receipt: receiptsFor(harness.window.DF_DATA_LOADER, ['MERGE_QUEUE']),
+  });
+  const { container } = harness.mount(harness.window.DF_TABS.MergeTab, { projectFilter: [] });
+  return { harness, container };
+}
+
+function panelTitled(container, prefix) {
+  const titles = [...container.querySelectorAll('.panel-head > .title')].filter(title => title.textContent.startsWith(prefix));
+  assert.equal(titles.length, 1, `expected exactly one panel titled "${prefix}…"`);
+  return titles[0].closest('.panel');
+}
+
+test('tabs.jsx::MergeTab renders an unread runs.db as unknown, never as measured zeros', t => {
+  const { harness, container } = mountMergeTab(t, mergeQueueBlock({ bucketMinutes: 60, unread: true }));
+  const DF = harness.window.DF_DATA;
+  const { attemptsOver, worstP95Over, projectAttempts } = harness.window.DF_MERGE_QUEUE;
+  const { datumView, EM_DASH } = harness.window.DF_DATUM;
+
+  const merges = datumView(attemptsOver(DF, null)).text;
+  assert.equal(merges, EM_DASH);
+  assert.equal(statTile(container, 'Merges (window)').querySelector('.val').textContent, merges);
+  const worst = datumView(worstP95Over(DF, null)).text;
+  assert.equal(worst, EM_DASH);
+  assert.equal(statTile(container, 'p95 latency · worst project').querySelector('.val').textContent, worst);
+
+  const pips = [...container.querySelectorAll('.pip')].map(pip => pip.textContent);
+  assert.ok(pips.includes(`${datumView(projectAttempts(DF, PROJECT)).text} attempts`), JSON.stringify(pips));
+  assert.ok(!pips.some(text => text.startsWith('0 attempts')), `an unread project reads a measured 0: ${JSON.stringify(pips)}`);
+  for (const prefix of ['Outcomes', 'Merge attempts']) {
+    assert.equal(panelTitled(container, prefix).querySelector('svg'), null, `${prefix} draws a chart over an unread window`);
+  }
+});
+
+test('tabs.jsx::MergeTab counts a measured window\'s attempts with attemptCount', t => {
+  const block = mergeQueueBlock({ bucketMinutes: 60, outcomes: { done: 3, conflict: 2 } });
+  const { harness, container } = mountMergeTab(t, block);
+
+  const count = harness.window.DF_MERGE_QUEUE.attemptCount(block.attempts.value);
+  assert.equal(count, 5);
+  assert.equal(statTile(container, 'Merges (window)').querySelector('.val').textContent, String(count));
+  for (const prefix of ['Outcomes', 'Merge attempts']) {
+    assert.notEqual(panelTitled(container, prefix).querySelector('svg'), null, `${prefix} draws no chart over a measured window`);
+  }
+});
+
+function withDepthValues(block, values) {
+  return { ...block, depth: { ...block.depth, value: { ...block.depth.value, values } } };
+}
+
+function panelMeta(container, prefix) {
+  return panelTitled(container, prefix).querySelector('.panel-head > .meta').textContent;
+}
+
+// The depth series' first bucket is counted whole (test_merge_queue_data.py::test_first_bucket_includes_events_before_cutoff), so its sum is not the window's attempt count; attemptCount is the only one.
+for (const values of [[1], [2, 0, 3]]) {
+  test(`tabs.jsx::MergeTab reads the depth panel as the series' per-bucket peak over ${JSON.stringify(values)}`, t => {
+    const block = withDepthValues(mergeQueueBlock({ bucketMinutes: 60, buckets: values.length }), values);
+    const { container } = mountMergeTab(t, block);
+
+    const meta = panelMeta(container, 'Merge attempts');
+    assert.ok(meta.startsWith(`peak ${Math.max(0, ...values)}/bucket`), meta);
+  });
+}
+
+test('tabs.jsx::MergeTab gives a window one attempt count, whatever the depth series sums to', t => {
+  const block = withDepthValues(mergeQueueBlock({ bucketMinutes: 60, buckets: 3, outcomes: { done: 1 } }), [1, 0, 1]);
+  const { harness, container } = mountMergeTab(t, block);
+  const count = harness.window.DF_MERGE_QUEUE.attemptCount(block.attempts.value);
+
+  const pips = [...container.querySelectorAll('.pip')].map(pip => pip.textContent);
+  assert.ok(pips.includes(`${count} attempts`), JSON.stringify(pips));
+  const outcomes = panelMeta(container, 'Outcomes');
+  assert.ok(outcomes.startsWith(`${count} merges`), outcomes);
+  assert.equal(statTile(container, 'Merges (window)').querySelector('.val').textContent, String(count));
+  const depth = panelMeta(container, 'Merge attempts');
+  assert.doesNotMatch(depth, /\battempts\b/);
+  assert.doesNotMatch(depth, /\bmerges\b/);
+});
+
+// ── The Completion-paths legend (charts.jsx::PALETTE.paths) ──
+// Every slice performance.py::get_completion_paths serves draws in a colour of
+// its own, so no slice reads as another or as nothing.
+
+const COMPLETION_PATHS = ['one-pass', 'multi-pass', 'via-steward', 'via-interactive', 'requeued', 'blocked'];
+
+// performance.py::PerformanceCards.to_wire, one attempt down each path.
+const PERF_CARDS = {
+  paths: COMPLETION_PATHS.map(path => ({ path, count: 1, pct: 16.7 })),
+  escalation: {
+    steward_rate: 0, interactive_rate: 0, interactive_count: 0,
+    human_attention: { zero: 0, minimal: 0, significant: 0 },
+  },
+  hist_outer: { labels: ['0', '1', '2', '3+'], values: [6, 0, 0, 0] },
+  hist_inner: { labels: ['0', '1', '2', '3+'], values: [6, 0, 0, 0] },
+  ttc: { p50: 1000, p75: 1000, p90: 1000, p95: 1000, count: 2 },
+};
+
+function seedPerformance(window) {
+  seedDashboardData(window, {
+    PROJECTS: [projectRow(PROJECT)],
+    PERFORMANCE: {
+      [PROJECT]: {
+        cards: wireDatum(PERF_CARDS),
+        time_centiles_history: { labels: [], p50: [], p95: [] },
+        one_pass_history: { labels: [], values: [] },
+        escalation_history: { labels: [], values: [] },
+      },
+    },
+    PERFORMANCE_LISTING: wireDatum(1),
+    __receipt: receiptsFor(window.DF_DATA_LOADER, ['PERFORMANCE', 'PERFORMANCE_LISTING', 'PROJECTS']),
+  });
+}
+
+// The 8px swatch beside the legend label that reads *path*.
+function legendSwatch(panel, path) {
+  const labels = [...panel.querySelectorAll('span')].filter(
+    span => span.textContent === path && span.previousElementSibling?.style.width === '8px',
+  );
+  assert.equal(labels.length, 1, `expected exactly one Completion-paths legend row for "${path}"`);
+  return labels[0].previousElementSibling;
+}
+
+test('tabs.jsx::PerfTab Completion paths gives every slice its own PALETTE.paths swatch', t => {
+  const harness = openWindow(t);
+  seedPerformance(harness.window);
+  const { container } = harness.mount(harness.window.DF_TABS.PerfTab, { projectFilter: [] });
+  const panel = panelTitled(container, 'Completion paths');
+
+  const swatches = COMPLETION_PATHS.map(path => {
+    const swatch = legendSwatch(panel, path).style.background;
+    assert.notEqual(swatch, '', `the "${path}" slice has no swatch colour`);
+    assert.equal(swatch, styledColor(harness.window, harness.window.DF_CHARTS.PALETTE.paths[path]), path);
+    return swatch;
+  });
+  assert.equal(new Set(swatches).size, COMPLETION_PATHS.length, `two slices share a colour: ${JSON.stringify(swatches)}`);
+});
 
 // ── Decision 6: a render throw is contained, and its notice is render_failure.js's ──
 // React's development build reports every throw a boundary catches on
@@ -773,3 +918,251 @@ test('tab_escalations.jsx::EscalationSidebar renders no check-owner section with
 
   assert.equal(nullDialog.innerHTML, absentDialog.innerHTML);
 });
+
+// ── Decision 8: the Tasks tab's preferences go through persisted_state.js ──
+// A key exists only while its value differs from its default, and a write the
+// browser refuses is reported on console.warn rather than swallowed.
+
+const TASKS_PREFERENCE_KEYS = ['df.tasksOpen', 'df.tasksGroupByPrd', 'df.tasks.views'];
+
+function storedKeys(window) {
+  const { localStorage } = window;
+  return Array.from({ length: localStorage.length }, (_, i) => localStorage.key(i));
+}
+
+function viewButton(window, container, key) {
+  const { label } = window.DF_TASK_SNAPSHOT.CENSUS_VIEWS.find(view => view.key === key);
+  const buttons = [...container.querySelectorAll('.seg button')].filter(button => button.textContent === label);
+  assert.equal(buttons.length, 1, `expected one '${label}' view button`);
+  return buttons[0];
+}
+
+function mountTasks(harness) {
+  const task = inProgressTask(false);
+  seedOneTask(harness.window, task);
+  const handle = harness.mount(harness.window.DF_TASKS.TasksTab, TAB_PROPS);
+  assert.ok(graphNode(handle.container, task), 'the seeded task never reached the graph');
+  return handle;
+}
+
+function projectHead(container) {
+  const heads = [...container.querySelectorAll('.proj-head')].filter(head => head.querySelector('.name')?.textContent === PROJECT);
+  assert.equal(heads.length, 1, `expected one header for project ${PROJECT}`);
+  return heads[0];
+}
+
+// Fills storage until jsdom's own quota refuses a single character more, and
+// returns the error that refusal threw.
+function fillStorageToQuota(storage) {
+  let refusal = null;
+  let written = 0;
+  for (let size = 1 << 20; size >= 1; size >>= 1) {
+    const chunk = 'x'.repeat(size);
+    for (;;) {
+      try {
+        storage.setItem(`fill.${written}`, chunk);
+        written += 1;
+      } catch (error) {
+        refusal = error;
+        break;
+      }
+    }
+  }
+  return refusal;
+}
+
+test('tab_tasks.jsx::TasksTab stores none of its preferences while each is at its default', t => {
+  const harness = openWindow(t);
+  mountTasks(harness);
+
+  const stored = storedKeys(harness.window);
+  assert.deepEqual(TASKS_PREFERENCE_KEYS.filter(key => stored.includes(key)), []);
+});
+
+test('tab_tasks.jsx::TasksTab reports a preference it cannot store on console.warn, and the view still flips', t => {
+  const harness = openWindow(t);
+  const { window } = harness;
+  const refusal = fillStorageToQuota(window.localStorage);
+  assert.equal(refusal?.name, 'QuotaExceededError', 'the fill did not reach the storage quota');
+  const warnings = [];
+  window.console.warn = (...args) => warnings.push(args);
+
+  const { container } = mountTasks(harness);
+  click(window, viewButton(window, container, 'terminal'));
+
+  assert.ok(viewButton(window, container, 'terminal').classList.contains('on'), 'the terminal view did not flip on');
+  assert.ok(
+    warnings.some(([message, error]) => String(message).includes('df.tasks.views') && error?.name === 'QuotaExceededError'),
+    `no console.warn named 'df.tasks.views' with its QuotaExceededError: ${JSON.stringify(warnings.map(([message]) => String(message)))}`,
+  );
+});
+
+test('tab_tasks.jsx::TasksTab stores a flipped view, seeds the next mount with it, and removes the key when flipped back', t => {
+  const harness = openWindow(t);
+  const { window } = harness;
+  const first = mountTasks(harness);
+  click(window, viewButton(window, first.container, 'terminal'));
+  assert.equal(JSON.parse(window.localStorage.getItem('df.tasks.views'))?.terminal, true, 'the flipped view was not stored');
+  first.unmount();
+
+  const { container } = mountTasks(harness);
+  assert.ok(viewButton(window, container, 'terminal').classList.contains('on'), 'the stored view did not seed the next mount');
+  click(window, viewButton(window, container, 'terminal'));
+  assert.ok(!storedKeys(window).includes('df.tasks.views'), 'the view is back at its default, yet its key is still stored');
+});
+
+test('tab_tasks.jsx::TasksTab folds a project on its first header click, and the fold seeds the next mount', t => {
+  const harness = openWindow(t);
+  const { window } = harness;
+  const first = mountTasks(harness);
+  assert.equal(projectHead(first.container).dataset.open, 'true', 'a project with no stored flag did not start open');
+  click(window, projectHead(first.container));
+  assert.equal(projectHead(first.container).dataset.open, 'false', 'one header click did not fold the project');
+  assert.ok(storedKeys(window).includes('df.tasksOpen'), 'the fold was not stored');
+  first.unmount();
+
+  // A folded project renders no graph, so this mount cannot go through mountTasks.
+  const { container } = harness.mount(window.DF_TASKS.TasksTab, TAB_PROPS);
+  assert.equal(projectHead(container).dataset.open, 'false', 'the stored fold did not seed the next mount');
+  click(window, projectHead(container));
+  assert.equal(projectHead(container).dataset.open, 'true', 'one header click did not unfold the project');
+  assert.ok(!storedKeys(window).includes('df.tasksOpen'), 'the project is back at its default-open, yet its key is still stored');
+});
+
+function groupingButton(container, label) {
+  const buttons = [...projectHead(container).querySelectorAll('.seg button')].filter(button => button.textContent === label);
+  assert.equal(buttons.length, 1, `expected one '${label}' grouping button`);
+  return buttons[0];
+}
+
+test('tab_tasks.jsx::TasksTab stores a project grouped by PRD, and removes the key when it is listed flat again', t => {
+  const harness = openWindow(t);
+  const { window } = harness;
+  const { container } = mountTasks(harness);
+  click(window, groupingButton(container, 'by PRD'));
+  assert.equal(JSON.parse(window.localStorage.getItem('df.tasksGroupByPrd'))?.[PROJECT], 'prd', 'the by-PRD grouping was not stored');
+
+  click(window, groupingButton(container, 'list'));
+  assert.ok(groupingButton(container, 'list').classList.contains('on'), 'the project did not return to the flat list');
+  assert.ok(!storedKeys(window).includes('df.tasksGroupByPrd'), 'the grouping is back at its default, yet its key is still stored');
+});
+
+// ── Decision 9: a count axis's maximum (spark_path.js::axisMax) ──
+// A chart marked `countAxis` labels its gridlines and draws its data against
+// axisMax's snapped maximum; any other chart keeps its exact data maximum, and
+// formatY only presents the ticks it is handed.
+
+const DATA_MAX = 7;
+
+const COUNT_AXIS_CHARTS = [
+  {
+    name: 'LineChart',
+    props: { series: [{ values: [0, DATA_MAX] }], labels: ['a', 'b'] },
+  },
+  {
+    name: 'StackedAreaChart',
+    props: { stacks: [{ key: 'a', color: 'red', values: [3, DATA_MAX] }], labels: ['a', 'b'] },
+  },
+];
+
+function yTickLabels(container) {
+  return [...container.querySelectorAll('svg text[text-anchor="end"]')].map(text => text.textContent);
+}
+
+function gridlineYs(container) {
+  return [...container.querySelectorAll('svg line')].map(line => Number(line.getAttribute('y1')));
+}
+
+function peakY(container) {
+  const ys = [...container.querySelectorAll('svg path')].flatMap(path =>
+    [...path.getAttribute('d').matchAll(/[ML]\s*[-\d.e]+,([-\d.e]+)/g)].map(match => Number(match[1])),
+  );
+  return Math.min(...ys);
+}
+
+function renderAxis(harness, chart, props) {
+  const { container } = harness.mount(harness.window.DF_CHARTS[chart.name], { ...chart.props, ...props });
+  const labels = yTickLabels(container);
+  const gridYs = gridlineYs(container);
+  return {
+    labels,
+    ticks: labels.length - 1,
+    floor: Math.max(...gridYs),
+    top: Math.min(...gridYs),
+    peak: peakY(container),
+  };
+}
+
+function tickValues(max, ticks) {
+  return Array.from({ length: ticks + 1 }, (_, i) => (max * i) / ticks);
+}
+
+for (const chart of COUNT_AXIS_CHARTS) {
+  test(`charts.jsx::${chart.name} with countAxis labels its gridlines to axisMax's snapped maximum`, t => {
+    const harness = openWindow(t);
+    const axis = renderAxis(harness, chart, { countAxis: true });
+    const max = harness.window.DF_SPARK_PATH.axisMax(DATA_MAX, axis.ticks, true);
+    assert.notEqual(max, DATA_MAX, 'the fixture does not make the snap visible');
+    assert.deepEqual(axis.labels, tickValues(max, axis.ticks).map(String));
+  });
+
+  test(`charts.jsx::${chart.name} with countAxis draws its data on the same snapped scale as its gridlines`, t => {
+    const harness = openWindow(t);
+    const axis = renderAxis(harness, chart, { countAxis: true });
+    const max = harness.window.DF_SPARK_PATH.axisMax(DATA_MAX, axis.ticks, true);
+    assert.equal((axis.floor - axis.peak) / (axis.floor - axis.top), DATA_MAX / max);
+  });
+
+  test(`charts.jsx::${chart.name} without countAxis keeps its exact data maximum`, t => {
+    const harness = openWindow(t);
+    const axis = renderAxis(harness, chart, { formatY: v => String(v) });
+    const max = harness.window.DF_SPARK_PATH.axisMax(DATA_MAX, axis.ticks, false);
+    assert.deepEqual(axis.labels, tickValues(max, axis.ticks).map(String));
+    assert.equal(axis.peak, axis.top, 'the data maximum does not reach the top gridline');
+  });
+
+  test(`charts.jsx::${chart.name} hands a caller's formatY the snapped ticks on a count axis`, t => {
+    const harness = openWindow(t);
+    const axis = renderAxis(harness, chart, { countAxis: true, formatY: v => `${v} ops` });
+    const max = harness.window.DF_SPARK_PATH.axisMax(DATA_MAX, axis.ticks, true);
+    assert.deepEqual(axis.labels, tickValues(max, axis.ticks).map(v => `${v} ops`));
+  });
+}
+
+// ── Decision 10: the Tasks tab's banner notices (tasks_offline_banner.js::tasksBannerNoticesFor) ──
+// Every notice kind the helper returns renders under its own test id. Each
+// case seeds the one /tasks fact that yields that kind and nothing else, so a
+// kind with no bannerTestIds entry renders with no test id and fails here.
+
+const OTHER_PROJECT = 'q';
+const BANNER_CASES = [
+  { kind: 'global', testId: 'tasks-offline-banner',
+    data: { TASKS_OFFLINE: true, TASKS_OFFLINE_PROJECTS: [PROJECT], TASKS_PROJECT_COUNT: 1 } },
+  { kind: 'partial', testId: 'tasks-partial-banner',
+    data: { TASKS_OFFLINE_PROJECTS: [OTHER_PROJECT], TASKS_PROJECT_COUNT: 2 } },
+  { kind: 'degraded', testId: 'tasks-degraded-banner',
+    data: { TASKS_DEGRADED_PROJECTS: [OTHER_PROJECT], TASKS_PROJECT_COUNT: 2 } },
+  { kind: 'count-unknown', testId: 'tasks-count-unknown-banner',
+    data: { TASKS_COUNT_UNKNOWN_PROJECTS: [PROJECT], TASKS_PROJECT_COUNT: 1 } },
+  { kind: 'count-stale', testId: 'tasks-count-stale-banner',
+    data: { TASKS_COUNT_STALE_PROJECTS: [PROJECT], TASKS_PROJECT_COUNT: 1 } },
+];
+
+for (const { kind, testId, data } of BANNER_CASES) {
+  test(`tab_tasks.jsx::TasksTab renders the ${kind} notice tasksBannerNoticesFor describes under ${testId}`, t => {
+    const harness = openWindow(t);
+    const { window } = harness;
+    seedOneTask(window, inProgressTask(false));
+    seedDashboardData(window, { ...data, __receipt: receiptsFor(window.DF_DATA_LOADER, Object.keys(data)) });
+    const { container } = harness.mount(window.DF_TASKS.TasksTab, TAB_PROPS);
+
+    const notices = window.DF_TASKS_OFFLINE_BANNER.tasksBannerNoticesFor(window.DF_DATA);
+    assert.deepEqual(Array.from(notices, n => n.kind), [kind]);
+    const rendered = [...container.querySelectorAll(`[data-testid="${testId}"]`)];
+    assert.equal(rendered.length, 1, `the ${kind} notice must render exactly once under ${testId}`);
+    assert.equal(rendered[0].textContent, notices[0].text);
+    for (const other of BANNER_CASES.filter(c => c.kind !== kind)) {
+      assert.deepEqual([...container.querySelectorAll(`[data-testid="${other.testId}"]`)], [], other.testId);
+    }
+  });
+}

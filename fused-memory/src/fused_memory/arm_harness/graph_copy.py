@@ -7,6 +7,7 @@ every arm, the 1536-dimension incumbent included.
 """
 
 import asyncio
+import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -15,10 +16,13 @@ from typing import Any, Protocol
 from redis.exceptions import ResponseError
 
 from fused_memory.arm_harness.arm_embedder import DocumentEmbedder, DocumentEmbeddings
+from fused_memory.arm_harness.fork_slot import ForkHolder, ServerInfo, read_fork_holders
 from fused_memory.arm_harness.frozen_model import FrozenModel
 from fused_memory.arm_harness.normalization import NormStats, norm_stats
 from fused_memory.arm_harness.scratch_guard import GuardCheckpoint, require_scratch_name
 from fused_memory.arm_harness.sleep_seam import Sleep
+
+logger = logging.getLogger(__name__)
 
 ADOPT_NODE_GROUP_CYPHER = 'MATCH (n) SET n.group_id = $group_id RETURN count(n)'
 ADOPT_EDGE_GROUP_CYPHER = 'MATCH ()-[r]->() SET r.group_id = $group_id RETURN count(r)'
@@ -49,8 +53,14 @@ COPY_FORK_REFUSAL = 'GRAPH.COPY failed, could not fork'
 """How FalkorDB's reply begins while another child process (e.g. a BGSAVE) holds the fork; graph module 4.18.0."""
 
 COPY_ATTEMPTS = 60
-COPY_RETRY_INTERVAL_S = 2.0
-"""Sixty attempts, fifty-nine sleeps: at most 118s waiting, against BGSAVEs measured at 13-42s."""
+FORK_POLL_INTERVAL_S = 2.0
+"""After a refused copy: one interval, then INFO persistence every interval while a child holds the fork.
+
+So COPY_ATTEMPTS bounds refusals, not seconds: however long a BGSAVE runs, it costs
+one refused copy, and the copy is reissued once the child has exited.
+"""
+FORK_WAIT_REPORT_EVERY_POLLS = 30
+"""A wait on a held fork is logged when its holders change, and again every this many polls."""
 
 
 class ScratchGraph(Protocol):
@@ -68,6 +78,9 @@ class CopyableGraph(Protocol):
 class GraphCopyClient(Protocol):
     """The slice of falkordb's async FalkorDB client a reference copy uses."""
 
+    @property
+    def connection(self) -> ServerInfo: ...
+
     async def list_graphs(self) -> list[str]: ...
 
     def select_graph(self, graph_id: str, /) -> CopyableGraph: ...
@@ -77,17 +90,30 @@ class GraphCopyRefused(RuntimeError):
     """FalkorDB refused every GRAPH.COPY attempt because it could not fork; no copy exists."""
 
     def __init__(
-        self, reference: str, target: str, attempts: int, waited_s: float, reply: str
+        self,
+        reference: str,
+        target: str,
+        attempts: int,
+        waited_s: float,
+        holders: frozenset[ForkHolder],
+        reply: str,
     ) -> None:
         self.reference = reference
         self.target = target
         self.attempts = attempts
         self.waited_s = waited_s
+        self.holders = holders
         self.reply = reply
         super().__init__(
             f'GRAPH.COPY {reference!r} -> {target!r} was refused {attempts} times over '
-            f'{waited_s:.0f}s: {reply}; the server could not fork, so no copy was made'
+            f'{waited_s:.0f}s: {reply}; {_fork_account(holders)}, so no copy was made'
         )
+
+
+def _fork_account(holders: frozenset[ForkHolder]) -> str:
+    if holders:
+        return f'it waited out {", ".join(sorted(holders))} and the server still could not fork'
+    return 'no child held the fork, so the server itself could not fork'
 
 
 class ReembedCensusError(RuntimeError):
@@ -154,20 +180,33 @@ async def copy_reference_graph(
             f'copy target {target!r} already exists; tear it down first, because a stale '
             'copy is never reused'
         )
-    await _copy_through_fork_refusals(client.select_graph(reference), reference, target, sleep)
+    await _copy_through_fork_refusals(
+        client.select_graph(reference), client.connection, reference, target, sleep
+    )
+
+
+@dataclass(frozen=True)
+class _ForkWait:
+    slept_s: float
+    holders: frozenset[ForkHolder]
 
 
 async def _copy_through_fork_refusals(
     graph: CopyableGraph,
+    server: ServerInfo,
     reference: str,
     target: str,
     sleep: Sleep,
 ) -> None:
     """A refused copy leaves no target behind (measured), so the same copy is simply reissued."""
     refusal: ResponseError | None = None
+    waited_s = 0.0
+    holders: frozenset[ForkHolder] = frozenset()
     for attempt in range(COPY_ATTEMPTS):
         if attempt:
-            await sleep(COPY_RETRY_INTERVAL_S)
+            wait = await _wait_for_free_fork(server, sleep, reference, target)
+            waited_s += wait.slept_s
+            holders |= wait.holders
         try:
             await graph.copy(target)
             return
@@ -176,12 +215,32 @@ async def _copy_through_fork_refusals(
                 raise
             refusal = error
     raise GraphCopyRefused(
-        reference,
-        target,
-        COPY_ATTEMPTS,
-        (COPY_ATTEMPTS - 1) * COPY_RETRY_INTERVAL_S,
-        str(refusal),
+        reference, target, COPY_ATTEMPTS, waited_s, holders, str(refusal)
     ) from refusal
+
+
+async def _wait_for_free_fork(
+    server: ServerInfo, sleep: Sleep, reference: str, target: str
+) -> _ForkWait:
+    seen: frozenset[ForkHolder] = frozenset()
+    previous: frozenset[ForkHolder] = frozenset()
+    polls = 0
+    while True:
+        await sleep(FORK_POLL_INTERVAL_S)
+        polls += 1
+        holding = await read_fork_holders(server)
+        if not holding:
+            return _ForkWait(polls * FORK_POLL_INTERVAL_S, seen)
+        if holding != previous or polls % FORK_WAIT_REPORT_EVERY_POLLS == 0:
+            logger.info(
+                'GRAPH.COPY %r -> %r has waited %.0fs since its refusal; %s holds the fork',
+                reference,
+                target,
+                polls * FORK_POLL_INTERVAL_S,
+                ', '.join(sorted(holding)),
+            )
+        previous = holding
+        seen |= holding
 
 
 def _is_fork_refusal(error: ResponseError) -> bool:

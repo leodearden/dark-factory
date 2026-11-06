@@ -11,8 +11,9 @@ contract intact across the cutover.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, ClassVar
 
+from shared.declared_scope import DECLARED_SCOPE_METADATA_KEY, StampViolation
 from shared.task_deferral import DeferralRefusalCode
 
 TASKMASTER_TOOL_ERROR: str = 'TASKMASTER_TOOL_ERROR'
@@ -310,6 +311,45 @@ class DeferralWriteAuthorityError(TaskmasterError):
         }
 
 
+_DECLARED_SCOPE_WRITE_AUTHORITY_HINT = (
+    'metadata.declared_scope is machine-stamped once, at filing, by submit_task; '
+    'submit_task and update_task may not add, alter or remove it. An unchanged echo of '
+    "the stored record is accepted, so a metadata_mode='replace' payload must carry it "
+    'through verbatim. See docs/task-authoring.md §8.'
+)
+
+
+class DeclaredScopeWriteAuthorityError(TaskmasterError):
+    """Raised when a caller would add, alter or remove ``metadata.declared_scope``.
+
+    PRD plans/follow-up-filing-shape-prd.md §3 decision 7. ``reason`` names the arm the write
+    tripped and ``stored`` is the stamp on the row, None when it has none. Call
+    :meth:`to_error_dict` for the wire shape; callers branch on ``error == ERROR``.
+    """
+
+    ERROR: ClassVar[str] = 'declared_scope_write_authority'
+
+    def __init__(self, task_id: str | None, reason: StampViolation, stored: Any = None) -> None:
+        self.task_id = task_id
+        self.reason = reason
+        self.stored = stored
+        super().__init__(
+            'TASKMASTER_TOOL_ERROR', f'{reason.value}: {_DECLARED_SCOPE_WRITE_AUTHORITY_HINT}',
+        )
+
+    def to_error_dict(self) -> dict[str, Any]:
+        return {
+            'success': False,
+            'error': self.ERROR,
+            'error_type': type(self).__name__,
+            'task_id': self.task_id,
+            'path': f'metadata.{DECLARED_SCOPE_METADATA_KEY}',
+            'reason': self.reason.value,
+            'stored': self.stored,
+            'hint': _DECLARED_SCOPE_WRITE_AUTHORITY_HINT,
+        }
+
+
 _METADATA_NOT_AN_OBJECT_HINT = (
     'update_task metadata must be a JSON object: a dict, or a JSON string '
     'that encodes one. Nothing was written. Under merge/additive, send an '
@@ -366,6 +406,33 @@ class MetadataNotAnObjectError(TaskmasterError):
 
     def to_error_dict(self) -> dict[str, Any]:
         return metadata_not_an_object_error(self.task_id, self.received)
+
+
+class MetadataTooDeepError(TaskmasterError):
+    """Raised when an additive metadata merge is nested too deeply to recurse.
+
+    The write is refused and nothing is written: the stored metadata,
+    ``done_provenance`` included, is left unchanged. Keeps the
+    ``TASKMASTER_TOOL_ERROR`` code. Like :class:`AppendUnsupportedFieldError`
+    it has no ``to_error_dict()`` and reaches callers raw through
+    ``server/tool_errors.py::mcp_tool_errors``.
+
+    Attributes:
+        task_id: The task the rejected write targeted (``None`` if not supplied).
+    """
+
+    def __init__(self, task_id: str | None) -> None:
+        self.task_id = task_id
+        super().__init__(
+            'TASKMASTER_TOOL_ERROR',
+            f'Refusing an additive metadata merge for task {task_id!r}: the '
+            'payload and the stored metadata share a key path nested too deeply '
+            'to merge recursively (beyond the interpreter recursion limit). '
+            'Nothing was written; the stored metadata, done_provenance included, '
+            'is unchanged. Flatten the payload, or pass metadata_mode=\'merge\' '
+            '(without append=True) to overwrite each supplied top-level key '
+            'wholesale.',
+        )
 
 
 class AppendUnsupportedFieldError(TaskmasterError):
@@ -433,7 +500,9 @@ __all__ = [
     'DoneProvenanceWriteAuthorityError',
     'DefectRecordsWriteAuthorityError',
     'DeferralWriteAuthorityError',
+    'DeclaredScopeWriteAuthorityError',
     'MetadataNotAnObjectError',
+    'MetadataTooDeepError',
     'AppendUnsupportedFieldError',
     'status_via_update_task_error',
     'done_provenance_via_update_task_error',

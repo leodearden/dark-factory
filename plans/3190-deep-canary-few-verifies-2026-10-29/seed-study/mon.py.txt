@@ -1,0 +1,26 @@
+import os,time,json,sys,re
+end=time.time()+float(sys.argv[1]);out=open(sys.argv[2],'a',buffering=1)
+def rd(p):
+    try:return open(p,errors='replace').read()
+    except Exception:return None
+while time.time()<end:
+    t=time.time();rows=[];nD=0;nrustc=0;ncc=0;nlink=0
+    for p in os.listdir('/proc'):
+        if not p.isdigit():continue
+        cl=rd(f'/proc/{p}/cmdline')
+        if not cl:continue
+        a=cl.split('\0');c=a[0].rsplit('/',1)[-1]
+        if c=='rustc':nrustc+=1
+        elif c in('cc1plus','cc','c++','clang','clang++','cc1'):ncc+=1
+        elif c in('ld','ld.lld','mold','collect2','rust-lld'):nlink+=1
+        kind=None
+        if c=='cp' and '--reflink=always' in cl:kind='cp'
+        elif c=='rm' and 'warm-lanes' in cl:kind='rm'
+        if kind is None:continue
+        st=rd(f'/proc/{p}/stat');ss=rd(f'/proc/{p}/schedstat');wc=rd(f'/proc/{p}/wchan');io=rd(f'/proc/{p}/io')
+        if not st or not ss:continue
+        f=st.rsplit(')',1)[1].split()
+        rows.append(dict(pid=int(p),k=kind,s=f[0],ut=int(f[11]),st=int(f[12]),start=int(f[19]),blk=int(f[39]),ss=[int(x) for x in ss.split()],wc=wc,sc=re.findall(r'(?:syscr|syscw): (\d+)',io or ''),tgt=[x for x in a if 'warm-lanes' in x][-1][-60:]))
+    pr={k:rd(f'/proc/pressure/{k}') for k in('cpu','io','memory')}
+    out.write(json.dumps(dict(t=t,rows=rows,pr=pr,rustc=nrustc,cc=ncc,ld=nlink,load=rd('/proc/loadavg')))+'\n')
+    time.sleep(max(0,2-(time.time()-t)))

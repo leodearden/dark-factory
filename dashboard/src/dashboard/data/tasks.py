@@ -10,7 +10,7 @@ do not need to be re-keyed.
 Network errors are caught and surfaced as ``{'offline': True, 'error': ...}``;
 the caller turns that into a per-project skip plus a Tasks-tab banner.
 
-Note: the four failover loops below raise ``ValueError`` from within their
+Note: the five failover loops below raise ``ValueError`` from within their
 ``_call`` closures on a "soft failure" (malformed/errored MCP result), which
 ``mcp_fanout.first_success`` treats the same as a transport error — including
 invalidating that URL's cached session. Previously a soft failure here fell
@@ -19,8 +19,9 @@ through with a bare ``continue`` and no session teardown; see
 ``fetch_task_prose`` RETURNS one structured error instead of raising it: a
 missing task is a definitive answer, not a soft failure.
 
-Three of those four loops (``fetch_tasks``, ``fetch_statuses``,
-``fetch_task_prose``) are parameterized by ``project_root``, so they compose
+Four of those five loops (``fetch_tasks``, ``fetch_statuses``,
+``fetch_task_prose``, ``fetch_metadata_projection``) are parameterized by
+``project_root``, so they compose
 their ``log_label`` through ``mcp_fanout.fanout_label`` to keep each root's
 failure streak on its own throttle key — one fused-memory URL serves every
 root, so a fixed literal label would let a healthy root's success clear a
@@ -39,9 +40,10 @@ from __future__ import annotations
 import functools
 import math
 import os
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from types import MappingProxyType
 from typing import Any, TypeVar
 
 import httpx
@@ -571,13 +573,11 @@ async def fetch_tasks(
     **Server-side narrowing.**  *statuses* is forwarded to the ``get_tasks``
     MCP tool and is added to the arguments dict only when actually requested,
     so a caller that narrows nothing sends a dict byte-identical to the
-    pre-narrowing shape — the one full-tree caller,
-    ``app._fanout_probe_completion``, is unaffected.  It is a REAL server-side
-    row filter — it becomes ``WHERE tag = ? AND status IN (...)`` in SQL, so
-    narrowing with it cuts backend work, not just wire bytes.  ``None`` (the
-    default) means "no filter"; an EMPTY LIST is a valid, distinct "return
-    nothing" request
-    and is therefore SENT rather than dropped — which is why every guard on
+    pre-narrowing shape.  It is a REAL server-side row filter — it becomes
+    ``WHERE tag = ? AND status IN (...)`` in SQL, so narrowing with it cuts
+    backend work, not just wire bytes.  ``None`` (the default) means "no
+    filter"; an EMPTY LIST is a valid, distinct "return nothing" request and
+    is therefore SENT rather than dropped — which is why every guard on
     this path tests ``is not None`` and never truthiness, ``frozenset()``
     being falsy.  A bare string is rejected server-side with a
     ``ValidationError``.  Because the ``IN`` list is order-insensitive,
@@ -596,9 +596,10 @@ async def fetch_tasks(
     ``asyncio.wait_for``, and the two layers are complementary rather than
     redundant. ``task_snapshot._bounded`` does so around each of the snapshot
     unit's reads. The one caller deliberately left unbounded is
-    ``app._fanout_probe_completion``: the /healthz probe keeps its read
-    outstanding so a wedge stays observable, and
-    ``app._MCP_PROBE_OUTSTANDING_LIMIT`` turns that read's age into a verdict.
+    ``app.py::_fanout_probe_completion``, whose read is a one-row
+    :func:`fetch_task_page`: the /healthz probe keeps its read outstanding so
+    a wedge stays observable, and ``app.py::_MCP_PROBE_OUTSTANDING_LIMIT``
+    turns that read's age into a verdict.
     """
     read = _TasksRead(
         str(project_root),
@@ -861,3 +862,81 @@ async def fetch_task(
         client, config, project_root, task_id,
         timeout=timeout, log_name='fetch_task', project=_row_of,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectedTask:
+    """One task's id and the requested metadata keys present on it."""
+
+    id: int
+    metadata: Mapping[str, Any]
+
+
+async def fetch_metadata_projection(
+    client: httpx.AsyncClient,
+    config: DashboardConfig,
+    project_root: str | os.PathLike[str],
+    *,
+    metadata_keys: Sequence[str],
+    timeout: float = DEFAULT_PER_CALL_TIMEOUT,
+) -> tuple[ProjectedTask, ...] | TaskReadOffline:
+    """Read every task's id and *metadata_keys* in ONE unpaged projected ``get_tasks``.
+
+    The wire ``fields`` list is built here from metadata KEYS, so the read
+    cannot ask for a field :class:`ProjectedTask` does not carry. Rows are
+    never passed through :func:`_shape_task`, which would fabricate a title
+    and a status the projection did not fetch. A row whose id is not an
+    integer is skipped; a row without dict metadata carries ``{}``.
+
+    Its one caller is ``dashboard.data.task_lineage`` (the access grant in
+    ``tests/test_datum_access_paths.py``). *timeout* is per HTTP request; the
+    caller bounds the whole read with ``asyncio.wait_for``, as for
+    :func:`fetch_tasks`.
+    """
+    root = str(project_root)
+    fields = ['id', *(f'metadata.{key}' for key in metadata_keys)]
+
+    async def _call(url: str) -> tuple[ProjectedTask, ...]:
+        result = await mcp_tool_call(
+            client, url, 'get_tasks', {'project_root': root, 'fields': fields},
+            timeout=timeout,
+        )
+        if 'error' in result and 'tasks' not in result:
+            raise ValueError(str(result['error']))
+        rows = result.get('tasks')
+        if not isinstance(rows, list):
+            raise ValueError(f'get_tasks answered without a task list: {rows!r:.200}')
+        return tuple(_projected(rows))
+
+    return await first_success(
+        config.fused_memory_urls,
+        _call,
+        log_label=fanout_label('fetch_metadata_projection', root, config.project_labels),
+        offline_result=lambda errs: TaskReadOffline('; '.join(errs)),
+    )
+
+
+def _projected(rows: list[Any]) -> list[ProjectedTask]:
+    projected: list[ProjectedTask] = []
+    for row in rows:
+        task_id = _integer_id(row.get('id')) if isinstance(row, dict) else None
+        if task_id is None:
+            continue
+        metadata = row.get('metadata')
+        projected.append(ProjectedTask(
+            task_id, MappingProxyType(dict(metadata) if isinstance(metadata, dict) else {}),
+        ))
+    return projected
+
+
+def _integer_id(raw_id: object) -> int | None:
+    if isinstance(raw_id, bool):
+        return None
+    if isinstance(raw_id, int):
+        return raw_id
+    if isinstance(raw_id, str):
+        try:
+            return int(raw_id)
+        except ValueError:
+            return None
+    return None

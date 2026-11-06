@@ -352,10 +352,8 @@ elif resolve["status"] == "refused":
     # is no task_id. Intended outcome — record resolve["reason"] and move on.
     # Do NOT retry and do NOT record a task id.
     note_refused(resolve["reason"])
-elif resolve["status"] == "awaiting_curation":
-    # The curator could not judge it yet: the ticket is durably parked and
-    # retried until it gets a verdict. No task_id yet. Do NOT re-submit; see
-    # skills/_shared/ticket-failure-handling.md.
+elif resolve["status"] in ("pending", "awaiting_curation"):  # open — resolve the SAME ticket again, never re-submit (skills/_shared/ticket-failure-handling.md)
+    # No task_id yet. Still open after the re-resolve: record the ticket id.
     note_parked(ticket)
 elif resolve["status"] == "failed":
     # On `failed`: escalate the reason to the user and skip queuing this non-blocker.

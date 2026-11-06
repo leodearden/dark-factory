@@ -23,12 +23,11 @@ see `OPERATIONS.md` once you're up and running.
 - **`OPENAI_API_KEY` IS required.** fused-memory uses it for Graphiti/Mem0
   embeddings (`gpt-4o-mini` + `text-embedding-3-small`) — nothing else in the
   stack needs it.
-- **Multi-account OAuth pool is entirely optional.** A single logged-in Claude
-  Code CLI session is sufficient to run everything in this doc. The pool
-  (`config/usage-accounts.yaml` + `CLAUDE_OAUTH_TOKEN_*` env vars) exists to
-  spread load across several Claude Max accounts and fail over on rate-limit
-  — skip it unless you're running a large concurrent fleet. Detail in
-  §4 below.
+- **Multi-account OAuth pool is the default.** The pool
+  (`config/usage-accounts.yaml` + `CLAUDE_OAUTH_TOKEN_*` env vars) spreads
+  load across several Claude Max accounts and fails over on rate-limit. A
+  single-user setup without it must opt out explicitly. Detail in §4 below
+  and in `OPERATIONS.md`.
 
 ## 2. Clone with submodules
 
@@ -160,19 +159,18 @@ them in sync, or symlink one to the other.
   `orchestrator/src/orchestrator/defaults.yaml`'s equivalent hardcode
   `${DARK_FACTORY_ROOT:/home/leo/src/dark-factory}/config/usage-accounts.yaml`
   as their fallback — without the env var on a different path, they'll try
-  to read a file that isn't there (harmless — the pool just falls back to
-  no accounts / plain CLI auth — but worth setting to avoid a confusing
-  startup warning).
+  to read a file that isn't there, which leaves the pool empty (see "Optional:
+  multi-account OAuth pool" below for the single-user routes).
 - **Side-tooling keys** (`ANTHROPIC_API_KEY`, `GEMINI_API_KEY`,
   `PERPLEXITY_API_KEY`, `HF_DOWNLOAD_TOKEN`, `RUNPOD_API_KEY`) appear
   commented out in `.env.example` for optional eval harnesses and auxiliary
   scripts only — **not** needed for the core factory (agents authenticate
   via the Claude Code CLI's own OAuth, never `ANTHROPIC_API_KEY`).
 
-### Optional: multi-account OAuth pool
+### Multi-account OAuth pool
 
-Only relevant if you want several Claude Max accounts sharing load with
-automatic failover on a rate limit. `config/usage-accounts.yaml` lists
+`usage_cap` is enabled in the shipped configs, so the factory expects a pool
+(or an explicit single-user opt-out, below). `config/usage-accounts.yaml` lists
 accounts by name and the **env var name** holding each one's OAuth token
 (never the token itself):
 
@@ -186,10 +184,10 @@ accounts:
 
 For each account, generate a long-lived OAuth token (`claude setup-token`)
 and put it in `.env` as `CLAUDE_OAUTH_TOKEN_A=...`, `CLAUDE_OAUTH_TOKEN_B=...`,
-etc. Absent this file (or an absent env var for a listed account), the pool
-degrades gracefully to plain Claude Code CLI default auth — this is the
-normal, supported single-account setup. Don't configure this unless you
-know you need it; see `OPERATIONS.md` for the failover/capacity model.
+etc. Absent this file (or an absent env var for every listed account), the
+pool is empty and every invocation raises. For a single-user setup, use one of
+the two supported routes described in `OPERATIONS.md` ("Multi-account failover
+(`usage_cap.*`)"); see it too for the failover/capacity model.
 
 ## 5. Start backing stores
 

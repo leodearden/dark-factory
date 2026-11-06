@@ -8,6 +8,7 @@ from __future__ import annotations
 import functools
 import hashlib
 import json
+import re
 import sqlite3
 import types
 from collections.abc import Callable
@@ -356,62 +357,95 @@ def _decided() -> Any:
 
 class TestThirdRoundBlockers:
     def test_names_each_pair_a_tie_or_an_open_follow_up_alone_blocks(self) -> None:
-        derivations = [
-            ('tied', _incomplete(_gap('p1', 'conflict', 'tied'))),
-            ('open', _incomplete(_gap('p2', 'loss', 'open'))),
-            ('both', _incomplete(_gap('p3', 'home', 'tied'), _gap('p3', 'loss', 'open'))),
-            ('decided', _decided()),
-            ('unclear', _rubric().Unclear(binaries=(('p4', _rubric().Binary.HOME),))),
-        ]
+        derivations = {
+            ('tied', 'p1'): _incomplete(_gap('p1', 'conflict', 'tied')),
+            ('open', 'p2'): _incomplete(_gap('p2', 'loss', 'open')),
+            ('both', 'p3'): _incomplete(_gap('p3', 'home', 'tied'), _gap('p3', 'loss', 'open')),
+            ('decided', 'p1'): _decided(),
+            ('unclear', 'p4'): _rubric().Unclear(binaries=(('p4', _rubric().Binary.HOME),)),
+        }
         assert _mod().third_round_blockers(derivations) == [
             ('both', 'p3'), ('open', 'p2'), ('tied', 'p1'),
         ]
 
-    def test_a_multi_target_derivation_blocks_only_its_gap_targets(self) -> None:
-        derivations = [('stored', _incomplete(_gap('t2', 'home', 'tied'), _gap('t5', 'conflict', 'tied')))]
-        assert _mod().third_round_blockers(derivations) == [('stored', 't2'), ('stored', 't5')]
-
-    def test_one_entry_may_come_once_per_pair(self) -> None:
-        derivations = [('w', _incomplete(_gap('t1', 'home', 'tied'))), ('w', _decided()),
-                       ('w', _incomplete(_gap('t3', 'loss', 'open')))]
+    def test_one_entry_may_come_once_per_target(self) -> None:
+        derivations = {('w', 't1'): _incomplete(_gap('t1', 'home', 'tied')), ('w', 't2'): _decided(),
+                       ('w', 't3'): _incomplete(_gap('t3', 'loss', 'open'))}
         assert _mod().third_round_blockers(derivations) == [('w', 't1'), ('w', 't3')]
 
-    def test_an_unrated_decisive_binary_is_refused_naming_the_entry_and_binaries(self) -> None:
-        derivations = [
-            ('fine', _incomplete(_gap('p1', 'conflict', 'tied'))),
-            ('unrated-entry', _incomplete(_gap('p1', 'home', 'tied'), _gap('p1', 'conflict', 'unrated'))),
-        ]
-        with pytest.raises(ValueError, match=r"'unrated-entry'.*\['conflict'\]"):
+    def test_an_unrated_decisive_binary_is_refused_naming_the_pair_and_binaries(self) -> None:
+        derivations = {
+            ('fine', 'p1'): _incomplete(_gap('p1', 'conflict', 'tied')),
+            ('unrated-entry', 'p1'): _incomplete(_gap('p1', 'home', 'tied'), _gap('p1', 'conflict', 'unrated')),
+        }
+        with pytest.raises(ValueError, match=r"\('unrated-entry', 'p1'\).*\['conflict'\]"):
             _mod().third_round_blockers(derivations)
 
     def test_an_unrated_gap_after_a_tie_on_one_pair_is_refused(self) -> None:
         derivation = _incomplete(_gap('p1', 'conflict', 'tied'), _gap('p1', 'loss', 'unrated'))
         assert [str(gap.kind) for gap in derivation.missing] == ['tied', 'unrated']
-        with pytest.raises(ValueError, match=r"'w'.*\['loss'\]"):
-            _mod().third_round_blockers([('w', derivation)])
+        with pytest.raises(ValueError, match=r"\('w', 'p1'\).*\['loss'\]"):
+            _mod().third_round_blockers({('w', 'p1'): derivation})
 
     def test_nothing_blocked_is_an_empty_list(self) -> None:
-        assert _mod().third_round_blockers([('decided', _decided())]) == []
+        assert _mod().third_round_blockers({('decided', 'p1'): _decided()}) == []
 
 
-class TestLossConsumingPairs:
-    def test_names_each_current_pair_resolving_home_yes_and_conflict_no(self) -> None:
-        kept = {'home': 'YES', 'conflict': 'NO', 'loss': 'NO'}
-        rows = [
-            _rated('agree', role='primary', **kept), _rated('agree', role='second', **kept),
-            _rated('third-resolved', role='primary', home='YES', conflict='YES'),
-            _rated('third-resolved', role='second', **kept),
-            _rated('third-resolved', role='third', home='YES', conflict='NO', loss='YES'),
-            _rated('conflict', role='primary', home='YES', conflict='YES'),
-            _rated('conflict', role='second', home='YES', conflict='YES'),
-            _rated('tied', role='primary', home='YES', conflict='YES'),
-            _rated('tied', role='second', **kept),
-            _rated('home-no', role='primary', home='NO', conflict='NO'),
-            _rated('home-no', role='second', home='NO', conflict='NO'),
-            _rated('attach', role='primary', basis='attach_time', **kept),
-            _rated('attach', role='second', basis='attach_time', **kept),
-        ]
-        assert _mod().loss_consuming_pairs(rows) == [('agree', 'p1'), ('third-resolved', 'p1')]
+_KEPT = {'home': 'YES', 'conflict': 'NO', 'loss': 'NO'}
+_LOSS_UNCLEAR = {'home': 'YES', 'conflict': 'NO', 'loss': 'UNCLEAR'}
+_CONFLICTING = {'home': 'YES', 'conflict': 'YES', 'scope': 'CENTRAL', 'action_changing': 'YES'}
+_HOMELESS = {'home': 'NO', 'conflict': 'NO'}
+
+
+def _restated(answers_by_entry: dict[str, dict[str, str]]) -> dict[tuple[str, str], Any]:
+    """Each entry's restated derivation against p1, both raters giving the entry's answers."""
+    rubric = _rubric()
+    rows = [_rated(entry, role=role, **answers)
+            for entry, answers in answers_by_entry.items() for role in ('primary', 'second')]
+    judgements = rubric.resolve_judgements(rows)
+    return {(key.entry_id, key.target_id): rubric.derive('restated', {key.target_id: judgement})
+            for key, judgement in judgements.items()}
+
+
+class TestPairsReadingLoss:
+    def test_names_each_pair_whose_derivation_consumes_loss_or_leaves_it_unclear(self) -> None:
+        derivations = _restated({'kept': _KEPT, 'unclear': _LOSS_UNCLEAR,
+                                 'conflict': _CONFLICTING, 'home-no': _HOMELESS})
+        rubric = _rubric()
+        assert isinstance(derivations['kept', 'p1'], rubric.Decided)
+        assert isinstance(derivations['unclear', 'p1'], rubric.Unclear)
+        assert _mod().pairs_reading_loss(derivations) == {('kept', 'p1'), ('unclear', 'p1')}
+
+    def test_an_incomplete_pair_reads_no_loss(self) -> None:
+        derivations = {('tied', 'p1'): _incomplete(_gap('p1', 'loss', 'tied'))}
+        assert _mod().pairs_reading_loss(derivations) == set()
+
+
+class TestRefuseLossOutsideTheLatestRerate:
+    @staticmethod
+    def _key(*rerates: tuple[str, list[tuple[str, str]]]) -> dict[str, Any]:
+        return {'shards': {}, 'items': {}, 'rerates': [
+            {'version': version, 'pairs': [list(pair) for pair in pairs]} for version, pairs in rerates]}
+
+    def test_a_key_without_rerates_refuses_nothing(self) -> None:
+        derivations = _restated({'kept': _KEPT})
+        _mod().refuse_loss_outside_the_latest_rerate({'shards': {}, 'items': {}}, derivations)
+
+    def test_every_pair_reading_loss_inside_the_latest_rerate_passes(self) -> None:
+        derivations = _restated({'kept': _KEPT, 'conflict': _CONFLICTING})
+        _mod().refuse_loss_outside_the_latest_rerate(self._key(('v2.2', [('kept', 'p1')])), derivations)
+
+    def test_a_pair_reading_loss_outside_the_latest_rerate_is_refused_naming_it(self) -> None:
+        derivations = _restated({'kept': _KEPT, 'unclear': _LOSS_UNCLEAR})
+        key = self._key(('v2.2', [('unclear', 'p1')]))
+        with pytest.raises(ValueError, match=r'(?s)latest re-rate \(v2\.2\).*\nkept p1'):
+            _mod().refuse_loss_outside_the_latest_rerate(key, derivations)
+
+    def test_only_the_latest_rerate_counts_not_the_union(self) -> None:
+        derivations = _restated({'kept': _KEPT, 'unclear': _LOSS_UNCLEAR})
+        key = self._key(('v2.2', [('kept', 'p1'), ('unclear', 'p1')]), ('v2.3', [('unclear', 'p1')]))
+        with pytest.raises(ValueError, match=r'(?s)latest re-rate \(v2\.3\).*\nkept p1'):
+            _mod().refuse_loss_outside_the_latest_rerate(key, derivations)
 
 
 class TestShard:
@@ -935,6 +969,154 @@ class TestARerateRetiresThirdVotesOnItsPairsOnly:
         lines = scratch.effective_lines(scratch.load_key())
         thirds = sorted((row['entry_id'], row['target_id']) for row in lines if row['role'] == 'third')
         assert thirds == [('w', 't2'), ('x', 't1')]
+
+
+@pytest.fixture
+def new_brief(tmp_path: Path) -> Path:
+    path = tmp_path / 'brief_v2_2.md'
+    path.write_text('# Rater brief v2.2: a revised wording\n\nAnswer LOSS the new way.\n')
+    return path
+
+
+def _two_writes() -> dict[Triple, Any]:
+    rounds = _mod()
+    return {(entry_id, 'p1', 'current'): rounds.ShardEntry(
+        entry_id, 'p1', 'current', 'df', f'child of {entry_id}', f'parent of {entry_id}')
+        for entry_id in ('w', 'x')}
+
+
+class TestEffectiveLinesUnderOneBrief:
+    @pytest.fixture
+    def rerated(self, tmp_path: Path, old_brief: Path, new_brief: Path) -> tuple[Any, dict[str, Any]]:
+        """Round 0 under *old_brief*, then ('w', 'p1') re-rated under *new_brief*; every shard rated."""
+        rounds, entries = _mod(), _two_writes()
+        first = rounds.RatingScratch(tmp_path / 'scratch', brief=old_brief)
+        key = first.load_key()
+        first.add_shards(key, list(entries.values()), seed=7)
+        first.save_key(key)
+        _rate_every_unrated_shard(first, entries)
+        revised = rounds.RatingScratch(first.root, brief=new_brief)
+        rounds.rerate_round(revised, revised.load_key(), entries, [('w', 'p1')], version='v2.2')
+        _rate_every_unrated_shard(revised, entries)
+        return revised, revised.load_key()
+
+    def test_unfiltered_the_rerate_line_supersedes_the_round_0_line(
+        self, rerated: tuple[Any, dict[str, Any]],
+    ) -> None:
+        scratch, key = rerated
+        rerate_shards = set(key['rerates'][0]['shards'])
+        batches = {(row['entry_id'], row['rater']): row['batch'] for row in scratch.effective_lines(key)}
+        assert {batches['w', rater] in rerate_shards for rater in ('opus-primary', 'opus-second')} == {True}
+        assert {batches['x', rater] in rerate_shards for rater in ('opus-primary', 'opus-second')} == {False}
+
+    def test_under_the_round_0_brief_each_rater_keeps_its_round_0_line(
+        self, rerated: tuple[Any, dict[str, Any]], old_brief: Path,
+    ) -> None:
+        scratch, key = rerated
+        lines = scratch.effective_lines(key, brief_sha256=_sha(old_brief))
+        assert sorted((row['entry_id'], row['rater']) for row in lines) == [
+            (entry, rater) for entry in ('w', 'x') for rater in ('opus-primary', 'opus-second')]
+        assert {key['shards'][row['batch']]['brief_sha256'] for row in lines} == {_sha(old_brief)}
+        assert {key['shards'][row['batch']]['round'] for row in lines} == {0}
+
+    def test_under_the_rerates_brief_only_its_lines_remain(
+        self, rerated: tuple[Any, dict[str, Any]], new_brief: Path,
+    ) -> None:
+        scratch, key = rerated
+        lines = scratch.effective_lines(key, brief_sha256=_sha(new_brief))
+        assert sorted((row['entry_id'], row['rater']) for row in lines) == [
+            ('w', 'opus-primary'), ('w', 'opus-second')]
+        assert {row['batch'] for row in lines} <= set(key['rerates'][0]['shards'])
+
+
+_UNSAFE_LABELS = ('../v2.2', 'v2.2/x', 'v2.2 ', '2.2', 'v2.', 'v2..2', '')
+
+
+class TestBriefVersion:
+    @pytest.mark.parametrize('label', ['v2', 'v2.2', 'v10.0.3'])
+    def test_returns_a_v_numbered_label(self, label: str) -> None:
+        assert _mod().brief_version(label) == label
+
+    @pytest.mark.parametrize('label', _UNSAFE_LABELS)
+    def test_refuses_any_other_label_naming_it(self, label: str) -> None:
+        with pytest.raises(ValueError, match=re.escape(f'brief version label {label!r} ')):
+            _mod().brief_version(label)
+
+
+def _never_called() -> dict[tuple[str, str], Any]:
+    raise AssertionError('the derivations were read though the re-rate is already keyed')
+
+
+class TestEnsureRerate:
+    @pytest.fixture
+    def scratch(self, tmp_path: Path, old_brief: Path, new_brief: Path) -> Any:
+        """Round 0 under *old_brief* and a third round on ('x', 'p1'), all rated; the
+        scratch returned renders under *new_brief*."""
+        rounds, entries = _mod(), _two_writes()
+        first = rounds.RatingScratch(tmp_path / 'scratch', brief=old_brief)
+        key = first.load_key()
+        first.add_shards(key, list(entries.values()), seed=7)
+        first.save_key(key)
+        _rate_every_unrated_shard(first, entries)
+        rounds.third_round(first, first.load_key(), entries, {('x', 'p1')})
+        _rate_every_unrated_shard(first, entries)
+        return rounds.RatingScratch(first.root, brief=new_brief)
+
+    def test_keys_one_rerate_over_exactly_the_pairs_reading_loss(
+        self, scratch: Any, new_brief: Path,
+    ) -> None:
+        rounds = _mod()
+        key = scratch.load_key()
+        summary = rounds.ensure_rerate(scratch, key, _two_writes(), version='v2.2',
+                                       derivations=lambda: _restated({'w': _KEPT, 'x': _CONFLICTING}))
+        assert summary == {
+            'version': 'v2.2', 'round': 1, 'pairs': 1, 'retires_third_raters': ['opus-third-00'],
+            'new_shards': {'primary': {'rerate_01_primary_00': 1}, 'second': {'rerate_01_second_00': 1}},
+            'rendered_again': [],
+        }
+        [rerate] = scratch.load_key()['rerates']
+        assert rerate == key['rerates'][0]
+        assert (rerate['version'], rerate['round'], rerate['pairs']) == ('v2.2', 1, [['w', 'p1']])
+        assert rerate['brief_sha256'] == _sha(new_brief)
+        assert rerate['retires_third_raters'] == ['opus-third-00']
+        assert (scratch.root / 'rater_prompt.md').read_text() == rounds.rater_prompt(new_brief)
+
+    def test_refuses_while_a_pair_awaits_a_third_rater_keying_nothing(self, scratch: Any) -> None:
+        key = scratch.load_key()
+        tied = {**_restated({'w': _KEPT}), ('x', 'p1'): _incomplete(_gap('p1', 'conflict', 'tied'))}
+        with pytest.raises(ValueError, match=r"run third.*\('x', 'p1'\)"):
+            _mod().ensure_rerate(scratch, key, _two_writes(), version='v2.2', derivations=lambda: tied)
+        assert 'rerates' not in key
+        assert 'rerates' not in scratch.load_key()
+
+    @pytest.mark.parametrize('label', _UNSAFE_LABELS)
+    def test_refuses_a_label_that_is_not_a_brief_version_reading_nothing_keying_nothing(
+        self, scratch: Any, label: str,
+    ) -> None:
+        key = scratch.load_key()
+        with pytest.raises(ValueError, match='brief version label'):
+            _mod().ensure_rerate(scratch, key, _two_writes(), version=label, derivations=_never_called)
+        with pytest.raises(ValueError, match='brief version label'):
+            _mod().rerate_round(scratch, key, _two_writes(), [('w', 'p1')], version=label)
+        assert 'rerates' not in key
+        assert 'rerates' not in scratch.load_key()
+
+    def test_a_rerun_reads_no_derivation_keys_nothing_and_renders_a_deleted_shard_again(
+        self, scratch: Any,
+    ) -> None:
+        rounds = _mod()
+        rounds.ensure_rerate(scratch, scratch.load_key(), _two_writes(), version='v2.2',
+                             derivations=lambda: _restated({'w': _KEPT, 'x': _CONFLICTING}))
+        key_bytes = scratch.key_path.read_bytes()
+        deleted = scratch.root / 'shards' / 'rerate_01_primary_00.txt'
+        shard_bytes = deleted.read_bytes()
+        deleted.unlink()
+        summary = rounds.ensure_rerate(scratch, scratch.load_key(), _two_writes(), version='v2.2',
+                                       derivations=_never_called)
+        assert summary['new_shards'] == {}
+        assert summary['rendered_again'] == ['rerate_01_primary_00']
+        assert scratch.key_path.read_bytes() == key_bytes
+        assert deleted.read_bytes() == shard_bytes
 
 
 class TestTheRaterContract:
