@@ -15,6 +15,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from shared.boundary_storm_escape import storm_outcome_label
+
 from escalation.categories import EscalationCategory
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
@@ -93,7 +95,7 @@ def file_storm_once(
         severity='blocking',
         category=alarm.category,
         summary=(
-            f'{record.get("count")} {record.get("outcome")} MCP call(s) in '
+            f'{record.get("count")} {storm_outcome_label(record)} MCP call(s) in '
             f'{record.get("window_seconds")}s for project={record.get("project")!r} '
             f'— {alarm.condition}'
         ),
