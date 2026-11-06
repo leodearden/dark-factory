@@ -55,7 +55,9 @@ TASK_CITATION_RE = re.compile(r'\btask (\d+)\b', re.IGNORECASE)
 
 _SCAN_CONTEXT = 'sitting.inventory'
 _SCAN_PARSE_ERRORS: tuple[type[BaseException], ...] = (json.JSONDecodeError, KeyError, TypeError, ValueError)
-_KEY_ARITY = {'esc': 3, 'decision': 2}
+AUDIT_KIND = 'audit'
+QUESTION_KINDS = frozenset({'esc', 'decision'})
+_KEY_ARITY = {'esc': 3, 'decision': 2, AUDIT_KIND: 2}
 
 ItemKey = tuple[str, ...]
 
@@ -141,6 +143,11 @@ def escalation_key(queue_dir: str, escalation_id: str) -> ItemKey:
 
 def decision_key(decision_id: str) -> ItemKey:
     return ('decision', decision_id)
+
+
+def audit_key(decision_id: str) -> ItemKey:
+    """An executor close drawn for audit, keyed by the DecisionRecord that closed it."""
+    return (AUDIT_KIND, decision_id)
 
 
 def key_str(key: ItemKey) -> str:
@@ -236,7 +243,7 @@ def collect_open_items(
     items: dict[ItemKey, OpenItem] = {}
     for queue_dir in dict.fromkeys(normalize_escalations_dir(q) for q in queue_dirs):
         queue_index, records = _scan_queue(queue_dir)
-        index[queue_dir] = MappingProxyType(queue_index)
+        index[queue_dir] = queue_index
         pending[queue_dir] = records
         shortfalls += records.unreadable
         for esc in (esc for escs in records.by_task.values() for esc in escs if esc.level == 2):
@@ -361,13 +368,17 @@ def read_escalation(path: Path) -> tuple[Escalation | None, Shortfall | None]:
     return esc, None
 
 
-def _scan_queue(queue_dir: str) -> tuple[dict[str, Path], PendingRecords]:
+def index_queue(queue_dir: str) -> Mapping[str, Path]:
+    """Every root and archive record of *queue_dir*, id to path, the root copy winning; nothing is read."""
+    return MappingProxyType({path.stem: path for path in iter_all_escalation_paths(Path(queue_dir))})
+
+
+def _scan_queue(queue_dir: str) -> tuple[Mapping[str, Path], PendingRecords]:
     root = Path(queue_dir)
-    index: dict[str, Path] = {}
+    index = index_queue(queue_dir)
     by_task: dict[str, list[Escalation]] = defaultdict(list)
     unreadable: list[Shortfall] = []
-    for path in iter_all_escalation_paths(root):
-        index[path.stem] = path
+    for path in index.values():
         if path.parent != root:
             continue
         esc, problem = read_escalation(path)

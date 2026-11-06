@@ -277,6 +277,7 @@ def compose(
     done = tuple(
         brief.DoneEntry(entry.number, parse_key(key), entry.done_at or '')
         for key, entry in numbered_ledger.in_state('done')
+        if parse_key(key)[0] in inventory.QUESTION_KINDS
     )
     closes = tuple(
         brief.CloseRecord(c.item, c.verdict, c.payloads)
