@@ -5,12 +5,13 @@ archived record was replayed onto, read-only and never guessed
 
 from __future__ import annotations
 
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
-from _git_fault_shim import fail_git
+from _git_fault_shim import answer_git, fail_git
 from _git_fixtures import seed_repo
 
 from orchestrator.config import GitConfig
@@ -174,6 +175,33 @@ class TestCommitsNamed:
         with pytest.raises(GitQueryFailed):
             await GitOps(_git_config(), plain).commits_named(['abc1234'])
 
+    async def test_an_ambiguous_token_is_omitted(
+        self, git_ops, tmp_path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        answer_git(monkeypatch, tmp_path / 'bin', 'cat-file*', 'abc1234^{commit} ambiguous\n')
+
+        assert await git_ops.commits_named(['abc1234']) == {}
+
+    @pytest.mark.parametrize(
+        ('answer', 'raised'),
+        [
+            pytest.param('garbage\n', "answered 'garbage' for 'abc1234'", id='unparseable-line'),
+            pytest.param('', 'answered 0 lines for 1 tokens', id='too-few-lines'),
+            pytest.param(
+                'abc1234^{commit} missing\nabc1234^{commit} missing\n',
+                'answered 2 lines for 1 tokens',
+                id='too-many-lines',
+            ),
+        ],
+    )
+    async def test_an_answer_that_is_neither_an_oid_nor_a_miss_raises(
+        self, git_ops, tmp_path, monkeypatch: pytest.MonkeyPatch, answer: str, raised: str,
+    ):
+        answer_git(monkeypatch, tmp_path / 'bin', 'cat-file*', answer)
+
+        with pytest.raises(GitQueryFailed, match=re.escape(raised)):
+            await git_ops.commits_named(['abc1234'])
+
 
 async def _cite_rebased_s1(repo: Path) -> str:
     return (await _land_rebased_branch(repo)).s1
@@ -201,13 +229,15 @@ class TestFaultsAreNeverReadAsFacts:
             await git_ops.resolve_rebased_citation(landed.s1)
 
     @pytest.mark.parametrize(
-        ('argv_glob', 'cite'),
+        ('argv_glob', 'after', 'cite'),
         [
-            pytest.param('diff-tree*', _cite_rebased_s1, id='diff-tree'),
-            pytest.param('patch-id*', _cite_rebased_s1, id='patch-id'),
-            pytest.param('log -p*', _cite_rebased_s1, id='log-p'),
-            pytest.param('log -1 --format=%s*', _cite_rebased_s1, id='landed-subject'),
-            pytest.param('log --format=%H*', _cite_subject_only_side, id='range-subjects'),
+            pytest.param('diff-tree*', 0, _cite_rebased_s1, id='diff-tree'),
+            pytest.param('log -p -1 *', 0, _cite_rebased_s1, id='target-log-p'),
+            pytest.param('patch-id*', 0, _cite_rebased_s1, id='target-patch-id'),
+            pytest.param('log -p --no-color --full-diff *', 0, _cite_rebased_s1, id='range-log-p'),
+            pytest.param('patch-id*', 1, _cite_rebased_s1, id='range-patch-id'),
+            pytest.param('log -1 --format=%s *', 0, _cite_rebased_s1, id='landed-subject'),
+            pytest.param('log --format=%H*', 0, _cite_subject_only_side, id='range-subjects'),
         ],
     )
     async def test_a_failing_git_query_mid_lookup_raises(
@@ -217,10 +247,14 @@ class TestFaultsAreNeverReadAsFacts:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
         argv_glob: str,
+        after: int,
         cite: Callable[[Path], Awaitable[str]],
     ):
+        """Only the one call each param names fails, so a fault the code under
+        test swallowed lets the lookup go on to answer and the test fails."""
         cited = await cite(repo)
-        fail_git(monkeypatch, tmp_path / 'bin', argv_glob)
+        fail_git(monkeypatch, tmp_path / 'bin', argv_glob, after=after, times=1)
+        failing_query = re.escape(f'git {argv_glob.rstrip("*")}')
 
-        with pytest.raises(GitQueryFailed):
+        with pytest.raises(GitQueryFailed, match=f'^{failing_query}.* exited 128: fatal: injected'):
             await git_ops.resolve_rebased_citation(cited)
