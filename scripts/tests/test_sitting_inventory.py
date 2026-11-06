@@ -412,3 +412,36 @@ class TestReadOnly:
         assert _snapshot(fleet, df_root) == before
         assert not [p for p in tmp_path.rglob('*.lock')]
         assert not absent_queue.exists()
+
+
+class TestAuditKey:
+    def test_an_audit_key_names_its_decision_and_round_trips(self):
+        key = mod.audit_key('dec-1')
+
+        assert key == ('audit', 'dec-1')
+        assert mod.parse_key(mod.key_str(key)) == key
+
+    @pytest.mark.parametrize('text', ['["audit"]', '["audit", "a", "b"]'])
+    def test_a_malformed_audit_key_is_refused(self, text):
+        with pytest.raises(ValueError):
+            mod.parse_key(text)
+
+    def test_the_audit_kind_is_not_a_question_kind(self):
+        assert {'esc', 'decision'} == mod.QUESTION_KINDS
+        assert mod.AUDIT_KIND == 'audit'
+        assert mod.AUDIT_KIND not in mod.QUESTION_KINDS
+
+
+class TestIndexQueue:
+    def test_maps_every_root_and_archive_record_to_its_path(self, df_root):
+        queue = df_root / 'data' / 'escalations'
+        _write_escalation(queue, id='esc-61-1', level=2)
+        _write_escalation(queue, subdir='archive/2026-09-01', id='esc-61-2', status='resolved')
+
+        assert dict(mod.index_queue(str(queue))) == {
+            'esc-61-1': queue / 'esc-61-1.json',
+            'esc-61-2': queue / 'archive' / '2026-09-01' / 'esc-61-2.json',
+        }
+
+    def test_a_missing_queue_indexes_nothing(self, tmp_path):
+        assert dict(mod.index_queue(str(tmp_path / 'absent'))) == {}
