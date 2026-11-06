@@ -65,7 +65,7 @@ def estimate_tokens(text: str) -> int:
 
 
 def format_event(event: ReconciliationEvent) -> str:
-    """Format an event the same way _format_events does in memory_consolidator."""
+    """Format an event the same way ``stage1_payload_format.py::format_events`` does."""
     return f'- [{event.type.value}] {event.timestamp.isoformat()}: {json.dumps(event.payload)}'
 
 

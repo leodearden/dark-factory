@@ -110,7 +110,7 @@ async def _run(
     with (
         patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
         patch(
-            'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+            'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
             new=dedup_mock,
         ),
     ):
