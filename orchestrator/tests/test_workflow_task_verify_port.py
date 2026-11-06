@@ -13,14 +13,17 @@ Imports orchestrator.workflow only, never orchestrator.merge_lane.
 from __future__ import annotations
 
 import contextlib
+import subprocess
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _git_fixtures import seed_repo
 from _orch_helpers import MOCK_WORKFLOW_PROJECT_ROOT, pydantic_spec
 
+from orchestrator.artifacts import ReviewAggregation, TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.task_verify_dispatch import DispatchDecision
@@ -159,6 +162,21 @@ async def _verify_then_review(wf: TaskWorkflow) -> None:
     wf._enter_phase(WorkflowState.REVIEW)
 
 
+def _done_plan_artifacts(wf: TaskWorkflow) -> TaskArtifacts:
+    """Real artifacts in the worktree whose plan is done, so EXECUTE passes straight through."""
+    assert wf.worktree is not None
+    artifacts = TaskArtifacts(wf.worktree)
+    artifacts.init(_TASK, 'T', 'd', base_commit=_BASE)
+    artifacts.write_plan({
+        'task_id': _TASK, 'title': 'T', 'files': [], 'analysis': 'a', 'prerequisites': [],
+        'steps': [{
+            'id': 'step-1', 'type': 'impl', 'description': 'd', 'status': 'done', 'commit': _TIP,
+        }],
+    })
+    artifacts.stamp_plan_provenance(wf.session_id)
+    return artifacts
+
+
 def _verify_rows(store: EventStore) -> list[dict[str, Any]]:
     return [row['data'] for row in store.fetch_events_by_type(EventType.workflow_verify)]
 
@@ -238,6 +256,39 @@ class TestGreenRunner:
 
         [row] = _verify_rows(store)
         assert row['runner'] == 'local'
+
+    async def test_the_verify_review_loop_pairs_the_runner_with_the_real_tip(
+        self, tmp_path: Path,
+    ) -> None:
+        """Row 17 through the loop that sequences VERIFY->REVIEW, not a hand-built edge.
+
+        The loop resets the runner at VERIFY entry, captures the green tip
+        from the worktree's real HEAD, then emits at REVIEW entry.
+        """
+        store = EventStore(tmp_path / 'runs.db', run_id='run-test')
+        port = _RecordingPort({(_TASK, 1): _laptop_decision()})
+        wf = _workflow(task_verify=port, event_store=store)
+        wf.worktree = seed_repo(tmp_path / 'wt')
+        head = subprocess.run(
+            ['git', 'rev-parse', 'HEAD'], cwd=wf.worktree, check=True,
+            capture_output=True, text=True,
+        ).stdout.strip()
+        wf.artifacts = _done_plan_artifacts(wf)
+        wf.config.max_execute_iterations = 5
+        wf.config.inter_iteration_rebase = False
+        wf.config.max_review_cycles = 2
+        wf.config.max_amendment_rounds = 1
+        passing_review = ReviewAggregation(
+            has_blocking_issues=False, blocking_issues=[], suggestions=[], reviews={'analyst': {}},
+        )
+
+        with patch.object(wf, '_review', AsyncMock(return_value=passing_review)), \
+             patch.object(wf, '_write_suggestions_to_memory', AsyncMock()):
+            assert await wf._execute_verify_review_loop() == WorkflowOutcome.DONE
+
+        assert len(port.calls) == 1
+        [row] = _verify_rows(store)
+        assert (row['runner'], row['tip_sha'], row['site']) == ('laptop', head, 'implement')
 
     async def test_the_pre_merge_reverify_stays_local(self, tmp_path: Path) -> None:
         store = EventStore(tmp_path / 'runs.db', run_id='run-test')
