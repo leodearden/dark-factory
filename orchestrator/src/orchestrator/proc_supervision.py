@@ -456,6 +456,11 @@ class RestartPlan:
         if not self.script.is_absolute():
             object.__setattr__(self, 'script', self.cwd / self.script)
 
+    def _child_environ(self) -> dict[str, str] | None:
+        """``env`` overlaid on ``os.environ``, or None (full inherit) when empty: the
+        rule of ``orchestrator/src/orchestrator/before_done_script.py::run_script``."""
+        return {**os.environ, **self.env} if self.env else None
+
     async def execute(self, *, runner=None, inspector=None) -> RestartOutcome:
         """Run this restart plan, honoring RP-1..5.
 
@@ -660,6 +665,7 @@ class RestartPlan:
         proc = await runner(
             str(self.script), *self.args,
             cwd=str(self.cwd),
+            env=self._child_environ(),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
@@ -983,6 +989,7 @@ class RestartPlan:
         await runner(
             str(self.script), *self.args,
             cwd=str(self.cwd),
+            env=self._child_environ(),
             start_new_session=True,
         )
         return RestartOutcome(disposition=RestartDisposition.SCHEDULED)
