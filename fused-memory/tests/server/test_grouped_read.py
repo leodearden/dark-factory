@@ -1077,7 +1077,7 @@ class TestIsContestedChild:
 
 
 class TestChildParentId:
-    """The single definition of 'is this Mem0 record a child' (D5)."""
+    """The definition of 'is this Mem0 record a child' (D5)."""
 
     @pytest.mark.parametrize('kind', sorted(CHILD_KINDS))
     def test_a_child_kind_with_a_str_parent_returns_the_parent(self, kind):
