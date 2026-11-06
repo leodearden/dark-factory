@@ -1019,3 +1019,20 @@ verify_host_unreachable_escalate_after_n: 3
 verify_host_unreachable_escalate_after_secs: 600.0
 verify_host_policy: prefer_local
 verify_host_reprobe_interval_s: 120.0
+
+# Remote task-leg verifies (task 6670; plans/remote-task-leg-verify-prd.md
+# §5.7).  All four are green-tier: the dispatcher reads them per dispatch.
+#
+# verify_task_host_policy: local (default) runs every task verify locally and
+#   writes no dispatch sidecar.  remote_modules makes a verify eligible when its
+#   executed modules intersect verify_task_remote_modules (which must then be
+#   non-empty); remote_all makes every verify eligible.  Rollback is one reload
+#   back to local.
+# verify_task_remote_cross_check_every_n: every n-th eligible verify also runs
+#   locally, local authoritative (0 = off).
+# verify_task_remote_red_confirms_locally: a remote red is re-run locally and
+#   the local verdict returned.
+verify_task_host_policy: local
+verify_task_remote_modules: []
+verify_task_remote_cross_check_every_n: 0
+verify_task_remote_red_confirms_locally: false
