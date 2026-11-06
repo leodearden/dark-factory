@@ -248,6 +248,51 @@ class TestApplyAcrossTwoPorts:
             assert decision.state == DecisionState.ANSWERED
             assert decision.closing_evidence
 
+    def _update_task_step(self, s: Sitting, fused: RecordingToolCaller) -> tuple[int, dict]:
+        alpha_n = s.number(s.alpha.queue_dir, 'esc-100-1')
+
+        report = s.apply([s.answer(alpha_n, 'A')], {str(alpha_n): 'resume'}, fused=fused)
+
+        (row,) = report.rows
+        assert json.loads(json.dumps(row, sort_keys=True)) == row
+        (step,) = [step for step in row['steps'] if step['step'] == 'update_task']
+        return report.exit_code, step
+
+    def test_a_superseded_string_ruling_is_disclosed_on_its_step(self, sitting):
+        prior = 'RULED 2026-09-20: scope A'
+        fused = RecordingToolCaller({'get_task': {'id': '100', 'metadata': {payloads.X_RULING_KEY: prior}}})
+
+        exit_code, step = self._update_task_step(sitting, fused)
+
+        assert exit_code == 0
+        assert step == {'step': 'update_task', 'outcome': 'ok', 'supersedes': prior}
+
+    def test_a_superseded_structured_ruling_is_disclosed_as_its_json_text(self, sitting):
+        prior = {'esc_id': 'esc-100-0', 'action': 'resume', 'text': 'scope A', 'by': 'leo', 'at': '2026-09-20'}
+        fused = RecordingToolCaller({'get_task': {'id': '100', 'metadata': {payloads.X_RULING_KEY: prior}}})
+
+        exit_code, step = self._update_task_step(sitting, fused)
+
+        assert exit_code == 0
+        assert step['outcome'] == 'ok'
+        assert json.loads(step['supersedes']) == prior
+
+    def test_with_no_prior_ruling_the_step_names_nothing_superseded(self, sitting):
+        exit_code, step = self._update_task_step(sitting, _fused())
+
+        assert exit_code == 0
+        assert step == {'step': 'update_task', 'outcome': 'ok'}
+
+    def test_a_failed_update_discloses_nothing_superseded(self, sitting):
+        fused = RecordingToolCaller({'get_task': {'id': '100', 'metadata': {payloads.X_RULING_KEY: 'RULED: A'}}},
+                                    fail=frozenset({'update_task'}))
+
+        exit_code, step = self._update_task_step(sitting, fused)
+
+        assert exit_code == mod.EXIT_STEP_FAILED
+        assert step['outcome'] == 'failed'
+        assert 'supersedes' not in step
+
     def test_one_row_per_item_names_every_step(self, sitting):
         s = sitting
         alpha_n, beta_n = s.number(s.alpha.queue_dir, 'esc-100-1'), s.number(s.beta.queue_dir, 'esc-200-1')
