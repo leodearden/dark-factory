@@ -12,6 +12,8 @@ import json
 
 import pytest
 
+from orchestrator.recovery_emission import STREAK_CHARGING_SITES
+
 # ---------------------------------------------------------------------------
 # S3 — the pure payload primitives
 # ---------------------------------------------------------------------------
@@ -1335,13 +1337,15 @@ def _ref(esc_id: str):
     )
 
 
-def _row(esc_id: str, *, level: int = 1, members: tuple[str, ...] = ()):
+def _row(
+    esc_id: str, *, level: int = 1, members: tuple[str, ...] = (), task_id: str = '3535',
+):
     """A real queue ``Escalation`` — the shape the scheduler / deterministic
     recon sites pass, since they hold raw queue rows rather than refs."""
     from escalation.models import Escalation
 
     return Escalation(
-        id=esc_id, task_id='3535', agent_role='implementer', severity='blocking',
+        id=esc_id, task_id=task_id, agent_role='implementer', severity='blocking',
         category='risk_identified', summary='held', level=level,
         members=list(members),
     )
@@ -1624,3 +1628,86 @@ class TestPinBuckets:
 
         assert pins.human_parked is True
         assert sorted(pins.buckets['queue_handoff']) == ['esc-1', 'esc-2']
+
+    # -- task 7716: an L2 filed under ANOTHER task id holds this task's L1 --
+
+    def test_an_l1_an_l2_on_another_task_holds_is_human_parked(self):
+        """Only the filing gate moves: the outside L2 never enters this task's
+        buckets, so the payload and the veto signature stay byte-identical."""
+        from orchestrator.recovery_emission import LeaveReason, pin_buckets, veto_signature
+
+        outside = _row('esc-9-2', level=2, members=('esc-1',), task_id='9')
+        pins = pin_buckets(
+            '3535', [_row('esc-1')], store_unavailable=False, holder_candidates=[outside],
+        )
+        without = pin_buckets('3535', [_row('esc-1')], store_unavailable=False)
+
+        assert pins.human_parked is True
+        assert pins.buckets['queue_handoff'] == ['esc-1']
+        assert not [ids for ids in pins.buckets.values() if 'esc-9-2' in ids]
+        assert veto_signature(
+            LeaveReason.escalation_pinned, 's', pins.buckets,
+        ) == veto_signature(LeaveReason.escalation_pinned, 's', without.buckets)
+
+    def test_holder_candidates_never_park_an_unreadable_store(self):
+        from orchestrator.recovery_emission import pin_buckets
+
+        outside = _row('esc-9-2', level=2, members=('esc-1',), task_id='9')
+        pins = pin_buckets(
+            '3535', [_row('esc-1')], store_unavailable=True, holder_candidates=[outside],
+        )
+
+        assert pins.human_parked is False
+
+    def test_without_candidates_the_same_l1_is_not_human_parked(self):
+        from orchestrator.recovery_emission import pin_buckets
+
+        pins = pin_buckets('3535', [_row('esc-1')], store_unavailable=False)
+
+        assert pins.human_parked is False
+
+
+class TestPendingHolderCandidates:
+    """``pending_holder_candidates``: the pending queue, read only where a
+    ``human_parked`` answer gates a filing (task 7716)."""
+
+    @staticmethod
+    def _seeded_queue(tmp_path):
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_row('esc-9-2', level=2, members=('esc-1',), task_id='9'))
+        queue.submit(_row('esc-9-3', level=2, task_id='9'))
+        queue.resolve('esc-9-3', 'done')
+        return queue
+
+    @pytest.mark.parametrize('site', sorted(STREAK_CHARGING_SITES))
+    def test_a_streak_charging_site_reads_exactly_the_pending_records(self, tmp_path, site):
+        from orchestrator.recovery_emission import pending_holder_candidates
+
+        queue = self._seeded_queue(tmp_path)
+
+        assert [esc.id for esc in pending_holder_candidates(queue, site)] == ['esc-9-2']
+
+    @pytest.mark.parametrize('site', ['scheduler_blocked_redispatch', 'already_landed_gate'])
+    def test_a_per_tick_site_reads_nothing(self, tmp_path, site):
+        from orchestrator.recovery_emission import RecoverySite, pending_holder_candidates
+
+        queue = self._seeded_queue(tmp_path)
+
+        assert pending_holder_candidates(queue, RecoverySite(site)) == []
+
+    def test_no_queue_reads_nothing(self):
+        from orchestrator.recovery_emission import RecoverySite, pending_holder_candidates
+
+        assert pending_holder_candidates(None, RecoverySite.reconcile_sweep) == []
+
+    def test_a_failed_read_fails_open_to_no_candidates(self):
+        """Losing the cross-task suppression only means the alarm files."""
+        from orchestrator.recovery_emission import RecoverySite, pending_holder_candidates
+
+        class _UnreadableQueue:
+            def get_pending(self):
+                raise OSError('queue root unreadable')
+
+        assert pending_holder_candidates(_UnreadableQueue(), RecoverySite.reconcile_sweep) == []
