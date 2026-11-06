@@ -25,6 +25,7 @@ import pytest
 import pytest_asyncio
 from _escalation_queue_probe import probe_escalation_queue_io
 from _fm_helpers import LoopFreedomProbe
+from _swallowed_failure_log import swallowed_causes
 from escalation.queue import EscalationQueue
 from shared.project_layout import escalation_queue_dir
 
@@ -951,8 +952,9 @@ async def test_probe_defect_path_files_off_the_event_loop(store, tmp_path, monke
 
 @pytest.mark.asyncio
 async def test_ticket_failure_whose_id_cannot_be_minted_is_retried_next_tick(
-    store, tmp_path, monkeypatch,
+    store, tmp_path, monkeypatch, caplog,
 ):
+    caplog.set_level(logging.WARNING, logger='fused_memory.middleware.ticket_janitor')
     handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
     try:
         ticket_id = await store.submit(
@@ -970,6 +972,7 @@ async def test_ticket_failure_whose_id_cannot_be_minted_is_retried_next_tick(
             await janitor.tick()
 
         assert _escalation_categories(tmp_path) == []
+        assert swallowed_causes(caplog, 'failed to submit escalation for group') == [OSError]
         row = await store.get(ticket_id)
         assert row is not None
         assert row['escalated_at'] is None
@@ -985,7 +988,10 @@ async def test_ticket_failure_whose_id_cannot_be_minted_is_retried_next_tick(
 
 
 @pytest.mark.asyncio
-async def test_ticket_failure_whose_queue_cannot_be_opened_is_retried_next_tick(store, tmp_path):
+async def test_ticket_failure_whose_queue_cannot_be_opened_is_retried_next_tick(
+    store, tmp_path, caplog,
+):
+    caplog.set_level(logging.WARNING, logger='fused_memory.middleware.ticket_janitor')
     handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
     try:
         ticket_id = await store.submit(
@@ -999,6 +1005,7 @@ async def test_ticket_failure_whose_queue_cannot_be_opened_is_retried_next_tick(
 
         await janitor.tick()
 
+        assert swallowed_causes(caplog, 'failed to submit escalation for group') == [FileExistsError]
         row = await store.get(ticket_id)
         assert row is not None
         assert row['escalated_at'] is None
@@ -1010,6 +1017,42 @@ async def test_ticket_failure_whose_queue_cannot_be_opened_is_retried_next_tick(
         row = await store.get(ticket_id)
         assert row is not None
         assert row['escalated_at'] is not None
+    finally:
+        handle.close()
+
+
+@pytest.mark.asyncio
+async def test_infra_escalation_whose_queue_cannot_be_opened_names_its_cause_and_is_retried(
+    store, tmp_path, caplog,
+):
+    """Drives _submit_infra_escalation, the filer the dedup-outage path shares."""
+    caplog.set_level(logging.WARNING, logger='fused_memory.middleware.ticket_janitor')
+    handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+    try:
+        def _raising_liveness_probe(pid: str) -> bool:
+            raise RuntimeError('probe broken')
+
+        await store.submit(
+            project_id=_project_id_for(tmp_path),
+            candidate_json=_candidate_blob(title='stranded task'),
+        )
+        janitor = TicketJanitor(
+            store,
+            primary_project_root=str(tmp_path),
+            liveness_probe=_raising_liveness_probe,
+            probe_defect_threshold=1,
+        )
+        queue_dir_blocker = escalation_queue_dir(tmp_path)
+        queue_dir_blocker.write_text('a file where the queue directory belongs')
+
+        await janitor.tick()
+
+        assert swallowed_causes(caplog, 'failed to submit infra escalation') == [FileExistsError]
+
+        queue_dir_blocker.unlink()
+        await janitor.tick()
+
+        assert _escalation_categories(tmp_path) == ['infra_issue']
     finally:
         handle.close()
 

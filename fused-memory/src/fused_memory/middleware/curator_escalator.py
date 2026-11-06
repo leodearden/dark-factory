@@ -972,6 +972,9 @@ class CuratorEscalator:
         ``tests/test_curator_escalator.py::TestZeroOutputTimeoutEscalation``
         pins it in
         ``test_concurrent_batch_bisect_files_one_record_and_hands_every_sibling_its_id``.
+        The stamp is taken once the filing returns, so the window counts from
+        the end of the attempt and siblings queued behind a filing slower than
+        the window still get its id.
         """
         detail = _zot_detail(
             project_id=project_id,
@@ -985,15 +988,15 @@ class CuratorEscalator:
             tools_used=tools_used,
         )
         async with self._zot_window_lock:
-            now_mono = time.monotonic()
+            arrived_at = time.monotonic()
             last = self._zot_last_submitted.get(project_id)
-            if last is not None and (now_mono - last[0]) < _ZOT_DEDUP_WINDOW_SECS:
+            if last is not None and (arrived_at - last[0]) < _ZOT_DEDUP_WINDOW_SECS:
                 logger.info(
                     'curator_escalator: deduplicating ZOT escalation for project %s '
                     '(last submitted %.1fs ago < dedup window %.0fs); '
                     'candidate_title=%r',
                     project_id,
-                    now_mono - last[0],
+                    arrived_at - last[0],
                     _ZOT_DEDUP_WINDOW_SECS,
                     candidate_title,
                 )
@@ -1006,5 +1009,5 @@ class CuratorEscalator:
                 account_name=account_name,
                 duration_ms=duration_ms,
             )
-            self._zot_last_submitted[project_id] = (now_mono, escalation_id)
+            self._zot_last_submitted[project_id] = (time.monotonic(), escalation_id)
             return escalation_id

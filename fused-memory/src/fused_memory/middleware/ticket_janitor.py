@@ -338,7 +338,7 @@ class TicketJanitor:
                 detail=detail,
             )
         except Exception:
-            logger.warning(
+            logger.exception(
                 'ticket_janitor: failed to submit infra escalation for %s; '
                 'will retry next tick: %s', pid, summary,
             )

@@ -19,11 +19,14 @@ import fcntl
 import json
 import logging
 import threading
+import time
+from types import SimpleNamespace
 from typing import IO, Any, Literal, overload
 
 import pytest
 from _escalation_queue_probe import probe_escalation_queue_io
 from _fm_helpers import LOOP_FREEDOM_CEILING_SECONDS, LoopFreedomProbe
+from _swallowed_failure_log import swallowed_causes
 from escalation.queue import EscalationQueue
 from shared.project_layout import escalation_queue_dir
 
@@ -477,6 +480,38 @@ class TestZeroOutputTimeoutEscalation:
         assert record['dedupe_count'] == 0
         assert ids == [record['id']] * n
 
+    @pytest.mark.asyncio
+    async def test_siblings_queued_behind_a_filing_slower_than_the_window_still_get_its_id(
+        self, tmp_path, monkeypatch,
+    ):
+        """The window counts from the end of the filing attempt, not from its start."""
+        clock = _SteppedClock()
+        monkeypatch.setattr(
+            curator_escalator, 'time', SimpleNamespace(time=time.time, monotonic=clock),
+        )
+        real_filing = curator_escalator._file_zot_escalation
+
+        def _filing_slower_than_the_window(*args, **kwargs):
+            clock.advance(curator_escalator._ZOT_DEDUP_WINDOW_SECS + 1)
+            return real_filing(*args, **kwargs)
+
+        monkeypatch.setattr(
+            curator_escalator, '_file_zot_escalation', _filing_slower_than_the_window,
+        )
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            escalator = CuratorEscalator()
+
+            ids = await asyncio.gather(
+                *(escalator.report_failure(**_zot_report(tmp_path)) for _ in range(3)),
+            )
+
+            [record] = _pending_records(tmp_path)
+            assert record['dedupe_count'] == 0
+            assert ids == [record['id']] * 3
+        finally:
+            handle.close()
+
     # Recurrence folding, per Leo's 2026-08-27 ACCEPT-AND-RETUNE ruling on
     # esc-task-curator-17. A SEPARATE CuratorEscalator per report stands in for
     # "hours apart / across a restart" without touching the 60s in-process
@@ -813,6 +848,19 @@ class TestReportZotDuplicate:
 
 
 _PINNED_ZOT_ROOT_CAUSE = 'curator-empty-output-pre-turn-hang'
+
+
+class _SteppedClock:
+    """A monotonic clock that moves only when a test advances it."""
+
+    def __init__(self) -> None:
+        self._now = 0.0
+
+    def __call__(self) -> float:
+        return self._now
+
+    def advance(self, seconds: float) -> None:
+        self._now += seconds
 
 
 def _zot_report(root, project_id: str = 'proj-fold') -> dict[str, Any]:
@@ -1213,8 +1261,9 @@ class TestQueueFilingRunsOffTheEventLoop:
     @pytest.mark.asyncio
     @pytest.mark.parametrize(('method_name', 'kwargs'), _EVERY_ROUTE)
     async def test_every_route_swallows_a_queue_that_cannot_mint_an_id(
-        self, tmp_path, monkeypatch, method_name: str, kwargs: dict[str, Any],
+        self, tmp_path, monkeypatch, caplog, method_name: str, kwargs: dict[str, Any],
     ):
+        caplog.set_level(logging.WARNING, logger='fused_memory.middleware.curator_escalator')
         handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
         try:
             def _unmintable(self, key):
@@ -1227,21 +1276,25 @@ class TestQueueFilingRunsOffTheEventLoop:
             )
 
             assert _pending_records(tmp_path) == []
+            assert swallowed_causes(caplog, 'failed to submit', 'proj-x') == [OSError]
         finally:
             handle.close()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(('method_name', 'kwargs'), _EVERY_ROUTE)
     async def test_every_route_swallows_a_queue_that_cannot_be_opened(
-        self, tmp_path, method_name: str, kwargs: dict[str, Any],
+        self, tmp_path, caplog, method_name: str, kwargs: dict[str, Any],
     ):
+        caplog.set_level(logging.WARNING, logger='fused_memory.middleware.curator_escalator')
         handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
         try:
             escalation_queue_dir(tmp_path).write_text('a file where the queue directory belongs')
 
-            assert await getattr(CuratorEscalator(), method_name)(
+            await getattr(CuratorEscalator(), method_name)(
                 project_root=str(tmp_path), project_id='proj-x', **kwargs,
-            ) is None
+            )
+
+            assert swallowed_causes(caplog, 'failed to submit', 'proj-x') == [FileExistsError]
         finally:
             handle.close()
 
