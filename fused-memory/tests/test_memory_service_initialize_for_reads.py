@@ -13,7 +13,9 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
+from _fm_helpers import MockEdge
 
+from fused_memory.models.scope import Scope
 from fused_memory.services.memory_service import MemoryService
 from fused_memory.services.planned_episode_registry import PlannedEpisodeRegistry
 
@@ -76,6 +78,30 @@ async def test_a_populated_queue_dir_gains_no_queue_or_sidecar(svc, mock_config)
     assert await registry.get_planned_uuids('proj') == {'ep-1'}
     with pytest.raises(sqlite3.OperationalError):
         await registry.register('ep-2', 'proj')
+
+
+@pytest.mark.asyncio
+async def test_search_and_count_run_on_the_read_open(svc, mock_config):
+    await _seed_planned_registry(Path(mock_config.queue.data_dir))
+    svc.graphiti.search = AsyncMock(return_value=[
+        MockEdge(fact='seen only in a plan', uuid='edge-planned', episodes=['ep-1']),
+        MockEdge(fact='seen in an observation', uuid='edge-observed', episodes=['ep-2']),
+    ])
+    svc.mem0.search = AsyncMock(return_value={'results': [
+        {'id': 'mem-1', 'memory': 'a mem0 fact', 'score': 0.9, 'metadata': {}},
+    ]})
+    svc.mem0.count_by_metadata = AsyncMock(return_value=3)
+
+    await svc.initialize_for_reads()
+    results = await svc.search('fact', project_id='proj', stores=['graphiti', 'mem0'])
+    count = await svc.count_memories_by_metadata('proj', {'category': 'procedural_knowledge'})
+
+    assert not results.degraded, results.failure_diagnostics
+    assert sorted(r.id for r in results) == ['edge-observed', 'mem-1']
+    assert count == 3
+    svc.mem0.count_by_metadata.assert_awaited_once_with(
+        Scope(project_id='proj'), {'category': 'procedural_knowledge'},
+    )
 
 
 @pytest.mark.asyncio

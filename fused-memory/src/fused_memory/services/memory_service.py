@@ -2677,7 +2677,7 @@ class MemoryService:
         Runs no Graphiti startup maintenance, starts no durable write queue and
         opens the planned registry read-only, unless one is already wired, which
         it keeps as initialize() does. It does NOT make the service
-        write-proof: mem0 writes would still reach Qdrant, hence not "read_only".
+        write-proof: mem0 writes would still reach Qdrant.
         """
         await self.graphiti.initialize(skip_maintenance=True)
 
