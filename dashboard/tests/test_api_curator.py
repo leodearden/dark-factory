@@ -79,28 +79,22 @@ def _override_client(config):
         yield c
 
 
-def test_override_client_lifespan_starts_only_the_reaper(tmp_path: Path):
-    started: list[str] = []
+# ---------------------------------------------------------------------------
+# harness: this module's lifespans run with samplers off (task 6292)
+# ---------------------------------------------------------------------------
 
-    def _recording(name: str):
-        def _start(*args, **kwargs):
-            started.append(name)
-            return asyncio.sleep(0)
 
-        return _start
+def test_this_modules_lifespans_run_with_samplers_off():
+    """The lifespan gates its samplers on the config it builds from env.
 
-    with (
-        patch('dashboard.app._burndown_loop', new=_recording('_burndown_loop')),
-        patch('dashboard.app._metrics_loop', new=_recording('_metrics_loop')),
-        patch('dashboard.app.reaper_loop', new=_recording('reaper_loop')),
-        _override_client(_make_config(tmp_path)) as c,
-    ):
-        assert c.get('/api/health').status_code == 200
+    That gate is pinned in dashboard/tests/test_lifespan_samplers.py, so this
+    module needs only to prove that the env switch is off for its own tests.
+    """
+    from dashboard.config import DashboardConfig
 
-    assert started == ['reaper_loop'], (
-        'reaper_loop proves the lifespan ran under these patches; any sampler '
-        "name means this module's own TestClient starts the samplers, which "
-        'dial dashboard.data.metrics.mcp_tool_call (via _sample_curator -> '
+    assert DashboardConfig.from_env().samplers_enabled is False, (
+        "this module's pytestmark must request samplers_off: the metrics sampler "
+        'dials dashboard.data.metrics.mcp_tool_call (via _sample_curator -> '
         'fan_out_list_tickets), the same seam these tests patch'
     )
 
