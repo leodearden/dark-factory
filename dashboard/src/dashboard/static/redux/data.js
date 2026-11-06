@@ -77,6 +77,7 @@ function endpointsFor(win) {
     '/api/v2/dashboard/escalations':                  { 'ESCALATIONS': PLAIN },
     '/api/v2/dashboard/escalation-analytics':         { 'ESCALATION_ANALYTICS': PLAIN },
     '/api/v2/dashboard/memory-evals':                 { 'MEMORY_EVALS': PLAIN },
+    '/api/v2/dashboard/prds':                         { 'PRD_VIEW': PLAIN, 'PRD_CONTENTION': PLAIN },
   };
 }
 
@@ -181,6 +182,12 @@ window.DF_DATA = {
   //   Rows carry no description/details: the Task Detail pane fetches those
   //   for the selected task only, via ON_DEMAND_KEYS.taskProse.
   TASKS_SNAPSHOT: {},
+  // PRD_VIEW, PRD_CONTENTION: {project: Datum} each, the /prds body's per-PRD
+  //   view and contention line. Seeded EMPTY and stamped with the /prds
+  //   receipt by prd_lanes_view.js's readers, as TASKS_SNAPSHOT is by
+  //   task_snapshot.js.
+  PRD_VIEW: {},
+  PRD_CONTENTION: {},
   // INVARIANTS: one claimant-invariant record per known root (E-1). Seeded
   //   EMPTY so a project with no record renders no chip: unknown is not clean.
   INVARIANTS: [],
