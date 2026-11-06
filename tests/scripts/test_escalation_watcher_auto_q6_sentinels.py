@@ -113,7 +113,7 @@ def test_renaming_a_sentinel_cell_changes_the_extraction_but_rewording_the_rule_
     assert _span_sentinels(reworded, source='synthetic') == ['__a__', '__b__']
 
     renamed = _SYNTHETIC_SPAN.replace('`__a__`', '`__a2__`')
-    assert _span_sentinels(renamed, source='synthetic') != ['__a__', '__b__']
+    assert _span_sentinels(renamed, source='synthetic') == ['__a2__', '__b__']
 
 
 def test_a_span_with_no_sentinel_rows_fails_loudly() -> None:
@@ -123,5 +123,5 @@ def test_a_span_with_no_sentinel_rows_fails_loudly() -> None:
         '|---|---|---|\n'
         '<!-- q6-detector-sentinels:end -->\n'
     )
-    with pytest.raises(AssertionError):
+    with pytest.raises(AssertionError, match='at least one sentinel row'):
         _span_sentinels(header_only, source='synthetic')
