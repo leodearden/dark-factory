@@ -508,6 +508,8 @@ def _audit_target(row: ledgers.EchoRow, decisions_root: Path) -> _AuditTarget | 
                 'audited_at': record.audit_outcome.audited_at}
     queue_dir = normalize_escalations_dir(record.escalations_dir)
     close = audits.executor_close_of(record, {queue_dir: index_queue(queue_dir)})
+    if isinstance(close, audits.AgedOut):
+        return {'code': 'escalation_aged_out', 'escalation_id': close.escalation_id, 'queue_dir': close.queue_dir}
     if not isinstance(close, audits.ExecutorClose):
         reason = close.reason if close is not None else 'its escalation was not closed by the executor under a class'
         return {'code': 'not_an_executor_close', 'reason': reason}
@@ -535,8 +537,7 @@ def _audit_one(target: _AuditTarget, decisions_root: Path) -> dict[str, Any]:
                 'class_state_after': base['class_state_before']}
     after = before
     if verdict == AuditVerdict.WRONG and before is not None:
-        index = {close.queue_dir: index_queue(close.queue_dir)}
-        audited, wrong = audits.class_tally(decisions_root, index, close.queue_dir, close.policy_class)
+        audited, wrong = audits.class_tally(decisions_root, close.queue_dir, close.policy_class)
         target_state = audit_escape_target(before, audited, wrong)
         if target_state is not None:
             policy_state.set_class_state(queue, close.policy_class, target_state)

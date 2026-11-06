@@ -713,7 +713,7 @@ class TestExecutorAuditDraw:
 
     def test_an_unreadable_executor_escalation_degrades_the_section_and_is_printed(self, env, capsys):
         _twelve_executor_closes(env)
-        broken = _executor_close(env, 30)
+        broken = _executor_close(env, 30, closed_at=_hours_before_now(3))
         path = env.queue / 'archive' / '2026-09-25' / f'{broken.escalation_id}.json'
         path.write_text('{not json')
 

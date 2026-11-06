@@ -283,7 +283,7 @@ def _previous_numbering(path: Path | None) -> tuple[ledgers.Ledger | None, Short
 
 
 def _no_draw(seed: str) -> AuditDraw:
-    return AuditDraw('no_executor_close', (), (), seed, 0)
+    return AuditDraw(state='no_executor_close', full=(), sampled=(), seed=seed, population=0, aged_out=0)
 
 
 def _audit_draw(
@@ -296,7 +296,8 @@ def _audit_draw(
         return Measurement(_no_draw(seed), now.isoformat(), str(registry), 'source_missing', (missing,))
     week = Window.trailing(now, days=audits.AUDIT_WINDOW_DAYS)
     closes = audits.executor_closes(decisions_root, escalation_index, week)
-    drawn = audits.draw(closes.in_window, seed=seed, lifetime_by_class=closes.lifetime_by_class)
+    drawn = audits.draw(closes.in_window, seed=seed, audited_by_class=closes.audited_by_class,
+                        aged_out=closes.aged_out)
     return Measurement(drawn, now.isoformat(), str(registry), 'ok', closes.shortfalls)
 
 
