@@ -68,6 +68,8 @@ from fused_memory.middleware.curator_zot_duplicate_sweep import (
 from fused_memory.services.orchestrator_detector import is_orchestrator_lock_held
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from escalation.models import Escalation  # type: ignore[import-untyped]
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
 
@@ -286,6 +288,8 @@ class CuratorEscalator:
         self,
         cooldown_secs: float = _DEFAULT_COOLDOWN_SECS,
         state_path: str | Path | None = None,
+        *,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._cooldown_secs = cooldown_secs
         self._state_path: Path | None = Path(state_path) if state_path is not None else None
@@ -303,6 +307,7 @@ class CuratorEscalator:
         # for a single outage event, and hands every sibling the same id.
         # Stays monotonic — in-process dedup, intentionally reset on restart.
         self._zot_last_submitted: dict[str, tuple[float, str | None]] = {}
+        self._monotonic = monotonic
         # Serialise concurrent _persist_state calls so only one write is ever
         # in flight.  Mirrors the asyncio.Lock instances held by TaskInterceptor
         # (task_interceptor.py:288-289,1308,1332) for per-project mutations.
@@ -988,7 +993,7 @@ class CuratorEscalator:
             tools_used=tools_used,
         )
         async with self._zot_window_lock:
-            arrived_at = time.monotonic()
+            arrived_at = self._monotonic()
             last = self._zot_last_submitted.get(project_id)
             if last is not None and (arrived_at - last[0]) < _ZOT_DEDUP_WINDOW_SECS:
                 logger.info(
@@ -1009,5 +1014,5 @@ class CuratorEscalator:
                 account_name=account_name,
                 duration_ms=duration_ms,
             )
-            self._zot_last_submitted[project_id] = (time.monotonic(), escalation_id)
+            self._zot_last_submitted[project_id] = (self._monotonic(), escalation_id)
             return escalation_id
