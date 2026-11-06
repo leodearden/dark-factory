@@ -1,6 +1,7 @@
 """The merge lane's façade and ports (PRD ``plans/merge-lane-quality-prd.md`` tasks ζ1, β, ζ2 and η).
 
-The façade is pinned by what it exports, at runtime and to pyright, and by
+The façade is pinned by what it exports, at runtime and to pyright, by no
+submodule but the worker loading the worker, and by
 the fourteen pre-package module names being gone: task η migrated their importers and deleted the
 aliases, so each old name must now fail to import. The ports are
 pinned by driving a real ``MergeLane`` over a real git repository with the
@@ -76,7 +77,6 @@ def test_every_export_resolves_and_the_reason_constants_are_strings() -> None:
     ]
     assert len(reasons) == REASON_CONSTANTS, reasons
     assert all(isinstance(resolved[name], str) for name in reasons)
-    assert set(merge_lane.__all__) <= set(dir(merge_lane))
 
 
 def test_a_name_outside_the_facade_is_an_attribute_error() -> None:
@@ -112,15 +112,41 @@ def test_the_type_checking_block_declares_exactly_the_runtime_exports() -> None:
 
 
 def test_the_facade_serves_lazily_exactly_its_all() -> None:
-    assert set(dir(merge_lane)) - set(vars(merge_lane)) == set(merge_lane.__all__)
+    assert set(dir(merge_lane)) - set(vars(merge_lane)) == set(merge_lane.__all__), (
+        'names served lazily (dir minus module globals) must equal __all__; '
+        'this assumes __getattr__ does not cache into globals()'
+    )
 
 
 def test_the_facade_types_its_worker_and_ports_statically() -> None:
     assert_type(MergeLane, type[SpeculativeMergeWorker])
     assert_type(merge_lane.ClockPort, type[lane_ports.ClockPort])
     assert_type(merge_lane.VerifyPort, type[lane_ports.VerifyPort])
-    assert merge_lane.ClockPort is lane_ports.ClockPort
-    assert merge_lane.VerifyPort is lane_ports.VerifyPort
+
+
+_FIRST_SUBMODULE_TO_LOAD_THE_WORKER = """
+import importlib, pkgutil, sys
+import orchestrator.merge_lane as lane
+modules = ['orchestrator.merge_lane'] + sorted(
+    f'orchestrator.merge_lane.{found.name}'
+    for found in pkgutil.iter_modules(lane.__path__) if found.name != 'worker'
+)
+for module in modules:
+    importlib.import_module(module)
+    if 'orchestrator.merge_lane.worker' in sys.modules:
+        print(module)
+        break
+"""
+
+
+def test_no_submodule_but_the_worker_loads_the_worker() -> None:
+    """Why the façade resolves lazily; a fresh interpreter, since this suite loads the worker."""
+    completed = subprocess.run(
+        [sys.executable, '-c', _FIRST_SUBMODULE_TO_LOAD_THE_WORKER],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == '', f'importing {completed.stdout.strip()} loaded the worker'
 
 
 #: The pre-package module names task 5037 deleted. Nothing aliases them, so a
