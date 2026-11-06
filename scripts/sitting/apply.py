@@ -13,6 +13,11 @@ whole batch. Each item then runs the skill's order (stamp the markers,
 DecisionRecord, write two memories), and a failed step skips the rest of that
 item only.
 
+``audit`` records the sitting's ``ok`` / ``wrong`` verdict on each drawn
+executor close (``sitting.audits``). A ``wrong`` re-counts the class's audits on
+that queue from the registry and, under ``authority.audit_escape_target``,
+moves the class to shadow in the queue's policy-table state.
+
 Exit codes: 0 applied; 1 a step failed after pre-flight; 2 a configuration or
 validation error, nothing written; 3 ask back, a token did not resolve and
 nothing was applied; 4 refused, either at pre-flight (nothing written, the
@@ -40,13 +45,26 @@ for _path in (_REPO_ROOT / 'orchestrator' / 'src', _REPO_ROOT / 'scripts'):
         sys.path.insert(0, str(_path))
 
 from dashboard.config import DEFAULT_FUSED_MEMORY_URLS  # noqa: E402
-from escalation.authority import COORDINATOR_IDENTITY, coordinator_denied  # noqa: E402
+from escalation.authority import (  # noqa: E402
+    COORDINATOR_IDENTITY,
+    audit_escape_target,
+    coordinator_denied,
+)
 from escalation.models import Escalation  # noqa: E402
-from orchestrator.session_registry import DecisionState, fleet_root  # noqa: E402
+from orchestrator.session_registry import (  # noqa: E402
+    AuditVerdict,
+    DecisionAuditRefused,
+    DecisionRecord,
+    DecisionState,
+    decision_path_for_id,
+    fleet_root,
+    normalize_escalations_dir,
+    record_audit_outcome,
+)
 from shared.mcp_session import McpCallError, SyncMcpSession  # noqa: E402
-from sitting import brief, payloads, ports  # noqa: E402
+from sitting import audits, brief, payloads, ports  # noqa: E402
 from sitting import ledger as ledgers  # noqa: E402
-from sitting.inventory import key_str, parse_key  # noqa: E402
+from sitting.inventory import AUDIT_KIND, index_queue, key_str, parse_key  # noqa: E402
 from sitting.payloads import AgreedMarker, ApplyPayload, PreparedMarker, Ruling  # noqa: E402
 from sitting.ports import PortUnknown, QueuePort  # noqa: E402
 from sitting.preparation import (  # noqa: E402
@@ -59,10 +77,13 @@ from sitting.prepare_sitting import (  # noqa: E402
     AnswerTurn,
     Sources,
     answer_turn,
+    clock_arguments,
     parse_answer_token,
     sources_from_args,
     stores_arguments,
 )
+
+from escalation import policy_state  # noqa: E402
 
 EXIT_OK, EXIT_STEP_FAILED, EXIT_CONFIG, EXIT_ASK_BACK, EXIT_REFUSED = 0, 1, 2, 3, 4
 
@@ -414,6 +435,107 @@ def _rationale(prep: Preparation | None, row: ledgers.EchoRow) -> str:
     return '; '.join(parts) or 'Leo answered at the sitting without a note'
 
 
+@dataclass(frozen=True)
+class _AuditTarget:
+    row: ledgers.EchoRow
+    record: DecisionRecord
+    close: audits.ExecutorClose
+
+
+def run_audit(
+    ledger_path: Path, answers: Sequence[ledgers.Answer], *, decisions_root: Path,
+) -> ApplyReport:
+    """Record each ``audit N=ok|wrong[:note]`` verdict; a ``wrong`` may flip its class to shadow on its queue.
+
+    The ledger is read, never saved: an audited close leaves the next draw
+    because its DecisionRecord now carries an outcome.
+    """
+    loaded = ledgers.load(ledger_path)
+    if loaded is None:
+        return ApplyReport(EXIT_CONFIG, messages=(f'no sitting at {ledger_path}',))
+    options = {key: audits.AUDIT_OPTIONS for key, entry in loaded.entries.items()
+               if parse_key(key)[0] == AUDIT_KIND and entry.state == 'open'}
+    _, resolved = ledgers.resolve_answers(loaded, answers, options)
+    if resolved.unresolved:
+        return ApplyReport(EXIT_ASK_BACK, echo=ledgers.render_echo_table(resolved))
+    numbers = [row.number for row in resolved.rows]
+    repeated = sorted({n for n in numbers if numbers.count(n) > 1})
+    if repeated:
+        return ApplyReport(EXIT_CONFIG, messages=tuple(f'audit {n} is answered more than once' for n in repeated))
+    targets, refusals = _audit_preflight(resolved.rows, decisions_root)
+    if refusals:
+        return ApplyReport(EXIT_REFUSED, rows=tuple(refusals), messages=(
+            f'nothing audited: {len(refusals)} item(s) refused at pre-flight',))
+    try:
+        for queue_dir in {target.close.queue_dir for target in targets}:
+            policy_state.load_class_states(Path(queue_dir))
+    except policy_state.PolicyStateUnreadable as exc:
+        return ApplyReport(EXIT_CONFIG, messages=(f'nothing audited: {exc}',))
+    rows = tuple(_audit_one(target, decisions_root) for target in targets)
+    failed = any(row['outcome'] != 'ok' for row in rows)
+    return ApplyReport(EXIT_STEP_FAILED if failed else EXIT_OK, rows=rows,
+                       echo=ledgers.render_echo_table(resolved))
+
+
+def _audit_preflight(
+    rows: Sequence[ledgers.EchoRow], decisions_root: Path,
+) -> tuple[list[_AuditTarget], list[dict[str, Any]]]:
+    targets: list[_AuditTarget] = []
+    refusals: list[dict[str, Any]] = []
+    for row in rows:
+        target = _audit_target(row, decisions_root)
+        if isinstance(target, _AuditTarget):
+            targets.append(target)
+        else:
+            refusals.append({'number': row.number, 'decision_id': row.record_id, 'refusal': target})
+    return targets, refusals
+
+
+def _audit_target(row: ledgers.EchoRow, decisions_root: Path) -> _AuditTarget | dict[str, Any]:
+    try:
+        record = DecisionRecord.from_json(decision_path_for_id(row.record_id, root=decisions_root).read_text())
+    except (OSError, KeyError, TypeError, ValueError) as exc:
+        return {'code': 'decision_unreadable', 'reason': f'{type(exc).__name__}: {exc}'}
+    if record.audit_outcome is not None:
+        return {'code': 'already_audited', 'verdict': str(record.audit_outcome.verdict),
+                'audited_at': record.audit_outcome.audited_at}
+    queue_dir = normalize_escalations_dir(record.escalations_dir)
+    close = audits.executor_close_of(record, {queue_dir: index_queue(queue_dir)})
+    if not isinstance(close, audits.ExecutorClose):
+        reason = close.reason if close is not None else 'its escalation was not closed by the executor under a class'
+        return {'code': 'not_an_executor_close', 'reason': reason}
+    return _AuditTarget(row, record, close)
+
+
+def _audit_one(target: _AuditTarget, decisions_root: Path) -> dict[str, Any]:
+    close, row = target.close, target.row
+    queue = Path(close.queue_dir)
+    verdict = AuditVerdict(row.option_label)
+    before = policy_state.load_class_states(queue).get(close.policy_class)
+    base = {'number': row.number, 'decision_id': close.decision_id, 'escalation_id': close.escalation_id,
+            'policy_class': close.policy_class, 'queue_dir': close.queue_dir, 'verdict': str(verdict),
+            'class_state_before': None if before is None else str(before)}
+    try:
+        written = record_audit_outcome(
+            close.decision_id, verdict, row.note, root=decisions_root, expected_project=target.record.project,
+            expected_escalations_dir=target.record.escalations_dir, audited_at=row.answered_at,
+        )
+    except DecisionAuditRefused as exc:
+        return {**base, 'outcome': 'failed', 'detail': str(exc), 'class_state_after': base['class_state_before']}
+    if written is None:
+        return {**base, 'outcome': 'failed', 'detail': 'the decision registry did not take the write',
+                'class_state_after': base['class_state_before']}
+    after = before
+    if verdict == AuditVerdict.WRONG and before is not None:
+        index = {close.queue_dir: index_queue(close.queue_dir)}
+        audited, wrong = audits.class_tally(decisions_root, index, close.queue_dir, close.policy_class)
+        target_state = audit_escape_target(before, audited, wrong)
+        if target_state is not None:
+            policy_state.set_class_state(queue, close.policy_class, target_state)
+            after = target_state
+    return {**base, 'outcome': 'ok', 'class_state_after': None if after is None else str(after)}
+
+
 def parse_action_token(token: str) -> tuple[str, str]:
     """One ``N=ACTION`` token as ``(item number text, action)``; anything else is a ValueError."""
     ref, has_action, action = token.partition('=')
@@ -470,6 +592,14 @@ def _cmd_apply(args: argparse.Namespace) -> int:
     return report.exit_code
 
 
+def _cmd_audit(args: argparse.Namespace) -> int:
+    now = args.now or datetime.now(UTC)
+    answers = [parse_answer_token(token, args.source, now.isoformat()) for token in args.answer]
+    report = run_audit(args.ledger, answers, decisions_root=fleet_root(args.decisions_root))
+    _print_report(report)
+    return report.exit_code
+
+
 def _print_report(report: ApplyReport) -> None:
     print(report.echo, end='')
     for row in report.rows:
@@ -488,6 +618,13 @@ def _parser() -> argparse.ArgumentParser:
                            help=f"repeatable 'N=ACTION' per escalation item; ACTION one of {list(CLOSING_ACTIONS)}")
     apply_cmd.add_argument('--source', choices=sorted(ledgers.ANSWER_SOURCES), default='terminal')
     apply_cmd.set_defaults(handler=_cmd_apply)
+
+    audit_cmd = commands.add_parser('audit', parents=[clock_arguments()], help='record verdicts on drawn audits')
+    audit_cmd.add_argument('--ledger', type=Path, required=True, help='the ledger that numbered the audits')
+    audit_cmd.add_argument('--answer', action='append', required=True, help="repeatable 'N=ok|wrong[:note]' token")
+    audit_cmd.add_argument('--decisions-root', type=Path, help='fleet root holding decisions/ (default: fleet_root())')
+    audit_cmd.add_argument('--source', choices=sorted(ledgers.ANSWER_SOURCES), default='terminal')
+    audit_cmd.set_defaults(handler=_cmd_audit)
     return parser
 
 
