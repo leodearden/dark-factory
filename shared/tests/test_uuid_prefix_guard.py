@@ -601,6 +601,7 @@ def detection_fact(**overrides: Any) -> dict[str, Any]:
         'namespace': 'mem0',
         'agent_id': AGENT,
         'project': PROJECT,
+        'reason': None,
     }
     fact.update(overrides)
     return fact
@@ -1332,7 +1333,7 @@ class TestB12ResolverUnavailable:
         """"The resolver is down" is not actionable; "mem0 is down" is."""
         h = outage_harness()
         result = await h.call('add_memory', dict(self.CALL))
-        assert repair_of(result) == {'resolver': 'unavailable', 'store': OUTAGE}
+        assert repair_of(result) == {'resolver': 'unavailable', 'store': OUTAGE, 'reason': 'unreachable'}
 
     async def test_one_fact_with_outcome_resolver_unavailable(self) -> None:
         """No candidates were ever enumerated, so the record says so."""
@@ -1343,6 +1344,7 @@ class TestB12ResolverUnavailable:
                 outcome='resolver_unavailable',
                 candidate_ids=[],
                 namespace=None,
+                reason='unreachable',
             )
         ]
 
@@ -1356,6 +1358,7 @@ class TestB12ResolverUnavailable:
             'threshold': 3,
             'window_seconds': 3600.0,
             'outcome': 'resolver_unavailable',
+            'reason': 'unreachable',
             'project': PROJECT,
         }
 
@@ -1406,12 +1409,57 @@ class TestAnOutageAbandonsAnAlreadyResolvedExpansion:
         """No `substitutions` key claiming an expansion that was abandoned."""
         h = self.harness()
         result = await h.call('add_memory', dict(self.CALL))
-        assert repair_of(result) == {'resolver': 'unavailable', 'store': OUTAGE}
+        assert repair_of(result) == {'resolver': 'unavailable', 'store': OUTAGE, 'reason': 'unreachable'}
 
     async def test_no_expanded_fact_is_emitted_for_the_abandoned_token(self) -> None:
         h = self.harness()
         await h.call('add_memory', dict(self.CALL))
         assert [f['outcome'] for f in h.facts] == ['resolver_unavailable']
+
+
+class TestTheOutageReason:
+    """WHY there was no resolution rides on meta, on the fact and in the storm key.
+
+    The guard's action is the same whatever the reason — it forwards unchanged
+    — so the reason qualifies the outcome rather than being a fifth one. What
+    it buys is that a slow resolver and an unreachable one fire separate alarms.
+    """
+
+    CALL = {'content': f'see {BFF}', 'project_id': PROJECT, 'agent_id': AGENT}
+
+    @pytest.mark.parametrize('reason', list(guard.UnavailableReason))
+    async def test_each_reason_reaches_meta_and_the_fact(self, reason: guard.UnavailableReason) -> None:
+        h = build_harness(raises={BFF: guard.ResolverUnavailable(OUTAGE, reason=reason)}, project_for=project_of)
+        result = await h.call('add_memory', dict(self.CALL))
+        assert repair_of(result) == {'resolver': 'unavailable', 'store': OUTAGE, 'reason': reason}
+        assert [fact['reason'] for fact in h.facts] == [reason]
+
+    def timed_out_harness(self) -> Harness:
+        return build_harness(
+            raises={
+                BFF: guard.ResolverUnavailable(OUTAGE, reason=guard.UnavailableReason.TIMED_OUT),
+                AMB: guard.ResolverUnavailable(OUTAGE),
+            },
+            project_for=project_of,
+            time_provider=_Clock(),
+        )
+
+    async def test_timeouts_and_refusals_are_separate_storm_buckets(self) -> None:
+        h = self.timed_out_harness()
+        results = []
+        for _ in range(2):
+            results.append(await h.call('add_memory', dict(self.CALL)))
+            results.append(await h.call('add_memory', {'content': f'see {AMB}', 'project_id': PROJECT}))
+        assert all('storm' not in (repair_of(r) or {}) for r in results)
+        assert h.escalations == []
+
+    async def test_a_burst_of_timeouts_fires_its_own_storm(self) -> None:
+        h = self.timed_out_harness()
+        for _ in range(3):
+            result = await h.call('add_memory', dict(self.CALL))
+        storm = (repair_of(result) or {})['storm']
+        for record in (storm, h.escalations[0]):
+            assert (record['outcome'], record['reason']) == ('resolver_unavailable', 'timed_out')
 
 
 class TestAResolverBugIsNotAnOutage:
@@ -2202,7 +2250,7 @@ class TestTheDistinctTokensResolveConcurrently:
         h = build_harness(resolver=resolver)
         result = await h.call('add_memory', prose([first, second]))
         assert h.resolver.prefixes == [second, first], 'the second answered first'
-        assert repair_of(result) == {'resolver': 'unavailable', 'store': 'mem0'}
+        assert repair_of(result) == {'resolver': 'unavailable', 'store': 'mem0', 'reason': 'unreachable'}
         assert [fact['token'] for fact in h.facts] == [first]
 
 
@@ -2393,4 +2441,4 @@ class TestTheApplyPhaseIsOneDoorCallPerGuardedCall:
         )
         assert door.calls == 0
         assert h.recorder.args['content'] == submitted
-        assert repair_of(result) == {'resolver': 'unavailable', 'store': OUTAGE}
+        assert repair_of(result) == {'resolver': 'unavailable', 'store': OUTAGE, 'reason': 'unreachable'}
