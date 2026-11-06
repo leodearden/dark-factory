@@ -293,6 +293,17 @@ class TestDecisionProject:
             mod.OpenItem(key=mod.escalation_key('/q', 'esc-1-1'), escalation_id='esc-1-1', decision_project='reify')
 
 
+class TestStoreTaskId:
+    @pytest.mark.parametrize(
+        ('task_id', 'expected'),
+        [('4125', '4125'), ('dashboard-watchdog-restart-ceiling', None), ('', None), (None, None)],
+    )
+    def test_only_a_store_task_id_names_a_task(self, task_id, expected):
+        item = mod.OpenItem(key=mod.escalation_key('/q', 'esc-1-1'), escalation_id='esc-1-1', task_id=task_id)
+
+        assert item.store_task_id == expected
+
+
 class TestQueueTag:
     def test_the_two_known_queue_shapes(self, df_root):
         assert mod.queue_tag(_queue(df_root)) == ''

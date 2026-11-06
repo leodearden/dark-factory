@@ -322,6 +322,37 @@ class TestApplyAcrossTwoPorts:
         assert ledger_mod.resolution_turns(saved, s.key(s.alpha.queue_dir, 'esc-100-1')) == 1
 
 
+SENTINEL_TASK = 'dashboard-watchdog-restart-ceiling'
+"""The literal of scripts/dashboard-watchdog.py::ESCALATION_TASK_SENTINEL; that file is not importable by name."""
+
+
+class TestSentinelTaskId:
+    def test_an_escalation_naming_a_sentinel_applies_without_touching_a_task(self, sitting, capsys):
+        s = sitting
+        esc_id = f'esc-{SENTINEL_TASK}-1'
+        _pending(s.alpha.queue_dir, esc_id, s.now, task_id=SENTINEL_TASK, agent_role='harness-dashboard-watchdog')
+        assert prepare_sitting.main(['brief', *s.stores(), '--ledger', str(s.ledger)]) == 0
+        capsys.readouterr()
+        n = s.number(s.alpha.queue_dir, esc_id)
+        fused = _fused()
+
+        report = s.apply([s.answer(n, 'A')], {str(n): 'close_only'}, fused=fused)
+
+        assert report.exit_code == 0, report.rows
+        (row,) = report.rows
+        outcomes = [(step['step'], step['outcome']) for step in row['steps']]
+        assert outcomes == [('stamp_triage', 'ok'), ('resolve_issue', 'ok'), ('update_task', 'skipped'),
+                            ('close_decision', 'ok'), ('add_memory', 'ok'), ('add_memory', 'ok')]
+        assert 'sentinel' in row['steps'][2]['detail']
+        assert not {'get_task', 'update_task'} & set(fused.names())
+        memories = [args for name, args in fused.calls if name == 'add_memory']
+        assert len(memories) == 2 and all(args['entities'] == [] for args in memories)
+        assert _record(s.alpha, esc_id).resolved_by == COORDINATOR_IDENTITY
+        decision = _decision_for(s.fleet, s.alpha.queue_dir, esc_id)
+        assert decision.state == DecisionState.ANSWERED
+        assert decision.closing_evidence
+
+
 class TestPreflightRefusals:
     """Rows 4 and 5: a refused item stops the whole batch before anything is written."""
 
