@@ -43,10 +43,11 @@ SUBPROCESS_TIMEOUT_SECS = 120
 EMPTY_COLLECTIONS = json.dumps({'result': {'collections': []}, 'status': 'ok', 'time': 0.0}).encode()
 
 
-def closed_port() -> int:
-    with closing(socket.socket()) as probe:
-        probe.bind(('127.0.0.1', 0))
-        return probe.getsockname()[1]
+@contextmanager
+def refused_port() -> Iterator[int]:
+    with closing(socket.socket()) as reservation:
+        reservation.bind(('127.0.0.1', 0))
+        yield reservation.getsockname()[1]
 
 
 def lease_files(directory: Path) -> list[str]:
@@ -136,7 +137,8 @@ def test_a_refused_port_turns_connects_away_and_cannot_be_bound_while_held() -> 
 
 
 def test_unreachable_qdrant_is_an_outage_naming_qdrant(lease_dir: Path) -> None:
-    result = run_probe(lease_dir=lease_dir, env={'QDRANT_URL': f'http://127.0.0.1:{closed_port()}'})
+    with refused_port() as port:
+        result = run_probe(lease_dir=lease_dir, env={'QDRANT_URL': f'http://127.0.0.1:{port}'})
 
     assert result.returncode == OUTAGE_EXIT_STATUS, result.stderr
     assert result.stdout.startswith('qdrant: ')
@@ -154,7 +156,8 @@ def test_a_qdrant_that_refuses_writes_is_an_outage_at_the_step_that_was_refused(
 
 
 def test_unreachable_falkordb_is_an_outage_naming_falkordb(lease_dir: Path) -> None:
-    result = run_probe('falkordb', lease_dir=lease_dir, env={'FALKORDB_URI': f'redis://127.0.0.1:{closed_port()}'})
+    with refused_port() as port:
+        result = run_probe('falkordb', lease_dir=lease_dir, env={'FALKORDB_URI': f'redis://127.0.0.1:{port}'})
 
     assert result.returncode == OUTAGE_EXIT_STATUS, result.stderr
     assert result.stdout.startswith('falkordb: ')
@@ -163,10 +166,10 @@ def test_unreachable_falkordb_is_an_outage_naming_falkordb(lease_dir: Path) -> N
 
 
 def test_the_same_outage_prints_the_same_line(lease_dir: Path) -> None:
-    env = {'QDRANT_URL': f'http://127.0.0.1:{closed_port()}'}
-
-    first = run_probe('qdrant', lease_dir=lease_dir, env=env)
-    second = run_probe('qdrant', lease_dir=lease_dir, env=env)
+    with refused_port() as port:
+        env = {'QDRANT_URL': f'http://127.0.0.1:{port}'}
+        first = run_probe('qdrant', lease_dir=lease_dir, env=env)
+        second = run_probe('qdrant', lease_dir=lease_dir, env=env)
 
     assert first.stdout == second.stdout
 
