@@ -12,6 +12,7 @@ import dataclasses
 import os
 import subprocess
 import sys
+import tomllib
 from collections.abc import Callable
 from pathlib import Path
 
@@ -990,6 +991,7 @@ _DOMAIN_TRACKED = (
     'alpha/scripts/tool.py',
     'scripts/x.py',
     'scripts/legibility/y.py',
+    'scripts/local-model-serving/lms_z.py',
     'scripts/tests/test_x.py',
     'tests/test_y.py',
     'hooks/h.py',
@@ -1049,12 +1051,32 @@ class TestWorkspaceDomain:
             ],
             'scripts': [
                 ('scripts/legibility/y.py', src, 'legibility.y'),
+                ('scripts/local-model-serving/lms_z.py', src, 'local-model-serving.lms_z'),
                 # The tests root wins over the scripts src root that contains it.
                 ('scripts/tests/test_x.py', tests, None),
                 ('scripts/x.py', src, 'x'),
             ],
             'tests': [('tests/test_y.py', tests, None)],
         }
+
+    def test_extra_import_roots_give_their_files_a_second_name(self, root: Path) -> None:
+        members = {member.name: member for member in source_measures.workspace_domain(root)}
+        scripts = {f.path: f for f in members.pop('scripts').files}
+        assert {path: f.extra_import_names for path, f in scripts.items()} == {
+            'scripts/legibility/y.py': ('y',),
+            'scripts/local-model-serving/lms_z.py': ('lms_z',),
+            'scripts/tests/test_x.py': (),
+            'scripts/x.py': (),
+        }
+        assert {path: f.import_names for path, f in scripts.items()} == {
+            'scripts/legibility/y.py': ('legibility.y', 'y'),
+            'scripts/local-model-serving/lms_z.py': ('local-model-serving.lms_z', 'lms_z'),
+            'scripts/tests/test_x.py': (),
+            'scripts/x.py': ('x',),
+        }
+        others = [f for member in members.values() for f in member.files]
+        assert others
+        assert all(f.extra_import_names == () for f in others)
 
     def test_files_outside_every_member_root_are_not_in_the_domain(
         self, root: Path
@@ -1100,6 +1122,13 @@ class TestWorkspaceDomain:
         assert (layer.kind, layer.import_name) == (source_measures.FileKind.SRC, 'source_measures')
         package = by_name['orchestrator']['orchestrator/src/orchestrator/__init__.py']
         assert package.import_name == 'orchestrator'
+        census = by_name['scripts']['scripts/legibility/census.py']
+        assert census.import_names == ('legibility.census', 'census')
+        serving = by_name['scripts']['scripts/local-model-serving/lms_ctl.py']
+        assert (serving.import_name, serving.extra_import_names) == (
+            'local-model-serving.lms_ctl',
+            ('lms_ctl',),
+        )
         script_kinds = [f.kind for f in by_name['scripts'].values()]
         assert script_kinds.count(source_measures.FileKind.SRC) >= 50
         assert script_kinds.count(source_measures.FileKind.TESTS) >= 50
@@ -1134,6 +1163,83 @@ class TestSrcModuleName:
         assert [source_measures.src_module_name(f.path) for f in declared] == [
             f.import_name for f in declared
         ]
+
+
+class TestExtraImportNames:
+    """A source file below an extra import root also imports by its path below that root."""
+
+    @pytest.fixture
+    def roots(self) -> source_measures.MemberRoots:
+        return source_measures.MemberRoots(
+            name='scripts',
+            pseudo=True,
+            src_root='scripts',
+            tests_root='scripts/tests',
+            extra_import_roots=('scripts/legibility', 'scripts/local-model-serving'),
+        )
+
+    @pytest.mark.parametrize(
+        ('path', 'names'),
+        [
+            ('scripts/legibility/census.py', ('census',)),
+            ('scripts/legibility/sub/mod.py', ('sub.mod',)),
+            ('scripts/legibility/sub/__init__.py', ('sub',)),
+            # An extra root's own __init__ has no name below that root.
+            ('scripts/legibility/__init__.py', ()),
+            ('scripts/local-model-serving/lms_ctl.py', ('lms_ctl',)),
+            ('scripts/tool.py', ()),
+            # A sibling that only shares the root's prefix is not below it.
+            ('scripts/legibility.py', ()),
+            ('scripts/tests/test_x.py', ()),
+            ('scripts/legibility/data.json', ()),
+        ],
+    )
+    def test_the_names_a_path_also_imports_as(
+        self, roots: source_measures.MemberRoots, path: str, names: tuple[str, ...]
+    ) -> None:
+        assert roots.extra_import_names(path) == names
+
+    def test_the_primary_name_stays_the_dotted_path_below_the_src_root(
+        self, roots: source_measures.MemberRoots
+    ) -> None:
+        # The S2 snapshot's node id, unchanged by the extra roots.
+        assert roots.import_name('scripts/local-model-serving/lms_ctl.py') == (
+            'local-model-serving.lms_ctl'
+        )
+
+    @pytest.mark.parametrize(
+        ('src_root', 'extra_import_roots'),
+        [
+            pytest.param('scripts', ('tools/x',), id='outside-the-src-root'),
+            pytest.param('scripts', ('scripts',), id='equal-to-the-src-root'),
+            pytest.param(None, ('scripts/legibility',), id='no-src-root'),
+        ],
+    )
+    def test_an_extra_import_root_not_strictly_below_the_src_root_is_refused(
+        self, src_root: str | None, extra_import_roots: tuple[str, ...]
+    ) -> None:
+        with pytest.raises(ValueError) as refused:
+            source_measures.MemberRoots(
+                name='scripts',
+                pseudo=True,
+                src_root=src_root,
+                tests_root='scripts/tests',
+                extra_import_roots=extra_import_roots,
+            )
+        assert extra_import_roots[0] in str(refused.value)
+        assert repr(src_root) in str(refused.value)
+
+    def test_the_scripts_extra_import_roots_are_the_root_pyright_extra_paths_below_scripts(
+        self,
+    ) -> None:
+        # scripts/tests/conftest.py puts these on sys.path at runtime; the root
+        # pyright table is that fact's structured mirror.
+        with (REPO_ROOT / 'pyproject.toml').open('rb') as fh:
+            extra_paths = tomllib.load(fh)['tool']['pyright']['extraPaths']
+        scripts = next(m for m in source_measures.PSEUDO_MEMBERS if m.name == 'scripts')
+        assert {path for path in extra_paths if path.startswith('scripts/')} == set(
+            scripts.extra_import_roots
+        )
 
 
 def _workspace(*members: str) -> str:
