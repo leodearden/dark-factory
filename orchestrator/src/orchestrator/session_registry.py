@@ -530,6 +530,39 @@ class DecisionState(StrEnum):
     DROPPED = 'dropped'
 
 
+class AuditVerdict(StrEnum):
+    """The sitting's verdict on an audited executor close."""
+
+    OK = 'ok'
+    WRONG = 'wrong'
+
+
+@dataclass(frozen=True)
+class AuditOutcome:
+    """One audit of a closed DecisionRecord: the verdict, the auditor's note, and when."""
+
+    verdict: AuditVerdict
+    note: str
+    audited_at: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'verdict', AuditVerdict(self.verdict))
+        if not isinstance(self.audited_at, str):
+            raise ValueError(f'audited_at must be ISO-8601 text, got {self.audited_at!r}')
+        datetime.fromisoformat(self.audited_at)
+
+    def to_dict(self) -> dict[str, str]:
+        return {'verdict': str(self.verdict), 'note': self.note, 'audited_at': self.audited_at}
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> AuditOutcome:
+        return cls(
+            verdict=data['verdict'],
+            note=str(data.get('note') or ''),
+            audited_at=data['audited_at'],
+        )
+
+
 @dataclass
 class DecisionRecord:
     """One decision-record — ``<fleet_root>/decisions/<id>.json`` (Fleet Cockpit C1 B2, PRD §6.1).
@@ -593,6 +626,11 @@ class DecisionRecord:
         that: a carve-out close targets an L2 that has been open a while.
         Defaults to '' (not closed with evidence, or closed before this field
         existed).
+    audit_outcome: the sitting's AuditOutcome for an executor close, or None
+        (not audited). Written only by record_audit_outcome, never
+        overwritten; CUSTODY like ``closing_evidence``, and kept by
+        reopen_decision, because an audited close stays history the per-class
+        wrong rate counts.
 
     Concurrency: unlike SessionRecord (single-writer-per-slug -- only the
     spawning session ever mutates its own record), a single decision id's
@@ -603,11 +641,12 @@ class DecisionRecord:
     set_decision_escalations_dir), the ``write-decision`` verb itself
     (task 3559), whose enrichment path folds a SECOND watcher's filing into
     an existing open record, -- for task 5376's sitting preparer -- the
-    ``close-decision`` verb (via close_decision_with_evidence), and the
-    ``reopen-decision`` verb (via reopen_decision, task 4835). The
+    ``close-decision`` verb (via close_decision_with_evidence), the
+    ``reopen-decision`` verb (via reopen_decision, task 4835), and the
+    sitting's audit verb (via record_audit_outcome, task 8425). The
     ``write-decision`` verb is the only mutator that may CREATE the record
     rather than merely mutate an existing one, so it races on a path where
-    nothing exists on disk yet. All six serialize their
+    nothing exists on disk yet. All seven serialize their
     read-modify-write span per-decision-id via
     decision_id_lock (a stable ``<id>.json.lock`` sidecar, mirroring task
     1609's escalation_id_lock), so a concurrent state-update, boost-update,
@@ -616,7 +655,8 @@ class DecisionRecord:
     read+mutate+write span is serialized against other callers on the same
     id. See update_decision_state/set_manual_boost/
     set_decision_escalations_dir/_run_write_decision/
-    close_decision_with_evidence/reopen_decision for the caller-facing note.
+    close_decision_with_evidence/reopen_decision/record_audit_outcome for the
+    caller-facing note.
     """
 
     id: str
@@ -634,6 +674,7 @@ class DecisionRecord:
     closing_evidence: str = field(default='', kw_only=True)
     closed_at: str = field(default='', kw_only=True)
     record_slug: str = field(default='', kw_only=True)
+    audit_outcome: AuditOutcome | None = field(default=None, kw_only=True)
 
     @property
     def linked_session_slug(self) -> str | None:
@@ -664,6 +705,7 @@ class DecisionRecord:
             'closing_evidence': self.closing_evidence,
             'closed_at': self.closed_at,
             'record_slug': self.record_slug,
+            'audit_outcome': None if self.audit_outcome is None else self.audit_outcome.to_dict(),
         }
 
     @classmethod
@@ -689,6 +731,7 @@ class DecisionRecord:
             closing_evidence=data.get('closing_evidence') or '',
             closed_at=data.get('closed_at') or '',
             record_slug=data.get('record_slug') or '',
+            audit_outcome=_audit_outcome_of(data.get('audit_outcome')),
         )
 
     def to_json(self) -> str:
@@ -697,6 +740,14 @@ class DecisionRecord:
     @classmethod
     def from_json(cls, raw: str) -> DecisionRecord:
         return cls.from_dict(json.loads(raw))
+
+
+def _audit_outcome_of(value: Any) -> AuditOutcome | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ValueError(f'audit_outcome must be a mapping or null, got {value!r}')
+    return AuditOutcome.from_dict(value)
 
 
 # ---------------------------------------------------------------------------
@@ -1323,8 +1374,8 @@ def _mutate_decision(
 
     The single implementation of the field-setter body shared by
     update_decision_state, set_manual_boost, set_decision_escalations_dir
-    (task 3640 amendment), close_decision_with_evidence (task 5376) and
-    reopen_decision (task 4835). Those
+    (task 3640 amendment), close_decision_with_evidence (task 5376),
+    reopen_decision (task 4835) and record_audit_outcome (task 8425). Those
     are the public, caller-facing names and keep their own docstrings; this holds the parts that MUST NOT diverge
     between them -- the lock placement, the read, the write, and the
     fail-soft except-tuple.
@@ -1595,6 +1646,54 @@ def reopen_decision(
     return _mutate_decision(decision_id, _reopen, caller='reopen_decision', root=root)
 
 
+class DecisionAuditRefused(Exception):
+    """record_audit_outcome refused; the record is untouched and the message names why.
+
+    Not a ValueError, for DecisionCloseRefused's reason: _mutate_decision
+    absorbs ValueError, and a refusal must reach its caller.
+    """
+
+
+def record_audit_outcome(
+    decision_id: str,
+    verdict: AuditVerdict,
+    note: str,
+    root: Path | str | None = None,
+    *,
+    expected_project: str,
+    expected_escalations_dir: str | Path,
+    audited_at: str,
+) -> DecisionRecord | None:
+    """Record the sitting's *verdict* on *decision_id*'s close, in ONE locked read-modify-write.
+
+    The caller names the record exactly as for close_decision_with_evidence,
+    and any other record at that id raises DecisionAuditRefused; so does a
+    record with no closing evidence (nothing was closed to audit) and one that
+    already carries an outcome (never overwritten). A malformed verdict or
+    stamp raises ValueError before the lock.
+
+    Otherwise FAIL-SOFT like its sibling setters: None (logged at ERROR) on a
+    missing file, a corrupt body, a lock fault or a write failure.
+    """
+    outcome = AuditOutcome(verdict=verdict, note=note, audited_at=audited_at)
+    wanted = _decision_identity(expected_project, expected_escalations_dir)
+
+    def _audit(record: DecisionRecord) -> None:
+        _refuse_unless_named_record(decision_id, record, wanted, DecisionAuditRefused, action='audited')
+        if not record.closing_evidence:
+            raise DecisionAuditRefused(
+                f'{decision_id} carries no closing evidence; only a closed record is audited'
+            )
+        if record.audit_outcome is not None:
+            raise DecisionAuditRefused(
+                f'{decision_id} was already audited {record.audit_outcome.verdict!s} at '
+                f'{record.audit_outcome.audited_at}; refusing to overwrite it'
+            )
+        record.audit_outcome = outcome
+
+    return _mutate_decision(decision_id, _audit, caller='record_audit_outcome', root=root)
+
+
 def _merge_queue_and_escalation_id(
     existing: DecisionRecord,
     incoming: DecisionRecord,
@@ -1724,10 +1823,11 @@ def merge_decision_enrichment(
     - ``id`` / ``project``   -- from *existing*. The id is the JOIN KEY: it
       is the whole reason these two records are being merged.
     - ``filed_at`` / ``state`` / ``manual_boost`` / ``closing_evidence`` /
-      ``closed_at`` -- from *existing* (CUSTODY). A second watcher must not
-      restamp queue age, re-open or close the record (that is
-      update_decision_state's job), reset an operator's C5 cockpit boost, or
-      erase the evidence a close recorded or when it recorded it.
+      ``closed_at`` / ``audit_outcome`` -- from *existing* (CUSTODY). A second
+      watcher must not restamp queue age, re-open or close the record (that is
+      update_decision_state's job), reset an operator's C5 cockpit boost,
+      erase the evidence a close recorded or when it recorded it, or erase
+      the sitting's audit of that close.
     - ``text`` / ``task_id`` / ``session_id`` / ``record_slug`` /
       ``options`` -- keep *existing* where it is non-empty; take *incoming*
       ONLY to fill a field the first filer left empty/None. That fill is what
@@ -1812,8 +1912,8 @@ def merge_same_queue_refile(
       in the cockpit queue forever. This is the whole reason the same-queue
       case is not just routed through merge_decision_enrichment.
     - ``filed_at`` / ``state`` / ``manual_boost`` / ``closing_evidence`` /
-      ``closed_at`` -- from *existing* (CUSTODY), and it is the SAME set
-      merge_decision_enrichment keeps, because custody does not depend on
+      ``closed_at`` / ``audit_outcome`` -- from *existing* (CUSTODY), and it
+      is the SAME set merge_decision_enrichment keeps, because custody does not depend on
       which queue re-filed. ``closing_evidence`` and ``closed_at`` travel
       with ``state``: they are the evidence for the disposition being held
       and when it was recorded. ``filed_at``
@@ -1899,6 +1999,7 @@ def merge_same_queue_refile(
         manual_boost=existing.manual_boost,
         closing_evidence=existing.closing_evidence,
         closed_at=existing.closed_at,
+        audit_outcome=existing.audit_outcome,
     )
 
 

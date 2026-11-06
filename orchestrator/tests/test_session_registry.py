@@ -6473,6 +6473,9 @@ def test_same_queue_refile_and_enrichment_agree_on_the_custody_field_set() -> No
         escalations_dir=queue,
         closing_evidence='the operator dropped it: superseded by esc-5914-2',
         closed_at='2026-08-01T00:00:00+00:00',
+        audit_outcome=sr.AuditOutcome(
+            verdict=sr.AuditVerdict.OK, note='', audited_at='2026-08-02T00:00:00+00:00',
+        ),
     )
     incoming = _make_decision(
         text="the watcher's current view",
@@ -6506,6 +6509,7 @@ def test_same_queue_refile_and_enrichment_agree_on_the_custody_field_set() -> No
         'manual_boost',
         'closing_evidence',
         'closed_at',
+        'audit_outcome',
         'escalations_dir',
     }
 

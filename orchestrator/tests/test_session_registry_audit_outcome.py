@@ -140,18 +140,18 @@ class TestRecordAuditOutcome:
         assert path.read_bytes() == before
 
     @pytest.mark.parametrize(
-        'overrides',
-        [{'expected_project': 'reify'}, {'expected_escalations_dir': '/srv/other/data/escalations'}],
+        ('project', 'queue'),
+        [('reify', _QUEUE), (_PROJECT, '/srv/other/data/escalations')],
         ids=['project', 'queue'],
     )
     def test_another_records_identity_is_refused_untouched(
-        self, tmp_path: Path, overrides: dict[str, object],
+        self, tmp_path: Path, project: str, queue: str,
     ) -> None:
         path = _seed_closed(tmp_path)
         before = path.read_bytes()
 
         with pytest.raises(sr.DecisionAuditRefused):
-            _audit(tmp_path, **overrides)
+            _audit(tmp_path, expected_project=project, expected_escalations_dir=queue)
 
         assert path.read_bytes() == before
 
