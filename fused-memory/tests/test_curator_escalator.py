@@ -19,7 +19,6 @@ import fcntl
 import json
 import logging
 import threading
-import time
 from typing import IO, Any, Literal, overload
 
 import pytest
