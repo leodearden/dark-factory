@@ -7,6 +7,8 @@ downward only: this module must never import ``orchestrator.merge_lane`` or
 ``orchestrator.workflow``.
 """
 
+# pyright: reportIncompatibleMethodOverride=true
+
 from __future__ import annotations
 
 import asyncio
@@ -445,7 +447,7 @@ async def _reap_race(race: _Race) -> None:
     await asyncio.gather(*reaps)
 
 
-class TaskVerifyDispatcher:
+class TaskVerifyDispatcher(DispatchRecords):
     """Routes each task verify to whichever comes first: a remote host's turn or *run_local*.
 
     Shared by every workflow of one orchestrator, so decisions are keyed by
