@@ -11423,3 +11423,79 @@ class TestOperationalLlmGateMarker:
         assert 'operational_llm_needs_lane' not in esc.detail, (
             f'decision+llm gate (no marker) detail must carry no token: {esc.detail!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Task 8598: before_done.env reaches the self-target detached restart. The
+# DEFAULT restart scheduler builds a RestartPlan whose systemd-run argv must
+# carry each entry as --setenv, because systemd-run passes on none of this
+# process's environment.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestSelfTargetRestartCarriesBeforeDoneEnv:
+    """run() on a self-target deploy, through the default restart scheduler."""
+
+    async def _run_self_target(self, tmp_path: Path, env: dict):
+        from unittest.mock import patch
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(
+            task_id='8598', target_unit='orchestrator-reify.service', env=env,
+        )
+        scheduler = _mock_scheduler(task)
+        queue = EscalationQueue(tmp_path)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(return_value=_BASELINE_UNIT_STATE),
+            script_runner=script_runner,
+            own_unit_resolver=lambda: 'orchestrator-reify.service',
+        )
+        mock_proc = AsyncMock()
+        mock_proc.communicate = AsyncMock(return_value=(b'', b''))
+        mock_proc.returncode = 0
+
+        with patch('asyncio.create_subprocess_exec', return_value=mock_proc) as mock_exec:
+            outcome = await runner.run(_make_assignment(task))
+
+        systemd_run_calls = [
+            call for call in mock_exec.call_args_list
+            if call.args and call.args[0] == 'systemd-run'
+        ]
+        return outcome, systemd_run_calls, script_runner, scheduler, queue
+
+    async def test_before_done_env_reaches_systemd_run_argv(self, tmp_path: Path):
+        from orchestrator.workflow import WorkflowOutcome
+
+        outcome, systemd_run_calls, script_runner, _scheduler, _queue = (
+            await self._run_self_target(tmp_path, {'DEPLOY_FLAG': 'canary'})
+        )
+
+        assert outcome == WorkflowOutcome.DONE
+        assert len(systemd_run_calls) == 1
+        argv = systemd_run_calls[0].args
+        assert '--setenv=DEPLOY_FLAG=canary' in argv, (
+            f'before_done.env must reach the transient unit: {argv!r}'
+        )
+        assert argv.index('--setenv=DEPLOY_FLAG=canary') < argv.index('/bin/sh')
+        script_runner.assert_not_awaited()
+
+    async def test_pythonpath_in_env_is_refused_loudly_not_dropped(self, tmp_path: Path):
+        from orchestrator.workflow import WorkflowOutcome
+
+        outcome, systemd_run_calls, _script_runner, scheduler, queue = (
+            await self._run_self_target(tmp_path, {'PYTHONPATH': '/x'})
+        )
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        assert systemd_run_calls == []
+        pending = queue.get_by_task('8598', status='pending')
+        assert len(pending) == 1
+        assert pending[0].category == 'infra_issue'
+        assert 'PYTHONPATH' in pending[0].detail
+        assert all(
+            'done' not in call.args for call in scheduler.set_task_status.call_args_list
+        ), 'a refused env must never be reported as a scheduled DONE'
