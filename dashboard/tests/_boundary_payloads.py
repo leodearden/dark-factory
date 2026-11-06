@@ -22,7 +22,16 @@ import aiosqlite
 import httpx
 from _canned_mcp import CannedMCP, _raw_row
 from _dt_helpers import make_fixed_datetime_cls
-from _prd_lanes_tree import CARRIER, Scenario, holder_processes, lanes_tree, sidecar, tree_tasks
+from _prd_lanes_tree import (
+    CARRIER,
+    LaneTask,
+    Scenario,
+    holder_processes,
+    lanes_tree,
+    prd_key,
+    sidecar,
+    tree_tasks,
+)
 from _prd_tree import prd_tree_tasks
 from _runs_db_fixture import EVENTS_DDL, EventRow, runs_db_path, write_runs_db
 from escalation.archive import archive_dir_for_date
@@ -805,11 +814,26 @@ def _contend(substrate: CannedMCP) -> None:
         substrate.status_map[task_id] = TaskStatus.PENDING.value
 
 
+SECOND_TAIL = 'second_tail'
+"""A second delivered-signal PRD beside the lanes tree's one, so the collapsed Tail line lists
+more than one title (boundary row 20)."""
+
+
+def _second_tail() -> Scenario:
+    """Its signal leaf 961 is done and its one follow-up, 962, is open."""
+    key = prd_key(SECOND_TAIL)
+    return Scenario(
+        {961: LaneTask('done', {'prd_path': key}), 962: LaneTask('pending', {'spawned_from': 961})},
+        signal_leaves={'gate': 961},
+        key=key,
+    )
+
+
 def prd_lanes_family(client: TestClient, workdir: Path) -> dict[str, Any]:
     """Boundary rows 13–21 end to end: the lanes tree served through every γ2 input.
 
-    :data:`LANES_ROOT` serves the lanes tree with its run ledger, escalation
-    queue, sidecars and PRD files, and :data:`QUEUELESS_ROOT` a plain tree with
+    :data:`LANES_ROOT` serves the lanes tree plus :data:`SECOND_TAIL` with its
+    run ledger, escalation queue, sidecars and PRD files, and :data:`QUEUELESS_ROOT` a plain tree with
     a run ledger and no queue. The live session holder is a real process alive
     while every body is served. ``prd_lanes_tasks`` is the /tasks body served
     over the same substrate at the same instant as ``prd_lanes``.
@@ -821,7 +845,7 @@ def prd_lanes_family(client: TestClient, workdir: Path) -> dict[str, Any]:
     """
     bodies: dict[str, Any] = {}
     with holder_processes() as (live, dead):
-        tree = lanes_tree(T0, live_holder=live, dead_holder=dead)
+        tree = {**lanes_tree(T0, live_holder=live, dead_holder=dead), SECOND_TAIL: _second_tail()}
 
         def serve(
             name: str,

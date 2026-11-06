@@ -1400,20 +1400,33 @@ def test_prd_grouping_js_load_order(
     )
 
 
-# prd_lanes_view.js stamps the /prds Datums through datum.js::servedDatum,
-# destructured at module scope (task 6585).
+# prd_lanes_view.js stamps the /prds Datums through datum.js::servedDatum, and
+# prd_lanes.jsx renders the page through shell.jsx's readings, charts.jsx's
+# palette and prd_lanes_view.js's decisions; tab_tasks.jsx hosts it. Each
+# destructures the module before it at module scope (task 6585).
 _PRD_LANES_VIEW_PREFIX = '/static/redux/prd_lanes_view.js'
-_PRD_LANES_VIEW_ORDER_CASES = [
+_PRD_LANES_PREFIX = '/static/redux/prd_lanes.jsx'
+_PRD_LANES_ORDER_CASES = [
     (_DATUM_PREFIX, 'datum.js', _PRD_LANES_VIEW_PREFIX, 'prd_lanes_view.js', _READS_AT_MODULE_SCOPE),
+    (_PRD_LANES_VIEW_PREFIX, 'prd_lanes_view.js', _PRD_LANES_PREFIX, 'prd_lanes.jsx', _READS_AT_MODULE_SCOPE),
+    (_SHELL_PREFIX, 'shell.jsx', _PRD_LANES_PREFIX, 'prd_lanes.jsx', _READS_AT_MODULE_SCOPE),
+    (_CHARTS_PREFIX, 'charts.jsx', _PRD_LANES_PREFIX, 'prd_lanes.jsx', _READS_AT_MODULE_SCOPE),
+    (_PRD_LANES_PREFIX, 'prd_lanes.jsx', _TAB_TASKS_PREFIX, 'tab_tasks.jsx', _READS_AT_MODULE_SCOPE),
 ]
 
 
 @pytest.mark.parametrize(
     'before_prefix, before_label, after_prefix, after_label, why',
-    _PRD_LANES_VIEW_ORDER_CASES,
-    ids=['datum-before-prd-lanes-view'],
+    _PRD_LANES_ORDER_CASES,
+    ids=[
+        'datum-before-prd-lanes-view',
+        'prd-lanes-view-before-prd-lanes',
+        'shell-before-prd-lanes',
+        'charts-before-prd-lanes',
+        'prd-lanes-before-tab-tasks',
+    ],
 )
-def test_prd_lanes_view_js_load_order(
+def test_prd_lanes_load_order(
     index_html_body: str,
     before_prefix: str,
     before_label: str,
@@ -1421,7 +1434,7 @@ def test_prd_lanes_view_js_load_order(
     after_label: str,
     why: str,
 ) -> None:
-    """The PRD lanes reader loads after every module it reads."""
+    """The PRD lanes page's modules load after every module they read."""
     assert_script_loads_before(
         index_html_body,
         before_prefix,

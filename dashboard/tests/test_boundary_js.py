@@ -1,7 +1,9 @@
 """The two-way boundary suite: real served bodies through the real client (sketch #1-#13).
 
 ``plans/dashboard-one-datum-one-path-prd.md`` sketches each datum's server row
-and the client decision that renders it. Component tests prove each half
+and the client decision that renders it; the suite also owns rows 20-21 of
+``plans/dashboard-prd-lanes-prd.md``, the PRD lanes page rendered from the
+served /prds and /tasks bodies (``prd lanes #N:`` tests). Component tests prove each half
 alone; this suite proves the pair agrees. ``_boundary_payloads`` drives the
 real routes over fixture substrates, and ``js/boundary_*.test.mjs`` apply
 those exact bodies through data.js's real refreshOne. This file is the node
@@ -25,6 +27,7 @@ from _boundary_payloads import (
     ESCALATIONS_ARCHIVED,
     ESCALATIONS_FILED,
     HELD,
+    LANES_ROOT,
     LOCKED_MODULE,
     MEMORY_OPS,
     MERGE_ATTEMPTS,
@@ -50,15 +53,19 @@ from shared.task_statuses import TaskStatus
 
 from dashboard.data.burndown import aggregate_forecast_confidence
 from dashboard.data.census import SERIES_KEYS
+from dashboard.data.prd_view import LANE_DISPLAY_ORDER, Lane
 
 _JS_DIR = Path(__file__).parent / 'js'
 
 _SKETCH_ROWS = frozenset(range(1, 14))
+_PRD_LANES_ROWS = frozenset({20})
 
-# A top-level TAP result for a passing test named 'sketch #N: ...'; TAP
-# escapes the '#' because a bare one opens a directive. A `not ok` line never
-# matches, so a failing row counts as uncovered.
+# A top-level TAP result for a passing test named 'sketch #N: ...' or
+# 'prd lanes #N: ...'; TAP escapes the '#' because a bare one opens a
+# directive. A `not ok` line never matches, so a failing row counts as
+# uncovered.
 _PASSING_ROW_RE = re.compile(r'^ok \d+ - sketch \\#(\d+):', re.MULTILINE)
+_PASSING_PRD_LANES_ROW_RE = re.compile(r'^ok \d+ - prd lanes \\#(\d+):', re.MULTILINE)
 
 
 @pytest.fixture(scope='module')
@@ -91,12 +98,16 @@ def test_the_boundary_suite_covers_every_sketch_row(served_bodies, tmp_path):
         f'the boundary suite exited {result.returncode}\n'
         f'--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}'
     )
-    covered = {int(row) for row in _PASSING_ROW_RE.findall(result.stdout)}
-    missing = sorted(_SKETCH_ROWS - covered)
-    assert not missing, (
-        f'sketch row(s) {missing} have no passing top-level "sketch #N:" test in '
-        f'{[file.name for file in files]}\n--- stdout ---\n{result.stdout}'
-    )
+    for label, rows, pattern in (
+        ('sketch', _SKETCH_ROWS, _PASSING_ROW_RE),
+        ('prd lanes', _PRD_LANES_ROWS, _PASSING_PRD_LANES_ROW_RE),
+    ):
+        covered = {int(row) for row in pattern.findall(result.stdout)}
+        missing = sorted(rows - covered)
+        assert not missing, (
+            f'{label} row(s) {missing} have no passing top-level "{label} #N:" test in '
+            f'{[file.name for file in files]}\n--- stdout ---\n{result.stdout}'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -359,3 +370,23 @@ def test_sketch_12_a_served_parked_and_held_lock_is_one_class_in_the_cell_and_th
     _fixture_cell, fixture_chip = heatmap_cell_and_chip(fixture_row, fixture_module)
     assert cell == chip, f'heatmap cell {cell!r} disagrees with the lock chip {chip!r}'
     assert chip['cls'] == fixture_chip['cls'] == 'lock-taken'
+
+
+def test_prd_lanes_20_the_served_view_fills_every_lane_in_display_order(served_bodies):
+    view = served_bodies['prd_lanes']['PRD_VIEW'][LANES_ROOT]
+    assert view['state'] == 'fresh', view['reason']
+    lanes = view['value']['lanes']
+
+    assert [entry['lane'] for entry in lanes] == [lane.value for lane in LANE_DISPLAY_ORDER]
+    assert all(entry['prd_keys'] for entry in lanes), 'an empty lane renders nothing to check'
+    (tail,) = (entry for entry in lanes if entry['lane'] == Lane.TAIL.value)
+    assert len(tail['prd_keys']) >= 2, 'one tail title cannot show the collapsed line lists them all'
+
+    contention = served_bodies['prd_lanes_contended']['PRD_CONTENTION'][LANES_ROOT]
+    assert contention['state'] == 'fresh', contention['reason']
+    assert contention['value']['top'], 'an empty top renders every served entry vacuously'
+
+    for scenario, key in (('prd_view_map_failed', 'PRD_VIEW'), ('prd_lanes_scheduler_offline', 'PRD_CONTENTION')):
+        degraded = served_bodies[scenario][key][LANES_ROOT]
+        assert degraded['state'] == 'unknown', degraded
+        assert (degraded['reason'] or '').strip(), f'{scenario}: an unknown {key} must say why'
