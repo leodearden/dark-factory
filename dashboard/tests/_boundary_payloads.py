@@ -22,7 +22,7 @@ import aiosqlite
 import httpx
 from _canned_mcp import CannedMCP, _raw_row
 from _dt_helpers import make_fixed_datetime_cls
-from _prd_lanes_tree import Scenario, holder_processes, lanes_tree, sidecar, tree_tasks
+from _prd_lanes_tree import CARRIER, Scenario, holder_processes, lanes_tree, sidecar, tree_tasks
 from _prd_tree import prd_tree_tasks
 from _runs_db_fixture import EVENTS_DDL, EventRow, runs_db_path, write_runs_db
 from escalation.archive import archive_dir_for_date
@@ -229,14 +229,28 @@ def _heal(substrate: CannedMCP) -> None:
 
 
 class _ByRoot:
-    """One canned substrate per project root, routed by the read's ``project_root``."""
+    """One canned substrate per project root, routed by the read's ``project_root``.
+
+    ``get_external_statuses`` names no root: it answers each ``project:id`` dep
+    from the substrate labelled ``project``, flat, with fused-memory's
+    ``unknown_project`` / ``unknown_task`` sentinels for one no substrate holds.
+    """
 
     def __init__(self, by_label: Mapping[str, CannedMCP]) -> None:
         self._by_label = by_label
 
     async def __call__(self, client, url, tool, args, **kwargs):
+        if tool == 'get_external_statuses':
+            return {dep: self._external_status(dep) for dep in args['deps']}
         substrate = self._by_label[Path(args['project_root']).name]
         return await substrate(client, url, tool, args, **kwargs)
+
+    def _external_status(self, dep: str) -> str:
+        label, _, task_id = dep.partition(':')
+        substrate = self._by_label.get(label)
+        if substrate is None:
+            return 'unknown_project'
+        return substrate.status_map.get(int(task_id), 'unknown_task')
 
 
 class _SchedulerByRoot:
@@ -772,16 +786,38 @@ def _projected_read(call: dict) -> bool:
     return call['tool'] == 'get_tasks' and call['args'].get('fields') is not None
 
 
+CONTENDED_IDS = (950, 951, 952)
+"""Ready high-priority tasks outside the lanes tree, each footprinting :data:`LOCKED_FILE`."""
+_CARRIER_HOLDS_LOCKED_MODULE: Mapping[str, Any] = {
+    **CANNED_SCHEDULER_STATE,
+    'current_holders': {LOCKED_MODULE: str(CARRIER)},
+}
+"""A scheduler whose :data:`LOCKED_MODULE` is held by :data:`CARRIER`, a pending task the store holds."""
+
+
+def _contend(substrate: CannedMCP) -> None:
+    """Add :data:`CONTENDED_IDS` to *substrate*: pending, dependency-free, high priority, each
+    naming :data:`LOCKED_FILE`, so the contention line's ``top`` has a key ready tasks want."""
+    for task_id in CONTENDED_IDS:
+        substrate.rows.append(
+            _raw_row(task_id, TaskStatus.PENDING.value, priority='high', metadata={'files': [LOCKED_FILE]}),
+        )
+        substrate.status_map[task_id] = TaskStatus.PENDING.value
+
+
 def prd_lanes_family(client: TestClient, workdir: Path) -> dict[str, Any]:
-    """Boundary rows 13–19 end to end: the lanes tree served through every γ2 input.
+    """Boundary rows 13–21 end to end: the lanes tree served through every γ2 input.
 
     :data:`LANES_ROOT` serves the lanes tree with its run ledger, escalation
     queue, sidecars and PRD files, and :data:`QUEUELESS_ROOT` a plain tree with
     a run ledger and no queue. The live session holder is a real process alive
-    while every body is served. ``prd_lanes_scheduler_offline`` has an
-    unreachable scheduler on :data:`LANES_ROOT`; ``prd_lanes_runs_db_unreadable``
-    a run ledger that is no database; ``prd_lanes_lineage_failed`` a lineage
-    read that fails.
+    while every body is served. ``prd_lanes_tasks`` is the /tasks body served
+    over the same substrate at the same instant as ``prd_lanes``.
+    ``prd_lanes_scheduler_offline`` has an unreachable scheduler on
+    :data:`LANES_ROOT`; ``prd_lanes_runs_db_unreadable`` a run ledger that is no
+    database; ``prd_lanes_lineage_failed`` a lineage read that fails;
+    ``prd_lanes_contended`` adds :data:`CONTENDED_IDS` under a scheduler whose
+    lock :data:`CARRIER` holds.
     """
     bodies: dict[str, Any] = {}
     with holder_processes() as (live, dead):
@@ -793,10 +829,14 @@ def prd_lanes_family(client: TestClient, workdir: Path) -> dict[str, Any]:
             schedulers: Mapping[str, Mapping[str, Any] | None] | None = None,
             ledger_readable: bool = True,
             lineage_fails: bool = False,
+            contended: bool = False,
+            tasks_body: str | None = None,
         ) -> None:
             substrate = lanes_substrate(tree)
             if lineage_fails:
                 substrate.fail_when = _projected_read
+            if contended:
+                _contend(substrate)
             substrates = {LANES_ROOT: substrate, QUEUELESS_ROOT: _substrate(REIFY_COUNTS)}
             furnish = {
                 LANES_ROOT: _furnish_lanes(tree, ledger_readable=ledger_readable),
@@ -804,13 +844,19 @@ def prd_lanes_family(client: TestClient, workdir: Path) -> dict[str, Any]:
             }
             with _canned_roots(
                 client, workdir / name, substrates, schedulers=schedulers, furnish=furnish,
-            ):
+            ) as render_tasks:
                 bodies[name] = _render_prds(client, T0)
+                if tasks_body is not None:
+                    bodies[tasks_body] = render_tasks(T0)
 
-        serve('prd_lanes')
+        serve('prd_lanes', tasks_body='prd_lanes_tasks')
         serve('prd_lanes_scheduler_offline', schedulers={LANES_ROOT: None})
         serve('prd_lanes_runs_db_unreadable', ledger_readable=False)
         serve('prd_lanes_lineage_failed', lineage_fails=True)
+        serve(
+            'prd_lanes_contended', contended=True,
+            schedulers={LANES_ROOT: _CARRIER_HOLDS_LOCKED_MODULE},
+        )
     return bodies
 
 
