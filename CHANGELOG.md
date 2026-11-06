@@ -1700,15 +1700,18 @@ contain it.)  The renamed event's pre-1230 form (`reservation_installed` +
 
 - **A git fault is never read as "no twin".** `GitOps.resolve_rebased_citation` used to
   return None, the "already on main, not a commit, or no twin" answer, when git could not
-  answer: an index lock, a bad `project_root`, an unknown main branch, or a failed
-  `diff-tree`, `patch-id` or `log` mid-lookup. It now raises the new `GitQueryFailed`
-  for each of these. Only empty output stays a fact.
+  answer: a `project_root` that is not a git repository, an unknown main branch, or a
+  failed `diff-tree`, `patch-id` or `log` mid-lookup. It now raises the new
+  `GitQueryFailed` for each of these (`WorktreeMissing` when `project_root` no longer
+  exists). Only empty output stays a fact.
 - **Only tokens that name a commit count against the cap.** One `git cat-file
   --batch-check` (`GitOps.commits_named`) checks every cited token's object type before
   `MAX_CITED_SHAS_RESOLVED` is applied. UUID segments, digit runs and hashes are dropped,
   so they no longer push a real SHA into `skipped_shas`.
 - **New response key `failed_shas: [{cited, error}]`**, in cited order, for each token git
-  could not answer for. Nothing may be concluded about those tokens.
+  could not answer for. Nothing may be concluded about those tokens. Each fault is also
+  logged at WARNING with its traceback. When git cannot check the tokens at all, every
+  token counts against the cap, so the response stays bounded.
 
 #### plan.json writers serialise on a cross-writer mutex (task 5745)
 

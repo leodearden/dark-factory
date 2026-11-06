@@ -9,11 +9,11 @@ from __future__ import annotations
 
 import subprocess
 import types
-from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 import pytest
+from _citation_resolver_stub import StubCitationResolver
 from _escalation_seed import seed_escalation
 from _sha_noise import NOISE
 
@@ -33,29 +33,6 @@ except ImportError:
 SHA_A = 'a7ceed6597'
 SHA_B = '570dc88ad6'
 TWIN_A: dict[str, object] = {'landed': 'a' * 40, 'subject': 'feat: a', 'method': 'patch-id'}
-
-
-class _StubGitOps:
-    """Every token names a commit; a sha in *faults* raises its exception."""
-
-    def __init__(
-        self,
-        answers: Mapping[str, Mapping[str, object]] | None = None,
-        *,
-        faults: Mapping[str, Exception] | None = None,
-    ) -> None:
-        self._answers = answers or {}
-        self._faults = faults or {}
-        self.calls: list[str] = []
-
-    async def commits_named(self, tokens: Sequence[str]) -> Mapping[str, str]:
-        return {t: t for t in tokens}
-
-    async def resolve_rebased_citation(self, sha: str) -> Mapping[str, object] | None:
-        self.calls.append(sha)
-        if sha in self._faults:
-            raise self._faults[sha]
-        return self._answers.get(sha)
 
 
 @pytest.fixture
@@ -81,7 +58,7 @@ def _record_bytes(queue: EscalationQueue, escalation_id: str) -> bytes:
 @pytest.mark.asyncio
 class TestResolveEscalationShas:
     async def test_cited_shas_resolve_through_the_harness_git_authority(self, queue):
-        git_ops = _StubGitOps({SHA_A: TWIN_A})
+        git_ops = StubCitationResolver({SHA_A: TWIN_A})
         esc = seed_escalation(
             queue, level=0, task_id='7', detail=f'step-1 commit {SHA_A} was orphaned',
             evidence=[{'observation': f'step-2 at {SHA_B}', 'measured_at': 'x', 'ref': 'y'}],
@@ -95,43 +72,44 @@ class TestResolveEscalationShas:
             'failed_shas': [],
             'skipped_shas': [],
         }
-        assert git_ops.calls == [SHA_A, SHA_B]
+        assert git_ops.lookups == [SHA_A, SHA_B]
 
     async def test_a_lookup_git_could_not_answer_is_reported_in_failed_shas(self, queue):
-        git_ops = _StubGitOps(faults={SHA_A: RuntimeError('fatal: Unable to create index.lock')})
+        git_ops = StubCitationResolver(faults={SHA_A: RuntimeError('fatal: bad object a7ceed6597')})
         esc = seed_escalation(queue, level=0, task_id='7', detail=f'cites {SHA_A}')
 
         result = await _resolve(_server(queue, git_ops), esc.id)
 
         assert result['resolved_shas'] == []
-        assert [f['cited'] for f in result['failed_shas']] == [SHA_A]
-        assert 'index.lock' in result['failed_shas'][0]['error']
+        assert result['failed_shas'] == [
+            {'cited': SHA_A, 'error': 'RuntimeError: fatal: bad object a7ceed6597'},
+        ]
 
     async def test_tokens_past_the_cap_are_reported_skipped_and_never_looked_up(self, queue):
         tokens = [f'{n:07x}' for n in range(MAX_CITED_SHAS_RESOLVED + 3)]
-        git_ops = _StubGitOps()
+        git_ops = StubCitationResolver()
         esc = seed_escalation(queue, level=0, task_id='7', detail=' '.join(tokens))
 
         result = await _resolve(_server(queue, git_ops), esc.id)
 
         assert result['skipped_shas'] == tokens[MAX_CITED_SHAS_RESOLVED:]
-        assert git_ops.calls == tokens[:MAX_CITED_SHAS_RESOLVED]
+        assert git_ops.lookups == tokens[:MAX_CITED_SHAS_RESOLVED]
 
     async def test_the_record_is_never_rewritten(self, queue):
         esc = seed_escalation(queue, level=0, task_id='7', detail=f'cites {SHA_A}')
         before = _record_bytes(queue, esc.id)
 
-        await _resolve(_server(queue, _StubGitOps({SHA_A: TWIN_A})), esc.id)
+        await _resolve(_server(queue, StubCitationResolver({SHA_A: TWIN_A})), esc.id)
 
         assert _record_bytes(queue, esc.id) == before
 
     async def test_unknown_escalation_id_is_an_error_naming_it(self, queue):
-        git_ops = _StubGitOps()
+        git_ops = StubCitationResolver()
 
         result = await _resolve(_server(queue, git_ops), 'esc-7-404')
 
         assert 'esc-7-404' in result['error']
-        assert git_ops.calls == []
+        assert git_ops.lookups == []
 
     async def test_standalone_server_has_no_git_authority(self, queue):
         standalone = create_server(queue, startup_sweep=False)

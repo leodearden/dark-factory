@@ -5108,10 +5108,13 @@ def create_server(
         ``escalation/src/escalation/sha_citations.py::MAX_CITED_SHAS_RESOLVED``.
         ``skipped_shas`` lists the commit-naming tokens past that cap, never
         looked up.  ``failed_shas`` lists the tokens git could not answer
-        for (an index lock, a bad project_root, a missing ref): a fault, so
-        nothing may be concluded about those tokens.  A looked-up token in
-        neither ``resolved_shas`` nor ``failed_shas`` is already on main or
-        has no twin.
+        for (project_root is not a git repository, the main branch is
+        unknown, a git process crashed): a fault, so nothing may be
+        concluded about those tokens.  When git cannot check the tokens at
+        all, every token counts against the cap: the first ones are failed
+        and the rest skipped.  A looked-up token in neither
+        ``resolved_shas`` nor ``failed_shas`` is already on main or has no
+        twin.
 
         Read-only: the record is never rewritten, and ``get_escalation`` /
         ``get_task_escalations`` are unchanged — they still show the SHAs as
