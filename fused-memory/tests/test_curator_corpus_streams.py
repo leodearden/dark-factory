@@ -11,6 +11,7 @@ therefore unavailable in every case here.
 
 from __future__ import annotations
 
+import asyncio
 import itertools
 import json
 import logging
@@ -30,12 +31,16 @@ from shared.task_statuses import ACTIVE
 
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 from fused_memory.config.schema import FusedMemoryConfig, TaskmasterConfig
+from fused_memory.middleware.curation_deferral import DeferReason
 from fused_memory.middleware.curator_types import (
     CandidateTask,
     PoolEntry,
     PreparedCandidate,
 )
 from fused_memory.middleware.task_curator import TaskCurator
+from fused_memory.middleware.task_interceptor import TaskInterceptor
+from fused_memory.middleware.ticket_store import TicketStatus, TicketStore
+from fused_memory.reconciliation.event_buffer import EventBuffer
 
 _CLOSED_LOOPBACK_URL = 'http://127.0.0.1:9'
 _FOLLOWUP = 'agent_followup'
@@ -587,3 +592,84 @@ async def test_a_failed_dependency_read_is_named(tmp_path):
 
     assert _ids_from(prepared.pool, 'anchor') == {anchor_id}
     assert 'dependency' in _unavailable(prepared)
+
+
+_RESOLVE_DEADLINE_SECONDS = 30.0
+
+
+@asynccontextmanager
+async def _interceptor_over(
+    stack: CorpusStack, state_dir: Path,
+) -> AsyncIterator[tuple[TaskInterceptor, TicketStore]]:
+    """A real interceptor, and its ticket store, whose worker curates through *stack*'s curator."""
+    store = TicketStore(state_dir / 'tickets.db')
+    await store.initialize()
+    buffer = EventBuffer(db_path=state_dir / 'events.db', buffer_size_threshold=100)
+    await buffer.initialize()
+    interceptor = TaskInterceptor(
+        stack.backend, None, buffer, ticket_store=store, curator=stack.curator,
+    )
+    try:
+        yield interceptor, store
+    finally:
+        await interceptor.close()
+        await buffer.close()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_a_candidate_whose_every_stream_failed_is_corpus_failed(tmp_path):
+    async with _open_stack(tmp_path / 'project', _ModuleReadFailsBackend) as stack:
+        prepared = await stack.curator.prepare_candidate(
+            CandidateTask(title='t', files_to_modify=[_CANDIDATE_FILE]), 'p', stack.root,
+        )
+        [decision] = await stack.curator.curate_prepared([prepared], 'p', stack.root)
+
+    assert prepared.corpus_error is not None
+    assert 'module' in prepared.corpus_error
+    assert 'embedding' in prepared.corpus_error
+    assert _unavailable(prepared) == ('module', 'embedding')
+    assert decision.action == 'defer'
+    assert decision.defer_reason == DeferReason.CORPUS_FAILED
+    assert decision.to_log_fields()['unavailable_streams'] == ['module', 'embedding']
+
+
+@pytest.mark.asyncio
+async def test_a_candidate_with_only_the_embedding_stream_and_it_failed_is_corpus_failed(stack):
+    prepared = await stack.curator.prepare_candidate(CandidateTask(title='t'), 'p', stack.root)
+
+    assert prepared.corpus_error is not None
+    assert _unavailable(prepared) == ('embedding',)
+
+
+@pytest.mark.asyncio
+async def test_the_ticket_of_an_all_streams_failed_candidate_parks_awaiting_curation(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv('DARK_FACTORY_DATA_DIR', str(tmp_path / 'data'))
+    async with (
+        _open_stack(tmp_path / 'project', _ModuleReadFailsBackend) as stack,
+        _interceptor_over(stack, tmp_path) as (interceptor, store),
+    ):
+        submitted = await interceptor.submit_task(
+            stack.root, title='Fix the slate runner', metadata={'files': [_CANDIDATE_FILE]},
+        )
+        ticket_id = submitted['ticket']
+
+        answer = await asyncio.wait_for(
+            interceptor.resolve_ticket(
+                ticket_id, stack.root, timeout_seconds=_RESOLVE_DEADLINE_SECONDS,
+            ),
+            timeout=_RESOLVE_DEADLINE_SECONDS + 5,
+        )
+        row = await store.get(ticket_id)
+        stored = await stack.backend.get_statuses_raw(stack.root)
+
+    assert answer == {
+        'status': TicketStatus.AWAITING_CURATION,
+        'ticket': ticket_id,
+        'reason': f'curation-deferred: {DeferReason.CORPUS_FAILED}',
+    }
+    assert row is not None
+    assert row['defer_reason'] == DeferReason.CORPUS_FAILED.value
+    assert stored == {}
