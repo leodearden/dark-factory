@@ -95,6 +95,8 @@ async def test_cold_dispatch_keeps_task_artifacts_in_the_task_root(
             lane_plan_is_symlink=lane_plan.is_symlink(),
             lane_plan_target=lane_plan.resolve(strict=True),
             expected_target=(task_root / 'plan.json').resolve(),
+            lane_iterations_target=(worktree / '.task' / 'iterations.jsonl').resolve(strict=True),
+            expected_iterations=(task_root / 'iterations.jsonl').resolve(),
         )
         lane_names.update(
             p.name for p in TaskArtifacts.meta_root_for(worktree.parent, worktree.name).iterdir()
@@ -109,6 +111,7 @@ async def test_cold_dispatch_keeps_task_artifacts_in_the_task_root(
     assert observed['task_iterations'] is True
     assert observed['lane_plan_is_symlink'] is True
     assert observed['lane_plan_target'] == observed['expected_target']
+    assert observed['lane_iterations_target'] == observed['expected_iterations']
     assert lane_names <= _LANE_KEYED
 
 
