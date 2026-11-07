@@ -717,6 +717,30 @@ def read_escalation_for_scan(
         return None, 'unparsable'
 
 
+def _warn_cross_tier_duplicates(root_paths: list[Path], archive_paths: list[Path]) -> None:
+    """WARN once per escalation id that has a copy in BOTH the queue root and the archive.
+
+    That signals a crash-mid-resolve or a backup-restore needing reconciliation.
+    Each path's tier is known from which list it came in, so ids are matched
+    by filename alone, with no JSON parsing and no per-path ``.parent``.  An id
+    present in several dated archive subdirs but not the root is NOT warned
+    about: ``queue.py::EscalationQueue._locate_path`` selects the newest copy.
+    """
+    root_names = {path.name for path in root_paths}
+    archive_copies: dict[str, list[Path]] = {}
+    for path in archive_paths:
+        if path.name in root_names:
+            archive_copies.setdefault(path.name, []).append(path)
+    for root_copy in root_paths:
+        copies = archive_copies.get(root_copy.name)
+        if copies:
+            esc_paths = [root_copy, *copies]
+            logger.warning(
+                f'Escalation {root_copy.stem!r} exists in both queue_dir and archive: '
+                f'{[str(p) for p in esc_paths]}; reconciliation may be needed'
+            )
+
+
 class EscalationQueue:
     """Filesystem queue for escalations.
 
@@ -1098,8 +1122,7 @@ class EscalationQueue:
         anyway.
 
         Recovery is further gated to a ``'vanished'`` path whose parent is
-        the queue ROOT (the same root/archive tier test the pre-scan above
-        already makes).  An archive-tier path going ``'vanished'`` is
+        the queue ROOT.  An archive-tier path going ``'vanished'`` is
         overwhelmingly ``archive.prune_archive`` rmtree-ing its whole dated
         subdir wholesale — a genuine deletion recovery cannot help with, not
         the root -> archive move this recovery targets — and re-locating it
@@ -1108,42 +1131,15 @@ class EscalationQueue:
         that is genuinely gone.  This deliberately leaves a second,
         archive-to-archive relocation (e.g. a re-date) unrecovered.
         """
-        # Build the candidate path list.
-        paths: list[Path] = list(self.queue_dir.glob('esc-*.json'))
-        if status != 'pending':
-            paths.extend(self._iter_archive_paths('esc-*.json'))
-
-        # Pre-scan: detect ids that span both queue_dir root and archive subtree.
-        # Uses filename stems only (no JSON parsing) to avoid extra I/O.
-        #
-        # Tier-membership: classify each path by comparing its parent directory
-        # to self.queue_dir.  Files written by queue_dir.glob('esc-*.json') are
-        # non-recursive, so their parent IS self.queue_dir (root tier).  Files
-        # from _iter_archive_paths come from archive_root.rglob(...) and land
-        # inside a dated subdir (e.g. archive/2025-06-15/); their parent is that
-        # date dir, NOT self.queue_dir (archive tier).
-        #
-        # A single id can legitimately appear multiple times within the archive
-        # tier (the same stem in two different dated subdirs after a requeue or
-        # backup-restore).  That situation is handled by get()'s newest-by-date
-        # selection (queue.py:102-117) and is NOT a cross-tier inconsistency.
-        # We warn only when an id has members in BOTH tiers — that signals a
-        # crash-mid-resolve or backup-restore scenario requiring reconciliation.
-        id_to_paths: dict[str, list[Path]] = {}
-        for path in paths:
-            id_to_paths.setdefault(path.stem, []).append(path)
-        for esc_id, esc_paths in id_to_paths.items():
-            has_root = any(p.parent == self.queue_dir for p in esc_paths)
-            has_archive = any(p.parent != self.queue_dir for p in esc_paths)
-            if has_root and has_archive:
-                logger.warning(
-                    f'Escalation {esc_id!r} exists in both queue_dir and archive: '
-                    f'{[str(p) for p in esc_paths]}; reconciliation may be needed'
-                )
+        root_paths: list[Path] = list(self.queue_dir.glob('esc-*.json'))
+        archive_paths: list[Path] = (
+            list(self._iter_archive_paths('esc-*.json')) if status != 'pending' else []
+        )
+        _warn_cross_tier_duplicates(root_paths, archive_paths)
 
         seen: set[str] = set()
         results = []
-        for path in paths:
+        for path in root_paths + archive_paths:
             # The glob above snapshotted the listing; nothing holds a lock over
             # these reads, so a concurrent resolve()/sweep can relocate any of
             # them mid-scan.  read_escalation_for_scan keeps that case (DEBUG)
@@ -1158,8 +1154,7 @@ class EscalationQueue:
                 # vanish -- re-locate it fresh and retry the read once before
                 # giving up on it.
                 #
-                # Gated to the ROOT tier (path.parent == self.queue_dir), the
-                # same root/archive test the pre-scan above already uses.
+                # Gated to the ROOT tier (path.parent == self.queue_dir).
                 # An ARCHIVE-tier path going 'vanished' is overwhelmingly
                 # archive.prune_archive rmtree-ing its whole dated subdir --
                 # a genuine deletion this recovery cannot help with, not the
