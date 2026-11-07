@@ -15,6 +15,7 @@ from typing import Any
 
 import pytest
 from _pending_tool_fixtures import _file
+from _resolve_issue_call import call_resolve_issue
 
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
@@ -180,12 +181,6 @@ class TestRelatedPending:
         assert resolved.to_dict() == resolved_before
 
 
-async def _resolve(server, **kw: Any) -> dict[str, Any]:
-    """``resolve_issue`` is a SYNC tool, so ``tool.fn`` returns directly."""
-    tool = await server.get_tool('resolve_issue')
-    return tool.fn(**kw)
-
-
 class _CensusFailingQueue(EscalationQueue):
     """A REAL queue whose ``get_pending`` raises once ``fail_census`` is armed.
 
@@ -220,7 +215,7 @@ class TestResolveIssueRelatedPending:
         twin_bytes = _record_bytes(queue, twin.id)
         l2_b_bytes = _record_bytes(queue, l2_b.id)
 
-        response = await _resolve(
+        response = await call_resolve_issue(
             server, escalation_id=l2_a.id, resolution='ruled', action='resume',
         )
 
@@ -241,7 +236,7 @@ class TestResolveIssueRelatedPending:
         assert _record_bytes(queue, twin.id) == twin_bytes, 'report-only'
         assert _record_bytes(queue, l2_b.id) == l2_b_bytes, 'report-only'
 
-        lonely = await _resolve(
+        lonely = await call_resolve_issue(
             server, escalation_id=loner.id, resolution='ruled', action='resume',
         )
         assert lonely['related_pending'] == []
@@ -252,7 +247,7 @@ class TestResolveIssueRelatedPending:
         twin = _file(queue, 'T1', level=1)
         server = create_server(queue, startup_sweep=False)
 
-        response = await _resolve(
+        response = await call_resolve_issue(
             server, escalation_id=target.id, resolution='parked', action='park',
         )
 
@@ -265,7 +260,7 @@ class TestResolveIssueRelatedPending:
         twin = _file(queue, 'T1', level=1)
         server = create_server(queue, startup_sweep=False)
 
-        response = await _resolve(
+        response = await call_resolve_issue(
             server, escalation_id=target.id, resolution='closed', action='close_only',
         )
 
@@ -283,7 +278,7 @@ class TestResolveIssueRelatedPending:
         queue.fail_census = True
 
         with caplog.at_level(logging.ERROR, logger='escalation.server'):
-            response = await _resolve(
+            response = await call_resolve_issue(
                 server, escalation_id=target.id, resolution='ruled', action='resume',
             )
 
@@ -301,7 +296,7 @@ class TestResolveIssueRelatedPending:
         _file(queue, 'T1', level=1)
         server = create_server(queue, startup_sweep=False)
 
-        response = await _resolve(
+        response = await call_resolve_issue(
             server, escalation_id='esc-nope-1', resolution='x', action='resume',
         )
 

@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _pending_tool_fixtures import _get_pending
 
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
@@ -39,16 +40,6 @@ async def _history(server: Any, **kwargs: Any) -> dict[str, Any]:
     """Invoke the get_task_escalation_history MCP tool directly (sync tool)."""
     tool = await server.get_tool('get_task_escalation_history')
     return tool.fn(**kwargs)
-
-
-async def _get_pending(server: Any, **kwargs: Any) -> list[dict[str, Any]]:
-    """Invoke get_pending_escalations directly, for the B6 contrast.
-
-    Async as of task 3543 (it awaits a batched scheduler status read for the
-    pins_recovery annotation), unlike its sync siblings above.
-    """
-    tool = await server.get_tool('get_pending_escalations')
-    return await tool.fn(**kwargs)
 
 
 @pytest.mark.asyncio

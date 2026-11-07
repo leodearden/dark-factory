@@ -19,7 +19,13 @@ from typing import Any
 import pytest
 from _escalation_seed import seed_escalation
 from _filing_tools import call_blocker, call_info, call_promote
-from _merge_tool_calls import call_merge_cancel, call_merge_request, call_merge_status
+from _merge_tool_calls import (
+    call_get_merge_queue,
+    call_merge_cancel,
+    call_merge_request,
+    call_merge_status,
+)
+from _pending_tool_fixtures import _get_pending
 from _resolve_issue_call import call_resolve_issue
 from _tool_calls import call_tool
 from shared.merge_state import MergeReason
@@ -87,13 +93,6 @@ _COMMON_KWARGS: dict[str, Any] = {
     'category': 'scope_violation',
     'summary': 'born-at-L2 test',
 }
-
-
-async def _get_pending(server, **kwargs: Any) -> list[dict[str, Any]]:
-    tool = await server.get_tool('get_pending_escalations')
-    # async def as of task 3543 — it awaits a batched scheduler status read to
-    # compute each record's pins_recovery annotation.
-    return await tool.fn(**kwargs)
 
 
 async def _stamp_triage(server, **kwargs: Any) -> dict[str, Any]:
@@ -4951,12 +4950,6 @@ class TestMergeRequestWorkflowVerifyEmission:
 # ---------------------------------------------------------------------------
 
 
-async def _call_get_merge_queue(server) -> dict[str, Any]:
-    """Invoke the get_merge_queue MCP tool directly (sync tool)."""
-    tool = await server.get_tool('get_merge_queue')
-    return tool.fn()
-
-
 @pytest.mark.asyncio
 @pytest.mark.skipif(not _ORCHESTRATOR_AVAILABLE, reason='orchestrator package not installed')
 class TestGetMergeQueue:
@@ -5072,7 +5065,7 @@ class TestGetMergeQueue:
         esc_queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(esc_queue)  # NO merge_queue — standalone
 
-        result = await _call_get_merge_queue(server)
+        result = await call_get_merge_queue(server)
 
         assert isinstance(result, dict), f'Expected dict, got {type(result)}'
         assert 'error' in result, f'Expected error key, got: {result}'
@@ -5171,7 +5164,7 @@ class TestGetMergeQueue:
         esc_queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(esc_queue, merge_queue=mq, harness=stub_harness)
 
-        result = await _call_get_merge_queue(server)
+        result = await call_get_merge_queue(server)
 
         assert isinstance(result, dict), f'Expected dict, got: {result}'
         assert 'error' not in result, f'Unexpected error: {result}'
@@ -5225,7 +5218,7 @@ class TestGetMergeQueue:
         esc_queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(esc_queue, merge_queue=mq, harness=stub_harness)
 
-        result = await _call_get_merge_queue(server)
+        result = await call_get_merge_queue(server)
         entries = result.get('entries', [])
 
         live_entry = next((e for e in entries if e['task_id'] == 'LIVE'), None)
@@ -5332,7 +5325,7 @@ class TestGetMergeQueue:
         esc_queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(esc_queue, merge_queue=mq, harness=stub_harness)
 
-        result = await _call_get_merge_queue(server)
+        result = await call_get_merge_queue(server)
 
         assert 'error' not in result, f'Unexpected error: {result}'
         entries = result['entries']
