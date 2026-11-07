@@ -459,6 +459,7 @@ def _make_dedup_harness(tmp_path: Path, queue_subdir: str = 'recon_esc'):
     """
     from escalation.queue import EscalationQueue
 
+    queue_dir = tmp_path / queue_subdir
     harness = make_harness(
         journal=MagicMock(),
         event_buffer=MagicMock(),
@@ -467,9 +468,8 @@ def _make_dedup_harness(tmp_path: Path, queue_subdir: str = 'recon_esc'):
         # No Judge: it would need a real journal to initialise.
         config=make_harness_config(judge_enabled=False),
         known_projects={},
+        escalation_queue=EscalationQueue(queue_dir),
     )
-    queue_dir = tmp_path / queue_subdir
-    harness._escalation_queue = EscalationQueue(queue_dir)
     return harness, queue_dir
 
 
