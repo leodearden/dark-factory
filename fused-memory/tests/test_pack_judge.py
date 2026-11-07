@@ -15,8 +15,9 @@ from unittest.mock import AsyncMock
 
 import pytest
 from _curator_helpers import agent_result, make_config
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 from shared.cli_invoke import AgentResult, AllAccountsCappedException
+from shared.cost_store import CostStore
 from shared.followup_items import observed_item
 from shared.prompt_artifact import ArtifactProvenance, PromptArtifactStore, compose_prompt
 from shared.task_statuses import TaskStatus
@@ -130,13 +131,16 @@ def _model_group(*member_ids: int) -> PackGroup:
     return PackGroup.model_validate(_group(*member_ids))
 
 
-def test_verdict_models_are_frozen():
-    group: Any = _model_group(1, 2)
-    verdict: Any = PackVerdict(verdict='pack', groups=(group,), justification='j')
+@pytest.mark.parametrize(
+    ('model', 'field', 'value'),
+    [
+        (_model_group(1, 2), 'title', 'renamed'),
+        (PackVerdict(verdict='pack', groups=(_model_group(1, 2),), justification='j'), 'verdict', 'reject'),
+    ],
+)
+def test_verdict_models_are_frozen(model: BaseModel, field: str, value: object):
     with pytest.raises(ValidationError):
-        group.title = 'renamed'
-    with pytest.raises(ValidationError):
-        verdict.verdict = 'reject'
+        setattr(model, field, value)
 
 
 def test_verdict_models_refuse_extra_keys():
@@ -278,13 +282,12 @@ def test_a_rendered_member_names_an_unstamped_band():
     assert 'band=unstamped' in rendered
 
 
-COST_STORE: Any = object()
 RENDERED = tuple(f'[Task {task_id}] rendered member block {task_id}' for task_id in PACK.members)
 WHOLE_PACK = _raw('pack', _group(1, 2, 3, 4, 5), justification='one concern')
 
 
-def _judge_curator(store: PromptArtifactStore, invoke: AsyncMock) -> TaskCurator:
-    return TaskCurator(make_config(), prompt_store=store, cost_store=COST_STORE, invoke=invoke)
+def _judge_curator(store: PromptArtifactStore, invoke: AsyncMock, cost_store: CostStore) -> TaskCurator:
+    return TaskCurator(make_config(), prompt_store=store, cost_store=cost_store, invoke=invoke)
 
 
 def _invoke_kwargs(invoke: AsyncMock) -> Mapping[str, Any]:
@@ -294,9 +297,15 @@ def _invoke_kwargs(invoke: AsyncMock) -> Mapping[str, Any]:
 
 
 async def _judged(
-    tmp_path: Path, invoke: AsyncMock, *, store: PromptArtifactStore | None = None,
+    tmp_path: Path,
+    invoke: AsyncMock,
+    *,
+    store: PromptArtifactStore | None = None,
+    cost_store: CostStore | None = None,
 ) -> tuple[PackVerdict, JudgeCall]:
-    curator = _judge_curator(store or PromptArtifactStore(tmp_path), invoke)
+    curator = _judge_curator(
+        store or PromptArtifactStore(tmp_path), invoke, cost_store or CostStore(tmp_path / 'costs.db'),
+    )
     return await judge_pack(curator, PACK, RENDERED, project_id='dark_factory')
 
 
@@ -316,11 +325,12 @@ async def test_judge_pack_returns_the_verdict_and_what_the_ledger_records(tmp_pa
 @pytest.mark.asyncio
 async def test_judge_pack_makes_one_pure_classifier_call_ledgered_as_curator_pack(tmp_path):
     invoke = AsyncMock(return_value=agent_result(WHOLE_PACK))
-    await _judged(tmp_path, invoke)
+    cost_store = CostStore(tmp_path / 'costs.db')
+    await _judged(tmp_path, invoke, cost_store=cost_store)
     invoke.assert_awaited_once()
     kwargs = _invoke_kwargs(invoke)
     assert (kwargs['role'], kwargs['project_id'], kwargs['model']) == ('curator_pack', 'dark_factory', 'sonnet')
-    assert kwargs['cost_store'] is COST_STORE
+    assert kwargs['cost_store'] is cost_store
     assert kwargs['output_schema'] is CURATOR_PACK_OUTPUT_SCHEMA
     assert kwargs['system_prompt'] == CURATOR_PACK_SPEC.in_code_constant
     assert kwargs['disallowed_tools'] == ['*']

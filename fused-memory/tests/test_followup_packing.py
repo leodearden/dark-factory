@@ -157,10 +157,10 @@ def test_member_refuses_a_value_outside_its_vocabulary(overrides, field, value):
     assert value in str(refused.value)
 
 
-def test_member_is_frozen():
-    frozen: Any = member()
+@pytest.mark.parametrize('field', ['title', 'status'])
+def test_member_is_frozen(field: str):
     with pytest.raises(dataclasses.FrozenInstanceError):
-        frozen.title = 'renamed'
+        setattr(member(), field, 'renamed')
 
 
 def test_pack_lock_keys_drops_directory_charters_and_normalises_to_the_lock_depth():
