@@ -1482,6 +1482,30 @@ by `shared/tests/test_declared_scope_readers.py`
 merge-lane, triage or routing path may read it: the same test fails if one of
 those modules names the key or anything `shared.declared_scope` exports.
 
+`followup_items` is the list of observations one follow-up task was filed to
+address. It is a registered submodel
+(`shared/src/shared/followup_items.py::FollowupItem`, cardinality list),
+machine-keyed and deliberately not Tier-A blessed. Each item is `{key,
+summary, files, origin_task, origin_escalation_id}`: `summary` is one line of
+at most 300 chars and `files` is non-empty. On creation `submit_task` derives
+every R4 key server-side, on both creation paths
+(`shared/src/shared/followup_items.py::with_derived_bundle_keys`):
+`origin_task` is `spawned_from`, or `unparented` without one; each item's
+`key`; the top-level `escalation_id` `agent-followup-<parent>`, absent when
+unparented; and the top-level `suggestion_hash` over the sorted item keys. Any
+caller value for these is overwritten. It refuses, with error
+`followup_items_refused` and a `reason` of `not_a_list`, `invalid_item`,
+`item_count`, `duplicate_key` or `undeclared_files`, a bundle outside 1..5
+items, one that repeats a key, or one with an item file missing from
+`metadata.files`. A submission without the key keeps its caller-supplied R4
+keys: steward and review-cycle filings, and pre-bundle singles, which
+`legacy_item` reads as one item. `merge_items` is the one union every later
+writer uses. The architect briefing renders the list numbered, and in v1 only
+architect and implementer filers bundle (`plans/follow-up-filing-shape-prd.md`
+§4.1 and §3 decisions 1 and 3–5). As for `shared.defects`, the registration is
+an import side effect of `shared.followup_items`, so a process that never
+imports it would census the key as `unknown_key`.
+
 `claimant_exception` is the machine ledger entry
 `{claimant_run_id, target_status, agent_id, tag, stamped_at}`. The
 fused-memory interceptor writes it, atomically with the status, on a `done`
