@@ -7,8 +7,11 @@ the only caller. ``task_curator.py`` supplies the shared heuristics and is impor
 
 from __future__ import annotations
 
+import asyncio
+import json
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from enum import StrEnum
 from typing import Annotated, Any, Literal, Self, get_args
 
@@ -22,12 +25,14 @@ from pydantic import (
     ValidationError,
     model_validator,
 )
+from shared.cli_invoke import AgentResult, is_zero_output_timeout, no_mcp_servers_config
 from shared.followup_items import FollowupItem
-from shared.prompt_artifact import PromptSpec
+from shared.neutral_cwd import neutral_cli_cwd
+from shared.prompt_artifact import PromptArtifactStore, PromptSpec, default_artifacts_root
 
-from fused_memory.middleware.curator_types import clip_for_prompt
+from fused_memory.middleware.curator_types import CuratorFailureError, clip_for_prompt
 from fused_memory.middleware.followup_packing import CandidatePack, PackMember
-from fused_memory.middleware.task_curator import _CURATOR_HEURISTICS
+from fused_memory.middleware.task_curator import _CURATOR_HEURISTICS, TaskCurator
 
 __all__ = [
     'CURATOR_PACK_OUTPUT_SCHEMA',
@@ -35,10 +40,12 @@ __all__ = [
     'MAX_JUSTIFICATION_CHARS',
     'PACK_LEDGER_ROLE',
     'PACK_PROMPT_HARNESS_VERSION',
+    'JudgeCall',
     'PackGroup',
     'PackVerdict',
     'VerdictDegrade',
     'VerdictKind',
+    'judge_pack',
     'parse_pack_verdict',
     'render_pack_member',
 ]
@@ -98,6 +105,8 @@ MAX_JUSTIFICATION_CHARS = 500
 _MIN_GROUP_MEMBERS = 2
 _NO_PARENT = 'none'
 _UNSTAMPED_BAND = 'unstamped'
+# A capped pool ends the sweep tick, so the cap wait is bounded in minutes, as the filing curator's is.
+_PACK_CAP_WAIT_SANITY_SECS = 120.0
 
 CURATOR_PACK_OUTPUT_SCHEMA: dict[str, Any] = {
     'type': 'object',
@@ -319,3 +328,90 @@ def render_pack_member(
         f'  description: {clip_for_prompt(description, desc_cap)}',
         f'  details: {clip_for_prompt(details, details_cap)}',
     ])
+
+
+@dataclass(frozen=True)
+class JudgeCall:
+    """What the sweep ledgers for one judged pack: the judge, its cost and the verdict's raw text."""
+
+    model: str
+    harness_version: str
+    cost_usd: float
+    raw_output: str
+
+
+def _render_pack_prompt(pack: CandidatePack, rendered_members: Sequence[str]) -> str:
+    union_keys = ', '.join(pack.union_keys) if pack.union_keys else '(none)'
+    header = (
+        f'# Candidate pack generator={pack.generator} key={pack.key}\n'
+        f'members: {", ".join(str(task_id) for task_id in pack.members)}\n'
+        f'union_keys: {union_keys}'
+    )
+    return '\n\n'.join([header, '# Members', *rendered_members])
+
+
+def _resolved_pack_prompt(store: PromptArtifactStore | None, executor_model: str) -> str:
+    resolver = store or PromptArtifactStore(default_artifacts_root())
+    return resolver.resolve(
+        CURATOR_PACK_SPEC, executor_model=executor_model, harness_version=PACK_PROMPT_HARNESS_VERSION,
+    ).text
+
+
+def _judge_failure(result: AgentResult) -> CuratorFailureError:
+    return CuratorFailureError(
+        f'pack judge LLM call failed: subtype={result.subtype!r} output={result.output[:200]!r} '
+        f'timed_out={result.timed_out} duration_ms={result.duration_ms}',
+        timed_out=result.timed_out,
+        duration_ms=result.duration_ms,
+        subtype=result.subtype or None,
+        schema_tool_denied=result.schema_tool_denied,
+        zero_output_timeout=is_zero_output_timeout(result),
+        account_name=result.account_name,
+        cost_usd=result.cost_usd,
+        transcript_turns=result.transcript_turns,
+    )
+
+
+async def judge_pack(
+    curator: TaskCurator, pack: CandidatePack, rendered_members: Sequence[str], *, project_id: str,
+) -> tuple[PackVerdict, JudgeCall]:
+    """One curator-model call judging *pack*, whose members *rendered_members* render in order.
+
+    A capped or frozen pool propagates unchanged, and a failed call raises
+    :exc:`CuratorFailureError`: neither may be recorded as a reject, because a rejected pack is
+    never judged again. Every read of the curator's internals stays in this one body.
+    """
+    cfg = curator._config.curator
+    system_prompt = await asyncio.to_thread(_resolved_pack_prompt, curator._prompt_store, cfg.model)
+    result: AgentResult = await curator._invoke(
+        usage_gate=curator._usage_gate,
+        label=f'curator-pack[{project_id}]',
+        project_id=project_id,
+        prompt=_render_pack_prompt(pack, rendered_members),
+        system_prompt=system_prompt,
+        cwd=neutral_cli_cwd(),
+        model=cfg.model,
+        max_turns=cfg.max_turns,
+        max_budget_usd=cfg.max_budget_usd,
+        disallowed_tools=['*'],
+        mcp_config=no_mcp_servers_config(),
+        strict_mcp_config=True,
+        output_schema=CURATOR_PACK_OUTPUT_SCHEMA,
+        permission_mode='bypassPermissions',
+        timeout_seconds=cfg.timeout_seconds,
+        cap_wait_sanity_secs=_PACK_CAP_WAIT_SANITY_SECS,
+        park_on_frozen_pool=False,
+        **curator._ledger_kwargs(PACK_LEDGER_ROLE),
+    )
+    if not result.success:
+        raise _judge_failure(result)
+    structured = result.structured_output
+    verdict = parse_pack_verdict({} if structured is None else structured, pack)
+    raw_output = result.output if structured is None else json.dumps(structured, sort_keys=True)
+    call = JudgeCall(
+        model=cfg.model,
+        harness_version=PACK_PROMPT_HARNESS_VERSION,
+        cost_usd=result.cost_usd,
+        raw_output=raw_output,
+    )
+    return verdict, call

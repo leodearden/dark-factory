@@ -7,6 +7,7 @@ driven through their public signatures.
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -285,6 +286,12 @@ def _judge_curator(store: PromptArtifactStore, invoke: AsyncMock) -> TaskCurator
     return TaskCurator(make_config(), prompt_store=store, cost_store=COST_STORE, invoke=invoke)
 
 
+def _invoke_kwargs(invoke: AsyncMock) -> Mapping[str, Any]:
+    awaited = invoke.await_args
+    assert awaited is not None
+    return awaited.kwargs
+
+
 async def _judged(
     tmp_path: Path, invoke: AsyncMock, *, store: PromptArtifactStore | None = None,
 ) -> tuple[PackVerdict, JudgeCall]:
@@ -310,7 +317,7 @@ async def test_judge_pack_makes_one_pure_classifier_call_ledgered_as_curator_pac
     invoke = AsyncMock(return_value=agent_result(WHOLE_PACK))
     await _judged(tmp_path, invoke)
     invoke.assert_awaited_once()
-    kwargs = invoke.await_args.kwargs
+    kwargs = _invoke_kwargs(invoke)
     assert (kwargs['role'], kwargs['project_id'], kwargs['model']) == ('curator_pack', 'dark_factory', 'sonnet')
     assert kwargs['cost_store'] is COST_STORE
     assert kwargs['output_schema'] is CURATOR_PACK_OUTPUT_SCHEMA
@@ -323,7 +330,7 @@ async def test_judge_pack_makes_one_pure_classifier_call_ledgered_as_curator_pac
 async def test_the_judge_prompt_carries_the_pack_header_and_every_rendered_member(tmp_path):
     invoke = AsyncMock(return_value=agent_result(WHOLE_PACK))
     await _judged(tmp_path, invoke)
-    prompt = invoke.await_args.kwargs['prompt']
+    prompt = _invoke_kwargs(invoke)['prompt']
     for shown in (*RENDERED, PACK.generator, PACK.key, *PACK.union_keys):
         assert shown in prompt
 
@@ -342,7 +349,7 @@ async def test_a_pin_under_the_pack_harness_supplies_the_heuristics(tmp_path):
               provenance=_provenance(PACK_PROMPT_HARNESS_VERSION))
     invoke = AsyncMock(return_value=agent_result(WHOLE_PACK))
     await _judged(tmp_path, invoke, store=store)
-    assert invoke.await_args.kwargs['system_prompt'] == compose_prompt(CURATOR_PACK_SPEC.contract, 'PINNED')
+    assert _invoke_kwargs(invoke)['system_prompt'] == compose_prompt(CURATOR_PACK_SPEC.contract, 'PINNED')
 
 
 @pytest.mark.asyncio
@@ -351,7 +358,7 @@ async def test_a_pin_under_the_filing_curator_harness_does_not_reach_the_pack_ju
     store.pin('curator_pack', 'sonnet', 'curator-v1', heuristics='PINNED', provenance=_provenance('curator-v1'))
     invoke = AsyncMock(return_value=agent_result(WHOLE_PACK))
     await _judged(tmp_path, invoke, store=store)
-    assert invoke.await_args.kwargs['system_prompt'] == CURATOR_PACK_SPEC.in_code_constant
+    assert _invoke_kwargs(invoke)['system_prompt'] == CURATOR_PACK_SPEC.in_code_constant
 
 
 @pytest.mark.asyncio
