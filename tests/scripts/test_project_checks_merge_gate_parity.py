@@ -26,7 +26,7 @@ from hook_checks_fixture import (
 )
 
 BAD_TYPE = 'x: int = "not an int"\n'
-TIMED_LINE = re.compile(r'merge-gate checks .* in [0-9]+s')
+TIMED_LINE = re.compile(r'merge-gate checks\b.* in [0-9]+s')
 SCRIPTS_TYPE_COMMAND = 'uv run --project shared pyright scripts/'
 MODULES = (
     dataclasses.replace(SCRIPTS, type_check_command=SCRIPTS_TYPE_COMMAND),
