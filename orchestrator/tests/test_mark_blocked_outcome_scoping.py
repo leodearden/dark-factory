@@ -111,13 +111,18 @@ def _make_busy_on_older_l0_steward(
     ``resolve()`` with *new_l0_closer* as ``resolved_by`` and *new_l0_dismiss*
     as ``dismiss``.
 
+    Except for ``RESOLVED_AFTER_OLDER``, all of that happens synchronously in
+    ``start()``, which ``_mark_blocked`` awaits after filing the new L0 and
+    before its wait begins, so the older L0's envelope is on the channel when
+    the wait starts — by construction, not by timing.
+
     The class is itself the ``steward_factory``; every built instance lands in
     ``instances``, so teardown can stop them without reaching into the workflow.
     """
 
     class _FakeSteward:
         instances: list[_FakeSteward] = []
-        published: list[tuple[str, float]] = []
+        published: list[str] = []
 
         def __init__(self, wt_path: Path, cfg_dir: Path | None) -> None:
             self._outcome_channel: asyncio.Queue[PublishedStewardOutcome] | None = None
@@ -135,9 +140,7 @@ def _make_busy_on_older_l0_steward(
             self._outcome_channel.put_nowait(
                 PublishedStewardOutcome(esc_id, StewardResolved(text)),
             )
-            _FakeSteward.published.append(
-                (esc_id, asyncio.get_running_loop().time()),
-            )
+            _FakeSteward.published.append(esc_id)
 
         def _close_other_pending(self) -> list[str]:
             closed = [
@@ -152,20 +155,24 @@ def _make_busy_on_older_l0_steward(
                 )
             return closed
 
-        async def _run(self) -> None:
-            await asyncio.sleep(0.05)
+        def _finish_older(self) -> None:
             if new_l0 is NewL0Handling.CLOSED_WITH_OLDER:
                 self._close_other_pending()
             queue.resolve(older_id, 'older fixed', resolved_by='fake-steward')
             self._publish(older_id, 'older fixed')
-            if new_l0 is not NewL0Handling.RESOLVED_AFTER_OLDER:
-                return
+
+        async def _finish_older_then_new(self) -> None:
+            await asyncio.sleep(0.05)
+            self._finish_older()
             await asyncio.sleep(0.2)
             for esc_id in self._close_other_pending():
                 self._publish(esc_id, f'fixed {esc_id}')
 
         async def start(self) -> None:
-            self._work = asyncio.create_task(self._run())
+            if new_l0 is NewL0Handling.RESOLVED_AFTER_OLDER:
+                self._work = asyncio.create_task(self._finish_older_then_new())
+            else:
+                self._finish_older()
 
         async def stop(self) -> None:
             if self._work is not None:
@@ -235,7 +242,6 @@ class TestMarkBlockedWaitIsScopedToItsOwnEscalation:
             completion_timeout=grace,
         )
 
-        call_started = asyncio.get_running_loop().time()
         try:
             outcome = await asyncio.wait_for(
                 workflow._mark_blocked(
@@ -247,11 +253,9 @@ class TestMarkBlockedWaitIsScopedToItsOwnEscalation:
         finally:
             await _stop_all(steward_cls)
 
-        [(published_id, published_at)] = steward_cls.published
-        assert published_id == older.id
-        assert published_at < call_started + grace, (
-            "precondition: the older L0's outcome must reach the channel inside "
-            'the grace window, or BLOCKED proves nothing about scoping'
+        assert steward_cls.published == [older.id], (
+            "precondition: the older L0's outcome must be on the channel when "
+            'the wait begins, or BLOCKED proves nothing about scoping'
         )
         assert outcome == WorkflowOutcome.BLOCKED, (
             "the older L0's StewardResolved must not end the wait for the new L0"
@@ -390,7 +394,6 @@ class TestMarkBlockedWaitIsScopedToItsOwnEscalation:
             completion_timeout=grace,
         )
 
-        call_started = asyncio.get_running_loop().time()
         try:
             outcome = await asyncio.wait_for(
                 workflow._mark_blocked('Suffix item needs rebase onto frozen-prefix tip'),
@@ -399,12 +402,10 @@ class TestMarkBlockedWaitIsScopedToItsOwnEscalation:
         finally:
             await _stop_all(steward_cls)
 
-        [(published_id, published_at)] = steward_cls.published
-        assert published_id == older.id
-        assert published_at < call_started + grace, (
-            'precondition: the sweep close and the older L0\'s outcome must land '
-            'inside the grace window, or BLOCKED is a plain timeout and proves '
-            'nothing about the sweep close'
+        assert steward_cls.published == [older.id], (
+            'precondition: the sweep close and the older L0\'s outcome must '
+            'precede the wait, or BLOCKED is a plain timeout and proves nothing '
+            'about the sweep close'
         )
         assert outcome == WorkflowOutcome.BLOCKED, (
             'a sweep close carries no finding, so it must not settle the wait'
