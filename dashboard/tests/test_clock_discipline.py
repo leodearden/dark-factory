@@ -154,13 +154,18 @@ def _resolve_callee(module: types.ModuleType, func: ast.expr) -> object:
     return None
 
 
+_POSITIONAL_KINDS = (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+
+
 def _passes(call: ast.Call, parameters: list[inspect.Parameter], parameter: inspect.Parameter) -> bool:
     if any(keyword.arg in (parameter.name, None) for keyword in call.keywords):
         return True
-    if any(isinstance(arg, ast.Starred) for arg in call.args):
-        return True
-    positional = (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-    return parameter.kind in positional and parameters.index(parameter) < len(call.args)
+    if parameter.kind not in _POSITIONAL_KINDS:
+        return False
+    return (
+        any(isinstance(arg, ast.Starred) for arg in call.args)
+        or parameters.index(parameter) < len(call.args)
+    )
 
 
 def find_unthreaded_clock_calls(module: types.ModuleType, source: str) -> list[tuple[int, str]]:
@@ -169,7 +174,8 @@ def find_unthreaded_clock_calls(module: types.ModuleType, source: str) -> list[t
     A callee is clocked when it resolves through *module*'s globals to a
     ``dashboard.*`` function with a parameter in :data:`_CLOCK_PARAMETERS`.
     The call passes that parameter by keyword, by position, or through
-    ``*args`` / ``**kwargs``; otherwise the callee reads the live clock.
+    ``**kwargs``; ``*args`` counts only for a positional parameter, since it
+    can never fill a keyword-only one. Otherwise the callee reads the live clock.
     """
     violations: list[tuple[int, str]] = []
     for node in ast.walk(ast.parse(source)):
@@ -336,8 +342,10 @@ async def route(db, now, options):
     await reader(db)
     await reader(db, now=now)
     await reader(db, **options)
+    await reader(db, *options)
     positional_reader(db)
     positional_reader(db, now)
+    positional_reader(db, *options)
 '''
 
 
@@ -348,12 +356,17 @@ def _fixture_route_module() -> types.ModuleType:
 
 
 def test_unthreaded_clock_guard_flags_only_the_calls_that_drop_the_instant():
-    """An un-threaded call fires; keyword, positional and **kwargs threading do not."""
+    """An un-threaded call fires, and so does ``*args`` against a keyword-only instant.
+
+    Keyword, positional and ``**kwargs`` threading do not, nor does ``*args``
+    into a positional instant.
+    """
     violations = find_unthreaded_clock_calls(_fixture_route_module(), _CLOCKED_ROUTE_SOURCE)
 
     assert violations == [
         (11, 'dashboard._clocked_route_fixture.reader missing now='),
-        (14, 'dashboard._clocked_route_fixture.positional_reader missing now='),
+        (14, 'dashboard._clocked_route_fixture.reader missing now='),
+        (15, 'dashboard._clocked_route_fixture.positional_reader missing now='),
     ]
 
 
@@ -570,6 +583,8 @@ def test_routes_pass_their_instant_to_every_clocked_callee():
     """Every route call to a dashboard function taking now/served_at/measured_at passes it.
 
     A reader handed to ``asyncio.to_thread`` is an argument, not a Call node, and is out of reach.
+    So is a bound method or a wrapped callable (``functools.partial``, an
+    ``lru_cache`` wrapper): ``inspect.isfunction`` does not admit them.
     """
     violations = [
         f'{path.relative_to(_SRC_ROOT)}:{lineno}: {message}'
