@@ -5,7 +5,6 @@ Contract: plans/cancel-with-children-prd.md §4 and §5.
 
 from __future__ import annotations
 
-import json
 import re
 from collections import Counter, deque
 from collections.abc import Callable, Collection, Mapping, Sequence
@@ -29,6 +28,7 @@ from pydantic import (
 )
 from pydantic_core import ErrorDetails, PydanticCustomError
 
+from shared.json_safe import json_safe
 from shared.project_id import normalize_project_id
 from shared.task_statuses import TaskStatus
 
@@ -47,6 +47,7 @@ __all__ = [
     'CancelChildrenInvalidReason',
     'CancelChildrenRefusalCode',
     'CancelChildrenView',
+    'CanonicalProjectId',
     'CancelDispositionEntry',
     'CancelDispositionEntryVariant',
     'ChildDisposition',
@@ -102,6 +103,8 @@ ENTRY_ONLY_ACTIONS: Final = frozenset({CancelAction.CO_CANCELLED})
 CHILD_CANCELLING_ACTIONS: Final = frozenset({CancelAction.FOLD, CancelAction.MOOT})
 
 REASON_MAX_CHARS: Final = 500
+MISSING_FILES_CAP: Final = 20
+PAYLOAD_ID_CAP: Final = 50
 
 
 _Sortable = TypeVar('_Sortable', int, str)
@@ -115,7 +118,9 @@ def _distinct(ids: tuple[int, ...]) -> tuple[int, ...]:
     repeated = _repeated(ids)
     if repeated:
         raise PydanticCustomError(
-            'duplicate_target', 'names {repeated} more than once', {'repeated': repeated}
+            'duplicate_target',
+            'names {repeated} more than once',
+            {'repeated': repeated[:PAYLOAD_ID_CAP]},
         )
     return ids
 
@@ -185,6 +190,7 @@ class CancelChildrenInvalidReason(StrEnum):
     INVALID_VALUE = 'invalid_value'
     INVALID_CHILD_KEY = 'invalid_child_key'
     CHILD_IS_PARENT = 'child_is_parent'
+    CO_CANCELLED_CHILD = 'co_cancelled_child'
     EXTERNAL_NOT_REPOINT = 'external_not_repoint'
     TARGET_IS_PARENT = 'target_is_parent'
     TARGET_IS_CHILD = 'target_is_child'
@@ -199,14 +205,6 @@ _INVALID_HINT: Final = (
     'Nothing was written: correct the field named by `field` (see `reason_code`) and re-send '
     'the whole cancel.'
 )
-
-
-def _json_safe(value: object) -> object:
-    try:
-        json.dumps(value)
-    except (TypeError, ValueError):
-        return repr(value)
-    return value
 
 
 class CancelChildrenInvalid(Exception):
@@ -227,12 +225,31 @@ class CancelChildrenInvalid(Exception):
             'task_id': task_id,
             'reason_code': self.reason.value,
             'field': self.field,
-            'value': _json_safe(self.value),
+            'value': json_safe(self.value),
             'hint': _INVALID_HINT,
         }
 
 
-_QUALIFIED_TASK_REF: Final = re.compile(r'([^:\s]+):([1-9][0-9]*)', re.ASCII)
+_PROJECT_ID: Final = r'[^:\s]+'
+_PROJECT_ID_TEXT: Final = re.compile(_PROJECT_ID, re.ASCII)
+_QUALIFIED_TASK_REF: Final = re.compile(rf'({_PROJECT_ID}):([1-9][0-9]*)', re.ASCII)
+
+
+def _is_canonical_project_id(text: str) -> bool:
+    return _PROJECT_ID_TEXT.fullmatch(text) is not None and normalize_project_id(text) == text
+
+
+def _canonical_project_id(text: str) -> str:
+    if not _is_canonical_project_id(text):
+        raise PydanticCustomError(
+            'canonical_project_id',
+            'expected a project id spelled as normalize_project_id spells it, got {text!r}',
+            {'text': text},
+        )
+    return text
+
+
+CanonicalProjectId = Annotated[str, AfterValidator(_canonical_project_id)]
 
 
 def qualified_task_ref(project_id: str, task_id: int) -> str:
@@ -243,7 +260,7 @@ def qualified_task_ref(project_id: str, task_id: int) -> str:
 def _split_qualified_ref(text: str) -> tuple[str, int] | None:
     """The parts of a qualified_task_ref spelling, or None (also for a non-canonical project)."""
     match = _QUALIFIED_TASK_REF.fullmatch(text)
-    if match is None or match[1] != normalize_project_id(match[1]):
+    if match is None or not _is_canonical_project_id(match[1]):
         return None
     return match[1], int(match[2])
 
@@ -259,6 +276,7 @@ def _qualified_ref_text(text: str) -> str:
 
 
 QualifiedTaskRefText = Annotated[str, AfterValidator(_qualified_ref_text)]
+_QUALIFIED_REF_ADAPTER: Final = TypeAdapter(QualifiedTaskRefText)
 
 
 def sibling_lookup_values(parent_id: str) -> tuple[str | int, ...]:
@@ -274,6 +292,13 @@ class ExternalChild:
 
     project_id: str
     task_id: int
+
+    def __post_init__(self) -> None:
+        if _split_qualified_ref(self.key) != (self.project_id, self.task_id):
+            raise ValueError(
+                'an external child is a canonical project id and a positive task id, got '
+                f'{self.project_id!r} and {self.task_id!r}'
+            )
 
     @property
     def key(self) -> str:
@@ -300,8 +325,19 @@ def _reason_for(error: ErrorDetails) -> CancelChildrenInvalidReason:
     return _ERROR_TYPE_REASONS.get(error['type'], CancelChildrenInvalidReason.INVALID_VALUE)
 
 
+def _field_path(*parts: object) -> str:
+    return '.'.join(map(str, parts))
+
+
 def _child_field(key_text: str, *path: object) -> str:
-    return '.'.join(['children', key_text, *map(str, path)])
+    return _field_path('children', key_text, *path)
+
+
+def _refusal_value(error: ErrorDetails) -> object:
+    """The offending value: a duplicate's repeated ids, None for a missing field, else the input."""
+    if error['type'] == 'missing':
+        return None
+    return error.get('ctx', {}).get('repeated', error['input'])
 
 
 def _child_key(key_text: object, *, parent_id: int, parent_project_id: str) -> ChildKey:
@@ -328,8 +364,9 @@ def _disposition_refusal(
         return CancelChildrenInvalid(
             _reason_for(error), _child_field(key_text, 'action'), raw.get('action')
         )
-    value = None if error['type'] == 'missing' else error['input']
-    return CancelChildrenInvalid(_reason_for(error), _child_field(key_text, *path_below_tag), value)
+    return CancelChildrenInvalid(
+        _reason_for(error), _child_field(key_text, *path_below_tag), _refusal_value(error)
+    )
 
 
 def _disposition(key_text: str, raw: object) -> ChildDispositionVariant:
@@ -413,7 +450,10 @@ def parse_superseded_by(raw: object, *, parent_id: int) -> tuple[int, ...]:
     try:
         superseders = _TASK_IDS_ADAPTER.validate_python(raw)
     except ValidationError as exc:
-        raise CancelChildrenInvalid(_reason_for(exc.errors()[0]), 'superseded_by', raw) from exc
+        error = exc.errors()[0]
+        raise CancelChildrenInvalid(
+            _reason_for(error), _field_path('superseded_by', *error['loc']), _refusal_value(error)
+        ) from exc
     if parent_id in superseders:
         raise CancelChildrenInvalid(
             CancelChildrenInvalidReason.TARGET_IS_PARENT, 'superseded_by', parent_id
@@ -510,6 +550,16 @@ def _check_child(
             )
 
 
+def _check_not_co_cancelled(
+    children: Mapping[ChildKey, ChildDispositionVariant], co_cancelled: Collection[int]
+) -> None:
+    both = sorted(child for child in children if isinstance(child, int) and child in co_cancelled)
+    if both:
+        raise CancelChildrenInvalid(
+            CancelChildrenInvalidReason.CO_CANCELLED_CHILD, _child_field(str(both[0])), both[0]
+        )
+
+
 def check_targets(
     children: Mapping[ChildKey, ChildDispositionVariant],
     superseded_by: Sequence[int],
@@ -519,8 +569,9 @@ def check_targets(
     target_status: Mapping[int, TaskStatus | None],
     depends_on: Mapping[int, Sequence[int]],
 ) -> None:
-    """Refuse a target that is missing, cancelled (already or by this cancel), or would close
-    a dependency cycle in the graph this cancel leaves behind.
+    """Refuse a child the same act co-cancels, then a target that is missing, cancelled
+    (already or by this cancel), or would close a dependency cycle in the graph this cancel
+    leaves behind.
 
     co_cancelled names the tasks the same act cancels separately (PRD §4.1); target_status
     maps each named target to its status, None when no such task exists; depends_on is the
@@ -528,6 +579,7 @@ def check_targets(
     children, parent_id and co_cancelled. Local children are checked in ascending id order,
     then external ones by key, then superseded_by.
     """
+    _check_not_co_cancelled(children, co_cancelled)
     cancelled = _cancelled_by(children, parent_id, co_cancelled)
     edges = _post_cancel_edges(children, depends_on, parent_id=parent_id, cancelled=cancelled)
     for child in sorted(children, key=_child_order):
@@ -628,7 +680,9 @@ def co_cancelled_entry(
 def entry_for_parent(
     entries: Sequence[CancelDispositionEntryVariant], parent: str
 ) -> CancelDispositionEntryVariant | None:
-    return next((entry for entry in entries if entry.parent == parent), None)
+    """The entry `parent` stamped, or None; a parent not spelled by qualified_task_ref raises."""
+    wanted = _QUALIFIED_REF_ADAPTER.validate_python(parent)
+    return next((entry for entry in entries if entry.parent == wanted), None)
 
 
 def with_entry(
@@ -679,9 +733,6 @@ class ChildRelation(StrEnum):
     EXTERNAL_DEPENDENT = 'external_dependent'
 
 
-MISSING_FILES_CAP: Final = 20
-PAYLOAD_ID_CAP: Final = 50
-
 Count = Annotated[int, Field(strict=True, ge=0)]
 
 
@@ -691,7 +742,7 @@ class ChildRow(BaseModel):
     model_config = ConfigDict(frozen=True, extra='forbid')
 
     id: TaskId
-    project_id: str
+    project_id: CanonicalProjectId
     title: str
     status: TaskStatus
     relation: ChildRelation
@@ -733,7 +784,7 @@ class CancelChildrenView(BaseModel):
     model_config = ConfigDict(frozen=True, extra='forbid')
 
     task_id: TaskId
-    project_id: str
+    project_id: CanonicalProjectId
     status: TaskStatus
     children: tuple[ChildRow, ...]
     superseded_by: DistinctTaskIds = ()
@@ -785,7 +836,7 @@ class DecisionRow:
     order: int
     question: str
     evidence_check: str
-    action: str
+    action_text: str
     dispositions: tuple[CancelAction, ...]
     report_examples: tuple[str, ...]
 
@@ -798,7 +849,7 @@ DECISION_TABLE: Final = (
             "child's declared files/behaviour landed under another commit "
             '(`git log -S`/`delivered_checks` green)'
         ),
-        action=(
+        action_text=(
             'mark child `done` `found_on_main` BEFORE the cancel '
             '(then it is terminal, unlisted)'
         ),
@@ -809,7 +860,7 @@ DECISION_TABLE: Final = (
         order=1,
         question='Is the child one of the replacements the superseding act names?',
         evidence_check='`named_superseder` (in `superseded_by`)',
-        action='**keep** (default)',
+        action_text='**keep** (default)',
         dispositions=(CancelAction.KEEP,),
         report_examples=('8032–8058', '928/930'),
     ),
@@ -820,7 +871,7 @@ DECISION_TABLE: Final = (
             '`declared_files_missing_from_main == []` and its description names no '
             'parent-branch artifact; `spawned_from` is provenance only'
         ),
-        action='**keep** (U)',
+        action_text='**keep** (U)',
         dispositions=(CancelAction.KEEP,),
         report_examples=('6906', '7007', '8207', '733'),
     ),
@@ -834,7 +885,7 @@ DECISION_TABLE: Final = (
             "relation `dependent`/`both`/`external_dependent`; description references the "
             "parent's output"
         ),
-        action=(
+        action_text=(
             '**repoint** onto the superseder(s) (P). This is the class where silence does '
             'harm: locally it releases early, cross-project it wedges'
         ),
@@ -851,7 +902,7 @@ DECISION_TABLE: Final = (
             "`declared_files_missing_from_main` non-empty; read the superseder's "
             'description/plan for each child item'
         ),
-        action=(
+        action_text=(
             "covered → **fold** into it after copying uncovered items into the superseder's "
             '`details` while it is `pending` (F); not covered → **moot** (M)'
         ),
@@ -869,7 +920,7 @@ DECISION_TABLE: Final = (
         order=5,
         question='Partly on main?',
         evidence_check='some declared files present, some missing',
-        action='**keep** + `update_task` trimming the child to what main lacks (R)',
+        action_text='**keep** + `update_task` trimming the child to what main lacks (R)',
         dispositions=(CancelAction.KEEP,),
         report_examples=('261', '792'),
     ),
@@ -877,7 +928,7 @@ DECISION_TABLE: Final = (
         order=6,
         question="Cannot decide (superseder's scope unknown to you)?",
         evidence_check='—',
-        action=(
+        action_text=(
             'do NOT cancel the parent yet: ask (watcher → Leo; Stage 2 → recon_report)'
         ),
         dispositions=(),
@@ -891,7 +942,8 @@ _TABLE_RULE: Final = '|---|---|---|---|---|'
 
 def _table_line(row: DecisionRow) -> str:
     examples = ', '.join(row.report_examples) or '—'
-    return f'| {row.order} | {row.question} | {row.evidence_check} | {row.action} | {examples} |'
+    cells = (str(row.order), row.question, row.evidence_check, row.action_text, examples)
+    return f'| {" | ".join(cells)} |'
 
 
 def render_decision_table_markdown() -> str:
@@ -942,8 +994,9 @@ def render_cancel_children_rules() -> str:
         'child with the table, stopping at the first yes:\n\n'
         f'{render_decision_table_markdown()}\n\n'
         "Then cancel with ONE call: `set_task_status(<id>, 'cancelled', children={...}, "
-        "superseded_by=[...])`. Key `children` by each listed row's `key`: the decimal task "
-        'id, or `<project_id>:<id>` for an external dependent, which admits only `repoint`. '
+        "superseded_by=[...])`. Key `children` by each listed row's `id`, or by "
+        f"`<project_id>:<id>` for a `{ChildRelation.EXTERNAL_DEPENDENT.value}` row, which "
+        f'admits only `{CancelAction.REPOINT.value}`. '
         '`superseded_by` names the task(s) replacing the cancelled one; a child it names '
         'defaults to `keep`. Each `children` value is one disposition:\n'
         f'{action_lines}\n\n'

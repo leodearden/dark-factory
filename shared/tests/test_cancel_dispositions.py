@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import re
 from collections.abc import Mapping, MutableMapping
 from datetime import UTC, datetime
 
@@ -184,6 +185,21 @@ def test_a_qualified_task_ref_spells_the_project_id_canonically():
     assert qualified_task_ref('Dark-Factory', 12) == 'dark_factory:12'
 
 
+@pytest.mark.parametrize(
+    ('project_id', 'task_id'),
+    [
+        pytest.param('Reify', 44, id='non-canonical-project'),
+        pytest.param('', 44, id='empty-project'),
+        pytest.param('re:ify', 44, id='project-with-a-colon'),
+        pytest.param('reify', 0, id='task-id-zero'),
+        pytest.param('reify', True, id='bool-task-id'),
+    ],
+)
+def test_an_external_child_is_refused_unless_its_key_parses_back_to_it(project_id, task_id):
+    with pytest.raises(ValueError, match='canonical project id'):
+        ExternalChild(project_id=project_id, task_id=task_id)
+
+
 def test_children_round_trip_through_their_wire_form():
     parsed = _parse(
         {
@@ -340,7 +356,7 @@ def test_children_round_trip_through_their_wire_form():
             {'1': {'action': 'repoint', 'onto': [3, 3]}},
             Reason.DUPLICATE_TARGET,
             'children.1.onto',
-            [3, 3],
+            [3],
             id='duplicate-onto',
         ),
         pytest.param(
@@ -371,20 +387,45 @@ def test_parse_superseded_by_returns_the_ids_in_order():
 
 
 @pytest.mark.parametrize(
-    ('raw', 'reason'),
+    ('raw', 'reason', 'field', 'value'),
     [
-        pytest.param([], Reason.INVALID_VALUE, id='empty'),
-        pytest.param('8032', Reason.INVALID_VALUE, id='not-a-list'),
-        pytest.param([True], Reason.INVALID_VALUE, id='bool-is-not-an-id'),
-        pytest.param([8032, 8032], Reason.DUPLICATE_TARGET, id='duplicate'),
-        pytest.param([PARENT], Reason.TARGET_IS_PARENT, id='names-the-parent'),
+        pytest.param([], Reason.INVALID_VALUE, 'superseded_by', [], id='empty'),
+        pytest.param('8032', Reason.INVALID_VALUE, 'superseded_by', '8032', id='not-a-list'),
+        pytest.param(
+            [8032, True], Reason.INVALID_VALUE, 'superseded_by.1', True, id='bool-is-not-an-id'
+        ),
+        pytest.param(
+            [8032, 0], Reason.INVALID_VALUE, 'superseded_by.1', 0, id='one-element-not-an-id'
+        ),
+        pytest.param(
+            [8032, 8032], Reason.DUPLICATE_TARGET, 'superseded_by', [8032], id='duplicate'
+        ),
+        pytest.param(
+            [*range(1, 200), 5],
+            Reason.DUPLICATE_TARGET,
+            'superseded_by',
+            [5],
+            id='duplicate-in-a-long-list-names-only-the-repeat',
+        ),
+        pytest.param(
+            [8032, PARENT], Reason.TARGET_IS_PARENT, 'superseded_by', PARENT, id='names-the-parent'
+        ),
     ],
 )
-def test_parse_superseded_by_refuses_on_the_superseded_by_field(raw, reason):
+def test_parse_superseded_by_names_the_reason_field_and_value_of_a_refusal(
+    raw, reason, field, value
+):
     with pytest.raises(CancelChildrenInvalid) as caught:
         parse_superseded_by(raw, parent_id=PARENT)
 
-    assert (caught.value.reason, caught.value.field) == (reason, 'superseded_by')
+    assert (caught.value.reason, caught.value.field, caught.value.value) == (reason, field, value)
+
+
+def test_a_duplicate_refusal_names_at_most_the_payload_cap_of_repeated_ids():
+    with pytest.raises(CancelChildrenInvalid) as caught:
+        parse_superseded_by([*range(1, 80), *range(1, 80)], parent_id=PARENT)
+
+    assert caught.value.value == list(range(1, PAYLOAD_ID_CAP + 1))
 
 
 def test_the_refusal_codes_are_the_house_slugs():
@@ -656,6 +697,41 @@ def test_a_path_through_a_co_cancelled_task_closes_no_cycle():
 
 
 @pytest.mark.parametrize(
+    'disposition',
+    [
+        pytest.param(KeepDisposition(), id='keep'),
+        pytest.param(RepointDisposition(onto=(SUPERSEDER,)), id='repoint'),
+        pytest.param(FoldDisposition(into=SUPERSEDER), id='fold'),
+        pytest.param(MootDisposition(), id='moot'),
+    ],
+)
+def test_a_child_the_same_act_co_cancels_cannot_also_be_dispositioned(
+    disposition: ChildDispositionVariant,
+):
+    refusal = _refusal_of({7007: disposition}, co_cancelled=(7007,))
+
+    assert refusal == (Reason.CO_CANCELLED_CHILD, 'children.7007', 7007)
+
+
+def test_a_co_cancelled_child_is_refused_before_any_cycle_its_repoint_would_close():
+    refusal = _refusal_of(
+        {7007: RepointDisposition(onto=(SUPERSEDER,))},
+        depends_on={SUPERSEDER: [7007]},
+        co_cancelled=(7007,),
+    )
+
+    assert refusal == (Reason.CO_CANCELLED_CHILD, 'children.7007', 7007)
+
+
+def test_of_two_co_cancelled_children_the_lowest_id_is_reported():
+    refusal = _refusal_of(
+        {7008: KeepDisposition(), 7007: MootDisposition()}, co_cancelled=(7008, 7007)
+    )
+
+    assert refusal[1] == 'children.7007'
+
+
+@pytest.mark.parametrize(
     'children',
     [
         pytest.param(
@@ -825,6 +901,20 @@ def test_entry_for_parent_finds_the_parent_s_entry_or_none():
     assert entry_for_parent(entries, C) is None
 
 
+@pytest.mark.parametrize(
+    'parent',
+    [
+        pytest.param(f'Dark-Factory:{PARENT}', id='non-canonical-project'),
+        pytest.param(str(PARENT), id='bare-id'),
+    ],
+)
+def test_entry_for_parent_refuses_a_parent_qualified_task_ref_would_not_spell(parent: str):
+    entries = (_keep_for(qualified_task_ref(PROJECT, PARENT)),)
+
+    with pytest.raises(ValidationError):
+        entry_for_parent(entries, parent)
+
+
 _ENTRIES = (
     _keep_for(A, 'stands on main'),
     stamp_entry(RepointDisposition(onto=(8032, 8033)), parent=B, **_STAMP),
@@ -936,6 +1026,8 @@ def test_a_row_is_frozen(field: str, value: object):
             id='missing-total-above-the-declared-total',
         ),
         pytest.param({'relation': 'sibling'}, id='unknown-relation'),
+        pytest.param({'project_id': 'Dark-Factory'}, id='non-canonical-project'),
+        pytest.param({'project_id': ''}, id='empty-project'),
     ],
 )
 def test_a_row_with_inconsistent_facts_is_rejected(overrides):
@@ -1033,6 +1125,11 @@ def test_a_view_rejects_a_row_whose_project_contradicts_its_relation(row: ChildR
         _view(children=(row,))
 
 
+def test_a_view_rejects_a_non_canonical_project_id():
+    with pytest.raises(ValidationError):
+        _view(project_id='Dark-Factory', children=())
+
+
 def test_capped_lists_at_most_the_payload_cap_and_the_total():
     assert PAYLOAD_ID_CAP == 50
     assert capped('undispositioned', list(range(75))) == {
@@ -1075,7 +1172,7 @@ def test_the_decision_table_reaches_every_caller_action_and_no_entry_only_one():
 
 @pytest.mark.parametrize('row', DECISION_TABLE, ids=lambda row: f'row-{row.order}')
 def test_a_row_s_action_prose_names_each_of_its_dispositions_in_bold(row: DecisionRow):
-    assert all(f'**{action.value}**' in row.action for action in row.dispositions)
+    assert all(f'**{action.value}**' in row.action_text for action in row.dispositions)
 
 
 def test_the_first_and_last_rows_dispose_of_nothing():
@@ -1133,7 +1230,28 @@ def test_the_rules_embed_the_table_render_verbatim():
 
 
 def test_the_rules_forbid_folding_or_mooting_an_in_progress_child():
-    assert f'`{TaskStatus.IN_PROGRESS.value}`' in render_cancel_children_rules()
+    child_cancelling = ' or '.join(
+        f'`{action.value}`' for action in sorted(CHILD_CANCELLING_ACTIONS)
+    )
+    sentences = render_cancel_children_rules().split('. ')
+
+    assert [
+        sentence
+        for sentence in sentences
+        if 'may not' in sentence
+        and child_cancelling in sentence
+        and f'`{TaskStatus.IN_PROGRESS.value}`' in sentence
+    ]
+
+
+def test_the_rules_key_children_only_by_fields_a_listed_row_carries():
+    rules = render_cancel_children_rules()
+    named = re.findall(r"row's `(\w+)`", rules)
+    row_fields = set(rows_to_json([_row()])[0])
+
+    assert named
+    assert set(named) <= row_fields
+    assert f'`<project_id>:<id>` for a `{ChildRelation.EXTERNAL_DEPENDENT.value}` row' in rules
 
 
 # --- the metadata vocabulary (§4.8, §6 row 26) --------------------------------
