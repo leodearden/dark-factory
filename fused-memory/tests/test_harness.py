@@ -22889,8 +22889,8 @@ def test_routed_record_behind_an_unrelated_open_l1_is_not_dismissed_and_folds_ne
     this test pins only the composition. With the info-L0 router on, the router
     owns the record instead: see `orchestrator/tests/test_info_l0_router_harness.py::TestReaperRoutesInfoOrphans::test_an_open_l1_of_another_category_does_not_swallow_an_info_note`.
     """
-    from escalation.models import Escalation  # type: ignore[import-untyped]
-    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+    from escalation.models import Escalation
+    from escalation.queue import EscalationQueue
 
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
     queue_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
