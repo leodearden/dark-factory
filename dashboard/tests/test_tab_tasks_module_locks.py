@@ -1,10 +1,12 @@
 """Wiring of tab_tasks.jsx::ModuleLocksSection, the Task-detail lock chips.
 
-What the section draws is rendered by ``js/jsx_render.test.mjs``. This file pins
-only what a render cannot see: that no second classifier survives beside the
-shared ones, since an inline copy gives the same answer until the two drift.
-Every probe runs over comment-stripped code, and the extractor raises on a miss,
-so an absence assert cannot pass on a deleted section.
+What the section draws is rendered by ``js/jsx_render.test.mjs``, which also
+swaps ``window.DF_SCHED_UTILS.lockChipStateFor`` for a sentinel, so an inline
+chip classifier shows there however it is spelled. locksCellState and
+schedulerLocksDatum are bound when tab_tasks.jsx loads, so no render can swap
+them, and an inline copy gives the same answer until the two drift: only these
+probes see one. Every probe runs over comment-stripped code, and the extractor
+raises on a miss, so an absence assert cannot pass on a deleted section.
 """
 
 from __future__ import annotations
@@ -33,6 +35,10 @@ def test_chips_are_classified_by_lock_chip_state_for(module_locks_code: str) -> 
             'is the one place a lock is decided to be mine, taken, parked or free; hand it '
             'the module entry whole.'
         )
+    assert not re.search(r'\.holder\b', module_locks_code), (
+        'ModuleLocksSection reads the holder off a module entry itself. '
+        'scheduler_utils.jsx::lockChipStateFor decides whether a held lock is mine.'
+    )
 
 
 def test_the_section_asks_locks_cell_state_whether_anything_is_known(module_locks_code: str) -> None:

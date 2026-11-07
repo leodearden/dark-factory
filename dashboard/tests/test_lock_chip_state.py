@@ -98,7 +98,7 @@ def _exported_sched_utils_keys() -> list[str]:
 
 
 def test_lock_chip_state_for_is_the_only_classifier_exported():
-    """No caller can hand the precedence a mine-ness it decided itself."""
+    """window.DF_SCHED_UTILS offers no entry point that takes a caller-computed isMine."""
     exported = _exported_sched_utils_keys()
     assert 'lockChipStateFor' in exported, exported
     assert 'lockChipState' not in exported, (

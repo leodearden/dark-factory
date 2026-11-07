@@ -1271,10 +1271,8 @@ test("tab_tasks.jsx::TaskDetail draws the Module locks em-dash with locksCellSta
   assert.deepEqual(lockChips(detail), [], 'a project whose locks are unknown must draw no lock chip');
 });
 
-test('tab_tasks.jsx::TaskDetail draws each lock chip in the class lockChipStateFor answers, for a project the scheduler measured', t => {
-  const harness = openWindow(t);
-  const { window } = harness;
-  const task = inProgressTask(false);
+// `task` locks four paths in a measured project, one in each lock class.
+function seedTaskHoldingEveryLockClass(window, task) {
   const paths = { mine: 'src/mine', taken: 'src/taken', parked: 'src/parked', free: 'src/free' };
   seedTaskWithScheduler(window, task, schedulerSnapshot({
     rows: [schedulerLockRow({ project: PROJECT, taskId: task.id, lockSet: Object.values(paths) })],
@@ -1284,6 +1282,13 @@ test('tab_tasks.jsx::TaskDetail draws each lock chip in the class lockChipStateF
       schedulerModule({ project: PROJECT, path: paths.parked, parkedBy: '9', parkedOwnerLive: true }),
     ],
   }));
+}
+
+test('tab_tasks.jsx::TaskDetail draws each lock chip in the class lockChipStateFor answers, for a project the scheduler measured', t => {
+  const harness = openWindow(t);
+  const { window } = harness;
+  const task = inProgressTask(false);
+  seedTaskHoldingEveryLockClass(window, task);
   const detail = taskDetailOf(harness, task);
   assert.ok(detail, 'the detail pane never opened on the task');
 
@@ -1307,6 +1312,28 @@ test('tab_tasks.jsx::TaskDetail draws each lock chip in the class lockChipStateF
     if (cls === 'lock-taken' || cls === 'lock-parked') {
       assert.ok(chip.querySelector('.holder')?.textContent.includes(ownerLabel), `the ${path} chip does not name ${ownerLabel}`);
     }
+  }
+});
+
+// An inline classifier answers as lockChipStateFor does until the two drift, so
+// the public seam is swapped for a sentinel: a chip it did not classify shows.
+test('tab_tasks.jsx::TaskDetail classifies every lock chip through window.DF_SCHED_UTILS.lockChipStateFor, with no classifier of its own', t => {
+  const harness = openWindow(t);
+  const { window } = harness;
+  const task = inProgressTask(false);
+  seedTaskHoldingEveryLockClass(window, task);
+  const { lockSet } = window.DF_SCHED_UTILS.buildSchedLockInfo(task, window.DF_DATA.SCHEDULER);
+  window.DF_SCHED_UTILS = { ...window.DF_SCHED_UTILS, lockChipStateFor: () => ({ cls: 'lock-probe', ownerLabel: 'probe' }) };
+  const detail = taskDetailOf(harness, task);
+  assert.ok(detail, 'the detail pane never opened on the task');
+
+  const section = moduleLocksSection(detail);
+  assert.ok(section, 'the detail pane draws no Module locks section for a task holding locks');
+  const chips = lockChips(section.body);
+  assert.equal(chips.length, lockSet.length, 'the section must draw one chip per locked path');
+  for (const chip of chips) {
+    assert.deepEqual([...chip.classList].filter(cls => cls.startsWith('lock-')), ['lock-probe'],
+      `the ${chip.title} chip was not classified by window.DF_SCHED_UTILS.lockChipStateFor`);
   }
 });
 
