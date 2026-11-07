@@ -2,7 +2,8 @@
 
 Single site (INV-5) for four related but distinct classification concerns.
 The first two are described in plans/escalation-lifecycle-dashboard-prd.md
-Contract Seam 1; the third in plans/info-l0-disposition-router-prd.md D8:
+Contract Seam 1; the third in plans/info-l0-disposition-router-prd.md D8; the
+fourth has no design doc, and its docstring is its contract:
 
 - ``classify_resolver_tier`` — maps a ``resolved_by`` attribution string to a
   coarse resolver *tier* (human / cascade / auto-watcher / steward /
@@ -119,11 +120,9 @@ def closed_by_non_sweep_resolver(record: Escalation) -> bool:
     ``abandon`` actions dismiss rather than resolve.
 
     A steward's hand-off dismissal (``resolved_by='steward'``, filed with an
-    L1 by ``orchestrator/steward.py::TaskSteward._auto_escalate_to_human``)
-    also passes, though it hands the record to a human rather than resolving
-    it: the stamp is shared with the back-fill of an unattributed agent close.
-    A caller needing "resolved, not handed off" excludes hand-offs itself, as
-    ``orchestrator/workflow.py::TaskWorkflow._awaited_record_outcome`` does.
+    L1) also passes, though it hands the record to a human rather than
+    resolving it: the stamp is shared with the back-fill of an unattributed
+    agent close, so the predicate cannot tell the two apart.
     """
     if record.status not in ('resolved', 'dismissed'):
         return False
