@@ -22830,6 +22830,15 @@ def test_unrelated_pending_record_on_the_same_task_does_not_suppress_the_filing(
     so it cannot see the pending L0 that
     `test_file_finding_task_escalation_folds_across_cycles` pins, and that test
     fails under either the categorized or the uncategorized spelling.
+
+    Case (c) also pins the composed filer -> reaper -> filer property (task
+    6341): the orphan reaper's real coverage call,
+    `escalation/queue.py::EscalationQueue.dismiss_if_covered`, leaves the
+    routed L0 behind the unrelated L1 pending, and the next cycle folds onto
+    it. The queue rule alone is pinned by
+    `escalation/tests/test_queue.py::TestDismissIfCovered::test_no_open_same_category_l1_writes_nothing`.
+    With the info-L0 router on, the router owns the record instead: see
+    `orchestrator/tests/test_info_l0_router_harness.py::TestReaperRoutesInfoOrphans::test_an_open_l1_of_another_category_does_not_swallow_an_info_note`.
     """
     from escalation.models import Escalation  # type: ignore[import-untyped]
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
@@ -22876,47 +22885,12 @@ def test_unrelated_pending_record_on_the_same_task_does_not_suppress_the_filing(
     ]
     assert [e.id for e in filed] == [esc_id]
 
-
-def test_routed_record_behind_an_unrelated_open_l1_is_not_dismissed_and_folds_next_cycle(
-    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
-):
-    """Composed filer -> reaper -> filer: an unrelated open L1 cannot start the dismiss-and-refile loop (task 6341).
-
-    The filer's real record shape meets the reaper's real coverage call
-    (`escalation/queue.py::EscalationQueue.dismiss_if_covered`, task 5223),
-    and the filer's next cycle folds onto the surviving L0. The queue rule on
-    its own is pinned by `escalation/tests/test_queue.py::TestDismissIfCovered::test_no_open_same_category_l1_writes_nothing`;
-    this test pins only the composition. With the info-L0 router on, the router
-    owns the record instead: see `orchestrator/tests/test_info_l0_router_harness.py::TestReaperRoutesInfoOrphans::test_an_open_l1_of_another_category_does_not_swallow_an_info_note`.
-    """
-    from escalation.models import Escalation
-    from escalation.queue import EscalationQueue
-
-    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-    queue_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
-    queue = EscalationQueue(queue_dir)
-    queue.submit(Escalation(
-        id=queue.make_id('4458'),
-        task_id='4458',
-        agent_role='steward',
-        severity='blocking',
-        category='scope_violation',
-        summary='Escalated by a human to L1',
-        level=1,
-    ))
-
-    first = harness._file_finding_task_escalation('test-project', 'run-1', _orch_finding(), 4)
-    assert first
-
-    routed = queue.get(first)
+    routed = queue.get(esc_id)
     assert routed is not None
     assert queue.dismiss_if_covered(routed, resolver='harness-orphan-reaper') == []
-    survivor = queue.get(first)
-    assert survivor is not None and survivor.status == 'pending'
-
     second = harness._file_finding_task_escalation('test-project', 'run-2', _orch_finding(), 5)
     assert second is None, f'the next cycle must fold onto the surviving L0, got {second!r}'
-    assert [e.id for e in _routed_records(queue_dir)] == [first]
+    assert [e.id for e in _routed_records(queue_dir)] == [esc_id]
 
 
 def test_promoted_record_folds_the_next_cycle(
