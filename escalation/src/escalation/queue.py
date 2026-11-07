@@ -722,6 +722,9 @@ class EscalationQueue:
 
     Each escalation is a JSON file named {id}.json in the queue directory.
     Writes are atomic (tmp file + rename). Reads tolerate partial writes.
+    The read paths (``get`` / ``get_by_task`` / ``get_pending``) may run on
+    worker threads while writes run on the loop thread, which is why
+    iteration over the archive-listing memo is snapshot-based.
     """
 
     def __init__(self, queue_dir: Path):
@@ -909,7 +912,7 @@ class EscalationQueue:
         listing = self._get_archive_listing()
         candidates = [
             archive_root / subdir / f'{escalation_id}.json'
-            for subdir, stems in listing.items()
+            for subdir, stems in list(listing.items())
             if escalation_id in stems
             and (archive_root / subdir / f'{escalation_id}.json').exists()
         ]
