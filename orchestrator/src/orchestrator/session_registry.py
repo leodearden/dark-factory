@@ -58,6 +58,7 @@ if (
 ) not in sys.path and Path(_CHECKOUT_SHARED_SRC).is_dir():
     sys.path.append(_CHECKOUT_SHARED_SRC)
 
+from shared.process_identity import ProcessIdentity
 from shared.project_id import fold_project_token
 
 # ---------------------------------------------------------------------------
@@ -73,7 +74,8 @@ SCHEMA_VERSION = 1
 # 4: SessionRecord.self_exit (task 7179).
 # 5: SessionRecord.exit_request and exit_requested_at (task 7193).
 # 6: SessionRecord.claude_launch_session_id (task 6069).
-SCHEMA_MINOR = 6
+# 7: SessionRecord.launcher_identity and claude_owner_identity (task 8125).
+SCHEMA_MINOR = 7
 """Additive-extension counter for this module's contract (Fleet Cockpit C1,
 plans/fleet-cockpit-prd.md §6.1). A CODE-LEVEL signal only -- never persisted
 per-record. Bump this when a new backward-compatible (optional/defaulted)
@@ -303,6 +305,28 @@ def _coerce_owner_pid(value: Any) -> int | None:
     return value if value > 0 else None
 
 
+def _coerce_identity(value: Any, pid: Any) -> ProcessIdentity | None:
+    """Read a stored ProcessIdentity naming *pid*; any other shape reads None. Never raises."""
+    if not isinstance(value, dict) or not _is_strict_int(pid):
+        return None
+    identity_pid = value.get('pid')
+    start_ticks = value.get('start_ticks')
+    boot_id = value.get('boot_id')
+    host = value.get('host')
+    if not (
+        _is_strict_int(identity_pid)
+        and identity_pid == pid
+        and _is_strict_int(start_ticks)
+        and isinstance(boot_id, str)
+        and isinstance(host, str)
+    ):
+        return None
+    try:
+        return ProcessIdentity(identity_pid, start_ticks, boot_id, host)
+    except ValueError:
+        return None
+
+
 def _coerce_session_id(value: Any) -> str | None:
     """Read a stored Claude Code session id from a record body, tolerating junk.
 
@@ -340,6 +364,10 @@ def _coerce_exit_request(value: Any) -> ExitRequest | None:
     )
 
 
+def _identity_wire(identity: ProcessIdentity | None) -> dict[str, Any] | None:
+    return None if identity is None else dataclasses.asdict(identity)
+
+
 @dataclass
 class SessionRecord:
     """One session-registry record — ``<fleet_root>/sessions/<slug>/record.json``.
@@ -359,6 +387,10 @@ class SessionRecord:
     prompt: the literal prompt passed to `claude`.
     cwd: the working directory `claude` was launched in.
     launcher_pid: spawn-claude.sh's own $$ — the reaper's liveness proxy.
+    launcher_identity: the ProcessIdentity of ``launcher_pid`` captured when
+        the record was first written, or None for a record written before
+        task 8125 or when /proc could not answer. Reads None unless it names
+        ``launcher_pid`` (see ``_coerce_identity``).
     start_ts: ISO-8601 timestamp of when this record was first written.
     status: current lifecycle status; see Status.
     exit_code: claude's exit code, populated once status is terminal.
@@ -401,6 +433,10 @@ class SessionRecord:
         ``session_hooks._env_slug_is_owned``. A non-int, bool, or
         non-positive value in a record body reads back as None instead of
         surviving unchanged (see ``_coerce_owner_pid``).
+    claude_owner_identity: the ProcessIdentity of ``claude_owner_pid``,
+        stamped with it, or None for a record bound before task 8125 or when
+        /proc could not answer. Reads None unless it names
+        ``claude_owner_pid`` (see ``_coerce_identity``).
     self_exit: true when the spawn launched with self-exit on, as resolved
         per lane by ``skills/spawn/spawn-claude.sh`` (rule: the
         ``CLAUDE_SPAWN_SELF_EXIT`` entry in ``skills/spawn/SKILL.md``), which
@@ -426,6 +462,7 @@ class SessionRecord:
     prompt: str = field(default='', kw_only=True)
     cwd: str = field(default='', kw_only=True)
     launcher_pid: int = field(default=0, kw_only=True)
+    launcher_identity: ProcessIdentity | None = field(default=None, kw_only=True)
     start_ts: str = field(default='', kw_only=True)
     exit_code: int | None = field(default=None, kw_only=True)
     result_file: str | None = field(default=None, kw_only=True)
@@ -437,6 +474,7 @@ class SessionRecord:
     claude_session_id: str | None = field(default=None, kw_only=True)
     claude_launch_session_id: str | None = field(default=None, kw_only=True)
     claude_owner_pid: int | None = field(default=None, kw_only=True)
+    claude_owner_identity: ProcessIdentity | None = field(default=None, kw_only=True)
     self_exit: bool = field(default=False, kw_only=True)
     exit_request: ExitRequest | None = field(default=None, kw_only=True)
     exit_requested_at: str | None = field(default=None, kw_only=True)
@@ -454,6 +492,7 @@ class SessionRecord:
             'prompt': self.prompt,
             'cwd': self.cwd,
             'launcher_pid': self.launcher_pid,
+            'launcher_identity': _identity_wire(self.launcher_identity),
             'start_ts': self.start_ts,
             'status': Status(self.status).value,
             'exit_code': self.exit_code,
@@ -466,6 +505,7 @@ class SessionRecord:
             'claude_session_id': self.claude_session_id,
             'claude_launch_session_id': self.claude_launch_session_id,
             'claude_owner_pid': self.claude_owner_pid,
+            'claude_owner_identity': _identity_wire(self.claude_owner_identity),
             'self_exit': self.self_exit,
             'exit_request': self.exit_request.to_dict() if self.exit_request is not None else None,
             'exit_requested_at': self.exit_requested_at,
@@ -476,6 +516,8 @@ class SessionRecord:
         display_data = data.get('display')
         question_data = data.get('question')
         exit_requested_at = data.get('exit_requested_at')
+        launcher_pid = data.get('launcher_pid', 0)
+        claude_owner_pid = _coerce_owner_pid(data.get('claude_owner_pid'))
         return cls(
             session_slug=data['session_slug'],
             status=Status(data['status']),
@@ -487,7 +529,8 @@ class SessionRecord:
             escalation_id=data.get('escalation_id'),
             prompt=data.get('prompt', ''),
             cwd=data.get('cwd', ''),
-            launcher_pid=data.get('launcher_pid', 0),
+            launcher_pid=launcher_pid,
+            launcher_identity=_coerce_identity(data.get('launcher_identity'), launcher_pid),
             start_ts=data.get('start_ts', ''),
             exit_code=data.get('exit_code'),
             result_file=data.get('result_file'),
@@ -498,7 +541,10 @@ class SessionRecord:
             question=Question.from_dict(question_data) if isinstance(question_data, dict) else None,
             claude_session_id=_coerce_session_id(data.get('claude_session_id')),
             claude_launch_session_id=_coerce_session_id(data.get('claude_launch_session_id')),
-            claude_owner_pid=_coerce_owner_pid(data.get('claude_owner_pid')),
+            claude_owner_pid=claude_owner_pid,
+            claude_owner_identity=_coerce_identity(
+                data.get('claude_owner_identity'), claude_owner_pid
+            ),
             self_exit=data.get('self_exit') is True,
             exit_request=_coerce_exit_request(data.get('exit_request')),
             exit_requested_at=exit_requested_at if isinstance(exit_requested_at, str) else None,
