@@ -2896,7 +2896,8 @@ class DeterministicRunner:
                     # rung-one evidence via done_provenance.escalation_id.  The
                     # `bool(...)` semantics below are byte-identical to task
                     # 2954's original expression.
-                    own_records = self.escalation_queue.get_by_task(
+                    own_records = await asyncio.to_thread(
+                        self.escalation_queue.get_by_task,
                         task_id, agent_role=DETERMINISTIC_AGENT_ROLE,
                     )
                     own_escalation_resolved = bool(own_records)
@@ -3097,7 +3098,8 @@ class DeterministicRunner:
                 # unrelated escalation sharing this task_id (e.g. a starvation-
                 # watchdog filing) must never alias as proof a human resolved
                 # THIS runner's failure (task 2120).
-                own_escalation_resolved = bool(self.escalation_queue.get_by_task(
+                own_escalation_resolved = bool(await asyncio.to_thread(
+                    self.escalation_queue.get_by_task,
                     task_id, agent_role=DETERMINISTIC_AGENT_ROLE,
                 ))
                 # ζ D3 (finding 4.0): bare escalation existence is not proof
