@@ -19,9 +19,9 @@ from pathlib import Path
 
 import pytest
 from _ladder_git import commit, git, git_env, new_repo
-from orchestrator.agents.landed_sha_searches import LandedShaSearches
 from shared.merge_subject import format_merge_subject
 
+from orchestrator.agents.landed_sha_searches import LandedShaSearches
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import GitOps, task_citation_pattern
 

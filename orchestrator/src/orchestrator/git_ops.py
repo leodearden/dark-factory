@@ -466,6 +466,14 @@ DEFAULT_COMMIT_CITATION_PATTERN: str = (
     r'|\(task {tid}([ ,/][^)]*)?\)'
 )
 
+
+def task_citation_pattern(tid: str, pattern_template: str | None = None) -> str | None:
+    """*tid*'s citation regex, valid as both git ERE and Python ``re``; None when *pattern_template* is ``''`` (opted out)."""
+    template = pattern_template if pattern_template is not None else DEFAULT_COMMIT_CITATION_PATTERN
+    if template == '':
+        return None
+    return template.format(tid=re.escape(tid))
+
 # Fixed name for the persistent warm merge-verify worktree (task 1692).
 # Lives at <worktree_base>/_merge-verify.  Excluded from prune and
 # find_inflight enumeration (see _iter_merge_worktrees).
@@ -10073,14 +10081,9 @@ class GitOps:
         that writes on a miss and so must not read "could not look" as "no
         citation".
         """
-        template = (
-            pattern_template
-            if pattern_template is not None
-            else DEFAULT_COMMIT_CITATION_PATTERN
-        )
-        if template == '':
+        pattern_str = task_citation_pattern(tid, pattern_template)
+        if pattern_str is None:
             return None
-        pattern_str = template.format(tid=re.escape(tid))
         try:
             compiled = re.compile(pattern_str)
         except re.error as exc:
