@@ -19,6 +19,7 @@ from pydantic import ValidationError
 from shared.cli_invoke import AgentResult, AllAccountsCappedException
 from shared.followup_items import observed_item
 from shared.prompt_artifact import ArtifactProvenance, PromptArtifactStore, compose_prompt
+from shared.task_statuses import TaskStatus
 from shared.usage_gate import PoolFrozen
 
 from fused_memory.middleware.curator_types import CuratorFailureError, clip_for_prompt
@@ -60,7 +61,7 @@ def _member(*, band: Literal['narrow'] | None) -> PackMember:
         band=band,
         pending_since=datetime(2026, 10, 1, tzinfo=UTC),
         text_fp='0' * 16,
-        status='pending',
+        status=TaskStatus.PENDING,
         dependencies=frozenset(),
         held=True,
         is_holder=False,

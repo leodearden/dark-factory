@@ -20,6 +20,7 @@ from typing import Any
 
 import pytest
 from shared.followup_items import MAX_FOLLOWUP_ITEMS
+from shared.task_statuses import TaskStatus
 
 from fused_memory.middleware.followup_packing import (
     HUB_SHARE,
@@ -62,7 +63,7 @@ def member(**overrides: Any) -> PackMember:
         'band': None,
         'pending_since': NOW - timedelta(days=30),
         'text_fp': member_text_fp(title, '', ''),
-        'status': 'pending',
+        'status': TaskStatus.PENDING,
         'dependencies': frozenset(),
         'held': True,
         'is_holder': False,
@@ -103,7 +104,7 @@ def _dump_member(record: Mapping[str, Any], *, lock_depth: int) -> PackMember:
         band=None,
         pending_since=_parsed_pending_since(record['pending_since']),
         text_fp=member_text_fp(record['title'], '', ''),
-        status='pending',
+        status=TaskStatus.PENDING,
         dependencies=frozenset(),
         held=True,
         is_holder=False,
@@ -147,6 +148,7 @@ def test_bounds_have_one_home_each():
         ({'item_count': 0}, 'item_count', '0'),
         ({'lock_keys': ('b/y.py', 'a/x.py')}, 'lock_keys', 'b/y.py'),
         ({'lock_keys': ('a/x.py', 'a/x.py')}, 'lock_keys', 'a/x.py'),
+        ({'status': 'pending-ish'}, 'status', 'pending-ish'),
     ],
 )
 def test_member_refuses_a_value_outside_its_vocabulary(overrides, field, value):
@@ -232,7 +234,7 @@ def test_rider_reserved_count_on_the_dump_matches_the_prd_table(pool, project, r
     [
         ({'is_holder': True}, PackExclusion.HOLDER),
         ({'held': False}, PackExclusion.NOT_HELD),
-        ({'status': 'in-progress'}, PackExclusion.NOT_HELD),
+        ({'status': TaskStatus.IN_PROGRESS}, PackExclusion.NOT_HELD),
         ({'band': 'broad'}, PackExclusion.BROAD),
         ({'has_live_dependents': True}, PackExclusion.LIVE_DEPENDENTS),
         ({'claimed': True}, PackExclusion.CLAIMED),
