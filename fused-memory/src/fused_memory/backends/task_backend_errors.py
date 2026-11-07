@@ -16,6 +16,7 @@ from typing import Any, ClassVar
 from shared.declared_scope import DECLARED_SCOPE_METADATA_KEY, StampViolation
 from shared.followup_items import (
     FOLLOWUP_ITEMS_METADATA_KEY,
+    FOLLOWUP_ITEMS_REFUSED_ERROR,
     MAX_FOLLOWUP_ITEMS,
     FollowupBundleInvalid,
 )
@@ -372,7 +373,7 @@ class FollowupItemsRefusedError(TaskmasterError):
     :meth:`to_error_dict` for the wire shape; callers branch on ``error == ERROR`` and ``reason``.
     """
 
-    ERROR: ClassVar[str] = 'followup_items_refused'
+    ERROR: ClassVar[str] = FOLLOWUP_ITEMS_REFUSED_ERROR
 
     def __init__(self, refusal: FollowupBundleInvalid) -> None:
         self.reason = refusal.reason

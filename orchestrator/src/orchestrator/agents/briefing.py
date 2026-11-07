@@ -11,9 +11,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
-from pydantic import ValidationError
 from shared.briefing_queries import BriefingScope
-from shared.followup_items import FOLLOWUP_ITEMS_METADATA_KEY, FollowupItem
+from shared.followup_items import FOLLOWUP_ITEMS_METADATA_KEY, parse_item
 from shared.task_text_fingerprint import TaskTextDrift
 
 from orchestrator.agents.harness_guidance import WAIT_PATTERN_REMINDER
@@ -324,7 +323,7 @@ def _format_followup_items(raw: object) -> str:
             f'⚠ `metadata.{FOLLOWUP_ITEMS_METADATA_KEY}` is malformed (a {type(raw).__name__}, not a '
             'list), so its observations cannot be shown here; read them from the task record.'
         )
-    items = [item for item in map(_followup_item_or_none, raw) if item is not None]
+    items = [item for item in map(parse_item, raw) if item is not None]
     lines = [
         f'{number}. {item.summary} — files: {", ".join(item.files)} (observed in task {item.origin_task})'
         for number, item in enumerate(items, start=1)
@@ -342,15 +341,6 @@ def _format_followup_items(raw: object) -> str:
         'Each numbered item is one observation this task was filed to address; the plan must '
         f'cover every one.\n\n{numbered}'
     )
-
-
-def _followup_item_or_none(element: object) -> FollowupItem | None:
-    if not isinstance(element, dict):
-        return None
-    try:
-        return FollowupItem.model_validate(element)
-    except ValidationError:
-        return None
 
 
 def _caller_agent_id(task_id: str | None, role: str) -> str:

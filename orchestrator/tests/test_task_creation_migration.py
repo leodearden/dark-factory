@@ -14,7 +14,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 from _orch_helpers import pydantic_spec
-from shared.followup_items import FOLLOWUP_ITEMS_METADATA_KEY, MAX_FOLLOWUP_ITEMS, MAX_SUMMARY_CHARS
+from shared.followup_items import FOLLOWUP_ITEMS_METADATA_KEY, FOLLOWUP_ITEMS_REFUSED_ERROR
 
 from orchestrator.agents.roles import (
     _FOLLOWUP_FILING_INSTRUCTIONS,
@@ -193,16 +193,18 @@ class TestFollowupBundlingPrompt:
         assert f'"{FOLLOWUP_ITEMS_METADATA_KEY}":' in _FOLLOWUP_FILING_INSTRUCTIONS
         assert '"summary":' in _FOLLOWUP_FILING_INSTRUCTIONS
         assert '"files":' in _FOLLOWUP_FILING_INSTRUCTIONS
-        assert f'at most {MAX_FOLLOWUP_ITEMS} items' in _FOLLOWUP_FILING_INSTRUCTIONS
-        assert f'at most {MAX_SUMMARY_CHARS} chars' in _FOLLOWUP_FILING_INSTRUCTIONS
 
     def test_the_template_does_not_ask_for_server_derived_keys(self):
         assert '"suggestion_hash":' not in _FOLLOWUP_FILING_INSTRUCTIONS
         assert '"escalation_id":' not in _FOLLOWUP_FILING_INSTRUCTIONS
 
+    def test_a_bundle_refusal_is_named_as_correctable(self):
+        assert f'`{FOLLOWUP_ITEMS_REFUSED_ERROR}`' in _FOLLOWUP_FILING_INSTRUCTIONS
+
     def test_steward_and_deep_reviewer_keep_their_templates(self):
         for role in (STEWARD, DEEP_REVIEWER):
             assert FOLLOWUP_ITEMS_METADATA_KEY not in role.system_prompt
+            assert FOLLOWUP_ITEMS_REFUSED_ERROR not in role.system_prompt
             assert '"suggestion_hash":' in role.system_prompt
 
 

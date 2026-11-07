@@ -131,10 +131,12 @@ class CandidateTask:
     items: tuple[FollowupItem, ...] = ()
 
     def payload_hash(self) -> str:
-        """Stable hash over fields the curator actually reads.
+        """Stable hash over the fields a curator decision depends on.
 
         Two candidates with the same hash get the same cached decision — this
-        prevents combine-on-combine drift when a creation is retried.
+        prevents combine-on-combine drift when a creation is retried. ``items``
+        is hashed ahead of the curator reading it (plans/follow-up-filing-shape-prd.md
+        §4.1), so a cached decision never outlives a change to a bundle.
         """
         h = hashlib.sha256()
         h.update(self.title.encode())

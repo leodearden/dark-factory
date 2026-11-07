@@ -4,7 +4,12 @@ import textwrap
 from dataclasses import dataclass, field
 from typing import Literal
 
-from shared.followup_items import FOLLOWUP_ITEMS_METADATA_KEY, MAX_FOLLOWUP_ITEMS, MAX_SUMMARY_CHARS
+from shared.followup_items import (
+    FOLLOWUP_ITEMS_METADATA_KEY,
+    FOLLOWUP_ITEMS_REFUSED_ERROR,
+    MAX_FOLLOWUP_ITEMS,
+    MAX_SUMMARY_CHARS,
+)
 from shared.governed_exceptions import DECLARATION_FORMS, INLINE_MARKER_FORMS
 from shared.prompt_artifact import PromptSpec
 
@@ -1556,6 +1561,9 @@ reaper to maybe recover:
         "directories. Do not send `escalation_id`, `suggestion_hash` or item keys:\n"
         "the submit boundary derives them from `spawned_from` and the items and\n"
         "overwrites any you send, which is what makes a re-filed observation dedupe.\n"
+        f"A `{FOLLOWUP_ITEMS_REFUSED_ERROR}` error is the exception to skipping: it is\n"
+        "correctable, so fix what its `reason` and `detail` name (add the file to the\n"
+        "top-level `files`, or move the extra items into a second call) and resubmit once.\n"
         'An observation that is not a work item is not filed here: see "## Escalation".\n'
         "A one-time operational ask that no agent can carry out (restart a service,\n"
         "run a script after X lands) IS filed here too: add\n"
