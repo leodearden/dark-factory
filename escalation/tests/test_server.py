@@ -1,8 +1,7 @@
 """Tests for L2 severity-gated born-at-L2 path and get_pending_escalations level filter.
 
-Drives tools through the shared wrappers in ``_tool_calls.py``,
-``_filing_tools.py``, ``_merge_tool_calls.py`` and ``_resolve_issue_call.py``,
-and uses tmp_path isolation with EscalationQueue.
+Drives tools through ``_tool_calls.py::call_tool``, directly or via a shared
+per-family wrapper, and uses tmp_path isolation with EscalationQueue.
 """
 
 from __future__ import annotations

@@ -28,6 +28,7 @@ import types
 from typing import Any
 
 from _tool_calls import call_tool
+from fastmcp import FastMCP
 
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
@@ -83,6 +84,6 @@ def _harness(statuses: dict[str, str], *, live: set[str] | None = None, **kw: An
     )
 
 
-async def _get_pending(server, **kwargs: Any) -> list[dict[str, Any]]:
+async def _get_pending(server: FastMCP, **kwargs: Any) -> list[dict[str, Any]]:
     """Invoke the server's ``get_pending_escalations`` tool with *kwargs*."""
     return await call_tool(server, 'get_pending_escalations', **kwargs)

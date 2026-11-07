@@ -1,9 +1,4 @@
-"""Contract tests for ``_tool_calls.call_tool``.
-
-Every in-process tool call in this suite reaches the server through this
-helper, either directly or through a per-family wrapper, so a regression here
-would change their premises while they stayed green.
-"""
+"""Contract tests for ``_tool_calls.call_tool``."""
 
 from __future__ import annotations
 
