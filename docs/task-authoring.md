@@ -1749,10 +1749,10 @@ writes. Only `subsumed_by` warns, pinned by
 `test_superseded_by_tier_b_alias_still_warns`
 (`shared/tests/test_task_metadata.py`). `x_coalesced_into` keeps its legacy
 readers, and the deferral `carried_by` record stays a hold with a carrier,
-not a supersession; neither is folded into `superseded_by`. The task key is
-deliberately not the Mem0 memory key `x_superseded_by`: same name, but a
-different store and shape. Contract: `plans/cancel-with-children-prd.md`
-§4.8.
+not a supersession; neither is folded into `superseded_by`. The task key
+deliberately does not reuse the Mem0 memory key `x_superseded_by`: one name
+for a different store and shape would mislead. Contract:
+`plans/cancel-with-children-prd.md` §4.8.
 
 ### Tier-C: ad-hoc keys
 
