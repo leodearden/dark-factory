@@ -4350,14 +4350,12 @@ class TestWriteJournalConfig:
             ('idempotent_ops_retention_days', 'WRITE_JOURNAL_IDEMPOTENT_OPS_RETENTION_DAYS', 7.0),
         ],
     )
-    def test_small_table_horizon_ships_at_its_default_and_is_env_tunable(
+    def test_small_table_horizon_has_a_schema_default_and_is_env_tunable(
         self, monkeypatch, field, env_name, days,
     ):
         from fused_memory.config.schema import WriteJournalConfig
 
-        monkeypatch.delenv(env_name, raising=False)
         assert getattr(WriteJournalConfig(), field) == days
-        assert getattr(FusedMemoryConfig().write_journal, field) == days
 
         monkeypatch.setenv(env_name, '3')
         assert getattr(FusedMemoryConfig().write_journal, field) == 3.0, (

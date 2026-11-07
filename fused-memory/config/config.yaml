@@ -269,9 +269,9 @@ taskmaster:
 # log at startup. Measured 2026-10-31: 416 rows from 2026-09-17 to 2026-10-31,
 # ~12.6/day, so the 365-day horizon keeps ~4.6k rows.
 #
-# mem0_intents_retention_days ages out terminal (completed/failed) mem0_intents
-# at startup; dead-lettered intents are never aged out. idempotent_ops_retention_days
-# ages out idempotent_ops client keys at startup.
+# mem0_intents_retention_days ages out terminal mem0_intents at startup (which
+# statuses count: services/write_journal.py::WriteJournal.prune_mem0_intents).
+# idempotent_ops_retention_days ages out idempotent_ops client keys at startup.
 # ─────────────────────────────────────────────────────────────────────────────
 write_journal:
   read_retention_days: ${WRITE_JOURNAL_READ_RETENTION_DAYS:30}
