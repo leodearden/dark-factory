@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -1073,7 +1074,7 @@ class TestFollowupItemsAtWriteBoundary:
     """
 
     @staticmethod
-    def _items_blob() -> dict[str, object]:
+    def _items_blob() -> dict[str, list[dict[str, Any]]]:
         items = [
             observed_item(summary='one', files=['pkg/a.py'], origin_task='8414'),
             observed_item(summary='two', files=['pkg/a.py', 'pkg/b.py'], origin_task='8414'),
@@ -1084,7 +1085,7 @@ class TestFollowupItemsAtWriteBoundary:
     async def test_a_dict_shaped_slice_is_rejected_with_no_row(self, make_backend, tmp_path):
         backend = await make_backend(enforce=True)
         project_root = str(tmp_path / 'enforce')
-        element = self._items_blob()[FOLLOWUP_ITEMS_METADATA_KEY][0]  # type: ignore[index]
+        element = self._items_blob()[FOLLOWUP_ITEMS_METADATA_KEY][0]
 
         with pytest.raises(TypeError):
             await backend.add_task(
@@ -1098,7 +1099,7 @@ class TestFollowupItemsAtWriteBoundary:
     async def test_an_element_without_files_is_rejected(self, make_backend, tmp_path):
         backend = await make_backend(enforce=True)
         project_root = str(tmp_path / 'enforce')
-        element = dict(self._items_blob()[FOLLOWUP_ITEMS_METADATA_KEY][0])  # type: ignore[index]
+        element = dict(self._items_blob()[FOLLOWUP_ITEMS_METADATA_KEY][0])
         element.pop('files')
 
         with pytest.raises(ValidationError):
