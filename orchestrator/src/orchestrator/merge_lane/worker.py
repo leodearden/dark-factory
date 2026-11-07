@@ -79,6 +79,12 @@ from orchestrator.main_health_fix_owner import (
     ensure_main_fix_owner,
 )
 from orchestrator.merge_lane.coalesce_unwind import restore_pre_stack_tips
+from orchestrator.merge_lane.dead_base_ledger import (
+    DeadBaseKiller,
+    DeadBaseLedger,
+    DeadBaseSite,
+    VoidPoint,
+)
 from orchestrator.merge_lane.disposition import (
     MergeFailureDisposition,
     SkewEvidence,
@@ -225,6 +231,19 @@ from orchestrator.merge_lane.verify_base_detector import (
     alarm_verify_base_divergence,
     detect_verify_base_divergence,
 )
+from orchestrator.merge_lane.verify_cancellation import (
+    RecordedDispatches,
+    VerifyCancel,
+    VerifyCancelCause,
+    VerifyDurationWindow,
+    merge_verify_cancelled_data,
+)
+from orchestrator.merge_verify_facts import (
+    BaseRelation,
+    MergeVerifyDispatchFacts,
+    RunnerReason,
+    classify_base_relation,
+)
 from orchestrator.remote_gate import GateIdentityPair, RunnerUnavailableKind
 from orchestrator.scheduler import StaleEvidenceRejection
 from orchestrator.task_status import WORKFLOW_PRESERVE_STATUSES
@@ -323,7 +342,7 @@ dead commit only needs to stay catchable until its stragglers re-dispatch —
 which the prompt-invalidation cascade + the dispatch/adoption dead-base checks
 do promptly — so evicting very old entries is safe: a false-negative on an
 ancient dead commit is unreachable in practice (such an item is long since
-re-merged).  Overridable per-instance via ``worker._dead_base_commits_cap`` in tests."""
+re-merged).  A test builds a smaller ledger with ``DeadBaseLedger(cap=...)``."""
 
 _TRAIN_PREDECESSOR_SETTLE_POLL_SECS = 0.05
 """Poll interval for :meth:`SpeculativeMergeWorker._await_unadvanced_predecessor`.
@@ -2423,6 +2442,19 @@ async def _record_flake_observation(
     )
 
 
+def _gate_dispatch_facts(
+    lease: HostLease | None, history_leg_command: str | None, *, fell_back: bool,
+) -> MergeVerifyDispatchFacts:
+    """The dispatch facts of a gate re-verify, which verifies the head rebased onto main."""
+    if fell_back:
+        reason = RunnerReason.REMOTE_QUARANTINED
+    elif lease is None or history_leg_command is not None:
+        reason = RunnerReason.LOCAL_ONLY_RULE
+    else:
+        reason = RunnerReason.GATE_ON_HEAD_HOST
+    return MergeVerifyDispatchFacts(runner_reason=reason, base_relation=BaseRelation.MAIN)
+
+
 async def _run_post_merge_verify(
     git_ops: GitOps,
     req: MergeRequest,
@@ -2453,6 +2485,7 @@ async def _run_post_merge_verify(
     main_sha: str | None = None,
     verifier: VerifyPort = PRODUCTION_VERIFIER,
     history_leg_command: str | None = None,
+    dispatch_facts: MergeVerifyDispatchFacts | None = None,
 ) -> MergeOutcome | None:
     """Run post-merge verification for a single task.
 
@@ -2614,6 +2647,9 @@ async def _run_post_merge_verify(
             ``history_leg.py::HistoryLegRunner``, instead of the full gate;
             every step around the dispatch is unchanged.  ``None`` (default)
             runs the full gate.
+        dispatch_facts: The ``runner_reason``/``base_relation`` attempt 0's
+            ``merge_verify`` row carries; every retry reports it as
+            ``retry_held_host`` (``orchestrator/merge_verify_facts.py``).
     """
     # Normalize the narrowed-budget counter dict once up front (task 2835):
     # None (the default for every unmigrated caller) becomes a fresh,
@@ -2856,7 +2892,9 @@ async def _run_post_merge_verify(
         verify = await pool.dispatch(
             merge_sha, spec, depth=depth, speculative=speculative,
             chain_items=chain_items, chain_build_ms=chain_build_ms,
+            dispatch_facts=dispatch_facts,
         )
+        retry_facts = (dispatch_facts or MergeVerifyDispatchFacts()).as_retry()
 
         # Transient-infra (disk pressure) retry: an ENOSPC failure is
         # often a self-healing host condition.  Prune stale _merge-*
@@ -2879,6 +2917,7 @@ async def _run_post_merge_verify(
                 verify = await pool.dispatch(
                     merge_sha, spec, attempt=1, depth=depth, speculative=speculative,
                     chain_items=chain_items, chain_build_ms=chain_build_ms,
+                    dispatch_facts=retry_facts,
                 )
         # Classified infra-transient retry (task ν, verify-scope-inversion-prd.md):
         # a failing VerifyResult whose category is policy-table infra-transient
@@ -2989,7 +3028,7 @@ async def _run_post_merge_verify(
                 verify = await pool.dispatch(
                     merge_sha, spec, attempt=retries[req.task_id], depth=depth,
                     speculative=speculative, chain_items=chain_items,
-                    chain_build_ms=chain_build_ms,
+                    chain_build_ms=chain_build_ms, dispatch_facts=retry_facts,
                 )
 
     # Task ε: record EVERY attempt's flake observation, oldest first.
@@ -4431,6 +4470,7 @@ class _TrainMergeHost(Protocol):
         verify_task: asyncio.Task[Any] | None,
         task_id: str,
         *,
+        cancel: VerifyCancel | None,
         shutdown_defensive: bool = False,
     ) -> None: ...
 
@@ -5930,6 +5970,13 @@ async def _run_verify_reaped(
     return task.result()
 
 
+def _slot_cancel(
+    cause: VerifyCancelCause, entry_slot: InflightEntrySlot | None, lease: HostLease | None,
+) -> VerifyCancel:
+    """The cancel of the verify *entry_slot* wraps, running on *lease*."""
+    return VerifyCancel.of(cause, entry_slot.entry if entry_slot is not None else None, lease)
+
+
 class _TrainVerifyHost:
     """The host a train's verifies run on: the slot it leased, or unleased local."""
 
@@ -5996,7 +6043,7 @@ class _TrainVerifyHost:
         """
         return await _run_verify_reaped(verify, reap=functools.partial(
             self._worker._teardown_verify_task,
-            self._lease, task_id=self._task_id, shutdown_defensive=True,
+            self._lease, task_id=self._task_id, cancel=None, shutdown_defensive=True,
         ))
 
     async def release(self, *, aborted: bool) -> None:
@@ -8405,14 +8452,14 @@ class SpeculativeMergeWorker:
         # SET of merge commits that were failed/ejected/superseded/re-merged since
         # creation — orphaned speculative bases that will never land on main.  A
         # speculative item whose base_sha ∈ this set has a BROKEN chain and its
-        # verdict is VOID (see _chain_dead_link).  Membership is the primary
-        # structure (checked in the hot path); _dead_base_order tracks FIFO
-        # insertion order so _record_dead_base can evict the oldest past the cap.
-        # Bounded so it cannot grow unboundedly across a long worker lifetime.
-        self._dead_base_commits: set[str] = set()
-        self._dead_base_order: collections.deque[str] = collections.deque()
-        # Overridable in tests for fast eviction checks (mirrors _shutdown_timeout).
-        self._dead_base_commits_cap: int = _DEAD_BASE_COMMITS_CAP
+        # verdict is VOID (see _chain_dead_link).  Each entry keeps the killer
+        # that first recorded it (task 8523).  Bounded so it cannot grow
+        # unboundedly across a long worker lifetime.
+        self._dead_base_commits = DeadBaseLedger(cap=_DEAD_BASE_COMMITS_CAP)
+        # merge_verify_cancelled state (task 8523): per-host completed-verify
+        # durations (the fraction's denominator) and the dispatches already recorded.
+        self._verify_durations = VerifyDurationWindow(maxlen=20)
+        self._cancelled_dispatches = RecordedDispatches(cap=256)
         # γ cross-iteration state promoted from loop-locals: set by finalize after
         # each head result; read by dispatch to decide chain re-merge.
         # Single-host: byte-identical (deque is always empty at dispatch point).
@@ -10537,7 +10584,7 @@ class SpeculativeMergeWorker:
             if (d := e.verify_base_divergence) is not None
         )
 
-    def _record_dead_base(self, *shas: str) -> None:
+    def _record_dead_base(self, *shas: str, killer: DeadBaseKiller) -> None:
         """Record merge commit(s) as dead bases in the INV-3 chain-liveness ledger.
 
         A commit passed here was failed/ejected/superseded/re-merged, so any
@@ -10546,28 +10593,18 @@ class SpeculativeMergeWorker:
         (head-failure cascade, dispatch chain-invalidation discard, adoption-time
         void, RUNNER_UNAVAILABLE re-merge, rebased landing) so a built-awaiting-host
         straggler that the cascade missed is still caught at its next dispatch.
-
-        Bounded FIFO (cap ``self._dead_base_commits_cap``): past the cap the
-        oldest recorded commit is evicted from BOTH the membership set and the
-        order deque.  Empty/blank SHAs and already-recorded duplicates are
-        no-ops.  Pure / synchronous.
+        *killer* names that site; the ledger keeps a commit's first killer.
         """
         for sha in shas:
-            if not sha:
-                continue
-            s = sha.strip()
-            if not s or s in self._dead_base_commits:
-                continue
-            self._dead_base_commits.add(s)
-            self._dead_base_order.append(s)
-            while len(self._dead_base_order) > self._dead_base_commits_cap:
-                evicted = self._dead_base_order.popleft()
-                self._dead_base_commits.discard(evicted)
+            self._dead_base_commits.record(sha, killer)
 
-    def _record_item_commit_dead(self, item: SpeculativeItem) -> None:
+    def _record_item_commit_dead(self, item: SpeculativeItem, site: DeadBaseSite) -> None:
         """Record *item*'s own merge commit as a dead base; a DecidedItem built none."""
         if isinstance(item, RealMergeItem):
-            self._record_dead_base(item.merge_result.merge_commit or '')
+            self._record_dead_base(
+                item.merge_result.merge_commit or '',
+                killer=DeadBaseKiller(site, item.request.task_id),
+            )
 
     def _chain_dead_link(self, item: SpeculativeItem, main_sha: str) -> str | None:
         """Return the dead base link iff *item*'s chain is BROKEN, else None (INV-3).
@@ -13596,6 +13633,7 @@ class SpeculativeMergeWorker:
             # racing its own finally-block releases is safe.
             await self._teardown_verify_task(
                 _fh_entry.lease, _fh_entry.verify_task, _fh_req.task_id,
+                cancel=VerifyCancel.of(VerifyCancelCause.SHUTDOWN, _fh_entry),
                 shutdown_defensive=True,
             )
             if _fh_entry.merge_wt is not None:
@@ -13714,6 +13752,7 @@ class SpeculativeMergeWorker:
                 # CancelledError cannot abort the drain loop.
                 await self._teardown_verify_task(
                     _ie.lease, _ie.verify_task, _ie_req.task_id,
+                    cancel=VerifyCancel.of(VerifyCancelCause.SHUTDOWN, _ie),
                     shutdown_defensive=True,
                 )
             await self._release_drained_worktrees(_ie)
@@ -13858,6 +13897,60 @@ class SpeculativeMergeWorker:
                 event_type, task_id=task_id, phase='merge',
                 data={k: str(v) for k, v in data.items()},
             )
+
+    def _note_verify_completed(
+        self, out: object, entry_slot: InflightEntrySlot | None, lease: HostLease | None,
+    ) -> None:
+        """Add a verify that ran to a verdict to its host's duration window.
+
+        *out* is whatever the verify task returned; only a low-disk
+        ``verify_skipped`` outcome is left out, because it ran no verify.
+        """
+        entry = entry_slot.entry if entry_slot is not None else None
+        if lease is None or entry is None or entry.started_at is None:
+            return
+        if isinstance(out, MergeOutcome) and out.verify_skipped:
+            return
+        self._verify_durations.record(
+            lease.name, (self._clock.now() - entry.started_at) * 1000,
+        )
+
+    def _emit_verify_cancelled(self, task_id: str, cancel: VerifyCancel) -> None:
+        """Write one ``merge_verify_cancelled`` row, unless this dispatch already has one."""
+        if not self._event_store or not self._cancelled_dispatches.claim(task_id, cancel):
+            return
+        self._event_store.emit(
+            EventType.merge_verify_cancelled, task_id=task_id, phase='merge',
+            data=merge_verify_cancelled_data(
+                cancel, now=self._clock.now(), window=self._verify_durations,
+            ),
+        )
+
+    def _emit_verdict_voided(
+        self, req: MergeRequest, item: SpeculativeItem, dead_link: str, *, point: VoidPoint,
+    ) -> None:
+        """Emit ``verdict_voided`` with the voided item's commit and its base's killer.
+
+        Not through :meth:`_emit_speculative`, which str()-ifies every value:
+        ``killer`` is a nested ``{site, task_id}`` object.  Call it before the
+        site records the item's own commit dead, so a full ledger cannot evict
+        *dead_link* before its killer is looked up.
+        """
+        if not self._event_store:
+            return
+        killer = self._dead_base_commits.killer_of(dead_link)
+        self._event_store.emit(
+            EventType.verdict_voided, task_id=req.task_id, phase='merge',
+            data={
+                'dead_link': dead_link,
+                'reason': 'chain_dead',
+                'point': point.value,
+                'item_commit': (
+                    item.merge_result.merge_commit if isinstance(item, RealMergeItem) else None
+                ),
+                'killer': killer.to_wire() if killer is not None else None,
+            },
+        )
 
     # ------------------------------------------------------------------
     # Out-of-band delivery helper
@@ -15353,7 +15446,7 @@ class SpeculativeMergeWorker:
     async def _release_parked_gate_head(self, head: InflightEntry) -> None:
         """Tear down a detached head's gate, then release its lease, speculation
         permit and drift base."""
-        await self._teardown_parked_gate(head)
+        await self._teardown_parked_gate(head, VerifyCancelCause.SHUTDOWN)
         with contextlib.suppress(BaseException):
             await self._cancel_and_release_tracked(head.lease)
         head.lease = None
@@ -15361,7 +15454,9 @@ class SpeculativeMergeWorker:
             self._speculation_ledger.release(head.permit)
         self._drift_base.pop(head.item.request.request_id, None)
 
-    async def _teardown_parked_gate(self, entry: InflightEntry) -> Path | None:
+    async def _teardown_parked_gate(
+        self, entry: InflightEntry, cause: VerifyCancelCause,
+    ) -> Path | None:
         """Cancel and reap *entry*'s parked gate re-verify and return its worktree.
 
         Returns that worktree, already released (warm or cold, as the
@@ -15377,7 +15472,11 @@ class SpeculativeMergeWorker:
         if gate is None:
             return None
         await self._teardown_verify_task(
-            None, gate.task, entry.item.request.task_id, shutdown_defensive=True,
+            None, gate.task, entry.item.request.task_id,
+            cancel=VerifyCancel(
+                cause, gate.started_at, entry.lease.name if entry.lease else None,
+            ),
+            shutdown_defensive=True,
         )
         with contextlib.suppress(BaseException):
             await self._release_or_cleanup(
@@ -15393,7 +15492,7 @@ class SpeculativeMergeWorker:
         first, and the entry's own merge worktree is cold-removed only when it
         is a different path, so a warm lane is never released and then removed.
         """
-        gate_wt = await self._teardown_parked_gate(entry)
+        gate_wt = await self._teardown_parked_gate(entry, VerifyCancelCause.SHUTDOWN)
         if entry.merge_wt is not None and entry.merge_wt != gate_wt:
             with contextlib.suppress(BaseException):
                 await self._cleanup_owned_merge_worktree(entry.merge_wt)
@@ -15409,7 +15508,7 @@ class SpeculativeMergeWorker:
         """
         await self._finalize_inflight(entry)
         if entry.gate is not None:
-            await self._teardown_parked_gate(entry)
+            await self._teardown_parked_gate(entry, VerifyCancelCause.FINALIZE_ERROR)
             raise RuntimeError(
                 f'task {entry.item.request.task_id}: a passthrough finalize '
                 'parked on a gate re-verify',
@@ -15764,7 +15863,7 @@ class SpeculativeMergeWorker:
                     # (enforcement (a)) instead of verifying against it.  Each
                     # downstream entry's OLD commit is recorded below, just before
                     # its own _remerge replaces the item.
-                    self._record_item_commit_dead(head.item)
+                    self._record_item_commit_dead(head.item, DeadBaseSite.HEAD_FAILED)
 
                     # Detect whether the head failure was due to operator halt
                     # (REQUEUED sentinel).  In that case downstream tasks will
@@ -15824,6 +15923,7 @@ class SpeculativeMergeWorker:
                                     _entry.lease,
                                     _entry.verify_task,
                                     _entry.item.request.task_id,
+                                    cancel=VerifyCancel.of(VerifyCancelCause.CASCADE, _entry),
                                 )
                                 # Peek at the completed result to detect REQUEUED
                                 # (operator-halt): the request is already back on
@@ -15920,7 +16020,9 @@ class SpeculativeMergeWorker:
                             # is about to be re-merged away, so a straggler stacked
                             # on it now has a dangling successor edge.  Recording it
                             # dead makes that straggler catchable at dispatch.
-                            self._record_item_commit_dead(_entry.item)
+                            self._record_item_commit_dead(
+                                _entry.item, DeadBaseSite.CASCADE_REMERGE,
+                            )
                             _rid = _entry.item.request.request_id
                             _from_state = self._lifecycle.current(_rid)
                             if _from_state is not None:
@@ -16650,10 +16752,18 @@ class SpeculativeMergeWorker:
         verify_task: asyncio.Task | None,
         task_id: str,
         *,
+        cancel: VerifyCancel | None,
         shutdown_defensive: bool = False,
     ) -> None:
         """THE verify-abort teardown: signal the REMOTE verify, then cancel and
         reap the LOCAL verify task (task 3204).
+
+        *cancel* (required keyword) is the deliberate canceller's record: when
+        it is given and *verify_task* is still running, one
+        ``merge_verify_cancelled`` row is written before the abort, unless
+        this dispatch already has one (``RecordedDispatches``).  Reaps
+        reacting to an outer cancel pass ``None``, because the canceller of
+        the outer task already recorded it.
 
         The sole caller of BOTH steps — :meth:`_abort_remote_verify` and
         ``verify_task.cancel()`` — enforced by
@@ -16742,6 +16852,8 @@ class SpeculativeMergeWorker:
         the teardown at several sites are likewise left in place: they differ
         in both order and content between sites.
         """
+        if cancel is not None and verify_task is not None and not verify_task.done():
+            self._emit_verify_cancelled(task_id, cancel)
         if lease is not None:
             if shutdown_defensive:
                 with contextlib.suppress(BaseException):
@@ -17044,16 +17156,20 @@ class SpeculativeMergeWorker:
         ``on_unavailable`` chokepoint and the gate re-runs on local, leaseless,
         never blocking the item; its restart-drain deadline restarts with it.
         An interrupted remote attempt is aborted on its host while still live.
+        Each row's ``runner_reason`` says which of these arms ran it.
         """
+        fell_back = False
         if lease is not None and not lease.is_local and history_leg_command is None:
             try:
                 return await _run_verify_reaped(
                     self._lane_post_merge_verify(
-                        git_ops, req, merge_wt, runner=lease.runner, **gate_kwargs,
+                        git_ops, req, merge_wt, runner=lease.runner,
+                        dispatch_facts=_gate_dispatch_facts(lease, None, fell_back=False),
+                        **gate_kwargs,
                     ),
                     reap=functools.partial(
                         self._teardown_verify_task,
-                        lease, task_id=req.task_id, shutdown_defensive=True,
+                        lease, task_id=req.task_id, cancel=None, shutdown_defensive=True,
                     ),
                 )
             except RunnerUnavailable as exc:
@@ -17064,8 +17180,11 @@ class SpeculativeMergeWorker:
                 )
                 self.bench_unavailable_runner(lease.name, exc)
                 self._note_verify_started(req.request_id)
+                fell_back = True
         return await self._lane_post_merge_verify(
-            git_ops, req, merge_wt, history_leg_command=history_leg_command, **gate_kwargs,
+            git_ops, req, merge_wt, history_leg_command=history_leg_command,
+            dispatch_facts=_gate_dispatch_facts(lease, history_leg_command, fell_back=fell_back),
+            **gate_kwargs,
         )
 
     async def _run_inflight_verify(
@@ -17087,6 +17206,7 @@ class SpeculativeMergeWorker:
         chain: ChainResult | None = None,
         verify_wt: VerifyWorktreeHandle | None = None,
         entry_slot: InflightEntrySlot | None = None,
+        dispatch_facts: MergeVerifyDispatchFacts | None = None,
     ) -> InflightVerifyResult:
         """Run the verify portion for one in-flight item.
 
@@ -17477,6 +17597,7 @@ class SpeculativeMergeWorker:
                 chain_build_ms=chain_build_ms,
                 merge_base_sha=verify_base.merge_base_sha,
                 main_sha=verify_base.main_sha,
+                dispatch_facts=dispatch_facts,
             ))
             # Abort trigger 3's progress watch, seeded unconditionally (both
             # lease kinds) before the first await, so a coasting remote lease
@@ -17521,6 +17642,7 @@ class SpeculativeMergeWorker:
                 )
                 if verify_task in done:
                     out = verify_task.result()
+                    self._note_verify_completed(out, entry_slot, lease)
                     # ── task 3186 (PRD δ): THE ADOPT DECISION ──────────────
                     # Made HERE, the moment the verdict exists, because the
                     # `finally` below runs BEFORE the chain arm's exit block
@@ -17537,7 +17659,10 @@ class SpeculativeMergeWorker:
                 # DROP the request.  Checked first so a gave-up waiter wins
                 # over the operator-halt re-queue when both hold simultaneously.
                 if self._request_abandoned(req):
-                    await self._teardown_verify_task(lease, verify_task, req.task_id)
+                    await self._teardown_verify_task(
+                        lease, verify_task, req.task_id,
+                        cancel=_slot_cancel(VerifyCancelCause.ABANDONED, entry_slot, lease),
+                    )
                     await _dispose_verify_worktree()
                     # task 2420 amend (reviewer finding, resource_cleanup): this
                     # request is DROPPED (sole waiter gave up) — the per-task
@@ -17584,7 +17709,10 @@ class SpeculativeMergeWorker:
                         'and re-queuing merge for re-verify after un-halt',
                         req.task_id,
                     )
-                    await self._teardown_verify_task(lease, verify_task, req.task_id)
+                    await self._teardown_verify_task(
+                        lease, verify_task, req.task_id,
+                        cancel=_slot_cancel(VerifyCancelCause.OPERATOR_HALT, entry_slot, lease),
+                    )
                     await _dispose_verify_worktree()
                     await self._requeue_from_verify(item, entry_slot)
                     # task 3003 amend (robustness): an operator-halt requeue is
@@ -17649,7 +17777,10 @@ class SpeculativeMergeWorker:
                         _abort.max_strikes,
                     )
                     emit_no_progress_abort(self._event_store, _abort)
-                    await self._teardown_verify_task(lease, verify_task, req.task_id)
+                    await self._teardown_verify_task(
+                        lease, verify_task, req.task_id,
+                        cancel=_slot_cancel(VerifyCancelCause.NO_PROGRESS, entry_slot, lease),
+                    )
                     await _dispose_verify_worktree()
                     # task 3003 amend (robustness): a no-progress abort — requeue
                     # or busy-loop cap — is not lane contention either (the verify
@@ -18186,7 +18317,7 @@ class SpeculativeMergeWorker:
                             asyncio.shield(
                                 self._teardown_verify_task(
                                     None, verify_task, req.task_id,
-                                    shutdown_defensive=True,
+                                    cancel=None, shutdown_defensive=True,
                                 )
                             ),
                             timeout=self.ORPHAN_REAP_TIMEOUT_SECS,
@@ -18508,15 +18639,12 @@ class SpeculativeMergeWorker:
         _spec_warm = vr.spec_warm if vr is not None else False
         if _wt is not None:
             await self._release_or_cleanup(_wt, spec_warm=_spec_warm)
-        self._emit_speculative(
-            EventType.verdict_voided, req.task_id,
-            dead_link=dead_link, reason='chain_dead', point='adoption',
-        )
+        self._emit_verdict_voided(req, item, dead_link, point=VoidPoint.ADOPTION)
         self._note_transition(
             req.request_id, ItemLifecycleState.FINALIZING,
             ItemLifecycleState.MERGING, live_obj=entry,
         )
-        self._record_item_commit_dead(item)
+        self._record_item_commit_dead(item, DeadBaseSite.ADOPTION_VOID)
         # §5.3 re-merge carve-out, consumer 2/5 — INV-3 adoption-time void
         # (PRD §5.3).  This site is also the reason §5.3 needs no dispatch-time
         # enforcement: it is where a verdict built on a known-dead base is
@@ -18694,6 +18822,7 @@ class SpeculativeMergeWorker:
             )
             await self._teardown_verify_task(
                 head.lease, head.verify_task, head_task_id,
+                cancel=VerifyCancel.of(VerifyCancelCause.TIP_ADOPTED, head),
             )
             await self._cancel_and_release_tracked(head.lease)
             head.lease = None
@@ -19499,7 +19628,7 @@ class SpeculativeMergeWorker:
                 # record it dead so a straggler stacked on it is caught at
                 # dispatch (parity with the head-failure cascade + Mechanism-2
                 # discard remerge sites).
-                self._record_item_commit_dead(entry.item)
+                self._record_item_commit_dead(entry.item, DeadBaseSite.RUNNER_UNAVAILABLE)
                 self._note_transition(
                     req.request_id, ItemLifecycleState.FINALIZING,
                     ItemLifecycleState.MERGING, live_obj=entry,
@@ -19986,7 +20115,9 @@ class SpeculativeMergeWorker:
             )
             return True
         # INV-3 (task 6273): the rebase superseded current_sha; it will never be on main.
-        self._record_dead_base(current_sha)
+        self._record_dead_base(
+            current_sha, killer=DeadBaseKiller(DeadBaseSite.GATE_REBASED, req.task_id),
+        )
         # ι=1894: count this as a merge retry — main advanced under the
         # request, so a fresh re-verify is required.  Both cas_failed and
         # rebased_pending_reverify are included in retries_per_landing (see
@@ -20023,6 +20154,7 @@ class SpeculativeMergeWorker:
             candidate=candidate,
             rebased_sha=rebased_sha,
             rebased_onto=rebased_onto,
+            started_at=self._clock.now(),
         )
         return False
 
@@ -20122,6 +20254,16 @@ class SpeculativeMergeWorker:
             ItemLifecycleState.FINALIZING, live_obj=entry,
         )
         return candidate.reanchored(item, gate.rebased_sha)
+
+    def _frontier_base_commits(self) -> tuple[set[str], set[str]]:
+        """The frozen prefix's merge commits and gate-rebased heads a dispatch may be built on."""
+        frozen = self._frozen_inflight_entries()
+        stacked_on = {
+            e.item.merge_result.merge_commit for e in frozen
+            if isinstance(e.item, RealMergeItem) and e.item.merge_result.merge_commit
+        }
+        rebased_heads = {e.gate.rebased_sha for e in frozen if e.gate is not None}
+        return stacked_on, rebased_heads
 
     async def _dispatch_item(
         self,
@@ -20304,10 +20446,7 @@ class SpeculativeMergeWorker:
             # merge_wt is a required non-None Path on a RealMergeItem (task ο);
             # _chain_dead_link returned non-None → item is a RealMergeItem here.
             await self._cleanup_owned_merge_worktree(item.merge_wt)
-            self._emit_speculative(
-                EventType.verdict_voided, req.task_id,
-                dead_link=_dispatch_dead, reason='chain_dead', point='dispatch',
-            )
+            self._emit_verdict_voided(req, item, _dispatch_dead, point=VoidPoint.DISPATCH)
             logger.info(
                 'Task %s: dead-base straggler at dispatch (dead link %s) — '
                 're-merging against actual main instead of burning a verify',
@@ -20320,7 +20459,7 @@ class SpeculativeMergeWorker:
             # other invalidation sites (head-failure cascade, RUNNER_UNAVAILABLE,
             # and the Mechanism-2 staleness discard just below), all of which
             # record the old commit dead for the identical reason.
-            self._record_item_commit_dead(item)
+            self._record_item_commit_dead(item, DeadBaseSite.DISPATCH_VOID)
             # §5.3 re-merge carve-out, consumer 4/5 — dead-base straggler at
             # dispatch (PRD §5.3).  This site is the CIRCULARITY argument in the
             # flesh: it exists to ESCAPE a base known dead, and
@@ -20455,7 +20594,7 @@ class SpeculativeMergeWorker:
                 # this stale merge is about to be re-merged away — record its
                 # now-orphaned commit dead so a straggler stacked on it is caught
                 # by the dispatch-time dead-base re-check.
-                self._record_item_commit_dead(item)
+                self._record_item_commit_dead(item, DeadBaseSite.STALE_DISCARD)
                 # §5.3 re-merge carve-out, consumer 5/5 — Mechanism-2
                 # staleness / chain-invalidation: targets real main, not
                 # frozen_prefix_tip().  PRD §5.3.
@@ -20572,6 +20711,7 @@ class SpeculativeMergeWorker:
             #      region, not a `return` -- a `return` is a normal exit and no
             #      `except` arm sees it.  Trap 2 stands unchanged.)
             verify_base_divergence: VerifyBaseDivergence | None = None
+            _guard_main_sha: str | None = None
             try:
                 _guard_main_sha = await self._git_ops.get_main_sha()
                 # DEFECT 2 (task 2357): refresh the §5.3 snapshot cache from the
@@ -20584,6 +20724,15 @@ class SpeculativeMergeWorker:
                 )
             except Exception:
                 pass  # fail-open: skip the check (and the refresh) on any git error
+            # Vocabulary: orchestrator/merge_verify_facts.py.
+            stacked_on, rebased_heads = self._frontier_base_commits()
+            dispatch_facts = MergeVerifyDispatchFacts(
+                runner_reason=lease.reason,
+                base_relation=classify_base_relation(
+                    item.base_sha, main_sha=_guard_main_sha,
+                    stacked_on=stacked_on, rebased_heads=rebased_heads,
+                ),
+            )
 
             # ── Launch background verify task ────────────────────────────────────
             # depth (task 2340) is computed synchronously HERE — before
@@ -20702,7 +20851,7 @@ class SpeculativeMergeWorker:
             self._run_inflight_verify(
                 item, lease, depth=depth, probe_base=probe_base,
                 chain_items=chain_items, chain=chain, verify_wt=verify_wt,
-                entry_slot=entry_slot,
+                entry_slot=entry_slot, dispatch_facts=dispatch_facts,
             )
         )
 

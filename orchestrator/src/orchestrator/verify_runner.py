@@ -66,6 +66,7 @@ from orchestrator import flake_ledger, verify
 from orchestrator.config import EnvProbeConfig, ModuleConfig, VerifyHostPolicy
 from orchestrator.deployed_sha import DeployedSha, resolve_code_checkout
 from orchestrator.event_store import EventType
+from orchestrator.merge_verify_facts import MergeVerifyDispatchFacts, RunnerReason
 from orchestrator.remote_gate import (
     ENSURE_CLIENT_TIMEOUT_SECS,
     SHIM_REMEDY,
@@ -2530,6 +2531,7 @@ class VerifyRunnerPool:
         speculative: bool | None = None,
         chain_items: int = 1,
         chain_build_ms: int | None = None,
+        dispatch_facts: MergeVerifyDispatchFacts | None = None,
     ) -> VerifyResult:
         """Run the verify bundle and emit a merge_verify event.
 
@@ -2584,6 +2586,12 @@ class VerifyRunnerPool:
         ``merge_verify`` doc-comment in ``event_store.py`` for the full field
         note.
 
+        ``dispatch_facts`` (task 8523) supplies ``runner_reason`` and
+        ``base_relation``; both keys are always present, None when the caller
+        reported no allocation decision.  A RunnerUnavailable fallback to
+        local reports ``remote_quarantined``.  Vocabulary:
+        ``orchestrator/merge_verify_facts.py``.
+
         Fail-safe (PRD §A Invariant 2 / D5): if the selected runner raises
         RunnerUnavailable, dispatch reports it to the pool's *on_unavailable*
         sink and falls back to the local runner (if distinct), logging exactly
@@ -2630,6 +2638,10 @@ class VerifyRunnerPool:
                 # RunnerUnavailable→local fallback: always 2-arg (local never archives remote stderr)
                 result = await self._local.run_merge_verify(merge_sha, spec)
                 actual_runner = self._local
+                dispatch_facts = dataclasses.replace(
+                    dispatch_facts or MergeVerifyDispatchFacts(),
+                    runner_reason=RunnerReason.REMOTE_QUARANTINED,
+                )
             else:
                 raise
         duration_ms = round((time.monotonic() - t0) * 1000)
@@ -2688,6 +2700,7 @@ class VerifyRunnerPool:
                     # dispatch()'s docstring for why the default is 1.
                     'chain_items': chain_items,
                     'chain_build_ms': chain_build_ms,
+                    **(dispatch_facts or MergeVerifyDispatchFacts()).event_fields(),
                     # task 2837 (PRD verify-retry-failed-only D5): retry_scope +
                     # retry_subset_sizes — always-present (None for a full/legacy
                     # verify), derived from the D2 failed-only contract carried in
@@ -4124,11 +4137,18 @@ class HostLease:
     name      : host name (matches RemoteRunner.name, or 'local' for the local slot)
     runner    : the VerifyRunner instance assigned to this slot
     is_local  : True when name == 'local' (LocalRunner)
+    reason    : why :meth:`HostAllocator.acquire` granted this host; None for a
+                lease taken by ``acquire_local``/``acquire_remote`` directly
     """
 
     name: str
     runner: Any
     is_local: bool
+    reason: RunnerReason | None = None
+
+
+def _with_reason(lease: HostLease | None, reason: RunnerReason) -> HostLease | None:
+    return None if lease is None else dataclasses.replace(lease, reason=reason)
 
 
 class HostAllocator:
@@ -4251,18 +4271,32 @@ class HostAllocator:
         Eligibility is NOT re-checked here: acquire_remote() already demands a
         FREE, non-quarantined, non-PARKED slot, so a busy, quarantined or
         PARKED remote falls through to local on its own.
+
+        The returned lease's ``reason`` records the decision as a
+        :class:`~orchestrator.merge_verify_facts.RunnerReason`.
         """
         match policy:
             case 'prefer_local':
                 local = self.acquire_local(local_factory)
-                return local if local is not None else self.acquire_remote()
+                if local is not None:
+                    return _with_reason(local, RunnerReason.PREFER_LOCAL_FREE)
+                return _with_reason(self.acquire_remote(), RunnerReason.LOCAL_BUSY)
             case 'prefer_remote':
                 remote = self.acquire_remote()
                 if remote is not None:
-                    return remote
-                return self.acquire_local(local_factory)
+                    return _with_reason(remote, RunnerReason.PREFER_REMOTE_FREE)
+                fallback_reason = self._local_fallback_reason()
+                return _with_reason(self.acquire_local(local_factory), fallback_reason)
             case _:
                 assert_never(policy)
+
+    def _local_fallback_reason(self) -> RunnerReason:
+        """Why no remote was taken; read before local is, so slot state is current."""
+        if not self._remote_runners:
+            return RunnerReason.LOCAL_ONLY_RULE
+        if any(self._slots[name] == _SLOT_BUSY for name in self._remote_runners):
+            return RunnerReason.REMOTE_BUSY
+        return RunnerReason.REMOTE_QUARANTINED
 
     async def release(self, lease: HostLease) -> None:
         """Release a held slot back to FREE.  Idempotent."""

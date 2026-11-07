@@ -9448,7 +9448,8 @@ class TestMergedBranchTipCarryThroughRebuild:
 
         def _spy_replace(obj, **changes):
             rebuilt = _real_replace(obj, **changes)
-            captured.append(rebuilt)
+            if isinstance(rebuilt, (RealMergeItem, DecidedItem)):
+                captured.append(rebuilt)
             return rebuilt
 
         pyright_clean = MagicMock(broken=False, failing_subprojects=[], detail='')
@@ -9534,7 +9535,8 @@ class TestMergedBranchTipCarryThroughRebuild:
 
         def _spy_replace(obj, **changes):
             rebuilt = _real_replace(obj, **changes)
-            captured.append(rebuilt)
+            if isinstance(rebuilt, (RealMergeItem, DecidedItem)):
+                captured.append(rebuilt)
             return rebuilt
 
         advance_calls = [0]

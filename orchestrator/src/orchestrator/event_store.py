@@ -205,7 +205,20 @@ class EventType(StrEnum):
     # PLUS three always-present, nullable keys (task 5651): plan_hash,
     # cache_mode and units, defined by
     # orchestrator/src/orchestrator/verify_evidence.py::verify_event_fields.
+    # PLUS two always-present, nullable keys (task 8523): runner_reason (why
+    # the verify ran on that host) and base_relation (what the merge was built
+    # on); vocabulary in orchestrator/src/orchestrator/merge_verify_facts.py,
+    # rationale in plans/merge-lane-policy-prd.md D10.
     merge_verify = 'merge_verify'
+    # The merge lane cancelled a still-running merge verify (task 8523).
+    # task_id-keyed, phase='merge'; emitted by
+    # orchestrator/src/orchestrator/merge_lane/worker.py::
+    # SpeculativeMergeWorker._teardown_verify_task.  data {elapsed_ms, fraction,
+    # cause, host} per orchestrator/src/orchestrator/merge_lane/
+    # verify_cancellation.py::merge_verify_cancelled_data: elapsed from the
+    # entry's dispatch; fraction against the host's rolling median completed
+    # verify, null until that host has completed one in this process.
+    merge_verify_cancelled = 'merge_verify_cancelled'
     # A merge-role scoped-verify red that the isolated-rerun-confirm gate
     # (verify.apply_merge_flake_suppression, PRD task α) demonstrated was a
     # CPU-starvation flake and suppressed so the merge could proceed.
@@ -326,13 +339,17 @@ class EventType(StrEnum):
     # Emitted from enqueue_merge_request's terminal done-callback when a
     # MergeRequest future reaches its final state (resolved, cancelled, or
     # exception).  Payload shape: {request_id, branch, state, snapshot_tip,
-    # merge_sha, superseded_by, generation, reason, landed_via_chain}.  state
+    # merge_sha, superseded_by, generation, reason, landed_via_chain,
+    # absorbed_request_ids, queue_to_land_secs}.  state
     # is one of MergeOutcome.status values, 'abandoned' (cancelled future), or
     # 'error' (unexpected exception).  landed_via_chain is 1 on an item landed
     # by a deep merge-ahead chain walk and None otherwise (task 3186 δ); it is
     # what scripts/merge-deep-canary-predicate.sh sums for its items-landed-
     # per-deep-verify statistic.  (superseded_by/generation/reason had been
     # emitted but undocumented here; listed now rather than left stale.)
+    # queue_to_land_secs (task 8523) is seconds on the monotonic clock from
+    # this request's own enqueue to its finalize, present on every state;
+    # readers filter state='done'.
     merge_finalized = 'merge_finalized'
     # Unconditional observability of the generic merge-blocked fall-through in
     # TaskWorkflow._submit_to_merge_queue.  Emitted BEFORE _mark_blocked and
@@ -401,7 +418,10 @@ class EventType(StrEnum):
     # item's base_sha points at a dead commit (failed/ejected/superseded/
     # re-merged since verify dispatch).  A distinct type (not speculative_discard)
     # so the phantom-block-avoided signal is separately countable via the event
-    # census.  data: {dead_link, reason ('chain_dead'), point ('dispatch'|'adoption')}.
+    # census.  data: {dead_link, reason ('chain_dead'), point ('dispatch'|'adoption'),
+    # item_commit (the voided item's own merge commit), killer ({site, task_id}:
+    # the DeadBaseSite and task whose lane event recorded dead_link dead, null
+    # when unknown; vocabulary in merge_lane/dead_base_ledger.py, task 8523)}.
     verdict_voided = 'verdict_voided'
 
     # Task lifecycle

@@ -1691,6 +1691,90 @@ class TestDispatchChainItems:
 
 
 @pytest.mark.asyncio
+class TestDispatchFacts:
+    """``runner_reason``/``base_relation`` on the merge_verify event (task 8523).
+
+    Always present, None when the caller reported no allocation decision —
+    the same reader contract as ``depth``.
+    """
+
+    def _make_pool(self, runners):
+        from orchestrator.verify_runner import VerifyRunnerPool
+
+        emitted = []
+        event_store = MagicMock()
+        event_store.emit = MagicMock(side_effect=lambda *a, **kw: emitted.append((a, kw)))
+        pool = VerifyRunnerPool(runners, event_store=event_store, task_id='t-facts')
+        return pool, emitted
+
+    def _fake_runner(self, name, *, raises=None):
+        runner = MagicMock(spec=VerifyRunner)
+        runner.name = name
+        runner.is_local = name == 'local'
+        runner.run_merge_verify = AsyncMock(
+            return_value=_make_pass_result(), side_effect=raises,
+        )
+        return runner
+
+    async def test_dispatch_facts_are_emitted_as_wire_strings(self):
+        from orchestrator.event_store import EventType
+        from orchestrator.merge_verify_facts import (
+            BaseRelation,
+            MergeVerifyDispatchFacts,
+            RunnerReason,
+        )
+
+        pool, emitted = self._make_pool([self._fake_runner('local')])
+
+        await pool.dispatch(
+            'sha-facts', _make_spec(),
+            dispatch_facts=MergeVerifyDispatchFacts(
+                RunnerReason.PREFER_REMOTE_FREE, BaseRelation.STACKED,
+            ),
+        )
+
+        (event_type,), kwargs = emitted[-1]
+        assert event_type == EventType.merge_verify
+        assert kwargs['data']['runner_reason'] == 'prefer_remote_free'
+        assert kwargs['data']['base_relation'] == 'stacked'
+
+    async def test_bare_dispatch_emits_both_keys_null(self):
+        pool, emitted = self._make_pool([self._fake_runner('local')])
+
+        await pool.dispatch('sha-bare', _make_spec())
+
+        data = emitted[-1][1]['data']
+        assert 'runner_reason' in data and data['runner_reason'] is None
+        assert 'base_relation' in data and data['base_relation'] is None
+
+    async def test_unavailable_remote_fallback_reports_remote_quarantined(self):
+        from orchestrator.merge_verify_facts import (
+            BaseRelation,
+            MergeVerifyDispatchFacts,
+            RunnerReason,
+        )
+        from orchestrator.verify_runner import RunnerUnavailable
+
+        pool, emitted = self._make_pool([
+            self._fake_runner('local'),
+            self._fake_runner('laptop', raises=RunnerUnavailable('host down')),
+        ])
+
+        await pool.dispatch(
+            'sha-fallback', _make_spec(),
+            dispatch_facts=MergeVerifyDispatchFacts(
+                RunnerReason.PREFER_REMOTE_FREE, BaseRelation.MAIN,
+            ),
+        )
+
+        assert len(emitted) == 1
+        data = emitted[0][1]['data']
+        assert data['runner'] == 'local'
+        assert data['runner_reason'] == 'remote_quarantined'
+        assert data['base_relation'] == 'main'
+
+
+@pytest.mark.asyncio
 class TestDispatchDurationWiring:
     """The persisted merge_verify payload's ``duration_ms`` is the runner's real wall time.
 
