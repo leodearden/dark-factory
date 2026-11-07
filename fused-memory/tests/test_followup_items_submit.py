@@ -13,16 +13,16 @@ import logging
 import re
 import subprocess
 import sys
-from collections.abc import AsyncIterator
-from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock
 
 import pytest
-import pytest_asyncio
+from _submit_stack import Stack
+from _submit_stack import curator_creates as curator_creates
+from _submit_stack import passthrough_main_checkout as passthrough_main_checkout
+from _submit_stack import stack as stack
 from shared.followup_items import (
     FOLLOWUP_ITEMS_METADATA_KEY,
+    FOLLOWUP_ITEMS_REFUSED_ERROR,
     MAX_FOLLOWUP_ITEMS,
     UNPARENTED_ORIGIN,
     FollowupItem,
@@ -30,86 +30,10 @@ from shared.followup_items import (
     with_derived_bundle_keys,
 )
 
-from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
-from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig, TaskmasterConfig
-from fused_memory.middleware.curator_types import CuratorDecision, PreparedCandidate
+from fused_memory.middleware.curator_types import CandidateTask, PreparedCandidate
 from fused_memory.middleware.task_curator import TaskCurator
-from fused_memory.middleware.task_interceptor import TaskInterceptor
-from fused_memory.middleware.ticket_store import TicketStore
-from fused_memory.reconciliation.event_buffer import EventBuffer
-from fused_memory.server.tools import create_mcp_server
 
 _HEX16 = re.compile(r'[0-9a-f]{16}')
-
-
-@pytest.fixture(autouse=True)
-def passthrough_main_checkout(monkeypatch: pytest.MonkeyPatch) -> None:
-    """This suite's project roots are tmp_path directories, not git checkouts."""
-    monkeypatch.setattr('fused_memory.server.tools.resolve_main_checkout', lambda p: str(p))
-
-
-@dataclass
-class Stack:
-    root: str
-    backend: SqliteTaskBackend
-    server: Any
-
-    async def call(self, tool: str, **args: Any) -> Any:
-        return await self.server._tool_manager.call_tool(tool, {'project_root': self.root, **args})
-
-    async def task_count(self) -> int:
-        return len((await self.call('get_tasks'))['tasks'])
-
-    async def metadata(self, task_id: str) -> dict[str, Any]:
-        result = await self.call('get_task', id=task_id)
-        assert 'error' not in result, result
-        return result['metadata']
-
-    async def file_normal(self, **args: Any) -> str:
-        submitted = await self.call('submit_task', **args)
-        assert 'ticket' in submitted, submitted
-        resolved = await self.call('resolve_ticket', ticket=submitted['ticket'], timeout_seconds=30)
-        assert resolved.get('status') == 'created', resolved
-        return str(resolved['task_id'])
-
-    async def file_planned(self, **args: Any) -> str:
-        result = await self.call('submit_task', planning_mode=True, **args)
-        assert 'error' not in result, result
-        return str(result['task_id'])
-
-
-@pytest_asyncio.fixture
-async def stack(tmp_path: Path) -> AsyncIterator[Stack]:
-    backend = SqliteTaskBackend(TaskmasterConfig(project_root=str(tmp_path)), task_metadata_enforce=True)
-    await backend.start()
-    event_buffer = EventBuffer(db_path=tmp_path / 'events.db', buffer_size_threshold=100)
-    await event_buffer.initialize()
-    ticket_store = TicketStore(tmp_path / 'tickets.db')
-    await ticket_store.initialize()
-    config = FusedMemoryConfig()
-    config.taskmaster = None
-    config.curator = CuratorConfig()
-    interceptor = TaskInterceptor(backend, None, event_buffer, config, ticket_store=ticket_store)
-    server = create_mcp_server(AsyncMock(), task_interceptor=interceptor)
-    try:
-        yield Stack(root=str(tmp_path / 'proj'), backend=backend, server=server)
-    finally:
-        await interceptor.close()
-        await event_buffer.close()
-        await backend.close()
-
-
-@pytest.fixture
-def curated(monkeypatch: pytest.MonkeyPatch) -> list[PreparedCandidate]:
-    """Every curated candidate is created as filed; the bundles the curator was handed are kept."""
-    handed: list[PreparedCandidate] = []
-
-    async def _create_each(self, prepared, project_id, project_root):
-        handed.extend(prepared)
-        return [CuratorDecision(action='create', justification='followup-items test') for _ in prepared]
-
-    monkeypatch.setattr(TaskCurator, 'curate_prepared', _create_each)
-    return handed
 
 
 _AREA_FILES = ['src/app/a.py', 'src/app/b.py', 'src/app/c.py']
@@ -134,7 +58,7 @@ def _bundle(*items: dict[str, Any], **top: Any) -> dict[str, Any]:
 
 @pytest.mark.asyncio
 async def test_an_implementer_bundle_lands_with_server_derived_keys(
-    stack: Stack, curated: list[PreparedCandidate],
+    stack: Stack, curator_creates: list[PreparedCandidate],
 ) -> None:
     task_id = await stack.file_normal(
         title='Follow-ups in src/app', description='Two observations in one area.',
@@ -155,7 +79,7 @@ async def test_an_implementer_bundle_lands_with_server_derived_keys(
     assert _HEX16.fullmatch(metadata['suggestion_hash'])
     assert metadata['declared_scope']['basis'] == 'submit'
 
-    assert [bundle.candidate.items for bundle in curated] == [
+    assert [bundle.candidate.items for bundle in curator_creates] == [
         tuple(FollowupItem.model_validate(item) for item in stored),
     ]
 
@@ -165,7 +89,7 @@ async def test_an_implementer_bundle_lands_with_server_derived_keys(
 
 @pytest.mark.asyncio
 async def test_re_filing_the_same_observations_is_an_idempotency_hit(
-    stack: Stack, curated: list[PreparedCandidate],
+    stack: Stack, curator_creates: list[PreparedCandidate],
 ) -> None:
     first = await stack.file_normal(
         title='Follow-ups in src/app', description='Two observations in one area.',
@@ -207,7 +131,7 @@ async def test_a_planning_mode_bundle_carries_the_derived_keys(stack: Stack) -> 
 
 @pytest.mark.asyncio
 async def test_an_unparented_bundle_has_no_escalation_id(
-    stack: Stack, curated: list[PreparedCandidate],
+    stack: Stack, curator_creates: list[PreparedCandidate],
 ) -> None:
     metadata = _bundle(_FIRST, escalation_id='esc-forged')
     metadata.pop('spawned_from')
@@ -255,7 +179,7 @@ async def test_a_bundle_breaking_a_create_invariant_is_refused(
 
     assert result['success'] is False, result
     assert (result['error'], result['error_type'], result['path']) == (
-        'followup_items_refused', 'FollowupItemsRefusedError', f'metadata.{FOLLOWUP_ITEMS_METADATA_KEY}',
+        FOLLOWUP_ITEMS_REFUSED_ERROR, 'FollowupItemsRefusedError', f'metadata.{FOLLOWUP_ITEMS_METADATA_KEY}',
     ), result
     assert (result['reason'], result['index']) == (reason, index), result
     assert result['detail'], result
@@ -268,7 +192,7 @@ async def test_a_bundle_breaking_a_create_invariant_is_refused(
 
 @pytest.mark.asyncio
 async def test_a_steward_shaped_submission_keeps_its_keys(
-    stack: Stack, curated: list[PreparedCandidate],
+    stack: Stack, curator_creates: list[PreparedCandidate],
 ) -> None:
     task_id = await stack.file_normal(
         title='A steward follow-up', description='Filed from an escalation.',
@@ -285,7 +209,7 @@ async def test_a_steward_shaped_submission_keeps_its_keys(
 
 @pytest.mark.asyncio
 async def test_filing_a_bundle_emits_no_census_line_for_it(
-    stack: Stack, curated: list[PreparedCandidate], caplog: pytest.LogCaptureFixture,
+    stack: Stack, curator_creates: list[PreparedCandidate], caplog: pytest.LogCaptureFixture,
 ) -> None:
     with caplog.at_level(logging.WARNING, logger='fused_memory.backends.sqlite_task_backend'):
         caplog.clear()
@@ -300,6 +224,37 @@ async def test_filing_a_bundle_emits_no_census_line_for_it(
         and FOLLOWUP_ITEMS_METADATA_KEY in record.getMessage()
     ]
     assert census == []
+
+
+# (i): indexing a stored row whose bundle is malformed never aborts; the candidate loses its items.
+
+
+@pytest.mark.asyncio
+async def test_indexing_a_malformed_stored_bundle_records_the_candidate_without_items(
+    stack: Stack, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    recorded: list[tuple[str, CandidateTask]] = []
+
+    async def _record(self: TaskCurator, task_id: str, candidate: CandidateTask, project_id: str) -> None:
+        recorded.append((task_id, candidate))
+
+    monkeypatch.setattr(TaskCurator, 'record_task', _record)
+    keyless = {'summary': 'An element without a key', 'files': ['src/app/a.py'], 'origin_task': '8414'}
+    row = {'id': '7', 'title': 'A stored bundle', 'metadata': {FOLLOWUP_ITEMS_METADATA_KEY: [keyless]}}
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.middleware.task_interceptor'):
+        caplog.clear()
+        await stack.interceptor.index_committed_tasks([row], stack.root)
+
+    assert [(task_id, candidate.title, candidate.items) for task_id, candidate in recorded] == [
+        ('7', 'A stored bundle', ()),
+    ]
+    census = [
+        record.getMessage() for record in caplog.records
+        if 'task_metadata.schema_warning' in record.getMessage()
+        and FOLLOWUP_ITEMS_METADATA_KEY in record.getMessage()
+    ]
+    assert len(census) == 1, census
 
 
 def test_the_interceptor_import_chain_registers_the_slice() -> None:
