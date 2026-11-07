@@ -2875,7 +2875,6 @@ class TestJudgeWriteInheritsBetasFailOpenApparatus:
     not os.environ.get('OPENAI_API_KEY'),
     reason='needs OPENAI_API_KEY for a live Responses API call',
 )
-@pytest.mark.timeout(120)
 class TestTheFrontierArmLive:
     """The live edge: a frontier reasoning model judges a fixture write through triage."""
 
@@ -3046,7 +3045,6 @@ class TestTheLiveWordingBudgetGuard:
     not os.environ.get('OPENAI_API_KEY'),
     reason='needs OPENAI_API_KEY for a live Responses API call',
 )
-@pytest.mark.timeout(120)
 class TestTheShippedWordingLive:
     """Boundary row 3 (flip-readiness PRD §11.4): `contests` covers an outdated candidate.
 

@@ -53,7 +53,6 @@ from fused_memory.services.memory_service import RRF_K, MemoryService
 
 pytestmark = [
     qdrant_skipif(),
-    pytest.mark.timeout(120),
     # Real Qdrant + real OpenAI embedder: the integration/offline lane per task
     # 3019 / the integration-test-lane PRD, never a merge-lane gate.
     pytest.mark.integration,

@@ -18,7 +18,6 @@ from pathlib import Path
 import config_dir_archival_allowlist
 import loop_blocking_allowlist
 import pytest
-import shared_timeout_marker_grandfathered
 import silent_fallthrough_allowlist
 
 from shared.governed_exceptions import (
@@ -179,16 +178,6 @@ RUFF_CONFIG_SUPPRESSIONS = governed_exceptions(
         'orchestrator/pyproject.toml::tool.ruff.lint.per-file-ignores::tests/**/*.py::F811': Debt(TaskRef(7137)),
         'orchestrator/pyproject.toml::tool.ruff.lint.per-file-ignores::src/**/*.py::TID251': Debt(TaskRef(8622)),
     },
-)
-
-
-SHARED_TIMEOUT_MARKER_GRANDFATHERED = governed_exceptions(
-    'shared.tests.shared_timeout_marker_grandfathered.INVERSION_BAND_GRANDFATHERED',
-    'An in-band timeout-marker site in shared/tests that predates the timeout-marker '
-    'inversion guard, exempt from it until migrated; entries may only be removed.',
-    sorted('::'.join(site) for site in shared_timeout_marker_grandfathered.INVERSION_BAND_GRANDFATHERED),
-    default=Debt(TaskRef(6337)),
-    default_covers=1,
 )
 
 
