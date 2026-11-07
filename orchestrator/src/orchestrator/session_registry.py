@@ -60,11 +60,13 @@ if (
 
 from shared.process_identity import (
     PROC_ROOT,
+    Liveness,
     ProcessIdentity,
     ProcessIdentityUnreadable,
     capture,
 )
 from shared.project_id import fold_project_token
+from shared.session_liveness import judge
 
 # ---------------------------------------------------------------------------
 # Schema / contract (PRD §6 G5): consumers import this; they never re-derive
@@ -2830,6 +2832,16 @@ def pid_alive(pid: int) -> bool:
     return _pid_alive(pid)
 
 
+def _swept_as_dead(
+    identity: ProcessIdentity | None, pid: int, *, sweep: str, subject: str
+) -> bool:
+    """Whether a liveness sweep may treat *pid* as dead: ``judge``'s DEAD, with an OTHER_HOST skip logged."""
+    verdict = judge(identity, pid, pid_alive=_pid_alive)
+    if verdict is Liveness.OTHER_HOST and identity is not None:
+        logger.info('%s: skipped %s, reason=other_host host=%s', sweep, subject, identity.host)
+    return verdict is Liveness.DEAD
+
+
 def capture_for_record(pid: int, *, proc_root: Path = PROC_ROOT) -> ProcessIdentity | None:
     """The identity a record stamps for *pid*: ``capture``'s answer, an unreadable /proc logged and read as None."""
     try:
@@ -2878,8 +2890,10 @@ def reap_stale_records(
       NON_TERMINAL_HEARTBEAT_TTL -> reaped, reason='corrupt'.
     - status is terminal (EXITED/FAILED_TO_START) and age > TERMINAL_TTL ->
       reaped, reason='terminal_ttl' (independent of launcher_pid liveness).
-    - status is non-terminal, launcher_pid is dead, and age >
-      NON_TERMINAL_HEARTBEAT_TTL -> reaped, reason='stale_pid'. A T3-hosted
+    - status is non-terminal, age > NON_TERMINAL_HEARTBEAT_TTL, and the
+      launcher is judged DEAD by
+      ``shared/src/shared/session_liveness.py::judge`` -> reaped,
+      reason='stale_pid'. A T3-hosted
       record (``display.kind == 't3'``) is exempt: its liveness is its
       thread, swept by ``mark_t3_sessions_exited``.
     - otherwise -> kept.
@@ -2918,8 +2932,13 @@ def reap_stale_records(
                 reason = 'terminal_ttl' if age > TERMINAL_TTL else None
             elif (
                 not is_t3_record(record)
-                and not _pid_alive(record.launcher_pid)
                 and age > NON_TERMINAL_HEARTBEAT_TTL
+                and _swept_as_dead(
+                    record.launcher_identity,
+                    record.launcher_pid,
+                    sweep='reap_stale_records',
+                    subject=slug,
+                )
             ):
                 reason = 'stale_pid'
             else:
@@ -2960,14 +2979,32 @@ def _is_stale_session_pointer(path: Path, root: Path | str | None) -> bool:
         pid = int(path.name)
     except ValueError:
         return True
-    if pid <= 0 or path.name != str(pid) or not _pid_alive(pid):
+    if pid <= 0 or path.name != str(pid):
         return True
     slug = _read_session_pointer(path)
-    return (
+    if (
         slug is None
         or not is_record_key(slug)
         or not record_path_for_slug(slug, root=root).is_file()
+    ):
+        return True
+    return _swept_as_dead(
+        _pointed_owner_identity(slug, pid, root),
+        pid,
+        sweep='reap_stale_session_pointers',
+        subject=path.name,
     )
+
+
+def _pointed_owner_identity(
+    slug: str, pid: int, root: Path | str | None
+) -> ProcessIdentity | None:
+    """The owner identity *slug*'s record holds for *pid*; None when unreadable or naming another pid."""
+    try:
+        identity = read_record(slug, root=root).claude_owner_identity
+    except (CorruptSessionRecord, OSError):
+        return None
+    return identity if identity is not None and identity.pid == pid else None
 
 
 def _is_stale_claude_session_pointer(path: Path, root: Path | str | None) -> bool:
@@ -3007,8 +3044,11 @@ def reap_stale_session_pointers(root: Path | str | None = None) -> list[Path]:
     """Remove every pointer entry that can no longer serve a reader.
 
     A ``sessions-by-pid/`` entry is stale when its name is not a canonical
-    positive pid, its pid is dead, its content is not a record key, or the
-    record it names has no ``record.json``; no record body is parsed for it.
+    positive pid, its content is not a record key, the record it names has no
+    ``record.json``, or its pid is judged DEAD by
+    ``shared/src/shared/session_liveness.py::judge`` against that record's
+    ``claude_owner_identity`` when it names the same pid, so each such entry
+    costs one record read.
     A dead pid's pointer goes even while its record still exists: its owner
     can never query it again, and a process that reuses the pid must not
     inherit it.
@@ -3104,8 +3144,9 @@ def mark_orphaned_sessions_exited(
     those records terminal.
 
     Mirrors ``reap_stale_records``'s ``stale_pid`` predicate EXACTLY --
-    status is non-terminal (not in TERMINAL_STATUSES), ``launcher_pid`` is
-    dead (``_pid_alive``), and age (record.json's mtime vs *now*) exceeds
+    status is non-terminal (not in TERMINAL_STATUSES), the launcher is judged
+    DEAD (``shared/src/shared/session_liveness.py::judge``), and age
+    (record.json's mtime vs *now*) exceeds
     ``NON_TERMINAL_HEARTBEAT_TTL`` -- the same false-positive guard that
     rule already trusts: a genuinely-live session (including a
     detached/tmux one) keeps bumping its record's mtime via its own hooks,
@@ -3114,7 +3155,7 @@ def mark_orphaned_sessions_exited(
     Known trade-off for DETACHED spawns (reviewer-flagged): spawn-claude.sh
     itself exits once it hands off (its ``launcher_pid`` dies) while claude
     keeps running standalone, so for the entire remaining life of a
-    detached session ``_pid_alive`` is already False -- the heartbeat
+    detached session the launcher is already judged DEAD -- the heartbeat
     (record.json's mtime, bumped only by that session's own
     Notification/Stop hooks after convergence) is the SOLE thing keeping it
     unswept. A detached session that goes quieter than
@@ -3184,8 +3225,13 @@ def mark_orphaned_sessions_exited(
             continue  # already terminal -- idempotent, never re-stamped
         if is_t3_record(record):
             continue  # liveness is the thread's, swept by mark_t3_sessions_exited
-        if _pid_alive(record.launcher_pid):
-            continue  # a live launcher_pid is never swept, regardless of age
+        if not _swept_as_dead(
+            record.launcher_identity,
+            record.launcher_pid,
+            sweep='mark_orphaned_sessions_exited',
+            subject=slug,
+        ):
+            continue  # a launcher not judged dead is never swept, regardless of age
 
         record_path = slug_dir / 'record.json'
         try:
