@@ -5198,11 +5198,22 @@ def create_server(
         entry's ``observation`` for 7-40 hex SHA tokens and maps each one a
         rebase orphaned to its landed twin on main (patch-id first, then a
         unique exact subject; never a guess).  Returns ``{escalation_id,
-        resolved_shas: [{cited, landed, subject, method}], skipped_shas}``,
-        both in cited order.  Only the first
-        ``escalation.sha_citations.MAX_CITED_SHAS_RESOLVED`` distinct tokens
-        are looked up; ``skipped_shas`` lists the rest, unresolved.  A looked-up token absent from ``resolved_shas`` is
-        already on main, is not a commit, or has no twin.
+        resolved_shas: [{cited, landed, subject, method}], failed_shas:
+        [{cited, error}], skipped_shas}``, all in cited order.
+
+        Tokens are first checked against git's object store: a token naming
+        no commit (a UUID segment, a digit run, a hash) is dropped and never
+        counts against
+        ``escalation/src/escalation/sha_citations.py::MAX_CITED_SHAS_RESOLVED``.
+        ``skipped_shas`` lists the commit-naming tokens past that cap, never
+        looked up.  ``failed_shas`` lists the tokens git could not answer
+        for (project_root is not a git repository, the main branch is
+        unknown, a git process crashed): a fault, so nothing may be
+        concluded about those tokens.  When git cannot check the tokens at
+        all, every token counts against the cap: the first ones are failed
+        and the rest skipped.  A looked-up token in neither
+        ``resolved_shas`` nor ``failed_shas`` is already on main or has no
+        twin.
 
         Read-only: the record is never rewritten, and ``get_escalation`` /
         ``get_task_escalations`` are unchanged — they still show the SHAs as
@@ -5220,6 +5231,7 @@ def create_server(
         return {
             'escalation_id': esc.id,
             'resolved_shas': list(citations.resolved),
+            'failed_shas': list(citations.failed),
             'skipped_shas': list(citations.skipped),
         }
 

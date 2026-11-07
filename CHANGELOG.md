@@ -1721,6 +1721,23 @@ shadows), and a park owner can pass a lower-key park on a key it has not parked.
 `request_park_eviction` behaves as before. Rationale:
 `plans/scheduler-dispatch-scoring-and-lock-layer-prd.md` §7, Amendment (task 7799).
 
+#### resolve_escalation_shas reports git faults as failed_shas (task 7485)
+
+- **A git fault is never read as "no twin".** `GitOps.resolve_rebased_citation` used to
+  return None, the "already on main, not a commit, or no twin" answer, when git could not
+  answer: a `project_root` that is not a git repository, an unknown main branch, or a
+  failed `diff-tree`, `patch-id` or `log` mid-lookup. It now raises the new
+  `GitQueryFailed` for each of these (`WorktreeMissing` when `project_root` no longer
+  exists). Only empty output stays a fact.
+- **Only tokens that name a commit count against the cap.** One `git cat-file
+  --batch-check` (`GitOps.commits_named`) checks every cited token's object type before
+  `MAX_CITED_SHAS_RESOLVED` is applied. UUID segments, digit runs and hashes are dropped,
+  so they no longer push a real SHA into `skipped_shas`.
+- **New response key `failed_shas: [{cited, error}]`**, in cited order, for each token git
+  could not answer for. Nothing may be concluded about those tokens. Each fault is also
+  logged at WARNING with its traceback. When git cannot check the tokens at all, every
+  token counts against the cap, so the response stays bounded.
+
 #### plan.json writers serialise on a cross-writer mutex (task 5745)
 
 Every plan.json read-modify-write now holds `TaskArtifacts.plan_mutex`: the 13 plan-tools

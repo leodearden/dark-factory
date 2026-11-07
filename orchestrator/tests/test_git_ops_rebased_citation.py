@@ -5,14 +5,17 @@ archived record was replayed onto, read-only and never guessed
 
 from __future__ import annotations
 
+import re
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+from _git_fault_shim import answer_git, fail_git
 from _git_fixtures import seed_repo
 
 from orchestrator.config import GitConfig
-from orchestrator.git_ops import GitOps, _run
+from orchestrator.git_ops import GitOps, GitQueryFailed, _run
 
 
 async def _git(repo: Path, *args: str) -> str:
@@ -66,13 +69,27 @@ def repo(tmp_path: Path) -> Path:
     return seed_repo(tmp_path / 'repo')
 
 
-@pytest.fixture
-def git_ops(repo: Path) -> GitOps:
-    config = GitConfig(
-        main_branch='main', branch_prefix='task/', remote='origin',
+async def _land_by_subject_only(repo: Path) -> tuple[str, str]:
+    """A side commit, and the same-subject commit on main whose diff differs."""
+    side = await _side_commit(
+        repo, 'task/9', 'feature2.py', 'version = "side"\n', 'feat(9): only subject',
+    )
+    on_main = await _commit(
+        repo, 'feature2.py', 'version = "rewritten on landing"\n', 'feat(9): only subject',
+    )
+    return side, on_main
+
+
+def _git_config(main_branch: str = 'main') -> GitConfig:
+    return GitConfig(
+        main_branch=main_branch, branch_prefix='task/', remote='origin',
         worktree_dir='.worktrees', push_after_advance=False,
     )
-    return GitOps(config, repo)
+
+
+@pytest.fixture
+def git_ops(repo: Path) -> GitOps:
+    return GitOps(_git_config(), repo)
 
 
 @pytest.mark.asyncio
@@ -112,12 +129,7 @@ class TestResolveRebasedCitation:
         assert await git_ops.resolve_rebased_citation(lonely) is None
 
     async def test_unique_subject_resolves_when_patch_id_misses(self, repo, git_ops):
-        side = await _side_commit(
-            repo, 'task/9', 'feature2.py', 'version = "side"\n', 'feat(9): only subject',
-        )
-        on_main = await _commit(
-            repo, 'feature2.py', 'version = "rewritten on landing"\n', 'feat(9): only subject',
-        )
+        side, on_main = await _land_by_subject_only(repo)
 
         assert await git_ops.resolve_rebased_citation(side) == {
             'landed': on_main,
@@ -141,3 +153,108 @@ class TestResolveRebasedCitation:
         assert result is not None
         assert result['landed'] == landed.s1_landed
         assert result['method'] == 'patch-id'
+
+
+@pytest.mark.asyncio
+class TestCommitsNamed:
+    async def test_maps_each_commit_token_to_its_full_sha_and_drops_the_rest(
+        self, repo, git_ops,
+    ):
+        head = await _git(repo, 'rev-parse', 'HEAD')
+        tree = await _git(repo, 'rev-parse', 'HEAD^{tree}')
+        tokens = [
+            head, head[:10], tree, '20261023', '3f2a9c1e', '5c8d0b7f1a33', '9c1e7b4d5a609e21',
+        ]
+
+        assert await git_ops.commits_named(tokens) == {head: head, head[:10]: head}
+
+    async def test_a_directory_that_is_not_a_repository_raises(self, tmp_path):
+        plain = tmp_path / 'plain'
+        plain.mkdir()
+
+        with pytest.raises(GitQueryFailed):
+            await GitOps(_git_config(), plain).commits_named(['abc1234'])
+
+    async def test_an_ambiguous_token_is_omitted(
+        self, git_ops, tmp_path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        answer_git(monkeypatch, tmp_path / 'bin', 'cat-file*', 'abc1234^{commit} ambiguous\n')
+
+        assert await git_ops.commits_named(['abc1234']) == {}
+
+    @pytest.mark.parametrize(
+        ('answer', 'raised'),
+        [
+            pytest.param('garbage\n', "answered 'garbage' for 'abc1234'", id='unparseable-line'),
+            pytest.param('', 'answered 0 lines for 1 tokens', id='too-few-lines'),
+            pytest.param(
+                'abc1234^{commit} missing\nabc1234^{commit} missing\n',
+                'answered 2 lines for 1 tokens',
+                id='too-many-lines',
+            ),
+        ],
+    )
+    async def test_an_answer_that_is_neither_an_oid_nor_a_miss_raises(
+        self, git_ops, tmp_path, monkeypatch: pytest.MonkeyPatch, answer: str, raised: str,
+    ):
+        answer_git(monkeypatch, tmp_path / 'bin', 'cat-file*', answer)
+
+        with pytest.raises(GitQueryFailed, match=re.escape(raised)):
+            await git_ops.commits_named(['abc1234'])
+
+
+async def _cite_rebased_s1(repo: Path) -> str:
+    return (await _land_rebased_branch(repo)).s1
+
+
+async def _cite_subject_only_side(repo: Path) -> str:
+    side, _ = await _land_by_subject_only(repo)
+    return side
+
+
+@pytest.mark.asyncio
+class TestFaultsAreNeverReadAsFacts:
+    async def test_a_root_that_is_not_a_repository_raises(self, tmp_path):
+        plain = tmp_path / 'plain'
+        plain.mkdir()
+
+        with pytest.raises(GitQueryFailed):
+            await GitOps(_git_config(), plain).resolve_rebased_citation('a7ceed6597')
+
+    async def test_an_unknown_main_branch_raises(self, repo):
+        landed = await _land_rebased_branch(repo)
+        git_ops = GitOps(_git_config(main_branch='no-such-branch'), repo)
+
+        with pytest.raises(GitQueryFailed):
+            await git_ops.resolve_rebased_citation(landed.s1)
+
+    @pytest.mark.parametrize(
+        ('argv_glob', 'after', 'cite'),
+        [
+            pytest.param('diff-tree*', 0, _cite_rebased_s1, id='diff-tree'),
+            pytest.param('log -p -1 *', 0, _cite_rebased_s1, id='target-log-p'),
+            pytest.param('patch-id*', 0, _cite_rebased_s1, id='target-patch-id'),
+            pytest.param('log -p --no-color --full-diff *', 0, _cite_rebased_s1, id='range-log-p'),
+            pytest.param('patch-id*', 1, _cite_rebased_s1, id='range-patch-id'),
+            pytest.param('log -1 --format=%s *', 0, _cite_rebased_s1, id='landed-subject'),
+            pytest.param('log --format=%H*', 0, _cite_subject_only_side, id='range-subjects'),
+        ],
+    )
+    async def test_a_failing_git_query_mid_lookup_raises(
+        self,
+        repo: Path,
+        git_ops: GitOps,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        argv_glob: str,
+        after: int,
+        cite: Callable[[Path], Awaitable[str]],
+    ):
+        """Only the one call each param names fails, so a fault the code under
+        test swallowed lets the lookup go on to answer and the test fails."""
+        cited = await cite(repo)
+        fail_git(monkeypatch, tmp_path / 'bin', argv_glob, after=after, times=1)
+        failing_query = re.escape(f'git {argv_glob.rstrip("*")}')
+
+        with pytest.raises(GitQueryFailed, match=f'^{failing_query}.* exited 128: fatal: injected'):
+            await git_ops.resolve_rebased_citation(cited)
