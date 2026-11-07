@@ -503,7 +503,7 @@ class TestAmendmentOutOfScopeRouting:
         wf = _make_workflow(modules=['src'])
         wf.mcp = None
         wf.escalation_queue = MagicMock()
-        wf._escalate_suggestions = MagicMock()
+        wf._escalate_suggestions = AsyncMock()
 
         # Round 0: file the out-of-scope complement (records the hash).
         await wf._route_review_suggestions_to_curator(
@@ -516,4 +516,4 @@ class TestAmendmentOutOfScopeRouting:
         )
 
         # Despite two route calls, the fallback fires exactly once.
-        assert cast(MagicMock, wf._escalate_suggestions).call_count == 1
+        assert cast(AsyncMock, wf._escalate_suggestions).await_count == 1
