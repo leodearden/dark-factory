@@ -38,6 +38,7 @@ from _fake_t3_server import (
     put_fake_t3_cli_on_path,
     replies_in_turn,
 )
+from shared.process_identity import ProcessIdentity, capture
 
 from orchestrator import session_registry as sr
 from orchestrator import spawn_t3_lane as lane
@@ -925,7 +926,13 @@ def write_transcript(
     return path
 
 
-def hand_record(env: Env, session_id: str, owner_pid: int | None) -> str:
+def hand_record(
+    env: Env,
+    session_id: str,
+    owner_pid: int | None,
+    *,
+    owner_identity: ProcessIdentity | None = None,
+) -> str:
     """A hand-launched record plus its session-id pointer, as the hooks write them."""
     slug = f'session-proj-{session_id}'
     sr.write_record(
@@ -935,6 +942,7 @@ def hand_record(env: Env, session_id: str, owner_pid: int | None) -> str:
             cwd=str(env.project),
             claude_session_id=session_id,
             claude_owner_pid=owner_pid,
+            claude_owner_identity=owner_identity,
         ),
         root=env.fleet,
     )
@@ -977,6 +985,22 @@ class TestAwaitStarted:
         assert sr.resolve_session_slug_for_pid(424242, root=env.fleet) == slug
         folded = sr.read_record(hand_slug, root=env.fleet)
         assert (folded.status, folded.exit_code) == (sr.Status.EXITED, sr.FOLDED_EXIT_CODE)
+
+    def test_started_copies_the_hand_launched_owner_identity_with_its_pid(
+        self, env: Env, t3: FakeT3Server, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        t3.tool_replies['t3_thread_read'] = thread_read(status='running')
+        record_dir = spawn_record(env)
+        write_transcript(env, SESSION_ID, trailer(record_dir))
+        owner = capture(os.getpid())
+        assert owner is not None
+        hand_record(env, SESSION_ID, owner_pid=os.getpid(), owner_identity=owner)
+
+        self._await(capsys, env, record_dir, since=time.time() - 60)
+
+        record = sr.read_record(Path(record_dir).name, root=env.fleet)
+        assert record.claude_owner_pid == os.getpid()
+        assert record.claude_owner_identity == owner
 
     def test_started_binds_without_a_pid_when_no_hand_launched_record_exists(
         self, env: Env, t3: FakeT3Server, capsys: pytest.CaptureFixture[str]
