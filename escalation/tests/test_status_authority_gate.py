@@ -37,6 +37,7 @@ from unittest.mock import patch
 import pytest
 from _escalation_http import escalation_http_call
 from _escalation_seed import seed_escalation
+from _resolve_issue_call import call_resolve_issue
 from shared.task_statuses import TaskStatus
 from shared.task_transitions import ActorClass, is_legal_transition
 
@@ -54,14 +55,6 @@ from escalation.server import create_server
 # ---------------------------------------------------------------------------
 # In-process (header-less) drive harness — B5, B3-server, D1.
 # ---------------------------------------------------------------------------
-
-
-async def _resolve_issue(server, **kwargs: Any) -> dict[str, Any]:
-    """Invoke the resolve_issue MCP tool directly (sync tool; mirrors
-    test_server.py:1364-1368). ``get_http_headers()`` resolves ``{}`` here —
-    this is the header-less / full-authority path (esc-2087-2)."""
-    tool = await server.get_tool('resolve_issue')
-    return tool.fn(**kwargs)
 
 
 def _seed(
@@ -159,7 +152,7 @@ class TestB5BogusActionRejected:
         server = create_server(queue)
         esc = _seed(queue, level=1, task_id='t-b5')
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='n/a', action='bogus',
         )
 
@@ -194,7 +187,7 @@ class TestB3ServerParkKeepsL2Open:
         server = create_server(queue)
         esc = _seed(queue, level=1, task_id='t-b3-server')
 
-        result = await _resolve_issue(
+        result = await call_resolve_issue(
             server, escalation_id=esc.id, resolution='parked pending human', action='park',
         )
 

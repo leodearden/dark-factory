@@ -9,7 +9,6 @@ before.
 
 from __future__ import annotations
 
-import inspect
 import json
 from collections.abc import Callable, Iterable
 from pathlib import Path
@@ -19,6 +18,7 @@ import _project_root_stores as stores
 import pytest
 from _pending_tool_fixtures import _file
 from _project_root_stores import storm_records
+from _tool_calls import call_tool
 from fastmcp import Client, FastMCP
 from mcp.types import TextContent
 
@@ -38,19 +38,11 @@ _FILING = {
 }
 
 
-async def call(server, name: str, **kw: Any) -> Any:
-    tool = await server.get_tool(name)
-    result = tool.fn(**kw)
-    if inspect.isawaitable(result):
-        result = await result
-    return result
-
-
 async def assert_refused(
     server, kwargs_for: Callable[[str], dict[str, Any]], root: str, names: Iterable[str],
 ) -> None:
     for name in names:
-        result = await call(server, name, **kwargs_for(name), project_root=root)
+        result = await call_tool(server, name, **kwargs_for(name), project_root=root)
         assert set(result) == {'error'}, name
 
 
@@ -133,7 +125,7 @@ class TestProjectStoreMismatch:
         proj: Path,
         other: Path,
     ) -> None:
-        result = await call(project_server, name, **kwargs_for(name), project_root=str(other))
+        result = await call_tool(project_server, name, **kwargs_for(name), project_root=str(other))
 
         assert set(result) == {'error'}
         assert 'project_root mismatch' in result['error']
@@ -153,10 +145,10 @@ class TestProjectStoreMatch:
         kwargs_for: Callable[[str], dict[str, Any]],
         matching_spellings: list[str],
     ) -> None:
-        omitted = await call(project_server, name, **kwargs_for(name))
+        omitted = await call_tool(project_server, name, **kwargs_for(name))
 
         for spelling in matching_spellings:
-            asserted = await call(project_server, name, **kwargs_for(name), project_root=spelling)
+            asserted = await call_tool(project_server, name, **kwargs_for(name), project_root=spelling)
             assert asserted == omitted, spelling
 
     @pytest.mark.asyncio
@@ -170,7 +162,7 @@ class TestProjectStoreMatch:
         matching_spellings: list[str],
     ) -> None:
         for spelling in matching_spellings:
-            result = await call(project_server, name, **kwargs_for(name), project_root=spelling)
+            result = await call_tool(project_server, name, **kwargs_for(name), project_root=spelling)
             assert result['status'] == 'queued', spelling
             assert queue.get(result['id']) is not None
 
@@ -188,7 +180,7 @@ class TestReconciliationStore:
         other: Path,
     ) -> None:
         for asserted in (str(other), str(proj)):
-            result = await call(recon_server, name, **kwargs_for(name), project_root=asserted)
+            result = await call_tool(recon_server, name, **kwargs_for(name), project_root=asserted)
 
             assert set(result) == {'error'}
             assert 'reconciliation store' in result['error']
@@ -207,9 +199,9 @@ class TestIdentitylessServer:
         kwargs_for: Callable[[str], dict[str, Any]],
         other: Path,
     ) -> None:
-        omitted = await call(bare_server, name, **kwargs_for(name))
+        omitted = await call_tool(bare_server, name, **kwargs_for(name))
 
-        assert await call(bare_server, name, **kwargs_for(name), project_root=str(other)) == omitted
+        assert await call_tool(bare_server, name, **kwargs_for(name), project_root=str(other)) == omitted
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('name', WRITES)
@@ -221,7 +213,7 @@ class TestIdentitylessServer:
         kwargs_for: Callable[[str], dict[str, Any]],
         other: Path,
     ) -> None:
-        result = await call(bare_server, name, **kwargs_for(name), project_root=str(other))
+        result = await call_tool(bare_server, name, **kwargs_for(name), project_root=str(other))
 
         assert result['status'] == 'queued'
         assert queue.get(result['id']) is not None
@@ -237,7 +229,7 @@ class TestOmittedAssertionIsUnchanged:
         bare_server: FastMCP,
         kwargs_for: Callable[[str], dict[str, Any]],
     ) -> None:
-        assert await call(project_server, name, **kwargs_for(name)) == await call(
+        assert await call_tool(project_server, name, **kwargs_for(name)) == await call_tool(
             bare_server, name, **kwargs_for(name)
         )
 
@@ -249,7 +241,7 @@ class TestOmittedAssertionIsUnchanged:
         project_server: FastMCP,
         kwargs_for: Callable[[str], dict[str, Any]],
     ) -> None:
-        assert await call(project_server, name, **kwargs_for(name), project_root='') == await call(
+        assert await call_tool(project_server, name, **kwargs_for(name), project_root='') == await call_tool(
             project_server, name, **kwargs_for(name)
         )
 
@@ -390,8 +382,8 @@ class TestMismatchStormEscape:
         proj: Path,
     ) -> None:
         for name in READS * 4:
-            await call(project_server, name, **kwargs_for(name), project_root=str(proj))
-            await call(project_server, name, **kwargs_for(name))
+            await call_tool(project_server, name, **kwargs_for(name), project_root=str(proj))
+            await call_tool(project_server, name, **kwargs_for(name))
 
         assert storm_records(queue) == []
 
@@ -404,6 +396,6 @@ class TestMismatchStormEscape:
         other: Path,
     ) -> None:
         for name in READS * 4:
-            await call(bare_server, name, **kwargs_for(name), project_root=str(other))
+            await call_tool(bare_server, name, **kwargs_for(name), project_root=str(other))
 
         assert storm_records(queue) == []
