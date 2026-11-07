@@ -21,7 +21,7 @@ from unittest.mock import AsyncMock, patch
 import aiosqlite
 import httpx
 from _canned_mcp import CannedMCP, _raw_row
-from _dt_helpers import make_fixed_datetime_cls
+from _dt_helpers import fixed_clock, installed_clock
 from _prd_lanes_tree import (
     CARRIER,
     LaneTask,
@@ -34,6 +34,7 @@ from _prd_lanes_tree import (
 )
 from _prd_tree import prd_tree_tasks
 from _runs_db_fixture import EVENTS_DDL, EventRow, runs_db_path, write_runs_db
+from _served_reads import forget_escalation_corpus, forget_served_reads
 from escalation.archive import archive_dir_for_date
 from escalation.models import DeliveredCheckOwner, Escalation
 from escalation.queue import EscalationQueue
@@ -43,16 +44,11 @@ from shared.locking import files_to_modules
 from shared.task_statuses import TaskStatus
 
 import dashboard.data.task_snapshot as snapshot_mod
-from dashboard.api.escalations import _analytics_memo_clear
 from dashboard.app import app
 from dashboard.config import DashboardConfig
 from dashboard.data import escalation_corpus
-from dashboard.data.active_tasks import reset_task_snapshot_state
 from dashboard.data.burndown import BURNDOWN_SCHEMA, collect_snapshot
-from dashboard.data.prd_signal import clear_prd_documents
-from dashboard.data.scheduler import _scheduler_cache_clear, clear_scheduler_state
-from dashboard.data.task_activity import clear_activity_state
-from dashboard.data.task_lineage import clear_lineage_state
+from dashboard.data.scheduler import _scheduler_cache_clear
 
 T0 = datetime(2026, 10, 4, 9, 0, 0, tzinfo=UTC)
 """The instant every scenario's first render is served at."""
@@ -286,16 +282,6 @@ def _quietly(labels: Iterable[str]) -> dict[str, Callable[[Path], object]]:
     return dict.fromkeys(labels, quiet_ledgers)
 
 
-def _forget_served_reads() -> None:
-    """Every access store a route reads, forgotten through its own public hook."""
-    reset_task_snapshot_state()
-    clear_lineage_state()
-    clear_scheduler_state()
-    clear_activity_state()
-    clear_prd_documents()
-    _clear_corpus()
-
-
 def _get(client: TestClient, path: str, **params: str) -> dict[str, Any]:
     resp = client.get(path, params=params)
     assert resp.status_code == 200, resp.text
@@ -326,10 +312,10 @@ def _canned_roots(
         if furnish is not None and root.name in furnish:
             furnish[root.name](root)
     app.state.config = DashboardConfig(project_root=roots[0], known_project_roots=roots[1:])
-    _forget_served_reads()
+    forget_served_reads()
 
     def render(at: datetime) -> dict[str, Any]:
-        with patch('dashboard.api.tasks.resolve_now', new=lambda _now: at):
+        with installed_clock(app, fixed_clock(at)):
             return _get(client, TASKS)
 
     try:
@@ -341,7 +327,7 @@ def _canned_roots(
         ):
             yield render
     finally:
-        _forget_served_reads()
+        forget_served_reads()
 
 
 def _census_family(client: TestClient, workdir: Path) -> dict[str, Any]:
@@ -385,24 +371,23 @@ def _sample(client: TestClient, at: datetime) -> None:
     orchestrator: the sampled roots are exactly the configured ones.
     """
     assert client.portal is not None, 'the sampler runs inside a live TestClient'
-    with (
-        patch('dashboard.data.burndown.datetime', make_fixed_datetime_cls(at)),
-        patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
-    ):
-        client.portal.call(_collect_into_store, app.state.config, app.state.http_client)
+    with patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]):
+        client.portal.call(_collect_into_store, app.state.config, app.state.http_client, at)
 
 
-async def _collect_into_store(config: DashboardConfig, http_client: httpx.AsyncClient) -> None:
+async def _collect_into_store(
+    config: DashboardConfig, http_client: httpx.AsyncClient, at: datetime,
+) -> None:
     config.burndown_db.parent.mkdir(parents=True, exist_ok=True)
     async with aiosqlite.connect(config.burndown_db) as conn:
         await conn.executescript(BURNDOWN_SCHEMA)
         await conn.commit()
-        await collect_snapshot(conn, config, http_client)
+        await collect_snapshot(conn, config, http_client, now=at)
 
 
 def _render_burndown(client: TestClient, at: datetime, window: str) -> dict[str, Any]:
     """GET /burndown?window=*window* on the real route, its single clock capture at *at*."""
-    with patch('dashboard.api.burndown.datetime', make_fixed_datetime_cls(at)):
+    with installed_clock(app, fixed_clock(at)):
         return _get(client, BURNDOWN, window=window)
 
 
@@ -469,16 +454,10 @@ def _window_family(client: TestClient, workdir: Path) -> dict[str, Any]:
     with _canned_roots(client, workdir / 'merge', {'dark-factory': _substrate(REIFY_COUNTS)}):
         _write_merge_attempts(app.state.config.project_root)
         for window in ('7d', '24h'):
-            with patch('dashboard.api.merge_queue.resolve_now', new=lambda _now: T0):
+            with installed_clock(app, fixed_clock(T0)):
                 bodies[f'merge_{window}'] = _get(client, MERGE_QUEUE, window=window)
 
     return bodies
-
-
-def _clear_corpus() -> None:
-    """Forget the corpus walk and the analytics derived from it, through their own hooks."""
-    escalation_corpus._corpus_cache_clear()
-    _analytics_memo_clear()
 
 
 def _file_escalations(config: DashboardConfig) -> None:
@@ -524,17 +503,6 @@ def _write_memory_ops(config: DashboardConfig) -> None:
         conn.commit()
 
 
-@contextmanager
-def _memory_graphs_at_t0() -> Iterator[None]:
-    """Both clocks a /memory-graphs request reads, pinned to T0: the journal
-    read's as_of and the route's served_at."""
-    with (
-        patch('dashboard.data.write_journal.resolve_now', new=lambda now: now or T0),
-        patch('dashboard.app.resolve_now', new=lambda now: now or T0),
-    ):
-        yield
-
-
 def _held_tree() -> CannedMCP:
     """H's two in-progress tasks, both footprinting :data:`LOCKED_FILE`."""
     footprint = {'metadata': {'files': [LOCKED_FILE]}}
@@ -569,22 +537,22 @@ def _corpus_family(client: TestClient, workdir: Path) -> dict[str, Any]:
         _file_escalations(app.state.config)
         for hours, (generation, ttl) in enumerate(CORPUS_TTL_GENERATIONS.items()):
             at = T0 + timedelta(hours=hours)
-            _clear_corpus()
+            forget_escalation_corpus()
             with (
                 patch.object(escalation_corpus, 'CORPUS_TTL_SECONDS', ttl),
-                patch('dashboard.api.escalations.resolve_now', new=lambda _now, at=at: at),
+                installed_clock(app, fixed_clock(at)),
             ):
                 bodies[f'escalations_{generation}'] = _get(client, ESCALATIONS)
                 bodies[f'analytics_{generation}'] = _get(client, ESCALATION_ANALYTICS)
-        _clear_corpus()
+        forget_escalation_corpus()
 
     with _canned_roots(client, workdir / 'memory', {'dark-factory': _substrate(REIFY_COUNTS)}):
         _write_memory_ops(app.state.config)
-        with _memory_graphs_at_t0():
+        with installed_clock(app, fixed_clock(T0)):
             bodies['memory_ops'] = _get(client, MEMORY_GRAPHS)
     with (
         _canned_roots(client, workdir / 'memory_missing', {'dark-factory': _substrate(REIFY_COUNTS)}),
-        _memory_graphs_at_t0(),
+        installed_clock(app, fixed_clock(T0)),
     ):
         bodies['memory_ops_missing'] = _get(client, MEMORY_GRAPHS)
 
@@ -609,7 +577,7 @@ def _check_owner_family(client: TestClient, workdir: Path) -> dict[str, Any]:
     owner-carrying row is checked against a shape the route really serves.
     """
     with _canned_roots(client, workdir / 'check_owner', {'dark-factory': _substrate(REIFY_COUNTS)}):
-        _clear_corpus()
+        forget_escalation_corpus()
         config = app.state.config
         queue = EscalationQueue(config.escalations_dir)
         queue.submit(Escalation(
@@ -628,10 +596,10 @@ def _check_owner_family(client: TestClient, workdir: Path) -> dict[str, Any]:
         ))
         config.reconciliation_escalations_dir.mkdir(parents=True, exist_ok=True)
         try:
-            with patch('dashboard.api.escalations.resolve_now', new=lambda _now: T0):
+            with installed_clock(app, fixed_clock(T0)):
                 return {'escalations_check_owner': _get(client, ESCALATIONS)}
         finally:
-            _clear_corpus()
+            forget_escalation_corpus()
 
 
 PRD_C = 'plans/c-prd.md'
@@ -659,7 +627,7 @@ def _grow_past_lineage(substrate: CannedMCP) -> None:
 
 
 def _render_prds(client: TestClient, at: datetime) -> dict[str, Any]:
-    with patch('dashboard.api.prds.resolve_now', new=lambda _now: at):
+    with installed_clock(app, fixed_clock(at)):
         return _get(client, PRDS)
 
 

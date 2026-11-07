@@ -34,6 +34,7 @@ import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
+from dashboard.api.clock import app_clock
 from dashboard.config import DashboardConfig
 from dashboard.data.active_tasks import TasksBudget
 from dashboard.data.datum import (
@@ -73,7 +74,6 @@ from dashboard.data.task_activity import (
 )
 from dashboard.data.task_lineage import acquire_lineage
 from dashboard.data.task_snapshot import acquire_snapshot
-from dashboard.data.utils import resolve_now
 from dashboard.project_dbs import _project_scoped_dbs_labeled
 
 logger = logging.getLogger(__name__)
@@ -375,11 +375,12 @@ async def api_prds(request: Request) -> JSONResponse:
     config: DashboardConfig = request.app.state.config
     client: httpx.AsyncClient = request.app.state.http_client
     pool: DbPool = request.app.state.db
-    render_at = resolve_now(None)
+    clock = app_clock(request.app)
+    render_at = clock()
     acquired = await _acquire_within_budget(
         client, config, pool, now=render_at, budget=PRDS_BUDGET,
     )
-    served_at = resolve_now(None)
+    served_at = clock()
     labels = config.project_labels
     views: dict[str, object] = {}
     contentions: dict[str, object] = {}

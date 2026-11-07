@@ -440,9 +440,10 @@ def test_a_unit_another_render_refreshed_later_is_not_a_contract_break(client, c
     from datetime import datetime, timedelta
 
     from _canned_mcp import CannedMCP, _raw_row
+    from _dt_helpers import installed_clock
 
     import dashboard.data.task_snapshot as snapshot_mod
-    from dashboard.data.utils import resolve_now
+    from dashboard.api.clock import live_clock
 
     config = client.app.state.config
     root = config.project_root
@@ -454,8 +455,8 @@ def test_a_unit_another_render_refreshed_later_is_not_a_contract_break(client, c
     )
     instants = iter(())
 
-    def b_clock(now):
-        return next(instants, None) or resolve_now(now)
+    def b_clock():
+        return next(instants, None) or live_clock()
 
     snapshot_mod.clear_snapshot_cache()
     try:
@@ -468,7 +469,7 @@ def test_a_unit_another_render_refreshed_later_is_not_a_contract_break(client, c
             render_b = a_as_of - timedelta(seconds=1)
             instants = iter([render_b])
             with (
-                patch('dashboard.api.tasks.resolve_now', new=b_clock),
+                installed_clock(client.app, b_clock),
                 caplog.at_level(logging.WARNING),
             ):
                 resp = client.get('/api/v2/dashboard/tasks')
