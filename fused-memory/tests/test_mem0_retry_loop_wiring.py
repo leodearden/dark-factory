@@ -17,7 +17,7 @@ import pytest
 
 from fused_memory.memory_metadata import SUPERSEDED_BY_METADATA_KEY
 from fused_memory.services.mem0_add_outcome import Mem0AddOutcome
-from fused_memory.services.mem0_write_retry import Mem0RetryPolicy
+from fused_memory.services.mem0_write_retry import DEFAULT_MEM0_RETRY_POLICY, Mem0RetryPolicy
 
 _OLD = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
 
@@ -60,7 +60,10 @@ async def _first_pass(service: _RecordingService) -> dict[str, Any]:
 
     task = _start_mem0_retry_loop(service)
     try:
-        await asyncio.wait_for(service.passed.wait(), timeout=1.0)
+        # noqa: wall-clock-deadline — the deadline is the assertion: a pass inside half the default policy's interval proves the loop read the service's own policy
+        await asyncio.wait_for(
+            service.passed.wait(), timeout=DEFAULT_MEM0_RETRY_POLICY.poll_interval_seconds / 2
+        )
     finally:
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
