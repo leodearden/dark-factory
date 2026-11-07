@@ -1,0 +1,247 @@
+"""``metadata.followup_items``: the observations one follow-up task was filed to address.
+
+Contract: plans/follow-up-filing-shape-prd.md §4.1 and §3 decisions 1, 3 and 4. Each item's
+``key``, ``origin_task`` and ``origin_escalation_id`` are server-owned, and :func:`merge_items` is
+the one union every writer uses. The slice registers itself at import, like ``shared.defects``, and
+is not re-exported from ``shared/__init__.py``.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import re
+from collections import Counter
+from collections.abc import Iterable, Mapping, Sequence
+from enum import StrEnum
+from typing import Annotated, Final
+
+from pydantic import AfterValidator, BaseModel, BeforeValidator, ConfigDict, ValidationError
+
+from shared.task_metadata import register_metadata_submodel
+
+__all__ = [
+    'FOLLOWUP_ITEMS_METADATA_KEY',
+    'MAX_FOLLOWUP_ITEMS',
+    'MAX_SUMMARY_CHARS',
+    'UNPARENTED_ORIGIN',
+    'BundleViolation',
+    'DuplicateFollowupItemKey',
+    'FollowupBundleInvalid',
+    'FollowupItem',
+    'item_key',
+    'legacy_item',
+    'merge_items',
+    'observed_item',
+    'read_items',
+    'require_unique_item_keys',
+]
+
+FOLLOWUP_ITEMS_METADATA_KEY: Final = 'followup_items'
+MAX_FOLLOWUP_ITEMS: Final = 5
+MAX_SUMMARY_CHARS: Final = 300
+UNPARENTED_ORIGIN: Final = 'unparented'
+
+_WHITESPACE_RUN = re.compile(r'\s+')
+# No repo path and no one-line summary contains NUL, so the joined key material is unambiguous.
+_KEY_MATERIAL_SEPARATOR = '\x00'
+_UNDERIVED_KEY = 'underived'
+
+
+def _one_line(text: str) -> str:
+    return _WHITESPACE_RUN.sub(' ', text).strip()
+
+
+def _canonical_files(files: Iterable[str]) -> tuple[str, ...]:
+    return tuple(sorted(set(files)))
+
+
+def _sha256_16(material: str) -> str:
+    # A stdlib mirror of orchestrator/src/orchestrator/agents/triage.py::sha256_16's 16-char shape.
+    return hashlib.sha256(material.encode()).hexdigest()[:16]
+
+
+def _non_blank(text: str) -> str:
+    if not text.strip():
+        raise ValueError('must not be blank')
+    return text
+
+
+def _collapse_if_str(value: object) -> object:
+    return _one_line(value) if isinstance(value, str) else value
+
+
+def _bounded_summary(text: str) -> str:
+    if not text:
+        raise ValueError('summary must not be blank')
+    if len(text) > MAX_SUMMARY_CHARS:
+        raise ValueError(
+            f'summary is {len(text)} chars on one line; at most {MAX_SUMMARY_CHARS} are allowed'
+        )
+    return text
+
+
+def _declared_files(files: tuple[str, ...]) -> tuple[str, ...]:
+    if not files:
+        raise ValueError('files must name at least one file')
+    if any(not path.strip() for path in files):
+        raise ValueError(f'files must not contain a blank entry; got {list(files)!r}')
+    return _canonical_files(files)
+
+
+_NonBlankStr = Annotated[str, AfterValidator(_non_blank)]
+_ItemSummary = Annotated[str, BeforeValidator(_collapse_if_str), AfterValidator(_bounded_summary)]
+_ItemFiles = Annotated[tuple[str, ...], AfterValidator(_declared_files)]
+
+
+class FollowupItem(BaseModel):
+    """One observation, stored canonically: the summary on one line, the files sorted and unique."""
+
+    model_config = ConfigDict(frozen=True, extra='forbid')
+
+    key: _NonBlankStr
+    summary: _ItemSummary
+    files: _ItemFiles
+    origin_task: _NonBlankStr
+    origin_escalation_id: str | None = None
+
+
+class BundleViolation(StrEnum):
+    """Which §4.1 invariant a ``followup_items`` value breaks: the ``reason`` its refusal reports."""
+
+    NOT_A_LIST = 'not_a_list'
+    INVALID_ITEM = 'invalid_item'
+    ITEM_COUNT = 'item_count'
+    DUPLICATE_KEY = 'duplicate_key'
+    UNDECLARED_FILES = 'undeclared_files'
+
+
+class FollowupBundleInvalid(ValueError):
+    """A ``followup_items`` value breaks the invariant ``reason`` names; ``detail`` gives the offending values."""
+
+    def __init__(self, reason: BundleViolation, detail: str, *, index: int | None = None) -> None:
+        self.reason = reason
+        self.detail = detail
+        self.index = index
+        where = '' if index is None else f' at item {index}'
+        super().__init__(f'metadata.{FOLLOWUP_ITEMS_METADATA_KEY} {reason.value}{where}: {detail}')
+
+
+class DuplicateFollowupItemKey(FollowupBundleInvalid):
+    """One list names a key more than once; ``keys`` holds each repeated key once, first seen first."""
+
+    def __init__(self, keys: tuple[str, ...]) -> None:
+        self.keys = keys
+        super().__init__(
+            BundleViolation.DUPLICATE_KEY,
+            f'item keys must be unique; repeated: {", ".join(repr(key) for key in keys)}',
+        )
+
+
+def item_key(*, origin_task: str, files: Sequence[str], summary: str) -> str:
+    """The item's identity: blind to file order, repeated files, and summary case and whitespace."""
+    material = (origin_task, *_canonical_files(files), _one_line(summary).casefold())
+    return _sha256_16(_KEY_MATERIAL_SEPARATOR.join(material))
+
+
+def observed_item(
+    *, summary: str, files: Sequence[str], origin_task: str, origin_escalation_id: str | None = None,
+) -> FollowupItem:
+    """One observation as an item keyed by its own stored fields.
+
+    Raises:
+        ValidationError: when the observation breaks a field invariant.
+    """
+    unkeyed = FollowupItem.model_validate({
+        'key': _UNDERIVED_KEY,
+        'summary': summary,
+        'files': files,
+        'origin_task': origin_task,
+        'origin_escalation_id': origin_escalation_id,
+    })
+    derived = item_key(origin_task=unkeyed.origin_task, files=unkeyed.files, summary=unkeyed.summary)
+    return unkeyed.model_copy(update={'key': derived})
+
+
+def require_unique_item_keys(items: Iterable[FollowupItem]) -> None:
+    """Refuse a list the registration cannot see is invalid: one that repeats a key.
+
+    Raises:
+        DuplicateFollowupItemKey: naming each repeated key.
+    """
+    counts = Counter(item.key for item in items)
+    repeated = tuple(key for key, count in counts.items() if count > 1)
+    if repeated:
+        raise DuplicateFollowupItemKey(repeated)
+
+
+def merge_items(base: Sequence[FollowupItem], extra: Sequence[FollowupItem]) -> tuple[FollowupItem, ...]:
+    """The order-preserving union by key; a key present in both keeps ``base``'s item.
+
+    Raises:
+        DuplicateFollowupItemKey: when either input repeats a key.
+    """
+    require_unique_item_keys(base)
+    require_unique_item_keys(extra)
+    present = {item.key for item in base}
+    return (*base, *(item for item in extra if item.key not in present))
+
+
+def _origin_task(metadata: Mapping[str, object]) -> str:
+    spawned_from = metadata.get('spawned_from')
+    origin = '' if spawned_from is None else str(spawned_from).strip()
+    return origin or UNPARENTED_ORIGIN
+
+
+def legacy_item(
+    *, title: str, files: Sequence[str], metadata: Mapping[str, object],
+) -> FollowupItem | None:
+    """A pre-bundle single follow-up as one item keyed by its caller-sent ``suggestion_hash``.
+
+    None when the row is not such a single: no usable ``suggestion_hash``, no files, or it is
+    already a bundle.
+    """
+    suggestion_hash = metadata.get('suggestion_hash')
+    if FOLLOWUP_ITEMS_METADATA_KEY in metadata or not files:
+        return None
+    if not isinstance(suggestion_hash, str) or not suggestion_hash.strip():
+        return None
+    escalation_id = metadata.get('escalation_id')
+    return FollowupItem.model_validate({
+        'key': suggestion_hash,
+        'summary': _one_line(title)[:MAX_SUMMARY_CHARS],
+        'files': files,
+        'origin_task': _origin_task(metadata),
+        'origin_escalation_id': escalation_id if isinstance(escalation_id, str) else None,
+    })
+
+
+def read_items(metadata: Mapping[str, object]) -> tuple[FollowupItem, ...]:
+    """The stored items, strictly: () when the key is absent.
+
+    Raises:
+        FollowupBundleInvalid: ``NOT_A_LIST``, or ``INVALID_ITEM`` naming the element's index.
+    """
+    if FOLLOWUP_ITEMS_METADATA_KEY not in metadata:
+        return ()
+    raw = metadata[FOLLOWUP_ITEMS_METADATA_KEY]
+    if not isinstance(raw, list):
+        raise FollowupBundleInvalid(
+            BundleViolation.NOT_A_LIST, f'expected a list of item objects, got {type(raw).__name__}',
+        )
+    return tuple(_stored_item(index, element) for index, element in enumerate(raw))
+
+
+def _stored_item(index: int, element: object) -> FollowupItem:
+    if not isinstance(element, Mapping):
+        raise FollowupBundleInvalid(
+            BundleViolation.INVALID_ITEM, f'expected an object, got {type(element).__name__}', index=index,
+        )
+    try:
+        return FollowupItem.model_validate(dict(element))
+    except ValidationError as exc:
+        raise FollowupBundleInvalid(BundleViolation.INVALID_ITEM, str(exc), index=index) from exc
+
+
+# An import side effect of THIS module, never of shared.task_metadata; why is
+# shared/src/shared/deploy_state.py::DeployState's module docstring.
+register_metadata_submodel(FOLLOWUP_ITEMS_METADATA_KEY, FollowupItem, cardinality='list')

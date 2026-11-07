@@ -211,9 +211,9 @@ class TestLegacyItem:
         )
 
     def test_a_long_title_is_clipped_to_the_summary_bound(self) -> None:
-        item = legacy_item(title='word ' * 200, files=['pkg/a.py'], metadata=self._META)
+        item = legacy_item(title='x' * (MAX_SUMMARY_CHARS + 50), files=['pkg/a.py'], metadata=self._META)
         assert item is not None
-        assert len(item.summary) == MAX_SUMMARY_CHARS
+        assert item.summary == 'x' * MAX_SUMMARY_CHARS
 
     @pytest.mark.parametrize('spawned_from', [None, '', '  '])
     def test_an_unparented_single_has_the_unparented_origin(self, spawned_from: object) -> None:
