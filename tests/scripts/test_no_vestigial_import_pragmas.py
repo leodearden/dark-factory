@@ -106,6 +106,10 @@ _SIBLING_SUITE_DIR = REPO_ROOT / 'scripts' / 'tests'
 # guard is what keeps that true.
 _SCANNED_DIRS = (_THIS_DIR, _SIBLING_SUITE_DIR)
 
+# What the root table's two declared gates check, recursively: `pyright
+# tests/scripts/` and `pyright scripts/`, the latter including scripts/tests/.
+_ROOT_PYRIGHT_TARGET_DIRS = (_THIS_DIR, REPO_ROOT / 'scripts')
+
 # The rule these guards forbid suppressing, ASSEMBLED FROM PARTS rather than
 # spelled as one literal. A guard that forbids a token must not itself contain
 # that token: `grep -rn 'pyright: ignore\[reportMissingImports\]' tests/scripts/`
@@ -661,4 +665,78 @@ def test_no_root_extrapaths_entry_holds_a_test_module_or_conftest() -> None:
         'tests/scripts and scripts/tests. Put only the helper modules the root '
         'table\'s targets import into a dedicated directory, such as '
         'orchestrator/tests/cross_suite_helpers, and list that directory instead'
+    )
+
+
+def test_a_same_directory_sibling_that_a_root_extrapaths_module_shadows_is_reported(
+    tmp_path: Path,
+) -> None:
+    root_modules = {path.stem for path in REPO_ROOT.glob('*.py')}
+    shadowing = next(
+        (
+            (entry, stem)
+            for entry in _load_root_pyright_config().get('extraPaths', [])
+            for stem in sorted(path.stem for path in (REPO_ROOT / entry).glob('*.py'))
+            if stem.isidentifier() and stem not in root_modules
+        ),
+        None,
+    )
+    assert shadowing is not None, (
+        'no root extraPaths entry holds a top-level module that is not also at '
+        f'{REPO_ROOT}, so this test would pass vacuously'
+    )
+    entry, module = shadowing
+    sibling = '_shadow_guard_probe_sibling'
+    suite_dir = tmp_path / 'suite'
+    suite_dir.mkdir()
+    (suite_dir / f'{module}.py').write_text('')
+    (suite_dir / f'{sibling}.py').write_text('')
+    probe = suite_dir / 'test_probe.py'
+    probe.write_text(f'import {module}\nimport {sibling}\n')
+
+    reported = [
+        (reported_module, root)
+        for *_, reported_module, root in _shadowed_sibling_imports([probe])
+    ]
+
+    assert reported == [(module, REPO_ROOT / entry)], (
+        f'expected exactly `{module}` reported at {REPO_ROOT / entry}, got '
+        f'{reported}. Pyright searches every root extraPaths entry before the '
+        f'importing file\'s own directory, so it binds {entry}/{module}.py where '
+        f'the runtime binds the sibling {suite_dir}/{module}.py. `{sibling}` '
+        f'exists only beside the importing file, so pyright and the runtime '
+        f'agree on it'
+    )
+
+
+def test_no_bare_import_in_a_root_pyright_target_resolves_past_its_same_directory_sibling() -> None:
+    target_files = [
+        path
+        for directory in _ROOT_PYRIGHT_TARGET_DIRS
+        for path in sorted(directory.rglob('*.py'))
+        if not any(part.startswith('.') for part in path.relative_to(directory).parts)
+    ]
+    assert target_files, (
+        f'no *.py found under {_ROOT_PYRIGHT_TARGET_DIRS}, so this test would '
+        f'pass vacuously'
+    )
+
+    offenders = _shadowed_sibling_imports(target_files)
+
+    assert not offenders, (
+        f'{len(offenders)} bare import(s) resolve on a pyright search root '
+        f'ahead of the same-directory sibling that the runtime binds:\n'
+        + '\n'.join(
+            f'  {path.relative_to(REPO_ROOT)}:{lineno}: `{module}` resolves at '
+            f'{root.relative_to(REPO_ROOT)}/ ahead of the sibling `{module}` in '
+            f'{path.parent.relative_to(REPO_ROOT)}/'
+            for path, lineno, module, root in offenders
+        )
+        + '\nPyright searches the execution root and every root extraPaths entry '
+        'before the importing file\'s own directory, so these lines type-check '
+        'against a different file than the one they run. Rename the sibling, or '
+        'take the colliding module off that extraPaths root (list a directory '
+        'that holds only the helpers these targets import, as '
+        'test_no_root_extrapaths_entry_holds_a_test_module_or_conftest '
+        'requires). Never add a pragma'
     )
