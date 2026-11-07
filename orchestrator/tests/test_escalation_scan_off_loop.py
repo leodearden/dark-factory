@@ -13,10 +13,11 @@ from __future__ import annotations
 import asyncio
 import threading
 from pathlib import Path
-from typing import Any
-from unittest.mock import MagicMock
+from typing import Any, NamedTuple
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import test_deterministic_runner as _det
 import test_suggestion_triage as _triage
 import test_workflow_infra_thrash as _infra
 from escalation.models import Escalation
@@ -28,12 +29,20 @@ from test_workflow_escalated_steward_stall import git_repo as git_repo
 from test_workflow_escalated_steward_stall import task_assignment as task_assignment
 
 from orchestrator.config import OrchestratorConfig
+from orchestrator.deterministic_runner import DETERMINISTIC_AGENT_ROLE, DeterministicRunner
 from orchestrator.git_ops import GitOps
 from orchestrator.scheduler import TaskAssignment
+from orchestrator.workflow import WorkflowOutcome
+
+
+class _Scan(NamedTuple):
+    thread: int
+    status: str | None
+    agent_role: str | None
 
 
 class _ThreadProbeQueue(EscalationQueue):
-    """A REAL queue recording the thread and status filter of every task scan.
+    """A REAL queue recording the thread and filters of every task scan.
 
     Delegates through ``super()``, so each probed call still does the real glob
     and JSON parse.  The status is kept because only a non-``'pending'`` scan
@@ -42,14 +51,14 @@ class _ThreadProbeQueue(EscalationQueue):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        self.scans: list[tuple[int, str | None]] = []
+        self.scans: list[_Scan] = []
 
     def get_by_task(self, task_id, status=None, level=None, agent_role=None):
-        self.scans.append((threading.get_ident(), status))
+        self.scans.append(_Scan(threading.get_ident(), status, agent_role))
         return super().get_by_task(task_id, status, level, agent_role)
 
     def archive_inclusive_threads(self) -> list[int]:
-        return [thread for thread, status in self.scans if status != 'pending']
+        return [scan.thread for scan in self.scans if scan.status != 'pending']
 
 
 def _assert_archive_scans_ran_off_loop(probe: _ThreadProbeQueue) -> None:
@@ -61,21 +70,32 @@ def _assert_archive_scans_ran_off_loop(probe: _ThreadProbeQueue) -> None:
     )
 
 
+def _assert_own_role_archive_scan_ran_off_loop(probe: _ThreadProbeQueue) -> None:
+    assert any(
+        scan.status != 'pending' and scan.agent_role == DETERMINISTIC_AGENT_ROLE
+        for scan in probe.scans
+    ), f'no role-scoped archive-inclusive scan was recorded: {probe.scans}'
+    _assert_archive_scans_ran_off_loop(probe)
+
+
 def _file(
     queue: EscalationQueue,
     task_id: str,
     *,
     category: str,
     granted_files: list[str] | None = None,
+    agent_role: str = 'implementer',
+    level: int = 0,
 ) -> Escalation:
     esc = Escalation(
         id=queue.make_id(task_id),
         task_id=task_id,
-        agent_role='implementer',
+        agent_role=agent_role,
         severity='blocking',
         category=category,
         summary=f'{category} blocker',
         granted_files=list(granted_files or []),
+        level=level,
     )
     queue.submit(esc)
     return esc
@@ -139,7 +159,7 @@ class TestWorkflowScansRunOffLoop:
 
         assert [c.escalation_id for c in carried] == [first.id, second.id]
         off_loop_statuses = {
-            status for thread, status in probe.scans if thread != threading.get_ident()
+            scan.status for scan in probe.scans if scan.thread != threading.get_ident()
         }
         assert {'resolved', None} <= off_loop_statuses, probe.scans
         _assert_archive_scans_ran_off_loop(probe)
@@ -159,3 +179,54 @@ class TestWorkflowScansRunOffLoop:
         filed = probe.get_by_task('42', status='pending')
         assert [e.category for e in filed] == ['review_suggestions']
         _assert_archive_scans_ran_off_loop(probe)
+
+
+@pytest.mark.asyncio
+class TestDeterministicRunnerScansRunOffLoop:
+    async def test_pure_gate_resume_proof_is_read_off_loop(self, tmp_path: Path):
+        probe = _ThreadProbeQueue(tmp_path)
+        gate = _file(
+            probe, '99', category='milestone_gate',
+            agent_role=DETERMINISTIC_AGENT_ROLE, level=2,
+        )
+        probe.resolve(gate.id, 'human approved the gate', resolved_by='human')
+        task = _det._gate_task(task_id='99', gate_escalated_at='2026-06-23T12:00:00+00:00')
+        scheduler = _det._mock_scheduler(task)
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=probe)
+
+        outcome = await runner.run(_det._make_assignment(task))
+
+        assert outcome == WorkflowOutcome.DONE
+        scheduler.set_task_status.assert_awaited_once_with(
+            '99',
+            'done',
+            done_provenance={
+                'kind': 'deterministic-gate',
+                'note': 'pure gate resolved',
+                'escalation_id': gate.id,
+            },
+        )
+        _assert_own_role_archive_scan_ran_off_loop(probe)
+
+    async def test_deploy_resume_proof_is_read_off_loop(self, tmp_path: Path):
+        probe = _ThreadProbeQueue(tmp_path)
+        failure = _file(
+            probe, '600', category='infra_issue',
+            agent_role=DETERMINISTIC_AGENT_ROLE, level=2,
+        )
+        probe.resolve(failure.id, 'human verified the unit manually')
+        task = _det._deploy_task(task_id='600', before_done_ran_at='2026-06-23T10:00:00+00:00')
+        scheduler = _det._mock_scheduler(task)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=probe,
+            unit_inspector=AsyncMock(return_value=_det._BASELINE_UNIT_STATE),
+            script_runner=script_runner,
+        )
+
+        await runner.run(_det._make_assignment(task))
+
+        script_runner.assert_not_awaited()
+        assert [c.args[1] for c in scheduler.set_task_status.await_args_list] == ['done']
+        _assert_own_role_archive_scan_ran_off_loop(probe)
