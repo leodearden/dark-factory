@@ -15,7 +15,7 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import Final, Literal, get_args
+from typing import Final, Literal, TypeVar, get_args
 
 from shared.declared_scope import DeclaredScopeBand
 from shared.followup_items import MAX_FOLLOWUP_ITEMS
@@ -28,11 +28,13 @@ __all__ = [
     'RIDER_RESERVE_DAYS',
     'RECIPES',
     'RIDER_RESERVE_MAX_DECLINES',
+    'CandidatePack',
     'MemberKind',
     'PackExclusion',
     'PackGenerator',
     'PackMember',
     'PackRecipe',
+    'candidate_packs',
     'exclusion',
     'hub_keys',
     'member_text_fp',
@@ -54,6 +56,10 @@ MemberKind = Literal['followup', 'review_suggestion']
 _HELD_STATUS = 'pending'
 _TEXT_FP_SEPARATOR = '\x00'
 _UNKNOWN_AGE = datetime.min.replace(tzinfo=UTC)
+_FILELESS_DIRECTORY = '~'
+
+_Item = TypeVar('_Item')
+_GroupKey = TypeVar('_GroupKey')
 
 
 class PackExclusion(StrEnum):
@@ -232,3 +238,211 @@ def survivor_of(members: Sequence[PackMember]) -> int:
     """The member a pack is rewritten into: the oldest, then the lowest id; unknown age is oldest."""
     _require(bool(members), 'survivor_of needs at least one member')
     return min(members, key=_age_key).task_id
+
+
+@dataclass(frozen=True)
+class CandidatePack:
+    """Two or more eligible members proposed as one task, for the judge to accept, split or reject.
+
+    ``key`` is the parent id of a ``parent`` pack and the recipe of a ``recipe`` pack.
+    ``rider_decline_hints`` pairs each member carrying a ``rider_ledger.last_decline_reason`` with
+    that reason: recorded on the proposal, not acted on in v1 (decision 7).
+    """
+
+    generator: PackGenerator
+    key: str
+    members: tuple[int, ...]
+    union_keys: tuple[str, ...]
+    survivor: int
+    pack_key: str
+    rider_decline_hints: tuple[tuple[int, str], ...] = ()
+
+    def __post_init__(self) -> None:
+        _require(
+            self.generator in get_args(PackGenerator),
+            f'generator must be one of {get_args(PackGenerator)}; got {self.generator!r}',
+        )
+        _require(len(self.members) >= 2, f'members must name at least two tasks; got {self.members!r}')
+        _require(
+            self.members == tuple(sorted(set(self.members))),
+            f'members must be sorted and unique; got {self.members!r}',
+        )
+        _require(
+            self.survivor in self.members,
+            f'survivor {self.survivor} must be one of the members {self.members!r}',
+        )
+        _require(
+            self.union_keys == tuple(sorted(set(self.union_keys))),
+            f'union_keys must be sorted and unique; got {self.union_keys!r}',
+        )
+
+
+def _pack_key(chunk: Sequence[PackMember]) -> str:
+    pairs = sorted((m.task_id, m.text_fp) for m in chunk)
+    return _sha256_16(_TEXT_FP_SEPARATOR.join(f'{task_id}:{text_fp}' for task_id, text_fp in pairs))
+
+
+def _decline_hints(chunk: Sequence[PackMember]) -> tuple[tuple[int, str], ...]:
+    return tuple(sorted(
+        (m.task_id, m.rider_last_decline_reason)
+        for m in chunk
+        if m.rider_last_decline_reason is not None
+    ))
+
+
+def _build_pack(generator: PackGenerator, key: str, chunk: Sequence[PackMember]) -> CandidatePack:
+    return CandidatePack(
+        generator=generator,
+        key=key,
+        members=tuple(sorted(m.task_id for m in chunk)),
+        union_keys=tuple(sorted({k for m in chunk for k in m.lock_keys})),
+        survivor=survivor_of(chunk),
+        pack_key=_pack_key(chunk),
+        rider_decline_hints=_decline_hints(chunk),
+    )
+
+
+def _grouped(
+    items: Iterable[_Item], key: Callable[[_Item], _GroupKey | None],
+) -> dict[_GroupKey, list[_Item]]:
+    """*items* by *key*, None-keyed ones dropped; groups and their items keep the input order."""
+    groups: dict[_GroupKey, list[_Item]] = {}
+    for item in items:
+        group_key = key(item)
+        if group_key is not None:
+            groups.setdefault(group_key, []).append(item)
+    return groups
+
+
+def _by_dependencies(group: Sequence[PackMember]) -> list[list[PackMember]]:
+    """Partitions of equal dependency sets, in order of their smallest task_id (decision 8)."""
+    ascending = sorted(group, key=lambda m: m.task_id)
+    return list(_grouped(ascending, lambda m: m.dependencies).values())
+
+
+def _chunks(
+    ordered: Iterable[PackMember], *, max_items: int, max_union_keys: int,
+) -> list[list[PackMember]]:
+    """Greedy chunks of *ordered*: a member that would break a bound opens the next chunk."""
+    chunks: list[list[PackMember]] = [[]]
+    items = 0
+    keys: set[str] = set()
+    for m in ordered:
+        widened = keys.union(m.lock_keys)
+        if chunks[-1] and (items + m.item_count > max_items or len(widened) > max_union_keys):
+            chunks.append([])
+            items, widened = 0, set(m.lock_keys)
+        chunks[-1].append(m)
+        items += m.item_count
+        keys = widened
+    return [chunk for chunk in chunks if len(chunk) >= 2]
+
+
+class _DisjointSets:
+    def __init__(self, size: int) -> None:
+        self._root = list(range(size))
+
+    def find(self, i: int) -> int:
+        while self._root[i] != i:
+            self._root[i] = self._root[self._root[i]]
+            i = self._root[i]
+        return i
+
+    def union(self, i: int, j: int) -> None:
+        self._root[self.find(i)] = self.find(j)
+
+
+def _non_hub_components(
+    partition: Sequence[PackMember], hubs: frozenset[str],
+) -> list[list[PackMember]]:
+    """Members joined by shared non-hub lock keys, each component in the partition's order."""
+    sets = _DisjointSets(len(partition))
+    first_declarer: dict[str, int] = {}
+    for position, m in enumerate(partition):
+        for key in m.lock_keys:
+            if key not in hubs:
+                sets.union(position, first_declarer.setdefault(key, position))
+    positions = _grouped(range(len(partition)), sets.find)
+    return [[partition[i] for i in component] for component in positions.values()]
+
+
+def _parent_packs(
+    eligible: Sequence[PackMember], *, hubs: frozenset[str], max_items: int, max_union_keys: int,
+) -> list[CandidatePack]:
+    """a2: same parent and kind, joined by shared non-hub keys, walked in ascending task_id."""
+    groups = _grouped(eligible, lambda m: None if m.parent is None else (m.parent, m.kind))
+    return [
+        _build_pack('parent', str(parent), chunk)
+        for (parent, _kind), group in groups.items()
+        for partition in _by_dependencies(group)
+        for component in _non_hub_components(partition, hubs)
+        for chunk in _chunks(component, max_items=max_items, max_union_keys=max_union_keys)
+    ]
+
+
+def _directory_of_first_key(m: PackMember) -> str:
+    return m.lock_keys[0].rsplit('/', 1)[0] if m.lock_keys else _FILELESS_DIRECTORY
+
+
+def _recipe_walk_key(m: PackMember) -> tuple[str, int]:
+    return (_directory_of_first_key(m), m.task_id)
+
+
+def _recipe_packs(
+    remaining: Sequence[PackMember], *, max_items: int, max_union_keys: int,
+) -> list[CandidatePack]:
+    """c2: one group per recipe, walked by the directory of each member's first key."""
+    groups = _grouped(remaining, lambda m: title_recipe(m.title))
+    return [
+        _build_pack('recipe', recipe.value, chunk)
+        for recipe, group in groups.items()
+        for partition in _by_dependencies(group)
+        for chunk in _chunks(
+            sorted(partition, key=_recipe_walk_key), max_items=max_items, max_union_keys=max_union_keys,
+        )
+    ]
+
+
+def _require_bounds(members: Sequence[PackMember], *, max_items: int, max_union_keys: int) -> None:
+    _require(
+        1 <= max_items <= PACK_MAX_ITEMS,
+        f'max_items must be between 1 and {PACK_MAX_ITEMS}; got {max_items}',
+    )
+    _require(
+        1 <= max_union_keys <= PACK_MAX_UNION_KEYS,
+        f'max_union_keys must be between 1 and {PACK_MAX_UNION_KEYS}; got {max_union_keys}',
+    )
+    repeated = sorted(task_id for task_id, n in Counter(m.task_id for m in members).items() if n > 1)
+    _require(not repeated, f'each member needs its own task_id; repeated: {repeated}')
+
+
+def candidate_packs(
+    members: Sequence[PackMember],
+    *,
+    hubs: frozenset[str],
+    now: datetime,
+    max_items: int = PACK_MAX_ITEMS,
+    max_union_keys: int = PACK_MAX_UNION_KEYS,
+) -> tuple[CandidatePack, ...]:
+    """Disjoint packs of the eligible *members*: a2 first, c2 over what a2 left.
+
+    Config may tighten a bound, never loosen it (decision 6). Packs come in judge-call order: the
+    most members first, then the oldest survivor, then the lowest survivor id.
+    """
+    _require_aware_now(now)
+    _require_bounds(members, max_items=max_items, max_union_keys=max_union_keys)
+    eligible = sorted((m for m in members if exclusion(m, now=now) is None), key=lambda m: m.task_id)
+    parent_packs = _parent_packs(
+        eligible, hubs=hubs, max_items=max_items, max_union_keys=max_union_keys,
+    )
+    packed = {task_id for pack in parent_packs for task_id in pack.members}
+    recipe_packs = _recipe_packs(
+        [m for m in eligible if m.task_id not in packed],
+        max_items=max_items,
+        max_union_keys=max_union_keys,
+    )
+    by_id = {m.task_id: m for m in eligible}
+    return tuple(sorted(
+        parent_packs + recipe_packs,
+        key=lambda pack: (-len(pack.members), _age_key(by_id[pack.survivor])),
+    ))
