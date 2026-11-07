@@ -105,6 +105,7 @@ from orchestrator.lane_lifecycle import (
 )
 from orchestrator.lane_task_dir import archive_root_for, evict_previous_occupant
 from orchestrator.recut_ruling import ParkedIncarnation, RecutRuling, RecutRulingViolation
+from orchestrator.script_warnings import log_warnings_despite_success
 from orchestrator.teardown import complete_despite_cancellation, path_confirmed_absent
 from orchestrator.tree_removal import remove_tree
 from orchestrator.verify_cancel import (
@@ -120,6 +121,7 @@ from orchestrator.verify_classify import reports_disk_full
 from orchestrator.warm_lane_gc_summary import log_reclaim_outcome
 from orchestrator.warm_lane_pool import WarmLanePool, WarmLanePoolCensus, WarmLanePoolShrink
 from orchestrator.worktree_admin_entries import unlock_dangling_locked_entries
+from orchestrator.worktree_hooks_arm import arm_worktree_hooks
 from orchestrator.worktree_identity import identities_match, read_worktree_title
 
 logger = logging.getLogger(__name__)
@@ -4991,6 +4993,7 @@ class GitOps:
                             worktree_path, actual_base[:8],
                         )
 
+                await arm_worktree_hooks(worktree_path)
                 # Re-run on reuse so the requeued agent re-acquires a free
                 # port and re-patches its .mcp.json.  The script must be
                 # idempotent (return the same port for the same worktree dir)
@@ -5148,6 +5151,7 @@ class GitOps:
             cwd=worktree_path,
         )
         post_create_base = mb_out.strip() or base_sha.strip()
+        await arm_worktree_hooks(worktree_path)
         port = await self._provision_reify_debug_port(worktree_path)
         return WorktreeInfo(
             path=worktree_path,
@@ -5652,6 +5656,9 @@ class GitOps:
         non-zero).  77 and 124 are both contention on ``<lane_dir>.lock`` but
         from opposite sides: 77 is the SCRIPT refusing, 124 is THIS method
         timing out waiting.
+
+        An rc-0 seed's ``[warn]``/``[error]`` stderr lines are logged at
+        WARNING, since each one is a fail-open degradation the seed survived.
         """
         try:
             script = lane_dir / 'scripts' / 'seed-warm-lane.sh'
@@ -5794,6 +5801,9 @@ class GitOps:
                 # idempotent/best-effort and never raises. Covers every seed
                 # site (create-once, reset-in-place, recycle) uniformly.
                 await asyncio.to_thread(self._scrub_seeded_lane_target, lane_dir)
+                log_warnings_despite_success(
+                    logger, f'_seed_warm_lane: seed for {lane_dir}', err,
+                )
             return rc
         except Exception:
             logger.warning(
@@ -8466,7 +8476,9 @@ class GitOps:
         3. Un-stack, then rebase onto main (best-effort; log failure and
            continue on old base) — :meth:`_rebase_requeued_onto_main`.
         4. Recompute ``base_commit`` as ``merge-base main HEAD``.
-        5. Re-provision the debug port (inv.7).
+        5. Arm the stash-guard hooks: no ``--fresh-checkout`` seed ran on
+           this path to arm them (:func:`arm_worktree_hooks`).
+        6. Re-provision the debug port (inv.7).
 
         *keep_stack* skips step 3's un-stack, for a train successor.  Only
         the cold reattach can pass it: :meth:`acquire_warm_lane` never serves
@@ -8517,7 +8529,10 @@ class GitOps:
         _, head_sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=lane_dir)
         base_commit = mb_out.strip() or head_sha.strip()
 
-        # 5. Re-provision debug port (inv.7)
+        # 5. Arm the stash-guard hooks (no --fresh-checkout seed ran here)
+        await arm_worktree_hooks(lane_dir)
+
+        # 6. Re-provision debug port (inv.7)
         port = await self._provision_reify_debug_port(lane_dir)
 
         logger.info(
