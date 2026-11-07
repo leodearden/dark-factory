@@ -40,7 +40,7 @@ from dashboard.api import orchestrators as api_orchestrators_routes
 from dashboard.api import prds as api_prds_routes
 from dashboard.api import task_prose as api_task_prose_routes
 from dashboard.api import tasks as api_tasks_routes
-from dashboard.api.clock import install_clock, live_clock
+from dashboard.api.clock import app_clock, install_clock, live_clock
 from dashboard.api.window import _parse_window, with_window
 from dashboard.config import DashboardConfig
 from dashboard.data import memory as memory_data
@@ -102,7 +102,7 @@ from dashboard.data.reconciliation import (
 from dashboard.data.scheduler import get_scheduler_snapshot
 from dashboard.data.task_snapshot import ROW_READ_STATUSES
 from dashboard.data.tasks import fetch_task_page
-from dashboard.data.utils import resolve_now, safe_gather_result
+from dashboard.data.utils import safe_gather_result
 from dashboard.data.write_journal import MEMORY_OPS_FRESHNESS_BOUND_SECONDS, get_memory_ops
 from dashboard.http_pool import reaper_loop
 from dashboard.loops import _burndown_loop, _BurndownStore, _metrics_loop, _MetricsStore
@@ -947,16 +947,18 @@ async def api_memory_graphs(request: Request) -> JSONResponse:
     """MEMORY_OPS from the write journal; a failed read is an unknown reading, never a 500."""
     config: DashboardConfig = request.app.state.config
     pool: DbPool = request.app.state.db
+    clock = app_clock(request.app)
     db = await pool.get(config.write_journal_db)
+    render_at = clock()
     try:
-        ops = await get_memory_ops(db)
+        ops = await get_memory_ops(db, now=render_at)
     except Exception as exc:
         logger.warning('memory-graphs: memory ops read failed', exc_info=True)
         ops = unknown_datum(
             f'memory ops read failed: {type(exc).__name__}: {exc}',
             MEMORY_OPS_FRESHNESS_BOUND_SECONDS,
         )
-    served_at = resolve_now(None)
+    served_at = clock()
     return JSONResponse(redux_api.shape_memory_graphs(ops, served_at=served_at))
 
 
@@ -1014,7 +1016,7 @@ async def api_costs(request: Request) -> JSONResponse:
     pool: DbPool = request.app.state.db
     window = _parse_window(request.query_params)
     dbs = await _cost_sources(config, pool)
-    now = datetime.now(UTC)  # clock-exempt: single-capture route
+    now = app_clock(request.app)()
     summary, by_project, by_account, by_role, trend, events, by_model_role = await asyncio.gather(
         aggregate_cost_summary(dbs, days=window.days, now=now),
         aggregate_cost_by_project(dbs, days=window.days, now=now),
@@ -1046,7 +1048,7 @@ async def api_performance(request: Request) -> JSONResponse:
     pool: DbPool = request.app.state.db
     dbs, esc_dirs = await _performance_resources(config, pool)
     window = _parse_window(request.query_params, default='7d')
-    now = datetime.now(UTC)  # clock-exempt: single-capture route
+    now = app_clock(request.app)()
     cards_r, history_r = await asyncio.gather(
         aggregate_performance_cards(dbs, esc_dirs, days=window.days, now=now),
         aggregate_performance_history(dbs, days=window.days, now=now),
@@ -1176,7 +1178,7 @@ async def api_curator(request: Request) -> JSONResponse:
     config: DashboardConfig = request.app.state.config
     pool: DbPool = request.app.state.db
     http_client: httpx.AsyncClient = request.app.state.http_client
-    now = datetime.now(UTC)  # clock-exempt: single-capture route
+    now = app_clock(request.app)()
 
     # 1 + 2 + 3. Fan-out list_tickets, latency sparks, and cap intervals all
     #              run concurrently — the fan-out dominates latency under slow
@@ -1602,7 +1604,7 @@ async def api_memory_evals(request: Request) -> JSONResponse:
     limits/verdicts artifacts) runs in a worker thread via asyncio.to_thread
     behind a ~60s single-flight TTL cache, so a cold scan never blocks the
     event loop and repeated polls within the window are free. Each rebuild
-    resolves `now` once via resolve_now (the sanctioned clock site); it stamps
+    reads `now` once from the app's clock (dashboard.api.clock); it stamps
     the payload, and stamps the escalation corpus walk only if this rebuild
     triggers one.
 
@@ -1641,9 +1643,10 @@ async def api_memory_evals(request: Request) -> JSONResponse:
     memory_evals_dir = config.memory_evals_dir
     queue = reconciliation_queue(config)
     key = f'{memory_evals_dir}|{queue.directory}'
+    clock = app_clock(request.app)
 
     async def _refresh() -> dict:
-        now = resolve_now(None)
+        now = clock()
         try:
             corpus = await acquire_corpus(corpus_queues(config), now=now)
         except Exception as exc:
