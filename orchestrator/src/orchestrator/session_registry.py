@@ -58,7 +58,12 @@ if (
 ) not in sys.path and Path(_CHECKOUT_SHARED_SRC).is_dir():
     sys.path.append(_CHECKOUT_SHARED_SRC)
 
-from shared.process_identity import ProcessIdentity
+from shared.process_identity import (
+    PROC_ROOT,
+    ProcessIdentity,
+    ProcessIdentityUnreadable,
+    capture,
+)
 from shared.project_id import fold_project_token
 
 # ---------------------------------------------------------------------------
@@ -2825,6 +2830,15 @@ def pid_alive(pid: int) -> bool:
     return _pid_alive(pid)
 
 
+def capture_for_record(pid: int, *, proc_root: Path = PROC_ROOT) -> ProcessIdentity | None:
+    """The identity a record stamps for *pid*: ``capture``'s answer, an unreadable /proc logged and read as None."""
+    try:
+        return capture(pid, proc_root=proc_root)
+    except ProcessIdentityUnreadable as exc:
+        logger.warning('pid %d stamped unqualified: %s', pid, exc)
+        return None
+
+
 @dataclass(frozen=True)
 class ReapedSessionRecord:
     """One session-registry record directory removed by reap_stale_records.
@@ -5039,6 +5053,7 @@ def _run_launching(env: Mapping[str, str]) -> str:
         prompt=prompt,
         cwd=cwd,
         launcher_pid=launcher_pid,
+        launcher_identity=capture_for_record(launcher_pid),
         start_ts=datetime.now(UTC).isoformat(),
         result_file=str(record_dir / RESULT_FILENAME),
         transcript_path=transcript_path_for_cwd(cwd),
