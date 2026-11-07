@@ -6,15 +6,21 @@ driven through their public signatures.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, Literal
+from unittest.mock import AsyncMock
 
 import pytest
+from _curator_helpers import agent_result, make_config
 from pydantic import ValidationError
+from shared.cli_invoke import AgentResult, AllAccountsCappedException
 from shared.followup_items import observed_item
-from shared.prompt_artifact import PromptArtifactStore
+from shared.prompt_artifact import ArtifactProvenance, PromptArtifactStore, compose_prompt
+from shared.usage_gate import PoolFrozen
 
-from fused_memory.middleware.curator_types import clip_for_prompt
+from fused_memory.middleware.curator_types import CuratorFailureError, clip_for_prompt
 from fused_memory.middleware.followup_packing import CandidatePack, PackMember
 from fused_memory.middleware.pack_judge import (
     CURATOR_PACK_OUTPUT_SCHEMA,
@@ -22,13 +28,19 @@ from fused_memory.middleware.pack_judge import (
     MAX_JUSTIFICATION_CHARS,
     PACK_LEDGER_ROLE,
     PACK_PROMPT_HARNESS_VERSION,
+    JudgeCall,
     PackGroup,
     PackVerdict,
     VerdictDegrade,
+    judge_pack,
     parse_pack_verdict,
     render_pack_member,
 )
-from fused_memory.middleware.task_curator import CURATOR_BATCH_SPEC, CURATOR_SINGLE_SPEC
+from fused_memory.middleware.task_curator import (
+    CURATOR_BATCH_SPEC,
+    CURATOR_SINGLE_SPEC,
+    TaskCurator,
+)
 
 PACK = CandidatePack('parent', '1', (1, 2, 3, 4, 5), ('a/x.py',), survivor=1, pack_key='0' * 16)
 
@@ -262,3 +274,118 @@ def test_a_rendered_member_shows_what_the_judge_needs():
 def test_a_rendered_member_names_an_unstamped_band():
     _, _, _, rendered = _rendered(band=None)
     assert 'band=unstamped' in rendered
+
+
+COST_STORE: Any = object()
+RENDERED = tuple(f'[Task {task_id}] rendered member block {task_id}' for task_id in PACK.members)
+WHOLE_PACK = _raw('pack', _group(1, 2, 3, 4, 5), justification='one concern')
+
+
+def _judge_curator(store: PromptArtifactStore, invoke: AsyncMock) -> TaskCurator:
+    return TaskCurator(make_config(), prompt_store=store, cost_store=COST_STORE, invoke=invoke)
+
+
+async def _judged(
+    tmp_path: Path, invoke: AsyncMock, *, store: PromptArtifactStore | None = None,
+) -> tuple[PackVerdict, JudgeCall]:
+    curator = _judge_curator(store or PromptArtifactStore(tmp_path), invoke)
+    return await judge_pack(curator, PACK, RENDERED, project_id='dark_factory')
+
+
+@pytest.mark.asyncio
+async def test_judge_pack_returns_the_verdict_and_what_the_ledger_records(tmp_path):
+    invoke = AsyncMock(return_value=agent_result(WHOLE_PACK))
+    verdict, call = await _judged(tmp_path, invoke)
+    assert verdict.verdict == 'pack'
+    assert call == JudgeCall(
+        model='sonnet',
+        harness_version='curator-pack-v1',
+        cost_usd=0.01,
+        raw_output=json.dumps(WHOLE_PACK, sort_keys=True),
+    )
+
+
+@pytest.mark.asyncio
+async def test_judge_pack_makes_one_pure_classifier_call_ledgered_as_curator_pack(tmp_path):
+    invoke = AsyncMock(return_value=agent_result(WHOLE_PACK))
+    await _judged(tmp_path, invoke)
+    invoke.assert_awaited_once()
+    kwargs = invoke.await_args.kwargs
+    assert (kwargs['role'], kwargs['project_id'], kwargs['model']) == ('curator_pack', 'dark_factory', 'sonnet')
+    assert kwargs['cost_store'] is COST_STORE
+    assert kwargs['output_schema'] is CURATOR_PACK_OUTPUT_SCHEMA
+    assert kwargs['system_prompt'] == CURATOR_PACK_SPEC.in_code_constant
+    assert kwargs['disallowed_tools'] == ['*']
+    assert kwargs['park_on_frozen_pool'] is False
+
+
+@pytest.mark.asyncio
+async def test_the_judge_prompt_carries_the_pack_header_and_every_rendered_member(tmp_path):
+    invoke = AsyncMock(return_value=agent_result(WHOLE_PACK))
+    await _judged(tmp_path, invoke)
+    prompt = invoke.await_args.kwargs['prompt']
+    for shown in (*RENDERED, PACK.generator, PACK.key, *PACK.union_keys):
+        assert shown in prompt
+
+
+def _provenance(harness_version: str) -> ArtifactProvenance:
+    return ArtifactProvenance(
+        optimizer_model='opus', corpus_hash='c0ffee', split_seed=0, held_out_TEST_score=0.9,
+        accept_delta=0.1, git_sha='9b3db98a92', date='2026-11-07', harness_version=harness_version,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_pin_under_the_pack_harness_supplies_the_heuristics(tmp_path):
+    store = PromptArtifactStore(tmp_path)
+    store.pin('curator_pack', 'sonnet', PACK_PROMPT_HARNESS_VERSION, heuristics='PINNED',
+              provenance=_provenance(PACK_PROMPT_HARNESS_VERSION))
+    invoke = AsyncMock(return_value=agent_result(WHOLE_PACK))
+    await _judged(tmp_path, invoke, store=store)
+    assert invoke.await_args.kwargs['system_prompt'] == compose_prompt(CURATOR_PACK_SPEC.contract, 'PINNED')
+
+
+@pytest.mark.asyncio
+async def test_a_pin_under_the_filing_curator_harness_does_not_reach_the_pack_judge(tmp_path):
+    store = PromptArtifactStore(tmp_path)
+    store.pin('curator_pack', 'sonnet', 'curator-v1', heuristics='PINNED', provenance=_provenance('curator-v1'))
+    invoke = AsyncMock(return_value=agent_result(WHOLE_PACK))
+    await _judged(tmp_path, invoke, store=store)
+    assert invoke.await_args.kwargs['system_prompt'] == CURATOR_PACK_SPEC.in_code_constant
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'unavailable',
+    [
+        AllAccountsCappedException(retries=3, elapsed_secs=120.0, label='curator-pack[dark_factory]'),
+        PoolFrozen(account_count=2, capped_account_names=('a', 'b'), auth_failed_account_names=()),
+    ],
+)
+async def test_an_unavailable_pool_propagates_unchanged(tmp_path, unavailable):
+    with pytest.raises(type(unavailable)) as raised:
+        await _judged(tmp_path, AsyncMock(side_effect=unavailable))
+    assert raised.value is unavailable
+
+
+@pytest.mark.asyncio
+async def test_a_failed_call_raises_rather_than_recording_a_reject(tmp_path):
+    failed = AgentResult(success=False, output='', subtype='error_max_turns', cost_usd=0.02)
+    with pytest.raises(CuratorFailureError) as raised:
+        await _judged(tmp_path, AsyncMock(return_value=failed))
+    assert (raised.value.subtype, raised.value.cost_usd) == ('error_max_turns', 0.02)
+
+
+@pytest.mark.asyncio
+async def test_a_call_without_structured_output_is_a_schema_invalid_reject_carrying_the_text(tmp_path):
+    verdict, call = await _judged(tmp_path, AsyncMock(return_value=agent_result(None, output='prose only')))
+    assert (verdict.verdict, verdict.degraded) == ('reject', VerdictDegrade.SCHEMA_INVALID)
+    assert call.raw_output == 'prose only'
+
+
+@pytest.mark.asyncio
+async def test_a_verdict_naming_a_stranger_is_an_unknown_member_reject_carrying_the_json(tmp_path):
+    stranger = _raw('pack', _group(1, 2, 3, 4, 99))
+    verdict, call = await _judged(tmp_path, AsyncMock(return_value=agent_result(stranger)))
+    assert (verdict.verdict, verdict.degraded) == ('reject', VerdictDegrade.UNKNOWN_MEMBER)
+    assert call.raw_output == json.dumps(stranger, sort_keys=True)
