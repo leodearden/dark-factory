@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import test_deterministic_runner as _det
+import test_harness_deterministic_recon_sweep as _recon
 import test_suggestion_triage as _triage
 import test_workflow_infra_thrash as _infra
 from escalation.models import Escalation
@@ -230,3 +231,31 @@ class TestDeterministicRunnerScansRunOffLoop:
         script_runner.assert_not_awaited()
         assert [c.args[1] for c in scheduler.set_task_status.await_args_list] == ['done']
         _assert_own_role_archive_scan_ran_off_loop(probe)
+
+
+@pytest.mark.asyncio
+async def test_recon_sweep_gate_proof_is_read_off_loop(tmp_path: Path):
+    h = _recon._make_recon_harness()
+    h.event_store = None
+    probe = _ThreadProbeQueue(tmp_path)
+    h._escalation_queue = probe
+    tid = 'tid-gate'
+    task = {
+        'id': tid, 'status': 'blocked',
+        'title': 'Human gate 5330', 'description': 'Approve reify 5330.',
+        'metadata': {
+            'task_kind': 'deterministic',
+            'always_escalates': True,
+            'before_done': None,
+            'gate_escalated_at': '2026-07-01T00:05:00+00:00',
+            'gate_options': ['approve', 'reject'],
+        },
+    }
+    h.scheduler.get_tasks = AsyncMock(return_value=[task])
+    h.scheduler.get_statuses = AsyncMock(return_value=({}, None))
+
+    await h._run_deterministic_recon_sweep()
+
+    refiled = probe.get_by_task(tid, status='pending')
+    assert [(e.category, e.level) for e in refiled] == [('milestone_gate', 2)]
+    _assert_own_role_archive_scan_ran_off_loop(probe)
