@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import re
 from collections import Counter
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from enum import StrEnum
 from typing import Annotated, Final
 
@@ -34,6 +34,7 @@ __all__ = [
     'observed_item',
     'read_items',
     'require_unique_item_keys',
+    'with_derived_bundle_keys',
 ]
 
 FOLLOWUP_ITEMS_METADATA_KEY: Final = 'followup_items'
@@ -151,13 +152,16 @@ def observed_item(
     Raises:
         ValidationError: when the observation breaks a field invariant.
     """
-    unkeyed = FollowupItem.model_validate({
-        'key': _UNDERIVED_KEY,
+    return _keyed_item({
         'summary': summary,
         'files': files,
         'origin_task': origin_task,
         'origin_escalation_id': origin_escalation_id,
     })
+
+
+def _keyed_item(fields: Mapping[str, object]) -> FollowupItem:
+    unkeyed = FollowupItem.model_validate({**fields, 'key': _UNDERIVED_KEY})
     derived = item_key(origin_task=unkeyed.origin_task, files=unkeyed.files, summary=unkeyed.summary)
     return unkeyed.model_copy(update={'key': derived})
 
@@ -186,10 +190,14 @@ def merge_items(base: Sequence[FollowupItem], extra: Sequence[FollowupItem]) -> 
     return (*base, *(item for item in extra if item.key not in present))
 
 
-def _origin_task(metadata: Mapping[str, object]) -> str:
+def _parent_task(metadata: Mapping[str, object]) -> str | None:
     spawned_from = metadata.get('spawned_from')
-    origin = '' if spawned_from is None else str(spawned_from).strip()
-    return origin or UNPARENTED_ORIGIN
+    parent = '' if spawned_from is None else str(spawned_from).strip()
+    return parent or None
+
+
+def _followup_escalation_id(parent_task: str | None) -> str | None:
+    return None if parent_task is None else f'agent-followup-{parent_task}'
 
 
 def legacy_item(
@@ -210,7 +218,7 @@ def legacy_item(
         'key': suggestion_hash,
         'summary': _one_line(title)[:MAX_SUMMARY_CHARS],
         'files': files,
-        'origin_task': _origin_task(metadata),
+        'origin_task': _parent_task(metadata) or UNPARENTED_ORIGIN,
         'origin_escalation_id': escalation_id if isinstance(escalation_id, str) else None,
     })
 
@@ -223,23 +231,93 @@ def read_items(metadata: Mapping[str, object]) -> tuple[FollowupItem, ...]:
     """
     if FOLLOWUP_ITEMS_METADATA_KEY not in metadata:
         return ()
-    raw = metadata[FOLLOWUP_ITEMS_METADATA_KEY]
+    elements = _require_list(metadata[FOLLOWUP_ITEMS_METADATA_KEY])
+    return tuple(
+        _validated_element(index, element, FollowupItem.model_validate)
+        for index, element in enumerate(elements)
+    )
+
+
+def _require_list(raw: object) -> list[object]:
     if not isinstance(raw, list):
         raise FollowupBundleInvalid(
             BundleViolation.NOT_A_LIST, f'expected a list of item objects, got {type(raw).__name__}',
         )
-    return tuple(_stored_item(index, element) for index, element in enumerate(raw))
+    return raw
 
 
-def _stored_item(index: int, element: object) -> FollowupItem:
+def _validated_element(
+    index: int, element: object, build: Callable[[dict[str, object]], FollowupItem],
+) -> FollowupItem:
     if not isinstance(element, Mapping):
         raise FollowupBundleInvalid(
             BundleViolation.INVALID_ITEM, f'expected an object, got {type(element).__name__}', index=index,
         )
     try:
-        return FollowupItem.model_validate(dict(element))
+        return build(dict(element))
     except ValidationError as exc:
         raise FollowupBundleInvalid(BundleViolation.INVALID_ITEM, str(exc), index=index) from exc
+
+
+def with_derived_bundle_keys(metadata: Mapping[str, object]) -> dict[str, object]:
+    """A copy of ``metadata`` whose follow-up bundle carries server-derived R4 keys (decision 3).
+
+    Without ``followup_items`` the copy is unchanged, so steward, review-cycle and pre-bundle
+    filers keep the keys they sent. With it, each item's ``key``, ``origin_task`` and
+    ``origin_escalation_id``, and the top-level ``escalation_id`` and ``suggestion_hash``, are
+    derived from ``spawned_from`` and the items, and any caller value is overwritten.
+
+    Raises:
+        FollowupBundleInvalid: when the bundle breaks a create invariant; ``reason`` names which.
+    """
+    derived = dict(metadata)
+    if FOLLOWUP_ITEMS_METADATA_KEY not in metadata:
+        return derived
+    parent = _parent_task(metadata)
+    escalation_id = _followup_escalation_id(parent)
+    items = _observed_bundle(
+        metadata[FOLLOWUP_ITEMS_METADATA_KEY],
+        {'origin_task': parent or UNPARENTED_ORIGIN, 'origin_escalation_id': escalation_id},
+    )
+    _require_declared_files(items, metadata.get('files'))
+    derived[FOLLOWUP_ITEMS_METADATA_KEY] = [item.model_dump(mode='json') for item in items]
+    derived['suggestion_hash'] = _bundle_suggestion_hash(items)
+    if escalation_id is None:
+        derived.pop('escalation_id', None)
+    else:
+        derived['escalation_id'] = escalation_id
+    return derived
+
+
+def _observed_bundle(raw: object, origin: Mapping[str, object]) -> tuple[FollowupItem, ...]:
+    elements = _require_list(raw)
+    if not 1 <= len(elements) <= MAX_FOLLOWUP_ITEMS:
+        raise FollowupBundleInvalid(
+            BundleViolation.ITEM_COUNT,
+            f'a bundle holds 1..{MAX_FOLLOWUP_ITEMS} items; got {len(elements)}',
+        )
+    items = tuple(
+        _validated_element(index, element, lambda fields: _keyed_item({**fields, **origin}))
+        for index, element in enumerate(elements)
+    )
+    require_unique_item_keys(items)
+    return items
+
+
+def _require_declared_files(items: Iterable[FollowupItem], declared: object) -> None:
+    declared_files = (
+        {path for path in declared if isinstance(path, str)} if isinstance(declared, list) else set()
+    )
+    missing = sorted({path for item in items for path in item.files} - declared_files)
+    if missing:
+        raise FollowupBundleInvalid(
+            BundleViolation.UNDECLARED_FILES,
+            f'every item file must also be in metadata.files; missing: {", ".join(missing)}',
+        )
+
+
+def _bundle_suggestion_hash(items: Iterable[FollowupItem]) -> str:
+    return _sha256_16(_KEY_MATERIAL_SEPARATOR.join(sorted(item.key for item in items)))
 
 
 # An import side effect of THIS module, never of shared.task_metadata; why is
