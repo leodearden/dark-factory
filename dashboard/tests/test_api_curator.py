@@ -169,12 +169,14 @@ def test_curator_pending_list_from_list_tickets_fanout(tmp_path: Path):
     }
     mcp_result = {'project_id': 'proj_p', 'count': 1, 'tickets': [ticket_row]}
 
+    from dashboard.app import app
+
     config = _make_config(tmp_path)
     with (
         _override_client(config) as c,
         patch(_PATCH_TARGET, new=AsyncMock(return_value=mcp_result)),
         patch(_PATCH_CURATOR_STATE, new=AsyncMock(return_value=_HEALTHY_GATE)),
-        installed_clock(c.app, fixed_clock(now)),
+        installed_clock(app, fixed_clock(now)),
     ):
         resp = c.get('/api/v2/dashboard/curator')
 
