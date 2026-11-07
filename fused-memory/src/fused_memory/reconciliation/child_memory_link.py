@@ -4,14 +4,14 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from fused_memory.server.grouped_read import PARENT_ID_KEY, _parent_id_in_meta
+from fused_memory.server.grouped_read import PARENT_ID_KEY, child_parent_id
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
 
 def render_parent_link(meta: Mapping[str, Any]) -> str:
-    parent_id = _parent_id_in_meta(meta)
+    parent_id = child_parent_id(meta)
     if parent_id is None:
         return ''
     return f' {PARENT_ID_KEY}={parent_id} kind={meta["kind"]}'
