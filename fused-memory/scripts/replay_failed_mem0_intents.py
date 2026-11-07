@@ -295,18 +295,14 @@ def _assert_journal_may_be_opened(*, apply: bool) -> None:
             ),
         )
         return
-    # The guard's own record tells the operator to re-run without --apply,
-    # which a dry run already is, so this arm reports the refusal itself.
-    try:
-        assert_store_mutation_allowed(operation='replay_failed_mem0_intents (dry run)')
-    except StoreMutationUnavailable as exc:
-        logger.error(
-            "%s Even a dry run opens write_journal.db, which applies the journal's "
-            'schema migration, so nothing was opened or selected; run it from an '
-            'unsandboxed operator shell.',
-            exc,
-        )
-        raise
+    assert_store_mutation_allowed(
+        operation='replay_failed_mem0_intents (dry run)',
+        logger=logger,
+        extra_detail=(
+            "even a dry run opens write_journal.db, which applies the journal's "
+            'schema migration. Nothing was opened and nothing was selected'
+        ),
+    )
 
 
 async def _run(
