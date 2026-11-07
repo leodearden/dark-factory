@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import re
+import socket
 import subprocess
 import sys
 import threading
@@ -31,7 +32,7 @@ from typing import Any
 
 import pytest
 from _reap_report_wait import await_reap_report
-from shared.process_identity import ProcessIdentity
+from shared.process_identity import ProcessIdentity, capture
 from shared.project_id import PROJECT_ID_ALIASES, fold_project_token
 
 from orchestrator import session_registry as sr
@@ -2650,6 +2651,70 @@ def test_main_launching_writes_record_and_prints_only_record_dir(
     assert record.prompt == '/unblock 2085'
     assert record.cwd == '/home/leo/src/dark-factory'
     assert record.launcher_pid == 4242
+
+
+def _reaped_child_pid() -> int:
+    child = subprocess.Popen(['true'])
+    child.wait()
+    return child.pid
+
+
+def test_capture_for_record_is_the_live_identity() -> None:
+    identity = sr.capture_for_record(os.getpid())
+
+    assert identity == capture(os.getpid())
+    assert identity is not None
+    assert identity.host == socket.gethostname()
+
+
+def test_capture_for_record_of_a_reaped_pid_is_none() -> None:
+    assert sr.capture_for_record(_reaped_child_pid()) is None
+
+
+def test_capture_for_record_reads_an_unreadable_proc_as_none_and_warns(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.WARNING, logger=sr.__name__):
+        identity = sr.capture_for_record(os.getpid(), proc_root=tmp_path)
+
+    assert identity is None
+    assert [r.levelno for r in caplog.records if r.name == sr.__name__] == [logging.WARNING]
+
+
+def test_main_launching_stamps_the_launcher_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _set_env(monkeypatch, _launching_env(tmp_path, launcher_pid=str(os.getpid())))
+
+    rc = sr.main(['launching'])
+
+    assert rc == 0
+    slug = sr.build_session_slug('unblock', 'df', '2085', os.getpid())
+    record_file = sr.record_path_for_slug(slug, root=tmp_path)
+    assert capsys.readouterr().out.strip() == str(record_file.parent)
+    assert sr.read_record(slug, root=tmp_path).launcher_identity == capture(os.getpid())
+    on_disk = json.loads(record_file.read_text())
+    assert on_disk['launcher_identity']['host'] == socket.gethostname()
+
+
+def test_main_launching_with_a_dead_launcher_still_writes_an_unqualified_record(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _set_env(monkeypatch, _launching_env(tmp_path, launcher_pid=str(_DEAD_PID)))
+
+    rc = sr.main(['launching'])
+
+    assert rc == 0
+    slug = sr.build_session_slug('unblock', 'df', '2085', _DEAD_PID)
+    expected_dir = sr.record_path_for_slug(slug, root=tmp_path).parent
+    assert capsys.readouterr().out.strip() == str(expected_dir)
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.launcher_pid == _DEAD_PID
+    assert record.launcher_identity is None
 
 
 def test_main_exit_sets_status_exited_and_exit_code(
