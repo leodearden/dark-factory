@@ -2,6 +2,7 @@
 
 import http.client
 import json
+import signal
 import socket
 import threading
 import time
@@ -9,6 +10,7 @@ from contextlib import ExitStack, closing
 from datetime import UTC, datetime, timedelta
 from urllib.parse import urlsplit
 
+import pytest
 from _mock_openai_server import chat_completion_body, mock_openai_server
 
 from arm_harness._loopback_http import (
@@ -294,6 +296,58 @@ def test_a_call_still_in_flight_when_the_drain_bound_expires_is_marked_as_outliv
     assert record.outlived_session is True
     assert record.status == 200
     assert record.prompt_tokens == HELD_PROMPT_TOKENS
+
+
+class _InterruptedWhileDraining(Exception):
+    """Stands in for a KeyboardInterrupt that lands while a closing session drains."""
+
+
+def _raise_interrupted(signum, frame) -> None:
+    raise _InterruptedWhileDraining
+
+
+def _interrupt_main_thread_once_closed(tap_url: str) -> threading.Thread:
+    """Signal the main thread once the tap refuses connections: it is then draining."""
+    port = urlsplit(tap_url).port
+
+    def interrupt() -> None:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            with socket.socket() as probe:
+                probe.settimeout(1)
+                if probe.connect_ex(('127.0.0.1', port)) != 0:
+                    break
+            time.sleep(0.05)
+        time.sleep(0.3)
+        signal.pthread_kill(threading.main_thread().ident or 0, signal.SIGUSR1)
+
+    interrupter = threading.Thread(target=interrupt, daemon=True)
+    interrupter.start()
+    return interrupter
+
+
+def test_an_interrupted_drain_still_marks_the_abandoned_call_as_outliving_the_session(tmp_path):
+    log = tmp_path / 'calls.jsonl'
+    received, release = threading.Event(), threading.Event()
+    statuses: list[int] = []
+    previous = signal.signal(signal.SIGUSR1, _raise_interrupted)
+    try:
+        with held_upstream(received, release) as upstream:
+            with pytest.raises(_InterruptedWhileDraining), usage_tap(
+                upstream, log_path=log
+            ) as tap_url:
+                client = _post_in_background(tap_url, statuses)
+                assert received.wait(timeout=10)
+                interrupter = _interrupt_main_thread_once_closed(tap_url)
+            interrupter.join(timeout=10)
+            release.set()
+            client.join(timeout=10)
+    finally:
+        signal.signal(signal.SIGUSR1, previous)
+
+    assert statuses == [200]
+    (record,) = load_call_records(log)
+    assert record.outlived_session is True
 
 
 def test_an_idle_keep_alive_connection_does_not_hold_a_closing_session_open(tmp_path):

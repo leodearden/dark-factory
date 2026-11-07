@@ -31,7 +31,7 @@ _HOP_BY_HOP = frozenset({
 _NOT_FORWARDED = _HOP_BY_HOP | {'host', 'accept-encoding'}
 _NOT_RETURNED = _HOP_BY_HOP | {'date', 'server'}
 
-Headers = list[tuple[str, str]]
+Headers = tuple[tuple[str, str], ...]
 
 
 class StatusOrigin(StrEnum):
@@ -147,8 +147,10 @@ class _SessionCallLog:
 
     def close(self, drain_timeout_s: float) -> None:
         with self._state:
-            self._state.wait_for(lambda: self._in_flight == 0, timeout=drain_timeout_s)
-            self._closed = True
+            try:
+                self._state.wait_for(lambda: self._in_flight == 0, timeout=drain_timeout_s)
+            finally:
+                self._closed = True
 
     def append(self, record: CallRecord) -> None:
         with self._state, self._path.open('a') as stream:
@@ -168,7 +170,7 @@ class _Reply:
 
 def _tap_error(status: int, message: str) -> _Reply:
     body = json.dumps({'error': {'message': message, 'type': 'usage_tap'}}).encode()
-    return _Reply(status, [('Content-Type', 'application/json')], body, StatusOrigin.TAP)
+    return _Reply(status, (('Content-Type', 'application/json'),), body, StatusOrigin.TAP)
 
 
 def _exchange(
@@ -190,7 +192,7 @@ def _exchange(
         connection.request(method, path, body=body, headers=forwarded)
         response = connection.getresponse()
         return _Reply(
-            response.status, response.getheaders(), response.read(), StatusOrigin.UPSTREAM
+            response.status, tuple(response.getheaders()), response.read(), StatusOrigin.UPSTREAM
         )
     except (OSError, http.client.HTTPException) as error:
         return _tap_error(
