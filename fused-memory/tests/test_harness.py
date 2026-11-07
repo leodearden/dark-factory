@@ -5942,7 +5942,6 @@ async def test_escalate_without_queue_logs_dropped_warning(
     journal, event_buffer, mock_memory_service, caplog,
 ):
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-    assert harness._escalation_queue is None
 
     with caplog.at_level(logging.WARNING):
         harness._escalate(_DROP_CATEGORY, _DROP_RUN_ID, _DROP_SUMMARY)
@@ -5956,9 +5955,11 @@ async def test_escalate_without_escalation_package_logs_dropped_warning(
 ):
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
 
-    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
     esc_queue = EscalationQueue(tmp_path / 'esc')
-    harness._escalation_queue = esc_queue
+    harness = _make_test_harness(
+        journal, event_buffer, mock_memory_service,
+        escalation_queue=esc_queue,
+    )
 
     with (
         patch('fused_memory.reconciliation.harness.HAS_ESCALATION', False),
@@ -5976,8 +5977,10 @@ async def test_escalate_submit_failure_logs_dropped_warning(
 ):
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
 
-    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-    harness._escalation_queue = EscalationQueue(tmp_path / 'esc')
+    harness = _make_test_harness(
+        journal, event_buffer, mock_memory_service,
+        escalation_queue=EscalationQueue(tmp_path / 'esc'),
+    )
 
     with (
         patch(
@@ -5997,9 +6000,11 @@ async def test_escalate_successful_submit_logs_no_drop_warning(
 ):
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
 
-    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
     esc_queue = EscalationQueue(tmp_path / 'esc')
-    harness._escalation_queue = esc_queue
+    harness = _make_test_harness(
+        journal, event_buffer, mock_memory_service,
+        escalation_queue=esc_queue,
+    )
 
     with caplog.at_level(logging.WARNING):
         harness._escalate(_DROP_CATEGORY, _DROP_RUN_ID, _DROP_SUMMARY)
@@ -13223,10 +13228,12 @@ async def test_non_actionable_finding_does_not_escalate_and_is_logged(
     """
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
 
-    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
     # Wire a real EscalationQueue so we can assert on queue contents
     esc_queue = EscalationQueue(tmp_path / 'esc')
-    harness._escalation_queue = esc_queue
+    harness = _make_test_harness(
+        journal, event_buffer, mock_memory_service,
+        escalation_queue=esc_queue,
+    )
 
     await event_buffer.push(_make_event())
     await event_buffer.push(_make_event())
@@ -13379,9 +13386,11 @@ async def test_unresolved_after_remediation_does_not_escalate_when_persistence_b
 
     from fused_memory.reconciliation.harness import _INTEGRITY_FINDING_RECURRENCE_THRESHOLD
 
-    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
     esc_queue = EscalationQueue(tmp_path / 'esc')
-    harness._escalation_queue = esc_queue
+    harness = _make_test_harness(
+        journal, event_buffer, mock_memory_service,
+        escalation_queue=esc_queue,
+    )
 
     await event_buffer.push(_make_event())
 
@@ -13498,9 +13507,11 @@ async def test_unresolved_after_remediation_escalates_when_persistence_meets_thr
 
     from fused_memory.reconciliation.harness import _INTEGRITY_FINDING_RECURRENCE_THRESHOLD
 
-    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
     esc_queue = EscalationQueue(tmp_path / 'esc')
-    harness._escalation_queue = esc_queue
+    harness = _make_test_harness(
+        journal, event_buffer, mock_memory_service,
+        escalation_queue=esc_queue,
+    )
 
     # Use the first actionable finding from _make_s3_findings()
     actionable_finding = _make_s3_findings()[0]
@@ -13625,9 +13636,11 @@ async def test_non_actionable_finding_from_remediation_pass_is_never_escalated_e
 
     from fused_memory.reconciliation.harness import _INTEGRITY_FINDING_RECURRENCE_THRESHOLD
 
-    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
     esc_queue = EscalationQueue(tmp_path / 'esc')
-    harness._escalation_queue = esc_queue
+    harness = _make_test_harness(
+        journal, event_buffer, mock_memory_service,
+        escalation_queue=esc_queue,
+    )
 
     # F is non-actionable (systemic_pattern); A is actionable (memory_stale)
     s3_findings = _make_s3_findings()
@@ -13836,9 +13849,11 @@ async def test_maybe_remediate_suppresses_all_when_open_escalation_exists(
 
     from fused_memory.reconciliation.harness import _derive_affected_ids
 
-    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
     esc_queue = EscalationQueue(tmp_path / 'esc')
-    harness._escalation_queue = esc_queue
+    harness = _make_test_harness(
+        journal, event_buffer, mock_memory_service,
+        escalation_queue=esc_queue,
+    )
 
     # Use the first actionable finding from the standard fixture set.
     actionable_finding = _make_s3_findings()[0]
@@ -13926,9 +13941,11 @@ async def test_maybe_remediate_partial_suppression_remediates_only_uncovered(
 
     from fused_memory.reconciliation.harness import _derive_affected_ids
 
-    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
     esc_queue = EscalationQueue(tmp_path / 'esc')
-    harness._escalation_queue = esc_queue
+    harness = _make_test_harness(
+        journal, event_buffer, mock_memory_service,
+        escalation_queue=esc_queue,
+    )
 
     # Two actionable findings from the standard fixture.
     findings = _make_s3_findings()
@@ -14011,9 +14028,11 @@ async def test_maybe_remediate_fail_open_when_queue_raises(
     """
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
 
-    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
     esc_queue = EscalationQueue(tmp_path / 'esc')
-    harness._escalation_queue = esc_queue
+    harness = _make_test_harness(
+        journal, event_buffer, mock_memory_service,
+        escalation_queue=esc_queue,
+    )
 
     # Patch get_pending() to raise — simulates a transient queue I/O failure.
     def raise_on_get_pending():
@@ -14889,9 +14908,11 @@ async def _cycle_flagging_after_prior_runs(
 
     from fused_memory.reconciliation.harness import _INTEGRITY_FINDING_RECURRENCE_THRESHOLD
 
-    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
     esc_queue = EscalationQueue(tmp_path / 'esc')
-    harness._escalation_queue = esc_queue
+    harness = _make_test_harness(
+        journal, event_buffer, mock_memory_service,
+        escalation_queue=esc_queue,
+    )
     for _ in range(_INTEGRITY_FINDING_RECURRENCE_THRESHOLD - 2):
         await _persist_parent_run(journal, 'test-project', prior_items)
 
@@ -15520,9 +15541,11 @@ def test_phantom_citation_storm_alarm_folds_to_single_pending_escalation(
 
     from fused_memory.reconciliation.harness import _PHANTOM_CITATION_DROP_STORM_FINDING
 
-    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
     esc_queue = EscalationQueue(tmp_path / 'esc')
-    harness._escalation_queue = esc_queue
+    harness = _make_test_harness(
+        journal, event_buffer, mock_memory_service,
+        escalation_queue=esc_queue,
+    )
 
     # Compute the expected fingerprint from the STABLE finding identity
     expected_fp = compute_content_fingerprint(
@@ -15609,9 +15632,11 @@ async def test_live_workflow_gate_suppresses_escalation_when_task_is_live(
     import fused_memory.reconciliation.harness as harness_module
     from fused_memory.reconciliation.harness import _INTEGRITY_FINDING_RECURRENCE_THRESHOLD
 
-    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
     esc_queue = EscalationQueue(tmp_path / 'esc')
-    harness._escalation_queue = esc_queue
+    harness = _make_test_harness(
+        journal, event_buffer, mock_memory_service,
+        escalation_queue=esc_queue,
+    )
 
     task_id = '4321'
     actionable_finding = _make_finding_with_cited_task(task_id)
@@ -15714,9 +15739,11 @@ async def test_live_workflow_gate_allows_escalation_when_task_is_not_live(
     import fused_memory.reconciliation.harness as harness_module
     from fused_memory.reconciliation.harness import _INTEGRITY_FINDING_RECURRENCE_THRESHOLD
 
-    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
     esc_queue = EscalationQueue(tmp_path / 'esc')
-    harness._escalation_queue = esc_queue
+    harness = _make_test_harness(
+        journal, event_buffer, mock_memory_service,
+        escalation_queue=esc_queue,
+    )
 
     task_id = '9999'
     actionable_finding = _make_finding_with_cited_task(task_id)
@@ -15810,9 +15837,11 @@ async def test_live_workflow_gate_threads_task_status_for_deferred_cited_task(
     import fused_memory.reconciliation.harness as harness_module
     from fused_memory.reconciliation.harness import _INTEGRITY_FINDING_RECURRENCE_THRESHOLD
 
-    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
     esc_queue = EscalationQueue(tmp_path / 'esc')
-    harness._escalation_queue = esc_queue
+    harness = _make_test_harness(
+        journal, event_buffer, mock_memory_service,
+        escalation_queue=esc_queue,
+    )
 
     task_id = '452'
     actionable_finding = _make_finding_with_cited_task(task_id)
@@ -15943,9 +15972,11 @@ async def test_live_workflow_gate_threads_task_kind_for_blocked_deterministic_ci
     import fused_memory.reconciliation.harness as harness_module
     from fused_memory.reconciliation.harness import _INTEGRITY_FINDING_RECURRENCE_THRESHOLD
 
-    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
     esc_queue = EscalationQueue(tmp_path / 'esc')
-    harness._escalation_queue = esc_queue
+    harness = _make_test_harness(
+        journal, event_buffer, mock_memory_service,
+        escalation_queue=esc_queue,
+    )
 
     task_id = '2059'
     actionable_finding = _make_finding_with_cited_task(task_id)
@@ -16137,9 +16168,11 @@ class TestIntegrityGateInputParityWithRenderer:
             _INTEGRITY_FINDING_RECURRENCE_THRESHOLD,
         )
 
-        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
         esc_queue = EscalationQueue(tmp_path / 'esc')
-        harness._escalation_queue = esc_queue
+        harness = _make_test_harness(
+            journal, event_buffer, mock_memory_service,
+            escalation_queue=esc_queue,
+        )
 
         actionable_finding = _make_finding_with_cited_task(str(cited_task['id']))
         harness.taskmaster.get_tasks.return_value = {  # type: ignore[union-attr,attr-defined]
@@ -16753,9 +16786,11 @@ class TestRemediationSnapshotClockPinnedToTreeRead:
             TierConfig,
         )
 
-        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
         esc_queue = EscalationQueue(tmp_path / 'esc')
-        harness._escalation_queue = esc_queue
+        harness = _make_test_harness(
+            journal, event_buffer, mock_memory_service,
+            escalation_queue=esc_queue,
+        )
 
         if taskmaster_tasks is not None:
             harness.taskmaster.get_tasks.return_value = {  # type: ignore[union-attr,attr-defined]
@@ -17146,9 +17181,11 @@ async def test_live_workflow_gate_drops_bare_orchestrator_signal_for_blocked_nor
     import fused_memory.services.live_workflow_detector as detector_module
     from fused_memory.reconciliation.harness import _INTEGRITY_FINDING_RECURRENCE_THRESHOLD
 
-    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
     esc_queue = EscalationQueue(tmp_path / 'esc')
-    harness._escalation_queue = esc_queue
+    harness = _make_test_harness(
+        journal, event_buffer, mock_memory_service,
+        escalation_queue=esc_queue,
+    )
 
     task_id = '2335'
     actionable_finding = _make_finding_with_cited_task(task_id)
@@ -17372,9 +17409,11 @@ def test_escalate_suppressed_when_recently_resolved(
 
     from fused_memory.reconciliation.harness import _derive_affected_ids
 
-    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
     esc_queue = EscalationQueue(tmp_path / 'esc')
-    harness._escalation_queue = esc_queue
+    harness = _make_test_harness(
+        journal, event_buffer, mock_memory_service,
+        escalation_queue=esc_queue,
+    )
 
     # Use the first finding: category='memory_stale', has affected_ids
     finding = _make_s3_findings()[0]
@@ -17453,9 +17492,11 @@ def test_escalate_refires_when_resolved_outside_recurrence_window(
 
     from fused_memory.reconciliation.harness import _derive_affected_ids
 
-    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
     esc_queue = EscalationQueue(tmp_path / 'esc')
-    harness._escalation_queue = esc_queue
+    harness = _make_test_harness(
+        journal, event_buffer, mock_memory_service,
+        escalation_queue=esc_queue,
+    )
 
     finding = _make_s3_findings()[0]
     fp = compute_content_fingerprint(
@@ -17514,9 +17555,11 @@ def test_finding_recently_resolved_respects_window(
     from escalation.models import Escalation  # type: ignore[import-untyped]
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
 
-    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
     esc_queue = EscalationQueue(tmp_path / 'esc')
-    harness._escalation_queue = esc_queue
+    harness = _make_test_harness(
+        journal, event_buffer, mock_memory_service,
+        escalation_queue=esc_queue,
+    )
 
     now = datetime(2026, 6, 7, 12, 0, 0, tzinfo=UTC)
 
@@ -17589,9 +17632,11 @@ def test_escalate_suppressed_when_dismissed_within_window(
 
     from fused_memory.reconciliation.harness import _derive_affected_ids
 
-    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
     esc_queue = EscalationQueue(tmp_path / 'esc')
-    harness._escalation_queue = esc_queue
+    harness = _make_test_harness(
+        journal, event_buffer, mock_memory_service,
+        escalation_queue=esc_queue,
+    )
 
     finding = _make_s3_findings()[0]
     fp = compute_content_fingerprint(
@@ -17676,9 +17721,11 @@ def test_dead_owner_storm_alarm_folds_to_single_pending_escalation(
 
     from fused_memory.reconciliation.harness import _DEAD_OWNER_STORM_FINDING
 
-    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
     esc_queue = EscalationQueue(tmp_path / 'esc')
-    harness._escalation_queue = esc_queue
+    harness = _make_test_harness(
+        journal, event_buffer, mock_memory_service,
+        escalation_queue=esc_queue,
+    )
 
     # Compute the expected fingerprint from the STABLE finding identity
     expected_fp = compute_content_fingerprint(
@@ -18141,13 +18188,15 @@ class TestHarnessDetectIndexDrift:
     ):
         from escalation.queue import EscalationQueue
 
-        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        queue_dir = tmp_path / 'recon_esc'
+        harness = _make_test_harness(
+            journal, event_buffer, mock_memory_service,
+            escalation_queue=EscalationQueue(queue_dir),
+        )
         harness.memory.graphiti = MagicMock()
         harness.memory.graphiti.list_indices = AsyncMock(
             return_value=_index_records_for(specs)
         )
-        queue_dir = tmp_path / 'recon_esc'
-        harness._escalation_queue = EscalationQueue(queue_dir)
         return harness, queue_dir
 
     # --- (a)+(b) storm escape at the caller's altitude ---
@@ -18217,7 +18266,6 @@ class TestHarnessDetectIndexDrift:
         harness.memory.graphiti.list_indices = AsyncMock(
             return_value=_index_records_for(expected - {dropped})
         )
-        harness._escalation_queue = None
 
         result = await harness._detect_index_drift('dark_factory')
 
@@ -20690,9 +20738,11 @@ async def test_perpetually_fresh_thread_escalates_within_bounded_cycles(
     )
     from fused_memory.reconciliation.scope_freshness import ScopeFreshnessResult
 
-    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
     esc_queue = EscalationQueue(tmp_path / 'esc')
-    harness._escalation_queue = esc_queue
+    harness = _make_test_harness(
+        journal, event_buffer, mock_memory_service,
+        escalation_queue=esc_queue,
+    )
 
     monkeypatch.setattr(harness_module, 'is_workflow_live_for_task', _async_is_live(False))
 
@@ -22410,12 +22460,14 @@ async def test_persistent_finding_naming_a_task_lands_on_both_queues(
         _INTEGRITY_FINDING_RECURRENCE_THRESHOLD,
     )
 
-    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-
     # The RECON queue (config.escalation_queue_dir, port-8103 watcher) — a
     # DIFFERENT directory from the per-project orchestrator queue below.
     recon_queue = EscalationQueue(tmp_path / 'recon-esc')
-    harness._escalation_queue = recon_queue
+    harness = _make_test_harness(
+        journal, event_buffer, mock_memory_service,
+        escalation_queue=recon_queue,
+    )
+
     orch_queue_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
     # A real remediation tree containing task 4458, so this test crosses the
     # existence gate the way production does rather than on its fail-open
@@ -22487,9 +22539,11 @@ async def test_two_persistent_findings_on_one_task_in_one_cycle_yield_two_record
         _INTEGRITY_FINDING_RECURRENCE_THRESHOLD,
     )
 
-    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
     recon_queue = EscalationQueue(tmp_path / 'recon-esc')
-    harness._escalation_queue = recon_queue
+    harness = _make_test_harness(
+        journal, event_buffer, mock_memory_service,
+        escalation_queue=recon_queue,
+    )
     orch_queue_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
     _wire_remediation_tree(harness, ['4458'])
 
@@ -22539,8 +22593,10 @@ async def test_non_actionable_finding_naming_a_task_is_not_routed(
     """
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
 
-    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-    harness._escalation_queue = EscalationQueue(tmp_path / 'recon-esc')
+    harness = _make_test_harness(
+        journal, event_buffer, mock_memory_service,
+        escalation_queue=EscalationQueue(tmp_path / 'recon-esc'),
+    )
     orch_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
 
     finding = _orch_finding(actionable=False, category='systemic_pattern')
@@ -22570,8 +22626,10 @@ async def test_referenceless_placeholder_finding_naming_a_task_is_not_routed(
     )
     from fused_memory.reconciliation.harness import _finding_has_reference
 
-    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-    harness._escalation_queue = EscalationQueue(tmp_path / 'recon-esc')
+    harness = _make_test_harness(
+        journal, event_buffer, mock_memory_service,
+        escalation_queue=EscalationQueue(tmp_path / 'recon-esc'),
+    )
     orch_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
 
     finding = _orch_finding(affected_ids=[])
@@ -22596,8 +22654,10 @@ async def test_finding_below_the_persistence_threshold_is_not_routed(
         _INTEGRITY_FINDING_RECURRENCE_THRESHOLD,
     )
 
-    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-    harness._escalation_queue = EscalationQueue(tmp_path / 'recon-esc')
+    harness = _make_test_harness(
+        journal, event_buffer, mock_memory_service,
+        escalation_queue=EscalationQueue(tmp_path / 'recon-esc'),
+    )
     orch_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
 
     # No seeded runs: the parent and remediation runs supply 2, below the bar of 4.
@@ -22623,8 +22683,11 @@ async def test_finding_suppressed_by_the_live_workflow_gate_is_not_routed(
 
     import fused_memory.reconciliation.harness as _h
 
-    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-    harness._escalation_queue = EscalationQueue(tmp_path / 'recon-esc')
+    recon_queue = EscalationQueue(tmp_path / 'recon-esc')
+    harness = _make_test_harness(
+        journal, event_buffer, mock_memory_service,
+        escalation_queue=recon_queue,
+    )
     orch_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
 
     # The gate iterates CITED task ids, so the finding must carry one.
@@ -22639,7 +22702,7 @@ async def test_finding_suppressed_by_the_live_workflow_gate_is_not_routed(
     # Parity check: the recon queue is silenced by the same gate, so the two
     # paths stay in lockstep rather than one leaking past the other.
     assert [
-        e for e in harness._escalation_queue.get_pending()
+        e for e in recon_queue.get_pending()
         if e.summary.startswith('Persistently unresolved after remediation')
     ] == []
 
@@ -22671,8 +22734,11 @@ async def test_routed_target_absent_from_the_remediation_tree_is_not_filed(
     """
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
 
-    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-    harness._escalation_queue = EscalationQueue(tmp_path / 'recon-esc')
+    recon_queue = EscalationQueue(tmp_path / 'recon-esc')
+    harness = _make_test_harness(
+        journal, event_buffer, mock_memory_service,
+        escalation_queue=recon_queue,
+    )
     orch_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
     # A populated tree that does NOT contain 9999 — the gate needs a tree to
     # read, or it (deliberately) fails open. See the next test.
@@ -22687,7 +22753,7 @@ async def test_routed_target_absent_from_the_remediation_tree_is_not_filed(
         'esc-9999-N, which the orphan reaper eventually promotes to a phantom L1'
     )
     assert [
-        e for e in harness._escalation_queue.get_pending()
+        e for e in recon_queue.get_pending()
         if e.summary.startswith('Persistently unresolved after remediation')
     ] != [], (
         'the existence gate must narrow only the NEW routed filing — the '
@@ -22716,8 +22782,10 @@ async def test_unavailable_task_tree_does_not_disable_routing(
     """
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
 
-    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-    harness._escalation_queue = EscalationQueue(tmp_path / 'recon-esc')
+    harness = _make_test_harness(
+        journal, event_buffer, mock_memory_service,
+        escalation_queue=EscalationQueue(tmp_path / 'recon-esc'),
+    )
     orch_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
     # No tree at all — the shape a failed/disabled taskmaster fetch produces.
     _wire_remediation_tree(harness, [])
@@ -22760,8 +22828,11 @@ async def test_bare_task_id_finding_is_gated_by_the_live_workflow_check(
 
     import fused_memory.reconciliation.harness as _h
 
-    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-    harness._escalation_queue = EscalationQueue(tmp_path / 'recon-esc')
+    recon_queue = EscalationQueue(tmp_path / 'recon-esc')
+    harness = _make_test_harness(
+        journal, event_buffer, mock_memory_service,
+        escalation_queue=recon_queue,
+    )
     orch_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
 
     # The fixture as-is: a bare task_id, NO cited_tasks.
@@ -22780,7 +22851,7 @@ async def test_bare_task_id_finding_is_gated_by_the_live_workflow_check(
     # (b) The existing recon-queue gate is UNCHANGED: with no cited tasks it was
     # vacuously not-live before this fix and must stay that way after it.
     assert [
-        e for e in harness._escalation_queue.get_pending()
+        e for e in recon_queue.get_pending()
         if e.summary.startswith('Persistently unresolved after remediation')
     ] != [], (
         'the fix must gate only the NEW routed filing — widening the _escalate '
