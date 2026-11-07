@@ -10,7 +10,7 @@ from _lane_test_helpers import make_warm_lane_repo
 from _seed_script_stubs import commit_seed_script, warm_pool_git_config
 
 from orchestrator.git_ops import GitOps
-from orchestrator.script_warnings import tagged_warning_lines
+from orchestrator.script_warnings import log_warnings_despite_success, tagged_warning_lines
 
 SEED_WARN = '\x1b[1;33m[warn]\x1b[0m  hooks-armed-guard.sh arm failed (exit 9) — seed continues'
 GUARD_WARN = '[warn] hooks-armed-guard: NOT armed in /x: reason'
@@ -68,6 +68,38 @@ class TestTaggedWarningLines:
             '[warn]  hooks-armed-guard.sh arm failed (exit 9) — seed continues',
             '[warn]    run scripts/hooks-armed-guard.sh check /lane',
         )
+
+
+
+class TestLogWarningsDespiteSuccess:
+    def test_all_warning_lines_land_in_one_record_under_the_headline(
+        self, caplog: pytest.LogCaptureFixture,
+    ):
+        log = logging.getLogger('test_script_warnings.success')
+        stderr = f'[info] start\n{SEED_WARN}\n{GUARD_ERROR}\n'
+
+        with caplog.at_level(logging.DEBUG, logger=log.name):
+            log_warnings_despite_success(log, 'seed for /lane', stderr)
+
+        assert len(caplog.records) == 1
+        record = caplog.records[0]
+        assert record.levelno == logging.WARNING
+        message = record.getMessage()
+        assert message.startswith('seed for /lane exited 0 but reported 2 warning(s)')
+        assert 'hooks-armed-guard.sh arm failed (exit 9)' in message
+        assert GUARD_ERROR in message
+        assert '[info] start' not in message
+        assert '\x1b' not in message
+
+    def test_stderr_without_warning_lines_logs_nothing(
+        self, caplog: pytest.LogCaptureFixture,
+    ):
+        log = logging.getLogger('test_script_warnings.success')
+
+        with caplog.at_level(logging.DEBUG, logger=log.name):
+            log_warnings_despite_success(log, 'seed for /lane', '[info] a\n[ok] b\n')
+
+        assert caplog.records == []
 
 
 _WARNING_SEED_SCRIPT = r"""#!/usr/bin/env bash

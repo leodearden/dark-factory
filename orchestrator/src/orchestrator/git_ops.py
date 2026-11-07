@@ -105,6 +105,7 @@ from orchestrator.lane_lifecycle import (
 )
 from orchestrator.lane_task_dir import archive_root_for, evict_previous_occupant
 from orchestrator.recut_ruling import ParkedIncarnation, RecutRuling, RecutRulingViolation
+from orchestrator.script_warnings import log_warnings_despite_success
 from orchestrator.teardown import complete_despite_cancellation, path_confirmed_absent
 from orchestrator.tree_removal import remove_tree
 from orchestrator.verify_cancel import (
@@ -5652,6 +5653,9 @@ class GitOps:
         non-zero).  77 and 124 are both contention on ``<lane_dir>.lock`` but
         from opposite sides: 77 is the SCRIPT refusing, 124 is THIS method
         timing out waiting.
+
+        An rc-0 seed's ``[warn]``/``[error]`` stderr lines are logged at
+        WARNING, since each one is a fail-open degradation the seed survived.
         """
         try:
             script = lane_dir / 'scripts' / 'seed-warm-lane.sh'
@@ -5794,6 +5798,9 @@ class GitOps:
                 # idempotent/best-effort and never raises. Covers every seed
                 # site (create-once, reset-in-place, recycle) uniformly.
                 await asyncio.to_thread(self._scrub_seeded_lane_target, lane_dir)
+                log_warnings_despite_success(
+                    logger, f'_seed_warm_lane: seed for {lane_dir}', err,
+                )
             return rc
         except Exception:
             logger.warning(
