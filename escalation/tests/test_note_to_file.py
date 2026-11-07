@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock
 import pytest
 from _filing_tools import call_info
 from _resolve_issue_call import call_resolve_issue
+from fastmcp import FastMCP
 
 from escalation.action_effects import WORKFLOW_NONE, TaskEffect, effect_for
 from escalation.archive import archive_dir_for_date
@@ -108,7 +109,7 @@ class TestFlagAndClassArePaired:
         assert resolved == []
 
 
-def _server(queue: EscalationQueue, *, status: str | None = 'in-progress') -> tuple[object, AsyncMock]:
+def _server(queue: EscalationQueue, *, status: str | None = 'in-progress') -> tuple[FastMCP, AsyncMock]:
     status_lookup = AsyncMock(return_value=status)
     server = create_server(
         queue,

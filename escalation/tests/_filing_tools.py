@@ -29,12 +29,12 @@ from _tool_calls import call_tool
 from fastmcp import FastMCP
 
 
-async def call_blocker(server, **kwargs: Any) -> dict[str, Any]:
+async def call_blocker(server: FastMCP, **kwargs: Any) -> dict[str, Any]:
     """Invoke ``escalate_blocker`` on *server* and return its response dict."""
     return await call_tool(server, 'escalate_blocker', **kwargs)
 
 
-async def call_info(server, **kwargs: Any) -> dict[str, Any]:
+async def call_info(server: FastMCP, **kwargs: Any) -> dict[str, Any]:
     """Invoke ``escalate_info`` on *server* and return its response dict."""
     return await call_tool(server, 'escalate_info', **kwargs)
 

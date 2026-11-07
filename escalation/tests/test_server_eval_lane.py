@@ -17,6 +17,7 @@ import pytest
 from _escalation_http import escalation_http_call
 from _escalation_seed import seed_escalation
 from _filing_tools import call_blocker, call_info, call_promote
+from fastmcp import FastMCP
 
 from escalation.action_effects import WORKFLOW_NONE, effect_for
 from escalation.models import Escalation
@@ -45,7 +46,7 @@ def _server(
     *,
     status: str | None = 'in-progress',
     claimant: str | None = 'run-live',
-) -> tuple[object, AsyncMock, AsyncMock]:
+) -> tuple[FastMCP, AsyncMock, AsyncMock]:
     status_lookup = AsyncMock(return_value=status)
     claimant_lookup = AsyncMock(return_value=claimant)
     server = create_server(
