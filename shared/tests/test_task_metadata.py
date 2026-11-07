@@ -1978,6 +1978,23 @@ class TestParseMetadataFailurePolicy:
         with pytest.raises((ValidationError, TypeError)):
             parse_metadata({_DEPLOY_STATE_STUB_KEY: [1, 2]}, direction='write', enforce=True)
 
+    # A RootModel submodel raises a bare ValueError, not ValidationError, when
+    # the splatted mapping carries a `root` key beside any other key.
+    @pytest.mark.parametrize(
+        'raw',
+        [
+            pytest.param({'deferral': {'root': 1, 'kind': 'x'}}, id='deferral'),
+            pytest.param(
+                {'cancel_dispositions': [{'root': 1, 'parent': 'x'}]}, id='cancel_dispositions'
+            ),
+        ],
+    )
+    def test_a_root_model_slice_with_a_root_key_read_warns_never_raises(self, raw):
+        (key,) = raw
+        model, warnings = parse_metadata(raw, direction='read')
+        assert [(w.field, w.code) for w in warnings] == [(key, 'invalid_submodel')]
+        assert model.model_dump()[key] == raw[key]
+
     def test_x_prefixed_unknown_key_silent_zero_warnings(self):
         model, warnings = parse_metadata({'x_experimental': 'v'}, direction='write')
         assert warnings == []

@@ -1764,7 +1764,10 @@ def parse_metadata(
                 # other malformed sub-model, never escaping uncaught in
                 # read or write+enforce=False.
                 parsed = {**parsed, key: submodel(**raw)}
-        except (ValidationError, TypeError) as exc:
+        # ValueError covers ValidationError (its subclass) and the bare
+        # ValueError a RootModel submodel (DeferralRecord, CancelDispositionEntry)
+        # raises when the stored mapping carries a `root` key beside others.
+        except (TypeError, ValueError) as exc:
             if direction == 'write' and enforce:
                 raise
             warnings.append(SchemaWarning(field=key, code='invalid_submodel', message=str(exc)))
