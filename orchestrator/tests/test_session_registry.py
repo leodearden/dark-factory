@@ -31,6 +31,7 @@ from typing import Any
 
 import pytest
 from _reap_report_wait import await_reap_report
+from shared.process_identity import ProcessIdentity
 from shared.project_id import PROJECT_ID_ALIASES, fold_project_token
 
 from orchestrator import session_registry as sr
@@ -234,6 +235,8 @@ def test_session_record_parses_rail_vintage_dict_migration_free() -> None:
     # Task 4193's additive hook-owner binding: absent on disk -> None, no
     # migration required.
     assert record.claude_session_id is None
+    assert record.launcher_identity is None
+    assert record.claude_owner_identity is None
 
 
 def test_schema_minor_is_int_bumped() -> None:
@@ -338,6 +341,103 @@ def test_session_record_from_dict_coerces_non_int_claude_owner_pid() -> None:
     data['claude_owner_pid'] = True
     record = sr.SessionRecord.from_dict(data)
     assert record.claude_owner_pid is None
+
+
+# ---------------------------------------------------------------------------
+# Task 8125: SessionRecord.launcher_identity and claude_owner_identity
+# ---------------------------------------------------------------------------
+
+_IDENTITY_FIELDS = ('launcher_identity', 'claude_owner_identity')
+_RECORD_PID = 1
+
+
+def _identity_wire(**overrides: object) -> dict[str, object]:
+    return {'pid': _RECORD_PID, 'start_ticks': 11, 'boot_id': 'boot-a', 'host': 'host-a', **overrides}
+
+
+def _record_dict_with_pids(pid: int) -> dict[str, Any]:
+    return _make_record(launcher_pid=pid, claude_owner_pid=pid).to_dict()
+
+
+def test_session_record_round_trip_includes_both_identities() -> None:
+    r = _make_record(
+        launcher_pid=4242,
+        launcher_identity=ProcessIdentity(4242, 11, 'boot-a', 'host-a'),
+        claude_owner_pid=424242,
+        claude_owner_identity=ProcessIdentity(424242, 12, 'boot-a', 'host-a'),
+    )
+
+    assert sr.SessionRecord.from_dict(r.to_dict()) == r
+    assert sr.SessionRecord.from_json(r.to_json()) == r
+    # The wire keys are pinned by name: watchers read them back off disk.
+    assert r.to_dict()['launcher_identity'] == {
+        'pid': 4242,
+        'start_ticks': 11,
+        'boot_id': 'boot-a',
+        'host': 'host-a',
+    }
+    assert r.to_dict()['claude_owner_identity'] == {
+        'pid': 424242,
+        'start_ticks': 12,
+        'boot_id': 'boot-a',
+        'host': 'host-a',
+    }
+
+
+def test_session_record_defaults_both_identities_to_none() -> None:
+    record = sr.SessionRecord(session_slug='s', status=sr.Status.LAUNCHING)
+
+    assert record.launcher_identity is None
+    assert record.claude_owner_identity is None
+
+
+@pytest.mark.parametrize('identity_field', _IDENTITY_FIELDS)
+def test_a_well_formed_identity_naming_its_pid_reads_back(identity_field: str) -> None:
+    data = _record_dict_with_pids(_RECORD_PID)
+    data[identity_field] = _identity_wire()
+
+    record = sr.SessionRecord.from_dict(data)
+
+    assert getattr(record, identity_field) == ProcessIdentity(_RECORD_PID, 11, 'boot-a', 'host-a')
+
+
+@pytest.mark.parametrize('identity_field', _IDENTITY_FIELDS)
+@pytest.mark.parametrize(
+    'junk',
+    [
+        pytest.param('host-a', id='str'),
+        pytest.param(_RECORD_PID, id='int'),
+        pytest.param(list(_identity_wire().values()), id='list'),
+        pytest.param(
+            {k: v for k, v in _identity_wire().items() if k != 'host'}, id='missing-host'
+        ),
+        pytest.param(_identity_wire(pid=True), id='bool-pid'),
+        pytest.param(_identity_wire(start_ticks='11'), id='str-start-ticks'),
+        pytest.param(_identity_wire(start_ticks=-1), id='negative-start-ticks'),
+        pytest.param(_identity_wire(boot_id=''), id='empty-boot-id'),
+        pytest.param(_identity_wire(host=''), id='empty-host'),
+        pytest.param(_identity_wire(pid=_RECORD_PID + 1), id='names-another-pid'),
+    ],
+)
+def test_a_junk_identity_reads_none(identity_field: str, junk: object) -> None:
+    data = _record_dict_with_pids(_RECORD_PID)
+    data[identity_field] = junk
+
+    assert getattr(sr.SessionRecord.from_dict(data), identity_field) is None
+
+
+@pytest.mark.parametrize(
+    ('identity_field', 'pid_field'),
+    [('launcher_identity', 'launcher_pid'), ('claude_owner_identity', 'claude_owner_pid')],
+)
+def test_an_identity_on_a_record_without_its_pid_reads_none(
+    identity_field: str, pid_field: str
+) -> None:
+    data = _record_dict_with_pids(_RECORD_PID)
+    del data[pid_field]
+    data[identity_field] = _identity_wire()
+
+    assert getattr(sr.SessionRecord.from_dict(data), identity_field) is None
 
 
 def test_spawn_mode_enum_values() -> None:
