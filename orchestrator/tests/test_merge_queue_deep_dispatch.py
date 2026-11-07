@@ -83,13 +83,15 @@ def _make_worker(git_ops: GitOps) -> SpeculativeMergeWorker:
     return SpeculativeMergeWorker(git_ops, asyncio.Queue())
 
 
-def _frontier_stand_ins(frontier: int) -> list[SimpleNamespace]:
-    """*frontier* frozen entries that set ``_verify_frontier_depth()`` and are built on nothing.
+def _seed_frontier(worker: SpeculativeMergeWorker, frontier: int) -> None:
+    """Stub *frontier* frozen entries that set ``_verify_frontier_depth()`` and are built on nothing.
 
     Dispatch reads each frozen entry's ``item`` and ``gate`` for the bases a
     new item may stack on; ``None`` for both contributes no base commit.
     """
-    return [SimpleNamespace(item=None, gate=None) for _ in range(frontier)]
+    worker._frozen_inflight_entries = (  # type: ignore[assignment,method-assign]
+        lambda: [SimpleNamespace(item=None, gate=None) for _ in range(frontier)]
+    )
 
 
 def _owns_merge_worktree(worker: SpeculativeMergeWorker, wt: Path) -> bool:
@@ -1143,7 +1145,7 @@ class TestRunInflightVerifyChainRedirect:
         worker._intake.replace_lane('normal', [
             _make_req(tid, tid, config, git_repo) for tid in ('102', '103')
         ])
-        worker._frozen_inflight_entries = lambda: _frontier_stand_ins(frontier)  # type: ignore[assignment,method-assign]
+        _seed_frontier(worker, frontier)
         item = _make_item(
             _make_req('101', '101', config, git_repo), head,
             _ephemeral_merge_wt(git_ops, 'redirect'),
@@ -2045,9 +2047,7 @@ async def _make_deep_scene(
     if allocator is not None:
         worker._host_allocator = allocator
     if frontier:
-        worker._frozen_inflight_entries = (  # type: ignore[assignment,method-assign]
-            lambda: _frontier_stand_ins(frontier)
-        )
+        _seed_frontier(worker, frontier)
     scene = _DeepScene(git_ops, config, worker, head, repo, store)
 
     # ── the round recorder, installed ONCE ───────────────────────────────────
