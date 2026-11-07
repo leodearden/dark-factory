@@ -33,7 +33,13 @@ from shared.locking import (
     files_to_modules,
     normalize_lock,
 )
-from shared.mcp_envelope import parse_tool_result, resolver_failed
+from shared.mcp_envelope import (
+    EnvelopeShape,
+    parse_tool_result,
+    resolver_failed,
+    tool_error_text,
+    tool_text_blocks,
+)
 from shared.mcp_idempotency import maybe_inject_client_op_id
 from shared.project_layout import scheduler_state_json
 from shared.psi import PsiSample, read_psi_sample
@@ -76,7 +82,7 @@ from orchestrator.guard_state import PersistentMap, guard_path
 from orchestrator.hold_history import HoldHistory
 from orchestrator.id_tie_break import id_tie_break
 from orchestrator.lock_table import ModuleLockTable
-from orchestrator.mcp_lifecycle import ORCHESTRATOR_MCP_IDENTITY, mcp_call, tool_error_text
+from orchestrator.mcp_lifecycle import ORCHESTRATOR_MCP_IDENTITY, mcp_call
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
 from orchestrator.overrides import OverrideRow, OverrideSource, OverrideStore
 from orchestrator.park_eviction_requests import ParkEvictionRequestStore
@@ -452,41 +458,54 @@ TRANSIENT_ERROR_TYPES = (
 )
 
 
-def extract_rejection(response: Any) -> str | None:
-    """Return a one-line description of a fused-memory rejection, or None on success.
+def _decoded_payload(result: dict) -> Any:
+    """The tool's payload: a dict ``structuredContent``, else the JSON of the first text block."""
+    structured = result.get('structuredContent')
+    if isinstance(structured, dict):
+        return structured
+    texts = tool_text_blocks(result)
+    if not texts:
+        return None
+    try:
+        return json.loads(texts[0])
+    except (ValueError, TypeError):
+        return None
 
-    fused-memory's set_task_status returns structured error dicts (terminal-exit
-    gate, phantom-done gate, done_provenance validation) without raising. The
-    payload arrives wrapped in MCP envelope:
-    ``{result: {structuredContent: {...}, content: [{type: text, text: <json>}], isError: bool}}``.
 
-    A rejection has either ``error`` (truthy) or ``success: False`` in the payload.
-    A no-op (same-status) returns ``success: True, no_op: True`` and is treated
-    as success.
-    """
+def _rejection_payload(response: Any) -> dict | None:
+    """The rejection payload of a fused-memory tool reply, or None when the write landed."""
     if not isinstance(response, dict):
         return None
     result = response.get('result', response)
     if not isinstance(result, dict):
         return None
-    payload = result.get('structuredContent')
-    if not isinstance(payload, dict):
-        # Fall back to parsing the text content block.
-        for block in result.get('content', []) or []:
-            if isinstance(block, dict) and block.get('type') == 'text':
-                try:
-                    payload = json.loads(block.get('text') or '')
-                except (ValueError, TypeError):
-                    payload = None
-                break
-    if not isinstance(payload, dict):
+    payload = _decoded_payload(result)
+    if isinstance(payload, dict) and (payload.get('error') or payload.get('success') is False):
+        return payload
+    error_text = tool_error_text(result)
+    if error_text is not None:
+        return {'error': EnvelopeShape.IS_ERROR.value, 'hint': error_text}
+    return None
+
+
+def extract_rejection(response: Any) -> str | None:
+    """Return a one-line description of a fused-memory rejection, or None on success.
+
+    fused-memory's set_task_status returns structured error dicts (terminal-exit
+    gate, phantom-done gate, done_provenance validation) without raising, as the
+    reply's ``structuredContent`` or JSON text block. A rejection has either
+    ``error`` (truthy) or ``success: False`` in that payload. An ``isError`` reply
+    is a rejection even when its text is not JSON, rendered ``IS_ERROR — <prose>``.
+    A no-op (same-status) returns ``success: True, no_op: True`` and is treated
+    as success.
+    """
+    payload = _rejection_payload(response)
+    if payload is None:
         return None
     if payload.get('error'):
         hint = payload.get('hint') or payload.get('error_type') or ''
         return f'{payload["error"]}{" — " + hint if hint else ""}'
-    if payload.get('success') is False:
-        return f'success=False payload={payload!r}'
-    return None
+    return f'success=False payload={payload!r}'
 
 
 def extract_structured_rejection(response: Any) -> dict | None:
@@ -496,29 +515,10 @@ def extract_structured_rejection(response: Any) -> dict | None:
     callers can inspect typed fields (``error``, ``from_status``, …) without
     re-parsing the rendered string. Used by ``set_task_status`` to classify
     ``terminal_exit_rejected`` responses as logical contradictions worthy of
-    raising ``TerminalExitRejection``.
+    raising ``TerminalExitRejection``. An ``isError`` reply whose text carries
+    no structured error yields ``{'error': 'IS_ERROR', 'hint': <its prose>}``.
     """
-    if not isinstance(response, dict):
-        return None
-    result = response.get('result', response)
-    if not isinstance(result, dict):
-        return None
-    payload = result.get('structuredContent')
-    if not isinstance(payload, dict):
-        for block in result.get('content', []) or []:
-            if isinstance(block, dict) and block.get('type') == 'text':
-                try:
-                    payload = json.loads(block.get('text') or '')
-                except (ValueError, TypeError):
-                    payload = None
-                break
-    if not isinstance(payload, dict):
-        return None
-    if payload.get('error'):
-        return payload
-    if payload.get('success') is False:
-        return payload
-    return None
+    return _rejection_payload(response)
 
 
 def is_transient_rejection(rejection: str | None) -> bool:
@@ -2627,7 +2627,8 @@ class Scheduler:
         ``None`` is itself the clear value — see ``_CLAIMANT_ABSENT``.
 
         Best-effort: any exception (including a raised transient MCP error,
-        or a rejection embedded in the response) is logged and swallowed.
+        or a rejection embedded in the response, an ``isError`` reply
+        included) is logged and swallowed.
         Unlike ``set_task_status``, a lost heartbeat/clear does not strand
         the caller — a missed refresh self-corrects on the next cadence
         tick, and a missed clear self-heals (next heartbeat, or W10's
