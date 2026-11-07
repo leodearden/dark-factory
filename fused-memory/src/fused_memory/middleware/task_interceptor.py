@@ -22,6 +22,13 @@ from shared.declared_scope import (
     stamp_violation,
 )
 from shared.defects import DeclareEvent, OutcomeEvent
+from shared.followup_items import (
+    FOLLOWUP_ITEMS_METADATA_KEY,
+    FollowupBundleInvalid,
+    FollowupItem,
+    read_items,
+    with_derived_bundle_keys,
+)
 from shared.mcp_envelope import write_failure_reason
 from shared.task_metadata import DoneProvenance, SchemaWarning, parse_metadata
 from shared.task_metadata_wire import coerce_task_metadata
@@ -43,6 +50,7 @@ from fused_memory.backends.task_backend_errors import (
     DeferralWriteAuthorityError,
     DoneProvenanceWriteAuthorityError,
     DuplicateCandidateKeyError,
+    FollowupItemsRefusedError,
     LeakedEnvelopeMarkupError,
     MetadataNotAnObjectError,
     StatusWriteAuthorityError,
@@ -612,6 +620,27 @@ def _with_declared_scope_stamp(metadata: Any, kwargs: dict[str, Any]) -> Any:
         basis='submit',
     )
     return {**readable, DECLARED_SCOPE_METADATA_KEY: stamp.model_dump()}
+
+
+def _with_derived_bundle_keys(metadata: Any) -> Any:
+    """*metadata* with its follow-up bundle's R4 keys derived; any other wire value is returned as is."""
+    readable = coerce_task_metadata(metadata)
+    if readable is None or FOLLOWUP_ITEMS_METADATA_KEY not in readable:
+        return metadata
+    return with_derived_bundle_keys(readable)
+
+
+def _candidate_items(meta: Mapping[str, Any]) -> tuple[FollowupItem, ...]:
+    """The candidate's follow-up items; () with a census line when a stored list is malformed."""
+    try:
+        return read_items(meta)
+    except FollowupBundleInvalid as exc:
+        logger.warning(
+            'task_metadata.schema_warning source=%s error=%s; candidate items discarded',
+            '_candidate_items',
+            exc,
+        )
+        return ()
 
 
 class TaskInterceptor:
@@ -2673,6 +2702,7 @@ class TaskInterceptor:
             spawned_from=meta.get('spawned_from'),
             spawn_context=str(meta.get('spawn_context') or 'manual'),
             execution_class=meta.get('execution_class'),
+            items=_candidate_items(meta),
         )
 
     def _files_scope_check(
@@ -4164,6 +4194,15 @@ class TaskInterceptor:
         routing_override_reason = str(
             kwargs.pop('routing_override_reason', '') or ''
         ).strip()
+
+        # First, so no reader of this submission on either creation path, the path guard's
+        # candidate included, sees a caller-sent follow-up key (plans/follow-up-filing-shape-prd.md
+        # §3 decision 3).
+        if 'metadata' in kwargs:
+            try:
+                kwargs['metadata'] = _with_derived_bundle_keys(kwargs['metadata'])
+            except FollowupBundleInvalid as exc:
+                return FollowupItemsRefusedError(exc).to_error_dict()
 
         # Path-scope guard: reject before persisting if the candidate references
         # paths owned by another project.  The guard runs for every project
