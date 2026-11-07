@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 import pytest
+
 from orchestrator.worktree_hooks_arm import HooksArmOutcome, arm_worktree_hooks
 
 _ARM_LOGGER = 'orchestrator.worktree_hooks_arm'
