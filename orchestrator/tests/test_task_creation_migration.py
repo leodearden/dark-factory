@@ -14,6 +14,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 from _orch_helpers import pydantic_spec
+from shared.followup_items import FOLLOWUP_ITEMS_METADATA_KEY, MAX_FOLLOWUP_ITEMS, MAX_SUMMARY_CHARS
 
 from orchestrator.agents.roles import (
     _FOLLOWUP_FILING_INSTRUCTIONS,
@@ -179,6 +180,30 @@ class TestOperationalAskRouting:
         assert (Path(__file__).resolve().parents[2] / doc).is_file(), (
             f'{doc} is cited by _FOLLOWUP_FILING_INSTRUCTIONS but does not exist'
         )
+
+
+class TestFollowupBundlingPrompt:
+    """Architect and implementer filers send one bundle per area (plans/follow-up-filing-shape-prd.md §3).
+
+    The submit boundary derives every R4 key of a bundle (decision 3), so the template no longer
+    asks for them; the steward and deep-reviewer templates keep theirs (decision 5).
+    """
+
+    def test_the_template_carries_a_bundle_of_items(self):
+        assert f'"{FOLLOWUP_ITEMS_METADATA_KEY}":' in _FOLLOWUP_FILING_INSTRUCTIONS
+        assert '"summary":' in _FOLLOWUP_FILING_INSTRUCTIONS
+        assert '"files":' in _FOLLOWUP_FILING_INSTRUCTIONS
+        assert f'at most {MAX_FOLLOWUP_ITEMS} items' in _FOLLOWUP_FILING_INSTRUCTIONS
+        assert f'at most {MAX_SUMMARY_CHARS} chars' in _FOLLOWUP_FILING_INSTRUCTIONS
+
+    def test_the_template_does_not_ask_for_server_derived_keys(self):
+        assert '"suggestion_hash":' not in _FOLLOWUP_FILING_INSTRUCTIONS
+        assert '"escalation_id":' not in _FOLLOWUP_FILING_INSTRUCTIONS
+
+    def test_steward_and_deep_reviewer_keep_their_templates(self):
+        for role in (STEWARD, DEEP_REVIEWER):
+            assert FOLLOWUP_ITEMS_METADATA_KEY not in role.system_prompt
+            assert '"suggestion_hash":' in role.system_prompt
 
 
 class TestStewardSweepUp:
