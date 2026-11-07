@@ -121,6 +121,7 @@ from orchestrator.verify_classify import reports_disk_full
 from orchestrator.warm_lane_gc_summary import log_reclaim_outcome
 from orchestrator.warm_lane_pool import WarmLanePool, WarmLanePoolCensus, WarmLanePoolShrink
 from orchestrator.worktree_admin_entries import unlock_dangling_locked_entries
+from orchestrator.worktree_hooks_arm import arm_worktree_hooks
 from orchestrator.worktree_identity import identities_match, read_worktree_title
 
 logger = logging.getLogger(__name__)
@@ -4997,6 +4998,7 @@ class GitOps:
                 # idempotent (return the same port for the same worktree dir)
                 # to avoid leaking ports across requeues — see the docstring
                 # of _provision_reify_debug_port for the full contract.
+                await arm_worktree_hooks(worktree_path)
                 port = await self._provision_reify_debug_port(worktree_path)
                 return WorktreeInfo(
                     path=worktree_path,
@@ -5149,6 +5151,7 @@ class GitOps:
             cwd=worktree_path,
         )
         post_create_base = mb_out.strip() or base_sha.strip()
+        await arm_worktree_hooks(worktree_path)
         port = await self._provision_reify_debug_port(worktree_path)
         return WorktreeInfo(
             path=worktree_path,
@@ -8473,7 +8476,9 @@ class GitOps:
         3. Un-stack, then rebase onto main (best-effort; log failure and
            continue on old base) — :meth:`_rebase_requeued_onto_main`.
         4. Recompute ``base_commit`` as ``merge-base main HEAD``.
-        5. Re-provision the debug port (inv.7).
+        5. Arm the stash-guard hooks: no ``--fresh-checkout`` seed ran on
+           this path to arm them (:func:`arm_worktree_hooks`).
+        6. Re-provision the debug port (inv.7).
 
         *keep_stack* skips step 3's un-stack, for a train successor.  Only
         the cold reattach can pass it: :meth:`acquire_warm_lane` never serves
@@ -8524,7 +8529,10 @@ class GitOps:
         _, head_sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=lane_dir)
         base_commit = mb_out.strip() or head_sha.strip()
 
-        # 5. Re-provision debug port (inv.7)
+        # 5. Arm the stash-guard hooks (no --fresh-checkout seed ran here)
+        await arm_worktree_hooks(lane_dir)
+
+        # 6. Re-provision debug port (inv.7)
         port = await self._provision_reify_debug_port(lane_dir)
 
         logger.info(
