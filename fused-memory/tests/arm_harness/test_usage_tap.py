@@ -21,6 +21,7 @@ from arm_harness._loopback_http import (
 from fused_memory.arm_harness.usage_tap import (
     ERROR_EXCERPT_CHARS,
     CallRecord,
+    StatusOrigin,
     call_record,
     load_call_records,
     usage_tap,
@@ -75,6 +76,7 @@ def test_forwards_a_chat_completion_unchanged_and_records_the_server_usage(tmp_p
     assert record.finish_reason == 'length'
     assert record.error_excerpt is None
     assert record.outlived_session is False
+    assert record.status_origin is StatusOrigin.UPSTREAM
 
 
 def test_a_rejected_call_passes_through_and_records_an_excerpt_without_usage(tmp_path):
@@ -94,6 +96,7 @@ def test_a_rejected_call_passes_through_and_records_an_excerpt_without_usage(tmp
     assert record.request_model == 'qwen3.5-9b'
     assert record.error_excerpt == body.decode()[:ERROR_EXCERPT_CHARS]
     assert len(body.decode()) > ERROR_EXCERPT_CHARS
+    assert record.status_origin is StatusOrigin.UPSTREAM
 
 
 def test_a_success_without_usage_passes_through_with_no_token_counts(tmp_path):
@@ -121,6 +124,7 @@ def test_call_record_tolerates_bodies_that_are_not_json():
         request_body=b'not json either',
         status=200,
         response_body=b'<html>gateway says hi</html>',
+        status_origin=StatusOrigin.UPSTREAM,
     )
 
     assert record.status == 200
@@ -130,6 +134,7 @@ def test_call_record_tolerates_bodies_that_are_not_json():
     assert record.prompt_tokens is None
     assert record.finish_reason is None
     assert record.error_excerpt is None
+    assert record.status_origin is StatusOrigin.UPSTREAM
 
 
 def test_call_record_tolerates_json_of_the_wrong_shape():
@@ -141,11 +146,13 @@ def test_call_record_tolerates_json_of_the_wrong_shape():
         request_body=json.dumps(['a', 'list']).encode(),
         status=200,
         response_body=json.dumps({'usage': 'none', 'choices': []}).encode(),
+        status_origin=StatusOrigin.UPSTREAM,
     )
 
     assert record.request_model is None
     assert record.prompt_tokens is None
     assert record.finish_reason is None
+    assert record.status_origin is StatusOrigin.UPSTREAM
 
 
 def test_an_unreachable_upstream_answers_502_promptly_and_names_the_error(tmp_path):
@@ -161,13 +168,15 @@ def test_an_unreachable_upstream_answers_502_promptly_and_names_the_error(tmp_pa
     assert record.status == 502
     assert record.prompt_tokens is None
     assert 'ConnectionRefusedError' in (record.error_excerpt or '')
+    assert record.status_origin is StatusOrigin.TAP
 
 
 def test_a_streamed_request_is_refused_rather_than_mismeasured(tmp_path):
     log = tmp_path / 'calls.jsonl'
     with mock_openai_server() as mock:
         with usage_tap(_origin(mock), log_path=log) as tap_url:
-            status, _ = post_json(tap_url, CHAT_PATH, json.dumps(REQUEST | {'stream': True}).encode())
+            streamed = json.dumps(REQUEST | {'stream': True}).encode()
+            status, _ = post_json(tap_url, CHAT_PATH, streamed)
         upstream = mock.requests
 
     assert status == 501
@@ -175,6 +184,7 @@ def test_a_streamed_request_is_refused_rather_than_mismeasured(tmp_path):
     (record,) = load_call_records(log)
     assert record.status == 501
     assert record.prompt_tokens is None
+    assert record.status_origin is StatusOrigin.TAP
 
 
 def test_concurrent_requests_each_append_one_whole_line(tmp_path):
@@ -232,9 +242,9 @@ def test_a_session_with_no_calls_still_leaves_its_empty_log(tmp_path):
 
 
 def _post_in_background(tap_url: str, statuses: list[int]) -> threading.Thread:
+    raw = json.dumps(REQUEST).encode()
     client = threading.Thread(
-        target=lambda: statuses.append(post_json(tap_url, CHAT_PATH, json.dumps(REQUEST).encode())[0]),
-        daemon=True,
+        target=lambda: statuses.append(post_json(tap_url, CHAT_PATH, raw)[0]), daemon=True
     )
     client.start()
     return client
@@ -308,7 +318,7 @@ def test_an_idle_keep_alive_connection_does_not_hold_a_closing_session_open(tmp_
     assert exit_s < 5
 
 
-def test_a_record_written_without_the_session_marker_loads_as_inside_its_session(tmp_path):
+def test_a_record_predating_the_session_and_origin_fields_loads_in_session_with_no_origin(tmp_path):
     log = tmp_path / 'calls.jsonl'
     record = call_record(
         started_at=datetime(2026, 10, 7, tzinfo=UTC),
@@ -318,10 +328,14 @@ def test_a_record_written_without_the_session_marker_loads_as_inside_its_session
         request_body=json.dumps(REQUEST).encode(),
         status=200,
         response_body=json.dumps(usage_body(10, 1, 'stop')).encode(),
+        status_origin=StatusOrigin.UPSTREAM,
     )
     payload = record.model_dump(mode='json')
     del payload['outlived_session']
+    del payload['status_origin']
     log.write_text(json.dumps(payload) + '\n')
 
-    assert load_call_records(log) == (record,)
-    assert record.outlived_session is False
+    (loaded,) = load_call_records(log)
+    assert loaded.outlived_session is False
+    assert loaded.status_origin is None
+    assert loaded == record.model_copy(update={'status_origin': None})
