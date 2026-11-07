@@ -43,6 +43,13 @@ TIMEOUT_ERROR_TEXT = (
 
 DONE_GATE_PAYLOAD = {'error': 'done_gate_missing_files', 'missing_files': ['a.py']}
 
+# A whole JSON-RPC body with an error member and no result.
+JSONRPC_ERROR_BODY = {
+    'jsonrpc': '2.0',
+    'id': 9,
+    'error': {'code': -32602, 'message': 'Invalid params: unknown tool set_task_status'},
+}
+
 
 class _ScriptedReplySession(HermeticMcpSession):
     """Answers scripted tools from a per-tool queue and records each call it serves.
@@ -147,6 +154,18 @@ def test_is_error_without_a_structured_error_is_a_rejection(result: dict) -> Non
     assert structured['error'] == 'IS_ERROR'
 
 
+def test_json_rpc_error_body_is_a_rejection_naming_code_and_message() -> None:
+    rendered = extract_rejection(JSONRPC_ERROR_BODY)
+
+    assert rendered is not None
+    assert 'JSON_RPC_ERROR' in rendered
+    assert '-32602' in rendered
+    assert 'Invalid params' in rendered
+    structured = extract_structured_rejection(JSONRPC_ERROR_BODY)
+    assert structured is not None
+    assert structured['error'] == 'JSON_RPC_ERROR'
+
+
 def test_structured_error_code_survives_an_is_error_reply() -> None:
     body = _body(_is_error_json(DONE_GATE_PAYLOAD))
 
@@ -204,6 +223,24 @@ async def test_is_error_blocked_write_raises_and_is_not_counted_as_parked(
 
 
 @pytest.mark.asyncio
+async def test_json_rpc_error_blocked_write_raises_and_is_not_counted_as_parked(
+    tmp_path: Path,
+) -> None:
+    session = _ScriptedReplySession({'set_task_status': [JSONRPC_ERROR_BODY]})
+    on_trip = AsyncMock()
+    scheduler = _scheduler(tmp_path, session, on_park_stop_trip=on_trip)
+
+    with pytest.raises(SetTaskStatusRejected) as excinfo:
+        await scheduler.set_task_status('42', 'blocked')
+
+    assert excinfo.value.error_code == 'JSON_RPC_ERROR'
+    assert len(session.calls_to('set_task_status')) == 1
+    assert scheduler.parked_window_churn_count == 0
+    assert scheduler.is_paused is False
+    on_trip.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_landed_blocked_write_is_counted_and_trips_park_stop(tmp_path: Path) -> None:
     session = _ScriptedReplySession(
         {'set_task_status': [_clean({'id': '42', 'status': 'blocked'})]},
@@ -252,6 +289,23 @@ async def test_is_error_claimant_write_logs_one_rejection_warning(
     message = warnings[0].getMessage()
     assert '42' in message
     assert '1 validation error' in message
+
+
+@pytest.mark.asyncio
+async def test_json_rpc_error_claimant_clear_logs_one_rejection_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger=SCHEDULER_LOGGER)
+    session = _ScriptedReplySession({'set_task_claimant': [JSONRPC_ERROR_BODY]})
+    scheduler = _scheduler(tmp_path, session)
+
+    await scheduler.set_task_claimant('42', claimant_run_id=None, heartbeat_at=None)
+
+    warnings = _scheduler_warnings(caplog)
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert '42' in message
+    assert 'Invalid params' in message
 
 
 @pytest.mark.asyncio
