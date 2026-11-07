@@ -84,7 +84,8 @@ class PlannedEpisodeRegistry:
         path = Path(data_dir) / _DB_FILENAME
         if not await asyncio.to_thread(path.is_file):
             raise FileNotFoundError(f'no planned episode registry at {path}')
-        conn = await connect_daemon(f'{path.resolve().as_uri()}?mode=ro', uri=True)
+        resolved = await asyncio.to_thread(path.resolve)
+        conn = await connect_daemon(f'{resolved.as_uri()}?mode=ro', uri=True)
         return cls(data_dir, access=AtomicConnection(conn))
 
     def _require_access(self) -> AtomicConnection:
