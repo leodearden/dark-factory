@@ -117,7 +117,7 @@ def _make_busy_on_older_l0_steward(
 
     class _FakeSteward:
         instances: list[_FakeSteward] = []
-        published: list[str] = []
+        published: list[tuple[str, float]] = []
 
         def __init__(self, wt_path: Path, cfg_dir: Path | None) -> None:
             self._outcome_channel: asyncio.Queue[PublishedStewardOutcome] | None = None
@@ -135,7 +135,9 @@ def _make_busy_on_older_l0_steward(
             self._outcome_channel.put_nowait(
                 PublishedStewardOutcome(esc_id, StewardResolved(text)),
             )
-            _FakeSteward.published.append(esc_id)
+            _FakeSteward.published.append(
+                (esc_id, asyncio.get_running_loop().time()),
+            )
 
         def _close_other_pending(self) -> list[str]:
             closed = [
@@ -227,10 +229,13 @@ class TestMarkBlockedWaitIsScopedToItsOwnEscalation:
         steward_cls = _make_busy_on_older_l0_steward(
             queue, older.id, new_l0=NewL0Handling.UNTOUCHED,
         )
+        grace = 0.5
         workflow, scheduler = await _build_workflow(
-            git_repo, task_assignment, queue, steward_cls, tmp_path, completion_timeout=0.5,
+            git_repo, task_assignment, queue, steward_cls, tmp_path,
+            completion_timeout=grace,
         )
 
+        call_started = asyncio.get_running_loop().time()
         try:
             outcome = await asyncio.wait_for(
                 workflow._mark_blocked(
@@ -242,9 +247,11 @@ class TestMarkBlockedWaitIsScopedToItsOwnEscalation:
         finally:
             await _stop_all(steward_cls)
 
-        assert steward_cls.published == [older.id], (
-            "precondition: the older L0's outcome must reach the channel during "
-            'the wait, or BLOCKED proves nothing about scoping'
+        [(published_id, published_at)] = steward_cls.published
+        assert published_id == older.id
+        assert published_at < call_started + grace, (
+            "precondition: the older L0's outcome must reach the channel inside "
+            'the grace window, or BLOCKED proves nothing about scoping'
         )
         assert outcome == WorkflowOutcome.BLOCKED, (
             "the older L0's StewardResolved must not end the wait for the new L0"

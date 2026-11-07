@@ -512,6 +512,35 @@ class TestScopedWaitSettlesOnTheAwaitedRecord:
 
         assert outcome == StewardInterrupted('timeout', wip_commits_present=False)
 
+    async def test_own_record_closed_under_an_unrelated_l1_settles_promptly(
+        self, tmp_path: Path,
+    ):
+        """An open L1 of another category does not make a close of this
+        task's own record a hand-off: the wait settles on the record at once
+        and the open-L1 override turns it into ESCALATED, never a timeout."""
+        wf, queue, channel, older, awaited = self._workflow_with_two_l0s(
+            tmp_path, timeout=30.0,
+        )
+        l1 = Escalation(
+            id=queue.make_id('2248'), task_id='2248', agent_role='steward',
+            severity='blocking', category='design_concern',
+            summary='unrelated hand-off', level=1,
+        )
+        queue.submit(l1)
+        queue.resolve(
+            awaited.id, 'fixed by the rebase',
+            resolved_by='claude-task-2248-steward',
+        )
+        channel.put_nowait(
+            PublishedStewardOutcome(older.id, StewardResolved('older fixed')),
+        )
+
+        outcome = await asyncio.wait_for(
+            wf._await_steward_completion(escalation_id=awaited.id), 5,
+        )
+
+        assert outcome == StewardReescalatedL1(esc_id=l1.id)
+
     async def test_hand_off_close_of_another_tasks_record_does_not_settle(
         self, tmp_path: Path,
     ):

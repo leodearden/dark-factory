@@ -225,6 +225,12 @@ class TestClosedByNonSweepResolver:
         record = _make_escalation(status='dismissed', resolved_by='claude-task-42-steward')
         assert closed_by_non_sweep_resolver(record) is True
 
+    def test_steward_hand_off_dismissal_counts(self):
+        """The steward's give-up dismissal shares the 'steward' stamp with an
+        attributed agent close, so the predicate cannot exclude it."""
+        record = _make_escalation(status='dismissed', resolved_by='steward')
+        assert closed_by_non_sweep_resolver(record) is True
+
     def test_human_resolved_counts(self):
         record = _make_escalation(status='resolved', resolved_by='interactive')
         assert closed_by_non_sweep_resolver(record) is True

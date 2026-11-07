@@ -114,10 +114,16 @@ def effective_benign(record: Escalation) -> tuple[str | None, str]:
 def closed_by_non_sweep_resolver(record: Escalation) -> bool:
     """Is *record* terminal, and closed by a resolver outside the reaper-sweep tier?
 
-    Such a close carries a finding: an agent, a human, a cascade or another
-    non-sweep actor decided it. Both terminal states count, because
-    ``resolve_issue``'s ``close_only`` and ``abandon`` actions dismiss rather
-    than resolve.
+    An agent, a human, a cascade or another non-sweep actor decided it. Both
+    terminal states count, because ``resolve_issue``'s ``close_only`` and
+    ``abandon`` actions dismiss rather than resolve.
+
+    A steward's hand-off dismissal (``resolved_by='steward'``, filed with an
+    L1 by ``orchestrator/steward.py::TaskSteward._auto_escalate_to_human``)
+    also passes, though it hands the record to a human rather than resolving
+    it: the stamp is shared with the back-fill of an unattributed agent close.
+    A caller needing "resolved, not handed off" excludes hand-offs itself, as
+    ``orchestrator/workflow.py::TaskWorkflow._awaited_record_outcome`` does.
     """
     if record.status not in ('resolved', 'dismissed'):
         return False
