@@ -44,7 +44,7 @@ async def api_orchestrators(request: Request) -> JSONResponse:
     metrics_db = await pool.get(config.metrics_db)
     orchestrators, running_spark = await asyncio.gather(
         discover_orchestrators(config),
-        get_orchestrators_running_series(metrics_db, days=1),
+        get_orchestrators_running_series(metrics_db, days=1, now=served_at),
     )
     return JSONResponse(
         {

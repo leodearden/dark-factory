@@ -55,9 +55,9 @@ async def api_memory(request: Request) -> JSONResponse:
         memory_data.get_queue_stats(
             http_client, config, timeout=_MEMORY_ENDPOINT_TIMEOUT_SECONDS,
         ),
-        get_memory_sparks(metrics_db, days=1),
-        get_queue_pending_series(metrics_db, days=1),
-        get_memory_24h_ago(metrics_db),
+        get_memory_sparks(metrics_db, days=1, now=render_at),
+        get_queue_pending_series(metrics_db, days=1, now=render_at),
+        get_memory_24h_ago(metrics_db, now=render_at),
         memory_data.get_wal_status(
             http_client, config, timeout=_MEMORY_ENDPOINT_TIMEOUT_SECONDS,
         ),

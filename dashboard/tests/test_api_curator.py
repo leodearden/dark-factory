@@ -583,7 +583,7 @@ def test_api_curator_runs_fanout_and_db_concurrently(tmp_path: Path):
         'p99': {'labels': [], 'values': []},
     }
 
-    async def _mock_sparks(db, *, days):
+    async def _mock_sparks(db, *, days, now=None):
         sparks_started.set()
         return _empty_sparks
 

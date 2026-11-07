@@ -965,18 +965,19 @@ async def api_memory_graphs(request: Request) -> JSONResponse:
 @app.get('/api/v2/dashboard/recon')
 async def api_recon(request: Request) -> JSONResponse:
     """RECON_STATE + AGENTS — latest reconciliation buffer/burst/runs/verdict."""
+    now = app_clock(request.app)()
     config: DashboardConfig = request.app.state.config
     pool: DbPool = request.app.state.db
     db = await pool.get(config.reconciliation_db)
 
     metrics_db = await pool.get(config.metrics_db)
     bs_r, burst_r, wm_r, verdict_r, runs_r, sparks_r = await asyncio.gather(
-        get_buffer_stats(db),
-        get_burst_state(db),
+        get_buffer_stats(db, now=now),
+        get_burst_state(db, now=now),
         get_watermarks(db),
         get_latest_verdict(db),
         get_recent_runs(db),
-        get_recon_sparks(metrics_db, days=1),
+        get_recon_sparks(metrics_db, days=1, now=now),
         return_exceptions=True,
     )
     buffer_stats = safe_gather_result(
@@ -985,7 +986,7 @@ async def api_recon(request: Request) -> JSONResponse:
         'recon/buffer',
     )
     burst_state_raw = safe_gather_result(burst_r, [], 'recon/burst')
-    active_burst, _ = partition_burst_state(burst_state_raw)
+    active_burst, _ = partition_burst_state(burst_state_raw, now=now)
     watermarks = safe_gather_result(wm_r, [], 'recon/watermarks')
     verdict = safe_gather_result(verdict_r, None, 'recon/verdict')
     runs = safe_gather_result(runs_r, [], 'recon/runs')
@@ -1197,13 +1198,13 @@ async def api_curator(request: Request) -> JSONResponse:
     # leg uses mcp_tool_call (not pool.get) and is therefore unaffected.
     async def _sparks_leg() -> dict[str, dict[str, list]]:
         md = await pool.get(config.metrics_db)
-        return await get_curator_sparks(md, days=1)
+        return await get_curator_sparks(md, days=1, now=now)
 
     async def _intervals_leg() -> list[CapInterval]:
         cd = await _cost_dbs(config, pool)
         # days=7 matches _sample_curator look-back so caps older than 1 day are
         # not misreported as uncapped (consistent with metrics.py:323).
-        return await read_cap_intervals(cd, days=7)
+        return await read_cap_intervals(cd, days=7, now=now)
 
     fanout_r, sparks_r, intervals_r, state_r = await asyncio.gather(
         fan_out_list_tickets(
@@ -1279,7 +1280,7 @@ async def api_curator(request: Request) -> JSONResponse:
     _empty_capped: ChartData = {'labels': [], 'values': []}
     try:
         capped_now, capped_windows = compute_capped_now_and_windows(intervals, account_count)
-        capped_spark: ChartData = bucketise_cap_sparkline(capped_windows)
+        capped_spark: ChartData = bucketise_cap_sparkline(capped_windows, now=now)
     except Exception:
         # Raise to WARNING so the silent capped_now=0 degrade is always visible in logs.
         # The prior code returned capped_now=1 when any interval was open-ended; that
