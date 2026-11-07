@@ -11,7 +11,7 @@ import dataclasses
 import json
 import logging
 import math
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Generic, TypedDict, TypeVar
@@ -83,6 +83,15 @@ class UnmeasuredRecord(TypedDict):
     stage: str
     cause: str
     reason: str
+
+
+def format_invocation_errors(
+    records: Sequence[UnmeasuredRecord] | None,
+) -> str | None:
+    """*records* on one line as ``stage:cause: reason``, ``'; '``-joined; ``None`` if none."""
+    if not records:
+        return None
+    return '; '.join(f"{r['stage']}:{r['cause']}: {r['reason']}" for r in records)
 
 
 def _require_type(owner: str, field: str, value: object, expected: type) -> None:
