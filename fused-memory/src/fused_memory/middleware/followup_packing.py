@@ -20,6 +20,7 @@ from typing import Final, Literal, TypeVar, get_args
 from shared.declared_scope import DeclaredScopeBand
 from shared.followup_items import MAX_FOLLOWUP_ITEMS
 from shared.locking import files_to_modules, strip_directory_locks
+from shared.task_statuses import TaskStatus
 
 __all__ = [
     'HUB_SHARE',
@@ -53,7 +54,7 @@ RIDER_RESERVE_MAX_DECLINES = 3
 PackGenerator = Literal['parent', 'recipe']
 MemberKind = Literal['followup', 'review_suggestion']
 
-_HELD_STATUS = 'pending'
+_TASK_STATUSES: Final = frozenset(TaskStatus)
 _TEXT_FP_SEPARATOR = '\x00'
 _UNKNOWN_AGE = datetime.min.replace(tzinfo=UTC)
 _FILELESS_DIRECTORY = '~'
@@ -111,7 +112,7 @@ class PackMember:
     band: DeclaredScopeBand | None
     pending_since: datetime | None
     text_fp: str
-    status: str
+    status: TaskStatus
     dependencies: frozenset[int]
     held: bool
     is_holder: bool
@@ -136,6 +137,10 @@ class PackMember:
         _require(
             self.band is None or self.band in get_args(DeclaredScopeBand),
             f'band must be None or one of {get_args(DeclaredScopeBand)}; got {self.band!r}',
+        )
+        _require(
+            self.status in _TASK_STATUSES,
+            f'status must be one of {sorted(_TASK_STATUSES)}; got {self.status!r}',
         )
         _require(self.item_count >= 1, f'item_count must be at least 1; got {self.item_count}')
         _require(
@@ -175,7 +180,7 @@ _ExclusionRule = Callable[[PackMember, datetime], bool]
 
 _EXCLUSION_RULES: tuple[tuple[PackExclusion, _ExclusionRule], ...] = (
     (PackExclusion.HOLDER, lambda m, _now: m.is_holder),
-    (PackExclusion.NOT_HELD, lambda m, _now: not m.held or m.status != _HELD_STATUS),
+    (PackExclusion.NOT_HELD, lambda m, _now: not m.held or m.status != TaskStatus.PENDING),
     (PackExclusion.BROAD, lambda m, _now: m.band == 'broad'),
     (PackExclusion.LIVE_DEPENDENTS, lambda m, _now: m.has_live_dependents),
     (PackExclusion.CLAIMED, lambda m, _now: m.claimed),
