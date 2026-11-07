@@ -4465,6 +4465,38 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
 
         return _side_effect, decided_at
 
+    @staticmethod
+    def _recorded_with_held_read(turns_side_effect, reads, *, held_call, held_secs):
+        """count_transcript_turns side_effect appending each read's index to *reads*
+        as it STARTS, holding read *held_call* for *held_secs*, then delegating.
+
+        The read runs on the asyncio.to_thread worker, so the hold blocks no loop
+        yet guarantees the kill checks after the held read run at least
+        *held_secs* after it started.  *reads* is appended on the worker thread
+        and read on the loop thread; at most one read is in flight, so this is safe.
+        """
+        import time as _time
+
+        def _side_effect(config_dir, session_id):
+            index = len(reads)
+            reads.append(index)
+            if index == held_call:
+                _time.sleep(held_secs)
+            return turns_side_effect(config_dir, session_id)
+
+        return _side_effect
+
+    @staticmethod
+    def _assert_extension_exercised_past_ceiling(reads):
+        """Witness for a run recorded with ``_recorded_with_held_read(held_call=1)``."""
+        assert len(reads) >= 3, (
+            f'Expected >= 3 transcript reads, got {len(reads)}: read 0 latches seen_turn, '
+            f'read 1 is the extension poll held past the old ceiling, and read 2 starts '
+            f'only after the kill checks that followed it let the run live. Fewer reads '
+            f'means the run exited without the working-regime extension being exercised '
+            f'past the ceiling.'
+        )
+
     async def test_productive_run_survives_ceiling_and_completes_normally(self, tmp_path):
         """(a) PRODUCTIVE-SURVIVES-CEILING: transcript turns keep growing across the
         old timeout_seconds ceiling; the process eventually completes normally with
@@ -4482,20 +4514,25 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
             'duration_ms': 300, 'num_turns': 8, 'session_id': sid,
         }).encode()
         proc = self._make_delayed_success_proc(0.3, valid_json)
+        old_ceiling = 0.1
+        reads: list[int] = []
+        turns = self._recorded_with_held_read(
+            self._always_growing_turns(), reads, held_call=1, held_secs=old_ceiling,
+        )
 
         async def fake_exec(*args, **kwargs):
             return proc
 
         with (
             patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec),
-            patch('shared.cli_invoke.count_transcript_turns', side_effect=self._always_growing_turns()),
+            patch('shared.cli_invoke.count_transcript_turns', side_effect=turns),
             patch('shared.cli_invoke._WATCHDOG_POLL_SECS', 0.02),
             patch('shared.cli_invoke._WATCHDOG_WORKING_POLL_SECS', 0.02),
         ):
             t0 = _time.monotonic()
             result = await _run_subprocess(
                 ['fake'], cwd=tmp_path, env={}, model='opus',
-                timeout_seconds=0.1, startup_grace_secs=0.02,
+                timeout_seconds=old_ceiling, startup_grace_secs=0.02,
                 session_id=sid, config_dir=cfg_dir,
                 working_idle_secs=1.0, absolute_cap_secs=5.0,
             )
@@ -4505,6 +4542,7 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
             'Expected the productive run to survive the old 0.1s ceiling and complete '
             'normally — continuous transcript growth must extend the working regime.'
         )
+        self._assert_extension_exercised_past_ceiling(reads)
         assert result.duration_ms >= 100, (
             f'Expected duration_ms >= old ceiling (100ms), got {result.duration_ms}'
         )
@@ -4589,20 +4627,25 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
             'duration_ms': 200, 'num_turns': 1, 'session_id': sid,
         }).encode()
         proc = self._make_delayed_success_proc(0.2, valid_json)
+        old_ceiling = 0.05
+        reads: list[int] = []
+        turns = self._recorded_with_held_read(
+            self._flat_turns(1), reads, held_call=1, held_secs=old_ceiling,
+        )
 
         async def fake_exec(*args, **kwargs):
             return proc
 
         with (
             patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec),
-            patch('shared.cli_invoke.count_transcript_turns', side_effect=self._flat_turns(1)),
+            patch('shared.cli_invoke.count_transcript_turns', side_effect=turns),
             patch('shared.cli_invoke._WATCHDOG_POLL_SECS', 0.02),
             patch('shared.cli_invoke._WATCHDOG_WORKING_POLL_SECS', 0.02),
         ):
             t0 = _time.monotonic()
             result = await _run_subprocess(
                 ['fake'], cwd=tmp_path, env={}, model='opus',
-                timeout_seconds=0.05, startup_grace_secs=0.02,
+                timeout_seconds=old_ceiling, startup_grace_secs=0.02,
                 session_id=sid, config_dir=cfg_dir,
                 working_idle_secs=0.5, absolute_cap_secs=5.0,
             )
@@ -4613,6 +4656,7 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
             '0.05s ceiling and the 0.5s idle bound must survive, not be false-killed '
             'at the old ceiling (B6 safety).'
         )
+        self._assert_extension_exercised_past_ceiling(reads)
         assert result.duration_ms >= 50, (
             f'Expected duration_ms >= old ceiling (50ms), got {result.duration_ms}'
         )
