@@ -2666,6 +2666,19 @@ async def test_add_and_remove_dependency_round_trip(backend, project_root):
 
 
 @pytest.mark.asyncio
+async def test_get_task_returns_only_its_own_dependencies_ascending(backend, project_root):
+    for title in ('a', 'b', 'c', 'd'):
+        await backend.add_task(project_root=project_root, title=title)
+    await backend.add_dependency('3', '2', project_root=project_root)
+    await backend.add_dependency('3', '1', project_root=project_root)
+    await backend.add_dependency('4', '3', project_root=project_root)
+
+    assert (await backend.get_task('3', project_root))['dependencies'] == [1, 2]
+    assert (await backend.get_task('4', project_root))['dependencies'] == [3]
+    assert (await backend.get_task('1', project_root))['dependencies'] == []
+
+
+@pytest.mark.asyncio
 async def test_add_dependency_self_loop_raises(backend, project_root):
     await backend.add_task(project_root=project_root, title='a')
     with pytest.raises(TaskmasterError):

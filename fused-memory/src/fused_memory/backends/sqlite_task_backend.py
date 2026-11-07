@@ -1589,6 +1589,48 @@ async def _read_status_map(
     }
 
 
+async def _fetch_dependencies(read_all: _ReadAll, tag: str) -> dict[int, list[int]]:
+    """Return ``{task_id: [depends_on, ...]}`` for *tag*, each list ascending.
+
+    Intra-call read skew: callers issue the tasks-row SELECT and this
+    dependencies SELECT as two separate reads on the shared read
+    connection, not one joint snapshot. A write committed between the
+    two can leave a task's ``dependencies`` reflecting a different
+    point in time than its own row within the SAME ``get_task``/
+    ``get_tasks`` call. This is the same kind of ordinary read skew
+    :meth:`SqliteTaskBackend.get_statuses_raw`'s "Snapshot consistency"
+    note already treats as benign for cross-call reads; it self-heals on
+    the next call and no in-tree caller depends on stronger atomicity here.
+    """
+    rows = await read_all(
+        'SELECT task_id, depends_on FROM dependencies WHERE tag = ?',
+        (tag,),
+    )
+    out: dict[int, list[int]] = {}
+    for row in rows:
+        out.setdefault(row['task_id'], []).append(row['depends_on'])
+    for deps in out.values():
+        deps.sort()
+    return out
+
+
+async def _fetch_task_dependencies(read_all: _ReadAll, tag: str, tid: int) -> list[int]:
+    """Return task *tid*'s ``depends_on`` ids, ascending, in one hop.
+
+    The single-task counterpart of :func:`_fetch_dependencies`, for
+    ``get_task`` on the shared read access and for a writer re-reading its
+    own row inside its write unit: scanning the whole tag would hold either
+    for every task's deps. The intra-call read skew note there applies to
+    ``get_task`` here too.
+    """
+    rows = await read_all(
+        'SELECT depends_on FROM dependencies WHERE tag = ? AND task_id = ? '
+        'ORDER BY depends_on',
+        (tag, tid),
+    )
+    return [row['depends_on'] for row in rows]
+
+
 class SqliteTaskBackend:
     """Implements :class:`TaskBackendProtocol` against per-project SQLite files.
 
@@ -1906,48 +1948,6 @@ class SqliteTaskBackend:
 
     # ── Read helpers ───────────────────────────────────────────────────
 
-    async def _fetch_dependencies(
-        self, access: AtomicConnection, tag: str,
-    ) -> dict[int, list[int]]:
-        """Return ``{task_id: [depends_on, ...]}`` for *tag*.
-
-        Intra-call read skew: callers issue the tasks-row SELECT and this
-        dependencies SELECT as two separate reads on the shared read
-        connection, not one joint snapshot. A write committed between the
-        two can leave a task's ``dependencies`` reflecting a different
-        point in time than its own row within the SAME ``get_task``/
-        ``get_tasks`` call. This is the same kind of ordinary read skew
-        :meth:`get_statuses_raw`'s "Snapshot consistency" note already
-        treats as benign for cross-call reads; it self-heals on the next
-        call and no in-tree caller depends on stronger atomicity here.
-        """
-        rows = await access.read_all(
-            'SELECT task_id, depends_on FROM dependencies WHERE tag = ?',
-            (tag,),
-        )
-        out: dict[int, list[int]] = {}
-        for row in rows:
-            out.setdefault(row['task_id'], []).append(row['depends_on'])
-        for deps in out.values():
-            deps.sort()
-        return out
-
-    async def _fetch_task_dependencies(
-        self, conn: aiosqlite.Connection, tag: str, tid: int,
-    ) -> list[int]:
-        """Return task *tid*'s ``depends_on`` ids, ascending, in one queued hop.
-
-        The single-task counterpart of :meth:`_fetch_dependencies`, for a
-        writer re-reading its own row inside its write unit: scanning the whole
-        tag there would hold the project's write path for every task's deps.
-        """
-        rows = await conn.execute_fetchall(
-            'SELECT depends_on FROM dependencies WHERE tag = ? AND task_id = ? '
-            'ORDER BY depends_on',
-            (tag, tid),
-        )
-        return [row['depends_on'] for row in rows]
-
     async def _get_tasks_internal(
         self, project_root: str, tag: str,
         statuses: list[str] | None = None,
@@ -1966,7 +1966,7 @@ class SqliteTaskBackend:
                 f'SELECT * FROM tasks WHERE tag = ? AND status IN ({placeholders}) ORDER BY id',
                 (tag, *statuses),
             )
-        deps = await self._fetch_dependencies(access, tag)
+        deps = await _fetch_dependencies(access.read_all, tag)
         return [
             _row_to_task(row, deps.get(row['id'], []), project_root=project_root)
             for row in rows
@@ -2012,9 +2012,9 @@ class SqliteTaskBackend:
             # RC2). TaskNotFoundError keeps this call's code/message
             # byte-identical; only its type is more specific.
             raise TaskNotFoundError(task_id, tag=tag)
-        deps = await self._fetch_dependencies(access, tag)
+        deps = await _fetch_task_dependencies(access.read_all, tag, tid)
 
-        out = _row_to_task(row, deps.get(row['id'], []), project_root=project_root)
+        out = _row_to_task(row, deps, project_root=project_root)
         # get_task surfaces a single task — Taskmaster returns int id here
         # (asymmetric with get_tasks; mirror that quirk to keep wire-compat).
         with contextlib.suppress(TypeError, ValueError):
@@ -2074,7 +2074,7 @@ class SqliteTaskBackend:
         """Return ``{task_id: [depends_on, ...]}`` for *tag* — the edge set alone.
 
         The compact counterpart of :meth:`get_tasks`, as :meth:`get_statuses`
-        is, and a thin wrapper over :meth:`_fetch_dependencies`:
+        is, and a thin wrapper over :func:`_fetch_dependencies`:
 
         - each dependency list is SORTED ascending;
         - a task with NO dependencies is **absent** from the map, not present
@@ -2089,7 +2089,8 @@ class SqliteTaskBackend:
         """
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG
-        return await self._fetch_dependencies(await self._get_read_access(project_root), tag)
+        access = await self._get_read_access(project_root)
+        return await _fetch_dependencies(access.read_all, tag)
 
     async def get_statuses_raw(
         self,
@@ -2116,7 +2117,7 @@ class SqliteTaskBackend:
         :meth:`get_statuses_fresh`, not this method, and already treats
         single-cycle divergence as advisory. The same skew can occur WITHIN
         one :meth:`get_task`/:meth:`get_tasks` call — see
-        :meth:`_fetch_dependencies`'s "Intra-call read skew" note.
+        :func:`_fetch_dependencies`'s "Intra-call read skew" note.
 
         Args:
             project_root: Absolute path to the project root.
@@ -3478,7 +3479,7 @@ class SqliteTaskBackend:
                 (tag, tid),
             )
             refreshed = await refreshed_cursor.fetchone()
-            deps = await self._fetch_task_dependencies(conn, tag, tid)
+            deps = await _fetch_task_dependencies(conn.execute_fetchall, tag, tid)
         return _updated_task_response(
             refreshed, deps, task_id=task_id, project_root=project_root,
             message=f'Task {task_id} updated',
@@ -3698,7 +3699,7 @@ class SqliteTaskBackend:
                 (tag, tid),
             )
             refreshed = await refreshed_cursor.fetchone()
-            deps = await self._fetch_task_dependencies(conn, tag, tid)
+            deps = await _fetch_task_dependencies(conn.execute_fetchall, tag, tid)
         return _updated_task_response(
             refreshed, deps, task_id=task_id, project_root=project_root,
             message=f'Rotated audit trail of task {task_id}',
