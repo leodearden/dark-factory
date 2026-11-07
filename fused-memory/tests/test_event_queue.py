@@ -10,6 +10,7 @@ import pathlib
 import threading
 import time
 import uuid
+from concurrent.futures import Future
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock
 
@@ -30,6 +31,7 @@ from fused_memory.models.reconciliation import (
     EventType,
     ReconciliationEvent,
 )
+from fused_memory.reconciliation.dead_letter_writer import DeadLetterWriter
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.event_journal import EventJournal
 from fused_memory.reconciliation.event_queue import EventQueue, _iter_lines_reversed
@@ -1943,3 +1945,21 @@ async def test_a_cancelled_flush_leaves_no_error_on_the_loop_when_its_write_sett
         held.release.set()
         await q.close()
         loop.set_exception_handler(previous_handler)
+
+
+@pytest.mark.asyncio
+async def test_flush_dead_letters_is_cancelled_when_the_writers_flush_future_is(
+    monkeypatch, tmp_path,
+):
+    """A cancelled writer future cancels the flush awaiting it, as
+    asyncio.wrap_future would, rather than leaving that flush to hang."""
+    q = EventQueue(AsyncMock(), dead_letter_path=tmp_path / 'dl.jsonl')
+    try:
+        cancelled: Future[None] = Future()
+        cancelled.cancel()
+        with monkeypatch.context() as patched:
+            patched.setattr(DeadLetterWriter, 'flushed', lambda _writer: cancelled)
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(q.flush_dead_letters(), timeout=5)
+    finally:
+        await q.close()

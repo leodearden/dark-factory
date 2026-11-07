@@ -118,6 +118,9 @@ async def _await_after_queued_loop_callbacks(future: Future[_Outcome]) -> _Outco
     def _copy(done: Future[_Outcome]) -> None:
         if resumed.cancelled():
             return
+        if done.cancelled():
+            resumed.cancel()
+            return
         exc = done.exception()
         if exc is not None:
             resumed.set_exception(exc)
