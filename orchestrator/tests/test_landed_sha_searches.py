@@ -21,7 +21,7 @@ import pytest
 from _ladder_git import commit, git, git_env, new_repo
 from shared.merge_subject import format_merge_subject
 
-from orchestrator.agents.landed_sha_searches import LandedShaSearches
+from orchestrator.agents.landed_sha_searches import LandedShaSearches, already_merged_step
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import GitOps, task_citation_pattern
 
@@ -157,3 +157,28 @@ def test_opted_out_project_renders_no_citation_walk() -> None:
     searches = LandedShaSearches.for_task(TASK_ID, GitConfig(commit_citation_pattern=''))
 
     assert searches.citation_walk is None
+
+
+_STEP_CONFIGS = [
+    pytest.param(GitConfig(), True, id='defaults'),
+    pytest.param(
+        GitConfig(main_branch='trunk', branch_prefix='feat/', commit_citation_pattern=r'^\[{tid}\]'),
+        True,
+        id='trunk-feat-project-pattern',
+    ),
+    pytest.param(GitConfig(commit_citation_pattern=''), False, id='opted-out'),
+]
+
+
+@pytest.mark.parametrize(('cfg', 'renders_walk'), _STEP_CONFIGS)
+def test_already_merged_step_carries_the_rendered_searches(
+    cfg: GitConfig, renders_walk: bool,
+) -> None:
+    searches = LandedShaSearches.for_task(TASK_ID, cfg)
+    step = already_merged_step(searches)
+
+    assert (searches.citation_walk is not None) == renders_walk
+    assert searches.ancestry in step
+    assert searches.marker_search in step
+    if searches.citation_walk is not None:
+        assert searches.citation_walk in step
