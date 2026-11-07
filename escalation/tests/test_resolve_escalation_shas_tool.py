@@ -16,6 +16,7 @@ import pytest
 from _citation_resolver_stub import StubCitationResolver
 from _escalation_seed import seed_escalation
 from _sha_noise import NOISE
+from _tool_calls import call_tool
 
 from escalation.queue import EscalationQueue, iter_all_escalation_paths
 from escalation.server import create_server
@@ -46,8 +47,7 @@ def _server(queue: EscalationQueue, git_ops: object) -> Any:
 
 
 async def _resolve(server: Any, escalation_id: str) -> dict[str, Any]:
-    tool = await server.get_tool('resolve_escalation_shas')
-    return await tool.fn(escalation_id=escalation_id)
+    return await call_tool(server, 'resolve_escalation_shas', escalation_id=escalation_id)
 
 
 def _record_bytes(queue: EscalationQueue, escalation_id: str) -> bytes:

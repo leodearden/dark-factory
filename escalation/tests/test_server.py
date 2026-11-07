@@ -96,27 +96,19 @@ _COMMON_KWARGS: dict[str, Any] = {
 
 
 async def _stamp_triage(server, **kwargs: Any) -> dict[str, Any]:
-    tool = await server.get_tool('stamp_triage')
-    # stamp_triage is a sync def, so tool.fn(...) returns directly
-    return tool.fn(**kwargs)
+    return await call_tool(server, 'stamp_triage', **kwargs)
 
 
 async def _declare_pin(server, **kwargs: Any) -> dict[str, Any]:
-    tool = await server.get_tool('declare_pin')
-    # declare_pin is a sync def, so tool.fn(...) returns directly
-    return tool.fn(**kwargs)
+    return await call_tool(server, 'declare_pin', **kwargs)
 
 
 async def _get_task_escalations(server, **kwargs: Any) -> list[dict[str, Any]]:
-    tool = await server.get_tool('get_task_escalations')
-    # get_task_escalations is a sync def, so tool.fn(...) returns directly
-    return tool.fn(**kwargs)
+    return await call_tool(server, 'get_task_escalations', **kwargs)
 
 
 async def _get_escalation(server, **kwargs: Any) -> dict[str, Any]:
-    tool = await server.get_tool('get_escalation')
-    # get_escalation is a sync def, so tool.fn(...) returns directly
-    return tool.fn(**kwargs)
+    return await call_tool(server, 'get_escalation', **kwargs)
 
 
 # ---------------------------------------------------------------------------

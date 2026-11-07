@@ -304,9 +304,7 @@ class TestQueueAmend:
 
 
 async def _amend(server, **kw: Any) -> dict[str, Any]:
-    """``amend_escalation`` is an ASYNC tool: it awaits the storm reporter."""
-    tool = await server.get_tool('amend_escalation')
-    return await tool.fn(**kw)
+    return await call_tool(server, 'amend_escalation', **kw)
 
 
 class _AmendThreadProbeQueue(EscalationQueue):
