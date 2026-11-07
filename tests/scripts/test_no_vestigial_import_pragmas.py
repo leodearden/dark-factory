@@ -1,7 +1,8 @@
-"""Guards that no import in this suite carries a suppression that suppresses nothing.
+"""Guards on how the root pyright table resolves its targets' bare imports.
 
-Two guards, deliberately SEPARATE because the two classes of vestigial pragma
-are vestigial for DIFFERENT reasons and have DIFFERENT remedies:
+Two of them check that no import in these suites carries a suppression that
+suppresses nothing, deliberately SEPARATE because the two classes of vestigial
+pragma are vestigial for DIFFERENT reasons and have DIFFERENT remedies:
 
 * ``test_no_missing_imports_pragma_on_installed_module_import`` — class (b),
   about INTERPRETER/venv selection. ``pytest``, ``yaml`` and every other
@@ -17,8 +18,19 @@ A single blanket "no such pragma anywhere in this directory" assertion would
 collapse that distinction, hand a reader whichever remedy happened to be
 written down rather than the one that fits, and additionally forbid a
 legitimate future suppression for a genuinely unresolvable import — turning a
-hygiene guard into a blanket ban. Neither guard here forbids a pragma that is
-doing real work.
+hygiene guard into a blanket ban. Neither pragma guard forbids a pragma that
+is doing real work.
+
+The other two keep pyright and the runtime binding the same file, because
+pyright searches every root ``extraPaths`` entry before the importing file's
+own directory (task 8507):
+
+* ``test_no_root_extrapaths_entry_holds_a_test_module_or_conftest`` — the
+  CONFIG: no ``extraPaths`` root holds the test modules and conftests that
+  suites define in parallel.
+* ``test_no_bare_import_in_a_root_pyright_target_resolves_past_its_same_directory_sibling``
+  — the USE: no bare import in the root table's targets resolves elsewhere
+  while a same-directory sibling holds that module.
 
 WHY THESE EXIST (task 4516). Task 3456 added ``scripts``,
 ``scripts/legibility`` and ``scripts/local-model-serving`` to the root
@@ -304,6 +316,12 @@ def _imported_top_level_modules(node: ast.Import | ast.ImportFrom) -> list[str]:
     return [alias.name.split('.')[0] for alias in node.names]
 
 
+def _holds_module_or_regular_package(directory: Path, module: str) -> bool:
+    return (directory / f'{module}.py').is_file() or (
+        directory / module / '__init__.py'
+    ).is_file()
+
+
 def _resolving_root(module: str, roots: list[Path]) -> Path | None:
     """The *root* pyright resolves *module* on as a bare top-level import, else None.
 
@@ -311,7 +329,7 @@ def _resolving_root(module: str, roots: list[Path]) -> Path | None:
     directory is taken only when no root holds either.
     """
     for root in roots:
-        if (root / f'{module}.py').is_file() or (root / module / '__init__.py').is_file():
+        if _holds_module_or_regular_package(root, module):
             return root
     for root in roots:
         if (root / module).is_dir():
@@ -338,6 +356,26 @@ def _resolvable_import_offenders(
         for module in _imported_top_level_modules(node)
         if (root := _class_a_root(path, module)) is not None
     ]
+
+
+def _shadowed_sibling_imports(paths: Iterable[Path]) -> list[tuple[Path, int, str, Path]]:
+    """The ``(path, lineno, module, root)`` of each bare import in *paths* that pyright resolves on *root*.
+
+    Reported only when *path*'s own directory holds that module or a regular
+    package, which the runtime binds instead, so the two check different files.
+    """
+    shadowed: list[tuple[Path, int, str, Path]] = []
+    for path in paths:
+        for node in ast.walk(ast.parse(path.read_text(), filename=str(path))):
+            if not isinstance(node, (ast.Import, ast.ImportFrom)):
+                continue
+            for module in _imported_top_level_modules(node):
+                if not _holds_module_or_regular_package(path.parent, module):
+                    continue
+                root = _class_a_root(path, module)
+                if root is not None and root != path.parent:
+                    shadowed.append((path, node.lineno, module, root))
+    return shadowed
 
 
 # The verdict goes on its own final line because site's `sitecustomize` and
