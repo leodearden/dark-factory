@@ -1736,13 +1736,18 @@ async def test_failed_dead_letter_write_keeps_the_journal_row(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_close_leaves_every_handed_off_record_on_disk_and_its_row_released(tmp_path):
+async def test_close_leaves_every_handed_off_record_on_disk_and_its_row_released(
+    tmp_path, caplog,
+):
     """After close(), every event is in exactly one store: written to the
     dead-letter file with its journal row released, or still journaled.
 
     Only set relations are asserted: which event the drainer holds when
-    close() cancels it depends on scheduling.
+    close() cancels it depends on scheduling. Every assertion message names
+    each event's store, the queue's stats() and its WARNING+ log records, so
+    a red under load shows which branch failed.
     """
+    caplog.set_level(logging.WARNING, logger='fused_memory.reconciliation')
     buf = AsyncMock()
 
     async def blocking_push(event):
@@ -1764,12 +1769,28 @@ async def test_close_leaves_every_handed_off_record_on_disk_and_its_row_released
         q.enqueue(event)
     await q.close()
 
-    records = [json.loads(line) for line in dl.read_text(encoding='utf-8').splitlines()]
+    stats = q.stats()
+    lines = dl.read_text(encoding='utf-8').splitlines() if dl.exists() else []
+    records = [json.loads(line) for line in lines]
     dead_lettered = {r['event']['id'] for r in records}
     journaled = journaled_ids(ej)
-    assert dead_lettered.isdisjoint(journaled), dead_lettered & journaled
-    assert dead_lettered | journaled == {e.id for e in events}
-    assert {r['reason'] for r in records} <= {'overflow_drop', 'shutdown_timeout'}
+    placement = {
+        index: sorted(
+            store
+            for store, ids in (('dead_letter', dead_lettered), ('journal', journaled))
+            if event.id in ids
+        )
+        for index, event in enumerate(events)
+    }
+    logs = [(r.name, r.levelname, r.getMessage()) for r in caplog.records]
+    evidence = f'placement={placement} stats={stats} logs={logs}'
+
+    assert all(len(stores) == 1 for stores in placement.values()), evidence
+    assert dead_lettered | journaled == {e.id for e in events}, evidence
+    assert len(records) == len(dead_lettered), evidence
+    assert stats['dead_letters_pending'] == 0, evidence
+    assert stats['dead_letters'] == len(records), evidence
+    assert {r['reason'] for r in records} <= {'overflow_drop', 'shutdown_timeout'}, evidence
 
 
 @pytest.mark.asyncio
