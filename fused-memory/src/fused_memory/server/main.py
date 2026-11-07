@@ -43,7 +43,11 @@ from fused_memory.server.tools import (  # noqa: E402
 from fused_memory.server.wal_status import (  # noqa: E402
     CHECKPOINT_STATUS as _CHECKPOINT_STATUS,
 )
+from fused_memory.services.mem0_write_retry import run_periodic_mem0_retry  # noqa: E402
 from fused_memory.services.memory_service import MemoryService  # noqa: E402
+from fused_memory.services.supersession_mark import (  # noqa: E402
+    mark_superseded_after_retry,
+)
 
 if TYPE_CHECKING:
     from shared.cost_store import CostStore
@@ -574,10 +578,6 @@ async def run_server():
 
     # Initialize write journal
     from fused_memory.services.journal_retention import prune_every_table_at_startup
-    from fused_memory.services.mem0_write_retry import (
-        DEFAULT_MEM0_RETRY_POLICY,
-        run_periodic_mem0_retry,
-    )
     from fused_memory.services.write_journal import WriteJournal
     from fused_memory.services.write_ops_retention import run_periodic_write_ops_prune
 
@@ -1140,17 +1140,7 @@ async def run_server():
         config.write_journal.prune_max_rows_per_run,
     )
 
-    mem0_retry_task = asyncio.create_task(
-        run_periodic_mem0_retry(
-            memory_service.retry_due_mem0_intents,
-            interval_seconds=DEFAULT_MEM0_RETRY_POLICY.poll_interval_seconds,
-        ),
-    )
-    logger.info(
-        '  Mem0 write retry loop: every %.0fs, up to %d due intents per pass',
-        DEFAULT_MEM0_RETRY_POLICY.poll_interval_seconds,
-        DEFAULT_MEM0_RETRY_POLICY.batch_size,
-    )
+    mem0_retry_task = _start_mem0_retry_loop(memory_service)
 
     remint_sweep_task: asyncio.Task[None] | None = _start_remint_sweep(
         taskmaster,
@@ -1615,6 +1605,32 @@ def _start_loop_lag_monitor(config) -> asyncio.Task[None]:
         _loop_lag_monitor(threshold_ms=threshold_ms),
         name='loop_lag_monitor',
     )
+
+
+def _start_mem0_retry_loop(memory_service: MemoryService) -> asyncio.Task[None]:
+    """Spawn the Mem0 write retry loop on the service's own policy; RETURN its handle for teardown.
+
+    Each landed re-issue has its journaled supersedes marked. That hook is
+    composed here because the service layer cannot import supersession_mark
+    without pulling server modules up into it.
+    """
+    policy = memory_service.mem0_retry_policy
+    task = asyncio.create_task(
+        run_periodic_mem0_retry(
+            partial(
+                memory_service.retry_due_mem0_intents,
+                on_landed=partial(mark_superseded_after_retry, memory_service),
+            ),
+            interval_seconds=policy.poll_interval_seconds,
+        ),
+        name='mem0_write_retry',
+    )
+    logger.info(
+        '  Mem0 write retry loop: every %.0fs, up to %d due intents per pass',
+        policy.poll_interval_seconds,
+        policy.batch_size,
+    )
+    return task
 
 
 def _start_remint_sweep(
