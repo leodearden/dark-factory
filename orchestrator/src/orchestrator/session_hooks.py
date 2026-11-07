@@ -52,7 +52,7 @@ from orchestrator.session_self_exit import SelfExit
 # session_registry's import puts this checkout's shared/src on sys.path for the bare shell.
 # isort: split
 from shared.process_identity import Liveness
-from shared.session_liveness import judge
+from shared.session_liveness import capture_for_record, judge
 
 logger = logging.getLogger(__name__)
 
@@ -538,7 +538,7 @@ def _stamp_owner(record: session_registry.SessionRecord, pid: int | None) -> Non
     """Write *record*'s owner pid and its identity together, so the pair never diverges."""
     record.claude_owner_pid = pid
     record.claude_owner_identity = (
-        None if pid is None else session_registry.capture_for_record(pid)
+        None if pid is None else capture_for_record(pid)
     )
 
 
@@ -547,12 +547,14 @@ def _reclaim_dead_owner_pid(record: session_registry.SessionRecord, probes: Even
 
     A live recorded owner keeps the record: that is a nested ``claude
     --resume`` of the same session id. An owner on another host, or one
-    /proc cannot answer for, keeps it too. Returns whether *record* was
-    mutated.
+    /proc cannot answer for, keeps it too. An owner recorded with this very
+    pid is re-stamped only when its identity is judged DEAD: a reboot or pid
+    reuse handed the pid back, and the stale identity must not outlive it.
+    Returns whether *record* was mutated.
     """
     pid = probes.owning_claude_pid()
     owner = record.claude_owner_pid
-    if pid is None or owner == pid:
+    if pid is None or (owner == pid and record.claude_owner_identity is None):
         return False
     if (
         owner is not None
@@ -908,7 +910,7 @@ def run_session_start(
             escalation_id=identity.escalation_id,
             cwd=cwd,
             launcher_pid=launcher_pid,
-            launcher_identity=session_registry.capture_for_record(launcher_pid),
+            launcher_identity=capture_for_record(launcher_pid),
             start_ts=datetime.now(UTC).isoformat(),
             transcript_path=session_registry.transcript_path_for_cwd(cwd),
         )

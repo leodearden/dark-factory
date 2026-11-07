@@ -115,7 +115,9 @@ resumes in a new process keeps its session id.
 When the recorded owner is judged dead
 (`shared/src/shared/session_liveness.py::judge`), the resumed process's event
 re-stamps it with the new claude. An owner on another host is never
-reclaimed. This dead-owner reclaim applies on two lanes:
+reclaimed. An owner recorded with the event's own pid is re-stamped only when
+its identity is judged dead: a reboot or a reused pid handed that pid back.
+This dead-owner reclaim applies on two lanes:
 
 - an event reached through its session-id pointer;
 - an event reached through the hand-launched keying, whose slug embeds that

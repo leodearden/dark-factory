@@ -58,15 +58,9 @@ if (
 ) not in sys.path and Path(_CHECKOUT_SHARED_SRC).is_dir():
     sys.path.append(_CHECKOUT_SHARED_SRC)
 
-from shared.process_identity import (
-    PROC_ROOT,
-    Liveness,
-    ProcessIdentity,
-    ProcessIdentityUnreadable,
-    capture,
-)
+from shared.process_identity import Liveness, ProcessIdentity
 from shared.project_id import fold_project_token
-from shared.session_liveness import judge
+from shared.session_liveness import capture_for_record, judge
 
 # ---------------------------------------------------------------------------
 # Schema / contract (PRD §6 G5): consumers import this; they never re-derive
@@ -2784,9 +2778,9 @@ TERMINAL_TTL = timedelta(hours=24)
 last write before the reaper reclaims it, regardless of launcher_pid."""
 
 NON_TERMINAL_HEARTBEAT_TTL = timedelta(hours=1)
-"""How long a non-terminal record survives with a dead launcher_pid and no
-fresh write (heartbeat) before the reaper reclaims it. A live launcher_pid
-retains the record regardless of age."""
+"""How long a non-terminal record survives with its launcher judged DEAD and
+no fresh write (heartbeat) before the reaper reclaims it. A launcher not
+judged DEAD retains the record regardless of age."""
 
 
 def _pid_alive(pid: int) -> bool:
@@ -2842,15 +2836,6 @@ def _swept_as_dead(
     return verdict is Liveness.DEAD
 
 
-def capture_for_record(pid: int, *, proc_root: Path = PROC_ROOT) -> ProcessIdentity | None:
-    """The identity a record stamps for *pid*: ``capture``'s answer, an unreadable /proc logged and read as None."""
-    try:
-        return capture(pid, proc_root=proc_root)
-    except ProcessIdentityUnreadable as exc:
-        logger.warning('pid %d stamped unqualified: %s', pid, exc)
-        return None
-
-
 @dataclass(frozen=True)
 class ReapedSessionRecord:
     """One session-registry record directory removed by reap_stale_records.
@@ -2860,7 +2845,7 @@ class ReapedSessionRecord:
         directory name itself (never from the record body).
     reason: why it was reaped -- one of ``'terminal_ttl'`` (a terminal
         record older than TERMINAL_TTL), ``'stale_pid'`` (a non-terminal
-        record whose launcher_pid is dead and older than
+        record whose launcher is judged DEAD and older than
         NON_TERMINAL_HEARTBEAT_TTL), or ``'corrupt'`` (record.json missing
         or unparseable and older than NON_TERMINAL_HEARTBEAT_TTL).
     """

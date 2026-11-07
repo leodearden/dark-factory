@@ -16,12 +16,13 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Iterator, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
+from _process_identity_variants import own_identity
 from _process_tree_fakes import claude_process_tree, counting_walks
 from shared.process_identity import ProcessIdentity
 
@@ -239,6 +240,19 @@ class TestRefusals:
         assert record.exit_requested_at is None
         assert record.status is sr.Status.IDLE
         assert _marker(tmp_path).exists()
+
+    def test_an_owner_identity_on_this_host_passes_the_host_check(self, tmp_path):
+        on_this_host = replace(own_identity(), pid=OWNER)
+        armed = _armed(tmp_path, claude_owner_identity=on_this_host)
+        kill = _KillRecorder(tmp_path)
+
+        _stop(tmp_path, armed, kill)
+
+        record = _read(tmp_path)
+        assert kill.calls == [(OWNER, signal.SIGINT)]
+        assert record.exit_request is not None
+        assert record.exit_request.state is sr.ExitRequestState.ATTEMPTED
+        assert record.claude_owner_identity == on_this_host
 
     def test_a_refusal_is_not_a_deadlock(self, tmp_path):
         armed = _armed(tmp_path)

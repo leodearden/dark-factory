@@ -9,6 +9,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+from _process_identity_variants import IdentityVariant, own_identity
 from _process_tree_fakes import claude_process_tree
 from _session_hook_fixtures import (
     assert_hook_env_isolated,
@@ -17,7 +18,7 @@ from _session_hook_fixtures import (
     stdin_json,
     write_bound_parent,
 )
-from shared.process_identity import ProcessIdentity, capture
+from shared.process_identity import ProcessIdentity
 
 from orchestrator import session_hooks as sh
 from orchestrator import session_registry as sr
@@ -1067,16 +1068,9 @@ def test_hand_launched_record_keeps_the_durable_session_leader_pid(tmp_path: Pat
 
 _IDENTITY_CWD = '/home/leo/src/dark-factory'
 
-
-def _own_identity() -> ProcessIdentity:
-    identity = capture(os.getpid())
-    assert identity is not None
-    return identity
-
-
-def _absent_pid() -> int:
-    """A pid above this host's pid_max, so /proc never holds it."""
-    return int(Path('/proc/sys/kernel/pid_max').read_text()) + 1
+# A pid virtually guaranteed dead on any host (the suite-wide idiom; see
+# test_session_registry.py's own _DEAD_PID -- deliberately not imported).
+_DEAD_PID = 2**31 - 1
 
 
 @pytest.mark.parametrize('owner_resolved', [True, False], ids=['owner-resolved', 'owner-unresolved'])
@@ -1095,7 +1089,7 @@ def test_the_bind_stamps_the_owner_identity_with_the_owner_pid(
 
     record = sr.read_record(slug, root=tmp_path)
     assert record.claude_owner_pid == owner_pid
-    assert record.claude_owner_identity == (_own_identity() if owner_resolved else None)
+    assert record.claude_owner_identity == (own_identity() if owner_resolved else None)
 
 
 def test_a_new_record_stamps_the_launcher_identity(tmp_path: Path) -> None:
@@ -1107,50 +1101,57 @@ def test_a_new_record_stamps_the_launcher_identity(tmp_path: Path) -> None:
     slug = sh.hook_session_slug(hook_input, env={}, root=tmp_path, process_tree=tree)
     record = sr.read_record(slug, root=tmp_path)
     assert record.launcher_pid == os.getpid()
-    assert record.launcher_identity == _own_identity()
+    assert record.launcher_identity == own_identity()
 
 
-def _recorded_owner(variant: str) -> ProcessIdentity:
-    """This live test process's identity, altered so that only the identity can make it dead."""
-    live = _own_identity()
-    return {
-        'live': live,
-        'reused-pid': dataclasses.replace(live, start_ticks=live.start_ticks + 1),
-        'rebooted': dataclasses.replace(live, boot_id='00000000-0000-0000-0000-000000000000'),
-        'other-host': dataclasses.replace(live, host='other-host.invalid'),
-    }[variant]
+_RECLAIM_EVENT = {'session_id': 'sess-reclaim', 'cwd': _IDENTITY_CWD}
 
 
-@pytest.mark.parametrize(
-    ('variant', 'reclaimed'),
-    [('reused-pid', True), ('rebooted', True), ('other-host', False), ('live', False)],
-)
-def test_the_reclaim_judges_the_recorded_owner_by_its_identity(
-    tmp_path: Path, variant: str, reclaimed: bool
-) -> None:
-    hook_input = {'session_id': 'sess-reclaim', 'cwd': _IDENTITY_CWD}
+def _write_owned_by_this_process(tmp_path: Path, recorded: ProcessIdentity) -> str:
+    """Seed the record ``_RECLAIM_EVENT`` keys on, owned by this test process as *recorded* names it."""
     slug = sh.hook_session_slug(
-        hook_input, env={}, root=tmp_path, process_tree=claude_process_tree(None)
+        _RECLAIM_EVENT, env={}, root=tmp_path, process_tree=claude_process_tree(None)
     )
-    recorded = _recorded_owner(variant)
     sr.write_record(
         sr.SessionRecord(
             session_slug=slug,
             status=sr.Status.IDLE,
             cwd=_IDENTITY_CWD,
-            claude_session_id='sess-reclaim',
+            claude_session_id=_RECLAIM_EVENT['session_id'],
             claude_owner_pid=os.getpid(),
             claude_owner_identity=recorded,
         ),
         root=tmp_path,
     )
-    new_owner = _absent_pid()
+    return slug
 
-    sh.run_stop(hook_input, {}, root=tmp_path, process_tree=claude_process_tree(new_owner))
+
+@pytest.mark.parametrize('variant', list(IdentityVariant))
+def test_the_reclaim_judges_the_recorded_owner_by_its_identity(
+    tmp_path: Path, variant: IdentityVariant
+) -> None:
+    recorded = own_identity(variant)
+    slug = _write_owned_by_this_process(tmp_path, recorded)
+
+    sh.run_stop(_RECLAIM_EVENT, {}, root=tmp_path, process_tree=claude_process_tree(_DEAD_PID))
 
     record = sr.read_record(slug, root=tmp_path)
-    if reclaimed:
-        assert record.claude_owner_pid == new_owner
+    if variant.judged_dead:
+        assert record.claude_owner_pid == _DEAD_PID
     else:
         assert record.claude_owner_pid == os.getpid()
         assert record.claude_owner_identity == recorded
+
+
+@pytest.mark.parametrize('variant', list(IdentityVariant))
+def test_an_owner_recorded_with_this_events_pid_is_re_stamped_iff_its_identity_is_judged_dead(
+    tmp_path: Path, variant: IdentityVariant
+) -> None:
+    recorded = own_identity(variant)
+    slug = _write_owned_by_this_process(tmp_path, recorded)
+
+    sh.run_stop(_RECLAIM_EVENT, {}, root=tmp_path, process_tree=claude_process_tree(os.getpid()))
+
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.claude_owner_pid == os.getpid()
+    assert record.claude_owner_identity == (own_identity() if variant.judged_dead else recorded)

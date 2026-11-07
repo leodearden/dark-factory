@@ -1,4 +1,7 @@
-"""Judge whether a session record's pid is alive, by its identity when the record carries one.
+"""Stamp a session record's process identities, and judge its pids alive by them.
+
+``capture_for_record`` is the stamp side and ``judge`` the use side; on both,
+an unreadable /proc never fails the caller.
 
 Contract: plans/spawn-t3-lane-mcp-and-host-registry-prd.md §6.4 and D16.
 """
@@ -14,10 +17,11 @@ from shared.process_identity import (
     Liveness,
     ProcessIdentity,
     ProcessIdentityUnreadable,
+    capture,
     liveness,
 )
 
-__all__ = ['judge']
+__all__ = ['capture_for_record', 'judge']
 
 logger = logging.getLogger(__name__)
 
@@ -38,3 +42,12 @@ def judge(
     except ProcessIdentityUnreadable as exc:
         logger.warning('pid %d judged alive: %s', pid, exc)
         return Liveness.ALIVE
+
+
+def capture_for_record(pid: int, *, proc_root: Path = PROC_ROOT) -> ProcessIdentity | None:
+    """The identity a record stamps for *pid*: ``capture``'s answer, an unreadable /proc logged and read as None."""
+    try:
+        return capture(pid, proc_root=proc_root)
+    except ProcessIdentityUnreadable as exc:
+        logger.warning('pid %d stamped unqualified: %s', pid, exc)
+        return None

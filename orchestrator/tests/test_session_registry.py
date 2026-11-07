@@ -31,8 +31,9 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _process_identity_variants import IdentityVariant, own_identity
 from _reap_report_wait import await_reap_report
-from shared.process_identity import ProcessIdentity, capture
+from shared.process_identity import ProcessIdentity
 from shared.project_id import PROJECT_ID_ALIASES, fold_project_token
 
 from orchestrator import session_registry as sr
@@ -2183,24 +2184,19 @@ def test_mark_orphaned_handles_mixed_population_in_one_sweep(tmp_path: Path) -> 
 # Task 8125: the pid sweeps judge the launcher by its identity
 # ---------------------------------------------------------------------------
 
-_FORGED_BOOT_ID = '00000000-0000-0000-0000-000000000000'
-_OTHER_HOST = 'other-host.invalid'
-_ELSEWHERE = 'elsewhere'
-_JUDGED_DEAD = {'reused-pid', 'rebooted'}
-_JUDGED_KEPT = ('live-launcher', _ELSEWHERE, 'unqualified')
+def _launcher_slug(variant: IdentityVariant) -> str:
+    return f'launcher-{variant}'
+
+
+_UNQUALIFIED = 'launcher-unqualified'
+_ELSEWHERE = _launcher_slug(IdentityVariant.OTHER_HOST)
+_JUDGED_DEAD = {_launcher_slug(v) for v in IdentityVariant if v.judged_dead}
+_JUDGED_KEPT = {_launcher_slug(v) for v in IdentityVariant if not v.judged_dead} | {_UNQUALIFIED}
 
 
 def _launcher_identities() -> dict[str, ProcessIdentity | None]:
-    """One identity per verdict, all naming this live test process: only the identity can make one dead."""
-    live = capture(os.getpid())
-    assert live is not None
-    return {
-        'live-launcher': live,
-        'reused-pid': dataclasses.replace(live, start_ticks=live.start_ticks + 1),
-        'rebooted': dataclasses.replace(live, boot_id=_FORGED_BOOT_ID),
-        _ELSEWHERE: dataclasses.replace(live, host=_OTHER_HOST),
-        'unqualified': None,
-    }
+    """One record slug per identity, all naming this live test process: only the identity can make one dead."""
+    return {_launcher_slug(v): own_identity(v) for v in IdentityVariant} | {_UNQUALIFIED: None}
 
 
 def _seed_stale_launchers(root: Path) -> None:
@@ -2731,34 +2727,6 @@ def test_main_launching_writes_record_and_prints_only_record_dir(
     assert record.launcher_pid == 4242
 
 
-def _reaped_child_pid() -> int:
-    child = subprocess.Popen(['true'])
-    child.wait()
-    return child.pid
-
-
-def test_capture_for_record_is_the_live_identity() -> None:
-    identity = sr.capture_for_record(os.getpid())
-
-    assert identity == capture(os.getpid())
-    assert identity is not None
-    assert identity.host == socket.gethostname()
-
-
-def test_capture_for_record_of_a_reaped_pid_is_none() -> None:
-    assert sr.capture_for_record(_reaped_child_pid()) is None
-
-
-def test_capture_for_record_reads_an_unreadable_proc_as_none_and_warns(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    with caplog.at_level(logging.WARNING, logger=sr.__name__):
-        identity = sr.capture_for_record(os.getpid(), proc_root=tmp_path)
-
-    assert identity is None
-    assert [r.levelno for r in caplog.records if r.name == sr.__name__] == [logging.WARNING]
-
-
 def test_main_launching_stamps_the_launcher_identity(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -2772,7 +2740,7 @@ def test_main_launching_stamps_the_launcher_identity(
     slug = sr.build_session_slug('unblock', 'df', '2085', os.getpid())
     record_file = sr.record_path_for_slug(slug, root=tmp_path)
     assert capsys.readouterr().out.strip() == str(record_file.parent)
-    assert sr.read_record(slug, root=tmp_path).launcher_identity == capture(os.getpid())
+    assert sr.read_record(slug, root=tmp_path).launcher_identity == own_identity()
     on_disk = json.loads(record_file.read_text())
     assert on_disk['launcher_identity']['host'] == socket.gethostname()
 

@@ -11,9 +11,10 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest  # pyright: ignore[reportMissingImports]
+from _process_identity_variants import IdentityVariant, own_identity
 from _process_tree_fakes import claude_process_tree
 from _reap_report_wait import await_reap_report
-from shared.process_identity import ProcessIdentity, capture
+from shared.process_identity import ProcessIdentity
 
 from orchestrator import session_hooks as sh
 from orchestrator import session_registry as sr
@@ -251,18 +252,6 @@ class TestResolveOwnRecordSlug:
         assert any(r.levelno == logging.WARNING for r in caplog.records)
 
 
-def _own_identity(variant: str) -> ProcessIdentity:
-    """This live test process's identity, altered so that only the identity can make it dead."""
-    live = capture(os.getpid())
-    assert live is not None
-    return {
-        'live': live,
-        'reused-pid': dataclasses.replace(live, start_ticks=live.start_ticks + 1),
-        'rebooted': dataclasses.replace(live, boot_id='00000000-0000-0000-0000-000000000000'),
-        'other-host': dataclasses.replace(live, host='other-host.invalid'),
-    }[variant]
-
-
 class TestReapStaleSessionPointers:
     _SLUG = 'role-proj-uuid'
 
@@ -335,20 +324,40 @@ class TestReapStaleSessionPointers:
     def test_an_absent_pointer_dir_is_an_empty_pass(self, tmp_path: Path) -> None:
         assert sr.reap_stale_session_pointers(root=tmp_path) == []
 
-    @pytest.mark.parametrize(
-        ('variant', 'removed'),
-        [('reused-pid', True), ('rebooted', True), ('other-host', False), ('live', False)],
-    )
+    @pytest.mark.parametrize('variant', list(IdentityVariant))
     def test_a_live_pids_pointer_is_judged_by_its_records_owner_identity(
-        self, tmp_path: Path, variant: str, removed: bool
+        self, tmp_path: Path, variant: IdentityVariant
     ) -> None:
-        owner = _record(self._SLUG, owner_pid=os.getpid(), owner_identity=_own_identity(variant))
+        owner = _record(self._SLUG, owner_pid=os.getpid(), owner_identity=own_identity(variant))
         sr.write_record(owner, root=tmp_path)
         sr.write_session_pointer(os.getpid(), self._SLUG, root=tmp_path)
         pointer = sr.session_pointer_path_for_pid(os.getpid(), root=tmp_path)
+        removed = variant.judged_dead
 
         assert sr.reap_stale_session_pointers(root=tmp_path) == ([pointer] if removed else [])
         assert pointer.exists() is not removed
+
+    def test_a_dead_pids_pointer_to_a_record_reclaimed_by_a_live_owner_is_removed(
+        self, tmp_path: Path
+    ) -> None:
+        owner = _record(self._SLUG, owner_pid=os.getpid(), owner_identity=own_identity())
+        sr.write_record(owner, root=tmp_path)
+        sr.write_session_pointer(_DEAD_PID, self._SLUG, root=tmp_path)
+        pointer = sr.session_pointer_path_for_pid(_DEAD_PID, root=tmp_path)
+
+        assert sr.reap_stale_session_pointers(root=tmp_path) == [pointer]
+        assert not pointer.exists()
+
+    def test_a_live_pids_pointer_to_a_record_owned_by_another_pid_is_judged_by_its_own_pid(
+        self, tmp_path: Path
+    ) -> None:
+        elsewhere = dataclasses.replace(own_identity(), pid=_DEAD_PID)
+        owner = _record(self._SLUG, owner_pid=_DEAD_PID, owner_identity=elsewhere)
+        sr.write_record(owner, root=tmp_path)
+        sr.write_session_pointer(os.getpid(), self._SLUG, root=tmp_path)
+
+        assert sr.reap_stale_session_pointers(root=tmp_path) == []
+        assert sr.session_pointer_path_for_pid(os.getpid(), root=tmp_path).is_file()
 
     def test_a_corrupt_record_reads_unqualified_so_a_live_pids_pointer_is_kept(
         self, tmp_path: Path

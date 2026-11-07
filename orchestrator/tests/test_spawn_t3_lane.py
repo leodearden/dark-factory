@@ -38,7 +38,8 @@ from _fake_t3_server import (
     put_fake_t3_cli_on_path,
     replies_in_turn,
 )
-from shared.process_identity import ProcessIdentity, capture
+from _process_identity_variants import own_identity
+from shared.process_identity import ProcessIdentity
 
 from orchestrator import session_registry as sr
 from orchestrator import spawn_t3_lane as lane
@@ -992,8 +993,7 @@ class TestAwaitStarted:
         t3.tool_replies['t3_thread_read'] = thread_read(status='running')
         record_dir = spawn_record(env)
         write_transcript(env, SESSION_ID, trailer(record_dir))
-        owner = capture(os.getpid())
-        assert owner is not None
+        owner = own_identity()
         hand_record(env, SESSION_ID, owner_pid=os.getpid(), owner_identity=owner)
 
         self._await(capsys, env, record_dir, since=time.time() - 60)

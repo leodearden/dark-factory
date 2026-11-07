@@ -181,9 +181,10 @@ def _outcome_refusal(record_dir: Path) -> SelfExitRefusal | None:
 def _host_refusal(record: session_registry.SessionRecord) -> SelfExitRefusal | None:
     """An owner on another host is never compared with, nor signalled as, a local pid."""
     identity = record.claude_owner_identity
-    if identity is None:
+    owner_pid = record.claude_owner_pid
+    if identity is None or owner_pid is None:
         return None
-    verdict = judge(identity, identity.pid, pid_alive=session_registry.pid_alive)
+    verdict = judge(identity, owner_pid, pid_alive=session_registry.pid_alive)
     return SelfExitRefusal.OTHER_HOST if verdict is Liveness.OTHER_HOST else None
 
 
