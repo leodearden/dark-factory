@@ -727,6 +727,7 @@ def bind_session(record_dir: str, transcript: Transcript) -> Binding:
         )
         return Binding(session_id, None, bound=False)
     owner_pid = hand.claude_owner_pid if hand else None
+    owner_identity = hand.claude_owner_identity if hand else None
     hand_slug = hand.session_slug if hand else None
     try:
         record = session_registry.read_record(slug, root=root)
@@ -735,6 +736,7 @@ def bind_session(record_dir: str, transcript: Transcript) -> Binding:
         record.claude_session_id = session_id
         if owner_pid is not None:
             record.claude_owner_pid = owner_pid
+            record.claude_owner_identity = owner_identity
         session_registry.write_record(record, root=root)
     except Exception as exc:
         logger.warning(f'cannot bind session {session_id} to {record_dir}: {exc}')
