@@ -40,6 +40,7 @@ from dashboard.api import orchestrators as api_orchestrators_routes
 from dashboard.api import prds as api_prds_routes
 from dashboard.api import task_prose as api_task_prose_routes
 from dashboard.api import tasks as api_tasks_routes
+from dashboard.api.clock import install_clock, live_clock
 from dashboard.api.window import _parse_window, with_window
 from dashboard.config import DashboardConfig
 from dashboard.data import memory as memory_data
@@ -343,6 +344,7 @@ async def lifespan(app: FastAPI):
     # on the client, so evaluating it first is safe.
     config = DashboardConfig.from_env()
     app.state.config = config
+    install_clock(app, live_clock)
     http_client = httpx.AsyncClient(
         follow_redirects=True,
         limits=_build_http_limits(config),
