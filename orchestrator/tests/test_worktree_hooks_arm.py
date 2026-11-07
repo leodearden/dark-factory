@@ -7,7 +7,14 @@ import time
 from pathlib import Path
 
 import pytest
+from _git_fixtures import seed_repo
+from _lane_test_helpers import make_warm_lane_repo
+from _orch_helpers import assert_isolated_git_repo
+from _seed_script_stubs import commit_seed_script, warm_pool_git_config
+from shared.git_async import run_git
 
+from orchestrator.config import GitConfig
+from orchestrator.git_ops import GitOps
 from orchestrator.worktree_hooks_arm import HooksArmOutcome, arm_worktree_hooks
 
 _ARM_LOGGER = 'orchestrator.worktree_hooks_arm'
@@ -154,3 +161,85 @@ class TestArmWorktreeHooks:
         warnings = _arm_warnings(caplog)
         assert len(warnings) == 1
         assert 'timed out' in warnings[0]
+
+
+_PLAIN_SEED_SCRIPT = '#!/usr/bin/env bash\nmkdir -p "$2/target"\nexit 0\n'
+
+
+def _cold_git_ops(repo: Path) -> GitOps:
+    config = GitConfig(
+        main_branch='main', branch_prefix='task/', remote='origin',
+        worktree_dir='.worktrees', push_after_advance=False,
+    )
+    return GitOps(config, repo)
+
+
+def _logged_calls(log: Path) -> list[str]:
+    return log.read_text().splitlines() if log.exists() else []
+
+
+async def _git(repo: Path, *args: str) -> None:
+    result = await run_git(['git', *args], cwd=repo)
+    assert result.ok, f'git {args} failed: {result.stderr}'
+
+
+async def _commit_guard_stub(repo: Path, log: Path, rc: int) -> None:
+    assert_isolated_git_repo(repo)
+    _write_guard(repo, _recording_guard_body(log, rc))
+    await _git(repo, 'add', 'scripts/hooks-armed-guard.sh')
+    await _git(repo, 'commit', '-m', 'add hooks-armed-guard stub')
+
+
+@pytest.mark.asyncio
+class TestWorktreeHandoffArmsHooks:
+    async def test_cold_fresh_create_arms_the_new_worktree(
+        self, tmp_path: Path, log: Path,
+    ):
+        repo = seed_repo(tmp_path / 'repo')
+        await _commit_guard_stub(repo, log, 0)
+
+        info = await _cold_git_ops(repo).create_worktree('t1')
+
+        assert _logged_calls(log) == [f'arm {info.path}']
+
+    async def test_cold_reuse_by_path_arms_again(self, tmp_path: Path, log: Path):
+        repo = seed_repo(tmp_path / 'repo')
+        await _commit_guard_stub(repo, log, 0)
+        git_ops = _cold_git_ops(repo)
+
+        first = await git_ops.create_worktree('t1')
+        again = await git_ops.create_worktree('t1')
+
+        assert again.path == first.path
+        assert _logged_calls(log) == [f'arm {again.path}', f'arm {again.path}']
+
+    async def test_failed_arm_still_hands_the_worktree_over(
+        self, tmp_path: Path, log: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        repo = seed_repo(tmp_path / 'repo')
+        await _commit_guard_stub(repo, log, 1)
+
+        with caplog.at_level(logging.DEBUG, logger=_ARM_LOGGER):
+            info = await _cold_git_ops(repo).create_worktree('t2')
+
+        assert info.path.is_dir()
+        warnings = _arm_warnings(caplog)
+        assert len(warnings) == 1
+        assert str(info.path) in warnings[0]
+        assert 'rc=1' in warnings[0]
+
+    async def test_warm_live_requeue_arms_but_the_seeded_acquire_leaves_it_to_the_seed(
+        self, tmp_path: Path, log: Path,
+    ):
+        repo = make_warm_lane_repo(tmp_path)
+        _write_guard(repo, _recording_guard_body(log, 0))
+        await commit_seed_script(repo, _PLAIN_SEED_SCRIPT)
+        git_ops = GitOps(warm_pool_git_config(), repo, warm_lane_pool_size=1)
+
+        first = await git_ops.create_worktree('A')
+        assert _logged_calls(log) == []
+
+        again = await git_ops.create_worktree('A')
+
+        assert again.path == first.path
+        assert _logged_calls(log) == [f'arm {again.path}']
