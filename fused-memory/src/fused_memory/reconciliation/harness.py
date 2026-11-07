@@ -817,6 +817,7 @@ class ReconciliationHarness:
         server_ready_event: asyncio.Event | None = None,
         escalation_listener: socket.socket | None = None,
         full_cycle_deadline: Callable[[float], asyncio.Timeout] = asyncio.timeout,
+        escalation_queue: EscalationQueue | None = None,
     ):
         self.memory = memory_service
         # systemd-held listening socket for the escalation port, so it stays
@@ -947,7 +948,7 @@ class ReconciliationHarness:
         )
 
         # Escalation support
-        self._escalation_queue: EscalationQueue | None = None
+        self._escalation_queue: EscalationQueue | None = escalation_queue
         self._escalation_task: asyncio.Task | None = None
         self._escalation_url: str | None = None
 
@@ -1282,8 +1283,9 @@ class ReconciliationHarness:
         Called from ``_make_stages`` once per cycle (task 2146 β — there is no
         long-lived ``self.stages`` list to push into from
         ``_start_escalation_server`` anymore; escalation startup only stores
-        ``self._escalation_url``/``self._escalation_queue`` for the next
-        ``_make_stages`` call to pick up). Defensive: only assigns when the
+        ``self._escalation_url`` for the next ``_make_stages`` call to pick up,
+        and ``self._escalation_queue`` is either injected at construction or
+        built by escalation startup). Defensive: only assigns when the
         harness has a value, so calls before escalation startup leave stages
         untouched.
 
@@ -2545,16 +2547,28 @@ class ReconciliationHarness:
 
     # ── Escalation support ─────────────────────────────────────────────
 
+    def _configured_escalation_queue_dir(self) -> Path:
+        """``config.escalation_queue_dir``, made absolute against ``explore_codebase_root``."""
+        queue_dir = Path(self.config.escalation_queue_dir)
+        if not queue_dir.is_absolute():
+            queue_dir = Path(self.config.explore_codebase_root) / queue_dir
+        return queue_dir
+
     async def _start_escalation_server(self) -> None:
-        """Start the escalation MCP server as a background asyncio task."""
+        """Start the escalation MCP server as a background asyncio task.
+
+        A queue injected at construction takes precedence over
+        ``config.escalation_queue_dir`` and is the one the server serves, so
+        filing and serving share one store.
+        """
         if not HAS_ESCALATION:
             logger.info('Escalation package not installed — skipping escalation server')
             return
 
-        queue_dir = Path(self.config.escalation_queue_dir)
-        if not queue_dir.is_absolute():
-            queue_dir = Path(self.config.explore_codebase_root) / queue_dir
-        self._escalation_queue = EscalationQueue(queue_dir)  # type: ignore[possibly-undefined]
+        if self._escalation_queue is None:
+            self._escalation_queue = EscalationQueue(  # type: ignore[possibly-undefined]
+                self._configured_escalation_queue_dir()
+            )
 
         mcp_server = create_escalation_server(  # type: ignore[possibly-undefined]
             self._escalation_queue,
