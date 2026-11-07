@@ -1018,6 +1018,9 @@ async def open_conn(tmp_path: Path):
     seconds.  Belt and braces: connections are opened through
     :func:`connect_daemon`, the repo convention that marks the worker thread
     daemon, so even a teardown that is itself skipped cannot wedge exit.
+
+    Its connections skip fsync (``synchronous=OFF``); see
+    :func:`test_open_conn_commits_do_not_wait_on_the_disk`.
     """
     conns: list[aiosqlite.Connection] = []
 
@@ -1026,6 +1029,8 @@ async def open_conn(tmp_path: Path):
         conns.append(conn)
         conn.row_factory = aiosqlite.Row
         await apply_wal_pragmas(conn, busy_timeout_ms=5000)
+        # Rationale: test_open_conn_commits_do_not_wait_on_the_disk
+        await conn.execute('PRAGMA synchronous=OFF')
         return conn
 
     try:
