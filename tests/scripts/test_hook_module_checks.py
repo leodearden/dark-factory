@@ -55,10 +55,8 @@ def test_a_dependency_module_type_checks_every_module(tmp_path: Path, dependency
         if m.type_check_command is not None
     }
     assert run.rc == 0, run.stderr
-    _assert_units(
-        run.units,
-        {f'module:{dependency.prefix}:lint': dependency.lint_command, **every_type_leg},
-    )
+    lint_leg = {unit: cmd for unit, cmd in _legs(dependency).items() if unit.endswith(':lint')}
+    _assert_units(run.units, {**lint_leg, **every_type_leg})
 
 
 def test_a_dependency_fan_out_skips_a_module_without_a_type_check(tmp_path: Path) -> None:
