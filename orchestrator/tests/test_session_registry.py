@@ -2180,6 +2180,84 @@ def test_mark_orphaned_handles_mixed_population_in_one_sweep(tmp_path: Path) -> 
 
 
 # ---------------------------------------------------------------------------
+# Task 8125: the pid sweeps judge the launcher by its identity
+# ---------------------------------------------------------------------------
+
+_FORGED_BOOT_ID = '00000000-0000-0000-0000-000000000000'
+_OTHER_HOST = 'other-host.invalid'
+_ELSEWHERE = 'elsewhere'
+_JUDGED_DEAD = {'reused-pid', 'rebooted'}
+_JUDGED_KEPT = ('live-launcher', _ELSEWHERE, 'unqualified')
+
+
+def _launcher_identities() -> dict[str, ProcessIdentity | None]:
+    """One identity per verdict, all naming this live test process: only the identity can make one dead."""
+    live = capture(os.getpid())
+    assert live is not None
+    return {
+        'live-launcher': live,
+        'reused-pid': dataclasses.replace(live, start_ticks=live.start_ticks + 1),
+        'rebooted': dataclasses.replace(live, boot_id=_FORGED_BOOT_ID),
+        _ELSEWHERE: dataclasses.replace(live, host=_OTHER_HOST),
+        'unqualified': None,
+    }
+
+
+def _seed_stale_launchers(root: Path) -> None:
+    for slug, identity in _launcher_identities().items():
+        record = _make_record(
+            session_slug=slug,
+            status=sr.Status.RUNNING,
+            launcher_pid=os.getpid(),
+            launcher_identity=identity,
+        )
+        sr.write_record(record, root=root)
+        _set_mtime(
+            sr.record_path_for_slug(slug, root=root),
+            _NOW,
+            sr.NON_TERMINAL_HEARTBEAT_TTL + timedelta(minutes=1),
+        )
+
+
+def _logged_other_host_skip(caplog: pytest.LogCaptureFixture, sweep: str, subject: str) -> bool:
+    return any(
+        sweep in r.getMessage() and subject in r.getMessage() and 'reason=other_host' in r.getMessage()
+        for r in caplog.records
+        if r.name == sr.__name__ and r.levelno == logging.INFO
+    )
+
+
+class TestPidSweepsJudgeTheLauncherByIdentity:
+    def test_mark_orphaned_marks_exactly_the_launchers_judged_dead(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        _seed_stale_launchers(tmp_path)
+
+        with caplog.at_level(logging.INFO, logger=sr.__name__):
+            marked = sr.mark_orphaned_sessions_exited(root=tmp_path, now=_NOW)
+
+        assert {m.session_slug for m in marked} == _JUDGED_DEAD
+        for slug in _JUDGED_KEPT:
+            assert sr.read_record(slug, root=tmp_path).status == sr.Status.RUNNING
+        assert _logged_other_host_skip(caplog, 'mark_orphaned_sessions_exited', _ELSEWHERE)
+
+    def test_reap_stale_records_reaps_exactly_the_launchers_judged_dead(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        _seed_stale_launchers(tmp_path)
+
+        with caplog.at_level(logging.INFO, logger=sr.__name__):
+            reaped = sr.reap_stale_records(root=tmp_path, now=_NOW)
+
+        assert {r.session_slug: r.reason for r in reaped} == dict.fromkeys(
+            _JUDGED_DEAD, 'stale_pid'
+        )
+        for slug in _JUDGED_KEPT:
+            assert sr.record_path_for_slug(slug, root=tmp_path).is_file()
+        assert _logged_other_host_skip(caplog, 'reap_stale_records', _ELSEWHERE)
+
+
+# ---------------------------------------------------------------------------
 # Task 2934 step-1/2: _normalize_wm_window_id (decimal-vs-hex canonicalization)
 # ---------------------------------------------------------------------------
 
