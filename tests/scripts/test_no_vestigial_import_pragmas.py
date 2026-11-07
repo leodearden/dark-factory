@@ -628,3 +628,37 @@ def test_a_suppressed_import_of_a_package_is_reported_at_its_regular_package_roo
         f'at the execution root, so `{package}` resolves at {package_root}. The '
         f'reported root must be the one pyright actually uses'
     )
+
+
+def test_no_root_extrapaths_entry_holds_a_test_module_or_conftest() -> None:
+    extra_paths = _load_root_pyright_config().get('extraPaths', [])
+    assert extra_paths, (
+        'the root [tool.pyright] table lists no extraPaths, so this test would '
+        'pass vacuously'
+    )
+    suite_modules_by_entry = {
+        entry: sorted(
+            path.name
+            for path in (REPO_ROOT / entry).glob('*.py')
+            if path.name == 'conftest.py' or path.name.startswith('test_')
+        )
+        for entry in extra_paths
+    }
+    offending = {entry: names for entry, names in suite_modules_by_entry.items() if names}
+
+    assert not offending, (
+        'root [tool.pyright] extraPaths entries hold test modules or a conftest:\n'
+        + '\n'.join(
+            f'  {entry}/: {len(names)} file(s): {", ".join(names)}'
+            for entry, names in offending.items()
+        )
+        + '\nPyright resolves a root extraPaths module ahead of a same-named '
+        'module in the importing file\'s own directory, while at runtime '
+        'tests/scripts/conftest.py inserts that own directory at sys.path[0], '
+        'so pyright and the runtime bind different files. Test modules and '
+        'conftests are exactly the names suites define in parallel: '
+        'test_timeout_marker_inversion_guard exists in orchestrator/tests, '
+        'tests/scripts and scripts/tests. Put only the helper modules the root '
+        'table\'s targets import into a dedicated directory, such as '
+        'orchestrator/tests/cross_suite_helpers, and list that directory instead'
+    )
