@@ -109,7 +109,7 @@ from fused_memory.reconciliation.standing_decision_writer import (
 )
 from fused_memory.routing.classifier import WriteClassifier
 from fused_memory.routing.router import ReadRouter
-from fused_memory.services import mem0_write_retry, overreach_guard
+from fused_memory.services import mem0_retry_backlog_alarm, mem0_write_retry, overreach_guard
 from fused_memory.services.classification_fallback_alarm import (
     ClassificationFallbackAlarm,
     journal_params,
@@ -7245,22 +7245,34 @@ class MemoryService:
             raw, operation='add', zero_ids_anomalous=_MEM0_ADD_INFER_PINNED_FALSE
         )
 
+    @property
+    def mem0_retry_policy(self) -> Mem0RetryPolicy:
+        return self._mem0_retry_policy
+
     async def retry_due_mem0_intents(
         self,
         *,
         now: datetime | None = None,
         on_landed: OnMem0Landed | None = None,
     ) -> Mem0RetryPassSummary:
-        """Run one server-side retry pass over the Mem0 writes deferred for retry."""
+        """Run one server-side retry pass, then escalate any backlog older than the policy allows."""
         if self._write_journal is None:
             return Mem0RetryPassSummary()
-        return await mem0_write_retry.retry_due_mem0_intents(
+        now = now or datetime.now(UTC)
+        summary = await mem0_write_retry.retry_due_mem0_intents(
             self._write_journal,
             self.reissue_mem0_intent,
             policy=self._mem0_retry_policy,
-            now=now or datetime.now(UTC),
+            now=now,
             on_landed=on_landed,
         )
+        await mem0_retry_backlog_alarm.alarm_on_stale_mem0_retries(
+            self._write_journal,
+            now=now,
+            max_age=timedelta(seconds=self._mem0_retry_policy.backlog_alarm_age_seconds),
+            project_roots=self._known_projects,
+        )
+        return summary
 
     # ------------------------------------------------------------------
     # Recovery: reconcile crash-mid-write mem0 intents (task 2710)
