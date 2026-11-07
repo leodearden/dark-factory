@@ -5,12 +5,14 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
+from types import MappingProxyType
 
 import pytest
 from pydantic import ValidationError
 
 from shared.followup_items import (
     FOLLOWUP_ITEMS_METADATA_KEY,
+    FOLLOWUP_ITEMS_REFUSED_ERROR,
     MAX_FOLLOWUP_ITEMS,
     MAX_SUMMARY_CHARS,
     UNPARENTED_ORIGIN,
@@ -22,6 +24,7 @@ from shared.followup_items import (
     legacy_item,
     merge_items,
     observed_item,
+    parse_item,
     read_items,
     require_unique_item_keys,
     with_derived_bundle_keys,
@@ -127,6 +130,10 @@ class TestItemKey:
     )
     def test_a_substantive_difference_changes_the_key(self, variant: _KeyArgs) -> None:
         assert variant.key() != _KeyArgs().key()
+
+    def test_one_str_of_files_is_refused_rather_than_keyed_by_character(self) -> None:
+        with pytest.raises(TypeError, match='files'):
+            item_key(origin_task='8414', files='pkg/a.py', summary='The loop hides it')
 
 
 class TestObservedItem:
@@ -251,6 +258,39 @@ class TestLegacyItem:
         metadata = {key: value for key, value in {**self._META, **overrides}.items() if value is not None}
         assert legacy_item(title='t', files=files, metadata=metadata) is None
 
+    @pytest.mark.parametrize(
+        ('title', 'files'),
+        [
+            pytest.param(' \n ', ['pkg/a.py'], id='blank-title'),
+            pytest.param('t', ['pkg/a.py', '  '], id='blank-file'),
+            pytest.param('t', 'pkg/a.py', id='one-str-of-files'),
+        ],
+    )
+    def test_it_is_none_when_no_item_can_hold_the_row(self, title: str, files: list[str]) -> None:
+        assert legacy_item(title=title, files=files, metadata=self._META) is None
+
+
+class TestParseItem:
+    def test_a_valid_element_is_its_item(self) -> None:
+        item = observed_item(summary='one', files=['pkg/a.py'], origin_task='1')
+        assert parse_item(item.model_dump(mode='json')) == item
+
+    @pytest.mark.parametrize(
+        'element',
+        [
+            pytest.param('one', id='not-a-mapping'),
+            pytest.param(None, id='none'),
+            pytest.param(_fields(title='t'), id='unknown-key'),
+            pytest.param({name: value for name, value in _fields().items() if name != 'key'}, id='no-key'),
+        ],
+    )
+    def test_an_invalid_element_is_none(self, element: object) -> None:
+        assert parse_item(element) is None
+
+    def test_it_reads_any_mapping_as_the_strict_reader_does(self) -> None:
+        element = MappingProxyType(_fields())
+        assert parse_item(element) == read_items({FOLLOWUP_ITEMS_METADATA_KEY: [element]})[0]
+
 
 class TestMetadataRegistration:
     def test_a_list_of_items_parses_to_typed_items(self) -> None:
@@ -284,6 +324,7 @@ class TestMetadataRegistration:
 
 def test_the_contract_constants() -> None:
     assert FOLLOWUP_ITEMS_METADATA_KEY == 'followup_items'
+    assert FOLLOWUP_ITEMS_REFUSED_ERROR == 'followup_items_refused'
     assert MAX_FOLLOWUP_ITEMS == 5
 
 

@@ -21,6 +21,7 @@ from shared.task_metadata import register_metadata_submodel
 
 __all__ = [
     'FOLLOWUP_ITEMS_METADATA_KEY',
+    'FOLLOWUP_ITEMS_REFUSED_ERROR',
     'MAX_FOLLOWUP_ITEMS',
     'MAX_SUMMARY_CHARS',
     'UNPARENTED_ORIGIN',
@@ -32,12 +33,15 @@ __all__ = [
     'legacy_item',
     'merge_items',
     'observed_item',
+    'parse_item',
     'read_items',
     'require_unique_item_keys',
     'with_derived_bundle_keys',
 ]
 
 FOLLOWUP_ITEMS_METADATA_KEY: Final = 'followup_items'
+# The wire ``error`` of a submit_task refused for its bundle: fused-memory reports it, filer prompts name it.
+FOLLOWUP_ITEMS_REFUSED_ERROR: Final = 'followup_items_refused'
 MAX_FOLLOWUP_ITEMS: Final = 5
 MAX_SUMMARY_CHARS: Final = 300
 UNPARENTED_ORIGIN: Final = 'unparented'
@@ -139,7 +143,13 @@ class DuplicateFollowupItemKey(FollowupBundleInvalid):
 
 
 def item_key(*, origin_task: str, files: Sequence[str], summary: str) -> str:
-    """The item's identity: blind to file order, repeated files, and summary case and whitespace."""
+    """The item's identity: blind to file order, repeated files, and summary case and whitespace.
+
+    Raises:
+        TypeError: when ``files`` is one str, which would otherwise be keyed character by character.
+    """
+    if isinstance(files, str):
+        raise TypeError(f'item_key files must be a sequence of paths, not one str: {files!r}')
     material = (origin_task, *_canonical_files(files), _one_line(summary).casefold())
     return _sha256_16(_KEY_MATERIAL_SEPARATOR.join(material))
 
@@ -205,8 +215,8 @@ def legacy_item(
 ) -> FollowupItem | None:
     """A pre-bundle single follow-up as one item keyed by its caller-sent ``suggestion_hash``.
 
-    None when the row is not such a single: no usable ``suggestion_hash``, no files, or it is
-    already a bundle.
+    None when the row is not such a single: no usable ``suggestion_hash``, no files, already a
+    bundle, or a title or files no item can hold.
     """
     suggestion_hash = metadata.get('suggestion_hash')
     if FOLLOWUP_ITEMS_METADATA_KEY in metadata or not files:
@@ -214,13 +224,21 @@ def legacy_item(
     if not isinstance(suggestion_hash, str) or not suggestion_hash.strip():
         return None
     escalation_id = metadata.get('escalation_id')
-    return FollowupItem.model_validate({
+    return parse_item({
         'key': suggestion_hash,
         'summary': _one_line(title)[:MAX_SUMMARY_CHARS],
         'files': files,
         'origin_task': _parent_task(metadata) or UNPARENTED_ORIGIN,
         'origin_escalation_id': escalation_id if isinstance(escalation_id, str) else None,
     })
+
+
+def parse_item(element: object) -> FollowupItem | None:
+    """One stored element as an item, or None when it is not one: the lenient twin of :func:`read_items`."""
+    try:
+        return _validated_element(element, FollowupItem.model_validate)
+    except FollowupBundleInvalid:
+        return None
 
 
 def read_items(metadata: Mapping[str, object]) -> tuple[FollowupItem, ...]:
@@ -233,7 +251,7 @@ def read_items(metadata: Mapping[str, object]) -> tuple[FollowupItem, ...]:
         return ()
     elements = _require_list(metadata[FOLLOWUP_ITEMS_METADATA_KEY])
     return tuple(
-        _validated_element(index, element, FollowupItem.model_validate)
+        _validated_element(element, FollowupItem.model_validate, index=index)
         for index, element in enumerate(elements)
     )
 
@@ -247,7 +265,7 @@ def _require_list(raw: object) -> list[object]:
 
 
 def _validated_element(
-    index: int, element: object, build: Callable[[dict[str, object]], FollowupItem],
+    element: object, build: Callable[[dict[str, object]], FollowupItem], *, index: int | None = None,
 ) -> FollowupItem:
     if not isinstance(element, Mapping):
         raise FollowupBundleInvalid(
@@ -297,7 +315,7 @@ def _observed_bundle(raw: object, origin: Mapping[str, object]) -> tuple[Followu
             f'a bundle holds 1..{MAX_FOLLOWUP_ITEMS} items; got {len(elements)}',
         )
     items = tuple(
-        _validated_element(index, element, lambda fields: _keyed_item({**fields, **origin}))
+        _validated_element(element, lambda fields: _keyed_item({**fields, **origin}), index=index)
         for index, element in enumerate(elements)
     )
     require_unique_item_keys(items)
