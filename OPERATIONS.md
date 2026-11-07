@@ -2686,33 +2686,35 @@ directly, not just interactive sessions. Treat it accordingly:
 - For a direct-to-main commit under contention, use
   `git commit --only <path>` (not a bare `git commit`) so you don't sweep
   up unrelated staged or dirty state from a concurrent process.
-- `pre-commit` path-filters its pyright stage (since task 2551 — see
-  `hooks/project-checks` for the authoritative logic), so what a commit
-  costs depends on what it stages:
-  - **No staged `.py` files** — pyright is skipped entirely; the hook
-    prints `pre-commit: pyright skipped (no Python changes)` and the
-    commit completes in seconds. A docs/plans-only commit needs no
-    bumped timeout: reach for a plain gated `git commit --only <paths>`
-    first.
-  - **Staged `.py` under `shared/` or `escalation/`** — every dependent
-    package imports them, so the hook runs a full sweep across all seven
-    `PYRIGHT_PACKAGES` (`fused-memory`, `orchestrator`, `dashboard`,
-    `shared`, `escalation`, `sampler`, `cockpit` — the members of
-    `type_check_command`). This is the 7x worst case and can comfortably
-    exceed two minutes.
-  - **Staged `.py` under exactly one of the other `PYRIGHT_PACKAGES`
-    (`fused-memory`, `orchestrator`, `dashboard`, `sampler`, `cockpit`)** — pyright runs once, for that package only.
-  - **Staged `.py` outside every prefix above** (e.g. `scripts/`, a
-    root-level `conftest.py`) — pyright is skipped for the whole commit,
-    and unlike the no-Python case the hook prints *nothing*, so there is
-    no signal that it was skipped. This over-narrowing is deliberate
-    (root-level Python is itself unconfigured for pyright); if the changed
-    file is imported by a package, run `uv run pyright` there by hand.
+- On main, `pre-commit` runs the merge gate's own checks for what the
+  commit stages (task 8531; `scripts/hook_module_checks.py` derives the
+  list, `hooks/project-checks` runs it in parallel), so what a commit costs
+  depends on what it stages:
+  - **Staged `.py` under a registered module** — that module's
+    `lint_command` and `type_check_command` run verbatim, exactly as the
+    merge gate would run them, so a staged `scripts/*.py` now runs
+    `module:scripts:type`.
+  - **Staged `.py` under `shared/` or `escalation/`** — every module
+    imports them, so the type check of EVERY registered module runs. This
+    is the worst case.
+  - **A staged file under `plans/`, `docs/` or `review/`, or a
+    `*.yaml`/`*.json`/`*.md` outside a workspace package** — the
+    whole-tree screen runs the `scripts/merge_screen.yaml` checks: about
+    10 s warm and 45 s cold, as measured in
+    `plans/merge-pre-verify-screen-prd.md` §3, decision 4.
+  - **Nothing above** — the hook prints `pre-commit: merge-gate checks
+    skipped (no staged file maps to a module or the screen) in Ns`. A
+    commit like that needs no bumped timeout: reach for a plain gated
+    `git commit --only <paths>` first.
 
-  In the two middle cases — the only ones that actually invoke pyright —
-  pass a generous timeout (five minutes or more) to whatever you use to
-  run commit commands, or run it detached and poll, rather than letting a
-  default timeout kill it mid-hook.
+  The hook prints each unit it runs and the elapsed time. A module type
+  check can take minutes: the measurements are recorded at
+  `scripts/orchestrator.yaml::type_check_command` and
+  `shared/orchestrator.yaml::type_check_command` (orchestrator's pyright).
+  For any commit that runs a module check, pass a generous timeout (five
+  minutes or more) to whatever runs the commit, or run it detached and
+  poll, so a default timeout does not kill it mid-hook. `--no-verify` still
+  bypasses the hook, as it does for any git hook.
 - **Never run `git stash`** in the main checkout: the stash stack is
   consumed by the merge worker's own advance path, so a stash you push can
   be popped out from under you by an unrelated process. Park work-in-progress
@@ -2720,10 +2722,11 @@ directly, not just interactive sessions. Treat it accordingly:
 - A pure docs-only commit landing under contention (index lock held by a
   concurrent process) may use `--no-verify` — docs changes don't need the
   code-quality hooks, and retrying past a lock contest is safe for a
-  no-code change. Reach for `--only` first regardless. Since task 2551 a
-  docs-only commit passes the hook cheaply anyway (pyright is skipped),
-  so this is a last resort for genuine index-lock contention — not a way
-  to dodge a slow hook.
+  no-code change. Reach for `--only` first regardless. A docs-only commit
+  outside `plans/`, `docs/` and `review/` passes the hook cheaply anyway
+  (no merge-gate check maps to it); one inside them pays for the screen.
+  Either way, `--no-verify` is a last resort for genuine index-lock
+  contention, not a way to dodge a slow hook.
 
 ---
 

@@ -359,7 +359,8 @@ definition for phantom heads (the §5.3 "separate task"); the pre-verify screen'
    `merge_verify` rows at start (the probe's `_recent_verify_outcomes` shape). Decide in ζ.
 2. **Whether the gate-rebased item (γ) prefers the head's previous host.** Suggested: no; `prefer_remote`
    as for any dispatch. Decide in γ.
-3. **The hook's screen-leg file set.** Suggested: the globs in D8; the η implementer may narrow to the paths
-   the fast seven actually read. Decide in η.
+3. **The hook's screen-leg file set.** DECIDED in η (task 8531): exactly the D8 globs, not narrowed. A
+   "package" is a uv workspace member with a `src` dir, so `scripts/` is not one. See
+   `scripts/hook_module_checks.py::screen_triggered`.
 4. **Whether `merge_verify_cancelled` should carry partial unit outcomes.** Suggested: only `elapsed_ms` and
    `fraction`. Decide in α.

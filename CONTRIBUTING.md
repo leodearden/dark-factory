@@ -417,17 +417,18 @@ catching it locally.
 (installed via `hooks/setup.sh`, which points `core.hooksPath` at `hooks/`):
 it strips any staged `.task/` files (see §8), then on `main` runs `ruff
 check`, the asyncmock/bare-MagicMock style checks on staged test files, and
-**pyright up to 8×** (once per touched package under `PYRIGHT_PACKAGES` —
-the same eight members the merge gate type-checks — or across all of them if
-the change touches a shared dependency like `shared` or `escalation`). That stage is path-filtered since task 2551: a commit
-staging no `.py` files skips pyright entirely and finishes in seconds
-(`pre-commit: pyright skipped (no Python changes)`), and a staged `.py`
-outside every one of those prefixes (e.g. `scripts/`, a root-level
-`conftest.py`) skips it too — silently, with no such line printed. A
-commit that does stage Python under a configured package can comfortably
-exceed two minutes — give those a timeout of at least `300000`ms (or run
-detached via `setsid` and poll) rather than letting a default 2-minute
-timeout kill it mid-hook; the two skip cases above need no bumped timeout.
+**the merge gate's own checks for what the commit stages** (task 8531, via
+`scripts/hook_module_checks.py`). Each registered module that a staged `.py`
+maps to runs its `lint_command` and `type_check_command` verbatim. A staged
+`.py` under `shared` or `escalation` runs the type check of every module. A
+staged file under `plans/`, `docs/` or `review/`, or a `*.yaml`/`*.json`/`*.md`
+outside a workspace package, runs the `scripts/merge_screen.yaml` screen. A
+commit that maps to none of these prints `pre-commit: merge-gate checks
+skipped (no staged file maps to a module or the screen) in Ns` and finishes
+in seconds. A commit that runs a module type check can take minutes. Give it
+a timeout of at least `300000`ms, or run it detached via `setsid` and poll,
+rather than letting a default 2-minute timeout kill it mid-hook; the skip
+case needs no bumped timeout.
 Never `--no-verify` this hook to skip pyright/ruff on a code change; the
 two narrow documented exceptions are the *pre-merge-commit* emergency
 bypass (§5) and a **docs-only** commit landing under index-lock contention
