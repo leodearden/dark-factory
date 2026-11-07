@@ -4354,6 +4354,12 @@ class TestRunSubprocessWatchdog:
         terminate_pg_mock.assert_called_once()
 
 
+# Ordering invariant: delay_secs + this valve stays under every extension bound
+# the gated (a)/(c) runs pass (working_idle_secs, absolute_cap_secs), so a valve
+# trip ends as a normal exit reported by the reads witness, never as a kill.
+_EXTENSION_READS_VALVE_SECS = 2.0
+
+
 class TestRunSubprocessWorkingRegimeProgressExtension:
     """Working-regime progress-extension tests for _run_subprocess (task 2360).
 
@@ -4378,11 +4384,22 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
     """
 
     @staticmethod
-    def _make_delayed_success_proc(delay_secs, stdout_bytes):
-        """proc whose communicate() sleeps *delay_secs* then returns *stdout_bytes* once."""
+    def _make_delayed_success_proc(delay_secs, stdout_bytes, *, reads=None, min_reads=0):
+        """proc whose communicate() returns *stdout_bytes* once, after at least
+        *delay_secs* AND, when *reads* is given, once *min_reads* transcript reads
+        have started (bounded by _EXTENSION_READS_VALVE_SECS).  The fixed lifetime
+        alone let a starved loop break at ``comm_task in done`` before any read —
+        see the READS GATE note at
+        shared/tests/test_cli_invoke_transcript_offloop.py::_make_delayed_success_proc.
+        """
+        import time as _time
 
         async def communicate_side_effect(input=None):  # noqa: A002
             await asyncio.sleep(delay_secs)
+            if reads is not None:
+                deadline = _time.monotonic() + _EXTENSION_READS_VALVE_SECS
+                while len(reads) < min_reads and _time.monotonic() < deadline:
+                    await asyncio.sleep(0.005)
             return (stdout_bytes, b'')
 
         proc = MagicMock()
@@ -4513,9 +4530,9 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
             'result': 'ok', 'subtype': 'success', 'cost_usd': 0.02,
             'duration_ms': 300, 'num_turns': 8, 'session_id': sid,
         }).encode()
-        proc = self._make_delayed_success_proc(0.3, valid_json)
         old_ceiling = 0.1
         reads: list[int] = []
+        proc = self._make_delayed_success_proc(0.3, valid_json, reads=reads, min_reads=3)
         turns = self._recorded_with_held_read(
             self._always_growing_turns(), reads, held_call=1, held_secs=old_ceiling,
         )
@@ -4534,7 +4551,7 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
                 ['fake'], cwd=tmp_path, env={}, model='opus',
                 timeout_seconds=old_ceiling, startup_grace_secs=0.02,
                 session_id=sid, config_dir=cfg_dir,
-                working_idle_secs=1.0, absolute_cap_secs=5.0,
+                working_idle_secs=3.0, absolute_cap_secs=5.0,
             )
             wall = _time.monotonic() - t0
 
@@ -4626,9 +4643,9 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
             'result': 'ok', 'subtype': 'success', 'cost_usd': 0.01,
             'duration_ms': 200, 'num_turns': 1, 'session_id': sid,
         }).encode()
-        proc = self._make_delayed_success_proc(0.2, valid_json)
         old_ceiling = 0.05
         reads: list[int] = []
+        proc = self._make_delayed_success_proc(0.2, valid_json, reads=reads, min_reads=3)
         turns = self._recorded_with_held_read(
             self._flat_turns(1), reads, held_call=1, held_secs=old_ceiling,
         )
@@ -4647,13 +4664,13 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
                 ['fake'], cwd=tmp_path, env={}, model='opus',
                 timeout_seconds=old_ceiling, startup_grace_secs=0.02,
                 session_id=sid, config_dir=cfg_dir,
-                working_idle_secs=0.5, absolute_cap_secs=5.0,
+                working_idle_secs=3.0, absolute_cap_secs=5.0,
             )
             wall = _time.monotonic() - t0
 
         assert result.timed_out is False, (
             'A single long synchronous tool call (flat turn count) between the old '
-            '0.05s ceiling and the 0.5s idle bound must survive, not be false-killed '
+            '0.05s ceiling and the 3.0s idle bound must survive, not be false-killed '
             'at the old ceiling (B6 safety).'
         )
         self._assert_extension_exercised_past_ceiling(reads)
