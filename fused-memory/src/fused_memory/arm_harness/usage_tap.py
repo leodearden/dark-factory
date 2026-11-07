@@ -115,17 +115,32 @@ def load_call_records(path: Path | str) -> tuple[CallRecord, ...]:
 
 
 class _SessionCallLog:
+    """One tap session's calls; closing it drains the calls still in flight."""
+
     def __init__(self, path: Path) -> None:
         self._path = path
-        self._lock = threading.Lock()
+        self._state = threading.Condition()
+        self._in_flight = 0
         self._closed = False
 
-    def close(self) -> None:
-        with self._lock:
+    @contextmanager
+    def in_flight(self) -> Iterator[None]:
+        with self._state:
+            self._in_flight += 1
+        try:
+            yield
+        finally:
+            with self._state:
+                self._in_flight -= 1
+                self._state.notify_all()
+
+    def close(self, drain_timeout_s: float) -> None:
+        with self._state:
+            self._state.wait_for(lambda: self._in_flight == 0, timeout=drain_timeout_s)
             self._closed = True
 
     def append(self, record: CallRecord) -> None:
-        with self._lock, self._path.open('a') as stream:
+        with self._state, self._path.open('a') as stream:
             if self._closed:
                 record = record.model_copy(update={'outlived_session': True})
             stream.write(record.model_dump_json() + '\n')
@@ -181,21 +196,22 @@ def _handler_class(
             self._proxy()
 
         def _proxy(self) -> None:
-            started_at = datetime.now(UTC)
-            started = time.perf_counter()
-            body = self.rfile.read(int(self.headers.get('Content-Length') or 0))
-            status, headers, response_body = _exchange(
-                upstream, self.command, self.path, self.headers, body
-            )
-            call_log.append(call_record(
-                started_at=started_at,
-                duration_ms=(time.perf_counter() - started) * 1000,
-                method=self.command,
-                path=self.path,
-                request_body=body,
-                status=status,
-                response_body=response_body,
-            ))
+            with call_log.in_flight():
+                started_at = datetime.now(UTC)
+                started = time.perf_counter()
+                body = self.rfile.read(int(self.headers.get('Content-Length') or 0))
+                status, headers, response_body = _exchange(
+                    upstream, self.command, self.path, self.headers, body
+                )
+                call_log.append(call_record(
+                    started_at=started_at,
+                    duration_ms=(time.perf_counter() - started) * 1000,
+                    method=self.command,
+                    path=self.path,
+                    request_body=body,
+                    status=status,
+                    response_body=response_body,
+                ))
             self.send_response(status)
             for name, value in headers:
                 if name.lower() not in _NOT_RETURNED:
@@ -219,7 +235,12 @@ def _upstream_origin(upstream_url: str) -> SplitResult:
 
 @contextmanager
 def usage_tap(
-    upstream_url: str, *, log_path: Path | str, host: str = '127.0.0.1', port: int = 0
+    upstream_url: str,
+    *,
+    log_path: Path | str,
+    host: str = '127.0.0.1',
+    port: int = 0,
+    drain_timeout_s: float = UPSTREAM_TIMEOUT_S,
 ) -> Iterator[str]:
     call_log_path = Path(log_path)
     call_log_path.touch()
@@ -232,7 +253,7 @@ def usage_tap(
     try:
         yield f'http://{host}:{server.server_address[1]}'
     finally:
-        call_log.close()
         server.shutdown()
         server.server_close()
+        call_log.close(drain_timeout_s)
         thread.join(timeout=5)

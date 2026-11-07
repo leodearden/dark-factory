@@ -259,8 +259,11 @@ Live endpoints come from `FusedMemoryConfig()` (honours `CONFIG_PATH`).
 `screen_slate.py`, beside `harness.py`, is η's sweep driver. It runs every LLM
 arm in turn: start, smoke, run, α's healthcheck, stop and teardown, all through
 the pinned harness. Each arm's traffic passes through the in-process usage tap
-(`usage_tap.py`), which records the server's own per-call `usage`. Its
-provenance and run record:
+(`usage_tap.py`), which records the server's own per-call `usage`. Leaving a
+tap session waits, up to the tap's upstream timeout, for calls the harness
+abandoned but the arm is still serving, so the arm is healthchecked and stopped
+only after they land; a call outlasting that bound is marked
+`outlived_session`. The sweep's provenance and run record:
 `plans/local-memory-models-eval-screening/README.md`.
 
 `run` refuses before touching any store unless the spec's `code_sha` is the
