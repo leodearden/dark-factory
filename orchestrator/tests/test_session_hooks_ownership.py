@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
 from collections.abc import Callable
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from _session_hook_fixtures import (
     stdin_json,
     write_bound_parent,
 )
+from shared.process_identity import ProcessIdentity, capture
 
 from orchestrator import session_hooks as sh
 from orchestrator import session_registry as sr
@@ -1057,3 +1059,98 @@ def test_hand_launched_record_keeps_the_durable_session_leader_pid(tmp_path: Pat
 
     slug = sh.hook_session_slug(hook_input, env={}, root=tmp_path, process_tree=tree)
     assert sr.read_record(slug, root=tmp_path).launcher_pid == 515151
+
+
+# ---------------------------------------------------------------------------
+# Task 8125: hooks stamp and judge process identities
+# ---------------------------------------------------------------------------
+
+_IDENTITY_CWD = '/home/leo/src/dark-factory'
+
+
+def _own_identity() -> ProcessIdentity:
+    identity = capture(os.getpid())
+    assert identity is not None
+    return identity
+
+
+def _absent_pid() -> int:
+    """A pid above this host's pid_max, so /proc never holds it."""
+    return int(Path('/proc/sys/kernel/pid_max').read_text()) + 1
+
+
+@pytest.mark.parametrize('owner_resolved', [True, False], ids=['owner-resolved', 'owner-unresolved'])
+def test_the_bind_stamps_the_owner_identity_with_the_owner_pid(
+    tmp_path: Path, owner_resolved: bool
+) -> None:
+    owner_pid = os.getpid() if owner_resolved else None
+    hook_input = {'session_id': 'sess-stamp', 'cwd': _IDENTITY_CWD}
+    slug = sh.hook_session_slug(
+        hook_input, env={}, root=tmp_path, process_tree=claude_process_tree(None)
+    )
+
+    sh.run_session_start(
+        hook_input, env={}, root=tmp_path, process_tree=claude_process_tree(owner_pid)
+    )
+
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.claude_owner_pid == owner_pid
+    assert record.claude_owner_identity == (_own_identity() if owner_resolved else None)
+
+
+def test_a_new_record_stamps_the_launcher_identity(tmp_path: Path) -> None:
+    tree = dataclasses.replace(claude_process_tree(424242), session_leader_pid=os.getpid)
+    hook_input = {'session_id': 'sess-launcher', 'cwd': _IDENTITY_CWD}
+
+    sh.run_session_start(hook_input, env={}, root=tmp_path, process_tree=tree)
+
+    slug = sh.hook_session_slug(hook_input, env={}, root=tmp_path, process_tree=tree)
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.launcher_pid == os.getpid()
+    assert record.launcher_identity == _own_identity()
+
+
+def _recorded_owner(variant: str) -> ProcessIdentity:
+    """This live test process's identity, altered so that only the identity can make it dead."""
+    live = _own_identity()
+    return {
+        'live': live,
+        'reused-pid': dataclasses.replace(live, start_ticks=live.start_ticks + 1),
+        'rebooted': dataclasses.replace(live, boot_id='00000000-0000-0000-0000-000000000000'),
+        'other-host': dataclasses.replace(live, host='other-host.invalid'),
+    }[variant]
+
+
+@pytest.mark.parametrize(
+    ('variant', 'reclaimed'),
+    [('reused-pid', True), ('rebooted', True), ('other-host', False), ('live', False)],
+)
+def test_the_reclaim_judges_the_recorded_owner_by_its_identity(
+    tmp_path: Path, variant: str, reclaimed: bool
+) -> None:
+    hook_input = {'session_id': 'sess-reclaim', 'cwd': _IDENTITY_CWD}
+    slug = sh.hook_session_slug(
+        hook_input, env={}, root=tmp_path, process_tree=claude_process_tree(None)
+    )
+    recorded = _recorded_owner(variant)
+    sr.write_record(
+        sr.SessionRecord(
+            session_slug=slug,
+            status=sr.Status.IDLE,
+            cwd=_IDENTITY_CWD,
+            claude_session_id='sess-reclaim',
+            claude_owner_pid=os.getpid(),
+            claude_owner_identity=recorded,
+        ),
+        root=tmp_path,
+    )
+    new_owner = _absent_pid()
+
+    sh.run_stop(hook_input, {}, root=tmp_path, process_tree=claude_process_tree(new_owner))
+
+    record = sr.read_record(slug, root=tmp_path)
+    if reclaimed:
+        assert record.claude_owner_pid == new_owner
+    else:
+        assert record.claude_owner_pid == os.getpid()
+        assert record.claude_owner_identity == recorded
