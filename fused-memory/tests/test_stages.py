@@ -13116,8 +13116,7 @@ class TestBaseStageEscalationQueueAttribute:
         assert stage._escalation_queue is fake_queue
 
 
-@pytest.fixture
-def minimal_harness():
+def _minimal_harness(*, escalation_queue=None):
     """Construct a minimal ReconciliationHarness with all deps mocked."""
     from fused_memory.config.schema import FusedMemoryConfig
 
@@ -13127,30 +13126,30 @@ def minimal_harness():
         memory_service=AsyncMock(),
         taskmaster=AsyncMock(),
         config=FusedMemoryConfig(),
+        escalation_queue=escalation_queue,
     )
 
 
 class TestHarnessWiresEscalationQueueOntoStages:
     """ReconciliationHarness._make_stages wires _escalation_queue onto each stage."""
 
-    def test_make_stages_wires_escalation_queue(self, minimal_harness):
-        """_make_stages() propagates harness._escalation_queue to each returned stage."""
+    def test_make_stages_wires_escalation_queue(self):
+        """_make_stages() propagates the harness's escalation queue to each returned stage."""
         fake_queue = MagicMock()
-        minimal_harness._escalation_queue = fake_queue
+        harness = _minimal_harness(escalation_queue=fake_queue)
 
-        stages = minimal_harness._make_stages(_scope('test_project', '/tmp/test'))
+        stages = harness._make_stages(_scope('test_project', '/tmp/test'))
 
         for stage in stages:
             assert stage._escalation_queue is fake_queue, (
                 f'Stage {stage.stage_id} did not receive _escalation_queue from harness'
             )
 
-    def test_make_stages_no_queue_leaves_stages_at_none(self, minimal_harness):
-        """When _escalation_queue is None, stages are left with _escalation_queue=None."""
-        # Ensure harness has no queue (default)
-        minimal_harness._escalation_queue = None
+    def test_make_stages_no_queue_leaves_stages_at_none(self):
+        """When the harness has no queue, stages are left with _escalation_queue=None."""
+        harness = _minimal_harness()
 
-        stages = minimal_harness._make_stages(_scope('test_project', '/tmp/test'))
+        stages = harness._make_stages(_scope('test_project', '/tmp/test'))
 
         for stage in stages:
             assert stage._escalation_queue is None
@@ -13159,14 +13158,14 @@ class TestHarnessWiresEscalationQueueOntoStages:
 class TestPropagateEscalationQueueHelper:
     """ReconciliationHarness._propagate_escalation_queue wires URL and queue onto an arbitrary stage list."""
 
-    def test_propagates_url_and_queue_onto_pre_existing_stages(self, minimal_harness):
+    def test_propagates_url_and_queue_onto_pre_existing_stages(self):
         """Helper propagates harness URL and queue to every stage in the supplied list."""
         fake_queue = MagicMock()
-        minimal_harness._escalation_url = 'http://test.local:9999/mcp'
-        minimal_harness._escalation_queue = fake_queue
+        harness = _minimal_harness(escalation_queue=fake_queue)
+        harness._escalation_url = 'http://test.local:9999/mcp'
 
         stages = [MagicMock(_escalation_url=None, _escalation_queue=None) for _ in range(3)]
-        minimal_harness._propagate_escalation_queue(stages)
+        harness._propagate_escalation_queue(stages)
 
         for stage in stages:
             assert stage._escalation_url == 'http://test.local:9999/mcp', (
@@ -13176,17 +13175,17 @@ class TestPropagateEscalationQueueHelper:
                 'Stage did not receive _escalation_queue from harness'
             )
 
-    def test_no_op_when_harness_has_no_url_or_queue(self, minimal_harness):
+    def test_no_op_when_harness_has_no_url_or_queue(self):
         """When harness has no URL or queue, pre-existing stage values are not overwritten."""
         sentinel_queue = MagicMock()
-        minimal_harness._escalation_url = None
-        minimal_harness._escalation_queue = None
+        harness = _minimal_harness()
+        harness._escalation_url = None
 
         stages = [
             MagicMock(_escalation_url='preexisting', _escalation_queue=sentinel_queue)
             for _ in range(3)
         ]
-        minimal_harness._propagate_escalation_queue(stages)
+        harness._propagate_escalation_queue(stages)
 
         for stage in stages:
             assert stage._escalation_url == 'preexisting', (
@@ -13196,17 +13195,17 @@ class TestPropagateEscalationQueueHelper:
                 'Helper must not overwrite _escalation_queue when harness has no queue'
             )
 
-    def test_propagates_url_only_when_queue_is_none(self, minimal_harness):
+    def test_propagates_url_only_when_queue_is_none(self):
         """When only URL is set on harness, URL propagates but queue is left at pre-existing value."""
         sentinel_queue = MagicMock()
-        minimal_harness._escalation_url = 'http://test.local:9999/mcp'
-        minimal_harness._escalation_queue = None
+        harness = _minimal_harness()
+        harness._escalation_url = 'http://test.local:9999/mcp'
 
         stages = [
             MagicMock(_escalation_url=None, _escalation_queue=sentinel_queue)
             for _ in range(3)
         ]
-        minimal_harness._propagate_escalation_queue(stages)
+        harness._propagate_escalation_queue(stages)
 
         for stage in stages:
             assert stage._escalation_url == 'http://test.local:9999/mcp', (
@@ -13216,14 +13215,14 @@ class TestPropagateEscalationQueueHelper:
                 'Helper must not overwrite _escalation_queue when harness queue is None'
             )
 
-    def test_propagates_to_single_pass_iterable(self, minimal_harness):
+    def test_propagates_to_single_pass_iterable(self):
         """Helper must propagate URL and queue even when stages is a single-pass iterable (e.g., generator/iter())."""
         fake_queue = MagicMock()
-        minimal_harness._escalation_url = 'http://test.local:9999/mcp'
-        minimal_harness._escalation_queue = fake_queue
+        harness = _minimal_harness(escalation_queue=fake_queue)
+        harness._escalation_url = 'http://test.local:9999/mcp'
 
         stages = [MagicMock(_escalation_url=None, _escalation_queue=None) for _ in range(3)]
-        minimal_harness._propagate_escalation_queue(iter(stages))
+        harness._propagate_escalation_queue(iter(stages))
 
         for stage in stages:
             assert stage._escalation_url == 'http://test.local:9999/mcp', (
@@ -13233,21 +13232,21 @@ class TestPropagateEscalationQueueHelper:
                 'Stage did not receive _escalation_queue — single-pass iterator was exhausted by URL pass'
             )
 
-    def test_propagates_queue_only_when_url_is_none(self, minimal_harness):
+    def test_propagates_queue_only_when_url_is_none(self):
         """When only queue is set on harness, queue propagates but URL is left at pre-existing value.
 
         Symmetric counterpart of test_propagates_url_only_when_queue_is_none; completes
         the asymmetric-guard matrix: (url+queue, neither, url-only, queue-only).
         """
         fake_queue = MagicMock()
-        minimal_harness._escalation_url = None
-        minimal_harness._escalation_queue = fake_queue
+        harness = _minimal_harness(escalation_queue=fake_queue)
+        harness._escalation_url = None
 
         stages = [
             MagicMock(_escalation_url='preexisting', _escalation_queue=None)
             for _ in range(3)
         ]
-        minimal_harness._propagate_escalation_queue(stages)
+        harness._propagate_escalation_queue(stages)
 
         for stage in stages:
             assert stage._escalation_queue is fake_queue, (

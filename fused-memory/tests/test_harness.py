@@ -628,6 +628,38 @@ async def test_escalation_server_receives_a_reconciliation_store_identity(
     assert identity.queue_dir == (tmp_path / 'esc').resolve()
 
 
+@pytest.mark.asyncio
+async def test_escalation_server_serves_the_constructor_injected_queue(
+    journal, event_buffer, mock_memory_service, tmp_path
+):
+    """A queue injected at construction is the one the escalation server serves.
+
+    Startup must not build a second queue from ``escalation_queue_dir``: the
+    harness would then file into one store while the server serves another.
+    """
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+    from reconciliation.escalation_server_capture import create_escalation_server_kwargs
+
+    injected = EscalationQueue(tmp_path / 'injected')
+    harness = make_harness(
+        journal=journal,
+        event_buffer=event_buffer,
+        memory_service=mock_memory_service,
+        taskmaster=AsyncMock(),
+        config=make_harness_config(
+            explore_codebase_root=str(tmp_path), escalation_queue_dir='configured'
+        ),
+        escalation_queue=injected,
+    )
+
+    kwargs = await create_escalation_server_kwargs(harness)
+
+    assert kwargs['store_identity'].queue_dir == (tmp_path / 'injected').resolve()
+    assert not (tmp_path / 'configured').exists(), (
+        'startup built a second queue from escalation_queue_dir'
+    )
+
+
 def _mock_stage_run(stage, items_flagged=None, before_return=None, capture_call_args=None):
     """Replace stage.run with a mock that returns a StageReport.
 
