@@ -9,9 +9,11 @@ sweep's tick is its only caller.
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Callable, Iterable
+import re
+from collections import Counter
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Final, Literal, get_args
 
@@ -24,15 +26,20 @@ __all__ = [
     'PACK_MAX_ITEMS',
     'PACK_MAX_UNION_KEYS',
     'RIDER_RESERVE_DAYS',
+    'RECIPES',
     'RIDER_RESERVE_MAX_DECLINES',
     'MemberKind',
     'PackExclusion',
     'PackGenerator',
     'PackMember',
+    'PackRecipe',
     'exclusion',
+    'hub_keys',
     'member_text_fp',
     'pack_lock_keys',
     'rider_reserved',
+    'survivor_of',
+    'title_recipe',
 ]
 
 PACK_MAX_ITEMS: Final = MAX_FOLLOWUP_ITEMS
@@ -46,6 +53,7 @@ MemberKind = Literal['followup', 'review_suggestion']
 
 _HELD_STATUS = 'pending'
 _TEXT_FP_SEPARATOR = '\x00'
+_UNKNOWN_AGE = datetime.min.replace(tzinfo=UTC)
 
 
 class PackExclusion(StrEnum):
@@ -177,3 +185,50 @@ def exclusion(m: PackMember, *, now: datetime) -> PackExclusion | None:
     """The first exclusion that applies to *m*, or None when it may be packed."""
     _require_aware_now(now)
     return next((reason for reason, applies in _EXCLUSION_RULES if applies(m, now)), None)
+
+
+def hub_keys(members: Sequence[PackMember], *, share: float = HUB_SHARE) -> frozenset[str]:
+    """Lock keys declared by more than *share* of *members*, the whole held pool (decision 5)."""
+    _require(0 < share < 1, f'share must be strictly between 0 and 1; got {share}')
+    declared = Counter(key for m in members for key in m.lock_keys)
+    return frozenset(key for key, count in declared.items() if count > share * len(members))
+
+
+class PackRecipe(StrEnum):
+    """A mechanical change that members of different parents can share as one task."""
+
+    H14_RELOCATE = 'h14_relocate'
+    CITE_DOC_HYGIENE = 'cite_doc_hygiene'
+    SPOT_DEDUPE = 'spot_dedupe'
+    TEST_SEAM = 'test_seam'
+    DIAG_CODE = 'diag_code'
+
+
+# v1, the table the 2026-11-04 re-run used: task 8451's details, plans/followup-packing-sweep-prd.md
+# §9 item 2. A None recipe blocks: a title whose first match is that row has no recipe.
+RECIPES: tuple[tuple[PackRecipe | None, re.Pattern[str]], ...] = tuple(
+    (recipe, re.compile(pattern, re.IGNORECASE))
+    for recipe, pattern in (
+        (PackRecipe.CITE_DOC_HYGIENE, r'\bstale\b.{0,60}\b(prose|comments?|docstrings?|docs?|cites?|citations?|references?|claims?|entry|wording|narrative|framing|breadcrumbs?)\b|\b(re-?point|retarget|correct|fix|refresh)\b.{0,50}\bstale\b|line[- ]number (doc )?cites|intra-doc|rustdoc|\bdocs? sweep\b'),
+        (PackRecipe.H14_RELOCATE, r'heuristic[- ]?14|inline test mod|in-module .{0,40}tests|\(\d[\d.,]*k? lines|\d[\d.,]*k? lines\)|into (its|their) own (module|file|suite|guard)|(partition|split) \S+\.(py|rs|sh|ts)\b'),
+        (None, r'\bstale\b|\b(re-?point|retarget)\b|\bcit(e|es|ation|ations)\b|\bdrift(ed)?\b|intra-doc|rustdoc|-D warnings|line pin|\bdocs?\b.*\b(align|sweep|refresh)'),
+        (PackRecipe.SPOT_DEDUPE, r'\bSPOT\b|heuristic 11|single[- ]source|\bdeduplicate|\bduplicat(e|ed|ion)\b|\bcopies\b|\bone (shared|owner|typed|home)\b|\bspelled twice\b'),
+        (PackRecipe.TEST_SEAM, r'\bseam\b|dotted-path|stop patching|patch(es|ing)? _\w|reach(es|ing)? (into )?(the )?(module|private|internal)'),
+        (PackRecipe.DIAG_CODE, r'DiagnosticCode|diag(nostic)?[_ ]code|text[- ]match'),
+    )
+)
+
+
+def title_recipe(title: str) -> PackRecipe | None:
+    """The recipe of the first :data:`RECIPES` row whose pattern occurs in *title*."""
+    return next((recipe for recipe, pattern in RECIPES if pattern.search(title)), None)
+
+
+def _age_key(m: PackMember) -> tuple[bool, datetime, int]:
+    return (m.pending_since is not None, m.pending_since or _UNKNOWN_AGE, m.task_id)
+
+
+def survivor_of(members: Sequence[PackMember]) -> int:
+    """The member a pack is rewritten into: the oldest, then the lowest id; unknown age is oldest."""
+    _require(bool(members), 'survivor_of needs at least one member')
+    return min(members, key=_age_key).task_id
