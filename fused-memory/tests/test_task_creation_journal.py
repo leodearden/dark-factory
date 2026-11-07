@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
-from _curator_helpers import curator_returning
+from _curator_helpers import answer_each_with, curator_returning, serve_existing_task
 from _fm_helpers import poll_until
 
 from fused_memory.backends.task_backend_errors import DuplicateCandidateKeyError
@@ -649,7 +649,7 @@ class TestOrphanRaceJournal:
             return decision
 
         curator = curator_returning()
-        curator.curate = AsyncMock(side_effect=gated_curate)
+        answer_each_with(curator, gated_curate)
         interceptor = build_interceptor(curator)
 
         ticket = await _submit(interceptor)
@@ -678,7 +678,7 @@ class TestIdempotencyHitJournal:
     async def test_idempotency_hit_writes_task_combined(
         self, build_interceptor, write_journal, taskmaster,
     ):
-        taskmaster.get_tasks = AsyncMock(return_value={'tasks': [self._EXISTING]})
+        serve_existing_task(taskmaster, self._EXISTING)
         interceptor = build_interceptor(curator_returning())
 
         resolved = await _resolve(interceptor, await _submit(interceptor, metadata=self._METADATA))

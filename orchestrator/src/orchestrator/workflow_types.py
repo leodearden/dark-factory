@@ -287,7 +287,9 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
 
     from orchestrator.git_ops import (
         BranchResetError,
+        CitationPatternInvalid,
         EphemeralWorktreeError,
+        GitQueryFailed,
         InteractiveWorktreeLimitError,
         LaneLockSelfOwnedLeak,
         MergeParkContentionError,
@@ -788,6 +790,34 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
             requeue_kind=RequeueKind.BLOCK,
             counts_against_requeue_cap=True,
             reason_prefix='Ephemeral probe worktree add failed after retries',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
+        # BD-2-completeness-only rows (task 7332), the same category as
+        # EphemeralWorktreeError above: raised only by GitOps'
+        # find_merge_marker_checked / find_task_citation_commit_checked and
+        # caught at source -- by the fail-safe twins (git_ops.py's
+        # _none_if_query_failed and find_task_citation_commit) and by
+        # scripts/restamp_degenerate_branch_bases.py, which excludes the task
+        # as git_error -- so neither reaches _drive() or classify_failure().
+        # The values say what an escape would mean. The checked lookups exist
+        # for callers that write on a miss, so "git could not answer" must not
+        # pass silently: BLOCK + escalate, as EphemeralWorktreeError does. An
+        # uncompilable git.commit_citation_pattern is operator configuration
+        # that no waiting or requeue repairs, ProbeSpawnError's shape.
+        GitQueryFailed: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=True,
+            requeue_kind=RequeueKind.BLOCK,
+            counts_against_requeue_cap=True,
+            reason_prefix='Git lookup on main could not answer',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
+        CitationPatternInvalid: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=True,
+            requeue_kind=RequeueKind.BLOCK,
+            counts_against_requeue_cap=True,
+            reason_prefix='Citation pattern is not a valid Python re',
             block_class=BlockClass.AGENT_FAILURE,
         ),
     }

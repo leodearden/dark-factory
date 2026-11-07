@@ -258,7 +258,7 @@ worktree, and return a structured JSON verdict.
 You MUST output ONLY valid JSON matching the schema provided by the
 --json-schema flag. No markdown fences, no prose outside the JSON.
 """,
-    allowed_tools=[*_READ_ONLY_TOOLS, *_JCODEMUNCH_TOOLS],
+    allowed_tools=[*_ANALYSIS_TOOLS, *_JCODEMUNCH_TOOLS],
     disallowed_tools=['Edit', 'Write'],
     default_model='sonnet',
     default_budget=0.50,
@@ -795,7 +795,7 @@ closing the cross-group route.
 |---|---|---|
 | The **instrument** | `judge_plan_quality` refuses a non-`is_scorable_plan` artifact up front — before a prompt is built, before `invoke_agent` — and returns the floor's own value | 3303 |
 | The **writer** | `run_architect_eval` gates the judge call site on `is_scorable_plan`, so no new incoherent cell is written | 3302 |
-| The **reader** | `report._plan_quality_score` floors a no-plan cell at read time, because the 2026-07-27 / 07-29 corpus is already on disk carrying the old shape | 3302 |
+| The **reader** | `cell_admission.plan_quality_score` floors a no-plan cell at read time, because the 2026-07-27 / 07-29 corpus is already on disk carrying the old shape | 3302 |
 
 ### The validity bound: judged without a reference (task 3628)
 
@@ -827,7 +827,7 @@ therefore valid ground-truth-independently.
 `EvalMetrics.to_dict` writes the key on *every* architect cell, so a healthy
 cell says `False` explicitly; a cell whose metrics predate task 3628 carries no
 key at all, and its validity was therefore never measured. The report layer
-keeps those apart (`report._judged_without_reference`): one keyless cell in a
+keeps those apart (`cell_admission.judged_without_reference`): one keyless cell in a
 config's admitted pool makes that config's count — and the report-level total —
 `None`, rendered `-`, with `judged_without_reference_unmeasured` carrying how
 many cells drove it and the trailer printing `UNMEASURED` rather than being
@@ -835,7 +835,7 @@ suppressed. Reporting `0` there would let a rebuild over the 2026-07-27 / 07-29
 corpus — the campaign this doc's provenance note says was judged blind on half
 the hard subset — render byte-identically to a campaign graded entirely against
 landed diffs, which is the very degradation σ exists to remove, reintroduced at
-the reader. It is the same read-time discipline `report._plan_quality_score`
+the reader. It is the same read-time discipline `cell_admission.plan_quality_score`
 applies to the no-plan floor, and the same rule
 `scripts/run_fable_trial_v2_campaign.py` (task 3632) states as its rule 3 and
 enforces per cell with `MARKER_KEY not in metrics`; the two consumers of this
@@ -868,9 +868,10 @@ cost_per_plan = (spend over ADMITTED plan-only cells) / (n_admitted - no_plan)
 | `plan_rate` | `plan_rate` (beside `plan_quality_n`, the denominator) | `plan_rate` | `plan_rate` on `format_composite_table` **and** in the `plan_quality by config:` block |
 | `cost_per_plan` | `cost_per_plan` (immediately after `cost_usd`) | — (see below) | `cost_per_plan` on `format_composite_table` |
 
-Both reduce through the shared `report._plan_rate` / `report._cost_per_plan`,
-and `_plan_rate` is called by **both** builders — the `_mean_plan_quality`
-discipline, so the two tables the CLI prints adjacently cannot drift.
+Both reduce through the shared `cell_admission.plan_rate` /
+`cell_admission.cost_per_plan`, and `cell_admission.plan_rate` is called by
+**both** builders — the `cell_admission.mean_plan_quality` discipline, so the
+two tables the CLI prints adjacently cannot drift.
 `cost_per_plan` is composite-row-only because `build_plan_quality_report`
 carries no cost data at all; threading some there would create a *second* cost
 surface free to drift from `cost_usd`.
@@ -895,9 +896,9 @@ arithmetic makes the point — fable read `$3.456`/fixture against the opus-max
 incumbent but `$4.731` per usable plan, i.e. *no cheaper at all*, while failing
 to plan 5× as often. Netting the failed attempts out of the numerator would
 report that illusion rather than remove it. An *unmeasurable* cell's `$0.00` is
-still excluded, for the same reason `_is_unmeasurable` keeps it out of the
-`cost` pool: it is the price of a run that never happened, and letting it in
-would report the cap window as a discount.
+still excluded, for the same reason `cell_admission.is_unmeasurable` keeps it
+out of the `cost` pool: it is the price of a run that never happened, and
+letting it in would report the cap window as a discount.
 
 **`select_survivors` ranks on `plan_rate` as a TIE-BREAK, below
 `plan_quality`** (axes 5–6 of 7; the name tiebreak falls to 7). Not above:
@@ -1131,6 +1132,63 @@ fabricated zero. They are abandoned, not migrated, and they load as measured.
 A campaign that needs a trustworthy mean must rerun into a fresh
 `--results-dir`.
 
+### Reviewer-trial panel cache and score loop (task 6741)
+
+Code: `reviewer_trial/runner.py::PanelRunKey`, `::run_panel_cached`,
+`::run_trial` and `::run_and_score` (under
+`orchestrator/src/orchestrator/evals/`).
+
+**One keyed panel cache.** `run_panel_cached` is the only panel cache, and
+`run_panel` stamps every result with a `PanelRunKey`. That key holds three
+things: a sha256 of the price table the caller passed (None when the call was
+unpriced), whether a usage gate was offered, and the diff cap. Each key has
+its own file, `<results_dir>/<variant>__<diff>__<key digest>.json`, written
+atomically. A stored panel is reused only when it records the requested
+variant and diff and an equal key. So an entry written by `smoke` or
+`calibrate` (unpriced, ungated, default cap) is never reused by a priced,
+pooled or cap-lifted run such as a campaign. And because the keys do not share
+a file, `full`/`sweep` (unpriced) and `refresh` (priced) each keep their own
+`variant_a` panels rather than re-running and overwriting each other's. A
+corrupt or foreign entry is re-run and overwritten. Before this task, two
+hand-rolled caches reused any parseable file, whatever produced it.
+
+**The key hashes what the caller passed.** `prices=None` and
+`prices=default_price_table()` are different keys, even though
+`orchestrator/agents/invoke.py::_estimate_cost` prices both the same way.
+Treating them as one would re-encode that function's private resolution of
+None in a second place. The worst case is a false miss, which costs a rerun.
+A false hit cannot happen. Because the key is a content digest, an edit to the
+packaged price seeds also invalidates every priced entry stored under the old
+table.
+
+**Backfill (INV-13).** Panel entries written before this task carry no
+`run_key` and sit at the bare `<variant>__<diff>.json`. One is honoured as a
+cache hit for any key whose own file is absent, and it is not migrated. This
+mirrors the task-6736 rule for score files above. Each hit is logged at INFO
+naming the file, and `run_trial` logs one WARNING per call counting the legacy
+panels it reused and naming the directory. The packaged results directory and
+finished campaign directories hold such entries, and treating them as misses
+would re-spend every one of them. To re-measure one, delete it or rerun into a
+fresh `--results-dir`.
+
+**One score loop.** `run_and_score` runs `run_trial`'s panels and then scores
+each one through `scorer.py::score_panel_run`, under the same usage gate as
+the panels. It is the run-and-score loop of every reviewer-trial subcommand
+(`calibrate`, `corpus-sanity`, `full`, `sweep`, `refresh` and `campaign`). Its
+optional `score_dir` is the campaign score cache. A score is stored under
+the same file name as the panel it scored, so it is keyed by that panel's key,
+and a legacy panel's score keeps the bare name. A stored score is reused, an
+unreadable one is re-scored and overwritten, and an unmeasured score is never
+stored, so a rerun measures that cell again.
+
+**Resuming a campaign.** Each trial directory's panels and scores are keyed by
+the invocation that wrote them. Resumed with the options it was started with,
+a campaign only reduces what is on disk. Resumed with a different
+`--pool`/`--no-pool` or `--diff-cap`, it runs and scores new panels beside the
+old ones, and the report reads only the new ones. A campaign whose panels
+predate the key only reduces, whatever options it is resumed with, because a
+legacy panel is reused under every key (see Backfill above).
+
 ### Terminal outcome (`terminal_kind`, task 4760)
 
 The three counts above all describe the *quality* axis. This one describes what
@@ -1201,7 +1259,7 @@ way and neither reading is destroyed. `declined - no_plan_declined` recovers tha
 population exactly.
 
 **planRate is DELIBERATELY unchanged.** `produced_a_plan` is still
-`plan_steps > 0`, `_plan_rate` still reduces the same two numbers, and
+`plan_steps > 0`, `cell_admission.plan_rate` still reduces the same two numbers, and
 `is_scorable_plan` / `score_plan_structure` / `cap_tainted` are untouched — so
 every campaign artifact already committed stays comparable. The split is
 reported ALONGSIDE it, by
@@ -1440,12 +1498,14 @@ candidate under test.
    and account state it never asked for.
 2. The constructor raised.
 3. The gate constructed but resolved zero accounts. `_init_accounts` logs "No
-   accounts configured and no default credential found" and returns `[]`, so
+   configured account resolved a token, and the ~/.claude default-credential
+   fallback is disabled" and returns `[]` (the fallback is an explicit opt-in
+   since task 8161), so
    construction succeeds and the failure is deferred to the first
    `before_invoke`, which raises `RuntimeError('No OAuth accounts available
    ...')`. That lands in the caller's harness-error handler, so the cell is
    tainted and excluded. With `usage_cap.enabled=True` but no `CLAUDE_OAUTH_*`
-   exported and no `~/.claude/.credentials.json` (an ordinary CI shell), every
+   exported (an ordinary CI shell), every
    architect cell would be lost, where the same campaign ran fine ungated on
    ambient credentials before φ. An empty pool has nothing to fail over to, so
    degrading forfeits nothing. The discarded gate is still shut down

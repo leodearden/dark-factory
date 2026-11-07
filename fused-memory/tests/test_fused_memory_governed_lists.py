@@ -11,7 +11,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import fm_timeout_marker_grandfathered
 from _fm_helpers import load_script_module
 from shared.governed_exceptions import Debt, Policy, TaskRef, governed_exceptions
 
@@ -49,15 +48,6 @@ WALL_CLOCK_DEADLINE_BASELINE = governed_exceptions(
     ['fused-memory/scripts/check_bare_magicmock_config.py::_WALL_CLOCK_DEADLINE_DEBT'],
     default=Debt(TaskRef(6201)),
     default_covers=1,
-)
-
-FUSED_MEMORY_TIMEOUT_MARKER_GRANDFATHERED = governed_exceptions(
-    'fused_memory_tests.fm_timeout_marker_grandfathered.INVERSION_BAND_GRANDFATHERED',
-    'An in-band timeout-marker site in fused-memory/tests that predates the timeout-marker '
-    'inversion guard, exempt from it until migrated; entries may only be removed.',
-    sorted('::'.join(site) for site in fm_timeout_marker_grandfathered.INVERSION_BAND_GRANDFATHERED),
-    default=Debt(TaskRef(6337)),
-    default_covers=20,
 )
 
 CANCELLED_PREMISE_BLOCKLIST = governed_exceptions(

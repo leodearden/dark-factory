@@ -293,8 +293,13 @@ async def mcp_tool_call(
     covered too, notably ``task_runtime.py::_probe_one``, whose own ``wait_for``
     cancels this call and which previously did not invalidate at all.
 
-    The guard catches ONLY the two hang-shaped exits (``asyncio.CancelledError``
-    and the builtin ``TimeoutError``) and always re-raises. It deliberately does
+    The guard catches ONLY the three hang-shaped exits and always re-raises:
+    ``asyncio.CancelledError``, the builtin ``TimeoutError``, and
+    ``httpx.TimeoutException`` — a per-request budget expiring. An equal outer
+    ``wait_for`` used to convert that expiry into a cancellation; one sized by
+    ``enclosing_deadline`` lets it arrive as itself, and evicting on it keeps
+    the task-4958 guarantee for ``task_runtime.py::_probe_one`` and the other
+    escalation-URL probes. It deliberately does
     not catch ``httpx.HTTPStatusError`` / ``ValueError``: teardown policy for
     those already belongs to the callers (``first_success``,
     ``get_queue_stats``, ``get_wal_status`` each invalidate themselves), and a
@@ -304,7 +309,7 @@ async def mcp_tool_call(
     session = _get_session(base_url)
     try:
         return await session.call_tool(client, tool_name, arguments, timeout=timeout)
-    except (asyncio.CancelledError, TimeoutError):
+    except (asyncio.CancelledError, TimeoutError, httpx.TimeoutException):
         invalidate_session(base_url)
         raise
 
@@ -321,7 +326,8 @@ def enclosing_deadline(per_request_timeout: float) -> float:
     that exception is then absorbed unseen by ``_settle`` and the caller sees
     only a bare ``TimeoutError``. A saturated pool fails the FIRST post's
     acquisition, so one budget plus headroom is enough for that failure to
-    reach ``mcp_fanout.py::first_success`` and be named by ``describe_exc``.
+    reach the caller's OWN except clause (``mcp_fanout.py::first_success``, or
+    a probe's) so ``mcp_fanout.py::describe_exc`` can name it.
     """
     return per_request_timeout + _ENCLOSING_DEADLINE_HEADROOM_SECONDS
 

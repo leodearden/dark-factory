@@ -19,6 +19,7 @@ class EventType(StrEnum):
     task_modified = 'task_modified'
     task_deleted = 'task_deleted'
     deferral_restamped = 'deferral_restamped'
+    task_text_amended = 'task_text_amended'
 
 
 class EventSource(StrEnum):

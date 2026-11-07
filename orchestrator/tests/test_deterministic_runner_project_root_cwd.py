@@ -18,11 +18,8 @@ import pytest
 from escalation.queue import EscalationQueue
 from shared.repo_paths import DARK_FACTORY_ROOT_ENV
 
-from orchestrator.deterministic_runner import (
-    DeterministicRunner,
-    ProcessTeardown,
-    ScriptTimeout,
-)
+from orchestrator.before_done_script import ProcessTeardown, ScriptTimeout
+from orchestrator.deterministic_runner import DeterministicRunner
 from orchestrator.proc_supervision import RestartDisposition, RestartOutcome, RestartPlan
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.workflow import WorkflowOutcome

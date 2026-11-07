@@ -24,7 +24,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal
 
-from _task_db_scan import TaskDbUnreadable, connect_ro, tasks_db_path
+from _task_db_scan import tasks_db_path
 from orchestrator.session_registry import (
     OWNING_OUTCOMES,
     RESULT_FILENAME,
@@ -36,6 +36,7 @@ from orchestrator.session_registry import (
 from shared.project_id import fold_project_token
 from shared.task_deferral import CarriedByDeferral, InvalidRecord, parse_record
 from shared.task_statuses import TaskStatus
+from shared.tasks_db_readonly import TaskDbUnreadable, connect_ro
 from sitting.inventory import ItemKey, OpenItem, Shortfall, cited_ids, parse_stamp
 
 ProbeStatus = Literal['owns', 'mentions', 'empty', 'unavailable']

@@ -121,7 +121,7 @@ Design notes
   ``scripts/setup-host.sh`` does; duplicating it here would be a fourth copy of
   the install logic.  Drift is reported with a remediation pointer instead.
 - Two consumers branch on the 0/1/2 exit codes: ``setup-host.sh``, and
-  ``scripts/orchestrator-watchdog.py::unit_parity_pass``, which runs this
+  ``scripts/_watchdog_dashboard_parity.py::unit_parity_pass``, which runs this
   checker read-only, at most hourly, on the watchdog's timer tick.  Changing
   the codes changes both.
 

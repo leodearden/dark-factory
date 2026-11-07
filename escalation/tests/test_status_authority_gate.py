@@ -548,10 +548,21 @@ class TestAuthorityTablesMatchDrivenIdentities:
             'C2/C3 drive this exact identity expecting an {0,1} ceiling'
         )
 
-    def test_promote_allowed_contains_only_the_watcher_auto_identity(self) -> None:
-        assert frozenset({'orchestrator-escalation-watcher-auto'}) == PROMOTE_ALLOWED, (
-            "C4's disallowed-identity case ('some-other-agent') relies on "
-            'PROMOTE_ALLOWED containing exactly this identity and no other'
+    def test_promote_allowed_is_exactly_the_three_promoting_identities(self) -> None:
+        assert frozenset({
+            'orchestrator-escalation-watcher-auto',
+            'orchestrator-escalation-executor',
+            'interactive:coordinator',
+        }) == PROMOTE_ALLOWED, (
+            'PROMOTE_ALLOWED is exactly the auto-watcher, the executor '
+            '(plans/decision-stream-prd.md §3 decision 3: "promote allowed") '
+            'and the coordinator (decision 3: "full levels, denied only on a '
+            'record carrying a fresh executor claim", which an identified '
+            'caller refused promote_to_l2 would contradict); any other change '
+            'to who may mint an L2 needs re-examination here'
+        )
+        assert 'some-other-agent' not in PROMOTE_ALLOWED, (
+            "C4's disallowed-identity case drives 'some-other-agent' expecting denial"
         )
 
 

@@ -26,8 +26,8 @@ skip status never affects `-m` selection: a skipif-marked test is still
 collected, and only the marker governs deselection. So the assertions hold
 whether or not a backend is reachable, and the guard needs no running service;
 the up-to-~2s-per-module probe (worst case, backend unreachable — the very
-oversubscribed-box scenario this task targets) is why each carries generous
-@pytest.mark.timeout(120) headroom.
+oversubscribed-box scenario this task targets) fits inside the ambient
+per-test budget.
 
 This is a NEW module rather than an extension of
 test_integration_marker_config.py: sibling task 3019 edits that file, and 3020
@@ -46,8 +46,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-import pytest
-
 TESTS_DIR = Path(__file__).resolve().parent
 FUSED_MEMORY_DIR = TESTS_DIR.parent
 FUSED_MEMORY_PYPROJECT = FUSED_MEMORY_DIR / 'pyproject.toml'
@@ -65,8 +63,7 @@ def _collect(module_path: Path, *extra_args: str) -> str:
 
     Collecting these real modules evaluates each live target's skip predicate
     (qdrant_skipif() / _falkor_available()), which attempts a bounded ~2s
-    connection probe to the backend — so the caller gets generous timeout
-    headroom via @pytest.mark.timeout(120) over each file's own default budget.
+    connection probe to the backend.
     """
     result = subprocess.run(
         [
@@ -91,7 +88,6 @@ def _collect(module_path: Path, *extra_args: str) -> str:
     return result.stdout + result.stderr
 
 
-@pytest.mark.timeout(120)
 def test_mem0_client_qdrant_probe_gated() -> None:
     """The real-Qdrant round-trip class must be gated; its mock siblings must not be.
 
@@ -122,7 +118,6 @@ def test_mem0_client_qdrant_probe_gated() -> None:
     )
 
 
-@pytest.mark.timeout(120)
 def test_list_indices_integration_module_gated() -> None:
     """The whole live-FalkorDB module must be deselected by default, selectable via marker.
 
@@ -166,7 +161,6 @@ def test_list_indices_integration_module_gated() -> None:
         )
 
 
-@pytest.mark.timeout(120)
 def test_startup_identity_scan_live_classes_gated() -> None:
     """Both live-FalkorDB scan classes gated; the fast mock scan class stays collected.
 
@@ -205,7 +199,6 @@ def test_startup_identity_scan_live_classes_gated() -> None:
         )
 
 
-@pytest.mark.timeout(120)
 def test_merge_entities_live_class_gated() -> None:
     """The live-FalkorDB redirect class gated; the module's mock tests stay collected.
 
@@ -238,7 +231,6 @@ def test_merge_entities_live_class_gated() -> None:
     )
 
 
-@pytest.mark.timeout(120)
 def test_refresh_entity_summary_live_class_gated() -> None:
     """The live-FalkorDB edge-dedup class gated; the module's mock tests stay collected.
 

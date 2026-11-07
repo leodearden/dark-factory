@@ -13,11 +13,13 @@ import dataclasses
 import re
 import shutil
 import subprocess
-import sys
+from collections.abc import Iterable
 from pathlib import Path, PurePosixPath
+from typing import NamedTuple
 
 import pytest
 from _fm_helpers import load_script_module
+from shared.testing_xdist_groups import single_xdist_group
 
 # Load the checker script via importlib to avoid sys.path pollution.
 # fused-memory/scripts/ is not on PYTHONPATH per pyproject.toml (pythonpath=['src']).
@@ -27,6 +29,7 @@ SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'check_bare_magicmock_c
 _checker = load_script_module(SCRIPT_PATH, mod_name='check_bare_magicmock_config')
 find_violations = _checker.find_violations
 _lint_cli = load_script_module(SCRIPT_PATH.with_name('_lint_cli.py'))
+Violation = _lint_cli.Violation
 
 
 class TestFindViolationsConfigNameDetection:
@@ -382,8 +385,7 @@ def _assert_violation_output(stdout: str, bad_file: Path) -> None:
     Checks: full bad_file path present, mock_orch_config present,
     MagicMock(spec_set=pydantic_spec(...)) present, task 1339 reference present.
 
-    Shared by TestCliExitCodes (sys.executable) and TestStdlibOnlyProof
-    (python3 -I -S) so both tests track the same output contract.
+    Shared by TestCliExitCodes and TestCliBoundary so both track the same output contract.
     """
     assert str(bad_file) in stdout, f'Expected bad_file path in violation output, got: {stdout!r}'
     assert 'mock_orch_config' in stdout, (
@@ -398,29 +400,21 @@ def _assert_violation_output(stdout: str, bad_file: Path) -> None:
 class TestCliExitCodes:
     """CLI exit-code contract: 1 on violations, 0 on clean input."""
 
-    def test_cli_exits_nonzero_and_prints_violations_on_bad_file(self, tmp_path: Path):
-        """Violations file → returncode 1, stdout contains path/alternatives/1339."""
+    def test_cli_exits_nonzero_and_prints_violations_on_bad_file(self, tmp_path: Path, capsys):
+        """Violations file → exit 1, stdout contains path/alternatives/1339."""
         bad_file = tmp_path / 'test_bad.py'
         bad_file.write_text(_VIOLATION_SOURCE)
-        result = subprocess.run(
-            [sys.executable, str(SCRIPT_PATH), str(bad_file)],
-            capture_output=True,
-            text=True,
-        )
-        assert result.returncode == 1
-        _assert_violation_output(result.stdout, bad_file)
+        exit_code = _checker.main([str(bad_file)])
+        assert exit_code == 1
+        _assert_violation_output(capsys.readouterr().out, bad_file)
 
-    def test_cli_exits_zero_on_clean_file(self, tmp_path: Path):
-        """Clean file (exempted) → returncode 0, stdout empty."""
+    def test_cli_exits_zero_on_clean_file(self, tmp_path: Path, capsys):
+        """Clean file (exempted) → exit 0, stdout empty."""
         clean_file = tmp_path / 'test_clean.py'
         clean_file.write_text(_CLEAN_SOURCE)
-        result = subprocess.run(
-            [sys.executable, str(SCRIPT_PATH), str(clean_file)],
-            capture_output=True,
-            text=True,
-        )
-        assert result.returncode == 0
-        assert result.stdout == ''
+        exit_code = _checker.main([str(clean_file)])
+        assert exit_code == 0
+        assert capsys.readouterr().out == ''
 
 
 class TestCliDirectoryScan:
@@ -429,7 +423,9 @@ class TestCliDirectoryScan:
     Every other .py file is ignored.
     """
 
-    def test_cli_recursively_scans_directory_for_test_files_and_conftest(self, tmp_path: Path):
+    def test_cli_recursively_scans_directory_for_test_files_and_conftest(
+        self, tmp_path: Path, capsys
+    ):
         """Dir scan: test_example.py + conftest.py flagged; other_file.py ignored."""
         subdir = tmp_path / 'sub'
         subdir.mkdir()
@@ -440,19 +436,15 @@ class TestCliDirectoryScan:
         # Should NOT be scanned (not a test_*.py or conftest.py)
         (subdir / 'other_file.py').write_text(_VIOLATION_SOURCE)
 
-        result = subprocess.run(
-            [sys.executable, str(SCRIPT_PATH), str(tmp_path)],
-            capture_output=True,
-            text=True,
-        )
-        assert result.returncode == 1
-        output = result.stdout
+        exit_code = _checker.main([str(tmp_path)])
+        assert exit_code == 1
+        output = capsys.readouterr().out
         assert 'test_example.py' in output
         assert 'conftest.py' in output
         assert 'other_file.py' not in output
 
 
-    def test_cli_scans_underscore_helper_modules(self, tmp_path: Path):
+    def test_cli_scans_underscore_helper_modules(self, tmp_path: Path, capsys):
         """``_*.py`` helpers are scanned, at any depth; other non-test files still are not."""
         (tmp_path / '_helper.py').write_text(_VIOLATION_SOURCE)
         subdir = tmp_path / 'sub'
@@ -460,13 +452,9 @@ class TestCliDirectoryScan:
         (subdir / '_nested_helper.py').write_text(_VIOLATION_SOURCE)
         (tmp_path / 'other_file.py').write_text(_VIOLATION_SOURCE)
 
-        result = subprocess.run(
-            [sys.executable, str(SCRIPT_PATH), str(tmp_path)],
-            capture_output=True,
-            text=True,
-        )
-        assert result.returncode == 1
-        output = result.stdout
+        exit_code = _checker.main([str(tmp_path)])
+        assert exit_code == 1
+        output = capsys.readouterr().out
         assert '_helper.py' in output
         assert '_nested_helper.py' in output
         assert 'other_file.py' not in output
@@ -565,70 +553,58 @@ class TestCliErrorHandling:
         assert str(other) in capsys.readouterr().out
 
 
-class TestStdlibOnlyProof:
-    """Running the script under python3 -I -S proves it imports only stdlib modules.
+class TestCliBoundary:
+    """The checker spawned under ``python3 -I -S``, stricter than any of its call sites.
 
-    ``python3 -I`` alone does NOT block venv site-packages on this machine (python 3.14,
-    uv-managed venv): ``-I`` only disables *user* site-packages (implies ``-s``), not system
-    or venv site-packages.  ``-I -S`` additionally skips site.py, so venv site-packages are
-    never added to sys.path — any accidental third-party import in the script would raise
-    ModuleNotFoundError at interpreter startup, loudly failing this test.
-
-    Three cases are exercised:
-      1. Empty directory: no test_*.py → exit 0, empty stdout (startup isolation).
-      2. Clean file: parse/scan runs → exit 0, empty stdout (scan path isolation).
-      3. Violation file: exit 1, stdout has violation + alternatives + 1339 (print path).
+    hooks/project-checks and every lint_command run a bare ``python3 <script> <paths>``.
+    ``-I -S`` also drops the script's directory and site-packages from sys.path and ignores
+    PYTHON* env vars, so passing here implies passing there. The converse does not hold: a
+    failure that depends on the caller's environment, such as PYTHONPATH, does not reproduce here.
     """
 
-    def test_script_runs_under_isolated_python3_proves_stdlib_only(self, tmp_path: Path):
-        """python3 -I -S three-case stdlib-only proof."""
+    def test_isolated_python3_spawn_is_stdlib_only_and_reports_every_rule(self, tmp_path: Path):
+        """The single test that crosses the process boundary the nine call sites cross.
+
+        ``-I -S`` keeps venv site-packages off sys.path, so a third-party import anywhere in
+        any rule's path fails startup. A startup crash also exits 1, but with empty stdout, so
+        the stdout assertions are what make rc == 1 meaningful. Every other CLI behaviour is
+        driven in process through main().
+        """
         if shutil.which('python3') is None:
             pytest.skip('python3 not found on PATH — cannot verify hook runtime assumption')
 
-        # --- Case 1: empty directory (startup + import isolation) ---
+        rule_a_file = tmp_path / 'test_rule_a.py'
+        rule_a_file.write_text(_VIOLATION_SOURCE)
+        rule_b_file = tmp_path / 'test_rule_b.py'
+        rule_b_file.write_text(_TASK_3980_SHAPE)
+        rule_c_file = tmp_path / 'test_rule_c.py'
+        rule_c_file.write_text(_RULE_C_SOURCE)
+        (tmp_path / 'test_clean.py').write_text(_CLEAN_SOURCE)
+
         result = subprocess.run(
             ['python3', '-I', '-S', str(SCRIPT_PATH), str(tmp_path)],
             capture_output=True,
             text=True,
         )
-        assert result.returncode == 0, (
-            f'Script exited non-zero under python3 -I -S:\n'
+
+        assert result.returncode == 1, (
+            f'expected exit 1 under python3 -I -S, got {result.returncode}:\n'
             f'  stdout: {result.stdout!r}\n'
             f'  stderr: {result.stderr!r}'
         )
-        assert result.stdout == '', (
-            f'Expected empty stdout (no scan targets in empty dir), got: {result.stdout!r}'
+        assert 'Traceback' not in result.stderr, result.stderr
+        _assert_violation_output(result.stdout, rule_a_file)
+        reported = result.stdout.splitlines()
+        rule_b_report = [line for line in reported if line.startswith(f'{rule_b_file}:')]
+        rule_c_report = [line for line in reported if line.startswith(f'{rule_c_file}:')]
+        for needle in ('bare-dataclass-double', 'VerifyResult', 'fake_verify_result', 'verify_skipped'):
+            assert any(needle in line for line in rule_b_report), (
+                f'expected {needle!r} on a {rule_b_file.name} line; got: {result.stdout!r}'
+            )
+        assert any('wall-clock-deadline' in line for line in rule_c_report), (
+            f'expected a wall-clock-deadline report for {rule_c_file.name}; got: {result.stdout!r}'
         )
-
-        # --- Case 2: clean file (parse/scan path isolation) ---
-        clean_file = tmp_path / 'test_clean.py'
-        clean_file.write_text(_CLEAN_SOURCE)
-        result2 = subprocess.run(
-            ['python3', '-I', '-S', str(SCRIPT_PATH), str(tmp_path)],
-            capture_output=True,
-            text=True,
-        )
-        assert result2.returncode == 0, (
-            f'Script exited non-zero (clean scan) under python3 -I -S:\n'
-            f'  stdout: {result2.stdout!r}\n'
-            f'  stderr: {result2.stderr!r}'
-        )
-        assert result2.stdout == '', f'Expected empty stdout (clean file), got: {result2.stdout!r}'
-
-        # --- Case 3: violation file (print-violations branch isolation) ---
-        bad_file = tmp_path / 'test_bad.py'
-        bad_file.write_text(_VIOLATION_SOURCE)
-        result3 = subprocess.run(
-            ['python3', '-I', '-S', str(SCRIPT_PATH), str(bad_file)],
-            capture_output=True,
-            text=True,
-        )
-        assert result3.returncode == 1, (
-            f'Script should exit 1 under python3 -I -S, got {result3.returncode}:\n'
-            f'  stdout: {result3.stdout!r}\n'
-            f'  stderr: {result3.stderr!r}'
-        )
-        _assert_violation_output(result3.stdout, bad_file)
+        assert 'test_clean.py' not in result.stdout
 
 
 class TestHooksIntegration:
@@ -1098,40 +1074,6 @@ class TestDataclassDoubleMessage:
             f'the message must instruct the Rule B noqa code verbatim; got {message!r}'
         )
 
-    def test_rule_b_path_runs_under_isolated_python3_stdlib_only(self, tmp_path: Path):
-        """The registry, walk and message builder add no third-party import.
-
-        Reuses TestStdlibOnlyProof's harness: under ``python3 -I -S`` no venv
-        site-packages are on sys.path, so any accidental third-party import in the
-        Rule B path would raise ModuleNotFoundError at startup instead of reporting.
-        """
-        if shutil.which('python3') is None:
-            pytest.skip('python3 not found on PATH — cannot verify hook runtime assumption')
-
-        bad_file = tmp_path / 'test_bad_double.py'
-        bad_file.write_text(_TASK_3980_SHAPE)
-        result = subprocess.run(
-            ['python3', '-I', '-S', str(SCRIPT_PATH), str(bad_file)],
-            capture_output=True,
-            text=True,
-        )
-        assert result.returncode == 1, (
-            f'Rule B should exit 1 under python3 -I -S, got {result.returncode}:\n'
-            f'  stdout: {result.stdout!r}\n'
-            f'  stderr: {result.stderr!r}'
-        )
-        for needle in (
-            str(bad_file),
-            'VerifyResult',
-            'fake_verify_result',
-            'verify_skipped',
-            'bare-dataclass-double',
-        ):
-            assert needle in result.stdout, (
-                f'Expected {needle!r} in Rule B stdout under python3 -I -S, '
-                f'got: {result.stdout!r}'
-            )
-
 
 _RULE_B_SOURCE = "bare = MagicMock(passed=False, summary='x')\n"
 _RULE_A_SOURCE = 'config = MagicMock()\n'
@@ -1287,36 +1229,12 @@ class TestRuleBIsUnconditional:
         )
 
 
-class TestFusedMemoryTestsDirectoryClean:
-    """Regression guard: fused-memory/tests must have zero bare MagicMock() config sites.
-
-    Task 1531 migrated all 26 violation sites in fused-memory/tests off bare
-    MagicMock() and onto MagicMock(spec_set=pydantic_spec(FusedMemoryConfig)).
-    This test re-runs the hook script against the real fused-memory/tests
-    directory so that any future reintroduction is caught at pytest time (not
-    only at commit time, since the hook is repo-wide and operators may skip it
-    locally).
-    """
-
-    def test_fused_memory_tests_directory_has_zero_violations(self):
-        """Running the checker against fused-memory/tests must exit 0 with empty stdout."""
-        tests_dir = Path(__file__).parent
-        result = subprocess.run(
-            [sys.executable, str(SCRIPT_PATH), str(tests_dir)],
-            capture_output=True,
-            text=True,
-        )
-        assert result.returncode == 0, (
-            f'check_bare_magicmock_config found violations in fused-memory/tests '
-            f'(task 1531 regression). Fix by wrapping each bare MagicMock() config '
-            f'with MagicMock(spec_set=pydantic_spec(FusedMemoryConfig)).\n'
-            f'Violations:\n{result.stdout}'
-        )
-
-
 # Each repo-wide scan sweeps all seven packages' tests/; 61.52s x 8 = 492.16, rounded up to a
 # whole minute. Family rationale: orchestrator/tests/_orch_helpers.py::WHOLE_TREE_SCAN_TEST_TIMEOUT.
 MAGICMOCK_REPO_SCAN_TEST_TIMEOUT = 540
+
+# Both scan classes run on one loadgroup worker, so `repo_test_scan` is built once per run.
+_REPO_SCAN_GROUP_NAME = 'bare_magicmock_repo_scan'
 
 # Worst root-bound wall clock of these scans under real load, task 5442; corpus is plans/pytest-per-test-timeout-measurement-2026-09-17.md.
 _REPO_SCAN_MEASURED_UNDER_LOAD_WORST_CASE = 61.52
@@ -1362,6 +1280,72 @@ def test_only_the_repo_wide_scans_run_under_their_own_ceiling(request):
     )
 
 
+def test_the_repo_wide_scans_share_one_xdist_worker(request):
+    scan_classes = (TestAllScannedTestDirsClean, TestWallClockDeadlineBaselineIntegrity)
+    scan_items = [item for item in request.session.items if getattr(item, 'cls', None) in scan_classes]
+    if not scan_items:
+        pytest.skip('no repo-wide scan item is selected in this session')
+
+    assert single_xdist_group(scan_items) == _REPO_SCAN_GROUP_NAME
+
+
+class _ScannedTestFile(NamedTuple):
+    """What the two repo-wide scans need from one scanned file; its tree is not kept."""
+
+    path: Path
+    relpath: str
+    gate_violations: tuple[Violation, ...]
+    rule_c_count: int
+    syntax_error: SyntaxError | None
+
+
+def _rule_c_count(tree: ast.Module, lines: list[str], entry: str) -> int:
+    """Count *tree*'s Rule C violations with the checker's own predicate, before any debt budget."""
+    return sum(
+        len(_checker._wall_clock_deadline_violations(node, lines, entry))
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+    )
+
+
+def _scan_test_file(path: Path, relpath: str) -> _ScannedTestFile:
+    source = path.read_text(encoding='utf-8')
+    try:
+        tree = ast.parse(source, filename=str(path))
+    except SyntaxError as exc:
+        return _ScannedTestFile(path, relpath, gate_violations=(), rule_c_count=0, syntax_error=exc)
+    return _ScannedTestFile(
+        path,
+        relpath,
+        gate_violations=tuple(_checker.find_violations_in_tree(tree, source, str(path))),
+        rule_c_count=_rule_c_count(tree, source.splitlines(), relpath),
+        syntax_error=None,
+    )
+
+
+def _scan_repo_test_dirs(
+    repo_root: Path, scanned_dirs: Iterable[str]
+) -> tuple[_ScannedTestFile, ...]:
+    """Parse every file the lint call sites scan ONCE, for both the gate and the Rule C census.
+
+    The file set, the strict utf-8 read and the filename are run_cli's, so the gate
+    sees what the CLI would. Facts, not trees: every ast.Module of seven packages'
+    tests, retained, would cost on the order of a GB of RSS on the scanning worker.
+    """
+    return tuple(
+        _scan_test_file(path, path.relative_to(repo_root).as_posix())
+        for scanned_dir in scanned_dirs
+        if (repo_root / scanned_dir).is_dir()
+        for path in _checker.discover_scan_targets(repo_root / scanned_dir)
+    )
+
+
+@pytest.fixture(scope='module')
+def repo_test_scan() -> tuple[_ScannedTestFile, ...]:
+    return _scan_repo_test_dirs(_REPO_ROOT, TestAllScannedTestDirsClean._SCANNED_DIRS)
+
+
+@pytest.mark.xdist_group(_REPO_SCAN_GROUP_NAME)
 @pytest.mark.timeout(MAGICMOCK_REPO_SCAN_TEST_TIMEOUT)
 class TestAllScannedTestDirsClean:
     """Non-regression gate for all nine call sites: every scanned tests/ dir stays clean.
@@ -1376,6 +1360,10 @@ class TestAllScannedTestDirsClean:
     counterpart to TestRuleBIsUnconditional and TestWallClockDeadlineDebtBaseline:
     those classes pin what may and may not be grandfathered, this one pins that
     nothing else was missed.
+
+    It runs the checker in-process over the shared ``repo_test_scan``. The process
+    boundary is TestCliBoundary's; the CLI's in-process behaviour is TestCliExitCodes',
+    TestCliDirectoryScan's and TestCliErrorHandling's.
     """
 
     _SCANNED_DIRS = (
@@ -1388,19 +1376,18 @@ class TestAllScannedTestDirsClean:
         'cockpit/tests',
     )
 
-    def test_every_scanned_tests_directory_exits_zero(self):
-        """The checker exits 0 over every directory the nine call sites scan."""
+    def test_every_scanned_tests_directory_exits_zero(self, repo_test_scan):
+        """The checker reports no violation over every directory the nine call sites scan."""
         present = [d for d in self._SCANNED_DIRS if (_REPO_ROOT / d).is_dir()]
         assert present, (
             f'No scanned tests/ directory found under {_REPO_ROOT} — the repo-root '
             'reach (Path(__file__).parent.parent.parent) is probably wrong'
         )
-        result = subprocess.run(
-            [sys.executable, str(SCRIPT_PATH), *(str(_REPO_ROOT / d) for d in present)],
-            capture_output=True,
-            text=True,
+        violations = sorted(
+            (v for record in repo_test_scan for v in record.gate_violations),
+            key=lambda v: (v.filename, v.lineno, v.col_offset),
         )
-        assert result.returncode == 0, (
+        assert violations == [], (
             'check_bare_magicmock_config found violations in the directories scanned '
             'by the nine configured call sites (seven package orchestrator.yaml '
             'lint_commands, dark-factory-orchestrator.yaml, hooks/project-checks). '
@@ -1411,8 +1398,8 @@ class TestAllScannedTestDirsClean:
             '  wall-clock-deadline   → wait_responsive(...) with a label= / bound derived from MERGE_RESULT_TIMEOUT,\n'
             '                          or, for a debt-baseline slack report, lower the named budget\n'
             f'Scanned: {present}\n'
-            f'Violations:\n{result.stdout}\n'
-            f'stderr:\n{result.stderr}'
+            'Violations:\n'
+            + ''.join(f'{v.filename}:{v.lineno}:{v.col_offset}: {v.message}\n' for v in violations)
         )
 
 
@@ -1448,7 +1435,7 @@ class TestWallClockLoadBearingTarget:
     ``asyncio.wait(aws)`` and ``threading.Event.wait(timeout)`` out.
 
     The Name negative is the load-bearing one: it is what keeps the
-    ``_stop_worker`` teardown join — ``asyncio.wait_for(worker_task, ...)``,
+    ``stop_merge_worker`` teardown join — ``asyncio.wait_for(worker_task, ...)``,
     inside ``contextlib.suppress``, asserting nothing — exempt STRUCTURALLY by
     its Name-vs-Attribute/Call shape rather than by a hand-maintained name list.
     """
@@ -1483,7 +1470,7 @@ class TestWallClockLoadBearingTarget:
     def test_bare_name_target_is_not_load_bearing(self):
         """``worker_task`` → None.
 
-        THE load-bearing negative. ``_stop_worker``'s teardown join targets a
+        THE load-bearing negative. ``stop_merge_worker``'s teardown join targets a
         bare Name; that shape — not a name list — is what exempts it, which is
         what lets the rule scan every scope in every scanned file.
         """
@@ -1590,7 +1577,7 @@ class TestWallClockDeadlineDetection:
         assert all(v.lineno == 3 for v in violations), violations
 
     def test_a_name_targeted_teardown_join_is_clean(self):
-        """``_stop_worker``'s join stays exempt by its Name target, not by a list.
+        """``stop_merge_worker``'s join stays exempt by its Name target, not by a list.
 
         The rule scans every scope in every scanned file, so a module-level
         teardown helper is squarely in range.  It must stay silent anyway.
@@ -2380,7 +2367,7 @@ class TestWallClockDeadlineDebtSlack:
         )
 
     def test_a_removal_reds_the_owning_packages_own_lint_command_naming_the_edit(
-        self, tmp_path: Path
+        self, tmp_path: Path, capsys
     ):
         """DONE-WHEN (task 6202): the red lands in the author's own package lint.
 
@@ -2391,25 +2378,26 @@ class TestWallClockDeadlineDebtSlack:
         entry, budget = self._live_entry_of_at_least_2()
         debt_file = tmp_path / entry
         debt_file.parent.mkdir(parents=True)
-        package_tests_dir = tmp_path.joinpath(*PurePosixPath(entry).parts[:2])
-        command = [sys.executable, str(SCRIPT_PATH), str(package_tests_dir)]
+        argv = [str(tmp_path.joinpath(*PurePosixPath(entry).parts[:2]))]
 
         debt_file.write_text(_RULE_C_ONE_HIT * (budget - 1))
-        removed = subprocess.run(command, capture_output=True, text=True)
-        assert removed.returncode == 1, (
+        removed_exit = _checker.main(argv)
+        removed = capsys.readouterr()
+        assert removed_exit == 1, (
             f'a removal without the budget edit must red the package lint; '
-            f'stdout={removed.stdout!r} stderr={removed.stderr!r}'
+            f'stdout={removed.out!r} stderr={removed.err!r}'
         )
         edit = f"_WALL_CLOCK_DEADLINE_DEBT['{entry}'] from {budget} to {budget - 1}"
-        assert edit in removed.stdout, (
-            f'the package lint must name the edit {edit!r}; got {removed.stdout!r}'
+        assert edit in removed.out, (
+            f'the package lint must name the edit {edit!r}; got {removed.out!r}'
         )
 
         debt_file.write_text(_RULE_C_ONE_HIT * budget)
-        exact = subprocess.run(command, capture_output=True, text=True)
-        assert exact.returncode == 0, (
+        exact_exit = _checker.main(argv)
+        exact = capsys.readouterr()
+        assert exact_exit == 0, (
             f'a debt file at exactly its budget must leave the package lint green; '
-            f'stdout={exact.stdout!r} stderr={exact.stderr!r}'
+            f'stdout={exact.out!r} stderr={exact.err!r}'
         )
 
 
@@ -2432,6 +2420,7 @@ class TestDebtBaselineIsolation:
         assert 'mock_orch_config' in violations[0].message
 
 
+@pytest.mark.xdist_group(_REPO_SCAN_GROUP_NAME)
 @pytest.mark.timeout(MAGICMOCK_REPO_SCAN_TEST_TIMEOUT)
 class TestWallClockDeadlineBaselineIntegrity:
     """The Rule C baseline names exactly the real files that carry Rule C debt.
@@ -2450,16 +2439,6 @@ class TestWallClockDeadlineBaselineIntegrity:
     is why the existence test stays.
     """
 
-    def _live_count(self, path: Path, entry: str) -> int:
-        """Recount *path*'s Rule C violations with the checker's own predicates."""
-        source = path.read_text(encoding='utf-8')
-        lines = source.splitlines()
-        return sum(
-            len(_checker._wall_clock_deadline_violations(node, lines, entry))
-            for node in ast.walk(ast.parse(source, filename=str(path)))
-            if isinstance(node, ast.Call)
-        )
-
     def test_every_debt_entry_resolves_to_an_existing_file(self):
         """A deleted or renamed file must not leave a stale blanket suppression behind."""
         missing = [
@@ -2473,7 +2452,7 @@ class TestWallClockDeadlineBaselineIntegrity:
             'and would grandfather a NEW file created at that path. Remove them.'
         )
 
-    def test_no_scanned_file_outside_the_baseline_carries_a_violation(self):
+    def test_no_scanned_file_outside_the_baseline_carries_a_violation(self, repo_test_scan):
         """The baseline is complete: every offending file in the seven scanned dirs is listed.
 
         The complement of test_every_debt_entry_resolves_to_an_existing_file — that one
@@ -2483,21 +2462,115 @@ class TestWallClockDeadlineBaselineIntegrity:
         """
         listed = set(_checker._WALL_CLOCK_DEADLINE_DEBT)
         unlisted = []
-        for scanned in TestAllScannedTestDirsClean._SCANNED_DIRS:
-            root = _REPO_ROOT / scanned
-            if not root.is_dir():
+        for record in repo_test_scan:
+            if record.relpath in listed:
                 continue
-            for path in _checker.discover_scan_targets(root):
-                entry = str(path.relative_to(_REPO_ROOT))
-                if entry in listed:
-                    continue
-                count = self._live_count(path, entry)
-                if count:
-                    unlisted.append(f'{entry}: {count}')
+            if record.syntax_error is not None:
+                raise record.syntax_error
+            if record.rule_c_count:
+                unlisted.append(f'{record.relpath}: {record.rule_c_count}')
         assert unlisted == [], (
             'These scanned files carry Rule C violations but are NOT on the baseline, '
             'so their package lint_command is RED:\n  ' + '\n  '.join(unlisted)
         )
+
+
+def _assert_the_tree_seam_agrees(source: str, filename: str) -> list:
+    expected = find_violations(source, filename)
+    tree = ast.parse(source, filename=filename)
+    assert _checker.find_violations_in_tree(tree, source, filename) == expected
+    return expected
+
+
+class TestFindViolationsInTree:
+    """The tree-taking seam is find_violations after its parse, for every rule."""
+
+    @pytest.mark.parametrize(
+        'source',
+        [
+            pytest.param(_RULE_A_SOURCE, id='rule-a'),
+            pytest.param(
+                '# noqa: bare-magicmock — exempted for the seam test\n' + _RULE_A_SOURCE,
+                id='rule-a-exempted',
+            ),
+            pytest.param(_RULE_B_SOURCE, id='rule-b'),
+            pytest.param(_RULE_C_SOURCE, id='rule-c'),
+        ],
+    )
+    def test_agrees_with_find_violations_on_each_rule(self, source: str):
+        _assert_the_tree_seam_agrees(source, _NON_DEBT_FILE)
+
+    @pytest.mark.parametrize('offset', [-1, 0, 1], ids=['below', 'at', 'above'])
+    def test_agrees_with_find_violations_on_the_debt_budget(self, offset: int):
+        entry, budget = _live_rule_c_debt_entry()
+
+        _assert_the_tree_seam_agrees(_RULE_C_ONE_HIT * (budget + offset), entry)
+
+    def test_agrees_with_find_violations_on_a_source_carrying_all_three(self):
+        source = _RULE_A_SOURCE + _RULE_B_SOURCE + _RULE_C_SOURCE
+
+        violations = _assert_the_tree_seam_agrees(source, _NON_DEBT_FILE)
+
+        assert [v.lineno for v in violations] == [1, 2, 3, 3]
+
+
+class TestScanRepoTestDirs:
+    """One parse per scanned file yields both the gate's violations and Rule C's count."""
+
+    _DIRS = ('pkg_a/tests', 'pkg_b/tests', 'absent/tests')
+
+    @pytest.fixture
+    def fake_repo(self, tmp_path: Path) -> Path:
+        files = {
+            'pkg_a/tests/test_bad.py': _RULE_A_SOURCE,
+            'pkg_a/tests/conftest.py': 'import pytest\n',
+            'pkg_a/tests/_helper.py': _RULE_C_ONE_HIT,
+            'pkg_a/tests/notes.py': _RULE_A_SOURCE,
+            'pkg_b/tests/sub/test_broken.py': 'def broken(:\n',
+        }
+        for rel, source in files.items():
+            path = tmp_path / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(source, encoding='utf-8')
+        return tmp_path
+
+    def test_scans_exactly_the_discovered_files_of_each_present_dir(self, fake_repo: Path):
+        scanned = _scan_repo_test_dirs(fake_repo, self._DIRS)
+
+        assert [record.path for record in scanned] == [
+            *_checker.discover_scan_targets(fake_repo / 'pkg_a/tests'),
+            *_checker.discover_scan_targets(fake_repo / 'pkg_b/tests'),
+        ]
+        assert [record.relpath for record in scanned] == [
+            'pkg_a/tests/_helper.py',
+            'pkg_a/tests/conftest.py',
+            'pkg_a/tests/test_bad.py',
+            'pkg_b/tests/sub/test_broken.py',
+        ]
+
+    def test_gate_violations_carry_the_filename_the_cli_passes(self, fake_repo: Path):
+        by_relpath = {r.relpath: r for r in _scan_repo_test_dirs(fake_repo, self._DIRS)}
+        bad = fake_repo / 'pkg_a/tests/test_bad.py'
+
+        assert by_relpath['pkg_a/tests/test_bad.py'].gate_violations == tuple(
+            find_violations(_RULE_A_SOURCE, str(bad))
+        )
+        assert by_relpath['pkg_a/tests/test_bad.py'].gate_violations[0].filename == str(bad)
+        assert by_relpath['pkg_a/tests/conftest.py'].gate_violations == ()
+
+    def test_rule_c_sites_are_counted_in_a_debt_free_file(self, fake_repo: Path):
+        by_relpath = {r.relpath: r for r in _scan_repo_test_dirs(fake_repo, self._DIRS)}
+
+        assert by_relpath['pkg_a/tests/_helper.py'].rule_c_count == 1
+        assert by_relpath['pkg_a/tests/test_bad.py'].rule_c_count == 0
+
+    def test_a_syntax_error_is_recorded_with_no_gate_violation(self, fake_repo: Path):
+        by_relpath = {r.relpath: r for r in _scan_repo_test_dirs(fake_repo, self._DIRS)}
+        broken = by_relpath['pkg_b/tests/sub/test_broken.py']
+
+        assert isinstance(broken.syntax_error, SyntaxError)
+        assert broken.gate_violations == ()
+        assert by_relpath['pkg_a/tests/test_bad.py'].syntax_error is None
 
 
 _MERGE_SPECULATION = 'orchestrator/tests/test_merge_speculation.py'

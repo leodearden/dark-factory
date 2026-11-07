@@ -185,11 +185,13 @@ a standing exemption for whatever it becomes:
     itself.  No CLI flag reaches the prefix (``--project-suffix`` moves the
     suffix only), so no invocation can point these deletes or writes at a
     ``fused``-prefixed production collection;
-  * it does not write mem0's shared SQLite history: ``seed_arm`` stubs
-    ``instance.db.add_history`` per instance before the first ``add`` (that
-    writer is process-shared, xdist-contended, and read-only in the sandbox —
-    see ``seed_arm``'s own docstring).  So the capability the preflight probes
-    for is not one the seeding path needs.
+  * it does not write mem0's shared SQLite history: ``run_bake_off`` sets
+    ``config.mem0.persist_history = False`` on its own config copy, so every
+    arm's mem0 instance keeps its history in a private in-memory DB and never
+    opens the shared ``$MEM0_DIR/history.db`` (process-shared, xdist-contended,
+    and read-only in the sandbox — see
+    ``fused_memory/config/schema.py::Mem0BackendConfig.persist_history``).  So
+    the capability the preflight probes for is not one the seeding path needs.
 
 THE RESIDUAL, stated rather than papered over — and scoped to the LIVE path
 (i.e. absent ``--replay-fetches``): on that path ``run_bake_off`` builds a
@@ -214,6 +216,8 @@ mutations, overstating one is still drift.
 from __future__ import annotations
 
 import asyncio
+import copy
+import hashlib
 import json
 import shutil
 import sys
@@ -1312,13 +1316,12 @@ def build_canonical_by_topic(records: list[ArmRecord]) -> dict[str, ArmRecord]:
     depend on scroll order — non-deterministic between runs, and invisible in
     the report.
     """
+    from fused_memory.canonical_marker import is_canonical
+
     index: dict[str, ArmRecord] = {}
     for record in records:
         topic = record.metadata.get('topic')
-        # Bool identity, matching β's `invalid_canonical_type` rule: a truthy
-        # 1 is a FATAL violation at the write boundary, so it must not be
-        # treated as canonical here either.
-        if topic is None or record.metadata.get('canonical') is not True:
+        if topic is None or not is_canonical(record.metadata):
             continue
         existing = index.get(topic)
         if existing is not None:
@@ -2117,6 +2120,35 @@ def audit_recall_over_labeled_fixture(
     }
 
 
+_AUDIT_RECALL_BY_CONTENT: dict[tuple[str, float, object], dict[str, Any]] = {}
+
+
+def memoized_audit_recall(
+    records: list[dict[str, Any]],
+    threshold: float | None = None,
+) -> dict[str, Any]:
+    """:func:`audit_recall_over_labeled_fixture`, computed once per process per content.
+
+    The audit is an O(n^2) sweep over the WHOLE alpha fixture that
+    ``cluster_limit`` does not shrink.  Keyed on the records actually audited,
+    the resolved threshold and the detector function itself, so a swapped-in
+    detector neither reads another detector's result nor leaves its own for
+    the next caller.  Every caller gets its own deep copy.
+    """
+    if threshold is None:
+        threshold = resolve_audit_threshold()
+    content = hashlib.sha256(
+        json.dumps(records, sort_keys=True, ensure_ascii=False).encode(),
+    ).hexdigest()
+    detector = load_audit_script().find_near_duplicate_memory_groups
+    key = (content, threshold, detector)
+    if key not in _AUDIT_RECALL_BY_CONTENT:
+        _AUDIT_RECALL_BY_CONTENT[key] = audit_recall_over_labeled_fixture(
+            records, threshold,
+        )
+    return copy.deepcopy(_AUDIT_RECALL_BY_CONTENT[key])
+
+
 # ---------------------------------------------------------------------------
 # The report — the artifact gate η reads
 # ---------------------------------------------------------------------------
@@ -2384,6 +2416,26 @@ def _git_stdout(args: list[str], cwd: Path) -> str | None:
     return completed.stdout.strip() or None
 
 
+_LAST_TOUCHING_COMMIT: dict[tuple[str | None, str, str], str] = {}
+
+
+def _last_touching_commit(head: str | None, path: Path, repo_root: Path) -> str | None:
+    """``git log -1`` for *path*, walked once per process per HEAD.
+
+    A path's last-touching commit is a pure function of the history reachable
+    from HEAD, so a moved HEAD re-walks.  Only git's answers are remembered:
+    with no HEAD, or after a walk that failed (a timeout under load, a
+    transient OSError), the next call asks git again.
+    """
+    key = (head, str(path), str(repo_root))
+    if key in _LAST_TOUCHING_COMMIT:
+        return _LAST_TOUCHING_COMMIT[key]
+    commit = _git_stdout(['log', '-1', '--format=%H', '--', str(path)], repo_root)
+    if head is not None and commit is not None:
+        _LAST_TOUCHING_COMMIT[key] = commit
+    return commit
+
+
 def fixture_provenance(paths: list[str | Path]) -> list[dict[str, Any]]:
     """Repo-relative path, content blob and last-touching commit per fixture.
 
@@ -2411,13 +2463,13 @@ def fixture_provenance(paths: list[str | Path]) -> list[dict[str, Any]]:
     audit trail is worse than an absent one, because it looks checkable.
     """
     repo_root = _PACKAGE_ROOT.parent
+    head = _git_stdout(['rev-parse', 'HEAD'], repo_root)
     provenance: list[dict[str, Any]] = []
     for raw in paths:
         path = Path(raw).resolve()
         provenance.append({
             'path': _repo_relative(path),
-            'commit': _git_stdout(
-                ['log', '-1', '--format=%H', '--', str(path)], repo_root),
+            'commit': _last_touching_commit(head, path, repo_root),
             'blob': _git_stdout(['hash-object', '--', str(path)], repo_root),
         })
     return provenance
@@ -3937,19 +3989,10 @@ async def seed_arm(
     """Write every record of one arm into its own ephemeral collection.
 
     Populates ``by_stored_id`` in place and returns the same object.
-
-    ``instance.db.add_history`` is stubbed first: mem0's SQLite history
-    writer is process-shared and xdist-contended (and read-only in the
-    sandbox).  It is not the question under test, and its failure would mask
-    the one that is — the same reason ``test_recon_dedup_premise.py:135`` and
-    the E1 probe stub it.
     """
     from fused_memory.models.scope import Scope  # noqa: PLC0415
 
     scope = Scope(project_id=seeded.project_id, agent_id=SEED_AGENT_ID)
-    instance = await backend._get_instance(scope)
-    instance.db.add_history = lambda *args, **kwargs: None
-
     semaphore = asyncio.Semaphore(concurrency)
 
     async def _write(record: ArmRecord) -> None:
@@ -4160,8 +4203,6 @@ def corpus_fingerprint(records: list[ArmRecord]) -> str:
     ``json.dumps(sort_keys=True)`` rather than ``str(dict)`` so the digest
     does not depend on metadata insertion order either.
     """
-    import hashlib  # noqa: PLC0415
-
     digest = hashlib.sha256()
     for record_id, content, metadata in sorted(
         (
@@ -4196,8 +4237,6 @@ def fixture_digests(paths: list[str | Path]) -> list[dict[str, Any]]:
     absolute home-directory checkout is neither reproducible nor readable by
     anyone else.
     """
-    import hashlib  # noqa: PLC0415
-
     rows: list[dict[str, Any]] = []
     for raw in paths:
         path = Path(raw).resolve()
@@ -5600,6 +5639,7 @@ async def run_bake_off(
 
     config = (config or FusedMemoryConfig()).model_copy(deep=True)
     config.mem0.collection_prefix = ephemeral_collection_prefix()
+    config.mem0.persist_history = False
     # Clearing the pinned key makes mem0's OpenAIEmbedding fall back to the
     # real OPENAI_API_KEY.  A stub constant vector would make every ranking in
     # this report meaningless.  `providers.openai` is optional in the schema
@@ -5810,9 +5850,7 @@ async def run_bake_off(
 
     return build_report(
         arms=arms,
-        audit_recall=audit_recall_over_labeled_fixture(
-            load_labeled_fixture(alpha_fixture),
-        ),
+        audit_recall=memoized_audit_recall(load_labeled_fixture(alpha_fixture)),
         regrowth=regrowth_block,
         protocol={
             'blind_authoring': BLIND_AUTHORING_PROTOCOL,
@@ -6008,9 +6046,7 @@ async def _replay_bake_off(
 
     return build_report(
         arms=arms,
-        audit_recall=audit_recall_over_labeled_fixture(
-            load_labeled_fixture(alpha_fixture),
-        ),
+        audit_recall=memoized_audit_recall(load_labeled_fixture(alpha_fixture)),
         regrowth=regrowth_block,
         protocol={
             'blind_authoring': BLIND_AUTHORING_PROTOCOL,

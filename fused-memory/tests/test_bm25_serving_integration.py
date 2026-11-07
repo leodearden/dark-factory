@@ -49,10 +49,6 @@ from fused_memory.backends.graphiti_client import GraphitiBackend
 
 pytestmark = [
     falkor_skipif(),
-    # Provisioning and settling are bounded well under this; `timeout_method =
-    # "thread"` os._exit(1)s the xdist worker, so an under-budget timeout would
-    # read as an infrastructure crash.
-    pytest.mark.timeout(120),
     pytest.mark.integration,
 ]
 

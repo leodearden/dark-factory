@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 from _git_repo import make_repo
-from _stores import RunsDb, TasksDb
+from _stores import EscalationQueueDir, RunsDb, TasksDb
 
 from client_feed.contract import (
     ENGAGEMENT_FILENAME,
@@ -47,6 +47,7 @@ def policy(tmp_path: Path, in_dir: Path) -> Policy:
     repo.commit('c1', when=T0)
     TasksDb.create(repo.root)
     RunsDb.create(repo.root)
+    EscalationQueueDir.create(repo.root)
     out_dir = tmp_path / 'out'
     out_dir.mkdir()
     return Policy.model_validate(

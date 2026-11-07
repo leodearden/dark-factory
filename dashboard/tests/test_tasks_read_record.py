@@ -108,9 +108,9 @@ class TestFetchTasksNarrowing:
     the MCP boundary — not what the dashboard discards afterwards. These
     tests therefore assert on ``mcp_tool_call``'s recorded call args.
 
-    The unnarrowed shape is pinned byte-identical because the full-tree
-    caller (``app._fanout_probe_completion``, the /healthz probe) must be
-    unaffected by narrowing.
+    The unnarrowed shape is pinned byte-identical as ``fetch_tasks``' own
+    wire contract: a call with no narrowing sends exactly
+    ``{'project_root': ...}``.
     """
 
     @staticmethod

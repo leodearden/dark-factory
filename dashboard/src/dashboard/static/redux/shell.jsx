@@ -461,11 +461,11 @@ function ProjectGroup({ id, label, open, onToggle, summary, summaryRight, childr
 // shared markup this component adopts unchanged rather than new variants it
 // invents; `color` and `badge` are each absent on the shape that does not use
 // it, so neither draws an empty 7px dot nor an untoned chip.
-function Pip({ datum, label, color, format, badge }) {
+function Pip({ datum, label, color, format, badge, rule }) {
   const view = datumView(datum, { now: Date.now(), format });
   const reading = <>{view.text}{label && ` ${label}`}{view.age && <span style={PIP_AGE_STYLE}> {view.age}</span>}</>;
   return (
-    <span className="pip" title={view.title || undefined}>
+    <span className="pip" title={view.title || rule || undefined}>
       {color && <span className="pip-dot" style={{ background: color }}></span>}
       {badge ? <span className={`badge ${badge}`} style={PIP_BADGE_STYLE}>{reading}</span> : reading}
     </span>
@@ -476,9 +476,9 @@ function Pip({ datum, label, color, format, badge }) {
 // The topbar pill, the rail badge, OrchTab's filter buttons, Progress header
 // and legend, the Overview pipeline: one datum and one `format`, the same
 // decision and the same age suffix as Pip, without the dot.
-function DatumReading({ datum, format }) {
+function DatumReading({ datum, format, rule }) {
   const view = datumView(datum, { now: Date.now(), format });
-  return <span title={view.title || undefined}>{view.text}{view.age && <span style={PIP_AGE_STYLE}> {view.age}</span>}</span>;
+  return <span title={view.title || rule || undefined}>{view.text}{view.age && <span style={PIP_AGE_STYLE}> {view.age}</span>}</span>;
 }
 
 // ── Segmented control ──

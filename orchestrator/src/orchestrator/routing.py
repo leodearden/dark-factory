@@ -12,7 +12,8 @@ Task epsilon adds ``resolve_route`` -- the single layered authority for
 ``orchestrator.workflow.TaskWorkflow._invoke``. See ``resolve_route``'s own
 docstring for the layer precedence.
 
-Kept import-light at module top (stdlib only) so ``config.py`` can
+Kept import-light at module top (stdlib, plus the stdlib-only
+``orchestrator.implementer_brief_variant``) so ``config.py`` can
 ``from orchestrator.routing import DEFAULT_ALLOWED_MODELS`` with no circular
 import; heavier imports (e.g. ``shared.cli_invoke.invoke_claude_agent``) are
 deferred to inside the functions that need them. ``OrchestratorConfig`` is
@@ -28,6 +29,8 @@ import logging
 import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
+
+from orchestrator.implementer_brief_variant import invocation_bounds
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Mapping
@@ -537,6 +540,10 @@ def resolve_route(inputs: RouteInputs, config: OrchestratorConfig) -> RoutingDec
        always available and unconditional -- this is the only layer never
        subject to fail-safe validation -- so this function never raises).
 
+    Then a final, non-layer transform: under ``config.implementer_brief_variant``
+    one-step the implementer's budget_usd/max_turns are divided per
+    ``orchestrator/src/orchestrator/implementer_brief_variant.py``.
+
     Each of effort/budget_usd/max_turns is resolved independently
     field-by-field from the highest layer that specifies it;
     ``source_layer`` tracks only ``model``'s provenance. Pure and
@@ -661,6 +668,10 @@ def resolve_route(inputs: RouteInputs, config: OrchestratorConfig) -> RoutingDec
             source_layer = 'metadata_override'
         else:
             rejected.append(f'metadata_override:{reason}')
+
+    budget_usd, max_turns = invocation_bounds(
+        config.implementer_brief_variant, inputs.role_name, budget_usd, max_turns,
+    )
 
     return RoutingDecision(
         model=model,

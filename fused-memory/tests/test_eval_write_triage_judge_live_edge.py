@@ -25,6 +25,7 @@ from _eval_write_triage_fixtures import cli_mod as _mod
 from _eval_write_triage_fixtures import live_judge_mod as _live_judge
 from _eval_write_triage_fixtures import rec as _rec
 from _eval_write_triage_fixtures import wording_mod as _wording
+from _sdk_client_stubs import sdk_client_double
 from _write_triage_store_fake import FakeMemoryService
 
 from fused_memory.models.enums import SourceStore
@@ -79,7 +80,7 @@ _ID_LINE = re.compile(r'^- id: (\S+)$', re.MULTILINE)
 
 
 def _openai(word: str, *, named: int = 0, billed: object = _BILLED) -> MagicMock:
-    """A fake `AsyncOpenAI` that is its own async context manager, as the SDK is.
+    """A fake `AsyncOpenAI` that answers on the Responses API only.
 
     Every Responses call answers *word* about the candidate at position *named*
     of its own prompt (an attach verdict must name one; `distinct` names none)
@@ -96,9 +97,7 @@ def _openai(word: str, *, named: int = 0, billed: object = _BILLED) -> MagicMock
             incomplete_details=None, usage=billed,
         )
 
-    client = MagicMock()
-    client.__aenter__ = AsyncMock(return_value=client)
-    client.__aexit__ = AsyncMock(return_value=False)
+    client = sdk_client_double()
     client.responses.create = AsyncMock(side_effect=_respond)
     client.chat.completions.create = AsyncMock()
     return client
@@ -238,9 +237,7 @@ def _answering_both_apis() -> MagicMock:
             usage=None,
         )
 
-    client = MagicMock()
-    client.__aenter__ = AsyncMock(return_value=client)
-    client.__aexit__ = AsyncMock(return_value=False)
+    client = sdk_client_double()
     client.responses.create = AsyncMock(side_effect=_respond)
     client.chat.completions.create = AsyncMock(side_effect=_complete)
     return client

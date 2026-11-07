@@ -81,8 +81,15 @@ def architect_eval_mcp_scope(worktree: Path) -> dict[str, Any]:
     The PAIR is the invariant (task 4757). A plan-tools config without the
     strict flag still ambient-merges the worktree's tracked ``.mcp.json``, i.e.
     the live escalation (:8102) and fused-memory (:8002) servers.
+
+    The meta root is also the task root, matching ``open_eval_artifacts``:
+    parallel trials of one task id must not share ``.task-meta/task-<id>``.
     """
-    return {'mcp_config': _inject_plan_tools_mcp(None, worktree), 'strict_mcp_config': True}
+    meta_root = _meta_root_for_worktree(worktree)
+    return {
+        'mcp_config': _inject_plan_tools_mcp(None, worktree, task_root=meta_root),
+        'strict_mcp_config': True,
+    }
 
 
 def open_eval_artifacts(worktree: Path) -> TaskArtifacts:
@@ -287,12 +294,12 @@ class _ArchitectCall:
                 f'Architect eval {self.label}',
                 invoke_fn=timed_attempt,
                 backend=self.config.backend,
-                **_architect_invocation(self.task, self.config, prompt, self.worktree),
+                **architect_invocation(self.task, self.config, prompt, self.worktree),
             )
         return result, artifacts
 
 
-def _architect_invocation(
+def architect_invocation(
     task: dict, config: EvalConfig, prompt: str, worktree: Path,
 ) -> dict[str, Any]:
     """This candidate's architect invocation, scoped to plan-tools alone."""

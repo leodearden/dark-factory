@@ -22,13 +22,12 @@ import contextlib
 import logging
 import os
 import signal
-import time
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from _recording_event_store import _RecordingEventStore
-from df_pytest_isolation import PIPE_CLOSING_LEAKER_SRC, read_leaked_pid
+from df_pytest_isolation import PIPE_CLOSING_LEAKER_SRC, read_leaked_pid, wait_pid_gone
 from pydantic import ValidationError
 from shared.delivered_check_polarity import (
     CheckOutcome,
@@ -36,7 +35,6 @@ from shared.delivered_check_polarity import (
     build_path_argv,
     interpret_grep_rc,
 )
-from shared.proc_group import pid_running
 
 from orchestrator.config import RELOADABLE_FIELDS, DeliveredChecksConfig, OrchestratorConfig
 from orchestrator.delivered_checks import (
@@ -434,7 +432,9 @@ class TestRunnerScriptKind:
         try:
             leaked_pid = await asyncio.to_thread(read_leaked_pid, pidfile)
 
-            assert await _wait_pid_exited(leaked_pid, timeout=check['timeout_secs'] + 5.0), (
+            assert await asyncio.to_thread(
+                wait_pid_gone, leaked_pid, timeout=check['timeout_secs'] + 5.0
+            ), (
                 f'pid {leaked_pid}, a helper the script backgrounded, survived its timeout'
             )
             assert await task is DeliveredCheckResult.ERRORED
@@ -443,21 +443,6 @@ class TestRunnerScriptKind:
             if leaked_pid is not None:
                 with contextlib.suppress(OSError):
                     os.kill(leaked_pid, signal.SIGKILL)
-
-
-async def _wait_pid_exited(pid: int, timeout: float = 5.0) -> bool:
-    """Poll until *pid* is gone or a zombie; False if still running at *timeout*.
-
-    A zombie counts as exited: an orphaned grandchild of a killed group awaits
-    systemd --user's reap, which is not the runner's to perform (task 6029).
-    """
-    deadline = time.monotonic() + timeout
-    while True:
-        if not pid_running(pid):
-            return True
-        if time.monotonic() >= deadline:
-            return False
-        await asyncio.sleep(0.05)
 
 
 # ---------------------------------------------------------------------------

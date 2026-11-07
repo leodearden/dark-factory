@@ -70,11 +70,12 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
 
 @pytest.fixture
 def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
-    return OrchestratorConfig(project_root=git_repo, git=git_config)
+    return lane_scene_config(git_repo, git_config)
 
 
 def _request(
-    task_id: str, worktree: Path, config: OrchestratorConfig, **flags: bool,
+    task_id: str, worktree: Path, config: OrchestratorConfig, *,
+    awaited_by_workflow: bool = False,
 ) -> MergeRequest:
     return MergeRequest(
         task_id=task_id,
@@ -85,7 +86,7 @@ def _request(
         module_configs=[],
         config=config,
         result=asyncio.get_running_loop().create_future(),
-        **flags,
+        awaited_by_workflow=awaited_by_workflow,
     )
 
 

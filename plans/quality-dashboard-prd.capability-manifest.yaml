@@ -1,0 +1,222 @@
+# Machine-readable twin of plans/quality-dashboard-prd.capability-manifest.md
+# Schema: plans/capability-delivered-checks-prd.md §Contract; loader shared/src/shared/capability_manifest.py.
+# task_id values are stamped by commit_planning at decompose. Every grep pattern below had 0 matches on
+# main a26991efc9 (2026-11-04), so each check fails until its producer lands.
+prd: plans/quality-dashboard-prd.md
+schema_version: 1
+signal_leaves: ["κ"]
+tasks:
+  - label: "α"
+    task_id: 8457
+    title: "Shared quality producer: landings, verify units, per-landing rows, statistics"
+    capabilities:
+      - name: "per-landing-row-producer-exists"
+        binding: "capability→producer — shared/src/shared/quality_series/rows.py::rows_for (new); landing join over merge_finalized done ∪ train_merged"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def rows_for\\("
+          paths: ["shared/src/shared/quality_series/"]
+          expect: present
+      - name: "stdlib-statistics-exist"
+        binding: "capability→producer — shared/src/shared/quality_series/stats.py::cusum_alarms (new)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def cusum_alarms\\("
+          paths: ["shared/src/shared/quality_series/"]
+          expect: present
+      - name: "train-timestamp-is-main-advance"
+        binding: "premise — verified by α against each member sha's first reach of main (PRD open question 1)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "a measurement α records in its return, not a grep"
+  - label: "β"
+    task_id: 8458
+    title: "quality.db store and the 600 s quality sampler loop"
+    capabilities:
+      - name: "quality-store-in-loops"
+        binding: "capability→producer — dashboard/src/dashboard/loops.py::_QualityStore (new) on the _BurndownStore pattern"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class _QualityStore"
+          paths: ["dashboard/src/dashboard/loops.py"]
+          expect: present
+      - name: "quality-db-config-leaf"
+        binding: "capability→producer — dashboard/src/dashboard/config.py quality_db (new)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "quality_db"
+          paths: ["dashboard/src/dashboard/config.py"]
+          expect: present
+      - name: "retention-excludes-quality-db"
+        binding: "rejection-mechanism — β's test pins quality.db absent from metrics.py::_DOWNSAMPLE_TABLES"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "an absence in a tuple is pinned by β's test, not expressible as a stable grep"
+  - label: "γ"
+    task_id: 8459
+    title: "Quality reader, /api/v2/dashboard/quality endpoint, landing windows, access-path guard"
+    capabilities:
+      - name: "quality-endpoint-registered"
+        binding: "capability→producer — dashboard/src/dashboard/api/quality.py (new) behind app.include_router"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "api/v2/dashboard/quality"
+          paths: ["dashboard/src/dashboard/api/"]
+          expect: present
+      - name: "access-path-guard-covers-quality-series"
+        binding: "capability→producer — dashboard/tests/test_datum_access_paths.py::GUARDED extended to the quality event types"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "quality_series"
+          paths: ["dashboard/tests/test_datum_access_paths.py"]
+          expect: present
+      - name: "no-producer-state-for-unlanded-fields"
+        binding: "readers-prove-their-producer — charter_class / prompt_digest series render 'no producer has written here' until ζ fires"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "a served Datum state verified by κ row 14/15, not a grep"
+  - label: "δ"
+    task_id: 8460
+    title: "Quality markers: derived routing steps, curated schema extension, one reader, server-side ordinals"
+    capabilities:
+      - name: "curated-marker-reader-exists"
+        binding: "capability→producer — dashboard/src/dashboard/data/quality_markers.py::load_curated_markers (new); escalation_analytics delegates"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def load_curated_markers\\("
+          paths: ["dashboard/src/dashboard/data/"]
+          expect: present
+      - name: "disk-full-artefact-curated"
+        binding: "field-population — regime-markers.yaml gains the 2026-10-16 artefact range entry"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "kind: artefact"
+          paths: ["dashboard/regime-markers.yaml"]
+          expect: present
+  - label: "ε"
+    task_id: 8461
+    title: "Quality tab, LineChart band prop and shared marker overlay"
+    capabilities:
+      - name: "quality-tab-asset-wired"
+        binding: "capability→producer — static/redux/tab_quality.jsx (new) loaded by index.html"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "tab_quality"
+          paths: ["dashboard/src/dashboard/static/redux/index.html"]
+          expect: present
+      - name: "boundary-test-for-quality-payload"
+        binding: "capability→producer — dashboard/tests/js/boundary_quality.test.mjs (new) on the boundary_*.test.mjs pattern"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "boundary_quality"
+          paths: ["dashboard/tests/"]
+          expect: present
+  - label: "ζ"
+    task_id: 8462
+    title: "Orchestrator: typed charter_class at the architect block sites; prompt_digest on routing_decision"
+    capabilities:
+      - name: "charter-class-written-at-block-site"
+        binding: "capability→producer — workflow.py architect block sites write charter_class (new; distinct from unblock_types.py::BlockClass)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "charter_class"
+          paths: ["orchestrator/src/orchestrator/workflow.py"]
+          expect: present
+      - name: "prompt-digest-on-routing-decision"
+        binding: "capability→producer — routing_dispatch.py routing_decision payload gains prompt_digest (new)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "prompt_digest"
+          paths: ["orchestrator/src/orchestrator/routing_dispatch.py"]
+          expect: present
+  - label: "η"
+    task_id: 8463
+    title: "Quality-metrics snapshot identity: schema 3 params, identity test, labelled diff, cadence wrapper"
+    capabilities:
+      - name: "schema-3-params"
+        binding: "capability→producer — scripts/quality_metrics_snapshot.py SCHEMA_VERSION 2 → 3 with python_version + instrument shas"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "SCHEMA_VERSION = 3"
+          paths: ["scripts/quality_metrics_snapshot.py"]
+          expect: present
+      - name: "measurement-identity-function"
+        binding: "capability→producer — scripts/quality_metrics_snapshot.py::measurement_identity (new)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def measurement_identity\\("
+          paths: ["scripts/quality_metrics_snapshot.py"]
+          expect: present
+      - name: "cadence-wrapper-exists"
+        binding: "capability→producer — scripts/quality_snapshot_cadence.py (new): pins the tree, exact-identity skip, never commits"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "already measured"
+          paths: ["scripts/quality_snapshot_cadence.py"]
+          expect: present
+  - label: "θ"
+    task_id: 8464
+    title: "Nightly quality-snapshot timer per project, weekly backfill since 2026-10-08, /review-all accepts nightly snapshots"
+    capabilities:
+      - name: "timer-unit-template"
+        binding: "capability→producer — scripts/quality-snapshot@.service (new) runs the η wrapper"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "quality_snapshot_cadence"
+          paths: ["scripts/quality-snapshot@.service"]
+          expect: present
+      - name: "review-all-reads-nightly-snapshots"
+        binding: "capability→producer — skills/review-all/SKILL.md Phase 1 step 1 names data/quality-metrics/"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "data/quality-metrics"
+          paths: ["skills/review-all/SKILL.md"]
+          expect: present
+      - name: "backfill-points-exist"
+        binding: "field-population — data/quality-metrics/dark_factory/ holds weekly shas since 10-08 (gitignored, host-local)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "host-local gitignored files; verified by κ row 20"
+  - label: "ι"
+    task_id: 8465
+    title: "Quality-snapshot step-series datum and tab section"
+    capabilities:
+      - name: "snapshots-datum-served"
+        binding: "capability→producer — api/quality.py serves QUALITY_SNAPSHOTS from data/quality_snapshots.py (new)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "QUALITY_SNAPSHOTS"
+          paths: ["dashboard/src/dashboard/api/"]
+          expect: present
+  - label: "κ"
+    task_id: 8466
+    title: "Quality dashboard integration gate: boundary-test sketch rows 1–21 against live stores"
+    capabilities:
+      - name: "boundary-sketch-observed"
+        binding: "DAG-direction — every producer upstream (ε, ζ, ι chains); rows 14–15 observed on a dispatched run or recorded 'not yet observed'"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "the task IS the check suite; its signal is the sketch table with observed postconditions in the PRD"

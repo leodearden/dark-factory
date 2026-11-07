@@ -19,7 +19,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from _orch_helpers import _init_harness_state_for_test
+from _orch_helpers import HermeticMcpSession, _init_harness_state_for_test
 
 import orchestrator.harness as harness_module
 from orchestrator.config import OrchestratorConfig
@@ -116,7 +116,7 @@ def _make_scheduler(config: OrchestratorConfig) -> Scheduler:
     """A real Scheduler (like test_harness_reblock_guard.py) so the retry-cap
     / release bookkeeping _run_slot's finally exercises works without hand
     -stubbing every internal method."""
-    return Scheduler(config, time_source=lambda: 1000.0)
+    return Scheduler(config, time_source=lambda: 1000.0, mcp_session=HermeticMcpSession())
 
 
 class TestClaimantClearedOnEveryOutcome:

@@ -363,6 +363,27 @@ AUDITED_SITES: tuple[dict[str, Any], ...] = (
             'deleted at close.'
         ),
     },
+    {
+        'path': 'scripts/sitting/nightly_prepare.py',
+        'qualname': 'run',
+        'destroyed_by': (
+            'nightly_prepare.py::run -> TaskConfigDir.cleanup ONLY on the '
+            'no-lease skip, before any CLI session exists; a night that runs '
+            'keeps its dir (only the credentials file is removed)'
+        ),
+        'disposition': UNARCHIVED_BY_DESIGN,
+        'rationale': (
+            'Per-night prepare-sitting dir under data/sitting/config/ (task '
+            '6203), created there so the Landlock grant on data/sitting '
+            'contains it by construction. Nothing destroys a dir whose session '
+            'ran, so its transcript is retained in place (gitignored data/) '
+            'rather than archived; the run\'s product, the recorded '
+            'preparations, is persisted by prepare_sitting.py record. Before '
+            'task 6203 these sessions landed in the host ~/.claude/projects. '
+            'The one rmtree is the no-lease skip, which deletes an empty dir '
+            'no session ever wrote to.'
+        ),
+    },
 )
 
 

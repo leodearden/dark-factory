@@ -202,13 +202,12 @@ def test_parallel_member_addopts_declare_xdist_with_loadgroup(member: str) -> No
 def test_parallel_member_addopts_do_not_copy_max_worker_restart(member: str) -> None:
     """No parallelised member copies ``--max-worker-restart`` across.
 
-    The flag is required exactly where ``timeout_method = "thread"`` is set —
-    orchestrator and fused-memory — and that invariant, with its
-    executable reproduction, lives in ``test_xdist_worker_restart_policy.py``.
-    Copying it here would look like completing the family, but these members
-    run ``timeout_method = "signal"``: a timeout raises inside the test and the
-    worker survives, so the case the flag exists for does not arise from their
-    cap, and task 5408 declined to widen it to them without a measured need.
+    orchestrator and fused-memory run ``timeout_method = "signal"`` and keep the
+    flag, for the reason recorded at
+    ``test_xdist_worker_restart_policy.py::RESTART_DISABLED_CONFIGS``, which
+    pins it beside its executable reproduction. Copying it here would look like
+    completing the family, but these members have not been given it: task 5408
+    found no measured need, and declined to widen it without one.
     """
     offenders = [
         token
@@ -217,12 +216,11 @@ def test_parallel_member_addopts_do_not_copy_max_worker_restart(member: str) -> 
     ]
     assert not offenders, (
         f"{member}/pyproject.toml's addopts declares {offenders!r} (task 5408). "
-        'That flag is required only where timeout_method = "thread" is set '
-        '(orchestrator, fused-memory — see '
-        'test_xdist_worker_restart_policy.py). This member runs '
-        'timeout_method = "signal", where a timeout raises inside the test and '
-        'the worker survives, so the case the flag exists for does not arise '
-        'from its cap. Do not widen it here without a measured need'
+        'orchestrator and fused-memory run timeout_method = "signal" and keep '
+        'that flag, for the reason recorded at '
+        'test_xdist_worker_restart_policy.py::RESTART_DISABLED_CONFIGS. This '
+        'member has not been given it, because no measured need was found. Do '
+        'not widen it here without one'
     )
 
 

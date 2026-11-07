@@ -918,7 +918,7 @@ def seed_plan(artifacts: TaskArtifacts) -> dict[str, Any]:
 def plan_on_disk(artifacts: TaskArtifacts) -> dict[str, Any]:
     """``plan.json`` parsed straight off disk, bypassing any normalisation."""
     return json.loads(
-        (artifacts.root / 'plan.json').read_text(encoding='utf-8')
+        artifacts.artifact_path('plan.json').read_text(encoding='utf-8')
     )
 
 
@@ -938,7 +938,7 @@ class TestThePlanStampRecordsTheRefusal:
         assert len(block['events']) == 1
         assert block['events'][0]['param'] == 'decision'
         assert block['note'] == plan_markup_stamp.STAMP_NOTE
-        assert locator == str(artifacts.root / 'plan.json'), (
+        assert locator == str(artifacts.artifact_path('plan.json')), (
             'the locator names the artifact, as the journal sink names its file'
         )
 
@@ -1002,7 +1002,7 @@ class TestThePlanStampRecordsTheRefusal:
 
         await stamp(make_fact())
 
-        text = (artifacts.root / 'plan.json').read_text(encoding='utf-8')
+        text = artifacts.artifact_path('plan.json').read_text(encoding='utf-8')
         for sequence in _FORBIDDEN_SEQUENCES:
             assert sequence not in text, (
                 f'the stamped plan carries the raw sentinel {sequence!r}'
@@ -1025,7 +1025,7 @@ class TestThePlanStampNeverRaises:
         self, artifacts: TaskArtifacts, monkeypatch
     ):
         seed_plan(artifacts)
-        before = (artifacts.root / 'plan.json').read_bytes()
+        before = artifacts.artifact_path('plan.json').read_bytes()
 
         def boom(plan, **_kwargs):
             raise OSError('the plan is unwritable')
@@ -1034,7 +1034,7 @@ class TestThePlanStampNeverRaises:
         stamp = plan_markup_stamp.make_plan_stamp(artifacts=artifacts, now=_Clock())
 
         assert await stamp(make_fact()) is None
-        assert (artifacts.root / 'plan.json').read_bytes() == before
+        assert artifacts.artifact_path('plan.json').read_bytes() == before
 
     @pytest.mark.asyncio
     async def test_a_failing_read_is_swallowed(
@@ -1105,7 +1105,7 @@ class TestARefusalBeforeAnyPlanExistsIsBuffered:
 
         await stamp(make_fact(tool='create_plan', param='title'))
 
-        assert not (artifacts.root / 'plan.json').exists(), (
+        assert not artifacts.artifact_path('plan.json').exists(), (
             'a refusal must not conjure a plan that no architect authored'
         )
 
