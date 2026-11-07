@@ -11,6 +11,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Final, Literal
 
+from shared.followup_items import FollowupItem
 from shared.task_statuses import TaskStatus
 
 from fused_memory.middleware.curation_deferral import DeferReason, deferral_justification
@@ -126,6 +127,8 @@ class CandidateTask:
     # untagged asks still use the substring fallback. Also part of payload_hash
     # (see below).
     execution_class: str | None = None
+    # metadata.followup_items (plans/follow-up-filing-shape-prd.md §4.1); part of payload_hash.
+    items: tuple[FollowupItem, ...] = ()
 
     def payload_hash(self) -> str:
         """Stable hash over fields the curator actually reads.
@@ -156,6 +159,8 @@ class CandidateTask:
         # would let one's cached decision be wrongly returned for the other, so
         # it must remain part of the key.
         h.update((self.execution_class or '').encode())
+        h.update(b'\x00')
+        h.update('\n'.join(sorted(item.key for item in self.items)).encode())
         # 16-char sha256-hex shape — canonical owner: orchestrator.agents.triage.sha256_16.
         # Any change to length or algorithm must be mirrored there and at the
         # other mirror site, candidate_key.py::compute_candidate_key.
