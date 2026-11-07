@@ -1046,7 +1046,7 @@ async def test_open_conn_commits_do_not_wait_on_the_disk(tmp_path, open_conn):
     """open_conn hands out connections running with PRAGMA synchronous=OFF.
 
     Tests built on open_conn bound their units with wall-clock hang guards
-    (wait_for at 5s and 10s, and _GATE_HANG_GUARD_SECS).  Under
+    (asyncio.wait_for, _GATE_HANG_GUARD_SECS).  Under
     synchronous=FULL every write unit's COMMIT and every TRUNCATE checkpoint
     is an fsync, whose latency is set by whatever else is writing to the host
     disk, not by the code under test.  That is how a 10s guard in
@@ -1056,9 +1056,10 @@ async def test_open_conn_commits_do_not_wait_on_the_disk(tmp_path, open_conn):
     do not depend on synchronous.
     """
     conn = await open_conn(tmp_path / 'sync.db')
-    rows = await conn.execute_fetchall('PRAGMA synchronous')
-    assert rows[0][0] == 0, (
-        f'open_conn hands out PRAGMA synchronous={rows[0][0]}, expected 0 (OFF): '
+    async with conn.execute('PRAGMA synchronous') as cur:
+        row = await cur.fetchone()
+    assert row is not None and row[0] == 0, (
+        f'open_conn hands out PRAGMA synchronous={None if row is None else row[0]}, expected 0 (OFF): '
         'every commit and TRUNCATE checkpoint would wait on host-disk fsync '
         "latency inside this module's wall-clock hang guards"
     )
