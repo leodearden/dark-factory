@@ -2,6 +2,14 @@
 
 from __future__ import annotations
 
+import logging
+from pathlib import Path
+
+import pytest
+from _lane_test_helpers import make_warm_lane_repo
+from _seed_script_stubs import commit_seed_script, warm_pool_git_config
+
+from orchestrator.git_ops import GitOps
 from orchestrator.script_warnings import tagged_warning_lines
 
 SEED_WARN = '\x1b[1;33m[warn]\x1b[0m  hooks-armed-guard.sh arm failed (exit 9) — seed continues'
@@ -60,3 +68,68 @@ class TestTaggedWarningLines:
             '[warn]  hooks-armed-guard.sh arm failed (exit 9) — seed continues',
             '[warn]    run scripts/hooks-armed-guard.sh check /lane',
         )
+
+
+_WARNING_SEED_SCRIPT = r"""#!/usr/bin/env bash
+mkdir -p "$2/target"
+echo seeded > "$2/target/seeded.bin"
+printf '\033[1;34m[info]\033[0m  %s\n' 'stash-guard hooks armed' >&2
+printf '\033[1;33m[warn]\033[0m  %s\n' 'hooks-armed-guard.sh arm failed (exit 9) — seed continues' >&2
+exit 0
+"""
+
+_QUIET_SEED_SCRIPT = r"""#!/usr/bin/env bash
+mkdir -p "$2/target"
+echo seeded > "$2/target/seeded.bin"
+printf '\033[1;34m[info]\033[0m  %s\n' 'stash-guard hooks armed' >&2
+printf '\033[1;32m[ok]\033[0m  %s\n' 'target seeded' >&2
+exit 0
+"""
+
+
+async def _warm_git_ops(tmp_path: Path, seed_body: str) -> GitOps:
+    repo = make_warm_lane_repo(tmp_path)
+    await commit_seed_script(repo, seed_body)
+    return GitOps(warm_pool_git_config(), repo, warm_lane_pool_size=1)
+
+
+def _seed_warning_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [
+        record for record in caplog.records
+        if record.levelno == logging.WARNING
+        and record.getMessage().startswith('_seed_warm_lane:')
+    ]
+
+
+@pytest.mark.asyncio
+class TestSeedWarningsSurfacedOnSuccess:
+    async def test_rc0_seed_warn_line_is_logged_once_without_colour(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        git_ops = await _warm_git_ops(tmp_path, _WARNING_SEED_SCRIPT)
+        caplog.set_level(logging.DEBUG, logger='orchestrator.git_ops')
+
+        info = await git_ops.create_worktree('A')
+
+        lane = git_ops.worktree_base / '_lane-0'
+        assert info.path == lane
+        seed_warnings = _seed_warning_records(caplog)
+        assert len(seed_warnings) == 1, [r.getMessage() for r in seed_warnings]
+        message = seed_warnings[0].getMessage()
+        assert 'hooks-armed-guard.sh arm failed (exit 9)' in message
+        assert str(lane) in message
+        assert not any('\x1b' in r.getMessage() for r in caplog.records)
+        assert not any(
+            'stash-guard hooks armed' in r.getMessage()
+            for r in caplog.records if r.levelno >= logging.WARNING
+        )
+
+    async def test_rc0_seed_with_only_info_and_ok_lines_logs_no_warning(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        git_ops = await _warm_git_ops(tmp_path, _QUIET_SEED_SCRIPT)
+        caplog.set_level(logging.DEBUG, logger='orchestrator.git_ops')
+
+        await git_ops.create_worktree('A')
+
+        assert _seed_warning_records(caplog) == []
