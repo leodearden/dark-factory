@@ -1,9 +1,11 @@
 """The recording reverse proxy between the pinned harness and an arm (arm_harness/usage_tap.py)."""
 
+import http.client
 import json
 import socket
 import threading
 import time
+from contextlib import ExitStack, closing
 from datetime import UTC, datetime, timedelta
 from urllib.parse import urlsplit
 
@@ -229,30 +231,81 @@ def test_a_session_with_no_calls_still_leaves_its_empty_log(tmp_path):
     assert load_call_records(log) == ()
 
 
-def test_a_call_still_in_flight_when_the_session_closes_is_marked_as_outliving_it(tmp_path):
+def _post_in_background(tap_url: str, statuses: list[int]) -> threading.Thread:
+    client = threading.Thread(
+        target=lambda: statuses.append(post_json(tap_url, CHAT_PATH, json.dumps(REQUEST).encode())[0]),
+        daemon=True,
+    )
+    client.start()
+    return client
+
+
+def test_closing_a_session_waits_for_a_call_still_in_flight_and_records_it_inside_the_session(
+    tmp_path,
+):
     log = tmp_path / 'calls.jsonl'
     received, release = threading.Event(), threading.Event()
     statuses: list[int] = []
     with held_upstream(received, release) as upstream:
         with usage_tap(upstream, log_path=log) as tap_url:
-            client = threading.Thread(
-                target=lambda: statuses.append(
-                    post_json(tap_url, CHAT_PATH, json.dumps(REQUEST).encode())[0]
-                ),
-                daemon=True,
-            )
-            client.start()
+            client = _post_in_background(tap_url, statuses)
             assert received.wait(timeout=10)
+            threading.Timer(1.0, release.set).start()
+        recorded_at_session_exit = load_call_records(log)
+        client.join(timeout=10)
+
+    (record,) = recorded_at_session_exit
+    assert record.status == 200
+    assert record.prompt_tokens == HELD_PROMPT_TOKENS
+    assert record.outlived_session is False
+    assert statuses == [200]
+
+
+def test_a_call_still_in_flight_when_the_drain_bound_expires_is_marked_as_outliving_the_session(
+    tmp_path,
+):
+    log = tmp_path / 'calls.jsonl'
+    received, release = threading.Event(), threading.Event()
+    statuses: list[int] = []
+    with held_upstream(received, release) as upstream:
+        with usage_tap(upstream, log_path=log, drain_timeout_s=0.2) as tap_url:
+            client = _post_in_background(tap_url, statuses)
+            assert received.wait(timeout=10)
+            exiting = time.monotonic()
+        exit_s = time.monotonic() - exiting
         recorded_at_session_exit = log.read_text()
         release.set()
         client.join(timeout=10)
 
+    assert exit_s < 5
     assert recorded_at_session_exit == ''
     assert statuses == [200]
     (record,) = load_call_records(log)
     assert record.outlived_session is True
     assert record.status == 200
     assert record.prompt_tokens == HELD_PROMPT_TOKENS
+
+
+def test_an_idle_keep_alive_connection_does_not_hold_a_closing_session_open(tmp_path):
+    log = tmp_path / 'calls.jsonl'
+    with mock_openai_server() as mock, ExitStack() as connections:
+        mock.set_response('/chat/completions', usage_body(10, 2, 'stop'))
+        with usage_tap(_origin(mock), log_path=log) as tap_url:
+            parts = urlsplit(tap_url)
+            connection = connections.enter_context(
+                closing(http.client.HTTPConnection(parts.hostname or '', parts.port, timeout=30))
+            )
+            connection.request(
+                'POST', CHAT_PATH, body=json.dumps(REQUEST).encode(),
+                headers={'Content-Type': 'application/json'},
+            )
+            response = connection.getresponse()
+            response.read()
+            exiting = time.monotonic()
+        exit_s = time.monotonic() - exiting
+
+    assert response.status == 200
+    assert exit_s < 5
 
 
 def test_a_record_written_without_the_session_marker_loads_as_inside_its_session(tmp_path):
