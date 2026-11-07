@@ -6037,11 +6037,11 @@ def _make_completing_harness(
     """A harness whose three stages all complete, with a real escalation queue."""
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
 
-    harness = _make_test_harness(
-        journal, event_buffer, mock_memory_service, **harness_kwargs,
-    )
     esc_queue = EscalationQueue(tmp_path / 'esc')
-    harness._escalation_queue = esc_queue
+    harness = _make_test_harness(
+        journal, event_buffer, mock_memory_service,
+        escalation_queue=esc_queue, **harness_kwargs,
+    )
     for stage in harness.stages:
         _mock_stage_run(stage)
     return harness, esc_queue
@@ -6233,9 +6233,10 @@ def _make_failing_harness(journal, event_buffer, mock_memory_service, tmp_path):
     """A harness whose Stage 1 raises, with a real escalation queue."""
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
 
-    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
     esc_queue = EscalationQueue(tmp_path / 'esc')
-    harness._escalation_queue = esc_queue
+    harness = _make_test_harness(
+        journal, event_buffer, mock_memory_service, escalation_queue=esc_queue,
+    )
     harness.stages[0].run = _raising_stage_run(lambda: RuntimeError('stage exploded'))
     _mock_stage_run(harness.stages[1])
     _mock_stage_run(harness.stages[2])
