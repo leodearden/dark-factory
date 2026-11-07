@@ -511,6 +511,12 @@ class WriteJournalConfig(BaseModel):
     #: pass) re-verifies every row against the live graph, so a long horizon
     #: loses nothing.
     referent_findings_retention_days: float = Field(default=365.0, gt=0)
+    #: Terminal ``completed``/``failed`` ``mem0_intents``; dead-letters are never
+    #: aged out (``services/write_journal.py::WriteJournal.prune_mem0_intents``).
+    mem0_intents_retention_days: float = Field(default=30.0, gt=0)
+    #: ``idempotent_ops`` client keys, which only need to outlive the retry
+    #: window they guard (``services/write_journal.py::WriteJournal.prune_idempotent_ops``).
+    idempotent_ops_retention_days: float = Field(default=7.0, gt=0)
 
     @model_validator(mode='after')
     def _validate_search_outlives_reads(self) -> 'WriteJournalConfig':

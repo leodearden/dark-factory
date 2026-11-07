@@ -268,6 +268,10 @@ taskmaster:
 # referent_findings_retention_days (task 5551) ages out the referent diagnosis
 # log at startup. Measured 2026-10-31: 416 rows from 2026-09-17 to 2026-10-31,
 # ~12.6/day, so the 365-day horizon keeps ~4.6k rows.
+#
+# mem0_intents_retention_days ages out terminal (completed/failed) mem0_intents
+# at startup; dead-lettered intents are never aged out. idempotent_ops_retention_days
+# ages out idempotent_ops client keys at startup.
 # ─────────────────────────────────────────────────────────────────────────────
 write_journal:
   read_retention_days: ${WRITE_JOURNAL_READ_RETENTION_DAYS:30}
@@ -278,6 +282,8 @@ write_journal:
   prune_max_seconds: ${WRITE_JOURNAL_PRUNE_MAX_SECONDS:30}
   prune_interval_seconds: ${WRITE_JOURNAL_PRUNE_INTERVAL_SECONDS:1800}
   referent_findings_retention_days: ${WRITE_JOURNAL_REFERENT_FINDINGS_RETENTION_DAYS:365}
+  mem0_intents_retention_days: ${WRITE_JOURNAL_MEM0_INTENTS_RETENTION_DAYS:30}
+  idempotent_ops_retention_days: ${WRITE_JOURNAL_IDEMPOTENT_OPS_RETENTION_DAYS:7}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # write_journal_growth_alarm — RED-TIER / restart-only (task 3311). Every
