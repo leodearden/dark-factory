@@ -9,9 +9,9 @@ import re
 
 import pytest
 from pytest_config_discovery import (
-    MIN_EXPECTED_PYTEST_CONFIGS,
     ROOT_CONFIG_NAME,
     discovered_pytest_configs,
+    workspace_members,
 )
 
 
@@ -26,7 +26,7 @@ def test_discovers_the_root_and_every_member_that_declares_a_pytest_table(
     _write_pyproject(
         tmp_path,
         '[tool.uv.workspace]\n'
-        'members = ["alpha", "beta", "gamma", "delta"]\n'
+        'members = ["alpha", "beta", "gamma"]\n'
         '\n'
         '[tool.pytest.ini_options]\n'
         'timeout = 5\n',
@@ -34,13 +34,48 @@ def test_discovers_the_root_and_every_member_that_declares_a_pytest_table(
     _write_pyproject(tmp_path / 'alpha', '[tool.pytest.ini_options]\ntimeout_method = "thread"\n')
     _write_pyproject(tmp_path / 'beta', '[tool.pytest.ini_options]\n')
     _write_pyproject(tmp_path / 'gamma', '[project]\nname = "gamma"\n')
-    (tmp_path / 'delta').mkdir()
 
     assert discovered_pytest_configs(tmp_path, min_expected=3) == {
         ROOT_CONFIG_NAME: {'timeout': 5},
         'alpha': {'timeout_method': 'thread'},
         'beta': {},
     }
+
+
+def test_workspace_members_returns_the_declared_members_in_order(tmp_path: pathlib.Path) -> None:
+    _write_pyproject(tmp_path, '[tool.uv.workspace]\nmembers = ["beta", "alpha"]\n')
+    _write_pyproject(tmp_path / 'alpha', '[project]\nname = "alpha"\n')
+    _write_pyproject(tmp_path / 'beta', '[project]\nname = "beta"\n')
+
+    assert workspace_members(tmp_path) == ['beta', 'alpha']
+
+
+@pytest.mark.parametrize(
+    'member',
+    [
+        pytest.param('delta', id='directory-without-pyproject'),
+        pytest.param('pkgs/*', id='glob-member'),
+    ],
+)
+def test_a_member_without_a_pyproject_fails_loudly(tmp_path: pathlib.Path, member: str) -> None:
+    _write_pyproject(
+        tmp_path,
+        '[tool.uv.workspace]\n'
+        f'members = ["alpha", "{member}"]\n'
+        '\n'
+        '[tool.pytest.ini_options]\n'
+        'timeout = 5\n',
+    )
+    _write_pyproject(tmp_path / 'alpha', '[tool.pytest.ini_options]\ntimeout = 5\n')
+    (tmp_path / 'delta').mkdir()
+    _write_pyproject(tmp_path / 'pkgs' / 'one', '[tool.pytest.ini_options]\ntimeout = 5\n')
+
+    with pytest.raises(AssertionError) as refused:
+        discovered_pytest_configs(tmp_path, min_expected=1)
+
+    message = str(refused.value)
+    assert repr(member) in message, message
+    assert str(tmp_path / member / 'pyproject.toml') in message, message
 
 
 @pytest.mark.parametrize(
@@ -87,4 +122,3 @@ def test_this_checkouts_discovery_clears_the_default_floor() -> None:
     configs = discovered_pytest_configs()
 
     assert ROOT_CONFIG_NAME in configs
-    assert len(configs) >= MIN_EXPECTED_PYTEST_CONFIGS, sorted(configs)

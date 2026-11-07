@@ -1,7 +1,12 @@
-"""The one home for the workspace pytest-config discovery walk and its two anti-vacuity guards.
+"""The shared workspace members read, and the pytest-config discovery walk built on it.
 
-IMPORT ME, DO NOT COPY ME. A guard that needs to know which pyproject.toml files
+IMPORT ME, DO NOT COPY ME. A guard that needs the workspace's members calls
+:func:`workspace_members`; one that needs to know which pyproject.toml files
 declare ``[tool.pytest.ini_options]`` calls :func:`discovered_pytest_configs`.
+Each carries anti-vacuity guards that a copy would silently drop. Older inline
+reads of ``[tool.uv.workspace].members`` remain elsewhere in tests/scripts,
+``test_pytest_workspace_collection.py``'s among them; task 8311 tracks moving
+them onto a shared helper.
 
 This module holds NO test functions of its own and imports no test file. It
 resolves by bare name because tests/scripts/conftest.py puts this directory on
@@ -32,21 +37,49 @@ def _pytest_ini_options(pyproject: pathlib.Path) -> dict | None:
     """``[tool.pytest.ini_options]`` for *pyproject*, or ``None`` if it declares none.
 
     Shape copied from ``test_pytest_workspace_collection.py::_pytest_ini_options``,
-    with ONE deliberate difference: that helper returns ``{}`` both for an absent
-    file and for a config that declares no pytest table, which is right for a
-    caller reading a single key out of it. This module DISCOVERS configs by the
-    presence of that table, so the two cases have to be distinguishable — an
-    empty-but-present table would otherwise be skipped by discovery rather than
-    reported by a sweep as a config missing its keys, which is a vacuity hole
-    exactly where the sweeps can least afford one.
+    with two deliberate differences. That helper returns ``{}`` for a config
+    that declares no pytest table, which is right for a caller reading a single
+    key out of it. This module DISCOVERS configs by the presence of that table,
+    so an empty-but-present table has to be distinguishable from an absent one —
+    otherwise it would be skipped by discovery rather than reported by a sweep as
+    a config missing its keys, a vacuity hole exactly where the sweeps can least
+    afford one. That helper also returns ``{}`` for an absent FILE; here an
+    absent member file is refused by :func:`workspace_members` before this runs.
     """
-    if not pyproject.exists():
-        return None
     data = tomllib.loads(pyproject.read_text(encoding='utf-8'))
     pytest_table = data.get('tool', {}).get('pytest', {})
     if 'ini_options' not in pytest_table:
         return None
     return pytest_table['ini_options']
+
+
+def workspace_members(repo_root: pathlib.Path = REPO_ROOT) -> list[str]:
+    """``[tool.uv.workspace].members`` from *repo_root*'s pyproject.toml, never empty.
+
+    Every member it returns has a pyproject.toml. A member that silently dropped
+    out here would be a member no sweep checks, while the floors, carried by the
+    members already there, still passed — so both guards fail loudly instead.
+    """
+    root_pyproject = repo_root / 'pyproject.toml'
+    root_data = tomllib.loads(root_pyproject.read_text(encoding='utf-8'))
+    members = root_data.get('tool', {}).get('uv', {}).get('workspace', {}).get('members', [])
+
+    # A typo'd key here would make every discovery loop iterate nothing and turn
+    # every sweep built on it into a silent pass.
+    assert members, (
+        '[tool.uv.workspace].members is empty or missing in the root '
+        f'pyproject.toml at {repo_root} — discovery reads it to find which '
+        'subprojects to check, so every sweep would otherwise pass vacuously.'
+    )
+    for member in members:
+        pyproject = repo_root / member / 'pyproject.toml'
+        assert pyproject.is_file(), (
+            f'workspace member {member!r} has no pyproject.toml at {pyproject} — '
+            'uv rejects such a member, and each [tool.uv.workspace].members entry '
+            'is joined literally here (a glob is not expanded), so every sweep '
+            'would otherwise skip it.'
+        )
+    return members
 
 
 def discovered_pytest_configs(
@@ -59,23 +92,12 @@ def discovered_pytest_configs(
     defect the sweeps guard against is a config that nobody remembered to hold to
     a policy, and a hand-written list is the same class of forgetting.
 
-    Both anti-vacuity guards live HERE rather than in each caller, because they
+    The anti-vacuity guards — :func:`workspace_members`'s and the config-count
+    floor below — live in discovery rather than in each caller, because they
     are properties of DISCOVERY and every sweep depends on them.
     """
-    root_pyproject = repo_root / 'pyproject.toml'
-    root_data = tomllib.loads(root_pyproject.read_text(encoding='utf-8'))
-    members = root_data.get('tool', {}).get('uv', {}).get('workspace', {}).get('members', [])
-
-    # A typo'd key here would make the loop below iterate nothing and turn every
-    # sweep into a silent pass.
-    assert members, (
-        '[tool.uv.workspace].members is empty or missing in the root '
-        f'pyproject.toml at {repo_root} — discovery reads it to find which '
-        'subprojects to check, so every sweep would otherwise pass vacuously.'
-    )
-
     configs: dict[str, dict] = {}
-    for name in [ROOT_CONFIG_NAME, *members]:
+    for name in [ROOT_CONFIG_NAME, *workspace_members(repo_root)]:
         ini_options = _pytest_ini_options(repo_root / name / 'pyproject.toml')
         if ini_options is not None:
             configs[name] = ini_options
