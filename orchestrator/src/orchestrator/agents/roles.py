@@ -4,6 +4,12 @@ import textwrap
 from dataclasses import dataclass, field
 from typing import Literal
 
+from shared.followup_items import (
+    FOLLOWUP_ITEMS_METADATA_KEY,
+    FOLLOWUP_ITEMS_REFUSED_ERROR,
+    MAX_FOLLOWUP_ITEMS,
+    MAX_SUMMARY_CHARS,
+)
 from shared.governed_exceptions import DECLARATION_FORMS, INLINE_MARKER_FORMS
 from shared.prompt_artifact import PromptSpec
 
@@ -1477,7 +1483,9 @@ def submit_only_instructions(
 
     Args:
         metadata_template: The metadata dict literal to show in the submit_task call.
-            MUST include both ``escalation_id`` and ``suggestion_hash`` keys —
+            MUST include both ``escalation_id`` and ``suggestion_hash`` keys unless
+            the submit boundary derives them, as it does for the follow-up bundle
+            (``shared/src/shared/followup_items.py::with_derived_bundle_keys``) —
             once the agent stops calling ``resolve_ticket``, that R4 metadata
             is the only handle the interceptor has to dedupe re-queued triages.
         outcome_target: Role-specific outcome target string (e.g. 'resolve_issue
@@ -1535,9 +1543,9 @@ candidate so it is captured deterministically instead of left for a downstream
 reaper to maybe recover:
 """ + submit_only_instructions(
     '{"source": "agent-followup", "spawn_context": "agent_followup",\n'
-    '"spawned_from": "<this task id>", "files": ["path/to/file-or-dir", ...],\n'
-    '"escalation_id": "agent-followup-<this task id>",\n'
-    '"suggestion_hash": "<stable hash of the follow-up>"}',
+    '"spawned_from": "<this task id>", "files": ["<every file any item names>", ...],\n'
+    f'"{FOLLOWUP_ITEMS_METADATA_KEY}": [{{"summary": "<one standalone line, at most {MAX_SUMMARY_CHARS} chars>",\n'
+    '"files": ["path/to/file.py", ...]}, ...]}',
     outcome_target='iteration log',
     step_label='1',
     extra_submit_guidance=(
@@ -1545,8 +1553,17 @@ reaper to maybe recover:
         "steps you can just do. Use priority `low` unless the work is clearly more\n"
         "urgent. The `description` must stand alone WITHOUT your session context:\n"
         "name this task's id, the escalation id if one exists, the concrete file\n"
-        "paths, and the rationale verbatim. `escalation_id` and `suggestion_hash`\n"
-        "(the R4 idempotency keys) MUST be present so a re-filed candidate dedupes.\n"
+        "paths, and the rationale verbatim.\n"
+        "File ONE `submit_task` per area (a module or subsystem): each observation in\n"
+        f"that area is one entry of `{FOLLOWUP_ITEMS_METADATA_KEY}`, at most {MAX_FOLLOWUP_ITEMS} items, and a\n"
+        "further one starts a second call. A lone observation is a bundle of one.\n"
+        "Every item file must also be in the top-level `files`; name files, not\n"
+        "directories. Do not send `escalation_id`, `suggestion_hash` or item keys:\n"
+        "the submit boundary derives them from `spawned_from` and the items and\n"
+        "overwrites any you send, which is what makes a re-filed observation dedupe.\n"
+        f"A `{FOLLOWUP_ITEMS_REFUSED_ERROR}` error is the exception to skipping: it is\n"
+        "correctable, so fix what its `reason` and `detail` name (add the file to the\n"
+        "top-level `files`, or move the extra items into a second call) and resubmit once.\n"
         'An observation that is not a work item is not filed here: see "## Escalation".\n'
         "A one-time operational ask that no agent can carry out (restart a service,\n"
         "run a script after X lands) IS filed here too: add\n"

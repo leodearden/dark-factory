@@ -31,6 +31,7 @@ from _curator_helpers import make_config as _make_config
 from _curator_helpers import pool_with_ids as _pool_with_ids
 from _curator_helpers import prepared as _bundle
 from shared.cli_invoke import AgentResult, no_mcp_servers_config
+from shared.followup_items import observed_item
 from shared.neutral_cwd import neutral_cli_cwd
 from shared.prompt_artifact import (
     ArtifactProvenance,
@@ -625,6 +626,31 @@ class TestCandidateHash:
         b1 = CandidateTask(title='T', description='D', details='X', execution_class='operational')
         b2 = CandidateTask(title='T', description='D', details='X', execution_class='operational')
         assert b1.payload_hash() == b2.payload_hash()
+
+    @staticmethod
+    def _items(*summaries: str):
+        return tuple(observed_item(summary=s, files=['pkg/a.py'], origin_task='8414') for s in summaries)
+
+    def test_items_affect_hash(self):
+        """(task 8414) a cached curator decision is never served for a bundle whose items changed."""
+        one = CandidateTask(title='T', items=self._items('first'))
+        two = CandidateTask(title='T', items=self._items('first', 'second'))
+        other = CandidateTask(title='T', items=self._items('other'))
+        assert one.payload_hash() != two.payload_hash()
+        assert one.payload_hash() != other.payload_hash()
+
+    def test_item_order_insensitive(self):
+        a = CandidateTask(title='T', items=self._items('first', 'second'))
+        b = CandidateTask(title='T', items=self._items('second', 'first'))
+        assert a.payload_hash() == b.payload_hash()
+
+    def test_items_vs_none_differ(self):
+        a = CandidateTask(title='T', items=self._items('first'))
+        b = CandidateTask(title='T', items=())
+        assert a.payload_hash() != b.payload_hash()
+
+    def test_items_default_to_empty(self):
+        assert CandidateTask(title='T').items == ()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
