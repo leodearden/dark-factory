@@ -4,18 +4,30 @@
 Reads newline-separated staged paths on stdin and prints one ``<unit>\\t<command>``
 line per check: ``module:<prefix>:lint`` and ``module:<prefix>:type`` carry the
 registered module's own commands, verbatim, for every module the gate would
-execute for those paths. Exit 0 is a listing, possibly empty; exit 2 means no
-listing could be derived, with the named cause on stderr. Contract:
-plans/merge-lane-policy-prd.md D8 / §6 'Hook contract'.
+execute for those paths; ``screen:<id>`` runs one scripts/merge_screen.yaml check
+when a staged path is one the whole-tree screen reads. Exit 0 is a listing,
+possibly empty; exit 2 means no listing could be derived, with the named cause on
+stderr. Contract: plans/merge-lane-policy-prd.md D8 / §6 'Hook contract'.
 """
 from __future__ import annotations
 
 import os
 import sys
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
 
 import _checkout as _checkout
+import yaml
 from orchestrator.config import ConfigRequiredError, ModuleConfig, OrchestratorConfig, load_config
+from orchestrator.verify_cmd import (
+    ToolKind,
+    VerifyCmd,
+    apply_pytest_numprocesses,
+    parse_config_command,
+    render,
+    scope_to,
+)
 from orchestrator.verify_evidence import module_leg_name
 from orchestrator.verify_plan import (
     derive_verify_plan,
@@ -26,6 +38,11 @@ from orchestrator.verify_plan import (
 TOP_CONFIG = 'dark-factory-orchestrator.yaml'
 # A staged .py here can break any importer, so it type-checks every module (task 2551).
 DEPENDENCY_MODULES = frozenset({'shared', 'escalation'})
+SCREEN_MANIFEST = Path('scripts/merge_screen.yaml')
+SCREEN_TREES = ('plans/', 'docs/', 'review/')
+SCREEN_SUFFIXES = frozenset({'.yaml', '.json', '.md'})
+SCREEN_TOP_KEYS = frozenset({'checks'})
+SCREEN_ENTRY_KEYS = frozenset({'id', 'module', 'node_ids'})
 Unit = tuple[str, str]
 
 
@@ -85,6 +102,118 @@ def module_units(
     ]
 
 
+@dataclass(frozen=True)
+class ScreenCheck:
+    id: str
+    module: str
+    node_ids: tuple[str, ...]
+
+
+def member_package_dirs() -> frozenset[str]:
+    return frozenset(src.parent.relative_to(_checkout.ROOT).as_posix() for src in _checkout.MEMBER_SRC)
+
+
+def _screen_reads(path: str, package_dirs: frozenset[str]) -> bool:
+    if path.startswith(SCREEN_TREES):
+        return True
+    in_package = any(path.startswith(f'{pkg}/') for pkg in package_dirs)
+    return PurePosixPath(path).suffix in SCREEN_SUFFIXES and not in_package
+
+
+def screen_triggered(staged: list[str], package_dirs: frozenset[str]) -> bool:
+    return any(_screen_reads(path, package_dirs) for path in staged)
+
+
+def _screen_base(label: str, mc: ModuleConfig) -> VerifyCmd:
+    parsed = parse_config_command(mc.test_command) if mc.test_command else None
+    if parsed is None or parsed.raw is not None or parsed.tool is not ToolKind.PYTEST:
+        raise HookChecksError(
+            f'{label}: module {mc.prefix!r} test_command {mc.test_command!r} is not one '
+            'structured pytest command, so it cannot be scoped to node ids'
+        )
+    return parsed
+
+
+def _read_manifest(path: Path) -> list[object]:
+    try:
+        doc: object = yaml.safe_load(path.read_text(encoding='utf-8'))
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
+        raise HookChecksError(f'{SCREEN_MANIFEST}: unreadable screen manifest: {exc}') from exc
+    if not isinstance(doc, dict) or set(doc) != SCREEN_TOP_KEYS:
+        found = sorted(map(str, doc)) if isinstance(doc, dict) else type(doc).__name__
+        raise HookChecksError(
+            f'{SCREEN_MANIFEST}: top-level keys must be exactly {sorted(SCREEN_TOP_KEYS)}, found {found}'
+        )
+    checks = doc['checks']
+    if not isinstance(checks, list) or not checks:
+        raise HookChecksError(f'{SCREEN_MANIFEST}: checks must be a non-empty list, found {checks!r}')
+    return checks
+
+
+def _entry_fields(entry: object) -> tuple[str, Mapping[object, object]]:
+    if not isinstance(entry, dict):
+        raise HookChecksError(f'{SCREEN_MANIFEST}: a check must be a mapping, found {entry!r}')
+    label = f'{SCREEN_MANIFEST}: check {entry.get("id")!r}'
+    if set(entry) != SCREEN_ENTRY_KEYS:
+        raise HookChecksError(
+            f'{label}: keys must be exactly {sorted(SCREEN_ENTRY_KEYS)}, found {sorted(map(str, entry))}'
+        )
+    check_id = entry['id']
+    if not isinstance(check_id, str) or not check_id or any(char.isspace() for char in check_id):
+        raise HookChecksError(f'{label}: id must be a non-empty string with no whitespace')
+    return label, entry
+
+
+def _entry_node_ids(label: str, entry: Mapping[object, object], base: VerifyCmd) -> tuple[str, ...]:
+    node_ids = entry['node_ids']
+    if not isinstance(node_ids, list) or not node_ids or not all(isinstance(n, str) and n for n in node_ids):
+        raise HookChecksError(f'{label}: node_ids must be a non-empty list of strings, found {node_ids!r}')
+    cwd = _checkout.ROOT / (base.cwd_rel or '')
+    missing = [node for node in node_ids if not (cwd / node.split('::', 1)[0]).exists()]
+    if missing:
+        raise HookChecksError(f'{label}: node id file missing under {cwd}: {missing}')
+    return tuple(node_ids)
+
+
+def _screen_check(entry: object, by_prefix: Mapping[str, ModuleConfig]) -> ScreenCheck:
+    label, fields = _entry_fields(entry)
+    module = fields['module']
+    mc = by_prefix.get(module) if isinstance(module, str) else None
+    if mc is None:
+        raise HookChecksError(f'{label}: module {module!r} is not a registered module')
+    node_ids = _entry_node_ids(label, fields, _screen_base(label, mc))
+    return ScreenCheck(str(fields['id']), mc.prefix, node_ids)
+
+
+def load_screen_checks(path: Path, registry: list[ModuleConfig]) -> tuple[ScreenCheck, ...]:
+    by_prefix = {mc.prefix: mc for mc in registry}
+    checks = [_screen_check(entry, by_prefix) for entry in _read_manifest(path)]
+    ids = [check.id for check in checks]
+    duplicates = sorted({check_id for check_id in ids if ids.count(check_id) > 1})
+    if duplicates:
+        raise HookChecksError(f'{SCREEN_MANIFEST}: duplicate check id(s) {duplicates}')
+    return tuple(checks)
+
+
+def screen_units(checks: Sequence[ScreenCheck], registry: list[ModuleConfig]) -> list[Unit]:
+    by_prefix = {mc.prefix: mc for mc in registry}
+    units: list[Unit] = []
+    for check in checks:
+        base = _screen_base(f'screen check {check.id!r}', by_prefix[check.module])
+        scoped = apply_pytest_numprocesses(scope_to(base, list(check.node_ids)), '0')
+        units.append((f'screen:{check.id}', render(scoped)))
+    return units
+
+
+def listed_units(staged: list[str]) -> list[Unit]:
+    config, registry = load_registry()
+    units = module_units(staged, registry, config)
+    if not screen_triggered(staged, member_package_dirs()):
+        return units
+    checks = load_screen_checks(_checkout.ROOT / SCREEN_MANIFEST, registry)
+    return [*units, *screen_units(checks, registry)]
+
+
 def _render(units: Sequence[Unit]) -> Iterator[str]:
     for unit, command in units:
         if '\t' in command or '\n' in command:
@@ -95,8 +224,7 @@ def _render(units: Sequence[Unit]) -> Iterator[str]:
 def main() -> int:
     staged = read_staged(sys.stdin.read())
     try:
-        config, registry = load_registry()
-        lines = list(_render(module_units(staged, registry, config)))
+        lines = list(_render(listed_units(staged)))
     except HookChecksError as exc:
         print(f'hook_module_checks: {exc}', file=sys.stderr)
         return 2
