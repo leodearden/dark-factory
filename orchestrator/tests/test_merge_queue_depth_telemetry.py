@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -53,15 +54,15 @@ from orchestrator.verify import VerifyResult
 
 
 def _sentinel_entry() -> InflightEntry:
-    """Opaque, identity-only stand-in for a real ``InflightEntry``.
+    """Stand-in for a frozen ``InflightEntry`` that is built on nothing.
 
-    Mirrors test_merge_queue_single_writer_asserts.py's ``_sentinel_entry``:
-    the tests below only care about the *count* of frozen entries
-    (``_verify_frontier_depth`` is a pure ``len()`` delegation), never their
-    fields, so a bare ``object()`` cast to ``InflightEntry`` is enough at
-    runtime without constructing a real merge-result/lease graph.
+    The tests below care about the *count* of frozen entries
+    (``_verify_frontier_depth`` is a pure ``len()`` delegation).  Dispatch
+    also reads each entry's ``item`` and ``gate`` for the bases a new item
+    may stack on; ``None`` for both contributes no base commit, so no real
+    merge-result/lease graph is needed.
     """
-    return cast(InflightEntry, object())
+    return cast(InflightEntry, SimpleNamespace(item=None, gate=None))
 
 
 # ---------------------------------------------------------------------------
