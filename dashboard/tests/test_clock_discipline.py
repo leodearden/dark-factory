@@ -18,6 +18,9 @@ same protection as the data layer. Routes read the present only through
 installed, so a test can pin every instant a route serves. A stricter route
 guard enforces that over app.py and `dashboard/api/*.py` (minus the seam's own
 module): no `.now(` call there even when tagged, and no `resolve_now` call.
+A third guard imports each route module and requires every call to a
+dashboard function that takes `now`, `served_at` or `measured_at` to pass it,
+so an installed clock controls a route's whole body, not just its stamp.
 The scan covers
 `dashboard/data/*.py`, `app.py`, `dashboard/api/*.py` and `loops.py` — the
 data layer plus every module the composition layer was split into (task
@@ -26,7 +29,7 @@ data layer plus every module the composition layer was split into (task
 follows them rather than quietly shedding the coverage). `_scanned_modules`
 is the one definition of that set: every real-tree test below reads it, and
 it fails loudly when any part of the set goes missing. No module beyond
-those is scanned by either guard; that boundary is intentional, not an
+those is scanned by any guard here; that boundary is intentional, not an
 oversight.
 
 The matcher intentionally does not require the receiver to be a bare
@@ -59,7 +62,10 @@ and bound as a parameter. A literal that only names the function in prose
 from __future__ import annotations
 
 import ast
+import importlib
+import inspect
 import re
+import types
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -134,6 +140,51 @@ def find_route_clock_violations(source: str) -> list[tuple[int, str]]:
             or _is_resolve_now_call(node)
         )
     ]
+
+
+_CLOCK_PARAMETERS = frozenset({'now', 'served_at', 'measured_at'})
+
+
+def _resolve_callee(module: types.ModuleType, func: ast.expr) -> object:
+    """The object a ``name(...)`` or ``name.attr(...)`` call reaches through *module*'s globals."""
+    if isinstance(func, ast.Name):
+        return vars(module).get(func.id)
+    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+        return getattr(vars(module).get(func.value.id), func.attr, None)
+    return None
+
+
+def _passes(call: ast.Call, parameters: list[inspect.Parameter], parameter: inspect.Parameter) -> bool:
+    if any(keyword.arg in (parameter.name, None) for keyword in call.keywords):
+        return True
+    if any(isinstance(arg, ast.Starred) for arg in call.args):
+        return True
+    positional = (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    return parameter.kind in positional and parameters.index(parameter) < len(call.args)
+
+
+def find_unthreaded_clock_calls(module: types.ModuleType, source: str) -> list[tuple[int, str]]:
+    """Return ``(line, message)`` for every call in *source* that leaves a clocked callee's instant unset.
+
+    A callee is clocked when it resolves through *module*'s globals to a
+    ``dashboard.*`` function with a parameter in :data:`_CLOCK_PARAMETERS`.
+    The call passes that parameter by keyword, by position, or through
+    ``*args`` / ``**kwargs``; otherwise the callee reads the live clock.
+    """
+    violations: list[tuple[int, str]] = []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Call):
+            continue
+        callee = _resolve_callee(module, node.func)
+        if not (inspect.isfunction(callee) and callee.__module__.startswith('dashboard.')):
+            continue
+        parameters = list(inspect.signature(callee).parameters.values())
+        violations.extend(
+            (node.lineno, f'{callee.__module__}.{callee.__qualname__} missing {parameter.name}=')
+            for parameter in parameters
+            if parameter.name in _CLOCK_PARAMETERS and not _passes(node, parameters, parameter)
+        )
+    return sorted(violations)
 
 
 def _iter_non_docstring_string_literals(tree: ast.AST) -> Iterator[tuple[int, str]]:
@@ -270,6 +321,48 @@ def test_route_guard_accepts_the_app_clock():
     """Calling the clock `app_clock` returns is the one sanctioned route read."""
     source = 'clock = app_clock(request.app)\nrender_at = clock()\nserved_at = clock()\n'
     assert find_route_clock_violations(source) == []
+
+
+_CLOCKED_ROUTE_SOURCE = '''
+async def reader(db, *, now=None):
+    return now
+
+
+def positional_reader(db, now=None):
+    return now
+
+
+async def route(db, now, options):
+    await reader(db)
+    await reader(db, now=now)
+    await reader(db, **options)
+    positional_reader(db)
+    positional_reader(db, now)
+'''
+
+
+def _fixture_route_module() -> types.ModuleType:
+    module = types.ModuleType('dashboard._clocked_route_fixture')
+    exec(compile(_CLOCKED_ROUTE_SOURCE, '<fixture>', 'exec'), vars(module))
+    return module
+
+
+def test_unthreaded_clock_guard_flags_only_the_calls_that_drop_the_instant():
+    """An un-threaded call fires; keyword, positional and **kwargs threading do not."""
+    violations = find_unthreaded_clock_calls(_fixture_route_module(), _CLOCKED_ROUTE_SOURCE)
+
+    assert violations == [
+        (11, 'dashboard._clocked_route_fixture.reader missing now='),
+        (14, 'dashboard._clocked_route_fixture.positional_reader missing now='),
+    ]
+
+
+def test_unthreaded_clock_guard_ignores_callees_outside_dashboard():
+    """A clocked function from outside the dashboard package is not the route's to thread."""
+    module = types.ModuleType('elsewhere')
+    exec(compile(_CLOCKED_ROUTE_SOURCE, '<fixture>', 'exec'), vars(module))
+
+    assert find_unthreaded_clock_calls(module, _CLOCKED_ROUTE_SOURCE) == []
 
 
 # ---------------------------------------------------------------------------
@@ -465,6 +558,30 @@ def test_routes_read_the_present_only_through_the_app_clock():
     assert not violations, (
         'Route clock reads that bypass dashboard.api.clock.app_clock (take '
         '`clock = app_clock(request.app)` and call it instead):\n' + '\n'.join(violations)
+    )
+
+
+def _module_name(path: Path) -> str:
+    parts = path.relative_to(_SRC_ROOT).with_suffix('').parts
+    return '.'.join(parts[:-1] if parts[-1] == '__init__' else parts)
+
+
+def test_routes_pass_their_instant_to_every_clocked_callee():
+    """Every route call to a dashboard function taking now/served_at/measured_at passes it.
+
+    A reader handed to ``asyncio.to_thread`` is an argument, not a Call node, and is out of reach.
+    """
+    violations = [
+        f'{path.relative_to(_SRC_ROOT)}:{lineno}: {message}'
+        for path in _route_modules()
+        for lineno, message in find_unthreaded_clock_calls(
+            importlib.import_module(_module_name(path)), path.read_text(),
+        )
+    ]
+
+    assert not violations, (
+        'Route calls that leave a reader on the live clock (pass the route '
+        'instant from app_clock):\n' + '\n'.join(violations)
     )
 
 
