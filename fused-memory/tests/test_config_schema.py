@@ -4340,6 +4340,44 @@ class TestWriteJournalConfig:
         assert section.prune_max_seconds == 30.0
         assert section.prune_interval_seconds == 1800.0
         assert section.referent_findings_retention_days == 365.0
+        assert section.mem0_intents_retention_days == 30.0
+        assert section.idempotent_ops_retention_days == 7.0
+
+    @pytest.mark.parametrize(
+        ('field', 'env_name', 'days'),
+        [
+            ('mem0_intents_retention_days', 'WRITE_JOURNAL_MEM0_INTENTS_RETENTION_DAYS', 30.0),
+            ('idempotent_ops_retention_days', 'WRITE_JOURNAL_IDEMPOTENT_OPS_RETENTION_DAYS', 7.0),
+        ],
+    )
+    def test_small_table_horizon_ships_at_its_default_and_is_env_tunable(
+        self, monkeypatch, field, env_name, days,
+    ):
+        from fused_memory.config.schema import WriteJournalConfig
+
+        monkeypatch.delenv(env_name, raising=False)
+        assert getattr(WriteJournalConfig(), field) == days
+        assert getattr(FusedMemoryConfig().write_journal, field) == days
+
+        monkeypatch.setenv(env_name, '3')
+        assert getattr(FusedMemoryConfig().write_journal, field) == 3.0, (
+            f'RED: {env_name} must reach write_journal.{field} through config.yaml; '
+            'WriteJournalConfig ignores unknown keys, so a misspelled leaf reads '
+            'silently as the schema default'
+        )
+
+    @pytest.mark.parametrize(
+        'field', ['mem0_intents_retention_days', 'idempotent_ops_retention_days'],
+    )
+    def test_a_non_positive_small_table_horizon_is_rejected(self, field):
+        from fused_memory.config.schema import WriteJournalConfig
+
+        with pytest.raises(ValidationError) as excinfo:
+            WriteJournalConfig.model_validate({field: 0})
+        assert field in str(excinfo.value), (
+            'RED: a 0-day horizon deletes every row of its table at each startup; '
+            'the rejection must name the field'
+        )
 
     def test_search_rows_outlive_task_read_rows(self):
         section = FusedMemoryConfig().write_journal
