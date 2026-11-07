@@ -6,8 +6,10 @@ import threading
 import time
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.message import Message
+from enum import StrEnum
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -32,6 +34,11 @@ _NOT_RETURNED = _HOP_BY_HOP | {'date', 'server'}
 Headers = list[tuple[str, str]]
 
 
+class StatusOrigin(StrEnum):
+    UPSTREAM = 'upstream'
+    TAP = 'tap'
+
+
 class CallRecord(FrozenModel):
     started_at: AwareDatetime
     duration_ms: float = Field(ge=0)
@@ -46,6 +53,8 @@ class CallRecord(FrozenModel):
     finish_reason: str | None
     error_excerpt: str | None
     outlived_session: bool = False
+    # None marks a record written before the tap recorded who set the status.
+    status_origin: StatusOrigin | None = None
 
     @property
     def succeeded(self) -> bool:
@@ -85,6 +94,7 @@ def call_record(
     request_body: bytes,
     status: int,
     response_body: bytes,
+    status_origin: StatusOrigin,
 ) -> CallRecord:
     request = _json_object(request_body)
     response = _json_object(response_body) if is_success_status(status) else {}
@@ -106,6 +116,7 @@ def call_record(
         error_excerpt=None
         if is_success_status(status)
         else response_body.decode('utf-8', 'replace')[:ERROR_EXCERPT_CHARS],
+        status_origin=status_origin,
     )
 
 
@@ -147,14 +158,22 @@ class _SessionCallLog:
             stream.flush()
 
 
-def _tap_error(status: int, message: str) -> tuple[int, Headers, bytes]:
+@dataclass(frozen=True)
+class _Reply:
+    status: int
+    headers: Headers
+    body: bytes
+    origin: StatusOrigin
+
+
+def _tap_error(status: int, message: str) -> _Reply:
     body = json.dumps({'error': {'message': message, 'type': 'usage_tap'}}).encode()
-    return status, [('Content-Type', 'application/json')], body
+    return _Reply(status, [('Content-Type', 'application/json')], body, StatusOrigin.TAP)
 
 
 def _exchange(
     upstream: SplitResult, method: str, path: str, headers: Message, body: bytes
-) -> tuple[int, Headers, bytes]:
+) -> _Reply:
     if _json_object(body).get('stream') is True:
         return _tap_error(
             STREAM_REFUSED_STATUS,
@@ -170,7 +189,9 @@ def _exchange(
     try:
         connection.request(method, path, body=body, headers=forwarded)
         response = connection.getresponse()
-        return response.status, response.getheaders(), response.read()
+        return _Reply(
+            response.status, response.getheaders(), response.read(), StatusOrigin.UPSTREAM
+        )
     except (OSError, http.client.HTTPException) as error:
         return _tap_error(
             UPSTREAM_UNREACHABLE_STATUS,
@@ -200,25 +221,24 @@ def _handler_class(
                 started_at = datetime.now(UTC)
                 started = time.perf_counter()
                 body = self.rfile.read(int(self.headers.get('Content-Length') or 0))
-                status, headers, response_body = _exchange(
-                    upstream, self.command, self.path, self.headers, body
-                )
+                reply = _exchange(upstream, self.command, self.path, self.headers, body)
                 call_log.append(call_record(
                     started_at=started_at,
                     duration_ms=(time.perf_counter() - started) * 1000,
                     method=self.command,
                     path=self.path,
                     request_body=body,
-                    status=status,
-                    response_body=response_body,
+                    status=reply.status,
+                    response_body=reply.body,
+                    status_origin=reply.origin,
                 ))
-            self.send_response(status)
-            for name, value in headers:
+            self.send_response(reply.status)
+            for name, value in reply.headers:
                 if name.lower() not in _NOT_RETURNED:
                     self.send_header(name, value)
-            self.send_header('Content-Length', str(len(response_body)))
+            self.send_header('Content-Length', str(len(reply.body)))
             self.end_headers()
-            self.wfile.write(response_body)
+            self.wfile.write(reply.body)
 
     return TapHandler
 
