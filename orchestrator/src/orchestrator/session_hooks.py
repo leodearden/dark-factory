@@ -18,8 +18,10 @@ or hand-launched) keys on a registry pointer, else on its stdin
 
 IMPORT CONTRACT. ``skills/spawn/hooks/*.sh`` run this file by absolute path
 from a plain shell with only ``PYTHONPATH=<repo>/orchestrator/src``: no venv,
-no install. ``from orchestrator import ...`` works; a module-scope ``shared``
-or third-party import makes every hook die quietly. Pinned and mutation-tested
+no install. ``from orchestrator import ...`` works. ``shared`` leaves are
+reachable only below the ``session_registry`` import, whose bootstrap appends
+shared/src; a ``shared`` import above it, or any third-party import, makes
+every hook die quietly. Pinned and mutation-tested
 by the ``session_hooks.py`` row of
 ``orchestrator/tests/test_session_registry.py::TestStdlibOnlySelfContainment``.
 ``session_ownership_probes`` carries the same contract under its own row.
@@ -46,6 +48,11 @@ from typing import Any
 from orchestrator import session_registry
 from orchestrator.session_ownership_probes import EventProbes, ProcessTree
 from orchestrator.session_self_exit import SelfExit
+
+# session_registry's import puts this checkout's shared/src on sys.path for the bare shell.
+# isort: split
+from shared.process_identity import Liveness
+from shared.session_liveness import judge
 
 logger = logging.getLogger(__name__)
 
@@ -523,21 +530,37 @@ def _bind_claude_session_id(
     record.claude_session_id = hook_session_id
     # The pid later tells a re-mint inside the owner from a nested claude;
     # None, when unresolvable, reads back as "cannot prove ownership".
-    record.claude_owner_pid = probes.owning_claude_pid()
+    _stamp_owner(record, probes.owning_claude_pid())
     return True
 
 
+def _stamp_owner(record: session_registry.SessionRecord, pid: int | None) -> None:
+    """Write *record*'s owner pid and its identity together, so the pair never diverges."""
+    record.claude_owner_pid = pid
+    record.claude_owner_identity = (
+        None if pid is None else session_registry.capture_for_record(pid)
+    )
+
+
 def _reclaim_dead_owner_pid(record: session_registry.SessionRecord, probes: EventProbes) -> bool:
-    """Re-stamp *record*'s ``claude_owner_pid`` with this event's claude pid iff no live process holds it.
+    """Re-stamp *record*'s owner with this event's claude pid iff its recorded owner is judged DEAD.
 
     A live recorded owner keeps the record: that is a nested ``claude
-    --resume`` of the same session id. Returns whether *record* was mutated.
+    --resume`` of the same session id. An owner on another host, or one
+    /proc cannot answer for, keeps it too. Returns whether *record* was
+    mutated.
     """
     pid = probes.owning_claude_pid()
     owner = record.claude_owner_pid
-    if pid is None or owner == pid or (owner is not None and session_registry.pid_alive(owner)):
+    if pid is None or owner == pid:
         return False
-    record.claude_owner_pid = pid
+    if (
+        owner is not None
+        and judge(record.claude_owner_identity, owner, pid_alive=session_registry.pid_alive)
+        is not Liveness.DEAD
+    ):
+        return False
+    _stamp_owner(record, pid)
     return True
 
 
@@ -885,6 +908,7 @@ def run_session_start(
             escalation_id=identity.escalation_id,
             cwd=cwd,
             launcher_pid=launcher_pid,
+            launcher_identity=session_registry.capture_for_record(launcher_pid),
             start_ts=datetime.now(UTC).isoformat(),
             transcript_path=session_registry.transcript_path_for_cwd(cwd),
         )

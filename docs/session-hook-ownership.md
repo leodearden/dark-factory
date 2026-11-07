@@ -112,9 +112,10 @@ claude's pid finds the record, and the pid condition above holds. The
 re-bind also writes a session-id pointer for the new id. A T3 thread that T3
 resumes in a new process keeps its session id.
 
-When no live process holds the recorded `claude_owner_pid`, the resumed
-process's event re-stamps it with the new claude. This dead-owner reclaim
-applies on two lanes:
+When the recorded owner is judged dead
+(`shared/src/shared/session_liveness.py::judge`), the resumed process's event
+re-stamps it with the new claude. An owner on another host is never
+reclaimed. This dead-owner reclaim applies on two lanes:
 
 - an event reached through its session-id pointer;
 - an event reached through the hand-launched keying, whose slug embeds that
