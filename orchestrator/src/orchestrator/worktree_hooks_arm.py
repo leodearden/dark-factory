@@ -27,6 +27,7 @@ _PIN_CANNOT_FIX_RC = 2
 class HooksArmOutcome(Enum):
     ARMED = 'armed'
     PIN_CANNOT_FIX = 'pin_cannot_fix'
+    TIMED_OUT = 'timed_out'
     FAILED = 'failed'
     NO_SCRIPT = 'no_script'
     NOT_EXECUTABLE = 'not_executable'
@@ -61,13 +62,13 @@ async def _arm(worktree: Path, timeout_secs: float) -> HooksArmOutcome:
         cwd=worktree, timeout=timeout_secs, bounded=False,
     )
     outcome = _outcome_for(result)
-    _log_outcome(worktree, outcome, result, timeout_secs)
+    _log_outcome(worktree, outcome, result)
     return outcome
 
 
 def _outcome_for(result: GitResult) -> HooksArmOutcome:
     if result.timed_out:
-        return HooksArmOutcome.FAILED
+        return HooksArmOutcome.TIMED_OUT
     if result.returncode == 0:
         return HooksArmOutcome.ARMED
     if result.returncode == _PIN_CANNOT_FIX_RC:
@@ -75,9 +76,7 @@ def _outcome_for(result: GitResult) -> HooksArmOutcome:
     return HooksArmOutcome.FAILED
 
 
-def _log_outcome(
-    worktree: Path, outcome: HooksArmOutcome, result: GitResult, timeout_secs: float,
-) -> None:
+def _log_outcome(worktree: Path, outcome: HooksArmOutcome, result: GitResult) -> None:
     stderr = result.stderr.strip()
     if outcome is HooksArmOutcome.ARMED:
         logger.info('arm_worktree_hooks: stash-guard hooks armed in %s', worktree)
@@ -87,11 +86,11 @@ def _log_outcome(
             'hooks stay unarmed: %s',
             worktree, result.returncode, stderr,
         )
-    elif result.timed_out:
+    elif outcome is HooksArmOutcome.TIMED_OUT:
         logger.warning(
-            'arm_worktree_hooks: arm timed out after %.1fs for %s; its stash-guard '
-            'hooks may be unarmed: %s',
-            timeout_secs, worktree, stderr,
+            'arm_worktree_hooks: arm did not finish for %s (%s); its stash-guard '
+            'hooks may be unarmed',
+            worktree, stderr,
         )
     else:
         logger.warning(

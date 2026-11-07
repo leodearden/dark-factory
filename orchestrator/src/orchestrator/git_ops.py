@@ -4993,12 +4993,12 @@ class GitOps:
                             worktree_path, actual_base[:8],
                         )
 
+                await arm_worktree_hooks(worktree_path)
                 # Re-run on reuse so the requeued agent re-acquires a free
                 # port and re-patches its .mcp.json.  The script must be
                 # idempotent (return the same port for the same worktree dir)
                 # to avoid leaking ports across requeues — see the docstring
                 # of _provision_reify_debug_port for the full contract.
-                await arm_worktree_hooks(worktree_path)
                 port = await self._provision_reify_debug_port(worktree_path)
                 return WorktreeInfo(
                     path=worktree_path,

@@ -146,7 +146,7 @@ class TestArmWorktreeHooks:
         assert len(_arm_warnings(caplog)) == 1
         assert not log.exists()
 
-    async def test_wedged_guard_times_out_as_failed(
+    async def test_wedged_guard_is_timed_out_and_warns_with_the_timeout(
         self, wt: Path, caplog: pytest.LogCaptureFixture,
     ):
         _write_guard(wt, '#!/usr/bin/env bash\nsleep 30\n')
@@ -156,11 +156,12 @@ class TestArmWorktreeHooks:
             outcome = await arm_worktree_hooks(wt, timeout_secs=0.5)
         elapsed = time.monotonic() - started
 
-        assert outcome is HooksArmOutcome.FAILED
+        assert outcome is HooksArmOutcome.TIMED_OUT
         assert elapsed < 10
         warnings = _arm_warnings(caplog)
         assert len(warnings) == 1
-        assert 'timed out' in warnings[0]
+        assert str(wt) in warnings[0]
+        assert 'timed out after 0.5s' in warnings[0]
 
 
 _PLAIN_SEED_SCRIPT = '#!/usr/bin/env bash\nmkdir -p "$2/target"\nexit 0\n'
