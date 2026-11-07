@@ -5875,18 +5875,21 @@ async def _read_x_probe_task_ids(backend, project_root):
     ],
 )
 async def test_warm_cached_reader_sees_out_of_band_commit(
-    backend, project_root, monkeypatch, out_of_band_sql, read, stale, fresh,
+    backend, project_root, tmp_path, monkeypatch, out_of_band_sql, read, stale, fresh,
 ):
     """A warm cached reader observes a commit another process made, on the SAME connection.
 
     The zero ``connect_daemon`` count after the commit is what makes the
     freshness meaningful: a cache that quietly reopened its connection would
-    see the commit trivially.
+    see the commit trivially.  The same reader on a cold project must then
+    count one connect, or the spy is not on the bring-up path at all.
     """
     from shared.async_sqlite_base import apply_wal_pragmas
 
     from fused_memory.backends import sqlite_task_backend as _sb
 
+    cold_root = str(tmp_path / 'cold-proj')
+    await backend.add_task(project_root=cold_root, title='C1')  # warms only the write side
     await backend.add_task(project_root=project_root, title='T1')  # id=1
     await backend.add_task(project_root=project_root, title='T2')  # id=2
     await backend.set_task_status('1', 'done', project_root)
@@ -5914,6 +5917,9 @@ async def test_warm_cached_reader_sees_out_of_band_commit(
 
     assert await read(backend, project_root) == fresh
     assert connects == 0, f'Expected the reread to reuse the warm connection, opened {connects}'
+
+    await read(backend, cold_root)
+    assert connects == 1, f'Expected one read-connection bring-up on a cold project, counted {connects}'
 
 
 @pytest.mark.asyncio
