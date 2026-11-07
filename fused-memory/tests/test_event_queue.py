@@ -1790,6 +1790,7 @@ async def test_close_leaves_every_handed_off_record_on_disk_and_its_row_released
     assert len(records) == len(dead_lettered), evidence
     assert stats['dead_letters_pending'] == 0, evidence
     assert stats['dead_letters'] == len(records), evidence
+    assert stats['dead_letters'] >= stats['overflow_drops'] > 0, evidence
     assert {r['reason'] for r in records} <= {'overflow_drop', 'shutdown_timeout'}, evidence
 
 
