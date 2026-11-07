@@ -34,6 +34,7 @@ from _prd_lanes_tree import (
 )
 from _prd_tree import prd_tree_tasks
 from _runs_db_fixture import EVENTS_DDL, EventRow, runs_db_path, write_runs_db
+from _served_reads import forget_escalation_corpus, forget_served_reads
 from escalation.archive import archive_dir_for_date
 from escalation.models import DeliveredCheckOwner, Escalation
 from escalation.queue import EscalationQueue
@@ -43,16 +44,11 @@ from shared.locking import files_to_modules
 from shared.task_statuses import TaskStatus
 
 import dashboard.data.task_snapshot as snapshot_mod
-from dashboard.api.escalations import _analytics_memo_clear
 from dashboard.app import app
 from dashboard.config import DashboardConfig
 from dashboard.data import escalation_corpus
-from dashboard.data.active_tasks import reset_task_snapshot_state
 from dashboard.data.burndown import BURNDOWN_SCHEMA, collect_snapshot
-from dashboard.data.prd_signal import clear_prd_documents
-from dashboard.data.scheduler import _scheduler_cache_clear, clear_scheduler_state
-from dashboard.data.task_activity import clear_activity_state
-from dashboard.data.task_lineage import clear_lineage_state
+from dashboard.data.scheduler import _scheduler_cache_clear
 
 T0 = datetime(2026, 10, 4, 9, 0, 0, tzinfo=UTC)
 """The instant every scenario's first render is served at."""
@@ -286,16 +282,6 @@ def _quietly(labels: Iterable[str]) -> dict[str, Callable[[Path], object]]:
     return dict.fromkeys(labels, quiet_ledgers)
 
 
-def forget_served_reads() -> None:
-    """Every access store a route reads, forgotten through its own public hook."""
-    reset_task_snapshot_state()
-    clear_lineage_state()
-    clear_scheduler_state()
-    clear_activity_state()
-    clear_prd_documents()
-    _clear_corpus()
-
-
 def _get(client: TestClient, path: str, **params: str) -> dict[str, Any]:
     resp = client.get(path, params=params)
     assert resp.status_code == 200, resp.text
@@ -474,12 +460,6 @@ def _window_family(client: TestClient, workdir: Path) -> dict[str, Any]:
     return bodies
 
 
-def _clear_corpus() -> None:
-    """Forget the corpus walk and the analytics derived from it, through their own hooks."""
-    escalation_corpus._corpus_cache_clear()
-    _analytics_memo_clear()
-
-
 def _file_escalations(config: DashboardConfig) -> None:
     """File :data:`ESCALATIONS_FILED` pending records, then move the last few under the archive.
 
@@ -557,14 +537,14 @@ def _corpus_family(client: TestClient, workdir: Path) -> dict[str, Any]:
         _file_escalations(app.state.config)
         for hours, (generation, ttl) in enumerate(CORPUS_TTL_GENERATIONS.items()):
             at = T0 + timedelta(hours=hours)
-            _clear_corpus()
+            forget_escalation_corpus()
             with (
                 patch.object(escalation_corpus, 'CORPUS_TTL_SECONDS', ttl),
                 installed_clock(app, fixed_clock(at)),
             ):
                 bodies[f'escalations_{generation}'] = _get(client, ESCALATIONS)
                 bodies[f'analytics_{generation}'] = _get(client, ESCALATION_ANALYTICS)
-        _clear_corpus()
+        forget_escalation_corpus()
 
     with _canned_roots(client, workdir / 'memory', {'dark-factory': _substrate(REIFY_COUNTS)}):
         _write_memory_ops(app.state.config)
@@ -597,7 +577,7 @@ def _check_owner_family(client: TestClient, workdir: Path) -> dict[str, Any]:
     owner-carrying row is checked against a shape the route really serves.
     """
     with _canned_roots(client, workdir / 'check_owner', {'dark-factory': _substrate(REIFY_COUNTS)}):
-        _clear_corpus()
+        forget_escalation_corpus()
         config = app.state.config
         queue = EscalationQueue(config.escalations_dir)
         queue.submit(Escalation(
@@ -619,7 +599,7 @@ def _check_owner_family(client: TestClient, workdir: Path) -> dict[str, Any]:
             with installed_clock(app, fixed_clock(T0)):
                 return {'escalations_check_owner': _get(client, ESCALATIONS)}
         finally:
-            _clear_corpus()
+            forget_escalation_corpus()
 
 
 PRD_C = 'plans/c-prd.md'

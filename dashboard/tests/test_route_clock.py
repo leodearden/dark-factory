@@ -9,11 +9,10 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import pytest
-from _boundary_payloads import forget_served_reads
 from _dt_helpers import fixed_clock, installed_clock
+from _served_reads import forget_served_reads
 
 from dashboard.api.clock import app_clock, live_clock
-from dashboard.app import _memory_evals_cache_clear
 
 # A PAST instant no live read can equal; a stale read is the worst it can leak.
 FIXED = datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
@@ -74,9 +73,5 @@ def test_the_terminal_answer_serves_at_the_installed_clock(client):
 
 
 def test_memory_evals_are_generated_at_the_installed_clock(client):
-    _memory_evals_cache_clear()
-    try:
-        body = _get_at_the_installed_clock(client, '/api/v2/dashboard/memory-evals', {})
-    finally:
-        _memory_evals_cache_clear()
+    body = _get_at_the_installed_clock(client, '/api/v2/dashboard/memory-evals', {})
     assert body['MEMORY_EVALS']['generated_at'] == FIXED.isoformat()
