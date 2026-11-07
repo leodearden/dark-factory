@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 
 import pytest
@@ -21,6 +22,7 @@ from shared.followup_items import (
     merge_items,
     observed_item,
     require_unique_item_keys,
+    with_derived_bundle_keys,
 )
 from shared.task_metadata import parse_metadata
 
@@ -273,3 +275,164 @@ class TestMetadataRegistration:
 def test_the_contract_constants() -> None:
     assert FOLLOWUP_ITEMS_METADATA_KEY == 'followup_items'
     assert MAX_FOLLOWUP_ITEMS == 5
+
+
+# --- The submit-boundary derivation ------------------------------------------------
+
+
+def _raw(summary: str, *files: str, **extra: object) -> dict[str, object]:
+    return {'summary': summary, 'files': list(files), **extra}
+
+
+def _bundle(*items: object, **top: object) -> dict[str, object]:
+    return {
+        'source': 'agent-followup',
+        'spawn_context': 'agent_followup',
+        'spawned_from': '8414',
+        'files': ['pkg/a.py', 'pkg/b.py', 'pkg/c.py'],
+        'x_note': 'kept',
+        FOLLOWUP_ITEMS_METADATA_KEY: list(items) if items else [
+            _raw('one', 'pkg/a.py'), _raw('two', 'pkg/b.py', 'pkg/c.py'),
+        ],
+        **top,
+    }
+
+
+def _stored(output: dict[str, object]) -> list[dict[str, object]]:
+    items = output[FOLLOWUP_ITEMS_METADATA_KEY]
+    assert isinstance(items, list)
+    return items
+
+
+class TestWithDerivedBundleKeys:
+    def test_metadata_without_items_comes_back_as_an_equal_new_dict(self) -> None:
+        metadata = {'source': 'steward', 'escalation_id': 'esc-1', 'suggestion_hash': 'h'}
+        output = with_derived_bundle_keys(metadata)
+        assert output == metadata
+        assert output is not metadata
+
+    @pytest.mark.parametrize('spawned_from', [8414, '8414'])
+    def test_a_parented_bundle_derives_every_item_identity(self, spawned_from: object) -> None:
+        output = with_derived_bundle_keys(_bundle(spawned_from=spawned_from))
+
+        assert output['escalation_id'] == 'agent-followup-8414'
+        for stored in _stored(output):
+            assert stored['origin_task'] == '8414'
+            assert stored['origin_escalation_id'] == 'agent-followup-8414'
+            assert stored['key'] == item_key(
+                origin_task='8414', files=stored['files'], summary=stored['summary'],  # type: ignore[arg-type]
+            )
+
+    def test_caller_supplied_identities_are_overwritten(self) -> None:
+        forged = {'key': 'forged', 'origin_task': '1', 'origin_escalation_id': 'esc-forged'}
+        honest = with_derived_bundle_keys(_bundle())
+        output = with_derived_bundle_keys(_bundle(
+            _raw('one', 'pkg/a.py', **forged),
+            _raw('two', 'pkg/b.py', 'pkg/c.py', **forged),
+            escalation_id='esc-forged',
+            suggestion_hash='forged',
+        ))
+        assert output == honest
+
+    def test_the_bundle_suggestion_hash_is_derived_over_the_item_keys(self) -> None:
+        first, second = _raw('one', 'pkg/a.py'), _raw('two', 'pkg/b.py')
+        output = with_derived_bundle_keys(_bundle(first, second))
+        suggestion_hash = output['suggestion_hash']
+
+        assert isinstance(suggestion_hash, str)
+        assert _HEX16.fullmatch(suggestion_hash)
+        assert with_derived_bundle_keys(_bundle(second, first))['suggestion_hash'] == suggestion_hash
+        changed = with_derived_bundle_keys(_bundle(first, _raw('three', 'pkg/b.py')))
+        assert changed['suggestion_hash'] != suggestion_hash
+        assert suggestion_hash not in {stored['key'] for stored in _stored(output)}
+
+    @pytest.mark.parametrize('spawned_from', [None, '', '   '])
+    def test_an_unparented_bundle_has_no_top_level_escalation_id(self, spawned_from: object) -> None:
+        metadata = _bundle(escalation_id='esc-forged')
+        if spawned_from is None:
+            metadata.pop('spawned_from')
+        else:
+            metadata['spawned_from'] = spawned_from
+
+        output = with_derived_bundle_keys(metadata)
+
+        assert 'escalation_id' not in output
+        assert _HEX16.fullmatch(str(output['suggestion_hash']))
+        for stored in _stored(output):
+            assert (stored['origin_task'], stored['origin_escalation_id']) == (UNPARENTED_ORIGIN, None)
+
+    def test_every_other_caller_key_is_preserved(self) -> None:
+        metadata = _bundle()
+        output = with_derived_bundle_keys(metadata)
+        for key in ('source', 'spawn_context', 'spawned_from', 'files', 'x_note'):
+            assert output[key] == metadata[key]
+
+    def test_the_output_is_plain_json(self) -> None:
+        output = with_derived_bundle_keys(_bundle())
+        assert all(isinstance(stored['files'], list) for stored in _stored(output))
+        assert json.loads(json.dumps(output)) == output
+
+
+def _refusal(metadata: dict[str, object]) -> FollowupBundleInvalid:
+    with pytest.raises(FollowupBundleInvalid) as caught:
+        with_derived_bundle_keys(metadata)
+    return caught.value
+
+
+class TestWithDerivedBundleKeysRefusals:
+    @pytest.mark.parametrize('value', [_raw('one', 'pkg/a.py'), 'one', None])
+    def test_a_non_list_value_is_not_a_list(self, value: object) -> None:
+        metadata = _bundle()
+        metadata[FOLLOWUP_ITEMS_METADATA_KEY] = value
+        assert _refusal(metadata).reason is BundleViolation.NOT_A_LIST
+
+    @pytest.mark.parametrize('count', [0, MAX_FOLLOWUP_ITEMS + 1])
+    def test_a_count_outside_the_bound_is_refused(self, count: int) -> None:
+        metadata = _bundle(files=[f'pkg/m{index}.py' for index in range(count)])
+        metadata[FOLLOWUP_ITEMS_METADATA_KEY] = [
+            _raw(f'observation {index}', f'pkg/m{index}.py') for index in range(count)
+        ]
+        refusal = _refusal(metadata)
+        assert refusal.reason is BundleViolation.ITEM_COUNT
+        assert str(count) in refusal.detail
+        assert f'1..{MAX_FOLLOWUP_ITEMS}' in refusal.detail
+
+    @pytest.mark.parametrize(
+        'element',
+        [
+            pytest.param('one', id='not-a-mapping'),
+            pytest.param(_raw('one', 'pkg/b.py', title='t'), id='unknown-key'),
+            pytest.param(_raw('   ', 'pkg/b.py'), id='blank-summary'),
+            pytest.param(_raw('one'), id='empty-files'),
+        ],
+    )
+    def test_an_invalid_element_is_named_by_index(self, element: object) -> None:
+        refusal = _refusal(_bundle(_raw('fine', 'pkg/a.py'), element))
+        assert refusal.reason is BundleViolation.INVALID_ITEM
+        assert refusal.index == 1
+
+    def test_two_items_equal_after_normalisation_are_duplicates(self) -> None:
+        refusal = _refusal(_bundle(_raw('One  thing', 'pkg/a.py'), _raw(' one thing', 'pkg/a.py', 'pkg/a.py')))
+        assert isinstance(refusal, DuplicateFollowupItemKey)
+
+    def test_an_item_file_outside_metadata_files_is_undeclared(self) -> None:
+        refusal = _refusal(_bundle(
+            _raw('one', 'pkg/a.py', 'pkg/z.py'), _raw('two', 'pkg/y.py'), files=['pkg/a.py'],
+        ))
+        assert refusal.reason is BundleViolation.UNDECLARED_FILES
+        assert 'pkg/y.py' in refusal.detail
+        assert 'pkg/z.py' in refusal.detail
+        assert 'pkg/a.py' not in refusal.detail
+
+    @pytest.mark.parametrize('files', [None, 'pkg/a.py'])
+    def test_absent_or_non_list_metadata_files_declare_nothing(self, files: object) -> None:
+        metadata = _bundle(_raw('one', 'pkg/a.py'))
+        if files is None:
+            metadata.pop('files')
+        else:
+            metadata['files'] = files
+        assert _refusal(metadata).reason is BundleViolation.UNDECLARED_FILES
+
+    def test_metadata_files_may_declare_more_than_the_items_name(self) -> None:
+        output = with_derived_bundle_keys(_bundle(_raw('one', 'pkg/a.py'), files=['pkg/a.py', 'pkg/extra.py']))
+        assert len(_stored(output)) == 1
