@@ -26,10 +26,14 @@ from fused_memory.middleware.followup_packing import (
     RIDER_RESERVE_MAX_DECLINES,
     PackExclusion,
     PackMember,
+    PackRecipe,
     exclusion,
+    hub_keys,
     member_text_fp,
     pack_lock_keys,
     rider_reserved,
+    survivor_of,
+    title_recipe,
 )
 
 NOW = datetime(2026, 11, 4, tzinfo=UTC)
@@ -255,3 +259,108 @@ def test_exclusion_admits_every_band_but_broad(band):
 
 def test_a_decline_reason_is_a_hint_never_an_exclusion():
     assert exclusion(member(rider_last_decline_reason='different_intent'), now=NOW) is None
+
+
+HUB = 'h/hub.py'
+
+
+def _pool_declaring(key: str, *, declaring: int, size: int, fileless: int = 0) -> list[PackMember]:
+    with_files = [
+        member(task_id=i, lock_keys=(key,) if i < declaring else (f'own/{i}.py',)) for i in range(size)
+    ]
+    return with_files + [member(task_id=size + i) for i in range(fileless)]
+
+
+def test_a_key_declared_by_more_than_the_share_is_a_hub():
+    assert hub_keys(_pool_declaring(HUB, declaring=2, size=50)) == frozenset({HUB})
+
+
+def test_a_key_declared_by_exactly_the_share_is_not_a_hub():
+    assert hub_keys(_pool_declaring(HUB, declaring=2, size=100)) == frozenset()
+
+
+def test_fileless_members_count_in_the_hub_denominator():
+    assert hub_keys(_pool_declaring(HUB, declaring=2, size=50, fileless=100)) == frozenset()
+
+
+def test_a_member_counts_once_toward_a_hub_whatever_its_item_count():
+    members = _pool_declaring(HUB, declaring=1, size=99) + [
+        member(task_id=200, lock_keys=(HUB,), item_count=3),
+    ]
+    assert hub_keys(members) == frozenset()
+
+
+@pytest.mark.parametrize('share', [0.0, 1.0, -0.1, 1.5])
+def test_hub_keys_refuses_a_share_outside_the_open_unit_interval(share):
+    with pytest.raises(ValueError, match='share'):
+        hub_keys(_pool_declaring(HUB, declaring=2, size=50), share=share)
+
+
+def test_an_empty_pool_has_no_hubs():
+    assert hub_keys([]) == frozenset()
+
+
+@pytest.mark.parametrize(('project', 'hubs'), [('dark_factory', 8), ('reify', 16)])
+def test_hub_keys_over_the_whole_dump_pool_are_the_header_hubs(pool, project, hubs):
+    found = hub_keys(pool[project].members)
+    assert found == frozenset(pool[project].header['hub_keys'])
+    assert len(found) == hubs
+
+
+@pytest.mark.parametrize(
+    ('title', 'recipe'),
+    [
+        ('Relocate the inline test mod of foo.rs into its own module', PackRecipe.H14_RELOCATE),
+        ('Retarget the stale docstring cites in bar.py', PackRecipe.CITE_DOC_HYGIENE),
+        ('Deduplicate the two copies of the parser', PackRecipe.SPOT_DEDUPE),
+        ('Stop patching _private by dotted-path', PackRecipe.TEST_SEAM),
+        ('Assert the DiagnosticCode instead of a text-match', PackRecipe.DIAG_CODE),
+        ('Deduplicate the cite helper', None),
+        ('Split engine.rs into its own module and update cites', PackRecipe.H14_RELOCATE),
+        ('RELOCATE THE INLINE TEST MOD OF FOO.RS', PackRecipe.H14_RELOCATE),
+        ('Add a retry to the fetcher', None),
+    ],
+)
+def test_title_recipe_is_the_first_matching_row(title, recipe):
+    assert title_recipe(title) is recipe
+
+
+def _recipe_label(title: str) -> str | None:
+    recipe = title_recipe(title)
+    return None if recipe is None else recipe.value
+
+
+@pytest.mark.parametrize('project', PROJECTS)
+def test_title_recipe_reproduces_the_dump_recipe_labels(pool, project):
+    mislabelled = [
+        (r['task_id'], r['recipe_v1'])
+        for r in pool[project].records
+        if _recipe_label(r['title']) != r['recipe_v1']
+    ]
+    assert mislabelled == []
+
+
+def test_the_oldest_member_survives():
+    members = [
+        member(task_id=10, pending_since=NOW - timedelta(days=5)),
+        member(task_id=11, pending_since=NOW - timedelta(days=20)),
+    ]
+    assert survivor_of(members) == 11
+
+
+def test_the_lowest_id_survives_a_tie():
+    members = [member(task_id=12), member(task_id=11)]
+    assert survivor_of(members) == 11
+
+
+def test_an_unknown_age_reads_as_oldest():
+    members = [
+        member(task_id=10, pending_since=NOW - timedelta(days=100)),
+        member(task_id=11, pending_since=None),
+    ]
+    assert survivor_of(members) == 11
+
+
+def test_survivor_of_refuses_an_empty_pack():
+    with pytest.raises(ValueError, match='member'):
+        survivor_of([])
