@@ -22,14 +22,18 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
-from _mem0_intent_fixtures import rate_limit_error
+from _mem0_intent_fixtures import rate_limit_error, seed_mem0_intent
 
 from fused_memory.models.enums import SourceStore
 from fused_memory.models.memory import Mem0WriteState
 from fused_memory.models.scope import Scope
 from fused_memory.services.mem0_add_outcome import Mem0AddOutcome
+from fused_memory.services.mem0_write_retry import (
+    DEFAULT_MEM0_RETRY_POLICY,
+    Mem0RetryPolicy,
+)
 from fused_memory.services.memory_service import MemoryService
-from fused_memory.services.write_journal import WriteJournal
+from fused_memory.services.write_journal import Mem0IntentStatus, WriteJournal
 
 
 @pytest_asyncio.fixture
@@ -471,6 +475,47 @@ class TestAddMemoryTransientDeferral:
         )
 
         assert result.model_dump()['stores_pending_retry'] == ['mem0']
+
+
+class TestTheServiceOwnsItsRetryPolicy:
+    def test_the_injected_policy_is_the_one_it_reports(self, mock_config):
+        custom = Mem0RetryPolicy(
+            initial_delay_seconds=5,
+            max_delay_seconds=60,
+            poll_interval_seconds=7,
+            batch_size=3,
+            backlog_alarm_age_seconds=120,
+        )
+
+        assert MemoryService(mock_config, mem0_retry_policy=custom).mem0_retry_policy is custom
+
+    def test_the_default_policy_is_reported_when_none_is_injected(self, mock_config):
+        assert MemoryService(mock_config).mem0_retry_policy is DEFAULT_MEM0_RETRY_POLICY
+
+    @pytest.mark.asyncio
+    async def test_a_pass_escalates_a_backlog_older_than_the_policy_allows(
+        self, recovery_service, recovery_journal, tmp_path
+    ):
+        svc = recovery_service
+        svc.set_known_projects({'dark_factory': str(tmp_path)})
+        now = datetime.datetime(2026, 11, 3, 12, tzinfo=datetime.UTC)
+        alarm_age = svc.mem0_retry_policy.backlog_alarm_age_seconds
+        await seed_mem0_intent(
+            recovery_journal,
+            status=Mem0IntentStatus.RETRYING,
+            project_id='dark_factory',
+            created_at=now - datetime.timedelta(seconds=alarm_age + 60),
+            retry_at=now + datetime.timedelta(minutes=5),
+        )
+
+        await svc.retry_due_mem0_intents(now=now)
+
+        (record,) = [
+            json.loads(path.read_text())
+            for path in (tmp_path / 'data' / 'escalations').glob('esc-*.json')
+        ]
+        assert record['category'] == 'mem0_write_retry_backlog'
+        svc.mem0.add.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
