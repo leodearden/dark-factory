@@ -18,41 +18,6 @@ from _fm_helpers import make_retry_budget_queue, poll_until_dead
 
 
 @pytest.mark.asyncio
-async def test_dead_letter_warning_names_operation_and_group(tmp_path, caplog):
-    execute = AsyncMock(side_effect=RuntimeError('boom'))
-    q = make_retry_budget_queue(tmp_path, execute)
-    await q.initialize()
-    try:
-        with caplog.at_level(
-            logging.WARNING, logger='fused_memory.services.durable_queue'
-        ):
-            await q.enqueue(
-                group_id='proj-alpha', operation='add_episode',
-                payload={'content': 'c', 'group_id': 'proj-alpha', 'name': 'ep'},
-            )
-            await poll_until_dead(q, group_id='proj-alpha', expected_dead=1)
-
-        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
-        assert any(
-            'add_episode' in r.getMessage() and 'proj-alpha' in r.getMessage()
-            for r in warnings
-        ), (
-            'expected the dead-letter WARNING to name both the operation and '
-            'the group_id; got: '
-            f'{[r.getMessage() for r in warnings]}'
-        )
-        assert any(
-            '5 attempts' in r.getMessage() and 'RuntimeError' in r.getMessage()
-            for r in warnings
-        ), (
-            'expected the dead-letter WARNING to carry the attempt count and '
-            f'the error text; got: {[r.getMessage() for r in warnings]}'
-        )
-    finally:
-        await q.close()
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ('exc', 'label', 'budget'),
     [
@@ -61,12 +26,11 @@ async def test_dead_letter_warning_names_operation_and_group(tmp_path, caplog):
     ],
     ids=['transient', 'normal'],
 )
-async def test_dead_letter_warning_labels_the_budget_it_exhausted(
+async def test_one_dead_letter_warning_carries_every_triage_field(
     tmp_path, caplog, exc, label, budget
 ):
-    """One WARNING pairs the classification label with the attempt count of
-    the budget the item actually used up, so the label cannot name one budget
-    while the item died on the other."""
+    """All five fields sit on ONE record, so a triager never has to stitch
+    lines together, and the label names the budget the item actually used up."""
     q = make_retry_budget_queue(
         tmp_path, AsyncMock(side_effect=exc), transient_max_attempts=3
     )
@@ -81,14 +45,19 @@ async def test_dead_letter_warning_labels_the_budget_it_exhausted(
             )
             await poll_until_dead(q, group_id='proj-alpha', expected_dead=1)
 
-        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
-        assert any(
-            f'{budget} attempts' in r.getMessage()
-            and f'[{label}]' in r.getMessage()
-            for r in warnings
-        ), (
-            f'expected one dead-letter WARNING carrying both "{budget} attempts" '
-            f'and [{label}]; got: {[r.getMessage() for r in warnings]}'
-        )
+        dead_letter_lines = [
+            r.getMessage() for r in caplog.records
+            if r.levelno == logging.WARNING and 'dead-lettered' in r.getMessage()
+        ]
+        assert len(dead_letter_lines) == 1, dead_letter_lines
+        (line,) = dead_letter_lines
+        for field in (
+            'add_episode',
+            'proj-alpha',
+            f'{budget} attempts',
+            type(exc).__name__,
+            f'[{label}]',
+        ):
+            assert field in line, f'{field!r} missing from {line!r}'
     finally:
         await q.close()
