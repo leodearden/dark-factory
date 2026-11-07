@@ -21,7 +21,7 @@ from unittest.mock import AsyncMock, patch
 import aiosqlite
 import httpx
 from _canned_mcp import CannedMCP, _raw_row
-from _dt_helpers import make_fixed_datetime_cls
+from _dt_helpers import fixed_clock, installed_clock, make_fixed_datetime_cls
 from _prd_lanes_tree import (
     CARRIER,
     LaneTask,
@@ -286,7 +286,7 @@ def _quietly(labels: Iterable[str]) -> dict[str, Callable[[Path], object]]:
     return dict.fromkeys(labels, quiet_ledgers)
 
 
-def _forget_served_reads() -> None:
+def forget_served_reads() -> None:
     """Every access store a route reads, forgotten through its own public hook."""
     reset_task_snapshot_state()
     clear_lineage_state()
@@ -326,10 +326,10 @@ def _canned_roots(
         if furnish is not None and root.name in furnish:
             furnish[root.name](root)
     app.state.config = DashboardConfig(project_root=roots[0], known_project_roots=roots[1:])
-    _forget_served_reads()
+    forget_served_reads()
 
     def render(at: datetime) -> dict[str, Any]:
-        with patch('dashboard.api.tasks.resolve_now', new=lambda _now: at):
+        with installed_clock(app, fixed_clock(at)):
             return _get(client, TASKS)
 
     try:
@@ -341,7 +341,7 @@ def _canned_roots(
         ):
             yield render
     finally:
-        _forget_served_reads()
+        forget_served_reads()
 
 
 def _census_family(client: TestClient, workdir: Path) -> dict[str, Any]:
@@ -402,7 +402,7 @@ async def _collect_into_store(config: DashboardConfig, http_client: httpx.AsyncC
 
 def _render_burndown(client: TestClient, at: datetime, window: str) -> dict[str, Any]:
     """GET /burndown?window=*window* on the real route, its single clock capture at *at*."""
-    with patch('dashboard.api.burndown.datetime', make_fixed_datetime_cls(at)):
+    with installed_clock(app, fixed_clock(at)):
         return _get(client, BURNDOWN, window=window)
 
 
@@ -469,7 +469,7 @@ def _window_family(client: TestClient, workdir: Path) -> dict[str, Any]:
     with _canned_roots(client, workdir / 'merge', {'dark-factory': _substrate(REIFY_COUNTS)}):
         _write_merge_attempts(app.state.config.project_root)
         for window in ('7d', '24h'):
-            with patch('dashboard.api.merge_queue.resolve_now', new=lambda _now: T0):
+            with installed_clock(app, fixed_clock(T0)):
                 bodies[f'merge_{window}'] = _get(client, MERGE_QUEUE, window=window)
 
     return bodies
@@ -572,7 +572,7 @@ def _corpus_family(client: TestClient, workdir: Path) -> dict[str, Any]:
             _clear_corpus()
             with (
                 patch.object(escalation_corpus, 'CORPUS_TTL_SECONDS', ttl),
-                patch('dashboard.api.escalations.resolve_now', new=lambda _now, at=at: at),
+                installed_clock(app, fixed_clock(at)),
             ):
                 bodies[f'escalations_{generation}'] = _get(client, ESCALATIONS)
                 bodies[f'analytics_{generation}'] = _get(client, ESCALATION_ANALYTICS)
@@ -628,7 +628,7 @@ def _check_owner_family(client: TestClient, workdir: Path) -> dict[str, Any]:
         ))
         config.reconciliation_escalations_dir.mkdir(parents=True, exist_ok=True)
         try:
-            with patch('dashboard.api.escalations.resolve_now', new=lambda _now: T0):
+            with installed_clock(app, fixed_clock(T0)):
                 return {'escalations_check_owner': _get(client, ESCALATIONS)}
         finally:
             _clear_corpus()
@@ -659,7 +659,7 @@ def _grow_past_lineage(substrate: CannedMCP) -> None:
 
 
 def _render_prds(client: TestClient, at: datetime) -> dict[str, Any]:
-    with patch('dashboard.api.prds.resolve_now', new=lambda _now: at):
+    with installed_clock(app, fixed_clock(at)):
         return _get(client, PRDS)
 
 
