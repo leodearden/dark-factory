@@ -27,13 +27,17 @@ T3 Code v0.1.6 (``~/src/t3code-v0.1.6``):
 ``apps/server/src/cliAuthFormat.ts::formatIssuedPairingCredential`` (the CLI's
 ``--json`` output) and effect's ``McpServer`` ``CallToolResult``.
 
-WHY A ``_``-PREFIXED SIBLING.  Four test modules drive this server: the lane's
-(``test_spawn_t3_lane.py``), its client's (``test_t3_mcp_client.py``), the
-fake's own (``test_fake_t3_server.py``), and ``tests/scripts/test_spawn_claude.py``,
-which imports it by ``sys.path``; ``_mcp_transport_harness.py`` records the
-convention. No pytest fixtures live here, so no consumer imports one it never
-names: each test module wraps :meth:`FakeT3Server.running` in its own short
-fixture. A test plays T3's state per call with a :data:`ToolResponder` in
+WHY ``cross_suite_helpers/``.  Four test modules in two suites import this by
+bare name: the lane's (``test_spawn_t3_lane.py``), its client's
+(``test_t3_mcp_client.py``), the fake's own (``test_fake_t3_server.py``), and
+``tests/scripts/test_spawn_claude.py``. ``orchestrator/tests/conftest.py`` and
+``tests/scripts/test_spawn_claude.py`` put this directory on ``sys.path``, and
+both pyright tables (the root one and orchestrator's) list it on
+``extraPaths``, so the root table sees this helper and none of
+``orchestrator/tests``' own modules. The ``_`` prefix is the convention
+``orchestrator/tests/_mcp_transport_harness.py`` records. No pytest fixtures
+live here, so no consumer imports one it never names: each test module wraps
+:meth:`FakeT3Server.running` in its own short fixture. A test plays T3's state per call with a :data:`ToolResponder` in
 ``tool_replies``, such as :func:`replies_in_turn`; :data:`HANG_UP` drops one call.
 """
 

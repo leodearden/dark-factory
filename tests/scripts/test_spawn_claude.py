@@ -28,12 +28,12 @@ import pytest
 # orchestrator/src goes FIRST, ahead of any editable install pointing at a
 # different checkout, so `orchestrator.session_registry` is the module
 # spawn-claude.sh itself invokes by absolute path (task 2285). The repo root
-# and orchestrator/tests (the t3-lane section's fake T3 server) are APPENDED,
-# never inserted: see the root conftest.py. Bare module-level calls, because
-# ruff exempts exactly that shape from E402.
+# and orchestrator/tests/cross_suite_helpers (the t3-lane section's fake T3
+# server) are APPENDED, never inserted: see the root conftest.py. Bare
+# module-level calls, because ruff exempts exactly that shape from E402.
 sys.path.insert(0, str(pathlib.Path(__file__).parents[2] / "orchestrator" / "src"))
 sys.path.append(str(pathlib.Path(__file__).resolve().parents[2]))
-sys.path.append(str(pathlib.Path(__file__).resolve().parents[2] / "orchestrator" / "tests"))
+sys.path.append(str(pathlib.Path(__file__).resolve().parents[2] / "orchestrator" / "tests" / "cross_suite_helpers"))
 
 from _fake_t3_server import (
     DEAD_ORIGIN,
@@ -4946,9 +4946,10 @@ def test_payload_publishes_sentinel_by_atomic_rename(tmp_path: pathlib.Path) -> 
 # task 7489: CLAUDE_SPAWN_BACKEND vocabulary and the t3 lane
 # ===========================================================================
 # The t3 lane drives orchestrator/src/orchestrator/spawn_t3_lane.py, which
-# reaches T3 over /mcp. Here T3 is orchestrator/tests/_fake_t3_server.py's
-# FakeT3Server, named by server-runtime.json and paired with this host; the
-# _T3Lane responders answer in T3 Code v0.1.6's shapes and, on
+# reaches T3 over /mcp. Here T3 is
+# orchestrator/tests/cross_suite_helpers/_fake_t3_server.py's FakeT3Server,
+# named by server-runtime.json and paired with this host; the _T3Lane
+# responders answer in T3 Code v0.1.6's shapes and, on
 # t3_thread_launch, play the child: a transcript carrying the message (which
 # names the record dir) and, when asked, a final result.md.
 

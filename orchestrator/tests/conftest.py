@@ -41,6 +41,9 @@ if str(_ESCALATION_SRC) not in sys.path:
 _TESTS_DIR = Path(__file__).parent
 if str(_TESTS_DIR) not in sys.path:
     sys.path.insert(0, str(_TESTS_DIR))
+_CROSS_SUITE_HELPERS_DIR = _TESTS_DIR / "cross_suite_helpers"
+if str(_CROSS_SUITE_HELPERS_DIR) not in sys.path:
+    sys.path.insert(0, str(_CROSS_SUITE_HELPERS_DIR))
 
 # Repo root of this worktree.  Used by the autouse ``_isolate_orch_config``
 # fixture to pin ``ORCH_CONFIG_PATH`` at the canonical top-level

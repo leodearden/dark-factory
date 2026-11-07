@@ -40,9 +40,14 @@ extraPaths = [
     "orchestrator/src",
     "sampler/src",
     "shared/src",
-    # Test helpers tests/scripts imports by name (_fake_t3_server, task 8507);
-    # last, so every earlier root wins a name clash.
-    "orchestrator/tests",
+    # Only the orchestrator test helpers this table's targets import by bare
+    # name (_fake_t3_server, task 8507). Pyright resolves an extraPaths module
+    # ahead of a same-named module in the importing file's own directory, so
+    # anything added here claims its name over siblings in scripts/ and
+    # tests/scripts/. Guarded by tests/scripts/test_no_vestigial_import_pragmas.py::
+    # test_no_root_extrapaths_entry_holds_a_test_module_or_conftest and ::
+    # test_no_bare_import_in_a_root_pyright_target_resolves_past_its_same_directory_sibling.
+    "orchestrator/tests/cross_suite_helpers",
 ]
 pythonVersion = "3.11"
 typeCheckingMode = "basic"
