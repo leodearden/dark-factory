@@ -384,10 +384,13 @@ class TestMarkBlockedWaitIsScopedToItsOwnEscalation:
             new_l0_closer='auto-dismissed',
             new_l0_dismiss=True,
         )
+        grace = 0.5
         workflow, scheduler = await _build_workflow(
-            git_repo, task_assignment, queue, steward_cls, tmp_path, completion_timeout=0.5,
+            git_repo, task_assignment, queue, steward_cls, tmp_path,
+            completion_timeout=grace,
         )
 
+        call_started = asyncio.get_running_loop().time()
         try:
             outcome = await asyncio.wait_for(
                 workflow._mark_blocked('Suffix item needs rebase onto frozen-prefix tip'),
@@ -396,6 +399,13 @@ class TestMarkBlockedWaitIsScopedToItsOwnEscalation:
         finally:
             await _stop_all(steward_cls)
 
+        [(published_id, published_at)] = steward_cls.published
+        assert published_id == older.id
+        assert published_at < call_started + grace, (
+            'precondition: the sweep close and the older L0\'s outcome must land '
+            'inside the grace window, or BLOCKED is a plain timeout and proves '
+            'nothing about the sweep close'
+        )
         assert outcome == WorkflowOutcome.BLOCKED, (
             'a sweep close carries no finding, so it must not settle the wait'
         )

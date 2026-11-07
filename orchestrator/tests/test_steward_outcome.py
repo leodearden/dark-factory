@@ -574,6 +574,32 @@ class TestScopedWaitSettlesOnTheAwaitedRecord:
 
         assert outcome == StewardInterrupted('timeout', wip_commits_present=False)
 
+    async def test_resolution_of_another_tasks_record_settles(self, tmp_path: Path):
+        """The open-L1 guard is the only reason another task's record is
+        refused: a dedupe-fold parent its own steward resolved, with no L1
+        open on that task, settles the wait like this task's own record."""
+        wf, queue, channel, older, _awaited = self._workflow_with_two_l0s(
+            tmp_path, timeout=30.0,
+        )
+        foreign_parent = Escalation(
+            id=queue.make_id('99'), task_id='99', agent_role='implementer',
+            severity='blocking', category='task_failure', summary='main is red',
+        )
+        queue.submit(foreign_parent)
+        queue.resolve(
+            foreign_parent.id, 'main fixed upstream',
+            resolved_by='claude-task-99-steward',
+        )
+        channel.put_nowait(
+            PublishedStewardOutcome(older.id, StewardResolved('older fixed')),
+        )
+
+        outcome = await asyncio.wait_for(
+            wf._await_steward_completion(escalation_id=foreign_parent.id), 5,
+        )
+
+        assert outcome == StewardResolved('main fixed upstream')
+
     async def test_deadline_consults_the_awaited_record(self, tmp_path: Path):
         wf, queue, _channel, _older, awaited = self._workflow_with_two_l0s(
             tmp_path, timeout=0.2,
