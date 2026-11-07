@@ -301,7 +301,8 @@ Reversing this decision means updating this section, `CLAUDE.md` and
     deadline expiry on such a wait fails a test whose awaited event did
     happen. Both legs are pure **shape**: no receiver name, no class list
     and no budget threshold decides which sites are scanned, and the teardown
-    join in `_stop_worker` is exempt structurally (a bare `ast.Name` target).
+    join in `stop_merge_worker` (`orchestrator/tests/_merge_worker_drive.py`)
+    is exempt structurally (a bare `ast.Name` target).
     `wait_responsive` and `MERGE_RESULT_TIMEOUT` live in
     `orchestrator/tests/_orch_helpers.py` and are importable only under
     `orchestrator/tests`, so in any other package the

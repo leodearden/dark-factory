@@ -115,6 +115,7 @@ from fused_memory.reconciliation.task_filter import (
     filter_task_tree,
 )
 from fused_memory.reconciliation.tree_read_instant import resolve_tree_read_instant
+from fused_memory.services.id_resolver import IdResolver
 from fused_memory.services.live_workflow_detector import (
     corroboration_for_task,
     is_pure_gate_metadata,
@@ -2805,6 +2806,11 @@ class ReconciliationHarness:
                 project_id=None,
                 project_root=None,
             ),
+            # This store serves every project, so create_server leaves the guard
+            # unscoped (resolver='no_project') until task 6910 scopes it per call.
+            prefix_resolver=lambda project_id, prefix: IdResolver.for_memory_service(
+                self.memory
+            ).resolve_prefix(project_id, prefix),
         )
         host = self.config.escalation_host
         port = self.config.escalation_port

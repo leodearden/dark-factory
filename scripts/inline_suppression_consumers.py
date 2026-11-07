@@ -125,7 +125,8 @@ class RuffConfig:
 
     Attributes:
         path: The declaring file, repo-relative, so ``--json`` can name it.
-        select: The selectors, parsed.
+        select: The effective selectors, parsed: ``select`` followed by
+            ``extend-select``.
         ignore: The suppressors, parsed.  Read because it is the same tomllib
             call and is strictly more honest: ruff provably never emits an
             ignored code, so every ``noqa`` naming one is dead — which is
@@ -151,6 +152,9 @@ class RuffConfig:
 #: (`extend-ignore`, `per-file-ignores`) are tolerated and deliberately not
 #: modelled, because over-reading only grandfathers a dead marker.
 #:
+#: `extend-select` is modelled, appended to the same config's `select` in
+#: `_ruff_config_at`, so it is not in the list.
+#:
 #: `extend` is in the list because config INHERITANCE widens in exactly that
 #: expensive direction: the inherited file carries its own `select` /
 #: `extend-select`, which this model does not follow, so the local list read
@@ -162,7 +166,7 @@ class RuffConfig:
 #: enforced with it: ruff then applies its BUILT-IN default rule set, which is
 #: wider than the nothing this model would otherwise infer and which drifts
 #: with the ruff version.
-_WIDENING_KEYS: tuple[str, ...] = ('extend-select', 'extend')
+_WIDENING_KEYS: tuple[str, ...] = ('extend',)
 
 
 def _ruff_config_at(location: Path, *, relative: str) -> RuffConfig | None:
@@ -180,6 +184,7 @@ def _ruff_config_at(location: Path, *, relative: str) -> RuffConfig | None:
     same key.  Taking both off the one table that happened to declare
     ``select`` would drop an ``ignore`` sitting beside it, and an ignored code
     is precisely the dead marker :class:`RuffConfig` reads ``ignore`` to name.
+    ``extend-select`` resolves by the same rule and is appended to ``select``.
     """
     try:
         raw = tomllib.loads(location.read_text(encoding='utf-8'))
@@ -226,7 +231,11 @@ def _ruff_config_at(location: Path, *, relative: str) -> RuffConfig | None:
             'explicitly.'
         )
 
-    return RuffConfig(path=relative, select=select, ignore=declared('ignore') or ())
+    return RuffConfig(
+        path=relative,
+        select=select + (declared('extend-select') or ()),
+        ignore=declared('ignore') or (),
+    )
 
 
 #: The rule codes first-party checkers define, each mapped to the checker that

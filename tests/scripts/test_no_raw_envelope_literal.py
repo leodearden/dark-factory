@@ -18,6 +18,7 @@ import pytest
 import raw_envelope_literal_guard
 from git_listing import git, listed_files
 from raw_envelope_literal_guard import (
+    ENVELOPE_ONLY_RAW_PREFIXES,
     ESCAPED_BRACKET,
     LITERAL_OWNER,
     RAW_PREFIXES,
@@ -74,6 +75,25 @@ def test_every_envelope_literal_starts_with_a_scanned_prefix() -> None:
     )
 
 
+def test_every_envelope_only_prefix_opens_an_envelope_literal() -> None:
+    def escaped(prefixes: list[str]) -> list[str]:
+        return [prefix.replace(_LT, ESCAPED_BRACKET) for prefix in prefixes]
+
+    unowned = [
+        prefix for prefix in ENVELOPE_ONLY_RAW_PREFIXES
+        if not any(literal.startswith(prefix) for literal in ENVELOPE_LITERALS)
+    ]
+    unscanned = [prefix for prefix in ENVELOPE_ONLY_RAW_PREFIXES if not prefix.startswith(RAW_PREFIXES)]
+    assert not unowned, (
+        f'ENVELOPE_ONLY_RAW_PREFIXES {escaped(unowned)} open no member of '
+        f'{LITERAL_OWNER}.ENVELOPE_LITERALS, so they admit files on a signal the owner does not define.'
+    )
+    assert not unscanned, (
+        f'ENVELOPE_ONLY_RAW_PREFIXES {escaped(unscanned)} start with none of the scanned prefixes '
+        f'{escaped(list(RAW_PREFIXES))}, so a file they admit could pass unreported.'
+    )
+
+
 def test_raw_prefix_lines_reports_each_prefix_under_its_escaped_spelling() -> None:
     source = (
         'a = 1\n'
@@ -107,6 +127,9 @@ def test_raw_prefix_lines_ignores_brackets_that_open_no_envelope_literal(source:
         pytest.param('from shared import toolcall_markup\n', id='from-package-import-owner'),
         pytest.param('import shared.toolcall_markup as markup\n', id='import-owner'),
         pytest.param('def broken(:\n    pass  # toolcall_markup\n', id='unparsable-fails-closed'),
+        pytest.param('X = "' + _LT + 'parameter name=\'a\'>"\n', id='raw-parameter-opener-only'),
+        pytest.param('X = "' + _LT + '/parameter>"\n', id='raw-parameter-closer-only'),
+        pytest.param('X = "' + _LT + '/invoke>"\n', id='raw-invoke-closer-only'),
     ],
 )
 def test_handles_envelope_markup_selects_markup_handling_sources(source: str) -> None:
@@ -122,6 +145,23 @@ def test_handles_envelope_markup_selects_markup_handling_sources(source: str) ->
             id='owner-named-only-in-prose',
         ),
         pytest.param('import toolcall_markup_corpus_extract\n', id='lookalike-module'),
+        pytest.param('TPL = "' + _LT + 'div>x' + _LT + '/div>"\n', id='html-closer'),
+        pytest.param(
+            'HTML = "' + _LT + 'details>' + _LT + 'summary>s' + _LT + '/summary>d' + _LT + '/details>"\n',
+            id='html-details-closer',
+        ),
+        pytest.param(
+            'XML = "' + _LT + 'description>d' + _LT + '/description>"\n',
+            id='xml-description-closer',
+        ),
+        pytest.param(
+            'POM = "' + _LT + 'parameters>p' + _LT + '/parameters>"\n',
+            id='xml-parameters-tag',
+        ),
+        pytest.param(
+            'WSDL = "' + _LT + 'parameterList>p' + _LT + '/parameterList>"\n',
+            id='xml-parameterlist-tag',
+        ),
     ],
 )
 def test_handles_envelope_markup_rejects_other_sources(source: str) -> None:
@@ -146,9 +186,13 @@ def synthetic_repo(tmp_path: Path) -> Path:
     _plant(root, 'clean_handler.py', 'from shared.toolcall_markup import closer_for\n')
     _plant(root, 'deleted.py', 'LT = chr(60)\n')
     _plant(root, 'notes.txt', 'chr(60) ' + _LT + '/content>\n')
+    _plant(
+        root, 'raw_only_violator.py',
+        'X = "' + _LT + '/invoke>"\n\nY = "' + _LT + 'parameter name=\'a\'>"\n',
+    )
     git(
         root, 'add', '.gitignore', 'tracked_violator.py', 'html_fixture.py',
-        'clean_handler.py', 'deleted.py', 'notes.txt',
+        'clean_handler.py', 'deleted.py', 'notes.txt', 'raw_only_violator.py',
     )
     (root / 'deleted.py').unlink()
     _plant(
@@ -166,6 +210,7 @@ def test_discovery_lists_existing_tracked_and_unignored_python_only(
         synthetic_repo / 'clean_handler.py',
         synthetic_repo / 'html_fixture.py',
         synthetic_repo / 'pkg' / 'untracked_violator.py',
+        synthetic_repo / 'raw_only_violator.py',
         synthetic_repo / 'tracked_violator.py',
     ]
     assert sorted(listed_files(synthetic_repo, '*.py')) == expected
@@ -178,6 +223,7 @@ def test_raw_literal_violations_reports_tracked_and_untracked_violators(
     assert violations == {
         'tracked_violator.py': {'\\x3c/': (2,)},
         'pkg/untracked_violator.py': {'\\x3cparameter': (4,)},
+        'raw_only_violator.py': {'\\x3c/': (1,), '\\x3cparameter': (3,)},
     }
 
 

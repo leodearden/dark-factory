@@ -540,6 +540,39 @@ of re-parking it. Hand-carries (deferred owners) get no park protection (D8). Th
 has one home, `orchestrator/src/orchestrator/scheduler.py::Scheduler._park_hold_refusal`,
 which park GC, the operator eviction guard and `reserve_now` all consult.
 
+**Amendment (task 7799, park-cycle-787-945).** Ruling (Leo, 2026-10-30): a deadlock
+between parked owners must be impossible by construction. solar_challenge sighted four:
+945<->919 (10-27, over 23 h), 787<->945 (10-29/30), 787<->{894,919} (10-30) and
+919<->955 (10-31 to 11-01, about 31 h, ended only by an orchestrator restart that wiped
+park state). Each owner held a partial park and needed a key the other had parked, and
+each one's acquire was refused by the other's park. A requeue (architect `max_turns`,
+`scope_grant_lock_conflict`) re-parks a task within a minute, so hand-breaks and
+restarts cleared a cycle only incidentally. The fix is one total order on park entries,
+`orchestrator/src/orchestrator/scheduler.py::_ParkKey`: rank first, then the dispatch
+tie-break (older numeric id, then id; non-numeric ids last, I-4). One comparator is
+enforced at two points. At INSTALL (INV-3), a new entry shadows a conflicting top with
+a larger key and is blocked by one with a smaller key, so same-tier installs resolve by
+id instead of colliding. At the GATE (INV-8,
+`orchestrator/src/orchestrator/scheduler.py::ModuleLockTable._precedence_blocking_parks`), a
+foreign top blocks a requester that owns parks only when its key precedes the
+requester's best key, the minimum over every entry it holds. A requester that owns no
+park is blocked by every park, as before. A park owner therefore passes a lower-key park
+even on a key it has not parked yet, which is exactly the edge that formed every
+sighted cycle. The gate carries the guarantee, not install: install runs only for the
+tick's top-skipped candidate, so a predecessor that is not the score-top never retries
+it (945 logged no `task_skipped` in 787<->945). Under the gate every park wait goes
+from an owner to one with a strictly smaller best key. So the wait-for graph between
+park owners is acyclic in every reachable state, including the state right after a
+requeue re-parks, and the smallest-key owner waits only on live holders. Installation
+stays rank-1-gated, so the "Below-rank-1 park INSTALLATION" row above is not widened.
+The operator eviction lever keeps its D4 live-owner refusal
+(`orchestrator/src/orchestrator/scheduler.py::Scheduler._park_hold_refusal`) unchanged:
+no pending owner can be part of a cycle, so nothing needs evicting to break one. Branch
+progress is deliberately not in the key. The key must be computable from lock-table
+state alone and stay stable from tick to tick. Branch progress is the asynchronously
+refreshed `work_product` view, and the score already credits it as continuity, which
+decides who is TRIED first. Precedence decides only whose park may block whom.
+
 ## 8. Pre-conditions and substrate verification (G3)
 
 Verified against `main` on 2026-08-06. No assumed capability is unresolved.

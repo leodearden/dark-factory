@@ -203,7 +203,7 @@ class TestEvalMetricsInvocationErrorField:
         ``scripts/run_fable_trial_v2_campaign.py`` decides per-cell reference
         validity by KEY PRESENCE — its ``MARKER_KEY not in metrics`` means "not
         known-good", never False, and the count it consumes from
-        ``report._judged_blind_count`` is None for any config with even one
+        ``cell_admission.judged_blind_count`` is None for any config with even one
         keyless cell. If this key
         were emitted only when True (a conditional dict update, or filtering
         falsy fields out of the persisted dict), every HEALTHY cell would be
@@ -768,7 +768,7 @@ class TestJudgePlanQuality:
     # clamp_unit_score's docstring in judge.py for the mechanics). A bare
     # clamp DOES keep +/-Infinity in [0, 1] — but only by fabricating the
     # best/worst possible score (1.0/0.0) on a surface
-    # report._mean_plan_quality -> select_survivors actually ranks on. Both
+    # cell_admission.mean_plan_quality -> select_survivors actually ranks on. Both
     # are equally NOT a judgement, so both are Unmeasured(judge, unparseable).
     # Both are reachable through the SAME schema-bypassing
     # json.loads(result.output) fallback — CPython's json.loads accepts the
@@ -998,8 +998,8 @@ class TestPlanJudgeOutcomeCarriesItsSpend:
 # judge, which scored an empty artifact because it had no scorability guard of
 # its own — its coherence rested ENTIRELY on its one caller remembering to gate.
 #
-# Task 3302 closed the two OUTER halves: the CALL SITE (run_architect_eval
-# gates on is_scorable_plan) and the READER (report._plan_quality_score floors
+# Task 3302 closed the two OUTER halves: the CALL SITE (run_architect_eval gates
+# on is_scorable_plan) and the READER (cell_admission.plan_quality_score floors
 # an on-disk no-plan cell). This class pins the INSTRUMENT itself, so a second
 # caller — a backfill/re-scoring script, a new eval path, prompt_opt, a resume
 # wave — cannot silently re-open the same defect.
@@ -1985,7 +1985,9 @@ class TestRunArchitectEval:
         # the RELOCATED .task-meta/<name>/ root (matching production
         # _inject_plan_tools_mcp), so the plan-tools server writes plan.json where
         # the TaskArtifacts(worktree, meta_root=_meta_root_for_worktree(worktree))
-        # readback reads it.
+        # readback reads it. That meta root is also its task root (task 3155):
+        # the eval stays single-root, since parallel trials of one task id would
+        # otherwise share one .task-meta/task-<id>.
         import sys
 
         from orchestrator.workflow import _meta_root_for_worktree
@@ -2005,6 +2007,7 @@ class TestRunArchitectEval:
             '-m', 'orchestrator.mcp.plan_tools',
             '--worktree', str(Path('/fake/wt')),
             '--meta-root', str(expected_meta_root),
+            '--task-root', str(expected_meta_root),
         ]
 
 
@@ -3240,7 +3243,7 @@ class TestPlanQualityReport:
         many of its scores were judged blind — it can only report that it does
         not know. Reporting the measured ones' count (here 1) would understate
         the bound while wearing the appearance of a complete answer. This is
-        ``report._judged_blind_count``'s rule, which task 3632's campaign
+        ``cell_admission.judged_blind_count``'s rule, which task 3632's campaign
         script consumes rather than re-deriving, so the two surfaces of one
         field answer the same question identically.
         """
@@ -4396,10 +4399,10 @@ class TestPinnedTaintSemanticsSurviveTheCapRetrySeam:
 def _zero_account_gate():
     """A UsageGate that CONSTRUCTS successfully but resolves ZERO accounts.
 
-    Not a hypothetical: ``_init_accounts`` logs "No accounts configured and no
-    default credential found" and returns ``[]`` whenever ``usage_cap.enabled``
-    is on but no ``CLAUDE_OAUTH_*`` env is exported and no
-    ``~/.claude/.credentials.json`` exists — an ordinary CI/cron shell. The
+    Not a hypothetical: ``_init_accounts`` warns that the pool is empty and
+    returns ``[]`` whenever ``usage_cap.enabled`` is on but no
+    ``CLAUDE_OAUTH_*`` env is exported and ``fallback_to_default_credential``
+    is off — an ordinary CI/cron shell. The
     constructor SUCCEEDS, so the enabled-guard and the try/except around
     construction both pass it straight through.
     """
@@ -4468,8 +4471,8 @@ class TestArchitectEvalZeroAccountGate:
 
         # Loud about it — an empty pool where the operator asked for one is a
         # misconfiguration worth seeing in the campaign log.
-        assert 'ZERO accounts' in caplog.text
-        assert 'without failover' in caplog.text
+        assert 'no accounts resolved' in caplog.text
+        assert 'UNGATED' in caplog.text
 
         # …and the cell is a NORMAL cell: one invoke, measured, judged,
         # INCLUDED. An empty pool has nothing to fail over TO, so the ungated

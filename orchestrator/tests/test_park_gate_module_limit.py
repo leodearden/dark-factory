@@ -28,8 +28,9 @@ from _recording_event_store import _RecordingEventStore
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventStore
+from orchestrator.lock_table import ModuleLockTable
 from orchestrator.pin_reservation import BlockerKind
-from orchestrator.scheduler import ModuleLockTable, Scheduler
+from orchestrator.scheduler import Scheduler
 
 WIDE = 'pkg/tests/wide.json'
 NARROW = 'pkg/tests/narrow.json'

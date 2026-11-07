@@ -272,7 +272,8 @@ _CENSUS = f'{_TASKS}?projection=census'
 
 _BANNER_KEYS = (
     'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS', 'TASKS_DEGRADED_PROJECTS',
-    'TASKS_COUNT_UNKNOWN_PROJECTS', 'TASKS_PROJECT_COUNT',
+    'TASKS_COUNT_UNKNOWN_PROJECTS', 'TASKS_COUNT_STALE_PROJECTS',
+    'TASKS_PROJECT_COUNT',
 )
 
 
@@ -384,7 +385,7 @@ const fs = require('fs');
 const path = require('path');
 const [redux, mode, url] = process.argv.slice(1);
 globalThis.window = { dispatchEvent() {} };
-for (const name of ['endpoint_staleness.js', 'datum.js']) require(path.join(redux, name));
+for (const name of ['poll_scope.js', 'endpoint_staleness.js', 'datum.js']) require(path.join(redux, name));
 const api = require(path.join(redux, 'data.js'));
 for (const name of ['task_vocab.js', 'task_snapshot.js']) require(path.join(redux, name));
 const TASKS = '/api/v2/dashboard/tasks';

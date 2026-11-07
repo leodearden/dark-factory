@@ -20,17 +20,19 @@ from typing import Any
 
 import pytest
 from _escalation_seed import seed_escalation
-from _filing_tools import call_promote
+from _filing_tools import call_blocker, call_info, call_promote
 from _merge_tool_calls import call_merge_cancel, call_merge_request, call_merge_status
 from _resolve_issue_call import call_resolve_issue
 from shared.merge_state import MergeReason
 
 from escalation import server as escalation_server
+from escalation.amendments import MAX_AMENDMENTS
 from escalation.canonical import canonical_root_cause
 from escalation.dedupe import DedupeConfig, summary_dedupe_key
+from escalation.grant_delivery import GrantDelivery
 from escalation.merge_status_answer import hint_for
 from escalation.models import Escalation
-from escalation.queue import _MAX_AMENDMENTS, EscalationQueue
+from escalation.queue import EscalationQueue
 from escalation.server import (
     _AMENDMENT_TRUNCATION_ANCHOR_TASK_ID,
     _AMENDMENT_TRUNCATION_STORM_THRESHOLD,
@@ -49,13 +51,13 @@ from escalation.server import (
 try:
     from orchestrator.config import OrchestratorConfig  # type: ignore[reportMissingImports]
     from orchestrator.event_store import EventStore, EventType  # type: ignore[reportMissingImports]
+    from orchestrator.merge_lane.types import TerminalOutcomeRecord
     from orchestrator.merge_lane.worker import (
         MergeRequest,
         QueuedBranch,
         RealMergeItem,
         SpeculativeItem,
         SpeculativeMergeWorker,
-        TerminalOutcomeRecord,
         TerminalOutcomeRetention,
     )
     _ORCHESTRATOR_AVAILABLE = True
@@ -86,16 +88,6 @@ _COMMON_KWARGS: dict[str, Any] = {
     'category': 'scope_violation',
     'summary': 'born-at-L2 test',
 }
-
-
-async def _blocker(server, **kwargs: Any) -> dict[str, Any]:
-    tool = await server.get_tool('escalate_blocker')
-    return await tool.fn(**kwargs)
-
-
-async def _info(server, **kwargs: Any) -> dict[str, Any]:
-    tool = await server.get_tool('escalate_info')
-    return await tool.fn(**kwargs)
 
 
 async def _get_pending(server, **kwargs: Any) -> list[dict[str, Any]]:
@@ -143,7 +135,7 @@ class TestBornAtL2:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _blocker(server, severity='critical', **_COMMON_KWARGS)
+        result = await call_blocker(server, severity='critical', **_COMMON_KWARGS)
 
         assert result['status'] == 'queued', f"Expected 'queued', got: {result}"
 
@@ -157,7 +149,7 @@ class TestBornAtL2:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _blocker(
+        result = await call_blocker(
             server, severity='critical',
             **{**_COMMON_KWARGS, 'agent_role': 'orchestrator-watcher-supervisor'},
         )
@@ -177,7 +169,7 @@ class TestBornAtL2:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _blocker(
+        result = await call_blocker(
             server, severity=severity,
             **{**_COMMON_KWARGS, 'agent_role': 'orchestrator-watcher-supervisor'},
         )
@@ -197,7 +189,7 @@ class TestBornAtL2:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _info(
+        result = await call_info(
             server, severity=severity,
             **{**_COMMON_KWARGS, 'agent_role': 'orchestrator-watcher-supervisor'},
         )
@@ -214,7 +206,7 @@ class TestBornAtL2:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _blocker(server, **_COMMON_KWARGS)
+        result = await call_blocker(server, **_COMMON_KWARGS)
 
         esc = queue.get(result['id'])
         assert esc is not None
@@ -226,7 +218,7 @@ class TestBornAtL2:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _info(server, **_COMMON_KWARGS)
+        result = await call_info(server, **_COMMON_KWARGS)
 
         esc = queue.get(result['id'])
         assert esc is not None
@@ -238,7 +230,7 @@ class TestBornAtL2:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _blocker(server, severity='blocking', **_COMMON_KWARGS)
+        result = await call_blocker(server, severity='blocking', **_COMMON_KWARGS)
 
         esc = queue.get(result['id'])
         assert esc is not None
@@ -250,7 +242,7 @@ class TestBornAtL2:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _info(server, severity='info', **_COMMON_KWARGS)
+        result = await call_info(server, severity='info', **_COMMON_KWARGS)
 
         esc = queue.get(result['id'])
         assert esc is not None
@@ -872,7 +864,7 @@ class TestL2DedupeBypass:
         # Child call: same category, overlapping summary, but born-at-L2.
         # Uses sentinel agent_role so the C4/D3 downgrade is bypassed —
         # dedupe-bypass coverage requires level==2 on the child record.
-        result = await _info(
+        result = await call_info(
             server,
             task_id='task-999',
             agent_role='orchestrator-watcher-supervisor',
@@ -907,7 +899,7 @@ class TestL2DedupeBypass:
         queue.submit(parent)
         parent_id = parent.id
 
-        await _info(
+        await call_info(
             server,
             task_id='task-999',
             agent_role='orchestrator-watcher-supervisor',
@@ -940,7 +932,7 @@ class TestL2DedupeBypass:
 
         # Uses sentinel agent_role so the C4/D3 downgrade is bypassed and
         # the born-at-L2 + terminal-task auto-resolve combination is covered.
-        result = await _blocker(
+        result = await call_blocker(
             server, severity='critical',
             **{**_COMMON_KWARGS, 'agent_role': 'orchestrator-watcher-supervisor'},
         )
@@ -968,7 +960,7 @@ class TestL2DedupeBypass:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue, task_status_lookup=_lookup)
 
-        result = await _info(
+        result = await call_info(
             server,
             task_id='task-999',
             agent_role='implementer',
@@ -1002,7 +994,7 @@ class TestL2DedupeBypass:
 
         # Uses sentinel agent_role so the C4/D3 downgrade is bypassed —
         # dedupe-bypass coverage requires the urgent escalation to stay at L2.
-        result = await _blocker(
+        result = await call_blocker(
             server,
             task_id='task-999',
             agent_role='orchestrator-watcher-supervisor',
@@ -1033,7 +1025,7 @@ class TestSeverityValidation:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _blocker(server, severity='CRITICAL', **_COMMON_KWARGS)
+        result = await call_blocker(server, severity='CRITICAL', **_COMMON_KWARGS)
 
         assert 'error' in result, f"Expected error for 'CRITICAL' (case-sensitive), got: {result}"
 
@@ -1043,7 +1035,7 @@ class TestSeverityValidation:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _info(server, severity='Urgent', **_COMMON_KWARGS)
+        result = await call_info(server, severity='Urgent', **_COMMON_KWARGS)
 
         assert 'error' in result, f"Expected error for 'Urgent' (case-sensitive), got: {result}"
 
@@ -1053,7 +1045,7 @@ class TestSeverityValidation:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _blocker(server, severity='criticial', **_COMMON_KWARGS)
+        result = await call_blocker(server, severity='criticial', **_COMMON_KWARGS)
 
         assert 'error' in result, f"Expected error for typo severity 'criticial', got: {result}"
         assert len(queue.get_pending()) == 0, (
@@ -1067,7 +1059,7 @@ class TestSeverityValidation:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _blocker(server, severity=severity, **_COMMON_KWARGS)
+        result = await call_blocker(server, severity=severity, **_COMMON_KWARGS)
 
         assert 'error' in result, (
             f"Expected error for severity={severity!r} (case-sensitive gate), got: {result}"
@@ -1081,7 +1073,7 @@ class TestSeverityValidation:
         server = create_server(queue)
 
         for sev in KNOWN_SEVERITIES:
-            result = await _blocker(
+            result = await call_blocker(
                 server,
                 task_id=f'task-{sev}',
                 agent_role='implementer',
@@ -1581,6 +1573,164 @@ class TestResolveIssueGrantedFiles:
         assert record.granted_files == []
 
 
+_GRANT_TASK = 't-grant-delivery'
+_GRANTED = ['pkg/b.py']
+
+
+def _probe_harness(blocker: GrantDelivery | None) -> types.SimpleNamespace:
+    return types.SimpleNamespace(granted_files_delivery_blocker=lambda _task_id: blocker)
+
+
+def _raising_probe_harness() -> types.SimpleNamespace:
+    def _probe(_task_id: str) -> GrantDelivery | None:
+        raise RuntimeError('probe exploded')
+
+    return types.SimpleNamespace(granted_files_delivery_blocker=_probe)
+
+
+def _assert_shortfall(result: dict[str, Any], expected: GrantDelivery) -> None:
+    assert result['granted_files_delivery'] == expected
+    reason = result['granted_files_delivery_reason']
+    assert _GRANT_TASK in reason
+    for path in _GRANTED:
+        assert path in reason
+
+
+class TestResolveIssueGrantedFilesDelivery:
+    """Every success return of resolve_issue says what became of granted_files (task 5650).
+
+    ``granted_files_delivery`` is always present, mirroring
+    ``late_resolution_captured``: the returned record looks identically
+    healthy whether or not the grant will land.
+    """
+
+    def _seed(self, queue: EscalationQueue) -> Escalation:
+        return seed_escalation(queue, level=0, task_id=_GRANT_TASK)
+
+    @pytest.mark.asyncio
+    async def test_no_grant_is_none_granted(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue, harness=_probe_harness(None))
+        esc = self._seed(queue)
+
+        result = await call_resolve_issue(
+            server, escalation_id=esc.id, resolution='fixed', action='resume',
+        )
+
+        assert result['granted_files_delivery'] == GrantDelivery.NONE_GRANTED
+        assert 'granted_files_delivery_reason' not in result
+
+    @pytest.mark.asyncio
+    async def test_an_unblocked_resume_grant_is_scheduled(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue, harness=_probe_harness(None))
+        esc = self._seed(queue)
+
+        result = await call_resolve_issue(
+            server, escalation_id=esc.id, resolution='granted', action='resume',
+            granted_files=_GRANTED,
+        )
+
+        assert result['granted_files_delivery'] == GrantDelivery.SCHEDULED
+        assert 'granted_files_delivery_reason' not in result
+
+    @pytest.mark.asyncio
+    async def test_no_harness_is_no_orchestrator(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed(queue)
+
+        result = await call_resolve_issue(
+            server, escalation_id=esc.id, resolution='granted', action='resume',
+            granted_files=_GRANTED,
+        )
+
+        _assert_shortfall(result, GrantDelivery.NO_ORCHESTRATOR)
+
+    @pytest.mark.asyncio
+    async def test_a_probe_blocker_is_reported(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(
+            queue, harness=_probe_harness(GrantDelivery.NO_PLAN_TO_WIDEN),
+        )
+        esc = self._seed(queue)
+
+        result = await call_resolve_issue(
+            server, escalation_id=esc.id, resolution='granted', action='resume',
+            granted_files=_GRANTED,
+        )
+
+        _assert_shortfall(result, GrantDelivery.NO_PLAN_TO_WIDEN)
+
+    @pytest.mark.asyncio
+    async def test_a_close_only_grant_does_not_apply(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue, harness=_probe_harness(None))
+        esc = self._seed(queue)
+
+        result = await call_resolve_issue(
+            server, escalation_id=esc.id, resolution='closed', action='close_only',
+            granted_files=_GRANTED,
+        )
+
+        _assert_shortfall(result, GrantDelivery.ACTION_DOES_NOT_APPLY_GRANTS)
+
+    @pytest.mark.asyncio
+    async def test_a_park_grant_is_reported_and_discarded(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue, harness=_probe_harness(None))
+        esc = self._seed(queue)
+
+        result = await call_resolve_issue(
+            server, escalation_id=esc.id, resolution='parked', action='park',
+            granted_files=_GRANTED,
+        )
+
+        _assert_shortfall(result, GrantDelivery.ACTION_DOES_NOT_APPLY_GRANTS)
+        record = queue.get(esc.id)
+        assert record is not None
+        assert record.granted_files == [], 'park discards the grant outright'
+
+    @pytest.mark.asyncio
+    async def test_a_grant_on_an_already_closed_record_is_record_not_open(
+        self, tmp_path: Path,
+    ):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue, harness=_probe_harness(None))
+        esc = self._seed(queue)
+        await call_resolve_issue(
+            server, escalation_id=esc.id, resolution='closed', action='close_only',
+        )
+
+        result = await call_resolve_issue(
+            server, escalation_id=esc.id, resolution='granted', action='resume',
+            granted_files=_GRANTED,
+        )
+
+        _assert_shortfall(result, GrantDelivery.RECORD_NOT_OPEN)
+        record = queue.get(esc.id)
+        assert record is not None
+        assert record.granted_files == []
+
+    @pytest.mark.asyncio
+    async def test_a_raising_probe_still_resolves_and_reports_scheduled(
+        self, tmp_path: Path,
+    ):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue, harness=_raising_probe_harness())
+        esc = self._seed(queue)
+
+        result = await call_resolve_issue(
+            server, escalation_id=esc.id, resolution='granted', action='resume',
+            granted_files=_GRANTED,
+        )
+
+        assert result['granted_files_delivery'] == GrantDelivery.SCHEDULED
+        record = queue.get(esc.id)
+        assert record is not None
+        assert record.status == 'resolved'
+
+
 # ---------------------------------------------------------------------------
 # TestResolveIssueTerminateMcpPath: terminate= guard reachable via MCP dispatch
 # ---------------------------------------------------------------------------
@@ -1678,7 +1828,7 @@ class TestChokepointSeverityDowngrade:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _blocker(
+        result = await call_blocker(
             server,
             task_id='task-999',
             agent_role='implementer',
@@ -1700,7 +1850,7 @@ class TestChokepointSeverityDowngrade:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _blocker(
+        result = await call_blocker(
             server,
             task_id='task-999',
             agent_role='implementer',
@@ -1733,7 +1883,7 @@ class TestChokepointSeverityDowngrade:
         server = create_server(queue)
         original_summary = f'original {severity} summary'
 
-        result = await _blocker(
+        result = await call_blocker(
             server,
             task_id='task-999',
             agent_role='implementer',
@@ -1766,7 +1916,7 @@ class TestChokepointSeverityDowngrade:
         server = create_server(queue)
 
         with caplog.at_level(logging.WARNING, logger='escalation.server'):
-            await _blocker(
+            await call_blocker(
                 server,
                 task_id='task-999',
                 agent_role='implementer',
@@ -1792,7 +1942,7 @@ class TestChokepointSeverityDowngrade:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _info(
+        result = await call_info(
             server,
             task_id='task-999',
             agent_role='implementer',
@@ -1828,7 +1978,7 @@ class TestChokepointSeverityDowngrade:
         server = create_server(queue)
         original_summary = f'original {severity} info summary'
 
-        result = await _info(
+        result = await call_info(
             server,
             task_id='task-999',
             agent_role='implementer',
@@ -1861,7 +2011,7 @@ class TestChokepointSeverityDowngrade:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _blocker(
+        result = await call_blocker(
             server,
             task_id='task-999',
             agent_role=sentinel_role,
@@ -1895,7 +2045,7 @@ class TestChokepointSeverityDowngrade:
         server = create_server(queue)
         original_summary = 'sentinel critical escalation'
 
-        result = await _blocker(
+        result = await call_blocker(
             server,
             task_id='task-999',
             agent_role=sentinel_role,
@@ -1927,7 +2077,7 @@ class TestChokepointSeverityDowngrade:
         server = create_server(queue)
 
         with caplog.at_level(logging.WARNING, logger='escalation.server'):
-            await _blocker(
+            await call_blocker(
                 server,
                 task_id='task-999',
                 agent_role=sentinel_role,
@@ -2963,7 +3113,7 @@ class TestAmendmentTruncationStorm:
 
         # Fill the amendment list exactly to the cap — no truncation yet, so
         # nothing may be filed.  Bound derived from the NAME, never the value.
-        for i in range(_MAX_AMENDMENTS):
+        for i in range(MAX_AMENDMENTS):
             filled = await self._fold(server, f'fill-{i}')
             assert filled['status'] == 'updated', f'Expected a fold, got {filled}'
         at_cap = queue.get(l2_id)
@@ -3043,7 +3193,7 @@ class TestAmendmentTruncationStorm:
         assert crossed['status'] == 'updated', f'Expected a fold, got {crossed}'
         assert crossed['id'] == l2_id
         assert crossed['amendment_recorded'] is True, f'framing must still land: {crossed}'
-        assert crossed['amendments'] == _MAX_AMENDMENTS, (
+        assert crossed['amendments'] == MAX_AMENDMENTS, (
             f'the list stays capped while truncating: {crossed}'
         )
         assert crossed['severity'] == 'blocking', f'severity must still report: {crossed}'
@@ -3087,7 +3237,7 @@ class TestAmendmentTruncationStorm:
         assert created['status'] == 'created', f'Unexpected first result: {created}'
 
         # Fill to the cap, then burst past the threshold on server #1.
-        for i in range(_MAX_AMENDMENTS + _AMENDMENT_TRUNCATION_STORM_THRESHOLD):
+        for i in range(MAX_AMENDMENTS + _AMENDMENT_TRUNCATION_STORM_THRESHOLD):
             await self._fold(server, f'first-{i}')
         known = pending_ids()
         assert len(known) == 2, (
@@ -3869,10 +4019,8 @@ class TestMergeRequestDedup:
         """
         import asyncio
 
-        from orchestrator.merge_lane import worker as _mq_mod
-        from orchestrator.merge_lane.worker import (
-            MergeDispatchResult,
-        )
+        from orchestrator.merge_lane import intake
+        from orchestrator.merge_lane.types import MergeDispatchResult
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
         mq: asyncio.Queue = asyncio.Queue()
@@ -3888,7 +4036,7 @@ class TestMergeRequestDedup:
             )
 
         monkeypatch.setattr(
-            _mq_mod, 'coalesce_or_enqueue_merge_request', _fake_coalesce,
+            intake, 'coalesce_or_enqueue_merge_request', _fake_coalesce,
         )
 
         server = create_server(
@@ -4229,10 +4377,8 @@ class TestMergeRequestDedup:
         import asyncio
         from pathlib import Path as _Path
 
-        from orchestrator.merge_lane.worker import (
-            MergeRequest,
-            register_and_enqueue_merge_request,
-        )
+        from orchestrator.merge_lane.intake import register_and_enqueue_merge_request
+        from orchestrator.merge_lane.worker import MergeRequest
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
         mq: asyncio.Queue = asyncio.Queue()
@@ -4366,13 +4512,14 @@ def _stub_patch_content_contained(monkeypatch: pytest.MonkeyPatch, stub: object)
     """Install *stub* where both readers of ``patch_content_contained`` look it up.
 
     The server reads it through the façade, whose home for it is
-    ``orchestrator.merge_lane.landing_evidence``; the worker's
-    ``coalesce_or_enqueue_merge_request`` reads the worker's own binding.
+    ``orchestrator.merge_lane.landing_evidence``; the C3 gate of
+    ``coalesce_or_enqueue_merge_request`` reads it through
+    ``orchestrator.merge_lane.tip_relation.resolve_divergent``.
     """
     import orchestrator.merge_lane.landing_evidence as landing_evidence
-    import orchestrator.merge_lane.worker as worker
+    import orchestrator.merge_lane.tip_relation as tip_relation
 
-    for module in (worker, landing_evidence):
+    for module in (tip_relation, landing_evidence):
         monkeypatch.setattr(module, 'patch_content_contained', stub)
 
 
@@ -5734,12 +5881,12 @@ class TestGetMergeQueue:
             f'wip_overlap, got: {bad_states}'
         )
 
-        # (5) The halt reverses cleanly — retirement did not corrupt
-        # _lane_halt.
+        # (5) The halt reverses cleanly — retirement did not corrupt the
+        # lane halt state.
         worker.unhalt_wip()
         assert not worker.is_wip_halted, (
             'Expected is_wip_halted False after unhalt_wip() — retirement '
-            'must not have corrupted _lane_halt'
+            'must not have corrupted the lane halt state'
         )
 
 
@@ -5790,7 +5937,7 @@ class TestDowngradeDedupeCorrectness:
         server = create_server(queue, dedupe_config=DedupeConfig())
         S = self._SUMMARY_A
 
-        result = await _blocker(
+        result = await call_blocker(
             server,
             task_id='task-999',
             agent_role='implementer',
@@ -5845,7 +5992,7 @@ class TestDowngradeDedupeCorrectness:
         queue.submit(parent)
 
         # File an agent critical with the SAME summary — should fold into parent
-        result = await _blocker(
+        result = await call_blocker(
             server,
             task_id='task-999',
             agent_role='implementer',
@@ -5877,7 +6024,7 @@ class TestDowngradeDedupeCorrectness:
         server = create_server(queue, dedupe_config=DedupeConfig())
         S = self._SUMMARY_A
 
-        first = await _blocker(
+        first = await call_blocker(
             server,
             task_id='task-1',
             agent_role='implementer',
@@ -5887,7 +6034,7 @@ class TestDowngradeDedupeCorrectness:
         )
         assert first['status'] == 'queued', f'Expected first to be queued, got: {first}'
 
-        second = await _blocker(
+        second = await call_blocker(
             server,
             task_id='task-2',
             agent_role='implementer',
@@ -5919,7 +6066,7 @@ class TestDowngradeDedupeCorrectness:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue, dedupe_config=DedupeConfig())
 
-        first = await _blocker(
+        first = await call_blocker(
             server,
             task_id='task-1',
             agent_role='implementer',
@@ -5931,7 +6078,7 @@ class TestDowngradeDedupeCorrectness:
             f'Expected first (SUMMARY_A) to be queued, got: {first}'
         )
 
-        second = await _blocker(
+        second = await call_blocker(
             server,
             task_id='task-2',
             agent_role='implementer',
@@ -5991,7 +6138,7 @@ class TestDowngradeDedupeCorrectness:
         queue.submit(parent)
 
         # File an agent critical with the same summary — should fold into parent
-        result = await _blocker(
+        result = await call_blocker(
             server,
             task_id='task-999',
             agent_role='implementer',
@@ -6602,8 +6749,9 @@ async def _call_tool(server: Any, name: str, **kwargs: Any) -> Any:
     """Invoke an async MCP tool by name.
 
     *server* is intentionally typed ``Any`` so pyright does not reach into
-    FastMCP's ``Tool`` internals (``.fn``) — mirroring the ``_blocker`` /
-    ``_info`` helpers above and ``_merge_tool_calls.py::call_merge_status``,
+    FastMCP's ``Tool`` internals (``.fn``) — mirroring
+    ``_filing_tools.py::call_blocker`` / ``call_info`` and
+    ``_merge_tool_calls.py::call_merge_status``,
     which the type-check gate accepts for exactly this reason.
     """
     tool = await server.get_tool(name)
@@ -6794,7 +6942,7 @@ class TestEscalateEvidenceParam:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _blocker(server, evidence=self._EVIDENCE, **_COMMON_KWARGS)
+        result = await call_blocker(server, evidence=self._EVIDENCE, **_COMMON_KWARGS)
 
         esc = queue.get(result['id'])
         assert esc is not None
@@ -6806,7 +6954,7 @@ class TestEscalateEvidenceParam:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _info(server, evidence=self._EVIDENCE, **_COMMON_KWARGS)
+        result = await call_info(server, evidence=self._EVIDENCE, **_COMMON_KWARGS)
 
         esc = queue.get(result['id'])
         assert esc is not None
@@ -6818,7 +6966,7 @@ class TestEscalateEvidenceParam:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _blocker(server, **_COMMON_KWARGS)
+        result = await call_blocker(server, **_COMMON_KWARGS)
 
         esc = queue.get(result['id'])
         assert esc is not None
@@ -6830,7 +6978,7 @@ class TestEscalateEvidenceParam:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _info(server, **_COMMON_KWARGS)
+        result = await call_info(server, **_COMMON_KWARGS)
 
         esc = queue.get(result['id'])
         assert esc is not None
@@ -6951,7 +7099,7 @@ class TestEscalateBlockerLevelParam:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _blocker(server, level=1, **_COMMON_KWARGS)
+        result = await call_blocker(server, level=1, **_COMMON_KWARGS)
 
         assert 'error' not in result, f'Unexpected error: {result}'
         esc = queue.get(result['id'])
@@ -6964,7 +7112,7 @@ class TestEscalateBlockerLevelParam:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _blocker(server, **_COMMON_KWARGS)
+        result = await call_blocker(server, **_COMMON_KWARGS)
 
         esc = queue.get(result['id'])
         assert esc is not None
@@ -6976,7 +7124,7 @@ class TestEscalateBlockerLevelParam:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _blocker(server, level=0, **_COMMON_KWARGS)
+        result = await call_blocker(server, level=0, **_COMMON_KWARGS)
 
         assert 'error' not in result, f'Unexpected error: {result}'
         esc = queue.get(result['id'])
@@ -6994,7 +7142,7 @@ class TestEscalateBlockerLevelParam:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _blocker(server, level=2, **_COMMON_KWARGS)
+        result = await call_blocker(server, level=2, **_COMMON_KWARGS)
 
         assert 'error' in result, f'Expected an error response, got: {result}'
         assert 'id' not in result, f'Nothing should be submitted, got: {result}'
@@ -7025,7 +7173,7 @@ class TestEscalateBlockerLevelParam:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _blocker(server, level=bad_level, **_COMMON_KWARGS)
+        result = await call_blocker(server, level=bad_level, **_COMMON_KWARGS)
 
         assert 'error' in result, f'level={bad_level!r}: expected error, got: {result}'
         assert queue.get_pending() == [], f'level={bad_level!r} must not submit any record'
@@ -7041,7 +7189,7 @@ class TestEscalateBlockerLevelParam:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _blocker(
+        result = await call_blocker(
             server, level=1, severity='critical',
             **{**_COMMON_KWARGS, 'agent_role': 'orchestrator-watcher-supervisor'},
         )
@@ -7072,7 +7220,7 @@ class TestUnexpectedLevel1FilerIsObservable:
         server = create_server(queue)
 
         with caplog.at_level(logging.WARNING, logger='escalation.server'):
-            result = await _blocker(
+            result = await call_blocker(
                 server, level=1,
                 **{**_COMMON_KWARGS, 'agent_role': 'implementer', 'task_id': 'task-777'},
             )
@@ -7097,7 +7245,7 @@ class TestUnexpectedLevel1FilerIsObservable:
         server = create_server(queue)
 
         with caplog.at_level(logging.WARNING, logger='escalation.server'):
-            result = await _blocker(
+            result = await call_blocker(
                 server, level=1, **{**_COMMON_KWARGS, 'agent_role': 'steward'},
             )
 
@@ -7117,7 +7265,7 @@ class TestUnexpectedLevel1FilerIsObservable:
         server = create_server(queue)
 
         with caplog.at_level(logging.WARNING, logger='escalation.server'):
-            await _blocker(server, **{**_COMMON_KWARGS, 'agent_role': 'implementer'})
+            await call_blocker(server, **{**_COMMON_KWARGS, 'agent_role': 'implementer'})
 
         unexpected = [
             r.message for r in caplog.records
@@ -7142,7 +7290,7 @@ class TestLevelEchoIsPresentOnEveryResponseBranch:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        result = await _blocker(server, level=1, **_COMMON_KWARGS)
+        result = await call_blocker(server, level=1, **_COMMON_KWARGS)
 
         assert result.get('level') == 1, f'Expected level echo on queued, got: {result}'
 
@@ -7165,7 +7313,7 @@ class TestLevelEchoIsPresentOnEveryResponseBranch:
 
         queue.get = _boom  # type: ignore[method-assign]
         try:
-            result = await _blocker(server, level=1, **_COMMON_KWARGS)
+            result = await call_blocker(server, level=1, **_COMMON_KWARGS)
         finally:
             queue.get = real_get  # type: ignore[method-assign]
 
@@ -7188,8 +7336,8 @@ class TestLevelEchoIsPresentOnEveryResponseBranch:
             'category': 'infra_issue',
             'summary': 'docker daemon unreachable',
         }
-        first = await _blocker(server, level=1, **kwargs)
-        second = await _blocker(server, level=1, **kwargs)
+        first = await call_blocker(server, level=1, **kwargs)
+        second = await call_blocker(server, level=1, **kwargs)
 
         assert second.get('status') == 'dedup_skipped', (
             f'Expected the second filing to fold into the first ({first}), got: {second}'
@@ -7208,7 +7356,7 @@ class TestLevelEchoIsPresentOnEveryResponseBranch:
 
         server = create_server(queue, task_status_lookup=_terminal_lookup)
 
-        result = await _blocker(server, level=1, **_COMMON_KWARGS)
+        result = await call_blocker(server, level=1, **_COMMON_KWARGS)
 
         assert result.get('status') != 'queued', (
             f'Expected the terminal-task auto-resolve branch, got: {result}'
@@ -7298,9 +7446,11 @@ class TestPromoteToL2CanonicalFold:
     ):
         """The over-fold evidence trail: the incoming spelling lands in `amendments`.
 
-        This is also what proves ``_framing_view`` was NOT canonicalised — if it
-        had been, a spelling-only difference would read as a REPEAT and be
-        suppressed, emptying the slot task 3997 built for exactly this.
+        This is also what proves
+        ``escalation/src/escalation/amendments.py::_framing_view`` was NOT
+        canonicalised — if it had been, a spelling-only difference would read
+        as a REPEAT and be suppressed, emptying the slot task 3997 built for
+        exactly this.
         """
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
@@ -7760,7 +7910,7 @@ class TestFilingClaimantIdentityStamp:
             startup_sweep=False,
         )
 
-        result = await _blocker(server, **_COMMON_KWARGS)
+        result = await call_blocker(server, **_COMMON_KWARGS)
 
         esc = queue.get(result['id'])
         assert esc is not None
@@ -7776,7 +7926,7 @@ class TestFilingClaimantIdentityStamp:
             startup_sweep=False,
         )
 
-        result = await _info(server, **_COMMON_KWARGS)
+        result = await call_info(server, **_COMMON_KWARGS)
 
         esc = queue.get(result['id'])
         assert esc is not None
@@ -7792,7 +7942,7 @@ class TestFilingClaimantIdentityStamp:
             startup_sweep=False,
         )
 
-        await _blocker(server, **_COMMON_KWARGS)
+        await call_blocker(server, **_COMMON_KWARGS)
 
         assert calls == ['task-999']
 
@@ -7806,7 +7956,7 @@ class TestFilingClaimantIdentityStamp:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue, startup_sweep=False)
 
-        result = await _blocker(server, **_COMMON_KWARGS)
+        result = await call_blocker(server, **_COMMON_KWARGS)
 
         esc = queue.get(result['id'])
         assert esc is not None
@@ -7829,7 +7979,7 @@ class TestFilingClaimantIdentityStamp:
         server = create_server(queue, task_claimant_lookup=_boom, startup_sweep=False)
 
         with caplog.at_level(logging.WARNING):
-            result = await _blocker(server, **_COMMON_KWARGS)
+            result = await call_blocker(server, **_COMMON_KWARGS)
 
         esc = queue.get(result['id'])
         assert esc is not None
@@ -7857,7 +8007,7 @@ class TestFilingClaimantIdentityStamp:
             startup_sweep=False,
         )
 
-        result = await _blocker(server, **_COMMON_KWARGS)
+        result = await call_blocker(server, **_COMMON_KWARGS)
 
         esc = queue.get(result['id'])
         assert esc is not None
@@ -7883,7 +8033,7 @@ class TestFilingClaimantIdentityStamp:
             startup_sweep=False,
         )
 
-        result = await _blocker(server, **_COMMON_KWARGS)
+        result = await call_blocker(server, **_COMMON_KWARGS)
 
         assert result['status'] == 'resolved', f'expected auto-resolve, got: {result}'
         esc = queue.get(result['id'])
@@ -7901,7 +8051,7 @@ class TestFilingClaimantIdentityStamp:
             startup_sweep=False,
         )
 
-        result = await _blocker(
+        result = await call_blocker(
             server, severity='critical',
             **{**_COMMON_KWARGS, 'agent_role': 'orchestrator-watcher-supervisor'},
         )
@@ -7922,7 +8072,7 @@ class TestFilingClaimantIdentityStamp:
             startup_sweep=False,
         )
 
-        result = await _blocker(server, severity='critical', **_COMMON_KWARGS)
+        result = await call_blocker(server, severity='critical', **_COMMON_KWARGS)
 
         esc = queue.get(result['id'])
         assert esc is not None
@@ -7941,7 +8091,7 @@ class TestFilingClaimantIdentityStamp:
             startup_sweep=False,
         )
 
-        result = await _blocker(
+        result = await call_blocker(
             server, level=1, **{**_COMMON_KWARGS, 'agent_role': 'steward'},
         )
 

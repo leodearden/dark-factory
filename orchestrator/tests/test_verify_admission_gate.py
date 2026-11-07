@@ -27,6 +27,7 @@ from orchestrator.verify_admission_gate import (
     AdmissionPlan,
     AdmissionPolicy,
     AdmissionRequest,
+    PlanLatch,
     gate_for,
 )
 
@@ -163,14 +164,71 @@ class TestAdmissionPlan:
             )
 
 
+class TestPlanLatch:
+    def test_a_fresh_latch_is_not_granted(self):
+        assert PlanLatch().granted is False
+
+    def test_marking_is_one_way(self):
+        latch = PlanLatch()
+
+        latch.mark_granted()
+        latch.mark_granted()
+
+        assert latch.granted is True
+
+    def test_latches_compare_by_identity(self):
+        a, b = PlanLatch(), PlanLatch()
+
+        assert a != b
+        assert a == a
+
+
+class TestPlanGrantedRead:
+    def test_a_begun_plan_has_not_been_granted(self):
+        assert AdmissionPlan.begin(role='task', task_id='7').has_been_granted() is False
+
+    def test_marking_the_plan_latch_reads_granted(self):
+        plan = AdmissionPlan.begin(role='task', task_id='7')
+
+        plan.latch.mark_granted()
+
+        assert plan.has_been_granted() is True
+
+    def test_two_plans_have_distinct_latches(self):
+        first = AdmissionPlan.begin(role='task', task_id='7')
+        second = AdmissionPlan.begin(role='task', task_id='7')
+
+        first.latch.mark_granted()
+
+        assert first.latch is not second.latch
+        assert second.has_been_granted() is False
+
+    def test_a_request_carries_its_plan_latch(self):
+        plan = AdmissionPlan.begin(role='task', task_id='7')
+
+        assert plan.request(module='m', scope_kind=None).plan_latch is plan.latch
+
+    def test_the_latch_is_not_part_of_a_request_value(self):
+        plan = AdmissionPlan.begin(role='task', task_id='7')
+        first = plan.request(module='m', scope_kind=None)
+        second = plan.request(module='m', scope_kind=None)
+        detached = dataclasses.replace(first, plan_latch=None)
+
+        assert first == second == detached
+        assert 'latch' not in repr(first)
+
+
 class TestAdmissionPolicy:
     def test_a_valid_policy_constructs(self):
         policy = AdmissionPolicy(slots=1, order='arrival', promote_after_secs=0.0)
         assert (policy.slots, policy.order, policy.promote_after_secs) == (1, 'arrival', 0.0)
 
-    def test_slots_below_one_is_rejected(self):
-        with pytest.raises(ValueError, match=r'slots.*0'):
-            AdmissionPolicy(slots=0, order='unordered', promote_after_secs=1.0)
+    def test_zero_slots_is_a_paused_host_and_constructs(self):
+        assert AdmissionPolicy(slots=0, order='arrival', promote_after_secs=1.0).slots == 0
+
+    def test_negative_slots_is_rejected(self):
+        with pytest.raises(ValueError, match=r'slots.*-1'):
+            AdmissionPolicy(slots=-1, order='unordered', promote_after_secs=1.0)
 
     def test_an_unknown_order_is_rejected(self):
         with pytest.raises(ValueError, match=r'order.*fifo'):
@@ -349,6 +407,93 @@ class TestPolicyIsReadAtEachGrant:
         assert legs.granted[2:] == sorted({'A', 'B', 'C'} - {first})
         assert legs.grants[first].order == 'unordered'
         assert {legs.grants[label].order for label in legs.granted[2:]} == {'arrival'}
+
+
+def _queued_modules(legs: _Legs) -> list[str | None]:
+    return [w.request.module for w in legs.gate.snapshot().waiters]
+
+
+def _holder_modules(legs: _Legs) -> list[str | None]:
+    return [h.request.module for h in legs.gate.snapshot().holders]
+
+
+@pytest.mark.asyncio
+class TestPausedGate:
+    async def test_a_zero_slot_gate_queues_its_waiter_without_running_it(self, tmp_path):
+        legs = _Legs(tmp_path, _policy(slots=0))
+
+        await legs.queue('A')
+        await asyncio.sleep(0.05)
+
+        assert _queued_modules(legs) == ['A']
+        assert legs.gate.snapshot().holders == ()
+        assert legs.granted == []
+        legs.policy = _policy(slots=1)
+        legs.gate.redispatch(legs.policy)
+        await legs.finish()
+
+    async def test_redispatch_grants_a_queued_waiter_with_no_arrival_or_departure(self, tmp_path):
+        legs = _Legs(tmp_path, _policy(slots=0))
+        await legs.queue('A', hold=True)
+
+        legs.policy = _policy(slots=1)
+        legs.gate.redispatch(legs.policy)
+
+        assert _holder_modules(legs) == ['A']
+        assert legs.gate.snapshot().depth == 0
+        await _until(lambda: legs.granted == ['A'])
+        await legs.finish()
+
+    async def test_redispatch_picks_the_older_plan_first(self, tmp_path):
+        legs = _Legs(tmp_path, _policy(slots=0))
+        older, younger = _request('A'), _request('B')
+        await legs.queue('B', younger, hold=True)
+        await legs.queue('A', older, hold=True)
+
+        legs.policy = _policy(slots=1)
+        legs.gate.redispatch(legs.policy)
+
+        assert _holder_modules(legs) == ['A']
+        assert _queued_modules(legs) == ['B']
+        await legs.finish()
+        assert legs.granted == ['A', 'B']
+
+    async def test_a_holder_leaving_a_paused_gate_hands_no_turn_on(self, tmp_path):
+        legs = _Legs(tmp_path, _policy(slots=1))
+        await legs.hold('H')
+        await legs.queue('A', hold=True)
+
+        legs.policy = _policy(slots=0)
+        legs.release('H')
+        await _until(lambda: legs.tasks['H'].done())
+        await asyncio.sleep(0.05)
+
+        assert legs.gate.snapshot().holders == ()
+        assert _queued_modules(legs) == ['A']
+        legs.policy = _policy(slots=1)
+        legs.gate.redispatch(legs.policy)
+        assert _holder_modules(legs) == ['A']
+        await legs.finish()
+        assert legs.granted == ['H', 'A']
+
+    async def test_redispatch_on_an_empty_gate_grants_nothing(self, tmp_path):
+        gate = gate_for(tmp_path)
+
+        gate.redispatch(_policy(slots=1))
+
+        assert gate.snapshot().depth == 0
+        assert gate.snapshot().holders == ()
+
+    async def test_redispatch_on_a_full_gate_grants_nothing(self, tmp_path):
+        legs = _Legs(tmp_path, _policy(slots=1))
+        await legs.hold('H')
+        await legs.queue('A', hold=True)
+
+        legs.gate.redispatch(legs.policy)
+
+        assert _holder_modules(legs) == ['H']
+        assert _queued_modules(legs) == ['A']
+        await legs.finish()
 
 
 def _loop_callback_errors(caplog: pytest.LogCaptureFixture) -> list[str]:

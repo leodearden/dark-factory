@@ -388,7 +388,7 @@ def payload_kind(source_description: object) -> str:
 def content_hash(content: str, *, uuid: str | None = None) -> str:
     """Return the full 64-char SHA-256 hex digest of *content*'s UTF-8 bytes.
 
-    Deliberately NOT ``memory_eval_retrieval_probe.content_key()``, which is
+    Deliberately NOT ``fused_memory.eval.retrieval_probe.content_key()``, which is
     ``sha256(whitespace-normalized)[:16]``. That digest's job is stable
     *identity matching* of memory text across re-indentation and rewrapping;
     this one's job is the opposite — **drift detection** on replay inputs. For

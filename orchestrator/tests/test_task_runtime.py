@@ -18,7 +18,7 @@ from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.lane_lifecycle import LaneState
+from orchestrator.lane_lifecycle import LaneLifecycle, LaneState
 from orchestrator.task_runtime import (
     _derive_phase,
     _map_lane_state,
@@ -58,11 +58,10 @@ def git_repo(tmp_path: Path) -> Path:
 
 
 def _make_task_artifacts(worktree_base: Path, name: str, task_id: str) -> TaskArtifacts:
-    """Create <worktree_base>/<name> plus its .task-meta/<name> artifacts root."""
+    """Create <worktree_base>/<name> plus both of its .task-meta roots, as a dispatch does."""
     worktree = worktree_base / name
     worktree.mkdir(parents=True, exist_ok=True)
-    meta_root = TaskArtifacts.meta_root_for(worktree_base, name)
-    ta = TaskArtifacts(worktree, meta_root)
+    ta = TaskArtifacts.for_task(worktree, task_id)
     ta.init(task_id, f'Task {task_id}', 'desc')
     return ta
 
@@ -162,8 +161,7 @@ class TestNonPooled:
 
 # ---------------------------------------------------------------------------
 # Pooled layout (scenarios B1/B3/B4) — durable .lane-state records drive
-# task<->lane, task<->lane_state; artifacts still read via the shared
-# .task-meta/<lane> root.
+# task<->lane, task<->lane_state; each artifact is read from its own root.
 # ---------------------------------------------------------------------------
 
 
@@ -192,7 +190,7 @@ class TestPooled:
         # honest zero, not a read failure).
         lifecycle.note_assigned('_lane-7', task_id='44')
         _make_task_artifacts(worktree_base, '_lane-7', '44')
-        empty_log = TaskArtifacts.meta_root_for(worktree_base, '_lane-7') / 'iterations.jsonl'
+        empty_log = TaskArtifacts.task_root_for(worktree_base, '44') / 'iterations.jsonl'
         empty_log.write_text('')
 
         # A task-less lane record (RELEASED clears task_id) must produce NO
@@ -223,6 +221,89 @@ class TestPooled:
 
 
 # ---------------------------------------------------------------------------
+# Dual root (task 3155): plan.json, iterations.jsonl and reviews/ come from
+# .task-meta/task-<id>; only metadata.json comes from the lane's own root.
+# ---------------------------------------------------------------------------
+
+_CREATED_AT = '2026-10-23T00:00:00+00:00'
+
+
+def _seed_task_scoped(root: Path) -> None:
+    """Hand-write a mixed plan, two iterations and one review under *root*."""
+    (root / 'reviews').mkdir(parents=True, exist_ok=True)
+    (root / 'plan.json').write_text(json.dumps({'steps': [
+        {'id': 's1', 'status': 'done'},
+        {'id': 's2', 'status': 'pending'},
+    ]}))
+    (root / 'iterations.jsonl').write_text('{"n": 1}\n{"n": 2}\n')
+    (root / 'reviews' / 'reviewer-a.json').write_text(json.dumps({'verdict': 'PASS', 'issues': []}))
+
+
+def _seed_lane_metadata(worktree_base: Path, name: str, task_id: str) -> Path:
+    """Create <worktree_base>/<name> and its lane metadata.json; return the lane root."""
+    (worktree_base / name).mkdir(parents=True, exist_ok=True)
+    lane_root = TaskArtifacts.meta_root_for(worktree_base, name)
+    lane_root.mkdir(parents=True, exist_ok=True)
+    (lane_root / 'metadata.json').write_text(json.dumps({'task_id': task_id, 'created_at': _CREATED_AT}))
+    return lane_root
+
+
+class TestEachArtifactFromItsOwnRoot:
+    def test_non_pooled_reads_the_task_root_and_lane_metadata(self, git_repo: Path):
+        git_ops = GitOps(GitConfig(), git_repo)
+        worktree_base = git_ops.worktree_base
+        _seed_lane_metadata(worktree_base, '42', '42')
+        _seed_task_scoped(TaskArtifacts.task_root_for(worktree_base, '42'))
+
+        [entry] = build_task_runtime_snapshot(git_ops=git_ops)
+
+        assert (entry.task_id, entry.loops, entry.attempts, entry.phase) == (42, 2, 1, 'EXECUTE')
+        assert entry.started == _CREATED_AT
+        assert entry.error is None
+
+    def test_pooled_lane_record_reads_its_tasks_root(self, git_repo: Path):
+        git_ops = GitOps(_warm_config(), git_repo, warm_lane_pool_size=1)
+        worktree_base = git_ops.worktree_base
+        LaneLifecycle(worktree_base).note_assigned('_lane-0', task_id='7')
+        _seed_lane_metadata(worktree_base, '_lane-0', '7')
+        _seed_task_scoped(TaskArtifacts.task_root_for(worktree_base, '7'))
+
+        [entry] = build_task_runtime_snapshot(git_ops=git_ops)
+
+        assert (entry.task_id, entry.lane, entry.loops, entry.attempts, entry.phase) == (
+            7, '_lane-0', 2, 1, 'EXECUTE',
+        )
+        assert entry.started == _CREATED_AT
+
+    def test_task_scoped_artifacts_left_at_the_lane_root_are_not_read(self, git_repo: Path):
+        """No new-then-old fallback (PRD decision 7): γ's adoption moves them."""
+        git_ops = GitOps(GitConfig(), git_repo)
+        _seed_task_scoped(_seed_lane_metadata(git_ops.worktree_base, '42', '42'))
+
+        [entry] = build_task_runtime_snapshot(git_ops=git_ops)
+
+        assert (entry.loops, entry.attempts, entry.phase, entry.error) == (0, 0, 'PLAN', None)
+
+
+class TestSnapshotIsReadOnly:
+    def test_malformed_plan_is_not_rewritten_by_a_snapshot(self, git_repo: Path):
+        git_ops = GitOps(GitConfig(), git_repo)
+        worktree_base = git_ops.worktree_base
+        _make_task_artifacts(worktree_base, '70', '70')
+        task_root = TaskArtifacts.task_root_for(worktree_base, '70')
+        plan_path = task_root / 'plan.json'
+        plan_path.write_text(json.dumps({'tdd_steps': [{'id': 's1', 'status': 'done'}]}))
+        bytes_before = plan_path.read_bytes()
+        listing_before = sorted(p.name for p in task_root.iterdir())
+
+        [entry] = build_task_runtime_snapshot(git_ops=git_ops)
+
+        assert (entry.phase, entry.error) == ('DONE', None)
+        assert plan_path.read_bytes() == bytes_before
+        assert sorted(p.name for p in task_root.iterdir()) == listing_before
+
+
+# ---------------------------------------------------------------------------
 # INV-2 structured-facts-at-failure: a per-task artifact READ FAILURE is
 # marked (error set, loops/attempts/phase/started all None) — never coerced
 # to a fabricated 0/'PLAN'. Honest-empty artifacts stay 0/'PLAN'/error=None.
@@ -235,8 +316,7 @@ class TestReadFailureMarked:
         worktree_base = git_ops.worktree_base
 
         _make_task_artifacts(worktree_base, '50', '50')
-        meta_root = TaskArtifacts.meta_root_for(worktree_base, '50')
-        (meta_root / 'plan.json').write_text('{not valid json')
+        (TaskArtifacts.task_root_for(worktree_base, '50') / 'plan.json').write_text('{not valid json')
 
         result = build_task_runtime_snapshot(git_ops=git_ops)
 
@@ -264,8 +344,7 @@ class TestReadFailureMarked:
         worktree_base = git_ops.worktree_base
 
         _make_task_artifacts(worktree_base, '51', '51')
-        meta_root = TaskArtifacts.meta_root_for(worktree_base, '51')
-        (meta_root / 'iterations.jsonl').write_text('')
+        (TaskArtifacts.task_root_for(worktree_base, '51') / 'iterations.jsonl').write_text('')
 
         result = build_task_runtime_snapshot(git_ops=git_ops)
 
@@ -274,6 +353,35 @@ class TestReadFailureMarked:
         assert entry.task_id == 51
         assert entry.loops == 0
         assert entry.error is None
+
+    def test_corrupted_iteration_log_line_marks_error_not_undercount(self, git_repo: Path):
+        git_ops = GitOps(GitConfig(), git_repo)
+        worktree_base = git_ops.worktree_base
+        _make_task_artifacts(worktree_base, '52', '52')
+        (TaskArtifacts.task_root_for(worktree_base, '52') / 'iterations.jsonl').write_text(
+            '{"n": 1}\nnot json\n{"n": 2}\n',
+        )
+
+        [entry] = build_task_runtime_snapshot(git_ops=git_ops)
+
+        assert entry.error and 'iterations.jsonl' in entry.error
+        assert (entry.loops, entry.attempts, entry.phase, entry.started) == (None, None, None, None)
+        assert entry.has_worktree is True
+
+    @pytest.mark.parametrize('steps', ['abc', {'s1': {'status': 'done'}}])
+    def test_non_list_plan_steps_marks_error(self, git_repo: Path, steps):
+        git_ops = GitOps(GitConfig(), git_repo)
+        worktree_base = git_ops.worktree_base
+        _make_task_artifacts(worktree_base, '53', '53')
+        (TaskArtifacts.task_root_for(worktree_base, '53') / 'plan.json').write_text(
+            json.dumps({'steps': steps}),
+        )
+
+        [entry] = build_task_runtime_snapshot(git_ops=git_ops)
+
+        assert entry.error and 'steps' in entry.error
+        assert (entry.loops, entry.attempts, entry.phase, entry.started) == (None, None, None, None)
+        assert entry.has_worktree is True
 
 
 # ---------------------------------------------------------------------------

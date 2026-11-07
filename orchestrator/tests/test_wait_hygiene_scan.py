@@ -216,7 +216,7 @@ class TestSecondOffender:
         """`contextlib.suppress(Exception):` (not `TimeoutError`
         specifically) around a wait_for call is NOT reported -- this is the
         blessed best-effort teardown-join shape (the `worker_task` join in
-        `test_merge_queue_concurrent_verify.py::_stop_worker`), which
+        `_merge_worker_drive.py::stop_merge_worker`), which
         asserts nothing and so isn't the None-outcome
         anti-pattern.
         """
@@ -323,7 +323,7 @@ async def test_x():
 class TestWorkerTeardownGuardScanner:
     """Unit tests for `unguarded_worker_teardown_items` -- the executable
     form of the esc-3980-4 leak invariant recorded in
-    `test_merge_queue_concurrent_verify.py::_stop_worker`'s docstring: `wait_responsive` gives up by raising `_pytest.outcomes.Failed`, so a
+    `_merge_worker_drive.py::stop_merge_worker`'s docstring: `wait_responsive` gives up by raising `_pytest.outcomes.Failed`, so a
     give-up on a straight-line body (like a mid-body `assert`) skips the
     worker-stop call entirely and leaks a live SpeculativeMergeWorker plus
     its run task into pytest-asyncio teardown -- how one red test used to
@@ -332,7 +332,7 @@ class TestWorkerTeardownGuardScanner:
     A stop call counts as guarded only when the `finally:`'s guarding
     `try:` body encloses EVERY `wait_responsive` call in the method (not
     merely when SOME finally exists somewhere in the method), and either
-    `worker.stop()` or the shared `_stop_worker(...)` helper counts as a
+    `worker.stop()` or the shared `stop_merge_worker(...)` helper counts as a
     stop call (task 4219 amendment; both fixed after review found the
     original implementation's blind spots).
     """
@@ -426,7 +426,7 @@ class TestMixedGuardedAndUnguarded:
         )
 
     def test_straight_line_stop_worker_helper_is_reported(self) -> None:
-        """A straight-line `await _stop_worker(worker, worker_task)` --
+        """A straight-line `await stop_merge_worker(worker, worker_task)` --
         the shared teardown helper -- IS reported when not inside a
         finally, exactly like a straight-line `worker.stop()`. Without this, a future migration
         that adopts the OTHER blessed teardown shape would make
@@ -436,17 +436,17 @@ class TestMixedGuardedAndUnguarded:
 class TestUnguardedStopWorkerHelper:
     async def test_it(self):
         await wait_responsive(fut, timeout=5.0, label='x')
-        await _stop_worker(worker, worker_task)
+        await stop_merge_worker(worker, worker_task)
 '''
         result = unguarded_worker_teardown_items(source)
 
         assert result == ['TestUnguardedStopWorkerHelper::test_it'], (
-            f'Expected the straight-line _stop_worker(...) helper call to '
+            f'Expected the straight-line stop_merge_worker(...) helper call to '
             f'be reported, got {result!r}.'
         )
 
     def test_stop_worker_helper_inside_finally_is_not_reported(self) -> None:
-        """The same `_stop_worker(...)` helper call, moved into a
+        """The same `stop_merge_worker(...)` helper call, moved into a
         `try: ... finally:` block whose try encloses the wait_responsive
         call, is NOT reported.
         """
@@ -456,12 +456,12 @@ class TestGuardedStopWorkerHelper:
         try:
             await wait_responsive(fut, timeout=5.0, label='x')
         finally:
-            await _stop_worker(worker, worker_task)
+            await stop_merge_worker(worker, worker_task)
 '''
         result = unguarded_worker_teardown_items(source)
 
         assert result == [], (
-            f'Expected a finally-wrapped _stop_worker(...) helper call to '
+            f'Expected a finally-wrapped stop_merge_worker(...) helper call to '
             f'NOT be reported, got {result!r}.'
         )
 

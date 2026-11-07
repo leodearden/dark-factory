@@ -5,12 +5,22 @@ that handles MCP envelope markup must never spell an envelope literal with a
 raw opening bracket. That module's 'Sentinel-literal hazard' section says why.
 
 POPULATION. Every ``.py`` file git knows about (tracked, or untracked and not
-ignored) whose source already handles envelope markup the sanctioned way: it
-spells the bracket as the text ``chr(60)`` or the ``\\x3c`` escape, or it
-imports ``shared.toolcall_markup``. Files are found by path scan, read once and
-never imported. The population selects itself, so this guard stops a
-markup-handling file from regressing to a raw literal; a file that spells
-envelope literals ONLY raw never enters it and is not caught here.
+ignored) whose source either (i) handles envelope markup the sanctioned way:
+it spells the bracket as the text ``chr(60)`` or the ``\\x3c`` escape, or it
+imports ``shared.toolcall_markup``; or (ii) spells raw one of the envelope
+grammar's own tags, ``ENVELOPE_ONLY_RAW_PREFIXES``: the parameter opener
+followed by a space, the whole parameter closer or the whole invoke closer
+(escaped, ``\\x3cparameter`` plus a space, ``\\x3c/parameter>`` and
+``\\x3c/invoke>``). Each ends at a tag boundary, so a longer XML tag name that
+shares the prefix, such as ``parameters`` or ``parameterList``, admits nothing.
+Files are found by path scan, read once and never imported. Signal (i) stops a markup-handling file from
+regressing to a raw literal; signal (ii) reaches a file that spells envelope
+literals ONLY raw. The echoed parameter-name closers (description, details,
+content) are not signals, because HTML and XML use those words as tag names
+too. That is also why the raw slash needle stays gated by the population: on
+its own it would flag every HTML or JSX closer, such as those in
+``dashboard/tests``. The residual gap: a raw-only file whose only envelope
+literals are those name-echo closers is not caught.
 
 NEEDLES. The two raw prefixes every envelope literal starts with: the bracket
 followed by a slash, and the bracket followed by ``parameter``. Reports name a
@@ -40,7 +50,9 @@ CHECKOUT_ROOT = Path(__file__).resolve().parents[2]
 
 _LT = chr(60)
 ESCAPED_BRACKET = '\\x3c'
-RAW_PREFIXES: tuple[str, ...] = (_LT + '/', _LT + 'parameter')
+_PARAMETER_OPENER = _LT + 'parameter'
+RAW_PREFIXES: tuple[str, ...] = (_LT + '/', _PARAMETER_OPENER)
+ENVELOPE_ONLY_RAW_PREFIXES: tuple[str, ...] = (_PARAMETER_OPENER + ' ', _LT + '/parameter>', _LT + '/invoke>')
 SANCTIONED_BRACKET_SPELLINGS: tuple[str, ...] = ('chr(60)', ESCAPED_BRACKET)
 LITERAL_OWNER = 'shared.toolcall_markup'
 _OWNER_PACKAGE, _, _OWNER_MODULE = LITERAL_OWNER.rpartition('.')
@@ -71,7 +83,11 @@ def imports_literal_owner(source: str) -> bool:
 def handles_envelope_markup(source: str) -> bool:
     """Whether *source* belongs to the guarded population."""
     spells_bracket = any(spelling in source for spelling in SANCTIONED_BRACKET_SPELLINGS)
-    return spells_bracket or imports_literal_owner(source)
+    return (
+        spells_bracket
+        or any(prefix in source for prefix in ENVELOPE_ONLY_RAW_PREFIXES)
+        or imports_literal_owner(source)
+    )
 
 
 def raw_prefix_lines(source: str) -> dict[str, tuple[int, ...]]:

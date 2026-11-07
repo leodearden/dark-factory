@@ -29,7 +29,7 @@ from orchestrator.merge_lane import (
     coalesce_or_enqueue_merge_request,
     enqueue_merge_request,
 )
-from orchestrator.merge_lane.worker import register_and_enqueue_merge_request
+from orchestrator.merge_lane.intake import register_and_enqueue_merge_request
 
 pytestmark = pytest.mark.asyncio
 

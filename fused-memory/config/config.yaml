@@ -170,15 +170,22 @@ taskmaster:
   tool_mode: "all"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# write_journal — RED-TIER / restart-only. The prune runs at startup and every
+# write_journal — RED-TIER / restart-only. Every journal table with a horizon is
+# pruned once at startup (services/journal_retention.py) and write_ops again every
 # prune_interval_seconds (services/write_ops_retention.py); nothing re-reads
 # these values after startup, so a changed leaf is correctly reported
 # restart_required by mcp__escalation__reload_config.
 #
+# backend_ops (task 5551) is the Layer-2 half of each write, so it ages out at
+# write_retention_days. At startup it shares prune_max_rows_per_run and
+# prune_max_seconds with write_ops, taking what write_ops left, so one startup's
+# batched pruning stays inside one deadline. Measured 2026-10-31: 553,525 rows,
+# ~7.3k/day, the oldest from 2026-04-07, so nothing is deleted until ~2028-04.
+#
 # These are the DEPLOYED values, and they are meant to be edited. The fallback
 # for an omitted leaf is config/schema.py::WriteJournalConfig, which is the one
-# place the numbers are defined — prune_write_ops itself takes all six as
-# required arguments precisely so there is no third copy to drift.
+# place the numbers are defined — the prune methods these leaves feed take them
+# as required arguments precisely so there is no third copy to drift.
 #
 # MEASURED STARTING STATE (2026-09-11, before this section existed): write_ops
 # held 35,428,715 rows / 16 GB spanning 157 days, never pruned. The mix is
@@ -257,6 +264,10 @@ taskmaster:
 #   the batch in flight and the serving-cost basis above stands.
 # - prune_interval_seconds: a pass with nothing expired seeks each horizon from
 #   its resume point, milliseconds, so frequent passes cost nothing once drained.
+#
+# referent_findings_retention_days (task 5551) ages out the referent diagnosis
+# log at startup. Measured 2026-10-31: 416 rows from 2026-09-17 to 2026-10-31,
+# ~12.6/day, so the 365-day horizon keeps ~4.6k rows.
 # ─────────────────────────────────────────────────────────────────────────────
 write_journal:
   read_retention_days: ${WRITE_JOURNAL_READ_RETENTION_DAYS:30}
@@ -266,6 +277,7 @@ write_journal:
   prune_max_rows_per_run: ${WRITE_JOURNAL_PRUNE_MAX_ROWS:500000}
   prune_max_seconds: ${WRITE_JOURNAL_PRUNE_MAX_SECONDS:30}
   prune_interval_seconds: ${WRITE_JOURNAL_PRUNE_INTERVAL_SECONDS:1800}
+  referent_findings_retention_days: ${WRITE_JOURNAL_REFERENT_FINDINGS_RETENTION_DAYS:365}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # write_journal_growth_alarm — RED-TIER / restart-only (task 3311). Every
@@ -466,11 +478,12 @@ reconciliation:
   # DENY-ON-MISSING: a caller whose resolved identity matches no prefix here is
   # refused, and an EMPTY list denies EVERY caller — that empty value is the
   # incident knob, and it is green-tier so it lands on the next call rather than
-  # after a restart. Only 'orchestrator' by default: the orchestrator sends no
-  # agent_id, so the identity resolver falls back to the clientInfo.name its MCP
-  # session advertises, which is that literal. NOTE the identity this bar reads
-  # is SELF-REPORTED, so it deters a cooperating caller rather than enforcing a
-  # boundary. Shown at its shipped default; uncomment to change.
+  # after a restart. Only 'orchestrator' by default: Scheduler.set_task_status
+  # sends agent_id='orchestrator' explicitly, because stateless HTTP drops
+  # clientInfo so the identity resolver has nothing to fall back to. NOTE the
+  # identity this bar reads is SELF-REPORTED, so it deters a cooperating caller
+  # rather than enforcing a boundary. Shown at its shipped default; uncomment
+  # to change.
   # deterministic_provenance_allowed_agent_prefixes: ['orchestrator']
   usage_cap:
     enabled: true

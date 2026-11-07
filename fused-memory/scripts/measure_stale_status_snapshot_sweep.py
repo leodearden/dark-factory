@@ -1,8 +1,9 @@
 """Measure the stale status-snapshot sweep over the complete live corpus. (task 4851)
 
 Answers three questions about
-``fused_memory/reconciliation/stale_status_snapshot_edge_sweep.py`` with one
-read per project, and writes the answers to ONE committed artifact pair —
+``fused_memory/reconciliation/stale_status_snapshot_edge_sweep.py`` and its
+extraction module ``fused_memory/reconciliation/status_snapshot_extraction.py``
+with one read per project, and writes the answers to ONE committed artifact pair —
 the only place their figures live:
 
 - #4387 COVERAGE. How much of what the sweep could retire does it retire?
@@ -70,26 +71,27 @@ from shared.cli_boundary import LoudArgumentParser, run_cli
 # The probe IMPORTS what it measures rather than re-spelling it, so a code
 # change can never leave it measuring a stale spelling (the
 # measure_plural_enum_guard_recall.py precedent).
-_SRC = Path(__file__).resolve().parent.parent / 'src'
-if str(_SRC) not in sys.path:
+if str(_SRC := Path(__file__).resolve().parent.parent / 'src') not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from shared.task_statuses import TaskStatus  # noqa: E402
+from shared.task_statuses import TaskStatus
 
-from fused_memory.backends.graphiti_client import PagedRead  # noqa: E402
-from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (  # noqa: E402
+from fused_memory.backends.graphiti_client import PagedRead
+from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (
+    flatten_dedup_edges,
+    select_stale_status_snapshot_edges,
+)
+from fused_memory.reconciliation.status_snapshot_extraction import (
     CLAUSE_BREAK_CHARS,
     SNAPSHOT_STATUS_RE,
     extract_marker_task_ids,
-    flatten_dedup_edges,
     is_token_internal_break,
-    select_stale_status_snapshot_edges,
 )
-from fused_memory.reconciliation.task_filter import (  # noqa: E402
+from fused_memory.reconciliation.task_filter import (
     INACTIVE_TASK_STATUSES,
     TASK_REF_RE,
 )
-from fused_memory.utils.target_store_preflight import (  # noqa: E402
+from fused_memory.utils.target_store_preflight import (
     TargetStoreUnpopulated,
     assert_task_store_populated,
 )
@@ -196,7 +198,7 @@ _KNOWN_STATUSES = frozenset(TaskStatus)
 
 
 def ids_by_marker(fact: str) -> dict[str, set[int]]:
-    """Per-marker ids, through the sweep's own per-marker seam."""
+    """Per-marker ids, through the extraction module's own per-marker seam."""
     return {
         marker: extract_marker_task_ids(fact, adjective, transitive)
         for marker, (adjective, transitive, _) in _MARKERS.items()

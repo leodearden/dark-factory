@@ -18,7 +18,6 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from _curator_helpers import (
     agent_result,
-    empty_corpus,
     escalator_double,
     make_config,
     pool_with_ids,
@@ -50,17 +49,17 @@ def _frozen() -> PoolFrozen:
 
 
 async def _curate(curator: TaskCurator, bundle: PreparedCandidate) -> CuratorDecision:
-    return await asyncio.wait_for(
-        curator.curate(bundle.candidate, 'p', '/x', prepared=bundle),
-        DEADLINE_SECS,
+    [decision] = await asyncio.wait_for(
+        curator.curate_prepared([bundle], 'p', '/x'), DEADLINE_SECS,
     )
+    return decision
 
 
 async def _curate_batch(
     curator: TaskCurator, bundles: list[PreparedCandidate],
 ) -> list[CuratorDecision]:
     return await asyncio.wait_for(
-        curator.curate_batch_prepared(bundles, 'p', '/x'), DEADLINE_SECS,
+        curator.curate_prepared(bundles, 'p', '/x'), DEADLINE_SECS,
     )
 
 
@@ -234,15 +233,18 @@ class TestBatchDefersOnUnavailablePool:
         invoke = AsyncMock(side_effect=[batch_failed, _capped(), _capped()])
 
         curator = TaskCurator(config=make_config(), taskmaster=None, invoke=invoke)
-        with patch.object(curator, '_build_corpus', side_effect=empty_corpus):
-            decisions = await _curate_batch(curator, [prepared('A'), prepared('B')])
+        decisions = await _curate_batch(curator, [prepared('A'), prepared('B')])
 
-        assert [d.action for d in decisions] == ['defer', 'defer']
-        assert invoke.await_count == 3
+        assert [(d.action, d.defer_reason) for d in decisions] == [
+            ('defer', DeferReason.ALL_ACCOUNTS_CAPPED), ('defer', DeferReason.ALL_ACCOUNTS_CAPPED),
+        ]
+        assert [call.kwargs['role'] for call in invoke.await_args_list] == [
+            'task_curator_batch', 'task_curator', 'task_curator',
+        ]
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('error', [_capped, _frozen], ids=['capped', 'frozen'])
-    async def test_curate_batch_prepared_never_raises_pool_unavailable(self, error):
+    async def test_curate_prepared_never_raises_pool_unavailable(self, error):
         escalator = escalator_double()
         curator = TaskCurator(
             config=make_config(), taskmaster=None, escalator=escalator,

@@ -195,7 +195,7 @@ Scoping the rule to orchestrator/tests instead would reintroduce exactly the
 a-list-decides-coverage failure mode the paragraph above rejects.
 
 What is deliberately NOT load-bearing: a wait on a bare ``ast.Name`` target, i.e. the
-``asyncio.wait_for(worker_task, ...)`` teardown join in ``_stop_worker``.  It sits
+``asyncio.wait_for(worker_task, ...)`` teardown join in ``stop_merge_worker``.  It sits
 inside ``contextlib.suppress(Exception)``, asserts nothing and swallows its own
 TimeoutError, so it cannot manufacture the flake this rule exists to prevent.  That
 exclusion is STRUCTURAL — the Name-vs-Attribute/Call distinction — precisely so it is
@@ -771,7 +771,7 @@ def _load_bearing_wait_target(node: ast.expr) -> str | None:
 
     Deliberately NOT load-bearing, and therefore excluded: the
     ``await asyncio.wait_for(worker_task, timeout=join_timeout)`` join in
-    ``_stop_worker``.  It targets a bare ``Name`` (the worker Task), sits inside
+    ``stop_merge_worker``.  It targets a bare ``Name`` (the worker Task), sits inside
     ``contextlib.suppress(Exception)``, asserts nothing, and swallows its own
     TimeoutError — so it cannot manufacture the flake task 3980 fixed, and
     stretching it would only slow teardown down.  The Name-vs-Attribute/Call
@@ -981,7 +981,22 @@ def _wall_clock_deadline_violations(
 
 
 def find_violations(source: str, filename: str) -> list[Violation]:
-    """Parse *source* and return every violation of ALL THREE rules.
+    """Parse *source* and return ``find_violations_in_tree`` over it.
+
+    SyntaxError in *source* → returns an empty list.
+    """
+    try:
+        tree = ast.parse(source, filename=filename)
+    except SyntaxError:
+        return []
+    return find_violations_in_tree(tree, source, filename)
+
+
+def find_violations_in_tree(tree: ast.Module, source: str, filename: str) -> list[Violation]:
+    """Return every violation of ALL THREE rules in *tree*, the parse of *source*.
+
+    The seam for a caller that already holds the parse and runs other predicates
+    over the same tree, so that tree is parsed once.
 
     Rule A — ``bare-magicmock``: each ``<config_name> = MagicMock()`` that has at
     least one ast.Name target whose id matches the config-name set, calls MagicMock
@@ -1005,16 +1020,9 @@ def find_violations(source: str, filename: str) -> list[Violation]:
     it and one file-level slack violation below it.  Rules A and B have no baseline
     and apply in full to every file.
 
-    SyntaxError in *source* → returns an empty list.
-
     Returned violations are sorted ascending by (lineno, col_offset) for
     deterministic source-order output (ast.walk yields BFS order, not source order).
     """
-    try:
-        tree = ast.parse(source, filename=filename)
-    except SyntaxError:
-        return []
-
     lines = source.splitlines()
     violations: list[Violation] = []
 

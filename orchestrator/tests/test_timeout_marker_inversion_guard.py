@@ -148,9 +148,9 @@ _SPAWN_BUDGET_FIXTURE = '_within_spawn_budget'
 #: Names a ``pytest.mark.timeout(...)`` argument may resolve to, and the
 #: seconds each one carries.  A literal MAP rather than an import, because none
 #: of the three is importable from ``_orch_helpers``: two are defined
-#: FILE-LOCALLY in the modules that use them --
-#: ``HEAVY_BARRIER_TEST_TIMEOUT = 540``
-#: (test_merge_queue_concurrent_verify.py) and ``PYTEST_TIMEOUT = 960``
+#: outside it -- ``HEAVY_BARRIER_TEST_TIMEOUT = 540`` in the shared support
+#: module orchestrator/tests/_merge_worker_drive.py, and, FILE-LOCALLY,
+#: ``PYTEST_TIMEOUT = 960``
 #: (test_warm_lane_bash_suite.py -- test_pytest_marker_deselection.py's
 #: identical line is inside a string FIXTURE, so it is not a binding, which
 #: :class:`TestSanctionedNameMirrors` measures rather than assumes).
@@ -605,8 +605,9 @@ class TestSanctionedNameMirrors:
     the sweep stays green over a live inversion.
 
     THE CASE this closes:
-    ``HEAVY_BARRIER_TEST_TIMEOUT`` (test_merge_queue_concurrent_verify.py) is
-    defined file-locally -- lower it by hand from 540 to 225 and every site
+    ``HEAVY_BARRIER_TEST_TIMEOUT`` is defined in the shared support module
+    orchestrator/tests/_merge_worker_drive.py, not in ``_orch_helpers`` --
+    lower it by hand from 540 to 225 and every site
     marked with it really pins 225s while this map still answers 540.  And
     because ``timeout_marker_sites`` matches on the TRAILING
     name only, a NEW file-local ``PYTEST_TIMEOUT = 120`` anywhere under this

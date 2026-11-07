@@ -617,9 +617,9 @@ class TaskGroundTruth:
         *worktree_path* is :meth:`derive_truth`'s single
         ``worktree_resolver(tid)`` resolution (also shared with
         ``worktree_present``, review finding #2) — this method makes no I/O
-        of its own beyond the plan.lock read, which is addressed at
-        *worktree_path*'s ``.task-meta`` SIBLING, not inside it (task 4028;
-        see the comment on that leg below).
+        of its own beyond the plan.lock read, which is addressed at *tid*'s
+        own ``.task-meta/task-<tid>`` root beside *worktree_path* (see the
+        comment on that leg below).
         """
         if self.scheduler.is_actively_held(tid):
             return Claimant(run_id=None, heartbeat_at=None, source=ClaimantSource.IN_MEMORY)
@@ -634,37 +634,31 @@ class TaskGroundTruth:
                 source=ClaimantSource.DB,
             )
 
-        # Addressed at the ``.task-meta`` SIBLING — where the lock's sole
-        # writer puts it (``TaskWorkflow`` builds its ``TaskArtifacts`` with
-        # ``_meta_root_for_worktree(self.worktree)``, workflow.py) — via
-        # ``meta_root_for``, the single owner of that path shape, so neither
-        # side hand-joins ``.task-meta`` (task 4028).
+        # Addressed at the task's own root, ``.task-meta/task-<tid>`` — where
+        # the lock's sole writer puts it (plan.lock is task-scoped in
+        # ``ARTIFACT_ROOTS``, and ``TaskWorkflow._artifact_roots`` hands every
+        # dispatch that root) — via ``TaskArtifacts.for_task``, so neither side
+        # hand-joins ``.task-meta`` (tasks 4028, 3155).
         #
-        # Deliberately NO legacy fallback: nothing has written
-        # ``<worktree>/.task/plan.lock`` since the meta-root migration, so a
-        # new-then-old read (as in ``Harness._resolve_recovery_artifact``)
-        # would be dead code on arrival, and any legacy lock still on disk
-        # necessarily predates that migration and so fails ``_lock_fresh``
-        # below anyway. Pinned by
-        # ``TestPlanLockIsReadFromTheMetaRoot::test_lock_at_the_legacy_root_is_ignored``.
+        # Deliberately NO fallback to the lane root ``.task-meta/<name>`` or
+        # the legacy ``<worktree>/.task``: nothing writes a lock there any
+        # more, so a new-then-old read would be dead code on arrival (PRD
+        # ``plans/task-meta-task-keying-prd.md`` decision 7), and a lock still
+        # sitting at either address predates the move and so fails
+        # ``_lock_fresh`` below anyway. Pinned by
+        # ``test_task_ground_truth.py::TestPlanLockIsReadFromTheTaskRoot``.
         #
         # ATTRIBUTION IS BY ADDRESS, NOT BY SESSION IDENTITY: any fresh,
-        # live-pid lock at this task's resolved meta root is taken to be
-        # *tid*'s, WITHOUT checking that ``session_id`` carries the
-        # ``'{tid}-'`` prefix ``clear_stale_plan_lock`` keys on.  Deliberate,
-        # and deliberately not symmetric with that method:
+        # live-pid lock at this task's root is taken to be *tid*'s, WITHOUT
+        # checking that ``session_id`` carries the ``'{tid}-'`` prefix
+        # ``clear_stale_plan_lock`` keys on.  Deliberate, and deliberately not
+        # symmetric with that method:
         #   * The dominant stale-lock case is a crashed PRIOR incarnation of
-        #     the SAME task (a same-task lane reuse preserves the meta root
-        #     precisely because those artifacts are the task's own), and it
-        #     carries a MATCHING prefix — so a prefix gate would not catch
-        #     the case that actually happens.
-        #   * The cross-task case a gate WOULD catch — a warm lane's meta
-        #     root outliving its previous occupant, since it is a sibling of
-        #     the worktree and survives cleanup — is already cleared on every
-        #     different-task acquisition route by
-        #     ``GitOps._clear_foreign_meta_root`` (RECYCLE /
-        #     RESET_IN_PLACE_REATTACH / CREATE_ONCE_FRESH /
-        #     CREATE_ONCE_REATTACH).
+        #     the SAME task, and it carries a MATCHING prefix — so a prefix
+        #     gate would not catch the case that actually happens.
+        #   * The root is keyed by task id, so no lane lifecycle can leave
+        #     another task's lock there; a gate would guard only against a
+        #     writer bug.
         #   * A gate would fail DANGEROUS. Rejecting a lock this resolver
         #     cannot positively attribute makes a LIVE task read as
         #     unclaimed, which is the task-2588 un-claim incident class.
@@ -677,12 +671,17 @@ class TaskGroundTruth:
         # recovery mid-run. Pinned (both the attribution and its freshness
         # bound) by test_task_ground_truth.py::TestPlanLockAttributionIsByAddress.
         #
-        # Derived OUTSIDE the try: this is pure path algebra with no I/O, and
-        # must not be swallowed by the degradation arm below, which exists for
-        # a corrupt lock FILE — not for a mis-derived root.
-        meta_root = TaskArtifacts.meta_root_for(worktree_path.parent, worktree_path.name)
+        # Derived OUTSIDE the corrupt-file try below: an id ``task_root_for``
+        # refuses is an unaddressable task, not a corrupt lock FILE. It has no
+        # lock to read, so it degrades to "no plan-lock claimant" on its own
+        # arm rather than aborting the sweep.
         try:
-            lock_data = TaskArtifacts(worktree_path, meta_root).read_plan_lock()
+            artifacts = TaskArtifacts.for_task(worktree_path, tid)
+        except ValueError:
+            logger.warning('No plan-lock claimant for unaddressable task id %r', tid)
+            return None
+        try:
+            lock_data = artifacts.read_plan_lock()
         except (ValueError, OSError):
             # A truncated/corrupt plan.lock is a realistic outcome of the
             # very crash this resolver recovers from — degrade to "no

@@ -3551,7 +3551,6 @@ class _RecordingLiveGraph:
 
 @pytest.mark.integration
 @falkor_skipif()
-@pytest.mark.timeout(120)
 def test_live_dark_factory_population_smoke(monkeypatch):
     """One GRAPH.RO_QUERY against the live graph; nothing is written.
 

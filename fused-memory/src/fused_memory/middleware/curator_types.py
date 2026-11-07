@@ -20,16 +20,14 @@ from fused_memory.utils.clip_disclosure import elide_text
 class CuratorFailureError(RuntimeError):
     """Raised when the curator's LLM call fails and cannot be salvaged.
 
-    The curator no longer degrades silently to ``action='create'`` on LLM
-    errors; instead the interceptor translates this into an L1 escalation or
-    a hard failure at the MCP boundary so operators notice breakage.
+    The curator does not degrade silently to ``action='create'`` on LLM
+    errors; ``TaskCurator._failure_decision`` reports this to the escalator,
+    which files an L1 escalation, and decides the candidate.
 
     Attaches ``timed_out``, ``duration_ms``, ``subtype``, ``schema_tool_denied``,
     and ``cost_usd`` from the underlying ``AgentResult`` so
-    :class:`CuratorEscalator` can surface them in the L1 escalation detail and
-    so the bisecting fallback in
-    :meth:`TaskCurator._call_llm_batch_with_fallback` can branch on the
-    failure subtype without leaking the underlying ``AgentResult`` outside
+    :class:`CuratorEscalator` can surface them in the L1 escalation detail
+    without the ``AgentResult`` leaking outside
     :meth:`TaskCurator._invoke_curator`, whose failures
     ``task_curator.py::_failure_error`` maps to this one error.
     Defaults make the attributes safe to read even when the failure
@@ -102,6 +100,11 @@ Action = Literal['drop', 'combine', 'create', 'route_deterministic', 'refuse', '
 
 
 DEFAULT_PRIORITY = 'medium'  # canonical fallback used by both record_task and backfill_corpus
+
+# Every status but cancelled: what a dedupe lookup treats as existing work.
+NON_CANCELLED_STATUSES: Final[tuple[str, ...]] = tuple(
+    sorted(status.value for status in TaskStatus if status is not TaskStatus.CANCELLED),
+)
 
 
 @dataclass
@@ -199,8 +202,8 @@ class CuratorDecision:
     pool_sizes: dict[str, int] = field(default_factory=dict)
     latency_ms: int = 0
     cost_usd: float = 0.0
-    # Set only by curate_batch when a candidate is a duplicate of another
-    # candidate in the same batch (neither yet materialised as a task).
+    # Set only by TaskCurator.curate_prepared when a candidate is a duplicate
+    # of another candidate in the same batch (neither yet materialised as a task).
     # The worker substitutes the sibling's resulting task_id at dispatch time.
     batch_target_index: int | None = None
     # True for a fail-open create that no dedupe judgement stands behind: the
@@ -214,6 +217,9 @@ class CuratorDecision:
     degraded_by_zot: bool = False
     zot_escalation_id: str | None = None
     defer_reason: DeferReason | None = None
+    # The corpus streams whose read failed for this candidate: see
+    # PoolWithheld.unavailable_streams.
+    unavailable_streams: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if (self.action == 'defer') != (self.defer_reason is not None):
@@ -221,6 +227,7 @@ class CuratorDecision:
                 "CuratorDecision.defer_reason must be set iff action == 'defer', got "
                 f'action={self.action!r} defer_reason={self.defer_reason!r}'
             )
+        _require_pool_streams(self.unavailable_streams, 'CuratorDecision')
 
     @classmethod
     def deferred(
@@ -248,6 +255,7 @@ class CuratorDecision:
             'latency_ms': self.latency_ms,
             'cost_usd': self.cost_usd,
             'defer_reason': self.defer_reason,
+            'unavailable_streams': list(self.unavailable_streams),
         }
 
 
@@ -276,6 +284,30 @@ class PreparedCandidate:
     withheld: PoolWithheld | None = None
     corpus_error: str | None = None
 
+    @classmethod
+    def corpus_failed(
+        cls,
+        candidate: CandidateTask,
+        error: str,
+        unavailable_streams: tuple[str, ...] = (),
+    ) -> PreparedCandidate:
+        """The bundle of a candidate whose corpus could not be assembled.
+
+        *unavailable_streams* names the streams whose failure made the corpus
+        unusable, when assembly got far enough to know them.
+
+        It costs no prompt tokens: the pipeline defers it ``corpus-failed``
+        without ever rendering it into a prompt.
+        """
+        return cls(
+            candidate=candidate,
+            pool=[],
+            pool_sizes=empty_pool_sizes(),
+            prompt_tokens=0,
+            withheld=PoolWithheld(unavailable_streams=unavailable_streams),
+            corpus_error=error,
+        )
+
 
 @dataclass(frozen=True)
 class PoolWithheld:
@@ -295,9 +327,12 @@ class PoolWithheld:
     carries the configured limits that produced those counts, so a reader can
     tell a pool one entry over its cap from one that lost forty.
 
-    The ``module``, ``sibling`` and ``dependency`` counts are
-    corpus-exhaustive — module and dependency scan every task, and sibling
-    counts come from an exact store lookup. The ``embedding`` count is NOT: it is taken over
+    The ``module`` and ``dependency`` counts cover the OPEN BACKLOG
+    (``shared.task_statuses.ACTIVE``): module over every open task,
+    dependency over the anchor's open neighbours. A done task reaches the
+    pool only through the similarity-ordered embedding stream. The
+    ``sibling`` count comes from an exact store lookup over every
+    non-cancelled status. The ``embedding`` count is NOT exhaustive: it is taken over
     a fixed qdrant retrieval window (``pool_embedding_cap + 20`` points), so
     at most 20 neighbours can ever be reported however many near-duplicates
     the corpus holds. A stream whose count is ceilinged that way is named in
@@ -306,11 +341,18 @@ class PoolWithheld:
     actual similarity — the stream whose withheld entries are the likeliest
     duplicates of all.
 
-    Every count is deliberately per-STREAM and not only at ``total_cap``:
-    under stock config the stream caps are the binding constraints and
-    ``total_cap`` never fires at all (see the pool-cap block in
-    ``config/schema.py::CuratorConfig``), so a census keyed on the final trim
-    alone would be permanently silent.
+    Every count is deliberately per-STREAM and not only at ``total_cap``: a
+    stream cap discards entries before the final trim ever sees them, and
+    under stock config the embedding cap binds on every candidate measured
+    (see the pool-cap block in ``config/schema.py::CuratorConfig``), so a
+    census keyed on the final trim alone would miss most of what the pool
+    loses.
+
+    ``unavailable_streams`` names the streams whose read FAILED, so their
+    empty contribution to the pool is not evidence that nothing overlaps
+    (INV-11). Each renders as its own line, even when no cap withheld
+    anything: an outage is a fact about the pool whether or not it was also
+    truncated.
 
     An empty census renders nothing: a pool that fit says nothing about
     fitting, exactly as a complete result surface carries no delta.
@@ -319,6 +361,10 @@ class PoolWithheld:
     by_source: Mapping[str, int] = field(default_factory=dict)
     caps: Mapping[str, int] = field(default_factory=dict)
     lower_bounds: tuple[str, ...] = ()
+    unavailable_streams: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        _require_pool_streams(self.unavailable_streams, 'PoolWithheld')
 
     @property
     def total(self) -> int:
@@ -326,7 +372,23 @@ class PoolWithheld:
         return sum(self.by_source.values())
 
     def render(self) -> str | None:
-        """Render the prompt block, or ``None`` when nothing was withheld."""
+        """Render the prompt block, or ``None`` when nothing was withheld or failed."""
+        blocks = [
+            block
+            for block in (self._render_truncation(), self._render_unavailable())
+            if block is not None
+        ]
+        return '\n'.join(blocks) if blocks else None
+
+    def _render_unavailable(self) -> str | None:
+        if not self.unavailable_streams:
+            return None
+        return '\n'.join(
+            f'stream {name} unavailable: absence is not proof of no overlap'
+            for name in self.unavailable_streams
+        )
+
+    def _render_truncation(self) -> str | None:
         if self.total == 0:
             return None
         payload: dict[str, object] = {
@@ -353,6 +415,16 @@ class PoolWithheld:
 
 # Strongest-first; task_curator.py::_trim_pool drops in the reverse order.
 POOL_SOURCES: Final = ('anchor', 'sibling', 'module', 'embedding', 'dependency')
+
+
+def _require_pool_streams(names: tuple[str, ...], owner: str) -> None:
+    """Refuse any corpus-stream name outside :data:`POOL_SOURCES`."""
+    unknown = [name for name in names if name not in POOL_SOURCES]
+    if unknown:
+        raise ValueError(
+            f'{owner}.unavailable_streams names unknown streams {unknown!r}; '
+            f'valid streams are {list(POOL_SOURCES)!r}'
+        )
 
 
 def empty_pool_sizes() -> dict[str, int]:

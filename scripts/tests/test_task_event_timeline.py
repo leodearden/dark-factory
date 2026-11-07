@@ -20,7 +20,7 @@ import sqlite3
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from _task_db_scan import TaskDbProblem
+from shared.tasks_db_readonly import TaskDbProblem
 from task_event_timeline import (
     EXIT_NO_EVENTS,
     EXIT_OK,

@@ -36,7 +36,7 @@ from enum import StrEnum
 from pathlib import Path
 
 import _checkout as _checkout
-from _task_db_scan import UNREADABLE_STORE_ERRORS, connect_ro, tasks_db_path
+from _task_db_scan import UNREADABLE_STORE_ERRORS, tasks_db_path
 from orchestrator.branch_stack import (
     STACK_BASE_REF_NAMESPACE,
     StackBaseLedger,
@@ -47,6 +47,7 @@ from orchestrator.branch_stack import (
 from shared.git_async import run_git
 from shared.project_layout import default_project_root
 from shared.task_statuses import TERMINAL
+from shared.tasks_db_readonly import connect_ro
 
 _TASK_BRANCH_PREFIX = 'task/'
 _HEADS = 'refs/heads/'

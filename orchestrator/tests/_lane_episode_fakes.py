@@ -490,8 +490,8 @@ class Lane:
     def episode(self, node: str = A) -> Episode:
         return self.stored().episodes[node]
 
-    def pending(self, category: str) -> list:
-        sentinel = sentinel_task_id(COMMAND)
+    def pending(self, category: str, *, command: str = COMMAND) -> list:
+        sentinel = sentinel_task_id(command)
         return [e for e in self.queue.get_pending() if e.task_id == sentinel and e.category == category] if self.queue else []
 
     def lane_metadata(self, index: int = -1) -> dict[str, Any]:

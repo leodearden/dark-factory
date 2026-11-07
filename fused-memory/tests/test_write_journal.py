@@ -18,6 +18,7 @@ from _mem0_intent_fixtures import (
 )
 
 from fused_memory.backends.llm_token_usage import LlmTokenUsage
+from fused_memory.config.schema import WriteJournalConfig
 from fused_memory.services.write_journal import (
     OPERATOR_TELEMETRY_QUERY,
     Mem0IntentStatus,
@@ -1616,7 +1617,7 @@ async def test_record_terminal_outcome_returns_false_and_logs_on_db_error(
 # ------------------------------------------------------------------
 # write_ops retention (task 3212 item 4)
 #
-# Unlike its two siblings this prune runs against a table measured at
+# Unlike its single-DELETE siblings this prune runs against a table measured at
 # 35.4M rows / 16 GB on 2026-09-11, so it is BATCHED and doubly bounded —
 # by a row budget and by a wall-clock deadline. Both bounds are asserted
 # here, because an unbounded startup DELETE would hold the write lock past
@@ -1839,6 +1840,156 @@ def test_prune_write_ops_takes_every_bound_from_its_caller():
         'config/schema.py::WriteJournalConfig, and server/main.py already '
         'passes all six from there.'
     )
+
+
+# ------------------------------------------------------------------
+# backend_ops retention (task 5551)
+#
+# Every backend_ops row is the Layer-2 half of a write, so it ages out at the
+# write horizon and through the same batched, doubly bounded drain as write_ops:
+# SQLite's write lock covers the whole file, so a long DELETE here would drop
+# journal rows exactly as one on write_ops would.
+# ------------------------------------------------------------------
+
+
+async def _prune_backend(journal, **overrides):
+    """Run the backend_ops prune at the SHIPPED bounds, overriding only what a test is about."""
+    from fused_memory.services.write_journal import prune_deadline
+
+    config = WriteJournalConfig()
+    bounds = {
+        'older_than_days': config.write_retention_days,
+        'batch_size': config.prune_batch_size,
+        'max_rows': config.prune_max_rows_per_run,
+        'deadline': prune_deadline(config.prune_max_seconds),
+    }
+    return await journal.prune_backend_ops(**{**bounds, **overrides})
+
+
+async def _aged_backend_op(journal, *, age_days: float) -> str:
+    write_op_id = str(uuid.uuid4())
+    await journal.log_backend_op(write_op_id=write_op_id, backend='mem0', operation='add')
+    with closing(sqlite3.connect(journal.db_path)) as conn:
+        conn.execute(
+            'UPDATE backend_ops SET created_at = ? WHERE write_op_id = ?',
+            (_days_ago(age_days), write_op_id),
+        )
+        conn.commit()
+    return write_op_id
+
+
+def _surviving_backend_write_op_ids(journal) -> set[str]:
+    with closing(sqlite3.connect(journal.db_path)) as conn:
+        return {row[0] for row in conn.execute('SELECT write_op_id FROM backend_ops')}
+
+
+@pytest.mark.asyncio
+async def test_backend_ops_prune_batch_seeks_created_at(journal):
+    from fused_memory.services.write_journal import BACKEND_OPS_PRUNE_BATCH_SQL
+
+    with closing(sqlite3.connect(journal.db_path)) as conn:
+        plan = conn.execute(
+            f'EXPLAIN QUERY PLAN {BACKEND_OPS_PRUNE_BATCH_SQL}',
+            ('2026-01-01T00:00:00+00:00', '2026-02-01T00:00:00+00:00', 1),
+        ).fetchall()
+    details = [row[3] for row in plan]
+    assert (
+        'SEARCH backend_ops USING INDEX idx_bo_created (created_at>? AND created_at<?)'
+        in details
+    ), (
+        f'the backend_ops batch plans as {details}. Unless the created_at seek is '
+        'bounded on both sides, a batch re-walks every row an earlier batch passed over.'
+    )
+    assert not any('TEMP B-TREE' in detail for detail in details), (
+        'the backend_ops batch sorts instead of reading created_at order off the index'
+    )
+
+
+@pytest.mark.asyncio
+async def test_prune_backend_ops_ages_out_rows_past_the_write_horizon(journal):
+    fresh = await _aged_backend_op(journal, age_days=0)
+    inside = await _aged_backend_op(journal, age_days=100)
+    await _aged_backend_op(journal, age_days=800)
+
+    deleted = await _prune_backend(journal)
+
+    assert deleted == 1
+    assert _surviving_backend_write_op_ids(journal) == {fresh, inside}
+
+
+@pytest.mark.asyncio
+async def test_prune_backend_ops_row_budget_bounds_a_single_run(journal, caplog):
+    from fused_memory.services import write_journal as wj
+
+    for _ in range(5):
+        await _aged_backend_op(journal, age_days=800)
+
+    with caplog.at_level(logging.WARNING, logger=wj.logger.name):
+        deleted = await _prune_backend(journal, batch_size=1, max_rows=2)
+
+    assert deleted == 2
+    assert len(_surviving_backend_write_op_ids(journal)) == 3
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any('backend_ops' in message for message in warnings), (
+        f'exhausting the row budget with rows still eligible must be loud: {warnings}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_spent_row_budget_is_reported_as_not_attempted(journal, caplog):
+    """A row budget spent before the prune starts shows nothing about the horizon,
+    so the WARNING must not claim a backlog."""
+    from fused_memory.services import write_journal as wj
+
+    await _aged_backend_op(journal, age_days=800)
+
+    with caplog.at_level(logging.WARNING, logger=wj.logger.name):
+        deleted = await _prune_backend(journal, max_rows=0)
+
+    assert deleted == 0
+    assert len(_surviving_backend_write_op_ids(journal)) == 1
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any('not attempted' in message for message in warnings), warnings
+    assert not any('stopped' in message for message in warnings), warnings
+
+
+@pytest.mark.asyncio
+async def test_the_next_backend_ops_prune_drains_what_the_row_budget_left(journal):
+    for _ in range(4):
+        await _aged_backend_op(journal, age_days=800)
+
+    assert await _prune_backend(journal, batch_size=1, max_rows=2) == 2
+    assert await _prune_backend(journal, batch_size=1, max_rows=2) == 2
+    assert not _surviving_backend_write_op_ids(journal), (
+        'a prune resumed past rows its row budget left behind'
+    )
+
+
+@pytest.mark.asyncio
+async def test_prune_backend_ops_deadline_bounds_a_single_run(journal, caplog):
+    """The deadline is checked between full batches against a monotonic clock,
+    so a zero budget runs exactly one batch."""
+    from fused_memory.services import write_journal as wj
+
+    for _ in range(5):
+        await _aged_backend_op(journal, age_days=800)
+
+    with caplog.at_level(logging.WARNING, logger=wj.logger.name):
+        deleted = await _prune_backend(
+            journal, batch_size=1, max_rows=1_000_000, deadline=wj.prune_deadline(0),
+        )
+
+    assert deleted == 1
+    assert len(_surviving_backend_write_op_ids(journal)) == 4
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any('deadline' in message for message in warnings), warnings
+
+
+@pytest.mark.asyncio
+async def test_prune_backend_ops_never_raises(journal):
+    """A prune hiccup must not crash startup — returns 0, no raise."""
+    await journal.close()
+    assert await _prune_backend(journal) == 0
 
 
 # ------------------------------------------------------------------
@@ -2193,9 +2344,9 @@ async def test_a_batch_keeps_its_order_despite_sharing_one_timestamp(journal):
 async def test_a_reader_pages_forward_instead_of_re_reading_the_oldest_page(
     journal,
 ):
-    """The table has no status column to mark a row handled and no prune path,
-    so `limit` alone hands a consumer the SAME oldest page forever once the
-    table outgrows it. `after_seq` is the only thing that advances a reader."""
+    """The table has no status column to mark a row handled, so `limit` alone
+    hands a consumer the SAME oldest page forever once the table outgrows it.
+    `after_seq` is the only thing that advances a reader."""
     await journal.log_referent_findings(
         [_finding_payload(edge_uuid=f'e{n}') for n in range(5)],
         group_id='reify', episode_uuid='ep-1',
@@ -2258,6 +2409,39 @@ async def test_an_empty_batch_touches_nothing(journal, tmp_path):
 
     assert await journal.get_referent_findings() == []
     assert uninitialized.journal_drop_stats()['dropped_total'] == 0
+
+
+@pytest.mark.asyncio
+async def test_prune_referent_findings_ages_out_rows_past_the_horizon(journal):
+    await journal.log_referent_findings(
+        [_finding_payload(edge_uuid='e1'), _finding_payload(edge_uuid='e2')],
+        group_id='g', episode_uuid='old',
+    )
+    await journal.log_referent_findings(
+        [_finding_payload(edge_uuid='e3')], group_id='g', episode_uuid='fresh',
+    )
+    with closing(sqlite3.connect(journal.db_path)) as conn:
+        conn.execute(
+            'UPDATE referent_findings SET created_at = ? WHERE episode_uuid = ?',
+            ('2000-01-01T00:00:00+00:00', 'old'),
+        )
+        conn.commit()
+
+    deleted = await journal.prune_referent_findings(
+        older_than_days=WriteJournalConfig().referent_findings_retention_days,
+    )
+
+    assert deleted == 2
+    assert [r['episode_uuid'] for r in await journal.get_referent_findings()] == ['fresh']
+
+
+@pytest.mark.asyncio
+async def test_prune_referent_findings_never_raises(journal):
+    """A prune hiccup must not crash startup — returns 0, no raise."""
+    await journal.close()
+    assert await journal.prune_referent_findings(
+        older_than_days=WriteJournalConfig().referent_findings_retention_days,
+    ) == 0
 
 
 # ------------------------------------------------------------------
