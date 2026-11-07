@@ -7,7 +7,9 @@ an append ran off the caller's thread. ``parked_queue`` is its drainer-side
 counterpart: a running EventQueue whose drainer cannot commit anything until
 the block exits, so ``journaled_events`` and ``journaled_ids`` (what a fresh
 journal reader still lists) show the settled-at-enqueue state without racing
-the drain.
+the drain. ``record_dead_letter_writes`` spies on ``DeadLetterWriter.append``
+and hands the test every write's future, so it can wait until a write has
+resolved.
 """
 
 from __future__ import annotations
@@ -23,11 +25,16 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock
 
+from fused_memory.reconciliation.dead_letter_writer import DeadLetterWriter
 from fused_memory.reconciliation.event_journal import EventJournal
 from fused_memory.reconciliation.event_queue import EventQueue
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Callable, Mapping
+    from concurrent.futures import Future
+    from typing import Any
+
+    import pytest
 
     from fused_memory.models.reconciliation import ReconciliationEvent
 
@@ -83,6 +90,25 @@ class HeldFifo:
 
 def hold_fifo(path: Path) -> HeldFifo:
     return HeldFifo(path).start()
+
+
+def record_dead_letter_writes(monkeypatch: pytest.MonkeyPatch) -> list[Future[bool]]:
+    """Every future ``DeadLetterWriter.append`` returns from now on, in call order."""
+    writes: list[Future[bool]] = []
+    real_append = DeadLetterWriter.append
+
+    def append(
+        self: DeadLetterWriter,
+        record: Mapping[str, Any],
+        *,
+        on_settled: Callable[[bool], None] | None = None,
+    ) -> Future[bool]:
+        written = real_append(self, record, on_settled=on_settled)
+        writes.append(written)
+        return written
+
+    monkeypatch.setattr(DeadLetterWriter, 'append', append)
+    return writes
 
 
 @asynccontextmanager

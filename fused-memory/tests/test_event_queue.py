@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import pathlib
@@ -20,6 +21,7 @@ from _dead_letter_helpers import (
     journaled_events,
     journaled_ids,
     parked_queue,
+    record_dead_letter_writes,
     seed_dead_letters,
 )
 
@@ -1859,3 +1861,85 @@ async def test_flush_dead_letters_returns_only_after_the_journal_row_release_is_
     finally:
         unpark.set()
         await q.close()
+
+
+@pytest.mark.asyncio
+async def test_flush_dead_letters_releases_the_row_of_a_write_that_finished_before_the_flush(
+    monkeypatch, tmp_path,
+):
+    """A record already on disk when flush_dead_letters() is called still has
+    its journal-row release run before the flush returns.
+
+    Blocking on the write's future holds the loop thread, so the release the
+    writer thread queued on the loop has not run when the flush starts.
+    """
+    writes = record_dead_letter_writes(monkeypatch)
+    ej = tmp_path / 'ej.db'
+    q = EventQueue(AsyncMock(), dead_letter_path=tmp_path / 'dl.jsonl', journal_path=ej, maxsize=1)
+    try:
+        e1, e2 = _make_event(), _make_event()
+        assert q.enqueue(e1) is True
+        assert q.enqueue(e2) is False
+        assert writes[-1].result(timeout=5) is True
+
+        await q.flush_dead_letters()
+
+        journaled = journaled_ids(ej)
+        assert e2.id not in journaled
+        assert e1.id in journaled
+    finally:
+        await q.close()
+
+
+@pytest.mark.asyncio
+async def test_close_releases_the_row_of_a_write_that_finished_before_close(
+    monkeypatch, tmp_path,
+):
+    """close() runs the journal-row release of a record already on disk before
+    it closes the journal, so recover() cannot redeliver a dead-lettered event."""
+    writes = record_dead_letter_writes(monkeypatch)
+    ej = tmp_path / 'ej.db'
+    q = EventQueue(AsyncMock(), dead_letter_path=tmp_path / 'dl.jsonl', journal_path=ej, maxsize=1)
+    try:
+        e1, e2 = _make_event(), _make_event()
+        assert q.enqueue(e1) is True
+        assert q.enqueue(e2) is False
+        assert writes[-1].result(timeout=5) is True
+    finally:
+        await q.close()
+
+    assert journaled_ids(ej) == {e1.id}
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_flush_leaves_no_error_on_the_loop_when_its_write_settles(tmp_path):
+    """Cancelling flush_dead_letters() while a write is pending leaves nothing
+    for the loop's exception handler once that write settles, and a later
+    flush still releases the written record's journal row."""
+    loop = asyncio.get_running_loop()
+    contexts: list[dict] = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: contexts.append(context))
+    held = hold_fifo(tmp_path / 'dl.jsonl')
+    ej = tmp_path / 'ej.db'
+    q = EventQueue(AsyncMock(), dead_letter_path=held.path, journal_path=ej, maxsize=1)
+    try:
+        e1, e2 = _make_event(), _make_event()
+        assert q.enqueue(e1) is True
+        assert q.enqueue(e2) is False
+        flush = asyncio.ensure_future(q.flush_dead_letters())
+        await asyncio.sleep(0)
+        flush.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await flush
+
+        held.release.set()
+        held.records()
+        await q.flush_dead_letters()
+
+        assert contexts == []
+        assert e2.id not in journaled_ids(ej)
+    finally:
+        held.release.set()
+        await q.close()
+        loop.set_exception_handler(previous_handler)
