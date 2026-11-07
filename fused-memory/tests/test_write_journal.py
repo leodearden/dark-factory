@@ -838,7 +838,9 @@ async def test_prune_mem0_intents_can_include_dead_explicitly(journal):
 async def test_prune_mem0_intents_never_raises(journal):
     """A prune hiccup must not crash startup — returns 0, no raise."""
     await journal.close()
-    assert await journal.prune_mem0_intents() == 0
+    assert await journal.prune_mem0_intents(
+        older_than_days=WriteJournalConfig().mem0_intents_retention_days,
+    ) == 0
 
 
 # The mem0_intents DDL as it stood before task 7397 added attempts and
@@ -1116,7 +1118,9 @@ async def test_prune_idempotent_ops_ages_out_old_rows(journal):
 async def test_prune_idempotent_ops_never_raises(journal):
     """A prune hiccup must not crash startup — returns 0, no raise."""
     await journal.close()
-    assert await journal.prune_idempotent_ops() == 0
+    assert await journal.prune_idempotent_ops(
+        older_than_days=WriteJournalConfig().idempotent_ops_retention_days,
+    ) == 0
 
 
 # --- write_ops(created_at) seekability (task 3304) -------------------------

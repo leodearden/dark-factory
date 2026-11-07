@@ -470,9 +470,10 @@ class WriteJournalConfig(BaseModel):
     ``restart_required`` — honest, rather than a leaf advertised hot-reloadable
     while silently ignoring reloads.
 
-    The three horizons are not interchangeable, and the asymmetry is the whole
-    point: see ``services/write_journal.py::prune_write_ops`` for the measured
-    row-mix that set them.
+    The three write_ops horizons (read/search/write) are not interchangeable,
+    and the asymmetry is the whole point: see
+    ``services/write_journal.py::prune_write_ops`` for the measured row-mix
+    that set them.
     """
 
     #: Non-search reads (``get_task``/``get_tasks``/``get_statuses``/
@@ -511,6 +512,12 @@ class WriteJournalConfig(BaseModel):
     #: pass) re-verifies every row against the live graph, so a long horizon
     #: loses nothing.
     referent_findings_retention_days: float = Field(default=365.0, gt=0)
+    #: Terminal ``mem0_intents`` (which statuses count:
+    #: ``services/write_journal.py::WriteJournal.prune_mem0_intents``).
+    mem0_intents_retention_days: float = Field(default=30.0, gt=0)
+    #: ``idempotent_ops`` client keys, which only need to outlive the retry
+    #: window they guard (``services/write_journal.py::WriteJournal.prune_idempotent_ops``).
+    idempotent_ops_retention_days: float = Field(default=7.0, gt=0)
 
     @model_validator(mode='after')
     def _validate_search_outlives_reads(self) -> 'WriteJournalConfig':
