@@ -97,7 +97,7 @@ async def test_a_combine_audit_lands_in_the_tests_tmp_path_from_any_cwd(
     resolved = await _combine_once(taskmaster, event_buffer, ticket_store)
 
     assert resolved['status'] == 'combined'
-    assert not (elsewhere / 'data').exists()
+    assert list(elsewhere.iterdir()) == []
     [record] = _audit_records(tmp_path / 'data' / AUDIT_FILE)
     assert record['target_id'] == '50'
 
