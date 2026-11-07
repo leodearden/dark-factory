@@ -2238,28 +2238,54 @@ class ReconciliationHarness:
         Nothing writes 'interrupted' since task 5514 retired resume; this
         converts the rows a pre-5514 process left behind, through the same
         :meth:`_recover_one_run` body the other recovery passes use.
+
+        Rows are recovered one at a time, in isolation. If one row's recovery
+        raises, the error is logged with that row's run id and the sweep moves
+        on, so one bad row cannot strand the hundreds behind it. If the raise
+        came before the row's write to 'failed' landed, the row stays
+        'interrupted' and the next startup's sweep retries it; nothing else
+        selects that status.
         """
-        for run in await self.journal.get_interrupted_runs():
-            lock_holder, lock_age = await self.buffer.get_lock_status(run.project_id)
-            diag = await self._recover_one_run(
-                run, lock_holder, lock_age,
-                error_type='LegacyInterruptedRunRecovery',
-                error_message=(
-                    'Legacy interrupted run (resume retired, task 5514) '
-                    'recovered at startup'
-                ),
+        runs = await self.journal.get_interrupted_runs()
+        stranded: list[str] = []
+        for run in runs:
+            try:
+                await self._recover_legacy_interrupted_run(run)
+            except Exception as e:
+                stranded.append(run.id)
+                logger.warning(
+                    'Legacy interrupted run %s (project %s) failed to recover at '
+                    'startup: %r',
+                    run.id, run.project_id, e,
+                )
+        if runs:
+            logger.log(
+                logging.WARNING if stranded else logging.INFO,
+                'reconciliation.legacy_interrupted_sweep_finished',
+                extra={'rows': len(runs), 'stranded_run_ids': stranded},
             )
-            if diag is None:
-                continue
-            logger.info(
-                'reconciliation.legacy_interrupted_run_recovered',
-                extra={
-                    'run_id': run.id,
-                    'project_id': run.project_id,
-                    'instance_id': run.instance_id,
-                    'disposition': diag['disposition'],
-                },
-            )
+
+    async def _recover_legacy_interrupted_run(self, run: ReconciliationRun) -> None:
+        lock_holder, lock_age = await self.buffer.get_lock_status(run.project_id)
+        diag = await self._recover_one_run(
+            run, lock_holder, lock_age,
+            error_type='LegacyInterruptedRunRecovery',
+            error_message=(
+                'Legacy interrupted run (resume retired, task 5514) '
+                'recovered at startup'
+            ),
+        )
+        if diag is None:
+            return
+        logger.info(
+            'reconciliation.legacy_interrupted_run_recovered',
+            extra={
+                'run_id': run.id,
+                'project_id': run.project_id,
+                'instance_id': run.instance_id,
+                'disposition': diag['disposition'],
+            },
+        )
 
     # ── Dead-owner suppression storm counter ─────────────────────────
 
