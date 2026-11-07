@@ -1087,14 +1087,14 @@ class TestAwaitStewardCompletion:
     @pytest.mark.asyncio
     async def test_returns_immediately_if_no_queue(self):
         wf = _make_workflow(escalation_queue=None)
-        await wf._await_steward_completion()
+        await wf._await_steward_completion(escalation_id=None)
 
     @pytest.mark.asyncio
     async def test_returns_immediately_if_no_pending(self):
         queue = MagicMock()
         queue.get_by_task.return_value = []
         wf = _make_workflow(escalation_queue=queue)
-        await wf._await_steward_completion()
+        await wf._await_steward_completion(escalation_id=None)
 
     @pytest.mark.asyncio
     async def test_returns_when_resolved(self):
@@ -1111,7 +1111,7 @@ class TestAwaitStewardCompletion:
             event.set()
 
         task = asyncio.create_task(_resolve_after_delay())
-        await wf._await_steward_completion()
+        await wf._await_steward_completion(escalation_id=None)
         await task
 
         queue.submit.assert_not_called()
@@ -1131,7 +1131,7 @@ class TestAwaitStewardCompletion:
         wf._steward_outcome_channel = asyncio.Queue()  # nothing published
         wf.scheduler.get_status = AsyncMock(return_value='blocked')
 
-        outcome = await wf._await_steward_completion()
+        outcome = await wf._await_steward_completion(escalation_id=None)
 
         assert outcome == StewardInterrupted('timeout', wip_commits_present=False)
         queue.submit.assert_not_called()

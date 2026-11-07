@@ -30,7 +30,8 @@ from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Protocol, cast
 # nothing in it imports orchestrator.  escalation.pins (is_queue_handoff, the
 # severity semantics _needs_human consumes) is pure and imports only
 # escalation.models, so it is cycle-safe too; harness.py already imports it at
-# module top.
+# module top.  escalation.classify is likewise pure over escalation.models.
+from escalation.classify import closed_by_non_sweep_resolver
 from escalation.dedupe import submit_or_dedupe
 from escalation.models import BORN_AT_L2_SEVERITIES
 from escalation.pins import is_queue_handoff
@@ -232,6 +233,7 @@ from orchestrator.workflow_types import (  # noqa: F401  re-export shim
     DryRunSpawn,
     IllegalTransition,
     OnTerminalEntry,
+    PublishedStewardOutcome,
     RequeueKind,
     StewardBudgetExhausted,
     StewardInterrupted,
@@ -1421,7 +1423,7 @@ class TaskWorkflow:
         # lazily in _ensure_steward_started and registered on the steward via
         # set_outcome_channel — replaces the escalation-queue forensic re-read
         # that _mark_blocked used to perform.
-        self._steward_outcome_channel: asyncio.Queue | None = None
+        self._steward_outcome_channel: asyncio.Queue[PublishedStewardOutcome] | None = None
         self._config_dir: TaskConfigDir | None = None
         # The prior dispatch's metadata.json fork point: Layer-B's discriminator,
         # and _plan()'s revalidation fallback for a plan with no trusted _base_commit.
@@ -3891,7 +3893,7 @@ class TaskWorkflow:
         # Info leftovers are the exit finalizer's (_disposition_info_l0s), not a steward's.
         if self._pending_steward_l0s():
             await self._ensure_steward_started()
-        await self._await_steward_completion(skip_if_idle=True)
+        await self._await_steward_completion(escalation_id=None, skip_if_idle=True)
         return await self._finalise_merged_done()
 
     async def _resume_merge_retry_if_pending(
@@ -17595,6 +17597,7 @@ class TaskWorkflow:
             # SAME-signature L1 should suppress the steward-facing L0 (task 2757):
             # an unrelated open L1 (different category) must not silently drop a
             # new root cause's L0.
+            awaited_escalation_id: str | None = None
             if not self.escalation_queue.has_open_l1(self.task_id, category=category):
                 from escalation.models import Escalation
 
@@ -17632,6 +17635,7 @@ class TaskWorkflow:
                             key_fn=content_fingerprint_key,
                         ),
                     )
+                    awaited_escalation_id = result['id']
                     # Emit escalation_created only when this task is the parent
                     # (status='queued' means a new parent was filed, not a child fold).
                     if result.get('status') == 'queued' and self.event_store:
@@ -17651,6 +17655,7 @@ class TaskWorkflow:
                     # own blocked state.
                 else:
                     self.escalation_queue.submit(esc)
+                    awaited_escalation_id = esc.id
                     if self.event_store:
                         self.event_store.emit(
                             EventType.escalation_created,
@@ -17662,7 +17667,10 @@ class TaskWorkflow:
             # Give the steward a chance to resolve the escalation
             await self._ensure_steward_started()
             if self._steward:
-                outcome = await self._await_steward_completion()
+                # Scoped to the filed record (task 5563); see _await_steward_completion.
+                outcome = await self._await_steward_completion(
+                    escalation_id=awaited_escalation_id,
+                )
 
                 async def _requeue() -> WorkflowOutcome:
                     if self.event_store:
@@ -18821,15 +18829,19 @@ class TaskWorkflow:
 
     @staticmethod
     def _outcome_severity(outcome: StewardOutcome) -> int:
-        """Rank a published ``StewardOutcome`` for the drain+reduce step in
-        :meth:`_await_steward_completion` (task 2248 / W9-delta review fix).
+        """Rank a published ``StewardOutcome`` so a burst of publications
+        reduces to the most severe one (task 2248 / W9-delta review fix).
 
-        The steward handles escalations serially and can publish more than
-        one outcome within a single grace window — e.g. resolve the
-        workflow's own L0 (``StewardResolved``), then chain a follow-on L0
-        of its own and give up on it (``StewardReescalatedL1``).  A single
-        ``channel.get()`` would only ever see the leading (least severe)
-        outcome.  Higher wins: an L1 hand-off outranks budget exhaustion,
+        Only publications that share a wait's scope are ranked against each
+        other (task 5563).  An unscoped wait and
+        :meth:`_drain_steward_outcomes` rank the whole burst.  A scoped wait
+        ranks only publications about its own escalation, and no current
+        steward producer publishes twice for one escalation.  The task-2248
+        case of a follow-on L0 the steward chained and gave up on is foreign
+        to a scoped wait; the ``has_open_l1`` override in
+        :meth:`_await_steward_completion` covers it, not this ranking.
+
+        Higher wins: an L1 hand-off outranks budget exhaustion,
         which outranks a no-wip interruption, which outranks a wip-present
         interruption (already the "softest" give-up — task-2060 resume-plan),
         which outranks a clean resolution.  ``StewardTerminalDecision`` is
@@ -19034,7 +19046,7 @@ class TaskWorkflow:
         channel = self._steward_outcome_channel
         if channel is None:
             return None
-        drained: list[StewardOutcome] = []
+        drained: list[PublishedStewardOutcome] = []
         while True:
             try:
                 drained.append(channel.get_nowait())
@@ -19042,7 +19054,7 @@ class TaskWorkflow:
                 break
         if not drained:
             return None
-        most_severe = max(drained, key=self._outcome_severity)
+        most_severe = max((p.outcome for p in drained), key=self._outcome_severity)
         logger.info(
             'Task %s: drained %d unconsumed steward outcome(s) after the '
             'ESCALATED wait (most severe: %r) — the escalation-queue state '
@@ -19052,11 +19064,157 @@ class TaskWorkflow:
         )
         return most_severe
 
+    @staticmethod
+    def _in_wait_scope(
+        publication: PublishedStewardOutcome, escalation_id: str | None,
+    ) -> bool:
+        """Whether *publication* may end a steward wait scoped to *escalation_id*
+        (``None`` = unscoped) — THE scope rule of task 5563."""
+        return escalation_id is None or publication.escalation_id == escalation_id
+
+    def _in_scope_burst(
+        self,
+        channel: asyncio.Queue[PublishedStewardOutcome],
+        first: PublishedStewardOutcome,
+        *,
+        escalation_id: str | None,
+    ) -> list[StewardOutcome]:
+        """*first* plus every publication already queued behind it, reduced to
+        the outcomes in the wait's scope; each one out of scope is logged and
+        discarded (never re-buffered — no later waiter would read it)."""
+        burst = [first]
+        while True:
+            try:
+                burst.append(channel.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        in_scope: list[StewardOutcome] = []
+        for publication in burst:
+            if self._in_wait_scope(publication, escalation_id):
+                in_scope.append(publication.outcome)
+                continue
+            logger.info(
+                'Task %s: discarding steward outcome published for escalation '
+                '%s while waiting on %s: %r',
+                self.task_id, publication.escalation_id, escalation_id,
+                publication.outcome,
+            )
+        return in_scope
+
+    def _awaited_record_outcome(
+        self, escalation_id: str | None,
+    ) -> StewardResolved | None:
+        """The outcome a wait scoped to *escalation_id* settles on when that
+        record is found closed by a non-sweep resolver, else ``None``.
+
+        A dedupe fold can make the awaited record ANOTHER task's.  Its close
+        while that task has an open L1 may be its steward's hand-off to a
+        human (``steward.py::TaskSteward._auto_escalate_to_human`` files the
+        L1, then dismisses the L0), not a resolution, so it never settles the
+        wait.  This task's own hand-off always arrives as an in-scope envelope,
+        and :meth:`_await_steward_completion`'s open-L1 override covers any
+        other close of its own record.  The text mirrors the steward's own
+        lost-race publish (``steward.py::TaskSteward._give_up_with_wip``).
+        """
+        if escalation_id is None or self.escalation_queue is None:
+            return None
+        record = self.escalation_queue.get(escalation_id)
+        if record is None or not closed_by_non_sweep_resolver(record):
+            return None
+        if record.task_id != self.task_id and self.escalation_queue.has_open_l1(
+            record.task_id,
+        ):
+            return None
+        logger.info(
+            'Task %s: awaited escalation %s found %s by %s with no outcome '
+            'published for it — settling the steward wait on the record',
+            self.task_id, escalation_id, record.status, record.resolved_by,
+        )
+        return StewardResolved(resolution_text=record.resolution or record.summary)
+
+    async def _receive_steward_outcome(
+        self,
+        channel: asyncio.Queue[PublishedStewardOutcome],
+        *,
+        escalation_id: str | None,
+        timeout: float,
+    ) -> StewardOutcome | None:
+        """Race the channel against the soft-cancel event until the wait
+        settles, or return ``None`` on cancel or once *timeout* has elapsed
+        since the call.
+
+        The wait settles on an in-scope outcome (the most severe of its burst),
+        or on the awaited record found closed by a non-sweep resolver
+        (:meth:`_awaited_record_outcome`).  The record is read after each burst
+        with nothing in scope and once at the deadline, never on cancel.
+
+        Out-of-scope publications do not move the deadline.  An in-scope
+        publication still wins a tie with the cancel event.
+        """
+        if self._cancel_event.is_set():
+            return None
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while (remaining := deadline - loop.time()) > 0:
+            get_wait = asyncio.create_task(channel.get())
+            cancel_wait = asyncio.create_task(self._cancel_event.wait())
+            try:
+                done, _pending = await asyncio.wait(
+                    {get_wait, cancel_wait},
+                    timeout=remaining,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            finally:
+                for t in (get_wait, cancel_wait):
+                    if not t.done():
+                        t.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await t
+            in_scope = (
+                self._in_scope_burst(
+                    channel, get_wait.result(), escalation_id=escalation_id,
+                )
+                if get_wait in done else []
+            )
+            if in_scope:
+                return max(in_scope, key=self._outcome_severity)
+            if self._cancel_event.is_set():
+                logger.info(
+                    f'Task {self.task_id}: cancel-event fired during steward grace — '
+                    f'exiting completion wait'
+                )
+                return None
+            if get_wait not in done or loop.time() >= deadline:
+                break
+            if (settled := self._awaited_record_outcome(escalation_id)) is not None:
+                return settled
+        if (settled := self._awaited_record_outcome(escalation_id)) is not None:
+            return settled
+        logger.warning(
+            f'Task {self.task_id}: steward completion timed out after '
+            f'{timeout:.0f}s with no outcome published for {escalation_id or "any escalation"}'
+        )
+        return None
+
     async def _await_steward_completion(
-        self, *, skip_if_idle: bool = False,
+        self, *, escalation_id: str | None, skip_if_idle: bool = False,
     ) -> StewardOutcome:
         """Wait for the steward to publish an outcome, with a grace period
         (task 2248 / W9-delta, SO-1).
+
+        *escalation_id* scopes the wait (task 5563): only an outcome the
+        steward published about that escalation ends it.  One published about
+        any other escalation — typically an older L0 the steward was still
+        working when this one was filed — is logged and discarded, and the
+        wait runs on to its original deadline.  The wait also settles when
+        the awaited record itself is found closed by a non-sweep resolver,
+        read after each out-of-scope burst and once at the deadline, never on
+        cancel: the steward can close it while handling another L0, and humans
+        can close it from outside, and neither publishes an envelope for it.
+        ``None`` is the explicit unscoped mode, where any publication ends the
+        wait.  The argument is required rather than defaulted so every caller
+        chooses its scope; the rule's homes are :meth:`_in_wait_scope` and
+        ``escalation/classify.py::closed_by_non_sweep_resolver``.
 
         *skip_if_idle* (task 3170) is passed by the post-merge success tail,
         whose contract is "give queued steward work a chance to finish" rather
@@ -19123,20 +19281,24 @@ class TaskWorkflow:
         genuine steward give-up, not for this slot being told to stop.  A
         real (non-cancel) grace-timeout still derives wip normally.
 
-        Two extra layers close the multi-outcome silent-requeue gap (review
-        fix): (1) once an outcome is obtained, any further outcomes already
-        sitting on the channel (the serial steward published a burst within
-        this same grace window) are drained non-blockingly and reduced to
-        the most severe via :meth:`_outcome_severity`.  (2) before returning
-        a requeue-producing outcome (:meth:`_outcome_requeues`), the
-        escalation queue's ``has_open_l1`` is re-checked as a source-of-truth
-        backstop — catching the publish-timing race where a follow-on L1 was
-        filed but its outcome has not yet landed on the channel — and
-        ``StewardReescalatedL1`` is returned instead when one is open (and,
-        when the overridden outcome was a wip-present ``StewardInterrupted``,
-        the still-pending L0 it never dismissed is dismissed here too — that
+        Once an in-scope outcome is obtained, every publication already
+        queued behind it is drained non-blockingly, and the in-scope ones are
+        reduced to the most severe via :meth:`_outcome_severity`.
+
+        The multi-outcome silent-requeue gap (task 2248 review fix) is closed
+        by the ``has_open_l1`` source-of-truth override.  That gap is the
+        steward resolving this L0, then chaining a follow-on L0 and handing
+        THAT one to a human.  In a scoped wait the follow-on's outcome is
+        foreign and discarded, so the override is the only layer that sees
+        it.  Before a requeue-producing outcome (:meth:`_outcome_requeues`)
+        is returned, the escalation queue's ``has_open_l1`` is re-checked,
+        which also catches the publish-timing race where the follow-on L1 was
+        filed but its outcome has not yet landed on the channel.  When an L1
+        is open, ``StewardReescalatedL1`` is returned instead.  If the
+        overridden outcome was a wip-present ``StewardInterrupted``, the
+        still-pending L0 it never dismissed is dismissed here too: that
         publisher deliberately skips ``_auto_escalate_to_human``, so the
-        override's ``StewardReescalatedL1`` would otherwise strand it).
+        override's ``StewardReescalatedL1`` would otherwise strand it.
         """
         channel = self._steward_outcome_channel
         if channel is None:
@@ -19153,47 +19315,9 @@ class TaskWorkflow:
             f'Task {self.task_id}: waiting up to {timeout:.0f}s for steward completion'
         )
 
-        outcome: StewardOutcome | None = None
-        deadline = asyncio.get_event_loop().time() + timeout
-        remaining = deadline - asyncio.get_event_loop().time()
-        if not self._cancel_event.is_set() and remaining > 0:
-            get_wait = asyncio.create_task(channel.get())
-            cancel_wait = asyncio.create_task(self._cancel_event.wait())
-            try:
-                done, _pending = await asyncio.wait(
-                    {get_wait, cancel_wait},
-                    timeout=remaining,
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-            finally:
-                for t in (get_wait, cancel_wait):
-                    if not t.done():
-                        t.cancel()
-                        with contextlib.suppress(asyncio.CancelledError):
-                            await t
-            if get_wait in done:
-                most_severe: StewardOutcome = get_wait.result()
-                # Drain any further outcomes the serial steward already
-                # published in this same grace window and reduce to the
-                # most severe (review fix — see class docstring above).
-                while True:
-                    try:
-                        next_outcome: StewardOutcome = channel.get_nowait()
-                    except asyncio.QueueEmpty:
-                        break
-                    if self._outcome_severity(next_outcome) > self._outcome_severity(most_severe):
-                        most_severe = next_outcome
-                outcome = most_severe
-            elif cancel_wait in done:
-                logger.info(
-                    f'Task {self.task_id}: cancel-event fired during steward grace — '
-                    f'exiting completion wait'
-                )
-            else:
-                logger.warning(
-                    f'Task {self.task_id}: steward completion timed out after '
-                    f'{timeout:.0f}s with no outcome published'
-                )
+        outcome = await self._receive_steward_outcome(
+            channel, escalation_id=escalation_id, timeout=timeout,
+        )
 
         # Single fresh read of the store — a terminal/deferred status always
         # wins, regardless of what (if anything) the channel produced.
@@ -19203,9 +19327,9 @@ class TaskWorkflow:
         if outcome is not None:
             # has_open_l1 source-of-truth override (review fix): a
             # requeue-producing outcome must not race past an L1 that is
-            # already open — the publish-timing race where the steward
-            # filed a follow-on L1 whose outcome has not yet landed on the
-            # channel.  _mark_blocked's existing StewardReescalatedL1
+            # already open — one the steward filed for a follow-on L0, whose
+            # outcome was discarded as foreign to this scoped wait or has not
+            # yet landed on the channel.  _mark_blocked's existing StewardReescalatedL1
             # branch (unmodified) routes this to ESCALATED with no
             # duplicate L1.
             if (
