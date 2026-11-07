@@ -11,68 +11,16 @@ explicit ``@pytest.mark.asyncio``.
 from __future__ import annotations
 
 import logging
-from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
-from _fm_helpers import poll_until
-
-from fused_memory.services.durable_queue import DurableWriteQueue
-
-
-async def _poll_until_dead(
-    q: DurableWriteQueue,
-    *,
-    group_id: str | None = None,
-    expected_dead: int,
-    timeout: float = 20.0,
-) -> None:
-    """Poll queue stats until at least *expected_dead* items reach status='dead'.
-
-    Mirrors ``test_durable_queue.py::_poll_until_dead``. Fixed sleeps are unsafe here:
-    the suite runs under ``-n auto --dist loadgroup`` with a 60s per-test
-    timeout that kills the whole worker, and the generous 20s budget means a
-    regression fails on the observed COUNT rather than by timing out.
-    """
-    last_counts: dict = {}
-
-    async def _dead_count_reached():
-        stats = await q.get_stats(group_id=group_id)
-        last_counts.update(stats['counts'])
-        return stats['counts'].get('dead', 0) >= expected_dead
-
-    try:
-        await poll_until(_dead_count_reached, timeout=timeout, interval=0.05)
-    except AssertionError as exc:
-        raise AssertionError(
-            f'Timed out waiting for {expected_dead} dead item(s) '
-            f'(group_id={group_id!r}); last counts={last_counts}'
-        ) from exc
-
-
-def _queue(tmp_path, execute, **overrides) -> DurableWriteQueue:
-    """Plain budget 5, extended transient budget 12, sub-second backoff."""
-    # Annotated: without it pyright joins the heterogeneous literal values into
-    # a single narrow type and rejects the ** unpacking below.
-    kwargs: dict[str, Any] = dict(
-        data_dir=tmp_path / 'queue',
-        execute_write=execute,
-        workers_per_group=1,
-        semaphore_limit=5,
-        max_attempts=5,
-        retry_base_seconds=0.01,
-        retry_max_delay_seconds=0.05,
-        write_timeout_seconds=2.0,
-        transient_max_attempts=12,
-    )
-    kwargs.update(overrides)
-    return DurableWriteQueue(**kwargs)
+from _fm_helpers import make_retry_budget_queue, poll_until_dead
 
 
 @pytest.mark.asyncio
 async def test_dead_letter_warning_names_operation_and_group(tmp_path, caplog):
     execute = AsyncMock(side_effect=RuntimeError('boom'))
-    q = _queue(tmp_path, execute)
+    q = make_retry_budget_queue(tmp_path, execute)
     await q.initialize()
     try:
         with caplog.at_level(
@@ -82,9 +30,7 @@ async def test_dead_letter_warning_names_operation_and_group(tmp_path, caplog):
                 group_id='proj-alpha', operation='add_episode',
                 payload={'content': 'c', 'group_id': 'proj-alpha', 'name': 'ep'},
             )
-            await _poll_until_dead(
-                q, group_id='proj-alpha', expected_dead=1, timeout=20.0
-            )
+            await poll_until_dead(q, group_id='proj-alpha', expected_dead=1)
 
         warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
         assert any(
@@ -121,7 +67,9 @@ async def test_dead_letter_warning_labels_the_budget_it_exhausted(
     """One WARNING pairs the classification label with the attempt count of
     the budget the item actually used up, so the label cannot name one budget
     while the item died on the other."""
-    q = _queue(tmp_path, AsyncMock(side_effect=exc), transient_max_attempts=3)
+    q = make_retry_budget_queue(
+        tmp_path, AsyncMock(side_effect=exc), transient_max_attempts=3
+    )
     await q.initialize()
     try:
         with caplog.at_level(
@@ -131,9 +79,7 @@ async def test_dead_letter_warning_labels_the_budget_it_exhausted(
                 group_id='proj-alpha', operation='add_episode',
                 payload={'content': 'c', 'group_id': 'proj-alpha', 'name': 'ep'},
             )
-            await _poll_until_dead(
-                q, group_id='proj-alpha', expected_dead=1, timeout=20.0
-            )
+            await poll_until_dead(q, group_id='proj-alpha', expected_dead=1)
 
         warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
         assert any(
