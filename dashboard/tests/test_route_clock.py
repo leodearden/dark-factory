@@ -13,6 +13,7 @@ from _boundary_payloads import forget_served_reads
 from _dt_helpers import fixed_clock, installed_clock
 
 from dashboard.api.clock import app_clock, live_clock
+from dashboard.app import _memory_evals_cache_clear
 
 # A PAST instant no live read can equal; a stale read is the worst it can leak.
 FIXED = datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
@@ -30,6 +31,11 @@ API_ROUTES = [
     ('/api/v2/dashboard/prds', {}),
 ]
 
+APP_ROUTES = [
+    ('/api/v2/dashboard/memory-graphs', {}),
+    ('/api/v2/dashboard/performance', {}),
+]
+
 
 @pytest.fixture(autouse=True)
 def _no_served_read_outlives_its_test():
@@ -38,11 +44,11 @@ def _no_served_read_outlives_its_test():
     forget_served_reads()
 
 
-def _served_at_the_installed_clock(client, path: str, params: dict[str, str]) -> str:
+def _get_at_the_installed_clock(client, path: str, params: dict[str, str]) -> dict:
     with installed_clock(client.app, fixed_clock(FIXED)):
         resp = client.get(path, params=params)
     assert resp.status_code == 200, resp.text
-    return resp.json()['served_at']
+    return resp.json()
 
 
 def test_the_app_serves_the_live_clock_by_default(client):
@@ -55,14 +61,22 @@ def test_an_installed_clock_is_read_until_it_is_restored(client):
     assert app_clock(client.app) is live_clock
 
 
-@pytest.mark.parametrize(('path', 'params'), API_ROUTES)
-def test_an_api_route_serves_at_the_installed_clock(client, path, params):
-    assert _served_at_the_installed_clock(client, path, params) == FIXED.isoformat()
+@pytest.mark.parametrize(('path', 'params'), API_ROUTES + APP_ROUTES)
+def test_a_route_serves_at_the_installed_clock(client, path, params):
+    body = _get_at_the_installed_clock(client, path, params)
+    assert body['served_at'] == FIXED.isoformat()
 
 
 def test_the_terminal_answer_serves_at_the_installed_clock(client):
     label = client.app.state.config.project_root.name
-    served_at = _served_at_the_installed_clock(
-        client, '/api/v2/dashboard/tasks', {'terminal': label},
-    )
-    assert served_at == FIXED.isoformat()
+    body = _get_at_the_installed_clock(client, '/api/v2/dashboard/tasks', {'terminal': label})
+    assert body['served_at'] == FIXED.isoformat()
+
+
+def test_memory_evals_are_generated_at_the_installed_clock(client):
+    _memory_evals_cache_clear()
+    try:
+        body = _get_at_the_installed_clock(client, '/api/v2/dashboard/memory-evals', {})
+    finally:
+        _memory_evals_cache_clear()
+    assert body['MEMORY_EVALS']['generated_at'] == FIXED.isoformat()

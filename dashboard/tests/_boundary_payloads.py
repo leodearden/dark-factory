@@ -524,17 +524,6 @@ def _write_memory_ops(config: DashboardConfig) -> None:
         conn.commit()
 
 
-@contextmanager
-def _memory_graphs_at_t0() -> Iterator[None]:
-    """Both clocks a /memory-graphs request reads, pinned to T0: the journal
-    read's as_of and the route's served_at."""
-    with (
-        patch('dashboard.data.write_journal.resolve_now', new=lambda now: now or T0),
-        patch('dashboard.app.resolve_now', new=lambda now: now or T0),
-    ):
-        yield
-
-
 def _held_tree() -> CannedMCP:
     """H's two in-progress tasks, both footprinting :data:`LOCKED_FILE`."""
     footprint = {'metadata': {'files': [LOCKED_FILE]}}
@@ -580,11 +569,11 @@ def _corpus_family(client: TestClient, workdir: Path) -> dict[str, Any]:
 
     with _canned_roots(client, workdir / 'memory', {'dark-factory': _substrate(REIFY_COUNTS)}):
         _write_memory_ops(app.state.config)
-        with _memory_graphs_at_t0():
+        with installed_clock(app, fixed_clock(T0)):
             bodies['memory_ops'] = _get(client, MEMORY_GRAPHS)
     with (
         _canned_roots(client, workdir / 'memory_missing', {'dark-factory': _substrate(REIFY_COUNTS)}),
-        _memory_graphs_at_t0(),
+        installed_clock(app, fixed_clock(T0)),
     ):
         bodies['memory_ops_missing'] = _get(client, MEMORY_GRAPHS)
 

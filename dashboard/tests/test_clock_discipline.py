@@ -13,13 +13,12 @@ top of the data layer — is scanned too. A future regression there (e.g. a
 route reverting to a per-leg `datetime.now(UTC)` instead of one shared
 capture) would reintroduce exactly the cross-DB
 clock-skew race this guard exists to prevent, so the route layer needs the
-same protection as the data layer. Route handlers legitimately read the
-clock once per request — there is nothing upstream to inject a `now` from,
-so they call `datetime.now(UTC)` directly rather than `resolve_now(None)` —
-and either thread that single value through a fan-out (`now=now` kwargs,
-mirroring how `resolve_now` callers behave in the data layer) or use it
-once locally (e.g. a ticket-age computation). Each such site is tagged
-`# clock-exempt: single-capture route`. The scan covers
+same protection as the data layer. Routes read the present only through
+`dashboard/src/dashboard/api/clock.py::app_clock`, the clock their app has
+installed, so a test can pin every instant a route serves. A stricter route
+guard enforces that over app.py and `dashboard/api/*.py` (minus the seam's own
+module): no `.now(` call there even when tagged, and no `resolve_now` call.
+The scan covers
 `dashboard/data/*.py`, `app.py`, `dashboard/api/*.py` and `loops.py` — the
 data layer plus every module the composition layer was split into (task
 5586 moved two tagged single-capture routes, `api_burndown` and
@@ -109,6 +108,32 @@ def find_clock_violations(source: str) -> list[tuple[int, str]]:
             continue
         violations.append((lineno, lines[lineno - 1]))
     return violations
+
+
+def _is_resolve_now_call(node: ast.Call) -> bool:
+    func = node.func
+    return (isinstance(func, ast.Name) and func.id == 'resolve_now') or (
+        isinstance(func, ast.Attribute) and func.attr == 'resolve_now'
+    )
+
+
+def find_route_clock_violations(source: str) -> list[tuple[int, str]]:
+    """Return ``(line, text)`` for every clock a route module reads past its app clock.
+
+    Flags every ``<expr>.now(...)`` call whatever its line is tagged, and every
+    call to ``resolve_now``: a route reads the present only by calling the
+    clock ``app_clock`` hands it.
+    """
+    lines = source.splitlines()
+    return [
+        (node.lineno, lines[node.lineno - 1])
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call)
+        and (
+            (isinstance(node.func, ast.Attribute) and node.func.attr == 'now')
+            or _is_resolve_now_call(node)
+        )
+    ]
 
 
 def _iter_non_docstring_string_literals(tree: ast.AST) -> Iterator[tuple[int, str]]:
@@ -220,6 +245,31 @@ def test_aliased_module_import_fires():
     violations = find_clock_violations(source)
     assert len(violations) == 1, f'expected exactly one violation, got {violations!r}'
     assert violations[0][0] == 1
+
+
+def test_route_guard_ignores_the_exemption_tag():
+    """A tagged `.now(` that the module-wide guard accepts is still a route violation."""
+    source = 'now = datetime.now(UTC)  # clock-exempt: single-capture route\n'
+    assert find_clock_violations(source) == []
+    assert [lineno for lineno, _ in find_route_clock_violations(source)] == [1]
+
+
+@pytest.mark.parametrize(
+    'source',
+    [
+        pytest.param('render_at = resolve_now(None)\n', id='bare-name'),
+        pytest.param('render_at = utils.resolve_now(None)\n', id='attribute'),
+    ],
+)
+def test_route_guard_flags_resolve_now(source: str):
+    """A route that resolves its own `now` bypasses the installed clock."""
+    assert [lineno for lineno, _ in find_route_clock_violations(source)] == [1]
+
+
+def test_route_guard_accepts_the_app_clock():
+    """Calling the clock `app_clock` returns is the one sanctioned route read."""
+    source = 'clock = app_clock(request.app)\nrender_at = clock()\nserved_at = clock()\n'
+    assert find_route_clock_violations(source) == []
 
 
 # ---------------------------------------------------------------------------
@@ -362,6 +412,7 @@ _DATA_DIR = _SRC_ROOT / 'dashboard' / 'data'
 _APP_PY = _SRC_ROOT / 'dashboard' / 'app.py'
 _API_DIR = _SRC_ROOT / 'dashboard' / 'api'
 _LOOPS_PY = _SRC_ROOT / 'dashboard' / 'loops.py'
+_CLOCK_PY = _API_DIR / 'clock.py'
 
 # Seven route modules plus the package marker. A rename or a further split
 # must fail loudly here rather than silently shrinking the scan.
@@ -388,6 +439,33 @@ def _scanned_modules() -> list[Path]:
         assert fixed_target.is_file(), f'scan target is missing: {fixed_target}'
 
     return data_files + [_APP_PY] + api_files + [_LOOPS_PY]
+
+
+def _route_modules() -> list[Path]:
+    """The route layer: app.py plus every dashboard/api module except the clock seam itself.
+
+    ``api/clock.py`` is exempt the way ``resolve_now``'s own definition is: it
+    is the sanctioned reader. It must exist, or the exemption names nothing.
+    """
+    assert _CLOCK_PY.is_file(), f'the route clock seam is missing: {_CLOCK_PY}'
+    return [
+        path for path in _scanned_modules()
+        if path == _APP_PY or (path.parent == _API_DIR and path != _CLOCK_PY)
+    ]
+
+
+def test_routes_read_the_present_only_through_the_app_clock():
+    """No route module reads a clock other than the one its app installed."""
+    violations = [
+        f'{path.relative_to(_SRC_ROOT)}:{lineno}: {text.strip()}'
+        for path in _route_modules()
+        for lineno, text in find_route_clock_violations(path.read_text())
+    ]
+
+    assert not violations, (
+        'Route clock reads that bypass dashboard.api.clock.app_clock (take '
+        '`clock = app_clock(request.app)` and call it instead):\n' + '\n'.join(violations)
+    )
 
 
 def test_no_bare_clock_reads_in_scanned_modules():
