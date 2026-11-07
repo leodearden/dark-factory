@@ -472,10 +472,21 @@ def _decoded_payload(result: dict) -> Any:
         return None
 
 
+def _json_rpc_error_payload(error: Any) -> dict:
+    """The rejection payload standing for a JSON-RPC body's ``error`` member."""
+    if isinstance(error, Mapping):
+        prose = f"{error.get('code')}: {error.get('message')}"
+    else:
+        prose = str(error)
+    return {'error': EnvelopeShape.JSON_RPC_ERROR.value, 'hint': prose}
+
+
 def _rejection_payload(response: Any) -> dict | None:
     """The rejection payload of a fused-memory tool reply, or None when the write landed."""
     if not isinstance(response, dict):
         return None
+    if response.get('error') is not None:
+        return _json_rpc_error_payload(response['error'])
     result = response.get('result', response)
     if not isinstance(result, dict):
         return None
@@ -495,7 +506,8 @@ def extract_rejection(response: Any) -> str | None:
     gate, phantom-done gate, done_provenance validation) without raising, as the
     reply's ``structuredContent`` or JSON text block. A rejection has either
     ``error`` (truthy) or ``success: False`` in that payload. An ``isError`` reply
-    is a rejection even when its text is not JSON, rendered ``IS_ERROR — <prose>``.
+    is a rejection even when its text is not JSON, rendered ``IS_ERROR — <prose>``,
+    and so is a JSON-RPC error body, rendered ``JSON_RPC_ERROR — <code>: <message>``.
     A no-op (same-status) returns ``success: True, no_op: True`` and is treated
     as success.
     """
@@ -516,7 +528,8 @@ def extract_structured_rejection(response: Any) -> dict | None:
     re-parsing the rendered string. Used by ``set_task_status`` to classify
     ``terminal_exit_rejected`` responses as logical contradictions worthy of
     raising ``TerminalExitRejection``. An ``isError`` reply whose text carries
-    no structured error yields ``{'error': 'IS_ERROR', 'hint': <its prose>}``.
+    no structured error yields ``{'error': 'IS_ERROR', 'hint': <its prose>}``,
+    and a JSON-RPC error body ``{'error': 'JSON_RPC_ERROR', 'hint': <code: message>}``.
     """
     return _rejection_payload(response)
 
