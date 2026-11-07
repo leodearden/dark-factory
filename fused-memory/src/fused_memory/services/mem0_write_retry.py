@@ -63,6 +63,7 @@ class Mem0RetryPolicy:
     max_delay_seconds: float
     poll_interval_seconds: float
     batch_size: int
+    backlog_alarm_age_seconds: float = 3600.0
 
     def __post_init__(self) -> None:
         for name in (
@@ -70,6 +71,7 @@ class Mem0RetryPolicy:
             'max_delay_seconds',
             'poll_interval_seconds',
             'batch_size',
+            'backlog_alarm_age_seconds',
         ):
             value = getattr(self, name)
             if value <= 0:
