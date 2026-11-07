@@ -1433,7 +1433,7 @@ stream, cross_repo, cross_repo_project, human_curator_gate,
 human_curator_adjudicated_at, last_blocked_at, recurrence,
 execution_class, merge_lane, pending_since, pending_since_backfilled,
 claimant_exception, audit_trail_rotation, plan_text_fp, plan_authored_at,
-main_health_signature
+main_health_signature, superseded_by, cancel_dispositions
 ```
 <!-- /tier-a-blessed-keys-mirror -->
 
@@ -1446,10 +1446,10 @@ copy was hand-maintained prose: task 4372 had to mirror two keys across in a
 separate follow-up commit, and the frozenset's own header comment sat stale
 across two blessings.
 
-`recurrence` (§6.1) is unusual for a Tier-A entry: it is *also* a registered
-submodel, so it is doubly exempt from the `unknown_key` scan (a registered
-key is already in `known_fields`). The blessing is deliberate
-belt-and-braces — it keeps the key suppressed if the registration is ever
+`recurrence` (§6.1) and `cancel_dispositions` are unusual for Tier-A entries:
+each is *also* a registered submodel, so each is doubly exempt from the
+`unknown_key` scan (a registered key is already in `known_fields`). The
+blessing is deliberate belt-and-braces — it keeps the key suppressed if the registration is ever
 moved or made lazy, and it is what makes
 `fused-memory/scripts/migrate_task_metadata_to_x_namespace.py` refuse to
 `x_`-namespace it, which for a submodel-backed key with live readers is the
@@ -1462,6 +1462,15 @@ Tier-A blessed. Only the status writers write it: `set_task_status` and
 `update_task` and `submit_task` refuse any add, alter or removal with
 `deferral_write_authority`; an unchanged echo of the stored record passes.
 Its shapes and use are §9 "Deferring a task".
+
+`superseded_by` and `cancel_dispositions` are the cancel-with-children
+vocabulary (contract `plans/cancel-with-children-prd.md` §4.8). Their shapes
+live in `shared/src/shared/cancel_dispositions.py`; read them there. A
+cancelled parent carries `superseded_by: list[int]`, the tasks that replace
+it. Each child carries `cancel_dispositions`, a list holding one entry per
+cancelled parent. An entry's `parent` is always qualified as
+`"<project_id>:<id>"`, because an external dependent's entry lives in another
+project's store, where a bare id names a different task.
 
 `declared_scope` is the size a task declared when it was filed. It is a
 registered submodel (`shared/src/shared/declared_scope.py::DeclaredScope`,
@@ -1738,8 +1747,9 @@ after which the resume path nonetheless closed the task.
 
 These aliases are deliberately *not* on the Tier-A allowlist, so each still
 emits `code=unknown_key` as a greppable drift signal until the caller is
-fixed to use the canonical spelling — with one documented exception,
-`origin_finding_id`, noted under the table.
+fixed to use the canonical spelling — with documented exceptions noted under
+the table: `origin_finding_id`, and the `x_`-prefixed aliases of
+`superseded_by`.
 
 Every key in the **Canonical** column is itself Tier-A blessed and therefore
 **silent**, so the `code=unknown_key` drift signal is **alias-only** and
@@ -1758,6 +1768,7 @@ re-creating that task's defect, where authors were told to migrate to
 | `invariants` | `inv` |
 | `related_tasks` | `related_task`, `related_df_tasks`, `related_task_examples` |
 | `source_finding_id` | `origin_finding_id`, `origin_finding`, `origin_stage1_finding_id`, `source_finding`, `finding_id` |
+| `superseded_by` | `x_superseded_by`, `x_subsumed_by`, `subsumed_by`, `x_coalesced_into`, `x_replacement` |
 
 <!-- /tier-b-canonical-keys -->
 
@@ -1790,6 +1801,18 @@ made for spellings not measured.)
 key in its own right, naming the Stage-1 finding specifically, and is
 deliberately **not** something to migrate to `source_finding_id` — only the
 `origin_`-prefixed near-miss `origin_stage1_finding_id` is drift.
+
+**The `superseded_by` row's `x_`-prefixed spellings emit no drift line**
+(`esc-8142-1`). They sit in the Tier-C `x_` namespace below, which the parser
+never warns on, so the row lists them only as spellings to avoid in new
+writes. Only `subsumed_by` warns, pinned by
+`test_superseded_by_tier_b_alias_still_warns`
+(`shared/tests/test_task_metadata.py`). `x_coalesced_into` keeps its legacy
+readers, and the deferral `carried_by` record stays a hold with a carrier,
+not a supersession; neither is folded into `superseded_by`. The task key
+deliberately does not reuse the Mem0 memory key `x_superseded_by`: one name
+for a different store and shape would mislead. Contract:
+`plans/cancel-with-children-prd.md` §4.8.
 
 ### Tier-C: ad-hoc keys
 
@@ -2115,7 +2138,9 @@ than removing and resubmitting — resubmission loses the task's id (and
 anything depending on that id), history, and any escalations already
 attached to it. To retire a task instead of correcting it, cancel it
 (`status="cancelled"`) rather than removing it, so the record and its id
-remain resolvable by anything that referenced it.
+remain resolvable by anything that referenced it. A task with live children
+is retired with `/cancel-with-children <id>`, which decides and passes a
+disposition for every child (contract `plans/cancel-with-children-prd.md`).
 
 **Adding an escalation category.** Every filed category must be a member of
 `escalation/src/escalation/categories.py::EscalationCategory`; its module

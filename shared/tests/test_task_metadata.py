@@ -2033,6 +2033,23 @@ class TestParseMetadataFailurePolicy:
         with pytest.raises((ValidationError, TypeError)):
             parse_metadata({_DEPLOY_STATE_STUB_KEY: [1, 2]}, direction='write', enforce=True)
 
+    # A RootModel submodel raises a bare ValueError, not ValidationError, when
+    # the splatted mapping carries a `root` key beside any other key.
+    @pytest.mark.parametrize(
+        'raw',
+        [
+            pytest.param({'deferral': {'root': 1, 'kind': 'x'}}, id='deferral'),
+            pytest.param(
+                {'cancel_dispositions': [{'root': 1, 'parent': 'x'}]}, id='cancel_dispositions'
+            ),
+        ],
+    )
+    def test_a_root_model_slice_with_a_root_key_read_warns_never_raises(self, raw):
+        (key,) = raw
+        model, warnings = parse_metadata(raw, direction='read')
+        assert [(w.field, w.code) for w in warnings] == [(key, 'invalid_submodel')]
+        assert model.model_dump()[key] == raw[key]
+
     def test_x_prefixed_unknown_key_silent_zero_warnings(self):
         model, warnings = parse_metadata({'x_experimental': 'v'}, direction='write')
         assert warnings == []
@@ -2444,6 +2461,23 @@ class TestParseMetadataFailurePolicy:
             f'{near_miss_alias} must stay unblessed so its drift line keeps appearing '
             f'in the census; got warnings: {warnings}'
         )
+
+    def test_cancel_with_children_keys_are_known(self):
+        """`superseded_by` and `cancel_dispositions` never census-warn (plans/cancel-with-children-prd.md §4.8)."""
+        _, warnings = parse_metadata(
+            {'superseded_by': [8032], 'cancel_dispositions': []}, direction='read'
+        )
+
+        assert [w for w in warnings if w.code == 'unknown_key'] == []
+
+    def test_superseded_by_tier_b_alias_still_warns(self):
+        """`subsumed_by` is the one un-prefixed Tier-B alias of `superseded_by`, so it carries the drift line.
+
+        The row's `x_`-prefixed aliases are Tier-C silent by the parser's `x_` rule (esc-8142-1).
+        """
+        _, warnings = parse_metadata({'subsumed_by': [8032]}, direction='read')
+
+        assert 'subsumed_by' in {w.field for w in warnings if w.code == 'unknown_key'}
 
     def test_execution_class_metadata_key_is_blessed(self):
         """The recon-stage execution-class discriminator must not census-warn (task 3780).

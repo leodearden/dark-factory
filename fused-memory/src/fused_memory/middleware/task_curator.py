@@ -54,6 +54,7 @@ from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Required, TypeAlias, TypedDict, TypeVar
 
+from shared.cancel_dispositions import sibling_lookup_values
 from shared.cli_invoke import (
     AgentResult,
     TranscriptEvidence,
@@ -2707,7 +2708,7 @@ class TaskCurator:
         rows: dict[int, MetadataLookupRow] = {}
         failure: Exception | None = None
         answered = False
-        for value in _sibling_lookup_values(parent_id):
+        for value in sibling_lookup_values(parent_id):
             try:
                 page = await taskmaster.find_tasks_by_metadata(
                     project_root, 'spawned_from', value,
@@ -3375,13 +3376,6 @@ def _followup_parent_id(candidate: CandidateTask) -> str | None:
     if candidate.spawn_context != _SIBLING_STREAM_SPAWN_CONTEXT:
         return None
     return _spawned_from_id(candidate.spawned_from)
-
-
-def _sibling_lookup_values(parent_id: str) -> tuple[str | int, ...]:
-    """Every stored form of *parent_id*: the metadata lookup is type-strict."""
-    if parent_id.isdecimal():
-        return (parent_id, int(parent_id))
-    return (parent_id,)
 
 
 def _sibling_rank(row: MetadataLookupRow) -> tuple[bool, int, int]:
