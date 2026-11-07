@@ -126,33 +126,27 @@ FINDING_TASK_ESCALATION_CATEGORY = 'recon_task_finding'
 #
 # Routing note: filed at `severity='info', level=0`.  Level-0 records are
 # surfaced via the steward's pending-escalation view and any external monitor
-# polling the queue.  UNLIKE the notes on
+# polling the queue.  The notes on
 # `orchestrator/harness.py::_file_starvation_info` and
-# `::_file_warm_base_hard_down_notice`, which claim level-0 records "do NOT
-# auto-promote", this one does not: `Harness._reap_orphan_l0_escalations` DOES
-# act on a pending L0 once it is older than `config.orphan_l0_timeout_secs` and
-# the incarnation that filed it is gone (its liveness gate reads
-# `_escalation_events` and `scheduler.is_actively_held`).  Such a routed L0 goes
-# one of two ways:
+# `::_file_warm_base_hard_down_notice` claim level-0 records "do NOT
+# auto-promote"; that does not hold for this one.  Once a routed L0 is aged and
+# unattended, `orchestrator/harness.py::Harness._reap_orphan_l0_escalations`
+# acts on it.  What the reaper does with it is the orchestrator's contract,
+# pinned there by
+# `orchestrator/tests/test_info_l0_router_harness.py::TestReaperRoutesInfoOrphans`
+# (info L0s, router on and off) and `::TestBlockingDedupIsCategoryScoped` (its
+# category-scoped coverage branch).  Read it there, not here.  This filer
+# relies on one property of it only: no L1 of another category closes a routed
+# L0, the same task-2757 scope `routed_record_covers_finding` applies.
 #
-#   - with `info_l0_router_enabled` (default on), the info-L0 router owns it,
-#     because it is info severity at level 0
-#     (`orchestrator/escalation_router.py::router_owns`).  The router converts it
-#     to a task through the curator, or promotes it to an L1 carrying the
-#     conversion hint;
-#   - with the router off, the reaper promotes it verbatim to L1 unless an open
-#     L1 of its OWN category covers it, in which case it is dismissed as a
-#     duplicate (`escalation/queue.py::EscalationQueue.dismiss_if_covered`).
-#
-# An unrelated open L1 suppresses neither path.
-#
-# The consequence is the good one, and it is why no escalate-if-unattended
-# behaviour needs asserting here: an unattended routed finding reaches a
-# consumer on its own, delivered by the component that OWNS strand-detection
-# semantics (liveness, hold state, duplicate suppression), while one an L1 of
-# its own category already covers is folded away.  Re-deriving any of that at
-# this filer would mean re-deriving all three signals from a process that
-# cannot see them.
+# That is why no escalate-if-unattended behaviour needs asserting here: an
+# unattended routed finding reaches a consumer on its own, delivered by the
+# component that OWNS strand-detection semantics (liveness, hold state,
+# duplicate suppression).  Re-deriving any of that at this filer would mean
+# re-deriving those signals from a process that cannot see them.  It does not
+# keep one record per finding on the default path: see
+# `routed_record_covers_finding` for the refile after the info-L0 router
+# converts a record (task 7894).
 #
 # PUBLIC (and in `__all__`), like `FINDING_TASK_ESCALATION_CATEGORY` above:
 # the level a routed record is filed at is part of this module's CROSS-MODULE
@@ -452,21 +446,19 @@ def routed_record_covers_finding(
     every run.
 
     A record ABOVE ``FINDING_TASK_ESCALATION_LEVEL`` covers EVERY finding.  It
-    is a routed finding a human already holds, so a refile would only churn.
-    With the info-L0 router off,
-    ``escalation/queue.py::EscalationQueue.dismiss_if_covered`` folds any L0 of
-    this category into an open L1 of this category, so a refile would be folded
-    every cycle; with the router on, a refile would go to the curator again
-    every cycle.  Promotion builds a new record that keeps ``detail`` (with a
-    suffix appended) but not ``dedupe_fingerprint``, which is why the level
-    alone decides here.
+    is a routed finding a human already holds, so a refile would only hand the
+    orphan reaper a duplicate to dispose of every cycle.  Promotion builds a
+    new record that keeps ``detail`` (with a suffix appended) but not
+    ``dedupe_fingerprint``, which is why the level alone decides here.
 
-    An L1 of another category covers nothing, here or in the reaper: both apply
-    the task-2757 category scope, so a routed L0 behind an unrelated L1 stays
-    pending and the next cycle folds onto it (task 6341).
+    An L1 of another category covers nothing, here or in the orphan reaper,
+    which applies the same task-2757 category scope (task 6341).
 
     The caller passes PENDING records only, so a finding reaches the ladder
-    again once the covering record is adjudicated.
+    again once the covering record is closed, whether a human adjudicated it
+    or the info-L0 router (on by default) converted it to a task.  In the
+    second case the next cycle refiles it while the finding persists; task
+    7894 owns that.
     """
     if record.category != FINDING_TASK_ESCALATION_CATEGORY:
         return False
