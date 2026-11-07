@@ -1,19 +1,21 @@
 """The recording reverse proxy between the pinned harness and an arm (arm_harness/usage_tap.py)."""
 
-import http.client
 import json
 import socket
 import threading
 import time
-from collections.abc import Iterator
-from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
 from urllib.parse import urlsplit
 
 from _mock_openai_server import chat_completion_body, mock_openai_server
 
+from arm_harness._loopback_http import (
+    HELD_PROMPT_TOKENS,
+    held_upstream,
+    post_json,
+    unused_port,
+    usage_body,
+)
 from fused_memory.arm_harness.usage_tap import (
     ERROR_EXCERPT_CHARS,
     CallRecord,
@@ -32,49 +34,19 @@ REQUEST = {
 }
 
 
-def _post(base_url: str, path: str, body: bytes, headers: dict[str, str] | None = None):
-    parts = urlsplit(base_url)
-    connection = http.client.HTTPConnection(parts.hostname or '', parts.port, timeout=30)
-    try:
-        connection.request(
-            'POST', path, body=body, headers={'Content-Type': 'application/json', **(headers or {})}
-        )
-        response = connection.getresponse()
-        return response.status, response.read()
-    finally:
-        connection.close()
-
-
 def _origin(mock) -> str:
     return f'http://{mock.host}:{mock.port}'
 
 
-def _closed_port() -> int:
-    with socket.socket() as probe:
-        probe.bind(('127.0.0.1', 0))
-        return probe.getsockname()[1]
-
-
-def _usage_body(prompt_tokens: int, completion_tokens: int, finish_reason: str) -> dict:
-    body = chat_completion_body('{"entities": []}')
-    body['usage'] = {
-        'prompt_tokens': prompt_tokens,
-        'completion_tokens': completion_tokens,
-        'total_tokens': prompt_tokens + completion_tokens,
-    }
-    body['choices'][0]['finish_reason'] = finish_reason
-    return body
-
-
 def test_forwards_a_chat_completion_unchanged_and_records_the_server_usage(tmp_path):
     log = tmp_path / 'calls.jsonl'
-    upstream_body = _usage_body(1234, 56, 'length')
+    upstream_body = usage_body(1234, 56, 'length')
     raw = json.dumps(REQUEST).encode()
     before = datetime.now(UTC)
     with mock_openai_server() as mock:
         mock.set_response('/chat/completions', upstream_body)
         with usage_tap(_origin(mock), log_path=log) as tap_url:
-            status, body = _post(tap_url, CHAT_PATH, raw, {'Authorization': 'Bearer sk-test'})
+            status, body = post_json(tap_url, CHAT_PATH, raw, {'Authorization': 'Bearer sk-test'})
         upstream = mock.requests_to('/chat/completions')
 
     assert status == 200
@@ -109,7 +81,7 @@ def test_a_rejected_call_passes_through_and_records_an_excerpt_without_usage(tmp
     with mock_openai_server() as mock:
         mock.set_response_sequence('/chat/completions', [(400, error_body)])
         with usage_tap(_origin(mock), log_path=log) as tap_url:
-            status, body = _post(tap_url, CHAT_PATH, json.dumps(REQUEST).encode())
+            status, body = post_json(tap_url, CHAT_PATH, json.dumps(REQUEST).encode())
 
     assert status == 400
     assert body == json.dumps(error_body).encode()
@@ -129,7 +101,7 @@ def test_a_success_without_usage_passes_through_with_no_token_counts(tmp_path):
     with mock_openai_server() as mock:
         mock.set_response('/chat/completions', upstream_body)
         with usage_tap(_origin(mock), log_path=log) as tap_url:
-            status, body = _post(tap_url, CHAT_PATH, json.dumps(REQUEST).encode())
+            status, body = post_json(tap_url, CHAT_PATH, json.dumps(REQUEST).encode())
 
     assert (status, body) == (200, json.dumps(upstream_body).encode())
     (record,) = load_call_records(log)
@@ -176,9 +148,9 @@ def test_call_record_tolerates_json_of_the_wrong_shape():
 
 def test_an_unreachable_upstream_answers_502_promptly_and_names_the_error(tmp_path):
     log = tmp_path / 'calls.jsonl'
-    with usage_tap(f'http://127.0.0.1:{_closed_port()}', log_path=log) as tap_url:
+    with usage_tap(f'http://127.0.0.1:{unused_port()}', log_path=log) as tap_url:
         started = time.monotonic()
-        status, _ = _post(tap_url, CHAT_PATH, json.dumps(REQUEST).encode())
+        status, _ = post_json(tap_url, CHAT_PATH, json.dumps(REQUEST).encode())
         elapsed = time.monotonic() - started
 
     assert status == 502
@@ -193,7 +165,7 @@ def test_a_streamed_request_is_refused_rather_than_mismeasured(tmp_path):
     log = tmp_path / 'calls.jsonl'
     with mock_openai_server() as mock:
         with usage_tap(_origin(mock), log_path=log) as tap_url:
-            status, _ = _post(tap_url, CHAT_PATH, json.dumps(REQUEST | {'stream': True}).encode())
+            status, _ = post_json(tap_url, CHAT_PATH, json.dumps(REQUEST | {'stream': True}).encode())
         upstream = mock.requests
 
     assert status == 501
@@ -207,10 +179,10 @@ def test_concurrent_requests_each_append_one_whole_line(tmp_path):
     log = tmp_path / 'calls.jsonl'
     statuses: list[int] = []
     with mock_openai_server() as mock:
-        mock.set_response('/chat/completions', _usage_body(10, 2, 'stop'))
+        mock.set_response('/chat/completions', usage_body(10, 2, 'stop'))
         with usage_tap(_origin(mock), log_path=log) as tap_url:
             def call() -> None:
-                statuses.append(_post(tap_url, CHAT_PATH, json.dumps(REQUEST).encode())[0])
+                statuses.append(post_json(tap_url, CHAT_PATH, json.dumps(REQUEST).encode())[0])
 
             threads = [threading.Thread(target=call) for _ in range(3)]
             for thread in threads:
@@ -230,11 +202,11 @@ def test_records_load_in_file_order_and_the_port_closes_on_exit(tmp_path):
     with mock_openai_server() as mock:
         mock.set_response_sequence(
             '/chat/completions',
-            [(200, _usage_body(100, 1, 'stop')), (200, _usage_body(200, 2, 'stop'))],
+            [(200, usage_body(100, 1, 'stop')), (200, usage_body(200, 2, 'stop'))],
         )
         with usage_tap(_origin(mock), log_path=log) as tap_url:
-            _post(tap_url, CHAT_PATH, json.dumps(REQUEST).encode())
-            _post(tap_url, CHAT_PATH, json.dumps(REQUEST).encode())
+            post_json(tap_url, CHAT_PATH, json.dumps(REQUEST).encode())
+            post_json(tap_url, CHAT_PATH, json.dumps(REQUEST).encode())
     port = urlsplit(tap_url).port
 
     records = load_call_records(log)
@@ -257,48 +229,15 @@ def test_a_session_with_no_calls_still_leaves_its_empty_log(tmp_path):
     assert load_call_records(log) == ()
 
 
-@contextmanager
-def _held_upstream(received: threading.Event, release: threading.Event) -> Iterator[str]:
-    """An upstream that answers each call only once ``release`` is set."""
-    body = json.dumps(_usage_body(321, 5, 'stop')).encode()
-
-    class HeldHandler(BaseHTTPRequestHandler):
-        protocol_version = 'HTTP/1.1'
-
-        def log_message(self, *args: Any) -> None:  # noqa: A002 - stdlib signature
-            """Silent."""
-
-        def do_POST(self) -> None:  # noqa: N802 - stdlib naming
-            self.rfile.read(int(self.headers.get('Content-Length') or 0))
-            received.set()
-            release.wait(timeout=30)
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.send_header('Content-Length', str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-    server = ThreadingHTTPServer(('127.0.0.1', 0), HeldHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
-        yield f'http://127.0.0.1:{server.server_address[1]}'
-    finally:
-        release.set()
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=5)
-
-
 def test_a_call_still_in_flight_when_the_session_closes_is_marked_as_outliving_it(tmp_path):
     log = tmp_path / 'calls.jsonl'
     received, release = threading.Event(), threading.Event()
     statuses: list[int] = []
-    with _held_upstream(received, release) as upstream:
+    with held_upstream(received, release) as upstream:
         with usage_tap(upstream, log_path=log) as tap_url:
             client = threading.Thread(
                 target=lambda: statuses.append(
-                    _post(tap_url, CHAT_PATH, json.dumps(REQUEST).encode())[0]
+                    post_json(tap_url, CHAT_PATH, json.dumps(REQUEST).encode())[0]
                 ),
                 daemon=True,
             )
@@ -313,7 +252,7 @@ def test_a_call_still_in_flight_when_the_session_closes_is_marked_as_outliving_i
     (record,) = load_call_records(log)
     assert record.outlived_session is True
     assert record.status == 200
-    assert record.prompt_tokens == 321
+    assert record.prompt_tokens == HELD_PROMPT_TOKENS
 
 
 def test_a_record_written_without_the_session_marker_loads_as_inside_its_session(tmp_path):
@@ -325,7 +264,7 @@ def test_a_record_written_without_the_session_marker_loads_as_inside_its_session
         path=CHAT_PATH,
         request_body=json.dumps(REQUEST).encode(),
         status=200,
-        response_body=json.dumps(_usage_body(10, 1, 'stop')).encode(),
+        response_body=json.dumps(usage_body(10, 1, 'stop')).encode(),
     )
     payload = record.model_dump(mode='json')
     del payload['outlived_session']
