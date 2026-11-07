@@ -1739,13 +1739,14 @@ async def test_failed_dead_letter_write_keeps_the_journal_row(tmp_path):
 async def test_close_leaves_every_handed_off_record_on_disk_and_its_row_released(
     tmp_path, caplog,
 ):
-    """After close(), every event is in exactly one store: written to the
-    dead-letter file with its journal row released, or still journaled.
+    """After close(), every record handed to the dead-letter writer is on
+    disk with its journal row released; only the event the drainer held when
+    close() cancelled it may remain journaled.
 
-    Only set relations are asserted: which event the drainer holds when
-    close() cancels it depends on scheduling. Every assertion message names
-    each event's store, the queue's stats() and its WARNING+ log records, so
-    a red under load shows which branch failed.
+    Only set relations and counts are asserted: which event the drainer holds
+    when close() cancels it depends on scheduling. Every assertion message
+    names each event's store, the queue's stats() and its WARNING+ log
+    records, so a red under load shows which branch failed.
     """
     caplog.set_level(logging.WARNING, logger='fused_memory.reconciliation')
     buf = AsyncMock()
@@ -1770,8 +1771,16 @@ async def test_close_leaves_every_handed_off_record_on_disk_and_its_row_released
     await q.close()
 
     stats = q.stats()
+    logs = [(r.name, r.levelname, r.getMessage()) for r in caplog.records]
     lines = dl.read_text(encoding='utf-8').splitlines() if dl.exists() else []
-    records = [json.loads(line) for line in lines]
+    records = []
+    for line in lines:
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError as exc:
+            raise AssertionError(
+                f'unparseable dead-letter line {line!r} stats={stats} logs={logs}',
+            ) from exc
     dead_lettered = {r['event']['id'] for r in records}
     journaled = journaled_ids(ej)
     placement = {
@@ -1782,15 +1791,16 @@ async def test_close_leaves_every_handed_off_record_on_disk_and_its_row_released
         )
         for index, event in enumerate(events)
     }
-    logs = [(r.name, r.levelname, r.getMessage()) for r in caplog.records]
     evidence = f'placement={placement} stats={stats} logs={logs}'
 
     assert all(len(stores) == 1 for stores in placement.values()), evidence
     assert dead_lettered | journaled == {e.id for e in events}, evidence
+    assert len(journaled) <= 1, evidence
     assert len(records) == len(dead_lettered), evidence
     assert stats['dead_letters_pending'] == 0, evidence
     assert stats['dead_letters'] == len(records), evidence
-    assert stats['dead_letters'] >= stats['overflow_drops'] > 0, evidence
+    overflow_records = sum(r['reason'] == 'overflow_drop' for r in records)
+    assert overflow_records == stats['overflow_drops'] > 0, evidence
     assert {r['reason'] for r in records} <= {'overflow_drop', 'shutdown_timeout'}, evidence
 
 
