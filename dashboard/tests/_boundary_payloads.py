@@ -21,7 +21,7 @@ from unittest.mock import AsyncMock, patch
 import aiosqlite
 import httpx
 from _canned_mcp import CannedMCP, _raw_row
-from _dt_helpers import fixed_clock, installed_clock, make_fixed_datetime_cls
+from _dt_helpers import fixed_clock, installed_clock
 from _prd_lanes_tree import (
     CARRIER,
     LaneTask,
@@ -385,19 +385,18 @@ def _sample(client: TestClient, at: datetime) -> None:
     orchestrator: the sampled roots are exactly the configured ones.
     """
     assert client.portal is not None, 'the sampler runs inside a live TestClient'
-    with (
-        patch('dashboard.data.burndown.datetime', make_fixed_datetime_cls(at)),
-        patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
-    ):
-        client.portal.call(_collect_into_store, app.state.config, app.state.http_client)
+    with patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]):
+        client.portal.call(_collect_into_store, app.state.config, app.state.http_client, at)
 
 
-async def _collect_into_store(config: DashboardConfig, http_client: httpx.AsyncClient) -> None:
+async def _collect_into_store(
+    config: DashboardConfig, http_client: httpx.AsyncClient, at: datetime,
+) -> None:
     config.burndown_db.parent.mkdir(parents=True, exist_ok=True)
     async with aiosqlite.connect(config.burndown_db) as conn:
         await conn.executescript(BURNDOWN_SCHEMA)
         await conn.commit()
-        await collect_snapshot(conn, config, http_client)
+        await collect_snapshot(conn, config, http_client, now=at)
 
 
 def _render_burndown(client: TestClient, at: datetime, window: str) -> dict[str, Any]:
