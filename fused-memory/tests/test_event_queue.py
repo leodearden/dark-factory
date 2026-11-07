@@ -21,6 +21,7 @@ from _dead_letter_helpers import (
     hold_fifo,
     journaled_events,
     journaled_ids,
+    overflowed_queue,
     parked_queue,
     record_dead_letter_writes,
     seed_dead_letters,
@@ -1652,11 +1653,8 @@ async def test_enqueue_overflow_returns_before_dead_letter_append_lands(tmp_path
     while the append is still held open, so the loop never waits on that I/O.
     """
     held = hold_fifo(tmp_path / 'dl.jsonl')
-    q = EventQueue(AsyncMock(), dead_letter_path=held.path, maxsize=1)
-    try:
-        e1, e2 = _make_event(), _make_event()
-        assert q.enqueue(e1) is True
-        assert q.enqueue(e2) is False
+    e1, e2 = _make_event(), _make_event()
+    async with overflowed_queue(held.path, e1, e2) as q:
         assert not held.reader_opened.is_set(), (
             'enqueue() only returned after the FIFO reader opened: the '
             'dead-letter append ran on the event-loop thread'
@@ -1670,8 +1668,6 @@ async def test_enqueue_overflow_returns_before_dead_letter_append_lands(tmp_path
         assert [(r['reason'], r['event']['id']) for r in records] == [('overflow_drop', e2.id)]
         assert q.stats()['dead_letters'] == 1
         assert q.stats()['dead_letters_pending'] == 0
-    finally:
-        await q.close()
 
 
 @pytest.mark.asyncio
@@ -1680,11 +1676,8 @@ async def test_overflow_journal_row_survives_until_its_dead_letter_is_written(tm
     on disk, so a kill -9 while the append is pending cannot lose it."""
     held = hold_fifo(tmp_path / 'dl.jsonl')
     ej = tmp_path / 'ej.db'
-    q = EventQueue(AsyncMock(), dead_letter_path=held.path, journal_path=ej, maxsize=1)
-    try:
-        e1, e2 = _make_event(), _make_event()
-        assert q.enqueue(e1) is True
-        assert q.enqueue(e2) is False
+    e1, e2 = _make_event(), _make_event()
+    async with overflowed_queue(held.path, e1, e2, journal_path=ej) as q:
         assert e2.id in journaled_ids(ej)
 
         held.release.set()
@@ -1694,8 +1687,6 @@ async def test_overflow_journal_row_survives_until_its_dead_letter_is_written(tm
         journaled = journaled_ids(ej)
         assert e1.id in journaled
         assert e2.id not in journaled
-    finally:
-        await q.close()
 
 
 @pytest.mark.asyncio
@@ -1721,22 +1712,12 @@ async def test_failed_dead_letter_write_keeps_the_journal_row(tmp_path):
     recover() to redeliver, rather than silently losing the event."""
     (tmp_path / 'blocker').write_text('a regular file, not a directory')
     ej = tmp_path / 'ej.db'
-    q = EventQueue(
-        AsyncMock(),
-        dead_letter_path=tmp_path / 'blocker' / 'dl.jsonl',
-        journal_path=ej,
-        maxsize=1,
-    )
-    try:
-        e1, e2 = _make_event(), _make_event()
-        assert q.enqueue(e1) is True
-        assert q.enqueue(e2) is False
+    e1, e2 = _make_event(), _make_event()
+    async with overflowed_queue(tmp_path / 'blocker' / 'dl.jsonl', e1, e2, journal_path=ej) as q:
         await q.flush_dead_letters()
 
         assert e2.id in journaled_ids(ej)
         assert q.stats()['dead_letters'] == 0
-    finally:
-        await q.close()
 
 
 @pytest.mark.asyncio
@@ -1877,20 +1858,16 @@ async def test_flush_dead_letters_releases_the_row_of_a_write_that_finished_befo
     """
     writes = record_dead_letter_writes(monkeypatch)
     ej = tmp_path / 'ej.db'
-    q = EventQueue(AsyncMock(), dead_letter_path=tmp_path / 'dl.jsonl', journal_path=ej, maxsize=1)
-    try:
-        e1, e2 = _make_event(), _make_event()
-        assert q.enqueue(e1) is True
-        assert q.enqueue(e2) is False
-        assert writes[-1].result(timeout=5) is True
+    e1, e2 = _make_event(), _make_event()
+    async with overflowed_queue(tmp_path / 'dl.jsonl', e1, e2, journal_path=ej) as q:
+        [written] = writes
+        assert written.result(timeout=5) is True
 
         await q.flush_dead_letters()
 
         journaled = journaled_ids(ej)
         assert e2.id not in journaled
         assert e1.id in journaled
-    finally:
-        await q.close()
 
 
 @pytest.mark.asyncio
@@ -1901,14 +1878,10 @@ async def test_close_releases_the_row_of_a_write_that_finished_before_close(
     it closes the journal, so recover() cannot redeliver a dead-lettered event."""
     writes = record_dead_letter_writes(monkeypatch)
     ej = tmp_path / 'ej.db'
-    q = EventQueue(AsyncMock(), dead_letter_path=tmp_path / 'dl.jsonl', journal_path=ej, maxsize=1)
-    try:
-        e1, e2 = _make_event(), _make_event()
-        assert q.enqueue(e1) is True
-        assert q.enqueue(e2) is False
-        assert writes[-1].result(timeout=5) is True
-    finally:
-        await q.close()
+    e1, e2 = _make_event(), _make_event()
+    async with overflowed_queue(tmp_path / 'dl.jsonl', e1, e2, journal_path=ej):
+        [written] = writes
+        assert written.result(timeout=5) is True
 
     assert journaled_ids(ej) == {e1.id}
 
