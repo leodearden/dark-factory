@@ -87,6 +87,7 @@ PURE_STDLIB_LEAVES = (
     'safe_io',
     'secret_env',
     'secret_redaction',
+    'session_liveness',
     'streak',
     'task_claimant',
     'task_metadata_wire',
