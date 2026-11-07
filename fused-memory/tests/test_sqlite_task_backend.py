@@ -5931,6 +5931,23 @@ async def test_close_drains_cached_read_connections(backend, project_root):
 
 
 @pytest.mark.asyncio
+async def test_close_runs_no_wal_checkpoint_on_the_read_connection(backend, project_root):
+    """The read connection never writes, so close() owes it no WAL checkpoint.
+
+    A TRUNCATE checkpoint there busy-waits behind any other process's open
+    snapshot, spending the shared shutdown budget on a no-op.
+    """
+    await backend.add_task(project_root=project_root, title='T1')
+    conn = (await backend._get_read_access(project_root)).connection
+    recorded_sql: list[str] = []
+    await conn.set_trace_callback(recorded_sql.append)
+
+    await backend.close()
+
+    assert [sql for sql in recorded_sql if 'wal_checkpoint' in sql.lower()] == []
+
+
+@pytest.mark.asyncio
 async def test_get_read_access_does_not_leak_when_closed_during_bring_up(
     backend, project_root, monkeypatch,
 ):

@@ -1712,9 +1712,12 @@ class SqliteTaskBackend:
             with contextlib.suppress(Exception):
                 await access.close()
             logger.debug('SqliteTaskBackend final-checkpointed and closed %s', root)
+        # Read accesses are autocommit and never write, so they skip
+        # AtomicConnection.close()'s checkpoint: a TRUNCATE there only
+        # busy-waits behind another process's snapshot for nothing.
         for root, access in read_access_items:
             with contextlib.suppress(Exception):
-                await access.close()
+                await access.connection.close()
             logger.debug('SqliteTaskBackend closed read connection for %s', root)
         logger.info('SqliteTaskBackend closed (%d connection(s))', len(write_access_items))
 
