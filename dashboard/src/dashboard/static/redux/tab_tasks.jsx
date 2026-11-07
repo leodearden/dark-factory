@@ -10,7 +10,7 @@ const { useState: uS_T, useEffect: uE_T, useRef: uR_T, useLayoutEffect: uLE_T, u
 const { computeNeighborhood, focusGroupView, layoutSignature, taskGraphLayout } = window.DF_GRAPH_LAYOUT;
 const { ProjectPrdLanes, PrdContentionLine } = window.DF_PRD_LANES;
 const { projectPrdView, projectPrdContention } = window.DF_PRD_LANES_VIEW;
-const { strandBadgeState, agentCellState } = window.DF_TASK_ROW_CELLS;
+const { strandBadgeState, agentCellState, locksCellState, schedulerLocksDatum } = window.DF_TASK_ROW_CELLS;
 const { rtCell, rtAge, rtProbe, rtProbeSummary } = window.DF_RUNTIME_FMT;
 const { tasksBannerNoticesFor } = window.DF_TASKS_OFFLINE_BANNER;
 const { invariantChipFor, chainChipFor } = window.DF_INVARIANT_CHIP;
@@ -59,6 +59,38 @@ function DeferralHold({ task }) {
       {cell.needsHuman && <span className="deferral-human">needs human</span>}
     </div>
   );
+}
+
+// The detail pane's lock chips. Whether anything is known about the project's
+// locks is locksCellState's answer, drawn as tabs.jsx::LocksCell draws it.
+function ModuleLocksSection({ task }) {
+  const { buildSchedLockInfo, disambiguateLabels, lockChipStateFor } = window.DF_SCHED_UTILS;
+  const lockInfo = buildSchedLockInfo(task, DF_T.SCHEDULER);
+  const cell = locksCellState(schedulerLocksDatum(DF_T.SCHEDULER, task.project, DF_T.__receipt), lockInfo);
+  if (cell.placeholder) {
+    return (<>
+      <div className="section-lbl">Module locks</div>
+      <span className="chip-empty" title={cell.title || undefined}>{cell.placeholder}</span>
+    </>);
+  }
+  const { rawTaskId, lockSet, moduleByPath } = lockInfo;
+  if (!lockSet.length) return null;
+  const labelMap = disambiguateLabels(lockSet);
+  return (<>
+    <div className="section-lbl">Module locks ({lockSet.length})</div>
+    <div className="chips column">
+      {lockSet.map(modPath => {
+        const { cls, ownerLabel } = lockChipStateFor(moduleByPath.get(modPath), rawTaskId, task.project);
+        return (
+          <span key={modPath} className={`chip ${cls}`} title={modPath}>
+            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{labelMap.get(modPath)}</span>
+            {cls === 'lock-parked' && <span className="holder">⏸ {ownerLabel}</span>}
+            {cls === 'lock-taken' && <span className="holder">⊘ {ownerLabel}</span>}
+          </span>
+        );
+      })}
+    </div>
+  </>);
 }
 
 // ── Edge router: draw curves from each parent (dep) to each child node ──
@@ -417,35 +449,7 @@ function TaskDetail({ task, allTasks }) {
         </>);
       })()}
 
-      {(() => {
-        const { buildSchedLockInfo, disambiguateLabels } = window.DF_SCHED_UTILS || {};
-        const { rawTaskId, lockSet, moduleByPath } = buildSchedLockInfo
-          ? buildSchedLockInfo(task, DF_T.SCHEDULER)
-          : { rawTaskId: String(task.id).split('/T-').pop(), lockSet: [], moduleByPath: new Map() };
-        if (!lockSet.length) return null;
-        const labelMap = disambiguateLabels ? disambiguateLabels(lockSet) : null;
-        return (<>
-          <div className="section-lbl">Module locks ({lockSet.length})</div>
-          <div className="chips column">
-            {lockSet.map(modPath => {
-              const m = moduleByPath.get(modPath);
-              const holder = m && m.holder;
-              const holderProject = m && m.holder_project;
-              const parkedBy = m && m.parked_by;
-              const parkedOwnerLive = m && m.parked_owner_live;
-              const isMine = holder === rawTaskId && (holderProject || task.project) === task.project;
-              const { cls, ownerLabel } = window.DF_SCHED_UTILS.lockChipState({ holder, isMine, parkedBy, parkedOwnerLive });
-              return (
-                <span key={modPath} className={`chip ${cls}`} title={modPath}>
-                  <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{labelMap ? labelMap.get(modPath) : modPath}</span>
-                  {cls === 'lock-parked' && <span className="holder">⏸ {ownerLabel}</span>}
-                  {cls === 'lock-taken' && <span className="holder">⊘ {ownerLabel}</span>}
-                </span>
-              );
-            })}
-          </div>
-        </>);
-      })()}
+      <ModuleLocksSection task={task} />
     </div>
   );
 }

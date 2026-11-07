@@ -242,6 +242,33 @@ export function mergeQueueBlock({ bucketMinutes = null, buckets = 3, outcomes = 
   };
 }
 
+// The SCHEDULER payload, as /scheduler serves it: the keys data.js seeds it
+// with, every project in `offlineProjects` listed offline, nothing paused.
+export function schedulerSnapshot({ offlineProjects = [], rows = [], modules = [] } = {}) {
+  return {
+    rows,
+    modules,
+    pin_queue: [],
+    events_by_task: {},
+    snapshot_at: WIRE_AS_OF,
+    offline: offlineProjects.length > 0,
+    offline_projects: offlineProjects,
+    paused: false,
+    paused_projects: [],
+  };
+}
+
+// One SCHEDULER row: the modules task `taskId` of `project` declares it locks.
+export function schedulerLockRow({ project, taskId, lockSet }) {
+  return { project, task_id: taskId, lock_set: lockSet };
+}
+
+// One SCHEDULER.modules entry: who holds `path` in `project`, and who has it
+// parked. Every lock field is null unless given, which reads as a free module.
+export function schedulerModule({ project, path, holder = null, holderProject = null, parkedBy = null, parkedOwnerLive = null }) {
+  return { project, path, holder, holder_project: holderProject, parked_by: parkedBy, parked_owner_live: parkedOwnerLive };
+}
+
 // One ORCHESTRATORS row, as /orchestrators serves it.
 export function orchestratorRow({ pid, project, running }) {
   return { pid, project, running };
