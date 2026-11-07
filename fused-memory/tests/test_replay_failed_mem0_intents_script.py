@@ -372,6 +372,13 @@ class TestAckFromToolResult:
         assert 'mcp_tool_error' in detail
         assert 'boom' in detail
 
+    def test_an_unreadable_ack_says_the_outcome_is_unknown(self):
+        result, detail = _script.classify_ack({'memory_ids': 'new-1'})
+
+        assert result is ReplayResult.NOT_LANDED
+        assert 'unknown' in detail
+        assert 'check Mem0' in detail
+
     @pytest.mark.parametrize('structured', [None, {}], ids=['none', 'empty'])
     def test_a_missing_structured_ack_says_the_outcome_is_unknown(self, structured):
         ack = _script.ack_from_tool_result(_tool_result(structured, text='queued?'))
