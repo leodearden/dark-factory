@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
 
 import pytest
 from pydantic import ValidationError
@@ -21,6 +22,7 @@ from shared.followup_items import (
     legacy_item,
     merge_items,
     observed_item,
+    read_items,
     require_unique_item_keys,
     with_derived_bundle_keys,
 )
@@ -51,7 +53,7 @@ class TestFollowupItem:
     def test_the_record_is_frozen(self) -> None:
         item = FollowupItem.model_validate(_fields())
         with pytest.raises(ValidationError):
-            item.summary = 'changed'  # type: ignore[misc]
+            item.summary = 'changed'
 
     def test_the_summary_is_stored_as_one_line(self) -> None:
         item = FollowupItem.model_validate(_fields(summary='  line one\n\n  line\ttwo  '))
@@ -86,37 +88,45 @@ class TestFollowupItem:
         assert FollowupItem.model_validate(_fields()).origin_escalation_id is None
 
 
+@dataclass(frozen=True)
+class _KeyArgs:
+    origin_task: str = '8414'
+    files: tuple[str, ...] = ('pkg/a.py', 'pkg/b.py')
+    summary: str = 'The loop hides it'
+
+    def key(self) -> str:
+        return item_key(origin_task=self.origin_task, files=self.files, summary=self.summary)
+
+
 class TestItemKey:
-    _BASE = {'origin_task': '8414', 'files': ['pkg/a.py', 'pkg/b.py'], 'summary': 'The loop hides it'}
-
     def test_it_is_sixteen_lowercase_hex_chars_and_deterministic(self) -> None:
-        key = item_key(**self._BASE)
+        key = _KeyArgs().key()
         assert _HEX16.fullmatch(key)
-        assert item_key(**self._BASE) == key
+        assert _KeyArgs().key() == key
 
     @pytest.mark.parametrize(
         'variant',
         [
-            pytest.param({'files': ['pkg/b.py', 'pkg/a.py']}, id='file-order'),
-            pytest.param({'files': ['pkg/a.py', 'pkg/b.py', 'pkg/a.py']}, id='duplicate-file'),
-            pytest.param({'summary': 'the LOOP hides it'}, id='summary-case'),
-            pytest.param({'summary': '  The loop\n  hides\tit '}, id='summary-whitespace'),
+            pytest.param(_KeyArgs(files=('pkg/b.py', 'pkg/a.py')), id='file-order'),
+            pytest.param(_KeyArgs(files=('pkg/a.py', 'pkg/b.py', 'pkg/a.py')), id='duplicate-file'),
+            pytest.param(_KeyArgs(summary='the LOOP hides it'), id='summary-case'),
+            pytest.param(_KeyArgs(summary='  The loop\n  hides\tit '), id='summary-whitespace'),
         ],
     )
-    def test_presentation_differences_share_one_key(self, variant: dict[str, object]) -> None:
-        assert item_key(**{**self._BASE, **variant}) == item_key(**self._BASE)  # type: ignore[arg-type]
+    def test_presentation_differences_share_one_key(self, variant: _KeyArgs) -> None:
+        assert variant.key() == _KeyArgs().key()
 
     @pytest.mark.parametrize(
         'variant',
         [
-            pytest.param({'origin_task': '8415'}, id='origin-task'),
-            pytest.param({'files': ['pkg/a.py', 'pkg/c.py']}, id='a-file'),
-            pytest.param({'files': ['pkg/a.py']}, id='fewer-files'),
-            pytest.param({'summary': 'The loop shows it'}, id='summary-words'),
+            pytest.param(_KeyArgs(origin_task='8415'), id='origin-task'),
+            pytest.param(_KeyArgs(files=('pkg/a.py', 'pkg/c.py')), id='a-file'),
+            pytest.param(_KeyArgs(files=('pkg/a.py',)), id='fewer-files'),
+            pytest.param(_KeyArgs(summary='The loop shows it'), id='summary-words'),
         ],
     )
-    def test_a_substantive_difference_changes_the_key(self, variant: dict[str, object]) -> None:
-        assert item_key(**{**self._BASE, **variant}) != item_key(**self._BASE)  # type: ignore[arg-type]
+    def test_a_substantive_difference_changes_the_key(self, variant: _KeyArgs) -> None:
+        assert variant.key() != _KeyArgs().key()
 
 
 class TestObservedItem:
@@ -298,10 +308,8 @@ def _bundle(*items: object, **top: object) -> dict[str, object]:
     }
 
 
-def _stored(output: dict[str, object]) -> list[dict[str, object]]:
-    items = output[FOLLOWUP_ITEMS_METADATA_KEY]
-    assert isinstance(items, list)
-    return items
+def _stored(output: dict[str, object]) -> tuple[FollowupItem, ...]:
+    return read_items(output)
 
 
 class TestWithDerivedBundleKeys:
@@ -317,11 +325,9 @@ class TestWithDerivedBundleKeys:
 
         assert output['escalation_id'] == 'agent-followup-8414'
         for stored in _stored(output):
-            assert stored['origin_task'] == '8414'
-            assert stored['origin_escalation_id'] == 'agent-followup-8414'
-            assert stored['key'] == item_key(
-                origin_task='8414', files=stored['files'], summary=stored['summary'],  # type: ignore[arg-type]
-            )
+            assert stored.origin_task == '8414'
+            assert stored.origin_escalation_id == 'agent-followup-8414'
+            assert stored.key == item_key(origin_task='8414', files=stored.files, summary=stored.summary)
 
     def test_caller_supplied_identities_are_overwritten(self) -> None:
         forged = {'key': 'forged', 'origin_task': '1', 'origin_escalation_id': 'esc-forged'}
@@ -344,7 +350,7 @@ class TestWithDerivedBundleKeys:
         assert with_derived_bundle_keys(_bundle(second, first))['suggestion_hash'] == suggestion_hash
         changed = with_derived_bundle_keys(_bundle(first, _raw('three', 'pkg/b.py')))
         assert changed['suggestion_hash'] != suggestion_hash
-        assert suggestion_hash not in {stored['key'] for stored in _stored(output)}
+        assert suggestion_hash not in {stored.key for stored in _stored(output)}
 
     @pytest.mark.parametrize('spawned_from', [None, '', '   '])
     def test_an_unparented_bundle_has_no_top_level_escalation_id(self, spawned_from: object) -> None:
@@ -359,7 +365,7 @@ class TestWithDerivedBundleKeys:
         assert 'escalation_id' not in output
         assert _HEX16.fullmatch(str(output['suggestion_hash']))
         for stored in _stored(output):
-            assert (stored['origin_task'], stored['origin_escalation_id']) == (UNPARENTED_ORIGIN, None)
+            assert (stored.origin_task, stored.origin_escalation_id) == (UNPARENTED_ORIGIN, None)
 
     def test_every_other_caller_key_is_preserved(self) -> None:
         metadata = _bundle()
@@ -369,7 +375,9 @@ class TestWithDerivedBundleKeys:
 
     def test_the_output_is_plain_json(self) -> None:
         output = with_derived_bundle_keys(_bundle())
-        assert all(isinstance(stored['files'], list) for stored in _stored(output))
+        raw = output[FOLLOWUP_ITEMS_METADATA_KEY]
+        assert isinstance(raw, list)
+        assert all(isinstance(element, dict) and isinstance(element['files'], list) for element in raw)
         assert json.loads(json.dumps(output)) == output
 
 
