@@ -31,7 +31,7 @@ from collections import deque
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar
 
 import aiosqlite
 
@@ -45,6 +45,8 @@ if TYPE_CHECKING:
     from fused_memory.reconciliation.event_buffer import EventBuffer
 
 logger = logging.getLogger(__name__)
+
+_Outcome = TypeVar('_Outcome')
 
 
 def _dead_letter_record(
@@ -69,8 +71,10 @@ def _release_row_once_written(
     Runs before the write's future resolves: on the writer thread, or inline
     when the hand-off itself failed. The journal's connection is
     loop-thread-only, so the release is marshalled onto the loop, where it
-    runs ahead of every waiter's wake-up. A failed write, or a loop that has
-    already closed, keeps the row for :meth:`EventQueue.recover` to redeliver.
+    runs ahead of every waiter that resumes through
+    :func:`_await_after_queued_loop_callbacks`. A failed write, or a loop that
+    has already closed, keeps the row for :meth:`EventQueue.recover` to
+    redeliver.
     """
     if not ok:
         logger.warning(
@@ -100,6 +104,33 @@ def _release_journal_row(journal: EventJournal, event_id: str) -> None:
             'event=%s: %s',
             event_id, exc,
         )
+
+
+async def _await_after_queued_loop_callbacks(future: Future[_Outcome]) -> _Outcome:
+    """Await a writer-thread future, resuming only after every loop callback queued before it resolved.
+
+    ``asyncio.wrap_future`` gives no such order: from CPython 3.13.12 it
+    resolves an already-done future inline, without a pass through the loop.
+    """
+    loop = asyncio.get_running_loop()
+    resumed: asyncio.Future[_Outcome] = loop.create_future()
+
+    def _copy(done: Future[_Outcome]) -> None:
+        if resumed.cancelled():
+            return
+        exc = done.exception()
+        if exc is not None:
+            resumed.set_exception(exc)
+        else:
+            resumed.set_result(done.result())
+
+    def _hop(done: Future[_Outcome]) -> None:
+        # A closed loop has no awaiter left to resume.
+        with contextlib.suppress(RuntimeError):
+            loop.call_soon_threadsafe(_copy, done)
+
+    future.add_done_callback(_hop)
+    return await resumed
 
 
 def _iter_lines_reversed(
@@ -268,7 +299,7 @@ class EventQueue:
                 recovered += 1
             except asyncio.QueueFull:
                 self._overflow_drops += 1
-                await asyncio.wrap_future(self._hand_off_to_dead_letter(
+                await _await_after_queued_loop_callbacks(self._hand_off_to_dead_letter(
                     event, reason='recover_overflow', attempts=0,
                 ))
         if recovered:
@@ -361,7 +392,7 @@ class EventQueue:
         By then each written record's journal-row release has run on the
         loop, which is why :meth:`close` calls it before closing the journal.
         """
-        await asyncio.wrap_future(self._dead_letter_writer.flushed())
+        await _await_after_queued_loop_callbacks(self._dead_letter_writer.flushed())
 
     # ── enqueue (sync, non-blocking, event-loop thread only) ───────────
 
@@ -511,7 +542,7 @@ class EventQueue:
                     'EventQueue.drain: non-retriable error for event=%s: %s',
                     event.id, exc, exc_info=True,
                 )
-                await asyncio.wrap_future(self._hand_off_to_dead_letter(
+                await _await_after_queued_loop_callbacks(self._hand_off_to_dead_letter(
                     event, reason='non_retriable', attempts=attempts,
                 ))
                 if self._retry_in_flight > 0 and attempts > 1:
@@ -536,9 +567,10 @@ class EventQueue:
         is on disk, so a kill -9 while the append is pending leaves the event
         in the journal rather than in neither store. The returned future
         resolves ``True`` once the record is written, ``False`` if it failed;
-        a coroutine awaiting it through ``asyncio.wrap_future`` resumes only
-        after that release has run, because the release is the write's
-        ``on_settled`` hook, queued on the loop before the future resolves.
+        a coroutine awaiting it through :func:`_await_after_queued_loop_callbacks`
+        resumes only after that release has run, because the release is the
+        write's ``on_settled`` hook, queued on the loop before the future
+        resolves.
         """
         release_row = None
         if self._journal is not None:
