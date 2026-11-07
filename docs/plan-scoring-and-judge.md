@@ -1341,7 +1341,7 @@ The cross-group route needs the composite hard gate. Both are set out in "The
 plan-production predicate (task 3302)" above.
 
 **One admission decision for every measured pool.** An unmeasurable plan-only
-trial (`cell_admission.is_unmeasurable`) leaves the plan-quality, composite,
+trial (`cell_admission.py::is_unmeasurable`) leaves the plan-quality, composite,
 quality, cost and latency pools, the efficiency floors and the `cost_source`
 label together, so no two of them can disagree about a cell. An earlier scope
 kept tainted trials in the composite pool, on the grounds that the composite
@@ -1357,14 +1357,15 @@ sibling because one of its trials was refused. `trials`, `fixtures` and the
 counts the skipped ones.
 
 **An empty pool is `None`, never `0.0`.** A config with no measured trial
-reports `None` for `composite`, `quality`, `cost_usd`, `latency_secs` and all
-three `ci95` intervals, rendered `-`. `mean_ci95([])` returns a mean of `0.0`
+reports `None`, rendered `-`, for every value taken over its measured pools.
+The keys are listed in `composite_report.py::build_composite_report`'s
+docstring. `mean_ci95([])` returns a mean of `0.0`
 with a zero-width interval, which would read as "it scored nothing, for free,
 instantly, and we are confident". The pools share one admission decision, so
 they are empty together or not at all.
 
 **A plan-only row's quality axis is `plan_quality`.** An architect trial
-(`cell_admission.is_plan_only`) ran no test, so it is blended with
+(`cell_admission.py::is_plan_only`) ran no test, so it is blended with
 `quality=plan_quality, plan_only=True` instead of being hard-gated to `0.0` by
 its absent `tests_pass`. `quality` reports the axis that fed the composite;
 otherwise every architect row would render `quality 0.0000` beside a non-zero
@@ -1378,9 +1379,9 @@ mean drops its source with it. A config with no measured trial says `cli`, for
 back-compat.
 
 **`plan_quality` is the config's pooled mean.** It reduces through
-`cell_admission.mean_plan_quality`, the reduction `build_plan_quality_report`
+`cell_admission.py::mean_plan_quality`, the reduction `build_plan_quality_report`
 also uses, so the two tables the CLI prints together cannot disagree. Its pool
-admits a cell through `cell_admission.plan_quality_score`, the same accessor
+admits a cell through `cell_admission.py::plan_quality_score`, the same accessor
 that table uses. It was once the first untainted trial's value, passed
 through. That was defensible only while it was a diagnostic echo, and stopped
 being so when `select_survivors` began ranking on it.
@@ -1420,34 +1421,29 @@ survivors with `--arch` / `--impl`.
 
 Code: `orchestrator/src/orchestrator/evals/composite_report.py::select_survivors`.
 
-`select_survivors` keeps the top *k* configs per `role_under_test`, ranked by:
-
-1. a measured `composite` before `None`;
-2. descending `composite`;
-3. a `plan_quality` before `None`;
-4. descending `plan_quality`;
-5. a `plan_rate` before `None`;
-6. descending `plan_rate`;
-7. ascending config name, kept only as the final byte-stability guarantee.
+`select_survivors` keeps the top *k* configs per `role_under_test`. The ranking
+order is that function's docstring, which is the contract. This section only
+says why the order has that shape.
 
 `None` sorts last on each axis because it means "we measured nothing", which
 must never outrank a config that genuinely scored zero. Coercing it with
 `or 0.0` would tie the two and hand the win to the name sort, promoting the
-candidate we know least about.
+candidate we know least about. The config name is the last key, kept only as
+the final byte-stability guarantee.
 
-**Why axes 3–4 exist.** While every architect composite was hard-gated to
-`0.0` (the bug task 3099 fixed), the name tiebreak had silently become the
-whole selection mechanism for the architect role. `architect-fable-high` was
-"selected" for sorting first, not for planning best
+**Why the `plan_quality` axis exists.** While every architect composite was
+hard-gated to `0.0` (the bug task 3099 fixed), the name tiebreak had silently
+become the whole selection mechanism for the architect role.
+`architect-fable-high` was "selected" for sorting first, not for planning best
 (`plans/eval-architect-effort-verdict-2026-07-27.md`, defect 2). Fixing the
 composite alone would leave the same trap armed for the next pair of genuinely
 tied composites, so the alphabet sits below every axis that carries signal. A
-workflow row carries neither `plan_quality` nor `plan_rate`, so axes 3–6 are
+workflow row carries neither `plan_quality` nor `plan_rate`, so both axes are
 inert for it and the implementer ordering is unchanged.
 
-**Axes 5–6** are the reliability tie-break, and they sit below `plan_quality`
-rather than above it. The reason is the TIE-BREAK paragraph of "The derived
-reliability surface (task 3379)".
+**The `plan_rate` axis** is the reliability tie-break, and it sits below
+`plan_quality` rather than above it. The reason is the TIE-BREAK paragraph of
+"The derived reliability surface (task 3379)".
 
 ### The plan-quality report: four treatments (tasks 3118, 3302, 3628, 4760)
 
