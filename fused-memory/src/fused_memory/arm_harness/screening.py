@@ -152,24 +152,16 @@ def _origin_note(origin: StatusOrigin | None) -> str:
             return ''
 
 
-_UnreportedKind = tuple[int, StatusOrigin | None, str]
-
-
-def _kind_order(counted: tuple[_UnreportedKind, int]) -> tuple[int, str, str]:
-    (status, origin, excerpt), _ = counted
-    return status, '' if origin is None else origin.value, excerpt
-
-
 def _unreported_detail(
     model_id: str, unreported: Sequence[CallRecord], own: Sequence[CallRecord]
 ) -> str:
-    kinds = Counter(
-        (call.status, call.status_origin, call.error_excerpt or '') for call in unreported
-    )
-    ordered = sorted(kinds.items(), key=_kind_order)
+    kinds = sorted(Counter(
+        (call.status, _origin_note(call.status_origin), call.error_excerpt or '')
+        for call in unreported
+    ).items())
     listed = '; '.join(
-        f'{count}x status {status}{_origin_note(origin)}: {excerpt}'
-        for (status, origin, excerpt), count in ordered[:_LISTED_REJECTIONS]
+        f'{count}x status {status}{origin_note}: {excerpt}'
+        for (status, origin_note, excerpt), count in kinds[:_LISTED_REJECTIONS]
     )
     reported = _reported_prompts(own)
     longest = f'{max(reported)} tokens' if reported else 'none'

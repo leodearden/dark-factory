@@ -207,6 +207,20 @@ def test_a_server_rejection_is_named_as_the_servers_in_the_unmeasured_detail():
     assert 'synthesized by the usage tap' not in result.detail
 
 
+def test_unreported_calls_sharing_a_status_and_excerpt_are_listed_once_per_origin():
+    calls = tuple(
+        call(status=502, error_excerpt='upstream failed', status_origin=origin)
+        for origin in (StatusOrigin.TAP, None, StatusOrigin.UPSTREAM)
+    )
+
+    result = context_gate(arm_evidence(QWEN, calls=calls))
+
+    assert result.verdict is GateVerdict.UNMEASURED
+    assert '1x status 502 (synthesized by the usage tap): upstream failed' in result.detail
+    assert '1x status 502 (from the server): upstream failed' in result.detail
+    assert '1x status 502: upstream failed' in result.detail
+
+
 def test_a_served_own_model_call_without_usage_leaves_the_longest_prompt_unknown():
     calls = (call(prompt_tokens=500), call(prompt_tokens=None))
 
