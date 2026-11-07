@@ -8,6 +8,7 @@ run only in its dry-run form, which never opens an MCP client.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import sqlite3
 from contextlib import closing
@@ -19,9 +20,11 @@ import pytest
 import pytest_asyncio
 from _fm_helpers import load_script_module
 from _mem0_intent_fixtures import mem0_intent_row, seed_mem0_intent
+from _store_mutation_preflight_contract import SENTINEL, deny, neutralise_fixture
 from mcp.types import CallToolResult, TextContent
 
 from fused_memory.services.write_journal import Mem0IntentStatus, WriteJournal
+from fused_memory.utils.store_mutation_preflight import StoreMutationUnavailable
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'replay_failed_mem0_intents.py'
 
@@ -42,6 +45,16 @@ _PENDING_ACK = {
     'stores_pending_retry': ['mem0'],
     'message': 'Memory queued for [] [mem0_pending_retry: rate_limited: RateLimitError: 429]',
 }
+
+
+_neutralise = neutralise_fixture(
+    _script,
+    note="""``_run`` runs the preflight before it opens write_journal.db, in a
+    dry run as well as under ``--apply`` (task 7650), because opening the
+    journal applies its schema migration. The suite's substrate is a real
+    WriteJournal on tmp_path and an injected add_memory double; no MCP client
+    is opened. ``TestTheStoreMutationPreflight`` re-rigs the guard to refuse.""",
+)
 
 
 @pytest_asyncio.fixture
@@ -284,6 +297,23 @@ class TestReplay:
         assert (await mem0_intent_row(journal, first))['status'] == 'failed'
 
     @pytest.mark.asyncio
+    async def test_a_raising_call_says_its_outcome_is_unknown(self, journal):
+        intent_id = await _seed(journal)
+
+        (outcome,) = await _script.replay(
+            journal,
+            _AddMemory(TimeoutError('add_memory timed out after 180s')),
+            selection=Selection(intent_ids=(intent_id,)),
+            apply=True,
+        )
+
+        assert outcome.outcome is ReplayResult.ERROR
+        assert 'TimeoutError: add_memory timed out after 180s' in outcome.detail
+        assert 'outcome unknown' in outcome.detail
+        assert 'check Mem0 for its content before re-running this id' in outcome.detail
+        assert (await mem0_intent_row(journal, intent_id))['status'] == 'failed'
+
+    @pytest.mark.asyncio
     async def test_a_second_run_replays_nothing(self, journal):
         await _seed(journal, created_at=_T)
         await _seed(journal, created_at=_T)
@@ -368,6 +398,31 @@ def _seed_journal_dir(data_dir: Path, count: int) -> list[str]:
 def _statuses(data_dir: Path) -> dict[str, str]:
     with closing(sqlite3.connect(data_dir / 'write_journal.db')) as conn:
         return dict(conn.execute('SELECT id, status FROM mem0_intents').fetchall())
+
+
+class TestTheStoreMutationPreflight:
+    @pytest.mark.asyncio
+    async def test_a_refused_dry_run_leaves_the_journal_untouched(
+        self, tmp_path, monkeypatch
+    ):
+        deny(_script, monkeypatch)
+        data_dir = tmp_path / 'wj'
+        data_dir.mkdir()
+        db_path = WriteJournal(data_dir).db_path
+        with closing(sqlite3.connect(db_path)) as conn, conn:
+            conn.execute('CREATE TABLE unmigrated (x INTEGER)')
+        before = hashlib.sha256(db_path.read_bytes()).hexdigest()
+
+        with pytest.raises(StoreMutationUnavailable, match=SENTINEL):
+            await _script._run(
+                data_dir,
+                Selection(intent_ids=('x',)),
+                apply=False,
+                mcp_url='http://127.0.0.1:1/mcp',
+            )
+
+        assert hashlib.sha256(db_path.read_bytes()).hexdigest() == before
+        assert sorted(data_dir.iterdir()) == [db_path]
 
 
 class TestMain:
