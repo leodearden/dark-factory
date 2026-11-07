@@ -34,7 +34,9 @@ from orchestrator.harness import Harness
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome, WorkflowState
 from orchestrator.workflow_types import (
+    PublishedStewardOutcome,
     StewardInterrupted,
+    StewardOutcome,
     StewardReescalatedL1,
     StewardResolved,
     TerminalReport,
@@ -99,7 +101,15 @@ def _status(queue: EscalationQueue, esc: Escalation) -> str:
     return current.status
 
 
-def _wip_interrupting_steward() -> type:
+def _publish_for_pending_l0s(
+    channel: asyncio.Queue, queue: EscalationQueue, outcome: StewardOutcome,
+) -> None:
+    """Publish *outcome* once per pending L0, tagged with its id, as a real steward does."""
+    for esc in queue.get_by_task(TASK_ID, status='pending', level=0):
+        channel.put_nowait(PublishedStewardOutcome(esc.id, outcome))
+
+
+def _wip_interrupting_steward(queue: EscalationQueue) -> type:
     """A steward that publishes a wip-present interruption as soon as it starts."""
 
     class _Steward:
@@ -114,7 +124,9 @@ def _wip_interrupting_steward() -> type:
 
         async def start(self) -> None:
             assert self._channel is not None
-            self._channel.put_nowait(StewardInterrupted('attempt_cap', wip_commits_present=True))
+            _publish_for_pending_l0s(
+                self._channel, queue, StewardInterrupted('attempt_cap', wip_commits_present=True),
+            )
 
         async def stop(self) -> None:
             pass
@@ -136,16 +148,19 @@ async def _wip_interruption(workflow: TaskWorkflow, queue: EscalationQueue, tmp_
     worktree = tmp_path / 'wt'
     worktree.mkdir()
     workflow.worktree = worktree
-    workflow._steward_factory = _wip_interrupting_steward()
+    workflow._steward_factory = _wip_interrupting_steward(queue)
     assert await workflow._mark_blocked('synthetic failure') == WorkflowOutcome.REQUEUED
 
 
 async def _open_l1_override(workflow: TaskWorkflow, queue: EscalationQueue, tmp_path: Path) -> None:
     _submit(queue, severity='blocking', level=1)
     channel: asyncio.Queue = asyncio.Queue()
-    channel.put_nowait(StewardInterrupted('timeout', wip_commits_present=True))
+    channel.put_nowait(PublishedStewardOutcome(
+        'esc-earlier-l0', StewardInterrupted('timeout', wip_commits_present=True),
+    ))
     workflow._steward_outcome_channel = channel
-    assert isinstance(await workflow._await_steward_completion(), StewardReescalatedL1)
+    outcome = await workflow._await_steward_completion(escalation_id=None)
+    assert isinstance(outcome, StewardReescalatedL1)
 
 
 async def _steward_wait_timeout(workflow: TaskWorkflow, queue: EscalationQueue, tmp_path: Path) -> None:
@@ -537,7 +552,7 @@ class TestExitFinalizerNoOps:
         assert cleanups[-2:] == ['release_lane', 'cleanup_config_dir']
 
 
-def _recording_steward(started: list[str]) -> type:
+def _recording_steward(started: list[str], queue: EscalationQueue) -> type:
     """A steward that records its start and resolves at once."""
 
     class _Steward:
@@ -553,7 +568,7 @@ def _recording_steward(started: list[str]) -> type:
         async def start(self) -> None:
             started.append('started')
             assert self._channel is not None
-            self._channel.put_nowait(StewardResolved(resolution_text='resolved'))
+            _publish_for_pending_l0s(self._channel, queue, StewardResolved(resolution_text='resolved'))
 
         async def stop(self) -> None:
             pass
@@ -567,7 +582,8 @@ async def _post_merge_tail(workflow: TaskWorkflow, tmp_path: Path) -> list[str]:
     worktree.mkdir()
     workflow.worktree = worktree
     started: list[str] = []
-    workflow._steward_factory = _recording_steward(started)
+    assert workflow.escalation_queue is not None
+    workflow._steward_factory = _recording_steward(started, workflow.escalation_queue)
     workflow._run_merge_phase = AsyncMock(return_value=None)
     workflow._clear_merge_retry_pending = AsyncMock()
     workflow._clear_merge_phase_entered = AsyncMock()

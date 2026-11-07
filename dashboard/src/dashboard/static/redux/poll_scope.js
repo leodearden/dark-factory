@@ -66,6 +66,7 @@ const TAB_ENDPOINTS = Object.freeze({
     '/api/v2/dashboard/orchestrators',
     '/api/v2/dashboard/scheduler',
     '/api/v2/dashboard/invariants',
+    '/api/v2/dashboard/prds',
   ]),
   scheduler: Object.freeze(['/api/v2/dashboard/scheduler']),
   curator: Object.freeze(['/api/v2/dashboard/curator']),

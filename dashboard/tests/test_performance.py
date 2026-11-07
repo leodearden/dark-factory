@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 import aiosqlite
 import pytest
+from shared.task_transitions import WORKFLOW_OUTCOMES
 
 from dashboard.data import performance, redux_api
 from dashboard.data.datum import DatumState, validate_datum
@@ -2802,3 +2803,131 @@ class TestCancelOutcomesAreNotCounted:
         assert idle.value is not None and idle.value.to_wire()['paths'] == []
         for datum in cards.values():
             validate_datum(datum, CARDS_NOW)
+
+
+# ---------------------------------------------------------------------------
+# Every workflow outcome lands in a decided completion-path slice (task 6427)
+# ---------------------------------------------------------------------------
+
+# The slice a row with review_cycles=0, steward_invocations=0 and no
+# escalation lands in, transcribed BY HAND: deliberately not derived from
+# performance.py's _READING_BY_OUTCOME, so it is an independent oracle. None
+# means the row is counted by no slice.
+_SLICE_OF_A_CLEAN_ATTEMPT: dict[str, str | None] = {
+    'done': 'one-pass',
+    # Passed; its merge waits on a train or a coalesced merge, and the merge
+    # worker usually flips it done with no new row. Some are instead re-run in
+    # a later orchestrator run and record a done row too: the card counts
+    # attempts, not tasks, so such a task reads as two passes. Accepted.
+    'merge-deferred': 'one-pass',
+    # The exit re-pends the row and the scheduler re-dispatches it.
+    'requeued': 'requeued',
+    # Never a run() exit; the orchestrator's exit router reads it as a requeue.
+    'planned': 'requeued',
+    'blocked': 'blocked',
+    # The exit leaves the row 'blocked', the same as a block, with an L1 open.
+    'escalated': 'blocked',
+    # Cancels: see TestCancelOutcomesAreNotCounted.
+    'cancelled': None,
+    'soft-cancelled': None,
+}
+
+
+@contextlib.asynccontextmanager
+async def _runs_conn_of(tmp_path, rows: list[tuple]):
+    db_path = _make_runs_db(tmp_path, 'taxonomy.db', rows)
+    async with aiosqlite.connect(str(db_path)) as conn:
+        conn.row_factory = aiosqlite.Row
+        yield conn
+
+
+class TestCompletionPathTaxonomy:
+    """Each workflow outcome reads as one decided completion-path slice: a
+    merge-deferred attempt passed, a requeue is its own slice, an escalation
+    is a block, and a cancel is not counted."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_history_cache(self):
+        _HISTORY_CACHE.clear()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('outcome', sorted(WORKFLOW_OUTCOMES))
+    async def test_a_clean_attempt_lands_in_its_outcomes_slice(
+        self, tmp_path, empty_escalations_dir, outcome,
+    ):
+        assert outcome in _SLICE_OF_A_CLEAN_ATTEMPT, (
+            f'no completion-path reading has been decided for outcome {outcome!r}: '
+            'add it to dashboard/src/dashboard/data/performance.py::_READING_BY_OUTCOME '
+            'and to this oracle'
+        )
+        rows = [_task_row('t1', 'proj', CARDS_NOW - timedelta(hours=1), outcome=outcome)]
+        async with _runs_conn_of(tmp_path, rows) as conn:
+            result = await get_completion_paths(
+                conn, empty_escalations_dir, days=CARDS_DAYS, now=CARDS_NOW, projects=['proj'],
+            )
+        expected_slice = _SLICE_OF_A_CLEAN_ATTEMPT[outcome]
+        expected = [] if expected_slice is None else [
+            {'path': expected_slice, 'count': 1, 'pct': 100.0},
+        ]
+        assert result['proj'] == expected
+
+    @pytest.mark.asyncio
+    async def test_a_merge_deferred_attempt_is_sliced_by_how_it_passed(self, tmp_path):
+        at = CARDS_NOW - timedelta(hours=1)
+        rows = [
+            _task_row('m1', 'proj', at, outcome='merge-deferred'),
+            _task_row('m2', 'proj', at, outcome='merge-deferred', review_cycles=1),
+            _task_row('m3', 'proj', at, outcome='merge-deferred', steward_invocations=1),
+            _task_row('m4', 'proj', at, outcome='merge-deferred'),
+        ]
+        escalations_dir = _make_escalations_dir(
+            tmp_path, 'escalations', [{'task_id': 'm4', 'level': 1, 'status': 'resolved'}],
+        )
+        async with _runs_conn_of(tmp_path, rows) as conn:
+            result = await get_completion_paths(
+                conn, escalations_dir, days=CARDS_DAYS, now=CARDS_NOW, projects=['proj'],
+            )
+        assert {p['path']: p['count'] for p in result['proj']} == {
+            'one-pass': 1, 'multi-pass': 1, 'via-steward': 1, 'via-interactive': 1,
+        }
+
+    @pytest.mark.asyncio
+    async def test_the_one_pass_denominator_is_every_counted_attempt(
+        self, tmp_path, empty_escalations_dir,
+    ):
+        at = CARDS_NOW - timedelta(hours=1)
+        rows = [
+            _task_row('d1', 'proj', at),
+            _task_row('m1', 'proj', at, outcome='merge-deferred'),
+            _task_row('r1', 'proj', at, outcome='requeued'),
+            _task_row('b1', 'proj', at, outcome='blocked'),
+            _task_row('c1', 'proj', at, outcome='cancelled'),
+        ]
+        async with _runs_conn_of(tmp_path, rows) as conn:
+            result = await aggregate_completion_paths(
+                [conn], [empty_escalations_dir], days=CARDS_DAYS, now=CARDS_NOW,
+            )
+        assert {p['path']: p['pct'] for p in result['proj']} == {
+            'one-pass': 50.0, 'requeued': 25.0, 'blocked': 25.0,
+        }
+
+    @pytest.mark.asyncio
+    async def test_the_one_pass_history_reads_a_merge_deferred_pass_as_a_pass(self, tmp_path):
+        """The sparkline agrees with the card on what a pass is, while time to
+        complete stays done-only: a merge-deferred row's duration stops at the park."""
+        rows = [
+            _task_row('d1', 'proj', CARDS_NOW - timedelta(minutes=30), duration_ms=1000),
+            _task_row(
+                'm1', 'proj', CARDS_NOW - timedelta(minutes=40),
+                outcome='merge-deferred', duration_ms=9000,
+            ),
+            _task_row('r1', 'proj', CARDS_NOW - timedelta(minutes=50), outcome='requeued'),
+        ]
+        async with _runs_conn_of(tmp_path, rows) as conn:
+            history = await aggregate_performance_history([conn], days=CARDS_DAYS, now=CARDS_NOW)
+        assert history['proj']['one_pass_history'] == {
+            'labels': ['2026-09-30T11:00'], 'values': [66.7],
+        }
+        assert history['proj']['time_centiles_history'] == {
+            'labels': ['2026-09-30T11:00'], 'p50': [1000], 'p95': [1000],
+        }

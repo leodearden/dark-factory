@@ -71,6 +71,7 @@ const PALETTE = {
     'multi-pass':      'oklch(0.72 0.14 230)',
     'via-steward':     'oklch(0.80 0.14 80)',
     'via-interactive': 'oklch(0.72 0.10 50)',
+    'requeued':        'oklch(0.62 0.20 305)',
     'blocked':         'oklch(0.68 0.18 25)',
   },
 };

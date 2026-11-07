@@ -716,6 +716,9 @@ This expresses auto-deploys, act-then-ask gates, pure human gates, and (via
 [docs/task-authoring.md](docs/task-authoring.md)'s "Deterministic tasks" and
 "Milestones" sections for the full field reference; that's task-author-facing
 configuration, not architecture, so it isn't repeated here.
+The runner's internal dispatch state machine (idempotency and quiescence,
+the `before_done` sub-paths, the pure gate's proof ladder) is documented in
+[docs/deterministic-runner.md](docs/deterministic-runner.md).
 
 ---
 
@@ -739,7 +742,7 @@ matter most for reasoning about safety:
 
 | Role | Stage | Purpose | Model / effort / budget / turns |
 |---|---|---|---|
-| `architect` | PLAN | Explores the codebase, verifies premises, builds the TDD plan | opus / max / $15 / 100 |
+| `architect` | PLAN | Explores the codebase, verifies premises, builds the TDD plan | opus / xhigh / $15 / 180 |
 | `implementer` | EXECUTE | RED test → GREEN implementation → commit, per plan step; sandboxed | sonnet / max / $10 / 80 (routed to opus above ~12 steps or ~3 modules) |
 | `debugger` | VERIFY failure loop | Fixes test/lint/typecheck failures with minimal changes; sandboxed | sonnet / max / $5 / 50 |
 | `reviewer_comprehensive` | REVIEW | Sole reviewer: test quality, reuse, architecture, performance, robustness; read-only | opus / high / $5 / 30 (config resolves `reviewer_comprehensive` → the `reviewer` config key) |

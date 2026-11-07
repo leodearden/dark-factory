@@ -211,6 +211,10 @@ def split_managed_metadata(
 # be a behaviour CHANGE, not a no-op — see _build_config_dict.
 _MEM0_DEFAULT_EMBEDDING_DIMS = 1536
 
+# mem0's MemoryConfig.history_db_path value for a private, per-instance SQLite
+# history DB (SQLiteManager's own default).
+_MEM0_IN_MEMORY_HISTORY_DB = ':memory:'
+
 
 class Mem0Backend:
     """Lazily creates AsyncMemory instances keyed by project_id.
@@ -246,6 +250,7 @@ class Mem0Backend:
     def __init__(self, config: FusedMemoryConfig):
         self.config = config
         self._instances: dict[str, AsyncMemory] = {}
+        self._instance_creations: dict[str, asyncio.Task[AsyncMemory]] = {}
         self._read_timeout: float = config.queue.backend_read_timeout_seconds
         self._write_timeout: float = config.queue.backend_write_timeout_seconds
         self._async_qdrant_client = None  # Lazy async client for count/list ops
@@ -262,9 +267,11 @@ class Mem0Backend:
                     'collection_name': collection_name,
                     # Note the deliberate asymmetry with the embedder's
                     # 'embedding_dims' below: DIFFERENT key name, different
-                    # upstream semantics, different emission rule. This one
-                    # controls the dimensionality Qdrant CREATES the collection
-                    # with, and mem0's own default is already 1536
+                    # upstream semantics, different emission rule. mem0 would
+                    # CREATE the collection at this width, but never does:
+                    # _ensure_collection has already created it from the same
+                    # cfg.embedder.dimensions, so mem0's create_col always
+                    # finds it present and skips. mem0's own default is 1536
                     # (mem0/configs/vector_stores/qdrant.py), so emitting it
                     # unconditionally is a no-op at the shipped config.
                     #
@@ -272,11 +279,12 @@ class Mem0Backend:
                     # EXISTING deployment: neither key was plumbed before, so
                     # such a config was inert — mem0 created the collection at
                     # its own 1536 default and requested 1536-wide vectors.
-                    # Both now follow the config, but mem0's
-                    # QdrantDB.create_col short-circuits when the collection
-                    # already exists ('Collection ... already exists. Skipping
-                    # creation.'), leaving a 1536-wide collection that every
-                    # N-wide upsert then fails against at runtime. Changing
+                    # Both now follow the config, but an existing collection
+                    # keeps its old width: _ensure_collection's exists-check
+                    # skips it, and so does mem0's QdrantDB.create_col
+                    # ('Collection ... already exists. Skipping creation.'),
+                    # leaving a 1536-wide collection that every N-wide upsert
+                    # then fails against at runtime. Changing
                     # embedder.dimensions requires recreating and re-embedding
                     # the Qdrant collection; it is not a live-migratable knob.
                     'embedding_model_dims': cfg.embedder.dimensions,
@@ -349,18 +357,70 @@ class Mem0Backend:
                 'config': embedder_config,
             }
 
+        # Emitted ONLY when persistence is off: omitting the key keeps the
+        # shipped config byte-identical, and mem0 resolves its own shared
+        # $MEM0_DIR/history.db.
+        if not cfg.mem0.persist_history:
+            config_dict['history_db_path'] = _MEM0_IN_MEMORY_HISTORY_DB
+
         return config_dict
 
     async def _get_instance(self, scope: Scope) -> AsyncMemory:
-        """Lazily create and cache an AsyncMemory instance for a project."""
+        """Lazily create and cache an AsyncMemory instance for a project.
+
+        Concurrent first calls for a project await ONE shared creation, so its
+        failure reaches all of them at once and the next call starts afresh.
+        The creation is shielded: a cancelled caller does not cancel it for
+        the others.
+        """
         project_id = scope.project_id
-        if project_id not in self._instances:
-            collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
-            config_dict = self._build_config_dict(collection_name)
-            instance = AsyncMemory.from_config(config_dict)
-            self._instances[project_id] = instance
-            logger.info(f'Mem0 instance created for project {project_id} (collection: {collection_name})')
-        return self._instances[project_id]
+        instance = self._instances.get(project_id)
+        if instance is not None:
+            return instance
+        creation = self._instance_creations.get(project_id)
+        if creation is None:
+            creation = asyncio.create_task(self._create_instance(scope))
+            self._instance_creations[project_id] = creation
+            creation.add_done_callback(lambda _: self._instance_creations.pop(project_id))
+        return await asyncio.shield(creation)
+
+    async def _create_instance(self, scope: Scope) -> AsyncMemory:
+        collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
+        config_dict = self._build_config_dict(collection_name)
+        await self._ensure_collection(collection_name)
+        instance = AsyncMemory.from_config(config_dict)
+        self._instances[scope.project_id] = instance
+        logger.info(f'Mem0 instance created for project {scope.project_id} (collection: {collection_name})')
+        return instance
+
+    async def _ensure_collection(self, collection_name: str) -> None:
+        """Create the collection if absent, under this backend's own budgets (tests/test_mem0_collection_provisioning.py).
+
+        Gap, owned by task 8196: the shared client's socket timeout is
+        ``int(read budget)``, so a create slower than that fails as an
+        unattributed ``ResponseHandlingException`` before the write budget.
+        """
+        from qdrant_client.http import models as qmodels
+        from qdrant_client.http.exceptions import UnexpectedResponse
+
+        client = await self._get_async_qdrant()
+        if await self._timed_read(client.collection_exists(collection_name), 'collection_exists'):
+            return
+        try:
+            await self._timed_write(
+                client.create_collection(
+                    collection_name=collection_name,
+                    vectors_config=qmodels.VectorParams(
+                        size=self.config.embedder.dimensions,
+                        distance=qmodels.Distance.COSINE,
+                    ),
+                ),
+                'create_collection',
+            )
+        except UnexpectedResponse as exc:
+            # 409: another creator won between the exists check and the create.
+            if exc.status_code != 409:
+                raise
 
     async def _timed_read(self, awaitable: Awaitable[_T], op: str) -> _T:
         """``await_within`` under this backend's READ budget."""

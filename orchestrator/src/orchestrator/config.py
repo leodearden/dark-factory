@@ -50,6 +50,7 @@ from orchestrator.config_census_ignore import (  # noqa: F401 (re-exported for t
     audit_census_ignore_entries,
     parse_census_ignore_entries,
 )
+from orchestrator.implementer_brief_variant import ImplementerBriefVariant
 from orchestrator.routing import DEFAULT_ALLOWED_MODELS, DEFAULT_LADDER
 from orchestrator.shadow_types import ShadowShape
 from orchestrator.verify_admission_gate import AdmissionOrder
@@ -3674,6 +3675,11 @@ class OrchestratorConfig(BaseSettings):
 
     # Iteration limits
     max_execute_iterations: int = Field(default=10)
+    # Whole-plan or one-step implementer brief, and the bounds each implies:
+    # orchestrator/src/orchestrator/implementer_brief_variant.py (live-shadow-eval PRD decision 14).
+    implementer_brief_variant: ImplementerBriefVariant = Field(
+        default=ImplementerBriefVariant.WHOLE_PLAN,
+    )
     # Independent bound on progress-timeout+resume churn. A ceiling-kill of a
     # productive run (transcript_turns>0) followed by its resume counts as
     # ONE iteration against max_execute_iterations (see
@@ -6646,6 +6652,9 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # the shared live config object, so a flip applies from the next
         # merge attempt.
         'pre_merge_reverify',
+        # Flat field read at use by the brief, the EXECUTE cap and resolve_route off
+        # the shared live object (task 5385), like pre_merge_reverify.
+        'implementer_brief_variant',
         # EASY-backfill admission (task 3823 / PRD C7).  Explicit literals, not
         # a _submodel_leaf_paths group: these are FLAT top-level fields, not a
         # submodel.  Green-tier on purpose — PRD Open Q3 ships safety_factor

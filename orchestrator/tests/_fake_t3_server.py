@@ -8,7 +8,9 @@ streamable-HTTP ``/mcp`` endpoint, framed as a JSON body or as SSE frames.
 :func:`install_fake_t3_cli` writes an executable ``t3`` that answers
 ``--version`` and mints pairing codes on that server, the way the real CLI
 writes the real server's state; :func:`put_fake_t3_cli_on_path` installs it
-first on a test's PATH. :data:`DEAD_ORIGIN` is an origin nothing answers.
+first on a test's PATH. :meth:`FakeT3Server.write_paired_credential` stands in for
+a completed pairing, storing this host's credential for the server.
+:data:`DEAD_ORIGIN` is an origin nothing answers.
 
 WHERE THE SHAPES COME FROM.  Every canned payload and refusal is copied from
 T3 Code v0.1.6 (``~/src/t3code-v0.1.6``):
@@ -20,13 +22,19 @@ T3 Code v0.1.6 (``~/src/t3code-v0.1.6``):
 ``mcpOAuth`` group and the ``descriptor`` endpoint),
 ``packages/contracts/src/environment.ts::ExecutionEnvironmentDescriptor``,
 ``apps/server/src/mcp/McpHttpServer.ts`` (the 401 body),
+``apps/server/src/auth/PairingGrantStore.ts`` (``PAIRING_TOKEN_ALPHABET``,
+``PAIRING_TOKEN_LENGTH``: the pairing codes),
 ``apps/server/src/cliAuthFormat.ts::formatIssuedPairingCredential`` (the CLI's
 ``--json`` output) and effect's ``McpServer`` ``CallToolResult``.
 
-WHY A ``_``-PREFIXED SIBLING.  The lane's tests and its client's tests both
-drive this server; ``_mcp_transport_harness.py`` records the convention. No
-pytest fixtures live here, so no consumer imports one it never names: each
-test module wraps :meth:`FakeT3Server.running` in its own short fixture.
+WHY A ``_``-PREFIXED SIBLING.  Four test modules drive this server: the lane's
+(``test_spawn_t3_lane.py``), its client's (``test_t3_mcp_client.py``), the
+fake's own (``test_fake_t3_server.py``), and ``tests/scripts/test_spawn_claude.py``,
+which imports it by ``sys.path``; ``_mcp_transport_harness.py`` records the
+convention. No pytest fixtures live here, so no consumer imports one it never
+names: each test module wraps :meth:`FakeT3Server.running` in its own short
+fixture. A test plays T3's state per call with a :data:`ToolResponder` in
+``tool_replies``, such as :func:`replies_in_turn`; :data:`HANG_UP` drops one call.
 """
 
 from __future__ import annotations
@@ -40,14 +48,17 @@ import secrets
 import sys
 import threading
 import uuid
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from email.message import Message
-from enum import StrEnum
+from enum import Enum, StrEnum
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import parse_qs, urlencode, urlsplit
+
+from orchestrator import t3_mcp_client
 
 if TYPE_CHECKING:
     import pytest
@@ -60,6 +71,10 @@ FULL_ACCESS_SCOPES = ('orchestration:read', 'orchestration:operate', 'settings:w
 DEAD_ORIGIN = 'http://127.0.0.1:1'
 """Nothing answers here: binding port 1 needs root, so unlike a freed ephemeral
 port no concurrently running fake can be handed it."""
+PAIRING_CODE_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ'
+PAIRING_CODE_LENGTH = 12
+"""T3's ``PAIRING_TOKEN_ALPHABET`` and ``PAIRING_TOKEN_LENGTH``: no minted code
+begins with '-', so each one passes on argv as ``--code <code>`` the way an operator's does."""
 
 DESCRIPTOR_PATH = '/.well-known/t3/environment'
 REGISTER_PATH = '/oauth/mcp/register'
@@ -91,6 +106,32 @@ class ToolFailure:
 
 
 ToolReply = ToolSuccess | ToolFailure
+
+
+class _HangUp(Enum):
+    HANG_UP = 'hang-up'
+
+
+HANG_UP = _HangUp.HANG_UP
+"""A responder's answer that closes this one call's connection without a reply."""
+
+ToolAnswer = ToolReply | Literal[_HangUp.HANG_UP]
+ToolResponder = Callable[[Mapping[str, Any]], ToolAnswer]
+"""Called with each call's ``arguments`` (an empty dict when absent); the request is recorded first."""
+
+
+def replies_in_turn(*replies: ToolAnswer | ToolResponder) -> ToolResponder:
+    """Answer each call with the next of ``replies``, repeating the last; a responder among them is called."""
+    if not replies:
+        raise ValueError('replies_in_turn needs at least one reply')
+    pending, lock = list(replies), threading.Lock()
+
+    def respond(arguments: Mapping[str, Any]) -> ToolAnswer:
+        with lock:
+            reply = pending.pop(0) if len(pending) > 1 else pending[0]
+        return reply(arguments) if callable(reply) else reply
+
+    return respond
 
 
 @dataclass(frozen=True)
@@ -208,7 +249,9 @@ class FakeT3Server(ThreadingHTTPServer):
         """True puts a server-to-client ``ping`` bearing the client's own request id before each SSE reply."""
         self.hangs_up = False
         """True closes every connection without a reply, as a server dying mid-request does."""
-        self.tool_replies: dict[str, ToolReply] = {'t3_environment_read': _environment_read(environment_id, server_version)}
+        self.tool_replies: dict[str, ToolReply | ToolResponder] = {
+            't3_environment_read': _environment_read(environment_id, server_version)
+        }
         self.requests: list[RecordedRequest] = []
         self._lock = threading.Lock()
         self._pairing_codes: set[str] = set()
@@ -240,7 +283,7 @@ class FakeT3Server(ThreadingHTTPServer):
         self.tool_replies['t3_environment_read'] = _environment_read(environment_id, self.server_version)
 
     def add_pairing_code(self) -> str:
-        code = secrets.token_urlsafe(12)
+        code = ''.join(secrets.choice(PAIRING_CODE_ALPHABET) for _ in range(PAIRING_CODE_LENGTH))
         with self._lock:
             self._pairing_codes.add(code)
             self._issued_pairing_codes.append(code)
@@ -257,6 +300,24 @@ class FakeT3Server(ThreadingHTTPServer):
             self._tokens.add(token)
             self._issued_tokens.append(token)
         return token
+
+    def write_paired_credential(self, root: Path | str, *, access_token: str | None = None) -> Path:
+        """This host's credential for the server under fleet ``root``, on a bearer it issued unless one is given."""
+        paired_at = datetime.now(UTC).replace(microsecond=0)
+        credential = t3_mcp_client.Credential(
+            schema_version=t3_mcp_client.CREDENTIAL_SCHEMA_VERSION,
+            origin=self.origin,
+            environment_id=self.environment_id,
+            server_version=self.server_version,
+            access=t3_mcp_client.ACCESS,
+            client_id='mcp-client-1',
+            access_token=access_token if access_token is not None else self.issue_token(),
+            expires_at=paired_at + timedelta(days=30),
+            paired_at=paired_at,
+            paired_by=t3_mcp_client.PairedBy.SELF_PAIR,
+        )
+        t3_mcp_client.write_credential(credential, root=root)
+        return t3_mcp_client.credential_path(self.environment_id, root=root)
 
     def revoke_tokens(self) -> None:
         with self._lock:
@@ -314,7 +375,8 @@ class FakeT3Server(ThreadingHTTPServer):
             },
         )
 
-    def answer_post(self, path: str, headers: Message, body: Any) -> _Reply:
+    def answer_post(self, path: str, headers: Message, body: Any) -> _Reply | None:
+        """The reply to send, or None to close the connection without one."""
         if path == MCP_PATH:
             return self._mcp(headers, body)
         if not isinstance(body, dict):
@@ -393,7 +455,7 @@ class FakeT3Server(ThreadingHTTPServer):
         }
         return _json_reply(200, issued | self.token_reply_overrides)
 
-    def _mcp(self, headers: Message, body: Any) -> _Reply:
+    def _mcp(self, headers: Message, body: Any) -> _Reply | None:
         with self._lock:
             authorized = _bearer(headers.get('Authorization')) in self._tokens
         if not authorized:
@@ -429,10 +491,14 @@ class FakeT3Server(ThreadingHTTPServer):
             return _Reply(202)
         if body['method'] != 'tools/call':
             return self._framed(self._rpc_error(body['id'], -32601, f'Method not found: {body["method"]}'))
-        name = (body.get('params') or {}).get('name')
-        reply = self.tool_replies.get(name) if isinstance(name, str) else None
-        if reply is None:
+        params = body.get('params') or {}
+        name = params.get('name')
+        entry = self.tool_replies.get(name) if isinstance(name, str) else None
+        if entry is None:
             return self._framed(self._rpc_error(body['id'], -32602, f'Tool {name} not found'))
+        reply = entry(params.get('arguments') or {}) if callable(entry) else entry
+        if reply is HANG_UP:
+            return None
         return self._framed({'jsonrpc': '2.0', 'id': body['id'], 'result': _call_tool_result(reply)})
 
     @staticmethod
@@ -469,7 +535,9 @@ class _Handler(BaseHTTPRequestHandler):
         self.server.record(RecordedRequest('POST', path, self._header_map(), body))
         if self.server.hangs_up:
             return
-        self._send(self.server.answer_post(path, self.headers, body))
+        reply = self.server.answer_post(path, self.headers, body)
+        if reply is not None:
+            self._send(reply)
 
     def _header_map(self) -> dict[str, str]:
         return {name.lower(): value for name, value in self.headers.items()}

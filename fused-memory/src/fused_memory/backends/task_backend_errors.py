@@ -11,8 +11,15 @@ contract intact across the cutover.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, ClassVar
 
+from shared.declared_scope import DECLARED_SCOPE_METADATA_KEY, StampViolation
+from shared.followup_items import (
+    FOLLOWUP_ITEMS_METADATA_KEY,
+    FOLLOWUP_ITEMS_REFUSED_ERROR,
+    MAX_FOLLOWUP_ITEMS,
+    FollowupBundleInvalid,
+)
 from shared.task_deferral import DeferralRefusalCode
 
 TASKMASTER_TOOL_ERROR: str = 'TASKMASTER_TOOL_ERROR'
@@ -310,6 +317,83 @@ class DeferralWriteAuthorityError(TaskmasterError):
         }
 
 
+_DECLARED_SCOPE_WRITE_AUTHORITY_HINT = (
+    'metadata.declared_scope is machine-stamped once, at filing, by submit_task; '
+    'submit_task and update_task may not add, alter or remove it. An unchanged echo of '
+    "the stored record is accepted, so a metadata_mode='replace' payload must carry it "
+    'through verbatim. See docs/task-authoring.md §8.'
+)
+
+
+class DeclaredScopeWriteAuthorityError(TaskmasterError):
+    """Raised when a caller would add, alter or remove ``metadata.declared_scope``.
+
+    PRD plans/follow-up-filing-shape-prd.md §3 decision 7. ``reason`` names the arm the write
+    tripped and ``stored`` is the stamp on the row, None when it has none. Call
+    :meth:`to_error_dict` for the wire shape; callers branch on ``error == ERROR``.
+    """
+
+    ERROR: ClassVar[str] = 'declared_scope_write_authority'
+
+    def __init__(self, task_id: str | None, reason: StampViolation, stored: Any = None) -> None:
+        self.task_id = task_id
+        self.reason = reason
+        self.stored = stored
+        super().__init__(
+            'TASKMASTER_TOOL_ERROR', f'{reason.value}: {_DECLARED_SCOPE_WRITE_AUTHORITY_HINT}',
+        )
+
+    def to_error_dict(self) -> dict[str, Any]:
+        return {
+            'success': False,
+            'error': self.ERROR,
+            'error_type': type(self).__name__,
+            'task_id': self.task_id,
+            'path': f'metadata.{DECLARED_SCOPE_METADATA_KEY}',
+            'reason': self.reason.value,
+            'stored': self.stored,
+            'hint': _DECLARED_SCOPE_WRITE_AUTHORITY_HINT,
+        }
+
+
+_FOLLOWUP_ITEMS_REFUSED_HINT = (
+    f'metadata.followup_items is a bundle of 1..{MAX_FOLLOWUP_ITEMS} observations with unique '
+    'keys, and every item file must also be in metadata.files. submit_task derives each item '
+    'key and origin_task and the top-level escalation_id and suggestion_hash, so do not send '
+    'them. Nothing was filed. See docs/task-authoring.md §8.'
+)
+
+
+class FollowupItemsRefusedError(TaskmasterError):
+    """Raised when a submission's ``metadata.followup_items`` breaks a create invariant.
+
+    PRD plans/follow-up-filing-shape-prd.md §4.1. Built from the shared
+    :class:`~shared.followup_items.FollowupBundleInvalid`: ``reason`` names the invariant, ``index``
+    the offending element when there is one, and ``detail`` the offending values. Call
+    :meth:`to_error_dict` for the wire shape; callers branch on ``error == ERROR`` and ``reason``.
+    """
+
+    ERROR: ClassVar[str] = FOLLOWUP_ITEMS_REFUSED_ERROR
+
+    def __init__(self, refusal: FollowupBundleInvalid) -> None:
+        self.reason = refusal.reason
+        self.index = refusal.index
+        self.detail = refusal.detail
+        super().__init__('TASKMASTER_TOOL_ERROR', str(refusal))
+
+    def to_error_dict(self) -> dict[str, Any]:
+        return {
+            'success': False,
+            'error': self.ERROR,
+            'error_type': type(self).__name__,
+            'path': f'metadata.{FOLLOWUP_ITEMS_METADATA_KEY}',
+            'reason': self.reason.value,
+            'index': self.index,
+            'detail': self.detail,
+            'hint': _FOLLOWUP_ITEMS_REFUSED_HINT,
+        }
+
+
 _METADATA_NOT_AN_OBJECT_HINT = (
     'update_task metadata must be a JSON object: a dict, or a JSON string '
     'that encodes one. Nothing was written. Under merge/additive, send an '
@@ -460,6 +544,8 @@ __all__ = [
     'DoneProvenanceWriteAuthorityError',
     'DefectRecordsWriteAuthorityError',
     'DeferralWriteAuthorityError',
+    'DeclaredScopeWriteAuthorityError',
+    'FollowupItemsRefusedError',
     'MetadataNotAnObjectError',
     'MetadataTooDeepError',
     'AppendUnsupportedFieldError',

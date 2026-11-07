@@ -31,13 +31,14 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from collections import Counter
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sized
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeGuard
 
 # NOTE: this module is executed by absolute path from
 # skills/spawn/spawn-claude.sh and the SKILL.md verb lines with no venv,
@@ -233,6 +234,7 @@ class Display:
     tmux_target: a tmux target spec (e.g. ``'session:window.pane'``), for a
         'tmux' kind.
     t3_thread_id: the T3 Code thread hosting the session, for a 't3' kind.
+    t3_environment_id: the T3 environment that thread lives in, for a 't3' kind.
     """
 
     kind: str
@@ -240,6 +242,7 @@ class Display:
     wm_window_id: str | None = None
     tmux_target: str | None = None
     t3_thread_id: str | None = None
+    t3_environment_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -248,6 +251,7 @@ class Display:
             'wm_window_id': self.wm_window_id,
             'tmux_target': self.tmux_target,
             't3_thread_id': self.t3_thread_id,
+            't3_environment_id': self.t3_environment_id,
         }
 
     @classmethod
@@ -258,6 +262,7 @@ class Display:
             wm_window_id=data.get('wm_window_id'),
             tmux_target=data.get('tmux_target'),
             t3_thread_id=data.get('t3_thread_id'),
+            t3_environment_id=data.get('t3_environment_id'),
         )
 
 
@@ -280,17 +285,20 @@ class Question:
         return cls(text=data['text'], asked_at=data['asked_at'])
 
 
+def _is_strict_int(value: object) -> TypeGuard[int]:
+    """An int that is not a bool: Python's ``True`` would otherwise pass as int 1."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 def _coerce_owner_pid(value: Any) -> int | None:
     """Read ``claude_owner_pid`` from a record body, tolerating junk.
 
-    A bool is rejected before the int check (``bool`` IS an ``int`` in
-    Python, and ``True`` would silently become pid 1). Anything else that is
-    not a positive int -- absent, null, a string, a float, 0, a negative --
-    reads as None, i.e. "no owner pid bound". Never raises: this is on
-    ``from_dict``'s path, and a hand-edited or older record body must not be
-    what breaks a session hook.
+    Anything that is not a positive ``_is_strict_int`` -- absent, null, a
+    bool, a string, a float, 0, a negative -- reads as None, i.e. "no owner
+    pid bound". Never raises: this is on ``from_dict``'s path, and a
+    hand-edited or older record body must not be what breaks a session hook.
     """
-    if isinstance(value, bool) or not isinstance(value, int):
+    if not _is_strict_int(value):
         return None
     return value if value > 0 else None
 
@@ -522,6 +530,59 @@ class DecisionState(StrEnum):
     DROPPED = 'dropped'
 
 
+class AuditVerdict(StrEnum):
+    """The sitting's verdict on an audited executor close."""
+
+    OK = 'ok'
+    WRONG = 'wrong'
+
+
+@dataclass(frozen=True)
+class AuditOutcome:
+    """One audit of a closed DecisionRecord: the verdict, the auditor's note, when, the class judged, and which close.
+
+    ``closed_at`` is the ``closed_at`` of the close the audit judged; ''
+    judges a close that recorded no instant.
+    """
+
+    verdict: AuditVerdict
+    note: str
+    audited_at: str
+    policy_class: str
+    closed_at: str = ''
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'verdict', AuditVerdict(self.verdict))
+        if not isinstance(self.audited_at, str):
+            raise ValueError(f'audited_at must be ISO-8601 text, got {self.audited_at!r}')
+        datetime.fromisoformat(self.audited_at)
+        if not isinstance(self.policy_class, str) or not self.policy_class:
+            raise ValueError(f'policy_class must be a non-empty class name, got {self.policy_class!r}')
+        if not isinstance(self.closed_at, str):
+            raise ValueError(f"closed_at must be ISO-8601 text or '', got {self.closed_at!r}")
+        if self.closed_at:
+            datetime.fromisoformat(self.closed_at)
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            'verdict': str(self.verdict),
+            'note': self.note,
+            'audited_at': self.audited_at,
+            'policy_class': self.policy_class,
+            'closed_at': self.closed_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> AuditOutcome:
+        return cls(
+            verdict=data['verdict'],
+            note=str(data.get('note') or ''),
+            audited_at=data['audited_at'],
+            policy_class=data['policy_class'],
+            closed_at=data.get('closed_at') or '',
+        )
+
+
 @dataclass
 class DecisionRecord:
     """One decision-record — ``<fleet_root>/decisions/<id>.json`` (Fleet Cockpit C1 B2, PRD §6.1).
@@ -585,6 +646,20 @@ class DecisionRecord:
         that: a carve-out close targets an L2 that has been open a while.
         Defaults to '' (not closed with evidence, or closed before this field
         existed).
+    audit_outcomes: the sitting's AuditOutcomes for this record's executor
+        closes, oldest first; empty when never audited. APPEND-ONLY: written
+        only by record_audit_outcome, which adds one outcome per audited close
+        and never replaces one. CUSTODY like ``closing_evidence``, and kept by
+        reopen_decision, because every audited close stays history the
+        per-class wrong rate counts. Each outcome names the close it judged
+        (its ``closed_at``), so a reopened record closed again is unaudited
+        (``current_audit`` is None) until that new close is audited in turn,
+        and both verdicts then count. Each names the policy class the
+        audit judged, copied from the escalation record at audit time:
+        escalation archives are pruned
+        (escalation/src/escalation/archive.py::DEFAULT_RETENTION_DAYS) and the
+        per-class counts must outlive them. The escalation record stays the
+        class's home for the close itself.
 
     Concurrency: unlike SessionRecord (single-writer-per-slug -- only the
     spawning session ever mutates its own record), a single decision id's
@@ -595,11 +670,12 @@ class DecisionRecord:
     set_decision_escalations_dir), the ``write-decision`` verb itself
     (task 3559), whose enrichment path folds a SECOND watcher's filing into
     an existing open record, -- for task 5376's sitting preparer -- the
-    ``close-decision`` verb (via close_decision_with_evidence), and the
-    ``reopen-decision`` verb (via reopen_decision, task 4835). The
+    ``close-decision`` verb (via close_decision_with_evidence), the
+    ``reopen-decision`` verb (via reopen_decision, task 4835), and the
+    sitting's audit verb (via record_audit_outcome, task 8425). The
     ``write-decision`` verb is the only mutator that may CREATE the record
     rather than merely mutate an existing one, so it races on a path where
-    nothing exists on disk yet. All six serialize their
+    nothing exists on disk yet. All seven serialize their
     read-modify-write span per-decision-id via
     decision_id_lock (a stable ``<id>.json.lock`` sidecar, mirroring task
     1609's escalation_id_lock), so a concurrent state-update, boost-update,
@@ -608,7 +684,8 @@ class DecisionRecord:
     read+mutate+write span is serialized against other callers on the same
     id. See update_decision_state/set_manual_boost/
     set_decision_escalations_dir/_run_write_decision/
-    close_decision_with_evidence/reopen_decision for the caller-facing note.
+    close_decision_with_evidence/reopen_decision/record_audit_outcome for the
+    caller-facing note.
     """
 
     id: str
@@ -626,6 +703,7 @@ class DecisionRecord:
     closing_evidence: str = field(default='', kw_only=True)
     closed_at: str = field(default='', kw_only=True)
     record_slug: str = field(default='', kw_only=True)
+    audit_outcomes: tuple[AuditOutcome, ...] = field(default=(), kw_only=True)
 
     @property
     def linked_session_slug(self) -> str | None:
@@ -638,6 +716,12 @@ class DecisionRecord:
         field directly.
         """
         return self.record_slug or self.session_id or None
+
+    @property
+    def current_audit(self) -> AuditOutcome | None:
+        """The outcome that judged the close this record carries now, else None."""
+        return next((outcome for outcome in reversed(self.audit_outcomes)
+                     if outcome.closed_at == self.closed_at), None)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -656,6 +740,7 @@ class DecisionRecord:
             'closing_evidence': self.closing_evidence,
             'closed_at': self.closed_at,
             'record_slug': self.record_slug,
+            'audit_outcomes': [outcome.to_dict() for outcome in self.audit_outcomes],
         }
 
     @classmethod
@@ -681,6 +766,7 @@ class DecisionRecord:
             closing_evidence=data.get('closing_evidence') or '',
             closed_at=data.get('closed_at') or '',
             record_slug=data.get('record_slug') or '',
+            audit_outcomes=_audit_outcomes_of(data.get('audit_outcomes')),
         )
 
     def to_json(self) -> str:
@@ -689,6 +775,14 @@ class DecisionRecord:
     @classmethod
     def from_json(cls, raw: str) -> DecisionRecord:
         return cls.from_dict(json.loads(raw))
+
+
+def _audit_outcomes_of(value: Any) -> tuple[AuditOutcome, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list) or not all(isinstance(item, Mapping) for item in value):
+        raise ValueError(f'audit_outcomes must be a list of mappings or null, got {value!r}')
+    return tuple(AuditOutcome.from_dict(item) for item in value)
 
 
 # ---------------------------------------------------------------------------
@@ -1315,8 +1409,8 @@ def _mutate_decision(
 
     The single implementation of the field-setter body shared by
     update_decision_state, set_manual_boost, set_decision_escalations_dir
-    (task 3640 amendment), close_decision_with_evidence (task 5376) and
-    reopen_decision (task 4835). Those
+    (task 3640 amendment), close_decision_with_evidence (task 5376),
+    reopen_decision (task 4835) and record_audit_outcome (task 8425). Those
     are the public, caller-facing names and keep their own docstrings; this holds the parts that MUST NOT diverge
     between them -- the lock placement, the read, the write, and the
     fail-soft except-tuple.
@@ -1569,7 +1663,9 @@ def reopen_decision(
     DecisionReopenRefused. Clears ``closing_evidence`` and ``closed_at``,
     because a close never overwrites evidence, so a re-opened gate could
     otherwise never be closed with evidence again. Every other field is kept,
-    ``filed_at`` and ``manual_boost`` included (custody). It is reopen-only
+    ``filed_at``, ``manual_boost`` and ``audit_outcomes`` included (custody);
+    each kept outcome names the close it judged, so the record's next close is
+    unaudited until it is audited in turn. It is reopen-only
     rather than a generic state setter, which would bypass the evidence-quoting
     close; see plans/4835-decision-plumbing-decisions.md.
 
@@ -1585,6 +1681,69 @@ def reopen_decision(
         record.closed_at = ''
 
     return _mutate_decision(decision_id, _reopen, caller='reopen_decision', root=root)
+
+
+class DecisionAuditRefused(Exception):
+    """record_audit_outcome refused; the record is untouched and the message names why.
+
+    Not a ValueError, for DecisionCloseRefused's reason: _mutate_decision
+    absorbs ValueError, and a refusal must reach its caller.
+    """
+
+
+def record_audit_outcome(
+    decision_id: str,
+    verdict: AuditVerdict,
+    note: str,
+    root: Path | str | None = None,
+    *,
+    expected_project: str,
+    expected_escalations_dir: str | Path,
+    audited_at: str,
+    policy_class: str,
+    closed_at: str,
+) -> DecisionRecord | None:
+    """Record the sitting's *verdict* on *decision_id*'s close, in ONE locked read-modify-write.
+
+    The caller names the record exactly as for close_decision_with_evidence,
+    and any other record at that id raises DecisionAuditRefused. *closed_at*
+    is the ``closed_at`` of the close the auditor judged; DecisionAuditRefused
+    also meets a record with no closing evidence (nothing was closed to
+    audit), one whose close is no longer that one (reopened, or closed
+    again), and one whose current close already carries an outcome (never
+    overwritten). The outcome is APPENDED to ``audit_outcomes``: one that
+    judged an earlier close of a reopened record is kept, so both count.
+    *policy_class* is the class the audit judged. A malformed
+    verdict, stamp or class raises ValueError before the lock.
+
+    Otherwise FAIL-SOFT like its sibling setters: None (logged at ERROR) on a
+    missing file, a corrupt body, a lock fault or a write failure.
+    """
+    outcome = AuditOutcome(
+        verdict=verdict, note=note, audited_at=audited_at, policy_class=policy_class, closed_at=closed_at,
+    )
+    wanted = _decision_identity(expected_project, expected_escalations_dir)
+
+    def _audit(record: DecisionRecord) -> None:
+        _refuse_unless_named_record(decision_id, record, wanted, DecisionAuditRefused, action='audited')
+        if not record.closing_evidence:
+            raise DecisionAuditRefused(
+                f'{decision_id} carries no closing evidence; only a closed record is audited'
+            )
+        if record.closed_at != closed_at:
+            raise DecisionAuditRefused(
+                f'{decision_id} now carries the close of {record.closed_at!r}, not the judged close of '
+                f'{closed_at!r}; it was reopened or closed again since it was drawn'
+            )
+        current = record.current_audit
+        if current is not None:
+            raise DecisionAuditRefused(
+                f'{decision_id} was already audited {current.verdict!s} at {current.audited_at}; '
+                'refusing to overwrite it'
+            )
+        record.audit_outcomes = (*record.audit_outcomes, outcome)
+
+    return _mutate_decision(decision_id, _audit, caller='record_audit_outcome', root=root)
 
 
 def _merge_queue_and_escalation_id(
@@ -1716,10 +1875,11 @@ def merge_decision_enrichment(
     - ``id`` / ``project``   -- from *existing*. The id is the JOIN KEY: it
       is the whole reason these two records are being merged.
     - ``filed_at`` / ``state`` / ``manual_boost`` / ``closing_evidence`` /
-      ``closed_at`` -- from *existing* (CUSTODY). A second watcher must not
-      restamp queue age, re-open or close the record (that is
-      update_decision_state's job), reset an operator's C5 cockpit boost, or
-      erase the evidence a close recorded or when it recorded it.
+      ``closed_at`` / ``audit_outcomes`` -- from *existing* (CUSTODY). A second
+      watcher must not restamp queue age, re-open or close the record (that is
+      update_decision_state's job), reset an operator's C5 cockpit boost,
+      erase the evidence a close recorded or when it recorded it, or erase
+      the sitting's audit of that close.
     - ``text`` / ``task_id`` / ``session_id`` / ``record_slug`` /
       ``options`` -- keep *existing* where it is non-empty; take *incoming*
       ONLY to fill a field the first filer left empty/None. That fill is what
@@ -1804,8 +1964,8 @@ def merge_same_queue_refile(
       in the cockpit queue forever. This is the whole reason the same-queue
       case is not just routed through merge_decision_enrichment.
     - ``filed_at`` / ``state`` / ``manual_boost`` / ``closing_evidence`` /
-      ``closed_at`` -- from *existing* (CUSTODY), and it is the SAME set
-      merge_decision_enrichment keeps, because custody does not depend on
+      ``closed_at`` / ``audit_outcomes`` -- from *existing* (CUSTODY), and it
+      is the SAME set merge_decision_enrichment keeps, because custody does not depend on
       which queue re-filed. ``closing_evidence`` and ``closed_at`` travel
       with ``state``: they are the evidence for the disposition being held
       and when it was recorded. ``filed_at``
@@ -1891,6 +2051,7 @@ def merge_same_queue_refile(
         manual_boost=existing.manual_boost,
         closing_evidence=existing.closing_evidence,
         closed_at=existing.closed_at,
+        audit_outcomes=existing.audit_outcomes,
     )
 
 
@@ -1931,11 +2092,13 @@ def decision_id_lock(decision_id: str, root: Path | str | None = None) -> Iterat
             record.some_field = new_value
             write_decision(record, root=root)
     """
-    lock_path = Path(str(decision_path_for_id(decision_id, root=root)) + '.lock')
-    # Defensively create the parent dir so a caller can take this lock
-    # without a decision having been written for this id yet -- note this
-    # means the sidecar itself is created even for an unknown id (see
-    # ORPHAN SIDECARS above).
+    with _exclusive_sidecar_lock(Path(str(decision_path_for_id(decision_id, root=root)) + '.lock')):
+        yield
+
+
+@contextlib.contextmanager
+def _exclusive_sidecar_lock(lock_path: Path) -> Iterator[None]:
+    """Blocking exclusive flock on the stable sidecar *lock_path*, creating it and its parent."""
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
     try:
@@ -2567,20 +2730,6 @@ TERMINAL_TTL = timedelta(hours=24)
 """How long a terminal (EXITED/FAILED_TO_START) record survives after its
 last write before the reaper reclaims it, regardless of launcher_pid."""
 
-REAP_BATCH_LIMIT = 100
-"""Per-call cap on how many stale record dirs a single OPPORTUNISTIC
-(spawn-path) reap removes -- see reap_stale_records' `limit` param. Caps a
-single spawn's synchronous prune cost regardless of how large the on-disk
-backlog has grown, at the cost of draining a large backlog over several
-spawns rather than in one call. Drain order follows reap_stale_records'
-sorted(iterdir()) (directory-name) order, not oldest-first, so if the
-on-disk backlog ever grows faster than spawns can drain it,
-alphabetically-later stale dirs can persist longer than
-alphabetically-earlier ones (TERMINAL_TTL eligibility itself is unaffected
-either way). The CLI `reap` verb (_run_reap) stays unbounded (limit=None)
-so an operator wanting a full, immediate drain can still clear the entire
-backlog in a single invocation."""
-
 NON_TERMINAL_HEARTBEAT_TTL = timedelta(hours=1)
 """How long a non-terminal record survives with a dead launcher_pid and no
 fresh write (heartbeat) before the reaper reclaims it. A live launcher_pid
@@ -2653,7 +2802,6 @@ def reap_stale_records(
     root: Path | str | None = None,
     *,
     now: datetime | None = None,
-    limit: int | None = None,
 ) -> list[ReapedSessionRecord]:
     """Sweep ``<root>/sessions/*/`` and remove stale session-record directories.
 
@@ -2681,20 +2829,6 @@ def reap_stale_records(
 
     *now* is injectable for deterministic tests; defaults to the real UTC
     clock.
-
-    *limit* is None (the default) for an unbounded full sweep -- today's
-    behavior, unchanged. A positive int stops the sweep once *limit*
-    directories have actually been removed, bounding the rmtree work (the
-    dominant reclamation cost) per call -- this is what lets an
-    opportunistic per-spawn caller stay cheap regardless of backlog size.
-    The directory *scan* itself is NOT bounded by *limit* in the worst
-    case: directories are visited in sorted(iterdir()) (name) order and the
-    sweep only breaks after a removal, so if enough kept (non-stale)
-    directories sort ahead of the *limit*-th stale one, every one of them
-    is still stat'd and read before the sweep stops -- the scan remains
-    O(N) in the total directory count, short-circuiting only once *limit*
-    removals have occurred. A directory whose removal is attempted and
-    fails (logged, see below) does NOT count against *limit*.
     """
     if now is None:
         now = datetime.now(UTC)
@@ -2741,8 +2875,6 @@ def reap_stale_records(
                 logger.error('reap_stale_records: failed to remove %s', slug_dir, exc_info=True)
                 continue
             reaped.append(ReapedSessionRecord(path=slug_dir, session_slug=slug, reason=reason))
-            if limit is not None and len(reaped) >= limit:
-                break
 
     return reaped
 
@@ -2860,18 +2992,23 @@ of every reserved range avoids that ambiguity."""
 
 
 def _mark_exited_if_still_non_terminal(
-    slug: str, root: Path | str | None, *, exit_code: int
+    slug: str,
+    root: Path | str | None,
+    *,
+    exit_code: int,
+    still_applies: Callable[[SessionRecord], bool] | None = None,
 ) -> SessionRecord | None:
     """TOCTOU-safe terminal stamp used by the liveness sweeps and ``mark_session_folded``.
 
     Re-reads *slug* itself -- a second, fresher read than the sweep's own
     caller-side liveness check -- and, ONLY if status is still non-terminal
-    on THIS read, stamps status=EXITED/exit_code=*exit_code* and writes.
-    Returns the marked record, or ``None`` if a concurrent writer (most
-    plausibly spawn-claude.sh's own ``finish()``) already made the record
-    terminal in the narrow window between the sweep's own liveness check
+    on THIS read and *still_applies* (when given) accepts THIS read, stamps
+    status=EXITED/exit_code=*exit_code* and writes. Returns the marked
+    record, or ``None`` if a concurrent writer (most plausibly
+    spawn-claude.sh's own ``finish()``, or a hook re-binding the record)
+    already changed it in the window between the sweep's own liveness check
     and this call -- in which case nothing is written, so that writer's
-    real exit_code is never clobbered by the orphan sentinel.
+    real state is never clobbered by the orphan sentinel.
 
     Deliberately a narrow variant rather than a change to ``update_status``
     itself: ``update_status``'s own ``exit`` CLI subcommand caller is an
@@ -2881,6 +3018,8 @@ def _mark_exited_if_still_non_terminal(
     """
     record = read_record(slug, root=root)
     if record.status in TERMINAL_STATUSES:
+        return None
+    if still_applies is not None and not still_applies(record):
         return None
     record.status = Status.EXITED
     record.exit_code = exit_code
@@ -2921,9 +3060,9 @@ def mark_orphaned_sessions_exited(
     unswept. A detached session that goes quieter than
     ``NON_TERMINAL_HEARTBEAT_TTL`` (1h) between hook events -- e.g. one long
     tool-heavy turn with no intervening Notification/Stop -- can therefore
-    be marked EXITED while genuinely still running, driven opportunistically
-    from every other spawn's ``_run_launching``/from ``reap`` (not just an
-    explicit CLI ``reap``, unlike before this task). This is self-correcting
+    be marked EXITED while genuinely still running, by the reap every other
+    spawn's ``_run_launching`` starts, not just by an explicit CLI ``reap``.
+    This is self-correcting
     -- its next hook event calls ``refresh_record`` and flips status back --
     but there is a real window of an incorrectly-EXITED cockpit row. Reusing
     the pre-existing ``NON_TERMINAL_HEARTBEAT_TTL`` (rather than introducing
@@ -3229,6 +3368,17 @@ def _wmctrl_live_window_ids(
     return live_ids
 
 
+def _wm_window_id_of(record: SessionRecord) -> str | None:
+    """Normalized window id of a wm-display *record*; ``None`` for other displays or a bad id."""
+    if record.display is None or record.display.kind != DisplayKind.WM.value:
+        return None
+    return _normalize_wm_window_id(record.display.wm_window_id)
+
+
+def _names_window(window_id: str) -> Callable[[SessionRecord], bool]:
+    return lambda record: _wm_window_id_of(record) == window_id
+
+
 def mark_windowless_wm_sessions_exited(
     root: Path | str | None = None,
     *,
@@ -3244,8 +3394,8 @@ def mark_windowless_wm_sessions_exited(
     record younger than ``NON_TERMINAL_HEARTBEAT_TTL``). Folding the two
     predicates together would muddy ``mark_orphaned_sessions_exited``'s
     "mirrors reap_stale_records' stale_pid predicate EXACTLY" contract, and
-    would run ``wmctrl -l`` on every liveness check instead of once per
-    sweep.
+    would run ``wmctrl -l`` on every liveness check instead of at most twice
+    per sweep.
 
     Scope: only records with ``display is not None and display.kind ==
     DisplayKind.WM.value`` are ever considered. A ``display=None`` (headless
@@ -3257,23 +3407,33 @@ def mark_windowless_wm_sessions_exited(
     we cannot prove the window is gone, so we fail toward keep and defer to
     the pid/TTL sweep.
 
-    HARD fail-soft: resolves ``live_ids = _wmctrl_live_window_ids(run)``
-    exactly once per sweep; if that is ``None`` (missing ``wmctrl`` binary, a
-    nonzero return code, or any exception -- see its docstring), this
-    returns ``[]`` immediately and marks NOTHING. "No window evidence" (a
-    headless host, an X11 hiccup) must never be treated as "every window is
-    gone" -- that would mass-mark every wm session on the fleet EXITED.
+    HARD fail-soft: if the first ``_wmctrl_live_window_ids(run)`` probe is
+    ``None`` (missing ``wmctrl`` binary, a nonzero return code, or any
+    exception -- see its docstring), this returns ``[]`` immediately and
+    marks NOTHING. "No window evidence" (a headless host, an X11 hiccup)
+    must never be treated as "every window is gone" -- that would mass-mark
+    every wm session on the fleet EXITED.
+
+    Two-probe rule: a record is marked only on a probe taken AFTER it was
+    read. ``_run_launching``'s detached reap runs concurrently with the
+    spawned session's SessionStart hook, which writes its ``wm_window_id``
+    (``orchestrator/src/orchestrator/session_hooks.py::_resolve_display``),
+    so a window id can land after the first probe; the pass therefore only
+    collects candidates absent from the first probe, and one confirming
+    probe after the pass decides (``None`` again marks nothing). The mark
+    itself re-reads the record and goes ahead only if it still names the
+    candidate's window, so a hook that re-bound it to a new window since
+    the pass read it is left alone.
 
     Self-correction trade-off (mirrors ``mark_orphaned_sessions_exited``): a
-    single missed/late ``wmctrl`` probe (e.g. racing a window remap) can mark
-    a still-live session EXITED. This is deliberately accepted -- the
+    window that both probes miss (e.g. racing a window remap) can mark a
+    still-live session EXITED. This is deliberately accepted -- the
     session's next hook event calls ``refresh_record`` and flips status back
-    -- rather than adding retries here, keeping this sweep a single
-    fail-soft decision point per call.
+    -- rather than adding retries beyond the confirming probe.
 
     Known trade-off for a multi-DISPLAY fleet (reviewer-flagged): ``wmctrl
     -l`` only reports windows on the single X ``DISPLAY`` the invoking
-    process is connected to -- whatever ``_run_launching``/``_run_reap`` (or
+    process is connected to -- whatever ``_run_launching``/``run_reap`` (or
     a directly-invoked CLI) happens to inherit as ``$DISPLAY`` -- never
     every display a fleet's sessions might be spread across. A session
     whose window genuinely lives on a DIFFERENT display than the one this
@@ -3312,6 +3472,7 @@ def mark_windowless_wm_sessions_exited(
     if not base.is_dir():
         return marked
 
+    candidates: list[tuple[str, str]] = []
     for slug_dir in sorted(base.iterdir()):
         if not slug_dir.is_dir():
             continue
@@ -3323,15 +3484,24 @@ def mark_windowless_wm_sessions_exited(
             continue  # missing/corrupt body -- reap_stale_records' 'corrupt' rule's job
         if record.status in TERMINAL_STATUSES:
             continue  # already terminal -- idempotent, never re-stamped
-        if record.display is None or record.display.kind != DisplayKind.WM.value:
-            continue  # tmux / headless -- stays on the pid/TTL path
-        normalized = _normalize_wm_window_id(record.display.wm_window_id)
-        if normalized is None or normalized in live_ids:
-            continue  # unprovable, or the window is still live
+        window_id = _wm_window_id_of(record)
+        if window_id is None or window_id in live_ids:
+            continue  # tmux / headless / unprovable id, or the window is still live
+        candidates.append((slug, window_id))
+
+    if not candidates:
+        return marked
+    confirmed_live_ids = _wmctrl_live_window_ids(run)
+    if confirmed_live_ids is None:
+        return marked  # the confirming probe yielded no evidence -- mark nothing.
+
+    for slug, window_id in candidates:
+        if window_id in confirmed_live_ids:
+            continue  # the window appeared after the first probe
 
         try:
             marked_record = _mark_exited_if_still_non_terminal(
-                slug, root, exit_code=ORPHAN_EXIT_CODE
+                slug, root, exit_code=ORPHAN_EXIT_CODE, still_applies=_names_window(window_id)
             )
         except (FileNotFoundError, CorruptSessionRecord, OSError):
             # A single unmarkable record (a concurrent-reap race, an
@@ -3357,6 +3527,151 @@ def mark_windowless_wm_sessions_exited(
             os.environ.get('DISPLAY'),
         )
     return marked
+
+
+# ---------------------------------------------------------------------------
+# Reap pipeline: one serialised, timed, fail-soft drain (task 7944)
+# ---------------------------------------------------------------------------
+
+REAP_LOCK_FILENAME = 'reap.lock'
+REAP_REPORT_FILENAME = 'last-reap.json'
+
+
+def reap_lock_path(root: Path | str | None = None) -> Path:
+    return fleet_root(root) / REAP_LOCK_FILENAME
+
+
+def reap_report_path(root: Path | str | None = None) -> Path:
+    return fleet_root(root) / REAP_REPORT_FILENAME
+
+
+@contextlib.contextmanager
+def reap_lock(root: Path | str | None = None) -> Iterator[None]:
+    """Blocking exclusive flock on ``<fleet_root>/reap.lock``, serialising reaps.
+
+    The sidecar is a stable lock target, created once and never renamed or
+    deleted, for the same reason as ``decision_id_lock``'s.
+    """
+    with _exclusive_sidecar_lock(reap_lock_path(root)):
+        yield
+
+
+@dataclass(frozen=True)
+class ReapPhase:
+    """One phase of ``run_reap``: its wall time, and either its count or its error."""
+
+    name: str
+    seconds: float
+    count: int | None
+    error: str | None
+
+
+@dataclass(frozen=True)
+class ReapReport:
+    """What one ``run_reap`` did, persisted at ``reap_report_path``.
+
+    ``requested_at`` to ``started_at`` is the time it queued on ``reap_lock``;
+    ``remaining_record_dirs`` is the registry's size after the drain, or
+    ``None`` if it could not be counted.
+    """
+
+    requested_at: str
+    started_at: str
+    finished_at: str
+    phases: tuple[ReapPhase, ...]
+    remaining_record_dirs: int | None
+
+    def to_json(self) -> str:
+        return json.dumps(dataclasses.asdict(self), indent=2) + '\n'
+
+
+def _run_reap_phase(
+    name: str, phase: Callable[[Path | str | None], Sized], root: Path | str | None
+) -> ReapPhase:
+    started = time.monotonic()
+    try:
+        count = len(phase(root))
+    except Exception as exc:
+        logger.error('run_reap: phase %s failed', name, exc_info=True)
+        return ReapPhase(
+            name=name,
+            seconds=time.monotonic() - started,
+            count=None,
+            error=f'{type(exc).__name__}: {exc}',
+        )
+    return ReapPhase(name=name, seconds=time.monotonic() - started, count=count, error=None)
+
+
+def _count_record_dirs(root: Path | str | None) -> int | None:
+    try:
+        with os.scandir(sessions_dir(root)) as entries:
+            return sum(1 for entry in entries if entry.is_dir())
+    except FileNotFoundError:
+        return 0
+    except OSError:
+        logger.warning('run_reap: could not count record dirs', exc_info=True)
+        return None
+
+
+def _a_reap_started_since(requested_at: datetime, root: Path | str | None) -> bool:
+    try:
+        last = json.loads(reap_report_path(root).read_text(encoding='utf-8'))
+        return datetime.fromisoformat(last['started_at']) > requested_at
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
+def run_reap(root: Path | str | None = None) -> ReapReport | None:
+    """Drain the registry: mark orphans/windowless-wm exited, THEN delete stale dirs and pointers.
+
+    The ``reap`` verb, for the operator and for ``_run_launching``'s detached
+    child alike. Concurrent calls queue on ``reap_lock``. A call whose turn
+    comes after a reap that STARTED after this call was requested returns
+    ``None`` without draining: that reap already covered everything this
+    call could see, so a burst of spawns costs one drain, not one each.
+
+    Mark-then-delete keeps a pass complete: a record either liveness sweep
+    marks exited this pass must not simultaneously be eligible for stale_pid
+    deletion (marking bumps its mtime, so it lands back within
+    reap_stale_records' NON_TERMINAL_HEARTBEAT_TTL heartbeat grace) -- it
+    only becomes reapable later, once it ages past TERMINAL_TTL as any other
+    terminal record does. ``mark_windowless_wm_sessions_exited`` runs here
+    alongside ``mark_orphaned_sessions_exited`` because it marks exactly the
+    live-pid / age<1h wm-display zombies the pid/TTL sweep is forced to keep.
+    ``reap_stale_session_pointers`` runs last so pointers to records removed
+    in this same pass go too.
+
+    Each phase is timed and fail-soft on its own, so one phase's fault never
+    skips the rest. The report is written atomically to
+    ``reap_report_path``: it is the only window into a detached child whose
+    stdio is DEVNULL. A failed report write is logged, not raised.
+    """
+    requested_at = datetime.now(UTC)
+    with reap_lock(root):
+        if _a_reap_started_since(requested_at, root):
+            logger.info('run_reap: a reap started since this one was requested; skipping')
+            return None
+        started_at = datetime.now(UTC)
+        phases = (
+            _run_reap_phase('mark_orphaned_sessions_exited', mark_orphaned_sessions_exited, root),
+            _run_reap_phase(
+                'mark_windowless_wm_sessions_exited', mark_windowless_wm_sessions_exited, root
+            ),
+            _run_reap_phase('reap_stale_records', reap_stale_records, root),
+            _run_reap_phase('reap_stale_session_pointers', reap_stale_session_pointers, root),
+        )
+        report = ReapReport(
+            requested_at=requested_at.isoformat(),
+            started_at=started_at.isoformat(),
+            finished_at=datetime.now(UTC).isoformat(),
+            phases=phases,
+            remaining_record_dirs=_count_record_dirs(root),
+        )
+        try:
+            _atomic_write_text(reap_report_path(root), report.to_json())
+        except OSError:
+            logger.error('run_reap: failed to write %s', reap_report_path(root), exc_info=True)
+    return report
 
 
 # ---------------------------------------------------------------------------
@@ -3785,6 +4100,10 @@ class HolderRecordState(StrEnum):
 class LeaseHolder:
     """Serialized identity of a lease's current holder -- the exact ``.lease`` file body.
 
+    Every field is type-checked at construction, and from_dict also rejects
+    a body that is not a JSON object, so a mistyped body is unreadable
+    rather than a holder.
+
     session_slug: a CLAIMANT-CHOSEN ownership token, NOT a session-registry
         record key. The skills prescribe ``<lease-role>-<project>-<pid>``
         (escalation-watcher's and recon-escalation-watcher's "Claiming the
@@ -3812,7 +4131,8 @@ class LeaseHolder:
         Its ONLY two roles are (i) the ownership comparison in
         ``_check_lease_ownership`` and (ii) naming the holder in a
         human-readable contention/refusal message.
-    pid: the holder process's pid; liveness is checked via _pid_alive.
+    pid: the holder process's pid; liveness is checked via _pid_alive. Any int, bool
+        excluded (0 is resolve_session_pid's degraded provably-dead value).
     start_ts: ISO-8601 timestamp of when this holder claimed the lease.
     record_slug: the holder's session-registry record key, resolved at claim
         time from *pid*'s pointer (``resolve_session_slug_for_pid``). '' when
@@ -3825,6 +4145,14 @@ class LeaseHolder:
     start_ts: str
     record_slug: str = ''
 
+    def __post_init__(self) -> None:
+        if not _is_strict_int(self.pid):
+            raise TypeError(f'LeaseHolder.pid must be an int (not a bool), got {self.pid!r}')
+        for name in ('session_slug', 'start_ts', 'record_slug'):
+            value = getattr(self, name)
+            if not isinstance(value, str):
+                raise TypeError(f'LeaseHolder.{name} must be a str, got {value!r}')
+
     def to_dict(self) -> dict[str, Any]:
         return {
             'session_slug': self.session_slug,
@@ -3835,11 +4163,14 @@ class LeaseHolder:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> LeaseHolder:
+        if not isinstance(data, dict):
+            raise TypeError(f'LeaseHolder body must be a JSON object, got {data!r}')
+        record_slug = data.get('record_slug')
         return cls(
             session_slug=data['session_slug'],
             pid=data['pid'],
             start_ts=data['start_ts'],
-            record_slug=data.get('record_slug') or '',
+            record_slug='' if record_slug is None else record_slug,
         )
 
     def to_json(self) -> str:
@@ -4601,44 +4932,44 @@ def parse_spawn_identity(
     return SpawnIdentity(role=role, project=project, task_id=task_id, escalation_id=escalation_id)
 
 
+def start_detached_reap(root: Path | str | None = None) -> bool:
+    """Start ``run_reap`` on *root*'s fleet in a detached ``reap`` child and return at once.
+
+    The child gets its own session, no inherited fds, DEVNULL stdio and ``/``
+    as its cwd, so it can never hold a caller's pipe open nor keep the
+    caller's worktree in use while it runs or queues. It inherits
+    ``os.environ`` (so ``DISPLAY`` carries over) with ``CLAUDE_FLEET_ROOT``
+    pinned to the absolute fleet root. A start failure is logged to stderr
+    only and returns False.
+    """
+    try:
+        env = {**os.environ, 'CLAUDE_FLEET_ROOT': str(fleet_root(root).absolute())}
+        subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), 'reap'],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            cwd='/',
+            env=env,
+            start_new_session=True,
+            close_fds=True,
+        )
+    except (OSError, ValueError, subprocess.SubprocessError):
+        logger.warning('start_detached_reap: could not start the reap child', exc_info=True)
+        return False
+    return True
+
+
 def _run_launching(env: Mapping[str, str]) -> str:
     """Build + write a LAUNCHING record from CLAUDE_SPAWN_* env; return its dir.
 
-    Also opportunistically drives the liveness sweeps
-    (``mark_orphaned_sessions_exited`` and, task 2934,
-    ``mark_windowless_wm_sessions_exited``) AND a bounded prune
-    (``reap_stale_records(limit=REAP_BATCH_LIMIT)``): none of these sweeps has
-    a periodic production driver of its own (CLI-only), so every spawn is
-    what drains prior orphaned (unclean-death) and windowless-wm records to
-    ``exited`` AND reclaims terminal/stale record dirs from disk -- the
-    backlog is bounded by spawn rate and self-limits as it drains, over
-    successive spawns for the bounded prune. Each sweep is wrapped in its OWN
-    fail-soft guard: a sweep fault must never raise here and must never write
-    to stdout, or it would corrupt the printed record dir spawn-claude.sh
-    captures into ``SESSION_RECORD_DIR`` -- and one sweep's fault must not
-    skip the others.
-
-    Cost model (reviewer-flagged): the pid/TTL sweep is O(N) in the number of
-    session directories -- one ``iterdir`` + one ``record.json`` parse per
-    peer, plus a second read+write for each record it actually marks -- and
-    runs synchronously in this call, so every spawn pays for scanning all
-    of its peers, not just its own write. The wm-window sweep adds ONE
-    ``wmctrl -l`` subprocess per spawn on top of that same O(N) scan (fail-
-    soft: a missing binary or nonzero rc just short-circuits it to a no-op,
-    per ``_wmctrl_live_window_ids``). This is a deliberate trade-off given
-    neither sweep has a periodic/out-of-band driver to run on instead (see
-    above); it is bounded and self-limiting (the backlog this drains only
-    shrinks the cost over time), acceptable at today's fleet sizes, and the
-    right place to revisit if spawn latency ever becomes a problem is a
-    dedicated periodic timer (systemd/cron) rather than this synchronous
-    call -- out of this task's module scope (would touch harness/systemd).
-    The bounded prune (``limit=REAP_BATCH_LIMIT``) caps its own scan/rmtree
-    cost per call regardless of backlog size; the CLI ``reap`` verb
-    (``_run_reap``) remains the operator's unbounded full-drain path.
-
-    Last, ``reap_stale_session_pointers`` drops dead-pid and dangling pid
-    pointers, under the same per-sweep guard; spawns are its only regular
-    driver.
+    Every spawn still drives the full mark-then-delete drain (``run_reap``),
+    now in a detached ``reap`` child (``start_detached_reap``), so the
+    launcher never waits on an O(N) registry pass. That child's stdio is
+    DEVNULL and a start failure only logs to stderr, so the printed record dir
+    stays the only stdout -- spawn-claude.sh captures it into
+    ``SESSION_RECORD_DIR``. Concurrent spawns' reaps serialise on
+    ``reap_lock``.
     """
     title = env.get('CLAUDE_SPAWN_TITLE', '') or ''
     prompt = env.get('CLAUDE_SPAWN_PROMPT', '') or ''
@@ -4668,14 +4999,7 @@ def _run_launching(env: Mapping[str, str]) -> str:
         self_exit=self_exit,
     )
     write_record(record)
-    with contextlib.suppress(Exception):
-        mark_orphaned_sessions_exited()
-    with contextlib.suppress(Exception):
-        mark_windowless_wm_sessions_exited()
-    with contextlib.suppress(Exception):
-        reap_stale_records(limit=REAP_BATCH_LIMIT)
-    with contextlib.suppress(Exception):
-        reap_stale_session_pointers()
+    start_detached_reap()
     return str(record_dir)
 
 
@@ -4719,31 +5043,6 @@ def _run_set_display(
         tmux_target=tmux_target,
         t3_thread_id=t3_thread_id,
     )
-
-
-def _run_reap() -> list[ReapedSessionRecord]:
-    """Run the canonical ``reap`` verb: mark orphans/windowless-wm exited, THEN delete stale dirs.
-
-    Mark-then-delete keeps `reap` complete: a record either liveness sweep
-    would mark exited this same pass must not simultaneously be eligible
-    for stale_pid deletion (marking bumps its mtime, so it lands back
-    within reap_stale_records' NON_TERMINAL_HEARTBEAT_TTL heartbeat grace) --
-    it only becomes reapable later, once it ages past TERMINAL_TTL as any
-    other terminal record does. This is why ``mark_windowless_wm_sessions_exited``
-    (task 2934) runs here too, alongside ``mark_orphaned_sessions_exited`` --
-    it reaps exactly the live-pid / age<1h wm-display zombies (a closed
-    terminal window with a still-alive launcher_pid) the pid/TTL sweep is
-    forced to keep, so `reap` must drive both before deleting.
-
-    ``reap_stale_session_pointers`` runs after the deletion so pointers to
-    records removed in this same pass go too; the return value still lists
-    only the removed record dirs.
-    """
-    mark_orphaned_sessions_exited()
-    mark_windowless_wm_sessions_exited()
-    reaped = reap_stale_records()
-    reap_stale_session_pointers()
-    return reaped
 
 
 def _run_lease_claim(
@@ -6045,7 +6344,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.t3_thread_id,
             )
         elif args.verb == 'reap':
-            _run_reap()
+            run_reap()
         elif args.verb == 'lease-claim':
             _run_lease_claim(
                 args.name, args.slug, args.pid, args.policy, record_slug=args.record_slug

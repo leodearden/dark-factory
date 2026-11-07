@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # scripts/lib_live_refs.sh — Shared live-reference /proc scanner for the warm-lane pool.
 #
-# Sourced by (both consumers, one definition — G7 no-lockstep-duplication):
+# Sourced by (three consumers, one definition — G7 no-lockstep-duplication):
 #   scripts/warm-lane-gc.sh        — the ε reclaim PRIMITIVE. Calls
 #       live_ref_present per lane (Pass 1) and per orphan (Pass 2), immediately
 #       before the reset/remove, while that entry's flock is already held. Every
@@ -12,6 +12,10 @@
 #   scripts/warm-lane-gc-sweep.sh  — the δ periodic backstop. Calls
 #       live_referenced_paths ONCE per sweep for the whole batch of dead-PID
 #       .reseed-trash candidates (_reap_stale_trash, task 5326).
+#   scripts/thin-warm-lane.sh      — release-thin. Calls live_ref_present
+#       ONCE per invocation (its T4 gate), under the held T3 <lane>.lock flock
+#       and immediately before its `rm -rf <lane>/target` (task 5307,
+#       README Delta 17).
 #
 # FUNCTIONS (defined when sourced):
 #   live_referenced_paths RP...

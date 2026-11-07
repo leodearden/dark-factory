@@ -1055,9 +1055,8 @@ def test_whole_tree_scanners_carry_module_level_timeout_mark() -> None:
     acts purely as a FLOOR and narrows nothing.
 
     NO SKIP-SELF, deliberately, and stated here because it inverts a convention
-    a reviewer will expect. Five sibling guards
+    a reviewer will expect. Four sibling guards
     (test_prune_chokepoint_guard.py::test_exactly_one_prune_argv_literal_inside_chokepoint,
-    test_event_loop_antipattern_guard.py::test_no_get_event_loop_in_orchestrator_tests,
     and the serial-merge-worker, reachback and lock-release guards) carry a
     ``_THIS_FILE``/``continue``
     skip-self because their forbidden pattern necessarily appears in their own

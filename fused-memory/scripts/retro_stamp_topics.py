@@ -87,15 +87,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import functools
-import importlib.util
 import json
 import logging
 import sys
-import types
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from fused_memory.eval.topic_registry import load_topic_registry
 from fused_memory.memory_metadata import is_canonical, normalize_supersedes
 from fused_memory.topic_slug import (
     TOPIC_SLUG_MAX_LEN,
@@ -178,56 +176,6 @@ CALIBRATION_FIXTURE_PATH = str(
 TOPIC_REGISTRY_PATH = str(
     _PACKAGE_ROOT / 'tests' / 'fixtures' / 'memory_eval_topic_registry.json'
 )
-
-_PROBE_SCRIPT_PATH = _PACKAGE_ROOT / 'scripts' / 'memory_eval_retrieval_probe.py'
-
-
-@functools.cache
-def _load_probe_module() -> types.ModuleType:
-    """Load ``memory_eval_retrieval_probe`` by path.
-
-    ``scripts/`` is not a package, so a plain import cannot reach it — the
-    same importlib idiom this script's own tests use to reach this script.
-
-    Memoized on THIS function, not merely in ``sys.modules``: repeat calls
-    must return the same module object the aliases below were bound from,
-    and ``sys.modules`` is a shared slot any other by-path loader of the
-    same script may overwrite with a freshly executed module (the probe's
-    own test module does exactly that).  Reading the slot on every call
-    would then hand back a module whose ``RegistryEntry`` is a *different
-    class object* than the one this module re-exports — silently breaking
-    any ``isinstance`` check across the seam.  ``sys.modules`` is still
-    consulted for the FIRST resolution so an already-imported probe is not
-    executed twice.
-    """
-    mod_name = 'memory_eval_retrieval_probe'
-    cached = sys.modules.get(mod_name)
-    if cached is not None:
-        return cached
-    spec = importlib.util.spec_from_file_location(mod_name, _PROBE_SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {_PROBE_SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    try:
-        spec.loader.exec_module(module)
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
-
-
-_probe = _load_probe_module()
-
-#: The registry loader and its model, REUSED rather than re-parsed.  It is
-#: required-strict (a malformed entry fails by name) and additive-tolerant —
-#: ``RegistryEntry.extra`` exists precisely so this consumer can load a
-#: richer entry without forcing a fixture rewrite; its docstring names 3201.
-load_topic_registry = _probe.load_topic_registry
-RegistryEntry = _probe.RegistryEntry
-TopicRegistry = _probe.TopicRegistry
-Canonical = _probe.Canonical
-Phrasing = _probe.Phrasing
 
 
 # ---------------------------------------------------------------------------

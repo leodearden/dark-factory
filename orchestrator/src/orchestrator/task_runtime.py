@@ -54,13 +54,14 @@ class TaskRuntimeState:
 
 
 def _derive_phase(plan: dict) -> str:
-    """Coarse PLAN/EXECUTE/DONE derivation from a ``plan.json`` dict's
-    ``steps`` — reproduces the dashboard's exact rule
-    (``dashboard/src/dashboard/data/orchestrator.py``'s
-    ``read_task_artifacts``, lines 279-296) for parity with today (Open-Q1:
-    ship coarse, not event_store phase).
+    """Coarse phase from a ``plan.json`` dict's ``steps`` (Open-Q1: ship
+    coarse, not event_store phase): no steps is PLAN, every step a dict with
+    status ``'done'`` is DONE, anything else is EXECUTE. A non-list ``steps``
+    is a malformed plan and raises.
     """
     steps = plan.get('steps', [])
+    if not isinstance(steps, list):
+        raise ValueError(f"plan.json 'steps' must be a list, got {type(steps).__name__}")
     total = len(steps)
     done = sum(1 for s in steps if isinstance(s, dict) and s.get('status') == 'done')
     if total == 0:
@@ -147,6 +148,19 @@ class _StartedFallbackCache:
         return self._map.get(task_id)
 
 
+def _count_iterations(artifacts: TaskArtifacts) -> int:
+    """Number of entries in ``iterations.jsonl``; a corrupted line is a read
+    failure, not an entry to skip, so the count can never undercount silently.
+    """
+    entries, corrupted = artifacts.read_iteration_log()
+    if corrupted:
+        raise ValueError(
+            f'iterations.jsonl: {len(corrupted)} of {len(entries) + len(corrupted)} lines '
+            f'are not valid JSON (first: {corrupted[0][:60]!r})'
+        )
+    return len(entries)
+
+
 def _read_task_entry(
     *,
     task_id: int,
@@ -159,10 +173,13 @@ def _read_task_entry(
     """Read one task's artifacts into a :class:`TaskRuntimeState`.
 
     Shared by both the pooled and non-pooled enumeration branches so B4
-    honest-zero and phase parity hold identically for both layouts.
+    honest-zero and phase parity hold identically for both layouts. The
+    read writes nothing: the plan comes from ``peek_plan``, not
+    ``read_plan``, so a live agent's malformed plan is never repaired here.
 
     INV-2 (structured-facts-at-failure): a per-task artifact READ FAILURE
-    (e.g. corrupt ``plan.json``/review JSON raising) is marked — ``error``
+    (e.g. corrupt ``plan.json``/review JSON raising, or a corrupted
+    ``iterations.jsonl`` line) is marked — ``error``
     carries a diagnostic string and ``loops``/``attempts``/``phase``/
     ``started`` are all ``None``, never a fabricated ``0``/``'PLAN'``.
     Honest-empty artifacts (``[]``/``{}``) are not a failure and continue to
@@ -180,10 +197,9 @@ def _read_task_entry(
     """
     artifacts = TaskArtifacts.for_task(worktree, str(task_id))
     try:
-        entries, _corrupted = artifacts.read_iteration_log()
-        loops = len(entries)
+        loops = _count_iterations(artifacts)
         attempts = len(artifacts.read_reviews())
-        phase = _derive_phase(artifacts.read_plan())
+        phase = _derive_phase(artifacts.peek_plan())
         started = artifacts.read_created_at() or started_fallback.get(str(task_id))
         error = None
     except Exception as exc:

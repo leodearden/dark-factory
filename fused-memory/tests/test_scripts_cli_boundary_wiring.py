@@ -43,6 +43,7 @@ _MIGRATED_SCRIPTS = [
     ('investigate_cross_graph_duplication.py', '--uuid'),
     ('measure_stale_status_snapshot_sweep.py', '--triage-note'),
     ('repair_recon_citation.py', '--target-run-id'),
+    ('run_write_triage_config_matrix.py', '--data-root'),
 ]
 """``(script, a flag its help must show)`` for every migrated script."""
 

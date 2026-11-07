@@ -96,15 +96,10 @@ class _HeldCurator:
             await self.release.wait()
         return PreparedCandidate(candidate=candidate, pool=[], pool_sizes={}, prompt_tokens=0)
 
-    async def curate_batch_prepared(
+    async def curate_prepared(
         self, prepared: list[PreparedCandidate], project_id: str, project_root: str,
     ) -> list[CuratorDecision]:
         return [self.decision for _ in prepared]
-
-    async def curate(
-        self, candidate: CandidateTask, project_id: str, project_root: str,
-    ) -> CuratorDecision:
-        return self.decision
 
     def note_created(self, project_id: str, candidate: CandidateTask, task_id: str) -> None:
         return None

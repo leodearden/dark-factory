@@ -115,6 +115,7 @@ from fused_memory.reconciliation.task_filter import (
     filter_task_tree,
 )
 from fused_memory.reconciliation.tree_read_instant import resolve_tree_read_instant
+from fused_memory.services.id_resolver import IdResolver
 from fused_memory.services.live_workflow_detector import (
     corroboration_for_task,
     is_pure_gate_metadata,
@@ -187,7 +188,7 @@ one spelling: a drifted literal would silently stop folding."""
 #     queue with a different reader.  Unlike BacklogPolicy, this filer does not
 #     close its own records either.  Level 0 keeps them off the orchestrator's
 #     level-1-only has_open_l1 guard surface; an unattended one still reaches
-#     L1 on its own, promoted by Harness._reap_orphan_l0_escalations once it
+#     a consumer on its own (the orphan reaper and its info-L0 router) once it
 #     ages past orphan_l0_timeout_secs with no live workflow on the task.
 #   See ReconciliationHarness._escalate() docstring for per-call-site details.
 _RECON_DEDUP_CONFIG = (
@@ -2805,6 +2806,11 @@ class ReconciliationHarness:
                 project_id=None,
                 project_root=None,
             ),
+            # This store serves every project, so create_server leaves the guard
+            # unscoped (resolver='no_project') until task 6910 scopes it per call.
+            prefix_resolver=lambda project_id, prefix: IdResolver.for_memory_service(
+                self.memory
+            ).resolve_prefix(project_id, prefix),
         )
         host = self.config.escalation_host
         port = self.config.escalation_port
@@ -2985,8 +2991,8 @@ class ReconciliationHarness:
         on this task", so an L1 here would turn a passive observation into a
         gate on dispatch.  See the `FINDING_TASK_ESCALATION_LEVEL` comment block in
         `finding_task_escalation.py` for the full guard-site population and for
-        why an unattended record still reaches L1 (via
-        `Harness._reap_orphan_l0_escalations`) without this filer asserting it.
+        why an unattended record still reaches a consumer (the orphan reaper and
+        its info-L0 router) without this filer asserting it.
 
         FAIL-SAFE: a queue hiccup is logged and swallowed — a reconciliation
         cycle is never aborted by a failed filing (mirroring

@@ -29,6 +29,7 @@ from shared.memory_eval_metrics import (
     serialize_metric_series,
 )
 
+from fused_memory.eval import retrieval_probe
 from fused_memory.reconciliation.index_health import summarize_index_health
 
 REPO_ROOT = Path(__file__).parents[2]
@@ -245,7 +246,7 @@ class TestTheE1SecondaryIsAValidM1Artifact:
 
     def test_the_briefing_task_semantic_item_is_adjudicated(self):
         series = load_metric_series(_e1_run()[0])
-        (tripwire,) = [m for m in series.metrics if m.metric_id == _e1().METRIC_TOPIC_CANONICAL_PRESENT]
+        (tripwire,) = [m for m in series.metrics if m.metric_id == retrieval_probe.METRIC_TOPIC_CANONICAL_PRESENT]
 
         assert BRIEFING_TASK_SEMANTIC_ITEM in {item.item_key for item in tripwire.items or []}
 

@@ -15,6 +15,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _tool_calls import call_tool
 
 # TEST-TIME only import: dark-factory-shared is already a declared workspace
 # dependency of escalation/pyproject.toml, so this resolves without adding a new
@@ -79,8 +80,7 @@ class _FakeHarness:
 
 
 async def _call_release(server, **kwargs: Any) -> dict[str, Any]:
-    tool = await server.get_tool('release_workflow')
-    return await tool.fn(**kwargs)
+    return await call_tool(server, 'release_workflow', **kwargs)
 
 
 # DERIVED from the canonical vocabulary, not hand-copied: the whole point of the

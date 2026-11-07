@@ -11,9 +11,10 @@ import os
 import re
 import tempfile
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal, TypedDict
+from typing import Any, Generic, Literal, TypedDict, TypeVar
 
 from shared.timestamps import parse_timestamp_or_warn
 
@@ -302,6 +303,26 @@ class AmendWithoutRecord(TypedDict):
 # it gets `escalation` typed exactly for that status and a type checker flags
 # any status the caller leaves unhandled.
 AmendResult = AmendWithRecord | AmendWithoutRecord
+
+
+R = TypeVar('R')
+
+
+@dataclass(frozen=True)
+class ClaimResult(Generic[R]):
+    """What ONE :meth:`EscalationQueue.claim_policy_class` call did.
+
+    ``record`` is the claimed record, or ``refusal`` is what the caller's
+    refuse callback returned; never both. Both ``None`` means the id was not
+    found in the queue root, failed to parse, or is not pending.
+    """
+
+    record: Escalation | None
+    refusal: R | None
+
+    def __post_init__(self) -> None:
+        if self.record is not None and self.refusal is not None:
+            raise ValueError('a claim cannot both succeed and be refused')
 
 
 class ResolveOutcome(TypedDict):
@@ -2236,6 +2257,22 @@ class EscalationQueue:
                 )
             return esc
 
+    def _load_root_pending(self, escalation_id: str) -> Escalation | None:
+        """The pending record at the queue root, or ``None`` when absent, unparsable or not pending.
+
+        Never falls back to the archive, so a caller that rewrites the result
+        cannot resurrect an archived record. Call it under ``escalation_id_lock``.
+        """
+        path = self.queue_dir / f'{escalation_id}.json'
+        if not path.exists():
+            return None
+        try:
+            esc = Escalation.from_json(path.read_text())
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            logger.warning(f'Failed to parse escalation {escalation_id}: {e}')
+            return None
+        return esc if esc.status == 'pending' else None
+
     def stamp_triage(
         self, escalation_id: str, *, triaged_by: str | None = None, triage_note: str = '',
     ) -> Escalation | None:
@@ -2280,16 +2317,8 @@ class EscalationQueue:
         (archived/resolved/dismissed).
         """
         with escalation_id_lock(self.queue_dir, escalation_id):
-            path = self.queue_dir / f'{escalation_id}.json'
-            if not path.exists():
-                return None
-            try:
-                esc = Escalation.from_json(path.read_text())
-            except (json.JSONDecodeError, KeyError, TypeError) as e:
-                logger.warning(f'Failed to parse escalation {escalation_id}: {e}')
-                return None
-
-            if esc.status != 'pending':
+            esc = self._load_root_pending(escalation_id)
+            if esc is None:
                 return None
 
             esc.triaged_at = datetime.now(UTC).isoformat()
@@ -2300,6 +2329,42 @@ class EscalationQueue:
             self._rewrite(escalation_id, esc)
             logger.info('stamp_triage: stamped triage ack on %s', escalation_id)
             return esc
+
+    def claim_policy_class(
+        self, escalation_id: str, *, policy_class: str, claimed_by: str,
+        refuse: Callable[[Escalation], R | None],
+    ) -> ClaimResult[R]:
+        """Stamp a policy-class claim on a pending escalation (task 8422).
+
+        The sole writer of ``policy_class`` / ``claimed_at`` / ``claimed_by``.
+        It has :meth:`stamp_triage`'s write shape for the same reasons: it is
+        serialized per id by ``escalation_id_lock``, it loads from the queue
+        root only, so an archived record is refused rather than resurrected, it
+        refuses a non-pending record, and it leaves ``updated_at`` alone
+        because a claim is not a content change.
+
+        *refuse* is evaluated on the record as read under the lock, so a
+        check on the existing claim cannot race another claim. A non-``None``
+        return is handed back as the refusal and nothing is written. This
+        method owns ``claimed_at``'s clock, as :meth:`stamp_triage` owns
+        ``triaged_at``'s.
+        """
+        with escalation_id_lock(self.queue_dir, escalation_id):
+            esc = self._load_root_pending(escalation_id)
+            if esc is None:
+                return ClaimResult(record=None, refusal=None)
+            refusal = refuse(esc)
+            if refusal is not None:
+                return ClaimResult(record=None, refusal=refusal)
+
+            esc.policy_class = policy_class
+            esc.claimed_at = datetime.now(UTC).isoformat()
+            esc.claimed_by = claimed_by
+            self._rewrite(escalation_id, esc)
+            logger.info(
+                'claim_policy_class: %s claimed %s as %s', claimed_by, escalation_id, policy_class,
+            )
+            return ClaimResult(record=esc, refusal=None)
 
     def amend(
         self, escalation_id: str, *, root_cause: str = '', summary: str = '',
@@ -2427,16 +2492,8 @@ class EscalationQueue:
         *declared_by* normalises to nothing new.
         """
         with escalation_id_lock(self.queue_dir, escalation_id):
-            path = self.queue_dir / f'{escalation_id}.json'
-            if not path.exists():
-                return None
-            try:
-                esc = Escalation.from_json(path.read_text())
-            except (json.JSONDecodeError, KeyError, TypeError) as e:
-                logger.warning(f'Failed to parse escalation {escalation_id}: {e}')
-                return None
-
-            if esc.status != 'pending':
+            esc = self._load_root_pending(escalation_id)
+            if esc is None:
                 return None
 
             existing = list(esc.pin_declared_by)

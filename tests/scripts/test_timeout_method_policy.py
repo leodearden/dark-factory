@@ -131,13 +131,15 @@ import tomllib
 import types
 
 import pytest
-
-# The one config-discovery walk, with its anti-vacuity floors. Resolves because
-# tests/scripts/conftest.py puts this directory on sys.path.
-import test_pytest_per_test_timeout_policy as per_test_timeout_policy
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 from packaging.version import Version
+from pytest_config_discovery import (
+    REPO_ROOT,
+    ROOT_CONFIG_NAME,
+    discovered_pytest_configs,
+    workspace_members,
+)
 
 SIGNAL_METHOD = 'signal'
 THREAD_METHOD = 'thread'
@@ -154,7 +156,7 @@ MAIN_THREAD_WORKERS_XDIST = Version('3.6.0')
 XDIST_DISTRIBUTION = 'pytest-xdist'
 
 # A FLOOR, not an equality: 8 at authorship, every workspace member. Same idiom
-# as per_test_timeout_policy.MIN_EXPECTED_PYTEST_CONFIGS.
+# as pytest_config_discovery.MIN_EXPECTED_PYTEST_CONFIGS.
 MIN_EXPECTED_XDIST_DECLARERS = 8
 
 PROBE_WORKERS = 2
@@ -582,7 +584,7 @@ def test_the_probes_take_this_runs_per_test_timeout_and_the_child_budget_sits_be
 def test_thread_timeout_method_is_confined_to_the_recorded_configs() -> None:
     thread_configs = {
         name
-        for name, ini_options in per_test_timeout_policy.discovered_pytest_configs().items()
+        for name, ini_options in discovered_pytest_configs().items()
         if ini_options.get('timeout_method') == THREAD_METHOD
     }
     assert thread_configs == THREAD_TIMEOUT_METHOD_CONFIGS, (
@@ -607,7 +609,7 @@ def _xdist_requirements(config_name: str) -> list[Requirement]:
     another group rather than a distribution, so they are skipped; the group
     they include is walked in its own right.
     """
-    pyproject = per_test_timeout_policy.REPO_ROOT / config_name / 'pyproject.toml'
+    pyproject = REPO_ROOT / config_name / 'pyproject.toml'
     data = tomllib.loads(pyproject.read_text(encoding='utf-8'))
     project = data.get('project', {})
     declaration_lists = [
@@ -655,8 +657,8 @@ def test_every_pytest_xdist_floor_admits_only_main_thread_workers() -> None:
     declarers: list[str] = []
     violations: list[str] = []
     config_names = [
-        per_test_timeout_policy.ROOT_CONFIG_NAME,
-        *per_test_timeout_policy.workspace_members(),
+        ROOT_CONFIG_NAME,
+        *workspace_members(),
     ]
     for config_name in config_names:
         requirements = _xdist_requirements(config_name)

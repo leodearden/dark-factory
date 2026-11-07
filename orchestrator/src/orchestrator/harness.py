@@ -109,6 +109,7 @@ from orchestrator.flake_debt_drain import DRAIN_INTERVAL_SECS, run_drain_pass
 from orchestrator.flake_ledger import ledger_db_path
 from orchestrator.fleet_drain import DrainIdentity, DrainParticipant, FleetDrainEvent
 from orchestrator.fleet_heartbeat import build_heartbeat_payload, resolve_fleet_dir, write_heartbeat
+from orchestrator.fm_retry import is_fm_null_sentinel
 from orchestrator.git_ops import GitOps, classify_worktree_entry
 from orchestrator.lane_lifecycle import LaneRecord
 from orchestrator.lane_lifecycle import LaneState as DurableLaneState
@@ -161,6 +162,7 @@ from orchestrator.recovery_emission import (
     emit_recovery_event,
     emit_recovery_veto_streak_escalation,
     escalation_ages_secs,
+    pending_holder_candidates,
     pin_buckets,
     render_shape,
     resolve_recovery_veto_streak_escalation,
@@ -243,6 +245,8 @@ from orchestrator.zero_progress_requeue import (
 )
 
 if TYPE_CHECKING:
+    from shared.uuid_prefix_guard import PrefixResolver
+
     from orchestrator.merge_lane.worker import (
         BreakerTrip,
         SpeculativeMergeWorker,
@@ -251,6 +255,7 @@ if TYPE_CHECKING:
     from orchestrator.warm_lane_pool import WarmLanePoolCensus
 
 try:
+    from escalation.prefix_resolver_client import PrefixResolverClient
     from escalation.queue import EscalationQueue
     from escalation.server import create_server
     from escalation.store_identity import StoreIdentity
@@ -4310,6 +4315,12 @@ class Harness:
         top_pool = self.git_ops.warm_lane_pool
         if top_pool is not None:
             top_pool.set_lane_lifecycle(self.git_ops._lane_lifecycle)
+        # Leaf δ: under the unit's KillMode=control-group no dark-factory
+        # child survives the restart that led here, so every IN_USE record is
+        # a crash fossil; left alone it would make its lane unreclaimable
+        # once ε lands. An orphan of an unmanaged kill (its agents run in
+        # their own sessions) is still guarded by γ's /proc gate.
+        self.git_ops.reset_stale_lane_in_use_records()
         self.git_ops.warn_on_warm_lane_pool_shrink()
 
         for entry in worktree_base.iterdir():
@@ -9185,15 +9196,16 @@ class Harness:
         """Invoke the warm-lane GC reclaim helper once (single cadence tick).
 
         Delegates unconditionally to ``git_ops._run_warm_lane_gc_reclaim()``,
-        which is already fail-soft: rc 127 when the script is absent (no-op),
-        non-zero on script error (logged at WARNING inside the helper), and
-        never raises.  This method therefore also never raises.
+        which is already fail-soft: rc 127 when no reclaim ran, non-zero on
+        script error (logged at WARNING inside the helper), and never raises.
+        This method therefore also never raises.
 
-        Logging is tiered to avoid noise on hosts where gc.sh is absent
-        (rc=127 is the expected no-op case on ~144 ticks/day with the 600s
-        default):
-          * rc==0   → INFO  (actual reclaim ran)
-          * rc==127 → DEBUG (script absent — expected no-op)
+        Logging is tiered against what git_ops already logs for the pass:
+          * rc==0   → DEBUG, because git_ops' preceding line reports the pass:
+            the INFO ``reclaim pass`` record, or an "uncounted" WARNING
+          * rc==127 → INFO, cause-free; git_ops' preceding line names the
+            cause: a lease deferral at INFO; a pool refusal, script not found
+            (naming both candidates) or unexpected error at WARNING
           * other   → WARNING (unexpected non-zero)
 
         Also folds in the interactive-worktree (``_iact-*``) crash-safety
@@ -9206,9 +9218,15 @@ class Harness:
         """
         rc = await self.git_ops._run_warm_lane_gc_reclaim()
         if rc == 0:
-            logger.info('Warm-lane GC reclaim pass: reclaimed (rc=0)')
+            logger.debug(
+                'Warm-lane GC reclaim pass: script exited 0 (see the preceding '
+                '_run_warm_lane_gc_reclaim line)',
+            )
         elif rc == 127:
-            logger.debug('Warm-lane GC reclaim pass: script absent, no-op (rc=127)')
+            logger.info(
+                'Warm-lane GC reclaim pass: no reclaim ran this tick (rc=127) — '
+                'the preceding _run_warm_lane_gc_reclaim line names the cause',
+            )
         else:
             logger.warning('Warm-lane GC reclaim pass: non-zero rc=%d', rc)
         await self._run_interactive_worktree_reaper_pass()
@@ -11770,9 +11788,18 @@ class Harness:
             # here: classify_pins is consulted for BUCKETING and the streak
             # alarm's human-parked gate only (never for the veto answer), and
             # records=None carries its store-unavailable third state, which
-            # must never collapse into "no records".
+            # must never collapse into "no records"; where that gate can decide
+            # a filing the pending queue feeds it too, because a cluster L2 may
+            # sit under another task id (task 7716).
             pins = pin_buckets(
                 task_id, records, store_unavailable=store_unavailable,
+                holder_candidates=pending_holder_candidates(
+                    getattr(self, '_escalation_queue', None), site,
+                    reason=reason,
+                    store_unavailable=store_unavailable,
+                    streak_escalation_enabled=cfg.streak_escalation_enabled,
+                    suppress_human_parked=cfg.streak_escalation_suppress_human_parked,
+                ),
             )
             buckets = pins.buckets
 
@@ -13070,6 +13097,18 @@ class Harness:
 
         return _lookup
 
+    def _build_prefix_resolver(self) -> PrefixResolver | None:
+        """fused-memory's ``POST /resolve-prefix`` (PRD D7), or no uuid-prefix guard at all.
+
+        Under the D8 null sentinel fused-memory is absent by design, so every
+        resolution would be 'unavailable', and the guard's storm alarm would
+        file a blocking L1 about an outage nobody can fix.
+        """
+        url = self.config.fused_memory.url
+        if is_fm_null_sentinel(url):
+            return None
+        return PrefixResolverClient(base_url=url).resolve_prefix
+
     async def _start_escalation_server(self) -> None:
         """Start the escalation MCP server as a background asyncio task."""
         if not HAS_ESCALATION:
@@ -13122,6 +13161,7 @@ class Harness:
                 project_id=self.config.fused_memory.project_id,
                 project_root=self.config.project_root,
             ),
+            prefix_resolver=self._build_prefix_resolver(),
         )
         host = self.config.escalation.host
         port = self.config.escalation.port

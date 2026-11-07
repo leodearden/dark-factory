@@ -19,7 +19,7 @@ import json
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from types import MappingProxyType
 from typing import Any, ClassVar, Literal, get_args
 
@@ -35,6 +35,7 @@ from pydantic import (
 from pydantic_core import PydanticCustomError
 
 from shared.cancel_dispositions import CancelDispositionEntry
+from shared.declared_scope import DECLARED_SCOPE_METADATA_KEY, DeclaredScope
 from shared.strand_conversion import STRAND_CONVERTED_METADATA_KEY, StrandConverted
 from shared.task_deferral import DeferralRecord
 
@@ -675,6 +676,33 @@ class Milestone(BaseModel):
                 raise ValueError("Milestone: at must not be set when mode='delayed'.")
         return self
 
+    def fired(self, anchor: str | None, now: datetime) -> bool:
+        """Return whether this milestone has fired at *now* (tz-aware).
+
+        This is the home of milestone semantics. A ``'dated'`` milestone fires
+        once ``now >= at``; *anchor* is ignored. A ``'delayed'`` milestone
+        fires once ``now >= anchor + after_secs``, where *anchor* is the raw
+        ``metadata.milestone_deps_satisfied_at`` string; a falsy anchor never
+        fires. A tz-naive ``at`` or anchor is read as UTC.
+
+        A malformed spec cannot be a ``Milestone``, so "never fires" for
+        malformed metadata belongs to the caller; an unparseable *anchor*
+        raises ``ValueError``. ``Scheduler._milestone_time_gated`` keeps its
+        own copy of these rules until a follow-up repoints it here.
+        """
+        if self.mode == 'dated':
+            assert self.at is not None
+            return now >= _as_utc(datetime.fromisoformat(self.at))
+        if not anchor:
+            return False
+        assert self.after_secs is not None
+        deadline = _as_utc(datetime.fromisoformat(anchor)) + timedelta(seconds=self.after_secs)
+        return deadline <= now
+
+
+def _as_utc(moment: datetime) -> datetime:
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
+
 
 class Recurrence(BaseModel):
     """``metadata.recurrence`` — one link of a recurring deterministic chain.
@@ -1077,6 +1105,9 @@ register_metadata_submodel('cancel_dispositions', CancelDispositionEntry, cardin
 
 # strand_converted: shared/src/shared/strand_conversion.py.
 register_metadata_submodel(STRAND_CONVERTED_METADATA_KEY, StrandConverted, cardinality='dict')
+
+# declared_scope: plans/follow-up-filing-shape-prd.md §4.2.
+register_metadata_submodel(DECLARED_SCOPE_METADATA_KEY, DeclaredScope, cardinality='dict')
 
 
 def _normalize_legacy_memory_hints(value: object) -> object:

@@ -1005,9 +1005,9 @@ def _assert_two_way_quiescent(
         green over a genuinely leaking one.
       * *main_sha* must be a REAL sha, never falsy and never the literal
         ``'unknown'``.  ``two_layer_invariants`` gates its base-chain
-        (``check_frozen_prefix_invariant``) and verify-base sub-checks on
-        exactly that condition, leaving only the two graph-consistency checks
-        running for the sentinel.
+        (``check_frozen_prefix_invariant``, INV-3) sub-check on exactly that
+        condition, leaving only the two graph-consistency checks running for
+        the sentinel.
 
     WORKER SIDE
       (a) every request in *requests* has resolved (done or cancelled) — no
@@ -1060,9 +1060,9 @@ def _assert_two_way_quiescent(
     )
     assert main_sha and main_sha != 'unknown', (
         f'_assert_two_way_quiescent requires a REAL main_sha, got '
-        f'{main_sha!r}: two_layer_invariants silently skips its base-chain and '
-        f'verify-base sub-checks for a falsy or \'unknown\' sha, so surface '
-        f'(e) would pass vacuously'
+        f'{main_sha!r}: two_layer_invariants silently skips its base-chain '
+        f'(INV-3) sub-check for a falsy or \'unknown\' sha, so surface (e) '
+        f'would pass vacuously'
     )
 
     # ── (a) every tracked request resolved ──────────────────────────────────
@@ -1162,8 +1162,8 @@ def _assert_two_way_quiescent(
 #     both `return []` immediately when `not self._running` (stop() over-
 #     releases both semaphores by depth+1 as a shutdown safety valve, which
 #     would otherwise read as a spurious violation);
-#   * `two_layer_invariants(main_sha)` SKIPS its base-chain and verify-base
-#     sub-checks for a falsy or 'unknown' main_sha (the snapshot() sentinel).
+#   * `two_layer_invariants(main_sha)` SKIPS its base-chain (INV-3) sub-check
+#     for a falsy or 'unknown' main_sha (the snapshot() sentinel).
 #
 # — so the oracle must REJECT those inputs rather than consume them.  This
 # class pins all three as POSITIVE CONTROLS, and pins a forced permit leak as
@@ -1242,8 +1242,8 @@ class TestTwoWayOracleContract:
         """VACUITY TRAP (ii): ``two_layer_invariants`` skips sub-checks for 'unknown'.
 
         ``snapshot()`` passes the literal ``'unknown'`` when ``get_main_sha()``
-        is unavailable, and the base-chain + verify-base sub-checks are gated
-        off for it (and for a falsy sha) so startup does not report spurious
+        is unavailable, and the base-chain (INV-3) sub-check is gated off for
+        it (and for a falsy sha) so startup does not report spurious
         violations.  A gate that handed the oracle that sentinel would be
         asserting only the two graph-consistency checks and calling it §5.3.
 

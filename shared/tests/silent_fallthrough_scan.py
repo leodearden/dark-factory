@@ -36,7 +36,6 @@ what the others see.
 
 References:
   - plans/silent-fallthrough-dedup-prd.md (PRD task σ)
-  - orchestrator/tests/test_event_loop_antipattern_guard.py (guard pattern)
   - fused-memory/scripts/check_bare_magicmock_config.py (Violation NamedTuple)
 """
 from __future__ import annotations

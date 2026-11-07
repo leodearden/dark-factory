@@ -224,7 +224,7 @@ class TestTerminalWindow:
         default_render_keys = {
             'TASKS_SNAPSHOT', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS',
             'TASKS_DEGRADED_PROJECTS', 'TASKS_COUNT_UNKNOWN_PROJECTS',
-            'TASKS_PROJECT_COUNT',
+            'TASKS_COUNT_STALE_PROJECTS', 'TASKS_PROJECT_COUNT',
         }
         assert not default_render_keys & set(body), (
             'no project snapshot and no banner list belongs on the terminal '

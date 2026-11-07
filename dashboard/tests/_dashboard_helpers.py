@@ -539,7 +539,7 @@ def write_escalation_record(
 
     Field names mirror ``escalation.models.Escalation`` (``timestamp``, not
     ``created_at``) since that is what the queue serialises and what
-    ``load_queue_escalations`` passes through unchanged.  The
+    ``escalation.models.Escalation.from_dict`` reads back.  The
     ``category='eval_regression'`` / ``status='pending'`` defaults are exactly
     the pair ``memory_evals._index_escalations`` accepts; every other
     combination is dropped by that reader and can only ever appear on the
@@ -549,8 +549,9 @@ def write_escalation_record(
     VERBATIM, so a caller can hand it a JSON number and get an ``id`` that
     survives to both payloads un-coerced — which is what makes a str/int drift
     testable rather than hypothetical.  ``omit_id=True`` leaves the ``id`` key
-    out of the record entirely, the shape that makes a queue file address
-    NOTHING; ``**extra`` overrides or adds any other field.
+    out of the record entirely, a shape ``Escalation.from_dict`` rejects, so
+    both payloads report the file as unreadable; ``**extra`` overrides or adds
+    any other field.
 
     KNOWN DUPLICATION, deliberately left: ``test_memory_evals_data.py`` carries
     its own ``_write_escalation``/``_dump`` with this same field set.  Folding

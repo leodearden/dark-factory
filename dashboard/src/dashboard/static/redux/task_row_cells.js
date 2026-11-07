@@ -4,9 +4,10 @@
 //
 //   1. the stranded badge (strandBadgeState), at three sites;
 //   2. the agent cell it sits beside (agentCellState), at two of them;
-//   3. the Locks cell of that same row, at one: whether anything is known
+//   3. the Locks cell of that same row, at two: whether anything is known
 //      about the project's locks (schedulerLocksDatum) and what the cell draws
-//      for that answer (locksCellState).
+//      for that answer (locksCellState), for tabs.jsx::LocksCell and the
+//      Task-detail tab_tasks.jsx::ModuleLocksSection.
 //
 // THE THIRD ONE ARRIVED LAST AND FOR THE SAME REASON THE FIRST TWO DID. The
 // Locks column is a cell of the identical task row, and its decision was a

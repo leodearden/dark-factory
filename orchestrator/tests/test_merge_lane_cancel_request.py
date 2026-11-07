@@ -74,7 +74,8 @@ def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
 
 
 def _request(
-    task_id: str, worktree: Path, config: OrchestratorConfig, **flags: bool,
+    task_id: str, worktree: Path, config: OrchestratorConfig, *,
+    awaited_by_workflow: bool = False,
 ) -> MergeRequest:
     return MergeRequest(
         task_id=task_id,
@@ -85,7 +86,7 @@ def _request(
         module_configs=[],
         config=config,
         result=asyncio.get_running_loop().create_future(),
-        **flags,
+        awaited_by_workflow=awaited_by_workflow,
     )
 
 
