@@ -5886,7 +5886,108 @@ async def test_get_tasks_tree_fresh_despite_pinned_write_connection(
     await conn.rollback()
 
 
-# ── cached read-connection pin hardening (task 2694) ────────────────────
+# ── cached read connection freshness ────────────────────────────────────
+
+
+async def _read_task_1_status(backend, project_root):
+    return (await backend.get_task('1', project_root))['status']
+
+
+async def _read_tree_task_1_status(backend, project_root):
+    by_id = {t['id']: t for t in (await backend.get_tasks(project_root))['tasks']}
+    return by_id['1']['status']
+
+
+async def _read_bulk_and_scoped_task_1_status(backend, project_root):
+    bulk = await backend.get_statuses(project_root)
+    scoped = await backend.get_statuses(project_root, ids=['1'])
+    return bulk['1'], scoped['1']
+
+
+async def _read_dependency_edges(backend, project_root):
+    return await backend.get_dependency_edges(project_root)
+
+
+async def _read_tag_set(backend, project_root):
+    return set(await backend.list_tags(project_root))
+
+
+async def _read_x_probe_task_ids(backend, project_root):
+    result = await backend.find_tasks_by_metadata(project_root, 'x_probe')
+    return [row['task_id'] for row in result['results']]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('out_of_band_sql', 'read', 'stale', 'fresh'),
+    [
+        pytest.param(
+            "UPDATE tasks SET status='cancelled' WHERE id=1",
+            _read_task_1_status, 'done', 'cancelled', id='get_task',
+        ),
+        pytest.param(
+            "UPDATE tasks SET status='cancelled' WHERE id=1",
+            _read_tree_task_1_status, 'done', 'cancelled', id='get_tasks',
+        ),
+        pytest.param(
+            "UPDATE tasks SET status='cancelled' WHERE id=1",
+            _read_bulk_and_scoped_task_1_status,
+            ('done', 'done'), ('cancelled', 'cancelled'), id='get_statuses',
+        ),
+        pytest.param(
+            "INSERT INTO dependencies(tag, task_id, depends_on) VALUES ('master', 2, 1)",
+            _read_dependency_edges, {}, {2: [1]}, id='get_dependency_edges',
+        ),
+        pytest.param(
+            "UPDATE tasks SET tag='other' WHERE id=2",
+            _read_tag_set, {'master'}, {'master', 'other'}, id='list_tags',
+        ),
+        pytest.param(
+            """UPDATE tasks SET metadata='{"x_probe": 1}' WHERE id=1""",
+            _read_x_probe_task_ids, [], [1], id='find_tasks_by_metadata',
+        ),
+    ],
+)
+async def test_warm_cached_reader_sees_out_of_band_commit(
+    backend, project_root, monkeypatch, out_of_band_sql, read, stale, fresh,
+):
+    """A warm cached reader observes a commit another process made, on the SAME connection.
+
+    The zero ``connect_daemon`` count after the commit is what makes the
+    freshness meaningful: a cache that quietly reopened its connection would
+    see the commit trivially.
+    """
+    from shared.async_sqlite_base import apply_wal_pragmas
+
+    from fused_memory.backends import sqlite_task_backend as _sb
+
+    await backend.add_task(project_root=project_root, title='T1')  # id=1
+    await backend.add_task(project_root=project_root, title='T2')  # id=2
+    await backend.set_task_status('1', 'done', project_root)
+    await backend.set_task_status('2', 'done', project_root)
+
+    assert await read(backend, project_root) == stale
+
+    writer = await _sb.connect_daemon(str(tasks_db(project_root)), isolation_level=None)
+    try:
+        await apply_wal_pragmas(writer, busy_timeout_ms=5000)
+        await writer.execute(out_of_band_sql)
+        await writer.commit()
+    finally:
+        await writer.close()
+
+    real_connect_daemon = _sb.connect_daemon
+    connects = 0
+
+    async def _counting_connect_daemon(*args, **kwargs):
+        nonlocal connects
+        connects += 1
+        return await real_connect_daemon(*args, **kwargs)
+
+    monkeypatch.setattr(_sb, 'connect_daemon', _counting_connect_daemon)
+
+    assert await read(backend, project_root) == fresh
+    assert connects == 0, f'Expected the reread to reuse the warm connection, opened {connects}'
 
 
 async def _pin_cached_read_connection_then_commit_out_of_band(backend, project_root) -> Any:
