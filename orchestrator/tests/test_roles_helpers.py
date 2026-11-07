@@ -28,6 +28,12 @@ from _roles_helpers import tool_is_granted
             id='other-family-wildcard',
         ),
         pytest.param(
+            'mcp__fused-memory__search',
+            {'mcp__fused-memory__add_memory'},
+            False,
+            id='same-family-sibling-direct-grant',
+        ),
+        pytest.param(
             'Read',
             {'__*'},
             False,
