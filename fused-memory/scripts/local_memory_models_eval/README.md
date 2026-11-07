@@ -263,7 +263,9 @@ the pinned harness. Each arm's traffic passes through the in-process usage tap
 tap session waits, up to the tap's upstream timeout, for calls the harness
 abandoned but the arm is still serving, so the arm is healthchecked and stopped
 only after they land; a call outlasting that bound is marked
-`outlived_session`. The sweep's provenance and run record:
+`outlived_session`. The tap prints a `usage tap:` line to stdout when it starts
+waiting, and another if the bound expires, so a pause before the healthcheck is
+explained in the journal. The sweep's provenance and run record:
 `plans/local-memory-models-eval-screening/README.md`.
 
 `run` refuses before touching any store unless the spec's `code_sha` is the

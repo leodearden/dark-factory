@@ -234,13 +234,14 @@ def test_records_load_in_file_order_and_the_port_closes_on_exit(tmp_path):
         assert probe.connect_ex(('127.0.0.1', port)) != 0
 
 
-def test_a_session_with_no_calls_still_leaves_its_empty_log(tmp_path):
+def test_a_session_with_no_calls_still_leaves_its_empty_log(tmp_path, capsys):
     log = tmp_path / 'calls.jsonl'
     with mock_openai_server() as mock, usage_tap(_origin(mock), log_path=log):
         pass
 
     assert log.read_text() == ''
     assert load_call_records(log) == ()
+    assert capsys.readouterr().out == ''
 
 
 def _post_in_background(tap_url: str, statuses: list[int]) -> threading.Thread:
@@ -253,7 +254,7 @@ def _post_in_background(tap_url: str, statuses: list[int]) -> threading.Thread:
 
 
 def test_closing_a_session_waits_for_a_call_still_in_flight_and_records_it_inside_the_session(
-    tmp_path,
+    tmp_path, capsys
 ):
     log = tmp_path / 'calls.jsonl'
     received, release = threading.Event(), threading.Event()
@@ -271,10 +272,13 @@ def test_closing_a_session_waits_for_a_call_still_in_flight_and_records_it_insid
     assert record.prompt_tokens == HELD_PROMPT_TOKENS
     assert record.outlived_session is False
     assert statuses == [200]
+    (waiting,) = capsys.readouterr().out.splitlines()
+    assert waiting.startswith('usage tap: waiting')
+    assert '1 in-flight call' in waiting
 
 
 def test_a_call_still_in_flight_when_the_drain_bound_expires_is_marked_as_outliving_the_session(
-    tmp_path,
+    tmp_path, capsys
 ):
     log = tmp_path / 'calls.jsonl'
     received, release = threading.Event(), threading.Event()
@@ -296,6 +300,10 @@ def test_a_call_still_in_flight_when_the_drain_bound_expires_is_marked_as_outliv
     assert record.outlived_session is True
     assert record.status == 200
     assert record.prompt_tokens == HELD_PROMPT_TOKENS
+    waiting, expired = capsys.readouterr().out.splitlines()
+    assert waiting.startswith('usage tap: waiting')
+    assert expired.startswith('usage tap: drain bound')
+    assert '1 call(s) still in flight' in expired
 
 
 class _InterruptedWhileDraining(Exception):

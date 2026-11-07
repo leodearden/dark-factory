@@ -125,6 +125,10 @@ def load_call_records(path: Path | str) -> tuple[CallRecord, ...]:
     return tuple(CallRecord.model_validate_json(line) for line in lines if line.strip())
 
 
+def _notice(line: str) -> None:
+    print(line, flush=True)
+
+
 class _SessionCallLog:
     """One tap session's calls; closing it drains the calls still in flight."""
 
@@ -148,9 +152,22 @@ class _SessionCallLog:
     def close(self, drain_timeout_s: float) -> None:
         with self._state:
             try:
-                self._state.wait_for(lambda: self._in_flight == 0, timeout=drain_timeout_s)
+                self._drain(drain_timeout_s)
             finally:
                 self._closed = True
+
+    def _drain(self, drain_timeout_s: float) -> None:
+        if not self._in_flight:
+            return
+        _notice(
+            f'usage tap: waiting up to {drain_timeout_s:g} s for {self._in_flight} '
+            'in-flight call(s) to land before the session closes'
+        )
+        if not self._state.wait_for(lambda: self._in_flight == 0, timeout=drain_timeout_s):
+            _notice(
+                f'usage tap: drain bound of {drain_timeout_s:g} s expired with '
+                f'{self._in_flight} call(s) still in flight; they land marked outlived_session'
+            )
 
     def append(self, record: CallRecord) -> None:
         with self._state, self._path.open('a') as stream:
