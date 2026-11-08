@@ -1402,7 +1402,7 @@
     "orchestrator/tests/test_merge_queue_invariant_integration_gate.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_merge_queue_landed_dispatch_gate.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_merge_queue_landed_reconciler.py": {"patch_targets": ["worker.gate_mark_done_on_delivered_checks"], "private_reads": 0},
-    "orchestrator/tests/test_merge_queue_lifecycle_registry.py": {"patch_targets": [], "private_reads": 180},
+    "orchestrator/tests/test_merge_queue_lifecycle_registry.py": {"patch_targets": [], "private_reads": 179},
     "orchestrator/tests/test_merge_queue_main_health.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_merge_queue_main_health_deferred.py": {"patch_targets": ["worker._run_post_merge_verify", "worker._spawn_main_health_probe", "worker.verify_failure_is_preexisting_on_main"], "private_reads": 19},
     "orchestrator/tests/test_merge_queue_metrics.py": {"patch_targets": [], "private_reads": 0},
