@@ -48,9 +48,9 @@ import contextlib
 import logging
 import os
 import re
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, TypeVar
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -893,18 +893,40 @@ def _unreached_provider_skip_reason(exc: openai.APIError) -> str | None:
     )
 
 
-async def _sdk_error(handler: Callable[[httpx.Request], httpx.Response]) -> openai.APIError:
-    """Make one real SDK call over *handler* and return the error the SDK raised."""
+_T = TypeVar('_T')
+
+
+async def _skip_if_provider_unreached(write: Awaitable[_T]) -> _T:
+    """Await *write*, skipping the test only when the provider was never reached."""
+    try:
+        return await write
+    except openai.APIError as exc:
+        if (reason := _unreached_provider_skip_reason(exc)) is None:
+            raise
+        pytest.skip(reason)
+
+
+async def _sdk_call(handler: Callable[[httpx.Request], httpx.Response]) -> None:
+    """Make one real SDK call over *handler*."""
     async with openai.AsyncOpenAI(
         api_key='sk-hermetic-not-a-real-key',
         max_retries=0,
         http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
     ) as client:
-        with pytest.raises(openai.APIError) as excinfo:
-            await client.chat.completions.create(
-                model='gpt-4o-mini', messages=[{'role': 'user', 'content': 'x'}]
-            )
-    return excinfo.value
+        await client.chat.completions.create(
+            model='gpt-4o-mini', messages=[{'role': 'user', 'content': 'x'}]
+        )
+
+
+async def _raised_by(awaitable: Awaitable[object]) -> BaseException:
+    """What awaiting *awaitable* raised, a skip included: a skip is no Exception,
+    so pytest.raises would pass it through and report the guard skipped, not red.
+    """
+    try:
+        await awaitable
+    except (Exception, pytest.skip.Exception) as raised:
+        return raised
+    pytest.fail('the awaited call raised nothing')
 
 
 def _connect_timeout(request: httpx.Request) -> httpx.Response:
@@ -935,12 +957,12 @@ def _model_not_found(request: httpx.Request) -> httpx.Response:
 
 
 @pytest.mark.asyncio
-async def test_a_connect_timeout_reads_as_an_unreached_provider():
-    reason = _unreached_provider_skip_reason(await _sdk_error(_connect_timeout))
+async def test_a_connect_timeout_skips_the_live_write():
+    raised = await _raised_by(_skip_if_provider_unreached(_sdk_call(_connect_timeout)))
 
-    assert reason is not None
-    assert 'api.openai.com' in reason
-    assert 'ConnectTimeout' in reason
+    assert isinstance(raised, pytest.skip.Exception), raised
+    assert 'api.openai.com' in str(raised)
+    assert 'ConnectTimeout' in str(raised)
 
 
 @pytest.mark.parametrize(
@@ -953,7 +975,9 @@ async def test_a_connect_timeout_reads_as_an_unreached_provider():
 )
 @pytest.mark.asyncio
 async def test_a_provider_failure_other_than_a_connect_timeout_stays_red(handler):
-    assert _unreached_provider_skip_reason(await _sdk_error(handler)) is None
+    raised = await _raised_by(_skip_if_provider_unreached(_sdk_call(handler)))
+
+    assert isinstance(raised, openai.APIError), raised
 
 
 @falkor_skipif()
@@ -1008,14 +1032,9 @@ async def test_the_write_creates_a_real_episodic_node_in_falkordb(mock_config):
 
         # The real production route: enqueue, then execute the queued payload.
         await svc.add_episode(content=_LIVE_CONTENT, project_id=graph_name)
-        try:
-            result = await svc._execute_graphiti_write(
-                'add_episode', _enqueued_payload(svc)
-            )
-        except openai.APIError as exc:
-            if (reason := _unreached_provider_skip_reason(exc)) is None:
-                raise
-            pytest.skip(reason)
+        result = await _skip_if_provider_unreached(
+            svc._execute_graphiti_write('add_episode', _enqueued_payload(svc))
+        )
 
         real_uuid = result.episode.uuid
         assert real_uuid, 'graphiti_core must report the uuid it minted'
