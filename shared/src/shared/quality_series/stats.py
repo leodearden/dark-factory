@@ -14,13 +14,26 @@ import statistics
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from enum import StrEnum
 
 __all__ = [
     'CUSUM_H',
+    'BaselineState',
+    'CostEffect',
     'CusumDesign',
+    'Effect',
     'EwmaLimits',
+    'NotYet',
     'OccurrenceCap',
+    'RateDatum',
+    'RateState',
     'RegimeEvent',
+    'RegimeSegments',
+    'Segment',
+    'baseline_rate',
+    'before_after_cost',
+    'before_after_rate',
+    'block_rate_datum',
     'bootstrap_interval',
     'cap_occurrences',
     'content_seed',
@@ -33,6 +46,7 @@ __all__ = [
     'log_residuals',
     'newcombe_difference',
     'reference_cost',
+    'regime_segments',
     'theil_sen',
     'wilson_interval',
 ]
@@ -181,6 +195,15 @@ class RegimeEvent:
     series: tuple[str, ...] | None = None
     artefact: bool = False
 
+    def __post_init__(self) -> None:
+        if self.artefact:
+            _require(self.until is not None and self.until >= self.at,
+                     'an artefact is a range ending at or after its start',
+                     event_id=self.event_id, at=self.at, until=self.until)
+
+    def applies_to(self, series: str) -> bool:
+        return self.series is None or series in self.series
+
 
 def _landing_index(landed_at: Sequence[datetime], at: datetime) -> int:
     return bisect.bisect_left(landed_at, at)
@@ -228,11 +251,17 @@ def cost_fit(
     lines: Sequence[int], costs: Sequence[float], min_lines: int = 5
 ) -> tuple[float, float]:
     """Theil–Sen on (ln lines, ln cost) over points with lines >= min_lines and cost > 0."""
+    points = _log_points(lines, costs, min_lines)
+    return theil_sen([x for x, _ in points], [y for _, y in points])
+
+
+def _log_points(
+    lines: Sequence[int], costs: Sequence[float], min_lines: int
+) -> list[tuple[float, float]]:
     _require(len(lines) == len(costs), 'lines and costs pair one to one',
              len_lines=len(lines), len_costs=len(costs))
-    points = [(math.log(n), math.log(c)) for n, c in zip(lines, costs, strict=True)
-              if n >= min_lines and c > 0]
-    return theil_sen([x for x, _ in points], [y for _, y in points])
+    return [(math.log(n), math.log(c)) for n, c in zip(lines, costs, strict=True)
+            if n >= min_lines and c > 0]
 
 
 def reference_cost(
@@ -271,4 +300,221 @@ def cap_occurrences(
         bearing=tuple(count > 0 for count in counts),
         mass_event_indices=tuple(i for i, count in enumerate(counts) if count > cap),
         cap=cap,
+    )
+
+
+@dataclass(frozen=True)
+class Segment:
+    """Landings [start, end) since the regime event ``event_id`` (None: since the first landing)."""
+
+    start: int
+    end: int
+    event_id: str | None
+
+
+@dataclass(frozen=True)
+class RegimeSegments:
+    segments: tuple[Segment, ...]
+    excluded: frozenset[int]
+
+
+def regime_segments(
+    landed_at: Sequence[datetime], events: Iterable[RegimeEvent], series: str
+) -> RegimeSegments:
+    """Split the landings at each regime event for ``series``; artefact ranges become ``excluded``.
+
+    An event's boundary is the first landing at or after its ``at``; empty segments are dropped.
+    """
+    relevant = [event for event in events if event.applies_to(series)]
+    boundaries = sorted(
+        (_landing_index(landed_at, event.at), event.at, event.event_id)
+        for event in relevant
+        if not event.artefact
+    )
+    starts: list[tuple[int, str | None]] = [(0, None)]
+    starts.extend((index, event_id) for index, _, event_id in boundaries)
+    ends = [start for start, _ in starts[1:]] + [len(landed_at)]
+    segments = tuple(
+        Segment(start, end, event_id)
+        for (start, event_id), end in zip(starts, ends, strict=True)
+        if start < end
+    )
+    excluded: set[int] = set()
+    for event in relevant:
+        if event.artefact and event.until is not None:
+            excluded.update(range(_landing_index(landed_at, event.at),
+                                  bisect.bisect_right(landed_at, event.until)))
+    return RegimeSegments(segments=segments, excluded=frozenset(excluded))
+
+
+class BaselineState(StrEnum):
+    FROZEN = 'frozen'
+    PROVISIONAL = 'provisional'
+
+
+def _measured(xs: Iterable[int | None]) -> list[int]:
+    return [x for x in xs if x is not None]
+
+
+def baseline_rate(
+    segment_xs: Sequence[int | None], n_base: int = 200, n_min: int = 100
+) -> tuple[float | None, BaselineState | None]:
+    """p0 over the first n_base measured landings of a segment: frozen at n_base, provisional from n_min."""
+    measured = _measured(segment_xs)
+    if len(measured) < n_min:
+        return None, None
+    window = measured[:n_base]
+    state = BaselineState.FROZEN if len(measured) >= n_base else BaselineState.PROVISIONAL
+    return sum(window) / len(window), state
+
+
+class RateState(StrEnum):
+    RATE = 'rate'
+    K_OF_N = 'k_of_n'
+    UNKNOWN = 'unknown'
+
+
+@dataclass(frozen=True)
+class RateDatum:
+    """k of n over the block; rate, lo and hi are None and ``reason`` says why when UNKNOWN."""
+
+    k: int
+    n: int
+    rate: float | None
+    lo: float | None
+    hi: float | None
+    state: RateState
+    reason: str | None
+    window_task_ids: tuple[str, ...]
+
+
+def block_rate_datum(
+    xs: Sequence[int | None], task_ids: Sequence[str], n_block: int = 100, n_min: int = 30
+) -> RateDatum:
+    """The headline rate over the last n_block measured landings; unmeasured landings never count."""
+    _require(len(xs) == len(task_ids), 'xs and task_ids pair one to one',
+             len_xs=len(xs), len_task_ids=len(task_ids))
+    measured = [(x, task_id) for x, task_id in zip(xs, task_ids, strict=True) if x is not None]
+    window = measured[-n_block:]
+    k = sum(x for x, _ in window)
+    n = len(window)
+    ids = tuple(task_id for _, task_id in window)
+    if n < n_min:
+        reason = f'n={n} measured landings; a rate needs >= {n_min}'
+        return RateDatum(k, n, None, None, None, RateState.UNKNOWN, reason, ids)
+    lo, hi = wilson_interval(k, n)
+    state = RateState.RATE if n >= n_block else RateState.K_OF_N
+    return RateDatum(k, n, k / n, lo, hi, state, None, ids)
+
+
+COMPARISON_WINDOW = 300
+
+
+@dataclass(frozen=True)
+class Effect:
+    """d = after rate − before rate with its Newcombe interval."""
+
+    d: float
+    lo: float
+    hi: float
+    n_before: int
+    n_after: int
+
+
+@dataclass(frozen=True)
+class CostEffect:
+    """after/before ratio of size-corrected cost with its bootstrap interval."""
+
+    ratio: float
+    lo: float
+    hi: float
+    n_before: int
+    n_after: int
+
+
+@dataclass(frozen=True)
+class NotYet:
+    """Too few landings after the event; min_detectable is the resolvable rate difference (rates only)."""
+
+    n_before: int
+    n_after: int
+    eta_days: float | None
+    min_detectable: float | None
+
+
+def _eta_days(n_after: int, n_min: int, landings_per_day: float | None) -> float | None:
+    if landings_per_day is None:
+        return None
+    _require(landings_per_day > 0, 'a landing velocity is positive', landings_per_day=landings_per_day)
+    return (n_min - n_after) / landings_per_day
+
+
+def _min_detectable_rate(p_before: float, n_min: int) -> float:
+    k = round(p_before * n_min)
+    _, lo, hi = newcombe_difference(k, n_min, k, n_min)
+    return (hi - lo) / 2
+
+
+def before_after_rate(
+    xs_before: Sequence[int | None],
+    xs_after: Sequence[int | None],
+    n_min: int = 100,
+    landings_per_day: float | None = None,
+) -> Effect | NotYet:
+    """Newcombe difference over the last 300 measured before and the first 300 measured after."""
+    before = _measured(xs_before)[-COMPARISON_WINDOW:]
+    after = _measured(xs_after)[:COMPARISON_WINDOW]
+    _require(len(before) > 0, 'a comparison needs a measured landing before the event',
+             n_before=len(before))
+    if len(after) < n_min:
+        return NotYet(
+            n_before=len(before),
+            n_after=len(after),
+            eta_days=_eta_days(len(after), n_min, landings_per_day),
+            min_detectable=_min_detectable_rate(sum(before) / len(before), n_min),
+        )
+    d, lo, hi = newcombe_difference(sum(before), len(before), sum(after), len(after))
+    return Effect(d, lo, hi, len(before), len(after))
+
+
+def before_after_cost(
+    before_lines: Sequence[int],
+    before_costs: Sequence[float],
+    after_lines: Sequence[int],
+    after_costs: Sequence[float],
+    seed: int,
+    B: int = 1000,
+    n_min: int = 100,
+    min_lines: int = 5,
+    landings_per_day: float | None = None,
+    alpha: float = 0.05,
+) -> CostEffect | NotYet:
+    """Ratio of size-corrected cost after/before at the before window's Theil–Sen slope.
+
+    ratio = exp(median(after y − b·x) − median(before y − b·x)) on (ln lines, ln cost); the band
+    resamples both windows B times with Random(seed). Windows are capped as in before_after_rate.
+    """
+    before = _log_points(before_lines, before_costs, min_lines)[-COMPARISON_WINDOW:]
+    after = _log_points(after_lines, after_costs, min_lines)[:COMPARISON_WINDOW]
+    if len(after) < n_min:
+        return NotYet(len(before), len(after), _eta_days(len(after), n_min, landings_per_day), None)
+    _, b = theil_sen([x for x, _ in before], [y for _, y in before])
+    before_r = [y - b * x for x, y in before]
+    after_r = [y - b * x for x, y in after]
+    _require(B > 0 and 0 < alpha < 1, 'a bootstrap needs B > 0 and 0 < alpha < 1', B=B, alpha=alpha)
+    rng = random.Random(seed)
+    resampled = sorted(
+        math.exp(
+            statistics.median(rng.choices(after_r, k=len(after_r)))
+            - statistics.median(rng.choices(before_r, k=len(before_r)))
+        )
+        for _ in range(B)
+    )
+    ratio = math.exp(statistics.median(after_r) - statistics.median(before_r))
+    return CostEffect(
+        ratio=ratio,
+        lo=_nearest_rank(resampled, alpha / 2),
+        hi=_nearest_rank(resampled, 1 - alpha / 2),
+        n_before=len(before),
+        n_after=len(after),
     )
