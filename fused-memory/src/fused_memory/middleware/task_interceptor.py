@@ -92,12 +92,12 @@ from fused_memory.middleware.curator_zot_duplicate_sweep import (
     sweep_zot_duplicate,
 )
 from fused_memory.middleware.deferral_gate import StatusWriteScope
-from fused_memory.middleware.followup_hold import is_holder
 from fused_memory.middleware.done_provenance_authz import (
     DETERMINISTIC_CALLER_ERROR_TYPE,
     DETERMINISTIC_PROVENANCE_KINDS,
     resolve_deterministic_provenance_authorization,
 )
+from fused_memory.middleware.followup_hold import is_holder
 from fused_memory.middleware.live_task_write_guard import (
     FileFindingFn,
     guarded_recon_task_write,
