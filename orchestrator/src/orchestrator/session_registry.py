@@ -3338,6 +3338,7 @@ def mark_t3_sessions_exited(
     root: Path | str | None = None,
     *,
     listed_at: datetime | None = None,
+    thread_ended: Callable[[str], bool],
 ) -> list[str]:
     """Mark EXITED every indexed T3-hosted record of *environment_id* whose thread has gone.
 
@@ -3345,8 +3346,9 @@ def mark_t3_sessions_exited(
     threads. Only ``sessions-by-t3-thread/`` is read: a record behind a
     vouched entry whose thread is unlisted and whose ``t3_environment_id`` is
     *environment_id* or unset is marked (exit_code ``ORPHAN_EXIT_CODE``),
-    which drops its pointer. With *listed_at*, a record written after that
-    instant is skipped: the listing predates it and cannot vouch for its
+    which drops its pointer, once *thread_ended* confirms that thread ended:
+    a listing omits live side chats. With *listed_at*, a record written after
+    that instant is skipped: the listing predates it and cannot vouch for its
     thread's absence.
 
     Returns the marked slugs. One unreadable or unwritable record is logged
@@ -3359,7 +3361,7 @@ def mark_t3_sessions_exited(
     for thread_id in thread_ids:
         if thread_id in listed_threads:
             continue
-        slug = _mark_t3_session_gone(thread_id, environment_id, root, listed_at)
+        slug = _mark_t3_session_gone(thread_id, environment_id, root, listed_at, thread_ended)
         if slug is not None:
             marked.append(slug)
     logger.info(
@@ -3372,9 +3374,13 @@ def mark_t3_sessions_exited(
 
 
 def _mark_t3_session_gone(
-    thread_id: str, environment_id: str, root: Path | str | None, listed_at: datetime | None
+    thread_id: str,
+    environment_id: str,
+    root: Path | str | None,
+    listed_at: datetime | None,
+    thread_ended: Callable[[str], bool],
 ) -> str | None:
-    """Mark the live record of unlisted thread *thread_id* EXITED; its slug, or None when none was marked."""
+    """Mark the live record of unlisted thread *thread_id* EXITED once *thread_ended* confirms it; its slug, or None."""
     slug = resolve_session_slug_for_t3_thread(thread_id, root=root)
     if slug is None:
         return None
@@ -3389,6 +3395,15 @@ def _mark_t3_session_gone(
             and display.t3_environment_id in (None, environment_id)
         )
 
+    try:
+        record = read_record(slug, root=root)
+    except (FileNotFoundError, CorruptSessionRecord, OSError):
+        logger.error('mark_t3_sessions_exited: failed to read %s', slug, exc_info=True)
+        return None
+    if record.status in TERMINAL_STATUSES or not still_this_environments(record):
+        return None
+    if not thread_ended(thread_id):
+        return None
     try:
         marked = _mark_exited_if_still_non_terminal(
             slug, root, exit_code=ORPHAN_EXIT_CODE, still_applies=still_this_environments

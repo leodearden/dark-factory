@@ -905,6 +905,9 @@ class ThreadState(StrEnum):
     UNREACHABLE = 'unreachable'
 
 
+ENDED_THREAD_STATES = frozenset({ThreadState.GONE, ThreadState.ARCHIVED})
+
+
 @dataclass(frozen=True)
 class ThreadObservation:
     state: ThreadState
@@ -980,12 +983,17 @@ def wait(
 def _observe(
     client: t3_mcp_client.T3McpClient | None, thread_id: str, cwd: str, record_dir: str
 ) -> ThreadObservation:
-    """The thread's state, after one sweep of its environment and the binding's upkeep."""
-    thread = _read_thread(client, thread_id, read_timeout=CALL_TIMEOUT_SECS)
+    """The thread's state, then one sweep of its environment and the binding's upkeep."""
+    observation = _observe_thread(client, thread_id)
     if client is not None:
         _sweep_listed_threads(client)
     if record_dir:
         _maintain_binding_softly(record_dir, cwd)
+    return observation
+
+
+def _observe_thread(client: t3_mcp_client.T3McpClient | None, thread_id: str) -> ThreadObservation:
+    thread = _read_thread(client, thread_id, read_timeout=CALL_TIMEOUT_SECS)
     if isinstance(thread, ThreadUnread):
         return ThreadObservation(ThreadState.GONE if thread.gone else ThreadState.UNREACHABLE)
     if thread.get('archived') is True:
@@ -1008,7 +1016,10 @@ def _needs_pause(slice_held: bool, record_dir: str) -> bool:
 
 
 def _sweep_listed_threads(client: t3_mcp_client.T3McpClient) -> None:
-    """Sweep this environment's indexed t3 records against its active threads, only from a complete listing."""
+    """Sweep this environment's indexed t3 records against its active threads, only from a complete listing.
+
+    An unlisted thread's record is marked only once a read finds the thread gone or archived.
+    """
     listed_at = datetime.now(UTC)
     threads = _paged(client, 't3_thread_list', {'allProjects': True}, 'threads')
     thread_ids = None if isinstance(threads, Incomplete) else [thread.get('threadId') for thread in threads]
@@ -1017,7 +1028,10 @@ def _sweep_listed_threads(client: t3_mcp_client.T3McpClient) -> None:
         return
     try:
         session_registry.mark_t3_sessions_exited(
-            client.environment_id, frozenset(map(str, thread_ids)), listed_at=listed_at
+            client.environment_id,
+            frozenset(map(str, thread_ids)),
+            listed_at=listed_at,
+            thread_ended=lambda thread_id: _observe_thread(client, thread_id).state in ENDED_THREAD_STATES,
         )
     except Exception as exc:
         logger.warning(f't3 session sweep failed: {exc}')
