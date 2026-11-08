@@ -12,11 +12,18 @@ import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
+from escalation.models import Escalation
 from shared import safe_io
 
+from orchestrator.event_store import EventType
 from orchestrator.lane_lifecycle import LaneRecord, LaneState
+
+if TYPE_CHECKING:
+    from escalation.queue import EscalationQueue
+
+    from orchestrator.event_store import EventStore
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +32,16 @@ PERSISTENT_DIVERGENCE_DIGESTS: Final = 2
 STREAKS_FILENAME: Final = '.lane-record-divergence-streaks.json'
 
 _HOLDING_STATES: Final = frozenset({LaneState.ASSIGNED, LaneState.IN_USE})
+
+_ALARM_SENTINEL_TASK: Final = '__lane_record_divergence__'
+_ALARM_ROLE: Final = 'orchestrator-lane-record-divergence'
+_ALARM_GUIDANCE: Final = (
+    'This is a read-only alarm: the orchestrator repairs nothing. The durable '
+    '.lane-state record is canonical (PRD W2b) and the in-memory assignment map '
+    'is its cache. Corroborate each lane\'s .lane-state record against the live '
+    'pool before acting; the digest section lists every divergent lane and '
+    'shows _none_ once they have all cleared.'
+)
 
 
 @dataclass(frozen=True)
@@ -136,4 +153,87 @@ def _save_streaks(path: Path, divergences: Sequence[LaneDivergence]) -> None:
         logger.warning(
             'lane_record_divergence: could not save streaks to %s', path,
             exc_info=True,
+        )
+
+
+def file_persistent_divergence_alarm(
+    escalation_queue: EscalationQueue | None,
+    divergences: Sequence[LaneDivergence],
+    *,
+    event_store: EventStore | None,
+    filing_claimant_run_id: str | None,
+) -> Escalation | None:
+    """File one deduped born-at-L2 once any lane diverges persistently.
+
+    Fail-open: any filing error is logged and ``None`` returned, so the
+    digest never breaks on it.
+    """
+    persistent = [d for d in divergences if d.is_persistent]
+    if escalation_queue is None or not persistent:
+        return None
+    try:
+        if escalation_queue.find_pending_l2_by_root_cause(LANE_RECORD_DIVERGENCE) is not None:
+            return None
+        escalation = _alarm(escalation_queue, persistent, filing_claimant_run_id)
+        escalation_queue.submit(escalation)
+    except Exception:
+        logger.warning('lane_record_divergence: failed to file the L2 alarm', exc_info=True)
+        return None
+    _emit_alarm_created(event_store, escalation)
+    logger.warning(
+        'lane_record_divergence: %d lane(s) diverged persistently; L2 filed %s',
+        len(persistent), escalation.id,
+    )
+    return escalation
+
+
+def _alarm(
+    escalation_queue: EscalationQueue,
+    persistent: Sequence[LaneDivergence],
+    filing_claimant_run_id: str | None,
+) -> Escalation:
+    lanes = ', '.join(d.lane for d in persistent)
+    summary = (
+        f'warm-lane map/record divergence persisted on {len(persistent)} '
+        f'lane(s): {lanes}'
+    )
+    detail = '\n'.join(
+        [f'Lanes diverged for at least {PERSISTENT_DIVERGENCE_DIGESTS} consecutive digests:']
+        + [f'- {d.render()}' for d in persistent]
+        + ['', _ALARM_GUIDANCE]
+    )
+    return Escalation(
+        id=escalation_queue.make_id(_ALARM_SENTINEL_TASK),
+        task_id=_ALARM_SENTINEL_TASK,
+        agent_role=_ALARM_ROLE,
+        severity='urgent',
+        category='infra_issue',
+        level=2,
+        root_cause=LANE_RECORD_DIVERGENCE,
+        summary=summary[:200],
+        detail=detail,
+        suggested_action='investigate_lane_record_divergence',
+        filing_claimant_run_id=filing_claimant_run_id,
+    )
+
+
+def _emit_alarm_created(event_store: EventStore | None, escalation: Escalation) -> None:
+    if event_store is None:
+        return
+    try:
+        event_store.emit(
+            EventType.escalation_created,
+            task_id=_ALARM_SENTINEL_TASK,
+            data={
+                'escalation_id': escalation.id,
+                'category': escalation.category,
+                'severity': escalation.severity,
+                'level': escalation.level,
+                'reason': 'lane-record-divergence-persistent',
+            },
+        )
+    except Exception:
+        logger.warning(
+            'lane_record_divergence: L2 %s filed but escalation_created emit failed',
+            escalation.id, exc_info=True,
         )
