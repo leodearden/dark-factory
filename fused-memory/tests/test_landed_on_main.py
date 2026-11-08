@@ -19,6 +19,7 @@ from pathlib import Path
 
 import pytest
 from _fm_helpers import _init_git_repo
+from shared.merge_subject import format_merge_subject
 
 from fused_memory.services import landed_on_main as landed_module
 from fused_memory.services.landed_on_main import (
@@ -389,3 +390,53 @@ async def test_shared_scans_run_once_per_probe_call(
     assert len(branch_listings) == 1, f'branch listing must be hoisted; got {branch_listings!r}'
     assert len(marker_scans) == 1, f'marker scan must be hoisted; got {marker_scans!r}'
     assert len(twin_scans) <= 1, f'main twin scan must be hoisted; got {twin_scans!r}'
+
+
+# ─── B1, fused-memory half: the configured naming, written by shared ─────────
+# fused-memory cannot import orchestrator, so format_merge_subject stands in
+# for git_ops as the writer; orchestrator/tests/test_merge_subject_readers.py
+# proves git_ops writes exactly that subject.
+
+
+@pytest.fixture
+def trunk_repo(repo: Path) -> Path:
+    _git(repo, 'branch', '-m', 'main', 'trunk')
+    return repo
+
+
+async def _probe_feat_trunk(repo: Path, task_id: str) -> LandingVerdict:
+    verdicts = await probe_landing(
+        str(repo), [LandingQuery(task_id)], branch_prefix='feat/', main_branch='trunk',
+    )
+    return verdicts[task_id]
+
+
+@pytest.mark.asyncio
+async def test_feat_prefix_merge_into_trunk_is_landed(trunk_repo: Path) -> None:
+    _git(trunk_repo, 'checkout', '-q', '-b', 'feat/50', 'trunk')
+    _commit(trunk_repo, 'feat-50.txt', 'work for the B1 round trip', when=T0)
+    _git(trunk_repo, 'checkout', '-q', 'trunk')
+    _git(
+        trunk_repo, 'merge', '-q', '--no-ff',
+        '-m', format_merge_subject('feat/50', 'trunk'), 'feat/50',
+        when=T0 + timedelta(hours=1),
+    )
+    merge_sha = _git(trunk_repo, 'rev-parse', 'HEAD')
+    _git(trunk_repo, 'branch', '-q', '-D', 'feat/50')
+
+    verdict = await _probe_feat_trunk(trunk_repo, '50')
+
+    assert verdict.landed is True
+    assert verdict.evidence is LandingEvidence.MERGE_MARKER
+    assert verdict.commit == merge_sha
+
+
+@pytest.mark.asyncio
+async def test_revert_subject_for_an_unlanded_task_is_not_a_landing(trunk_repo: Path) -> None:
+    _git(
+        trunk_repo, 'commit', '-q', '--allow-empty',
+        '-m', 'Revert "' + format_merge_subject('feat/51', 'trunk') + '"',
+        when=T0,
+    )
+
+    assert await _probe_feat_trunk(trunk_repo, '51') == LandingVerdict.not_landed()
