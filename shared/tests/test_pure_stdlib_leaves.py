@@ -313,9 +313,15 @@ def test_init_has_no_runtime_submodule_imports():
     )
 
 
+def _leaf_source(leaf: str) -> Path:
+    """The file defining ``shared.<leaf>``: a dotted leaf is a subpackage module, a package its __init__."""
+    module = _SRC.joinpath('shared', *leaf.split('.'))
+    return module / '__init__.py' if module.is_dir() else module.with_suffix('.py')
+
+
 def test_designated_leaves_exist():
     """Every name in PURE_STDLIB_LEAVES names a real module (rename hygiene)."""
-    missing = [leaf for leaf in PURE_STDLIB_LEAVES if not (_SRC / 'shared' / f'{leaf}.py').is_file()]
+    missing = [leaf for leaf in PURE_STDLIB_LEAVES if not _leaf_source(leaf).is_file()]
     assert missing == [], (
         f'PURE_STDLIB_LEAVES names module(s) that do not exist: {missing}.\n'
         'Update the list when a module is renamed or removed.'
