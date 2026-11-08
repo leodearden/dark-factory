@@ -18,13 +18,15 @@ import pytest
 import pytest_asyncio
 from _git_fixtures import seed_repo
 from _orch_helpers import git_env_with_ceiling
-from shared.merge_subject import format_merge_subject
+from shared.merge_subject import format_merge_subject, rendered_prefix
 
 from orchestrator.config import GitConfig
 from orchestrator.evals.reviewer_trial.mining import resolve_merge_sha_by_task_id
 from orchestrator.evals.task_sampler import discover_completed_tasks
 from orchestrator.git_ops import DEFAULT_COMMIT_CITATION_PATTERN, GitOps, render_citation_pattern
 from orchestrator.merge_lane.gates import ALREADY_LANDED_CITATION_PATTERN
+
+_CITATION_LIB = Path(__file__).resolve().parents[1] / 'scripts' / 'warm-lane' / 'lib_task_citation.sh'
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -189,3 +191,33 @@ class TestEvalMinersFollowTheConfiguredSubject:
         self, feat_trunk: FeatTrunk,
     ) -> None:
         assert _resolve_feat_trunk('a b', feat_trunk.repo) is None
+
+
+_LIB_CITES = (
+    'source "$1"; prefix_re="$(task_citation_regex_escape "$2")"; '
+    'task_citation_message_cites "$3" "$4" "$prefix_re" "$5" "$6"'
+)
+
+
+def _lib_cites(message: str, task_id: str, *, rendered_for: str = 'feat/') -> bool:
+    """Ask lib_task_citation.sh, prefix ``feat/``, with the merge arm rendered for *rendered_for*."""
+    head, into = rendered_prefix(rendered_for)
+    completed = subprocess.run(
+        ['bash', '-c', _LIB_CITES, '_', str(_CITATION_LIB), 'feat/', message, task_id, head, into],
+        capture_output=True, text=True,
+    )
+    assert completed.returncode in (0, 1) and completed.stderr == '', completed
+    return completed.returncode == 0
+
+
+class TestLibTaskCitationFedRenderedPrefix:
+    def test_the_landing_message_cites_its_task(self, feat_trunk: FeatTrunk) -> None:
+        message = _git(feat_trunk.repo, 'show', '-s', '--format=%B', feat_trunk.merge_sha)
+        assert _lib_cites(message, '50')
+
+    def test_a_revert_message_cites_nothing(self, feat_trunk: FeatTrunk) -> None:
+        message = _git(feat_trunk.repo, 'show', '-s', '--format=%B', feat_trunk.revert_sha)
+        assert not _lib_cites(message, '51')
+
+    def test_the_lib_uses_the_merge_arm_it_is_given(self) -> None:
+        assert not _lib_cites(_feat_trunk_landing(), '50', rendered_for='wip/')
