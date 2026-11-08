@@ -21,9 +21,13 @@ import pytest
 from _ladder_git import commit, git, git_env, new_repo
 from shared.merge_subject import format_merge_subject
 
-from orchestrator.agents.landed_sha_searches import LandedShaSearches, already_merged_step
+from orchestrator.agents.landed_sha_searches import (
+    CitationGateUnavailable,
+    LandedShaSearches,
+    already_merged_step,
+)
 from orchestrator.config import GitConfig
-from orchestrator.git_ops import GitOps, task_citation_pattern
+from orchestrator.git_ops import CitationPatternInvalid, GitOps, task_citation_pattern
 
 TASK_ID = '49'
 
@@ -138,7 +142,7 @@ def test_citation_walk_lists_the_commit_find_task_citation_commit_cites(
     ]
 
     walk = LandedShaSearches.for_task(TASK_ID, cfg).citation_walk
-    assert walk is not None
+    assert isinstance(walk, str)
     pattern = task_citation_pattern(TASK_ID, cfg.commit_citation_pattern)
     assert pattern is not None
     cites = re.compile(pattern)
@@ -156,7 +160,28 @@ def test_citation_walk_lists_the_commit_find_task_citation_commit_cites(
 def test_opted_out_project_renders_no_citation_walk() -> None:
     searches = LandedShaSearches.for_task(TASK_ID, GitConfig(commit_citation_pattern=''))
 
-    assert searches.citation_walk is None
+    assert searches.citation_walk is CitationGateUnavailable.OPTED_OUT
+
+
+_UNRENDERABLE_TEMPLATES = [
+    pytest.param(r'^\[{tid}\][0-9]{2}', id='ere-brace-quantifier'),
+    pytest.param('{nope}', id='unknown-field'),
+    pytest.param('({tid}', id='not-a-python-re'),
+]
+
+
+@pytest.mark.parametrize('template', _UNRENDERABLE_TEMPLATES)
+def test_an_unrenderable_project_pattern_is_one_typed_error(template: str) -> None:
+    with pytest.raises(CitationPatternInvalid):
+        task_citation_pattern(TASK_ID, template)
+
+
+@pytest.mark.parametrize('template', _UNRENDERABLE_TEMPLATES)
+def test_an_unrenderable_project_pattern_leaves_the_step_renderable(template: str) -> None:
+    searches = LandedShaSearches.for_task(TASK_ID, GitConfig(commit_citation_pattern=template))
+
+    assert searches.citation_walk is CitationGateUnavailable.PATTERN_INVALID
+    assert 'commit_citation_pattern' in already_merged_step(searches)
 
 
 _STEP_CONFIGS = [
@@ -177,8 +202,8 @@ def test_already_merged_step_carries_the_rendered_searches(
     searches = LandedShaSearches.for_task(TASK_ID, cfg)
     step = already_merged_step(searches)
 
-    assert (searches.citation_walk is not None) == renders_walk
+    assert isinstance(searches.citation_walk, str) == renders_walk
     assert searches.ancestry in step
     assert searches.marker_search in step
-    if searches.citation_walk is not None:
+    if isinstance(searches.citation_walk, str):
         assert searches.citation_walk in step

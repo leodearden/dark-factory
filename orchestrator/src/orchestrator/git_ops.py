@@ -468,11 +468,24 @@ DEFAULT_COMMIT_CITATION_PATTERN: str = (
 
 
 def task_citation_pattern(tid: str, pattern_template: str | None = None) -> str | None:
-    """*tid*'s citation regex, valid as both git ERE and Python ``re``; None when *pattern_template* is ``''`` (opted out)."""
+    """*tid*'s citation regex, valid as both git ERE and Python ``re``; None when *pattern_template* is ``''`` (opted out).
+
+    Raises :class:`CitationPatternInvalid` when the template does not render
+    for *tid* (a literal brace such as an ERE ``{2}`` quantifier is a format
+    field) or renders to something Python ``re`` cannot compile.
+    """
     template = pattern_template if pattern_template is not None else DEFAULT_COMMIT_CITATION_PATTERN
     if template == '':
         return None
-    return template.format(tid=re.escape(tid))
+    try:
+        pattern = template.format(tid=re.escape(tid))
+    except (KeyError, IndexError, ValueError, AttributeError, TypeError) as exc:
+        raise CitationPatternInvalid(template) from exc
+    try:
+        re.compile(pattern)
+    except re.error as exc:
+        raise CitationPatternInvalid(pattern) from exc
+    return pattern
 
 # Fixed name for the persistent warm merge-verify worktree (task 1692).
 # Lives at <worktree_base>/_merge-verify.  Excluded from prune and
@@ -1711,10 +1724,10 @@ class GitQueryFailed(RuntimeError):
 
 
 class CitationPatternInvalid(ValueError):
-    """A citation lookup's pattern is not a valid Python ``re``: a caller's error, not git's."""
+    """A citation pattern does not render to a valid Python ``re``: a caller's error, not git's."""
 
     def __init__(self, pattern: str) -> None:
-        super().__init__(f'citation pattern is not a valid Python re; raising: {pattern!r}')
+        super().__init__(f'citation pattern does not render to a valid Python re: {pattern!r}')
         self.pattern = pattern
 
 
@@ -10004,7 +10017,8 @@ class GitOps:
         """Search main's history for a commit whose SUBJECT cites *tid*.
 
         The fail-safe face of :meth:`find_task_citation_commit_checked`: a git
-        failure or an uncompilable override reads as no citation.
+        failure or an override that does not render to a valid Python ``re``
+        reads as no citation.
 
         Used by the reconciler to gate the ``is_ancestor==True`` fast-path:
         ``is_ancestor`` returns True trivially for zero-commit branches
@@ -10047,15 +10061,15 @@ class GitOps:
                 (caller opt-out for projects without citation
                 conventions).  Must be valid as both a git
                 ``--extended-regexp`` pattern and a Python ``re`` pattern
-                — an uncompilable override is treated as fail-safe
-                no-citation (logs a warning and returns None), mirroring
+                — an override that does not render to one is treated as
+                fail-safe no-citation (logs a warning and returns None), mirroring
                 the prior git-error-means-None behavior.
 
         Returns:
             The 40-char commit SHA of the most recent commit on main
             whose SUBJECT cites *tid*, or None when no commit's subject
             cites the task, the pattern is disabled, or an override
-            pattern fails to compile as a Python ``re``.
+            pattern does not render to a valid Python ``re``.
         """
         try:
             return await _none_if_query_failed(
@@ -10063,8 +10077,8 @@ class GitOps:
             )
         except CitationPatternInvalid as exc:
             logger.warning(
-                'find_task_citation_commit: pattern_template is not a '
-                'valid Python re pattern (tid=%s); treating as '
+                'find_task_citation_commit: pattern_template does not '
+                'render to a valid Python re pattern (tid=%s); treating as '
                 'no-citation (fail-safe): %r',
                 tid, exc.pattern,
             )
@@ -10076,18 +10090,15 @@ class GitOps:
         """:meth:`find_task_citation_commit`, but a failed lookup raises :class:`GitQueryFailed`.
 
         Raises :class:`GitQueryFailed` on a git failure and
-        :class:`CitationPatternInvalid` on an override that is not a valid
-        Python ``re``; a disabled pattern (``''``) still answers None. For a caller
+        :class:`CitationPatternInvalid` on an override that does not render to
+        a valid Python ``re``; a disabled pattern (``''``) still answers None. For a caller
         that writes on a miss and so must not read "could not look" as "no
         citation".
         """
         pattern_str = task_citation_pattern(tid, pattern_template)
         if pattern_str is None:
             return None
-        try:
-            compiled = re.compile(pattern_str)
-        except re.error as exc:
-            raise CitationPatternInvalid(pattern_str) from exc
+        compiled = re.compile(pattern_str)
         rc, out, err = await _run(
             [
                 'git', 'log', self.config.main_branch,

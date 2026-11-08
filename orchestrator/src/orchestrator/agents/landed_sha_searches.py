@@ -15,12 +15,28 @@ from __future__ import annotations
 
 import shlex
 from dataclasses import dataclass
+from enum import Enum, auto
 
 from shared.branch_names import canonical_queued_branch_name
 from shared.merge_subject import format_merge_subject
 
 from orchestrator.config import GitConfig
-from orchestrator.git_ops import task_citation_pattern
+from orchestrator.git_ops import CitationPatternInvalid, task_citation_pattern
+
+
+class CitationGateUnavailable(Enum):
+    OPTED_OUT = auto()
+    PATTERN_INVALID = auto()
+
+
+def _citation_walk(main: str, task_id: str, template: str | None) -> str | CitationGateUnavailable:
+    try:
+        pattern = task_citation_pattern(task_id, template)
+    except CitationPatternInvalid:
+        return CitationGateUnavailable.PATTERN_INVALID
+    if pattern is None:
+        return CitationGateUnavailable.OPTED_OUT
+    return f"git log {main} --extended-regexp --format='%H %s' --grep={shlex.quote(pattern)}"
 
 
 @dataclass(frozen=True)
@@ -29,7 +45,7 @@ class LandedShaSearches:
     marker_subject: str
     ancestry: str
     marker_search: str
-    citation_walk: str | None
+    citation_walk: str | CitationGateUnavailable
 
     @classmethod
     def for_task(cls, task_id: str, git: GitConfig) -> LandedShaSearches:
@@ -37,7 +53,6 @@ class LandedShaSearches:
         subject = format_merge_subject(branch, git.main_branch)
         main = shlex.quote(git.main_branch)
         quoted_branch = shlex.quote(branch)
-        pattern = task_citation_pattern(task_id, git.commit_citation_pattern)
         return cls(
             branch=branch,
             marker_subject=subject,
@@ -46,11 +61,7 @@ class LandedShaSearches:
                 f"git log {main} --fixed-strings --grep={quoted_branch} --format='%H%x09%s'"
                 f" | awk -F'\\t' -v s={shlex.quote(subject)} '$2==s && !seen {{print $1; seen=1}}'"
             ),
-            citation_walk=(
-                None
-                if pattern is None
-                else f"git log {main} --extended-regexp --format='%H %s' --grep={shlex.quote(pattern)}"
-            ),
+            citation_walk=_citation_walk(main, task_id, git.commit_citation_pattern),
         )
 
 
@@ -76,10 +87,13 @@ passes ancestry trivially. No subject-citing row means a phantom branch: stamp n
 it as not landed. `escalation/src/escalation/git_authority.py::found_on_main_response` resolves the \
 same question the same way."""
 
-_CITATION_OPTED_OUT = """\
-   - **Citation gate** (ancestry rc=0 with no qualifying marker): this project sets \
-`git.commit_citation_pattern: ""`, so the gate cannot be evaluated. Stamp nothing on this arm and \
-report it as un-evaluable, not as not landed."""
+_UNAVAILABLE_CITATION_CAUSE = {
+    CitationGateUnavailable.OPTED_OUT: 'this project sets `git.commit_citation_pattern: ""`',
+    CitationGateUnavailable.PATTERN_INVALID: (
+        "this project's `git.commit_citation_pattern` does not render to a valid regex for this "
+        'task (the merge lane reads it as no citation)'
+    ),
+}
 
 _LADDER_ONLY = """\
    - Every other outcome (ancestry rc=1, a `coalesce-*` train, a rebased solo landing) is decided \
@@ -115,9 +129,13 @@ def _marker_reading(searches: LandedShaSearches) -> str:
     )
 
 
-def _citation_bullet(citation_walk: str | None) -> str:
-    if citation_walk is None:
-        return _CITATION_OPTED_OUT
+def _citation_bullet(citation_walk: str | CitationGateUnavailable) -> str:
+    if isinstance(citation_walk, CitationGateUnavailable):
+        return (
+            '   - **Citation gate** (ancestry rc=0 with no qualifying marker): '
+            f'{_UNAVAILABLE_CITATION_CAUSE[citation_walk]}, so the gate cannot be evaluated. Stamp '
+            'nothing on this arm and report it as un-evaluable, not as not landed.'
+        )
     return _command_bullet(
         '**Citation gate** (ancestry rc=0 with no qualifying marker: a fast-forward, or work '
         'covered by a sibling task):',
