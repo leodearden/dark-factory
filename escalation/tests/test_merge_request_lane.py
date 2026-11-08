@@ -22,6 +22,7 @@ the lane fallback never adds a second Taskmaster round-trip to the submit path.
 from __future__ import annotations
 
 import asyncio
+import json
 import types
 from pathlib import Path
 from typing import Any
@@ -42,12 +43,14 @@ try:
     from orchestrator.merge_lane.worker import (
         InFlightMergeRegistry,
     )
+    from orchestrator.scheduler import Scheduler
     _ORCHESTRATOR_AVAILABLE = True
 except ImportError:
     _ORCHESTRATOR_AVAILABLE = False
     OrchestratorConfig: Any = None  # type: ignore[assignment,misc]
     InFlightMergeRegistry: Any = None  # type: ignore[assignment,misc]
     MergeOutcome: Any = None  # type: ignore[assignment,misc]
+    Scheduler: Any = None  # type: ignore[assignment,misc]
 
 
 pytestmark = [
@@ -496,3 +499,79 @@ class TestSubmitResponseEchoesTheResolvedLane:
         assert result.get('lane') == 'high', result
         assert result.get('lane_source') == 'argument', result
         assert result.get('lane_applied') is False, result
+
+
+# ---------------------------------------------------------------------------
+# The real orchestrator Scheduler — a fused-memory fault is not "no such task"
+# ---------------------------------------------------------------------------
+
+
+class _GetTaskReplySession:
+    """An ``mcp_session`` double that answers ``get_task`` with one payload.
+
+    Any other tool raises, so a read this composition does not expect fails
+    loudly instead of being answered.
+    """
+
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self._payload = payload
+
+    async def call_tool(
+        self, name: str, arguments: dict[str, Any], timeout: float = 30,
+    ) -> dict[str, Any]:
+        if name != 'get_task':
+            raise NotImplementedError(f'unexpected tool call: {name}')
+        return {
+            'jsonrpc': '2.0',
+            'id': 1,
+            'result': {'content': [{'type': 'text', 'text': json.dumps(self._payload)}]},
+        }
+
+
+def _real_scheduler_harness(tmp_path: Path, payload: dict[str, Any]) -> types.SimpleNamespace:
+    return types.SimpleNamespace(
+        git_ops=_stub_git_ops(),
+        scheduler=Scheduler(
+            OrchestratorConfig(project_root=tmp_path / 'repo'),
+            mcp_session=_GetTaskReplySession(payload),
+        ),
+    )
+
+
+class TestRealSchedulerReadFeedsLaneSource:
+    """Task 8336: drive the production ``Scheduler`` itself, not a stub of it.
+
+    The real ``Scheduler.get_task`` never raises: it answers ``None`` for a
+    fused-memory fault and for absence alike.  So an AsyncMock that raises
+    kept the "could not read" arm looking tested while, in production, every
+    fault read as "no such task" and reported ``lane_source='default'``.
+    """
+
+    async def test_a_fused_memory_error_reply_reports_unavailable(self, tmp_path: Path):
+        harness = _real_scheduler_harness(
+            tmp_path,
+            {'error': 'fused-memory backend unreachable', 'error_type': 'TaskmasterError'},
+        )
+        result = await _submit_nonblocking(tmp_path, harness)
+        assert result.get('status') == 'queued', result
+        assert result.get('lane') == 'normal', result
+        assert result.get('lane_source') == 'unavailable', result
+
+    async def test_no_such_task_reports_the_default(self, tmp_path: Path):
+        harness = _real_scheduler_harness(
+            tmp_path,
+            {'error': 'No tasks found for ID(s): 4888', 'error_type': 'TaskNotFoundError'},
+        )
+        result = await _submit_nonblocking(tmp_path, harness)
+        assert result.get('status') == 'queued', result
+        assert result.get('lane') == 'normal', result
+        assert result.get('lane_source') == 'default', result
+
+    async def test_a_task_row_lane_is_honoured(self, tmp_path: Path):
+        harness = _real_scheduler_harness(
+            tmp_path, {'id': '4888', 'status': 'pending', 'metadata': {'merge_lane': 'high'}},
+        )
+        result = await _submit_nonblocking(tmp_path, harness)
+        assert result.get('status') == 'queued', result
+        assert result.get('lane') == 'high', result
+        assert result.get('lane_source') == 'task_metadata', result
