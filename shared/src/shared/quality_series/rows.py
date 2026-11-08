@@ -9,11 +9,14 @@ unit's members and copied to each; reviews stay per landing.
 from __future__ import annotations
 
 import bisect
+import json
 import os
 import sqlite3
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from enum import StrEnum
+from pathlib import Path
 from typing import Any, Generic, TypeVar
 
 from shared.quality_series.git_lines import ModuleLines
@@ -21,11 +24,15 @@ from shared.quality_series.landings import Landing, parse_utc
 
 __all__ = [
     'IMPLEMENTER_CLASS_ROLES',
+    'CharterClass',
+    'CharterClassSource',
     'Cost',
     'LandingRow',
     'Outcomes',
     'QualityRowInvariantError',
+    'ReviewRoundsSource',
     'SourceEpochs',
+    'UnknownCharterClass',
     'rows_for',
     'unit_heads',
 ]
@@ -112,6 +119,38 @@ class Outcomes:
 
 IMPLEMENTER_CLASS_ROLES = ('implementer', 'simple_task')
 
+
+class ReviewRoundsSource(StrEnum):
+    REVIEW_COMPLETED = 'review_completed'
+    DISK_COUNTER = 'disk_counter'
+
+
+class CharterClass(StrEnum):
+    """Why a task's charter blocked it; task ζ's orchestrator writer imports this vocabulary."""
+
+    UNDER_SPECIFIED = 'under_specified'
+    STALE_CHARTER = 'stale_charter'
+    PLAN_FILES_UNTOUCHED = 'plan_files_untouched'
+
+
+class CharterClassSource(StrEnum):
+    CHARTER_CLASS = 'charter_class'
+    REGEX_BACKFILL = 'regex_backfill'
+
+
+class UnknownCharterClass(ValueError):
+    """task_results.charter_class holds a value outside CharterClass."""
+
+
+_CHARTER_BACKFILL_PREFIXES: tuple[tuple[str, CharterClass], ...] = (
+    ('Architect reported task unactionable', CharterClass.UNDER_SPECIFIED),
+    ('Architect reported false RED-test premise', CharterClass.UNDER_SPECIFIED),
+    ('Architect reported task already done', CharterClass.STALE_CHARTER),
+    # orchestrator/src/orchestrator/merge_lane/gates.py::PLAN_FILES_NOT_TOUCHED_REASON_PREFIX
+    ('Plan files not touched by branch', CharterClass.PLAN_FILES_UNTOUCHED),
+)
+"""The pre-ζ backfill: block_reason prefixes, the only string matching in this package."""
+
 TURNS_CAP_REASON = 'turns'
 """shared/src/shared/cost_store.py::CapReason.TURNS, restated: that module is not stdlib-only."""
 
@@ -126,6 +165,10 @@ class Cost:
     execute_iterations: int | None
     turns: int | None
     turns_capped: bool
+    review_rounds: int | None
+    review_rounds_source: ReviewRoundsSource | None
+    charter_class: CharterClass | None
+    charter_class_source: CharterClassSource | None
 
     def __post_init__(self) -> None:
         _invariant((self.all_role_usd is None) == (self.implementer_invocations is None),
@@ -138,6 +181,14 @@ class Cost:
         _invariant(self.turns is not None or not self.turns_capped,
                    'a turns cap needs a turns count', turns=self.turns,
                    turns_capped=self.turns_capped)
+        _invariant((self.review_rounds is None) == (self.review_rounds_source is None),
+                   'review_rounds and its source are None together',
+                   review_rounds=self.review_rounds,
+                   review_rounds_source=self.review_rounds_source)
+        _invariant((self.charter_class is None) == (self.charter_class_source is None),
+                   'charter_class and its source are None together',
+                   charter_class=self.charter_class,
+                   charter_class_source=self.charter_class_source)
 
 
 @dataclass(frozen=True)
@@ -219,6 +270,36 @@ _EXECUTE_SQL = """
 SELECT task_id, completed_at, execute_iterations FROM task_results
  WHERE completed_at IS NOT NULL AND completed_at != '' AND task_id IN ({})
 """
+_CHARTER_SQL = """
+SELECT task_id, completed_at, task_id, {charter_column}, block_reason FROM task_results
+ WHERE completed_at IS NOT NULL AND completed_at != '' AND task_id IN ({{}})
+"""
+
+
+def _has_charter_column(conn: sqlite3.Connection) -> bool:
+    return any(row[1] == 'charter_class' for row in conn.execute('PRAGMA table_info(task_results)'))
+
+
+@dataclass(frozen=True)
+class _Charter:
+    charter_class: CharterClass
+    source: CharterClassSource
+
+
+def _charter(values: tuple[Any, ...]) -> _Charter | None:
+    task_id, column, block_reason = values
+    if column is not None:
+        try:
+            return _Charter(CharterClass(column), CharterClassSource.CHARTER_CLASS)
+        except ValueError as exc:
+            raise UnknownCharterClass(
+                f'task_results.charter_class={column!r} for task_id={task_id!r} is not one of '
+                f'{sorted(c.value for c in CharterClass)}'
+            ) from exc
+    for prefix, charter_class in _CHARTER_BACKFILL_PREFIXES:
+        if (block_reason or '').startswith(prefix):
+            return _Charter(charter_class, CharterClassSource.REGEX_BACKFILL)
+    return None
 
 FLAKE_CONFIRMED = 'passes_in_isolation'
 FLAKE_REAL_RED = 'fails_in_isolation'
@@ -254,6 +335,7 @@ class _Sources:
     invocations: dict[str, _Timeline[_Invocation]]
     turns: dict[str, _Timeline[_Turns]]
     execute_iterations: dict[str, _Timeline[int]]
+    charters: dict[str, _Timeline[_Charter | None]]
 
     @classmethod
     def load(cls, conn: sqlite3.Connection, task_ids: Sequence[str]) -> _Sources:
@@ -270,6 +352,9 @@ class _Sources:
                              lambda v: _Turns(int(v[0]), v[1] == TURNS_CAP_REASON)),
             execute_iterations=_timelines(conn, _EXECUTE_SQL, task_ids,
                                           lambda v: int(v[0] or 0)),
+            charters=_timelines(conn, _CHARTER_SQL.format(
+                charter_column='charter_class' if _has_charter_column(conn) else 'NULL',
+            ), task_ids, _charter),
         )
 
     def window(self, timelines: dict[str, _Timeline[T]], landing: Landing) -> list[T]:
@@ -332,7 +417,38 @@ def _usd_by_role(invocations: list[_Invocation]) -> tuple[tuple[str, float], ...
     return tuple(sorted(by_role.items()))
 
 
-def _cost(sources: _Sources, landing: Landing) -> Cost:
+def _disk_review_cycles(repo: str | os.PathLike[str], task_id: str) -> int | None:
+    meta = Path(repo) / '.worktrees' / '.task-meta'
+    for dirname in (task_id, f'task-{task_id}'):
+        state = meta / dirname / 'review_state.json'
+        if not state.exists():
+            continue
+        try:
+            document = json.loads(state.read_text())
+        except (OSError, json.JSONDecodeError):
+            return None
+        total = document.get('review_cycles_total') if isinstance(document, dict) else None
+        return total if isinstance(total, int) and not isinstance(total, bool) else None
+    return None
+
+
+def _review_rounds(
+    sources: _Sources, landing: Landing, repo: str | os.PathLike[str]
+) -> tuple[int | None, ReviewRoundsSource | None]:
+    """Rounds from review_completed cycles; before that source's epoch, the lifetime disk counter."""
+    if _covers(sources.epochs.review_completed, landing):
+        cycles = [review.cycle for review in sources.window(sources.reviews, landing)]
+        return (max(cycles), ReviewRoundsSource.REVIEW_COMPLETED) if cycles else (None, None)
+    total = _disk_review_cycles(repo, landing.task_id)
+    return (total + 1, ReviewRoundsSource.DISK_COUNTER) if total is not None else (None, None)
+
+
+def _charter_class(sources: _Sources, landing: Landing) -> _Charter | None:
+    classified = [c for c in sources.window(sources.charters, landing) if c is not None]
+    return classified[-1] if classified else None
+
+
+def _cost(sources: _Sources, landing: Landing, repo: str | os.PathLike[str]) -> Cost:
     epochs = sources.epochs
     invocations = (sources.window(sources.invocations, landing)
                    if _covers(epochs.invocations, landing) else [])
@@ -341,6 +457,8 @@ def _cost(sources: _Sources, landing: Landing) -> Cost:
     iterations = sources.window(sources.execute_iterations, landing)
     by_role = _usd_by_role(invocations)
     implementer = sum(1 for i in invocations if i.role in IMPLEMENTER_CLASS_ROLES)
+    review_rounds, review_rounds_source = _review_rounds(sources, landing, repo)
+    charter = _charter_class(sources, landing)
     return Cost(
         all_role_usd=sum(usd for _, usd in by_role) if invocations else None,
         by_role=by_role,
@@ -348,6 +466,10 @@ def _cost(sources: _Sources, landing: Landing) -> Cost:
         execute_iterations=sum(iterations) if iterations else None,
         turns=sum(t.turns for t in turns) if turns else None,
         turns_capped=any(t.capped for t in turns),
+        review_rounds=review_rounds,
+        review_rounds_source=review_rounds_source,
+        charter_class=None if charter is None else charter.charter_class,
+        charter_class_source=None if charter is None else charter.source,
     )
 
 
@@ -373,7 +495,7 @@ def rows_for(
             LandingRow(
                 landing=member,
                 outcomes=_outcomes(sources, unit_outcomes, member),
-                cost=_cost(sources, member),
+                cost=_cost(sources, member, repo),
                 modules=(),
                 rule_vintage=sources.epochs,
             )
