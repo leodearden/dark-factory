@@ -54,6 +54,7 @@ from escalation.models import (
     STATUS_ACCEPTED_UNPERSISTED,
     Escalation,
     LateResolution,
+    cascade_resolved_by,
     max_severity,
     note_to_file_class_conflict,
     recut_action_conflict,
@@ -1446,9 +1447,10 @@ class EscalationQueue:
 
         Cascade: if the escalation is an L2 with a non-empty ``members`` list,
         after archiving the L2 each member id is resolved recursively with the
-        same *resolution* text.  The cascade uses
-        ``resolved_by='l2-cascade:{escalation_id}'`` so the audit trail
-        distinguishes direct resolves from cascades.  *dismiss* is propagated
+        same *resolution* text.  The cascade stamps
+        ``resolved_by=models.cascade_resolved_by(escalation_id)`` (read back by
+        ``models.cascade_parent_id``) so the audit trail distinguishes direct
+        resolves from cascades.  *dismiss* is propagated
         so a dismissed L2 dismisses its members too.
 
         Cascade contract:
@@ -1578,14 +1580,14 @@ class EscalationQueue:
         # Cascade to member L1s (L2 clusters only — L0/L1 have empty members).
         # Recursion is bounded: L1 members carry empty members[], so no deeper nesting.
         if esc.members:
-            cascade_resolved_by = f'l2-cascade:{escalation_id}'
+            member_resolved_by = cascade_resolved_by(escalation_id)
             for member_id in esc.members:
                 try:
                     self.resolve(
                         member_id,
                         resolution,
                         dismiss=dismiss,
-                        resolved_by=cascade_resolved_by,
+                        resolved_by=member_resolved_by,
                         resolution_class=esc.resolution_class,
                     )
                 except Exception as e:
@@ -1827,7 +1829,7 @@ class EscalationQueue:
                         )
                         continue
                     # In-memory cascade signal only; no disk write.
-                    member.resolved_by = f'l2-cascade:{escalation_id}'
+                    member.resolved_by = cascade_resolved_by(escalation_id)
                     if self._resolve_callback:
                         try:
                             self._resolve_callback(member)
