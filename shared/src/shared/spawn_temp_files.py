@@ -11,6 +11,7 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import NamedTuple
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +59,7 @@ def sweep_orphaned_spawn_temp_files(
     The per-call ``finally`` unlink in every caller of
     shared/src/shared/cli_invoke.py::build_claude_argv is the eager path; this is the
     SIGKILL-recovery half, run once at process start. Returns the number of files this
-    call genuinely removed.
+    call genuinely removed. Contains every ``OSError`` and never raises one.
 
     A file is deleted only when ALL of these hold: its name has a ``SPAWN_TEMP_NAMES``
     kind's exact mkstemp shape; it is a regular file (not a symlink, not a dir); it is
@@ -67,26 +68,63 @@ def sweep_orphaned_spawn_temp_files(
     embedded in an ``sh -c`` token or a ``--flag=value`` is caught). Why cmdline and not
     fds: shared/tests/test_spawn_temp_files.py::test_keeps_a_stale_file_a_live_process_names_on_its_cmdline.
 
+    Fails safe: when liveness cannot be established (*proc_root* unlistable, this
+    process absent from it, or a cmdline unreadable for any reason but the pid exiting),
+    nothing is deleted and one WARNING says so.
+
     No TOCTOU: every invocation, resume included since task 3983, mkstemps FRESH files,
     so no new process can come to reference a file already past *min_age_secs*.
+
+    *deadline_secs* bounds the directory walk and the unlinks, and a stop is logged as
+    INCOMPLETE. The /proc read is deliberately NOT bounded: a truncated process table is
+    unknown liveness and must never license a delete.
     """
     base = base_dir or Path(tempfile.gettempdir())
-    candidates = _stale_candidates(base, min_age_secs)
-    if not candidates:
+    deadline = time.monotonic() + deadline_secs
+    try:
+        scan = _scan_stale_candidates(base, min_age_secs, deadline)
+    except OSError:
+        logger.warning('Could not scan %s for orphaned agent-spawn temp files — skipping the sweep',
+                       base, exc_info=True)
         return 0
-    referenced = _referenced_by_live_processes(proc_root, [path.name for path in candidates])
-    removed = _unlink_orphans([path for path in candidates if path.name not in referenced])
+    if not scan.complete:
+        _warn_incomplete(deadline_secs, scan.examined, removed=0)
+        return 0
+    if not scan.candidates:
+        return 0
+    referenced = _referenced_by_live_processes(proc_root, [path.name for path in scan.candidates])
+    if referenced is None:
+        logger.warning(
+            'Deleted nothing from %s: could not establish process liveness from %s (it must be '
+            'listable, list this process, pid %d, and have every cmdline readable)',
+            base, proc_root, os.getpid(),
+        )
+        return 0
+    orphans = [path for path in scan.candidates if path.name not in referenced]
+    removed, complete = _unlink_orphans(orphans, deadline)
+    if not complete:
+        _warn_incomplete(deadline_secs, scan.examined, removed)
     if removed:
         logger.info('Reclaimed %d orphaned agent-spawn temp file(s) from %s', removed, base)
     return removed
 
 
-def _stale_candidates(base: Path, min_age_secs: float) -> list[Path]:
+class _Scan(NamedTuple):
+    candidates: list[Path]
+    examined: int
+    complete: bool
+
+
+def _scan_stale_candidates(base: Path, min_age_secs: float, deadline: float) -> _Scan:
     euid = os.geteuid()
     now = time.time()
     candidates: list[Path] = []
+    examined = 0
     with os.scandir(base) as entries:
         for entry in entries:
+            if time.monotonic() >= deadline:
+                return _Scan(candidates, examined, complete=False)
+            examined += 1
             if not any(kind.matches(entry.name) for kind in SPAWN_TEMP_NAMES):
                 continue
             try:
@@ -95,23 +133,35 @@ def _stale_candidates(base: Path, min_age_secs: float) -> list[Path]:
                 continue
             if stat.S_ISREG(st.st_mode) and st.st_uid == euid and now - st.st_mtime >= min_age_secs:
                 candidates.append(Path(entry.path))
-    return candidates
+    return _Scan(candidates, examined, complete=True)
 
 
-def _referenced_by_live_processes(proc_root: Path, names: list[str]) -> frozenset[str]:
+def _referenced_by_live_processes(proc_root: Path, names: list[str]) -> frozenset[str] | None:
+    """The *names* some live process's cmdline mentions, or None when liveness is unknown."""
+    try:
+        pids = [name for name in os.listdir(proc_root) if name.isdigit()]
+    except OSError:
+        return None
+    if str(os.getpid()) not in pids:
+        return None
     cmdlines: list[bytes] = []
-    for pid in (name for name in os.listdir(proc_root) if name.isdigit()):
+    for pid in pids:
         try:
             cmdlines.append((proc_root / pid / 'cmdline').read_bytes())
         except (FileNotFoundError, ProcessLookupError):
             continue
+        except OSError:
+            return None
     blob = b'\0'.join(cmdlines)
     return frozenset(name for name in names if os.fsencode(name) in blob)
 
 
-def _unlink_orphans(orphans: list[Path]) -> int:
+def _unlink_orphans(orphans: list[Path], deadline: float) -> tuple[int, bool]:
+    """Unlink *orphans* until the deadline; return (removed, whether every one was tried)."""
     removed = 0
     for path in orphans:
+        if time.monotonic() >= deadline:
+            return removed, False
         try:
             path.unlink()
         except FileNotFoundError:
@@ -120,4 +170,12 @@ def _unlink_orphans(orphans: list[Path]) -> int:
             logger.warning('Could not reclaim orphaned agent-spawn temp file %s', path, exc_info=True)
             continue
         removed += 1
-    return removed
+    return removed, True
+
+
+def _warn_incomplete(deadline_secs: float, examined: int, removed: int) -> None:
+    logger.warning(
+        'Orphaned agent-spawn temp-file sweep stopped on the %.1fs deadline — this sweep is '
+        'INCOMPLETE (examined %d, removed %d). Later sweeps reclaim the rest.',
+        deadline_secs, examined, removed,
+    )
