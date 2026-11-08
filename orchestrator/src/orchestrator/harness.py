@@ -114,6 +114,12 @@ from orchestrator.git_ops import GitOps, classify_worktree_entry
 from orchestrator.landing_reject_emission import LandingRejectRecorder, LandingRejectSite
 from orchestrator.lane_lifecycle import LaneRecord
 from orchestrator.lane_lifecycle import LaneState as DurableLaneState
+from orchestrator.lane_record_divergence import (
+    STREAKS_FILENAME,
+    LaneDivergence,
+    advance_lane_record_divergence,
+    file_persistent_divergence_alarm,
+)
 from orchestrator.main_tip_sweep_cadence import MainSweepColdControl, SweepSeedMode
 from orchestrator.mcp_lifecycle import McpLifecycle
 from orchestrator.merge_deferred_recovery import AbandonedMemberSweep
@@ -5697,6 +5703,37 @@ class Harness:
                     f'stale {age.total_seconds() / 86400:.1f}d'
                 )
         return census
+
+    def _lane_record_divergence_for_digest(
+        self, digest_dir: Path,
+    ) -> tuple[LaneDivergence, ...] | None:
+        """This digest's warm-lane map↔record divergences (task 2987 δ).
+
+        See :mod:`orchestrator.lane_record_divergence`. ``None`` means the
+        durable records could not be read.
+        """
+        pool = self.git_ops.warm_lane_pool
+        if pool is None:
+            return ()
+        try:
+            # Back-to-back with no await: no acquire/release can interleave.
+            assignments = pool.assignments_snapshot()
+            records = self.git_ops._lane_lifecycle.all_records()
+        except OSError:
+            logger.warning(
+                'lane_record_divergence: durable lane records unreadable; '
+                'skipping this digest\'s cross-check', exc_info=True,
+            )
+            return None
+        divergences = advance_lane_record_divergence(
+            assignments, records, streaks_path=digest_dir / STREAKS_FILENAME,
+        )
+        file_persistent_divergence_alarm(
+            self._escalation_queue, divergences,
+            event_store=self.event_store,
+            filing_claimant_run_id=self._filing_claimant_run_id,
+        )
+        return divergences
 
     def _get_ground_truth(self) -> TaskGroundTruth:
         """Lazily build (and memoize) the ground-truth resolver (task 2243, W10-θ2).
@@ -19179,6 +19216,8 @@ class Harness:
         10. Update EWA using EventStore done_count.
         11. Compute trip flag and anomaly flags.
         11c. Gather the paused-waiting section inputs (fail-open; task 5311).
+        11d. Cross-check the warm-lane map against the durable lane records
+             (read-only, fail-open; task 2987).
         12. Write digest file (fail-open via write_digest_entry).
         13. Advance counters/state using the snapshot from step 2 (not the
             live counter), so that concurrent callbacks firing inside this
@@ -19335,6 +19374,8 @@ class Harness:
             stale_lane_census = await self._stale_lane_assignment_census()
             # (11c) Paused re-pends and overdue pause L1s (task 5311) — fail-open.
             pause_visibility = await self._pause_visibility_for_digest(events_db_path)
+            # (11d) Lane map↔record divergence cross-check (task 2987 δ) — read-only, fail-open.
+            lane_record_divergence = self._lane_record_divergence_for_digest(digest_dir)
 
             inputs = digest_mod.DigestInputs(
                 window_start_iso=window_start,
@@ -19357,6 +19398,7 @@ class Harness:
                 lifecycle_events_in_step=diff,
                 pause_visibility=pause_visibility,
                 chain_telemetry=chain_telemetry,
+                lane_record_divergence=lane_record_divergence,
             )
 
             digest_mod.write_digest_entry(digest_dir, inputs)
