@@ -26,6 +26,7 @@ from _merge_lane_fakes import (
     make_lane,
     merge_through_lane,
     running_lane,
+    slot_states,
 )
 from _orch_helpers import wait_responsive
 from _recording_event_store import _RecordingEventStore
@@ -136,11 +137,6 @@ async def _single(scene: _Scene, name: str) -> MergeRequest:
     )
 
 
-def _slot_states(lane: MergeLane) -> dict[str, str]:
-    """Each verify host's slot state, as the lane's public census reports it."""
-    return {host['name']: host['slot_state'] for host in lane.snapshot()['hosts']}
-
-
 def _in_flight(lane: MergeLane, task_id: str) -> list[dict[str, Any]]:
     """The restart drain's in-flight verify records for *task_id*."""
     records = lane.snapshot()['restart_drain']['verifies_in_flight']
@@ -219,10 +215,10 @@ async def test_a_train_verify_holds_the_local_host_slot_until_it_lands(scene: _S
     async with running_lane(lane) as run:
         await queue.put(train.request)
         await wait_responsive(entered.wait(), label='train verify under way')
-        while_verifying = _slot_states(lane).get('local')
+        while_verifying = slot_states(lane).get('local')
         release.set()
         outcome = await run.outcome(train.request)
-        after_landing = _slot_states(lane).get('local')
+        after_landing = slot_states(lane).get('local')
 
     assert while_verifying == 'busy'
     assert outcome.status == 'done', outcome
@@ -246,11 +242,11 @@ async def test_a_two_member_train_verifies_on_a_free_remote_under_prefer_remote(
     async with running_lane(lane) as run:
         await queue.put(train.request)
         await wait_responsive(entered.wait(), label='train verify under way on the remote')
-        while_verifying = _slot_states(lane).get('laptop')
+        while_verifying = slot_states(lane).get('laptop')
         records = _in_flight(lane, train.tip)
         release.set()
         outcome = await run.outcome(train.request)
-        after_landing = _slot_states(lane).get('laptop')
+        after_landing = slot_states(lane).get('laptop')
 
     assert while_verifying == 'busy'
     assert [(r['host'], r['kind']) for r in records] == [('laptop', 'train')]

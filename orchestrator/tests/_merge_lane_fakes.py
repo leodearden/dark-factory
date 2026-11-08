@@ -11,7 +11,8 @@ hand-advanced clock whose ``sleep`` advances it and waits at most
 in-flight verify keeps writing;
 ``RecordingEscalations`` stands in for the escalation queue and keeps what
 the lane filed; ``lane_state``/``lane_entry`` read an item's state back off
-the lane's public ``snapshot()`` census. ``make_lane`` builds a lane on all three at once, so a test
+the lane's public ``snapshot()`` census, and ``slot_states`` each verify
+host's slot state. ``make_lane`` builds a lane on all three at once, so a test
 that owns its worker never falls back to a production adapter by omission;
 ``running_lane`` runs such a lane for the body of a block and
 ``merge_through_lane`` until it resolves one request; ``drive_merge`` plays
@@ -70,6 +71,12 @@ def lane_state(lane: MergeLane, request_id: str) -> str | None:
     """
     entry = lane_entry(lane, request_id)
     return None if entry is None else entry['state']
+
+
+def slot_states(lane: MergeLane) -> dict[str, str]:
+    """Each verify host's slot state, keyed by host name, as the lane's
+    public ``snapshot()['hosts']`` census reports it."""
+    return {host['name']: host['slot_state'] for host in lane.snapshot()['hosts']}
 
 
 def lane_finalizing(lane: MergeLane) -> list[dict[str, Any]]:
@@ -323,9 +330,9 @@ class FakeRemoteRunner:
     ``reap_idle_gates`` is the no-op a running lane's reprobe loop calls on
     every remote.
 
-    It exposes no ``dispatch_in_flight``, which the lane's no-progress abort
-    reads as a live dispatch (``worker.py::SpeculativeMergeWorker._run_inflight_verify``),
-    so a verify held on it is never no-progress-aborted.
+    It exposes no ``dispatch_in_flight``, which the lane reads as a live
+    dispatch (``orchestrator/merge_lane/types.py::remote_dispatch_live``), so
+    a verify held on it is never no-progress-aborted.
     """
 
     is_local: ClassVar[bool] = False

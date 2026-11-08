@@ -9,7 +9,7 @@ import contextlib
 import dataclasses
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, assert_never
 
 import pytest
 from _git_fixtures import RepoSeed, seed_repo
@@ -18,10 +18,12 @@ from _merge_lane_fakes import (
     FakeVerifier,
     hangs_until,
     healthy_verify_clock,
+    lane_entry,
     lane_scene_config,
     lane_state,
     make_lane,
     running_lane,
+    slot_states,
 )
 from _orch_helpers import wait_responsive
 
@@ -37,7 +39,8 @@ _GIT = GitConfig(
 )
 _SEED = RepoSeed(files=(('README.md', '# Test\n'),), message='Initial commit')
 _HEAD_HOST = 'head-host'
-_REQUEUE_TRIGGERS = ('no_progress',)
+_VerifyExit = Literal['no_progress', 'abandon']
+_REQUEUE_TRIGGERS: tuple[_VerifyExit, ...] = ('no_progress',)
 _POLL_SECS = 0.005
 _SETTLE_POLLS = 200
 
@@ -90,14 +93,6 @@ async def _settle(predicate: Callable[[], bool]) -> None:
         await asyncio.sleep(_POLL_SECS)
 
 
-def _rendered_ids(snap: dict[str, Any]) -> list[str]:
-    return [entry['request_id'] for entry in snap['entries']]
-
-
-def _slot_states(snap: dict[str, Any]) -> dict[str, str]:
-    return {host['name']: host['slot_state'] for host in snap['hosts']}
-
-
 @dataclasses.dataclass(frozen=True)
 class _VacatedScene:
     """A running lane whose head H still verifies, after R's verify exited."""
@@ -109,7 +104,7 @@ class _VacatedScene:
 
 
 @contextlib.asynccontextmanager
-async def _vacated_scene(scene: _Scene, trigger: str) -> AsyncIterator[_VacatedScene]:
+async def _vacated_scene(scene: _Scene, trigger: _VerifyExit) -> AsyncIterator[_VacatedScene]:
     """Run a lane until R's verify has exited through *trigger*.
 
     'no_progress' requeues R, and ``halt_admission()`` (taken before R's
@@ -143,21 +138,23 @@ async def _vacated_scene(scene: _Scene, trigger: str) -> AsyncIterator[_VacatedS
         await wait_responsive(head_entered.wait(), label='head verify under way on the remote')
         await queue.put(req)
         await wait_responsive(r_entered.wait(), label='R verify under way on local')
-        assert _slot_states(lane.snapshot()).get('local') == 'busy', lane.snapshot()['hosts']
+        assert slot_states(lane).get('local') == 'busy', lane.snapshot()['hosts']
         if trigger == 'abandon':
             req.result.cancel()
             await wait_responsive(
-                _until(lambda: _slot_states(lane.snapshot()).get('local') == 'free'),
+                _until(lambda: slot_states(lane).get('local') == 'free'),
                 label="abandoned R's verify handed its local lease back",
             )
             await _settle(lambda: lane_state(lane, req.request_id) is None)
-        else:
+        elif trigger == 'no_progress':
             lane.halt_admission('test: hold the requeued request')
             clock.content_tick = 0.0
             await wait_responsive(
                 _until(lambda: req.request_id in lane.unfrozen_suffix()),
-                label=f'R requeued by {trigger} into its lane buffer',
+                label='R requeued by no_progress into its lane buffer',
             )
+        else:
+            assert_never(trigger)
         yield _VacatedScene(lane=lane, head=head, req=req, main_sha=main_sha)
 
 
@@ -185,7 +182,7 @@ class TestVacatedInflightEntryRendersAtMostOnce:
 
     @pytest.mark.parametrize('trigger', _REQUEUE_TRIGGERS)
     async def test_requeued_request_renders_once_as_queued(
-        self, scene: _Scene, trigger: str,
+        self, scene: _Scene, trigger: _VerifyExit,
     ) -> None:
         async with _vacated_scene(scene, trigger) as vacated:
             lane = vacated.lane
@@ -219,7 +216,7 @@ class TestVacatedInflightEntryRendersAtMostOnce:
             assert snap['frozen_prefix']['request_ids'] == [head.request_id], (
                 f'{snap["frozen_prefix"]!r} {entries!r}'
             )
-            assert _slot_states(snap).get('local') == 'free', (
+            assert slot_states(lane).get('local') == 'free', (
                 f'the vacate must hand R\'s local lease back: {snap["hosts"]!r} {entries!r}'
             )
 
@@ -230,7 +227,7 @@ class TestVacatedInflightEntryRendersAtMostOnce:
             snap = lane.snapshot()
             entries = snap['entries']
 
-            assert _rendered_ids(snap).count(rid) == 0, (
+            assert lane_entry(lane, rid) is None, (
                 f'a dropped request must not render as its vacated entry: {entries!r}'
             )
             assert rid not in lane.frozen_prefix(), f'{lane.frozen_prefix()!r} {entries!r}'
@@ -242,7 +239,7 @@ class TestVacatedInflightEntryRendersAtMostOnce:
             assert snap['verify_in_progress']['task_id'] == vacated.head.task_id, (
                 f'{snap["verify_in_progress"]!r} {entries!r}'
             )
-            assert _slot_states(snap).get('local') == 'free', (
+            assert slot_states(lane).get('local') == 'free', (
                 f'the drop must hand R\'s local lease back: {snap["hosts"]!r} {entries!r}'
             )
             assert lane.check_frozen_prefix_invariant(vacated.main_sha) == [], (

@@ -3361,11 +3361,6 @@ class TestRunInflightVerifyRequeuesOnlyThroughVacate:
         )
 
 
-def _rendered_ids(snap: dict) -> list[str]:
-    """The request_ids of *snap*'s entries, in emission order."""
-    return [e['request_id'] for e in snap['entries']]
-
-
 # The render-once property is pinned through public submission in
 # test_merge_lane_vacated_entry_census.py::TestVacatedInflightEntryRendersAtMostOnce.
 
@@ -3497,6 +3492,11 @@ def _warnings_naming(caplog: pytest.LogCaptureFixture, request_id: str) -> list[
         r.getMessage() for r in caplog.records
         if r.levelno == logging.WARNING and request_id in r.getMessage()
     ]
+
+
+def _rendered_ids(snap: dict) -> list[str]:
+    """The request_ids of *snap*'s entries, in emission order."""
+    return [e['request_id'] for e in snap['entries']]
 
 
 @pytest.mark.asyncio
