@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import dataclasses
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
+from escalation.queue import EscalationQueue
 
+from orchestrator.event_store import EventStore, EventType
 from orchestrator.lane_lifecycle import LaneRecord, LaneState
 from orchestrator.lane_record_divergence import (
     LANE_RECORD_DIVERGENCE,
@@ -20,6 +23,7 @@ from orchestrator.lane_record_divergence import (
     LaneDivergence,
     advance_lane_record_divergence,
     cross_check_lane_records,
+    file_persistent_divergence_alarm,
 )
 
 
@@ -232,3 +236,87 @@ class TestAdvanceLaneRecordDivergence:
             for r in caplog.records
         )
         assert second.consecutive_digests == 2
+
+
+def _divergence(lane: str, consecutive: int) -> LaneDivergence:
+    return LaneDivergence(
+        lane=lane, map_task_id=None, record_state=LaneState.ASSIGNED,
+        record_task_id='101', consecutive_digests=consecutive,
+    )
+
+
+_PERSISTENT = _divergence('_lane-0', PERSISTENT_DIVERGENCE_DIGESTS)
+_FRESH = _divergence('_lane-1', 1)
+
+
+class TestFilePersistentDivergenceAlarm:
+    @pytest.fixture
+    def queue(self, tmp_path):
+        return EscalationQueue(tmp_path / 'esc')
+
+    @pytest.fixture
+    def event_store(self):
+        return MagicMock(spec=EventStore)
+
+    def _file(self, queue, divergences, event_store=None):
+        return file_persistent_divergence_alarm(
+            queue, divergences, event_store=event_store, filing_claimant_run_id=None,
+        )
+
+    def test_no_alarm_before_any_lane_persists(self, queue, event_store):
+        assert self._file(queue, [_FRESH], event_store) is None
+        assert queue.get_pending() == []
+        event_store.emit.assert_not_called()
+
+    def test_persistent_divergence_files_one_born_at_l2(self, queue, event_store):
+        escalation = self._file(queue, [_PERSISTENT, _FRESH], event_store)
+
+        assert escalation is not None
+        (pending,) = queue.get_pending()
+        assert pending.id == escalation.id
+        assert pending.level == 2
+        assert pending.root_cause == LANE_RECORD_DIVERGENCE
+        assert pending.category == 'infra_issue'
+        assert pending.severity == 'urgent'
+        assert pending.agent_role.startswith('orchestrator-')
+        assert _PERSISTENT.render() in pending.detail
+        assert '_lane-0' in pending.summary
+        assert '_lane-1' not in pending.summary
+        event_store.emit.assert_called_once()
+        (event_type,) = event_store.emit.call_args.args
+        assert event_type is EventType.escalation_created
+        assert event_store.emit.call_args.kwargs['data']['escalation_id'] == escalation.id
+
+    def test_pending_alarm_dedups(self, queue):
+        self._file(queue, [_PERSISTENT])
+
+        assert self._file(queue, [_PERSISTENT]) is None
+        assert len(queue.get_pending()) == 1
+
+    def test_realarms_after_a_human_resolves_while_divergence_persists(self, queue):
+        first = self._file(queue, [_PERSISTENT])
+        assert first is not None
+        queue.resolve(first.id, 'investigated')
+
+        second = self._file(queue, [_PERSISTENT])
+
+        assert second is not None and second.id != first.id
+        assert [e.id for e in queue.get_pending()] == [second.id]
+
+    def test_no_queue_is_a_no_op(self):
+        assert self._file(None, [_PERSISTENT]) is None
+
+    def test_filing_failure_is_logged_not_raised(self, caplog):
+        queue = MagicMock(spec=EscalationQueue)
+        queue.find_pending_l2_by_root_cause.return_value = None
+        queue.make_id.return_value = 'esc-x-1'
+        queue.submit.side_effect = RuntimeError('queue down')
+
+        with caplog.at_level('WARNING'):
+            assert self._file(queue, [_PERSISTENT]) is None
+
+        assert any(r.levelname == 'WARNING' for r in caplog.records)
+
+    def test_files_without_an_event_store(self, queue):
+        assert self._file(queue, [_PERSISTENT], event_store=None) is not None
+        assert len(queue.get_pending()) == 1
