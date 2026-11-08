@@ -1,0 +1,34 @@
+{
+ "stream": "S16",
+ "prd_path": "docs/prds/review-all-tariff-as-a-typed-domain-value.md",
+ "manifest_path": "docs/prds/review-all-tariff-as-a-typed-domain-value.capability-manifest.yaml",
+ "leaves_estimate": 6,
+ "lead_rulings_on_open_questions": [
+  "Q1 RULED by Leo 2026-10-16 (ruled_by: human; session rule:solar_challenge_platform#1236, commit a629f24): option B — while an account holds no statement, its first tariff assignment follows its opening. Interim in delta (1236): D11's 409 stays as the guard (opens_on earlier than first_assignment_day), naming the remedy (close with closed_on = opened_on, re-create); delta also refuses a first assignment dated after the start of the supply span (otherwise the account is skipped no_tariff for good). Replacement = new leaf delta2 (task 1299, after epsilon and S21 beta/epsilon): a generic EffectiveDatedLedger.prepend fail-closed through config/authority.py::PREPENDABLE = {AccountTariffAssignment}, an account-row lock, RestatesBilledDays.check_assignment, epsilon's version-in-force 422, and a partial unique index on closed effective_to. Invariant weakened exactly: for assignments only, S21's 'nothing lands before a partition's first row' becomes 'insert ending exactly at the earliest row while unbilled'. Rejected: refusing permanently; restatement as a later PRD; a bitemporal ledger; flooring the first assignment at the tariff's first version; billing extending the first span.",
+  "Q2 (G4 conflict): the TouTariff type is the one home of 'is TOU' (R16/C9, fk-c7780f124df0 is S16's); S10's planner.is_tou takes TariffTerms and is isinstance(terms, TouTariff) — or S10 drops it for the type match; coordination note on S10-eta (1207); the second of 1207 and S16-beta to land makes it so (D5 keeps the two rules agreeing on every valid tariff meanwhile).",
+  "Q3: D10 stands (a back-dated rate version is refused when any account ever assigned that tariff has billed past its effective day). Q4: D5 stands (a TOU tariff needs at least two distinct rates; otherwise enter it as FLAT). Q5: no ruling needed — beta depends on 555 (S1-delta).",
+  "D2 (typed value in models/tariff_value.py, S18 strata) and D7 (both tariff facts take effect at UTC midnight on S21's mixin; date-typed store API) accepted; program row S16 scope reads 'in models/tariff_value.py'."
+ ],
+ "lead_actions_now": [
+  "803 and 811 set deferred by the lead on 2026-10-15 (803 would read bands through the library's matches_time; 811 is its partition check)."
+ ],
+ "lead_actions_at_decompose": [
+  "cancel 803 with x_acceptance_reason naming S16-alpha (typed Band, library-identical convention) + S16-beta; cancel 811 naming S16-alpha (BANDS_OVERLAP/BANDS_LEAVE_GAP) + S16-epsilon (enforced at write)",
+  "nothing held — upstream filed: beta -> 555 (S1-delta); zeta -> 194 (S1-alpha), 1213 (S1-eta), 1070 (S22-beta); delta -> 1127 (S21-alpha), 1130 (S21-beta), 1138 (S21-epsilon), 1095 (S9-alpha), 1096 (S9-epsilon), 1131 (S17-delta1), 1134 (S17-delta2), 1136 (S17-epsilon); epsilon -> delta, 1098 (S9-beta)",
+  "coordination note on 1207 (S10-eta, Q2) and on 521 (no edge: after epsilon, TariffSpan.version_id makes the priced tariff version recordable)",
+  "no leaf joins gate 1065 (every key is medium)"
+ ],
+ "cross_reference_lines": [
+  "S1: fk-9215f3d84973's 'the pointer gates billing' clause closes with S16-delta; S16-beta retypes PricedSegment.tariff and to_finance_config's tariff parameter to TariffTerms; S16-delta removes price_plan's tariff_pointer parameter, its fallback and TariffNotFound/tariff_not_found (NoTariff stays: a supplied day has no tariff in force) and replaces segment_period's assignments argument with TariffSpans.",
+  "S1/S22: S16-zeta re-bases MeterEvidenceMismatch, MeterEvidenceIncomplete, AmountDueExceedsTotal, CoverageVerdictIncomplete, RegisterRegressionError and MoneyFinerThanFiled onto models/damaged_record.py::DamagedRecord(ValueError); _REFUSALS_NEEDING_REPAIR becomes (DamagedRecord,); NothingOwed and OverlappingSupply are not damaged records.",
+  "S10 (Q2): the deletable list's _is_tou_tariff is S16's (beta); is_tou retypes to TariffTerms; ResolvedIdentity.tariff becomes TariffTerms after S16-beta; resolve reads TariffStore.in_force after S16-delta; INVALID_TARIFF catches StoredTariffInvalid only.",
+  "S17: S16-delta removes tariff_id from AccountChange and AccountUpdate (AccountUpdate gets extra='forbid'); AccountCreate.tariff_id becomes a declared __not_columns__ field; S16-epsilon registers TariffTerms <-> FlatTermsIn/TouTermsIn/BandIn in tests/test_wire_shapes_derived.py declaring the time <-> minutes divergence; TariffUpdate is name-only.",
+  "S21: GOVERNED_WRITE_ROLES gains TariffVersion -> {ADMIN} (epsilon) and AccountTariffAssignment -> {ADMIN} (delta); S21's out-of-scope line 'AccountTariffAssignment adopting the mixin … S16 decides' is decided yes, with DateTime UTC-midnight instants (D7); S21 A3/E4 cover both models.",
+  "S7: S16-delta retargets ScopedRepository._reachable_tariff_subq and the tariffs RLS hub to account_tariff_assignments and deletes Account.tariff_id's add-time FK check; INV-6's tenant-table list gains account_tariff_assignments (delta) and tariff_versions/tariff_version_bands (epsilon).",
+  "S9: delta's migration drops accounts.tariff_id after replacing the tariffs policy on PG and reshapes account_tariff_assignments; epsilon's migration creates tariff_versions (kind on enum_column) plus tariff_version_bands, drops tariff_periods and the tariffs price columns, then DROP TYPE tariff_kind; TariffKind moves from models/enums.py into models/tariff.py.",
+  "S11: generated types pick up TariffRead{id,name,current}, TariffDetail, TariffVersionOut and TariffAssignmentOut; epsilon hand-edits adminTypes.ts and CrmView TariffsTable only to keep the console building.",
+  "S12: query_smoke_summary's standing-charge SQL (JOIN tariffs t ON a.tariff_id) is replaced by TariffStore.in_force_for in S16-delta, in whatever module S12's split leaves it.",
+  "S18: models/tariff_value.py and models/damaged_record.py sit in stratum 2 with no allowlist entry.",
+  "Briefing (lead, interactive on main after delta): review/briefing.yaml's tariff and known-gap lines."
+ ]
+}

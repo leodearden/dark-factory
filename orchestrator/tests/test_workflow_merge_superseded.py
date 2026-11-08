@@ -28,7 +28,7 @@ from _orch_helpers import MOCK_WORKFLOW_PROJECT_ROOT, pydantic_spec
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventType
-from orchestrator.merge_queue import MergeOutcome
+from orchestrator.merge_lane.worker import MergeOutcome
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
 

@@ -1,0 +1,1182 @@
+{
+ "run_id": "mutation-dark_factory-20261005",
+ "instrument": "mutation (mutmut 3.7.0, not a registered docs/quality-findings-contract.md instrument; this record follows its §1/§2/§5 shape so keys join)",
+ "as_of_sha": "c285747072",
+ "since": "none",
+ "evidence": {
+  "mutated": {
+   "orchestrator/src/orchestrator/merge_lane/gates.py": 1540,
+   "orchestrator/src/orchestrator/merge_lane/types.py": 191
+  },
+  "test_selection": "141 files, 3,205 tests reaching a target ([tool.mutmut] in orchestrator/pyproject.toml)"
+ },
+ "verification": {
+  "confirmed": 37,
+  "weakened": 0,
+  "refuted": 2,
+  "unverified": 0
+ },
+ "cost": {
+  "agents": 1,
+  "wall_clock": "5 h 07 min (mutmut), plus one reviewer agent"
+ },
+ "inputs_consumed": [],
+ "results": {
+  "gates.py": {
+   "mutants": 1540,
+   "killed": 1322,
+   "survived": 218,
+   "score": 0.858
+  },
+  "types.py": {
+   "mutants": 191,
+   "killed": 170,
+   "survived": 21,
+   "score": 0.89
+  }
+ },
+ "findings": [
+  {
+   "key": "fk-686d7c85ef80",
+   "area": "orchestrator",
+   "anchor": "orchestrator/src/orchestrator/merge_lane/gates.py::_map_advance_failure",
+   "tags": [
+    "tests",
+    "kind:mutation"
+   ],
+   "evidence_source": [
+    "metrics"
+   ],
+   "statement": "40 mutmut mutants of _map_advance_failure survive the 141-file merge-lane suite (fenced, unsampled run mutation-dark_factory-20261005 at c285747072): no test fails when they are applied.",
+   "first_seen": "mutation-dark_factory-20261005",
+   "last_seen": [],
+   "supersedes": [],
+   "extra": {
+    "survivors": [
+     "orchestrator.merge_lane.gates.x__map_advance_failure__mutmut_16",
+     "orchestrator.merge_lane.gates.x__map_advance_failure__mutmut_22",
+     "orchestrator.merge_lane.gates.x__map_advance_failure__mutmut_27",
+     "orchestrator.merge_lane.gates.x__map_advance_failure__mutmut_33",
+     "orchestrator.merge_lane.gates.x__map_advance_failure__mutmut_34",
+     "orchestrator.merge_lane.gates.x__map_advance_failure__mutmut_35",
+     "orchestrator.merge_lane.gates.x__map_advance_failure__mutmut_41",
+     "orchestrator.merge_lane.gates.x__map_advance_failure__mutmut_53",
+     "orchestrator.merge_lane.gates.x__map_advance_failure__mutmut_54",
+     "orchestrator.merge_lane.gates.x__map_advance_failure__mutmut_59",
+     "orchestrator.merge_lane.gates.x__map_advance_failure__mutmut_61",
+     "orchestrator.merge_lane.gates.x__map_advance_failure__mutmut_62",
+     "orchestrator.merge_lane.gates.x__map_advance_failure__mutmut_63",
+     "orchestrator.merge_lane.gates.x__map_advance_failure__mutmut_84",
+     "orchestrator.merge_lane.gates.x__map_advance_failure__mutmut_114",
+     "orchestrator.merge_lane.gates.x__map_advance_failure__mutmut_115",
+     "orchestrator.merge_lane.gates.x__map_advance_failure__mutmut_117",
+     "orchestrator.merge_lane.gates.x__map_advance_failure__mutmut_118",
+     "orchestrator.merge_lane.gates.x__map_advance_failure__mutmut_119",
+     "orchestrator.merge_lane.gates.x__map_advance_failure__mutmut_120",
+     "orchestrator.merge_lane.gates.x__map_advance_failure__mutmut_121",
+     "orchestrator.merge_lane.gates.x__map_advance_failure__mutmut_143",
+     "orchestrator.merge_lane.gates.x__map_advance_failure__mutmut_144",
+     "orchestrator.merge_lane.gates.x__map_advance_failure__mutmut_145",
+     "orchestrator.merge_lane.gates.x__map_advance_failure__mutmut_166",
+     "orchestrator.merge_lane.gates.x__map_advance_failure__mutmut_167",
+     "orchestrator.merge_lane.gates.x__map_advance_failure__mutmut_177",
+     "orchestrator.merge_lane.gates.x__map_advance_failure__mutmut_178",
+     "orchestrator.merge_lane.gates.x__map_advance_failure__mutmut_180",
+     "orchestrator.merge_lane.gates.x__map_advance_failure__mutmut_181",
+     "orchestrator.merge_lane.gates.x__map_advance_failure__mutmut_204",
+     "orchestrator.merge_lane.gates.x__map_advance_failure__mutmut_206",
+     "orchestrator.merge_lane.gates.x__map_advance_failure__mutmut_215",
+     "orchestrator.merge_lane.gates.x__map_advance_failure__mutmut_216",
+     "orchestrator.merge_lane.gates.x__map_advance_failure__mutmut_217",
+     "orchestrator.merge_lane.gates.x__map_advance_failure__mutmut_218",
+     "orchestrator.merge_lane.gates.x__map_advance_failure__mutmut_219",
+     "orchestrator.merge_lane.gates.x__map_advance_failure__mutmut_220",
+     "orchestrator.merge_lane.gates.x__map_advance_failure__mutmut_221",
+     "orchestrator.merge_lane.gates.x__map_advance_failure__mutmut_222"
+    ]
+   },
+   "severity": "low",
+   "verdict": "confirmed",
+   "disposition": "filed:6416"
+  },
+  {
+   "key": "fk-0d9ce2c36201",
+   "area": "orchestrator",
+   "anchor": "orchestrator/src/orchestrator/merge_lane/gates.py::_commit_is_linear",
+   "tags": [
+    "tests",
+    "kind:mutation"
+   ],
+   "evidence_source": [
+    "metrics"
+   ],
+   "statement": "20 mutmut mutants of _commit_is_linear survive the 141-file merge-lane suite (fenced, unsampled run mutation-dark_factory-20261005 at c285747072): no test fails when they are applied.",
+   "first_seen": "mutation-dark_factory-20261005",
+   "last_seen": [],
+   "supersedes": [],
+   "extra": {
+    "survivors": [
+     "orchestrator.merge_lane.gates.x__commit_is_linear__mutmut_1",
+     "orchestrator.merge_lane.gates.x__commit_is_linear__mutmut_2",
+     "orchestrator.merge_lane.gates.x__commit_is_linear__mutmut_3",
+     "orchestrator.merge_lane.gates.x__commit_is_linear__mutmut_4",
+     "orchestrator.merge_lane.gates.x__commit_is_linear__mutmut_5",
+     "orchestrator.merge_lane.gates.x__commit_is_linear__mutmut_6",
+     "orchestrator.merge_lane.gates.x__commit_is_linear__mutmut_7",
+     "orchestrator.merge_lane.gates.x__commit_is_linear__mutmut_8",
+     "orchestrator.merge_lane.gates.x__commit_is_linear__mutmut_9",
+     "orchestrator.merge_lane.gates.x__commit_is_linear__mutmut_10",
+     "orchestrator.merge_lane.gates.x__commit_is_linear__mutmut_11",
+     "orchestrator.merge_lane.gates.x__commit_is_linear__mutmut_12",
+     "orchestrator.merge_lane.gates.x__commit_is_linear__mutmut_13",
+     "orchestrator.merge_lane.gates.x__commit_is_linear__mutmut_14",
+     "orchestrator.merge_lane.gates.x__commit_is_linear__mutmut_15",
+     "orchestrator.merge_lane.gates.x__commit_is_linear__mutmut_16",
+     "orchestrator.merge_lane.gates.x__commit_is_linear__mutmut_17",
+     "orchestrator.merge_lane.gates.x__commit_is_linear__mutmut_18",
+     "orchestrator.merge_lane.gates.x__commit_is_linear__mutmut_20",
+     "orchestrator.merge_lane.gates.x__commit_is_linear__mutmut_21"
+    ]
+   },
+   "severity": "medium",
+   "verdict": "confirmed",
+   "disposition": "filed:6411"
+  },
+  {
+   "key": "fk-04a3cd4d3f09",
+   "area": "orchestrator",
+   "anchor": "orchestrator/src/orchestrator/merge_lane/gates.py::_finalize_advanced_merge",
+   "tags": [
+    "tests",
+    "kind:mutation"
+   ],
+   "evidence_source": [
+    "metrics"
+   ],
+   "statement": "20 mutmut mutants of _finalize_advanced_merge survive the 141-file merge-lane suite (fenced, unsampled run mutation-dark_factory-20261005 at c285747072): no test fails when they are applied.",
+   "first_seen": "mutation-dark_factory-20261005",
+   "last_seen": [],
+   "supersedes": [],
+   "extra": {
+    "survivors": [
+     "orchestrator.merge_lane.gates.x__finalize_advanced_merge__mutmut_1",
+     "orchestrator.merge_lane.gates.x__finalize_advanced_merge__mutmut_20",
+     "orchestrator.merge_lane.gates.x__finalize_advanced_merge__mutmut_24",
+     "orchestrator.merge_lane.gates.x__finalize_advanced_merge__mutmut_27",
+     "orchestrator.merge_lane.gates.x__finalize_advanced_merge__mutmut_31",
+     "orchestrator.merge_lane.gates.x__finalize_advanced_merge__mutmut_32",
+     "orchestrator.merge_lane.gates.x__finalize_advanced_merge__mutmut_45",
+     "orchestrator.merge_lane.gates.x__finalize_advanced_merge__mutmut_46",
+     "orchestrator.merge_lane.gates.x__finalize_advanced_merge__mutmut_47",
+     "orchestrator.merge_lane.gates.x__finalize_advanced_merge__mutmut_50",
+     "orchestrator.merge_lane.gates.x__finalize_advanced_merge__mutmut_72",
+     "orchestrator.merge_lane.gates.x__finalize_advanced_merge__mutmut_75",
+     "orchestrator.merge_lane.gates.x__finalize_advanced_merge__mutmut_77",
+     "orchestrator.merge_lane.gates.x__finalize_advanced_merge__mutmut_79",
+     "orchestrator.merge_lane.gates.x__finalize_advanced_merge__mutmut_80",
+     "orchestrator.merge_lane.gates.x__finalize_advanced_merge__mutmut_81",
+     "orchestrator.merge_lane.gates.x__finalize_advanced_merge__mutmut_85",
+     "orchestrator.merge_lane.gates.x__finalize_advanced_merge__mutmut_86",
+     "orchestrator.merge_lane.gates.x__finalize_advanced_merge__mutmut_87",
+     "orchestrator.merge_lane.gates.x__finalize_advanced_merge__mutmut_88"
+    ]
+   },
+   "severity": "medium",
+   "verdict": "confirmed",
+   "disposition": "filed:6411"
+  },
+  {
+   "key": "fk-f9dcfd18b280",
+   "area": "orchestrator",
+   "anchor": "orchestrator/src/orchestrator/merge_lane/gates.py::_run_unscoped_typechecks",
+   "tags": [
+    "tests",
+    "kind:mutation"
+   ],
+   "evidence_source": [
+    "metrics"
+   ],
+   "statement": "17 mutmut mutants of _run_unscoped_typechecks survive the 141-file merge-lane suite (fenced, unsampled run mutation-dark_factory-20261005 at c285747072): no test fails when they are applied.",
+   "first_seen": "mutation-dark_factory-20261005",
+   "last_seen": [],
+   "supersedes": [],
+   "extra": {
+    "survivors": [
+     "orchestrator.merge_lane.gates.x__run_unscoped_typechecks__mutmut_7",
+     "orchestrator.merge_lane.gates.x__run_unscoped_typechecks__mutmut_8",
+     "orchestrator.merge_lane.gates.x__run_unscoped_typechecks__mutmut_12",
+     "orchestrator.merge_lane.gates.x__run_unscoped_typechecks__mutmut_13",
+     "orchestrator.merge_lane.gates.x__run_unscoped_typechecks__mutmut_18",
+     "orchestrator.merge_lane.gates.x__run_unscoped_typechecks__mutmut_19",
+     "orchestrator.merge_lane.gates.x__run_unscoped_typechecks__mutmut_20",
+     "orchestrator.merge_lane.gates.x__run_unscoped_typechecks__mutmut_21",
+     "orchestrator.merge_lane.gates.x__run_unscoped_typechecks__mutmut_22",
+     "orchestrator.merge_lane.gates.x__run_unscoped_typechecks__mutmut_23",
+     "orchestrator.merge_lane.gates.x__run_unscoped_typechecks__mutmut_24",
+     "orchestrator.merge_lane.gates.x__run_unscoped_typechecks__mutmut_32",
+     "orchestrator.merge_lane.gates.x__run_unscoped_typechecks__mutmut_37",
+     "orchestrator.merge_lane.gates.x__run_unscoped_typechecks__mutmut_38",
+     "orchestrator.merge_lane.gates.x__run_unscoped_typechecks__mutmut_39",
+     "orchestrator.merge_lane.gates.x__run_unscoped_typechecks__mutmut_40",
+     "orchestrator.merge_lane.gates.x__run_unscoped_typechecks__mutmut_44"
+    ]
+   },
+   "severity": "medium",
+   "verdict": "confirmed",
+   "disposition": "filed:6414"
+  },
+  {
+   "key": "fk-bb48145757ed",
+   "area": "orchestrator",
+   "anchor": "orchestrator/src/orchestrator/merge_lane/gates.py::_resolve_renamed_plan_path",
+   "tags": [
+    "tests",
+    "kind:mutation"
+   ],
+   "evidence_source": [
+    "metrics"
+   ],
+   "statement": "12 mutmut mutants of _resolve_renamed_plan_path survive the 141-file merge-lane suite (fenced, unsampled run mutation-dark_factory-20261005 at c285747072): no test fails when they are applied.",
+   "first_seen": "mutation-dark_factory-20261005",
+   "last_seen": [],
+   "supersedes": [],
+   "extra": {
+    "survivors": [
+     "orchestrator.merge_lane.gates.x__resolve_renamed_plan_path__mutmut_15",
+     "orchestrator.merge_lane.gates.x__resolve_renamed_plan_path__mutmut_19",
+     "orchestrator.merge_lane.gates.x__resolve_renamed_plan_path__mutmut_24",
+     "orchestrator.merge_lane.gates.x__resolve_renamed_plan_path__mutmut_25",
+     "orchestrator.merge_lane.gates.x__resolve_renamed_plan_path__mutmut_33",
+     "orchestrator.merge_lane.gates.x__resolve_renamed_plan_path__mutmut_36",
+     "orchestrator.merge_lane.gates.x__resolve_renamed_plan_path__mutmut_38",
+     "orchestrator.merge_lane.gates.x__resolve_renamed_plan_path__mutmut_43",
+     "orchestrator.merge_lane.gates.x__resolve_renamed_plan_path__mutmut_47",
+     "orchestrator.merge_lane.gates.x__resolve_renamed_plan_path__mutmut_65",
+     "orchestrator.merge_lane.gates.x__resolve_renamed_plan_path__mutmut_66",
+     "orchestrator.merge_lane.gates.x__resolve_renamed_plan_path__mutmut_71"
+    ]
+   },
+   "severity": "medium",
+   "verdict": "confirmed",
+   "disposition": "filed:6412"
+  },
+  {
+   "key": "fk-370ecc0921e0",
+   "area": "orchestrator",
+   "anchor": "orchestrator/src/orchestrator/merge_lane/gates.py::_auto_chain_on_equivalence_blocked",
+   "tags": [
+    "tests",
+    "kind:mutation"
+   ],
+   "evidence_source": [
+    "metrics"
+   ],
+   "statement": "11 mutmut mutants of _auto_chain_on_equivalence_blocked survive the 141-file merge-lane suite (fenced, unsampled run mutation-dark_factory-20261005 at c285747072): no test fails when they are applied.",
+   "first_seen": "mutation-dark_factory-20261005",
+   "last_seen": [],
+   "supersedes": [],
+   "extra": {
+    "survivors": [
+     "orchestrator.merge_lane.gates.x__auto_chain_on_equivalence_blocked__mutmut_1",
+     "orchestrator.merge_lane.gates.x__auto_chain_on_equivalence_blocked__mutmut_6",
+     "orchestrator.merge_lane.gates.x__auto_chain_on_equivalence_blocked__mutmut_7",
+     "orchestrator.merge_lane.gates.x__auto_chain_on_equivalence_blocked__mutmut_8",
+     "orchestrator.merge_lane.gates.x__auto_chain_on_equivalence_blocked__mutmut_28",
+     "orchestrator.merge_lane.gates.x__auto_chain_on_equivalence_blocked__mutmut_29",
+     "orchestrator.merge_lane.gates.x__auto_chain_on_equivalence_blocked__mutmut_30",
+     "orchestrator.merge_lane.gates.x__auto_chain_on_equivalence_blocked__mutmut_34",
+     "orchestrator.merge_lane.gates.x__auto_chain_on_equivalence_blocked__mutmut_35",
+     "orchestrator.merge_lane.gates.x__auto_chain_on_equivalence_blocked__mutmut_36",
+     "orchestrator.merge_lane.gates.x__auto_chain_on_equivalence_blocked__mutmut_37"
+    ]
+   },
+   "severity": "medium",
+   "verdict": "confirmed",
+   "disposition": "filed:6413"
+  },
+  {
+   "key": "fk-e2d18dfdac1c",
+   "area": "orchestrator",
+   "anchor": "orchestrator/src/orchestrator/merge_lane/gates.py::_rename_aware_real_drops",
+   "tags": [
+    "tests",
+    "kind:mutation"
+   ],
+   "evidence_source": [
+    "metrics"
+   ],
+   "statement": "11 mutmut mutants of _rename_aware_real_drops survive the 141-file merge-lane suite (fenced, unsampled run mutation-dark_factory-20261005 at c285747072): no test fails when they are applied.",
+   "first_seen": "mutation-dark_factory-20261005",
+   "last_seen": [],
+   "supersedes": [],
+   "extra": {
+    "survivors": [
+     "orchestrator.merge_lane.gates.x__rename_aware_real_drops__mutmut_5",
+     "orchestrator.merge_lane.gates.x__rename_aware_real_drops__mutmut_6",
+     "orchestrator.merge_lane.gates.x__rename_aware_real_drops__mutmut_11",
+     "orchestrator.merge_lane.gates.x__rename_aware_real_drops__mutmut_12",
+     "orchestrator.merge_lane.gates.x__rename_aware_real_drops__mutmut_13",
+     "orchestrator.merge_lane.gates.x__rename_aware_real_drops__mutmut_28",
+     "orchestrator.merge_lane.gates.x__rename_aware_real_drops__mutmut_29",
+     "orchestrator.merge_lane.gates.x__rename_aware_real_drops__mutmut_35",
+     "orchestrator.merge_lane.gates.x__rename_aware_real_drops__mutmut_36",
+     "orchestrator.merge_lane.gates.x__rename_aware_real_drops__mutmut_37",
+     "orchestrator.merge_lane.gates.x__rename_aware_real_drops__mutmut_38"
+    ]
+   },
+   "severity": "medium",
+   "verdict": "confirmed",
+   "disposition": "filed:6412"
+  },
+  {
+   "key": "fk-cf497f9a2cdc",
+   "area": "orchestrator",
+   "anchor": "orchestrator/src/orchestrator/merge_lane/gates.py::_rename_aware_compare_set",
+   "tags": [
+    "tests",
+    "kind:mutation"
+   ],
+   "evidence_source": [
+    "metrics"
+   ],
+   "statement": "11 mutmut mutants of _rename_aware_compare_set survive the 141-file merge-lane suite (fenced, unsampled run mutation-dark_factory-20261005 at c285747072): no test fails when they are applied.",
+   "first_seen": "mutation-dark_factory-20261005",
+   "last_seen": [],
+   "supersedes": [],
+   "extra": {
+    "survivors": [
+     "orchestrator.merge_lane.gates.x__rename_aware_compare_set__mutmut_5",
+     "orchestrator.merge_lane.gates.x__rename_aware_compare_set__mutmut_6",
+     "orchestrator.merge_lane.gates.x__rename_aware_compare_set__mutmut_11",
+     "orchestrator.merge_lane.gates.x__rename_aware_compare_set__mutmut_12",
+     "orchestrator.merge_lane.gates.x__rename_aware_compare_set__mutmut_13",
+     "orchestrator.merge_lane.gates.x__rename_aware_compare_set__mutmut_30",
+     "orchestrator.merge_lane.gates.x__rename_aware_compare_set__mutmut_31",
+     "orchestrator.merge_lane.gates.x__rename_aware_compare_set__mutmut_37",
+     "orchestrator.merge_lane.gates.x__rename_aware_compare_set__mutmut_38",
+     "orchestrator.merge_lane.gates.x__rename_aware_compare_set__mutmut_39",
+     "orchestrator.merge_lane.gates.x__rename_aware_compare_set__mutmut_40"
+    ]
+   },
+   "severity": "medium",
+   "verdict": "confirmed",
+   "disposition": "filed:6412"
+  },
+  {
+   "key": "fk-1de95aeeb9d2",
+   "area": "orchestrator",
+   "anchor": "orchestrator/src/orchestrator/merge_lane/gates.py::_run_equivalence_gate",
+   "tags": [
+    "tests",
+    "kind:mutation"
+   ],
+   "evidence_source": [
+    "metrics"
+   ],
+   "statement": "7 mutmut mutants of _run_equivalence_gate survive the 141-file merge-lane suite (fenced, unsampled run mutation-dark_factory-20261005 at c285747072): no test fails when they are applied.",
+   "first_seen": "mutation-dark_factory-20261005",
+   "last_seen": [],
+   "supersedes": [],
+   "extra": {
+    "survivors": [
+     "orchestrator.merge_lane.gates.x__run_equivalence_gate__mutmut_2",
+     "orchestrator.merge_lane.gates.x__run_equivalence_gate__mutmut_6",
+     "orchestrator.merge_lane.gates.x__run_equivalence_gate__mutmut_13",
+     "orchestrator.merge_lane.gates.x__run_equivalence_gate__mutmut_19",
+     "orchestrator.merge_lane.gates.x__run_equivalence_gate__mutmut_20",
+     "orchestrator.merge_lane.gates.x__run_equivalence_gate__mutmut_29",
+     "orchestrator.merge_lane.gates.x__run_equivalence_gate__mutmut_30"
+    ]
+   },
+   "severity": "medium",
+   "verdict": "confirmed",
+   "disposition": "filed:6413"
+  },
+  {
+   "key": "fk-36edb2cbd99e",
+   "area": "orchestrator",
+   "anchor": "orchestrator/src/orchestrator/merge_lane/gates.py::_ls_tree_object_type",
+   "tags": [
+    "tests",
+    "kind:mutation"
+   ],
+   "evidence_source": [
+    "metrics"
+   ],
+   "statement": "7 mutmut mutants of _ls_tree_object_type survive the 141-file merge-lane suite (fenced, unsampled run mutation-dark_factory-20261005 at c285747072): no test fails when they are applied.",
+   "first_seen": "mutation-dark_factory-20261005",
+   "last_seen": [],
+   "supersedes": [],
+   "extra": {
+    "survivors": [
+     "orchestrator.merge_lane.gates.x__ls_tree_object_type__mutmut_2",
+     "orchestrator.merge_lane.gates.x__ls_tree_object_type__mutmut_7",
+     "orchestrator.merge_lane.gates.x__ls_tree_object_type__mutmut_8",
+     "orchestrator.merge_lane.gates.x__ls_tree_object_type__mutmut_9",
+     "orchestrator.merge_lane.gates.x__ls_tree_object_type__mutmut_10",
+     "orchestrator.merge_lane.gates.x__ls_tree_object_type__mutmut_13",
+     "orchestrator.merge_lane.gates.x__ls_tree_object_type__mutmut_14"
+    ]
+   },
+   "severity": "medium",
+   "verdict": "confirmed",
+   "disposition": "filed:6411"
+  },
+  {
+   "key": "fk-639ce0161c9b",
+   "area": "orchestrator",
+   "anchor": "orchestrator/src/orchestrator/merge_lane/gates.py::_check_plan_files_touched_in_branch",
+   "tags": [
+    "tests",
+    "kind:mutation"
+   ],
+   "evidence_source": [
+    "metrics"
+   ],
+   "statement": "7 mutmut mutants of _check_plan_files_touched_in_branch survive the 141-file merge-lane suite (fenced, unsampled run mutation-dark_factory-20261005 at c285747072): no test fails when they are applied.",
+   "first_seen": "mutation-dark_factory-20261005",
+   "last_seen": [],
+   "supersedes": [],
+   "extra": {
+    "survivors": [
+     "orchestrator.merge_lane.gates.x__check_plan_files_touched_in_branch__mutmut_10",
+     "orchestrator.merge_lane.gates.x__check_plan_files_touched_in_branch__mutmut_36",
+     "orchestrator.merge_lane.gates.x__check_plan_files_touched_in_branch__mutmut_57",
+     "orchestrator.merge_lane.gates.x__check_plan_files_touched_in_branch__mutmut_58",
+     "orchestrator.merge_lane.gates.x__check_plan_files_touched_in_branch__mutmut_67",
+     "orchestrator.merge_lane.gates.x__check_plan_files_touched_in_branch__mutmut_75",
+     "orchestrator.merge_lane.gates.x__check_plan_files_touched_in_branch__mutmut_80"
+    ]
+   },
+   "severity": "medium",
+   "verdict": "confirmed",
+   "disposition": "filed:6412"
+  },
+  {
+   "key": "fk-2450ca4c2aab",
+   "area": "orchestrator",
+   "anchor": "orchestrator/src/orchestrator/merge_lane/gates.py::_reverify_rebased_tree",
+   "tags": [
+    "tests",
+    "kind:mutation"
+   ],
+   "evidence_source": [
+    "metrics"
+   ],
+   "statement": "7 mutmut mutants of _reverify_rebased_tree survive the 141-file merge-lane suite (fenced, unsampled run mutation-dark_factory-20261005 at c285747072): no test fails when they are applied.",
+   "first_seen": "mutation-dark_factory-20261005",
+   "last_seen": [],
+   "supersedes": [],
+   "extra": {
+    "survivors": [
+     "orchestrator.merge_lane.gates.x__reverify_rebased_tree__mutmut_1",
+     "orchestrator.merge_lane.gates.x__reverify_rebased_tree__mutmut_7",
+     "orchestrator.merge_lane.gates.x__reverify_rebased_tree__mutmut_12",
+     "orchestrator.merge_lane.gates.x__reverify_rebased_tree__mutmut_23",
+     "orchestrator.merge_lane.gates.x__reverify_rebased_tree__mutmut_24",
+     "orchestrator.merge_lane.gates.x__reverify_rebased_tree__mutmut_25",
+     "orchestrator.merge_lane.gates.x__reverify_rebased_tree__mutmut_26"
+    ]
+   },
+   "severity": "low",
+   "verdict": "confirmed",
+   "disposition": "filed:6419"
+  },
+  {
+   "key": "fk-5ae4fd352530",
+   "area": "orchestrator",
+   "anchor": "orchestrator/src/orchestrator/merge_lane/gates.py::_branch_delta_survives",
+   "tags": [
+    "tests",
+    "kind:mutation"
+   ],
+   "evidence_source": [
+    "metrics"
+   ],
+   "statement": "6 mutmut mutants of _branch_delta_survives survive the 141-file merge-lane suite (fenced, unsampled run mutation-dark_factory-20261005 at c285747072): no test fails when they are applied.",
+   "first_seen": "mutation-dark_factory-20261005",
+   "last_seen": [],
+   "supersedes": [],
+   "extra": {
+    "survivors": [
+     "orchestrator.merge_lane.gates.x__branch_delta_survives__mutmut_16",
+     "orchestrator.merge_lane.gates.x__branch_delta_survives__mutmut_27",
+     "orchestrator.merge_lane.gates.x__branch_delta_survives__mutmut_67",
+     "orchestrator.merge_lane.gates.x__branch_delta_survives__mutmut_80",
+     "orchestrator.merge_lane.gates.x__branch_delta_survives__mutmut_82",
+     "orchestrator.merge_lane.gates.x__branch_delta_survives__mutmut_84"
+    ]
+   },
+   "severity": "medium",
+   "verdict": "confirmed",
+   "disposition": "filed:6413"
+  },
+  {
+   "key": "fk-d77867b27fab",
+   "area": "orchestrator",
+   "anchor": "orchestrator/src/orchestrator/merge_lane/gates.py::_rename_pair_for",
+   "tags": [
+    "tests",
+    "kind:mutation"
+   ],
+   "evidence_source": [
+    "metrics"
+   ],
+   "statement": "6 mutmut mutants of _rename_pair_for survive the 141-file merge-lane suite (fenced, unsampled run mutation-dark_factory-20261005 at c285747072): no test fails when they are applied.",
+   "first_seen": "mutation-dark_factory-20261005",
+   "last_seen": [],
+   "supersedes": [],
+   "extra": {
+    "survivors": [
+     "orchestrator.merge_lane.gates.x__rename_pair_for__mutmut_22",
+     "orchestrator.merge_lane.gates.x__rename_pair_for__mutmut_36",
+     "orchestrator.merge_lane.gates.x__rename_pair_for__mutmut_42",
+     "orchestrator.merge_lane.gates.x__rename_pair_for__mutmut_46",
+     "orchestrator.merge_lane.gates.x__rename_pair_for__mutmut_51",
+     "orchestrator.merge_lane.gates.x__rename_pair_for__mutmut_52"
+    ]
+   },
+   "severity": "medium",
+   "verdict": "confirmed",
+   "disposition": "filed:6412"
+  },
+  {
+   "key": "fk-e36d4f7542e9",
+   "area": "orchestrator",
+   "anchor": "orchestrator/src/orchestrator/merge_lane/gates.py::_run_pyright_gate",
+   "tags": [
+    "tests",
+    "kind:mutation"
+   ],
+   "evidence_source": [
+    "metrics"
+   ],
+   "statement": "5 mutmut mutants of _run_pyright_gate survive the 141-file merge-lane suite (fenced, unsampled run mutation-dark_factory-20261005 at c285747072): no test fails when they are applied.",
+   "first_seen": "mutation-dark_factory-20261005",
+   "last_seen": [],
+   "supersedes": [],
+   "extra": {
+    "survivors": [
+     "orchestrator.merge_lane.gates.x__run_pyright_gate__mutmut_2",
+     "orchestrator.merge_lane.gates.x__run_pyright_gate__mutmut_6",
+     "orchestrator.merge_lane.gates.x__run_pyright_gate__mutmut_11",
+     "orchestrator.merge_lane.gates.x__run_pyright_gate__mutmut_20",
+     "orchestrator.merge_lane.gates.x__run_pyright_gate__mutmut_21"
+    ]
+   },
+   "severity": "medium",
+   "verdict": "confirmed",
+   "disposition": "filed:6414"
+  },
+  {
+   "key": "fk-7a290cbad0ba",
+   "area": "orchestrator",
+   "anchor": "orchestrator/src/orchestrator/merge_lane/gates.py::_emit_merge_attempt",
+   "tags": [
+    "tests",
+    "kind:mutation"
+   ],
+   "evidence_source": [
+    "metrics"
+   ],
+   "statement": "4 mutmut mutants of _emit_merge_attempt survive the 141-file merge-lane suite (fenced, unsampled run mutation-dark_factory-20261005 at c285747072): no test fails when they are applied.",
+   "first_seen": "mutation-dark_factory-20261005",
+   "last_seen": [],
+   "supersedes": [],
+   "extra": {
+    "survivors": [
+     "orchestrator.merge_lane.gates.x__emit_merge_attempt__mutmut_41",
+     "orchestrator.merge_lane.gates.x__emit_merge_attempt__mutmut_46",
+     "orchestrator.merge_lane.gates.x__emit_merge_attempt__mutmut_49",
+     "orchestrator.merge_lane.gates.x__emit_merge_attempt__mutmut_50"
+    ]
+   },
+   "severity": "medium",
+   "verdict": "confirmed",
+   "disposition": "filed:6411"
+  },
+  {
+   "key": "fk-def205571cc4",
+   "area": "orchestrator",
+   "anchor": "orchestrator/src/orchestrator/merge_lane/gates.py::_rebase_delta_touched_overlap",
+   "tags": [
+    "tests",
+    "kind:mutation"
+   ],
+   "evidence_source": [
+    "metrics"
+   ],
+   "statement": "4 mutmut mutants of _rebase_delta_touched_overlap survive the 141-file merge-lane suite (fenced, unsampled run mutation-dark_factory-20261005 at c285747072): no test fails when they are applied.",
+   "first_seen": "mutation-dark_factory-20261005",
+   "last_seen": [],
+   "supersedes": [],
+   "extra": {
+    "survivors": [
+     "orchestrator.merge_lane.gates.x__rebase_delta_touched_overlap__mutmut_1",
+     "orchestrator.merge_lane.gates.x__rebase_delta_touched_overlap__mutmut_2",
+     "orchestrator.merge_lane.gates.x__rebase_delta_touched_overlap__mutmut_3",
+     "orchestrator.merge_lane.gates.x__rebase_delta_touched_overlap__mutmut_4"
+    ]
+   },
+   "severity": "low",
+   "verdict": "confirmed",
+   "disposition": "filed:6419"
+  },
+  {
+   "key": "fk-f846fc5058ff",
+   "area": "orchestrator",
+   "anchor": "orchestrator/src/orchestrator/merge_lane/gates.py::_rename_pairs",
+   "tags": [
+    "tests",
+    "kind:mutation"
+   ],
+   "evidence_source": [
+    "metrics"
+   ],
+   "statement": "3 mutmut mutants of _rename_pairs survive the 141-file merge-lane suite (fenced, unsampled run mutation-dark_factory-20261005 at c285747072): no test fails when they are applied.",
+   "first_seen": "mutation-dark_factory-20261005",
+   "last_seen": [],
+   "supersedes": [],
+   "extra": {
+    "survivors": [
+     "orchestrator.merge_lane.gates.x__rename_pairs__mutmut_18",
+     "orchestrator.merge_lane.gates.x__rename_pairs__mutmut_27",
+     "orchestrator.merge_lane.gates.x__rename_pairs__mutmut_28"
+    ]
+   },
+   "severity": "medium",
+   "verdict": "confirmed",
+   "disposition": "filed:6412"
+  },
+  {
+   "key": "fk-311b5e19680b",
+   "area": "orchestrator",
+   "anchor": "orchestrator/src/orchestrator/merge_lane/gates.py::_entry_touched_beneath",
+   "tags": [
+    "tests",
+    "kind:mutation"
+   ],
+   "evidence_source": [
+    "metrics"
+   ],
+   "statement": "3 mutmut mutants of _entry_touched_beneath survive the 141-file merge-lane suite (fenced, unsampled run mutation-dark_factory-20261005 at c285747072): no test fails when they are applied.",
+   "first_seen": "mutation-dark_factory-20261005",
+   "last_seen": [],
+   "supersedes": [],
+   "extra": {
+    "survivors": [
+     "orchestrator.merge_lane.gates.x__entry_touched_beneath__mutmut_3",
+     "orchestrator.merge_lane.gates.x__entry_touched_beneath__mutmut_4",
+     "orchestrator.merge_lane.gates.x__entry_touched_beneath__mutmut_5"
+    ]
+   },
+   "severity": "medium",
+   "verdict": "confirmed",
+   "disposition": "filed:6411"
+  },
+  {
+   "key": "fk-5b1980f1df07",
+   "area": "orchestrator",
+   "anchor": "orchestrator/src/orchestrator/merge_lane/gates.py::_disjoint_skip_blockers",
+   "tags": [
+    "tests",
+    "kind:mutation"
+   ],
+   "evidence_source": [
+    "metrics"
+   ],
+   "statement": "3 mutmut mutants of _disjoint_skip_blockers survive the 141-file merge-lane suite (fenced, unsampled run mutation-dark_factory-20261005 at c285747072): no test fails when they are applied.",
+   "first_seen": "mutation-dark_factory-20261005",
+   "last_seen": [],
+   "supersedes": [],
+   "extra": {
+    "survivors": [
+     "orchestrator.merge_lane.gates.x__disjoint_skip_blockers__mutmut_21",
+     "orchestrator.merge_lane.gates.x__disjoint_skip_blockers__mutmut_26",
+     "orchestrator.merge_lane.gates.x__disjoint_skip_blockers__mutmut_39"
+    ]
+   },
+   "severity": "low",
+   "verdict": "confirmed",
+   "disposition": "filed:6419"
+  },
+  {
+   "key": "fk-82dd948d2330",
+   "area": "orchestrator",
+   "anchor": "orchestrator/src/orchestrator/merge_lane/gates.py::_check_post_merge_pyright",
+   "tags": [
+    "tests",
+    "kind:mutation"
+   ],
+   "evidence_source": [
+    "metrics"
+   ],
+   "statement": "3 mutmut mutants of _check_post_merge_pyright survive the 141-file merge-lane suite (fenced, unsampled run mutation-dark_factory-20261005 at c285747072): no test fails when they are applied.",
+   "first_seen": "mutation-dark_factory-20261005",
+   "last_seen": [],
+   "supersedes": [],
+   "extra": {
+    "survivors": [
+     "orchestrator.merge_lane.gates.x__check_post_merge_pyright__mutmut_11",
+     "orchestrator.merge_lane.gates.x__check_post_merge_pyright__mutmut_12",
+     "orchestrator.merge_lane.gates.x__check_post_merge_pyright__mutmut_17"
+    ]
+   },
+   "severity": "medium",
+   "verdict": "confirmed",
+   "disposition": "filed:6414"
+  },
+  {
+   "key": "fk-f13d7fa78353",
+   "area": "orchestrator",
+   "anchor": "orchestrator/src/orchestrator/merge_lane/gates.py::_check_plan_targets_in_tree",
+   "tags": [
+    "tests",
+    "kind:mutation"
+   ],
+   "evidence_source": [
+    "metrics"
+   ],
+   "statement": "2 mutmut mutants of _check_plan_targets_in_tree survive the 141-file merge-lane suite (fenced, unsampled run mutation-dark_factory-20261005 at c285747072): no test fails when they are applied.",
+   "first_seen": "mutation-dark_factory-20261005",
+   "last_seen": [],
+   "supersedes": [],
+   "extra": {
+    "survivors": [
+     "orchestrator.merge_lane.gates.x__check_plan_targets_in_tree__mutmut_64",
+     "orchestrator.merge_lane.gates.x__check_plan_targets_in_tree__mutmut_71"
+    ]
+   },
+   "severity": "medium",
+   "verdict": "confirmed",
+   "disposition": "filed:6412"
+  },
+  {
+   "key": "fk-964c53f450b7",
+   "area": "orchestrator",
+   "anchor": "orchestrator/src/orchestrator/merge_lane/gates.py::_resolve_already_landed_branch",
+   "tags": [
+    "tests",
+    "kind:mutation"
+   ],
+   "evidence_source": [
+    "metrics"
+   ],
+   "statement": "2 mutmut mutants of _resolve_already_landed_branch survive the 141-file merge-lane suite (fenced, unsampled run mutation-dark_factory-20261005 at c285747072): no test fails when they are applied.",
+   "first_seen": "mutation-dark_factory-20261005",
+   "last_seen": [],
+   "supersedes": [],
+   "extra": {
+    "survivors": [
+     "orchestrator.merge_lane.gates.x__resolve_already_landed_branch__mutmut_24",
+     "orchestrator.merge_lane.gates.x__resolve_already_landed_branch__mutmut_64"
+    ]
+   },
+   "severity": "medium",
+   "verdict": "confirmed",
+   "disposition": "filed:6411"
+  },
+  {
+   "key": "fk-c1f6739d8a37",
+   "area": "orchestrator",
+   "anchor": "orchestrator/src/orchestrator/merge_lane/gates.py::_path_existed_in_branch_history",
+   "tags": [
+    "tests",
+    "kind:mutation"
+   ],
+   "evidence_source": [
+    "metrics"
+   ],
+   "statement": "2 mutmut mutants of _path_existed_in_branch_history survive the 141-file merge-lane suite (fenced, unsampled run mutation-dark_factory-20261005 at c285747072): no test fails when they are applied.",
+   "first_seen": "mutation-dark_factory-20261005",
+   "last_seen": [],
+   "supersedes": [],
+   "extra": {
+    "survivors": [
+     "orchestrator.merge_lane.gates.x__path_existed_in_branch_history__mutmut_12",
+     "orchestrator.merge_lane.gates.x__path_existed_in_branch_history__mutmut_17"
+    ]
+   },
+   "severity": "medium",
+   "verdict": "confirmed",
+   "disposition": "filed:6411"
+  },
+  {
+   "key": "fk-0adcde3b4223",
+   "area": "orchestrator",
+   "anchor": "orchestrator/src/orchestrator/merge_lane/gates.py::_check_post_merge_equivalence",
+   "tags": [
+    "tests",
+    "kind:mutation"
+   ],
+   "evidence_source": [
+    "metrics"
+   ],
+   "statement": "2 mutmut mutants of _check_post_merge_equivalence survive the 141-file merge-lane suite (fenced, unsampled run mutation-dark_factory-20261005 at c285747072): no test fails when they are applied.",
+   "first_seen": "mutation-dark_factory-20261005",
+   "last_seen": [],
+   "supersedes": [],
+   "extra": {
+    "survivors": [
+     "orchestrator.merge_lane.gates.x__check_post_merge_equivalence__mutmut_71",
+     "orchestrator.merge_lane.gates.x__check_post_merge_equivalence__mutmut_78"
+    ]
+   },
+   "severity": "medium",
+   "verdict": "confirmed",
+   "disposition": "filed:6413"
+  },
+  {
+   "key": "fk-430f0c416fd6",
+   "area": "orchestrator",
+   "anchor": "orchestrator/src/orchestrator/merge_lane/gates.py::_elapsed_ms",
+   "tags": [
+    "tests",
+    "kind:mutation"
+   ],
+   "evidence_source": [
+    "metrics"
+   ],
+   "statement": "1 mutmut mutant of _elapsed_ms survive the 141-file merge-lane suite (fenced, unsampled run mutation-dark_factory-20261005 at c285747072): no test fails when it is applied.",
+   "first_seen": "mutation-dark_factory-20261005",
+   "last_seen": [],
+   "supersedes": [],
+   "extra": {
+    "survivors": [
+     "orchestrator.merge_lane.gates.x__elapsed_ms__mutmut_5"
+    ]
+   },
+   "severity": "medium",
+   "verdict": "confirmed",
+   "disposition": "filed:6411"
+  },
+  {
+   "key": "fk-f9775451871b",
+   "area": "orchestrator",
+   "anchor": "orchestrator/src/orchestrator/merge_lane/gates.py::is_cross_repo_task",
+   "tags": [
+    "tests",
+    "kind:mutation"
+   ],
+   "evidence_source": [
+    "metrics"
+   ],
+   "statement": "1 mutmut mutant of is_cross_repo_task survive the 141-file merge-lane suite (fenced, unsampled run mutation-dark_factory-20261005 at c285747072): no test fails when it is applied.",
+   "first_seen": "mutation-dark_factory-20261005",
+   "last_seen": [],
+   "supersedes": [],
+   "extra": {
+    "survivors": [
+     "orchestrator.merge_lane.gates.x_is_cross_repo_task__mutmut_10"
+    ]
+   },
+   "severity": "medium",
+   "verdict": "confirmed",
+   "disposition": "filed:6411"
+  },
+  {
+   "key": "fk-5cda09732e42",
+   "area": "orchestrator",
+   "anchor": "orchestrator/src/orchestrator/merge_lane/gates.py::_normalize_plan_path",
+   "tags": [
+    "tests",
+    "kind:mutation"
+   ],
+   "evidence_source": [
+    "metrics"
+   ],
+   "statement": "1 mutmut mutant of _normalize_plan_path survive the 141-file merge-lane suite (fenced, unsampled run mutation-dark_factory-20261005 at c285747072): no test fails when it is applied.",
+   "first_seen": "mutation-dark_factory-20261005",
+   "last_seen": [],
+   "supersedes": [],
+   "extra": {
+    "survivors": [
+     "orchestrator.merge_lane.gates.x__normalize_plan_path__mutmut_4"
+    ]
+   },
+   "severity": "medium",
+   "verdict": "confirmed",
+   "disposition": "filed:6412"
+  },
+  {
+   "key": "fk-373739976009",
+   "area": "orchestrator",
+   "anchor": "orchestrator/src/orchestrator/merge_lane/types.py::TerminalOutcomeRetention.record_alias",
+   "tags": [
+    "tests",
+    "kind:mutation"
+   ],
+   "evidence_source": [
+    "metrics"
+   ],
+   "statement": "5 mutmut mutants of TerminalOutcomeRetention.record_alias survive the 141-file merge-lane suite (fenced, unsampled run mutation-dark_factory-20261005 at c285747072): no test fails when they are applied.",
+   "first_seen": "mutation-dark_factory-20261005",
+   "last_seen": [],
+   "supersedes": [],
+   "extra": {
+    "survivors": [
+     "orchestrator.merge_lane.types.xǁTerminalOutcomeRetentionǁrecord_alias__mutmut_3",
+     "orchestrator.merge_lane.types.xǁTerminalOutcomeRetentionǁrecord_alias__mutmut_4",
+     "orchestrator.merge_lane.types.xǁTerminalOutcomeRetentionǁrecord_alias__mutmut_5",
+     "orchestrator.merge_lane.types.xǁTerminalOutcomeRetentionǁrecord_alias__mutmut_6",
+     "orchestrator.merge_lane.types.xǁTerminalOutcomeRetentionǁrecord_alias__mutmut_7"
+    ]
+   },
+   "severity": "low",
+   "verdict": "confirmed",
+   "disposition": "filed:4833",
+   "proposal": "None: the class is never constructed in production (task 3149), and task 4833 deletes it."
+  },
+  {
+   "key": "fk-5d9b64f39791",
+   "area": "orchestrator",
+   "anchor": "orchestrator/src/orchestrator/merge_lane/types.py::InFlightMergeRegistry.acquire",
+   "tags": [
+    "tests",
+    "kind:mutation"
+   ],
+   "evidence_source": [
+    "metrics"
+   ],
+   "statement": "4 mutmut mutants of InFlightMergeRegistry.acquire survive the 141-file merge-lane suite (fenced, unsampled run mutation-dark_factory-20261005 at c285747072): no test fails when they are applied.",
+   "first_seen": "mutation-dark_factory-20261005",
+   "last_seen": [],
+   "supersedes": [],
+   "extra": {
+    "survivors": [
+     "orchestrator.merge_lane.types.xǁInFlightMergeRegistryǁacquire__mutmut_9",
+     "orchestrator.merge_lane.types.xǁInFlightMergeRegistryǁacquire__mutmut_16",
+     "orchestrator.merge_lane.types.xǁInFlightMergeRegistryǁacquire__mutmut_18",
+     "orchestrator.merge_lane.types.xǁInFlightMergeRegistryǁacquire__mutmut_31"
+    ]
+   },
+   "severity": "medium",
+   "verdict": "confirmed",
+   "disposition": "filed:6415"
+  },
+  {
+   "key": "fk-cc7acc4aba57",
+   "area": "orchestrator",
+   "anchor": "orchestrator/src/orchestrator/merge_lane/types.py::InFlightMergeRegistry.eta_seconds",
+   "tags": [
+    "tests",
+    "kind:mutation"
+   ],
+   "evidence_source": [
+    "metrics"
+   ],
+   "statement": "3 mutmut mutants of InFlightMergeRegistry.eta_seconds survive the 141-file merge-lane suite (fenced, unsampled run mutation-dark_factory-20261005 at c285747072): no test fails when they are applied.",
+   "first_seen": "mutation-dark_factory-20261005",
+   "last_seen": [],
+   "supersedes": [],
+   "extra": {
+    "survivors": [
+     "orchestrator.merge_lane.types.xǁInFlightMergeRegistryǁeta_seconds__mutmut_7",
+     "orchestrator.merge_lane.types.xǁInFlightMergeRegistryǁeta_seconds__mutmut_8",
+     "orchestrator.merge_lane.types.xǁInFlightMergeRegistryǁeta_seconds__mutmut_9"
+    ]
+   },
+   "severity": "medium",
+   "verdict": "confirmed",
+   "disposition": "filed:6415"
+  },
+  {
+   "key": "fk-f7b381081691",
+   "area": "orchestrator",
+   "anchor": "orchestrator/src/orchestrator/merge_lane/types.py::item_merge_wt",
+   "tags": [
+    "tests",
+    "kind:mutation"
+   ],
+   "evidence_source": [
+    "metrics"
+   ],
+   "statement": "2 mutmut mutants of item_merge_wt survive the 141-file merge-lane suite (fenced, unsampled run mutation-dark_factory-20261005 at c285747072): no test fails when they are applied.",
+   "first_seen": "mutation-dark_factory-20261005",
+   "last_seen": [],
+   "supersedes": [],
+   "extra": {
+    "survivors": [
+     "orchestrator.merge_lane.types.x_item_merge_wt__mutmut_3",
+     "orchestrator.merge_lane.types.x_item_merge_wt__mutmut_4"
+    ]
+   },
+   "severity": "low",
+   "verdict": "refuted",
+   "disposition": "refuted",
+   "refutation": "unreachable: both mutants edit an `assert_never` arm that the type checker proves unreachable"
+  },
+  {
+   "key": "fk-7c10d081e252",
+   "area": "orchestrator",
+   "anchor": "orchestrator/src/orchestrator/merge_lane/types.py::MergeBounceRegistry.clear",
+   "tags": [
+    "tests",
+    "kind:mutation"
+   ],
+   "evidence_source": [
+    "metrics"
+   ],
+   "statement": "1 mutmut mutant of MergeBounceRegistry.clear survive the 141-file merge-lane suite (fenced, unsampled run mutation-dark_factory-20261005 at c285747072): no test fails when it is applied.",
+   "first_seen": "mutation-dark_factory-20261005",
+   "last_seen": [],
+   "supersedes": [],
+   "extra": {
+    "survivors": [
+     "orchestrator.merge_lane.types.xǁMergeBounceRegistryǁclear__mutmut_3"
+    ]
+   },
+   "severity": "medium",
+   "verdict": "confirmed",
+   "disposition": "filed:6415"
+  },
+  {
+   "key": "fk-b023d75909a5",
+   "area": "orchestrator",
+   "anchor": "orchestrator/src/orchestrator/merge_lane/types.py::TerminalOutcomeRetention.__init__",
+   "tags": [
+    "tests",
+    "kind:mutation"
+   ],
+   "evidence_source": [
+    "metrics"
+   ],
+   "statement": "1 mutmut mutant of TerminalOutcomeRetention.__init__ survive the 141-file merge-lane suite (fenced, unsampled run mutation-dark_factory-20261005 at c285747072): no test fails when it is applied.",
+   "first_seen": "mutation-dark_factory-20261005",
+   "last_seen": [],
+   "supersedes": [],
+   "extra": {
+    "survivors": [
+     "orchestrator.merge_lane.types.xǁTerminalOutcomeRetentionǁ__init____mutmut_1"
+    ]
+   },
+   "severity": "low",
+   "verdict": "confirmed",
+   "disposition": "filed:4833",
+   "proposal": "None: the class is never constructed in production (task 3149), and task 4833 deletes it."
+  },
+  {
+   "key": "fk-54f2462a0dea",
+   "area": "orchestrator",
+   "anchor": "orchestrator/src/orchestrator/merge_lane/types.py::TerminalOutcomeRetention.record",
+   "tags": [
+    "tests",
+    "kind:mutation"
+   ],
+   "evidence_source": [
+    "metrics"
+   ],
+   "statement": "1 mutmut mutant of TerminalOutcomeRetention.record survive the 141-file merge-lane suite (fenced, unsampled run mutation-dark_factory-20261005 at c285747072): no test fails when it is applied.",
+   "first_seen": "mutation-dark_factory-20261005",
+   "last_seen": [],
+   "supersedes": [],
+   "extra": {
+    "survivors": [
+     "orchestrator.merge_lane.types.xǁTerminalOutcomeRetentionǁrecord__mutmut_4"
+    ]
+   },
+   "severity": "low",
+   "verdict": "confirmed",
+   "disposition": "filed:4833",
+   "proposal": "None: the class is never constructed in production (task 3149), and task 4833 deletes it."
+  },
+  {
+   "key": "fk-b165b0dafef7",
+   "area": "orchestrator",
+   "anchor": "orchestrator/src/orchestrator/merge_lane/types.py::TerminalOutcomeRetention.forget",
+   "tags": [
+    "tests",
+    "kind:mutation"
+   ],
+   "evidence_source": [
+    "metrics"
+   ],
+   "statement": "1 mutmut mutant of TerminalOutcomeRetention.forget survive the 141-file merge-lane suite (fenced, unsampled run mutation-dark_factory-20261005 at c285747072): no test fails when it is applied.",
+   "first_seen": "mutation-dark_factory-20261005",
+   "last_seen": [],
+   "supersedes": [],
+   "extra": {
+    "survivors": [
+     "orchestrator.merge_lane.types.xǁTerminalOutcomeRetentionǁforget__mutmut_13"
+    ]
+   },
+   "severity": "low",
+   "verdict": "confirmed",
+   "disposition": "filed:4833",
+   "proposal": "None: the class is never constructed in production (task 3149), and task 4833 deletes it."
+  },
+  {
+   "key": "fk-c4e383c51351",
+   "area": "orchestrator",
+   "anchor": "orchestrator/src/orchestrator/merge_lane/types.py::InFlightMergeRegistry.attach",
+   "tags": [
+    "tests",
+    "kind:mutation"
+   ],
+   "evidence_source": [
+    "metrics"
+   ],
+   "statement": "1 mutmut mutant of InFlightMergeRegistry.attach survive the 141-file merge-lane suite (fenced, unsampled run mutation-dark_factory-20261005 at c285747072): no test fails when it is applied.",
+   "first_seen": "mutation-dark_factory-20261005",
+   "last_seen": [],
+   "supersedes": [],
+   "extra": {
+    "survivors": [
+     "orchestrator.merge_lane.types.xǁInFlightMergeRegistryǁattach__mutmut_7"
+    ]
+   },
+   "severity": "medium",
+   "verdict": "confirmed",
+   "disposition": "filed:6415"
+  },
+  {
+   "key": "fk-6cfc9d7664a7",
+   "area": "orchestrator",
+   "anchor": "orchestrator/src/orchestrator/merge_lane/types.py::InFlightMergeRegistry.detach",
+   "tags": [
+    "tests",
+    "kind:mutation"
+   ],
+   "evidence_source": [
+    "metrics"
+   ],
+   "statement": "1 mutmut mutant of InFlightMergeRegistry.detach survive the 141-file merge-lane suite (fenced, unsampled run mutation-dark_factory-20261005 at c285747072): no test fails when it is applied.",
+   "first_seen": "mutation-dark_factory-20261005",
+   "last_seen": [],
+   "supersedes": [],
+   "extra": {
+    "survivors": [
+     "orchestrator.merge_lane.types.xǁInFlightMergeRegistryǁdetach__mutmut_9"
+    ]
+   },
+   "severity": "medium",
+   "verdict": "confirmed",
+   "disposition": "filed:6415"
+  },
+  {
+   "key": "fk-785f153e6313",
+   "area": "orchestrator",
+   "anchor": "orchestrator/src/orchestrator/merge_lane/types.py::InFlightMergeRegistry._release_if_current",
+   "tags": [
+    "tests",
+    "kind:mutation"
+   ],
+   "evidence_source": [
+    "metrics"
+   ],
+   "statement": "1 mutmut mutant of InFlightMergeRegistry._release_if_current survive the 141-file merge-lane suite (fenced, unsampled run mutation-dark_factory-20261005 at c285747072): no test fails when it is applied.",
+   "first_seen": "mutation-dark_factory-20261005",
+   "last_seen": [],
+   "supersedes": [],
+   "extra": {
+    "survivors": [
+     "orchestrator.merge_lane.types.xǁInFlightMergeRegistryǁ_release_if_current__mutmut_5"
+    ]
+   },
+   "severity": "low",
+   "verdict": "refuted",
+   "disposition": "refuted",
+   "refutation": "equivalent: the pop only runs after `self._slots.get(branch) is entry`, so the key is always present"
+  }
+ ]
+}

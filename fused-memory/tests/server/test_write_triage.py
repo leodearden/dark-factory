@@ -24,13 +24,12 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from fused_memory.models.enums import MEM0_PRIMARY, MemoryCategory, SourceStore
-from fused_memory.models.memory import MemoryResult
+from fused_memory.models.memory import AddMemoryResponse, MemoryResult
 from fused_memory.server import write_triage
 from fused_memory.server.grouped_read import (
     CHILD_KINDS,
     CONTESTED_METADATA_KEY,
     PARENT_ID_KEY,
-    _parent_id_in_meta,
 )
 from fused_memory.server.write_triage import (
     _DEFAULT_CANDIDATE_K,
@@ -47,8 +46,9 @@ from fused_memory.server.write_triage import (
     ROUTED_KEY,
     TRIAGE_OUTCOMES,
     TriageFailOpenCounter,
-    _canonical_id_of,
+    TriageJudgeVerdict,
     _stub_judge,
+    attach_write_durable,
     attach_write_landed,
     decide_band,
     declares_attach_keys,
@@ -60,6 +60,7 @@ from fused_memory.server.write_triage import (
     triage_write,
 )
 from fused_memory.services.memory_service import RRF_K, SearchResults
+from fused_memory.utils.clip_disclosure import TruncationFact
 
 # The real post-RRF relevance_score for a rank-1 hit, from production rather
 # than restated as the literal 60 — see test_near_duplicate_guard.py.
@@ -630,6 +631,7 @@ class TestDecideBand:
         ('label', 'extra'),
         [
             ('no kind at all', None),
+            ('parent_id without kind', {PARENT_ID_KEY: 'm1'}),
             ('kind outside CHILD_KINDS', {'kind': 'note', PARENT_ID_KEY: 'm1'}),
             ('kind is None', {'kind': None, PARENT_ID_KEY: 'm1'}),
         ],
@@ -659,7 +661,7 @@ class TestDecideBand:
     def test_a_child_with_a_malformed_parent_id_does_not_hoist(
         self, label, extra,
     ) -> None:
-        """Matches `_parent_id_in_meta`'s exact rule, so the two cannot disagree.
+        """The rule is grouped_read's `child_parent_id`: a malformed link is no child.
 
         A child kind whose parent link is unusable is treated as an ordinary
         candidate rather than hoisted to a nonsense target: `parent_id` must
@@ -670,37 +672,6 @@ class TestDecideBand:
             [_result('c1', 0.97, extra_metadata=extra)], t_high=T_HIGH, t_low=T_LOW,
         )
         assert d.canonical_id == 'c1', label
-
-    @pytest.mark.parametrize(
-        'extra',
-        [
-            None,
-            {},
-            {'kind': 'sighting', PARENT_ID_KEY: 'm1'},
-            {'kind': 'amendment', PARENT_ID_KEY: 'm1'},
-            {'kind': 'sighting'},
-            {'kind': 'sighting', PARENT_ID_KEY: None},
-            {'kind': 'sighting', PARENT_ID_KEY: ''},
-            {'kind': 'sighting', PARENT_ID_KEY: 7},
-            {'kind': 'note', PARENT_ID_KEY: 'm1'},
-            {'kind': None, PARENT_ID_KEY: 'm1'},
-            {PARENT_ID_KEY: 'm1'},
-        ],
-    )
-    def test_the_child_rule_cannot_drift_from_grouped_reads(self, extra) -> None:
-        """DRIFT GUARD: one rule, asserted against the READ side's own function.
-
-        `write_triage` decides where a child's write attaches; `grouped_read`
-        decides where a child is displayed. If those two disagree about what
-        counts as a child, the write lands somewhere the read cannot fold it
-        from — a child that exists but never groups. Asserting equivalence
-        against the landed `_parent_id_in_meta` means a future tightening of
-        the rule in either module cannot silently re-open this hole in the
-        other.
-        """
-        result = _result('own-id', 0.97, extra_metadata=extra)
-        expected = _parent_id_in_meta(result.metadata) or 'own-id'
-        assert _canonical_id_of(result) == expected
 
 
 # ---------------------------------------------------------------------------
@@ -1529,6 +1500,77 @@ class TestTheRetrievedCandidatesReachTheJudge:
         assert called == [], label
 
 
+class TestTheDecisionDisclosesClippedCandidates:
+    """A decision says when retrieval may have cut in-band candidates and when the judge saw a trimmed slate."""
+
+    _RETRIEVAL_FACT = TruncationFact(field='triage_candidates', cap=3, elided=None)
+
+    @staticmethod
+    def _service(results, *, t_low: float | None = T_LOW) -> types.SimpleNamespace:
+        service = _svc(enabled=True, t_high=T_HIGH, t_low=t_low, candidate_k=3)
+        service.search = AsyncMock(return_value=SearchResults(results))
+        return service
+
+    @staticmethod
+    async def _triage(service, judge=None):
+        return await triage_write(
+            service, content='c', project_id='p',
+            counter=TriageFailOpenCounter(time_provider=_Clock()), judge=judge,
+        )
+
+    @staticmethod
+    def _results(*scores: float | None) -> list[MemoryResult]:
+        return [_result(f'm{i}', score, omit_store_score=score is None) for i, score in enumerate(scores)]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'scores',
+        [(0.99, 0.98, 0.97), (0.99, 0.80, T_LOW), (0.99, 0.98, None)],
+        ids=['all-high', 'weakest-exactly-t_low', 'uncomparable-ignored'],
+    )
+    async def test_a_full_retrieval_still_in_band_at_its_weakest_says_so(self, scores) -> None:
+        decision = await self._triage(self._service(self._results(*scores)))
+
+        assert decision.truncation_facts == (self._RETRIEVAL_FACT,)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'scores',
+        [(0.99, 0.98, T_LOW - 0.01), (0.30, 0.20, 0.10), (None, None, None)],
+        ids=['restated-tail-below-band', 'stored', 'nothing-comparable'],
+    )
+    async def test_a_full_retrieval_cut_below_the_band_reports_nothing(self, scores) -> None:
+        decision = await self._triage(self._service(self._results(*scores)))
+
+        assert decision.truncation_facts == ()
+
+    @pytest.mark.asyncio
+    async def test_an_uncalibrated_band_reports_nothing(self) -> None:
+        decision = await self._triage(self._service(self._results(0.99, 0.98, 0.97), t_low=None))
+
+        assert decision.truncation_facts == ()
+
+    @pytest.mark.asyncio
+    async def test_a_retrieval_under_candidate_k_reports_nothing(self) -> None:
+        decision = await self._triage(self._service(self._results(0.99, 0.98)))
+
+        assert decision.truncation_facts == ()
+
+    @pytest.mark.asyncio
+    async def test_a_judged_decision_carries_the_judges_facts_too(self) -> None:
+        judge_fact = TruncationFact(field='judge_candidates', cap=2, elided=1)
+
+        async def _judge(**_kwargs):
+            return TriageJudgeVerdict(OUTCOME_RESTATED, 'm0', truncation_facts=(judge_fact,))
+
+        results = [_result(f'm{i}', 0.75 - i / 1000) for i in range(3)]
+
+        decision = await self._triage(self._service(results), judge=_judge)
+
+        assert decision.outcome == OUTCOME_RESTATED
+        assert decision.truncation_facts == (self._RETRIEVAL_FACT, judge_fact)
+
+
 # ---------------------------------------------------------------------------
 # The config -> retrieval join (the width is only real if it reaches the wire)
 # ---------------------------------------------------------------------------
@@ -1670,6 +1712,31 @@ class TestEmitTriageFailOpenStormEscalation:
             f'must route the burst at the owning PRD leaf: {payload!r}'
         )
 
+    def test_states_the_mem0_intent_counts_for_the_window(self, tmp_path) -> None:
+        """The journal, not triage, knows whether each write's Mem0 leg landed."""
+        pytest.importorskip('escalation')
+        storm = {
+            **_STORM,
+            'mem0_intents_in_window': {'completed': 7, 'failed': 2, 'retrying': 3},
+        }
+
+        emit_triage_fail_open_storm_escalation(str(tmp_path), storm)
+
+        detail = _only_escalation(tmp_path)['detail']
+        assert (
+            "mem0_intents_in_window={'completed': 7, 'failed': 2, 'retrying': 3}"
+            in detail
+        ), detail
+
+    def test_without_counts_it_records_none(self, tmp_path) -> None:
+        """A fail-open storm is often the same outage that fails the Mem0 write itself."""
+        pytest.importorskip('escalation')
+
+        emit_triage_fail_open_storm_escalation(str(tmp_path), _STORM)
+
+        payload = _only_escalation(tmp_path)
+        assert 'mem0_intents_in_window=None' in payload['detail']
+
     def test_the_escalation_id_is_greppable_via_the_stable_anchor(
         self, tmp_path,
     ) -> None:
@@ -1736,6 +1803,28 @@ class TestEmitTriageFailOpenStormEscalation:
         assert payload['category'] == 'write_triage_fail_open_storm'
         assert payload['task_id'] == write_triage._ANCHOR_TASK_ID
         assert payload['level'] == 1
+
+
+def _only_escalation(project_root) -> dict:
+    (path,) = (project_root / 'data' / 'escalations').glob('esc-*.json')
+    return json.loads(path.read_text())
+
+
+class TestAttachWriteDurable:
+    """An attach whose Mem0 leg is queued for server-side retry still stands."""
+
+    def test_a_response_with_ids_is_durable(self) -> None:
+        assert attach_write_durable(AddMemoryResponse(memory_ids=['m1'])) is True
+
+    def test_a_mem0_leg_pending_retry_is_durable(self) -> None:
+        result = AddMemoryResponse(memory_ids=[], stores_pending_retry=[SourceStore.mem0])
+        assert attach_write_durable(result) is True
+
+    def test_nothing_landed_and_nothing_pending_is_not_durable(self) -> None:
+        assert attach_write_durable(AddMemoryResponse(memory_ids=[])) is False
+
+    def test_an_unspecced_test_double_reads_as_durable(self) -> None:
+        assert attach_write_durable(Mock()) is True
 
 
 class TestAttachWriteLanded:

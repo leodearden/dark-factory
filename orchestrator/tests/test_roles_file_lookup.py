@@ -15,31 +15,21 @@ from __future__ import annotations
 from dataclasses import replace
 
 from _role_splice_contract import (
-    MARKDOWN_HEADING,
+    READ_ONLY_UNPINNED_ROLES,
+    UNPINNED_ROLES,
     SpliceContract,
     assert_brace_free,
     assert_nonempty,
+    assert_opens_own_section,
+    bash_capable_unpinned_contract,
 )
 
 from orchestrator.agents.file_lookup_guidance import FILE_LOOKUP_GUIDANCE
-from orchestrator.agents.roles import (
+from orchestrator.agents.harness_guidance import (
     GREP_LOOKAROUND_GUIDANCE,
     GREP_LOOKAROUND_GUIDANCE_READ_ONLY,
-    ROLES,
-    AgentRole,
 )
-
-#: Every role with a literal system_prompt. DERIVED rather than
-#: hand-maintained, as in the sibling census-block modules.
-_UNPINNED_ROLES = frozenset(name for name, role in ROLES.items() if role.prompt_spec is None)
-
-#: The carriers of `_BASH_CAPABLE_ROLE_PREAMBLE`, whose tail this block joins.
-_BASH_PREAMBLE_ROLES = frozenset(
-    name for name in _UNPINNED_ROLES if 'Bash' in ROLES[name].allowed_tools
-)
-
-#: Roles building their own chain around the read-only Grep variant (`judge`).
-_READ_ONLY_ROLES = _UNPINNED_ROLES - _BASH_PREAMBLE_ROLES
+from orchestrator.agents.roles import AgentRole
 
 
 def _can_run_every_prescribed_lookup(role: AgentRole) -> bool:
@@ -55,8 +45,8 @@ def _can_run_every_prescribed_lookup(role: AgentRole) -> bool:
 _CONTRACT = SpliceContract(
     constant_name='FILE_LOOKUP_GUIDANCE',
     constant=FILE_LOOKUP_GUIDANCE,
-    roles=_UNPINNED_ROLES,
-    role_set_name='_UNPINNED_ROLES',
+    roles=UNPINNED_ROLES,
+    role_set_name='UNPINNED_ROLES (in _role_splice_contract.py)',
     capability=_can_run_every_prescribed_lookup,
     capability_description=(
         'a literal (non-PromptSpec) system_prompt, `Glob`, `Grep` and a '
@@ -89,45 +79,27 @@ def test_guidance_is_brace_free():
 
 def test_guidance_opens_its_own_section():
     """The block opens with its own ``\\n## `` heading."""
-    assert FILE_LOOKUP_GUIDANCE.startswith(MARKDOWN_HEADING), (
-        'FILE_LOOKUP_GUIDANCE does not start with MARKDOWN_HEADING, so where it '
-        'is spliced it would read as an unheaded continuation of whichever '
-        'block precedes it. Give it a leading blank line and a `## ` heading.'
-    )
-
-
-def test_derived_role_sets_are_nonempty():
-    """No splice test below can pass vacuously over an emptied derivation.
-
-    `_READ_ONLY_ROLES` is deliberately not required non-empty: it empties
-    legitimately if `judge` ever gains unqualified `Bash`, and the grep
-    module's own tripwire fires for that change.
-    """
-    assert _UNPINNED_ROLES, (
-        'No role has a literal system_prompt, so every splice test here passes '
-        'over an empty set. Check the `prompt_spec is None` derivation.'
-    )
-    assert _BASH_PREAMBLE_ROLES, (
-        'No literal-prompt role holds unqualified `Bash`, so the preamble-order '
-        "test passes over an empty set. Check the `'Bash' in allowed_tools` "
-        'derivation.'
+    assert_opens_own_section(
+        'FILE_LOOKUP_GUIDANCE',
+        FILE_LOOKUP_GUIDANCE,
+        remedy='Give it a leading blank line and a `## ` heading.',
     )
 
 
 def test_every_carrier_can_run_the_lookups():
     """Every derived carrier holds `Glob`, `Grep` and a git-capable `Bash`.
 
-    Not a tautology: `_UNPINNED_ROLES` is derived from the literal prompt
+    Not a tautology: `UNPINNED_ROLES` is derived from the literal prompt
     alone, while the capability also requires the three grants the block
     prescribes.
     """
     _CONTRACT.assert_role_set_matches_capability(
         remedy=(
-            '_UNPINNED_ROLES is derived, not hand-maintained, so a `lost=` role '
+            'UNPINNED_ROLES is derived, not hand-maintained, so a `lost=` role '
             'is a literal-prompt role missing `Glob`, `Grep` or a git-capable '
             '`Bash`: it would be told to run a lookup it cannot run. Grant the '
-            'missing tool, or exclude it from the derivation and from the '
-            'splice together.'
+            'missing tool, or give this block its own narrower role set and '
+            'drop the splice from that role together.'
         ),
     )
 
@@ -137,7 +109,7 @@ def test_every_unpinned_role_carries_guidance():
     _CONTRACT.assert_every_role_carries(
         remedy=(
             'For a role holding unqualified `Bash`, append FILE_LOOKUP_GUIDANCE '
-            'to the tail of roles.py::_BASH_CAPABLE_ROLE_PREAMBLE. For any other '
+            'to the tail of harness_guidance.py::BASH_CAPABLE_ROLE_PREAMBLE. For any other '
             "literal-prompt role, splice it into that role's own chain, as "
             'roles.py::JUDGE does.'
         ),
@@ -175,16 +147,16 @@ def test_guidance_lands_after_the_grep_block_in_bash_roles():
 
     Order, not adjacency: sibling census blocks append to the same tail in any
     merge order. The APPEND-ONLY comment above
-    `orchestrator/src/orchestrator/agents/roles.py::_BASH_CAPABLE_ROLE_PREAMBLE`
+    `orchestrator/src/orchestrator/agents/harness_guidance.py::BASH_CAPABLE_ROLE_PREAMBLE`
     holds that rationale.
     """
-    replace(
-        _CONTRACT, roles=_BASH_PREAMBLE_ROLES, role_set_name='_BASH_PREAMBLE_ROLES'
+    bash_capable_unpinned_contract(
+        'FILE_LOOKUP_GUIDANCE', FILE_LOOKUP_GUIDANCE
     ).assert_lands_after(
         follows=GREP_LOOKAROUND_GUIDANCE,
         follows_name='GREP_LOOKAROUND_GUIDANCE',
         remedy=(
-            'Re-append it at the END of roles.py::_BASH_CAPABLE_ROLE_PREAMBLE; '
+            'Re-append it at the END of harness_guidance.py::BASH_CAPABLE_ROLE_PREAMBLE; '
             'moving it earlier breaks the adjacency pins of the blocks ahead of '
             'it.'
         ),
@@ -194,7 +166,9 @@ def test_guidance_lands_after_the_grep_block_in_bash_roles():
 def test_guidance_lands_after_the_read_only_grep_block():
     """In the read-only roles the block lands after `GREP_LOOKAROUND_GUIDANCE_READ_ONLY`."""
     replace(
-        _CONTRACT, roles=_READ_ONLY_ROLES, role_set_name='_READ_ONLY_ROLES'
+        _CONTRACT,
+        roles=READ_ONLY_UNPINNED_ROLES,
+        role_set_name='READ_ONLY_UNPINNED_ROLES (in _role_splice_contract.py)',
     ).assert_lands_after(
         follows=GREP_LOOKAROUND_GUIDANCE_READ_ONLY,
         follows_name='GREP_LOOKAROUND_GUIDANCE_READ_ONLY',

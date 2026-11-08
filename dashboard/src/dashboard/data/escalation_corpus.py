@@ -4,7 +4,7 @@ Declared by ``plans/dashboard-one-datum-one-path-prd.md``, decision 13, and
 this module is that datum's single access implementation: every escalation
 surface — the Escalations tab's live-queue table and the analytics
 aggregates — reads the same walk through :func:`acquire_corpus` and its one
-cache. "Pending in the live queue" and "open in history" are two named views
+cache, directly or through :func:`serve_corpus`'s bounded wait. "Pending in the live queue" and "open in history" are two named views
 over that walk (:class:`EscalationView`), so the two can no longer count
 different populations at different freshnesses.
 
@@ -34,15 +34,22 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from types import MappingProxyType
+from typing import TypeVar
 
 from escalation.models import Escalation
 from escalation.queue import iter_all_escalation_paths
+from shared.task_tags import DEFAULT_TAG
 
 from dashboard.config import DashboardConfig
 from dashboard.data.datum import Datum, DatumState, unknown_datum
 from dashboard.data.mcp_fanout import TTLCache
+from dashboard.data.served_read import ServedRead
+from dashboard.data.task_ids import parse_task_id
 
 logger = logging.getLogger(__name__)
+
+_TaskKey = TypeVar('_TaskKey', str, int)
 
 CORPUS_TTL_SECONDS = 60.0
 """How long one walk is served before the next request walks again."""
@@ -140,23 +147,30 @@ class EscalationCorpus:
         return any(scan.reached for scan in self.scans)
 
 
-def _orchestrator_queue(root: Path) -> QueueRef:
+def _orchestrator_queue(root: Path, label: str) -> QueueRef:
     """The escalation queue of the project at *root*, beside that project's run ledger."""
     data = root / 'data'
     return QueueRef(
-        id=str(root), label=root.name, kind=QueueKind.ORCHESTRATOR,
+        id=str(root), label=label, kind=QueueKind.ORCHESTRATOR,
         directory=data / 'escalations', runs_db=data / 'orchestrator' / 'runs.db',
+    )
+
+
+def reconciliation_queue(config: DashboardConfig) -> QueueRef:
+    """The fused-memory reconciliation queue, the one memory-eval regressions are filed onto."""
+    return QueueRef(
+        id='reconciliation', label='fused-memory', kind=QueueKind.RECONCILIATION,
+        directory=config.reconciliation_escalations_dir, runs_db=None,
     )
 
 
 def corpus_queues(config: DashboardConfig) -> tuple[QueueRef, ...]:
     """Every escalation queue: the primary root, the other known roots, reconciliation."""
-    roots = dict.fromkeys([config.project_root, *config.known_project_roots])
-    reconciliation = QueueRef(
-        id='reconciliation', label='fused-memory', kind=QueueKind.RECONCILIATION,
-        directory=config.reconciliation_escalations_dir, runs_db=None,
+    labels = config.project_labels
+    return (
+        *(_orchestrator_queue(root, labels.of(root)) for root in config.all_project_roots),
+        reconciliation_queue(config),
     )
-    return (*(_orchestrator_queue(root) for root in roots), reconciliation)
 
 
 def _scan(queue: QueueRef) -> QueueScan:
@@ -218,9 +232,15 @@ _corpus_cache: TTLCache[Datum[EscalationCorpus], tuple[QueueRef, ...]] = TTLCach
 )
 
 
+_served_corpus: ServedRead[tuple[QueueRef, ...], EscalationCorpus] = ServedRead(
+    ttl_seconds=lambda: 0.0, freshness_bound_seconds=CORPUS_FRESHNESS_BOUND_SECONDS,
+)
+
+
 def _corpus_cache_clear() -> None:
-    """Clear the corpus cache (test/admin hook)."""
+    """Clear the corpus cache and its last good walk (test/admin hook)."""
     _corpus_cache.clear()
+    _served_corpus.clear()
 
 
 def measure_corpus(queues: Iterable[QueueRef], *, now: datetime) -> Datum[EscalationCorpus]:
@@ -242,6 +262,20 @@ async def acquire_corpus(
 
     return await _corpus_cache.get_or_refresh(
         key, _refresh, cache_ok=lambda datum: datum.value is not None and datum.value.reached_any,
+    )
+
+
+async def serve_corpus(
+    queues: Iterable[QueueRef], *, now: datetime, wait_seconds: float | None,
+) -> Datum[EscalationCorpus]:
+    """:func:`acquire_corpus`, waited on for at most *wait_seconds* and never raising.
+
+    A walk that raises or misses the wait is served as the last good walk, stale,
+    or unknown before any; a slow walk still lands in the one walk cache.
+    """
+    key = tuple(queues)
+    return await _served_corpus.serve(
+        key, lambda: acquire_corpus(key, now=now), now=now, wait_seconds=wait_seconds,
     )
 
 
@@ -281,3 +315,91 @@ def views_over(
         )
         for view in EscalationView
     }
+
+
+HUMAN_LEVEL = 2
+"""The escalation level a human rules on (``escalation/src/escalation/models.py``'s L2)."""
+
+
+def pending_level2_by_task(
+    corpus_datum: Datum[EscalationCorpus], queue_id: str,
+) -> Datum[Mapping[int, tuple[str, ...]]]:
+    """Each task's pending human-level escalations in the live queue *queue_id*, sorted.
+
+    A record whose task id names no task (``dashboard.data.task_ids.parse_task_id``)
+    is left out. The datum is as partial as that queue's scan, as
+    :func:`views_over` scopes a count.
+    """
+    corpus = corpus_datum.value
+    bound = corpus_datum.freshness_bound_seconds
+    if corpus is None:
+        return unknown_datum(corpus_datum.reason or 'the escalation corpus was not read', bound)
+    try:
+        scan = corpus.scan(queue_id)
+    except KeyError:
+        return unknown_datum(f'the escalation corpus carries no queue {queue_id}', bound)
+    state, reason = _scope_provenance(corpus_datum, [scan])
+    return Datum(_pending_ids_by(scan, _human_level_task), corpus_datum.as_of, state, reason, bound)
+
+
+def _human_level_task(escalation: Escalation) -> int | None:
+    return parse_task_id(escalation.task_id) if escalation.level == HUMAN_LEVEL else None
+
+
+def _pending_ids_by(
+    scan: QueueScan, task_of: Callable[[Escalation], _TaskKey | None],
+) -> Mapping[_TaskKey, tuple[str, ...]]:
+    """*scan*'s pending live escalation ids, sorted, by the task *task_of* reads off each.
+
+    An escalation *task_of* reads None off is left out.
+    """
+    by_task: dict[_TaskKey, list[str]] = {}
+    for record in scan.records:
+        task = task_of(record.escalation)
+        if task is not None and EscalationView.QUEUE_PENDING.admits(record):
+            by_task.setdefault(task, []).append(record.escalation.id)
+    return MappingProxyType({task: tuple(sorted(ids)) for task, ids in by_task.items()})
+
+
+@dataclass(frozen=True, slots=True)
+class PendingEscalations:
+    """One orchestrator queue's pending live escalations, by the id of the task each names.
+
+    An orchestrator names no tag when it reads its tasks, so every task its queue
+    names is in the task store's default tag; of any other tag the queue knows nothing.
+    """
+
+    by_task_id: Mapping[str, tuple[str, ...]]
+
+    def pinning(self, tag: str, task_id: int | str) -> tuple[str, ...] | None:
+        """The ids of the pending escalations naming *tag*/*task_id*; None outside the queue's tag."""
+        if tag != DEFAULT_TAG:
+            return None
+        return self.by_task_id.get(str(task_id), ())
+
+
+def _live_queue_fully_read(scan: QueueScan) -> bool:
+    """Whether every file at *scan*'s queue root was read; the archive holds no live escalation."""
+    return scan.reached and not any(
+        unreadable.location is Location.ROOT for unreadable in scan.unreadable
+    )
+
+
+def pending_escalation_ids(
+    corpus_datum: Datum[EscalationCorpus], queue_id: str,
+) -> PendingEscalations | None:
+    """The queue's pending live escalations by task; None when that queue root was not fully read.
+
+    A queue directory that was not found is unknown even for a project that has
+    never escalated: an absent directory reads the same as an unmounted one.
+    """
+    corpus = corpus_datum.value
+    if corpus is None:
+        return None
+    try:
+        scan = corpus.scan(queue_id)
+    except KeyError:
+        return None
+    if not _live_queue_fully_read(scan):
+        return None
+    return PendingEscalations(_pending_ids_by(scan, lambda escalation: escalation.task_id))

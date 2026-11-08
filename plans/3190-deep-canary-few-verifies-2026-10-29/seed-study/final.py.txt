@@ -1,0 +1,34 @@
+import json,time,collections,bisect,calendar,math
+exec(open('/tmp/3190s/bin/sarcorr.py').read().split("print('10-min bins")[0])
+def spear(a,b):
+    def rk(v):
+        o=sorted(range(len(v)),key=lambda i:v[i]);r=[0]*len(v)
+        for i,x in enumerate(o):r[x]=i
+        return r
+    ra,rb=rk(a),rk(b);n=len(a);ma=(n-1)/2
+    return sum((x-ma)*(y-ma) for x,y in zip(ra,rb))/math.sqrt(sum((x-ma)**2 for x in ra)*sum((y-ma)**2 for y in rb))
+print('10-min bins, loop0 await<100ms only, n=',sum(1 for x in X if x[1]['aw']<100))
+Lo=[x for x in X if x[1]['aw']<100]
+for f in ('tps','r','w','aq','aw','ut'):print(f,round(spear([x[3] for x in Lo],[x[1][f] for x in Lo]),2),end='; ')
+print()
+print('clone p50 by loop0 write MB/s, await<100ms band: band bins clone_p50 tps util rMB')
+for a,c in ((0,20),(20,40),(40,70),(70,100),(100,150),(150,999)):
+    v=[x for x in Lo if a<=x[1]['w']/1024<c]
+    if v:print((a,c),len(v),f"{pct([x[3] for x in v],.5):.0f} {pct([x[1]['tps'] for x in v],.5):.0f} {pct([x[1]['ut'] for x in v],.5):.0f} {pct([x[1]['r'] for x in v],.5)/1024:.0f}")
+print('clone p50 by loop0 tps, all bins')
+for a,c in ((0,2000),(2000,3000),(3000,4000),(4000,5000),(5000,7000),(7000,20000)):
+    v=[x for x in X if a<=x[1]['tps']<c]
+    if v:print((a,c),len(v),f"{pct([x[3] for x in v],.5):.0f} util={pct([x[1]['ut'] for x in v],.5):.0f} w={pct([x[1]['w'] for x in v],.5)/1024:.0f}MB r={pct([x[1]['r'] for x in v],.5)/1024:.0f}MB")
+rows=[]
+for l in open('/home/leo/src/reify/data/verify-logs/verify-runs.jsonl',errors='replace'):
+    try:r=json.loads(l)
+    except Exception:continue
+    rows.append(r)
+print('time-averaged concurrent verifies (ledger, UTC day): sum wall / day-hours')
+eras=[('10-15..18',calendar.timegm((2026,10,15,0,0,0)),calendar.timegm((2026,10,19,0,0,0))),('10-19..21',calendar.timegm((2026,10,19,0,0,0)),calendar.timegm((2026,10,22,0,0,0))),('10-22..25',calendar.timegm((2026,10,22,0,0,0)),calendar.timegm((2026,10,26,0,0,0))),('10-26..29',calendar.timegm((2026,10,26,0,0,0)),calendar.timegm((2026,10,30,0,0,0)))]
+for en,lo,hi in eras:
+    s=0
+    for r in rows:
+        a,b=r.get('started_at'),r.get('ended_at')
+        if a and b:s+=max(0,min(b,hi)-max(a,lo))
+    print(en,round(s/(hi-lo),2))

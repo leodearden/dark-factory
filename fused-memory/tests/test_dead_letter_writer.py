@@ -1,0 +1,156 @@
+"""Tests for the single-thread dead-letter appender (task 6085, INV-8)."""
+
+from __future__ import annotations
+
+import json
+import logging
+from pathlib import Path
+
+import pytest
+from _dead_letter_helpers import hold_fifo
+
+from fused_memory.reconciliation.dead_letter_writer import DeadLetterWriter
+
+_WRITER_LOGGER = 'fused_memory.reconciliation.dead_letter_writer'
+
+
+def _read_records(path: Path) -> list[dict]:
+    return [json.loads(line) for line in path.read_text(encoding='utf-8').splitlines()]
+
+
+def test_appends_land_in_submission_order_and_flush_waits_for_them(tmp_path: Path):
+    path = tmp_path / 'dl.jsonl'
+    writer = DeadLetterWriter(path)
+    records = [{'n': i, 'reason': f'r{i}'} for i in range(5)]
+
+    futures = [writer.append(record) for record in records]
+    writer.flushed().result(timeout=5)
+
+    assert _read_records(path) == records
+    assert [f.result(timeout=0) for f in futures] == [True] * 5
+    assert writer.records_written == 5
+
+
+def test_append_returns_before_the_write_lands(tmp_path: Path):
+    held = hold_fifo(tmp_path / 'dl.jsonl')
+    writer = DeadLetterWriter(held.path)
+    record = {'event': {'id': 'e1'}, 'reason': 'overflow_drop'}
+
+    written = writer.append(record)
+
+    assert not written.done()
+    assert not held.reader_opened.is_set(), (
+        'append() only returned after the FIFO reader opened: the write ran '
+        'on the caller thread'
+    )
+    assert writer.records_pending == 1
+    held.release.set()
+    assert held.records() == [record]
+    assert written.result(timeout=5) is True
+    assert writer.records_pending == 0
+
+
+def test_a_failed_write_is_logged_and_resolves_false(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+):
+    (tmp_path / 'blocker').write_text('a regular file, not a directory')
+    writer = DeadLetterWriter(tmp_path / 'blocker' / 'dl.jsonl')
+
+    with caplog.at_level(logging.ERROR, logger=_WRITER_LOGGER):
+        written = writer.append({'event': {'id': 'e1'}})
+        assert written.result(timeout=5) is False
+
+    assert writer.records_written == 0
+    assert writer.records_pending == 0
+    assert any(
+        rec.name == _WRITER_LOGGER and rec.levelno == logging.ERROR
+        for rec in caplog.records
+    ), caplog.records
+
+
+def test_an_accepted_append_cannot_be_cancelled(tmp_path: Path):
+    held = hold_fifo(tmp_path / 'dl.jsonl')
+    writer = DeadLetterWriter(held.path)
+    record = {'event': {'id': 'e1'}, 'reason': 'shutdown_timeout'}
+
+    written = writer.append(record)
+
+    assert written.cancel() is False
+    held.release.set()
+    assert held.records() == [record]
+    assert written.result(timeout=5) is True
+
+
+def test_an_unused_writer_is_already_flushed(tmp_path: Path):
+    assert DeadLetterWriter(tmp_path / 'dl.jsonl').flushed().done()
+
+
+def test_paths_list_the_current_file_then_each_rotation(tmp_path: Path):
+    path = tmp_path / 'dl.jsonl'
+
+    assert DeadLetterWriter(path, keep_rotations=2).paths() == [
+        path,
+        tmp_path / 'dl.jsonl.1',
+        tmp_path / 'dl.jsonl.2',
+    ]
+    assert DeadLetterWriter(path, keep_rotations=0).paths() == [path]
+
+
+def test_on_settled_runs_before_the_append_future_resolves(tmp_path: Path):
+    held = hold_fifo(tmp_path / 'dl.jsonl')
+    writer = DeadLetterWriter(held.path)
+    record = {'event': {'id': 'e1'}, 'reason': 'overflow_drop'}
+    seen: list[tuple[bool, bool]] = []
+
+    written = writer.append(record, on_settled=lambda ok: seen.append((ok, written.done())))
+
+    held.release.set()
+    assert held.records() == [record]
+    assert written.result(timeout=5) is True
+    assert seen == [(True, False)], 'on_settled ran after the future resolved'
+
+
+def test_on_settled_receives_false_when_the_write_fails(tmp_path: Path):
+    (tmp_path / 'blocker').write_text('a regular file, not a directory')
+    writer = DeadLetterWriter(tmp_path / 'blocker' / 'dl.jsonl')
+    seen: list[bool] = []
+
+    written = writer.append({'event': {'id': 'e1'}}, on_settled=seen.append)
+
+    assert written.result(timeout=5) is False
+    assert seen == [False]
+
+
+def test_on_settled_runs_inline_when_the_record_cannot_be_handed_off(tmp_path: Path):
+    writer = DeadLetterWriter(tmp_path / 'dl.jsonl')
+    seen: list[bool] = []
+
+    written = writer.append({'event': object()}, on_settled=seen.append)
+
+    assert seen == [False]
+    assert written.result(timeout=0) is False
+
+
+def test_a_raising_on_settled_still_resolves_the_future(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+):
+    path = tmp_path / 'dl.jsonl'
+    writer = DeadLetterWriter(path)
+
+    def raising_hook(_ok: bool) -> None:
+        raise RuntimeError('hook bug')
+
+    with caplog.at_level(logging.ERROR, logger=_WRITER_LOGGER):
+        written = writer.append({'event': {'id': 'e1'}}, on_settled=raising_hook)
+        assert written.result(timeout=5) is True
+
+    assert writer.records_written == 1
+    hook_failures = [
+        rec for rec in caplog.records
+        if rec.name == _WRITER_LOGGER
+        and rec.levelno == logging.ERROR
+        and rec.exc_info is not None
+        and rec.exc_info[0] is RuntimeError
+    ]
+    assert len(hook_failures) == 1, caplog.records
+    assert str(path) in hook_failures[0].getMessage()

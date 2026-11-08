@@ -22,8 +22,6 @@ phrase (e.g. verify.py's DD5 notes, git_ops.py's own docstrings) are never
 matched, avoiding false positives. A literal only counts as "inside the
 chokepoint" when it falls within a ``_prune_registrations`` method defined
 directly on the ``GitOps`` class (not merely any same-named function).
-Mirrors the AST-walk / rglob / offender file:line list / skip-self pattern
-used by orchestrator/tests/test_event_loop_antipattern_guard.py.
 """
 from __future__ import annotations
 

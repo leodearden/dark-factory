@@ -36,6 +36,7 @@ from shared.async_sqlite_base import AsyncSqliteBase
 from dashboard.config import DashboardConfig
 from dashboard.data.burndown import (
     BURNDOWN_SCHEMA,
+    SAMPLE_INTERVAL_SECONDS,
     collect_snapshot,
     downsample,
     ensure_snapshot_columns,
@@ -51,7 +52,6 @@ from dashboard.project_dbs import _project_scoped_dbs_labeled
 logger = logging.getLogger(__name__)
 
 
-_SAMPLE_INTERVAL_SECONDS = 600  # 10 minutes
 _DOWNSAMPLE_INTERVAL_SECONDS = 3600  # 1 hour
 _CHECKPOINT_INTERVAL_SECONDS = 3600  # 1 hour
 
@@ -142,7 +142,7 @@ async def _burndown_loop(
     last_downsample = 0.0
     last_checkpoint = 0.0
     while True:
-        await _sleep_to_aligned_tick(_SAMPLE_INTERVAL_SECONDS)
+        await _sleep_to_aligned_tick(SAMPLE_INTERVAL_SECONDS)
         conn = store.connection
         try:
             await collect_snapshot(conn, config, client)
@@ -230,7 +230,7 @@ async def _metrics_loop(
     last_downsample = 0.0
     last_checkpoint = 0.0
     while True:
-        await _sleep_to_aligned_tick(_SAMPLE_INTERVAL_SECONDS)
+        await _sleep_to_aligned_tick(SAMPLE_INTERVAL_SECONDS)
         try:
             await _run_once()
             conn = store.connection

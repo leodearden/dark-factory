@@ -43,7 +43,7 @@ from typing import Any
 from shared import safe_io
 from shared.safe_io import load_json_or_warn
 
-logger = logging.getLogger('orchestrator.landed_outbox')
+logger = logging.getLogger('orchestrator.merge_lane')
 
 
 @dataclass(frozen=True)

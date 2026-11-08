@@ -16,12 +16,13 @@
 // destructures window.DF_DATUM and window.DF_TASK_VOCAB at module scope with no
 // fallback, and datum.js in turn destructures window.DF_ENDPOINT_STALENESS. So
 // the shim goes in first and the chain is required through it —
-// prd_grouping.test.mjs::loadPrdGrouping has the same shape.
+// prd_lanes_view.test.mjs::loadPrdLanesView has the same shape.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 
 import staleness from '../../src/dashboard/static/redux/endpoint_staleness.js';
+import { reactStandIn } from './_react_stand_in.mjs';
 
 const REDUX = '../../src/dashboard/static/redux/';
 const LOAD_CHAIN = ['datum.js', 'task_vocab.js', 'task_snapshot.js'].map(name => REDUX + name);
@@ -41,8 +42,8 @@ const { CENSUS_VIEWS, CENSUS_TILES, censusSegments, censusHistory } = snapshot;
 const { inFlightCount, runningOfInFlight, terminalOfTotal, censusTotal, viewShareText } = snapshot;
 const { projectRows, viewRows, unrequestedTerminalRows } = snapshot;
 const { snapshotRowsOver, EVERY_VIEW, terminalWindowProjects, terminalWindowEntrants } = snapshot;
-const { sameDatum } = snapshot;
-const { isDatum, datumView, displayedAgeMs, EM_DASH } = loadedWindow.DF_DATUM;
+const { terminalSelectingProjects, createTerminalWindowHooks } = snapshot;
+const { isDatum, datumView, displayedAgeMs, EM_DASH, servedDatum } = loadedWindow.DF_DATUM;
 const { MEMBERS, VIEWS, SUB_VIEWS } = loadedWindow.DF_TASK_VOCAB;
 
 const EXPECTED_FUNCTION_NAMES = [
@@ -61,7 +62,8 @@ const EXPECTED_FUNCTION_NAMES = [
   'snapshotRowsOver',
   'terminalWindowProjects',
   'terminalWindowEntrants',
-  'sameDatum',
+  'terminalSelectingProjects',
+  'createTerminalWindowHooks',
 ];
 const EXPECTED_EXPORT_NAMES = [
   ...EXPECTED_FUNCTION_NAMES,
@@ -211,6 +213,24 @@ test('projectCensus: an unknown served census stays unknown with the producer\'s
   assert.equal(census.reason, 'status map read failed');
 });
 
+const UNAGEABLE_TASKS_RECEIPTS = [{ servedAt: SERVED_AT }, { servedAt: SERVED_AT, receivedAt: 'not a clock' }];
+
+test("projectCensus and projectRows: a receipt that cannot age a Datum is no receipt — servedDatum's own verdict", () => {
+  for (const receipt of UNAGEABLE_TASKS_RECEIPTS) {
+    const data = sketchData({ __receipt: { [TASKS_ENDPOINT]: receipt } });
+    for (const [reader, wireKey] of [[projectCensus, 'census'], [projectRows, 'rows']]) {
+      const label = `${reader.name} under ${JSON.stringify(receipt)}`;
+      const served = data.TASKS_SNAPSHOT['dark-factory'][wireKey];
+
+      assert.deepEqual(
+        reader(data, 'dark-factory'),
+        servedDatum(served, TASKS_ENDPOINT, 'unused', data.__receipt),
+        label,
+      );
+    }
+  }
+});
+
 // ── censusOver: one project, or a member-wise total over several ────────────
 
 test('censusOver: a single project in scope is that project\'s census', () => {
@@ -286,6 +306,22 @@ test('censusOver: the total renders the placeholder, never a 0, when nothing is 
     },
   });
   assert.equal(view.text, EM_DASH);
+});
+
+test('censusOver: a receipt that cannot age a Datum makes a hole of the total, never a throw', () => {
+  const data = sketchData({ __receipt: { [TASKS_ENDPOINT]: { servedAt: SERVED_AT } } });
+  for (const scope of [null, ['dark-factory']]) {
+    const label = `scope ${JSON.stringify(scope)}`;
+    let fleet;
+    assert.doesNotThrow(() => {
+      fleet = censusOver(data, scope);
+    }, label);
+
+    assert.equal(isDatum(fleet), true, label);
+    assert.equal(fleet.state, 'unknown', label);
+    assert.equal(fleet.value, null, label);
+    assert.match(fleet.reason, /not yet fetched/, label);
+  }
 });
 
 // ── The named readings ──────────────────────────────────────────────────────
@@ -572,46 +608,6 @@ test('projectRows: an absent project or rows half is a reasoned hole', () => {
   assert.ok(noRows.reason);
 });
 
-// ── sameDatum: a fresh stamped copy against the Datum a caller holds ───────
-// projectRows stamps a new object on every call, so a render-to-render memo
-// cannot key on its identity. sameDatum says whether the copy would render
-// exactly as the held one: every field identical, the value by reference.
-
-test('sameDatum: two reads of one payload are distinct objects that are the same Datum', () => {
-  const data = sketchData();
-  const first = projectRows(data, 'dark-factory');
-  const second = projectRows(data, 'dark-factory');
-  assert.notEqual(first, second);
-  assert.equal(sameDatum(first, second), true);
-});
-
-test('sameDatum: a new payload is a different Datum, even with equal rows', () => {
-  const before = projectRows(sketchData(), 'dark-factory');
-  const reshipped = sketchData({
-    TASKS_SNAPSHOT: { 'dark-factory': entryWith(datumIn('fresh', DF_CENSUS_VALUE), structuredClone(FRESH_ROWS)) },
-  });
-  assert.equal(sameDatum(before, projectRows(reshipped, 'dark-factory')), false);
-});
-
-test('sameDatum: a new receipt over the same rows is a different Datum, so its age is re-read', () => {
-  const before = projectRows(sketchData(), 'dark-factory');
-  const later = sketchData({ __receipt: { [TASKS_ENDPOINT]: { servedAt: SERVED_AT, receivedAt: RECEIVED_AT + 3_000 } } });
-  assert.equal(sameDatum(before, projectRows(later, 'dark-factory')), false);
-});
-
-test('sameDatum: holes are the same while their reason is', () => {
-  const hole = () => projectRows(sketchData(), 'hive');
-  assert.equal(sameDatum(hole(), hole()), true);
-  assert.equal(sameDatum(hole(), unrequestedTerminalRows(undefined)), false);
-  assert.equal(sameDatum(unrequestedTerminalRows(undefined), unrequestedTerminalRows(undefined)), true);
-});
-
-test('sameDatum: a stamped copy is not the same Datum as its unstamped wire original', () => {
-  const data = sketchData();
-  assert.equal(sameDatum(data.TASKS_SNAPSHOT['dark-factory'].rows, projectRows(data, 'dark-factory')), false);
-  assert.equal(sameDatum(projectRows(data, 'dark-factory'), data.TASKS_SNAPSHOT['dark-factory'].rows), false);
-});
-
 // One row per non-terminal member — including the three the old filter bar
 // silently dropped (review, merge-deferred, infra-hold).
 const SNAPSHOT_ROWS = [
@@ -721,9 +717,9 @@ test('viewRows: nothing selected lists nothing and leaves the sentence to orch_f
   assert.deepEqual(result.notes, []);
 });
 
-// OrchTab lists terminal rows without requesting the window: that request is
-// another surface's. So an absent window must not read 'not yet fetched', which
-// is data.js::datumFor's answer and promises a fetch that nothing here makes.
+// A surface can list a window it did not request: the Tasks tab, for a project
+// outside its wanted set. So an absent window must not read 'not yet fetched',
+// which is data.js::datumFor's answer and promises a fetch that nothing there makes.
 test('unrequestedTerminalRows: an absent window says it is fetched on request — never "not yet fetched"', () => {
   const absent = unrequestedTerminalRows(undefined);
 
@@ -812,40 +808,22 @@ test('EVERY_VIEW: one row per status member is listed — review and infra-hold 
 
 const PROJECT_IDS = ['dark-factory', 'reify', 'hive'];
 
-test('terminalWindowProjects: the terminal view requests every project, in project order', () => {
-  assert.deepEqual(terminalWindowProjects(PROJECT_IDS, { terminal: true }, []), PROJECT_IDS);
-  assert.deepEqual(terminalWindowProjects(PROJECT_IDS, { terminal: true }, ['hive']), PROJECT_IDS);
+test('terminalWindowProjects: the terminal view requests every visible project, in project order', () => {
+  assert.deepEqual(terminalWindowProjects(PROJECT_IDS, { terminal: true }), PROJECT_IDS);
 });
 
-test('terminalWindowProjects: without the terminal view, only PRD-grouped projects request it', () => {
-  const filter = { in_flight: true, backlog: true, terminal: false };
-  assert.deepEqual(terminalWindowProjects(PROJECT_IDS, filter, ['hive', 'dark-factory']), ['dark-factory', 'hive']);
-  assert.deepEqual(terminalWindowProjects(PROJECT_IDS, {}, ['reify']), ['reify']);
-});
-
-test('terminalWindowProjects: a grouped id that is not a visible project is ignored', () => {
-  assert.deepEqual(terminalWindowProjects(PROJECT_IDS, {}, ['elsewhere', 'reify']), ['reify']);
-});
-
-test('terminalWindowProjects: nothing selected and nothing grouped requests nothing', () => {
-  assert.deepEqual(terminalWindowProjects(PROJECT_IDS, {}, []), []);
-  assert.deepEqual(terminalWindowProjects([], { terminal: true }, ['reify']), []);
-});
-
-test('terminalWindowProjects: each project is requested once', () => {
-  const wanted = terminalWindowProjects(PROJECT_IDS, { terminal: true }, ['reify', 'reify']);
-  assert.deepEqual(wanted, PROJECT_IDS);
-  assert.deepEqual(terminalWindowProjects(PROJECT_IDS, {}, ['reify', 'reify']), ['reify']);
+test('terminalWindowProjects: without the terminal view nothing requests it, the by-PRD lanes included', () => {
+  assert.deepEqual(terminalWindowProjects(PROJECT_IDS, { in_flight: true, backlog: true, terminal: false }), []);
+  assert.deepEqual(terminalWindowProjects(PROJECT_IDS, {}), []);
+  assert.deepEqual(terminalWindowProjects([], { terminal: true }), []);
 });
 
 test('terminalWindowProjects: its inputs are not mutated', () => {
   const projectIds = PROJECT_IDS.slice();
-  const filter = { terminal: false };
-  const grouped = ['hive', 'reify'];
-  terminalWindowProjects(projectIds, filter, grouped);
+  const filter = { terminal: true };
+  terminalWindowProjects(projectIds, filter);
   assert.deepEqual(projectIds, PROJECT_IDS);
-  assert.deepEqual(filter, { terminal: false });
-  assert.deepEqual(grouped, ['hive', 'reify']);
+  assert.deepEqual(filter, { terminal: true });
 });
 
 // ── terminalWindowEntrants: which wanted projects a request is owed ────────
@@ -863,16 +841,17 @@ test('terminalWindowEntrants: the first wanted set is requested whole, in its ow
 });
 
 test('terminalWindowEntrants: a project that left the set is requested again when it re-enters', () => {
-  const before = terminalWindowProjects(PROJECT_IDS, {}, ['hive']);
-  const left = terminalWindowProjects(PROJECT_IDS, {}, []);
+  const before = terminalWindowProjects(['dark-factory', 'hive'], { terminal: true });
+  const left = terminalWindowProjects(['dark-factory'], { terminal: true });
   assert.deepEqual(terminalWindowEntrants(before, left), []);
   assert.deepEqual(terminalWindowEntrants(left, before), ['hive']);
 });
 
-test('terminalWindowEntrants: toggling the terminal view on requests only the projects not yet grouped', () => {
-  const grouped = terminalWindowProjects(PROJECT_IDS, { terminal: false }, ['reify']);
-  const everything = terminalWindowProjects(PROJECT_IDS, { terminal: true }, ['reify']);
-  assert.deepEqual(terminalWindowEntrants(grouped, everything), ['dark-factory', 'hive']);
+test('terminalWindowEntrants: toggling the terminal view on requests every visible project, once', () => {
+  const off = terminalWindowProjects(PROJECT_IDS, { terminal: false });
+  const on = terminalWindowProjects(PROJECT_IDS, { terminal: true });
+  assert.deepEqual(terminalWindowEntrants(off, on), PROJECT_IDS);
+  assert.deepEqual(terminalWindowEntrants(on, on), []);
 });
 
 test('terminalWindowEntrants: its inputs are not mutated', () => {
@@ -881,4 +860,177 @@ test('terminalWindowEntrants: its inputs are not mutated', () => {
   terminalWindowEntrants(before, wanted);
   assert.deepEqual(before, ['reify']);
   assert.deepEqual(wanted, ['dark-factory', 'reify']);
+});
+
+// ── terminalSelectingProjects: which projects OrchTab requests ?terminal= for ──
+// OrchTab keeps one view filter per orchestrator, so its wanted set is the
+// projects a listing selects the terminal view for.
+
+const [DARK_FACTORY, REIFY, HIVE] = PROJECT_IDS;
+const listing = (project, filter) => ({ project, filter });
+
+test('terminalSelectingProjects: only a listing whose filter selects the terminal view wants its window, in listing order', () => {
+  const listings = [
+    listing(DARK_FACTORY, { in_flight: true, terminal: true }),
+    listing(REIFY, { in_flight: true }),
+    listing(HIVE, { terminal: true }),
+  ];
+  assert.deepEqual(terminalSelectingProjects(listings), [DARK_FACTORY, HIVE]);
+});
+
+test('terminalSelectingProjects: a project two orchestrators list is wanted once, if either listing selects terminal', () => {
+  const listings = [listing(DARK_FACTORY, { terminal: false }), listing(DARK_FACTORY, { terminal: true }), listing(DARK_FACTORY, { terminal: true })];
+  assert.deepEqual(terminalSelectingProjects(listings), [DARK_FACTORY]);
+  assert.deepEqual(terminalSelectingProjects([listing(DARK_FACTORY, { terminal: false }), listing(DARK_FACTORY, {})]), []);
+});
+
+test('terminalSelectingProjects: no listing selecting terminal wants nothing', () => {
+  assert.deepEqual(terminalSelectingProjects([]), []);
+  const listings = PROJECT_IDS.map(project => listing(project, { in_flight: true, backlog: true }));
+  assert.deepEqual(terminalSelectingProjects(listings), []);
+});
+
+test('terminalSelectingProjects: its inputs are not mutated', () => {
+  const listings = [listing(DARK_FACTORY, { terminal: true }), listing(DARK_FACTORY, { terminal: true }), listing(REIFY, {})];
+  const pristine = structuredClone(listings);
+  terminalSelectingProjects(listings);
+  assert.deepEqual(listings, pristine);
+});
+
+// ── createTerminalWindowHooks: the hook a requesting surface renders through ──
+// Driven through reactStandIn and a loader stand-in that records each request
+// and settles it only when a case says so. What a wanted project reads is what
+// data.js::onDemandDatum makes of the outcome handed to it, which
+// data_poll.test.mjs executes; the stand-in echoes its arguments, so these
+// cases assert which outcome each project is read with.
+
+function loaderStandIn() {
+  const requests = [];
+  return {
+    requests,
+    requestOnDemand: (name, project) => new Promise(settle => { requests.push({ name, project, settle }); }),
+    onDemandDatum: (name, project, outcome) => ({ onDemandDatum: [name, project, outcome] }),
+    ON_DEMAND_KEYS: { terminal: { key: project => `TASKS_TERMINAL:${project}` } },
+  };
+}
+
+// One surface holding the hook over `data`. show(wanted) renders it again and
+// returns its reader; requested() lists every project asked for, in order.
+function terminalWindowsSurface(data = {}) {
+  const react = reactStandIn();
+  const loader = loaderStandIn();
+  const { useTerminalWindows } = createTerminalWindowHooks(react, loader);
+  return {
+    show: wanted => react.render(() => useTerminalWindows(data, wanted)),
+    requested: () => loader.requests.map(({ name, project }) => {
+      assert.equal(name, 'terminal');
+      return project;
+    }),
+    // Settles the latest request for `project`, then lets its .then run.
+    settle: async (project, outcome) => {
+      loader.requests.findLast(request => request.project === project).settle(outcome);
+      await new Promise(resolve => setImmediate(resolve));
+    },
+  };
+}
+
+const awaiting = project => ({ onDemandDatum: ['terminal', project, null] });
+const settledAs = (project, outcome) => ({ onDemandDatum: ['terminal', project, outcome] });
+
+test('createTerminalWindowHooks: a mount requests each wanted project once, in wanted order', () => {
+  const surface = terminalWindowsSurface();
+  const windowOf = surface.show([HIVE, DARK_FACTORY]);
+  assert.deepEqual(surface.requested(), [HIVE, DARK_FACTORY]);
+  assert.deepEqual(windowOf(HIVE), awaiting(HIVE));
+  assert.deepEqual(windowOf(DARK_FACTORY), awaiting(DARK_FACTORY));
+});
+
+test('createTerminalWindowHooks: a re-render over an equal wanted set requests nothing, as each poll rebuilds it', () => {
+  const surface = terminalWindowsSurface();
+  surface.show([DARK_FACTORY, REIFY]);
+  surface.show([DARK_FACTORY, REIFY]);
+  surface.show([DARK_FACTORY, REIFY]);
+  assert.deepEqual(surface.requested(), [DARK_FACTORY, REIFY]);
+});
+
+test('createTerminalWindowHooks: a project entering the set is the only one requested; a settled one keeps its outcome', async () => {
+  const surface = terminalWindowsSurface();
+  surface.show([DARK_FACTORY]);
+  await surface.settle(DARK_FACTORY, 'applied');
+  const windowOf = surface.show([DARK_FACTORY, REIFY]);
+  assert.deepEqual(surface.requested(), [DARK_FACTORY, REIFY]);
+  assert.deepEqual(windowOf(DARK_FACTORY), settledAs(DARK_FACTORY, 'applied'));
+  assert.deepEqual(windowOf(REIFY), awaiting(REIFY));
+});
+
+test("createTerminalWindowHooks: each wanted project reads its own request's outcome", async () => {
+  const surface = terminalWindowsSurface();
+  surface.show([DARK_FACTORY, REIFY]);
+  await surface.settle(REIFY, 'failed');
+  const windowOf = surface.show([DARK_FACTORY, REIFY]);
+  assert.deepEqual(windowOf(REIFY), settledAs(REIFY, 'failed'));
+  assert.deepEqual(windowOf(DARK_FACTORY), awaiting(DARK_FACTORY));
+});
+
+test('createTerminalWindowHooks: a request pending when the set changes keeps its outcome, since nothing re-requests it', async () => {
+  const surface = terminalWindowsSurface();
+  surface.show([DARK_FACTORY]);
+  surface.show([DARK_FACTORY, REIFY]);
+  await surface.settle(DARK_FACTORY, 'applied');
+  const windowOf = surface.show([DARK_FACTORY, REIFY]);
+  assert.deepEqual(surface.requested(), [DARK_FACTORY, REIFY]);
+  assert.deepEqual(windowOf(DARK_FACTORY), settledAs(DARK_FACTORY, 'applied'));
+});
+
+test('createTerminalWindowHooks: a project that leaves and re-enters is requested again, and reads as awaiting that request', async () => {
+  const surface = terminalWindowsSurface();
+  surface.show([DARK_FACTORY]);
+  await surface.settle(DARK_FACTORY, 'failed');
+  surface.show([]);
+  const windowOf = surface.show([DARK_FACTORY]);
+  assert.deepEqual(surface.requested(), [DARK_FACTORY, DARK_FACTORY]);
+  assert.deepEqual(windowOf(DARK_FACTORY), awaiting(DARK_FACTORY));
+
+  await surface.settle(DARK_FACTORY, 'applied');
+  assert.deepEqual(surface.show([DARK_FACTORY])(DARK_FACTORY), settledAs(DARK_FACTORY, 'applied'));
+});
+
+test('createTerminalWindowHooks: a project outside the wanted set is not requested, and reads as unrequestedTerminalRows', () => {
+  const landed = terminalWindow(TERMINAL_ROWS);
+  const surface = terminalWindowsSurface({ [`TASKS_TERMINAL:${HIVE}`]: landed });
+  const windowOf = surface.show([DARK_FACTORY]);
+  assert.deepEqual(surface.requested(), [DARK_FACTORY]);
+  assert.equal(windowOf(HIVE), landed, 'a window another surface landed is read as served');
+  assert.deepEqual(windowOf(REIFY), unrequestedTerminalRows(undefined));
+});
+
+// OrchTab's wanted set is terminalSelectingProjects over its listings, rebuilt
+// on every render; these cases drive the hook with it.
+
+test("createTerminalWindowHooks over OrchTab's listings: flipping one terminal view requests its project on each entry only", () => {
+  const withReify = terminal => terminalSelectingProjects([
+    listing(DARK_FACTORY, { terminal: true }),
+    listing(REIFY, { terminal }),
+    listing(HIVE, { terminal: false }),
+  ]);
+  const surface = terminalWindowsSurface();
+  surface.show(withReify(false));
+  assert.deepEqual(surface.requested(), [DARK_FACTORY]);
+  surface.show(withReify(true));
+  assert.deepEqual(surface.requested(), [DARK_FACTORY, REIFY]);
+  surface.show(withReify(false));
+  assert.deepEqual(surface.requested(), [DARK_FACTORY, REIFY]);
+  surface.show(withReify(true));
+  assert.deepEqual(surface.requested(), [DARK_FACTORY, REIFY, REIFY]);
+});
+
+test("createTerminalWindowHooks over OrchTab's listings: a mount requests each project a persisted filter selects, once", () => {
+  const surface = terminalWindowsSurface();
+  surface.show(terminalSelectingProjects([
+    listing(HIVE, { terminal: true }),
+    listing(REIFY, {}),
+    listing(DARK_FACTORY, { terminal: true }),
+    listing(HIVE, { terminal: true }),
+  ]));
+  assert.deepEqual(surface.requested(), [HIVE, DARK_FACTORY]);
 });

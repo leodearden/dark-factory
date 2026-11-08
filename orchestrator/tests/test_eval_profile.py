@@ -50,7 +50,7 @@ def _changed_leaf_paths(a: OrchestratorConfig, b: OrchestratorConfig) -> set[str
 
 
 def test_eval_profile_documented_keys():
-    """EVAL_PROFILE is exactly the 6 documented C1 leaves — no more, no less."""
+    """EVAL_PROFILE is exactly the 7 documented C1 leaves — no more, no less."""
     assert EVAL_PROFILE == {
         'rebase_before_verify': False,
         'inter_iteration_rebase': False,
@@ -58,6 +58,7 @@ def test_eval_profile_documented_keys():
         'auto_eval_enabled': False,
         'simple_task_enabled': False,
         'fused_memory.url': 'http://127.0.0.1:1',
+        'strict_mcp_config': True,
     }
 
 
@@ -65,7 +66,7 @@ def test_eval_profile_sentinel_single_sourced_from_fm_retry():
     """The D8 fused_memory.url sentinel is the shared fm_retry constant (task 2880).
 
     The eval profile neutralizes FM writes with a non-routable sentinel; the
-    McpSession transport (mcp_lifecycle._retry_backoffs) must recognize exactly
+    fused-memory session factory (mcp_lifecycle.fm_session) must recognize exactly
     that same string to fail fast on it instead of spinning the ~120s
     fm-restart window. Single-sourcing the string in fm_retry — with
     evals/profile.py importing it DOWN — makes profile<->transport drift
@@ -125,10 +126,11 @@ def test_apply_eval_profile_parity(tmp_path):
 
     Invariant P1 / Boundary test B1 — the D5 root-cause guard. Exactness holds
     by identity: model_copy(update=X) changes exactly X's leaves and every
-    profile leaf diverges from its base value (the 5 bool True -> False flips
-    plus the D8 fused_memory.url production -> null-sentinel change), so the
-    diff is precisely the 6 documented EVAL_PROFILE keys — never more (an
-    undocumented leak) or fewer (a no-op profile entry).
+    profile leaf diverges from its base value (the 5 bool True -> False flips,
+    the strict_mcp_config False -> True flip, and the D8 fused_memory.url
+    production -> null-sentinel change), so the diff is precisely the 7
+    documented EVAL_PROFILE keys — never more (an undocumented leak) or fewer
+    (a no-op profile entry).
     """
     base = OrchestratorConfig(project_root=tmp_path)
 

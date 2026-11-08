@@ -1,0 +1,19 @@
+{
+  "arm_id": "incumbent-openai-20",
+  "arm_role": "control",
+  "axis": "llm",
+  "code_sha": "055e9c15a0d756704017b0d77ffbe4185155402f",
+  "corpus_sha": "850cf7c937c745b0d224a0ba975efc1c69080ad61d84c5369d06287cdd16f2e8",
+  "incomplete": false,
+  "measured_at": "2026-10-07T02:12:13.889203Z",
+  "metric": {
+    "denominator": 20,
+    "direction": "lower_is_worse",
+    "kind": "proportion",
+    "metric_id": "retrieval-utility",
+    "n": 20,
+    "value": 1.0
+  },
+  "preregistration_sha": null,
+  "schema_version": 1
+}

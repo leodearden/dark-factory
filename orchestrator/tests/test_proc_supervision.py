@@ -4,104 +4,25 @@ proc_supervision.py is the single owned restart-seam (M1): RestartPlan,
 EscalationSpec, FreshPidVerify, RestartOutcome/RestartDisposition, and one
 async execute() honoring 5 invariants (RP-1..5, PRD Sec 5.1).
 
-Prerequisite-1: shared test scaffolding (no behaviour assertions here) —
-FakeRunner (records every (argv, kwargs) call, returns a configurable-
-returncode fake proc), fake_inspector (configurable inspect-result async
-callable), tmp_queue_dir fixture, and read_escalations() helper. Mirrors the
-fake-runner pattern in test_service_restart.py:1042+ (patch of
-asyncio.create_subprocess_exec / injected `runner=`) and the injected-
-inspector pattern in test_deterministic_runner.py (AsyncMock unit_inspector).
+Shared proc_supervision test scaffolding lives in _proc_supervision_doubles.
 """
 
 from __future__ import annotations
 
+import re
 import shlex
+from collections.abc import Mapping
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _proc_supervision_doubles import (
+    FakeRunner,
+    detached_rp4_plan,
+    make_fake_inspector,
+    read_escalations,
+)
+from _proc_supervision_doubles import tmp_queue_dir as tmp_queue_dir
 from escalation.queue import EscalationQueue
-
-
-class FakeRunner:
-    """Async callable matching ``asyncio.create_subprocess_exec``'s signature.
-
-    Records every ``(argv, kwargs)`` call in ``self.calls`` so tests can
-    assert on exact positional argv and keyword args (cwd=, stdout=, ...).
-    Returns a ``MagicMock`` proc whose ``communicate()`` is an
-    ``AsyncMock(return_value=(stdout, None))`` and whose ``returncode`` is
-    configurable (default 0) — mirroring the ``fake_proc`` idiom already used
-    throughout test_service_restart.py and test_deterministic_runner.py.
-    """
-
-    def __init__(self, returncode: int = 0, stdout: bytes = b'') -> None:
-        self.returncode = returncode
-        self.stdout = stdout
-        self.calls: list[tuple[tuple, dict]] = []
-        # Every fake proc this runner has handed back, in call order — lets a
-        # test assert on a spawned proc's post-return state (e.g. that
-        # .communicate() was never awaited on a fire-and-forget leaf spawn)
-        # without execute() needing to hand the proc back to the caller.
-        self.procs: list[MagicMock] = []
-
-    async def __call__(self, *args: object, **kwargs: object):
-        self.calls.append((args, kwargs))
-        proc = MagicMock()
-        proc.communicate = AsyncMock(return_value=(self.stdout, None))
-        proc.returncode = self.returncode
-        self.procs.append(proc)
-        return proc
-
-
-def make_fake_inspector(state: dict):
-    """Build an async inspector callable: ``(unit, *, timeout_secs, reap_grace_secs=5.0) -> dict``.
-
-    Returns a shallow copy of *state* on every call regardless of args, and
-    records each call's kwargs on the returned callable's ``.calls`` list
-    (each entry: ``{'unit', 'timeout_secs', 'reap_grace_secs'}``) so tests can
-    assert the exact unit/timeout the RP-5 verify leg was invoked with.
-    """
-    calls: list[dict] = []
-
-    async def _inspector(unit: str, *, timeout_secs: float, reap_grace_secs: float = 5.0) -> dict:
-        calls.append({
-            'unit': unit,
-            'timeout_secs': timeout_secs,
-            'reap_grace_secs': reap_grace_secs,
-        })
-        return dict(state)
-
-    _inspector.calls = calls  # type: ignore[attr-defined]
-    return _inspector
-
-
-@pytest.fixture
-def tmp_queue_dir(tmp_path: Path) -> Path:
-    """A ``tmp_path`` subdirectory usable as an ``EscalationQueue`` queue_dir.
-
-    Not pre-created — ``EscalationQueue.__init__`` mkdir(parents=True,
-    exist_ok=True)'s it, matching production (the queue dir may not yet exist
-    when the first escalation is filed).
-    """
-    return tmp_path / 'escalations'
-
-
-def read_escalations(
-    queue_dir: str | Path,
-    task_id: str,
-    *,
-    status: str | None = None,
-    level: int | None = None,
-    agent_role: str | None = None,
-) -> list:
-    """Construct ``EscalationQueue(queue_dir)`` and return ``get_by_task(task_id, ...)``.
-
-    Product read path (PRD Sec 7): tests assert filed escalations through
-    this helper rather than inspecting on-disk JSON directly.
-    """
-    return EscalationQueue(Path(queue_dir)).get_by_task(
-        task_id, status=status, level=level, agent_role=agent_role,
-    )
 
 
 def _build_cross_unit_verify_plan(*, on_failure_escalation):
@@ -1607,33 +1528,6 @@ class TestDetachedLeafPlainSpawn:
 # ---------------------------------------------------------------------------
 
 
-def _detached_plan_with_spec(tmp_queue_dir: Path, spec):
-    """The canonical detached RP-4 plan used by the task-3453 cells."""
-    from orchestrator.proc_supervision import RestartPlan
-
-    return RestartPlan(
-        script=Path('/proj/scripts/restart-orchestrator.sh'),
-        args=['--foo'],
-        cwd=Path('/proj'),
-        target_unit='orch.service',
-        own_unit='orch.service',
-        on_failure_escalation=spec,
-        verify=None,
-        transient_unit='orch-redeploy-restart-99.service',
-        on_active_secs=10,
-    )
-
-
-def _make_spec(tmp_queue_dir: Path):
-    from orchestrator.proc_supervision import EscalationSpec
-
-    return EscalationSpec(
-        queue_dir=str(tmp_queue_dir),
-        task_id='task-99',
-        summary='Self-restart fire-time failure',
-    )
-
-
 def _setenv_pythonpath_tokens(argv) -> list[str]:
     """Every ``--setenv=PYTHONPATH=`` token on a built systemd-run argv."""
     return [t for t in argv if isinstance(t, str) and t.startswith('--setenv=PYTHONPATH=')]
@@ -1660,7 +1554,7 @@ class TestSubmitChildPythonPathIsExplicit:
     ) -> None:
         monkeypatch.delenv('PYTHONPATH', raising=False)
         runner = FakeRunner(returncode=0)
-        plan = _detached_plan_with_spec(tmp_queue_dir, _make_spec(tmp_queue_dir))
+        plan = detached_rp4_plan(tmp_queue_dir, with_spec=True)
 
         await plan.execute(runner=runner)
 
@@ -1705,7 +1599,7 @@ class TestSubmitChildPythonPathIsExplicit:
         monkeypatch.setenv('PYTHONPATH', sentinel)
 
         runner = FakeRunner(returncode=0)
-        plan = _detached_plan_with_spec(tmp_queue_dir, _make_spec(tmp_queue_dir))
+        plan = detached_rp4_plan(tmp_queue_dir, with_spec=True)
         await plan.execute(runner=runner)
 
         argv, _kwargs = runner.calls[0]
@@ -1724,7 +1618,7 @@ class TestSubmitChildPythonPathIsExplicit:
         # still make the guarantee non-empty.
         monkeypatch.delenv('PYTHONPATH', raising=False)
         runner2 = FakeRunner(returncode=0)
-        plan2 = _detached_plan_with_spec(tmp_queue_dir, _make_spec(tmp_queue_dir))
+        plan2 = detached_rp4_plan(tmp_queue_dir, with_spec=True)
         await plan2.execute(runner=runner2)
 
         argv2, _kwargs2 = runner2.calls[0]
@@ -1827,7 +1721,7 @@ class TestSubmitChildPythonPathDegradesLoudly:
         _stub_find_spec(monkeypatch, set(_SUBMIT_CHILD_PACKAGES))
 
         runner = FakeRunner(returncode=0)
-        plan = _detached_plan_with_spec(tmp_queue_dir, _make_spec(tmp_queue_dir))
+        plan = detached_rp4_plan(tmp_queue_dir, with_spec=True)
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.proc_supervision'):
             outcome = await plan.execute(runner=runner)
@@ -1865,7 +1759,7 @@ class TestSubmitChildPythonPathDegradesLoudly:
         _stub_find_spec(monkeypatch, {'shared'})
 
         runner = FakeRunner(returncode=0)
-        plan = _detached_plan_with_spec(tmp_queue_dir, _make_spec(tmp_queue_dir))
+        plan = detached_rp4_plan(tmp_queue_dir, with_spec=True)
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.proc_supervision'):
             outcome = await plan.execute(runner=runner)
@@ -1921,7 +1815,7 @@ class TestSubmitChildInterpreterGuarantee:
         import sys
 
         runner = FakeRunner(returncode=0)
-        plan = _detached_plan_with_spec(tmp_queue_dir, _make_spec(tmp_queue_dir))
+        plan = detached_rp4_plan(tmp_queue_dir, with_spec=True)
 
         await plan.execute(runner=runner)
 
@@ -1937,54 +1831,274 @@ class TestSubmitChildInterpreterGuarantee:
             f'user manager PATH, not this process: {interpreter!r}'
         )
 
-    async def test_unimportable_submit_module_warns_at_registration(
-        self,
-        tmp_queue_dir: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        caplog: pytest.LogCaptureFixture,
+
+# ---------------------------------------------------------------------------
+# task 8598: RestartPlan.env reaches the restart script on every execute()
+# path. systemd-run propagates none of the caller's environment, so the
+# detached path prefixes the payload command with one shell assignment per
+# entry; the RP-4 submit child in the same transient unit sees none of them.
+# ---------------------------------------------------------------------------
+
+
+def _write_env_probe(path: Path, *, record_to: Path, exit_code: int) -> Path:
+    """Write an executable stub that records ``[$MODE][$PYTHONPATH]`` (or
+    ``unset``) into *record_to*, ignores argv, and exits *exit_code*."""
+    path.write_text(
+        '#!/bin/sh\n'
+        'printf "[%s][%s]" "${MODE-unset}" "${PYTHONPATH-unset}" > '
+        f'{shlex.quote(str(record_to))}\n'
+        f'exit {exit_code}\n'
+    )
+    path.chmod(0o755)
+    return path
+
+
+_SYSTEMD_EXECSTART_EXPANSION = re.compile(r'\$(?:\$|\{([A-Za-z_][A-Za-z0-9_]*)\})')
+
+
+def _as_systemd_execstart_runs(command: str, unit_env: Mapping[str, str]) -> str:
+    """Model systemd's ``$$`` -> ``$`` and ``${NAME}`` expansion inside an ExecStart argv word."""
+    return _SYSTEMD_EXECSTART_EXPANSION.sub(
+        lambda m: '$' if m.group(0) == '$$' else unit_env.get(m.group(1), ''),
+        command,
+    )
+
+
+@pytest.mark.asyncio
+class TestDetachedPayloadCarriesEnv:
+    """Each ``RestartPlan.env`` entry becomes a ``KEY=<quoted value>``
+    assignment prefixing the detached payload command, never a unit-wide
+    systemd-run ``--setenv``."""
+
+    async def test_env_prefixes_the_payload_command(
+        self, tmp_queue_dir: Path,
     ) -> None:
-        """The registration-time canary for the 3404-class failure ("exactly
-        one L2 must be filed on failure, got 0"): the process that builds the
-        argv can prove the invariant cheaply, in-process — so it must say so
-        out loud when it cannot."""
-        import logging
+        import dataclasses
+
+        runner = FakeRunner(returncode=0)
+        plan = dataclasses.replace(
+            detached_rp4_plan(tmp_queue_dir, with_spec=True),
+            env={'DEPLOY_FLAG': 'canary', 'MODE': 'two words'},
+        )
+
+        await plan.execute(runner=runner)
+
+        argv, _kwargs = runner.calls[0]
+        submit_child_tokens = _setenv_pythonpath_tokens(argv)
+        assert len(submit_child_tokens) == 1, (
+            f'the submit child keeps its own PYTHONPATH token: {argv!r}'
+        )
+        assert [t for t in argv if t.startswith('--setenv=')] == submit_child_tokens, (
+            f'the plan env must not become a unit-wide --setenv: {argv!r}'
+        )
+        wrapped = argv[-1]
+        assert wrapped.startswith(
+            "DEPLOY_FLAG=canary MODE='two words' "
+            '/proj/scripts/restart-orchestrator.sh --foo; '
+        ), wrapped
+
+    async def test_env_prefixes_the_payload_without_escalation_spec(
+        self, tmp_queue_dir: Path,
+    ) -> None:
+        import dataclasses
+
+        runner = FakeRunner(returncode=0)
+        plan = dataclasses.replace(
+            detached_rp4_plan(tmp_queue_dir, with_spec=False),
+            env={'DEPLOY_FLAG': 'canary'},
+        )
+
+        await plan.execute(runner=runner)
+
+        argv, _kwargs = runner.calls[0]
+        assert [t for t in argv if t.startswith('--setenv=')] == []
+        assert argv[-1] == 'DEPLOY_FLAG=canary /proj/scripts/restart-orchestrator.sh --foo'
+
+    async def test_empty_env_argv_unchanged(self, tmp_queue_dir: Path) -> None:
+        import dataclasses
+
+        default_plan = detached_rp4_plan(tmp_queue_dir, with_spec=True)
+        explicit_plan = dataclasses.replace(default_plan, env={})
+        default_runner = FakeRunner(returncode=0)
+        explicit_runner = FakeRunner(returncode=0)
+
+        await default_plan.execute(runner=default_runner)
+        await explicit_plan.execute(runner=explicit_runner)
+
+        assert default_plan.env == {}
+        assert default_runner.calls[0][0] == explicit_runner.calls[0][0]
+
+    async def test_env_value_dollars_survive_systemd_expansion(
+        self, tmp_queue_dir: Path,
+    ) -> None:
+        import dataclasses
+
+        runner = FakeRunner(returncode=0)
+        plan = dataclasses.replace(
+            detached_rp4_plan(tmp_queue_dir, with_spec=False),
+            env={'X': 'a$b ${HOME}'},
+        )
+
+        await plan.execute(runner=runner)
+
+        argv, _kwargs = runner.calls[0]
+        assert argv[-1] == "X='a$$b $${HOME}' /proj/scripts/restart-orchestrator.sh --foo"
+
+    async def test_env_reaches_the_payload_but_not_the_submit_child(
+        self, tmp_path: Path, tmp_queue_dir: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Executes the REAL wrapper the way the fired unit would: from a bare
+        environment, with a failing payload so the submit child runs too."""
+        import asyncio
+        import dataclasses
+        import os
+        import sys
+
+        payload_saw = tmp_path / 'payload-saw'
+        submit_saw = tmp_path / 'submit-saw'
+        payload = _write_env_probe(tmp_path / 'payload.sh', record_to=payload_saw, exit_code=7)
+        monkeypatch.setattr(
+            sys, 'executable',
+            str(_write_env_probe(tmp_path / 'stub-python', record_to=submit_saw, exit_code=0)),
+        )
+        plan = dataclasses.replace(
+            detached_rp4_plan(tmp_queue_dir, with_spec=True),
+            script=payload,
+            cwd=tmp_path,
+            env={'MODE': 'two $$words ${HOME}', 'PYTHONPATH': '/payload-only'},
+        )
+        runner = FakeRunner(returncode=0)
+        await plan.execute(runner=runner)
+
+        proc = await asyncio.create_subprocess_exec(
+            '/bin/sh', '-c',
+            _as_systemd_execstart_runs(runner.calls[0][0][-1], {'HOME': '/home/unit-user'}),
+            env={'PATH': os.environ['PATH']},
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        out, _ = await proc.communicate()
+
+        assert proc.returncode == 7, out
+        assert payload_saw.read_text() == '[two $$words ${HOME}][/payload-only]'
+        assert submit_saw.read_text() == '[unset][unset]', (
+            'the plan env must reach the payload alone, never the RP-4 submit child'
+        )
+
+
+def _leaf_plain_spawn_plan(**overrides):
+    """The leaf plain-spawn plan shape from ``TestDetachedLeafPlainSpawn``."""
+    from orchestrator.proc_supervision import RestartPlan
+
+    fields = {
+        'script': Path('/proj/scripts/restart-fused-memory.sh'),
+        'args': ['--drain'],
+        'cwd': Path('/proj'),
+        'target_unit': 'fused-memory.service',
+        'own_unit': '',
+        'on_failure_escalation': None,
+        'verify': None,
+        'transient_unit': None,
+    }
+    fields.update(overrides)
+    return RestartPlan(**fields)
+
+
+_FRESH_CROSS_UNIT_STATE = {
+    'MainPID': 99,
+    'ActiveState': 'active',
+    'ActiveEnterTimestampMonotonic': 2000,
+}
+
+
+@pytest.mark.asyncio
+class TestBlockingAndLeafSpawnCarryEnv:
+    """The cross-unit blocking and leaf plain-spawn paths overlay
+    ``RestartPlan.env`` on this process's environment, the same rule as
+    ``orchestrator/src/orchestrator/before_done_script.py::run_script``."""
+
+    async def test_cross_unit_blocking_overlays_env_on_os_environ(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import dataclasses
 
         from orchestrator.proc_supervision import RestartDisposition
 
-        _stub_find_spec(monkeypatch, {'escalation.submit'})
-
+        monkeypatch.setenv('DF_8598_INHERITED', 'kept')
         runner = FakeRunner(returncode=0)
-        plan = _detached_plan_with_spec(tmp_queue_dir, _make_spec(tmp_queue_dir))
-
-        with caplog.at_level(logging.WARNING, logger='orchestrator.proc_supervision'):
-            outcome = await plan.execute(runner=runner)
-
-        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
-        assert any('escalation.submit' in r.getMessage() for r in warnings), (
-            'an unimportable submit module must be named at registration time, '
-            'while a human is still watching the deploy: '
-            f'{[r.getMessage() for r in warnings]!r}'
+        plan = dataclasses.replace(
+            _build_cross_unit_verify_plan(on_failure_escalation=None),
+            env={'DEPLOY_FLAG': 'canary'},
         )
 
-        assert outcome.disposition == RestartDisposition.SCHEDULED, (
-            'the canary reports, it must never block the restart'
+        outcome = await plan.execute(
+            runner=runner, inspector=make_fake_inspector(_FRESH_CROSS_UNIT_STATE),
         )
 
-    async def test_importable_submit_module_logs_no_warning(
-        self, tmp_queue_dir: Path, caplog: pytest.LogCaptureFixture,
+        _args, kwargs = runner.calls[0]
+        assert kwargs['env']['DEPLOY_FLAG'] == 'canary'
+        assert kwargs['env']['DF_8598_INHERITED'] == 'kept', (
+            'the child must keep the inherited environment (PATH, HOME, ...)'
+        )
+        assert outcome.disposition == RestartDisposition.DEPLOYED_AND_VERIFIED
+
+    async def test_leaf_plain_spawn_overlays_env_on_os_environ(
+        self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Silent on the healthy path — a canary that fires every restart is
-        log noise, not a signal."""
-        import logging
-
+        monkeypatch.setenv('DF_8598_INHERITED', 'kept')
         runner = FakeRunner(returncode=0)
-        plan = _detached_plan_with_spec(tmp_queue_dir, _make_spec(tmp_queue_dir))
+        plan = _leaf_plain_spawn_plan(env={'DEPLOY_FLAG': 'canary'})
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.proc_supervision'):
-            await plan.execute(runner=runner)
+        await plan.execute(runner=runner)
 
-        noisy = [
-            r.getMessage() for r in caplog.records
-            if r.levelno >= logging.WARNING and 'escalation.submit' in r.getMessage()
-        ]
-        assert not noisy, f'the canary must stay silent when the import is healthy: {noisy!r}'
+        _args, kwargs = runner.calls[0]
+        assert kwargs['env']['DEPLOY_FLAG'] == 'canary'
+        assert kwargs['env']['DF_8598_INHERITED'] == 'kept'
+
+    async def test_empty_env_inherits(self) -> None:
+        blocking_runner = FakeRunner(returncode=0)
+        leaf_runner = FakeRunner(returncode=0)
+
+        await _build_cross_unit_verify_plan(on_failure_escalation=None).execute(
+            runner=blocking_runner,
+            inspector=make_fake_inspector(_FRESH_CROSS_UNIT_STATE),
+        )
+        await _leaf_plain_spawn_plan().execute(runner=leaf_runner)
+
+        assert blocking_runner.calls[0][1].get('env') is None
+        assert leaf_runner.calls[0][1].get('env') is None
+
+
+class TestEnvInvariants:
+    """``RestartPlan.__post_init__`` admits only portable variable names as
+    ``env`` keys, and keeps its own read-only copy of ``env``."""
+
+    @pytest.mark.parametrize('key', ['A=B', '', 'A\x00B', 'FOO-BAR', '1FOO', 'A B'])
+    def test_non_portable_env_key_is_refused(self, key: str) -> None:
+        with pytest.raises(ValueError) as excinfo:
+            _leaf_plain_spawn_plan(env={key: 'v'})
+
+        message = str(excinfo.value)
+        assert 'environment variable name' in message
+        assert '[A-Za-z_][A-Za-z0-9_]*' in message
+        assert repr(key) in message
+
+    @pytest.mark.parametrize('key', ['_X', 'deploy_flag', 'A1', 'PYTHONPATH'])
+    def test_portable_env_key_is_accepted_on_every_plan_shape(
+        self, key: str, tmp_queue_dir: Path,
+    ) -> None:
+        import dataclasses
+
+        assert _leaf_plain_spawn_plan(env={key: 'v'}).env == {key: 'v'}
+        detached = dataclasses.replace(
+            detached_rp4_plan(tmp_queue_dir, with_spec=True), env={key: 'v'},
+        )
+        assert detached.env == {key: 'v'}
+
+    def test_caller_mutation_after_construction_does_not_reach_the_plan(self) -> None:
+        caller_env = {'DEPLOY_FLAG': 'canary'}
+        plan = _leaf_plain_spawn_plan(env=caller_env)
+
+        caller_env['A=B'] = 'v'
+
+        assert plan.env == {'DEPLOY_FLAG': 'canary'}

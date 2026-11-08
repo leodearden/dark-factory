@@ -1,11 +1,8 @@
-"""The two-line dance every test that files an escalation has to repeat.
+"""Named wrappers for the escalation-filing MCP tools.
 
-``escalate_blocker`` and ``escalate_info`` are async FastMCP tools, so calling
-one means ``await server.get_tool(name)`` and then ``await tool.fn(**kwargs)``.
-That pair was copied verbatim into a THIRD test module before this one existed
-(``test_server_chokepoint.py`` and ``test_observed_submit_response.py`` each
-carried its own identical copy) — the point at which a copy stops being cheaper
-than a name.
+``call_blocker``, ``call_info`` and ``call_promote`` name ``escalate_blocker``,
+``escalate_info`` and ``promote_to_l2``; the call shape itself lives in
+``_tool_calls.py::call_tool``.
 
 A uniquely-named sibling support module rather than a ``conftest.py`` fixture,
 matching ``_escalation_http.py``: these are plain callables with no setup or
@@ -20,22 +17,28 @@ The filing KWARGS are deliberately NOT shared.  Each suite pins its own
 the chokepoint suite files against an already-done task, the unpersisted-filing
 suite files an ``infra_issue`` precisely because that is the one category the
 stock dedupe config folds.  Sharing them would couple two suites through a
-constant neither controls.  Only the call SHAPE is common, so only it lives
-here.
+constant neither controls.  Only the tool each wrapper names is common, so only
+it lives here.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
+from _tool_calls import call_tool
+from fastmcp import FastMCP
 
-async def call_blocker(server, **kwargs: Any) -> dict[str, Any]:
+
+async def call_blocker(server: FastMCP, **kwargs: Any) -> dict[str, Any]:
     """Invoke ``escalate_blocker`` on *server* and return its response dict."""
-    tool = await server.get_tool('escalate_blocker')
-    return await tool.fn(**kwargs)
+    return await call_tool(server, 'escalate_blocker', **kwargs)
 
 
-async def call_info(server, **kwargs: Any) -> dict[str, Any]:
+async def call_info(server: FastMCP, **kwargs: Any) -> dict[str, Any]:
     """Invoke ``escalate_info`` on *server* and return its response dict."""
-    tool = await server.get_tool('escalate_info')
-    return await tool.fn(**kwargs)
+    return await call_tool(server, 'escalate_info', **kwargs)
+
+
+async def call_promote(server: FastMCP, **kwargs: Any) -> dict[str, Any]:
+    """Invoke ``promote_to_l2`` on *server* and return its response dict."""
+    return await call_tool(server, 'promote_to_l2', **kwargs)

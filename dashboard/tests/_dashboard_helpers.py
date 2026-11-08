@@ -10,7 +10,9 @@ from __future__ import annotations
 import asyncio
 import html.parser
 import json
+import os
 import re
+import shutil
 import sqlite3
 import threading
 from collections.abc import Awaitable, Callable, Coroutine, Sequence
@@ -375,23 +377,43 @@ def mcp_notify_response() -> httpx.Response:
     return httpx.Response(202, headers={'mcp-session-id': MCP_SESSION_ID})
 
 
-def mcp_tool_response(inner: dict, request_id: int = 1) -> httpx.Response:
-    """A ``tools/call`` result carrying *inner* as JSON text content.
+def _tool_result_envelope(inner: dict, request_id: int) -> dict:
+    """The JSON-RPC ``tools/call`` result carrying *inner* as JSON text content.
 
     MCP nests the tool's own payload as a JSON *string* inside
     ``result.content[0].text``, so *inner* is serialized, not embedded — which
     is exactly the double-encoding the dashboard readers have to undo.
     """
+    return {
+        'jsonrpc': '2.0',
+        'id': request_id,
+        'result': {
+            'content': [{'type': 'text', 'text': json.dumps(inner)}],
+        },
+    }
+
+
+def mcp_tool_response(inner: dict, request_id: int = 1) -> httpx.Response:
+    """A ``tools/call`` result carrying *inner*, framed as a JSON body."""
     return httpx.Response(
         200,
-        json={
-            'jsonrpc': '2.0',
-            'id': request_id,
-            'result': {
-                'content': [{'type': 'text', 'text': json.dumps(inner)}],
-            },
-        },
+        json=_tool_result_envelope(inner, request_id),
         headers={'mcp-session-id': MCP_SESSION_ID},
+    )
+
+
+def mcp_sse_tool_response(inner: dict, request_id: int = 1) -> httpx.Response:
+    """The same ``tools/call`` result, framed as a Streamable-HTTP SSE body.
+
+    FastMCP may answer ``text/event-stream`` instead of ``application/json``;
+    the envelope inside the ``data:`` frame is identical to
+    :func:`mcp_tool_response`'s.
+    """
+    envelope = json.dumps(_tool_result_envelope(inner, request_id))
+    return httpx.Response(
+        200,
+        text=f'event: message\ndata: {envelope}\n\n',
+        headers={'content-type': 'text/event-stream', 'mcp-session-id': MCP_SESSION_ID},
     )
 
 
@@ -517,7 +539,7 @@ def write_escalation_record(
 
     Field names mirror ``escalation.models.Escalation`` (``timestamp``, not
     ``created_at``) since that is what the queue serialises and what
-    ``load_queue_escalations`` passes through unchanged.  The
+    ``escalation.models.Escalation.from_dict`` reads back.  The
     ``category='eval_regression'`` / ``status='pending'`` defaults are exactly
     the pair ``memory_evals._index_escalations`` accepts; every other
     combination is dropped by that reader and can only ever appear on the
@@ -527,8 +549,9 @@ def write_escalation_record(
     VERBATIM, so a caller can hand it a JSON number and get an ``id`` that
     survives to both payloads un-coerced — which is what makes a str/int drift
     testable rather than hypothetical.  ``omit_id=True`` leaves the ``id`` key
-    out of the record entirely, the shape that makes a queue file address
-    NOTHING; ``**extra`` overrides or adds any other field.
+    out of the record entirely, a shape ``Escalation.from_dict`` rejects, so
+    both payloads report the file as unreadable; ``**extra`` overrides or adds
+    any other field.
 
     KNOWN DUPLICATION, deliberately left: ``test_memory_evals_data.py`` carries
     its own ``_write_escalation``/``_dump`` with this same field set.  Folding
@@ -755,20 +778,6 @@ CREATE TABLE IF NOT EXISTS runs (
 CREATE INDEX IF NOT EXISTS idx_runs_project ON runs(project_id);
 CREATE INDEX IF NOT EXISTS idx_runs_started ON runs(started_at);
 
-CREATE TABLE IF NOT EXISTS journal_entries (
-    id TEXT PRIMARY KEY,
-    run_id TEXT NOT NULL,
-    stage TEXT,
-    timestamp TEXT NOT NULL,
-    operation TEXT NOT NULL,
-    target_system TEXT NOT NULL,
-    before_state TEXT,
-    after_state TEXT,
-    reasoning TEXT DEFAULT '',
-    evidence TEXT DEFAULT '[]'
-);
-CREATE INDEX IF NOT EXISTS idx_journal_run ON journal_entries(run_id);
-
 CREATE TABLE IF NOT EXISTS judge_verdicts (
     run_id TEXT PRIMARY KEY,
     reviewed_at TEXT NOT NULL,
@@ -874,6 +883,30 @@ async def make_recon_db(
         yield conn
 
 
+def node_path() -> str:
+    """The node binary: a skip locally, a failure under CI (CI carries node)."""
+    path = shutil.which('node')
+    if not path:
+        if os.environ.get('CI'):
+            pytest.fail('node is required in CI but not found on PATH')
+        pytest.skip('node not available')
+    return path
+
+
+def bug_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """Every captured WARNING a dashboard handler logs for its own bug, never an outage.
+
+    Matches the sentence ``dashboard/src/dashboard/api/tasks.py::_unknown_after_contract_break``,
+    ``dashboard/src/dashboard/api/tasks.py::_unknown_after_unexpected_error``
+    and the fan-out's catch-all in ``dashboard/src/dashboard/data/active_tasks.py``
+    all put in their message.
+    """
+    return [
+        record.getMessage() for record in caplog.records
+        if 'this is a BUG, not an outage' in record.getMessage()
+    ]
+
+
 # ---------------------------------------------------------------------------
 # JSX source slicing.
 #
@@ -917,6 +950,25 @@ class _JsSpan(NamedTuple):
     closed: bool
 
 
+def _string_literal_end(source: str, quote_at: int) -> tuple[int, bool]:
+    """Return ``(end, closed)`` for the literal whose opening quote is at *quote_at*.
+
+    ``end`` is exclusive and clamped to ``len(source)``; ``closed`` is False
+    when the source ran out first.  A backslash skips the next character, so
+    an escaped quote cannot close the literal.
+    """
+    quote = source[quote_at]
+    i, n = quote_at + 1, len(source)
+    while i < n:
+        if source[i] == '\\':
+            i += 2
+            continue
+        if source[i] == quote:
+            return i + 1, True
+        i += 1
+    return n, False
+
+
 def _scan_js(source: str) -> list[_JsSpan]:
     """Return the string-literal and comment spans of *source*, in order.
 
@@ -933,19 +985,9 @@ def _scan_js(source: str) -> list[_JsSpan]:
         ch = source[i]
 
         if ch in '\'"`':
-            start = i
-            i += 1
-            closed = False
-            while i < n:
-                if source[i] == '\\':  # an escaped char cannot close the literal
-                    i += 2
-                    continue
-                if source[i] == ch:
-                    i += 1
-                    closed = True
-                    break
-                i += 1
-            spans.append(_JsSpan(start, min(i, n), 'string', ch, closed))
+            end, closed = _string_literal_end(source, i)
+            spans.append(_JsSpan(i, end, 'string', ch, closed))
+            i = end
             continue
 
         if source[i : i + 2] == '//':
@@ -1222,13 +1264,13 @@ def strip_js_comments(source: str) -> str:
 # list they check against can never drift from what the files actually say.
 #
 # `destructure_bindings` returns (canonical, local) PAIRS, and each caller
-# projects the half it needs.  This is not fussiness — the three consumers it
-# replaces answer OPPOSITE questions over the identical line:
+# projects the half it needs.  This is not fussiness — its two DF_CHARTS
+# consumers answer OPPOSITE questions over the identical line:
 #   test_charts_consumer_bindings wants the LOCAL/alias name  — what the file
 #       must actually reference, since the alias is what it renders by;
-#   test_charts_axis_labels wants the CANONICAL/source name   — what must
-#       actually exist on the namespace object;
-#   test_tab_burndown wants BOTH, as an alias -> canonical map.
+#   test_tab_burndown wants BOTH, as an alias -> canonical map, plus the
+#       CANONICAL/source names of the export literal — what must actually
+#       exist on the namespace object.
 # On tabs.jsx's real `HistBar: HB` those are 'HB' and 'HistBar'.  A primitive
 # that picked one side would silently INVERT one of the two suites, which is
 # precisely the canonical-vs-alias slip test_charts_consumer_bindings.py
@@ -1248,10 +1290,11 @@ def strip_js_comments(source: str) -> str:
 #     object are not statically enumerable the way a destructure list is.  The
 #     defect these suites exist to catch can only exist in the destructure
 #     shape anyway.
-#   - A NESTED brace must fail loudly at the call site that names the coupling,
-#     rather than yield a half-read binding list that turns a downstream
-#     assertion red with an unrelated-looking message.  Three call sites turn
-#     the miss into a self-naming assertion for exactly that reason.
+#   - A NESTED brace must yield NO match rather than a half-read binding list:
+#     an empty result turns a downstream assertion red, where a half-read list
+#     would let a sweep go quietly wrong.  No call site names the coupling on
+#     that miss (test_tab_burndown.py's readers return an empty result), so the
+#     property is pinned in the contract below.
 #
 # Contract: test_jsx_source_helpers.py::TestDfChartsDestructure.
 # ---------------------------------------------------------------------------
@@ -1371,6 +1414,57 @@ def extract_df_data_block(src: str, key: str) -> str:
     if m is None:
         return ''
     return walk_balanced(src, m.end() - 1)  # m.end() - 1 is the opening `{`
+
+
+# ---------------------------------------------------------------------------
+# JSX opening-tag walk.
+#
+# Spans one opening tag, attributes included, so a probe can confine itself to
+# that element.  Contract: test_jsx_source_helpers.py::TestJsxOpenTagEnd.
+# ---------------------------------------------------------------------------
+
+
+def jsx_open_tag_end(src: str, start: int) -> int | None:
+    """Return the index JUST PAST the ``>`` closing the opening tag at *start*.
+
+    *start* must index the tag's ``<``, else ``ValueError``.  ``src[start:end]``
+    is the whole tag; ``src[end - 2:end] == '/>'`` tells a self-closing one.  A
+    ``<`` or ``>`` inside a ``{...}`` attribute expression or a string/template
+    literal does not end the tag.
+
+    ``None``, never a raise, when *start* begins no closed opening tag: it is
+    never closed, a literal is never terminated, a bare ``<`` opens at depth 0
+    first, or a ``}`` drives brace depth negative.
+
+    Not comment-aware (pass `strip_js_comments` output), and it shares
+    `_scan_js`'s lexer blind spots.
+    """
+    if src[start : start + 1] != '<':
+        raise ValueError(
+            f"jsx_open_tag_end: start={start} must index the tag's `<`, "
+            f'found {src[start : start + 1]!r}'
+        )
+    depth = 0
+    i = start + 1
+    while i < len(src):
+        c = src[i]
+        if c in '\'"`':
+            i, closed = _string_literal_end(src, i)
+            if not closed:
+                return None
+            continue
+        if c == '{':
+            depth += 1
+        elif c == '}':
+            depth -= 1
+            if depth < 0:
+                return None
+        elif depth == 0 and c == '>':
+            return i + 1
+        elif depth == 0 and c == '<':
+            return None
+        i += 1
+    return None
 
 
 # ---------------------------------------------------------------------------

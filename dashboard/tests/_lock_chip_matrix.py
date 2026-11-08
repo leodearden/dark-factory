@@ -16,15 +16,12 @@ Executing it needs node: absent from PATH it skips, or fails when CI is set.
 from __future__ import annotations
 
 import json
-import os
 import pathlib
-import shutil
 import subprocess
 from collections.abc import Iterable
 from typing import Any
 
-import pytest
-from _dashboard_helpers import extract_function_body, find_function_params
+from _dashboard_helpers import extract_function_body, find_function_params, node_path
 
 _REDUX_DIR = pathlib.Path(__file__).parent.parent / 'src/dashboard/static/redux'
 SCHED_UTILS_PATH = str(_REDUX_DIR / 'scheduler_utils.jsx')
@@ -48,15 +45,6 @@ CELL_MATRIX: dict[str, dict[str, Any]] = {
     },
     'parked by a dead owner': {'parked_by': 'C', 'parked_owner_live': False},
 }
-
-
-def node_path() -> str:
-    path = shutil.which('node')
-    if not path:
-        if os.environ.get('CI'):
-            pytest.fail('node is required in CI but not found on PATH')
-        pytest.skip('node not available')
-    return path
 
 
 def heatmap_module(**fields: Any) -> dict[str, Any]:

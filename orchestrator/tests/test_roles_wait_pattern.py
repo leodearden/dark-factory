@@ -29,12 +29,13 @@ precondition that is machine-checkable (IMPLEMENTER really does carry the
 block — see ``test_amender_reminder_cannot_dangle`` for the half that is not).
 
 Size figures are deliberately absent from this file, with one flagged
-historical exception (see ``test_combined_guidance_is_stated_up_front``). The
-block's measured bytes are stated in exactly one place — the comment above
-``WAIT_PATTERN_REMINDER`` in ``roles.py`` — together with the command to
-re-derive them. An earlier revision hand-copied the figure to 6 sites in this
-file and 2 in ``roles.py``, and all 8 were wrong (task 3607 review). Say "the
-full block".
+historical exception (see ``test_combined_guidance_is_stated_up_front``). No
+byte figure for the block is stated anywhere; re-derive one when you need it::
+
+    cd orchestrator && uv run python -c 'from orchestrator.agents.harness_guidance import BACKGROUND_WAIT_GUIDANCE, WAIT_PATTERN_REMINDER; print(len(BACKGROUND_WAIT_GUIDANCE), len(WAIT_PATTERN_REMINDER))'
+
+An earlier revision hand-copied the figure to 6 sites in this file and 2 in
+``roles.py``, and all 8 were wrong (task 3607 review). Say "the full block".
 
 Its real effect is on model behaviour and is not unit-testable, but silent
 removal during a prompt refactor is a genuine safety regression — the repo
@@ -63,48 +64,36 @@ vs-hardcoded role-set comparison, the count and index bookkeeping — lives in
 per invariant, each delegating its body to that helper while keeping its own
 docstring and its own remediation prose. That module's docstring is the
 authoritative account of what the shared shape does and does not absorb — most
-of it is NOT restated here. This file's own ``capability`` predicate is
-``'Bash' in role.allowed_tools`` (see the comment on
-``_BACKGROUND_CAPABLE_ROLES`` below); it deliberately differs from the
-sibling's, and ``SpliceContract``'s class docstring explains why both are
-correct for their own constant.
+of it is NOT restated here. This file's carrier set is the shared
+``BASH_CAPABLE_UNPINNED_ROLES``, but its own ``capability`` predicate is
+``'Bash' in role.allowed_tools`` (see the comment above ``_CONTRACT`` below); it
+deliberately differs from the sibling's, and ``SpliceContract``'s class
+docstring explains why both are correct for their own constant.
 """
 
 from __future__ import annotations
 
-import importlib.resources as pkg_resources
 from unittest.mock import patch
 
 import pytest
-import yaml
-from _role_splice_contract import SpliceContract, assert_brace_free, assert_nonempty
+from _packaged_defaults import load_packaged_defaults
+from _role_splice_contract import (
+    BASH_CAPABLE_UNPINNED_ROLES,
+    SpliceContract,
+    assert_brace_free,
+    assert_nonempty,
+)
 
 from orchestrator.agents.briefing import BriefingAssembler
-from orchestrator.agents.roles import (
+from orchestrator.agents.harness_guidance import (
     BACKGROUND_TASK_WARNING,
     BACKGROUND_WAIT_GUIDANCE,
     EXTERNAL_KILL_GUIDANCE,
-    ROLES,
     WAIT_PATTERN_GUIDANCE,
     WAIT_PATTERN_REMINDER,
 )
+from orchestrator.agents.roles import ROLES
 from orchestrator.config import OrchestratorConfig
-
-# A role can encounter background work iff it holds the UNQUALIFIED ``'Bash'``
-# tool — i.e. it can launch a build, a full test suite, or a long verification
-# run. ``reviewer_comprehensive`` and ``judge`` hold only ``'Bash(git:*)'``
-# (read-only git, no long-running command is reachable) and are deliberately
-# excluded: the whole block would be dead weight in every one of their
-# sessions.
-_BACKGROUND_CAPABLE_ROLES = frozenset({
-    'architect',
-    'implementer',
-    'debugger',
-    'merger',
-    'steward',
-    'deep_reviewer',
-    'simple_task',
-})
 
 # Secondary, deliberately LOOSE bound on how much identity paragraph may
 # precede the block. The real invariant is the structural one below (the
@@ -114,6 +103,16 @@ _BACKGROUND_CAPABLE_ROLES = frozenset({
 # headroom and will not fire merely because someone added a sentence.
 _UP_FRONT_CHAR_BUDGET = 1500
 
+# A role can encounter background work iff it holds the UNQUALIFIED ``'Bash'``
+# tool — i.e. it can launch a build, a full test suite, or a long verification
+# run. ``reviewer_comprehensive`` and ``judge`` hold only ``'Bash(git:*)'``
+# (read-only git, no long-running command is reachable) and are deliberately
+# excluded: the whole block would be dead weight in every one of their
+# sessions. The contract checks the shared set against this file's own
+# ``'Bash' in role.allowed_tools`` predicate, so a PromptSpec-backed role gaining
+# ``Bash`` fires this tripwire, a wait-specific signal the shared predicate
+# would hide.
+#
 # The splice contract for this constant: what is spliced, into which roles, and
 # the capability that justifies it. ``all_roles`` is omitted, so it binds the
 # real ``ROLES``. The structural ``\n## `` landmark the placement check compares
@@ -122,8 +121,8 @@ _UP_FRONT_CHAR_BUDGET = 1500
 _CONTRACT = SpliceContract(
     constant_name='BACKGROUND_WAIT_GUIDANCE',
     constant=BACKGROUND_WAIT_GUIDANCE,
-    roles=_BACKGROUND_CAPABLE_ROLES,
-    role_set_name='_BACKGROUND_CAPABLE_ROLES',
+    roles=BASH_CAPABLE_UNPINNED_ROLES,
+    role_set_name='BASH_CAPABLE_UNPINNED_ROLES (in _role_splice_contract.py)',
     capability=lambda role: 'Bash' in role.allowed_tools,
     capability_description='the unqualified `Bash` tool',
 )
@@ -171,6 +170,9 @@ def test_session_idle_bound_config_drift_tripwire() -> None:
     That idle mechanism is NOT uniform across the spliced roles, so two bounds
     are pinned here rather than one — see the second assertion for why
     ``timeouts.steward`` binds the steward through a different code path.
+    deep_reviewer is dispatched with no ``timeout_seconds`` at all
+    (``orchestrator/src/orchestrator/review_checkpoint.py``), so no watchdog
+    kill fires for it and only the harness Bash cap binds it.
 
     ``WAIT_PATTERN_GUIDANCE`` / ``WAIT_PATTERN_REMINDER`` state a ~25-minute
     background threshold derived from that 1800s bound. This test does NOT
@@ -179,9 +181,11 @@ def test_session_idle_bound_config_drift_tripwire() -> None:
     reworded to say the opposite, so it costs every future prompt edit without
     buying correctness. What IS checkable is the premise the prose was derived
     from — if the config default moves, the derivation is stale and an editor
-    has to revisit the wording deliberately. The standing instruction not to
-    "restore" 3900000 lives as a provenance comment above the constants in
-    roles.py, which is the right home for an editorial rule.
+    has to revisit the wording deliberately. The standing rule for that
+    wording: 3900000 is the harness Bash cap, not the binding ceiling, so do not
+    "restore" it as the threshold. The ~25-minute threshold stays under the
+    tightest real ceiling, the steward's FLAT 1800s, which has no idle slack to
+    reclaim.
 
     BOTH sources of that 1800 are checked, because they are two hand-maintained
     copies and only one of them binds. ``defaults.yaml`` is what a dispatched
@@ -198,9 +202,7 @@ def test_session_idle_bound_config_drift_tripwire() -> None:
     accepted — the prose is sized to the SHIPPED bound.
     """
     field_timeouts = OrchestratorConfig.model_fields['timeouts'].default_factory()  # type: ignore[misc]
-    shipped_timeouts = yaml.safe_load(
-        (pkg_resources.files('orchestrator') / 'defaults.yaml').read_text()
-    )['timeouts']
+    shipped_timeouts = load_packaged_defaults()['timeouts']
 
     field_default = field_timeouts.working_idle_secs
     shipped = shipped_timeouts['working_idle_secs']
@@ -211,7 +213,7 @@ def test_session_idle_bound_config_drift_tripwire() -> None:
         'wait-pattern guidance quotes 1800s / 30 minutes as the session idle '
         'bound and derives its ~25-minute background threshold from it. If the '
         'two now DISAGREE, defaults.yaml is the one that binds a dispatched '
-        'session — fix the drift first. Then update both constants in roles.py '
+        'session — fix the drift first. Then update both constants in harness_guidance.py '
         'to stay under the new bound, and update this assertion.'
     )
 
@@ -236,7 +238,7 @@ def test_session_idle_bound_config_drift_tripwire() -> None:
         f'config.py Field default={field_steward}s (both were 1800s). '
         'WAIT_PATTERN_GUIDANCE tells the steward its ceiling is a FLAT 1800s / '
         '30 minutes from session start that nothing resets — update that bullet '
-        'in roles.py, and re-check that the ~25-minute background threshold '
+        'in harness_guidance.py, and re-check that the ~25-minute background threshold '
         'still leaves margin under the new value.'
     )
 
@@ -318,10 +320,14 @@ def test_background_capable_role_set_matches_bash_capability() -> None:
     """
     _CONTRACT.assert_role_set_matches_capability(
         remedy=(
-            'A newly Bash-capable role must be added to _BACKGROUND_CAPABLE_ROLES '
-            'AND given BACKGROUND_WAIT_GUIDANCE up front in its system_prompt; if '
-            'it is genuinely exempt, justify the exclusion in the comment above '
-            'the set.'
+            'This tripwire deliberately compares the shared set against unqualified '
+            '`Bash` ALONE, whether or not a role is PromptSpec-backed, so it is wider '
+            'than the predicate the set is named for. A newly Bash-capable role '
+            'needs BACKGROUND_WAIT_GUIDANCE up front. If '
+            'its system_prompt is literal, add it to BASH_CAPABLE_UNPINNED_ROLES '
+            'and the preamble carries the block. If it is PromptSpec-backed, the '
+            "shared set no longer describes this block's carriers: declare a "
+            'wait-specific set here, and justify any exclusion in its comment.'
         ),
     )
 
@@ -351,7 +357,7 @@ def test_excluded_roles_do_not_carry_combined_guidance() -> None:
             'These roles cannot launch a long-running command, so the block is '
             'dead weight in every one of their sessions. Either remove the splice, '
             'or — if the role genuinely gained the capability — grant it `Bash` and '
-            'add it to _BACKGROUND_CAPABLE_ROLES.'
+            'add it to BASH_CAPABLE_UNPINNED_ROLES.'
         ),
     )
 
@@ -384,7 +390,7 @@ def test_combined_guidance_appears_exactly_once_per_role() -> None:
     ``BACKGROUND_TASK_WARNING`` and ``EXTERNAL_KILL_GUIDANCE`` counts are each
     checked separately because the combined unit CONTAINS them: a leftover bare
     ``+ BACKGROUND_TASK_WARNING`` tail, or an ``+ EXTERNAL_KILL_GUIDANCE``
-    appended to ``_BASH_CAPABLE_ROLE_PREAMBLE`` as well, would push that half's
+    appended to ``BASH_CAPABLE_ROLE_PREAMBLE`` as well, would push that half's
     count to 2 while the combined count stayed at 1.
 
     The counts were one combined ``{role: {const: count}}`` payload before task
@@ -415,7 +421,7 @@ def test_combined_guidance_appears_exactly_once_per_role() -> None:
             'A count of 2 for EXTERNAL_KILL_GUIDANCE means a stale standalone '
             '`+ EXTERNAL_KILL_GUIDANCE` survives beside the composed '
             'BACKGROUND_WAIT_GUIDANCE (e.g. appended to the tail of '
-            '_BASH_CAPABLE_ROLE_PREAMBLE as well), doubling the block in every '
+            'BASH_CAPABLE_ROLE_PREAMBLE as well), doubling the block in every '
             'session of that role — delete it, the composed unit already carries it.'
         ),
     )
@@ -470,8 +476,8 @@ def test_amender_reminder_cannot_dangle() -> None:
     source is precisely the brittle pin two review cycles removed from this
     file. So re-pointing ``build_amender_prompt`` at a role without the block
     would dangle the pointer silently — an accepted, documented gap, recorded
-    here and above ``WAIT_PATTERN_REMINDER`` in ``roles.py`` rather than papered
-    over by a test name that implies more coverage than exists.
+    here rather than papered over by a test name that implies more coverage
+    than exists.
     """
     assert BACKGROUND_WAIT_GUIDANCE in ROLES['implementer'].system_prompt, (
         "IMPLEMENTER lost BACKGROUND_WAIT_GUIDANCE, so build_amender_prompt's "

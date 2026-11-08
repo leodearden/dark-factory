@@ -1,0 +1,31 @@
+{
+ "stream": "S13",
+ "prd_path": "docs/prds/review-all-consent-purpose-catalogue-and-gate-decide.md",
+ "manifest_path": "docs/prds/review-all-consent-purpose-catalogue-and-gate-decide.capability-manifest.yaml",
+ "leaves_estimate": 11,
+ "lead_rulings_on_open_questions": [
+  "Q1: the placement-axis half of fk-21cfdda2e0b0 is routed to S5 (one stage after S5-epsilon; setting in S24's hermetic table); S13-theta accepts only the module split.",
+  "Q2: task 582 held deferred now; S13 decompose re-scopes it to lawful basis + the GET surface S13 does not cover, after S13-alpha. RULED by Leo 2026-10-16 (ruled_by: human; session rule:solar_challenge_platform#582, commit 8ad584b): option A-narrow — 582 owns LawfulBasis {CONSENT, CONTRACT, LEGITIMATE_INTEREST} and LAWFUL_BASIS beside REQUIRED_SCOPE in consent/purposes.py plus the basis-first branch in ConsentGate.check (reads no consent row and no account; in scope -> OTHER_LAWFUL_BASIS else SCOPE_INSUFFICIENT; no NO_ACTIVE_ACCOUNT reason); 617 shrinks to TermsVersion/offered/digests/migration; 618 keeps GET /consent/purposes and ConsentScreen (the 'GET surface' half of this ruling moves from 582 to 618). cbs_billing = CONTRACT (A1 adopted, provisional pending the board; supersedes the 2026-09-29 clause); platform_operation = CONTRACT. S13 §10 rows B6-B8 restated: 1200 -> 582 edge; notes on 493, 1195; 461/462/476 drop the consent-denied limb of B4.",
+  "Q3 confirmed: require_consent is deleted (PRD §0.11; the 2026-06-25 boundary decision superseded the 2026-06-21 three-surfaces decision); fk-be6b977957ce's weakened filing row closes on that leaf."
+ ],
+ "lead_actions_at_decompose": [
+  "gamma2 = task 493 amended in place; 582 re-scoped and wired after alpha; theta filed then cancelled with x_acceptance_reason (acceptance record)",
+  "delta1 held on S26 (1087/1089 now filed -> wire, not held); delta2 held on S9 (1098 filed -> wire)",
+  "gamma3 depends on 583 or the S5 leaf that subsumes it (S5-epsilon)",
+  "high leaves alpha, beta -> gate 1065"
+ ],
+ "cross_reference_lines": [
+  "S5: 583 owns the ingest disposition of a CHECK_FAILED row until S5-epsilon subsumes it; S5 never mints CHECK_FAILED itself (ConsentDecision.check_failed / ConsentGate.decide are S13's).",
+  "S10: after S13-gamma1 the optimiser consent step is ConsentGate.decide and cannot raise a store fault; BatchOutcome's reason enum includes DecisionReason.CHECK_FAILED.",
+  "S1: consent_check required = ConsentDecide seam wired to ConsentGate.decide; S1 never wraps it in try/except or rolls back.",
+  "S2: SkipReason absorbs CONSENT_CHECK_FAILED beside CONSENT_DENIED; a consent-check failure fails the close; decide never commits/rolls back.",
+  "S11: generated portal types replace S13's hand edits (EffectiveConsentStatus, GrantRequest {purpose, customer_id?}, ConsentStateOut.as_of); ConsentScreen's me prop (S13-zeta) is the first MeResponse-passed-down instance.",
+  "S7's consent-router role table rebases on S13-beta/delta1; S13 leaves enforcement._active_customer_id to S7's occupancy predicate.",
+  "S25: runtime/seed.py consent grants go through consent.store.record_grant over a tuple of purposes (S13-beta).",
+  "S26: consent/gate.py::_strip_tz retired by S13-delta1 in favour of utc.as_utc.",
+  "S9: delta2's migration removes 'expired' from consent_current.status's persisted form at chain head (S9 states native ENUM vs enum_column).",
+  "S18: S13-alpha removes the consent->auth/fastapi/db.session edges (same stratum).",
+  "S27: invariant 3's enforcing test = tests/integration/test_consent_catalogue_boundary.py (S13-eta); invariant 10's consent pointers fixed by S13-alpha.",
+  "Program C8 resolved by R13 + S13-delta1; task 620 (renewals_due) depends on delta1."
+ ]
+}

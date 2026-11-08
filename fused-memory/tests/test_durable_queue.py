@@ -5,12 +5,16 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from datetime import UTC, datetime
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import aiosqlite
 import pytest
 import pytest_asyncio
-from _fm_helpers import poll_until
+from _fm_held_writes import HeldWrites
+from _fm_helpers import make_retry_budget_queue, poll_until, poll_until_dead
+from shared.async_sqlite_base import CheckpointResult
 
 import fused_memory.services.durable_queue as dq_module
 from fused_memory.services.durable_queue import DurableWriteQueue
@@ -221,10 +225,9 @@ class TestDeadLetter:
         # wall-clock sleep.  The dead-letter path (attempt1→retry→attempt2→dead)
         # involves several real SQLite fsync commits; under full-suite xdist load
         # the fixed 1.0s budget was regularly exceeded, causing flaky failures.
-        # 20s is generous under any load while staying well under the 60s
-        # pytest-timeout.  The accounting itself (attempts counter, 'dead'
-        # status) is deterministic given a single worker + max_attempts=2.
-        await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+        # The accounting itself (attempts counter, 'dead' status) is
+        # deterministic given a single worker + max_attempts=2.
+        await poll_until_dead(q, group_id='proj1', expected_dead=1)
 
         dead = await q.get_dead_items()
         assert len(dead) == 1
@@ -253,7 +256,7 @@ class TestDeadLetter:
                 group_id='proj1', operation='add_episode',
                 payload={'content': f'item {i}', 'group_id': 'proj1', 'name': f'ep{i}'},
             )
-        await _poll_until_dead(q, group_id='proj1', expected_dead=4, timeout=20.0)
+        await poll_until_dead(q, group_id='proj1', expected_dead=4)
 
         # All 4 should be dead.
         all_dead = await q.get_dead_items()
@@ -305,7 +308,7 @@ class TestReplayDead:
             group_id='proj1', operation='add_episode',
             payload={'content': 'test', 'group_id': 'proj1', 'name': 'ep'},
         )
-        await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+        await poll_until_dead(q, group_id='proj1', expected_dead=1)
 
         # Should be dead-lettered
         dead = await q.get_dead_items()
@@ -398,8 +401,7 @@ class TestRecovery:
         await q.initialize()
 
         # Manually insert an in_flight item (simulating crash)
-        assert q._db is not None
-        await q._db.execute(
+        await q._require_access().connection.execute(
             'INSERT INTO write_queue '
             '(group_id, operation, payload, status, attempts, max_attempts, '
             ' next_retry_at, created_at) '
@@ -407,7 +409,7 @@ class TestRecovery:
             ('proj1', 'add_episode', '{"content":"crashed","group_id":"proj1","name":"ep"}',
              time.time()),
         )
-        await q._db.commit()
+        await q._require_access().connection.commit()
         await q.close()
 
         # Re-open — should recover
@@ -505,15 +507,98 @@ class TestEnqueueBatchRollback:
         with pytest.raises(KeyError):
             await queue.enqueue_batch(items)
 
-        # Verify rollback: no items should have been persisted
-        assert queue._db is not None
-        cursor = await queue._db.execute(
-            "SELECT COUNT(*) FROM write_queue WHERE status='pending'"
+        counts = (await queue.get_stats(group_id='proj1'))['counts']
+        assert counts == {}, f'Expected no rows after rollback, got {counts}'
+
+    @pytest.mark.asyncio
+    async def test_a_failed_batch_is_atomic_while_workers_commit(self, tmp_path):
+        """A failing batch leaves nothing, and no worker's commit is discarded.
+
+        The queue shares ONE aiosqlite connection between ``enqueue_batch`` and
+        every worker, so the batch's statements and the workers' claim /
+        executed / completed / failure commits interleave on it.  A worker's
+        commit then commits whatever half of the batch was already inserted,
+        and the batch's rollback discards whatever a worker had not committed
+        yet — the connection-wide rollback of
+        ``plans/recon-sqlite-database-locked-rca-2026-09-16.md`` RC9.
+
+        Measured before ``AtomicConnection`` with a probe of this shape minus
+        the transient failures, 3 runs: 85 and 88 'batch' rows survived as
+        pending, and in the third run the batch's explicit ``BEGIN`` raised
+        ``OperationalError: cannot start a transaction within a transaction``
+        (so ``pytest.raises(KeyError)`` fails too).  This final shape, which
+        also puts ``_handle_failure``'s commit in the window, re-measured over
+        5 runs: failed 5/5 — 126, 138, 140 and 153 'batch' rows survived as
+        pending in four, and the fifth raised the same ``BEGIN`` error.  After
+        the fix: passed 5/5, no batch row left.
+
+        A CANCELLED batch is deliberately absent: it measured clean before the
+        fix (it cancels at its ``BEGIN`` and leaves nothing), and an arm that
+        passes on unfixed code asserts nothing.
+        """
+        executed: list[str] = []
+        attempts: dict[str, int] = {}
+
+        async def execute_write(_operation, payload):
+            name = payload['name']
+            attempts[name] = attempts.get(name, 0) + 1
+            if int(name.removeprefix('w')) % 2 == 1 and attempts[name] == 1:
+                raise ConnectionError(f'first attempt of {name} fails transiently')
+            executed.append(name)
+            return {'ok': True}
+
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=execute_write,
+            workers_per_group=3,
+            semaphore_limit=5,
+            max_attempts=3,
+            retry_base_seconds=0.05,
+            write_timeout_seconds=2.0,
         )
-        row = await cursor.fetchone()
-        assert row[0] == 0, (
-            f'Expected 0 pending items after rollback, got {row[0]}'
-        )
+        await q.initialize()
+        try:
+            for i in range(30):
+                await q.enqueue(
+                    group_id='workers', operation='add_episode',
+                    payload={'content': f'item {i}', 'group_id': 'workers', 'name': f'w{i}'},
+                )
+            batch = [
+                {'group_id': 'batch', 'operation': 'add_episode',
+                 'payload': {'content': f'batch {i}', 'group_id': 'batch', 'name': f'b{i}'}}
+                for i in range(200)
+            ]
+            # Missing 'operation' — a KeyError after 200 INSERTs.
+            batch.append(
+                {'group_id': 'batch',
+                 'payload': {'content': 'bad', 'group_id': 'batch', 'name': 'bad'}}
+            )
+
+            with pytest.raises(KeyError):
+                await asyncio.wait_for(q.enqueue_batch(batch), 10)
+
+            async def _workers_drained():
+                stats = await q.get_stats(group_id='workers')
+                return stats if stats['counts'].get('completed', 0) == 30 else None
+
+            await poll_until(
+                _workers_drained,
+                timeout=20.0,
+                message='timed out waiting for the 30 worker items to complete',
+            )
+
+            batch_counts = (await q.get_stats(group_id='batch'))['counts']
+            assert batch_counts == {}, (
+                f'the failed batch left rows behind: {batch_counts} — a worker commit '
+                'swept up its half-inserted statements'
+            )
+            assert len(executed) == 30 and len(set(executed)) == 30, (
+                f'{len(executed)} executions of {len(set(executed))} items: a foreign '
+                'rollback discarded a claim or completion and the item re-executed'
+            )
+            assert await q.get_dead_items() == []
+        finally:
+            await q.close()
 
 
 class TestCallbackFailure:
@@ -530,7 +615,7 @@ class TestCallbackFailure:
         )
 
         # Wait for all retries to exhaust (max_attempts=3 in fixture)
-        await _poll_until_dead(queue, group_id='proj1', expected_dead=1, timeout=20.0)
+        await poll_until_dead(queue, group_id='proj1', expected_dead=1)
 
         stats = await queue.get_stats()
         # Item should be dead-lettered, not completed — callback kept failing
@@ -588,43 +673,55 @@ class TestShutdown:
 
         # Workers should be cleaned up
         assert len(q._worker_tasks) == 0
-        assert q._db is None
+        assert await q.checkpoint() == CheckpointResult.unavailable()
 
 
 class TestDeleteDead:
-    """Tests for DurableWriteQueue.delete_dead(group_id, ids)."""
+    """Tests for DurableWriteQueue.delete_dead(group_id, ids).
 
-    async def _insert_dead_row(self, q, group_id: str = 'proj1') -> int:
-        """Insert a dead row directly via SQL and return its id."""
-        assert q._db is not None
-        cursor = await q._db.execute(
-            'INSERT INTO write_queue '
-            '(group_id, operation, payload, status, attempts, max_attempts, '
-            ' next_retry_at, created_at) '
-            "VALUES (?, 'add_episode', '{\"content\":\"dead\"}', 'dead', 3, 3, 0, ?)",
-            (group_id, time.time()),
-        )
-        await q._db.commit()
-        return cursor.lastrowid  # type: ignore[return-value]
+    Rows are seeded and re-read through an independent connection to the
+    queue's database file, never through the queue's own connection.
+    """
 
-    async def _insert_pending_row(self, q, group_id: str = 'proj1') -> int:
-        """Insert a pending row directly via SQL and return its id."""
-        assert q._db is not None
-        cursor = await q._db.execute(
-            'INSERT INTO write_queue '
-            '(group_id, operation, payload, status, attempts, max_attempts, '
-            ' next_retry_at, created_at) '
-            "VALUES (?, 'add_episode', '{\"content\":\"pending\"}', 'pending', 0, 3, 0, ?)",
-            (group_id, time.time()),
-        )
-        await q._db.commit()
-        return cursor.lastrowid  # type: ignore[return-value]
+    @pytest.fixture
+    def queue_file(self, tmp_path) -> Path:
+        """The database file of a queue whose ``data_dir`` is ``tmp_path / 'queue'``."""
+        return tmp_path / 'queue' / 'write_queue.db'
+
+    @staticmethod
+    async def _insert_row(queue_file: Path, group_id: str, status: str, attempts: int) -> int:
+        async with aiosqlite.connect(str(queue_file)) as db:
+            cursor = await db.execute(
+                'INSERT INTO write_queue '
+                '(group_id, operation, payload, status, attempts, max_attempts, '
+                ' next_retry_at, created_at) '
+                "VALUES (?, 'add_episode', ?, ?, ?, 3, 0, ?)",
+                (group_id, f'{{"content":"{status}"}}', status, attempts, time.time()),
+            )
+            await db.commit()
+        assert cursor.lastrowid is not None
+        return cursor.lastrowid
+
+    async def _insert_dead_row(self, queue_file: Path, group_id: str = 'proj1') -> int:
+        return await self._insert_row(queue_file, group_id, 'dead', 3)
+
+    async def _insert_pending_row(self, queue_file: Path, group_id: str = 'proj1') -> int:
+        return await self._insert_row(queue_file, group_id, 'pending', 0)
+
+    @staticmethod
+    async def _present_ids(queue_file: Path, ids: list[int]) -> set[int]:
+        async with aiosqlite.connect(str(queue_file)) as db:
+            rows = await db.execute_fetchall(
+                f"SELECT id FROM write_queue WHERE id IN ({','.join('?' * len(ids))})",
+                tuple(ids),
+            )
+        return {row[0] for row in rows}
 
     @pytest.mark.asyncio
-    async def test_bulk_delete_dead_rows(self, queue):
+    async def test_bulk_delete_dead_rows(self, queue, queue_file):
         """Bulk-deleting dead rows returns them in 'deleted' and removes them."""
-        id1 = await self._insert_dead_row(queue, 'proj1')
-        id2 = await self._insert_dead_row(queue, 'proj1')
+        id1 = await self._insert_dead_row(queue_file, 'proj1')
+        id2 = await self._insert_dead_row(queue_file, 'proj1')
 
         result = await queue.delete_dead(group_id='proj1', ids=[id1, id2])
 
@@ -646,9 +743,9 @@ class TestDeleteDead:
         assert sorted(result['not_found']) == [88888, 99999]
 
     @pytest.mark.asyncio
-    async def test_cross_project_ids_not_deleted(self, queue):
+    async def test_cross_project_ids_not_deleted(self, queue, queue_file):
         """Dead rows from proj-b are not deleted when calling with proj-a."""
-        id_b = await self._insert_dead_row(queue, 'proj-b')
+        id_b = await self._insert_dead_row(queue_file, 'proj-b')
 
         result = await queue.delete_dead(group_id='proj-a', ids=[id_b])
 
@@ -660,22 +757,18 @@ class TestDeleteDead:
         assert any(item['id'] == id_b for item in dead_b)
 
     @pytest.mark.asyncio
-    async def test_non_dead_status_ids_not_deleted(self, queue):
+    async def test_non_dead_status_ids_not_deleted(self, queue, queue_file):
         """Pending rows are silently skipped (land in 'not_found') and stay in table."""
-        id_pending = await self._insert_pending_row(queue, 'proj1')
+        id_pending = await self._insert_pending_row(queue_file, 'proj1')
 
         result = await queue.delete_dead(group_id='proj1', ids=[id_pending])
 
         assert result['deleted'] == []
         assert result['not_found'] == [id_pending]
 
-        # Row must still be present
-        assert queue._db is not None
-        cursor = await queue._db.execute(
-            'SELECT id FROM write_queue WHERE id = ?', (id_pending,)
+        assert await self._present_ids(queue_file, [id_pending]) == {id_pending}, (
+            'Pending row must not be deleted'
         )
-        row = await cursor.fetchone()
-        assert row is not None, 'Pending row must not be deleted'
 
     @pytest.mark.asyncio
     async def test_empty_ids_no_op(self, queue):
@@ -685,11 +778,11 @@ class TestDeleteDead:
         assert result == {'deleted': [], 'not_found': []}
 
     @pytest.mark.asyncio
-    async def test_mixed_call_partitions_correctly(self, queue):
+    async def test_mixed_call_partitions_correctly(self, queue, queue_file):
         """Mixed input: valid dead, cross-project dead, non-existent, non-dead partitions."""
-        id_dead_proj1 = await self._insert_dead_row(queue, 'proj1')
-        id_dead_proj2 = await self._insert_dead_row(queue, 'proj2')
-        id_pending = await self._insert_pending_row(queue, 'proj1')
+        id_dead_proj1 = await self._insert_dead_row(queue_file, 'proj1')
+        id_dead_proj2 = await self._insert_dead_row(queue_file, 'proj2')
+        id_pending = await self._insert_pending_row(queue_file, 'proj1')
         id_nonexistent = 999999
 
         result = await queue.delete_dead(
@@ -702,7 +795,7 @@ class TestDeleteDead:
 
     @pytest.mark.asyncio
     async def test_chunks_large_id_lists_without_param_limit_error(
-        self, queue, monkeypatch
+        self, queue, queue_file, monkeypatch
     ):
         """Large id lists are processed in chunks without hitting SQLite variable limits.
 
@@ -713,11 +806,11 @@ class TestDeleteDead:
         monkeypatch.setattr(dq_module, '_DELETE_DEAD_BATCH_SIZE', 3)
 
         # Insert 7 dead rows for proj1.
-        dead_ids = [await self._insert_dead_row(queue, 'proj1') for _ in range(7)]
+        dead_ids = [await self._insert_dead_row(queue_file, 'proj1') for _ in range(7)]
 
         # Insert 1 pending row for proj1 and 1 dead row for proj2 (both ineligible).
-        pending_id = await self._insert_pending_row(queue, 'proj1')
-        cross_id = await self._insert_dead_row(queue, 'proj2')
+        pending_id = await self._insert_pending_row(queue_file, 'proj1')
+        cross_id = await self._insert_dead_row(queue_file, 'proj2')
         nonexistent_id = 999999
 
         all_input_ids = dead_ids + [pending_id, cross_id, nonexistent_id]
@@ -738,7 +831,7 @@ class TestDeleteDead:
         assert any(item['id'] == cross_id for item in proj2_items)
 
     @pytest.mark.asyncio
-    async def test_exact_batch_size_boundary(self, queue, monkeypatch):
+    async def test_exact_batch_size_boundary(self, queue, queue_file, monkeypatch):
         """ids count == batch_size exercises the loop with zero remainder.
 
         An off-by-one in ``range(0, len(ids), step)`` would silently drop the
@@ -749,7 +842,7 @@ class TestDeleteDead:
 
         # Boundary cases: batch_size-1, batch_size, batch_size+1, 2*batch_size.
         for count in (2, 3, 4, 6):
-            dead_ids = [await self._insert_dead_row(queue, 'proj1') for _ in range(count)]
+            dead_ids = [await self._insert_dead_row(queue_file, 'proj1') for _ in range(count)]
             result = await queue.delete_dead(group_id='proj1', ids=dead_ids)
             assert sorted(result['deleted']) == sorted(dead_ids), (
                 f'All {count} dead rows must be deleted (batch_size boundary)'
@@ -757,7 +850,7 @@ class TestDeleteDead:
             assert result['not_found'] == []
 
     @pytest.mark.asyncio
-    async def test_all_ineligible_chunk_followed_by_eligible_chunk(self, queue, monkeypatch):
+    async def test_all_ineligible_chunk_followed_by_eligible_chunk(self, queue, queue_file, monkeypatch):
         """An all-ineligible first chunk does not clobber the deleted accumulator.
 
         If ``deleted`` were ever overwritten instead of unioned, the second
@@ -766,8 +859,8 @@ class TestDeleteDead:
         """
         monkeypatch.setattr(dq_module, '_DELETE_DEAD_BATCH_SIZE', 3)
 
-        pending_ids = [await self._insert_pending_row(queue, 'proj1') for _ in range(3)]
-        dead_ids = [await self._insert_dead_row(queue, 'proj1') for _ in range(3)]
+        pending_ids = [await self._insert_pending_row(queue_file, 'proj1') for _ in range(3)]
+        dead_ids = [await self._insert_dead_row(queue_file, 'proj1') for _ in range(3)]
 
         # Interleave so the first chunk is all-ineligible.
         all_ids = pending_ids + dead_ids
@@ -776,34 +869,28 @@ class TestDeleteDead:
         assert sorted(result['deleted']) == sorted(dead_ids)
         assert sorted(result['not_found']) == sorted(pending_ids)
 
-        # Pending rows must still be present.
-        assert queue._db is not None
-        cursor = await queue._db.execute(
-            f"SELECT id FROM write_queue WHERE id IN ({','.join('?' * len(pending_ids))})",
-            tuple(pending_ids),
+        assert await self._present_ids(queue_file, pending_ids) == set(pending_ids), (
+            'Pending rows must not be deleted'
         )
-        rows = await cursor.fetchall()
-        found = {(row[0] if isinstance(row, tuple) else row['id']) for row in rows}
-        assert found == set(pending_ids), 'Pending rows must not be deleted'
 
     @pytest.mark.asyncio
-    async def test_operational_error_returns_typed_envelope(self, queue, monkeypatch):
+    async def test_operational_error_returns_typed_envelope(self, queue, queue_file, monkeypatch):
         """An aiosqlite.OperationalError during DELETE returns a typed retriable envelope.
 
         The function must NOT raise; instead it returns a dict with
         error_type='TransientSqliteError' and retriable=True.
         """
-        id1 = await self._insert_dead_row(queue, 'proj1')
+        id1 = await self._insert_dead_row(queue_file, 'proj1')
 
         # Replace db.execute with one that raises OperationalError on any DELETE call.
-        original_execute = queue._db.execute
+        original_execute = queue._require_access().connection.execute
 
         async def mock_execute(sql, *args, **kwargs):
             if 'DELETE' in sql.upper():
                 raise aiosqlite.OperationalError('database is locked')
             return await original_execute(sql, *args, **kwargs)
 
-        monkeypatch.setattr(queue._db, 'execute', mock_execute)
+        monkeypatch.setattr(queue._require_access().connection, 'execute', mock_execute)
 
         result = await queue.delete_dead(group_id='proj1', ids=[id1])
 
@@ -820,7 +907,7 @@ class TestDeleteDead:
 
     @pytest.mark.asyncio
     async def test_operational_error_mid_batch_preserves_deleted_progress(
-        self, queue, monkeypatch
+        self, queue, queue_file, monkeypatch
     ):
         """Mid-batch OperationalError: prior-chunk deletions are committed and reported.
 
@@ -834,11 +921,11 @@ class TestDeleteDead:
         """
         monkeypatch.setattr(dq_module, '_DELETE_DEAD_BATCH_SIZE', 3)
 
-        dead_ids = [await self._insert_dead_row(queue, 'proj1') for _ in range(7)]
+        dead_ids = [await self._insert_dead_row(queue_file, 'proj1') for _ in range(7)]
 
         # Track which DELETE invocation we're on.
         delete_call_count = 0
-        original_execute = queue._db.execute
+        original_execute = queue._require_access().connection.execute
 
         async def mock_execute(sql, *args, **kwargs):
             nonlocal delete_call_count
@@ -848,7 +935,7 @@ class TestDeleteDead:
                     raise aiosqlite.OperationalError('database is locked')
             return await original_execute(sql, *args, **kwargs)
 
-        monkeypatch.setattr(queue._db, 'execute', mock_execute)
+        monkeypatch.setattr(queue._require_access().connection, 'execute', mock_execute)
 
         result = await queue.delete_dead(group_id='proj1', ids=dead_ids)
 
@@ -868,7 +955,7 @@ class TestDeleteDead:
         # confirm the commit landed.  We avoid re-instantiating DurableWriteQueue
         # with hard-coded constructor args (which could silently diverge from the
         # fixture) — raw aiosqlite is sufficient for a table-contents check.
-        db_path = queue._data_dir / 'write_queue.db'
+        db_path = queue_file
         await queue.close()
 
         async with aiosqlite.connect(str(db_path)) as raw_db:
@@ -895,7 +982,7 @@ class TestDeleteDead:
         assert envelope_deleted | envelope_remaining == set(dead_ids)
 
     @pytest.mark.asyncio
-    async def test_duplicate_input_ids_never_overlap_buckets(self, queue, monkeypatch):
+    async def test_duplicate_input_ids_never_overlap_buckets(self, queue, queue_file, monkeypatch):
         """Duplicate ids in the input must never appear in both deleted and not_found.
 
         When batch_size=1 a list like [id1, id1] forces two separate chunks.
@@ -908,7 +995,7 @@ class TestDeleteDead:
         """
         monkeypatch.setattr(dq_module, '_DELETE_DEAD_BATCH_SIZE', 1)
 
-        id1 = await self._insert_dead_row(queue, 'proj1')
+        id1 = await self._insert_dead_row(queue_file, 'proj1')
 
         result = await queue.delete_dead(group_id='proj1', ids=[id1, id1])
 
@@ -922,7 +1009,7 @@ class TestDeleteDead:
 
     @pytest.mark.asyncio
     async def test_recovery_commit_failure_logs_at_error_level_with_traceback(
-        self, queue, monkeypatch, caplog
+        self, queue, queue_file, monkeypatch, caplog
     ):
         """Recovery-commit failure must be logged at ERROR level with a traceback.
 
@@ -932,23 +1019,23 @@ class TestDeleteDead:
         operators see the traceback — distinguishing logger.exception() from
         logger.error() or logger.warning().
         """
-        id1 = await self._insert_dead_row(queue, 'proj1')
+        id1 = await self._insert_dead_row(queue_file, 'proj1')
 
         # Raise OperationalError on any DELETE to trigger the error path.
-        original_execute = queue._db.execute
+        original_execute = queue._require_access().connection.execute
 
         async def mock_execute(sql, *args, **kwargs):
             if 'DELETE' in sql.upper():
                 raise aiosqlite.OperationalError('database is locked')
             return await original_execute(sql, *args, **kwargs)
 
-        monkeypatch.setattr(queue._db, 'execute', mock_execute)
+        monkeypatch.setattr(queue._require_access().connection, 'execute', mock_execute)
 
         # Also fail the recovery commit so we enter the double-failure branch.
         async def mock_commit():
             raise aiosqlite.OperationalError('disk I/O error')
 
-        monkeypatch.setattr(queue._db, 'commit', mock_commit)
+        monkeypatch.setattr(queue._require_access().connection, 'commit', mock_commit)
 
         with caplog.at_level(logging.ERROR, logger='fused_memory.services.durable_queue'):
             result = await queue.delete_dead(group_id='proj1', ids=[id1])
@@ -977,7 +1064,7 @@ class TestDeleteDead:
     @pytest.mark.parametrize('journal_mode', ['WAL', 'DELETE'])
     @pytest.mark.asyncio
     async def test_real_sqlite_busy_mid_batch_durable_recovery(
-        self, tmp_path, monkeypatch, journal_mode
+        self, tmp_path, monkeypatch, journal_mode, queue_file
     ):
         """Real SQLITE_BUSY on chunk 2: prior-chunk deletes are durable (both journal modes).
 
@@ -1004,27 +1091,26 @@ class TestDeleteDead:
             write_timeout_seconds=2.0,
         )
         await q.initialize()
-        assert q._db is not None  # narrowed from Optional after initialize()
 
         try:
             # (2) Patch batch size to 3 so 7 rows => chunks [0:3], [3:6], [6:7].
             monkeypatch.setattr(dq_module, '_DELETE_DEAD_BATCH_SIZE', 3)
-            dead_ids = [await self._insert_dead_row(q, 'proj1') for _ in range(7)]
+            dead_ids = [await self._insert_dead_row(queue_file, 'proj1') for _ in range(7)]
 
             # (3) Switch the queue connection to the parametrized journal mode.
             #     Fetch the PRAGMA result to confirm the switch actually happened —
             #     PRAGMA journal_mode silently returns the *current* mode rather
             #     than raising on failure, so discarding the cursor can mask a
             #     no-op switch (e.g. WAL→DELETE while another connection holds WAL).
-            cur = await q._db.execute(f'PRAGMA journal_mode={journal_mode}')
+            cur = await q._require_access().connection.execute(f'PRAGMA journal_mode={journal_mode}')
             row = await cur.fetchone()
             assert row is not None and row[0].lower() == journal_mode.lower(), (
                 f'journal_mode switch failed: expected {journal_mode!r}, '
                 f'got {(row[0] if row else None)!r}'
             )
-            await q._db.commit()
+            await q._require_access().connection.commit()
 
-            db_path = q._data_dir / 'write_queue.db'
+            db_path = queue_file
 
             # (4) Open conn2 to the same file; confirm the matching journal mode.
             async with aiosqlite.connect(str(db_path)) as conn2:
@@ -1036,7 +1122,7 @@ class TestDeleteDead:
                 )
                 await conn2.commit()
 
-                # (5) Install the coordinator wrapper around q._db.execute.
+                # (5) Install the coordinator wrapper around the queue connection's execute.
                 #
                 # Chunk-1 path (delete_call_count == 1):
                 #   a. Execute chunk-1 DELETE and pre-fetch RETURNING rows before
@@ -1047,14 +1133,13 @@ class TestDeleteDead:
                 #   e. Return a proxy cursor with the pre-buffered RETURNING rows.
                 # All other calls (including chunk-2 DELETE) forward to the real execute.
                 #
-                # Recovery-commit safety note: delete_dead's except-OperationalError
-                # handler calls ``await self._db.commit()`` as a recovery attempt after
-                # chunk-2 fails.  That commit is a no-op because the coordinator already
+                # Recovery-commit safety note: delete_dead's write unit commits on
+                # its clean exit after chunk-2 fails.  That commit is a no-op because the coordinator already
                 # committed chunk-1 above, leaving *no pending transaction* on the queue
                 # connection.  A no-op commit never needs the write lock, so there is no
                 # race risk from busy_timeout still being 50 ms at that point.
                 delete_call_count = 0
-                q_db = q._db
+                q_db = q._require_access().connection
                 original_execute = q_db.execute
 
                 async def coordinator(sql, *args, **kwargs):
@@ -1135,7 +1220,7 @@ class TestDeleteDead:
             )
 
         finally:
-            # close() guards against _db being None, so a double-call is a no-op.
+            # close() guards against _access being None, so a double-call is a no-op.
             await q.close()
 
 
@@ -1178,7 +1263,7 @@ class TestStats:
         # Poll until both successful items complete and the failing item
         # dead-letters. A fixed sleep raced under full-suite CPU load: the two
         # 'good' writes had not both drained yet, yielding completed==1 (see
-        # _poll_until_dead's rationale — same fix, both terminal counts).
+        # poll_until_dead's rationale — same fix, both terminal counts).
         # Delegates to the shared poll_until (task 2377); last_counts is a
         # side-channel capture so the timeout message can still report the
         # latest observed counts, since poll_until's message is static.
@@ -1202,38 +1287,6 @@ class TestStats:
         assert stats['counts'].get('completed', 0) == 2
         assert stats['counts'].get('dead', 0) == 1
         await q.close()
-
-
-async def _poll_until_dead(
-    q: DurableWriteQueue,
-    *,
-    group_id: str | None = None,
-    expected_dead: int,
-    timeout: float = 5.0,
-) -> None:
-    """Poll queue stats until at least *expected_dead* items have status='dead'.
-
-    Thin wrapper over the shared poll_until (task 2377): replaces fixed
-    ``asyncio.sleep`` calls in tests that wait for items to dead-letter,
-    avoiding the 1.5 s floor on fast machines while still handling slow CI
-    runners via the *timeout* guard. last_counts is a side-channel capture
-    so the timeout message can still report the latest observed counts,
-    since poll_until's message is static.
-    """
-    last_counts: dict = {}
-
-    async def _dead_count_reached():
-        stats = await q.get_stats(group_id=group_id)
-        last_counts.update(stats['counts'])
-        return stats['counts'].get('dead', 0) >= expected_dead
-
-    try:
-        await poll_until(_dead_count_reached, timeout=timeout, interval=0.05)
-    except AssertionError as exc:
-        raise AssertionError(
-            f'Timed out waiting for {expected_dead} dead item(s) '
-            f'(group_id={group_id!r}); last counts={last_counts}'
-        ) from exc
 
 
 class TestGetStatsScopedByGroup:
@@ -1270,7 +1323,7 @@ class TestGetStatsScopedByGroup:
                 )
             # Wait for all 5 items to dead-letter (2 proj_a + 3 proj_b).
             # Polling is faster than a fixed sleep and reliable on slow CI.
-            await _poll_until_dead(q, expected_dead=5)
+            await poll_until_dead(q, expected_dead=5)
 
             stats_a = await q.get_stats(group_id='proj_a')
             stats_b = await q.get_stats(group_id='proj_b')
@@ -1316,7 +1369,7 @@ class TestGetStatsScopedByGroup:
                     payload={'content': f'b{i}', 'group_id': 'proj_b', 'name': f'b{i}'},
                 )
             # Wait for all 5 items to dead-letter; polling avoids fixed-sleep flakiness.
-            await _poll_until_dead(q, expected_dead=5)
+            await poll_until_dead(q, expected_dead=5)
 
             stats = await q.get_stats()  # no group_id → unscoped
             # Should see the total across both groups
@@ -1347,9 +1400,8 @@ class TestGetStatsScopedByGroup:
             old_ts = now - 100.0  # proj_a item created 100 seconds ago
             recent_ts = now - 10.0  # proj_b item created 10 seconds ago
 
-            assert q._db is not None
             # Insert directly so workers aren't triggered (they'd change status)
-            await q._db.execute(
+            await q._require_access().connection.execute(
                 'INSERT INTO write_queue '
                 '(group_id, operation, payload, status, attempts, max_attempts, '
                 ' next_retry_at, created_at) '
@@ -1358,7 +1410,7 @@ class TestGetStatsScopedByGroup:
                  '{"content":"old","group_id":"proj_a","name":"old"}',
                  old_ts),
             )
-            await q._db.execute(
+            await q._require_access().connection.execute(
                 'INSERT INTO write_queue '
                 '(group_id, operation, payload, status, attempts, max_attempts, '
                 ' next_retry_at, created_at) '
@@ -1367,7 +1419,7 @@ class TestGetStatsScopedByGroup:
                  '{"content":"recent","group_id":"proj_b","name":"recent"}',
                  recent_ts),
             )
-            await q._db.commit()
+            await q._require_access().connection.commit()
 
             stats_b = await q.get_stats(group_id='proj_b')
             age_b = stats_b['oldest_pending_age_seconds']
@@ -1437,7 +1489,7 @@ class TestTransientErrorRetryPolicy:
                 group_id='proj1', operation='add_episode',
                 payload={'content': 'test', 'group_id': 'proj1', 'name': 'ep'},
             )
-            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+            await poll_until_dead(q, group_id='proj1', expected_dead=1)
 
             dead = await q.get_dead_items()
             assert len(dead) == 1
@@ -1467,10 +1519,7 @@ class TestTransientErrorRetryPolicy:
                 group_id='proj1', operation='add_episode',
                 payload={'content': 'test', 'group_id': 'proj1', 'name': 'ep'},
             )
-            # Generous timeout: 5 attempts at a 0.01s backoff base is fast in
-            # practice, but slow CI runners need headroom (see other dead-letter
-            # tests in this file using the same 20s budget).
-            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+            await poll_until_dead(q, group_id='proj1', expected_dead=1)
 
             dead = await q.get_dead_items()
             assert len(dead) == 1
@@ -1568,23 +1617,6 @@ class TestNotFoundFamilyIsNotTransient:
     governs. TestTransientErrorRetryPolicy covers the mechanism.
     """
 
-    @staticmethod
-    def _queue(tmp_path, execute):
-        """The shared config: plain budget 5, extended budget 12, and no
-        transient_error_names= override so DEFAULT_TRANSIENT_ERROR_NAMES
-        decides which one applies."""
-        return DurableWriteQueue(
-            data_dir=tmp_path / 'queue',
-            execute_write=execute,
-            workers_per_group=1,
-            semaphore_limit=5,
-            max_attempts=5,
-            retry_base_seconds=0.01,
-            retry_max_delay_seconds=0.05,
-            write_timeout_seconds=2.0,
-            transient_max_attempts=12,
-        )
-
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         'exc_cls',
@@ -1601,17 +1633,16 @@ class TestNotFoundFamilyIsNotTransient:
         this never did at any budget.
         """
         execute = AsyncMock(side_effect=exc_cls('uuid abc-123 not found'))
-        q = self._queue(tmp_path, execute)
+        q = make_retry_budget_queue(tmp_path, execute)
         await q.initialize()
         try:
             await q.enqueue(
                 group_id='proj1', operation='add_episode',
                 payload={'content': 'test', 'group_id': 'proj1', 'name': 'ep'},
             )
-            # 20s budget for slow CI runners, matching the rest of this file;
             # 12 attempts at a 0.05s delay ceiling costs well under a second,
             # so the pre-3585 behaviour fails on the COUNT, not by timing out.
-            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+            await poll_until_dead(q, group_id='proj1', expected_dead=1)
 
             dead = await q.get_dead_items()
             assert len(dead) == 1
@@ -1632,14 +1663,14 @@ class TestNotFoundFamilyIsNotTransient:
         This is what fails if a later edit prunes the set too broadly.
         """
         execute = AsyncMock(side_effect=ConnectionResetError('connection reset by peer'))
-        q = self._queue(tmp_path, execute)
+        q = make_retry_budget_queue(tmp_path, execute)
         await q.initialize()
         try:
             await q.enqueue(
                 group_id='proj1', operation='add_episode',
                 payload={'content': 'test', 'group_id': 'proj1', 'name': 'ep'},
             )
-            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+            await poll_until_dead(q, group_id='proj1', expected_dead=1)
 
             dead = await q.get_dead_items()
             assert len(dead) == 1
@@ -1717,7 +1748,7 @@ class TestTerminalHook:
                 group_id='proj1', operation='add_episode',
                 payload={'content': 'x', '_write_op_id': 'W2'},
             )
-            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+            await poll_until_dead(q, group_id='proj1', expected_dead=1)
             await poll_until(lambda: len(calls) >= 1, timeout=20.0, interval=0.05)
             assert len(calls) == 1
             write_op_id, status, error = calls[0]
@@ -1762,7 +1793,7 @@ class TestTerminalHook:
                 payload={'content': 'x', '_write_op_id': 'W8'},
                 callback_type='dual_write_episode',
             )
-            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+            await poll_until_dead(q, group_id='proj1', expected_dead=1)
             await poll_until(lambda: len(calls) >= 1, timeout=20.0, interval=0.05)
             assert len(calls) == 1
             write_op_id, status, error = calls[0]
@@ -1818,7 +1849,7 @@ class TestTerminalHook:
                 payload={'content': 'x', '_write_op_id': 'W9'},
                 callback_type='dual_write_episode',
             )
-            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+            await poll_until_dead(q, group_id='proj1', expected_dead=1)
             await poll_until(lambda: len(calls) >= 1, timeout=20.0, interval=0.05)
             assert len(calls) == 1
             write_op_id, status, error = calls[0]
@@ -1870,11 +1901,11 @@ class TestTerminalHook:
                 payload={'content': 'x', '_write_op_id': 'W10'},
                 callback_type='dual_write_episode',
             )
-            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+            await poll_until_dead(q, group_id='proj1', expected_dead=1)
             await poll_until(lambda: len(calls) >= 1, timeout=20.0, interval=0.05)
 
             assert await q.replay_dead(group_id='proj1') == 1
-            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+            await poll_until_dead(q, group_id='proj1', expected_dead=1)
             await poll_until(lambda: len(calls) >= 2, timeout=20.0, interval=0.05)
 
             assert len(calls) == 2
@@ -1933,8 +1964,8 @@ class TestTerminalHook:
                 payload={'content': 'never', '_write_op_id': 'W12'},
                 callback_type='dual_write_episode',
             )
-            await _poll_until_dead(q, group_id='landed-grp', expected_dead=1, timeout=20.0)
-            await _poll_until_dead(q, group_id='never-grp', expected_dead=1, timeout=20.0)
+            await poll_until_dead(q, group_id='landed-grp', expected_dead=1)
+            await poll_until_dead(q, group_id='never-grp', expected_dead=1)
 
             landed = (await q.get_dead_items(group_id='landed-grp'))[0]
             never = (await q.get_dead_items(group_id='never-grp'))[0]
@@ -2057,7 +2088,7 @@ class TestTerminalHook:
                 payload={'content': 'x', '_write_op_id': 'W14'},
                 callback_type='dual_write_episode',
             )
-            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+            await poll_until_dead(q, group_id='proj1', expected_dead=1)
             await poll_until(lambda: len(calls) >= 1, timeout=20.0, interval=0.05)
 
             dead = await q.get_dead_items(group_id='proj1')
@@ -2493,7 +2524,7 @@ class TestExecutedColumnSchema:
                 {'group_id': 'batch-grp', 'operation': 'add_episode',
                  'payload': {'content': 'via enqueue_batch'}},
             ])
-            await _poll_until_dead(q, group_id='batch-grp', expected_dead=1, timeout=20.0)
+            await poll_until_dead(q, group_id='batch-grp', expected_dead=1)
 
             dead = await q.get_dead_items(group_id='batch-grp')
             assert dead[0]['executed'] is False, (
@@ -2556,7 +2587,7 @@ class TestDeadLetterHook:
                 group_id='proj1', operation='add_episode',
                 payload={'content': 'never lands', '_write_op_id': 'W1'},
             )
-            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+            await poll_until_dead(q, group_id='proj1', expected_dead=1)
             await poll_until(lambda: len(events) >= 1, timeout=20.0, interval=0.05)
 
             assert len(events) == 1, f'exactly one alarm per death, got {events}'
@@ -2668,9 +2699,7 @@ class TestDeadLetterHook:
                 group_id='mem0_proj1', operation='mem0_classify_and_add',
                 payload={'fact_text': 'no join key here', 'project_id': 'proj1'},
             )
-            await _poll_until_dead(
-                q, group_id='mem0_proj1', expected_dead=1, timeout=20.0
-            )
+            await poll_until_dead(q, group_id='mem0_proj1', expected_dead=1)
             await poll_until(lambda: len(events) >= 1, timeout=20.0, interval=0.05)
 
             assert len(events) == 1
@@ -2712,7 +2741,7 @@ class TestDeadLetterHook:
                 payload={'content': 'the write landed', '_write_op_id': 'W4'},
                 callback_type='dual_write_episode',
             )
-            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+            await poll_until_dead(q, group_id='proj1', expected_dead=1)
             await poll_until(lambda: len(events) >= 1, timeout=20.0, interval=0.05)
 
             assert len(events) == 1
@@ -2756,9 +2785,7 @@ class TestDeadLetterHook:
                     payload={'content': 'b', '_write_op_id': 'W6'},
                 )
                 # The worker keeps draining despite the hook raising on item 1.
-                await _poll_until_dead(
-                    q, group_id='proj1', expected_dead=2, timeout=20.0
-                )
+                await poll_until_dead(q, group_id='proj1', expected_dead=2)
                 await poll_until(
                     lambda: len(seen) >= 2, timeout=20.0, interval=0.05
                 )
@@ -2823,7 +2850,7 @@ class TestDeadByOperation:
                 group_id='proj_a', operation='add_memory_graphiti',
                 payload={'content': 'mem', 'group_id': 'proj_a'},
             )
-            await _poll_until_dead(q, expected_dead=3)
+            await poll_until_dead(q, expected_dead=3)
 
             stats = await q.get_stats()
 
@@ -2869,7 +2896,7 @@ class TestDeadByOperation:
                 group_id='proj_a', operation='add_memory_graphiti',
                 payload={'content': 'bad', 'group_id': 'proj_a', 'fail': True},
             )
-            await _poll_until_dead(q, expected_dead=1)
+            await poll_until_dead(q, expected_dead=1)
 
             stats = await q.get_stats()
 
@@ -2924,7 +2951,7 @@ class TestDeadByOperation:
                     group_id='proj_b', operation='add_memory_graphiti',
                     payload={'content': f'b{i}', 'group_id': 'proj_b'},
                 )
-            await _poll_until_dead(q, expected_dead=3)
+            await poll_until_dead(q, expected_dead=3)
 
             stats_a = await q.get_stats(group_id='proj_a')
             stats_b = await q.get_stats(group_id='proj_b')
@@ -2968,7 +2995,7 @@ class TestDeadByOperation:
                 group_id='mem0_proj_a', operation='mem0_classify_and_add',
                 payload={'fact_text': 'a derived fact', 'project_id': 'proj_a'},
             )
-            await _poll_until_dead(q, expected_dead=2)
+            await poll_until_dead(q, expected_dead=2)
 
             scoped = await q.get_stats(group_id='proj_a')
             mem0_scoped = await q.get_stats(group_id='mem0_proj_a')
@@ -2992,3 +3019,92 @@ class TestDeadByOperation:
                 )
         finally:
             await q.close()
+
+
+class TestEarliestExecutingStart:
+    """earliest_executing_start: when the oldest write still inside execute_write began."""
+
+    @staticmethod
+    async def _enqueue(queue: DurableWriteQueue, name: str) -> None:
+        await queue.enqueue(
+            group_id='proj1', operation='add_episode',
+            payload={'content': name, 'group_id': 'proj1', 'name': name},
+        )
+
+    @staticmethod
+    async def _wait_entered(held: HeldWrites, name: str) -> None:
+        await poll_until(
+            lambda: name in held.entered_at,
+            message=f'write {name} never entered execute_write',
+        )
+
+    @staticmethod
+    async def _wait_completed(queue: DurableWriteQueue, count: int) -> None:
+        async def _completed():
+            stats = await queue.get_stats()
+            return stats['counts'].get('completed', 0) >= count
+
+        await poll_until(_completed, message=f'fewer than {count} writes completed')
+
+    @pytest.mark.asyncio
+    async def test_idle_queue_reports_none(self, queue):
+        assert queue.earliest_executing_start('proj1') is None
+
+    @pytest.mark.asyncio
+    async def test_executing_write_reports_its_start_for_its_own_group_only(
+        self, queue, mock_execute,
+    ):
+        held = HeldWrites()
+        mock_execute.side_effect = held.execute
+        before = datetime.now(UTC)
+        try:
+            await self._enqueue(queue, 'A')
+            await self._wait_entered(held, 'A')
+
+            start = queue.earliest_executing_start('proj1')
+            assert start is not None
+            assert before <= start <= held.entered_at['A']
+            assert queue.earliest_executing_start('proj2') is None
+        finally:
+            held.release_all()
+
+    @pytest.mark.asyncio
+    async def test_reports_the_oldest_write_still_executing(self, queue, mock_execute):
+        held = HeldWrites()
+        mock_execute.side_effect = held.execute
+        try:
+            await self._enqueue(queue, 'A')
+            await self._wait_entered(held, 'A')
+            first = queue.earliest_executing_start('proj1')
+            assert first is not None
+
+            await self._enqueue(queue, 'B')
+            await self._wait_entered(held, 'B')
+            assert queue.earliest_executing_start('proj1') == first
+
+            held.release('A')
+            await self._wait_completed(queue, 1)
+            after_a = queue.earliest_executing_start('proj1')
+            assert after_a is not None
+            assert first < after_a <= held.entered_at['B']
+
+            held.release('B')
+            await self._wait_completed(queue, 2)
+            assert queue.earliest_executing_start('proj1') is None
+        finally:
+            held.release_all()
+
+    @pytest.mark.asyncio
+    async def test_failed_write_leaves_nothing_executing(self, queue, mock_execute):
+        held = HeldWrites(fail_on_release=True)
+        mock_execute.side_effect = held.execute
+        try:
+            await self._enqueue(queue, 'A')
+            await self._wait_entered(held, 'A')
+            assert queue.earliest_executing_start('proj1') is not None
+
+            held.release('A')
+            await poll_until_dead(queue, expected_dead=1)
+            assert queue.earliest_executing_start('proj1') is None
+        finally:
+            held.release_all()

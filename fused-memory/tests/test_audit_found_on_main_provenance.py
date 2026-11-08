@@ -13,9 +13,13 @@ import types
 from pathlib import Path
 
 import pytest
-from _fm_helpers import load_script_module
+from _fm_helpers import (
+    load_script_module,
+    make_populated_task_store,
+    make_zero_byte_task_store,
+)
 
-from fused_memory.utils.target_store_preflight import TargetStoreMissing
+from fused_memory.utils.target_store_preflight import TargetStoreUnpopulated
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'audit_found_on_main_provenance.py'
 
@@ -2103,7 +2107,7 @@ class TestRunTargetStorePreflight:
     async def test_refuses_a_missing_task_store(self, tmp_path, monkeypatch, apply):
         factory = self._patch(monkeypatch)
 
-        with pytest.raises(TargetStoreMissing):
+        with pytest.raises(TargetStoreUnpopulated):
             await _mod._run(_run_args(tmp_path, apply=apply))
 
         assert factory.constructions == []
@@ -2111,10 +2115,23 @@ class TestRunTargetStorePreflight:
     async def test_refusal_leaves_the_db_absent(self, tmp_path, monkeypatch):
         self._patch(monkeypatch)
 
-        with pytest.raises(TargetStoreMissing):
+        with pytest.raises(TargetStoreUnpopulated):
             await _mod._run(_run_args(tmp_path))
 
         assert not (tmp_path / '.taskmaster').exists()
+
+    async def test_refuses_a_zero_byte_task_store(self, tmp_path, monkeypatch):
+        """A zero-byte tasks.db is refused before any backend is built (task 5468).
+
+        The predicate is pinned in test_target_store_preflight.py::TestTaskStoreArm.
+        """
+        make_zero_byte_task_store(tmp_path)
+        factory = self._patch(monkeypatch)
+
+        with pytest.raises(TargetStoreUnpopulated):
+            await _mod._run(_run_args(tmp_path))
+
+        assert factory.constructions == []
 
     @pytest.mark.parametrize('fail_on_findings', [False, True])
     async def test_refusal_is_not_one_of_the_fail_on_findings_exit_codes(
@@ -2123,21 +2140,21 @@ class TestRunTargetStorePreflight:
         """A refusal is an exception, never 0 / 1 / 2.
 
         ``--fail-on-findings`` exists so a clean exit only ever means "nothing
-        flagged", and ``scripts/check_found_on_main_spurious_rate.py`` wraps
-        this script as a CI predicate reading that ladder. The guard must not
-        be confusable with "clean report" (0) or "findings present" (2).
+        flagged". ``scripts/check_found_on_main_spurious_rate.py`` reuses this
+        module's ``build_audit_report`` but not its exit-code ladder, and maps
+        its own store refusal onto a reserved exit 3. The guard must not be
+        confusable with "clean report" (0) or "findings present" (2) on THIS
+        script's ladder.
         """
         self._patch(monkeypatch)
 
-        with pytest.raises(TargetStoreMissing):
+        with pytest.raises(TargetStoreUnpopulated):
             await _mod._run(
                 _run_args(tmp_path, fail_on_findings=fail_on_findings),
             )
 
-    async def test_proceeds_when_the_db_exists(self, tmp_path, monkeypatch):
-        db = tmp_path / '.taskmaster' / 'tasks' / 'tasks.db'
-        db.parent.mkdir(parents=True)
-        db.touch()
+    async def test_proceeds_when_the_db_holds_tasks(self, tmp_path, monkeypatch):
+        make_populated_task_store(tmp_path)
         factory = self._patch(monkeypatch)
 
         exit_code = await _mod._run(_run_args(tmp_path))

@@ -31,6 +31,7 @@ from fused_memory.maintenance.cross_graph_move import (
     CreateResult,
     SubgraphEdgeResult,
 )
+from fused_memory.utils.store_mutation_preflight import StoreMutationUnavailable
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'migrate_cross_graph_leak.py'
 
@@ -2246,7 +2247,7 @@ class TestRunApplyStoreMutationPreflight:
         manifest_path = self._manifest_path(tmp_path)
 
         with pytest.raises(
-            _mod.StoreMutationUnavailable, match=SENTINEL
+            StoreMutationUnavailable, match=SENTINEL
         ):
             await _mod.run(
                 _args(apply=True, manifest=str(manifest_path)), memory_service,
@@ -2271,7 +2272,7 @@ class TestRunApplyStoreMutationPreflight:
         load_mock = MagicMock(side_effect=AssertionError('manifest was loaded'))
         monkeypatch.setattr(_mod, 'load_reviewed_manifest', load_mock)
 
-        with pytest.raises(_mod.StoreMutationUnavailable):
+        with pytest.raises(StoreMutationUnavailable):
             await _mod.run(
                 _args(apply=True, manifest=str(manifest_path)), memory_service,
             )
@@ -2330,7 +2331,6 @@ class TestRunApplyStoreMutationPreflight:
     ):
         """Happy path: a writable environment migrates exactly as before,
         driving all three dispositions through their phases."""
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
         mocks, memory_service, _ = self._scenario(monkeypatch)
         manifest_path = self._manifest_path(tmp_path)
 
@@ -2387,13 +2387,14 @@ class TestRunApplyStoreMutationPreflight:
 
         with (
             caplog.at_level(logging.ERROR),
-            pytest.raises(_mod.StoreMutationUnavailable),
+            pytest.raises(StoreMutationUnavailable),
         ):
             await _mod.run(
                 _args(apply=True, manifest=str(manifest_path)), memory_service,
             )
 
-        assert fail_closed_records(caplog, 'migrate_cross_graph_leak'), (
+        (record,) = fail_closed_records(caplog, 'migrate_cross_graph_leak')
+        assert SENTINEL in record.getMessage(), (
             'nothing else explains this traceback -- the guard site must log '
             'the fail-closed diagnosis before raising; got: '
             f'{[rec.getMessage() for rec in caplog.records]}'

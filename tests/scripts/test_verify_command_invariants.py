@@ -434,6 +434,31 @@ def test_positional_targets_needs_no_entry_for_the_equals_spelling() -> None:
     assert vci.positional_targets(segment, _PYTEST) == ["tests/scripts/"]
 
 
+def test_pytest_value_flags_drop_the_separate_value_of_every_flag_either_guard_needed() -> None:
+    """One exported set covers what both former private copies listed.
+
+    Task 6172. ``test_skills_module_config_decision.py`` and
+    ``test_fallback_verify_config.py`` each kept their own set, and the second
+    lacked ``--junitxml``, ``--color`` and ``--log-level``, so it read those
+    flags' values as suites. This command carries flags from both copies,
+    including the three only the first had.
+    """
+    segment = (
+        "uv run --project shared pytest tests/scripts/ -k expr --junitxml out.xml "
+        "--color yes --log-level INFO -n 4 --dist loadgroup --timeout 300"
+    )
+    targets = vci.positional_targets(segment, _PYTEST, value_flags=vci.PYTEST_VALUE_FLAGS)
+    assert targets == ["tests/scripts/"]
+
+
+def test_pytest_value_flags_holds_no_boolean_flag() -> None:
+    """The dangerous direction: a listed boolean flag swallows a real target."""
+    booleans = {"-q", "-v", "-x", "-s", "-l", "--lf", "--ff", "--sw"}
+    assert booleans.isdisjoint(vci.PYTEST_VALUE_FLAGS), sorted(
+        booleans & vci.PYTEST_VALUE_FLAGS
+    )
+
+
 def test_positional_targets_threads_path_anchor_to_the_anchor_split() -> None:
     """The fifth caller reaches ``anchor_split``'s new parameter through here.
 
@@ -879,3 +904,74 @@ def test_marked_span_fails_loudly_and_names_the_artifact(doc: str, case: str) ->
     assert _SPAN_KWARGS["begin"] in message, case
     assert _SPAN_KWARGS["source"] in message, case
     assert _SPAN_KWARGS["task"] in message, case
+
+
+# ---------------------------------------------------------------------------
+# marked_body
+# ---------------------------------------------------------------------------
+
+_BODY_KWARGS = {
+    "slug": "demo-policy",
+    "source": "CONTRIBUTING.md",
+    "label": "the demo policy prose",
+    "task": "5769",
+}
+
+_MARKED_BODY_DOC = """\
+Decoy prose above the span names demo-policy too.
+
+<!-- demo-policy-extra:begin -->decoy<!-- demo-policy-extra:end -->
+
+<!-- demo-policy:begin the opener carries its own prose, cites
+`file.py:NNN` in inline code, and spans two lines -->
+The demo policy prose.
+<!-- note -->
+<!-- demo-policy:end -->
+
+Trailing prose.
+"""
+
+
+def test_marked_body_returns_the_text_after_the_opening_comment_verbatim() -> None:
+    """The body starts where the opener comment closes and ends at the end marker.
+
+    The decoy span's longer slug must not match, the opener's own prose is not
+    body, and neither the nested comment nor the surrounding newlines are
+    stripped: comment and whitespace policy belong to the caller.
+    """
+    assert (
+        vci.marked_body(_MARKED_BODY_DOC, **_BODY_KWARGS)
+        == "\nThe demo policy prose.\n<!-- note -->\n"
+    )
+
+
+@pytest.mark.parametrize(
+    ("doc", "case"),
+    [
+        ("The demo policy prose, unmarked.\n", "no marker at all"),
+        (
+            "<!-- demo-policy:begin -->\nalpha\n<!-- demo-policy:end -->\n"
+            "<!-- demo-policy:begin -->\nbeta\n<!-- demo-policy:end -->\n",
+            "duplicated span",
+        ),
+        ("<!-- demo-policy:begin -->\nalpha\n", "unterminated span"),
+        (
+            "<!-- demo-policy:end -->\nalpha\n<!-- demo-policy:begin -->\n",
+            "inverted markers",
+        ),
+        (
+            "<!-- demo-policy:begin the opener never closes\nalpha\n"
+            "<!-- demo-policy:end -->\n",
+            "unterminated opener",
+        ),
+        ("<!-- demo-policy:begin -->\n  \n<!-- demo-policy:end -->\n", "blank body"),
+    ],
+)
+def test_marked_body_fails_loudly_and_names_the_artifact(doc: str, case: str) -> None:
+    with pytest.raises(AssertionError) as excinfo:
+        vci.marked_body(doc, **_BODY_KWARGS)
+
+    message = str(excinfo.value)
+    assert "<!-- demo-policy:begin" in message, case
+    assert "CONTRIBUTING.md" in message, case
+    assert "5769" in message, case

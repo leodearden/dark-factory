@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from fused_memory.middleware.task_curator import CandidateTask
+from fused_memory.middleware.curator_types import CandidateTask
 
 # ──────────────────────────────────────────────────────────────────────────────
 # step-1 RED: TestLoadOperationalRegistry
@@ -719,7 +719,7 @@ class TestSeedOperationalAskRegistry:
         candidate = CandidateTask(
             title="Fix null pointer in task_curator batch dedup when candidates list is empty",
             description=(
-                "Add a guard so curate_batch_prepared does not crash on an empty "
+                "Add a guard so curate_prepared does not crash on an empty "
                 "candidates list; add a regression test."
             ),
         )

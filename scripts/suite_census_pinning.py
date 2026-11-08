@@ -1,9 +1,9 @@
 """Part 2 of the suite census for Python trees (task 5414): how test files pin implementation detail.
 
-Whole-tree and report-only: every tracked ``.py`` file under a ``tests``
-directory, grouped by package (its first path segment), measured with the
-merge-lane ratchet's own measures wherever one exists. The output is a count
-per package, never a ranking.
+Whole-tree and report-only: every tracked ``.py`` test file of the workspace
+domain (``source_measures.workspace_domain``), grouped by its member, measured
+with the merge-lane ratchet's own measures wherever one exists. The output is a
+count per package, never a ranking.
 """
 from __future__ import annotations
 
@@ -11,26 +11,30 @@ import ast
 import copy
 import hashlib
 from collections import defaultdict
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 
-from merge_lane_metrics import (
+from source_measures import (
+    PSEUDO_MEMBERS,
+    DomainFile,
+    DomainMember,
+    FileKind,
+    MemberRoots,
     MetricsError,
     PatchCall,
     file_size_measures_in_tree,
     patch_calls_in_tree,
     private_reads_in_tree,
-    src_module_name,
-    tracked_files,
+    unique_import_paths,
+    workspace_domain,
 )
 
 _PROSE_MIN_WORDS = 6
 _QUOTE_MIN_CHARS = 3
 _PROSE_COMPARE_OPS = (ast.In, ast.NotIn, ast.Eq, ast.NotEq)
 _UNREADABLE = (SyntaxError, ValueError, MetricsError, OSError)
-_SCRIPT_DIRS = ('scripts', 'scripts/legibility')
 _TOTAL = 'total'
 
 _ADDITIVE = (
@@ -71,31 +75,45 @@ class PythonPinningCensus:
 # ---------------------------------------------------------------------------
 # What is first-party, and where its modules live.
 
+def _importable(dotted: str) -> bool:
+    return all(segment.isidentifier() for segment in dotted.split('.'))
+
+
+def _importable_names(file: DomainFile) -> tuple[str, ...]:
+    return tuple(filter(_importable, file.import_names))
+
+
 @dataclass(frozen=True)
 class _FirstParty:
     roots: frozenset[str]
     modules: MappingProxyType[str, str]
+    primary_names: MappingProxyType[str, str]
 
     @classmethod
-    def of(cls, tracked: Sequence[str]) -> _FirstParty:
-        modules: dict[str, str] = {}
-        for path in tracked:
-            name = src_module_name(path)
-            if name is not None:
-                modules[name.removesuffix('.__init__')] = path
-            elif path.rpartition('/')[0] in _SCRIPT_DIRS:
-                modules[path.rpartition('/')[2].removesuffix('.py')] = path
-        roots = {
-            name.split('.', 1)[0] for name, path in modules.items()
-            if path.endswith('/__init__.py') and '.' not in name
+    def of(cls, domain: Sequence[DomainMember]) -> _FirstParty:
+        modules = unique_import_paths(domain, _importable_names)
+        primary_names = {
+            file.path: names[0]
+            for member in domain for file in member.files
+            if (names := _importable_names(file))
         }
-        roots.update(
-            name for name, path in modules.items() if path.rpartition('/')[0] in _SCRIPT_DIRS
+        return cls(
+            roots=frozenset(name.split('.', 1)[0] for name in modules),
+            modules=MappingProxyType(modules),
+            primary_names=MappingProxyType(primary_names),
         )
-        return cls(roots=frozenset(roots), modules=MappingProxyType(modules))
 
     def owns(self, dotted: str) -> bool:
         return dotted.split('.', 1)[0] in self.roots
+
+    def canonical(self, dotted: str) -> str:
+        """*dotted* respelled through the primary name of its longest first-party module prefix."""
+        segments = dotted.split('.')
+        for end in range(len(segments), 0, -1):
+            path = self.modules.get('.'.join(segments[:end]))
+            if path is not None:
+                return '.'.join((self.primary_names[path], *segments[end:]))
+        return dotted
 
 
 class _ProseIndex:
@@ -188,11 +206,11 @@ class _PatchJudge:
 
     def target(self, call: PatchCall) -> str | None:
         if call.target is not None:
-            return call.target
+            return self.first_party.canonical(call.target)
         if isinstance(call.receiver, ast.Name):
             module = self.bindings.get(call.receiver.id)
             if module in self.first_party.modules:
-                return f'{module}.{call.attribute}'
+                return self.first_party.canonical(f'{module}.{call.attribute}')
         return None
 
     def _is_private(self, call: PatchCall) -> bool:
@@ -401,21 +419,24 @@ def _totals(rows: Sequence[PackageRow]) -> PackageRow:
     )
 
 
-def _in_test_tree(path: str) -> bool:
-    return 'tests' in path.split('/')[:-1]
+def _member_test_files(domain: Iterable[DomainMember]) -> Iterator[tuple[str, str]]:
+    """(member name, path) of every tests-kind file in *domain*."""
+    return (
+        (member.name, file.path)
+        for member in domain for file in member.files
+        if file.kind is FileKind.TESTS
+    )
 
 
 def measure_python_tree(tree_root: Path) -> PythonPinningCensus:
-    tracked = tracked_files(tree_root, '*.py')
-    first_party = _FirstParty.of(tracked)
+    domain = workspace_domain(tree_root)
+    first_party = _FirstParty.of(domain)
     prose = _ProseIndex(tree_root, first_party)
     by_package: defaultdict[str, list[_FileMeasures]] = defaultdict(list)
     unreadable: set[str] = set()
-    for path in filter(_in_test_tree, tracked):
+    for package, path in _member_test_files(domain):
         try:
-            by_package[path.split('/', 1)[0]].append(
-                _measure_file(tree_root, path, first_party, prose)
-            )
+            by_package[package].append(_measure_file(tree_root, path, first_party, prose))
         except _UNREADABLE:
             unreadable.add(path)
     unreadable |= prose.unreadable
@@ -429,10 +450,27 @@ def measure_python_tree(tree_root: Path) -> PythonPinningCensus:
 # ---------------------------------------------------------------------------
 # Rendering.
 
-_DEFINITIONS = """\
-Every tracked `.py` file with a `tests` directory in its path is a test file;
-its package is its first path segment. Rows are in package-name order and are
-not ranked.
+_DECLARED_TESTS_ROOT = MemberRoots.declared('<member>').tests_root
+_SINGLE_PACKAGE_TESTS_ROOT = MemberRoots.single_package('<name>').tests_root
+_PSEUDO_MEMBERS_TEXT = ', '.join(f'`{m.name}` (`{m.tests_root}/`)' for m in PSEUDO_MEMBERS)
+_EXTRA_IMPORT_ROOTS_TEXT = ' and '.join(
+    f'`{root}/`' for m in PSEUDO_MEMBERS for root in m.extra_import_roots
+)
+
+_DEFINITIONS = f"""\
+A test file is a tracked `.py` file under a workspace member's tests root, as
+`source_measures.workspace_domain` classifies it: each member listed in the root
+pyproject.toml's `[tool.uv.workspace].members` (`{_DECLARED_TESTS_ROOT}/`), plus the
+pseudo-members {_PSEUDO_MEMBERS_TEXT}. A tree with no workspace table is one
+package named by its `[project].name`, whose tests root is
+`{_SINGLE_PACKAGE_TESTS_ROOT}/`, followed only by the `scripts` pseudo-member. Its
+package is its member. First-party
+names are the import names of the domain's source files whose every dotted
+segment is an identifier, so `scripts/` is an import root and
+`scripts/legibility/x.py` is `legibility.x`. {_EXTRA_IMPORT_ROOTS_TEXT} are
+import roots too, as `scripts/tests/conftest.py` puts them on `sys.path`, so
+that file is also `x`. A name two files share is refused.
+Rows are in package-name order and are not ranked.
 
 - **test fns**: module-level `test*` functions and `test*` methods of `Test*`
   classes (nested `Test*` classes included), in `test_*.py` / `*_test.py` files.
@@ -449,7 +487,9 @@ not ranked.
 - **patch sites outside tests**: the same calls in fixtures, helpers and module
   scope, counted here rather than attributed to the tests that use them.
 - **distinct targets**: string targets plus object-form targets whose receiver
-  is a first-party module import.
+  is a first-party module import, each spelled through its file's first name
+  (`legibility.x`, or the bare `x` where the dotted name is not importable), so a
+  module reached by both names counts each attribute once.
 - **prose asserts**: `assert` statements comparing (`in`, `not in`, `==`, `!=`)
   a string of 3+ characters that occurs inside a module-level string constant
   of 6+ words in a first-party module the file imports. These are candidates

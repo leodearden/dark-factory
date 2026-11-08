@@ -6,24 +6,21 @@ observable.  Every permissive ``AsyncMock`` in the suite accepts any ``uuid=``,
 which is exactly why nothing about that contract was ever testable.
 
 It lives here rather than in ``_fm_helpers`` — the suite-wide miscellany most
-test modules import — so that the double stays shared between its two
-consumers (``test_add_episode_uuid_identity.py`` and
-``test_graphiti_add_episode_uuid_param.py``) without either enlarging a
-grab-bag module or being duplicated.  The ``tests/_*.py`` name follows the
-established helper convention (``_fm_helpers``, ``_git_root_helper``,
-``_mock_openai_server``): a module name unique per subproject, so a
-``from _graphiti_fake import X`` cannot collide with a sibling subproject's
-helpers when root-level pytest loads several of them in one process.
+test modules import — so that the double is shared without either enlarging a
+grab-bag module or being duplicated.  ``conftest.py``'s
+``make_backend_over_fake_graphiti`` wires it into a real ``GraphitiBackend``;
+modules that subclass it or wire it onto a live driver import the class
+directly.  The ``tests/_*.py`` name follows the established helper convention
+(``_fm_helpers``, ``_git_root_helper``, ``_mock_openai_server``): a module name
+unique per subproject, so a ``from _graphiti_fake import X`` cannot collide
+with a sibling subproject's helpers when root-level pytest loads several of
+them in one process.
 """
 
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
 
-from _fm_helpers import install_identity_mocks
 from graphiti_core.errors import NodeNotFoundError
-
-from fused_memory.backends.graphiti_client import GraphitiBackend
 
 
 class FakeGraphitiClient:
@@ -145,28 +142,3 @@ class FakeGraphitiClient:
             community_edges=[],
         )
 
-
-def backend_with_fake_graphiti(mock_config) -> tuple[GraphitiBackend, FakeGraphitiClient]:
-    """A REAL GraphitiBackend whose graphiti_core client is the stateful fake.
-
-    Mirrors the ``b._client_for = MagicMock(return_value=mock_client)`` idiom in
-    test_temporal_context.py:35-46 — the real backend is kept in the path so the
-    production ``uuid=`` forwarding, group canonicalisation and write timeout are
-    all exercised; only the graphiti_core client is replaced.
-    """
-    backend = GraphitiBackend(mock_config)
-    fake = FakeGraphitiClient()
-    backend.client = fake  # type: ignore[assignment]
-    backend._client_for = MagicMock(return_value=fake)  # type: ignore[method-assign]
-    # GraphitiBackend.search resolves a per-group driver CLONE off the real
-    # FalkorDB driver before delegating to the client, and there is no real
-    # driver here. The clone is only ever forwarded to client.search(driver=...),
-    # which the fake ignores — so stubbing it keeps the real backend (its
-    # @_canonicalize_group_args entry, group_ids plumbing and read timeout) in
-    # the path while making the read seam reachable without a live graph.
-    backend._driver_for = MagicMock(return_value=None)  # type: ignore[method-assign]
-    # Real _identity_lock_for already works on a real backend; this additionally
-    # no-ops _resolve_or_create_entity so the post-write reconcile sweeps cannot
-    # reach a (nonexistent) FalkorDB driver.
-    install_identity_mocks(backend)  # type: ignore[arg-type]
-    return backend, fake

@@ -47,11 +47,14 @@ import pytest
 # own docstring's instruction, and it resolves by the conftest.py sys.path
 # insertion this directory relies on under --import-mode=importlib.
 import verify_command_invariants as vci
+from orchestrator.config import ModuleConfig
+
+from orchestrator import verify_cmd
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from orchestrator.config import ModuleConfig
+    from orchestrator.config import OrchestratorConfig
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 
@@ -199,13 +202,12 @@ def test_parallel_member_addopts_declare_xdist_with_loadgroup(member: str) -> No
 def test_parallel_member_addopts_do_not_copy_max_worker_restart(member: str) -> None:
     """No parallelised member copies ``--max-worker-restart`` across.
 
-    The flag is required exactly where ``timeout_method = "thread"`` is set —
-    orchestrator and fused-memory — and that invariant, with its
-    executable reproduction, lives in ``test_xdist_worker_restart_policy.py``.
-    Copying it here would look like completing the family, but these members
-    run ``timeout_method = "signal"``: a timeout raises inside the test and the
-    worker survives, so the case the flag exists for does not arise from their
-    cap, and task 5408 declined to widen it to them without a measured need.
+    orchestrator and fused-memory run ``timeout_method = "signal"`` and keep the
+    flag, for the reason recorded at
+    ``test_xdist_worker_restart_policy.py::RESTART_DISABLED_CONFIGS``, which
+    pins it beside its executable reproduction. Copying it here would look like
+    completing the family, but these members have not been given it: task 5408
+    found no measured need, and declined to widen it without one.
     """
     offenders = [
         token
@@ -214,12 +216,11 @@ def test_parallel_member_addopts_do_not_copy_max_worker_restart(member: str) -> 
     ]
     assert not offenders, (
         f"{member}/pyproject.toml's addopts declares {offenders!r} (task 5408). "
-        'That flag is required only where timeout_method = "thread" is set '
-        '(orchestrator, fused-memory — see '
-        'test_xdist_worker_restart_policy.py). This member runs '
-        'timeout_method = "signal", where a timeout raises inside the test and '
-        'the worker survives, so the case the flag exists for does not arise '
-        'from its cap. Do not widen it here without a measured need'
+        'orchestrator and fused-memory run timeout_method = "signal" and keep '
+        'that flag, for the reason recorded at '
+        'test_xdist_worker_restart_policy.py::RESTART_DISABLED_CONFIGS. This '
+        'member has not been given it, because no measured need was found. Do '
+        'not widen it here without one'
     )
 
 
@@ -264,7 +265,8 @@ def test_cockpit_addopts_keeps_its_smoke_deselection() -> None:
 
 
 # ---------------------------------------------------------------------------
-# The internal-sense invariant: `-n` requires a DECLARED plugin (task 5408)
+# The internal-sense invariant: `-n` requires a DECLARED plugin (task 5408),
+# counting the `-n` verify injects as well as the declared one (task 5486)
 # ---------------------------------------------------------------------------
 
 # The distribution that supplies `-n`, PEP 503-normalised for comparison.
@@ -341,31 +343,63 @@ def _selected_member(pre_anchor_tokens: list[str]) -> str | None:
     return None
 
 
+def _verify_would_inject_workers(test_command: str, injected_workers: str) -> bool:
+    """Whether verify would append ``-n <injected_workers>`` to any pytest it runs for *test_command*.
+
+    Asks the production code rather than copying it, at the width verify itself
+    works at. Verify hands ``verify_cmd.apply_pytest_numprocesses`` either the
+    WHOLE ``test_command`` or, on a path that segments the test leg, each clause
+    ``verify_cmd.split_and_chain_segments`` yields — which refuses every single
+    command, so the two coincide for every module config committed today. Both
+    candidates are tried, so neither verify path can inject where this says it
+    would not: for ``A && B -p no:xdist`` the whole chain is refused while its
+    clause ``A`` is not.
+
+    The transform's identity no-op contract is then the single home of every
+    rule for when it refuses (``''``/``'auto'``, ``-p no:xdist``, a non-pytest
+    tool, an unspliceable chain), so none of them is restated here.
+    """
+    chain = verify_cmd.split_and_chain_segments(test_command) or []
+    for candidate in [test_command, *(segment.command for segment in chain)]:
+        parsed = verify_cmd.parse_config_command(candidate)
+        if verify_cmd.apply_pytest_numprocesses(parsed, injected_workers) is not parsed:
+            return True
+    return False
+
+
 def _pytest_legs_carrying_workers(
     module_configs: dict[str, ModuleConfig],
+    injected_workers: str,
 ) -> list[tuple[str, str, str]]:
     """``(module prefix, selected member, where -n came from)`` for every parallel leg.
 
     DERIVED STRUCTURALLY from the production config walk, never from a
-    hardcoded list: a tenth module config that declares ``-n`` must be caught by
+    hardcoded list: a tenth module config that runs ``-n`` must be caught by
     this guard on the day it lands, not on the day someone remembers to extend a
     table here.
 
-    ``-n`` can reach pytest from either of two places, and both count because
+    ``-n`` can reach pytest from any of THREE places, and all count because
     pytest cannot tell them apart:
 
       * the command's own POST-anchor argv (how the ``scripts`` and
         ``tests/scripts`` legs get it, their targets being repo-root paths under
         no member's pyproject.toml);
       * the SELECTED member's own addopts (how the ``--directory <m>`` legs get
-        it).
+        it);
+      * verify's own injection of ``-n <injected_workers>`` (task 5486), which
+        reaches even a member whose addopts are serial — decided by
+        ``_verify_would_inject_workers``, which calls the production code
+        rather than restating it.
 
     Read no more strongly than it holds: the addopts consulted is the selected
     member's, which for a ``--directory <m>`` command is also the rootdir
     inifile pytest reads, but for a root-cwd ``--project <m>`` command is not.
-    In that second shape this can only ever require a declaration pytest would
-    not in fact have needed — over-requiring, never under-requiring — which is
-    the safe direction for a guard whose failure mode is a missing plugin.
+    Likewise the injection is counted whenever the transform WOULD inject,
+    without modelling the role gate (``shared.verify_admission.is_gated_role``)
+    or ``verify_admission_enabled``. In both shapes this can only ever require a
+    declaration pytest would not in fact have needed — over-requiring, never
+    under-requiring — which is the safe direction for a guard whose failure
+    mode is a missing plugin.
     """
     legs: list[tuple[str, str, str]] = []
     for prefix, module_config in sorted(module_configs.items()):
@@ -388,6 +422,12 @@ def _pytest_legs_carrying_workers(
             sources.append(f'{prefix}/orchestrator.yaml::test_command argv')
         if WORKERS_FLAG in shlex.split(_declared_addopts(member)):
             sources.append(f'{member}/pyproject.toml addopts')
+        if _verify_would_inject_workers(command, injected_workers):
+            sources.append(
+                f'verify_admission_pytest_n={injected_workers!r}, which verify '
+                f'appends as {WORKERS_FLAG} at the roles '
+                'shared.verify_admission.is_gated_role names'
+            )
         if sources:
             legs.append((prefix, member, ' and '.join(sources)))
     return legs
@@ -395,13 +435,19 @@ def _pytest_legs_carrying_workers(
 
 def test_every_pytest_leg_running_workers_declares_the_plugin(
     discover_module_configs: Callable[[], dict[str, ModuleConfig]],
+    root_config: OrchestratorConfig,
 ) -> None:
-    """A module config that runs ``-n`` must select a member that DECLARES pytest-xdist.
+    """Every pytest leg that will RUN ``-n``, declared or injected, selects a member declaring pytest-xdist.
 
     HEURISTIC 13 — a file has to make internal sense in isolation. A
     ``pyproject.toml`` whose addopts says ``-n auto`` while its dependency
     groups never mention the plugin that implements ``-n`` does not: read on its
-    own it describes a configuration that cannot run.
+    own it describes a configuration that cannot run. Nor does a member that
+    verify runs with ``-n <verify_admission_pytest_n>`` while declaring no
+    plugin — the measured instance (task 5486) was sampler, whose serial addopts
+    hid that its leg ran 8-way at the gated roles all the same. The knob is read
+    through ``root_config``, the production loader anchored at THIS worktree's
+    yaml, so the guard follows it when an operator moves it.
 
     AND IT IS NOT MERELY UNTIDY — MEASURED on the task-5408 tree. From a venv
     lacking the plugin, ``uv run --directory dashboard python -c "import
@@ -420,7 +466,9 @@ def test_every_pytest_leg_running_workers_declares_the_plugin(
     module config happens to declare the command. For the ``scripts`` and
     ``tests/scripts`` legs those differ: both select ``shared``.
     """
-    legs = _pytest_legs_carrying_workers(discover_module_configs())
+    legs = _pytest_legs_carrying_workers(
+        discover_module_configs(), root_config.verify_admission_pytest_n
+    )
     assert legs, (
         f'no discovered module config runs pytest with {WORKERS_FLAG} at all, so '
         'this guard has nothing to check and would pass vacuously. At least '
@@ -439,7 +487,7 @@ def test_every_pytest_leg_running_workers_declares_the_plugin(
         'these pytest legs run with '
         f'{WORKERS_FLAG} while the member their uv selector names declares no '
         f'{XDIST_DISTRIBUTION} in its [dependency-groups] '
-        f'{DEFAULT_DEPENDENCY_GROUP} group (task 5408):\n'
+        f'{DEFAULT_DEPENDENCY_GROUP} group (tasks 5408, 5486):\n'
         + '\n'.join(
             f'  - module {prefix!r} selects member {member!r}; {WORKERS_FLAG} '
             f'comes from {source}'
@@ -456,6 +504,64 @@ def test_every_pytest_leg_running_workers_declares_the_plugin(
         f'{DEFAULT_DEPENDENCY_GROUP} specifically: it is the group uv installs '
         'by default, so a declaration parked anywhere else never reaches the '
         'interpreter that runs the leg'
+    )
+
+
+@pytest.mark.parametrize(
+    ('injected_workers', 'tail', 'expect_counted'),
+    [
+        pytest.param('8', '', True, id='numeral-injects'),
+        pytest.param('auto', '', False, id='auto-is-a-no-op'),
+        pytest.param('8', ' -p no:xdist', False, id='forced-serial-refuses'),
+        pytest.param(
+            '8', ' && uv run pytest scripts/ -p no:xdist', True,
+            id='segmented-clause-injects-past-a-serial-sibling',
+        ),
+    ],
+)
+def test_the_injected_worker_count_is_counted_exactly_when_verify_would_inject(
+    injected_workers: str, tail: str, expect_counted: bool
+) -> None:
+    """THE CONTROL that keeps the third ``-n`` source from silently narrowing back.
+
+    The probe leg selects a RULED serial member, whose addopts
+    ``test_ruled_serial_members_stay_serial`` pins free of ``-n``, and its own
+    argv carries none either — so the injection is the ONLY way it can count.
+    The first positive case proves the helper sees the injection at all; the
+    two negative cases prove it defers to the production transform's refusals
+    rather than counting every knob value, the same shape as this file's
+    pyright ``--stats`` negative control. The chain case proves it also asks at
+    verify's SEGMENTED width: the transform refuses that whole chain, yet
+    verify, segmenting it, appends ``-n`` to the probe's own clause.
+    """
+    member = sorted(RULED_SERIAL_MEMBERS)[0]
+    probe = {
+        'probe': ModuleConfig(
+            prefix='probe',
+            test_command=f'uv run --directory {member} pytest tests/{tail}',
+        ),
+    }
+
+    legs = _pytest_legs_carrying_workers(probe, injected_workers)
+
+    if not expect_counted:
+        assert legs == [], (
+            f'with verify_admission_pytest_n={injected_workers!r} and '
+            f'{probe["probe"].test_command!r}, verify_cmd.apply_pytest_numprocesses '
+            f'appends no {WORKERS_FLAG}, yet the guard counted {legs!r}'
+        )
+        return
+    assert len(legs) == 1, (
+        f'with verify_admission_pytest_n={injected_workers!r}, verify appends '
+        f'{WORKERS_FLAG} {injected_workers} to {probe["probe"].test_command!r}, '
+        f'yet the guard counted {legs!r} — it no longer sees the injected '
+        f'{WORKERS_FLAG} (task 5486)'
+    )
+    prefix, selected, source = legs[0]
+    assert (prefix, selected) == ('probe', member)
+    assert 'verify_admission_pytest_n' in source, (
+        f'the probe leg counted, but from {source!r}: the injection must be '
+        'the only source here, so the attribution is wrong'
     )
 
 
@@ -523,7 +629,9 @@ RULED_SERIAL_MEMBERS = {
         'Workers on a test leg that short buy nothing measurable, so task 5408 '
         "spent this module's budget on `pyright --threads 8` instead. NOT an "
         'oversight: sampler is the one module 5408 touched for its TYPE leg '
-        'and deliberately left alone on its test leg'
+        'and deliberately left alone on its test leg. Task 5486 still declared '
+        'pytest-xdist for sampler, because verify injects -n at the gated '
+        "roles, WITHOUT touching sampler's own addopts"
     ),
 }
 
@@ -730,11 +838,12 @@ PYRIGHT_PROBE_GROUP = 'pyright_threads_probe'
 # so a wedged pyright surfaces as a TimeoutExpired carrying its captured output
 # rather than as pytest's axe carrying nothing.
 #
-# Those markers are 120s, which TIGHTENS rather than raises: the scripts verify
-# leg passes --timeout=300 on the command line, and a probe that checks ONE
-# trivially clean file has no business taking two minutes even behind a uv
-# resolve and a node startup on a loaded 32-core host. Failing at 2 minutes with
-# pyright's own captured output beats consuming the full 300s to say nothing.
+# This bound, not the marker, is what fails a wedged pyright fast: a probe that
+# checks ONE trivially clean file has no business taking 100s even behind a uv
+# resolve and a node startup on a loaded host. The markers sit at verify's own
+# --timeout=300, because a marker between 60 and that budget would clamp the
+# merge-gating leg rather than loosen it; why is in
+# shared/src/shared/testing_timeout_markers.py.
 PROBE_SUBPROCESS_TIMEOUT_SECS = 100
 
 _PROBE_SRC = 'def f(x: int) -> int:\n    return x + 1\n'
@@ -835,7 +944,7 @@ def test_pyright_long_pole_modules_pass_threads_eight(
 
 
 @pytest.mark.xdist_group(PYRIGHT_PROBE_GROUP)
-@pytest.mark.timeout(120)
+@pytest.mark.timeout(300)
 def test_the_configured_pyright_actually_accepts_threads_eight(
     tmp_path: pathlib.Path,
     discover_module_configs: Callable[[], dict[str, ModuleConfig]],
@@ -873,7 +982,7 @@ def test_the_configured_pyright_actually_accepts_threads_eight(
 
 
 @pytest.mark.xdist_group(PYRIGHT_PROBE_GROUP)
-@pytest.mark.timeout(120)
+@pytest.mark.timeout(300)
 def test_pyright_refuses_threads_together_with_stats(
     tmp_path: pathlib.Path,
     discover_module_configs: Callable[[], dict[str, ModuleConfig]],

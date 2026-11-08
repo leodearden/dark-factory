@@ -28,7 +28,6 @@ from pathlib import Path
 from typing import Any, TypeVar
 
 from audit_model_admission import (
-    DEFAULT_RUNS_DB,
     MERGER_ROLE,
     InvocationRecord,
     RoleContainment,
@@ -38,6 +37,7 @@ from audit_model_admission import (
     ServiceRestart,
     SpendInWindow,
     connect_ro,
+    default_runs_db,
     iso,
     load_events,
     markdown_table,
@@ -49,21 +49,21 @@ from audit_model_admission import (
     spend_in_window,
 )
 from escalation_ladder import (
-    DEFAULT_ESCALATIONS_DIR,
     STEWARD_ROLE,
     EscalationCorpus,
     L2TierMetrics,
     StewardDisposition,
     StewardDispositionSummary,
+    default_escalations_dir,
     l2_tier_metrics,
     load_escalation_corpus,
     summarize_steward_dispositions,
 )
+from shared.cli_invoke import BUDGET_EXHAUSTED_SUBTYPE
 
-# The CLI's result subtypes for a run killed at its dispatch caps. The _usd
-# spelling is orchestrator/src/orchestrator/routing.py::PROBE_BUDGET_EXHAUSTED_SUBTYPE.
+# The CLI's result subtype for a run killed at its turn cap; the budget one is
+# imported from shared.cli_invoke.
 TURN_CAP_SUBTYPE = 'error_max_turns'
-BUDGET_CAP_SUBTYPE = 'error_max_budget_usd'
 
 MERGE_DONE_STATE = 'done'
 MERGE_CONFLICT_STATE = 'conflict'
@@ -150,7 +150,7 @@ def summarize_outcomes(records: Sequence[InvocationRecord]) -> OutcomeSummary:
         runs=len(records),
         succeeded=sum(1 for r in records if r.succeeded is True),
         turn_cap_kills=sum(1 for r in records if r.subtype == TURN_CAP_SUBTYPE),
-        budget_kills=sum(1 for r in records if r.subtype == BUDGET_CAP_SUBTYPE),
+        budget_kills=sum(1 for r in records if r.subtype == BUDGET_EXHAUSTED_SUBTYPE),
         timed_out=sum(1 for r in records if r.timed_out is True),
         no_end_event=sum(1 for r in records if r.succeeded is None and r.subtype is None),
         over_flat_ceiling=sum(1 for r in records if r.at_or_over_flat_role_ceiling is True),
@@ -809,12 +809,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                              'means unknown, rendered as "-"')
     parser.add_argument('--steward-min-tier', default=1, type=int,
                         help='dispatch tier the steward arms split at (default: 1)')
-    parser.add_argument('--runs-db', default=DEFAULT_RUNS_DB, type=Path)
-    parser.add_argument('--escalations-dir', default=DEFAULT_ESCALATIONS_DIR, type=Path)
+    parser.add_argument('--runs-db', default=None, type=Path,
+                        help="(default: the main checkout's runs.db)")
+    parser.add_argument('--escalations-dir', default=None, type=Path,
+                        help="(default: the main checkout's escalation queue)")
     args = parser.parse_args(argv)
 
-    corpus = load_escalation_corpus(args.escalations_dir)
-    conn = connect_ro(args.runs_db)
+    corpus = load_escalation_corpus(
+        args.escalations_dir if args.escalations_dir is not None else default_escalations_dir()
+    )
+    conn = connect_ro(args.runs_db if args.runs_db is not None else default_runs_db())
     try:
         result = review(
             conn, corpus,

@@ -5,8 +5,9 @@ TABLE half of finding 1.2). This module is the pure, shared companion to
 ``shared.task_statuses`` (the vocabulary, shipped by task 2163): it adds the
 actor taxonomy (``ActorClass``, ``derive_actor_class``), the enumerated
 (from, to, actor) -> allowed legality table (``TRANSITIONS``,
-``is_legal_transition``), and the WorkflowOutcome -> TaskStatus consistency
-map (``outcome_allows_status``).
+``is_legal_transition``), the WorkflowOutcome -> TaskStatus consistency
+map (``outcome_allows_status``), and the outcome vocabulary that map is keyed
+by (``WORKFLOW_OUTCOMES``).
 
 This module is intentionally PURE: it imports only ``shared.task_statuses``
 and defines no I/O, no enforcement wiring, and no orchestrator/fused-memory
@@ -33,6 +34,7 @@ __all__ = [
     'TRANSITIONS',
     'is_legal_transition',
     'outcome_allows_status',
+    'WORKFLOW_OUTCOMES',
 ]
 
 
@@ -56,9 +58,10 @@ def derive_actor_class(agent_id: str | None) -> ActorClass:
     Ordering is CRITICAL — later rules would otherwise be shadowed by an
     earlier, broader prefix:
 
-    1. ``None`` (header-less write; orchestrator pipeline/scheduler/harness
-       callbacks/deterministic_runner/crash-recovery all write without a
-       per-write ``agent_id`` today) -> HUMAN, the safe-open default (D5).
+    1. ``None`` (header-less write) -> HUMAN, the safe-open default (D5).
+       Writes through ``Scheduler.set_task_status`` now carry
+       ``'orchestrator'`` (rule 4); header-less writes that remain, such as
+       direct ``dispatch_tool`` status writes, still land here.
     2. ``recon-stage-*`` (live prefix, verified at
        fused-memory/reconciliation/stages/task_knowledge_sync.py:2787) or the
        defensive doc-convention variant ``reconciliation-stage*`` ->
@@ -357,6 +360,10 @@ _OUTCOME_ALLOWED: dict[str, frozenset[TaskStatus]] = {
         }
     ),
 }
+
+# The WorkflowOutcome string vocabulary the exit contract is keyed by,
+# mirrored here because shared/ cannot import orchestrator.
+WORKFLOW_OUTCOMES: frozenset[str] = frozenset(_OUTCOME_ALLOWED)
 
 
 def outcome_allows_status(outcome: object, status: TaskStatus | str) -> bool:

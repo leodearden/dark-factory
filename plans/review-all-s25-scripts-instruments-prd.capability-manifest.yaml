@@ -1,0 +1,320 @@
+# Machine-readable twin of review-all-s25-scripts-instruments-prd.capability-manifest.md
+# Bindings verified at main ae3047ec3a (2026-10-10); every grep/path polarity was measured
+# at that tree (present-checks absent today, absent-checks present today).
+# ι and ξ are HELD leaves (released by the S20 / S2 decompose sessions); their task_id is
+# stamped when those sessions run commit_planning on them.
+prd: plans/review-all-s25-scripts-instruments-prd.md
+schema_version: 1
+tasks:
+  - label: "α"
+    task_id: 6756
+    title: "Lift the unit-parity driver into systemd_unit_parity (run_parity)"
+    capabilities:
+      - name: "run-parity-driver-defined"
+        binding: "capability→producer — α creates it; parser/environment_map/find_dropins/Drift it composes are wired at scripts/systemd_unit_parity.py (def environment_map, def find_dropins, class Drift)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^def run_parity\\("
+          paths: ["scripts/systemd_unit_parity.py"]
+          expect: present
+      - name: "private-absent-sentinel-retired"
+        binding: "rejection of the private name — _ABSENT defined in scripts/systemd_unit_parity.py today; α publishes ABSENT (absorbs task 6447)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^_ABSENT = "
+          paths: ["scripts/systemd_unit_parity.py"]
+          expect: absent
+      - name: "reexport-shims-retired"
+        binding: "the `environment_map as _environment_map` rebind exists in scripts/ today (finding fk-3042baa5983e); suites move to systemd_unit_parity"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "environment_map as _environment_map"
+          paths: ["scripts/"]
+          expect: absent
+      - name: "setup-host-and-watchdog-contract-unchanged"
+        binding: "consumers wired: scripts/setup-host.sh _orch_skip_reason reads `[orchestrator_unit_parity] verdict` lines; scripts/orchestrator-watchdog.py::unit_parity_pass reads exit codes"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "byte-identity of verdict lines and exit ladder is asserted by α's golden-fixture tests (B3/B4), not a grep"
+  - label: "β"
+    task_id: 6757
+    title: "Declare host-local Environment= policy once (EnvPolicy table)"
+    capabilities:
+      - name: "renderer-derives-from-policy-table"
+        binding: "producer α upstream (systemd_unit_parity is the shared home); section-8 harness copies systemd_unit_parity.py unconditionally (tests/scripts/test_check_dashboard_unit_parity.py repo builder) so the renderer may import it"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "EnvPolicy|ENV_POLICY"
+          paths: ["scripts/render_systemd_unit.py"]
+          expect: present
+      - name: "impossible-row-rejected"
+        binding: "rejection-mechanism built by β (host_local and required both true raises at import; B5)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "the raise is exercised by β's B5 test; not greppable"
+  - label: "γ"
+    task_id: 6758
+    title: "Add scripts/_checkout.py and bind the unbootstrapped shared importers"
+    capabilities:
+      - name: "checkout-module-exists"
+        binding: "γ creates it; workspace member list exists at pyproject.toml [tool.uv.workspace].members (tomllib, stdlib)"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["scripts/_checkout.py"]
+          expect: present
+      - name: "merge-lane-metrics-binds-its-checkout"
+        binding: "merge_lane_metrics.py imports shared with no bootstrap today (finding fk-638eb09e52b1, recounted at main); idiom `import _checkout as _checkout` probed lint-clean (no F401; sorts ahead of first-party)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^import _checkout as _checkout"
+          paths: ["scripts/merge_lane_metrics.py"]
+          expect: present
+  - label: "δ"
+    task_id: 6759
+    title: "Replace per-file checkout bootstraps in top-level scripts with _checkout"
+    capabilities:
+      - name: "member-src-inserts-gone-from-top-level-scripts"
+        binding: "producer γ upstream; the named bootstrap variables are present in these 17 files today"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_SHARED_SRC|_FM_SRC|_ORCH_SRC|_ORCHESTRATOR_SRC|_FUSED_MEMORY_SRC|/home/leo/src/dark-factory/orchestrator/src"
+          paths:
+            - "scripts/_eval_results_io.py"
+            - "scripts/audit_combine_gate_marker_loss.py"
+            - "scripts/audit_delivered_checks.py"
+            - "scripts/audit_manifest_descriptor_drift.py"
+            - "scripts/backfill_decision_queue_stamp.py"
+            - "scripts/check_consolidation_closure.py"
+            - "scripts/inline_suppression_refusal.py"
+            - "scripts/migrate_metadata_modules_to_files.py"
+            - "scripts/mint_hard_v2_fixtures.py"
+            - "scripts/repair_wiped_metadata_files.py"
+            - "scripts/reviewer_redundancy_diagnostic.py"
+            - "scripts/run_fable_trial_v2_campaign.py"
+            - "scripts/run_judge_ofat_pilot.py"
+            - "scripts/run_vllm_eval.py"
+            - "scripts/scan_plan_decision_pairing.py"
+            - "scripts/scan_task_toolcall_leaks.py"
+            - "scripts/sweep_toolcall_markup.py"
+          expect: absent
+  - label: "ε"
+    task_id: 6760
+    title: "Bind subdirectory scripts through _checkout and add the uniform-binding guard"
+    capabilities:
+      - name: "member-src-inserts-gone-from-subdir-scripts"
+        binding: "producers γ+δ upstream; _SHARED_SRC/_ORCH_SRC present under scripts/legibility today"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_SHARED_SRC|_ORCH_SRC"
+          paths: ["scripts/legibility/", "scripts/sitting/"]
+          expect: absent
+      - name: "uniform-binding-guard"
+        binding: "rejection-mechanism built by ε (B2: guard red on a fixture script lacking the bootstrap, green on the live tree)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "the guard's firing is shown by its own fixture test (B2)"
+  - label: "ζ"
+    task_id: 6761
+    title: "Publish the wiped-metadata audit's shared decoders; importers name definitions"
+    capabilities:
+      - name: "no-private-decoder-imports"
+        binding: "census_tagger_debris and repair import _coerce_file_list/_decode_files/_EVENT_PLAN_SOURCES/_format_coverage from the audit today"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^ +_(coerce_file_list|decode_files|EVENT_PLAN_SOURCES|format_coverage),"
+          paths: ["scripts/census_tagger_debris.py", "scripts/repair_wiped_metadata_files.py"]
+          expect: absent
+      - name: "terminal-statuses-from-shared"
+        binding: "shared.task_statuses.TERMINAL exists (shared/src/shared/task_statuses.py, TERMINAL = frozenset({DONE, CANCELLED})); local copy present today"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^TERMINAL_STATUSES\\b"
+          paths: ["scripts/repair_wiped_metadata_files.py"]
+          expect: absent
+  - label: "η"
+    task_id: 6762
+    title: "One exit-code enum per _task_db_scan tier; adopters render from it"
+    capabilities:
+      - name: "exit-code-enum-defined"
+        binding: "η creates it; no IntEnum exit type in _task_db_scan today"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class [A-Za-z_]*Exit[A-Za-z_]*\\(IntEnum\\)"
+          paths: ["scripts/_task_db_scan.py"]
+          expect: present
+      - name: "adopter-restatements-gone"
+        binding: "the hand-written 'never treat 3 as a clean' contract is present in the adopters today (23 restatements, finding fk-679f3dc5ca48)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "never treat 3 as a clean"
+          paths:
+            - "scripts/audit_wiped_metadata_files.py"
+            - "scripts/audit_combine_gate_marker_loss.py"
+            - "scripts/audit_delivered_checks.py"
+            - "scripts/audit_manifest_descriptor_drift.py"
+            - "scripts/scan_plan_decision_pairing.py"
+            - "scripts/scan_task_toolcall_leaks.py"
+            - "scripts/repair_wiped_metadata_files.py"
+          expect: absent
+  - label: "θ"
+    task_id: 6763
+    title: "Split audit_project into per-direction passes over one coverage accumulator"
+    capabilities:
+      - name: "single-coverage-builder-both-branches"
+        binding: "two AuditCoverage constructions inside audit_project today (git-failure branch and final); θ builds both from one accumulator"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "structural property asserted by θ's git-failure-branch completeness test"
+  - label: "ι"
+    task_id: null
+    title: "Route stamper and manifest audits through shared sidecar_for / tracked_sidecar_paths"
+    note: "HELD (metadata.x_seam_wait stream S20 contract C3): released by the S20 /prd decompose session after its C3 leaf (shared.capability_manifest SIDECAR_SUFFIX/sidecar_for/tracked_sidecar_paths) is filed; also depends on 6037."
+    capabilities:
+      - name: "shared-sidecar-surface"
+        binding: "producer = S20's C3 leaf (not yet filed) — bound by the held-leaf release protocol in the PRD's Pre-conditions; ι is not committed until that dependency is wired"
+        verdict: OPEN
+        delivered_check:
+          kind: manual
+          reason: "the producer lives in another stream's batch; the release protocol, not a grep, binds it"
+      - name: "stamper-calls-sidecar-for"
+        binding: "stamper derives the path inline in _prd_bound_tasks today"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "sidecar_for\\("
+          paths: ["fused-memory/src/fused_memory/server/manifest_stamping.py"]
+          expect: present
+      - name: "suffix-spellings-gone"
+        binding: "_SIDECAR_SUFFIX / MANIFEST_SUFFIX / _MANIFEST_SUFFIX defined in three consumers today"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^_?(SIDECAR|MANIFEST)_SUFFIX = "
+          paths:
+            - "fused-memory/src/fused_memory/server/manifest_stamping.py"
+            - "scripts/audit_delivered_checks.py"
+            - "scripts/audit_manifest_descriptor_drift.py"
+          expect: absent
+  - label: "κ"
+    task_id: 6765
+    title: "One _report_stats module; verify-budget policy out of the test tree"
+    capabilities:
+      - name: "report-stats-module-exists"
+        binding: "κ creates it"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["scripts/_report_stats.py"]
+          expect: present
+      - name: "percentile-copies-gone"
+        binding: "_percentile defined in three scripts today"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^def _percentile\\("
+          paths: ["scripts/verify_budget_census.py", "scripts/merge_lane_throughput.py", "scripts/mint_hard_v2_fixtures.py"]
+          expect: absent
+      - name: "census-policy-not-from-test-tree"
+        binding: "verify_budget_census imports module_budget_family via a tests/scripts sys.path insert and restates REFUSAL_CEILING today"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "module_budget_family|^REFUSAL_CEILING = "
+          paths: ["scripts/verify_budget_census.py"]
+          expect: absent
+  - label: "λ"
+    task_id: 6766
+    title: "Emit routing rejections as structured {layer, reason, model} values"
+    capabilities:
+      - name: "route-rejection-leaf-exists"
+        binding: "λ creates it (C4); stdlib-only, imported downward by orchestrator.routing and scripts"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["shared/src/shared/route_rejection.py"]
+          expect: present
+      - name: "producer-stops-composing-strings"
+        binding: "4 rejected.append f-string sites in orchestrator/src/orchestrator/routing.py today"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "rejected\\.append\\(f'"
+          paths: ["orchestrator/src/orchestrator/routing.py"]
+          expect: absent
+      - name: "audit-vocabulary-copies-gone"
+        binding: "MODEL_REJECTION_REASONS (audit_model_admission) and the rpartition parse (review_model_admission) present today"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^MODEL_REJECTION_REASONS = |rpartition\\(':'\\)"
+          paths: ["scripts/audit_model_admission.py", "scripts/review_model_admission.py"]
+          expect: absent
+      - name: "event-carries-rejections"
+        binding: "both routing_decision emitters (routing_dispatch, TaskWorkflow routing record) build payloads from the S10 mirror today; λ adds the event-only key via one builder (D7)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "end-to-end event shape asserted by λ's B8 test"
+  - label: "μ"
+    task_id: 6767
+    title: "Per-file classifier plus one accumulator in sweep_toolcall_markup.run_sweep"
+    capabilities:
+      - name: "file-verdict-type"
+        binding: "μ creates it; run_sweep holds 12 function-lifetime accumulators today"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class FileVerdict"
+          paths: ["scripts/sweep_toolcall_markup.py"]
+          expect: present
+  - label: "ν"
+    task_id: 6769
+    title: "Stop ratcheting raw lines/prose_lines in the merge-lane ratchet"
+    capabilities:
+      - name: "lines-out-of-ratcheted-set"
+        binding: "_SUMMED_FILE_MEASURES in scripts/merge_lane_metrics.py contains 'lines' and 'prose_lines' today, and _check_files/_check_totals ratchet them"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "asserted by ν's lines-only-rise-passes / cognitive-rise-fails fixture tests; the measure names stay in the report so a grep cannot tell ratcheted from reported"
+  - label: "ξ"
+    task_id: null
+    title: "Sitting close-safety gates read pin_declared_by and duplicate_of only"
+    note: "HELD (metadata.x_seam_wait stream S2 contract C5): released by the S2 /prd decompose session after its C5 leaf (Escalation.duplicate_of) is filed. Lead ruling 2026-10-11: the esc-3169-2 declare_pin migration is step 1 of this leaf, with its own check, not a decompose-time action."
+    capabilities:
+      - name: "duplicate-of-field"
+        binding: "producer = S2's C5 leaf (not yet filed); pin_declared_by already exists and is enforced (escalation/src/escalation/models.py Escalation.pin_declared_by; resolve_issue via declared_pins)"
+        verdict: OPEN
+        delivered_check:
+          kind: manual
+          reason: "the producer lives in another stream's batch; bound by the held-leaf release protocol"
+      - name: "pending-legacy-pins-migrated"
+        binding: "declare_pin exists (escalation server tool; sole writer queue.declare_pin, task 4377); one pending prefix record today (esc-3169-2, empty pin_declared_by) - migrated by this leaf's step 1"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "reads the live escalation queue (not the git tree); the leaf runs a read-only scan of pending records and records zero unmigrated prefix records before removing the prefix read"
+      - name: "string-protocol-gates-gone"
+        binding: "VETO_PIN_PREFIX and DEDUP_MARKER defined/consumed in scripts/sitting/gates.py, prepare_sitting.py and member-chain-sweep.py today"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "VETO_PIN_PREFIX|DEDUP_MARKER"
+          paths: ["scripts/"]
+          expect: absent

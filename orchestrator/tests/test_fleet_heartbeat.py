@@ -3,7 +3,7 @@ heartbeat producer (task 2395, α of the fleet-redeploy PRD).
 
 Covers the pure module functions in isolation (no Harness required):
   - ``DEFAULT_FLEET_DIR`` / ``resolve_fleet_dir`` — fleet-common directory resolution.
-  - ``build_heartbeat_payload`` — the five-field on-disk payload shape.
+  - ``build_heartbeat_payload`` — the eight-field on-disk payload shape.
   - ``write_heartbeat`` — the atomic tmp-file + os.replace writer.
 
 This is the SAME module the future reader (γ drain gate, ε --report) will
@@ -73,19 +73,25 @@ class TestResolveFleetDir:
 
 
 class TestBuildHeartbeatPayload:
-    """build_heartbeat_payload(...) — the five-field on-disk payload shape."""
+    """build_heartbeat_payload(...) — the eight-field on-disk payload shape."""
 
-    def test_returns_exactly_five_fields_with_type_fidelity(self):
-        """Payload has exactly {unit, merge_idle, depth, queue_empty, ts_epoch}, values/types preserved."""
+    def test_returns_exactly_eight_fields_with_type_fidelity(self):
+        """Payload has the five legacy fields plus drain/verifies_in_flight/deployed_sha, values/types preserved."""
         payload = build_heartbeat_payload(
             unit='orchestrator-reify.service',
             merge_idle=True,
             depth=0,
             queue_empty=True,
             ts_epoch=1234567890.5,
+            drain=None,
+            verifies_in_flight=[],
+            deployed_sha=None,
         )
 
-        assert set(payload.keys()) == {'unit', 'merge_idle', 'depth', 'queue_empty', 'ts_epoch'}
+        assert list(payload) == [
+            'unit', 'merge_idle', 'depth', 'queue_empty', 'ts_epoch',
+            'drain', 'verifies_in_flight', 'deployed_sha',
+        ]
         assert payload['unit'] == 'orchestrator-reify.service'
         assert isinstance(payload['unit'], str)
         assert payload['merge_idle'] is True
@@ -96,15 +102,47 @@ class TestBuildHeartbeatPayload:
         assert isinstance(payload['queue_empty'], bool)
         assert payload['ts_epoch'] == 1234567890.5
         assert isinstance(payload['ts_epoch'], float)
+        assert payload['drain'] is None
+        assert payload['verifies_in_flight'] == []
+        assert payload['deployed_sha'] is None
+
+    def test_deployed_sha_carries_the_running_code_and_its_flags(self):
+        """Task 6565: the unit's code sha and both flags reach the heartbeat as given."""
+        from orchestrator.deployed_sha import DeployedSha
+
+        deployed = DeployedSha(sha='a' * 40, indeterminate=True, dirty_wire_path=False)
+        payload = build_heartbeat_payload(
+            unit='orchestrator-dark-factory.service',
+            merge_idle=True,
+            depth=0,
+            queue_empty=True,
+            ts_epoch=1.0,
+            drain=None,
+            verifies_in_flight=[],
+            deployed_sha=deployed.to_wire(),
+        )
+
+        assert payload['deployed_sha'] == {
+            'sha': 'a' * 40, 'indeterminate': True, 'dirty_wire_path': False,
+        }
+        assert json.loads(json.dumps(payload))['deployed_sha'] == payload['deployed_sha']
 
     def test_busy_values_preserved(self):
-        """A busy/non-idle tick's values pass through unchanged (no truthy coercion)."""
+        """A busy/draining tick's values pass through unchanged (no truthy coercion)."""
+        drain = {'requested_ts': 1791240000, 'admission_halted': True, 'refused': None}
+        verify = {
+            'task_id': '5371', 'host': 'laptop', 'kind': 'verify',
+            'started_ts': 10.0, 'deadline_ts': 10810.0,
+        }
         payload = build_heartbeat_payload(
             unit='orchestrator-dark-factory.service',
             merge_idle=False,
             depth=3,
             queue_empty=False,
             ts_epoch=42.0,
+            drain=drain,
+            verifies_in_flight=[verify],
+            deployed_sha=None,
         )
 
         assert payload == {
@@ -113,7 +151,11 @@ class TestBuildHeartbeatPayload:
             'depth': 3,
             'queue_empty': False,
             'ts_epoch': 42.0,
+            'drain': drain,
+            'verifies_in_flight': [verify],
+            'deployed_sha': None,
         }
+        assert json.loads(json.dumps(payload)) == payload
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +175,9 @@ class TestWriteHeartbeat:
             depth=0,
             queue_empty=True,
             ts_epoch=111.0,
+            drain=None,
+            verifies_in_flight=[],
+            deployed_sha=None,
         )
 
         result = write_heartbeat(fleet_dir, 'orchestrator-reify.service', payload)
@@ -151,6 +196,9 @@ class TestWriteHeartbeat:
             depth=2,
             queue_empty=False,
             ts_epoch=222.5,
+            drain=None,
+            verifies_in_flight=[],
+            deployed_sha=None,
         )
 
         result = write_heartbeat(tmp_path, 'orchestrator-dark-factory.service', payload)
@@ -165,6 +213,9 @@ class TestWriteHeartbeat:
             depth=0,
             queue_empty=True,
             ts_epoch=333.0,
+            drain=None,
+            verifies_in_flight=[],
+            deployed_sha=None,
         )
 
         write_heartbeat(tmp_path, 'orchestrator-reify.service', payload)
@@ -180,6 +231,9 @@ class TestWriteHeartbeat:
             depth=0,
             queue_empty=True,
             ts_epoch=444.0,
+            drain=None,
+            verifies_in_flight=[],
+            deployed_sha=None,
         )
 
         result = write_heartbeat(tmp_path, 'orchestrator-reify.service', payload)
@@ -235,6 +289,9 @@ class TestMalformedUnitIsRefused:
             depth=0,
             queue_empty=True,
             ts_epoch=555.0,
+            drain=None,
+            verifies_in_flight=[],
+            deployed_sha=None,
         )
 
     def test_empty_unit_raises_and_writes_nothing(self, tmp_path):

@@ -30,8 +30,13 @@ import asyncio
 from pathlib import Path
 
 import pytest
+from _seed_script_stubs import (
+    CURRENT_LOCKING_SEED_SCRIPT,
+    commit_seed_script,
+    make_seed_test_repo,
+    warm_pool_git_config,
+)
 
-from orchestrator.config import GitConfig
 from orchestrator.git_ops import GitOps, SeedLaneLock, WorktreeKind, _run
 
 # Mirrors the real script's lock stage: refuse (75) when ${LANE_DIR}.lock is
@@ -164,75 +169,14 @@ echo seeded > "$lane_dir/target/seeded.bin"
 exit 0
 """
 
-# Models TODAY's reify script (post-5354 + post-5568): it takes
-# ${LANE_DIR}.lock itself unless told the caller already holds it, and refuses
-# with 77 under --distinct-lock-refusal-rc.  Stricter than the real script, it
-# VERIFIES an --assume-lane-lock-held assertion (exit 3 if the lock is in fact
-# free), so a caller asserting a lock it does not hold fails loudly instead of
-# silently dropping inv.2 exclusivity.
-_CURRENT_LOCKING_SEED_SCRIPT = """#!/usr/bin/env bash
-# Supported flags include --assume-lane-lock-held and --distinct-lock-refusal-rc.
-set -u
-lane_dir="$2"
-refusal_rc=75
-assume_held=""
-for a in "$@"; do
-    case "$a" in
-        --distinct-lock-refusal-rc) refusal_rc=77 ;;
-        --assume-lane-lock-held) assume_held=1 ;;
-    esac
-done
-if [ -z "$assume_held" ]; then
-    exec 9>"${lane_dir}.lock"
-    if ! flock -n 9; then
-        echo "LANE_LOCK_CONTENDED: ${lane_dir}.lock held by a live consumer" >&2
-        exit "$refusal_rc"
-    fi
-elif flock -n "${lane_dir}.lock" true; then
-    echo "asserted lane lock ${lane_dir}.lock is not actually held" >&2
-    exit 3
-fi
-mkdir -p "$lane_dir/target"
-echo seeded > "$lane_dir/target/seeded.bin"
-exit 0
-"""
-
-
 def _recorded_argv(lane: Path) -> list[str]:
     """The argv the stub seed script was actually handed."""
     return Path(f'{lane}.argv').read_text().split()
 
 
-async def _init_repo(repo: Path) -> None:
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
-
-
-def _config() -> GitConfig:
-    return GitConfig(
-        main_branch='main',
-        branch_prefix='task/',
-        remote='origin',
-        worktree_dir='.worktrees',
-        push_after_advance=False,
-        warm_lane_pool=True,
-        merge_spec_warm_lane_pool=True,
-    )
-
-
 @pytest.fixture
 def seed_repo(tmp_path: Path) -> Path:
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    asyncio.run(_init_repo(repo))
-    base = repo / '.worktrees' / '_merge-verify' / 'target'
-    base.mkdir(parents=True, exist_ok=True)
-    (base / '.keep').write_text('warm base sentinel\n')
-    return repo
+    return make_seed_test_repo(tmp_path)
 
 
 async def _make_lane(repo: Path, git_ops: GitOps, script_body: str) -> Path:
@@ -272,7 +216,7 @@ class TestSeedLaneLockReentrancy:
 
         Pre-fix this returns 75 (disk pressure) and the caller requeues forever.
         """
-        git_ops = GitOps(_config(), seed_repo)
+        git_ops = GitOps(warm_pool_git_config(), seed_repo)
         lane = await _make_lane(seed_repo, git_ops, _LOCKING_SEED_SCRIPT)
 
         rc = await _seed(git_ops, lane, '--fresh-checkout')
@@ -293,7 +237,7 @@ class TestSeedLaneLockReentrancy:
         The seed script comes from the LANE's own tree, so its vintage varies.
         Passing the flag blind would turn a working seed into a usage error.
         """
-        git_ops = GitOps(_config(), seed_repo)
+        git_ops = GitOps(warm_pool_git_config(), seed_repo)
         lane = await _make_lane(seed_repo, git_ops, _LEGACY_SEED_SCRIPT)
 
         rc = await _seed(git_ops, lane, '--fresh-checkout')
@@ -314,7 +258,7 @@ class TestSeedLaneLockReentrancy:
         acquire here would drop inv.2 exclusivity entirely rather than
         relocate it.
         """
-        git_ops = GitOps(_config(), seed_repo)
+        git_ops = GitOps(warm_pool_git_config(), seed_repo)
         lane = await _make_lane(seed_repo, git_ops, _LOCKING_SEED_SCRIPT)
 
         # Nobody holds the lock -> the script's own flock -n succeeds.
@@ -436,7 +380,7 @@ class TestDistinctLockRefusalRcPlumbing:
     async def test_flag_is_passed_when_the_script_advertises_it(
         self, seed_repo: Path,
     ):
-        git_ops = GitOps(_config(), seed_repo)
+        git_ops = GitOps(warm_pool_git_config(), seed_repo)
         lane = await _make_lane(seed_repo, git_ops, _ARGV_RECORDING_SEED_SCRIPT)
 
         rc = await _seed(git_ops, lane, '--fresh-checkout')
@@ -452,7 +396,7 @@ class TestDistinctLockRefusalRcPlumbing:
         self, seed_repo: Path,
     ):
         """A legacy lane must keep seeding cleanly — the flag is a usage error there."""
-        git_ops = GitOps(_config(), seed_repo)
+        git_ops = GitOps(warm_pool_git_config(), seed_repo)
         lane = await _make_lane(
             seed_repo, git_ops, _LEGACY_ARGV_RECORDING_SEED_SCRIPT,
         )
@@ -479,7 +423,7 @@ class TestDistinctLockRefusalRcPlumbing:
         original esc-5556-1 self-refusal shape.  Gating it would make it inert
         in exactly the cases it exists for.
         """
-        git_ops = GitOps(_config(), seed_repo)
+        git_ops = GitOps(warm_pool_git_config(), seed_repo)
         lane = await _make_lane(seed_repo, git_ops, _ARGV_RECORDING_SEED_SCRIPT)
 
         for mode in SeedLaneLock:
@@ -489,25 +433,6 @@ class TestDistinctLockRefusalRcPlumbing:
                 f'the flag must be passed under lane_lock={mode.name} — every '
                 'mode can meet a self-locking script that may refuse'
             )
-
-
-async def _commit_seed_script(repo: Path, script_body: str) -> None:
-    """Commit ``script_body`` as the repo's seed script so POOL lanes carry it.
-
-    Unlike ``_make_lane`` (which writes into one manually-registered lane),
-    ``acquire_warm_lane`` creates its own ``_lane-N`` worktrees, so the script
-    has to be in the committed tree for the lane checkout to pick it up.
-    """
-    scripts_dir = repo / 'scripts'
-    scripts_dir.mkdir(parents=True, exist_ok=True)
-    seed = scripts_dir / 'seed-warm-lane.sh'
-    seed.write_text(script_body)
-    seed.chmod(0o755)
-    debug = scripts_dir / 'setup-worktree-debug-port.sh'
-    debug.write_text('#!/usr/bin/env bash\necho 39411\n')
-    debug.chmod(0o755)
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'add seed + debug-port scripts'], cwd=repo)
 
 
 @pytest.mark.asyncio
@@ -526,8 +451,8 @@ class TestLaneLockRefusalEndToEnd:
     ):
         from orchestrator.git_ops import WarmLaneUnavailable
 
-        await _commit_seed_script(seed_repo, _POST_5568_LOCKING_SEED_SCRIPT)
-        git_ops = GitOps(_config(), seed_repo, warm_lane_pool_size=1)
+        await commit_seed_script(seed_repo, _POST_5568_LOCKING_SEED_SCRIPT)
+        git_ops = GitOps(warm_pool_git_config(), seed_repo, warm_lane_pool_size=1)
 
         result = await git_ops.acquire_warm_lane('task/lock', 'HEAD')
 
@@ -543,8 +468,8 @@ class TestLaneLockRefusalEndToEnd:
         """No ASSIGNED leak — same invariant the DISK_PRESSURE path already holds."""
         from orchestrator.warm_lane_pool import LaneState
 
-        await _commit_seed_script(seed_repo, _POST_5568_LOCKING_SEED_SCRIPT)
-        git_ops = GitOps(_config(), seed_repo, warm_lane_pool_size=1)
+        await commit_seed_script(seed_repo, _POST_5568_LOCKING_SEED_SCRIPT)
+        git_ops = GitOps(warm_pool_git_config(), seed_repo, warm_lane_pool_size=1)
 
         await git_ops.acquire_warm_lane('task/lock', 'HEAD')
 
@@ -568,8 +493,8 @@ class TestLaneLockRefusalEndToEnd:
         test_lane_is_released_back_to_free_after_a_refusal) holds under EITHER
         policy and so cannot distinguish them.
         """
-        await _commit_seed_script(seed_repo, _POST_5568_LOCKING_SEED_SCRIPT)
-        git_ops = GitOps(_config(), seed_repo, warm_lane_pool_size=1)
+        await commit_seed_script(seed_repo, _POST_5568_LOCKING_SEED_SCRIPT)
+        git_ops = GitOps(warm_pool_git_config(), seed_repo, warm_lane_pool_size=1)
 
         await git_ops.acquire_warm_lane('task/lock', 'HEAD')
 
@@ -594,8 +519,8 @@ class TestLaneLockRefusalEndToEnd:
         from orchestrator.git_ops import WarmLaneLockContention
         from orchestrator.workflow_types import RequeueKind, classify_failure
 
-        await _commit_seed_script(seed_repo, _POST_5568_LOCKING_SEED_SCRIPT)
-        git_ops = GitOps(_config(), seed_repo, warm_lane_pool_size=1)
+        await commit_seed_script(seed_repo, _POST_5568_LOCKING_SEED_SCRIPT)
+        git_ops = GitOps(warm_pool_git_config(), seed_repo, warm_lane_pool_size=1)
 
         with pytest.raises(WarmLaneLockContention) as excinfo:
             await git_ops.create_worktree('lock')
@@ -618,8 +543,8 @@ class TestLaneLockRefusalEndToEnd:
         """
         import logging
 
-        await _commit_seed_script(seed_repo, _POST_5568_LOCKING_SEED_SCRIPT)
-        git_ops = GitOps(_config(), seed_repo, warm_lane_pool_size=1)
+        await commit_seed_script(seed_repo, _POST_5568_LOCKING_SEED_SCRIPT)
+        git_ops = GitOps(warm_pool_git_config(), seed_repo, warm_lane_pool_size=1)
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
             await git_ops.acquire_warm_lane('task/lock', 'HEAD')
@@ -664,8 +589,8 @@ class TestLaneLockRefusalEndToEnd:
         """
         from orchestrator.git_ops import WarmLaneUnavailable
 
-        await _commit_seed_script(seed_repo, _PRE_5568_LOCKING_SEED_SCRIPT)
-        git_ops = GitOps(_config(), seed_repo, warm_lane_pool_size=1)
+        await commit_seed_script(seed_repo, _PRE_5568_LOCKING_SEED_SCRIPT)
+        git_ops = GitOps(warm_pool_git_config(), seed_repo, warm_lane_pool_size=1)
 
         result = await git_ops.acquire_warm_lane('task/legacy', 'HEAD')
 
@@ -682,8 +607,8 @@ class TestEphemeralWorktreeSeedsUnderItsOwnLaneLock:
     """
 
     async def _probe_was_seeded(self, repo: Path, script_body: str) -> bool:
-        await _commit_seed_script(repo, script_body)
-        git_ops = GitOps(_config(), repo)
+        await commit_seed_script(repo, script_body)
+        git_ops = GitOps(warm_pool_git_config(), repo)
         _, head, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=repo)
         async with git_ops.ephemeral_worktree(
             WorktreeKind.MAIN_PROBE, head.strip(), warm_seed=True,
@@ -694,7 +619,7 @@ class TestEphemeralWorktreeSeedsUnderItsOwnLaneLock:
         self, seed_repo: Path,
     ):
         seeded = await self._probe_was_seeded(
-            seed_repo, _CURRENT_LOCKING_SEED_SCRIPT,
+            seed_repo, CURRENT_LOCKING_SEED_SCRIPT,
         )
 
         assert seeded, (

@@ -59,12 +59,12 @@ Usage
 WHY THIS SCRIPT PREFLIGHTS ITS TARGET (a decision, task 4319)
 -------------------------------------------------------------
 :func:`_run` refuses, before it constructs a backend, unless ``--project-root``
-names a checkout whose ``.taskmaster/tasks/tasks.db`` ALREADY exists.  A task
-worktree has none, and merely reaching ``get_tasks`` would create one empty and
-report zero corrections -- indistinguishable from a backlog with nothing to
-correct.
+names a checkout whose ``.taskmaster/tasks/tasks.db`` ALREADY exists and holds
+tasks.  A task worktree has none, and merely reaching ``get_tasks`` would
+create one empty and report zero corrections -- indistinguishable from a
+backlog with nothing to correct.
 
-See ``fused_memory/utils/target_store_preflight.py::assert_task_store_exists``
+See ``fused_memory/utils/target_store_preflight.py::assert_task_store_populated``
 for the mechanism, the probe-vs-existence argument, the prior art and the
 placement rules -- that module is the single normative copy, and this note
 deliberately does not restate it.
@@ -89,7 +89,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
-from fused_memory.utils.target_store_preflight import assert_task_store_exists
+from fused_memory.utils.target_store_preflight import assert_task_store_populated
 
 logger = logging.getLogger('correct_found_on_main_backlog')
 
@@ -478,7 +478,7 @@ async def _run(args: argparse.Namespace) -> int:
         level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s',
     )
 
-    assert_task_store_exists(args.project_root, operation='correct_found_on_main_backlog')
+    assert_task_store_populated(args.project_root, operation='correct_found_on_main_backlog')
 
     import os  # noqa: PLC0415
 

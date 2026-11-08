@@ -63,17 +63,17 @@ CYCLE_SUMMARY_STAGE_TO_RECON_POOL: dict[str, str] = {
 CYCLE_SUMMARY_KIND = 'cycle_summary'
 
 # record_type vocabulary for kind='cycle_summary' Mem0 writes (task 2468).
-# There are two distinct writers: summary_pool.write_cycle_summary's
-# deterministic, terse, auto-generated mirror of the authoritative ledger row
-# (LEDGER_STAMP), and the LLM-authored reconstruction/self-heal write in
-# reconciliation/prompts/stage2.py (NARRATIVE).
+# The one live writer is summary_pool.write_cycle_summary's deterministic,
+# terse, auto-generated mirror of the authoritative ledger row (LEDGER_STAMP).
+# NARRATIVE is the value of the LLM-authored reconstruction write that task
+# 3734 retired from reconciliation/prompts/stage2.py; it is kept because
+# historical payloads carry it, and the task-3041 eviction order and the
+# protected-mirror guard still classify on it.
 #
-# NARRATIVE still has no Python consumer: prompts/stage2.py and
-# recon_self_model.py hardcode the literal in prose/f-string text rather than
-# importing it, because those prompt modules are deliberately import-light.
-# They COULD import from here (this module imports nothing), but that is a
-# separate cleanup with its own review surface — until it happens, keeping the
-# prompt-side literal in sync is a reviewed invariant, not an enforced one.
+# The prompts no longer contain the NARRATIVE literal, so there is no
+# prompt-side copy left to keep in sync.
+# tests/test_stage2_narrative_reconstruction_retired.py imports it to pin its
+# absence from the Stage 2 prompt.
 CYCLE_SUMMARY_RECORD_TYPE_LEDGER_STAMP = 'ledger_stamp'
 CYCLE_SUMMARY_RECORD_TYPE_NARRATIVE = 'narrative'
 

@@ -1,0 +1,146 @@
+{
+  "arm_id": "moe-stretch",
+  "records": [
+    {
+      "argv": [
+        "/home/leo/.local/bin/uv",
+        "run",
+        "--no-sync",
+        "--project",
+        "/home/leo/src/dark-factory/shared",
+        "python",
+        "/home/leo/src/dark-factory/scripts/local-model-serving/lms_ctl.py",
+        "start",
+        "moe-stretch"
+      ],
+      "exit_code": 0,
+      "finished_at": "2026-10-07T20:24:38.645734Z",
+      "output_tail": "started lms-arm@moe-stretch.service\n",
+      "stage": "start",
+      "started_at": "2026-10-07T20:24:38.005404Z"
+    },
+    {
+      "argv": [
+        "/home/leo/.local/bin/uv",
+        "run",
+        "--no-sync",
+        "--project",
+        "/home/leo/src/dark-factory/shared",
+        "python",
+        "/home/leo/src/dark-factory/scripts/local-model-serving/lms_ctl.py",
+        "wait-ready",
+        "moe-stretch"
+      ],
+      "exit_code": 0,
+      "finished_at": "2026-10-07T20:27:22.137895Z",
+      "output_tail": "moe-stretch: ready\n",
+      "stage": "wait-ready",
+      "started_at": "2026-10-07T20:24:38.645893Z"
+    },
+    {
+      "argv": [
+        "/home/leo/.local/bin/uv",
+        "run",
+        "--no-sync",
+        "python",
+        "scripts/local_memory_models_eval/harness.py",
+        "smoke",
+        "--arm-spec",
+        "/tmp/lme-eta-3720/evidence/specs/moe-stretch.json"
+      ],
+      "exit_code": 0,
+      "finished_at": "2026-10-07T20:27:32.817037Z",
+      "output_tail": "PASS endpoint-conformance: arm 'moe-stretch' at http://127.0.0.1:8418/v1 (json_object) returned a schema-valid SmokeEntities\nPASS validator-negative-control: the validator rejected a deliberately off-schema payload\n",
+      "stage": "smoke",
+      "started_at": "2026-10-07T20:27:22.251079Z"
+    },
+    {
+      "argv": [
+        "/home/leo/.local/bin/uv",
+        "run",
+        "--no-sync",
+        "python",
+        "scripts/local_memory_models_eval/harness.py",
+        "run",
+        "--arm-spec",
+        "/tmp/lme-eta-3720/evidence/specs/moe-stretch.json",
+        "--manifest",
+        "/tmp/lme-eta-3720/code/fused-memory/scripts/local_memory_models_eval/corpus_manifest.json",
+        "--out-root",
+        "/tmp/lme-eta-3720/evidence/runs",
+        "--repo-root",
+        "/tmp/lme-eta-3720/code",
+        "--limit",
+        "20",
+        "--concurrency",
+        "3",
+        "--index-configuration",
+        "with-indices"
+      ],
+      "exit_code": 4,
+      "finished_at": "2026-10-07T20:31:38.905568Z",
+      "output_tail": "run: /tmp/lme-eta-3720/evidence/runs/moe-stretch/20261007T202735Z\nPASS code-sha-matches-checkout: HEAD 055e9c15a0d756704017b0d77ffbe4185155402f is clean and matches the spec\nPASS preregistration-sha: 865a017d79c6a210da157474e639fd15fe51f9e0 carries plans/local-memory-models-eval-preregistration.md\nFAIL token-cost-accounting: arm 'moe-stretch': token accounting (and cost, on a metered arm) must be present and non-zero; got {<LlmMetricId.TOKENS_PER_EPISODE: 'tokens-per-episode'>: None}\naborted: {\"arm_id\":\"moe-stretch\",\"item_ids\":[\"8ed66f45-dde5-4c43-9812-9136d45beb6e\",\"62f8f47b-42b5-47a3-95f6-64a8f1c8cead\",\"026c9418-e82c-4793-a6a3-ab1421e5eff3\",\"3137f2d8-0e96-4269-a91f-a199f50a96ad\",\"32589460-bc9c-43e0-ac07-440933459352\"],\"error_classes\":[\"TimeoutError\",\"TimeoutError\",\"TimeoutError\",\"TimeoutError\",\"TimeoutError\"]}\n",
+      "stage": "run",
+      "started_at": "2026-10-07T20:27:33.158143Z"
+    },
+    {
+      "argv": [
+        "/home/leo/.local/bin/uv",
+        "run",
+        "--no-sync",
+        "--project",
+        "/home/leo/src/dark-factory/shared",
+        "python",
+        "/home/leo/src/dark-factory/scripts/local-model-serving/lms_healthcheck.py",
+        "--arm",
+        "moe-stretch",
+        "--output",
+        "/tmp/lme-eta-3720/evidence/arms/moe-stretch/health.json"
+      ],
+      "exit_code": 0,
+      "finished_at": "2026-10-07T20:32:37.094276Z",
+      "output_tail": "local model serving health — 2026-10-07T20:31:39.444927+00:00\nGPU: NVIDIA GeForce RTX 3090 (driver 580.178.04, 24576 MiB)\n\nARM          AXIS  STACK     ENDPOINT               VERDICT  REASON  COLD-MS  MS\n-----------  ----  --------  ---------------------  -------  ------  -------  ----\nmoe-stretch  llm   llamacpp  http://127.0.0.1:8413  PASS     ok      54698    2370\n\nVRAM PASS: the arm took 14629 MiB (21700 used - 7071 baseline) of the 17021 MiB free before it started\n  headroom 2.34 GiB; card total 24576 MiB, now 2391 MiB free\n  reported, NOT gating — PRD D10 nominal ceiling 19.5 GiB, measured operating budget on this host 16.37 GiB\n  the arm took 14.29 GiB (21700 - 7071 MiB), within the 16.62 GiB budget free before it started\n\nnon-arm GPU consumers\n  at baseline, before the arm started:\n    pid 9024 python — 4050 MiB (3.96 GiB)\n  at the probe reading (the arm included):\n    pid 9024 python — 4050 MiB (3.96 GiB)\n    pid 3293958 /app/llama-server — 14630 MiB (14.29 GiB)\n  INVENTORY, not an accounting: `nvidia-smi --query-compute-apps` lists only CUDA\n  compute applications. It does not list the KDE/X11 graphics contexts (Xorg,\n  plasmashell, kwin_x11, and ~40 small KDE clients) that hold the remaining ~3.3 GiB on\n  this host — which is exactly why the measured operating budget is ~16.37 GiB rather\n  than 19.5. These entries name who else held the card; they do not sum to memory.used.\n\nCOLD-MS is the DISCARDED warm-up, MS the measured run. Latency here is a SINGLE-SAMPLE health-probe measurement taken with the engine warm and the prefix cache COLD (one discarded warm-up on a different prompt precedes it). It is NOT the p95-under-load envelope metric (task 3719 zeta; PRD episode-latency-p50/p95 under concurrent load), and it must not be used to rank arms against one another.\n\nOVERALL: PASS\n\nwrote /tmp/lme-eta-3720/evidence/arms/moe-stretch/health.json\n",
+      "stage": "healthcheck",
+      "started_at": "2026-10-07T20:31:38.935859Z"
+    },
+    {
+      "argv": [
+        "/home/leo/.local/bin/uv",
+        "run",
+        "--no-sync",
+        "--project",
+        "/home/leo/src/dark-factory/shared",
+        "python",
+        "/home/leo/src/dark-factory/scripts/local-model-serving/lms_ctl.py",
+        "stop",
+        "moe-stretch"
+      ],
+      "exit_code": 0,
+      "finished_at": "2026-10-07T20:32:41.638422Z",
+      "output_tail": "stopped lms-arm@moe-stretch.service\n",
+      "stage": "stop",
+      "started_at": "2026-10-07T20:32:37.104394Z"
+    },
+    {
+      "argv": [
+        "/home/leo/.local/bin/uv",
+        "run",
+        "--no-sync",
+        "python",
+        "scripts/local_memory_models_eval/harness.py",
+        "teardown",
+        "--arm-spec",
+        "/tmp/lme-eta-3720/evidence/specs/moe-stretch.json"
+      ],
+      "exit_code": 0,
+      "finished_at": "2026-10-07T20:32:45.613020Z",
+      "output_tail": "deleted 'evalmem_lme_eta_moe_stretch'\n",
+      "stage": "teardown",
+      "started_at": "2026-10-07T20:32:41.638817Z"
+    }
+  ],
+  "tap": {
+    "listen_url": "http://127.0.0.1:8418",
+    "upstream_url": "http://127.0.0.1:8413"
+  }
+}

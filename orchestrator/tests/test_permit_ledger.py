@@ -1,5 +1,5 @@
-"""Unit tests for orchestrator.merge_types.SpecPermit and
-orchestrator.merge_speculation_controller.PermitLedger (MQ-refactor zeta /
+"""Unit tests for orchestrator.merge_lane.types.SpecPermit and
+orchestrator.merge_lane.speculation_controller.PermitLedger (MQ-refactor zeta /
 task 2159).
 
 Steps covered:
@@ -12,7 +12,7 @@ Steps covered:
   step-7 RED   — permit storage slot on RealMergeItem/DecidedItem/InflightEntry
   step-8 GREEN — add the permit storage field to the three dataclasses
 
-This module imports orchestrator.merge_speculation_controller LOCALLY inside
+This module imports orchestrator.merge_lane.speculation_controller LOCALLY inside
 each test — PermitLedger does not exist until step-2 — so a not-yet-implemented
 symbol never breaks collection of the rest of the file during the RED steps
 (mirrors test_merge_speculation_controller.py's convention). Neither
@@ -43,7 +43,7 @@ class TestPermitLedgerAcquire:
     async def test_acquire_returns_a_fresh_unreleased_permit_registered_live(
         self, depth: int,
     ) -> None:
-        from orchestrator.merge_speculation_controller import PermitLedger
+        from orchestrator.merge_lane.speculation_controller import PermitLedger
 
         ledger = PermitLedger(asyncio.Semaphore(depth), depth)
 
@@ -56,7 +56,7 @@ class TestPermitLedgerAcquire:
     async def test_n_acquires_track_live_count_and_slot_available(
         self, depth: int,
     ) -> None:
-        from orchestrator.merge_speculation_controller import PermitLedger
+        from orchestrator.merge_lane.speculation_controller import PermitLedger
 
         ledger = PermitLedger(asyncio.Semaphore(depth), depth)
 
@@ -89,7 +89,7 @@ class TestPermitLedgerRelease:
     async def test_release_restores_slot_and_marks_permit_released(
         self, depth: int,
     ) -> None:
-        from orchestrator.merge_speculation_controller import PermitLedger
+        from orchestrator.merge_lane.speculation_controller import PermitLedger
 
         ledger = PermitLedger(asyncio.Semaphore(depth), depth)
         p = await ledger.acquire()
@@ -103,7 +103,7 @@ class TestPermitLedgerRelease:
 
     @pytest.mark.parametrize('depth', [1, 2])
     async def test_double_release_is_a_silent_noop(self, depth: int) -> None:
-        from orchestrator.merge_speculation_controller import PermitLedger
+        from orchestrator.merge_lane.speculation_controller import PermitLedger
 
         ledger = PermitLedger(asyncio.Semaphore(depth), depth)
         p = await ledger.acquire()
@@ -117,8 +117,8 @@ class TestPermitLedgerRelease:
         assert ledger.slot_available + len(ledger.live) == ledger.depth
 
     async def test_release_of_a_never_acquired_permit_raises(self) -> None:
-        from orchestrator.merge_speculation_controller import PermitLedger
-        from orchestrator.merge_types import SpecPermit
+        from orchestrator.merge_lane.speculation_controller import PermitLedger
+        from orchestrator.merge_lane.types import SpecPermit
 
         ledger = PermitLedger(asyncio.Semaphore(1), 1)
         stranger = SpecPermit()
@@ -134,7 +134,7 @@ class TestPermitLedgerRelease:
         len(live) == depth`` at every single step (the ledger-level B7, in
         isolation from any real verifier release).
         """
-        from orchestrator.merge_speculation_controller import PermitLedger
+        from orchestrator.merge_lane.speculation_controller import PermitLedger
 
         depth = 3
         ledger = PermitLedger(asyncio.Semaphore(depth), depth)
@@ -176,7 +176,7 @@ class TestCapPermit:
     """
 
     def test_cap_permit_released_defaults_false(self) -> None:
-        from orchestrator.merge_types import CapPermit
+        from orchestrator.merge_lane.types import CapPermit
 
         p = CapPermit()
 
@@ -186,7 +186,7 @@ class TestCapPermit:
         """eq=False -> identity, not field-value, comparison (mirrors
         SpecPermit): a PermitLedger's ``live`` set must treat every acquired
         CapPermit as a distinct member."""
-        from orchestrator.merge_types import CapPermit
+        from orchestrator.merge_lane.types import CapPermit
 
         p1 = CapPermit()
         p2 = CapPermit()
@@ -211,8 +211,8 @@ class TestPermitLedgerTokenFactory:
     async def test_acquire_returns_a_fresh_unreleased_cap_permit_registered_live(
         self, depth: int,
     ) -> None:
-        from orchestrator.merge_speculation_controller import PermitLedger
-        from orchestrator.merge_types import CapPermit
+        from orchestrator.merge_lane.speculation_controller import PermitLedger
+        from orchestrator.merge_lane.types import CapPermit
 
         ledger = PermitLedger(asyncio.Semaphore(depth), depth, token_factory=CapPermit)
 
@@ -230,8 +230,8 @@ class TestPermitLedgerTokenFactory:
         assertions, but for a CapPermit-backed ledger -- proves the
         generalization didn't special-case SpecPermit anywhere in the
         acquire/release/conservation path."""
-        from orchestrator.merge_speculation_controller import PermitLedger
-        from orchestrator.merge_types import CapPermit
+        from orchestrator.merge_lane.speculation_controller import PermitLedger
+        from orchestrator.merge_lane.types import CapPermit
 
         ledger = PermitLedger(asyncio.Semaphore(depth), depth, token_factory=CapPermit)
 
@@ -258,8 +258,8 @@ class TestPermitLedgerTokenFactory:
         assert ledger.live == frozenset()
 
     async def test_release_is_idempotent_for_cap_permits_too(self) -> None:
-        from orchestrator.merge_speculation_controller import PermitLedger
-        from orchestrator.merge_types import CapPermit
+        from orchestrator.merge_lane.speculation_controller import PermitLedger
+        from orchestrator.merge_lane.types import CapPermit
 
         ledger = PermitLedger(asyncio.Semaphore(1), 1, token_factory=CapPermit)
         p = await ledger.acquire()
@@ -273,8 +273,8 @@ class TestPermitLedgerTokenFactory:
         assert ledger.slot_available + len(ledger.live) == ledger.depth
 
     async def test_release_of_a_never_acquired_cap_permit_raises(self) -> None:
-        from orchestrator.merge_speculation_controller import PermitLedger
-        from orchestrator.merge_types import CapPermit
+        from orchestrator.merge_lane.speculation_controller import PermitLedger
+        from orchestrator.merge_lane.types import CapPermit
 
         ledger = PermitLedger(asyncio.Semaphore(1), 1, token_factory=CapPermit)
         stranger = CapPermit()
@@ -287,8 +287,8 @@ class TestPermitLedgerTokenFactory:
         must keep issuing SpecPermit unchanged -- the default factory is
         additive, not a behaviour change for the existing
         ``_speculation_ledger`` construction."""
-        from orchestrator.merge_speculation_controller import PermitLedger
-        from orchestrator.merge_types import SpecPermit
+        from orchestrator.merge_lane.speculation_controller import PermitLedger
+        from orchestrator.merge_lane.types import SpecPermit
 
         ledger = PermitLedger(asyncio.Semaphore(1), 1)
 
@@ -312,7 +312,7 @@ class TestPermitLedgerReleaseForShutdown:
     """
 
     async def test_raises_slot_available_by_count(self) -> None:
-        from orchestrator.merge_speculation_controller import PermitLedger
+        from orchestrator.merge_lane.speculation_controller import PermitLedger
 
         depth = 2
         ledger = PermitLedger(asyncio.Semaphore(depth), depth)
@@ -324,7 +324,7 @@ class TestPermitLedgerReleaseForShutdown:
         assert ledger.slot_available == before + (depth + 1)
 
     async def test_does_not_mutate_live(self) -> None:
-        from orchestrator.merge_speculation_controller import PermitLedger
+        from orchestrator.merge_lane.speculation_controller import PermitLedger
 
         depth = 2
         ledger = PermitLedger(asyncio.Semaphore(depth), depth)
@@ -338,7 +338,7 @@ class TestPermitLedgerReleaseForShutdown:
         assert p1.released is False  # release_for_shutdown never touches the token itself
 
     async def test_never_raises_when_over_releasing_past_depth(self) -> None:
-        from orchestrator.merge_speculation_controller import PermitLedger
+        from orchestrator.merge_lane.speculation_controller import PermitLedger
 
         depth = 1
         ledger = PermitLedger(asyncio.Semaphore(depth), depth)
@@ -349,8 +349,8 @@ class TestPermitLedgerReleaseForShutdown:
         assert ledger.live == frozenset()
 
     async def test_works_for_a_cap_permit_ledger_too(self) -> None:
-        from orchestrator.merge_speculation_controller import PermitLedger
-        from orchestrator.merge_types import CapPermit
+        from orchestrator.merge_lane.speculation_controller import PermitLedger
+        from orchestrator.merge_lane.types import CapPermit
 
         depth = 2
         ledger = PermitLedger(asyncio.Semaphore(depth), depth, token_factory=CapPermit)
@@ -387,7 +387,7 @@ class TestPermitStorageSlot:
         from unittest.mock import MagicMock
 
         from orchestrator.git_ops import MergeResult
-        from orchestrator.merge_types import RealMergeItem, SpecPermit
+        from orchestrator.merge_lane.types import RealMergeItem, SpecPermit
 
         p = SpecPermit()
         item = RealMergeItem(
@@ -406,7 +406,7 @@ class TestPermitStorageSlot:
         from unittest.mock import MagicMock
 
         from orchestrator.git_ops import MergeResult
-        from orchestrator.merge_types import RealMergeItem
+        from orchestrator.merge_lane.types import RealMergeItem
 
         item = RealMergeItem(
             request=MagicMock(),
@@ -421,7 +421,7 @@ class TestPermitStorageSlot:
     def test_decided_item_carries_a_permit(self) -> None:
         from unittest.mock import MagicMock
 
-        from orchestrator.merge_types import DecidedItem, MergeOutcome, SpecPermit
+        from orchestrator.merge_lane.types import DecidedItem, MergeOutcome, SpecPermit
 
         p = SpecPermit()
         item = DecidedItem(
@@ -437,7 +437,7 @@ class TestPermitStorageSlot:
     def test_decided_item_permit_defaults_to_none(self) -> None:
         from unittest.mock import MagicMock
 
-        from orchestrator.merge_types import DecidedItem, MergeOutcome
+        from orchestrator.merge_lane.types import DecidedItem, MergeOutcome
 
         item = DecidedItem(
             request=MagicMock(),
@@ -451,7 +451,12 @@ class TestPermitStorageSlot:
     def test_inflight_entry_carries_a_permit(self) -> None:
         from unittest.mock import MagicMock
 
-        from orchestrator.merge_types import DecidedItem, InflightEntry, MergeOutcome, SpecPermit
+        from orchestrator.merge_lane.types import (
+            DecidedItem,
+            InflightEntry,
+            MergeOutcome,
+            SpecPermit,
+        )
 
         p = SpecPermit()
         decided_item = DecidedItem(
@@ -474,7 +479,7 @@ class TestPermitStorageSlot:
     def test_inflight_entry_permit_defaults_to_none(self) -> None:
         from unittest.mock import MagicMock
 
-        from orchestrator.merge_types import DecidedItem, InflightEntry, MergeOutcome
+        from orchestrator.merge_lane.types import DecidedItem, InflightEntry, MergeOutcome
 
         decided_item = DecidedItem(
             request=MagicMock(),
@@ -515,7 +520,7 @@ class TestCapPermitStorageSlot:
         from unittest.mock import MagicMock
 
         from orchestrator.git_ops import MergeResult
-        from orchestrator.merge_types import CapPermit, RealMergeItem
+        from orchestrator.merge_lane.types import CapPermit, RealMergeItem
 
         p = CapPermit()
         item = RealMergeItem(
@@ -534,7 +539,7 @@ class TestCapPermitStorageSlot:
         from unittest.mock import MagicMock
 
         from orchestrator.git_ops import MergeResult
-        from orchestrator.merge_types import RealMergeItem
+        from orchestrator.merge_lane.types import RealMergeItem
 
         item = RealMergeItem(
             request=MagicMock(),
@@ -551,7 +556,7 @@ class TestCapPermitStorageSlot:
         from unittest.mock import MagicMock
 
         from orchestrator.git_ops import MergeResult
-        from orchestrator.merge_types import RealMergeItem
+        from orchestrator.merge_lane.types import RealMergeItem
 
         item = RealMergeItem(
             request=MagicMock(),

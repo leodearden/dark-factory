@@ -6,17 +6,20 @@ import asyncio
 import json
 import logging
 import os
+import sys
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _usage_gate_test_helpers import spawn_fault as _spawn_fault
 
-from shared.cli_invoke import AgentResult
+from shared.cli_invoke import AgentResult, parse_claude_cli_output, resolve_claude_binary
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.invocation_outcome import (
     CAP_HIT_PREFIXES,
     NEAR_CAP_PREFIXES,
+    AuthFailed,
     CapHit,
     CliLocalError,
     NearCap,
@@ -671,9 +674,61 @@ def _make_mock_proc(
     return proc
 
 
+def _served_stdout(result_text: str = 'ok') -> bytes:
+    """CLI JSON result proving the call WAS served (exit 0 + subtype success).
+
+    With this on stdout the cap-prefix check is the only thing that can make
+    ``_run_probe`` return False, so a test feeding cap text alongside it pins
+    that check rather than the served-result rule.
+    """
+    return json.dumps({
+        'type': 'result',
+        'subtype': 'success',
+        'is_error': False,
+        'result': result_text,
+        'num_turns': 1,
+        'total_cost_usd': 0.002,
+    }).encode()
+
+
+def _budget_cap_stdout() -> bytes:
+    """CLI JSON result of the probe's own $0.01 cap: served, returns True alone."""
+    return json.dumps({
+        'type': 'result',
+        'subtype': 'error_max_budget_usd',
+        'total_cost_usd': 0.053,
+    }).encode()
+
+
+def _strip_claude_from_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Leave no `claude` on PATH, so a real spawn can never reach the real CLI."""
+    empty_bin = tmp_path / 'empty-bin'
+    empty_bin.mkdir()
+    monkeypatch.setenv('PATH', f'{empty_bin}{os.pathsep}/usr/bin')
+    assert resolve_claude_binary() is None, 'the premise: no claude is reachable'
+
+
+def _recording_fake_claude(tmp_path: Path) -> tuple[Path, Path]:
+    """An executable that records its argv and prints a served result.
+
+    Returns ``(fake, argv_record)``; each run appends one JSON argv line.
+    """
+    fake = tmp_path / 'fake-claude'
+    record = tmp_path / 'fake-claude-argv.jsonl'
+    fake.write_text(
+        f'#!{sys.executable}\n'
+        'import json, sys\n'
+        f'with open({str(record)!r}, "a") as fh:\n'
+        '    fh.write(json.dumps(sys.argv) + "\\n")\n'
+        f'sys.stdout.write({_served_stdout().decode()!r})\n'
+    )
+    fake.chmod(0o755)
+    return fake, record
+
+
 @pytest.mark.asyncio
 class TestRunProbe:
-    """Tests for _run_probe — mock asyncio.create_subprocess_exec."""
+    """Tests for _run_probe — mostly a mocked create_subprocess_exec; the CLAUDE_BINARY tests spawn a real recording fake."""
 
     async def _make_probing_gate(self) -> tuple[UsageGate, AccountState]:
         gate = make_gate(['a'])
@@ -682,9 +737,17 @@ class TestRunProbe:
         return gate, acct
 
     async def test_success_exit_0_no_cap_patterns(self):
-        """Exit code 0, no cap patterns -> returns True."""
+        """Exit 0 with a served success result -> True"""
         gate, acct = await self._make_probing_gate()
-        proc = _make_mock_proc(returncode=0, stdout=b'ok')
+        served = json.dumps({
+            'type': 'result',
+            'subtype': 'success',
+            'is_error': False,
+            'result': 'ok',
+            'num_turns': 1,
+            'total_cost_usd': 0.002,
+        }).encode()
+        proc = _make_mock_proc(returncode=0, stdout=served)
 
         with patch('asyncio.create_subprocess_exec', return_value=proc):
             result = await gate._run_probe(acct)
@@ -696,6 +759,7 @@ class TestRunProbe:
         gate, acct = await self._make_probing_gate()
         proc = _make_mock_proc(
             returncode=0,
+            stdout=_served_stdout(),
             stderr=b"You've hit your usage limit",
         )
 
@@ -709,7 +773,7 @@ class TestRunProbe:
         gate, acct = await self._make_probing_gate()
         proc = _make_mock_proc(
             returncode=0,
-            stdout=b"You're close to your usage limit",
+            stdout=_served_stdout("You're close to your usage limit"),
         )
 
         with patch('asyncio.create_subprocess_exec', return_value=proc):
@@ -723,7 +787,9 @@ class TestRunProbe:
         proc = _make_mock_proc(
             returncode=0,
             stderr=b'Some info',
-            stdout=b"You're close to your usage limit for this billing period",
+            stdout=_served_stdout(
+                "You're close to your usage limit for this billing period",
+            ),
         )
 
         with patch('asyncio.create_subprocess_exec', return_value=proc):
@@ -886,7 +952,7 @@ class TestRunProbe:
             await gate._run_probe(acct)
 
         cmd = captured_args[0]
-        assert 'claude' in cmd
+        assert cmd[0] == 'claude'
         assert '--print' in cmd
         assert '--output-format' in cmd
         assert 'json' in cmd
@@ -900,15 +966,42 @@ class TestRunProbe:
         assert 'bypassPermissions' in cmd
         assert 'Say ok' in cmd
 
-    async def test_empty_stdout_and_stderr_returns_true(self):
-        """Empty stdout and stderr -> returns True (exit code 0)."""
+    async def test_the_probe_spawns_the_claude_binary_override(self, tmp_path, monkeypatch):
+        """CLAUDE_BINARY names the probe's binary, through a real spawn."""
+        _strip_claude_from_path(tmp_path, monkeypatch)
+        fake, record = _recording_fake_claude(tmp_path)
+        monkeypatch.setenv('CLAUDE_BINARY', str(fake))
+        gate, acct = await self._make_probing_gate()
+
+        assert await gate._run_probe(acct) is True
+
+        argv = json.loads(record.read_text().splitlines()[0])
+        assert argv[0] == str(fake)
+
+    async def test_an_unspawnable_override_is_named_by_the_spawn_fault(
+        self, tmp_path, monkeypatch,
+    ):
+        """The spawn fault names the override the operator set, not a bare 'claude'."""
+        _strip_claude_from_path(tmp_path, monkeypatch)
+        missing = tmp_path / 'no-such-claude'
+        monkeypatch.setenv('CLAUDE_BINARY', str(missing))
+        gate, acct = await self._make_probing_gate()
+
+        with pytest.raises(ProbeSpawnError) as excinfo:
+            await gate._run_probe(acct)
+
+        assert excinfo.value.binary == str(missing)
+
+    async def test_empty_stdout_and_stderr_returns_false(self):
+        """Empty stdout and stderr -> False even on exit 0: nothing proves the
+        call was served."""
         gate, acct = await self._make_probing_gate()
         proc = _make_mock_proc(returncode=0, stdout=b'', stderr=b'')
 
         with patch('asyncio.create_subprocess_exec', return_value=proc):
             result = await gate._run_probe(acct)
 
-        assert result is True
+        assert result is False
 
     async def test_nonzero_exit_with_cap_pattern_returns_false(self):
         """Non-zero exit code WITH cap pattern -> returns False.
@@ -919,6 +1012,7 @@ class TestRunProbe:
         gate, acct = await self._make_probing_gate()
         proc = _make_mock_proc(
             returncode=1,
+            stdout=_budget_cap_stdout(),
             stderr=b"You've hit your usage limit",
         )
 
@@ -928,11 +1022,13 @@ class TestRunProbe:
         assert result is False
 
     async def test_all_cap_hit_prefixes_detected(self):
-        """Every prefix in CAP_HIT_PREFIXES triggers False."""
+        """Every prefix in CAP_HIT_PREFIXES triggers False even on a served result."""
         gate, acct = await self._make_probing_gate()
 
         for prefix in CAP_HIT_PREFIXES:
-            proc = _make_mock_proc(returncode=0, stderr=prefix.encode())
+            proc = _make_mock_proc(
+                returncode=0, stdout=_served_stdout(), stderr=prefix.encode(),
+            )
             with patch('asyncio.create_subprocess_exec', return_value=proc):
                 result = await gate._run_probe(acct)
             assert result is False, f'CAP_HIT prefix {prefix!r} not detected'
@@ -942,7 +1038,9 @@ class TestRunProbe:
         gate, acct = await self._make_probing_gate()
 
         for prefix in NEAR_CAP_PREFIXES:
-            proc = _make_mock_proc(returncode=0, stdout=prefix.encode())
+            proc = _make_mock_proc(
+                returncode=0, stdout=_served_stdout(prefix),
+            )
             with patch('asyncio.create_subprocess_exec', return_value=proc):
                 result = await gate._run_probe(acct)
             assert result is False, f'NEAR_CAP prefix {prefix!r} not detected'
@@ -952,6 +1050,7 @@ class TestRunProbe:
         gate, acct = await self._make_probing_gate()
         proc = _make_mock_proc(
             returncode=0,
+            stdout=_served_stdout(),
             stderr=b"YOU'VE HIT YOUR USAGE LIMIT",
         )
 
@@ -981,7 +1080,9 @@ class TestRunProbe:
         prefix = CAP_HIT_PREFIXES[0]  # e.g. "You've hit your"
         # Deliberately no 'resets', 'usage limit', or 'upgrade your plan' in the string.
         stderr_content = f'{prefix} quota'.encode()
-        proc = _make_mock_proc(returncode=0, stderr=stderr_content)
+        proc = _make_mock_proc(
+            returncode=0, stdout=_served_stdout(), stderr=stderr_content,
+        )
 
         with patch('asyncio.create_subprocess_exec', return_value=proc):
             result = await gate._run_probe(acct)
@@ -1405,7 +1506,8 @@ class TestStaleSpawnFailureCounter:
       cap detection, which the spawn-fault branch deliberately never
       touches); `_account_resume_probe_loop` then exits at its
       `if not acct.capped: return` without clearing anything.
-    - `_on_sighup_async` force-resets EVERY account to AVAILABLE.
+    - `_on_sighup_async` force-resets every non-AUTH_FAILED account to
+      AVAILABLE.
 
     The counter left behind is stale forever, because the account will never
     probe again to zero it, and it breaks the latch in BOTH directions:
@@ -1715,10 +1817,10 @@ class TestSighupSpawnFailureCounter:
     """SIGHUP on a broken host must leave no counter behind (task 4512 review).
 
     The one path that reaches `_note_probe_spawn_failure` for an account which
-    is NOT in a probing phase. `_on_sighup_async` force-resets every account to
-    AVAILABLE — zeroing `probe_spawn_failures` via `_transition` — and only
-    THEN fans out `_reprobe_account` across all of them. With the host broken,
-    every one of those reprobes raised `ProbeSpawnError` and left an AVAILABLE
+    is NOT in a probing phase. `_on_sighup_async` force-resets every
+    non-AUTH_FAILED account to AVAILABLE — zeroing `probe_spawn_failures` via
+    `_transition` — and only THEN fans out `_reprobe_account` across all of
+    them. With the host broken, every one of those reprobes raised `ProbeSpawnError` and left an AVAILABLE
     account holding a count of 1.
 
     Nothing could ever clear it: an AVAILABLE account runs neither
@@ -2129,14 +2231,16 @@ class TestProbeLoopSpawnFault:
 class TestRunProbeClassifyInvocationConsistency:
     """_run_probe's verdicts must agree with classify_invocation(strict_confirm=False).
 
-    ``test_non_cap_marker_is_not_misread_as_still_capped`` is RED against
-    today's _run_probe: it scans CAP_HIT_PREFIXES/NEAR_CAP_PREFIXES directly
-    with no notion of NON_CAP_CLI_ERROR_MARKERS, so a message that contains
-    both a cap-like prefix and a local-CLI-error marker is misread as "still
-    capped" (returns False) today. Once _run_probe is rewired onto
-    classify_invocation (step-4), CliLocalError precedence applies uniformly
-    and this goes green. The other test pins the already-correct prefix-only
-    (no confirm keyword) behavior against the classifier as a regression guard.
+    ``test_non_cap_marker_is_not_misread_as_still_capped`` pins CliLocalError
+    precedence (reify-3604): a message containing both a cap-like prefix and a
+    local-CLI-error marker is not read as "still capped". Since task 5944 such
+    a probe is also not SERVED, so both readings return False; the one place
+    they still differ is the AUTH_FAILED -> CAPPED demotion, which a "still
+    capped" reading would take and a CliLocalError reading must not. The other
+    test pins the prefix-only (no confirm keyword) behavior against the
+    classifier as a regression guard. A third pins AuthFailed precedence: a
+    401/403 result whose body carries a cap prefix is an auth failure, so an
+    AUTH_FAILED account is not demoted to CAPPED.
     """
 
     async def _make_probing_gate(self) -> tuple[UsageGate, AccountState]:
@@ -2156,7 +2260,9 @@ class TestRunProbeClassifyInvocationConsistency:
         )
         assert isinstance(outcome, (CapHit, NearCap))
 
-        proc = _make_mock_proc(returncode=0, stderr=text.encode())
+        proc = _make_mock_proc(
+            returncode=0, stdout=_served_stdout(), stderr=text.encode(),
+        )
         with patch('asyncio.create_subprocess_exec', return_value=proc):
             result = await gate._run_probe(acct)
         assert result is False
@@ -2164,7 +2270,9 @@ class TestRunProbeClassifyInvocationConsistency:
     async def test_non_cap_marker_is_not_misread_as_still_capped(self):
         """reify-3604 applied to _run_probe: a local CLI/usage error occurring
         alongside cap-like text must not be treated as "still capped"."""
-        gate, acct = await self._make_probing_gate()
+        gate = make_gate(['a'])
+        acct = gate._accounts[0]
+        acct.auth_failed = True
         text = (
             f'{CAP_HIT_PREFIXES[0]} usage limit. Your plan resets in 3h. '
             'permission denied: /tmp/x'
@@ -2177,10 +2285,35 @@ class TestRunProbeClassifyInvocationConsistency:
         proc = _make_mock_proc(returncode=0, stderr=text.encode())
         with patch('asyncio.create_subprocess_exec', return_value=proc):
             result = await gate._run_probe(acct)
-        assert result is True, (
+        assert result is False, 'a local CLI error is not evidence of a served call'
+        assert acct.phase == AccountPhase.AUTH_FAILED, (
             '_run_probe must not misread a local CLI error co-occurring with '
-            'cap-like text as "still capped" (CliLocalError precedence, reify-3604)'
+            'cap-like text as "still capped" and demote AUTH_FAILED -> CAPPED '
+            '(CliLocalError precedence, reify-3604)'
         )
+
+    async def test_auth_failure_status_outranks_cap_text_like_the_classifier(self):
+        stdout = json.dumps({
+            'type': 'result',
+            'subtype': 'success',
+            'is_error': True,
+            'api_error_status': 403,
+            'result': "You've used all seats in this organization",
+        })
+        outcome = classify_invocation(
+            parse_claude_cli_output(stdout=stdout, stderr='', returncode=1),
+            strict_confirm=False,
+        )
+        assert isinstance(outcome, AuthFailed)
+
+        gate = make_gate(['a'])
+        acct = gate._accounts[0]
+        acct.auth_failed = True
+        proc = _make_mock_proc(returncode=1, stdout=stdout.encode())
+        with patch('asyncio.create_subprocess_exec', return_value=proc):
+            result = await gate._run_probe(acct)
+        assert result is False
+        assert acct.phase == AccountPhase.AUTH_FAILED
 
 
 # ---------------------------------------------------------------------------

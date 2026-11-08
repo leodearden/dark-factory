@@ -21,7 +21,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock
 
 import pytest
-from _park_test_helpers import event_data_for, event_payloads, make_task
+from _park_test_helpers import event_data_for, event_payloads, make_task, make_withheld_task
 from _recording_event_store import _RecordingEventStore
 
 from orchestrator.config import OrchestratorConfig
@@ -31,8 +31,8 @@ M1, M2, M3, M4 = 'm1.py', 'm2.py', 'm3.py', 'm4.py'
 
 
 def _foreign_owner(files: list[str]) -> dict:
-    """F: a running task that keeps its park — not a candidate, not GC'd."""
-    return make_task('F', 'high', files, status='in-progress')
+    """F: a pending owner withheld from dispatch: keeps its park, never a candidate."""
+    return make_withheld_task('F', 'high', files)
 
 
 def _scheduler() -> tuple[Scheduler, _RecordingEventStore]:

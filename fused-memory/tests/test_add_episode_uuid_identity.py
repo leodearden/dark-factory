@@ -20,10 +20,11 @@ Every graphiti mock in the suite is a permissive ``AsyncMock(return_value=None)`
 test_journaling_integration.py, test_e2e_durable_queue.py).  A mock that accepts
 any ``uuid=`` can never surface a load-or-raise contract.  The missing seam is
 ``_graphiti_fake.FakeGraphitiClient``, a STATEFUL fake with a real episodic
-store that raises on an unknown uuid, reached here through
-``_graphiti_fake.backend_with_fake_graphiti``.  It lives in its own module
-rather than here because ``test_graphiti_add_episode_uuid_param.py`` (task
-3568) needs the same seam to exercise the backend-side guard.
+store that raises on an unknown uuid, wired into a real backend here by the
+conftest factory fixture ``make_backend_over_fake_graphiti``.  The fake lives
+in its own module rather than here because
+``test_graphiti_add_episode_uuid_param.py`` (task 3568) needs the same seam to
+exercise the backend-side guard.
 
 The fake also encodes the two traps this fix must not fall into:
 
@@ -59,9 +60,14 @@ from _fm_helpers import (
     falkor_skipif,
     unique_graph_name,
 )
-from _graphiti_fake import backend_with_fake_graphiti
+from _graphiti_fake import FakeGraphitiClient
 
-from fused_memory.backends.graphiti_client import GraphitiBackend
+from fused_memory.backends.graphiti_client import (
+    GraphitiBackend,
+    build_embedder,
+    build_llm_client,
+)
+from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.services.memory_service import MemoryService
 from fused_memory.services.planned_episode_registry import PlannedEpisodeRegistry
 
@@ -71,11 +77,11 @@ from fused_memory.services.planned_episode_registry import PlannedEpisodeRegistr
 
 
 @pytest.fixture
-def svc_and_fake(mock_config):
+def svc_and_fake(mock_config, make_backend_over_fake_graphiti):
     """MemoryService with a real GraphitiBackend over the stateful fake."""
     svc = MemoryService(mock_config)
-    backend, fake = backend_with_fake_graphiti(mock_config)
-    svc.graphiti = backend
+    fake = FakeGraphitiClient()
+    svc.graphiti = make_backend_over_fake_graphiti(mock_config, fake)
 
     svc.mem0 = MagicMock()
     svc.mem0.search = AsyncMock(return_value={'results': []})
@@ -779,6 +785,11 @@ class TestPlanningEpisodeIsFilteredFromSearch:
 #
 # Deselected by default (pyproject.toml's `-m 'not integration'`), so it
 # burdens neither CI nor a routine local run with OPENAI credits.
+#
+# Its config helper `_live_config` lives here too, with a hermetic guard over
+# that helper. The guard is neither live nor deselected: it runs in every
+# default suite, and is the in-pipeline evidence that the live test builds
+# graphiti's clients from config.
 # ---------------------------------------------------------------------------
 
 _LIVE_CONTENT = 'Task 3561 fixed the self-referential add_episode NodeNotFoundError.'
@@ -820,6 +831,51 @@ async def _live_episodic_count(graph_name: str, episode_uuid: str) -> tuple[int,
         await client.aclose()
 
 
+def _live_config(base: FusedMemoryConfig, api_key: str) -> FusedMemoryConfig:
+    """Point *base* at the live FalkorDB with *api_key* on both OpenAI providers.
+
+    Production config.yaml sets ``api_key: ${OPENAI_API_KEY}`` on both.
+    """
+    config = base.model_copy(deep=True)
+    # Keyless, Graphiti substitutes graphiti_core's default clients (deprecated small
+    # model gpt-4.1-nano); see test_the_live_config_runs_graphiti_on_the_configured_clients.
+    llm_provider = config.llm.providers.openai
+    embedder_provider = config.embedder.providers.openai
+    assert llm_provider is not None and embedder_provider is not None, (
+        'base config must carry openai provider blocks for both llm and embedder; '
+        '_live_config sets api_key on both'
+    )
+    llm_provider.api_key = api_key
+    embedder_provider.api_key = api_key
+    config.graphiti.falkordb.uri = f'redis://{FALKOR_HOST}:{FALKOR_PORT}'
+    return config
+
+
+def test_the_live_config_runs_graphiti_on_the_configured_clients(mock_config):
+    api_key = 'sk-hermetic-not-a-real-key'
+    config = _live_config(mock_config, api_key)
+
+    llm = build_llm_client(config)
+    assert llm is not None, (
+        'build_llm_client returned None, so graphiti_core.Graphiti substitutes '
+        'its default OpenAIClient(), whose small model is the hard-coded '
+        'gpt-4.1-nano (now 404 model_not_found, task 8072), not llm.model.'
+    )
+    assert (llm.model, llm.small_model, llm.config.api_key) == (
+        config.llm.model,
+        config.llm.model,
+        api_key,
+    )
+
+    embedder = build_embedder(config)
+    assert embedder is not None
+    assert (
+        embedder.config.embedding_model,
+        embedder.config.embedding_dim,
+        embedder.config.api_key,
+    ) == (config.embedder.model, config.embedder.dimensions, api_key)
+
+
 @falkor_skipif()
 @pytest.mark.integration
 @pytest.mark.skipif(
@@ -849,14 +905,7 @@ async def test_the_write_creates_a_real_episodic_node_in_falkordb(mock_config):
 
     graph_name = unique_graph_name('3561_episode_uuid')
 
-    config = mock_config.model_copy(deep=True)
-    # mock_config's api_keys are the literal string 'test-key'. Clearing them
-    # makes the OpenAI clients fall back to the real OPENAI_API_KEY env var —
-    # the idiom test_recon_dedup_premise.py:130-133 established for the two
-    # tests in this suite that need real embeddings.
-    config.llm.providers.openai.api_key = None
-    config.embedder.providers.openai.api_key = None
-    config.graphiti.falkordb.uri = f'redis://{FALKOR_HOST}:{FALKOR_PORT}'
+    config = _live_config(mock_config, os.environ['OPENAI_API_KEY'])
 
     backend = GraphitiBackend(config)
     # skip_maintenance=True is load-bearing, not an optimisation: the default

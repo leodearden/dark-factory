@@ -1,0 +1,210 @@
+{
+ "stream": "S11",
+ "prd_path": "docs/prds/review-all-shared-frontend-layer-and-generated-wire-types.md",
+ "sidecar_path": "docs/prds/review-all-shared-frontend-layer-and-generated-wire-types.capability-manifest.yaml",
+ "filed": [
+  {
+   "label": "alpha1",
+   "task_id": "1239",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-e7e284aee0d9"
+   ],
+   "depends_on": []
+  },
+  {
+   "label": "alpha2",
+   "task_id": "1249",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-e7e284aee0d9",
+    "fk-761322b9de8d",
+    "fk-49bd9ab85232",
+    "fk-9521847a42ef"
+   ],
+   "depends_on": [
+    "1239",
+    "442"
+   ],
+   "note": "session seam gate"
+  },
+  {
+   "label": "beta",
+   "task_id": "1255",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-89729c12b958",
+    "fk-9521847a42ef"
+   ],
+   "depends_on": [
+    "1249"
+   ]
+  },
+  {
+   "label": "gamma",
+   "task_id": "1258",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-14af6ece161a",
+    "fk-dd6838e7d69b",
+    "fk-9521847a42ef"
+   ],
+   "depends_on": [
+    "1249",
+    "1135"
+   ],
+   "note": "read seam gate"
+  },
+  {
+   "label": "delta1",
+   "task_id": "1262",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-2ef47a71c9b4",
+    "fk-14af6ece161a",
+    "fk-b1b250a04736",
+    "fk-557c2f999ab6",
+    "fk-9521847a42ef"
+   ],
+   "depends_on": [
+    "1258",
+    "1252",
+    "1074"
+   ]
+  },
+  {
+   "label": "delta2",
+   "task_id": "1264",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-14af6ece161a",
+    "fk-cc3f283090a7",
+    "fk-557c2f999ab6",
+    "fk-49bd9ab85232",
+    "fk-b1b250a04736",
+    "fk-9521847a42ef"
+   ],
+   "depends_on": [
+    "1258",
+    "1252",
+    "1193",
+    "1199"
+   ]
+  },
+  {
+   "label": "epsilon",
+   "task_id": "1252",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-e5b3c5ab2e42",
+    "fk-557c2f999ab6",
+    "fk-e7e284aee0d9"
+   ],
+   "depends_on": [
+    "1239"
+   ]
+  },
+  {
+   "label": "zeta",
+   "task_id": "1268",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-93dd43948eca",
+    "fk-6e809699ddc6",
+    "fk-e6d507d32735"
+   ],
+   "depends_on": [
+    "1239",
+    "1112",
+    "1122",
+    "1126",
+    "1079",
+    "1074",
+    "1193",
+    "1196",
+    "1141",
+    "1066",
+    "442"
+   ],
+   "note": "INV-4 enforcing test"
+  },
+  {
+   "label": "eta",
+   "task_id": "1270",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-9599cc585366"
+   ],
+   "depends_on": [
+    "1249",
+    "1252",
+    "1112",
+    "1115"
+   ]
+  },
+  {
+   "label": "theta",
+   "task_id": "1243",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-6e809699ddc6"
+   ],
+   "depends_on": [],
+   "note": "lands early; triage crash path"
+  },
+  {
+   "label": "iota",
+   "task_id": "1047",
+   "priority": "low",
+   "x_finding_key": [
+    "fk-d71b46072b60"
+   ],
+   "depends_on": [
+    "1249"
+   ],
+   "note": "amended in place"
+  },
+  {
+   "label": "kappa",
+   "task_id": "1245",
+   "priority": "low",
+   "x_finding_key": [
+    "fk-f6c542ac6996",
+    "fk-3c2eb5f0816d"
+   ],
+   "depends_on": [
+    "1069"
+   ]
+  },
+  {
+   "label": "frontend-verify-step (382 option B)",
+   "task_id": "1298",
+   "priority": "low",
+   "x_finding_key": [],
+   "depends_on": [
+    "382",
+    "1268"
+   ],
+   "note": "owner ruling 2026-10-16; external dep dark_factory:5653; not a gate dep"
+  }
+ ],
+ "held_leaves": [],
+ "gate_dependencies_added": [
+  "1239",
+  "1249",
+  "1258",
+  "1262",
+  "1264",
+  "1268",
+  "1243"
+ ],
+ "commit_planning_result": "all 12 pending; sidecar stamped",
+ "lead_rulings": [
+  "Cancelled as accepted (lead, 2026-10-15): 939 -> 1239; 554 -> 1249; 1049 -> 1258; 1043, 717 -> 1264; 786, 825 -> 1268. 785 NOT cancelled: branch task/785 carries commits (7a31f2f …); coordination note left; Leo decides land-or-cancel (1262 + 1264 subsume items 1, 3, 4; item 2 landed via 2476fda/5ecc31e).",
+  "Edges 697 -> 1258, 605 -> 1258 (Q4); 1249 and 1268 -> 442 (P-Gate alpha, Role as a set) added at decompose; coordination notes on 428, 605, 638, 474, 475, 442.",
+  "Decompose drift from task 210: frontend/src/api/opsTypes.ts (fourth hand-kept wire file, deleted by 1268) and components/ageLabel.ts (deleted by 1252).",
+  "fk-e5f819d4d63a closed by task 1017 (c4f37a6); 382 stays Leo's owner decision.",
+  "Briefing (interactive on main): portals known_gaps — console 401 gap closes with 1249; thin-coverage items with 1255/1258/1262/1264; after 1239 the reinstall hint is a root npm ci.",
+  "2026-10-16 (Leo, Q3): 382 re-scoped in place to the merge-verify frontend gate (high; 382 -> 1239; 1268 -> 382); 1298 filed for option B; briefing refresh gate 1305 (after 382) replaces the frontends decision entry."
+ ]
+}

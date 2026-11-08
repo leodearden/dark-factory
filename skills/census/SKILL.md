@@ -88,7 +88,7 @@ Watch for the final line:
    - **Verification:** present on every run given `--max-verify-clusters`, and therefore on every trickle-launched run. The anomaly to look for is the bullet **"ALL N … were REJECTED and none survived"**. It signals a suspected systemic verifier failure. Check the per-cluster `verify failed` warnings in the journal before accepting the run.
    - **Unresolved Verdicts:** verdicts paid for and dropped against a standing record.
    - **Origin x Manifestation Matrix:** from the verifier's phase stamps.
-   - **Synthesis:** prose. *(until L10)* It is not parsed. Its "inputs to the merger" dispositions are not applied, so act on any you agree with by hand.
+   - **Synthesis:** prose. *(until L10)* It is not parsed, and nothing in it is applied. Current reports open the section with the runner's not-applied notice, and the model heads its proposals with `scripts/legibility/census.py::SYNTHESIS_PROPOSALS_HEADING`; earlier reports call the same proposals "inputs to the merger", and those were never applied either. To act on one you agree with, put an entry correction or sighting in a §7.3 coding record and run `scripts/legibility/codebook.py apply`, checking that its printed `applied:` stats show it matched or applied (a record reusing the sighting's own session is a silent no-op); promote or reject a candidate through census adjudication; never hand-edit `docs/legibility/confusion-codebook.yaml`.
    - **Filed Tasks:** ticket ids, plus the cross-project list.
    - **Recorded, Not Filed** and **Cost**.
    The report has no per-stratum coverage section.
@@ -125,8 +125,8 @@ Precedent: dark_factory was seeded this way in commit `0b99cf4ca2`, from `plans/
   - The trickle and the census record every coded session in a host-local ledger. The census skips ledgered and zero-signal sessions, and a capped run's unmined sessions are picked up by the next run, so rolling `last_census_at` back is no longer needed.
   - `census-state.json` gains `last_census_run_id`, `last_census_as_of_sha` and `session_watermark`, and `last_census_report` becomes repo-relative. Check the ledger with `session_ledger.py stats --project-id <id>`.
 - **L8a:** The novelty spike becomes relative to its trailing baseline, and the floor is measured from the session watermark, so the trigger stops firing every night.
-- **L8b:** The tasks-landed condition and `last_census_done_count` are retired. The trigger fires on the weighted completion of the tasks the previous run filed (contract §11), or on a novelty spike. The anchor-seeding JSON then needs only `last_census_at` and `last_census_report`.
-  - **Open for Leo:** whether the 10-day `max_interval_days` backstop survives. The contract allows the calendar only as the minimum transcript window. If the backstop is kept, a first census still auto-fires once the earliest codebook date is `max_interval_days` old. If it is dropped, a first census fires only on a novelty spike or by hand.
+- **L8b:** The tasks-landed condition, the 10-day `max_interval_days` backstop and `last_census_done_count` are retired; the backstop is dropped by decision (Leo, 2026-10-05), and a `legibility.yaml` still carrying the key is ignored with one deprecation warning. The trigger fires on the weighted completion of the tasks the previous run filed (contract §11), or on a relative novelty spike, and either only once the floor has passed. The floor is the minimum transcript window, measured from the session watermark; it never fires a census by itself. The anchor-seeding JSON then needs only `last_census_at` and `last_census_report`.
+  - **A first census, without the backstop:** a never-censused project has no previous run id, so completion is N/A. Its floor is measured from the earliest codebook date, and once that floor has passed it fires only on a novelty spike. Otherwise it fires only when run by hand, which is also the only way a project with no trickle data gets a census.
 - **L2, L3:**
   - Verdicts carry anchor, tags, severity with a reason, and route.
   - Entries carry `finding_key`/`finding_area`/`finding_anchor`/`finding_tags`, and the report gains `## Findings` in the contract §1 shape.
@@ -139,7 +139,7 @@ Precedent: dark_factory was seeded this way in commit `0b99cf4ca2`, from `plans/
   - `## Screened` counts clusters attached to existing records with no verify spend.
   - `## Adjudication` drains the pending-candidate backlog through a capped, similarity-clustered queue and lists every attach for audit.
   - `--max-verify-clusters` deferrals then reach adjudication without recurring.
-- **L9:** The coder is given the project's invariant slugs, and unknown slugs are dropped and counted.
+- **L9:** The coder is given the project's invariant slugs, and unknown slugs are dropped and counted. It is also given the `## Definition` section of `docs/code-quality.md` (never the heuristics) as the test a confusion must meet to be minted; tagging stays with the verifier.
 - **L10:** Synthesis is rendered from validated JSON as new versus re-observed findings, and its phase refinements and corrections are applied rather than left in prose.
 - **G:** A deterministic gate checks the first automatic report after the batch lands for all of the above.
 

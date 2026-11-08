@@ -169,14 +169,10 @@ def test_orchestrator_restart_config_round_trips_through_config_model(
     _assert_key_binds(cfg, root_config, "orchestrator_restart_on_merge_enabled")
     _assert_key_binds(cfg, root_config, "orchestrator_restart_script")
     _assert_key_binds(cfg, root_config, "orchestrator_restart_watch_prefixes")
-
-    # Self-redeploy rate cap (task 2371). The committed YAML does not set this
-    # key, so it must round-trip to the field's default (8h). A rename/typo in
-    # config.py would surface here as the attribute vanishing (AttributeError).
-    assert root_config.orchestrator_restart_min_interval_secs == pytest.approx(28800.0), (
-        "OrchestratorConfig.orchestrator_restart_min_interval_secs did not "
-        "resolve to its 8h default — check for a field rename/typo in config.py"
-    )
+    # Self-redeploy rate cap (task 2371): committed explicitly since Leo's
+    # 2026-10-19 72h ruling. The value equals the field's own default, so the
+    # equality term is vacuous here and the two presence terms carry the guard.
+    _assert_key_binds(cfg, root_config, "orchestrator_restart_min_interval_secs")
 
 
 def test_binding_guard_bites_on_a_typod_key_and_on_a_renamed_field(

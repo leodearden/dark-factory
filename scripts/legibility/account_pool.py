@@ -81,7 +81,7 @@ def build_pool(*, accounts_file=None, env_file=None) -> UsageGate:
 
     NEVER RAISES: a pool that comes back empty, and a roster that cannot be
     read or parsed at all (task 5635), both degrade LOUDLY to an empty pool.
-    Copies ``evals/runner.py::_build_eval_usage_gate``'s warn-rather-than-crash
+    Copies ``evals/eval_gate.py::build_eval_usage_gate``'s warn-rather-than-crash
     shape, for a reason specific to this caller: refusing to start would
     take the whole night down, while a warned empty pool still reaches task
     4736's honest DEFERRED path (``session_runner`` raises ``NoHeadroom``

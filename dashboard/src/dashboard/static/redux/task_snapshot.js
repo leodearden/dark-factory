@@ -32,7 +32,7 @@
 // Module scope, no fallback, RENAMED — see the CANONICAL note in datum.js's
 // header.
 const {
-  withReceipt: stampSnapshotReceipt,
+  servedDatum: servedSnapshotDatum,
   unknownDatum: unknownSnapshotDatum,
   combinedDatum: combineSnapshotDatums,
   isDatum: isSnapshotDatum,
@@ -48,8 +48,8 @@ const TASKS_ENDPOINT = '/api/v2/dashboard/tasks';
 
 const SNAPSHOT_NOT_YET_FETCHED = 'not yet fetched';
 
-function snapshotReceipt(data) {
-  return (data.__receipt || {})[TASKS_ENDPOINT] || null;
+function snapshotReceipts(data) {
+  return data.__receipt || {};
 }
 
 function snapshotEntries(data) {
@@ -58,18 +58,13 @@ function snapshotEntries(data) {
 
 // The Datum under one wire key of one project's entry — `census` or `rows`,
 // as TaskSnapshot.to_wire() names them — stamped with the /tasks receipt, or a
-// hole saying which part is missing. No receipt outranks everything else, as
-// in datum.js::plainDatum: before the first payload, nothing that is absent is
-// yet evidence of anything.
+// hole saying which part is missing. The receipt rule is datum.js::servedDatum's.
 function snapshotDatum(data, project, wireKey) {
-  const receipt = snapshotReceipt(data);
-  if (!receipt) return unknownSnapshotDatum(SNAPSHOT_NOT_YET_FETCHED);
   const entry = snapshotEntries(data)[project];
-  if (!entry) return unknownSnapshotDatum('the /tasks payload has no entry for ' + project);
-  if (!isSnapshotDatum(entry[wireKey])) {
-    return unknownSnapshotDatum('the /tasks entry for ' + project + ' has no ' + wireKey + ' Datum');
-  }
-  return stampSnapshotReceipt(entry[wireKey], receipt);
+  const why = entry
+    ? 'the /tasks entry for ' + project + ' has no ' + wireKey + ' Datum'
+    : 'the /tasks payload has no entry for ' + project;
+  return servedSnapshotDatum(entry && entry[wireKey], TASKS_ENDPOINT, why, snapshotReceipts(data));
 }
 
 function projectCensus(data, project) {
@@ -89,23 +84,13 @@ function snapshotRowsOver(data) {
   );
 }
 
-// Whether a fresh read renders exactly as the Datum a caller already holds:
-// the same fields, the value compared by reference. projectRows and the
-// terminal readers stamp a new object per call, so identity cannot say it; a
-// new payload or a new receipt makes it false, and so re-reads the age.
-function sameDatum(held, fresh) {
-  const keys = Object.keys(held);
-  return keys.length === Object.keys(fresh).length
-    && keys.every(key => Object.prototype.hasOwnProperty.call(fresh, key) && Object.is(held[key], fresh[key]));
-}
-
 // ── A census over several projects ──
 // `projects` null means every project the snapshot carries: task ROOTS, not
 // ORCHESTRATORS entries, so a tile's headline and its burndown history count
 // one population. A hole in any project is a hole in the total
 // (datum.js::combinedDatum).
 function censusOver(data, projects) {
-  if (!snapshotReceipt(data)) return unknownSnapshotDatum(SNAPSHOT_NOT_YET_FETCHED);
+  if (!snapshotReceipts(data)[TASKS_ENDPOINT]) return unknownSnapshotDatum(SNAPSHOT_NOT_YET_FETCHED);
   const scope = projects === null ? Object.keys(snapshotEntries(data)) : projects;
   return combineSnapshotDatums(
     scope.map(project => [project, projectCensus(data, project)]),
@@ -272,27 +257,77 @@ function viewReason([view, datum]) {
 }
 
 // ── The terminal window ──
-// Terminal rows come only from the on-demand ?terminal=<project> window.
-// OrchTab lists that window when another surface's request has landed one, but
-// never requests it itself. data.js::datumFor would call an absent window
-// 'not yet fetched', which promises a fetch that is not coming, so the hole
-// states what is actually true instead.
+// Terminal rows come only from the on-demand ?terminal=<project> window. A
+// surface requests the windows of its wanted set through
+// createTerminalWindowHooks, and reads a window it requested as
+// data.js::onDemandDatum shows it. A window it did NOT request — the Tasks tab
+// lists one for each project outside its wanted set — reads through
+// unrequestedTerminalRows: data.js::datumFor would call an absent window 'not
+// yet fetched', which promises a fetch that is not coming, so the hole states
+// what is true instead.
 const TERMINAL_NOT_REQUESTED = 'the terminal window is fetched on request only, and this view does not request it';
 
 function unrequestedTerminalRows(served) {
   return isSnapshotDatum(served) ? served : unknownSnapshotDatum(TERMINAL_NOT_REQUESTED);
 }
 
-// PRD decision 5: the projects whose window a surface requests — every one
-// while the terminal view is selected, else each one grouped by PRD.
-function terminalWindowProjects(projectIds, filter, groupedIds) {
-  return projectIds.filter(id => filter.terminal || groupedIds.includes(id));
+// The Tasks tab's wanted set (PRD decision 5): its one filter covers every
+// project, so every one while the terminal view is selected, else none. The
+// by-PRD lanes read /prds and never request the window
+// (plans/dashboard-prd-lanes-prd.md §4.4).
+function terminalWindowProjects(projectIds, filter) {
+  return projectIds.filter(() => filter.terminal);
 }
 
 // The projects in `wanted` that were not in `wantedBefore`: the only ones a
 // change to the wanted set owes a request, since the rest already had theirs.
 function terminalWindowEntrants(wantedBefore, wanted) {
   return wanted.filter(id => !wantedBefore.includes(id));
+}
+
+// OrchTab's wanted set (PRD decision 5): each project whose view filter, on
+// any listing of it, selects the terminal view — once, in listing order.
+// OrchTab keeps one filter per orchestrator, so two listings of one project
+// owe one request.
+function terminalSelectingProjects(listings) {
+  const selecting = listings.filter(listing => listing.filter.terminal).map(listing => listing.project);
+  return selecting.filter((project, i) => selecting.indexOf(project) === i);
+}
+
+// The hook a requesting surface renders terminal windows through, built over
+// `react` (React itself, or anything carrying its useState, useEffect and
+// useRef) and `loader` (data.js's DF_DATA_LOADER). Both come from the caller,
+// as persisted_state.js::createPersistedHooks takes React, so this module
+// reads neither at load and node drives the hook with stand-ins.
+function createTerminalWindowHooks({ useState, useEffect, useRef }, loader) {
+  // Requests a project's window as it enters `wanted` (PRD decision 5: once per
+  // entry, never per poll) and returns windowOf(project), the Datum to list for
+  // any project: a wanted one's shows what this surface's own request is doing
+  // until the window lands; any other's is unrequestedTerminalRows over `data`.
+  //
+  // No cleanup cancels a pending outcome: a later run does not re-request a
+  // project still in the set, so its outcome arrives only via the run that asked.
+  function useTerminalWindows(data, wanted) {
+    const [outcomes, setOutcomes] = useState({});
+    const wantedBefore = useRef([]);
+    const wantedKey = wanted.join('\n');
+    useEffect(() => {
+      const entrants = terminalWindowEntrants(wantedBefore.current, wanted);
+      wantedBefore.current = wanted;
+      if (entrants.length === 0) return;
+      setOutcomes(held => ({ ...held, ...Object.fromEntries(entrants.map(project => [project, null])) }));
+      for (const project of entrants) {
+        loader.requestOnDemand('terminal', project).then(outcome => {
+          setOutcomes(held => ({ ...held, [project]: outcome }));
+        });
+      }
+    }, [wantedKey]); // eslint-disable-line react-hooks/exhaustive-deps
+    return project => (wanted.includes(project)
+      ? loader.onDemandDatum('terminal', project, outcomes[project] ?? null)
+      : unrequestedTerminalRows(data[loader.ON_DEMAND_KEYS.terminal.key(project)]));
+  }
+
+  return { useTerminalWindows };
 }
 
 // Module-unique export const, never a bare `API` — the CANONICAL note in
@@ -317,7 +352,8 @@ const TASK_SNAPSHOT_API = {
   unrequestedTerminalRows,
   terminalWindowProjects,
   terminalWindowEntrants,
-  sameDatum,
+  terminalSelectingProjects,
+  createTerminalWindowHooks,
 };
 
 if (typeof module !== 'undefined' && module.exports) {

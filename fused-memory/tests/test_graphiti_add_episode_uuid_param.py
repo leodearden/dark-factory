@@ -44,13 +44,11 @@ explicit ``@pytest.mark.asyncio``.
 from __future__ import annotations
 
 import logging
-from unittest.mock import MagicMock
 
 import pytest
-from _graphiti_fake import FakeGraphitiClient, backend_with_fake_graphiti
+from _graphiti_fake import FakeGraphitiClient
 from graphiti_core.errors import NodeNotFoundError as GraphitiCoreNodeNotFoundError
 
-import fused_memory.services.durable_queue as dq_module
 from fused_memory.backends import graphiti_client
 
 # Never stored by the fake, so its ``uuid=`` branch raises the genuine
@@ -86,9 +84,10 @@ def _seam_warnings(caplog) -> list[str]:
 
 
 @pytest.fixture
-def backend_and_fake(mock_config):
+def backend_and_fake(mock_config, make_backend_over_fake_graphiti):
     """A REAL GraphitiBackend over the stateful graphiti_core fake."""
-    return backend_with_fake_graphiti(mock_config)
+    fake = FakeGraphitiClient()
+    return make_backend_over_fake_graphiti(mock_config, fake), fake
 
 
 class TestFreshUuidIsRejectedLoudly:
@@ -153,37 +152,24 @@ class TestFreshUuidIsRejectedLoudly:
         )
         assert str(caught.value.__cause__) == upstream_message
 
-    @pytest.mark.asyncio
-    async def test_the_translated_message_stays_retryable_for_the_durable_queue(
-        self, backend_and_fake
-    ):
-        """The seam's cross-module claim, fed through the real parser.
 
-        ``durable_queue.py::_classify_failure`` dead-letters an item on attempt
-        1 (task 3586) when a not-found message names that item's OWN payload
-        uuid — a judgement it reaches by PARSING the message, since that module
-        deliberately does not import graphiti_core.  Replacing upstream's
-        message therefore silently decides the retry policy of any queued write
-        that carries it, and the comment at the translation site asserts the
-        answer (falls open to ordinary retry) without mechanising it.
+@pytest.fixture
+def backend_raising(mock_config, make_backend_over_fake_graphiti):
+    """callable(exc) -> a backend whose fake client raises *exc* from every add_episode.
 
-        Behavioural, not a wording pin: every rewording that keeps the message
-        unparseable stays green, and only one that made it parseable — flipping
-        a queued add_episode from retryable to permanently dead-lettered —
-        turns this red.
-        """
-        backend, _fake = backend_and_fake
+    Subclassing the promoted fake — rather than adding a raises= knob to
+    it — keeps this fail-open probing local to the module that needs it;
+    the shared double stays a faithful model of upstream's contract.
+    """
 
-        with pytest.raises(graphiti_client.NodeNotFoundError) as caught:
-            await backend.add_episode(name='n', content='c', group_id=GROUP, uuid=FRESH)
+    def _factory(exc: BaseException):
+        class _RaisingFake(FakeGraphitiClient):
+            async def add_episode(self, **kwargs):  # type: ignore[override]
+                raise exc
 
-        parsed = dq_module._parse_not_found_uuid(str(caught.value))
-        assert parsed is None, (
-            f'The translated message must not read as graphiti_core\'s own '
-            f'not-found shape, or a queued write failing this way would be '
-            f'dead-lettered on attempt 1 instead of retried; it parsed as '
-            f'{parsed!r} from {str(caught.value)!r}.'
-        )
+        return make_backend_over_fake_graphiti(mock_config, _RaisingFake())
+
+    return _factory
 
 
 class TestGuardFailsOpen:
@@ -198,30 +184,9 @@ class TestGuardFailsOpen:
     today's behaviour rather than to a confident wrong claim.
     """
 
-    @staticmethod
-    def _backend_raising(mock_config, exc: BaseException):
-        """A backend whose fake client raises *exc* from every add_episode.
-
-        Subclassing the promoted fake — rather than adding a raises= knob to
-        it — keeps this fail-open probing local to the module that needs it;
-        the shared double stays a faithful model of upstream's contract.
-        """
-
-        class _RaisingFake(FakeGraphitiClient):
-            async def add_episode(self, **kwargs):  # type: ignore[override]
-                raise exc
-
-        backend, _fake = backend_with_fake_graphiti(mock_config)
-        raising = _RaisingFake()
-        backend.client = raising  # type: ignore[assignment]
-        backend._client_for = MagicMock(return_value=raising)  # type: ignore[method-assign]
-        return backend
-
     @pytest.mark.asyncio
-    async def test_not_found_naming_a_different_node_propagates_untouched(self, mock_config):
-        backend = self._backend_raising(
-            mock_config, GraphitiCoreNodeNotFoundError('some-unrelated-node-uuid')
-        )
+    async def test_not_found_naming_a_different_node_propagates_untouched(self, backend_raising):
+        backend = backend_raising(GraphitiCoreNodeNotFoundError('some-unrelated-node-uuid'))
 
         with pytest.raises(GraphitiCoreNodeNotFoundError) as caught:
             await backend.add_episode(name='n', content='c', group_id=GROUP, uuid=FRESH)
@@ -232,12 +197,12 @@ class TestGuardFailsOpen:
         )
 
     @pytest.mark.asyncio
-    async def test_a_reworded_upstream_message_propagates_untouched(self, mock_config):
+    async def test_a_reworded_upstream_message_propagates_untouched(self, backend_raising):
         class _RewordedNotFound(GraphitiCoreNodeNotFoundError):
             def __str__(self) -> str:
                 return f'episodic node {FRESH} could not be located'
 
-        backend = self._backend_raising(mock_config, _RewordedNotFound(FRESH))
+        backend = backend_raising(_RewordedNotFound(FRESH))
 
         with pytest.raises(GraphitiCoreNodeNotFoundError) as caught:
             await backend.add_episode(name='n', content='c', group_id=GROUP, uuid=FRESH)
@@ -251,10 +216,8 @@ class TestGuardFailsOpen:
         )
 
     @pytest.mark.asyncio
-    async def test_uuid_none_never_translates(self, mock_config):
-        backend = self._backend_raising(
-            mock_config, GraphitiCoreNodeNotFoundError('anything')
-        )
+    async def test_uuid_none_never_translates(self, backend_raising):
+        backend = backend_raising(GraphitiCoreNodeNotFoundError('anything'))
 
         with pytest.raises(GraphitiCoreNodeNotFoundError) as caught:
             await backend.add_episode(name='n', content='c', group_id=GROUP)

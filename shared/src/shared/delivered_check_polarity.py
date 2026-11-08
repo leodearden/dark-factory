@@ -103,6 +103,13 @@ non-obvious and easy to diverge on:
 One builder plus one interpreter per kind makes divergence structurally
 impossible.
 
+THE SECOND AXIS: SCOPE LIVENESS. Orthogonal to polarity, an
+``expect=present`` check whose ``paths`` name a ``sys.modules`` alias shim or
+a path the mainline deleted or moved away can never go green either (task
+5036's ``merge_queue.py`` shim). That classification and its policy live in
+``shared.delivered_check_scope``; the lint reports them as ``shim_path`` and
+``removed_path`` rejects alongside any polarity finding.
+
 NEVER RAISES. :func:`lint_delivered_checks` returns findings for any
 iterable of entries — malformed check entries, values no argv can carry
 (a NUL byte, a lone surrogate), a non-repo root, a missing ``git``. Both wire points depend on that
@@ -126,13 +133,25 @@ import functools
 import json
 import logging
 import posixpath
-import re
 import subprocess
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any, Literal
+
+from shared.delivered_check_scope import (
+    GIT_PROBE_FAILURES,
+    GIT_TIMEOUT_SECS,
+    STALE_PATH_CODES,
+    STALE_PATH_REASONS,
+    PathState,
+    ScopePath,
+    classify_scope_paths,
+    resolve_commit,
+    stale_scope_paths,
+)
+from shared.posix_ere import compile_ere, top_level_arms
 
 __all__ = [
     'GATE_REF',
@@ -151,27 +170,12 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-#: Wall-clock ceiling for ONE authoring-time git probe (``grep``,
-#: ``ls-tree``, ``ls-files``). Generous relative to a real probe
-#: (milliseconds on this repo) because exceeding it is not a verdict — it
-#: degrades to ``ERRORED``, which is REPORTED rather than blocking, so a
-#: slow disk delays a commit_planning call instead of rejecting a healthy
-#: batch.
-GIT_TIMEOUT_SECS: float = 30.0
-
 #: The ref every delivered_check is judged against: the runtime gate's
 #: (``orchestrator/src/orchestrator/scheduler.py::Scheduler._resolve_main_sha``
 #: rev-parses it, and ``orchestrator.delivered_checks.run_delivered_check``
 #: defaults to it). The authoring-time wire points evaluate against the same
 #: name so the two gates judge one tree.
 GATE_REF: str = 'main'
-
-#: Everything ``subprocess.run`` can raise for one git probe, all of which mean
-#: "unevaluable", never a verdict: ``OSError`` (no ``git``, exec failure),
-#: ``SubprocessError`` (chiefly a timeout) and ``ValueError`` — an argv
-#: element carrying a NUL byte, or a lone surrogate that cannot be encoded
-#: (``UnicodeEncodeError`` is a ``ValueError``), both refused before git runs.
-_GIT_PROBE_FAILURES = (OSError, subprocess.SubprocessError, ValueError)
 
 
 class CheckOutcome(Enum):
@@ -302,10 +306,11 @@ class CheckFinding:
     ranking of confidence — they are three different contracts:
 
     ``'reject'``
-        A measured defect. The check is green at the authoring tree, so
-        landing its producer cannot change its verdict and it gates
-        nothing. ``commit_planning`` refuses the batch; the stamper
-        refuses to copy the check.
+        A measured defect. Either the check is green at the authoring tree,
+        so landing its producer cannot change its verdict and it gates
+        nothing, or its scope is stale, so it can never go green.
+        ``commit_planning`` refuses the batch; the stamper refuses to copy
+        the check.
     ``'warn'``
         Reported, never blocking. Reserved for classes that are genuinely
         undecidable at authoring time (an over-broad ``expect='absent'``
@@ -371,7 +376,7 @@ def evaluate_grep_at_tree(
         completed = subprocess.run(
             argv, capture_output=True, text=True, timeout=timeout_secs
         )
-    except _GIT_PROBE_FAILURES:
+    except GIT_PROBE_FAILURES:
         return CheckOutcome.ERRORED
     return interpret_grep_rc(completed.returncode, expect)
 
@@ -399,7 +404,7 @@ def evaluate_path_at_tree(
             completed = subprocess.run(
                 argv, capture_output=True, text=True, timeout=timeout_secs
             )
-        except _GIT_PROBE_FAILURES:
+        except GIT_PROBE_FAILURES:
             return CheckOutcome.ERRORED
         outcome = interpret_path_listing(completed.returncode, completed.stdout, expect)
         if outcome is not CheckOutcome.PASS:
@@ -468,10 +473,11 @@ def lint_delivered_checks(
 ) -> list[CheckFinding]:
     """Lint a whole ``metadata.delivered_checks`` list against the authoring tree.
 
-    Returns one :class:`CheckFinding` per offending check (at most one per
-    check) and an empty list for a clean batch. *files* is the task's
-    declared ``metadata.files``, used by the refinements to tell a match
-    inside the task's own scope from one outside it.
+    Returns at most one polarity finding per check, plus at most one per
+    stale-path code (the scope axis, see the module docstring), and an empty
+    list for a clean batch. *files* is the task's declared
+    ``metadata.files``, used by the refinements to tell a match inside the
+    task's own scope from one outside it.
 
     The 2x2 is a statement about POLARITY, so it evaluates the kinds that
     carry an ``expect`` — ``grep`` and ``path``. A script check has none to
@@ -484,7 +490,7 @@ def lint_delivered_checks(
     unresolved, a name like ``main`` with no such branch would be read as a
     PATHSPEC and answered from the working tree.
     """
-    tree = functools.cache(lambda: _resolve_commit(repo_root, ref))
+    tree = functools.cache(lambda: resolve_commit(repo_root, ref))
     findings: list[CheckFinding] = []
     for check in checks:
         finding = _lint_one_check(
@@ -492,22 +498,10 @@ def lint_delivered_checks(
         )
         if finding is not None:
             findings.append(finding)
-    return findings
-
-
-def _resolve_commit(
-    repo_root: str | Path, ref: str, timeout_secs: float = GIT_TIMEOUT_SECS
-) -> str | None:
-    """The commit *ref* names in *repo_root*, or ``None`` if it names none."""
-    argv = ['git', '-C', str(repo_root), 'rev-parse', '--verify', '--quiet', f'{ref}^{{commit}}']
-    try:
-        completed = subprocess.run(
-            argv, capture_output=True, text=True, timeout=timeout_secs
+        findings.extend(
+            _stale_scope_findings(check, repo_root=repo_root, ref=ref, tree=tree)
         )
-    except _GIT_PROBE_FAILURES:
-        return None
-    sha = completed.stdout.strip()
-    return sha if completed.returncode == 0 and sha else None
+    return findings
 
 
 def _unevaluable_finding(name: str, ref: str, repo_root: str | Path) -> CheckFinding:
@@ -517,6 +511,14 @@ def _unevaluable_finding(name: str, ref: str, repo_root: str | Path) -> CheckFin
         code='unevaluable',
         message=_unevaluable_message(name, ref, repo_root),
     )
+
+
+def _check_name(check: object) -> str | None:
+    """The usable name a finding about *check* is addressed to, if any."""
+    if not isinstance(check, dict):
+        return None
+    name = check.get('name')
+    return name if isinstance(name, str) and name else None
 
 
 def _lint_one_check(
@@ -545,10 +547,8 @@ def _lint_one_check(
       ``expect`` to invert; a script-only batch must cost nothing), or a
       kind the schema does not know at all.
     """
-    if not isinstance(check, dict):
-        return None
-    name = check.get('name')
-    if not isinstance(name, str) or not name:
+    name = _check_name(check)
+    if name is None:
         return None
     kind = check.get('kind')
     linter = _POLARITY_LINTERS.get(kind) if isinstance(kind, str) else None
@@ -726,6 +726,86 @@ _POLARITY_LINTERS: dict[str, Callable[..., CheckFinding | None]] = {
 
 
 # ---------------------------------------------------------------------------
+# The scope axis
+# ---------------------------------------------------------------------------
+
+def _shim_path_message(name: str, entries: Sequence[ScopePath], ref: str) -> str:
+    paths = [entry.path for entry in entries]
+    return (
+        f'delivered_check {name!r} (expect=present) is scoped to {paths!r} at '
+        f'{ref}: {STALE_PATH_REASONS["shim_path"]}'
+    )
+
+
+def _removed_path_message(name: str, entries: Sequence[ScopePath], ref: str) -> str:
+    sites = ', '.join(
+        f'{entry.path} (removed in {entry.removed_in or "mainline history"})'
+        for entry in entries
+    )
+    return (
+        f'delivered_check {name!r} (expect=present) names {sites}, absent at '
+        f'{ref}: {STALE_PATH_REASONS["removed_path"]} If this task genuinely '
+        f're-creates the file, scope a grep check to its parent directory instead.'
+    )
+
+
+_STALE_PATH_MESSAGES: dict[PathState, Callable[[str, Sequence[ScopePath], str], str]] = {
+    PathState.SYS_MODULES_SHIM: _shim_path_message,
+    PathState.REMOVED: _removed_path_message,
+}
+
+
+def _stale_scope_findings(
+    check: Any,
+    *,
+    repo_root: str | Path,
+    ref: str,
+    tree: Callable[[], str | None],
+) -> list[CheckFinding]:
+    """One reject per stale-path code for *check*, each listing its paths.
+
+    Skipped before any git call unless *check* is a named ``expect=present``
+    check of a polarity kind with usable ``paths``. Fails open: an
+    unresolvable tree is already reported by the polarity axis, and a
+    classification failure loses only this diagnosis.
+    """
+    name = _check_name(check)
+    if name is None:
+        return []
+    kind = check.get('kind')
+    expect = check.get('expect')
+    paths = list(dict.fromkeys(_strings_only(check.get('paths'))))
+    if not (isinstance(kind, str) and kind in _POLARITY_LINTERS):
+        return []
+    if expect != 'present' or not paths:
+        return []
+    sha = tree()
+    if sha is None:
+        return []
+    census = classify_scope_paths(paths, repo_root=repo_root, ref=sha)
+    if census is None:
+        logger.warning(
+            'delivered_check scope: could not classify the paths of check %r '
+            '(ref=%s, repo_root=%s); no scope finding emitted',
+            name, ref, repo_root,
+        )
+        return []
+    by_state: dict[PathState, list[ScopePath]] = {}
+    for entry in stale_scope_paths(kind, expect, [census[p] for p in paths if p in census]):
+        by_state.setdefault(entry.state, []).append(entry)
+    return [
+        CheckFinding(
+            check_name=name,
+            severity='reject',
+            code=STALE_PATH_CODES[state],
+            message=_STALE_PATH_MESSAGES[state](name, entries, ref),
+            detail=tuple(entry.path for entry in entries),
+        )
+        for state, entries in by_state.items()
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Diagnostic refinements, and the two rules the 2x2 cannot see
 # ---------------------------------------------------------------------------
 
@@ -735,10 +815,14 @@ _POLARITY_LINTERS: dict[str, Callable[..., CheckFinding | None]] = {
 #: ``shared`` must not depend on ``fused_memory``.
 _MANIFEST_SUFFIX = '.capability-manifest.yaml'
 
-#: A match line starting (after leading whitespace) with any of these is
-#: PROSE, not a capability. ``*`` covers both a C block-comment
-#: continuation and a markdown bullet — both are prose for this purpose.
+#: A match line in a non-markdown file starting (after leading whitespace)
+#: with any of these is PROSE, not a capability. ``*`` is a C block-comment
+#: continuation. In markdown a heading or a bullet can BE the capability
+#: (task 6036), so a markdown file uses :data:`_MARKDOWN_COMMENT_MARKERS`.
 _COMMENT_MARKERS = ('#', '//', '*', '"""', "'''")
+
+_MARKDOWN_SUFFIXES = ('.md', '.markdown')
+_MARKDOWN_COMMENT_MARKERS = ('<!--',)
 
 
 @dataclass(frozen=True)
@@ -761,13 +845,20 @@ def _grep_matches(
 ) -> list[_GrepMatch] | None:
     """The match SITES for a check. ``None`` means git could not answer.
 
-    ``-n`` is INSERTED into the argv :func:`build_grep_argv` returns rather
-    than a second argv being assembled here: the pattern's ``-e``
+    ``-n -z`` is INSERTED into the argv :func:`build_grep_argv` returns
+    rather than a second argv being assembled here: the pattern's ``-e``
     separator, the ``--`` pathspec placement and the ref position all stay
     owned by the one builder, so a refinement can never search a different
     corpus than the verdict it is refining (module docstring, PARITY
     CONTRACT). ``argv.index('-E')`` finds the FLAG even when the pattern is
     itself the literal ``'-E'``, since the flag precedes the pattern.
+    ``-z`` NUL-terminates the name and line number, so a ``:`` in a path
+    cannot split a record and names arrive unquoted (see
+    :func:`_parse_grep_records`). Unquoted names can be raw non-UTF-8
+    bytes, so each undecodable byte is replaced by U+FFFD: one such name or
+    line degrades only its own record, never the whole site list. A
+    replaced name equals no declared or descriptor-family path, which is
+    also true of the name it replaced.
 
     ``None`` (not ``[]``) for an unanswerable question is the load-bearing
     distinction: ``[]`` would read as "matches, but none of them are
@@ -775,25 +866,40 @@ def _grep_matches(
     rejection.
     """
     argv = build_grep_argv(pattern, paths, project_root=repo_root, ref=ref)
-    argv.insert(argv.index('-E'), '-n')
+    flag = argv.index('-E')
+    argv[flag:flag] = ['-n', '-z']
     try:
         completed = subprocess.run(
-            argv, capture_output=True, text=True, timeout=timeout_secs
+            argv,
+            capture_output=True,
+            encoding='utf-8',
+            errors='replace',
+            timeout=timeout_secs,
         )
-    except _GIT_PROBE_FAILURES:
+    except GIT_PROBE_FAILURES:
         return None
     if completed.returncode >= 2:
         return None
+    return _parse_grep_records(completed.stdout, prefix=f'{ref}:')
 
-    prefix = f'{ref}:'
+
+def _parse_grep_records(stdout: str, *, prefix: str) -> list[_GrepMatch]:
+    """``<ref>:<path> NUL <n> NUL <text>`` records, one per line, path
+    unquoted.
+
+    A record this parser cannot read — including git's localized
+    ``Binary file ... matches`` notice, which carries no NUL — degrades to
+    "no refinement", never to a wrong one. Splitting at the first two NULs
+    only leaves a NUL inside the matched text intact.
+    """
     matches: list[_GrepMatch] = []
-    for record in completed.stdout.splitlines():
-        rest = record[len(prefix):] if record.startswith(prefix) else record
-        path, _, remainder = rest.partition(':')
-        line_no, _, text = remainder.partition(':')
-        if not path or not line_no.isdigit():
-            # A record this parser cannot read degrades to "no refinement",
-            # never to a wrong one.
+    for record in stdout.split('\n'):
+        fields = record.split('\0', 2)
+        if len(fields) != 3:
+            continue
+        located, line_no, text = fields
+        path = located[len(prefix):]
+        if not located.startswith(prefix) or not path or not line_no.isdigit():
             continue
         matches.append(_GrepMatch(path=path, line_no=int(line_no), text=text))
     return matches
@@ -806,11 +912,19 @@ def _tracked_paths(
     ref: str,
     timeout_secs: float = GIT_TIMEOUT_SECS,
 ) -> list[str] | None:
-    """Paths in *ref*'s tree under *paths* (whole tree when empty) — the
-    committed tree the verdict was reached against, never the index.
-    ``None`` on any git failure — same never-guess contract as
-    :func:`_grep_matches`."""
-    argv = ['git', '-C', str(repo_root), 'ls-tree', '-r', '-z', '--full-tree', '--name-only', ref]
+    """Paths in *ref*'s tree under *paths* (all of it when empty): the
+    corpus ``git -C <repo_root> grep <ref>`` searches, so the filename rule
+    cannot name a file the grep cannot read. Without ``--full-tree``,
+    ls-tree is scoped to the ``-C`` directory with pathspecs and names
+    relative to it, exactly as the grep is; at the repository top level the
+    two forms list the same thing. It reads the committed tree the verdict
+    was reached against, never the index.
+
+    One known residual: ls-tree pathspecs are literal prefixes with no glob
+    magic, so a glob-scoped check lists nothing and gets no filename
+    diagnosis — the never-guess direction. ``None`` on any git failure, the
+    same contract as :func:`_grep_matches`."""
+    argv = ['git', '-C', str(repo_root), 'ls-tree', '-r', '-z', '--name-only', ref]
     if paths:
         argv.append('--')
         argv.extend(paths)
@@ -818,7 +932,7 @@ def _tracked_paths(
         completed = subprocess.run(
             argv, capture_output=True, text=True, timeout=timeout_secs
         )
-    except _GIT_PROBE_FAILURES:
+    except GIT_PROBE_FAILURES:
         return None
     if completed.returncode != 0:
         return None
@@ -840,8 +954,13 @@ def _descriptor_family(manifest_path: str) -> frozenset[str]:
     return frozenset({manifest_path})
 
 
-def _is_comment_line(text: str) -> bool:
-    return text.lstrip().startswith(_COMMENT_MARKERS)
+def _is_comment_line(match: _GrepMatch) -> bool:
+    markers = (
+        _MARKDOWN_COMMENT_MARKERS
+        if match.path.endswith(_MARKDOWN_SUFFIXES)
+        else _COMMENT_MARKERS
+    )
+    return match.text.lstrip().startswith(markers)
 
 
 def _covered_by_declared_files(path: str, declared: Sequence[str]) -> bool:
@@ -875,7 +994,7 @@ def _refine_vacuous_present(
     """Sharpen ``vacuous_present`` into a code that says WHY.
 
     Order is pinned: self-reference is the more specific diagnosis and wins
-    when both hold (a markdown bullet in the sibling PRD is inside the
+    when both hold (an HTML comment in the sibling PRD is inside the
     descriptor family AND comment-shaped). Emitting both would double-count
     one defect in the reject payload.
 
@@ -893,7 +1012,7 @@ def _refine_vacuous_present(
         if all(m.path in family for m in matches):
             return 'vacuous_present_self_referential', sites
 
-    if all(_is_comment_line(m.text) for m in matches):
+    if all(_is_comment_line(m) for m in matches):
         return 'vacuous_present_comment_only', sites
 
     return 'vacuous_present', sites
@@ -952,19 +1071,18 @@ def _filename_shaped_finding(
     tree those already exist, so a path check on them would itself be
     rejected as ``vacuous_present``.
 
-    ``re.search`` — Python's engine, not the POSIX ERE ``git grep -E`` uses
-    — is deliberate and safe HERE and nowhere else in this module: the
-    subject is a path LIST that git offers no grep mode over, the result is
-    a diagnostic rather than the verdict the runtime must reproduce, and any
-    pattern Python cannot compile yields ``None`` (no finding) rather than a
-    guess. A verdict is never decided this way.
+    Python's engine is used HERE and nowhere else in this module, because
+    the subject is a path LIST that git offers no grep mode over. The ERE
+    is compiled by ``shared/src/shared/posix_ere.py::compile_ere``, so the
+    diagnostic reads a bracket expression as git does. A pattern it cannot
+    read as git does yields ``None`` (no finding), never a guess, and a
+    verdict is never decided this way.
     """
     tracked = _tracked_paths(paths, repo_root=repo_root, ref=ref)
     if not tracked:
         return None
-    try:
-        matcher = re.compile(pattern)
-    except re.error:
+    matcher = compile_ere(pattern)
+    if matcher is None:
         return None
     hits = [path for path in tracked if matcher.search(path)]
     if not hits:
@@ -987,70 +1105,6 @@ def _filename_shaped_finding(
     )
 
 
-def _bracket_end(pattern: str, start: int) -> int:
-    """Index just past the ERE bracket expression opening at *start*, or -1.
-
-    A ``]`` first in the list (after an optional ``^``) is literal, and
-    ``[:class:]``, ``[.coll.]`` and ``[=equiv=]`` carry their own ``]``.
-    """
-    i = start + 1
-    if pattern.startswith('^', i):
-        i += 1
-    if pattern.startswith(']', i):
-        i += 1
-    while i < len(pattern):
-        if pattern[i] == ']':
-            return i + 1
-        if pattern[i] == '[' and pattern[i + 1 : i + 2] in (':', '.', '='):
-            close = pattern.find(pattern[i + 1] + ']', i + 2)
-            if close < 0:
-                return -1
-            i = close + 2
-            continue
-        i += 1
-    return -1
-
-
-def _top_level_arms(pattern: str) -> list[str] | None:
-    """The ERE alternatives of *pattern*: split on ``|`` outside groups,
-    bracket expressions and escapes, after unwrapping a group that encloses
-    the whole pattern. ``None`` when the pattern is not balanced.
-    """
-    arms: list[str] = []
-    depth = 0
-    start = 0
-    wholly_grouped = pattern.startswith('(')
-    i = 0
-    while i < len(pattern):
-        char = pattern[i]
-        if char == '\\':
-            i += 2
-            continue
-        if char == '[':
-            i = _bracket_end(pattern, i)
-            if i < 0:
-                return None
-            continue
-        if char == '(':
-            depth += 1
-        elif char == ')':
-            depth -= 1
-            if depth < 0:
-                return None
-            if depth == 0 and i != len(pattern) - 1:
-                wholly_grouped = False
-        elif char == '|' and depth == 0:
-            arms.append(pattern[start:i])
-            start = i + 1
-        i += 1
-    if depth:
-        return None
-    if wholly_grouped and not arms:
-        return _top_level_arms(pattern[1:-1])
-    arms.append(pattern[start:])
-    return arms
-
-
 def _declared_filename_finding(
     name: str,
     pattern: str,
@@ -1067,9 +1121,11 @@ def _declared_filename_finding(
     The task's ``metadata.files`` can.
 
     THE RULE, exactly: EVERY top-level alternative of the pattern (see
-    :func:`_top_level_arms`), compiled by Python ``re``, FULLY matches the
-    basename or the stem (basename minus its last suffix) of one declared
-    file that EVERY entry of the check's ``paths`` contains (the whole tree
+    ``shared/src/shared/posix_ere.py::top_level_arms``), compiled by
+    ``shared/src/shared/posix_ere.py::compile_ere`` so a bracket
+    expression reads as git reads it, FULLY matches the basename or the
+    stem (basename minus its last suffix) of one declared file that EVERY
+    entry of the check's ``paths`` contains (the whole tree
     when ``paths`` is empty). Full match, not search, so a symbol that
     merely shares text with a module name is not flagged; every arm, so an
     alternative naming a real symbol keeps the check a sound gate; every
@@ -1077,16 +1133,16 @@ def _declared_filename_finding(
     can be a wiring check — a declared module named in ANOTHER file's
     import.
     A pattern the splitter cannot parse is judged whole, and only when it
-    carries no ``|`` at all.
+    carries no ``|`` at all. An arm ``compile_ere`` cannot read yields no
+    finding, never a guess.
     """
-    arms = _top_level_arms(pattern)
+    arms = top_level_arms(pattern)
     if arms is None:
         if '|' in pattern:
             return None
         arms = [pattern]
-    try:
-        matchers = [re.compile(arm) for arm in arms]
-    except re.error:
+    matchers = [matcher for matcher in map(compile_ere, arms) if matcher is not None]
+    if len(matchers) != len(arms):
         return None
     for declared in files:
         if declared.endswith('/') or not all(_is_under(declared, scope) for scope in paths):
@@ -1233,7 +1289,9 @@ _POLARITY_HINT = (
     'is written can never signal anything — it gates nothing, and its dependent '
     'is dispatched as if unguarded. A check that can NEVER go green is worse: '
     'it blocks its dependent forever, and at runtime that is indistinguishable '
-    'from a genuinely undelivered capability.'
+    'from a genuinely undelivered capability. A check scoped to a sys.modules '
+    'shim, or to a path the mainline removed, is that kind: repath `paths` to '
+    'where the code lives now.'
 )
 
 
@@ -1257,11 +1315,12 @@ def polarity_error(
     prevent. Those findings are still REPORTED by the caller, just not here.
     """
     rejects = [f for f in findings if f.severity == 'reject']
+    rejected_checks = len({f.check_name for f in rejects})
     task_clause = f' (task {task_id})' if task_id else ''
     check_list = ', '.join(f'{f.check_name!r} [{f.code}]' for f in rejects)
     return {
         'error': (
-            f'metadata.delivered_checks contains {len(rejects)} check(s) that are '
+            f'metadata.delivered_checks contains {rejected_checks} check(s) that are '
             f'already satisfied at the authoring tree, or can never be satisfied'
             f'{task_clause}: {check_list}. Such a check gates nothing (or gates '
             f'forever), and at runtime a mis-authored check is indistinguishable '

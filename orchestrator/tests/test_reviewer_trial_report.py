@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
+from orchestrator.evals.measurement import MeasurementStage, Unmeasured, UnmeasuredCause
 from orchestrator.evals.reviewer_trial.corpus import CorpusDiff, CorpusManifest
-from orchestrator.evals.reviewer_trial.report import build_trial_report
+from orchestrator.evals.reviewer_trial.report import build_trial_report, format_markdown
 from orchestrator.evals.reviewer_trial.scorer import ScoringResult
 from orchestrator.evals.reviewer_trial.variants import ReviewerSpec, VariantConfig
 
@@ -114,3 +117,106 @@ class TestVariantSummaryCost:
 
         assert summary.total_cost_usd == pytest.approx(expected_total, abs=0.01)
         assert summary.f1_per_dollar == pytest.approx(expected_f1_per_dollar, abs=0.0001)
+
+
+# ---------------------------------------------------------------------------
+# Tests: an unmeasured score is excluded from every figure and counted
+# ---------------------------------------------------------------------------
+
+def _unmeasured_score(
+    variant_name: str, diff_id: str, cost_usd: float = 1.0, match_cost_usd: float = 0.31,
+) -> ScoringResult:
+    return ScoringResult(
+        variant_name=variant_name,
+        diff_id=diff_id,
+        cost_usd=cost_usd,
+        match_cost_usd=match_cost_usd,
+        unmeasured=Unmeasured(MeasurementStage.MATCHER, UnmeasuredCause.CAP_HIT, 'r', cost_usd=0.31),
+    )
+
+
+def _measured(variant_name: str, diff_id: str, f1: float) -> ScoringResult:
+    return ScoringResult(
+        variant_name=variant_name, diff_id=diff_id, recall=f1, precision=f1, f1=f1,
+        blocking_recall=f1, cost_usd=1.0, match_cost_usd=0.1, wall_clock_ms=500,
+    )
+
+
+class TestUnmeasuredScores:
+    def test_an_unmeasured_score_changes_no_variant_mean_but_its_counts(self) -> None:
+        corpus = _make_corpus('d1', 'd2', 'd3')
+        variants = [_make_variant('v1'), _make_variant('v2')]
+        measured = [
+            _measured('v1', 'd1', 0.8), _measured('v1', 'd2', 0.6),
+            _measured('v2', 'd1', 0.4), _measured('v2', 'd2', 0.5),
+        ]
+
+        clean = build_trial_report(measured, variants, corpus)
+        counted = build_trial_report([*measured, _unmeasured_score('v1', 'd3')], variants, corpus)
+
+        clean_v1 = next(s for s in clean.summaries if s.name == 'v1')
+        counted_v1 = next(s for s in counted.summaries if s.name == 'v1')
+        assert replace(counted_v1, unmeasured=0, unmeasured_cost_usd=0.0) == clean_v1
+        assert counted_v1.unmeasured == 1
+        assert counted_v1.unmeasured_cost_usd == pytest.approx(1.31)
+        assert counted.total_cost_usd == pytest.approx(clean.total_cost_usd + 1.31, abs=0.01)
+
+    def test_a_variant_with_nothing_measured_reports_none_and_sorts_last(self) -> None:
+        corpus = _make_corpus('d1', 'd2')
+        variants = [_make_variant('v2'), _make_variant('v1')]
+        scores = [
+            _measured('v1', 'd1', 0.0), _measured('v1', 'd2', 0.0),
+            _unmeasured_score('v2', 'd1'), _unmeasured_score('v2', 'd2'),
+        ]
+
+        report = build_trial_report(scores, variants, corpus)
+
+        v2 = report.summaries[-1]
+        assert v2.name == 'v2'
+        assert v2.mean_recall is None
+        assert v2.mean_precision is None
+        assert v2.mean_f1 is None
+        assert v2.mean_blocking_recall is None
+        assert v2.mean_wall_clock_ms is None
+        assert v2.f1_per_dollar is None
+        assert v2.blocking_recall_per_dollar is None
+        assert v2.unmeasured == 2
+        assert 'n/a' in format_markdown(report)
+
+    def test_head_to_head_skips_a_diff_either_side_did_not_measure(self) -> None:
+        corpus = _make_corpus('d1', 'd2')
+        variants = [_make_variant('v1'), _make_variant('v2')]
+        scores = [
+            _measured('v1', 'd1', 0.2), _unmeasured_score('v2', 'd1'),
+            _measured('v1', 'd2', 0.2), _measured('v2', 'd2', 0.6),
+        ]
+
+        h2h = build_trial_report(scores, variants, corpus).head_to_heads[0]
+
+        assert 'd1' not in h2h.a_wins + h2h.b_wins + h2h.ties
+        assert h2h.unmeasured == ['d1']
+        assert h2h.b_wins == ['d2']
+
+    def test_per_diff_scores_mark_an_unmeasured_cell_none(self) -> None:
+        corpus = _make_corpus('d1')
+        variants = [_make_variant('v1'), _make_variant('v2')]
+        scores = [_measured('v1', 'd1', 0.2), _unmeasured_score('v2', 'd1')]
+
+        report = build_trial_report(scores, variants, corpus)
+
+        assert report.per_diff_scores['d1']['v1'] == pytest.approx(0.2)
+        assert report.per_diff_scores['d1']['v2'] is None
+        assert '| d1 | 0.200 | n/a |' in format_markdown(report)
+
+    def test_leaderboard_shows_an_unmeasured_column(self) -> None:
+        corpus = _make_corpus('d1', 'd2')
+        variants = [_make_variant('v1')]
+        scores = [_measured('v1', 'd1', 0.5), _unmeasured_score('v1', 'd2')]
+
+        md = format_markdown(build_trial_report(scores, variants, corpus)).splitlines()
+
+        header = next(line for line in md if line.startswith('| Rank |'))
+        row = next(line for line in md if line.startswith('| 1 | v1 |'))
+        columns = [c.strip() for c in header.strip('|').split('|')]
+        cells = [c.strip() for c in row.strip('|').split('|')]
+        assert cells[columns.index('Unmeasured')] == '1'

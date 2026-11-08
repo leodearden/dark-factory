@@ -5,7 +5,8 @@
 # Project-specific checks are REACHED on every branch too, and the
 # project decides which of them apply to which branch -- hooks/project-checks
 # receives the branch as $2 and applies its own per-check policy (today:
-# the merge-lane ratchet audit universal, ruff/pyright main-only).
+# the merge-lane ratchet audit and the code-quality render check universal,
+# ruff/pyright main-only).
 #
 # WHY THE BRANCH IS PASSED DOWN RATHER THAN DECIDED HERE.  This hook used
 # to `exit 0` on every branch that is not main, so a project check could
@@ -14,8 +15,10 @@
 # contamination arrives by merge, and a CLEAN merge runs pre-merge-commit
 # rather than this hook (a conflicted one finished with `git commit` -- the
 # merge resolver's path -- does run this hook), while the merge worker
-# advances main with `git update-ref`, which runs no hooks at all.  The
-# .task/ guard below already had to be universal for exactly that reason.
+# advances main with `git update-ref`, which runs no commit hooks (only
+# hooks/reference-transaction, where a landing is audited for ratchet
+# raises).  The .task/ guard below already had to be universal for exactly
+# that reason.
 # Which checks are cheap enough to be universal is a PROJECT question, so
 # the project answers it.
 #

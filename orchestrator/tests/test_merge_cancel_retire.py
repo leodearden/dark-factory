@@ -30,14 +30,14 @@ from typing import Any
 import pytest
 
 from orchestrator.config import GitConfig, OrchestratorConfig
-from orchestrator.merge_queue import enqueue_merge_request
-from orchestrator.merge_types import (
+from orchestrator.merge_lane.types import (
     InFlightMergeRegistry,
     MergeRequest,
     QueuedBranch,
     TerminalOutcomeRecord,
     TerminalOutcomeRetention,
 )
+from orchestrator.merge_lane.worker import enqueue_merge_request
 
 
 class _RetireSpy:
@@ -123,7 +123,7 @@ class TestRetireCancelledMergeRequest:
     @pytest.mark.asyncio
     async def test_basic_release_worktree_and_forget(self, tmp_path: Path) -> None:
         """(a) release the slot, remove the worktree via C1, forget the sticky."""
-        from orchestrator.merge_queue import retire_cancelled_merge_request
+        from orchestrator.merge_lane.worker import retire_cancelled_merge_request
 
         registry = InFlightMergeRegistry()
         retention = TerminalOutcomeRetention()
@@ -157,7 +157,7 @@ class TestRetireCancelledMergeRequest:
         forgot BEFORE yielding, the async re-record would leave a live entry;
         a clean ring proves yield-then-forget.
         """
-        from orchestrator.merge_queue import retire_cancelled_merge_request
+        from orchestrator.merge_lane.worker import retire_cancelled_merge_request
 
         config = _config(tmp_path)
         registry = InFlightMergeRegistry()
@@ -187,7 +187,7 @@ class TestRetireCancelledMergeRequest:
     @pytest.mark.asyncio
     async def test_identity_guard_does_not_drop_fresh_slot(self, tmp_path: Path) -> None:
         """(c) a slot reclaimed by a DIFFERENT request_id must NOT be released."""
-        from orchestrator.merge_queue import retire_cancelled_merge_request
+        from orchestrator.merge_lane.worker import retire_cancelled_merge_request
 
         registry = InFlightMergeRegistry()
         retention = TerminalOutcomeRetention()
@@ -212,7 +212,7 @@ class TestRetireCancelledMergeRequest:
     @pytest.mark.asyncio
     async def test_none_guards_degrade_to_noop(self, tmp_path: Path) -> None:
         """(d) git_ops=None / retention=None / registry=None never raise."""
-        from orchestrator.merge_queue import retire_cancelled_merge_request
+        from orchestrator.merge_lane.worker import retire_cancelled_merge_request
 
         outcome = await retire_cancelled_merge_request(
             request_id='mr-a', branch='B', task_id='T',
@@ -225,7 +225,7 @@ class TestRetireCancelledMergeRequest:
         self, tmp_path: Path,
     ) -> None:
         """(d2) branch=None: forget still clears the sticky; no worktree scan."""
-        from orchestrator.merge_queue import retire_cancelled_merge_request
+        from orchestrator.merge_lane.worker import retire_cancelled_merge_request
 
         registry = InFlightMergeRegistry()
         retention = TerminalOutcomeRetention()

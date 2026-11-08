@@ -43,6 +43,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from fused_memory.middleware.deterministic_task_guard import DETERMINISTIC_ROUTING_HINT
 from fused_memory.middleware.lock_charter_guard import extract_files
 from fused_memory.middleware.metadata_dict import raw_metadata_dict
 from fused_memory.reconciliation.recon_self_model import EXECUTION_CLASSES
@@ -63,14 +64,6 @@ _GIT_PROBE_TIMEOUT_SECS = 10.0
 
 _ENFORCE_ENV_VAR = 'FUSED_GITIGNORED_DELIVERABLE_ENFORCE'
 _TRUTHY_ENV_VALUES: frozenset[str] = frozenset({'1', 'true', 'yes', 'on'})
-
-_ROUTING_HINT = (
-    "This is likely task_kind='deterministic' work, which has no commit "
-    'requirement: point metadata.before_done at a committed script for a '
-    'scripted action, or set metadata.always_escalates=True for a human gate. '
-    'If a code deliverable really is intended, declare at least one '
-    'committable path in metadata.files.'
-)
 
 _EXEMPT_EXECUTION_CLASSES: frozenset[str] = frozenset(
     c for c in EXECUTION_CLASSES if c != 'code_tdd'
@@ -174,7 +167,7 @@ def gitignored_deliverable_reject(finding: GitignoredDeliverableFinding) -> dict
     return {
         'error': _undeliverable_detail(finding),
         'error_type': 'ValidationError',
-        'hint': _ROUTING_HINT,
+        'hint': DETERMINISTIC_ROUTING_HINT,
     }
 
 
@@ -185,7 +178,7 @@ def gitignored_deliverable_warning(finding: GitignoredDeliverableFinding) -> dic
             'ignored_paths': list(finding.ignored_paths),
             'detail': _undeliverable_detail(finding),
             'hint': (
-                f'{_ROUTING_HINT} Set {_ENFORCE_ENV_VAR}=1 to hard-reject such '
+                f'{DETERMINISTIC_ROUTING_HINT} Set {_ENFORCE_ENV_VAR}=1 to hard-reject such '
                 'submissions instead of warning.'
             ),
         },

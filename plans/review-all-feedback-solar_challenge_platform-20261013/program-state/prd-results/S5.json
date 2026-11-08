@@ -1,0 +1,31 @@
+{
+ "stream": "S5",
+ "prd_path": "docs/prds/review-all-ingest-ack-persist-ordering.md",
+ "manifest_path": "docs/prds/review-all-ingest-ack-persist-ordering.capability-manifest.yaml",
+ "leaves_estimate": 10,
+ "lead_rulings_on_open_questions": [
+  "Q1 broker max_inflight_messages (must be <= INGESTION_INFLIGHT_WINDOW): an operator check for Leo; recorded in the triage briefing, not built.",
+  "Q2: task 583 is cancelled at S5 decompose as subsumed by S5-epsilon (x_acceptance_reason naming it); epsilon delivers the ruling's outcome (rows wait unacked and are judged when the DB recovers).",
+  "Q3: task 305 (always_escalates human gate) is closed at S5 decompose with x_acceptance_reason naming R5 + S5-epsilon.",
+  "Q4 accepted: task 451 owns ingestion/broker.py, S5 owns IngestSession, S12 retargets validation/ingest_session.py; the seam map's S12 row is amended.",
+  "Q5 accepted: the placement-axis half of fk-21cfdda2e0b0 (D8 roster check switched off with consent by AllowAllConsentChecker) is routed to S5 as one small stage after epsilon, with its setting in S24's hermetic-switch table; S5's decompose seat files it as leaf nu carrying that key.",
+  "Q6: mu may edit the two non-program PRDs (pointer lines only in scaling-defects-1k-10k.md D11/B13 and push-alerting-deep-health.md \u00a79.7).",
+  "Q7: INV-ACK ('an ingest message is acked only after its fate is final, on its connection, in receipt order') is added as INV-11 to docs/legibility/design-invariants.md by S27-alpha (task 1066; note appended), enforced by S5-theta's real-broker kill-the-store gate."
+ ],
+ "lead_actions_at_decompose": [
+  "cancel 583 -> epsilon; close 305 -> epsilon (x_acceptance_reason)",
+  "edges: delta <- 451; beta/epsilon <- 1008; beta/gamma <- 1018; eta <- 210; epsilon <- 1013 (S19-beta) and S26-delta/epsilon (1086, 1087)",
+  "high leaves epsilon, theta -> gate 1065"
+ ],
+ "cross_reference_lines": [
+  "Program row S5 upstream deps: S26, S19 (task 1013).",
+  "Seam map S12 row: 'ingestion BrokerConfig/session factory' becomes 'task 451 owns ingestion/broker.py; S5 owns IngestSession (delta); S12 retargets validation/ingest_session.py onto IngestSession.subscription()'.",
+  "S13 (shares consent/enforcement.py): S5 owns the guard's place in the pipeline, its result type ConsentFiltered/DropKind and the deletion of afilter_rows and the counters; S13 owns decide() and REQUIRED_SCOPE; S13-gamma3 depends on S5-epsilon.",
+  "S3: IngestionService.from_settings(settings, *, database, store) is S3's signature; S5 owns the body.",
+  "S24: S5 deletes ingestion_subscribe_qos and ingestion_buffer_max_depth and renames the shutdown timeout; new fields use S24's types.",
+  "S23 embeds IngestTick by type (zeta's field set: persisted and buffer_depth kept; dropped_* retired).",
+  "S18/S27: epsilon deletes their allowlist entries.",
+  "S9: zeta's migration is numbered from chain_head().",
+  "Triage: operator check \u2014 the pilot broker's max_inflight_messages must be <= INGESTION_INFLIGHT_WINDOW (default 1000)."
+ ]
+}

@@ -44,7 +44,8 @@ def _invoke_with_verdict(
     that never called ``submit_merge_disposition``.
     """
 
-    def _side_effect(*args, **kwargs):
+    async def _side_effect(_role, build_prompt, *args, **kwargs):
+        await build_prompt()
         if blocked is not None:
             f.artifacts.write_verdict(
                 'merger',

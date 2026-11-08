@@ -43,7 +43,7 @@ import pytest
 from _workflow_helpers import FakeBriefing, FakeMcp, FakeScheduler
 from escalation.queue import EscalationQueue
 
-from orchestrator.merge_queue import MergeOutcome
+from orchestrator.merge_lane.worker import MergeOutcome
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.workflow import _ORPHAN_HALT_NO_QUEUE_TOKENS, TaskWorkflow, WorkflowOutcome
 
@@ -91,7 +91,7 @@ class _FakeMergeWorker:
         ``_owner`` said only "reached inside".
 
         Deliberately a METHOD and not a writable public owner attribute: the
-        real ``_WipHaltMixin`` exposes ``halt_owner_esc_id`` read-only, and a
+        real worker exposes ``halt_owner_esc_id`` read-only, and a
         double carrying a public owner slot would model a surface production
         does not have.
         """

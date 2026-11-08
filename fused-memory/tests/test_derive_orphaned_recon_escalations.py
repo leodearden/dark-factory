@@ -32,7 +32,7 @@ from fused_memory.reconciliation.orphaned_recon_escalation_sweep import (
     classify_orphan,
     sweep_orphaned_recon_escalations,
 )
-from fused_memory.utils.target_store_preflight import TargetStoreMissing
+from fused_memory.utils.target_store_preflight import TargetStoreUnpopulated
 
 SCRIPT_PATH = (
     Path(__file__).parent.parent / 'scripts' / 'derive_orphaned_recon_escalations.py'
@@ -521,8 +521,8 @@ class TestDeriveOrphanedReconEscalations:
         json.dumps(report)
 
 
-class TestMissingQueueDirRefusal:
-    """The task-4319 preflight: a queue dir that does not exist is REFUSED.
+class TestUnpopulatedQueueDirRefusal:
+    """The task-4319 preflight: a queue dir that is missing or empty is REFUSED.
 
     ``EscalationQueue.__init__`` mkdirs its ``queue_dir``, so without the guard
     a mis-targeted ``--queue-dir`` -- or the RELATIVE default run from anywhere
@@ -530,7 +530,7 @@ class TestMissingQueueDirRefusal:
     ``"scanned": 0, "reaped": 0`` and exits 0: a false all-clear
     indistinguishable from a clean one.
 
-    Every OTHER class in this file passes an EXISTING ``tmp_path``, so the
+    Every OTHER class in this file passes a SEEDED ``tmp_path``, so the
     guard is a verified no-op for them.  If one of them breaks, that is a
     signal the guard was placed wrongly -- not a licence to weaken it.
     """
@@ -541,7 +541,7 @@ class TestMissingQueueDirRefusal:
         """The DRY RUN refuses too: its report is exactly as false as an apply."""
         missing = tmp_path / 'data' / 'reconciliation' / 'escalations'
 
-        with pytest.raises(TargetStoreMissing):
+        with pytest.raises(TargetStoreUnpopulated):
             await _mod.run(
                 queue_dir=missing, project_roots=PROJECT_ROOTS,
                 apply=apply_mode, taskmaster=taskmaster,
@@ -553,7 +553,7 @@ class TestMissingQueueDirRefusal:
         """The queue was never constructed, so the ``mkdir`` never happened."""
         missing = tmp_path / 'data' / 'reconciliation' / 'escalations'
 
-        with pytest.raises(TargetStoreMissing):
+        with pytest.raises(TargetStoreUnpopulated):
             await _mod.run(
                 queue_dir=missing, project_roots=PROJECT_ROOTS,
                 apply=apply_mode, taskmaster=taskmaster,
@@ -570,24 +570,26 @@ class TestMissingQueueDirRefusal:
         no census read -- which is why this call can pass ``taskmaster=None``
         without touching a live store.
         """
-        with pytest.raises(TargetStoreMissing):
+        with pytest.raises(TargetStoreUnpopulated):
             await _mod.run(
                 queue_dir=tmp_path / 'absent', project_roots=PROJECT_ROOTS,
                 taskmaster=None,
             )
 
     @pytest.mark.asyncio
-    async def test_an_existing_queue_dir_passes_the_guard(self, tmp_path, taskmaster):
-        """The guard requires neither absoluteness nor a non-empty queue."""
-        report = await _mod.run(
-            queue_dir=tmp_path, project_roots=PROJECT_ROOTS, taskmaster=taskmaster,
-        )
+    async def test_an_empty_existing_queue_dir_is_refused(self, tmp_path, taskmaster):
+        """An empty queue dir is refused before the scan (task 5468).
 
-        assert report['scanned'] == 0
-        assert report['reaped'] == 0
+        The predicate is pinned in test_target_store_preflight.py::TestQueueDirArm.
+        """
+        with pytest.raises(TargetStoreUnpopulated):
+            await _mod.run(
+                queue_dir=tmp_path, project_roots=PROJECT_ROOTS, taskmaster=taskmaster,
+            )
 
+    @pytest.mark.parametrize('create_empty_dir', [False, True], ids=['missing', 'empty'])
     def test_main_reports_the_refusal_as_a_nonzero_exit_not_a_traceback(
-        self, tmp_path, capsys,
+        self, tmp_path, capsys, create_empty_dir,
     ):
         """A refusal routed through the normal report path would exit 0.
 
@@ -598,23 +600,26 @@ class TestMissingQueueDirRefusal:
         """
         import sys as _sys  # noqa: PLC0415
 
-        missing = tmp_path / 'data' / 'reconciliation' / 'escalations'
+        target = tmp_path / 'data' / 'reconciliation' / 'escalations'
+        if create_empty_dir:
+            target.mkdir(parents=True)
+        before = sorted(tmp_path.rglob('*'))
         old_argv = _sys.argv
         try:
             _sys.argv = [
-                'derive_orphaned_recon_escalations.py', '--queue-dir', str(missing),
+                'derive_orphaned_recon_escalations.py', '--queue-dir', str(target),
             ]
             code = _mod.main()
         finally:
             _sys.argv = old_argv
 
-        assert code == _mod.EXIT_QUEUE_DIR_MISSING
+        assert code == _mod.EXIT_QUEUE_DIR_UNPOPULATED
         assert code != 0
         captured = capsys.readouterr()
-        assert str(missing) in captured.err
+        assert str(target) in captured.err
         assert 'Traceback' not in captured.err
         assert captured.out == '', 'a refusal must not print a report to stdout'
-        assert not missing.exists()
+        assert sorted(tmp_path.rglob('*')) == before, 'a refusal must create nothing'
 
 
 class TestMainExitCodes:
@@ -670,7 +675,7 @@ class TestMainExitCodes:
     def test_every_exit_code_is_distinct_and_avoids_the_argparse_usage_code(self):
         """2 is argparse's usage-error code; reusing it would conflate the two."""
         codes = [
-            _mod.EXIT_OK, _mod.EXIT_QUEUE_DIR_MISSING,
+            _mod.EXIT_OK, _mod.EXIT_QUEUE_DIR_UNPOPULATED,
             _mod.EXIT_CENSUS_ERRORS, _mod.EXIT_UNRESOLVABLE,
         ]
 

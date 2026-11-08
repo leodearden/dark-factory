@@ -41,7 +41,7 @@ import pytest
 import pytest_asyncio
 
 from fused_memory.models.memory import AddMemoryResponse
-from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
+from fused_memory.reconciliation.known_projects_section import render_known_projects_section
 from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord, ReconLedgerStore
 from fused_memory.server.recon_report import ReconReportState
 
@@ -58,11 +58,6 @@ _STUB_ADD_MEMORY_RESPONSE = AddMemoryResponse(memory_ids=['stub-id'])
 # ---------------------------------------------------------------------------
 # Local helpers (self-contained; do not import from test_flag_dedup.py)
 # ---------------------------------------------------------------------------
-
-
-def _scope(project_id: str, project_root: str) -> ProjectScope:
-    """Build a ProjectScope from raw strings — DRYs the many test call sites."""
-    return ProjectScope(ProjectId(project_id), ProjectRoot(project_root))
 
 
 @pytest_asyncio.fixture
@@ -209,8 +204,9 @@ class TestSignaturePathCrossCycleDedup:
 
     compute_flag_signature's cited_tasks fallback (introduced by task-1573)
     derives a deterministic (task_id, flag_type) tuple from cited_tasks when
-    the top-level task_id is None.  dedup_flags uses this signature to key
-    the stage1_flag_marker row in the recon_ledger (task 2227), so cycle 2
+    the top-level task_id is None.  dedup_flags keys the stage1_flag_marker
+    row in the recon_ledger (task 2227) on compute_marker_signature, the same
+    union with each foreign cited id project-qualified (task 5614), so cycle 2
     finds the prior row and annotates the flag with persisted_from_run
     instead of re-escalating.
 
@@ -280,8 +276,9 @@ class TestSignaturePathCrossCycleDedup:
         self, ledger_memory_service
     ):
         """Cycle 1 (no prior ledger row): flag not annotated; a stage1_flag_marker
-        ledger row is upserted keyed by the cited-tasks-derived signature
-        (task_id='3803', flag_type='cross_project')."""
+        ledger row is upserted keyed by the cited-tasks-derived marker signature
+        (task_id='reify:3803', flag_type='cross_project') — 'reify' is foreign
+        to the running project 'p'."""
         from fused_memory.reconciliation.flag_dedup import dedup_flags
 
         flag = {
@@ -304,21 +301,22 @@ class TestSignaturePathCrossCycleDedup:
             f'Fresh flag must not have persisted_from_run; got {result[0]}'
         )
 
-        # A stage1_flag_marker ledger row was upserted, keyed by the
-        # cited-tasks-derived signature (task_id='3803', flag_type='cross_project').
+        # A stage1_flag_marker ledger row was upserted, keyed by the cited-tasks-
+        # derived marker signature (task_id='reify:3803', flag_type='cross_project').
         row = await ledger_memory_service.recon_ledger.get_by_identity(
-            'p', 'stage1_flag_marker', '3803', 'cross_project', ''
+            'p', 'stage1_flag_marker', 'reify:3803', 'cross_project', ''
         )
         assert row is not None, (
-            'Expected a stage1_flag_marker ledger row for (task_id=3803, '
+            'Expected a stage1_flag_marker ledger row for (task_id=reify:3803, '
             'flag_type=cross_project)'
         )
         payload = json.loads(row.payload_json)
         assert payload.get('source') == 'stage1_flag_marker', (
             f'Marker source must be "stage1_flag_marker"; got {payload.get("source")!r}'
         )
-        assert payload.get('task_id') == '3803', (
-            f'Marker task_id must be "3803" (cited-tasks signature); got {payload.get("task_id")!r}'
+        assert payload.get('task_id') == 'reify:3803', (
+            'Marker task_id must be "reify:3803" (cited-tasks marker signature); '
+            f'got {payload.get("task_id")!r}'
         )
         assert payload.get('flag_type') == 'cross_project', (
             f'Marker flag_type must be "cross_project"; got {payload.get("flag_type")!r}'
@@ -342,14 +340,14 @@ class TestSignaturePathCrossCycleDedup:
             payload_json=json.dumps({
                 'source': 'stage1_flag_marker',
                 'kind': 'stage1_flag_marker',
-                'task_id': '3803',
+                'task_id': 'reify:3803',
                 'flag_type': 'cross_project',
                 'run_id': 'r0',
                 'last_seen_run_id': 'r0',
             }),
             state='active',
             created_at='2026-01-01T00:00:00+00:00',
-            task_id='3803',
+            task_id='reify:3803',
             flag_type='cross_project',
             run_id='',
             expires_at='2099-01-01T00:00:00+00:00',
@@ -515,7 +513,7 @@ class TestUnknownProjectBranchHasNoAnchor:
 
     server/main.py builds ONE known_projects map and feeds it to BOTH
     state.known_projects (gating cite_task) AND the payload's Known Projects section
-    (rendered by _format_known_projects_section). So:
+    (rendered by render_known_projects_section). So:
 
         'appears in Known Projects' ↔ 'in known_projects' ↔ 'cite_task succeeds'
 
@@ -572,7 +570,7 @@ class TestUnknownProjectBranchHasNoAnchor:
         state._task_interceptor.get_task.assert_not_awaited()
 
     def test_known_projects_section_lists_project_iff_registered(self):
-        """_format_known_projects_section renders 'reify' only when it is in known_projects.
+        """render_known_projects_section renders 'reify' only when it is in known_projects.
 
         Together with test_cross_project_finding_carries_cited_tasks (step-1, where
         'reify' IS registered and cite_task succeeds), this locks in the full invariant:
@@ -584,26 +582,20 @@ class TestUnknownProjectBranchHasNoAnchor:
         The corrected step-6 prompt must key the cite_task directive on EXACTLY this
         condition — it must appear in the KNOWN-project branch, not the unknown-project one.
         """
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            TaskKnowledgeSync,
-        )
-
         # Two-project case: 'reify' registered → section renders and contains 'reify'
-        stage = TaskKnowledgeSync.__new__(TaskKnowledgeSync)
-        stage.scope = _scope('dark_factory', '/a')
-        stage.known_projects = {'dark_factory': '/a', 'reify': '/b'}
-        section = stage._format_known_projects_section()
+        section = render_known_projects_section(
+            {'dark_factory': '/a', 'reify': '/b'}, current_project_id='dark_factory'
+        )
         assert 'reify' in section, (
             f"'reify' must appear in Known Projects section when registered; got:\n{section!r}"
         )
 
-        # Single-project case: < 2 projects guard (L1927) → empty string
+        # Single-project case: < 2 projects guard → empty string
         # 'reify' is absent from the payload — the LLM's Known Projects section
         # does NOT list it, consistent with cite_task failing for an unregistered project
-        stage_solo = TaskKnowledgeSync.__new__(TaskKnowledgeSync)
-        stage_solo.scope = _scope('dark_factory', '/a')
-        stage_solo.known_projects = {'dark_factory': '/a'}
-        section_solo = stage_solo._format_known_projects_section()
+        section_solo = render_known_projects_section(
+            {'dark_factory': '/a'}, current_project_id='dark_factory'
+        )
         assert section_solo == '', (
             f'Section must be empty when fewer than 2 projects known; got:\n{section_solo!r}'
         )

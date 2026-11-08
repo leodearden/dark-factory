@@ -286,7 +286,7 @@ hang-until-released) and `FakeClock` live in `orchestrator/tests/_merge_lane_fak
 | Module | Owns (from the concern map) | Owns these shared attributes | Task |
 |---|---|---|---|
 | `merge_lane/worker.py` | composition root; `_merger_loop`, `_verifier_loop` as thin schedulers; `stop` | `_live_loops`, `_shutdown_signaled`, `_pending_get`, `_pending_verifier_get` | ο |
-| `merge_lane/intake.py` | enqueue, coalesce, lane buffers, suffix conflict graph, bounce, `_drain_queue_into_lanes`, `_acquire_next_request` | `_lane_buffers`, `_suffix_tracker`, `_redispatch` (sole writer; others *request* redispatch via a method) | ι |
+| `merge_lane/intake.py` | enqueue, coalesce, lane buffers, suffix conflict graph, bounce, `_drain_queue_into_lanes`, `_acquire_next_request` (amend, esc-5305-1: the lane buffers, suffix graph and bounce went to `merge_lane/intake_buffers.py::MergeIntake` to keep both files under the 1500-line ceiling, and `intake.py` keeps the request entry) | `_lane_buffers`, `_suffix_tracker`, `_redispatch` (sole writer; others *request* redispatch via a method) | ι |
 | `merge_lane/verify_dispatch.py` | `_run_post_merge_verify`, `_run_inflight_verify`, `_dispatch_item`, host quarantine (`_reprobe_quarantined_hosts` et al.), main-health probe | `_runner_unavailable`, `_runner_quarantine`, `_remerge_occurred` | κ |
 | `merge_lane/speculation.py` | chain build/depth/placement, permits/leases, `_remerge`/`_void_and_remerge`, absorbing `merge_speculation_controller.py` | `_n_failed`, `_last_known_main_sha` (via the tracker), permit ledger | λ |
 | `merge_lane/landing.py` | `_finalize_inflight`, CAS advance handling, `_land_chain_prefix`, outbox/journal, `_drift_base` transitions | `_inflight` (sole writer through `_inflight_append/_popleft/_clear`), `_drift_base` | μ |
@@ -496,6 +496,15 @@ members of the pre-condition branch list.
    "tests": {...}}`. Decide in α.
 4. **Mutation ratchet.** Whether ε's report becomes a ratchet measure and at what
    granularity. Decide after ε lands, outside this batch.
+   [Ruled 2026-10-05 (Leo), after ε landed:
+   - **Granularity:** mutation measures exclude logger calls. The fence is an
+     anchored `do_not_mutate_patterns` in `[tool.mutmut]` (task 6374).
+   - **Measure unsampled where the run fits.**
+   - **Every measurement files tasks for its live-code survivors.** Task 6327 is
+     the standing owner of that filing for the post-split modules.
+
+   Rationale and numbers: `plans/merge-lane-quality-prd.mutation-baseline.md`.
+   Whether a ratchet exists at all is still open.]
 5. **`_merge_queue_harness.py`** (test helper): fold into `_merge_lane_fakes.py` or
    keep. Decide in β.
 6. **Order of θ–ξ** if a task's extraction turns out to need another's module first.

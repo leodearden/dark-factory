@@ -7,7 +7,9 @@ tests belong HERE for the same reason: pinned once, they hold for every guard
 that composes it, where a copy per guard would drift exactly as the code did.
 
 Everything below drives the public surface — ``record``, ``call_sink``,
-``tracked_keys`` and the two public tuning attributes. No test reaches a
+``tracked_keys``, ``names_callers`` and the three public live-read tuning
+attributes (``threshold``, ``window_seconds``, ``time_provider``). No test
+reaches a
 private member; the one property that needed a window into this object's state
 (that dormant counters are EVICTED, so a caller-supplied project key cannot
 grow it without bound) is served by ``tracked_keys`` being part of the
@@ -21,7 +23,7 @@ from typing import Any
 
 import pytest
 
-from shared.boundary_storm_escape import BoundaryStormEscape, call_sink
+from shared.boundary_storm_escape import BoundaryStormEscape, call_sink, storm_outcome_label
 
 
 class _Clock:
@@ -132,6 +134,64 @@ class TestTheKeyIsProjectAndOutcomeTogether:
         assert await escape.record('absorbed', 'beta') is None
 
 
+class TestAReasonSplitsTheKey:
+    """An optional ``reason`` qualifies an outcome: it is part of the counting
+    key and of the fired record, so two reasons never pool into one burst."""
+
+    async def _fire(self, escape: BoundaryStormEscape) -> dict[str, Any] | None:
+        for _ in range(2):
+            await escape.record('absorbed', 'alpha', reason='timed_out')
+        return await escape.record('absorbed', 'alpha', reason='timed_out')
+
+    async def test_two_reasons_do_not_pool_into_a_premature_fire(self) -> None:
+        escape, _ = build_escape()
+        fired = [
+            await escape.record('absorbed', 'alpha', reason=reason)
+            for reason in ('timed_out', 'unreachable', 'timed_out', 'unreachable')
+        ]
+        assert fired == [None, None, None, None]
+
+    async def test_the_third_same_reason_record_fires_naming_its_reason(self) -> None:
+        filed: list[dict[str, Any]] = []
+        escape, _ = build_escape(filed.append)
+        summary = await self._fire(escape)
+        expected = {
+            'count': 3,
+            'threshold': 3,
+            'window_seconds': 3600.0,
+            'outcome': 'absorbed',
+            'reason': 'timed_out',
+            'project': 'alpha',
+        }
+        assert summary == expected
+        assert summary is not None and list(summary) == list(expected)
+        assert filed == [{'error_type': ERROR_TYPE, **expected}]
+
+    async def test_a_reasonless_record_has_no_reason_slot(self) -> None:
+        escape, _ = build_escape()
+        for _ in range(2):
+            await escape.record('absorbed', 'alpha')
+        summary = await escape.record('absorbed', 'alpha')
+        assert summary is not None and 'reason' not in summary
+
+    async def test_reason_is_a_reserved_record_key(self) -> None:
+        escape, _ = build_escape()
+        with pytest.raises(ValueError) as excinfo:
+            await escape.record('absorbed', 'alpha', crossing={'reason': 'x'})
+        assert repr('reason') in str(excinfo.value)
+
+    async def test_the_error_line_names_the_reason(self, caplog: Any) -> None:
+        escape, _ = build_escape()
+        with caplog.at_level(logging.ERROR, logger='shared.boundary_storm_escape'):
+            await self._fire(escape)
+        [line] = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert line.startswith('test_guard_storm: 3 absorbed (timed_out)')
+
+    def test_the_outcome_label_appends_a_reason_only_when_present(self) -> None:
+        assert storm_outcome_label({'outcome': 'absorbed'}) == 'absorbed'
+        assert storm_outcome_label({'outcome': 'absorbed', 'reason': 'timed_out'}) == 'absorbed (timed_out)'
+
+
 class TestTheTuningIsReadLive:
     """``StormCounter``'s reload-safety contract, kept at this layer.
 
@@ -155,6 +215,17 @@ class TestTheTuningIsReadLive:
         assert await escape.record('absorbed', 'alpha') is None, (
             'the earlier event is outside the narrowed window, so the burst has '
             'a count of one'
+        )
+
+    async def test_the_clock_is_read_live_too(self) -> None:
+        """A REGISTERED guard is tuned by its tests through this attribute, not
+        by reaching private state, so a rebound clock must drive the window."""
+        escape, _ = build_escape()
+        for _ in range(2):
+            await escape.record('absorbed', 'alpha')
+        escape.time_provider = _Clock(now=10_000.0)
+        assert await escape.record('absorbed', 'alpha') is None, (
+            'read off the rebound clock, the first two events have drained'
         )
 
 
@@ -181,6 +252,131 @@ class TestDormantCountersAreEvicted:
         escape, _ = build_escape()
         await escape.record('absorbed', 'alpha')
         assert isinstance(escape.tracked_keys, frozenset)
+
+
+class TestCallersAreNamedWhenDeclared:
+    """``names_callers`` is STRUCTURAL: it decides whether a storm carries
+    ``callers`` at all, and a per-call ``caller=`` is only meaningful under it.
+    """
+
+    async def test_the_storm_names_the_distinct_callers_of_its_window(self) -> None:
+        escape, _ = build_escape(names_callers=True)
+        for caller in ('x', 'y'):
+            await escape.record('absorbed', 'alpha', caller=caller)
+        storm = await escape.record('absorbed', 'alpha', caller='x')
+        assert storm is not None and storm['callers'] == ['x', 'y']
+
+    async def test_unnamed_callers_still_count_and_leave_callers_empty(self) -> None:
+        escape, _ = build_escape(names_callers=True)
+        for _ in range(2):
+            await escape.record('absorbed', 'alpha', caller=None)
+        storm = await escape.record('absorbed', 'alpha', caller=None)
+        assert storm is not None
+        assert (storm['count'], storm['callers']) == (3, [])
+
+    async def test_callers_never_split_a_key_into_separate_thresholds(self) -> None:
+        """A caller buys attribution, never a threshold of its own."""
+        escape, _ = build_escape(names_callers=True)
+        fired = [
+            await escape.record('absorbed', 'alpha', caller=caller)
+            for caller in ('x', 'y', 'z')
+        ]
+        assert [storm is not None for storm in fired] == [False, False, True]
+
+    async def test_names_callers_is_readable_back(self) -> None:
+        assert build_escape(names_callers=True)[0].names_callers is True
+        assert build_escape()[0].names_callers is False
+
+    async def test_without_the_flag_the_storm_has_no_callers_slot(self) -> None:
+        """A constant-empty slot on every storm is the degenerate-slot defect
+        task 4805 removed from this very record."""
+        escape, _ = build_escape()
+        for _ in range(2):
+            await escape.record('absorbed', 'alpha')
+        storm = await escape.record('absorbed', 'alpha')
+        assert storm is not None and 'callers' not in storm
+
+    async def test_a_caller_without_the_flag_is_a_wiring_bug(self) -> None:
+        escape, _ = build_escape()
+        with pytest.raises(ValueError) as excinfo:
+            await escape.record('absorbed', 'alpha', caller='x')
+        message = str(excinfo.value)
+        assert 'caller' in message and 'names_callers' in message
+
+
+class TestCrossingFactsRideOnTheRecord:
+    """Per-call facts about the call that crossed the line, merged after the
+    base keys so the record stays one flat, key-sortable mapping."""
+
+    CROSSING = {'crossing_agent_id': 'a', 'crossing_x': None}
+
+    async def _fire(self, escape: BoundaryStormEscape) -> dict[str, Any] | None:
+        for _ in range(2):
+            await escape.record('absorbed', 'alpha')
+        return await escape.record('absorbed', 'alpha', crossing=self.CROSSING)
+
+    async def test_the_crossing_facts_reach_the_storm_and_the_sink(self) -> None:
+        filed: list[dict[str, Any]] = []
+        escape, _ = build_escape(filed.append)
+        storm = await self._fire(escape)
+        assert storm is not None
+        for record in (storm, filed[0]):
+            assert record['crossing_agent_id'] == 'a'
+            assert 'crossing_x' in record and record['crossing_x'] is None
+
+    async def test_the_record_order_is_base_then_crossing_then_callers(self) -> None:
+        filed: list[dict[str, Any]] = []
+        escape, _ = build_escape(filed.append, names_callers=True)
+        await self._fire(escape)
+        assert list(filed[0]) == [
+            'error_type',
+            'count',
+            'threshold',
+            'window_seconds',
+            'outcome',
+            'project',
+            'crossing_agent_id',
+            'crossing_x',
+            'callers',
+        ]
+
+    @pytest.mark.parametrize('reserved', ['count', 'project', 'callers', 'error_type'])
+    async def test_a_crossing_key_cannot_overwrite_a_reserved_one(
+        self, reserved: str
+    ) -> None:
+        escape, _ = build_escape(names_callers=True)
+        with pytest.raises(ValueError) as excinfo:
+            await escape.record('absorbed', 'alpha', crossing={reserved: 'x'})
+        assert repr(reserved) in str(excinfo.value)
+
+
+class TestTheErrorLine:
+    """ONE greppable ERROR line per burst, in the record's own vocabulary."""
+
+    BARE_LINE = "test_guard_storm: 3 absorbed outcome(s) in 3600.0s for project='alpha'"
+
+    async def _error_lines(
+        self, escape: BoundaryStormEscape, caplog: Any, **last_call: Any
+    ) -> list[str]:
+        with caplog.at_level(logging.ERROR, logger='shared.boundary_storm_escape'):
+            for _ in range(2):
+                await escape.record('absorbed', 'alpha')
+            await escape.record('absorbed', 'alpha', **last_call)
+        return [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+
+    async def test_advice_and_crossing_facts_extend_the_line(self, caplog: Any) -> None:
+        escape, _ = build_escape(log_advice='report it to X')
+        [line] = await self._error_lines(
+            escape, caplog, crossing={'crossing_agent_id': 'a', 'crossing_x': None}
+        )
+        assert line.startswith(self.BARE_LINE)
+        assert ' — report it to X' in line
+        assert line.endswith("; crossing call crossing_agent_id='a' crossing_x=None")
+
+    async def test_without_either_the_line_is_unchanged(self, caplog: Any) -> None:
+        """Pins the uuid guard's line, which sets neither option."""
+        escape, _ = build_escape()
+        assert await self._error_lines(escape, caplog) == [self.BARE_LINE]
 
 
 # ---------------------------------------------------------------------------

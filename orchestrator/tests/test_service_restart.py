@@ -10,7 +10,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from df_pytest_isolation import wait_pid_gone
+from df_pytest_isolation import read_proc_state
 
 from orchestrator.service_restart import (
     DEFAULT_FLEET_LEASE_MAX_AGE_SECS,
@@ -2268,7 +2268,11 @@ def _reliably_dead_pid() -> int:
     """A pid that is definitively not running, for the crash-safety tests."""
     proc = subprocess.Popen(['true'])
     proc.wait()
-    assert wait_pid_gone(proc.pid), 'the probe child must be reaped before use'
+    state = read_proc_state(proc.pid)
+    assert state is None, (
+        f'pid {proc.pid} still has a /proc entry {state} after proc.wait() reaped it; '
+        'os.kill(pid, 0), which the lease liveness check uses, would read it as alive'
+    )
     return proc.pid
 
 
@@ -2296,6 +2300,21 @@ def test_lease_gate_defaults_stored_on_coordinator(tmp_path: Path) -> None:
     )
     assert coord2._lease_path == lease_path
     assert coord2._lease_max_age_secs == 1234.0
+
+
+def test_coordinator_lease_max_age_default_matches_the_config_default() -> None:
+    """The coordinator's own default and the config field's are one bound.
+
+    The harness always passes the config value, so a drift here would show
+    only in a coordinator built without it -- the copy task 5371 left at 7200
+    while the config moved to 14400 for the --drain verify-wait cap.
+    """
+    from orchestrator.config import OrchestratorConfig
+
+    config_default = OrchestratorConfig.model_fields[
+        'orchestrator_restart_lease_max_age_secs'
+    ].default
+    assert config_default == DEFAULT_FLEET_LEASE_MAX_AGE_SECS
 
 
 @pytest.mark.asyncio
@@ -2546,9 +2565,10 @@ async def test_missing_lease_is_silent(tmp_path: Path, caplog) -> None:
 #
 # A positive int too large for the platform's C pid_t passes every type guard
 # lease_is_live applies -- isinstance(pid, int), not a bool, > 0 -- reaches
-# os.kill, and raises OverflowError, which is not an OSError and is caught by
-# nobody between there and Harness._maybe_restart_stale_service's run-forever
-# loop. These are CONTRACT tests against lease_is_live's own sentence:
+# os.kill, and raises OverflowError, which is not an OSError. Nothing in the
+# coordinator catches it: it would reach the stale-service-restart
+# BackgroundService, whose loop logs it and backs off, so the pending restart
+# would never fire. These are CONTRACT tests against lease_is_live's own sentence:
 # "FAIL-OPEN throughout: a missing, corrupt, unreadable or nonsensical lease
 # reads as 'no sweep in flight' and never raises."
 # ---------------------------------------------------------------------------
@@ -2581,8 +2601,9 @@ async def test_out_of_range_lease_pid_fires_fail_open(tmp_path: Path) -> None:
     Returning False from the predicate is only half the contract; the half
     that matters operationally is that a nonsensical lease costs at most one
     un-gated restart, the same fail-open direction every other unusable-lease
-    case takes. An OverflowError here escapes maybe_restart into
-    Harness._maybe_restart_stale_service, which has no try/except.
+    case takes. An OverflowError here would escape maybe_restart; the caller's
+    loop (``background_service.py::BackgroundService._loop``) would log it and
+    back off, so the restart would never fire.
     """
     lease = _write_lease(tmp_path / 'lease.json', pid=_UNREPRESENTABLE_PID)
     coord, current_time, _, executor = _make_force_fire_coordinator(

@@ -1,0 +1,275 @@
+{
+  "chosen_t_high": null,
+  "chosen_t_low": null,
+  "reason": "empty_class: cannot separate two classes when one is empty (n_duplicate=0, n_negative=2850)",
+  "deterministic_band_false_positives": null,
+  "distributions": {
+    "true_dup": {
+      "n": 0,
+      "min": null,
+      "max": null,
+      "mean": null,
+      "median": null,
+      "p05": null,
+      "p25": null,
+      "p75": null,
+      "p95": null
+    },
+    "unrelated": {
+      "n": 2636,
+      "min": 0.13766340271753896,
+      "max": 0.9001579636364982,
+      "mean": 0.41758880409216353,
+      "median": 0.3855726736911569,
+      "p05": 0.2465645502527128,
+      "p25": 0.3234685074548978,
+      "p75": 0.4884922313607716,
+      "p95": 0.6841675815872577
+    },
+    "hard_negative": {
+      "n": 214,
+      "min": 0.4541831350264498,
+      "max": 0.9604052090895375,
+      "mean": 0.7769899505830242,
+      "median": 0.7765010831273275,
+      "p05": 0.6137154472832169,
+      "p25": 0.7262540147060806,
+      "p75": 0.8357454548732174,
+      "p95": 0.9376505399624294
+    }
+  },
+  "per_band": {
+    "true_dup": {
+      "deterministic": 0,
+      "judge": 0,
+      "store": 0
+    },
+    "unrelated": {
+      "deterministic": 0,
+      "judge": 0,
+      "store": 2636
+    },
+    "hard_negative": {
+      "deterministic": 0,
+      "judge": 0,
+      "store": 214
+    }
+  },
+  "per_category": {
+    "observations_and_summaries": {
+      "distributions": {
+        "true_dup": {
+          "n": 0,
+          "min": null,
+          "max": null,
+          "mean": null,
+          "median": null,
+          "p05": null,
+          "p25": null,
+          "p75": null,
+          "p95": null
+        },
+        "unrelated": {
+          "n": 465,
+          "min": 0.27961811779242973,
+          "max": 0.9001579636364982,
+          "mean": 0.6138493929647924,
+          "median": 0.6355949844885155,
+          "p05": 0.3492829092023071,
+          "p25": 0.5803478579721066,
+          "p75": 0.6896197668107559,
+          "p95": 0.7895335102636702
+        },
+        "hard_negative": {
+          "n": 96,
+          "min": 0.6886746419979075,
+          "max": 0.9604052090895375,
+          "mean": 0.8401815172257187,
+          "median": 0.8411152993563783,
+          "p05": 0.7065320684615057,
+          "p25": 0.7770520161797663,
+          "p75": 0.9056637416165894,
+          "p95": 0.953798245765429
+        }
+      },
+      "t_high": null,
+      "t_low": null,
+      "reason": "empty_class: cannot separate two classes when one is empty (n_duplicate=0, n_negative=561)",
+      "pair_counts": {
+        "true_dup": 0,
+        "unrelated": 465,
+        "hard_negative": 96
+      },
+      "pooled_t_high_negatives_admitted": null
+    },
+    "procedural_knowledge": {
+      "distributions": {
+        "true_dup": {
+          "n": 0,
+          "min": null,
+          "max": null,
+          "mean": null,
+          "median": null,
+          "p05": null,
+          "p25": null,
+          "p75": null,
+          "p95": null
+        },
+        "unrelated": {
+          "n": 722,
+          "min": 0.13766340271753896,
+          "max": 0.7906209803291907,
+          "mean": 0.35332546586282343,
+          "median": 0.33462601968730904,
+          "p05": 0.20547020699607388,
+          "p25": 0.2742615307773995,
+          "p75": 0.4170985412610087,
+          "p95": 0.564007084661776
+        },
+        "hard_negative": {
+          "n": 98,
+          "min": 0.4541831350264498,
+          "max": 0.8348349638761745,
+          "mean": 0.7141495224579563,
+          "median": 0.7302975773291536,
+          "p05": 0.5392051309495599,
+          "p25": 0.6812366176904762,
+          "p75": 0.761671696252948,
+          "p95": 0.8181780148796314
+        }
+      },
+      "t_high": null,
+      "t_low": null,
+      "reason": "empty_class: cannot separate two classes when one is empty (n_duplicate=0, n_negative=820)",
+      "pair_counts": {
+        "true_dup": 0,
+        "unrelated": 722,
+        "hard_negative": 98
+      },
+      "pooled_t_high_negatives_admitted": null
+    },
+    "preferences_and_norms": {
+      "distributions": {
+        "true_dup": {
+          "n": 0,
+          "min": null,
+          "max": null,
+          "mean": null,
+          "median": null,
+          "p05": null,
+          "p25": null,
+          "p75": null,
+          "p95": null
+        },
+        "unrelated": {
+          "n": 0,
+          "min": null,
+          "max": null,
+          "mean": null,
+          "median": null,
+          "p05": null,
+          "p25": null,
+          "p75": null,
+          "p95": null
+        },
+        "hard_negative": {
+          "n": 0,
+          "min": null,
+          "max": null,
+          "mean": null,
+          "median": null,
+          "p05": null,
+          "p25": null,
+          "p75": null,
+          "p95": null
+        }
+      },
+      "t_high": null,
+      "t_low": null,
+      "reason": "empty_class: cannot separate two classes when one is empty (n_duplicate=0, n_negative=0)",
+      "pair_counts": {
+        "true_dup": 0,
+        "unrelated": 0,
+        "hard_negative": 0
+      },
+      "pooled_t_high_negatives_admitted": null
+    }
+  },
+  "recall_at_k": {
+    "per_k": [
+      {
+        "k": 1,
+        "hits": 0,
+        "total": 54,
+        "recall": 0.0
+      },
+      {
+        "k": 3,
+        "hits": 18,
+        "total": 54,
+        "recall": 0.3333333333333333
+      },
+      {
+        "k": 5,
+        "hits": 32,
+        "total": 54,
+        "recall": 0.5925925925925926
+      },
+      {
+        "k": 10,
+        "hits": 35,
+        "total": 54,
+        "recall": 0.6481481481481481
+      },
+      {
+        "k": 20,
+        "hits": 41,
+        "total": 54,
+        "recall": 0.7592592592592593
+      }
+    ],
+    "canonical_absent": [],
+    "absent_in_denominator": false
+  },
+  "provenance": {
+    "fixture_path": "tests/fixtures/write_triage_calibration_solar_challenge_platform.jsonl",
+    "embedder_model": "text-embedding-3-small",
+    "embedder_dimensions": 1536,
+    "project_id": "solar_challenge_platform",
+    "retrieval_mode": "production",
+    "retrieval_call": "fused_memory.server.write_triage::retrieve_candidates",
+    "canonical_aliases_path": null,
+    "canonical_aliases_count": 0,
+    "record_count": 76,
+    "cluster_count": 22,
+    "per_category_record_counts": {
+      "observations_and_summaries": 34,
+      "procedural_knowledge": 41,
+      "preferences_and_norms": 1
+    },
+    "cross_category_dropped": 1469,
+    "degraded_retrievals": 0,
+    "pair_counts": {
+      "true_dup": 0,
+      "unrelated": 2636,
+      "hard_negative": 214
+    },
+    "per_category_pair_counts": {
+      "observations_and_summaries": {
+        "true_dup": 0,
+        "unrelated": 465,
+        "hard_negative": 96
+      },
+      "procedural_knowledge": {
+        "true_dup": 0,
+        "unrelated": 722,
+        "hard_negative": 98
+      },
+      "preferences_and_norms": {
+        "true_dup": 0,
+        "unrelated": 0,
+        "hard_negative": 0
+      }
+    }
+  }
+}

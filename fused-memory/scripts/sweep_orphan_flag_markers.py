@@ -176,14 +176,15 @@ boundary: the two surviving reasons are each independently sufficient.
 Task 5286 ported the THIRD guard ``_sweep_stale_mem0_pool`` applies —
 ``mem0_tombstone.is_protected_audit_record`` / ``PROTECTED_AUDIT_KINDS`` (task
 4375), added after the age-only rule destroyed the 40 ``kind='cadence_check'``
-audit records described above — and added a primary arm of this script's own,
-the FOREIGN-KIND arm (:func:`protection_reason`): a record declaring any
-``kind`` other than ``MARKER_KIND`` belongs to another pool and is never
-deleted here. The denylist alone is not enough in this script, because
-``find_orphan_markers`` nominates every foreign-kind record on the first run at
-any age, and ``--terminal-drain`` inverts the terminal-task-closure gate that
-is the in-cycle collector's primary defence. The decision record is
-``docs/flag-marker-sweep-recurring.md``.
+audit records described above — and added a primary arm, the FOREIGN-KIND arm
+(:func:`protection_reason`): a record declaring any ``kind`` other than
+``MARKER_KIND`` belongs to another pool and is never deleted here. Task 6241
+gave the in-cycle collector the same arm; both call
+``mem0_tombstone.is_foreign_kind_record``. The denylist alone is not enough in
+this script, because ``find_orphan_markers`` nominates every foreign-kind
+record on the first run at any age, and ``--terminal-drain`` inverts the
+terminal-task-closure gate that is the ``flag_for_stage2`` collector's primary
+defence. The decision record is ``docs/flag-marker-sweep-recurring.md``.
 
 SINGLE SOURCE OF TRUTH for the dated census (which filter matched how many
 records, in which project, when), for the full censused-never-deleted
@@ -220,14 +221,12 @@ from typing import Any
 
 from fused_memory.reconciliation.flag_dedup import is_content_fingerprint_task_id
 from fused_memory.reconciliation.mem0_tombstone import (
+    is_foreign_kind_record,
     is_protected_audit_record,
     is_protected_mirror_record,
     record_mem0_deletion_tombstones,
 )
-from fused_memory.utils.store_mutation_preflight import (
-    StoreMutationUnavailable,
-    assert_store_mutation_allowed,
-)
+from fused_memory.utils.store_mutation_preflight import assert_store_mutation_allowed
 
 # ---------------------------------------------------------------------------
 # Module-level constants
@@ -578,15 +577,15 @@ def protection_reason(metadata: Any) -> ProtectionReason | None:
       (task 3041/4435).
     - ``PROTECTED_AUDIT_KIND`` — ``mem0_tombstone.is_protected_audit_record``,
       the ``PROTECTED_AUDIT_KINDS`` denylist (task 4375).
-    - ``FOREIGN_KIND`` — this sweep's PRIMARY arm (task 5286): a ``kind`` that
-      is present and is not :data:`MARKER_KIND`. The legacy pool's shape is
-      exactly "kind absent or MARKER_KIND", so a declared different kind is
-      positive evidence that the record belongs to another pool. The arm is
-      structurally opt-in: an UNREGISTERED audit kind is protected without
+    - ``FOREIGN_KIND`` — this sweep's PRIMARY arm (task 5286):
+      ``mem0_tombstone.is_foreign_kind_record`` against :data:`MARKER_KIND`,
+      shared with the in-cycle collector (task 6241). The legacy pool's shape
+      is exactly "kind absent or MARKER_KIND", so a declared different kind
+      is positive evidence that the record belongs to another pool. The arm
+      is structurally opt-in: an UNREGISTERED audit kind is protected without
       anyone editing ``PROTECTED_AUDIT_KINDS``. It does not consult task
       status, so ``--terminal-drain``, which inverts the in-cycle
-      terminal-closure gate, cannot weaken it. It compares with ``!=``, never
-      set membership, so a list- or dict-valued ``kind`` cannot raise.
+      terminal-closure gate, cannot weaken it.
 
     The order IS the attribution: a mirror or audit record is reported under
     its specific reason, never as merely foreign.
@@ -597,10 +596,7 @@ def protection_reason(metadata: Any) -> ProtectionReason | None:
         return ProtectionReason.CYCLE_SUMMARY_MIRROR
     if is_protected_audit_record(metadata):
         return ProtectionReason.PROTECTED_AUDIT_KIND
-    if not isinstance(metadata, dict):
-        return None
-    kind = metadata.get('kind')
-    if kind is not None and kind != MARKER_KIND:
+    if is_foreign_kind_record(metadata, MARKER_KIND):
         return ProtectionReason.FOREIGN_KIND
     return None
 
@@ -628,8 +624,9 @@ def find_protected_markers(members: list[dict]) -> list[dict]:
 
     Restores parity with the in-cycle collector
     ``stages/task_knowledge_sync.py::_sweep_stale_mem0_pool`` on its two
-    denylist guards, and adds the foreign-kind arm that collector does not
-    need. The decision record is ``docs/flag-marker-sweep-recurring.md``.
+    denylist guards. Both collectors also apply the foreign-kind arm, through
+    ``mem0_tombstone.is_foreign_kind_record`` (task 6241). The decision
+    record is ``docs/flag-marker-sweep-recurring.md``.
 
     The two ``mem0_tombstone`` predicates are deliberately IMPORTED rather
     than copied here, and stay separate predicates there. A local copy would
@@ -1092,9 +1089,10 @@ async def run(
     # The refusal reaches ``main``'s blanket ``except Exception``
     # (StoreMutationUnavailable subclasses RuntimeError), which logs and
     # returns 2. That is loud and non-zero, but the generic handler will label
-    # it a fatal sweep error -- which is exactly why the ``logger.error`` below
-    # must carry the fail-closed diagnosis (what was refused, that no marker
-    # was enumerated and nothing was mutated, and the remedy) BEFORE the raise. This also holds
+    # it a fatal sweep error -- which is exactly why the guard is handed this
+    # script's logger: its refusal record carries the fail-closed diagnosis
+    # (what was refused, that no marker was enumerated and nothing was
+    # mutated, and the remedy) BEFORE the raise. This also holds
     # under the ``--apply --check --max-backlog N`` predicate mode: a refused
     # run exits 2, so it can never be mistaken for a satisfied backlog gate.
     #
@@ -1102,21 +1100,16 @@ async def run(
     # builds ``'dry_run': not args.apply`` inline) so a read-only run stays
     # pure-read and needs no write capability at all.
     if args.apply:
-        try:
-            assert_store_mutation_allowed(operation='sweep_orphan_flag_markers --apply')
-        except StoreMutationUnavailable:
-            logger.error(
-                'sweep_orphan_flag_markers: --apply NOT started (fail-closed) -- '
-                "this process cannot write mem0's history directory, so deleting a "
-                'marker would remove its Qdrant point and then fail to write the '
-                'history, destroying records that survive nowhere but this log. '
-                'No marker was enumerated, nothing was mutated, and no backlog '
-                'predicate was evaluated. Route the sweep through the fused-memory '
-                'MCP server (the unsandboxed owner of the store), or re-run from an '
-                'unsandboxed operator shell. To obtain the sweep report safely from '
-                'anywhere, re-run without --apply.'
-            )
-            raise
+        assert_store_mutation_allowed(
+            operation='sweep_orphan_flag_markers --apply',
+            logger=logger,
+            extra_detail=(
+                'deleting a marker would remove its Qdrant point and then fail to '
+                'write the history, destroying records that survive nowhere but '
+                'this log. No marker was enumerated, nothing was mutated, and no '
+                'backlog predicate was evaluated.'
+            ),
+        )
 
     # --- Before counts (deterministic Qdrant payload-filter, not semantic) ---
     source_filter = {'source': MARKER_SOURCE}

@@ -1,0 +1,139 @@
+{
+ "stream": "S2",
+ "prd_path": "docs/prds/review-all-billing-push-lifecycle-and-unit-of-work.md",
+ "sidecar_path": "docs/prds/review-all-billing-push-lifecycle-and-unit-of-work.capability-manifest.yaml",
+ "filed": [
+  {
+   "label": "alpha",
+   "task_id": "1230",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-54ff8f0f1c91"
+   ],
+   "depends_on": [
+    "1147",
+    "1151",
+    "1180"
+   ]
+  },
+  {
+   "label": "beta1",
+   "task_id": "1232",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-a8c7fa69a520",
+    "fk-f08bf85cae29",
+    "fk-de4da351f5f0"
+   ],
+   "depends_on": [
+    "1230",
+    "1100"
+   ]
+  },
+  {
+   "label": "beta2",
+   "task_id": "1235",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-de4da351f5f0",
+    "fk-dce3d59c4630"
+   ],
+   "depends_on": [
+    "1232",
+    "1211",
+    "1212",
+    "1214"
+   ]
+  },
+  {
+   "label": "gamma",
+   "task_id": "295",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-ee01ed448860",
+    "fk-ca8aef7ca61a"
+   ],
+   "depends_on": [
+    "1230",
+    "493",
+    "1211",
+    "365",
+    "1212",
+    "1214"
+   ],
+   "note": "amended in place; released from lead-deferred"
+  },
+  {
+   "label": "delta",
+   "task_id": "1237",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-dce3d59c4630"
+   ],
+   "depends_on": [
+    "1235",
+    "493",
+    "1211",
+    "1212",
+    "1214"
+   ]
+  },
+  {
+   "label": "epsilon",
+   "task_id": "301",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-70a9451b40b6",
+    "fk-c4d0bd72b2a1"
+   ],
+   "depends_on": [
+    "1235",
+    "221"
+   ],
+   "note": "amended in place; priority low->medium"
+  },
+  {
+   "label": "zeta",
+   "task_id": "1046",
+   "priority": "low",
+   "x_finding_key": [
+    "fk-d5d6b9349097"
+   ],
+   "depends_on": [
+    "295",
+    "1235"
+   ],
+   "note": "amended in place; released from lead-deferred"
+  },
+  {
+   "label": "eta",
+   "task_id": "1240",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-de4da351f5f0",
+    "fk-dce3d59c4630"
+   ],
+   "depends_on": [
+    "295",
+    "1237",
+    "301",
+    "1046"
+   ],
+   "note": "integration gate"
+  }
+ ],
+ "held_leaves": [],
+ "gate_dependencies_added": [
+  "1232",
+  "1235",
+  "1240"
+ ],
+ "commit_planning_result": "all 8 pending; sidecar stamped; 35 checks red on main",
+ "lead_rulings": [
+  "Nothing held: S1 wired (1211/1212/1214/365); done deps 211 (from 295) and 187 (from 301) dropped.",
+  "Lead edges 2026-10-15: 459 -> 1235 (re-scope note; its four lifecycle checks repathed to 459's own delta); 460 -> 1230 + 1235 + 301 (bill-account-split-retired repathed to billing/push.py); 637 -> 1235; 639 -> 1232; 644 -> 1235; 663 -> 1232; notes on 461, 462, 464, 465, 466; fk-43579bc83b3d stamped on 476 (not a gate dep, Q5).",
+  "S23-beta2 (1117) released onto 1232. S15-gamma depends on 1235.",
+  "493's check check-failed-skip-reason widened to fleet_run.py + statement.py (295 moves the CONSENT_CHECK_FAILED spelling into SkipReason) to avoid a removed-path wave.",
+  "PRD drift corrected by the lead (held -> wired) before the sidecar commit. Briefing (interactive, after 1235): billing scenarios and run-state list."
+ ]
+}

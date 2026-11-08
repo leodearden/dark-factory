@@ -26,9 +26,10 @@ to work out who touched a historical record.
 Every test in the FIRST group runs against a CONSTRUCTED CLIENT with ``_post``
 stubbed out (see :func:`_record_handshake`); every test in the second runs
 against :class:`_CannedProject`, which replaces ``call_tool`` outright. No
-server is dialled, no socket is opened and no ``httpx.AsyncClient`` is built in
-either, so this file costs nothing to run and cannot be made flaky by the state
-of a live server.
+server is dialled and no socket is opened anywhere in this file (the
+``call_tool`` reply-shape tests build their client over
+``httpx.MockTransport``), so it costs nothing to run and cannot be made flaky
+by the state of a live server.
 """
 from __future__ import annotations
 
@@ -208,7 +209,7 @@ class _CannedProject:
         self.updates: list[dict] = []
         self._update_reply = update_reply or (lambda args: {'success': True})
 
-    async def call_tool(self, name: str, arguments: dict) -> dict:
+    async def call_tool(self, name: str, arguments: dict, *, timeout: float | None = None) -> dict:
         if name == 'get_tasks':
             return {'tasks': self._tasks}
         if name == 'update_task':
@@ -1015,7 +1016,7 @@ class _UnreadableProject:
         self._reply = reply
         self.updates: list[dict] = []
 
-    async def call_tool(self, name: str, arguments: dict) -> Any:
+    async def call_tool(self, name: str, arguments: dict, *, timeout: float | None = None) -> Any:
         if name != 'get_tasks':
             raise AssertionError(f'unreadable root must not reach {name}')
         if self._raises is not None:
@@ -1175,14 +1176,22 @@ def test_a_server_rejection_is_never_retried(monkeypatch):
 
 
 def _call_tool_against(result: dict) -> Any:
-    """Drive the REAL ``call_tool`` with ``_post`` stubbed. No socket, as ever."""
-    client = FusedMemoryClient('http://127.0.0.1:9')
+    """Drive the REAL client over an ``httpx.MockTransport`` that answers the tool call with *result*.
 
-    async def _fake_post(payload: dict) -> dict:
-        return result
+    No socket, as ever: the handshake posts get an empty 202.
+    """
 
-    client._post = _fake_post
-    return asyncio.run(client.call_tool('update_task', {}))
+    def answer(request: httpx.Request) -> httpx.Response:
+        if json.loads(request.content).get('method') == 'tools/call':
+            return httpx.Response(200, json=result)
+        return httpx.Response(202)
+
+    async def call() -> Any:
+        transport = httpx.MockTransport(answer)
+        async with FusedMemoryClient('http://127.0.0.1:9', transport=transport) as client:
+            return await client.call_tool('update_task', {})
+
+    return asyncio.run(call())
 
 
 def test_call_tool_marks_an_unparseable_text_reply_instead_of_swallowing_it():

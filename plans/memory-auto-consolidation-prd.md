@@ -250,10 +250,13 @@ run_auto_consolidation(memory_service, taskmaster, escalation_queue, *, project_
 - Otherwise the resolved `agent_id` must match a prefix in
   `reconciliation.deterministic_provenance_allowed_agent_prefixes` (default
   `['orchestrator']`; live-read, deny-on-missing, `mem0_update_authz.py` shape). The
-  orchestrator sends no `agent_id` and `tools.py::_resolve_identity` falls back to
-  `clientInfo.name`, which `orchestrator/src/orchestrator/mcp_lifecycle.py::McpSession.initialize`
-  advertises as `'orchestrator'`. Self-reported: a deterrent for cooperating callers, not a
-  boundary — stated in `docs/task-authoring.md`.
+  orchestrator sends explicit `agent_id='orchestrator'` on every
+  `Scheduler.set_task_status` write, the same spelling
+  `orchestrator/src/orchestrator/mcp_lifecycle.py::McpSession.initialize` advertises as
+  `clientInfo.name`. *(Corrected 2026-09-27, task 5241 review: stateless HTTP drops
+  clientInfo, so the `tools.py::_resolve_identity` fallback this bullet first relied on never
+  fires and the orchestrator sends explicit `agent_id='orchestrator'`.)* Self-reported: a
+  deterrent for cooperating callers, not a boundary — stated in `docs/task-authoring.md`.
 - The write journal row for a done write (accepted or refused) carries the resolved
   `agent_id` and `done_provenance.kind`.
 - `deterministic-gate` requires `escalation_id`; `deterministic_runner.py`'s pure-gate branch
@@ -290,7 +293,7 @@ the consumer-side recognition of the new categories is the watcher skill (task �
 | B8 | Supervised cycle | `enabled=false`, B1 inputs | Ledger `dry_run`, stats `auto_consolidations_dry_run=1`, zero memory writes, zero tasks; hazard input still files a gate |
 | B9 | Backlog trip | proposals > cap × multiplier | Nothing executed, one aggregate escalation, stats disclose `unexecuted` |
 | B10 | Reversal round-trip | After B1, `revert_auto_consolidation` | Canonical deleted, members' `topic` removed, census shows no orphan; after B2 reversal only n1–n3 un-stamped |
-| B11 | Provenance refusal | `set_task_status(done, done_provenance={kind: 'deterministic-gate'})` as `recon-stage-task_knowledge_sync` | Refused `DeterministicProvenanceCallerNotPermitted`; journal row carries agent id + kind; the same call with clientInfo `orchestrator` and `escalation_id` is accepted |
+| B11 | Provenance refusal | `set_task_status(done, done_provenance={kind: 'deterministic-gate'})` as `recon-stage-task_knowledge_sync` | Refused `DeterministicProvenanceCallerNotPermitted`; journal row carries agent id + kind; the same call with `agent_id='orchestrator'` and `escalation_id` is accepted *(corrected 2026-09-27, task 5241 review; see C5)* |
 | B12 | Stage surface | Stage 2 / Stage 3 tool allowlists | `propose_consolidation` absent; `consolidate_memories` absent from Stage 1 and 2; every fused-memory tool classified |
 | B13 | Project scoping | `enabled_projects=['dark_factory']`, proposal on `reify` | Skipped with stats `auto_consolidations_skipped_project`; no reads of reify members |
 
@@ -392,8 +395,9 @@ Verified present and wired:
 - `ReconLedgerRecord` fields and PK `(project_id, record_kind, task_id, flag_type, run_id)`;
   `upsert` last-write-wins; `mark_addressed`; index `ix_recon_ledger_project_kind_state`.
   **Absent:** a list-by-kind reader; TTL for NULL `expires_at` (task γ adds both).
-- `_resolve_identity` clientInfo fallback; `Scheduler.set_task_status` sends no `agent_id`;
-  `McpSession.initialize` advertises `'orchestrator'`; `deterministic_runner.py::
+- `_resolve_identity` clientInfo fallback (inert under stateless HTTP);
+  `Scheduler.set_task_status` sends explicit `agent_id='orchestrator'` *(corrected 2026-09-27,
+  task 5241 review; see C5)*; `McpSession.initialize` advertises `'orchestrator'`; `deterministic_runner.py::
   _build_done_provenance` is the live producer of `deterministic-*` kinds. One other
   producer exists (found at decompose, 2026-09-09):
   `fused-memory/scripts/cgl_eta_finalize_gate.py::_gate_done_provenance`, a finished one-shot
@@ -514,7 +518,8 @@ Same-file serialisation is carried by those edges (`server/tools.py`: β → γ 
   `services/write_journal.py`, `orchestrator/src/orchestrator/deterministic_runner.py`,
   `docs/task-authoring.md`, tests). Per C5. *Signal (leaf):* B11 — the recon-stage call is
   refused with `DeterministicProvenanceCallerNotPermitted`, the write-journal row names the
-  caller and kind, the orchestrator-clientInfo call with `escalation_id` is accepted, an empty
+  caller and kind, the orchestrator's explicit-`agent_id` call with `escalation_id` is accepted
+  *(corrected 2026-09-27, task 5241 review; see C5)*, an empty
   prefix list denies all, and `reload_config` flips the list live. G7: INV-1 (named error
   type), INV-2 (journal facts at the refusal).
 - **ζ — Review surfaces, skills, operator docs, cross-PRD pointers** (scripts + skills + docs +

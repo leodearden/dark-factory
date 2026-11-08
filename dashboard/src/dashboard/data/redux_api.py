@@ -10,10 +10,9 @@ through the matching ``shape_*`` function before serialising as JSON.
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass, replace
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 
 from shared.timestamps import parse_timestamp_or_warn
@@ -27,22 +26,25 @@ from dashboard.data.burndown import (
     compute_parity_alarm,
     compute_window_completion,
 )
+from dashboard.data.chart_utils import ChartData, trim_leading_zero_buckets
 from dashboard.data.datum import (
     Datum,
     DatumContractError,
     DatumInvariant,
     DatumState,
     aged_at,
+    map_datum,
     validate_datum,
 )
 from dashboard.data.escalation_corpus import EscalationView
-from dashboard.data.mcp_fanout import project_label
+from dashboard.data.merge_queue import DepthSeries, MergeAttempts
 from dashboard.data.outcome_colors import assign_outcome_colors
-from dashboard.data.performance import PerformanceCards
+from dashboard.data.performance import PerformanceListing
 from dashboard.data.reconciliation import AgentActivity
 from dashboard.data.stats_utils import percentile
 from dashboard.data.utils import resolve_now
 from dashboard.data.write_journal import MemoryOps
+from dashboard.project_labels import ProjectLabels, basename_label
 
 # ---------------------------------------------------------------------------
 # ORCHESTRATORS + PROJECTS
@@ -52,15 +54,18 @@ from dashboard.data.write_journal import MemoryOps
 def shape_orchestrators(
     orchestrators: Iterable[Mapping[str, Any]],
     *,
-    known_project_roots: Iterable[str | Path] = (),
+    labels: ProjectLabels,
     running_spark: Mapping[str, list] | None = None,
 ) -> dict[str, Any]:
     """Return ``{ORCHESTRATORS: [...], PROJECTS: [...]}`` for the API.
 
     ``orchestrators`` is the raw list from
-    :func:`dashboard.data.orchestrator.discover_orchestrators`.  ``known_project_roots``
-    is the union of configured roots; projects without a running orchestrator
-    are still surfaced (with ``active: False``).  ``running_spark`` is an
+    :func:`dashboard.data.orchestrator.discover_orchestrators`.  Every project
+    is named by its project label (``dashboard/project_labels.py::ProjectLabels``),
+    and ``labels.roots`` are the configured roots: a project without a running
+    orchestrator is still surfaced (with ``active: False``).  A running
+    orchestrator's root outside them is labelled alongside them
+    (``ProjectLabels.including``), so no two projects share an id.  ``running_spark`` is an
     optional ``{labels, values}`` time-series of the total running-orchestrator
     count over the last day, surfaced as ``ORCHESTRATORS_SPARK``.
 
@@ -87,18 +92,18 @@ def shape_orchestrators(
     its project's census Datum, whose state and reason travel with the count.
     """
     orchestrators = list(orchestrators)
+    active_roots = {str(o.get('project_root') or '') for o in orchestrators}
+    named = labels.including(active_roots)
     out_orchs: list[dict] = []
-    active_roots: set[str] = set()
     for o in orchestrators:
         pids = o.get('pids') or []
         primary_pid = pids[0] if pids else None
         project_root = o.get('project_root') or ''
-        active_roots.add(str(project_root))
         orch_entry: dict = {
             'pid': primary_pid,
             'pids': list(pids),
-            'label': o.get('label') or project_label(project_root),
-            'project': project_label(project_root),
+            'label': o.get('label') or named.of(project_root),
+            'project': named.of(project_root),
             'project_root': str(project_root),
             'running': bool(o.get('running')),
             'started': o.get('started') or '',
@@ -114,11 +119,11 @@ def shape_orchestrators(
     # whether an orchestrator is currently running for that root.
     seen: set[str] = set()
     out_projects: list[dict] = []
-    for root in (*active_roots, *(str(r) for r in known_project_roots)):
+    for root in (*active_roots, *(str(r) for r in labels.roots)):
         if root in seen:
             continue
         seen.add(root)
-        name = project_label(root)
+        name = named.of(root)
         out_projects.append({
             'id': name,
             'name': name,
@@ -184,6 +189,9 @@ def shape_memory(
     series; ``delta_24h`` carries per-project ``{graphiti_nodes,
     mem0_memories}`` snapshots from ~24h ago for delta rendering.  All three
     are populated from metrics.db; absent / empty when history is sparse.
+
+    graphiti/mem0 ``connected`` is served as ``get_status`` measured it, and
+    null when unmeasured: an absent flag, or fused-memory itself unreachable.
     """
     spark_g = (sparks or {}).get('graphiti_nodes') or _EMPTY_SERIES
     spark_m = (sparks or {}).get('mem0_memories') or _EMPTY_SERIES
@@ -200,10 +208,9 @@ def shape_memory(
 
     if status.get('offline'):
         return {'MEMORY_STATUS': {
-            'graphiti': {'connected': False, 'node_count': 0, 'edge_count': 0, 'episode_count': 0,
+            'graphiti': {'connected': None, 'node_count': 0, 'edge_count': 0, 'episode_count': 0,
                          'spark': _empty_series_dict()},
-            'mem0': {'connected': False, 'memory_count': 0, 'spark': _empty_series_dict()},
-            'taskmaster': {'connected': False},
+            'mem0': {'connected': None, 'memory_count': 0, 'spark': _empty_series_dict()},
             'queue': queue_block,
             'projects': {},
             'wal': _shape_wal_status(wal),
@@ -214,7 +221,7 @@ def shape_memory(
         }, 'served_at': served_at.isoformat()}
 
     graphiti = dict(status.get('graphiti') or {})
-    graphiti.setdefault('connected', True)
+    graphiti['connected'] = graphiti.get('connected')
     for _key in ('node_count', 'edge_count', 'episode_count'):
         graphiti.setdefault(_key, 0)
     graphiti['spark'] = {
@@ -222,15 +229,12 @@ def shape_memory(
         'values': list(spark_g.get('values') or []),
     }
     mem0 = dict(status.get('mem0') or {})
-    mem0.setdefault('connected', True)
+    mem0['connected'] = mem0.get('connected')
     mem0.setdefault('memory_count', 0)
     mem0['spark'] = {
         'labels': list(spark_m.get('labels') or []),
         'values': list(spark_m.get('values') or []),
     }
-    taskmaster = dict(status.get('taskmaster') or {})
-    taskmaster.setdefault('connected', True)
-
     raw_projects = dict(status.get('projects') or {})
     enriched_projects = {pid: _project_block(pid, payload) for pid, payload in raw_projects.items()}
 
@@ -239,7 +243,6 @@ def shape_memory(
     return {'MEMORY_STATUS': {
         'graphiti': graphiti,
         'mem0': mem0,
-        'taskmaster': taskmaster,
         'queue': queue_block,
         'projects': enriched_projects,
         'wal': wal_block,
@@ -351,30 +354,51 @@ def _shape_wal_status(
 # ---------------------------------------------------------------------------
 
 
-def shape_memory_graphs(ops: MemoryOps) -> dict[str, Any]:
-    """Return ``{MEMORY_OPS}``: one window's operations, both views.
+_MEMORY_OPS_SERIES_KEYS = ('labels', 'reads', 'writes', 'other', 'total', 'by_operation')
 
-    The hourly ``total`` series and the window ``totals`` are derived here
-    and nowhere else, so the client never re-counts: the reads/writes/other
-    caption and the donut's centre read the same served numbers, and
-    ``totals.total`` equals the ``by_operation`` sum by MemoryOps' invariant.
+
+def _memory_ops_series(ops: MemoryOps | None) -> dict[str, list]:
+    """The block's chart series; every one empty for an unmeasured window."""
+    if ops is None:
+        return {key: [] for key in _MEMORY_OPS_SERIES_KEYS}
+    return {
+        'labels': list(ops.labels),
+        'reads': list(ops.reads),
+        'writes': list(ops.writes),
+        'other': list(ops.other),
+        'total': [r + w + o for r, w, o in zip(ops.reads, ops.writes, ops.other, strict=True)],
+        'by_operation': [{'label': label, 'value': count} for label, count in ops.by_operation],
+    }
+
+
+def shape_memory_graphs(ops: Datum[MemoryOps], *, served_at: datetime) -> dict[str, Any]:
+    """Return ``{MEMORY_OPS, served_at}``: one window's operations, both views.
+
+    The hourly ``total`` series and the two readings, the window ``totals``
+    and the ``newest_hour_total``, are derived here and nowhere else, so the
+    client never re-counts: the reads/writes/other caption, the donut's centre
+    and the ops/min tile read the same served numbers, and ``totals.total``
+    equals the ``by_operation`` sum by MemoryOps' invariant. Both readings
+    carry *ops*'s provenance. An unmeasured window serves them ``unknown``
+    with every series empty, so no chart draws a flat zero line over a hole.
     """
-    reads, writes, other = sum(ops.reads), sum(ops.writes), sum(ops.other)
+    series = _memory_ops_series(ops.value)
+    if ops.value is None:
+        totals = newest_hour_total = None
+    else:
+        reads, writes, other = sum(series['reads']), sum(series['writes']), sum(series['other'])
+        totals = {'reads': reads, 'writes': writes, 'other': other, 'total': reads + writes + other}
+        newest_hour_total = series['total'][-1]
+
     return {
         'MEMORY_OPS': {
-            'labels': list(ops.labels),
-            'reads': list(ops.reads),
-            'writes': list(ops.writes),
-            'other': list(ops.other),
-            'total': [r + w + o for r, w, o in zip(ops.reads, ops.writes, ops.other, strict=True)],
-            'totals': {
-                'reads': reads, 'writes': writes, 'other': other,
-                'total': reads + writes + other,
-            },
-            'by_operation': [
-                {'label': label, 'value': count} for label, count in ops.by_operation
-            ],
+            **series,
+            'totals': _wire_served(replace(ops, value=totals), 'MEMORY_OPS totals', served_at),
+            'newest_hour_total': _wire_served(
+                replace(ops, value=newest_hour_total), 'MEMORY_OPS newest_hour_total', served_at,
+            ),
         },
+        'served_at': served_at.isoformat(),
     }
 
 
@@ -448,17 +472,26 @@ def shape_recon(
 # ---------------------------------------------------------------------------
 
 
-def _wire_served(candidate: object, field: str, served_at: datetime) -> dict[str, object]:
+def _wire_served(
+    candidate: object,
+    field: str,
+    served_at: datetime,
+    *,
+    project: Callable[[Any], object] | None = None,
+) -> dict[str, object]:
     """*candidate* as served at *served_at*: aged, validated and rendered to the wire.
 
     A route fills every Datum field of its payload, so a *field* holding
     anything but a Datum is a wiring bug and raises ``DATUM_REQUIRED``, as
-    does a Datum that breaks its contract at *served_at*.
+    does a Datum that breaks its contract at *served_at*. *project*, when
+    given, reshapes a known value for the wire (:func:`map_datum`).
     """
     if not isinstance(candidate, Datum):
         raise DatumContractError(
             DatumInvariant.DATUM_REQUIRED, f'{field} must be a Datum, got {candidate!r}',
         )
+    if project is not None:
+        candidate = map_datum(candidate, project)
     aged = aged_at(candidate, served_at)
     validate_datum(aged, served_at)
     return aged.to_wire()
@@ -475,22 +508,37 @@ def _wire_views(
     }
 
 
-def _shape_outcomes(raw: Mapping[str, Any] | None) -> dict[str, Any]:
-    """Enrich an outcomes dict with a parallel ``colors`` list.
+def _shape_outcomes(chart: ChartData) -> dict[str, Any]:
+    """An outcome chart's ``{labels, values}`` plus a parallel ``colors`` list.
 
-    Given the raw ``outcomes`` mapping (``{labels, values}`` from the
-    aggregator), returns a new dict with those keys preserved and a
-    ``colors`` key added via :func:`~dashboard.data.outcome_colors.assign_outcome_colors`.
+    The colors come from :func:`~dashboard.data.outcome_colors.assign_outcome_colors`.
     """
-    outcomes = dict(raw or {'labels': [], 'values': []})
-    labels: list[str] = outcomes.get('labels') or []
-    outcomes['colors'] = assign_outcome_colors(labels)
-    return outcomes
+    return {**chart, 'colors': assign_outcome_colors(chart['labels'])}
+
+
+def _shape_attempts(attempts: MergeAttempts) -> dict[str, Any]:
+    """One window's attempts as the donut's colored chart and the latency block."""
+    return {'outcomes': _shape_outcomes(attempts.outcome_chart()), 'latency': attempts.latency()}
+
+
+def _shape_depth(series: DepthSeries) -> dict[str, Any]:
+    """Serve a depth series as ``{labels, values, bucket_minutes}``, leading zero buckets trimmed.
+
+    ``bucket_minutes`` is the width in minutes each bucket spans, None when
+    the series names no width.
+    """
+    trimmed = trim_leading_zero_buckets(series)
+    return {
+        'labels': list(trimmed['labels']),
+        'values': list(trimmed['values']),
+        'bucket_minutes': series.get('bucket_minutes'),
+    }
 
 
 def shape_merge_queue(
     per_project: Mapping[str, Mapping[str, Any]],
     *,
+    labels: ProjectLabels,
     served_at: datetime,
     active_sparks: Mapping[str, Mapping[str, list]] | None = None,
     halt_status: Mapping[str, Mapping[str, Any]] | None = None,
@@ -498,33 +546,40 @@ def shape_merge_queue(
     """Return ``{MERGE_QUEUE: {project_label: {...}}, served_at}``.
 
     The aggregator already returns one entry per project; we relabel the keys
-    from absolute project_root paths to short basenames so the React side can
+    from absolute project_root paths to each root's project label
+    (``dashboard/project_labels.py::ProjectLabels``) so the React side can
     match against ``PROJECTS[].name``.  Per project: ``depth`` (renamed from
-    ``depth_timeseries``), ``outcomes``, ``latency`` (whose ``with_duration``
-    and ``without_duration`` sum to the outcomes total), ``recent``,
-    ``recent_total`` (how many merges the window holds; ``recent`` is capped),
-    ``speculative``, ``active`` (the live probe's entries), ``in_queue``,
-    ``live_probe_configured`` (false keeps the project out of the client's
-    multi-project in-queue totals), ``active_spark``, ``halt``,
-    ``train_events``. ``in_queue`` and ``live_probe_configured`` are required:
-    the route resolves both for every project.
+    ``depth_timeseries``, its value shaped by :func:`_shape_depth`),
+    ``attempts`` (one value ``{outcomes, latency}``, whose latency's
+    ``with_duration`` and ``without_duration`` sum to the outcomes total),
+    ``recent``, ``recent_total`` (how many merges the window holds;
+    ``recent`` is capped), ``speculative``, ``active`` (the live probe's
+    entries), ``in_queue``, ``live_probe_configured`` (false keeps the
+    project out of the client's multi-project in-queue totals),
+    ``active_spark``, ``halt``, ``train_events``, ``train_throughput``.
+    ``depth``, ``attempts``, ``in_queue``, ``speculative``, ``recent_total``,
+    ``train_throughput`` and ``live_probe_configured`` are required: the
+    route resolves them for every project.
 
-    ``in_queue`` and every ``recent``/``active`` row's ``title`` are Datums the
-    route resolved, each aged to *served_at*, validated against it and
-    rendered to the wire. A field that is not a Datum, or a Datum that breaks
-    its contract there, is a wiring or shaper bug, and the
+    ``depth``, ``attempts``, ``in_queue``, ``speculative``, ``recent_total``,
+    ``train_throughput`` and every ``recent``/``active`` row's ``title`` are
+    Datums the route resolved, each aged to *served_at*, validated against it
+    and rendered to the wire. A field that is not a Datum, or a Datum that
+    breaks its contract there, is a wiring or shaper bug, and the
     :class:`~dashboard.data.datum.DatumContractError` propagates.
 
     ``active_sparks`` (optional) is ``in_queue``'s sampled history, keyed by
     absolute project_root path, surfaced as ``active_spark`` per label.
 
-    ``halt_status`` (optional) is keyed by project basename and carries
+    ``halt_status`` (optional) is keyed by project label and carries
     ``{wired, halted, owner_esc_id, offline}`` per orchestrator. Missing
     projects fall back to ``{offline: True}`` so the UI can render an Offline
     pill on every panel.
     """
-    def _served(candidate: object, field: str) -> dict[str, object]:
-        return _wire_served(candidate, f'MERGE_QUEUE {field}', served_at)
+    def _served(
+        candidate: object, field: str, *, project: Callable[[Any], object] | None = None,
+    ) -> dict[str, object]:
+        return _wire_served(candidate, f'MERGE_QUEUE {field}', served_at, project=project)
 
     def _titled(rows: Iterable[Mapping[str, Any]] | None, table: str) -> list[dict[str, Any]]:
         return [
@@ -537,14 +592,13 @@ def shape_merge_queue(
     out: dict[str, dict] = {}
     for pid, data in per_project.items():
         spark = sparks.get(pid) or _EMPTY_SERIES
-        label = project_label(pid)
+        label = labels.of(pid)
         out[label] = {
-            'depth': dict(data.get('depth_timeseries') or {'labels': [], 'values': []}),
-            'outcomes': _shape_outcomes(data.get('outcomes')),
-            'latency': dict(data.get('latency') or {}),
+            'depth': _served(data.get('depth_timeseries'), f'{label}.depth', project=_shape_depth),
+            'attempts': _served(data.get('attempts'), f'{label}.attempts', project=_shape_attempts),
             'recent': _titled(data.get('recent'), f'{label}.recent'),
-            'recent_total': int(data.get('recent_total') or 0),
-            'speculative': dict(data.get('speculative') or {}),
+            'recent_total': _served(data.get('recent_total'), f'{label}.recent_total'),
+            'speculative': _served(data.get('speculative'), f'{label}.speculative'),
             'active': _titled(data.get('active'), f'{label}.active'),
             'in_queue': _served(data.get('in_queue'), f'{label}.in_queue'),
             'live_probe_configured': bool(data['live_probe_configured']),
@@ -554,7 +608,9 @@ def shape_merge_queue(
             },
             'halt': dict(halts.get(label) or {'offline': True}),
             'train_events': [dict(e) for e in (data.get('train_events') or [])],
-            'train_throughput': dict(data.get('train_throughput') or {}),
+            'train_throughput': _served(
+                data.get('train_throughput'), f'{label}.train_throughput', project=dict,
+            ),
             # ι=1894: live retries-per-landing + drift-at-detection metrics
             'metrics': dict(data.get('live_metrics') or {}),
         }
@@ -632,7 +688,7 @@ def shape_costs(
         models_list = list(models)
         sums = _sum_models(models_list)
         by_project_list.append({
-            'project': project_label(pid),
+            'project': basename_label(pid),
             'total': round(sum(sums.values()), 4),
             **{k: round(v, 4) for k, v in sums.items()},
         })
@@ -860,21 +916,24 @@ def shape_escalation_analytics(
 
 def shape_performance(
     *,
-    cards: Mapping[str, Datum[PerformanceCards]],
+    listing: PerformanceListing,
     history: Mapping[str, Mapping[str, Any]] | None = None,
     served_at: datetime,
 ) -> dict[str, Any]:
     """Each project's cards Datum beside its hour-bucketed histories, as served at *served_at*.
 
-    Output: ``{PERFORMANCE: {project_label: {cards, time_centiles_history,
-    one_pass_history, escalation_history}}, served_at}``, where ``cards`` is
-    the project's wire Datum from
+    Output: ``{PERFORMANCE: {project_basename: {cards, time_centiles_history,
+    one_pass_history, escalation_history}}, PERFORMANCE_LISTING, served_at}``,
+    where ``cards`` is the project's wire Datum from
     :func:`dashboard.data.performance.aggregate_performance_cards` and
     ``served_at`` is the instant every Datum was validated against — the one
     the client ages each ``as_of`` from.
 
-    ``cards`` is the listing authority: a project appears exactly when it has
-    a cards Datum, measured or UNKNOWN. ``history`` (optional) is
+    ``listing.cards`` decides which projects appear: exactly those with a
+    cards Datum, measured or UNKNOWN. ``PERFORMANCE_LISTING`` is
+    ``listing.listed``, aged, validated and wired: the authority on whether an
+    empty ``PERFORMANCE`` means no project completed anything or no runs.db
+    could be read. ``history`` (optional) is
     :func:`dashboard.data.performance.aggregate_performance_history`'s
     output; a project absent from it gets empty history blocks. A Datum that
     breaks its contract at *served_at* is a shaper bug, and the
@@ -884,16 +943,20 @@ def shape_performance(
     empty_pair = {'labels': [], 'values': []}
     empty_centiles = {'labels': [], 'p50': [], 'p95': []}
     out: dict[str, dict] = {}
-    for pid, datum in cards.items():
+    for pid, datum in listing.cards.items():
         validate_datum(datum, served_at)
         h = history.get(pid) or {}
-        out[project_label(pid)] = {
+        out[basename_label(pid)] = {
             'cards': datum.to_wire(),
             'time_centiles_history': dict(h.get('time_centiles_history') or empty_centiles),
             'one_pass_history': dict(h.get('one_pass_history') or empty_pair),
             'escalation_history': dict(h.get('escalation_history') or empty_pair),
         }
-    return {'PERFORMANCE': out, 'served_at': served_at.isoformat()}
+    return {
+        'PERFORMANCE': out,
+        'PERFORMANCE_LISTING': _wire_served(listing.listed, 'PERFORMANCE_LISTING', served_at),
+        'served_at': served_at.isoformat(),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -953,11 +1016,15 @@ _NO_FORECAST = _Provenance(None, DatumState.UNKNOWN, _NO_FORECAST_REASON)
 def shape_burndown(
     series_by_project: Mapping[str, Mapping[str, Any]],
     *,
+    labels: ProjectLabels,
     served_at: datetime | None = None,
 ) -> dict[str, Any]:
     """Build ``{BURNDOWN, BURNDOWN_BY_PROJECT}`` from per-project series.
 
-    ``BURNDOWN_BY_PROJECT`` is keyed by project basename.  Both blocks carry
+    ``BURNDOWN_BY_PROJECT`` is keyed by project label
+    (``dashboard/project_labels.py::ProjectLabels``); a series for a root
+    outside *labels* is labelled alongside them (``ProjectLabels.including``),
+    so no series overwrites another.  Both blocks carry
     one series per :data:`_BURNDOWN_KEYS` key (the nine census members and
     the rows' in-progress split), two served Datums — ``latest`` and
     ``forecast`` — and a parity block.  Per-project blocks also carry
@@ -1028,7 +1095,8 @@ def shape_burndown(
     aggregate banner is not left hunting for which one.
     """
     served_at = resolve_now(served_at)
-    raw = {project_label(pid): series for pid, series in series_by_project.items()}
+    named = labels.including(series_by_project)
+    raw = {named.of(pid): series for pid, series in series_by_project.items()}
     filled = {pid: _with_split(series) for pid, series in raw.items()}
     completions = {pid: compute_window_completion(series) for pid, series in raw.items()}
     provenance, aggregate_provenance = _burndown_provenance(
@@ -1356,11 +1424,12 @@ def shape_scheduler(
     pin_queue: list,
     events_by_task: dict,
     offline_projects: list,
+    degraded_projects: list,
     paused_projects: list,
     recovery_events: dict,
     snapshot_at: str | None,
 ) -> dict:
-    """Return ``{SCHEDULER: {rows, modules, pin_queue, events_by_task, snapshot_at, offline, offline_projects, paused, paused_projects, recovery_events, recovery_event_counts}}``.
+    """Return ``{SCHEDULER: {rows, modules, pin_queue, events_by_task, snapshot_at, offline, offline_projects, degraded, degraded_projects, paused, paused_projects, recovery_events, recovery_event_counts}}``.
 
     Pure, I/O-free — mirrors ``shape_curator`` style.  Shallow-copies top-level
     containers only (``list(rows)``, ``dict(events_by_task)``); inner dicts and
@@ -1381,9 +1450,15 @@ def shape_scheduler(
       the point: zero and unknown must not collapse, or a dead orchestrator
       renders as a quiet one.
 
-    ``recovery_events`` is a required keyword: a new collector element must be
-    threaded through here deliberately, and until it is the mismatch is a loud
-    ``TypeError`` rather than a field that silently never reaches the UI.
+    ``degraded_projects`` is its own ``degraded``/``degraded_projects`` pair,
+    never folded into ``offline_projects``: offline means the read FAILED,
+    degraded means the project's state is UNKNOWN (see the ``scheduler``
+    module docstring).
+
+    ``recovery_events`` and ``degraded_projects`` are required keywords: a new
+    collector element must be threaded through here deliberately, and until it
+    is the mismatch is a loud ``TypeError`` rather than a field that silently
+    never reaches the UI.
     """
     return {
         'SCHEDULER': {
@@ -1394,6 +1469,8 @@ def shape_scheduler(
             'snapshot_at': snapshot_at,
             'offline': bool(offline_projects),
             'offline_projects': list(offline_projects),
+            'degraded': bool(degraded_projects),
+            'degraded_projects': list(degraded_projects),
             'paused': bool(paused_projects),
             'paused_projects': list(paused_projects),
             'recovery_events': [
@@ -1420,8 +1497,9 @@ def shape_memory_evals(
     issues: list[dict] | None = None,
     issue_count: int = 0,
     unmatched_escalations: list[dict] | None = None,
+    escalation_queue: str | None = None,
 ) -> dict[str, Any]:
-    """Return ``{MEMORY_EVALS: {generated_at, root_present, storm_escape, evals, issues, issue_count, unmatched_escalations}}``.
+    """Return ``{MEMORY_EVALS: {generated_at, root_present, storm_escape, evals, issues, issue_count, unmatched_escalations, escalation_queue}}``.
 
     Pure, I/O-free — mirrors ``shape_curator`` / ``shape_scheduler`` style.
     The route calls this with ``**build_memory_evals(...)``; all disk access
@@ -1441,6 +1519,9 @@ def shape_memory_evals(
     UI never has to elect a row to read it from and it survives a root with
     zero eval dirs.
 
+    ``escalation_queue`` is the ESCALATIONS subsection id where every
+    escalation this payload links lives, ``None`` in the default body.
+
     Shallow-copies top-level containers only (``list(evals)``); the inner eval
     /issue /escalation dicts stay aliased to the builder's objects, which is
     benign because the builder constructs them fresh per call.  Defaults are
@@ -1458,5 +1539,6 @@ def shape_memory_evals(
             'issues': list(issues) if issues else [],
             'issue_count': issue_count,
             'unmatched_escalations': list(unmatched_escalations) if unmatched_escalations else [],
+            'escalation_queue': escalation_queue,
         }
     }

@@ -23,13 +23,15 @@ import sys
 import threading
 import time
 from collections import Counter
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
 import pytest
+from _reap_report_wait import await_reap_report
+from shared.project_id import PROJECT_ID_ALIASES, fold_project_token
 
 from orchestrator import session_registry as sr
 
@@ -75,7 +77,17 @@ def _make_record(**overrides: object) -> sr.SessionRecord:
         ),
         'question': sr.Question(text='approve rollout?', asked_at='2026-07-07T00:00:00+00:00'),
         'claude_session_id': 'uuid-claude-abc123',
+        'claude_launch_session_id': 'uuid-claude-launch-0',
         'claude_owner_pid': 424242,
+        'self_exit': True,
+        'exit_request': sr.ExitRequest(
+            state=sr.ExitRequestState.ATTEMPTED,
+            reason=None,
+            pid=424242,
+            at='2026-07-07T00:00:00+00:00',
+            marker_session_id='uuid-claude-abc123',
+        ),
+        'exit_requested_at': '2026-07-07T00:00:00+00:00',
     }
     fields.update(overrides)
     return sr.SessionRecord(**fields)
@@ -338,9 +350,10 @@ def test_spawn_mode_enum_values() -> None:
 
 def test_display_kind_enum_values() -> None:
     assert issubclass(sr.DisplayKind, str)
-    assert {m.value for m in sr.DisplayKind} == {'wm', 'tmux'}
+    assert {m.value for m in sr.DisplayKind} == {'wm', 'tmux', 't3'}
     assert sr.DisplayKind.WM.value == 'wm'
     assert sr.DisplayKind.TMUX.value == 'tmux'
+    assert sr.DisplayKind.T3.value == 't3'
 
 
 def test_display_round_trip() -> None:
@@ -353,6 +366,13 @@ def test_display_round_trip() -> None:
         kind='tmux', wm_title='', wm_window_id=None, tmux_target='session:0.1'
     )
     assert sr.Display.from_dict(without_optionals.to_dict()) == without_optionals
+
+    t3 = sr.Display(kind=sr.DisplayKind.T3.value, wm_title='unblock:df#7489', t3_thread_id='th-1')
+    assert sr.Display.from_dict(t3.to_dict()) == t3
+
+
+def test_display_from_a_body_without_t3_thread_id_reads_none() -> None:
+    assert sr.Display.from_dict({'kind': 'wm'}).t3_thread_id is None
 
 
 def test_question_round_trip() -> None:
@@ -1875,54 +1895,6 @@ def test_reap_handles_mixed_population_in_one_sweep(tmp_path: Path) -> None:
     assert remaining == {'kept-running', 'kept-recent-terminal'}
 
 
-def test_reap_respects_limit_stops_after_n_removals(tmp_path: Path) -> None:
-    """A positive `limit` stops the sweep after that many dirs are actually
-    removed -- bounding both the rmtree work and the per-call scan cost, so
-    an opportunistic per-spawn prune driver stays cheap regardless of how
-    large the on-disk backlog has grown.
-    """
-    records = [
-        _make_record(session_slug=slug, status=sr.Status.EXITED, launcher_pid=os.getpid())
-        for slug in ('term-a', 'term-b', 'term-c')
-    ]
-    for r in records:
-        sr.write_record(r, root=tmp_path)
-        _set_mtime(
-            sr.record_path_for_slug(r.session_slug, root=tmp_path),
-            _NOW,
-            sr.TERMINAL_TTL + timedelta(hours=1),
-        )
-
-    reaped = sr.reap_stale_records(root=tmp_path, now=_NOW, limit=1)
-
-    assert len(reaped) == 1
-    remaining = {p.name for p in sr.sessions_dir(root=tmp_path).iterdir()}
-    assert len(remaining) == 2
-
-
-def test_reap_default_limit_none_is_unbounded(tmp_path: Path) -> None:
-    """Explicit `limit=None` -- and the implicit default -- must reproduce
-    today's unbounded full sweep, so every pre-existing reap test keeps
-    passing unchanged.
-    """
-    records = [
-        _make_record(session_slug=slug, status=sr.Status.EXITED, launcher_pid=os.getpid())
-        for slug in ('term-d', 'term-e', 'term-f')
-    ]
-    for r in records:
-        sr.write_record(r, root=tmp_path)
-        _set_mtime(
-            sr.record_path_for_slug(r.session_slug, root=tmp_path),
-            _NOW,
-            sr.TERMINAL_TTL + timedelta(hours=1),
-        )
-
-    reaped = sr.reap_stale_records(root=tmp_path, now=_NOW, limit=None)
-
-    assert len(reaped) == 3
-    assert list(sr.sessions_dir(root=tmp_path).iterdir()) == []
-
-
 def test_reap_continues_sweep_when_one_directory_fails_to_remove(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2422,6 +2394,101 @@ def test_mark_windowless_handles_mixed_population_in_one_sweep(tmp_path: Path) -
     assert reloaded_terminal.exit_code == 0
 
 
+def _call_indexed_wmctrl_run(
+    *results: tuple[int, str],
+    on_call: Mapping[int, Callable[[], None]] | None = None,
+) -> Callable[[list[str]], subprocess.CompletedProcess[str]]:
+    """A fake ``run`` answering call N with ``results[N]``, repeating the last thereafter.
+
+    ``on_call[N]`` runs inside call N, before it answers -- the hook a test
+    uses to land a record write just after one of the sweep's probes.
+    """
+    calls = 0
+
+    def _run(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        nonlocal calls
+        if on_call is not None and calls in on_call:
+            on_call[calls]()
+        returncode, stdout = results[min(calls, len(results) - 1)]
+        calls += 1
+        return subprocess.CompletedProcess(argv, returncode=returncode, stdout=stdout)
+
+    return _run
+
+
+def test_mark_windowless_keeps_a_window_that_appears_after_the_first_probe(
+    tmp_path: Path,
+) -> None:
+    def _set_display_lands() -> None:
+        sr.write_record(
+            _make_record(
+                session_slug='late-window',
+                status=sr.Status.RUNNING,
+                display=sr.Display(kind='wm', wm_title='t', wm_window_id='0x1a'),
+            ),
+            root=tmp_path,
+        )
+
+    run = _call_indexed_wmctrl_run(
+        (0, '0x99  0 host  other\n'),
+        (0, '0x1a  0 host  late\n0x99  0 host  other\n'),
+        on_call={0: _set_display_lands},
+    )
+
+    marked = sr.mark_windowless_wm_sessions_exited(root=tmp_path, run=run)
+
+    assert 'late-window' not in {m.session_slug for m in marked}
+    assert sr.read_record('late-window', root=tmp_path).status == sr.Status.RUNNING
+
+
+def test_mark_windowless_marks_nothing_when_the_confirming_probe_fails(tmp_path: Path) -> None:
+    sr.write_record(
+        _make_record(
+            session_slug='unconfirmed',
+            status=sr.Status.RUNNING,
+            display=sr.Display(kind='wm', wm_title='t', wm_window_id='0x1a'),
+        ),
+        root=tmp_path,
+    )
+    run = _call_indexed_wmctrl_run((0, '0x99  0 host  other\n'), (127, ''))
+
+    marked = sr.mark_windowless_wm_sessions_exited(root=tmp_path, run=run)
+
+    assert marked == []
+    reloaded = sr.read_record('unconfirmed', root=tmp_path)
+    assert reloaded.status == sr.Status.RUNNING
+    assert reloaded.exit_code is None
+
+
+def test_mark_windowless_leaves_a_record_rebound_to_a_live_window_after_the_pass(
+    tmp_path: Path,
+) -> None:
+    def _write_wm_record(window_id: str) -> None:
+        sr.write_record(
+            _make_record(
+                session_slug='rebound',
+                status=sr.Status.RUNNING,
+                display=sr.Display(kind='wm', wm_title='t', wm_window_id=window_id),
+            ),
+            root=tmp_path,
+        )
+
+    _write_wm_record('0x1a')
+    run = _call_indexed_wmctrl_run(
+        (0, '0x99  0 host  other\n'),
+        (0, '0x2b  0 host  resumed\n0x99  0 host  other\n'),
+        on_call={1: lambda: _write_wm_record('0x2b')},
+    )
+
+    marked = sr.mark_windowless_wm_sessions_exited(root=tmp_path, run=run)
+
+    assert marked == []
+    reloaded = sr.read_record('rebound', root=tmp_path)
+    assert reloaded.status == sr.Status.RUNNING
+    assert reloaded.display is not None
+    assert reloaded.display.wm_window_id == '0x2b'
+
+
 # ---------------------------------------------------------------------------
 # Step-9: CLI + fail-soft
 # ---------------------------------------------------------------------------
@@ -2752,130 +2819,108 @@ def test_main_launching_fail_soft_when_launcher_pid_not_numeric(
 # ---------------------------------------------------------------------------
 
 
-def test_main_launching_drains_prior_orphan_via_sweep(
-    monkeypatch: pytest.MonkeyPatch,
+def test_launching_returns_while_a_reap_holds_the_lock_and_its_detached_reap_drains_after(
     tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    # A stale orphan O (non-terminal, dead pid, aged past the heartbeat TTL)
-    # pre-exists in the same sessions dir BEFORE this spawn's own `launching`
-    # write -- every spawn should opportunistically drain prior orphans.
-    orphan = _make_record(session_slug='orphan-o', status=sr.Status.RUNNING, launcher_pid=_DEAD_PID)
-    sr.write_record(orphan, root=tmp_path)
+    """An inline sweep would block on the held lock, and a child that inherited
+    stdout or stderr would keep ``run`` from returning: either way it times out.
+    """
+    sr.write_record(
+        _make_record(
+            session_slug='orphan-o', status=sr.Status.RUNNING, launcher_pid=_DEAD_PID, display=None
+        ),
+        root=tmp_path,
+    )
     _set_mtime(
         sr.record_path_for_slug('orphan-o', root=tmp_path),
         datetime.now(UTC),
         sr.NON_TERMINAL_HEARTBEAT_TTL + timedelta(minutes=1),
     )
-
-    _set_env(monkeypatch, _launching_env(tmp_path))
-
-    rc = sr.main(['launching'])
-
-    assert rc == 0
+    _write_aged_exited('old-terminal', tmp_path)
+    env = {k: v for k, v in os.environ.items() if not k.startswith('CLAUDE_SPAWN_')}
+    env.update(_launching_env(tmp_path))
     slug = sr.build_session_slug('unblock', 'df', '2085', 4242)
-    expected_dir = sr.record_path_for_slug(slug, root=tmp_path).parent
-    # (i) the NEW launching record's dir is printed unchanged.
-    assert capsys.readouterr().out.strip() == str(expected_dir)
-    assert sr.read_record(slug, root=tmp_path).status == sr.Status.LAUNCHING
 
-    # (ii) the pre-existing orphan is now marked exited.
-    orphan_reloaded = sr.read_record('orphan-o', root=tmp_path)
-    assert orphan_reloaded.status == sr.Status.EXITED
-    assert orphan_reloaded.exit_code == sr.ORPHAN_EXIT_CODE
+    with sr.reap_lock(tmp_path):
+        result = subprocess.run(
+            [sys.executable, str(Path(sr.__file__).resolve()), 'launching'],
+            env=env,
+            capture_output=True,
+            timeout=120,
+            text=True,
+        )
 
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == str(sr.record_path_for_slug(slug, root=tmp_path).parent)
+        assert sr.read_record(slug, root=tmp_path).status == sr.Status.LAUNCHING
+        assert sr.read_record('orphan-o', root=tmp_path).status == sr.Status.RUNNING
+        assert (sr.sessions_dir(root=tmp_path) / 'old-terminal').is_dir()
 
-def test_main_launching_bound_prunes_old_terminal_record(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """Every spawn's `launching` path must also opportunistically bound-prune
-    terminal/stale record dirs (reap_stale_records(limit=REAP_BATCH_LIMIT)),
-    not just mark orphans exited -- otherwise the disk backlog is marked
-    terminal on every spawn but never actually reclaimed.
-    """
-    assert isinstance(sr.REAP_BATCH_LIMIT, int)
-    assert sr.REAP_BATCH_LIMIT > 0
-
-    old_terminal = _make_record(
-        session_slug='old-terminal', status=sr.Status.EXITED, exit_code=0, launcher_pid=os.getpid()
-    )
-    sr.write_record(old_terminal, root=tmp_path)
-    _set_mtime(
-        sr.record_path_for_slug('old-terminal', root=tmp_path),
-        datetime.now(UTC),
-        sr.TERMINAL_TTL + timedelta(hours=1),
-    )
-
-    _set_env(monkeypatch, _launching_env(tmp_path))
-
-    rc = sr.main(['launching'])
-
-    assert rc == 0
-    slug = sr.build_session_slug('unblock', 'df', '2085', 4242)
-    expected_dir = sr.record_path_for_slug(slug, root=tmp_path).parent
-    assert capsys.readouterr().out.strip() == str(expected_dir)
-    assert sr.read_record(slug, root=tmp_path).status == sr.Status.LAUNCHING
-
+    await_reap_report(tmp_path)
+    orphan = sr.read_record('orphan-o', root=tmp_path)
+    assert orphan.status == sr.Status.EXITED
+    assert orphan.exit_code == sr.ORPHAN_EXIT_CODE
     assert not (sr.sessions_dir(root=tmp_path) / 'old-terminal').exists()
 
 
-def test_main_launching_fail_soft_when_sweep_raises(
-    monkeypatch: pytest.MonkeyPatch,
+def _pids_with_cwd_under(directory: Path) -> list[int]:
+    pids: list[int] = []
+    for proc in Path('/proc').iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            cwd = Path(os.readlink(proc / 'cwd'))
+        except OSError:
+            continue
+        if cwd == directory or directory in cwd.parents:
+            pids.append(int(proc.name))
+    return pids
+
+
+def test_launchings_detached_reap_leaves_the_callers_cwd_and_drains_its_relative_fleet_root(
     tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    _set_env(monkeypatch, _launching_env(tmp_path))
-
-    calls: list[None] = []
-
-    def _boom(*_args: object, **_kwargs: object) -> list[sr.SessionRecord]:
-        calls.append(None)
-        raise OSError('sweep on fire')
-
-    monkeypatch.setattr(sr, 'mark_orphaned_sessions_exited', _boom)
-
-    rc = sr.main(['launching'])
-
-    assert rc == 0
-    assert calls  # the sweep really was invoked (and really did raise)
-    slug = sr.build_session_slug('unblock', 'df', '2085', 4242)
-    expected_dir = sr.record_path_for_slug(slug, root=tmp_path).parent
-    # The sweep fault is swallowed INSIDE _run_launching -- the printed dir
-    # (what spawn-claude.sh captures into SESSION_RECORD_DIR) stays exactly
-    # the new record's dir, never corrupted or suppressed by the fault.
-    assert capsys.readouterr().out.strip() == str(expected_dir)
-    assert sr.read_record(slug, root=tmp_path).status == sr.Status.LAUNCHING
-
-
-def test_main_launching_fail_soft_when_prune_raises(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """Mirrors test_main_launching_fail_soft_when_sweep_raises for the bounded
-    prune: a fault in reap_stale_records must never raise out of
-    _run_launching (it would corrupt the printed record dir spawn-claude.sh
-    captures into SESSION_RECORD_DIR), exactly like a fault in the mark sweep.
+    """A reap child whose cwd stayed in the caller's worktree would hold that
+    worktree in use for as long as it queued on the held lock.
     """
+    worktree = tmp_path / 'worktree'
+    fleet = worktree / 'fleet'
+    _write_aged_exited('old-terminal', fleet)
+    env = {k: v for k, v in os.environ.items() if not k.startswith('CLAUDE_SPAWN_')}
+    env.update(_launching_env(fleet))
+    env['CLAUDE_FLEET_ROOT'] = 'fleet'
+
+    with sr.reap_lock(fleet):
+        result = subprocess.run(
+            [sys.executable, str(Path(sr.__file__).resolve()), 'launching'],
+            cwd=worktree,
+            env=env,
+            capture_output=True,
+            timeout=120,
+            text=True,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert _pids_with_cwd_under(worktree) == []
+
+    await_reap_report(fleet)
+    assert not (sr.sessions_dir(root=fleet) / 'old-terminal').exists()
+
+
+def test_main_launching_fail_soft_when_the_detached_reap_cannot_start(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     _set_env(monkeypatch, _launching_env(tmp_path))
-
-    calls: list[None] = []
-
-    def _boom(*_args: object, **_kwargs: object) -> list[sr.ReapedSessionRecord]:
-        calls.append(None)
-        raise OSError('prune on fire')
-
-    monkeypatch.setattr(sr, 'reap_stale_records', _boom)
+    monkeypatch.setattr(sys, 'executable', str(tmp_path / 'no-such-python'))
 
     rc = sr.main(['launching'])
 
     assert rc == 0
-    assert calls  # the prune really was invoked (and really did raise)
     slug = sr.build_session_slug('unblock', 'df', '2085', 4242)
     expected_dir = sr.record_path_for_slug(slug, root=tmp_path).parent
-    assert capsys.readouterr().out.strip() == str(expected_dir)
+    assert capsys.readouterr().out == f'{expected_dir}\n'
     assert sr.read_record(slug, root=tmp_path).status == sr.Status.LAUNCHING
 
 
@@ -2922,6 +2967,137 @@ def test_main_reap_marks_then_deletes(
     assert not sr.record_path_for_slug('old-terminal', root=tmp_path).parent.exists()
 
 
+def _write_aged_exited(slug: str, root: Path) -> None:
+    sr.write_record(
+        _make_record(session_slug=slug, status=sr.Status.EXITED, exit_code=0), root=root
+    )
+    _set_mtime(
+        sr.record_path_for_slug(slug, root=root),
+        datetime.now(UTC),
+        sr.TERMINAL_TTL + timedelta(hours=1),
+    )
+
+
+def test_main_reap_drains_every_eligible_record_in_one_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    monkeypatch.setenv('PATH', str(tmp_path / 'no-bin'))
+    aged_slugs = [f'aged-exited-{i:03d}' for i in range(150)]
+    for slug in aged_slugs:
+        _write_aged_exited(slug, tmp_path)
+    sr.write_record(
+        _make_record(session_slug='drain-orphan', status=sr.Status.RUNNING, launcher_pid=_DEAD_PID),
+        root=tmp_path,
+    )
+    _set_mtime(
+        sr.record_path_for_slug('drain-orphan', root=tmp_path),
+        datetime.now(UTC),
+        sr.NON_TERMINAL_HEARTBEAT_TTL + timedelta(minutes=1),
+    )
+
+    rc = sr.main(['reap'])
+
+    assert rc == 0
+    for slug in aged_slugs:
+        assert not (sr.sessions_dir(root=tmp_path) / slug).exists()
+    orphan = sr.read_record('drain-orphan', root=tmp_path)
+    assert orphan.status == sr.Status.EXITED
+    assert orphan.exit_code == sr.ORPHAN_EXIT_CODE
+
+    report_path = sr.reap_report_path(tmp_path)
+    assert report_path.is_file()
+    report = json.loads(report_path.read_text())
+    requested_at = datetime.fromisoformat(report['requested_at'])
+    started_at = datetime.fromisoformat(report['started_at'])
+    assert requested_at <= started_at <= datetime.fromisoformat(report['finished_at'])
+    assert report['remaining_record_dirs'] == 1
+    phases = report['phases']
+    assert [phase['name'] for phase in phases] == [
+        'mark_orphaned_sessions_exited',
+        'mark_windowless_wm_sessions_exited',
+        'reap_stale_records',
+        'reap_stale_session_pointers',
+    ]
+    for phase in phases:
+        assert isinstance(phase['seconds'], (int, float))
+        assert phase['seconds'] >= 0
+        assert phase['error'] is None
+    by_name = {phase['name']: phase for phase in phases}
+    assert by_name['mark_orphaned_sessions_exited']['count'] == 1
+    assert by_name['reap_stale_records']['count'] == 150
+
+
+def test_main_reap_runs_later_phases_when_one_phase_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    monkeypatch.setenv('PATH', str(tmp_path / 'no-bin'))
+
+    def _boom(*_args: object, **_kwargs: object) -> list[sr.SessionRecord]:
+        raise OSError('mark phase on fire')
+
+    monkeypatch.setattr(sr, 'mark_orphaned_sessions_exited', _boom)
+    _write_aged_exited('aged-despite-fault', tmp_path)
+
+    rc = sr.main(['reap'])
+
+    assert rc == 0
+    assert not (sr.sessions_dir(root=tmp_path) / 'aged-despite-fault').exists()
+    first_phase = json.loads(sr.reap_report_path(tmp_path).read_text())['phases'][0]
+    assert first_phase['name'] == 'mark_orphaned_sessions_exited'
+    assert 'OSError' in first_phase['error']
+    assert first_phase['count'] is None
+
+
+def _write_report_started(root: Path, started_at: datetime) -> str:
+    report = json.dumps({'started_at': started_at.isoformat()})
+    sr.reap_report_path(root).write_text(report)
+    return report
+
+
+def test_main_reap_skips_only_when_a_reap_started_after_it_was_requested(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    monkeypatch.setenv('PATH', str(tmp_path / 'no-bin'))
+    _write_aged_exited('aged', tmp_path)
+    later = _write_report_started(tmp_path, datetime.now(UTC) + timedelta(hours=1))
+
+    assert sr.main(['reap']) == 0
+
+    assert (sr.sessions_dir(root=tmp_path) / 'aged').is_dir()
+    assert sr.reap_report_path(tmp_path).read_text() == later
+
+    _write_report_started(tmp_path, datetime.now(UTC) - timedelta(hours=1))
+
+    assert sr.main(['reap']) == 0
+
+    assert not (sr.sessions_dir(root=tmp_path) / 'aged').exists()
+
+
+def test_reap_lock_is_a_stable_sidecar_under_the_fleet_root(tmp_path: Path) -> None:
+    lock_path = sr.reap_lock_path(tmp_path)
+    with sr.reap_lock(tmp_path):
+        assert lock_path.is_file()
+        assert lock_path.parent == tmp_path
+    assert lock_path.is_file()
+
+
+def test_reap_lock_excludes_another_holder_until_released(tmp_path: Path) -> None:
+    sr.reap_lock_path(tmp_path).touch()
+    fd = os.open(sr.reap_lock_path(tmp_path), os.O_RDWR)
+    try:
+        with sr.reap_lock(tmp_path), pytest.raises(BlockingIOError):
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        os.close(fd)
+
+
 # ---------------------------------------------------------------------------
 # Task 2934 step-9/10: driving the WM-window sweep from `launching`/`reap`
 # ---------------------------------------------------------------------------
@@ -2957,36 +3133,6 @@ def test_main_reap_marks_windowless_wm_session_before_deleting(
     reloaded = sr.read_record('reap-windowless', root=tmp_path)
     assert reloaded.status == sr.Status.EXITED
     assert reloaded.exit_code == sr.ORPHAN_EXIT_CODE
-
-
-def test_main_launching_fail_soft_when_window_sweep_raises(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """Mirrors test_main_launching_fail_soft_when_sweep_raises for the new WM
-    window sweep: a fault must never raise out of _run_launching (it would
-    corrupt the printed record dir spawn-claude.sh captures into
-    SESSION_RECORD_DIR), exactly like a fault in the orphan mark sweep.
-    """
-    _set_env(monkeypatch, _launching_env(tmp_path))
-
-    calls: list[None] = []
-
-    def _boom(*_args: object, **_kwargs: object) -> list[sr.SessionRecord]:
-        calls.append(None)
-        raise OSError('window sweep on fire')
-
-    monkeypatch.setattr(sr, 'mark_windowless_wm_sessions_exited', _boom)
-
-    rc = sr.main(['launching'])
-
-    assert rc == 0
-    assert calls  # the sweep really was invoked (and really did raise)
-    slug = sr.build_session_slug('unblock', 'df', '2085', 4242)
-    expected_dir = sr.record_path_for_slug(slug, root=tmp_path).parent
-    assert capsys.readouterr().out.strip() == str(expected_dir)
-    assert sr.read_record(slug, root=tmp_path).status == sr.Status.LAUNCHING
 
 
 # ---------------------------------------------------------------------------
@@ -4971,6 +5117,17 @@ def _parse_kv(out: str) -> dict[str, str]:
     return dict(line.split('=', 1) for line in out.splitlines() if '=' in line)
 
 
+def _assert_age_between_clock_reads(
+    reported_secs: str, *, backdated_by: timedelta, before: datetime, after: datetime
+) -> None:
+    """lease-show's age is its own clock read, taken somewhere in [before, after], minus an mtime of before - backdated_by.
+
+    The 1 s of upper slack covers filesystem mtime granularity.
+    """
+    reported = timedelta(seconds=int(reported_secs))
+    assert backdated_by <= reported <= backdated_by + (after - before) + timedelta(seconds=1)
+
+
 def test_main_lease_show_prints_machine_readable_fields_for_a_held_lease(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -4979,10 +5136,12 @@ def test_main_lease_show_prints_machine_readable_fields_for_a_held_lease(
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
     _claim_via_cli()
     lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
-    _set_mtime(lease_path, datetime.now(UTC), timedelta(hours=1))
+    before = datetime.now(UTC)
+    _set_mtime(lease_path, before, timedelta(hours=1))
     capsys.readouterr()
 
     rc = sr.main(['lease-show', '--name', 'watcher-df'])
+    after = datetime.now(UTC)
 
     assert rc == 0
     fields = _parse_kv(capsys.readouterr().out)
@@ -4993,7 +5152,9 @@ def test_main_lease_show_prints_machine_readable_fields_for_a_held_lease(
     assert fields['holder_pid_alive'] == 'true'
     assert fields['reclaimable'] == 'false'
     # The freshness clock `cat <lease>` cannot show, replacing `stat -c %y`.
-    assert abs(int(fields['heartbeat_age_secs']) - 3600) <= 5
+    _assert_age_between_clock_reads(
+        fields['heartbeat_age_secs'], backdated_by=timedelta(hours=1), before=before, after=after
+    )
     assert datetime.fromisoformat(fields['heartbeat_ts']).tzinfo is not None
 
 
@@ -5038,16 +5199,20 @@ def test_main_lease_show_on_a_corrupt_body_is_fail_soft(
     lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
     lease_path.parent.mkdir(parents=True, exist_ok=True)
     lease_path.write_text('{not valid json')
-    _set_mtime(lease_path, datetime.now(UTC), timedelta(hours=1))
+    before = datetime.now(UTC)
+    _set_mtime(lease_path, before, timedelta(hours=1))
 
     rc = sr.main(['lease-show', '--name', 'watcher-df'])
+    after = datetime.now(UTC)
 
     assert rc == 0
     fields = _parse_kv(capsys.readouterr().out)
     # Marks the body unreadable rather than asserting a fake holder -- and
     # still reports a REAL heartbeat age, the axis that decides reapability.
     assert fields['state'] == 'unreadable'
-    assert abs(int(fields['heartbeat_age_secs']) - 3600) <= 5
+    _assert_age_between_clock_reads(
+        fields['heartbeat_age_secs'], backdated_by=timedelta(hours=1), before=before, after=after
+    )
     assert lease_path.is_file()  # read-only: inspection never reaps
 
 
@@ -5316,6 +5481,7 @@ def test_main_write_decision_already_canonical_project_logs_nothing(
     do -- must not emit a warning on every park, or the signal is noise.
     """
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    _file_from_a_linked_session(monkeypatch, tmp_path)
 
     with caplog.at_level(logging.WARNING):
         rc = sr.main(
@@ -5395,6 +5561,7 @@ def test_main_write_decision_recommended_solar_token_warns_nothing(
     signal.
     """
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    _file_from_a_linked_session(monkeypatch, tmp_path)
 
     with caplog.at_level(logging.WARNING):
         rc = sr.main(
@@ -6306,6 +6473,10 @@ def test_same_queue_refile_and_enrichment_agree_on_the_custody_field_set() -> No
         escalations_dir=queue,
         closing_evidence='the operator dropped it: superseded by esc-5914-2',
         closed_at='2026-08-01T00:00:00+00:00',
+        audit_outcomes=(sr.AuditOutcome(
+            verdict=sr.AuditVerdict.OK, note='', audited_at='2026-08-02T00:00:00+00:00',
+            policy_class='landing_provenance',
+        ),),
     )
     incoming = _make_decision(
         text="the watcher's current view",
@@ -6339,6 +6510,7 @@ def test_same_queue_refile_and_enrichment_agree_on_the_custody_field_set() -> No
         'manual_boost',
         'closing_evidence',
         'closed_at',
+        'audit_outcomes',
         'escalations_dir',
     }
 
@@ -6346,115 +6518,6 @@ def test_same_queue_refile_and_enrichment_agree_on_the_custody_field_set() -> No
 # ---------------------------------------------------------------------------
 # Project-token canonicalization (task 3807)
 # ---------------------------------------------------------------------------
-
-_PROJECT_TOKEN_CASES: list[tuple[str, str]] = [
-    # Separator/case folding: one project, five spellings, one token.
-    ('dark_factory', 'dark_factory'),
-    ('dark-factory', 'dark_factory'),
-    ('Dark-Factory', 'dark_factory'),
-    ('DARK_FACTORY', 'dark_factory'),
-    ('  dark-factory  ', 'dark_factory'),
-    # Alias: the one seeded PROJECT_TOKEN_ALIASES entry, itself folded first.
-    ('df', 'dark_factory'),
-    ('DF', 'dark_factory'),
-    (' df ', 'dark_factory'),
-    ('-df-', 'dark_factory'),
-    # Unset sentinel -- '' is never a token (mirrors normalize_escalations_dir).
-    ('', ''),
-    ('   ', ''),
-    ('\t\n', ''),
-    # Pass-through: an already-canonical token of another project is untouched.
-    ('reify', 'reify'),
-    # A split whose spellings differ ONLY by separator folds with no alias
-    # entry -- and autopilot_video is also what that project's config
-    # declares, so folding fully resolves it.
-    ('autopilot-video', 'autopilot_video'),
-    ('autopilot_video', 'autopilot_video'),
-    # solar-challenge's two spellings fold into ONE bucket, but that bucket
-    # is NOT its declared memory.project_id. See the residual-gap test below
-    # -- this row deliberately does not claim folding resolved it.
-    ('solar-challenge', 'solar_challenge'),
-    ('solar_challenge', 'solar_challenge'),
-]
-
-
-@pytest.mark.parametrize(('raw', 'expected'), _PROJECT_TOKEN_CASES)
-def test_normalize_project_token_table(raw: str, expected: str) -> None:
-    """One project must have ONE token, whatever spelling it was filed under.
-
-    The live population that motivated this (2026-08-06): 41 OPEN
-    dark-factory decisions split 22/17/2 across ``dark_factory``/``df``/
-    ``dark-factory``, each partition invisible to a reap scoped to either of
-    the others.
-    """
-    assert sr.normalize_project_token(raw) == expected
-
-
-def test_normalize_project_token_does_not_merge_solar_challenge_platform() -> None:
-    """COLLAPSE GUARD: folding must never merge two DIFFERENT projects.
-
-    ``/home/leo/src/solar-challenge`` declares ``my_solar_challenge`` and
-    ``/home/leo/src/solar-challenge-platform`` declares
-    ``solar_challenge_platform`` -- separate project roots, separate
-    orchestrator configs, separate escalation queues, whose tokens merely
-    share a prefix. Merging them would let one project's reaper close the
-    other's decisions, which is strictly worse than the bug being fixed. Only
-    case and separator differences may ever fold.
-    """
-    assert sr.normalize_project_token('solar_challenge_platform') == 'solar_challenge_platform'
-    assert sr.normalize_project_token('solar-challenge-platform') == 'solar_challenge_platform'
-    assert sr.normalize_project_token('solar_challenge_platform') != sr.normalize_project_token(
-        'solar-challenge'
-    )
-
-
-@pytest.mark.parametrize('raw', [case[0] for case in _PROJECT_TOKEN_CASES])
-def test_normalize_project_token_is_idempotent(raw: str) -> None:
-    """f(f(x)) == f(x) for every token in the table.
-
-    Load-bearing twice over: the migration decides a record is already
-    canonical by comparing ``normalize_project_token(p) == p``, so a
-    non-idempotent fold would rewrite the same record on every run; and the
-    reaper normalizes an already-normalized stored token on every compare.
-    """
-    once = sr.normalize_project_token(raw)
-    assert sr.normalize_project_token(once) == once
-
-
-@pytest.mark.parametrize('raw', [None, 42, 3.5, Path('/tmp/x'), object()])
-def test_normalize_project_token_fail_soft_on_non_str(raw: object) -> None:
-    """Fail-soft, matching normalize_escalations_dir's contract for helpers a
-    C8 watch loop calls directly: a non-str value never raises into the
-    caller.
-    """
-    assert isinstance(sr.normalize_project_token(raw), str)
-
-
-def test_normalize_project_token_coerces_non_str_to_a_matchless_token() -> None:
-    """Pins the VALUE a coercion produces, not just that it is a str.
-
-    ``isinstance(..., str)`` alone is a tautology under a ``return str(...)``
-    body -- it cannot fail, so it cannot defend the docstring's actual claim
-    that a coerced token "matches no real project". These assert the claim.
-    """
-    assert sr.normalize_project_token(42) == '42'
-    assert sr.normalize_project_token(3.5) == '3.5'
-
-
-def test_normalize_project_token_maps_none_to_the_unset_sentinel() -> None:
-    """``None`` means UNSET, so it must land on ``''``, not on ``'none'``.
-
-    ``str(None)`` folds to ``'none'`` -- an ordinary-looking token, not a
-    sentinel. That matters because ``DecisionRecord.from_dict`` reads
-    ``data['project']`` with no coercion, so a hand-edited record carrying
-    ``"project": null`` round-trips a real ``None``; without this case the
-    migration would rewrite it onto a literal ``'none'`` bucket that a
-    reaper scoped to a project spelled that way could then match. ``''``
-    only ever matches ``''``, keeping the fail-OPEN direction.
-    """
-    assert sr.normalize_project_token(None) == ''
-    assert sr.normalize_project_token(None) != 'none'
-
 
 def test_solar_challenge_alias_was_decided_and_declined() -> None:
     """The naming mismatch is a DECIDED, standing state -- not a pending gap.
@@ -6484,29 +6547,29 @@ def test_solar_challenge_alias_was_decided_and_declined() -> None:
     humans and watchers that read it, and both CLI verbs warn if you pass
     the config-declared token.
     """
-    assert sr.normalize_project_token('solar-challenge') == 'solar_challenge'
-    assert sr.normalize_project_token('solar-challenge') == sr.normalize_project_token(
+    assert fold_project_token('solar-challenge') == 'solar_challenge'
+    assert fold_project_token('solar-challenge') == fold_project_token(
         'solar_challenge'
     )
-    assert sr.normalize_project_token('my_solar_challenge') != sr.normalize_project_token(
+    assert fold_project_token('my_solar_challenge') != fold_project_token(
         'solar-challenge'
     )
-    assert 'solar_challenge' not in sr.PROJECT_TOKEN_ALIASES
+    assert 'solar_challenge' not in PROJECT_ID_ALIASES
 
 
 def test_project_token_aliases_maps_folded_to_folded() -> None:
-    """Every PROJECT_TOKEN_ALIASES key AND value must already be canonical
+    """Every PROJECT_ID_ALIASES key AND value must already be canonical
     under the fold, or a lookup would miss (key) or emit a non-canonical
     token (value) -- the alias map is applied AFTER folding, never before.
     """
-    assert sr.PROJECT_TOKEN_ALIASES['df'] == 'dark_factory'
-    for alias, canonical in sr.PROJECT_TOKEN_ALIASES.items():
-        assert sr.normalize_project_token(alias) == canonical
-        assert sr.normalize_project_token(canonical) == canonical
+    assert PROJECT_ID_ALIASES['df'] == 'dark_factory'
+    for alias, canonical in PROJECT_ID_ALIASES.items():
+        assert fold_project_token(alias) == canonical
+        assert fold_project_token(canonical) == canonical
 
 
 def test_project_token_alias_declines_registry_shape() -> None:
-    """The DECLINE registry is the mirror image of PROJECT_TOKEN_ALIASES, and
+    """The DECLINE registry is the mirror image of PROJECT_ID_ALIASES, and
     it is what makes task 3813's decision durable rather than prose.
 
     A decision task's product has to survive the session that made it. Task
@@ -6535,17 +6598,17 @@ def test_project_token_alias_declines_registry_shape() -> None:
 
     # THE GUARD: the two tables partition the alias space. Adding a declined
     # alias to the live table without removing the decline fails right here.
-    assert set(declined) & set(sr.PROJECT_TOKEN_ALIASES) == set()
+    assert set(declined) & set(PROJECT_ID_ALIASES) == set()
 
     # Same folded-to-folded hygiene invariant the live table carries (see
     # test_project_token_aliases_maps_folded_to_folded), so promoting an
     # entry is a one-line move between the two dicts.
     for alias, (canonical, _reason) in declined.items():
-        assert sr.normalize_project_token(alias) == alias
-        assert sr.normalize_project_token(canonical) == canonical
+        assert fold_project_token(alias) == alias
+        assert fold_project_token(canonical) == canonical
 
     # The decline is IN FORCE in the fold, not merely recorded beside it.
-    assert sr.normalize_project_token('solar_challenge') != sr.normalize_project_token(
+    assert fold_project_token('solar_challenge') != fold_project_token(
         'my_solar_challenge'
     )
 
@@ -6660,7 +6723,7 @@ def test_declined_project_token_hint_is_none_for_everything_else(token: str) -> 
 
 @pytest.mark.parametrize('token', [None, 42, 3.5, Path('/tmp/x'), object()])
 def test_declined_project_token_hint_fail_soft_on_non_str(token: object) -> None:
-    """Fail-soft, mirroring normalize_project_token's contract: a helper a C8
+    """Fail-soft, mirroring fold_project_token's contract: a helper a C8
     watch loop calls on its filing path never raises into the caller.
     """
     assert sr.declined_project_token_hint(token) is None
@@ -7859,6 +7922,22 @@ def _file_decision(**kwargs: str) -> int:
     return sr.main(argv)
 
 
+def _file_from_a_linked_session(
+    monkeypatch: pytest.MonkeyPatch, root: Path, pid: int = 7_527_001
+) -> None:
+    """Make the next write-decision file from a session linked to its own registry record.
+
+    write-decision WARNs when it cannot link a filing to its filer's session
+    record (task 7527), so a test pinning an otherwise-quiet filing path files
+    from a linked session, as a spawned watcher does.
+    """
+    sr.write_record(
+        _make_record(session_slug='linked-watcher-record', claude_owner_pid=pid), root=root
+    )
+    sr.write_session_pointer(pid, 'linked-watcher-record', root=root)
+    monkeypatch.setenv('CLAUDE_PID', str(pid))
+
+
 def test_main_write_decision_mode2_second_queue_enriches_and_never_downgrades(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -8139,6 +8218,7 @@ def test_main_write_decision_warns_when_a_same_queue_refile_is_held_closed(
     break a contract agents already rely on. The divergence goes to the log.
     """
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    _file_from_a_linked_session(monkeypatch, tmp_path)
     orch, _recon = _two_queues(tmp_path)
 
     _file_decision(
@@ -8189,6 +8269,7 @@ def test_main_write_decision_same_queue_refile_of_an_open_record_is_quiet(
     is how the genuinely-actionable one above gets tuned out.
     """
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    _file_from_a_linked_session(monkeypatch, tmp_path)
     orch, _recon = _two_queues(tmp_path)
 
     _file_decision(
@@ -9247,19 +9328,23 @@ _BARE_SHELL_ENTRYPOINTS: tuple[_BareShellEntrypoint, ...] = (
         callers=(
             'downstream Python consumers that import orchestrator.session_registry '
             'with orchestrator/src on PYTHONPATH but no install (T4 verify, T5 '
-            'result, T6 hooks, T7 leases). This row carries the assertion formerly '
-            'made by test_imports_under_a_bare_interpreter_with_no_workspace_'
-            'packages (task 3223 step-31).'
+            'result, T6 hooks, T7 leases). Nothing on that path reaches `shared`; '
+            "the module's own bootstrap appends this checkout's shared/src, so only "
+            'its stdlib-only shared leaves are importable. This row carries the '
+            'assertion formerly made by test_imports_under_a_bare_interpreter_with_'
+            'no_workspace_packages (task 3223 step-31).'
         ),
     ),
     _BareShellEntrypoint(
         name='session_registry.py (tier-1: bare shell, NO PYTHONPATH)',
         path=_SR_PKG_ROOT / 'orchestrator' / 'session_registry.py',
         # THE POINT OF THIS ROW: running a script by absolute path puts only
-        # the script's OWN directory on sys.path. Nothing else is reachable —
-        # not `shared`, not `orchestrator.<sibling>`. That is a STRICTLY
-        # stronger contract than the tier-2 row above, which the PYTHONPATH
-        # entry makes able to reach every intra-orchestrator sibling.
+        # the script's OWN directory on sys.path. Nothing else is reachable
+        # from the env — not `shared`, not `orchestrator.<sibling>` — so the
+        # only `shared` the module sees is the checkout's shared/src its own
+        # bootstrap appends. That is a STRICTLY stronger contract than the
+        # tier-2 row above, which the PYTHONPATH entry makes able to reach
+        # every intra-orchestrator sibling.
         pythonpath=(),
         shape=_EntrypointShape.SCRIPT,
         argv=('--help',),
@@ -9267,7 +9352,8 @@ _BARE_SHELL_ENTRYPOINTS: tuple[_BareShellEntrypoint, ...] = (
         callers=(
             'skills/spawn/spawn-claude.sh lines 145 (launching), 428 (exit), 596 '
             'and 693 (refresh), 871 (set-display) — `python3 "$SESSION_REGISTRY_PY"` '
-            'with no venv, no install and no PYTHONPATH. FOUR OF THE FIVE end in '
+            'with no venv, no install and no PYTHONPATH — and the SKILL.md verb '
+            'lines that run it the same way. FOUR OF THE FIVE spawn lines end in '
             '`|| true`, so a break here is SILENT: the subprocess simply never '
             'writes record.json and the session goes missing from the fleet.'
         ),
@@ -9291,6 +9377,65 @@ _BARE_SHELL_ENTRYPOINTS: tuple[_BareShellEntrypoint, ...] = (
             'hand-launched ones.'
         ),
     ),
+    _BareShellEntrypoint(
+        name='session_ownership_probes.py (tier-2: import with PYTHONPATH)',
+        path=_SR_PKG_ROOT / 'orchestrator' / 'session_ownership_probes.py',
+        pythonpath=(_SR_PKG_ROOT_ENTRY,),
+        shape=_EntrypointShape.IMPORT,
+        argv=(),
+        probe='from shared import safe_io',
+        callers=(
+            'session_hooks.py imports this module at module scope, and '
+            'skills/spawn/hooks/{session-start,stop,notification}.sh run '
+            'session_hooks.py by absolute path with PYTHONPATH=orchestrator/src and '
+            'no venv. A non-stdlib import here makes session_hooks.py unimportable, '
+            'which silently disables every hook.'
+        ),
+    ),
+    _BareShellEntrypoint(
+        name='spawn_t3_lane.py (tier-2: bare shell + PYTHONPATH)',
+        path=_SR_PKG_ROOT / 'orchestrator' / 'spawn_t3_lane.py',
+        pythonpath=(_SR_PKG_ROOT_ENTRY,),
+        shape=_EntrypointShape.SCRIPT,
+        argv=('--help',),
+        probe='from shared import safe_io',
+        callers=(
+            'skills/spawn/spawn-claude.sh runs it by absolute path for the t3 lane '
+            '(detect, launch, await-started, wait, self-record, pair, status) with '
+            'PYTHONPATH="$REPO_ROOT/orchestrator/src" and no venv. A non-stdlib import '
+            'here turns every t3-lane spawn into a launcher failure.'
+        ),
+    ),
+    _BareShellEntrypoint(
+        name='t3_mcp_client.py (tier-2: import with PYTHONPATH)',
+        path=_SR_PKG_ROOT / 'orchestrator' / 't3_mcp_client.py',
+        pythonpath=(_SR_PKG_ROOT_ENTRY,),
+        shape=_EntrypointShape.IMPORT,
+        argv=(),
+        probe='from shared import safe_io',
+        callers=(
+            'spawn_t3_lane.py imports this module at module scope, and '
+            'skills/spawn/spawn-claude.sh runs spawn_t3_lane.py by absolute path '
+            'with PYTHONPATH="$REPO_ROOT/orchestrator/src" and no venv. A non-stdlib '
+            'import here makes the lane unimportable, so every t3-lane spawn becomes '
+            'a launcher failure.'
+        ),
+    ),
+    _BareShellEntrypoint(
+        name='session_self_exit.py (tier-2: import with PYTHONPATH)',
+        path=_SR_PKG_ROOT / 'orchestrator' / 'session_self_exit.py',
+        pythonpath=(_SR_PKG_ROOT_ENTRY,),
+        shape=_EntrypointShape.IMPORT,
+        argv=(),
+        probe='from shared import safe_io',
+        callers=(
+            'session_hooks.py imports this module at module scope, and '
+            'skills/spawn/hooks/stop.sh (with its session-start/notification '
+            'siblings) runs session_hooks.py by absolute path with '
+            'PYTHONPATH=orchestrator/src and no venv. A non-stdlib import here makes '
+            'session_hooks.py unimportable, which silently disables every hook.'
+        ),
+    ),
 )
 
 #: Mutation matrix: ``(entrypoint filename, import injected at module scope)``.
@@ -9298,7 +9443,12 @@ _BARE_SHELL_ENTRYPOINTS: tuple[_BareShellEntrypoint, ...] = (
 #: entrypoint.  This is the load-bearing signal — a guard that has never been
 #: observed to fail is not evidence that it guards anything.
 _MUST_BE_REJECTED: tuple[tuple[str, str], ...] = (
-    ('session_registry.py', 'from shared import safe_io'),
+    # session_registry's own bootstrap puts this checkout's shared/src on
+    # sys.path, and its payloads are injected AFTER that (see
+    # ``_INJECTION_ANCHORS``), so `shared` itself is reachable here by design.
+    # What must still be refused is a shared module with a third-party
+    # dependency: config_models fails on its pydantic import.
+    ('session_registry.py', 'from shared import config_models'),
     ('session_registry.py', 'from orchestrator import config'),
     ('session_registry.py', 'from orchestrator import stop_instruction'),
     # The dependency-footprint half of the contract: a plain third-party import
@@ -9316,10 +9466,22 @@ _MUST_BE_REJECTED: tuple[tuple[str, str], ...] = (
     # session_hooks.py's contract is the WEAKER tier-2 one: it does
     # `from orchestrator import session_registry` at module scope (line 50) and
     # its callers export PYTHONPATH for exactly that, so `orchestrator.*` is
-    # ALLOWED. `shared` and third-party are not — nothing puts shared/src or a
-    # site-packages on that path.
+    # ALLOWED. `shared` and third-party are not: its env puts neither shared/src
+    # nor a site-packages on the path, and the payload lands at the
+    # `from __future__` anchor, before the session_registry import whose
+    # bootstrap would otherwise make `shared` reachable as a side effect.
     ('session_hooks.py', 'from shared import safe_io'),
     ('session_hooks.py', 'import pydantic'),
+    ('session_ownership_probes.py', 'from shared import safe_io'),
+    ('session_ownership_probes.py', 'import pydantic'),
+    ('session_self_exit.py', 'from shared import safe_io'),
+    ('session_self_exit.py', 'import pydantic'),
+    ('spawn_t3_lane.py', 'from shared import safe_io'),
+    ('spawn_t3_lane.py', 'import pydantic'),
+    # Lands at the `from __future__` anchor, BEFORE t3_mcp_client's own
+    # session_registry import, whose bootstrap is what makes `shared` reachable.
+    ('t3_mcp_client.py', 'from shared import safe_io'),
+    ('t3_mcp_client.py', 'import pydantic'),
 )
 
 
@@ -9552,10 +9714,38 @@ def _first_bare_importable_sibling(probes: _BareShellProbes) -> str | None:
     return None
 
 
+#: The line a payload is injected after, per entrypoint; any other entrypoint
+#: uses ``from __future__ import annotations``.  session_registry's payloads go
+#: after its shared import, so each is judged with the module's own shared/src
+#: bootstrap already applied: that is the environment a later module-scope
+#: import in that file really runs in.
+_INJECTION_ANCHORS: dict[str, str] = {
+    'session_registry.py': 'from shared.project_id import ',
+}
+_DEFAULT_INJECTION_ANCHOR = 'from __future__ import annotations'
+
+
+def _inject_after_anchor(source: str, entrypoint_filename: str, payload: str) -> str:
+    anchor = _INJECTION_ANCHORS.get(entrypoint_filename, _DEFAULT_INJECTION_ANCHOR)
+    lines = source.splitlines(keepends=True)
+    anchored = [index for index, line in enumerate(lines) if line.startswith(anchor)]
+    assert anchored, (
+        f'{entrypoint_filename} has no module-scope line starting `{anchor}` to '
+        'anchor the injection on; pick another anchor rather than injecting blindly'
+    )
+    insert_at = anchored[0] + 1
+    return ''.join([*lines[:insert_at], f'{payload}\n', *lines[insert_at:]])
+
+
 def _inject_import_sandbox(tmp_path: Path, entrypoint_filename: str, payload: str) -> Path:
-    """Mirror the orchestrator package, with ``payload`` injected into one file.
+    """Mirror the checkout layout, with ``payload`` injected into one file.
 
     Returns the directory that stands in for ``orchestrator/src``.
+
+    The sandbox is laid out like a checkout: the package sits at
+    ``<sandbox>/orchestrator/src/orchestrator`` and ``<sandbox>/shared/src``
+    links the real ``shared/src``, so a mutated session_registry.py resolves its
+    ``__file__``-relative shared bootstrap exactly as the real file does.
 
     Every entry of the real package is mirrored as a SYMLINK (``__pycache__``
     excepted) and only the mutated entrypoint is a real file.  Faithfulness and
@@ -9566,8 +9756,11 @@ def _inject_import_sandbox(tmp_path: Path, entrypoint_filename: str, payload: st
     """
     slug = re.sub(r'\W+', '-', f'{entrypoint_filename}-{payload}').strip('-')
     sandbox = tmp_path / f'sandbox-{slug}'
-    pkg = sandbox / 'orchestrator'
+    pkg_root = sandbox / 'orchestrator' / 'src'
+    pkg = pkg_root / 'orchestrator'
     pkg.mkdir(parents=True)
+    (sandbox / 'shared').mkdir()
+    (sandbox / 'shared' / 'src').symlink_to(_SR_REPO_ROOT / 'shared' / 'src')
 
     real_pkg = _SR_PKG_ROOT / 'orchestrator'
     for entry in real_pkg.iterdir():
@@ -9575,33 +9768,36 @@ def _inject_import_sandbox(tmp_path: Path, entrypoint_filename: str, payload: st
             continue
         (pkg / entry.name).symlink_to(entry)
 
-    marker = 'from __future__ import annotations\n'
     source = (real_pkg / entrypoint_filename).read_text()
-    assert marker in source, (
-        f'{entrypoint_filename} has no `{marker.strip()}` line to anchor the '
-        'injection on; pick another anchor rather than injecting blindly'
-    )
     (pkg / entrypoint_filename).unlink()
-    (pkg / entrypoint_filename).write_text(source.replace(marker, f'{marker}{payload}\n', 1))
-    return sandbox
+    (pkg / entrypoint_filename).write_text(
+        _inject_after_anchor(source, entrypoint_filename, payload)
+    )
+    return pkg_root
 
 
 class TestStdlibOnlySelfContainment:
-    """The bare-shell entrypoints must run with NO venv, install or workspace deps.
+    """The bare-shell entrypoints must run with NO venv, install or third-party deps.
 
     This is an architectural contract, not a style preference.  Two production
     shell paths execute orchestrator modules directly, and they do it under
     DIFFERENT environments — so this class pins a REGISTRY
-    (``_BARE_SHELL_ENTRYPOINTS``) of invocations, not one module:
+    (``_BARE_SHELL_ENTRYPOINTS``) of invocations, not one module.  What such a
+    module may import is the stdlib plus this checkout's stdlib-only ``shared``
+    leaves, and the only route to those is session_registry's own bootstrap,
+    which appends the checkout's ``shared/src`` (derived from ``__file__``) to
+    ``sys.path``; no caller exports anything for it.
 
     - **tier-1 — bare shell, NO PYTHONPATH.**  ``skills/spawn/spawn-claude.sh``
-      runs ``session_registry.py`` by absolute path with nothing exported, so
-      only the script's own directory is on ``sys.path``: no ``shared``, no
-      third-party, and no ``orchestrator.<sibling>`` either.
+      and the SKILL.md verb lines run ``session_registry.py`` by absolute path
+      with nothing exported, so only the script's own directory is on
+      ``sys.path``: no third-party, no ``orchestrator.<sibling>``, and no
+      ``shared`` beyond what the bootstrap appends.
     - **tier-2 — bare shell (or plain import) WITH PYTHONPATH=orchestrator/src.**
       ``skills/spawn/hooks/*.sh`` run ``session_hooks.py``, and Python consumers
       import ``orchestrator.session_registry``.  Intra-orchestrator siblings are
-      reachable here; ``shared`` and third-party are still not.
+      reachable here; third-party is still not, and ``shared`` only through the
+      same bootstrap.
 
     Tier-1 is STRICTLY STRONGER, so the rows are not interchangeable and neither
     may be deleted as a duplicate of the other — pinned by
@@ -9613,9 +9809,10 @@ class TestStdlibOnlySelfContainment:
     dependency and against a control run of the SAME sandbox with nothing
     injected — so a degraded sandbox cannot masquerade as a working guard.  A
     guard that has never been observed to fail is not evidence of anything —
-    task 3223's consolidation added ``from shared import safe_io`` and broke
-    exactly this contract (escalation esc-3223-2) while the only symptom in the
-    suite was two downstream ``test_session_hooks.py`` failures.  A row counts
+    task 3223's consolidation added ``from shared import safe_io`` before any
+    bootstrap existed and broke exactly this contract (escalation esc-3223-2)
+    while the only symptom in the suite was two downstream
+    ``test_session_hooks.py`` failures.  A row counts
     as able to discriminate only when BOTH its own vacuity ``probe`` AND the
     payload under test are unreachable under its documented env; otherwise it
     SKIPS loudly rather than reporting a green it did not earn.
@@ -9626,7 +9823,8 @@ class TestStdlibOnlySelfContainment:
     DO NOT WIDEN THIS INTO A REPO-WIDE RULE.  "stdlib-only" names at least three
     different contracts in this repo, and only the first is what these rows pin:
 
-    (a) bare-shell executability — ``session_registry``, ``session_hooks``;
+    (a) bare-shell executability — ``session_registry``, ``session_hooks``,
+        ``session_ownership_probes``, ``session_self_exit``;
     (b) layering / cycle avoidance — ``routing``, ``stop_instruction``,
         ``fm_retry``, ``agents/triage``, ``fused_memory/config``/``schema``,
         where importing an intra-package sibling is perfectly fine;
@@ -9671,6 +9869,47 @@ class TestStdlibOnlySelfContainment:
             'genuinely required, the caller can no longer run it bare).\n'
             f'stdout:\n{result.stdout}\nstderr:\n{result.stderr}'
         )
+
+    def test_bare_shell_write_decision_folds_project_through_shared(self, tmp_path):
+        """The production spawn-claude/SKILL invocation reaches the shared fold.
+
+        ``write-decision`` run by absolute path with no PYTHONPATH stores its
+        project folded by ``shared.project_id.fold_project_token``, so the fold
+        the cockpit reads with is reachable from a bare shell.
+        """
+        interpreter = _non_venv_interpreter()
+        if interpreter is None:
+            pytest.skip('no non-venv interpreter available on this host')
+        fleet = tmp_path / 'fleet'
+
+        result = subprocess.run(
+            [
+                interpreter,
+                str(_SR_PKG_ROOT / 'orchestrator' / 'session_registry.py'),
+                'write-decision',
+                '--id', 'esc-1-1',
+                '--project', 'Dark-Factory',
+                '--text', 'Approve the bare-shell filing?',
+                '--escalations-dir', str(tmp_path / 'escalations'),
+            ],
+            env={
+                'PATH': '/usr/bin:/bin',
+                'HOME': str(tmp_path),
+                'PYTHONNOUSERSITE': '1',
+                'PYTHONDONTWRITEBYTECODE': '1',
+                'CLAUDE_FLEET_ROOT': str(fleet),
+            },
+            # Neutral cwd, LOAD-BEARING for the reasons ``_run_row`` gives.
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+
+        assert result.returncode == 0, f'stderr:\n{result.stderr}'
+        assert [decision.project for decision in sr.list_decisions(root=fleet)] == [
+            fold_project_token('Dark-Factory')
+        ], f'stderr:\n{result.stderr}'
 
     def test_tier1_is_strictly_stronger_than_tier2(self, tmp_path, bare_shell_probes):
         """The two session_registry rows encode DIFFERENT contracts, not one twice.
@@ -9923,7 +10162,7 @@ def test_migrate_decision_project_tokens_changes_only_the_project_field(tmp_path
 def test_migrate_decision_project_tokens_is_idempotent(tmp_path: Path) -> None:
     """A second sweep is a no-op: nothing reported, no file rewritten.
 
-    Follows from normalize_project_token's idempotence, and is what makes the
+    Follows from fold_project_token's idempotence, and is what makes the
     verb safe to keep as a permanent repair tool rather than a one-shot
     script that must be deleted after use.
     """
@@ -10921,6 +11160,7 @@ class TestReopenDecision:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
         monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+        _file_from_a_linked_session(monkeypatch, tmp_path)
         queue = str(tmp_path / 'data' / 'escalations')
         filing = {
             'id': 'esc-5914-1', 'project': 'dark_factory', 'text': 'Adopt the reify plan?', 'escalations_dir': queue,
@@ -11046,3 +11286,209 @@ class TestReopenDecisionVerb:
         assert rc == 0
         [reread] = sr.list_decisions(root=tmp_path)
         assert (reread.id, reread.state) == (printed, sr.DecisionState.OPEN)
+
+
+# ---------------------------------------------------------------------------
+# Task 7489: the T3 lane's registry primitives
+# ---------------------------------------------------------------------------
+
+
+def test_main_set_display_stamps_a_t3_thread_id(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _set_env(monkeypatch, _launching_env(tmp_path))
+    sr.main(['launching'])
+    record_dir = capsys.readouterr().out.strip()
+
+    rc = sr.main(
+        ['set-display', '--record', record_dir, '--kind', 't3', '--t3-thread-id', 'th-9',
+         '--wm-title', 'unblock:df#2085']
+    )
+
+    assert rc == 0
+    display = sr.read_record(Path(record_dir).name, root=tmp_path).display
+    assert display == sr.Display(kind='t3', wm_title='unblock:df#2085', t3_thread_id='th-9')
+
+
+_SID = '0b6a3c1e-1111-4222-8333-444455556666'
+
+
+def _bound_record(tmp_path: Path, slug: str, session_id: str | None) -> sr.SessionRecord:
+    record = _make_record(session_slug=slug, claude_session_id=session_id)
+    sr.write_record(record, root=tmp_path)
+    return record
+
+
+class TestClaudeSessionPointers:
+    def test_pointer_dir_is_a_sibling_of_sessions(self, tmp_path: Path) -> None:
+        assert sr.claude_session_pointers_dir(tmp_path) == tmp_path / 'sessions-by-claude-id'
+        assert sr.claude_session_pointer_path(_SID, tmp_path).parent.parent == tmp_path
+
+    def test_a_written_pointer_resolves_while_the_record_vouches(self, tmp_path: Path) -> None:
+        _bound_record(tmp_path, 'session-df-7489-1', _SID)
+
+        assert sr.write_claude_session_pointer(_SID, 'session-df-7489-1', root=tmp_path)
+        assert sr.claude_session_pointer_path(_SID, tmp_path).read_text() == 'session-df-7489-1'
+        assert sr.resolve_session_slug_for_claude_session_id(_SID, root=tmp_path) == (
+            'session-df-7489-1'
+        )
+
+    def test_a_record_bound_to_another_session_does_not_vouch(self, tmp_path: Path) -> None:
+        _bound_record(tmp_path, 'session-df-7489-1', 'some-other-session')
+        sr.write_claude_session_pointer(_SID, 'session-df-7489-1', root=tmp_path)
+
+        assert sr.resolve_session_slug_for_claude_session_id(_SID, root=tmp_path) is None
+
+    def test_a_missing_record_or_pointer_resolves_none(self, tmp_path: Path) -> None:
+        assert sr.resolve_session_slug_for_claude_session_id(_SID, root=tmp_path) is None
+        sr.write_claude_session_pointer(_SID, 'gone-record', root=tmp_path)
+        assert sr.resolve_session_slug_for_claude_session_id(_SID, root=tmp_path) is None
+
+    @pytest.mark.parametrize('session_id', ['', '../escape', 'a/b', 'x' * 129])
+    def test_an_unsafe_session_id_is_never_written_or_read(
+        self, tmp_path: Path, session_id: str
+    ) -> None:
+        assert not sr.write_claude_session_pointer(session_id, 'session-df-1', root=tmp_path)
+        assert sr.resolve_session_slug_for_claude_session_id(session_id, root=tmp_path) is None
+        assert not sr.claude_session_pointers_dir(tmp_path).exists()
+
+    def test_a_non_record_key_slug_is_not_written(self, tmp_path: Path) -> None:
+        assert not sr.write_claude_session_pointer(_SID, '..', root=tmp_path)
+        assert not sr.write_claude_session_pointer(_SID, 'a/b', root=tmp_path)
+
+    def test_reap_removes_pointers_no_record_vouches_for(self, tmp_path: Path) -> None:
+        _bound_record(tmp_path, 'vouched', _SID)
+        _bound_record(tmp_path, 'rebound', 'newer-session')
+        sr.write_claude_session_pointer(_SID, 'vouched', root=tmp_path)
+        sr.write_claude_session_pointer('old-session', 'rebound', root=tmp_path)
+        sr.write_claude_session_pointer('orphan-session', 'gone-record', root=tmp_path)
+        pointers = sr.claude_session_pointers_dir(tmp_path)
+        (pointers / 'bad name').write_text('vouched')
+        fresh_temp = pointers / f'inflight{sr._ATOMIC_WRITE_TEMP_SUFFIX}'
+        fresh_temp.write_text('vouched')
+
+        removed = sr.reap_stale_session_pointers(root=tmp_path)
+
+        assert {path.name for path in removed} == {'old-session', 'orphan-session', 'bad name'}
+        assert sorted(path.name for path in pointers.iterdir()) == sorted([_SID, fresh_temp.name])
+
+
+def _t3_record(
+    tmp_path: Path,
+    slug: str,
+    thread_id: str | None,
+    *,
+    cwd: str,
+    status: sr.Status = sr.Status.RUNNING,
+    kind: str = sr.DisplayKind.T3.value,
+) -> None:
+    sr.write_record(
+        _make_record(
+            session_slug=slug,
+            status=status,
+            cwd=cwd,
+            exit_code=None,
+            display=sr.Display(kind=kind, t3_thread_id=thread_id),
+        ),
+        root=tmp_path,
+    )
+
+
+class TestMarkT3SessionsExited:
+    def test_marks_only_this_projects_records_whose_thread_is_gone_or_archived(
+        self, tmp_path: Path
+    ) -> None:
+        project, other = tmp_path / 'proj', tmp_path / 'other'
+        project.mkdir()
+        other.mkdir()
+        _t3_record(tmp_path, 'listed', 'th-live', cwd=str(project))
+        _t3_record(tmp_path, 'archived', 'th-archived', cwd=str(project))
+        _t3_record(tmp_path, 'gone', 'th-gone', cwd=str(project))
+        _t3_record(tmp_path, 'other-project', 'th-gone', cwd=str(other))
+        _t3_record(tmp_path, 'already-exited', 'th-gone', cwd=str(project), status=sr.Status.EXITED)
+        _t3_record(tmp_path, 'not-t3', 'th-gone', cwd=str(project), kind='wm')
+        _t3_record(tmp_path, 'no-thread-yet', None, cwd=str(project))
+
+        marked = sr.mark_t3_sessions_exited(
+            str(project), {'th-live': False, 'th-archived': True}, root=tmp_path
+        )
+
+        assert sorted(marked) == ['archived', 'gone']
+        for slug in ('archived', 'gone'):
+            record = sr.read_record(slug, root=tmp_path)
+            assert (record.status, record.exit_code) == (sr.Status.EXITED, sr.ORPHAN_EXIT_CODE)
+        for slug in ('listed', 'other-project', 'not-t3', 'no-thread-yet'):
+            assert sr.read_record(slug, root=tmp_path).status == sr.Status.RUNNING
+
+    def test_project_root_matches_by_realpath(self, tmp_path: Path) -> None:
+        project = tmp_path / 'proj'
+        project.mkdir()
+        link = tmp_path / 'link'
+        link.symlink_to(project)
+        _t3_record(tmp_path, 'gone', 'th-gone', cwd=str(link))
+
+        assert sr.mark_t3_sessions_exited(str(project), {}, root=tmp_path) == ['gone']
+
+    def test_a_record_written_after_the_listing_is_skipped(self, tmp_path: Path) -> None:
+        _t3_record(tmp_path, 'just-launched', 'th-new', cwd=str(tmp_path))
+        listed_at = datetime.now(UTC) - timedelta(minutes=1)
+
+        assert sr.mark_t3_sessions_exited(str(tmp_path), {}, root=tmp_path, listed_at=listed_at) == []
+
+
+class TestT3RecordsAreExemptFromPidSweeps:
+    def _stale_t3_record(self, tmp_path: Path, status: sr.Status) -> Path:
+        _t3_record(tmp_path, 't3-quiet', 'th-1', cwd=str(tmp_path), status=status)
+        record = sr.read_record('t3-quiet', root=tmp_path)
+        record.launcher_pid = _DEAD_PID
+        sr.write_record(record, root=tmp_path)
+        path = sr.record_path_for_slug('t3-quiet', root=tmp_path)
+        _set_mtime(path, _NOW, sr.TERMINAL_TTL + timedelta(hours=1))
+        return path
+
+    def test_mark_orphaned_skips_a_quiet_t3_record_with_a_dead_launcher(
+        self, tmp_path: Path
+    ) -> None:
+        self._stale_t3_record(tmp_path, sr.Status.AWAITING_INPUT)
+
+        assert sr.mark_orphaned_sessions_exited(root=tmp_path, now=_NOW) == []
+        assert sr.read_record('t3-quiet', root=tmp_path).status == sr.Status.AWAITING_INPUT
+
+    def test_reap_keeps_a_non_terminal_t3_record_with_a_dead_launcher(self, tmp_path: Path) -> None:
+        path = self._stale_t3_record(tmp_path, sr.Status.RUNNING)
+
+        assert sr.reap_stale_records(root=tmp_path, now=_NOW) == []
+        assert path.is_file()
+
+    def test_reap_still_applies_terminal_ttl_to_a_t3_record(self, tmp_path: Path) -> None:
+        self._stale_t3_record(tmp_path, sr.Status.EXITED)
+
+        reaped = sr.reap_stale_records(root=tmp_path, now=_NOW)
+
+        assert [(r.session_slug, r.reason) for r in reaped] == [('t3-quiet', 'terminal_ttl')]
+
+
+def test_mark_session_folded_stamps_the_fold_code_once(tmp_path: Path) -> None:
+    sr.write_record(_make_record(session_slug='hand', status=sr.Status.RUNNING), root=tmp_path)
+
+    folded = sr.mark_session_folded('hand', root=tmp_path)
+
+    assert folded is not None
+    assert (folded.status, folded.exit_code) == (sr.Status.EXITED, sr.FOLDED_EXIT_CODE)
+    assert sr.mark_session_folded('hand', root=tmp_path) is None
+
+
+def test_is_t3_record_reads_the_display_kind() -> None:
+    t3 = _make_record(display=sr.Display(kind=sr.DisplayKind.T3.value, t3_thread_id='th-1'))
+
+    assert sr.is_t3_record(t3)
+    assert not sr.is_t3_record(_make_record())
+    assert not sr.is_t3_record(_make_record(display=None))
+
+
+def test_pid_alive_is_the_public_liveness_probe() -> None:
+    assert sr.pid_alive(os.getpid())
+    assert not sr.pid_alive(_DEAD_PID)
+    assert not sr.pid_alive(0)

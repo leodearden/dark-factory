@@ -1,0 +1,12 @@
+{
+  "task_id": "6660",
+  "reason": "New test file test_done_phase_wedge.py drives a real TaskWorkflow through Harness._run_slot, the one seam that owns slot release; the single private read is that entry point (net-additive test of a new guarantee, not a refactor)",
+  "measures": [
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6557,
+      "current": 6558
+    }
+  ]
+}

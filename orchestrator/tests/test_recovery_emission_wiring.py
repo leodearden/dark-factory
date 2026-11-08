@@ -26,7 +26,11 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _orch_helpers import wire_scheduler_liveness_mock
+from _orch_helpers import (
+    wire_clear_claim_then_set_status,
+    wire_live_status_from_get_task,
+    wire_scheduler_liveness_mock,
+)
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from shared.deploy_state import DeployPhase
@@ -35,7 +39,7 @@ from shared.task_statuses import TaskStatus
 from orchestrator.config import RecoveryEmissionConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.harness import Harness
-from orchestrator.landed_outbox import MergeProvenance
+from orchestrator.merge_lane.landed_outbox import MergeProvenance
 from orchestrator.recovery_emission import (
     RECOVERY_VETO_STREAK_SENTINEL_PREFIX,
     RecoveryVetoStreakTracker,
@@ -78,6 +82,7 @@ def _ref(
     severity: str = 'blocking',
     category: str = 'needs_human',
     age_secs: float = 300.0,
+    members: tuple[str, ...] = (),
 ) -> EscalationRef:
     """A pinning record, by default one the auto-watcher has NOT yet promoted.
 
@@ -92,6 +97,7 @@ def _ref(
         category=category,
         severity=severity,
         created_at=_iso(secs_ago=age_secs),
+        members=members,
     )
 
 
@@ -239,6 +245,8 @@ def harness(tmp_path: Path, mock_orch_config):
 
     h.scheduler = MagicMock()
     wire_scheduler_liveness_mock(h.scheduler)
+    wire_clear_claim_then_set_status(h.scheduler)
+    wire_live_status_from_get_task(h.scheduler)
     h.scheduler.get_tasks = AsyncMock(return_value=[])
     h.scheduler.get_statuses = AsyncMock(return_value=({}, None))
     h.scheduler.set_task_status = AsyncMock()
@@ -761,6 +769,37 @@ def _alarms(harness, tid: str = 'T1') -> list:
     )
 
 
+def _outside_l2(
+    queue: EscalationQueue,
+    esc_id: str,
+    *,
+    members: tuple[str, ...],
+    task_id: str = '9',
+    severity: str = 'blocking',
+) -> Escalation:
+    """A pending cluster L2 the auto-watcher filed under ANOTHER task id."""
+    l2 = Escalation(
+        id=esc_id, task_id=task_id, agent_role='escalation-watcher-auto',
+        severity=severity, category='risk_identified', summary='cluster',
+        level=2, members=list(members),
+    )
+    queue.submit(l2)
+    return l2
+
+
+def _count_pending_scans(monkeypatch, queue: EscalationQueue) -> list[None]:
+    """One entry per ``queue.get_pending()`` call — each a full root scan."""
+    scans: list[None] = []
+    real = queue.get_pending
+
+    def counted():
+        scans.append(None)
+        return real()
+
+    monkeypatch.setattr(queue, 'get_pending', counted)
+    return scans
+
+
 @pytest.mark.asyncio
 class TestVetoStreakAlarm:
     async def test_the_first_two_sweeps_file_nothing(self, clocked):
@@ -1052,6 +1091,118 @@ class TestHumanParkedHoldsDoNotAlarm:
 
         await _sweeps(harness, clock, 3)
 
+        assert len(_alarms(harness)) == 1
+
+    async def test_a_hold_pinned_by_an_l2_and_its_member_l1_files_no_alarm(self, clocked):
+        """Task 7709: the promoted hold — the L1 stays open beside the L2 that
+        names it in members until the L2's cascade closes it."""
+        harness, clock = clocked
+        _bind_reports(harness, {'T1': _pinned_hold(escalations=[
+            _ref('esc-1', level=1), _ref('esc-2', level=2, members=('esc-1',)),
+        ])})
+
+        await _sweeps(harness, clock, 8)
+
+        assert _alarms(harness) == []
+
+    async def test_an_l1_beside_an_l2_that_does_not_hold_it_still_alarms(self, clocked):
+        """COUNTER-SIGNAL: an L2 holding some other id leaves the L1 unpromoted."""
+        harness, clock = clocked
+        _bind_reports(harness, {'T1': _pinned_hold(escalations=[
+            _ref('esc-1', level=1), _ref('esc-2', level=2, members=('esc-other',)),
+        ])})
+
+        await _sweeps(harness, clock, 3)
+
+        assert len(_alarms(harness)) == 1
+
+    # -- task 7716: the L2 holding the L1 was filed under ANOTHER task id --
+
+    async def test_an_l1_held_by_an_l2_filed_under_another_task_files_no_alarm(
+        self, clocked,
+    ):
+        """``promote_to_l2`` mints a cluster L2 under one task id, so the task's
+        own read never sees it; the pending queue does."""
+        harness, clock = clocked
+        _outside_l2(_queue(harness), 'esc-9-2', members=('esc-1',))
+        _bind_reports(harness, {'T1': _pinned_hold(escalations=[_ref('esc-1', level=1)])})
+
+        await _sweeps(harness, clock, 8)
+
+        assert _alarms(harness) == []
+
+    async def test_outside_holder_suppression_is_not_blindness(self, clocked):
+        """The veto rows still name the task's own pin, and never the outside L2."""
+        harness, clock = clocked
+        _outside_l2(_queue(harness), 'esc-9-2', members=('esc-1',))
+        _bind_reports(harness, {'T1': _pinned_hold(escalations=[_ref('esc-1', level=1)])})
+
+        await _sweeps(harness, clock, 8)
+
+        rows = _rows(harness, EventType.recovery_vetoed)
+        assert rows
+        assert all('esc-1' in json.dumps(r['data']) for r in rows)
+        assert not [r for r in rows if 'esc-9-2' in json.dumps(r['data'])]
+
+    async def test_an_outside_l2_holding_another_id_still_alarms(self, clocked):
+        """COUNTER-SIGNAL: the outside L2 leaves this task's L1 unpromoted."""
+        harness, clock = clocked
+        _outside_l2(_queue(harness), 'esc-9-2', members=('esc-other',))
+        _bind_reports(harness, {'T1': _pinned_hold(escalations=[_ref('esc-1', level=1)])})
+
+        await _sweeps(harness, clock, 3)
+
+        assert len(_alarms(harness)) == 1
+
+    async def test_a_resolved_outside_l2_holds_nothing(self, clocked):
+        """COUNTER-SIGNAL: a closed L2 is no longer in front of anyone."""
+        harness, clock = clocked
+        holder = _outside_l2(_queue(harness), 'esc-9-2', members=('esc-1',))
+        _queue(harness).resolve(holder.id, 'answered')
+        _bind_reports(harness, {'T1': _pinned_hold(escalations=[_ref('esc-1', level=1)])})
+
+        await _sweeps(harness, clock, 3)
+
+        assert len(_alarms(harness)) == 1
+
+    async def test_an_info_outside_l2_holds_nothing(self, clocked):
+        """COUNTER-SIGNAL: link 1 makes an info L2 an annotation, not a handoff."""
+        harness, clock = clocked
+        _outside_l2(_queue(harness), 'esc-9-2', members=('esc-1',), severity='info')
+        _bind_reports(harness, {'T1': _pinned_hold(escalations=[_ref('esc-1', level=1)])})
+
+        await _sweeps(harness, clock, 3)
+
+        assert len(_alarms(harness)) == 1
+
+    async def test_each_sweep_scans_the_pending_queue_once_per_held_task(
+        self, clocked, monkeypatch,
+    ):
+        harness, clock = clocked
+        _outside_l2(_queue(harness), 'esc-9-2', members=('esc-1',))
+        _bind_reports(harness, {'T1': _pinned_hold(escalations=[_ref('esc-1', level=1)])})
+        scans = _count_pending_scans(monkeypatch, _queue(harness))
+
+        await _sweeps(harness, clock, 3)
+
+        assert len(scans) == 3
+
+    async def test_with_the_suppression_off_no_sweep_scans_the_pending_queue(
+        self, clocked, monkeypatch,
+    ):
+        """Every pending read is a root scan, and with the knob off no filing
+        reads the answer."""
+        harness, clock = clocked
+        harness.config.recovery_emission = RecoveryEmissionConfig(
+            streak_escalation_suppress_human_parked=False,
+        )
+        _outside_l2(_queue(harness), 'esc-9-2', members=('esc-1',))
+        _bind_reports(harness, {'T1': _pinned_hold(escalations=[_ref('esc-1', level=1)])})
+        scans = _count_pending_scans(monkeypatch, _queue(harness))
+
+        await _sweeps(harness, clock, 3)
+
+        assert scans == []
         assert len(_alarms(harness)) == 1
 
 

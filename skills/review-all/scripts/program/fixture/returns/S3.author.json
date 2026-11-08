@@ -1,0 +1,23 @@
+{
+  "schema": "review-all-prd-return/1",
+  "run_id": "review-all-fixture-20261019",
+  "stream": "S3",
+  "pass": "author",
+  "session": {
+    "kind": "spawn",
+    "title": "prd:fixture S3"
+  },
+  "prd_path": "plans/review-all-fixture-s3-prd.md",
+  "manifest_path": "plans/review-all-fixture-s3-prd.capability-manifest.md",
+  "sidecar_path": "plans/review-all-fixture-s3-prd.capability-manifest.yaml",
+  "commits": [],
+  "open_questions": [],
+  "rulings_in_session": [],
+  "seam_dependencies": [],
+  "xrefs": [],
+  "lead_actions": [],
+  "notes": "Spawned session; the gamma shim has one importer left.",
+  "touches": [
+    "src/fixture/gamma.py"
+  ]
+}

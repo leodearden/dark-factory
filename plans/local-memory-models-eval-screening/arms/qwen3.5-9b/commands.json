@@ -1,0 +1,146 @@
+{
+  "arm_id": "qwen3.5-9b",
+  "records": [
+    {
+      "argv": [
+        "/home/leo/.local/bin/uv",
+        "run",
+        "--no-sync",
+        "--project",
+        "/home/leo/src/dark-factory/shared",
+        "python",
+        "/home/leo/src/dark-factory/scripts/local-model-serving/lms_ctl.py",
+        "start",
+        "qwen3.5-9b"
+      ],
+      "exit_code": 0,
+      "finished_at": "2026-10-07T19:59:09.536005Z",
+      "output_tail": "started lms-arm@qwen3.5-9b.service\n",
+      "stage": "start",
+      "started_at": "2026-10-07T19:59:08.772419Z"
+    },
+    {
+      "argv": [
+        "/home/leo/.local/bin/uv",
+        "run",
+        "--no-sync",
+        "--project",
+        "/home/leo/src/dark-factory/shared",
+        "python",
+        "/home/leo/src/dark-factory/scripts/local-model-serving/lms_ctl.py",
+        "wait-ready",
+        "qwen3.5-9b"
+      ],
+      "exit_code": 0,
+      "finished_at": "2026-10-07T20:08:41.429275Z",
+      "output_tail": "qwen3.5-9b: ready\n",
+      "stage": "wait-ready",
+      "started_at": "2026-10-07T19:59:09.536590Z"
+    },
+    {
+      "argv": [
+        "/home/leo/.local/bin/uv",
+        "run",
+        "--no-sync",
+        "python",
+        "scripts/local_memory_models_eval/harness.py",
+        "smoke",
+        "--arm-spec",
+        "/tmp/lme-eta-3720/evidence/specs/qwen3.5-9b.json"
+      ],
+      "exit_code": 0,
+      "finished_at": "2026-10-07T20:09:04.101453Z",
+      "output_tail": "PASS endpoint-conformance: arm 'qwen3.5-9b' at http://127.0.0.1:8418/v1 (json_schema) returned a schema-valid SmokeEntities\nPASS validator-negative-control: the validator rejected a deliberately off-schema payload\n",
+      "stage": "smoke",
+      "started_at": "2026-10-07T20:08:41.801231Z"
+    },
+    {
+      "argv": [
+        "/home/leo/.local/bin/uv",
+        "run",
+        "--no-sync",
+        "python",
+        "scripts/local_memory_models_eval/harness.py",
+        "run",
+        "--arm-spec",
+        "/tmp/lme-eta-3720/evidence/specs/qwen3.5-9b.json",
+        "--manifest",
+        "/tmp/lme-eta-3720/code/fused-memory/scripts/local_memory_models_eval/corpus_manifest.json",
+        "--out-root",
+        "/tmp/lme-eta-3720/evidence/runs",
+        "--repo-root",
+        "/tmp/lme-eta-3720/code",
+        "--limit",
+        "20",
+        "--concurrency",
+        "3",
+        "--index-configuration",
+        "with-indices"
+      ],
+      "exit_code": 4,
+      "finished_at": "2026-10-07T20:13:11.477860Z",
+      "output_tail": "Error in generating LLM response: Expecting value: line 1 column 1 (char 0)\nRetrying after application error (attempt 1/2): Expecting value: line 1 column 1 (char 0)\nError in generating LLM response: Expecting value: line 1 column 1 (char 0)\nRetrying after application error (attempt 1/2): Expecting value: line 1 column 1 (char 0)\nError in generating LLM response: Expecting value: line 1 column 1 (char 0)\nRetrying after application error (attempt 1/2): Expecting value: line 1 column 1 (char 0)\nrun: /tmp/lme-eta-3720/evidence/runs/qwen3.5-9b/20261007T200908Z\nPASS code-sha-matches-checkout: HEAD 055e9c15a0d756704017b0d77ffbe4185155402f is clean and matches the spec\nPASS preregistration-sha: 865a017d79c6a210da157474e639fd15fe51f9e0 carries plans/local-memory-models-eval-preregistration.md\nFAIL token-cost-accounting: arm 'qwen3.5-9b': token accounting (and cost, on a metered arm) must be present and non-zero; got {<LlmMetricId.TOKENS_PER_EPISODE: 'tokens-per-episode'>: None}\naborted: {\"arm_id\":\"qwen3.5-9b\",\"item_ids\":[\"8ed66f45-dde5-4c43-9812-9136d45beb6e\",\"62f8f47b-42b5-47a3-95f6-64a8f1c8cead\",\"026c9418-e82c-4793-a6a3-ab1421e5eff3\",\"3137f2d8-0e96-4269-a91f-a199f50a96ad\",\"32589460-bc9c-43e0-ac07-440933459352\"],\"error_classes\":[\"TimeoutError\",\"TimeoutError\",\"TimeoutError\",\"TimeoutError\",\"TimeoutError\"]}\n",
+      "stage": "run",
+      "started_at": "2026-10-07T20:09:04.460725Z"
+    },
+    {
+      "argv": [
+        "/home/leo/.local/bin/uv",
+        "run",
+        "--no-sync",
+        "--project",
+        "/home/leo/src/dark-factory/shared",
+        "python",
+        "/home/leo/src/dark-factory/scripts/local-model-serving/lms_healthcheck.py",
+        "--arm",
+        "qwen3.5-9b",
+        "--output",
+        "/tmp/lme-eta-3720/evidence/arms/qwen3.5-9b/health.json"
+      ],
+      "exit_code": 0,
+      "finished_at": "2026-10-07T20:14:38.436198Z",
+      "output_tail": "local model serving health — 2026-10-07T20:13:12.060948+00:00\nGPU: NVIDIA GeForce RTX 3090 (driver 580.178.04, 24576 MiB)\n\nARM         AXIS  STACK  ENDPOINT               VERDICT  REASON  COLD-MS  MS\n----------  ----  -----  ---------------------  -------  ------  -------  -----\nqwen3.5-9b  llm   vllm   http://127.0.0.1:8410  PASS     ok      45587    40194\n\nVRAM PASS: the arm took 14901 MiB (21972 used - 7071 baseline) of the 17020 MiB free before it started\n  headroom 2.07 GiB; card total 24576 MiB, now 2120 MiB free\n  reported, NOT gating — PRD D10 nominal ceiling 19.5 GiB, measured operating budget on this host 16.37 GiB\n  the arm took 14.55 GiB (21972 - 7071 MiB), within the 16.62 GiB budget free before it started\n\nnon-arm GPU consumers\n  at baseline, before the arm started:\n    pid 9024 python — 4050 MiB (3.96 GiB)\n  at the probe reading (the arm included):\n    pid 9024 python — 4050 MiB (3.96 GiB)\n    pid 2601674 VLLM::EngineCore — 14902 MiB (14.55 GiB)\n  INVENTORY, not an accounting: `nvidia-smi --query-compute-apps` lists only CUDA\n  compute applications. It does not list the KDE/X11 graphics contexts (Xorg,\n  plasmashell, kwin_x11, and ~40 small KDE clients) that hold the remaining ~3.3 GiB on\n  this host — which is exactly why the measured operating budget is ~16.37 GiB rather\n  than 19.5. These entries name who else held the card; they do not sum to memory.used.\n\nCOLD-MS is the DISCARDED warm-up, MS the measured run. Latency here is a SINGLE-SAMPLE health-probe measurement taken with the engine warm and the prefix cache COLD (one discarded warm-up on a different prompt precedes it). It is NOT the p95-under-load envelope metric (task 3719 zeta; PRD episode-latency-p50/p95 under concurrent load), and it must not be used to rank arms against one another.\n\nOVERALL: PASS\n\nwrote /tmp/lme-eta-3720/evidence/arms/qwen3.5-9b/health.json\n",
+      "stage": "healthcheck",
+      "started_at": "2026-10-07T20:13:11.595409Z"
+    },
+    {
+      "argv": [
+        "/home/leo/.local/bin/uv",
+        "run",
+        "--no-sync",
+        "--project",
+        "/home/leo/src/dark-factory/shared",
+        "python",
+        "/home/leo/src/dark-factory/scripts/local-model-serving/lms_ctl.py",
+        "stop",
+        "qwen3.5-9b"
+      ],
+      "exit_code": 0,
+      "finished_at": "2026-10-07T20:14:46.937350Z",
+      "output_tail": "stopped lms-arm@qwen3.5-9b.service\n",
+      "stage": "stop",
+      "started_at": "2026-10-07T20:14:38.436772Z"
+    },
+    {
+      "argv": [
+        "/home/leo/.local/bin/uv",
+        "run",
+        "--no-sync",
+        "python",
+        "scripts/local_memory_models_eval/harness.py",
+        "teardown",
+        "--arm-spec",
+        "/tmp/lme-eta-3720/evidence/specs/qwen3.5-9b.json"
+      ],
+      "exit_code": 0,
+      "finished_at": "2026-10-07T20:14:50.726468Z",
+      "output_tail": "deleted 'evalmem_lme_eta_qwen3_5_9b'\n",
+      "stage": "teardown",
+      "started_at": "2026-10-07T20:14:46.937552Z"
+    }
+  ],
+  "tap": {
+    "listen_url": "http://127.0.0.1:8418",
+    "upstream_url": "http://127.0.0.1:8410"
+  }
+}

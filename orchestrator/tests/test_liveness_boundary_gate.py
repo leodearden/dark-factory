@@ -32,6 +32,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _orch_helpers import pydantic_spec
+from _workflow_helpers import fixed_prompt
 from shared.cli_invoke import (
     _run_subprocess,
     count_transcript_turns,
@@ -529,7 +530,7 @@ class TestB3ResumeAcrossWall:
             patch.object(wf, '_build_agent_env', return_value=None),
         ):
             mock_iwcr.return_value = success_result
-            await wf._invoke(IMPLEMENTER, 'test-prompt', tmp_path)
+            await wf._invoke(IMPLEMENTER, fixed_prompt('test-prompt'), tmp_path)
 
         # resume_session_id passed to invoke_with_cap_retry
         assert mock_iwcr.call_args is not None, 'Expected invoke_with_cap_retry to be called'
@@ -587,7 +588,7 @@ class TestB5EvidenceCarriesTranscript:
         assert wf.artifacts is not None
 
         # Build a real TaskConfigDir so _capture_zero_output_evidence can locate the transcript
-        config_dir = TaskConfigDir(wf.task_id, base_dir=wf.artifacts.root)
+        config_dir = TaskConfigDir(wf.task_id, base_dir=wf.artifacts.lane_root)
         wf._config_dir = config_dir  # type: ignore[attr-defined]
 
         sid = 'sid-b5-evidence'
@@ -608,7 +609,7 @@ class TestB5EvidenceCarriesTranscript:
 
         wf._capture_zero_output_evidence(result, iteration=3)  # type: ignore[attr-defined]
 
-        evidence_path = wf.artifacts.root / 'zero_output_evidence-iter3.json'
+        evidence_path = wf.artifacts.zero_output_evidence_path(3)
         assert evidence_path.exists(), f'Expected evidence file at {evidence_path}'
 
         data = json.loads(evidence_path.read_text())

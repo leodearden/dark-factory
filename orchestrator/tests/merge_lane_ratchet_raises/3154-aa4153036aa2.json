@@ -1,0 +1,42 @@
+{
+  "task_id": "3154",
+  "reason": "net-additive: task 3154 provisioning-door refusal (recut_ruling keyword on create_worktree and acquire_warm_lane + _refuse_prior_incarnation, 2 cognitive); Part A of the same task lowered the disk-backstop nesting",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 1463,
+      "current": 1465
+    },
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 16110,
+      "current": 16133
+    },
+    {
+      "measure": "prose_lines",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 9321,
+      "current": 9331
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 4856,
+      "current": 4858
+    },
+    {
+      "measure": "total:lines",
+      "key": "<cluster>",
+      "baseline": 57179,
+      "current": 57202
+    },
+    {
+      "measure": "total:prose_lines",
+      "key": "<cluster>",
+      "baseline": 31564,
+      "current": 31574
+    }
+  ]
+}

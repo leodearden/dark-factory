@@ -173,9 +173,9 @@ def _isolate_caches():
     """The snapshot unit cache may not cross a test."""
     import dashboard.data.task_snapshot as snapshot_mod
 
-    snapshot_mod._snapshot_cache_clear()
+    snapshot_mod.clear_snapshot_cache()
     yield
-    snapshot_mod._snapshot_cache_clear()
+    snapshot_mod.clear_snapshot_cache()
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -2011,6 +2011,46 @@ class TestDownsample:
                 assert row is not None
                 assert row[0] == 1  # only the recent one
 
+    async def test_retains_relative_to_an_explicit_now(self, tmp_path):
+        """Both cutoffs are measured from *now*; against today's wall clock the
+        recent hour would collapse to one row and the 89-day row would expire."""
+        db_path = tmp_path / 'burndown.db'
+        _create_burndown_db(db_path)
+        now = datetime(2026, 3, 1, 12, 0, tzinfo=UTC)
+        old_hour = (now - timedelta(days=10)).replace(minute=0, second=0, microsecond=0)
+        gap_only_hour = old_hour - timedelta(hours=1)
+        recent_hour = (now - timedelta(days=1)).replace(minute=0, second=0, microsecond=0)
+
+        def at(hour: datetime, minute: int) -> str:
+            return (hour + timedelta(minutes=minute)).isoformat()
+
+        kept_89d = (now - timedelta(days=89)).isoformat()
+        sync_conn = sqlite3.connect(str(db_path))
+        _insert_value(sync_conn, 'proj', at(old_hour, 10))
+        _insert_gap(sync_conn, 'proj', at(old_hour, 50))
+        _insert_gap(sync_conn, 'proj', at(gap_only_hour, 10))
+        _insert_gap(sync_conn, 'proj', at(gap_only_hour, 50))
+        _insert_value(sync_conn, 'proj', at(recent_hour, 10))
+        _insert_value(sync_conn, 'proj', at(recent_hour, 50))
+        _insert_value(sync_conn, 'proj', kept_89d)
+        _insert_value(sync_conn, 'proj', (now - timedelta(days=100)).isoformat())
+        sync_conn.commit()
+        sync_conn.close()
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            await downsample(conn, now=now)
+            async with conn.execute('SELECT ts, state FROM snapshots ORDER BY ts') as cur:
+                got = [tuple(row) for row in await cur.fetchall()]
+
+        expected = [
+            (kept_89d, 'value'),
+            (at(gap_only_hour, 50), 'gap'),
+            (at(old_hour, 10), 'value'),
+            (at(recent_hour, 10), 'value'),
+            (at(recent_hour, 50), 'value'),
+        ]
+        assert got == expected, f'expected {expected}, got {got}'
+
 
 # ---------------------------------------------------------------------------
 # get_burndown_projects
@@ -2362,7 +2402,9 @@ class TestReadSideSeesMeasuredRowsOnly:
         """Wire compatibility with ``redux_api.shape_burndown`` (task 5592 owns it):
         a gap row contributes nothing — not zeros — to either block."""
         from dashboard.data.redux_api import shape_burndown
+        from dashboard.project_labels import ProjectLabels
 
+        no_configured_roots = ProjectLabels.of_roots(())
         with_gap, without_gap = tmp_path / 'with_gap.db', tmp_path / 'without_gap.db'
         for path in (with_gap, without_gap):
             _migrated_pre_delta1_db(path)
@@ -2375,8 +2417,8 @@ class TestReadSideSeesMeasuredRowsOnly:
             conn.commit()
             conn.close()
 
-        shaped = shape_burndown({'/p/proj': await _series_of(with_gap)})
-        expected = shape_burndown({'/p/proj': await _series_of(without_gap)})
+        shaped = shape_burndown({'/p/proj': await _series_of(with_gap)}, labels=no_configured_roots)
+        expected = shape_burndown({'/p/proj': await _series_of(without_gap)}, labels=no_configured_roots)
 
         assert shaped['BURNDOWN_BY_PROJECT'] == expected['BURNDOWN_BY_PROJECT']
         assert shaped['BURNDOWN'] == expected['BURNDOWN']
@@ -2937,8 +2979,8 @@ class TestCollectSnapshotExplicitRollback:
         """An unexpected exception inside collect_snapshot must trigger conn.rollback()
         and re-raise the original exception.
 
-        Injection point: patch `dashboard.data.burndown.datetime` so that
-        `datetime.now(UTC).isoformat()` raises RuntimeError('clock failure').
+        Injection point: patch `dashboard.data.burndown.resolve_now` so that
+        the cycle's clock read raises RuntimeError('clock failure').
         This fires before any per-project try/except, so the outer except
         must catch it, call rollback, then re-raise.
 
@@ -2960,16 +3002,13 @@ class TestCollectSnapshotExplicitRollback:
 
         conn.rollback = rollback_spy
 
-        # Patch datetime.now to raise RuntimeError — fires before any per-project try/except
-        class _FakeDatetime:
-            @staticmethod
-            def now(tz=None):
-                raise RuntimeError('clock failure')
-
         try:
             with (
                 _patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
-                _patch('dashboard.data.burndown.datetime', _FakeDatetime),
+                _patch(
+                    'dashboard.data.burndown.resolve_now',
+                    side_effect=RuntimeError('clock failure'),
+                ),
                 pytest.raises(RuntimeError, match='clock failure'),
             ):
                 await collect_snapshot(conn, config, client=dummy_client)
@@ -3002,11 +3041,9 @@ class TestCollectSnapshotPerRootBudget:
         pre-empts a unit still inside its own bounds. Ceiling: half one
         collector cycle, so cycle N is done before cycle N+1 starts even when a
         root spends its whole budget."""
-        import dashboard.loops as loops_module
-
         budget = burndown_module._SNAPSHOT_PER_ROOT_BUDGET
         floor = burndown_module._SNAPSHOT_UNIT_WORST_CASE_SECONDS
-        ceiling = loops_module._SAMPLE_INTERVAL_SECONDS / 2
+        ceiling = burndown_module.SAMPLE_INTERVAL_SECONDS / 2
 
         assert budget >= floor, (
             f'_SNAPSHOT_PER_ROOT_BUDGET ({budget}) is below the snapshot unit\'s own '
@@ -3015,8 +3052,8 @@ class TestCollectSnapshotPerRootBudget:
         )
         assert budget <= ceiling, (
             f'_SNAPSHOT_PER_ROOT_BUDGET ({budget}) is above HALF one collector '
-            f'cycle ({ceiling} s = _SAMPLE_INTERVAL_SECONDS / 2 = '
-            f'{loops_module._SAMPLE_INTERVAL_SECONDS} / 2).'
+            f'cycle ({ceiling} s = SAMPLE_INTERVAL_SECONDS / 2 = '
+            f'{burndown_module.SAMPLE_INTERVAL_SECONDS} / 2).'
         )
 
 
