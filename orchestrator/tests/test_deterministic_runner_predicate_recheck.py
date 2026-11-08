@@ -19,6 +19,7 @@ import pytest
 from escalation.authority import L2_AUTO_CLOSE_DENY_CATEGORIES
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
+from shared.milestone_rearm import scheduled_fire_at
 
 from orchestrator.deterministic_runner import DETERMINISTIC_AGENT_ROLE, DeterministicRunner
 from orchestrator.event_store import EventStore, EventType
@@ -286,7 +287,9 @@ class TestRearmOnNotYet:
         assert write['mode'] == 'merge'
         payload = write['metadata']
         assert set(payload) == {'milestone', 'predicate_recheck', 'predicate_verdict'}
-        assert payload['milestone'] == {**DECLARED_MILESTONE, 'at': next_at}
+        assert payload['milestone'] == {
+            **DECLARED_MILESTONE, 'at': next_at, 'scheduled_at': DATED['at'],
+        }
         assert payload['predicate_recheck'] == {
             'consecutive': 1,
             'first_rearmed_at': FIXED_NOW.isoformat(),
@@ -321,9 +324,9 @@ class TestRearmOnNotYet:
         assert record['consecutive'] == 2
         assert record['first_rearmed_at'] == FIXED_NOW.isoformat()
         assert record['last_checked_at'] == clock.now.isoformat()
-        assert scheduler.task['metadata']['milestone']['at'] == (
-            clock.now + timedelta(seconds=86400)
-        ).isoformat()
+        milestone = scheduler.task['metadata']['milestone']
+        assert milestone['at'] == (clock.now + timedelta(seconds=86400)).isoformat()
+        assert scheduled_fire_at(milestone) == DATED['at']
 
 
 @pytest.mark.asyncio
