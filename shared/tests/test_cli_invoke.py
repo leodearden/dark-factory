@@ -4354,6 +4354,9 @@ class TestRunSubprocessWatchdog:
         terminate_pg_mock.assert_called_once()
 
 
+_EXTENSION_READS_VALVE_SECS = 2.0
+
+
 class TestRunSubprocessWorkingRegimeProgressExtension:
     """Working-regime progress-extension tests for _run_subprocess (task 2360).
 
@@ -4377,12 +4380,37 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
     ``_WATCHDOG_WORKING_POLL_SECS`` does not exist yet.
     """
 
+    _HELD_READ = 1
+    _WITNESS_READS = _HELD_READ + 2
+
     @staticmethod
-    def _make_delayed_success_proc(delay_secs, stdout_bytes):
-        """proc whose communicate() sleeps *delay_secs* then returns *stdout_bytes* once."""
+    def _make_delayed_success_proc(
+        delay_secs, stdout_bytes, *, reads_observed, min_reads,
+        working_idle_secs, absolute_cap_secs,
+    ):
+        """proc whose communicate() returns *stdout_bytes* once, after at least
+        *delay_secs* AND once *min_reads* transcript reads have started (bounded
+        by _EXTENSION_READS_VALVE_SECS).  The fixed lifetime alone let a starved
+        loop break at ``comm_task in done`` before any read — see the READS GATE
+        note at
+        shared/tests/test_cli_invoke_transcript_offloop.py::_make_delayed_success_proc.
+
+        Refuses extension bounds the valve could reach, so a valve trip ends as a
+        normal exit reported by the reads witness, never as an idle- or cap-kill.
+        """
+        import time as _time
+
+        assert delay_secs + _EXTENSION_READS_VALVE_SECS < min(working_idle_secs, absolute_cap_secs), (
+            f'delay_secs={delay_secs} + valve={_EXTENSION_READS_VALVE_SECS} must stay under '
+            f'working_idle_secs={working_idle_secs} and absolute_cap_secs={absolute_cap_secs}, '
+            f'or a valve trip is reported as a kill instead of by the reads witness'
+        )
 
         async def communicate_side_effect(input=None):  # noqa: A002
             await asyncio.sleep(delay_secs)
+            deadline = _time.monotonic() + _EXTENSION_READS_VALVE_SECS
+            while len(reads_observed) < min_reads and _time.monotonic() < deadline:
+                await asyncio.sleep(0.005)
             return (stdout_bytes, b'')
 
         proc = MagicMock()
@@ -4465,6 +4493,38 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
 
         return _side_effect, decided_at
 
+    @classmethod
+    def _recorded_with_held_read(cls, turns_side_effect, reads, *, held_secs):
+        """count_transcript_turns side_effect appending each read's index to *reads*
+        as it STARTS, holding read ``_HELD_READ`` for *held_secs*, then delegating.
+
+        The read runs on the asyncio.to_thread worker, so the hold blocks no loop
+        yet guarantees the kill checks after the held read run at least
+        *held_secs* after it started.  *reads* is appended on the worker thread
+        and read on the loop thread; at most one read is in flight, so this is safe.
+        """
+        import time as _time
+
+        def _side_effect(config_dir, session_id):
+            index = len(reads)
+            reads.append(index)
+            if index == cls._HELD_READ:
+                _time.sleep(held_secs)
+            return turns_side_effect(config_dir, session_id)
+
+        return _side_effect
+
+    @classmethod
+    def _assert_extension_exercised_past_ceiling(cls, reads):
+        """Witness for a run recorded with ``_recorded_with_held_read``."""
+        assert len(reads) >= cls._WITNESS_READS, (
+            f'Expected >= {cls._WITNESS_READS} transcript reads, got {len(reads)}: '
+            f'read 0 latches seen_turn, read {cls._HELD_READ} is the extension poll held '
+            f'past the old ceiling, and read {cls._HELD_READ + 1} starts only after the '
+            f'kill checks that followed it let the run live. Fewer reads means the run '
+            f'exited without the working-regime extension being exercised past the ceiling.'
+        )
+
     async def test_productive_run_survives_ceiling_and_completes_normally(self, tmp_path):
         """(a) PRODUCTIVE-SURVIVES-CEILING: transcript turns keep growing across the
         old timeout_seconds ceiling; the process eventually completes normally with
@@ -4481,23 +4541,32 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
             'result': 'ok', 'subtype': 'success', 'cost_usd': 0.02,
             'duration_ms': 300, 'num_turns': 8, 'session_id': sid,
         }).encode()
-        proc = self._make_delayed_success_proc(0.3, valid_json)
+        old_ceiling = 0.1
+        working_idle_secs, absolute_cap_secs = 3.0, 5.0
+        reads: list[int] = []
+        proc = self._make_delayed_success_proc(
+            0.3, valid_json, reads_observed=reads, min_reads=self._WITNESS_READS,
+            working_idle_secs=working_idle_secs, absolute_cap_secs=absolute_cap_secs,
+        )
+        turns = self._recorded_with_held_read(
+            self._always_growing_turns(), reads, held_secs=old_ceiling,
+        )
 
         async def fake_exec(*args, **kwargs):
             return proc
 
         with (
             patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec),
-            patch('shared.cli_invoke.count_transcript_turns', side_effect=self._always_growing_turns()),
+            patch('shared.cli_invoke.count_transcript_turns', side_effect=turns),
             patch('shared.cli_invoke._WATCHDOG_POLL_SECS', 0.02),
             patch('shared.cli_invoke._WATCHDOG_WORKING_POLL_SECS', 0.02),
         ):
             t0 = _time.monotonic()
             result = await _run_subprocess(
                 ['fake'], cwd=tmp_path, env={}, model='opus',
-                timeout_seconds=0.1, startup_grace_secs=0.02,
+                timeout_seconds=old_ceiling, startup_grace_secs=0.02,
                 session_id=sid, config_dir=cfg_dir,
-                working_idle_secs=1.0, absolute_cap_secs=5.0,
+                working_idle_secs=working_idle_secs, absolute_cap_secs=absolute_cap_secs,
             )
             wall = _time.monotonic() - t0
 
@@ -4505,10 +4574,13 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
             'Expected the productive run to survive the old 0.1s ceiling and complete '
             'normally — continuous transcript growth must extend the working regime.'
         )
+        self._assert_extension_exercised_past_ceiling(reads)
         assert result.duration_ms >= 100, (
             f'Expected duration_ms >= old ceiling (100ms), got {result.duration_ms}'
         )
-        assert wall < 2.0, f'Expected normal completion well under the 5s cap, got {wall:.3f}s'
+        assert wall < 2.0, (
+            f'Expected normal completion well under the {absolute_cap_secs}s cap, got {wall:.3f}s'
+        )
 
     async def test_idle_kill_fires_after_progress_stops_not_at_old_ceiling(self, tmp_path):
         """(b) IDLE-KILL: transcript turns grow then go static.  Kill fires after
@@ -4588,31 +4660,41 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
             'result': 'ok', 'subtype': 'success', 'cost_usd': 0.01,
             'duration_ms': 200, 'num_turns': 1, 'session_id': sid,
         }).encode()
-        proc = self._make_delayed_success_proc(0.2, valid_json)
+        old_ceiling = 0.05
+        working_idle_secs, absolute_cap_secs = 3.0, 5.0
+        reads: list[int] = []
+        proc = self._make_delayed_success_proc(
+            0.2, valid_json, reads_observed=reads, min_reads=self._WITNESS_READS,
+            working_idle_secs=working_idle_secs, absolute_cap_secs=absolute_cap_secs,
+        )
+        turns = self._recorded_with_held_read(
+            self._flat_turns(1), reads, held_secs=old_ceiling,
+        )
 
         async def fake_exec(*args, **kwargs):
             return proc
 
         with (
             patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec),
-            patch('shared.cli_invoke.count_transcript_turns', side_effect=self._flat_turns(1)),
+            patch('shared.cli_invoke.count_transcript_turns', side_effect=turns),
             patch('shared.cli_invoke._WATCHDOG_POLL_SECS', 0.02),
             patch('shared.cli_invoke._WATCHDOG_WORKING_POLL_SECS', 0.02),
         ):
             t0 = _time.monotonic()
             result = await _run_subprocess(
                 ['fake'], cwd=tmp_path, env={}, model='opus',
-                timeout_seconds=0.05, startup_grace_secs=0.02,
+                timeout_seconds=old_ceiling, startup_grace_secs=0.02,
                 session_id=sid, config_dir=cfg_dir,
-                working_idle_secs=0.5, absolute_cap_secs=5.0,
+                working_idle_secs=working_idle_secs, absolute_cap_secs=absolute_cap_secs,
             )
             wall = _time.monotonic() - t0
 
         assert result.timed_out is False, (
-            'A single long synchronous tool call (flat turn count) between the old '
-            '0.05s ceiling and the 0.5s idle bound must survive, not be false-killed '
-            'at the old ceiling (B6 safety).'
+            f'A single long synchronous tool call (flat turn count) between the old '
+            f'{old_ceiling}s ceiling and the {working_idle_secs}s idle bound must survive, '
+            f'not be false-killed at the old ceiling (B6 safety).'
         )
+        self._assert_extension_exercised_past_ceiling(reads)
         assert result.duration_ms >= 50, (
             f'Expected duration_ms >= old ceiling (50ms), got {result.duration_ms}'
         )
