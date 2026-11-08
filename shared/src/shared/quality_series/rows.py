@@ -12,6 +12,7 @@ import bisect
 import json
 import os
 import sqlite3
+import time
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -19,10 +20,17 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Generic, TypeVar
 
-from shared.quality_series.git_lines import ModuleLines
+from shared.quality_series.git_lines import (
+    GitObjectMissing,
+    GitTimeout,
+    LandedLines,
+    ModuleLines,
+    landed_lines,
+)
 from shared.quality_series.landings import Landing, parse_utc
 
 __all__ = [
+    'FIRST_UNIT_GIT_FLOOR_S',
     'IMPLEMENTER_CLASS_ROLES',
     'CharterClass',
     'CharterClassSource',
@@ -33,6 +41,7 @@ __all__ = [
     'ReviewRoundsSource',
     'SourceEpochs',
     'UnknownCharterClass',
+    'module_allocation',
     'rows_for',
     'unit_heads',
 ]
@@ -165,6 +174,9 @@ class Cost:
     execute_iterations: int | None
     turns: int | None
     turns_capped: bool
+    code_lines: int | None
+    src_lines: int | None
+    test_lines: int | None
     review_rounds: int | None
     review_rounds_source: ReviewRoundsSource | None
     charter_class: CharterClass | None
@@ -181,6 +193,10 @@ class Cost:
         _invariant(self.turns is not None or not self.turns_capped,
                    'a turns cap needs a turns count', turns=self.turns,
                    turns_capped=self.turns_capped)
+        lines = (self.code_lines, self.src_lines, self.test_lines)
+        _invariant(len({value is None for value in lines}) == 1,
+                   'the three line fields are None together', code_lines=self.code_lines,
+                   src_lines=self.src_lines, test_lines=self.test_lines)
         _invariant((self.review_rounds is None) == (self.review_rounds_source is None),
                    'review_rounds and its source are None together',
                    review_rounds=self.review_rounds,
@@ -448,7 +464,9 @@ def _charter_class(sources: _Sources, landing: Landing) -> _Charter | None:
     return classified[-1] if classified else None
 
 
-def _cost(sources: _Sources, landing: Landing, repo: str | os.PathLike[str]) -> Cost:
+def _cost(
+    sources: _Sources, landing: Landing, repo: str | os.PathLike[str], lines: LandedLines | None
+) -> Cost:
     epochs = sources.epochs
     invocations = (sources.window(sources.invocations, landing)
                    if _covers(epochs.invocations, landing) else [])
@@ -466,6 +484,9 @@ def _cost(sources: _Sources, landing: Landing, repo: str | os.PathLike[str]) -> 
         execute_iterations=sum(iterations) if iterations else None,
         turns=sum(t.turns for t in turns) if turns else None,
         turns_capped=any(t.capped for t in turns),
+        code_lines=None if lines is None else lines.code_lines,
+        src_lines=None if lines is None else lines.src_lines,
+        test_lines=None if lines is None else lines.test_lines,
         review_rounds=review_rounds,
         review_rounds_source=review_rounds_source,
         charter_class=None if charter is None else charter.charter_class,
@@ -480,28 +501,79 @@ def _units(landings: Sequence[Landing]) -> list[tuple[Landing, ...]]:
     return [tuple(unit) for unit in members.values()]
 
 
+FIRST_UNIT_GIT_FLOOR_S = 60.0
+"""The git timeout the first unit of a call always gets, so a spent budget still makes progress."""
+
+
+class _BudgetSpent(Exception):
+    pass
+
+
+def _unit_lines(
+    repo: str | os.PathLike[str], head: Landing, timeout_s: float
+) -> LandedLines | None:
+    """The unit's landed lines; None when they are permanently unmeasurable."""
+    if head.base_sha is None:
+        return None
+    try:
+        return landed_lines(repo, head.base_sha, head.merge_sha, timeout_s)
+    except GitObjectMissing:
+        return None
+
+
+def _git_timeout(first: bool, deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if first:
+        return max(FIRST_UNIT_GIT_FLOOR_S, remaining)
+    if remaining <= 0:
+        raise _BudgetSpent
+    return remaining
+
+
 def rows_for(
     landings: Sequence[Landing],
     runs_db: sqlite3.Connection,
     repo: str | os.PathLike[str],
     git_budget_s: float,
 ) -> list[LandingRow]:
-    """One LandingRow per landing, in the order given (ordinal order from landings())."""
+    """LandingRows for the longest unit-atomic prefix of ``landings`` measurable in the budget.
+
+    Units are measured in the order given (ordinal order from landings()); the first always gets
+    at least FIRST_UNIT_GIT_FLOOR_S of git time, each later one the remaining budget. A spent
+    budget or a GitTimeout ends the call before that unit, never inside it, and no row is ever
+    emitted with lines missing for budget reasons: the caller resumes with
+    ``landings[len(rows):]``.
+    """
+    deadline = time.monotonic() + git_budget_s
     sources = _Sources.load(runs_db, sorted({landing.task_id for landing in landings}))
     rows: list[LandingRow] = []
-    for unit in _units(landings):
+    for index, unit in enumerate(_units(landings)):
+        head = unit[0]
+        try:
+            timeout_s = _git_timeout(index == 0, deadline) if head.base_sha is not None else 0.0
+            lines = _unit_lines(repo, head, timeout_s) if head.base_sha is not None else None
+        except (_BudgetSpent, GitTimeout):
+            break
         unit_outcomes = _unit_outcomes(sources, unit)
         rows.extend(
             LandingRow(
                 landing=member,
                 outcomes=_outcomes(sources, unit_outcomes, member),
-                cost=_cost(sources, member, repo),
-                modules=(),
+                cost=_cost(sources, member, repo, lines),
+                modules=() if lines is None else lines.modules,
                 rule_vintage=sources.epochs,
             )
             for member in unit
         )
     return rows
+
+
+def module_allocation(row: LandingRow) -> tuple[tuple[str, float], ...]:
+    """Each module's share of the row's src lines; empty when it touched no src lines."""
+    total = sum(module.src_lines for module in row.modules)
+    if total == 0:
+        return ()
+    return tuple((module.module, module.src_lines / total) for module in row.modules)
 
 
 def unit_heads(rows: Sequence[LandingRow]) -> list[LandingRow]:

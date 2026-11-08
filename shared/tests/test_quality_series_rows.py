@@ -408,14 +408,16 @@ class TestLines:
 
 
 class TestGitBudget:
-    def test_a_spent_budget_still_measures_the_first_unit_whole(self, outcomes_scenario):
+    def test_a_spent_budget_measures_the_first_unit_whole_then_stops_before_git(
+        self, outcomes_scenario
+    ):
         s = outcomes_scenario
         batch = landings(s.db.conn, s.repo.root, since_cursor=None).landings
         rows = rows_for(batch[2:], s.db.conn, s.repo.root, git_budget_s=0)
         assert [(r.landing.task_id, r.landing.merge_sha) for r in rows] == [
-            ('103', s.m3), ('104', s.m3), ('105', s.m3),
+            ('103', s.m3), ('104', s.m3), ('105', s.m3), ('106', s.side),
         ]
-        assert all(r.cost.code_lines is not None for r in rows)
+        assert all(r.cost.code_lines is not None for r in rows[:3])
 
     def test_resuming_with_the_rest_continues_from_the_next_unit(
         self, outcomes_scenario, outcome_rows
