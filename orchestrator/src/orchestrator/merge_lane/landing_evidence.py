@@ -1758,6 +1758,7 @@ async def validate_landing_evidence(
     candidate_sha: str | None = None,
     pattern_template: str | None = None,
     delivered_checks: list[dict[str, Any]] | None = None,
+    checks_enabled: bool = True,
 ) -> LandingVerdict:
     """Validate already-landed evidence for *task_id* on *branch*.
 
@@ -1845,6 +1846,12 @@ async def validate_landing_evidence(
             If ``delivered_checks_state == 'unwired'`` is still appearing in
             escalations after 4500 has landed, that is the bug: one of the
             seven sites regressed to the default.
+        checks_enabled: The project's ``delivered_checks.enabled`` leaf.
+            False disarms the second accept path, recorded as
+            ``probe['delivered_checks_outcome'] == 'disabled'``. A caller
+            holding the project config must pass it, because a real
+            ``GitOps.config`` carries no ``delivered_checks`` (see the KILL
+            SWITCH paragraph of :func:`_delivered_checks_differential`).
 
     Returns:
         A :class:`LandingVerdict`.
@@ -1882,6 +1889,7 @@ async def validate_landing_evidence(
         # apply ONLY the FIX 1' effect-present guard to candidate_sha.
         return await _candidate_effect_verdict(
             git_ops, candidate_sha, delivered_checks, probe, method=method,
+            checks_enabled=checks_enabled,
         )
 
     citation = await git_ops.find_task_citation_commit(
@@ -1942,7 +1950,7 @@ async def validate_landing_evidence(
         # a pre-branch baseline (see _differential_parent_ref).
         if delivered_checks and await _delivered_checks_differential(
             git_ops, effect_check_sha, delivered_checks, probe,
-            anchor_is_branch_tip=anchor_is_branch_tip,
+            anchor_is_branch_tip=anchor_is_branch_tip, enabled=checks_enabled,
         ):
             return _accept(citation)
         return _reject(LandingReason.effect_absent)
