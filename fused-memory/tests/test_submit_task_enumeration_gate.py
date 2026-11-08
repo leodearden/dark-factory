@@ -25,25 +25,22 @@ from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
+from reconciliation.enumeration_fixtures import (
+    DELETED_0D5,
+    FINDING_IDS,
+    LIVE_21F,
+    LIVE_23E,
+    LIVE_B3F,
+    LIVE_IDS,
+    VALID_SCOPE,
+    fake_memory_service,
+)
 
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 from fused_memory.config.schema import TaskmasterConfig
 from fused_memory.server.tools import create_mcp_server
 
 RECON_AGENT = 'recon-stage-task_knowledge_sync'
-
-LIVE_B3F = 'b3f55b47-0879-49e0-a26d-53bf6ea9689a'
-LIVE_21F = '21f78de1-a5f3-4259-b907-16c8f2328e2f'
-LIVE_23E = '23eff0cd-8515-40fb-9b3e-9a5be19cbc0c'
-DELETED_0D5 = '0d542614-874b-4003-b136-76dd9d8b40f8'
-LIVE_IDS = (LIVE_B3F, LIVE_21F, LIVE_23E)
-
-VALID_SCOPE = {
-    'stores': ['mem0'],
-    'categories': ['observations_and_summaries', 'procedural_knowledge'],
-    'exhaustive': False,
-    'note': 'Stage-1 search over two categories only',
-}
 
 GATE_DESCRIPTION = '\n'.join([
     'THE FOUR ENTRIES:',
@@ -88,15 +85,7 @@ def project_root(tmp_path) -> str:
 @pytest.fixture
 def memory_service() -> AsyncMock:
     """get_memory_by_id resolves the three live entries and misses the rest."""
-
-    async def _get(_project_id: str, memory_id: str) -> dict[str, Any] | None:
-        if memory_id in LIVE_IDS:
-            return {'id': memory_id, 'content': 'x', 'metadata': {}}
-        return None
-
-    service = AsyncMock()
-    service.get_memory_by_id = AsyncMock(side_effect=_get)
-    return service
+    return fake_memory_service(live=LIVE_IDS)
 
 
 @pytest.fixture
@@ -372,10 +361,6 @@ class TestUpdateTask:
 # --------------------------------------------------------------------------- #
 
 SEED_STAMP = '2026-01-01T00:00:00+00:00'
-FINDING_IDS = [
-    'f11018d4-be96-456b-9ab9-cf6814155500',
-    '00004132-cd91-41dc-a059-bcd698bdd73c',
-]
 
 # Gate 5537 as stored after an earlier write: the four-entry enumeration, a
 # stale stamp, a stale exception for an unrelated id, and attached hints.

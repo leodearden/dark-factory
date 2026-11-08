@@ -39,23 +39,21 @@ from fused_memory.reconciliation.predicate_contradiction import (
 )
 from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
 from fused_memory.utils.validation import validate_full_uuid
+from reconciliation.enumeration_fixtures import (
+    DELETED_0D5,
+    FINDING_IDS,
+    LIVE_21F,
+    LIVE_23E,
+    LIVE_B3F,
+    VALID_SCOPE,
+    fake_memory_service,
+)
 
 FIXED_NOW = datetime(2026, 9, 28, 12, 0, tzinfo=UTC)
 RECON_AGENT = 'recon-stage-task_knowledge_sync'
 
-# Gate 5537's enumeration at filing time: three live entries plus 0d542614,
-# which had been deleted ~11 minutes before the gate shipped.
-LIVE_B3F = 'b3f55b47-0879-49e0-a26d-53bf6ea9689a'
-LIVE_21F = '21f78de1-a5f3-4259-b907-16c8f2328e2f'
-LIVE_23E = '23eff0cd-8515-40fb-9b3e-9a5be19cbc0c'
-DELETED_0D5 = '0d542614-874b-4003-b136-76dd9d8b40f8'
-
-# Canonical UUIDs that are NOT Mem0 ids: Stage-1 finding ids and Graphiti edge
-# uuids, both of which get_memory_by_id (a Mem0 point read) reports as absent.
-FINDING_IDS = [
-    'f11018d4-be96-456b-9ab9-cf6814155500',
-    '00004132-cd91-41dc-a059-bcd698bdd73c',
-]
+# Graphiti edge uuids: canonical, but not Mem0 ids, so get_memory_by_id (a
+# Mem0 point read) reports them as absent, like FINDING_IDS.
 GRAPHITI_EDGE_IDS = [
     '4c1f0a57-6a8e-4d1b-9a53-2d7e1f0c9b11',
     '9e2b7d44-1f3c-4a6e-8b0d-5c7a3e9f2d22',
@@ -77,27 +75,6 @@ GATE_5533_SCALARS: dict[str, Any] = {
     'execution_class': 'operational',
     'operational_mode': 'gate',
 }
-
-
-def memory_service(
-    *,
-    live: tuple[str, ...] = (),
-    raising: dict[str, Exception] | None = None,
-) -> AsyncMock:
-    """A memory service whose point read resolves *live* ids, raises for the
-    ids in *raising*, and returns None (a genuine miss) for everything else."""
-    raising = raising or {}
-
-    async def _get(_project_id: str, memory_id: str) -> dict[str, Any] | None:
-        if memory_id in raising:
-            raise raising[memory_id]
-        if memory_id in live:
-            return {'id': memory_id, 'content': 'x', 'metadata': {}}
-        return None
-
-    service = AsyncMock()
-    service.get_memory_by_id = AsyncMock(side_effect=_get)
-    return service
 
 
 @pytest.fixture
@@ -166,7 +143,7 @@ class TestPassThrough:
             **GATE_5533_SCALARS,
         }
         description = f'- {DELETED_0D5} likeliest deletion target'
-        service = memory_service(live=(LIVE_B3F,))
+        service = fake_memory_service(live=(LIVE_B3F,))
 
         result = await run_gate(
             project_root, metadata, service=service, description=description,
@@ -187,7 +164,7 @@ class TestPassThrough:
         self, project_root, metadata,
     ):
         description = 'a description'
-        service = memory_service()
+        service = fake_memory_service()
 
         result = await run_gate(
             project_root, metadata, service=service, description=description,
@@ -207,7 +184,7 @@ class TestPassThrough:
     ):
         metadata = dict(GATE_5533_SCALARS)
         description = f'Stage 1 finding {metadata["stage1_finding_id"]}'
-        service = memory_service(live=(metadata['mem0_primary_target'],))
+        service = fake_memory_service(live=(metadata['mem0_primary_target'],))
 
         result = await run_gate(
             project_root, metadata, service=service, description=description,
@@ -235,8 +212,8 @@ class TestPassThrough:
         }
         description = f'- {DELETED_0D5} likeliest deletion target'
         live = (LIVE_B3F, LIVE_21F, LIVE_23E)
-        dict_service = memory_service(live=live)
-        string_service = memory_service(live=live)
+        dict_service = fake_memory_service(live=live)
+        string_service = fake_memory_service(live=live)
 
         from_dict = await run_gate(
             project_root, metadata, service=dict_service, description=description,
@@ -335,7 +312,7 @@ class TestTruncatedFragmentShape:
         self, project_root, case,
     ):
         metadata, offenders = TRUNCATED_PAYLOADS[case]
-        service = memory_service(live=(LIVE_B3F, LIVE_21F, LIVE_23E))
+        service = fake_memory_service(live=(LIVE_B3F, LIVE_21F, LIVE_23E))
 
         result = await run_gate(
             project_root, metadata, service=service, is_filing=True,
@@ -363,7 +340,7 @@ class TestTruncatedFragmentShape:
         original = json.loads(json.dumps(metadata))
 
         result = await run_gate(
-            project_root, metadata, service=memory_service(), is_filing=False,
+            project_root, metadata, service=fake_memory_service(), is_filing=False,
         )
 
         assert result.rejection is None
@@ -384,7 +361,7 @@ class TestTruncatedFragmentShape:
         self, project_root, case, is_filing,
     ):
         metadata = dict(NOT_FRAGMENTS[case])
-        service = memory_service()
+        service = fake_memory_service()
 
         result = await run_gate(
             project_root, metadata, service=service, is_filing=is_filing,
@@ -420,7 +397,7 @@ class TestLiveness:
 
         result = await run_gate(
             project_root, payload,
-            service=memory_service(live=(LIVE_B3F, LIVE_21F, LIVE_23E)),
+            service=fake_memory_service(live=(LIVE_B3F, LIVE_21F, LIVE_23E)),
         )
 
         assert result.rejection is None
@@ -448,7 +425,7 @@ class TestLiveness:
         self, project_root, caplog,
     ):
         metadata = {'mem0_falsified_entries': [LIVE_B3F, LIVE_21F]}
-        service = memory_service(
+        service = fake_memory_service(
             live=(LIVE_B3F,), raising={LIVE_21F: TimeoutError('qdrant timeout')},
         )
 
@@ -484,7 +461,7 @@ class TestLiveness:
             'x_deleted_before_gate_open': [DELETED_0D5],
             'x_unreachable': [LIVE_B3F, LIVE_23E],
         }
-        service = memory_service(raising={
+        service = fake_memory_service(raising={
             LIVE_B3F: RuntimeError('backend down'),
             LIVE_23E: TimeoutError('qdrant timeout'),
         })
@@ -509,7 +486,7 @@ class TestLiveness:
         }
 
         result = await run_gate(
-            project_root, metadata, service=memory_service(live=(LIVE_B3F,)),
+            project_root, metadata, service=fake_memory_service(live=(LIVE_B3F,)),
         )
 
         assert result.metadata['mem0_falsified_entries'] == [LIVE_B3F]
@@ -531,7 +508,7 @@ class TestLiveness:
                 'observed_members': [DELETED_0D5], 'authoritative': False,
             }},
         }
-        service = memory_service(live=(LIVE_B3F, LIVE_21F, LIVE_23E))
+        service = fake_memory_service(live=(LIVE_B3F, LIVE_21F, LIVE_23E))
 
         result = await run_gate(project_root, metadata, service=service)
 
@@ -546,7 +523,7 @@ class TestLiveness:
             'mem0_falsified_entries': [LIVE_B3F, DELETED_0D5],
             'x_related_memories': [DELETED_0D5, LIVE_21F, LIVE_B3F],
         }
-        service = memory_service(live=(LIVE_B3F, LIVE_21F))
+        service = fake_memory_service(live=(LIVE_B3F, LIVE_21F))
 
         result = await run_gate(project_root, metadata, service=service)
 
@@ -595,7 +572,7 @@ class TestLiveness:
 
         await run_gate(
             project_root, metadata,
-            service=memory_service(
+            service=fake_memory_service(
                 live=(LIVE_B3F,), raising={LIVE_21F: TimeoutError('slow')},
             ),
         )
@@ -645,7 +622,7 @@ class TestDescriptionAnnotation:
         metadata = {'mem0_falsified_entries': [LIVE_B3F, DELETED_0D5]}
 
         result = await run_gate(
-            project_root, metadata, service=memory_service(live=(LIVE_B3F,)),
+            project_root, metadata, service=fake_memory_service(live=(LIVE_B3F,)),
             description=GATE_5537_DESCRIPTION,
         )
 
@@ -668,7 +645,7 @@ class TestDescriptionAnnotation:
 
         result = await run_gate(
             project_root, metadata,
-            service=memory_service(
+            service=fake_memory_service(
                 live=(LIVE_B3F,), raising={LIVE_21F: TimeoutError('slow')},
             ),
             description=description,
@@ -682,7 +659,7 @@ class TestDescriptionAnnotation:
     @pytest.mark.asyncio
     async def test_annotating_twice_adds_no_second_annotation(self, project_root):
         metadata = {'mem0_falsified_entries': [LIVE_B3F, DELETED_0D5]}
-        service = memory_service(live=(LIVE_B3F,))
+        service = fake_memory_service(live=(LIVE_B3F,))
 
         first = await run_gate(
             project_root, metadata, service=service,
@@ -700,7 +677,7 @@ class TestDescriptionAnnotation:
     async def test_a_none_description_stays_none(self, project_root):
         result = await run_gate(
             project_root, {'mem0_falsified_entries': [LIVE_B3F, DELETED_0D5]},
-            service=memory_service(live=(LIVE_B3F,)), description=None,
+            service=fake_memory_service(live=(LIVE_B3F,)), description=None,
         )
 
         assert result.description is None
@@ -719,7 +696,7 @@ class TestDescriptionAnnotation:
         ])
 
         result = await run_gate(
-            project_root, metadata, service=memory_service(live=(LIVE_B3F,)),
+            project_root, metadata, service=fake_memory_service(live=(LIVE_B3F,)),
             description=description,
         )
 
@@ -727,7 +704,7 @@ class TestDescriptionAnnotation:
 
     @pytest.mark.asyncio
     async def test_the_description_is_never_a_detection_source(self, project_root):
-        service = memory_service(live=(LIVE_B3F,))
+        service = fake_memory_service(live=(LIVE_B3F,))
         description = f'- {DELETED_0D5} likeliest deletion target'
 
         result = await run_gate(
@@ -747,7 +724,7 @@ class TestDescriptionAnnotation:
 
         result = await run_gate(
             project_root, {'mem0_falsified_entries': [LIVE_B3F, DELETED_0D5]},
-            service=memory_service(live=(LIVE_B3F,)), description=description,
+            service=fake_memory_service(live=(LIVE_B3F,)), description=description,
         )
 
         assert result.description == description
@@ -771,15 +748,15 @@ STALE_EXCEPTIONS = [
 REVERIFIED = {
     'all-live': (
         [LIVE_B3F, LIVE_21F],
-        lambda: memory_service(live=(LIVE_B3F, LIVE_21F)),
+        lambda: fake_memory_service(live=(LIVE_B3F, LIVE_21F)),
     ),
     'one-absent': (
         [LIVE_B3F, DELETED_0D5],
-        lambda: memory_service(live=(LIVE_B3F,)),
+        lambda: fake_memory_service(live=(LIVE_B3F,)),
     ),
     'one-inconclusive': (
         [LIVE_B3F, LIVE_21F],
-        lambda: memory_service(
+        lambda: fake_memory_service(
             live=(LIVE_B3F,), raising={LIVE_21F: TimeoutError('slow')},
         ),
     ),
@@ -820,7 +797,7 @@ class TestGateOwnedKeys:
         }
 
         result = await run_gate(
-            project_root, metadata, service=memory_service(live=(LIVE_B3F,)),
+            project_root, metadata, service=fake_memory_service(live=(LIVE_B3F,)),
         )
 
         assert result.metadata[X_LIVENESS_REVERIFIED_AT_KEY] == FIXED_NOW.isoformat()
@@ -833,7 +810,7 @@ class TestGateOwnedKeys:
         }
 
         result = await run_gate(
-            project_root, metadata, service=memory_service(live=(LIVE_B3F,)),
+            project_root, metadata, service=fake_memory_service(live=(LIVE_B3F,)),
         )
 
         assert result.metadata[X_LIVENESS_EXCEPTIONS_KEY] == [
@@ -854,7 +831,7 @@ class TestGateOwnedKeys:
         }
 
         result = await run_gate(
-            project_root, metadata, service=memory_service(live=(LIVE_B3F,)),
+            project_root, metadata, service=fake_memory_service(live=(LIVE_B3F,)),
         )
 
         assert X_LIVENESS_EXCEPTIONS_KEY not in result.metadata
@@ -876,7 +853,7 @@ class TestGateOwnedKeys:
             X_LIVENESS_EXCEPTIONS_KEY: list(STALE_EXCEPTIONS),
         }
 
-        result = await run_gate(project_root, metadata, service=memory_service())
+        result = await run_gate(project_root, metadata, service=fake_memory_service())
 
         assert result.rejection is None
         assert result.metadata == {**GATE_5533_SCALARS, **lists}
@@ -891,7 +868,7 @@ class TestGateOwnedKeys:
         }
 
         result = await run_gate(
-            project_root, metadata, service=memory_service(), is_filing=False,
+            project_root, metadata, service=fake_memory_service(), is_filing=False,
         )
 
         assert X_LIVENESS_REVERIFIED_AT_KEY not in result.metadata
@@ -903,13 +880,6 @@ class TestGateOwnedKeys:
 # --------------------------------------------------------------------------- #
 # CHANGE 2: the structured x_enumeration_scope
 # --------------------------------------------------------------------------- #
-
-VALID_SCOPE = {
-    'stores': ['mem0'],
-    'categories': ['observations_and_summaries', 'procedural_knowledge'],
-    'exhaustive': False,
-    'note': 'Stage-1 search over two categories only',
-}
 
 # Gate 5533's real value: the legacy prose form.
 GATE_5533_SCOPE = (
@@ -953,7 +923,7 @@ def gate_5537_filing(**overrides: Any) -> dict[str, Any]:
 
 
 def gate_5537_service() -> AsyncMock:
-    return memory_service(live=(LIVE_B3F, LIVE_21F, LIVE_23E))
+    return fake_memory_service(live=(LIVE_B3F, LIVE_21F, LIVE_23E))
 
 
 # Every declaration the operational routing turns into an escalating gate,
@@ -1155,7 +1125,7 @@ class TestUpdateMergeMode:
     ):
         result = await run_gate(
             project_root, {'mem0_falsified_entries': [LIVE_B3F, LIVE_21F]},
-            service=memory_service(live=(LIVE_B3F, LIVE_21F)), append=True,
+            service=fake_memory_service(live=(LIVE_B3F, LIVE_21F)), append=True,
         )
 
         assert result.rejection is not None
@@ -1194,7 +1164,7 @@ class TestUpdateMergeMode:
         }
 
         result = await run_gate(
-            project_root, metadata, service=memory_service(), append=True,
+            project_root, metadata, service=fake_memory_service(), append=True,
         )
 
         assert result.rejection is None
@@ -1205,7 +1175,7 @@ class TestUpdateMergeMode:
         self, project_root,
     ):
         metadata = copy.deepcopy(STAGE2_MEMORY_HINTS_ATTACH)
-        service = memory_service()
+        service = fake_memory_service()
 
         result = await run_gate(project_root, metadata, service=service, append=True)
 
@@ -1220,7 +1190,7 @@ class TestUpdateMergeMode:
         metadata = {'mem0_legacy_repeat_entries': list(GATE_5533_FRAGMENTS)}
 
         result = await run_gate(
-            project_root, metadata, service=memory_service(), append=True,
+            project_root, metadata, service=fake_memory_service(), append=True,
         )
 
         assert result.rejection is None
@@ -1239,7 +1209,7 @@ class TestUpdateMergeMode:
         }
 
         result = await run_gate(
-            project_root, metadata, service=memory_service(), append=True,
+            project_root, metadata, service=fake_memory_service(), append=True,
         )
 
         assert result.rejection is None
