@@ -10771,6 +10771,28 @@ def _group_node_ids_by_subproject(
     return groups
 
 
+def _node_id_test_config(
+    module_config: ModuleConfig,
+    node_ids: Sequence[str],
+    *,
+    tree: Path,
+    timeout_secs: int,
+) -> ModuleConfig:
+    """The module's test leg alone, scoped to *node_ids*, forced serial, with a per-test timeout."""
+    return replace(
+        module_config,
+        test_command=_with_pytest_timeout_str(
+            _serial_pytest_str(
+                _scope_to_keyword(module_config.test_command, 'pytest', list(node_ids)),
+                invocation_dir=tree,
+            ),
+            timeout_secs,
+        ),
+        lint_command=None,
+        type_check_command=None,
+    )
+
+
 #: Generous per-test timeout (seconds) injected into the main-tip-sweep
 #: isolated PRE-FILTER's re-run command via ``_with_pytest_timeout_str``.
 #: Same rationale as ``_MERGE_FLAKE_CONFIRM_TIMEOUT_SECS``: the serial
@@ -10853,16 +10875,9 @@ async def _sweep_failure_reproduces_in_isolation(
             return None
 
         for prefix, group_node_ids in groups.items():
-            mc = module_configs[prefix]
-            scoped_cmd = _with_pytest_timeout_str(
-                _serial_pytest_str(
-                    _scope_to_keyword(mc.test_command, 'pytest', group_node_ids),
-                    invocation_dir=worktree,
-                ),
-                _SWEEP_PREFILTER_TIMEOUT_SECS,
-            )
-            scoped_mc = replace(
-                mc, test_command=scoped_cmd, lint_command=None, type_check_command=None,
+            scoped_mc = _node_id_test_config(
+                module_configs[prefix], group_node_ids,
+                tree=worktree, timeout_secs=_SWEEP_PREFILTER_TIMEOUT_SECS,
             )
             result = await run_verification(
                 worktree, config, scoped_mc, max_retries=0, role='background',
@@ -11047,16 +11062,9 @@ async def confirm_main_tip_failure_is_real(
         # Each subproject group gets its own scoped + forced-serial isolated
         # re-run. ALL groups must confirm green to suppress.
         for prefix, group_node_ids in groups.items():
-            mc = module_configs[prefix]
-            scoped_cmd = _with_pytest_timeout_str(
-                _serial_pytest_str(
-                    _scope_to_keyword(mc.test_command, 'pytest', group_node_ids),
-                    invocation_dir=tmp_path,
-                ),
-                _SWEEP_CONFIRM_TIMEOUT_SECS,
-            )
-            scoped_mc = replace(
-                mc, test_command=scoped_cmd, lint_command=None, type_check_command=None,
+            scoped_mc = _node_id_test_config(
+                module_configs[prefix], group_node_ids,
+                tree=tmp_path, timeout_secs=_SWEEP_CONFIRM_TIMEOUT_SECS,
             )
             if not await _run_isolated_confirm_group(tmp_path, config, scoped_mc):
                 return True
@@ -11575,11 +11583,10 @@ async def confirm_isolated_rerun_verdict(
     ``git worktree add``/``remove``, no cleanup ``finally``.
 
     SERIAL + ISOLATED + GENEROUS TIMEOUT (INV-4): each subproject group is
-    re-run through ``_with_pytest_timeout_str(_serial_pytest_str(
-    _scope_to_keyword(...), invocation_dir=worktree), policy.timeout_secs)``
-    with ``lint_command`` and ``type_check_command`` nulled, so only the named
-    tests run, serially, under the governing pyproject ``addopts`` minus xdist
-    and an explicit ``--timeout`` in place of its ini per-test default.
+    re-run through ``_node_id_test_config`` with ``policy.timeout_secs``, so
+    only the named tests run, serially, under the governing pyproject
+    ``addopts`` minus xdist and an explicit ``--timeout`` in place of its ini
+    per-test default.
 
     At the merge gate (``policy.refuses_partially_measured_sessions``) no
     re-run is attempted when the failing session left tests unmeasured: a
@@ -11797,16 +11804,9 @@ async def confirm_isolated_rerun_verdict(
         # continuing and a full re-run's cost to lose.
         unconfirmable_observation: _RerunObservation | None = None
         for prefix, group_node_ids in groups.items():
-            mc = mc_by_prefix[prefix]
-            scoped_cmd = _with_pytest_timeout_str(
-                _serial_pytest_str(
-                    _scope_to_keyword(mc.test_command, 'pytest', group_node_ids),
-                    invocation_dir=worktree,
-                ),
-                policy.timeout_secs,
-            )
-            scoped_mc = replace(
-                mc, test_command=scoped_cmd, lint_command=None, type_check_command=None,
+            scoped_mc = _node_id_test_config(
+                mc_by_prefix[prefix], group_node_ids,
+                tree=worktree, timeout_secs=policy.timeout_secs,
             )
             observation = await policy.engine(
                 worktree, config, scoped_mc,
