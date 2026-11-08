@@ -2937,10 +2937,12 @@ def _contests_exemplar() -> judge_module.JudgeExemplar:
 
 
 async def _live_judge_verdict(**judge_kwargs: Any) -> TriageJudgeVerdict:
-    """`judge_write`'s verdict; a call past the judge budget skips, every other failure stays red.
+    """`judge_write`'s verdict; no verdict for a provider-side reason skips, every other failure stays red.
 
-    A budget expiry yields no verdict, so it says nothing about the wording. TestTheFrontierArmLive
-    keeps a timeout red: it is the live edge for the fail-open/latency dimension.
+    A budget expiry, a provider 5xx and a provider 429 each yield no verdict, so they say nothing
+    about the wording. Connection errors, SDK timeouts, other 4xx and unusable answers stay red.
+    TestTheFrontierArmLive keeps a timeout red: it is the live edge for the fail-open/latency
+    dimension.
     """
     try:
         return await judge_write(**judge_kwargs)
@@ -2950,6 +2952,14 @@ async def _live_judge_verdict(**judge_kwargs: Any) -> TriageJudgeVerdict:
             f'{resolve_judge_model(service)} (effort {resolve_judge_reasoning_effort(service)}) '
             f'gave no verdict within write_triage.judge_timeout_seconds='
             f'{resolve_judge_timeout(service)}; production stores this write and counts a '
+            f'fail-open (contract C1, write_triage.py::triage_write); no wording was observed',
+        )
+    except (openai.InternalServerError, openai.RateLimitError) as exc:
+        service = judge_kwargs['memory_service']
+        pytest.skip(
+            f'{resolve_judge_model(service)} (effort {resolve_judge_reasoning_effort(service)}) '
+            f'gave no verdict: the provider answered {type(exc).__name__} '
+            f'(status {exc.status_code}); production stores this write and counts a '
             f'fail-open (contract C1, write_triage.py::triage_write); no wording was observed',
         )
 
@@ -2970,7 +2980,7 @@ def _raises_without_skipping(
 
 
 class TestTheLiveWordingBudgetGuard:
-    """`_live_judge_verdict` skips only a call past the judge budget; the rest stays red."""
+    """`_live_judge_verdict` skips only a budget expiry, a provider 5xx or a 429; the rest stays red."""
 
     @staticmethod
     def _judge_kwargs(**write_triage: Any) -> dict[str, Any]:
@@ -3097,7 +3107,8 @@ class TestTheShippedWordingLive:
 
     Pinned to Sol: gpt-4o-mini labels both outdated entries `contested` under
     the old wording too, so only Sol tells the two wordings apart. A call past
-    the judge budget skips through `_live_judge_verdict`.
+    the judge budget, or one the provider answers with a 5xx or a 429, skips
+    through `_live_judge_verdict`.
     """
 
     @pytest.mark.asyncio
