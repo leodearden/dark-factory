@@ -83,6 +83,7 @@ from fused_memory.middleware.curator_types import (
     CandidateTask,
     CuratorDecision,
     PreparedCandidate,
+    declared_scope_of,
     exception_summary,
     is_combine_eligible_status,
 )
@@ -2703,6 +2704,7 @@ class TaskInterceptor:
             spawn_context=str(meta.get('spawn_context') or 'manual'),
             execution_class=meta.get('execution_class'),
             items=_candidate_items(meta),
+            declared_scope=declared_scope_of(meta),
         )
 
     def _files_scope_check(
