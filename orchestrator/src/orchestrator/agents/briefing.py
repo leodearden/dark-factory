@@ -1517,7 +1517,7 @@ where the previous agent left off.
 # Action
 
 1. Understand the escalation and the task context.
-{already_merged}
+2. {already_merged}
 3. Read the relevant code.
 4. Handle the escalation — fix the issue, or triage suggestions.
 5. Run tests to verify any code changes.

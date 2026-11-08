@@ -101,4 +101,4 @@ class TestBuildStewardInitialPrompt:
         prompt = await _initial_prompt(briefing, tmp_path)
 
         expected = already_merged_step(LandedShaSearches.for_task(str(_TASK['id']), git))
-        assert expected in prompt
+        assert f'\n2. {expected}\n3. ' in prompt

@@ -1,10 +1,13 @@
 """The steward's landed-sha searches, rendered for one task from the merge lane's own rules.
 
 `orchestrator/src/orchestrator/agents/briefing.py::BriefingAssembler.build_steward_initial_prompt`
-splices the step built here into its `# Action` list. Each command is a
-`skills/_shared/deriving-landed-sha.md` search with this task's branch, merge
-subject and citation regex filled in from the same sources production reads:
-the marker search mirrors
+splices the step built here into its `# Action` list, and numbers it. The step
+is the whole already-merged item: the searches, how to read each one, and the
+`done_provenance` / `resolve_issue` instructions that follow a landing.
+
+Each command is a `skills/_shared/deriving-landed-sha.md` search with this
+task's branch, merge subject and citation regex filled in from the same sources
+production reads: the marker search mirrors
 `orchestrator/src/orchestrator/git_ops.py::GitOps.find_merge_marker`, the
 containment check mirrors `GitOps.is_ancestor_checked`, and the citation walk
 mirrors `GitOps.find_task_citation_commit`.
@@ -73,7 +76,7 @@ class LandedShaSearches:
 
 
 _INTRO = """\
-2. Check whether this task's branch has already landed on main. Every sha you record in \
+Check whether this task's branch has already landed on main. Every sha you record in \
 `done_provenance` comes from one of the task-scoped searches below, never from main's HEAD or an \
 eyeballed `git log main` listing. `skills/_shared/deriving-landed-sha.md` is the full ladder; these \
 commands are its searches, rendered for this task from the merge lane's own rules. Run them from \
@@ -149,7 +152,7 @@ def _citation_bullet(citation_walk: str | CitationGateUnavailable) -> str:
 
 
 def already_merged_step(searches: LandedShaSearches) -> str:
-    """The steward's `# Action` item 2, with this task's searches spliced in."""
+    """The body of the steward's already-merged `# Action` item; the caller owns its number."""
     return '\n'.join((
         _INTRO,
         _command_bullet('**Ancestry:**', searches.ancestry, _ANCESTRY_READING),
