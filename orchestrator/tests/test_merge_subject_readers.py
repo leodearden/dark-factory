@@ -9,6 +9,7 @@ negative every reader must refuse. The fused-memory half lives in
 
 from __future__ import annotations
 
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,7 +21,8 @@ from _orch_helpers import git_env_with_ceiling
 from shared.merge_subject import format_merge_subject
 
 from orchestrator.config import GitConfig
-from orchestrator.git_ops import GitOps
+from orchestrator.git_ops import DEFAULT_COMMIT_CITATION_PATTERN, GitOps, render_citation_pattern
+from orchestrator.merge_lane.gates import ALREADY_LANDED_CITATION_PATTERN
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -92,3 +94,60 @@ class TestWriterAndMergeMarker:
         git_ops = feat_trunk.git_ops
         assert await git_ops.find_merge_marker('feat/51', gate_on_existing_ref=False) is None
         assert await git_ops.find_merge_marker_checked('feat/51') is None
+
+
+_TEMPLATES = [
+    pytest.param(DEFAULT_COMMIT_CITATION_PATTERN, id='default'),
+    pytest.param(ALREADY_LANDED_CITATION_PATTERN, id='already-landed'),
+]
+
+
+@pytest.mark.asyncio
+class TestCitationTemplatesFollowTheConfiguredSubject:
+    async def test_the_already_landed_template_cites_the_landing(
+        self, feat_trunk: FeatTrunk,
+    ) -> None:
+        cited = await feat_trunk.git_ops.find_task_citation_commit(
+            '50', pattern_template=ALREADY_LANDED_CITATION_PATTERN,
+        )
+        assert cited == feat_trunk.merge_sha
+
+    async def test_the_default_template_cites_the_landing(self, feat_trunk: FeatTrunk) -> None:
+        assert await feat_trunk.git_ops.find_task_citation_commit('50') == feat_trunk.merge_sha
+
+    @pytest.mark.parametrize('template', _TEMPLATES)
+    async def test_a_revert_subject_cites_nothing(
+        self, feat_trunk: FeatTrunk, template: str,
+    ) -> None:
+        cited = await feat_trunk.git_ops.find_task_citation_commit('51', pattern_template=template)
+        assert cited is None
+
+
+def _feat_trunk_landing(tid: str = '50') -> str:
+    return format_merge_subject(f'feat/{tid}', 'trunk')
+
+
+class TestRenderCitationPattern:
+    @pytest.mark.parametrize('template', _TEMPLATES)
+    def test_the_merge_slot_cites_the_configured_landing(self, template: str) -> None:
+        rendered = render_citation_pattern(template, '50', branch_prefix='feat/', main_branch='trunk')
+        assert re.search(rendered, _feat_trunk_landing())
+
+    @pytest.mark.parametrize('template', _TEMPLATES)
+    @pytest.mark.parametrize('subject', [
+        pytest.param('Revert "' + _feat_trunk_landing() + '"', id='revert'),
+        pytest.param(format_merge_subject('feat/50', 'main'), id='other-main'),
+        pytest.param(format_merge_subject('task/50', 'trunk'), id='other-prefix'),
+        pytest.param(_feat_trunk_landing('500'), id='superstring-id'),
+        pytest.param(_feat_trunk_landing() + ' (retry)', id='suffixed'),
+    ])
+    def test_the_merge_slot_refuses_anything_else(self, template: str, subject: str) -> None:
+        rendered = render_citation_pattern(template, '50', branch_prefix='feat/', main_branch='trunk')
+        assert re.search(rendered, subject) is None
+
+    def test_rendering_leaves_the_conventional_commit_arms_alone(self) -> None:
+        rendered = render_citation_pattern(
+            ALREADY_LANDED_CITATION_PATTERN, '4369', branch_prefix='task/', main_branch='main',
+        )
+        assert re.search(rendered, 'impl(4369 step-8): x')
+        assert re.search(rendered, 'impl(43690 step-8): x') is None
