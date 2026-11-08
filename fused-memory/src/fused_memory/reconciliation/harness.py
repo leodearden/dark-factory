@@ -2566,9 +2566,8 @@ class ReconciliationHarness:
             return
 
         if self._escalation_queue is None:
-            self._escalation_queue = EscalationQueue(  # type: ignore[possibly-undefined]
-                self._configured_escalation_queue_dir()
-            )
+            queue_dir = self._configured_escalation_queue_dir()
+            self._escalation_queue = EscalationQueue(queue_dir)  # type: ignore[possibly-undefined]
 
         mcp_server = create_escalation_server(  # type: ignore[possibly-undefined]
             self._escalation_queue,
@@ -2605,8 +2604,8 @@ class ReconciliationHarness:
         logger.info(f'Reconciliation escalation server starting on {host}:{port}')
         await _sleep(0.5)
 
-        # Store escalation URL and queue; _make_stages propagates them to each
-        # cycle's fresh stages via _propagate_escalation_queue (task 2146 β —
+        # Store the escalation URL; _make_stages propagates it (and the queue) to
+        # each cycle's fresh stages via _propagate_escalation_queue (task 2146 β —
         # there is no long-lived self.stages list to push into here anymore).
         escalation_url = f'http://{host}:{port}/mcp'
         self._escalation_url = escalation_url

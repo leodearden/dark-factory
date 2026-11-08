@@ -637,7 +637,7 @@ async def test_escalation_server_serves_the_constructor_injected_queue(
     Startup must not build a second queue from ``escalation_queue_dir``: the
     harness would then file into one store while the server serves another.
     """
-    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+    from escalation.queue import EscalationQueue
     from reconciliation.escalation_server_capture import create_escalation_server_kwargs
 
     injected = EscalationQueue(tmp_path / 'injected')
