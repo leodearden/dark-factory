@@ -3,13 +3,20 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 from pathlib import Path
 
 import pytest
 from quality_series_fixtures import LandingScenario, at_hour, build_landing_scenario
 
 from shared.quality_series import LandingRow, landings, rows_for, unit_heads
-from shared.quality_series.rows import SourceEpochs
+from shared.quality_series.rows import (
+    CharterClass,
+    CharterClassSource,
+    ReviewRoundsSource,
+    SourceEpochs,
+    UnknownCharterClass,
+)
 
 POST_MERGE = 'post_merge_verify'
 
@@ -242,3 +249,128 @@ class TestExecuteIterations:
 
     def test_no_rows_is_unknown(self, cost_scenario, cost_rows):
         assert cost_rows[('107', cost_scenario.m7)].cost.execute_iterations is None
+
+
+def _review_state(root: Path, dirname: str, text: str) -> None:
+    meta = root / '.worktrees' / '.task-meta' / dirname
+    meta.mkdir(parents=True, exist_ok=True)
+    (meta / 'review_state.json').write_text(text)
+
+
+UNACTIONABLE = 'Architect reported task unactionable: x'
+FALSE_PREMISE = 'Architect reported false RED-test premise: y'
+ALREADY_DONE = 'Architect reported task already done at abc123 but the claim could not be accepted'
+PLAN_FILES = 'Plan files not touched by branch: a.py'
+
+
+@pytest.fixture(scope='module')
+def review_scenario(tmp_path_factory: pytest.TempPathFactory) -> LandingScenario:
+    """Review events start at 13:30, after every landing but m7/m8; plus charter block rows."""
+    s = build_landing_scenario(tmp_path_factory.mktemp('review') / 'proj')
+    db, root = s.db, s.repo.root
+    db.review_completed(at_hour(13.5), '107', cycle=1, has_blocking=True)
+    db.review_completed(at_hour(13.8), '107', cycle=2, has_blocking=False)
+    _review_state(root, '101', json.dumps({'review_cycles_total': 2}))
+    _review_state(root, 'task-102', json.dumps({'review_cycles_total': 0}))
+    _review_state(root, '104', '{not json')
+    _review_state(root, '105', json.dumps({'amendment_rounds_total': 1}))
+    _review_state(root, '106', json.dumps({'review_cycles_total': 'two'}))
+    _review_state(root, '108', json.dumps({'review_cycles_total': 4}))
+
+    db.task_result('101', 'run-a', 'blocked', at_hour(9.0), block_reason=UNACTIONABLE)
+    db.task_result('101', 'run-b', 'blocked', at_hour(9.5), block_reason=ALREADY_DONE)
+    db.task_result('102', 'run-a', 'blocked', at_hour(10.5), block_reason=UNACTIONABLE)
+    db.task_result('103', 'run-a', 'blocked', at_hour(11.5), block_reason=FALSE_PREMISE)
+    db.task_result('105', 'run-a', 'blocked', at_hour(11.5), block_reason=PLAN_FILES)
+    db.task_result('106', 'run-a', 'blocked', at_hour(12.2),
+                   block_reason='Post-merge verification failed: z')
+    return s
+
+
+@pytest.fixture(scope='module')
+def review_rows(review_scenario: LandingScenario) -> dict[tuple[str, str], LandingRow]:
+    return _by_key(_rows(review_scenario))
+
+
+class TestReviewRounds:
+    def test_the_highest_review_cycle_in_the_window(self, review_scenario, review_rows):
+        cost = review_rows[('107', review_scenario.m7)].cost
+        assert (cost.review_rounds, cost.review_rounds_source) == (
+            2, ReviewRoundsSource.REVIEW_COMPLETED,
+        )
+
+    def test_before_the_epoch_the_disk_counter_reads_lifetime_rounds(
+        self, review_scenario, review_rows
+    ):
+        cost = review_rows[('101', review_scenario.m1)].cost
+        assert (cost.review_rounds, cost.review_rounds_source) == (
+            3, ReviewRoundsSource.DISK_COUNTER,
+        )
+
+    def test_the_task_prefixed_meta_directory_is_read(self, review_scenario, review_rows):
+        cost = review_rows[('102', review_scenario.f2)].cost
+        assert (cost.review_rounds, cost.review_rounds_source) == (
+            1, ReviewRoundsSource.DISK_COUNTER,
+        )
+
+    @pytest.mark.parametrize('task', ['103', '104', '105'])
+    def test_no_usable_counter_before_the_epoch_is_unknown(
+        self, review_scenario, review_rows, task
+    ):
+        cost = review_rows[(task, review_scenario.m3)].cost
+        assert (cost.review_rounds, cost.review_rounds_source) == (None, None)
+
+    def test_a_non_integer_counter_is_unknown(self, review_scenario, review_rows):
+        cost = review_rows[('106', review_scenario.side)].cost
+        assert (cost.review_rounds, cost.review_rounds_source) == (None, None)
+
+    def test_after_the_epoch_the_disk_counter_is_never_read(self, review_scenario, review_rows):
+        cost = review_rows[('108', review_scenario.m8)].cost
+        assert (cost.review_rounds, cost.review_rounds_source) == (None, None)
+
+
+class TestCharterClassBackfill:
+    @pytest.mark.parametrize(
+        ('task', 'sha', 'expected'),
+        [
+            ('102', 'f2', CharterClass.UNDER_SPECIFIED),
+            ('103', 'm3', CharterClass.UNDER_SPECIFIED),
+            ('105', 'm3', CharterClass.PLAN_FILES_UNTOUCHED),
+            ('101', 'm1', CharterClass.STALE_CHARTER),
+        ],
+    )
+    def test_block_reason_prefixes_map_to_classes(
+        self, review_scenario, review_rows, task, sha, expected
+    ):
+        cost = review_rows[(task, getattr(review_scenario, sha))].cost
+        assert (cost.charter_class, cost.charter_class_source) == (
+            expected, CharterClassSource.REGEX_BACKFILL,
+        )
+
+    def test_other_block_reasons_are_no_charter_class(self, review_scenario, review_rows):
+        cost = review_rows[('106', review_scenario.side)].cost
+        assert (cost.charter_class, cost.charter_class_source) == (None, None)
+
+    def test_the_vocabulary(self):
+        assert {c.value for c in CharterClass} == {
+            'under_specified', 'stale_charter', 'plan_files_untouched',
+        }
+
+
+class TestCharterClassColumn:
+    def test_the_column_wins_over_a_matching_block_reason(self, tmp_path: Path) -> None:
+        s = build_landing_scenario(tmp_path / 'proj', with_charter_class=True)
+        s.db.task_result('102', 'run-a', 'blocked', at_hour(10.5),
+                         block_reason=UNACTIONABLE, charter_class='stale_charter')
+        cost = _by_key(_rows(s))[('102', s.f2)].cost
+        assert (cost.charter_class, cost.charter_class_source) == (
+            CharterClass.STALE_CHARTER, CharterClassSource.CHARTER_CLASS,
+        )
+
+    def test_an_unknown_column_value_is_refused(self, tmp_path: Path) -> None:
+        s = build_landing_scenario(tmp_path / 'proj', with_charter_class=True)
+        s.db.task_result('102', 'run-a', 'blocked', at_hour(10.5), charter_class='bogus')
+        with pytest.raises(UnknownCharterClass) as excinfo:
+            _rows(s)
+        assert 'bogus' in str(excinfo.value)
+        assert '102' in str(excinfo.value)
