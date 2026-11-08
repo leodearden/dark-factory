@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+from shared.cli_invoke import build_claude_argv
 from shared.spawn_temp_files import (
     MCP_CONFIG_TEMP_NAME,
     SPAWN_TEMP_NAMES,
@@ -306,3 +307,43 @@ def test_an_unlink_failure_is_logged_and_not_counted(
     assert stale.exists()
     messages = _warnings(caplog)
     assert any(str(stale) in m for m in messages), messages
+
+
+def test_reclaims_what_build_claude_argv_creates_once_no_live_process_names_it(
+    base: Path, tmp_path: Path, idle_proc: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(tempfile, 'tempdir', str(base))
+    cmd, temp_files = build_claude_argv(
+        model='opus',
+        max_budget_usd=5.0,
+        system_prompt='sys prompt text',
+        max_turns=50,
+        permission_mode='bypassPermissions',
+        allowed_tools=None,
+        disallowed_tools=None,
+        mcp_config={'mcpServers': {}},
+        output_schema=None,
+        effort=None,
+        resume_session_id=None,
+        session_id=None,
+    )
+    try:
+        assert len(temp_files) == 2, temp_files
+        sysprompt, mcp = (Path(p) for p in temp_files)
+        assert sysprompt.parent == base
+        assert mcp.parent == base
+        assert SYSPROMPT_TEMP_NAME.matches(sysprompt.name), sysprompt
+        assert MCP_CONFIG_TEMP_NAME.matches(mcp.name), mcp
+        for path in (sysprompt, mcp):
+            _age(path, _STALE_SECS)
+
+        spawned = b'\0'.join(os.fsencode(arg) for arg in cmd) + b'\0'
+        live_proc = _fake_proc(tmp_path / 'live-proc', {os.getpid() + 1: spawned})
+        assert sweep_orphaned_spawn_temp_files(base_dir=base, proc_root=live_proc) == 0
+        assert sysprompt.exists()
+        assert mcp.exists()
+
+        assert sweep_orphaned_spawn_temp_files(base_dir=base, proc_root=idle_proc) == 2
+    finally:
+        for path in temp_files:
+            Path(path).unlink(missing_ok=True)
