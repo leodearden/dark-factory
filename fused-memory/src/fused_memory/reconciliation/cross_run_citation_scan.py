@@ -22,6 +22,8 @@ from typing import Any, NamedTuple
 from fused_memory.models.reconciliation import StageReport
 from fused_memory.reconciliation.citation_repair import SUPPORTED_STORE
 from fused_memory.reconciliation.citation_verifier import (
+    LivenessVerdict,
+    MemoryLiveness,
     is_concrete_memory_id,
     make_memory_resolver,
 )
@@ -38,11 +40,6 @@ CROSS_RUN_CITATION_SCAN_LOOKBACK_RUNS = 50
 MAX_CROSS_RUN_CITATION_IDS_PER_SCAN = 100
 MAX_CONSECUTIVE_CITATION_READ_ERRORS = 3
 MAX_DANGLING_CITATION_FINDINGS_PER_SCAN = 20
-
-_FOUND = 'found'
-_MISSING = 'missing'
-_ERROR = 'error'
-
 
 @dataclass(frozen=True)
 class CrossRunCitationScan:
@@ -110,15 +107,15 @@ async def scan_cross_run_citations(
     dangling = tuple(
         record
         for c, outcome in zip(citations, outcomes, strict=True)
-        if outcome == _MISSING and (record := _addressable_record(c)) is not None
+        if outcome == MemoryLiveness.ABSENT and (record := _addressable_record(c)) is not None
     )
     counts = Counter(outcomes)
     return CrossRunCitationScan(
         dangling=dangling[:max_findings],
         runs_scanned=len(runs),
-        citations_verified=counts[_FOUND],
+        citations_verified=counts[MemoryLiveness.LIVE],
         dangling_total=len(dangling),
-        verification_errors=counts[_ERROR],
+        verification_errors=counts[MemoryLiveness.INCONCLUSIVE],
         unchecked=counts[None],
         scan_failed=False,
     )
@@ -182,11 +179,11 @@ def _addressable_record(citation: _Citation) -> DanglingCitation | None:
 
 async def _outcome_per_citation(
     citations: list[_Citation],
-    resolve: Callable[[Any], Awaitable[tuple[str, str | None]]],
+    resolve: Callable[[Any], Awaitable[LivenessVerdict]],
     *,
     max_ids: int,
     max_consecutive_errors: int,
-) -> list[str | None]:
+) -> list[MemoryLiveness | None]:
     spelling_by_key: dict[str, str] = {}
     for citation in citations:
         spelling_by_key.setdefault(citation.memory_id.lower(), citation.memory_id)
@@ -202,25 +199,25 @@ async def _outcome_per_citation(
 
 async def _resolve_distinct_ids(
     memory_ids: Iterable[str],
-    resolve: Callable[[Any], Awaitable[tuple[str, str | None]]],
+    resolve: Callable[[Any], Awaitable[LivenessVerdict]],
     *,
     max_ids: int,
     max_consecutive_errors: int,
-) -> list[str | None]:
+) -> list[MemoryLiveness | None]:
     """Resolve each id in order, answering ``None`` for every id left unchecked.
 
     Resolution stops after *max_ids* ids, or once *max_consecutive_errors*
     reads in a row raised: each read on a degraded store waits out its own
     backend timeout on Stage 3's critical path.
     """
-    outcomes: list[str | None] = []
+    outcomes: list[MemoryLiveness | None] = []
     consecutive_errors = 0
     for memory_id in memory_ids:
         if len(outcomes) >= max_ids or consecutive_errors >= max_consecutive_errors:
             outcomes.append(None)
             continue
         outcome, _detail = await resolve(memory_id)
-        consecutive_errors = consecutive_errors + 1 if outcome == _ERROR else 0
+        consecutive_errors = consecutive_errors + 1 if outcome == MemoryLiveness.INCONCLUSIVE else 0
         if consecutive_errors == max_consecutive_errors:
             logger.warning(
                 'cross-run citation scan: %d consecutive mem0 reads failed; '
