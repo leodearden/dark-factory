@@ -85,6 +85,10 @@ _ADMISSION = (
     'Verify admission scheduling: it decides when a run starts and at what priority, never what it selects.'
 )
 _CGROUP_SHAPING = 'cgroup CPU shaping: it weights the run against other work and leaves its commands alone.'
+_CGROUP_MEMORY_LIMITS = (
+    'cgroup memory limits: MemoryHigh only slows a run and a MemoryMax kill leaves a killed leg '
+    'with no passing verdict, so no value turns a failing verify green.'
+)
 _FAILS_CLOSED_TIMEOUT = (
     'A timeout only ends a run timed_out, which the merge path fails closed: the scoped verify does '
     'not pass, and the unscoped gate runs with block_on_timeout=True.'
@@ -164,6 +168,7 @@ MERGE_PATH_CONFIG_READS: Mapping[str, Classified] = MappingProxyType({
     'verify_cgroup_cpu_weight_background': Classified(Fidelity.MERGE_NEUTRAL, _CGROUP_SHAPING),
     'verify_cgroup_cpu_weight_merge': Classified(Fidelity.MERGE_NEUTRAL, _CGROUP_SHAPING),
     'verify_cgroup_cpu_weight_task': Classified(Fidelity.MERGE_NEUTRAL, _CGROUP_SHAPING),
+    'verify_cgroup_memory': Classified(Fidelity.MERGE_NEUTRAL, _CGROUP_MEMORY_LIMITS),
     'verify_use_cgroup_scope': Classified(Fidelity.MERGE_NEUTRAL, _CGROUP_SHAPING),
     'verify_clock_stop_enabled': Classified(Fidelity.MERGE_NEUTRAL, _FAILS_CLOSED_TIMEOUT),
     'verify_clock_stop_heartbeat_idle_max': Classified(Fidelity.MERGE_NEUTRAL, _FAILS_CLOSED_TIMEOUT),
