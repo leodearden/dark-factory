@@ -36,7 +36,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from _task_db_scan import connect_ro
+from shared.tasks_db_readonly import connect_ro
 from tasks_db_schema import (
     EXIT_OK,
     EXIT_UNREADABLE,

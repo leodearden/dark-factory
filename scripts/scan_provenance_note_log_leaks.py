@@ -3,11 +3,12 @@
 
 READ-ONLY / DETECTION-ONLY: this module and its CLI never mutate task data.
 Every database connection it opens goes through
-``_task_db_scan.py::connect_ro``, a read-only SQLite URI (``mode=ro``), so the
-sweep is structurally incapable of the auto-mutation this tool is explicitly
-forbidden from doing. Remediation of any match it finds is a separate, manual,
-individually-reviewed follow-up (matching the safe-vs-irreversible handling
-already applied to tasks 2080 and 2865) — never bulk-edited by this script.
+``shared/src/shared/tasks_db_readonly.py::connect_ro``, a read-only SQLite URI
+(``mode=ro``), so the sweep is structurally incapable of the auto-mutation this
+tool is explicitly forbidden from doing. Remediation of any match it finds is a
+separate, manual, individually-reviewed follow-up (matching the
+safe-vs-irreversible handling already applied to tasks 2080 and 2865) — never
+bulk-edited by this script.
 
 Background (task 3286): ``DeterministicRunner._run_predicate`` stamped a
 predicate check's raw stdout tail straight into ``done_provenance.note``.
@@ -48,8 +49,8 @@ would therefore appear mid-line. See the comment on ``LOG_LINE_LEAK``.
 Known blind spot, shared with the writer it guards: a log line under a
 ``%(name)s %(message)s``-style formatter (no timestamp, no level token) is
 matched by neither this discriminator nor
-``deterministic_runner._LOG_LINE_RE``, so such a line can reach a note and go
-unreported here. Detecting it would require naming logger substrings, which
+``orchestrator/src/orchestrator/predicate_output.py::_LOG_LINE_RE``, so such a
+line can reach a note and go unreported here. Detecting it would require naming logger substrings, which
 is precisely the over-reporting failure above. The writer's cap bounds the
 exposure to one ≤400-char line; a predicate script wanting a guaranteed-clean
 note should emit its verdict as trailing JSON.
@@ -65,12 +66,12 @@ from typing import NamedTuple
 from _task_db_scan import (
     SCAN_EXIT_CODE_EPILOG,
     add_db_discovery_args,
-    connect_ro,
     format_json,
     group_matches_by_db,
     run_scan_cli,
     truncate,
 )
+from shared.tasks_db_readonly import connect_ro
 
 # A real log line: ISO date+time (with optional ,milliseconds), then a
 # whitespace-separated logger-name field, then a standalone level token.
@@ -123,9 +124,10 @@ class NoteLeakMatch(NamedTuple):
 def scan_db(db_path: str) -> list[NoteLeakMatch]:
     """Scan *db_path* read-only for leaked log lines in done_provenance notes.
 
-    Opens through ``_task_db_scan.py::connect_ro`` (read-only; see there for
-    refusals). The read-only open matters concretely here: task 2902's note
-    is a preserved forensic specimen, and this tool must be unable to touch it.
+    Opens through ``shared/src/shared/tasks_db_readonly.py::connect_ro``
+    (read-only; see there for refusals). The read-only open matters concretely
+    here: task 2902's note is a preserved forensic specimen, and this tool must
+    be unable to touch it.
 
     Every row shape is tolerated: metadata that is NULL, undecodable, or a
     JSON scalar/array rather than an object, and a ``done_provenance`` that is

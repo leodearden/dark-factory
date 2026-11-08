@@ -23,6 +23,7 @@ No test in this file needs an API key, a network, or Qdrant.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -30,12 +31,14 @@ import subprocess
 import sys
 import types
 import uuid
-from collections.abc import MutableMapping
+from collections.abc import Callable, Iterator, MutableMapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
+import httpx
+import openai
 import pytest
 from _mock_openai_server import mock_openai_server
 from _sdk_client_stubs import sdk_client_double
@@ -2872,7 +2875,6 @@ class TestJudgeWriteInheritsBetasFailOpenApparatus:
     not os.environ.get('OPENAI_API_KEY'),
     reason='needs OPENAI_API_KEY for a live Responses API call',
 )
-@pytest.mark.timeout(120)
 class TestTheFrontierArmLive:
     """The live edge: a frontier reasoning model judges a fixture write through triage."""
 
@@ -2934,17 +2936,121 @@ def _contests_exemplar() -> judge_module.JudgeExemplar:
     )
 
 
+async def _live_judge_verdict(**judge_kwargs: Any) -> TriageJudgeVerdict:
+    """`judge_write`'s verdict; a call past the judge budget skips, every other failure stays red.
+
+    A budget expiry yields no verdict, so it says nothing about the wording. TestTheFrontierArmLive
+    keeps a timeout red: it is the live edge for the fail-open/latency dimension.
+    """
+    try:
+        return await judge_write(**judge_kwargs)
+    except TimeoutError:
+        service = judge_kwargs['memory_service']
+        pytest.skip(
+            f'{resolve_judge_model(service)} (effort {resolve_judge_reasoning_effort(service)}) '
+            f'gave no verdict within write_triage.judge_timeout_seconds='
+            f'{resolve_judge_timeout(service)}; production stores this write and counts a '
+            f'fail-open (contract C1, write_triage.py::triage_write); no wording was observed',
+        )
+
+
+_RESPONSES_REQUEST = httpx.Request('POST', 'https://api.openai.com/v1/responses')
+
+
+@contextlib.contextmanager
+def _raises_without_skipping(
+    expected: type[BaseException],
+) -> Iterator[pytest.ExceptionInfo[BaseException]]:
+    """`pytest.raises`, except a skip fails: a skipped guard test would hide a widened `except`."""
+    try:
+        with pytest.raises(expected) as excinfo:
+            yield excinfo
+    except pytest.skip.Exception as skipped:
+        pytest.fail(f'skipped instead of raising {expected.__name__}: {skipped}')
+
+
+class TestTheLiveWordingBudgetGuard:
+    """`_live_judge_verdict` skips only a call past the judge budget; the rest stays red."""
+
+    @staticmethod
+    def _judge_kwargs(**write_triage: Any) -> dict[str, Any]:
+        return {
+            'memory_service': _judge_svc(**write_triage),
+            'content': 'c', 'project_id': 'p',
+            'decision': _decision('m1'), 'candidates': [_result('m1', 0.80)],
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_call_past_the_judge_budget_skips_naming_the_budget(self) -> None:
+        async def _hang(*_args, **_kwargs):
+            await asyncio.sleep(5)
+
+        client = sdk_client_double()
+        client.responses.create = AsyncMock(side_effect=_hang)
+        with patch('openai.AsyncOpenAI', return_value=client), \
+                pytest.raises(pytest.skip.Exception) as excinfo:
+            await _live_judge_verdict(**self._judge_kwargs(judge_timeout_seconds=0.01))
+
+        reason = str(excinfo.value)
+        assert 'test-model' in reason
+        assert '0.01' in reason
+
+    @pytest.mark.asyncio
+    async def test_a_verdict_is_returned_as_is(self) -> None:
+        client = _openai_client(_payload('restates', 'm1'))
+        with patch('openai.AsyncOpenAI', return_value=client):
+            verdict = await _live_judge_verdict(**self._judge_kwargs())
+
+        assert verdict.outcome == OUTCOME_RESTATED
+        assert verdict.candidate_id == 'm1'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'make_client',
+        [
+            lambda: _openai_client('I cannot answer that.'),
+            lambda: _incomplete_openai_client(_payload('restates', 'm1'), 'max_output_tokens'),
+        ],
+        ids=['unparseable', 'incomplete'],
+    )
+    async def test_an_unusable_answer_stays_red(
+        self, make_client: Callable[[], MagicMock],
+    ) -> None:
+        with patch('openai.AsyncOpenAI', return_value=make_client()), \
+                _raises_without_skipping(JudgeOutputError):
+            await _live_judge_verdict(**self._judge_kwargs())
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'error',
+        [
+            RuntimeError('boom'),
+            openai.APITimeoutError(request=_RESPONSES_REQUEST),
+            openai.APIConnectionError(request=_RESPONSES_REQUEST),
+        ],
+        ids=['runtime-error', 'sdk-timeout', 'sdk-connection-error'],
+    )
+    async def test_a_transport_error_stays_red(self, error: Exception) -> None:
+        client = sdk_client_double()
+        client.responses.create = AsyncMock(side_effect=error)
+        with patch('openai.AsyncOpenAI', return_value=client), \
+                _raises_without_skipping(type(error)) as excinfo:
+            await _live_judge_verdict(**self._judge_kwargs())
+
+        assert excinfo.value is error
+
+
 @pytest.mark.integration
 @pytest.mark.skipif(
     not os.environ.get('OPENAI_API_KEY'),
     reason='needs OPENAI_API_KEY for a live Responses API call',
 )
-@pytest.mark.timeout(120)
 class TestTheShippedWordingLive:
     """Boundary row 3 (flip-readiness PRD §11.4): `contests` covers an outdated candidate.
 
     Pinned to Sol: gpt-4o-mini labels both outdated entries `contested` under
-    the old wording too, so only Sol tells the two wordings apart.
+    the old wording too, so only Sol tells the two wordings apart. A call past
+    the judge budget skips through `_live_judge_verdict`.
     """
 
     @pytest.mark.asyncio
@@ -3000,7 +3106,7 @@ class TestTheShippedWordingLive:
         write_triage.judge_reasoning_effort = 'low'
         service = types.SimpleNamespace(config=config)
 
-        verdict = await judge_write(
+        verdict = await _live_judge_verdict(
             memory_service=service, content=entry, project_id='p',
             decision=_decision(candidate_id), candidates=slate,
         )

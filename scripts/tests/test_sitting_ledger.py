@@ -7,7 +7,7 @@ from dataclasses import replace
 
 import pytest
 from sitting import ledger as mod
-from sitting.inventory import decision_key, escalation_key, key_str
+from sitting.inventory import AUDIT_KIND, audit_key, decision_key, escalation_key, key_str
 from sitting.preparation import EscalationClosed, Manual, Standing, TaskStatusIs
 
 QUEUE = '/src/dark-factory/data/escalations'
@@ -397,3 +397,56 @@ class TestPersistence:
 
         assert caught.value.path == path
         assert str(path) in str(caught.value)
+
+
+AUDIT_1, AUDIT_2 = key_str(audit_key('dec-a1')), key_str(audit_key('dec-a2'))
+AUDIT_KINDS = frozenset({AUDIT_KIND})
+
+
+class TestAssignByKind:
+    """Audits share the sitting's numbers without either population sweeping the other."""
+
+    def _with_open_audit(self) -> mod.Ledger:
+        return mod.assign(_sitting(), [AUDIT_1], _flat, T1, kinds=AUDIT_KINDS)
+
+    def test_a_question_assign_leaves_an_audit_entry_untouched(self):
+        ledger = self._with_open_audit()
+        audit_before = ledger.entries[AUDIT_1]
+
+        swept = _assign(ledger, [A], now=T2)
+
+        assert swept.entries[AUDIT_1] == audit_before
+        assert swept.entries[C].state == 'done'
+
+    def test_audit_keys_number_from_the_shared_high_water_mark(self):
+        ledger = _sitting()
+
+        numbered = mod.assign(ledger, [AUDIT_1, AUDIT_2], _flat, T1, kinds=AUDIT_KINDS)
+
+        assert {numbered.entries[k].number for k in (AUDIT_1, AUDIT_2)} == {
+            ledger.next_number, ledger.next_number + 1,
+        }
+        assert {k: e for k, e in numbered.entries.items() if k not in (AUDIT_1, AUDIT_2)} == dict(ledger.entries)
+
+    def test_an_undrawn_audit_goes_done_and_questions_are_untouched(self):
+        ledger = mod.assign(_sitting(), [AUDIT_1, AUDIT_2], _flat, T1, kinds=AUDIT_KINDS)
+
+        redrawn = mod.assign(ledger, [AUDIT_2], _flat, T2, kinds=AUDIT_KINDS)
+
+        assert redrawn.entries[AUDIT_1].state == 'done'
+        assert redrawn.entries[AUDIT_2] == ledger.entries[AUDIT_2]
+        assert {k: e for k, e in redrawn.entries.items() if k not in (AUDIT_1, AUDIT_2)} == {
+            k: e for k, e in ledger.entries.items() if k not in (AUDIT_1, AUDIT_2)
+        }
+
+    @pytest.mark.parametrize(('live', 'kinds'), [([AUDIT_1], None), ([A], AUDIT_KINDS)])
+    def test_a_live_key_outside_the_kinds_is_refused(self, live, kinds):
+        extra = {} if kinds is None else {'kinds': kinds}
+
+        with pytest.raises(ValueError):
+            mod.assign(_sitting(), live, _flat, T1, **extra)
+
+    def test_the_summary_counts_no_audit(self):
+        ledger = mod.assign(_sitting(), [AUDIT_1], _flat, T1, kinds=AUDIT_KINDS)
+
+        assert mod.sitting_summary(ledger) == mod.sitting_summary(_sitting())

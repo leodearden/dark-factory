@@ -64,8 +64,6 @@ _SYNTHETIC_CLOCK_MODULES: frozenset[str] = frozenset(
 #: add one for new code.
 _WAIT_BUDGET_DEBT: Mapping[str, float] = MappingProxyType(
     {
-        # Burned down by task 6507.
-        'test_merge_lane_restart_drain.py::test_a_train_does_not_park_on_a_predecessor_the_halt_sent_back_to_the_queue': 450.0,
         # Landed by task 5556 before this guard: its dispatch wait is bounded
         # by a local built from a call. Burned down by task 7624.
         'test_laptop_warm_verify_boundary.py::test_starvation_trigger_survives_real_remote_dispatch_and_replayed_worker_warning': math.inf,

@@ -84,16 +84,6 @@ function snapshotRowsOver(data) {
   );
 }
 
-// Whether a fresh read renders exactly as the Datum a caller already holds:
-// the same fields, the value compared by reference. projectRows and the
-// terminal readers stamp a new object per call, so identity cannot say it; a
-// new payload or a new receipt makes it false, and so re-reads the age.
-function sameDatum(held, fresh) {
-  const keys = Object.keys(held);
-  return keys.length === Object.keys(fresh).length
-    && keys.every(key => Object.prototype.hasOwnProperty.call(fresh, key) && Object.is(held[key], fresh[key]));
-}
-
 // ── A census over several projects ──
 // `projects` null means every project the snapshot carries: task ROOTS, not
 // ORCHESTRATORS entries, so a tile's headline and its burndown history count
@@ -282,10 +272,11 @@ function unrequestedTerminalRows(served) {
 }
 
 // The Tasks tab's wanted set (PRD decision 5): its one filter covers every
-// project, so every one while the terminal view is selected, else each one
-// grouped by PRD.
-function terminalWindowProjects(projectIds, filter, groupedIds) {
-  return projectIds.filter(id => filter.terminal || groupedIds.includes(id));
+// project, so every one while the terminal view is selected, else none. The
+// by-PRD lanes read /prds and never request the window
+// (plans/dashboard-prd-lanes-prd.md §4.4).
+function terminalWindowProjects(projectIds, filter) {
+  return projectIds.filter(() => filter.terminal);
 }
 
 // The projects in `wanted` that were not in `wantedBefore`: the only ones a
@@ -363,7 +354,6 @@ const TASK_SNAPSHOT_API = {
   terminalWindowEntrants,
   terminalSelectingProjects,
   createTerminalWindowHooks,
-  sameDatum,
 };
 
 if (typeof module !== 'undefined' && module.exports) {

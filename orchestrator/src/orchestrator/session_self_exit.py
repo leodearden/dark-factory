@@ -6,8 +6,9 @@ A spawned session that has finished touches ``exit-requested`` in its record
 dir. On a proven-owner Stop, ``SelfExit.evaluate`` checks every precondition
 and returns the ``ExitRequest`` the hook stamps in its one write;
 ``SelfExit.enact`` then signals the owning ``claude`` and deletes the marker.
-Stdlib-only: ``session_hooks.py`` imports this at module scope and runs from a
-bare shell with only ``PYTHONPATH=orchestrator/src``, pinned by
+Stdlib plus the ``shared`` leaves below the ``session_registry`` import, whose
+bootstrap appends shared/src: ``session_hooks.py`` imports this at module scope
+and runs from a bare shell with only ``PYTHONPATH=orchestrator/src``, pinned by
 ``orchestrator/tests/test_session_registry.py::TestStdlibOnlySelfContainment``.
 Contract: plans/review-all-program-tooling-prd.md §4 H5 and §5 decision 10.
 """
@@ -27,6 +28,11 @@ from typing import Any
 
 from orchestrator import session_registry
 
+# session_registry's import puts this checkout's shared/src on sys.path for the bare shell.
+# isort: split
+from shared.process_identity import Liveness
+from shared.session_liveness import judge
+
 logger = logging.getLogger(__name__)
 
 _MARKER_READ_LIMIT = 4096
@@ -39,6 +45,7 @@ class SelfExitRefusal(StrEnum):
     SELF_EXIT_OFF = 'self-exit-off'
     RESULT_UNREADABLE = 'result-unreadable'
     OUTCOME_NOT_TERMINAL = 'outcome-not-terminal'
+    OTHER_HOST = 'other-host'
     OWNER_PID_UNRESOLVED = 'owner-pid-unresolved'
     OWNER_PID_MISMATCH = 'owner-pid-mismatch'
     SHARED_SESSION_HOST = 'shared-session-host'
@@ -144,6 +151,7 @@ def _first_refusal(
         return SelfExitRefusal.SELF_EXIT_OFF
     return (
         _outcome_refusal(record_dir)
+        or _host_refusal(record)
         or _owner_refusal(record.claude_owner_pid, owner_pid)
         or _hook_list_refusal(
             hook_input,
@@ -168,6 +176,16 @@ def _outcome_refusal(record_dir: Path) -> SelfExitRefusal | None:
     if session_registry.parse_result_outcome(text) in session_registry.TERMINAL_RESULT_OUTCOMES:
         return None
     return SelfExitRefusal.OUTCOME_NOT_TERMINAL
+
+
+def _host_refusal(record: session_registry.SessionRecord) -> SelfExitRefusal | None:
+    """An owner on another host is never compared with, nor signalled as, a local pid."""
+    identity = record.claude_owner_identity
+    owner_pid = record.claude_owner_pid
+    if identity is None or owner_pid is None:
+        return None
+    verdict = judge(identity, owner_pid, pid_alive=session_registry.pid_alive)
+    return SelfExitRefusal.OTHER_HOST if verdict is Liveness.OTHER_HOST else None
 
 
 def _owner_refusal(bound_pid: int | None, owner_pid: int | None) -> SelfExitRefusal | None:

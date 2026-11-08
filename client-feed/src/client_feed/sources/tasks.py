@@ -17,7 +17,7 @@ from shared.project_layout import tasks_db
 
 from client_feed.contract import CommitSha, RepoPath, Source, TaskStatus, WaitingOn
 from client_feed.redact import redact_paths
-from client_feed.sources.events import OpenEscalations
+from client_feed.sources.escalations import OpenEscalations
 from client_feed.sources.store import read_only
 
 TASK_TAG: Final = 'master'
@@ -26,7 +26,7 @@ LEO_LEVEL: Final = 2
 _FINISHED: Final = frozenset({TaskStatus.DONE, TaskStatus.CANCELLED})
 
 
-def waiting_on(status: TaskStatus, levels: Sequence[int | None]) -> WaitingOn | None:
+def waiting_on(status: TaskStatus, levels: Sequence[int]) -> WaitingOn | None:
     """Leo on an open level-2 escalation; the factory on any other, or on a block; no one once finished."""
     if status in _FINISHED:
         return None

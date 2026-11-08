@@ -56,6 +56,7 @@ class Resolution(enum.StrEnum):
     COMBINED = "combined"
     REFUSED = "refused"
     FAILED = "failed"
+    CANCELLED = "cancelled"
     EXISTING = "existing"
 
 
@@ -119,6 +120,7 @@ _RESOLUTION_OF = {
     task_store.TicketStatus.COMBINED: Resolution.COMBINED,
     task_store.TicketStatus.REFUSED: Resolution.REFUSED,
     task_store.TicketStatus.FAILED: Resolution.FAILED,
+    task_store.TicketStatus.CANCELLED: Resolution.CANCELLED,
 }
 
 _require_the_codebook_vocabulary("Step", (step.value for step in Step), codebook.FILED_TICKET_STEPS)

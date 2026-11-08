@@ -10,13 +10,15 @@ module from calling the constructor directly.
 
 from __future__ import annotations
 
+import os
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from shared.config_models import AccountConfig, UsageCapConfig
 
 from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
 from fused_memory.models.reconciliation import StageReport
@@ -35,7 +37,12 @@ if TYPE_CHECKING:
 
 _PIPELINE_STAGE_CLASSES = (MemoryConsolidator, TaskKnowledgeSync, IntegrityCheck)
 
+_FAKE_ACCOUNT_TOKEN_ENV = 'FM_TEST_FAKE_OAUTH_TOKEN'
+
 _BASELINE_RECONCILIATION_FIELDS: dict[str, Any] = {
+    'usage_cap': UsageCapConfig(
+        accounts=[AccountConfig(name='test', oauth_token_env=_FAKE_ACCOUNT_TOKEN_ENV)],
+    ),
     'enabled': True,
     'explore_codebase_root': '/tmp/test',
     'agent_llm_provider': 'anthropic',
@@ -110,16 +117,19 @@ def make_harness(
     """Build a harness; constructor kwargs not named here are forwarded only when given.
 
     ``taskmaster`` is required because ``None`` ("no taskmaster") is a meaningful
-    test input, not a default.
+    test input, not a default. The baseline config carries one account whose
+    token resolves only for the duration of construction, so no harness ever
+    adopts the machine's ``~/.claude`` login.
     """
-    return ReconciliationHarness(
-        memory_service=make_memory_service() if memory_service is None else memory_service,
-        taskmaster=taskmaster,
-        journal=journal,
-        event_buffer=event_buffer,
-        config=make_harness_config() if config is None else config,
-        **harness_kwargs,
-    )
+    with patch.dict(os.environ, {_FAKE_ACCOUNT_TOKEN_ENV: 'sk-ant-oat01-test'}):
+        return ReconciliationHarness(
+            memory_service=make_memory_service() if memory_service is None else memory_service,
+            taskmaster=taskmaster,
+            journal=journal,
+            event_buffer=event_buffer,
+            config=make_harness_config() if config is None else config,
+            **harness_kwargs,
+        )
 
 
 @asynccontextmanager
@@ -149,7 +159,7 @@ def stub_stage_runs(
     """Replace ``run`` on every pipeline stage class with *fake_run* until test teardown.
 
     *fake_run* has the signature
-    ``(self, events, watermark, prior_reports, run_id, model=None, resume_session_id=None)``.
+    ``(self, events, watermark, prior_reports, run_id, model=None)``.
     """
     for stage_class in _PIPELINE_STAGE_CLASSES:
         monkeypatch.setattr(stage_class, 'run', fake_run)

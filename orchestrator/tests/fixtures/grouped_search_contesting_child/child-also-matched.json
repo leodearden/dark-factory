@@ -25,7 +25,8 @@
             "digest": "Correction: the 600-second merge-lane verify timeout is outdated. Since the coalesce-train rollout the lane runs every verify under a 900-second ceiling, set as git.merge_verify_timeout_seconds in dark-factory-orchestrator.yaml, and a verif…",
             "created_at": "2026-09-20T00:00:00+00:00",
             "kind": "amendment",
-            "contested": true
+            "contested": true,
+            "content": "Correction: the 600-second merge-lane verify timeout is outdated. Since the coalesce-train rollout the lane runs every verify under a 900-second ceiling, set as git.merge_verify_timeout_seconds in dark-factory-orchestrator.yaml, and a verify that overruns it is parked as verify_timeout rather than retried. Plan around 900 seconds, not 600."
           }
         ],
         "amendment_count": 2,

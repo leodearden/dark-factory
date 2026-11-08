@@ -26,6 +26,7 @@ from pathlib import Path
 
 import pytest
 from config_reload_script_fakes import (
+    TOOL_RAISED,
     TRANSPORT_FAULTS,
     ClosedPort,
     FakeEscalationMcp,
@@ -66,6 +67,10 @@ SEEDS = {
         "review:\n"
         "  enabled: true\n"
     ),
+}
+SEEDS_AT_6 = {
+    "block_present": SEEDS["block_present"].replace("chain_cap: 0", "chain_cap: 6"),
+    "block_absent": SEEDS["block_absent"] + "\nmerge_deep:\n  chain_cap: 6\n",
 }
 
 
@@ -124,13 +129,13 @@ def _assert_left_nothing_behind(repo, env):
 # The forward transition: landed through the queue, then hot-applied
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("seed", list(SEEDS.values()), ids=list(SEEDS))
+@pytest.mark.parametrize("seed", list(SEEDS))
 def test_a_cap_change_lands_through_the_queue_then_is_hot_applied(tmp_path, deploy_env, seed):
     """0 -> 6 lands ONE deploy commit, touching only the yaml, as a merge of
     a task/deploy-* branch the queue verified; only then does the script
     reload, and it reads the knob out of the reload's `applied` disposition.
     Every tool call handshakes and releases its session."""
-    config = commit_config(init_repo(tmp_path), seed)
+    config = _seeded(tmp_path, seed)
     repo = config.parent
     before = head(repo)
     queue = FakeMergeQueue(repo, states=["verifying", "done"])
@@ -158,8 +163,7 @@ def test_a_cap_change_lands_through_the_queue_then_is_hot_applied(tmp_path, depl
     assert git(repo, "log", "-1", "--format=%s", deploy_commit).strip() == DEPLOY_MESSAGE
     assert git(repo, "show", "--name-only", "--format=", deploy_commit).split() == [CONFIG]
     landed = git(repo, "show", f"{deploy_commit}:{CONFIG}")
-    assert "merge_deep:\n  chain_cap: 6\n" in landed, landed
-    assert "chain_cap: 0" not in landed, landed
+    assert landed == SEEDS_AT_6[seed], landed
 
     (submitted,) = queue.calls_to("merge_request")
     assert (f"merge-deep-set-cap: landed task/{submitted['branch']} "
@@ -261,18 +265,20 @@ def test_sigterm_while_the_landing_polls_cancels_it_and_tears_down(tmp_path, dep
     _assert_left_nothing_behind(repo, deploy_env)
 
 
-def test_rerunning_at_the_cap_main_carries_dies_before_any_request(tmp_path, deploy_env):
+RERUN_SEEDS = {
+    "block_last": "project_root: /nowhere\nmerge_deep:\n  chain_cap: 6\n",
+    "blank_line_after_block": SEEDS_AT_6["block_present"],
+    "blank_line_at_eof": "project_root: /nowhere\nmerge_deep:\n  chain_cap: 6\n\n",
+}
+
+
+@pytest.mark.parametrize("seed", list(RERUN_SEEDS.values()), ids=list(RERUN_SEEDS))
+def test_rerunning_at_the_cap_main_carries_dies_before_any_request(tmp_path, deploy_env, seed):
     """Pins the documented non-idempotence: at the cap main already carries
     there is nothing to land, and the script dies before the server sees
-    anything.
-
-    The seed puts the merge_deep block LAST with no blank line after it on
-    purpose: step 1's editor drops a blank line FOLLOWING the block, so with
-    one there the re-run is not byte-identical and the no-op path this pins is
-    never exercised.
-    """
+    anything."""
     repo = init_repo(tmp_path)
-    config = commit_config(repo, "project_root: /nowhere\nmerge_deep:\n  chain_cap: 6\n")
+    config = commit_config(repo, seed)
     before = head(repo)
     queue = FakeMergeQueue(repo)
 
@@ -283,6 +289,36 @@ def test_rerunning_at_the_cap_main_carries_dies_before_any_request(tmp_path, dep
     assert failure_tag(proc) == "nothing_to_land"
     assert received == [], f"a no-op deploy reached the server: {received}"
     assert head(repo) == before
+    _assert_left_nothing_behind(repo, deploy_env)
+
+
+def test_a_cap_inserted_into_the_block_lands_above_its_blank_separator(tmp_path, deploy_env):
+    config = commit_config(
+        init_repo(tmp_path),
+        "project_root: /nowhere\n"
+        "merge_deep:\n"
+        "  # canary\n"
+        "\n"
+        "review:\n"
+        "  enabled: true\n",
+    )
+    repo = config.parent
+    queue = FakeMergeQueue(repo)
+
+    with _target(queue, reload_report(config_path=str(config), applied=APPLIED_6)) as server:
+        proc = _run(server, config, "6", env=deploy_env)
+
+    assert proc.returncode == 0, f"stdout={proc.stdout} stderr={proc.stderr}"
+    assert queue.has_landed()
+    assert git(repo, "show", f"main:{CONFIG}") == (
+        "project_root: /nowhere\n"
+        "merge_deep:\n"
+        "  # canary\n"
+        "  chain_cap: 6\n"
+        "\n"
+        "review:\n"
+        "  enabled: true\n"
+    )
     _assert_left_nothing_behind(repo, deploy_env)
 
 
@@ -463,6 +499,29 @@ def test_a_reload_that_never_reached_the_tool_fails_closed(tmp_path, deploy_env,
         proc = _run(server, config, "6", env=deploy_env)
 
     assert failure_tag(proc) == "no_reload_report"
+    assert outcome_verdict_lines(proc) == []
+    landed_as = head(repo)
+    assert queue.has_landed() and landed_as == queue.merge_sha
+    assert last_verdict(proc)["commit"] == queue.merge_sha
+    assert landed_as in proc.stderr, f"stderr={proc.stderr}"
+    assert "lands at the next restart" in proc.stderr, f"stderr={proc.stderr}"
+    assert "Traceback" not in proc.stderr, f"stderr={proc.stderr}"
+    _assert_left_nothing_behind(repo, deploy_env)
+
+
+def test_a_reload_that_raised_fails_closed_naming_the_tool(tmp_path, deploy_env):
+    """reload_config was reached and raised once the cap had landed: the
+    failure names the TOOL, which may have applied the cap before failing,
+    never a transport that did not deliver it."""
+    config = _seeded(tmp_path)
+    repo = config.parent
+    queue = FakeMergeQueue(repo)
+
+    with _target(queue, reload_report(config_path=str(config), applied=APPLIED_6),
+                 faults_armed=queue.has_landed, **TOOL_RAISED) as server:
+        proc = _run(server, config, "6", env=deploy_env)
+
+    assert failure_tag(proc) == "reload_raised"
     assert outcome_verdict_lines(proc) == []
     landed_as = head(repo)
     assert queue.has_landed() and landed_as == queue.merge_sha

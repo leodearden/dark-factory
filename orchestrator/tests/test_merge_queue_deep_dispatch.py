@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from _merge_deep_scene import (
@@ -80,6 +81,17 @@ from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 def _make_worker(git_ops: GitOps) -> SpeculativeMergeWorker:
     """Build a bare SpeculativeMergeWorker for unit tests (no harness wiring)."""
     return SpeculativeMergeWorker(git_ops, asyncio.Queue())
+
+
+def _seed_frontier(worker: SpeculativeMergeWorker, frontier: int) -> None:
+    """Stub *frontier* frozen entries that set ``_verify_frontier_depth()`` and are built on nothing.
+
+    Dispatch reads each frozen entry's ``item`` and ``gate`` for the bases a
+    new item may stack on; ``None`` for both contributes no base commit.
+    """
+    worker._frozen_inflight_entries = (  # type: ignore[assignment,method-assign]
+        lambda: [SimpleNamespace(item=None, gate=None) for _ in range(frontier)]
+    )
 
 
 def _owns_merge_worktree(worker: SpeculativeMergeWorker, wt: Path) -> bool:
@@ -448,10 +460,10 @@ class TestDeepChainPlacementGate:
         git_ops = _make_git_ops(git_repo)
         config = _make_config(git_repo, chain_cap=chain_cap)
         worker = _make_worker(git_ops)
-        worker._lane_buffers['normal'].extend(
+        worker._intake.replace_lane('normal', [
             _make_req(str(200 + i), str(200 + i), config, git_repo)
             for i in range(queued)
-        )
+        ])
         item = _make_item(
             _make_req('101', '101', config, git_repo), 'beef' * 10, git_repo,
         )
@@ -487,9 +499,9 @@ class TestDeepChainPlacementGate:
         git_ops = _make_git_ops(git_repo)
         config = _make_config(git_repo, chain_cap=6)
         worker = _make_worker(git_ops)
-        worker._lane_buffers['normal'].extend(
+        worker._intake.replace_lane('normal', [
             _make_req(str(300 + i), str(300 + i), config, git_repo) for i in range(5)
-        )
+        ])
         built = _spy_build_chain(monkeypatch)
         lanes = _count_spec_lane_acquires(git_ops, monkeypatch)
         scans = _spy_chain_snapshot(worker, monkeypatch)
@@ -631,9 +643,9 @@ class TestDeepChainPlacementBuild:
             await _create_branch_editing(git_repo, f'task/{task_id}', filename, content)
         head = await _merge_commit_off_main(git_repo, 'task/101', '101')
         worker = _make_worker(git_ops)
-        worker._lane_buffers['normal'].extend(
+        worker._intake.replace_lane('normal', [
             _make_req(task_id, task_id, config, git_repo) for task_id, _, _ in queued
-        )
+        ])
         item = _make_item(_make_req('101', '101', config, git_repo), head, git_repo)
         return git_ops, worker, item, head, config
 
@@ -1035,7 +1047,7 @@ class TestDeepChainPlacementBuild:
         monkeypatch.setattr(worker, '_note_conflict_detected', conflicts.append)
         store = _CapturingEventStore()
         worker._event_store = store
-        queued_reqs = list(worker._lane_buffers['normal'])
+        queued_reqs = list(worker._intake.buffered('normal'))
 
         res = await worker._deep_chain_placement(item)
 
@@ -1130,10 +1142,10 @@ class TestRunInflightVerifyChainRedirect:
             await _create_branch_editing(git_repo, f'task/{tid}', fn, f'edit-{tid}\n')
         head = await _merge_commit_off_main(git_repo, 'task/101', '101')
         worker = _make_worker(git_ops)
-        worker._lane_buffers['normal'].extend(
+        worker._intake.replace_lane('normal', [
             _make_req(tid, tid, config, git_repo) for tid in ('102', '103')
-        )
-        worker._frozen_inflight_entries = lambda: [object()] * frontier  # type: ignore[assignment,method-assign]
+        ])
+        _seed_frontier(worker, frontier)
         item = _make_item(
             _make_req('101', '101', config, git_repo), head,
             _ephemeral_merge_wt(git_ops, 'redirect'),
@@ -1730,7 +1742,7 @@ class TestDeepTipVerifyNeverAdopts:
         head = await _merge_commit_off_main(git_repo, 'task/101', '101')
         worker = _make_worker(git_ops)
         queued_reqs = [_make_req(tid, tid, config, git_repo) for tid in ('102', '103')]
-        worker._lane_buffers['normal'].extend(queued_reqs)
+        worker._intake.replace_lane('normal', queued_reqs)
         store = _CapturingEventStore()
         worker._event_store = store
         item = _make_item(
@@ -2029,15 +2041,13 @@ async def _make_deep_scene(
     store = _CapturingEventStore()
     worker = _make_worker(git_ops)
     worker._event_store = store
-    worker._lane_buffers['normal'].extend(
+    worker._intake.replace_lane('normal', [
         _make_req(tid, tid, config, repo) for tid in _DEEP_QUEUE
-    )
+    ])
     if allocator is not None:
         worker._host_allocator = allocator
     if frontier:
-        worker._frozen_inflight_entries = (  # type: ignore[assignment,method-assign]
-            lambda: [object()] * frontier
-        )
+        _seed_frontier(worker, frontier)
     scene = _DeepScene(git_ops, config, worker, head, repo, store)
 
     # ── the round recorder, installed ONCE ───────────────────────────────────

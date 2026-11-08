@@ -25,6 +25,7 @@ from typing import Literal
 from unittest.mock import AsyncMock
 
 import pytest
+from _merge_lane_fakes import lane_scene_config
 
 import orchestrator.suffix_graph as suffix_graph
 from orchestrator.config import GitConfig, OrchestratorConfig
@@ -85,7 +86,7 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
 
 @pytest.fixture
 def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
-    return OrchestratorConfig(project_root=git_repo, git=git_config)
+    return lane_scene_config(git_repo, git_config)
 
 
 def _make_req(
@@ -399,8 +400,8 @@ class TestTrackerBounceWithoutWorker:
     items that conflict with the frozen tip — no SpeculativeMergeWorker
     involved.
 
-    RED until step-6 GREEN moves the _bounce_conflicting_suffix_items() body
-    (verbatim) into SuffixConflictTracker.bounce_conflicting_suffix_items().
+    RED until step-6 GREEN moves the worker's bounce body (verbatim) into
+    SuffixConflictTracker.bounce_conflicting_suffix_items().
     """
 
     async def test_clean_rebase_requeues_item(self, git_ops, config, git_repo):

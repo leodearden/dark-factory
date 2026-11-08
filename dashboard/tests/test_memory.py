@@ -211,6 +211,20 @@ class TestSessionAwareHandler:
         assert handler.tool_calls == 0, 'no tools/call was issued'
 
 
+def _stall_host_before(port, seconds, handler):
+    """Wrap *handler* so a request to *port* first blocks the loop THREAD for *seconds*.
+
+    Models a starved xdist worker: the wall clock moves while the event loop cannot run.
+    """
+
+    async def stalled(request: httpx.Request) -> httpx.Response:
+        if request.url.port == port:
+            time.sleep(seconds)
+        return await handler(request)
+
+    return stalled
+
+
 @pytest.fixture(autouse=True)
 def _clean_sessions():
     """Reset session cache before each test."""
@@ -330,19 +344,26 @@ class TestMcpToolCallInvalidatesOnHang:
     TimeoutError from its own wait_for and never invalidated at all).
     """
 
+    @virtual_clock_test
     async def test_cancellation_invalidates_the_cached_session(self):
+        """Runs on shared/src/shared/testing_virtual_clock.py::virtual_clock_test."""
         from dashboard.data.memory import _get_session, _sessions, mcp_tool_call
 
+        deadline_seconds = 0.05
+        host_stall_seconds = 2 * deadline_seconds
         url = 'http://localhost:8000'
         handler = _SessionAwareHandler(hang_always=True)
-        transport = httpx.MockTransport(handler)
+        transport = httpx.MockTransport(
+            _stall_host_before(8000, host_stall_seconds, handler),
+        )
         _get_session(url)
         assert url in _sessions
 
         async with httpx.AsyncClient(transport=transport) as client:
             with pytest.raises(TimeoutError):
                 await asyncio.wait_for(
-                    mcp_tool_call(client, url, 'get_status', {}), timeout=0.05,
+                    mcp_tool_call(client, url, 'get_status', {}),
+                    timeout=deadline_seconds,
                 )
 
         assert handler.tool_calls == 1, 'the hang must be in tools/call'
@@ -1063,20 +1084,6 @@ class TestAggregatingLoopsLogFailuresAtWarning:
             f'five poll cycles against one dead server must warn once, got '
             f'{[r.getMessage() for r in warnings]}'
         )
-
-
-def _stall_host_before(port, seconds, handler):
-    """Wrap *handler* so a request to *port* first blocks the loop THREAD for *seconds*.
-
-    Models a starved xdist worker: the wall clock moves while the event loop cannot run.
-    """
-
-    async def stalled(request: httpx.Request) -> httpx.Response:
-        if request.url.port == port:
-            time.sleep(seconds)
-        return await handler(request)
-
-    return stalled
 
 
 # ── one hung url must not starve the hand-rolled per-URL loops ──

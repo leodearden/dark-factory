@@ -1,7 +1,7 @@
 """Routing κ — judge-model OFAT pilot: decide + render + analyze (task 2815).
 
 An ADDITIVE, CONSUME-ONLY analysis surface over the eval-revival ο judge-OFAT
-seam (task 2825). This module IMPORTS ``report.build_composite_report`` /
+seam (task 2825). This module IMPORTS ``composite_report.py::build_composite_report`` /
 ``format_composite_table`` and consumes ``ResultStore.load_all`` / ``run_ofat_stage``
 output, and MODIFIES NONE of them (PRD decision 11 forbids this PRD from editing the eval
 instrument — runner.py / configs.py / the judge / the Elo machinery). It is the
@@ -23,8 +23,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from .composite_report import build_composite_report, format_composite_table
 from .metrics import RoleUnderTest
-from .report import build_composite_report, format_composite_table
 
 if TYPE_CHECKING:
     from .results import EvalResult
@@ -248,7 +248,7 @@ def select_judge_results(results: list[EvalResult]) -> list[EvalResult]:
 
     The ο judge branch makes each judge-candidate ``EvalResult`` a JUDGE cell;
     every other row (implementer / architect / end_to_end) is
-    dropped. Filtering BEFORE :func:`report.build_composite_report` matters for
+    dropped. Filtering BEFORE ``composite_report.py::build_composite_report`` matters for
     correctness, not just tidiness: a stray non-judge row sharing a fixture would
     otherwise shift that fixture's cost/latency normalization floor and distort
     the judge composites. Pure over *results*, order-preserving.
@@ -266,7 +266,7 @@ def analyze_judge_ofat(
     """Filter → composite → decide: the full judge-OFAT analysis over *results*.
 
     Filters to judge rows (:func:`select_judge_results`), builds the λ
-    :func:`report.build_composite_report` over them, runs
+    ``composite_report.py::build_composite_report`` over them, runs
     :func:`decide_judge_adoption`, and returns ``(decision, composite_report)`` so
     the caller can both act on the verdict and render the embedded table. Consumes
     ο's seam wholesale — invents no new per-config schema.
@@ -299,7 +299,7 @@ def format_judge_ofat_report(
     incumbent/candidate + composite/raw-quality/cost/judge-cost deltas — the raw
     quality delta sits next to the cost-normalized composite so a borderline
     verdict's pure quality gap is visible), the structured
-    ``reasons``, the EMBEDDED :func:`report.format_composite_table` data section
+    ``reasons``, the EMBEDDED ``composite_report.py::format_composite_table`` data section
     (so the committed report is consistent with every other eval surface and
     stays byte-stable), and a decide-and-act footer: on ``adopt`` the recommended
     ``models.judge`` flip; on ``marginal``/``reject`` a keep-sonnet + escalate

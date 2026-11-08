@@ -25,7 +25,7 @@ from fused_memory.middleware.curator_types import (
 from fused_memory.middleware.task_curator import TaskCurator
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.middleware.ticket_janitor import curation_backlog_anchor
-from fused_memory.middleware.ticket_store import AWAITING_CURATION, TicketStore
+from fused_memory.middleware.ticket_store import TicketStatus, TicketStore
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.server.main import _build_ticket_janitor
 
@@ -47,7 +47,7 @@ class _DeferThenHoldCurator:
     ) -> PreparedCandidate:
         return PreparedCandidate(candidate=candidate, pool=[], pool_sizes={}, prompt_tokens=0)
 
-    async def curate_batch_prepared(
+    async def curate_prepared(
         self, prepared: list[PreparedCandidate], project_id: str, project_root: str,
     ) -> list[CuratorDecision]:
         if self._defer_next:
@@ -59,11 +59,6 @@ class _DeferThenHoldCurator:
 
     async def close(self) -> None:
         return None
-
-
-@pytest.fixture(autouse=True)
-def _combine_audit_in_tmp(monkeypatch, tmp_path):
-    monkeypatch.setenv('DARK_FACTORY_DATA_DIR', str(tmp_path / 'data'))
 
 
 @pytest.fixture
@@ -112,7 +107,7 @@ async def _park_through(interceptor: TaskInterceptor) -> str:
         interceptor.resolve_ticket(ticket_id, PROJECT_ROOT, timeout_seconds=DEADLINE_SECONDS),
         timeout=DEADLINE_SECONDS + 1,
     )
-    assert answer['status'] == AWAITING_CURATION
+    assert answer['status'] == TicketStatus.AWAITING_CURATION
     return ticket_id
 
 
