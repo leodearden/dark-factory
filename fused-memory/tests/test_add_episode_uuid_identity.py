@@ -952,7 +952,7 @@ async def test_a_connect_timeout_reads_as_an_unreached_provider():
     ],
 )
 @pytest.mark.asyncio
-async def test_a_provider_failure_past_the_connect_phase_stays_red(handler):
+async def test_a_provider_failure_other_than_a_connect_timeout_stays_red(handler):
     assert _unreached_provider_skip_reason(await _sdk_error(handler)) is None
 
 
