@@ -453,15 +453,18 @@ _CURATOR_HEURISTICS = """\
    to the lock set, refuse and "create" instead.
 3. Planning budget. The rewritten task can be planned by one architect in one \
    session: ≤ 15 files_to_modify, ≤ 5 distinct concerns at bullet level, combined \
-   details under ~8000 chars.
+   details under ~8000 chars. Each follow-up item a task carries (its \
+   followup_items count, or its listed items) is one concern toward that ≤ 5.
 4. No critical-path drag. If the target is high-priority and on a milestone critical \
    path, the candidate must itself be critical or tightly coupled to the target's \
    correctness. Do NOT weigh critical work down with adjacent nice-to-haves.
 
 ## Positive signals (bias toward combining when the above hold)
 
-- Either task alone is tiny (< 300 chars of real detail, or < 3 files). Tiny tasks \
-  have orchestrator overhead disproportionate to the work delivered.
+- Either task's declared-scope band is `narrow` (shown as `declared_scope: narrow` \
+  or `band=narrow`): it declared small work when it was filed, so its orchestrator \
+  overhead is disproportionate to the work. The band says what a task declared, not \
+  what it will cost, and an `unstamped` band carries no information either way.
 - The two tasks share a root cause or subsystem concept — fixing both together \
   means the implementer loads context once.
 - They will serialize on the same module lock anyway (scheduler already serializes \
