@@ -175,9 +175,7 @@ async def _seed_prior_incarnation(git_ops: GitOps) -> str:
     _, tip, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=worktree)
     tip = tip.strip()
 
-    artifacts = TaskArtifacts(
-        worktree, TaskArtifacts.meta_root_for(worktree.parent, worktree.name),
-    )
+    artifacts = TaskArtifacts.for_task(worktree, TASK_ID)
     artifacts.init(TASK_ID, TITLE, DESCRIPTION, base_commit=main_sha)
     plan = copy.deepcopy(PLAN)
     for step in plan['steps']:
@@ -189,7 +187,7 @@ async def _seed_prior_incarnation(git_ops: GitOps) -> str:
         _task_text_fp=task_text_fingerprint(DESCRIPTION, None),
     )
     assert all((worktree / f).exists() for f in plan['files'])
-    (artifacts.root / 'plan.json').write_text(json.dumps(plan))
+    artifacts.artifact_path('plan.json').write_text(json.dumps(plan))
     return tip
 
 
