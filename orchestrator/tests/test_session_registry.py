@@ -11727,6 +11727,18 @@ _ENVIRONMENT = '3f9a1c2e-5b7d-4e8f-9a0b-1c2d3e4f5a6b'
 _GONE_THREAD = '2c4e6a8b-0d1f-4a3c-9e5b-7d9f1b3d5e70'
 
 
+class _ThreadEnded:
+    """A ``thread_ended`` predicate answering *answer* for every thread, recording each thread asked."""
+
+    def __init__(self, answer: bool = True) -> None:
+        self.answer = answer
+        self.calls: list[str] = []
+
+    def __call__(self, thread_id: str) -> bool:
+        self.calls.append(thread_id)
+        return self.answer
+
+
 class TestMarkT3SessionsExited:
     def test_marks_only_indexed_records_of_this_environment_whose_thread_is_gone(
         self, tmp_path: Path
@@ -11743,7 +11755,9 @@ class TestMarkT3SessionsExited:
         )
         _t3_record(tmp_path, 'unindexed', unindexed_thread, cwd=cwd, environment_id=_ENVIRONMENT)
 
-        marked = sr.mark_t3_sessions_exited(_ENVIRONMENT, frozenset({_THREAD}), root=tmp_path)
+        marked = sr.mark_t3_sessions_exited(
+            _ENVIRONMENT, frozenset({_THREAD}), root=tmp_path, thread_ended=_ThreadEnded()
+        )
 
         assert marked == ['gone']
         gone = sr.read_record('gone', root=tmp_path)
@@ -11757,7 +11771,9 @@ class TestMarkT3SessionsExited:
     def test_a_record_with_no_environment_is_this_environments(self, tmp_path: Path) -> None:
         _t3_record(tmp_path, 'legacy', _GONE_THREAD, cwd=str(tmp_path), pointer=True)
 
-        assert sr.mark_t3_sessions_exited(_ENVIRONMENT, frozenset(), root=tmp_path) == ['legacy']
+        assert sr.mark_t3_sessions_exited(
+            _ENVIRONMENT, frozenset(), root=tmp_path, thread_ended=_ThreadEnded()
+        ) == ['legacy']
 
     def test_a_worktree_bound_record_is_marked_whatever_its_cwd(self, tmp_path: Path) -> None:
         worktree = tmp_path / 'proj' / '.worktrees' / '8124'
@@ -11770,20 +11786,61 @@ class TestMarkT3SessionsExited:
             pointer=True,
         )
 
-        assert sr.mark_t3_sessions_exited(_ENVIRONMENT, frozenset(), root=tmp_path) == [
-            'worktree-bound'
-        ]
+        assert sr.mark_t3_sessions_exited(
+            _ENVIRONMENT, frozenset(), root=tmp_path, thread_ended=_ThreadEnded()
+        ) == ['worktree-bound']
 
-    def test_a_record_written_after_the_listing_is_skipped(self, tmp_path: Path) -> None:
+    def test_a_record_written_after_the_listing_is_skipped_unasked(self, tmp_path: Path) -> None:
         _t3_record(tmp_path, 'just-launched', _GONE_THREAD, cwd=str(tmp_path), pointer=True)
         listed_at = datetime.now(UTC) - timedelta(minutes=1)
+        thread_ended = _ThreadEnded()
 
         assert (
             sr.mark_t3_sessions_exited(
-                _ENVIRONMENT, frozenset(), root=tmp_path, listed_at=listed_at
+                _ENVIRONMENT,
+                frozenset(),
+                root=tmp_path,
+                listed_at=listed_at,
+                thread_ended=thread_ended,
             )
             == []
         )
+        assert thread_ended.calls == []
+
+    def test_an_unlisted_thread_not_confirmed_ended_keeps_its_record(self, tmp_path: Path) -> None:
+        _t3_record(
+            tmp_path, 'side-chat', _GONE_THREAD, cwd=str(tmp_path), environment_id=_ENVIRONMENT, pointer=True
+        )
+
+        marked = sr.mark_t3_sessions_exited(
+            _ENVIRONMENT, frozenset(), root=tmp_path, thread_ended=_ThreadEnded(answer=False)
+        )
+
+        assert marked == []
+        assert sr.read_record('side-chat', root=tmp_path).status == sr.Status.RUNNING
+        assert sr.resolve_session_slug_for_t3_thread(_GONE_THREAD, root=tmp_path) == 'side-chat'
+
+    def test_only_this_environments_unlisted_indexed_threads_are_confirmed(
+        self, tmp_path: Path
+    ) -> None:
+        foreign_thread, unindexed_thread = (
+            '4e6a8c0d-2f1b-4c5e-8a7d-9b1d3f5a7c92',
+            '6a8c0e2f-4b3d-4e7a-8c9f-1d3f5b7d9e14',
+        )
+        cwd = str(tmp_path)
+        _t3_record(tmp_path, 'listed', _THREAD, cwd=cwd, environment_id=_ENVIRONMENT, pointer=True)
+        _t3_record(tmp_path, 'gone', _GONE_THREAD, cwd=cwd, environment_id=_ENVIRONMENT, pointer=True)
+        _t3_record(
+            tmp_path, 'foreign', foreign_thread, cwd=cwd, environment_id='env-elsewhere', pointer=True
+        )
+        _t3_record(tmp_path, 'unindexed', unindexed_thread, cwd=cwd, environment_id=_ENVIRONMENT)
+        thread_ended = _ThreadEnded()
+
+        sr.mark_t3_sessions_exited(
+            _ENVIRONMENT, frozenset({_THREAD}), root=tmp_path, thread_ended=thread_ended
+        )
+
+        assert thread_ended.calls == [_GONE_THREAD]
 
     def test_one_info_line_reports_the_index_entries_scanned(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
@@ -11797,7 +11854,10 @@ class TestMarkT3SessionsExited:
 
         with caplog.at_level(logging.INFO, logger='orchestrator.session_registry'):
             sr.mark_t3_sessions_exited(
-                _ENVIRONMENT, frozenset({_THREAD, _OTHER_THREAD}), root=tmp_path
+                _ENVIRONMENT,
+                frozenset({_THREAD, _OTHER_THREAD}),
+                root=tmp_path,
+                thread_ended=_ThreadEnded(),
             )
 
         [line] = [

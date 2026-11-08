@@ -605,12 +605,49 @@ class TestLaunch:
         self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         stale_dir = stale_t3_record(env)
+        t3.tool_replies['t3_thread_read'] = ToolFailure('thread_not_found', 'Thread th-vanished was not found.')
 
         launch_line(capsys, tmp_path, env.project)
 
         stale = sr.read_record(Path(stale_dir).name, root=env.fleet)
         assert (stale.status, stale.exit_code) == (sr.Status.EXITED, sr.ORPHAN_EXIT_CODE)
         assert t3.tool_calls('t3_thread_list') == [{'allProjects': True, 'limit': 100}]
+
+    def test_an_unlisted_thread_whose_read_archives_it_is_swept(
+        self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        stale_dir = stale_t3_record(env)
+        t3.tool_replies['t3_thread_read'] = thread_read(threadId='th-vanished', archived=True)
+
+        launch_line(capsys, tmp_path, env.project)
+
+        stale = sr.read_record(Path(stale_dir).name, root=env.fleet)
+        assert (stale.status, stale.exit_code) == (sr.Status.EXITED, sr.ORPHAN_EXIT_CODE)
+
+    def test_an_unlisted_thread_that_still_reads_present_is_not_swept(
+        self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """T3 v0.1.6 lists no side chat (``ThreadManagementService.ts::listProjectThreads``), yet it is live."""
+        stale_dir = stale_t3_record(env)
+        t3.tool_replies['t3_thread_read'] = thread_read(threadId='th-vanished')
+
+        launch_line(capsys, tmp_path, env.project)
+
+        assert sr.read_record(Path(stale_dir).name, root=env.fleet).status == sr.Status.LAUNCHING
+        assert sr.resolve_session_slug_for_t3_thread('th-vanished', root=env.fleet) == (
+            Path(stale_dir).name
+        )
+        assert t3.tool_calls('t3_thread_read') == [{'threadId': 'th-vanished', 'limit': 1}]
+
+    def test_an_unlisted_thread_whose_read_fails_is_not_swept(
+        self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        stale_dir = stale_t3_record(env)
+        t3.tool_replies['t3_thread_read'] = ToolFailure('orchestration_error', 'busy')
+
+        launch_line(capsys, tmp_path, env.project)
+
+        assert sr.read_record(Path(stale_dir).name, root=env.fleet).status == sr.Status.LAUNCHING
 
     def test_a_record_of_another_environment_is_left_to_its_own_sweep(
         self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -623,6 +660,7 @@ class TestLaunch:
         assert sr.resolve_session_slug_for_t3_thread('th-vanished', root=env.fleet) == (
             Path(stale_dir).name
         )
+        assert t3.tool_calls('t3_thread_read') == []
 
     def test_an_incomplete_thread_listing_sweeps_nothing(
         self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -1533,6 +1571,18 @@ class TestWait:
         stale = sr.read_record(Path(stale_dir).name, root=env.fleet)
         assert (stale.status, stale.exit_code) == (sr.Status.EXITED, sr.ORPHAN_EXIT_CODE)
         assert t3.tool_calls('t3_thread_list') == [{'allProjects': True, 'limit': 100}]
+
+    def test_a_pass_leaves_an_unlisted_thread_that_still_reads_present(self, env: Env, t3: FakeT3Server) -> None:
+        stale_dir = stale_t3_record(env)
+
+        def read_per_thread(arguments: Mapping[str, Any]) -> ToolSuccess:
+            thread_id = arguments['threadId']
+            return thread_read(threadId=thread_id, archived=thread_id == THREAD_ID)
+
+        t3.tool_replies['t3_thread_read'] = read_per_thread
+
+        assert wait_for(env, '', FakeClock()) == 'finished code=0'
+        assert sr.read_record(Path(stale_dir).name, root=env.fleet).status == sr.Status.LAUNCHING
 
     def test_an_incomplete_listing_sweeps_nothing_while_waiting(self, env: Env, t3: FakeT3Server) -> None:
         stale_dir = stale_t3_record(env)
