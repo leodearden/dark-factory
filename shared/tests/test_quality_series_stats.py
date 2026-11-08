@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import statistics
 from dataclasses import astuple
 from datetime import UTC, datetime, timedelta
@@ -12,13 +13,18 @@ import pytest
 from shared.quality_series.stats import (
     RegimeEvent,
     bootstrap_interval,
+    cap_occurrences,
     content_seed,
+    cost_fit,
     cusum_alarms,
     cusum_design,
     ewma_limits,
     ewma_series,
     explain_alarm,
+    log_residuals,
     newcombe_difference,
+    reference_cost,
+    theil_sen,
     wilson_interval,
 )
 
@@ -167,3 +173,57 @@ class TestExplainAlarm:
         landed_at = _hourly(200)
         events = [RegimeEvent('zeta', landed_at[145]), RegimeEvent('alpha', landed_at[155])]
         assert explain_alarm(150, landed_at[150], events, landed_at) == 'alpha'
+
+
+class TestTheilSen:
+    _XS = [float(x) for x in range(1, 21)]
+
+    def test_recovers_an_exact_line(self) -> None:
+        ys = [0.7 + 0.57 * x for x in self._XS]
+        assert theil_sen(self._XS, ys) == pytest.approx((0.7, 0.57), abs=1e-9)
+
+    def test_one_gross_outlier_moves_nothing(self) -> None:
+        ys = [0.7 + 0.57 * x for x in self._XS]
+        ys[7] = 500.0
+        assert theil_sen(self._XS, ys) == pytest.approx((0.7, 0.57), abs=1e-9)
+
+    @pytest.mark.parametrize('xs', [[3.0], [3.0, 3.0, 3.0]])
+    def test_fewer_than_two_distinct_xs_are_refused(self, xs: list[float]) -> None:
+        with pytest.raises(ValueError):
+            theil_sen(xs, [1.0] * len(xs))
+
+
+class TestCostModel:
+    _LINES = [10, 50, 100, 400, 1000, 2500, 2]
+    _COSTS = [2 * n**0.5 for n in _LINES[:-1]] + [40.0]
+
+    def test_reference_cost_reads_the_power_law_at_100_lines(self) -> None:
+        assert reference_cost(self._LINES, self._COSTS) == pytest.approx(20.0, abs=1e-9)
+
+    def test_reference_cost_at_another_size(self) -> None:
+        assert reference_cost(self._LINES, self._COSTS, ref=400) == pytest.approx(40.0, abs=1e-9)
+
+    def test_fit_excludes_landings_below_min_lines(self) -> None:
+        a, b = cost_fit(self._LINES, self._COSTS)
+        assert (a, b) == pytest.approx((math.log(2), 0.5), abs=1e-9)
+
+    def test_log_residuals_measure_against_the_fit_and_skip_unmeasurable_points(self) -> None:
+        a, b = math.log(2), 0.5
+        residuals = log_residuals([100, 0, 100, 400], [20.0, 5.0, 0.0, 40.0 * math.e], a, b)
+        assert residuals[0] == pytest.approx(0.0, abs=1e-9)
+        assert residuals[1] is None
+        assert residuals[2] is None
+        assert residuals[3] == pytest.approx(1.0, abs=1e-9)
+
+
+class TestCapOccurrences:
+    def test_bearing_flags_and_mass_events_at_the_floor(self) -> None:
+        capped = cap_occurrences([1, 3, 0, 25, 478], baseline_median=2, floor=20)
+        assert capped.bearing == (True, True, False, True, True)
+        assert capped.mass_event_indices == (3, 4)
+        assert capped.cap == 20
+
+    def test_the_baseline_relative_term_raises_the_cap(self) -> None:
+        capped = cap_occurrences([1, 3, 0, 25, 478], baseline_median=5, floor=20)
+        assert capped.mass_event_indices == (4,)
+        assert capped.cap == 50
