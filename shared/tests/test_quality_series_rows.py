@@ -159,3 +159,86 @@ def test_a_landing_row_is_frozen(outcome_rows):
     row = next(iter(outcome_rows.values()))
     with pytest.raises(dataclasses.FrozenInstanceError):
         row.outcomes = row.outcomes  # type: ignore[misc]
+
+
+@pytest.fixture(scope='module')
+def cost_scenario(tmp_path_factory: pytest.TempPathFactory) -> LandingScenario:
+    """The step-11 history plus invocations, invocation_end turns and task_results rows."""
+    s = build_landing_scenario(tmp_path_factory.mktemp('cost') / 'proj')
+    db = s.db
+    db.invocation('101', 'architect', 1.0, at_hour(8.0))
+    db.invocation('101', 'implementer', 2.0, at_hour(8.5))
+    db.invocation('101', 'implementer', 2.0, at_hour(9.0))
+    db.invocation('101', 'reviewer_comprehensive', 0.5, at_hour(9.5))
+    db.invocation('101', 'implementer', 3.0, at_hour(10.5))
+    db.invocation('102', 'simple_task', 1.5, at_hour(10.2))
+    db.invocation('107', 'architect', 0.7, at_hour(13.2))
+
+    db.invocation_end(at_hour(8.6), '101', 'implementer', 30)
+    db.invocation_end(at_hour(9.1), '101', 'implementer', 50, capped_reason='turns')
+    db.invocation_end(at_hour(9.6), '101', 'reviewer_comprehensive', 99)
+    db.invocation_end(at_hour(10.25), '102', 'simple_task', 12)
+
+    db.task_result('101', 'run-a', 'requeued', at_hour(9.2), execute_iterations=1)
+    db.task_result('101', 'run-b', 'blocked', at_hour(9.8), execute_iterations=2)
+    db.task_result('101', 'run-c', 'done', at_hour(10.4), execute_iterations=3)
+    db.task_result('101', 'run-d', 'cancelled', '', execute_iterations=5)
+    return s
+
+
+@pytest.fixture(scope='module')
+def cost_rows(cost_scenario: LandingScenario) -> dict[tuple[str, str], LandingRow]:
+    return _by_key(_rows(cost_scenario))
+
+
+class TestInvocationCost:
+    def test_all_roles_by_role_and_implementer_invocations(self, cost_scenario, cost_rows):
+        cost = cost_rows[('101', cost_scenario.m1)].cost
+        assert cost.all_role_usd == pytest.approx(5.5)
+        assert cost.by_role == (
+            ('architect', 1.0), ('implementer', 4.0), ('reviewer_comprehensive', 0.5),
+        )
+        assert cost.implementer_invocations == 2
+
+    def test_a_second_landing_counts_only_what_started_after_the_first(
+        self, cost_scenario, cost_rows
+    ):
+        cost = cost_rows[('101', cost_scenario.m6)].cost
+        assert cost.all_role_usd == pytest.approx(3.0)
+        assert cost.by_role == (('implementer', 3.0),)
+        assert cost.implementer_invocations == 1
+
+    def test_simple_task_is_implementer_class(self, cost_scenario, cost_rows):
+        assert cost_rows[('102', cost_scenario.f2)].cost.implementer_invocations == 1
+
+    def test_only_an_architect_invocation_is_zero_implementer_invocations(
+        self, cost_scenario, cost_rows
+    ):
+        cost = cost_rows[('107', cost_scenario.m7)].cost
+        assert (cost.all_role_usd, cost.implementer_invocations) == (pytest.approx(0.7), 0)
+
+    def test_no_invocation_at_all_is_unknown_cost(self, cost_scenario, cost_rows):
+        cost = cost_rows[('108', cost_scenario.m8)].cost
+        assert (cost.all_role_usd, cost.implementer_invocations, cost.by_role) == (None, None, ())
+
+
+class TestTurns:
+    def test_implementer_turns_sum_and_a_cap_is_flagged(self, cost_scenario, cost_rows):
+        cost = cost_rows[('101', cost_scenario.m1)].cost
+        assert (cost.turns, cost.turns_capped) == (80, True)
+
+    def test_simple_task_turns_count(self, cost_scenario, cost_rows):
+        cost = cost_rows[('102', cost_scenario.f2)].cost
+        assert (cost.turns, cost.turns_capped) == (12, False)
+
+    def test_no_implementer_invocation_end_is_unknown_turns(self, cost_scenario, cost_rows):
+        cost = cost_rows[('107', cost_scenario.m7)].cost
+        assert (cost.turns, cost.turns_capped) == (None, False)
+
+
+class TestExecuteIterations:
+    def test_sums_rows_completed_inside_the_window(self, cost_scenario, cost_rows):
+        assert cost_rows[('101', cost_scenario.m1)].cost.execute_iterations == 3
+
+    def test_no_rows_is_unknown(self, cost_scenario, cost_rows):
+        assert cost_rows[('107', cost_scenario.m7)].cost.execute_iterations is None
