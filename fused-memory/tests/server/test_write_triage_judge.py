@@ -2940,7 +2940,9 @@ async def _live_judge_verdict(**judge_kwargs: Any) -> TriageJudgeVerdict:
     """`judge_write`'s verdict; no verdict for a provider-side reason skips, every other failure stays red.
 
     A budget expiry, a provider 5xx and a provider 429 each yield no verdict, so they say nothing
-    about the wording. Connection errors, SDK timeouts, other 4xx and unusable answers stay red.
+    about the wording. Connection errors, SDK timeouts, other 4xx and unusable answers stay red,
+    and so does a 429 whose code is `insufficient_quota`: an account out of credit is a lasting
+    fault, and skipping it would silently retire every wording check on every run.
     TestTheFrontierArmLive keeps a timeout red: it is the live edge for the fail-open/latency
     dimension.
     """
@@ -2955,6 +2957,8 @@ async def _live_judge_verdict(**judge_kwargs: Any) -> TriageJudgeVerdict:
             f'fail-open (contract C1, write_triage.py::triage_write); no wording was observed',
         )
     except (openai.InternalServerError, openai.RateLimitError) as exc:
+        if exc.code == 'insufficient_quota':
+            raise
         service = judge_kwargs['memory_service']
         pytest.skip(
             f'{resolve_judge_model(service)} (effort {resolve_judge_reasoning_effort(service)}) '
@@ -2980,7 +2984,7 @@ def _raises_without_skipping(
 
 
 class TestTheLiveWordingBudgetGuard:
-    """`_live_judge_verdict` skips only a budget expiry, a provider 5xx or a 429; the rest stays red."""
+    """`_live_judge_verdict` skips only a budget expiry, a provider 5xx or a transient 429; the rest stays red."""
 
     @staticmethod
     def _judge_kwargs(**write_triage: Any) -> dict[str, Any]:
@@ -3082,8 +3086,12 @@ class TestTheLiveWordingBudgetGuard:
             openai.BadRequestError(
                 'bad', response=httpx.Response(400, request=_RESPONSES_REQUEST), body=None,
             ),
+            openai.RateLimitError(
+                'out of credit', response=httpx.Response(429, request=_RESPONSES_REQUEST),
+                body={'code': 'insufficient_quota', 'type': 'insufficient_quota'},
+            ),
         ],
-        ids=['provider-400'],
+        ids=['provider-400', 'provider-429-insufficient-quota'],
     )
     async def test_a_non_retryable_provider_status_stays_red(
         self, error: openai.APIStatusError,
@@ -3107,8 +3115,8 @@ class TestTheShippedWordingLive:
 
     Pinned to Sol: gpt-4o-mini labels both outdated entries `contested` under
     the old wording too, so only Sol tells the two wordings apart. A call past
-    the judge budget, or one the provider answers with a 5xx or a 429, skips
-    through `_live_judge_verdict`.
+    the judge budget, or one the provider answers with a 5xx or a transient
+    429, skips through `_live_judge_verdict`.
     """
 
     @pytest.mark.asyncio
