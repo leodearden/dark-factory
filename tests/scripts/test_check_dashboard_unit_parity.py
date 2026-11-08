@@ -1228,6 +1228,29 @@ def test_exec_start_flag_that_lost_its_argument_is_drift_naming_no_argument():
     assert "argument differs" in drift.reason, drift.reason
 
 
+def test_flag_repeated_on_the_installed_command_only_is_drift():
+    """An appended installed `--port 9090` override is drift, not parity on the first `--port`.
+
+    uvicorn (click) and uv (clap) apply the LAST occurrence, so a reader that
+    stopped at the first would report parity on a unit that listens elsewhere.
+    """
+    mod = _load_checker()
+    spec = _flag_spec(mod, "port")
+
+    drifts = mod.compare_unit(
+        spec,
+        _exec_unit("/usr/bin/uv", "/opt/df", _BOTH_FLAGS),
+        _exec_unit("/usr/bin/uv", "/opt/df", f"{_BOTH_FLAGS} \\\n  --port 9090"),
+    )
+
+    assert len(drifts) == 1, drifts
+    (drift,) = drifts
+    assert drift.key == "ExecStart --port"
+    assert drift.repo_value == "8080"
+    assert drift.installed_value == "8080 | 9090"
+    assert "argument differs" in drift.reason, drift.reason
+
+
 def _switch_spec(mod: types.ModuleType, *switches: str):
     """A minimal UnitSpec that compares exactly *switches* inside ExecStart."""
     return mod.UnitSpec(
@@ -1331,8 +1354,8 @@ def test_exec_start_switch_lookup_ignores_the_comment_block():
 def test_exec_start_switch_does_not_disturb_flag_reading():
     """A switch beside a flag leaves the flag's argument read correctly.
 
-    The hazard the separate field exists for: `--no-sync --project dashboard`
-    read as a FLAG would take `--project` as no-sync's argument.
+    In `--no-sync --project dashboard`, --project still reads `dashboard`, and
+    no-sync compares by presence alone.
     """
     mod = _load_checker()
     spec = mod.UnitSpec(
@@ -1506,8 +1529,10 @@ def _flags_missing_their_argument(mod: types.ModuleType, spec, service) -> list[
     """Registered flags of *spec* that read as NO_ARGUMENT on *service*.
 
     A switch mis-registered on exec_start_flags has no argument to read:
-    `--no-sync --project dashboard` follows no-sync with another option. Shared
-    by the guard and its proof, as _unregistered_directives is.
+    `--no-sync --project dashboard` follows no-sync with another option. A
+    switch followed by a positional is NOT detected: it reads that positional
+    as its argument. Shared by the guard and its proof, as
+    _unregistered_directives is.
     """
     readings = spec.read_exec_start_options(service)
     return [flag for flag in spec.exec_start_flags if readings[flag] == mod.NO_ARGUMENT]
@@ -1809,19 +1834,6 @@ def test_exec_start_option_names_lists_every_long_option():
     ), "options named only in the comment block must not be listed"
 
 
-def _uncompared_exec_start_options(mod: types.ModuleType, spec, service) -> list[str]:
-    """Every long option on *service*'s ExecStart that *spec* neither compares nor waives.
-
-    Takes the spec and the parsed section, as _unregistered_directives does, so
-    the real registry and the throwaway fixture proving the guard fires share
-    one code path.
-    """
-    waived = {name for name, _reason in spec.unchecked_exec_start_options}
-    return sorted(
-        mod.exec_start_option_names(service) - spec.covered_exec_start_options() - waived
-    )
-
-
 def test_every_committed_exec_start_option_is_compared_or_explicitly_unchecked():
     """COMPLETENESS GUARD, ExecStart option edition: every long option was considered.
 
@@ -1833,7 +1845,7 @@ def test_every_committed_exec_start_option_is_compared_or_explicitly_unchecked()
     mod = _load_checker()
 
     for name, spec in mod.UNITS.items():
-        uncompared = _uncompared_exec_start_options(mod, spec, _committed_service(spec))
+        uncompared = sorted(spec.unregistered_exec_start_options(_committed_service(spec)))
         assert uncompared == [], (
             f"{name}: the committed ExecStart in {spec.repo_relpath} carries "
             + ", ".join(f"--{option}" for option in uncompared)
@@ -1858,7 +1870,7 @@ def test_exec_start_option_guard_fires_on_an_unregistered_option():
     )
     service = _committed_service(pre_6381)
 
-    assert _uncompared_exec_start_options(mod, pre_6381, service) == ["no-sync", "project"]
+    assert pre_6381.unregistered_exec_start_options(service) == {"no-sync", "project"}
 
     waived = dataclasses.replace(
         pre_6381,
@@ -1868,7 +1880,7 @@ def test_exec_start_option_guard_fires_on_an_unregistered_option():
         ),
     )
 
-    assert _uncompared_exec_start_options(mod, waived, service) == []
+    assert waived.unregistered_exec_start_options(service) == frozenset()
 
 
 def test_unchecked_exec_start_options_all_carry_a_nonempty_reason():

@@ -233,9 +233,13 @@ class UnitSpec:
     # prefix are ignored, while a stale --timeout-graceful-shutdown is not.
     exec_start_flags: tuple[str, ...] = ()
     # Bare names of ARGUMENT-LESS options (no leading '--') compared by
-    # PRESENCE inside [Service] ExecStart. A separate field because the flag
-    # reader takes the next token as the argument: registering no-sync on
-    # exec_start_flags would read `--project` as its value.
+    # PRESENCE inside [Service] ExecStart. Such an option has no argument to
+    # compare by value: registered on exec_start_flags it reads as NO_ARGUMENT,
+    # which test_registry_exec_start_flags_are_really_on_the_committed_command
+    # rejects. Registering it here is the declaration
+    # test_every_committed_exec_start_option_is_compared_or_explicitly_unchecked
+    # requires. At run time it compares by presence, as an unregistered option
+    # does.
     exec_start_switches: tuple[str, ...] = ()
     # (section, key) pairs that must be present on BOTH sides or NEITHER,
     # registered because their presence on the installed side alone redirects
@@ -334,19 +338,33 @@ class UnitSpec:
         """Every ExecStart long option registered by kind (flag or switch), by bare name.
 
         The option-level counterpart of covered_directives(), read by
-        ``__post_init__`` and by
-        tests/scripts/test_check_dashboard_unit_parity.py::test_every_committed_exec_start_option_is_compared_or_explicitly_unchecked.
+        ``__post_init__`` and ``unregistered_exec_start_options``.
         """
         return frozenset((*self.exec_start_flags, *self.exec_start_switches))
+
+    def unregistered_exec_start_options(
+        self, service_directives: dict[str, list[str]]
+    ) -> frozenset[str]:
+        """Long options on one parsed [Service] ExecStart this spec neither registers nor waives.
+
+        The one statement of what "unregistered" means: read_exec_start_options
+        compares these by presence, and
+        tests/scripts/test_check_dashboard_unit_parity.py::test_every_committed_exec_start_option_is_compared_or_explicitly_unchecked
+        requires the committed command to have none.
+        """
+        waived = {option for option, _reason in self.unchecked_exec_start_options}
+        return (
+            exec_start_option_names(service_directives) - self.covered_exec_start_options() - waived
+        )
 
     def read_exec_start_options(
         self, service_directives: dict[str, list[str]]
     ) -> dict[str, str | None]:
         """How each long option reads on one parsed [Service] ExecStart, by bare name.
 
-        A flag reads as its argument (or ``NO_ARGUMENT``), a switch as its own
-        ``--name`` token, and a registered option the command lacks as None.
-        Every other long option on the command that is not waived reads as its
+        A flag reads as its argument as ``_exec_start_flag`` renders it, a
+        switch as its own ``--name`` token, and a registered option the command
+        lacks as None. Every unregistered option on the command reads as its
         token too, so an option the registry never names is still compared by
         presence: the completeness guard holds only the COMMITTED command's
         options registered, and cannot see one that exists on the installed
@@ -359,10 +377,7 @@ class UnitSpec:
                 for switch in self.exec_start_switches
             },
         }
-        waived = {option for option, _reason in self.unchecked_exec_start_options}
-        unregistered = (
-            exec_start_option_names(service_directives) - self.covered_exec_start_options() - waived
-        )
+        unregistered = self.unregistered_exec_start_options(service_directives)
         readings.update((name, f"--{name}") for name in sorted(unregistered))
         return readings
 
@@ -437,7 +452,7 @@ class UnitSpec:
 
 
 def _render(values: list[str] | None) -> str:
-    """Render a directive's values for a Drift record / the report."""
+    """Render a directive's values, or a flag's arguments, for a Drift record / the report."""
     if not values:
         return ABSENT
     if len(values) == 1:
@@ -456,7 +471,7 @@ def _exec_start_argv(service_directives: dict[str, list[str]]) -> tuple[str, ...
 
 
 def _exec_start_flag(service_directives: dict[str, list[str]], flag: str) -> str | None:
-    """Return the argument of ``--<flag>`` in ExecStart, ``NO_ARGUMENT``, or None if absent.
+    """Return the argument of each ``--<flag>`` in ExecStart, or None if absent.
 
     Reads the ALREADY-JOINED ExecStart value out of a parsed section — never
     the raw file text.  That scoping is load-bearing, and the hazard is real
@@ -475,21 +490,30 @@ def _exec_start_flag(service_directives: dict[str, list[str]], flag: str) -> str
     Returns the RAW token, not an int, so non-numeric flags like
     ``--host 127.0.0.1`` work too.
 
-    A flag present with no argument reads as ``NO_ARGUMENT``: never as the next
+    Every occurrence is read, joined as ``_render`` joins a repeated
+    directive's values.  click (uvicorn) and clap (uv) apply the LAST
+    occurrence, so an appended installed ``--port 9090`` override must not
+    read as parity on the first ``--port``.
+
+    An occurrence with no argument reads as ``NO_ARGUMENT``: never as the next
     option's token, and never as absent.  So an installed ``--project
     --no-sync`` is reported as a missing argument rather than as the argument
-    ``--no-sync``, and a switch registered here by mistake still compares by
-    presence.
+    ``--no-sync``.  That covers an occurrence followed by another long option,
+    ending the command, or spelled ``--flag=``.  It does not cover one followed
+    by a positional: a switch registered here by mistake and followed by
+    ``python`` reads ``python`` as its argument.
     """
     option = f"--{flag}"
     argv = _exec_start_argv(service_directives)
+    arguments: list[str] = []
     for index, token in enumerate(argv):
         if token == option:
-            argument = argv[index + 1] if index + 1 < len(argv) else ""
-            return NO_ARGUMENT if not argument or argument.startswith("--") else argument
-        if token.startswith(f"{option}="):
-            return token.removeprefix(f"{option}=") or NO_ARGUMENT
-    return None
+            following = argv[index + 1] if index + 1 < len(argv) else ""
+            takes_none = not following or following.startswith("--")
+            arguments.append(NO_ARGUMENT if takes_none else following)
+        elif token.startswith(f"{option}="):
+            arguments.append(token.removeprefix(f"{option}=") or NO_ARGUMENT)
+    return _render(arguments) if arguments else None
 
 
 def _exec_start_switch(service_directives: dict[str, list[str]], switch: str) -> str | None:
@@ -507,8 +531,12 @@ def exec_start_option_names(service_directives: dict[str, list[str]]) -> frozens
 
     ``--name=value`` yields ``name``; a bare ``--`` is skipped. Long options
     only: short options (``-m``) and positionals (the app target) are not
-    reached. This is the enumeration the option completeness guard reads, and
-    the one ``UnitSpec.read_exec_start_options`` finds unregistered options in.
+    reached. ``UnitSpec.unregistered_exec_start_options`` subtracts the
+    registry from this enumeration.
+
+    Names are not scoped by program: uv's options (before ``python -m
+    uvicorn``) and uvicorn's (after) share one namespace, so a name both
+    programs take would read as one option.
     """
     names = (
         token[2:].partition("=")[0]
