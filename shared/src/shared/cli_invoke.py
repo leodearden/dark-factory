@@ -23,6 +23,7 @@ from shared.cost_store import CapReason
 from shared.proc_group import snapshot_process_group, terminate_process_group
 from shared.process_cost import ProcessCostBasis, derive_process_cost, next_resume_prior
 from shared.secret_env import agent_subprocess_env
+from shared.spawn_temp_files import MCP_CONFIG_TEMP_NAME, SYSPROMPT_TEMP_NAME
 
 # VllmBridge depends on aiohttp, which is not installed in every consumer
 # environment (e.g. dashboard's venv).  Tolerate ImportError so that callers
@@ -3627,6 +3628,8 @@ def build_claude_argv(
     plus the mcp-config path when an ``mcp_config`` is supplied.  The caller
     owns cleanup of a successful return, typically via
     ``finally: for p in temp_files: Path(p).unlink(missing_ok=True)``.
+    Files a killed caller never unlinked are reclaimed by
+    ``shared/src/shared/spawn_temp_files.py::sweep_orphaned_spawn_temp_files``.
 
     On exception (e.g. a non-serializable ``mcp_config``), any temp files
     already created during this call are unlinked before the exception
@@ -3696,7 +3699,7 @@ def build_claude_argv(
         # recon Stage 2 branches on `project_id`, reviewer/curator prompts are
         # model-keyed artifacts, Stage 1/3 introspect live FastMCP signatures, and
         # recon-verify is tool-list templated.
-        fd, sysprompt_path = tempfile.mkstemp(suffix='.txt', prefix='sysprompt_')
+        fd, sysprompt_path = SYSPROMPT_TEMP_NAME.mkstemp()
         temp_files.append(sysprompt_path)
         with open(fd, 'w') as f:
             f.write(system_prompt)
@@ -3735,7 +3738,7 @@ def build_claude_argv(
             cmd.extend(['--disallowed-tools', *disallowed_tools])
 
         if mcp_config:
-            fd, mcp_config_path = tempfile.mkstemp(suffix='.json', prefix='mcp_')
+            fd, mcp_config_path = MCP_CONFIG_TEMP_NAME.mkstemp()
             temp_files.append(mcp_config_path)
             with open(fd, 'w') as f:
                 json.dump(mcp_config, f)
