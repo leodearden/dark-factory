@@ -7,15 +7,22 @@ this module reports it and never repairs it.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import json
+import logging
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
+from shared import safe_io
+
 from orchestrator.lane_lifecycle import LaneRecord, LaneState
+
+logger = logging.getLogger(__name__)
 
 LANE_RECORD_DIVERGENCE: Final = 'lane_record_divergence'
 PERSISTENT_DIVERGENCE_DIGESTS: Final = 2
+STREAKS_FILENAME: Final = '.lane-record-divergence-streaks.json'
 
 _HOLDING_STATES: Final = frozenset({LaneState.ASSIGNED, LaneState.IN_USE})
 
@@ -79,3 +86,54 @@ def cross_check_lane_records(
             consecutive_digests=streaks.get(lane, 0) + 1,
         ))
     return tuple(divergences)
+
+
+def advance_lane_record_divergence(
+    assignments: Mapping[str, Path],
+    records: Mapping[str, LaneRecord],
+    *,
+    streaks_path: Path,
+) -> tuple[LaneDivergence, ...]:
+    """Cross-check one digest, continuing and then saving the per-lane streaks."""
+    divergences = cross_check_lane_records(
+        assignments, records, _load_streaks(streaks_path),
+    )
+    _save_streaks(streaks_path, divergences)
+    return divergences
+
+
+def _load_streaks(path: Path) -> dict[str, int]:
+    try:
+        return _parse_streaks(path.read_text(encoding='utf-8'))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
+        logger.warning(
+            'lane_record_divergence: ignoring streaks file %s, counting afresh: %s',
+            path, exc,
+        )
+        return {}
+
+
+def _parse_streaks(text: str) -> dict[str, int]:
+    data = json.loads(text)
+    if not isinstance(data, dict) or not all(
+        _is_streak(lane, count) for lane, count in data.items()
+    ):
+        raise ValueError(f'not a lane -> streak map: {text[:80]!r}')
+    return data
+
+
+def _is_streak(lane: object, count: object) -> bool:
+    return isinstance(lane, str) and type(count) is int and count >= 1
+
+
+def _save_streaks(path: Path, divergences: Sequence[LaneDivergence]) -> None:
+    streaks = {d.lane: d.consecutive_digests for d in divergences}
+    try:
+        safe_io.atomic_write_text(path, json.dumps(streaks, sort_keys=True), mkdir=True)
+    except OSError:
+        logger.warning(
+            'lane_record_divergence: could not save streaks to %s', path,
+            exc_info=True,
+        )
