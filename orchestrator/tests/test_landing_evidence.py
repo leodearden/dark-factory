@@ -1625,6 +1625,57 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         _summary, detail = format_unattributed_landing_detail('42', 'task/42', verdict)
         assert 'delivered_checks.enabled is false' in detail
 
+    @pytest.mark.parametrize('checks_enabled', [True, False])
+    @pytest.mark.parametrize('mode', ['candidate', 'discovery'])
+    async def test_the_caller_supplied_kill_switch_governs_the_rescue(
+        self, mode: str, checks_enabled: bool,
+    ) -> None:
+        """A real ``GitOps.config`` carries no ``delivered_checks``, so the
+        caller holding the project config passes the leaf as ``checks_enabled``.
+
+        The git_ops here says ENABLED, the real-GitOps shape: only the caller's
+        argument can disarm the rescue, in either mode.
+        """
+        sha = 'c' * 40
+        if mode == 'candidate':
+            git_ops = self._rejecting_git_ops(sha)
+            candidate_sha: str | None = sha
+        else:
+            git_ops = _git_ops(
+                citation=sha,
+                is_ancestor_map={(sha, 'task/42'): False},
+                effect_present=False,
+                effect_probe=CommitEffectProbe(
+                    present=False,
+                    diverged_paths=('shared/manifest.py',),
+                    anchor_sha=sha,
+                    failure='effect_not_survived',
+                    aggregate_survival=0.42,
+                ),
+            )
+            candidate_sha = None
+        stub, calls = _check_runner({
+            f'{sha}^1': DeliveredCheckResult.FAILED,
+            sha: DeliveredCheckResult.DELIVERED,
+            'main': DeliveredCheckResult.DELIVERED,
+        })
+
+        with patch('orchestrator.delivered_checks.run_delivered_check', stub):
+            verdict = await validate_landing_evidence(
+                git_ops, '42', 'task/42', branch_tip_sha=None, candidate_sha=candidate_sha,
+                delivered_checks=[_grep_check()], checks_enabled=checks_enabled,
+            )
+
+        if checks_enabled:
+            assert verdict.accepted is True
+            assert verdict.rescued_by_delivered_checks is True
+            return
+        assert calls == [], 'no declared check may run while the caller disarms it'
+        assert verdict.accepted is False
+        assert verdict.reason == 'effect_absent'
+        assert verdict.probe['delivered_checks_outcome'] == 'disabled'
+        assert verdict.rescued_by_delivered_checks is False
+
     async def test_no_citation_reject_never_runs_the_differential(self) -> None:
         """A missing citation is an ATTRIBUTION failure, not a decayed-effect
         one: there is no commit to anchor a differential on, so the rescue
