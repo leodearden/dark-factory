@@ -187,11 +187,32 @@ class TestLandingRejectRecorder:
         ]
         assert _observe(recorder, _reject(), store, task_id='43') is False
 
-    def test_no_event_store_returns_false(self) -> None:
-        assert _observe(LandingRejectRecorder(), _reject(), None) is False
+    def test_a_reject_seen_with_no_event_store_is_announced_once_one_is_bound(
+        self, store: EventStore,
+    ) -> None:
+        recorder = LandingRejectRecorder()
 
-    def test_a_raising_event_store_is_contained(self) -> None:
+        assert _observe(recorder, _reject(), None) is False
+        assert _observe(recorder, _reject(), store) is True
+
+    def test_a_raising_event_store_leaves_the_reject_unannounced(
+        self, store: EventStore,
+    ) -> None:
+        recorder = LandingRejectRecorder()
         raising = MagicMock()
         raising.emit.side_effect = RuntimeError('store exploded')
 
-        assert _observe(LandingRejectRecorder(), _reject(), raising) is False
+        assert _observe(recorder, _reject(), raising) is False
+        assert _observe(recorder, _reject(), store) is True
+
+        assert len(landing_reject_rows(store)) == 1
+
+    def test_a_payload_that_cannot_be_built_leaves_the_reject_unannounced(
+        self, store: EventStore,
+    ) -> None:
+        recorder = LandingRejectRecorder()
+
+        assert _observe(recorder, _reject(opaque={('non', 'str'): 'key'}), store) is False
+        assert _observe(recorder, _reject(), store) is True
+
+        assert len(landing_reject_rows(store)) == 1

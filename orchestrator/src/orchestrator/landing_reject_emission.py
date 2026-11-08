@@ -27,7 +27,10 @@ already documents for this very gate.  The signature leaves out the survival
 numbers, so an ordinary main advance does not re-emit; a moved branch tip
 (``effect_check_sha``) is a new fact and does.  The memo is in-memory and
 non-durable (a restart re-arms it), bounded by one small tuple per task
-rejected and since neither accepted nor dispatched.
+rejected and since neither accepted nor dispatched.  It records only a row
+handed to the store: no store, a payload that cannot be built or a raising
+``emit`` leaves the reject unannounced, so the next identical one retries.
+A write failure ``EventStore.emit`` swallows itself is invisible here.
 
 PAYLOAD.  The verdict's probe verbatim, so its key vocabulary stays
 single-sourced on ``orchestrator/src/orchestrator/merge_lane/landing_evidence.py::
@@ -116,16 +119,14 @@ class LandingRejectRecorder:
                 self._signatures.pop(key, None)
                 return False
             signature = self._signature(verdict)
-            if self._signatures.get(key) == signature:
-                return False
-            self._signatures[key] = signature
-            if event_store is None:
+            if event_store is None or self._signatures.get(key) == signature:
                 return False
             event_store.emit(
                 EventType.landing_evidence_rejected,
                 task_id=str(task_id),
                 data=landing_reject_payload(verdict, site=site, task_status=task_status),
             )
+            self._signatures[key] = signature
             return True
         except Exception:
             logger.warning(
