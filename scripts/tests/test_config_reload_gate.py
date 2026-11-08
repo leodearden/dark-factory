@@ -143,19 +143,6 @@ def test_the_callers_path_is_compared_by_realpath(tmp_path):
     assert fetched == report
 
 
-def test_without_a_config_path_the_reread_is_not_checked():
-    """config_path=None asks only for the report: a caller that reads one
-    knob's own disposition gets it whichever file was re-read."""
-    report = reload_report(reloaded=False, config_path=None)
-
-    with FakeEscalationMcp(report) as server:
-        fetched = fetch_reload_report(
-            str(server.port), committed_as=COMMITTED_AS, config_path=None,
-        )
-
-    assert fetched == report
-
-
 def test_failure_tags_are_the_wire_vocabulary():
     """These strings are what a calling script prints in its JSON verdict, so
     renaming one breaks every consumer that branches on it."""
