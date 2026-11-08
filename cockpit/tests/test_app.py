@@ -504,21 +504,38 @@ class TestPollRefresh:
             assert state_glyph(sr.Status.RUNNING) not in row
 
 
-class TestTimerIntegration:
-    """The one test allowed to depend on real poll timing (see TestPollRefresh).
+class _ScanStartCountingScanner:
+    """Delegates to a real SessionScanner and counts scan() entries, so a test
+    can count the poll scans that began after a point in time. The app
+    serialises poll scans (TestScanBackpressure), so the plain int needs no lock.
+    """
 
-    Everything in TestPollRefresh now drives refresh_registry() directly
-    (deterministic, no sleeping across real ticks). This test alone proves
-    on_mount's set_interval(poll_interval, refresh_registry) is actually
-    wired end-to-end, so that guarantee isn't lost entirely to determinism.
+    def __init__(self, inner) -> None:
+        self._inner = inner
+        self.starts = 0
+
+    def scan(self) -> list:
+        self.starts += 1
+        return self._inner.scan()
+
+
+class TestTimerIntegration:
+    """The one test driven by the real set_interval poll timer (see TestPollRefresh).
+
+    Everything in TestPollRefresh drives refresh_registry() directly. This
+    test alone proves on_mount's set_interval wiring reaches disk end-to-end.
+    It waits on poll scans, not a wall-clock budget; the test body says why
+    two post-write scan starts bound the wait.
     """
 
     @pytest.mark.timeout(10)
     async def test_timer_tick_triggers_refresh(self, tmp_path):
         from cockpit.app import CockpitApp
         from cockpit.panes.session_table import SessionTable
+        from cockpit.registry_reader import SessionScanner
 
-        app = CockpitApp(fleet_root=tmp_path, poll_interval=0.05)
+        scanner = _ScanStartCountingScanner(SessionScanner(tmp_path))
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=0.05, scanner=scanner)
         async with app.run_test() as pilot:
             await pilot.pause()
             table = app.query_one(SessionTable)
@@ -526,10 +543,19 @@ class TestTimerIntegration:
 
             record = _make_record(session_slug='timer-1', status=sr.Status.RUNNING)
             sr.write_record(record, root=tmp_path)
+            starts_at_write = scanner.starts
 
-            await pilot.pause(0.3)
+            # Poll scans never overlap, and each one's apply lands before the
+            # next can begin, so by the time a second post-write scan starts
+            # the first (which saw the record) is already on screen.
+            while table.row_count == 0 and scanner.starts < starts_at_write + 2:
+                await pilot.pause(app.poll_interval)
 
-            assert table.row_count == 1
+            assert table.row_count == 1, (
+                f'row_count={table.row_count} after '
+                f'{scanner.starts - starts_at_write} poll scans began since the write; '
+                'a second post-write scan only begins once the first has been applied'
+            )
 
 
 class TestRowSelectionDetail:
