@@ -105,8 +105,13 @@ def test_a_naive_fire_time_is_read_as_utc(at, expected):
 
 @pytest.mark.parametrize(
     'milestone',
-    [None, {'mode': 'delayed', 'after_secs': 60}, {'mode': 'dated', 'at': 'not-a-date'}],
-    ids=['absent', 'delayed', 'unparseable'],
+    [
+        None,
+        {'mode': 'delayed', 'after_secs': 60},
+        {'mode': 'dated', 'at': 'not-a-date'},
+        {'mode': 'dated', 'at': (NOW + HOUR).isoformat(), 'scheduled_fire_at': 'not-a-date'},
+    ],
+    ids=['absent', 'delayed', 'unparseable', 'unparseable-scheduled'],
 )
 def test_an_unreadable_fire_time_is_overdue(milestone):
     task = _with_milestone(link(1, 'pending'), milestone)
