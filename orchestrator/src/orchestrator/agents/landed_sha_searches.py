@@ -5,8 +5,9 @@ splices the step built here into its `# Action` list. Each command is a
 `skills/_shared/deriving-landed-sha.md` search with this task's branch, merge
 subject and citation regex filled in from the same sources production reads:
 the marker search mirrors
-`orchestrator/src/orchestrator/git_ops.py::GitOps.find_merge_marker`, and the
-citation walk mirrors `GitOps.find_task_citation_commit`.
+`orchestrator/src/orchestrator/git_ops.py::GitOps.find_merge_marker`, the
+containment check mirrors `GitOps.is_ancestor_checked`, and the citation walk
+mirrors `GitOps.find_task_citation_commit`.
 `orchestrator/tests/test_landed_sha_searches.py` runs each command in real git
 and holds it in agreement with those methods.
 """
@@ -59,9 +60,15 @@ class LandedShaSearches:
             ancestry=f'git merge-base --is-ancestor {quoted_branch} {main}; echo "ancestry rc=$?"',
             marker_search=(
                 f"git log {main} --fixed-strings --grep={quoted_branch} --format='%H%x09%s'"
-                f" | awk -F'\\t' -v s={shlex.quote(subject)} '$2==s && !seen {{print $1; seen=1}}'"
+                f" | awk -F'\\t' -v s={shlex.quote(subject)} 'NF==2 && $2==s && !seen {{print $1; seen=1}}'"
             ),
             citation_walk=_citation_walk(main, task_id, git.commit_citation_pattern),
+        )
+
+    def containment(self, marker_sha: str) -> str:
+        return (
+            f'git merge-base --is-ancestor {shlex.quote(self.branch)} {shlex.quote(marker_sha)}; '
+            'echo "containment rc=$?"'
         )
 
 
@@ -115,10 +122,7 @@ def _command_bullet(heading: str, command: str, reading: str) -> str:
 
 
 def _marker_reading(searches: LandedShaSearches) -> str:
-    containment = (
-        f'git merge-base --is-ancestor {shlex.quote(searches.branch)} <marker-sha>; '
-        'echo "containment rc=$?"'
-    )
+    containment = searches.containment('<marker-sha>')
     return (
         f'It prints the newest commit on main whose subject is exactly '
         f'`{searches.marker_subject}`, or nothing.\n'

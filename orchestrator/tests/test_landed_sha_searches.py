@@ -5,7 +5,8 @@ renders shell commands for the steward briefing. Each test here runs one of
 those commands in a purpose-built real-git history and asserts it lands on the
 commit the production authority picks in the same repo:
 `orchestrator/src/orchestrator/git_ops.py::GitOps.find_merge_marker` for the
-marker search, `GitOps.find_task_citation_commit` for the citation walk. A
+marker search, `GitOps.is_ancestor_checked` for the containment check,
+`GitOps.find_task_citation_commit` for the citation walk. A
 change to either rule then fails here instead of leaving the steward a stale
 copy.
 """
@@ -55,9 +56,9 @@ def _commit_with_body(root: Path, subject: str, body: str, filename: str) -> str
     return git(root, 'rev-parse', 'HEAD')
 
 
-def _land_no_ff(root: Path, branch: str, main_branch: str) -> str:
-    git(root, 'checkout', '-b', branch)
-    commit(root, f'work on {branch}', f'{branch.replace("/", "-")}.txt')
+def _land_no_ff(root: Path, branch: str, main_branch: str, work: str = 'work') -> str:
+    git(root, 'checkout', '-B', branch)
+    commit(root, f'{work} on {branch}', f'{branch.replace("/", "-")}-{work}.txt')
     git(root, 'checkout', main_branch)
     git(root, 'merge', '--no-ff', '-m', format_merge_subject(branch, main_branch), branch)
     return git(root, 'rev-parse', 'HEAD')
@@ -73,16 +74,38 @@ _BRANCH_CONFIGS = [
 def test_marker_search_agrees_with_find_merge_marker(tmp_path: Path, cfg: GitConfig) -> None:
     root = _repo_on(tmp_path, cfg.main_branch)
     branch = f'{cfg.branch_prefix}{TASK_ID}'
-    genuine = _land_no_ff(root, branch, cfg.main_branch)
+    subject = format_merge_subject(branch, cfg.main_branch)
+    _land_no_ff(root, branch, cfg.main_branch)
+    remerged = _land_no_ff(root, branch, cfg.main_branch, work='rework')
     _land_no_ff(root, f'{cfg.branch_prefix}{TASK_ID}0', cfg.main_branch)
-    _commit_with_body(
-        root, 'docs: quote a marker', format_merge_subject(branch, cfg.main_branch), 'quote.txt',
-    )
+    _commit_with_body(root, 'docs: quote a marker', subject, 'quote.txt')
+    commit(root, f'{subject}\tsuffixed', 'tab-suffixed.txt')
 
     searches = LandedShaSearches.for_task(TASK_ID, cfg)
     oracle = asyncio.run(GitOps(cfg, root).find_merge_marker(branch, gate_on_existing_ref=False))
 
-    assert _run_rendered(root, searches.marker_search) == genuine == oracle
+    assert _run_rendered(root, searches.marker_search) == remerged == oracle
+
+
+def test_containment_agrees_with_is_ancestor(tmp_path: Path) -> None:
+    cfg = GitConfig()
+    root = _repo_on(tmp_path, cfg.main_branch)
+    branch = f'{cfg.branch_prefix}{TASK_ID}'
+    marker = _land_no_ff(root, branch, cfg.main_branch)
+    searches = LandedShaSearches.for_task(TASK_ID, cfg)
+    git_ops = GitOps(cfg, root)
+
+    def verdicts() -> tuple[str, bool | None]:
+        return (
+            _run_rendered(root, searches.containment(marker)),
+            asyncio.run(git_ops.is_ancestor_checked(branch, marker)),
+        )
+
+    assert verdicts() == ('containment rc=0', True)
+    git(root, 'checkout', branch)
+    commit(root, 'work after the landing', 'after.txt')
+    git(root, 'checkout', cfg.main_branch)
+    assert verdicts() == ('containment rc=1', False)
 
 
 def test_ancestry_reports_three_outcomes(tmp_path: Path) -> None:
@@ -205,5 +228,6 @@ def test_already_merged_step_carries_the_rendered_searches(
     assert isinstance(searches.citation_walk, str) == renders_walk
     assert searches.ancestry in step
     assert searches.marker_search in step
+    assert searches.containment('<marker-sha>') in step
     if isinstance(searches.citation_walk, str):
         assert searches.citation_walk in step
