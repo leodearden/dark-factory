@@ -16,7 +16,9 @@ from orchestrator.lane_lifecycle import LaneRecord, LaneState
 from orchestrator.lane_record_divergence import (
     LANE_RECORD_DIVERGENCE,
     PERSISTENT_DIVERGENCE_DIGESTS,
+    STREAKS_FILENAME,
     LaneDivergence,
+    advance_lane_record_divergence,
     cross_check_lane_records,
 )
 
@@ -153,3 +155,80 @@ class TestCrossCheckLaneRecords:
         assert PERSISTENT_DIVERGENCE_DIGESTS == 2
         assert divergence(1).is_persistent is False
         assert divergence(PERSISTENT_DIVERGENCE_DIGESTS).is_persistent is True
+
+
+_UNRECORDED_MAP_ENTRY = ({'T': _lane(0)}, {})
+
+
+class TestAdvanceLaneRecordDivergence:
+    @pytest.fixture
+    def streaks_path(self, tmp_path):
+        return tmp_path / 'digests' / STREAKS_FILENAME
+
+    def test_first_divergence_starts_a_streak_on_disk(self, streaks_path):
+        (divergence,) = advance_lane_record_divergence(
+            *_UNRECORDED_MAP_ENTRY, streaks_path=streaks_path,
+        )
+
+        assert divergence.consecutive_digests == 1
+        assert streaks_path.is_file()
+
+    def test_streak_survives_through_the_file(self, streaks_path):
+        advance_lane_record_divergence(*_UNRECORDED_MAP_ENTRY, streaks_path=streaks_path)
+
+        (divergence,) = advance_lane_record_divergence(
+            *_UNRECORDED_MAP_ENTRY, streaks_path=streaks_path,
+        )
+
+        assert divergence.consecutive_digests == 2
+
+    def test_coherence_drops_the_streak(self, streaks_path):
+        advance_lane_record_divergence(*_UNRECORDED_MAP_ENTRY, streaks_path=streaks_path)
+        coherent_records = {'_lane-0': LaneRecord(state=LaneState.ASSIGNED, task_id='T')}
+
+        assert advance_lane_record_divergence(
+            {'T': _lane(0)}, coherent_records, streaks_path=streaks_path,
+        ) == ()
+        (divergence,) = advance_lane_record_divergence(
+            *_UNRECORDED_MAP_ENTRY, streaks_path=streaks_path,
+        )
+
+        assert divergence.consecutive_digests == 1
+
+    def test_streak_is_keyed_by_lane_not_by_divergence_shape(self, streaks_path):
+        assignments = {'T': _lane(0)}
+        advance_lane_record_divergence(
+            assignments,
+            {'_lane-0': LaneRecord(state=LaneState.RELEASED)},
+            streaks_path=streaks_path,
+        )
+
+        (divergence,) = advance_lane_record_divergence(
+            assignments,
+            {'_lane-0': LaneRecord(state=LaneState.ASSIGNED, task_id='U')},
+            streaks_path=streaks_path,
+        )
+
+        assert divergence.consecutive_digests == 2
+
+    @pytest.mark.parametrize('content', ['not json', '["_lane-0"]', '{"_lane-0": "x"}'])
+    def test_corrupt_streaks_file_counts_as_no_prior_streak(
+        self, streaks_path, content, caplog,
+    ):
+        streaks_path.parent.mkdir(parents=True)
+        streaks_path.write_text(content, encoding='utf-8')
+
+        with caplog.at_level('WARNING'):
+            (first,) = advance_lane_record_divergence(
+                *_UNRECORDED_MAP_ENTRY, streaks_path=streaks_path,
+            )
+        (second,) = advance_lane_record_divergence(
+            *_UNRECORDED_MAP_ENTRY, streaks_path=streaks_path,
+        )
+
+        assert first.consecutive_digests == 1
+        assert any(
+            r.levelname == 'WARNING' and str(streaks_path) in r.getMessage()
+            for r in caplog.records
+        )
+        assert second.consecutive_digests == 2
