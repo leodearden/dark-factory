@@ -14,9 +14,11 @@ import json
 import sqlite3
 import subprocess
 from collections.abc import Mapping, Sequence
-from datetime import UTC, datetime
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from types import MappingProxyType
+from typing import Any, ClassVar
 
 Timestamp = datetime | str
 
@@ -352,3 +354,80 @@ class GitRepoBuilder:
         sha = self.commit(files, f'side commit {self._side_branches}')
         self.git('checkout', '-q', 'main')
         return sha
+
+
+SCENARIO_DAY = datetime(2026, 10, 27, tzinfo=UTC)
+"""A Tuesday of ISO week 2026-W44; every scenario timestamp is an offset from it."""
+
+
+def at_hour(hours: float) -> datetime:
+    return SCENARIO_DAY + timedelta(hours=hours)
+
+
+def _src(n: int, tag: str) -> str:
+    return ''.join(f'{tag} line {i}\n' for i in range(n))
+
+
+@dataclass(frozen=True)
+class LandingScenario:
+    """The step-11 history: every landing kind the producer distinguishes, in one repo and store.
+
+    main's first-parent line: c0, m1 (101), d (direct docs), f1, f2 (102 fast-forward),
+    m3 (train 103/104/105, tip 105), m4 (hand merge, no runs.db row), m6 (101 again),
+    m7 (107), m8 (108). side (106) is a merge_finalized sha never merged to main.
+    """
+
+    repo: GitRepoBuilder
+    db: RunsDbBuilder
+    c0: str
+    m1: str
+    d: str
+    f1: str
+    f2: str
+    m3: str
+    m4: str
+    m6: str
+    side: str
+    m7: str
+    m8: str
+
+    LANDED_HOURS: ClassVar[Mapping[str, float]] = MappingProxyType({
+        'm1': 10.0, 'f2': 11.0, 'm3': 12.0, 'side': 12.5, 'm6': 13.0, 'm7': 14.0, 'm8': 14.0,
+    })
+
+
+def build_landing_scenario(root: Path, *, with_charter_class: bool = False) -> LandingScenario:
+    """Repo at ``root`` and runs.db at ``root/data/orchestrator/runs.db`` (the project layout)."""
+    repo = GitRepoBuilder(root)
+    c0 = repo.commit({'README.md': 'scenario\n', 'pkg/src/pkg/base.py': _src(3, 'base')}, 'root')
+    m1 = repo.branch_merge('101', {
+        'pkg/src/pkg/a/x.py': _src(10, 'x'), 'pkg/tests/test_x.py': _src(4, 'tx'),
+    })
+    d = repo.commit({'docs/notes.md': _src(20, 'note')}, 'docs: direct to main')
+    f1, f2 = repo.ff_commits([
+        {'pkg/src/pkg/b/y.py': _src(3, 'y')},
+        {'pkg/src/pkg/b/y.py': _src(5, 'y'), 'pkg/tests/test_y.py': _src(2, 'ty')},
+    ])
+    m3 = repo.branch_merge('105', {
+        'pkg/src/pkg/c/z.py': _src(7, 'z'), 'pkg/src/pkg/a/x2.py': _src(2, 'x2'),
+    })
+    m4 = repo.branch_merge('hand', {'pkg/src/pkg/hand.py': _src(6, 'hand')})
+    m6 = repo.branch_merge('101', {'pkg/src/pkg/a/x.py': _src(12, 'x')})
+    side = repo.side_commit({'pkg/src/pkg/side.py': _src(9, 'side')})
+    m7 = repo.branch_merge('107', {'pkg/src/pkg/d/w.py': _src(1, 'w')})
+    m8 = repo.branch_merge('108', {'pkg/src/pkg/e/v.py': _src(2, 'v')})
+
+    db = RunsDbBuilder(root / 'data' / 'orchestrator' / 'runs.db',
+                       with_charter_class=with_charter_class)
+    hours = LandingScenario.LANDED_HOURS
+    db.merge_done(at_hour(hours['m1']), '101', m1)
+    db.merge_done(at_hour(hours['m1'] + 0.5), '101', m1)
+    db.merge_done(at_hour(hours['f2']), '102', f2)
+    db.merge_state(at_hour(11.5), '103', 'superseded', superseded_by='coalesce-105-abc')
+    db.merge_state(at_hour(11.6), '109', 'blocked')
+    db.train_merged(at_hour(hours['m3']), '105', ['103', '104', '105'], m3, f2)
+    db.merge_done(at_hour(hours['side']), '106', side)
+    db.merge_done(at_hour(hours['m6']), '101', m6)
+    db.merge_done(at_hour(hours['m7']), '107', m7)
+    db.merge_done(at_hour(hours['m8']), '108', m8)
+    return LandingScenario(repo, db, c0, m1, d, f1, f2, m3, m4, m6, side, m7, m8)
