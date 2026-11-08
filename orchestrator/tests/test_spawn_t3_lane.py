@@ -265,10 +265,15 @@ def spawn_record(env: Env, slug: str = 'unblock-df-7489-4242') -> str:
     return str(sr.record_path_for_slug(slug, root=env.fleet).parent)
 
 
-def stale_t3_record(env: Env) -> str:
-    """A live t3 record of ``env.project`` whose thread no listing names."""
+def stale_t3_record(env: Env, *, environment_id: str | None = None) -> str:
+    """A live, indexed t3 record of ``env.project`` whose thread no listing names."""
     record_dir = spawn_record(env, 'sibling-df-1-1')
-    sr.update_display('sibling-df-1-1', root=env.fleet, kind='t3', t3_thread_id='th-vanished')
+    record = sr.read_record('sibling-df-1-1', root=env.fleet)
+    record.display = sr.Display(
+        kind='t3', t3_thread_id='th-vanished', t3_environment_id=environment_id
+    )
+    sr.write_record(record, root=env.fleet)
+    sr.write_t3_thread_pointer('th-vanished', 'sibling-df-1-1', root=env.fleet)
     time.sleep(0.01)
     return record_dir
 
@@ -601,7 +606,19 @@ class TestLaunch:
 
         stale = sr.read_record(Path(stale_dir).name, root=env.fleet)
         assert (stale.status, stale.exit_code) == (sr.Status.EXITED, sr.ORPHAN_EXIT_CODE)
-        assert t3.tool_calls('t3_thread_list') == [{'projectId': PROJECT_ID, 'limit': 100}]
+        assert t3.tool_calls('t3_thread_list') == [{'allProjects': True, 'limit': 100}]
+
+    def test_a_record_of_another_environment_is_left_to_its_own_sweep(
+        self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        stale_dir = stale_t3_record(env, environment_id='env-elsewhere')
+
+        launch_line(capsys, tmp_path, env.project)
+
+        assert sr.read_record(Path(stale_dir).name, root=env.fleet).status == sr.Status.LAUNCHING
+        assert sr.resolve_session_slug_for_t3_thread('th-vanished', root=env.fleet) == (
+            Path(stale_dir).name
+        )
 
     def test_an_incomplete_thread_listing_sweeps_nothing(
         self, env: Env, t3: FakeT3Server, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -1395,14 +1412,14 @@ class TestWait:
         assert wait_for(env, record_dir, clock) == 'finished code=0'
         assert clock.sleeps == [lane.SETTLED_RECHECK_SECS] * 2
 
-    def test_each_pass_sweeps_the_read_threads_project(self, env: Env, t3: FakeT3Server) -> None:
+    def test_each_pass_sweeps_the_environment_wide_listing(self, env: Env, t3: FakeT3Server) -> None:
         stale_dir = stale_t3_record(env)
-        t3.tool_replies['t3_thread_read'] = thread_read(archived=True, projectId='project-of-the-read')
+        t3.tool_replies['t3_thread_read'] = thread_read(archived=True, projectId=None)
 
         assert wait_for(env, '', FakeClock()) == 'finished code=0'
         stale = sr.read_record(Path(stale_dir).name, root=env.fleet)
         assert (stale.status, stale.exit_code) == (sr.Status.EXITED, sr.ORPHAN_EXIT_CODE)
-        assert t3.tool_calls('t3_thread_list') == [{'projectId': 'project-of-the-read', 'limit': 100}]
+        assert t3.tool_calls('t3_thread_list') == [{'allProjects': True, 'limit': 100}]
 
     def test_an_incomplete_listing_sweeps_nothing_while_waiting(self, env: Env, t3: FakeT3Server) -> None:
         stale_dir = stale_t3_record(env)

@@ -11594,6 +11594,8 @@ def _t3_record(
     cwd: str,
     status: sr.Status = sr.Status.RUNNING,
     kind: str = sr.DisplayKind.T3.value,
+    environment_id: str | None = None,
+    pointer: bool = False,
 ) -> None:
     sr.write_record(
         _make_record(
@@ -11601,10 +11603,14 @@ def _t3_record(
             status=status,
             cwd=cwd,
             exit_code=None,
-            display=sr.Display(kind=kind, t3_thread_id=thread_id),
+            display=sr.Display(
+                kind=kind, t3_thread_id=thread_id, t3_environment_id=environment_id
+            ),
         ),
         root=tmp_path,
     )
+    if pointer and thread_id is not None:
+        assert sr.write_t3_thread_pointer(thread_id, slug, root=tmp_path)
 
 
 _THREAD = '7d1f0c2a-5b3e-4c8d-9a6f-1e2d3c4b5a69'
@@ -11717,46 +11723,89 @@ class TestT3ThreadPointers:
         assert not sr.t3_thread_pointer_path(_THREAD, tmp_path).exists()
 
 
+_ENVIRONMENT = '3f9a1c2e-5b7d-4e8f-9a0b-1c2d3e4f5a6b'
+_GONE_THREAD = '2c4e6a8b-0d1f-4a3c-9e5b-7d9f1b3d5e70'
+
+
 class TestMarkT3SessionsExited:
-    def test_marks_only_this_projects_records_whose_thread_is_gone_or_archived(
+    def test_marks_only_indexed_records_of_this_environment_whose_thread_is_gone(
         self, tmp_path: Path
     ) -> None:
-        project, other = tmp_path / 'proj', tmp_path / 'other'
-        project.mkdir()
-        other.mkdir()
-        _t3_record(tmp_path, 'listed', 'th-live', cwd=str(project))
-        _t3_record(tmp_path, 'archived', 'th-archived', cwd=str(project))
-        _t3_record(tmp_path, 'gone', 'th-gone', cwd=str(project))
-        _t3_record(tmp_path, 'other-project', 'th-gone', cwd=str(other))
-        _t3_record(tmp_path, 'already-exited', 'th-gone', cwd=str(project), status=sr.Status.EXITED)
-        _t3_record(tmp_path, 'not-t3', 'th-gone', cwd=str(project), kind='wm')
-        _t3_record(tmp_path, 'no-thread-yet', None, cwd=str(project))
+        foreign_thread, unindexed_thread = (
+            '4e6a8c0d-2f1b-4c5e-8a7d-9b1d3f5a7c92',
+            '6a8c0e2f-4b3d-4e7a-8c9f-1d3f5b7d9e14',
+        )
+        cwd = str(tmp_path)
+        _t3_record(tmp_path, 'listed', _THREAD, cwd=cwd, environment_id=_ENVIRONMENT, pointer=True)
+        _t3_record(tmp_path, 'gone', _GONE_THREAD, cwd=cwd, environment_id=_ENVIRONMENT, pointer=True)
+        _t3_record(
+            tmp_path, 'foreign', foreign_thread, cwd=cwd, environment_id='env-elsewhere', pointer=True
+        )
+        _t3_record(tmp_path, 'unindexed', unindexed_thread, cwd=cwd, environment_id=_ENVIRONMENT)
 
-        marked = sr.mark_t3_sessions_exited(
-            str(project), {'th-live': False, 'th-archived': True}, root=tmp_path
+        marked = sr.mark_t3_sessions_exited(_ENVIRONMENT, frozenset({_THREAD}), root=tmp_path)
+
+        assert marked == ['gone']
+        gone = sr.read_record('gone', root=tmp_path)
+        assert (gone.status, gone.exit_code) == (sr.Status.EXITED, sr.ORPHAN_EXIT_CODE)
+        for slug in ('listed', 'foreign', 'unindexed'):
+            assert sr.read_record(slug, root=tmp_path).status == sr.Status.RUNNING
+        assert sorted(path.name for path in sr.t3_thread_pointers_dir(tmp_path).iterdir()) == (
+            sorted([_THREAD, foreign_thread])
         )
 
-        assert sorted(marked) == ['archived', 'gone']
-        for slug in ('archived', 'gone'):
-            record = sr.read_record(slug, root=tmp_path)
-            assert (record.status, record.exit_code) == (sr.Status.EXITED, sr.ORPHAN_EXIT_CODE)
-        for slug in ('listed', 'other-project', 'not-t3', 'no-thread-yet'):
-            assert sr.read_record(slug, root=tmp_path).status == sr.Status.RUNNING
+    def test_a_record_with_no_environment_is_this_environments(self, tmp_path: Path) -> None:
+        _t3_record(tmp_path, 'legacy', _GONE_THREAD, cwd=str(tmp_path), pointer=True)
 
-    def test_project_root_matches_by_realpath(self, tmp_path: Path) -> None:
-        project = tmp_path / 'proj'
-        project.mkdir()
-        link = tmp_path / 'link'
-        link.symlink_to(project)
-        _t3_record(tmp_path, 'gone', 'th-gone', cwd=str(link))
+        assert sr.mark_t3_sessions_exited(_ENVIRONMENT, frozenset(), root=tmp_path) == ['legacy']
 
-        assert sr.mark_t3_sessions_exited(str(project), {}, root=tmp_path) == ['gone']
+    def test_a_worktree_bound_record_is_marked_whatever_its_cwd(self, tmp_path: Path) -> None:
+        worktree = tmp_path / 'proj' / '.worktrees' / '8124'
+        _t3_record(
+            tmp_path,
+            'worktree-bound',
+            _GONE_THREAD,
+            cwd=str(worktree),
+            environment_id=_ENVIRONMENT,
+            pointer=True,
+        )
+
+        assert sr.mark_t3_sessions_exited(_ENVIRONMENT, frozenset(), root=tmp_path) == [
+            'worktree-bound'
+        ]
 
     def test_a_record_written_after_the_listing_is_skipped(self, tmp_path: Path) -> None:
-        _t3_record(tmp_path, 'just-launched', 'th-new', cwd=str(tmp_path))
+        _t3_record(tmp_path, 'just-launched', _GONE_THREAD, cwd=str(tmp_path), pointer=True)
         listed_at = datetime.now(UTC) - timedelta(minutes=1)
 
-        assert sr.mark_t3_sessions_exited(str(tmp_path), {}, root=tmp_path, listed_at=listed_at) == []
+        assert (
+            sr.mark_t3_sessions_exited(
+                _ENVIRONMENT, frozenset(), root=tmp_path, listed_at=listed_at
+            )
+            == []
+        )
+
+    def test_one_info_line_reports_the_index_entries_scanned(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        for slug, thread in (
+            ('listed', _THREAD),
+            ('also-listed', _OTHER_THREAD),
+            ('gone', _GONE_THREAD),
+        ):
+            _t3_record(tmp_path, slug, thread, cwd=str(tmp_path), pointer=True)
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.session_registry'):
+            sr.mark_t3_sessions_exited(
+                _ENVIRONMENT, frozenset({_THREAD, _OTHER_THREAD}), root=tmp_path
+            )
+
+        [line] = [
+            record.getMessage().replace(str(tmp_path), '<root>')
+            for record in caplog.records
+            if record.funcName == 'mark_t3_sessions_exited' and record.levelno == logging.INFO
+        ]
+        assert re.search(r'(?<!\d)3(?!\d)', line), line
 
 
 class TestT3RecordsAreExemptFromPidSweeps:
