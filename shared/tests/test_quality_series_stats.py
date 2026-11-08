@@ -4,15 +4,29 @@ from __future__ import annotations
 
 import hashlib
 import statistics
+from dataclasses import astuple
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from shared.quality_series.stats import (
+    RegimeEvent,
     bootstrap_interval,
     content_seed,
+    cusum_alarms,
+    cusum_design,
+    ewma_limits,
+    ewma_series,
+    explain_alarm,
     newcombe_difference,
     wilson_interval,
 )
+
+_T0 = datetime(2026, 10, 1, tzinfo=UTC)
+
+
+def _hourly(n: int) -> list[datetime]:
+    return [_T0 + timedelta(hours=i) for i in range(n)]
 
 
 class TestWilsonInterval:
@@ -78,3 +92,78 @@ class TestBootstrapInterval:
     def test_an_empty_sample_is_refused(self) -> None:
         with pytest.raises(ValueError):
             bootstrap_interval([], statistics.median, seed=1)
+
+
+class TestEwma:
+    def test_series_follows_the_recursion_from_z0(self) -> None:
+        assert ewma_series([1, 0, 0], 0.5, 0.0) == [0.5, 0.25, 0.125]
+
+    def test_asymptotic_limits_at_a_ten_percent_baseline(self) -> None:
+        limits = ewma_limits(0.10, 0.05, 3, t=10_000)
+        assert limits.ucl == pytest.approx(0.2441, abs=1e-4)
+        assert limits.lcl is None
+
+    def test_a_positive_lower_limit_is_reported(self) -> None:
+        limits = ewma_limits(0.30, 0.05, 3, t=10_000)
+        assert limits.lcl == pytest.approx(0.0799, abs=1e-4)
+
+    def test_early_limits_are_narrower_than_asymptotic_ones(self) -> None:
+        early = ewma_limits(0.30, 0.05, 3, t=1)
+        late = ewma_limits(0.30, 0.05, 3, t=10_000)
+        assert early.ucl < late.ucl
+        assert early.lcl is not None and late.lcl is not None
+        assert early.lcl > late.lcl
+
+
+class TestCusum:
+    def test_upward_alarms_reset_and_report_the_excursion_onset(self) -> None:
+        assert cusum_alarms([0] * 200 + [1] * 20, p0=0.1, p1=0.2, h=5) == [(207, 200), (215, 208)]
+
+    def test_downward_design_accumulates_on_zeros(self) -> None:
+        assert cusum_alarms([0] * 100, 0.1, 0.05, 5) == [(92, 0)]
+
+    @pytest.mark.parametrize(
+        ('p0', 'p1', 'h'),
+        [(0.0, 0.2, 5), (1.0, 0.2, 5), (0.1, 0.0, 5), (0.1, 1.0, 5), (0.1, 0.1, 5), (0.1, 0.2, 0)],
+    )
+    def test_invalid_designs_are_refused(self, p0: float, p1: float, h: float) -> None:
+        with pytest.raises(ValueError):
+            cusum_alarms([0, 1], p0, p1, h)
+
+    def test_design_doubles_and_halves_below_one_third(self) -> None:
+        assert astuple(cusum_design(0.10)) == pytest.approx((0.2, 0.05, 5))
+
+    def test_design_up_shift_stays_a_probability_at_one_half(self) -> None:
+        assert astuple(cusum_design(0.5)) == pytest.approx((0.75, 0.25, 5))
+
+    @pytest.mark.parametrize('p0', [0.0, 1.0, -0.1])
+    def test_design_refuses_a_degenerate_baseline(self, p0: float) -> None:
+        with pytest.raises(ValueError):
+            cusum_design(p0)
+
+
+class TestExplainAlarm:
+    def test_an_event_ten_landings_before_the_onset_explains_it(self) -> None:
+        landed_at = _hourly(200)
+        event = RegimeEvent('e1', landed_at[140])
+        assert explain_alarm(150, landed_at[150], [event], landed_at) == 'e1'
+
+    def test_an_event_far_in_landings_and_days_explains_nothing(self) -> None:
+        landed_at = _hourly(200)
+        event = RegimeEvent('e1', landed_at[50])
+        assert explain_alarm(150, landed_at[150], [event], landed_at) is None
+
+    def test_the_day_rule_reaches_past_the_landing_rule(self) -> None:
+        landed_at = _hourly(200)
+        event = RegimeEvent('e1', landed_at[110])
+        assert explain_alarm(150, landed_at[150], [event], landed_at) == 'e1'
+
+    def test_the_nearest_event_wins(self) -> None:
+        landed_at = _hourly(200)
+        events = [RegimeEvent('far', landed_at[140]), RegimeEvent('near', landed_at[145])]
+        assert explain_alarm(150, landed_at[150], events, landed_at) == 'near'
+
+    def test_equally_near_events_resolve_by_event_id(self) -> None:
+        landed_at = _hourly(200)
+        events = [RegimeEvent('zeta', landed_at[145]), RegimeEvent('alpha', landed_at[155])]
+        assert explain_alarm(150, landed_at[150], events, landed_at) == 'alpha'
