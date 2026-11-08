@@ -270,8 +270,10 @@ def _rendered(*, band: Literal['narrow'] | None) -> tuple[PackMember, str, str, 
 
 def test_a_rendered_member_shows_what_the_judge_needs():
     member, description, details, rendered = _rendered(band='narrow')
-    for shown in ('4242', 'review_suggestion', member.title, 'low', '7', 'narrow', 'a/x.py', 'b/y.py',
-                  'fix the thing', clip_for_prompt(description, 100), clip_for_prompt(details, 100)):
+    for shown in ('[Task 4242]', 'kind=review_suggestion', 'priority=low', 'spawned_from=7',
+                  'band=narrow', f'title: {member.title}', 'lock_keys: a/x.py, b/y.py',
+                  'item: fix the thing', f'description: {clip_for_prompt(description, 100)}',
+                  f'details: {clip_for_prompt(details, 100)}'):
         assert shown in rendered
     assert description not in rendered
     assert details not in rendered
@@ -342,7 +344,8 @@ async def test_the_judge_prompt_carries_the_pack_header_and_every_rendered_membe
     invoke = AsyncMock(return_value=agent_result(WHOLE_PACK))
     await _judged(tmp_path, invoke)
     prompt = _invoke_kwargs(invoke)['prompt']
-    for shown in (*RENDERED, PACK.generator, PACK.key, *PACK.union_keys):
+    for shown in (*RENDERED, f'generator={PACK.generator} key={PACK.key}', 'members: 1, 2, 3, 4, 5',
+                  f'union_keys: {", ".join(PACK.union_keys)}'):
         assert shown in prompt
 
 

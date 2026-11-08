@@ -457,6 +457,26 @@ def test_a_pack_holds_at_most_max_union_keys_keys():
     assert len(pack.union_keys) == 13
 
 
+@pytest.mark.parametrize(
+    ('oversized', 'bounds'),
+    [
+        pytest.param({'lock_keys': _keys('a/x.py', *(f'o/{n}.py' for n in range(16)))}, {}, id='keys'),
+        pytest.param({'lock_keys': ('a/x.py',), 'item_count': 3}, {'max_items': 2}, id='items'),
+    ],
+)
+def test_a_member_over_a_bound_on_its_own_never_packs_and_parts_its_neighbours(oversized, bounds):
+    packs = _packs(
+        [
+            member(task_id=10, lock_keys=('a/x.py',)),
+            member(task_id=11, **oversized),
+            member(task_id=12, lock_keys=('a/x.py',)),
+            member(task_id=13, lock_keys=('a/x.py',)),
+        ],
+        **bounds,
+    )
+    assert _packed(packs) == {('parent', frozenset({12, 13}))}
+
+
 def test_a_large_group_chunks_in_ascending_id():
     packs = _packs(member(task_id=i, lock_keys=('a/x.py',)) for i in range(10, 17))
     assert _packed(packs) == {
