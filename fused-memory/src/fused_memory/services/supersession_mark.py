@@ -49,6 +49,7 @@ SUPERSESSION_RETRY_SOURCE = 'mem0_write_retry'
 class UnmarkedReason(StrEnum):
     INVALID_MEMBER = 'invalid_supersedes_member'
     NO_SUPERSEDING_RECORD = 'no_superseding_mem0_record'
+    NO_PROJECT_ID = 'no_project_id'
     PATCH_FAILED = 'patch_failed'
 
 
@@ -140,7 +141,8 @@ async def mark_superseded_after_retry(
     Attributed to the intent's project, agent, session and causation, under
     :data:`SUPERSESSION_RETRY_SOURCE`. ``None`` when the intent declares no
     supersession; failures are reported in the result, as
-    :func:`mark_superseded` reports them.
+    :func:`mark_superseded` reports them. An intent naming no project marks
+    nothing: its targets' project is unknown.
     """
     declared = normalize_supersedes(decode_mem0_intent_metadata(intent).get('supersedes'))
     if not declared:
@@ -149,7 +151,7 @@ async def mark_superseded_after_retry(
         memory_service,
         declared,
         superseding_ids=outcome.memory_ids,
-        project_id=intent.get('project_id') or 'main',
+        project_id=intent.get('project_id') or None,
         agent_id=intent.get('agent_id'),
         session_id=intent.get('session_id'),
         causation_id=intent.get('causation_id'),
@@ -173,7 +175,7 @@ async def _mark_declared(
     declared: list[Any],
     *,
     superseding_ids: Sequence[str],
-    project_id: str,
+    project_id: str | None,
     agent_id: str | None,
     session_id: str | None,
     causation_id: str | None,
@@ -188,6 +190,13 @@ async def _mark_declared(
         )
         unmarked.extend(
             UnmarkedSupersession(target, UnmarkedReason.NO_SUPERSEDING_RECORD, no_record)
+            for target in targets
+        )
+    elif project_id is None:
+        unmarked.extend(
+            UnmarkedSupersession(
+                target, UnmarkedReason.NO_PROJECT_ID, 'the write names no project to mark in'
+            )
             for target in targets
         )
     else:

@@ -362,3 +362,23 @@ class TestMarkSupersededAfterRetry:
         [unmarked] = marks.unmarked
         assert unmarked.memory_id == OLD
         assert unmarked.reason == UnmarkedReason.PATCH_FAILED
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('project_id', [None, ''], ids=['missing', 'empty'])
+    async def test_an_intent_naming_no_project_is_reported_not_marked_in_a_default_project(
+        self, project_id, caplog
+    ) -> None:
+        service = _service()
+        intent = {**_intent({'supersedes': [OLD, 'abc']}), 'project_id': project_id}
+
+        with caplog.at_level('WARNING', logger='fused_memory.services.supersession_mark'):
+            marks = await mark_superseded_after_retry(service, intent, _landed(NEW_ID))
+
+        service.update_memory.assert_not_awaited()
+        assert marks is not None
+        assert marks.marked == ()
+        assert {u.memory_id: u.reason for u in marks.unmarked} == {
+            OLD: UnmarkedReason.NO_PROJECT_ID,
+            'abc': UnmarkedReason.INVALID_MEMBER,
+        }
+        assert [r.levelname for r in caplog.records] == ['WARNING']
