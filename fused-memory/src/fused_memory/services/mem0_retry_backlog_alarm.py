@@ -17,18 +17,16 @@ ANCHOR_TASK_ID = 'mem0-write-retry-backlog'
 _AGENT_ROLE = 'fused-memory/mem0-write-retry'
 _CATEGORY = 'mem0_write_retry_backlog'
 LOG_EVENT = 'mem0_write_retry_backlog'
+_EVIDENCE_QUERY = (
+    'SELECT id, project_id, attempts, created_at, next_attempt_at, reason '
+    "FROM mem0_intents WHERE status='retrying'"
+)
 
 
 class Mem0RetryBacklogChecker(Protocol):
     """Escalates its own Mem0 retry backlog once it is older than its policy allows."""
 
     async def check_mem0_retry_backlog(self) -> object: ...
-
-
-_EVIDENCE_QUERY = (
-    'SELECT id, project_id, attempts, created_at, next_attempt_at, reason '
-    "FROM mem0_intents WHERE status='retrying'"
-)
 
 
 def emit_mem0_retry_backlog_escalation(
