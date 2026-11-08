@@ -830,8 +830,9 @@ _JUDGE_MAX_TOKENS = 128
 #: plans/write-triage-flip-readiness-prd.md §11.
 _JUDGE_MAX_OUTPUT_TOKENS = 2_048
 
-#: Every arm's SDK client makes ONE attempt, so ``write_triage.judge_timeout_seconds``
-#: is the call's only time policy. Why: that field's description in
+#: Every arm's SDK client makes ONE attempt, so nothing retries inside
+#: ``write_triage.judge_timeout_seconds``; the SDK's per-attempt timeouts still
+#: apply within it. Why: that field's description in
 #: ``config/schema.py::WriteTriageConfig``.
 _JUDGE_SDK_MAX_RETRIES = 0
 
