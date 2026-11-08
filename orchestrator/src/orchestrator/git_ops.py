@@ -479,12 +479,9 @@ def task_citation_pattern(tid: str, pattern_template: str | None = None) -> str 
         return None
     try:
         pattern = template.format(tid=re.escape(tid))
-    except (KeyError, IndexError, ValueError, AttributeError, TypeError) as exc:
-        raise CitationPatternInvalid(template) from exc
-    try:
         re.compile(pattern)
-    except re.error as exc:
-        raise CitationPatternInvalid(pattern) from exc
+    except (KeyError, IndexError, ValueError, AttributeError, TypeError, re.error) as exc:
+        raise CitationPatternInvalid(template) from exc
     return pattern
 
 # Fixed name for the persistent warm merge-verify worktree (task 1692).
