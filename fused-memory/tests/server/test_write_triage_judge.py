@@ -1711,7 +1711,7 @@ class TestProviderCredentials:
                 decision=_decision('m1'), candidates=[_result('m1', 0.80)],
             )
         assert ctor.call_args.kwargs == {
-            'api_key': 'sk-wire', 'base_url': 'http://h/v1',
+            'api_key': 'sk-wire', 'base_url': 'http://h/v1', 'max_retries': 0,
         }
 
     @pytest.mark.parametrize('provider', ['openai', 'anthropic'])
