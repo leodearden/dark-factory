@@ -10337,20 +10337,21 @@ class TaskWorkflow:
         surfaces as a VERIFY failure, never a silent green.
 
         Best-effort and defensive, mirroring its sibling: returns ``[]`` on any
-        missing collaborator (``worktree``/``git_ops``/``artifacts``), an unset
-        ``base_commit``, or any git error — a false negative here just reverts
-        to today's baseline briefing and must never sink PLAN.
+        missing collaborator (``worktree``/``git_ops``/``artifacts``) or any
+        git error — a false negative here just reverts to today's baseline
+        briefing and must never sink PLAN.
 
         Returns HEAD-first ``[{'sha': ..., 'subject': ...}]`` for
-        ``base_commit..HEAD``.
+        ``own_work_base..HEAD`` (task 7668). That range excludes everything
+        reachable from a merged-in main tip, leaving the branch's own commits
+        plus the merge commit.
         """
         if self.worktree is None or self.git_ops is None or self.artifacts is None:
             return []
-        base = self.artifacts.read_base_commit()
-        if not base:
-            return []
         try:
-            commits = await self.git_ops.get_commit_subjects(self.worktree, base)
+            commits = await self.git_ops.get_commit_subjects(
+                self.worktree, await self._own_work_base(),
+            )
             return [{'sha': sha, 'subject': subject} for sha, subject in commits]
         except Exception:
             logger.warning(
