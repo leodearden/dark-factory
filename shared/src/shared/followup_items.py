@@ -36,6 +36,7 @@ __all__ = [
     'parse_item',
     'read_items',
     'require_unique_item_keys',
+    'task_items',
     'with_derived_bundle_keys',
 ]
 
@@ -254,6 +255,20 @@ def read_items(metadata: Mapping[str, object]) -> tuple[FollowupItem, ...]:
         _validated_element(element, FollowupItem.model_validate, index=index)
         for index, element in enumerate(elements)
     )
+
+
+def task_items(
+    *, title: str, files: Sequence[str], metadata: Mapping[str, object],
+) -> tuple[FollowupItem, ...]:
+    """The observations a stored task stands for: its followup_items, else its pre-bundle single as one legacy item, else ().
+
+    Raises:
+        FollowupBundleInvalid: when the stored ``followup_items`` value is malformed.
+    """
+    if FOLLOWUP_ITEMS_METADATA_KEY in metadata:
+        return read_items(metadata)
+    legacy = legacy_item(title=title, files=files, metadata=metadata)
+    return () if legacy is None else (legacy,)
 
 
 def _require_list(raw: object) -> list[object]:
