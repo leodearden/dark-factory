@@ -18,13 +18,13 @@ from __future__ import annotations
 
 import asyncio
 import copy
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock, patch
 
 import pytest
-from _orch_helpers import wire_scheduler_liveness_mock
 from _task_store_doubles import TaskStoreDouble
+from _workflow_helpers import _build_harness
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
@@ -32,7 +32,14 @@ from fastmcp.tools.function_tool import FunctionTool
 
 from orchestrator.harness import Harness
 from orchestrator.merge_lane.gates import PLAN_FILES_NOT_TOUCHED_REASON_PREFIX
-from orchestrator.recut_ruling import RECUT_RULING_KEY, ruling_to_enforce
+from orchestrator.recut_ruling import (
+    RECUT_EXECUTED_KEY,
+    RECUT_RULING_KEY,
+    RecutRuling,
+    execution_record,
+    ruling_patch,
+    ruling_to_enforce,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -52,15 +59,7 @@ def harness(
     mock_orch_config, store: TaskStoreDouble, queue: EscalationQueue,
     monkeypatch: pytest.MonkeyPatch,
 ) -> Harness:
-    with (
-        patch('orchestrator.harness.McpLifecycle'),
-        patch('orchestrator.harness.OverrideStore'),
-        patch('orchestrator.harness.Scheduler'),
-        patch('orchestrator.harness.BriefingAssembler'),
-    ):
-        h = Harness(mock_orch_config)
-    h.scheduler = MagicMock()
-    wire_scheduler_liveness_mock(h.scheduler)
+    h = _build_harness(mock_orch_config)
     store.wire_into(h.scheduler)
     monkeypatch.setattr(h, 'is_workflow_active', lambda task_id: False)
     h._escalation_queue = queue
@@ -74,18 +73,31 @@ def server(queue: EscalationQueue, harness: Harness):
 
 
 def _file_l1(queue: EscalationQueue, task_id: str, *, level: int = 1, **kw: Any) -> Escalation:
+    kw.setdefault('category', 'design_concern')
+    kw.setdefault('summary', f'{PLAN_FILES_NOT_TOUCHED_REASON_PREFIX}: a.py, b.py.')
     esc = Escalation(
         id=queue.make_id(task_id),
         task_id=task_id,
         agent_role='orchestrator',
         severity='blocking',
-        category='design_concern',
-        summary=f'{PLAN_FILES_NOT_TOUCHED_REASON_PREFIX}: a.py, b.py.',
         level=level,
         **kw,
     )
     queue.submit(esc)
     return esc
+
+
+def _recut_unrecorded_l1s(queue: EscalationQueue, task_id: str) -> list[Escalation]:
+    return [
+        e for e in queue.get_by_task(task_id, status='pending', level=1)
+        if e.summary.startswith('RESTART_RECUT_UNRECORDED')
+    ]
+
+
+def _resolved_at(queue: EscalationQueue, esc_id: str) -> datetime:
+    record = queue.get(esc_id)
+    assert record is not None and record.resolved_at is not None
+    return datetime.fromisoformat(record.resolved_at)
 
 
 async def _resolve(server, harness: Harness, **kwargs: Any) -> dict[str, Any]:
@@ -108,7 +120,7 @@ class TestRestartRecutIssuesARuling:
 
         assert 'error' not in result, result
         ruling = ruling_to_enforce(store.tasks['42'])
-        assert ruling is not None and ruling.ruling_id == l1.id
+        assert ruling == RecutRuling(l1.id, _resolved_at(queue, l1.id))
         [ruling_write] = store.writes_of('42', RECUT_RULING_KEY)
         assert ruling_write < store.index_of(lambda c: c == ('set_task_status', '42', 'pending'))
         assert store.status('42') == 'pending'
@@ -135,8 +147,11 @@ class TestRestartRecutIssuesARuling:
         assert archived is not None and archived.recut is True
         for task_id in ('42', '43'):
             ruling = ruling_to_enforce(store.tasks[task_id])
-            assert ruling is not None and ruling.ruling_id == l2.id, task_id
+            assert ruling == RecutRuling(l2.id, _resolved_at(queue, l2.id)), task_id
             assert store.status(task_id) == 'pending'
+        [on_42] = store.writes_of('42', RECUT_RULING_KEY)
+        [on_43] = store.writes_of('43', RECUT_RULING_KEY)
+        assert store.calls[on_42][2] == store.calls[on_43][2]
 
     async def test_unrecorded_ruling_holds_the_task_blocked_and_files_an_l1(
         self, server, harness, store, queue,
@@ -149,13 +164,37 @@ class TestRestartRecutIssuesARuling:
 
         assert store.status('42') == 'blocked'
         assert ('set_task_status', '42', 'pending') not in store.calls
-        filed = [
-            e for e in queue.get_by_task('42', status='pending', level=1)
-            if e.category == 'infra_issue'
-        ]
-        assert len(filed) == 1, filed
-        assert filed[0].summary.startswith('RESTART_RECUT_UNRECORDED')
-        assert l1.id in filed[0].detail
+        [filed] = _recut_unrecorded_l1s(queue, '42')
+        assert filed.category == 'infra_issue'
+        assert l1.id in filed.detail
+
+    async def test_an_unrelated_open_infra_l1_does_not_hide_the_failure(
+        self, server, harness, store, queue,
+    ):
+        store.add('42')
+        unrelated = _file_l1(queue, '42', category='infra_issue', summary='verify host flaky')
+        store.refused_metadata_keys.add(RECUT_RULING_KEY)
+        l1 = _file_l1(queue, '42')
+
+        await _resolve(server, harness, escalation_id=l1.id, action='restart', recut=True)
+
+        [filed] = _recut_unrecorded_l1s(queue, '42')
+        assert filed.id != unrelated.id
+        assert store.status('42') == 'blocked'
+
+    async def test_a_second_failure_folds_into_the_open_recut_l1(
+        self, server, harness, store, queue,
+    ):
+        store.add('42')
+        store.refused_metadata_keys.add(RECUT_RULING_KEY)
+        first = _file_l1(queue, '42')
+        await _resolve(server, harness, escalation_id=first.id, action='restart', recut=True)
+        second = _file_l1(queue, '42')
+
+        await _resolve(server, harness, escalation_id=second.id, action='restart', recut=True)
+
+        [filed] = _recut_unrecorded_l1s(queue, '42')
+        assert first.id in filed.detail
 
     async def test_terminal_task_is_left_alone(self, server, harness, store, queue):
         store.add('42', status='done')
@@ -216,7 +255,25 @@ class TestRulingDroppedDuringTheKillWindow:
         assert ruling is not None and ruling.ruling_id == l1.id
         assert store.status('42') == 'pending'
 
-    async def test_a_failed_re_assert_files_an_l1(
+    async def test_an_older_ruling_restored_in_its_place_is_overwritten(
+        self, monkeypatch, server, harness, store, queue,
+    ):
+        older = RecutRuling('esc-42-prior', datetime(2026, 10, 1, tzinfo=UTC))
+        store.add('42', status='in-progress', metadata={
+            **ruling_patch(older),
+            RECUT_EXECUTED_KEY: execution_record(older, None, datetime(2026, 10, 2, tzinfo=UTC)),
+        })
+        _kill_lands_a_stale_replace_write(monkeypatch, harness, store, '42')
+        l1 = _file_l1(queue, '42')
+
+        await _resolve(server, harness, escalation_id=l1.id, action='restart', recut=True)
+
+        assert ruling_to_enforce(store.tasks['42']) == RecutRuling(
+            l1.id, _resolved_at(queue, l1.id),
+        )
+        assert store.status('42') == 'pending'
+
+    async def test_a_failed_re_assert_holds_the_task_blocked_and_files_an_l1(
         self, monkeypatch, server, harness, store, queue,
     ):
         store.add('42', status='in-progress')
@@ -228,13 +285,11 @@ class TestRulingDroppedDuringTheKillWindow:
         await _resolve(server, harness, escalation_id=l1.id, action='restart', recut=True)
 
         assert RECUT_RULING_KEY not in store.metadata('42')
-        filed = [
-            e for e in queue.get_by_task('42', status='pending', level=1)
-            if e.category == 'infra_issue'
-        ]
-        assert len(filed) == 1, filed
-        assert filed[0].summary.startswith('RESTART_RECUT_UNRECORDED')
-        assert l1.id in filed[0].detail
+        assert store.status('42') == 'blocked'
+        [filed] = _recut_unrecorded_l1s(queue, '42')
+        assert filed.category == 'infra_issue'
+        assert l1.id in filed.detail
+        assert 'held blocked' in filed.detail
 
 
 class TestUnrecordedRulingUndoesNothing:

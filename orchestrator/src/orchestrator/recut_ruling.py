@@ -135,6 +135,10 @@ def read_recut_ruling(task: dict[str, Any]) -> RecutReading:
             task.get('id'),
         )
         return RecutReading(RecutState.SKIP)
+    return _reading_of(metadata)
+
+
+def _reading_of(metadata: dict[str, Any]) -> RecutReading:
     if RECUT_RULING_KEY not in metadata:
         return RecutReading(RecutState.ABSENT)
     ruling = _parse_ruling(metadata[RECUT_RULING_KEY])
@@ -174,6 +178,11 @@ def execution_record(
     }
 
 
+def ruling_on_record(ruling_id: str, resolved_at: object, *, now: datetime) -> RecutRuling:
+    """The ruling a record resolved at *resolved_at* issues; ruled *now* if that is unreadable."""
+    return RecutRuling(ruling_id, _parse_ruled_at(resolved_at) or now)
+
+
 def ruling_patch(ruling: RecutRuling) -> dict[str, Any]:
     """The metadata patch that issues *ruling*; ``_parse_ruling`` reads it back."""
     return {
@@ -194,14 +203,44 @@ async def issue_ruling(
 
 
 def issued_ruling_was_dropped(task: dict[str, Any], ruling: RecutRuling) -> bool:
-    """True when *task* carries neither the issued *ruling* nor its execution.
+    """True when *task* carries neither *ruling*, its execution, nor a newer ruling.
 
-    Unreadable metadata reads False: nothing seen is nothing to restore.
+    An older ruling in its place, pending or already executed, reads as
+    dropped: a stale read-modify-write restored it. Unreadable metadata, or
+    a malformed ruling the dispatch gate will refuse loudly, reads False.
     """
     metadata = coerce_task_metadata(task.get('metadata'))
-    if metadata is None or RECUT_RULING_KEY in metadata:
+    if metadata is None or _executed_ruling_id(metadata) == ruling.ruling_id:
         return False
-    return _executed_ruling_id(metadata) != ruling.ruling_id
+    reading = _reading_of(metadata)
+    if reading.state is RecutState.ABSENT:
+        return True
+    present = reading.ruling
+    if reading.state is RecutState.MALFORMED or present is None:
+        return False
+    return present.ruling_id != ruling.ruling_id and present.ruled_at < ruling.ruled_at
+
+
+async def reassert_ruling(
+    task: dict[str, Any],
+    ruling: RecutRuling,
+    *,
+    persist: Callable[[dict[str, Any]], Awaitable[bool]],
+) -> str | None:
+    """Re-issue *ruling* if *task* dropped it; the failure reason, or None.
+
+    Re-issuing cannot re-cut twice: once ``recut_executed`` names the
+    ruling, it is neither re-issued nor enforced again.
+    """
+    if not issued_ruling_was_dropped(task, ruling):
+        return None
+    failure = await issue_ruling(ruling, persist=persist)
+    if failure is None:
+        logger.warning(
+            'RECUT RE-ASSERTED: task %s ruling %s had been dropped',
+            task.get('id'), ruling.ruling_id,
+        )
+    return failure
 
 
 async def enforce_recut_ruling(

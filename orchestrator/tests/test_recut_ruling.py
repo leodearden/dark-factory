@@ -24,6 +24,7 @@ from orchestrator.recut_ruling import (
     issue_ruling,
     issued_ruling_was_dropped,
     read_recut_ruling,
+    reassert_ruling,
     ruling_patch,
     ruling_to_enforce,
 )
@@ -349,6 +350,8 @@ class TestEnforceRecutRuling:
 
 
 ISSUED = RecutRuling(ruling_id='esc-5516-3', ruled_at=datetime(2026, 10, 30, 9, 15, tzinfo=UTC))
+OLDER = RecutRuling(ruling_id='esc-5516-1', ruled_at=datetime(2026, 10, 1, tzinfo=UTC))
+NEWER = RecutRuling(ruling_id='esc-5516-9', ruled_at=datetime(2026, 10, 31, tzinfo=UTC))
 
 
 class TestRulingPatch:
@@ -376,9 +379,8 @@ class TestRulingPatch:
         assert ruling_to_enforce(task) is None
 
     def test_newer_issued_ruling_over_an_older_execution_is_pending(self):
-        older = RecutRuling(ruling_id='esc-5516-1', ruled_at=datetime(2026, 10, 1, tzinfo=UTC))
         metadata = {
-            RECUT_EXECUTED_KEY: execution_record(older, PARKED, EXECUTED_AT),
+            RECUT_EXECUTED_KEY: execution_record(OLDER, PARKED, EXECUTED_AT),
             **ruling_patch(ISSUED),
         }
         task = {'id': '5516', 'metadata': metadata}
@@ -417,13 +419,57 @@ class TestIssuedRulingWasDropped:
         assert not issued_ruling_was_dropped({'metadata': metadata}, ISSUED)
 
     def test_ruling_gone_after_an_older_execution_is_dropped(self):
-        older = RecutRuling(ruling_id='esc-5516-1', ruled_at=datetime(2026, 10, 1, tzinfo=UTC))
-        metadata = {RECUT_EXECUTED_KEY: execution_record(older, PARKED, EXECUTED_AT)}
+        metadata = {RECUT_EXECUTED_KEY: execution_record(OLDER, PARKED, EXECUTED_AT)}
         assert issued_ruling_was_dropped({'metadata': metadata}, ISSUED)
 
-    def test_a_different_ruling_in_its_place_is_not_dropped(self):
-        newer = RecutRuling(ruling_id='esc-5516-9', ruled_at=datetime(2026, 10, 31, tzinfo=UTC))
-        assert not issued_ruling_was_dropped({'metadata': ruling_patch(newer)}, ISSUED)
+    def test_a_newer_ruling_in_its_place_is_not_dropped(self):
+        assert not issued_ruling_was_dropped({'metadata': ruling_patch(NEWER)}, ISSUED)
+
+    def test_a_newer_executed_ruling_in_its_place_is_not_dropped(self):
+        metadata = {
+            **ruling_patch(NEWER),
+            RECUT_EXECUTED_KEY: execution_record(NEWER, PARKED, EXECUTED_AT),
+        }
+        assert not issued_ruling_was_dropped({'metadata': metadata}, ISSUED)
+
+    def test_an_older_pending_ruling_in_its_place_is_dropped(self):
+        assert issued_ruling_was_dropped({'metadata': ruling_patch(OLDER)}, ISSUED)
+
+    def test_an_older_executed_ruling_in_its_place_is_dropped(self):
+        metadata = {
+            **ruling_patch(OLDER),
+            RECUT_EXECUTED_KEY: execution_record(OLDER, PARKED, EXECUTED_AT),
+        }
+        assert issued_ruling_was_dropped({'metadata': metadata}, ISSUED)
+
+    def test_a_malformed_ruling_in_its_place_is_left_to_the_gate(self):
+        metadata = {RECUT_RULING_KEY: {'ruling_id': 'esc-5516-1'}}
+        assert not issued_ruling_was_dropped({'metadata': metadata}, ISSUED)
 
     def test_unreadable_metadata_is_not_read_as_dropped(self):
         assert not issued_ruling_was_dropped({'metadata': 'not-json{'}, ISSUED)
+
+
+@pytest.mark.asyncio
+class TestReassertRuling:
+    async def test_a_carried_ruling_is_not_rewritten(self):
+        persist = AsyncMock(return_value=True)
+        task = {'id': '5516', 'metadata': ruling_patch(ISSUED)}
+        assert await reassert_ruling(task, ISSUED, persist=persist) is None
+        persist.assert_not_awaited()
+
+    async def test_an_older_ruling_restored_in_its_place_is_overwritten(self):
+        persist = AsyncMock(return_value=True)
+        metadata = {
+            **ruling_patch(OLDER),
+            RECUT_EXECUTED_KEY: execution_record(OLDER, PARKED, EXECUTED_AT),
+        }
+        task = {'id': '5516', 'metadata': metadata}
+        assert await reassert_ruling(task, ISSUED, persist=persist) is None
+        persist.assert_awaited_once_with(ruling_patch(ISSUED))
+
+    async def test_a_failed_re_issue_returns_the_reason(self):
+        persist = AsyncMock(return_value=False)
+        task = {'id': '5516', 'metadata': {}}
+        failure = await reassert_ruling(task, ISSUED, persist=persist)
+        assert isinstance(failure, str) and failure

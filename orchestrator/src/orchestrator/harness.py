@@ -27,7 +27,7 @@ from escalation.grant_delivery import (
     GrantDelivery,
     shortfall_reason,
 )
-from escalation.models import DeliveredCheckOwner, Escalation
+from escalation.models import DeliveredCheckOwner, Escalation, cascade_parent_id
 from escalation.pins import classify_pins
 from shared import delivered_check_polarity
 from shared.asyncio_tasks import abandon_task
@@ -9644,25 +9644,40 @@ class Harness:
                 'will still attempt to file escalation',
                 task_id, exc_info=True,
             )
-        self._file_dispatch_gate_l1(
+        self._file_harness_l1(
             task_id, category=category, summary=summary, detail=detail,
         )
 
-    def _file_dispatch_gate_l1(
+    def _file_harness_l1(
         self, task_id: str, *, category: str, summary: str, detail: str,
+        root_cause: str = '',
     ) -> None:
-        """File one category-scoped L1 for *task_id*, unless one is already open."""
+        """File one L1 for *task_id*, unless an open L1 already covers it.
+
+        Covering means an open L1 of *category*; with a *root_cause*, an open
+        L1 of *category* carrying that same root cause, so an unrelated L1 of
+        the category cannot hide this one.
+        """
         if not self._escalation_queue:
             logger.warning(
-                'Dispatch-gate block for task %s — no escalation queue, skipping L1 file',
-                task_id,
+                'Harness L1 for task %s — no escalation queue, skipping the file: %s',
+                task_id, summary,
             )
             return
-        if self._escalation_queue.has_open_l1(task_id, category=category):
+        if root_cause:
+            covered = any(
+                esc.category == category and esc.root_cause == root_cause
+                for esc in self._escalation_queue.get_by_task(
+                    task_id, status='pending', level=1,
+                )
+            )
+        else:
+            covered = self._escalation_queue.has_open_l1(task_id, category=category)
+        if covered:
             logger.warning(
-                'Dispatch-gate block for task %s — open %s L1 already exists, '
-                'suppressing duplicate',
-                task_id, category,
+                'Harness L1 for task %s — an open %s L1 already covers it, '
+                'suppressing duplicate: %s',
+                task_id, category, summary,
             )
             return
 
@@ -9678,6 +9693,7 @@ class Harness:
             detail=detail,
             suggested_action='manual_intervention',
             level=1,
+            root_cause=root_cause,
             filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self._escalation_queue.submit(esc)
@@ -16819,7 +16835,8 @@ class Harness:
             )
             return
 
-        action = self._resolve_escalation_action(escalation)
+        parent = self._cascade_parent(escalation)
+        action = self._resolve_escalation_action(escalation, parent)
 
         # Table B (ω3, task 2196): target_status and workflow routing are
         # sourced from escalation.action_effects.effect_for — the SAME
@@ -16895,10 +16912,11 @@ class Harness:
             # stranded sweep re-pends anyway — so there the guard delays the
             # resume rather than stopping it.
             #
-            # Cascade member: resolved_by startswith 'l2-cascade:' (the cascade
-            # fired _resolve_callback for the L2 first, then each member with
-            # 'l2-cascade:<id>').  Direct/orphan: NOT l2-cascade AND task_id
-            # NOT in _escalation_events (a live workflow owns its own re-pend).
+            # Cascade member: resolved_by names a parent L2
+            # (escalation.models.cascade_parent_id; the cascade fired
+            # _resolve_callback for the L2 first, then for each member).
+            # Direct/orphan: NOT a cascade member AND task_id NOT in
+            # _escalation_events (a live workflow owns its own re-pend).
             #
             # Live slot with a grant (task 5650): the third arm delivers
             # `granted_files` and does not re-pend, because the live workflow
@@ -16918,11 +16936,7 @@ class Harness:
             # branch delivers the grant through `TaskWorkflow._set_task_scope`,
             # which also acquires the module locks the grant needs, so a
             # harness write there could only race it.
-            is_l2_cascade = (
-                isinstance(escalation.resolved_by, str)
-                and escalation.resolved_by.startswith('l2-cascade:')
-            )
-            if is_l2_cascade:
+            if cascade_parent_id(escalation.resolved_by) is not None:
                 # Scheduled via _schedule_coro_threadsafe so it works whether
                 # this callback fires on the orchestrator loop or off it (sync
                 # MCP resolve_issue on a FastMCP worker — where a bare
@@ -16976,7 +16990,8 @@ class Harness:
                 escalation.task_id, effect.target_status, action,
                 escalation_id=escalation.id,
                 recut=(
-                    self._restart_recut_ruling(escalation) if action == 'restart' else None
+                    self._restart_recut_ruling(escalation, parent)
+                    if action == 'restart' else None
                 ),
             ),
             label=(
@@ -17015,7 +17030,8 @@ class Harness:
              suppression stamp, then (restart only) re-run step 3's clear and
              re-assert step 2's ruling, so neither a stamp resurrected nor a
              ruling dropped by the dying workflow's own metadata write
-             survives the restart.
+             survives the restart.  A re-assert that does not land fails
+             closed as step 2 does: a task still 'pending' is held 'blocked'.
 
         Preconditions per action:
           - restart: task must be non-terminal (checked at step 1); target='pending'.
@@ -17321,10 +17337,10 @@ class Harness:
         """Re-issue *ruling* if a write landing in the kill window dropped it.
 
         A dying workflow's replace-mode metadata write that read the task
-        before the ruling landed deletes it, which would silently degrade the
-        restart to a plain one. Re-issuing the same ruling cannot re-cut
-        twice: once ``recut_executed`` names it, it is neither re-issued nor
-        enforced again.
+        before the ruling landed deletes it, or restores an older ruling,
+        which would silently degrade the restart to a plain one. FAILS CLOSED
+        like the first write: if the re-issue does not land, a task still
+        'pending' is held 'blocked' and the L1 is filed.
         """
         task = await self.scheduler.get_task(task_id)
         if task is None:
@@ -17334,25 +17350,38 @@ class Harness:
                 task_id, ruling.ruling_id,
             )
             return
-        if not recut_ruling.issued_ruling_was_dropped(task, ruling):
-            return
-        failure = await recut_ruling.issue_ruling(
-            ruling, persist=functools.partial(self.scheduler.update_task, task_id),
+        failure = await recut_ruling.reassert_ruling(
+            task, ruling, persist=functools.partial(self.scheduler.update_task, task_id),
         )
         if failure is None:
-            logger.warning(
-                'RECUT RE-ASSERTED: task %s ruling %s was dropped in the kill window',
-                task_id, ruling.ruling_id,
-            )
             return
-        self._file_restart_recut_unrecorded(
-            task_id, ruling, failure, escalation_id=escalation_id,
-            consequence=(
+        if await self._block_if_still_pending(task_id):
+            consequence = (
+                'The ruling landed but was dropped in the kill window; the task is '
+                'held blocked rather than re-pended onto its stale plan and branch.'
+            )
+        else:
+            consequence = (
                 'The ruling landed but was dropped in the kill window, and the task '
-                'is already re-pended, so its next dispatch may reuse its stale plan '
+                'had already left pending, so a dispatch may reuse its stale plan '
                 'and branch.'
-            ),
+            )
+        self._file_restart_recut_unrecorded(
+            task_id, ruling, failure, escalation_id=escalation_id, consequence=consequence,
         )
+
+    async def _block_if_still_pending(self, task_id: str) -> bool:
+        """Write 'blocked' over a task that still reads 'pending'; True once written."""
+        if await self.scheduler.get_status(task_id) != 'pending':
+            return False
+        try:
+            await self.scheduler.set_task_status(task_id, 'blocked')
+        except Exception:
+            logger.warning(
+                'RECUT RE-CHECK: could not hold task %s blocked', task_id, exc_info=True,
+            )
+            return False
+        return True
 
     def _file_restart_recut_unrecorded(
         self,
@@ -17367,9 +17396,10 @@ class Harness:
             'RECUT UNRECORDED: task %s ruling %s via %s: %s %s',
             task_id, ruling.ruling_id, escalation_id, failure, consequence,
         )
-        self._file_dispatch_gate_l1(
+        self._file_harness_l1(
             task_id,
             category='infra_issue',
+            root_cause=f'restart-recut-unrecorded:{task_id}',
             summary=(
                 f'RESTART_RECUT_UNRECORDED: task {task_id} restart via {escalation_id} '
                 'demanded a re-cut that could not be recorded'
@@ -17383,37 +17413,34 @@ class Harness:
         )
 
     def _cascade_parent(self, escalation) -> Escalation | None:
-        """The parent L2 of an ``l2-cascade:<id>`` member, or None."""
-        resolved_by = escalation.resolved_by
-        if not (isinstance(resolved_by, str) and resolved_by.startswith('l2-cascade:')):
+        """The parent L2 a cascade member's ``resolved_by`` names, or None."""
+        parent_id = cascade_parent_id(escalation.resolved_by)
+        if parent_id is None or self._escalation_queue is None:
             return None
-        if self._escalation_queue is None:
+        return self._escalation_queue.get(parent_id)
+
+    @staticmethod
+    def _restart_recut_ruling(
+        escalation, parent: Escalation | None,
+    ) -> recut_ruling.RecutRuling | None:
+        """The ruling of the record whose resolution set ``recut``, ruled when it resolved."""
+        record = escalation if escalation.recut else parent
+        if record is None or not record.recut:
             return None
-        return self._escalation_queue.get(resolved_by.split(':', 1)[1])
+        return recut_ruling.ruling_on_record(
+            record.id, record.resolved_at, now=datetime.now(UTC),
+        )
 
-    def _restart_recut_ruling(self, escalation) -> recut_ruling.RecutRuling | None:
-        """The re-cut ruling a restart resolution issues, ruled now, or None."""
-        ruling_id = self._recut_ruling_id(escalation)
-        if ruling_id is None:
-            return None
-        return recut_ruling.RecutRuling(ruling_id, datetime.now(UTC))
-
-    def _recut_ruling_id(self, escalation) -> str | None:
-        """The id of the record whose resolution set ``recut``, or None."""
-        if escalation.recut:
-            return escalation.id
-        parent = self._cascade_parent(escalation)
-        return parent.id if parent is not None and parent.recut else None
-
-    def _resolve_escalation_action(self, escalation) -> str:
+    @staticmethod
+    def _resolve_escalation_action(escalation, parent: Escalation | None = None) -> str:
         """Resolve the canonical action for a resolved/dismissed escalation.
 
         Priority:
           1. The explicit ``resolution_action`` on the record (set by the MCP
              server at resolve_issue time — α1 path).
-          2. For cascade members (``resolved_by='l2-cascade:<parent_id>'``):
-             read the parent L2's ``resolution_action`` (already archived by
-             the time the member callback fires).  Falls through if absent.
+          2. For cascade members: the ``resolution_action`` of *parent*, the
+             L2 ``_cascade_parent`` read for *escalation* (already archived
+             by the time the member callback fires).  Falls through if absent.
           3. Legacy mapping (D10): ``status=='dismissed'`` → ``'close_only'``;
              ``status=='resolved'`` → ``'resume'``.
 
@@ -17426,7 +17453,6 @@ class Harness:
 
         # 2) Cascade member: inherit parent L2's action.  Falls through to the
         #    legacy map when there is no parent or it lacks resolution_action.
-        parent = self._cascade_parent(escalation)
         if parent is not None and parent.resolution_action is not None:
             return parent.resolution_action
 
