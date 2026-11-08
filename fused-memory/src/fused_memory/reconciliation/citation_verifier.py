@@ -367,7 +367,7 @@ async def resolve_memory_liveness(
     """
     try:
         record = await memory_service.get_memory_by_id(project_id, memory_id)
-    except Exception as exc:  # noqa: BLE001 — unknown is a verdict, not a crash
+    except Exception as exc:  # unknown is a verdict, not a crash
         return LivenessVerdict(MemoryLiveness.INCONCLUSIVE, type(exc).__name__)
     if record:
         return LivenessVerdict(MemoryLiveness.LIVE, None)
