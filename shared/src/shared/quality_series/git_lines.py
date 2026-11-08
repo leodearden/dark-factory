@@ -80,6 +80,8 @@ def path_class(path: str) -> PathClass:
 def module_key(path: str) -> str:
     """``<pkg>/src/<pkg2>/<rest>`` keys as ``<pkg>/<rest[0]>``; else two components at depth >= 3, else one."""
     parts = PurePosixPath(path).parts
+    if len(parts) == 0:
+        raise ValueError(f'module_key needs a non-empty path, got {path!r}')
     if len(parts) >= 4 and parts[1] == 'src':
         return f'{parts[0]}/{parts[3]}'
     if len(parts) >= 3:

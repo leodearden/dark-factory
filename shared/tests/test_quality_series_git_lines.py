@@ -58,6 +58,11 @@ def test_module_key(path: str, expected: str) -> None:
     assert module_key(path) == expected
 
 
+def test_module_key_rejects_an_empty_path() -> None:
+    with pytest.raises(ValueError, match='non-empty path'):
+        module_key('')
+
+
 def _lines(n: int, tag: str) -> str:
     return ''.join(f'{tag} {i}\n' for i in range(n))
 
