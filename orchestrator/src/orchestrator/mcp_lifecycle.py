@@ -15,7 +15,7 @@ from typing import Any
 import anyio
 import httpx
 from shared.jcodemunch_launch import jcodemunch_server_config
-from shared.mcp_envelope import (  # noqa: F401 — re-exported for scheduler.py and agents/memory_recall.py  # debt: task 7688
+from shared.mcp_envelope import (  # noqa: F401 — re-exported for agents/memory_recall.py  # debt: task 7688
     tool_error_text,
     tool_text_blocks,
 )
