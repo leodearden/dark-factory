@@ -11607,6 +11607,116 @@ def _t3_record(
     )
 
 
+_THREAD = '7d1f0c2a-5b3e-4c8d-9a6f-1e2d3c4b5a69'
+_OTHER_THREAD = '0f9e8d7c-6b5a-4938-8271-605f4e3d2c1b'
+
+
+class TestT3ThreadPointers:
+    def test_pointer_dir_is_a_sibling_of_sessions(self, tmp_path: Path) -> None:
+        assert sr.t3_thread_pointers_dir(tmp_path) == tmp_path / 'sessions-by-t3-thread'
+        assert sr.t3_thread_pointer_path(_THREAD, tmp_path).parent.parent == tmp_path
+
+    def test_a_written_pointer_resolves_while_a_live_t3_record_names_the_thread(
+        self, tmp_path: Path
+    ) -> None:
+        _t3_record(tmp_path, 'session-df-8124-1', _THREAD, cwd=str(tmp_path))
+
+        assert sr.write_t3_thread_pointer(_THREAD, 'session-df-8124-1', root=tmp_path)
+        assert sr.t3_thread_pointer_path(_THREAD, tmp_path).read_text() == 'session-df-8124-1'
+        assert sr.resolve_session_slug_for_t3_thread(_THREAD, root=tmp_path) == (
+            'session-df-8124-1'
+        )
+
+    @pytest.mark.parametrize(
+        ('thread_id', 'status', 'kind'),
+        [
+            pytest.param(_THREAD, sr.Status.RUNNING, 'wm', id='not-t3'),
+            pytest.param(_OTHER_THREAD, sr.Status.RUNNING, 't3', id='another-thread'),
+            pytest.param(_THREAD, sr.Status.EXITED, 't3', id='terminal'),
+        ],
+    )
+    def test_a_record_that_does_not_vouch_resolves_none(
+        self, tmp_path: Path, thread_id: str, status: sr.Status, kind: str
+    ) -> None:
+        _t3_record(tmp_path, 'held', thread_id, cwd=str(tmp_path), status=status, kind=kind)
+        sr.write_t3_thread_pointer(_THREAD, 'held', root=tmp_path)
+
+        assert sr.resolve_session_slug_for_t3_thread(_THREAD, root=tmp_path) is None
+
+    def test_a_missing_record_or_pointer_resolves_none(self, tmp_path: Path) -> None:
+        assert sr.resolve_session_slug_for_t3_thread(_THREAD, root=tmp_path) is None
+        sr.write_t3_thread_pointer(_THREAD, 'gone-record', root=tmp_path)
+        assert sr.resolve_session_slug_for_t3_thread(_THREAD, root=tmp_path) is None
+
+    @pytest.mark.parametrize('thread_id', ['', '../escape', 'a/b', 'x' * 129])
+    def test_an_unsafe_thread_id_is_never_written_or_read(
+        self, tmp_path: Path, thread_id: str
+    ) -> None:
+        assert not sr.write_t3_thread_pointer(thread_id, 'session-df-1', root=tmp_path)
+        assert sr.resolve_session_slug_for_t3_thread(thread_id, root=tmp_path) is None
+        assert not sr.t3_thread_pointers_dir(tmp_path).exists()
+
+    def test_a_non_record_key_slug_is_not_written(self, tmp_path: Path) -> None:
+        assert not sr.write_t3_thread_pointer(_THREAD, '..', root=tmp_path)
+        assert not sr.write_t3_thread_pointer(_THREAD, 'a/b', root=tmp_path)
+
+    def test_reap_removes_pointers_no_live_t3_record_vouches_for(self, tmp_path: Path) -> None:
+        ended, gone, moved = (
+            '1a2b3c4d-0000-4000-8000-000000000001',
+            '1a2b3c4d-0000-4000-8000-000000000002',
+            '1a2b3c4d-0000-4000-8000-000000000003',
+        )
+        _t3_record(tmp_path, 'live', _THREAD, cwd=str(tmp_path))
+        _t3_record(tmp_path, 'ended', ended, cwd=str(tmp_path), status=sr.Status.EXITED)
+        _t3_record(tmp_path, 'moved', _OTHER_THREAD, cwd=str(tmp_path))
+        sr.write_t3_thread_pointer(_THREAD, 'live', root=tmp_path)
+        sr.write_t3_thread_pointer(ended, 'ended', root=tmp_path)
+        sr.write_t3_thread_pointer(gone, 'gone-record', root=tmp_path)
+        sr.write_t3_thread_pointer(moved, 'moved', root=tmp_path)
+        pointers = sr.t3_thread_pointers_dir(tmp_path)
+        (pointers / 'bad name').write_text('live')
+        fresh_temp = pointers / f'inflight{sr._ATOMIC_WRITE_TEMP_SUFFIX}'
+        fresh_temp.write_text('live')
+
+        removed = sr.reap_stale_session_pointers(root=tmp_path)
+
+        assert {path.name for path in removed} == {ended, gone, moved, 'bad name'}
+        assert sorted(path.name for path in pointers.iterdir()) == sorted(
+            [_THREAD, fresh_temp.name]
+        )
+
+    def test_the_exit_verb_drops_the_pointer_naming_the_exited_record(
+        self, tmp_path: Path
+    ) -> None:
+        _t3_record(tmp_path, 'held', _THREAD, cwd=str(tmp_path))
+        sr.write_t3_thread_pointer(_THREAD, 'held', root=tmp_path)
+
+        assert sr.main(['exit', '--record', str(sr.sessions_dir(tmp_path) / 'held'), '--code', '0']) == 0
+
+        assert sr.read_record('held', root=tmp_path).status == sr.Status.EXITED
+        assert not sr.t3_thread_pointer_path(_THREAD, tmp_path).exists()
+
+    def test_the_exit_verb_keeps_a_pointer_another_live_record_holds(
+        self, tmp_path: Path
+    ) -> None:
+        _t3_record(tmp_path, 'holder', _THREAD, cwd=str(tmp_path))
+        _t3_record(tmp_path, 'bystander', _THREAD, cwd=str(tmp_path))
+        sr.write_t3_thread_pointer(_THREAD, 'holder', root=tmp_path)
+
+        sr.main(['exit', '--record', str(sr.sessions_dir(tmp_path) / 'bystander'), '--code', '0'])
+
+        assert sr.read_record('bystander', root=tmp_path).status == sr.Status.EXITED
+        assert sr.resolve_session_slug_for_t3_thread(_THREAD, root=tmp_path) == 'holder'
+
+    def test_folding_a_record_drops_the_pointer_naming_it(self, tmp_path: Path) -> None:
+        _t3_record(tmp_path, 'hand', _THREAD, cwd=str(tmp_path))
+        sr.write_t3_thread_pointer(_THREAD, 'hand', root=tmp_path)
+
+        assert sr.mark_session_folded('hand', root=tmp_path) is not None
+
+        assert not sr.t3_thread_pointer_path(_THREAD, tmp_path).exists()
+
+
 class TestMarkT3SessionsExited:
     def test_marks_only_this_projects_records_whose_thread_is_gone_or_archived(
         self, tmp_path: Path
