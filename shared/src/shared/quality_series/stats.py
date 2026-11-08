@@ -10,6 +10,7 @@ import bisect
 import hashlib
 import math
 import random
+import statistics
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -18,15 +19,21 @@ __all__ = [
     'CUSUM_H',
     'CusumDesign',
     'EwmaLimits',
+    'OccurrenceCap',
     'RegimeEvent',
     'bootstrap_interval',
+    'cap_occurrences',
     'content_seed',
+    'cost_fit',
     'cusum_alarms',
     'cusum_design',
     'ewma_limits',
     'ewma_series',
     'explain_alarm',
+    'log_residuals',
     'newcombe_difference',
+    'reference_cost',
+    'theil_sen',
     'wilson_interval',
 ]
 
@@ -200,3 +207,68 @@ def explain_alarm(
         if landings_apart <= k or time_apart <= window:
             candidates.append((landings_apart, time_apart, event.event_id))
     return min(candidates)[2] if candidates else None
+
+
+def theil_sen(xs: Sequence[float], ys: Sequence[float]) -> tuple[float, float]:
+    """(a, b) for y = a + b·x: b the median pairwise slope over distinct-x pairs, a = median(y − b·x)."""
+    _require(len(xs) == len(ys), 'xs and ys pair one to one', len_xs=len(xs), len_ys=len(ys))
+    slopes = [
+        (ys[j] - ys[i]) / (xs[j] - xs[i])
+        for i in range(len(xs))
+        for j in range(i + 1, len(xs))
+        if xs[j] != xs[i]
+    ]
+    _require(len(slopes) > 0, 'a slope needs at least two distinct xs', distinct_xs=len(set(xs)))
+    b = statistics.median(slopes)
+    a = statistics.median(y - b * x for x, y in zip(xs, ys, strict=True))
+    return a, b
+
+
+def cost_fit(
+    lines: Sequence[int], costs: Sequence[float], min_lines: int = 5
+) -> tuple[float, float]:
+    """Theil–Sen on (ln lines, ln cost) over points with lines >= min_lines and cost > 0."""
+    _require(len(lines) == len(costs), 'lines and costs pair one to one',
+             len_lines=len(lines), len_costs=len(costs))
+    points = [(math.log(n), math.log(c)) for n, c in zip(lines, costs, strict=True)
+              if n >= min_lines and c > 0]
+    return theil_sen([x for x, _ in points], [y for _, y in points])
+
+
+def reference_cost(
+    lines: Sequence[int], costs: Sequence[float], ref: float = 100, min_lines: int = 5
+) -> float:
+    """What a ``ref``-line landing costs under this window's log–log fit."""
+    a, b = cost_fit(lines, costs, min_lines)
+    return math.exp(a + b * math.log(ref))
+
+
+def log_residuals(
+    lines: Sequence[int], costs: Sequence[float], a: float, b: float
+) -> list[float | None]:
+    """ln(cost) − (a + b·ln lines) per landing; None where lines or cost is not positive."""
+    return [
+        math.log(c) - (a + b * math.log(n)) if n > 0 and c > 0 else None
+        for n, c in zip(lines, costs, strict=True)
+    ]
+
+
+@dataclass(frozen=True)
+class OccurrenceCap:
+    """Per-landing bearing flags, and the landings whose occurrence count exceeds ``cap``."""
+
+    bearing: tuple[bool, ...]
+    mass_event_indices: tuple[int, ...]
+    cap: float
+
+
+def cap_occurrences(
+    counts: Sequence[int], baseline_median: float, floor: float = 20
+) -> OccurrenceCap:
+    """A landing bears the outcome when its count is positive; above max(floor, 10·median) it is a mass event."""
+    cap = max(floor, 10 * baseline_median)
+    return OccurrenceCap(
+        bearing=tuple(count > 0 for count in counts),
+        mass_event_indices=tuple(i for i, count in enumerate(counts) if count > cap),
+        cap=cap,
+    )
