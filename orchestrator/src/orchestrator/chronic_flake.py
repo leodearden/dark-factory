@@ -46,6 +46,7 @@ from typing import TYPE_CHECKING, Protocol, TypeGuard
 
 from shared.mcp_envelope import parse_tool_result, tool_error_text
 from shared.safe_io import load_json_or_warn
+from shared.task_read import TASK_NOT_FOUND_ERROR_TYPE
 from shared.task_statuses import TERMINAL
 from shared.task_submit import SubmitFailed, SubmitOutcome
 
@@ -704,13 +705,6 @@ def _extract_statuses_map(result: object) -> tuple[dict[str, str], Exception | N
     return {str(key): str(value) for key, value in statuses.items()}, None
 
 
-# The `error_type` fused-memory's `get_task` tool answers with when its query ran and
-# found no row (backends/task_backend_errors.py::TaskNotFoundError, structured by
-# server/tool_errors.py::mcp_tool_errors).  The one error that is an ANSWER, not a
-# failure — and a type, so the discrimination never rests on message wording.
-_TASK_NOT_FOUND_ERROR_TYPE = 'TaskNotFoundError'
-
-
 def _extract_task(result: object) -> tuple[dict | None, Exception | None]:
     """Extract a ``get_task`` response's task from a ``dispatch_tool`` envelope (see
     :func:`_unwrap_dispatch_envelope`), as a ``(task, error)`` pair.
@@ -720,7 +714,7 @@ def _extract_task(result: object) -> tuple[dict | None, Exception | None]:
 
     - ``(task, None)`` — a dict carrying ``status``, after descending one ``data``
       layer (the wrapper ``scheduler.py::Scheduler.get_task`` also unwraps);
-    - ``(None, None)`` — :data:`_TASK_NOT_FOUND_ERROR_TYPE`, a CORROBORATED ABSENCE;
+    - ``(None, None)`` — :data:`TASK_NOT_FOUND_ERROR_TYPE`, a CORROBORATED ABSENCE;
     - ``(None, exc)`` — any other ``error``, or an answer with no task in it.
 
     Construct-don't-raise.  ``metadata`` is deliberately left as the tool sent it: the
@@ -728,7 +722,7 @@ def _extract_task(result: object) -> tuple[dict | None, Exception | None]:
     dict, a JSON string or ``None``.
     """
     envelope = _unwrap_dispatch_envelope(result)
-    if envelope.get('error_type') == _TASK_NOT_FOUND_ERROR_TYPE:
+    if envelope.get('error_type') == TASK_NOT_FOUND_ERROR_TYPE:
         return None, None
     if 'error' in envelope:
         return None, _response_error('get_task answered with an error', envelope)
