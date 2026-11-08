@@ -25,8 +25,6 @@ from _mock_openai_server import (
     responses_body,
 )
 
-from fused_memory.models.enums import MemoryCategory, SourceStore
-from fused_memory.models.memory import MemoryResult
 from fused_memory.server.write_triage import (
     OUTCOME_JUDGE,
     OUTCOME_STORED,
@@ -35,26 +33,17 @@ from fused_memory.server.write_triage import (
     triage_write,
 )
 from fused_memory.server.write_triage_judge import judge_write
-from fused_memory.services.memory_service import RRF_K, SearchResults
+from fused_memory.services.memory_service import SearchResults
+from server.write_triage_harness import T_HIGH, T_LOW, search_candidate
 
 _RESTATES = '{"verdict": "restates", "candidate_id": "m1"}'
 _DISTINCT = '{"verdict": "distinct", "candidate_id": null}'
 _ERROR_BODY = {'error': {'message': 'boom', 'type': 'server_error'}}
-
-
-def _candidate() -> MemoryResult:
-    return MemoryResult(
-        id='m1',
-        content='some content',
-        category=MemoryCategory.procedural_knowledge,
-        source_store=SourceStore.mem0,
-        relevance_score=1.0 / (RRF_K + 1),
-        metadata={'store_score': 0.80, 'store_rank': 1},
-    )
+_IN_JUDGE_BAND = 0.80
 
 
 def _decision() -> BandDecision:
-    return BandDecision(OUTCOME_JUDGE, 'm1', 0.80, 0.95, 0.70)
+    return BandDecision(OUTCOME_JUDGE, 'm1', _IN_JUDGE_BAND, T_HIGH, T_LOW)
 
 
 def _anthropic_message_body(text: str) -> dict[str, Any]:
@@ -78,10 +67,10 @@ class _Arm(NamedTuple):
     suffix: str
     ok_body: dict[str, Any]
     status_error: type[openai.APIStatusError] | type[anthropic.APIStatusError]
+    sdk_appends_v1: bool
 
     def judge_api_url(self, server: MockOpenAIServer) -> str:
-        """The anthropic SDK appends ``/v1/messages`` itself; openai's carries ``/v1``."""
-        if self.provider == 'anthropic':
+        if self.sdk_appends_v1:
             return f'http://{server.host}:{server.port}'
         return server.base_url
 
@@ -90,19 +79,22 @@ _ARMS = {
     'responses': _Arm(
         provider='openai', client_class='openai', suffix='/responses',
         ok_body=responses_body(_RESTATES), status_error=openai.APIStatusError,
+        sdk_appends_v1=False,
     ),
     'chat': _Arm(
         provider='openai', client_class='openai_generic', suffix='/chat/completions',
         ok_body=chat_completion_body(_RESTATES), status_error=openai.APIStatusError,
+        sdk_appends_v1=False,
     ),
     'anthropic': _Arm(
         provider='anthropic', client_class='openai', suffix='/messages',
         ok_body=_anthropic_message_body(_RESTATES), status_error=anthropic.APIStatusError,
+        sdk_appends_v1=True,
     ),
 }
 
 
-def _service(arm: _Arm, server: MockOpenAIServer, **write_triage: Any) -> types.SimpleNamespace:
+def _service(arm: _Arm, server: MockOpenAIServer) -> types.SimpleNamespace:
     """A memory service whose judge reaches *server* through the production credential path.
 
     The explicit ``api_key`` matters: a dispatched shell has no ``OPENAI_API_KEY``.
@@ -113,9 +105,8 @@ def _service(arm: _Arm, server: MockOpenAIServer, **write_triage: Any) -> types.
                 judge_provider=arm.provider,
                 judge_model='test-model',
                 judge_api_url=arm.judge_api_url(server),
-                t_high=0.95,
-                t_low=0.50,
-                **write_triage,
+                t_high=T_HIGH,
+                t_low=T_LOW,
             ),
             llm=types.SimpleNamespace(
                 provider=arm.provider,
@@ -144,7 +135,7 @@ class TestEachJudgeArmMakesOneAttempt:
                 await judge_write(
                     memory_service=_service(arm, server),
                     content='c', project_id='p',
-                    decision=_decision(), candidates=[_candidate()],
+                    decision=_decision(), candidates=[search_candidate(score=_IN_JUDGE_BAND)],
                 )
 
             assert excinfo.value.status_code == status
@@ -163,7 +154,9 @@ class TestTheFailOpenRecordNamesTheProviderError:
                 arm.suffix, [(500, _ERROR_BODY), (200, responses_body(_DISTINCT))],
             )
             service = _service(arm, server)
-            service.search = AsyncMock(return_value=SearchResults([_candidate()]))
+            service.search = AsyncMock(
+                return_value=SearchResults([search_candidate(score=_IN_JUDGE_BAND)]),
+            )
 
             with caplog.at_level(logging.WARNING, logger='fused_memory.server.write_triage'):
                 decision = await triage_write(
