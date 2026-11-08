@@ -68,6 +68,7 @@ from pathlib import Path
 from typing import Any, Literal, NamedTuple, TypedDict, TypeGuard
 
 from shared.git_async import run_git
+from shared.merge_subject import MergeSubject, format_merge_subject, parse_merge_subject
 from shared.proc_group import (
     reap_process_groups,
     scan_process_groups_under_path,
@@ -1497,28 +1498,6 @@ _EFFECT_PROBE_TRANSIENT_FAILURES = frozenset({
 _MERGE_MARKER_INDEX_RECHECK_SECS = 2.0
 
 
-@functools.lru_cache(maxsize=8)
-def _merge_marker_pattern(main_branch: str) -> re.Pattern[str]:
-    """Compile the regex that recovers a branch name from a merge marker.
-
-    DERIVED FROM ``git_ops.py::_merge_subject`` rather than hand-written, so the
-    marker index and the merge-commit writer can never drift apart — the same
-    single-source-of-truth property that ``find_merge_marker``'s original
-    ``--grep`` spelling had by construction.  A sentinel is substituted for the
-    branch, then split back out, so only ``_merge_subject`` decides the literal
-    format.
-
-    The capture is ``\\S+`` because a git branch name can never contain
-    whitespace.  The pattern is ANCHORED: a commit is a marker only when its
-    SUBJECT is exactly the merge subject, so a body quote, a ``Revert "..."``
-    subject or a suffixed subject is not a marker (task 5765).
-    """
-    sentinel = '\x00BRANCH\x00'
-    template = _merge_subject(sentinel, main_branch)
-    prefix, _, suffix = template.partition(sentinel)
-    return re.compile(r'\A' + re.escape(prefix) + r'(\S+)' + re.escape(suffix) + r'\Z')
-
-
 #: The ``git log`` output shape :func:`_merge_markers_by_branch` parses.
 _MERGE_MARKER_LOG_FORMAT: tuple[str, ...] = ('-z', '--format=%H%x1f%s')
 
@@ -1528,14 +1507,18 @@ def _merge_markers_by_branch(log_output: str, main_branch: str) -> dict[str, str
     :data:`_MERGE_MARKER_LOG_FORMAT`.  ``git log`` walks newest-first, so
     ``setdefault`` keeps the most recent marker of a branch merged more than
     once (measured: ``task/958``, ``task/924`` and ``task/791`` each twice).
+
+    A marker's SUBJECT is exactly a landing into *main_branch*, read by
+    ``shared/src/shared/merge_subject.py::parse_merge_subject``, so a body
+    quote, a ``Revert "..."`` subject or a suffixed subject is not a marker
+    (task 5765).
     """
-    pattern = _merge_marker_pattern(main_branch)
     markers: dict[str, str] = {}
     for record in log_output.split('\0'):
         sha, _, subject = record.partition('\x1f')
-        match = pattern.match(subject)
-        if match:
-            markers.setdefault(match.group(1), sha.strip())
+        match parse_merge_subject(subject):
+            case MergeSubject(branch=branch, main_branch=target) if target == main_branch:
+                markers.setdefault(branch, sha.strip())
     return markers
 
 
@@ -2792,18 +2775,6 @@ def _git_stderr_is_unresolved_ref(stderr: str) -> bool:
             'not a valid object name',
         )
     )
-
-
-def _merge_subject(branch: str, main_branch: str) -> str:
-    """Return the canonical subject line for a no-ff merge of *branch* into *main_branch*.
-
-    Single source of truth for the merge commit subject format consumed by
-    ``find_merge_marker``, ``merge_to_main``, and the retry path in
-    ``advance_main``.  Changing this function is the one place where the
-    format needs to be updated — all three consumers will automatically
-    use the new format.
-    """
-    return f'Merge {branch} into {main_branch}'
 
 
 def _merge_worktree_remove_argv(path: Path) -> list[str]:
@@ -9842,8 +9813,7 @@ class GitOps:
     async def find_merge_marker(
         self, branch: str, *, gate_on_existing_ref: bool = True,
     ) -> str | None:
-        """Search main's history for a merge commit whose subject matches
-        ``Merge {branch} into {main_branch}``.
+        """Search main's history for a merge commit whose subject is *branch*'s landing.
 
         This is the companion check to ``is_ancestor`` for the case where the
         branch ref has already been deleted (e.g., ``cleanup_worktree`` ran
@@ -9865,13 +9835,14 @@ class GitOps:
         off the branch, not the task id).
 
         **Marker rule**: a marker is a commit on main whose git subject
-        (``%s``) EQUALS ``_merge_subject(branch, self.config.main_branch)``.
-        The body is never read, so prose quoting a marker is not a landing
-        (task 5765).  The parent count is not checked, because a real landing
-        can be single-parent.  ``merge_to_main`` and ``advance_main``'s retry
-        path write that same ``_merge_subject``, so writer and reader cannot
-        drift apart, and substring safety (``task/1`` vs ``task/10``) follows
-        from equality.
+        (``%s``) EQUALS
+        ``shared/src/shared/merge_subject.py::format_merge_subject(branch,
+        self.config.main_branch)``.  The body is never read, so prose quoting
+        a marker is not a landing (task 5765).  The parent count is not
+        checked, because a real landing can be single-parent.
+        ``merge_to_main`` and ``advance_main``'s retry path write that same
+        subject, so writer and reader cannot drift apart, and substring safety
+        (``task/1`` vs ``task/10``) follows from equality.
 
         **Lookup is indexed, not re-scanned.** The search half delegates to
         :meth:`_lookup_merge_marker`, which builds one branch→sha map per main
@@ -12683,7 +12654,8 @@ class GitOps:
         Shared by :meth:`merge_to_main` and :meth:`merge_branch_into_worktree`
         so the two merge primitives derive the merge-SOURCE candidate and the
         canonical prefixed name identically.  *full_branch* is what
-        :func:`_merge_subject` renders into the commit message, so a drift
+        ``shared/src/shared/merge_subject.py::format_merge_subject`` renders
+        into the commit message, so a drift
         between the two callers would break ``find_merge_marker``
         already_merged idempotency for one of them only.
 
@@ -12704,7 +12676,8 @@ class GitOps:
         """Run the shared ``git merge --no-ff`` invocation in *worktree*.
 
         The single definition of HOW this repo merges a queued branch: the
-        argv, the ``-m`` subject (:func:`_merge_subject` over *full_branch*,
+        argv, the ``-m`` subject
+        (``shared/src/shared/merge_subject.py::format_merge_subject`` over *full_branch*,
         load-bearing for ``find_merge_marker`` idempotency), and the textual
         conflict detection.  Both :meth:`merge_to_main` and
         :meth:`merge_branch_into_worktree` call it so the chain builder can
@@ -12725,7 +12698,7 @@ class GitOps:
         """
         rc, out, err = await _run(
             ['git', 'merge', '--no-ff', merge_source,
-             '-m', _merge_subject(full_branch, self.config.main_branch)],
+             '-m', format_merge_subject(full_branch, self.config.main_branch)],
             cwd=worktree,
         )
         return rc, out, err, ('CONFLICT' in out or 'CONFLICT' in err)
@@ -12799,8 +12772,8 @@ class GitOps:
             # Merge with no-ff.
             # merge_source is the named branch ref when present, or the worktree
             # HEAD SHA as an absent-ref fallback.  full_branch is always the
-            # canonical prefixed name for _merge_subject so the commit message
-            # stays 'Merge task/<id> into main' for find_merge_marker.
+            # canonical prefixed name for format_merge_subject so the commit
+            # message stays the landing subject find_merge_marker reads.
             rc, out, err, conflicts = await self._run_no_ff_merge(
                 merge_wt, merge_source, full_branch,
             )
@@ -12842,7 +12815,7 @@ class GitOps:
         """Merge a task branch into a CALLER-SUPPLIED worktree (task 3184, PRD β).
 
         The chain-builder twin of :meth:`merge_to_main`.  Same merge semantics
-        — same ``git merge --no-ff``, same :func:`_merge_subject` (so
+        — same ``git merge --no-ff``, same merge subject (so
         ``find_merge_marker`` idempotency is preserved), same
         :meth:`resolve_queued_branch_ref` source resolution, same
         :class:`MergeResult` return type — but the worktree comes from the
@@ -14264,7 +14237,8 @@ class GitOps:
         children of ``worktree_base`` whose name starts with ``_merge-``).
         For each candidate, reads its HEAD commit subject with
         ``git log -1 --format=%s`` and compares it by **literal equality** to
-        ``_merge_subject(f'{branch_prefix}{branch}', main_branch)``.
+        ``shared/src/shared/merge_subject.py::format_merge_subject``
+        over ``f'{branch_prefix}{branch}'`` and ``main_branch``.
 
         Returns the first matching :class:`~pathlib.Path`, or ``None`` if no
         match is found.
@@ -14284,10 +14258,7 @@ class GitOps:
             await self.resolve_queued_branch_ref(branch)
             or f'{self.config.branch_prefix}{branch}'
         )
-        target_subject = _merge_subject(
-            full_branch,
-            self.config.main_branch,
-        )
+        target_subject = format_merge_subject(full_branch, self.config.main_branch)
 
         async for wt_path, _ in self._iter_merge_worktrees():
             # Read HEAD commit subject of this candidate
@@ -14872,7 +14843,7 @@ class GitOps:
             )
             merge_rc, merge_out, merge_err = await _run(
                 ['git', 'merge', '--no-ff', _remerge_target,
-                 '-m', _merge_subject(full_branch, self.config.main_branch)],
+                 '-m', format_merge_subject(full_branch, self.config.main_branch)],
                 cwd=merge_worktree,
             )
             if merge_rc != 0:
