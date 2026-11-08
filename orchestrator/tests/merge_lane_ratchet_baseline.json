@@ -1332,6 +1332,7 @@
     "orchestrator/tests/test_lane_lifecycle_gitops.py": {"patch_targets": [], "private_reads": 17},
     "orchestrator/tests/test_lane_lifecycle_integration.py": {"patch_targets": [], "private_reads": 13},
     "orchestrator/tests/test_lane_lock_leak_guard.py": {"patch_targets": [], "private_reads": 30},
+    "orchestrator/tests/test_lane_record_divergence.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_lane_state_lib.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_laptop_warm_verify_boundary.py": {"patch_targets": [], "private_reads": 1},
     "orchestrator/tests/test_locked_dangling_worktree_entry.py": {"patch_targets": [], "private_reads": 0},
