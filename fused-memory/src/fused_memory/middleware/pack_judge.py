@@ -32,7 +32,11 @@ from shared.prompt_artifact import PromptArtifactStore, PromptSpec, default_arti
 
 from fused_memory.middleware.curator_types import CuratorFailureError, clip_for_prompt
 from fused_memory.middleware.followup_packing import CandidatePack, PackMember
-from fused_memory.middleware.task_curator import _CURATOR_HEURISTICS, TaskCurator
+from fused_memory.middleware.task_curator import (
+    _CURATOR_CAP_WAIT_SANITY_SECS,
+    _CURATOR_HEURISTICS,
+    TaskCurator,
+)
 
 __all__ = [
     'CURATOR_PACK_OUTPUT_SCHEMA',
@@ -105,8 +109,6 @@ MAX_JUSTIFICATION_CHARS = 500
 _MIN_GROUP_MEMBERS = 2
 _NO_PARENT = 'none'
 _UNSTAMPED_BAND = 'unstamped'
-# A capped pool ends the sweep tick, so the cap wait is bounded in minutes, as the filing curator's is.
-_PACK_CAP_WAIT_SANITY_SECS = 120.0
 
 CURATOR_PACK_OUTPUT_SCHEMA: dict[str, Any] = {
     'type': 'object',
@@ -379,7 +381,9 @@ async def judge_pack(
 
     A capped or frozen pool propagates unchanged, and a failed call raises
     :exc:`CuratorFailureError`: neither may be recorded as a reject, because a rejected pack is
-    never judged again. Every read of the curator's internals stays in this one body.
+    never judged again. Every read of the curator's internals stays in this one body. The call
+    does not yet carry the curator's transcript scope, so ``zero_output_timeout`` on that error is
+    not transcript-accurate; task 8724's public judge-call seam carries it.
     """
     cfg = curator._config.curator
     system_prompt = await asyncio.to_thread(_resolved_pack_prompt, curator._prompt_store, cfg.model)
@@ -399,7 +403,7 @@ async def judge_pack(
         output_schema=CURATOR_PACK_OUTPUT_SCHEMA,
         permission_mode='bypassPermissions',
         timeout_seconds=cfg.timeout_seconds,
-        cap_wait_sanity_secs=_PACK_CAP_WAIT_SANITY_SECS,
+        cap_wait_sanity_secs=_CURATOR_CAP_WAIT_SANITY_SECS,
         park_on_frozen_pool=False,
         **curator._ledger_kwargs(PACK_LEDGER_ROLE),
     )
