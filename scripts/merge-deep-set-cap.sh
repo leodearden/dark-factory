@@ -39,13 +39,17 @@
 # Exit 0 = knob landed on the target's main, reloaded, and observed in
 # `applied`.  Non-zero = a failure the caller (a deterministic deploy task)
 # escalates born-at-L2; one that did not land names the request's last merge
-# state.  The last stdout line of every designed exit is a JSON verdict, for a
-# kind='predicate' before_done note, in merge-pytest-n-ab-switch.sh's shape:
-# {chain_cap, commit, outcome: "applied"} on exit 0, or one carrying
-# `failure: <tag>` on a failure, its prose on stderr just before it.  `commit` is
-# the sha the queue landed the cap as, or null when nothing landed; a refusal
-# before the landing prints only {"failure": <tag>}.  The tags come from die()
-# below, scripts/lib/deploy_main_copy.sh, step 3's fail(),
+# state.  The last stdout line of every designed exit is a JSON verdict in
+# merge-pytest-n-ab-switch.sh's shape: {chain_cap, commit, outcome: "applied"}
+# on exit 0, or one carrying `failure: <tag>` on a failure, its prose on stderr
+# just before it.  The runner reads stderr folded into stdout as one stream
+# (orchestrator/src/orchestrator/deterministic_runner.py::DeterministicRunner._default_run_script)
+# and a failure's escalation quotes that stream's tail, so the verdict is the
+# last line it shows; scripts/tests/test_merge_deep_set_cap.py reads the tag
+# from the same line.  `commit` is the sha the queue landed the cap as, or
+# null when nothing landed; a refusal before the landing prints only
+# {"failure": <tag>}.  The tags come from die() below,
+# scripts/lib/deploy_main_copy.sh, step 3's fail(),
 # scripts/_merge_queue_landing.py::LandingFailure and
 # scripts/_config_reload_gate.py::ReloadFailure.
 set -euo pipefail

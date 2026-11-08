@@ -75,28 +75,28 @@ def deploy_env(tmp_path):
     return deploy_tmpdir_env(tmp_path)
 
 
-def _run(server, config, cap, *, env, script=SCRIPT):
+def _invoke(*args, env, script=SCRIPT, merge_stderr=False):
+    """Run the script with the arguments *args*. *merge_stderr* folds stderr
+    into stdout, the one stream the deterministic runner reads a deploy as
+    (orchestrator/src/orchestrator/deterministic_runner.py::DeterministicRunner._default_run_script)."""
+    return subprocess.run(
+        ["bash", str(script), *args], env=env, text=True, timeout=120,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE,
+    )
+
+
+def _run(server, config, cap, *, env, **options):
     """Run the script for *cap* against *config*, pointing its landing and
-    reload at *server*'s real ephemeral port."""
-    return subprocess.run(
-        ["bash", str(script), cap, str(config), str(server.port)],
-        env=env, capture_output=True, text=True, timeout=120,
-    )
+    reload at *server*'s real ephemeral port; *options* are `_invoke`'s."""
+    return _invoke(cap, str(config), str(server.port), env=env, **options)
 
 
-def _run_merged(server, config, cap, *, env):
-    """`_run` with stderr folded into stdout, as the deterministic runner reads
-    a deploy (orchestrator/src/orchestrator/deterministic_runner.py)."""
-    return subprocess.run(
-        ["bash", str(SCRIPT), cap, str(config), str(server.port)],
-        env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120,
-    )
-
-
-def _assert_prose_then_verdict(merged):
-    """The merged stream carries the script's prose, and its verdict is last."""
+def _verdict_after_prose(merged):
+    """The verdict ending the merged stream of *merged*, asserted to come
+    after the script's prose."""
     *before, _ = [line for line in merged.stdout.splitlines() if line.strip()]
     assert any(line.startswith("merge-deep-set-cap: ") for line in before), merged.stdout
+    return last_verdict(merged)
 
 
 def _seeded(tmp_path, seed="block_present"):
@@ -212,6 +212,8 @@ def test_a_request_still_live_at_the_ceiling_is_cancelled_and_not_reloaded(tmp_p
 
     assert failure_tag(proc) == "timed_out"
     assert outcome_verdict_lines(proc) == []
+    # A loaded host can spend the whole second before the first poll answers,
+    # leaving the submit's own 'queued' as the last state the script saw.
     assert any(f"still {live}" in proc.stderr for live in ("queued", "verifying")), proc.stderr
     assert queue.calls_to("merge_cancel") == [{"request_id": queue.request_id}]
     assert "reload_config" not in tools, tools
@@ -312,10 +314,10 @@ def test_a_refusal_ends_the_merged_stream_with_its_verdict(tmp_path, deploy_env)
     before its verdict: the other order ends that stream with prose."""
     config = _seeded(tmp_path)
 
-    merged = _run_merged(types.SimpleNamespace(port=1), config, "06", env=deploy_env)
+    merged = _run(types.SimpleNamespace(port=1), config, "06", env=deploy_env, merge_stderr=True)
 
-    _assert_prose_then_verdict(merged)
-    assert failure_tag(merged) == "invalid_cap"
+    assert merged.returncode != 0
+    assert _verdict_after_prose(merged) == {"failure": "invalid_cap"}
 
 
 def test_a_landing_failure_ends_the_merged_stream_with_its_verdict(tmp_path, deploy_env):
@@ -325,10 +327,10 @@ def test_a_landing_failure_ends_the_merged_stream_with_its_verdict(tmp_path, dep
     queue = FakeMergeQueue(config.parent, states=[{"state": "blocked", "reason": "verify failed"}])
 
     with _target(queue, reload_report(config_path=str(config), applied=APPLIED_6)) as server:
-        merged = _run_merged(server, config, "6", env=deploy_env)
+        merged = _run(server, config, "6", env=deploy_env, merge_stderr=True)
 
-    _assert_prose_then_verdict(merged)
-    assert failure_tag(merged) == "not_landed"
+    assert merged.returncode != 0
+    assert _verdict_after_prose(merged) == {"chain_cap": 6, "commit": None, "failure": "not_landed"}
 
 
 @pytest.mark.parametrize("bad_port", ["0", "65536", "99999"])
@@ -342,6 +344,29 @@ def test_an_unconnectable_port_is_refused_before_the_landing(tmp_path, deploy_en
     proc = _run(types.SimpleNamespace(port=bad_port), config, "6", env=deploy_env)
 
     assert failure_tag(proc) == "invalid_port"
+    assert head(repo) == before
+    assert config.read_text() == SEEDS["block_present"]
+    _assert_left_nothing_behind(repo, deploy_env)
+
+
+# id -> (arguments built from this repo's config, the tag die() refuses them with).
+MALFORMED_INVOCATIONS = {
+    "two_arguments": (lambda config: ["6", str(config)], "usage"),
+    "config_absent": (lambda config: ["6", str(config.parent / "absent.yaml"), "1"], "config_not_found"),
+}
+
+
+@pytest.mark.parametrize(
+    "arguments,tag", list(MALFORMED_INVOCATIONS.values()), ids=list(MALFORMED_INVOCATIONS)
+)
+def test_a_malformed_invocation_is_refused_with_its_own_tag(tmp_path, deploy_env, arguments, tag):
+    config = _seeded(tmp_path)
+    repo = config.parent
+    before = head(repo)
+
+    proc = _invoke(*arguments(config), env=deploy_env)
+
+    assert failure_tag(proc) == tag
     assert head(repo) == before
     assert config.read_text() == SEEDS["block_present"]
     _assert_left_nothing_behind(repo, deploy_env)
