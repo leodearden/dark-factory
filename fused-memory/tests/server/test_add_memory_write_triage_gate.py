@@ -692,7 +692,7 @@ class TestTheForceStoreArms:
     async def test_a_declared_child_kind_alone_force_stores(self) -> None:
         """Either key alone is enough — the attach overwrites BOTH.
 
-        Deliberately wider than `grouped_read._parent_id_in_meta`, which needs
+        Deliberately wider than `grouped_read.child_parent_id`, which needs
         both keys well-formed to answer "does this record group?". The question
         here is "did the caller say anything about parentage that triage would
         overwrite?", and a half-declared link is a caller bug for

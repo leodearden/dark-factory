@@ -942,9 +942,10 @@ async def _call_llm(
     Each arm builds and closes its client PER CALL. A cached client would pin
     a stale ``api_key``/``api_url`` past a hot reload, turning a green-tier
     knob into a restart-only one. ``async with`` around ``asyncio.wait_for``
-    closes the connection pool even when a timeout cancels the request, which
-    matters because neither SDK client defines ``__del__``. The lost
-    connection reuse is a deliberate trade.
+    closes the connection pool even when a timeout cancels the request. The
+    SDK's own ``httpx`` wrapper finaliser (``AsyncHttpxClientWrapper.__del__``)
+    is no substitute: it closes the pool only if an event loop is running when
+    the client is collected. The lost connection reuse is a deliberate trade.
 
     NO ``try``/``except`` anywhere, and ``async with`` swallows nothing: every
     failure propagates to ``write_triage.py::triage_write``'s ``except`` arm,

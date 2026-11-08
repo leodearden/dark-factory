@@ -12,6 +12,7 @@ from unittest.mock import DEFAULT, AsyncMock, MagicMock, patch
 import httpx
 import pytest
 import pytest_asyncio
+from _fm_helpers import LoopFreedomProbe
 from _qdrant_responses import missing_collection_404
 from qdrant_client.http.exceptions import UnexpectedResponse
 from reconciliation.harness_fixtures import (
@@ -15479,7 +15480,7 @@ async def test_get_prior_s3_findings_drops_a_superseded_finding(
     stricter instruction than the Stage-2 channel's, and one that reads as a
     live to-do.
     """
-    from fused_memory.reconciliation.stages.memory_consolidator import _format_findings
+    from fused_memory.reconciliation.stage1_payload_format import format_findings
 
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
     superseded = _make_superseded_finding()
@@ -15495,8 +15496,8 @@ async def test_get_prior_s3_findings_drops_a_superseded_finding(
     # the renderer emits description/severity/category/suggested_action plus the
     # typed citation lists, and nothing else — so a retirement that survives
     # this far is invisible by the time an agent reads it.
-    assert _SUPERSEDER_FID not in _format_findings([superseded])
-    assert 'superseded_by' not in _format_findings([superseded])
+    assert _SUPERSEDER_FID not in format_findings([superseded])
+    assert 'superseded_by' not in format_findings([superseded])
 
 
 @pytest.mark.asyncio
@@ -17229,36 +17230,30 @@ class TestIntegrityGateIsAsyncAndNonBlocking:
     async def test_gate_does_not_block_the_event_loop(
         self, journal, event_buffer, mock_memory_service, tmp_path, monkeypatch, caplog,
     ):
-        """A slow detector must not stall the loop the remediation pass runs on.
+        """A suspended detector must not stall the loop the remediation pass runs on.
 
-        The fake awaits a real 200 ms sleep; a ticker coroutine advancing every
-        10 ms must keep advancing across it. A blocking implementation pins the
-        ticker at ~0.
+        While the gate is suspended inside the detector, a marker queued on the
+        test loop must run: the fake suspends on
+        fused-memory/tests/_fm_helpers.py::LoopFreedomProbe, and a gate that
+        resumed the detector itself instead of awaiting it reads False. This
+        loop-turn oracle replaces a wall-clock tick floor that reds under
+        GIL/host contention (task 5920 introduced the probe; task 5925 for this
+        site).
         """
-        ticks = 0
-
-        async def _ticker():
-            nonlocal ticks
-            while True:
-                await asyncio.sleep(0.01)
-                ticks += 1
+        probe = LoopFreedomProbe()
 
         async def _fake_is_live(_tid, _pr, **kw):
-            await asyncio.sleep(0.2)
+            await probe.suspend()
             return True
 
-        ticker = asyncio.create_task(_ticker())
-        try:
-            await self._run_gate(
-                journal=journal, event_buffer=event_buffer,
-                mock_memory_service=mock_memory_service, tmp_path=tmp_path,
-                monkeypatch=monkeypatch, caplog=caplog,
-                cited_task=self._cited_task(), fake_is_live=_fake_is_live,
-            )
-        finally:
-            ticker.cancel()
+        await self._run_gate(
+            journal=journal, event_buffer=event_buffer,
+            mock_memory_service=mock_memory_service, tmp_path=tmp_path,
+            monkeypatch=monkeypatch, caplog=caplog,
+            cited_task=self._cited_task(), fake_is_live=_fake_is_live,
+        )
 
-        assert ticks >= 5
+        probe.assert_loop_stayed_free()
 
     @pytest.mark.asyncio
     async def test_gate_hoists_the_worktree_index_across_the_cited_task_fan_out(
@@ -22632,20 +22627,6 @@ def _promote_like_orphan_reaper(queue, esc_id) -> str:
     return promoted_id
 
 
-def _dismiss_as_covered_like_orphan_reaper(queue, esc_id) -> None:
-    """Simulate the `has_open_l1` dismiss branch of `orchestrator/harness.py::Harness._reap_orphan_l0_escalations`.
-
-    orchestrator is not a fused-memory dependency, hence the simulation.
-    """
-    esc = queue.get(esc_id)
-    queue.resolve(
-        esc_id,
-        f'Dismissed by orphan reaper — open L1 already covers this task (task_id={esc.task_id})',
-        dismiss=True,
-        resolved_by='harness-orphan-reaper',
-    )
-
-
 def test_file_finding_task_escalation_lands_a_record_on_the_real_task(
     journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
 ):
@@ -22729,9 +22710,8 @@ def test_routed_record_is_invisible_to_the_orchestrator_l1_guards(
     `get_by_task(task_id, status='pending', level=1)`), and the orchestrator
     reads it UNCATEGORIZED — i.e. "is a human already on this task?" — at a
     spread of guards that divert or suppress real work: the external-dep,
-    cross-repo and substrate-flip block-and-escalate paths and the orphan-L0
-    reaper's DISMISS branch in `orchestrator/harness.py`, plus TWO sites in
-    `orchestrator/workflow.py`. That population is enumerated authoritatively,
+    cross-repo and substrate-flip block-and-escalate paths in
+    `orchestrator/harness.py`, plus TWO sites in `orchestrator/workflow.py`. That population is enumerated authoritatively,
     in `path::symbol` form, in the `FINDING_TASK_ESCALATION_LEVEL` comment block
     of `fused_memory/reconciliation/finding_task_escalation.py` — read it there
     rather than restating it here, and do not reintroduce bare line pins
@@ -22850,6 +22830,15 @@ def test_unrelated_pending_record_on_the_same_task_does_not_suppress_the_filing(
     so it cannot see the pending L0 that
     `test_file_finding_task_escalation_folds_across_cycles` pins, and that test
     fails under either the categorized or the uncategorized spelling.
+
+    Case (c) also pins the composed filer -> reaper -> filer property (task
+    6341): the orphan reaper's real coverage call,
+    `escalation/queue.py::EscalationQueue.dismiss_if_covered`, leaves the
+    routed L0 behind the unrelated L1 pending, and the next cycle folds onto
+    it. The queue rule alone is pinned by
+    `escalation/tests/test_queue.py::TestDismissIfCovered::test_no_open_same_category_l1_writes_nothing`.
+    With the info-L0 router on, the router owns the record instead: see
+    `orchestrator/tests/test_info_l0_router_harness.py::TestReaperRoutesInfoOrphans::test_an_open_l1_of_another_category_does_not_swallow_an_info_note`.
     """
     from escalation.models import Escalation  # type: ignore[import-untyped]
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
@@ -22895,6 +22884,13 @@ def test_unrelated_pending_record_on_the_same_task_does_not_suppress_the_filing(
         if e.category == FINDING_TASK_ESCALATION_CATEGORY and e.level == 0
     ]
     assert [e.id for e in filed] == [esc_id]
+
+    routed = queue.get(esc_id)
+    assert routed is not None
+    assert queue.dismiss_if_covered(routed, resolver='harness-orphan-reaper') == []
+    second = harness._file_finding_task_escalation('test-project', 'run-2', _orch_finding(), 5)
+    assert second is None, f'the next cycle must fold onto the surviving L0, got {second!r}'
+    assert [e.id for e in _routed_records(queue_dir)] == [esc_id]
 
 
 def test_promoted_record_folds_the_next_cycle(
@@ -23015,7 +23011,9 @@ def test_reaper_dismissed_sibling_is_not_refiled_while_the_routed_l1_is_open(
     assert a and b and a != b, (a, b)
 
     promoted = _promote_like_orphan_reaper(queue, a)
-    _dismiss_as_covered_like_orphan_reaper(queue, b)
+    sibling = queue.get(b)
+    assert sibling is not None
+    assert queue.dismiss_if_covered(sibling, resolver='harness-orphan-reaper') == [promoted]
 
     assert harness._file_finding_task_escalation(
         'test-project', 'run-2', _orch_finding(), 5,

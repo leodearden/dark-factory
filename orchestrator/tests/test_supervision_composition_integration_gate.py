@@ -43,11 +43,9 @@ Composition cells (observable signal — all GREEN in CI):
           recovers a stranded task to done{merged,sha} JOURNAL-FIRST, with
           git archaeology never awaited (TG-1).
 
-Sibling test scaffolding (FakeRunner, make_fake_inspector, read_escalations,
-_reset_merge_provenance, _bind_landed_row, _make_ground_truth,
-_fake_git_ops/_fake_scheduler, _RecordingService/wedging-service idiom) is
-reused by LOCAL re-declaration below — there is no conftest-shared version
-of these helpers to import.
+Shared proc_supervision scaffolding lives in _proc_supervision_doubles. The
+TaskGroundTruth, MergeProvenance and LifecycleRegistry scaffolding is
+re-declared locally below.
 """
 
 from __future__ import annotations
@@ -59,96 +57,21 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from escalation.queue import EscalationQueue
+from _proc_supervision_doubles import (
+    FakeRunner,
+    make_fake_inspector,
+    read_escalations,
+)
+from _proc_supervision_doubles import tmp_queue_dir as tmp_queue_dir
 
 from orchestrator.merge_lane.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
 from orchestrator.task_ground_truth import TaskGroundTruth
 
 # ---------------------------------------------------------------------------
-# Prerequisite-1: shared scaffolding (no behaviour assertions here) — reused
-# by LOCAL re-declaration (per the design decision above) from
-# test_proc_supervision.py, test_task_ground_truth.py / test_reconcile_stranded.py,
-# and test_background_service.py.
+# Prerequisite-1: scaffolding re-declared from test_task_ground_truth.py /
+# test_reconcile_stranded.py and test_background_service.py (no behaviour
+# assertions here).
 # ---------------------------------------------------------------------------
-
-
-class FakeRunner:
-    """Async callable matching ``asyncio.create_subprocess_exec``'s signature.
-
-    Records every ``(argv, kwargs)`` call in ``self.calls`` so tests can
-    assert on exact positional argv and keyword args (cwd=, stdout=, ...).
-    Returns a ``MagicMock`` proc whose ``communicate()`` is an
-    ``AsyncMock(return_value=(stdout, None))`` and whose ``returncode`` is
-    configurable (default 0). Copied verbatim from test_proc_supervision.py.
-    """
-
-    def __init__(self, returncode: int = 0, stdout: bytes = b'') -> None:
-        self.returncode = returncode
-        self.stdout = stdout
-        self.calls: list[tuple[tuple, dict]] = []
-        # Every fake proc this runner has handed back, in call order — lets a
-        # test assert on a spawned proc's post-return state without execute()
-        # needing to hand the proc back to the caller.
-        self.procs: list[MagicMock] = []
-
-    async def __call__(self, *args: object, **kwargs: object):
-        self.calls.append((args, kwargs))
-        proc = MagicMock()
-        proc.communicate = AsyncMock(return_value=(self.stdout, None))
-        proc.returncode = self.returncode
-        self.procs.append(proc)
-        return proc
-
-
-def make_fake_inspector(state: dict):
-    """Build an async inspector callable: ``(unit, *, timeout_secs, reap_grace_secs=5.0) -> dict``.
-
-    Returns a shallow copy of *state* on every call regardless of args, and
-    records each call's kwargs on the returned callable's ``.calls`` list.
-    Copied verbatim from test_proc_supervision.py.
-    """
-    calls: list[dict] = []
-
-    async def _inspector(unit: str, *, timeout_secs: float, reap_grace_secs: float = 5.0) -> dict:
-        calls.append({
-            'unit': unit,
-            'timeout_secs': timeout_secs,
-            'reap_grace_secs': reap_grace_secs,
-        })
-        return dict(state)
-
-    _inspector.calls = calls  # type: ignore[attr-defined]
-    return _inspector
-
-
-@pytest.fixture
-def tmp_queue_dir(tmp_path: Path) -> Path:
-    """A ``tmp_path`` subdirectory usable as an ``EscalationQueue`` queue_dir.
-
-    Not pre-created — ``EscalationQueue.__init__`` mkdir(parents=True,
-    exist_ok=True)'s it, matching production. Copied verbatim from
-    test_proc_supervision.py.
-    """
-    return tmp_path / 'escalations'
-
-
-def read_escalations(
-    queue_dir: str | Path,
-    task_id: str,
-    *,
-    status: str | None = None,
-    level: int | None = None,
-    agent_role: str | None = None,
-) -> list:
-    """Construct ``EscalationQueue(queue_dir)`` and return ``get_by_task(task_id, ...)``.
-
-    Product read path (PRD Sec 7): tests assert filed escalations through
-    this helper rather than inspecting on-disk JSON directly. Copied
-    verbatim from test_proc_supervision.py.
-    """
-    return EscalationQueue(Path(queue_dir)).get_by_task(
-        task_id, status=status, level=level, agent_role=agent_role,
-    )
 
 
 @pytest.fixture(autouse=True)

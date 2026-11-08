@@ -51,7 +51,7 @@ test('sketch #9: the recent-merges caption counts only its own window\'s merges,
   for (const win of ['7d', '24h']) {
     const { client, body, block, echo } = await mergeBlock(win);
     const { recentMergesCaption } = client.window.DF_WINDOW_CHIP;
-    const { latencyCaption, recentTotal, projectSpeculative } = client.window.DF_MERGE_QUEUE;
+    const { latencyCaption, recentTotal, projectSpeculative, projectAttempts, attemptCount } = client.window.DF_MERGE_QUEUE;
     const D = client.window.DF_DATA;
     const windowTotal = recentTotal(D, 'dark-factory');
 
@@ -67,28 +67,38 @@ test('sketch #9: the recent-merges caption counts only its own window\'s merges,
     }
     totals[win] = windowTotal.value;
 
-    const attempts = sum(block.outcomes.values);
-    const timed = block.latency.with_duration;
-    assert.equal(latencyCaption(block.latency), `of ${timed} with recorded duration · ${attempts - timed} without`);
+    const read = projectAttempts(D, 'dark-factory');
+    assert.equal(read.state, 'fresh', `${win}: a readable runs.db attempt window is measured`);
+    const attempts = attemptCount(read.value);
+    const timed = read.value.latency.with_duration;
+    assert.equal(latencyCaption(read.value.latency), `of ${timed} with recorded duration · ${attempts - timed} without`);
   }
   assert.ok(totals['24h'] < totals['7d'], `24h holds ${totals['24h']} merges and 7d ${totals['7d']}`);
 });
 
-test('sketch #9: the donut centre, summed inline in tabs.jsx and so asserted here as arithmetic over the served block, counts each attempt once', async () => {
+test('sketch #9: the donut centre, attemptCount over the served attempts Datum, counts each attempt once', async () => {
   for (const win of ['7d', '24h']) {
-    const { block } = await mergeBlock(win);
-    assert.equal(sum(block.outcomes.values), block.latency.with_duration + block.latency.without_duration, win);
-    assert.equal(block.outcomes.values.length, block.outcomes.labels.length, win);
+    const { client } = await mergeBlock(win);
+    const { projectAttempts, attemptCount } = client.window.DF_MERGE_QUEUE;
+    const read = projectAttempts(client.window.DF_DATA, 'dark-factory');
+
+    assert.equal(read.state, 'fresh', win);
+    const { outcomes, latency } = read.value;
+    assert.equal(attemptCount(read.value), latency.with_duration + latency.without_duration, win);
+    assert.equal(attemptCount(read.value), sum(outcomes.values), win);
+    assert.equal(outcomes.values.length, outcomes.labels.length, win);
   }
 });
 
 test('the depth chart names the bucket width its served labels are spaced at', async () => {
   const expected = { '24h': '15-min buckets', '7d': '1-h buckets' };
   for (const [win, caption] of Object.entries(expected)) {
-    const { client, block } = await mergeBlock(win);
-    const { labels, bucket_minutes: bucketMinutes } = block.depth;
+    const { client } = await mergeBlock(win);
+    const { projectDepth, depthBucketCaption } = client.window.DF_MERGE_QUEUE;
+    const depth = projectDepth(client.window.DF_DATA, 'dark-factory').value;
+    const { labels, bucket_minutes: bucketMinutes } = depth;
 
-    assert.equal(client.window.DF_MERGE_QUEUE.depthBucketCaption(block.depth), caption, win);
+    assert.equal(depthBucketCaption(depth), caption, win);
     assert.ok(labels.length >= 2, `${win}: the fixture's merges leave at least two buckets after the trim`);
     for (let i = 1; i < labels.length; i += 1) {
       assert.equal(Date.parse(labels[i]) - Date.parse(labels[i - 1]), bucketMinutes * 60_000, `${win} gap at ${i}`);

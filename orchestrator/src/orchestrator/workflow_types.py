@@ -46,6 +46,7 @@ __all__ = [
     "CancellationScope",
     "DryRunSpawn",
     "IllegalTransition",
+    "PublishedStewardOutcome",
     "RequeueKind",
     "StewardBudgetExhausted",
     "classify_failure",
@@ -287,7 +288,9 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
 
     from orchestrator.git_ops import (
         BranchResetError,
+        CitationPatternInvalid,
         EphemeralWorktreeError,
+        GitQueryFailed,
         InteractiveWorktreeLimitError,
         LaneLockSelfOwnedLeak,
         MergeParkContentionError,
@@ -790,6 +793,34 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
             reason_prefix='Ephemeral probe worktree add failed after retries',
             block_class=BlockClass.AGENT_FAILURE,
         ),
+        # BD-2-completeness-only rows (task 7332), the same category as
+        # EphemeralWorktreeError above: raised only by GitOps'
+        # find_merge_marker_checked / find_task_citation_commit_checked and
+        # caught at source -- by the fail-safe twins (git_ops.py's
+        # _none_if_query_failed and find_task_citation_commit) and by
+        # scripts/restamp_degenerate_branch_bases.py, which excludes the task
+        # as git_error -- so neither reaches _drive() or classify_failure().
+        # The values say what an escape would mean. The checked lookups exist
+        # for callers that write on a miss, so "git could not answer" must not
+        # pass silently: BLOCK + escalate, as EphemeralWorktreeError does. An
+        # uncompilable git.commit_citation_pattern is operator configuration
+        # that no waiting or requeue repairs, ProbeSpawnError's shape.
+        GitQueryFailed: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=True,
+            requeue_kind=RequeueKind.BLOCK,
+            counts_against_requeue_cap=True,
+            reason_prefix='Git lookup on main could not answer',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
+        CitationPatternInvalid: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=True,
+            requeue_kind=RequeueKind.BLOCK,
+            counts_against_requeue_cap=True,
+            reason_prefix='Citation pattern is not a valid Python re',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
     }
     return _disposition_table_cache
 
@@ -911,8 +942,10 @@ class StewardBudgetExhausted:
     """
 
 
-# The workflow↔steward RPC payload carried on the per-task in-process
-# asyncio.Queue (PRD §10 / Contract §8.1-8.2 SO-1, resolved decision D6).
+# The workflow↔steward RPC payload (PRD §10 / Contract §8.1-8.2 SO-1,
+# resolved decision D6): what TaskWorkflow._await_steward_completion returns.
+# The per-task in-process asyncio.Queue carries it wrapped in a
+# PublishedStewardOutcome envelope naming the escalation it is about.
 # A PEP-604 union (not an enum-with-payload) so every variant branches
 # uniformly via isinstance/match in TaskWorkflow._mark_blocked's single
 # routing choke point.
@@ -923,6 +956,15 @@ StewardOutcome = (
     | StewardInterrupted
     | StewardBudgetExhausted
 )
+
+
+@dataclass(frozen=True)
+class PublishedStewardOutcome:
+    """A StewardOutcome as published by TaskSteward about the level-0
+    escalation ``escalation_id`` it handled."""
+
+    escalation_id: str
+    outcome: StewardOutcome
 
 
 class IllegalTransition(Exception):

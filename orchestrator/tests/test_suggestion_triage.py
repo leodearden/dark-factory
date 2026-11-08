@@ -1087,14 +1087,14 @@ class TestAwaitStewardCompletion:
     @pytest.mark.asyncio
     async def test_returns_immediately_if_no_queue(self):
         wf = _make_workflow(escalation_queue=None)
-        await wf._await_steward_completion()
+        await wf._await_steward_completion(escalation_id=None)
 
     @pytest.mark.asyncio
     async def test_returns_immediately_if_no_pending(self):
         queue = MagicMock()
         queue.get_by_task.return_value = []
         wf = _make_workflow(escalation_queue=queue)
-        await wf._await_steward_completion()
+        await wf._await_steward_completion(escalation_id=None)
 
     @pytest.mark.asyncio
     async def test_returns_when_resolved(self):
@@ -1111,7 +1111,7 @@ class TestAwaitStewardCompletion:
             event.set()
 
         task = asyncio.create_task(_resolve_after_delay())
-        await wf._await_steward_completion()
+        await wf._await_steward_completion(escalation_id=None)
         await task
 
         queue.submit.assert_not_called()
@@ -1131,7 +1131,7 @@ class TestAwaitStewardCompletion:
         wf._steward_outcome_channel = asyncio.Queue()  # nothing published
         wf.scheduler.get_status = AsyncMock(return_value='blocked')
 
-        outcome = await wf._await_steward_completion()
+        outcome = await wf._await_steward_completion(escalation_id=None)
 
         assert outcome == StewardInterrupted('timeout', wip_commits_present=False)
         queue.submit.assert_not_called()
@@ -1199,17 +1199,16 @@ def _fake_agent_result(*, cost=0.5, turns=3, structured_output=None):
     return result
 
 
-def _write_triage_verdict(worktree: Path, triage_output: dict) -> None:
+def _write_triage_verdict(steward, triage_output: dict) -> None:
     """Simulate the verdict-tools server's submit_triage tool call.
 
-    Writes the verdict envelope to *worktree*'s `.task-meta` meta-root — the
-    identical root _pre_triage_suggestions' read-side TaskArtifacts derives
-    via meta_root_for. Creates the meta-root dir first since
-    TaskArtifacts.write_verdict guards on root.is_dir() (it does not mkdir
-    the root itself, only verdicts/ under an existing root).
+    Writes the verdict envelope through the same ``TaskArtifacts.for_task``
+    roots _pre_triage_suggestions reads (task 3155). Creates the task root
+    first since TaskArtifacts.write_verdict guards on root.is_dir() (it does
+    not mkdir the root itself, only verdicts/ under an existing root).
     """
-    meta_root = TaskArtifacts.meta_root_for(worktree.parent, worktree.name)
-    meta_root.mkdir(parents=True, exist_ok=True)
+    artifacts = TaskArtifacts.for_task(steward.worktree, steward.task_id)
+    artifacts.task_root.mkdir(parents=True, exist_ok=True)
     envelope = {
         'role': 'triage',
         'schema_version': 1,
@@ -1217,10 +1216,10 @@ def _write_triage_verdict(worktree: Path, triage_output: dict) -> None:
         'emitted_at': '2026-07-14T00:00:00+00:00',
         'verdict': triage_output,
     }
-    TaskArtifacts(worktree, meta_root).write_verdict('triage', envelope)
+    artifacts.write_verdict('triage', envelope)
 
 
-def _invoke_writing_verdict(worktree: Path, triage_output: dict, **result_kwargs):
+def _invoke_writing_verdict(steward, triage_output: dict, **result_kwargs):
     """Build an invoke_with_cap_retry side_effect that writes the verdict
     artifact (simulating submit_triage) before returning a fake AgentResult.
 
@@ -1230,7 +1229,7 @@ def _invoke_writing_verdict(worktree: Path, triage_output: dict, **result_kwargs
     method under test would be wiped before the read-back.
     """
     def _side_effect(*args, **kwargs):
-        _write_triage_verdict(worktree, triage_output)
+        _write_triage_verdict(steward, triage_output)
         return _fake_agent_result(**result_kwargs)
     return _side_effect
 
@@ -1265,7 +1264,7 @@ class TestPreTriageSuggestions:
         # structured_output= kwarg.
         with patch(
             'orchestrator.steward.invoke_with_cap_retry',
-            side_effect=_invoke_writing_verdict(steward.worktree, triage_output),
+            side_effect=_invoke_writing_verdict(steward, triage_output),
         ):
             result = await steward._pre_triage_suggestions(esc)
 
@@ -1337,7 +1336,7 @@ class TestPreTriageSuggestions:
         }
         # Pre-seed a STALE verdict, simulating leftover artifact state from a
         # prior triage run against the same worktree meta-root.
-        _write_triage_verdict(steward.worktree, stale_triage_output)
+        _write_triage_verdict(steward, stale_triage_output)
 
         # This invocation's mocked agent writes NOTHING (never calls submit_triage).
         with patch('orchestrator.steward.invoke_with_cap_retry',
@@ -1392,7 +1391,7 @@ class TestPreTriageSuggestions:
 
         with patch(
             'orchestrator.steward.invoke_with_cap_retry',
-            side_effect=_invoke_writing_verdict(steward.worktree, triage_output),
+            side_effect=_invoke_writing_verdict(steward, triage_output),
         ):
             result = await steward._pre_triage_suggestions(esc)
 
@@ -1427,7 +1426,7 @@ class TestPreTriageSuggestions:
 
         with patch(
             'orchestrator.steward.invoke_with_cap_retry',
-            side_effect=_invoke_writing_verdict(steward.worktree, malformed_triage_output),
+            side_effect=_invoke_writing_verdict(steward, malformed_triage_output),
         ):
             result = await steward._pre_triage_suggestions(esc)
 
@@ -1478,7 +1477,7 @@ class TestPreTriageSuggestions:
 
         with patch(
             'orchestrator.steward.invoke_with_cap_retry',
-            side_effect=_invoke_writing_verdict(steward.worktree, triage_output),
+            side_effect=_invoke_writing_verdict(steward, triage_output),
         ):
             result = await steward._pre_triage_suggestions(esc)
 

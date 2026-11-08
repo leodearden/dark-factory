@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, Literal
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import _INDEX_LOCK_STALE_FLOOR_S, GitOps, _run
 from orchestrator.merge_lane.disposition import MergeFailureDisposition, SkewEvidence
+from orchestrator.merge_lane.outcome_facts import ConflictEvidence
 from orchestrator.merge_lane.reverify_gate_decision import (
     MAX_LOGGED_OVERLAP_PATHS,
     GateClearance,
@@ -192,6 +193,7 @@ def _emit_merge_attempt(
     probe_host: Literal['local', 'remote'] | None = None,
     skew_evidence: SkewEvidence | None = None,
     gate_clearance: GateClearance | None = None,
+    conflict_evidence: ConflictEvidence | None = None,
 ) -> None:
     """Emit a ``merge_attempt`` event for the given outcome.
 
@@ -249,6 +251,12 @@ def _emit_merge_attempt(
     call site), no key is added -- existing callers' payloads stay
     byte-identical.
 
+    *conflict_evidence* is the conflicted paths of a ``conflict`` outcome
+    (task 7302), written through :meth:`ConflictEvidence.to_event_payload` so
+    this row spells them exactly as the workflow's ``merge_blocked`` row does.
+    When omitted (every non-conflict call site), no key is added -- existing
+    callers' payloads stay byte-identical.
+
     This helper is deliberately disposition-AGNOSTIC about evidence: it writes
     whatever bundle it is handed, and deciding *when* to emit at all is the
     caller's guard. That is what lets one code path serve both the
@@ -280,6 +288,8 @@ def _emit_merge_attempt(
                 # Recorded unconditionally: a reader never has to know the cap
                 # to tell a short citation from a truncated one.
                 data[f'{key}_total'] = len(items)
+        if conflict_evidence is not None:
+            data.update(conflict_evidence.to_event_payload())
         event_store.emit(
             EventType.merge_attempt, task_id=task_id, phase='merge',
             data=data, duration_ms=duration_ms,
@@ -474,10 +484,10 @@ before this prefix may be used, and for the three traps a naive version misses.
 
 ALREADY_LANDED_CITATION_PATTERN: str = (
     r'^(merge|impl|amend|fix|test|feat|chore|docs|refactor|style|build)'
-    r'\(#?{tid}\)!?:'
+    r'\(#?{tid}([ ,/][^)]*)?\)!?:'
     r'|^Merge task/{tid} into '
 )
-r"""STRICTER citation template for :func:`_resolve_already_landed_branch`.
+r"""Scope-position citation template for :func:`_resolve_already_landed_branch`.
 
 ``GitOps.DEFAULT_COMMIT_CITATION_PATTERN`` is deliberately permissive — it
 also accepts the UNANCHORED ``\(#?{tid}\)`` / ``\(task {tid}\)`` alternatives
@@ -491,14 +501,23 @@ wrong for THIS question, which is "is this commit this task's own delivery":
 and both touch exactly the paths the original landing touched, so signal 3
 (coverage) passes too and the branch is declared already-landed on a commit
 that is the OPPOSITE of its delivery.  Requiring the id in the
-conventional-commit SCOPE position — ``impl(3717):`` — is what separates an
-AUTHORED delivery from a commit that merely mentions the id.
+conventional-commit SCOPE position is what separates an AUTHORED delivery
+from a commit that merely mentions the id.  The id may close the scope
+(``impl(3717):``) or be followed by a qualifier (``impl(3717 step-8):``,
+``feat(3717/step-2):``); a qualifier is still scope position, so the reading
+holds, and only the scope's LEADING id attributes (``fix(4200/3717):`` is
+4200's).  Why the qualifier separator class is closed to ``[ ,/]`` (no dot,
+no hyphen) is stated once, in the doc comment of
+``orchestrator/src/orchestrator/git_ops.py::DEFAULT_COMMIT_CITATION_PATTERN``;
+``orchestrator/tests/test_already_landed_citation_pattern.py`` pins that the
+two templates agree on scope-position subjects, with one exception: a
+``#``-led qualified scope (``fix(#3717 step-1):``) attributes here, but the
+default does not cite it at all.
 
-Measured before narrowing, on this repo's last 4000 main commits: 1298
-subjects match this strict form, and exactly ONE subject matched only the
-dropped arms (itself a body-line false-cite, not a real citation).  So the
-narrowing costs no real attribution and removes the whole false-cite class.
-Anything it does miss falls through to the UNCHANGED
+The narrowing trades recall for precision: a delivery cited only outside
+scope position, as in ``fix(git_ops): ... (task 3717)``, is not attributed
+here (census: the message of commit ``impl(6221 step-2): accept the qualified
+scope``).  Anything this template misses falls through to the UNCHANGED
 ``plan_files_not_touched`` path — fail-closed, per this predicate's contract.
 
 Valid as both a git ``--extended-regexp`` pattern and a Python ``re``, which
@@ -1318,17 +1337,6 @@ async def _map_advance_failure(
             f'{f" (+{len(at_risk) - 20} more)" if len(at_risk) > 20 else ""}.'
             if at_risk else ''
         )
-        # WORDING CONSTRAINT — do not reintroduce the token 'ff' (as in
-        # "stood off") or the word 'advanced' anywhere in this reason.
-        # workflow.py's blocked path infers the merge-failure review category
-        # with a bare substring test
-        # (`'ff' in reason.lower() or 'advanced' in reason.lower()`
-        # -> category 'merge_ff_failed'), which then flows into
-        # `_write_merge_failure_review`, the merge_blocked event's
-        # data.category, and the signature-aware L1 dedup key.  "stood off"
-        # matched it, durably filing every index-lock stand-off as a
-        # fast-forward failure.  Pinned by
-        # test_reason_is_not_miscategorised_as_a_ff_failure.
         return MergeOutcome(
             'blocked',
             reason=(

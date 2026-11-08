@@ -57,6 +57,7 @@ from fused_memory.reconciliation.dangling_citation import dangling_citation_iden
 from fused_memory.reconciliation.drained_event_restore import (
     restore_unless_completed_best_effort,
 )
+from fused_memory.reconciliation.episode_window import next_episode_window_anchor
 from fused_memory.reconciliation.escalation_archive import (
     scan_recently_resolved_fingerprints,
 )
@@ -114,6 +115,7 @@ from fused_memory.reconciliation.task_filter import (
     filter_task_tree,
 )
 from fused_memory.reconciliation.tree_read_instant import resolve_tree_read_instant
+from fused_memory.services.id_resolver import IdResolver
 from fused_memory.services.live_workflow_detector import (
     corroboration_for_task,
     is_pure_gate_metadata,
@@ -186,7 +188,7 @@ one spelling: a drifted literal would silently stop folding."""
 #     queue with a different reader.  Unlike BacklogPolicy, this filer does not
 #     close its own records either.  Level 0 keeps them off the orchestrator's
 #     level-1-only has_open_l1 guard surface; an unattended one still reaches
-#     L1 on its own, promoted by Harness._reap_orphan_l0_escalations once it
+#     a consumer on its own (the orphan reaper and its info-L0 router) once it
 #     ages past orphan_l0_timeout_secs with no live workflow on the task.
 #   See ReconciliationHarness._escalate() docstring for per-call-site details.
 _RECON_DEDUP_CONFIG = (
@@ -2804,6 +2806,11 @@ class ReconciliationHarness:
                 project_id=None,
                 project_root=None,
             ),
+            # This store serves every project, so create_server leaves the guard
+            # unscoped (resolver='no_project') until task 6910 scopes it per call.
+            prefix_resolver=lambda project_id, prefix: IdResolver.for_memory_service(
+                self.memory
+            ).resolve_prefix(project_id, prefix),
         )
         host = self.config.escalation_host
         port = self.config.escalation_port
@@ -2984,8 +2991,8 @@ class ReconciliationHarness:
         on this task", so an L1 here would turn a passive observation into a
         gate on dispatch.  See the `FINDING_TASK_ESCALATION_LEVEL` comment block in
         `finding_task_escalation.py` for the full guard-site population and for
-        why an unattended record still reaches L1 (via
-        `Harness._reap_orphan_l0_escalations`) without this filer asserting it.
+        why an unattended record still reaches a consumer (the orphan reaper and
+        its info-L0 router) without this filer asserting it.
 
         FAIL-SAFE: a queue hiccup is logged and swallowed — a reconciliation
         cycle is never aborted by a failed filing (mirroring
@@ -3960,13 +3967,26 @@ class ReconciliationHarness:
                     run.stage_reports[stage_key] = report
 
                 completed_at = datetime.now(UTC)
+                episode_anchor = next_episode_window_anchor(run)
+                unfinished_write_start = episode_anchor.unfinished_write_start
+                logger.info(
+                    'reconciliation.episode_window_anchored',
+                    extra={
+                        'run_id': run_id,
+                        'project_id': project_id,
+                        'run_started_at': run.started_at.isoformat(),
+                        'unfinished_write_start': (
+                            None if unfinished_write_start is None
+                            else unfinished_write_start.isoformat()
+                        ),
+                        'anchor': episode_anchor.at.isoformat(),
+                    },
+                )
                 watermark = watermark.model_copy(update={
                     'last_full_run_id': run_id,
                     'last_full_run_completed': completed_at,
-                    # Run start, not completion (on resume, the original start): a mid-cycle
-                    # item is shown to the next cycle rather than to neither. Why, and the cost:
-                    # tests/reconciliation/test_recon_window_anchor.py
-                    'last_episode_timestamp': run.started_at,
+                    # Why these two anchors differ and neither is completion: reconciliation/episode_window.py
+                    'last_episode_timestamp': episode_anchor.at,
                     'last_memory_timestamp': run.started_at,
                     'last_task_change_timestamp': run.started_at,
                 })

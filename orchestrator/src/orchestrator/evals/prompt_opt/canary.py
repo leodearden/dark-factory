@@ -146,7 +146,7 @@ def load_window_rows(
     same half-open-range convention
     ``dashboard.data.performance`` uses. Read-only sync ``sqlite3`` — no
     durability pragmas needed, mirroring
-    ``reviewer_trial.__main__._fetch_titles`` /
+    ``reviewer_trial.mining.fetch_task_titles`` /
     ``reviewer_trial.mining.mine_fn_candidates``.
 
     The numeric columns are declared with a schema ``DEFAULT``, but that

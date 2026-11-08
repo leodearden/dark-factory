@@ -366,7 +366,7 @@ class TestArtifactsFromArgs:
             '--session-id', 'sess-9',
         ])
 
-        assert arts.root == mr
+        assert arts.lane_root == arts.task_root == mr
         assert arts.worktree == wt
         assert role == 'judge'
         assert sid == 'sess-9'
@@ -381,7 +381,7 @@ class TestArtifactsFromArgs:
             '--verdict-role', 'merger',
         ])
 
-        assert arts.root == wt / '.task'
+        assert arts.lane_root == arts.task_root == wt / '.task'
         assert arts.worktree == wt
         assert role == 'merger'
 
@@ -411,6 +411,45 @@ class TestArtifactsFromArgs:
                 '--worktree', str(wt),
                 '--verdict-role', '../escape',
             ])
+
+
+def _dual_root_argv(tmp_path, task_root, role):
+    wt = tmp_path / 'wt'
+    wt.mkdir()
+    lane = tmp_path / '.task-meta' / 'wt'
+    lane.mkdir(parents=True)
+    return [
+        '--worktree', str(wt), '--meta-root', str(lane),
+        '--task-root', str(task_root), '--verdict-role', role,
+    ]
+
+
+class TestArtifactsFromArgsTaskRoot:
+    """``--task-root`` (task 3155) points the verdicts at the task-lifetime
+    root, where the workflow reads them."""
+
+    @pytest.mark.asyncio
+    async def test_submitted_verdict_lands_in_task_root(self, tmp_path):
+        task = tmp_path / '.task-meta' / 'task-3155'
+        (task / 'verdicts').mkdir(parents=True)
+        arts, role, _ = _artifacts_from_args(_dual_root_argv(tmp_path, task, 'merger'))
+        assert arts.task_root == task.resolve()
+
+        tool = await create_server(arts, role).get_tool('submit_merge_disposition')
+        assert tool is not None
+        await tool.run({'blocked': False, 'reason': ''})
+
+        assert (task / 'verdicts' / 'merger.json').is_file()
+        assert not (arts.lane_root / 'verdicts').exists()
+
+    def test_missing_task_root_exits_naming_it(self, tmp_path, capsys):
+        task = tmp_path / '.task-meta' / 'task-absent'
+
+        with pytest.raises(SystemExit) as exc:
+            _artifacts_from_args(_dual_root_argv(tmp_path, task, 'judge'))
+
+        assert exc.value.code == 1
+        assert str(task.resolve()) in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------

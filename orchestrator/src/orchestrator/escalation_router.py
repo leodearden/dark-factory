@@ -21,6 +21,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Literal, Protocol, assert_never
 
+from escalation.amendments import amendment_room
 from escalation.categories import EscalationCategory
 from escalation.classify import INFO_L0_MECHANICAL_ROLES, info_l0_mechanical_class
 from escalation.disposition import (
@@ -38,7 +39,7 @@ from escalation.disposition import (
     route_info_l0,
 )
 from escalation.models import Escalation, normalised_severity
-from escalation.queue import EscalationQueue, ResolveOutcome, amendment_room
+from escalation.queue import EscalationQueue, ResolveOutcome
 from shared.eval_lane import eval_lane_provenance
 from shared.mcp_envelope import parse_tool_result
 from shared.task_submit import (

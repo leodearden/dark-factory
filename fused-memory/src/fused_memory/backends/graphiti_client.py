@@ -19,6 +19,7 @@ from typing import Any, TypedDict, TypeVar, cast
 from urllib.parse import urlparse
 
 from graphiti_core import Graphiti
+from graphiti_core.cross_encoder.client import CrossEncoderClient
 from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
 from graphiti_core.driver.driver import GraphDriver
 from graphiti_core.driver.falkordb_driver import FalkorDriver
@@ -1604,6 +1605,43 @@ class GraphitiBackend:
         self._cross_encoder = None
         self._group_clients: dict[str, Graphiti] = {}
 
+    @classmethod
+    def with_driver(
+        cls,
+        config: FusedMemoryConfig,
+        driver: FalkorDriver,
+        *,
+        registered_graph_ids: Iterable[str],
+        llm_client: LLMClient | None = None,
+        embedder: EmbedderClient | None = None,
+        cross_encoder: CrossEncoderClient | None = None,
+    ) -> 'GraphitiBackend':
+        """A backend over *driver* and the given sub-clients, wired without ``initialize()``.
+
+        No provisioning sweep, identity scan or server-settings read runs, and no
+        base ``client`` is built: methods that need one raise until it is assigned.
+        The registry is required because the derived one names real project graphs.
+        The backend takes ownership: ``close()`` releases the driver and sub-clients.
+        """
+        backend = cls(config, registered_graph_ids=registered_graph_ids)
+        backend._attach(
+            driver, llm_client=llm_client, embedder=embedder, cross_encoder=cross_encoder,
+        )
+        return backend
+
+    def _attach(
+        self,
+        driver: FalkorDriver,
+        *,
+        llm_client: LLMClient | None,
+        embedder: EmbedderClient | None,
+        cross_encoder: CrossEncoderClient | None,
+    ) -> None:
+        self._driver = driver
+        self._llm_client = llm_client
+        self._embedder = embedder
+        self._cross_encoder = cross_encoder
+
     @property
     def registered_graph_ids(self) -> frozenset[str]:
         """The graphs this backend provisions — PRD D5, docs/prds/falkordb-index-provisioning.md."""
@@ -1655,9 +1693,9 @@ class GraphitiBackend:
         graphiti.py:889-890) — since that condition is never true for a
         per-group client, the shared-driver mutation race that misroutes
         concurrent cross-group writes is structurally unreachable here.
-        The llm_client/embedder/cross_encoder sub-clients are shared (hoisted
-        in ``initialize()``) across every per-group client and the base
-        ``self.client``.
+        The llm_client/embedder/cross_encoder sub-clients are shared (attached
+        by ``initialize()`` or ``with_driver()``) across every per-group client
+        and the base ``self.client``.
 
         ``_group_clients`` is unbounded and never evicted, mirroring
         ``_cloned_drivers``/``_identity_locks`` above — safe because
@@ -1882,14 +1920,11 @@ class GraphitiBackend:
         host = parsed.hostname or 'localhost'
         port = parsed.port or 6379
 
-        self._driver = _MultiTenantFalkorDriver(
+        driver = _MultiTenantFalkorDriver(
             host=host,
             port=port,
             password=falkor_cfg.password,
         )
-
-        self._llm_client = llm_client
-        self._embedder = embedder_client
 
         # --- Cross-encoder (reranker) ---
         # Shared across the base client and every per-group client (see
@@ -1916,13 +1951,16 @@ class GraphitiBackend:
                 api_key=reranker_provider.api_key,
                 base_url=reranker_provider.api_url,
             )
-        self._cross_encoder = OpenAIRerankerClient(config=reranker_config)
+        cross_encoder = OpenAIRerankerClient(config=reranker_config)
 
+        self._attach(
+            driver, llm_client=llm_client, embedder=embedder_client, cross_encoder=cross_encoder,
+        )
         self.client = Graphiti(
-            graph_driver=self._driver,
-            llm_client=self._llm_client,
-            embedder=self._embedder,
-            cross_encoder=self._cross_encoder,
+            graph_driver=driver,
+            llm_client=llm_client,
+            embedder=embedder_client,
+            cross_encoder=cross_encoder,
             max_coroutines=cfg.queue.graphiti_max_coroutines,
         )
 
@@ -2020,19 +2058,8 @@ class GraphitiBackend:
             # Translate only a not-found provably about the caller's own uuid —
             # graphiti_core raises the same class from entity/edge resolution
             # after the episode loaded fine. The proof CONSTRUCTS the genuine
-            # upstream exception instead of parsing its text (the regex in
-            # durable_queue.py::_parse_not_found_uuid exists only because that
-            # module refuses to import graphiti_core; this one already does), so
-            # an upstream reword fails open rather than mislabelling.
-            #
-            # The replacement message deliberately does not match
-            # durable_queue.py::_NOT_FOUND_MESSAGE_RE, so inside a queued write
-            # it would fall open to ordinary retry rather than task 3586's
-            # ('permanent', 1) rule — moot today, since post-3561 an add_episode
-            # payload cannot carry a uuid at all. Enforced, not merely claimed:
-            # tests/test_graphiti_add_episode_uuid_param.py::
-            # test_the_translated_message_stays_retryable_for_the_durable_queue
-            # feeds this message through durable_queue's real parser.
+            # upstream exception instead of parsing its text, so an upstream
+            # reword fails open rather than mislabelling.
             if uuid is None or str(exc) != str(GraphitiCoreNodeNotFoundError(uuid)):
                 raise
             raise NodeNotFoundError(
@@ -2273,27 +2300,28 @@ class GraphitiBackend:
         invalid_at: datetime | None = None,
         clear_invalid_at: bool = False,
     ) -> dict[str, Any]:
-        """Update an existing edge's fact text and/or invalidate it.
+        """Update an existing edge's fact text and/or its ``invalid_at``.
 
         At least one of ``fact``, ``invalid_at``, or ``clear_invalid_at`` must
-        be provided. When ``fact`` is set, the edge's fact text is replaced and
-        its embedding is regenerated. When ``invalid_at`` is set, the edge is
-        marked superseded as of that timestamp (no re-embedding needed). Both
-        may be combined.
+        be provided; each dimension has its own write:
 
-        When ``clear_invalid_at=True``, the edge's ``invalid_at`` field is
-        reset to ``None``, restoring it to an active (non-superseded) state.
-        This takes precedence over ``invalid_at`` if both are supplied.
-        Compatible with ``fact`` (update text and un-supersede in one call).
-        Because graphiti's FalkorDB map-based ``edge.save()`` (``MERGE ... SET
-        e = $edge_data``) does not reliably clear a null-valued property, the
-        clear is force-persisted by an explicit direct-Cypher
-        ``SET e.invalid_at = NULL`` write, issued after ``edge.save()`` and
-        before the endpoint summary refresh below (so the restored edge is
-        counted valid by that refresh's ``WHERE e.invalid_at IS NULL`` filter).
+        - ``fact`` replaces the fact text through graphiti's full-map
+          ``edge.save`` with a regenerated embedding.
+        - ``invalid_at`` / ``clear_invalid_at`` is one targeted
+          ``SET e.invalid_at`` write that touches no other property;
+          ``clear_invalid_at`` wins when both are given.
 
-        After saving, both source and target entity node summaries are rebuilt
-        from their current valid edges so they stay consistent.
+        A call carrying both ``fact`` and an invalidity change is two
+        independent writes, not one transaction: if the invalidity write
+        fails, the new fact is already stored.
+
+        graphiti's ``get_by_uuid`` projection omits ``fact_embedding``, so a
+        full-map save without a regenerated embedding would write
+        ``vecf32(null)``.  ``tests/test_graphiti_update_edge.py`` pins this.
+
+        Both writes land before the endpoint summaries are rebuilt, so a
+        restored edge is counted by the refresh's ``WHERE e.invalid_at IS NULL``
+        filter.
         """
         if fact is None and invalid_at is None and not clear_invalid_at:
             raise ValueError('update_edge requires fact, invalid_at, or clear_invalid_at to be set')
@@ -2301,25 +2329,11 @@ class GraphitiBackend:
         edge = await EntityEdge.get_by_uuid(driver, edge_uuid)
         if fact is not None:
             edge.fact = fact
-            embedder = self._require_client().embedder
-            await edge.generate_embedding(embedder)
-        if invalid_at is not None:
-            edge.invalid_at = invalid_at
-        if clear_invalid_at:
-            edge.invalid_at = None
-        await self._timed_write(edge.save(driver), 'update_edge.save')
-
-        if clear_invalid_at:
-            # edge.save()'s map-based SET does not reliably clear a
-            # null-valued property on FalkorDB — force it deterministically.
-            graph = self._graph_for(group_id)
-            await self._timed_write(
-                graph.query(
-                    'MATCH ()-[e:RELATES_TO {uuid: $uuid}]->() '
-                    'SET e.invalid_at = NULL',
-                    {'uuid': edge_uuid},
-                ),
-                'update_edge.clear_invalid_at',
+            await edge.generate_embedding(self._require_client().embedder)
+            await self._timed_write(edge.save(driver), 'update_edge.save')
+        if clear_invalid_at or invalid_at is not None:
+            await self._write_edge_invalid_at(
+                edge_uuid, None if clear_invalid_at else invalid_at, group_id=group_id,
             )
 
         # Deterministically refresh both endpoint entity summaries so they
@@ -2340,6 +2354,21 @@ class GraphitiBackend:
             'fact': edge.fact,
             'refreshed_nodes': refreshed,
         }
+
+    async def _write_edge_invalid_at(
+        self, edge_uuid: str, invalid_at: datetime | None, *, group_id: str,
+    ) -> None:
+        """Set one RELATES_TO edge's ``invalid_at``, or remove it for ``None``; nothing else changes."""
+        await self._timed_write(
+            self._graph_for(group_id).query(
+                'MATCH ()-[e:RELATES_TO {uuid: $uuid}]->() SET e.invalid_at = $invalid_at',
+                {
+                    'uuid': edge_uuid,
+                    'invalid_at': None if invalid_at is None else invalid_at.isoformat(),
+                },
+            ),
+            'update_edge.invalid_at',
+        )
 
     @_canonicalize_group_args
     async def reassign_edge(
@@ -3597,6 +3626,11 @@ class GraphitiBackend:
         `old_uuid` lost the race, which is acceptable for an audit-only
         property.
 
+        Deleted-graph note: detection is read over GRAPH.RO_QUERY, so a graph
+        deleted after the startup scan listed it is refused rather than
+        recreated empty. Pinned by
+        fused-memory/tests/test_startup_identity_scan.py::TestRepairDuplicateEdgeUuidsLiveFalkorDB::test_repair_on_a_graph_deleted_after_listing_leaves_it_deleted.
+
         Args:
             group_id: Project graph to repair.
 
@@ -3611,7 +3645,7 @@ class GraphitiBackend:
             'RETURN u, eids'
         )
         start = time.monotonic()
-        detect_result = await graph.query(detect_cypher)
+        detect_result = await graph.ro_query(detect_cypher)
         dup_groups = detect_result.result_set or []
         repaired = 0
         for old_uuid, eids in dup_groups:

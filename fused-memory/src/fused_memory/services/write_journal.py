@@ -44,11 +44,17 @@ from fused_memory.services.read_rollup import (
 
 logger = logging.getLogger(__name__)
 
-#: The clock ``prune_write_ops`` measures its wall-clock deadline against, named
-#: at module scope so a test can substitute one without reaching into the stdlib
+#: The clock the batched prunes (``prune_write_ops``, ``prune_backend_ops``)
+#: measure their wall-clock deadline against, named at module scope so a test
+#: can substitute one without reaching into the stdlib
 #: ``time`` module globally. Monotonic, so a clock adjustment mid-sweep cannot
 #: turn a 30 s budget into an unbounded one.
 _monotonic = time.monotonic
+
+
+def prune_deadline(max_seconds: float) -> float:
+    """The instant *max_seconds* from now on the clock every batched prune checks its deadline against."""
+    return _monotonic() + max_seconds
 
 SCHEMA_SQL = """
 -- The read rollup table read_op_counts (task 5405) is created beside these; its DDL lives in services/read_rollup.py.
@@ -206,6 +212,8 @@ CREATE INDEX IF NOT EXISTS idx_wo_operation ON write_ops(operation);
 -- prune_write_ops bounds the rows, and services/journal_growth_alarm.py watches the file.
 CREATE INDEX IF NOT EXISTS idx_wo_created ON write_ops(created_at);
 
+-- backend_ops: aged out by WriteJournal.prune_backend_ops at
+-- WriteJournalConfig.write_retention_days, since each row is the Layer-2 half of a write.
 CREATE TABLE IF NOT EXISTS backend_ops (
     id TEXT PRIMARY KEY,
     write_op_id TEXT,
@@ -278,10 +286,8 @@ CREATE TABLE IF NOT EXISTS idempotent_ops (
 -- returns the OLDEST page and takes an `after_seq` cursor over the sqlite rowid,
 -- which is the only total insertion order here — one episode's findings are
 -- written in ONE batched commit and deliberately share a single `created_at`.
--- RETENTION is NOT yet wired: the startup sweep that runs prune_mem0_intents /
--- prune_idempotent_ops / prune_write_ops lives in server/main.py, outside task
--- 4984's locks, so growth is watched rather than bounded for now (the write path
--- is the ~0.2%-of-edges finding path, so the rate is low, not zero).
+-- RETENTION: rows are aged out by WriteJournal.prune_referent_findings at
+-- WriteJournalConfig.referent_findings_retention_days.
 --
 -- No ALTER migration: initialize() runs executescript(SCHEMA_SQL) unconditionally
 -- and this DDL is IF NOT EXISTS, so a fresh AND an existing database both pick
@@ -323,6 +329,24 @@ WRITE_OPS_PRUNE_BATCH_SQL: Mapping[str, str] = MappingProxyType({
     'search': _prune_batch_sql("kind = 'read' AND operation = 'search'"),
     'write': _prune_batch_sql("kind = 'write'"),
 })
+
+#: One batch of ``WriteJournal.prune_backend_ops``. It takes the same
+#: ``(resume_from, cutoff, limit)`` parameters and returns ``created_at`` like
+#: ``WRITE_OPS_PRUNE_BATCH_SQL``; INDEXED BY pins idx_bo_created.
+BACKEND_OPS_PRUNE_BATCH_SQL = (
+    'DELETE FROM backend_ops WHERE id IN ('
+    'SELECT id FROM backend_ops INDEXED BY idx_bo_created '
+    'WHERE created_at >= ? AND created_at < ? '
+    'ORDER BY created_at LIMIT ?) RETURNING created_at'
+)
+
+
+class _PruneStop(StrEnum):
+    """Why a batched prune stopped before showing its horizon drained; the value is the log wording."""
+
+    ROW_BUDGET = 'row budget'
+    DEADLINE = 'deadline'
+
 
 #: Parameters: ``(since_iso_timestamp, limit)``.
 OPERATOR_TELEMETRY_QUERY = """
@@ -771,8 +795,8 @@ class WriteJournal:
         """The OLDEST *limit* findings, in insertion order, ``payload`` decoded.
 
         OLDEST-FIRST AND TRUNCATED AT *limit* — say it plainly, because the
-        table has no prune path and no status column to mark a row handled (it
-        is a diagnosis log, not a work queue). A consumer of a table longer
+        table has no status column to mark a row handled (it is a diagnosis
+        log, not a work queue). A consumer of a table longer
         than one page that does not carry *after_seq* forward therefore re-reads
         the same oldest page forever and never reaches a newer diagnosis. Pass
         the ``seq`` of the last row handled to get the next page.
@@ -780,9 +804,9 @@ class WriteJournal:
         ``seq`` is the row's sqlite ``rowid``: assigned at INSERT, so it is the
         ONE key that totally orders these rows the way they were written —
         including inside a batched commit, where every row deliberately shares
-        one ``created_at``. It is also gap-tolerant as a cursor: a future
-        retention sweep deleting the oldest rows cannot renumber the newer ones
-        under a reader mid-page.
+        one ``created_at``. It is also gap-tolerant as a cursor, which matters
+        because the oldest rows ARE aged out (:meth:`prune_referent_findings`):
+        deleting them cannot renumber the newer ones under a reader mid-page.
 
         Unlike :meth:`log_referent_findings` this one MAY raise: it is an
         operator/replay read, not a hot write path, and an unreadable journal is
@@ -804,6 +828,32 @@ class WriteJournal:
             params,
         )
         return [{**dict(row), 'payload': json.loads(row['payload'])} for row in rows]
+
+    async def prune_referent_findings(self, *, older_than_days: float) -> int:
+        """Age out ``referent_findings`` rows older than ``older_than_days``.
+
+        Same fire-and-forget contract as :meth:`prune_idempotent_ops`. One
+        unbounded DELETE is safe because the table is tiny. The predicate scans,
+        since ``idx_rf_group_time`` leads with ``group_id``; an index is
+        deliberately not added, per the index note beside it in ``SCHEMA_SQL``.
+        """
+        try:
+            cutoff = (datetime.now(UTC) - timedelta(days=older_than_days)).isoformat()
+            async with self._require_access().write() as db:
+                cursor = await db.execute(
+                    'DELETE FROM referent_findings WHERE created_at < ?', (cutoff,),
+                )
+                deleted = max(cursor.rowcount, 0)
+            if deleted:
+                logger.info(
+                    'Pruned %d referent_findings rows older than %s days',
+                    deleted,
+                    older_than_days,
+                )
+            return deleted
+        except Exception as e:
+            logger.error(f'Failed to prune referent_findings: {e}')
+            return 0
 
     def journal_drop_stats(self) -> dict:
         """Return ``{'dropped_total': int, 'by_operation': dict}`` — rows LOST.
@@ -947,7 +997,7 @@ class WriteJournal:
                 f'Failed to record idempotent_ops for {client_op_id}: {e}'
             )
 
-    async def prune_idempotent_ops(self, *, older_than_days: float = 7.0) -> int:
+    async def prune_idempotent_ops(self, *, older_than_days: float) -> int:
         """Age out old ``idempotent_ops`` rows past a retention window.
 
         One row accrues per mutating task write (update_task / set_task_status /
@@ -957,7 +1007,8 @@ class WriteJournal:
         (seconds to minutes; a higher-level retry at most hours), so an
         aggressive TTL is safe: rows whose ``created_at`` is older than
         ``older_than_days`` are deleted and the count returned. Intended to run
-        at startup alongside ``prune_mem0_intents``.
+        at startup alongside ``prune_mem0_intents``. The horizon's home is
+        ``config/schema.py::WriteJournalConfig.idempotent_ops_retention_days``.
 
         Fire-and-forget — logs loudly on failure but never raises, so a prune
         hiccup cannot crash startup (mirrors ``prune_mem0_intents``).
@@ -1229,7 +1280,7 @@ class WriteJournal:
     async def prune_mem0_intents(
         self,
         *,
-        older_than_days: float = 30.0,
+        older_than_days: float,
         statuses: tuple[str, ...] = ('completed', 'failed'),
     ) -> int:
         """Age out terminal ``mem0_intents`` past a retention window.
@@ -1241,7 +1292,8 @@ class WriteJournal:
         ``resolved_at`` is older than ``older_than_days``, returning the count
         deleted. Intended to run once at startup (after
         ``MemoryService.recover_mem0_intents``) or from a periodic
-        maintenance task.
+        maintenance task. The horizon's home is
+        ``config/schema.py::WriteJournalConfig.mem0_intents_retention_days``.
 
         ``dead`` is deliberately EXCLUDED from the default ``statuses``: a
         dead-lettered intent carries the full content needed for manual replay
@@ -1321,8 +1373,9 @@ class WriteJournal:
         'read' horizon governs less than it did: see the ``write_journal`` block
         of ``fused-memory/config/config.yaml``.
 
-        BATCHED AND DOUBLY BOUNDED, unlike this file's two sibling prunes, whose
-        tables are small enough for a single unbounded DELETE. This one runs
+        BATCHED AND DOUBLY BOUNDED, like ``prune_backend_ops``, which shares
+        this drain (``_drain_horizon``), and unlike this file's other prunes,
+        whose tables are small enough for a single unbounded DELETE. This one runs
         against a table measured at 35,428,715 rows / 16 GB, and the
         ``idx_wo_created`` note in ``SCHEMA_SQL`` above measures 47 s merely to
         build one index on a copy of it, against ``STARTUP_GRACE_SECS = 120`` in
@@ -1384,14 +1437,14 @@ class WriteJournal:
             'write': write_older_than_days,
         }
         try:
-            deadline = _monotonic() + max_seconds
+            deadline = prune_deadline(max_seconds)
             total = 0
             by_horizon: dict[str, int] = {}
-            halted = ''
+            halted: _PruneStop | None = None
             backlog: list[str] = []
 
             for label, batch_sql in WRITE_OPS_PRUNE_BATCH_SQL.items():
-                if halted:
+                if halted is not None:
                     # Never attempted under this run's bounds — unknown, so
                     # reported as a backlog rather than assumed drained.
                     backlog.append(label)
@@ -1399,32 +1452,14 @@ class WriteJournal:
                 cutoff = (
                     datetime.now(UTC) - timedelta(days=older_than_days[label])
                 ).isoformat()
-                while True:
-                    limit = min(batch_size, max_rows - total)
-                    if limit <= 0:
-                        halted = 'row budget'
-                        backlog.append(label)
-                        break
-                    resume_from = self._pruned_below.get(label, '')
-                    async with self._require_access().write() as db:
-                        deleted = list(await db.execute_fetchall(
-                            batch_sql, (resume_from, cutoff, limit)
-                        ))
-                    removed = len(deleted)
-                    total += removed
-                    by_horizon[label] = by_horizon.get(label, 0) + removed
-                    if removed < limit:
-                        self._pruned_below[label] = cutoff
-                        break  # a short batch means this horizon is drained
-                    self._pruned_below[label] = max(row[0] for row in deleted)
-                    if total >= max_rows:
-                        halted = 'row budget'
-                        backlog.append(label)
-                        break
-                    if _monotonic() >= deadline:
-                        halted = 'deadline'
-                        backlog.append(label)
-                        break
+                removed, halted = await self._drain_horizon(
+                    label, batch_sql, cutoff,
+                    batch_size=batch_size, max_rows=max_rows - total, deadline=deadline,
+                )
+                total += removed
+                by_horizon[label] = removed
+                if halted is not None:
+                    backlog.append(label)
 
             if total:
                 logger.info(
@@ -1435,7 +1470,7 @@ class WriteJournal:
                     search_older_than_days, by_horizon.get('search', 0),
                     write_older_than_days, by_horizon.get('write', 0),
                 )
-            if halted:
+            if halted is not None:
                 # The achieved rate is the ONLY thing that says whether the
                 # passes keep up on this disk; see the net-progress rule above.
                 elapsed = max(_monotonic() - (deadline - max_seconds), 1e-9)
@@ -1450,3 +1485,94 @@ class WriteJournal:
         except Exception as e:
             logger.error(f'Failed to prune write_ops: {e}')
             return 0
+
+    async def prune_backend_ops(
+        self,
+        *,
+        older_than_days: float,
+        batch_size: int,
+        max_rows: int,
+        deadline: float,
+    ) -> int:
+        """Age out ``backend_ops`` rows older than ``older_than_days``.
+
+        Pass the WRITE horizon: every row is the Layer-2 half of a write, and
+        its readers (``recover_mem0_intents``, dead-letter triage,
+        ``telemetry_query``, :meth:`get_ops_by_causation`) read it as part of
+        that audit trail, so it must not expire before its ``write_ops`` row.
+
+        Batched and bounded through the same drain as :meth:`prune_write_ops`,
+        whose docstring measures why, with the same fire-and-forget contract.
+        *deadline* is an instant from :func:`prune_deadline`, so a caller can
+        share one deadline across prunes. Its resume cursor is correct because
+        :meth:`log_backend_op`, the only INSERT, stamps ``created_at`` with the
+        current time.
+        """
+        try:
+            if max_rows <= 0:
+                logger.warning(
+                    'backend_ops prune not attempted: its row budget was already spent '
+                    '(max_rows=%d), so rows past the %s-day horizon, if any, wait for '
+                    'a later startup.',
+                    max_rows, older_than_days,
+                )
+                return 0
+            started = _monotonic()
+            cutoff = (datetime.now(UTC) - timedelta(days=older_than_days)).isoformat()
+            removed, stop = await self._drain_horizon(
+                'backend_ops', BACKEND_OPS_PRUNE_BATCH_SQL, cutoff,
+                batch_size=batch_size, max_rows=max_rows, deadline=deadline,
+            )
+            if removed:
+                logger.info(
+                    'Pruned %d backend_ops rows older than %s days; frees pages for '
+                    'reuse, does not shrink the file',
+                    removed, older_than_days,
+                )
+            if stop is not None:
+                logger.warning(
+                    'backend_ops prune stopped early on the %s after %d rows in %.1fs '
+                    '(horizon %s days); any remainder drains on later startups.',
+                    stop, removed, _monotonic() - started, older_than_days,
+                )
+            return removed
+        except Exception as e:
+            logger.error(f'Failed to prune backend_ops: {e}')
+            return 0
+
+    async def _drain_horizon(
+        self,
+        label: str,
+        batch_sql: str,
+        cutoff: str,
+        *,
+        batch_size: int,
+        max_rows: int,
+        deadline: float,
+    ) -> tuple[int, _PruneStop | None]:
+        """Delete rows of *label* created before *cutoff*, one ``write()`` per batch.
+
+        Resumes from ``_pruned_below[label]`` and returns the rows removed with
+        the bound that stopped it, or None once a short batch shows the horizon
+        drained. *label* and *batch_sql* are this module's constants, never
+        caller input.
+        """
+        removed = 0
+        while True:
+            limit = min(batch_size, max_rows - removed)
+            if limit <= 0:
+                return removed, _PruneStop.ROW_BUDGET
+            resume_from = self._pruned_below.get(label, '')
+            async with self._require_access().write() as db:
+                deleted = list(await db.execute_fetchall(
+                    batch_sql, (resume_from, cutoff, limit)
+                ))
+            removed += len(deleted)
+            if len(deleted) < limit:
+                self._pruned_below[label] = cutoff
+                return removed, None
+            self._pruned_below[label] = max(row[0] for row in deleted)
+            if removed >= max_rows:
+                return removed, _PruneStop.ROW_BUDGET
+            if _monotonic() >= deadline:
+                return removed, _PruneStop.DEADLINE

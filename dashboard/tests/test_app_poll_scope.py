@@ -221,8 +221,8 @@ process.stdout.write(JSON.stringify({
   reads,
   missing,
   keyToPath,
-  chrome: [...window.DF_ENDPOINT_STALENESS.CHROME_ENDPOINTS],
-  tabs: window.DF_ENDPOINT_STALENESS.TAB_ENDPOINTS,
+  chrome: [...window.DF_POLL_SCOPE.CHROME_ENDPOINTS],
+  tabs: window.DF_POLL_SCOPE.TAB_ENDPOINTS,
 }));
 """
 """Each reader runs twice, with ``null`` and with a seeded project as its second
@@ -494,7 +494,7 @@ _DASH = '/api/v2/dashboard'
 _TAB_READ_FLOOR = {
     'orch': {f'{_DASH}/scheduler', f'{_DASH}/tasks'},
     'overview': {f'{_DASH}/merge-queue'},
-    'tasks': {f'{_DASH}/tasks', f'{_DASH}/invariants'},
+    'tasks': {f'{_DASH}/tasks', f'{_DASH}/invariants', f'{_DASH}/prds'},
 }
 """Reads the derivation must see, as literals: a non-vacuity floor, not the contract.
 

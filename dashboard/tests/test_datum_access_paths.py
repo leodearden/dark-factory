@@ -2,9 +2,9 @@
 
 ``plans/dashboard-one-datum-one-path-prd.md`` decision 17(b) replaces token
 greps with one executed check: ``fetch_tasks``, ``fetch_task_page``,
-``fetch_statuses`` and ``fetch_task`` are used only where an
-:class:`AccessGrant` below says so, and the one named exemption is
-``app.py::_fanout_probe_completion``. The apparatus — a finder, fixture tests
+``fetch_statuses``, ``fetch_task`` and ``fetch_metadata_projection`` are used
+only where an :class:`AccessGrant` below says so, and the one named exemption
+is ``app.py::_fanout_probe_completion``. The apparatus — a finder, fixture tests
 of its matcher, then acceptance tests over a scan set that fails loudly — is
 ``test_clock_discipline.py``'s.
 
@@ -33,7 +33,10 @@ from _dashboard_helpers import ScriptTagCollector, node_path
 # The finder
 # ---------------------------------------------------------------------------
 
-GUARDED = frozenset({'fetch_tasks', 'fetch_task_page', 'fetch_statuses', 'fetch_task'})
+GUARDED = frozenset({
+    'fetch_tasks', 'fetch_task_page', 'fetch_statuses', 'fetch_task',
+    'fetch_metadata_projection',
+})
 
 
 @dataclass(frozen=True, slots=True)
@@ -285,15 +288,21 @@ _GRANTS: tuple[AccessGrant, ...] = (
         'and row access implementation',
     ),
     AccessGrant(
+        'data/task_lineage.py', None, frozenset({'fetch_metadata_projection'}),
+        'the lineage index is the one access implementation of the projected '
+        'task read (PRD dashboard-prd-lanes §4.12, INV-12)',
+    ),
+    AccessGrant(
         'data/task_lookup.py', None, frozenset({'fetch_task'}),
         'the per-id miss path for a task the snapshot does not hold (PRD '
         'decision 12)',
     ),
     AccessGrant(
-        'app.py', '_fanout_probe_completion', frozenset({'fetch_tasks'}),
+        'app.py', '_fanout_probe_completion', frozenset({'fetch_task_page'}),
         'the /healthz MCP fan-out liveness probe reads raw and uncached by '
         'design: a stored value would mask the wedge it detects (PRD '
-        'decision 17). The ONE named exemption.',
+        'decision 17). It reads one row of the snapshot unit\'s row query '
+        '(task 6321). The ONE named exemption.',
     ),
 )
 

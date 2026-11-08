@@ -1577,10 +1577,10 @@ def _run_single_eval(
     """
     from orchestrator.evals.configs import EVAL_CONFIGS, get_config_by_name
     from orchestrator.evals.eval_gate import campaign_usage_gate
+    from orchestrator.evals.measurement import format_invocation_errors
     from orchestrator.evals.metrics import RoleUnderTest
-    from orchestrator.evals.report import (
+    from orchestrator.evals.plan_quality_report import (
         build_plan_quality_report,
-        format_invocation_errors,
         format_plan_quality_table,
     )
     from orchestrator.evals.runner import run_architect_eval, run_eval
@@ -1755,11 +1755,13 @@ def _emit_composite_report(results, price_table) -> None:
     architect rows emits the composite table alone, so the existing
     ``eval-matrix`` / ``eval-confirm`` end-to-end surfaces are unchanged.
     """
-    from orchestrator.evals.metrics import RoleUnderTest
-    from orchestrator.evals.report import (
+    from orchestrator.evals.composite_report import (
         build_composite_report,
-        build_plan_quality_report,
         format_composite_table,
+    )
+    from orchestrator.evals.metrics import RoleUnderTest
+    from orchestrator.evals.plan_quality_report import (
+        build_plan_quality_report,
         format_plan_quality_table,
     )
 
@@ -1777,7 +1779,7 @@ def _run_ofat_driver(
 ) -> None:
     """OFAT screen: ``run_ofat_stage`` over ``ofat_candidates()`` → composite (μ)."""
     from orchestrator.evals.configs import ofat_candidates
-    from orchestrator.evals.report import build_price_table
+    from orchestrator.evals.prices import build_price_table
     from orchestrator.evals.runner import run_ofat_stage
 
     task_paths = _resolve_eval_task_paths(base_config, tasks_dir)
@@ -1805,7 +1807,7 @@ def _run_matrix_driver(
     """
     from orchestrator.evals.configs import matrix_pairs, ofat_candidates
     from orchestrator.evals.metrics import RoleUnderTest
-    from orchestrator.evals.report import build_pairwise_price_table
+    from orchestrator.evals.prices import build_pairwise_price_table
     from orchestrator.evals.runner import run_matrix_stage
 
     task_paths = _resolve_eval_task_paths(base_config, tasks_dir)
@@ -1834,7 +1836,7 @@ def _run_confirm_driver(
     """Confirmation batch: the single winning ``(arch, impl)`` combo → composite (μ)."""
     from orchestrator.evals.configs import get_config_by_name
     from orchestrator.evals.metrics import RoleUnderTest
-    from orchestrator.evals.report import build_pairwise_price_table
+    from orchestrator.evals.prices import build_pairwise_price_table
     from orchestrator.evals.runner import run_confirm_stage
 
     arch_cfg = get_config_by_name(arch)
@@ -2030,8 +2032,8 @@ def eval_shadow_report_cmd(config_path, shape, candidate, as_json):
 def _run_judge_cmd(max_rounds: int = 50, reset: bool = False):
     """Run Elo-based judge on existing results."""
     from orchestrator.evals.elo import JudgeState, TaskPool, load_state, save_state
+    from orchestrator.evals.elo_report import build_report, format_markdown, save_report
     from orchestrator.evals.judge import run_elo_tournament
-    from orchestrator.evals.report import build_report, format_markdown, save_report
     from orchestrator.evals.results import ResultStore
     from orchestrator.evals.runner import load_task
     from orchestrator.evals.snapshots import get_diff_between_commits
@@ -2132,7 +2134,7 @@ def _run_judge_cmd(max_rounds: int = 50, reset: bool = False):
 def _run_report_cmd():
     """Generate report from existing judge state (no new judge calls)."""
     from orchestrator.evals.elo import load_state
-    from orchestrator.evals.report import build_report, format_markdown, save_report
+    from orchestrator.evals.elo_report import build_report, format_markdown, save_report
 
     state = load_state()
     if not state.per_task:

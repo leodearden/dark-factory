@@ -247,8 +247,8 @@ def _markup_subject_task_id(artifacts: TaskArtifacts) -> str:
         plan = artifacts.read_plan()
     except Exception:
         logger.warning(
-            'markup guard: could not read the plan for attribution under %s; '
-            'falling back to the worktree name', artifacts.root,
+            'markup guard: could not read the plan for attribution at %s; '
+            'falling back to the worktree name', artifacts.artifact_path('plan.json'),
         )
         return ''
     task_id = plan.get('task_id') if isinstance(plan, dict) else None
@@ -520,14 +520,15 @@ def create_server(
 def _artifacts_from_args(
     argv: list[str] | None = None,
 ) -> tuple[TaskArtifacts, str, str]:
-    """Parse ``--worktree``/``--meta-root``/``--verdict-role``/``--session-id``
-    and return the corresponding ``(TaskArtifacts, role, session_id)``.
+    """Parse ``--worktree``/``--meta-root``/``--task-root``/``--verdict-role``/
+    ``--session-id`` and return the corresponding
+    ``(TaskArtifacts, role, session_id)``.
 
-    The worktree/meta-root resolution mirrors plan_tools.py's
-    ``_artifacts_from_args`` byte-identically (parity signal) so both sides
-    resolve the IDENTICAL meta_root for a given worktree. When
-    ``--meta-root`` is omitted, the root dir checked for existence is the
-    legacy ``<worktree>/.task``. ``--verdict-role`` is validated eagerly
+    The root resolution mirrors plan_tools.py's ``_artifacts_from_args``
+    byte-identically (parity signal) so both servers resolve the IDENTICAL
+    roots for a given dispatch: each root must already exist, and omitting
+    both root flags leaves the legacy ``<worktree>/.task`` single root.
+    ``--verdict-role`` is validated eagerly
     here (``_validate_verdict_role``) so a malformed role aborts server
     startup with a clear message, instead of surfacing as an opaque
     ValueError on every subsequent tool call.
@@ -543,6 +544,13 @@ def _artifacts_from_args(
             'Optional `.task-meta` root (sibling of the worktree). When '
             'omitted, verdicts/ et al. are read/written at the legacy '
             '<worktree>/.task location.'
+        ),
+    )
+    parser.add_argument(
+        '--task-root', type=Path, default=None,
+        help=(
+            'Optional task-lifetime `.task-meta/task-<id>` root. When '
+            'omitted, every artifact resolves against the lane root.'
         ),
     )
     parser.add_argument(
@@ -563,14 +571,16 @@ def _artifacts_from_args(
         print(f'Error: {exc}', file=sys.stderr)
         sys.exit(1)
 
-    worktree = args.worktree.resolve()
-    meta_root = args.meta_root.resolve() if args.meta_root is not None else None
-    root_to_check = meta_root if meta_root is not None else worktree / '.task'
-    if not root_to_check.is_dir():
-        print(f'Error: {root_to_check} does not exist', file=sys.stderr)
-        sys.exit(1)
-
-    return TaskArtifacts(worktree, meta_root), args.verdict_role, args.session_id
+    artifacts = TaskArtifacts(
+        args.worktree.resolve(),
+        args.meta_root.resolve() if args.meta_root is not None else None,
+        args.task_root.resolve() if args.task_root is not None else None,
+    )
+    for root in (artifacts.lane_root, artifacts.task_root):
+        if not root.is_dir():
+            print(f'Error: {root} does not exist', file=sys.stderr)
+            sys.exit(1)
+    return artifacts, args.verdict_role, args.session_id
 
 
 def main() -> None:

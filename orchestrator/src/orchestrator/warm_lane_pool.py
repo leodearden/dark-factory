@@ -361,7 +361,9 @@ class WarmLanePool:
         moment the in-memory state flips (single-writer coherence, PRD
         warm-lane-exhaustion-hardening W2b I1 / boundary row 1). The REUSE
         branch does NOT re-write: the record is already ``ASSIGNED:branch_name``
-        (``note_assigned`` would no-op anyway). ``title``/``branch`` are
+        (``note_assigned`` would no-op anyway). Its ``updated_at`` reuse stamp
+        lives in ``refresh_assignment``, called once GitOps has decided the
+        REUSE route. ``title``/``branch`` are
         carry-forward hints threaded from GitOps so the durable record keeps
         its task_id/title/branch (used by the GitOps acquire consolidation).
 
@@ -684,6 +686,11 @@ class WarmLanePool:
         When a ``LaneLifecycle`` has been wired via ``set_lane_lifecycle``,
         also mirrors this assignment onto the durable record (best-effort;
         see ``_note_assigned_durable``). No-op when unwired.
+
+        It never refreshes ``updated_at``: crash recovery runs on every fleet
+        restart, so restamping here would keep abandoned lanes young and
+        defeat the GC age bound. ``refresh_assignment`` is the dispatch-only
+        stamp.
         """
         matched = self.canonical_lane(lane)
         if matched is None:
@@ -699,6 +706,35 @@ class WarmLanePool:
         self._lanes[matched] = LaneState.ASSIGNED
         self._assignments[task_id] = matched
         self._note_assigned_durable(task_id, matched)
+
+    def refresh_assignment(self, task_id: str, lane: Path) -> None:
+        """Restamp the durable record's ``updated_at`` for a REUSE dispatch.
+
+        Called only by ``GitOps._acquire_warm_lane_impl``'s REUSE route. The
+        record's ``updated_at`` is warm-lane-gc.sh's record-gate age clock, so
+        stamping each reuse makes that clock measure activity, not first
+        assignment. ``restore_assignment`` deliberately never calls it.
+
+        Leaves the in-memory cache untouched; no-op when unwired. A refusal
+        (the record is not held by *task_id*) or an ``OSError`` is drift: it
+        is logged and counted like every other mirror write, never raised.
+        """
+        if self._lane_lifecycle is None:
+            return
+        lifecycle = self._lane_lifecycle
+
+        def _refresh_write() -> bool:
+            lifecycle.refresh_assigned(lane, task_id=task_id)
+            return True
+
+        self._run_guarded_durable_write(
+            _refresh_write,
+            on_fail_log=lambda: logger.warning(
+                'warm_lane_pool: updated_at refresh for lane %s failed for '
+                'task %r — durable record left as-is',
+                lane.name, task_id, exc_info=True,
+            ),
+        )
 
     def _note_assigned_durable(
         self,

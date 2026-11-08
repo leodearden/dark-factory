@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from _merge_deep_scene import (
@@ -80,6 +81,17 @@ from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 def _make_worker(git_ops: GitOps) -> SpeculativeMergeWorker:
     """Build a bare SpeculativeMergeWorker for unit tests (no harness wiring)."""
     return SpeculativeMergeWorker(git_ops, asyncio.Queue())
+
+
+def _seed_frontier(worker: SpeculativeMergeWorker, frontier: int) -> None:
+    """Stub *frontier* frozen entries that set ``_verify_frontier_depth()`` and are built on nothing.
+
+    Dispatch reads each frozen entry's ``item`` and ``gate`` for the bases a
+    new item may stack on; ``None`` for both contributes no base commit.
+    """
+    worker._frozen_inflight_entries = (  # type: ignore[assignment,method-assign]
+        lambda: [SimpleNamespace(item=None, gate=None) for _ in range(frontier)]
+    )
 
 
 def _owns_merge_worktree(worker: SpeculativeMergeWorker, wt: Path) -> bool:
@@ -448,10 +460,10 @@ class TestDeepChainPlacementGate:
         git_ops = _make_git_ops(git_repo)
         config = _make_config(git_repo, chain_cap=chain_cap)
         worker = _make_worker(git_ops)
-        worker._lane_buffers['normal'].extend(
+        worker._intake.replace_lane('normal', [
             _make_req(str(200 + i), str(200 + i), config, git_repo)
             for i in range(queued)
-        )
+        ])
         item = _make_item(
             _make_req('101', '101', config, git_repo), 'beef' * 10, git_repo,
         )
@@ -487,9 +499,9 @@ class TestDeepChainPlacementGate:
         git_ops = _make_git_ops(git_repo)
         config = _make_config(git_repo, chain_cap=6)
         worker = _make_worker(git_ops)
-        worker._lane_buffers['normal'].extend(
+        worker._intake.replace_lane('normal', [
             _make_req(str(300 + i), str(300 + i), config, git_repo) for i in range(5)
-        )
+        ])
         built = _spy_build_chain(monkeypatch)
         lanes = _count_spec_lane_acquires(git_ops, monkeypatch)
         scans = _spy_chain_snapshot(worker, monkeypatch)
@@ -631,9 +643,9 @@ class TestDeepChainPlacementBuild:
             await _create_branch_editing(git_repo, f'task/{task_id}', filename, content)
         head = await _merge_commit_off_main(git_repo, 'task/101', '101')
         worker = _make_worker(git_ops)
-        worker._lane_buffers['normal'].extend(
+        worker._intake.replace_lane('normal', [
             _make_req(task_id, task_id, config, git_repo) for task_id, _, _ in queued
-        )
+        ])
         item = _make_item(_make_req('101', '101', config, git_repo), head, git_repo)
         return git_ops, worker, item, head, config
 
@@ -715,9 +727,9 @@ class TestDeepChainPlacementBuild:
         )
 
     async def test_build_is_wrapped_in_a_deadline_and_leaks_no_lane(
-        self, git_repo: Path, monkeypatch,
+        self, git_repo: Path, monkeypatch, caplog,
     ):
-        """A build that overruns ``CHAIN_BUILD_TIMEOUT_SECS`` degrades to today's path.
+        """A build that overruns ``merge_deep.chain_build_timeout_secs`` degrades to today's path.
 
         The REAL ``build_chain`` runs here (only the per-item merge is stalled),
         so the deadline genuinely cancels it mid-merge and its own
@@ -725,19 +737,18 @@ class TestDeepChainPlacementBuild:
         the lane.  Stubbing the builder wholesale would prove only that a stub
         does not leak.
         """
+        import logging
+
         from orchestrator.warm_lane_pool import LaneState
 
         git_ops, worker, item, _head, _cfg = await self._fixture(
             git_repo, chain_cap=6,
             queued=[('102', 'b.txt', 'edit-102\n'), ('103', 'c.txt', 'edit-103\n')],
         )
-        assert isinstance(merge_queue.CHAIN_BUILD_TIMEOUT_SECS, (int, float))
-        assert merge_queue.CHAIN_BUILD_TIMEOUT_SECS > 0
         # 2.0s, not a tighter value: the deadline starts at the `async with`,
         # so it also covers acquire_chain_build_lane's reset+clean+CoW seed.
         # Too tight and the cancel lands INSIDE the acquisition under parallel
         # load, testing a different path than the one this test names.
-        monkeypatch.setattr('orchestrator.merge_lane.worker.CHAIN_BUILD_TIMEOUT_SECS', 2.0)
         reached: list[str] = []
 
         async def _stalled_merge(_lane, branch):
@@ -746,9 +757,16 @@ class TestDeepChainPlacementBuild:
 
         monkeypatch.setattr(git_ops, 'merge_branch_into_worktree', _stalled_merge)
 
-        assert await worker._deep_chain_placement(item) is None
-        assert reached, 'the stall must be reached, so the cancel lands in the merge loop'
-        assert _lane_states(git_ops) == [LaneState.FREE], 'deadline must not strand a lane'
+        # The knob is read live off the dispatching request: a reload that
+        # changes it governs the NEXT dispatch, and the WARNING names it.
+        for secs in (2.0, 3.0):
+            item.request.config.merge_deep.chain_build_timeout_secs = secs
+            caplog.clear()
+            with caplog.at_level(logging.WARNING):
+                assert await worker._deep_chain_placement(item) is None
+            assert f'exceeded {secs:.0f}s' in caplog.text
+            assert reached, 'the stall must be reached, so the cancel lands in the merge loop'
+            assert _lane_states(git_ops) == [LaneState.FREE], 'deadline must not strand a lane'
 
     async def test_a_none_merge_commit_declines_before_any_build(
         self, git_repo: Path, monkeypatch,
@@ -851,7 +869,7 @@ class TestDeepChainPlacementBuild:
 
         The build is awaited INLINE on ``_verifier_loop``'s dispatch path, so
         for its whole duration no head can be finalized or landed and nothing
-        else can dispatch.  ``CHAIN_BUILD_TIMEOUT_SECS`` bounds that stall but
+        else can dispatch.  ``merge_deep.chain_build_timeout_secs`` bounds that stall but
         does not remove it, and the PRD's whole justification is throughput —
         so the cost has to reach telemetry (as ``chain_build_ms``) before ζ
         raises the cap.  Stamped by the CALLER, not by ``build_chain``, so it
@@ -1029,7 +1047,7 @@ class TestDeepChainPlacementBuild:
         monkeypatch.setattr(worker, '_note_conflict_detected', conflicts.append)
         store = _CapturingEventStore()
         worker._event_store = store
-        queued_reqs = list(worker._lane_buffers['normal'])
+        queued_reqs = list(worker._intake.buffered('normal'))
 
         res = await worker._deep_chain_placement(item)
 
@@ -1124,10 +1142,10 @@ class TestRunInflightVerifyChainRedirect:
             await _create_branch_editing(git_repo, f'task/{tid}', fn, f'edit-{tid}\n')
         head = await _merge_commit_off_main(git_repo, 'task/101', '101')
         worker = _make_worker(git_ops)
-        worker._lane_buffers['normal'].extend(
+        worker._intake.replace_lane('normal', [
             _make_req(tid, tid, config, git_repo) for tid in ('102', '103')
-        )
-        worker._frozen_inflight_entries = lambda: [object()] * frontier  # type: ignore[assignment,method-assign]
+        ])
+        _seed_frontier(worker, frontier)
         item = _make_item(
             _make_req('101', '101', config, git_repo), head,
             _ephemeral_merge_wt(git_ops, 'redirect'),
@@ -1724,7 +1742,7 @@ class TestDeepTipVerifyNeverAdopts:
         head = await _merge_commit_off_main(git_repo, 'task/101', '101')
         worker = _make_worker(git_ops)
         queued_reqs = [_make_req(tid, tid, config, git_repo) for tid in ('102', '103')]
-        worker._lane_buffers['normal'].extend(queued_reqs)
+        worker._intake.replace_lane('normal', queued_reqs)
         store = _CapturingEventStore()
         worker._event_store = store
         item = _make_item(
@@ -2023,15 +2041,13 @@ async def _make_deep_scene(
     store = _CapturingEventStore()
     worker = _make_worker(git_ops)
     worker._event_store = store
-    worker._lane_buffers['normal'].extend(
+    worker._intake.replace_lane('normal', [
         _make_req(tid, tid, config, repo) for tid in _DEEP_QUEUE
-    )
+    ])
     if allocator is not None:
         worker._host_allocator = allocator
     if frontier:
-        worker._frozen_inflight_entries = (  # type: ignore[assignment,method-assign]
-            lambda: [object()] * frontier
-        )
+        _seed_frontier(worker, frontier)
     scene = _DeepScene(git_ops, config, worker, head, repo, store)
 
     # ── the round recorder, installed ONCE ───────────────────────────────────

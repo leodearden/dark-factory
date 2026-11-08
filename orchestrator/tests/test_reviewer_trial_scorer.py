@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import asdict
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -291,6 +292,60 @@ class TestScoringResultMatchCost:
         """total_cost_usd is 0.0 when both components are at their defaults."""
         result = ScoringResult(variant_name='v', diff_id='d')
         assert result.total_cost_usd == pytest.approx(0.0)
+
+
+def _measured_score() -> ScoringResult:
+    return ScoringResult(
+        variant_name='v1',
+        diff_id='d1',
+        matches=[
+            IssueMatch({'location': 'a.py:1', 'description': 'A'}, 'gt1', 0.9, 'same bug'),
+            IssueMatch({'location': 'b.py:2', 'description': 'B'}, 'gt2', 0.7, 'same leak'),
+        ],
+        unmatched_gt=['gt3'],
+        false_positives=[{'location': 'c.py:3', 'description': 'C'}],
+        recall=0.6667,
+        precision=0.6667,
+        f1=0.6667,
+        blocking_recall=1.0,
+        cost_usd=1.5,
+        match_cost_usd=0.02,
+        wall_clock_ms=9000,
+    )
+
+
+class TestScoringResultFromDict:
+    """ScoringResult.from_dict is the inverse of asdict, as a campaign caches a score."""
+
+    def test_a_measured_score_round_trips(self) -> None:
+        score = _measured_score()
+        loaded = ScoringResult.from_dict(asdict(score))
+        assert asdict(loaded) == asdict(score)
+        assert all(isinstance(m, IssueMatch) for m in loaded.matches)
+
+    def test_an_unmeasured_score_round_trips(self) -> None:
+        unmeasured = Unmeasured(MeasurementStage.MATCHER, UnmeasuredCause.CAP_HIT, 'limit', cost_usd=0.31)
+        score = ScoringResult(
+            variant_name='v1', diff_id='d1', cost_usd=1.5, match_cost_usd=0.31, unmeasured=unmeasured,
+        )
+        loaded = ScoringResult.from_dict(json.loads(json.dumps(asdict(score))))
+        assert asdict(loaded) == asdict(score)
+        assert loaded.unmeasured == unmeasured
+
+    def test_a_record_cached_before_task_6736_loads_as_measured(self) -> None:
+        record = asdict(_measured_score())
+        del record['unmeasured']
+        del record['match_cost_usd']
+        loaded = ScoringResult.from_dict(record)
+        assert loaded.unmeasured is None
+        assert loaded.match_cost_usd == 0.0
+
+    @pytest.mark.parametrize('missing', ['variant_name', 'diff_id'])
+    def test_a_record_missing_its_identity_raises(self, missing: str) -> None:
+        record = asdict(_measured_score())
+        del record[missing]
+        with pytest.raises(KeyError):
+            ScoringResult.from_dict(record)
 
 
 class TestScorePanelRunCost:

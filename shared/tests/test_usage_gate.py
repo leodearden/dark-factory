@@ -1105,7 +1105,7 @@ class TestProbeConfigDirLeakSweep:
         instead — whether by a def-time default parameter, which cannot be
         intercepted at all, or by calling that module's global by name, which
         merely moves the single interception point there — then
-        conftest.py's `_confine_usage_gate_sweep` and the ~dozen sibling
+        df_pytest_isolation.py::confine_usage_gate_sweep and the ~dozen sibling
         `patch('shared.usage_gate.sweep_stale_pid_dirs', ...)` sites in this
         class silently stop intercepting, and this suite starts scandir-ing and
         deleting the developer's real /tmp.
@@ -1253,7 +1253,8 @@ class TestProbeConfigDirLeakSweep:
         """The whole fix, exercised against a real (redirected) tmp dir.
 
         Requests `real_probe_dir_sweep` to opt out of the suite-wide
-        confinement in conftest.py. Patching shared.config_dir.tempfile.gettempdir then
+        confinement, df_pytest_isolation.py::arm_usage_gate_sweep_confinement.
+        Patching shared.config_dir.tempfile.gettempdir then
         redirects BOTH TaskConfigDir and the sweep's default base to tmp_path,
         so this never touches the real /tmp.
         """

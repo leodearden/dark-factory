@@ -1116,8 +1116,8 @@ def run_stop(
     inheritor finishing its turn can no longer idle the spawning session
     mid-turn. *process_tree* is the tree this event's ownership probes
     read; None reads the live one (see ``ProcessTree``). *self_exit* is the
-    opt-in self-exit decision; None uses ``SelfExit()``, which signals with
-    the live ``os.kill``.
+    self-exit decision (acts only on a record stamped ``self_exit``); None
+    uses ``SelfExit()``, which signals with the live ``os.kill``.
     """
     return _run_status_refresh_and_retitle(
         hook_input,

@@ -176,7 +176,7 @@ def _snapshot(*, health='ok', done=0):
     about. Stamped at the live clock so a FRESH half is inside its own
     freshness bound at the instant the handler serves it.
     """
-    from datetime import UTC, datetime
+    from datetime import UTC, datetime, timedelta
     from types import MappingProxyType
 
     from dashboard.data.census import build_census
@@ -188,11 +188,16 @@ def _snapshot(*, health='ok', done=0):
     )
 
     as_of = datetime.now(UTC)
+    stale_age = timedelta(seconds=60)
     status_map = {task_id: 'done' for task_id in range(1, done + 1)}
     fresh_rows = Datum([], as_of, DatumState.FRESH, None, FRESHNESS_BOUND_SECONDS)
     fresh_census = Datum(
         build_census(status_map), as_of, DatumState.FRESH, None,
         FRESHNESS_BOUND_SECONDS,
+    )
+    stale_census = Datum(
+        build_census(status_map), as_of - stale_age, DatumState.STALE,
+        f'canned {health} root', FRESHNESS_BOUND_SECONDS,
     )
     unknown = Datum(
         None, None, DatumState.UNKNOWN, f'canned {health} root',
@@ -203,22 +208,30 @@ def _snapshot(*, health='ok', done=0):
         'offline': (SnapshotFailure.UNREACHABLE, unknown, unknown),
         'degraded': (SnapshotFailure.BUDGET, unknown, unknown),
         'count_unknown': (SnapshotFailure.NONE, fresh_rows, unknown),
+        'count_stale': (SnapshotFailure.NONE, fresh_rows, stale_census),
     }[health]
+    if unknown in (rows, census):
+        skew_seconds = None
+    else:
+        skew_seconds = int((rows.as_of - census.as_of).total_seconds())
     return TaskSnapshot(
         census=census, rows=rows,
         in_progress_live=None if rows is unknown else 0,
         in_progress_stranded=None if rows is unknown else 0,
-        skew_seconds=None if unknown in (rows, census) else 0,
+        skew_seconds=skew_seconds,
         status_map=MappingProxyType(status_map), failure=failure,
     )
 
 
-def _snapshots(labels, *, offline=(), degraded=(), count_unknown=(), done=None):
+def _snapshots(
+    labels, *, offline=(), degraded=(), count_unknown=(), count_stale=(), done=None,
+):
     """``{label: TaskSnapshot}`` for *labels*, in order, routed by membership."""
     counts = done or {}
     health = dict.fromkeys(offline, 'offline')
     health.update(dict.fromkeys(degraded, 'degraded'))
     health.update(dict.fromkeys(count_unknown, 'count_unknown'))
+    health.update(dict.fromkeys(count_stale, 'count_stale'))
     return {
         label: _snapshot(health=health.get(label, 'ok'), done=counts.get(label, 0))
         for label in labels
@@ -228,7 +241,7 @@ def _snapshots(labels, *, offline=(), degraded=(), count_unknown=(), done=None):
 _TASKS_KEYS = {
     'TASKS_SNAPSHOT', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS',
     'TASKS_DEGRADED_PROJECTS', 'TASKS_COUNT_UNKNOWN_PROJECTS',
-    'TASKS_PROJECT_COUNT', 'served_at',
+    'TASKS_COUNT_STALE_PROJECTS', 'TASKS_PROJECT_COUNT', 'served_at',
 }
 """The default render's whole payload. DONE_COUNTS and ACTIVE_TASKS are gone,
 and their ABSENCE is asserted rather than an empty value. Both were top-level
@@ -341,12 +354,12 @@ def _render_through_the_real_collector(client, canned):
     """
     import dashboard.data.task_snapshot as snapshot_mod
 
-    snapshot_mod._snapshot_cache_clear()
+    snapshot_mod.clear_snapshot_cache()
     try:
         with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
             return client.get('/api/v2/dashboard/tasks')
     finally:
-        snapshot_mod._snapshot_cache_clear()
+        snapshot_mod.clear_snapshot_cache()
 
 
 def test_a_healthy_root_is_fresh_when_the_real_collector_measures_it(client, caplog):
@@ -375,7 +388,7 @@ def test_a_healthy_root_is_fresh_when_the_real_collector_measures_it(client, cap
     import logging
     from datetime import datetime
 
-    from test_task_snapshot import CannedMCP, _raw_row
+    from _canned_mcp import CannedMCP, _raw_row
 
     label = client.app.state.config.project_root.name
     pairs = ((1, 'in-progress'), (2, 'pending'), (3, 'done'))
@@ -395,6 +408,7 @@ def test_a_healthy_root_is_fresh_when_the_real_collector_measures_it(client, cap
     assert entry['rows']['state'] == 'fresh', entry['rows']
     # (b) A healthy tree is named in no banner.
     assert body['TASKS_COUNT_UNKNOWN_PROJECTS'] == []
+    assert body['TASKS_COUNT_STALE_PROJECTS'] == []
     assert body['TASKS_OFFLINE_PROJECTS'] == []
     # (c) Nothing on the payload claims to have been measured after it was served.
     served_at = datetime.fromisoformat(body['served_at'])
@@ -425,10 +439,11 @@ def test_a_unit_another_render_refreshed_later_is_not_a_contract_break(client, c
     import logging
     from datetime import datetime, timedelta
 
-    from test_task_snapshot import CannedMCP, _raw_row
+    from _canned_mcp import CannedMCP, _raw_row
+    from _dt_helpers import installed_clock
 
     import dashboard.data.task_snapshot as snapshot_mod
-    from dashboard.data.utils import resolve_now
+    from dashboard.api.clock import live_clock
 
     config = client.app.state.config
     root = config.project_root
@@ -440,10 +455,10 @@ def test_a_unit_another_render_refreshed_later_is_not_a_contract_break(client, c
     )
     instants = iter(())
 
-    def b_clock(now):
-        return next(instants, None) or resolve_now(now)
+    def b_clock():
+        return next(instants, None) or live_clock()
 
-    snapshot_mod._snapshot_cache_clear()
+    snapshot_mod.clear_snapshot_cache()
     try:
         with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
             render_a = client.get('/api/v2/dashboard/tasks')
@@ -454,12 +469,12 @@ def test_a_unit_another_render_refreshed_later_is_not_a_contract_break(client, c
             render_b = a_as_of - timedelta(seconds=1)
             instants = iter([render_b])
             with (
-                patch('dashboard.api.tasks.resolve_now', new=b_clock),
+                installed_clock(client.app, b_clock),
                 caplog.at_level(logging.WARNING),
             ):
                 resp = client.get('/api/v2/dashboard/tasks')
     finally:
-        snapshot_mod._snapshot_cache_clear()
+        snapshot_mod.clear_snapshot_cache()
 
     assert resp.status_code == 200, resp.text
     body = resp.json()
@@ -492,7 +507,7 @@ def test_a_snapshot_that_breaks_the_envelope_borrows_no_last_good(client, caplog
     from datetime import UTC, datetime, timedelta
 
     import httpx
-    from test_task_snapshot import CannedMCP, _raw_row
+    from _canned_mcp import CannedMCP, _raw_row
 
     import dashboard.data.task_snapshot as snapshot_mod
     from dashboard.data.datum import DatumInvariant
@@ -515,7 +530,7 @@ def test_a_snapshot_that_breaks_the_envelope_borrows_no_last_good(client, caplog
         healthy,
         census=replace(healthy.census, as_of=datetime.now(UTC) + timedelta(hours=1)),
     )
-    snapshot_mod._snapshot_cache_clear()
+    snapshot_mod.clear_snapshot_cache()
     try:
         with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
             asyncio.run(_measure_earlier())
@@ -526,7 +541,7 @@ def test_a_snapshot_that_breaks_the_envelope_borrows_no_last_good(client, caplog
         ), caplog.at_level(logging.WARNING):
             resp = client.get('/api/v2/dashboard/tasks')
     finally:
-        snapshot_mod._snapshot_cache_clear()
+        snapshot_mod.clear_snapshot_cache()
 
     assert resp.status_code == 200, resp.text
     entry = resp.json()['TASKS_SNAPSHOT'][label]
@@ -572,8 +587,8 @@ def test_the_snapshot_rows_on_the_wire_are_the_shaped_task_rows(client):
     """
     from datetime import UTC
 
+    from _canned_mcp import CannedMCP, _raw_row
     from shared.task_deferral import PlanningDeferral, record_to_json
-    from test_task_snapshot import CannedMCP, _raw_row
 
     label = client.app.state.config.project_root.name
     pairs = ((1, 'in-progress'), (2, 'pending'), (3, 'blocked'), (4, 'deferred'))
@@ -724,17 +739,18 @@ def _install_roots(client, roots):
 
 def _tasks_body(
     client, *, offline_projects, degraded_projects=(),
-    count_unknown_projects=(), total_roots,
+    count_unknown_projects=(), count_stale_projects=(), total_roots,
 ):
     """GET /api/v2/dashboard/tasks with a canned collector result and N roots.
 
-    The three lists are no longer RETURNED by the collector — they are derived
+    The project lists are not RETURNED by the collector — they are derived
     from the per-root units — so the fixture builds the units that must yield
     them. A test that could only state the lists directly would be asserting
     the handler copies a list; this one asserts it reads a state machine.
     """
     labels = sorted(
-        {*offline_projects, *degraded_projects, *count_unknown_projects}
+        {*offline_projects, *degraded_projects, *count_unknown_projects,
+         *count_stale_projects}
         | {f'p{i}' for i in range(total_roots)}
     )
     collector = AsyncMock(
@@ -745,6 +761,7 @@ def _tasks_body(
                 offline=offline_projects,
                 degraded=degraded_projects,
                 count_unknown=count_unknown_projects,
+                count_stale=count_stale_projects,
             ),
         )
     )
@@ -1322,7 +1339,7 @@ def escalation_caches():
     def _clear() -> None:
         escalation_corpus._corpus_cache_clear()
         escalation_routes._analytics_memo_clear()
-        task_snapshot._snapshot_cache_clear()
+        task_snapshot.clear_snapshot_cache()
         task_lookup._lookup_cache_clear()
 
     _clear()
@@ -1767,13 +1784,17 @@ def _proj_raw(*roots: str) -> dict:
     from datetime import UTC
 
     from dashboard.data.datum import Datum, DatumState
+    from dashboard.data.merge_queue import MergeAttempts
 
     read_at = datetime.now(UTC)
     return {
         root: {
-            'depth_timeseries': {'labels': [], 'values': []},
-            'outcomes': {'labels': [], 'values': []},
-            'latency': {},
+            'depth_timeseries': Datum(
+                {'labels': [], 'values': [], 'bucket_minutes': 15},
+                read_at, DatumState.FRESH, None, 30,
+            ),
+            'attempts': Datum(MergeAttempts(), read_at, DatumState.FRESH, None, 30),
+            'train_throughput': Datum({}, read_at, DatumState.FRESH, None, 30),
             'recent': [],
             'recent_total': Datum(0, read_at, DatumState.FRESH, None, 30),
             'speculative': Datum(
@@ -1965,6 +1986,42 @@ def test_tasks_count_unknown_root_vetoes_the_outage_flag(client):
         'different (and separately reported) fact from an outage'
     )
     assert body['TASKS_COUNT_UNKNOWN_PROJECTS'] == ['p1']
+
+
+def test_tasks_count_stale_root_vetoes_the_outage_flag(client):
+    """A count-stale root's row read succeeded, so like a count-unknown root it is no absence of data."""
+    body = _tasks_body(
+        client,
+        offline_projects=['p0'],
+        count_stale_projects=['p1'],
+        total_roots=2,
+    )
+
+    assert body['TASKS_OFFLINE'] is False, (
+        "p1's rows were read — only its done count is aged, "
+        'which is a different (and separately reported) fact from an outage'
+    )
+    assert body['TASKS_COUNT_STALE_PROJECTS'] == ['p1']
+    assert body['TASKS_COUNT_UNKNOWN_PROJECTS'] == []
+
+
+def test_tasks_count_stale_root_is_listed_apart_from_count_unknown(client):
+    """A stale census is named on its own list, not as an unknown count.
+
+    Its surfaces render the last measured value with an age badge, so a banner
+    calling its done count unknown would contradict them.
+    """
+    body = _tasks_body(
+        client,
+        offline_projects=['p0'],
+        count_unknown_projects=['p1'],
+        count_stale_projects=['p2'],
+        total_roots=3,
+    )
+
+    assert body['TASKS_OFFLINE_PROJECTS'] == ['p0']
+    assert body['TASKS_COUNT_UNKNOWN_PROJECTS'] == ['p1']
+    assert body['TASKS_COUNT_STALE_PROJECTS'] == ['p2']
 
 
 def test_last_good_rows_do_not_veto_the_outage_flag(client):

@@ -633,7 +633,7 @@ def _failed_adv_result() -> EvalResult:
 
 class TestRecoveryReport:
     def test_build_recovery_report_rows(self):
-        from orchestrator.evals.report import build_recovery_report
+        from orchestrator.evals.plan_quality_report import build_recovery_report
 
         report = build_recovery_report([_adv_result(), _ordinary_result()])
         rows = report['rows']
@@ -649,7 +649,7 @@ class TestRecoveryReport:
         assert ordinary['adversarial'] is False
 
     def test_format_recovery_table_renders_column(self):
-        from orchestrator.evals.report import (
+        from orchestrator.evals.plan_quality_report import (
             build_recovery_report,
             format_recovery_table,
         )
@@ -674,7 +674,7 @@ class TestRecoveryReport:
         # but explicit adversarial flag True) must remain adversarial=True — NOT
         # be silently downgraded to a non-adversarial row. This is the crux of
         # keying the flag on the explicit task-record signal, not the score.
-        from orchestrator.evals.report import build_recovery_report
+        from orchestrator.evals.plan_quality_report import build_recovery_report
 
         report = build_recovery_report([_failed_adv_result()])
         row = report['rows'][0]
@@ -686,7 +686,7 @@ class TestRecoveryReport:
         # score marker '-' as an ordinary row, but its adversarial column reads
         # 'yes' vs the ordinary row's 'no' — so a scoring failure on an
         # adversarial fixture is visibly distinct, not hidden.
-        from orchestrator.evals.report import (
+        from orchestrator.evals.plan_quality_report import (
             build_recovery_report,
             format_recovery_table,
         )
@@ -712,7 +712,7 @@ class TestRecoveryReport:
     def test_explicit_adversarial_flag_overrides_score_inference(self):
         # An adversarial fixture that legitimately scored 0.0 (not a failure —
         # the model recovered on none of its criteria) is still adversarial.
-        from orchestrator.evals.report import build_recovery_report
+        from orchestrator.evals.plan_quality_report import build_recovery_report
 
         scored_zero = EvalResult(
             task_id='df_task_2284_adv_regression',

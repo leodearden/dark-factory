@@ -7,7 +7,7 @@ consistent instant across stores.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Final
 
@@ -15,13 +15,13 @@ from pydantic import TypeAdapter
 
 from client_feed.contract import NotRecorded, ReviewCounts
 from client_feed.policy import Policy
+from client_feed.sources.escalations import OpenEscalations, read_open_escalations
 from client_feed.sources.events import (
     EventBatch,
     FactoryStatus,
     LandedCommit,
     read_events,
     read_factory_status,
-    read_open_escalations,
     read_review_counts,
 )
 from client_feed.sources.git import main_head
@@ -31,10 +31,11 @@ from client_feed.sources.tasks import TasksRead, read_tasks
 
 @dataclass(frozen=True)
 class SourcesDump:
-    """main's head, the factory status, every task, their PRDs, one event batch and its landed tasks' reviews."""
+    """main's head, the factory status, the open escalations, every task, their PRDs, one event batch and its landed tasks' reviews."""
 
     head: str | None
     factory: FactoryStatus
+    escalations: OpenEscalations
     tasks: TasksRead
     prds: PrdsRead
     events: EventBatch
@@ -50,11 +51,17 @@ def _landed_task_ids(events: EventBatch) -> set[int]:
     }
 
 
+def _serializable(escalations: OpenEscalations) -> OpenEscalations:
+    """The same escalations by task in a plain dict, since pydantic serializes no read-only mapping."""
+    return replace(escalations, by_task=dict(escalations.by_task))
+
+
 def dump_sources(policy: Policy, *, now: datetime, after_id: int, limit: int) -> SourcesDump:
     """Read every source under `policy.project_root`; the event batch starts after `after_id`."""
     root = policy.project_root
     head = main_head(root)
-    tasks = read_tasks(root, since=None, escalations=read_open_escalations(root))
+    escalations = read_open_escalations(root)
+    tasks = read_tasks(root, since=None, escalations=escalations)
     prd_paths = {row.prd_path for row in tasks.rows if row.prd_path is not None}
     prds = (
         PrdsRead(found=(), absent=tuple(sorted(prd_paths)))
@@ -65,6 +72,7 @@ def dump_sources(policy: Policy, *, now: datetime, after_id: int, limit: int) ->
     return SourcesDump(
         head=head,
         factory=read_factory_status(root, now=now),
+        escalations=_serializable(escalations),
         tasks=tasks,
         prds=prds,
         events=events,
