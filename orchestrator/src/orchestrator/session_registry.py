@@ -952,6 +952,22 @@ def _read_session_pointer(path: Path) -> str | None:
         return None
 
 
+def _write_pointer_file(path: Path, slug: str) -> bool:
+    """Make the pointer file *path* hold *slug*: the shared body of every pointer writer.
+
+    True without rewriting when it already holds *slug*; False after a
+    WARNING when the write fails. Never raises.
+    """
+    if _read_session_pointer(path) == slug:
+        return True
+    try:
+        _atomic_write_text(path, slug)
+    except OSError as exc:
+        logger.warning('session pointer write failed: slug=%s path=%s: %s', slug, path, exc)
+        return False
+    return True
+
+
 def write_session_pointer(pid: int, slug: str, root: Path | str | None = None) -> bool:
     """Record *slug* as the record key of claude process *pid*'s current record.
 
@@ -966,17 +982,7 @@ def write_session_pointer(pid: int, slug: str, root: Path | str | None = None) -
     """
     if pid <= 0 or not is_record_key(slug):
         return False
-    path = session_pointer_path_for_pid(pid, root=root)
-    if _read_session_pointer(path) == slug:
-        return True
-    try:
-        _atomic_write_text(path, slug)
-    except OSError as exc:
-        logger.warning(
-            'session pointer write failed: pid=%s slug=%s path=%s: %s', pid, slug, path, exc
-        )
-        return False
-    return True
+    return _write_pointer_file(session_pointer_path_for_pid(pid, root=root), slug)
 
 
 def resolve_session_slug_for_pid(pid: int, root: Path | str | None = None) -> str | None:
@@ -1017,9 +1023,9 @@ def claude_session_pointer_path(session_id: str, root: Path | str | None = None)
     return claude_session_pointers_dir(root) / session_id
 
 
-def _is_session_id_token(session_id: str) -> bool:
-    """True iff *session_id* is safe as a pointer file name: the ``CLAUDE_CODE_SESSION_ID`` token shape."""
-    return _SESSION_ID_RE.fullmatch(session_id) is not None
+def _is_pointer_name_token(name: str) -> bool:
+    """True iff *name* is safe as a pointer file name: the ``CLAUDE_CODE_SESSION_ID`` token shape, which T3 thread ids (UUIDs) share."""
+    return _SESSION_ID_RE.fullmatch(name) is not None
 
 
 def write_claude_session_pointer(
@@ -1033,23 +1039,9 @@ def write_claude_session_pointer(
     is not a record key, False after a WARNING when the write fails, and
     never raises.
     """
-    if not _is_session_id_token(session_id) or not is_record_key(slug):
+    if not _is_pointer_name_token(session_id) or not is_record_key(slug):
         return False
-    path = claude_session_pointer_path(session_id, root=root)
-    if _read_session_pointer(path) == slug:
-        return True
-    try:
-        _atomic_write_text(path, slug)
-    except OSError as exc:
-        logger.warning(
-            'claude session pointer write failed: session_id=%s slug=%s path=%s: %s',
-            session_id,
-            slug,
-            path,
-            exc,
-        )
-        return False
-    return True
+    return _write_pointer_file(claude_session_pointer_path(session_id, root=root), slug)
 
 
 def resolve_session_slug_for_claude_session_id(
@@ -1061,7 +1053,7 @@ def resolve_session_slug_for_claude_session_id(
     returned only when the record it names carries
     ``claude_session_id == session_id``. Read-only; never raises.
     """
-    if not _is_session_id_token(session_id):
+    if not _is_pointer_name_token(session_id):
         return None
     slug = _read_session_pointer(claude_session_pointer_path(session_id, root=root))
     if slug is None or not is_record_key(slug):
@@ -1071,6 +1063,61 @@ def resolve_session_slug_for_claude_session_id(
     except (OSError, CorruptSessionRecord):
         return None
     return slug if record.claude_session_id == session_id else None
+
+
+T3_THREAD_POINTERS_DIRNAME = 'sessions-by-t3-thread'
+
+
+def t3_thread_pointers_dir(root: Path | str | None = None) -> Path:
+    """The T3 thread pointer dir, ``<fleet_root>/sessions-by-t3-thread/``; a sibling of ``sessions_dir`` like ``session_pointers_dir``.
+
+    It is the index of live T3-hosted records that ``mark_t3_sessions_exited`` iterates.
+    """
+    return fleet_root(root) / T3_THREAD_POINTERS_DIRNAME
+
+
+def t3_thread_pointer_path(thread_id: str, root: Path | str | None = None) -> Path:
+    return t3_thread_pointers_dir(root) / thread_id
+
+
+def write_t3_thread_pointer(thread_id: str, slug: str, root: Path | str | None = None) -> bool:
+    """Record *slug* as the record key of the session T3 thread *thread_id* hosts.
+
+    The thread twin of ``write_claude_session_pointer``, with the same contract.
+    """
+    if not _is_pointer_name_token(thread_id) or not is_record_key(slug):
+        return False
+    return _write_pointer_file(t3_thread_pointer_path(thread_id, root=root), slug)
+
+
+def resolve_session_slug_for_t3_thread(
+    thread_id: str, root: Path | str | None = None
+) -> str | None:
+    """Return the slug of the live record T3 thread *thread_id* hosts, or None.
+
+    Vouched more strictly than the other pointers: the named record must be
+    a t3 record naming *thread_id* AND non-terminal. That is the one
+    definition of the index's invariant -- a terminal record has no pointer
+    -- which the reap and every terminal write enforce through
+    ``_is_stale_t3_thread_pointer``. Read-only; never raises.
+    """
+    if not _is_pointer_name_token(thread_id):
+        return None
+    slug = _read_session_pointer(t3_thread_pointer_path(thread_id, root=root))
+    if slug is None or not is_record_key(slug):
+        return None
+    try:
+        record = read_record(slug, root=root)
+    except (OSError, CorruptSessionRecord):
+        return None
+    display = record.display
+    vouches = (
+        display is not None
+        and display.kind == DisplayKind.T3
+        and display.t3_thread_id == thread_id
+        and record.status not in TERMINAL_STATUSES
+    )
+    return slug if vouches else None
 
 
 def encode_cwd(cwd: str) -> str:
@@ -2995,9 +3042,36 @@ def _pointed_owner_identity(
 def _is_stale_claude_session_pointer(path: Path, root: Path | str | None) -> bool:
     if path.name.endswith(_ATOMIC_WRITE_TEMP_SUFFIX):
         return _is_abandoned_temp_file(path)
-    if not _is_session_id_token(path.name):
+    if not _is_pointer_name_token(path.name):
         return True
     return resolve_session_slug_for_claude_session_id(path.name, root=root) is None
+
+
+def _is_stale_t3_thread_pointer(path: Path, root: Path | str | None) -> bool:
+    if path.name.endswith(_ATOMIC_WRITE_TEMP_SUFFIX):
+        return _is_abandoned_temp_file(path)
+    if not _is_pointer_name_token(path.name):
+        return True
+    return resolve_session_slug_for_t3_thread(path.name, root=root) is None
+
+
+def _drop_t3_thread_pointer_if_stale(record: SessionRecord, root: Path | str | None) -> None:
+    """After a terminal write of *record*, unlink its thread's pointer unless a live record holds it.
+
+    A failed unlink is logged, never raised: the reap retries it.
+    """
+    display = record.display
+    if display is None or display.kind != DisplayKind.T3 or not display.t3_thread_id:
+        return
+    if not _is_pointer_name_token(display.t3_thread_id):
+        return
+    path = t3_thread_pointer_path(display.t3_thread_id, root=root)
+    if not _is_stale_t3_thread_pointer(path, root):
+        return
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning('t3 thread pointer drop failed: path=%s: %s', path, exc)
 
 
 def _reap_pointer_dir(
@@ -3043,7 +3117,11 @@ def reap_stale_session_pointers(root: Path | str | None = None) -> list[Path]:
     unreadable, or bound to another session id), so each such entry costs one
     record read.
 
-    In both dirs a temp file of ``_atomic_write_text`` is left to its writer
+    A ``sessions-by-t3-thread/`` entry is stale when its name is not a token
+    or ``resolve_session_slug_for_t3_thread`` finds no live t3 record of that
+    thread behind it, so each such entry costs one record read.
+
+    In every dir a temp file of ``_atomic_write_text`` is left to its writer
     until ``_POINTER_TEMP_FILE_GRACE`` has passed, so a sweep never unlinks it
     out from under a concurrent ``os.replace``.
 
@@ -3057,6 +3135,7 @@ def reap_stale_session_pointers(root: Path | str | None = None) -> list[Path]:
         *_reap_pointer_dir(
             claude_session_pointers_dir(root), _is_stale_claude_session_pointer, root
         ),
+        *_reap_pointer_dir(t3_thread_pointers_dir(root), _is_stale_t3_thread_pointer, root),
     ]
 
 
@@ -3109,6 +3188,7 @@ def _mark_exited_if_still_non_terminal(
     record.status = Status.EXITED
     record.exit_code = exit_code
     write_record(record, root=root)
+    _drop_t3_thread_pointer_if_stale(record, root)
     return record
 
 
@@ -5109,7 +5189,8 @@ def slug_root_from_record_dir(record_dir: str) -> tuple[str, Path]:
 
 def _run_exit(record_dir: str, code: int) -> None:
     slug, root = slug_root_from_record_dir(record_dir)
-    update_status(slug, root=root, status=Status.EXITED, exit_code=code)
+    record = update_status(slug, root=root, status=Status.EXITED, exit_code=code)
+    _drop_t3_thread_pointer_if_stale(record, root)
 
 
 def _run_refresh(record_dir: str, status_value: str) -> None:
