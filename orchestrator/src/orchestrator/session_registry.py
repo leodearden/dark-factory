@@ -3353,21 +3353,15 @@ def mark_t3_sessions_exited(
     and skipped, never fatal.
     """
     base = t3_thread_pointers_dir(root)
-    thread_ids = (
-        sorted(
-            path.name
-            for path in base.iterdir()
-            if not path.name.endswith(_ATOMIC_WRITE_TEMP_SUFFIX)
-        )
-        if base.is_dir()
-        else []
-    )
-    marked = [
-        slug
-        for thread_id in thread_ids
-        if thread_id not in listed_threads
-        and (slug := _mark_t3_session_gone(thread_id, environment_id, root, listed_at))
-    ]
+    entries = sorted(base.iterdir()) if base.is_dir() else []
+    thread_ids = [path.name for path in entries if not path.name.endswith(_ATOMIC_WRITE_TEMP_SUFFIX)]
+    marked: list[str] = []
+    for thread_id in thread_ids:
+        if thread_id in listed_threads:
+            continue
+        slug = _mark_t3_session_gone(thread_id, environment_id, root, listed_at)
+        if slug is not None:
+            marked.append(slug)
     logger.info(
         'mark_t3_sessions_exited: marked %d of %d indexed session(s) under %s',
         len(marked),
