@@ -48,10 +48,13 @@ import contextlib
 import logging
 import os
 import re
+from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
+import openai
 import pytest
 import pytest_asyncio
 from _fm_helpers import (
@@ -874,6 +877,76 @@ def test_the_live_config_runs_graphiti_on_the_configured_clients(mock_config):
         embedder.config.embedding_dim,
         embedder.config.api_key,
     ) == (config.embedder.model, config.embedder.dimensions, api_key)
+
+
+def _unreached_provider_skip_reason(exc: openai.APIError) -> str | None:
+    """The skip reason when *exc* shows the provider's connect phase timed out
+    before any response; None for every other failure.
+    """
+    return None
+
+
+async def _sdk_error(handler: Callable[[httpx.Request], httpx.Response]) -> openai.APIError:
+    """Make one real SDK call over *handler* and return the error the SDK raised."""
+    async with openai.AsyncOpenAI(
+        api_key='sk-hermetic-not-a-real-key',
+        max_retries=0,
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    ) as client:
+        with pytest.raises(openai.APIError) as excinfo:
+            await client.chat.completions.create(
+                model='gpt-4o-mini', messages=[{'role': 'user', 'content': 'x'}]
+            )
+    return excinfo.value
+
+
+def _connect_timeout(request: httpx.Request) -> httpx.Response:
+    raise httpx.ConnectTimeout('timed out', request=request)
+
+
+def _connect_error(request: httpx.Request) -> httpx.Response:
+    raise httpx.ConnectError('[Errno -3] Temporary failure in name resolution', request=request)
+
+
+def _read_timeout(request: httpx.Request) -> httpx.Response:
+    raise httpx.ReadTimeout('timed out', request=request)
+
+
+def _model_not_found(request: httpx.Request) -> httpx.Response:
+    return httpx.Response(
+        404,
+        json={
+            'error': {
+                'message': 'The model `gpt-4.1-nano` has been deprecated',
+                'type': 'invalid_request_error',
+                'param': None,
+                'code': 'model_not_found',
+            }
+        },
+        request=request,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_connect_timeout_reads_as_an_unreached_provider():
+    reason = _unreached_provider_skip_reason(await _sdk_error(_connect_timeout))
+
+    assert reason is not None
+    assert 'api.openai.com' in reason
+    assert 'ConnectTimeout' in reason
+
+
+@pytest.mark.parametrize(
+    'handler',
+    [
+        pytest.param(_connect_error, id='connect-error'),
+        pytest.param(_read_timeout, id='read-timeout'),
+        pytest.param(_model_not_found, id='model-not-found'),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_provider_failure_past_the_connect_phase_stays_red(handler):
+    assert _unreached_provider_skip_reason(await _sdk_error(handler)) is None
 
 
 @falkor_skipif()
