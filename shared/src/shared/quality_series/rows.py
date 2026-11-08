@@ -20,6 +20,8 @@ from shared.quality_series.git_lines import ModuleLines
 from shared.quality_series.landings import Landing, parse_utc
 
 __all__ = [
+    'IMPLEMENTER_CLASS_ROLES',
+    'Cost',
     'LandingRow',
     'Outcomes',
     'QualityRowInvariantError',
@@ -108,10 +110,41 @@ class Outcomes:
                    reverify_count=self.reverify_count, verify_failed_rows=self.verify_failed_rows)
 
 
+IMPLEMENTER_CLASS_ROLES = ('implementer', 'simple_task')
+
+TURNS_CAP_REASON = 'turns'
+"""shared/src/shared/cost_store.py::CapReason.TURNS, restated: that module is not stdlib-only."""
+
+
+@dataclass(frozen=True)
+class Cost:
+    """What the landing cost, over invocations started and task_results completed in its window."""
+
+    all_role_usd: float | None
+    by_role: tuple[tuple[str, float], ...]
+    implementer_invocations: int | None
+    execute_iterations: int | None
+    turns: int | None
+    turns_capped: bool
+
+    def __post_init__(self) -> None:
+        _invariant((self.all_role_usd is None) == (self.implementer_invocations is None),
+                   'all_role_usd and implementer_invocations are None together',
+                   all_role_usd=self.all_role_usd,
+                   implementer_invocations=self.implementer_invocations)
+        _invariant((self.all_role_usd is None) == (not self.by_role),
+                   'by_role is empty exactly when all_role_usd is None',
+                   all_role_usd=self.all_role_usd, by_role=self.by_role)
+        _invariant(self.turns is not None or not self.turns_capped,
+                   'a turns cap needs a turns count', turns=self.turns,
+                   turns_capped=self.turns_capped)
+
+
 @dataclass(frozen=True)
 class LandingRow:
     landing: Landing
     outcomes: Outcomes
+    cost: Cost
     modules: tuple[ModuleLines, ...]
     rule_vintage: SourceEpochs
 
@@ -173,6 +206,19 @@ SELECT task_id, timestamp, json_extract(data, '$.cycle'),
  WHERE event_type = 'review_completed' AND task_id IN ({})
 """
 _FLAKE_SQL = 'SELECT task_id, observed_at, verdict FROM flake_occurrence WHERE task_id IN ({})'
+_INVOCATIONS_SQL = 'SELECT task_id, started_at, role, cost_usd FROM invocations WHERE task_id IN ({})'
+_TURNS_SQL = f"""
+SELECT task_id, timestamp, json_extract(data, '$.turns'), json_extract(data, '$.capped_reason')
+  FROM events
+ WHERE event_type = 'invocation_end'
+   AND role IN ({', '.join(repr(role) for role in IMPLEMENTER_CLASS_ROLES)})
+   AND json_extract(data, '$.turns') IS NOT NULL
+   AND task_id IN ({{}})
+"""
+_EXECUTE_SQL = """
+SELECT task_id, completed_at, execute_iterations FROM task_results
+ WHERE completed_at IS NOT NULL AND completed_at != '' AND task_id IN ({})
+"""
 
 FLAKE_CONFIRMED = 'passes_in_isolation'
 FLAKE_REAL_RED = 'fails_in_isolation'
@@ -185,6 +231,18 @@ class _Review:
 
 
 @dataclass(frozen=True)
+class _Invocation:
+    role: str
+    cost_usd: float
+
+
+@dataclass(frozen=True)
+class _Turns:
+    turns: int
+    capped: bool
+
+
+@dataclass(frozen=True)
 class _Sources:
     """Everything rows_for reads from runs.db, loaded once per call."""
 
@@ -193,6 +251,9 @@ class _Sources:
     verifies: dict[str, _Timeline[bool]]
     reviews: dict[str, _Timeline[_Review]]
     flakes: dict[str, _Timeline[str]]
+    invocations: dict[str, _Timeline[_Invocation]]
+    turns: dict[str, _Timeline[_Turns]]
+    execute_iterations: dict[str, _Timeline[int]]
 
     @classmethod
     def load(cls, conn: sqlite3.Connection, task_ids: Sequence[str]) -> _Sources:
@@ -203,7 +264,17 @@ class _Sources:
             reviews=_timelines(conn, _REVIEW_SQL, task_ids,
                                lambda v: _Review(int(v[0]), bool(v[1]))),
             flakes=_timelines(conn, _FLAKE_SQL, task_ids, lambda v: str(v[0])),
+            invocations=_timelines(conn, _INVOCATIONS_SQL, task_ids,
+                                   lambda v: _Invocation(str(v[0]), float(v[1]))),
+            turns=_timelines(conn, _TURNS_SQL, task_ids,
+                             lambda v: _Turns(int(v[0]), v[1] == TURNS_CAP_REASON)),
+            execute_iterations=_timelines(conn, _EXECUTE_SQL, task_ids,
+                                          lambda v: int(v[0] or 0)),
         )
+
+    def window(self, timelines: dict[str, _Timeline[T]], landing: Landing) -> list[T]:
+        timeline = timelines.get(landing.task_id)
+        return [] if timeline is None else timeline.window(landing)
 
 
 def _members_window(
@@ -254,6 +325,32 @@ def _outcomes(sources: _Sources, unit: _UnitOutcomes, landing: Landing) -> Outco
     )
 
 
+def _usd_by_role(invocations: list[_Invocation]) -> tuple[tuple[str, float], ...]:
+    by_role: dict[str, float] = {}
+    for invocation in invocations:
+        by_role[invocation.role] = by_role.get(invocation.role, 0.0) + invocation.cost_usd
+    return tuple(sorted(by_role.items()))
+
+
+def _cost(sources: _Sources, landing: Landing) -> Cost:
+    epochs = sources.epochs
+    invocations = (sources.window(sources.invocations, landing)
+                   if _covers(epochs.invocations, landing) else [])
+    turns = (sources.window(sources.turns, landing)
+             if _covers(epochs.invocation_turns, landing) else [])
+    iterations = sources.window(sources.execute_iterations, landing)
+    by_role = _usd_by_role(invocations)
+    implementer = sum(1 for i in invocations if i.role in IMPLEMENTER_CLASS_ROLES)
+    return Cost(
+        all_role_usd=sum(usd for _, usd in by_role) if invocations else None,
+        by_role=by_role,
+        implementer_invocations=implementer if invocations else None,
+        execute_iterations=sum(iterations) if iterations else None,
+        turns=sum(t.turns for t in turns) if turns else None,
+        turns_capped=any(t.capped for t in turns),
+    )
+
+
 def _units(landings: Sequence[Landing]) -> list[tuple[Landing, ...]]:
     members: dict[str, list[Landing]] = {}
     for landing in landings:
@@ -276,6 +373,7 @@ def rows_for(
             LandingRow(
                 landing=member,
                 outcomes=_outcomes(sources, unit_outcomes, member),
+                cost=_cost(sources, member),
                 modules=(),
                 rule_vintage=sources.epochs,
             )
