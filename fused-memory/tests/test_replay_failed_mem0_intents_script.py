@@ -20,11 +20,14 @@ import pytest
 import pytest_asyncio
 from _fm_helpers import load_script_module
 from _mem0_intent_fixtures import mem0_intent_row, seed_mem0_intent
-from _store_mutation_preflight_contract import SENTINEL, deny, neutralise_fixture
+from _store_mutation_preflight_contract import (
+    deny,
+    fail_closed_records,
+    neutralise_fixture,
+)
 from mcp.types import CallToolResult, TextContent
 
 from fused_memory.services.write_journal import Mem0IntentStatus, WriteJournal
-from fused_memory.utils.store_mutation_preflight import StoreMutationUnavailable
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'replay_failed_mem0_intents.py'
 
@@ -408,9 +411,8 @@ def _statuses(data_dir: Path) -> dict[str, str]:
 
 
 class TestTheStoreMutationPreflight:
-    @pytest.mark.asyncio
-    async def test_a_refused_dry_run_leaves_the_journal_untouched(
-        self, tmp_path, monkeypatch
+    def test_a_refused_dry_run_fails_and_leaves_the_journal_untouched(
+        self, tmp_path, monkeypatch, caplog
     ):
         deny(_script, monkeypatch)
         data_dir = tmp_path / 'wj'
@@ -420,14 +422,14 @@ class TestTheStoreMutationPreflight:
             conn.execute('CREATE TABLE unmigrated (x INTEGER)')
         before = hashlib.sha256(db_path.read_bytes()).hexdigest()
 
-        with pytest.raises(StoreMutationUnavailable, match=SENTINEL):
-            await _script._run(
-                data_dir,
-                Selection(intent_ids=('x',)),
-                apply=False,
-                mcp_url='http://127.0.0.1:1/mcp',
-            )
+        code = _script.main([
+            '--journal-dir', str(data_dir),
+            '--intent-id', 'x',
+            '--mcp-url', 'http://127.0.0.1:1/mcp',
+        ])
 
+        assert code == _script.EXIT_RUN_FAILED
+        assert fail_closed_records(caplog, _script.logger.name)
         assert hashlib.sha256(db_path.read_bytes()).hexdigest() == before
         assert sorted(data_dir.iterdir()) == [db_path]
 
