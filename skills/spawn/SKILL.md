@@ -132,7 +132,7 @@ Callers do not need to scrub the namespace themselves — prefixing an invocatio
 
 - **Host.** The session is a T3 thread titled `<title>`, in the live T3 project whose workspace root contains `<cwd>` (the deepest one, from `t3_project_list`). `<cwd>` is either that root or a worktree T3 lists for the project, and the thread runs bound to it. No terminal, no sentinel, no `claude` argv.
 - **Transport.** The lane talks to T3's `/mcp` endpoint with this host's MCP credential. On the T3 host a missing or expired credential is self-paired through the local `t3` CLI. Elsewhere, or to repair one, run `spawn_t3_lane.py pair` (`pair --code <code>` off the T3 host); `spawn_t3_lane.py status` prints the credential's state. Both run as `PYTHONPATH=$DARK_FACTORY_ROOT/orchestrator/src python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/spawn_t3_lane.py <verb>`.
-- **Identity transport.** No env var reaches a T3 thread, so `$CLAUDE_SPAWN_SESSION_ID` and `$CLAUDE_SPAWN_RESULT_FILE` are **absent** inside a T3-spawned session. The registry record is linked by transcript discovery instead, and its `display.kind` is `t3` with `display.t3_thread_id` and `display.t3_environment_id`.
+- **Identity transport.** No `CLAUDE_SPAWN_*` env var reaches a T3 thread, so `$CLAUDE_SPAWN_SESSION_ID` and `$CLAUDE_SPAWN_RESULT_FILE` are **absent** inside a T3-spawned session. The registry record is bound through `T3CODE_THREAD_ID`, which T3 sets in the thread: the lane writes the record's thread pointer when it stamps the record, and the child's first SessionStart hook binds the record through it. Transcript discovery is the fallback. The record's `display.kind` is `t3` with `display.t3_thread_id` and `display.t3_environment_id`.
 - **Vocabularies.** `CLAUDE_SPAWN_MODEL` passes through as the thread's model (T3 resolves aliases). Permissions are the thread's runtime mode, picked by `skip_permissions`, not `--dangerously-skip-permissions`.
 - **Provider instance.** T3 takes a model only together with a provider instance, so a spawn with `CLAUDE_SPAWN_MODEL` runs on the first of: (1) `CLAUDE_SPAWN_T3_PROVIDER`, an instance id named for this launch (a per-launch input like `CLAUDE_SPAWN_MODEL`, scrubbed from the child); (2) the project's live Claude instance — the instance of its default model selection when that is an enabled Claude instance, else the only enabled Claude instance; (3) `claudeAgent`. Enablement and defaults are read from `$T3CODE_HOME/userdata/settings.json` (`orchestrator/src/orchestrator/spawn_t3_provider.py`); with no model the thread takes the project's default model and instance. `spawn_t3_lane.py provider --cwd <root>` prints the choice without launching.
 - **Self-exit.** When self-exit is on (see the `CLAUDE_SPAWN_SELF_EXIT` entry in [Arguments](#arguments)), the trailer asks the session to archive its own thread (`t3_thread_organize`, action `archive`) as its last action, in place of the `exit-requested` marker.
@@ -143,7 +143,7 @@ Callers do not need to scrub the namespace themselves — prefixing an invocatio
 
 | Mode | Script exit |
 |------|-------------|
-| `sibling` | `0`, but only after the thread leaves preparing/queued/starting and transcript discovery has run, bounded by the started grace (`SPAWN_STARTED_GRACE_SECS`, default 300s on this lane). It can take that long and still exit `0` with the record unbound; read the record and `result.md`. |
+| `sibling` | `0`, but only after the thread leaves preparing/queued/starting and the record binding (thread pointer, else transcript discovery) has run, bounded by the started grace (`SPAWN_STARTED_GRACE_SECS`, default 300s on this lane). It can take that long and still exit `0` with the record unbound; read the record and `result.md`. |
 | child, final `result.md` written (`outcome:` other than `in-progress`) or thread archived | `0` |
 | child, latest run failed / cancelled / interrupted, no newer run and no final `result.md` | `1` |
 | child, T3 unreachable beyond its grace | `126` |
@@ -162,8 +162,6 @@ PYTHONPATH=$DARK_FACTORY_ROOT/orchestrator/src python3 $DARK_FACTORY_ROOT/orches
 which prints `slug=<slug|none> parent=<slug|none>`. The result file is `<fleet_root>/sessions/<slug>/result.md`, with `fleet_root` = `$CLAUDE_FLEET_ROOT` if set, else `~/.claude/fleet`. `slug=none` means no record: skip fail-soft.
 
 **Hand-offs from inside T3.** A child-mode wait from inside a T3-hosted spawner is bounded by that spawner's own idle release (T3 releases an idle provider process after about 30 minutes, deferred while background work is pending, up to roughly 4 hours of silence). A hand-off that may run for hours should use `CLAUDE_SPAWN_MODE=sibling`.
-
-**Known identity gap.** After an idle release, a failed resume that binds a fresh session with a context handoff is not re-linked to the spawn record once the spawner has gone.
 
 ## Verification
 
