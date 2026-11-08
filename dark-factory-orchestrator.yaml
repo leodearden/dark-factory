@@ -1630,9 +1630,11 @@ merge_verify_max_concurrent_modules: 1
 # sha under gate_checkouts_path, cloned from df_checkout_path (task 6565). Both are
 # laptop paths and are restart-tier.
 # Laptop-side knobs live on leo-laptop, not here: its dark-factory-laptop.yaml sets
-# merge_verify_max_concurrent_modules: 1 and verify_use_cgroup_scope: true, and a systemd
-# drop-in caps each verify scope at MemoryMax=24G (a memory kill reports RED, not a
-# local fallback, until task 6106).
+# merge_verify_max_concurrent_modules: 1 and verify_use_cgroup_scope: true, and each
+# laptop verify scope takes its memory limits from that yaml's verify_cgroup_memory
+# (task 6106; ruled 2026-10-09 as MemoryHigh 24G, MemoryMax 40G, MemorySwapMax 32G),
+# replacing the earlier per-scope systemd drop-ins. A memory-killed leg is a no-verdict
+# that falls back to local (task 6667).
 # TRUST-ANCHOR TRADE-OFF, EYES OPEN: prefer-local existed because local is the trust
 # anchor (a laptop false green landed a red commit, #5120). Under prefer_remote nearly
 # every verdict is a REMOTE verdict, so verify_drift_check_every_n_lands is the
