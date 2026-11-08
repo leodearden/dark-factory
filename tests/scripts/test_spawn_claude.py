@@ -25,37 +25,17 @@ from typing import Any
 
 import pytest
 
-REPO_ROOT = pathlib.Path(__file__).parents[2]
-SPAWN_SCRIPT = REPO_ROOT / "skills" / "spawn" / "spawn-claude.sh"
+# orchestrator/src goes FIRST, ahead of any editable install pointing at a
+# different checkout, so `orchestrator.session_registry` is the module
+# spawn-claude.sh itself invokes by absolute path (task 2285). The repo root
+# and orchestrator/tests/cross_suite_helpers (the t3-lane section's fake T3
+# server) are APPENDED, never inserted: see the root conftest.py. Bare
+# module-level calls, because ruff exempts exactly that shape from E402.
+sys.path.insert(0, str(pathlib.Path(__file__).parents[2] / "orchestrator" / "src"))
+sys.path.append(str(pathlib.Path(__file__).resolve().parents[2]))
+sys.path.append(str(pathlib.Path(__file__).resolve().parents[2] / "orchestrator" / "tests" / "cross_suite_helpers"))
 
-# Insert this worktree's orchestrator/src onto sys.path (ahead of any
-# editable install pointing at a different checkout) so `import
-# orchestrator.session_registry` resolves to the module spawn-claude.sh
-# itself invokes by absolute path (task 2285) -- letting this file assert
-# in-process against the exact same record/reap contract. Also gives the
-# task-2298 (Fleet Cockpit C7) two-way boundary test direct, in-process
-# access to session_hooks.run_session_start -- the already-landed C1/C2
-# consumer of the CLAUDE_SPAWN_PARENT_ID this file's sibling-mode tests
-# export.
-_ORCH_SRC = REPO_ROOT / "orchestrator" / "src"
-if str(_ORCH_SRC) not in sys.path:
-    sys.path.insert(0, str(_ORCH_SRC))
-
-# APPEND, never insert(0, ...): the repo root must stay LAST on sys.path or the
-# subproject directories (orchestrator/, shared/, ...) resolve as namespace
-# packages shadowing their own src/<pkg>/ -- the failure the root conftest.py
-# docstring exists to prevent. Mirrors the same block in
-# tests/scripts/test_orchestrator_watchdog.py and
-# tests/scripts/test_fleet_dir_isolation.py. Needed here because
-# --import-mode=importlib does not put a test module's own tree on sys.path.
-if str(REPO_ROOT.resolve()) not in sys.path:
-    sys.path.append(str(REPO_ROOT.resolve()))
-# The t3-lane section's fake T3 server, appended for the same reason.
-_ORCH_TESTS = REPO_ROOT.resolve() / "orchestrator" / "tests"
-if str(_ORCH_TESTS) not in sys.path:
-    sys.path.append(str(_ORCH_TESTS))
-
-from _fake_t3_server import (  # noqa: E402  # pyright: ignore[reportMissingImports]  # debt: ticket tkt_0RWM91VJZ090GZN83A13S8E9N7
+from _fake_t3_server import (
     DEAD_ORIGIN,
     ENVIRONMENT_ID,
     FakeT3Server,
@@ -69,17 +49,17 @@ from _fake_t3_server import (  # noqa: E402  # pyright: ignore[reportMissingImpo
 # of this file so scripts/tests/ could reach it); aliased back to the local
 # name every call site below already uses. See the task-2733 section comment
 # further down for the history and the reason it is load-scaled at all.
-from df_pytest_isolation import (  # noqa: E402
+from df_pytest_isolation import (
     load_scaled_grace as _load_scaled_grace,
 )
-
-# noqa must sit on the STATEMENT's first line: E402 is reported at the start of
-# the import, so the per-name noqas ruff's I001 fix left on lines below suppress
-# nothing. The pyright ignores stay per-name, where each attribute is flagged.
-from orchestrator import (  # noqa: E402
+from orchestrator import (
     session_hooks,  # pyright: ignore[reportAttributeAccessIssue]
     session_registry,  # pyright: ignore[reportAttributeAccessIssue]
 )
+
+REPO_ROOT = pathlib.Path(__file__).parents[2]
+SPAWN_SCRIPT = REPO_ROOT / "skills" / "spawn" / "spawn-claude.sh"
+_ORCH_SRC = REPO_ROOT / "orchestrator" / "src"
 
 # Branch routing: the script dispatches on the first word of $CLAUDE_TERMINAL_CMD.
 FOREGROUND_NAMES = ["gnome-terminal", "xterm", "kitty"]
@@ -4966,9 +4946,10 @@ def test_payload_publishes_sentinel_by_atomic_rename(tmp_path: pathlib.Path) -> 
 # task 7489: CLAUDE_SPAWN_BACKEND vocabulary and the t3 lane
 # ===========================================================================
 # The t3 lane drives orchestrator/src/orchestrator/spawn_t3_lane.py, which
-# reaches T3 over /mcp. Here T3 is orchestrator/tests/_fake_t3_server.py's
-# FakeT3Server, named by server-runtime.json and paired with this host; the
-# _T3Lane responders answer in T3 Code v0.1.6's shapes and, on
+# reaches T3 over /mcp. Here T3 is
+# orchestrator/tests/cross_suite_helpers/_fake_t3_server.py's FakeT3Server,
+# named by server-runtime.json and paired with this host; the _T3Lane
+# responders answer in T3 Code v0.1.6's shapes and, on
 # t3_thread_launch, play the child: a transcript carrying the message (which
 # names the record dir) and, when asked, a final result.md.
 
