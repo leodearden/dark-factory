@@ -858,7 +858,10 @@ Choose one of these based on the analysis:
   ```
   resolve_issue(escalation_id="<id>", resolution="<reason for restart>", action='restart', resolved_by="interactive", resolution_turns=<N>)
   ```
-  Then create or update tasks as needed. Task goes to `pending`.
+  Then create or update tasks as needed. Task goes to `pending`. A plain restart reuses the branch, worktree and plan, so a recent plan can skip the architect entirely. When the plan or branch itself is wrong, add `recut=True`: the next dispatch parks the old incarnation (nothing is deleted) and re-plans on current main. See `escalation/src/escalation/server.py::resolve_issue` and `orchestrator/src/orchestrator/recut_ruling.py`.
+  ```
+  resolve_issue(escalation_id="<id>", resolution="<reason for re-cut>", action='restart', recut=True, resolved_by="interactive", resolution_turns=<N>)
+  ```
 
 **Turn counting:** `<N>` is the number of user messages since this skill was invoked (count each time the user sent a message, starting from the `/unblock` invocation). This tracks how much human attention the resolution required. If you lose count, estimate conservatively.
 
