@@ -42,6 +42,9 @@ ALLOWED_IMPORTERS: Mapping[str, Allowed] = MappingProxyType({
     'fused-memory/src/fused_memory/middleware/task_curator.py': Allowed('reader (γ)', _DECISION_8),
     'scripts/followup_filing_shape_report.py': Allowed('reader (θ)', _DECISION_8),
     'fused-memory/src/fused_memory/middleware/followup_packing.py': Allowed('reader (packing P0)', _PACKING_PRD),
+    'fused-memory/src/fused_memory/middleware/curator_types.py': Allowed(
+        'reader (γ: pool and candidate render)', _DECISION_8,
+    ),
 })
 
 _PENDING: Mapping[str, str] = MappingProxyType({

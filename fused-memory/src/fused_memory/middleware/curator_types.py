@@ -11,10 +11,12 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Final, Literal
 
-from shared.followup_items import FollowupItem
+from shared.declared_scope import DECLARED_SCOPE_METADATA_KEY, DeclaredScope
+from shared.followup_items import FollowupBundleInvalid, FollowupItem, read_items
 from shared.task_statuses import TaskStatus
 
 from fused_memory.middleware.curation_deferral import DeferReason, deferral_justification
+from fused_memory.middleware.followup_hold import is_holder
 from fused_memory.utils.clip_disclosure import elide_text
 
 
@@ -129,6 +131,8 @@ class CandidateTask:
     execution_class: str | None = None
     # metadata.followup_items (plans/follow-up-filing-shape-prd.md §4.1); part of payload_hash.
     items: tuple[FollowupItem, ...] = ()
+    # The submit stamp (§4.2). Not hashed: it is derived from fields already hashed.
+    declared_scope: DeclaredScope | None = None
 
     def payload_hash(self) -> str:
         """Stable hash over the fields a curator decision depends on.
@@ -453,6 +457,8 @@ class PoolEntry:
     priority: str
     source: str  # one of POOL_SOURCES
     combine_eligible: bool
+    item_count: int = 0
+    declared_scope: DeclaredScope | None = None
 
     def render(self, desc_cap: int, details_cap: int) -> str:
         """Render this entry as a human-readable block for the LLM prompt.
@@ -465,12 +471,49 @@ class PoolEntry:
         files = ', '.join(self.files_to_modify) if self.files_to_modify else '(none)'
         return (
             f'[Task {self.task_id}] status={self.status} priority={self.priority} '
-            f'source={self.source} combine_eligible={self.combine_eligible}\n'
+            f'source={self.source} combine_eligible={self.combine_eligible} '
+            f'followup_items={self.item_count}\n'
             f'  title: {self.title}\n'
             f'  description: {desc}\n'
             f'  details: {det}\n'
-            f'  files_to_modify: {files}'
+            f'  files_to_modify: {files}\n'
+            f'  declared_scope: {render_declared_scope(self.declared_scope)}'
         )
+
+
+# How an absent stamp reads to the LLM: no information, never 'undeclared' (PRD §4.2). The pack
+# judge renders the same word, since both prompts share task_curator.py::_CURATOR_HEURISTICS.
+UNSTAMPED_BAND: Final = 'unstamped'
+
+
+def render_declared_scope(scope: DeclaredScope | None) -> str:
+    """The one rendering of a declared-scope stamp, for pool entries and candidates alike."""
+    if scope is None:
+        return UNSTAMPED_BAND
+    return f'{scope.band} (files={scope.files}, text_chars={scope.text_chars}, basis={scope.basis})'
+
+
+def declared_scope_of(metadata: Mapping[str, Any]) -> DeclaredScope | None:
+    """The stored stamp as its record; None when it is absent or is not a valid stamp."""
+    stored = metadata.get(DECLARED_SCOPE_METADATA_KEY)
+    if not isinstance(stored, Mapping):
+        return None
+    try:
+        return DeclaredScope.model_validate(stored)
+    except ValueError:
+        return None
+
+
+def item_count_of(metadata: Mapping[str, Any]) -> int:
+    """How many items ``metadata.followup_items`` holds; 0 when it is absent or malformed.
+
+    The same reading ``task_interceptor.py::_candidate_items`` gives ``CandidateTask.items``, so
+    the pool and candidate sides count a list alike.
+    """
+    try:
+        return len(read_items(metadata))
+    except FollowupBundleInvalid:
+        return 0
 
 
 def embedding_text(title: str, description: str, files_to_modify: list[str]) -> str:
@@ -508,13 +551,25 @@ def clip_for_prompt(text: str, cap: int) -> str:
     return elide_text(text, cap, field='curator_prompt').text
 
 
+def is_combine_eligible(task: Mapping[str, Any]) -> bool:
+    """The single combine-eligibility predicate over a stored task row.
+
+    Called from BOTH the curator's selection snapshot
+    (``task_curator.py::_to_pool_entry``) and the interceptor's execution-time
+    combine guard (``task_interceptor.py::TaskInterceptor._execute_combine``).
+    A follow-up holder is never a combine target (PRD §4.3, decision 10), and it
+    stays pending forever, so the status axis alone never refuses it.
+    """
+    return is_combine_eligible_status(str(task.get('status') or '')) and not is_holder(task)
+
+
 def is_combine_eligible_status(status: str) -> bool:
     """Single source of truth for combine STATUS eligibility (task 4035).
 
-    Called from BOTH the curator's selection snapshot
-    (``_to_pool_entry.combine_eligible``) and the interceptor's
-    execution-time combine guard (``_execute_combine``). Keeping one
-    definition is the point: the two sites previously hand-copied
+    Reached through :func:`is_combine_eligible` from BOTH the curator's
+    selection snapshot (``_to_pool_entry.combine_eligible``) and the
+    interceptor's execution-time combine guard (``_execute_combine``).
+    Keeping one definition is the point: the two sites previously hand-copied
     ``status == 'pending'`` and silently diverged, letting 20.2% of combines
     land on non-pending targets mid-planning.
 
