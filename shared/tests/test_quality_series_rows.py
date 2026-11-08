@@ -10,12 +10,14 @@ import pytest
 from quality_series_fixtures import LandingScenario, at_hour, build_landing_scenario
 
 from shared.quality_series import LandingRow, landings, rows_for, unit_heads
+from shared.quality_series.git_lines import landed_lines
 from shared.quality_series.rows import (
     CharterClass,
     CharterClassSource,
     ReviewRoundsSource,
     SourceEpochs,
     UnknownCharterClass,
+    module_allocation,
 )
 
 POST_MERGE = 'post_merge_verify'
@@ -374,3 +376,69 @@ class TestCharterClassColumn:
             _rows(s)
         assert 'bogus' in str(excinfo.value)
         assert '102' in str(excinfo.value)
+
+
+class TestLines:
+    def _expect(self, row: LandingRow, repo: Path, base: str, sha: str) -> None:
+        lines = landed_lines(repo, base, sha, timeout_s=60)
+        assert (row.cost.code_lines, row.cost.src_lines, row.cost.test_lines) == (
+            lines.code_lines, lines.src_lines, lines.test_lines,
+        )
+        assert row.modules == lines.modules
+
+    def test_a_merge_is_measured_against_its_first_parent(self, outcomes_scenario, outcome_rows):
+        s = outcomes_scenario
+        self._expect(outcome_rows[('101', s.m1)], s.repo.root, s.c0, s.m1)
+
+    def test_train_members_carry_the_merge_commits_lines(self, outcomes_scenario, outcome_rows):
+        s = outcomes_scenario
+        for task in ('103', '104', '105'):
+            self._expect(outcome_rows[(task, s.m3)], s.repo.root, s.f2, s.m3)
+
+    def test_a_fast_forward_landing_is_measured_against_the_previous_landing(
+        self, outcomes_scenario, outcome_rows
+    ):
+        s = outcomes_scenario
+        self._expect(outcome_rows[('102', s.f2)], s.repo.root, s.m1, s.f2)
+
+    def test_an_off_first_parent_landing_is_unmeasurable(self, outcomes_scenario, outcome_rows):
+        row = outcome_rows[('106', outcomes_scenario.side)]
+        assert (row.cost.code_lines, row.cost.src_lines, row.cost.test_lines) == (None, None, None)
+        assert row.modules == ()
+
+
+class TestGitBudget:
+    def test_a_spent_budget_still_measures_the_first_unit_whole(self, outcomes_scenario):
+        s = outcomes_scenario
+        batch = landings(s.db.conn, s.repo.root, since_cursor=None).landings
+        rows = rows_for(batch[2:], s.db.conn, s.repo.root, git_budget_s=0)
+        assert [(r.landing.task_id, r.landing.merge_sha) for r in rows] == [
+            ('103', s.m3), ('104', s.m3), ('105', s.m3),
+        ]
+        assert all(r.cost.code_lines is not None for r in rows)
+
+    def test_resuming_with_the_rest_continues_from_the_next_unit(
+        self, outcomes_scenario, outcome_rows
+    ):
+        s = outcomes_scenario
+        remaining = landings(s.db.conn, s.repo.root, since_cursor=None).landings
+        measured: list[LandingRow] = []
+        while remaining:
+            rows = rows_for(remaining, s.db.conn, s.repo.root, git_budget_s=0)
+            assert rows, 'every call makes progress'
+            assert rows[0].landing == remaining[0]
+            measured.extend(rows)
+            remaining = remaining[len(rows):]
+        assert _by_key(measured) == outcome_rows
+
+
+class TestModuleAllocation:
+    def test_shares_follow_src_lines_and_sum_to_one(self, outcomes_scenario, outcome_rows):
+        row = outcome_rows[('105', outcomes_scenario.m3)]
+        allocation = module_allocation(row)
+        assert [module for module, _ in allocation] == [m.module for m in row.modules]
+        assert sum(share for _, share in allocation) == pytest.approx(1.0)
+        assert len(allocation) == 2
+
+    def test_no_src_lines_allocates_nothing(self, outcomes_scenario, outcome_rows):
+        assert module_allocation(outcome_rows[('106', outcomes_scenario.side)]) == ()
