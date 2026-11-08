@@ -52,6 +52,13 @@ from shared.scheduler_state import (
 )
 from shared.task_claimant import has_live_claimant, is_stranded_blocked
 from shared.task_metadata_wire import coerce_task_metadata
+from shared.task_read import (
+    TaskAbsent,
+    TaskFound,
+    TaskRead,
+    TaskReadFailed,
+    parse_get_task_result,
+)
 from shared.task_statuses import TaskStatus
 from shared.task_submit import SubmitFailed, SubmitOutcome, parse_submit_task_result
 
@@ -2737,8 +2744,15 @@ class Scheduler:
         A fused-memory error reply (``{'error', 'error_type'}``:
         TaskNotFoundError for a deleted task, INVALID_TASK_ID for a
         non-numeric id, server faults) is never a task row. Callers that must
-        tell absence from failure read through
-        ``orchestrator/src/orchestrator/chronic_flake.py::SchedulerChronicFlakeTaskClient.get_task``.
+        tell absence from failure call :meth:`read_task`.
+        """
+        read = await self.read_task(task_id)
+        return read.task if isinstance(read, TaskFound) else None
+
+    async def read_task(self, task_id: str) -> TaskRead:
+        """Read one task for a caller that must tell absence from failure.  Never raises.
+
+        The outcome taxonomy lives in ``shared/src/shared/task_read.py``.
         """
         try:
             result = await self.dispatch_tool(
@@ -2751,19 +2765,15 @@ class Scheduler:
                 'Failed to get task %s: %s: %s',
                 task_id, type(e).__name__, e,
             )
-            return None
-        task, parse_err = parse_tool_result(result, None, dict)
-        if parse_err is not None or task is None:
-            return None
-        if 'error' in task:
-            logger.warning(
-                'get_task(%s): fused-memory answered with an error reply, not a task row '
-                '(error_type=%s): %.200s — returning None',
-                task_id, task.get('error_type'), task.get('error'),
-            )
-            return None
-        self._normalize_task_metadata(task)
-        return task
+            return TaskReadFailed(f'get_task dispatch raised {type(e).__name__}: {e}')
+        read = parse_get_task_result(result)
+        if isinstance(read, TaskFound):
+            self._normalize_task_metadata(read.task)
+        elif isinstance(read, TaskAbsent):
+            logger.info('get_task(%s): fused-memory reports no such task', task_id)
+        else:
+            logger.warning('get_task(%s): could not read the task: %.300s', task_id, read.reason)
+        return read
 
     async def submit_task(self, arguments: dict, *, timeout: float = 30) -> SubmitOutcome:
         """Submit one task to fused-memory and return its typed outcome.
