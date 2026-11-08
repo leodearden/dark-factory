@@ -31,6 +31,7 @@ from _curator_helpers import make_config as _make_config
 from _curator_helpers import pool_with_ids as _pool_with_ids
 from _curator_helpers import prepared as _bundle
 from shared.cli_invoke import AgentResult, no_mcp_servers_config
+from shared.declared_scope import derive_declared_scope
 from shared.followup_items import observed_item
 from shared.neutral_cwd import neutral_cli_cwd
 from shared.prompt_artifact import (
@@ -1495,14 +1496,22 @@ class TestStartupSelfCheck:
         assert await curator.startup_self_check(project_id='p', project_root='/x') is False
 
 
+_GOLDEN_FILES = ['src/parser.py', 'tests/test_parser.py']
 _GOLDEN_CANDIDATE = CandidateTask(
     title='Fix the parser',
     description='The parser drops trailing commas.',
     details='See parser.py::parse_list.',
-    files_to_modify=['src/parser.py', 'tests/test_parser.py'],
+    files_to_modify=_GOLDEN_FILES,
     priority='high',
     spawned_from='4242',
     spawn_context='review',
+    items=(
+        observed_item(summary='The parser drops trailing commas', files=['src/parser.py'], origin_task='4242'),
+        observed_item(summary='No test covers a trailing comma', files=['tests/test_parser.py'], origin_task='4242'),
+    ),
+    declared_scope=derive_declared_scope(
+        _GOLDEN_FILES, 'The parser drops trailing commas.', 'See parser.py::parse_list.', basis='submit',
+    ),
 )
 _GOLDEN_CENSUS = PoolWithheld(
     by_source={'module': 5},
@@ -1520,21 +1529,25 @@ _GOLDEN_SINGLE_PROMPT = (
     '  description: The parser drops trailing commas.\n'
     '  details: See parser.py::parse_list.\n'
     '  files_to_modify: src/parser.py, tests/test_parser.py\n'
+    '  declared_scope: narrow (files=2, text_chars=59, basis=submit)\n'
+    '  followup_items: 2\n'
     '\n'
     '# Pool (2 tasks)\n'
     '[Task 10] status=pending priority=medium source=module '
-    'combine_eligible=True\n'
+    'combine_eligible=True followup_items=0\n'
     '  title: t\n'
     '  description: \n'
     '  details: \n'
     '  files_to_modify: (none)\n'
+    '  declared_scope: unstamped\n'
     '\n'
     '[Task 11] status=done priority=medium source=module '
-    'combine_eligible=False\n'
+    'combine_eligible=False followup_items=0\n'
     '  title: t\n'
     '  description: \n'
     '  details: \n'
     '  files_to_modify: (none)\n'
+    '  declared_scope: unstamped\n'
     '\n'
     'pool_truncated: {"caps": {"dependency": 3, "embedding": 10, "module": '
     '15, "total_cap": 30}, "withheld": {"module": 5}}\n'
@@ -1557,21 +1570,25 @@ _GOLDEN_BATCH_PROMPT = (
     '  description: The parser drops trailing commas.\n'
     '  details: See parser.py::parse_list.\n'
     '  files_to_modify: src/parser.py, tests/test_parser.py\n'
+    '  declared_scope: narrow (files=2, text_chars=59, basis=submit)\n'
+    '  followup_items: 2\n'
     '\n'
     '# Pool for batch_index=0 (2 tasks)\n'
     '[Task 10] status=pending priority=medium source=module '
-    'combine_eligible=True\n'
+    'combine_eligible=True followup_items=0\n'
     '  title: t\n'
     '  description: \n'
     '  details: \n'
     '  files_to_modify: (none)\n'
+    '  declared_scope: unstamped\n'
     '\n'
     '[Task 11] status=done priority=medium source=module '
-    'combine_eligible=False\n'
+    'combine_eligible=False followup_items=0\n'
     '  title: t\n'
     '  description: \n'
     '  details: \n'
     '  files_to_modify: (none)\n'
+    '  declared_scope: unstamped\n'
     '\n'
     'pool_truncated: {"caps": {"dependency": 3, "embedding": 10, "module": '
     '15, "total_cap": 30}, "withheld": {"module": 5}}\n'
@@ -1586,6 +1603,8 @@ _GOLDEN_BATCH_PROMPT = (
     '  title: Add a lint rule\n'
     '  priority: medium\n'
     '  spawn_context: manual\n'
+    '  declared_scope: unstamped\n'
+    '  followup_items: 0\n'
     '\n'
     '# Pool for batch_index=1 (0 tasks)\n'
     '  (empty — no candidates; answer "create")\n'
