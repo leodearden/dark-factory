@@ -33,6 +33,7 @@ from shared.before_done_paths import (
     resolve_before_done_paths,
     resolve_script_base,
 )
+from shared.milestone_rearm import rearmed_milestone
 from shared.repo_paths import DARK_FACTORY_ROOT_ENV, resolve_dark_factory_root
 from shared.task_metadata import (
     HUMAN_CURATOR_ADJUDICATED_AT_KEY,
@@ -2074,8 +2075,9 @@ class DeterministicRunner:
         - ``rc == 75`` (``os.EX_TEMPFAIL``) on a gate declaring
           ``before_done.recheck_secs`` with a dated milestone -> "not yet"
           (PRD ``plans/completion-driven-triggers-prd.md`` C1): ONE merge
-          write advances ``milestone.at`` by ``recheck_secs`` and stamps the
-          streak record and verdict, then a best-effort ``pending`` ->
+          write advances ``milestone.at`` by ``recheck_secs``, keeping the
+          link's scheduled fire time (``shared.milestone_rearm``), and
+          stamps the streak record and verdict, then a best-effort ``pending`` ->
           ``WorkflowOutcome.REQUEUED``.  A refused write files the
           no-verdict category and blocks instead.  The 75 that brings the
           streak to ``deterministic.predicate_recheck_stall_cap`` does not
@@ -2405,7 +2407,7 @@ class DeterministicRunner:
         recheck_secs: int,
         no_verdict_category: str,
     ) -> WorkflowOutcome:
-        """Advance the dated ``milestone.at`` to *record*'s next check and re-pend.
+        """Advance ``milestone.at`` to *record*'s next check, keep the fire time, re-pend.
 
         ONE merge write carries the advanced milestone, the streak record and
         the verdict.  It comes first, so a lost trailing status write leaves a
@@ -2415,7 +2417,7 @@ class DeterministicRunner:
         """
         next_check_at = record.next_check_at.isoformat()
         stamps = {
-            'milestone': {**metadata['milestone'], 'at': next_check_at},
+            'milestone': rearmed_milestone(metadata['milestone'], next_check_at),
             **verdict_stamps(metadata, verdict, record, always_stamp_verdict=True),
         }
         if not await self.scheduler.update_task(task_id, stamps, metadata_mode='merge'):
