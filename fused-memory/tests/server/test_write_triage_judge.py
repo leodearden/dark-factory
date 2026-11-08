@@ -3039,6 +3039,53 @@ class TestTheLiveWordingBudgetGuard:
 
         assert excinfo.value is error
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'error',
+        [
+            openai.InternalServerError(
+                'boom', response=httpx.Response(500, request=_RESPONSES_REQUEST), body=None,
+            ),
+            openai.RateLimitError(
+                'slow down', response=httpx.Response(429, request=_RESPONSES_REQUEST), body=None,
+            ),
+        ],
+        ids=['provider-5xx', 'provider-429'],
+    )
+    async def test_a_retryable_provider_status_skips_naming_it(
+        self, error: openai.APIStatusError,
+    ) -> None:
+        client = sdk_client_double()
+        client.responses.create = AsyncMock(side_effect=error)
+        with patch('openai.AsyncOpenAI', return_value=client), \
+                pytest.raises(pytest.skip.Exception) as excinfo:
+            await _live_judge_verdict(**self._judge_kwargs())
+
+        reason = str(excinfo.value)
+        assert type(error).__name__ in reason
+        assert str(error.status_code) in reason
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'error',
+        [
+            openai.BadRequestError(
+                'bad', response=httpx.Response(400, request=_RESPONSES_REQUEST), body=None,
+            ),
+        ],
+        ids=['provider-400'],
+    )
+    async def test_a_non_retryable_provider_status_stays_red(
+        self, error: openai.APIStatusError,
+    ) -> None:
+        client = sdk_client_double()
+        client.responses.create = AsyncMock(side_effect=error)
+        with patch('openai.AsyncOpenAI', return_value=client), \
+                _raises_without_skipping(type(error)) as excinfo:
+            await _live_judge_verdict(**self._judge_kwargs())
+
+        assert excinfo.value is error
+
 
 @pytest.mark.integration
 @pytest.mark.skipif(
