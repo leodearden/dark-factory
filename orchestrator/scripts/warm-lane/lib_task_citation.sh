@@ -17,8 +17,9 @@
 # reappears.
 #
 # The grammar — a message cites <id> iff ANY of:
-#   * a line of it is `Merge <prefix><id> into …` (grep's `^` is a LINE anchor;
-#     see Block B of the test suite for why that is kept);
+#   * a line of it begins `<merge_head_re><id><merge_into_re>`, the merge arm
+#     the caller passes in (grep's `^` is a LINE anchor; see Block B of the
+#     test suite for why that is kept);
 #   * its SUBJECT is a conventional-commit head citing <id>: `<kind>(<id>)` /
 #     `<kind>(<id>:`, or — for a non-empty prefix — `<kind>` followed later in
 #     the subject by `<prefix><id>`, where <kind> is dark-factory's closed list.
@@ -33,8 +34,10 @@
 # Relationship to dark-factory — measured, not assumed. dark-factory's
 # normative pattern is orchestrator/git_ops.py DEFAULT_COMMIT_CITATION_PATTERN,
 # applied to the SUBJECT only (its task 2675). Arm by arm:
-#   * merge-subject arm — agrees with DF's `^Merge task/{tid} into `
-#     alternative, and with find_merge_marker's unanchored search.
+#   * merge-subject arm — the line form (`'^' + head + id + into`) of
+#     shared/src/shared/merge_subject.py::rendered_prefix, passed in by the
+#     caller. A superset of DF's anchored `{merge_subject}` alternative: it
+#     also accepts a suffixed subject and any target branch.
 #   * conventional-commit arm — mirrors DF's first alternative, kind list and
 #     `[):]` terminator included, for the default prefix `task/` (DF hardcodes
 #     `task/` there; this arm takes the caller's prefix, and drops the
@@ -58,7 +61,9 @@
 # parameters. No git invocation, no caller global (REPO_DIR, BRANCH_PREFIX_RE
 # and friends are passed in, never read), no argv parsing, no `set -e` /
 # `pipefail` side effect on a sourcing script, no stdout beyond the documented
-# result. That is what makes this file safe to `source` from anywhere.
+# result. That is what makes this file safe to `source` from anywhere. The
+# merge arm's head and into are parameters too, and this file does not validate
+# them: its caller renders and checks them.
 #
 # The converse of that contract is the reason for the feeding idiom below: this
 # file does not set `pipefail`, but every consumer does, so a pipeline's status
@@ -74,9 +79,11 @@
 # Block G of tests/infra/test_lib_task_citation.sh pins this.
 #
 # Exports exactly three functions:
-#   task_citation_regex_escape  <string>                       -> escaped (stdout)
-#   task_citation_message_cites <message> <id> <escaped_prefix> -> exit 0/1
-#   task_citation_peer_ids      <message> <escaped_prefix>      -> ids (stdout)
+#   task_citation_regex_escape  <string>                                  -> escaped (stdout)
+#   task_citation_message_cites <message> <id> <escaped_prefix> <merge_head_re> <merge_into_re>
+#                                                                         -> exit 0/1
+#   task_citation_peer_ids      <message> <escaped_prefix> <merge_head_re> <merge_into_re>
+#                                                                         -> ids (stdout)
 
 # Source guard — prevent double-sourcing when two consumers meet in one shell.
 if [ "${_REIFY_LIB_TASK_CITATION_SH_SOURCED:-}" = "1" ]; then
@@ -93,7 +100,7 @@ _TASK_CITATION_KINDS='(merge|impl|amend|fix|test|feat|chore|docs|refactor|style|
 # task_citation_regex_escape <string>
 # Escapes ERE metacharacters in <string> (anything outside [a-zA-Z0-9_]) so it
 # can be safely interpolated into a `grep -E` pattern as a literal. Guards the
-# merge-subject check below against a caller-supplied branch prefix containing
+# conventional-commit check below against a caller-supplied branch prefix containing
 # regex metacharacters (e.g. "." or "+"), which would otherwise be interpreted
 # as regex syntax instead of matched literally. Prints the escaped string with
 # no trailing newline.
@@ -101,9 +108,11 @@ task_citation_regex_escape() {
     printf '%s' "$1" | sed -e 's/[^a-zA-Z0-9_]/\\&/g'
 }
 
-# task_citation_message_cites <message> <id> <escaped_prefix>
+# task_citation_message_cites <message> <id> <escaped_prefix> <merge_head_re> <merge_into_re>
 # True iff <message> cites task <id> under the grammar documented above.
-# <escaped_prefix> must already have been through task_citation_regex_escape.
+# <escaped_prefix> must already have been through task_citation_regex_escape;
+# <merge_head_re> / <merge_into_re> are shared.merge_subject.rendered_prefix's
+# ERE (head, into) for the same prefix.
 #
 # This function is the single ARBITER of the grammar: task_citation_peer_ids
 # below offers it a provably complete candidate set and defers every verdict
@@ -115,8 +124,9 @@ task_citation_regex_escape() {
 # `[A-Za-z]` also matches letters such as 'é', so the id boundary would
 # otherwise depend on the caller's environment.
 task_citation_message_cites() {
-    local msg="$1" id="$2" prefix_re="$3" line subject="" kind_ref
-    if grep -qE "^Merge ${prefix_re}${id} into " <<<"$msg"; then
+    local msg="$1" id="$2" prefix_re="$3" merge_head_re="$4" merge_into_re="$5"
+    local line subject="" kind_ref
+    if grep -qE "^${merge_head_re}${id}${merge_into_re}" <<<"$msg"; then
         return 0
     fi
     while IFS= read -r line; do
@@ -138,7 +148,7 @@ task_citation_message_cites() {
     return 1
 }
 
-# task_citation_peer_ids <message> <escaped_prefix>
+# task_citation_peer_ids <message> <escaped_prefix> <merge_head_re> <merge_into_re>
 # Prints every task id <message> cites, one per line, numerically sorted and
 # de-duplicated; prints nothing when it cites none. No id-width restriction —
 # the grammar is digit-boundary-delimited, not width-delimited.
@@ -154,7 +164,7 @@ task_citation_message_cites() {
 # yielded nothing), and before that it fused a digit-bearing prefix onto the
 # id. The enumeration cannot do either.
 task_citation_peer_ids() {
-    local msg="$1" prefix_re="$2" run i id
+    local msg="$1" prefix_re="$2" merge_head_re="$3" merge_into_re="$4" run i id
     local -A seen=()
     {
         while IFS= read -r run; do
@@ -162,7 +172,8 @@ task_citation_peer_ids() {
                 id="${run:i}"
                 [ -z "${seen[$id]:-}" ] || continue
                 seen[$id]=1
-                if task_citation_message_cites "$msg" "$id" "$prefix_re"; then
+                if task_citation_message_cites "$msg" "$id" "$prefix_re" \
+                    "$merge_head_re" "$merge_into_re"; then
                     printf '%s\n' "$id"
                 fi
             done

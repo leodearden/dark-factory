@@ -392,6 +392,29 @@ The remaining header-block differences belong to other entries. The
 K1–K6 index line is Delta 7. Header entries that describe dark-factory-native
 additions travel with those additions.
 
+### Delta 9 — `test_warm_lane_degenerate_ref.sh`: Block M, the merge arm from `shared.merge_subject`
+
+Added by **task 6716**. This is a dark-factory-native block with no reify
+counterpart, and it pins scripts README Delta 19. Its fixture is a
+`git init -b trunk` repo whose subjects are written by
+`shared.merge_subject.format_merge_subject`, for a `feat/` prefix landing into
+`trunk`. `shared/src` is found from `WARM_LANE_SCRIPTS_DIR` three levels up,
+and `python3 -I` renders each subject. The block has six asserts:
+
+- **M1:** `feat/6101` is parked on a no-ff merge carrying its own landing
+  subject. It reads `landed <sha>` and exits 4.
+- **M2:** `feat/6102` is parked on `Revert "<its landing subject>"`. It reads
+  `degenerate <sha>` and exits 0.
+- **M3:** the script and its lib are copied to a temp directory with no
+  `shared/src` three levels up. It exits 2, and stderr names
+  `shared.merge_subject`.
+
+The floor moved **84 → 90**. That count was re-measured, not raised to absorb a
+red: `Results: 90 passed, 0 failed`. The block is NON-VACUOUS by construction.
+Against the script before Delta 19 the same file reports
+`Results: 88 passed, 2 failed`, the two M3 asserts. The block needs `python3`,
+which `REQUIRED_HOST_TOOLS` already lists, so it is not a deduction.
+
 ### Not a delta — α's provision Deltas 1–2 needed no test-side change
 
 α's relocation of `provision-warm-lane-fs.sh` changed its `REPO_ROOT` to a
