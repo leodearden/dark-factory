@@ -27,7 +27,7 @@ from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.config import DeliveredChecksConfig, GitConfig, OrchestratorConfig
 from orchestrator.delivered_checks import (
     DeliveredChecksBlock,
     DeliveredChecksVerdict,
@@ -719,6 +719,27 @@ class TestReconcileOneStrandedLandingRejectEmission:
         assert provenance['commit'] == _RECOVERED_SHA
         assert 'cap-x' in provenance['note']
         assert landing_reject_rows(store) == []
+
+    async def test_a_disarmed_kill_switch_stops_the_rescue_and_reverts(
+        self, harness: Harness, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        tid = '9026'
+        store = _bind_event_store(harness, tmp_path)
+        _on_main_effect_absent(harness, tid, monkeypatch, metadata={'delivered_checks': [
+            {'name': 'cap-x', 'kind': 'grep', 'pattern': 'P', 'expect': 'present'},
+        ]})
+        harness.config.delivered_checks = DeliveredChecksConfig(enabled=False)
+        runner = AsyncMock(side_effect=differential_confirms)
+
+        with patch('orchestrator.delivered_checks.run_delivered_check', runner):
+            await _reconcile_stranded(harness, tid, 'in-progress')
+
+        runner.assert_not_awaited()
+        scheduler = cast(MagicMock, harness.scheduler)
+        scheduler.mark_done.assert_not_called()
+        cast(AsyncMock, scheduler.set_task_status).assert_awaited_once_with(tid, 'pending')
+        [row] = landing_reject_rows(store)
+        assert row['data']['delivered_checks_outcome'] == 'disabled'
 
 
 # ---------------------------------------------------------------------------

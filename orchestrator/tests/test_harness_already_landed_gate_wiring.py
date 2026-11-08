@@ -2740,6 +2740,25 @@ class TestAlreadyLandedGateAncestryRejectEmission:
 
         assert landing_reject_rows(h.event_store) == []
 
+    async def test_a_disarmed_kill_switch_is_recorded_on_the_reject_row(
+        self, mock_orch_config, tmp_path,
+    ) -> None:
+        h = _emitting_harness(mock_orch_config, tmp_path)
+        h.config.delivered_checks = DeliveredChecksConfig(enabled=False, check_timeout_secs=11.0)
+        h.scheduler.get_task = AsyncMock(
+            return_value={'id': '42', 'metadata': {'delivered_checks': [_DC_CHECK]}},
+        )
+        _effect_absent(h)
+        runner = AsyncMock(side_effect=differential_confirms)
+
+        with patch('orchestrator.delivered_checks.run_delivered_check', runner):
+            assert await h._already_landed_dispatch_gate('42') is False
+
+        runner.assert_not_awaited()
+        [row] = landing_reject_rows(h.event_store)
+        assert row['data']['delivered_checks_outcome'] == 'disabled'
+        assert row['data']['delivered_checks_state'] == 'evaluated'
+
 
 # ---------------------------------------------------------------------------
 # task 4496 — every gate arm passes the task's declared delivered_checks to
@@ -2781,3 +2800,23 @@ class TestAlreadyLandedGateDeliveredChecksWiring:
         assert mark.await_args is not None
         assert mark.await_args.args[1] == _ARM_EVIDENCE_SHA[arm]
         assert 'cap-x' in mark.await_args.args[2]
+
+    @pytest.mark.parametrize('arm', _ARMS)
+    async def test_a_disarmed_kill_switch_stops_the_rescue_and_dispatches(
+        self, mock_orch_config, arm,
+    ) -> None:
+        h, _meta = _arm_harness(mock_orch_config, arm)
+        h.config.delivered_checks = DeliveredChecksConfig(enabled=False, check_timeout_secs=11.0)
+        h.git_ops.commit_effect_present_in_main = AsyncMock(return_value=False)
+        runner = AsyncMock(side_effect=differential_confirms)
+        spy = AsyncMock(wraps=validate_landing_evidence)
+
+        with patch('orchestrator.delivered_checks.run_delivered_check', runner), \
+             patch('orchestrator.harness.validate_landing_evidence', spy):
+            result = await h._already_landed_dispatch_gate('42')
+
+        assert result is False
+        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+        runner.assert_not_awaited()
+        assert spy.await_args is not None
+        assert spy.await_args.kwargs.get('checks_enabled') is False
