@@ -11,7 +11,17 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from shared.quality_series.stats import (
+    BaselineState,
+    CostEffect,
+    Effect,
+    NotYet,
+    RateState,
     RegimeEvent,
+    Segment,
+    baseline_rate,
+    before_after_cost,
+    before_after_rate,
+    block_rate_datum,
     bootstrap_interval,
     cap_occurrences,
     content_seed,
@@ -24,6 +34,7 @@ from shared.quality_series.stats import (
     log_residuals,
     newcombe_difference,
     reference_cost,
+    regime_segments,
     theil_sen,
     wilson_interval,
 )
@@ -227,3 +238,150 @@ class TestCapOccurrences:
         capped = cap_occurrences([1, 3, 0, 25, 478], baseline_median=5, floor=20)
         assert capped.mass_event_indices == (4,)
         assert capped.cap == 50
+
+
+class TestRegimeSegments:
+    def test_series_tags_and_artefact_ranges(self) -> None:
+        landed_at = _hourly(50)
+        events = [
+            RegimeEvent('e1', landed_at[10]),
+            RegimeEvent('e2', landed_at[20], series=('reviewer_blocking',)),
+            RegimeEvent(
+                'a1', landed_at[30], until=landed_at[35], series=('flakes_confirmed',),
+                artefact=True,
+            ),
+        ]
+        segmented = regime_segments(landed_at, events, series='flakes_confirmed')
+        assert segmented.segments == (Segment(0, 10, None), Segment(10, 50, 'e1'))
+        assert segmented.excluded == frozenset(range(30, 36))
+
+    def test_an_event_before_every_landing_opens_the_first_segment(self) -> None:
+        landed_at = _hourly(5)
+        events = [RegimeEvent('e0', _T0 - timedelta(days=1))]
+        segmented = regime_segments(landed_at, events, series='x')
+        assert segmented.segments == (Segment(0, 5, 'e0'),)
+
+    def test_an_event_after_every_landing_adds_no_boundary(self) -> None:
+        landed_at = _hourly(5)
+        events = [RegimeEvent('late', _T0 + timedelta(days=30))]
+        segmented = regime_segments(landed_at, events, series='x')
+        assert segmented.segments == (Segment(0, 5, None),)
+
+    def test_an_artefact_needs_an_end(self) -> None:
+        with pytest.raises(ValueError):
+            RegimeEvent('a', _T0, artefact=True)
+
+
+class TestBaselineRate:
+    def test_two_hundred_observations_freeze_the_baseline(self) -> None:
+        assert baseline_rate([1] * 20 + [0] * 180) == (pytest.approx(0.1), BaselineState.FROZEN)
+
+    def test_only_the_first_n_base_observations_count(self) -> None:
+        xs = [1] * 20 + [0] * 180 + [1] * 100
+        assert baseline_rate(xs) == (pytest.approx(0.1), BaselineState.FROZEN)
+
+    def test_fewer_than_n_base_is_provisional_over_everything(self) -> None:
+        xs = [1] * 15 + [0] * 135
+        assert baseline_rate(xs) == (pytest.approx(0.1), BaselineState.PROVISIONAL)
+
+    def test_below_n_min_there_is_no_baseline(self) -> None:
+        assert baseline_rate([0] * 99) == (None, None)
+
+    def test_unmeasured_landings_are_skipped_not_counted(self) -> None:
+        assert baseline_rate([0] * 99 + [None] * 50) == (None, None)
+        xs: list[int | None] = [None, 1] * 20 + [0] * 180
+        assert baseline_rate(xs) == (pytest.approx(0.1), BaselineState.FROZEN)
+
+
+class TestBlockRateDatum:
+    def test_a_full_block_is_a_rate_over_the_last_n_block(self) -> None:
+        xs = [1] * 50 + [1] * 10 + [0] * 90
+        ids = [str(i) for i in range(len(xs))]
+        datum = block_rate_datum(xs, ids)
+        assert datum.state is RateState.RATE
+        assert (datum.k, datum.n) == (10, 100)
+        assert datum.rate == pytest.approx(0.1)
+        assert (datum.lo, datum.hi) == pytest.approx(wilson_interval(10, 100))
+        assert datum.window_task_ids == tuple(ids[50:])
+        assert datum.reason is None
+
+    def test_between_n_min_and_n_block_is_k_of_n(self) -> None:
+        datum = block_rate_datum([1] * 4 + [0] * 36, [str(i) for i in range(40)])
+        assert datum.state is RateState.K_OF_N
+        assert (datum.k, datum.n) == (4, 40)
+        assert (datum.lo, datum.hi) == pytest.approx(wilson_interval(4, 40))
+
+    def test_below_n_min_is_unknown_with_a_reason(self) -> None:
+        datum = block_rate_datum([1] + [0] * 28, [str(i) for i in range(29)])
+        assert datum.state is RateState.UNKNOWN
+        assert (datum.rate, datum.lo, datum.hi) == (None, None, None)
+        assert datum.reason is not None
+        assert '29' in datum.reason and '30' in datum.reason
+
+    def test_unmeasured_landings_drop_from_k_and_n(self) -> None:
+        xs: list[int | None] = [1, None, 0, None] * 10
+        datum = block_rate_datum(xs, [str(i) for i in range(40)])
+        assert (datum.k, datum.n) == (10, 20)
+        assert datum.state is RateState.UNKNOWN
+
+    def test_xs_and_task_ids_must_pair(self) -> None:
+        with pytest.raises(ValueError):
+            block_rate_datum([0, 1], ['a'])
+
+
+class TestBeforeAfterRate:
+    def test_a_full_after_window_is_a_newcombe_effect_on_capped_windows(self) -> None:
+        before = [1] * 100 + [1] * 30 + [0] * 270
+        after = [1] * 5 + [0] * 95 + [1] * 50 + [0] * 250 + [1] * 10
+        effect = before_after_rate(before, after)
+        assert isinstance(effect, Effect)
+        assert (effect.n_before, effect.n_after) == (300, 300)
+        d, lo, hi = newcombe_difference(30, 300, 55, 300)
+        assert (effect.d, effect.lo, effect.hi) == pytest.approx((d, lo, hi))
+
+    def test_exactly_n_min_after_is_enough(self) -> None:
+        effect = before_after_rate([1] * 10 + [0] * 90, [1] * 5 + [0] * 95)
+        assert isinstance(effect, Effect)
+        assert (effect.d, effect.lo, effect.hi) == pytest.approx(
+            newcombe_difference(10, 100, 5, 100)
+        )
+
+    def test_a_short_after_window_is_not_yet_with_an_eta(self) -> None:
+        verdict = before_after_rate([1] * 10 + [0] * 90, [0] * 40, landings_per_day=20)
+        assert isinstance(verdict, NotYet)
+        assert verdict.n_after == 40
+        assert verdict.eta_days == pytest.approx(3.0)
+        assert verdict.min_detectable is not None and verdict.min_detectable > 0
+
+    def test_without_a_velocity_there_is_no_eta(self) -> None:
+        verdict = before_after_rate([1] * 10 + [0] * 90, [0] * 40)
+        assert isinstance(verdict, NotYet)
+        assert verdict.eta_days is None
+
+
+class TestBeforeAfterCost:
+    _LINES = [10 + 7 * i for i in range(120)]
+
+    def _costs(self, scale: float) -> list[float]:
+        return [scale * n**0.5 for n in self._LINES]
+
+    def test_a_uniform_cost_increase_is_its_ratio_with_a_degenerate_band(self) -> None:
+        effect = before_after_cost(
+            self._LINES, self._costs(2.0), self._LINES, self._costs(3.0), seed=11, B=200
+        )
+        assert isinstance(effect, CostEffect)
+        assert (effect.ratio, effect.lo, effect.hi) == pytest.approx((1.5, 1.5, 1.5), abs=1e-9)
+
+    def test_is_deterministic_for_one_seed(self) -> None:
+        jitter = [1.0 + 0.1 * ((i * 7) % 5) for i in range(len(self._LINES))]
+        after = [c * j for c, j in zip(self._costs(3.0), jitter, strict=True)]
+        first = before_after_cost(self._LINES, self._costs(2.0), self._LINES, after, seed=5, B=200)
+        second = before_after_cost(self._LINES, self._costs(2.0), self._LINES, after, seed=5, B=200)
+        assert first == second
+
+    def test_a_short_after_window_is_not_yet(self) -> None:
+        verdict = before_after_cost(
+            self._LINES, self._costs(2.0), self._LINES[:50], self._costs(3.0)[:50], seed=1
+        )
+        assert isinstance(verdict, NotYet)
+        assert verdict.n_after == 50
