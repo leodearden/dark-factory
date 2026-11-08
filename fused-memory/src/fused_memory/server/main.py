@@ -14,7 +14,7 @@ import threading
 from collections.abc import Awaitable, Callable, Iterable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 from dotenv import load_dotenv
 
@@ -43,7 +43,11 @@ from fused_memory.server.tools import (  # noqa: E402
 from fused_memory.server.wal_status import (  # noqa: E402
     CHECKPOINT_STATUS as _CHECKPOINT_STATUS,
 )
-from fused_memory.services.mem0_write_retry import run_periodic_mem0_retry  # noqa: E402
+from fused_memory.services.consolidation_ops import MemoryUpdater  # noqa: E402
+from fused_memory.services.mem0_write_retry import (  # noqa: E402
+    Mem0RetryRunner,
+    run_periodic_mem0_retry,
+)
 from fused_memory.services.memory_service import MemoryService  # noqa: E402
 from fused_memory.services.supersession_mark import (  # noqa: E402
     mark_superseded_after_retry,
@@ -1607,7 +1611,11 @@ def _start_loop_lag_monitor(config) -> asyncio.Task[None]:
     )
 
 
-def _start_mem0_retry_loop(memory_service: MemoryService) -> asyncio.Task[None]:
+class _Mem0RetryLoopService(Mem0RetryRunner, MemoryUpdater, Protocol):
+    """What the Mem0 retry loop and its supersession landing hook read of the memory service."""
+
+
+def _start_mem0_retry_loop(memory_service: _Mem0RetryLoopService) -> asyncio.Task[None]:
     """Spawn the Mem0 write retry loop on the service's own policy; RETURN its handle for teardown.
 
     Each landed re-issue has its journaled supersedes marked. That hook is

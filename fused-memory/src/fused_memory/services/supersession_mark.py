@@ -19,14 +19,13 @@ from typing import TYPE_CHECKING, Any
 
 from fused_memory.memory_metadata import SUPERSEDED_BY_METADATA_KEY, normalize_supersedes
 from fused_memory.models.memory import Mem0WriteState
-from fused_memory.services.consolidation_ops import patch_memory_metadata
+from fused_memory.services.consolidation_ops import MemoryUpdater, patch_memory_metadata
 from fused_memory.services.write_journal import decode_mem0_intent_metadata
 from fused_memory.utils.validation import is_full_uuid
 
 if TYPE_CHECKING:
     from fused_memory.models.memory import AddMemoryResponse
     from fused_memory.services.mem0_add_outcome import Mem0AddOutcome
-    from fused_memory.services.memory_service import MemoryService
 
 __all__ = [
     'SUPERSESSION_ACK_KEY',
@@ -87,7 +86,7 @@ class SupersessionMarks:
 
 
 async def mark_superseded(
-    memory_service: MemoryService,
+    memory_service: MemoryUpdater,
     *,
     metadata: Any,
     written: AddMemoryResponse,
@@ -132,7 +131,7 @@ async def mark_superseded(
 
 
 async def mark_superseded_after_retry(
-    memory_service: MemoryService,
+    memory_service: MemoryUpdater,
     intent: Mapping[str, Any],
     outcome: Mem0AddOutcome,
 ) -> SupersessionMarks | None:
@@ -170,7 +169,7 @@ def _split_declared(declared: list[Any]) -> tuple[list[UnmarkedSupersession], li
 
 
 async def _mark_declared(
-    memory_service: MemoryService,
+    memory_service: MemoryUpdater,
     declared: list[Any],
     *,
     superseding_ids: Sequence[str],

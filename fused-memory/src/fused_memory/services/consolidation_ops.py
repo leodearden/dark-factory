@@ -49,7 +49,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 from fused_memory.memory_metadata import EXPERIMENTAL_KEY_PREFIX, is_canonical
 from fused_memory.models.memory import Mem0WriteState
@@ -64,6 +64,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     'TOPIC_MEMBER_LIMIT',
+    'MemoryUpdater',
     'RetainArmApplied',
     'RetainArmRefused',
     'TopicClosure',
@@ -130,8 +131,26 @@ class RetainArmRefused:
     response: dict[str, Any]
 
 
+class MemoryUpdater(Protocol):
+    """The ``update_memory`` member that :func:`patch_memory_metadata` calls."""
+
+    async def update_memory(
+        self,
+        *,
+        memory_id: str,
+        project_id: str,
+        content: str | None,
+        metadata_patch: dict[str, Any] | None,
+        metadata_mode: str,
+        agent_id: str | None,
+        session_id: str | None,
+        causation_id: str | None,
+        _source: str,
+    ) -> object: ...
+
+
 async def patch_memory_metadata(
-    memory_service: MemoryService,
+    memory_service: MemoryUpdater,
     *,
     memory_id: str,
     project_id: str,

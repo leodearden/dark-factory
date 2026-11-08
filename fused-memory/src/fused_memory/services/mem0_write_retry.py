@@ -10,7 +10,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
-from typing import Any
+from typing import Any, Protocol
 
 import openai
 
@@ -104,6 +104,15 @@ DEFAULT_MEM0_RETRY_POLICY = Mem0RetryPolicy(
     poll_interval_seconds=30.0,
     batch_size=50,
 )
+
+
+class Mem0RetryRunner(Protocol):
+    """Runs a Mem0 write retry pass on its own policy."""
+
+    @property
+    def mem0_retry_policy(self) -> Mem0RetryPolicy: ...
+
+    async def retry_due_mem0_intents(self, *, on_landed: OnMem0Landed | None = None) -> object: ...
 
 
 @dataclass(frozen=True)
