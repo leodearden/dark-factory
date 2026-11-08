@@ -562,50 +562,61 @@ def _bind_event_store(harness: Harness, tmp_path: Path) -> EventStore:
 _RECOVERED_SHA = 'deadbeef' + 'a' * 32
 
 
-def _on_main_effect_absent(harness: Harness, tid: str, *, metadata: dict | None = None) -> None:
+def _on_main_effect_absent(
+    harness: Harness, tid: str, monkeypatch: pytest.MonkeyPatch,
+    *, metadata: dict | None = None,
+) -> None:
     scheduler = cast(MagicMock, harness.scheduler)
-    git_ops = cast(MagicMock, harness.git_ops)
     scheduler.get_statuses.return_value = ({tid: 'in-progress'}, None)
     scheduler.get_task = AsyncMock(
         return_value={'status': 'in-progress', 'metadata': metadata or {}},
     )
-    git_ops.is_ancestor = AsyncMock(return_value=True)
-    git_ops.resolve_branch_sha = AsyncMock(return_value=_RECOVERED_SHA)
-    git_ops.commit_effect_present_in_main = AsyncMock(return_value=False)
-    git_ops.describe_commit_effect_in_main = AsyncMock(
-        return_value=CommitEffectProbe(
+    monkeypatch.setattr(harness.git_ops, 'is_ancestor', AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        harness.git_ops, 'resolve_branch_sha', AsyncMock(return_value=_RECOVERED_SHA),
+    )
+    monkeypatch.setattr(
+        harness.git_ops, 'commit_effect_present_in_main', AsyncMock(return_value=False),
+    )
+    monkeypatch.setattr(
+        harness.git_ops, 'describe_commit_effect_in_main',
+        AsyncMock(return_value=CommitEffectProbe(
             present=False, diverged_paths=('src/y.py',), anchor_sha=_RECOVERED_SHA,
             failure='effect_not_survived', aggregate_survival=0.3, added_lines_total=40,
-        ),
+        )),
     )
 
 
-def _blocked_marker_effect_absent(harness: Harness, tid: str, marker_sha: str) -> None:
+def _blocked_marker_effect_absent(
+    harness: Harness, tid: str, marker_sha: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     scheduler = cast(MagicMock, harness.scheduler)
-    git_ops = cast(MagicMock, harness.git_ops)
     scheduler.get_statuses.return_value = ({tid: 'blocked'}, None)
     scheduler.get_task = AsyncMock(
         return_value={'status': 'blocked', 'metadata': {}},
     )
-    git_ops.resolve_branch_sha = AsyncMock(return_value=None)
-    git_ops.find_merge_marker = AsyncMock(return_value=marker_sha)
-    git_ops.commit_effect_present_in_main = AsyncMock(return_value=False)
-    git_ops.describe_commit_effect_in_main = AsyncMock(
-        return_value=CommitEffectProbe(
+    monkeypatch.setattr(harness.git_ops, 'resolve_branch_sha', AsyncMock(return_value=None))
+    monkeypatch.setattr(harness.git_ops, 'find_merge_marker', AsyncMock(return_value=marker_sha))
+    monkeypatch.setattr(
+        harness.git_ops, 'commit_effect_present_in_main', AsyncMock(return_value=False),
+    )
+    monkeypatch.setattr(
+        harness.git_ops, 'describe_commit_effect_in_main',
+        AsyncMock(return_value=CommitEffectProbe(
             present=False, diverged_paths=('src/z.py',), anchor_sha=marker_sha,
             failure='effect_not_survived', aggregate_survival=0.2, added_lines_total=30,
-        ),
+        )),
     )
 
 
 @pytest.mark.asyncio
 class TestReconcileOneStrandedLandingRejectEmission:
     async def test_on_main_effect_absent_reject_is_recorded_and_still_reverts(
-        self, harness: Harness, tmp_path: Path,
+        self, harness: Harness, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ):
         tid = '9020'
         store = _bind_event_store(harness, tmp_path)
-        _on_main_effect_absent(harness, tid)
+        _on_main_effect_absent(harness, tid, monkeypatch)
 
         await harness._reconcile_stranded_in_progress()
 
@@ -625,11 +636,11 @@ class TestReconcileOneStrandedLandingRejectEmission:
         assert data['aggregate_survival'] == 0.3
 
     async def test_the_row_exists_before_the_revert_begins(
-        self, harness: Harness, tmp_path: Path,
+        self, harness: Harness, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ):
         tid = '9021'
         store = _bind_event_store(harness, tmp_path)
-        _on_main_effect_absent(harness, tid)
+        _on_main_effect_absent(harness, tid, monkeypatch)
         scheduler = cast(MagicMock, harness.scheduler)
         rows_at_write: list[int] = []
 
@@ -644,12 +655,12 @@ class TestReconcileOneStrandedLandingRejectEmission:
         assert rows_at_write == [1, 1]
 
     async def test_blocked_marker_effect_absent_reject_is_recorded(
-        self, harness: Harness, tmp_path: Path,
+        self, harness: Harness, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ):
         tid = '9022'
         marker_sha = 'c6' * 20
         store = _bind_event_store(harness, tmp_path)
-        _blocked_marker_effect_absent(harness, tid, marker_sha)
+        _blocked_marker_effect_absent(harness, tid, marker_sha, monkeypatch)
 
         await harness._reconcile_stranded_in_progress()
 
@@ -660,11 +671,11 @@ class TestReconcileOneStrandedLandingRejectEmission:
         assert row['data']['branch_tip_sha'] is None
 
     async def test_a_second_sweep_over_the_same_blocked_task_adds_no_row(
-        self, harness: Harness, tmp_path: Path,
+        self, harness: Harness, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ):
         tid = '9023'
         store = _bind_event_store(harness, tmp_path)
-        _blocked_marker_effect_absent(harness, tid, 'c7' * 20)
+        _blocked_marker_effect_absent(harness, tid, 'c7' * 20, monkeypatch)
 
         await harness._reconcile_stranded_in_progress()
         await harness._reconcile_stranded_in_progress()
@@ -673,11 +684,11 @@ class TestReconcileOneStrandedLandingRejectEmission:
 
 
     async def test_a_task_declaring_no_checks_is_recorded_as_none_declared(
-        self, harness: Harness, tmp_path: Path,
+        self, harness: Harness, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ):
         tid = '9024'
         store = _bind_event_store(harness, tmp_path)
-        _on_main_effect_absent(harness, tid, metadata={})
+        _on_main_effect_absent(harness, tid, monkeypatch, metadata={})
 
         await harness._reconcile_stranded_in_progress()
 
@@ -685,11 +696,11 @@ class TestReconcileOneStrandedLandingRejectEmission:
         assert row['data']['delivered_checks_state'] == 'none_declared'
 
     async def test_a_differential_rescue_marks_done_and_discloses_it(
-        self, harness: Harness, tmp_path: Path,
+        self, harness: Harness, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ):
         tid = '9025'
         store = _bind_event_store(harness, tmp_path)
-        _on_main_effect_absent(harness, tid, metadata={'delivered_checks': [
+        _on_main_effect_absent(harness, tid, monkeypatch, metadata={'delivered_checks': [
             {'name': 'cap-x', 'kind': 'grep', 'pattern': 'P', 'expect': 'present'},
         ]})
 
