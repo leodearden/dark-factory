@@ -1691,6 +1691,44 @@ class SccacheConfig(BaseModel):
         return dict(self.backend_env) if self.enabled else {}
 
 
+class VerifyCgroupMemoryConfig(BaseModel):
+    """Memory limits every verify scope is spawned with, as ``systemd-run -p``
+    properties; applied only when verify_use_cgroup_scope is on, one value for
+    every role.
+
+    Leaves are integer GiB, rendered with systemd's base-1024 ``G`` suffix. An
+    unset leaf adds no property (systemd's default applies). high may not
+    exceed max.
+    """
+
+    high_gib: int | None = Field(default=None, ge=1)
+    max_gib: int | None = Field(default=None, ge=1)
+    swap_max_gib: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode='after')
+    def _reject_high_above_max(self) -> 'VerifyCgroupMemoryConfig':
+        if (
+            self.high_gib is not None
+            and self.max_gib is not None
+            and self.high_gib > self.max_gib
+        ):
+            raise ValueError(
+                f'VerifyCgroupMemoryConfig.high_gib={self.high_gib} exceeds '
+                f'max_gib={self.max_gib}: MemoryHigh above MemoryMax never '
+                f'throttles before the kill; lower high_gib or raise max_gib.'
+            )
+        return self
+
+    def systemd_properties(self) -> tuple[str, ...]:
+        """Return ``<Property>=<n>G`` for each set leaf, in a fixed order."""
+        pairs = (
+            ('MemoryHigh', self.high_gib),
+            ('MemoryMax', self.max_gib),
+            ('MemorySwapMax', self.swap_max_gib),
+        )
+        return tuple(f'{prop}={gib}G' for prop, gib in pairs if gib is not None)
+
+
 class JobserverConfig(BaseModel):
     """Task-pool jobserver wiring for agent inner-loop cargo builds.
 
@@ -4263,6 +4301,12 @@ class OrchestratorConfig(BaseSettings):
     verify_cgroup_cpu_weight_merge: int = Field(default=100, ge=1, le=10000)
     verify_cgroup_cpu_weight_task: int = Field(default=33, ge=1, le=10000)
     verify_cgroup_cpu_weight_background: int = Field(default=10, ge=1, le=10000)
+    # Memory limits each verify scope is spawned with (`systemd-run -p
+    # MemoryHigh=/MemoryMax=/MemorySwapMax=`), only when verify_use_cgroup_scope
+    # is on; one value covers every role.
+    verify_cgroup_memory: VerifyCgroupMemoryConfig = Field(
+        default_factory=VerifyCgroupMemoryConfig,
+    )
 
     # ── Verify admission control (task 2390 T2; PRD
     # plans/verify-oversubscription-control-prd.md) ────────────────────────
@@ -6595,6 +6639,9 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     # fairness/starvation_watchdog submodel-group pattern: every threshold
     # is green-tier hot-reloadable.
     _submodel_leaf_paths('psi_admission', PsiAdmissionConfig),
+    # Read at each verify scope spawn (verify.py::_run_cmd via _scope_kw), so a
+    # reload applies from the next spawn, as the task-5205 CPUWeight knobs do.
+    _submodel_leaf_paths('verify_cgroup_memory', VerifyCgroupMemoryConfig),
     # Model allowlist (task beta, plans/adaptive-model-routing-prd.md):
     # green-tier hot-reloadable. apply_reload()'s existing post-apply
     # model_validate re-check already enforces
