@@ -562,7 +562,7 @@ def launch(
     if model and choice.enabled is False:
         return _provider_verdict(choice)
 
-    _sweep_listed_threads(client, project.project_id, cwd)
+    _sweep_listed_threads(client)
     message = _message_for(Path(prompt_file).read_text(encoding='utf-8'), record_dir)
     strategy = WorkspaceStrategy.for_cwd(project, cwd)
     arguments = _launch_arguments(
@@ -918,11 +918,10 @@ def wait(
 def _observe(
     client: t3_mcp_client.T3McpClient | None, thread_id: str, cwd: str, record_dir: str
 ) -> ThreadObservation:
-    """The thread's state, after one sweep of its project and the binding's upkeep."""
+    """The thread's state, after one sweep of its environment and the binding's upkeep."""
     thread = _read_thread(client, thread_id, read_timeout=CALL_TIMEOUT_SECS)
-    project_id = None if isinstance(thread, ThreadUnread) else thread.get('projectId')
-    if client is not None and isinstance(project_id, str):
-        _sweep_listed_threads(client, project_id, cwd)
+    if client is not None:
+        _sweep_listed_threads(client)
     if record_dir:
         _maintain_binding_softly(record_dir, cwd)
     if isinstance(thread, ThreadUnread):
@@ -946,20 +945,18 @@ def _needs_pause(slice_held: bool, record_dir: str) -> bool:
     return not slice_held and not result_is_final(record_dir)
 
 
-def _sweep_listed_threads(client: t3_mcp_client.T3McpClient, project_id: str, cwd: str) -> None:
-    """Sweep *cwd*'s t3 records against the project's active threads, only from a complete listing."""
+def _sweep_listed_threads(client: t3_mcp_client.T3McpClient) -> None:
+    """Sweep this environment's indexed t3 records against its active threads, only from a complete listing."""
     listed_at = datetime.now(UTC)
-    threads = _paged(client, 't3_thread_list', {'projectId': project_id}, 'threads')
+    threads = _paged(client, 't3_thread_list', {'allProjects': True}, 'threads')
     thread_ids = None if isinstance(threads, Incomplete) else [thread.get('threadId') for thread in threads]
     if thread_ids is None or not all(isinstance(thread_id, str) for thread_id in thread_ids):
-        logger.warning(f't3 session sweep skipped: no complete thread listing of project {project_id}')
+        logger.warning('t3 session sweep skipped: no complete thread listing of this environment')
         return
-    _sweep_project(cwd, dict.fromkeys(map(str, thread_ids), False), listed_at)
-
-
-def _sweep_project(cwd: str, known: Mapping[str, bool], listed_at: datetime) -> None:
     try:
-        session_registry.mark_t3_sessions_exited(cwd, known, listed_at=listed_at)
+        session_registry.mark_t3_sessions_exited(
+            client.environment_id, frozenset(map(str, thread_ids)), listed_at=listed_at
+        )
     except Exception as exc:
         logger.warning(f't3 session sweep failed: {exc}')
 
@@ -1177,5 +1174,5 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == '__main__':
-    logging.basicConfig(stream=sys.stderr, format='spawn_t3_lane: %(message)s')
+    logging.basicConfig(stream=sys.stderr, level=logging.INFO, format='spawn_t3_lane: %(message)s')
     sys.exit(main(sys.argv[1:]))

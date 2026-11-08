@@ -34,6 +34,7 @@ import tempfile
 import time
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sized
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -3331,59 +3332,77 @@ def is_t3_record(record: SessionRecord) -> bool:
     return record.display is not None and record.display.kind == DisplayKind.T3
 
 
-def _same_real_path(left: str, right: str) -> bool:
-    return bool(left) and bool(right) and os.path.realpath(left) == os.path.realpath(right)
-
-
 def mark_t3_sessions_exited(
-    project_root: str,
-    known_threads: Mapping[str, bool],
+    environment_id: str,
+    listed_threads: AbstractSet[str],
     root: Path | str | None = None,
     *,
     listed_at: datetime | None = None,
 ) -> list[str]:
-    """Mark EXITED every live T3-hosted record of *project_root* whose thread has gone.
+    """Mark EXITED every indexed T3-hosted record of *environment_id* whose thread has gone.
 
-    *known_threads* is one project's thread listing, thread id -> archived.
-    A non-terminal record with ``display.kind == 't3'`` and a
-    ``t3_thread_id``, whose ``cwd`` is *project_root* by realpath, is marked
-    (exit_code ``ORPHAN_EXIT_CODE``) when its thread is absent from the
-    listing or listed as archived. Records of other projects are untouched,
-    since the listing says nothing about them. With *listed_at*, a record
-    written after that instant is skipped: the listing predates it and cannot
-    vouch for its thread's absence.
+    *listed_threads* is one complete listing of the environment's active
+    threads. Only ``sessions-by-t3-thread/`` is read: a record behind a
+    vouched entry whose thread is unlisted and whose ``t3_environment_id`` is
+    *environment_id* or unset is marked (exit_code ``ORPHAN_EXIT_CODE``),
+    which drops its pointer. With *listed_at*, a record written after that
+    instant is skipped: the listing predates it and cannot vouch for its
+    thread's absence.
 
     Returns the marked slugs. One unreadable or unwritable record is logged
     and skipped, never fatal.
     """
-    base = sessions_dir(root)
-    if not base.is_dir():
-        return []
-    marked: list[str] = []
-    for slug_dir in sorted(base.iterdir()):
-        slug = slug_dir.name
-        try:
-            record = read_record(slug, root=root)
-        except (FileNotFoundError, CorruptSessionRecord):
-            continue
-        display = record.display
-        if (
-            record.status in TERMINAL_STATUSES
-            or display is None
-            or display.kind != DisplayKind.T3
-            or not display.t3_thread_id
-            or not _same_real_path(record.cwd, project_root)
-            or known_threads.get(display.t3_thread_id, True) is False
-        ):
-            continue
-        if listed_at is not None and _written_after(slug_dir / 'record.json', listed_at):
-            continue
-        try:
-            if _mark_exited_if_still_non_terminal(slug, root, exit_code=ORPHAN_EXIT_CODE):
-                marked.append(slug)
-        except (FileNotFoundError, CorruptSessionRecord, OSError):
-            logger.error('mark_t3_sessions_exited: failed to mark %s', slug, exc_info=True)
+    base = t3_thread_pointers_dir(root)
+    thread_ids = (
+        sorted(
+            path.name
+            for path in base.iterdir()
+            if not path.name.endswith(_ATOMIC_WRITE_TEMP_SUFFIX)
+        )
+        if base.is_dir()
+        else []
+    )
+    marked = [
+        slug
+        for thread_id in thread_ids
+        if thread_id not in listed_threads
+        and (slug := _mark_t3_session_gone(thread_id, environment_id, root, listed_at))
+    ]
+    logger.info(
+        'mark_t3_sessions_exited: marked %d of %d indexed session(s) under %s',
+        len(marked),
+        len(thread_ids),
+        base,
+    )
     return marked
+
+
+def _mark_t3_session_gone(
+    thread_id: str, environment_id: str, root: Path | str | None, listed_at: datetime | None
+) -> str | None:
+    """Mark the live record of unlisted thread *thread_id* EXITED; its slug, or None when none was marked."""
+    slug = resolve_session_slug_for_t3_thread(thread_id, root=root)
+    if slug is None:
+        return None
+    if listed_at is not None and _written_after(record_path_for_slug(slug, root=root), listed_at):
+        return None
+
+    def still_this_environments(record: SessionRecord) -> bool:
+        display = record.display
+        return (
+            display is not None
+            and display.t3_thread_id == thread_id
+            and display.t3_environment_id in (None, environment_id)
+        )
+
+    try:
+        marked = _mark_exited_if_still_non_terminal(
+            slug, root, exit_code=ORPHAN_EXIT_CODE, still_applies=still_this_environments
+        )
+    except (FileNotFoundError, CorruptSessionRecord, OSError):
+        logger.error('mark_t3_sessions_exited: failed to mark %s', slug, exc_info=True)
+        return None
+    return slug if marked is not None else None
 
 
 def _written_after(path: Path, instant: datetime) -> bool:

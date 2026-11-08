@@ -11805,7 +11805,7 @@ class TestMarkT3SessionsExited:
             for record in caplog.records
             if record.funcName == 'mark_t3_sessions_exited' and record.levelno == logging.INFO
         ]
-        assert re.search(r'(?<!\d)3(?!\d)', line), line
+        assert re.search(r'\b3\b', line), line
 
 
 class TestT3RecordsAreExemptFromPidSweeps:
