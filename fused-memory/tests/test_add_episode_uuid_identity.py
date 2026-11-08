@@ -883,7 +883,14 @@ def _unreached_provider_skip_reason(exc: openai.APIError) -> str | None:
     """The skip reason when *exc* shows the provider's connect phase timed out
     before any response; None for every other failure.
     """
-    return None
+    cause = exc.__cause__
+    if not (isinstance(exc, openai.APIConnectionError) and isinstance(cause, httpx.ConnectTimeout)):
+        return None
+    return (
+        f'{exc.request.url.host} was not reached: {type(cause).__name__} before any '
+        f'response, so no episode write was observed; a lasting outage is '
+        f"scripts/lane_dependency_probe.py's to report"
+    )
 
 
 async def _sdk_error(handler: Callable[[httpx.Request], httpx.Response]) -> openai.APIError:
@@ -1001,9 +1008,14 @@ async def test_the_write_creates_a_real_episodic_node_in_falkordb(mock_config):
 
         # The real production route: enqueue, then execute the queued payload.
         await svc.add_episode(content=_LIVE_CONTENT, project_id=graph_name)
-        result = await svc._execute_graphiti_write(
-            'add_episode', _enqueued_payload(svc)
-        )
+        try:
+            result = await svc._execute_graphiti_write(
+                'add_episode', _enqueued_payload(svc)
+            )
+        except openai.APIError as exc:
+            if (reason := _unreached_provider_skip_reason(exc)) is None:
+                raise
+            pytest.skip(reason)
 
         real_uuid = result.episode.uuid
         assert real_uuid, 'graphiti_core must report the uuid it minted'
