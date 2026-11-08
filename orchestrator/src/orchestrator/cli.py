@@ -20,7 +20,7 @@ import click
 from dotenv import load_dotenv
 from shared.project_layout import runs_db, tasks_db
 
-from orchestrator.config import ConfigRequiredError, OrchestratorConfig, load_config
+from orchestrator.config import ConfigRequiredError, GitConfig, OrchestratorConfig, load_config
 from orchestrator.config_census_ignore import audit_census_ignore_entries
 from orchestrator.main_checkout_defaults import cli_default
 from orchestrator.shadow_types import ShadowShape
@@ -1511,6 +1511,7 @@ async def _run_eval_sample(*, since: str, target_low: int, target_high: int,
 
     tasks_dir = tasks_dir or (Path(__file__).parent / 'evals' / 'tasks')
 
+    git = GitConfig()
     candidates = []
     for project, root in (('dark_factory', df_root), ('reify', reify_root)):
         if not root.exists():
@@ -1519,6 +1520,7 @@ async def _run_eval_sample(*, since: str, target_low: int, target_high: int,
             continue
         found = await discover_completed_tasks(
             root, since=since, project=project, project_root=str(root),
+            branch_prefix=git.branch_prefix, main_branch=git.main_branch,
         )
         found = enrich_candidates_from_task_db(found, tasks_db(root))
         click.echo(f'discovered {len(found)} completed-task merge(s) in {project}')
