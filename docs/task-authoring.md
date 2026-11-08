@@ -1851,14 +1851,20 @@ registration and mint no `unknown_key` census line.
   without one is rejected (`EnumerationScopeMissing`), and a value of any
   other shape is rejected on every write (`EnumerationScopeMalformed`).
 - **`x_liveness_reverified_at` and `x_liveness_exceptions`** are written
-  only by the gate. Never write them yourself.
+  only by the gate. Never author them. Each exception record's `outcome`
+  is an `enumeration_guard.py::EnumeratedIdOutcome` value.
 
 When you write an enumeration:
 - List full 36-char UUIDs, never fragments. A fragment is rejected on
   filing (`EnumeratedIdTruncated`).
 - Update it with an overwriting merge: `metadata_mode='merge'` (the
   default) or `'replace'`, never an additive one
-  (`EnumerationUpdateNotOverwriting`).
+  (`EnumerationUpdateNotOverwriting`). Both modes replace what you send
+  wholesale. `'merge'` replaces each top-level key you supply, so read the
+  task with `get_task` and send the COMPLETE list, never only the ids being
+  added. `'replace'` replaces the whole blob, so send every stored key,
+  `x_liveness_exceptions` included as read: the gate carries forward the
+  records for ids that write did not re-check.
 - Send a `memory_hints` attach as a separate update.
 
 The rules themselves live in the module docstring of

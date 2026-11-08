@@ -146,6 +146,21 @@ class TestSubmitTask:
         assert result['enumeration_liveness']['verified'] == 3
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'reply',
+        [{'success': False, 'error_type': 'CuratorRejected'}, {}],
+        ids=['success-false', 'empty'],
+    )
+    async def test_stats_ride_back_only_on_a_write_that_landed(
+        self, server, project_root, task_interceptor, reply,
+    ):
+        task_interceptor.submit_task.return_value = reply
+
+        result = await submit(server, project_root, gate_5537_metadata())
+
+        assert 'enumeration_liveness' not in result
+
+    @pytest.mark.asyncio
     async def test_a_truncated_fragment_is_rejected_before_any_lookup(
         self, server, project_root, task_interceptor, memory_service,
     ):
@@ -491,6 +506,27 @@ class TestUpdatePersistence:
             'path': 'mem0_falsified_entries[3]',
             'outcome': 'absent',
         }]
+
+    @pytest.mark.asyncio
+    async def test_a_replace_read_modify_write_keeps_the_stored_exceptions(
+        self, persisting_server, backend, project_root, seeded_task_id,
+    ):
+        resent = {
+            **await stored_metadata(backend, project_root, seeded_task_id),
+            'mem0_falsified_entries': list(LIVE_IDS),
+        }
+
+        result = await update(
+            persisting_server, project_root, task_id=seeded_task_id,
+            metadata=resent, merge_flags={'metadata_mode': 'replace'},
+        )
+
+        assert 'error' not in result
+        stored = await stored_metadata(backend, project_root, seeded_task_id)
+        assert stored['mem0_falsified_entries'] == list(LIVE_IDS)
+        assert stored['x_liveness_exceptions'] == SEED_METADATA['x_liveness_exceptions']
+        assert stored['x_liveness_reverified_at'] != SEED_STAMP
+        assert stored['memory_hints'] == SEED_METADATA['memory_hints']
 
     @pytest.mark.asyncio
     async def test_a_stage2_memory_hints_attach_stays_additive(

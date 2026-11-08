@@ -26,9 +26,14 @@ import pytest
 from fused_memory.reconciliation.consolidation_gate import GATE_METADATA_KEY
 from fused_memory.reconciliation.enumeration_guard import (
     ENUMERATION_UPDATE_NOT_OVERWRITING,
+    LIVENESS_LOOKUP_SKIPPED,
+    MAX_CONCURRENT_LIVENESS_READS,
+    MAX_CONSECUTIVE_LIVENESS_READ_ERRORS,
+    MAX_ENUMERATED_IDS_PER_WRITE,
     X_ENUMERATION_SCOPE_KEY,
     X_LIVENESS_EXCEPTIONS_KEY,
     X_LIVENESS_REVERIFIED_AT_KEY,
+    EnumeratedIdOutcome,
     EnumerationGateResult,
     enumeration_gate_for_filing,
     enumeration_gate_for_update,
@@ -596,6 +601,90 @@ class TestLiveness:
         assert result.metadata is metadata
 
 
+def generated_ids(count: int) -> list[str]:
+    return [f'{index:08x}-0000-4000-8000-{index:012x}' for index in range(1, count + 1)]
+
+
+def skipped_record(memory_id: str, path: str) -> dict[str, str]:
+    return {
+        'memory_id': memory_id,
+        'path': path,
+        'outcome': EnumeratedIdOutcome.INCONCLUSIVE.value,
+        'error_type': LIVENESS_LOOKUP_SKIPPED,
+    }
+
+
+class TestBoundedLookups:
+    """The gate runs on a write path, so its point reads are bounded: an id it
+    does not read is kept and recorded inconclusive, never treated as absent."""
+
+    @pytest.mark.asyncio
+    async def test_ids_past_the_lookup_budget_are_kept_unread_as_inconclusive(
+        self, project_root,
+    ):
+        members = generated_ids(MAX_ENUMERATED_IDS_PER_WRITE + 2)
+        service = fake_memory_service(live=tuple(members))
+
+        result = await run_gate(
+            project_root, {'x_related_memories': members}, service=service,
+        )
+
+        assert awaited_ids(service) == members[:MAX_ENUMERATED_IDS_PER_WRITE]
+        assert result.metadata['x_related_memories'] == members
+        assert result.metadata[X_LIVENESS_EXCEPTIONS_KEY] == [
+            skipped_record(member, f'x_related_memories[{index}]')
+            for index, member in enumerate(members)
+            if index >= MAX_ENUMERATED_IDS_PER_WRITE
+        ]
+
+    @pytest.mark.asyncio
+    async def test_no_more_than_the_read_limit_is_ever_in_flight(self, project_root):
+        in_flight = 0
+        peak = 0
+
+        async def _get(_project_id: str, memory_id: str) -> dict[str, Any] | None:
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            await asyncio.sleep(0)
+            in_flight -= 1
+            return {'id': memory_id}
+
+        service = AsyncMock()
+        service.get_memory_by_id = AsyncMock(side_effect=_get)
+        members = generated_ids(MAX_CONCURRENT_LIVENESS_READS * 3)
+
+        await run_gate(project_root, {'x_related_memories': members}, service=service)
+
+        assert peak == MAX_CONCURRENT_LIVENESS_READS
+        assert sorted(awaited_ids(service)) == sorted(members)
+
+    @pytest.mark.asyncio
+    async def test_reads_stop_once_the_store_keeps_failing(self, project_root):
+        failing = generated_ids(20)
+        service = fake_memory_service(
+            live=(LIVE_B3F,),
+            raising=dict.fromkeys(failing, TimeoutError('qdrant timeout')),
+        )
+        members = [LIVE_B3F, *failing]
+
+        result = await run_gate(
+            project_root, {'x_related_memories': members}, service=service,
+        )
+
+        read = awaited_ids(service)
+        assert len(read) <= 1 + MAX_CONCURRENT_LIVENESS_READS
+        assert result.metadata['x_related_memories'] == members
+        records = result.metadata[X_LIVENESS_EXCEPTIONS_KEY]
+        assert len(records) == len(failing)
+        timed_out = [r for r in records if r['error_type'] == 'TimeoutError']
+        assert len(timed_out) == len(read) - 1 >= MAX_CONSECUTIVE_LIVENESS_READ_ERRORS
+        assert [r for r in records if r not in timed_out] == [
+            skipped_record(r['memory_id'], r['path'])
+            for r in records if r not in timed_out
+        ]
+
+
 # --------------------------------------------------------------------------- #
 # CHANGE 1(c): description annotation
 # --------------------------------------------------------------------------- #
@@ -672,6 +761,34 @@ class TestDescriptionAnnotation:
         assert second.description == first.description
         assert second.stats is not None
         assert second.stats['annotated_lines'] == 0
+
+    @pytest.mark.asyncio
+    async def test_a_later_absent_verdict_rewrites_an_inconclusive_annotation(
+        self, project_root,
+    ):
+        metadata = {'mem0_falsified_entries': [LIVE_B3F, LIVE_21F]}
+        description = f'- {LIVE_21F} the fuller twin'
+        first = await run_gate(
+            project_root, metadata,
+            service=fake_memory_service(
+                live=(LIVE_B3F,), raising={LIVE_21F: TimeoutError('slow')},
+            ),
+            description=description,
+        )
+
+        second = await run_gate(
+            project_root, metadata, service=fake_memory_service(live=(LIVE_B3F,)),
+            description=first.description,
+        )
+
+        assert second.description is not None
+        assert second.description.startswith(description)
+        assert second.description.count('[21f78de1: ') == 1
+        assert f'already deleted, verified {VERIFIED_AT}' in second.description
+        assert 'inconclusive' not in second.description
+        assert second.stats is not None
+        assert second.stats['dropped_absent'] == 1
+        assert second.stats['annotated_lines'] == 1
 
     @pytest.mark.asyncio
     async def test_a_none_description_stays_none(self, project_root):
@@ -875,6 +992,103 @@ class TestGateOwnedKeys:
         assert [r['outcome'] for r in result.metadata[X_LIVENESS_EXCEPTIONS_KEY]] == (
             ['truncated'] * len(GATE_5533_FRAGMENTS)
         )
+
+
+class TestReplaceKeepsEarlierExceptions:
+    """``replace`` swaps in the whole blob, so the gate carries an earlier
+    write's exception records forward rather than erase the only trace of a
+    drop; ``merge`` leaves the stored key alone unless this write records."""
+
+    @pytest.mark.asyncio
+    async def test_records_for_ids_this_write_did_not_observe_are_carried(
+        self, project_root,
+    ):
+        metadata = {
+            'mem0_falsified_entries': [LIVE_B3F, LIVE_21F],
+            X_LIVENESS_REVERIFIED_AT_KEY: GATE_5537_STAMP,
+            X_LIVENESS_EXCEPTIONS_KEY: list(STALE_EXCEPTIONS),
+        }
+
+        result = await run_gate(
+            project_root, metadata,
+            service=fake_memory_service(live=(LIVE_B3F, LIVE_21F)),
+            metadata_mode='replace',
+        )
+
+        assert result.metadata[X_LIVENESS_EXCEPTIONS_KEY] == STALE_EXCEPTIONS
+        assert result.metadata[X_LIVENESS_REVERIFIED_AT_KEY] == FIXED_NOW.isoformat()
+
+    @pytest.mark.asyncio
+    async def test_this_writes_verdict_supersedes_a_record_for_the_same_id(
+        self, project_root,
+    ):
+        earlier_inconclusive = {
+            'memory_id': LIVE_21F.upper(),
+            'path': 'mem0_falsified_entries[1]',
+            'outcome': 'inconclusive',
+            'error_type': 'TimeoutError',
+        }
+        metadata = {
+            'mem0_falsified_entries': [LIVE_B3F, LIVE_21F, DELETED_0D5],
+            X_LIVENESS_EXCEPTIONS_KEY: [*STALE_EXCEPTIONS, earlier_inconclusive],
+        }
+
+        result = await run_gate(
+            project_root, metadata,
+            service=fake_memory_service(live=(LIVE_B3F, LIVE_21F)),
+            metadata_mode='replace',
+        )
+
+        assert result.metadata[X_LIVENESS_EXCEPTIONS_KEY] == [
+            {
+                'memory_id': DELETED_0D5,
+                'path': 'mem0_falsified_entries[2]',
+                'outcome': 'absent',
+            },
+        ]
+
+    @pytest.mark.asyncio
+    async def test_an_unproven_replace_keeps_the_records_but_not_the_stamp(
+        self, project_root,
+    ):
+        metadata = {
+            'origin_finding_ids': list(FINDING_IDS),
+            X_LIVENESS_REVERIFIED_AT_KEY: GATE_5537_STAMP,
+            X_LIVENESS_EXCEPTIONS_KEY: list(STALE_EXCEPTIONS),
+        }
+
+        result = await run_gate(
+            project_root, metadata, service=fake_memory_service(),
+            metadata_mode='replace',
+        )
+
+        assert result.metadata == {
+            'origin_finding_ids': FINDING_IDS,
+            X_LIVENESS_EXCEPTIONS_KEY: STALE_EXCEPTIONS,
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('incoming', [
+        'dropped 0d542614 on 2026-07-25',
+        [[DELETED_0D5]],
+        [{'memory_id': DELETED_0D5}],
+        [{'memory_id': DELETED_0D5, 'outcome': 'gone'}],
+        [{'memory_id': DELETED_0D5, 'outcome': ['absent']}],
+        [{'memory_id': 7, 'outcome': 'absent'}],
+    ], ids=['prose', 'bare-list', 'no-outcome', 'unknown-outcome',
+            'unhashable-outcome', 'non-string-id'])
+    async def test_a_malformed_record_is_never_carried(self, project_root, incoming):
+        metadata = {
+            'mem0_falsified_entries': [LIVE_B3F],
+            X_LIVENESS_EXCEPTIONS_KEY: incoming,
+        }
+
+        result = await run_gate(
+            project_root, metadata, service=fake_memory_service(live=(LIVE_B3F,)),
+            metadata_mode='replace',
+        )
+
+        assert X_LIVENESS_EXCEPTIONS_KEY not in result.metadata
 
 
 # --------------------------------------------------------------------------- #
@@ -1112,11 +1326,7 @@ class TestUpdateMergeMode:
         assert 'origin_finding_ids' not in rejection['error']
         assert rejection['metadata_mode'] == metadata_mode
         assert rejection['append'] == append
-        assert "'merge' or 'replace'" in rejection['error']
-        if (metadata_mode, append) == (None, False):
-            assert 'stored member' not in rejection['error']
-        for token in ('merge', 'replace', 'memory_hints'):
-            assert token in rejection['hint'], token
+        assert rejection['accepted_modes'] == ['merge', 'replace']
         assert result.stats is None
 
     @pytest.mark.asyncio

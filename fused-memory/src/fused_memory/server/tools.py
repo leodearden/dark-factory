@@ -9748,7 +9748,7 @@ def create_mcp_server(
         if _gitignored_finding is not None and isinstance(result, dict) and 'error' not in result:
             result.update(gitignored_deliverable_warning(_gitignored_finding))
             log_gitignored_deliverable_flagged(_gitignored_finding)
-        if _enumeration.stats is not None and isinstance(result, dict) and 'error' not in result:
+        if _enumeration.stats is not None and interceptor_write_succeeded(result):
             result['enumeration_liveness'] = _enumeration.stats
         return result
 
