@@ -14,7 +14,7 @@ reaches into the other's internals.
 Harness patterns are taken wholesale from the existing suite rather than
 hand-rolled — ``call_merge_request`` from ``_merge_tool_calls``, the
 ``captured_req`` background worker from ``test_server_chokepoint.py``, and the
-``scheduler.get_task`` AsyncMock (including its ``scheduler_raises`` fault arm)
+``scheduler.read_task`` AsyncMock (including its ``scheduler_raises`` fault arm)
 from ``test_merge_status_git_authority.py``.  The AsyncMock is also what makes
 the COST contract executable: ``await_count`` / ``assert_not_awaited`` pin that
 the lane fallback never adds a second Taskmaster round-trip to the submit path.
@@ -30,6 +30,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from _merge_tool_calls import call_merge_request
+from shared.task_read import TaskFound
 
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
@@ -91,14 +92,14 @@ def _make_harness(
     scheduler_raises: bool = False,
     no_scheduler: bool = False,
 ) -> types.SimpleNamespace:
-    """Harness with a ``scheduler.get_task`` AsyncMock the tests can interrogate."""
+    """Harness with a ``scheduler.read_task`` AsyncMock the tests can interrogate."""
     harness = types.SimpleNamespace(git_ops=git_ops or _stub_git_ops())
     if not no_scheduler:
         harness.scheduler = types.SimpleNamespace(
-            get_task=(
+            read_task=(
                 AsyncMock(side_effect=RuntimeError('scheduler unreachable'))
                 if scheduler_raises
-                else AsyncMock(return_value={'metadata': metadata or {}})
+                else AsyncMock(return_value=TaskFound({'metadata': metadata or {}}))
             ),
         )
     return harness
@@ -259,7 +260,7 @@ class TestInvalidLaneIsRejectedLoudly:
             lane='higgh',
         )
 
-        harness.scheduler.get_task.assert_not_awaited()
+        harness.scheduler.read_task.assert_not_awaited()
         git_ops.resolve_branch_sha.assert_not_awaited()
 
 
@@ -336,7 +337,7 @@ class TestMetadataReadIsPaidAtMostOnce:
     """The COST contract, made executable (design decision 5).
 
     ``git_authority.task_metadata`` is uncached: every call is a fresh
-    ``scheduler.get_task`` → Taskmaster MCP dispatch with an internal
+    ``scheduler.read_task`` → Taskmaster MCP dispatch with an internal
     ``timeout=15``.  Without these two tests the memoization is unpinned and a
     later edit can silently reintroduce a second round-trip on the submit path.
     """
@@ -365,7 +366,7 @@ class TestMetadataReadIsPaidAtMostOnce:
             project_root=repo,
         )
 
-    async def test_at_most_one_get_task_when_both_consumers_are_live(
+    async def test_at_most_one_read_task_when_both_consumers_are_live(
         self, tmp_path: Path
     ):
         tip = 'b' * 40
@@ -377,9 +378,9 @@ class TestMetadataReadIsPaidAtMostOnce:
 
         assert captured, 'the degenerate branch should fall through to the queue'
         assert captured[0].lane == 'high'
-        assert harness.scheduler.get_task.await_count <= 1, (
+        assert harness.scheduler.read_task.await_count <= 1, (
             'the degeneracy probe and the lane fallback must share ONE metadata '
-            f'read; got {harness.scheduler.get_task.await_count} awaits'
+            f'read; got {harness.scheduler.read_task.await_count} awaits'
         )
 
     async def test_explicit_lane_pays_no_metadata_read_at_all(self, tmp_path: Path):
@@ -388,7 +389,7 @@ class TestMetadataReadIsPaidAtMostOnce:
         _, captured = await _submit(tmp_path, harness, lane='high')
 
         assert captured and captured[0].lane == 'high'
-        harness.scheduler.get_task.assert_not_awaited()
+        harness.scheduler.read_task.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

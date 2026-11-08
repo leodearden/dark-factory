@@ -25,6 +25,7 @@ from unittest.mock import call as mock_call
 import pytest
 from _merge_tool_calls import call_merge_request, call_merge_status
 from shared.merge_state import MergeReason
+from shared.task_read import TaskFound
 
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
@@ -113,7 +114,7 @@ def _make_config(
 
 
 def _stub_harness(
-    git_ops, *, metadata: dict[str, Any] | None = None, get_task_raises: bool = False,
+    git_ops, *, metadata: dict[str, Any] | None = None, read_task_raises: bool = False,
 ) -> types.SimpleNamespace:
     """Return the standard merge_status harness stub wired to *git_ops*.
 
@@ -124,22 +125,22 @@ def _stub_harness(
     the citation gate), and the shape every pre-existing test in this module
     already uses.
 
-    Pass ``metadata=`` to attach a ``.scheduler`` whose ``get_task`` resolves
-    to ``{'metadata': metadata}``, or ``get_task_raises=True`` to attach one
-    whose ``get_task`` raises — the scheduler-fault path.
+    Pass ``metadata=`` to attach a ``.scheduler`` whose ``read_task`` resolves
+    to ``TaskFound({'metadata': metadata})``, or ``read_task_raises=True`` to
+    attach one whose ``read_task`` raises — the scheduler-fault path.
     """
     harness = types.SimpleNamespace(
         _merge_worker=None,
         _terminal_retention=None,
         git_ops=git_ops,
     )
-    if get_task_raises:
+    if read_task_raises:
         harness.scheduler = types.SimpleNamespace(
-            get_task=AsyncMock(side_effect=RuntimeError('scheduler unreachable')),
+            read_task=AsyncMock(side_effect=RuntimeError('scheduler unreachable')),
         )
     elif metadata is not None:
         harness.scheduler = types.SimpleNamespace(
-            get_task=AsyncMock(return_value={'metadata': metadata}),
+            read_task=AsyncMock(return_value=TaskFound({'metadata': metadata})),
         )
     return harness
 
@@ -606,7 +607,7 @@ class TestMergeStatusGitAuthority:
             f'Degenerate branch via branch= form must be no_record, got: {result}'
         )
         assert result.get('reason') == MergeReason.never_submitted, f'got: {result}'
-        stub_harness.scheduler.get_task.assert_awaited_once_with('3024')
+        stub_harness.scheduler.read_task.assert_awaited_once_with('3024')
 
     # ── task 3103: ancestor-arm citation gate ────────────────────────────────
 
@@ -619,7 +620,7 @@ class TestMergeStatusGitAuthority:
         citation: str | None = None,
         effect_present: bool = True,
         metadata: dict[str, Any] | None = None,
-        get_task_raises: bool = False,
+        read_task_raises: bool = False,
         commit_citation_pattern: str | None = None,
     ) -> tuple[Any, types.SimpleNamespace]:
         """Build a server whose branch is a NON-degenerate ancestor of main.
@@ -636,7 +637,7 @@ class TestMergeStatusGitAuthority:
             commit_effect_present_in_main=AsyncMock(return_value=effect_present),
         )
         stub_harness = _stub_harness(
-            stub_git, metadata=metadata, get_task_raises=get_task_raises,
+            stub_git, metadata=metadata, read_task_raises=read_task_raises,
         )
         esc_queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(
@@ -802,7 +803,7 @@ class TestMergeStatusGitAuthority:
         [('c' * 40, 'done', None), (None, 'no_record', MergeReason.landing_unattributable)],
         ids=['cited', 'uncited'],
     )
-    async def test_get_task_raises_still_applies_citation_gate(
+    async def test_read_task_raises_still_applies_citation_gate(
         self,
         tmp_path: Path,
         citation: str | None,
@@ -812,12 +813,12 @@ class TestMergeStatusGitAuthority:
         """A scheduler fault degrades ONE guard, never the whole probe.
 
         The metadata lookup's own try/except is nested inside the Tier-3.5
-        fire-safe wrapper precisely so a raising get_task cannot swallow the
+        fire-safe wrapper precisely so a raising read_task cannot swallow the
         citation gate along with the degeneracy check.
         """
         server, _ = self._ancestor_arm_server(
             tmp_path, '906', tip='a' * 40, citation=citation, effect_present=True,
-            get_task_raises=True,
+            read_task_raises=True,
         )
 
         result = await call_merge_status(server, task_id='906')
@@ -1535,9 +1536,10 @@ async def _run_merge_request_fast_path(
     )
     harness = types.SimpleNamespace(git_ops=git_ops)
     harness.scheduler = types.SimpleNamespace(
-        get_task=(
+        read_task=(
             AsyncMock(side_effect=RuntimeError('scheduler unreachable'))
-            if scheduler_raises else AsyncMock(return_value={'metadata': metadata or {}})
+            if scheduler_raises
+            else AsyncMock(return_value=TaskFound({'metadata': metadata or {}}))
         ),
     )
 
@@ -1611,7 +1613,7 @@ class TestMergeRequestUsesTheExtractedTier:
         """Behaviour-preservation: merge_request reads ``.metadata`` and
         IGNORES the new ``unavailable`` flag, exactly as today.
 
-        With a scheduler whose ``get_task`` raises, the extracted probe
+        With a scheduler whose ``read_task`` raises, the extracted probe
         reports ``unavailable=True`` — and the fast path must still answer
         its legacy ``already_merged`` rather than raising or declining.  A
         metadata fault must degrade a single guard, not the whole submission.
