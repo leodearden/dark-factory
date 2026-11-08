@@ -41,12 +41,9 @@ extraPaths = [
     "sampler/src",
     "shared/src",
     # Only the orchestrator test helpers this table's targets import by bare
-    # name (_fake_t3_server, task 8507). Pyright resolves an extraPaths module
-    # ahead of a same-named module in the importing file's own directory, so
-    # anything added here claims its name over siblings in scripts/ and
-    # tests/scripts/. Guarded by tests/scripts/test_no_vestigial_import_pragmas.py::
-    # test_no_root_extrapaths_entry_holds_a_test_module_or_conftest and ::
-    # test_no_bare_import_in_a_root_pyright_target_resolves_past_its_same_directory_sibling.
+    # name (task 8507), never a whole test directory: an entry here claims its
+    # names over same-directory siblings. Why, and the guards that enforce it:
+    # tests/scripts/test_no_vestigial_import_pragmas.py.
     "orchestrator/tests/cross_suite_helpers",
 ]
 pythonVersion = "3.11"
