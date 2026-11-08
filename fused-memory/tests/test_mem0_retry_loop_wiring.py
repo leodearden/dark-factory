@@ -25,21 +25,37 @@ _OLD = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
 class _RecordingService:
     """A structural stand-in for the members the retry loop, startup recovery and their supersession landing hook read."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self, *, backlog_alarm_age_seconds: float = 3600, pass_error: Exception | None = None
+    ) -> None:
         self.mem0_retry_policy = Mem0RetryPolicy(
             initial_delay_seconds=1,
             max_delay_seconds=2,
             poll_interval_seconds=0.01,
             batch_size=1,
+            backlog_alarm_age_seconds=backlog_alarm_age_seconds,
         )
         self.pass_kwargs: list[dict[str, Any]] = []
         self.recover_kwargs: list[dict[str, Any]] = []
         self.passed = asyncio.Event()
+        self.third_pass = asyncio.Event()
+        self.backlog_checks = 0
+        self.backlog_checked = asyncio.Event()
+        self._pass_error = pass_error
         self.update_memory = AsyncMock(return_value={'status': 'updated', 'store': 'mem0'})
 
     async def retry_due_mem0_intents(self, **kwargs: Any) -> None:
         self.pass_kwargs.append(kwargs)
         self.passed.set()
+        if len(self.pass_kwargs) >= 3:
+            self.third_pass.set()
+        if self._pass_error is not None:
+            raise self._pass_error
+
+    async def check_mem0_retry_backlog(self) -> list[str]:
+        self.backlog_checks += 1
+        self.backlog_checked.set()
+        return []
 
     async def recover_mem0_intents(self, **kwargs: Any) -> dict[str, int]:
         self.recover_kwargs.append(kwargs)
@@ -60,19 +76,23 @@ def _intent(metadata: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-async def _first_pass(service: _RecordingService) -> dict[str, Any]:
+async def _run_loop_until(service: _RecordingService, event: asyncio.Event) -> None:
     from fused_memory.server.main import _start_mem0_retry_loop  # noqa: PLC0415
 
     task = _start_mem0_retry_loop(service)
     try:
-        # noqa: wall-clock-deadline — the deadline is the assertion: a pass inside half the default policy's interval proves the loop read the service's own policy
+        # noqa: wall-clock-deadline — the deadline is the assertion: an event inside half the default policy's interval proves the loop read the service's own policy
         await asyncio.wait_for(
-            service.passed.wait(), timeout=DEFAULT_MEM0_RETRY_POLICY.poll_interval_seconds / 2
+            event.wait(), timeout=DEFAULT_MEM0_RETRY_POLICY.poll_interval_seconds / 2
         )
     finally:
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
+
+
+async def _first_pass(service: _RecordingService) -> dict[str, Any]:
+    await _run_loop_until(service, service.passed)
     return service.pass_kwargs[0]
 
 
@@ -106,6 +126,27 @@ class TestTheRetryLoopWiring:
         on_landed = (await _first_pass(service))['on_landed']
 
         await _assert_the_hook_marks_supersedes(service, on_landed)
+
+
+class TestTheBacklogCheckWiring:
+    @pytest.mark.asyncio
+    async def test_a_failing_retry_pass_does_not_stop_the_backlog_check(self):
+        # An alarm age of 12 poll intervals puts the check on the poll interval.
+        service = _RecordingService(
+            backlog_alarm_age_seconds=0.12, pass_error=RuntimeError('journal locked')
+        )
+
+        await _run_loop_until(service, service.backlog_checked)
+
+        assert service.backlog_checks >= 1
+
+    @pytest.mark.asyncio
+    async def test_the_backlog_is_checked_on_the_policys_check_interval_not_every_pass(self):
+        service = _RecordingService(backlog_alarm_age_seconds=3600)
+
+        await _run_loop_until(service, service.third_pass)
+
+        assert service.backlog_checks == 0
 
 
 class TestTheStartupRecoveryWiring:

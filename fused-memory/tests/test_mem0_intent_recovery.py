@@ -493,29 +493,56 @@ class TestTheServiceOwnsItsRetryPolicy:
         assert MemoryService(mock_config).mem0_retry_policy is DEFAULT_MEM0_RETRY_POLICY
 
     @pytest.mark.asyncio
-    async def test_a_pass_escalates_a_backlog_older_than_the_policy_allows(
+    async def test_the_backlog_check_escalates_a_backlog_older_than_the_policy_allows(
         self, recovery_service, recovery_journal, tmp_path
     ):
         svc = recovery_service
         svc.set_known_projects({'dark_factory': str(tmp_path)})
-        now = datetime.datetime(2026, 11, 3, 12, tzinfo=datetime.UTC)
-        alarm_age = svc.mem0_retry_policy.backlog_alarm_age_seconds
-        await seed_mem0_intent(
-            recovery_journal,
-            status=Mem0IntentStatus.RETRYING,
-            project_id='dark_factory',
-            created_at=now - datetime.timedelta(seconds=alarm_age + 60),
-            retry_at=now + datetime.timedelta(minutes=5),
-        )
+        now = await _seed_a_stale_retrying_intent(svc, recovery_journal)
+
+        filed = await svc.check_mem0_retry_backlog(now=now)
+
+        (record,) = _escalation_records(tmp_path)
+        assert record['category'] == 'mem0_write_retry_backlog'
+        assert filed == [record['id']]
+        svc.mem0.add.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_retry_pass_files_no_backlog_escalation(
+        self, recovery_service, recovery_journal, tmp_path
+    ):
+        svc = recovery_service
+        svc.set_known_projects({'dark_factory': str(tmp_path)})
+        now = await _seed_a_stale_retrying_intent(svc, recovery_journal)
 
         await svc.retry_due_mem0_intents(now=now)
 
-        (record,) = [
-            json.loads(path.read_text())
-            for path in (tmp_path / 'data' / 'escalations').glob('esc-*.json')
-        ]
-        assert record['category'] == 'mem0_write_retry_backlog'
-        svc.mem0.add.assert_not_awaited()
+        assert _escalation_records(tmp_path) == []
+
+    @pytest.mark.asyncio
+    async def test_the_backlog_check_without_a_journal_files_nothing(self, mock_config):
+        assert await MemoryService(mock_config).check_mem0_retry_backlog() == []
+
+
+async def _seed_a_stale_retrying_intent(svc, journal) -> datetime.datetime:
+    """Seed a retrying intent older than *svc*'s alarm age, not yet due; return the 'now' it is stale at."""
+    now = datetime.datetime(2026, 11, 3, 12, tzinfo=datetime.UTC)
+    alarm_age = svc.mem0_retry_policy.backlog_alarm_age_seconds
+    await seed_mem0_intent(
+        journal,
+        status=Mem0IntentStatus.RETRYING,
+        project_id='dark_factory',
+        created_at=now - datetime.timedelta(seconds=alarm_age + 60),
+        retry_at=now + datetime.timedelta(minutes=5),
+    )
+    return now
+
+
+def _escalation_records(project_root) -> list[dict[str, Any]]:
+    return [
+        json.loads(path.read_text())
+        for path in (project_root / 'data' / 'escalations').glob('esc-*.json')
+    ]
 
 
 # ---------------------------------------------------------------------------

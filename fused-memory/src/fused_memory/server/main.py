@@ -44,6 +44,9 @@ from fused_memory.server.wal_status import (  # noqa: E402
     CHECKPOINT_STATUS as _CHECKPOINT_STATUS,
 )
 from fused_memory.services.consolidation_ops import MemoryUpdater  # noqa: E402
+from fused_memory.services.mem0_retry_backlog_alarm import (  # noqa: E402
+    Mem0RetryBacklogChecker,
+)
 from fused_memory.services.mem0_write_retry import (  # noqa: E402
     Mem0RetryRunner,
     OnMem0Landed,
@@ -1611,7 +1614,9 @@ def _start_loop_lag_monitor(config) -> asyncio.Task[None]:
     )
 
 
-class _Mem0WriteDurabilityService(Mem0RetryRunner, MemoryUpdater, Protocol):
+class _Mem0WriteDurabilityService(
+    Mem0RetryRunner, Mem0RetryBacklogChecker, MemoryUpdater, Protocol
+):
     """What startup recovery, the Mem0 retry loop and their supersession landing hook read of the memory service."""
 
     async def recover_mem0_intents(
@@ -1636,22 +1641,35 @@ async def _recover_mem0_intents_at_startup(memory_service: _Mem0WriteDurabilityS
 
 
 def _start_mem0_retry_loop(memory_service: _Mem0WriteDurabilityService) -> asyncio.Task[None]:
-    """Spawn the Mem0 write retry loop on the service's own policy; RETURN its handle for teardown."""
+    """Spawn the Mem0 write retry pass and its backlog check on the service's own policy; RETURN one handle for teardown.
+
+    Each runs in its own loop, so a failing pass never skips the check.
+    """
     policy = memory_service.mem0_retry_policy
-    task = asyncio.create_task(
-        run_periodic_mem0_retry(
-            partial(
-                memory_service.retry_due_mem0_intents,
-                on_landed=_mark_supersedes_on_landing(memory_service),
-            ),
-            interval_seconds=policy.poll_interval_seconds,
-        ),
-        name='mem0_write_retry',
-    )
+
+    async def _run_both() -> None:
+        async with asyncio.TaskGroup() as loops:
+            loops.create_task(run_periodic_mem0_retry(
+                partial(
+                    memory_service.retry_due_mem0_intents,
+                    on_landed=_mark_supersedes_on_landing(memory_service),
+                ),
+                interval_seconds=policy.poll_interval_seconds,
+                what='retry pass',
+            ))
+            loops.create_task(run_periodic_mem0_retry(
+                memory_service.check_mem0_retry_backlog,
+                interval_seconds=policy.backlog_check_interval_seconds,
+                what='retry backlog check',
+            ))
+
+    task = asyncio.create_task(_run_both(), name='mem0_write_retry')
     logger.info(
-        '  Mem0 write retry loop: every %.0fs, up to %d due intents per pass',
+        '  Mem0 write retry loop: every %.0fs, up to %d due intents per pass; '
+        'backlog age checked every %.0fs',
         policy.poll_interval_seconds,
         policy.batch_size,
+        policy.backlog_check_interval_seconds,
     )
     return task
 

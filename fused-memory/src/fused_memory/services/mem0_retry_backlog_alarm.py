@@ -6,7 +6,7 @@ import asyncio
 import logging
 from collections.abc import Mapping
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, Protocol
 
 from fused_memory.middleware._folded_escalation import file_folded_escalation
 from fused_memory.services.write_journal import Mem0RetryBacklog, WriteJournal
@@ -17,6 +17,14 @@ ANCHOR_TASK_ID = 'mem0-write-retry-backlog'
 _AGENT_ROLE = 'fused-memory/mem0-write-retry'
 _CATEGORY = 'mem0_write_retry_backlog'
 LOG_EVENT = 'mem0_write_retry_backlog'
+
+
+class Mem0RetryBacklogChecker(Protocol):
+    """Escalates its own Mem0 retry backlog once it is older than its policy allows."""
+
+    async def check_mem0_retry_backlog(self) -> object: ...
+
+
 _EVIDENCE_QUERY = (
     'SELECT id, project_id, attempts, created_at, next_attempt_at, reason '
     "FROM mem0_intents WHERE status='retrying'"
@@ -52,8 +60,8 @@ def emit_mem0_retry_backlog_escalation(
         f'Evidence (write_journal.db, read-only): {_EVIDENCE_QUERY}',
         '',
         'This is the ONE open record for this project until it is resolved: '
-        'later retry passes fold into it and file nothing of their own, so the '
-        'figures above describe the pass that filed it, not a running total.',
+        'later backlog checks fold into it and file nothing of their own, so the '
+        'figures above describe the check that filed it, not a running total.',
     ))
 
     def _log_fold(existing: Any) -> None:

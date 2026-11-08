@@ -57,6 +57,12 @@ def retry_reason(failure: TransientProviderFailure, exc: BaseException) -> str:
     return f'{failure.value}: {type(exc).__name__}: {exc}'
 
 
+#: How many times per alarm age the retry backlog is checked: often enough to
+#: alarm close to the threshold, rare enough that a standing alarm folds a
+#: dozen times an hour rather than on every pass.
+_BACKLOG_CHECKS_PER_ALARM_AGE = 12
+
+
 @dataclass(frozen=True)
 class Mem0RetryPolicy:
     initial_delay_seconds: float
@@ -96,6 +102,14 @@ class Mem0RetryPolicy:
             self.initial_delay_seconds * 2 ** min(attempts - 1, doublings_to_cap),
         )
         return now + timedelta(seconds=delay)
+
+    @property
+    def backlog_check_interval_seconds(self) -> float:
+        """How often to check the retry backlog's age: never more often than a pass runs."""
+        return max(
+            self.poll_interval_seconds,
+            self.backlog_alarm_age_seconds / _BACKLOG_CHECKS_PER_ALARM_AGE,
+        )
 
 
 DEFAULT_MEM0_RETRY_POLICY = Mem0RetryPolicy(
@@ -299,12 +313,12 @@ def _warn_unstamped(
 
 
 async def run_periodic_mem0_retry(
-    pass_fn: Callable[[], Awaitable[object]], *, interval_seconds: float
+    pass_fn: Callable[[], Awaitable[object]], *, interval_seconds: float, what: str
 ) -> None:
-    """Run ``pass_fn`` every ``interval_seconds``, sleeping first, until cancelled."""
+    """Run ``pass_fn`` every ``interval_seconds``, sleeping first, until cancelled; ``what`` names it in a failure log."""
     while True:
         await asyncio.sleep(interval_seconds)
         try:
             await pass_fn()
         except Exception:
-            logger.exception('Mem0 periodic retry pass failed; the loop continues')
+            logger.exception('Mem0 periodic %s failed; the loop continues', what)

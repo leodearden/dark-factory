@@ -111,6 +111,20 @@ class TestMem0RetryPolicy:
     def test_the_default_backlog_alarm_age_is_an_hour(self):
         assert DEFAULT_MEM0_RETRY_POLICY.backlog_alarm_age_seconds == 3600
 
+    def test_the_default_backlog_is_checked_every_five_minutes(self):
+        assert DEFAULT_MEM0_RETRY_POLICY.backlog_check_interval_seconds == 300
+
+    def test_the_backlog_is_never_checked_more_often_than_a_retry_pass_runs(self):
+        policy = Mem0RetryPolicy(
+            initial_delay_seconds=30,
+            max_delay_seconds=900,
+            poll_interval_seconds=30,
+            batch_size=50,
+            backlog_alarm_age_seconds=60,
+        )
+
+        assert policy.backlog_check_interval_seconds == 30
+
     @pytest.mark.parametrize('age', [0, -1])
     def test_a_non_positive_backlog_alarm_age_is_rejected(self, age):
         with pytest.raises(ValueError, match='backlog_alarm_age_seconds'):
@@ -470,7 +484,9 @@ async def test_periodic_loop_survives_a_failing_pass_and_ends_on_cancel(caplog):
             raise RuntimeError('journal locked')
 
     with caplog.at_level(logging.ERROR):
-        task = asyncio.create_task(run_periodic_mem0_retry(pass_fn, interval_seconds=0.01))
+        task = asyncio.create_task(
+            run_periodic_mem0_retry(pass_fn, interval_seconds=0.01, what='retry pass')
+        )
         # A genuine hang is bounded by the suite's per-test timeout.
         await third_call.wait()
         task.cancel()

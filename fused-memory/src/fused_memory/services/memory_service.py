@@ -7255,24 +7255,27 @@ class MemoryService:
         now: datetime | None = None,
         on_landed: OnMem0Landed | None = None,
     ) -> Mem0RetryPassSummary:
-        """Run one server-side retry pass, then escalate any backlog older than the policy allows."""
+        """Run one server-side retry pass."""
         if self._write_journal is None:
             return Mem0RetryPassSummary()
-        now = now or datetime.now(UTC)
-        summary = await mem0_write_retry.retry_due_mem0_intents(
+        return await mem0_write_retry.retry_due_mem0_intents(
             self._write_journal,
             self.reissue_mem0_intent,
             policy=self._mem0_retry_policy,
-            now=now,
+            now=now or datetime.now(UTC),
             on_landed=on_landed,
         )
-        await mem0_retry_backlog_alarm.alarm_on_stale_mem0_retries(
+
+    async def check_mem0_retry_backlog(self, *, now: datetime | None = None) -> list[str]:
+        """Escalate each project whose Mem0 retry backlog is older than the policy allows; return the escalation ids."""
+        if self._write_journal is None:
+            return []
+        return await mem0_retry_backlog_alarm.alarm_on_stale_mem0_retries(
             self._write_journal,
-            now=now,
+            now=now or datetime.now(UTC),
             max_age=timedelta(seconds=self._mem0_retry_policy.backlog_alarm_age_seconds),
             project_roots=self._known_projects,
         )
-        return summary
 
     # ------------------------------------------------------------------
     # Recovery: reconcile crash-mid-write mem0 intents (task 2710)
