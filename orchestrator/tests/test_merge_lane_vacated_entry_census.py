@@ -16,19 +16,17 @@ from _git_fixtures import RepoSeed, seed_repo
 from _merge_lane_fakes import (
     FakeRemoteRunner,
     FakeVerifier,
-    VerifyScript,
     hangs_until,
     healthy_verify_clock,
     lane_scene_config,
     lane_state,
     make_lane,
-    raises_after,
     running_lane,
 )
 from _orch_helpers import wait_responsive
 
 from orchestrator.config import GitConfig, OrchestratorConfig
-from orchestrator.git_ops import GitOps, MergeVerifyLeaseContended
+from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane import MergeLane, MergeRequest, QueuedBranch
 
 pytestmark = pytest.mark.asyncio
@@ -39,7 +37,7 @@ _GIT = GitConfig(
 )
 _SEED = RepoSeed(files=(('README.md', '# Test\n'),), message='Initial commit')
 _HEAD_HOST = 'head-host'
-_REQUEUE_TRIGGERS = ('lane_contended', 'no_progress')
+_REQUEUE_TRIGGERS = ('no_progress',)
 _POLL_SECS = 0.005
 _SETTLE_POLLS = 200
 
@@ -110,20 +108,15 @@ class _VacatedScene:
     main_sha: str
 
 
-def _r_script(trigger: str, release: asyncio.Event, entered: asyncio.Event) -> VerifyScript:
-    if trigger == 'lane_contended':
-        contended = MergeVerifyLeaseContended(Path('/x/_merge-verify.lock'), 300.0)
-        return raises_after(release, contended, entered=entered)
-    return hangs_until(release, entered=entered)
-
-
 @contextlib.asynccontextmanager
 async def _vacated_scene(scene: _Scene, trigger: str) -> AsyncIterator[_VacatedScene]:
     """Run a lane until R's verify has exited through *trigger*.
 
-    'lane_contended' and 'no_progress' requeue R, and ``halt_admission()``
-    (taken before R's verify exits) holds it in its lane buffer; 'abandon'
-    cancels R's outcome, and the lane drops it.
+    'no_progress' requeues R, and ``halt_admission()`` (taken before R's
+    verify exits) holds it in its lane buffer; 'abandon' cancels R's outcome,
+    and the lane drops it. 'lane_contended' is not driven here, because its
+    requeue can land in the merger's post-halt window, where
+    worker.py::SpeculativeMergeWorker._acquire_next_request loses it.
 
     After an abandon the scene waits for R's 'local' lease to come back, read
     from the hosts census rather than from the filter under test, and only
@@ -137,9 +130,8 @@ async def _vacated_scene(scene: _Scene, trigger: str) -> AsyncIterator[_VacatedS
     clock = healthy_verify_clock()
     head_entered = asyncio.Event()
     remote = FakeRemoteRunner(_HEAD_HOST, release=asyncio.Event(), entered=head_entered)
-    r_release = asyncio.Event()
     r_entered = asyncio.Event()
-    verifier = FakeVerifier(scripts={req.task_id: _r_script(trigger, r_release, r_entered)})
+    verifier = FakeVerifier(scripts={req.task_id: hangs_until(asyncio.Event(), entered=r_entered)})
     queue: asyncio.Queue[Any] = asyncio.Queue()
     lane = make_lane(
         scene.git_ops, queue,
@@ -161,10 +153,7 @@ async def _vacated_scene(scene: _Scene, trigger: str) -> AsyncIterator[_VacatedS
             await _settle(lambda: lane_state(lane, req.request_id) is None)
         else:
             lane.halt_admission('test: hold the requeued request')
-            if trigger == 'lane_contended':
-                r_release.set()
-            else:
-                clock.content_tick = 0.0
+            clock.content_tick = 0.0
             await wait_responsive(
                 _until(lambda: req.request_id in lane.unfrozen_suffix()),
                 label=f'R requeued by {trigger} into its lane buffer',

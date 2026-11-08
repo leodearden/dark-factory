@@ -2,9 +2,8 @@
 
 Injected in place of the production adapters through
 ``MergeLane(..., verifier=FakeVerifier(...), clock=FakeClock(...))``.
-``FakeVerifier`` scripts the verify outcome per task id or in call order
-(``passes``, ``fails``, ``raises``, ``raises_after``, ``hangs_until``,
-``times_out``), and records each scoped verify as a ``ScopedVerifyCall``;
+``FakeVerifier`` scripts the verify outcome per task id or in call order,
+and records each scoped verify as a ``ScopedVerifyCall``;
 ``FakeRemoteRunner`` is a remote verify host handed to the lane through
 ``remote_runners=``; ``FakeClock`` is a
 hand-advanced clock whose ``sleep`` advances it and waits at most
@@ -125,8 +124,7 @@ class VerifyScript:
     """What one ``FakeVerifier.run_scoped`` call does.
 
     Exactly one of the shapes below applies: return ``result``, raise
-    ``error``, wait for ``release`` first and then return ``result``, or
-    wait for ``release`` and then raise ``error``.
+    ``error``, or wait for ``release`` first and then return ``result``.
     *entered*, when given, is set the moment a call reaches this script,
     before any release wait; it is the arrival half of a release gate.
     """
@@ -161,12 +159,6 @@ def fails(*, category: str, summary: str) -> VerifyScript:
 
 def raises(error: BaseException) -> VerifyScript:
     return VerifyScript(result=passes().result, error=error)
-
-
-def raises_after(
-    release: asyncio.Event, error: BaseException, *, entered: asyncio.Event | None = None,
-) -> VerifyScript:
-    return VerifyScript(result=passes().result, error=error, release=release, entered=entered)
 
 
 def hangs_until(
