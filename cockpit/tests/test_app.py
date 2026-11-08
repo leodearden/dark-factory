@@ -19,10 +19,14 @@ import shutil
 import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 from orchestrator import session_registry as sr
 from textual.coordinate import Coordinate
+
+if TYPE_CHECKING:
+    from cockpit.registry_reader import SessionScannerProtocol
 
 
 def _make_record(**overrides):
@@ -510,11 +514,11 @@ class _ScanStartCountingScanner:
     serialises poll scans (TestScanBackpressure), so the plain int needs no lock.
     """
 
-    def __init__(self, inner) -> None:
+    def __init__(self, inner: SessionScannerProtocol) -> None:
         self._inner = inner
         self.starts = 0
 
-    def scan(self) -> list:
+    def scan(self) -> list[sr.SessionRecord]:
         self.starts += 1
         return self._inner.scan()
 
@@ -547,7 +551,9 @@ class TestTimerIntegration:
 
             # Poll scans never overlap, and each one's apply lands before the
             # next can begin, so by the time a second post-write scan starts
-            # the first (which saw the record) is already on screen.
+            # the first (which saw the record) is already on screen. The second
+            # half rests on cockpit/src/cockpit/app.py::CockpitApp._scan_registry_worker
+            # marshalling _apply_scan BEFORE its finally clears _scan_in_flight.
             while table.row_count == 0 and scanner.starts < starts_at_write + 2:
                 await pilot.pause(app.poll_interval)
 
