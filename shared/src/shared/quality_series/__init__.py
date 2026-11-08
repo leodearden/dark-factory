@@ -10,11 +10,15 @@ from shared.quality_series.landings import (
     LandingBatch,
     landings,
 )
+from shared.quality_series.rows import LandingRow, rows_for, unit_heads
 
 __all__ = [
     'CursorNotOnMain',
     'GitCrossCheck',
     'Landing',
     'LandingBatch',
+    'LandingRow',
     'landings',
+    'rows_for',
+    'unit_heads',
 ]
