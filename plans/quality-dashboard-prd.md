@@ -275,6 +275,23 @@ Invariants: one row per `(project_id, merge_sha)`; `unit_size == len(members)` f
 every member of a unit shares `unit_id`; `git_first_parent` is False for a landing whose sha is not on
 main's first-parent line (served as the disagreement count, never dropped).
 
+**Correction (α, 2026-11-04).** Measured on the df runs.db and git; the shipped shape is
+`shared/src/shared/quality_series/landings.py::landings`.
+- The key is `(project_id, merge_sha, task_id)`. A train lands as one merge commit and its members have
+  no `merge_finalized done` row (0 of 287), so every member carries `merge_sha == unit_id ==
+  train_merged.merge_commit_sha`; per-member lines are not separable, so members share the merge
+  commit's lines and modules (consumers pairing cost with lines aggregate per `unit_id`).
+- Chain units are not formed: `merge_verify.$.chain_items` is a count, not member ids, and 4 of the 5
+  chain-verify shas never reached main. A chain landing is a unit of one.
+- Lines are measured against a typed `lines_base`: a merge's first parent; for a single-parent
+  (fast-forward) landing, the nearest older first-parent commit that is itself a landing (its own first
+  parent is the task's previous commit); off the first-parent line, unmeasurable (None).
+- The signature is `landings(runs_db, repo, since_cursor, *, project_id=None, ...) -> LandingBatch(landings,
+  git_check)`; `project_id` defaults to the repo root's project id (its basename), and the batch carries
+  the git cross-check counts. `since_cursor` has no default; `None` means the full history (every
+  landing in the store, ordered by landed_at then merge_sha), the promise
+  `plans/instruments-honesty-prd.md` decision 2 relies on.
+
 ### Per-landing row (`shared/src/shared/quality_series/rows.py`)
 
 ```
@@ -476,16 +493,23 @@ apply (no load-sampler metric). No waivers.
 
 ## Open questions (tactical)
 
-1. **`train_merged.timestamp` as main's advance.** Leaf α verifies against the member sha's first reach
-   of main; if it is the train's build time, use each member's `merge_finalized done` timestamp.
-   Decide during α.
-2. **`invocation_end.$.turns` across resumed sessions** (114 `session_resume` events in October): if
-   cumulative, α sums only the last row per session. Decide during α by reading
-   `shared/src/shared/cli_invoke.py`'s resume path.
+1. **`train_merged.timestamp` as main's advance.** Resolved by α (2026-11-04): it is main's advance in
+   the same sense as `merge_finalized done`. main's reflog reached the train merges 0f0fbc44ae and
+   dd31d2ad39 2m56s and 3m37s before their `train_merged` events, and the plain landings 9f7cc8091d,
+   1ea166355e and 6c42ed815e 3m52s, 2m54s and 38s before their `done` events: both event types lag the
+   ref update by the same few minutes. The fallback named here does not exist (members have no `done`
+   row). The event timestamp anchors both sources.
+2. **`invocation_end.$.turns` across resumed sessions.** Resolved by α (2026-11-04): summed over every
+   row. `_parse_claude_output` reads `num_turns` raw, and consecutive resumed (`session_delta`)
+   processes of one task and role report non-monotone turns (task 5836 steward 13, 5, 2; task 7977
+   steward 18, 9, 16, 6), which a cumulative counter cannot do. Per-process is a strong hypothesis, not
+   proven per session: `invocation_end` carries no session id.
 3. **Per-merge git cost** (inferred ~30 ms, unmeasured): β measures it and sets the per-root budget from
    the measurement. Decide during β.
-4. **Module key for non-`<pkg>/src/<pkg>` layouts** (reify, the solar repos): first two path components
-   when depth ≥ 3; α's brief may refine per project. Decide during α.
+4. **Module key for non-`<pkg>/src/<pkg>` layouts.** Resolved by α (2026-11-04): `<pkg>/src/<pkg2>/<rest>`
+   keys as `<pkg>/<rest[0]>`; otherwise the first two components at depth ≥ 3, else the first
+   (`crates/reify-core/src/lib.rs` → `crates/reify-core`). See
+   `shared/src/shared/quality_series/git_lines.py::module_key`.
 5. **Whether a 7-minute nightly run on the laptop is preferable** when the host is saturated: θ ships the
    workstation timer; a laptop instance is a config choice later.
 6. **CPUWeight value for the timer unit**: θ picks the lowest value with a precedent in
