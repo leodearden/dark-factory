@@ -1145,7 +1145,7 @@
     "orchestrator/tests/test_halt_owner.py": {"patch_targets": [], "private_reads": 57},
     "orchestrator/tests/test_harness.py": {"patch_targets": ["liveness.TOUCH_MISS_TOLERANCE", "worker.SpeculativeMergeWorker.run"], "private_reads": 31},
     "orchestrator/tests/test_harness_abandoned_merge_deferred_wiring.py": {"patch_targets": [], "private_reads": 4},
-    "orchestrator/tests/test_harness_already_landed_gate_wiring.py": {"patch_targets": [], "private_reads": 294},
+    "orchestrator/tests/test_harness_already_landed_gate_wiring.py": {"patch_targets": [], "private_reads": 297},
     "orchestrator/tests/test_harness_claimant_clear.py": {"patch_targets": [], "private_reads": 16},
     "orchestrator/tests/test_harness_fleet_drain.py": {"patch_targets": [], "private_reads": 5},
     "orchestrator/tests/test_harness_infra_resume_truthful.py": {"patch_targets": [], "private_reads": 8},

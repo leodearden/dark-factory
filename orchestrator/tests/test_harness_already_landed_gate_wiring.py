@@ -22,6 +22,7 @@ bare-harness construction helper exactly.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import sqlite3
@@ -48,6 +49,7 @@ from orchestrator.merge_lane.landing_evidence import (
     LandingEvidenceVerdict,
     validate_landing_evidence,
 )
+from orchestrator.scheduler import TaskAssignment
 
 _HARNESS_SRC_PATH = Path(__file__).parent.parent / 'src' / 'orchestrator' / 'harness.py'
 
@@ -2730,6 +2732,24 @@ class TestAlreadyLandedGateAncestryRejectEmission:
         assert await h._already_landed_dispatch_gate('42') is False
 
         assert len(landing_reject_rows(h.event_store)) == 1
+
+    async def test_a_dispatch_between_two_identical_rejects_records_both(
+        self, mock_orch_config, tmp_path,
+    ) -> None:
+        """The counting unit is one row per signature per dispatch the reject let through."""
+        h = _emitting_harness(mock_orch_config, tmp_path)
+        _effect_absent(h)
+        assert await h._already_landed_dispatch_gate('42') is False
+
+        slot = h._launch_slot(
+            TaskAssignment(task_id='42', task={'id': '42'}, modules=[]),
+            asyncio.Semaphore(0), [],
+        )
+        slot.cancel()
+        await asyncio.gather(slot, return_exceptions=True)
+
+        assert await h._already_landed_dispatch_gate('42') is False
+        assert len(landing_reject_rows(h.event_store)) == 2
 
     async def test_an_accepted_ancestry_landing_records_nothing(
         self, mock_orch_config, tmp_path,
