@@ -2413,11 +2413,29 @@ class DeterministicRunner:
         the verdict.  It comes first, so a lost trailing status write leaves a
         task whose advanced ``at`` already withholds re-dispatch.  A REFUSED
         write is escalated instead: with ``at`` not advanced, re-pending would
-        re-dispatch at once into the same 75, a loop with no escape.
+        re-dispatch at once into the same 75, a loop with no escape.  So is a
+        milestone with no readable scheduled fire time, which
+        ``rearmed_milestone`` refuses before anything is written.
         """
         next_check_at = record.next_check_at.isoformat()
+        try:
+            milestone = rearmed_milestone(metadata['milestone'], next_check_at)
+        except ValueError as exc:
+            return await self._file_infra_issue_and_block(
+                task_id,
+                summary='Predicate re-arm refused (rc=75)',
+                detail='\n'.join([
+                    f'The predicate answered "not yet" (exit 75) and should have re-armed '
+                    f'to next_check_at={next_check_at}, but the milestone was refused: {exc}',
+                    'Blocked rather than re-pended: nothing was written, so a re-dispatch '
+                    'would re-run the check at once into the same verdict.',
+                    'Repair milestone.scheduled_fire_at (or remove it so milestone.at is '
+                    'the fire time), then resume to re-run the check.',
+                ]),
+                category=no_verdict_category,
+            )
         stamps = {
-            'milestone': rearmed_milestone(metadata['milestone'], next_check_at),
+            'milestone': milestone,
             **verdict_stamps(metadata, verdict, record, always_stamp_verdict=True),
         }
         if not await self.scheduler.update_task(task_id, stamps, metadata_mode='merge'):

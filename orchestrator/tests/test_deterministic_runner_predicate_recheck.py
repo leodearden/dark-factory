@@ -426,6 +426,27 @@ class TestRearmWriteFailures:
         assert 'gate_escalated_at' not in scheduler.updates()[0]
         assert event_store.fetch_events_by_type(EventType.predicate_rearmed) == []
 
+    async def test_an_unreadable_fire_time_escalates_instead_of_re_arming(
+        self, queue, event_store,
+    ):
+        milestone = {**DECLARED_MILESTONE, 'scheduled_fire_at': None}
+        scheduler = _scheduler(
+            _predicate_task(recheck_secs=86400, milestone=milestone), event_store,
+        )
+
+        outcome = await _run(
+            scheduler, queue, _ScriptRunner(75, NOT_YET), **_rearm_kwargs(_Clock()),
+        )
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        assert [s['status'] for s in scheduler.statuses()] == ['blocked']
+        [escalation] = _pending(queue)
+        assert escalation.category == 'infra_issue'
+        assert 're-arm refused' in escalation.summary
+        assert 'ISO-8601 scheduled fire time' in escalation.detail
+        assert scheduler.updates() == []
+        assert event_store.fetch_events_by_type(EventType.predicate_rearmed) == []
+
 
 STALL_SUMMARY = 'Milestone predicate still not satisfied after {cap} consecutive checks'
 

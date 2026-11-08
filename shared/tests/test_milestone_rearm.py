@@ -54,6 +54,22 @@ class TestRearmedMilestone:
 
         assert original == before
 
+    @pytest.mark.parametrize(
+        'milestone',
+        [
+            {'mode': 'dated'},
+            {'mode': 'dated', 'at': 'not-a-date'},
+            {'mode': 'dated', 'at': SCHEDULED, 'scheduled_fire_at': None},
+            {'mode': 'dated', 'at': SCHEDULED, 'scheduled_fire_at': 'not-a-date'},
+        ],
+        ids=['no-at', 'unparseable-at', 'null-fire-time', 'unparseable-fire-time'],
+    )
+    def test_a_milestone_with_no_iso_fire_time_is_refused(self, milestone: dict) -> None:
+        with pytest.raises(ValueError, match='ISO-8601 scheduled fire time') as refusal:
+            rearmed_milestone(milestone, FIRST_CHECK)
+
+        assert repr(milestone) in str(refusal.value)
+
 
 class TestScheduledFireAt:
     def test_a_never_rearmed_dated_milestone_fires_at_its_at(self) -> None:
