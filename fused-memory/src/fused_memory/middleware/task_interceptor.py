@@ -54,13 +54,11 @@ from fused_memory.backends.task_backend_errors import (
     LeakedEnvelopeMarkupError,
     MetadataNotAnObjectError,
     StatusWriteAuthorityError,
-    TaskNotFoundError,
 )
 from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
 from fused_memory.backends.task_backend_types import (
     AmendmentAdvisory,
     MetadataLookupResult,
-    MetadataLookupRow,
 )
 from fused_memory.config.schema import CuratorConfig
 from fused_memory.middleware import deferral_gate, recon_write_policy
@@ -79,7 +77,6 @@ from fused_memory.middleware.curation_deferral import (
     pool_defer_reason,
 )
 from fused_memory.middleware.curator_types import (
-    NON_CANCELLED_STATUSES,
     CandidateTask,
     CuratorDecision,
     PreparedCandidate,
@@ -124,6 +121,12 @@ from fused_memory.middleware.path_scope_guard import (
 )
 from fused_memory.middleware.pre_done_hook import run_hook as _run_hook
 from fused_memory.middleware.project_prefix_registry import ProjectPrefixRegistry
+from fused_memory.middleware.r4_idempotency import (
+    DroppedItem,
+    R4Verdict,
+    check_r4,
+    metadata_keeping,
+)
 from fused_memory.middleware.recurrence_mint import (
     RECURRENCE_MINT_SOURCE,
     MintOutcome,
@@ -321,9 +324,6 @@ def _resolve_backend_label(taskmaster: Any) -> str:
 # and never compares them to the backend's sentinel.
 _UNSET = object()
 
-# One R4 lookup page; a suggestion_hash shared past it is paged, not missed.
-_R4_LOOKUP_PAGE = 100
-
 
 def _maybe_kwargs(sentinel: object, **pairs: object) -> dict:
     """Return only the *pairs* entries whose value is not *sentinel*.
@@ -432,6 +432,25 @@ class _PreparedTicket:
     candidate: CandidateTask | None
     prepared: PreparedCandidate | None
     attribution: CreationAttribution
+    r4_dropped: tuple[DroppedItem, ...] = ()
+
+    def keeping(self, verdict: R4Verdict) -> '_PreparedTicket':
+        """This ticket filing only the verdict's kept items, carrying what R4 dropped."""
+        candidate = (
+            None if self.candidate is None
+            else dataclasses.replace(self.candidate, items=verdict.kept)
+        )
+        prepared = (
+            None if self.prepared is None or candidate is None
+            else dataclasses.replace(self.prepared, candidate=candidate)
+        )
+        return dataclasses.replace(
+            self,
+            metadata=metadata_keeping(coerce_task_metadata(self.metadata) or {}, verdict),
+            candidate=candidate,
+            prepared=prepared,
+            r4_dropped=verdict.dropped,
+        )
 
     @property
     def prompt_tokens(self) -> int:
@@ -4048,97 +4067,32 @@ class TaskInterceptor:
         *,
         project_root: str,
         metadata,
-    ) -> tuple[dict | None, bool]:
-        """Return ``(hit, check_failed)`` where ``hit`` is an existing task's
-        identity if ``(escalation_id, suggestion_hash)`` in ``metadata``
-        matches a non-cancelled task, and ``check_failed`` is ``True`` when the
-        metadata lookup or its confirming read raised (so callers can fall
-        through to CREATE rather than treating a failure as a clean no-hit).
+    ) -> R4Verdict:
+        """R4 for one ticket's metadata (``r4_idempotency.py::check_r4``); no hit when it cannot run.
 
-        The store is asked for the tasks carrying the ``suggestion_hash``, and
-        each match's ``escalation_id`` is confirmed with one read, so the check
-        is bounded by the matching rows, not by the task tree.
-
-        R4: authoritative and cheap — no LLM, no embedding lookup.
-        Works even when the curator is disabled or broken, which is
-        exactly the regime that triggered the duplicate Type::Error
-        tasks (esc-1912-179 → esc-1912-190).
+        A lookup that raised falls through to CREATE with every item, logged here.
         """
         meta = self._extract_metadata_dict(metadata)
-        if not meta:
-            return (None, False)
-        esc_id = meta.get('escalation_id')
-        sug_hash = meta.get('suggestion_hash')
-        if not isinstance(esc_id, str) or not isinstance(sug_hash, str):
-            return (None, False)
-        if not esc_id or not sug_hash:
-            return (None, False)
-
-        if self.taskmaster is None:
-            return (None, False)
+        if not meta or self.taskmaster is None:
+            return R4Verdict()
         try:
-            row = await self._escalation_match(self.taskmaster, project_root, esc_id, sug_hash)
+            verdict = await check_r4(self.taskmaster, project_root, meta)
         except Exception:
             logger.warning(
                 'r4: metadata lookup failed during idempotency check',
                 exc_info=True,
             )
-            return (None, True)
-        if row is None:
-            return (None, False)
-        tid = str(row['task_id'])
-        logger.warning(
-            'r4: idempotency hit — returning existing task %s for '
-            'escalation_id=%s suggestion_hash=%s',
-            tid,
-            esc_id,
-            sug_hash,
-        )
-        return (
-            {
-                'id': tid,
-                'title': str(row['title']),
-                'deduplicated': True,
-                'action': 'idempotency_hit',
-                'reason': 'escalation+suggestion matched',
-            },
-            False,
-        )
-
-    async def _escalation_match(
-        self,
-        taskmaster: TaskBackendProtocol,
-        project_root: str,
-        esc_id: str,
-        sug_hash: str,
-    ) -> MetadataLookupRow | None:
-        """The first non-cancelled task carrying *sug_hash* whose ``escalation_id`` is *esc_id*."""
-        offset = 0
-        while True:
-            page = await taskmaster.find_tasks_by_metadata(
-                project_root, key='suggestion_hash', value=sug_hash,
-                statuses=list(NON_CANCELLED_STATUSES), limit=_R4_LOOKUP_PAGE, offset=offset,
+            return R4Verdict()
+        if verdict.hit is not None:
+            logger.warning(
+                'r4: idempotency hit — returning existing task %s (%s) for '
+                'escalation_id=%s suggestion_hash=%s',
+                verdict.hit.task_id,
+                verdict.match,
+                meta.get('escalation_id'),
+                meta.get('suggestion_hash'),
             )
-            rows = list(page['results'])
-            if not rows:
-                return None
-            for row in rows:
-                if await self._carries_escalation(taskmaster, project_root, row['task_id'], esc_id):
-                    return row
-            offset += len(rows)
-            if offset >= page['total']:
-                return None
-
-    async def _carries_escalation(
-        self, taskmaster: TaskBackendProtocol, project_root: str, task_id: int, esc_id: str,
-    ) -> bool:
-        """Whether task *task_id* still exists and its metadata names *esc_id*."""
-        try:
-            task = await taskmaster.get_task(str(task_id), project_root)
-        except TaskNotFoundError:
-            return False
-        task_meta = self._extract_metadata_dict(task.get('metadata'))
-        return bool(task_meta) and task_meta.get('escalation_id') == esc_id
+        return verdict
 
     async def submit_task(
         self, project_root: str, *, agent_id: str | None = None, **kwargs: Any
@@ -5379,36 +5333,29 @@ class TaskInterceptor:
             curator = await self._get_curator()
 
             # ── R4 idempotency checks (per-ticket, before curator call) ──────
-            # Tickets that match an existing non-cancelled task are resolved
-            # 'combined' immediately and excluded from the curate call.
+            # A ticket whose work a live task already carries resolves
+            # 'combined' onto it and is excluded from the curate call; one
+            # carrying some live items is filed with the rest.
             active_ticket_data: list[_PreparedTicket] = []
             for t in ticket_data:
-                # _idem_check_failed is intentionally unused today: both
-                # check_failed=True and check_failed=False with hit=None fall
-                # through to CREATE — retained for future observability/metrics.
-                idempotency_hit, _idem_check_failed = (
-                    await self._check_escalation_idempotency(
-                        project_root=t.project_root,
-                        metadata=t.metadata,
-                    )
+                verdict = await self._check_escalation_idempotency(
+                    project_root=t.project_root,
+                    metadata=t.metadata,
                 )
-                if idempotency_hit is not None:
-                    existing_id = str(idempotency_hit.get('id', ''))
+                if verdict.hit is not None:
                     await self._persist_worker_terminal(
                         t.ticket_id,
                         status=TicketStatus.COMBINED,
-                        task_id=existing_id or None,
+                        task_id=str(verdict.hit.task_id),
                         reason='idempotency_hit',
-                        result_dict=idempotency_hit,
+                        result_dict=verdict.hit_result(),
                         caller='add_tickets_batch_idempotency',
                         project_root=t.project_root,
                         attribution=t.attribution,
                     )
                     self._signal_ticket_event(t.ticket_id)
                 else:
-                    # check_failed=True (get_tasks raised) → fall through to
-                    # CREATE; WARNING already emitted at source.
-                    active_ticket_data.append(t)
+                    active_ticket_data.append(t.keeping(verdict) if verdict.partial else t)
             ticket_data = active_ticket_data
 
             if not ticket_data:
@@ -5605,6 +5552,17 @@ class TaskInterceptor:
                         reason = str(exc)
                         task_id = None
                         result_dict = None
+
+                    if t.r4_dropped:
+                        result_dict = {
+                            **(result_dict or {}),
+                            'idempotency_dropped_items': [d.to_record() for d in t.r4_dropped],
+                        }
+                        logger.info(
+                            'r4: ticket %s filed without %d item(s) already live: %s',
+                            t.ticket_id, len(t.r4_dropped),
+                            ', '.join(f'{d.key}->{d.owner.task_id}' for d in t.r4_dropped),
+                        )
 
                     await self._persist_worker_outcome(
                         t.ticket_id,
