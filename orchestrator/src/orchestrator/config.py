@@ -50,6 +50,7 @@ from orchestrator.config_census_ignore import (  # noqa: F401 (re-exported for t
     audit_census_ignore_entries,
     parse_census_ignore_entries,
 )
+from orchestrator.implementer_brief_variant import ImplementerBriefVariant
 from orchestrator.routing import DEFAULT_ALLOWED_MODELS, DEFAULT_LADDER
 from orchestrator.shadow_types import ShadowShape
 from orchestrator.verify_admission_gate import AdmissionOrder
@@ -67,6 +68,13 @@ logger = logging.getLogger(__name__)
 # one-way (verify_runner -> config); config.py imports nothing from
 # verify_runner.py, so there is no cycle.
 VerifyHostPolicy = Literal['prefer_local', 'prefer_remote']
+
+# --- Task-verify host policy (remote task leg, task 6670) ---
+#
+# Same single-home rule as VerifyHostPolicy: task_verify_dispatch.py imports
+# this name as its HostPolicy, so the config field and the dispatcher's
+# eligibility match share one vocabulary.
+VerifyTaskHostPolicy = Literal['local', 'remote_modules', 'remote_all']
 
 
 # --- Priority-tier constants (value/h scheduler) ---
@@ -3674,6 +3682,11 @@ class OrchestratorConfig(BaseSettings):
 
     # Iteration limits
     max_execute_iterations: int = Field(default=10)
+    # Whole-plan or one-step implementer brief, and the bounds each implies:
+    # orchestrator/src/orchestrator/implementer_brief_variant.py (live-shadow-eval PRD decision 14).
+    implementer_brief_variant: ImplementerBriefVariant = Field(
+        default=ImplementerBriefVariant.WHOLE_PLAN,
+    )
     # Independent bound on progress-timeout+resume churn. A ceiling-kill of a
     # productive run (transcript_turns>0) followed by its resume counts as
     # ONE iteration against max_execute_iterations (see
@@ -5605,6 +5618,46 @@ class OrchestratorConfig(BaseSettings):
             'an orchestrator restart.  Must be >= 1.'
         ),
     )
+    verify_task_host_policy: VerifyTaskHostPolicy = Field(
+        default='local',
+        description=(
+            "Which task-role verifies may run on a remote verify host.  'local' "
+            '(default) short-circuits the dispatcher before it records anything, '
+            "so every task verify runs locally exactly as before.  'remote_modules' "
+            'makes a verify eligible when its executed module set intersects '
+            "verify_task_remote_modules; 'remote_all' makes every verify eligible.  "
+            'Read per dispatch, so rollback is one reload to \'local\'.  See '
+            'plans/remote-task-leg-verify-prd.md decision 6.'
+        ),
+    )
+    verify_task_remote_modules: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Module prefixes eligible for a remote task verify under "
+            "verify_task_host_policy 'remote_modules' (must then be non-empty).  "
+            'See plans/remote-task-leg-verify-prd.md decision 6.'
+        ),
+    )
+    verify_task_remote_cross_check_every_n: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            'Parity knob: every n-th task verify that returns a remote verdict, '
+            'green or red, counted per orchestrator process, is re-run locally, '
+            'the local verdict authoritative, recording the agreement in the '
+            'dispatch sidecar (the false-green direction).  0 (default) is off.  '
+            'See plans/remote-task-leg-verify-prd.md decision 9.'
+        ),
+    )
+    verify_task_remote_red_confirms_locally: bool = Field(
+        default=False,
+        description=(
+            'Parity knob: a remote red re-runs the ordinary local verify before the '
+            'verdict is returned, and the local verdict is returned (the '
+            'false-red direction).  Default false.  See '
+            'plans/remote-task-leg-verify-prd.md decision 9.'
+        ),
+    )
 
     # Usage cap handling
     usage_cap: UsageCapConfig = Field(default_factory=UsageCapConfig)
@@ -5867,6 +5920,17 @@ class OrchestratorConfig(BaseSettings):
                 'short inside the grace window. '
                 'Raise timeouts.steward to >= steward_completion_timeout, or lower '
                 'steward_completion_timeout in your orchestrator.yaml.'
+            )
+        return self
+
+    @model_validator(mode='after')
+    def _validate_verify_task_remote_modules(self) -> 'OrchestratorConfig':
+        if self.verify_task_host_policy == 'remote_modules' and not self.verify_task_remote_modules:
+            raise ValueError(
+                "verify_task_host_policy 'remote_modules' needs a non-empty "
+                'verify_task_remote_modules; an empty list would make no task '
+                "verify eligible.  Name the module prefixes, or use 'local' or "
+                "'remote_all'."
             )
         return self
 
@@ -6646,6 +6710,9 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # the shared live config object, so a flip applies from the next
         # merge attempt.
         'pre_merge_reverify',
+        # Flat field read at use by the brief, the EXECUTE cap and resolve_route off
+        # the shared live object (task 5385), like pre_merge_reverify.
+        'implementer_brief_variant',
         # EASY-backfill admission (task 3823 / PRD C7).  Explicit literals, not
         # a _submodel_leaf_paths group: these are FLAT top-level fields, not a
         # submodel.  Green-tier on purpose — PRD Open Q3 ships safety_factor
@@ -6765,6 +6832,14 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # dispatch prefers and cannot split an in-flight merge.  Read the
         # field's trust-anchor caveat before flipping it live.
         'verify_host_policy',
+        # Remote task-leg dispatch policy and parity knobs (task 6670) — read
+        # per dispatch and per remote grant through
+        # task_verify_dispatch.py::policy_from_config, so a reload never
+        # changes a leg already running.
+        'verify_task_host_policy',
+        'verify_task_remote_modules',
+        'verify_task_remote_cross_check_every_n',
+        'verify_task_remote_red_confirms_locally',
         # Per-model USD/1M-token price table (task 2459) — green-tier like
         # verify_env above. Threaded into every task-workflow role
         # invocation via the shared TaskWorkflow._invoke chokepoint (task

@@ -1,0 +1,18 @@
+{
+  "task_id": "3076",
+  "reason": "net-additive \u03b4 amendment \u2014 the IN_USE re-key refusal moves from note_assigned's _refuse_in_use_steal into transition() (_refuse_in_use_rekey), so every direct transition() caller is protected, not only note_assigned; the guard gains one branch over the helper it replaces",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/lane_lifecycle.py",
+      "baseline": 56,
+      "current": 57
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5038,
+      "current": 5039
+    }
+  ]
+}

@@ -66,7 +66,7 @@ def _setup(
 
 
 def _mirror(f: _Fixture) -> dict:
-    return json.loads((f.artifacts.root / 'reviews' / 'reviewer_comprehensive.json').read_text())
+    return json.loads((f.artifacts.artifact_path('reviews') / 'reviewer_comprehensive.json').read_text())
 
 
 @pytest.mark.asyncio

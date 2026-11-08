@@ -14,9 +14,10 @@ always loses to an existing ``config.prices`` entry).
 import logging
 import os
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from orchestrator.config import default_price_table
+from orchestrator.implementer_brief_variant import ImplementerBriefVariant
 from orchestrator.shadow_types import CostBasis
 
 from .metrics import CANDIDATE_ROLES, RoleUnderTest
@@ -41,6 +42,9 @@ class EvalConfig:
     role: RoleUnderTest = RoleUnderTest.IMPLEMENTER
     max_budget_usd: float = 20.0
     env_overrides: dict[str, str] = field(default_factory=dict)
+    # The implementer brief variant this candidate runs under; becomes the
+    # cell's OrchestratorConfig.implementer_brief_variant (task 5385).
+    harness_variant: ImplementerBriefVariant = ImplementerBriefVariant.WHOLE_PLAN
     # vLLM-only pod fields (None / 0 for non-vllm or workstation configs)
     image: str | None = None              # Docker image tag
     gpu_type: str | None = None           # RunPod GPU type id
@@ -53,6 +57,10 @@ class EvalConfig:
                 f'EvalConfig {self.name!r}: role {self.role.value!r} is not a candidate '
                 f'role; expected one of {sorted(r.value for r in CANDIDATE_ROLES)}',
             )
+
+
+class UnknownHarnessVariant(ValueError):
+    """A ``<name>@<variant>`` lookup named a variant outside ImplementerBriefVariant."""
 
 
 def _vllm_config(
@@ -487,7 +495,36 @@ def get_config_by_name(name: str) -> EvalConfig | None:
     judge candidate is intentionally unsupported: a lookup returns ``None``
     ("Unknown config") — a graceful, no-silent-misbehavior failure — rather
     than mis-running. See ``JUDGE_EVAL_CONFIGS`` below and design decision 4.
+
+    A name may carry a harness variant, ``<name>@<variant>`` (task 5385): it
+    resolves to a copy of the registered ``<name>`` relabelled with the full
+    requested name and carrying that ``harness_variant``. Two refusals keep a
+    variant from silently not applying: an unknown or empty variant raises
+    ``UnknownHarnessVariant`` before any scan, and a non-whole-plan variant on
+    a non-implementer candidate raises ``ValueError`` naming its role.
     """
+    base_name, separator, raw_variant = name.partition('@')
+    if not separator:
+        return _find_registered(name)
+    try:
+        variant = ImplementerBriefVariant(raw_variant)
+    except ValueError:
+        known = ', '.join(repr(member.value) for member in ImplementerBriefVariant)
+        raise UnknownHarnessVariant(
+            f'{name!r}: unknown harness variant {raw_variant!r}; known: {known}',
+        ) from None
+    base = _find_registered(base_name)
+    if base is None:
+        return None
+    if variant is not ImplementerBriefVariant.WHOLE_PLAN and base.role is not RoleUnderTest.IMPLEMENTER:
+        raise ValueError(
+            f'{name!r}: harness variant {variant.value!r} changes only the '
+            f'implementer brief, but {base_name!r} is a {base.role.value!r}-role candidate',
+        )
+    return replace(base, name=name, harness_variant=variant)
+
+
+def _find_registered(name: str) -> EvalConfig | None:
     families: tuple[Callable[[], list[EvalConfig]], ...] = (
         lambda: [*EVAL_CONFIGS, *FINAL_RUN_CONFIGS, *ARCHITECT_EVAL_CONFIGS],
         claude_endpoint_candidates,

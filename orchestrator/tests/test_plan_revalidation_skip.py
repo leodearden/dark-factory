@@ -3,8 +3,8 @@
 When the prior plan has provenance and the diff main has gained since the
 plan was stamped does not overlap any plan files, the architect's
 revalidation pass is short-circuited. The orchestrator stamps
-``_revalidated_at`` and bumps ``base_commit`` directly (mirroring
-``confirm_plan``), then returns PLANNED without invoking the architect.
+``_revalidated_at`` and advances the plan's own ``_base_commit`` to current
+main, then returns PLANNED without invoking the architect.
 
 Task 4031 adds a fifth precondition: the plan's ``_task_text_fp`` must equal
 the fingerprint of the task's current description/details.
@@ -27,8 +27,8 @@ from _workflow_helpers import FakeMetadataBackend, wire_metadata_backend
 from shared.cli_invoke import AgentResult
 from shared.task_text_fingerprint import TaskTextDrift, task_text_fingerprint
 
-from orchestrator.artifacts import PLAN_SCHEMA_VERSION, TaskArtifacts
-from orchestrator.config import OrchestratorConfig
+from orchestrator.artifacts import PLAN_BASE_COMMIT_KEY, PLAN_SCHEMA_VERSION, TaskArtifacts
+from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventType
 from orchestrator.mcp.plan_tools import (
     _add_plan_step,
@@ -99,6 +99,7 @@ def _make(
     plan_text_fp_gate_enabled: bool = True,
     plan_steps: list[dict] | None = None,
     git_head: bool = False,
+    plan_base_commit: str | None = None,
 ) -> _Fixture:
     if plan_files is None:
         plan_files = ['mod_a/file.py']
@@ -140,9 +141,11 @@ def _make(
     }
     if plan_text_fp is not None:
         plan['_task_text_fp'] = plan_text_fp
+    if plan_base_commit is not None:
+        plan[PLAN_BASE_COMMIT_KEY] = plan_base_commit
     # Write directly (bypassing artifacts.write_plan, which clobbers
     # _schema_version) so the schema-mismatch test can stage stale plans.
-    (artifacts.root / 'plan.json').write_text(json.dumps(plan))
+    artifacts.artifact_path('plan.json').write_text(json.dumps(plan))
 
     assignment = MagicMock()
     assignment.task_id = task_id
@@ -162,6 +165,7 @@ def _make(
     config.lock_depth = 2
     config.steward_completion_timeout = 300.0
     config.project_root = project_root
+    config.git = GitConfig(main_branch='main')
     config.revalidation_skip_enabled = revalidation_skip_enabled
     config.max_revalidation_age_hours = max_revalidation_age_hours
     config.plan_text_fp_gate_enabled = plan_text_fp_gate_enabled
@@ -187,6 +191,8 @@ def _make(
     git_ops.get_changed_files = get_changed_files
     # The done-step reconciler's collaborators: every done commit reachable.
     git_ops.is_ancestor = AsyncMock(return_value=True)
+    # The plan's own _base_commit is corroborated as on main's history.
+    git_ops.is_ancestor_checked = AsyncMock(return_value=True)
     git_ops.get_commit_subjects = AsyncMock(return_value=[])
     git_ops.find_equivalent_commit = AsyncMock(return_value=None)
     git_ops.get_commit_changed_files = AsyncMock(return_value=[])
@@ -252,8 +258,9 @@ async def test_overlap_zero_short_circuits(tmp_path: Path):
     assert '_revalidated_at' in plan
     assert plan['_revalidated_by_session'] == f.wf.session_id
 
-    # base_commit advanced to current main SHA
-    assert f.artifacts.read_base_commit() == 'newmain456'
+    # The skip advances the plan's own base; the dispatch base is untouched.
+    assert plan[PLAN_BASE_COMMIT_KEY] == 'newmain456'
+    assert f.artifacts.read_base_commit() == 'oldmain123'
 
     # phase_skipped event emitted with the right reason
     skip_calls = [c for c in f.event_emit.call_args_list
@@ -465,7 +472,7 @@ async def test_fresh_dispatch_excludes_prior_proposals(tmp_path: Path):
     """
     f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
     # Simulate a truly-fresh dispatch: no plan.json on disk at all.
-    (f.artifacts.root / 'plan.json').unlink()
+    f.artifacts.artifact_path('plan.json').unlink()
 
     with pytest.raises(AssertionError, match='architect must NOT'):
         await f.wf._plan()
@@ -613,7 +620,7 @@ def _confirm_plan_architect(f: _Fixture, monkeypatch: pytest.MonkeyPatch) -> Asy
     """An architect that only calls confirm_plan(): every plan key is kept."""
     async def _confirm(_role, build_prompt, *args, **kwargs) -> AgentResult:
         await build_prompt()
-        plan_path = f.artifacts.root / 'plan.json'
+        plan_path = f.artifacts.artifact_path('plan.json')
         plan = json.loads(plan_path.read_text())
         plan['_finalized_at'] = datetime.now(UTC).isoformat()
         plan_path.write_text(json.dumps(plan))
@@ -838,7 +845,7 @@ async def test_mirror_failure_never_fails_the_plan(
 
 
 def _finalize_fixture_plan(f: _Fixture) -> None:
-    plan_path = f.artifacts.root / 'plan.json'
+    plan_path = f.artifacts.artifact_path('plan.json')
     plan = json.loads(plan_path.read_text())
     plan['_finalized_at'] = '2026-10-01T00:00:00+00:00'
     plan_path.write_text(json.dumps(plan))
@@ -957,7 +964,7 @@ async def test_done_step_the_architect_re_marks_at_an_orphaned_commit_is_reconci
     async def _mark_then_confirm(_role, build_prompt, *args, **kwargs) -> AgentResult:
         await build_prompt()
         assert f.artifacts.mark_step_committed('step-2', remarked)
-        plan_path = f.artifacts.root / 'plan.json'
+        plan_path = f.artifacts.artifact_path('plan.json')
         plan = json.loads(plan_path.read_text())
         plan['_finalized_at'] = datetime.now(UTC).isoformat()
         plan_path.write_text(json.dumps(plan))

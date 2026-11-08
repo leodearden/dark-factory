@@ -19,10 +19,12 @@ WHY SIGNAL IS VALID UNDER XDIST. A Python signal handler only ever runs on the
 MAIN thread. pytest-xdist 3.6.0 (changelog #1027) starts its workers with
 execnet's ``main_thread_only`` execmodel
 (``xdist/workermanage.py::NodeManager``), so tests run on each worker's main
-thread and SIGALRM reaches them. The member floors do NOT guarantee that: they
-read ``pytest-xdist>=3.5.0``, and orchestrator's ``>=3.0``. What guarantees it
-is the single workspace ``uv.lock`` pin, at 3.8.0 when this was written. A
-resolve below 3.6.0 would put tests back on a non-main thread, and
+thread and SIGALRM reaches them. The member floors guarantee that: every
+workspace member's pytest-xdist declaration reads ``>=3.6.0`` (esc-5470-3,
+ruled 2026-10-07; task 6477), which
+``test_every_pytest_xdist_floor_admits_only_main_thread_workers`` enforces, and
+the single workspace ``uv.lock`` pin (3.8.0 when this was written) sits above
+it. A resolve below 3.6.0 would put tests back on a non-main thread, and
 ``test_runs_on_main_thread`` in the probe below is what turns that red.
 
 THE MEASUREMENT (task 5470; pytest 9.0.3, pytest-xdist 3.8.0, execnet 2.1.2,
@@ -108,9 +110,10 @@ THE DECISION:
     governs the worker deaths that remain (segfault, OOM, ``os._exit`` in code
     under test). ``test_xdist_worker_restart_policy.py`` records why, and pins
     it.
-  * The pytest-xdist floors stay as they are. Raising them to ``>=3.6.0`` is
-    esc-5470-3, which awaits a ruling; until then the ``uv.lock`` pin and the
-    probe's main-thread assertions guard the premise above.
+  * Every pytest-xdist floor is ``>=3.6.0``, by esc-5470-3's ruling (task
+    6477). Three things guard the premise above: the floor test
+    (``tests/scripts/test_timeout_method_policy.py::test_every_pytest_xdist_floor_admits_only_main_thread_workers``),
+    the ``uv.lock`` pin, and the probe's main-thread assertions.
 
 Citations are by ``path::symbol``, never file:line, which is the house style
 ``test_line_pin_policy.py`` enforces in this directory.
@@ -124,13 +127,19 @@ import pathlib
 import re
 import subprocess
 import sys
+import tomllib
 import types
 
 import pytest
-
-# The one config-discovery walk, with its anti-vacuity floors. Resolves because
-# tests/scripts/conftest.py puts this directory on sys.path.
-import test_pytest_per_test_timeout_policy as per_test_timeout_policy
+from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
+from packaging.version import Version
+from pytest_config_discovery import (
+    REPO_ROOT,
+    ROOT_CONFIG_NAME,
+    discovered_pytest_configs,
+    workspace_members,
+)
 
 SIGNAL_METHOD = 'signal'
 THREAD_METHOD = 'thread'
@@ -139,6 +148,16 @@ THREAD_METHOD = 'thread'
 # future member is a recorded divergence from signal, with its reason in the
 # module docstring.
 THREAD_TIMEOUT_METHOD_CONFIGS: frozenset[str] = frozenset()
+
+# The first pytest-xdist release whose workers run under execnet's
+# main_thread_only execmodel (changelog #1027), which the docstring's signal
+# premise depends on.
+MAIN_THREAD_WORKERS_XDIST = Version('3.6.0')
+XDIST_DISTRIBUTION = 'pytest-xdist'
+
+# A FLOOR, not an equality: 8 at authorship, every workspace member. Same idiom
+# as pytest_config_discovery.MIN_EXPECTED_PYTEST_CONFIGS.
+MIN_EXPECTED_XDIST_DECLARERS = 8
 
 PROBE_WORKERS = 2
 PROBE_TIMEOUT_SECS = 2
@@ -565,7 +584,7 @@ def test_the_probes_take_this_runs_per_test_timeout_and_the_child_budget_sits_be
 def test_thread_timeout_method_is_confined_to_the_recorded_configs() -> None:
     thread_configs = {
         name
-        for name, ini_options in per_test_timeout_policy.discovered_pytest_configs().items()
+        for name, ini_options in discovered_pytest_configs().items()
         if ini_options.get('timeout_method') == THREAD_METHOD
     }
     assert thread_configs == THREAD_TIMEOUT_METHOD_CONFIGS, (
@@ -578,4 +597,94 @@ def test_thread_timeout_method_is_confined_to_the_recorded_configs() -> None:
         'THREAD_TIMEOUT_METHOD_CONFIGS and the rationale in '
         'tests/scripts/test_timeout_method_policy.py\'s module docstring in the '
         'same change.'
+    )
+
+
+def _xdist_requirements(config_name: str) -> list[Requirement]:
+    """Every pytest-xdist entry *config_name*'s pyproject.toml declares.
+
+    Reads all three tables that can declare one: ``[project].dependencies``,
+    every list in ``[project.optional-dependencies]``, and every group in
+    ``[dependency-groups]``. Dict entries such as ``{include-group = ...}`` name
+    another group rather than a distribution, so they are skipped; the group
+    they include is walked in its own right.
+    """
+    pyproject = REPO_ROOT / config_name / 'pyproject.toml'
+    data = tomllib.loads(pyproject.read_text(encoding='utf-8'))
+    project = data.get('project', {})
+    declaration_lists = [
+        project.get('dependencies', []),
+        *project.get('optional-dependencies', {}).values(),
+        *data.get('dependency-groups', {}).values(),
+    ]
+    requirements = [
+        Requirement(entry)
+        for entries in declaration_lists
+        for entry in entries
+        if isinstance(entry, str)
+    ]
+    return [req for req in requirements if canonicalize_name(req.name) == XDIST_DISTRIBUTION]
+
+
+def _floor_violation(config_name: str, requirement: Requirement) -> str | None:
+    """Why *requirement* admits an xdist below ``MAIN_THREAD_WORKERS_XDIST``, or None."""
+    floors = [
+        Version(clause.version)
+        for clause in requirement.specifier
+        if clause.operator == '>='
+    ]
+    if not floors:
+        return (
+            f'{config_name}/pyproject.toml declares {str(requirement)!r}, which has no '
+            f'`>=` floor; spell it {XDIST_DISTRIBUTION}>={MAIN_THREAD_WORKERS_XDIST}'
+        )
+    if max(floors) < MAIN_THREAD_WORKERS_XDIST:
+        return (
+            f'{config_name}/pyproject.toml declares {str(requirement)!r}, below the '
+            f'required floor {XDIST_DISTRIBUTION}>={MAIN_THREAD_WORKERS_XDIST}'
+        )
+    return None
+
+
+def test_every_pytest_xdist_floor_admits_only_main_thread_workers() -> None:
+    """The declaration-level guard on the signal premise.
+
+    The probes above check the resolved xdist at run time and ``uv.lock`` pins
+    it; this checks what the root pyproject.toml and every workspace member
+    admit, in any dependency table, so a lowered floor or a new declaration at
+    an old one fails here, by name, before any relock can resolve below it.
+    """
+    declarers: list[str] = []
+    violations: list[str] = []
+    config_names = [
+        ROOT_CONFIG_NAME,
+        *workspace_members(),
+    ]
+    for config_name in config_names:
+        requirements = _xdist_requirements(config_name)
+        if requirements:
+            declarers.append(config_name)
+        violations.extend(
+            violation
+            for violation in (_floor_violation(config_name, req) for req in requirements)
+            if violation is not None
+        )
+
+    assert len(declarers) >= MIN_EXPECTED_XDIST_DECLARERS, (
+        f'only {len(declarers)} pyproject.toml files declare {XDIST_DISTRIBUTION} '
+        f'({sorted(declarers)}), expected at least {MIN_EXPECTED_XDIST_DECLARERS}. '
+        'Discovery reads the root pyproject.toml plus one per '
+        '[tool.uv.workspace].members entry, and in each the [project] '
+        'dependencies, [project.optional-dependencies] and [dependency-groups]; '
+        'a declaration it stopped finding is one this guard no longer checks.'
+    )
+    assert not violations, (
+        f'these {XDIST_DISTRIBUTION} declarations admit a release below '
+        f'{MAIN_THREAD_WORKERS_XDIST}:\n'
+        + '\n'.join(f'  {violation}' for violation in violations)
+        + f'\n\nBelow {MAIN_THREAD_WORKERS_XDIST}, xdist does not run tests on the '
+        "worker's main thread, so SIGALRM never reaches them and this file's "
+        'premise that timeout_method = "signal" is valid under xdist fails. '
+        'See tests/scripts/test_timeout_method_policy.py\'s module docstring and '
+        'esc-5470-3.'
     )

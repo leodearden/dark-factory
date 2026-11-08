@@ -16,7 +16,8 @@ harness by bare module-name sibling import (no ``tests/__init__.py``):
 
 Step-1 (this commit) covers the pure predicate + recorder foundation:
   * ``_chain_dead_link(item, main_sha)`` — the single shared chain-intact predicate.
-  * ``_record_dead_base(*shas)`` — the bounded-FIFO dead-commit ledger.
+  * ``_record_dead_base(*shas, killer)`` — the dead-commit ledger's write path
+    (its bounded FIFO is pinned by test_merge_lane_dead_base_ledger.py).
 Adoption / dispatch / cascade enforcement land in later steps.
 """
 
@@ -45,6 +46,7 @@ from test_merge_speculation import _LateArrivalFakeEventStore
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, _run
+from orchestrator.merge_lane.dead_base_ledger import DeadBaseKiller, DeadBaseSite
 from orchestrator.merge_lane.worker import (
     DecidedItem,
     InflightEntry,
@@ -101,6 +103,7 @@ def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
 # 40-char fake SHAs, mutually distinct so base==main / base∈dead-set are
 # unambiguous.
 _DEAD = 'd' * 40
+_KILLER = DeadBaseKiller(DeadBaseSite.HEAD_FAILED, 'chain-intact-killer')
 _MAIN = 'a' * 40
 # A LIVE deep predecessor merge_commit — != main and NOT in the dead set.  A
 # verdict on this base is verify-depth-agnostic INTACT (never voided).
@@ -194,7 +197,7 @@ class TestChainDeadLinkPredicate:
         _, item = _make_fake_item(
             't1', base_sha='deadcommit', merge_commit='mc1', config=config, git_repo=git_repo,
         )
-        worker._dead_base_commits.add('deadcommit')
+        worker._record_dead_base('deadcommit', killer=_KILLER)
         assert worker._chain_dead_link(item, 'livemain') == 'deadcommit'
 
     async def test_base_equals_main_returns_none(
@@ -205,7 +208,7 @@ class TestChainDeadLinkPredicate:
         _, item = _make_fake_item(
             't2', base_sha='mainsha', merge_commit='mc2', config=config, git_repo=git_repo,
         )
-        worker._dead_base_commits.add('mainsha')
+        worker._record_dead_base('mainsha', killer=_KILLER)
         assert worker._chain_dead_link(item, 'mainsha') is None
 
     async def test_live_deep_base_returns_none(
@@ -227,31 +230,8 @@ class TestChainDeadLinkPredicate:
         _, item = _make_fake_item(
             't4', base_sha='deadcommit', merge_commit=None, config=config, git_repo=git_repo,
         )
-        worker._dead_base_commits.add('deadcommit')
+        worker._record_dead_base('deadcommit', killer=_KILLER)
         assert worker._chain_dead_link(item, 'livemain') is None
-
-
-# ── _record_dead_base bounded FIFO ledger ────────────────────────────────────
-
-
-class TestRecordDeadBase:
-    """The dead-commit ledger is a bounded FIFO: past the cap the oldest recorded
-    commit is evicted; empty/blank/duplicate SHAs are no-ops."""
-
-    def test_record_and_bounded_fifo_eviction(self, git_ops: GitOps) -> None:
-        worker = _make_worker(git_ops)
-        worker._dead_base_commits_cap = 3
-        # cap+1 distinct SHAs → oldest (c0) evicted; size clamps to cap.
-        worker._record_dead_base('c0', 'c1', 'c2', 'c3')
-        assert len(worker._dead_base_commits) == 3
-        assert 'c0' not in worker._dead_base_commits
-        assert {'c1', 'c2', 'c3'} <= worker._dead_base_commits
-
-    def test_record_skips_empty_blank_and_dupes(self, git_ops: GitOps) -> None:
-        worker = _make_worker(git_ops)
-        # '' and '  ' (strips to empty) are skipped; the duplicate 'x' collapses.
-        worker._record_dead_base('', 'x', 'x', '  ')
-        assert worker._dead_base_commits == {'x'}
 
 
 # ── Adoption-time FAIL-void (the 5260 incident) + one-shot / no-livelock ──────
@@ -277,7 +257,7 @@ class TestAdoptionFailVoid:
         worker = _make_worker(git_ops, event_store=store)
         worker._register_owned_merge_worktree(item.merge_wt)
         worker._host_allocator = _make_mock_allocator()
-        worker._dead_base_commits.add(_DEAD)
+        worker._record_dead_base(_DEAD, killer=_KILLER)
 
         # The re-merged (live-based) replacement _remerge would produce.
         _, remerged = _make_fake_item(
@@ -318,7 +298,7 @@ class TestAdoptionFailVoid:
         worker = _make_worker(git_ops, event_store=store)
         worker._register_owned_merge_worktree(item.merge_wt)
         worker._host_allocator = _make_mock_allocator()
-        worker._dead_base_commits.add(_DEAD)  # unrelated dead commit
+        worker._record_dead_base(_DEAD, killer=_KILLER)  # unrelated dead commit
         worker._remerge = AsyncMock()  # type: ignore[method-assign]
 
         lease = HostLease(name='local', runner=MagicMock(), is_local=True)
@@ -364,7 +344,7 @@ class TestAdoptionPassVoid:
         worker = _make_worker(git_ops, event_store=store)
         worker._register_owned_merge_worktree(item.merge_wt)
         worker._host_allocator = _make_mock_allocator()
-        worker._dead_base_commits.add(_DEAD)
+        worker._record_dead_base(_DEAD, killer=_KILLER)
 
         _, remerged = _make_fake_item(
             'remerged-pass', base_sha=main_before, merge_commit='rmc11111',
@@ -408,7 +388,7 @@ class TestAdoptionPassVoid:
         worker.MAX_CAS_RETRIES = 0  # type: ignore[assignment]
         worker._register_owned_merge_worktree(item.merge_wt)
         worker._host_allocator = _make_mock_allocator()
-        worker._dead_base_commits.add(_DEAD)  # unrelated dead commit; _LIVE_DEEP is NOT in it
+        worker._record_dead_base(_DEAD, killer=_KILLER)  # unrelated dead commit; _LIVE_DEEP is NOT in it
         worker._remerge = AsyncMock()  # type: ignore[method-assign]
 
         lease = HostLease(name='local', runner=MagicMock(), is_local=True)
@@ -454,7 +434,7 @@ class TestDispatchDeadBaseRecheck:
         main_sha = await git_ops.get_main_sha()   # the REAL tip the re-check reads
         store = _LateArrivalFakeEventStore()
         worker = _make_worker(git_ops, event_store=store)
-        worker._dead_base_commits.add(_DEAD)
+        worker._record_dead_base(_DEAD, killer=_KILLER)
         worker._host_allocator = _fake_local_allocator()  # one free local slot
         worker._cleanup_owned_merge_worktree = AsyncMock()  # type: ignore[method-assign]
         worker._run_inflight_verify = AsyncMock(  # type: ignore[method-assign]
@@ -500,7 +480,7 @@ class TestDispatchDeadBaseRecheck:
         main_sha = await git_ops.get_main_sha()   # the REAL tip the re-check reads
         store = _LateArrivalFakeEventStore()
         worker = _make_worker(git_ops, event_store=store)
-        worker._dead_base_commits.add(_DEAD)  # unrelated dead commit
+        worker._record_dead_base(_DEAD, killer=_KILLER)  # unrelated dead commit
         worker._host_allocator = _fake_local_allocator()
         worker._cleanup_owned_merge_worktree = AsyncMock()  # type: ignore[method-assign]
         worker._remerge = AsyncMock()  # type: ignore[method-assign]
@@ -612,7 +592,8 @@ class TestCascadeStragglerCaughtComposition:
     RED: phase 1 records nothing → in phase 2 ``_chain_dead_link`` returns None →
     the straggler burns a verify against the dead base (no ``verdict_voided``,
     ``_run_inflight_verify`` called).  GREEN (step-10): the straggler is caught.
-    ``two_layer_invariants`` stays empty throughout (§5.3 monitored → enforced).
+    ``two_layer_invariants`` stays empty throughout: INV-3 is the invariant it
+    reports over the frozen prefix, and the caught straggler never sits there.
     """
 
     async def test_straggler_on_dead_downstream_base_caught_at_dispatch(
@@ -687,5 +668,5 @@ class TestCascadeStragglerCaughtComposition:
         assert voided[0]['data']['reason'] == 'chain_dead'
         assert voided[0]['data']['point'] == 'dispatch'
 
-        # §5.3 stays clean throughout (monitored → enforced upgrade).
+        # INV-3, the invariant two_layer_invariants reports, reads clean.
         assert worker.two_layer_invariants(main_sha) == []

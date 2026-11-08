@@ -1,9 +1,9 @@
 """`/api/v2/dashboard/tasks` — the per-project task snapshot (census and rows).
 
-The default render fans out over every known project root, reporting four
-distinct failure facts separately (offline / degraded / count-unknown / no
-root measured) rather than collapsing them into one "empty" — see the
-handler docstring for why each is its own signal. A ``?terminal=<project>``
+The default render fans out over every known project root, reporting five
+distinct failure facts separately (offline / degraded / count-unknown /
+count-stale / no root measured) rather than collapsing them into one "empty"
+— see the handler docstring for why each is its own signal. A ``?terminal=<project>``
 request reads that one root instead.
 """
 
@@ -19,6 +19,7 @@ import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
+from dashboard.api.clock import Clock, app_clock
 from dashboard.config import DashboardConfig
 from dashboard.data.active_tasks import (
     collect_census_snapshots,
@@ -43,7 +44,6 @@ from dashboard.data.task_snapshot import (
     classify,
     measured_terminal_total,
 )
-from dashboard.data.utils import resolve_now
 
 logger = logging.getLogger(__name__)
 
@@ -174,7 +174,7 @@ async def _terminal_window(
 
 
 async def _terminal_answer(
-    client: httpx.AsyncClient, config: DashboardConfig, label: str,
+    client: httpx.AsyncClient, config: DashboardConfig, label: str, clock: Clock,
 ) -> dict[str, object]:
     """The whole ``?terminal=<label>`` answer: the window under its key, and ``served_at``.
 
@@ -183,12 +183,12 @@ async def _terminal_answer(
     unknown, and never the response.
     """
     what = f'the terminal window for {label}'
-    render_at = resolve_now(None)
+    render_at = clock()
     try:
         window = await _terminal_window(client, config, label, now=render_at)
     except Exception:
         window = _unknown_after_unexpected_error(what)
-    served_at = resolve_now(None)
+    served_at = clock()
     try:
         validate_datum(window, served_at)
     except DatumContractError as broken:
@@ -248,7 +248,7 @@ async def api_tasks(
     debugging and tooling. No frontend UI reads it directly — lock display
     routes through D.SCHEDULER.
 
-    **Four distinct failure facts (plus a denominator), deliberately not
+    **Five distinct failure facts (plus a denominator), deliberately not
     collapsed:**
 
     - ``TASKS_OFFLINE`` — NO root was measured this render and at least one
@@ -276,9 +276,16 @@ async def api_tasks(
     - ``TASKS_OFFLINE_PROJECTS`` — the roots whose fetch DEMONSTRABLY failed.
       Non-empty with ``TASKS_OFFLINE`` false is the normal partial case.
     - ``TASKS_COUNT_UNKNOWN_PROJECTS`` — roots whose ACTIVE rows loaded fine
-      but whose compact status map did not, so the census is UNKNOWN. Neither
+      but whose census has NO value to show: the compact status map did not
+      load and there is no last good one, so the census is UNKNOWN. Neither
       offline nor degraded: without a list of their own they would render as a
       healthy project with a confident "0 done".
+    - ``TASKS_COUNT_STALE_PROJECTS`` — roots whose row read did not fail and
+      whose census is served as its last measured value at its own ``as_of``, which
+      every census surface renders with an age badge. Named apart from an
+      unknown count because calling that count unknown would contradict the
+      value those surfaces show. It claims nothing about the rows: a cached
+      unit served past its freshness bound lands here with both halves aged.
     - ``TASKS_DEGRADED_PROJECTS`` — roots the handler ran out of budget for
       (see ``collect_tasks_with_counts``). Their state is UNKNOWN, not bad:
       nothing was proven unreachable, so degradation ALONE never raises the
@@ -296,9 +303,9 @@ async def api_tasks(
     ``TASKS_OFFLINE`` used to be ``bool(offline_projects)``. That is what made
     the banner claim a total outage over eight healthy projects' rows carried
     in the very same payload — one unreachable root out of nine was enough.
-    Collapsing any of these four into the others reintroduces that lie.
+    Collapsing any of these five into the others reintroduces that lie.
 
-    **All three lists are DERIVED, in one pass, from the per-root units.** The
+    **All four lists are DERIVED, in one pass, from the per-root units.** The
     collector returns a ``TaskSnapshot`` per root and ``task_snapshot.classify``
     routes each to exactly one banner from its STRUCTURED failure kind and its
     census's state — never from ``Datum.reason``, which is by contract the
@@ -357,12 +364,13 @@ async def api_tasks(
     """
     config = request.app.state.config
     http_client = request.app.state.http_client
+    clock = app_clock(request.app)
     # A PRESENT parameter, even an empty one, selects the terminal answer.
     # Absent is not the same as empty: no parameter is the default render,
     # with no terminal read and no terminal key.
     terminal = request.query_params.get('terminal')
     if terminal is not None:
-        return JSONResponse(await _terminal_answer(http_client, config, terminal))
+        return JSONResponse(await _terminal_answer(http_client, config, terminal, clock))
     # TWO instants, in this order. render_at is the producer's: it stamps what
     # this render measures and ages its rows, one clock read for all of them.
     # served_at is resolved only AFTER the fan-out returns, and every Datum on
@@ -381,19 +389,21 @@ async def api_tasks(
     # narrowed active fetch and one compact get_statuses walk, concurrent and
     # under one TTL. The third slot in task_snapshot.PER_PROJECT_MCP_CALLS is
     # the terminal window, which only the `?terminal=` request spends.
-    render_at = resolve_now(None)
+    render_at = clock()
     snapshots = await _collect_snapshots(
         projection, http_client, config, now=render_at,
     )
-    served_at = resolve_now(None)
+    served_at = clock()
     offline_projects: list[str] = []
     degraded_projects: list[str] = []
     count_unknown_projects: list[str] = []
+    count_stale_projects: list[str] = []
     wire_snapshots: dict[str, dict] = {}
     banners = {
         SnapshotHealth.OFFLINE: offline_projects,
         SnapshotHealth.DEGRADED: degraded_projects,
         SnapshotHealth.COUNT_UNKNOWN: count_unknown_projects,
+        SnapshotHealth.COUNT_STALE: count_stale_projects,
     }
     for label, acquired in snapshots.items():
         snapshot = _validated(label, as_served(acquired, served_at), served_at)
@@ -427,6 +437,7 @@ async def api_tasks(
             'TASKS_OFFLINE_PROJECTS': offline_projects,
             'TASKS_DEGRADED_PROJECTS': degraded_projects,
             'TASKS_COUNT_UNKNOWN_PROJECTS': count_unknown_projects,
+            'TASKS_COUNT_STALE_PROJECTS': count_stale_projects,
             'TASKS_PROJECT_COUNT': total_roots,
             'served_at': served_at.isoformat(),
         }

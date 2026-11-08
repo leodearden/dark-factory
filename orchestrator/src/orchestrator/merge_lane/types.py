@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any, Literal, TypeAlias, assert_never
 from shared.branch_names import bare_queued_branch_id, canonical_queued_branch_name
 
 from orchestrator.branch_stack import PreStackTip
+from orchestrator.critical_gate import critical_filing_gate
 from orchestrator.git_ops import MergeResult
 from orchestrator.merge_lane.disposition import MergeFailureDisposition, SkewEvidence
 from orchestrator.merge_lane.outcome_facts import ConflictEvidence, MergeBlockCategory
@@ -34,6 +35,7 @@ from orchestrator.verify import VerifyResult, merge_verify_command_budget_secs
 
 if TYPE_CHECKING:
     from orchestrator.config import ModuleConfig, OrchestratorConfig
+    from orchestrator.verify_runner import HostLease
 
 logger = logging.getLogger('orchestrator.merge_lane')
 
@@ -1328,7 +1330,8 @@ class DecidedItem:
     permit: SpecPermit | None = None  # ζ: speculation-slot token owned by PermitLedger; threaded/released by η
     # task 3206 / PRD §5.3: mirrors RealMergeItem so BOTH arms of the union
     # carry the marker.  Currently UNREAD on this arm — both §5.3 consumers
-    # (_warn_if_verify_base_not_frozen_tip, _frozen_base_chain) type-narrow to
+    # (merge_lane/verify_base_detector.py::detect_verify_base_divergence and
+    # worker.py::SpeculativeMergeWorker::_frozen_base_chain) type-narrow to
     # RealMergeItem before reading it, because only a real merge has a verify
     # base to check.  It is not decorative, though: _remerge's single-exit
     # chokepoint stamps the marker with dataclasses.replace on whichever
@@ -1730,6 +1733,35 @@ class VerifyBaseFacts:
 
 
 @dataclass(frozen=True)
+class VerifyBaseDivergence:
+    """A real-verify dispatched on a base that was not the frozen-prefix tip
+    (PRD §5.3, task 5302).
+
+    Recorded once, at dispatch, against that moment's freshly read main, so a
+    later move of main can never create or change one.  ``verify_depth`` is
+    the frozen-prefix height the verify joined; ``observed_at`` is the lane
+    clock's reading at dispatch.
+    """
+
+    request_id: str
+    task_id: str
+    base_sha: str
+    expected_tip: str
+    verify_depth: int
+    observed_at: float
+
+    def to_wire(self) -> dict[str, str | int | float]:
+        return {
+            'request_id': self.request_id,
+            'task_id': self.task_id,
+            'base_sha': self.base_sha,
+            'expected_tip': self.expected_tip,
+            'verify_depth': self.verify_depth,
+            'observed_at': self.observed_at,
+        }
+
+
+@dataclass(frozen=True)
 class LandingCandidate:
     """A verified tree the finalize CAS loop is landing on main (task 6155).
 
@@ -1760,13 +1792,90 @@ class PendingGate:
     stays parked at the front of ``_inflight`` (task 6155).
 
     ``candidate`` is what the CAS was landing when it rebased; ``rebased_sha``
-    onto ``rebased_onto`` is what the gate is re-verifying.
+    onto ``rebased_onto`` is what the gate is re-verifying.  ``started_at``
+    is when the gate was parked, on the worker clock's wall ``now()`` scale.
     """
 
     task: asyncio.Task[MergeOutcome | GateClearance]
     candidate: LandingCandidate
     rebased_sha: str
     rebased_onto: str
+    started_at: float | None = None
+
+
+class LeaseActivity(StrEnum):
+    """What an in-flight entry's held host lease is doing (task 5290).
+
+    DISPATCHING and VERIFYING are the live members: work is about to run, or
+    runs, on the leased host.  NO_LIVE_DISPATCH is a remote lease with no
+    live ssh dispatch while its verify task still runs on THIS host, either
+    before the dispatch claims its request (the main-mirror push, which can
+    hang on an ssh connect) or after it returned (task 2822's cross-check, a
+    task-6155 gate re-verify); the runner does not tell the two apart.
+    FINISHED holds the lease until finalize with nothing left to run.
+    """
+
+    DISPATCHING = 'dispatching'
+    VERIFYING = 'verifying'
+    NO_LIVE_DISPATCH = 'no_live_dispatch'
+    FINISHED = 'finished'
+
+    @property
+    def is_live(self) -> bool:
+        return self in (LeaseActivity.DISPATCHING, LeaseActivity.VERIFYING)
+
+
+def remote_dispatch_live(lease: HostLease) -> bool:
+    """THE "an ssh dispatch is live on this remote lease" predicate (task 5290).
+
+    Shared by Abort trigger 3 and :func:`lease_activity`.  A runner without
+    ``dispatch_in_flight`` reads live, trigger 3's fail-safe.
+    """
+    return not lease.is_local and bool(getattr(lease.runner, 'dispatch_in_flight', True))
+
+
+def lease_activity(lease: HostLease, pending_task: asyncio.Task[object] | None) -> LeaseActivity:
+    """What *lease* is doing while finalize waits on *pending_task* (task 5290).
+
+    *pending_task* is :attr:`InflightEntry.pending_task`, so a parked gate
+    re-verify reads as running.
+    """
+    if pending_task is None:
+        return LeaseActivity.DISPATCHING
+    if pending_task.done():
+        return LeaseActivity.FINISHED
+    if lease.is_local or remote_dispatch_live(lease):
+        return LeaseActivity.VERIFYING
+    return LeaseActivity.NO_LIVE_DISPATCH
+
+
+@dataclass(frozen=True)
+class LeaseRow:
+    """One held host lease: who holds it and what it is doing (task 5290).
+
+    The typed row behind ``snapshot()``'s ``occupancy.leases`` (:meth:`to_wire`)
+    and the heartbeat's ``verifying N/M hosts`` segment.
+    """
+
+    host: str
+    task_id: str
+    request_id: str
+    activity: LeaseActivity
+    host_quarantined: bool
+
+    @property
+    def counts_verifying(self) -> bool:
+        """Whether it counts toward ``verifying_by_host``: live, on a host not quarantined."""
+        return self.activity.is_live and not self.host_quarantined
+
+    def to_wire(self) -> dict[str, str | bool]:
+        return {
+            'host': self.host,
+            'task_id': self.task_id,
+            'request_id': self.request_id,
+            'activity': self.activity.value,
+            'host_quarantined': self.host_quarantined,
+        }
 
 
 @dataclass
@@ -1855,6 +1964,9 @@ class InflightEntry:
                      rebased tree re-verifies, or ``None`` (task 6155).  While
                      it is set the entry keeps its lease and permit, and the
                      next ``_finalize_inflight`` call resumes the CAS from it.
+    verify_base_divergence: the :class:`VerifyBaseDivergence` recorded when
+                     this entry's verify was dispatched off the frozen tip, or
+                     ``None`` (task 5302).
     """
 
     item: SpeculativeItem
@@ -1873,6 +1985,7 @@ class InflightEntry:
     spec_warm: bool = False                 # δ (task 3186): warmth of an ADOPTED head's published merge_wt
     verify_base: VerifyBaseFacts | None = None
     gate: PendingGate | None = None
+    verify_base_divergence: VerifyBaseDivergence | None = None
 
     @property
     def pending_task(self) -> asyncio.Task[object] | None:
@@ -2027,6 +2140,33 @@ def escalation_policy(kind: RunnerUnavailableKind, *, sticky: bool) -> Escalatio
     return 'immediate' if sticky or kind == 'wire_shape' else 'ladder'
 
 
+class RecoveryEvidence(StrEnum):
+    """What re-admitted a benched host: the only facts a verify-host alarm may be resolved on.
+
+    Occupancy is deliberately not a member (task 5290): a lease on a host is
+    a proxy, and recovery is a measurement or an explicit operator act.
+    """
+
+    SSH_HEALTH_PROBE = 'ssh_health_probe'
+    ENSURE_GATE = 'ensure_gate'
+    OPERATOR_CLEAR = 'operator_clear'
+
+    def describe(self) -> str:
+        """The clause an alarm resolution names this evidence with, led by its value."""
+        return f'evidence {self.value} ({_RECOVERY_EVIDENCE_DETAIL[self]})'
+
+
+_RECOVERY_EVIDENCE_DETAIL: Mapping[RecoveryEvidence, str] = MappingProxyType({
+    RecoveryEvidence.SSH_HEALTH_PROBE:
+        'the host answered `ssh -o BatchMode=yes -o ConnectTimeout=10 <host> true`',
+    RecoveryEvidence.ENSURE_GATE:
+        "ensure-gate passed: this dispatcher's gate was published, built or reused, "
+        'and handshaken',
+    RecoveryEvidence.OPERATOR_CLEAR:
+        'an operator called clear_verify_host_quarantine; health was not probed',
+})
+
+
 @dataclass
 class _HostUnavailability:
     """Per-host RunnerUnavailable tracker entry (task 1795; kinds, task 6565).
@@ -2052,6 +2192,20 @@ class _HostUnavailability:
     kind: RunnerUnavailableKind = 'transport'
     identity: GateIdentityPair | None = None
     sticky: bool = False
+
+    def alarm_due(self, now: float, *, after_n: int, after_secs: float) -> bool:
+        """THE definition of "this bench episode warrants an open alarm" (task 5290).
+
+        The immediate :func:`escalation_policy`, the *after_n* streak ladder,
+        or *after_secs* of downtime when that gate is enabled (> 0).  The bench
+        site and every still-down reprobe sweep ask it, so a resolve issued
+        while it still holds is re-opened by the next sweep.
+        """
+        return (
+            escalation_policy(self.kind, sticky=self.sticky) == 'immediate'
+            or critical_filing_gate(streak=self.streak, threshold=after_n)
+            or (after_secs > 0 and now - self.first_unavailable_at >= after_secs)
+        )
 
     def to_wire(self, now: float) -> dict[str, Any]:
         """This episode as the heartbeat ``hosts`` block shows it, aged against *now*.

@@ -354,7 +354,10 @@ async def test_a_remote_lease_head_gates_on_the_host_it_holds(remote_scene: _Sce
     assert len(host.calls) == 2, host.calls
     assert host.calls[1] == landed != host.calls[0]
     assert verifier.verify_calls == []
-    assert [row['runner'] for row in _rows(store, 'merge_verify', landed)] == ['laptop']
+    assert [
+        (row['runner'], row['runner_reason'], row['base_relation'])
+        for row in _rows(store, 'merge_verify', landed)
+    ] == [('laptop', 'gate_on_head_host', 'main')]
 
 
 async def test_a_red_gate_on_the_head_host_blocks_without_a_local_rerun(
@@ -455,7 +458,10 @@ async def test_a_same_tree_history_leg_stays_local_on_a_remote_lease_head(
     assert gate['reason'] == 'same_tree_history_leg', gate
     assert host.calls == [gate['verified_merge_sha']]
     assert leg_head.read_text().strip() == landed
-    assert [row['runner'] for row in _rows(store, 'merge_verify', landed)] == ['history-leg']
+    assert [
+        (row['runner'], row['runner_reason'])
+        for row in _rows(store, 'merge_verify', landed)
+    ] == [('history-leg', 'local_only_rule')]
 
 
 # ─── An unreachable head host moves the gate to local ───────────────────────
@@ -501,7 +507,10 @@ async def test_the_gate_falls_back_to_local_when_the_head_host_is_unreachable(
     on_main = _git(remote_scene.repo, 'ls-tree', '--name-only', 'main').splitlines()
     assert {'drift.txt', 'gate.txt'} <= set(on_main), on_main
     assert verifier.heads == [landed]
-    assert [row['runner'] for row in _rows(store, 'merge_verify', landed)] == ['local']
+    assert [
+        (row['runner'], row['runner_reason'], row['base_relation'])
+        for row in _rows(store, 'merge_verify', landed)
+    ] == [('local', 'remote_quarantined', 'main')]
     (laptop,) = [row for row in lane.snapshot()['hosts'] if row['name'] == host.name]
     assert laptop['quarantined'] is True, laptop
     assert 'exited 255' in laptop['reason'], laptop

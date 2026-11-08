@@ -28,7 +28,7 @@ import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from escalation.models import Escalation
@@ -760,8 +760,20 @@ class TestAlreadyLandedDispatchGateMarkerPath:
         cast(MagicMock, h._escalation_queue).submit.assert_not_called()
 
 
+_CONTENT_TIP_SHA = 'f' * 40
+_CONTENT_MERGE_BASE_SHA = '8' * 40
+
+
+def _expected_twin_lookup(h: Harness):
+    return call(
+        h.git_ops.project_root, _CONTENT_MERGE_BASE_SHA, _CONTENT_TIP_SHA,
+        patch_id_only=True,
+    )
+
+
 def _wired_content_harness(
     mock_orch_config, *, citation_sha, content_in_main, effect_present=True,
+    twin_sha: str | None = None,
 ) -> Harness:
     """Bare harness with the branch existing but is_ancestor(branch, main)
     False and find_merge_marker None, so neither the ancestry path nor the
@@ -782,7 +794,12 @@ def _wired_content_harness(
     in TestAlreadyLandedDispatchGateAncestryGuards and
     test_landing_evidence.py. ``get_main_sha`` is wired but must NEVER be
     called — the silent ``citation or get_main_sha()`` fallback (task 2678)
-    is deleted.
+    is deleted. ``merge_base_with_main`` and ``find_equivalent_commit`` are
+    stubbed so the citation-miss content-equivalence fallback decides on its
+    own logic rather than on the TypeError a bare MagicMock auto-child
+    raises when awaited. ``twin_sha`` None means main holds no patch-id twin
+    and the fallback declines as 'unanchored'; a 40-hex sha is the twin the
+    fallback anchors on.
     """
     h = _build_harness(mock_orch_config)
     h.git_ops = MagicMock()
@@ -797,11 +814,13 @@ def _wired_content_harness(
             return True  # citation modeled as an in-branch work commit
         raise AssertionError(f'unexpected is_ancestor call: {a!r}, {b!r}')
 
-    h.git_ops.resolve_branch_sha = AsyncMock(return_value='f' * 40)
+    h.git_ops.resolve_branch_sha = AsyncMock(return_value=_CONTENT_TIP_SHA)
     h.git_ops.is_ancestor = AsyncMock(side_effect=_is_ancestor)
     h.git_ops.find_merge_marker = AsyncMock(return_value=None)
     h.git_ops.find_task_citation_commit = AsyncMock(return_value=citation_sha)
     h.git_ops.branch_content_in_main = AsyncMock(return_value=content_in_main)
+    h.git_ops.merge_base_with_main = AsyncMock(return_value=_CONTENT_MERGE_BASE_SHA)
+    h.git_ops.find_equivalent_commit = AsyncMock(return_value=twin_sha)
     h.git_ops.get_main_sha = AsyncMock(return_value='c' * 40)
     h.git_ops.commit_effect_present_in_main = AsyncMock(return_value=effect_present)
 
@@ -842,6 +861,9 @@ class TestAlreadyLandedDispatchGateContentEquivalence:
         gate must NOT fabricate an anchor from main HEAD, must NOT mark
         done, and must file exactly one 'provenance_unattributed'
         escalation carrying the branch. get_main_sha must never be called.
+        The content-equivalence fallback (task 4862) runs and declines as
+        'unanchored' because main holds no patch-id twin, so the verdict
+        stays no_citation.
         """
         h = _wired_content_harness(
             mock_orch_config,
@@ -861,20 +883,37 @@ class TestAlreadyLandedDispatchGateContentEquivalence:
         assert esc.task_id == '42'
         assert 'task/42' in esc.detail
         assert 'no_citation' in esc.detail
+        assert "'content_fallback': 'unanchored'" in esc.detail
+        assert 'content_fallback_error' not in esc.detail
+        assert cast(AsyncMock, h.git_ops.find_equivalent_commit).await_args_list == [
+            _expected_twin_lookup(h),
+        ]
 
-    async def test_content_equivalent_with_citation_and_effect_present_marks_done(
-        self, mock_orch_config,
+    @pytest.mark.parametrize(
+        ('citation_sha', 'twin_sha', 'effect_present', 'evidence_sha', 'twin_lookups'),
+        [
+            pytest.param('d' * 40, None, True, 'd' * 40, 0, id='cited'),
+            pytest.param(None, '7' * 40, False, '7' * 40, 1, id='uncited-patch-id-twin'),
+        ],
+    )
+    async def test_content_equivalent_attributed_landing_marks_done_on_its_evidence(
+        self, mock_orch_config, citation_sha, twin_sha, effect_present, evidence_sha,
+        twin_lookups,
     ) -> None:
-        """branch_content_in_main True, a citation commit is present on
-        main AND its effect is present at main HEAD -> the citation sha
-        anchors the flip, not main HEAD; no escalation filed.
+        """A content-equivalent branch is stamped done anchored on the
+        evidence that attributes it, never main HEAD, and no escalation is
+        filed. The evidence is the citation when main has one, else the
+        patch-id twin on main that the uncited tip's lookup finds (task
+        4862's fallback; esc-4881-8 shape). That lookup judges the tip sha
+        (task 3103) on patch-id alone, and the twin accept runs no
+        effect-present check, so its row holds the effect absent.
         """
-        citation_sha = 'd' * 40
         h = _wired_content_harness(
             mock_orch_config,
             citation_sha=citation_sha,
             content_in_main=True,
-            effect_present=True,
+            effect_present=effect_present,
+            twin_sha=twin_sha,
         )
 
         result = await h._already_landed_dispatch_gate('42')
@@ -884,9 +923,12 @@ class TestAlreadyLandedDispatchGateContentEquivalence:
         call_args = cast(AsyncMock, h._mark_in_progress_done).await_args
         assert call_args is not None
         assert call_args.args[0] == '42'
-        assert call_args.args[1] == citation_sha
+        assert call_args.args[1] == evidence_sha
         assert call_args.args[3] == 'dispatch-gate-content-equivalent'
         cast(MagicMock, h._escalation_queue).submit.assert_not_called()
+        assert cast(AsyncMock, h.git_ops.find_equivalent_commit).await_args_list == (
+            [_expected_twin_lookup(h)] * twin_lookups
+        )
 
     async def test_content_equivalent_with_citation_and_effect_absent_escalates(
         self, mock_orch_config,

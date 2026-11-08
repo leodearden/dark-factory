@@ -14,13 +14,17 @@ that suppresses spam from a stuck curator.
 
 from __future__ import annotations
 
+import asyncio
 import fcntl
 import json
 import logging
+import threading
 from typing import IO, Any, Literal, overload
 
 import pytest
-from _fm_helpers import LoopFreedomProbe
+from _escalation_queue_probe import probe_escalation_queue_io
+from _fm_helpers import LOOP_FREEDOM_CEILING_SECONDS, LoopFreedomProbe
+from _swallowed_failure_log import swallowed_causes
 from escalation.queue import EscalationQueue
 from shared.project_layout import escalation_queue_dir
 
@@ -449,6 +453,58 @@ class TestZeroOutputTimeoutEscalation:
         finally:
             handle.close()
 
+    @pytest.mark.asyncio
+    async def test_concurrent_batch_bisect_files_one_record_and_hands_every_sibling_its_id(
+        self, tmp_path, monkeypatch,
+    ):
+        """The barrier releases every sibling's liveness probe together, before any window check."""
+        n = 4
+        barrier = threading.Barrier(n)
+
+        def _all_siblings_clear_the_probe_together(project_root):
+            barrier.wait(timeout=LOOP_FREEDOM_CEILING_SECONDS)
+            return True
+
+        monkeypatch.setattr(
+            curator_escalator, 'is_orchestrator_lock_held', _all_siblings_clear_the_probe_together,
+        )
+        escalator = CuratorEscalator()
+
+        ids = await asyncio.gather(
+            *(escalator.report_failure(**_zot_report(tmp_path)) for _ in range(n)),
+        )
+
+        [record] = _pending_records(tmp_path)
+        assert record['dedupe_count'] == 0
+        assert ids == [record['id']] * n
+
+    @pytest.mark.asyncio
+    async def test_siblings_queued_behind_a_filing_slower_than_the_window_still_get_its_id(
+        self, tmp_path, monkeypatch,
+    ):
+        """The window counts from the end of the filing attempt, not from its start."""
+        clock = _SteppedClock()
+        real_make_id = EscalationQueue.make_id
+
+        def _minting_slower_than_the_window(self, *args, **kwargs):
+            clock.advance(3600)
+            return real_make_id(self, *args, **kwargs)
+
+        monkeypatch.setattr(EscalationQueue, 'make_id', _minting_slower_than_the_window)
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            escalator = CuratorEscalator(monotonic=clock)
+
+            ids = await asyncio.gather(
+                *(escalator.report_failure(**_zot_report(tmp_path)) for _ in range(3)),
+            )
+
+            [record] = _pending_records(tmp_path)
+            assert record['dedupe_count'] == 0
+            assert ids == [record['id']] * 3
+        finally:
+            handle.close()
+
     # Recurrence folding, per Leo's 2026-08-27 ACCEPT-AND-RETUNE ruling on
     # esc-task-curator-17. A SEPARATE CuratorEscalator per report stands in for
     # "hours apart / across a restart" without touching the 60s in-process
@@ -787,6 +843,19 @@ class TestReportZotDuplicate:
 _PINNED_ZOT_ROOT_CAUSE = 'curator-empty-output-pre-turn-hang'
 
 
+class _SteppedClock:
+    """A monotonic clock that moves only when a test advances it."""
+
+    def __init__(self) -> None:
+        self._now = 0.0
+
+    def __call__(self) -> float:
+        return self._now
+
+    def advance(self, seconds: float) -> None:
+        self._now += seconds
+
+
 def _zot_report(root, project_id: str = 'proj-fold') -> dict[str, Any]:
     return dict(
         project_root=str(root), project_id=project_id,
@@ -1091,60 +1160,60 @@ class TestBackendBinaryUnresolvableEscalation:
         assert any('claude' in r.getMessage() for r in errors)
 
 
+_EVERY_ROUTE = [
+    pytest.param(
+        'report_failure',
+        dict(justification='max_turns exhausted', candidate_title='T'),
+        id='failure',
+    ),
+    pytest.param(
+        'report_failure',
+        dict(
+            justification='denied', candidate_title='T',
+            schema_tool_denied=True,
+        ),
+        id='schema-tool-denied',
+    ),
+    pytest.param(
+        'report_failure',
+        dict(
+            justification='ZOT', candidate_title='T',
+            zero_output_timeout=True, timed_out=True,
+            duration_ms=181_966, transcript_turns=0, tools_used=(),
+        ),
+        id='zero-output-timeout',
+    ),
+    pytest.param(
+        'report_zot_duplicate',
+        dict(
+            finding=_FINDING, candidate_title='T',
+            zot_escalation_id='esc-curator-41', stamped=True,
+        ),
+        id='zot-duplicate',
+    ),
+    pytest.param(
+        'report_consecutive_degraded',
+        dict(
+            streak=5, threshold=5, last_justification='j',
+            candidate_title='T',
+        ),
+        id='consecutive-degraded',
+    ),
+    pytest.param(
+        'report_backend_binary_unresolvable',
+        dict(binary_spec='claude', search_path='/usr/bin'),
+        id='backend-binary-unresolvable',
+    ),
+]
+
+
 class TestEveryRouteFilesUnderItsAnchor:
     """The value filed must be the constant that
     tests/test_folded_escalation.py::TestNoTwoFilersShareAnAnchor sweeps, or a
     site with a diverging literal escapes the collision check."""
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        ('method_name', 'kwargs'),
-        [
-            pytest.param(
-                'report_failure',
-                dict(justification='max_turns exhausted', candidate_title='T'),
-                id='failure',
-            ),
-            pytest.param(
-                'report_failure',
-                dict(
-                    justification='denied', candidate_title='T',
-                    schema_tool_denied=True,
-                ),
-                id='schema-tool-denied',
-            ),
-            pytest.param(
-                'report_failure',
-                dict(
-                    justification='ZOT', candidate_title='T',
-                    zero_output_timeout=True, timed_out=True,
-                    duration_ms=181_966, transcript_turns=0, tools_used=(),
-                ),
-                id='zero-output-timeout',
-            ),
-            pytest.param(
-                'report_zot_duplicate',
-                dict(
-                    finding=_FINDING, candidate_title='T',
-                    zot_escalation_id='esc-curator-41', stamped=True,
-                ),
-                id='zot-duplicate',
-            ),
-            pytest.param(
-                'report_consecutive_degraded',
-                dict(
-                    streak=5, threshold=5, last_justification='j',
-                    candidate_title='T',
-                ),
-                id='consecutive-degraded',
-            ),
-            pytest.param(
-                'report_backend_binary_unresolvable',
-                dict(binary_spec='claude', search_path='/usr/bin'),
-                id='backend-binary-unresolvable',
-            ),
-        ],
-    )
+    @pytest.mark.parametrize(('method_name', 'kwargs'), _EVERY_ROUTE)
     async def test_the_filed_task_id_is_the_anchor_constant(
         self, tmp_path, method_name: str, kwargs: dict[str, Any],
     ):
@@ -1156,6 +1225,69 @@ class TestEveryRouteFilesUnderItsAnchor:
 
             [record] = _pending_records(tmp_path)
             assert record['task_id'] == curator_escalator._ANCHOR_TASK_ID
+        finally:
+            handle.close()
+
+
+class TestQueueFilingRunsOffTheEventLoop:
+    """Every route mints its id and submits off the loop, and survives a queue that cannot mint."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('method_name', 'kwargs'), _EVERY_ROUTE)
+    async def test_every_route_mints_and_submits_off_the_event_loop(
+        self, tmp_path, monkeypatch, method_name: str, kwargs: dict[str, Any],
+    ):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            probe = LoopFreedomProbe()
+            probe_escalation_queue_io(monkeypatch, probe)
+
+            await getattr(CuratorEscalator(), method_name)(
+                project_root=str(tmp_path), project_id='proj-x', **kwargs,
+            )
+
+            probe.assert_loop_stayed_free()
+            [record] = _pending_records(tmp_path)
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('method_name', 'kwargs'), _EVERY_ROUTE)
+    async def test_every_route_swallows_a_queue_that_cannot_mint_an_id(
+        self, tmp_path, monkeypatch, caplog, method_name: str, kwargs: dict[str, Any],
+    ):
+        caplog.set_level(logging.WARNING, logger='fused_memory.middleware.curator_escalator')
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            def _unmintable(self, key):
+                raise OSError('counter unwritable')
+
+            monkeypatch.setattr(EscalationQueue, 'make_id', _unmintable)
+
+            await getattr(CuratorEscalator(), method_name)(
+                project_root=str(tmp_path), project_id='proj-x', **kwargs,
+            )
+
+            assert _pending_records(tmp_path) == []
+            assert swallowed_causes(caplog, 'failed to submit', 'proj-x') == [OSError]
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('method_name', 'kwargs'), _EVERY_ROUTE)
+    async def test_every_route_swallows_a_queue_that_cannot_be_opened(
+        self, tmp_path, caplog, method_name: str, kwargs: dict[str, Any],
+    ):
+        caplog.set_level(logging.WARNING, logger='fused_memory.middleware.curator_escalator')
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            escalation_queue_dir(tmp_path).write_text('a file where the queue directory belongs')
+
+            await getattr(CuratorEscalator(), method_name)(
+                project_root=str(tmp_path), project_id='proj-x', **kwargs,
+            )
+
+            assert swallowed_causes(caplog, 'failed to submit', 'proj-x') == [FileExistsError]
         finally:
             handle.close()
 
@@ -1367,34 +1499,37 @@ class TestPersistStateConcurrency:
         and must not corrupt or lose any burst-log entry."""
         import asyncio
         import json
+        import os
+        import time
 
         state_path = tmp_path / 'curator_escalator_state.json'
         handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
         try:
             escalator = CuratorEscalator(cooldown_secs=3600.0, state_path=state_path)
 
-            # ── Instrumentation ─────────────────────────────────────────────────
+            # ── Instrumentation: count writers landing on the state file ────────
             in_flight = 0
             max_in_flight = 0
-            real_to_thread = asyncio.to_thread
+            counter_lock = threading.Lock()
+            real_replace = os.replace
 
-            async def _patched_to_thread(func, *args, **kwargs):
+            def _counting_replace(src, dst, *args, **kwargs):
                 nonlocal in_flight, max_in_flight
-                if func is curator_escalator.is_orchestrator_lock_held:
-                    # The liveness probe's hop is not a state write.
-                    return await real_to_thread(func, *args, **kwargs)
-                in_flight += 1
-                if in_flight > max_in_flight:
-                    max_in_flight = in_flight
-                # Widen the interleave window so concurrent coroutines can enter
-                # before the first one returns — exposes the race without the lock.
-                await asyncio.sleep(0.02)
+                if os.fspath(dst) != os.fspath(state_path):
+                    return real_replace(src, dst, *args, **kwargs)
+                with counter_lock:
+                    in_flight += 1
+                    max_in_flight = max(max_in_flight, in_flight)
                 try:
-                    return await real_to_thread(func, *args, **kwargs)
+                    # Widen the overlap window so unserialised writers would
+                    # land here together — exposes the race without the lock.
+                    time.sleep(0.02)
+                    return real_replace(src, dst, *args, **kwargs)
                 finally:
-                    in_flight -= 1
+                    with counter_lock:
+                        in_flight -= 1
 
-            monkeypatch.setattr(asyncio, 'to_thread', _patched_to_thread)
+            monkeypatch.setattr(os, 'replace', _counting_replace)
 
             # ── Fire 5 concurrent report_failure calls ───────────────────────
             # Same project_id, DISTINCT subtypes → independent _failure_log keys

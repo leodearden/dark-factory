@@ -85,10 +85,11 @@ on a queue where L2s legitimately stay parked for days it re-fired forever,
 and an operator closing it only restarted the cycle.  So an
 ``escalation_pinned`` hold whose every pin is an L2, or an L1 that one of those
 L2s holds as a member, files no alarm (the canonical statement is
-``escalation.pins.pinned_only_by_human_parked``); any other reason, and any
-hold with an L1 that no L2 in the task's read holds, still does.  Only the
-queue WRITE is suppressed — the streak still counts and the events and sweep
-summary still flow — and
+``escalation.pins.pinned_only_by_human_parked``); an L1 counts as held by a
+pending L2 wherever that L2 was filed (:func:`pending_holder_candidates`), so
+only another reason, or a hold with an L1 that no pending L2 holds, still
+alarms.  Only the queue WRITE is suppressed — the streak still counts and the
+events and sweep summary still flow — and
 ``recovery_emission.streak_escalation_suppress_human_parked`` turns it off
 live.  Retuning ``veto_streak_threshold`` / ``veto_streak_min_span_secs``
 or ``streak_escalation_enabled`` instead was rejected: each also silences
@@ -150,6 +151,7 @@ __all__ = [
     'emit_recovery_event',
     'emit_recovery_veto_streak_escalation',
     'escalation_ages_secs',
+    'pending_holder_candidates',
     'pin_buckets',
     'render_shape',
     'resolve_recovery_veto_streak_escalation',
@@ -410,7 +412,10 @@ class PinBuckets:
     #: ``PinReport.store_unavailable`` — never inferred from an empty bucket.
     store_unavailable: bool
     #: ``escalation.pins.pinned_only_by_human_parked`` over the same report —
-    #: always ``False`` when the store could not be read.
+    #: always ``False`` when the store could not be read.  It counts holders
+    #: filed under other task ids only when the caller passed
+    #: ``holder_candidates`` (:func:`pending_holder_candidates`), so it is
+    #: authoritative only where that read runs: the streak filing gate.
     human_parked: bool
 
 
@@ -419,6 +424,7 @@ def pin_buckets(
     records: Any,
     *,
     store_unavailable: bool,
+    holder_candidates: Iterable[Any] = (),
 ) -> PinBuckets:
     """Bucket *records* for the payload — never for the veto ANSWER.
 
@@ -430,7 +436,8 @@ def pin_buckets(
     same argument), and here a drifted bucket set would silently change the
     veto SIGNATURE — see :func:`veto_signature`.  The streak alarm's
     human-parked gate (PIN-CLASS AWARENESS in this module's docstring) is read
-    off the SAME report, never a second classification.
+    off the SAME report, never a second classification.  *holder_candidates*
+    feed only that gate, never the buckets; see :func:`pending_holder_candidates`.
 
     ``store_unavailable=True`` passes ``records=None`` down to
     ``classify_pins``, which is its documented third state: a read that FAILED
@@ -461,8 +468,54 @@ def pin_buckets(
             'non_pinning': list(pins.non_pinning),
         },
         store_unavailable=bool(pins.store_unavailable),
-        human_parked=pinned_only_by_human_parked(pins, read),
+        human_parked=pinned_only_by_human_parked(
+            pins, read, holder_candidates=list(holder_candidates),
+        ),
     )
+
+
+def pending_holder_candidates(
+    escalation_queue: Any,
+    site: RecoverySite | str,
+    *,
+    reason: LeaveReason | str | None,
+    store_unavailable: bool,
+    streak_escalation_enabled: bool,
+    suppress_human_parked: bool,
+) -> list[Any]:
+    """The pending queue, as the outside holders :func:`pin_buckets` may consult.
+
+    ``escalation.server.promote_to_l2`` mints a cluster L2 under ONE task id,
+    so a task's own read cannot see the L2 that holds its L1 from another
+    task (task 7716).  Every read is a root scan, so it runs only where its
+    answer can gate a filing: an ``escalation_pinned`` hold at
+    :data:`STREAK_CHARGING_SITES` whose own read succeeded, with the streak
+    alarm and its human-parked suppression both on.  Fails open to ``[]``,
+    which forgoes only the cross-task suppression: the alarm files, the safe
+    direction.
+    """
+    can_gate_a_filing = (
+        site in STREAK_CHARGING_SITES
+        and streak_escalation_enabled
+        and not store_unavailable
+        and _human_parked_suppression_applies(reason, suppress_human_parked)
+    )
+    if escalation_queue is None or not can_gate_a_filing:
+        return []
+    try:
+        return list(escalation_queue.get_pending())
+    except Exception as exc:
+        logger.warning(
+            'recovery emission: pending-queue read failed at site %s (%s); '
+            'no cross-task holders this pass', site, exc,
+        )
+        return []
+
+
+def _human_parked_suppression_applies(
+    reason: LeaveReason | str | None, suppress_human_parked: bool,
+) -> bool:
+    return suppress_human_parked and reason == LeaveReason.escalation_pinned
 
 
 def veto_signature(
@@ -956,11 +1009,7 @@ def emit_recovery_veto_streak_escalation(
         return False
 
     # Before the memo and `has_open_l1`, so a suppressed hold costs no I/O.
-    if (
-        suppress_human_parked
-        and human_parked
-        and reason == LeaveReason.escalation_pinned
-    ):
+    if human_parked and _human_parked_suppression_applies(reason, suppress_human_parked):
         if streak == threshold:
             logger.info(
                 'Recovery veto streak for task %s at %s not escalated: every '

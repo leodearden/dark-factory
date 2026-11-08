@@ -176,6 +176,12 @@ test('taskStore: an unmeasured done count alone is amber', () => {
   assert.equal(healthTone(row), 'warn');
 });
 
+test('taskStore: a stale done count alone is amber', () => {
+  const row = taskStoreHealth(tasksData({ TASKS_COUNT_STALE_PROJECTS: ['c'], TASKS_PROJECT_COUNT: 4 }));
+  assert.equal(row.sub, 'count-stale');
+  assert.equal(healthTone(row), 'warn');
+});
+
 test('taskStore: a clean fan-out is green and counts the projects answering', () => {
   assert.deepEqual(taskStoreHealth(tasksData({ TASKS_PROJECT_COUNT: 3 })), {
     sub: '3 projects answering',

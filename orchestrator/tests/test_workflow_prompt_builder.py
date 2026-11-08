@@ -291,7 +291,7 @@ def _rewrite_analysis(artifacts: TaskArtifacts) -> None:
 
 
 def _remove_plan(artifacts: TaskArtifacts) -> None:
-    (artifacts.root / 'plan.json').unlink()
+    artifacts.artifact_path('plan.json').unlink()
 
 
 def _stamp_prior_session(wf: TaskWorkflow) -> None:

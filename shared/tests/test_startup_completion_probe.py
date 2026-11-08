@@ -162,8 +162,8 @@ def _confine_stale_dir_sweep(monkeypatch, sweep_root) -> Iterator[None]:
     that clears every prefix.  The bare form also drops
     ``claude-config-usage-gate-probe-``, which this module does not own, and
     clearing another module's state is a widening.  That prefix's sweep needs no
-    help from here: conftest.py's ``_confine_usage_gate_sweep`` confines every
-    gate's sweep in this package.
+    help from here: ``df_pytest_isolation.py::arm_usage_gate_sweep_confinement``,
+    armed by conftest.py, confines every gate's sweep in this package.
     """
     real_sweep = probe.sweep_stale_pid_dirs
 

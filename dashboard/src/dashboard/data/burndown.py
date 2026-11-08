@@ -24,7 +24,7 @@ import enum
 import logging
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from types import MappingProxyType
 from typing import Any
 
@@ -337,10 +337,12 @@ async def collect_snapshot(
     conn: aiosqlite.Connection,
     config: DashboardConfig,
     client: httpx.AsyncClient,
+    *,
+    now: datetime | None = None,
 ) -> None:
     """Discover projects and insert exactly one snapshot row per project per cycle.
 
-    Each root is read through the task snapshot unit
+    *now* is the cycle's instant, the live clock when omitted. Each root is read through the task snapshot unit
     (``task_snapshot.acquire_snapshot``), and the unit is judged as served at
     this cycle's instant. A root whose census and rows are BOTH fresh gets a
     value row: the census gives the nine member columns, the rows give the
@@ -376,7 +378,7 @@ async def collect_snapshot(
       regressions.
     """
     try:
-        now_dt = datetime.now(UTC)  # clock-exempt: single-capture writer
+        now_dt = resolve_now(now)
         # One instant for the whole cycle: the ``ts`` written to every row, the
         # instant a unit is measured at, and the one it is served at must be
         # the SAME capture, or a row could claim a measurement its own

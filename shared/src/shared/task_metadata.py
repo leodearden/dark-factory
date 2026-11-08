@@ -19,7 +19,7 @@ import json
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from types import MappingProxyType
 from typing import Any, ClassVar, Literal, get_args
 
@@ -34,6 +34,8 @@ from pydantic import (
 )
 from pydantic_core import PydanticCustomError
 
+from shared.cancel_dispositions import CancelDispositionEntry
+from shared.declared_scope import DECLARED_SCOPE_METADATA_KEY, DeclaredScope
 from shared.strand_conversion import STRAND_CONVERTED_METADATA_KEY, StrandConverted
 from shared.task_deferral import DeferralRecord
 
@@ -674,6 +676,33 @@ class Milestone(BaseModel):
                 raise ValueError("Milestone: at must not be set when mode='delayed'.")
         return self
 
+    def fired(self, anchor: str | None, now: datetime) -> bool:
+        """Return whether this milestone has fired at *now* (tz-aware).
+
+        This is the home of milestone semantics. A ``'dated'`` milestone fires
+        once ``now >= at``; *anchor* is ignored. A ``'delayed'`` milestone
+        fires once ``now >= anchor + after_secs``, where *anchor* is the raw
+        ``metadata.milestone_deps_satisfied_at`` string; a falsy anchor never
+        fires. A tz-naive ``at`` or anchor is read as UTC.
+
+        A malformed spec cannot be a ``Milestone``, so "never fires" for
+        malformed metadata belongs to the caller; an unparseable *anchor*
+        raises ``ValueError``. ``Scheduler._milestone_time_gated`` keeps its
+        own copy of these rules until a follow-up repoints it here.
+        """
+        if self.mode == 'dated':
+            assert self.at is not None
+            return now >= _as_utc(datetime.fromisoformat(self.at))
+        if not anchor:
+            return False
+        assert self.after_secs is not None
+        deadline = _as_utc(datetime.fromisoformat(anchor)) + timedelta(seconds=self.after_secs)
+        return deadline <= now
+
+
+def _as_utc(moment: datetime) -> datetime:
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
+
 
 class Recurrence(BaseModel):
     """``metadata.recurrence`` — one link of a recurring deterministic chain.
@@ -1071,8 +1100,14 @@ register_metadata_submodel('recurrence', Recurrence, cardinality='dict')
 # deferral: plans/deferral-flip-condition-prd.md §5.1.
 register_metadata_submodel('deferral', DeferralRecord, cardinality='dict')
 
+# cancel_dispositions: plans/cancel-with-children-prd.md §4.8.
+register_metadata_submodel('cancel_dispositions', CancelDispositionEntry, cardinality='list')
+
 # strand_converted: shared/src/shared/strand_conversion.py.
 register_metadata_submodel(STRAND_CONVERTED_METADATA_KEY, StrandConverted, cardinality='dict')
+
+# declared_scope: plans/follow-up-filing-shape-prd.md §4.2.
+register_metadata_submodel(DECLARED_SCOPE_METADATA_KEY, DeclaredScope, cardinality='dict')
 
 
 def _normalize_legacy_memory_hints(value: object) -> object:
@@ -1223,9 +1258,10 @@ _WHOLE_METADATA_FIELD = '<metadata>'
 # still preserves each value byte-for-value (I1). Blessed keys are NORMALLY
 # disjoint from TaskMetadata.model_fields and _SUBMODEL_REGISTRY — a typed
 # field or a registered submodel already suppresses unknown_key via
-# known_fields, so blessing it too would be redundant. 'recurrence' is the
-# one deliberate overlap: task 4676 / PRD
-# docs/prds/recurring-deterministic-tasks.md R-D4 specifies both, so the key
+# known_fields, so blessing it too would be redundant. 'recurrence' and
+# 'cancel_dispositions' are the two deliberate overlaps: task 4676 / PRD
+# docs/prds/recurring-deterministic-tasks.md R-D4 and
+# plans/cancel-with-children-prd.md §4.8 each specify both, so the key
 # stays suppressed if its registration is ever moved or made lazy, and so
 # migrate_task_metadata_to_x_namespace.py refuses to x_-namespace it, which
 # for a submodel-backed key with live readers is the correct refusal.
@@ -1462,8 +1498,8 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         # vocabulary and be re-added on the next block.
         'last_blocked_at',
         # recurrence (task 4676, PRD docs/prds/recurring-deterministic-tasks.md
-        # R-D4) is the ONE blessed key that is also a registered submodel — see
-        # the header note above on why the overlap is deliberate.
+        # R-D4) is a blessed key that is also a registered submodel — see the
+        # header note above on why the overlap is deliberate.
         'recurrence',
         # Recon-stage execution-class discriminator (task 3780): machine-read
         # by live guards at the fused-memory submit boundary, with real
@@ -1591,6 +1627,16 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         # written by orchestrator/src/orchestrator/main_health_fix_owner.py, which
         # also reads it back through find_tasks_by_metadata as its dedupe key.
         'main_health_signature',
+        # The cancelled parent's superseders (plans/cancel-with-children-prd.md
+        # §4.8). Writer: the cancel gate, task β; validated there by
+        # shared/src/shared/cancel_dispositions.py::parse_superseded_by. Readers:
+        # the residue backstop, get_cancel_children and /review phase 3.
+        'superseded_by',
+        # Each child's per-parent disposition record; also a registered list
+        # submodel (the second deliberate overlap, header note above). Writer:
+        # the cancel gate, task β. Readers: the residue backstop,
+        # get_cancel_children (existing_disposition) and /review phase 3.
+        'cancel_dispositions',
     }
 )
 
@@ -1749,7 +1795,10 @@ def parse_metadata(
                 # other malformed sub-model, never escaping uncaught in
                 # read or write+enforce=False.
                 parsed = {**parsed, key: submodel(**raw)}
-        except (ValidationError, TypeError) as exc:
+        # ValueError covers ValidationError (its subclass) and the bare
+        # ValueError a RootModel submodel (DeferralRecord, CancelDispositionEntry)
+        # raises when the stored mapping carries a `root` key beside others.
+        except (TypeError, ValueError) as exc:
             if direction == 'write' and enforce:
                 raise
             warnings.append(SchemaWarning(field=key, code='invalid_submodel', message=str(exc)))

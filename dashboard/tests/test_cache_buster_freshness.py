@@ -516,7 +516,7 @@ class TestResolveReduxBaseStateWhenNoBaseRefResolves:
 # retirement observable rather than merely asserted.
 _REQUIRED_ASSETS = (
     'graph_layout.js',
-    'prd_grouping.js',
+    'prd_lanes_view.js',
     'runtime_format.js',
     'orch_filter.js',
     'esc_flow_layout.js',

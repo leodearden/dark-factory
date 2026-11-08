@@ -12404,8 +12404,8 @@ class TestAcquireDiskBackstopReuseDetachedRebind:
 
 @pytest.mark.asyncio
 class TestReuseWarmLaneBranchAware:
-    """_reuse_warm_lane called on a DETACHED lane must rebind refs/heads/task/R
-    to the lane HEAD after commit()+rebase_onto_main.
+    """_reuse_warm_lane called on a DETACHED lane must leave the lane attached
+    on task/R, with refs/heads/task/R equal to the rebased lane HEAD.
 
     RED today: _reuse_warm_lane runs commit+rebase on the detached HEAD but
     never rebinds refs/heads/task/R — the ref stays at the pre-detach tip

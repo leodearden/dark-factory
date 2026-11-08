@@ -233,7 +233,7 @@ test('every notice is a {kind, text} pair with a known kind', () => {
   for (const notice of notices) {
     assert.deepEqual(Object.keys(notice).sort(), ['kind', 'text']);
     assert.ok(
-      ['global', 'partial', 'degraded', 'count-unknown'].includes(notice.kind),
+      ['global', 'partial', 'degraded', 'count-unknown', 'count-stale'].includes(notice.kind),
       notice.kind
     );
     assert.equal(typeof notice.text, 'string');
@@ -294,6 +294,58 @@ test('a missing countUnknownProjects key produces no notice', () => {
   );
 });
 
+test('a count-stale project is NAMED, with copy that agrees with its aged surfaces', () => {
+  // The census for this root is served from its last good value, and every
+  // census surface renders that value with an age badge. Calling the count
+  // unknown or unavailable would contradict the value shown beside it.
+  const notices = tasksBannerNotices({
+    offline: false,
+    countStaleProjects: ['reify'],
+    totalProjects: 9,
+  });
+
+  assert.deepEqual(kinds(notices), ['count-stale']);
+  const [{ text }] = notices;
+  assert.ok(text.includes('reify'), text);
+  assert.ok(text.includes('1 of 9'), text);
+  assert.match(text, /last measured/);
+  assert.match(text, /age/);
+  assert.doesNotMatch(text, /unknown|unavailable/);
+  assert.ok(!text.includes('fused-memory offline'), text);
+  // A unit served past its freshness bound is count-stale with BOTH halves
+  // aged (task_snapshot.py::classify), so the copy cannot vouch for the rows.
+  assert.doesNotMatch(text, /rows/);
+});
+
+test('count-stale composes with count-unknown', () => {
+  const notices = tasksBannerNotices({
+    offline: false,
+    countUnknownProjects: ['a'],
+    countStaleProjects: ['b'],
+    totalProjects: 4,
+  });
+
+  assert.deepEqual(kinds(notices), ['count-unknown', 'count-stale']);
+});
+
+test('a global outage subsumes the count-stale notice', () => {
+  const notices = tasksBannerNotices({
+    offline: true,
+    offlineProjects: ['a', 'b'],
+    countStaleProjects: ['c'],
+    totalProjects: 3,
+  });
+
+  assert.deepEqual(kinds(notices), ['global']);
+});
+
+test('a missing countStaleProjects key produces no notice', () => {
+  assert.deepEqual(
+    tasksBannerNotices({ offline: false, countStaleProjects: undefined, totalProjects: 3 }),
+    []
+  );
+});
+
 // ── tasksBannerNoticesFor: the ONE mapping from DF_DATA's /tasks keys ────────
 // The Tasks-tab banner and the System health Taskmaster row both read the
 // /tasks fan-out through it, so they cannot disagree about it.
@@ -315,10 +367,11 @@ test('tasksBannerNoticesFor: each per-root list maps to its own notice, counted 
     TASKS_OFFLINE_PROJECTS: ['a'],
     TASKS_DEGRADED_PROJECTS: ['b'],
     TASKS_COUNT_UNKNOWN_PROJECTS: ['c'],
+    TASKS_COUNT_STALE_PROJECTS: ['d'],
     TASKS_PROJECT_COUNT: 9,
   });
 
-  assert.deepEqual(kinds(notices), ['partial', 'degraded', 'count-unknown']);
+  assert.deepEqual(kinds(notices), ['partial', 'degraded', 'count-unknown', 'count-stale']);
   for (const notice of notices) assert.ok(notice.text.includes('1 of 9'), notice.text);
 });
 
@@ -333,6 +386,7 @@ test('tasksBannerNoticesFor is tasksBannerNotices over the same keys', () => {
     TASKS_OFFLINE_PROJECTS: ['a', 'b'],
     TASKS_DEGRADED_PROJECTS: ['c'],
     TASKS_COUNT_UNKNOWN_PROJECTS: [],
+    TASKS_COUNT_STALE_PROJECTS: ['d'],
     TASKS_PROJECT_COUNT: 5,
   };
 
@@ -343,12 +397,13 @@ test('tasksBannerNoticesFor is tasksBannerNotices over the same keys', () => {
       offlineProjects: ['a', 'b'],
       degradedProjects: ['c'],
       countUnknownProjects: [],
+      countStaleProjects: ['d'],
       totalProjects: 5,
     }),
   );
 });
 
-test('tasksBannerNoticesFor reads exactly the five /tasks keys, so no runtime-probe fact can enter the pipeline', () => {
+test('tasksBannerNoticesFor reads exactly the six /tasks keys, so no runtime-probe fact can enter the pipeline', () => {
   // tab_tasks.jsx hands DF_DATA over whole, so this is the one place the
   // input set is decided. A probe fact folded in here would be suppressed by
   // the offline short-circuit (test_tab_tasks_runtime.py::
@@ -364,6 +419,7 @@ test('tasksBannerNoticesFor reads exactly the five /tasks keys, so no runtime-pr
   tasksBannerNoticesFor(data);
 
   assert.deepEqual([...read].sort(), [
+    'TASKS_COUNT_STALE_PROJECTS',
     'TASKS_COUNT_UNKNOWN_PROJECTS',
     'TASKS_DEGRADED_PROJECTS',
     'TASKS_OFFLINE',

@@ -427,8 +427,17 @@ async def _read_grouped_document(
     return block
 
 
-def _parent_id_in_meta(meta: Mapping[str, Any] | None) -> str | None:
+def child_parent_id(meta: Mapping[str, Any] | None) -> str | None:
     """The parent id *meta* points at, or ``None`` when it is not a child's.
+
+    Modules that ask "is this Mem0 record a child, and of what?" call this
+    rather than restating the rule. One copy remains:
+    ``services/topic_anchor.py::_is_child_shaped``, kept because importing this
+    module from ``services`` would close an import cycle. That copy is
+    stricter: it answers "not a child" for a non-``str`` ``kind``, where this
+    function raises ``TypeError`` on an unhashable one, so swapping it for a
+    call to this function must keep that guard. Task 6720 moves this function
+    into ``memory_metadata.py`` and removes that copy.
 
     A child is identified STRICTLY by ``metadata.parent_id`` plus a child
     ``kind`` (D5): a shared ``topic`` is not a grouping key, and two entries
@@ -443,9 +452,9 @@ def _parent_id_in_meta(meta: Mapping[str, Any] | None) -> str | None:
     return None
 
 
-def _child_parent_id(result: Any) -> str | None:
-    """:func:`_parent_id_in_meta` for a search hit."""
-    return _parent_id_in_meta(getattr(result, 'metadata', None))
+def _search_hit_parent_id(hit: Any) -> str | None:
+    """:func:`child_parent_id` for a search hit."""
+    return child_parent_id(getattr(hit, 'metadata', None))
 
 
 def _is_mem0(result: Any) -> bool:
@@ -720,7 +729,7 @@ async def group_search_results(
     child_parents = {
         index: parent_id
         for index, hit in enumerate(hits)
-        if (parent_id := _child_parent_id(hit)) is not None
+        if (parent_id := _search_hit_parent_id(hit)) is not None
     }
     absent = [
         parent_id
@@ -740,7 +749,7 @@ async def group_search_results(
                 hit_id
                 for hit in hits
                 if _is_mem0(hit)
-                and _child_parent_id(hit) is None
+                and _search_hit_parent_id(hit) is None
                 and isinstance(hit_id := getattr(hit, 'id', None), str)
                 and hit_id  # '' is not an id: probing it costs a guaranteed-zero count
             ]
@@ -878,7 +887,7 @@ async def group_memory_document(
     child, the other by surfacing the group.
     """
     _require_positive_text_cap(contested_text_chars)
-    parent_id = _parent_id_in_meta(record.get('metadata'))
+    parent_id = child_parent_id(record.get('metadata'))
     if parent_id is None:
         return await build_grouped_document(
             service, project_id, memory_id, contested_text_chars=contested_text_chars,

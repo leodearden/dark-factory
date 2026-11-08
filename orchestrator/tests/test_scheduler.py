@@ -25,6 +25,7 @@ from orchestrator.config import (
 from orchestrator.evals.runner import _StubMcpSession
 from orchestrator.event_store import EventType
 from orchestrator.fm_retry import fm_retry_backoffs
+from orchestrator.lock_table import ModuleLockTable
 from orchestrator.pause_policy import (
     HaltNotPermittedError,
     PauseClass,
@@ -34,7 +35,6 @@ from orchestrator.pause_policy import (
 from orchestrator.scheduler import (
     BlastRadiusResult,
     ExternalResolverError,
-    ModuleLockTable,
     Scheduler,
     SchedulerCallbacks,
     TickContext,

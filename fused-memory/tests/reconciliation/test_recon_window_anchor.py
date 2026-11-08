@@ -43,7 +43,7 @@ unchanged. Its own cost: a task that reaches done between run start and the
 tree read is audited by both cycles, and so is a done task whose ``updatedAt``
 this cycle's own writes bumped. Stage 2's ``stage2_suppress`` count-gate bounds
 both. ``last_full_run_completed`` keeps its completion-time meaning for its
-display readers, ``memory_consolidator.py::_format_watermark`` and the
+display readers, ``stage1_payload_format.py::format_watermark`` and the
 dashboard; Stage 2's done-task audit and the context assembler no longer read
 it.
 """

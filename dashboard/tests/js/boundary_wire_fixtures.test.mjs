@@ -15,6 +15,9 @@ import {
   escalationsPayload,
   mergeQueueBlock,
   openEscalationItem,
+  schedulerLockRow,
+  schedulerModule,
+  schedulerSnapshot,
   taskCensus,
   tasksSnapshotEntry,
   wireDatum,
@@ -86,6 +89,17 @@ test('a MERGE_QUEUE block is built only with keys /merge-queue serves', () => {
   const served = payload('merge_7d').MERGE_QUEUE['dark-factory'];
 
   assertBuiltKeysServed(mergeQueueBlock({ bucketMinutes: 60 }), served, 'MERGE_QUEUE[project]');
+});
+
+test('a SCHEDULER snapshot, a lock row and a module included, is built only with keys /scheduler serves', () => {
+  const served = payload('scheduler_offline').SCHEDULER;
+  const built = schedulerSnapshot({
+    offlineProjects: ['P'],
+    rows: [schedulerLockRow({ project: 'H', taskId: '1', lockSet: ['src/m'] })],
+    modules: [schedulerModule({ project: 'H', path: 'src/m', holder: '1', holderProject: 'H', parkedBy: '2', parkedOwnerLive: true })],
+  });
+
+  assertBuiltKeysServed(built, served, 'SCHEDULER');
 });
 
 test('an /escalations payload, a check-owner row included, is built only with keys /escalations serves', () => {

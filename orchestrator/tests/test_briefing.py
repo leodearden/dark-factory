@@ -25,9 +25,9 @@ from _briefing_helpers import (
     briefing,  # noqa: F401 — re-export: pytest fixture used by test methods
     memory_transport,
 )
+from _roles_helpers import tool_is_granted
 from shared.capability_manifest import DeliveredCheckMeta
 from shared.task_text_fingerprint import TaskTextDrift
-from test_roles_ancestry_check import _tool_is_granted
 
 from orchestrator.agents.briefing import (
     DELIVERED_CHECK_BULLET_LIMIT,
@@ -678,7 +678,7 @@ class TestPlanTighteningPromptToolGrants:
         granted = set(ARCHITECT.allowed_tools)
         missing = sorted(
             qualified for qualified in (f'mcp__plan-tools__{n}' for n in named)
-            if not _tool_is_granted(qualified, granted)
+            if not tool_is_granted(qualified, granted)
         )
         assert not missing, (
             f'build_plan_tightening_prompt prescribes plan tools absent from '

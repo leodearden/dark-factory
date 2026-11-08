@@ -6,8 +6,10 @@ import threading
 import time
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.message import Message
+from enum import StrEnum
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -29,7 +31,12 @@ _HOP_BY_HOP = frozenset({
 _NOT_FORWARDED = _HOP_BY_HOP | {'host', 'accept-encoding'}
 _NOT_RETURNED = _HOP_BY_HOP | {'date', 'server'}
 
-Headers = list[tuple[str, str]]
+Headers = tuple[tuple[str, str], ...]
+
+
+class StatusOrigin(StrEnum):
+    UPSTREAM = 'upstream'
+    TAP = 'tap'
 
 
 class CallRecord(FrozenModel):
@@ -46,6 +53,8 @@ class CallRecord(FrozenModel):
     finish_reason: str | None
     error_excerpt: str | None
     outlived_session: bool = False
+    # None marks a record written before the tap recorded who set the status.
+    status_origin: StatusOrigin | None = None
 
     @property
     def succeeded(self) -> bool:
@@ -85,6 +94,7 @@ def call_record(
     request_body: bytes,
     status: int,
     response_body: bytes,
+    status_origin: StatusOrigin,
 ) -> CallRecord:
     request = _json_object(request_body)
     response = _json_object(response_body) if is_success_status(status) else {}
@@ -106,6 +116,7 @@ def call_record(
         error_excerpt=None
         if is_success_status(status)
         else response_body.decode('utf-8', 'replace')[:ERROR_EXCERPT_CHARS],
+        status_origin=status_origin,
     )
 
 
@@ -114,32 +125,74 @@ def load_call_records(path: Path | str) -> tuple[CallRecord, ...]:
     return tuple(CallRecord.model_validate_json(line) for line in lines if line.strip())
 
 
+def _notice(line: str) -> None:
+    print(line, flush=True)
+
+
 class _SessionCallLog:
+    """One tap session's calls; closing it drains the calls still in flight."""
+
     def __init__(self, path: Path) -> None:
         self._path = path
-        self._lock = threading.Lock()
+        self._state = threading.Condition()
+        self._in_flight = 0
         self._closed = False
 
-    def close(self) -> None:
-        with self._lock:
-            self._closed = True
+    @contextmanager
+    def in_flight(self) -> Iterator[None]:
+        with self._state:
+            self._in_flight += 1
+        try:
+            yield
+        finally:
+            with self._state:
+                self._in_flight -= 1
+                self._state.notify_all()
+
+    def close(self, drain_timeout_s: float) -> None:
+        with self._state:
+            try:
+                self._drain(drain_timeout_s)
+            finally:
+                self._closed = True
+
+    def _drain(self, drain_timeout_s: float) -> None:
+        if not self._in_flight:
+            return
+        _notice(
+            f'usage tap: waiting up to {drain_timeout_s:g} s for {self._in_flight} '
+            'in-flight call(s) to land before the session closes'
+        )
+        if not self._state.wait_for(lambda: self._in_flight == 0, timeout=drain_timeout_s):
+            _notice(
+                f'usage tap: drain bound of {drain_timeout_s:g} s expired with '
+                f'{self._in_flight} call(s) still in flight; they land marked outlived_session'
+            )
 
     def append(self, record: CallRecord) -> None:
-        with self._lock, self._path.open('a') as stream:
+        with self._state, self._path.open('a') as stream:
             if self._closed:
                 record = record.model_copy(update={'outlived_session': True})
             stream.write(record.model_dump_json() + '\n')
             stream.flush()
 
 
-def _tap_error(status: int, message: str) -> tuple[int, Headers, bytes]:
+@dataclass(frozen=True)
+class _Reply:
+    status: int
+    headers: Headers
+    body: bytes
+    origin: StatusOrigin
+
+
+def _tap_error(status: int, message: str) -> _Reply:
     body = json.dumps({'error': {'message': message, 'type': 'usage_tap'}}).encode()
-    return status, [('Content-Type', 'application/json')], body
+    return _Reply(status, (('Content-Type', 'application/json'),), body, StatusOrigin.TAP)
 
 
 def _exchange(
     upstream: SplitResult, method: str, path: str, headers: Message, body: bytes
-) -> tuple[int, Headers, bytes]:
+) -> _Reply:
     if _json_object(body).get('stream') is True:
         return _tap_error(
             STREAM_REFUSED_STATUS,
@@ -155,7 +208,9 @@ def _exchange(
     try:
         connection.request(method, path, body=body, headers=forwarded)
         response = connection.getresponse()
-        return response.status, response.getheaders(), response.read()
+        return _Reply(
+            response.status, tuple(response.getheaders()), response.read(), StatusOrigin.UPSTREAM
+        )
     except (OSError, http.client.HTTPException) as error:
         return _tap_error(
             UPSTREAM_UNREACHABLE_STATUS,
@@ -181,28 +236,28 @@ def _handler_class(
             self._proxy()
 
         def _proxy(self) -> None:
-            started_at = datetime.now(UTC)
-            started = time.perf_counter()
-            body = self.rfile.read(int(self.headers.get('Content-Length') or 0))
-            status, headers, response_body = _exchange(
-                upstream, self.command, self.path, self.headers, body
-            )
-            call_log.append(call_record(
-                started_at=started_at,
-                duration_ms=(time.perf_counter() - started) * 1000,
-                method=self.command,
-                path=self.path,
-                request_body=body,
-                status=status,
-                response_body=response_body,
-            ))
-            self.send_response(status)
-            for name, value in headers:
+            with call_log.in_flight():
+                started_at = datetime.now(UTC)
+                started = time.perf_counter()
+                body = self.rfile.read(int(self.headers.get('Content-Length') or 0))
+                reply = _exchange(upstream, self.command, self.path, self.headers, body)
+                call_log.append(call_record(
+                    started_at=started_at,
+                    duration_ms=(time.perf_counter() - started) * 1000,
+                    method=self.command,
+                    path=self.path,
+                    request_body=body,
+                    status=reply.status,
+                    response_body=reply.body,
+                    status_origin=reply.origin,
+                ))
+            self.send_response(reply.status)
+            for name, value in reply.headers:
                 if name.lower() not in _NOT_RETURNED:
                     self.send_header(name, value)
-            self.send_header('Content-Length', str(len(response_body)))
+            self.send_header('Content-Length', str(len(reply.body)))
             self.end_headers()
-            self.wfile.write(response_body)
+            self.wfile.write(reply.body)
 
     return TapHandler
 
@@ -219,7 +274,12 @@ def _upstream_origin(upstream_url: str) -> SplitResult:
 
 @contextmanager
 def usage_tap(
-    upstream_url: str, *, log_path: Path | str, host: str = '127.0.0.1', port: int = 0
+    upstream_url: str,
+    *,
+    log_path: Path | str,
+    host: str = '127.0.0.1',
+    port: int = 0,
+    drain_timeout_s: float = UPSTREAM_TIMEOUT_S,
 ) -> Iterator[str]:
     call_log_path = Path(log_path)
     call_log_path.touch()
@@ -232,7 +292,7 @@ def usage_tap(
     try:
         yield f'http://{host}:{server.server_address[1]}'
     finally:
-        call_log.close()
         server.shutdown()
         server.server_close()
+        call_log.close(drain_timeout_s)
         thread.join(timeout=5)

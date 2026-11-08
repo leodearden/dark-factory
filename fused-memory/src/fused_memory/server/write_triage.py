@@ -64,13 +64,13 @@ from fused_memory.memory_metadata import normalize_supersedes
 from fused_memory.middleware._folded_escalation import file_folded_escalation
 from fused_memory.models.enums import MEM0_PRIMARY, SourceStore
 from fused_memory.server.grouped_read import (
-    CHILD_KINDS,
     CONTESTED_METADATA_KEY,
     PARENT_ID_KEY,
+    child_parent_id,
 )
 
 # The per-store-cosine reader, IMPORTED rather than re-implemented (INV-5) —
-# the same treatment PARENT_ID_KEY and CHILD_KINDS get above. This module
+# the same treatment PARENT_ID_KEY and child_parent_id get above. This module
 # retires ``near_duplicate_guard``, so a copy here would have been the obvious
 # shortcut; it is also exactly how task 3658's field move (relevance_score →
 # metadata['store_score']) would go wrong a second time. One copy updated and
@@ -516,7 +516,7 @@ def declares_attach_keys(metadata: Any) -> bool:
     Likewise ANY ``parent_id``, well-formed or not: a malformed link is a
     caller bug for ``memory_metadata`` validation to report, and quietly
     converting it into a triage attach would hide it. Contrast
-    ``grouped_read._parent_id_in_meta``, which requires both keys well-formed
+    ``grouped_read.child_parent_id``, which requires both keys well-formed
     because it answers a different question — "does this record group?" rather
     than "did the caller set something an attach would overwrite?".
     """
@@ -569,19 +569,12 @@ def canonical_id_of(result: MemoryResult) -> str:
     (deleted) parent now refuses to ``stored`` instead
     (:attr:`AttachRefusal.TARGET_COSINE_UNAVAILABLE`).
 
-    The child rule mirrors ``grouped_read._parent_id_in_meta`` rule-for-rule —
-    a child ``kind`` AND a non-empty ``str`` ``parent_id``, with a malformed
-    parent link falling back to the record's own id — and both the kind set
-    and the metadata key are IMPORTED from that module rather than spelled as
-    literals (INV-5), because a drift between the write side and the read side
-    is exactly what produces an unfoldable child.
+    The child rule IS ``grouped_read.child_parent_id``, called rather than
+    restated (INV-5), because a drift between the write side and the read side
+    is exactly what produces an unfoldable child. A malformed parent link is
+    not a child link, so it falls back to the record's own id.
     """
-    meta = result.metadata or {}
-    if meta.get('kind') in CHILD_KINDS:
-        parent_id = meta.get(PARENT_ID_KEY)
-        if isinstance(parent_id, str) and parent_id:
-            return parent_id
-    return result.id
+    return child_parent_id(result.metadata) or result.id
 
 
 def decide_band(

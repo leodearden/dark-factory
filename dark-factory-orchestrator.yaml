@@ -6,7 +6,15 @@
 # had finished implementing and sat in verify, measured at 44 of 48, several for
 # 8h+. Each held its dispatch slot while contributing ~1.8 test legs to the
 # single-slot admission queue. Red tier: takes effect at restart.
-max_concurrent_tasks: 24
+# 24 -> 18 (Leo, 2026-11-02, ruling after the 2026-11-01 portfolio review, seat Q3):
+# the per-project task-verify slot is saturated (a waiter is present in 92-99% of
+# heartbeat samples, W43-W44). A closed-loop queue model fitted to W44 keeps the slot
+# >= 97.6% busy at 18 while roughly halving verify wait (2.9 h -> 1.5 h) and rebase
+# drift (the W44 median was 34 commits, up from 13 in W42). Tripwire: if the weekly
+# waiter-present share falls below 0.90 or landings/day fall below the W44 rate,
+# revert at the next redeploy; raise again when task 7977's remote task legs reach
+# this project. Red tier: takes effect at the next redeploy.
+max_concurrent_tasks: 18
 
 # lock_depth 4→12 (Leo 2026-08-07): make module locks effectively file-granular.
 # Until now dark-factory never set this key at all — it silently inherited the
@@ -94,7 +102,7 @@ lock_depth: 12
 # no longer collide. The ledger keys are the RETIRED array path, kept because
 # pending tasks still declare it, and the directory's one fixed file. A PARK on
 # these keys takes one of the key's slots instead of reserving it exclusively
-# (orchestrator/src/orchestrator/scheduler.py::ModuleLockTable._iter_blocking_park_owners).
+# (orchestrator/src/orchestrator/lock_table.py::ModuleLockTable._iter_blocking_park_owners).
 # Same red tier as above.
 module_overrides:
   orchestrator/src/orchestrator/workflow.py: 2
@@ -1650,6 +1658,17 @@ verify_runners:
 verify_host_policy: prefer_remote
 verify_drift_check_every_n_lands: 10
 verify_cross_check_remote_green: false
+# Remote TASK verifies (task 6670, plans/remote-task-leg-verify-prd.md §5.7): the four
+# verify_task_* keys let an implement-phase task verify run on a verify_runners host
+# (one queue per host, shared with the merge lane's bench). None is set here, so the
+# code default verify_task_host_policy: local stands: every task verify runs locally
+# exactly as before and no dispatch sidecar is written. All four are green tier,
+# read per dispatch and per remote grant. Task ε (DF rollout) sets them, e.g.:
+# verify_task_host_policy: remote_modules        # local | remote_modules | remote_all
+# verify_task_remote_modules: [orchestrator]     # must be non-empty under remote_modules
+# verify_task_remote_red_confirms_locally: true  # a remote red re-runs locally, local wins
+# verify_task_remote_cross_check_every_n: 5      # every 5th remote verdict (per process) is re-run locally, local wins
+# ROLLBACK: verify_task_host_policy: local (or delete the keys) + mcp__escalation__reload_config.
 
 # Pre-merge rebase: the merge phase only REBASES (Leo, 2026-10-09, task 6580).
 # workflow.py's merge phase rebases the task branch onto main and submits it to the
@@ -1792,7 +1811,7 @@ psi_admission:            # PRD plans/load-throttle-harmonisation-prd.md §6.2 (
   mem_some_avg10: 15.0
   mem_full_avg10: 3.0
   io_some_avg10: 40.0
-  runqueue_ratio: 4.0     # provisional (D9); the calibration gate re-derives it
+  runqueue_ratio: 6.0     # calibrated: plans/load-threshold-calibration-2026-11-03.md (esc-5219-1)
   min_inflight_floor: 3
   # cpu_some_avg10 and own_cpu_some_avg10 deliberately absent: off (D1, D2)
 

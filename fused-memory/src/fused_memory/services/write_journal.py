@@ -997,7 +997,7 @@ class WriteJournal:
                 f'Failed to record idempotent_ops for {client_op_id}: {e}'
             )
 
-    async def prune_idempotent_ops(self, *, older_than_days: float = 7.0) -> int:
+    async def prune_idempotent_ops(self, *, older_than_days: float) -> int:
         """Age out old ``idempotent_ops`` rows past a retention window.
 
         One row accrues per mutating task write (update_task / set_task_status /
@@ -1007,7 +1007,8 @@ class WriteJournal:
         (seconds to minutes; a higher-level retry at most hours), so an
         aggressive TTL is safe: rows whose ``created_at`` is older than
         ``older_than_days`` are deleted and the count returned. Intended to run
-        at startup alongside ``prune_mem0_intents``.
+        at startup alongside ``prune_mem0_intents``. The horizon's home is
+        ``config/schema.py::WriteJournalConfig.idempotent_ops_retention_days``.
 
         Fire-and-forget — logs loudly on failure but never raises, so a prune
         hiccup cannot crash startup (mirrors ``prune_mem0_intents``).
@@ -1279,7 +1280,7 @@ class WriteJournal:
     async def prune_mem0_intents(
         self,
         *,
-        older_than_days: float = 30.0,
+        older_than_days: float,
         statuses: tuple[str, ...] = ('completed', 'failed'),
     ) -> int:
         """Age out terminal ``mem0_intents`` past a retention window.
@@ -1291,7 +1292,8 @@ class WriteJournal:
         ``resolved_at`` is older than ``older_than_days``, returning the count
         deleted. Intended to run once at startup (after
         ``MemoryService.recover_mem0_intents``) or from a periodic
-        maintenance task.
+        maintenance task. The horizon's home is
+        ``config/schema.py::WriteJournalConfig.mem0_intents_retention_days``.
 
         ``dead`` is deliberately EXCLUDED from the default ``statuses``: a
         dead-lettered intent carries the full content needed for manual replay

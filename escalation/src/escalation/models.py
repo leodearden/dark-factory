@@ -29,6 +29,11 @@ Pause-detector trip facts (default None; task 4686):
               EwaRateTripFacts / ParkStopTripFacts carried by the escalation
               a non-halting pause detector files instead of halting
 
+Cancel-with-children facts (default None; task 8142):
+  cancel_children / children / superseded_by:
+              child rows, the disposition map and the superseders, as the
+              JSON shared/src/shared/cancel_dispositions.py serializes them
+
 Incoming-framing amendments (default-empty; task 3997):
   amendments: append-only list of Amendment entries -- the framing
               (root_cause/summary/detail/options) a fold carried in, preserved
@@ -811,6 +816,23 @@ class Escalation:
     # __dataclass_fields__ filter.
     ewa_rate_trip: EwaRateTripFacts | None = None
     park_stop_trip: ParkStopTripFacts | None = None
+    # Cancel-with-children facts as plain JSON (contract:
+    # shared/src/shared/cancel_dispositions.py). Writers: the residue record (γ)
+    # and the abandon persistence (δ). cancel_children holds rows_to_json
+    # output, one ChildRow each; children holds the disposition map as
+    # children_to_json writes it. Validation is at the δ boundary, not here.
+    # None for every other escalation; zero migration via the from_dict
+    # __dataclass_fields__ filter.
+    cancel_children: list[dict] | None = None
+    children: dict[str, dict] | None = None
+    superseded_by: list[int] | None = None
+    # The executor's policy-class claim (task 8422). Sole writer:
+    # queue.claim_policy_class. The fields survive resolution, so a closed
+    # record still names the class it was closed under. Zero migration via the
+    # from_dict filter.
+    policy_class: str | None = None
+    claimed_at: str | None = None
+    claimed_by: str | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)

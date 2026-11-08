@@ -109,6 +109,7 @@ from orchestrator.flake_debt_drain import DRAIN_INTERVAL_SECS, run_drain_pass
 from orchestrator.flake_ledger import ledger_db_path
 from orchestrator.fleet_drain import DrainIdentity, DrainParticipant, FleetDrainEvent
 from orchestrator.fleet_heartbeat import build_heartbeat_payload, resolve_fleet_dir, write_heartbeat
+from orchestrator.fm_retry import is_fm_null_sentinel
 from orchestrator.git_ops import GitOps, classify_worktree_entry
 from orchestrator.lane_lifecycle import LaneRecord
 from orchestrator.lane_lifecycle import LaneState as DurableLaneState
@@ -161,6 +162,7 @@ from orchestrator.recovery_emission import (
     emit_recovery_event,
     emit_recovery_veto_streak_escalation,
     escalation_ages_secs,
+    pending_holder_candidates,
     pin_buckets,
     render_shape,
     resolve_recovery_veto_streak_escalation,
@@ -226,9 +228,12 @@ from orchestrator.task_status import (
     TERMINAL_STATUSES,
     is_infra_held,
 )
+from orchestrator.task_verify_dispatch import TaskVerifyDispatcher, policy_from_config
 from orchestrator.usage_gate import UsageGate
 from orchestrator.verify_admission_watch import ADMISSION_WATCH_INTERVAL_SECS, AdmissionWatch
 from orchestrator.verify_categories import FailureCategory
+from orchestrator.verify_hosts import HostPool, remote_runner_factory, task_verify_hosts
+from orchestrator.verify_runner import RunnerUnavailable
 from orchestrator.workflow import (
     ResumeFailure,
     TerminalReport,
@@ -243,6 +248,8 @@ from orchestrator.zero_progress_requeue import (
 )
 
 if TYPE_CHECKING:
+    from shared.uuid_prefix_guard import PrefixResolver
+
     from orchestrator.merge_lane.worker import (
         BreakerTrip,
         SpeculativeMergeWorker,
@@ -251,6 +258,7 @@ if TYPE_CHECKING:
     from orchestrator.warm_lane_pool import WarmLanePoolCensus
 
 try:
+    from escalation.prefix_resolver_client import PrefixResolverClient
     from escalation.queue import EscalationQueue
     from escalation.server import create_server
     from escalation.store_identity import StoreIdentity
@@ -2217,6 +2225,22 @@ class Harness:
         self._merge_inflight_registry: InFlightMergeRegistry = InFlightMergeRegistry()
         self._merge_worker: SpeculativeMergeWorker | None = None
         self._merge_worker_task: asyncio.Task | None = None
+        # Remote verify host health for the PROCESS lifetime (task 6670, PRD
+        # plans/remote-task-leg-verify-prd.md §5.6): one quarantine set, shared
+        # by reference with every merge worker built below, and the task path's
+        # pool and dispatcher over it, whether or not a merge worker starts.
+        self._runner_quarantine: set[str] = set()
+        self._host_pool = HostPool(
+            task_verify_hosts(config, deployed_sha=deployed_sha),
+            runner_for=remote_runner_factory(
+                config, config.project_root, deployed_sha=deployed_sha,
+            ),
+            quarantine=self._runner_quarantine,
+            on_unavailable=self._bench_verify_host,
+        )
+        self._task_verify_dispatcher = TaskVerifyDispatcher(
+            self._host_pool, self.git_ops, policy_of=policy_from_config,
+        )
         self._abandoned_member_sweep = AbandonedMemberSweep()
         # This unit's side of the restart drain (task 5371): steers the merge
         # worker's admission from the heartbeat pass, reports at stop.
@@ -3564,22 +3588,42 @@ class Harness:
             logger.info(f'Module cache sample: {sample}')
 
     def _resolve_recovery_artifact(self, entry: Path, name: str) -> Path:
-        """Resolve a `.task` artifact path new-then-old (W11 delta relocation).
+        """Resolve a LANE-keyed artifact (``agent_session.json``) new-then-old.
 
         Prefers ``TaskArtifacts.meta_root_for(worktree_base, entry.name) /
-        name`` (the new ``.task-meta`` sibling location, W11 beta), falling
-        back to the legacy ``entry / '.task' / name`` when the new path is
-        absent.  Mirrors ``TaskArtifacts._read_path``'s new-then-old
-        contract, for the ``_recover_crashed_tasks`` reads that don't go
-        through a ``TaskArtifacts`` instance.
+        name`` (the ``.task-meta`` lane root, W11 beta), falling back to the
+        legacy ``entry / '.task' / name`` when that path is absent.
+        Task-scoped artifacts go through :meth:`_task_recovery_artifact`.
         """
         new_path = TaskArtifacts.meta_root_for(self.git_ops.worktree_base, entry.name) / name
         if new_path.exists():
             return new_path
         return entry / '.task' / name
 
+    def _task_recovery_artifact(self, entry: Path, task_id: str | None, name: str) -> Path | None:
+        """Where task-scoped *name* (plan.json, plan.lock) of *task_id* survives
+        for *entry*: the task root (``TaskArtifacts.for_task``), else the legacy
+        ``entry / '.task' / name`` (W11 compat).
+
+        ``None`` when *task_id* is None or ``task_root_for`` rejects it: there
+        is no task to read for, so the caller takes its no-plan branch.
+        """
+        if task_id is None:
+            return None
+        try:
+            task_path = TaskArtifacts.for_task(entry, task_id).artifact_path(name)
+        except ValueError as exc:
+            logger.warning(
+                'Recovery: %s names an unaddressable task id (%s) — no %s to read',
+                entry.name, exc, name,
+            )
+            return None
+        if task_path.exists():
+            return task_path
+        return entry / '.task' / name
+
     def _clear_recovery_artifact(self, entry: Path, name: str) -> None:
-        """Remove a `.task` artifact from BOTH the new and legacy roots.
+        """Remove a LANE-keyed artifact from BOTH the lane and legacy roots.
 
         The write-side mirror of :meth:`_resolve_recovery_artifact` — mirrors
         ``TaskArtifacts._clear_path``: clearing only the resolved path risks
@@ -3606,11 +3650,11 @@ class Harness:
         ``AgentSession`` through.
 
         Keying: when *task_id* is given (the plan-present sites, keyed by
-        the plan-derived recovery id) it is used directly — this covers both
+        the entry's recovery id) it is used directly — this covers both
         a v2 sidecar (whose own ``task_id`` should equal it) and a v1
         sidecar (which has no ``task_id`` of its own, B11 fallback). When
         *task_id* is ``None`` (the no-plan lane site, which has no
-        plan-derived id) falls back to the sidecar's own v2 ``task_id``. If
+        recovered plan) falls back to the sidecar's own v2 ``task_id``. If
         neither yields a usable key (a v1 sidecar on a no-plan lane) — or the
         sidecar is missing, unreadable, or parsed to something that is not a
         JSON OBJECT — nothing is adopted and ``None`` is returned. Never
@@ -3673,8 +3717,8 @@ class Harness:
         # ``orchestrator/src/orchestrator/workflow.py::TaskWorkflow`` as
         # ``TaskConfigDir(self.task_id, base_dir=self.worktree / '.task')``.
         # And ``key`` above IS the real task id at every call arity (the
-        # plan-derived recovery id, the v2 sidecar's own ``task_id``, or the
-        # cold worktree's dir name — all the same identity).
+        # lane metadata's recovery id, the v2 sidecar's own ``task_id``, or
+        # the cold worktree's dir name — all the same identity).
         #
         # Nothing else is EVER stashed: the one other creator,
         # ``orchestrator/src/orchestrator/dry_run_unblock.py::dry_run_unblock``,
@@ -4290,6 +4334,12 @@ class Harness:
         top_pool = self.git_ops.warm_lane_pool
         if top_pool is not None:
             top_pool.set_lane_lifecycle(self.git_ops._lane_lifecycle)
+        # Leaf δ: under the unit's KillMode=control-group no dark-factory
+        # child survives the restart that led here, so every IN_USE record is
+        # a crash fossil; left alone it would make its lane unreclaimable
+        # once ε lands. An orphan of an unmanaged kill (its agents run in
+        # their own sessions) is still guarded by γ's /proc gate.
+        self.git_ops.reset_stale_lane_in_use_records()
         self.git_ops.warn_on_warm_lane_pool_shrink()
 
         for entry in worktree_base.iterdir():
@@ -4506,10 +4556,10 @@ class Harness:
                                 continue
 
                         pool.restore_assignment(rec.task_id, entry)
-                        rec_plan_path = self._resolve_recovery_artifact(
-                            entry, 'plan.json',
+                        rec_plan_path = self._task_recovery_artifact(
+                            entry, rec.task_id, 'plan.json',
                         )
-                        if rec_plan_path.exists():
+                        if rec_plan_path is not None and rec_plan_path.exists():
                             try:
                                 rec_plan = json.loads(rec_plan_path.read_text())
                             except (json.JSONDecodeError, OSError) as e:
@@ -4552,10 +4602,10 @@ class Harness:
                                         entry.name, rec.task_id,
                                     )
                                     self._preserved_worktrees.add(rec.task_id)
-                        rec_lock_path = self._resolve_recovery_artifact(
-                            entry, 'plan.lock',
+                        rec_lock_path = self._task_recovery_artifact(
+                            entry, rec.task_id, 'plan.lock',
                         )
-                        if rec_lock_path.exists():
+                        if rec_lock_path is not None and rec_lock_path.exists():
                             rec_lock_path.unlink()
                             logger.info(
                                 'Recovery: cleared stale plan.lock for '
@@ -4607,16 +4657,27 @@ class Harness:
                         cleaned += 1
                         continue
 
-            plan_path = self._resolve_recovery_artifact(entry, 'plan.json')
+            # The task this entry was dispatched for. A cold worktree is named
+            # for it; a lane is named for its pool slot, so its id comes from
+            # the lane root's metadata.json — never from a plan.json, which is
+            # task-scoped and lives in the task root that id names.
+            recovery_id = (
+                TaskArtifacts.read_lane_task_id(
+                    TaskArtifacts.meta_root_for(worktree_base, entry.name),
+                )
+                if is_lane else task_id
+            )
+            plan_path = self._task_recovery_artifact(entry, recovery_id, 'plan.json')
 
-            if not plan_path.exists():
+            if recovery_id is None or plan_path is None or not plan_path.exists():
                 # Mid-invocation crash: an agent subprocess was in flight when
                 # the prior orchestrator died (no plan was written yet).  The
                 # sidecar pins the Claude session UUID so the next workflow
                 # can --resume it with a "continue" prompt instead of spawning
                 # a fresh agent.
                 #
-                # For lanes: a v1 sidecar carries session_id/role/owner_pid
+                # For lanes this also covers a lane whose metadata names no
+                # task.  A v1 sidecar carries session_id/role/owner_pid
                 # but NO task_id, and the in-memory assignment map is empty
                 # after a restart, so a v1-only lane still can't be mapped
                 # back to its real task -- nothing is adopted for it.  A v2
@@ -4672,31 +4733,6 @@ class Harness:
                 cleaned += 1
                 continue
 
-            # For lanes, derive the real task id from plan.json.  A lane dir
-            # name (e.g. '_lane-0') never equals the real task_id by design —
-            # the lane dir is named after the pool slot, not the task.
-            # Cold path: recovery_id == task_id (entry.name) — byte-identical.
-            # Normalize to str: plan.json could store task_id as int; dispatch
-            # and restore_assignment key off str (mirroring the str() coercion
-            # in the orphan-reaper live_ids set).
-            recovery_id = (
-                str(plan.get('task_id'))
-                if (is_lane and plan.get('task_id') is not None)
-                else task_id
-            )
-
-            # For lanes: if plan.json has no task_id there is no recoverable
-            # identity — release the lane back to the pool.
-            if is_lane and not recovery_id:
-                logger.warning(
-                    'Recovery: lane %s plan.json has no task_id — '
-                    'releasing back to pool',
-                    task_id,
-                )
-                await self.git_ops.cleanup_worktree(entry, task_id)
-                cleaned += 1
-                continue
-
             # Validate plan belongs to this task (cold path only).
             # Lanes skip this check: lane name != task_id is expected by
             # design, so the cold numeric-mismatch cleanup must not fire.
@@ -4719,7 +4755,7 @@ class Harness:
             # task).  Compare the worktree's stored title to the LIVE DB
             # task's title and quarantine on a provable mismatch — this is the
             # exact line that would have caught 3770.
-            # For lanes, recovery_id is the real task id read from plan.json.
+            # For lanes, recovery_id is the real task id from lane metadata.
             if self.config.worktree_identity_guard_enabled:
                 live = await self.scheduler.get_task(recovery_id)
                 if live is None:
@@ -4810,7 +4846,9 @@ class Harness:
                 # 17-20 wasted Opus calls per 14d.  Keep the worktree, unlink
                 # plan.lock, and add to _preserved_worktrees so the next
                 # acquisition reuses it; _plan() will then take the
-                # revalidation branch via _old_plan_base.  We deliberately
+                # revalidation branch via the plan's own _base_commit
+                # (falling back to the lane's prior base for unstamped
+                # plans).  We deliberately
                 # do NOT pre-load into _recovered_plans because that bypasses
                 # _plan() entirely.
                 if plan.get('_session_id'):
@@ -4818,8 +4856,8 @@ class Harness:
                         f'Recovery: worktree {recovery_id} has stamped plan with '
                         f'no completed steps — preserving for revalidation'
                     )
-                    lock_path = self._resolve_recovery_artifact(entry, 'plan.lock')
-                    if lock_path.exists():
+                    lock_path = self._task_recovery_artifact(entry, recovery_id, 'plan.lock')
+                    if lock_path is not None and lock_path.exists():
                         lock_path.unlink()
                         logger.info(
                             f'Recovery: cleared stale plan.lock for '
@@ -4855,8 +4893,8 @@ class Harness:
             self._recovered_plans[recovery_id] = plan
             self._adopt_recovered_session(entry, recovery_id)
             # Clear stale plan.lock so the new session doesn't immediately requeue
-            lock_path = self._resolve_recovery_artifact(entry, 'plan.lock')
-            if lock_path.exists():
+            lock_path = self._task_recovery_artifact(entry, recovery_id, 'plan.lock')
+            if lock_path is not None and lock_path.exists():
                 lock_path.unlink()
                 logger.info(f'Recovery: cleared stale plan.lock for task {recovery_id}')
             recovered += 1
@@ -9177,15 +9215,16 @@ class Harness:
         """Invoke the warm-lane GC reclaim helper once (single cadence tick).
 
         Delegates unconditionally to ``git_ops._run_warm_lane_gc_reclaim()``,
-        which is already fail-soft: rc 127 when the script is absent (no-op),
-        non-zero on script error (logged at WARNING inside the helper), and
-        never raises.  This method therefore also never raises.
+        which is already fail-soft: rc 127 when no reclaim ran, non-zero on
+        script error (logged at WARNING inside the helper), and never raises.
+        This method therefore also never raises.
 
-        Logging is tiered to avoid noise on hosts where gc.sh is absent
-        (rc=127 is the expected no-op case on ~144 ticks/day with the 600s
-        default):
-          * rc==0   → INFO  (actual reclaim ran)
-          * rc==127 → DEBUG (script absent — expected no-op)
+        Logging is tiered against what git_ops already logs for the pass:
+          * rc==0   → DEBUG, because git_ops' preceding line reports the pass:
+            the INFO ``reclaim pass`` record, or an "uncounted" WARNING
+          * rc==127 → INFO, cause-free; git_ops' preceding line names the
+            cause: a lease deferral at INFO; a pool refusal, script not found
+            (naming both candidates) or unexpected error at WARNING
           * other   → WARNING (unexpected non-zero)
 
         Also folds in the interactive-worktree (``_iact-*``) crash-safety
@@ -9198,9 +9237,15 @@ class Harness:
         """
         rc = await self.git_ops._run_warm_lane_gc_reclaim()
         if rc == 0:
-            logger.info('Warm-lane GC reclaim pass: reclaimed (rc=0)')
+            logger.debug(
+                'Warm-lane GC reclaim pass: script exited 0 (see the preceding '
+                '_run_warm_lane_gc_reclaim line)',
+            )
         elif rc == 127:
-            logger.debug('Warm-lane GC reclaim pass: script absent, no-op (rc=127)')
+            logger.info(
+                'Warm-lane GC reclaim pass: no reclaim ran this tick (rc=127) — '
+                'the preceding _run_warm_lane_gc_reclaim line names the cause',
+            )
         else:
             logger.warning('Warm-lane GC reclaim pass: non-zero rc=%d', rc)
         await self._run_interactive_worktree_reaper_pass()
@@ -10675,6 +10720,7 @@ class Harness:
                 event_store=self.event_store,
                 cost_store=self.cost_store,
                 cancel_event=cancel_event,
+                task_verify=self._task_verify_dispatcher,
                 resume_session_id=recovered_session,
                 run_id=self._run_id,
                 # ε (task 3733): the harness IS the sink — it owns the streak,
@@ -11770,9 +11816,18 @@ class Harness:
             # here: classify_pins is consulted for BUCKETING and the streak
             # alarm's human-parked gate only (never for the veto answer), and
             # records=None carries its store-unavailable third state, which
-            # must never collapse into "no records".
+            # must never collapse into "no records"; where that gate can decide
+            # a filing the pending queue feeds it too, because a cluster L2 may
+            # sit under another task id (task 7716).
             pins = pin_buckets(
                 task_id, records, store_unavailable=store_unavailable,
+                holder_candidates=pending_holder_candidates(
+                    getattr(self, '_escalation_queue', None), site,
+                    reason=reason,
+                    store_unavailable=store_unavailable,
+                    streak_escalation_enabled=cfg.streak_escalation_enabled,
+                    suppress_human_parked=cfg.streak_escalation_suppress_human_parked,
+                ),
             )
             buckets = pins.buckets
 
@@ -12329,7 +12384,15 @@ class Harness:
             provenance_conflict_sink=self._provenance_conflict_sink,
             deployed_sha=self._deployed_sha,
             verify_hosts=[r.name for r in self.config.verify_runners],
+            runner_quarantine=self._runner_quarantine,
+            host_holder_reader=self._host_pool.holders,
+            on_host_readmitted=self._note_verify_host_readmitted,
         )
+        # Manage every remote host from the start, so a task-path bench before
+        # the first merge lands on a tracked host (task 6670).  Without a
+        # deployed sha no remote verify runs, and the build would refuse.
+        if self._deployed_sha is not None:
+            self._merge_worker.ensure_host_allocator(self.config)
 
         # task 2828 (limb 1) — STARTUP SURVIVOR BARRIER.  Reap any orphaned
         # verify subtree from a PREVIOUS run still alive under the warm
@@ -12371,6 +12434,37 @@ class Harness:
                 await self._merge_worker_task
             self._merge_worker_task = None
             logger.info('Merge worker stopped')
+
+    def _bench_verify_host(self, name: str, exc: RunnerUnavailable) -> None:
+        """The task pool's bench sink: one RunnerUnavailable bench on the merge lane.
+
+        The allocator is ensured first, so the host is managed and the
+        unreachability thresholds come from config before the bench.  Without
+        a running merge worker there is no tracker to bench on and no reprobe
+        sweep to readmit the host: logged, no-op.  A merge-lane fault is
+        logged and never reaches the task verify, as the worker's readmit
+        hook never lets a task-pool fault reach the merge lane.
+        """
+        task = self._merge_worker_task
+        worker = self._merge_worker if task is not None and not task.done() else None
+        if worker is None:
+            logger.warning(
+                'Remote verify host %s is unavailable (%s), but no merge worker '
+                'is running to bench it', name, exc,
+            )
+            return
+        try:
+            worker.ensure_host_allocator(self.config)
+            worker.bench_unavailable_runner(name, exc)
+        except Exception:
+            logger.exception(
+                'Benching unavailable remote verify host %r on the merge lane raised; '
+                'the task verify goes on without the bench', name,
+            )
+
+    def _note_verify_host_readmitted(self, name: str) -> None:
+        """The merge lane's readmission hook: re-offer *name* to the task pool's waiters."""
+        self._host_pool.note_readmitted(name, self.config)
 
     async def _note_merge_all(
         self, task_id: str, base_sha: str, head_sha: str
@@ -13070,6 +13164,18 @@ class Harness:
 
         return _lookup
 
+    def _build_prefix_resolver(self) -> PrefixResolver | None:
+        """fused-memory's ``POST /resolve-prefix`` (PRD D7), or no uuid-prefix guard at all.
+
+        Under the D8 null sentinel fused-memory is absent by design, so every
+        resolution would be 'unavailable', and the guard's storm alarm would
+        file a blocking L1 about an outage nobody can fix.
+        """
+        url = self.config.fused_memory.url
+        if is_fm_null_sentinel(url):
+            return None
+        return PrefixResolverClient(base_url=url).resolve_prefix
+
     async def _start_escalation_server(self) -> None:
         """Start the escalation MCP server as a background asyncio task."""
         if not HAS_ESCALATION:
@@ -13122,6 +13228,7 @@ class Harness:
                 project_id=self.config.fused_memory.project_id,
                 project_root=self.config.project_root,
             ),
+            prefix_resolver=self._build_prefix_resolver(),
         )
         host = self.config.escalation.host
         port = self.config.escalation.port
@@ -17781,16 +17888,26 @@ class Harness:
     def _locate_plan_artifacts(self, task_id: str) -> TaskArtifacts | None:
         """Return *task_id*'s plan artifacts resolved new-then-old, or None.
 
-        The W11 ``.task-meta`` SIBLING first, the legacy ``<worktree>/.task``
-        second. Without the fallback arm every pre-relocation task would take
-        the "no plan" exit of :meth:`_fold_granted_files`.
-        :meth:`_resolve_recovery_artifact` is the read-only sibling of the same
-        contract, for single artifact paths.
+        The task's own ``.task-meta/task-<id>`` root first, the legacy
+        ``<worktree>/.task`` second. Without the fallback arm every
+        pre-relocation task would take the "no plan" exit of
+        :meth:`_fold_granted_files`. :meth:`_task_recovery_artifact` is the
+        read-only sibling of the same contract, for single artifact paths.
+
+        ``None`` also when ``task_root_for`` rejects *task_id*: there is no
+        addressable task root to read, so the caller takes its no-plan branch.
         """
         wt = self._resolve_task_worktree(task_id)
-        new_root = TaskArtifacts.meta_root_for(self.git_ops.worktree_base, wt.name)
-        if (new_root / 'plan.json').exists():
-            return TaskArtifacts(wt, meta_root=new_root)
+        try:
+            task_view = TaskArtifacts.for_task(wt, task_id)
+        except ValueError as exc:
+            logger.warning(
+                'granted-files fold: task %s names an unaddressable task id (%s) '
+                '— no plan to widen', task_id, exc,
+            )
+            return None
+        if task_view.artifact_path('plan.json').exists():
+            return task_view
         if (wt / '.task' / 'plan.json').exists():
             return TaskArtifacts(wt)
         return None
@@ -18015,11 +18132,9 @@ class Harness:
                 # an operator-visible line.
                 wt = self._resolve_task_worktree(task_id)
                 logger.warning(
-                    'granted-files fold: task %s has no plan.json at %s or %s '
-                    '— the grant %s was not delivered',
-                    task_id,
-                    TaskArtifacts.meta_root_for(self.git_ops.worktree_base, wt.name),
-                    wt / '.task', granted,
+                    'granted-files fold: task %s has no plan.json in its task '
+                    'root or at %s — the grant %s was not delivered',
+                    task_id, wt / '.task', granted,
                 )
                 return GrantDelivery.NO_PLAN_TO_WIDEN
 

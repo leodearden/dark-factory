@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from _merge_tool_calls import call_get_merge_queue
+from _tool_calls import call_tool
 
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
@@ -86,8 +87,7 @@ def _server(tmp_path: Path, queued: list[Any], *, scheduler: Any = None):
 
 
 async def _relane(server, **kwargs: Any) -> dict[str, Any]:
-    tool = await server.get_tool('merge_relane')
-    return await tool.fn(**kwargs)
+    return await call_tool(server, 'merge_relane', **kwargs)
 
 
 async def test_relaned_request_is_listed_first_in_the_high_lane(tmp_path: Path) -> None:

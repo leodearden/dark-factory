@@ -89,6 +89,7 @@ from orchestrator.task_status import WORKFLOW_PRESERVE_STATUSES
 from orchestrator.verify import VerifyResult
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 from orchestrator.workflow_types import (
+    PublishedStewardOutcome,
     StewardResolved,
     WorkflowState,
     outcome_allows_status,
@@ -701,10 +702,11 @@ def _make_journalling_resolving_steward(
                     esc.id, 'Resolved by journalling FakeSteward',
                     resolved_by='fake-steward',
                 )
-            if self._outcome_channel is not None:
-                self._outcome_channel.put_nowait(
-                    StewardResolved(resolution_text='Resolved by FakeSteward'),
-                )
+                if self._outcome_channel is not None:
+                    self._outcome_channel.put_nowait(PublishedStewardOutcome(
+                        esc.id,
+                        StewardResolved(resolution_text='Resolved by FakeSteward'),
+                    ))
 
         async def stop(self) -> None:
             events.append('steward:stop')

@@ -52,8 +52,6 @@ from _task_db_scan import (
     AUDIT_EXIT_NO_ROOT,
     AUDIT_EXIT_NOTHING_AUDITED,
     AUDIT_EXIT_OK,
-    TaskDbProblem,
-    TaskDbUnreadable,
 )
 from audit_wiped_metadata_files import (
     CLEAN_MERGE_SHA,
@@ -103,6 +101,7 @@ from repair_wiped_metadata_files import (
     writable_plan_files,
 )
 from shared.task_store_schema import TASK_STORE_DDL
+from shared.tasks_db_readonly import TaskDbProblem, TaskDbUnreadable
 from tasks_db_schema import columns_outside, introspect, introspect_ddl
 
 # ---------------------------------------------------------------------------

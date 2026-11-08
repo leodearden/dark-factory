@@ -33,6 +33,7 @@ import pytest
 from _fm_helpers import load_script_module
 from shared.project_id import project_id_for_root
 from shared.project_layout import default_project_root, tasks_db
+from shared.tasks_db_readonly import TaskDbProblem, TaskDbUnreadable
 
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.reconciliation.consolidation_gate import (
@@ -59,8 +60,6 @@ def _load_module() -> types.ModuleType:
 
 
 mod = _load_module()
-TaskDbUnreadable = mod.TaskDbUnreadable
-TaskDbProblem = sys.modules[mod.connect_ro.__module__].TaskDbProblem
 
 _TOPIC = 'cli-demo-topic'
 _PROJECT_ID = 'dark_factory'

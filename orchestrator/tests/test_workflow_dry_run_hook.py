@@ -134,6 +134,7 @@ def _make_workflow(*, tmp_path: Path, task_id: str = '42',
     worktree = tmp_path / 'wt'
     worktree.mkdir(parents=True, exist_ok=True)
     wf.artifacts = TaskArtifacts(worktree)
+    wf.artifacts.init(task_id, 'title', 'desc')
     wf.worktree = worktree
     wf.plan = {'files': []}
     # No escalation queue so _mark_blocked doesn't try to submit escalations
