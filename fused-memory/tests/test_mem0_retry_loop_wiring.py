@@ -1,4 +1,4 @@
-"""``server/main.py::_start_mem0_retry_loop`` runs the service's retry pass on the service's own policy.
+"""``server/main.py`` runs the service's Mem0 retry pass on its own policy, and marks supersedes whenever a re-issue lands.
 
 As in ``tests/test_audit_trail_archive_wiring.py``, the wiring is proved by
 driving what it built against a recording stub, not by a call-args assertion
@@ -23,7 +23,7 @@ _OLD = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
 
 
 class _RecordingService:
-    """A structural stand-in for the members the retry loop and its supersession landing hook read."""
+    """A structural stand-in for the members the retry loop, startup recovery and their supersession landing hook read."""
 
     def __init__(self) -> None:
         self.mem0_retry_policy = Mem0RetryPolicy(
@@ -33,12 +33,17 @@ class _RecordingService:
             batch_size=1,
         )
         self.pass_kwargs: list[dict[str, Any]] = []
+        self.recover_kwargs: list[dict[str, Any]] = []
         self.passed = asyncio.Event()
         self.update_memory = AsyncMock(return_value={'status': 'updated', 'store': 'mem0'})
 
     async def retry_due_mem0_intents(self, **kwargs: Any) -> None:
         self.pass_kwargs.append(kwargs)
         self.passed.set()
+
+    async def recover_mem0_intents(self, **kwargs: Any) -> dict[str, int]:
+        self.recover_kwargs.append(kwargs)
+        return {}
 
 
 def _intent(metadata: dict[str, Any]) -> dict[str, Any]:
@@ -71,6 +76,20 @@ async def _first_pass(service: _RecordingService) -> dict[str, Any]:
     return service.pass_kwargs[0]
 
 
+async def _assert_the_hook_marks_supersedes(service: _RecordingService, on_landed: Any) -> None:
+    await on_landed(
+        _intent({'supersedes': [_OLD]}),
+        Mem0AddOutcome(memory_ids=('new-id',), empty_result_error=None),
+    )
+
+    service.update_memory.assert_awaited_once()
+    await_args = service.update_memory.await_args
+    assert await_args is not None
+    kwargs = await_args.kwargs
+    assert kwargs['memory_id'] == _OLD
+    assert kwargs['metadata_patch'] == {SUPERSEDED_BY_METADATA_KEY: 'new-id'}
+
+
 class TestTheRetryLoopWiring:
     @pytest.mark.asyncio
     async def test_a_pass_runs_on_the_services_own_poll_interval(self):
@@ -85,14 +104,18 @@ class TestTheRetryLoopWiring:
         service = _RecordingService()
 
         on_landed = (await _first_pass(service))['on_landed']
-        await on_landed(
-            _intent({'supersedes': [_OLD]}),
-            Mem0AddOutcome(memory_ids=('new-id',), empty_result_error=None),
-        )
 
-        service.update_memory.assert_awaited_once()
-        await_args = service.update_memory.await_args
-        assert await_args is not None
-        kwargs = await_args.kwargs
-        assert kwargs['memory_id'] == _OLD
-        assert kwargs['metadata_patch'] == {SUPERSEDED_BY_METADATA_KEY: 'new-id'}
+        await _assert_the_hook_marks_supersedes(service, on_landed)
+
+
+class TestTheStartupRecoveryWiring:
+    @pytest.mark.asyncio
+    async def test_a_recovered_writes_supersedes_are_marked_when_it_lands(self):
+        from fused_memory.server.main import _recover_mem0_intents_at_startup  # noqa: PLC0415
+
+        service = _RecordingService()
+
+        await _recover_mem0_intents_at_startup(service)
+
+        (recover_kwargs,) = service.recover_kwargs
+        await _assert_the_hook_marks_supersedes(service, recover_kwargs['on_landed'])

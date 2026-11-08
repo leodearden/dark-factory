@@ -209,18 +209,19 @@ async def _retry_one(
         outcome=_RetryOutcome.LANDED,
     )
     if on_landed is not None:
-        await _report_landed(on_landed, intent, landed)
+        await report_mem0_landing(on_landed, intent, landed)
     return outcome
 
 
-async def _report_landed(
-    on_landed: OnMem0Landed, intent: dict, landed: Mem0AddOutcome
+async def report_mem0_landing(
+    on_landed: OnMem0Landed, intent: Mapping[str, Any], landed: Mem0AddOutcome
 ) -> None:
+    """Tell ``on_landed`` that ``intent``'s re-issue landed; its failure is logged, never raised."""
     try:
         await on_landed(intent, landed)
     except Exception:
         logger.exception(
-            'Mem0 retry landing hook failed for intent %s (write_op_id=%s); '
+            'Mem0 re-issue landing hook failed for intent %s (write_op_id=%s); '
             'the write itself landed',
             intent['id'],
             intent['write_op_id'],

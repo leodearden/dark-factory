@@ -7278,7 +7278,9 @@ class MemoryService:
     # Recovery: reconcile crash-mid-write mem0 intents (task 2710)
     # ------------------------------------------------------------------
 
-    async def recover_mem0_intents(self) -> dict[str, int]:
+    async def recover_mem0_intents(
+        self, *, on_landed: OnMem0Landed | None = None
+    ) -> dict[str, int]:
         """Reconcile every crash-mid-write mem0 intent still ``pending``.
 
         A ``pending`` intent means the process died between the write-ahead
@@ -7293,7 +7295,8 @@ class MemoryService:
         - only FAILED mem0 backend_op(s) → ``add()`` raised. In the common
           (clean, pre-persist) failure mem0 did not land, so re-issue is safe
           (0 prior writes + 1 = 1): ``reissue_mem0_intent``; ``completed`` on
-          success, ``retrying`` on a transient provider error (the periodic
+          success, then ``on_landed`` is told what landed, as the retry pass
+          tells it; ``retrying`` on a transient provider error (the periodic
           retry pass takes it over), ``dead`` on any other error. Crash
           after re-issue: ``fused-memory/tests/test_mem0_intent_recovery.py::TestRecoverMem0Intents::test_crash_after_successful_reissue_is_reconciled_not_reissued_again``.
           RESIDUAL DUPLICATE RISK (accepted, documented): a failure raised
@@ -7356,7 +7359,7 @@ class MemoryService:
                 # note in this method's docstring for the narrow
                 # post-commit-failure case where this can mint a duplicate twin.
                 try:
-                    await self.reissue_mem0_intent(intent)
+                    landed = await self.reissue_mem0_intent(intent)
                     await self._write_journal.resolve_mem0_intent(
                         intent_id,
                         Mem0IntentStatus.COMPLETED,
@@ -7389,6 +7392,9 @@ class MemoryService:
                             intent_id,
                             e,
                         )
+                else:
+                    if on_landed is not None:
+                        await mem0_write_retry.report_mem0_landing(on_landed, intent, landed)
             else:
                 # No backend_op → UNKNOWN outcome → dead-letter (never silent).
                 reason = (

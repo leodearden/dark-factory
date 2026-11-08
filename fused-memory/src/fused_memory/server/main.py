@@ -46,6 +46,7 @@ from fused_memory.server.wal_status import (  # noqa: E402
 from fused_memory.services.consolidation_ops import MemoryUpdater  # noqa: E402
 from fused_memory.services.mem0_write_retry import (  # noqa: E402
     Mem0RetryRunner,
+    OnMem0Landed,
     run_periodic_mem0_retry,
 )
 from fused_memory.services.memory_service import MemoryService  # noqa: E402
@@ -595,8 +596,7 @@ async def run_server():
     # self.mem0 / self.durable_queue), so this must run here rather than inside
     # initialize(). Idempotent — no pending intents ⇒ no-op — so it is safe to
     # run on every startup; a partial dual write is thus never left SILENT.
-    _mem0_recovery = await memory_service.recover_mem0_intents()
-    logger.info(f'mem0 intent recovery at startup: {_mem0_recovery}')
+    await _recover_mem0_intents_at_startup(memory_service)
 
     # Must follow mem0 intent recovery, so no still-pending intent is pruned.
     _pruned = await prune_every_table_at_startup(write_journal, config.write_journal)
@@ -1611,23 +1611,38 @@ def _start_loop_lag_monitor(config) -> asyncio.Task[None]:
     )
 
 
-class _Mem0RetryLoopService(Mem0RetryRunner, MemoryUpdater, Protocol):
-    """What the Mem0 retry loop and its supersession landing hook read of the memory service."""
+class _Mem0WriteDurabilityService(Mem0RetryRunner, MemoryUpdater, Protocol):
+    """What startup recovery, the Mem0 retry loop and their supersession landing hook read of the memory service."""
+
+    async def recover_mem0_intents(
+        self, *, on_landed: OnMem0Landed | None = None
+    ) -> object: ...
 
 
-def _start_mem0_retry_loop(memory_service: _Mem0RetryLoopService) -> asyncio.Task[None]:
-    """Spawn the Mem0 write retry loop on the service's own policy; RETURN its handle for teardown.
+def _mark_supersedes_on_landing(memory_service: MemoryUpdater) -> OnMem0Landed:
+    """The hook every Mem0 re-issue path runs when it lands: mark the write's journaled supersedes.
 
-    Each landed re-issue has its journaled supersedes marked. That hook is
-    composed here because the service layer cannot import supersession_mark
+    Composed here because the service layer cannot import supersession_mark
     without pulling server modules up into it.
     """
+    return partial(mark_superseded_after_retry, memory_service)
+
+
+async def _recover_mem0_intents_at_startup(memory_service: _Mem0WriteDurabilityService) -> None:
+    summary = await memory_service.recover_mem0_intents(
+        on_landed=_mark_supersedes_on_landing(memory_service)
+    )
+    logger.info(f'mem0 intent recovery at startup: {summary}')
+
+
+def _start_mem0_retry_loop(memory_service: _Mem0WriteDurabilityService) -> asyncio.Task[None]:
+    """Spawn the Mem0 write retry loop on the service's own policy; RETURN its handle for teardown."""
     policy = memory_service.mem0_retry_policy
     task = asyncio.create_task(
         run_periodic_mem0_retry(
             partial(
                 memory_service.retry_due_mem0_intents,
-                on_landed=partial(mark_superseded_after_retry, memory_service),
+                on_landed=_mark_supersedes_on_landing(memory_service),
             ),
             interval_seconds=policy.poll_interval_seconds,
         ),

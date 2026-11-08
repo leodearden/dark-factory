@@ -550,6 +550,26 @@ async def _seed_pending_intent(
     )
 
 
+_SUPERSEDED = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+
+
+async def _seed_failed_only_intent(journal, *, metadata=None) -> str:
+    """A ``pending`` intent whose only mem0 backend_op failed: recovery re-issues it."""
+    write_op_id = str(uuid.uuid4())
+    intent_id = str(uuid.uuid4())
+    await _seed_pending_intent(
+        journal, write_op_id=write_op_id, intent_id=intent_id, metadata=metadata
+    )
+    await journal.log_backend_op(
+        write_op_id=write_op_id,
+        backend='mem0',
+        operation='add',
+        success=False,
+        error='RateLimitError: 429',
+    )
+    return intent_id
+
+
 class TestRecoverMem0Intents:
     @pytest.mark.asyncio
     async def test_success_beop_marks_completed_no_reissue(self, recovery_service):
@@ -812,6 +832,59 @@ class TestRecoverMem0Intents:
         }
         completed = await recovery_journal.get_mem0_intents(status='completed')
         assert [r['id'] for r in completed] == [intent_id]
+
+    @pytest.mark.asyncio
+    async def test_a_direct_reissue_hands_the_landed_write_to_the_landing_hook(
+        self, recovery_service, recovery_journal
+    ):
+        """A crash-recovered write that lands now has its supersedes marked, as a retried one does."""
+        svc = recovery_service
+        intent_id = await _seed_failed_only_intent(
+            recovery_journal, metadata={'supersedes': [_SUPERSEDED]}
+        )
+        svc.mem0.add = AsyncMock(return_value={'results': [{'id': 'reissued-1'}]})
+        landed: list[tuple[Any, Mem0AddOutcome]] = []
+
+        async def on_landed(row, outcome):
+            landed.append((row, outcome))
+
+        summary = await svc.recover_mem0_intents(on_landed=on_landed)
+
+        assert summary['reissued'] == 1
+        ((row, outcome),) = landed
+        assert row['id'] == intent_id
+        assert json.loads(row['metadata'])['supersedes'] == [_SUPERSEDED]
+        assert outcome == Mem0AddOutcome(memory_ids=('reissued-1',), empty_result_error=None)
+
+    @pytest.mark.asyncio
+    async def test_a_failing_landing_hook_leaves_the_reissue_completed(
+        self, recovery_service, recovery_journal
+    ):
+        svc = recovery_service
+        intent_id = await _seed_failed_only_intent(recovery_journal)
+        on_landed = AsyncMock(side_effect=RuntimeError('mark boom'))
+
+        summary = await svc.recover_mem0_intents(on_landed=on_landed)
+
+        on_landed.assert_awaited_once()
+        assert summary['reissued'] == 1
+        assert summary['dead_lettered'] == 0
+        completed = await recovery_journal.get_mem0_intents(status='completed')
+        assert [r['id'] for r in completed] == [intent_id]
+
+    @pytest.mark.asyncio
+    async def test_a_deferred_reissue_is_left_to_the_retry_pass_landing_hook(
+        self, recovery_service, recovery_journal
+    ):
+        svc = recovery_service
+        await _seed_failed_only_intent(recovery_journal)
+        svc.mem0.add = AsyncMock(side_effect=rate_limit_error())
+        on_landed = AsyncMock()
+
+        summary = await svc.recover_mem0_intents(on_landed=on_landed)
+
+        assert summary['deferred'] == 1
+        on_landed.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_second_recover_is_zero_work(self, recovery_service):
