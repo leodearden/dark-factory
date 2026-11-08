@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 from quality_series_fixtures import GitRepoBuilder
+
 from shared.quality_series.git_lines import (
     GitObjectMissing,
     GitTimeout,

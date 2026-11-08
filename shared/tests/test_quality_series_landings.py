@@ -7,16 +7,17 @@ from pathlib import Path
 
 import pytest
 from quality_series_fixtures import LandingScenario, at_hour, build_landing_scenario
-from shared.quality_series.landings import LandingSource, LinesBase
 
 from shared.project_id import project_id_for_root
 from shared.quality_series import CursorNotOnMain, Landing, landings
 from shared.quality_series.git_lines import GitUnavailable
+from shared.quality_series.landings import LandingSource, LinesBase
 
 
-@pytest.fixture
-def scenario(tmp_path: Path) -> LandingScenario:
-    return build_landing_scenario(tmp_path / 'proj')
+@pytest.fixture(scope='module')
+def scenario(tmp_path_factory: pytest.TempPathFactory) -> LandingScenario:
+    """Read-only for every test here, so one build serves the module."""
+    return build_landing_scenario(tmp_path_factory.mktemp('landings') / 'proj')
 
 
 def _key(landing: Landing) -> tuple[str, str]:

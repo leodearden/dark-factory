@@ -1,4 +1,4 @@
-"""Landed lines of one git change: numstat churn by path class, and src lines per module.
+"""Reading git under a timeout with typed failures, down to one change's landed lines by path class.
 
 Path classes and the module key are plans/quality-dashboard-prd.md decision 6 and open question 4.
 """
@@ -19,6 +19,7 @@ __all__ = [
     'LandedLines',
     'ModuleLines',
     'PathClass',
+    'git_output',
     'landed_lines',
     'module_key',
     'path_class',
@@ -119,27 +120,46 @@ def _run_git(
 
 
 def _classify_failure(
-    repo: str | os.PathLike[str], shas: tuple[str, ...], stderr: bytes, timeout_s: float
+    repo: str | os.PathLike[str], args: list[str], objects: tuple[str, ...], stderr: bytes,
+    timeout_s: float,
 ) -> Exception:
     if _run_git(repo, ['rev-parse', '--git-dir'], timeout_s).returncode != 0:
         return GitUnavailable(f'{os.fspath(repo)} is not a git repository')
-    for sha in shas:
-        if _run_git(repo, ['cat-file', '-e', f'{sha}^{{commit}}'], timeout_s).returncode != 0:
-            return GitObjectMissing(f'commit {sha} is not in {os.fspath(repo)}')
+    for name in objects:
+        if _run_git(repo, ['cat-file', '-e', f'{name}^{{commit}}'], timeout_s).returncode != 0:
+            return GitObjectMissing(f'commit {name} is not in {os.fspath(repo)}')
     return GitUnavailable(
-        f'git diff {" ".join(shas)} failed in {os.fspath(repo)}: {stderr.decode(errors="replace")}'
+        f'git {" ".join(args)} failed in {os.fspath(repo)}: {stderr.decode(errors="replace")}'
     )
+
+
+def git_output(
+    repo: str | os.PathLike[str], args: list[str], timeout_s: float,
+    *, objects: tuple[str, ...] = (),
+) -> bytes:
+    """stdout of one ``git -C repo <args>`` bounded by ``timeout_s``.
+
+    Raises GitTimeout, GitUnavailable, or GitObjectMissing when one of ``objects`` (the commits
+    the command names) does not exist; only the failure path makes the probe calls that tell
+    those apart, so no git message text is parsed.
+    """
+    if not timeout_s > 0:
+        raise ValueError(f'a git call needs a positive timeout (timeout_s={timeout_s!r})')
+    result = _run_git(repo, args, timeout_s)
+    if result.returncode != 0:
+        raise _classify_failure(repo, args, objects, result.stderr, timeout_s)
+    return result.stdout
 
 
 def _numstat(
     repo: str | os.PathLike[str], base_sha: str, sha: str, timeout_s: float
 ) -> list[tuple[str, int]]:
-    args = ['diff', '--numstat', '--no-renames', '-z', base_sha, sha]
-    result = _run_git(repo, args, timeout_s)
-    if result.returncode != 0:
-        raise _classify_failure(repo, (base_sha, sha), result.stderr, timeout_s)
+    stdout = git_output(
+        repo, ['diff', '--numstat', '--no-renames', '-z', base_sha, sha], timeout_s,
+        objects=(base_sha, sha),
+    )
     churn: list[tuple[str, int]] = []
-    for record in result.stdout.decode(errors='surrogateescape').split('\0'):
+    for record in stdout.decode(errors='surrogateescape').split('\0'):
         if not record:
             continue
         added, deleted, path = record.split('\t', 2)
@@ -151,13 +171,7 @@ def _numstat(
 def landed_lines(
     repo: str | os.PathLike[str], base_sha: str, sha: str, timeout_s: float
 ) -> LandedLines:
-    """Churn of ``base_sha..sha`` by path class, under one git call bounded by ``timeout_s``.
-
-    Raises GitTimeout, GitObjectMissing or GitUnavailable; only the failure path makes the
-    extra probe calls that tell the latter two apart.
-    """
-    if not timeout_s > 0:
-        raise ValueError(f'a git call needs a positive timeout (timeout_s={timeout_s!r})')
+    """Churn of ``base_sha..sha`` by path class, under one git call (see git_output for errors)."""
     by_class: Counter[PathClass] = Counter()
     by_module: Counter[str] = Counter()
     for path, lines in _numstat(repo, base_sha, sha, timeout_s):
