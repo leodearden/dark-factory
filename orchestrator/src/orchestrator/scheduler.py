@@ -472,20 +472,23 @@ def _decoded_payload(result: dict) -> Any:
         return None
 
 
-def _json_rpc_error_payload(error: Any) -> dict:
-    """The rejection payload standing for a JSON-RPC body's ``error`` member."""
-    if isinstance(error, Mapping):
-        prose = f"{error.get('code')}: {error.get('message')}"
-    else:
-        prose = str(error)
-    return {'error': EnvelopeShape.JSON_RPC_ERROR.value, 'hint': prose}
+def _json_rpc_error_payload(error: Mapping) -> dict:
+    """The rejection payload standing for a JSON-RPC body's ``error`` object."""
+    return {
+        'error': EnvelopeShape.JSON_RPC_ERROR.value,
+        'hint': f"{error.get('code')}: {error.get('message')}",
+    }
 
 
 def _rejection_payload(response: Any) -> dict | None:
-    """The rejection payload of a fused-memory tool reply, or None when the write landed."""
+    """The rejection payload of a fused-memory tool reply, or None when the write landed.
+
+    *response* is the whole JSON-RPC body or its CallToolResult, never a bare
+    tool payload.
+    """
     if not isinstance(response, dict):
         return None
-    if response.get('error') is not None:
+    if isinstance(response.get('error'), Mapping):
         return _json_rpc_error_payload(response['error'])
     result = response.get('result', response)
     if not isinstance(result, dict):
@@ -4273,12 +4276,7 @@ class Scheduler:
             # level deeper.  Delegate to extract_structured_rejection(result) which
             # correctly unwraps both shapes (mirrors set_task_status at :1608).
             if (rej := extract_structured_rejection(result)) is not None:
-                logger.error(
-                    'Failed to update task %s (%s): %s',
-                    task_id,
-                    rej.get('error_type'),
-                    rej.get('error'),
-                )
+                logger.error('Failed to update task %s: rejected %r', task_id, rej)
                 return False
             return True
         except Exception as e:

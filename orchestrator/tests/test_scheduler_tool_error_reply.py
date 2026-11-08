@@ -55,7 +55,9 @@ class _ScriptedReplySession(HermeticMcpSession):
     """Answers scripted tools from a per-tool queue and records each call it serves.
 
     A scripted entry is either a CallToolResult, wrapped into a JSON-RPC body,
-    or a whole JSON-RPC body (it carries ``jsonrpc``), returned verbatim.
+    or a whole JSON-RPC body (it carries ``jsonrpc``), returned verbatim. A call
+    past the end of a tool's script fails the test at once: ``pytest.fail`` is a
+    BaseException, so a retrying ``except Exception`` caller cannot absorb it.
     """
 
     def __init__(self, replies: dict[str, list[dict]]) -> None:
@@ -75,6 +77,8 @@ class _ScriptedReplySession(HermeticMcpSession):
         if name not in self._replies:
             return await super().call_tool(name, arguments, timeout=timeout)
         self.calls.append((name, arguments))
+        if not self._replies[name]:
+            pytest.fail(f'unexpected extra {name} call: {arguments!r}')
         reply = self._replies[name].pop(0)
         if 'jsonrpc' in reply:
             return reply
@@ -319,3 +323,23 @@ async def test_landed_claimant_write_logs_no_warning(
     await scheduler.set_task_claimant('42', heartbeat_at='2026-11-07T00:00:00+00:00')
 
     assert _scheduler_warnings(caplog) == []
+
+
+# --- Scheduler.update_task -----------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_json_rpc_error_metadata_update_fails_and_logs_code_and_message(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.ERROR, logger=SCHEDULER_LOGGER)
+    session = _ScriptedReplySession({'update_task': [JSONRPC_ERROR_BODY]})
+    scheduler = _scheduler(tmp_path, session)
+
+    updated = await scheduler.update_task('42', {'k': 'v'})
+
+    assert updated is False
+    assert len(session.calls_to('update_task')) == 1
+    message = ' '.join(r.getMessage() for r in _scheduler_warnings(caplog))
+    assert '-32602' in message
+    assert 'Invalid params' in message
