@@ -37,13 +37,13 @@ class TestRearmedMilestone:
         assert rearmed['at'] == SECOND_CHECK
         assert scheduled_fire_at(rearmed) == SCHEDULED
 
-    def test_the_persisted_shape_adds_only_the_scheduled_at_key(self) -> None:
+    def test_the_persisted_shape_adds_only_the_scheduled_fire_at_key(self) -> None:
         original = _dated()
 
         assert rearmed_milestone(original, FIRST_CHECK) == {
             **original,
             'at': FIRST_CHECK,
-            'scheduled_at': SCHEDULED,
+            'scheduled_fire_at': SCHEDULED,
         }
 
     def test_the_input_milestone_is_not_mutated(self) -> None:

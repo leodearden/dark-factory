@@ -288,7 +288,7 @@ class TestRearmOnNotYet:
         payload = write['metadata']
         assert set(payload) == {'milestone', 'predicate_recheck', 'predicate_verdict'}
         assert payload['milestone'] == {
-            **DECLARED_MILESTONE, 'at': next_at, 'scheduled_at': DATED['at'],
+            **DECLARED_MILESTONE, 'at': next_at, 'scheduled_fire_at': DATED['at'],
         }
         assert payload['predicate_recheck'] == {
             'consecutive': 1,
