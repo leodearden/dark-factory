@@ -18,12 +18,14 @@ from _git_fixtures import seed_repo
 from _orch_helpers import assert_isolated_git_repo, git_env_with_ceiling
 
 from orchestrator.config import GitConfig
-from orchestrator.git_ops import DEFAULT_COMMIT_CITATION_PATTERN, GitOps
+from orchestrator.git_ops import DEFAULT_COMMIT_CITATION_PATTERN, GitOps, render_citation_pattern
 
 
 def _cites(subject: str, tid: str) -> bool:
     """Apply the template to one SUBJECT the way ``find_task_citation_commit`` does."""
-    pattern = re.compile(DEFAULT_COMMIT_CITATION_PATTERN.format(tid=re.escape(tid)))
+    pattern = re.compile(render_citation_pattern(
+        DEFAULT_COMMIT_CITATION_PATTERN, tid, branch_prefix='task/', main_branch='main',
+    ))
     return pattern.search(subject) is not None
 
 

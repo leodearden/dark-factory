@@ -68,7 +68,12 @@ from pathlib import Path
 from typing import Any, Literal, NamedTuple, TypedDict, TypeGuard
 
 from shared.git_async import run_git
-from shared.merge_subject import MergeSubject, format_merge_subject, parse_merge_subject
+from shared.merge_subject import (
+    MergeSubject,
+    format_merge_subject,
+    merge_subject_pattern,
+    parse_merge_subject,
+)
 from shared.proc_group import (
     reap_process_groups,
     scan_process_groups_under_path,
@@ -395,8 +400,11 @@ class TrainStackResult:
 #     after a colon: ``impl(50): xyz`` / ``fix(50): xyz`` / ``test(50: ...)``.
 #   - Subjects that mention the task branch directly: ``... task/50 ...``
 #     anywhere in the subject line.
-#   - The canonical no-ff merge subject ``Merge task/50 into <main>`` produced
-#     by ``merge_to_main``.
+#   - The ``{merge_subject}`` slot: the landing subject ``merge_to_main``
+#     writes, rendered by ``render_citation_pattern`` from
+#     ``shared/src/shared/merge_subject.py::merge_subject_pattern`` with the
+#     configured ``branch_prefix``/``main_branch`` and anchored to the whole
+#     subject line.
 #   - Prefix-independent, unanchored paren citations anywhere in the
 #     subject (task 2870): ``(50)`` and ``(#50)`` (via ``\(#?{tid}\)``) and
 #     ``(task 50)`` (via ``\(task {tid}\)``). These are NOT tied to the
@@ -414,7 +422,7 @@ class TrainStackResult:
 #     ``({tid})`` arm is deliberately NOT widened: ``(30 s)`` / ``(3 files)``
 #     is the task-4705 false-positive class.
 #
-# The ``{tid}`` placeholder is interpolated via ``str.format`` with the
+# ``render_citation_pattern`` fills the ``{tid}`` placeholder with the
 # escaped task id; a ``\b`` (word boundary) at each side of the
 # conventional-commit / ``task/{tid}`` alternatives blocks substring overlap
 # so ``task/3399`` doesn't match a row that cites ``task/339``. The paren
@@ -428,8 +436,8 @@ class TrainStackResult:
 # and bare ``({tid})`` alternatives assume a parenthesized number in a
 # subject on main is ALWAYS a task citation in THIS repo — never a GitHub
 # PR number, squash-merge suffix, or trailing issue number. This holds
-# because dark-factory's merge worker writes the canonical
-# ``Merge task/{tid} into <main>`` subject (see ``merge_to_main``), not a
+# because dark-factory's merge worker writes the landing subject of
+# ``shared.merge_subject`` (see ``merge_to_main``), not a
 # GitHub-style ``(#PR)`` squash suffix, and the repo does not take PR
 # merges. The assumption matters because relaxing the FIX-2 bidirectional
 # lineage guard (task 2870) left the FIX-1' effect-present check as the SOLE
@@ -448,8 +456,8 @@ class TrainStackResult:
 # Subject-only (task 2675 FIX 2): this pattern is written with ``^``
 # anchors as if applied to a single SUBJECT line, but git's ``--grep``
 # applies ``^``/``$`` per LINE across the whole commit message — a BODY
-# line that happens to start with a conventional-commit token, or with
-# ``Merge task/{tid} into ``, or that carries a bare paren citation like
+# line that happens to start with a conventional-commit token, or that is
+# a landing subject, or that carries a bare paren citation like
 # ``(#50)``, would otherwise false-cite.
 # ``find_task_citation_commit`` uses ``--grep`` only as a coarse
 # full-message PRE-filter (a sound superset) and then re-applies this
@@ -462,10 +470,20 @@ class TrainStackResult:
 DEFAULT_COMMIT_CITATION_PATTERN: str = (
     r'^(merge|impl|amend|fix|test|feat|chore|docs|refactor|style|build)'
     r'(\(\b{tid}\b([):]|[ ,/][^)]*\))|.*\btask/{tid}\b)'
-    r'|^Merge task/{tid} into '
+    r'|{merge_subject}'
     r'|\(#?{tid}\)'
     r'|\(task {tid}([ ,/][^)]*)?\)'
 )
+
+
+def render_citation_pattern(template: str, tid: str, *, branch_prefix: str, main_branch: str) -> str:
+    """Fill a citation template's ``{tid}`` and ``{merge_subject}`` slots; the merge slot is the anchored whole-line landing subject for the configured naming."""
+    return template.format(
+        tid=re.escape(tid),
+        merge_subject=merge_subject_pattern(
+            branch_prefix=branch_prefix, task_id=tid, main_branch=main_branch,
+        ),
+    )
 
 # Fixed name for the persistent warm merge-verify worktree (task 1692).
 # Lives at <worktree_base>/_merge-verify.  Excluded from prune and
@@ -9978,8 +9996,8 @@ class GitOps:
         Matching is constrained to each candidate commit's SUBJECT line
         only (task 2675 FIX 2): git's ``--grep`` applies ``^``/``$`` per
         LINE across the whole commit message, so a BODY line that merely
-        happens to start with a conventional-commit token, or with
-        ``Merge task/{tid} into ``, would otherwise false-cite.  ``--grep``
+        happens to start with a conventional-commit token, or that is a
+        landing subject, would otherwise false-cite.  ``--grep``
         is used only as a coarse, uncapped full-message PRE-filter (a
         sound superset — any subject match is necessarily a message
         match); each candidate's subject is then re-tested against the
@@ -10002,9 +10020,10 @@ class GitOps:
         message-matches), but no such cap is applied here.
 
         Args:
-            tid: Bare task id (no ``task/`` prefix); the prefix is added
-                by the default pattern where appropriate.
-            pattern_template: Optional override for the citation pattern.
+            tid: Bare task id (no branch prefix); the configured prefix is
+                added by the ``{merge_subject}`` slot.
+            pattern_template: Optional override for the citation pattern,
+                rendered by :func:`render_citation_pattern`.
                 Defaults to ``DEFAULT_COMMIT_CITATION_PATTERN``.  Empty
                 string disables the check by returning None immediately
                 (caller opt-out for projects without citation
@@ -10051,7 +10070,10 @@ class GitOps:
         )
         if template == '':
             return None
-        pattern_str = template.format(tid=re.escape(tid))
+        pattern_str = render_citation_pattern(
+            template, tid,
+            branch_prefix=self.config.branch_prefix, main_branch=self.config.main_branch,
+        )
         try:
             compiled = re.compile(pattern_str)
         except re.error as exc:
