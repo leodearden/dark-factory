@@ -6750,6 +6750,7 @@ class Harness:
                 branch_tip_sha=branch_tip_sha,
                 candidate_sha=report.branch_state.sha,
                 delivered_checks=_declared_delivered_checks(metadata),
+                checks_enabled=self.config.delivered_checks.enabled,
             )
             self._landing_rejects.observe(
                 verdict, event_store=self.event_store,
@@ -14143,6 +14144,7 @@ class Harness:
                 branch_tip_sha=branch_tip_sha,
                 pattern_template=self.git_ops.config.commit_citation_pattern,
                 delivered_checks=_declared_delivered_checks(metadata),
+                checks_enabled=self.config.delivered_checks.enabled,
             )
             # 'pending' is the structural status of every gate candidate.
             self._landing_rejects.observe(
@@ -14190,6 +14192,7 @@ class Harness:
                     branch_tip_sha=None,
                     candidate_sha=marker,
                     delivered_checks=_declared_delivered_checks(metadata),
+                    checks_enabled=self.config.delivered_checks.enabled,
                 )
                 if not verdict.accepted:
                     self._file_unattributed_landing_escalation(task_id, branch, verdict)
@@ -14222,6 +14225,7 @@ class Harness:
                 branch_tip_sha=branch_tip_sha,
                 pattern_template=self.git_ops.config.commit_citation_pattern,
                 delivered_checks=_declared_delivered_checks(metadata),
+                checks_enabled=self.config.delivered_checks.enabled,
             )
             if not verdict.accepted:
                 self._file_unattributed_landing_escalation(task_id, branch, verdict)
