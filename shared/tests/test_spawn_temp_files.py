@@ -11,6 +11,7 @@ import os
 import re
 import tempfile
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -208,3 +209,100 @@ def test_logs_one_info_naming_the_count_only_when_it_removed_something(
     caplog.clear()
     assert sweep_orphaned_spawn_temp_files(base_dir=base, proc_root=idle_proc) == 0
     assert _infos(caplog) == []
+
+
+def _warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage() for r in caplog.records
+        if r.name == _LOGGER and r.levelno == logging.WARNING
+    ]
+
+
+def _missing_proc(tmp_path: Path) -> Path:
+    return tmp_path / 'no-such-proc'
+
+
+def _proc_without_this_process(tmp_path: Path) -> Path:
+    root = tmp_path / 'proc'
+    (root / str(os.getpid() + 1)).mkdir(parents=True)
+    (root / str(os.getpid() + 1) / 'cmdline').write_bytes(b'claude\0')
+    return root
+
+
+def _proc_with_an_unreadable_cmdline(tmp_path: Path) -> Path:
+    root = _fake_proc(tmp_path / 'proc', {os.getpid() + 1: b'claude\0'})
+    (root / str(os.getpid() + 1) / 'cmdline').chmod(0o000)
+    return root
+
+
+_ROOT_READS_ANYTHING = pytest.mark.skipif(
+    os.geteuid() == 0, reason='root bypasses file permission bits',
+)
+
+
+@pytest.mark.parametrize('make_proc', [
+    _missing_proc,
+    _proc_without_this_process,
+    pytest.param(_proc_with_an_unreadable_cmdline, marks=_ROOT_READS_ANYTHING),
+], ids=['proc-missing', 'own-pid-not-visible', 'cmdline-unreadable'])
+def test_deletes_nothing_when_liveness_cannot_be_established(
+    base: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    make_proc: Callable[[Path], Path],
+) -> None:
+    stale = _plant(base, 'sysprompt_abcd1234.txt', _STALE_SECS)
+    proc = make_proc(tmp_path)
+    try:
+        assert sweep_orphaned_spawn_temp_files(base_dir=base, proc_root=proc) == 0
+    finally:
+        for cmdline in proc.glob('*/cmdline'):
+            cmdline.chmod(0o644)
+
+    assert stale.exists()
+    messages = _warnings(caplog)
+    assert any(
+        'liveness' in m.lower() and 'nothing' in m.lower() for m in messages
+    ), messages
+
+
+def test_consults_proc_only_when_there_is_something_to_delete(
+    base: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    _plant(base, 'unrelated.txt', _STALE_SECS)
+
+    assert sweep_orphaned_spawn_temp_files(
+        base_dir=base, proc_root=_missing_proc(tmp_path),
+    ) == 0
+    assert _warnings(caplog) == []
+
+
+def test_an_expired_deadline_stops_the_sweep_and_says_it_is_incomplete(
+    base: Path, idle_proc: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    stale = _plant(base, 'sysprompt_abcd1234.txt', _STALE_SECS)
+
+    assert sweep_orphaned_spawn_temp_files(
+        base_dir=base, proc_root=idle_proc, deadline_secs=0,
+    ) == 0
+
+    assert stale.exists()
+    messages = _warnings(caplog)
+    assert any(
+        'INCOMPLETE' in m and re.search(r'examined \d+', m) and re.search(r'removed \d+', m)
+        for m in messages
+    ), messages
+
+
+@_ROOT_READS_ANYTHING
+def test_an_unlink_failure_is_logged_and_not_counted(
+    base: Path, idle_proc: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    stale = _plant(base, 'sysprompt_abcd1234.txt', _STALE_SECS)
+    base.chmod(0o500)
+    try:
+        assert sweep_orphaned_spawn_temp_files(base_dir=base, proc_root=idle_proc) == 0
+    finally:
+        base.chmod(0o700)
+
+    assert stale.exists()
+    messages = _warnings(caplog)
+    assert any(str(stale) in m for m in messages), messages
