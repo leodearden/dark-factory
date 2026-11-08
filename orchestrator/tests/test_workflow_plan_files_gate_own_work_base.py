@@ -13,7 +13,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from _merged_in_branch import branch_with_main_merged_in
+from _merged_in_branch import branch_with_main_merged_in, git
 from _workflow_helpers import _make, _make_git_ops
 
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
@@ -65,6 +65,18 @@ def _drops_x_py(wf: TaskWorkflow) -> Callable[[list[str]], Awaitable[bool]]:
     return narrow
 
 
+def _merges_main_again(wf: TaskWorkflow) -> Callable[[list[str]], Awaitable[bool]]:
+    async def narrow(_not_touched: list[str]) -> bool:
+        assert wf.worktree is not None
+        repo = Path(wf.config.project_root)
+        (repo / 'm2.py').write_text('m2 = 1\n')
+        git(repo, 'add', 'm2.py')
+        git(repo, 'commit', '-q', '-m', 'main advances again')
+        git(wf.worktree, 'merge', '-q', '--no-edit', 'main')
+        return True
+    return narrow
+
+
 async def test_a_file_only_main_touched_is_reported_not_touched(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -83,3 +95,13 @@ async def test_the_re_check_after_narrowing_still_measures_the_own_work_range(
     )
 
     assert _M1_ONLY_MISS in _reason(mark_blocked)
+
+
+async def test_the_re_check_re_derives_the_base_after_a_narrowing_pass_merges_main(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mark_blocked = await _submit_through_the_gate(
+        tmp_path, monkeypatch, ['a.py', 'm2.py'], _merges_main_again,
+    )
+
+    assert 'no commit on the branch touched them: m2.py.' in _reason(mark_blocked)

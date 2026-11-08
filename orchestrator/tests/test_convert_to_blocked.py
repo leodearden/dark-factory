@@ -2116,7 +2116,7 @@ class TestSubmitToMergeQueueAlreadyLanded:
         every case fail closed — i.e. silently restore the bug."""
         wf = _make_workflow(tmp_path=tmp_path)
         assert wf.artifacts is not None
-        wf.artifacts.init(wf.task_id, 'T', 'd', base_commit='base_sha')
+        wf.artifacts.init(wf.task_id, 'T', 'd', base_commit='stored_sha')
         seen: list = []
         self._stub_predicate(monkeypatch, self._landed(), seen=seen)
         self._wire(wf, monkeypatch)
@@ -2126,9 +2126,9 @@ class TestSubmitToMergeQueueAlreadyLanded:
         assert len(seen) == 1
         plan_files, base_sha, branch_head, kw = seen[0]
         assert plan_files == ['a.py', 'b.py', 'c.py']
-        assert base_sha == 'base_sha', (
+        assert base_sha == 'stored_sha', (
             'the own-work base (here the stored base: the fixture worktree is '
-            'not a checkout), not HEAD'
+            'not a checkout), not wf._base_commit and not HEAD'
         )
         assert branch_head == 'fake_head_sha'
         assert kw.get('task_id') == wf.task_id

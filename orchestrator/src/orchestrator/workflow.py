@@ -2845,9 +2845,10 @@ class TaskWorkflow:
             # NOTE: unlike a failed branch_base_sha write (_write_branch_base_sha,
             # which keeps a valid SHA in memory because only the metadata write
             # failed), this path has no SHA to record — _base_commit is left
-            # None so consumers gating on `is not None` (e.g. the plan-files-
-            # touched check in _submit_to_merge_queue) skip cleanly instead of
-            # receiving an empty SHA.
+            # None so consumers gating on `is not None` skip cleanly. The
+            # plan-files-touched check in _submit_to_merge_queue is one, but it
+            # measures from _own_work_base() (task 7668), so for it the guard
+            # only means "setup resolved HEAD", not "this is the range base".
             if proc.returncode != 0:
                 logger.warning(
                     'Task %s: git rev-parse HEAD failed in external worktree '
@@ -12296,7 +12297,7 @@ class TaskWorkflow:
                         if rc2 == 0 and branch_head2.strip():
                             check = await _check_plan_files_touched_in_branch(
                                 list(self._task_files or []),
-                                own_base,
+                                await self._own_work_base(),
                                 branch_head2.strip(),
                                 self.git_ops,
                                 task_id=self.task_id,
