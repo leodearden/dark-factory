@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import AsyncMock
 
 import pytest
@@ -18,6 +18,9 @@ import pytest
 from fused_memory.memory_metadata import SUPERSEDED_BY_METADATA_KEY
 from fused_memory.services.mem0_add_outcome import Mem0AddOutcome
 from fused_memory.services.mem0_write_retry import DEFAULT_MEM0_RETRY_POLICY, Mem0RetryPolicy
+
+if TYPE_CHECKING:
+    from fused_memory.services.memory_service import MemoryService
 
 _OLD = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
 
@@ -58,7 +61,7 @@ def _intent(metadata: dict[str, Any]) -> dict[str, Any]:
 async def _first_pass(service: _RecordingService) -> dict[str, Any]:
     from fused_memory.server.main import _start_mem0_retry_loop  # noqa: PLC0415
 
-    task = _start_mem0_retry_loop(service)
+    task = _start_mem0_retry_loop(cast('MemoryService', service))
     try:
         # noqa: wall-clock-deadline — the deadline is the assertion: a pass inside half the default policy's interval proves the loop read the service's own policy
         await asyncio.wait_for(
@@ -91,6 +94,8 @@ class TestTheRetryLoopWiring:
         )
 
         service.update_memory.assert_awaited_once()
-        kwargs = service.update_memory.await_args.kwargs
+        await_args = service.update_memory.await_args
+        assert await_args is not None
+        kwargs = await_args.kwargs
         assert kwargs['memory_id'] == _OLD
         assert kwargs['metadata_patch'] == {SUPERSEDED_BY_METADATA_KEY: 'new-id'}
