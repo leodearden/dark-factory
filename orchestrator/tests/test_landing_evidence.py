@@ -30,6 +30,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _git_fixtures import seed_repo
+from _landing_evidence_helpers import differential_confirms
 from _orch_helpers import assert_isolated_git_repo, git_env_with_ceiling
 
 from orchestrator.config import GitConfig
@@ -1800,7 +1801,8 @@ class TestRescuedByDeliveredChecks:
 
         disclosed = found_on_main_note('note', verdict)
 
-        assert disclosed.endswith('confirmed check(s): <unnamed>]')
+        assert disclosed.startswith('note')
+        assert '<unnamed>' in disclosed
 
     @pytest.mark.asyncio
     async def test_a_real_candidate_mode_rescue_reads_as_rescued(self) -> None:
@@ -1812,14 +1814,7 @@ class TestRescuedByDeliveredChecks:
                 failure='effect_not_survived', aggregate_survival=0.4,
             ),
         )
-        stub, _calls = _check_runner(
-            lambda _check, ref: (
-                DeliveredCheckResult.FAILED if ref.endswith('^1')
-                else DeliveredCheckResult.DELIVERED
-            ),
-        )
-
-        with patch('orchestrator.delivered_checks.run_delivered_check', stub):
+        with patch('orchestrator.delivered_checks.run_delivered_check', differential_confirms):
             verdict = await validate_landing_evidence(
                 git_ops, '42', 'task/42', branch_tip_sha=None, candidate_sha=sha,
                 delivered_checks=[

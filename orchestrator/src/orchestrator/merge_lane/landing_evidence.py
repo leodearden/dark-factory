@@ -256,6 +256,7 @@ __all__ = [
     'LANDING_GIT_ERROR_STORM_CATEGORY',
     'LANDING_GIT_ERROR_STORM_SENTINEL',
     'LANDING_TALLY',
+    'DifferentialOutcome',
     'LandingEvidenceVerdict',
     'LandingMethod',
     'LandingReason',
@@ -364,6 +365,22 @@ class LandingMethod(enum.StrEnum):
     #: build).  The default, so existing four-keyword constructions are
     #: unchanged.
     unspecified = 'unspecified'
+
+
+class DifferentialOutcome(enum.StrEnum):
+    """``probe['delivered_checks_outcome']``: what the delivered-checks differential concluded.
+
+    Genuine ``str`` members, for the same reasons as :class:`LandingReason`.
+    Absent from the probe when the differential never ran.
+    """
+
+    #: A declared check was made true by the evidence commit: the reject is
+    #: rescued (:attr:`LandingVerdict.rescued_by_delivered_checks`).
+    confirmed = 'confirmed'
+    #: No check confirmed, or the differential failed: the reject stands.
+    no_signal = 'no_signal'
+    #: ``delivered_checks.enabled`` is false, so no check ran.
+    disabled = 'disabled'
 
 
 #: Category used for BOTH the storm filing and its ``has_open_l1`` dedup
@@ -699,14 +716,20 @@ class LandingVerdict:
     def rescued_by_delivered_checks(self) -> bool:
         """Accepted by the delivered-checks differential, NOT by effect survival.
 
-        The ONE statement of the rescue discriminant.  A rescued accept's
-        ``evidence_sha`` IS on main but its effect is ABSENT at main HEAD — the
-        task-1175 shape FIX 1' guards — so ``accepted``/``evidence_sha`` alone
-        cannot tell it from a fully-guarded accept (see
+        The rescue discriminant for every reader in this package.  A rescued
+        accept's ``evidence_sha`` IS on main but its effect is ABSENT at main
+        HEAD — the task-1175 shape FIX 1' guards — so ``accepted``/
+        ``evidence_sha`` alone cannot tell it from a fully-guarded accept (see
         :func:`_delivered_checks_differential`).  Equality, not truthiness:
-        ``'no_signal'`` and ``'disabled'`` are truthy yet only reach a reject.
+        ``no_signal`` and ``disabled`` are truthy yet only reach a reject.
+        ``escalation/src/escalation/git_authority.py::_evidence_verdict`` still
+        repeats the comparison inline; task 4500's call-site audit owns
+        repointing it here.
         """
-        return self.accepted and self.probe.get('delivered_checks_outcome') == 'confirmed'
+        return (
+            self.accepted
+            and self.probe.get('delivered_checks_outcome') == DifferentialOutcome.confirmed
+        )
 
 
 #: Backward-compatible alias for the pre-rename spelling.  ``harness.py`` and
@@ -932,7 +955,7 @@ async def _delivered_checks_differential(
     this module was extracted to avoid.
 
     Writes ``delivered_checks_legs`` (every check's three-leg outcome) and
-    ``delivered_checks_outcome`` (``'confirmed'`` / ``'no_signal'``) into
+    ``delivered_checks_outcome`` (a :class:`DifferentialOutcome`) into
     *probe*, so the escalation can say "capability X was made true by this
     merge" or state plainly that there was no signal.  Returns True only on a
     confirmation; any exception is contained, recorded in
@@ -944,7 +967,7 @@ async def _delivered_checks_differential(
         # disabled the feature must be able to see in the escalation that the
         # second accept path was not merely unlucky.
         probe['delivered_checks_legs'] = []
-        probe['delivered_checks_outcome'] = 'disabled'
+        probe['delivered_checks_outcome'] = DifferentialOutcome.disabled
         return False
 
     from orchestrator.delivered_checks import (  # noqa: PLC0415
@@ -1011,7 +1034,9 @@ async def _delivered_checks_differential(
             effect_check_sha, exc_info=True,
         )
     probe['delivered_checks_legs'] = legs
-    probe['delivered_checks_outcome'] = 'confirmed' if confirmed else 'no_signal'
+    probe['delivered_checks_outcome'] = (
+        DifferentialOutcome.confirmed if confirmed else DifferentialOutcome.no_signal
+    )
     return confirmed
 
 
@@ -1828,14 +1853,12 @@ async def validate_landing_evidence(
             exactly).
 
             STAGING, NAMED SO IT CANNOT GO PERMANENT (amendment pass, review
-            finding — as shipped by task 3116 NO production call site passes
-            this, so the whole second accept path is unreachable and the only
-            live effect is the escalation text "this call site is unwired").
-            The call sites are owned by other tasks and are deliberately not
-            edited here — task 3116 holds no lock on them:
+            finding — task 3116 shipped this with no production caller; an
+            unwired site's only live effect is the escalation text "this call
+            site is unwired"). The call sites are owned by other tasks:
 
               task 4496  harness.py x4 (three ``_already_landed_dispatch_gate``
-                         arms + ``_reconcile_one_stranded``)
+                         arms + ``_reconcile_one_stranded``) — WIRED
               task 4497  merge_queue.py x1 (the coalesce re-drive)
               task 4498  escalation/server.py x2 (``merge_status``'s
                          git-authority arms)
@@ -2518,7 +2541,7 @@ def _render_delivered_checks_differential(
             'delivered-checks differential: not consulted (the effect check '
             'did not reject).\n\n'
         )
-    if outcome == 'disabled':
+    if outcome == DifferentialOutcome.disabled:
         return (
             'delivered-checks differential: NOT RUN — delivered_checks.enabled '
             'is false in this project config, so the task\'s declared checks '
