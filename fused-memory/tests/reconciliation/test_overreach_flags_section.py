@@ -403,8 +403,8 @@ def stage_1_pages(monkeypatch):
     """Stub every stage's run; record the flag page Stage 1 was configured with."""
     pages: list[OverreachFlagPage | None] = []
 
-    async def fake_run(self, events, watermark, prior_reports, run_id, model=None,
-                       resume_session_id=None) -> StageReport:
+    async def fake_run(self, events, watermark, prior_reports, run_id,
+                       model=None) -> StageReport:
         if isinstance(self, MemoryConsolidator):
             pages.append(self.overreach_flags)
         now = datetime.now(UTC)

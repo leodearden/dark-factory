@@ -100,7 +100,7 @@ def _stub_stage_runs(
     """
 
     async def fake_run(
-        self, events, watermark, prior_reports, run_id, model=None, resume_session_id=None,
+        self, events, watermark, prior_reports, run_id, model=None,
     ):
         on_invoke(self.stage_id)
         now = datetime.now(UTC)

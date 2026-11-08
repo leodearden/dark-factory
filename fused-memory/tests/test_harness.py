@@ -6859,7 +6859,6 @@ async def test_opus_tier_propagates_limits_to_consolidator(
         prior_reports,
         run_id,
         model=None,
-        resume_session_id=None,
         _s=stage0,
     ):
         captured['episode_limit'] = _s.episode_limit
@@ -17270,8 +17269,7 @@ async def test_run_full_cycle_injects_filtered_task_tree_into_integrity_check(
     for stage in harness.stages:
         if isinstance(stage, IntegrityCheck):
             async def mock_stage3_run(
-                events, watermark, prior_reports, run_id, model=None,
-                resume_session_id=None, _s=stage
+                events, watermark, prior_reports, run_id, model=None, _s=stage
             ):
                 captured_tree['tree'] = _s.filtered_task_tree
                 return StageReport(
@@ -19465,7 +19463,7 @@ class TestFullCycleWiringDiagnostics:
         stage1_queue_health: list = []
 
         async def fake_run(
-            self, events, watermark, prior_reports, run_id, model=None, resume_session_id=None,
+            self, events, watermark, prior_reports, run_id, model=None,
         ):
             if isinstance(self, MemoryConsolidator):
                 stage1_queue_health.append(self.graphiti_queue_health)
@@ -21452,7 +21450,7 @@ def test_placeholder_and_dead_owner_storm_counters_are_the_shared_storm_counter(
     than in near-identical tests.
 
     Structural rather than behavioural on purpose: a hand-rolled deque can
-    reproduce every behaviour below and still be a fourth copy, which is the
+    reproduce every behaviour below and still be another copy, which is the
     thing INV-5 forbids. The behavioural halves live in the half-open-window
     tests that follow.
 
@@ -21531,7 +21529,7 @@ def test_record_placeholder_finding_drop_window_is_half_open(
     )
 
 
-def test_migrated_per_event_counters_keep_the_three_key_return_shape(
+def test_both_storm_counters_keep_the_three_key_return_shape(
     journal, event_buffer, mock_memory_service,
 ):
     """The return dict stays EXACTLY {count, window_seconds, projects}.
@@ -21549,17 +21547,29 @@ def test_migrated_per_event_counters_keep_the_three_key_return_shape(
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
     base = datetime(2026, 6, 15, 0, 0, 0, tzinfo=UTC)
 
-    storm = None
+    def project(i: int) -> str:
+        return 'reify' if i % 2 == 0 else 'autopilot_video'
+
+    placeholder_drop_storm = None
     for i in range(_PLACEHOLDER_DROP_STORM_THRESHOLD):
-        storm = harness._record_placeholder_finding_drop(
-            'reify' if i % 2 == 0 else 'autopilot_video',
-            now=base + timedelta(seconds=i),
+        placeholder_drop_storm = harness._record_placeholder_finding_drop(
+            project(i), now=base + timedelta(seconds=i),
         )
-    assert storm is not None, 'the threshold-crossing drop must fire'
-    assert set(storm) == {'count', 'window_seconds', 'projects'}, (
-        f'exact 3-key harness shape expected, got {sorted(storm)}'
-    )
-    assert storm['projects'] == ['autopilot_video', 'reify']
+    dead_owner_storm = None
+    for i in range(harness.config.dead_owner_suppression_storm_threshold):
+        dead_owner_storm = harness._record_dead_owner_suppression(
+            project(i), f'dead-instance-{i}', now=base + timedelta(seconds=i),
+        )
+
+    for counter, storm in (
+        ('placeholder-drop', placeholder_drop_storm),
+        ('dead-owner', dead_owner_storm),
+    ):
+        assert storm is not None, f'the threshold-crossing {counter} event must fire'
+        assert set(storm) == {'count', 'window_seconds', 'projects'}, (
+            f'{counter}: exact 3-key harness shape expected, got {sorted(storm)}'
+        )
+        assert storm['projects'] == ['autopilot_video', 'reify'], counter
 
 
 def test_record_dead_owner_suppression_window_is_half_open(
