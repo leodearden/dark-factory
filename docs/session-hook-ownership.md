@@ -61,11 +61,16 @@ spawn record, re-points every pointer, and folds the hand record. The lane's
 transcript discovery, which binds the record to the session whose transcript
 names the record dir (task 7489), is now the fallback. The thread pointers
 are also the index the T3 sweep iterates, so every terminal write drops one.
+An indexed thread missing from the environment's `t3_thread_list` listing is
+marked exited only after `t3_thread_read` answers that it is gone or
+archived, because the listing omits live side-chat threads (T3 v0.1.6
+`ThreadManagementService.ts::listProjectThreads`).
 
 Code: `orchestrator/src/orchestrator/session_hooks.py::hook_session_slug`,
 `::_resolve_hook_slug`, `::_pointer_resolution`, `::_stamp_session_pointers`;
 `orchestrator/src/orchestrator/session_registry.py::resolve_session_slug_for_claude_session_id`,
-`::resolve_session_slug_for_pid`, `::resolve_session_slug_for_t3_thread`;
+`::resolve_session_slug_for_pid`, `::resolve_session_slug_for_t3_thread`,
+`::mark_t3_sessions_exited`;
 `orchestrator/src/orchestrator/spawn_t3_lane.py::bind_thread_pointer`.
 
 ## Owner or inheritor
