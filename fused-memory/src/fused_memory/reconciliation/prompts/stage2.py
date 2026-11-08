@@ -8,6 +8,9 @@ from fused_memory.reconciliation.blocked_gate_audit_section import BLOCKED_GATE_
 from fused_memory.reconciliation.consolidation_gate import (
     render_consolidation_gate_section,
 )
+from fused_memory.reconciliation.enumeration_guard import (
+    render_enumeration_guard_section,
+)
 from fused_memory.reconciliation.graphiti_degradation_probe import (
     render_graphiti_degradation_probe_section,
 )
@@ -108,6 +111,8 @@ returned. Treat as success, not failure.
 {render_finding_provenance_section(can_file_tasks=True)}
 
 {render_execution_class_section()}
+
+{render_enumeration_guard_section()}
 
 {render_source_completion_section(can_file_tasks=True)}
 

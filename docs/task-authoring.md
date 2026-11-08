@@ -1838,6 +1838,43 @@ accepted marker and declaration spellings are
 `shared.governed_exceptions.INLINE_MARKER_FORMS` and `DECLARATION_FORMS`;
 read them there rather than from a copy here.
 
+### Gate-enforced x_ keys: x_enumeration_scope and the liveness stamp
+
+Three `x_` keys are not free-form annotations. A write-time gate on
+`recon-stage-*` `submit_task` and `update_task` calls owns them (task
+3056). They stay in the `x_` namespace, so they need no blessed-key
+registration and mint no `unknown_key` census line.
+
+- **`x_enumeration_scope`** is a structured object stating which stores
+  and categories an enumeration of Mem0 ids was drawn from, and whether
+  that sweep was exhaustive. Filing a gate that enumerates Mem0 ids
+  without one is rejected (`EnumerationScopeMissing`), and a value of any
+  other shape is rejected on every write (`EnumerationScopeMalformed`).
+- **`x_liveness_reverified_at` and `x_liveness_exceptions`** are written
+  only by the gate. Never author them. Each exception record's `outcome`
+  is an `enumeration_guard.py::EnumeratedIdOutcome` value.
+
+When you write an enumeration:
+- List full 36-char UUIDs, never fragments. A fragment is rejected on
+  filing (`EnumeratedIdTruncated`).
+- Update it with an overwriting merge: `metadata_mode='merge'` (the
+  default) or `'replace'`, never an additive one
+  (`EnumerationUpdateNotOverwriting`). Both modes replace what you send
+  wholesale. `'merge'` replaces each top-level key you supply, so read the
+  task with `get_task` and send the COMPLETE list, never only the ids being
+  added. `'replace'` replaces the whole blob, so send every stored key,
+  `x_liveness_exceptions` included as read: the gate carries forward the
+  records for ids that write did not re-check.
+- Send a `memory_hints` attach as a separate update.
+
+The rules themselves live in the module docstring of
+`fused-memory/src/fused_memory/reconciliation/enumeration_guard.py`: what
+counts as an enumeration and as a gate, how filing and updating differ,
+and the residuals the gate leaves open. The guidance Stage 2 is shown is
+rendered by `enumeration_guard.py::render_enumeration_guard_section`, and
+`enumeration_guard.py::enumeration_scope_example` returns a well-formed
+scope.
+
 ### `allow_mcp_markup`: a write-time flag, not a metadata key
 
 `metadata={'allow_mcp_markup': True}` is the sanctioned move for a write
