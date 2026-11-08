@@ -21,6 +21,8 @@ from _orch_helpers import git_env_with_ceiling
 from shared.merge_subject import format_merge_subject
 
 from orchestrator.config import GitConfig
+from orchestrator.evals.reviewer_trial.mining import resolve_merge_sha_by_task_id
+from orchestrator.evals.task_sampler import discover_completed_tasks
 from orchestrator.git_ops import DEFAULT_COMMIT_CITATION_PATTERN, GitOps, render_citation_pattern
 from orchestrator.merge_lane.gates import ALREADY_LANDED_CITATION_PATTERN
 
@@ -151,3 +153,39 @@ class TestRenderCitationPattern:
         )
         assert re.search(rendered, 'impl(4369 step-8): x')
         assert re.search(rendered, 'impl(43690 step-8): x') is None
+
+
+def _resolve_feat_trunk(task_id: str, repo: Path) -> str | None:
+    return resolve_merge_sha_by_task_id(task_id, repo, branch_prefix='feat/', main_branch='trunk')
+
+
+class TestEvalMinersFollowTheConfiguredSubject:
+    @pytest.mark.asyncio
+    async def test_the_sampler_discovers_only_the_landing(self, feat_trunk: FeatTrunk) -> None:
+        candidates = await discover_completed_tasks(
+            feat_trunk.repo, since=None, project='dark_factory',
+            branch_prefix='feat/', main_branch='trunk',
+        )
+        first_parent = _git(feat_trunk.repo, 'rev-parse', f'{feat_trunk.merge_sha}^1')
+        assert [(c.task_id, c.merge_sha, c.pre_commit) for c in candidates] == [
+            ('50', feat_trunk.merge_sha, first_parent),
+        ]
+
+    def test_mining_resolves_only_the_landing(self, feat_trunk: FeatTrunk) -> None:
+        assert _resolve_feat_trunk('50', feat_trunk.repo) == feat_trunk.merge_sha
+        assert _resolve_feat_trunk('51', feat_trunk.repo) is None
+
+    def test_mining_reads_the_subject_not_a_body_line(self, feat_trunk: FeatTrunk) -> None:
+        repo = feat_trunk.repo
+        quoting = _git(
+            repo, 'commit-tree', 'HEAD^{tree}', '-p', 'HEAD',
+            '-m', 'docs: quote', '-m', format_merge_subject('feat/52', 'trunk'),
+        )
+        _git(repo, 'update-ref', 'refs/heads/side', quoting)
+
+        assert _resolve_feat_trunk('52', repo) is None
+
+    def test_mining_answers_none_for_an_id_that_is_not_a_ref_token(
+        self, feat_trunk: FeatTrunk,
+    ) -> None:
+        assert _resolve_feat_trunk('a b', feat_trunk.repo) is None
