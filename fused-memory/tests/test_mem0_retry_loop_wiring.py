@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-from typing import TYPE_CHECKING, Any, cast
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
@@ -19,14 +19,11 @@ from fused_memory.memory_metadata import SUPERSEDED_BY_METADATA_KEY
 from fused_memory.services.mem0_add_outcome import Mem0AddOutcome
 from fused_memory.services.mem0_write_retry import DEFAULT_MEM0_RETRY_POLICY, Mem0RetryPolicy
 
-if TYPE_CHECKING:
-    from fused_memory.services.memory_service import MemoryService
-
 _OLD = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
 
 
 class _RecordingService:
-    """The two ``MemoryService`` members the loop reads, and the one the landing hook calls."""
+    """A structural stand-in for the members the retry loop and its supersession landing hook read."""
 
     def __init__(self) -> None:
         self.mem0_retry_policy = Mem0RetryPolicy(
@@ -61,7 +58,7 @@ def _intent(metadata: dict[str, Any]) -> dict[str, Any]:
 async def _first_pass(service: _RecordingService) -> dict[str, Any]:
     from fused_memory.server.main import _start_mem0_retry_loop  # noqa: PLC0415
 
-    task = _start_mem0_retry_loop(cast('MemoryService', service))
+    task = _start_mem0_retry_loop(service)
     try:
         # noqa: wall-clock-deadline — the deadline is the assertion: a pass inside half the default policy's interval proves the loop read the service's own policy
         await asyncio.wait_for(
