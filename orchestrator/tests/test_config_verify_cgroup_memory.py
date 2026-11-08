@@ -89,8 +89,9 @@ class TestVerifyCgroupMemoryHighNotAboveMax:
         assert 'max_gib=40' in message
 
     def test_high_above_max_rejected_through_orchestrator_config(self):
+        yaml_shaped: dict[str, Any] = {'verify_cgroup_memory': {'high_gib': 48, 'max_gib': 40}}
         with pytest.raises(ValidationError):
-            OrchestratorConfig(verify_cgroup_memory={'high_gib': 48, 'max_gib': 40})
+            OrchestratorConfig(**yaml_shaped)
 
     def test_high_equal_to_max_accepted(self):
         memory = VerifyCgroupMemoryConfig(high_gib=40, max_gib=40)
@@ -138,10 +139,9 @@ class TestVerifyCgroupMemoryReloadDisposition:
 
     @pytest.mark.parametrize('leaf', LEAVES)
     def test_leaf_edit_lands_in_applied_candidates_not_restart_required(self, leaf):
-        diff = diff_config(
-            OrchestratorConfig(verify_cgroup_memory={leaf: 8}),
-            OrchestratorConfig(verify_cgroup_memory={leaf: 16}),
-        )
+        before: dict[str, Any] = {'verify_cgroup_memory': {leaf: 8}}
+        after: dict[str, Any] = {'verify_cgroup_memory': {leaf: 16}}
+        diff = diff_config(OrchestratorConfig(**before), OrchestratorConfig(**after))
         path = f'verify_cgroup_memory.{leaf}'
         assert path in diff.applied_candidates
         assert path not in diff.restart_required

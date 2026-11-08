@@ -21,6 +21,7 @@ import shlex
 import stat
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -151,12 +152,10 @@ class TestScopeSpawnCarriesMemoryLimits:
     ):
         monkeypatch.chdir(tmp_path)
         live = OrchestratorConfig(verify_use_cgroup_scope=True)
-        apply_reload(
-            live,
-            OrchestratorConfig(
-                verify_use_cgroup_scope=True, verify_cgroup_memory={'max_gib': 48},
-            ),
-        )
+        reloaded: dict[str, Any] = {
+            'verify_use_cgroup_scope': True, 'verify_cgroup_memory': {'max_gib': 48},
+        }
+        apply_reload(live, OrchestratorConfig(**reloaded))
         result = await run_verification(
             worktree, live, module_config=_module_config(), max_retries=0, role='task',
         )

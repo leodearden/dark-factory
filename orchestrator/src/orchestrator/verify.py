@@ -5694,6 +5694,7 @@ class _ScopeKw(TypedDict, total=False):
     use_cgroup_scope: bool
     scope_tag: str
     cpu_weight: int
+    memory_properties: tuple[str, ...]
 
 
 class _ClockKw(TypedDict, total=False):
@@ -5845,15 +5846,22 @@ def _clock_stop_reason(*, kind: str, limit: float, elapsed: float, remaining: fl
     )
 
 
-def _scope_launch_argv(scope_unit: str, cpu_weight: int | None) -> list[str]:
+def _scope_launch_argv(
+    scope_unit: str,
+    cpu_weight: int | None,
+    memory_properties: tuple[str, ...] = (),
+) -> list[str]:
     """The systemd-run prefix for a verify scope; CPUWeight is the between-cgroup
-    share (nice only orders threads inside the scope)."""
+    share (nice only orders threads inside the scope), and *memory_properties*
+    are the scope's memory limits (an empty tuple adds none)."""
     argv = [
         'systemd-run', '--user', '--scope', '--quiet', '--collect',
         f'--unit={scope_unit}',
     ]
     if cpu_weight is not None:
         argv += ['-p', f'CPUWeight={cpu_weight}']
+    for prop in memory_properties:
+        argv += ['-p', prop]
     return argv
 
 
@@ -5886,6 +5894,7 @@ async def _run_cmd(
     use_cgroup_scope: bool = False,
     scope_tag: str = '',
     cpu_weight: int | None = None,
+    memory_properties: tuple[str, ...] = (),
     clock_stop: ClockStopConfig | None = None,
 ) -> tuple[int, str, bool]:
     """Run a shell command, return (returncode, combined output, timed_out).
@@ -5906,7 +5915,8 @@ async def _run_cmd(
     flag is off or ``systemd-run`` is missing, so the default behaviour and the
     existing test suite are unchanged. When *cpu_weight* is not None the scope
     is created with ``-p CPUWeight=<cpu_weight>``; None omits the property
-    (systemd default).
+    (systemd default). Each *memory_properties* entry is added as
+    ``-p <entry>``; the default ``()`` adds none.
 
     When *log_path* is provided, subprocess output is streamed (read in 4 KiB
     chunks and flushed) to that file as it arrives, so a timeout-killed child
@@ -6003,7 +6013,7 @@ async def _run_cmd(
             # forwarding stdio to our pipe; --collect auto-removes the scope when
             # it exits (no unit leak on the normal-completion path).
             proc = await asyncio.create_subprocess_exec(
-                *_scope_launch_argv(scope_unit, cpu_weight),
+                *_scope_launch_argv(scope_unit, cpu_weight, memory_properties),
                 '/bin/bash', '-c', cmd,
                 cwd=str(cwd),
                 stdout=asyncio.subprocess.PIPE,
@@ -7459,6 +7469,7 @@ async def run_verification(
                     'use_cgroup_scope': True,
                     'scope_tag': _scope_tag_for(config.project_root),
                     'cpu_weight': _resolve_scope_cpu_weight(config, role),
+                    'memory_properties': config.verify_cgroup_memory.systemd_properties(),
                 }
                 if config.verify_use_cgroup_scope
                 else {}
