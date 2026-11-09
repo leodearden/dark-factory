@@ -2867,7 +2867,20 @@ class WriteTriageConfig(BaseModel):
             '(INV-4). Bounded gt=0 because a zero budget would fail every call '
             'and read as a total judge outage caused by nothing. 15 s rather '
             'than 10 s because the frontier judge arms measured p95 4.6-6.4 s '
-            '(plans/write-triage-flip-readiness-prd.md §11.2 D15).'
+            '(plans/write-triage-flip-readiness-prd.md §11.2 D15). This budget '
+            'is the judge call\'s overall bound, and nothing retries inside it: '
+            'every judge arm builds its SDK client with max_retries=0 '
+            '(server/write_triage_judge.py::_JUDGE_SDK_MAX_RETRIES), so a '
+            'provider 5xx, 429 or connection error is raised on its first '
+            'occurrence and the fail-open record names it, instead of being '
+            'retried with backoff inside this budget and logged as a bare '
+            'TimeoutError. The SDK\'s own per-attempt timeouts still apply '
+            'within the budget: the openai and anthropic connect timeout '
+            'defaults to 5 s, so a DNS or connect stall fails open at about 5 s '
+            'as APITimeoutError, and a budget below 5 s expires first. The '
+            'accepted cost: a transient error a retry would have rescued is a '
+            'counted fail-open, and the write is still stored (contract C1). '
+            'Task 8521.'
         ),
     )
     judge_reasoning_effort: JudgeReasoningEffort | None = Field(
