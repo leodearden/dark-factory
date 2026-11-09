@@ -1117,9 +1117,12 @@ script and decides by **exit code only** — it parses no output:
 | `75` **without** the declaration (no `recheck_secs`, or the milestone is not `dated`, e.g. a post-submit edit — task 3093) | today's `milestone_check_failed` escalation, plus one detail line naming the missing declaration. Never a silent re-arm |
 | timeout / runner error (**no verdict**) | born-at-L2 escalation + task `blocked`, **no** `gate_escalated_at` stamp in *either* case — the check is simply re-attempted on the next dispatch. Category is `infra_issue` for an ordinary predicate, `milestone_check_failed` for a task carrying `metadata.recurrence` (§6.1) |
 
-Exit `75` is `os.EX_TEMPFAIL` ("not yet"), and the runner treats it as a
-verdict only when `recheck_secs` is declared. The re-arm rewrites the
-`milestone` dict whole (`metadata_mode='merge'` is shallow) and writes three
+Exit `75` is `os.EX_TEMPFAIL`. The runner reads it as "not yet", a re-arm,
+only when `before_done.recheck_secs` is declared **and** the milestone is
+`dated` (`orchestrator/src/orchestrator/predicate_recheck.py::recheck_declaration`).
+Otherwise it is an ordinary failing verdict, the third `75` row:
+`milestone_check_failed`, `gate_escalated_at` stamped, task `blocked`. The
+re-arm rewrites the `milestone` dict whole (`metadata_mode='merge'` is shallow) and writes three
 keys in one update: `milestone`, `predicate_recheck`
 (`{consecutive, first_rearmed_at, last_checked_at, next_check_at}`) and
 `predicate_verdict`. The streak cap is the config leaf
@@ -1319,7 +1322,8 @@ consumer acting on a chain link should likewise re-verify rather than assume
 submit-time validation still holds.
 
 **75 re-arms in place; never mints.** A carrier whose predicate declares
-`recheck_secs` and exits `75` (§6) is not terminal: it returns to `pending`
+`recheck_secs`, whose milestone is still `dated`, and which exits `75` (§6's
+re-arm row) is not terminal: it returns to `pending`
 with its own `milestone.at` advanced, so no successor is minted and the chain
 holds one live link throughout. Minting happens only when the link completes
 `done`.
