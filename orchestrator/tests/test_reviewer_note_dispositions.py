@@ -49,6 +49,10 @@ from orchestrator.workflow import WorkflowOutcome
 TASK_ID = '42'
 STARVATION = 'orchestrator-starvation-watchdog'
 UNKNOWN_ID = 'esc-42-999'
+CORRUPTION = {
+    'agent_role': 'orchestrator', 'category': 'infra_issue',
+    'suggested_action': 'investigate_log_corruption',
+}
 PASSED = VerifyResult(
     passed=True, test_output='', lint_output='', type_output='', summary='All checks passed',
 )
@@ -92,13 +96,14 @@ def _assignment() -> TaskAssignment:
 
 def _file_note(
     queue: EscalationQueue, *, task_id: str = TASK_ID, severity: str = 'info',
-    agent_role: str = 'implementer',
+    agent_role: str = 'implementer', category: str = 'design_concern',
+    suggested_action: str = 'create_followup_task',
 ) -> Escalation:
     note = Escalation(
         id=queue.make_id(task_id), task_id=task_id, agent_role=agent_role,
-        severity=severity, category='design_concern',
+        severity=severity, category=category,
         summary=f'{agent_role} {severity} note', detail='Seen while editing foo.py.',
-        suggested_action='create_followup_task',
+        suggested_action=suggested_action,
     )
     queue.submit(note)
     return note
@@ -235,6 +240,7 @@ class TestReviewerIsBriefedWithItsNotes:
         _file_note(run.queue, severity='blocking')
         _file_note(run.queue, agent_role=STARVATION)
         _file_note(run.queue, task_id='99')
+        _file_note(run.queue, **CORRUPTION)
 
         assert await run.run() == WorkflowOutcome.DONE
 
@@ -365,4 +371,19 @@ class TestReviewLoopAppliesDispositions:
         assert [row['by'] for row in rows] == ['workflow-finalizer']
         assert (rows[0]['class'], rows[0]['exit_kind']) == ('convert-pending', 'blocked')
         hold = read_hold(run.current(note))
+        assert hold is not None and hold.ticket == 'tkt_1'
+
+    async def test_a_harness_notice_is_left_to_the_exit_router(self, tmp_path, monkeypatch):
+        stub = _DispositioningStub()
+        run = _FullRun(tmp_path, monkeypatch, stub)
+        notice = _file_note(run.queue, **CORRUPTION)
+        stub.note_dispositions = [_disposition(notice.id, 'no_action')]
+
+        assert await run.run() == WorkflowOutcome.DONE
+
+        reviewer_row, finalizer_row = run.rows(notice.id)
+        assert (reviewer_row['by'], reviewer_row['class']) == (REVIEWER_LEG_ID, 'rejected_disposition')
+        assert run.current(notice).resolution_class != 'observation-consumed'
+        assert (finalizer_row['by'], finalizer_row['exit_kind']) == ('workflow-finalizer', 'done')
+        hold = read_hold(run.current(notice))
         assert hold is not None and hold.ticket == 'tkt_1'

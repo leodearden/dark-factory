@@ -911,6 +911,11 @@ ORPHAN_FIELDS = {
     'agent_role': 'orchestrator', 'category': 'infra_issue',
     'suggested_action': 'verify_wip_reconciliation',
 }
+CORRUPTION_FIELDS = {
+    'agent_role': 'orchestrator', 'category': 'infra_issue',
+    'suggested_action': 'investigate_log_corruption',
+}
+SUGGESTIONS_FIELDS = {'agent_role': 'orchestrator', 'category': 'review_suggestions'}
 
 
 def _seed_in_eval_worktree(queue: EscalationQueue) -> Escalation:
@@ -939,6 +944,10 @@ class TestReviewerNotes:
         _seed(queue, task_id='99')
         _seed(queue, agent_role=STARVATION)
         _seed(queue, **ORPHAN_FIELDS)
+        _seed(queue, **CORRUPTION_FIELDS)
+        _seed(queue, **SUGGESTIONS_FIELDS)
+        _seed(queue, agent_role='orchestrator-workflow')
+        _seed(queue, agent_role='harness-orphan-reaper')
         _hold(queue, _seed(queue), 'tkt_9', datetime.now(UTC))
         _seed_in_eval_worktree(queue)
         resolved = _seed(queue)
@@ -971,7 +980,14 @@ class TestReviewerNoteRefusal:
             {'triaged_by': ROUTER_ID, 'triage_note': hold_note('tkt_9', datetime.now(UTC))},
             'tkt_9',
         ),
-    ], ids=['foreign-task', 'blocking', 'level-1', 'mechanical-role', 'orphan', 'router-held'])
+        (CORRUPTION_FIELDS, "'orchestrator'"),
+        (SUGGESTIONS_FIELDS, "'orchestrator'"),
+        ({'agent_role': 'orchestrator-workflow'}, 'orchestrator-workflow'),
+        ({'agent_role': 'harness-orphan-reaper'}, 'harness-orphan-reaper'),
+    ], ids=[
+        'foreign-task', 'blocking', 'level-1', 'mechanical-role', 'orphan', 'router-held',
+        'harness-corruption', 'harness-suggestions', 'harness-prefixed', 'harness-reaper',
+    ])
     def test_an_ineligible_note_is_refused_naming_the_offending_value(self, fields, named):
         reason = reviewer_note_refusal(_record(**fields), task_id='42', enabled=True)
 
@@ -1048,6 +1064,7 @@ class TestApplyReviewerDisposition:
 
     @pytest.mark.parametrize('case', [
         'unknown-id', 'foreign-task', 'blocking', 'info-l1', 'mechanical-role', 'dismissed',
+        'harness-filed',
     ])
     def test_an_ineligible_disposition_is_rejected_and_writes_nothing(
         self, queue, events, ports, curator, caplog, case,
@@ -1059,11 +1076,15 @@ class TestApplyReviewerDisposition:
             'info-l1': lambda: _seed(queue, level=1).id,
             'mechanical-role': lambda: _seed(queue, agent_role=STARVATION).id,
             'dismissed': lambda: _dismissed(queue).id,
+            'harness-filed': lambda: _seed(queue, **CORRUPTION_FIELDS).id,
         }[case]()
+        disposition = (
+            ReviewerDisposition.NO_ACTION if case == 'harness-filed' else ReviewerDisposition.ADDRESSED
+        )
         before = queue.get(esc_id)
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.escalation_router'):
-            applied = _apply_review(ports, _review_note(esc_id, ReviewerDisposition.ADDRESSED))
+            applied = _apply_review(ports, _review_note(esc_id, disposition))
 
         assert applied.outcome is Outcome.REJECTED
         assert queue.get(esc_id) == before
