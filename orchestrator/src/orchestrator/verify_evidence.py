@@ -85,10 +85,15 @@ class VerifyUnit:
         return cls(**{**d, 'tier': UnitTier(d['tier']), 'outcome': UnitOutcome(d['outcome'])})
 
 
+def module_leg_name(module_prefix: str | None, leg: str) -> str:
+    """The unit name of one module leg, e.g. ``module:scripts:type``."""
+    return f'module:{module_prefix or GLOBAL_MODULE}:{leg}'
+
+
 def module_leg_unit(module_prefix: str | None, leg: str, rc: int) -> VerifyUnit:
     """The unit for one module leg that ran and exited *rc*."""
     return VerifyUnit(
-        unit=f'module:{module_prefix or GLOBAL_MODULE}:{leg}',
+        unit=module_leg_name(module_prefix, leg),
         tier=UnitTier.MODULE,
         key=None,
         outcome=UnitOutcome.RAN_GREEN if rc == 0 else UnitOutcome.RAN_RED,
