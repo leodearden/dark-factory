@@ -5677,7 +5677,8 @@ class Harness:
 
         Rendered into the digest's ``## Stale lane assignments`` section via
         ``DigestInputs.stale_lane_census``. Fail-safe throughout: returns ``[]``
-        on a missing pool or a degraded ``get_statuses`` read; a record with an
+        on a missing pool, unreadable durable records or a degraded
+        ``get_statuses`` read; a record with an
         empty/unparseable ``updated_at`` is skipped (never counted). QUARANTINED
         and terminal records are excluded.
         """

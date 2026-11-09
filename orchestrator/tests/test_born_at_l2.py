@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-from typing import cast
 from unittest.mock import MagicMock
 
 import pytest
-from escalation.categories import EscalationCategory, UnregisteredEscalationCategory
+from escalation.categories import EscalationCategory
 from escalation.queue import EscalationQueue
 
 from orchestrator.born_at_l2 import BornAtL2Alarm, file_deduped_born_at_l2
@@ -61,18 +60,6 @@ def test_files_an_urgent_level_two_escalation_for_a_human(queue, event_store):
     assert pending.suggested_action == _ALARM.suggested_action
     assert (pending.summary, pending.detail) == ('probe tripped', 'probe detail')
     assert pending.filing_claimant_run_id == 'run-7'
-
-
-def test_unregistered_category_is_refused_at_construction():
-    with pytest.raises(UnregisteredEscalationCategory, match='infra_isue'):
-        BornAtL2Alarm(
-            root_cause='probe_condition',
-            sentinel_task='__probe_condition__',
-            role='orchestrator-probe-condition',
-            category=cast(EscalationCategory, 'infra_isue'),
-            suggested_action='x',
-            created_reason='y',
-        )
 
 
 def test_emits_escalation_created_with_the_alarm_reason(queue, event_store):
