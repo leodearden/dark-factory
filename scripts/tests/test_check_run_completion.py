@@ -4,13 +4,33 @@ selection over the real find_tasks_by_metadata tool, the predicate CLI and the
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
+import subprocess
+import threading
+from collections.abc import Callable, Coroutine, Iterator, Mapping
+from pathlib import Path
+from typing import Any, TypeVar
+from unittest.mock import AsyncMock
 
 import check_run_completion as crc
 import pytest
+from dashboard.config import DEFAULT_FUSED_MEMORY_URLS
+from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
+from fused_memory.config.schema import TaskmasterConfig
+from fused_memory.middleware.task_interceptor import TaskInterceptor
+from fused_memory.reconciliation.event_buffer import EventBuffer
+from fused_memory.server.tools import create_mcp_server
+from shared.testing_mcp_stub import StubMcpServer
 
 RUN = 'review-dark_factory-20261109-1'
+OTHER_RUN = 'hotspot-survey-dark_factory-20261101-1'
+LOOKUP = 'find_tasks_by_metadata'
+_LOOP_TIMEOUT_SECS = 60
+
+_T = TypeVar('_T')
+CallTool = Callable[[str, Mapping[str, Any]], Mapping[str, Any]]
 
 
 def _row(task_id: int, priority: str | None, status: str) -> dict[str, object]:
@@ -182,3 +202,248 @@ def test_the_worst_case_verdict_json_fits_the_note_cap():
     )
 
     assert len(verdict.to_json()) <= 400
+
+
+# ── The real store: SqliteTaskBackend behind the real fused-memory tools ──
+
+
+def _git_root(path: Path) -> str:
+    path.mkdir(parents=True)
+    subprocess.run(['git', 'init', '-q', str(path)], check=True, capture_output=True)
+    return str(path.resolve())
+
+
+class FixtureStore:
+    """A real task store served by the real MCP tool functions, driven synchronously.
+
+    SqliteTaskBackend is aiosqlite-backed, so every coroutine runs on one loop,
+    owned by a daemon thread; ``call_tool`` is safe from any thread.
+    """
+
+    def __init__(self, tmp_path: Path) -> None:
+        self.root = _git_root(tmp_path / 'project')
+        self._seeded = 0
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(target=self._loop.run_forever, daemon=True)
+        self._thread.start()
+        self._backend, self._interceptor, self._server = self._run(self._build())
+
+    def _run(self, coro: Coroutine[Any, Any, _T]) -> _T:
+        return asyncio.run_coroutine_threadsafe(coro, self._loop).result(timeout=_LOOP_TIMEOUT_SECS)
+
+    async def _build(self):
+        backend = SqliteTaskBackend(TaskmasterConfig(project_root=self.root))
+        await backend.start()
+        interceptor = TaskInterceptor(backend, None, EventBuffer(db_path=None))
+        return backend, interceptor, create_mcp_server(AsyncMock(), task_interceptor=interceptor)
+
+    def seed(
+        self,
+        *,
+        priority: str | None = None,
+        status: str = 'pending',
+        metadata: Mapping[str, Any] | None = None,
+        root: str | None = None,
+    ) -> int:
+        self._seeded += 1
+        added = self._run(self._backend.add_task(
+            project_root=root or self.root,
+            title=f'fixture task {self._seeded}',
+            description=f'seeded completion fixture task {self._seeded}',
+            priority=priority,
+            status=status,
+            metadata=json.dumps(dict(metadata)) if metadata is not None else None,
+        ))
+        return int(added['id'])
+
+    def seed_run(self, run_id: str, *spec: tuple[str | None, str]) -> list[int]:
+        return [
+            self.seed(priority=priority, status=status, metadata={crc.FINDING_RUN_KEY: run_id})
+            for priority, status in spec
+        ]
+
+    def call_tool(self, name: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        answer = self._run(self._server.call_tool(name, dict(arguments)))
+        assert isinstance(answer, tuple) and len(answer) == 2
+        structured = answer[1]
+        assert isinstance(structured, dict)
+        return structured
+
+    async def _shutdown(self) -> None:
+        await self._interceptor.close()
+        await self._backend.close()
+
+    def close(self) -> None:
+        try:
+            self._run(self._shutdown())
+        finally:
+            self._loop.call_soon_threadsafe(self._loop.stop)
+            self._thread.join(timeout=_LOOP_TIMEOUT_SECS)
+            self._loop.close()
+
+
+@pytest.fixture
+def store(tmp_path: Path) -> Iterator[FixtureStore]:
+    fixture = FixtureStore(tmp_path)
+    try:
+        yield fixture
+    finally:
+        fixture.close()
+
+
+class Recording:
+    """Forwards each call to *call_tool* and records ``(name, arguments)``."""
+
+    def __init__(self, call_tool: CallTool) -> None:
+        self._call_tool = call_tool
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    def __call__(self, name: str, arguments: Mapping[str, Any]) -> Mapping[str, Any]:
+        self.calls.append((name, dict(arguments)))
+        return self._call_tool(name, arguments)
+
+
+def recording(call_tool: CallTool) -> Recording:
+    return Recording(call_tool)
+
+
+def _answering(reply: Mapping[str, Any]) -> CallTool:
+    return lambda name, arguments: reply
+
+
+# ── The selection: run_tasks over the real lookup tool ──
+
+
+def test_run_tasks_selects_every_status_of_the_run_and_nothing_else(store):
+    ours = [
+        store.seed(priority='high', status=status, metadata={'x_finding_run': RUN})
+        for status in ('pending', 'done', 'cancelled', 'deferred')
+    ]
+    store.seed(priority='high', metadata={'x_finding_run': OTHER_RUN})
+    store.seed(priority='high', metadata={'x_other': RUN})
+    store.seed(priority='high')
+
+    selection = crc.run_tasks(store.root, RUN, call_tool=store.call_tool)
+
+    assert sorted(row['task_id'] for row in selection.rows) == sorted(ours)
+    assert {row['status'] for row in selection.rows} == {'pending', 'done', 'cancelled', 'deferred'}
+
+
+def test_run_tasks_sends_the_presence_query_for_the_run(store):
+    store.seed_run(RUN, ('high', 'pending'))
+    calls = recording(store.call_tool)
+
+    crc.run_tasks(store.root, RUN, call_tool=calls)
+
+    assert calls.calls[0] == (
+        LOOKUP, {'project_root': store.root, 'key': 'x_finding_run', 'value': RUN, 'limit': 100, 'offset': 0},
+    )
+
+
+def test_run_tasks_pages_by_the_returned_count(store):
+    seeded = store.seed_run(RUN, *[('low', 'pending')] * 150)
+    calls = recording(store.call_tool)
+
+    selection = crc.run_tasks(store.root, RUN, call_tool=calls)
+
+    assert sorted(row['task_id'] for row in selection.rows) == sorted(seeded)
+    assert [arguments['offset'] for _, arguments in calls.calls] == [0, 100]
+
+
+def test_run_tasks_sends_a_relative_root_absolute(store, monkeypatch):
+    store.seed_run(RUN, ('high', 'pending'))
+    monkeypatch.chdir(Path(store.root).parent)
+    calls = recording(store.call_tool)
+
+    selection = crc.run_tasks('project', RUN, call_tool=calls)
+
+    assert calls.calls[0][1]['project_root'] == store.root
+    assert len(selection.rows) == 1
+
+
+def test_tasks_with_key_is_zero_when_no_task_carries_the_key(store):
+    store.seed(priority='high')
+
+    selection = crc.run_tasks(store.root, RUN, call_tool=store.call_tool)
+
+    assert selection.tasks_with_key == 0
+    assert selection.rows == ()
+
+
+def test_tasks_with_key_counts_a_live_key_the_run_does_not_match(store):
+    store.seed_run(OTHER_RUN, ('high', 'pending'), ('low', 'done'))
+
+    selection = crc.run_tasks(store.root, RUN, call_tool=store.call_tool)
+
+    assert selection.tasks_with_key > 0
+    assert selection.rows == ()
+
+
+def test_a_tool_error_payload_is_raised_with_its_text(store, tmp_path):
+    plain = tmp_path / 'plain'
+    plain.mkdir()
+    answered = store.call_tool(LOOKUP, {'project_root': str(plain), 'key': 'x_finding_run', 'value': RUN})
+    assert 'error' in answered
+
+    with pytest.raises(crc.ToolErrorReply) as raised:
+        crc.run_tasks(str(plain), RUN, call_tool=store.call_tool)
+
+    assert answered['error'] in str(raised.value)
+    assert raised.value.code is crc.FailureCode.TOOL_ERROR
+
+
+def test_an_error_key_beside_results_is_still_refused():
+    reply = {'error': 'boom', 'error_type': 'Odd', 'results': [], 'tasks_with_key': 0, 'pagination': {'has_more': False}}
+
+    with pytest.raises(crc.ToolErrorReply, match='boom'):
+        crc.run_tasks('/nowhere', RUN, call_tool=_answering(reply))
+
+
+def test_a_raising_transport_is_store_unreachable_never_no_tasks():
+    cause = RuntimeError('connection refused')
+
+    def raising(name: str, arguments: Mapping[str, Any]) -> Mapping[str, Any]:
+        raise cause
+
+    with pytest.raises(crc.StoreUnreachable) as raised:
+        crc.run_tasks('/nowhere', RUN, call_tool=raising)
+
+    assert raised.value.__cause__ is cause
+    assert raised.value.code is crc.FailureCode.STORE_UNREACHABLE
+
+
+@pytest.mark.parametrize('reply', [
+    {'results': [], 'tasks_with_key': 1, 'pagination': {'has_more': True, 'returned': 0}},
+    {'tasks_with_key': 1, 'pagination': {'has_more': False}},
+], ids=['has_more_on_an_empty_page', 'no_results'])
+def test_a_malformed_reply_is_refused(reply):
+    with pytest.raises(crc.MalformedReply) as raised:
+        crc.run_tasks('/nowhere', RUN, call_tool=_answering(reply))
+
+    assert raised.value.code is crc.FailureCode.MALFORMED_REPLY
+
+
+def test_every_lookup_failure_is_a_lookup_failed():
+    for failure in (crc.StoreUnreachable, crc.ToolErrorReply, crc.MalformedReply):
+        assert issubclass(failure, crc.LookupFailed)
+
+
+def test_the_default_binding_posts_to_the_configured_url(store, monkeypatch):
+    seeded = store.seed_run(RUN, ('high', 'pending'), ('low', 'done'))
+
+    with StubMcpServer(stateful=False, tools=store.call_tool) as stub:
+        monkeypatch.setenv('FUSED_MEMORY_MCP_URL', stub.url)
+        selection = crc.run_tasks(store.root, RUN)
+
+    assert sorted(row['task_id'] for row in selection.rows) == sorted(seeded)
+    tool_calls = [
+        request for request in stub.requests
+        if request.http_method == 'POST' and request.path == '/mcp'
+        and isinstance(request.body, dict) and request.body.get('method') == 'tools/call'
+    ]
+    assert [request.body['params']['name'] for request in tool_calls] == [LOOKUP]
+
+
+def test_the_fused_memory_url_comes_from_the_environment_or_the_dashboard_default():
+    assert crc.fused_memory_url({}) == DEFAULT_FUSED_MEMORY_URLS[0]
+    assert crc.fused_memory_url({'FUSED_MEMORY_MCP_URL': 'http://x:1'}) == 'http://x:1'
