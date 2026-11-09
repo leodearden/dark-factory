@@ -686,16 +686,19 @@ def _stamp_session_pointers(
     session-id pointer only when this event changed the binding, the
     pid pointer whenever ``claude_owner_pid`` is this event's owning claude
     pid, and the thread pointer whenever the record is t3 for this event's
-    *t3_thread_id*. The pid and thread rules cover every lane (adopt, fork, a
-    withheld launch window, an unproven adopt, a blank session_id) without
-    branching on them. Fail-soft: the registry writers never raise.
+    *t3_thread_id* and no other live record holds that thread
+    (``session_registry.index_t3_record_if_unheld``): a hook never moves a
+    held thread pointer, only the T3 lane's bind does. The pid and thread
+    rules cover every lane (adopt, fork, a withheld launch window, an
+    unproven adopt, a blank session_id) without branching on them.
+    Fail-soft: the registry writers never raise.
     """
     if newly_bound and record.claude_session_id:
         session_registry.write_claude_session_pointer(
             record.claude_session_id, record.session_slug, root=root
         )
     if t3_thread_id is not None and session_registry.t3_thread_of(record) == t3_thread_id:
-        session_registry.write_t3_thread_pointer(t3_thread_id, record.session_slug, root=root)
+        session_registry.index_t3_record_if_unheld(record, record.session_slug, root=root)
     pid = probes.owning_claude_pid()
     if pid is None or record.claude_owner_pid != pid:
         return

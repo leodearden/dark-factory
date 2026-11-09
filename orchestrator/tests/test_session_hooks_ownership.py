@@ -1378,3 +1378,17 @@ def test_a_hand_t3_record_regains_its_lost_thread_pointer_on_its_next_event(
     assert sr.resolve_session_slug_for_t3_thread(_THREAD, root=tmp_path) == _hand_slug(
         hook_input, tmp_path
     )
+
+
+def test_a_hook_event_never_moves_a_thread_pointer_another_live_record_holds(
+    tmp_path: Path,
+) -> None:
+    hand_input = {'session_id': 'sess-hand', 'cwd': _IDENTITY_CWD}
+    tree = claude_process_tree(_T3_CLAUDE_PID)
+    sh.run_session_start(hand_input, _T3_ENV, root=tmp_path, process_tree=tree)
+    spawn_slug = _t3_spawn_record(tmp_path)
+
+    sh.run_notification(hand_input, _T3_ENV, root=tmp_path, process_tree=tree)
+
+    assert sr.is_t3_record(sr.read_record(_hand_slug(hand_input, tmp_path), root=tmp_path))
+    assert sr.resolve_session_slug_for_t3_thread(_THREAD, root=tmp_path) == spawn_slug

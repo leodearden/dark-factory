@@ -54,7 +54,8 @@ thread pointer no live record holds claims the thread for its hand-launched
 record, which gets `display.kind: t3`. Only that fall-through claims: an
 event keyed by `CLAUDE_SPAWN_SESSION_ID` never reads `T3CODE_THREAD_ID`, and
 an event a thread-pointed record disowned forks without claiming. Every event
-re-asserts the thread pointer of a t3 record of its own thread. When a hand
+re-asserts the thread pointer of a t3 record of its own thread unless another
+live record holds it: no hook moves a held pointer, only the lane does. When a hand
 record wins the race to the thread, the lane reconciles it at stamp time or
 in `await-started`: it binds the hand record's session and owner onto the
 spawn record, re-points every pointer, and folds the hand record. The lane's
