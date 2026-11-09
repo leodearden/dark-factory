@@ -17,7 +17,7 @@ from quality_series_fixtures import (
     build_landing_scenario,
 )
 
-from shared.quality_series import cli
+from shared.quality_series import cli, landings, rows_for
 
 _SRC = Path(__file__).resolve().parent.parent / 'src'
 POST_MERGE = 'post_merge_verify'
@@ -82,7 +82,7 @@ class TestSince:
     def test_states_the_disagreement_and_the_anchoring(self, project, capsys) -> None:
         _, lines, _ = _run(capsys, '--root', str(project.repo.root), '--since', project.m1)
         assert ('# git first-parent disagreement: 2 '
-                '(off_first_parent=1, merges_without_landing=1)') in lines
+                '(off_first_parent=1, merges_without_landing=1, late_claims=0)') in lines
         anchoring = next(line for line in lines if line.startswith('# anchoring:'))
         assert 'event timestamp' in anchoring
         assert '(previous landing, landing]' in anchoring
@@ -94,13 +94,21 @@ def test_week_summary_is_the_hand_computed_one(project, capsys) -> None:
     summary = [line for line in lines if line.startswith('# week') or line.startswith('#   ')]
     assert summary == [
         '# week 2026-W44: 7 units, 9 landings',
-        '#   rejections per 100 landings: 50.0 (3 events over 6 units)',
+        '#   rejections per 100 landings: 37.5 (3 events over 8 landings)',
         '#   landings with >= 1 rejection: 4/8',
         '#   confirmed-flake landings: 3/7',
         '#   real-red landings: 1/7',
         '#   review rounds >= 2: 2/3 (review_completed=2, disk_counter=1)',
-        '#   re-verifies per landing: 0.17 (1 over 6 units)',
+        '#   re-verifies per landing: 0.12 (1 over 8 landings)',
     ]
+
+
+def test_week_summary_denominators_are_known_landings(project) -> None:
+    batch = landings(project.db.conn, project.repo.root, since_cursor=None)
+    rows = rows_for(batch.landings, project.db.conn, project.repo.root, git_budget_s=60)
+    summary = cli.week_summary(rows, '2026-W44')
+    assert summary.rejection_events == cli.KOfN(3, 8)
+    assert summary.reverifies == cli.KOfN(1, 8)
 
 
 class TestRefusals:
