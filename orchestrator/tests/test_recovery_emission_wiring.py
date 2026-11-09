@@ -41,8 +41,12 @@ from orchestrator.event_store import EventStore, EventType
 from orchestrator.harness import Harness
 from orchestrator.merge_lane.landed_outbox import MergeProvenance
 from orchestrator.recovery_emission import (
+    RECOVERY_VETO_STREAK_ROLE,
     RECOVERY_VETO_STREAK_SENTINEL_PREFIX,
+    LeaveReason,
+    RecoverySite,
     RecoveryVetoStreakTracker,
+    emit_recovery_veto_streak_escalation,
 )
 from orchestrator.task_ground_truth import (
     BranchState,
@@ -1391,3 +1395,100 @@ class TestBothAdaptersAgreeOnTheVetoSignature:
         assert s._recovery_veto_tracker.observe(
             RecoverySite.scheduler_blocked_redispatch, 'T1', expected,
         ).changed is False
+
+
+
+def _restart_with_prior_alarm(harness, *, deterministic_sweep: bool) -> None:
+    """Make *harness* the RESTARTED process: a prior one filed T1's alarm."""
+    harness.config.deterministic_recon_sweep_enabled = deterministic_sweep
+    assert emit_recovery_veto_streak_escalation(
+        escalation_queue=_queue(harness), task_id='T1',
+        site=RecoverySite.reconcile_sweep, streak=3, threshold=3,
+        span_seconds=3600.0, min_span_seconds=0.0,
+        reason=LeaveReason.escalation_pinned, shape='x', escalation_ids=['esc-1'],
+        human_parked=False, suppress_human_parked=True,
+    ) is True
+    harness._inherit_pending_streak_alarms()
+
+
+def _tracked_tasks(harness) -> set[str]:
+    return {tid for _site, tid in harness._recovery_veto_tracker.tracked()}
+
+
+@pytest.mark.asyncio
+class TestVetoStreakAlarmSurvivesRestart:
+    """The fixture harness is the restarted process: its tracker and memo are
+    empty, and the prior process's alarm exists only on the queue."""
+
+    async def test_a_task_that_left_the_candidate_set_is_released(self, clocked):
+        harness, clock = clocked
+        _restart_with_prior_alarm(harness, deterministic_sweep=False)
+        # T9 keeps the status map non-empty, so the sweep does not abort.
+        _bind_reports(harness, {'T9': _report(claimant=_live_claimant())})
+
+        await _sweeps(harness, clock, 1)
+
+        assert _alarms(harness, 'T1') == []
+        assert 'T1' not in harness._recovery_streak_filed_at
+        assert 'T1' not in _tracked_tasks(harness)
+
+    async def test_a_task_still_held_keeps_one_alarm_until_the_hold_clears(
+        self, clocked,
+    ):
+        harness, clock = clocked
+        _restart_with_prior_alarm(harness, deterministic_sweep=False)
+        stub = _bind_reports(harness, {'T1': _pinned_hold(escalations=[_ref('esc-1')])})
+
+        await _sweeps(harness, clock, 5)
+        assert len(_alarms(harness, 'T1')) == 1, 'no duplicate of the inherited alarm'
+
+        stub.reports['T1'] = _report(
+            db_status=TaskStatus.BLOCKED,
+            branch=BranchStateKind.EXISTS_OFF_MAIN, sha=None,
+        )
+        await _sweeps(harness, clock, 1)
+
+        assert _alarms(harness, 'T1') == []
+
+    async def test_every_released_site_must_vouch_before_the_alarm_resolves(
+        self, clocked,
+    ):
+        """The disk record does not say which site charged it, so the
+        deterministic sweep must also pass without T1 — failing toward NOT
+        releasing, as the release's flap guard requires."""
+        harness, clock = clocked
+        _restart_with_prior_alarm(harness, deterministic_sweep=True)
+        _bind_reports(harness, {'T9': _report(claimant=_live_claimant())})
+
+        await _sweeps(harness, clock, 1)
+        assert len(_alarms(harness, 'T1')) == 1
+
+        await harness._run_deterministic_recon_sweep()
+
+        assert _alarms(harness, 'T1') == []
+
+    async def test_a_real_id_echo_is_inherited_and_resolved(self, clocked):
+        harness, clock = clocked
+        harness.config.deterministic_recon_sweep_enabled = False
+        _queue(harness).submit(Escalation(
+            id='esc-T1-echo', task_id='T1', agent_role=RECOVERY_VETO_STREAK_ROLE,
+            severity='blocking', level=1, category='risk_identified',
+            summary='echoed streak alarm',
+        ))
+        harness._inherit_pending_streak_alarms()
+        _bind_reports(harness, {'T9': _report(claimant=_live_claimant())})
+
+        await _sweeps(harness, clock, 1)
+
+        assert _queue(harness).get_by_task('T1', status='pending') == []
+
+    async def test_no_queue_is_a_no_op(self, clocked):
+        harness, _clock = clocked
+        harness.config.deterministic_recon_sweep_enabled = True
+        harness._escalation_queue = None
+
+        harness._inherit_pending_streak_alarms()
+
+        assert tuple(harness._recovery_veto_tracker.tracked()) == ()
+        assert harness._recovery_streak_filed_at == {}
+        assert harness._zero_progress_filed_at == {}
