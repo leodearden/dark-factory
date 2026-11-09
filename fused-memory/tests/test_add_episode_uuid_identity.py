@@ -48,13 +48,10 @@ import contextlib
 import logging
 import os
 import re
-from collections.abc import Awaitable, Callable
 from types import SimpleNamespace
-from typing import Any, TypeVar
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
-import httpx
-import openai
 import pytest
 import pytest_asyncio
 from _fm_helpers import (
@@ -64,6 +61,7 @@ from _fm_helpers import (
     unique_graph_name,
 )
 from _graphiti_fake import FakeGraphitiClient
+from _unreached_provider import skip_if_provider_unreached
 
 from fused_memory.backends.graphiti_client import (
     GraphitiBackend,
@@ -879,107 +877,6 @@ def test_the_live_config_runs_graphiti_on_the_configured_clients(mock_config):
     ) == (config.embedder.model, config.embedder.dimensions, api_key)
 
 
-def _unreached_provider_skip_reason(exc: openai.APIError) -> str | None:
-    """The skip reason when *exc* shows the provider's connect phase timed out
-    before any response; None for every other failure.
-    """
-    cause = exc.__cause__
-    if not (isinstance(exc, openai.APIConnectionError) and isinstance(cause, httpx.ConnectTimeout)):
-        return None
-    return (
-        f'{exc.request.url.host} was not reached: {type(cause).__name__} before any '
-        f'response, so no episode write was observed; a lasting outage is '
-        f"scripts/lane_dependency_probe.py's to report"
-    )
-
-
-_T = TypeVar('_T')
-
-
-async def _skip_if_provider_unreached(write: Awaitable[_T]) -> _T:
-    """Await *write*, skipping the test only when the provider was never reached."""
-    try:
-        return await write
-    except openai.APIError as exc:
-        if (reason := _unreached_provider_skip_reason(exc)) is None:
-            raise
-        pytest.skip(reason)
-
-
-async def _sdk_call(handler: Callable[[httpx.Request], httpx.Response]) -> None:
-    """Make one real SDK call over *handler*."""
-    async with openai.AsyncOpenAI(
-        api_key='sk-hermetic-not-a-real-key',
-        max_retries=0,
-        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
-    ) as client:
-        await client.chat.completions.create(
-            model='gpt-4o-mini', messages=[{'role': 'user', 'content': 'x'}]
-        )
-
-
-async def _raised_by(awaitable: Awaitable[object]) -> BaseException:
-    """What awaiting *awaitable* raised, a skip included: a skip is no Exception,
-    so pytest.raises would pass it through and report the guard skipped, not red.
-    """
-    try:
-        await awaitable
-    except (Exception, pytest.skip.Exception) as raised:
-        return raised
-    pytest.fail('the awaited call raised nothing')
-
-
-def _connect_timeout(request: httpx.Request) -> httpx.Response:
-    raise httpx.ConnectTimeout('timed out', request=request)
-
-
-def _connect_error(request: httpx.Request) -> httpx.Response:
-    raise httpx.ConnectError('[Errno -3] Temporary failure in name resolution', request=request)
-
-
-def _read_timeout(request: httpx.Request) -> httpx.Response:
-    raise httpx.ReadTimeout('timed out', request=request)
-
-
-def _model_not_found(request: httpx.Request) -> httpx.Response:
-    return httpx.Response(
-        404,
-        json={
-            'error': {
-                'message': 'The model `gpt-4.1-nano` has been deprecated',
-                'type': 'invalid_request_error',
-                'param': None,
-                'code': 'model_not_found',
-            }
-        },
-        request=request,
-    )
-
-
-@pytest.mark.asyncio
-async def test_a_connect_timeout_skips_the_live_write():
-    raised = await _raised_by(_skip_if_provider_unreached(_sdk_call(_connect_timeout)))
-
-    assert isinstance(raised, pytest.skip.Exception), raised
-    assert 'api.openai.com' in str(raised)
-    assert 'ConnectTimeout' in str(raised)
-
-
-@pytest.mark.parametrize(
-    'handler',
-    [
-        pytest.param(_connect_error, id='connect-error'),
-        pytest.param(_read_timeout, id='read-timeout'),
-        pytest.param(_model_not_found, id='model-not-found'),
-    ],
-)
-@pytest.mark.asyncio
-async def test_a_provider_failure_other_than_a_connect_timeout_stays_red(handler):
-    raised = await _raised_by(_skip_if_provider_unreached(_sdk_call(handler)))
-
-    assert isinstance(raised, openai.APIError), raised
-
-
 @falkor_skipif()
 @pytest.mark.integration
 @pytest.mark.skipif(
@@ -1032,7 +929,7 @@ async def test_the_write_creates_a_real_episodic_node_in_falkordb(mock_config):
 
         # The real production route: enqueue, then execute the queued payload.
         await svc.add_episode(content=_LIVE_CONTENT, project_id=graph_name)
-        result = await _skip_if_provider_unreached(
+        result = await skip_if_provider_unreached(
             svc._execute_graphiti_write('add_episode', _enqueued_payload(svc))
         )
 
