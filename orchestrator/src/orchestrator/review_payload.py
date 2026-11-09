@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, ClassVar
 
+from orchestrator.review_issue_contract import IssueField, IssueSeverity
+
 
 class Verdict(StrEnum):
     PASS = 'PASS'
@@ -19,7 +21,7 @@ class ReviewPayloadError(ValueError):
 
 
 def _is_blocking(issue: Mapping[str, Any]) -> bool:
-    return issue.get('severity') == 'blocking'
+    return issue.get(IssueField.SEVERITY) == IssueSeverity.BLOCKING
 
 
 @dataclass(frozen=True)
