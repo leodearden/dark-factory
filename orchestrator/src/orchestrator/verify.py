@@ -1337,6 +1337,10 @@ def extract_test_outcomes_from_junit(path: Path) -> dict[str, str] | None:
 
 NodeIdStatus = Literal['pass', 'fail', 'error', 'skipped']
 
+#: The status of an id named by several testcases (its parametrizations, or a
+#: test that failed and then errored in teardown): the first of these any has.
+_NODE_ID_STATUS_PRECEDENCE: tuple[NodeIdStatus, ...] = ('fail', 'error', 'skipped', 'pass')
+
 
 def _junit_testcase_statuses(path: Path) -> dict[str, NodeIdStatus] | None:
     """``{junit id: status}`` for every testcase of the report at *path*; ``None`` when no report parsed.
@@ -1344,7 +1348,9 @@ def _junit_testcase_statuses(path: Path) -> dict[str, NodeIdStatus] | None:
     A ``<failure>`` is ``'fail'``. An ``<error>`` without one, a setup or
     teardown error, is ``'error'``: the test got no verdict. A test that never
     executed is ``'skipped'``; any other testcase ran and passed. Ids use the
-    spelling of :func:`_extract_test_ids_from_junit`.
+    spelling of :func:`_extract_test_ids_from_junit`. pytest writes a test that
+    fails and then errors in teardown as two testcases with one id; repeats
+    fold by ``_NODE_ID_STATUS_PRECEDENCE``, so that test stays ``'fail'``.
     """
     try:
         root = ET.parse(path).getroot()
@@ -1362,7 +1368,11 @@ def _junit_testcase_statuses(path: Path) -> dict[str, NodeIdStatus] | None:
             status = 'skipped'
         else:
             status = 'pass'
-        statuses[_junit_testcase_id(testcase)] = status
+        testcase_id = _junit_testcase_id(testcase)
+        prior = statuses.get(testcase_id)
+        statuses[testcase_id] = status if prior is None else min(
+            prior, status, key=_NODE_ID_STATUS_PRECEDENCE.index,
+        )
     return statuses
 
 
@@ -10874,10 +10884,6 @@ def _node_id_test_config(
 _NODE_ID_RUN_TIMEOUT_SECS: int = 300
 
 
-#: The status of a function id over its parametrizations: the first of these any of them has.
-_PARAMETRIZED_STATUS_PRECEDENCE: tuple[NodeIdStatus, ...] = ('fail', 'error', 'skipped', 'pass')
-
-
 def _node_id_statuses(
     report: Path, prefix: str, qualified_by_id: Mapping[str, str],
 ) -> dict[str, NodeIdStatus] | None:
@@ -10901,7 +10907,7 @@ def _node_id_statuses(
             if spellings & {testcase, testcase.partition('[')[0]}
         ]
         if named:
-            statuses[node_id] = min(named, key=_PARAMETRIZED_STATUS_PRECEDENCE.index)
+            statuses[node_id] = min(named, key=_NODE_ID_STATUS_PRECEDENCE.index)
     return statuses
 
 

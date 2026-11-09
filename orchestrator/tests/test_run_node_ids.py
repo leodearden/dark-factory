@@ -29,6 +29,12 @@ def broken_fixture():
     raise RuntimeError('setup fails')
 
 
+@pytest.fixture
+def broken_teardown():
+    yield
+    raise RuntimeError('teardown fails')
+
+
 def test_ok():
     pass
 
@@ -43,6 +49,14 @@ def test_skip():
 
 
 def test_setup_error(broken_fixture):
+    pass
+
+
+def test_fail_then_teardown_error(broken_teardown):
+    assert False
+
+
+def test_pass_then_teardown_error(broken_teardown):
     pass
 
 
@@ -71,6 +85,8 @@ OK = 'pkg/tests/test_probe.py::test_ok'
 BAD = 'pkg/tests/test_probe.py::test_bad'
 SKIP = 'pkg/tests/test_probe.py::test_skip'
 SETUP_ERROR = 'pkg/tests/test_probe.py::test_setup_error'
+FAIL_THEN_TEARDOWN_ERROR = 'pkg/tests/test_probe.py::test_fail_then_teardown_error'
+PASS_THEN_TEARDOWN_ERROR = 'pkg/tests/test_probe.py::test_pass_then_teardown_error'
 BOX_Z = 'pkg/tests/test_probe.py::TestBox::test_z'
 PARAM = 'pkg/tests/test_probe.py::test_p[a/b]'
 PARAMETRIZED_ALL_PASS = 'pkg/tests/test_probe.py::test_p'
@@ -133,8 +149,9 @@ def _module_config(prefix: str, test_command: str = 'pytest') -> ModuleConfig:
 def test_each_id_gets_its_own_status(tmp_path):
     tree = _make_tree(tmp_path)
     ids = [
-        OK, BAD, SKIP, SETUP_ERROR, PARAM, PARAMETRIZED_ALL_PASS, PARAMETRIZED_ONE_FAILS,
-        PARAMETRIZED_ONE_SKIPS, MODULE_RELATIVE_Z, ABSENT_FILE,
+        OK, BAD, SKIP, SETUP_ERROR, FAIL_THEN_TEARDOWN_ERROR, PASS_THEN_TEARDOWN_ERROR, PARAM,
+        PARAMETRIZED_ALL_PASS, PARAMETRIZED_ONE_FAILS, PARAMETRIZED_ONE_SKIPS, MODULE_RELATIVE_Z,
+        ABSENT_FILE,
     ]
 
     statuses = asyncio.run(run_node_ids(tree, _make_config(tree), [_module_config('pkg')], ids))
@@ -144,6 +161,8 @@ def test_each_id_gets_its_own_status(tmp_path):
         BAD: 'fail',
         SKIP: 'skipped',
         SETUP_ERROR: 'error',
+        FAIL_THEN_TEARDOWN_ERROR: 'fail',
+        PASS_THEN_TEARDOWN_ERROR: 'error',
         PARAM: 'pass',
         PARAMETRIZED_ALL_PASS: 'pass',
         PARAMETRIZED_ONE_FAILS: 'fail',
