@@ -273,6 +273,27 @@ test('signalCell: a done leaf with no served done kind shows no parenthesis', ()
   assert.equal(signalCell({ mark: 'delivered', cause: null, reason: null, leaves }).detail, 'a #1 done');
 });
 
+test('signalCell: an unbound_label mark puts its reason first, then each leaf, an unbound one with no id', () => {
+  const reason = "signal leaf bound to no task: label 'γ'";
+  const leaves = [
+    { label: 'γ', task_id: null, status: null, done_kind: null },
+    { label: 'δ', task_id: 1234, status: 'pending', done_kind: null },
+  ];
+  const { detail } = signalCell({ mark: 'unknown', cause: 'unbound_label', reason, leaves });
+  const expected = "signal leaf bound to no task: label 'γ'\nγ not in the store\nδ #1234 pending";
+  assert.equal(detail, expected);
+  assert.equal(figureTitle('RULE', detail), `${expected}\n\nRULE`);
+});
+
+test('signalCell: a leaf_not_in_store mark names the bound id of a leaf the store does not hold', () => {
+  const reason = "signal leaf task absent from the store: label 'γ' is bound to task 99";
+  const leaves = [{ label: 'γ', task_id: 99, status: null, done_kind: null }];
+  assert.equal(
+    signalCell({ mark: 'unknown', cause: 'leaf_not_in_store', reason, leaves }).detail,
+    "signal leaf task absent from the store: label 'γ' is bound to task 99\nγ #99 not in the store",
+  );
+});
+
 // ── (f) The contention line ──
 
 test('contentionEntryText: a held key names its holder and the holder\'s store status', () => {
