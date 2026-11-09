@@ -1301,7 +1301,7 @@ class TestTriageWriteFailsOpen:
             return verdict
 
         decision = await triage_write(
-            service, content='c', project_id='p', counter=counter, judge=_judge,
+            service, content=_RECORD_TEXT, project_id='p', counter=counter, judge=_judge,
         )
 
         assert decision.outcome == verdict
@@ -1704,13 +1704,13 @@ class TestTheDecisionDisclosesClippedCandidates:
         judge_fact = TruncationFact(field='judge_candidates', cap=2, elided=1)
 
         async def _judge(**_kwargs):
-            return TriageJudgeVerdict(OUTCOME_RESTATED, 'm0', truncation_facts=(judge_fact,))
+            return TriageJudgeVerdict(OUTCOME_AMENDED, 'm0', truncation_facts=(judge_fact,))
 
         results = [_result(f'm{i}', 0.75 - i / 1000) for i in range(3)]
 
         decision = await self._triage(self._service(results), judge=_judge)
 
-        assert decision.outcome == OUTCOME_RESTATED
+        assert decision.outcome == OUTCOME_AMENDED
         assert decision.truncation_facts == (self._RETRIEVAL_FACT, judge_fact)
 
 

@@ -35,7 +35,7 @@ regression; see :func:`retrieve_candidates` for the full reasoning. Use the
 seam, and pass the flags a candidate-set consumer needs.
 
 THE JUDGE SLOT IS FILLED. ``server/write_triage_judge.py`` (leaf gamma) is
-the real middle-band judge, and ``server/tools.py`` is the SINGLE place that
+the real judge of every judged write (see :func:`route_band`), and ``server/tools.py`` is the SINGLE place that
 wires it in as ``triage_write(..., judge=judge_write)``. The import direction
 is one-way and load-bearing: that module imports this one for the ``OUTCOME_*``
 constants, so this module must NEVER import it — making the real judge
@@ -178,7 +178,8 @@ ATTACH_OWNED_KEYS: frozenset[str] = frozenset({
 #: :data:`TRIAGE_FAIL_OPEN_KEY`.
 OUTCOME_STORED = 'stored'
 
-#: The write restates an existing memory and was attached to it as a sighting.
+#: The write repeats an existing memory near-verbatim, adding nothing, and was
+#: attached to it as a sighting (``server/near_verbatim.py`` holds the rule).
 OUTCOME_RESTATED = 'restated'
 
 #: The write adds to an existing memory and was attached as an amendment.
@@ -220,7 +221,7 @@ class JudgeUsage(NamedTuple):
 
 
 class TriageJudgeVerdict(NamedTuple):
-    """The middle-band judge's answer: a verdict and the candidate it is about.
+    """The judge's answer: a verdict and the candidate it is about.
 
     This is the judge's return contract, so it lives beside the outcomes it is
     drawn from. ``write_triage_judge`` imports it; this module never imports
@@ -949,7 +950,7 @@ async def _stub_judge(
     decision: BandDecision | None,
     candidates: Any = (),
 ) -> str:
-    """Middle-band adjudication — leaf gamma's ``write_triage_judge`` replaces this.
+    """Adjudication of a judged write — leaf gamma's ``write_triage_judge`` replaces this.
 
     Returns :data:`OUTCOME_STORED` unconditionally. That is a DELIBERATE STUB,
     explicitly NOT a fail-open event: it must never be routed through
@@ -1151,7 +1152,7 @@ async def _judge_band(
     content: str,
     project_id: str,
 ) -> BandDecision:
-    """The middle band's judge slot: the judged decision, or ``stored`` plus one counted fail-open."""
+    """The judge slot for a judged write: the judged decision, or ``stored`` plus one counted fail-open."""
     try:
         answer = await (judge or _stub_judge)(
             memory_service=memory_service,
@@ -1168,7 +1169,10 @@ async def _judge_band(
             # here -- one home for that decision.
             candidates=results,
         )
-        judged = _apply_judge_verdict(decision, answer, results)
+        judged = _file_judged_restatement(
+            _apply_judge_verdict(decision, answer, results),
+            content=content, results=results, project_id=project_id,
+        )
         _log_retarget(decision, judged, project_id)
         return judged
     except Exception as exc:  # C1: nothing escapes this path.
@@ -1328,6 +1332,29 @@ def _apply_judge_verdict(
         canonical_id=canonical_id_of(judged),
         judged_candidate_id=verdict.candidate_id,
     )
+
+
+def _file_judged_restatement(
+    decision: BandDecision,
+    *,
+    content: str,
+    results: Iterable[MemoryResult],
+    project_id: str,
+) -> BandDecision:
+    """A judged `restated` stands only when the write repeats its record near-verbatim; else it is `amended`.
+
+    A sighting's text is never shown to a reader of its parent, so a
+    restatement that adds anything would hide it. Filed `amended`, its text is
+    digested into the canonical's grouped document instead.
+    """
+    if decision.outcome != OUTCOME_RESTATED or _restates_verbatim(content, results, decision):
+        return decision
+    logger.info(
+        'write_triage judged restatement filed as amended: project=%s candidate=%r '
+        'canonical=%r — the write is not near-verbatim (task 7155)',
+        project_id, decision.attach_source_id, decision.canonical_id,
+    )
+    return replace(decision, outcome=OUTCOME_AMENDED)
 
 
 def _judge_verdict_of(answer: object) -> TriageJudgeVerdict:

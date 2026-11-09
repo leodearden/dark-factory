@@ -1122,7 +1122,7 @@ async def judge_write(
     decision: Any,
     candidates: Any = (),
 ) -> TriageJudgeVerdict:
-    """Adjudicate one middle-band write, naming the candidate the verdict is about.
+    """Adjudicate one judged write, naming the candidate the verdict is about.
 
     This is what ``tools.py`` passes as ``triage_write(..., judge=...)``,
     replacing leaf beta's ``_stub_judge``. The signature is beta's, plus the
@@ -1189,7 +1189,7 @@ async def judge_write(
         # decision, not a failure.
         logger.info(
             'write_triage judge disabled by config '
-            '(write_triage.judge_enabled=false); middle-band write acked as '
+            '(write_triage.judge_enabled=false); judged write acked as '
             '%r without an LLM call',
             OUTCOME_STORED,
         )

@@ -76,11 +76,14 @@ def _result(
 
 
 def _middle_band_slate(**m3_metadata) -> list[MemoryResult]:
-    """Four candidates, all inside [t_low, t_high); the band's winner is m1."""
+    """Four candidates, all inside [t_low, t_high); the band's winner is m1.
+
+    m3 repeats the write verbatim, so a judge's `restates` naming it stands.
+    """
     return [
         _result('m1', 0.85),
         _result('m2', 0.83),
-        _result('m3', 0.80, extra_metadata=m3_metadata or None),
+        _result('m3', 0.80, content=_WRITE, extra_metadata=m3_metadata or None),
         _result('m4', 0.78),
     ]
 
@@ -388,7 +391,7 @@ async def _add_memory(
     monkeypatch.setattr(tools, 'TriageFailOpenCounter', lambda: counter)
     with patch('openai.AsyncOpenAI', return_value=_provider_answering(answer)):
         ack = await create_mcp_server(service)._tool_manager.call_tool('add_memory', {
-            'content': 'the new entry',
+            'content': _WRITE,
             'category': 'procedural_knowledge',
             'agent_id': 'claude-interactive',
             'project_id': 'dark_factory',
