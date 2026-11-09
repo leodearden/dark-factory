@@ -1185,20 +1185,12 @@ def build_method(
 ) -> dict[str, Any]:
     """The JSON-safe ``## Method`` block: the seven keys of the
     quality-findings contract §5, then ``extra``
-    (plans/census-incremental-prd.md §4.3), which carries
-    *verify_normalisations*: the verdict repairs per kind (§4.4), the
-    *reverify* counts of the outcome feedback (L5, D8), whose offered
-    re-verifies *verify_calls* includes, and the pre-screen's per-rule
-    *screened* counts (L6), and the similarity stage's *adjudication*
-    counts (L7), whose embedding requests are *embedding_calls*, and
-    *slug_tally*, the merge's ``invariant_violated`` screen
-    (codebook.SlugTally), recorded as ``slug_rejections`` (§4.3 C3).
-    *inputs_consumed* are the run ids of the other
-    instruments' records the pre-screen read, and *inputs_consumed_note*
-    says why any gave it none. *selection* is ``None`` for a
-    run with no mining window, which nulls the evidence and ledger fields it
-    would have supplied; an unreadable ledger counts ``ledger_rows`` and
-    ``ledger_pruned`` as ``None``, never 0."""
+    (plans/census-incremental-prd.md §4.3). *verify_calls* includes the
+    offered re-verifies counted in *reverify*, and *inputs_consumed* are the
+    run ids of the other instruments' records the pre-screen read.
+    *selection* is ``None`` for a run with no mining window, which nulls the
+    evidence and ledger fields it would have supplied; an unreadable ledger
+    counts ``ledger_rows`` and ``ledger_pruned`` as ``None``, never 0."""
     return {
         "run_id": run_id,
         "as_of_sha": as_of_sha,
