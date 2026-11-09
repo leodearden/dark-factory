@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import itertools
 import json
 import math
 import os
@@ -26,7 +27,7 @@ from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 from fused_memory.config.schema import TaskmasterConfig
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.reconciliation.event_buffer import EventBuffer
-from fused_memory.server.tools import create_mcp_server
+from fused_memory.server.tools import RESULT_BYTE_BUDGET, create_mcp_server
 from shared.testing_mcp_stub import StubMcpServer
 
 RUN = 'review-dark_factory-20261109-1'
@@ -307,10 +308,13 @@ class Recording:
     def __init__(self, call_tool: CallTool) -> None:
         self._call_tool = call_tool
         self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.replies: list[Mapping[str, Any]] = []
 
     def __call__(self, name: str, arguments: Mapping[str, Any]) -> Mapping[str, Any]:
         self.calls.append((name, dict(arguments)))
-        return self._call_tool(name, arguments)
+        reply = self._call_tool(name, arguments)
+        self.replies.append(reply)
+        return reply
 
 
 def recording(call_tool: CallTool) -> Recording:
@@ -876,3 +880,64 @@ def test_an_interim_chain_is_listed_with_its_human_gate(store):
     assert reported['completion_gate'] is None
     assert reported['verdict'] is None
     assert reported['human_gate'] == {'id': chain.human, 'status': 'pending'}
+
+
+# ── --pending under the lookup's byte budget ──
+
+SKILLS = ('review', 'hotspot-survey', 'review-all')
+
+
+def _seed_padded_chains(store: FixtureStore) -> list[str]:
+    run_ids = [f'{skill}-proj-20261109' for skill in SKILLS]
+    for skill, run_id in zip(SKILLS, run_ids, strict=True):
+        seed_chain(store, skill=skill, run_id=run_id, pad='p' * 20000)
+    return run_ids
+
+
+def test_a_row_over_the_byte_budget_is_re_read_not_dropped(store):
+    pad = 'p' * 60000
+    assert len(json.dumps(pad)) > RESULT_BYTE_BUDGET
+    store.seed_run(RUN, ('high', 'pending'), ('medium', 'done'), ('low', 'done'))
+    chain = seed_chain(store, pad=pad)
+    elided = store.call_tool(LOOKUP, {
+        'project_root': store.root, 'key': 'trigger_chain', 'include_value': True, 'limit': 100,
+    })
+    assert elided['results'][0]['truncated_value'] is True
+
+    checked = check(store)
+    document = pending_json(store, store.root)
+
+    [project] = document['projects']
+    assert project['unreadable_task_ids'] == []
+    reported = _only_chain(document)
+    assert (reported['skill'], reported['run_id']) == ('review', RUN)
+    assert reported['completion_gate']['id'] == chain.gate
+    assert reported['human_gate'] == {'id': chain.human, 'status': 'pending'}
+    assert reported['verdict'] == checked.verdict
+
+
+def test_chains_spread_over_budget_limited_pages_are_all_listed(store):
+    run_ids = _seed_padded_chains(store)
+
+    [project] = pending_json(store, store.root)['projects']
+
+    assert sorted(chain['run_id'] for chain in project['chains']) == sorted(run_ids)
+    assert project['unreadable_task_ids'] == []
+
+
+def test_the_chain_lookup_pages_by_each_pages_returned_count(store):
+    run_ids = _seed_padded_chains(store)
+    calls = recording(store.call_tool)
+
+    [report] = crc.read_pending([store.root], call_tool=calls)
+
+    assert sorted(chain.run_id for chain in report.chains) == sorted(run_ids)
+    pages = [
+        (arguments['offset'], reply['pagination']['returned'])
+        for (name, arguments), reply in zip(calls.calls, calls.replies, strict=True)
+        if name == LOOKUP and arguments['key'] == 'trigger_chain' and arguments.get('include_value')
+    ]
+    assert len(pages) > 1
+    assert pages[0][0] == 0
+    for (offset, returned), (next_offset, _) in itertools.pairwise(pages):
+        assert next_offset == offset + returned
