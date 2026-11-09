@@ -50,6 +50,7 @@ from orchestrator.escalation_router import (
     exit_kind_for,
     hold_note,
     read_hold,
+    read_reviewer_mark,
     reviewer_note_refusal,
     reviewer_notes,
     router_owns,
@@ -1047,7 +1048,7 @@ class TestApplyReviewerDisposition:
         }
         assert curator.calls == []
 
-    def test_work_leaves_the_note_pending_for_the_exit_router(
+    def test_work_leaves_the_note_pending_and_marked_for_the_exit_router(
         self, queue, events, ports, curator,
     ):
         record = _seed(queue)
@@ -1056,7 +1057,9 @@ class TestApplyReviewerDisposition:
 
         assert (applied.outcome, applied.reason) == (Outcome.DEFERRED, 'work')
         after = _current(queue, record.id)
-        assert (after.status, after.triaged_by, after.resolution) == ('pending', None, None)
+        assert (after.status, after.resolution) == ('pending', None)
+        assert read_reviewer_mark(after) is ReviewerDisposition.WORK
+        assert read_hold(after) is None
         (row,) = _dispositions(events)
         assert (row['data']['class'], row['data']['reason']) == ('defer', 'work')
         assert (row['data']['by'], row['data']['exit_kind']) == (REVIEWER_LEG_ID, None)

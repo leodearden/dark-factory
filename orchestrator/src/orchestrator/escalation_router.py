@@ -136,6 +136,33 @@ def read_hold(record: Escalation) -> RouterHold | None:
         return None
 
 
+_REVIEWER_MARK_PREFIX = 'reviewer verdict: '
+
+
+def reviewer_mark_note(disposition: ReviewerDisposition, rationale: str) -> str:
+    return _REVIEWER_MARK_PREFIX + json.dumps(
+        {'disposition': str(disposition), 'rationale': rationale},
+    )
+
+
+def read_reviewer_mark(record: Escalation) -> ReviewerDisposition | None:
+    """The reviewer's standing verdict on *record*, or None; the only parser of ``reviewer_mark_note``."""
+    if record.triaged_by != REVIEWER_LEG_ID:
+        return None
+    note = record.triage_note or ''
+    try:
+        if not note.startswith(_REVIEWER_MARK_PREFIX):
+            raise ValueError('note does not carry the reviewer-mark prefix')
+        return ReviewerDisposition(json.loads(note.removeprefix(_REVIEWER_MARK_PREFIX))['disposition'])
+    except (ValueError, TypeError, KeyError) as exc:
+        logger.warning(
+            'info-l0-router: %s is stamped by the reviewer but its triage note is not a '
+            'reviewer mark (%s); it will be routed without it. note=%r',
+            record.id, exc, note[:200],
+        )
+        return None
+
+
 @dataclass(frozen=True)
 class Converted:
     task_id: str
@@ -642,6 +669,12 @@ def _apply_reviewer(
         case ReviewerDisposition.NO_ACTION:
             resolution_class = ObservationConsumed.resolution_class
         case ReviewerDisposition.WORK:
+            marked = ports.queue.stamp_triage(
+                note.escalation_id, triaged_by=REVIEWER_LEG_ID,
+                triage_note=reviewer_mark_note(note.disposition, note.rationale),
+            )
+            if marked is None:
+                return Applied(note.escalation_id, Outcome.ALREADY_TERMINAL)
             return Applied(note.escalation_id, Outcome.DEFERRED, reason=str(note.disposition))
         case _:
             assert_never(note.disposition)
@@ -681,6 +714,7 @@ class InfoL0Sweep:
             decided = route_info_l0(
                 current, task_status=task_status, exit_kind=exit_kind,
                 mechanical_roles=INFO_L0_MECHANICAL_ROLES,
+                reviewer_disposition=read_reviewer_mark(current),
             )
         except Exception:
             logger.exception('info-l0-router: deciding %s failed (by=%s)', current.id, self._by)

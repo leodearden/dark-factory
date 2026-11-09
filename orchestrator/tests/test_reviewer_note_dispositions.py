@@ -337,6 +337,21 @@ class TestReviewLoopAppliesDispositions:
         assert hold is not None and hold.ticket == 'tkt_1'
         assert len(run.curator.calls_named('submit_task')) == 1
 
+    async def test_work_overrides_the_authors_no_action_declaration_at_the_exit(
+        self, tmp_path, monkeypatch,
+    ):
+        stub = _DispositioningStub()
+        run = _FullRun(tmp_path, monkeypatch, stub)
+        note = _file_note(run.queue, suggested_action='no action needed for this task')
+        stub.note_dispositions = [_disposition(note.id, 'work')]
+
+        assert await run.run() == WorkflowOutcome.DONE
+
+        _reviewer_row, finalizer_row = run.rows(note.id)
+        assert (finalizer_row['class'], finalizer_row['exit_kind']) == ('convert-pending', 'done')
+        assert run.current(note).status == 'pending'
+        assert len(run.curator.calls_named('submit_task')) == 1
+
     async def test_a_disposition_of_a_note_the_reviewer_was_not_shown_is_rejected(
         self, tmp_path, monkeypatch,
     ):
