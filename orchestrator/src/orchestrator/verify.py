@@ -2960,6 +2960,8 @@ class _JunitReportPlan:
     - ``'attributing'``: a merge verify at full breadth. One leg-level report,
       parsed into ``VerifyResult.failing_test_ids`` and archived. Never
       written per segment (task 3478).
+    - A caller-named report is ``'attributing'`` at the caller's path, whatever
+      the role and breadth.
     - ``'cost'``: a task verify with an archive destination. Archived, never
       parsed, so task-path attribution is unchanged. A segmented leg writes
       one per segment instead, at :meth:`segment_path`.
@@ -2992,10 +2994,14 @@ class _JunitReportPlan:
         attempt_id: 'int | None',
         task_id: 'str | None',
         archive_root: 'Path | None',
+        report: 'Path | None' = None,
     ) -> '_JunitReportPlan':
         kind: Literal['attributing', 'cost'] | None = None
         leg_path: Path | None = None
-        if role == 'merge' and merge_breadth_full:
+        if report is not None:
+            kind = 'attributing'
+            leg_path = report
+        elif role == 'merge' and merge_breadth_full:
             kind = 'attributing'
             # Shape-2 husk guard (task 2922): None, rather than re-creating a
             # torn-down worktree as an empty husk for a late writer.
@@ -7145,8 +7151,13 @@ async def run_verification(
     role: Literal['merge', 'task', 'background'] = 'task',
     segment_chained_test: bool = False,
     admission_request: AdmissionRequest | None = None,
+    junit_report: Path | None = None,
 ) -> VerifyResult:
     """Run test suite, linter, and type checker. Return structured result.
+
+    A caller-named *junit_report* is injected into the test leg at the existing
+    chokepoint, cleared before each pytest invocation, and parsed into
+    ``failing_test_ids``/``skipped_test_ids``.
 
     *admission_request* places the gated test leg in the admission gate's
     order (task 5628). A caller verifying several modules as one plan passes
@@ -7259,6 +7270,7 @@ async def run_verification(
         attempt_id=attempt_id,
         task_id=task_id,
         archive_root=archive_root,
+        report=junit_report,
     )
 
     if is_merge_verify:
