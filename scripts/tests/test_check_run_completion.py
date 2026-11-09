@@ -941,3 +941,17 @@ def test_the_chain_lookup_pages_by_each_pages_returned_count(store):
     assert pages[0][0] == 0
     for (offset, returned), (next_offset, _) in itertools.pairwise(pages):
         assert next_offset == offset + returned
+
+
+def test_a_failed_re_read_marks_the_project_an_error(store):
+    seed_chain(store, pad='p' * 60000)
+
+    def refusing_get_task(name: str, arguments: Mapping[str, Any]) -> Mapping[str, Any]:
+        if name == 'get_task':
+            return {'error': 'gone', 'error_type': 'TaskNotFoundError'}
+        return store.call_tool(name, arguments)
+
+    [report] = crc.read_pending([store.root], call_tool=refusing_get_task)
+
+    assert report.state is crc.ProjectState.ERROR
+    assert report.error is not None and 'get_task' in report.error and 'gone' in report.error

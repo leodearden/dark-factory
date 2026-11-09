@@ -564,12 +564,23 @@ def _get_task(call_tool: CallTool, project_root: str, task_id: int) -> tuple[str
     return status, metadata
 
 
-def _chain_links(rows: Iterable[Mapping[str, Any]]) -> tuple[tuple[_ChainLink, ...], tuple[int, ...]]:
+def _whole_chain_value(call_tool: CallTool, project_root: str, row: Mapping[str, Any]) -> object:
+    """The row's whole trigger_chain; one the lookup's byte budget elided is re-read with get_task."""
+    if row.get('truncated_value') is not True:
+        return row.get('matched_value')
+    _, metadata = _get_task(call_tool, project_root, row['task_id'])
+    return metadata.get(TRIGGER_CHAIN_KEY)
+
+
+def _chain_links(
+    call_tool: CallTool, project_root: str, rows: Iterable[Mapping[str, Any]],
+) -> tuple[tuple[_ChainLink, ...], tuple[int, ...]]:
     links: list[_ChainLink] = []
     unreadable: list[int] = []
     for row in rows:
+        value = _whole_chain_value(call_tool, project_root, row)
         try:
-            links.append(_ChainLink(row, TriggerChain.model_validate(row.get('matched_value'))))
+            links.append(_ChainLink(row, TriggerChain.model_validate(value)))
         except (ValidationError, TypeError):
             unreadable.append(row['task_id'])
     return tuple(links), tuple(unreadable)
@@ -654,7 +665,7 @@ def _read_project(call_tool: CallTool, project_root: str) -> ProjectReport:
     rows, _ = _lookup_pages(call_tool, arguments)
     if not rows:
         return _without_active_chains(call_tool, project_root)
-    links, unreadable = _chain_links(rows)
+    links, unreadable = _chain_links(call_tool, project_root, rows)
     chains = tuple(
         _chain_report(call_tool, project_root, chain, roles) for chain, roles in _open_chains(links).items()
     )
