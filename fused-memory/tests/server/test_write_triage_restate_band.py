@@ -9,34 +9,49 @@ the routing ``triage_write`` acts on.
 
 from __future__ import annotations
 
+import json
+import logging
 import types
 from dataclasses import replace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _sdk_client_stubs import sdk_client_double
 
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.memory import MemoryResult
-from fused_memory.server.grouped_read import PARENT_ID_KEY, SIGHTING_KIND
+from fused_memory.server import tools
+from fused_memory.server.grouped_read import AMENDMENT_KIND, PARENT_ID_KEY, SIGHTING_KIND
+from fused_memory.server.tools import create_mcp_server
 from fused_memory.server.write_triage import (
+    CANONICAL_ID_KEY,
     OUTCOME_AMENDED,
     OUTCOME_JUDGE,
     OUTCOME_RESTATED,
     OUTCOME_STORED,
+    ROUTED_KEY,
     AttachRefusal,
     BandDecision,
     TriageFailOpenCounter,
     TriageJudgeVerdict,
+    canonical_id_of,
     decide_band,
     route_band,
     triage_write,
 )
-from fused_memory.server.write_triage_judge import select_judge_candidates
+from fused_memory.server.write_triage_judge import (
+    CANDIDATE_ID_KEY,
+    VERDICT_KEY,
+    select_judge_candidates,
+)
 from fused_memory.services.memory_service import RRF_K, SearchResults
+from server.write_triage_harness import configure_triage_config, search_candidate
 
 _T_HIGH = 0.90
 _T_LOW = 0.70
 _PROJECT = 'proj-7155'
+_TRIAGE_LOGGER = 'fused_memory.server.write_triage'
+_REFILED_PREFIX = 'write_triage judged restatement filed as amended'
 
 _WRITE = 'The nightly verify of the ledger service finishes in 14m22s on the shared build host.'
 _WRITE_REFLOWED = 'the nightly verify of the ledger service\nfinishes in 14m22s   on the shared build host.'
@@ -213,3 +228,132 @@ class TestAHighBandWriteIsAJudgedWrite:
         judge.assert_awaited_once()
         assert decision.outcome == OUTCOME_STORED
         assert decision.attach_refusals == {AttachRefusal.HOIST_COSINE_GAP}
+
+
+class TestAJudgedRestatementThatAddsSomethingIsFiledAmended:
+
+    @staticmethod
+    def _slate(winner_cosine: float, *, m2_content: str = _PARAPHRASE) -> list[MemoryResult]:
+        """The band winner m1, and m2: a sighting child of p2, which is not on the slate."""
+        return [
+            _result('m1', winner_cosine, content='an unrelated record about the hook'),
+            _result('m2', 0.80, content=m2_content, extra_metadata=_sighting_of('p2')),
+        ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('winner_cosine', [0.97, 0.85], ids=['high-band', 'middle-band'])
+    async def test_a_restates_verdict_on_a_write_that_is_not_near_verbatim_is_amended(
+        self, winner_cosine: float,
+    ) -> None:
+        slate = self._slate(winner_cosine)
+        judge = AsyncMock(return_value=TriageJudgeVerdict(OUTCOME_RESTATED, 'm2'))
+        counter = _counter()
+
+        decision = await _triage(_svc(slate), judge, counter)
+
+        assert decision.outcome == OUTCOME_AMENDED
+        assert decision.canonical_id == canonical_id_of(slate[1]) == 'p2'
+        assert decision.judged_candidate_id == 'm2'
+        assert counter.live_count() == 0
+
+    @pytest.mark.asyncio
+    async def test_a_restates_verdict_on_a_near_verbatim_write_stays_restated(self) -> None:
+        slate = self._slate(0.85, m2_content=_WRITE_REFLOWED)
+        judge = AsyncMock(return_value=TriageJudgeVerdict(OUTCOME_RESTATED, 'm2'))
+
+        decision = await _triage(_svc(slate), judge, _counter())
+
+        assert decision.outcome == OUTCOME_RESTATED
+        assert decision.canonical_id == 'p2'
+
+    @pytest.mark.asyncio
+    async def test_a_bare_word_restated_is_checked_against_the_band_winner(self) -> None:
+        slate = [_result('m1', 0.97, content=_PARAPHRASE), _result('m2', 0.80, content=_WRITE)]
+        judge = AsyncMock(return_value=OUTCOME_RESTATED)
+
+        decision = await _triage(_svc(slate), judge, _counter())
+
+        assert decision.outcome == OUTCOME_AMENDED
+        assert decision.canonical_id == 'm1'
+
+    @pytest.mark.asyncio
+    async def test_a_refiled_restatement_is_one_info_line(self, caplog) -> None:
+        judge = AsyncMock(return_value=TriageJudgeVerdict(OUTCOME_RESTATED, 'm2'))
+        caplog.set_level(logging.INFO, logger=_TRIAGE_LOGGER)
+
+        await _triage(_svc(self._slate(0.97)), judge, _counter())
+
+        [line] = [
+            record for record in caplog.records
+            if record.name == _TRIAGE_LOGGER and record.getMessage().startswith(_REFILED_PREFIX)
+        ]
+        assert line.levelno == logging.INFO
+        message = line.getMessage()
+        for fragment in (_PROJECT, "'m2'", "'p2'", 'not near-verbatim'):
+            assert fragment in message, (fragment, message)
+
+
+def _model_answering(answer: dict) -> MagicMock:
+    """A fake ``AsyncOpenAI`` whose Responses API answers *answer*: only the model is faked."""
+    client = sdk_client_double()
+    client.responses.create = AsyncMock(return_value=types.SimpleNamespace(
+        output_text=json.dumps(answer),
+        status='completed',
+        incomplete_details=None,
+        usage=types.SimpleNamespace(
+            input_tokens=900, output_tokens=60,
+            output_tokens_details=types.SimpleNamespace(reasoning_tokens=40),
+        ),
+    ))
+    return client
+
+
+async def _add_memory(content: str, model: MagicMock, monkeypatch) -> tuple[dict, dict, TriageFailOpenCounter]:
+    """Write *content* through the tool against one 0.97 candidate m1; return the ack, the child's metadata, the counter."""
+    service = AsyncMock()
+    configure_triage_config(service, judge_enabled=True)
+    written = MagicMock()
+    written.model_dump.return_value = {
+        'id': 'new-id', 'category': 'procedural_knowledge', 'stored_in': ['mem0'],
+    }
+    service.add_memory.return_value = written
+    service.search.return_value = SearchResults([search_candidate('m1', 0.97, content=_WRITE)])
+    counter = _counter()
+    monkeypatch.setattr(tools, 'TriageFailOpenCounter', lambda: counter)
+    with patch('openai.AsyncOpenAI', return_value=model):
+        ack = await create_mcp_server(service)._tool_manager.call_tool('add_memory', {
+            'content': content,
+            'category': 'procedural_knowledge',
+            'agent_id': 'claude-interactive',
+            'project_id': _PROJECT,
+        })
+    persisted = service.add_memory.await_args.kwargs.get('metadata') or {}
+    return ack, persisted, counter
+
+
+class TestAddMemoryAcksRestatedOnlyForAWriteThatAddsNothing:
+
+    @pytest.mark.asyncio
+    async def test_a_high_band_paraphrase_the_model_calls_a_restatement_is_an_amendment(
+        self, monkeypatch,
+    ) -> None:
+        model = _model_answering({VERDICT_KEY: 'restates', CANDIDATE_ID_KEY: 'm1'})
+
+        ack, persisted, counter = await _add_memory(_PARAPHRASE, model, monkeypatch)
+
+        model.responses.create.assert_awaited_once()
+        assert ack[ROUTED_KEY] == OUTCOME_AMENDED, f'{ack!r}'
+        assert ack[CANONICAL_ID_KEY] == 'm1', f'{ack!r}'
+        assert persisted['kind'] == AMENDMENT_KIND, f'{persisted!r}'
+        assert counter.live_count() == 0
+
+    @pytest.mark.asyncio
+    async def test_a_verbatim_repeat_is_a_sighting_without_asking_the_model(self, monkeypatch) -> None:
+        model = _model_answering({VERDICT_KEY: 'amends', CANDIDATE_ID_KEY: 'm1'})
+
+        ack, persisted, _ = await _add_memory(_WRITE, model, monkeypatch)
+
+        model.responses.create.assert_not_awaited()
+        assert ack[ROUTED_KEY] == OUTCOME_RESTATED, f'{ack!r}'
+        assert ack[CANONICAL_ID_KEY] == 'm1', f'{ack!r}'
+        assert persisted['kind'] == SIGHTING_KIND, f'{persisted!r}'
