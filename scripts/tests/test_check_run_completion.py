@@ -632,6 +632,24 @@ def test_a_usage_error_exits_two_with_no_verdict(args):
     assert 'usage:' in run.stderr
 
 
+PENDING_OPTION_HELP = 'report the open trigger chains instead'
+
+
+@pytest.mark.parametrize('args', [
+    ['--help'],
+    ['-h'],
+    ['--run', RUN, '--threshold', '0.7', '--project-root', '/tmp', '--help'],
+    ['--pending', '--help'],
+], ids=['help', 'h', 'check_with_help', 'pending_with_help'])
+def test_help_in_check_mode_could_not_check(args):
+    run = run_script(*args, url=_closed_port_url())
+
+    assert run.rc == COULD_NOT_CHECK
+    assert run.lines == []
+    assert 'usage:' in run.stderr
+    assert PENDING_OPTION_HELP in run.stderr
+
+
 def test_the_script_is_an_executable_python3_predicate():
     assert os.access(SCRIPT, os.X_OK)
     assert SCRIPT.read_text().splitlines()[0] == '#!/usr/bin/env python3'
@@ -667,6 +685,7 @@ def seed_chain(
     human_status: str = 'pending',
     root: str | None = None,
     pad: str | None = None,
+    args: list[str] | None = None,
 ) -> Chain:
     """A final-form chain as skills/_shared/filing-the-trigger-chain.md §3 files it."""
     project = root or store.root
@@ -680,7 +699,7 @@ def seed_chain(
             'kind': 'predicate',
             'script': 'scripts/check_run_completion.py',
             'script_root': 'factory',
-            'args': ['--run', run_id, '--threshold', threshold, '--project-root', project],
+            'args': args if args is not None else ['--run', run_id, '--threshold', threshold, '--project-root', project],
             'timeout_secs': 120,
             'recheck_secs': 86400,
         },
@@ -880,6 +899,45 @@ def test_an_interim_chain_is_listed_with_its_human_gate(store):
     assert reported['completion_gate'] is None
     assert reported['verdict'] is None
     assert reported['human_gate'] == {'id': chain.human, 'status': 'pending'}
+
+
+ASKING_FOR_HELP = pytest.mark.parametrize(
+    'help_args', [['--help'], ['-h'], ['--he']], ids=['help', 'h', 'abbreviated'],
+)
+
+
+def _seed_a_gate_asking_for_help(store: FixtureStore, help_args: list[str]) -> Chain:
+    store.seed_run(RUN, ('high', 'pending'), ('medium', 'done'), ('low', 'done'))
+    seed_chain(store)
+    store.seed_run(OTHER_RUN, ('low', 'done'))
+    return seed_chain(store, skill='hotspot-survey', run_id=OTHER_RUN, args=help_args)
+
+
+@ASKING_FOR_HELP
+def test_a_gate_asking_for_help_is_unreadable_not_the_whole_report(store, help_args):
+    helped = _seed_a_gate_asking_for_help(store, help_args)
+
+    checked = check(store)
+    run = pending(store, store.root)
+
+    assert run.rc == 0, run
+    _line_with(run, f'share {checked.verdict["share"]}')
+    assert 'unreadable' in _line_with(run, f'completion gate {helped.gate}:')
+    assert not any('usage:' in line or PENDING_OPTION_HELP in line for line in run.lines)
+
+
+@ASKING_FOR_HELP
+def test_a_gate_asking_for_help_is_unreadable_in_the_json_report(store, help_args):
+    _seed_a_gate_asking_for_help(store, help_args)
+
+    checked = check(store)
+    [project] = pending_json(store, store.root)['projects']
+
+    chains = {chain['run_id']: chain for chain in project['chains']}
+    assert chains[OTHER_RUN]['completion_gate']['threshold'] is None
+    assert chains[OTHER_RUN]['completion_gate']['threshold_unreadable']
+    assert chains[OTHER_RUN]['verdict'] is None
+    assert chains[RUN]['verdict'] == checked.verdict
 
 
 # ── --pending under the lookup's byte budget ──
