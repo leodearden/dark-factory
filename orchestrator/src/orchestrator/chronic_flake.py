@@ -900,21 +900,23 @@ class SchedulerChronicFlakeTaskClient:
         return _extract_task(result)
 
     async def find_tasks_by_metadata(
-        self, key: str, value: str, statuses: Sequence[str],
+        self, key: str, value: str | None, statuses: Sequence[str], *, include_value: bool = False,
     ) -> tuple[list[dict], Exception | None]:
         """Every task in one of *statuses* whose top-level metadata *key* holds *value*,
         read page by page via ``dispatch_tool('find_tasks_by_metadata', ...)``.
 
+        A ``None`` *value* is a presence lookup, and *include_value* adds each row's
+        ``matched_value``; neither alters the wire of a call that omits them.
         An empty list is an answer (no such task), so a failure is reported in band as
         ``([], error)``: never a partial list, and never a raise, like its siblings.
         """
-        arguments = {
-            'project_root': self._project_root,
-            'key': key,
-            'value': value,
-            'statuses': list(statuses),
-            'limit': _METADATA_LOOKUP_PAGE,
-        }
+        arguments: dict = {'project_root': self._project_root, 'key': key}
+        if value is not None:
+            arguments['value'] = value
+        arguments['statuses'] = list(statuses)
+        arguments['limit'] = _METADATA_LOOKUP_PAGE
+        if include_value:
+            arguments['include_value'] = True
         rows: list[dict] = []
         has_more = True
         while has_more:
@@ -935,7 +937,7 @@ class SchedulerChronicFlakeTaskClient:
         except Exception as exc:
             logger.warning(
                 'chronic_flake: find_tasks_by_metadata dispatch failed for %s=%s',
-                arguments['key'], arguments['value'], exc_info=True,
+                arguments['key'], arguments.get('value'), exc_info=True,
             )
             return [], False, exc
         return _extract_metadata_matches(result)
