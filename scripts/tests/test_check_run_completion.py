@@ -226,6 +226,7 @@ class FixtureStore:
     """
 
     def __init__(self, tmp_path: Path) -> None:
+        self._tmp_path = tmp_path
         self.root = _git_root(tmp_path / 'project')
         self._seeded = 0
         self._loop = asyncio.new_event_loop()
@@ -261,11 +262,15 @@ class FixtureStore:
         ))
         return int(added['id'])
 
-    def seed_run(self, run_id: str, *spec: tuple[str | None, str]) -> list[int]:
+    def seed_run(self, run_id: str, *spec: tuple[str | None, str], root: str | None = None) -> list[int]:
         return [
-            self.seed(priority=priority, status=status, metadata={crc.FINDING_RUN_KEY: run_id})
+            self.seed(priority=priority, status=status, metadata={crc.FINDING_RUN_KEY: run_id}, root=root)
             for priority, status in spec
         ]
+
+    def another_root(self, name: str) -> str:
+        """A second project served by the same backend and tools, as one fused-memory serves many."""
+        return _git_root(self._tmp_path / name)
 
     def call_tool(self, name: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
         answer = self._run(self._server.call_tool(name, dict(arguments)))
@@ -478,10 +483,10 @@ class ScriptRun:
         return self.lines[:-1]
 
 
-def run_script(*args: str, url: str) -> ScriptRun:
+def run_script(*args: str, url: str, env: Mapping[str, str] | None = None) -> ScriptRun:
     done = subprocess.run(
         [sys.executable, '-s', str(SCRIPT), *args],
-        env={**os.environ, 'FUSED_MEMORY_MCP_URL': url},
+        env={**os.environ, **(env or {}), 'FUSED_MEMORY_MCP_URL': url},
         capture_output=True,
         text=True,
         timeout=_SCRIPT_TIMEOUT_SECS,
@@ -626,3 +631,248 @@ def test_a_usage_error_exits_two_with_no_verdict(args):
 def test_the_script_is_an_executable_python3_predicate():
     assert os.access(SCRIPT, os.X_OK)
     assert SCRIPT.read_text().splitlines()[0] == '#!/usr/bin/env python3'
+
+
+# ── The --pending report over open trigger chains ──
+
+NEXT_CHECK = '2026-11-10T09:00:00+00:00'
+FIRST_REARMED = '2026-11-08T09:00:00+00:00'
+LAST_CHECKED = '2026-11-09T09:00:00+00:00'
+NEXT_RUN = 'review-dark_factory-20261110-1'
+
+
+@dataclass(frozen=True)
+class Chain:
+    gate: int | None
+    human: int
+
+
+def _chain_link(role: str, skill: str, run_id: str, superseded_by: str | None) -> dict[str, Any]:
+    return {'role': role, 'skill': skill, 'run_id': run_id, 'superseded_by': superseded_by}
+
+
+def seed_chain(
+    store: FixtureStore,
+    *,
+    skill: str = 'review',
+    run_id: str = RUN,
+    threshold: str = '0.7',
+    streak: int | None = None,
+    superseded_by: str | None = None,
+    gate_status: str = 'pending',
+    human_status: str = 'pending',
+    root: str | None = None,
+    pad: str | None = None,
+) -> Chain:
+    """A final-form chain as skills/_shared/filing-the-trigger-chain.md §3 files it."""
+    project = root or store.root
+    link = _chain_link('completion_gate', skill, run_id, superseded_by)
+    if pad is not None:
+        link['pad'] = pad
+    gate_metadata: dict[str, Any] = {
+        'trigger_chain': link,
+        'milestone': {'mode': 'dated', 'at': NEXT_CHECK},
+        'before_done': {
+            'kind': 'predicate',
+            'script': 'scripts/check_run_completion.py',
+            'script_root': 'factory',
+            'args': ['--run', run_id, '--threshold', threshold, '--project-root', project],
+            'timeout_secs': 120,
+            'recheck_secs': 86400,
+        },
+    }
+    if streak is not None:
+        gate_metadata['predicate_recheck'] = {
+            'consecutive': streak,
+            'first_rearmed_at': FIRST_REARMED,
+            'last_checked_at': LAST_CHECKED,
+            'next_check_at': NEXT_CHECK,
+        }
+    gate = store.seed(priority='high', status=gate_status, metadata=gate_metadata, root=project)
+    human_link = _chain_link('human_gate', skill, run_id, superseded_by)
+    if pad is not None:
+        human_link['pad'] = pad
+    human = store.seed(
+        priority='high', status=human_status, root=project,
+        metadata={'trigger_chain': human_link, 'always_escalates': True},
+    )
+    return Chain(gate, human)
+
+
+def seed_interim_chain(store: FixtureStore, *, run_id: str = RUN) -> Chain:
+    """The interim form (§4): one human gate on a delayed milestone, no completion gate."""
+    human = store.seed(priority='high', metadata={
+        'trigger_chain': _chain_link('human_gate', 'review', run_id, None),
+        'milestone': {'mode': 'delayed', 'after_secs': 259200},
+        'always_escalates': True,
+    })
+    return Chain(None, human)
+
+
+def pending(store: FixtureStore, *roots: str, as_json: bool = False, env: Mapping[str, str] | None = None) -> ScriptRun:
+    args = ['--pending', *[arg for root in roots for arg in ('--project-root', root)]]
+    with served(store) as url:
+        return run_script(*args, *(['--json'] if as_json else []), url=url, env=env)
+
+
+def pending_json(store: FixtureStore, *roots: str) -> dict[str, Any]:
+    run = pending(store, *roots, as_json=True)
+    assert run.rc == 0, run
+    return json.loads('\n'.join(run.lines))
+
+
+def _only_chain(document: Mapping[str, Any]) -> dict[str, Any]:
+    [project] = document['projects']
+    [chain] = project['chains']
+    return chain
+
+
+def _line_with(run: ScriptRun, fragment: str) -> str:
+    matching = [line for line in run.lines if fragment in line]
+    assert matching, f'no line carries {fragment!r} in {run.lines}'
+    return matching[0]
+
+
+def test_a_project_with_no_chain_says_none_was_ever_filed(store):
+    store.seed(priority='high')
+
+    run = pending(store, store.root)
+
+    assert run.rc == 0
+    _line_with(run, f'no trigger chain has been filed in {store.root}')
+
+
+def test_a_project_whose_chains_all_closed_says_none_is_open(store):
+    seed_chain(store, gate_status='done', human_status='done')
+
+    run = pending(store, store.root)
+
+    assert run.rc == 0
+    _line_with(run, f'no open trigger chain in {store.root}')
+    assert not any('no trigger chain has been filed' in line for line in run.lines)
+
+
+def test_an_open_chain_reports_its_gates_and_the_live_share(store):
+    store.seed_run(RUN, ('high', 'pending'), ('medium', 'done'), ('low', 'done'))
+    chain = seed_chain(store, streak=2)
+
+    checked = check(store)
+    run = pending(store, store.root)
+
+    assert checked.rc == os.EX_TEMPFAIL
+    assert run.rc == 0
+    _line_with(run, RUN)
+    _line_with(run, 'review')
+    gate_line = _line_with(run, f'completion gate {chain.gate}')
+    for fragment in ('pending', NEXT_CHECK, 'streak 2', 'threshold 0.7'):
+        assert fragment in gate_line
+    assert 'pending' in _line_with(run, f'human gate {chain.human}')
+    _line_with(run, f'share {checked.verdict["share"]}')
+
+
+def test_the_json_report_carries_the_check_mode_verdict(store):
+    store.seed_run(RUN, ('high', 'pending'), ('medium', 'done'), ('low', 'done'))
+    chain = seed_chain(store, streak=2)
+
+    checked = check(store)
+    document = pending_json(store, store.root)
+
+    [project] = document['projects']
+    assert project['project_root'] == store.root
+    assert project['state'] == 'open_chains'
+    assert project['unreadable_task_ids'] == []
+    reported = _only_chain(document)
+    assert (reported['skill'], reported['run_id']) == ('review', RUN)
+    assert reported['verdict'] == checked.verdict
+    assert reported['completion_gate'] == {
+        'id': chain.gate, 'status': 'pending', 'next_check_at': NEXT_CHECK, 'streak': 2, 'threshold': 0.7,
+    }
+    assert reported['human_gate'] == {'id': chain.human, 'status': 'pending'}
+
+
+def test_the_threshold_is_read_back_from_the_gates_own_args(store):
+    store.seed_run(RUN, ('high', 'pending'), ('medium', 'done'), ('low', 'done'))
+    seed_chain(store, threshold='0.55')
+
+    reported = _only_chain(pending_json(store, store.root))
+
+    assert reported['completion_gate']['threshold'] == 0.55
+    assert reported['verdict']['threshold'] == 0.55
+    assert reported['completion_gate']['streak'] == 0
+
+
+def test_a_superseded_chain_is_not_open(store):
+    store.seed_run(RUN, ('high', 'done'))
+    seed_chain(store, superseded_by=NEXT_RUN)
+
+    [project] = pending_json(store, store.root)['projects']
+
+    assert project['chains'] == []
+    assert project['state'] == 'no_open_chains'
+
+
+def test_each_named_project_is_reported_under_its_own_root(store):
+    second = store.another_root('second')
+    store.seed_run(RUN, ('high', 'done'))
+    store.seed_run(OTHER_RUN, ('high', 'pending'), root=second)
+    seed_chain(store)
+    seed_chain(store, skill='hotspot-survey', run_id=OTHER_RUN, root=second)
+
+    document = pending_json(store, store.root, second)
+
+    reported = {project['project_root']: project['chains'] for project in document['projects']}
+    assert list(reported) == [store.root, second]
+    assert [chain['run_id'] for chain in reported[store.root]] == [RUN]
+    assert [chain['run_id'] for chain in reported[second]] == [OTHER_RUN]
+
+
+def test_with_no_root_named_the_known_roots_are_reported(store):
+    store.seed_run(RUN, ('high', 'done'))
+    seed_chain(store)
+
+    run = pending(store, env={'DASHBOARD_KNOWN_PROJECT_ROOTS': store.root})
+
+    assert run.rc == 0
+    _line_with(run, store.root)
+    _line_with(run, RUN)
+
+
+def test_a_bad_root_is_reported_beside_the_good_one(store, tmp_path):
+    store.seed_run(RUN, ('high', 'done'))
+    chain = seed_chain(store)
+    plain = tmp_path / 'plain'
+    plain.mkdir()
+    answered = store.call_tool(LOOKUP, {'project_root': str(plain), 'key': 'trigger_chain'})
+
+    run = pending(store, store.root, str(plain))
+
+    assert run.rc == COULD_NOT_CHECK
+    _line_with(run, f'completion gate {chain.gate}')
+    bad_line = _line_with(run, answered['error'])
+    assert str(plain) in bad_line
+
+
+def test_an_unreadable_trigger_chain_is_named_not_skipped(store):
+    bogus = store.seed(priority='high', metadata={
+        'trigger_chain': {'role': 'bogus', 'skill': 'review', 'run_id': RUN, 'superseded_by': None},
+    })
+
+    run = pending(store, store.root)
+
+    _line_with(run, f'unreadable trigger_chain on task {bogus}')
+
+
+def test_an_interim_chain_is_listed_with_its_human_gate(store):
+    store.seed_run(RUN, ('high', 'pending'))
+    chain = seed_interim_chain(store)
+
+    run = pending(store, store.root)
+    reported = _only_chain(pending_json(store, store.root))
+
+    assert run.rc == 0
+    _line_with(run, 'none (interim form)')
+    _line_with(run, f'human gate {chain.human}')
+    assert not any(line.strip().startswith('share') for line in run.lines)
+    assert reported['completion_gate'] is None
+    assert reported['verdict'] is None
+    assert reported['human_gate'] == {'id': chain.human, 'status': 'pending'}
