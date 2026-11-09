@@ -16441,7 +16441,8 @@ class SpeculativeMergeWorker:
         A speculative claim stacks the replacement on the live frontier tip
         with the claim's permit; any other claim merges onto main with none
         (plans/merge-lane-policy-prd.md D1).  With no claim, main is read and
-        the claim is taken here, holding no permit.  SINGLE EXIT: whatever
+        the claim is taken here with no permit in hand, so it stacks only on a
+        slot it can take without waiting.  SINGLE EXIT: whatever
         :meth:`_remerge_inner` returns leaves stamped with the claim, and a
         raising re-merge releases the claim's permit.
         """
