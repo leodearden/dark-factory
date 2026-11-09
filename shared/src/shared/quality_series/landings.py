@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import StrEnum
 
@@ -60,7 +60,11 @@ def parse_utc(text: str) -> datetime:
 
 @dataclass(frozen=True)
 class Landing:
-    """One task landed on main; train members share merge_sha == unit_id and unit_size."""
+    """One task landed on main; train members share merge_sha == unit_id and unit_size.
+
+    A late claim names a sha an earlier event already claimed for another task: it is a unit of
+    one under an opaque unit_id (compared for equality, never parsed) with unmeasurable lines.
+    """
 
     project_id: str
     merge_sha: str
@@ -70,6 +74,7 @@ class Landing:
     source: LandingSource
     unit_id: str
     unit_size: int
+    late_claim: bool
     git_first_parent: bool
     prev_landed_at: str | None
     lines_base: LinesBase
@@ -83,6 +88,20 @@ class Landing:
             raise ValueError(
                 'base_sha is None exactly when lines are unmeasurable '
                 f'(lines_base={self.lines_base!r}, base_sha={self.base_sha!r}, {where})'
+            )
+        if self.late_claim and (
+            self.unit_size != 1
+            or self.lines_base is not LinesBase.UNMEASURABLE
+            or self.unit_id == self.merge_sha
+        ):
+            raise ValueError(
+                'a late_claim is its own unit of one with unmeasurable lines '
+                f'(unit_id={self.unit_id!r}, unit_size={self.unit_size!r}, '
+                f'lines_base={self.lines_base!r}, {where})'
+            )
+        if not self.late_claim and self.unit_id != self.merge_sha:
+            raise ValueError(
+                f'a first claim\'s unit_id is its merge_sha (unit_id={self.unit_id!r}, {where})'
             )
         parse_utc(self.landed_at)
         if self.prev_landed_at is not None:
@@ -103,10 +122,11 @@ class GitCrossCheck:
 
     off_first_parent: int
     merges_without_landing: int
+    late_claims: int
 
     @property
     def disagreement(self) -> int:
-        return self.off_first_parent + self.merges_without_landing
+        return self.off_first_parent + self.merges_without_landing + self.late_claims
 
 
 @dataclass(frozen=True)
@@ -124,6 +144,7 @@ class _Recorded:
     source: LandingSource
     unit_size: int
     event_id: int
+    late_claim: bool = False
 
     @property
     def order(self) -> tuple[datetime, str, int, str]:
@@ -168,7 +189,25 @@ def _recorded_history(conn: sqlite3.Connection) -> list[_Recorded]:
     earliest: dict[tuple[str, str], _Recorded] = {}
     for recorded in sorted(found, key=lambda r: (r.landed, r.event_id)):
         earliest.setdefault((recorded.merge_sha, recorded.task_id), recorded)
-    return sorted(earliest.values(), key=lambda r: r.order)
+    return sorted(_mark_late_claims(list(earliest.values())), key=lambda r: r.order)
+
+
+def _mark_late_claims(records: list[_Recorded]) -> list[_Recorded]:
+    """A record is a late claim when an earlier event already claimed its sha for another task.
+
+    A train's members share their event's id, so they all stay with the claiming event.
+    """
+    claiming_event: dict[str, int] = {}
+    for recorded in sorted(records, key=lambda r: (r.landed, r.event_id)):
+        claiming_event.setdefault(recorded.merge_sha, recorded.event_id)
+    return [replace(r, late_claim=r.event_id != claiming_event[r.merge_sha]) for r in records]
+
+
+def _unit(recorded: _Recorded) -> tuple[str, int]:
+    """(unit_id, unit_size); a late claim's unit_id is opaque, compared only for equality."""
+    if recorded.late_claim:
+        return f'{recorded.merge_sha}:{recorded.task_id}', 1
+    return recorded.merge_sha, recorded.unit_size
 
 
 @dataclass(frozen=True)
@@ -230,9 +269,15 @@ def landings(
 
     ``since_cursor=None`` means the full history: every landing in the store, ordered by
     landed_at then merge_sha (train members tied on both by their member_task_ids position).
-    A sha cursor emits first-parent landings after it on main's first-parent line, and
-    off-first-parent landings recorded after the newest landing at or below it; ordinals are
-    numbered over the full history, so they are stable across calls. ``project_id`` defaults
+    A sha cursor emits first claims after it on main's first-parent line by position; late
+    claims and off-first-parent landings it emits by landed_at, those recorded after the newest
+    first-claim landing at or below the cursor, so a later cursor can re-emit one and consumers
+    upsert on (project_id, merge_sha, task_id). Ordinals are numbered over the full history, so
+    they are stable across calls.
+
+    A late claim (a done row naming a sha an earlier event already claimed for another task)
+    stays a landing, because the task left the merge queue with main advanced, but it forms its
+    own unit of one with unmeasurable lines, and git_check counts it. ``project_id`` defaults
     to the repo root's project id. The call runs one blocking ``git rev-list`` bounded by
     ``git_timeout_s``, so a coroutine calls it through ``asyncio.to_thread``. The return is a
     LandingBatch whose ``.landings`` are the rows.
@@ -245,6 +290,9 @@ def landings(
     history = _recorded_history(runs_db)
     bases = _lines_bases(line, {recorded.merge_sha for recorded in history})
 
+    def first_claim_on_line(recorded: _Recorded) -> bool:
+        return not recorded.late_claim and recorded.merge_sha in position
+
     on_line = [position[r.merge_sha] for r in history if r.merge_sha in position]
     if since_cursor is None:
         range_start = min(on_line, default=len(line.shas))
@@ -254,12 +302,12 @@ def landings(
         range_start = cursor_position + 1
         horizon = max(
             (r.landed for r in history
-             if r.merge_sha in position and position[r.merge_sha] <= cursor_position),
+             if first_claim_on_line(r) and position[r.merge_sha] <= cursor_position),
             default=None,
         )
 
     def emitted(recorded: _Recorded) -> bool:
-        if recorded.merge_sha in position:
+        if first_claim_on_line(recorded):
             return position[recorded.merge_sha] >= range_start
         return horizon is None or recorded.landed > horizon
 
@@ -267,7 +315,11 @@ def landings(
     previous: dict[str, str] = {}
     for ordinal, recorded in enumerate(history):
         landed_at = recorded.landed.isoformat()
-        lines_base, base_sha = bases.get(recorded.merge_sha, (LinesBase.UNMEASURABLE, None))
+        unit_id, unit_size = _unit(recorded)
+        lines_base, base_sha = (
+            (LinesBase.UNMEASURABLE, None) if recorded.late_claim
+            else bases.get(recorded.merge_sha, (LinesBase.UNMEASURABLE, None))
+        )
         landing = Landing(
             project_id=project,
             merge_sha=recorded.merge_sha,
@@ -275,8 +327,9 @@ def landings(
             landed_at=landed_at,
             ordinal=ordinal,
             source=recorded.source,
-            unit_id=recorded.merge_sha,
-            unit_size=recorded.unit_size,
+            unit_id=unit_id,
+            unit_size=unit_size,
+            late_claim=recorded.late_claim,
             git_first_parent=recorded.merge_sha in position,
             prev_landed_at=previous.get(recorded.task_id),
             lines_base=lines_base,
@@ -292,4 +345,7 @@ def landings(
         if len(line.parents[index]) >= 2 and line.shas[index] not in landing_shas
     )
     off_first_parent = sum(1 for row in rows if not row.git_first_parent)
-    return LandingBatch(tuple(rows), GitCrossCheck(off_first_parent, merges_without_landing))
+    late_claims = sum(1 for row in rows if row.late_claim)
+    return LandingBatch(
+        tuple(rows), GitCrossCheck(off_first_parent, merges_without_landing, late_claims)
+    )
