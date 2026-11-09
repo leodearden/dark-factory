@@ -3268,6 +3268,14 @@ installer is on main, because
 a `before_done` script that main does not have yet. The job is done when
 `systemctl --user list-timers --all` lists `fused-memory-memory-eval.timer`.
 
+That deploy task must depend on task 3217. The runner writes one verdict
+entry per tripwire item. The dashboard reader
+(`dashboard/src/dashboard/data/memory_evals.py::_read_verdicts`) still keys
+verdicts by `(eval_id, metric_id)` and keeps the first, so it would show an
+alarming tripwire as clear whenever its first item passes. Task 3217 re-keys
+that reader. Until it lands, the first scheduled run would publish a verdicts
+file the Memory tab misreads.
+
 ### Legibility trickle health probe (04:30)
 
 **What it does.** Runs the three trickle probes once a night and files one
