@@ -5,6 +5,11 @@ named tests of ``LANE_TESTS``; each test's behaviour across runs is fixed by a
 marker file it writes on its first run.  A ``Sabotage`` armed in the project
 breaks the next pytest session that collects its tests.  ``write_script`` puts
 an executable stub of a legacy leg's runner script into a worktree.
+
+Every session a lane project runs keeps its cache off and its basetemp inside
+the project, never in the host-wide ``/tmp/pytest-of-<user>`` root, whose
+exit-time cleanup of other sessions' dead dirs is unbounded; the contract is
+``test_offline_lane_confirm.py::TestRealPytestGenericLeg::test_a_pooled_detection_leaves_the_hosts_default_pytest_temp_root_untouched``.
 """
 
 from __future__ import annotations
@@ -15,7 +20,7 @@ from pathlib import Path
 
 LANE_FILE = 'tests/test_lane.py'
 
-_BASE_ADDOPTS = '-p no:cacheprovider'
+_BASE_ADDOPTS = '-p no:cacheprovider --basetemp=.lane-basetemp'
 
 _PRELUDE = '''\
 import pathlib
