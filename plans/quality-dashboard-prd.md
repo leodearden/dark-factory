@@ -346,10 +346,30 @@ applies uniformly: a field is None when its source has not started at the landin
 base is unmeasurable). So quality.db columns for them are nullable. `rule_vintage` is keyed by
 source, not by metric: a consumer maps each metric to the source it reads. `by_role` is a tuple of
 (role, usd) pairs. The single homes are `shared/src/shared/quality_series/rows.py::Outcomes`,
-`::Cost` and `::SourceEpochs`, with their `__post_init__` invariants. The `rejections` and
-`flake_occurrence` epochs are the first positive row of their source, so each is outcome-conditioned.
-As measured in α's review, on df and reify the first post_merge_verify rejection is also the first categorised `merge_blocked`
-(2026-07-19 and 07-20).
+`::Cost` and `::SourceEpochs`, with their `__post_init__` invariants. `SourceEpochs` and the
+Landing's `landed_at`/`prev_landed_at` are timezone-aware datetimes; ISO text is rendered only where a
+row is written to quality.db or printed.
+- (2026-11-09) The `rejections` epoch is the first categorised `merge_blocked` of any category, so a
+  project that never has a post-merge rejection reads 0/n, not unknown. On df and reify that is the
+  same instant as the first `post_merge_verify` rejection (2026-07-19T17:49:40Z and
+  2026-07-20T02:18:42Z), so neither series moves. The `flake_occurrence` epoch stays the table's first
+  row, and the table records only discriminated failing tests, so it is outcome-conditioned. A
+  project that never has one serves `flake_*` = None for every landing, indefinitely, and its series
+  starts on a positive observation, which biases small projects (reify, the solar repos) upward.
+  Render that as "no producer has written here", never as 0.
+- (2026-11-09) `execute_iterations` sums the `task_results` rows of the dispatches that produced the
+  landing (`shared/src/shared/quality_series/rows.py::_landing_dispatches`): the window's rows that did
+  not report `done`, plus the landing dispatch's own row. `task_results` is written when a dispatch
+  ends, after its merge lands, so that row is the task's first row after `landed_at`, counted when it
+  reports `done`. A `done` row inside a window is the previous landing's dispatch row and is not
+  charged again. On the 151 df W44 plain landings the dispatch row trailed the landing event by 12 s
+  at the median and about 12 min at p99. The strict window alone never counted it: W44 had 73 of 234
+  landings at None against 21 with no implementer invocation; with the dispatch row, 19. Two
+  residuals. A row computed before its landing dispatch's row is written lacks it, so β must
+  re-measure a stored row whose landing is younger than that lag, or accept the loss; decision 14's
+  upsert allows the re-measure. And a landing whose own dispatch wrote no row can claim the task's
+  next landing's `done` row, because `task_results` is keyed `(run_id, task_id)` with `INSERT OR
+  REPLACE`: 7 of the 3,527 df landings in the full history (2026-11-09).
 
 ### Pure statistics (`shared/src/shared/quality_series/stats.py`)
 

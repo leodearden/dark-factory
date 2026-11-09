@@ -98,6 +98,15 @@ class TestRejections:
         m1 = _by_key(_rows(s))[('101', s.m1)].outcomes
         assert (m1.rejected, m1.rejection_events) == (None, None)
 
+    def test_a_store_without_a_rejection_reads_zero_after_its_first_categorised_block(
+        self, tmp_path: Path
+    ) -> None:
+        s = build_landing_scenario(tmp_path / 'proj')
+        s.db.merge_blocked(at_hour(9.0), '101', 'merge_ff_failed', 'fast-forward failed')
+        m1 = _by_key(_rows(s))[('101', s.m1)]
+        assert (m1.outcomes.rejected, m1.outcomes.rejection_events) == (False, 0)
+        assert m1.rule_vintage.rejections == at_hour(9.0)
+
 
 class TestVerifies:
     def test_a_trains_verify_rows_combine_across_members(self, outcomes_scenario, outcome_rows):
@@ -196,6 +205,9 @@ def cost_scenario(tmp_path_factory: pytest.TempPathFactory) -> LandingScenario:
     db.task_result('101', 'run-b', 'blocked', at_hour(9.8), execute_iterations=2)
     db.task_result('101', 'run-c', 'done', at_hour(10.4), execute_iterations=3)
     db.task_result('101', 'run-d', 'cancelled', '', execute_iterations=5)
+    db.task_result('101', 'run-e', 'done', at_hour(13.05), execute_iterations=4)
+    db.task_result('102', 'run-a', 'merge-deferred', at_hour(10.9), execute_iterations=2)
+    db.task_result('102', 'run-b', 'requeued', at_hour(11.2), execute_iterations=7)
     return s
 
 
@@ -263,8 +275,20 @@ class TestTurns:
 
 
 class TestExecuteIterations:
-    def test_sums_rows_completed_inside_the_window(self, cost_scenario, cost_rows):
-        assert cost_rows[('101', cost_scenario.m1)].cost.execute_iterations == 3
+    def test_the_window_rows_and_the_landing_dispatchs_own_row_written_after_it(
+        self, cost_scenario, cost_rows
+    ):
+        assert cost_rows[('101', cost_scenario.m1)].cost.execute_iterations == 1 + 2 + 3
+
+    def test_the_first_landings_dispatch_row_is_not_charged_to_the_second(
+        self, cost_scenario, cost_rows
+    ):
+        assert cost_rows[('101', cost_scenario.m6)].cost.execute_iterations == 4
+
+    def test_a_row_after_the_landing_counts_only_when_it_reports_done(
+        self, cost_scenario, cost_rows
+    ):
+        assert cost_rows[('102', cost_scenario.f2)].cost.execute_iterations == 2
 
     def test_no_rows_is_unknown(self, cost_scenario, cost_rows):
         assert cost_rows[('107', cost_scenario.m7)].cost.execute_iterations is None

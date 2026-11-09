@@ -74,8 +74,10 @@ class SourceEpochs:
 
 
 _EPOCH_SQL = {
+    # The first categorised block of any category, so a project that never had a post-merge
+    # rejection reads 0 rejections per landing, not unknown.
     'rejections': "SELECT MIN(timestamp) FROM events WHERE event_type = 'merge_blocked'"
-                  " AND json_extract(data, '$.category') = 'post_merge_verify'",
+                  " AND json_extract(data, '$.category') IS NOT NULL",
     'merge_verify': "SELECT MIN(timestamp) FROM events WHERE event_type = 'merge_verify'",
     'review_completed': "SELECT MIN(timestamp) FROM events WHERE event_type = 'review_completed'",
     'flake_occurrence': 'SELECT MIN(observed_at) FROM flake_occurrence',
@@ -177,7 +179,11 @@ shared/tests/test_quality_series_rows.py asserts the two stay equal.
 
 @dataclass(frozen=True)
 class Cost:
-    """What the landing cost, over invocations started and task_results completed in its window."""
+    """What the landing cost, over invocations started and task_results completed in its window.
+
+    execute_iterations sums the task_results rows of the dispatches that produced the landing
+    (see _landing_dispatches), so it includes the landing dispatch's own row, written after it.
+    """
 
     all_role_usd: float | None
     by_role: tuple[tuple[str, float], ...]
@@ -241,6 +247,11 @@ class _Timeline(Generic[T]):
         start = 0 if prev is None else bisect.bisect_right(self._times, prev)
         return self._values[start:bisect.bisect_right(self._times, landing.landed_at)]
 
+    def first_after(self, at: datetime) -> T | None:
+        """The first value strictly after ``at``; None when there is none."""
+        index = bisect.bisect_right(self._times, at)
+        return self._values[index] if index < len(self._values) else None
+
 
 _CHUNK = 500
 
@@ -293,8 +304,8 @@ SELECT task_id, timestamp, json_extract(data, '$.turns'), json_extract(data, '$.
    AND json_extract(data, '$.turns') IS NOT NULL
    AND task_id IN ({{}})
 """
-_EXECUTE_SQL = """
-SELECT task_id, completed_at, execute_iterations FROM task_results
+_DISPATCH_SQL = """
+SELECT task_id, completed_at, outcome, execute_iterations FROM task_results
  WHERE completed_at IS NOT NULL AND completed_at != '' AND task_id IN ({})
 """
 _CHARTER_SQL = """
@@ -327,6 +338,21 @@ def _charter(values: tuple[Any, ...]) -> _Charter | None:
         if (block_reason or '').startswith(prefix):
             return _Charter(charter_class, CharterClassSource.REGEX_BACKFILL)
     return None
+
+
+DISPATCH_DONE_OUTCOME = 'done'
+"""orchestrator/src/orchestrator/workflow_types.py::WorkflowOutcome.DONE, restated.
+
+shared may not import orchestrator.
+"""
+
+
+@dataclass(frozen=True)
+class _Dispatch:
+    """One task_results row: a dispatch of the task, and whether it ended reporting done."""
+
+    done: bool
+    execute_iterations: int
 
 
 # orchestrator/src/orchestrator/flake_ledger.py::FlakeVerdict, restated: shared may not import it.
@@ -363,7 +389,7 @@ class _Sources:
     flakes: dict[str, _Timeline[str]]
     invocations: dict[str, _Timeline[_Invocation]]
     turns: dict[str, _Timeline[_Turns]]
-    execute_iterations: dict[str, _Timeline[int]]
+    dispatches: dict[str, _Timeline[_Dispatch]]
     charters: dict[str, _Timeline[_Charter | None]]
 
     @classmethod
@@ -379,8 +405,10 @@ class _Sources:
                                    lambda v: _Invocation(str(v[0]), float(v[1]))),
             turns=_timelines(conn, _TURNS_SQL, task_ids,
                              lambda v: _Turns(int(v[0]), v[1] == TURNS_CAP_REASON)),
-            execute_iterations=_timelines(conn, _EXECUTE_SQL, task_ids,
-                                          lambda v: int(v[0] or 0)),
+            dispatches=_timelines(
+                conn, _DISPATCH_SQL, task_ids,
+                lambda v: _Dispatch(v[0] == DISPATCH_DONE_OUTCOME, int(v[1] or 0)),
+            ),
             charters=_timelines(conn, _CHARTER_SQL.format(
                 charter_column='charter_class' if _has_charter_column(conn) else 'NULL',
             ), task_ids, _charter),
@@ -473,6 +501,21 @@ def _review_rounds(
     return (total + 1, ReviewRoundsSource.DISK_COUNTER) if total is not None else (None, None)
 
 
+def _landing_dispatches(sources: _Sources, landing: Landing) -> list[_Dispatch]:
+    """The task_results rows of the dispatches that produced the landing.
+
+    The window's rows that did not report done (a done row there is the previous landing's own
+    dispatch row), plus the landing dispatch's own row: task_results is written when a dispatch
+    ends, after its merge lands, so it is the task's first row after the landing, when done.
+    """
+    produced = [dispatch for dispatch in _window(sources.dispatches, landing) if not dispatch.done]
+    timeline = sources.dispatches.get(landing.task_id)
+    landing_dispatch = None if timeline is None else timeline.first_after(landing.landed_at)
+    if landing_dispatch is not None and landing_dispatch.done:
+        produced.append(landing_dispatch)
+    return produced
+
+
 def _charter_class(sources: _Sources, landing: Landing) -> _Charter | None:
     classified = [c for c in _window(sources.charters, landing) if c is not None]
     return classified[-1] if classified else None
@@ -486,7 +529,7 @@ def _cost(
                    if _covers(epochs.invocations, landing) else [])
     turns = (_window(sources.turns, landing)
              if _covers(epochs.invocation_turns, landing) else [])
-    iterations = _window(sources.execute_iterations, landing)
+    dispatches = _landing_dispatches(sources, landing)
     by_role = _usd_by_role(invocations)
     implementer = sum(1 for i in invocations if i.role in IMPLEMENTER_CLASS_ROLES)
     review_rounds, review_rounds_source = _review_rounds(sources, landing, repo)
@@ -495,7 +538,8 @@ def _cost(
         all_role_usd=sum(usd for _, usd in by_role) if invocations else None,
         by_role=by_role,
         implementer_invocations=implementer if invocations else None,
-        execute_iterations=sum(iterations) if iterations else None,
+        execute_iterations=(sum(d.execute_iterations for d in dispatches)
+                            if dispatches else None),
         turns=sum(t.turns for t in turns) if turns else None,
         turns_capped=any(t.capped for t in turns),
         code_lines=None if lines is None else lines.code_lines,
