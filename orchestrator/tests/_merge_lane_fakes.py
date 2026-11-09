@@ -41,6 +41,8 @@ from collections.abc import AsyncIterator, Collection, Coroutine, Iterable, Mapp
 from pathlib import Path
 from typing import Any, ClassVar
 
+from _merge_worker_drive import make_merge_request
+
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane import MergeLane
@@ -50,7 +52,6 @@ from orchestrator.merge_lane.types import (
     DiskGuardOutcome,
     MergeOutcome,
     MergeRequest,
-    QueuedBranch,
 )
 from orchestrator.merge_lane.worker import MAIN_HEALTH_PROBE_PENDING_NOTE
 from orchestrator.verify import VerifyResult
@@ -144,17 +145,7 @@ async def branch_merge_request(
     worktree = (await git_ops.create_worktree(task_id)).path
     (worktree / filename).write_text(f'# {task_id}\n')
     await git_ops.commit(worktree, f'Add {filename}')
-    prefix = config.git.branch_prefix
-    return MergeRequest(
-        task_id=task_id,
-        branch=QueuedBranch.parse(f'{prefix}{task_id}', prefix),
-        worktree=worktree,
-        pre_rebased=False,
-        task_files=None,
-        module_configs=[],
-        config=config,
-        result=asyncio.get_running_loop().create_future(),
-    )
+    return make_merge_request(task_id, f'{config.git.branch_prefix}{task_id}', worktree, config)
 
 
 @dataclasses.dataclass(frozen=True)
