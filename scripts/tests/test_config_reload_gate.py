@@ -70,7 +70,8 @@ def test_a_tool_that_raised_is_reload_raised():
 
 
 def test_a_dead_socket_is_no_reload_report():
-    refusal = _refusal(ClosedPort().port)
+    with ClosedPort() as closed:
+        refusal = _refusal(closed.port)
 
     assert refusal.failure is ReloadFailure.NO_RELOAD_REPORT
     assert COMMITTED_AS in refusal.detail, refusal.detail

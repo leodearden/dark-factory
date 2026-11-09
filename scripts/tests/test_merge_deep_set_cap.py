@@ -459,7 +459,8 @@ def test_a_dead_socket_fails_at_submit_without_claiming_a_landing(tmp_path, depl
     repo = config.parent
     before = head(repo)
 
-    proc = _run(ClosedPort(), config, "6", env=deploy_env)
+    with ClosedPort() as closed:
+        proc = _run(closed, config, "6", env=deploy_env)
 
     assert failure_tag(proc) == "transport_failed"
     assert last_verdict(proc)["commit"] is None

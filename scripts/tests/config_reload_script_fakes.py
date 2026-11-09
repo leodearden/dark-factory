@@ -279,18 +279,34 @@ TRANSPORT_FAULTS: dict[str, McpFault] = {
 
 
 class ClosedPort:
-    """A port with nothing listening on it, for the dead-socket case.
+    """A port with nothing listening on it, for the dead-socket case, held for
+    a with-block.
 
-    Bound and released, so it is free -- and the script's connect is the only
-    thing racing for it. Carries the same `port` attribute a script driver
-    reads from a FakeEscalationMcp, so the no-server case is driven the same
-    way.
+    While held, the port is bound and not listening: no other socket can bind
+    it, and a connect to it is refused. `port` is offered only inside the
+    with-block. It is the same `port` attribute a script driver reads from a
+    FakeEscalationMcp, so the no-server case is driven the same way.
     """
 
     def __init__(self):
-        with socket.socket() as probe:
-            probe.bind(("127.0.0.1", 0))
-            self.port = probe.getsockname()[1]
+        self._holder: socket.socket | None = None
+
+    @property
+    def port(self) -> int:
+        if self._holder is None:
+            raise RuntimeError("ClosedPort reserves its port only inside its with-block")
+        return self._holder.getsockname()[1]
+
+    def __enter__(self):
+        holder = socket.socket()
+        holder.bind(("127.0.0.1", 0))
+        self._holder = holder
+        return self
+
+    def __exit__(self, *exc):
+        holder, self._holder = self._holder, None
+        if holder is not None:
+            holder.close()
 
 
 # ---------------------------------------------------------------------------

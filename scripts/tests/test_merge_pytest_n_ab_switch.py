@@ -577,7 +577,8 @@ def test_a_converged_reload_that_never_reached_the_tool_fails_closed(tmp_path, s
     dead socket can refuse."""
     config = _make_repo(tmp_path, "8", marker=True)
 
-    proc = _run(ClosedPort(), config, "8")
+    with ClosedPort() as closed:
+        proc = _run(closed, config, "8")
 
     _assert_failed_closed_on_the_transport(proc)
     assert last_verdict(proc)["commit"] == "already-at-8"
@@ -626,7 +627,8 @@ def test_a_dead_socket_fails_a_flip_at_the_landing(tmp_path, scratch):
     repo = config.parent
     before = head(repo)
 
-    proc = _run(ClosedPort(), config, "8")
+    with ClosedPort() as closed:
+        proc = _run(closed, config, "8")
 
     assert failure_tag(proc) == "transport_failed"
     assert "merge_request never reached the tool" in proc.stderr, proc.stderr
