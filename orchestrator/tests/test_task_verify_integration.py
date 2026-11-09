@@ -36,7 +36,9 @@ Three PRD-text drifts are asserted as shipped:
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import json
+import logging
 import os
 import shlex
 import subprocess
@@ -45,22 +47,25 @@ from pathlib import Path
 import pytest
 from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT
 from _task_verify_integration_rig import (
+    LAPTOP,
     MODULE,
     SECOND_MODULE,
     Exit,
     Hold,
+    Raises,
     Subprocess,
     open_scene,
 )
 from _xdist_crash_fixtures import XDIST_WORKER_CRASH_OUTPUT
 
+from orchestrator.config import load_config
 from orchestrator.task_verify_run import prepare_task_verify_worktree
 from orchestrator.task_verify_spec import (
     build_task_verify_spec,
     task_spec_from_json,
     task_spec_to_json,
 )
-from orchestrator.verify import run_scoped_verification
+from orchestrator.verify import admission_active, run_scoped_verification
 from orchestrator.verify_cancel import pgid_file, read_worktree_path, worktree_path_file
 from orchestrator.verify_runner import (
     ConcurrentDispatchError,
@@ -72,10 +77,28 @@ from orchestrator.verify_runner import (
 pytestmark = [pytest.mark.asyncio, pytest.mark.usefixtures('code_default_config')]
 
 _CLI_TIMEOUT = pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
+_DISPATCH_LOGGER = 'orchestrator.task_verify_dispatch'
+_REMOTE_MINE = {'verify_task_host_policy': 'remote_modules', 'verify_task_remote_modules': [MODULE]}
+_TEST_LEG = f'test-{MODULE}'
 
 
 def _verdict_fields(result) -> tuple[bool, str, str, bool]:
     return result.passed, result.category, result.summary, result.timed_out
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _matches(names: list[str], *patterns: str) -> bool:
+    """Each name matches exactly one pattern, and each pattern exactly one name."""
+    return len(names) == len(patterns) and all(
+        len(fnmatch.filter(names, pattern)) == 1 for pattern in patterns
+    )
 
 
 def _pgid_gone(pgid: int) -> bool:
@@ -275,3 +298,212 @@ class TestLaptopCli:
             assert not pgf.exists()
             assert not worktree_path_file(pgf).exists()
             assert read_worktree_path(pgf) is None
+
+
+class TestHarnessDispatcher:
+    """The harness's own dispatcher with no merge worker; policy from the config's verify_task_* keys."""
+
+    @_CLI_TIMEOUT
+    async def test_row5_an_eligible_verify_runs_on_the_laptop_and_never_starts_local(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        async with open_scene(tmp_path, monkeypatch, **_REMOTE_MINE) as scene:
+            result = await scene.call([scene.module(MODULE)])
+
+            assert result.passed, result.summary
+            assert scene.legs.spawned_at('local') == []
+            assert scene.legs.spawned_at('laptop') == sorted(
+                f'{kind}-{MODULE}' for kind in ('lint', 'test', 'type')
+            )
+            sidecar = scene.sidecar()
+            assert (sidecar['decision'], sidecar['runner'], sidecar['reason']) == (
+                'remote', LAPTOP, 'remote',
+            )
+            assert sidecar['remote_wait_secs'] >= 0
+            assert result.archive_log_paths
+            assert all(
+                Path(path).is_relative_to(scene.archive_root) for path in result.archive_log_paths
+            )
+            assert _matches(
+                scene.archived_files(),
+                'attempt-1.dispatch-*.json', f'attempt-1.remote-{LAPTOP}.pass-summary-*.json',
+            ), scene.archived_files()
+            assert scene.unwound(), scene.turns()
+
+    @pytest.mark.parametrize('ineligible', ['other_module', 'force_workspace'])
+    async def test_row8_an_ineligible_verify_runs_local_and_never_meets_the_laptop(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ineligible: str,
+    ) -> None:
+        policy = (
+            {'verify_task_host_policy': 'remote_modules', 'verify_task_remote_modules': [SECOND_MODULE]}
+            if ineligible == 'other_module' else _REMOTE_MINE
+        )
+        async with open_scene(tmp_path, monkeypatch, **policy) as scene:
+            result = await scene.call(
+                [scene.module(MODULE)], force_workspace=ineligible == 'force_workspace',
+            )
+
+            assert result.passed, result.summary
+            assert scene.legs.spawned_at('local')
+            assert scene.legs.spawned_at('laptop') == []
+            assert scene.sidecar()['reason'] == 'not_eligible'
+            assert scene.laptop.calls == []
+            assert scene.runners.built == []
+            assert scene.unwound(), scene.turns()
+
+    async def test_row11_a_dirty_tree_runs_local_before_anything_reaches_the_laptop(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        async with open_scene(tmp_path, monkeypatch, **_REMOTE_MINE) as scene:
+            (scene.worktree / 'untracked.txt').write_text('not committed\n')
+
+            result = await scene.call([scene.module(MODULE)])
+
+            assert result.passed, result.summary
+            assert scene.legs.spawned_at('local')
+            sidecar = scene.sidecar()
+            assert (sidecar['decision'], sidecar['reason']) == ('local', 'dirty_tree')
+            assert scene.laptop.calls == []
+            assert scene.unwound(), scene.turns()
+
+    @_CLI_TIMEOUT
+    async def test_row15_every_second_remote_verdict_is_cross_checked_locally(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        async with open_scene(
+            tmp_path, monkeypatch, verify_task_remote_cross_check_every_n=2, **_REMOTE_MINE,
+        ) as scene:
+            scene.legs.fail(_TEST_LEG, 'local')
+            modules = [scene.module(MODULE)]
+
+            first = await scene.call(modules, attempt_id=1)
+
+            assert first.passed, first.summary
+            assert scene.legs.spawned_at('local') == []
+            assert (scene.sidecar(1)['reason'], scene.sidecar(1)['cross_check']) == ('remote', None)
+
+            second = await scene.call(modules, attempt_id=2)
+
+            assert not second.passed
+            assert scene.legs.spawned(_TEST_LEG, 'local')
+            assert len(scene.legs.pids(_TEST_LEG, 'laptop')) == 2
+            sidecar = scene.sidecar(2)
+            assert (sidecar['runner'], sidecar['reason']) == ('local', 'cross_check')
+            assert sidecar['cross_check'] == {
+                'remote_passed': True, 'local_passed': False, 'agree': False,
+            }
+
+    @_CLI_TIMEOUT
+    async def test_row18_a_reload_flips_the_next_dispatch_and_an_empty_module_list_is_refused(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        async with open_scene(tmp_path, monkeypatch) as scene:
+            modules = [scene.module(MODULE)]
+
+            flip = scene.reload(**_REMOTE_MINE)
+
+            assert flip['applied']['verify_task_host_policy'] == {
+                'old': 'local', 'new': 'remote_modules',
+            }
+            await scene.call(modules, attempt_id=1)
+            assert scene.sidecar(1)['reason'] == 'remote'
+
+            back = scene.reload(verify_task_host_policy='local', verify_task_remote_modules=[])
+
+            assert back['applied']['verify_task_host_policy']['new'] == 'local'
+            await scene.call(modules, attempt_id=2)
+            assert scene.sidecars(2) == []
+            assert scene.laptop.requests('verify_task') == ['req1']
+
+        refused = tmp_path / 'refused.yaml'
+        refused.write_text(
+            'verify_task_host_policy: remote_modules\nverify_task_remote_modules: []\n',
+        )
+        monkeypatch.setenv('ORCH_CONFIG_PATH', str(refused))
+        with pytest.raises(ValueError) as raised:
+            load_config(refused)
+        assert 'verify_task_host_policy' in str(raised.value)
+        assert 'verify_task_remote_modules' in str(raised.value)
+
+    async def test_row21_a_remote_verify_that_raises_propagates_and_leaves_the_turn(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        async with open_scene(tmp_path, monkeypatch, **_REMOTE_MINE) as scene:
+            scene.laptop.answers['verify-task'] = Raises(RuntimeError('the laptop shim blew up'))
+
+            with pytest.raises(RuntimeError, match='the laptop shim blew up'):
+                await scene.call([scene.module(MODULE)])
+
+            assert scene.sidecar()['reason'] == 'dispatcher_error'
+            assert scene.unwound(), scene.turns()
+
+    async def test_row23_a_local_policy_forwards_the_call_unchanged_and_records_nothing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        async with open_scene(tmp_path, monkeypatch) as scene:
+            result = await scene.call([scene.module(MODULE)], attempt_id=3)
+
+            assert result.passed, result.summary
+            assert scene.legs.spawned_at('local') == sorted(
+                f'{kind}-{MODULE}' for kind in ('lint', 'test', 'type')
+            )
+            assert scene.sidecars(3) == []
+            assert scene.dispatcher.decision_for(scene.task_id, 3) is None
+            assert scene.laptop.calls == []
+            assert scene.runners.built == []
+            assert _matches(
+                scene.archived_files(),
+                f'attempt-3.{MODULE}.summary-*.json', 'attempt-3.plan-*.json',
+            ), scene.archived_files()
+
+    async def test_row25_a_per_module_verify_env_keeps_every_dispatch_local_and_warns_once(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        async with open_scene(
+            tmp_path, monkeypatch, verify_task_host_policy='remote_all',
+        ) as scene:
+            modules = [scene.module(MODULE, verify_env={'MOD_ONLY': '1'})]
+
+            with caplog.at_level(logging.WARNING, logger=_DISPATCH_LOGGER):
+                await scene.call(modules, attempt_id=1)
+                await scene.call(modules, attempt_id=2)
+
+            assert [scene.sidecar(n)['reason'] for n in (1, 2)] == ['not_eligible'] * 2
+            warnings = [
+                r for r in caplog.records
+                if r.name == _DISPATCH_LOGGER and r.levelno == logging.WARNING
+            ]
+            assert len(warnings) == 1
+            assert repr(MODULE) in warnings[0].getMessage()
+            assert scene.laptop.calls == []
+
+    async def test_row34_an_ungated_local_leg_keeps_the_verify_once_the_laptop_frees(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        async with open_scene(
+            tmp_path, monkeypatch, verify_task_host_policy='remote_all',
+        ) as scene:
+            assert not admission_active(scene.config)
+            holder = scene.hold()
+            await asyncio.wait_for(holder.granted.wait(), 30)
+            scene.legs.block(_TEST_LEG, 'local')
+            call = scene.start([scene.module(MODULE)])
+            await scene.until(
+                lambda: scene.legs.spawned(_TEST_LEG, 'local'), what='the local test leg to spawn',
+            )
+
+            await holder.leave()
+            await scene.until(
+                lambda: scene.turns()['laptop_waiters'] == [], what='the attempt to leave the laptop',
+            )
+
+            [test_pid] = scene.legs.pids(_TEST_LEG, 'local')
+            assert _alive(test_pid)
+            assert scene.laptop.requests('verify_task') == []
+            scene.legs.release(_TEST_LEG, 'local')
+            result = await asyncio.wait_for(call, 60)
+
+            assert result.passed, result.summary
+            assert scene.sidecar()['reason'] == 'local_granted_first'
+            assert scene.laptop.calls == []
+            assert scene.unwound(), scene.turns()
