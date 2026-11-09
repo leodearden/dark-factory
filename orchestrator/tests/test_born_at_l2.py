@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from typing import cast
 from unittest.mock import MagicMock
 
 import pytest
+from escalation.categories import EscalationCategory, UnregisteredEscalationCategory
 from escalation.queue import EscalationQueue
 
 from orchestrator.born_at_l2 import BornAtL2Alarm, file_deduped_born_at_l2
@@ -14,7 +16,7 @@ _ALARM = BornAtL2Alarm(
     root_cause='probe_condition',
     sentinel_task='__probe_condition__',
     role='orchestrator-probe-condition',
-    category='infra_issue',
+    category=EscalationCategory.INFRA_ISSUE,
     suggested_action='investigate_probe_condition',
     created_reason='probe-condition-threshold',
 )
@@ -54,10 +56,23 @@ def test_files_an_urgent_level_two_escalation_for_a_human(queue, event_store):
     assert pending.task_id == _ALARM.sentinel_task
     assert pending.agent_role == _ALARM.role
     assert pending.category == _ALARM.category
+    assert pending.category == 'infra_issue'
     assert pending.root_cause == _ALARM.root_cause
     assert pending.suggested_action == _ALARM.suggested_action
     assert (pending.summary, pending.detail) == ('probe tripped', 'probe detail')
     assert pending.filing_claimant_run_id == 'run-7'
+
+
+def test_unregistered_category_is_refused_at_construction():
+    with pytest.raises(UnregisteredEscalationCategory, match='infra_isue'):
+        BornAtL2Alarm(
+            root_cause='probe_condition',
+            sentinel_task='__probe_condition__',
+            role='orchestrator-probe-condition',
+            category=cast(EscalationCategory, 'infra_isue'),
+            suggested_action='x',
+            created_reason='y',
+        )
 
 
 def test_emits_escalation_created_with_the_alarm_reason(queue, event_store):
