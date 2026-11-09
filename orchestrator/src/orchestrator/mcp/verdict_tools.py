@@ -40,6 +40,7 @@ from shared.mcp_missing_arguments import MissingArgumentMiddleware
 
 from orchestrator.artifacts import TaskArtifacts, _validate_verdict_role
 from orchestrator.mcp import markup_journal, markup_sink
+from orchestrator.review_issue_contract import IssueIntake, check_issues
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +67,8 @@ def _envelope(role: str, session_id: str, payload: dict) -> dict:
 # Standalone implementation functions (testable without MCP transport)
 #
 # Only _submit_review_verdict has constrained/validated fields (the
-# reviewer==role identity check and the verdict enum below) — the other
+# reviewer==role identity check, the verdict enum, and each issue checked
+# against the contract in orchestrator/review_issue_contract.py) — the other
 # three payloads (completion/triage/merge) have no enum-like fields today,
 # so they write whatever they receive. Booleans and lists are still
 # type-checked at the pydantic MCP tool boundary in create_server(). Add
@@ -109,13 +111,49 @@ def _submit_review_verdict(
             'status': 'error',
             'message': f'verdict must be one of PASS/ISSUES_FOUND, got {verdict!r}',
         }
+    intake = check_issues(issues)
+    if intake.unusable:
+        return _issue_contract_refusal(intake)
     payload = {
         'reviewer': reviewer,
         'verdict': verdict,
-        'issues': issues,
+        'issues': list(intake.issues),
         'summary': summary,
     }
-    return _write_and_ack(artifacts, role, session_id, payload)
+    ack = _write_and_ack(artifacts, role, session_id, payload)
+    if intake.normalised:
+        ack |= _issue_contract_normalised(intake)
+    return ack
+
+
+def _issue_contract_refusal(intake: IssueIntake) -> dict[str, Any]:
+    deviations = [d.describe() for d in intake.unusable]
+    return {
+        'status': 'error',
+        'message': (
+            'nothing was written: every issue needs a severity and a '
+            'description, and these do not: ' + '; '.join(deviations) + '. '
+            'Call submit_review_verdict again with severity and description on '
+            'every issue (or drop the issue) and the verdict will land.'
+        ),
+        'issue_contract': {'outcome': 'rejected', 'deviations': deviations},
+    }
+
+
+def _issue_contract_normalised(intake: IssueIntake) -> dict[str, Any]:
+    return {
+        'message': (
+            'the verdict was recorded with the normalisations listed in '
+            'issue_contract.deviations. If one misstates a finding (for '
+            'example a blocking finding recorded as a suggestion), call '
+            'submit_review_verdict again with corrected fields: the latest '
+            'call replaces this verdict.'
+        ),
+        'issue_contract': {
+            'outcome': 'normalised',
+            'deviations': [d.describe() for d in intake.normalised],
+        },
+    }
 
 
 def _submit_completion_verdict(
