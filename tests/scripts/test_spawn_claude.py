@@ -5491,19 +5491,6 @@ def test_t3_lane_stamps_the_spawn_parent_on_the_record(
     assert t3_lane.record().parent_session_id == expected_parent
 
 
-def test_t3_lane_self_exit_asks_the_thread_to_archive_itself(t3_lane: _T3Lane) -> None:
-    t3_lane.env["CLAUDE_SPAWN_MODE"] = "sibling"
-    t3_lane.env["CLAUDE_SPAWN_SELF_EXIT"] = "1"
-
-    result = t3_lane.run()
-
-    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
-    (launch,) = t3_lane.started_threads()
-    prompt = launch["message"]
-    assert "t3_thread_organize" in prompt and '"archive"' in prompt
-    assert "exit-requested" not in prompt
-
-
 @pytest.mark.parametrize("self_exit", [None, "", "true", "0"])
 def test_t3_lane_leaves_self_exit_off_unless_the_input_is_exactly_1(
     t3_lane: _T3Lane, self_exit: str | None,
@@ -5519,3 +5506,114 @@ def test_t3_lane_leaves_self_exit_off_unless_the_input_is_exactly_1(
     (launch,) = t3_lane.started_threads()
     assert "t3_thread_organize" not in launch["message"] and "exit-requested" not in launch["message"]
     assert t3_lane.record().self_exit is False
+
+
+_SPAWN_SKILL_DOC = SPAWN_SCRIPT.parents[2] / "skills" / "spawn" / "SKILL.md"
+_T3_ACTS = {"settle", "archive"}
+
+
+def _set_end_of_work_inputs(env: dict[str, str], t3_end: str | None, self_exit: str | None) -> None:
+    """Set or clear CLAUDE_SPAWN_T3_END and CLAUDE_SPAWN_SELF_EXIT; None means unset."""
+    for key, value in (("CLAUDE_SPAWN_T3_END", t3_end), ("CLAUDE_SPAWN_SELF_EXIT", self_exit)):
+        env.pop(key, None)
+        if value is not None:
+            env[key] = value
+
+
+@pytest.mark.parametrize(("t3_end", "self_exit", "expected_end", "expected_self_exit"), [
+    (None, None, None, False),
+    ("none", None, None, False),
+    ("", None, None, False),
+    ("settle", None, session_registry.T3End.SETTLE, False),
+    ("archive", None, session_registry.T3End.ARCHIVE, True),
+    (None, "1", session_registry.T3End.ARCHIVE, True),
+    ("archive", "1", session_registry.T3End.ARCHIVE, True),
+])
+def test_t3_lane_resolves_the_end_of_work_act_into_the_record_and_the_trailer(
+    t3_lane: _T3Lane,
+    t3_end: str | None,
+    self_exit: str | None,
+    expected_end: session_registry.T3End | None,
+    expected_self_exit: bool,
+) -> None:
+    t3_lane.env["CLAUDE_SPAWN_MODE"] = "sibling"
+    _set_end_of_work_inputs(t3_lane.env, t3_end, self_exit)
+
+    result = t3_lane.run()
+
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+    record = t3_lane.record()
+    assert record.t3_end is expected_end
+    assert record.self_exit is expected_self_exit
+    (launch,) = t3_lane.started_threads()
+    prompt = launch["message"]
+    assert "exit-requested" not in prompt
+    if expected_end is None:
+        assert "t3_thread_organize" not in prompt
+        return
+    (other_act,) = _T3_ACTS - {expected_end.value}
+    assert "t3_thread_organize" in prompt
+    assert f'"{expected_end.value}"' in prompt and f'"{other_act}"' not in prompt
+    assert "Ending a T3 session" in prompt
+    assert str(_SPAWN_SKILL_DOC) in prompt
+
+
+@pytest.mark.parametrize(("t3_end", "self_exit", "named"), [
+    ("settle", "1", ("CLAUDE_SPAWN_SELF_EXIT=1", "CLAUDE_SPAWN_T3_END=settle")),
+    ("Archive", None, ("CLAUDE_SPAWN_T3_END='Archive'",)),
+    ("exit", None, ("CLAUDE_SPAWN_T3_END='exit'",)),
+])
+def test_t3_lane_refuses_a_contradictory_or_unknown_end_of_work_input_before_anything(
+    t3_lane: _T3Lane, t3_end: str, self_exit: str | None, named: tuple[str, ...],
+) -> None:
+    _set_end_of_work_inputs(t3_lane.env, t3_end, self_exit)
+
+    result = t3_lane.run()
+
+    stderr = result.stderr.decode()
+    assert result.returncode == 2, f"stderr: {stderr}"
+    assert all(name in stderr for name in named), stderr
+    assert not t3_lane.records(), "bad usage must write no session record"
+    assert not t3_lane.calls(), "bad usage must precede every T3 call"
+    assert not t3_lane.emulator_marker.exists()
+
+
+def test_tmux_lane_notes_once_that_t3_end_does_not_apply_and_stamps_nothing(tmp_path: pathlib.Path) -> None:
+    bin_dir = _make_bin_dir(tmp_path)
+    prompt_file = tmp_path / "captured_prompt.txt"
+    env_file = tmp_path / "captured_env.bin"
+    tmux_used = tmp_path / "tmux_used"
+    _write_fake_claude_obeying_exit_marker(bin_dir, prompt_file, env_file)
+    _write_foreground_terminal(bin_dir, "xterm")
+    _write_fake_tmux(bin_dir, tmux_used)
+    env = _base_env(bin_dir, "xterm")
+    env["CLAUDE_SPAWN_BACKEND"] = "tmux"
+    env["CLAUDE_SPAWN_PROJECT"] = "proj"
+    _set_end_of_work_inputs(env, "archive", None)
+
+    result = _run_spawn(env, tmp_path)
+
+    stderr = result.stderr.decode()
+    assert result.returncode == 0, f"stderr: {stderr}"
+    assert len([line for line in stderr.splitlines() if "CLAUDE_SPAWN_T3_END" in line]) == 1, stderr
+    record = session_registry.SessionRecord.from_json(
+        _find_one_record(pathlib.Path(env["CLAUDE_FLEET_ROOT"])).read_text()
+    )
+    assert record.t3_end is None
+    assert record.self_exit is True
+    prompt = prompt_file.read_text()
+    assert "exit-requested" in prompt and "t3_thread_organize" not in prompt
+    assert "CLAUDE_SPAWN_T3_END" not in _read_spawn_namespace(env_file)
+
+
+@pytest.mark.parametrize("backend", ["wm", "tmux"])
+def test_unknown_t3_end_is_bad_usage_on_every_lane(t3_lane: _T3Lane, backend: str) -> None:
+    t3_lane.env["CLAUDE_SPAWN_BACKEND"] = backend
+    _set_end_of_work_inputs(t3_lane.env, "junk", None)
+
+    result = t3_lane.run()
+
+    assert result.returncode == 2, f"stderr: {result.stderr.decode()}"
+    assert "CLAUDE_SPAWN_T3_END='junk'" in result.stderr.decode()
+    assert not t3_lane.records(), "bad usage must write no session record"
+    assert not t3_lane.emulator_marker.exists()
