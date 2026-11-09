@@ -25,6 +25,7 @@ from shared.delivered_check_polarity import (
     lint_delivered_checks,
     polarity_error,
 )
+from shared.task_metadata import TASK_METADATA_CAPABILITIES
 from shared.task_statuses import ACTIVE
 from shared.uuid_prefix_guard import Namespace, Resolution, ResolverUnavailable
 
@@ -104,6 +105,7 @@ from fused_memory.middleware.task_interceptor import (
     _looks_like_task_id,
     interceptor_write_succeeded,
 )
+from fused_memory.middleware.trigger_chain_guard import trigger_chain_open_error
 from fused_memory.models.enums import (
     MEM0_PRIMARY,
     MemoryCategory,
@@ -7875,6 +7877,11 @@ def create_mcp_server(
         ``queue`` is the durable-write-queue subsystem, and conflating it with
         reconciliation state is the exact mis-triage task 2920 fixed.
 
+        The top-level ``task_metadata_capabilities`` lists the task-metadata
+        capabilities this running server's submit guard enforces. Filing
+        recipes probe it (skills/_shared/filing-the-trigger-chain.md §2)
+        because it comes from the running process, not from main.
+
         Args:
             project_id: Get stats for a specific project (optional)
         """
@@ -7947,6 +7954,9 @@ def create_mcp_server(
         # exact mis-triage task 2920 fixed.
         if write_journal is not None and isinstance(result, dict) and 'error' not in result:
             result['journal_drops'] = write_journal.journal_drop_stats()
+
+        if isinstance(result, dict) and 'error' not in result:
+            result['task_metadata_capabilities'] = sorted(TASK_METADATA_CAPABILITIES)
 
         return result
 
@@ -9638,6 +9648,16 @@ def create_mcp_server(
         )
         if _gate_err is not None:
             return _gate_err
+
+        # One open trigger chain per (project, skill), PRD
+        # plans/completion-driven-triggers-prd.md C2. Before the interceptor's
+        # planning_mode split, so it covers the curator and planning_mode paths;
+        # it fails open (see middleware/trigger_chain_guard.py).
+        _chain_err = await trigger_chain_open_error(
+            metadata, project_root, source=task_interceptor, tag=tag,
+        )
+        if _chain_err is not None:
+            return _chain_err
 
         # Operational-routing boundary coercion (task 2802/β) — the
         # AUTHORITATIVE operational→deterministic coercion, an unbypassable

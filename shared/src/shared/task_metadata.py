@@ -44,6 +44,8 @@ __all__ = [
     'HUMAN_CURATOR_GATE_KEY',
     'KNOWN_ROLE_NAMES',
     'RECHECK_SECS_MIN',
+    'TASK_METADATA_CAPABILITIES',
+    'TRIGGER_CHAIN_KEY',
     'BeforeDone',
     'DoneProvenance',
     'ExternalDep',
@@ -57,11 +59,15 @@ __all__ = [
     'SchemaWarning',
     'SubmodelCardinality',
     'TaskMetadata',
+    'TriggerChain',
+    'TriggerChainRole',
+    'TriggerChainSkill',
     'apply_migrations',
     'is_known_metadata_key',
     'parse_metadata',
     'recheck_secs_milestone_conflict',
     'register_metadata_submodel',
+    'registered_metadata_submodel',
     'script_root_kind_conflict',
     'validate_model_overrides',
 ]
@@ -760,6 +766,66 @@ class Recurrence(BaseModel):
     minted_from: str | None = None
 
 
+TRIGGER_CHAIN_KEY: str = 'trigger_chain'
+
+TriggerChainRole = Literal['completion_gate', 'human_gate']
+
+TriggerChainSkill = Literal['review', 'hotspot-survey', 'review-all']
+
+
+class TriggerChain(BaseModel):
+    """``metadata.trigger_chain`` — a task's place in an attended run's trigger chain.
+
+    A chain is the completion gate and human gate a run files so the next run
+    of the same skill is scheduled by completion (plans/completion-driven-triggers-prd.md
+    C2). This model owns the shape; the carrier rules live in the fused-memory
+    submit guard.
+    """
+
+    model_config = ConfigDict(extra='allow')
+
+    role: TriggerChainRole
+    skill: TriggerChainSkill
+    run_id: str
+    superseded_by: str | None = None
+
+    @field_validator('skill', mode='before')
+    @classmethod
+    def _skill_is_bare(cls, value: object) -> object:
+        if isinstance(value, str) and value.startswith('/'):
+            raise ValueError(
+                f'trigger_chain.skill={value!r} must be the bare skill name '
+                f'{value.lstrip("/")!r} (no leading slash)'
+            )
+        return value
+
+    @model_validator(mode='after')
+    def _run_ids_name_the_skill(self) -> TriggerChain:
+        _require_run_of(self.skill, 'run_id', self.run_id)
+        if self.superseded_by is not None:
+            _require_run_of(self.skill, 'superseded_by', self.superseded_by)
+        return self
+
+
+def _require_run_of(skill: str, field: str, run_id: str) -> None:
+    """Refuse a *run_id* that is not a run of *skill* (``<skill>-…``).
+
+    A run of a longer skill that *skill* prefixes (``review-all-…`` against
+    ``review``) is refused too: its ``review-`` prefix is not a ``review`` run.
+    """
+    prefix = f'{skill}-'
+    if not run_id.startswith(prefix):
+        raise ValueError(
+            f'trigger_chain.{field}={run_id!r} must start with {prefix!r}, '
+            f'the skill it was run by'
+        )
+    for longer in get_args(TriggerChainSkill):
+        if longer.startswith(prefix) and run_id.startswith(f'{longer}-'):
+            raise ValueError(
+                f'trigger_chain.{field}={run_id!r} is a run of {longer!r}, not of {skill!r}'
+            )
+
+
 class RoutingDecisionMirror(BaseModel):
     """One resolved routing decision for a single LLM invocation (PRD γ).
 
@@ -1065,6 +1131,11 @@ def register_metadata_submodel(
     _SUBMODEL_CARDINALITY[key] = cardinality
 
 
+def registered_metadata_submodel(key: str) -> type[BaseModel] | None:
+    """The model :func:`register_metadata_submodel` registered for ``metadata[key]``, if any."""
+    return _SUBMODEL_REGISTRY.get(key)
+
+
 # Milestone is the first real W10 registrant: registering at module-import
 # time (rather than lazily) guarantees the 'milestone' slice is validated
 # and typed before any of parse_metadata's many callers across packages run.
@@ -1108,6 +1179,15 @@ register_metadata_submodel(STRAND_CONVERTED_METADATA_KEY, StrandConverted, cardi
 
 # declared_scope: plans/follow-up-filing-shape-prd.md §4.2.
 register_metadata_submodel(DECLARED_SCOPE_METADATA_KEY, DeclaredScope, cardinality='dict')
+
+# trigger_chain: plans/completion-driven-triggers-prd.md C2.
+register_metadata_submodel(TRIGGER_CHAIN_KEY, TriggerChain, cardinality='dict')
+
+# The metadata capabilities this schema's submit guard enforces; the running
+# fused-memory reports it through get_status (PRD C2 "Capability report").
+TASK_METADATA_CAPABILITIES: frozenset[str] = frozenset(
+    {'before_done.recheck_secs', 'before_done.script_root', TRIGGER_CHAIN_KEY}
+)
 
 
 def _normalize_legacy_memory_hints(value: object) -> object:
@@ -1258,10 +1338,11 @@ _WHOLE_METADATA_FIELD = '<metadata>'
 # still preserves each value byte-for-value (I1). Blessed keys are NORMALLY
 # disjoint from TaskMetadata.model_fields and _SUBMODEL_REGISTRY — a typed
 # field or a registered submodel already suppresses unknown_key via
-# known_fields, so blessing it too would be redundant. 'recurrence' and
-# 'cancel_dispositions' are the two deliberate overlaps: task 4676 / PRD
-# docs/prds/recurring-deterministic-tasks.md R-D4 and
-# plans/cancel-with-children-prd.md §4.8 each specify both, so the key
+# known_fields, so blessing it too would be redundant. 'recurrence',
+# 'cancel_dispositions' and 'trigger_chain' are the three deliberate overlaps:
+# task 4676 / PRD docs/prds/recurring-deterministic-tasks.md R-D4,
+# plans/cancel-with-children-prd.md §4.8 and
+# plans/completion-driven-triggers-prd.md C2 each specify both, so the key
 # stays suppressed if its registration is ever moved or made lazy, and so
 # migrate_task_metadata_to_x_namespace.py refuses to x_-namespace it, which
 # for a submodel-backed key with live readers is the correct refusal.
@@ -1498,9 +1579,17 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         # vocabulary and be re-added on the next block.
         'last_blocked_at',
         # recurrence (task 4676, PRD docs/prds/recurring-deterministic-tasks.md
-        # R-D4) is a blessed key that is also a registered submodel — see the
-        # header note above on why the overlap is deliberate.
+        # R-D4), trigger_chain (below) and cancel_dispositions (below) are the
+        # blessed keys that are also registered submodels — see the header note
+        # above on why the overlap is deliberate.
         'recurrence',
+        # plans/completion-driven-triggers-prd.md C2: the chain record, and the
+        # runner stamps of C1 written by
+        # orchestrator/src/orchestrator/predicate_recheck.py::PREDICATE_RECHECK_KEY
+        # and ::PREDICATE_VERDICT_KEY.
+        TRIGGER_CHAIN_KEY,
+        'predicate_recheck',
+        'predicate_verdict',
         # Recon-stage execution-class discriminator (task 3780): machine-read
         # by live guards at the fused-memory submit boundary, with real
         # dispatch consequences rather than decorative ones. Readers, named
@@ -1633,7 +1722,7 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         # the residue backstop, get_cancel_children and /review phase 3.
         'superseded_by',
         # Each child's per-parent disposition record; also a registered list
-        # submodel (the second deliberate overlap, header note above). Writer:
+        # submodel (one of the three deliberate overlaps, header note above). Writer:
         # the cancel gate, task β. Readers: the residue backstop,
         # get_cancel_children (existing_disposition) and /review phase 3.
         'cancel_dispositions',
