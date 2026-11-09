@@ -47,6 +47,7 @@ from dashboard.data.metrics import (
     collect_metrics_snapshot,
     downsample_metrics,
 )
+from dashboard.data.quality_store import QUALITY_SCHEMA
 from dashboard.project_dbs import _project_scoped_dbs_labeled
 
 logger = logging.getLogger(__name__)
@@ -103,6 +104,19 @@ class _MetricsStore(AsyncSqliteBase):
     @property
     def _schema(self) -> str:
         return METRICS_SCHEMA
+
+    @property
+    def connection(self) -> aiosqlite.Connection:
+        """Public accessor for the open connection; raises RuntimeError if not opened."""
+        return self._require_conn()
+
+
+class _QualityStore(AsyncSqliteBase):
+    """Writable WAL-mode store for quality.db; its schema is dashboard.data.quality_store's."""
+
+    @property
+    def _schema(self) -> str:
+        return QUALITY_SCHEMA
 
     @property
     def connection(self) -> aiosqlite.Connection:
