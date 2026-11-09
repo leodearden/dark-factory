@@ -64,7 +64,9 @@ are also the index the T3 sweep iterates, so every terminal write drops one.
 A thread id that cannot name a pointer file is never claimed. The record
 reap and the orphan sweep index a live t3 record whose thread no pointer
 holds. They pid-sweep a t3 record that another live record displaced from its
-thread's pointer, so every live t3 record stays in exactly one sweep.
+thread's pointer, and a t3 record with no usable thread id. So every live t3
+record is in at most one sweep. A record whose index write failed is in
+neither until a later sweep's retry succeeds.
 An indexed thread missing from the environment's `t3_thread_list` listing is
 marked exited only after `t3_thread_read` answers that it is gone or
 archived, because the listing omits live side-chat threads (T3 v0.1.6

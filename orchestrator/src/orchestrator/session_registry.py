@@ -1024,8 +1024,11 @@ def claude_session_pointer_path(session_id: str, root: Path | str | None = None)
     return claude_session_pointers_dir(root) / session_id
 
 
-def _is_pointer_name_token(name: str) -> bool:
-    """True iff *name* is safe as a pointer file name: the ``CLAUDE_CODE_SESSION_ID`` token shape."""
+def _is_claude_session_pointer_name(name: str) -> bool:
+    """True iff *name* can name a ``sessions-by-claude-id/`` entry: the ``CLAUDE_CODE_SESSION_ID`` token shape.
+
+    The ``sessions-by-t3-thread/`` twin is ``is_t3_thread_pointer_name``.
+    """
     return _SESSION_ID_RE.fullmatch(name) is not None
 
 
@@ -1053,7 +1056,7 @@ def write_claude_session_pointer(
     is not a record key, False after a WARNING when the write fails, and
     never raises.
     """
-    if not _is_pointer_name_token(session_id) or not is_record_key(slug):
+    if not _is_claude_session_pointer_name(session_id) or not is_record_key(slug):
         return False
     return _write_pointer_file(claude_session_pointer_path(session_id, root=root), slug)
 
@@ -1067,7 +1070,7 @@ def resolve_session_slug_for_claude_session_id(
     returned only when the record it names carries
     ``claude_session_id == session_id``. Read-only; never raises.
     """
-    if not _is_pointer_name_token(session_id):
+    if not _is_claude_session_pointer_name(session_id):
         return None
     slug = _read_session_pointer(claude_session_pointer_path(session_id, root=root))
     if slug is None or not is_record_key(slug):
@@ -3060,7 +3063,7 @@ def _pointed_owner_identity(
 def _is_stale_claude_session_pointer(path: Path, root: Path | str | None) -> bool:
     if path.name.endswith(_ATOMIC_WRITE_TEMP_SUFFIX):
         return _is_abandoned_temp_file(path)
-    if not _is_pointer_name_token(path.name):
+    if not _is_claude_session_pointer_name(path.name):
         return True
     return resolve_session_slug_for_claude_session_id(path.name, root=root) is None
 
