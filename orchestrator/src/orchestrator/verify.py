@@ -1370,9 +1370,9 @@ def _junit_testcase_statuses(path: Path) -> dict[str, NodeIdStatus] | None:
             status = 'pass'
         testcase_id = _junit_testcase_id(testcase)
         prior = statuses.get(testcase_id)
-        statuses[testcase_id] = status if prior is None else min(
-            prior, status, key=_NODE_ID_STATUS_PRECEDENCE.index,
-        )
+        statuses[testcase_id] = status if prior is None else _NODE_ID_STATUS_PRECEDENCE[min(
+            _NODE_ID_STATUS_PRECEDENCE.index(prior), _NODE_ID_STATUS_PRECEDENCE.index(status),
+        )]
     return statuses
 
 
